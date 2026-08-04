@@ -26,6 +26,20 @@ struct mtmd_image_preproc_out {
     }
 };
 
+// Inkling hMLP preprocessing; pixel_values_bthwc is row-major BTHWC [n_patches, 2, 40, 40, 3].
+struct mtmd_inkling_image_preproc_out {
+    clip_image_size source_size;
+    clip_image_size resized_size;
+    int patch_rows = 0;
+    int patch_cols = 0;
+    std::vector<uint8_t> resized_rgb;
+    std::vector<float> pixel_values_bthwc;
+};
+
+mtmd_inkling_image_preproc_out mtmd_image_preprocess_inkling(
+        const clip_image_u8 & img,
+        resize_algo algo = RESIZE_ALGO_LANCZOS);
+
 // base class, models must inherit from this class
 struct mtmd_image_preprocessor {
     const clip_hparams & hparams;
@@ -74,7 +88,6 @@ struct mtmd_image_preprocessor_llava_uhd : mtmd_image_preprocessor {
         std::vector<slice_coordinates> slices;
     };
 
-    // LFM2 override this function to implement its custom slicing logic
     virtual slice_instructions get_slice_instructions(const clip_image_size & original_size);
 
     struct slice_output {
@@ -83,9 +96,10 @@ struct mtmd_image_preprocessor_llava_uhd : mtmd_image_preprocessor {
     };
     slice_output slice_image(const clip_image_u8 & img, const slice_instructions & inst);
 
-private:
+protected:
     clip_image_size get_best_resize(const clip_image_size & original_size, int scale_resolution, int patch_size, bool allow_upscale = false);
 
+private:
     clip_image_size resize_maintain_aspect_ratio(const clip_image_size & orig, const clip_image_size & target_max);
 
     /**
@@ -115,6 +129,12 @@ struct mtmd_image_preprocessor_fixed_size : mtmd_image_preprocessor {
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
 };
 
+// Inkling: split an image into 40x40 hMLP patches, each duplicated across a fixed temporal dimension of two.
+struct mtmd_image_preprocessor_inkling : mtmd_image_preprocessor {
+    mtmd_image_preprocessor_inkling(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
+};
+
 // resize image to multiple of patch_size*n_merge, while preserving aspect ratio
 // if image_resize_pad is true, the resized image will be padded, otherwise it will be either stretched or center-cropped depending on image_resize_pad
 // this is used by models with native support for dynamic image size, for example: Qwen-VL, Pixtral, Kimi-VL, etc
@@ -127,6 +147,12 @@ struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
 struct mtmd_image_preprocessor_longest_edge : mtmd_image_preprocessor {
     mtmd_image_preprocessor_longest_edge(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
+};
+
+// custom llava-uhd slicing logic for MiniCPM-V
+struct mtmd_image_preprocessor_minicpmv : mtmd_image_preprocessor_llava_uhd {
+    using mtmd_image_preprocessor_llava_uhd::mtmd_image_preprocessor_llava_uhd;
+    slice_instructions get_slice_instructions(const clip_image_size & original_size) override;
 };
 
 // custom llava-uhd slicing logic for LFM2

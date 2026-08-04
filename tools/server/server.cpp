@@ -139,6 +139,24 @@ int llama_server(common_params & params, int argc, char ** argv) {
     common_params_print_info(params, !is_router_server);
 
     if (!is_router_server) {
+        // Set an abort callback that prints a structured error message to
+        // stdout before abort() kills the process.  The parent's log thread
+        // (in router mode) reads stdout via a pipe and parses
+        // CMD_CHILD_TO_ROUTER_ERROR to capture the error for /v1/models.
+        // fflush(stdout) is essential: abort() does not flush stdio buffers.
+        ggml_set_abort_callback([](const char * msg) {
+            // Flatten multi-line messages so the fgets parser captures
+            // the full error, not just the first line.
+            char flat[4096];
+            size_t i;
+            for (i = 0; i < sizeof(flat) - 1 && msg[i]; i++) {
+                flat[i] = (msg[i] == '\n') ? ' ' : msg[i];
+            }
+            flat[i] = '\0';
+            fprintf(stdout, "%s%s\n", CMD_CHILD_TO_ROUTER_ERROR, flat);
+            fflush(stdout);
+        });
+
         // validate batch size for embeddings
         // embeddings require all tokens to be processed in a single ubatch
         // see https://github.com/ggml-org/llama.cpp/issues/12836
@@ -485,6 +503,13 @@ int llama_server(common_params & params, int argc, char ** argv) {
     }
 
     SRV_INF("listening on %s\n", ctx_http.listening_address.c_str());
+
+    // TODO: remove this in the future
+    // check the string to also handle the .sock case
+    if (string_ends_with(ctx_http.listening_address, ":8080")) {
+        SRV_WRN("%s", "NOTICE: server default port will be changed to :9931 in a future release\n");
+        SRV_WRN("%s", "        ref: https://github.com/ggml-org/llama.cpp/pull/26508\n");
+    }
 
     if (is_router_server) {
         if (!params.models_preset_hf.empty()) {

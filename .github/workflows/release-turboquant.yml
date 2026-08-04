@@ -1,0 +1,789 @@
+name: Release TurboQuant (semver, all platforms)
+
+# Stable release pipeline. Cut a release from `master` with:
+#
+#   ./scripts/turboquant-release.sh [patch|minor|major|X.Y.Z]
+#
+# which bumps TURBOQUANT_VERSION, commits, tags and pushes. Version/tag
+# format: <upstream-base>-<fork-semver>, e.g. b10018-1.2.0 (upstream
+# llama.cpp build the fork is based on + the fork's own semver). The tag
+# push triggers this workflow: every supported backend is built and ALL
+# archives are published into ONE GitHub release named after the tag.
+# Consumers (Atomic-Chat / atomic-chat-conf manifest) then point every
+# backend entry at the same tag.
+#
+# The rolling dev channel is separate — see dev-build.yml.
+
+on:
+  push:
+    tags:
+      - 'b[0-9]+-[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  LLAMA_LOG_COLORS: 1
+  LLAMA_LOG_PREFIX: 1
+  LLAMA_LOG_TIMESTAMPS: 1
+  # Keep in sync with the upstream `windows` release job.
+  VULKAN_VERSION: 1.4.313.2
+
+jobs:
+  # The tag must match the TURBOQUANT_VERSION file it points at — catches
+  # tags pushed from the wrong commit or a forgotten version bump.
+  verify-version:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check tag matches TURBOQUANT_VERSION
+        if: ${{ github.ref_type == 'tag' }}
+        run: |
+          FILE_VERSION=$(tr -d ' \n' < TURBOQUANT_VERSION)
+          TAG="${GITHUB_REF_NAME}"
+          echo "tag=$TAG file=$FILE_VERSION"
+          if [ "$TAG" != "$FILE_VERSION" ]; then
+            echo "::error::Tag $TAG does not match TURBOQUANT_VERSION file ($FILE_VERSION)"
+            exit 1
+          fi
+
+  linux-x64-vulkan:
+    needs: verify-version
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: turboquant-linux-x64-vulkan
+          evict-old-files: 1d
+
+      - name: Dependencies
+        run: |
+          wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk
+
+      - name: Build
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_VULKAN=ON \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Verify build
+        run: |
+          ./build/bin/llama-server --version 2>&1 || true
+          ./build/bin/llama-server --help 2>&1 | grep -A2 "cache-type-k" || true
+
+      - name: Prepare archive
+        run: |
+          mkdir -p release/build/bin
+          cp build/bin/llama-server release/build/bin/
+          cp build/bin/llama-cli release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-bench release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-perplexity release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-quantize release/build/bin/ 2>/dev/null || true
+          find build/bin -name "*.so*" -exec cp -P {} release/build/bin/ \; 2>/dev/null || true
+          cp LICENSE release/build/bin/ 2>/dev/null || true
+          cd release
+          zip -r ../llama-turboquant-linux-x64-vulkan.zip .
+          tar -czf ../llama-turboquant-linux-x64-vulkan.tar.gz .
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-linux-x64-vulkan
+          path: |
+            llama-turboquant-linux-x64-vulkan.zip
+            llama-turboquant-linux-x64-vulkan.tar.gz
+          retention-days: 30
+
+  linux-x64-cuda-13-3:
+    name: linux-x64-cuda-13.3
+    needs: verify-version
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: turboquant-linux-x64-cuda-13.3
+          evict-old-files: 1d
+
+      - name: Install CUDA Toolkit
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential \
+            cuda-nvcc-13-3 cuda-cccl-13-3 cuda-cudart-dev-13-3 libcublas-dev-13-3
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        # Consumer SASS: RTX 30 (86), RTX 40 (89), RTX 50 / Blackwell (120).
+        # PTX floor at Turing (75-virtual) so Turing/older consumer and all
+        # server cards (A100 80, H100/H200 90, B200 100) JIT at first run --
+        # we don't ship their SASS, which is what bloated the archive. Runner
+        # has no GPU: build only, backend is a dlopen'd libggml-cuda.so.
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_CUB_3DOT2=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="75-virtual;86-real;89-real;120-real" \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Verify build
+        run: |
+          ./build/bin/llama-server --version 2>&1 || true
+          ls -l build/bin/libggml-cuda.so
+
+      - name: Prepare archive
+        run: |
+          mkdir -p release/build/bin
+          cp build/bin/llama-server release/build/bin/
+          cp build/bin/llama-cli release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-bench release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-perplexity release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-quantize release/build/bin/ 2>/dev/null || true
+          find build/bin -name "*.so*" -exec cp -P {} release/build/bin/ \; 2>/dev/null || true
+          # CUDA runtime is not a given on user systems -- bundle it like the
+          # Windows job bundles cudart/cublas DLLs.
+          cp -P /usr/local/cuda/lib64/libcudart.so* release/build/bin/
+          cp -P /usr/local/cuda/lib64/libcublas.so* release/build/bin/
+          cp -P /usr/local/cuda/lib64/libcublasLt.so* release/build/bin/
+          cp LICENSE release/build/bin/ 2>/dev/null || true
+          cd release
+          zip -r ../llama-turboquant-linux-x64-cuda-13.3.zip .
+          tar -czf ../llama-turboquant-linux-x64-cuda-13.3.tar.gz .
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-linux-x64-cuda-13.3
+          path: |
+            llama-turboquant-linux-x64-cuda-13.3.zip
+            llama-turboquant-linux-x64-cuda-13.3.tar.gz
+          retention-days: 14
+
+  linux-x64-cpu:
+    needs: verify-version
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: turboquant-linux-x64-cpu
+          evict-old-files: 1d
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential
+
+      - name: Build
+        # Pure CPU, no GPU backend. GGML_CPU_ALL_VARIANTS picks the best SIMD
+        # level (SSE..AVX512) at runtime, so one binary runs on any x64 CPU
+        # with zero GPU runtime dependencies.
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Verify build
+        run: |
+          ./build/bin/llama-server --version 2>&1 || true
+
+      - name: Prepare archive
+        run: |
+          mkdir -p release/build/bin
+          cp build/bin/llama-server release/build/bin/
+          cp build/bin/llama-cli release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-bench release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-perplexity release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-quantize release/build/bin/ 2>/dev/null || true
+          find build/bin -name "*.so*" -exec cp -P {} release/build/bin/ \; 2>/dev/null || true
+          cp LICENSE release/build/bin/ 2>/dev/null || true
+          cd release
+          zip -r ../llama-turboquant-linux-x64-cpu.zip .
+          tar -czf ../llama-turboquant-linux-x64-cpu.tar.gz .
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-linux-x64-cpu
+          path: |
+            llama-turboquant-linux-x64-cpu.zip
+            llama-turboquant-linux-x64-cpu.tar.gz
+          retention-days: 30
+
+  linux-x64-cuda-12-4:
+    name: linux-x64-cuda-12.4
+    needs: verify-version
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: turboquant-linux-x64-cuda-12.4
+          evict-old-files: 1d
+
+      - name: Install CUDA Toolkit
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential \
+            cuda-nvcc-12-4 cuda-cccl-12-4 cuda-cudart-dev-12-4 libcublas-dev-12-4
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        # CUDA 12.4 for consumer cards on OLDER drivers (12.4 works where 13.x
+        # needs a newer driver -- the most-downloaded variant on Windows).
+        # Wide old-card net: SASS for Turing/Ampere/Ada (75/86/89), PTX floor
+        # at Pascal (61) for JIT. No sm_120 -- CUDA 12.4 predates Blackwell,
+        # and RTX 50 needs the newer driver + the 13.3 build anyway.
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_CUB_3DOT2=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="61-virtual;75-real;86-real;89-real" \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Verify build
+        run: |
+          ./build/bin/llama-server --version 2>&1 || true
+          ls -l build/bin/libggml-cuda.so
+
+      - name: Prepare archive
+        run: |
+          mkdir -p release/build/bin
+          cp build/bin/llama-server release/build/bin/
+          cp build/bin/llama-cli release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-bench release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-perplexity release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-quantize release/build/bin/ 2>/dev/null || true
+          find build/bin -name "*.so*" -exec cp -P {} release/build/bin/ \; 2>/dev/null || true
+          cp -P /usr/local/cuda/lib64/libcudart.so* release/build/bin/
+          cp -P /usr/local/cuda/lib64/libcublas.so* release/build/bin/
+          cp -P /usr/local/cuda/lib64/libcublasLt.so* release/build/bin/
+          cp LICENSE release/build/bin/ 2>/dev/null || true
+          cd release
+          zip -r ../llama-turboquant-linux-x64-cuda-12.4.zip .
+          tar -czf ../llama-turboquant-linux-x64-cuda-12.4.tar.gz .
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-linux-x64-cuda-12.4
+          path: |
+            llama-turboquant-linux-x64-cuda-12.4.zip
+            llama-turboquant-linux-x64-cuda-12.4.tar.gz
+          retention-days: 30
+
+  linux-x64-rocm:
+    needs: verify-version
+    runs-on: ubuntu-22.04
+    env:
+      ROCM_VERSION: "7.2.1"
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # ROCm SDK + build artifacts overrun the default runner disk.
+      - name: Free up disk space
+        uses: ggml-org/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: turboquant-linux-x64-rocm
+          evict-old-files: 1d
+
+      - name: Install ROCm
+        run: |
+          sudo mkdir --parents --mode=0755 /etc/apt/keyrings
+          wget https://repo.radeon.com/rocm/rocm.gpg.key -O - | \
+            gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
+          sudo tee /etc/apt/sources.list.d/rocm.list << EOF
+          deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/${ROCM_VERSION} jammy main
+          EOF
+          sudo tee /etc/apt/preferences.d/rocm-pin-600 << EOF
+          Package: *
+          Pin: release o=repo.radeon.com
+          Pin-Priority: 600
+          EOF
+          sudo apt-get update -y
+          sudo apt-get install -y build-essential cmake libssl-dev rocm-hip-sdk
+
+      - name: Build
+        # RDNA only, by scope decision: gfx1030 (RDNA2), gfx1100/1101/1102
+        # (RDNA3), gfx1151 (RDNA 3.5 / Strix Halo), gfx1200/1201 (RDNA4).
+        # GCN/CDNA are intentionally excluded -- those users use Vulkan.
+        # Runner has no AMD GPU: build only. libggml-hip.so is dlopen'd
+        # thanks to GGML_BACKEND_DL.
+        run: |
+          export ROCM_PATH=/opt/rocm
+          export PATH=$PATH:$ROCM_PATH/bin
+          cmake -B build \
+            -DCMAKE_HIP_COMPILER="$(hipconfig -l)/clang" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_HIP=ON \
+            -DHIP_PLATFORM=amd \
+            -DGPU_TARGETS="gfx1030;gfx1100;gfx1101;gfx1102;gfx1151;gfx1200;gfx1201" \
+            -DGGML_HIP_ROCWMMA_FATTN=ON \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Verify build
+        run: |
+          ./build/bin/llama-server --version 2>&1 || true
+          ls -l build/bin/libggml-hip.so
+
+      - name: Prepare archive
+        # Lean archive: binaries + libggml-*.so only. Do NOT bundle the ROCm
+        # runtime — rocBLAS/hipBLASLt ship a Tensile kernel database for every
+        # gfx arch that balloons the archive past 9 GB (and GitHub's 2 GB asset
+        # limit). AMD users install the ROCm runtime system-wide, exactly like
+        # upstream's ROCm builds; libggml-hip.so dlopen-links it at runtime.
+        run: |
+          mkdir -p release/build/bin
+          cp build/bin/llama-server release/build/bin/
+          cp build/bin/llama-cli release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-bench release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-perplexity release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-quantize release/build/bin/ 2>/dev/null || true
+          find build/bin -name "*.so*" -exec cp -P {} release/build/bin/ \; 2>/dev/null || true
+          cp LICENSE release/build/bin/ 2>/dev/null || true
+          cat > release/build/bin/README-ROCm.txt << 'EOF'
+          This build needs the AMD ROCm runtime installed on the system
+          (https://rocm.docs.amd.com). Targets AMD RDNA2-RDNA4:
+          gfx1030/1100/1101/1102/1151/1200/1201. GCN GPUs: use the Vulkan build.
+          EOF
+          cd release
+          zip -r ../llama-turboquant-linux-x64-rocm.zip .
+          tar -czf ../llama-turboquant-linux-x64-rocm.tar.gz .
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-linux-x64-rocm
+          path: |
+            llama-turboquant-linux-x64-rocm.zip
+            llama-turboquant-linux-x64-rocm.tar.gz
+          retention-days: 30
+
+  windows-x64:
+    needs: verify-version
+    runs-on: windows-2022
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cpu
+            cmake_flags: ''
+          - variant: vulkan
+            cmake_flags: '-DGGML_VULKAN=ON'
+          - variant: cuda-12.4
+            cuda: '12.4'
+            cmake_flags: '-DGGML_CUDA=ON -DGGML_CUDA_CUB_3DOT2=ON'
+          - variant: cuda-13.3
+            cuda: '13.3'
+            cmake_flags: '-DGGML_CUDA=ON -DGGML_CUDA_CUB_3DOT2=ON'
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: turboquant-windows-x64-${{ matrix.variant }}
+          evict-old-files: 1d
+
+      - name: Install CUDA Toolkit
+        if: ${{ startsWith(matrix.variant, 'cuda') }}
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ matrix.cuda }}
+
+      - name: Install Vulkan SDK
+        if: ${{ matrix.variant == 'vulkan' }}
+        shell: pwsh
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_RPC=OFF ^
+            -DLLAMA_CURL=OFF ^
+            -DLLAMA_OPENSSL=OFF ^
+            -DLLAMA_BUILD_SERVER=ON ^
+            -DLLAMA_BUILD_TOOLS=ON ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_EXAMPLES=OFF ^
+            ${{ matrix.cmake_flags }}
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% -t ggml
+          cmake --build build --config Release -j %NINJA_JOBS%
+
+      - name: Verify build
+        shell: pwsh
+        run: |
+          .\build\bin\Release\llama-server.exe --version 2>&1 | Write-Output
+          .\build\bin\Release\llama-server.exe --help 2>&1 | Select-String -Pattern "cache-type-k" -Context 0,2
+
+      - name: Bundle CUDA runtime DLLs
+        if: ${{ startsWith(matrix.variant, 'cuda') }}
+        shell: pwsh
+        run: |
+          $dst = ".\build\bin\Release"
+          Get-ChildItem "$env:CUDA_PATH\bin" -Filter *.dll |
+            Where-Object { $_.Name -match '^(cudart64|cublas64|cublasLt64)_.*\.dll$' } |
+            ForEach-Object {
+              Copy-Item $_.FullName -Destination $dst -Force
+            }
+
+      # Signed before staging, so the archive carries the signatures.
+      - name: Sign Windows binaries
+        uses: ./.github/actions/windows-code-sign
+        with:
+          path: build\bin\Release
+          sm-api-key: ${{ secrets.SM_API_KEY }}
+          sm-client-cert-b64: ${{ secrets.SM_CLIENT_CERT_FILE_B64 }}
+          sm-client-cert-password: ${{ secrets.SM_CLIENT_CERT_PASSWORD }}
+
+      - name: Prepare archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release\build\bin | Out-Null
+          Copy-Item .\build\bin\Release\* release\build\bin\ -Recurse -Force
+          Copy-Item .\LICENSE release\build\bin\ -ErrorAction SilentlyContinue
+          Compress-Archive -Path release\build -DestinationPath llama-turboquant-windows-x64-${{ matrix.variant }}.zip -Force
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-windows-x64-${{ matrix.variant }}
+          path: llama-turboquant-windows-x64-${{ matrix.variant }}.zip
+          retention-days: 30
+
+  macos-arm64:
+    needs: verify-version
+    runs-on: macos-latest
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: turboquant-macos-arm64
+          evict-old-files: 1d
+
+      - name: Import code signing certificate
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH=$RUNNER_TEMP/build_certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          echo -n "$MACOS_CERTIFICATE_P12" | base64 --decode -o $CERTIFICATE_PATH
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          security import $CERTIFICATE_PATH -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security list-keychain -d user -s $KEYCHAIN_PATH
+
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+          IDENTITY=$(security find-identity -v -p codesigning $KEYCHAIN_PATH | head -1 | grep -o '".*"' | tr -d '"')
+          echo "CODESIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            -DGGML_METAL=ON \
+            -DGGML_METAL_USE_BF16=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build build --config Release -j $(sysctl -n hw.ncpu)
+
+      - name: Verify build
+        run: |
+          ./build/bin/llama-server --version 2>&1 || true
+          if otool -L build/bin/llama-server | grep -vE '/usr/lib|/System|llama-server' | grep '\.dylib'; then
+            echo "ERROR: Found non-system dynamic dependency!"
+            exit 1
+          fi
+
+      - name: Sign binaries
+        run: |
+          for bin in build/bin/llama-server build/bin/llama-cli build/bin/llama-bench build/bin/llama-perplexity build/bin/llama-quantize; do
+            if [ -f "$bin" ]; then
+              codesign --force --options runtime --timestamp \
+                --entitlements .github/entitlements.plist \
+                --sign "$CODESIGN_IDENTITY" "$bin"
+              codesign --verify --verbose "$bin"
+            fi
+          done
+
+      - name: Prepare archive
+        run: |
+          mkdir -p release/build/bin
+          cp build/bin/llama-server release/build/bin/
+          cp build/bin/llama-cli release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-bench release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-perplexity release/build/bin/ 2>/dev/null || true
+          cp build/bin/llama-quantize release/build/bin/ 2>/dev/null || true
+          cd release
+          zip -r ../llama-turboquant-macos-arm64.zip .
+          tar -czf ../llama-turboquant-macos-arm64.tar.gz .
+
+      - name: Notarize release archive
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool submit llama-turboquant-macos-arm64.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 10m
+          for bin in build/bin/llama-server build/bin/llama-cli build/bin/llama-bench build/bin/llama-perplexity build/bin/llama-quantize; do
+            if [ -f "$bin" ]; then
+              name=$(basename "$bin")
+              zip -j "${name}.zip" "$bin"
+              xcrun notarytool submit "${name}.zip" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_ID_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" \
+                --wait --timeout 10m
+              rm "${name}.zip"
+            fi
+          done
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          security delete-keychain $KEYCHAIN_PATH 2>/dev/null || true
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-macos-arm64
+          path: |
+            llama-turboquant-macos-arm64.zip
+            llama-turboquant-macos-arm64.tar.gz
+          retention-days: 30
+
+  # A stable release must be COMPLETE: this job has hard `needs` on every
+  # build job — if anything failed, no release is published at all.
+  publish-release:
+    needs: [verify-version, linux-x64-cpu, linux-x64-vulkan, linux-x64-cuda-12-4, linux-x64-cuda-13-3, linux-x64-rocm, windows-x64, macos-arm64]
+    # Publish even if some backend build failed, so one broken backend never
+    # blocks shipping the others (the notes call out what is missing). Still
+    # requires the version check to pass.
+    if: ${{ always() && needs.verify-version.result == 'success' }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: archives
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          VERSION=$(tr -d ' \n' < TURBOQUANT_VERSION)
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            TAG="${VERSION}"
+          fi
+          UPSTREAM_BASE="${VERSION%%-*}"
+          ls -lh archives/
+
+          # A build job may have failed (if: always() above). Publish whatever
+          # archives exist and call out anything missing in the notes.
+          EXPECTED="linux-x64-cpu linux-x64-vulkan linux-x64-cuda-12.4 linux-x64-cuda-13.3 linux-x64-rocm windows-x64-cpu windows-x64-vulkan windows-x64-cuda-12.4 windows-x64-cuda-13.3 macos-arm64"
+          MISSING=""
+          for b in $EXPECTED; do
+            ls archives/ | grep -q "llama-turboquant-${b}\." || MISSING="$MISSING $b"
+          done
+
+          NOTES="## TurboQuant KV Cache ${VERSION}
+
+          Built from \`master\` at commit \`${SHORT_SHA}\`, based on upstream llama.cpp \`${UPSTREAM_BASE}\`.
+
+          ### What's included
+          - \`llama-server\` with \`--cache-type-k turbo3\` / \`turbo4\` support
+          - \`llama-cli\`, \`llama-bench\`, \`llama-perplexity\`, \`llama-quantize\`
+          - All supported backends in one release:
+
+          | Backend | Asset |
+          |---|---|
+          | Linux x64 CPU only | \`llama-turboquant-linux-x64-cpu.tar.gz\` |
+          | Linux x64 Vulkan (+ portable CPU) | \`llama-turboquant-linux-x64-vulkan.tar.gz\` |
+          | Linux x64 CUDA 12.4, older drivers (+ portable CPU) | \`llama-turboquant-linux-x64-cuda-12.4.tar.gz\` |
+          | Linux x64 CUDA 13.3 (+ portable CPU) | \`llama-turboquant-linux-x64-cuda-13.3.tar.gz\` |
+          | Linux x64 AMD ROCm, RDNA2-RDNA4 (+ portable CPU) | \`llama-turboquant-linux-x64-rocm.tar.gz\` |
+          | Windows x64 CPU | \`llama-turboquant-windows-x64-cpu.zip\` |
+          | Windows x64 Vulkan | \`llama-turboquant-windows-x64-vulkan.zip\` |
+          | Windows x64 CUDA 12.4 | \`llama-turboquant-windows-x64-cuda-12.4.zip\` |
+          | Windows x64 CUDA 13.3 | \`llama-turboquant-windows-x64-cuda-13.3.zip\` |
+          | macOS ARM64 (Metal, signed + notarized) | \`llama-turboquant-macos-arm64.zip\` |
+
+          The AMD ROCm archive targets RDNA2 through RDNA4 (gfx1030/1100/1101/1102/1151/1200/1201) and needs the ROCm runtime installed on the system. Older GCN cards: use the Vulkan build.
+
+          ### Versioning
+          \`<upstream-base>-<fork-semver>\`: \`${UPSTREAM_BASE}\` is the upstream llama.cpp build this fork is based on, \`${VERSION#*-}\` is the TurboQuant fork version. \`llama-server --version\` reports \`version: ${VERSION}\`."
+
+          if [ -n "$MISSING" ]; then
+            NOTES="$NOTES
+
+          ⚠️ **Missing backends in this build:**${MISSING} — see the failed jobs of run ${{ github.run_id }}."
+          fi
+
+          gh release create "$TAG" \
+            --target "${{ github.sha }}" \
+            --title "TurboQuant ${VERSION}" \
+            --latest \
+            --notes "$NOTES" \
+            archives/*

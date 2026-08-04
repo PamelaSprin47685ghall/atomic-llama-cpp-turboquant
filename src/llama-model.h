@@ -130,6 +130,7 @@ enum llm_type {
     LLM_TYPE_100B_A6B,
     LLM_TYPE_102B_A12B, // Solar-Open
     LLM_TYPE_106B_A12B, // GLM-4.5-Air
+    LLM_TYPE_118B_A8B,  // Laguna-S-2
     LLM_TYPE_120B_A12B, // Nemotron 3 Super
     LLM_TYPE_122B_A10B, // Qwen3.5
     LLM_TYPE_196B_A11B, // Step3.5-Flash
@@ -540,6 +541,15 @@ struct llama_layer {
     struct llama_layer_shortconv shortconv;
 
     struct llama_layer_nextn nextn;
+
+    // inkling (private arch)
+    struct ggml_tensor * wr             = nullptr; // attn_r  [n_embd, n_head*d_rel]
+    struct ggml_tensor * attn_rel_proj  = nullptr; // [rel_extent, d_rel] (checkpoint [d_rel, E] orientation)
+    struct ggml_tensor * shortconv_k    = nullptr; // [K, kvw]
+    struct ggml_tensor * shortconv_v    = nullptr; // [K, kvw]
+    struct ggml_tensor * shortconv_attn = nullptr; // [K, n_embd]
+    struct ggml_tensor * shortconv_mlp  = nullptr; // [K, n_embd]
+    struct ggml_tensor * ffn_gscale     = nullptr; // F32 [1]
 };
 
 struct llama_device {
@@ -617,6 +627,12 @@ struct llama_model {
     // eagle3
     struct ggml_tensor * fc  = nullptr;  // feature fusion layer
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
+
+    // dspark
+    struct ggml_tensor * dspark_markov_w1   = nullptr;
+    struct ggml_tensor * dspark_markov_w2   = nullptr;
+    struct ggml_tensor * dspark_conf_proj   = nullptr;
+    struct ggml_tensor * dspark_conf_proj_b = nullptr;
 
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
@@ -724,6 +740,7 @@ struct llama_model_base : public llama_model {
     const int TENSOR_NOT_REQUIRED;
     const int TENSOR_SKIP;
     const int TENSOR_SKIP_IF_VIRTUAL;
+    const int TENSOR_ALLOW_RESHAPE;
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;

@@ -37,7 +37,10 @@ struct common_sampler;
 // llama_sampler API overloads
 
 // note: can mutate params in some cases
-struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params);
+struct common_sampler * common_sampler_init(
+        const struct llama_model * model,
+        struct common_params_sampling & params,
+        int32_t n_ctx = 0);
 
 void common_sampler_free(struct common_sampler * gsmpl);
 
@@ -66,8 +69,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
 // generalized version of common_sampler_sample
 //
-// will cross-reference the sampled tokens with a batch of draft tokens and accept those that match
-// if the sampler disagrees at some point, we stop and return the accepted tokens up to now
+// will cross-reference greedy-argmax target tokens with a batch of draft tokens and accept those that match
+// (draft positions use raw-logit argmax so stochastic params like temperature do not break MTP / greedy drafts)
+// then samples the next continuation token with the full chain when all drafts matched
+// if the target disagrees at some point, we stop and return the accepted tokens up to now
 //
 //      common_sampler_sample_n(gsmpl, ctx, { idx }, {});
 //

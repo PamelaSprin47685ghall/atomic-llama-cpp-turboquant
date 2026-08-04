@@ -180,17 +180,12 @@ uint32_t llama_hparams::n_embd_v_gqa_max() const {
     return val;
 }
 
-uint32_t llama_hparams::n_embd_k_idx(uint32_t il) const {
-    if (!indexer_kv || indexer_head_size == 0) {
-        return 0; // arch without a MSA indexer
-    }
-    if (il < n_layer_dense_lead) {
-        return 0; // leading dense layers carry no indexer
-    }
-    return indexer_head_size; // 128
-}
-
 uint32_t llama_hparams::n_embd_r() const {
+    if (n_embd_r_impl != 0) {
+        // explicit override (e.g. inkling: 4 packed shortconv streams per layer)
+        return n_embd_r_impl;
+    }
+
     if (wkv_head_size != 0) {
         // for RWKV models
         return token_shift_count * n_embd;
@@ -275,6 +270,10 @@ uint32_t llama_hparams::n_embd_head_v_mla() const {
 }
 
 bool llama_hparams::has_kv(uint32_t il) const {
+    if (kv_only_nextn) {
+        return n_layer_nextn > 0 && il >= (n_layer() - n_layer_nextn);
+    }
+
     if (n_layer_kv_from_start >= 0) {
         if (il < (uint32_t) n_layer_kv_from_start) {
             return true;
@@ -289,6 +288,16 @@ bool llama_hparams::has_kv(uint32_t il) const {
 
 uint32_t llama_hparams::n_layer() const {
     return n_layer_all - n_layer_nextn;
+}
+
+uint32_t llama_hparams::n_layer_kv() const {
+    uint32_t res = 0;
+    for (uint32_t il = 0; il < n_layer(); ++il) {
+        if (has_kv(il)) {
+            res++;
+        }
+    }
+    return res;
 }
 
 bool llama_hparams::use_mrope() const {

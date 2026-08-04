@@ -39,6 +39,7 @@ add_library(mtmd
             models/hunyuanvl.cpp
             models/internvl.cpp
             models/kimik3.cpp
+            models/inkling.cpp
             models/kimivl.cpp
             models/kimik25.cpp
             models/nemotron-v2-vl.cpp
@@ -52,6 +53,7 @@ add_library(mtmd
             models/qwen3vl.cpp
             models/mimovl.cpp
             models/qwen3a.cpp
+            models/mimo-audio.cpp
             models/step3vl.cpp
             models/siglip.cpp
             models/whisper-enc.cpp
@@ -60,6 +62,7 @@ add_library(mtmd
             models/mobilenetv5.cpp
             models/youtuvl.cpp
             models/yasa2.cpp
+            models/parakeet.cpp
             )
 
 set_target_properties(mtmd PROPERTIES
