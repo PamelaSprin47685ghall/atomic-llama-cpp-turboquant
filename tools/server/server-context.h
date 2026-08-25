@@ -84,22 +84,23 @@ using server_state_callback_t = std::function<void(server_state, json /* payload
 class server_token_hack {
 public:
     struct config {
-        int64_t     progress_at    = -1;
-        int64_t     progress_every = 0;
         int         max_injections = 1;
         std::string progress_text  = "Now, reasoning progress is at ";
     };
 
     server_token_hack(llama_context * ctx, config cfg);
+    ~server_token_hack();
 
     void reset();
     llama_tokens after_block(const llama_tokens & confirmed_block);
 
 private:
+    struct impl;
+
     config cfg;
+    std::unique_ptr<impl> pimpl;
     llama_tokens progress_tokens;
     int64_t n_confirmed = 0;
-    int64_t next_progress_at = -1;
     int n_injected = 0;
 };
 

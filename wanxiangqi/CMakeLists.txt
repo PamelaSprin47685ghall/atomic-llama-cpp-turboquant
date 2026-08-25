@@ -4,21 +4,119 @@
 # tree with only minimal integration hooks.
 
 if (LLAMA_BUILD_TOOLS)
-    if (NOT TARGET llama-perplexity)
-        add_subdirectory(${PROJECT_SOURCE_DIR}/tools/perplexity ${CMAKE_CURRENT_BINARY_DIR}/perplexity)
-    endif()
+include(FetchContent)
+include(GNUInstallDirs)
 
-    add_subdirectory(qwen35-prune)
+set(CPP_TIKTOKEN_INSTALL OFF CACHE BOOL "" FORCE)
+set(CPP_TIKTOKEN_TESTING OFF CACHE BOOL "" FORCE)
+set(PCRE2_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(PCRE2_BUILD_PCRE2GREP OFF CACHE BOOL "" FORCE)
+if (DEFINED CMAKE_POLICY_VERSION_MINIMUM)
+    set(WANXIANGQI_PARENT_CMAKE_POLICY_VERSION_MINIMUM_DEFINED TRUE)
+    set(WANXIANGQI_PARENT_CMAKE_POLICY_VERSION_MINIMUM "${CMAKE_POLICY_VERSION_MINIMUM}")
+endif()
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+set(WANXIANGQI_PARENT_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(wanxiangqi_cpp_tiktoken
+    GIT_REPOSITORY https://github.com/gh-markt/cpp-tiktoken.git
+    GIT_TAG 9323db528d52e48900c75ce197c3251085b18480
+    GIT_SHALLOW FALSE
+    GIT_SUBMODULES_RECURSE TRUE)
+FetchContent_MakeAvailable(wanxiangqi_cpp_tiktoken)
+set(BUILD_SHARED_LIBS ${WANXIANGQI_PARENT_BUILD_SHARED_LIBS} CACHE BOOL "" FORCE)
+if (WANXIANGQI_PARENT_CMAKE_POLICY_VERSION_MINIMUM_DEFINED)
+    set(CMAKE_POLICY_VERSION_MINIMUM "${WANXIANGQI_PARENT_CMAKE_POLICY_VERSION_MINIMUM}")
+else()
+    unset(CMAKE_POLICY_VERSION_MINIMUM)
+endif()
 
-    if (TARGET server-context)
-        target_sources(server-context PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/server/server-corpus-dump.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/server/server-corpus-dump.h
-            ${CMAKE_CURRENT_SOURCE_DIR}/server/integration.cpp
-            ${CMAKE_CURRENT_SOURCE_DIR}/server/integration.h)
-        target_include_directories(server-context PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/server)
-    endif()
+add_library(wanxiangqi-o200k STATIC
+    common/o200k-codec.cpp
+    common/o200k-codec.h)
+target_compile_features(wanxiangqi-o200k PRIVATE cxx_std_20)
+target_link_libraries(wanxiangqi-o200k PRIVATE tiktoken)
+target_include_directories(wanxiangqi-o200k PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/common)
+
+file(MAKE_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/tokenizers")
+configure_file(
+    "${wanxiangqi_cpp_tiktoken_SOURCE_DIR}/o200k_base.tiktoken"
+    "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/tokenizers/o200k_base.tiktoken"
+    COPYONLY)
+
+find_package(Git REQUIRED)
+execute_process(
+    COMMAND ${GIT_EXECUTABLE} -C "${PROJECT_SOURCE_DIR}" ls-files --cached
+    OUTPUT_VARIABLE WANXIANGQI_REPETITION_CORPUS
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE WANXIANGQI_REPETITION_GIT_RESULT)
+if (NOT WANXIANGQI_REPETITION_GIT_RESULT EQUAL 0)
+    message(FATAL_ERROR "failed to enumerate repository corpus")
+endif()
+
+set(WANXIANGQI_REPETITION_MANIFEST "${CMAKE_CURRENT_BINARY_DIR}/repetition-corpus.txt")
+file(WRITE "${WANXIANGQI_REPETITION_MANIFEST}" "${WANXIANGQI_REPETITION_CORPUS}\n")
+
+string(REPLACE "\n" ";" WANXIANGQI_REPETITION_CORPUS_FILES "${WANXIANGQI_REPETITION_CORPUS}")
+list(TRANSFORM WANXIANGQI_REPETITION_CORPUS_FILES PREPEND "${PROJECT_SOURCE_DIR}/")
+
+add_executable(wanxiangqi-repetition-envelope-tool EXCLUDE_FROM_ALL
+    common/derive-repetition-envelope.cpp
+    common/repetition-corpus.cpp
+    common/repetition-corpus.h)
+target_compile_features(wanxiangqi-repetition-envelope-tool PRIVATE cxx_std_17)
+target_link_libraries(wanxiangqi-repetition-envelope-tool PRIVATE wanxiangqi-o200k)
+
+set(WANXIANGQI_REPETITION_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(WANXIANGQI_REPETITION_ENVELOPE "${WANXIANGQI_REPETITION_GENERATED_DIR}/repetition-envelope.h")
+
+add_custom_command(
+    OUTPUT "${WANXIANGQI_REPETITION_ENVELOPE}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${WANXIANGQI_REPETITION_GENERATED_DIR}"
+    COMMAND $<TARGET_FILE:wanxiangqi-repetition-envelope-tool>
+        "${PROJECT_SOURCE_DIR}"
+        "${WANXIANGQI_REPETITION_MANIFEST}"
+        "${WANXIANGQI_REPETITION_ENVELOPE}"
+    DEPENDS
+        wanxiangqi-repetition-envelope-tool
+        "${WANXIANGQI_REPETITION_MANIFEST}"
+        ${WANXIANGQI_REPETITION_CORPUS_FILES}
+    VERBATIM)
+
+add_custom_target(wanxiangqi-repetition-envelope
+    DEPENDS "${WANXIANGQI_REPETITION_ENVELOPE}")
+
+add_library(wanxiangqi-repetition-guard STATIC
+    common/repetition-guard.cpp
+    common/repetition-guard.h
+    "${WANXIANGQI_REPETITION_ENVELOPE}")
+add_dependencies(wanxiangqi-repetition-guard wanxiangqi-repetition-envelope)
+target_compile_features(wanxiangqi-repetition-guard PRIVATE cxx_std_17)
+target_link_libraries(wanxiangqi-repetition-guard PRIVATE wanxiangqi-o200k)
+target_include_directories(wanxiangqi-repetition-guard PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/common
+    "${WANXIANGQI_REPETITION_GENERATED_DIR}")
+
+if (NOT TARGET llama-perplexity)
+    add_subdirectory(${PROJECT_SOURCE_DIR}/tools/perplexity ${CMAKE_CURRENT_BINARY_DIR}/perplexity)
+endif()
+
+add_subdirectory(qwen35-prune)
+
+if (TARGET server-context)
+    target_sources(server-context PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/server/server-corpus-dump.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/server/server-corpus-dump.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/server/integration.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/server/integration.h)
+    target_include_directories(server-context PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/server
+        ${CMAKE_CURRENT_SOURCE_DIR}/common)
+    target_link_libraries(server-context PRIVATE wanxiangqi-repetition-guard)
+endif()
+
+install(FILES "${wanxiangqi_cpp_tiktoken_SOURCE_DIR}/o200k_base.tiktoken"
+    DESTINATION "${CMAKE_INSTALL_BINDIR}/tokenizers")
 endif()
 
 if (LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION AND TARGET server-context)
@@ -27,4 +125,11 @@ if (LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION AND TARGET server-context)
         ${PROJECT_SOURCE_DIR}/tools/server
         ${CMAKE_CURRENT_SOURCE_DIR}/server)
     target_link_libraries(test-server-corpus-dump PRIVATE server-context)
+
+    llama_build_and_test(${CMAKE_CURRENT_SOURCE_DIR}/tests/test-repetition-guard.cpp)
+    target_sources(test-repetition-guard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common/repetition-corpus.cpp)
+    target_include_directories(test-repetition-guard PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/common
+        "${WANXIANGQI_REPETITION_GENERATED_DIR}")
+    target_link_libraries(test-repetition-guard PRIVATE wanxiangqi-repetition-guard)
 endif()

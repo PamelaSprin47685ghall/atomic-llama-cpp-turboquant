@@ -1,5 +1,6 @@
 #include "server-context.h"
 #include "../../wanxiangqi/server/integration.h"
+#include "repetition-guard.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -24,7 +25,6 @@
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
-#include <limits>
 #include <memory>
 #include <filesystem>
 #include <utility>
@@ -44,35 +44,52 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+struct server_token_hack::impl {
+    llama_context * ctx;
+    wanxiangqi_repetition_guard repetition_guard;
+
+    explicit impl(llama_context * ctx)
+        : ctx(ctx) {
+    }
+};
+
 server_token_hack::server_token_hack(llama_context * ctx, config cfg)
-    : cfg(std::move(cfg)) {
+    : cfg(std::move(cfg)), pimpl(std::make_unique<impl>(ctx)) {
     progress_tokens = common_tokenize(ctx, this->cfg.progress_text, false, false);
     reset();
 }
 
+server_token_hack::~server_token_hack() = default;
+
 void server_token_hack::reset() {
     n_confirmed = 0;
-    next_progress_at = cfg.progress_at;
     n_injected = 0;
+    pimpl->repetition_guard.reset();
 }
 
 llama_tokens server_token_hack::after_block(const llama_tokens & confirmed_block) {
     n_confirmed += (int64_t) confirmed_block.size();
 
-    if (confirmed_block.empty() || progress_tokens.empty() || cfg.progress_at < 0 ||
-            n_injected >= cfg.max_injections || n_confirmed < next_progress_at) {
+    if (confirmed_block.empty() || progress_tokens.empty() || n_injected >= cfg.max_injections) {
+        return {};
+    }
+
+    std::string confirmed_text;
+    for (llama_token token : confirmed_block) {
+        confirmed_text += common_token_to_piece(pimpl->ctx, token, true);
+    }
+
+    const auto anomaly = pimpl->repetition_guard.observe(confirmed_text);
+    if (anomaly == wanxiangqi_repetition_state::normal) {
         return {};
     }
 
     ++n_injected;
-    if (cfg.progress_every > 0 && next_progress_at <= std::numeric_limits<int64_t>::max() - cfg.progress_every) {
-        next_progress_at += cfg.progress_every;
-    } else {
-        next_progress_at = std::numeric_limits<int64_t>::max();
-    }
+    pimpl->repetition_guard.reset();
 
-    SRV_INF("token hack progress injection: block=%zu confirmed=%" PRId64 " injection=%d/%d text='%s'\n",
-            confirmed_block.size(), n_confirmed, n_injected, cfg.max_injections, cfg.progress_text.c_str());
+    SRV_INF("token hack anomaly injection: anomaly=%s block=%zu confirmed=%" PRId64 " injection=%d/%d text='%s'\n",
+            wanxiangqi_repetition_state_name(anomaly), confirmed_block.size(), n_confirmed,
+            n_injected, cfg.max_injections, cfg.progress_text.c_str());
 
     return progress_tokens;
 }

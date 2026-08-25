@@ -202,8 +202,6 @@ int llama_server(common_params & params, int argc, char ** argv) {
     const int64_t progress_at = token_hack_env_i64("LLAMA_TOKEN_HACK_PROGRESS_AT", -1);
     if (!is_router_server && progress_at >= 0) {
         server_token_hack::config hack_cfg;
-        hack_cfg.progress_at = progress_at;
-        hack_cfg.progress_every = token_hack_env_i64("LLAMA_TOKEN_HACK_PROGRESS_EVERY", 0);
         hack_cfg.max_injections = (int) std::max<int64_t>(1, token_hack_env_i64("LLAMA_TOKEN_HACK_PROGRESS_MAX", 1));
 
         const char * progress_text = std::getenv("LLAMA_TOKEN_HACK_PROGRESS_TEXT");
@@ -211,8 +209,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
             hack_cfg.progress_text = progress_text;
         }
 
-        SRV_INF("enabling token hack: at=%" PRId64 ", every=%" PRId64 ", max=%d, text='%s'\n",
-                hack_cfg.progress_at, hack_cfg.progress_every, hack_cfg.max_injections, hack_cfg.progress_text.c_str());
+        SRV_INF("enabling token hack: anomaly=o200k, max=%d, text='%s'\n",
+                hack_cfg.max_injections, hack_cfg.progress_text.c_str());
 
         ctx_server.set_token_hack_factory([hack_cfg](llama_context * ctx) {
             return std::make_unique<server_token_hack>(ctx, hack_cfg);
