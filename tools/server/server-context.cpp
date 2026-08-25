@@ -95,18 +95,19 @@ llama_tokens server_token_hack::after_block(const llama_tokens & confirmed_block
 }
 
 static uint32_t server_n_outputs_max(const common_params & params) {
-    const uint32_t n_batch  = params.n_batch;
+    const uint32_t n_batch = params.n_batch;
+    const uint32_t n_seq_max = std::max(1, params.n_parallel);
 
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
-        return n_batch;
+        return std::max(n_batch, n_seq_max);
     }
 
     const uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
+    const uint64_t n_outputs = (uint64_t) n_seq_max * n_outputs_per_seq;
 
-    const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
-
-    return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
+    // llama_context::output_reserve() always keeps at least one output row per sequence.
+    return std::max<uint32_t>(n_seq_max, std::min<uint64_t>(n_batch, n_outputs));
 }
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
