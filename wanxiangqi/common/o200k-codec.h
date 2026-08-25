@@ -17,6 +17,7 @@ public:
     wanxiangqi_o200k_codec & operator=(const wanxiangqi_o200k_codec &) = delete;
 
     std::vector<int> encode(const std::string & text) const;
+    std::vector<int> encode_parallel(const std::string & text, std::size_t worker_count = 0) const;
     std::size_t vocabulary_size() const;
 
 private:

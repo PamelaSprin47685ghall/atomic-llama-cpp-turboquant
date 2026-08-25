@@ -13,6 +13,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -152,8 +153,12 @@ int main(int argc, char ** argv) {
             corpus_bytes += text.size();
         }
 
+        const unsigned int hardware_workers = std::thread::hardware_concurrency();
+        const std::size_t worker_count = hardware_workers == 0 ? 1 : hardware_workers;
+
         std::cerr << "o200k repetition corpus: files=" << source_files
-                  << " bytes=" << corpus_bytes << "\n";
+                  << " bytes=" << corpus_bytes
+                  << " workers=" << worker_count << "\n";
 
         std::string corpus;
         corpus.reserve(corpus_bytes);
@@ -164,7 +169,7 @@ int main(int argc, char ** argv) {
             corpus += texts[i];
         }
 
-        const std::vector<int> tokens = codec.encode(corpus);
+        const std::vector<int> tokens = codec.encode_parallel(corpus, worker_count);
         const affine_replay replay = replay_affine(tokens, lambda);
         const double normal_prior = solve_normal_prior(replay);
         const envelope_stats envelope = evaluate_envelope(replay.offsets, lambda, normal_prior);
