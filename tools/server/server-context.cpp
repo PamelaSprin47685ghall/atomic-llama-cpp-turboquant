@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "../../wanxiangqi/server/integration.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -906,6 +907,12 @@ public:
     server_queue    queue_tasks;
     server_response queue_results;
 
+    void dump_request_tokens(
+            const std::vector<llama_token> & tokens,
+            server_token_dump_kind kind) const {
+        request_token_dump.append(tokens, kind);
+    }
+
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
 
@@ -963,6 +970,8 @@ private:
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
+
+    wanxiangqi_server_token_dump request_token_dump;
 
     server_metrics metrics;
 
@@ -1054,6 +1063,10 @@ private:
 
         params_base = params;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
+
+        if (!request_token_dump.init(params_base, is_resume)) {
+            return false;
+        }
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -4273,6 +4286,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 }
             }
 
+            ctx_server.dump_request_tokens(
+                task.tokens.get_text_tokens(),
+                type == SERVER_TASK_TYPE_INFILL
+                    ? server_token_dump_kind::infill
+                    : server_token_dump_kind::completion);
+
             tasks.push_back(std::move(task));
         }
 
@@ -5126,6 +5145,7 @@ void server_routes::init_routes() {
                 auto tmp = format_prompt_rerank(ctx_server.model_tgt, ctx_server.vocab, ctx_server.mctx, query, documents[i]);
                 server_task task = server_task(SERVER_TASK_TYPE_RERANK);
                 task.id     = rd.get_new_id();
+                ctx_server.dump_request_tokens(tmp.get_text_tokens(), server_token_dump_kind::rerank);
                 task.tokens = std::move(tmp);
                 tasks.push_back(std::move(task));
             }
@@ -5408,6 +5428,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
             server_task task = server_task(SERVER_TASK_TYPE_EMBEDDING);
 
             task.id     = rd.get_new_id();
+            ctx_server.dump_request_tokens(
+                tokenized_prompts[i].get_text_tokens(),
+                server_token_dump_kind::embedding);
             task.tokens = std::move(tokenized_prompts[i]);
 
             // OAI-compat

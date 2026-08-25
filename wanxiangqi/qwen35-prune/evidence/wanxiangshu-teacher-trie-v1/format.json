@@ -1,0 +1,9 @@
+{
+  "format": "cachyllama-request-token-trie",
+  "version": 1,
+  "endianness": "little",
+  "root_node_id": 0,
+  "token_type": "int32",
+  "node_record": ["parent_id:u64", "token_id:i32", "reserved:u32"],
+  "request_record": ["leaf_id:u64", "n_tokens:u32", "kind:u32", "timestamp_ms:u64"]
+}

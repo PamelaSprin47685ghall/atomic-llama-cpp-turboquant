@@ -1,5 +1,7 @@
 #include "arg.h"
 
+#include "../wanxiangqi/common/arg-options.h"
+
 #include "build-info.h"
 #include "chat.h"
 #include "common.h"
@@ -4616,6 +4618,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             //params.speculative.ngram_map_k4v.min_hits = 2;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    for (auto & arg : wanxiangqi_common_args(params)) {
+        add_opt(std::move(arg));
+    }
 
     return ctx_arg;
 }

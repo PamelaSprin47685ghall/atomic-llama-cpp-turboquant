@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include "../wanxiangqi/common/params.h"
+
 #include "llama-cpp.h"
 
 #include "ggml-opt.h"
@@ -445,7 +447,7 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
-struct common_params {
+struct common_params : wanxiangqi_common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)

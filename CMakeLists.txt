@@ -229,6 +229,10 @@ if (LLAMA_BUILD_COMMON AND LLAMA_BUILD_TOOLS)
     add_subdirectory(tools)
 endif()
 
+if (LLAMA_BUILD_COMMON)
+    add_subdirectory(wanxiangqi)
+endif()
+
 if (LLAMA_BUILD_APP)
     add_subdirectory(app)
 endif()
