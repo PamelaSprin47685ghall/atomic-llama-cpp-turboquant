@@ -13,7 +13,9 @@
 #include "log.h"
 
 #include <atomic>
+#include <cinttypes>
 #include <clocale>
+#include <cstdlib>
 #include <exception>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
@@ -24,6 +26,17 @@
 
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
+
+static int64_t token_hack_env_i64(const char * name, int64_t fallback) {
+    const char * value = std::getenv(name);
+    if (!value || !*value) {
+        return fallback;
+    }
+
+    char * end = nullptr;
+    const long long parsed = std::strtoll(value, &end, 10);
+    return end != value ? (int64_t) parsed : fallback;
+}
 
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
@@ -185,6 +198,26 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     // struct that contains llama context and inference
     server_context ctx_server;
+
+    const int64_t progress_at = token_hack_env_i64("LLAMA_TOKEN_HACK_PROGRESS_AT", -1);
+    if (!is_router_server && progress_at >= 0) {
+        server_token_hack::config hack_cfg;
+        hack_cfg.progress_at = progress_at;
+        hack_cfg.progress_every = token_hack_env_i64("LLAMA_TOKEN_HACK_PROGRESS_EVERY", 0);
+        hack_cfg.max_injections = (int) std::max<int64_t>(1, token_hack_env_i64("LLAMA_TOKEN_HACK_PROGRESS_MAX", 1));
+
+        const char * progress_text = std::getenv("LLAMA_TOKEN_HACK_PROGRESS_TEXT");
+        if (progress_text && *progress_text) {
+            hack_cfg.progress_text = progress_text;
+        }
+
+        SRV_INF("enabling token hack: at=%" PRId64 ", every=%" PRId64 ", max=%d, text='%s'\n",
+                hack_cfg.progress_at, hack_cfg.progress_every, hack_cfg.max_injections, hack_cfg.progress_text.c_str());
+
+        ctx_server.set_token_hack_factory([hack_cfg](llama_context * ctx) {
+            return std::make_unique<server_token_hack>(ctx, hack_cfg);
+        });
+    }
 
     server_http_context ctx_http;
     if (!ctx_http.init(params)) {

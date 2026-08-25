@@ -7,6 +7,7 @@
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <set>
 
@@ -80,6 +81,30 @@ static server_state server_state_from_str(const std::string & str) {
 
 using server_state_callback_t = std::function<void(server_state, json /* payload */)>;
 
+class server_token_hack {
+public:
+    struct config {
+        int64_t     progress_at    = -1;
+        int64_t     progress_every = 0;
+        int         max_injections = 1;
+        std::string progress_text  = "Now, reasoning progress is at ";
+    };
+
+    server_token_hack(llama_context * ctx, config cfg);
+
+    void reset();
+    llama_tokens after_block(const llama_tokens & confirmed_block);
+
+private:
+    config cfg;
+    llama_tokens progress_tokens;
+    int64_t n_confirmed = 0;
+    int64_t next_progress_at = -1;
+    int n_injected = 0;
+};
+
+using server_token_hack_factory_t = std::function<std::unique_ptr<server_token_hack>(llama_context * ctx)>;
+
 struct server_context {
     std::unique_ptr<server_context_impl> impl;
 
@@ -109,6 +134,10 @@ struct server_context {
 
     // note: must be set before load_model() is called
     void set_state_callback(server_state_callback_t callback);
+
+    // Install one stateful append-only generation hook per slot.
+    // Must be set before load_model() is called.
+    void set_token_hack_factory(server_token_hack_factory_t factory);
 };
 
 

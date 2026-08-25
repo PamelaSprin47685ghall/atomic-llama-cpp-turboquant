@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <filesystem>
 #include <utility>
@@ -42,6 +43,39 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+server_token_hack::server_token_hack(llama_context * ctx, config cfg)
+    : cfg(std::move(cfg)) {
+    progress_tokens = common_tokenize(ctx, this->cfg.progress_text, false, false);
+    reset();
+}
+
+void server_token_hack::reset() {
+    n_confirmed = 0;
+    next_progress_at = cfg.progress_at;
+    n_injected = 0;
+}
+
+llama_tokens server_token_hack::after_block(const llama_tokens & confirmed_block) {
+    n_confirmed += (int64_t) confirmed_block.size();
+
+    if (confirmed_block.empty() || progress_tokens.empty() || cfg.progress_at < 0 ||
+            n_injected >= cfg.max_injections || n_confirmed < next_progress_at) {
+        return {};
+    }
+
+    ++n_injected;
+    if (cfg.progress_every > 0 && next_progress_at <= std::numeric_limits<int64_t>::max() - cfg.progress_every) {
+        next_progress_at += cfg.progress_every;
+    } else {
+        next_progress_at = std::numeric_limits<int64_t>::max();
+    }
+
+    SRV_INF("token hack progress injection: block=%zu confirmed=%" PRId64 " injection=%d/%d text='%s'\n",
+            confirmed_block.size(), n_confirmed, n_injected, cfg.max_injections, cfg.progress_text.c_str());
+
+    return progress_tokens;
+}
 
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
@@ -308,6 +342,10 @@ struct server_slot {
 
     common_sampler_ptr smpl;
 
+    std::unique_ptr<server_token_hack> token_hack;
+    llama_token token_append_anchor = LLAMA_TOKEN_NULL;
+    llama_tokens token_append_chunk;
+
     llama_token sampled; // in speculative mode, this is the last accepted token
 
     // for TTS models, this is the embd generated from prev step, decode this to generate next hidden state
@@ -349,13 +387,18 @@ struct server_slot {
         stopping_word  = "";
         n_sent_text    = 0;
 
-        if (can_speculate()) {
+        if (spec) {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
         generated_tokens.clear();
         generated_token_probs.clear();
+        token_append_anchor = LLAMA_TOKEN_NULL;
+        token_append_chunk.clear();
+        if (token_hack) {
+            token_hack->reset();
+        }
         json_schema = json();
 
         // clear speculative decoding stats
@@ -452,7 +495,7 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        return !!spec && token_append_chunk.empty();
     }
 
     void add_token(const completion_token_output & token) {
@@ -488,7 +531,29 @@ struct server_slot {
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
     void handle_last_sampled_token(server_batch & batch) {
         bool add_ok = true;
-        if (spec_draft.empty()) {
+        bool handled_append_chunk = false;
+        if (!token_append_chunk.empty()) {
+            GGML_ASSERT(spec_draft.empty());
+            GGML_ASSERT(token_append_anchor != LLAMA_TOKEN_NULL);
+            GGML_ASSERT((int32_t) token_append_chunk.size() + 1 <= batch.n_tokens_alloc - batch.size());
+            handled_append_chunk = true;
+
+            auto pos0 = prompt.tokens.pos_next();
+            const int32_t batch0 = batch.size();
+
+            add_ok &= batch.add(id, token_append_anchor, pos0++, false);
+            for (size_t i = 0; i < token_append_chunk.size(); ++i) {
+                add_ok &= batch.add(id, token_append_chunk[i], pos0++, i + 1 == token_append_chunk.size());
+            }
+
+            i_batch = batch0 + (int32_t) token_append_chunk.size();
+
+            prompt.tokens.push_back(token_append_anchor);
+            prompt.tokens.insert(token_append_chunk);
+            sampled = token_append_chunk.back();
+            token_append_anchor = LLAMA_TOKEN_NULL;
+            token_append_chunk.clear();
+        } else if (spec_draft.empty()) {
             // no speculative decoding
             i_batch = batch.size();
 
@@ -521,8 +586,10 @@ struct server_slot {
 
         GGML_ASSERT(add_ok && "batch must be large enough to hold the sampled and draft tokens");
 
-        prompt.tokens.push_back(sampled);
-        prompt.tokens.insert(spec_draft);
+        if (!handled_append_chunk) {
+            prompt.tokens.push_back(sampled);
+            prompt.tokens.insert(spec_draft);
+        }
     }
 
     void release() {
@@ -917,6 +984,7 @@ public:
     server_chat_params chat_params;
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
+    server_token_hack_factory_t token_hack_factory;
 
     server_context_impl() {
         mtmd_helper_log_set(common_log_default_callback, nullptr);
@@ -1366,6 +1434,9 @@ private:
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft;
             slot.mem.init(ctx_tgt, ctx_dft);
+            if (token_hack_factory) {
+                slot.token_hack = token_hack_factory(ctx_tgt);
+            }
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
 
@@ -3085,6 +3156,10 @@ private:
             if (spec) {
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
 
+                if (!slot.token_append_chunk.empty()) {
+                    return;
+                }
+
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
@@ -3863,6 +3938,43 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        auto accept_hack_block = [&](server_slot & slot, const llama_tokens & confirmed_block) {
+            if (!slot.token_hack || confirmed_block.empty()) {
+                return true;
+            }
+
+            llama_tokens appended = slot.token_hack->after_block(confirmed_block);
+            if (appended.empty()) {
+                return true;
+            }
+
+            slot.spec_draft.clear();
+            slot.spec_i_batch.clear();
+            slot.token_append_anchor = confirmed_block.back();
+            slot.token_append_chunk = std::move(appended);
+
+            for (llama_token token : slot.token_append_chunk) {
+                common_sampler_accept(slot.smpl.get(), token, true);
+
+                completion_token_output forced;
+                forced.tok          = token;
+                forced.text_to_send = common_token_to_piece(slot.ctx_tgt, token, accept_special_token(slot, token));
+                forced.prob         = 1.0f;
+
+                slot.n_decoded += 1;
+                if (!process_token(forced, slot)) {
+                    slot.print_timings();
+                    send_final_response(slot);
+                    metrics.on_prediction(slot);
+                    slot.release();
+                    return false;
+                }
+            }
+
+            slot.sampled = slot.token_append_anchor;
+            return true;
+        };
+
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
@@ -3952,6 +4064,10 @@ private:
                 metrics.on_prediction(slot);
                 slot.release();
 
+                return;
+            }
+
+            if (!accept_hack_block(slot, llama_tokens { id })) {
                 return;
             }
 
@@ -4078,6 +4194,10 @@ private:
                 }
             }
 
+            if (!accept_hack_block(slot, llama_tokens(ids.begin(), ids.end()))) {
+                return;
+            }
+
             slot.print_timings_tg();
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
@@ -4188,6 +4308,11 @@ struct server_res_generator : server_res_spipe {
         data = safe_json_to_str({{ "error", error_data }});
     }
 };
+
+void server_context::set_token_hack_factory(server_token_hack_factory_t factory) {
+    GGML_ASSERT(impl->ctx_tgt == nullptr && "token hack factory must be set before load_model");
+    impl->token_hack_factory = std::move(factory);
+}
 
 void server_context::set_state_callback(server_state_callback_t callback) {
     impl->callback_state = std::move(callback);
