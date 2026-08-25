@@ -2294,8 +2294,12 @@ common_params common_base_params_to_speculative(const common_params & params) {
         }
     }
 
-    result.cache_type_k  = params_spec.cache_type_k;
-    result.cache_type_v  = params_spec.cache_type_v;
+    if (params_spec.cache_type_k != GGML_TYPE_F16) {
+        result.cache_type_k = params_spec.cache_type_k;
+    }
+    if (params_spec.cache_type_v != GGML_TYPE_F16) {
+        result.cache_type_v = params_spec.cache_type_v;
+    }
     result.n_outputs_max = params.n_parallel;
 
     return result;
@@ -2326,8 +2330,12 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        const uint32_t n_draft_batch = std::max(16u, (uint32_t) params.speculative.draft.n_max);
+        cparams.n_batch  = std::min(cparams.n_batch,  n_draft_batch);
+        cparams.n_ubatch = std::min(cparams.n_ubatch, n_draft_batch);
+        cparams.type_k   = params.cache_type_k;
+        cparams.type_v   = params.cache_type_v;
     }
-
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;

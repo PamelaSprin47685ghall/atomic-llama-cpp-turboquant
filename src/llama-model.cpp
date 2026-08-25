@@ -2346,8 +2346,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             filter = [&](uint32_t il) { return il <  hparams.n_layer(); };
                         }
                     }
-
-                    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE && !mtp_on_hybrid_qwen) {
                         GGML_ASSERT(hparams.is_swa_any());
 
                         if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -2398,8 +2397,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     share);
                         }
                     } else {
-                        GGML_ASSERT(!hparams.is_swa_any());
-
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
@@ -2411,8 +2408,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 cparams.n_ctx_seq,
                                 cparams.n_seq_max,
                                 1,
-                                hparams.n_swa,
-                                hparams.swa_type,
+                                0,
+                                LLAMA_SWA_TYPE_NONE,
                                 nullptr,
                                 filter,
                                 nullptr,
