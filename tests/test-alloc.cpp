@@ -583,6 +583,54 @@ static void test_reallocation() {
     }
 }
 
+static void test_shared_buffer_pool_union() {
+    dummy_backend backend = dummy_backend_init(32, /*align*/ 4);
+    ggml_gallocr_buffer_pool_ptr pool(ggml_gallocr_buffer_pool_new());
+
+    auto [ctx_a, graph_a, ctx_a_ptr] = make_context();
+    ggml_tensor * a[4];
+    a[0] = make_input_with_size(ctx_a, 24);
+    a[1] = make_input_with_size(ctx_a, 16);
+    a[2] = ggml_view_1d(ctx_a, a[0], 4, 0);
+    a[3] = ggml_add(ctx_a, a[2], a[1]);
+    assign_names(ctx_a, "a");
+    ggml_set_output(a[3]);
+    ggml_build_forward_expand(graph_a, a[3]);
+
+    ggml_backend_buffer_type_t buft = &backend.buffer_type;
+    ggml_gallocr_ptr galloc_a(ggml_gallocr_new_n_shared(&buft, 1, pool.get()));
+    GGML_ASSERT(ggml_gallocr_reserve(galloc_a.get(), graph_a));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc_a.get(), graph_a));
+    check_all_allocated(graph_a);
+    GGML_ASSERT(backend.context->allocated_total() == 40);
+    const uint64_t generation_a = ggml_gallocr_buffer_pool_get_generation(pool.get());
+
+    auto [ctx_b, graph_b, ctx_b_ptr] = make_context();
+    ggml_tensor * b[3];
+    b[0] = make_input_with_size(ctx_b, 20);
+    b[1] = make_input_with_size(ctx_b, 20);
+    b[2] = ggml_add(ctx_b, b[0], b[1]);
+    assign_names(ctx_b, "b");
+    ggml_set_output(b[2]);
+    ggml_build_forward_expand(graph_b, b[2]);
+
+    ggml_gallocr_ptr galloc_b(ggml_gallocr_new_n_shared(&buft, 1, pool.get()));
+    GGML_ASSERT(ggml_gallocr_reserve(galloc_b.get(), graph_b));
+    GGML_ASSERT(backend.context->allocated_total() == 44);
+    GGML_ASSERT(ggml_gallocr_buffer_pool_get_generation(pool.get()) > generation_a);
+    GGML_ASSERT(a[1]->buffer == nullptr);
+    GGML_ASSERT(a[1]->data == nullptr);
+
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc_b.get(), graph_b));
+    check_all_allocated(graph_b);
+    GGML_ASSERT(backend.context->allocated_total() == 44);
+
+    GGML_ASSERT(ggml_gallocr_alloc_graph(galloc_a.get(), graph_a));
+    check_all_allocated(graph_a);
+    check_no_overlap(graph_a);
+    GGML_ASSERT(backend.context->allocated_total() == 44);
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -604,5 +652,6 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_shared_buffer_pool_union", test_shared_buffer_pool_union);
     return 0;
 }

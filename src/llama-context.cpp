@@ -145,6 +145,13 @@ llama_context::llama_context(
 
     cparams.ctx_other = nullptr;
 
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.ctx_other != nullptr) {
+        compute_pool.reset(ggml_backend_sched_compute_pool_ref(params.ctx_other->get_compute_pool()));
+        LLAMA_LOG_INFO("%s: sharing compute buffers with ctx_other\n", __func__);
+    } else {
+        compute_pool.reset(ggml_backend_sched_compute_pool_new());
+    }
+
     // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
         if (params.ctx_other == nullptr) {
@@ -483,6 +490,10 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    if (sched) {
+        ggml_backend_sched_reset(sched.get());
+    }
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -490,16 +501,20 @@ llama_context::~llama_context() {
 
             const size_t size_exp = backend_buf_exp_size[i];
             const size_t size_act = ggml_backend_sched_get_buffer_size(sched.get(), backend);
-            if (size_exp == size_act) {
-                LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, matches expectation of %8.4f MiB\n",
+            if (size_act >= size_exp) {
+                LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, requirement is %8.4f MiB\n",
                     __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
             } else {
-                LLAMA_LOG_WARN("%s: %10s compute buffer size of %8.4f MiB, does not match expectation of %8.4f MiB\n",
+                LLAMA_LOG_WARN("%s: %10s compute buffer size of %8.4f MiB is below requirement of %8.4f MiB\n",
                     __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
             }
         }
     }
     ggml_opt_free(opt_ctx);
+
+    if (sched) {
+        ggml_backend_sched_reset(sched.get());
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -590,6 +605,10 @@ void llama_context::sched_reserve() {
 
     synchronize();
 
+    if (sched) {
+        ggml_backend_sched_reset(sched.get());
+    }
+
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs_pp = cparams.n_seq_max_pp;
@@ -603,7 +622,7 @@ void llama_context::sched_reserve() {
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    sched.reset(ggml_backend_sched_new_shared(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload, compute_pool.get()));
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -639,7 +658,7 @@ void llama_context::sched_reserve() {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
-                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                sched.reset(ggml_backend_sched_new_shared(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload, compute_pool.get()));
                 gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -763,6 +782,10 @@ ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
 }
 
+ggml_backend_sched_compute_pool_t llama_context::get_compute_pool() const {
+    return compute_pool.get();
+}
+
 uint32_t llama_context::n_ctx() const {
     return cparams.n_ctx;
 }
@@ -823,6 +846,7 @@ bool llama_context::memory_update(bool optimize) {
         // reset the previous graph result to make sure that it won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
+        ggml_backend_sched_reset(sched.get());
         gf_res_prev->reset();
 
         if (!mctx->apply()) {
@@ -1337,6 +1361,18 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+struct llama_compute_guard {
+    ggml_backend_sched_t sched;
+
+    explicit llama_compute_guard(ggml_backend_sched_t sched) : sched(sched) {
+        ggml_backend_sched_compute_begin(sched);
+    }
+
+    ~llama_compute_guard() {
+        ggml_backend_sched_compute_end(sched);
+    }
+};
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1351,7 +1387,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    if (!graph_reuse_disable && ggml_backend_sched_is_allocated(sched.get()) && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1475,6 +1511,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     cparams.causal_attn = false;
 
     ggml_status status;
+    llama_compute_guard compute_guard(sched.get());
     const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
 
     cparams.causal_attn = causal_attn_org;
@@ -1867,6 +1904,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     do {
         const auto & ubatch = mctx->get_ubatch();
+        llama_compute_guard compute_guard(sched.get());
 
         // count the outputs in this ubatch
         {

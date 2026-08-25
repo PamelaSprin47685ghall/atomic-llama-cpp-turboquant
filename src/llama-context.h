@@ -61,6 +61,7 @@ struct llama_context {
     const llama_cparams & get_cparams() const;
 
     ggml_backend_sched_t get_sched() const;
+    ggml_backend_sched_compute_pool_t get_compute_pool() const;
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
@@ -341,6 +342,7 @@ private:
 
     std::vector<swap_info> output_swaps;
 
+    ggml_backend_sched_compute_pool_ptr compute_pool;
     ggml_backend_sched_ptr sched;
 
     bool sched_need_reserve = true;

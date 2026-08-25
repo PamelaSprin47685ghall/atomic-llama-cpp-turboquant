@@ -303,6 +303,7 @@ extern "C" {
     */
 
     typedef struct ggml_backend_sched * ggml_backend_sched_t;
+    typedef struct ggml_backend_sched_compute_pool * ggml_backend_sched_compute_pool_t;
 
     // Evaluation callback for each node in the graph (set with ggml_backend_sched_set_eval_callback)
     // when ask == true, the scheduler wants to know if the user wants to observe this node
@@ -314,8 +315,15 @@ extern "C" {
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
 
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
+    GGML_API ggml_backend_sched_compute_pool_t ggml_backend_sched_compute_pool_new(void);
+    GGML_API ggml_backend_sched_compute_pool_t ggml_backend_sched_compute_pool_ref(ggml_backend_sched_compute_pool_t pool);
+    GGML_API void                              ggml_backend_sched_compute_pool_free(ggml_backend_sched_compute_pool_t pool);
+
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
+    GGML_API ggml_backend_sched_t ggml_backend_sched_new_shared(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload, ggml_backend_sched_compute_pool_t compute_pool);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
+    GGML_API void                 ggml_backend_sched_compute_begin(ggml_backend_sched_t sched);
+    GGML_API void                 ggml_backend_sched_compute_end(ggml_backend_sched_t sched);
 
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
@@ -327,6 +335,7 @@ extern "C" {
     // Get the number of splits of the last graph
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
+    GGML_API bool                 ggml_backend_sched_is_allocated(ggml_backend_sched_t sched);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
