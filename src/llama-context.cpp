@@ -96,9 +96,13 @@ llama_context::llama_context(
     const auto & hparams = model.hparams;
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
+    cparams.n_seq_max_pp = params.n_seq_max_pp == 0 ? cparams.n_seq_max : std::max(1u, params.n_seq_max_pp);
     cparams.n_outputs_max = params.n_outputs_max;
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
+    }
+    if (cparams.n_seq_max_pp > cparams.n_seq_max) {
+        throw std::runtime_error("n_seq_max_pp must be <= n_seq_max");
     }
 
     cparams.n_rs_seq = params.n_rs_seq;
@@ -588,7 +592,8 @@ void llama_context::sched_reserve() {
 
     const int64_t t_start_us = ggml_time_us();
 
-    const uint32_t n_seqs = cparams.n_seq_max;
+    const uint32_t n_seqs_pp = cparams.n_seq_max_pp;
+    const uint32_t n_seqs_tg = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
@@ -610,11 +615,12 @@ void llama_context::sched_reserve() {
     }
 
     // avoid reserving graphs with zero outputs - assume one output per sequence
-    const int n_outputs = n_seqs;
+    const int n_outputs = n_seqs_tg;
 
-    LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
+    LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs_pp = %d, n_seqs_tg = %d, n_outputs = %d\n",
+            __func__, n_tokens, n_seqs_pp, n_seqs_tg, n_outputs);
 
-    resolve_fused_ops(mctx.get(), n_seqs);
+    resolve_fused_ops(mctx.get(), n_seqs_tg);
 
     // reserve worst-case graph
     int n_splits_pp = -1;
@@ -627,14 +633,14 @@ void llama_context::sched_reserve() {
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
+        auto * gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+                gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get());
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
@@ -647,9 +653,21 @@ void llama_context::sched_reserve() {
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
     {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
+        std::vector<size_t> sizes_tg;
+        if (model.hparams.no_alloc) {
+            sizes_tg.resize(backend_buf_exp_size.size());
+        }
+
+        auto * gf = graph_reserve(n_seqs_tg, n_seqs_tg, n_seqs_tg, mctx.get(),
+                model.hparams.no_alloc, model.hparams.no_alloc ? sizes_tg.data() : nullptr);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
+        }
+
+        if (model.hparams.no_alloc) {
+            for (size_t i = 0; i < backend_buf_exp_size.size(); ++i) {
+                backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], sizes_tg[i]);
+            }
         }
 
         n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
@@ -662,7 +680,7 @@ void llama_context::sched_reserve() {
         //
         // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
         //
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
@@ -3491,6 +3509,7 @@ llama_context_params llama_context_default_params() {
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
+        /*.n_seq_max_pp                =*/ 0,
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
