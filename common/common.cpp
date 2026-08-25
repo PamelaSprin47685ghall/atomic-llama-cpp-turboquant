@@ -1245,12 +1245,26 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
+        const uint32_t n_ctx_min = (params.n_ctx_kv_auto || params.n_ctx_kv > 0)
+            ? UINT32_MAX
+            : params.fit_params_min_ctx;
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
-            params.fit_params_min_ctx,
+            n_ctx_min,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+    }
+
+    if (params.n_ctx_kv_auto) {
+        const auto status = common_fit_kv_cache(
+            params.model.path.c_str(), &mparams, &cparams, params.n_ctx_kv_reserve,
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+            COM_ERR("%s", "failed to size unified KV cache automatically\n");
+            return;
+        }
+        params.n_ctx_kv = cparams.n_ctx_kv;
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1653,6 +1667,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     auto cparams = llama_context_default_params();
 
     cparams.n_ctx             = params.n_ctx;
+    cparams.n_ctx_kv          = params.n_ctx_kv;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_seq_max_pp      = params.n_parallel_pp;
     cparams.n_outputs_max     = params.n_outputs_max;

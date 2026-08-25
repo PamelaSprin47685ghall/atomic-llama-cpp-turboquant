@@ -409,6 +409,8 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        uint32_t n_ctx_kv; // unified KV capacity, 0 = n_ctx; ignored when kv_unified is false
     };
 
     struct llama_model_tensor_override {
@@ -556,6 +558,7 @@ extern "C" {
     //       ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     LLAMA_API uint32_t llama_n_ctx      (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
+    LLAMA_API uint32_t llama_n_ctx_kv   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
@@ -790,6 +793,17 @@ extern "C" {
     LLAMA_API llama_pos llama_memory_seq_pos_max(
             llama_memory_t mem,
               llama_seq_id seq_id);
+
+    struct llama_memory_kv_usage {
+        uint32_t capacity;
+        uint32_t used;
+    };
+
+    // Returns false when the memory does not expose an attention KV cache.
+    LLAMA_API bool llama_memory_get_kv_usage(llama_memory_t mem, struct llama_memory_kv_usage * usage);
+
+    // Returns the number of KV cells occupied by the specified sequence.
+    LLAMA_API uint32_t llama_memory_seq_get_kv_used(llama_memory_t mem, llama_seq_id seq_id);
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
