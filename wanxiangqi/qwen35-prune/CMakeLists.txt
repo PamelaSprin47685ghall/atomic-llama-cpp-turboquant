@@ -134,6 +134,13 @@ if (OpenSSL_FOUND AND TARGET OpenSSL::Crypto)
     target_compile_definitions(${TARGET} PRIVATE QWEN35_PRUNE_USE_OPENSSL_SHA=1)
 endif()
 
+add_executable(convert-vocab36k-q4k convert-vocab36k-q4k.cpp)
+target_include_directories(convert-vocab36k-q4k PRIVATE ../../ggml/include ../../ggml/src)
+target_link_libraries(convert-vocab36k-q4k PRIVATE ggml-base ggml ${CMAKE_THREAD_LIBS_INIT})
+target_compile_options(convert-vocab36k-q4k PRIVATE -fopenmp)
+target_link_options(convert-vocab36k-q4k PRIVATE -fopenmp)
+target_compile_features(convert-vocab36k-q4k PRIVATE cxx_std_17)
+
 if (LLAMA_TOOLS_INSTALL)
     install(TARGETS llama-qwen35-imatrix ${TARGET} test-q2-opt-signed test-q2-opt-backend test-gdn-function-projection test-gdn-observable-risk test-gdn-adjoint test-gdn-geometry-plan test-gdn-joint-replay test-enp-geometric-coreset test-expert-replacement RUNTIME)
 endif()
