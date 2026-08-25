@@ -24,6 +24,10 @@ FetchContent_Declare(wanxiangqi_cpp_tiktoken
     GIT_SHALLOW FALSE
     GIT_SUBMODULES_RECURSE TRUE)
 FetchContent_MakeAvailable(wanxiangqi_cpp_tiktoken)
+set_target_properties(tiktoken PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if (TARGET pcre2-8-static)
+    set_target_properties(pcre2-8-static PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
 set(BUILD_SHARED_LIBS ${WANXIANGQI_PARENT_BUILD_SHARED_LIBS} CACHE BOOL "" FORCE)
 if (WANXIANGQI_PARENT_CMAKE_POLICY_VERSION_MINIMUM_DEFINED)
     set(CMAKE_POLICY_VERSION_MINIMUM "${WANXIANGQI_PARENT_CMAKE_POLICY_VERSION_MINIMUM}")
@@ -34,8 +38,10 @@ endif()
 add_library(wanxiangqi-o200k STATIC
     common/o200k-codec.cpp
     common/o200k-codec.h)
+set_target_properties(wanxiangqi-o200k PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(wanxiangqi-o200k PRIVATE cxx_std_20)
-target_link_libraries(wanxiangqi-o200k PRIVATE tiktoken)
+find_package(Threads REQUIRED)
+target_link_libraries(wanxiangqi-o200k PRIVATE tiktoken Threads::Threads)
 target_include_directories(wanxiangqi-o200k PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/common)
 
 file(MAKE_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/tokenizers")
@@ -120,6 +126,10 @@ install(FILES "${wanxiangqi_cpp_tiktoken_SOURCE_DIR}/o200k_base.tiktoken"
 endif()
 
 if (LLAMA_BUILD_TESTS AND NOT CMAKE_JS_VERSION AND TARGET server-context)
+    llama_build_and_test(${CMAKE_CURRENT_SOURCE_DIR}/tests/test-o200k-codec.cpp)
+    target_include_directories(test-o200k-codec PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/common)
+    target_link_libraries(test-o200k-codec PRIVATE wanxiangqi-o200k)
+
     llama_build_and_test(${CMAKE_CURRENT_SOURCE_DIR}/tests/test-server-corpus-dump.cpp)
     target_include_directories(test-server-corpus-dump PRIVATE
         ${PROJECT_SOURCE_DIR}/tools/server
