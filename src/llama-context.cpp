@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 
@@ -615,7 +616,13 @@ void llama_context::sched_reserve() {
     const uint32_t n_seqs_tg = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
-    const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    // The full reserve memory context exposes all TG KV streams, even when the PP graph
+    // itself is reserved for fewer sequences. Attention splits Q across those KV streams,
+    // so the synthetic PP token count must be divisible by both sequence counts.
+    const uint32_t n_pp_align = std::lcm(n_seqs_pp, n_seqs_tg);
+    const uint32_t n_tokens_pp = ((n_tokens + n_pp_align - 1) / n_pp_align) * n_pp_align;
+
+    const size_t max_nodes = this->graph_max_nodes(n_tokens_pp);
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -636,8 +643,8 @@ void llama_context::sched_reserve() {
     // avoid reserving graphs with zero outputs - assume one output per sequence
     const int n_outputs = n_seqs_tg;
 
-    LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs_pp = %d, n_seqs_tg = %d, n_outputs = %d\n",
-            __func__, n_tokens, n_seqs_pp, n_seqs_tg, n_outputs);
+    LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_tokens_pp = %d, n_seqs_pp = %d, n_seqs_tg = %d, n_outputs = %d\n",
+            __func__, n_tokens, n_tokens_pp, n_seqs_pp, n_seqs_tg, n_outputs);
 
     resolve_fused_ops(mctx.get(), n_seqs_tg);
 
@@ -652,14 +659,14 @@ void llama_context::sched_reserve() {
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
-        auto * gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get(),
+        auto * gf = graph_reserve(n_tokens_pp, n_seqs_pp, n_outputs_pp, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new_shared(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload, compute_pool.get()));
-                gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get());
+                gf = graph_reserve(n_tokens_pp, n_seqs_pp, n_outputs_pp, mctx.get());
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
@@ -699,7 +706,7 @@ void llama_context::sched_reserve() {
         //
         // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
         //
-        auto * gf = graph_reserve(n_tokens, n_seqs_pp, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_tokens_pp, n_seqs_pp, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
