@@ -119,6 +119,11 @@ enum slot_state {
     SLOT_STATE_GENERATING,
 };
 
+enum server_inference_mode {
+    SERVER_INFERENCE_MODE_DECODE,
+    SERVER_INFERENCE_MODE_PREFILL,
+};
+
 struct server_slot; // forward declaration
 
 struct server_batch {
@@ -1054,6 +1059,9 @@ private:
     int slots_debug = 0;
     int n_empty_consecutive = 0;
 
+    server_inference_mode inference_mode = SERVER_INFERENCE_MODE_DECODE;
+    int32_t id_slot_prefill = -1;
+
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     wanxiangqi_server_token_dump request_token_dump;
@@ -1147,7 +1155,10 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        params_base.n_parallel_pp = 1;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
+        inference_mode = SERVER_INFERENCE_MODE_DECODE;
+        id_slot_prefill = -1;
 
         if (!request_token_dump.init(params_base, is_resume)) {
             return false;
@@ -2971,6 +2982,44 @@ private:
     };
 #endif
 
+    bool is_prefill_slot(const server_slot & slot) const {
+        return slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT;
+    }
+
+    server_inference_mode select_inference_mode() {
+        if (id_slot_prefill >= 0 && id_slot_prefill < (int32_t) slots.size()) {
+            if (is_prefill_slot(slots[id_slot_prefill])) {
+                return SERVER_INFERENCE_MODE_PREFILL;
+            }
+        }
+
+        id_slot_prefill = -1;
+        for (auto & slot : slots) {
+            if (is_prefill_slot(slot)) {
+                id_slot_prefill = slot.id;
+                return SERVER_INFERENCE_MODE_PREFILL;
+            }
+        }
+
+        return SERVER_INFERENCE_MODE_DECODE;
+    }
+
+    void update_inference_mode() {
+        const auto new_mode = select_inference_mode();
+        if (new_mode == inference_mode) {
+            return;
+        }
+
+        llama_synchronize(ctx_tgt);
+        if (ctx_dft) {
+            llama_synchronize(ctx_dft);
+        }
+
+        inference_mode = new_mode;
+        SRV_DBG("inference mode = %s, prefill slot = %d\n",
+                inference_mode == SERVER_INFERENCE_MODE_PREFILL ? "prefill" : "decode", id_slot_prefill);
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -3008,6 +3057,8 @@ private:
                 queue_tasks.post(std::move(task));
             }
         }
+
+        update_inference_mode();
 
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
@@ -3085,6 +3136,10 @@ private:
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
+            if (inference_mode != SERVER_INFERENCE_MODE_DECODE) {
+                return;
+            }
+
             if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
@@ -3157,6 +3212,10 @@ private:
 
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
+            if (inference_mode != SERVER_INFERENCE_MODE_DECODE) {
+                return;
+            }
+
             if (slot.state != SLOT_STATE_GENERATING) {
                 return;
             }
@@ -3220,7 +3279,7 @@ private:
         });
 
         // generate the actual drafts (if any)
-        {
+        if (inference_mode == SERVER_INFERENCE_MODE_DECODE) {
             common_speculative_draft(spec.get());
         }
 
@@ -3289,6 +3348,10 @@ private:
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
+                if (inference_mode != SERVER_INFERENCE_MODE_PREFILL || slot.id != id_slot_prefill) {
+                    return;
+                }
+
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }
