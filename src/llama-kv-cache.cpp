@@ -1462,6 +1462,31 @@ uint32_t llama_kv_cache::get_size() const {
     return cells.size();
 }
 
+uint32_t llama_kv_cache::get_kv_capacity() const {
+    uint64_t result = 0;
+    for (const auto & cells : v_cells) {
+        result += cells.size();
+    }
+    return (uint32_t) std::min<uint64_t>(result, UINT32_MAX);
+}
+
+uint32_t llama_kv_cache::get_kv_used() const {
+    uint64_t result = 0;
+    for (const auto & cells : v_cells) {
+        result += cells.get_used();
+    }
+    return (uint32_t) std::min<uint64_t>(result, UINT32_MAX);
+}
+
+uint32_t llama_kv_cache::get_kv_seq_used(llama_seq_id seq_id) const {
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return 0;
+    }
+
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    return cells.seq_get_used(seq_id);
+}
+
 uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }

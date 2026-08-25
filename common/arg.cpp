@@ -1607,6 +1607,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_SIZE"));
     add_opt(common_arg(
+        {"--kv-size", "--total-kv"}, "N|auto",
+        string_format("unified KV cache capacity in tokens (default: %u, 0 = ctx-size, auto = use all available device memory)", params.n_ctx_kv),
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.n_ctx_kv = 0;
+                params.n_ctx_kv_auto = true;
+                params.kv_unified = true;
+                return;
+            }
+
+            size_t pos = 0;
+            const auto parsed = std::stoull(value, &pos);
+            if (pos != value.size() || parsed > UINT32_MAX) {
+                throw std::invalid_argument("invalid KV size");
+            }
+
+            params.n_ctx_kv = (uint32_t) parsed;
+            params.n_ctx_kv_auto = false;
+            if (params.n_ctx_kv > 0) {
+                params.kv_unified = true;
+            }
+        }
+    ).set_env("LLAMA_ARG_KV_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION

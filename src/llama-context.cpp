@@ -281,6 +281,7 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.kv_size_explicit = params.n_ctx_kv != 0;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -299,7 +300,21 @@ llama_context::llama_context(
 
     if (cparams.kv_unified) {
         cparams.n_ctx_seq = cparams.n_ctx;
+
+        constexpr uint32_t n_ctx_kv_max = UINT32_MAX - (UINT32_MAX % 256);
+        if (params.n_ctx_kv > n_ctx_kv_max) {
+            throw std::runtime_error(format("n_ctx_kv (%u) exceeds the maximum aligned capacity (%u)", params.n_ctx_kv, n_ctx_kv_max));
+        }
+        cparams.n_ctx_kv = params.n_ctx_kv == 0 ? cparams.n_ctx_seq : GGML_PAD(params.n_ctx_kv, 256);
+
+        if (cparams.n_ctx_kv < cparams.n_ctx_seq) {
+            throw std::runtime_error(format("n_ctx_kv (%u) must be at least n_ctx_seq (%u)", cparams.n_ctx_kv, cparams.n_ctx_seq));
+        }
     } else {
+        if (params.n_ctx_kv != 0) {
+            LLAMA_LOG_WARN("%s: n_ctx_kv is ignored when kv_unified is disabled\n", __func__);
+        }
+
         cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
         cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
 
@@ -311,11 +326,14 @@ llama_context::llama_context(
             cparams.n_ctx =  cparams.n_ctx_seq * cparams.n_seq_max;
             LLAMA_LOG_WARN("%s: n_ctx is not divisible by n_seq_max - rounding down to %u\n", __func__, cparams.n_ctx);
         }
+
+        cparams.n_ctx_kv = cparams.n_ctx_seq;
     }
 
     LLAMA_LOG_INFO("%s: n_seq_max     = %u\n",   __func__, cparams.n_seq_max);
     LLAMA_LOG_INFO("%s: n_ctx         = %u\n",   __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_ctx_seq     = %u\n",   __func__, cparams.n_ctx_seq);
+    LLAMA_LOG_INFO("%s: n_ctx_kv      = %u\n",   __func__, cparams.n_ctx_kv);
     LLAMA_LOG_INFO("%s: n_batch       = %u\n",   __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch      = %u\n",   __func__, cparams.n_ubatch);
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
@@ -799,6 +817,10 @@ uint32_t llama_context::n_ctx() const {
 
 uint32_t llama_context::n_ctx_seq() const {
     return cparams.n_ctx_seq;
+}
+
+uint32_t llama_context::n_ctx_kv() const {
+    return cparams.n_ctx_kv;
 }
 
 uint32_t llama_context::n_batch() const {
@@ -3587,6 +3609,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.n_ctx_kv                    =*/ 0,
     };
 
     return result;
@@ -3752,6 +3775,10 @@ uint32_t llama_n_ctx(const llama_context * ctx) {
 
 uint32_t llama_n_ctx_seq(const llama_context * ctx) {
     return ctx->n_ctx_seq();
+}
+
+uint32_t llama_n_ctx_kv(const llama_context * ctx) {
+    return ctx->n_ctx_kv();
 }
 
 uint32_t llama_n_batch(const llama_context * ctx) {
@@ -4075,6 +4102,29 @@ llama_pos llama_memory_seq_pos_max(
     }
 
     return mem->seq_pos_max(seq_id);
+}
+
+bool llama_memory_get_kv_usage(llama_memory_t mem, llama_memory_kv_usage * usage) {
+    if (!mem || !usage) {
+        return false;
+    }
+
+    const uint32_t capacity = mem->get_kv_capacity();
+    if (capacity == 0) {
+        return false;
+    }
+
+    usage->capacity = capacity;
+    usage->used     = mem->get_kv_used();
+    return true;
+}
+
+uint32_t llama_memory_seq_get_kv_used(llama_memory_t mem, llama_seq_id seq_id) {
+    if (!mem) {
+        return 0;
+    }
+
+    return mem->get_kv_seq_used(seq_id);
 }
 
 bool llama_memory_can_shift(llama_memory_t mem) {

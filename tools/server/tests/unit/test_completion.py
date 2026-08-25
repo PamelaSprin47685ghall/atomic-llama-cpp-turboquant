@@ -403,6 +403,82 @@ def test_completion_unified(n_ctx, n_slots, n_predict_vals, expected_success):
                 assert res.body["timings"]["predicted_n"] == n_predict
 
 
+@pytest.mark.parametrize("cache_ram,cache_prompt", [(64, False), (64, True), (0, False)])
+def test_completion_unified_preemption_preserves_predict_budget(cache_ram: int, cache_prompt: bool):
+    global server
+    server.n_slots = 4
+    server.kv_unified = True
+    server.n_ctx = 256
+    server.kv_size = 256
+    server.cache_ram = cache_ram
+    server.start()
+
+    n_predict = 70
+    tasks = []
+    for _ in range(4):
+        tasks.append((server.make_request, ("POST", "/completion", {
+            "prompt": "A",
+            "n_predict": n_predict,
+            "ignore_eos": True,
+            "return_tokens": True,
+            "cache_prompt": cache_prompt,
+        })))
+
+    results = parallel_function_calls(tasks)
+    for res in results:
+        assert res.status_code == 200
+        assert res.body["timings"]["predicted_n"] == n_predict
+        assert len(res.body["tokens"]) == n_predict
+
+
+def test_completion_unified_preemption_stream_does_not_repeat_tokens():
+    global server
+    server.n_slots = 4
+    server.kv_unified = True
+    server.n_ctx = 256
+    server.kv_size = 256
+    server.cache_ram = 64
+    server.start()
+
+    n_predict = 70
+
+    def consume_stream():
+        n_tokens = 0
+        n_final = 0
+        for data in server.make_stream_request("POST", "/completion", data={
+            "prompt": "A",
+            "n_predict": n_predict,
+            "ignore_eos": True,
+            "return_tokens": True,
+            "cache_prompt": False,
+            "stream": True,
+        }):
+            if data["stop"]:
+                n_final += 1
+                assert data["timings"]["predicted_n"] == n_predict
+            else:
+                n_tokens += len(data["tokens"])
+        return n_tokens, n_final
+
+    results = parallel_function_calls([(consume_stream, ()) for _ in range(4)])
+    assert results == [(n_predict, 1)] * 4
+
+
+def test_completion_dynamic_kv_auto_parallel_not_fixed_to_four_slots():
+    global server
+    server.n_slots = -1
+    server.kv_unified = True
+    server.n_ctx = 128
+    server.kv_size = 256
+    server.server_slots = True
+    server.start()
+
+    res = server.make_request("GET", "/slots")
+    assert res.status_code == 200
+    assert len(res.body) > 4
+    assert all(slot["n_ctx"] == 128 for slot in res.body)
+
+
 @pytest.mark.parametrize(
     "prompt,n_predict,response_fields",
     [

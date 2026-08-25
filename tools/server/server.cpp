@@ -180,10 +180,12 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
 
         if (params.n_parallel < 0) {
-            SRV_TRC("%s", "n_parallel is set to auto, using n_parallel = 4 and kv_unified = true\n");
-
-            params.n_parallel = 4;
+            const bool dynamic_kv = params.n_ctx_kv_auto || params.n_ctx_kv > 0;
+            params.n_parallel = dynamic_kv ? (int) llama_max_parallel_sequences() : 4;
+            params.n_parallel_pp = dynamic_kv ? 1 : params.n_parallel;
             params.kv_unified = true;
+
+            SRV_TRC("n_parallel is set to auto, using n_parallel = %d and kv_unified = true\n", params.n_parallel);
         }
     }
 

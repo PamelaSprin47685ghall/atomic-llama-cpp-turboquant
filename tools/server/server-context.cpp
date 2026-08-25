@@ -286,11 +286,15 @@ struct server_slot {
     int32_t n_ctx       = 0;  // context size per slot
     int32_t n_keep      = 0;
     int32_t n_decoded   = 0;
+    int32_t n_decoded_start = 0;
     int32_t n_remaining = -1;
     int32_t i_batch     = -1;
 
-    int32_t n_prompt_tokens_cache     = 0;
-    int32_t n_prompt_tokens_processed = 0;
+    int32_t n_prompt_tokens_original          = 0;
+    int32_t n_prompt_tokens_cache             = 0;
+    int32_t n_prompt_tokens_cache_response    = 0;
+    int32_t n_prompt_tokens_processed         = 0;
+    int32_t n_prompt_tokens_processed_accum   = 0;
 
     size_t last_nl_pos = 0;
 
@@ -312,6 +316,7 @@ struct server_slot {
     slot_state state = SLOT_STATE_IDLE;
 
     server_prompt prompt;
+    server_tokens response_prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
@@ -384,6 +389,7 @@ struct server_slot {
     int32_t n_decoded_last = 0;
 
     double t_prompt_processing = 0.0; // ms
+    double t_prompt_processing_accum = 0.0;
     double t_token_generation = 0.0;  // ms
 
     std::function<void(int /* id_slot */)> callback_on_release;
@@ -399,7 +405,12 @@ struct server_slot {
 
         spec_is_replay = false;
 
-        n_prompt_tokens_cache = 0;
+        n_decoded_start                  = 0;
+        n_prompt_tokens_original         = 0;
+        n_prompt_tokens_cache            = 0;
+        n_prompt_tokens_cache_response   = 0;
+        n_prompt_tokens_processed_accum  = 0;
+        response_prompt.clear();
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -408,6 +419,7 @@ struct server_slot {
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
+        t_prompt_processing_accum = 0.0;
 
         if (spec) {
             spec_draft.clear();
@@ -614,7 +626,7 @@ struct server_slot {
         }
     }
 
-    void release() {
+    void release(bool schedule_deferred = true) {
         if (is_processing()) {
             GGML_ASSERT(task);
 
@@ -632,18 +644,27 @@ struct server_slot {
 
             reset();
 
-            callback_on_release(id);
+            if (schedule_deferred) {
+                callback_on_release(id);
+            }
         }
+    }
+
+    int32_t n_prompt_tokens_processed_total() const {
+        return n_prompt_tokens_processed_accum + n_prompt_tokens_processed;
     }
 
     result_timings get_timings() const {
         result_timings timings;
-        timings.cache_n = n_prompt_tokens_cache;
+        timings.cache_n = n_prompt_tokens_cache_response;
 
-        timings.prompt_n            = n_prompt_tokens_processed;
-        timings.prompt_ms           = t_prompt_processing;
-        timings.prompt_per_token_ms = t_prompt_processing / n_prompt_tokens_processed;
-        timings.prompt_per_second   = 1e3 / t_prompt_processing * n_prompt_tokens_processed;
+        const int32_t n_prompt_total = n_prompt_tokens_processed_total();
+        timings.prompt_n  = n_prompt_total;
+        timings.prompt_ms = t_prompt_processing;
+        if (n_prompt_total > 0 && t_prompt_processing > 0.0) {
+            timings.prompt_per_token_ms = t_prompt_processing / n_prompt_total;
+            timings.prompt_per_second   = 1e3 / t_prompt_processing * n_prompt_total;
+        }
 
         timings.predicted_n            = n_decoded;
         timings.predicted_ms           = t_token_generation;
@@ -723,15 +744,16 @@ struct server_slot {
     }
 
     void print_timings() const {
-        const double t_prompt        =       t_prompt_processing / n_prompt_tokens_processed;
-        const double n_prompt_second = 1e3 / t_prompt_processing * n_prompt_tokens_processed;
+        const int32_t n_prompt_total = n_prompt_tokens_processed_total();
+        const double t_prompt        = n_prompt_total > 0 ? t_prompt_processing / n_prompt_total : 0.0;
+        const double n_prompt_second = t_prompt_processing > 0.0 ? 1e3 / t_prompt_processing * n_prompt_total : 0.0;
 
         const double t_gen        =       t_token_generation / n_decoded;
         const double n_gen_second = 1e3 / t_token_generation * n_decoded;
 
         SLT_INF(*this,
                 "prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
-                t_prompt_processing, n_prompt_tokens_processed, t_prompt, n_prompt_second);
+                t_prompt_processing, n_prompt_total, t_prompt, n_prompt_second);
 
         SLT_INF(*this,
                 "       eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
@@ -739,7 +761,7 @@ struct server_slot {
 
         SLT_INF(*this,
                 "      total time = %10.2f ms / %5d tokens\n",
-                t_prompt_processing + t_token_generation, n_prompt_tokens_processed + n_decoded);
+                t_prompt_processing + t_token_generation, n_prompt_total + n_decoded);
 
         SLT_INF(*this,
                 "   graphs reused = %10d\n",
@@ -815,10 +837,14 @@ struct server_slot {
         other.n_remaining = n_remaining;
         other.i_batch     = i_batch;
 
-        other.t_start_process_prompt    = t_start_process_prompt;
-        other.t_prompt_processing       = t_prompt_processing;
-        other.n_prompt_tokens_cache     = n_prompt_tokens_cache;
-        other.n_prompt_tokens_processed = n_prompt_tokens_processed;
+        other.t_start_process_prompt          = t_start_process_prompt;
+        other.t_prompt_processing             = t_prompt_processing;
+        other.t_prompt_processing_accum       = t_prompt_processing_accum;
+        other.n_prompt_tokens_cache           = n_prompt_tokens_cache;
+        other.n_prompt_tokens_cache_response  = n_prompt_tokens_cache_response;
+        other.n_prompt_tokens_processed       = n_prompt_tokens_processed;
+        other.n_prompt_tokens_processed_accum = n_prompt_tokens_processed_accum;
+        other.truncated                       = truncated;
 
         other.prompt = prompt.clone();
         other.init_sampler();
@@ -943,10 +969,11 @@ struct server_metrics {
     }
 
     void on_prompt_eval(const server_slot & slot) {
+        const double t_prompt_attempt = std::max(0.0, slot.t_prompt_processing - slot.t_prompt_processing_accum);
         n_prompt_tokens_processed_total += slot.n_prompt_tokens_processed;
         n_prompt_tokens_processed       += slot.n_prompt_tokens_processed;
-        t_prompt_processing             += slot.t_prompt_processing;
-        t_prompt_processing_total       += slot.t_prompt_processing;
+        t_prompt_processing             += t_prompt_attempt;
+        t_prompt_processing_total       += t_prompt_attempt;
 
         n_tokens_max = std::max(n_tokens_max, (uint64_t) slot.prompt.n_tokens());
     }
@@ -1051,9 +1078,27 @@ private:
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
     int32_t n_swa;
 
+    struct server_retry_state {
+        int32_t n_decoded = 0;
+        int32_t n_prompt_tokens_original = 0;
+        int32_t n_prompt_tokens_cache_response = 0;
+        int32_t n_prompt_tokens_processed = 0;
+        server_tokens response_prompt;
+        size_t last_nl_pos = 0;
+        std::string generated_text;
+        llama_tokens generated_tokens;
+        std::vector<completion_token_output> generated_token_probs;
+        size_t n_sent_text = 0;
+        bool has_new_line = false;
+        bool truncated = false;
+        int64_t t_start_generation = 0;
+        double t_prompt_processing = 0.0;
+    };
+
     // slots / clients
     std::vector<server_slot> slots;
     std::unordered_map<std::string, int> cache_key_slots;
+    std::unordered_map<int, server_retry_state> retry_states;
 
     int trace = 0;
     int slots_debug = 0;
@@ -1155,6 +1200,7 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        params_base.n_ctx_kv_reserve.clear();
         params_base.n_parallel_pp = 1;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
         inference_mode = SERVER_INFERENCE_MODE_DECODE;
@@ -1170,6 +1216,11 @@ private:
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
+
+        if (has_spec && (params_base.n_ctx_kv_auto || params_base.n_ctx_kv > 0)) {
+            SRV_ERR("%s", "dynamic unified KV sizing is not supported with speculative decoding yet\n");
+            return false;
+        }
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1209,7 +1260,7 @@ private:
         }
 
         // optionally get the memory usage of mmproj
-        if (has_mmproj && params_base.fit_params) {
+        if (has_mmproj && (params_base.fit_params || params_base.n_ctx_kv_auto)) {
             int64_t t_start = ggml_time_us();
             auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
             int64_t t_elapsed = ggml_time_us() - t_start;
@@ -1226,6 +1277,7 @@ private:
                             if (i < params_base.fit_params_target.size()) {
                                 SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
                                 params_base.fit_params_target[i] += size;
+                                params_base.n_ctx_kv_reserve.emplace_back(dev, size);
                             }
                             break;
                         }
@@ -1514,7 +1566,8 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            const size_t cache_token_limit = params_base.kv_unified && params_base.n_ctx_kv > 0 ? 0 : n_ctx;
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, cache_token_limit);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1580,7 +1633,9 @@ private:
                 SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
                 params_base.cache_idle_slots = false;
             } else {
-                if (params_base.kv_unified) {
+                if (params_base.kv_unified && params_base.n_ctx_kv > 0) {
+                    SRV_TRC("%s", "idle slots will remain in unified KV and move to prompt cache on memory pressure\n");
+                } else if (params_base.kv_unified) {
                     SRV_TRC("%s", "idle slots will be saved to prompt cache and cleared upon starting a new task\n");
                 } else {
                     // without a unified KV cache, clearing a slot frees no reusable room, so we only
@@ -1850,6 +1905,7 @@ private:
         }
 
         if (ret) {
+            update_cache = update_cache || task.is_retry;
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for completion tasks
@@ -1875,36 +1931,209 @@ private:
         return ret;
     }
 
-    // return true if at least one slot has been cleared
-    // TODO: improve logic
-    //       - smarter decision which slot to clear (LRU or longest prompt?)
-    //       - move slot to level 2 cache instead of removing?
-    //       - instead of purging, try to store and resume later?
     bool try_clear_idle_slots() {
-        bool res = false;
-
         if (!params_base.kv_unified) {
-            return res;
+            return false;
         }
 
+        server_slot * victim = nullptr;
         for (auto & slot : slots) {
-            if (slot.is_processing()) {
+            if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
+                continue;
+            }
+            if (victim == nullptr || slot.t_last_used < victim->t_last_used) {
+                victim = &slot;
+            }
+        }
+
+        if (victim == nullptr) {
+            return false;
+        }
+
+        SLT_DBG(*victim, "demoting idle KV, n_tokens = %zu\n", victim->prompt.tokens.size());
+        if (prompt_cache && params_base.cache_idle_slots) {
+            victim->prompt_save(*prompt_cache);
+            prompt_cache->update();
+        }
+        victim->prompt_clear();
+        clear_cache_keys_for_slot(victim->id);
+        return true;
+    }
+
+    server_slot * find_preemption_victim(int32_t id_slot_protected) {
+        server_slot * victim = nullptr;
+        uint32_t victim_kv_used = 0;
+        size_t n_preemptible = 0;
+        llama_memory_t mem = llama_get_memory(ctx_tgt);
+
+        for (auto & slot : slots) {
+            if (slot.id == id_slot_protected || slot.state != SLOT_STATE_GENERATING || !slot.task) {
+                continue;
+            }
+            ++n_preemptible;
+            const uint32_t kv_used = llama_memory_seq_get_kv_used(mem, slot.id);
+            if (victim == nullptr || kv_used > victim_kv_used) {
+                victim = &slot;
+                victim_kv_used = kv_used;
+            }
+        }
+
+        if (id_slot_protected < 0 && n_preemptible <= 1) {
+            return nullptr;
+        }
+
+        return victim;
+    }
+
+    server_task make_retry_task(const server_slot & slot) const {
+        GGML_ASSERT(slot.task);
+        GGML_ASSERT(slot.state == SLOT_STATE_GENERATING);
+
+        server_task retry(slot.task->type);
+        retry.id        = slot.task->id;
+        retry.index     = slot.task->index;
+        retry.id_target = slot.task->id_target;
+        retry.id_slot   = -1;
+        retry.cache_key = slot.task->cache_key;
+        retry.id_parent = -1;
+        retry.params    = slot.task->params;
+        if (retry.params.n_keep < 0) {
+            retry.params.n_keep = slot.n_prompt_tokens_original;
+        }
+        retry.tokens    = slot.prompt.tokens.clone();
+        retry.is_retry  = true;
+
+        if (!slot.token_append_chunk.empty()) {
+            GGML_ASSERT(slot.token_append_anchor != LLAMA_TOKEN_NULL);
+            retry.tokens.push_back(slot.token_append_anchor);
+            retry.tokens.insert(slot.token_append_chunk);
+        } else if (slot.sampled != LLAMA_TOKEN_NULL) {
+            retry.tokens.push_back(slot.sampled);
+        }
+
+        return retry;
+    }
+
+    bool preempt_slot(server_slot & slot) {
+        if (!slot.task || slot.state != SLOT_STATE_GENERATING) {
+            return false;
+        }
+
+        const int id_task = slot.task->id;
+        server_task retry = make_retry_task(slot);
+
+        if (prompt_cache) {
+            slot.prompt_save(*prompt_cache);
+            prompt_cache->update();
+        }
+
+        server_retry_state state;
+        state.n_decoded                      = slot.n_decoded;
+        state.n_prompt_tokens_original       = slot.n_prompt_tokens_original;
+        state.n_prompt_tokens_cache_response = slot.n_prompt_tokens_cache_response;
+        state.n_prompt_tokens_processed      = slot.n_prompt_tokens_processed_total();
+        state.response_prompt                = slot.response_prompt.empty() ? slot.task->tokens.clone() : std::move(slot.response_prompt);
+        state.last_nl_pos              = slot.last_nl_pos;
+        state.generated_text           = std::move(slot.generated_text);
+        state.generated_tokens         = std::move(slot.generated_tokens);
+        state.generated_token_probs    = std::move(slot.generated_token_probs);
+        state.n_sent_text              = slot.n_sent_text;
+        state.has_new_line             = slot.has_new_line;
+        state.truncated                = slot.truncated;
+        state.t_start_generation       = slot.t_start_generation;
+        state.t_prompt_processing      = slot.t_prompt_processing;
+        retry_states[id_task]          = std::move(state);
+
+        SLT_WRN(slot, "preempting task %d, committed_kv = %d, retry_tokens = %d, n_decoded = %d\n",
+                id_task, slot.prompt.n_tokens(), retry.n_tokens(), slot.n_decoded);
+
+        slot.prompt_clear();
+        clear_cache_keys_for_slot(slot.id);
+        queue_tasks.defer(std::move(retry));
+        slot.release(false);
+        return true;
+    }
+
+    uint32_t estimate_next_kv_cells(int32_t & id_slot_protected) {
+        id_slot_protected = -1;
+
+        if (inference_mode == SERVER_INFERENCE_MODE_DECODE) {
+            uint64_t required = 0;
+            server_slot * slot_batched = nullptr;
+            const int n_draft_cfg = common_speculative_n_max(&params_base.speculative);
+
+            for (auto & slot : slots) {
+                if (slot.state != SLOT_STATE_GENERATING) {
+                    continue;
+                }
+                if (slot_batched == nullptr) {
+                    slot_batched = &slot;
+                } else if (!slot_batched->can_batch_with(slot)) {
+                    continue;
+                }
+
+                uint32_t n = 1;
+                if (!slot.token_append_chunk.empty()) {
+                    n += slot.token_append_chunk.size();
+                } else if (slot.can_speculate() && n_draft_cfg > 0) {
+                    n += std::min(n_draft_cfg, std::max(0, slot.get_n_draft_max()));
+                }
+                required += n;
+            }
+
+            return (uint32_t) std::min<uint64_t>(required, UINT32_MAX);
+        }
+
+        server_slot * slot = id_slot_prefill >= 0 ? get_slot_by_id(id_slot_prefill) : nullptr;
+        if (slot == nullptr || !slot->task || !slot->is_processing()) {
+            return 0;
+        }
+
+        id_slot_protected = slot->id;
+
+        size_t n_past = slot->prompt.n_tokens();
+        if (slot->state == SLOT_STATE_STARTED) {
+            n_past = (slot->task->params.cache_prompt || slot->task->is_retry) ? slot->prompt.tokens.get_common_prefix(slot->task->tokens) : 0;
+        }
+
+        const size_t n_task_tokens = slot->task->n_tokens();
+        const size_t n_remaining = n_task_tokens > n_past ? n_task_tokens - n_past : 0;
+        return (uint32_t) std::min<size_t>(n_remaining, llama_n_batch(ctx_tgt));
+    }
+
+    bool ensure_next_kv_capacity() {
+        if (!params_base.kv_unified || params_base.n_ctx_kv == 0) {
+            return true;
+        }
+
+        while (true) {
+            llama_memory_kv_usage usage;
+            if (!llama_memory_get_kv_usage(llama_get_memory(ctx_tgt), &usage)) {
+                return true;
+            }
+
+            int32_t id_slot_protected = -1;
+            const uint32_t required = estimate_next_kv_cells(id_slot_protected);
+            const uint64_t available = usage.capacity - std::min(usage.capacity, usage.used);
+
+            if (required <= available) {
+                return true;
+            }
+
+            if (try_clear_idle_slots()) {
                 continue;
             }
 
-            if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+            server_slot * victim = find_preemption_victim(id_slot_protected);
+            if (victim == nullptr) {
+                SRV_DBG("unified KV needs %u cells, only %" PRIu64 " available, continuing without preemption\n", required, available);
+                return true;
+            }
 
-                slot.prompt_clear();
-
-                res = true;
-
-                // clear slots one by one
-                break;
+            if (!preempt_slot(*victim)) {
+                return false;
             }
         }
-
-        return res;
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
@@ -2030,6 +2259,37 @@ private:
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+
+        auto retry_it = retry_states.find(slot.task->id);
+        if (retry_it != retry_states.end()) {
+            auto & retry = retry_it->second;
+            slot.n_decoded_start                  = retry.n_decoded;
+            slot.n_prompt_tokens_original         = retry.n_prompt_tokens_original;
+            slot.n_prompt_tokens_cache_response   = retry.n_prompt_tokens_cache_response;
+            slot.n_prompt_tokens_processed_accum  = retry.n_prompt_tokens_processed;
+            slot.response_prompt                  = std::move(retry.response_prompt);
+            slot.last_nl_pos             = retry.last_nl_pos;
+            slot.generated_text          = std::move(retry.generated_text);
+            slot.generated_tokens        = std::move(retry.generated_tokens);
+            slot.generated_token_probs   = std::move(retry.generated_token_probs);
+            slot.n_sent_text             = retry.n_sent_text;
+            slot.has_new_line            = retry.has_new_line;
+            slot.truncated               = retry.truncated;
+            slot.t_start_generation      = retry.t_start_generation;
+            slot.t_prompt_processing_accum = retry.t_prompt_processing;
+            retry_states.erase(retry_it);
+        } else {
+            slot.n_decoded_start                 = 0;
+            slot.n_prompt_tokens_original        = slot.task->n_tokens();
+            slot.n_prompt_tokens_cache_response  = 0;
+            slot.n_prompt_tokens_processed_accum = 0;
+            slot.response_prompt.clear();
+            slot.t_start_generation              = 0;
+            slot.t_prompt_processing_accum       = 0.0;
+        }
+
+        slot.n_decoded   = slot.n_decoded_start;
+        slot.n_remaining = -1;
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -2290,8 +2550,8 @@ private:
         }
 
         res->n_decoded             = slot.n_decoded;
-        res->n_prompt_tokens       = slot.task->n_tokens();
-        res->n_prompt_tokens_cache = slot.n_prompt_tokens_cache;
+        res->n_prompt_tokens       = slot.n_prompt_tokens_original;
+        res->n_prompt_tokens_cache = slot.n_prompt_tokens_cache_response;
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
 
         res->verbose           = slot.task->params.verbose;
@@ -2334,13 +2594,13 @@ private:
             res->tokens      = std::move(slot.generated_tokens);
         }
         res->timings         = slot.get_timings();
-        res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
+        res->prompt          = (slot.response_prompt.empty() ? slot.task->tokens : slot.response_prompt).detokenize(ctx_tgt, true);
         res->response_fields = std::move(slot.task->params.response_fields);
 
         res->truncated             = slot.truncated;
         res->n_decoded             = slot.n_decoded;
-        res->n_prompt_tokens       = slot.task->n_tokens();
-        res->n_prompt_tokens_cache = slot.n_prompt_tokens_cache;
+        res->n_prompt_tokens       = slot.n_prompt_tokens_original;
+        res->n_prompt_tokens_cache = slot.n_prompt_tokens_cache_response;
         res->n_tokens_cached       = slot.prompt.n_tokens();
         res->has_new_line          = slot.has_new_line;
         res->stopping_word         = slot.stopping_word;
@@ -2648,7 +2908,7 @@ private:
                         break; // drop the task
                     }
 
-                    if (params_base.cache_idle_slots) {
+                    if (params_base.cache_idle_slots && params_base.n_ctx_kv == 0) {
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
@@ -2658,7 +2918,7 @@ private:
                                     prompt_cache->update();
                                 }
 
-                                if (params_base.kv_unified) {
+                                if (params_base.kv_unified && params_base.n_ctx_kv == 0) {
                                     // [TAG_IDLE_SLOT_CLEAR]
                                     slot.prompt_clear();
                                 }
@@ -2668,6 +2928,8 @@ private:
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
+                    retry_states.erase(task.id_target);
+
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
@@ -2944,6 +3206,8 @@ private:
     }
 
     void abort_all_slots(const std::string & reason) {
+        retry_states.clear();
+
         for (auto & slot : slots) {
             if (slot.is_processing()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
@@ -3059,6 +3323,10 @@ private:
         }
 
         update_inference_mode();
+
+        if (!ensure_next_kv_capacity()) {
+            return;
+        }
 
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
@@ -3381,7 +3649,9 @@ private:
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.t_start_process_prompt = ggml_time_us();
-                        slot.t_start_generation = 0;
+                        if (slot.n_decoded_start == 0) {
+                            slot.t_start_generation = 0;
+                        }
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
@@ -3455,7 +3725,7 @@ private:
                                 return;
                             }
 
-                            if (slot.task->params.cache_prompt) {
+                            if (slot.task->params.cache_prompt || slot.task->is_retry) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -3648,12 +3918,15 @@ private:
                         }
 
                         slot.n_prompt_tokens_cache = n_past;
+                        if (slot.n_decoded_start == 0) {
+                            slot.n_prompt_tokens_cache_response = n_past;
+                        }
                         slot.n_prompt_tokens_processed = 0;
 
                         slot.prompt.tokens.keep_first(n_past);
 
                         // this is to signal the client that the request has started processing
-                        if (slot.task->params.stream) {
+                        if (slot.task->params.stream && slot.n_decoded_start == 0) {
                             if (slot.task->params.return_progress) {
                                 // send initial 0% progress update if needed
                                 send_partial_response(slot, {}, true);
@@ -3672,7 +3945,7 @@ private:
                     }
 
                     const int64_t t_now = ggml_time_us();
-                    slot.t_prompt_processing = (t_now - slot.t_start_process_prompt) / 1e3;
+                    slot.t_prompt_processing = slot.t_prompt_processing_accum + (t_now - slot.t_start_process_prompt) / 1e3;
                     slot.print_timings_pp();
 
                     // truncate any tokens that are beyond n_past for this slot
@@ -3836,7 +4109,7 @@ private:
                         // extract the logits only for the last token
                         batch.set_output(batch.size() - 1, true);
 
-                        slot.n_decoded = 0;
+                        slot.n_decoded = slot.n_decoded_start;
                         slot.i_batch   = batch.size() - 1;
 
                         slot.init_sampler();
@@ -3912,6 +4185,10 @@ private:
         metrics.on_decoded(slots);
 
         if (ret != 0) {
+            if (ret == 1 && n_batch == 1 && params_base.kv_unified && params_base.n_ctx_kv > 0 && try_clear_idle_slots()) {
+                return false;
+            }
+
             {
                 std::string err;
 
@@ -4058,7 +4335,7 @@ private:
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
-                if (slot.task->params.stream && slot.task->params.return_progress) {
+                if (slot.task->params.stream && slot.task->params.return_progress && slot.n_decoded_start == 0) {
                     send_partial_response(slot, {}, true);
                 }
             }
@@ -4118,11 +4395,15 @@ private:
 
             slot.n_decoded += 1;
 
-            if (slot.n_decoded == 1) {
+            if (slot.t_start_generation == 0) {
                 slot.t_start_generation = t_now;
+            }
+            if (slot.n_decoded == slot.n_decoded_start + 1) {
                 slot.t_print_last = t_now;
-                slot.n_decoded_last = 0;
-                slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                slot.n_decoded_last = slot.n_decoded_start;
+                if (slot.n_decoded_start == 0) {
+                    slot.t_prompt_processing = slot.t_prompt_processing_accum + (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                }
                 metrics.on_prompt_eval(slot);
             }
 

@@ -45,6 +45,7 @@ public:
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
+            seq_used[s] = 0;
         }
     }
 
@@ -359,6 +360,13 @@ public:
         return seq_pos[seq_id].rbegin()->first;
     }
 
+    uint32_t seq_get_used(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        return seq_used[seq_id];
+    }
+
     // note: call only if the cell is not empty
     llama_pos pos_get(uint32_t i) const {
         assert(i < pos.size());
@@ -497,13 +505,16 @@ private:
     //  - some vision models have input embeddings with repeating positions
     //
     std::map<llama_pos, int> seq_pos[LLAMA_MAX_SEQ];
+    uint32_t seq_used[LLAMA_MAX_SEQ] = {};
 
     // helper functions for updating `seq_pos`, once cell at a time:
 
     void seq_pos_dec(llama_seq_id s, llama_pos p) {
         auto it = seq_pos[s].find(p);
         assert(it != seq_pos[s].end());
+        assert(seq_used[s] > 0);
 
+        seq_used[s]--;
         if (--it->second == 0) {
             seq_pos[s].erase(it);
         }
@@ -511,6 +522,7 @@ private:
 
     void seq_pos_inc(llama_seq_id s, llama_pos p) {
         seq_pos[s][p]++;
+        seq_used[s]++;
     }
 
     // remove cell i

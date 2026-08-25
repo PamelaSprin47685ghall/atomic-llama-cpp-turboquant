@@ -109,6 +109,10 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    virtual uint32_t get_kv_capacity() const { return 0; }
+    virtual uint32_t get_kv_used()     const { return 0; }
+    virtual uint32_t get_kv_seq_used(llama_seq_id seq_id) const { GGML_UNUSED(seq_id); return 0; }
+
     //
     // ops
     //

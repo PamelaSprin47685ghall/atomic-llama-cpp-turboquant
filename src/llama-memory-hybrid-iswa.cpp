@@ -140,6 +140,18 @@ bool llama_memory_hybrid_iswa::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+uint32_t llama_memory_hybrid_iswa::get_kv_capacity() const {
+    return mem_attn->get_kv_capacity();
+}
+
+uint32_t llama_memory_hybrid_iswa::get_kv_used() const {
+    return mem_attn->get_kv_used();
+}
+
+uint32_t llama_memory_hybrid_iswa::get_kv_seq_used(llama_seq_id seq_id) const {
+    return mem_attn->get_kv_seq_used(seq_id);
+}
+
 void llama_memory_hybrid_iswa::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);

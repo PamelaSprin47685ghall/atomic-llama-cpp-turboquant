@@ -953,6 +953,146 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
     }
 }
 
+
+common_params_fit_status common_fit_kv_cache(
+                         const char * path_model,
+           const llama_model_params * mparams,
+               llama_context_params * cparams,
+        const std::vector<std::pair<ggml_backend_dev_t, size_t>> & reserve,
+                     ggml_log_level   log_level) {
+    if (!cparams->kv_unified) {
+        LOG_WRN("%s: automatic KV sizing requires unified KV cache\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+    if (!cparams->offload_kqv) {
+        LOG_WRN("%s: automatic KV sizing requires device-backed KV cache\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+
+    constexpr uint32_t n_align = 256;
+    constexpr uint32_t n_max = UINT32_MAX - (UINT32_MAX % n_align);
+
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0;
+    uint32_t hp_n_ctx_train = 0;
+    uint32_t hp_n_expert = 0;
+
+    auto get_data = [&](uint32_t n_ctx_kv, common_device_memory_data_vec & data) {
+        llama_context_params test = *cparams;
+        test.n_ctx_kv = n_ctx_kv;
+        try {
+            data = common_get_device_memory_data(path_model, mparams, &test, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+        } catch (const std::exception & e) {
+            LOG_TRC("%s: KV size %u probe failed: %s\n", __func__, n_ctx_kv, e.what());
+            return false;
+        }
+
+        if (devs.empty()) {
+            return false;
+        }
+
+        for (size_t i = 0; i < devs.size(); ++i) {
+            size_t reserved = 0;
+            for (const auto & [dev, bytes] : reserve) {
+                if (dev == devs[i]) {
+                    reserved += bytes;
+                }
+            }
+
+            const uint64_t used = data[i].model + data[i].context + data[i].compute + reserved;
+            if (data[i].free <= 0 || used > (uint64_t) data[i].free) {
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    common_device_memory_data_vec data;
+    llama_context_params baseline = *cparams;
+    baseline.n_ctx_kv = 0;
+    try {
+        data = common_get_device_memory_data(path_model, mparams, &baseline, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+    } catch (const std::exception & e) {
+        LOG_WRN("%s: failed to inspect device memory: %s\n", __func__, e.what());
+        return COMMON_PARAMS_FIT_STATUS_ERROR;
+    }
+
+    if (devs.empty()) {
+        LOG_WRN("%s: no device memory available for automatic KV sizing\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+
+    const uint32_t n_ctx_seq = cparams->n_ctx == 0 ? hp_n_ctx_train : cparams->n_ctx;
+    if (n_ctx_seq > n_max) {
+        LOG_WRN("%s: per-sequence context of %u tokens exceeds the maximum aligned KV capacity\n", __func__, n_ctx_seq);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+    const uint32_t n_min = std::max<uint32_t>(n_align, (uint32_t) (((uint64_t) n_ctx_seq + n_align - 1) / n_align * n_align));
+
+    if (!get_data(n_min, data)) {
+        LOG_WRN("%s: requested per-sequence context of %u tokens does not fit in device memory\n", __func__, n_min);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+
+    const uint32_t n_probe = (uint32_t) std::min<uint64_t>(n_max, std::max<uint64_t>((uint64_t) n_min * 2, (uint64_t) n_min + 4096));
+    if (n_probe > n_min) {
+        common_device_memory_data_vec data_probe;
+        if (get_data(n_probe, data_probe)) {
+            bool device_context_grows = false;
+            for (size_t i = 0; i < devs.size(); ++i) {
+                device_context_grows |= data_probe[i].context > data[i].context;
+            }
+            if (!device_context_grows) {
+                LOG_WRN("%s: no device-backed KV memory growth detected; automatic KV sizing is not applicable\n", __func__);
+                return COMMON_PARAMS_FIT_STATUS_FAILURE;
+            }
+        }
+    }
+
+    uint32_t lo = n_min;
+    uint32_t hi = n_min;
+
+    while (hi < n_max) {
+        const uint64_t next64 = std::min<uint64_t>(n_max, uint64_t(hi) * 2);
+        const uint32_t next = (uint32_t) next64;
+        if (next == hi || !get_data(next, data)) {
+            hi = next;
+            break;
+        }
+
+        lo = next;
+        hi = next;
+    }
+
+    if (hi == lo && hi == n_max) {
+        cparams->n_ctx_kv = lo;
+        return COMMON_PARAMS_FIT_STATUS_SUCCESS;
+    }
+
+    if (hi == lo) {
+        hi = std::min<uint32_t>(n_max, lo + n_align);
+    }
+
+    uint64_t lo_u = lo / n_align;
+    uint64_t hi_u = hi / n_align;
+
+    while (lo_u + 1 < hi_u) {
+        const uint64_t mid_u = lo_u + (hi_u - lo_u) / 2;
+        const uint32_t mid = (uint32_t) (mid_u * n_align);
+        if (get_data(mid, data)) {
+            lo_u = mid_u;
+        } else {
+            hi_u = mid_u;
+        }
+    }
+
+    cparams->n_ctx_kv = (uint32_t) (lo_u * n_align);
+    LOG_INF("%s: automatic unified KV capacity = %u tokens\n", __func__, cparams->n_ctx_kv);
+
+    return COMMON_PARAMS_FIT_STATUS_SUCCESS;
+}
+
 void common_fit_print(
         const char * path_model,
         llama_model_params * mparams,
