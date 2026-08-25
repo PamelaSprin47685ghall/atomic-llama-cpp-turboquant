@@ -13,6 +13,9 @@ static void test_envelope_metadata() {
 
     GGML_ASSERT(codec.vocabulary_size() == wanxiangqi_repetition_envelope::vocabulary_size);
     GGML_ASSERT(wanxiangqi_repetition_envelope::half_life == 256);
+    GGML_ASSERT(wanxiangqi_repetition_envelope::central_probability == 0.99);
+    GGML_ASSERT(wanxiangqi_repetition_envelope::lower_weighted_distinct_count < wanxiangqi_repetition_envelope::normal_weighted_distinct_count);
+    GGML_ASSERT(wanxiangqi_repetition_envelope::normal_weighted_distinct_count < wanxiangqi_repetition_envelope::upper_weighted_distinct_count);
 }
 
 static void test_repository_corpus_filter() {
@@ -31,9 +34,9 @@ static void test_repository_corpus_filter() {
 
 static void test_strict_envelope_boundaries() {
     GGML_ASSERT(wanxiangqi_repetition_classify(
-        wanxiangqi_repetition_envelope::minimum_weighted_distinct_count) == wanxiangqi_repetition_state::normal);
+        wanxiangqi_repetition_envelope::lower_weighted_distinct_count) == wanxiangqi_repetition_state::normal);
     GGML_ASSERT(wanxiangqi_repetition_classify(
-        wanxiangqi_repetition_envelope::maximum_weighted_distinct_count) == wanxiangqi_repetition_state::normal);
+        wanxiangqi_repetition_envelope::upper_weighted_distinct_count) == wanxiangqi_repetition_state::normal);
 }
 
 static void test_repetitive_sequence() {

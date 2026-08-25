@@ -17,10 +17,10 @@ const char * wanxiangqi_repetition_state_name(wanxiangqi_repetition_state state)
 }
 
 wanxiangqi_repetition_state wanxiangqi_repetition_classify(double weighted_distinct_count) {
-    if (weighted_distinct_count < wanxiangqi_repetition_envelope::minimum_weighted_distinct_count) {
+    if (weighted_distinct_count < wanxiangqi_repetition_envelope::lower_weighted_distinct_count) {
         return wanxiangqi_repetition_state::too_repetitive;
     }
-    if (weighted_distinct_count > wanxiangqi_repetition_envelope::maximum_weighted_distinct_count) {
+    if (weighted_distinct_count > wanxiangqi_repetition_envelope::upper_weighted_distinct_count) {
         return wanxiangqi_repetition_state::too_random;
     }
     return wanxiangqi_repetition_state::normal;

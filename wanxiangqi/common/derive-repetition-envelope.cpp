@@ -10,7 +10,6 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
-#include <limits>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -23,6 +22,9 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr std::size_t half_life = 256;
+constexpr double central_probability = 0.99;
+constexpr double lower_tail_probability = (1.0 - central_probability) / 2.0;
+constexpr double upper_tail_probability = 1.0 - lower_tail_probability;
 
 std::string read_file(const fs::path & path) {
     std::ifstream in(path, std::ios::binary);
@@ -40,8 +42,8 @@ struct affine_replay {
 };
 
 struct envelope_stats {
-    double minimum;
-    double maximum;
+    double lower;
+    double upper;
 };
 
 affine_replay replay_affine(const std::vector<int> & tokens, double lambda) {
@@ -88,19 +90,28 @@ double solve_normal_prior(const affine_replay & replay) {
     return static_cast<double>(mean_offset / (1.0L - mean_coefficient));
 }
 
-envelope_stats evaluate_envelope(const std::vector<double> & offsets, double lambda, double normal_prior) {
-    double coefficient = 1.0;
-    double minimum = std::numeric_limits<double>::infinity();
-    double maximum = -std::numeric_limits<double>::infinity();
-
-    for (double offset : offsets) {
-        coefficient *= lambda;
-        const double weighted_distinct = coefficient * normal_prior + offset;
-        minimum = std::min(minimum, weighted_distinct);
-        maximum = std::max(maximum, weighted_distinct);
+double empirical_quantile(std::vector<double> & values, double probability) {
+    if (values.empty() || probability <= 0.0 || probability > 1.0) {
+        throw std::runtime_error("invalid empirical quantile input");
     }
 
-    return {minimum, maximum};
+    const std::size_t rank = static_cast<std::size_t>(std::ceil(probability * values.size()));
+    const std::size_t index = std::min(values.size() - 1, rank - 1);
+    std::nth_element(values.begin(), values.begin() + index, values.end());
+    return values[index];
+}
+
+envelope_stats evaluate_envelope(std::vector<double> offsets, double lambda, double normal_prior) {
+    double coefficient = 1.0;
+
+    for (double & offset : offsets) {
+        coefficient *= lambda;
+        offset = coefficient * normal_prior + offset;
+    }
+
+    const double lower = empirical_quantile(offsets, lower_tail_probability);
+    const double upper = empirical_quantile(offsets, upper_tail_probability);
+    return {lower, upper};
 }
 
 } // namespace
@@ -170,9 +181,9 @@ int main(int argc, char ** argv) {
         }
 
         const std::vector<int> tokens = codec.encode_parallel(corpus, worker_count);
-        const affine_replay replay = replay_affine(tokens, lambda);
+        affine_replay replay = replay_affine(tokens, lambda);
         const double normal_prior = solve_normal_prior(replay);
-        const envelope_stats envelope = evaluate_envelope(replay.offsets, lambda, normal_prior);
+        const envelope_stats envelope = evaluate_envelope(std::move(replay.offsets), lambda, normal_prior);
 
         std::ofstream out(output, std::ios::trunc);
         if (!out) {
@@ -187,8 +198,11 @@ int main(int argc, char ** argv) {
         out << "inline constexpr std::size_t half_life = " << half_life << ";\n";
         out << "inline constexpr double lambda = " << lambda << ";\n";
         out << "inline constexpr double normal_weighted_distinct_count = " << normal_prior << ";\n";
-        out << "inline constexpr double minimum_weighted_distinct_count = " << envelope.minimum << ";\n";
-        out << "inline constexpr double maximum_weighted_distinct_count = " << envelope.maximum << ";\n";
+        out << "inline constexpr double central_probability = " << central_probability << ";\n";
+        out << "inline constexpr double lower_quantile_probability = " << lower_tail_probability << ";\n";
+        out << "inline constexpr double upper_quantile_probability = " << upper_tail_probability << ";\n";
+        out << "inline constexpr double lower_weighted_distinct_count = " << envelope.lower << ";\n";
+        out << "inline constexpr double upper_weighted_distinct_count = " << envelope.upper << ";\n";
         out << "inline constexpr std::size_t source_files = " << source_files << ";\n";
         out << "inline constexpr std::size_t corpus_tokens = " << tokens.size() << ";\n";
         out << "}\n";
@@ -196,9 +210,11 @@ int main(int argc, char ** argv) {
         std::cerr << "o200k repetition envelope: files=" << source_files
                   << " tokens=" << tokens.size()
                   << " half_life=" << half_life
-                  << " min=" << envelope.minimum
+                  << " lower_p=" << lower_tail_probability
+                  << " lower=" << envelope.lower
                   << " normal=" << normal_prior
-                  << " max=" << envelope.maximum << "\n";
+                  << " upper_p=" << upper_tail_probability
+                  << " upper=" << envelope.upper << "\n";
         return 0;
     } catch (const std::exception & e) {
         std::cerr << "derive-repetition-envelope: " << e.what() << "\n";
