@@ -50,22 +50,6 @@ configure_file(
     "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/tokenizers/o200k_base.tiktoken"
     COPYONLY)
 
-find_package(Git REQUIRED)
-execute_process(
-    COMMAND ${GIT_EXECUTABLE} -C "${PROJECT_SOURCE_DIR}" ls-files --cached
-    OUTPUT_VARIABLE WANXIANGQI_REPETITION_CORPUS
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    RESULT_VARIABLE WANXIANGQI_REPETITION_GIT_RESULT)
-if (NOT WANXIANGQI_REPETITION_GIT_RESULT EQUAL 0)
-    message(FATAL_ERROR "failed to enumerate repository corpus")
-endif()
-
-set(WANXIANGQI_REPETITION_MANIFEST "${CMAKE_CURRENT_BINARY_DIR}/repetition-corpus.txt")
-file(WRITE "${WANXIANGQI_REPETITION_MANIFEST}" "${WANXIANGQI_REPETITION_CORPUS}\n")
-
-string(REPLACE "\n" ";" WANXIANGQI_REPETITION_CORPUS_FILES "${WANXIANGQI_REPETITION_CORPUS}")
-list(TRANSFORM WANXIANGQI_REPETITION_CORPUS_FILES PREPEND "${PROJECT_SOURCE_DIR}/")
-
 add_executable(wanxiangqi-repetition-envelope-tool EXCLUDE_FROM_ALL
     common/derive-repetition-envelope.cpp
     common/repetition-corpus.cpp
@@ -73,30 +57,25 @@ add_executable(wanxiangqi-repetition-envelope-tool EXCLUDE_FROM_ALL
 target_compile_features(wanxiangqi-repetition-envelope-tool PRIVATE cxx_std_17)
 target_link_libraries(wanxiangqi-repetition-envelope-tool PRIVATE wanxiangqi-o200k)
 
-set(WANXIANGQI_REPETITION_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(WANXIANGQI_REPETITION_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/generated")
 set(WANXIANGQI_REPETITION_ENVELOPE "${WANXIANGQI_REPETITION_GENERATED_DIR}/repetition-envelope.h")
 
-add_custom_command(
-    OUTPUT "${WANXIANGQI_REPETITION_ENVELOPE}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${WANXIANGQI_REPETITION_GENERATED_DIR}"
-    COMMAND $<TARGET_FILE:wanxiangqi-repetition-envelope-tool>
-        "${PROJECT_SOURCE_DIR}"
-        "${WANXIANGQI_REPETITION_MANIFEST}"
-        "${WANXIANGQI_REPETITION_ENVELOPE}"
-    DEPENDS
-        wanxiangqi-repetition-envelope-tool
-        "${WANXIANGQI_REPETITION_MANIFEST}"
-        ${WANXIANGQI_REPETITION_CORPUS_FILES}
+# The envelope is a checked-in artifact. Normal configure/build paths only consume it.
+# Refresh it explicitly with: cmake --build <build-dir> --target wanxiangqi-repetition-envelope-update
+add_custom_target(wanxiangqi-repetition-envelope-update
+    COMMAND ${CMAKE_COMMAND}
+        -DWANXIANGQI_REPETITION_ROOT=${PROJECT_SOURCE_DIR}
+        -DWANXIANGQI_REPETITION_MANIFEST=${CMAKE_CURRENT_BINARY_DIR}/repetition-corpus.txt
+        -DWANXIANGQI_REPETITION_OUTPUT=${WANXIANGQI_REPETITION_ENVELOPE}
+        -DWANXIANGQI_REPETITION_TOOL=$<TARGET_FILE:wanxiangqi-repetition-envelope-tool>
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/update-repetition-envelope.cmake
+    DEPENDS wanxiangqi-repetition-envelope-tool
     VERBATIM)
-
-add_custom_target(wanxiangqi-repetition-envelope
-    DEPENDS "${WANXIANGQI_REPETITION_ENVELOPE}")
 
 add_library(wanxiangqi-repetition-guard STATIC
     common/repetition-guard.cpp
     common/repetition-guard.h
     "${WANXIANGQI_REPETITION_ENVELOPE}")
-add_dependencies(wanxiangqi-repetition-guard wanxiangqi-repetition-envelope)
 target_compile_features(wanxiangqi-repetition-guard PRIVATE cxx_std_17)
 target_link_libraries(wanxiangqi-repetition-guard PRIVATE wanxiangqi-o200k)
 target_include_directories(wanxiangqi-repetition-guard PUBLIC

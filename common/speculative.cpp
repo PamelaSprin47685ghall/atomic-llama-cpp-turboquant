@@ -1688,6 +1688,42 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
 
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+        const size_t state_size = (size_t) n_embd * sizeof(float);
+        data.resize(state_size);
+        std::memcpy(data.data(), pending_h[seq_id].data(), state_size);
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+        verify_h[seq_id].clear();
+        verify_h_rows[seq_id] = 0;
+        i_last[seq_id] = -1;
+        if (chain_heads) {
+            chain_h[seq_id].clear();
+        }
+
+        if (data.empty()) {
+            return;
+        }
+
+        const size_t state_size = (size_t) n_embd * sizeof(float);
+        if (data.size() != state_size) {
+            SPC_WRN("invalid MTP state size for seq_id=%d: got %zu, expected %zu\n",
+                    (int) seq_id, data.size(), state_size);
+            return;
+        }
+        std::memcpy(pending_h[seq_id].data(), data.data(), state_size);
+    }
+
     bool need_embd() const override {
         return false;
     }
@@ -2330,6 +2366,7 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        cparams.n_seq_recurrent = llama_n_seq_recurrent(ctx_tgt);
         const uint32_t n_draft_batch = std::max(16u, (uint32_t) params.speculative.draft.n_max);
         cparams.n_batch  = std::min(cparams.n_batch,  n_draft_batch);
         cparams.n_ubatch = std::min(cparams.n_ubatch, n_draft_batch);

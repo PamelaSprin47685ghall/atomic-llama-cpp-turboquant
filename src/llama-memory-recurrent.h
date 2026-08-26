@@ -61,6 +61,10 @@ public:
 
     bool get_can_shift() const override;
 
+    uint32_t get_recurrent_capacity() const override;
+    uint32_t get_recurrent_used()     const override;
+    uint32_t get_recurrent_seq_used(llama_seq_id seq_id) const override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -89,7 +93,6 @@ public:
         llama_pos pos  = -1;
         int32_t   src  = -1; // used to know where states should be copied from
         int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
-        int32_t   tail = -1;
 
         std::set<llama_seq_id> seq_id;
 
@@ -107,6 +110,7 @@ public:
     };
 
     std::vector<mem_cell> cells;
+    std::vector<int32_t> tails; // logical seq_id -> physical cell
 
     // per layer
     std::vector<ggml_tensor *> r_l;

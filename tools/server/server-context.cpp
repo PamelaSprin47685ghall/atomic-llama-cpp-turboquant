@@ -326,13 +326,15 @@ struct server_slot {
 
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        std::vector<uint8_t> state_spec;
+        common_speculative_get_state(spec, id, state_spec);
 
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
+        const size_t cur_size = cur_size_tgt + cur_size_dft + state_spec.size();
 
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, state_spec.size());
         if (cur == nullptr) {
             return false;
         }
@@ -341,12 +343,20 @@ struct server_slot {
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+        if (!state_spec.empty()) {
+            std::memcpy(cur->data.spec.data(), state_spec.data(), state_spec.size());
+        }
 
         return true;
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        std::vector<uint8_t> state_spec;
+        bool loaded_state = false;
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, &state_spec, &loaded_state);
+        if (res && loaded_state) {
+            common_speculative_set_state(spec, id, state_spec);
+        }
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -358,6 +368,7 @@ struct server_slot {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
+        common_speculative_set_state(spec, id, {});
 
         prompt.clear();
     }
@@ -847,6 +858,10 @@ struct server_slot {
         other.n_prompt_tokens_processed_accum = n_prompt_tokens_processed_accum;
         other.truncated                       = truncated;
 
+        std::vector<uint8_t> state_spec;
+        common_speculative_get_state(spec, id, state_spec);
+        common_speculative_set_state(spec, other.id, state_spec);
+
         other.prompt = prompt.clone();
         other.init_sampler();
     }
@@ -1218,8 +1233,8 @@ private:
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
 
-        if (has_spec && (params_base.n_ctx_kv_auto || params_base.n_ctx_kv > 0)) {
-            SRV_ERR("%s", "dynamic unified KV sizing is not supported with speculative decoding yet\n");
+        if (has_draft && (params_base.n_ctx_kv_auto || params_base.n_ctx_kv > 0)) {
+            SRV_ERR("%s", "dynamic unified KV sizing is not supported with an external draft model yet\n");
             return false;
         }
 
@@ -1301,6 +1316,12 @@ private:
                 auto cparams_dft = common_context_params_to_llama(params_dft);
                 if (spec_mtp) {
                     cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                    if (params_base.n_ctx_kv_auto || params_base.n_ctx_kv > 0) {
+                        // Dynamic KV/recurrent planning bootstraps from one physical
+                        // recurrent state. The final MTP capacity follows the target
+                        // context after unified KV sizing instead of reserving 4 here.
+                        cparams_dft.n_seq_recurrent = 1;
+                    }
                 }
                 cparams_dft.n_rs_seq = 0;
 
@@ -1961,18 +1982,30 @@ private:
         return true;
     }
 
-    server_slot * find_preemption_victim(int32_t id_slot_protected) {
+    server_slot * find_preemption_victim(int32_t id_slot_protected, bool recurrent_pressure) {
         server_slot * victim = nullptr;
-        uint32_t victim_kv_used = 0;
+        uint64_t victim_kv_used = 0;
         size_t n_preemptible = 0;
-        llama_memory_t mem = llama_get_memory(ctx_tgt);
+        llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
+        llama_memory_t mem_dft = ctx_dft ? llama_get_memory(ctx_dft) : nullptr;
 
         for (auto & slot : slots) {
             if (slot.id == id_slot_protected || slot.state != SLOT_STATE_GENERATING || !slot.task) {
                 continue;
             }
             ++n_preemptible;
-            const uint32_t kv_used = llama_memory_seq_get_kv_used(mem, slot.id);
+
+            const bool has_recurrent_tgt = llama_memory_seq_get_recurrent_used(mem_tgt, slot.id) != 0;
+            const bool has_recurrent_dft = mem_dft && mem_dft != mem_tgt &&
+                llama_memory_seq_get_recurrent_used(mem_dft, slot.id) != 0;
+            if (recurrent_pressure && !has_recurrent_tgt && !has_recurrent_dft) {
+                continue;
+            }
+
+            uint64_t kv_used = llama_memory_seq_get_kv_used(mem_tgt, slot.id);
+            if (mem_dft && mem_dft != mem_tgt) {
+                kv_used += llama_memory_seq_get_kv_used(mem_dft, slot.id);
+            }
             if (victim == nullptr || kv_used > victim_kv_used) {
                 victim = &slot;
                 victim_kv_used = kv_used;
@@ -2102,22 +2135,68 @@ private:
         return (uint32_t) std::min<size_t>(n_remaining, llama_n_batch(ctx_tgt));
     }
 
+    uint32_t estimate_next_recurrent_cells(llama_memory_t mem, bool draft_only) {
+        if (inference_mode == SERVER_INFERENCE_MODE_DECODE) {
+            uint32_t required = 0;
+            server_slot * slot_batched = nullptr;
+            for (auto & slot : slots) {
+                if (slot.state != SLOT_STATE_GENERATING || (draft_only && !slot.can_speculate())) {
+                    continue;
+                }
+                if (slot_batched == nullptr) {
+                    slot_batched = &slot;
+                } else if (!slot_batched->can_batch_with(slot)) {
+                    continue;
+                }
+                required += llama_memory_seq_get_recurrent_used(mem, slot.id) == 0 ? 1 : 0;
+            }
+            return required;
+        }
+
+        if (draft_only) {
+            return 0;
+        }
+
+        server_slot * slot = id_slot_prefill >= 0 ? get_slot_by_id(id_slot_prefill) : nullptr;
+        if (slot == nullptr || !slot->task || !slot->is_processing()) {
+            return 0;
+        }
+        return llama_memory_seq_get_recurrent_used(mem, slot->id) == 0 ? 1 : 0;
+    }
+
     bool ensure_next_kv_capacity() {
         if (!params_base.kv_unified || params_base.n_ctx_kv == 0) {
             return true;
         }
 
         while (true) {
-            llama_memory_kv_usage usage;
-            if (!llama_memory_get_kv_usage(llama_get_memory(ctx_tgt), &usage)) {
+            llama_memory_kv_usage usage_tgt = {};
+            llama_memory_kv_usage usage_dft = {};
+            llama_memory_kv_usage usage_recurrent_tgt = {};
+            llama_memory_kv_usage usage_recurrent_dft = {};
+            llama_memory_t mem_tgt = llama_get_memory(ctx_tgt);
+            llama_memory_t mem_dft = ctx_dft ? llama_get_memory(ctx_dft) : nullptr;
+            const bool has_tgt_usage = llama_memory_get_kv_usage(mem_tgt, &usage_tgt);
+            const bool has_dft_usage = mem_dft && mem_dft != mem_tgt && llama_memory_get_kv_usage(mem_dft, &usage_dft);
+            const bool has_recurrent_tgt = llama_memory_get_recurrent_usage(mem_tgt, &usage_recurrent_tgt);
+            const bool has_recurrent_dft = mem_dft && mem_dft != mem_tgt &&
+                llama_memory_get_recurrent_usage(mem_dft, &usage_recurrent_dft);
+            if (!has_tgt_usage && !has_dft_usage && !has_recurrent_tgt && !has_recurrent_dft) {
                 return true;
             }
 
             int32_t id_slot_protected = -1;
-            const uint32_t required = estimate_next_kv_cells(id_slot_protected);
-            const uint64_t available = usage.capacity - std::min(usage.capacity, usage.used);
+            const uint32_t required_kv = estimate_next_kv_cells(id_slot_protected);
+            const uint32_t required_recurrent_tgt = has_recurrent_tgt ? estimate_next_recurrent_cells(mem_tgt, false) : 0;
+            const uint32_t required_recurrent_dft = has_recurrent_dft ? estimate_next_recurrent_cells(mem_dft, true) : 0;
+            const uint64_t available_tgt = has_tgt_usage ? usage_tgt.capacity - std::min(usage_tgt.capacity, usage_tgt.used) : UINT64_MAX;
+            const uint64_t available_dft = has_dft_usage ? usage_dft.capacity - std::min(usage_dft.capacity, usage_dft.used) : UINT64_MAX;
+            const uint64_t available_recurrent_tgt = has_recurrent_tgt ? usage_recurrent_tgt.capacity - std::min(usage_recurrent_tgt.capacity, usage_recurrent_tgt.used) : UINT64_MAX;
+            const uint64_t available_recurrent_dft = has_recurrent_dft ? usage_recurrent_dft.capacity - std::min(usage_recurrent_dft.capacity, usage_recurrent_dft.used) : UINT64_MAX;
 
-            if (required <= available) {
+            if (required_kv <= available_tgt && required_kv <= available_dft &&
+                required_recurrent_tgt <= available_recurrent_tgt &&
+                required_recurrent_dft <= available_recurrent_dft) {
                 return true;
             }
 
@@ -2125,9 +2204,13 @@ private:
                 continue;
             }
 
-            server_slot * victim = find_preemption_victim(id_slot_protected);
+            const bool recurrent_pressure = required_recurrent_tgt > available_recurrent_tgt ||
+                                            required_recurrent_dft > available_recurrent_dft;
+            server_slot * victim = find_preemption_victim(id_slot_protected, recurrent_pressure);
             if (victim == nullptr) {
-                SRV_DBG("unified KV needs %u cells, only %" PRIu64 " available, continuing without preemption\n", required, available);
+                SRV_DBG("dynamic memory needs kv=%u recurrent_tgt=%u recurrent_dft=%u, target available=%" PRIu64 ", draft available=%" PRIu64 ", recurrent_tgt available=%" PRIu64 ", recurrent_dft available=%" PRIu64 "\n",
+                        required_kv, required_recurrent_tgt, required_recurrent_dft,
+                        available_tgt, available_dft, available_recurrent_tgt, available_recurrent_dft);
                 return true;
             }
 
@@ -3529,6 +3612,8 @@ private:
                         if (use_ckpt_dft) {
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
+                        slot.spec_ckpt.data_spec.clear();
+                        common_speculative_get_state(spec.get(), slot.id, slot.spec_ckpt.data_spec);
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
@@ -4484,6 +4569,7 @@ private:
                         if (slot.ctx_dft) {
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
+                        common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
 

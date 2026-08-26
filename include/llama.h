@@ -353,8 +353,9 @@ extern "C" {
         uint32_t n_ctx;             // text context, 0 = from model
         uint32_t n_batch;           // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;          // physical maximum batch size
-        uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
+        uint32_t n_seq_max;         // max number of logical sequences
         uint32_t n_seq_max_pp;      // max number of sequences used to reserve prompt-processing graphs, 0 = n_seq_max
+        uint32_t n_seq_recurrent;   // physical recurrent-state slots, 0 = n_seq_max [EXPERIMENTAL]
         uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_outputs_max;     // max outputs in a ubatch (0 = n_batch)
         int32_t  n_threads;         // number of threads to use for generation
@@ -561,8 +562,9 @@ extern "C" {
     LLAMA_API uint32_t llama_n_ctx_kv   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
-    LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
-    LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
+    LLAMA_API uint32_t llama_n_seq_max       (const struct llama_context * ctx);
+    LLAMA_API uint32_t llama_n_seq_recurrent (const struct llama_context * ctx);
+    LLAMA_API uint32_t llama_n_rs_seq        (const struct llama_context * ctx);
 
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");
@@ -804,6 +806,12 @@ extern "C" {
 
     // Returns the number of KV cells occupied by the specified sequence.
     LLAMA_API uint32_t llama_memory_seq_get_kv_used(llama_memory_t mem, llama_seq_id seq_id);
+
+    // Returns false when the memory does not expose recurrent state storage.
+    LLAMA_API bool llama_memory_get_recurrent_usage(llama_memory_t mem, struct llama_memory_kv_usage * usage);
+
+    // Returns 1 when the specified sequence owns recurrent state, otherwise 0.
+    LLAMA_API uint32_t llama_memory_seq_get_recurrent_used(llama_memory_t mem, llama_seq_id seq_id);
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);

@@ -1222,6 +1222,23 @@ static void common_init_sampler_from_model(
     get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA),    sparams.mirostat_eta,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA);
 }
 
+static uint32_t common_dynamic_recurrent_target(const llama_context_params & cparams) {
+    const uint32_t n_seq_max = std::max(1u, cparams.n_seq_max);
+    const uint32_t n_ctx = cparams.n_ctx;
+    const uint32_t n_ctx_kv = cparams.n_ctx_kv;
+
+    if (n_ctx == 0 || n_ctx_kv == 0) {
+        return 1;
+    }
+
+    // Assume active sequence lengths are uniformly distributed in [0, n_ctx].
+    // Their expected KV residency is n_ctx / 2, so provision recurrent state for
+    // the nearest integer expected concurrency instead of filling spare VRAM.
+    const uint64_t scaled = 2ull * n_ctx_kv;
+    const uint64_t rounded = (scaled + n_ctx / 2u) / n_ctx;
+    return std::max(1u, std::min<uint32_t>((uint32_t) std::min<uint64_t>(rounded, UINT32_MAX), n_seq_max));
+}
+
 struct common_init_result::impl {
     impl() = default;
     ~impl() = default;
@@ -1242,6 +1259,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    const bool dynamic_kv = params.n_ctx_kv_auto || params.n_ctx_kv > 0;
+    if (dynamic_kv) {
+        // Start auto KV fitting with the minimum recurrent footprint. The final
+        // physical recurrent capacity is derived from the fitted unified KV size.
+        cparams.n_seq_recurrent = 1;
+    }
+
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
@@ -1256,15 +1280,117 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
+    llama_context_params cparams_mtp = {};
+    const llama_context_params * extra_cparams = nullptr;
+    if (dynamic_kv) {
+        const bool spec_mtp = std::find(
+            params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        if (spec_mtp) {
+            cparams_mtp = cparams;
+            cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            cparams_mtp.ctx_other = nullptr;
+            cparams_mtp.n_seq_recurrent = cparams.n_seq_recurrent;
+            cparams_mtp.n_rs_seq = 0;
+            const uint32_t n_draft_batch = (uint32_t) std::max(16, params.speculative.draft.n_max);
+            cparams_mtp.n_batch  = std::min(cparams_mtp.n_batch,  n_draft_batch);
+            cparams_mtp.n_ubatch = std::min(cparams_mtp.n_ubatch, n_draft_batch);
+            extra_cparams = &cparams_mtp;
+        }
+
+    }
+
     if (params.n_ctx_kv_auto) {
-        const auto status = common_fit_kv_cache(
-            params.model.path.c_str(), &mparams, &cparams, params.n_ctx_kv_reserve,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        auto fit_kv = [&]() {
+            return common_fit_kv_cache(
+                params.model.path.c_str(), &mparams, &cparams, params.n_ctx_kv_reserve,
+                extra_cparams,
+                params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        };
+
+        auto status = fit_kv();
         if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
             COM_ERR("%s", "failed to size unified KV cache automatically\n");
             return;
         }
+
+        // Refit KV after deriving the recurrent target from expected KV residency.
+        // Only move the target downward after the first estimate: if adding state
+        // shrinks KV enough to cross a rounding boundary, prefer the lower state
+        // count rather than oscillating into an over-provisioned configuration.
+        uint32_t target_recurrent = common_dynamic_recurrent_target(cparams);
+        while (target_recurrent > cparams.n_seq_recurrent) {
+            cparams.n_seq_recurrent = target_recurrent;
+            if (extra_cparams != nullptr) {
+                cparams_mtp.n_seq_recurrent = target_recurrent;
+            }
+
+            status = fit_kv();
+            if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                target_recurrent = std::max(1u, target_recurrent / 2u);
+                cparams.n_seq_recurrent = 1;
+                if (extra_cparams != nullptr) {
+                    cparams_mtp.n_seq_recurrent = 1;
+                }
+                continue;
+            }
+
+            const uint32_t supported_recurrent = common_dynamic_recurrent_target(cparams);
+            if (supported_recurrent >= target_recurrent) {
+                break;
+            }
+            target_recurrent = std::max(1u, supported_recurrent);
+            cparams.n_seq_recurrent = 1;
+            if (extra_cparams != nullptr) {
+                cparams_mtp.n_seq_recurrent = 1;
+            }
+        }
+
+        if (cparams.n_seq_recurrent == 1 && target_recurrent > 1) {
+            cparams.n_seq_recurrent = target_recurrent;
+            if (extra_cparams != nullptr) {
+                cparams_mtp.n_seq_recurrent = target_recurrent;
+            }
+            status = fit_kv();
+            if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                COM_ERR("%s", "failed to size unified KV cache for recurrent target\n");
+                return;
+            }
+        }
+
         params.n_ctx_kv = cparams.n_ctx_kv;
+    } else if (dynamic_kv) {
+        // When --fit is off and the user did not specify -c, resolve n_ctx
+        // from the model's training context so that common_dynamic_recurrent_target
+        // computes the correct recurrent target instead of falling back to 1.
+        if (cparams.n_ctx == 0) {
+            llama_model_params meta_mparams = mparams;
+            meta_mparams.no_alloc  = true;
+            meta_mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+            llama_model * meta_model = llama_model_load_from_file(params.model.path.c_str(), meta_mparams);
+            if (meta_model != nullptr) {
+                const int32_t n_ctx_train = llama_model_n_ctx_train(meta_model);
+                if (n_ctx_train > 0) {
+                    cparams.n_ctx = (uint32_t) n_ctx_train;
+                }
+                llama_model_free(meta_model);
+            }
+        }
+        cparams.n_seq_recurrent = common_dynamic_recurrent_target(cparams);
+        if (extra_cparams != nullptr) {
+            cparams_mtp.n_seq_recurrent = cparams.n_seq_recurrent;
+        }
+    }
+
+    if (dynamic_kv) {
+        const auto status = common_fit_recurrent_cache(
+            params.model.path.c_str(), &mparams, &cparams, params.n_ctx_kv_reserve,
+            extra_cparams,
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+            COM_ERR("%s", "failed to size recurrent state pool automatically\n");
+            return;
+        }
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1670,6 +1796,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx_kv          = params.n_ctx_kv;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_seq_max_pp      = params.n_parallel_pp;
+    cparams.n_seq_recurrent   = 0;
     cparams.n_outputs_max     = params.n_outputs_max;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);

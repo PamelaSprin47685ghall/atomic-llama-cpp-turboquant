@@ -468,15 +468,15 @@ def test_completion_dynamic_kv_auto_parallel_not_fixed_to_four_slots():
     global server
     server.n_slots = -1
     server.kv_unified = True
-    server.n_ctx = 128
-    server.kv_size = 256
+    server.n_ctx = 256
+    server.kv_size = 512
     server.server_slots = True
     server.start()
 
     res = server.make_request("GET", "/slots")
     assert res.status_code == 200
     assert len(res.body) > 4
-    assert all(slot["n_ctx"] == 128 for slot in res.body)
+    assert all(slot["n_ctx"] == 256 for slot in res.body)
 
 
 @pytest.mark.parametrize(

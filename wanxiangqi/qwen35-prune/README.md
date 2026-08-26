@@ -75,7 +75,7 @@ The 1.0 test line compresses only the parts that are already sufficiently
 engineered for external evaluation:
 
 - routed-expert width: `512 -> 256`;
-- vocabulary: `248320 -> 36096`;
+- vocabulary: variable-size Chinese/English-preserving language filtering (no fixed target size);
 - hidden size: unchanged at 2048;
 - **Gated Delta Net (GDN): unchanged**;
 - GDN state/head dimension remains `128`;
@@ -178,11 +178,14 @@ final 1.x release is declared.
 
 ## Vocabulary compression
 
-The 1.0 vocabulary path reduces 248,320 tokens to 36,096 while preserving the
-complete 256-byte fallback alphabet.  It rebuilds tokenizer metadata, remaps
-special token IDs and retains tokenizer audit support.  The current test
-artifact contains 35,799 merge rules, 289 protected tokens and all 256 byte
-fallback tokens.
+The vocabulary path no longer targets a fixed token count. It keeps tokens that
+are Chinese, English/Latin-script, ASCII/code/protocol syntax, neutral Unicode
+(symbols, math, emoji), special/control tokens, and the complete 256-byte
+fallback alphabet. It removes only tokens whose decoded text is confidently in
+a non-Chinese/non-English writing system, then restores any removed token that
+is required as a BPE ancestor of a retained token. Ambiguous tokens are kept.
+The final vocabulary size is therefore data-independent and is recorded in the
+plan/manifest rather than forced to 36,096.
 
 ## Integrity and reproducibility
 
@@ -194,7 +197,7 @@ For a 1.0 test artifact, the essential release checks are:
 1. stock llama.cpp/qwen35moe can load the generated GGUF;
 2. model metadata reports GDN `128/4096`;
 3. all 150 GDN payload hashes equal their source hashes;
-4. expert width is 256 and vocabulary is 36,096;
+4. expert width is 256 and the variable pruned vocabulary size matches the plan/manifest;
 5. tokenizer metadata is internally consistent;
 6. a held-out PPL smoke completes with finite NLL/PPL;
 7. model SHA-256 and manifest are supplied to the tester.

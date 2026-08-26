@@ -98,6 +98,7 @@ llama_context::llama_context(
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     cparams.n_seq_max_pp = params.n_seq_max_pp == 0 ? cparams.n_seq_max : std::max(1u, params.n_seq_max_pp);
+    cparams.n_seq_recurrent = params.n_seq_recurrent == 0 ? cparams.n_seq_max : std::max(1u, std::min(params.n_seq_recurrent, cparams.n_seq_max));
     cparams.n_outputs_max = params.n_outputs_max;
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
@@ -331,6 +332,7 @@ llama_context::llama_context(
     }
 
     LLAMA_LOG_INFO("%s: n_seq_max     = %u\n",   __func__, cparams.n_seq_max);
+    LLAMA_LOG_INFO("%s: n_seq_recur   = %u\n",   __func__, cparams.n_seq_recurrent);
     LLAMA_LOG_INFO("%s: n_ctx         = %u\n",   __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_ctx_seq     = %u\n",   __func__, cparams.n_ctx_seq);
     LLAMA_LOG_INFO("%s: n_ctx_kv      = %u\n",   __func__, cparams.n_ctx_kv);
@@ -631,7 +633,13 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs_pp = cparams.n_seq_max_pp;
-    const uint32_t n_seqs_tg = cparams.n_seq_max;
+    uint32_t n_seqs_tg = cparams.n_seq_max;
+    if (memory) {
+        const uint32_t recurrent_capacity = memory->get_recurrent_capacity();
+        if (recurrent_capacity > 0) {
+            n_seqs_tg = std::min(n_seqs_tg, recurrent_capacity);
+        }
+    }
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
     // The full reserve memory context exposes all TG KV streams, even when the PP graph
@@ -3577,6 +3585,7 @@ llama_context_params llama_context_default_params() {
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
         /*.n_seq_max_pp                =*/ 0,
+        /*.n_seq_recurrent             =*/ 0,
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
@@ -3791,6 +3800,10 @@ uint32_t llama_n_ubatch(const llama_context * ctx) {
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {
     return ctx->n_seq_max();
+}
+
+uint32_t llama_n_seq_recurrent(const llama_context * ctx) {
+    return ctx->get_cparams().n_seq_recurrent;
 }
 
 uint32_t llama_n_rs_seq(const llama_context * ctx) {
@@ -4125,6 +4138,29 @@ uint32_t llama_memory_seq_get_kv_used(llama_memory_t mem, llama_seq_id seq_id) {
     }
 
     return mem->get_kv_seq_used(seq_id);
+}
+
+bool llama_memory_get_recurrent_usage(llama_memory_t mem, llama_memory_kv_usage * usage) {
+    if (!mem || !usage) {
+        return false;
+    }
+
+    const uint32_t capacity = mem->get_recurrent_capacity();
+    if (capacity == 0) {
+        return false;
+    }
+
+    usage->capacity = capacity;
+    usage->used     = mem->get_recurrent_used();
+    return true;
+}
+
+uint32_t llama_memory_seq_get_recurrent_used(llama_memory_t mem, llama_seq_id seq_id) {
+    if (!mem) {
+        return 0;
+    }
+
+    return mem->get_recurrent_seq_used(seq_id);
 }
 
 bool llama_memory_can_shift(llama_memory_t mem) {

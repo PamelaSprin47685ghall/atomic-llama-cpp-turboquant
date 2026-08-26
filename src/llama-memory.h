@@ -113,6 +113,10 @@ struct llama_memory_i {
     virtual uint32_t get_kv_used()     const { return 0; }
     virtual uint32_t get_kv_seq_used(llama_seq_id seq_id) const { GGML_UNUSED(seq_id); return 0; }
 
+    virtual uint32_t get_recurrent_capacity() const { return 0; }
+    virtual uint32_t get_recurrent_used()     const { return 0; }
+    virtual uint32_t get_recurrent_seq_used(llama_seq_id seq_id) const { GGML_UNUSED(seq_id); return 0; }
+
     //
     // ops
     //

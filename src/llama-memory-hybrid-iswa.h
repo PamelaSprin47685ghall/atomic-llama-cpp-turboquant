@@ -62,6 +62,10 @@ public:
     uint32_t get_kv_used()     const override;
     uint32_t get_kv_seq_used(llama_seq_id seq_id) const override;
 
+    uint32_t get_recurrent_capacity() const override;
+    uint32_t get_recurrent_used()     const override;
+    uint32_t get_recurrent_seq_used(llama_seq_id seq_id) const override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

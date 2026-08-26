@@ -355,6 +355,11 @@ static void common_params_fit_impl(
                             __func__, hp_nct, cparams->n_ctx, memory_reduction/MiB);
                     }
                 } else {
+                    // Context was not reduced (either full context requested or
+                    // model training context <= n_ctx_min).  Resolve n_ctx from
+                    // the model so downstream code (e.g. recurrent target) sees
+                    // a non-zero per-sequence context instead of 0.
+                    cparams->n_ctx = hp_nct;
                     if (n_ctx_min == UINT32_MAX) {
                         LOG_TRC("%s: user has requested full context size of %" PRIu32 " -> no change\n", __func__, hp_nct);
                     } else {
@@ -959,6 +964,7 @@ common_params_fit_status common_fit_kv_cache(
            const llama_model_params * mparams,
                llama_context_params * cparams,
         const std::vector<std::pair<ggml_backend_dev_t, size_t>> & reserve,
+        const llama_context_params * extra_cparams,
                      ggml_log_level   log_level) {
     if (!cparams->kv_unified) {
         LOG_WRN("%s: automatic KV sizing requires unified KV cache\n", __func__);
@@ -991,6 +997,24 @@ common_params_fit_status common_fit_kv_cache(
             return false;
         }
 
+        common_device_memory_data_vec extra_data;
+        std::vector<ggml_backend_dev_t> extra_devs;
+        if (extra_cparams != nullptr) {
+            llama_context_params extra = *extra_cparams;
+            extra.n_ctx_kv = n_ctx_kv;
+            uint32_t extra_ngl = 0;
+            uint32_t extra_n_ctx_train = 0;
+            uint32_t extra_n_expert = 0;
+            try {
+                extra_data = common_get_device_memory_data(
+                    path_model, mparams, &extra, extra_devs,
+                    extra_ngl, extra_n_ctx_train, extra_n_expert, log_level);
+            } catch (const std::exception & e) {
+                LOG_TRC("%s: extra context KV size %u probe failed: %s\n", __func__, n_ctx_kv, e.what());
+                return false;
+            }
+        }
+
         for (size_t i = 0; i < devs.size(); ++i) {
             size_t reserved = 0;
             for (const auto & [dev, bytes] : reserve) {
@@ -999,7 +1023,16 @@ common_params_fit_status common_fit_kv_cache(
                 }
             }
 
-            const uint64_t used = data[i].model + data[i].context + data[i].compute + reserved;
+            for (size_t j = 0; j < extra_devs.size(); ++j) {
+                if (extra_devs[j] == devs[i]) {
+                    reserved += extra_data[j].context;
+                }
+            }
+
+            constexpr uint64_t MiB = 1024ull * 1024ull;
+            const uint64_t runtime_headroom = std::min<uint64_t>(
+                256ull * MiB, std::max<uint64_t>(32ull * MiB, data[i].total / 100ull));
+            const uint64_t used = data[i].model + data[i].context + data[i].compute + reserved + runtime_headroom;
             if (data[i].free <= 0 || used > (uint64_t) data[i].free) {
                 return false;
             }
@@ -1023,7 +1056,13 @@ common_params_fit_status common_fit_kv_cache(
         return COMMON_PARAMS_FIT_STATUS_FAILURE;
     }
 
-    const uint32_t n_ctx_seq = cparams->n_ctx == 0 ? hp_n_ctx_train : cparams->n_ctx;
+    // Resolve the per-sequence context from the model's training context when the
+    // user did not specify -c.  This mirrors llama_context's own resolution and
+    // makes the value visible to common_dynamic_recurrent_target after we return.
+    if (cparams->n_ctx == 0) {
+        cparams->n_ctx = hp_n_ctx_train;
+    }
+    const uint32_t n_ctx_seq = cparams->n_ctx;
     if (n_ctx_seq > n_max) {
         LOG_WRN("%s: per-sequence context of %u tokens exceeds the maximum aligned KV capacity\n", __func__, n_ctx_seq);
         return COMMON_PARAMS_FIT_STATUS_FAILURE;
@@ -1090,6 +1129,115 @@ common_params_fit_status common_fit_kv_cache(
     cparams->n_ctx_kv = (uint32_t) (lo_u * n_align);
     LOG_INF("%s: automatic unified KV capacity = %u tokens\n", __func__, cparams->n_ctx_kv);
 
+    return COMMON_PARAMS_FIT_STATUS_SUCCESS;
+}
+
+common_params_fit_status common_fit_recurrent_cache(
+                         const char * path_model,
+           const llama_model_params * mparams,
+               llama_context_params * cparams,
+        const std::vector<std::pair<ggml_backend_dev_t, size_t>> & reserve,
+        const llama_context_params * extra_cparams,
+                     ggml_log_level   log_level) {
+    const uint32_t n_max = std::max(1u, cparams->n_seq_max);
+    const uint32_t n_target = std::max(1u, std::min(cparams->n_seq_recurrent == 0 ? 1u : cparams->n_seq_recurrent, n_max));
+
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0;
+    uint32_t hp_n_ctx_train = 0;
+    uint32_t hp_n_expert = 0;
+
+    auto fits = [&](uint32_t n_seq_recurrent) {
+        llama_context_params test = *cparams;
+        test.n_seq_recurrent = n_seq_recurrent;
+
+        common_device_memory_data_vec data;
+        try {
+            data = common_get_device_memory_data(
+                path_model, mparams, &test, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+        } catch (const std::exception & e) {
+            LOG_TRC("%s: recurrent capacity %u probe failed: %s\n", __func__, n_seq_recurrent, e.what());
+            return false;
+        }
+
+        if (devs.empty()) {
+            return true;
+        }
+
+        common_device_memory_data_vec extra_data;
+        std::vector<ggml_backend_dev_t> extra_devs;
+        if (extra_cparams != nullptr) {
+            llama_context_params extra = *extra_cparams;
+            extra.n_ctx_kv = cparams->n_ctx_kv;
+            extra.n_seq_recurrent = n_seq_recurrent;
+            uint32_t extra_ngl = 0;
+            uint32_t extra_n_ctx_train = 0;
+            uint32_t extra_n_expert = 0;
+            try {
+                extra_data = common_get_device_memory_data(
+                    path_model, mparams, &extra, extra_devs,
+                    extra_ngl, extra_n_ctx_train, extra_n_expert, log_level);
+            } catch (const std::exception & e) {
+                LOG_TRC("%s: extra context recurrent probe failed: %s\n", __func__, e.what());
+                return false;
+            }
+        }
+
+        for (size_t i = 0; i < devs.size(); ++i) {
+            uint64_t reserved = 0;
+            for (const auto & [dev, bytes] : reserve) {
+                if (dev == devs[i]) {
+                    reserved += bytes;
+                }
+            }
+            for (size_t j = 0; j < extra_devs.size(); ++j) {
+                if (extra_devs[j] == devs[i]) {
+                    reserved += extra_data[j].context;
+                }
+            }
+
+            const uint64_t used = data[i].model + data[i].context + data[i].compute + reserved;
+            if (data[i].free <= 0 || used > (uint64_t) data[i].free) {
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    if (!fits(1)) {
+        LOG_WRN("%s: one recurrent state slot does not fit in device memory\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+
+    if (devs.empty()) {
+        cparams->n_seq_recurrent = n_target;
+        LOG_INF("%s: no device-backed recurrent memory detected; keeping %u physical slots (logical sequences = %u)\n",
+                __func__, cparams->n_seq_recurrent, cparams->n_seq_max);
+        return COMMON_PARAMS_FIT_STATUS_SUCCESS;
+    }
+
+    if (n_target == 1 || fits(n_target)) {
+        cparams->n_seq_recurrent = n_target;
+        LOG_INF("%s: recurrent state capacity = %u physical slots (target = %u, logical sequences = %u)\n",
+                __func__, cparams->n_seq_recurrent, n_target, cparams->n_seq_max);
+        return COMMON_PARAMS_FIT_STATUS_SUCCESS;
+    }
+
+    uint32_t lo = 1;
+    uint32_t hi = n_target;
+    while (lo + 1 < hi) {
+        const uint32_t mid = lo + (hi - lo) / 2;
+        if (fits(mid)) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    cparams->n_seq_recurrent = lo;
+    LOG_INF("%s: recurrent state capacity = %u physical slots (target = %u, logical sequences = %u)\n",
+            __func__, cparams->n_seq_recurrent, n_target, cparams->n_seq_max);
     return COMMON_PARAMS_FIT_STATUS_SUCCESS;
 }
 

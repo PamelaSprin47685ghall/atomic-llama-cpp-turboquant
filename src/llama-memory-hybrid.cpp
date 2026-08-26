@@ -147,6 +147,18 @@ uint32_t llama_memory_hybrid::get_kv_seq_used(llama_seq_id seq_id) const {
     return mem_attn->get_kv_seq_used(seq_id);
 }
 
+uint32_t llama_memory_hybrid::get_recurrent_capacity() const {
+    return mem_recr->get_recurrent_capacity();
+}
+
+uint32_t llama_memory_hybrid::get_recurrent_used() const {
+    return mem_recr->get_recurrent_used();
+}
+
+uint32_t llama_memory_hybrid::get_recurrent_seq_used(llama_seq_id seq_id) const {
+    return mem_recr->get_recurrent_seq_used(seq_id);
+}
+
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);

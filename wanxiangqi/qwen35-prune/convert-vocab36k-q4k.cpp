@@ -93,7 +93,7 @@ int main(int argc, char ** argv) {
     const int64_t n_tensors = gguf_get_n_tensors(in_ctx.get());
     std::cout << "Input tensor count: " << n_tensors << "\n";
 
-    // Extract mapping from vocab fixture
+    // Extract the variable-size row mapping from the vocab fixture
     const int64_t f_token_key = gguf_find_key(vocab_ctx.get(), "tokenizer.ggml.tokens");
     const size_t n_vocab_dst = gguf_get_arr_n(vocab_ctx.get(), f_token_key);
     std::cout << "Target vocab size: " << n_vocab_dst << " tokens\n";
@@ -104,16 +104,25 @@ int main(int argc, char ** argv) {
     std::unordered_map<std::string, int> src_token_to_id;
     src_token_to_id.reserve(n_vocab_src * 2);
     for (size_t i = 0; i < n_vocab_src; ++i) {
-        src_token_to_id.emplace(gguf_get_arr_str(in_ctx.get(), in_token_key, i), (int) i);
+        const std::string token = gguf_get_arr_str(in_ctx.get(), in_token_key, i);
+        const auto [it, inserted] = src_token_to_id.emplace(token, (int) i);
+        if (!inserted) {
+            throw std::runtime_error("cannot infer vocab row mapping from duplicate source token text");
+        }
     }
 
     std::vector<int> vocab_mapping(n_vocab_dst);
+    std::vector<uint8_t> source_row_used(n_vocab_src, 0);
     for (size_t i = 0; i < n_vocab_dst; ++i) {
         const std::string token = gguf_get_arr_str(vocab_ctx.get(), f_token_key, i);
         auto it = src_token_to_id.find(token);
         if (it == src_token_to_id.end()) {
             throw std::runtime_error("vocab token missing in source: " + token);
         }
+        if (source_row_used[(size_t) it->second]) {
+            throw std::runtime_error("duplicate source row selected by vocab fixture");
+        }
+        source_row_used[(size_t) it->second] = 1;
         vocab_mapping[i] = it->second;
     }
 

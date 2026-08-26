@@ -76,7 +76,7 @@ constexpr int GDN_DIM_SRC = 128;
 constexpr int GDN_DIM_DST = 64;
 constexpr int GDN_QK_HEADS = 16;
 constexpr int GDN_V_HEADS = 32;
-constexpr int VOCAB_DST = 36096;
+constexpr int VOCAB_SRC = 248320;
 
 const std::array<int, 30> RECURRENT_LAYERS = {
     0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18,
@@ -438,6 +438,36 @@ static void require_source_contract(const source_gguf & src) {
 
     require_shape("token_embd.weight", {HIDDEN, 248320});
     require_shape("output.weight", {HIDDEN, 248320});
+}
+
+// Vocabulary-only operations may run after expert/GDN pruning. They only need
+// the original Qwen3.5 vocabulary axes and tokenizer metadata, so do not couple
+// them to the teacher's expert count/width or recurrent dimensions.
+static void require_vocab_source_contract(const source_gguf & src) {
+    if (src.get_str("general.architecture") != "qwen35moe") {
+        throw std::runtime_error("architecture is not qwen35moe");
+    }
+    if (src.get_u32("qwen35moe.embedding_length") != HIDDEN) {
+        throw std::runtime_error("embedding_length != 2048");
+    }
+
+    const int64_t token_key = gguf_find_key(src.meta(), "tokenizer.ggml.tokens");
+    const int64_t type_key  = gguf_find_key(src.meta(), "tokenizer.ggml.token_type");
+    const int64_t merge_key = gguf_find_key(src.meta(), "tokenizer.ggml.merges");
+    if (token_key < 0 || type_key < 0 || merge_key < 0) {
+        throw std::runtime_error("tokenizer arrays missing");
+    }
+    if (gguf_get_arr_n(src.meta(), token_key) != VOCAB_SRC ||
+        gguf_get_arr_n(src.meta(), type_key) != VOCAB_SRC) {
+        throw std::runtime_error("unexpected source vocab size");
+    }
+
+    for (const char * name : {"token_embd.weight", "output.weight"}) {
+        const ggml_tensor * t = src.tensor(name);
+        if (ggml_n_dims(t) != 2 || t->ne[0] != HIDDEN || t->ne[1] != VOCAB_SRC) {
+            throw std::runtime_error(std::string("unexpected vocab tensor shape: ") + name);
+        }
+    }
 }
 
 // Expert-count pruning is a second-stage operation on the already materialized
@@ -1965,10 +1995,12 @@ static json make_keep_source_gdn_plan() {
 }
 
 static json make_keep_source_vocab_plan() {
-    std::vector<int> placeholder(VOCAB_DST);
+    std::vector<int> placeholder(VOCAB_SRC);
     std::iota(placeholder.begin(), placeholder.end(), 0);
     return {
         {"output_to_input", placeholder},
+        {"source_vocab_size", VOCAB_SRC},
+        {"output_vocab_size", VOCAB_SRC},
         {"byte_fallback_count", 256},
         {"protected_count", 0},
         {"mode", "inactive-keep-source"},
@@ -2048,94 +2080,122 @@ static bool gpt2_byte_from_token(const std::string & token, uint8_t & byte) {
     return true;
 }
 
-static size_t utf8_codepoint_count(const std::string & s) {
-    size_t n = 0;
-    for (uint8_t c : s) {
-        if ((c & 0xc0u) != 0x80u) ++n;
-    }
-    return n;
-}
-
-static bool gpt2_token_decodes_to_zh_cn(const std::string & token) {
-    std::string raw;
+static bool gpt2_token_decode_raw(const std::string & token, std::string & raw) {
+    raw.clear();
     raw.reserve(token.size());
     for (size_t i = 0; i < token.size();) {
         const unsigned char c = (unsigned char) token[i];
-        size_t n = c < 0x80 ? 1 : ((c & 0xe0) == 0xc0 ? 2 : ((c & 0xf0) == 0xe0 ? 3 : 4));
-        if (i + n > token.size()) return false;
+        const size_t n = c < 0x80 ? 1 : ((c & 0xe0) == 0xc0 ? 2 : ((c & 0xf0) == 0xe0 ? 3 : ((c & 0xf8) == 0xf0 ? 4 : 0)));
+        if (n == 0 || i + n > token.size()) return false;
         uint8_t b = 0;
         if (!gpt2_byte_from_token(token.substr(i, n), b)) return false;
         raw.push_back((char) b);
         i += n;
     }
+    return true;
+}
 
-    for (size_t i = 0; i < raw.size();) {
-        const unsigned char c = (unsigned char) raw[i];
+static bool decode_utf8_text(const std::string & text, std::vector<uint32_t> & cps) {
+    cps.clear();
+    cps.reserve(text.size());
+    for (size_t i = 0; i < text.size();) {
+        const auto * p = (const uint8_t *) text.data() + i;
+        const size_t left = text.size() - i;
         uint32_t cp = 0;
         size_t n = 0;
-        if (c < 0x80) {
-            cp = c; n = 1;
-        } else if ((c & 0xe0) == 0xc0 && i + 2 <= raw.size()) {
-            cp = ((uint32_t) (c & 0x1f) << 6) | ((unsigned char) raw[i + 1] & 0x3f); n = 2;
-        } else if ((c & 0xf0) == 0xe0 && i + 3 <= raw.size()) {
-            cp = ((uint32_t) (c & 0x0f) << 12) |
-                 ((uint32_t) ((unsigned char) raw[i + 1] & 0x3f) << 6) |
-                 ((unsigned char) raw[i + 2] & 0x3f); n = 3;
-        } else if ((c & 0xf8) == 0xf0 && i + 4 <= raw.size()) {
-            cp = ((uint32_t) (c & 0x07) << 18) |
-                 ((uint32_t) ((unsigned char) raw[i + 1] & 0x3f) << 12) |
-                 ((uint32_t) ((unsigned char) raw[i + 2] & 0x3f) << 6) |
-                 ((unsigned char) raw[i + 3] & 0x3f); n = 4;
+        if (p[0] < 0x80) {
+            cp = p[0]; n = 1;
+        } else if ((p[0] & 0xe0) == 0xc0) {
+            if (left < 2 || (p[1] & 0xc0) != 0x80) return false;
+            cp = ((uint32_t) (p[0] & 0x1f) << 6) | (p[1] & 0x3f);
+            if (cp < 0x80) return false;
+            n = 2;
+        } else if ((p[0] & 0xf0) == 0xe0) {
+            if (left < 3 || (p[1] & 0xc0) != 0x80 || (p[2] & 0xc0) != 0x80) return false;
+            cp = ((uint32_t) (p[0] & 0x0f) << 12) |
+                 ((uint32_t) (p[1] & 0x3f) << 6) |
+                 (p[2] & 0x3f);
+            if (cp < 0x800 || (cp >= 0xd800 && cp <= 0xdfff)) return false;
+            n = 3;
+        } else if ((p[0] & 0xf8) == 0xf0) {
+            if (left < 4 || (p[1] & 0xc0) != 0x80 || (p[2] & 0xc0) != 0x80 || (p[3] & 0xc0) != 0x80) return false;
+            cp = ((uint32_t) (p[0] & 0x07) << 18) |
+                 ((uint32_t) (p[1] & 0x3f) << 12) |
+                 ((uint32_t) (p[2] & 0x3f) << 6) |
+                 (p[3] & 0x3f);
+            if (cp < 0x10000 || cp > 0x10ffff) return false;
+            n = 4;
         } else {
             return false;
         }
-        // Simplified-Chinese corpora are overwhelmingly covered by unified Han
-        // ideographs plus the two common extension ranges. This is a ranking hint,
-        // not a tokenizer-validity rule.
-        if ((cp >= 0x3400 && cp <= 0x4dbf) ||
-            (cp >= 0x4e00 && cp <= 0x9fff) ||
-            (cp >= 0x20000 && cp <= 0x2ebef)) {
-            return true;
-        }
+        cps.push_back(cp);
         i += n;
+    }
+    return true;
+}
+
+// Conservative language filter: return true only for codepoints that are
+// clearly letters/syllables from a non-English, non-Chinese writing system.
+// Neutral punctuation, digits, math, emoji and unclassified Unicode stay in
+// the vocabulary. Pure Han tokens stay too: a Han glyph cannot be reliably
+// labelled "Japanese" versus "Chinese" from the token text alone.
+static bool is_foreign_language_codepoint(uint32_t cp) {
+    auto in = [&](uint32_t lo, uint32_t hi) { return cp >= lo && cp <= hi; };
+
+    // Keep the complete Latin script, not only ASCII. Token-local text cannot
+    // reliably distinguish English loanwords/names such as "café" from other
+    // Latin-script languages, so pruning Latin would violate the "only known
+    // non-English/non-Chinese" safety rule.
+
+    // Greek and Cyrillic.
+    if (in(0x0370, 0x052f) || in(0x1c80, 0x1c8f) || in(0x1f00, 0x1fff) ||
+        in(0x2de0, 0x2dff) || in(0xa640, 0xa69f)) return true;
+
+    // Armenian, Hebrew, Arabic and related presentation forms.
+    if (in(0x0530, 0x08ff) || in(0xfb1d, 0xfdff) || in(0xfe70, 0xfeff)) return true;
+
+    // Indic, South/Southeast Asian, Tibetan, Georgian, Ethiopic, Cherokee,
+    // Canadian syllabics, Ogham/Runic, Khmer, Mongolian and neighboring scripts.
+    if (in(0x0900, 0x1cff)) return true;
+
+    // Japanese kana. CJK punctuation (3000-303f), Han ideographs and Bopomofo
+    // are deliberately not included here.
+    if (in(0x3040, 0x30ff) || in(0x31f0, 0x31ff) || in(0x1b000, 0x1b16f)) return true;
+
+    // Yi and a number of other explicitly language-bearing BMP scripts.
+    if (in(0xa000, 0xa4cf) || in(0xa500, 0xa63f) || in(0xa800, 0xa95f) ||
+        in(0xaa00, 0xab2f) || in(0xabc0, 0xabff)) return true;
+
+    // Korean Hangul/Jamo.
+    if (in(0xa960, 0xa97f) || in(0xac00, 0xd7af) || in(0xd7b0, 0xd7ff)) return true;
+
+    // Supplementary-plane historical/modern language scripts. Keep emoji,
+    // mathematical alphanumerics and Han extensions outside these ranges.
+    if (in(0x10000, 0x11fff) || in(0x16a40, 0x1b2ff) || in(0x1e000, 0x1efff)) return true;
+
+    return false;
+}
+
+static bool gpt2_token_is_foreign_language(const std::string & token) {
+    std::string raw;
+    if (!gpt2_token_decode_raw(token, raw)) return false; // ambiguous => preserve
+    std::vector<uint32_t> cps;
+    if (!decode_utf8_text(raw, cps)) return false;        // arbitrary bytes => preserve
+    for (uint32_t cp : cps) {
+        if (is_foreign_language_codepoint(cp)) return true;
     }
     return false;
 }
 
-static double gpt2_ascii_english_priority(const std::string & token, size_t token_id) {
-    std::string raw;
-    raw.reserve(token.size());
-    for (size_t i = 0; i < token.size();) {
-        const unsigned char c = (unsigned char) token[i];
-        const size_t n = c < 0x80 ? 1 : ((c & 0xe0) == 0xc0 ? 2 : ((c & 0xf0) == 0xe0 ? 3 : 4));
-        if (i + n > token.size()) return -1.0;
-        uint8_t b = 0;
-        if (!gpt2_byte_from_token(token.substr(i, n), b) || b >= 0x80) return -1.0;
-        raw.push_back((char) b);
-        i += n;
-    }
-    size_t alpha = 0;
-    for (unsigned char c : raw) {
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) ++alpha;
-    }
-    if (alpha == 0) return -1.0;
-    // Source merge rank is a useful commonness prior, while alpha length favors
-    // whole technical/common words over tiny fragments. This is used only for
-    // zero-frequency BAOMU tokens, never ahead of an observed token.
-    return std::pow((double) alpha, 1.5) / std::sqrt((double) token_id + 256.0);
-}
-
 static json make_vocab_plan(const source_gguf & src, const common_imatrix & imat) {
+    GGML_UNUSED(imat);
     const gguf_context * meta = src.meta();
     const int64_t token_key = gguf_find_key(meta, "tokenizer.ggml.tokens");
     const int64_t type_key  = gguf_find_key(meta, "tokenizer.ggml.token_type");
     if (token_key < 0 || type_key < 0) throw std::runtime_error("tokenizer arrays missing");
     const size_t n_vocab = gguf_get_arr_n(meta, token_key);
-    if (n_vocab != 248320 || gguf_get_arr_n(meta, type_key) != n_vocab) throw std::runtime_error("unexpected source vocab size");
+    if (n_vocab != VOCAB_SRC || gguf_get_arr_n(meta, type_key) != n_vocab) throw std::runtime_error("unexpected source vocab size");
     const int32_t * types = (const int32_t *) gguf_get_arr_data(meta, type_key);
-    const std::string freq_name = "prune.vocab";
-    const auto & freq_e = require_entry(imat, freq_name);
-    if (freq_e.sums.size() != n_vocab) throw std::runtime_error("vocab histogram size mismatch");
 
     std::vector<uint8_t> protected_id(n_vocab, 0);
     int byte_fallback_count = 0;
@@ -2165,9 +2225,9 @@ static json make_vocab_plan(const source_gguf & src, const common_imatrix & imat
         if (id < n_vocab) protected_id[(size_t) id] = 1;
     }
 
-    // Build one deterministic BPE ancestry edge per result token. Keeping a
-    // high-value result token without the operands needed to construct it makes
-    // that token unreachable after merge filtering and wastes vocabulary budget.
+    // Build one deterministic BPE ancestry edge per result token. Any ancestor
+    // required to construct a retained Chinese/English/neutral token is restored
+    // even if that ancestor itself looks foreign. There is no vocabulary budget.
     std::unordered_map<std::string, int> token_id;
     token_id.reserve(n_vocab * 2);
     for (size_t i = 0; i < n_vocab; ++i) token_id.emplace(gguf_get_arr_str(meta, token_key, i), (int) i);
@@ -2184,122 +2244,52 @@ static json make_vocab_plan(const source_gguf & src, const common_imatrix & imat
         auto ia = token_id.find(a), ib = token_id.find(b), ir = token_id.find(a + b);
         if (ia == token_id.end() || ib == token_id.end() || ir == token_id.end()) continue;
         auto & p = parents[(size_t) ir->second];
-        if (p[0] < 0) p = {ia->second, ib->second}; // earliest merge rank wins deterministically
+        if (p[0] < 0) p = {ia->second, ib->second};
+    }
+
+    std::vector<uint8_t> base_keep(n_vocab, 0);
+    size_t protected_count = 0;
+    size_t language_kept_count = 0;
+    size_t foreign_candidate_count = 0;
+    for (size_t i = 0; i < n_vocab; ++i) {
+        if (protected_id[i]) {
+            base_keep[i] = 1;
+            ++protected_count;
+            continue;
+        }
+        const std::string token = gguf_get_arr_str(meta, token_key, i);
+        if (gpt2_token_is_foreign_language(token)) {
+            ++foreign_candidate_count;
+        } else {
+            base_keep[i] = 1;
+            ++language_kept_count;
+        }
+    }
+
+    std::vector<uint8_t> kept(n_vocab, 0);
+    std::vector<uint8_t> visiting(n_vocab, 0);
+    size_t dependency_added = 0;
+    std::function<void(int)> retain_with_ancestors = [&](int id) {
+        if (kept[(size_t) id]) return;
+        if (visiting[(size_t) id]) throw std::runtime_error("cycle in tokenizer merge ancestry");
+        visiting[(size_t) id] = 1;
+        const auto p = parents[(size_t) id];
+        if (p[0] >= 0) {
+            retain_with_ancestors(p[0]);
+            retain_with_ancestors(p[1]);
+        }
+        visiting[(size_t) id] = 0;
+        if (!base_keep[(size_t) id]) ++dependency_added;
+        kept[(size_t) id] = 1;
+    };
+    for (size_t i = 0; i < n_vocab; ++i) {
+        if (base_keep[i]) retain_with_ancestors((int) i);
     }
 
     std::vector<int> keep;
-    std::vector<uint8_t> kept(n_vocab, 0);
-    for (size_t i = 0; i < n_vocab; ++i) {
-        if (protected_id[i]) {
-            kept[i] = 1;
-            keep.push_back((int) i);
-        }
-    }
-    const int protected_count = (int) keep.size();
-
-    // BAOMU is intentionally a narrow calibration corpus. Reserve part of the
-    // zero-frequency remainder for likely zh-CN and English merges so that the
-    // 36k vocabulary does not become a pure "whatever happened to occur in the
-    // document" vocabulary. Observed BAOMU tokens always outrank these priors.
-    std::vector<uint8_t> zh_zero_priority(n_vocab, 0);
-    std::vector<double> en_zero_priority(n_vocab, 0.0);
-    size_t zh_zero_kept = 0;
-    constexpr size_t ZH_ZERO_BUDGET = 16500;
-    constexpr size_t EN_ZERO_BUDGET = 12000;
-    for (size_t i = 0; i < n_vocab && zh_zero_kept < ZH_ZERO_BUDGET; ++i) {
-        if (freq_e.sums[i] == 0.0f && !protected_id[i]) {
-            const std::string token = gguf_get_arr_str(meta, token_key, i);
-            if (gpt2_token_decodes_to_zh_cn(token)) {
-                zh_zero_priority[i] = 1;
-                ++zh_zero_kept;
-            }
-        }
-    }
-    std::vector<std::pair<double, int>> en_zero_ranked;
-    en_zero_ranked.reserve(n_vocab / 2);
-    for (size_t i = 0; i < n_vocab; ++i) {
-        if (freq_e.sums[i] != 0.0f || protected_id[i]) continue;
-        const std::string token = gguf_get_arr_str(meta, token_key, i);
-        const double p = gpt2_ascii_english_priority(token, i);
-        if (p >= 0.0) en_zero_ranked.emplace_back(p, (int) i);
-    }
-    std::stable_sort(en_zero_ranked.begin(), en_zero_ranked.end(), [](const auto & a, const auto & b) {
-        if (a.first != b.first) return a.first > b.first;
-        return a.second < b.second;
-    });
-    const size_t en_budget = std::min(EN_ZERO_BUDGET, en_zero_ranked.size());
-    for (size_t i = 0; i < en_budget; ++i) {
-        // Preserve the heuristic order when these zero-frequency candidates are
-        // mixed with closure dependencies. A flat score would fall back to token
-        // id and discard useful whole words near the tail of the reserved set.
-        en_zero_priority[(size_t) en_zero_ranked[i].second] =
-            0.50 + 0.20 * (double) (en_budget - i) / (double) en_budget;
-    }
-
-    std::vector<std::pair<double,int>> scored;
-    for (size_t i = 0; i < n_vocab; ++i) {
-        if (!protected_id[i]) {
-            const std::string token = gguf_get_arr_str(meta, token_key, i);
-            const size_t byte_len = utf8_codepoint_count(token); // one GPT-2 alphabet codepoint == one raw byte
-            const double gain = std::max<size_t>(1, byte_len > 0 ? byte_len - 1 : 1);
-            // BAOMU's deployment target is intentionally English + zh-CN. Bias
-            // scarce 36k vocabulary capacity toward Han-token merges; other
-            // languages are allowed to degrade rather than stealing this budget.
-            const double zh_boost = gpt2_token_decodes_to_zh_cn(token) ? 24.0 : 1.0;
-            double score = (double) freq_e.sums[i] * gain * zh_boost;
-            if (freq_e.sums[i] == 0.0f) {
-                if (zh_zero_priority[i]) score = 0.75;
-                else if (en_zero_priority[i] > 0.0) score = en_zero_priority[i];
-            }
-            scored.emplace_back(score, (int) i);
-        }
-    }
-    if ((int) keep.size() > VOCAB_DST) throw std::runtime_error("protected vocabulary exceeds target size");
-    std::stable_sort(scored.begin(), scored.end(), [](const auto & a, const auto & b) {
-        if (a.first != b.first) return a.first > b.first;
-        return a.second < b.second;
-    });
-
-    size_t dependency_added = 0;
-    auto missing_closure = [&](int root) {
-        std::vector<int> missing;
-        std::vector<uint8_t> staged(n_vocab, 0);
-        std::vector<uint8_t> visiting(n_vocab, 0);
-        std::function<void(int)> visit = [&](int id) {
-            if (kept[(size_t) id] || staged[(size_t) id]) return;
-            if (visiting[(size_t) id]) throw std::runtime_error("cycle in tokenizer merge ancestry");
-            visiting[(size_t) id] = 1;
-            const auto p = parents[(size_t) id];
-            if (p[0] >= 0) {
-                visit(p[0]);
-                visit(p[1]);
-            }
-            visiting[(size_t) id] = 0;
-            staged[(size_t) id] = 1;
-            missing.push_back(id);
-        };
-        visit(root);
-        return missing;
-    };
-
-    for (const auto & [score, id] : scored) {
-        GGML_UNUSED(score);
-        if ((int) keep.size() >= VOCAB_DST) break;
-        if (kept[(size_t) id]) continue;
-        auto missing = missing_closure(id);
-        if (keep.size() + missing.size() > VOCAB_DST) continue;
-        for (int x : missing) {
-            if (!kept[(size_t) x]) {
-                kept[(size_t) x] = 1;
-                keep.push_back(x);
-                if (x != id) ++dependency_added;
-            }
-        }
-    }
-    if ((int) keep.size() != VOCAB_DST) {
-        throw std::runtime_error("failed to fill target vocabulary size without violating BPE ancestry closure");
-    }
-    std::sort(keep.begin(), keep.end());
+    keep.reserve(n_vocab);
+    for (size_t i = 0; i < n_vocab; ++i) if (kept[i]) keep.push_back((int) i);
+    const size_t pruned_count = n_vocab - keep.size();
 
     json specials = json::object();
     std::vector<int> inverse(n_vocab, -1);
@@ -2319,12 +2309,16 @@ static json make_vocab_plan(const source_gguf & src, const common_imatrix & imat
     }
 
     return {
+        {"mode", "zh-en-script-filter-variable-v1"},
         {"output_to_input", keep},
+        {"source_vocab_size", n_vocab},
+        {"output_vocab_size", keep.size()},
+        {"pruned_count", pruned_count},
+        {"foreign_candidate_count", foreign_candidate_count},
+        {"language_kept_count", language_kept_count},
         {"protected_count", protected_count},
         {"byte_fallback_count", byte_fallback_count},
         {"merge_dependency_tokens_added", dependency_added},
-        {"zh_zero_priority_budget", ZH_ZERO_BUDGET},
-        {"en_zero_priority_budget", EN_ZERO_BUDGET},
         {"special_id_remap", specials},
     };
 }
@@ -2410,7 +2404,14 @@ static void verify_plan_json(const json & plan) {
         }
     }
     const auto vocab = plan.at("vocab").at("output_to_input").get<std::vector<int>>();
-    if (vocab.size() != VOCAB_DST || std::set<int>(vocab.begin(), vocab.end()).size() != VOCAB_DST) throw std::runtime_error("vocab mapping invalid");
+    if (vocab.empty() || vocab.size() > VOCAB_SRC || std::set<int>(vocab.begin(), vocab.end()).size() != vocab.size() ||
+        *std::min_element(vocab.begin(), vocab.end()) < 0 || *std::max_element(vocab.begin(), vocab.end()) >= VOCAB_SRC) {
+        throw std::runtime_error("vocab mapping invalid");
+    }
+    if (plan.at("vocab").contains("output_vocab_size") &&
+        plan.at("vocab").at("output_vocab_size").get<size_t>() != vocab.size()) {
+        throw std::runtime_error("vocab output size metadata does not match mapping");
+    }
     if (plan.at("vocab").value("byte_fallback_count", 0) != 256) throw std::runtime_error("vocab plan does not preserve the complete 256-byte fallback alphabet");
 }
 
@@ -2980,7 +2981,8 @@ static void command_plan(
                 {"expert_width", EXPERT_WIDTH_DST},
                 {"expert_encoder", "source-quant-preserve-ablation"},
                 {"gdn_dim", expert_only ? GDN_DIM_SRC : GDN_DIM_DST},
-                {"vocab_size", expert_only ? 248320 : VOCAB_DST},
+                {"vocab_size", expert_only ? VOCAB_SRC : 0},
+                {"vocab_policy", expert_only ? "unchanged" : "zh-en-script-filter-variable-v1"},
             };
             plan["expert_selection"] = expert_selection;
             plan["plan_q2_robustness"] = robustness;
@@ -3006,6 +3008,7 @@ static void command_plan(
     plan.erase("checkpoint_completed_experts");
     plan["gdn"] = expert_only ? make_keep_source_gdn_plan() : make_gdn_plan(src, imat);
     plan["vocab"] = expert_only ? make_keep_source_vocab_plan() : make_vocab_plan(src, imat);
+    plan["targets"]["vocab_size"] = plan["vocab"].at("output_to_input").size();
     verify_plan_json(plan);
     // Checkpoint resumes use a cheap inode/size/mtime identity so repeated
     // short-lived invocations do not re-read a 20+ GiB source. Before the plan
@@ -3825,7 +3828,7 @@ static void command_plan_expert_downstream_384(
                 {"expert_width", EXPERT_WIDTH_DST},
                 {"expert_encoder", "source-q4km-gate-up-q4_0-down-ablation"},
                 {"gdn_dim", GDN_DIM_SRC},
-                {"vocab_size", 248320},
+                {"vocab_size", VOCAB_SRC},
             };
             plan["expert_selection"] = "standard-enp-times-post-moe-to-final-256d-ridge-survival-v1";
             plan["plan_q2_robustness"] = "downstream-lens-384-single-pass-v1";
@@ -4404,7 +4407,7 @@ static size_t rebuild_tokenizer_metadata(
     for (auto it = special.begin(); it != special.end(); ++it) set_special_id(out, meta, it.key(), it.value().get<uint64_t>());
 
     const int64_t vocab_size_key = gguf_find_key(meta, "qwen35moe.vocab_size");
-    if (vocab_size_key >= 0) gguf_set_val_u32(out, "qwen35moe.vocab_size", VOCAB_DST);
+    if (vocab_size_key >= 0) gguf_set_val_u32(out, "qwen35moe.vocab_size", (uint32_t) vocab.size());
     return merge_store.size();
 }
 
@@ -4413,7 +4416,7 @@ static void command_vocab_fixture(
         const std::string & imatrix_path,
         const std::string & output) {
     source_gguf src(model);
-    require_source_contract(src);
+    require_vocab_source_contract(src);
     common_imatrix imat;
     if (!common_imatrix_load(imatrix_path, imat)) throw std::runtime_error("failed to load imatrix");
     const json vocab_plan = make_vocab_plan(src, imat);
@@ -4439,6 +4442,7 @@ static ggml_tensor * make_output_descriptor(
         const ggml_tensor * src_t,
         const std::string & name,
         tensor_policy policy,
+        size_t vocab_size,
         bool expert_source_quant = false) {
     ggml_type type = src_t->type;
     int n_dims = ggml_n_dims(src_t);
@@ -4457,7 +4461,7 @@ static ggml_tensor * make_output_descriptor(
         if (ends_with(name, "ffn_down_exps.weight")) ne[0] = EXPERT_WIDTH_DST;
         else ne[1] = EXPERT_WIDTH_DST;
     } else if (policy == tensor_policy::vocab) {
-        ne[1] = VOCAB_DST;
+        ne[1] = (int64_t) vocab_size;
     } else if (policy == tensor_policy::gdn) {
         if (ends_with(name, "attn_qkv.weight")) ne[1] = 4096;
         else if (ends_with(name, "attn_gate.weight")) ne[1] = 2048;
@@ -5331,7 +5335,7 @@ static void command_apply(
             output_policy = tensor_policy::copy;
         }
         gguf_add_tensor(out_meta.get(), make_output_descriptor(
-            desc_ctx.get(), st, name, output_policy,
+            desc_ctx.get(), st, name, output_policy, idx.vocab.size(),
             expert_source_quant && output_policy == tensor_policy::expert_q2));
     }
     const uint32_t block_count = src.get_u32("qwen35moe.block_count");
@@ -5407,6 +5411,12 @@ static void command_apply(
         manifest["cxx_flags"] = plan.value("cxx_flags", std::string(QWEN35_PRUNE_CXX_FLAGS));
         manifest["expert_plan"] = expert_plan_diagnostics(plan);
         manifest["gdn_plan"] = plan.at("gdn");
+        manifest["vocab_policy"] = plan.at("vocab").value("mode", std::string("legacy"));
+        manifest["source_vocab_size"] = plan.at("vocab").value("source_vocab_size", (size_t) VOCAB_SRC);
+        manifest["output_vocab_size"] = idx.vocab.size();
+        manifest["vocab_pruned_tokens"] = plan.at("vocab").value("pruned_count", (size_t) (VOCAB_SRC - idx.vocab.size()));
+        manifest["vocab_foreign_candidates"] = plan.at("vocab").value("foreign_candidate_count", size_t(0));
+        manifest["vocab_dependency_tokens_restored"] = plan.at("vocab").value("merge_dependency_tokens_added", size_t(0));
         manifest["protected_tokens"] = plan.at("vocab").value("protected_count", 0);
         manifest["byte_fallback_tokens"] = plan.at("vocab").value("byte_fallback_count", 0);
 #if defined(NDEBUG)
@@ -5561,7 +5571,9 @@ static void verify_tokenizer(const source_gguf & src, const source_gguf & out, c
     const int64_t tk = gguf_find_key(m,"tokenizer.ggml.tokens");
     const int64_t ty = gguf_find_key(m,"tokenizer.ggml.token_type");
     const int64_t mk = gguf_find_key(m,"tokenizer.ggml.merges");
-    if (tk < 0 || ty < 0 || mk < 0 || gguf_get_arr_n(m,tk) != VOCAB_DST || gguf_get_arr_n(m,ty) != VOCAB_DST) throw std::runtime_error("output tokenizer array size mismatch");
+    const auto mapping = plan.at("vocab").at("output_to_input").get<std::vector<int>>();
+    const size_t n_vocab_dst = mapping.size();
+    if (tk < 0 || ty < 0 || mk < 0 || gguf_get_arr_n(m,tk) != n_vocab_dst || gguf_get_arr_n(m,ty) != n_vocab_dst) throw std::runtime_error("output tokenizer array size mismatch");
 
     const int64_t stk = gguf_find_key(sm, "tokenizer.ggml.tokens");
     const int64_t sty = gguf_find_key(sm, "tokenizer.ggml.token_type");
@@ -5573,8 +5585,7 @@ static void verify_tokenizer(const source_gguf & src, const source_gguf & out, c
     const float * src_scores = ssc >= 0 ? (const float *) gguf_get_arr_data(sm, ssc) : nullptr;
     const float * out_scores = osc >= 0 ? (const float *) gguf_get_arr_data(m, osc) : nullptr;
     if ((src_scores == nullptr) != (out_scores == nullptr)) throw std::runtime_error("tokenizer score-array presence changed");
-    const auto mapping = plan.at("vocab").at("output_to_input").get<std::vector<int>>();
-    for (int i = 0; i < VOCAB_DST; ++i) {
+    for (size_t i = 0; i < n_vocab_dst; ++i) {
         const int old = mapping[(size_t) i];
         if (std::string(gguf_get_arr_str(m, tk, (size_t) i)) != gguf_get_arr_str(sm, stk, (size_t) old)) {
             throw std::runtime_error("tokenizer token mapping mismatch at new id " + std::to_string(i));
@@ -5586,7 +5597,7 @@ static void verify_tokenizer(const source_gguf & src, const source_gguf & out, c
     }
 
     std::unordered_set<std::string> tokens;
-    for (int i=0;i<VOCAB_DST;++i) tokens.insert(gguf_get_arr_str(m,tk,(size_t)i));
+    for (size_t i = 0; i < n_vocab_dst; ++i) tokens.insert(gguf_get_arr_str(m, tk, i));
     for (size_t i=0;i<gguf_get_arr_n(m,mk);++i) {
         const std::string merge=gguf_get_arr_str(m,mk,i); const size_t sp=merge.find(' ');
         if (sp==std::string::npos) throw std::runtime_error("malformed output BPE merge");
@@ -5599,13 +5610,17 @@ static void verify_tokenizer(const source_gguf & src, const source_gguf & out, c
             case GGUF_TYPE_UINT32:v=gguf_get_val_u32(m,k);break; case GGUF_TYPE_INT32:v=gguf_get_val_i32(m,k);break;
             case GGUF_TYPE_UINT64:v=(int64_t)gguf_get_val_u64(m,k);break; case GGUF_TYPE_INT64:v=gguf_get_val_i64(m,k);break; default:continue;
         }
-        if(v<0||v>=VOCAB_DST) throw std::runtime_error("special token id out of range: "+key);
+        if(v<0 || (size_t) v >= n_vocab_dst) throw std::runtime_error("special token id out of range: "+key);
     }
     for (auto it = plan.at("vocab").at("special_id_remap").begin();
          it != plan.at("vocab").at("special_id_remap").end(); ++it) {
         if (read_integer_metadata(m, it.key()) != it.value().get<int64_t>()) {
             throw std::runtime_error("special token id remap mismatch: " + it.key());
         }
+    }
+    if (gguf_find_key(m, "qwen35moe.vocab_size") >= 0 &&
+        read_integer_metadata(m, "qwen35moe.vocab_size") != (int64_t) n_vocab_dst) {
+        throw std::runtime_error("model vocab_size metadata does not match tokenizer size");
     }
 }
 
@@ -8023,8 +8038,8 @@ static json audit_tokenizers(
     const int32_t source_vocab_size = llama_vocab_n_tokens(source_vocab);
     const int32_t output_vocab_size = llama_vocab_n_tokens(output_vocab);
     const bool keep_vocab = output_vocab_size == source_vocab_size;
-    if (!keep_vocab && output_vocab_size != VOCAB_DST) {
-        throw std::runtime_error("vocab-only loader sees wrong output vocabulary size");
+    if (output_vocab_size <= 0 || output_vocab_size > source_vocab_size) {
+        throw std::runtime_error("vocab-only loader sees invalid output vocabulary size");
     }
 
     std::vector<std::pair<std::string,std::string>> domains;
@@ -8568,7 +8583,7 @@ static void command_verify(
                     throw std::runtime_error("keep-vocab tensor mismatch: " + name);
                 }
             } else {
-                if(ot->ne[1]!=VOCAB_DST||ot->type!=st->type) throw std::runtime_error("vocab tensor mismatch: "+name);
+                if(ot->ne[1] != (int64_t) idx.vocab.size() || ot->type!=st->type) throw std::runtime_error("vocab tensor mismatch: "+name);
                 verify_selected_rows_exact(src, out, name, idx.vocab);
             }
         }

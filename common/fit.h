@@ -32,6 +32,15 @@ common_params_fit_status common_fit_kv_cache(
            const llama_model_params * mparams,
                llama_context_params * cparams,
         const std::vector<std::pair<ggml_backend_dev_t, size_t>> & reserve,
+        const llama_context_params * extra_cparams,
+                     ggml_log_level   log_level);
+
+common_params_fit_status common_fit_recurrent_cache(
+                         const char * path_model,
+           const llama_model_params * mparams,
+               llama_context_params * cparams,
+        const std::vector<std::pair<ggml_backend_dev_t, size_t>> & reserve,
+        const llama_context_params * extra_cparams,
                      ggml_log_level   log_level);
 
 // print estimated memory to stdout
