@@ -169,6 +169,8 @@ struct common_speculative_impl {
 
     virtual bool process(const llama_batch & batch) = 0;
 
+    virtual void reset() {}
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
@@ -608,23 +610,38 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
-        // Interleave each extract_layer's hidden state into a contiguous buffer of
-        // shape [n_tokens, target_layer_ids_n * n_embd_tgt]. Then run EAGLE3 encoder
-        // to get one g_embd row per token.
-        features_buf.resize((size_t) n_tokens * n_embd_enc, 0.0f);
+        const float * enc_features_ptr = nullptr;
 
-        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-            const float * layer = target_layer_ids[k] < n_layer_tgt
-                ? llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k])
+        if (target_layer_ids_n == 1) {
+            const float * layer = target_layer_ids[0] < n_layer_tgt
+                ? llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[0])
                 : llama_get_embeddings_nextn(ctx_tgt);
             if (!layer) {
-                GGML_ABORT("EAGLE3: target layer %d input not extracted.", target_layer_ids[k]);
+                GGML_ABORT("EAGLE3: target layer %d input not extracted.", target_layer_ids[0]);
             }
-            for (int32_t i = 0; i < n_tokens; ++i) {
-                float * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                const float * src = layer + (size_t) i * n_embd_tgt;
-                std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+            enc_features_ptr = layer;
+        } else {
+            // Interleave each extract_layer's hidden state into a contiguous buffer of
+            // shape [n_tokens, target_layer_ids_n * n_embd_tgt]. Then run EAGLE3 encoder
+            // to get one g_embd row per token.
+            if (features_buf.size() < (size_t) n_tokens * n_embd_enc) {
+                features_buf.resize((size_t) n_tokens * n_embd_enc, 0.0f);
             }
+
+            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                const float * layer = target_layer_ids[k] < n_layer_tgt
+                    ? llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k])
+                    : llama_get_embeddings_nextn(ctx_tgt);
+                if (!layer) {
+                    GGML_ABORT("EAGLE3: target layer %d input not extracted.", target_layer_ids[k]);
+                }
+                for (int32_t i = 0; i < n_tokens; ++i) {
+                    float * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                    const float * src = layer + (size_t) i * n_embd_tgt;
+                    std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                }
+            }
+            enc_features_ptr = features_buf.data();
         }
 
         g_embd_buf.resize((size_t) n_tokens * n_embd_dec);
@@ -638,7 +655,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             llama_batch enc_batch = {
                 /*.n_tokens =*/ n_chunk,
                 /*.token    =*/ nullptr,
-                /*.embd     =*/ features_buf.data() + (size_t) i * n_embd_enc,
+                /*.embd     =*/ const_cast<float *>(enc_features_ptr + (size_t) i * n_embd_enc),
                 /*.pos      =*/ nullptr,
                 /*.n_seq_id =*/ nullptr,
                 /*.seq_id   =*/ nullptr,
@@ -1072,25 +1089,39 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
 
-                // gather this chunk's target features, interleaved by extract layer
-                features_buf.resize((size_t) n_chunk * n_embd_enc);
-                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                const float * enc_embd_ptr = nullptr;
+
+                if (target_layer_ids_n == 1) {
+                    // Fast path: single extracted layer is already contiguous, pass pointer directly
+                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[0]);
                     if (!layer) {
-                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[0]);
                     }
-                    for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
-                        std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                    enc_embd_ptr = layer + (size_t) (i_batch_beg[seq_id] + offset) * n_embd_tgt;
+                } else {
+                    // Multi-layer extraction: interleave into features_buf
+                    if (features_buf.size() < (size_t) n_chunk * n_embd_enc) {
+                        features_buf.resize((size_t) n_chunk * n_embd_enc);
                     }
+                    for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                        const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                        if (!layer) {
+                            GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                        }
+                        for (int32_t i = 0; i < n_chunk; ++i) {
+                            float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                            const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                            std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                        }
+                    }
+                    enc_embd_ptr = features_buf.data();
                 }
 
                 // fuse extracted features through DFlash encoder
                 llama_batch enc_batch = {
                     /*.n_tokens =*/ n_chunk,
                     /*.token    =*/ nullptr,
-                    /*.embd     =*/ features_buf.data(),
+                    /*.embd     =*/ const_cast<float *>(enc_embd_ptr),
                     /*.pos      =*/ nullptr,
                     /*.n_seq_id =*/ nullptr,
                     /*.seq_id   =*/ nullptr,
@@ -1108,8 +1139,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
 
                 // inject the DFlash decoder K/V cache at the tokens' target positions
-                batch_inject.n_tokens = n_chunk;
-                std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
+                // Avoid redundant memcpy when inp_g is already contiguous valid floats
+                float * orig_batch_embd = batch_inject.embd;
+                batch_inject.embd       = const_cast<float *>(inp_g);
+                batch_inject.n_tokens   = n_chunk;
 
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     batch_inject.pos[i]       = batch_in.pos[i_batch_beg[seq_id] + offset + i];
@@ -1118,6 +1151,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.logits[i]    = false;
                 }
                 rc = llama_decode(ctx_dft, batch_inject);
+                batch_inject.embd = orig_batch_embd; // restore original buffer pointer
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
@@ -1184,14 +1218,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             auto & result = *dp.result;
 
             if (is_dspark) {
-                // DSpark predicts the next token from position 0 and optionally truncates
-                // at the first position below the confidence threshold.
-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                // DSpark predicts the next token from position 0 and truncates
+                // at the first position below the confidence threshold (checking both confidence head and sampling probability).
+                const float p_min_effective = params.p_min > 0.0f ? params.p_min : 0.65f;
+                const float * conf = llama_get_embeddings_nextn(ctx_dft);
 
                 for (int32_t i = 0; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
-                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                    if (conf && conf[(size_t) idx * n_embd_dec] < p_min_effective) {
                         break;
                     }
 
@@ -1384,6 +1419,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             batch.token = nullptr;
         }
         llama_batch_free(batch);
+    }
+
+    void reset() override {
+        auto * ctx_dft = this->params.ctx_dft;
+        if (ctx_dft) {
+            if (auto * mem = llama_get_memory(ctx_dft)) {
+                llama_memory_clear(mem, true);
+            }
+            llama_set_nextn_layer_offset(ctx_dft, 0);
+        }
+
+        common_batch_clear(batch);
+        for (auto & h : pending_h) {
+            std::fill(h.begin(), h.end(), 0.0f);
+        }
+        for (auto & h : verify_h) {
+            h.clear();
+        }
+        std::fill(verify_h_rows.begin(), verify_h_rows.end(), 0);
+        std::fill(i_last.begin(), i_last.end(), -1);
+        std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
+        std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
+        for (auto & h : chain_h) {
+            h.clear();
+        }
+        for (auto & smpl : smpls) {
+            common_sampler_reset(smpl.get());
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -2589,6 +2652,21 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     }
 
     return result;
+}
+
+void common_speculative_reset(common_speculative * spec) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->reset();
+    }
+
+    for (auto & dp : spec->dparams) {
+        dp.drafting = false;
+    }
+    std::fill(spec->impl_last.begin(), spec->impl_last.end(), nullptr);
 }
 
 bool common_speculative_need_embd(common_speculative * spec) {

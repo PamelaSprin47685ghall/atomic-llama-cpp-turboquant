@@ -4,7 +4,7 @@
 #include "imatrix-loader.h"
 #include "log.h"
 #include "llama.h"
-#include "../common/speculative.h"
+#include "speculative.h"
 #include "gguf.h"
 
 #include <algorithm>
