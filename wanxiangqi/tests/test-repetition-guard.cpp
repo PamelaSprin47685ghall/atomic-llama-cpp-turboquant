@@ -13,7 +13,7 @@ static void test_envelope_metadata() {
 
     GGML_ASSERT(codec.vocabulary_size() == wanxiangqi_repetition_envelope::vocabulary_size);
     GGML_ASSERT(wanxiangqi_repetition_envelope::half_life == 256);
-    GGML_ASSERT(wanxiangqi_repetition_envelope::central_probability == 0.99);
+    GGML_ASSERT(wanxiangqi_repetition_envelope::central_probability == 0.95);
     GGML_ASSERT(wanxiangqi_repetition_envelope::lower_weighted_distinct_count < wanxiangqi_repetition_envelope::normal_weighted_distinct_count);
     GGML_ASSERT(wanxiangqi_repetition_envelope::normal_weighted_distinct_count < wanxiangqi_repetition_envelope::upper_weighted_distinct_count);
 }

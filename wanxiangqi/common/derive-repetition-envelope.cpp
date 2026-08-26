@@ -22,7 +22,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr std::size_t half_life = 256;
-constexpr double central_probability = 0.99;
+constexpr double central_probability = 0.95;
 constexpr double lower_tail_probability = (1.0 - central_probability) / 2.0;
 constexpr double upper_tail_probability = 1.0 - lower_tail_probability;
 
