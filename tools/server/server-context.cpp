@@ -1499,6 +1499,13 @@ private:
             SRV_TRC("%s", "speculative decoding will use checkpoints\n");
         }
 
+        const uint32_t n_seq_recr = llama_n_seq_recurrent(ctx_tgt);
+        if (n_seq_recr > 0 && params_base.n_parallel > (int) n_seq_recr) {
+            SRV_INF("capping n_parallel (%d -> %u) to match fitted recurrent state capacity\n",
+                    params_base.n_parallel, n_seq_recr);
+            params_base.n_parallel = (int) n_seq_recr;
+        }
+
         // setup slots
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                 params_base.n_parallel, n_ctx_slot, params_base.kv_unified ? "true" : "false");
