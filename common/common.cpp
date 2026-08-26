@@ -1292,9 +1292,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             cparams_mtp.ctx_other = nullptr;
             cparams_mtp.n_seq_recurrent = cparams.n_seq_recurrent;
             cparams_mtp.n_rs_seq = 0;
-            const uint32_t n_draft_batch = (uint32_t) std::max(16, params.speculative.draft.n_max);
-            cparams_mtp.n_batch  = std::min(cparams_mtp.n_batch,  n_draft_batch);
-            cparams_mtp.n_ubatch = std::min(cparams_mtp.n_ubatch, n_draft_batch);
             extra_cparams = &cparams_mtp;
         }
 

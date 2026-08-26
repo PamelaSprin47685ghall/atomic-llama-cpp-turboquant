@@ -1322,6 +1322,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    int32_t n_batch_alloc = 0;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -1345,11 +1347,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 ctx_dft ? "yes" : "no",
                 common_speculative_get_devices_str(this->params.devices).c_str());
 
-        const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
-        batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
+        n_batch_alloc = std::max((int32_t) llama_n_batch(ctx_dft), (int32_t) llama_n_batch(ctx_tgt));
+        batch = llama_batch_init(/*n_tokens=*/ n_batch_alloc, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
         // llama_batch_init allocates only one of token/embd; MTP needs both.
         // TODO: fix, how to call without malloc
-        batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+        batch.token = (llama_token *) malloc(sizeof(llama_token) * n_batch_alloc);
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1503,6 +1505,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
+            if (n_tokens > n_batch_alloc) {
+                if (batch.token != nullptr) {
+                    free(batch.token);
+                    batch.token = nullptr;
+                }
+                llama_batch_free(batch);
+                n_batch_alloc = n_tokens;
+                batch = llama_batch_init(/*n_tokens=*/ n_batch_alloc, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
+                batch.token = (llama_token *) malloc(sizeof(llama_token) * n_batch_alloc);
+            }
+
             common_batch_clear(batch);
 
             for (int k = 0; k < n_tokens; ++k) {
@@ -2430,9 +2443,6 @@ common_speculative_init_result::common_speculative_init_result(
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         cparams.n_seq_recurrent = llama_n_seq_recurrent(ctx_tgt);
-        const uint32_t n_draft_batch = std::max(16u, (uint32_t) params.speculative.draft.n_max);
-        cparams.n_batch  = std::min(cparams.n_batch,  n_draft_batch);
-        cparams.n_ubatch = std::min(cparams.n_ubatch, n_draft_batch);
         cparams.type_k   = params.cache_type_k;
         cparams.type_v   = params.cache_type_v;
     }
