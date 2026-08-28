@@ -86,8 +86,6 @@ if (NOT TARGET llama-perplexity)
     add_subdirectory(${PROJECT_SOURCE_DIR}/tools/perplexity ${CMAKE_CURRENT_BINARY_DIR}/perplexity)
 endif()
 
-add_subdirectory(qwen35-prune)
-
 if (TARGET server-context)
     target_sources(server-context PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/server/server-corpus-dump.cpp
