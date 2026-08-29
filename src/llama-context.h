@@ -343,13 +343,24 @@ private:
 
     std::vector<swap_info> output_swaps;
 
-    ggml_backend_sched_compute_pool_ptr compute_pool;
-    ggml_backend_sched_ptr sched;
-
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // NOTE: these must be declared *after* `backends`.
+    //
+    // Members are destroyed in reverse declaration order, and
+    // ggml_backend_sched_free() synchronizes every backend the scheduler was
+    // built over. Declaring the scheduler first destroys the backends first and
+    // then lets the scheduler touch them - a use-after-free that surfaces as a
+    // segfault inside the graphics driver (resetCommandPool on an
+    // already-destroyed command pool) on every context teardown.
+    //
+    // `sched` is built over `compute_pool`, so it must also stay declared after
+    // it in order to be destroyed first.
+    ggml_backend_sched_compute_pool_ptr compute_pool;
+    ggml_backend_sched_ptr sched;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

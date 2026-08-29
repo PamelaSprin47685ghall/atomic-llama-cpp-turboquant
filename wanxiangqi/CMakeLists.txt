@@ -86,6 +86,77 @@ if (NOT TARGET llama-perplexity)
     add_subdirectory(${PROJECT_SOURCE_DIR}/tools/perplexity ${CMAKE_CURRENT_BINARY_DIR}/perplexity)
 endif()
 
+# Shared layer for the compression probes. Every tool below reads the same trie
+# and the same WXQCAL03 calibration dump; those formats and the dense linear
+# algebra over them are defined once, here, so a format change cannot land in one
+# reader and miss another.
+add_library(wanxiangqi-probe-lib STATIC
+    lib/calib-dump.cpp
+    lib/calib-dump.h
+    lib/gguf-slab.cpp
+    lib/gguf-slab.h
+    lib/linalg.cpp
+    lib/linalg.h
+    lib/parallel.cpp
+    lib/parallel.h
+    lib/trie.cpp
+    lib/trie.h)
+set_target_properties(wanxiangqi-probe-lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_features(wanxiangqi-probe-lib PRIVATE cxx_std_17)
+target_link_libraries(wanxiangqi-probe-lib PUBLIC ggml)
+target_include_directories(wanxiangqi-probe-lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/lib)
+
+# Trie-driven MoE calibration collector: routing counts + expert-input second
+# moment, gathered by walking the committed request-token trie depth first.
+add_executable(wanxiangqi-trie-calib calib/trie-calib.cpp)
+target_compile_features(wanxiangqi-trie-calib PRIVATE cxx_std_17)
+target_link_libraries(wanxiangqi-trie-calib PRIVATE wanxiangqi-probe-lib llama-common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+install(TARGETS wanxiangqi-trie-calib RUNTIME)
+
+# Offline structural probe: reads GGUF weights directly, never runs the model.
+add_executable(wanxiangqi-calib-probe calib/calib-probe.cpp)
+target_compile_features(wanxiangqi-calib-probe PRIVATE cxx_std_17)
+target_link_libraries(wanxiangqi-calib-probe PRIVATE wanxiangqi-probe-lib ggml ${CMAKE_THREAD_LIBS_INIT})
+install(TARGETS wanxiangqi-calib-probe RUNTIME)
+
+# Does QMoE's sub-1-bit ternary result transfer to a modern top-k MoE?
+add_executable(wanxiangqi-qmoe-probe calib/qmoe-probe.cpp)
+target_compile_features(wanxiangqi-qmoe-probe PRIVATE cxx_std_17)
+target_link_libraries(wanxiangqi-qmoe-probe PRIVATE wanxiangqi-probe-lib ggml ${CMAKE_THREAD_LIBS_INIT})
+install(TARGETS wanxiangqi-qmoe-probe RUNTIME)
+
+# Greedy generation for the behavioural collapse check. llama-cli segfaults
+# before it logs anything in this build; the tools here load the same model fine.
+add_executable(wanxiangqi-gen probe/wxq-gen.cpp)
+target_compile_features(wanxiangqi-gen PRIVATE cxx_std_17)
+target_link_libraries(wanxiangqi-gen PRIVATE llama-common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+install(TARGETS wanxiangqi-gen RUNTIME)
+
+# Applies a linear input transform to the expert weights in place: y = W(Mx)
+# is the same as y = (WM)x, so the tail ablation needs no graph change. Shapes
+# and types are preserved, so the output is a copy of the source with only the
+# gate/up slabs overwritten at their existing offsets.
+add_executable(wanxiangqi-bake probe/wxq-bake.cpp)
+target_compile_features(wanxiangqi-bake PRIVATE cxx_std_17)
+target_link_libraries(wanxiangqi-bake PRIVATE wanxiangqi-probe-lib ggml ${CMAKE_THREAD_LIBS_INIT})
+install(TARGETS wanxiangqi-bake RUNTIME)
+
+# Raw activation sampler. Covariance cannot see manifold dimension: a thin
+# curved manifold in high ambient dimension has near-full-rank covariance, so
+# intrinsic dimension needs samples, not moments.
+add_executable(wanxiangqi-manifold probe/wxq-manifold.cpp)
+target_compile_features(wanxiangqi-manifold PRIVATE cxx_std_17)
+target_link_libraries(wanxiangqi-manifold PRIVATE wanxiangqi-probe-lib llama-common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+install(TARGETS wanxiangqi-manifold RUNTIME)
+
+# Per-position KL against a reference dump, walked over the calibration trie.
+# tools/perplexity --kl-divergence cannot do the trie population, per-position
+# output, or role-weighted aggregation, all of which are needed here.
+add_executable(wanxiangqi-kl probe/wxq-kl.cpp)
+target_compile_features(wanxiangqi-kl PRIVATE cxx_std_17)
+target_link_libraries(wanxiangqi-kl PRIVATE wanxiangqi-probe-lib llama-common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+install(TARGETS wanxiangqi-kl RUNTIME)
+
 if (TARGET server-context)
     target_sources(server-context PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/server/server-corpus-dump.cpp
