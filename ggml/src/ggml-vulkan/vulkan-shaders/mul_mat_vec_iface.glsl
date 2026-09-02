@@ -32,4 +32,7 @@ layout (binding = 4) readonly buffer Fuse1 {D_TYPE data_fuse1[];};
 #ifdef MUL_MAT_ID
 layout (binding = 5) readonly buffer IDS {int data_ids[];};
 #endif
+#ifdef MUL_MAT_ID_GROUPED
+layout (binding = 6) readonly buffer EXPERT_COUNTS {uint data_expert_count[];};
+#endif
 

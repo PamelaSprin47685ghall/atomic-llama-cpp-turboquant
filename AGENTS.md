@@ -191,24 +191,24 @@ MTP enabled, draft max 2
 最近一次 auto-fit 得到：
 
 ```text
-physical unified KV = 66,048 cells
-recurrent capacity  = 5 slots
-server slots         = 5
+physical unified KV = 69,376 cells
+recurrent capacity  = 6 slots
+server slots         = 6
 ```
 
-Auto-fit 会随启动时可用显存变化；`66,048` 不是固定断言。启动期间 `KV size ... does not fit` 是 probe 候选失败，只有最终 `automatic unified KV capacity`、`model loaded` 和 health 才决定启动成功。
+Auto-fit 会随启动时可用显存变化；`69,376` 不是固定断言。启动期间 `KV size ... does not fit` 是 probe 候选失败，只有最终 `automatic unified KV capacity`、`model loaded` 和 health 才决定启动成功。
 
 当前已部署并验证的 server binary：
 
 ```text
-SHA-256 = bfefc541de18448bedc3da0a90d8d3e91a0558843a06e0270b90fd97c8674da2
+SHA-256 = 9fcd58b10b9b26c80482f1087b1e53a46933818ed81098aca06b664edc7e7694
 ```
 
 注意：以上 server hash 仅作为该次验证记录。重新构建后必须以新 build/deploy checksum 一致为准，不得把此值当成永久常量。
 
-### 2026-09-02 delivery candidate 收尾状态
+### 2026-09-02 delivery candidate 部署状态
 
-本次准备提交的本地 candidate：
+当前 build 与生产部署：
 
 ```text
 build binary: build-vulkan-localhost/bin/llama-server
@@ -217,15 +217,16 @@ calibration:  /opt/llama/data/ornith-1.5-35b.triattention
 calib SHA-256: 7fbfcdcfc7903e11efba96d7c13bea0ae9d60ff81c75475d54ee613bae2b3cc7
 ```
 
-生产路径 `/opt/llama/bin/llama-server` 仍是上一版：
+生产路径 `/opt/llama/bin/llama-server` 已部署同一 binary：
 
 ```text
-SHA-256: bfefc541de18448bedc3da0a90d8d3e91a0558843a06e0270b90fd97c8674da2
+SHA-256:          9fcd58b10b9b26c80482f1087b1e53a46933818ed81098aca06b664edc7e7694
+system fingerprint: b10724-f0b7765e7
 ```
 
-截至本次提交前，`llama-server.service` 保持 `inactive`。新 candidate 尚未复制到 `/opt/llama/bin`，也尚未重启生产服务；不得把本次 commit/push 误记为“已生产部署”。
+`llama-server.service` 当前为 active；`/health` 返回 `{"status":"ok"}`，真实推理返回 `DEPLOY_10724_OK`。build、deployed binary 及所需 runtime libraries 已逐项校验 checksum 一致。
 
-用户明确要求优先轻量验证、尽快交工，因此本次收尾没有重新运行 AIME/MATH 全量 A/B、66K/5-slot 大压力、shared-prefix 三分支、完整 RAM/checkpoint/context-shift 矩阵或多小时 soak。已运行且通过的轻量交付门为：
+用户明确要求优先轻量验证、尽快交工，因此本次收尾没有重新运行 AIME/MATH 全量 A/B、production auto-fit/full-slot 大压力、shared-prefix 三分支、完整 RAM/checkpoint/context-shift 矩阵或多小时 soak。已运行且通过的轻量交付门为：
 
 - focused `llama-server` build；
 - `test-triattention-score`：0 failures；
@@ -275,16 +276,16 @@ SHA-256: bfefc541de18448bedc3da0a90d8d3e91a0558843a06e0270b90fd97c8674da2
 
 当前 calibration correlation 只能证明采集一致性，不能替代任务质量评测。
 
-### P0：真实 66K KV、5-slot 压力
+### P0：真实 production auto-fit KV、全 slot 压力
 
 在 shadow instance 或维护窗口运行与生产完全相同的模型、MTP、Turbo K/V 和 Vulkan 配置，使总 resident KV 明确超过最终 auto-fit capacity。
 
 建议至少：
 
 ```text
-5 concurrent slots
-每槽约 15K+ logical tokens
-总 resident history > 66K
+6 concurrent slots
+每槽约 12K+ logical tokens
+总 resident history > 最终 auto-fit capacity（最近一次为 69,376）
 ```
 
 验收：
@@ -319,7 +320,7 @@ SHA-256: bfefc541de18448bedc3da0a90d8d3e91a0558843a06e0270b90fd97c8674da2
 - 三个 sequence 输出无交叉污染；
 - compaction 后 shared refs、positions、K/V bytes 不变。
 
-### P0：runtime scoring/compaction 性能（核心路径已完成，待 66K 大 drain 门）
+### P0：runtime scoring/compaction 性能（核心路径已完成，待 production-scale 大 drain 门）
 
 旧实现的受控结果：
 
@@ -344,7 +345,7 @@ SHA-256: bfefc541de18448bedc3da0a90d8d3e91a0558843a06e0270b90fd97c8674da2
 
 当前 2,048-cell 真实 Ornith 压力下，8 次 reclaim 的累计 scoring/pack 约为 `0.191 s / 0.062 s`；MTP 场景 4 次 reclaim 为 `0.106 s / 0.024 s`。剩余性能发布门只有：
 
-- 首次真实约 66K drain 不 OOM；
+- 首次真实 production-scale drain 不 OOM；
 - 在最终 production auto-fit 配置下记录首次大 drain 的 score/pack wall time，并确认没有显著吞吐断崖。
 
 Vulkan 是当前发布目标。其他 backend 未支持时必须明确失败，不得静默走极慢或错误路径。
@@ -392,7 +393,7 @@ calibration fingerprint
 100 次 drain/maintenance
 20 次 save/erase/restore
 10 次 floor-exhaustion/preemption
-5 slots 持续多小时
+全部 fitted slots 持续多小时
 ```
 
 验收：
@@ -512,7 +513,7 @@ drain -> slot save -> erase -> restore -> append from exact saved frontier
 
 1. Tri OFF 自动化零回归通过。
 2. Ornith FullKV vs 3/32 质量 A/B 无断崖。
-3. 真实 66K/5-slot/MTP/Vulkan 压力通过。
+3. 真实 production auto-fit/full-slot/MTP/Vulkan 压力通过。
 4. shared-prefix union 测试通过。
 5. recurrent-only pressure 不调用 Tri。
 6. runtime scoring/pack 达到明确性能门且首次大 drain 不 OOM。

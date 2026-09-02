@@ -1,7 +1,5 @@
 #version 450
 
-#extension GL_EXT_control_flow_attributes : enable
-
 #include "types.glsl"
 
 layout (push_constant) uniform parameter
@@ -11,6 +9,14 @@ layout (push_constant) uniform parameter
     uint32_t nb00;
     uint32_t nb01;
     uint32_t a_offset;
+    uint32_t mode;
+    uint32_t active_capacity;
+    uint32_t singleton_offset;
+    uint32_t grouped_max;
+    uint32_t grouped_list_offset;
+    uint32_t singleton_dispatch_offset;
+    uint32_t grouped_dispatch_offset;
+    uint32_t generic_dispatch_offset;
 } p;
 
 #define BLOCK_SIZE 256
@@ -18,34 +24,63 @@ layout (push_constant) uniform parameter
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A {uint data_a[];};
-layout (binding = 1) writeonly buffer D {uint data_d[];};
+layout (binding = 1) buffer D {uint data_d[];};
+layout (binding = 2) buffer Rows {uint data_rows[];};
 
-shared uint vals[BLOCK_SIZE];
+shared uint row_count;
 
 void main() {
-    const uint expert_id = gl_WorkGroupID.x;
-    const uint num_elements = p.ne00 * p.ne01;
     const uint tid = gl_LocalInvocationID.x;
 
-    uint count = 0;
-    for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
-        const uint i01 = idx / p.ne00;
-        const uint i00 = idx % p.ne00;
-        const uint a = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00];
-
-        count += uint(a == expert_id);
-    }
-
-    vals[tid] = count;
-    barrier();
-    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            vals[tid] += vals[tid + s];
+    if (p.mode == 0) {
+        if (gl_WorkGroupID.x == 0 && tid == 0) {
+            data_d[0] = 0;
+            data_rows[p.singleton_offset] = 0;
+            data_d[p.singleton_dispatch_offset + 1] = 0;
+            data_d[p.grouped_dispatch_offset + 1] = 0;
+            data_d[p.generic_dispatch_offset + 2] = 0;
         }
-        barrier();
+        return;
     }
+
+    const uint expert_id = gl_WorkGroupID.x;
+    const uint num_elements = p.ne00 * p.ne01;
+    const uint count_offset = 1 + p.active_capacity;
 
     if (tid == 0) {
-        data_d[expert_id] = vals[0];
+        row_count = 0;
+    }
+    barrier();
+
+    for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
+        const uint i01 = idx / p.ne00;
+        const uint i00 = idx - i01 * p.ne00;
+        const uint a = data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00];
+
+        if (a == expert_id) {
+            const uint row = atomicAdd(row_count, 1);
+            data_rows[expert_id*num_elements + row] = i00 | (i01 << 16);
+        }
+    }
+
+    memoryBarrierBuffer();
+    barrier();
+
+    if (tid == 0) {
+        data_d[count_offset + expert_id] = row_count;
+
+        if (p.mode == 2 && row_count == 1) {
+            const uint singleton_idx = atomicAdd(data_rows[p.singleton_offset], 1);
+            atomicAdd(data_d[p.singleton_dispatch_offset + 1], 1);
+            data_rows[p.singleton_offset + 1 + 2*singleton_idx] = expert_id;
+            data_rows[p.singleton_offset + 2 + 2*singleton_idx] = data_rows[expert_id*num_elements];
+        } else if (p.mode == 2 && row_count >= 2 && row_count <= p.grouped_max) {
+            const uint grouped_idx = atomicAdd(data_d[p.grouped_dispatch_offset + 1], 1);
+            data_d[p.grouped_list_offset + grouped_idx] = expert_id;
+        } else if (row_count != 0) {
+            const uint active_idx = atomicAdd(data_d[0], 1);
+            atomicAdd(data_d[p.generic_dispatch_offset + 2], 1);
+            data_d[1 + active_idx] = expert_id;
+        }
     }
 }

@@ -4539,7 +4539,7 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (!common_speculative_process(spec.get(), batch_view)) {
+        if (!common_speculative_process(spec.get(), batch_view, /*defer_mtp=*/ true)) {
             SRV_ERR("%s", "failed to process speculative batch\n");
 
             // TODO: handle error
@@ -4862,6 +4862,10 @@ private:
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
+
+        if (!common_speculative_commit(spec.get())) {
+            throw std::runtime_error("failed to commit deferred speculative state");
+        }
     }
 
     int get_slot_n_ctx() {

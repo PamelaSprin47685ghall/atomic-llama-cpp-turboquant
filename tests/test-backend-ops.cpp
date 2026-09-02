@@ -9135,6 +9135,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int n : {12, 18}) {
+        test_cases.emplace_back(new test_mul_mat(
+                GGML_TYPE_Q6_K, GGML_TYPE_F32,
+                64, n, 256, {1, 1}, {1, 1}));
+    }
+
     // TQ4_1S: Gemma-4 E2B dimensions. The fused mul_mat_vec kernel has a
     // shared-memory WHT on the activation and dequantizes centroid*scale per
     // thread; bugs in the butterfly or reduction only surface at production sizes.
@@ -9339,6 +9345,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
+
+    // MTP verification boundary: 256 experts, top-8 routing, the exact
+    // one-through-six-slot row counts, and one generic-path case above them.
+    for (int n : {3, 6, 8, 9, 12, 18, 24}) {
+        for (ggml_type type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS}) {
+            test_cases.emplace_back(new test_mul_mat_id(
+                    type, GGML_TYPE_F32,
+                    256, 8, false,
+                    64, n, 256));
+        }
+    }
+    for (int n : {9, 18, 24}) {
+        for (ggml_type type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS}) {
+            test_cases.emplace_back(new test_mul_mat_id_fusion(
+                    type, GGML_TYPE_F32,
+                    256, 8, false,
+                    64, n, 256, 3));
+        }
+    }
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
@@ -10120,6 +10145,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    for (int n : {6, 9, 18}) {
+        test_cases.emplace_back(new test_mul_mat_id(
+                GGML_TYPE_IQ2_S, GGML_TYPE_F32,
+                256, 8, false,
+                512, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(
+                GGML_TYPE_IQ3_XXS, GGML_TYPE_F32,
+                256, 8, false,
+                2048, n, 512));
+    }
 
     // Conv2d: K=CRS=NPQ=4096 matmul performance
     uint32_t                        iwh_idx  = 0;
