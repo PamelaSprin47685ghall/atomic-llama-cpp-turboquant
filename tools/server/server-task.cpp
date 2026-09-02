@@ -1560,6 +1560,22 @@ json server_task_result_metrics::to_json() {
         { "n_decode_total",                  n_decode_total },
         { "n_busy_slots_total",              n_busy_slots_total },
 
+        { "tri_drain_total",                 tri_drain_total },
+        { "tri_maintenance_total",           tri_maintenance_total },
+        { "tri_floor_exhausted_total",       tri_floor_exhausted_total },
+        { "tri_atomic_fallback_kv_total",    tri_atomic_fallback_kv_total },
+        { "tri_atomic_fallback_recurrent_total", tri_atomic_fallback_recurrent_total },
+        { "tri_cells_freed_total",           tri_cells_freed_total },
+        { "tri_score_us_total",              tri_score_us_total },
+        { "tri_pack_us_total",               tri_pack_us_total },
+        { "tri_cells_before",                tri_cells_before },
+        { "tri_cells_after",                 tri_cells_after },
+        { "tri_cells_freed",                 tri_cells_freed },
+        { "tri_references_removed",          tri_references_removed },
+        { "tri_target_references",           tri_target_references },
+        { "tri_hard_keep",                   tri_hard_keep },
+        { "tri_shared_keep",                 tri_shared_keep },
+
         { "slots",                           slots_data },
     };
 }

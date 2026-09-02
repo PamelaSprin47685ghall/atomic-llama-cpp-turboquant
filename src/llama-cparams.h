@@ -62,6 +62,7 @@ struct llama_cparams {
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    std::vector<bool> attention_q_pre_rope; // [n_layer()] extract normalized Q before RoPE
 
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;

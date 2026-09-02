@@ -1168,26 +1168,49 @@ void llama_kv_cache::compact() {
 
         const uint32_t kv_size = cells.size();
 
-        // Move K/V tensor data first (transaction safety: dst <= src, so src data is never
-        // overwritten before it has been copied). Only after all copies succeed do we update
-        // the cell metadata.
+        // Build one ordered backend-native move batch per backing buffer. The
+        // backend provides memmove semantics, so overlapping downward pack
+        // ranges are safe without CPU staging. We preflight every buffer before
+        // executing any data movement; only after every buffer succeeds do we
+        // commit cell metadata.
+        std::map<ggml_backend_buffer_t, std::vector<ggml_backend_tensor_memmove_region>> buffer_moves;
+
+        auto add_row_move = [&](ggml_tensor * tensor, const auto & move) {
+            const size_t row_bytes  = ggml_row_size(tensor->type, tensor->ne[0]);
+            const size_t row_stride = tensor->nb[1];
+
+            ggml_backend_tensor_memmove_region region = {};
+            region.tensor = tensor;
+            region.src_offset = (size_t) move.src_begin * row_stride;
+            region.dst_offset = (size_t) move.dst_begin * row_stride;
+
+            if (row_stride == row_bytes) {
+                region.size = (size_t) move.length * row_bytes;
+                region.n_copies = 1;
+                region.src_stride = 0;
+                region.dst_stride = 0;
+            } else {
+                // Preserve non-contiguous row layouts exactly rather than
+                // assuming nb[1] == row_size(type, ne[0]).
+                region.size = row_bytes;
+                region.n_copies = move.length;
+                region.src_stride = row_stride;
+                region.dst_stride = row_stride;
+            }
+
+            buffer_moves[tensor->buffer].push_back(region);
+        };
+
         for (const auto & layer : layers) {
             // Move K rows: one row per cell, row width = ne[0] (may be turbo-padded)
             if (layer.k_stream[s]) {
                 auto * k = layer.k_stream[s];
-                const size_t row_bytes = ggml_row_size(k->type, k->ne[0]);
 
                 for (const auto & move : plan.moves) {
                     if (move.dst_begin == move.src_begin) {
                         continue;
                     }
-                    const size_t src_offset = (size_t) move.src_begin * row_bytes;
-                    const size_t dst_offset = (size_t) move.dst_begin * row_bytes;
-                    const size_t buf_size   = (size_t) move.length  * row_bytes;
-
-                    std::vector<uint8_t> buf(buf_size);
-                    ggml_backend_tensor_get(k, buf.data(), src_offset, buf_size);
-                    ggml_backend_tensor_set(k, buf.data(), dst_offset, buf_size);
+                    add_row_move(k, move);
                 }
             }
 
@@ -1197,42 +1220,57 @@ void llama_kv_cache::compact() {
 
                 if (!v_trans) {
                     // Non-transposed V: same row layout as K
-                    const size_t row_bytes = ggml_row_size(v->type, v->ne[0]);
-
                     for (const auto & move : plan.moves) {
                         if (move.dst_begin == move.src_begin) {
                             continue;
                         }
-                        const size_t src_offset = (size_t) move.src_begin * row_bytes;
-                        const size_t dst_offset = (size_t) move.dst_begin * row_bytes;
-                        const size_t buf_size   = (size_t) move.length  * row_bytes;
-
-                        std::vector<uint8_t> buf(buf_size);
-                        ggml_backend_tensor_get(v, buf.data(), src_offset, buf_size);
-                        ggml_backend_tensor_set(v, buf.data(), dst_offset, buf_size);
+                        add_row_move(v, move);
                     }
                 } else {
-                    // Transposed V: element-at-a-time layout
-                    // Element (j, i) is at offset (i + j * kv_size) * v_size_el within the stream view
+                    // Transposed V: cell dimension is contiguous inside each
+                    // embedding row. Represent the entire embedding dimension
+                    // as one strided backend region rather than synchronizing
+                    // once per row.
+                    if (ggml_blck_size(v->type) != 1) {
+                        throw std::runtime_error(
+                            "TriAttention native compaction does not support transposed quantized V cache");
+                    }
+
                     const size_t   v_size_el = ggml_type_size(v->type);
                     const uint32_t n_embd_v  = (uint32_t) v->ne[0];
+                    const size_t   row_stride = (size_t) kv_size * v_size_el;
 
                     for (const auto & move : plan.moves) {
                         if (move.dst_begin == move.src_begin) {
                             continue;
                         }
-                        const size_t buf_size = (size_t) move.length * v_size_el;
-                        std::vector<uint8_t> buf(buf_size);
 
-                        for (uint32_t j = 0; j < n_embd_v; ++j) {
-                            const size_t src_offset = ((size_t) move.src_begin + (size_t) j * kv_size) * v_size_el;
-                            const size_t dst_offset = ((size_t) move.dst_begin + (size_t) j * kv_size) * v_size_el;
-
-                            ggml_backend_tensor_get(v, buf.data(), src_offset, buf_size);
-                            ggml_backend_tensor_set(v, buf.data(), dst_offset, buf_size);
-                        }
+                        ggml_backend_tensor_memmove_region region = {};
+                        region.tensor = v;
+                        region.src_offset = (size_t) move.src_begin * v_size_el;
+                        region.dst_offset = (size_t) move.dst_begin * v_size_el;
+                        region.size = (size_t) move.length * v_size_el;
+                        region.n_copies = n_embd_v;
+                        region.src_stride = row_stride;
+                        region.dst_stride = row_stride;
+                        buffer_moves[v->buffer].push_back(region);
                     }
                 }
+            }
+        }
+
+        for (const auto & [buffer, moves] : buffer_moves) {
+            if (!ggml_backend_tensor_memmove_regions_supported(moves.data(), moves.size())) {
+                throw std::runtime_error(
+                    std::string("TriAttention native compaction is unsupported by KV backend/layout: ") +
+                    (buffer ? ggml_backend_buffer_name(buffer) : "<null>"));
+            }
+        }
+
+        for (const auto & [buffer, moves] : buffer_moves) {
+            GGML_UNUSED(buffer);
+            if (!ggml_backend_tensor_memmove_regions(moves.data(), moves.size())) {
+                throw std::runtime_error("TriAttention native compaction failed after successful preflight");
             }
         }
 
@@ -1375,6 +1413,7 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
 
         // Score candidates
         std::vector<float> scores(n_candidates);
+        const int64_t t_score_start = ggml_time_us();
         tri_scorer->score_combined(
             scores.data(),
             k_tensors.data(),
@@ -1384,6 +1423,7 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
             cand_positions.data(),
             n_candidates,
             (int64_t) max_pos);
+        result.score_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_score_start);
 
         // Select top candidates to keep (highest score first)
         std::vector<uint32_t> order(n_candidates);
@@ -1405,16 +1445,25 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
                 const uint32_t cand_idx = order[k];
                 const uint32_t cell_i   = cand_indices[cand_idx];
 
-                if (!cells.seq_rm(cell_i, seq_id)) {
-                    // Cell is still used by another sequence
-                    result.shared_keep++;
-                }
+                cells.seq_rm(cell_i, seq_id);
+                result.references_removed++;
             }
         }
     }
 
+    // Report the final physical shared set, not the number of intermediate
+    // seq_rm() calls that happened to leave a cell referenced. This makes the
+    // metric directly describe the union that must remain resident.
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i) && cells.seq_count(i) > 1) {
+            result.shared_keep++;
+        }
+    }
+
     // Pack remaining used cells to [0, retained_count)
+    const int64_t t_pack_start = ggml_time_us();
     compact();
+    result.pack_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_pack_start);
 
     result.physical_after = cells.get_used();
     result.physical_freed = result.physical_before - result.physical_after;

@@ -45,7 +45,7 @@
 //   r_f            float32[freq_count]  ||E[q_f]|| / E[||q_f||] (validation)
 
 #define TRIATTENTION_MAGIC   0x54524941u  // "TRIA" in little-endian
-#define TRIATTENTION_VERSION 1u
+#define TRIATTENTION_VERSION 2u  // v2 adds rotary_dim for partial RoPE support
 
 // ============================================================================
 // Enums
@@ -83,7 +83,8 @@ struct triattention_calibration {
     uint32_t num_kv_groups;       // = num_attn_heads / num_kv_heads
     double   rope_theta;
     uint32_t rope_style;          // 0 = half, 1 = interleaved
-    uint32_t freq_count;          // = head_dim / 2
+    uint32_t freq_count;          // = rotary_dim / 2
+    uint32_t rotary_dim;          // dimensions with RoPE applied (<= head_dim). v2 field; v1 defaults to head_dim
     uint32_t n_sampled;           // number of (layer, head) pairs
 
     // Per sampled head arrays — length n_sampled
@@ -168,6 +169,20 @@ public:
     void print_info(FILE * stream) const;
 
 private:
+    // Score one exact calibration sample. Unlike score_head(), the sampled
+    // attention head is explicit; score_combined() uses this so heads that
+    // share a KV head still contribute their distinct calibration statistics.
+    void score_sampled_head(
+        float * out_scores,
+        const ggml_tensor * k_tensor,
+        const uint32_t * cell_indices,
+        const int32_t * positions,
+        uint32_t sampled_head_idx,
+        uint32_t kv_head_idx,
+        uint32_t n_candidates,
+        int64_t frontier_position
+    ) const;
+
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
@@ -187,14 +202,24 @@ extern "C" {
 //   out[f]           = in[f]*cos(w_f*pos) + in[f+fc]*sin(w_f*pos)
 //   out[f+fc]        = in[f+fc]*cos(w_f*pos) - in[f]*sin(w_f*pos)
 //
+// For "interleaved" style: pairs are (2f, 2f+1) in input, converted to half layout in output
+//   out[f]           = in[2f]*cos(w_f*pos) + in[2f+1]*sin(w_f*pos)
+//   out[f+fc]        = in[2f+1]*cos(w_f*pos) - in[2f]*sin(w_f*pos)
+//
+// For partial RoPE (rotary_dim < head_dim): only the first rotary_dim dimensions
+// are processed; dimensions [rotary_dim, head_dim) are copied unchanged.
+//
+// Output is always in half layout regardless of rope_style.
+//
 // Parameters:
-//   out           — [n_keys, head_dim] pre-RoPE K output
+//   out           — [n_keys, head_dim] pre-RoPE K output (half layout)
 //   post_rope_k   — [n_keys, head_dim] post-RoPE K input (dequantized)
 //   positions     — [n_keys] absolute positions of each key
 //   omega         — [freq_count] RoPE frequencies
 //   n_keys        — number of keys to process
-//   head_dim      — full head dimension (freq_count * 2)
-//   freq_count    — head_dim / 2
+//   head_dim      — full head dimension (for buffer sizing)
+//   rotary_dim    — dimensions with RoPE applied (<= head_dim)
+//   freq_count    — rotary_dim / 2
 //   rope_style    — 0=half, 1=interleaved
 void triattention_invert_rope(
     float       * out,
@@ -203,6 +228,7 @@ void triattention_invert_rope(
     const float * omega,
     uint32_t n_keys,
     uint32_t head_dim,
+    uint32_t rotary_dim,
     uint32_t freq_count,
     uint32_t rope_style);
 

@@ -70,6 +70,33 @@ extern "C" {
     // tensor copy between different backends
     GGML_API void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor * dst);
 
+    // In-place data movement for backend-native compaction. Regions are
+    // applied in array order with memmove semantics. Each region may describe
+    // one contiguous copy or a strided series of equal-sized copies. The
+    // offsets and strides are relative to tensor->data. Returns false without
+    // modifying data when the backing buffer/backend cannot implement the
+    // operation natively.
+    struct ggml_backend_tensor_memmove_region {
+        struct ggml_tensor * tensor;
+        size_t src_offset;
+        size_t dst_offset;
+        size_t size;
+        size_t n_copies;
+        size_t src_stride;
+        size_t dst_stride;
+    };
+
+    GGML_API bool ggml_backend_tensor_memmove_regions(
+        const struct ggml_backend_tensor_memmove_region * regions,
+        size_t n_regions);
+
+    // Preflight the same operation without changing tensor data. Backends may
+    // reserve/reuse internal scratch during this call so a later execution is
+    // not surprised by an allocation failure after another buffer was moved.
+    GGML_API bool ggml_backend_tensor_memmove_regions_supported(
+        const struct ggml_backend_tensor_memmove_region * regions,
+        size_t n_regions);
+
     //
     // Backend (stream)
     //

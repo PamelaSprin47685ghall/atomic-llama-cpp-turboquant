@@ -75,6 +75,9 @@ static void write_mock_calib(const char * path, const mock_calib_params & p) {
     fwrite(&p.rope_style, sizeof(uint32_t), 1, f);
     fwrite(&p.n_sampled, sizeof(uint32_t), 1, f);
     fwrite(&p.freq_count, sizeof(uint32_t), 1, f);
+    // v2: rotary_dim = head_dim (full RoPE for test model)
+    uint32_t rotary_dim = p.head_dim;
+    fwrite(&rotary_dim, sizeof(uint32_t), 1, f);
 
     // Model name (null-terminated, name_len includes the null)
     uint32_t name_len = (uint32_t)strlen(p.model_name) + 1;
@@ -93,6 +96,58 @@ static void write_mock_calib(const char * path, const mock_calib_params & p) {
         // q_abs_mean[f]  = 1.0 (mean magnitude)
         // r_f[f]         = 1.0 (perfect concentration ratio)
         std::vector<float> q_mean_real(p.freq_count, 1.0f);
+        std::vector<float> q_mean_imag(p.freq_count, 0.0f);
+        std::vector<float> q_abs_mean(p.freq_count, 1.0f);
+        std::vector<float> r_f(p.freq_count, 1.0f);
+
+        fwrite(q_mean_real.data(), sizeof(float), p.freq_count, f);
+        fwrite(q_mean_imag.data(), sizeof(float), p.freq_count, f);
+        fwrite(q_abs_mean.data(), sizeof(float), p.freq_count, f);
+        fwrite(r_f.data(), sizeof(float), p.freq_count, f);
+    }
+
+    fclose(f);
+}
+
+// One model layer, two attention heads sharing one KV head. The two sampled
+// heads have opposite mean-Q phase so both must participate in max/union.
+static void write_mock_shared_kv_calib(const char * path) {
+    mock_calib_params p;
+    p.num_layers = 1;
+    p.num_attn_heads = 2;
+    p.num_kv_heads = 1;
+    p.n_sampled = 2;
+
+    FILE * f = fopen(path, "wb");
+    assert(f && "cannot open temp calib file for writing");
+
+    uint32_t magic = TRIATTENTION_MAGIC;
+    uint32_t version = TRIATTENTION_VERSION;
+    fwrite(&magic, sizeof(uint32_t), 1, f);
+    fwrite(&version, sizeof(uint32_t), 1, f);
+    fwrite(&p.head_dim, sizeof(uint32_t), 1, f);
+    fwrite(&p.num_layers, sizeof(uint32_t), 1, f);
+    fwrite(&p.num_attn_heads, sizeof(uint32_t), 1, f);
+    fwrite(&p.num_kv_heads, sizeof(uint32_t), 1, f);
+    fwrite(&p.rope_theta, sizeof(double), 1, f);
+    fwrite(&p.rope_style, sizeof(uint32_t), 1, f);
+    fwrite(&p.n_sampled, sizeof(uint32_t), 1, f);
+    fwrite(&p.freq_count, sizeof(uint32_t), 1, f);
+    uint32_t rotary_dim = p.head_dim;
+    fwrite(&rotary_dim, sizeof(uint32_t), 1, f);
+
+    uint32_t name_len = (uint32_t)strlen(p.model_name) + 1;
+    fwrite(&name_len, sizeof(uint32_t), 1, f);
+    fwrite(p.model_name, 1, name_len, f);
+
+    for (uint32_t h = 0; h < p.n_sampled; ++h) {
+        uint32_t layer_idx = 0;
+        uint32_t head_idx = h;
+        fwrite(&layer_idx, sizeof(uint32_t), 1, f);
+        fwrite(&head_idx, sizeof(uint32_t), 1, f);
+
+        const float sign = h == 0 ? 1.0f : -1.0f;
+        std::vector<float> q_mean_real(p.freq_count, sign);
         std::vector<float> q_mean_imag(p.freq_count, 0.0f);
         std::vector<float> q_abs_mean(p.freq_count, 1.0f);
         std::vector<float> r_f(p.freq_count, 1.0f);
@@ -275,6 +330,7 @@ static void test_rope_inversion() {
         omega.data(),
         1,           // n_keys
         head_dim,
+        head_dim,    // rotary_dim = head_dim (full RoPE)
         freq_count,
         rope_style);
 
@@ -317,6 +373,7 @@ static void test_rope_inversion() {
         omega.data(),
         n_keys,
         head_dim,
+        head_dim,    // rotary_dim = head_dim (full RoPE)
         freq_count,
         rope_style);
 
@@ -329,6 +386,59 @@ static void test_rope_inversion() {
                 float_eq(k_rec_multi[i * head_dim + f + freq_count],
                          k_pre_multi[i * head_dim + f + freq_count], 1e-3f),
                 "Multi-key RoPE inversion failed for imag part");
+        }
+    }
+
+    // Partial, interleaved RoPE must convert the rotated prefix to the scorer's
+    // half layout while preserving non-rotary dimensions byte-for-byte.
+    {
+        const uint32_t partial_head_dim = 8;
+        const uint32_t rotary_dim = 4;
+        const uint32_t partial_fc = rotary_dim / 2;
+        const int32_t partial_pos = 7;
+        const std::vector<float> partial_omega = {1.0f, 0.1f};
+        const std::vector<float> pre_interleaved = {
+            0.25f, -0.50f,
+            0.75f,  1.25f,
+            2.00f,  3.00f, 4.00f, 5.00f,
+        };
+        const std::vector<float> expected_half = {
+            0.25f, 0.75f,
+           -0.50f, 1.25f,
+            2.00f, 3.00f, 4.00f, 5.00f,
+        };
+
+        std::vector<float> post(partial_head_dim);
+        for (uint32_t f = 0; f < partial_fc; ++f) {
+            const float angle = partial_omega[f] * (float) partial_pos;
+            const float c = cosf(angle);
+            const float s = sinf(angle);
+            const float re = pre_interleaved[2 * f];
+            const float im = pre_interleaved[2 * f + 1];
+            post[2 * f]     = re * c - im * s;
+            post[2 * f + 1] = re * s + im * c;
+        }
+        std::copy(
+            pre_interleaved.begin() + rotary_dim,
+            pre_interleaved.end(),
+            post.begin() + rotary_dim);
+
+        std::vector<float> recovered(partial_head_dim);
+        triattention_invert_rope(
+            recovered.data(),
+            post.data(),
+            &partial_pos,
+            partial_omega.data(),
+            1,
+            partial_head_dim,
+            rotary_dim,
+            partial_fc,
+            1);
+
+        for (uint32_t d = 0; d < partial_head_dim; ++d) {
+            TEST_ASSERT_MSG(
+                float_eq(recovered[d], expected_half[d], 1e-4f),
+                "Partial interleaved RoPE inversion failed");
         }
     }
 
@@ -465,6 +575,51 @@ static void test_scoring() {
         TEST_ASSERT_MSG(float_eq(combined[i], expected_max, 1e-2f),
             "combined score should be max of per-head scores");
     }
+
+    free_mock_tensor_ctx(mtc);
+    remove(tmp_path);
+    fprintf(stderr, "  PASSED\n");
+}
+
+static void test_combined_uses_exact_sampled_head() {
+    fprintf(stderr, "--- test_combined_uses_exact_sampled_head ---\n");
+
+    const char * tmp_path = "/tmp/test_triattention_shared_kv.triattention";
+    write_mock_shared_kv_calib(tmp_path);
+
+    triattention_scorer_config cfg;
+    cfg.normalize_scores = false;
+    triattention_scorer scorer(tmp_path, cfg, 10000.0, 128, 1);
+    TEST_ASSERT(scorer.valid());
+
+    mock_tensor_ctx mtc = make_mock_tensor_ctx(
+        ggml_tensor_overhead() * 2 + 2 * 128 * sizeof(float) + 1024);
+    ggml_tensor * k = make_k_tensor(mtc, 1, 128, 2);
+    alloc_mock_tensors(mtc);
+
+    std::vector<float> positive(128,  0.1f);
+    std::vector<float> negative(128, -0.1f);
+    write_k_cell(k, 0, 0, 128, positive.data());
+    write_k_cell(k, 1, 0, 128, negative.data());
+
+    uint32_t cells[2] = {0, 1};
+    int32_t positions[2] = {0, 0};
+
+    float first_head[2] = {};
+    scorer.score_head(first_head, k, cells, positions, 0, 2, 100);
+
+    float combined[2] = {};
+    ggml_tensor * tensors[1] = {k};
+    int32_t layer_map[1] = {0};
+    scorer.score_combined(combined, tensors, 1, layer_map, cells, positions, 2, 100);
+
+    const float expected = std::max(first_head[0], first_head[1]);
+    TEST_ASSERT_MSG(float_eq(combined[0], expected, 1e-3f),
+        "combined[0] must include the second attention head sharing the KV head");
+    TEST_ASSERT_MSG(float_eq(combined[1], expected, 1e-3f),
+        "combined[1] must include the second attention head sharing the KV head");
+    TEST_ASSERT_MSG(!float_eq(first_head[0], first_head[1], 1e-3f),
+        "fixture must distinguish the two candidate phases");
 
     free_mock_tensor_ctx(mtc);
     remove(tmp_path);
@@ -669,6 +824,7 @@ int main() {
     test_calibration_loading();
     test_rope_inversion();
     test_scoring();
+    test_combined_uses_exact_sampled_head();
     test_zscore_normalization();
 
     fprintf(stderr, "\n=== Results: %d failure(s) ===\n", g_test_failures);

@@ -1062,6 +1062,10 @@ struct vk_device_struct {
 
     vk::Fence fence;
     vk_buffer sync_staging;
+    // Reusable device-local scratch for ordered in-place buffer moves. This is
+    // intentionally separate from sync_staging: TriAttention compaction must
+    // stay on-device and never round-trip through host-visible memory.
+    vk_buffer memmove_scratch;
 
     ggml_backend_buffer_type buffer_type;
 
@@ -1078,6 +1082,7 @@ struct vk_device_struct {
         device.destroyFence(fence);
 
         ggml_vk_destroy_buffer(sync_staging);
+        ggml_vk_destroy_buffer(memmove_scratch);
 
         if (compute_queue) compute_queue->cmd_pool.destroy(device);
         if (transfer_queue) transfer_queue->cmd_pool.destroy(device);
@@ -8122,6 +8127,18 @@ static void ggml_vk_ensure_sync_staging_buffer(vk_device& device, size_t size) {
         device->sync_staging = ggml_vk_create_buffer_check(device, size,
             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
             vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+    }
+}
+
+static constexpr size_t GGML_VK_MEMMOVE_SCRATCH_SIZE = 8u * 1024u * 1024u;
+
+static void ggml_vk_ensure_memmove_scratch(vk_device& device) {
+    if (device->memmove_scratch == nullptr) {
+        VK_LOG_MEMORY("ggml_vk_ensure_memmove_scratch(" << GGML_VK_MEMMOVE_SCRATCH_SIZE << ")");
+        device->memmove_scratch = ggml_vk_create_buffer_check(
+            device,
+            GGML_VK_MEMMOVE_SCRATCH_SIZE,
+            {vk::MemoryPropertyFlagBits::eDeviceLocal});
     }
 }
 
@@ -15859,6 +15876,100 @@ static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, cons
     UNUSED(buffer);
 }
 
+static bool ggml_backend_vk_buffer_memmove_tensor(
+        ggml_backend_buffer_t buffer,
+        const ggml_backend_tensor_memmove_region * regions,
+        size_t n_regions,
+        bool dry_run) {
+    if (n_regions == 0) {
+        return true;
+    }
+
+    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *) buffer->context;
+    vk_buffer data_buf = buf_ctx->dev_buffer;
+    vk_device device = data_buf->device;
+
+    // Validate the full batch before touching data. vkCmdCopyBuffer requires
+    // 4-byte aligned offsets/sizes, so layouts that cannot be represented by
+    // transfer copies (notably some transposed F16/BF16 V moves) explicitly
+    // report unsupported instead of silently falling back to host staging.
+    for (size_t r = 0; r < n_regions; ++r) {
+        const auto & region = regions[r];
+        if (region.tensor == nullptr || region.tensor->buffer != buffer || region.n_copies == 0) {
+            return false;
+        }
+
+        const uint64_t base = vk_tensor_offset(region.tensor) + region.tensor->view_offs;
+        for (size_t c = 0; c < region.n_copies; ++c) {
+            const uint64_t src = base + region.src_offset + c * region.src_stride;
+            const uint64_t dst = base + region.dst_offset + c * region.dst_stride;
+            const uint64_t end_src = src + region.size;
+            const uint64_t end_dst = dst + region.size;
+
+            if (end_src > buffer->size || end_dst > buffer->size ||
+                (src & 3u) != 0 || (dst & 3u) != 0 || (region.size & 3u) != 0) {
+                return false;
+            }
+        }
+    }
+
+    std::lock_guard<std::recursive_mutex> guard(device->mutex);
+    ggml_vk_ensure_memmove_scratch(device);
+
+    if (dry_run) {
+        return true;
+    }
+
+    vk_context subctx = ggml_vk_create_temporary_context(device->transfer_queue->cmd_pool);
+    ggml_vk_ctx_begin(device, subctx);
+
+    auto move_one = [&](uint64_t src, uint64_t dst, size_t size) {
+        if (size == 0 || src == dst) {
+            return;
+        }
+
+        // The scratch buffer provides true memmove semantics even when source
+        // and destination overlap. Process backwards only for upward moves;
+        // compaction normally moves downward, but the backend primitive is
+        // intentionally general.
+        size_t remaining = size;
+        while (remaining > 0) {
+            const size_t chunk = std::min(remaining, GGML_VK_MEMMOVE_SCRATCH_SIZE);
+            const size_t off = dst > src ? remaining - chunk : size - remaining;
+
+            ggml_vk_buffer_copy_async(
+                subctx, device->memmove_scratch, 0, data_buf, src + off, chunk);
+            ggml_vk_sync_buffers(nullptr, subctx);
+            ggml_vk_buffer_copy_async(
+                subctx, data_buf, dst + off, device->memmove_scratch, 0, chunk);
+            ggml_vk_sync_buffers(nullptr, subctx);
+
+            remaining -= chunk;
+        }
+    };
+
+    for (size_t r = 0; r < n_regions; ++r) {
+        const auto & region = regions[r];
+        const uint64_t base = vk_tensor_offset(region.tensor) + region.tensor->view_offs;
+
+        // Preserve caller-specified region order. Within a strided region the
+        // copies are independent rows for current KV layouts.
+        for (size_t c = 0; c < region.n_copies; ++c) {
+            const uint64_t src = base + region.src_offset + c * region.src_stride;
+            const uint64_t dst = base + region.dst_offset + c * region.dst_stride;
+            move_one(src, dst, region.size);
+        }
+    }
+
+    ggml_vk_ctx_end(subctx);
+    ggml_vk_submit(subctx, device->fence);
+    VK_CHECK(device->device.waitForFences({ device->fence }, true, UINT64_MAX), "vk_buffer_memmove_tensor waitForFences");
+    device->device.resetFences({ device->fence });
+    ggml_vk_queue_command_pools_cleanup(device);
+
+    return true;
+}
+
 static void ggml_backend_vk_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
 
@@ -15877,6 +15988,7 @@ static ggml_backend_buffer_i ggml_backend_vk_buffer_interface = {
     /* .cpy_tensor      = */ ggml_backend_vk_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_vk_buffer_clear,
     /* .reset           = */ NULL,
+    /* .memmove_tensor  = */ ggml_backend_vk_buffer_memmove_tensor,
 };
 
 // vk buffer type

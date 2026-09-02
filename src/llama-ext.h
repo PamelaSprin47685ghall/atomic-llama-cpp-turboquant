@@ -115,6 +115,11 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
+// Extract normalized attention Q immediately before RoPE for calibration.
+// Enabled layers are copied asynchronously and synchronized once on the first getter.
+LLAMA_API void    llama_set_attention_q_pre_rope(struct llama_context * ctx, uint32_t lid, bool value);
+LLAMA_API float * llama_get_attention_q_pre_rope(struct llama_context * ctx, uint32_t lid);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //
@@ -154,9 +159,12 @@ struct llama_memory_kv_reclaim_result {
     uint32_t physical_before = 0;     // physical cells used before reclaim
     uint32_t physical_after = 0;      // physical cells used after reclaim
     uint32_t physical_freed = 0;      // physical cells actually freed
+    uint32_t references_removed = 0;  // per-sequence KV references removed (may exceed physical_freed for shared cells)
     uint32_t target_references = 0;   // total reference-level target across seqs
     uint32_t hard_keep = 0;           // cells kept due to hard protection (tail/in-flight)
-    uint32_t shared_keep = 0;         // shared cells kept because another seq needs them
+    uint32_t shared_keep = 0;         // physical cells retained by more than one sequence
+    uint64_t score_us = 0;            // wall time spent in importance scoring
+    uint64_t pack_us = 0;             // wall time spent physically compacting K/V
 };
 
 //
@@ -167,6 +175,13 @@ struct llama_memory_kv_reclaim_result {
 // Returns a result with supported=false if the memory type doesn't support reclaim.
 LLAMA_API struct llama_memory_kv_reclaim_result llama_memory_reclaim_kv(
         llama_memory_t mem,
+        const struct llama_memory_kv_reclaim_request * request);
+
+// Context-level reclaim entry point. This synchronizes pending backend work
+// before moving K/V data and invalidates the reserved graph after a change.
+// Server/runtime callers should prefer this over the raw memory-level API.
+LLAMA_API struct llama_memory_kv_reclaim_result llama_context_reclaim_kv(
+        struct llama_context * ctx,
         const struct llama_memory_kv_reclaim_request * request);
 
 // Returns true if positions in [seq_pos_min, seq_pos_max] may have gaps

@@ -113,6 +113,15 @@ target_compile_features(wanxiangqi-trie-calib PRIVATE cxx_std_17)
 target_link_libraries(wanxiangqi-trie-calib PRIVATE wanxiangqi-probe-lib llama-common llama ggml ${CMAKE_THREAD_LIBS_INIT})
 install(TARGETS wanxiangqi-trie-calib RUNTIME)
 
+# Trie-driven TriAttention calibration collector: pre-RoPE Q statistics
+# (complex mean, mean magnitude per frequency band) for all full-attention
+# layers, gathered by walking the request-token trie depth first.
+add_executable(wanxiangqi-trie-triattention-calib calib/trie-triattention-calib.cpp)
+target_compile_features(wanxiangqi-trie-triattention-calib PRIVATE cxx_std_17)
+target_include_directories(wanxiangqi-trie-triattention-calib PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(wanxiangqi-trie-triattention-calib PRIVATE wanxiangqi-probe-lib llama-common llama ggml ${CMAKE_THREAD_LIBS_INIT})
+install(TARGETS wanxiangqi-trie-triattention-calib RUNTIME)
+
 # Offline structural probe: reads GGUF weights directly, never runs the model.
 add_executable(wanxiangqi-calib-probe calib/calib-probe.cpp)
 target_compile_features(wanxiangqi-calib-probe PRIVATE cxx_std_17)

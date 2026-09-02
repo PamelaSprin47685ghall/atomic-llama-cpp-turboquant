@@ -95,6 +95,7 @@ struct llama_context {
     float * get_embeddings_nextn_ith(int32_t i);
 
     float * get_embeddings_layer_inp(uint32_t lid);
+    float * get_attention_q_pre_rope(uint32_t lid);
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -121,6 +122,7 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_attention_q_pre_rope(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
@@ -236,9 +238,12 @@ private:
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
-    // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
+    // async-copy enabled layer-input tensors (per cparams.embeddings_layer_inp)
     // from backend into host-side embd_layer_inp buffers
     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+
+    // async-copy enabled normalized pre-RoPE Q tensors into host buffers
+    void extract_attention_q_pre_rope(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
 
     //
     // graph
@@ -307,8 +312,12 @@ private:
     buffer_view<float> embd_nextn = {nullptr, 0};
 
     // host buffers for output layer input embeddings, per layer
-    // populated when cparams.output_layer_inp[il] is true
+    // populated when cparams.embeddings_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+
+    // host buffers for normalized attention Q before RoPE, per layer
+    // populated when cparams.attention_q_pre_rope[il] is true
+    std::vector<buffer_view<float>> attention_q_pre_rope;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

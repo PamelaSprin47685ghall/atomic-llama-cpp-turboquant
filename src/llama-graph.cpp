@@ -1302,6 +1302,9 @@ void llm_graph_result::reset() {
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
+    t_attn_q_pre_rope.resize(LLAMA_MAX_LAYERS);
+    std::fill(t_attn_q_pre_rope.begin(), t_attn_q_pre_rope.end(), nullptr);
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -1350,6 +1353,15 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             if (embeddings_layer_inp[il]) {
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
                 ggml_set_output(t_layer_inp[il]);
+            }
+        }
+    }
+    {
+        const auto & attention_q_pre_rope = params.cparams.attention_q_pre_rope;
+        for (size_t il = 0; il < attention_q_pre_rope.size(); ++il) {
+            if (attention_q_pre_rope[il]) {
+                GGML_ASSERT(t_attn_q_pre_rope[il] != nullptr && "pre-RoPE Q tensor is null");
+                ggml_set_output(t_attn_q_pre_rope[il]);
             }
         }
     }

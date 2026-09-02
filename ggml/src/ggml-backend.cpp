@@ -499,6 +499,44 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
     }
 }
 
+static bool ggml_backend_tensor_memmove_regions_impl(
+        const struct ggml_backend_tensor_memmove_region * regions,
+        size_t n_regions,
+        bool dry_run) {
+    if (n_regions == 0) {
+        return true;
+    }
+    if (regions == NULL || regions[0].tensor == NULL || regions[0].tensor->buffer == NULL) {
+        return false;
+    }
+
+    ggml_backend_buffer_t buffer = regions[0].tensor->buffer;
+    for (size_t i = 0; i < n_regions; ++i) {
+        const auto & region = regions[i];
+        if (region.tensor == NULL || region.tensor->buffer != buffer || region.n_copies == 0) {
+            return false;
+        }
+    }
+
+    if (buffer->iface.memmove_tensor == NULL) {
+        return false;
+    }
+
+    return buffer->iface.memmove_tensor(buffer, regions, n_regions, dry_run);
+}
+
+bool ggml_backend_tensor_memmove_regions(
+        const struct ggml_backend_tensor_memmove_region * regions,
+        size_t n_regions) {
+    return ggml_backend_tensor_memmove_regions_impl(regions, n_regions, false);
+}
+
+bool ggml_backend_tensor_memmove_regions_supported(
+        const struct ggml_backend_tensor_memmove_region * regions,
+        size_t n_regions) {
+    return ggml_backend_tensor_memmove_regions_impl(regions, n_regions, true);
+}
+
 void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 

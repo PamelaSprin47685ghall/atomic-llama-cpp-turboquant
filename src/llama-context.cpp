@@ -135,6 +135,9 @@ llama_context::llama_context(
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
     embd_layer_inp.resize(hparams.n_layer() + 1);
 
+    cparams.attention_q_pre_rope.resize(hparams.n_layer(), false);
+    attention_q_pre_rope.resize(hparams.n_layer());
+
     cparams.ctx_type     = params.ctx_type;
     cparams.pooling_type = params.pooling_type;
 
@@ -1121,6 +1124,12 @@ float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
     return embd_layer_inp[lid].data;
 }
 
+float * llama_context::get_attention_q_pre_rope(uint32_t lid) {
+    GGML_ASSERT(lid < attention_q_pre_rope.size() && attention_q_pre_rope[lid].has_data());
+
+    return attention_q_pre_rope[lid].data;
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -1316,6 +1325,15 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     cparams.embeddings_layer_inp[lid] = enable;
 
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
+    sched_need_reserve = true;
+}
+
+void llama_context::set_attention_q_pre_rope(uint32_t lid, bool enable) {
+    LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
+
+    GGML_ASSERT(lid < model.hparams.n_layer());
+
+    cparams.attention_q_pre_rope[lid] = enable;
     sched_need_reserve = true;
 }
 
@@ -2160,6 +2178,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        extract_attention_q_pre_rope(res, n_tokens_prev, ubatch.n_tokens);
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2281,6 +2300,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     size_t backend_float_count = 0;
     size_t backend_token_count = 0;
     size_t embd_layer_inp_float_count = 0;
+    size_t attention_q_pre_rope_float_count = 0;
 
     logits.size     = has_logits     ? n_vocab*n_outputs_max     : 0;
     embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
@@ -2298,6 +2318,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         }
     }
 
+    for (uint32_t il = 0; il < cparams.attention_q_pre_rope.size(); ++il) {
+        if (cparams.attention_q_pre_rope[il]) {
+            const size_t q_width = (size_t) hparams.n_embd_head_k(il) * hparams.n_head(il);
+            attention_q_pre_rope_float_count += q_width * n_batch;
+        }
+    }
+
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
     if (has_sampling) {
@@ -2312,8 +2339,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
-        (                                                                         backend_token_count) * sizeof(llama_token);
+        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count +
+         attention_q_pre_rope_float_count + backend_float_count) * sizeof(float) +
+        (                                        backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -2332,6 +2360,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             embd_nextn.data = nullptr;
             for (auto & layer_inp : embd_layer_inp) {
                 layer_inp = {nullptr, 0};
+            }
+            for (auto & q : attention_q_pre_rope) {
+                q = {nullptr, 0};
             }
         }
 
@@ -2370,6 +2401,16 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             offset += embd_layer_inp[il].size * sizeof(float);
         } else {
             embd_layer_inp[il] = buffer_view<float>{nullptr, 0};
+        }
+    }
+
+    for (uint32_t il = 0; il < attention_q_pre_rope.size(); ++il) {
+        if (cparams.attention_q_pre_rope[il]) {
+            const size_t q_width = (size_t) hparams.n_embd_head_k(il) * hparams.n_head(il);
+            attention_q_pre_rope[il] = buffer_view<float>{(float *) (base + offset), q_width * n_batch};
+            offset += attention_q_pre_rope[il].size * sizeof(float);
+        } else {
+            attention_q_pre_rope[il] = buffer_view<float>{nullptr, 0};
         }
     }
 
@@ -2444,6 +2485,39 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+    }
+}
+
+void llama_context::extract_attention_q_pre_rope(
+        const llm_graph_result * res,
+        size_t                   token_offset,
+        size_t                   n_tokens) {
+    for (uint32_t il = 0; il < cparams.attention_q_pre_rope.size(); ++il) {
+        if (!cparams.attention_q_pre_rope[il]) {
+            continue;
+        }
+        if (!attention_q_pre_rope[il].has_data()) {
+            GGML_ABORT("pre-RoPE Q output buffer not allocated");
+        }
+
+        ggml_tensor * t = res->get_attn_q_pre_rope((int) il);
+        if (!t) {
+            GGML_ABORT("pre-RoPE Q tensor not found");
+        }
+
+        const size_t nbytes = ggml_nbytes(t);
+        const size_t nfloats = nbytes / sizeof(float);
+        GGML_ASSERT(n_tokens > 0);
+        GGML_ASSERT(nfloats % n_tokens == 0);
+
+        const size_t row_floats = nfloats / n_tokens;
+        const size_t dst_offset = token_offset * row_floats;
+        GGML_ASSERT(dst_offset + nfloats <= attention_q_pre_rope[il].size);
+
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+        GGML_ASSERT(backend != nullptr);
+        ggml_backend_tensor_get_async(
+            backend, t, attention_q_pre_rope[il].data + dst_offset, 0, nbytes);
     }
 }
 
@@ -3696,6 +3770,8 @@ llama_context_params llama_context_default_params() {
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
         /*.n_ctx_kv                    =*/ 0,
+        /*.triattention                =*/ false,
+        /*.triattention_stats          =*/ nullptr,
     };
 
     return result;
@@ -3984,6 +4060,10 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
     ctx->set_embeddings_layer_inp(lid, value);
 }
 
+void llama_set_attention_q_pre_rope(llama_context * ctx, uint32_t lid, bool value) {
+    ctx->set_attention_q_pre_rope(lid, value);
+}
+
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
 }
@@ -4012,6 +4092,12 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     ctx->synchronize();
 
     return ctx->get_embeddings_layer_inp(lid);
+}
+
+float * llama_get_attention_q_pre_rope(llama_context * ctx, uint32_t lid) {
+    ctx->synchronize();
+
+    return ctx->get_attention_q_pre_rope(lid);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
@@ -4474,6 +4560,16 @@ llama_memory_kv_reclaim_result llama_memory_reclaim_kv(
         return result;
     }
     return mem->reclaim_kv(*request);
+}
+
+llama_memory_kv_reclaim_result llama_context_reclaim_kv(
+        llama_context * ctx,
+        const llama_memory_kv_reclaim_request * request) {
+    llama_memory_kv_reclaim_result result;
+    if (!ctx || !request) {
+        return result;
+    }
+    return ctx->memory_reclaim_kv(*request);
 }
 
 bool llama_memory_positions_are_sparse(llama_memory_t mem) {

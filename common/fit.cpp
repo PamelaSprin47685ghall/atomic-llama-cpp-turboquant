@@ -1001,6 +1001,9 @@ common_params_fit_status common_fit_kv_cache(
         std::vector<ggml_backend_dev_t> extra_devs;
         if (extra_cparams != nullptr) {
             llama_context_params extra = *extra_cparams;
+            // MTP/draft contexts use the same n_ctx_kv as the target — the n_ctx_kv >= n_ctx
+            // check requires it. However, the MTP context's KV cache only covers the MTP head
+            // layers (via layer filter), so its actual memory is much smaller than the target's.
             extra.n_ctx_kv = n_ctx_kv;
             uint32_t extra_ngl = 0;
             uint32_t extra_n_ctx_train = 0;
@@ -1023,6 +1026,18 @@ common_params_fit_status common_fit_kv_cache(
                 }
             }
 
+            // Vulkan TriAttention compaction uses one reusable 8 MiB
+            // device-local memmove scratch buffer per Vulkan device. Keep
+            // this in sync with GGML_VK_MEMMOVE_SCRATCH_SIZE so --total-kv
+            // auto never consumes the memory that native pack needs later.
+            if (cparams->triattention) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(devs[i]);
+                const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+                if (reg_name && std::string(reg_name).find("Vulkan") != std::string::npos) {
+                    reserved += 8ull * 1024ull * 1024ull;
+                }
+            }
+
             for (size_t j = 0; j < extra_devs.size(); ++j) {
                 if (extra_devs[j] == devs[i]) {
                     reserved += extra_data[j].context;
@@ -1034,6 +1049,12 @@ common_params_fit_status common_fit_kv_cache(
                 256ull * MiB, std::max<uint64_t>(32ull * MiB, data[i].total / 100ull));
             const uint64_t used = data[i].model + data[i].context + data[i].compute + reserved + runtime_headroom;
             if (data[i].free <= 0 || used > (uint64_t) data[i].free) {
+                LOG_WRN("%s: KV size %u does not fit: model=%llu context=%llu compute=%llu reserved=%llu headroom=%llu used=%llu free=%lld\n",
+                    __func__, n_ctx_kv,
+                    (unsigned long long)data[i].model, (unsigned long long)data[i].context,
+                    (unsigned long long)data[i].compute, (unsigned long long)reserved,
+                    (unsigned long long)runtime_headroom, (unsigned long long)used,
+                    (long long)data[i].free);
                 return false;
             }
         }

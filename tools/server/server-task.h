@@ -535,6 +535,26 @@ struct server_task_result_metrics : server_task_result {
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
 
+    // TriAttention runtime observability. Counters are cumulative for the
+    // process lifetime; cell/reference values describe the most recent
+    // successful reclaim operation.
+    uint64_t tri_drain_total              = 0;
+    uint64_t tri_maintenance_total        = 0;
+    uint64_t tri_floor_exhausted_total    = 0;
+    uint64_t tri_atomic_fallback_kv_total = 0;
+    uint64_t tri_atomic_fallback_recurrent_total = 0;
+    uint64_t tri_cells_freed_total        = 0;
+    uint64_t tri_score_us_total           = 0;
+    uint64_t tri_pack_us_total            = 0;
+
+    uint64_t tri_cells_before       = 0;
+    uint64_t tri_cells_after        = 0;
+    uint64_t tri_cells_freed        = 0;
+    uint64_t tri_references_removed = 0;
+    uint64_t tri_target_references  = 0;
+    uint64_t tri_hard_keep          = 0;
+    uint64_t tri_shared_keep        = 0;
+
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();

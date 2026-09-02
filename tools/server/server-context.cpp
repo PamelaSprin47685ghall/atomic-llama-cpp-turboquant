@@ -315,6 +315,7 @@ struct server_slot {
 
     // state
     slot_state state = SLOT_STATE_IDLE;
+    bool triattention_compressed = false;
 
     server_prompt prompt;
     server_tokens response_prompt;
@@ -357,6 +358,10 @@ struct server_slot {
         if (res && loaded_state) {
             common_speculative_set_state(spec, id, state_spec);
         }
+        if (res) {
+            triattention_compressed = loaded_state &&
+                llama_memory_seq_get_kv_used(llama_get_memory(ctx_tgt), id) < prompt.tokens.size();
+        }
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -371,6 +376,7 @@ struct server_slot {
         common_speculative_set_state(spec, id, {});
 
         prompt.clear();
+        triattention_compressed = false;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -1130,9 +1136,23 @@ private:
     server_metrics metrics;
 
     uint64_t tri_drain_count = 0;
-    uint64_t tri_cells_freed = 0;
+    uint64_t tri_maintenance_count = 0;
     uint64_t tri_floor_exhausted_count = 0;
-    uint64_t atomic_fallback_after_tri_count = 0;
+    uint64_t tri_atomic_fallback_kv_count = 0;
+    uint64_t tri_atomic_fallback_recurrent_count = 0;
+
+    uint64_t tri_cells_freed_total = 0;
+    uint64_t tri_score_us_total = 0;
+    uint64_t tri_pack_us_total = 0;
+
+    uint64_t tri_cells_before = 0;
+    uint64_t tri_cells_after = 0;
+    uint64_t tri_cells_freed = 0;
+    uint64_t tri_references_removed = 0;
+    uint64_t tri_target_references = 0;
+    uint64_t tri_hard_keep = 0;
+    uint64_t tri_shared_keep = 0;
+    uint32_t kv_batch_limit = UINT32_MAX;
 
     json json_ui_settings = json::object();
 
@@ -2177,9 +2197,17 @@ private:
     }
 
     bool ensure_next_kv_capacity() {
+        kv_batch_limit = UINT32_MAX;
+
         if (!params_base.kv_unified || params_base.n_ctx_kv == 0) {
             return true;
         }
+
+        // One pressure-planning call can iterate several times while idle
+        // slots are cleared or victims are preempted. Count each fallback
+        // reason once per planner invocation rather than once per loop pass.
+        bool counted_kv_fallback = false;
+        bool counted_recurrent_fallback = false;
 
         while (true) {
             llama_memory_kv_usage usage_tgt = {};
@@ -2206,69 +2234,162 @@ private:
             const uint64_t available_recurrent_tgt = has_recurrent_tgt ? usage_recurrent_tgt.capacity - std::min(usage_recurrent_tgt.capacity, usage_recurrent_tgt.used) : UINT64_MAX;
             const uint64_t available_recurrent_dft = has_recurrent_dft ? usage_recurrent_dft.capacity - std::min(usage_recurrent_dft.capacity, usage_recurrent_dft.used) : UINT64_MAX;
 
-            if (required_kv <= available_tgt && required_kv <= available_dft &&
-                required_recurrent_tgt <= available_recurrent_tgt &&
-                required_recurrent_dft <= available_recurrent_dft) {
+            const bool kv_pressure = required_kv > available_tgt || required_kv > available_dft;
+            const bool recurrent_pressure = required_recurrent_tgt > available_recurrent_tgt ||
+                                            required_recurrent_dft > available_recurrent_dft;
+            const uint32_t kv_deficit_tgt = has_tgt_usage && required_kv > available_tgt
+                ? (uint32_t) std::min<uint64_t>(UINT32_MAX, (uint64_t) required_kv - available_tgt)
+                : 0;
+            const uint32_t kv_deficit_dft = has_dft_usage && required_kv > available_dft
+                ? (uint32_t) std::min<uint64_t>(UINT32_MAX, (uint64_t) required_kv - available_dft)
+                : 0;
+
+            bool tri_maintenance_due = false;
+            if (params_base.triattention_enabled && !kv_pressure) {
+                for (const auto & slot : slots) {
+                    if (!slot.is_processing() || !slot.triattention_compressed) {
+                        continue;
+                    }
+
+                    const uint32_t logical_tokens = (uint32_t) slot.prompt.n_tokens();
+                    const uint32_t target = std::max<uint32_t>(128, (uint32_t) (((uint64_t) logical_tokens * 3 + 31) / 32));
+                    const uint32_t resident = llama_memory_seq_get_kv_used(mem_tgt, slot.id);
+                    if (resident > target + 128) {
+                        tri_maintenance_due = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!kv_pressure && !recurrent_pressure && !tri_maintenance_due) {
                 return true;
             }
 
-            // TriAttention drain: if enabled, try reclaim before falling back to idle-clear/preemption
-            if (params_base.triattention_enabled) {
-                // Build seq hints from active slots
+            // TriAttention only reclaims KV. Recurrent-only pressure must go directly
+            // to the existing recurrent fallback path.
+            if (params_base.triattention_enabled && (kv_pressure || tri_maintenance_due)) {
+                // Initial pressure drains every resident sequence. Maintenance only
+                // touches sequences that have already entered compressed mode.
                 std::vector<llama_memory_kv_reclaim_seq_hint> seq_hints;
                 for (auto & slot : slots) {
-                    if (!slot.is_processing()) {
+                    if (slot.prompt.n_tokens() == 0 || (!kv_pressure && !slot.triattention_compressed)) {
                         continue;
                     }
                     llama_memory_kv_reclaim_seq_hint hint;
                     hint.seq_id = slot.id;
-                    hint.logical_tokens = (uint32_t)(slot.prompt.n_tokens() + slot.n_decoded);
+                    hint.logical_tokens = (uint32_t) slot.prompt.n_tokens();
                     hint.tail_guard = 128; // recent window
                     hint.eligible = true;
                     seq_hints.push_back(hint);
                 }
 
                 llama_memory_kv_reclaim_request req;
-                req.required_free = required_kv; // need at least this many cells
+                // required_free is a deficit, not the whole incoming batch.
+                // drain_to_floor still makes the initial pressure event perform
+                // the fixed 3/32 drain regardless of the deficit size.
+                req.required_free = kv_deficit_tgt;
                 req.drain_to_floor = true;
                 req.seq_hints = std::move(seq_hints);
 
-                // Reclaim on target memory
-                auto result_tgt = llama_memory_reclaim_kv(mem_tgt, &req);
+                // Context-level reclaim synchronizes pending compute before any
+                // physical K/V movement and invalidates graph reservations after.
+                auto result_tgt = llama_context_reclaim_kv(ctx_tgt, &req);
                 if (result_tgt.supported && result_tgt.changed) {
-                    tri_drain_count++;
-                    tri_cells_freed += result_tgt.physical_freed;
+                    if (kv_pressure) {
+                        tri_drain_count++;
+                    } else {
+                        tri_maintenance_count++;
+                    }
+                    tri_cells_before       = result_tgt.physical_before;
+                    tri_cells_after        = result_tgt.physical_after;
+                    tri_cells_freed        = result_tgt.physical_freed;
+                    tri_references_removed = result_tgt.references_removed;
+                    tri_target_references  = result_tgt.target_references;
+                    tri_hard_keep          = result_tgt.hard_keep;
+                    tri_shared_keep        = result_tgt.shared_keep;
+                    tri_cells_freed_total += result_tgt.physical_freed;
+                    tri_score_us_total    += result_tgt.score_us;
+                    tri_pack_us_total     += result_tgt.pack_us;
+
+                    SRV_INF("TriAttention %s: before=%u after=%u freed=%u refs_removed=%u deficit=%u target_refs=%u hard_keep=%u shared_keep=%u score_ms=%.3f pack_ms=%.3f floor_reached=%s\n",
+                            kv_pressure ? "drain" : "maintenance",
+                            result_tgt.physical_before, result_tgt.physical_after, result_tgt.physical_freed,
+                            result_tgt.references_removed, kv_deficit_tgt,
+                            result_tgt.target_references, result_tgt.hard_keep,
+                            result_tgt.shared_keep,
+                            result_tgt.score_us / 1000.0, result_tgt.pack_us / 1000.0,
+                            result_tgt.floor_reached ? "true" : "false");
+
+                    if (kv_pressure) {
+                        for (auto & slot : slots) {
+                            if (slot.prompt.n_tokens() > 0 &&
+                                llama_memory_seq_get_kv_used(mem_tgt, slot.id) > 0) {
+                                slot.triattention_compressed = true;
+                            }
+                        }
+                    }
 
                     // Also reclaim on draft if separate
                     if (has_dft_usage && mem_dft != mem_tgt) {
-                        auto result_dft = llama_memory_reclaim_kv(mem_dft, &req);
+                        llama_memory_kv_reclaim_request req_dft = req;
+                        req_dft.required_free = kv_deficit_dft;
+                        auto result_dft = llama_context_reclaim_kv(ctx_dft, &req_dft);
                         if (result_dft.supported && result_dft.changed) {
-                            tri_cells_freed += result_dft.physical_freed;
+                            tri_cells_freed_total += result_dft.physical_freed;
+                            tri_score_us_total    += result_dft.score_us;
+                            tri_pack_us_total     += result_dft.pack_us;
                         }
                     }
                     // Re-check capacity by continuing the while loop
                     continue;
                 }
 
-                if (result_tgt.supported) {
-                    if (!result_tgt.changed || (result_tgt.floor_reached && !result_tgt.capacity_satisfied)) {
+                if (kv_pressure && result_tgt.supported) {
+                    if ((!result_tgt.changed || (result_tgt.floor_reached && !result_tgt.capacity_satisfied)) &&
+                        !counted_kv_fallback) {
                         tri_floor_exhausted_count++;
+                        tri_atomic_fallback_kv_count++;
+                        counted_kv_fallback = true;
                     }
-                    atomic_fallback_after_tri_count++;
+                    SRV_INF("TriAttention KV floor exhausted: used=%u deficit=%u target_refs=%u hard_keep=%u shared_keep=%u; entering atomic fallback\n",
+                            result_tgt.physical_after, kv_deficit_tgt, result_tgt.target_references,
+                            result_tgt.hard_keep, result_tgt.shared_keep);
+                } else if (kv_pressure && !result_tgt.supported) {
+                    SRV_ERR("%s\n", "TriAttention enabled but target KV memory does not support reclaim; entering atomic fallback");
                 }
+            }
+
+            if (!kv_pressure && !recurrent_pressure) {
+                return true;
+            }
+
+            if (params_base.triattention_enabled && recurrent_pressure && !counted_recurrent_fallback) {
+                tri_atomic_fallback_recurrent_count++;
+                counted_recurrent_fallback = true;
+                SRV_INF("%s\n", "recurrent pressure: entering atomic fallback without TriAttention KV reclaim");
             }
 
             if (try_clear_idle_slots()) {
                 continue;
             }
 
-            const bool recurrent_pressure = required_recurrent_tgt > available_recurrent_tgt ||
-                                            required_recurrent_dft > available_recurrent_dft;
             server_slot * victim = find_preemption_victim(id_slot_protected, recurrent_pressure);
             if (victim == nullptr) {
                 SRV_DBG("dynamic memory needs kv=%u recurrent_tgt=%u recurrent_dft=%u, target available=%" PRIu64 ", draft available=%" PRIu64 ", recurrent_tgt available=%" PRIu64 ", recurrent_dft available=%" PRIu64 "\n",
                         required_kv, required_recurrent_tgt, required_recurrent_dft,
                         available_tgt, available_dft, available_recurrent_tgt, available_recurrent_dft);
+
+                // The current prefill slot is protected from preemption. Process only
+                // the cells that fit, then re-enter the pressure planner before adding
+                // more tokens. This avoids exhausting the cache inside decode's
+                // smaller-batch retry loop.
+                if (kv_pressure && id_slot_protected >= 0) {
+                    const uint64_t available = std::min(available_tgt, available_dft);
+                    kv_batch_limit = (uint32_t) std::min<uint64_t>(available, llama_n_batch(ctx_tgt));
+                    if (kv_batch_limit > 0) {
+                        SRV_INF("KV floor exhausted during prefill; limiting next batch to %u cells\n", kv_batch_limit);
+                    }
+                }
                 return true;
             }
 
@@ -3160,6 +3281,23 @@ private:
                     res->n_decode_total          = metrics.n_decode_total;
                     res->n_busy_slots_total      = metrics.n_busy_slots_total;
 
+                    res->tri_drain_total              = tri_drain_count;
+                    res->tri_maintenance_total        = tri_maintenance_count;
+                    res->tri_floor_exhausted_total    = tri_floor_exhausted_count;
+                    res->tri_atomic_fallback_kv_total = tri_atomic_fallback_kv_count;
+                    res->tri_atomic_fallback_recurrent_total = tri_atomic_fallback_recurrent_count;
+                    res->tri_cells_freed_total        = tri_cells_freed_total;
+                    res->tri_score_us_total           = tri_score_us_total;
+                    res->tri_pack_us_total            = tri_pack_us_total;
+
+                    res->tri_cells_before       = tri_cells_before;
+                    res->tri_cells_after        = tri_cells_after;
+                    res->tri_cells_freed        = tri_cells_freed;
+                    res->tri_references_removed = tri_references_removed;
+                    res->tri_target_references  = tri_target_references;
+                    res->tri_hard_keep          = tri_hard_keep;
+                    res->tri_shared_keep        = tri_shared_keep;
+
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
@@ -3237,6 +3375,8 @@ private:
                     tokens.resize(token_count);
                     slot->prompt.clear();
                     slot->prompt.tokens.insert(tokens);
+                    slot->triattention_compressed =
+                        llama_memory_seq_get_kv_used(llama_get_memory(ctx_tgt), slot->id) < token_count;
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -3748,8 +3888,9 @@ private:
             slot.handle_last_sampled_token(batch);
         });
 
-        // process in chunks of params.n_batch
-        int32_t n_batch  = llama_n_batch(ctx_tgt);
+        // process in chunks of params.n_batch, capped when the pressure planner
+        // can only fit a partial prefill batch at the TriAttention floor.
+        int32_t n_batch  = (int32_t) std::min<uint32_t>(llama_n_batch(ctx_tgt), kv_batch_limit);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
         auto & alora_scale       = batch.alora_scale;
@@ -4001,7 +4142,12 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                const bool can_reuse_sparse_frontier =
+                                    slot.triattention_compressed &&
+                                    has_new_tokens &&
+                                    n_past == slot.prompt.n_tokens();
+
+                                if (pos_min >= pos_min_thold && !can_reuse_sparse_frontier) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -4098,6 +4244,14 @@ private:
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
                     slot.mem.seq_rm(slot.id, p0, -1);
+
+                    // A cache mismatch can discard every sparse gap. Once the
+                    // retained prefix is dense again, this is a new fill-first
+                    // sequence rather than a sticky compressed continuation.
+                    if (slot.triattention_compressed &&
+                        llama_memory_seq_get_kv_used(llama_get_memory(ctx_tgt), slot.id) >= (uint32_t) slot.prompt.n_tokens()) {
+                        slot.triattention_compressed = false;
+                    }
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
@@ -5195,6 +5349,30 @@ void server_routes::init_routes() {
                     {"name",  "n_tokens_max"},
                     {"help",  "Largest observed n_tokens."},
                     {"value",  res_task->n_tokens_max}
+            }, {
+                    {"name",  "tri_drain_total"},
+                    {"help",  "TriAttention initial pressure drains completed."},
+                    {"value",  res_task->tri_drain_total}
+            }, {
+                    {"name",  "tri_maintenance_total"},
+                    {"help",  "TriAttention sticky maintenance reclaims completed."},
+                    {"value",  res_task->tri_maintenance_total}
+            }, {
+                    {"name",  "tri_floor_exhausted_total"},
+                    {"help",  "KV pressure events that reached the TriAttention residency floor."},
+                    {"value",  res_task->tri_floor_exhausted_total}
+            }, {
+                    {"name",  "tri_cells_freed_total"},
+                    {"help",  "Physical KV cells freed by TriAttention over the process lifetime."},
+                    {"value",  res_task->tri_cells_freed_total}
+            }, {
+                    {"name",  "tri_score_seconds"},
+                    {"help",  "Wall time spent in TriAttention importance scoring."},
+                    {"value",  res_task->tri_score_us_total / 1.e6}
+            }, {
+                    {"name",  "tri_pack_seconds"},
+                    {"help",  "Wall time spent compacting TriAttention K/V data."},
+                    {"value",  res_task->tri_pack_us_total / 1.e6}
             }}},
             {"gauge", {{
                     {"name",  "prompt_tokens_seconds"},
@@ -5216,6 +5394,34 @@ void server_routes::init_routes() {
                     {"name",  "n_busy_slots_per_decode"},
                     {"help",  "Average number of busy slots per llama_decode() call"},
                     {"value",  (float) res_task->n_busy_slots_total / std::max((float) res_task->n_decode_total, 1.f)}
+            },{
+                    {"name",  "tri_cells_before"},
+                    {"help",  "Physical KV cells before the most recent successful TriAttention reclaim."},
+                    {"value",  res_task->tri_cells_before}
+            },{
+                    {"name",  "tri_cells_after"},
+                    {"help",  "Physical KV cells after the most recent successful TriAttention reclaim."},
+                    {"value",  res_task->tri_cells_after}
+            },{
+                    {"name",  "tri_cells_freed"},
+                    {"help",  "Physical KV cells freed by the most recent successful TriAttention reclaim."},
+                    {"value",  res_task->tri_cells_freed}
+            },{
+                    {"name",  "tri_references_removed"},
+                    {"help",  "Per-sequence KV references removed by the most recent successful TriAttention reclaim."},
+                    {"value",  res_task->tri_references_removed}
+            },{
+                    {"name",  "tri_target_references"},
+                    {"help",  "Reference-level residency targets in the most recent successful TriAttention reclaim."},
+                    {"value",  res_task->tri_target_references}
+            },{
+                    {"name",  "tri_hard_keep"},
+                    {"help",  "Hard-protected KV references in the most recent successful TriAttention reclaim."},
+                    {"value",  res_task->tri_hard_keep}
+            },{
+                    {"name",  "tri_shared_keep"},
+                    {"help",  "Physical KV cells retained by multiple sequences after the most recent TriAttention reclaim."},
+                    {"value",  res_task->tri_shared_keep}
             }}}
         };
 
@@ -5235,6 +5441,15 @@ void server_routes::init_routes() {
                             << "llamacpp:"        << name << " " << value << "\n";
             }
         }
+
+        // Labeled fallback counter is emitted separately because the compact
+        // metric-definition helper above intentionally models unlabeled series.
+        prometheus << "# HELP llamacpp:tri_atomic_fallback_total Atomic fallback entries after dynamic-memory pressure, by reason.\n"
+                   << "# TYPE llamacpp:tri_atomic_fallback_total counter\n"
+                   << "llamacpp:tri_atomic_fallback_total{reason=\"kv\"} "
+                   << res_task->tri_atomic_fallback_kv_total << "\n"
+                   << "llamacpp:tri_atomic_fallback_total{reason=\"recurrent\"} "
+                   << res_task->tri_atomic_fallback_recurrent_total << "\n";
 
         res->headers["Process-Start-Time-Unix"] = std::to_string(res_task->t_start);
         res->content_type = "text/plain; version=0.0.4";
