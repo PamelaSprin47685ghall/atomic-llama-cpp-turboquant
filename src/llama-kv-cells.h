@@ -27,6 +27,20 @@ struct llama_kv_cell_ext {
     }
 };
 
+// compaction: a single contiguous run of cells to move from src to dst
+struct kv_pack_move {
+    uint32_t src_begin;  // source start index (old physical)
+    uint32_t dst_begin;  // destination start index (new physical)
+    uint32_t length;     // number of consecutive cells to move
+};
+
+// compaction: a plan that packs all used cells to [0, retained_count)
+// all moves satisfy dst <= src, enabling in-place downward packing
+struct kv_pack_plan {
+    std::vector<kv_pack_move> moves;  // sorted by src_begin, all dst <= src
+    uint32_t retained_count = 0;      // total cells after packing
+};
+
 // meta information about KV cells that can be part of multiple sequences at the same time
 // TODO: add unit tests
 class llama_kv_cells {
@@ -232,6 +246,79 @@ public:
         shift[i] = 0;
 
         used.erase(i);
+    }
+
+    // Generate a compaction plan that packs all used cells to [0, used)
+    // All moves satisfy dst <= src (in-place downward)
+    kv_pack_plan make_pack_plan() const {
+        kv_pack_plan plan;
+
+        uint32_t dst = 0;
+        auto it = used.begin();
+        while (it != used.end()) {
+            const uint32_t src_begin = *it;
+            uint32_t length = 1;
+            ++it;
+            while (it != used.end() && *it == src_begin + length) {
+                ++length;
+                ++it;
+            }
+
+            plan.moves.push_back({src_begin, dst, length});
+            dst += length;
+        }
+
+        plan.retained_count = dst;
+        return plan;
+    }
+
+    // Execute a pack plan: move cells according to the plan
+    // After execution, used indices are [0, retained_count)
+    // This only moves metadata (pos, ext, seq, shift). K/V data is moved separately.
+    void apply_pack(const kv_pack_plan & plan) {
+        if (plan.moves.empty()) {
+            return;
+        }
+
+        const uint32_t n = plan.retained_count;
+
+        // Save metadata for all retained cells in ascending source order
+        std::vector<llama_pos>         saved_pos  (n);
+        std::vector<llama_kv_cell_ext> saved_ext  (n);
+        std::vector<seq_set_t>         saved_seq  (n);
+        std::vector<llama_pos>         saved_shift(n);
+
+        uint32_t dst = 0;
+        for (const auto & move : plan.moves) {
+            for (uint32_t k = 0; k < move.length; ++k) {
+                const uint32_t src = move.src_begin + k;
+                saved_pos  [dst] = pos  [src];
+                saved_ext  [dst] = ext  [src];
+                saved_seq  [dst] = seq  [src];
+                saved_shift[dst] = shift[src];
+                ++dst;
+            }
+        }
+
+        // Clear all old used cells (seq_pos, seq, pos, ext, shift, used set)
+        for (const uint32_t idx : used) {
+            seq_pos_rm(idx);
+            seq  [idx].reset();
+            pos  [idx] = -1;
+            ext  [idx].reset();
+            shift[idx] =  0;
+        }
+        used.clear();
+
+        // Write metadata to new dense positions [0, n)
+        for (uint32_t i = 0; i < n; ++i) {
+            pos  [i] = saved_pos  [i];
+            ext  [i] = saved_ext  [i];
+            seq  [i] = saved_seq  [i];
+            shift[i] = saved_shift[i];
+            used.insert(i);
+            seq_pos_add(i);
+        }
     }
 
     // note: call only if the cell has seq_id

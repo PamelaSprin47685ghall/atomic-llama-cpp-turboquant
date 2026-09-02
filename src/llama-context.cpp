@@ -7,6 +7,10 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -283,6 +287,7 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
     cparams.kv_size_explicit = params.n_ctx_kv != 0;
+    cparams.triattention_enabled = params.triattention;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -308,8 +313,13 @@ llama_context::llama_context(
         }
         cparams.n_ctx_kv = params.n_ctx_kv == 0 ? cparams.n_ctx_seq : GGML_PAD(params.n_ctx_kv, 256);
 
-        if (cparams.n_ctx_kv < cparams.n_ctx_seq) {
+        if (!params.triattention && cparams.n_ctx_kv < cparams.n_ctx_seq) {
             throw std::runtime_error(format("n_ctx_kv (%u) must be at least n_ctx_seq (%u)", cparams.n_ctx_kv, cparams.n_ctx_seq));
+        }
+
+        if (params.triattention && cparams.n_ctx_kv < cparams.n_ubatch + cparams.triattention_recent_window) {
+            throw std::runtime_error(format("n_ctx_kv (%u) too small for TriAttention (need at least n_ubatch (%u) + recent_window (%u))",
+                cparams.n_ctx_kv, cparams.n_ubatch, cparams.triattention_recent_window));
         }
     } else {
         if (params.n_ctx_kv != 0) {
@@ -414,14 +424,48 @@ llama_context::llama_context(
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
-            /*.type_k    =*/ params.type_k,
-            /*.type_v    =*/ params.type_v,
-            /*.swa_full  =*/ params.swa_full,
-            /*.ctx_type  =*/ cparams.ctx_type,
-            /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.type_k               =*/ params.type_k,
+            /*.type_v               =*/ params.type_v,
+            /*.swa_full             =*/ params.swa_full,
+            /*.ctx_type             =*/ cparams.ctx_type,
+            /*.mem_other            =*/ llama_get_memory(cparams.ctx_other),
+            /*.triattention_enabled =*/ params.triattention,
+            /*.triattention_stats   =*/ params.triattention_stats,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        if (params.triattention) {
+            if (!params.triattention_stats || params.triattention_stats[0] == '\0') {
+                throw std::runtime_error("TriAttention enabled but no stats file provided (use --triattention-stats)");
+            }
+
+            bool initialized = false;
+            auto init_tri = [&](llama_kv_cache * kv) {
+                if (kv) {
+                    kv->init_triattention(params.triattention_stats,
+                        cparams.triattention_target_num, cparams.triattention_target_den,
+                        cparams.triattention_recent_window);
+                    initialized = true;
+                }
+            };
+
+            if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
+                init_tri(kv);
+            } else if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
+                init_tri(iswa->get_base());
+            } else if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+                init_tri(hyb->get_mem_attn());
+            } else if (auto * hyb_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get())) {
+                if (auto * iswa = hyb_iswa->get_mem_attn()) {
+                    init_tri(iswa->get_base());
+                }
+            }
+
+            if (!initialized) {
+                throw std::runtime_error("Failed to find KV cache for TriAttention initialization");
+            }
+        }
     }
 
     // init backends
@@ -910,6 +954,28 @@ bool llama_context::memory_update(bool optimize) {
     }
 
     return true;
+}
+
+llama_memory_kv_reclaim_result llama_context::memory_reclaim_kv(const llama_memory_kv_reclaim_request & request) {
+    llama_memory_kv_reclaim_result result;
+    if (!memory) {
+        return result;
+    }
+
+    // Synchronize before reclaim — wait for any pending compute
+    ggml_backend_sched_synchronize(sched.get());
+
+    result = memory->reclaim_kv(request);
+
+    if (result.changed) {
+        // Invalidate the current graph so the next decode re-reserves
+        // the worst-case compute buffers. We do NOT clear memory data —
+        // only the compute graph reservation is invalidated.
+        sched_need_reserve = true;
+        gf_res_prev->reset();
+    }
+
+    return result;
 }
 
 enum llama_pooling_type llama_context::pooling_type() const {
@@ -1907,6 +1973,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 {
                     if (!did_optimize) {
                         did_optimize = true;
+
+                        // Try TriAttention reclaim first (if enabled)
+                        if (cparams.triattention_enabled) {
+                            llama_memory_kv_reclaim_request req;
+                            req.drain_to_floor = true;
+                            req.required_free = balloc->get_n_tokens();
+                            auto result = memory_reclaim_kv(req);
+                            if (result.changed) {
+                                continue;
+                            }
+                        }
 
                         if (memory_update(true)) {
                             LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
@@ -4387,4 +4464,21 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+llama_memory_kv_reclaim_result llama_memory_reclaim_kv(
+        llama_memory_t mem,
+        const llama_memory_kv_reclaim_request * request) {
+    llama_memory_kv_reclaim_result result;
+    if (!mem || !request) {
+        return result;
+    }
+    return mem->reclaim_kv(*request);
+}
+
+bool llama_memory_positions_are_sparse(llama_memory_t mem) {
+    if (!mem) {
+        return false;
+    }
+    return mem->positions_are_sparse();
 }

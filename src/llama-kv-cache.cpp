@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "llama-triattention.h"
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <numeric>
 #include <stdexcept>
 
 static bool ggml_is_power_of_2(int n) {
@@ -1134,6 +1136,298 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     }
 
     return updated;
+}
+
+void llama_kv_cache::compact() {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other) {
+        return;
+    }
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        auto & cells = v_cells[s];
+        auto & head  = v_heads[s];
+
+        const auto plan = cells.make_pack_plan();
+
+        if (plan.moves.empty()) {
+            continue;
+        }
+
+        // Check if already dense (no compaction needed)
+        bool needs_compaction = false;
+        for (const auto & move : plan.moves) {
+            if (move.dst_begin != move.src_begin) {
+                needs_compaction = true;
+                break;
+            }
+        }
+        if (!needs_compaction) {
+            continue;
+        }
+
+        const uint32_t kv_size = cells.size();
+
+        // Move K/V tensor data first (transaction safety: dst <= src, so src data is never
+        // overwritten before it has been copied). Only after all copies succeed do we update
+        // the cell metadata.
+        for (const auto & layer : layers) {
+            // Move K rows: one row per cell, row width = ne[0] (may be turbo-padded)
+            if (layer.k_stream[s]) {
+                auto * k = layer.k_stream[s];
+                const size_t row_bytes = ggml_row_size(k->type, k->ne[0]);
+
+                for (const auto & move : plan.moves) {
+                    if (move.dst_begin == move.src_begin) {
+                        continue;
+                    }
+                    const size_t src_offset = (size_t) move.src_begin * row_bytes;
+                    const size_t dst_offset = (size_t) move.dst_begin * row_bytes;
+                    const size_t buf_size   = (size_t) move.length  * row_bytes;
+
+                    std::vector<uint8_t> buf(buf_size);
+                    ggml_backend_tensor_get(k, buf.data(), src_offset, buf_size);
+                    ggml_backend_tensor_set(k, buf.data(), dst_offset, buf_size);
+                }
+            }
+
+            // Move V rows
+            if (layer.v_stream[s]) {
+                auto * v = layer.v_stream[s];
+
+                if (!v_trans) {
+                    // Non-transposed V: same row layout as K
+                    const size_t row_bytes = ggml_row_size(v->type, v->ne[0]);
+
+                    for (const auto & move : plan.moves) {
+                        if (move.dst_begin == move.src_begin) {
+                            continue;
+                        }
+                        const size_t src_offset = (size_t) move.src_begin * row_bytes;
+                        const size_t dst_offset = (size_t) move.dst_begin * row_bytes;
+                        const size_t buf_size   = (size_t) move.length  * row_bytes;
+
+                        std::vector<uint8_t> buf(buf_size);
+                        ggml_backend_tensor_get(v, buf.data(), src_offset, buf_size);
+                        ggml_backend_tensor_set(v, buf.data(), dst_offset, buf_size);
+                    }
+                } else {
+                    // Transposed V: element-at-a-time layout
+                    // Element (j, i) is at offset (i + j * kv_size) * v_size_el within the stream view
+                    const size_t   v_size_el = ggml_type_size(v->type);
+                    const uint32_t n_embd_v  = (uint32_t) v->ne[0];
+
+                    for (const auto & move : plan.moves) {
+                        if (move.dst_begin == move.src_begin) {
+                            continue;
+                        }
+                        const size_t buf_size = (size_t) move.length * v_size_el;
+                        std::vector<uint8_t> buf(buf_size);
+
+                        for (uint32_t j = 0; j < n_embd_v; ++j) {
+                            const size_t src_offset = ((size_t) move.src_begin + (size_t) j * kv_size) * v_size_el;
+                            const size_t dst_offset = ((size_t) move.dst_begin + (size_t) j * kv_size) * v_size_el;
+
+                            ggml_backend_tensor_get(v, buf.data(), src_offset, buf_size);
+                            ggml_backend_tensor_set(v, buf.data(), dst_offset, buf_size);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply metadata changes after all K/V data is moved
+        cells.apply_pack(plan);
+        head = plan.retained_count;
+    }
+}
+
+void llama_kv_cache::init_triattention(const char * stats_path, uint32_t target_num, uint32_t target_den, uint32_t recent_window) {
+    if (!stats_path || stats_path[0] == '\0') {
+        throw std::runtime_error("TriAttention stats path cannot be empty");
+    }
+
+    tri_target_num = target_num;
+    tri_target_den = target_den;
+    tri_recent_window = recent_window;
+
+    triattention_scorer_config cfg;
+    cfg.agg = TRIATTENTION_AGG_MAX;
+    cfg.normalize_scores = true;
+    cfg.disable_mlr = false;
+    cfg.disable_trig = false;
+
+    const double rope_theta = (double) hparams.rope_freq_base_train;
+    const uint32_t head_dim = n_embd_head_k_all > 0 ? (uint32_t) n_embd_head_k_all : hparams.n_embd_head_k(0);
+    const uint32_t n_kv_heads = hparams.n_head_kv(0);
+
+    tri_scorer = std::make_unique<triattention_scorer>(stats_path, cfg, rope_theta, head_dim, n_kv_heads);
+    if (!tri_scorer || !tri_scorer->valid()) {
+        tri_scorer.reset();
+        throw std::runtime_error(std::string("failed to initialize TriAttention scorer from: ") + stats_path);
+    }
+}
+
+llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_reclaim_request & request) {
+    llama_memory_kv_reclaim_result result;
+
+    // Physical owner dedup: view caches (other != nullptr) share v_cells_impl
+    // with their owner. Only the owner may execute reclaim/compact.
+    if (other) {
+        return other->reclaim_kv(request);
+    }
+
+    if (!tri_scorer || !tri_scorer->valid()) {
+        result.supported = false;
+        return result;
+    }
+
+    result.supported = true;
+
+    if (v_cells.empty()) {
+        return result;
+    }
+
+    // Unified KV: all sequences share stream 0
+    auto & cells = v_cells[0];
+
+    result.physical_before = cells.get_used();
+    if (result.physical_before == 0) {
+        result.physical_after = 0;
+        result.physical_freed = 0;
+        result.capacity_satisfied = (request.required_free == 0);
+        result.floor_reached = true;
+        return result;
+    }
+
+    // Build K tensor array and layer_map for score_combined()
+    const uint32_t n_kv_layers = (uint32_t) layers.size();
+    std::vector<ggml_tensor *> k_tensors(n_kv_layers);
+    std::vector<int32_t> layer_map(n_kv_layers);
+    for (uint32_t l = 0; l < n_kv_layers; l++) {
+        k_tensors[l] = layers[l].k;
+        layer_map[l] = (int32_t) layers[l].il;
+    }
+
+    std::vector<llama_memory_kv_reclaim_seq_hint> hints = request.seq_hints;
+    if (hints.empty()) {
+        llama_memory_kv_reclaim_seq_hint h;
+        h.seq_id = 0;
+        h.logical_tokens = (uint32_t) (cells.seq_pos_max(0) >= 0 ? cells.seq_pos_max(0) + 1 : 0);
+        h.tail_guard = tri_recent_window;
+        h.eligible = true;
+        hints.push_back(h);
+    }
+
+    for (const auto & hint : hints) {
+        if (!hint.eligible) {
+            continue;
+        }
+
+        const llama_seq_id seq_id = hint.seq_id;
+        const llama_pos max_pos = cells.seq_pos_max(seq_id);
+        if (max_pos < 0) {
+            continue;
+        }
+
+        const uint32_t tail_guard = hint.tail_guard > 0 ? hint.tail_guard : tri_recent_window;
+        const uint32_t logical_tokens = hint.logical_tokens > 0 ? hint.logical_tokens : (uint32_t) (max_pos + 1);
+
+        // Target retention based on 3/32 ratio (or configured target_num / target_den)
+        uint32_t target_retention = (uint32_t) std::ceil((double) logical_tokens * (double) tri_target_num / (double) tri_target_den);
+        target_retention = std::max(target_retention, tail_guard);
+
+        result.target_references += target_retention;
+
+        // Cells with pos >= recent_threshold are hard-protected
+        const llama_pos recent_threshold = (max_pos >= (llama_pos) tail_guard) ? (max_pos - (llama_pos) tail_guard + 1) : 0;
+
+        std::vector<uint32_t> cand_indices;
+        std::vector<int32_t>  cand_positions;
+        uint32_t n_protected = 0;
+
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.is_empty(i) || !cells.seq_has(i, seq_id)) {
+                continue;
+            }
+
+            const llama_pos pos = cells.pos_get(i);
+            if (pos >= recent_threshold) {
+                n_protected++;
+            } else {
+                cand_indices.push_back(i);
+                cand_positions.push_back((int32_t) pos);
+            }
+        }
+
+        result.hard_keep += n_protected;
+
+        const uint32_t n_candidates = (uint32_t) cand_indices.size();
+        const uint32_t total_seq_cells = n_protected + n_candidates;
+
+        if (total_seq_cells <= target_retention || n_candidates == 0) {
+            // Already at or below target retention, no candidates to evict
+            continue;
+        }
+
+        // How many candidates to keep
+        const uint32_t candidates_to_keep = (target_retention > n_protected) ? std::min(target_retention - n_protected, n_candidates) : 0;
+
+        // Score candidates
+        std::vector<float> scores(n_candidates);
+        tri_scorer->score_combined(
+            scores.data(),
+            k_tensors.data(),
+            n_kv_layers,
+            layer_map.data(),
+            cand_indices.data(),
+            cand_positions.data(),
+            n_candidates,
+            (int64_t) max_pos);
+
+        // Select top candidates to keep (highest score first)
+        std::vector<uint32_t> order(n_candidates);
+        std::iota(order.begin(), order.end(), 0);
+
+        if (candidates_to_keep < n_candidates) {
+            if (candidates_to_keep > 0) {
+                std::partial_sort(order.begin(), order.begin() + candidates_to_keep, order.end(),
+                    [&scores, &cand_positions](uint32_t a, uint32_t b) {
+                        if (scores[a] != scores[b]) {
+                            return scores[a] > scores[b];
+                        }
+                        return cand_positions[a] > cand_positions[b];
+                    });
+            }
+
+            // Evict candidates from order[candidates_to_keep .. n_candidates - 1]
+            for (uint32_t k = candidates_to_keep; k < n_candidates; ++k) {
+                const uint32_t cand_idx = order[k];
+                const uint32_t cell_i   = cand_indices[cand_idx];
+
+                if (!cells.seq_rm(cell_i, seq_id)) {
+                    // Cell is still used by another sequence
+                    result.shared_keep++;
+                }
+            }
+        }
+    }
+
+    // Pack remaining used cells to [0, retained_count)
+    compact();
+
+    result.physical_after = cells.get_used();
+    result.physical_freed = result.physical_before - result.physical_after;
+    result.changed = (result.physical_freed > 0);
+    result.capacity_satisfied = (result.physical_freed >= request.required_free);
+    result.floor_reached = true;
+
+    return result;
+}
+
+bool llama_kv_cache::positions_are_sparse() const {
+    // Positions may have gaps after TriAttention eviction
+    return tri_scorer && tri_scorer->valid();
 }
 
 llama_kv_cache::slot_info llama_kv_cache::mtp_slot_info(llama_seq_id seq_id) const {

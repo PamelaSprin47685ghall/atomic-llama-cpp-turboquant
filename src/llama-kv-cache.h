@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
+#include "llama-triattention.h"
 
 #include <unordered_map>
 #include <vector>
@@ -153,9 +154,15 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    llama_memory_kv_reclaim_result reclaim_kv(const llama_memory_kv_reclaim_request & request) override;
+
+    bool positions_are_sparse() const override;
+
     //
     // llama_kv_cache specific API
     //
+
+    void init_triattention(const char * stats_path, uint32_t target_num, uint32_t target_den, uint32_t recent_window);
 
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
@@ -205,6 +212,11 @@ public:
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
     bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
+
+    // Compact KV cache: pack all used cells to [0, used) for each stream
+    // Moves K/V tensor rows and updates cell metadata atomically
+    // Must be called after llama_synchronize() and before next init_batch()
+    void compact();
 
     // find a slot of kv cells that can hold the ubatch
     // if cont == true, then the slot must be continuous
@@ -308,6 +320,12 @@ private:
     stream_copy_info sc_info;
 
     std::vector<kv_layer> layers;
+
+    // TriAttention importance scorer and configuration
+    std::unique_ptr<triattention_scorer> tri_scorer;
+    uint32_t tri_target_num = 3;
+    uint32_t tri_target_den = 32;
+    uint32_t tri_recent_window = 128;
 
     // TurboQuant rotation matrices (128x128, row-major stored)
     ggml_tensor * turbo_rotation = nullptr;      // R (forward rotation)

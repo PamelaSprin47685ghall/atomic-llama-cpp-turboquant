@@ -1067,7 +1067,22 @@ common_params_fit_status common_fit_kv_cache(
         LOG_WRN("%s: per-sequence context of %u tokens exceeds the maximum aligned KV capacity\n", __func__, n_ctx_seq);
         return COMMON_PARAMS_FIT_STATUS_FAILURE;
     }
-    const uint32_t n_min = std::max<uint32_t>(n_align, (uint32_t) (((uint64_t) n_ctx_seq + n_align - 1) / n_align * n_align));
+
+    // When TriAttention is enabled, the physical KV only needs to cover the
+    // 3/32 residency floor plus operational overhead (recent window + ubatch),
+    // not the full per-sequence context. This allows physical KV << logical context.
+    uint32_t n_min;
+    if (cparams->triattention) {
+        // tri_floor = ceil(n_ctx_seq * 3 / 32)
+        const uint32_t tri_floor = (uint32_t) ((uint64_t(n_ctx_seq) * 3 + 31) / 32);
+        // operational_floor = recent_window(128) + n_ubatch, aligned
+        const uint32_t op_floor = cparams->n_ubatch + 128;
+        n_min = std::max<uint32_t>(n_align, (uint32_t) (((uint64_t) std::max(tri_floor, op_floor) + n_align - 1) / n_align * n_align));
+        LOG_INF("%s: TriAttention enabled, minimum physical KV = %u (tri_floor=%u, op_floor=%u, n_ctx_seq=%u)\n",
+                __func__, n_min, tri_floor, op_floor, n_ctx_seq);
+    } else {
+        n_min = std::max<uint32_t>(n_align, (uint32_t) (((uint64_t) n_ctx_seq + n_align - 1) / n_align * n_align));
+    }
 
     if (!get_data(n_min, data)) {
         LOG_WRN("%s: requested per-sequence context of %u tokens does not fit in device memory\n", __func__, n_min);

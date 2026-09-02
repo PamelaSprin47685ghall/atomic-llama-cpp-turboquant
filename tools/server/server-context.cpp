@@ -1129,6 +1129,11 @@ private:
 
     server_metrics metrics;
 
+    uint64_t tri_drain_count = 0;
+    uint64_t tri_cells_freed = 0;
+    uint64_t tri_floor_exhausted_count = 0;
+    uint64_t atomic_fallback_after_tri_count = 0;
+
     json json_ui_settings = json::object();
 
     // Necessary similarity of prompt for slot selection
@@ -2205,6 +2210,52 @@ private:
                 required_recurrent_tgt <= available_recurrent_tgt &&
                 required_recurrent_dft <= available_recurrent_dft) {
                 return true;
+            }
+
+            // TriAttention drain: if enabled, try reclaim before falling back to idle-clear/preemption
+            if (params_base.triattention_enabled) {
+                // Build seq hints from active slots
+                std::vector<llama_memory_kv_reclaim_seq_hint> seq_hints;
+                for (auto & slot : slots) {
+                    if (!slot.is_processing()) {
+                        continue;
+                    }
+                    llama_memory_kv_reclaim_seq_hint hint;
+                    hint.seq_id = slot.id;
+                    hint.logical_tokens = (uint32_t)(slot.prompt.n_tokens() + slot.n_decoded);
+                    hint.tail_guard = 128; // recent window
+                    hint.eligible = true;
+                    seq_hints.push_back(hint);
+                }
+
+                llama_memory_kv_reclaim_request req;
+                req.required_free = required_kv; // need at least this many cells
+                req.drain_to_floor = true;
+                req.seq_hints = std::move(seq_hints);
+
+                // Reclaim on target memory
+                auto result_tgt = llama_memory_reclaim_kv(mem_tgt, &req);
+                if (result_tgt.supported && result_tgt.changed) {
+                    tri_drain_count++;
+                    tri_cells_freed += result_tgt.physical_freed;
+
+                    // Also reclaim on draft if separate
+                    if (has_dft_usage && mem_dft != mem_tgt) {
+                        auto result_dft = llama_memory_reclaim_kv(mem_dft, &req);
+                        if (result_dft.supported && result_dft.changed) {
+                            tri_cells_freed += result_dft.physical_freed;
+                        }
+                    }
+                    // Re-check capacity by continuing the while loop
+                    continue;
+                }
+
+                if (result_tgt.supported) {
+                    if (!result_tgt.changed || (result_tgt.floor_reached && !result_tgt.capacity_satisfied)) {
+                        tri_floor_exhausted_count++;
+                    }
+                    atomic_fallback_after_tri_count++;
+                }
             }
 
             if (try_clear_idle_slots()) {

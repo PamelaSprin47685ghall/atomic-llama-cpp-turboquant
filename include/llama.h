@@ -412,6 +412,9 @@ extern "C" {
         struct llama_context * ctx_other;
 
         uint32_t n_ctx_kv; // unified KV capacity, 0 = n_ctx; ignored when kv_unified is false
+
+        bool triattention;              // enable TriAttention KV cache eviction
+        const char * triattention_stats; // path to .triattention calibration file
     };
 
     struct llama_model_tensor_override {

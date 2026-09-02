@@ -1631,6 +1631,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--triattention"},
+        "enable TriAttention KV cache eviction (requires --triattention-stats)",
+        [](common_params & params) {
+            params.triattention_enabled = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--triattention-stats"}, "PATH",
+        "path to .triattention calibration file (enables TriAttention eviction)",
+        [](common_params & params, const std::string & value) {
+            params.triattention_stats = value;
+            params.triattention_enabled = true;
+        }
+    ).set_env("LLAMA_ARG_TRIATTENTION_STATS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION

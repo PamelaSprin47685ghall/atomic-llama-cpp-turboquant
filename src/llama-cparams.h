@@ -55,6 +55,10 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool kv_size_explicit;
+    bool triattention_enabled = false;
+    uint32_t triattention_target_num = 3;
+    uint32_t triattention_target_den = 32;
+    uint32_t triattention_recent_window = 128;
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer

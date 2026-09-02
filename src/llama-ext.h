@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <map>
+#include <vector>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -124,3 +125,50 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+
+//
+// KV reclaim (Phase 2: generic lossy KV reclaim contract)
+//
+
+// Per-sequence hint for KV reclaim
+struct llama_memory_kv_reclaim_seq_hint {
+    llama_seq_id seq_id;
+    uint32_t     logical_tokens;  // total committed logical tokens for this seq
+    uint32_t     tail_guard;      // recent window + in-flight guard (hard-protected)
+    bool         eligible;        // whether this seq can be TriAttention-compressed
+};
+
+// Request to reclaim KV cells
+struct llama_memory_kv_reclaim_request {
+    uint32_t     required_free;       // minimum cells that must be freed
+    bool         drain_to_floor;      // if true, drain all eligible seqs to policy floor (not just deficit)
+    std::vector<llama_memory_kv_reclaim_seq_hint> seq_hints;
+};
+
+// Result of KV reclaim
+struct llama_memory_kv_reclaim_result {
+    bool     supported = false;       // false if memory type doesn't support reclaim
+    bool     changed = false;         // true if any cells were freed
+    bool     capacity_satisfied = false; // true if required_free was met
+    bool     floor_reached = false;   // true if all eligible seqs are at policy floor
+    uint32_t physical_before = 0;     // physical cells used before reclaim
+    uint32_t physical_after = 0;      // physical cells used after reclaim
+    uint32_t physical_freed = 0;      // physical cells actually freed
+    uint32_t target_references = 0;   // total reference-level target across seqs
+    uint32_t hard_keep = 0;           // cells kept due to hard protection (tail/in-flight)
+    uint32_t shared_keep = 0;         // shared cells kept because another seq needs them
+};
+
+//
+// KV reclaim — lossy KV cache compression (e.g. TriAttention)
+//
+
+// Request the memory to reclaim KV cells.
+// Returns a result with supported=false if the memory type doesn't support reclaim.
+LLAMA_API struct llama_memory_kv_reclaim_result llama_memory_reclaim_kv(
+        llama_memory_t mem,
+        const struct llama_memory_kv_reclaim_request * request);
+
+// Returns true if positions in [seq_pos_min, seq_pos_max] may have gaps
+// (e.g. after TriAttention eviction). Callers must not assume all positions exist.
+LLAMA_API bool llama_memory_positions_are_sparse(llama_memory_t mem);

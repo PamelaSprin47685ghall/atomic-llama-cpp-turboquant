@@ -78,6 +78,10 @@ struct llama_context {
     // return true if the memory was updated
     bool memory_update(bool optimize);
 
+    // Synchronous KV reclaim — calls synchronize() then memory->reclaim_kv()
+    // Returns the reclaim result. If memory doesn't support reclaim, result.supported=false.
+    llama_memory_kv_reclaim_result memory_reclaim_kv(const llama_memory_kv_reclaim_request & request);
+
     enum llama_pooling_type pooling_type() const;
 
     float * get_logits();

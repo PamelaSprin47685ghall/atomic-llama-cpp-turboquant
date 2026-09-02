@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "llama-graph.h"
+#include "llama-ext.h"
 
 #include <map>
 #include <memory>
@@ -25,6 +26,9 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    bool triattention_enabled = false;
+    const char * triattention_stats = nullptr;
 };
 
 enum llama_memory_status {
@@ -141,6 +145,20 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    // Lossy KV reclaim — allows the server to request freeing KV cells
+    // Default implementation returns unsupported (no reclaim possible)
+    virtual llama_memory_kv_reclaim_result reclaim_kv(const llama_memory_kv_reclaim_request & request) {
+        GGML_UNUSED(request);
+        llama_memory_kv_reclaim_result result;
+        result.supported = false;
+        return result;
+    }
+
+    // Returns true if positions in [seq_pos_min, seq_pos_max] may have gaps
+    // (e.g. after TriAttention eviction). Callers must not assume all positions
+    // in the range exist. Default is false (dense positions).
+    virtual bool positions_are_sparse() const { return false; }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

@@ -297,6 +297,14 @@ void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     kv_swa->state_read(io, seq_id, flags);
 }
 
+llama_memory_kv_reclaim_result llama_kv_cache_iswa::reclaim_kv(const llama_memory_kv_reclaim_request & request) {
+    return kv_base->reclaim_kv(request);
+}
+
+bool llama_kv_cache_iswa::positions_are_sparse() const {
+    return kv_base->positions_are_sparse();
+}
+
 llama_kv_cache * llama_kv_cache_iswa::get_base() const {
     return kv_base.get();
 }

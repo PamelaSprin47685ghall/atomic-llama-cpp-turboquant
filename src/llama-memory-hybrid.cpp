@@ -225,6 +225,14 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     mem_recr->state_read(io, seq_id, flags);
 }
 
+llama_memory_kv_reclaim_result llama_memory_hybrid::reclaim_kv(const llama_memory_kv_reclaim_request & request) {
+    return mem_attn->reclaim_kv(request);
+}
+
+bool llama_memory_hybrid::positions_are_sparse() const {
+    return mem_attn->positions_are_sparse();
+}
+
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
     return mem_attn.get();
 }
