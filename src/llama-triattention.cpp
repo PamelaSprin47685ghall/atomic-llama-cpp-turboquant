@@ -354,19 +354,64 @@ static void triattention_build_omega(float * omega, uint32_t freq_count, uint32_
     }
 }
 
-// Build frequency scaling squared: freq_scale_sq[f] = cos^2(omega[f]*0) + sin^2(omega[f]*0)
-// For standard RoPE this is always 1.0, but for scaled RoPE (YaRN etc.)
-// the scaling factors at position 0 capture any frequency-dependent scaling.
-// Paper Section 3.2: "frequency scaling factor"
-static void triattention_build_freq_scale_sq(float * freq_scale_sq, const float * omega, uint32_t freq_count) {
-    for (uint32_t f = 0; f < freq_count; f++) {
-        // At position 0: cos(omega*0)=1, sin(omega*0)=0
-        // So freq_scale_sq = 1.0 for all standard RoPE variants.
-        // If we later support YaRN scaling, this would use the actual scaling factors.
-        float c = cosf(omega[f] * 0.0f);
-        float s = sinf(omega[f] * 0.0f);
-        freq_scale_sq[f] = c * c + s * s;
+static float triattention_rope_yarn_ramp(float low, float high, uint32_t pair_dim) {
+    const float y = ((float) pair_dim / 2.0f - low) / fmaxf(0.001f, high - low);
+    return 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+}
+
+bool triattention_build_rope_tables(
+    float * omega,
+    float * freq_scale_sq,
+    uint32_t rotary_dim,
+    float freq_base,
+    float freq_scale,
+    int32_t n_ctx_orig,
+    float ext_factor,
+    float attn_factor,
+    float beta_fast,
+    float beta_slow,
+    const float * freq_factors)
+{
+    if (!omega || !freq_scale_sq || rotary_dim == 0 || (rotary_dim & 1u) != 0 ||
+        !std::isfinite(freq_base) || freq_base <= 0.0f ||
+        !std::isfinite(freq_scale) || freq_scale <= 0.0f ||
+        !std::isfinite(ext_factor) || !std::isfinite(attn_factor) || attn_factor <= 0.0f) {
+        return false;
     }
+
+    float corr_dims[2] = {0.0f, 0.0f};
+    if (ext_factor != 0.0f) {
+        if (n_ctx_orig <= 0) {
+            return false;
+        }
+        ggml_rope_yarn_corr_dims((int) rotary_dim, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+    }
+
+    float magnitude_scale = attn_factor;
+    if (ext_factor != 0.0f) {
+        magnitude_scale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    const float magnitude_scale_sq = magnitude_scale * magnitude_scale;
+
+    const uint32_t freq_count = rotary_dim / 2;
+    for (uint32_t f = 0; f < freq_count; ++f) {
+        const float factor = freq_factors ? freq_factors[f] : 1.0f;
+        if (!std::isfinite(factor) || factor == 0.0f) {
+            return false;
+        }
+
+        const float theta_extrap = powf(freq_base, -2.0f * (float) f / (float) rotary_dim) / factor;
+        float ramp_mix = 0.0f;
+        if (ext_factor != 0.0f) {
+            ramp_mix = triattention_rope_yarn_ramp(corr_dims[0], corr_dims[1], 2u * f) * ext_factor;
+        }
+        const float phase_scale = freq_scale * (1.0f - ramp_mix) + ramp_mix;
+
+        omega[f] = theta_extrap * phase_scale;
+        freq_scale_sq[f] = magnitude_scale_sq;
+    }
+
+    return true;
 }
 
 // Build geometric offset array: {1, 2, 4, 8, ..., offset_max}
@@ -417,7 +462,8 @@ static void triattention_precompute_head_derived(triattention_head_stats * hs, u
 //   k_pre[f]    = k_post[f]*cos(omega[f]*pos) + k_post[f+fc]*sin(omega[f]*pos)
 //   k_pre[f+fc] = k_post[f+fc]*cos(omega[f]*pos) - k_post[f]*sin(omega[f]*pos)
 //
-// For "interleaved" style: pairs are (2f, 2f+1)
+// For adjacent/even-odd style (ggml NORMAL): pairs are (2f, 2f+1).
+// Do not confuse this with ggml IMROPE, whose vector pairing is still NeoX/half.
 //   k_pre[2f]   = k_post[2f]*cos(omega[f]*pos) + k_post[2f+1]*sin(omega[f]*pos)
 //   k_pre[2f+1] = k_post[2f+1]*cos(omega[f]*pos) - k_post[2f]*sin(omega[f]*pos)
 void triattention_invert_rope(
@@ -425,6 +471,7 @@ void triattention_invert_rope(
     const float * post_rope_k,
     const int32_t * positions,
     const float * omega,
+    const float * freq_scale_sq,
     uint32_t n_keys,
     uint32_t head_dim,
     uint32_t rotary_dim,
@@ -443,8 +490,9 @@ void triattention_invert_rope(
                 float angle = omega[f] * pos;
                 float c = cosf(angle);
                 float s = sinf(angle);
-                float re = src[f];
-                float im = src[f + freq_count];
+                const float scale = freq_scale_sq ? sqrtf(fmaxf(freq_scale_sq[f], 1e-30f)) : 1.0f;
+                float re = src[f] / scale;
+                float im = src[f + freq_count] / scale;
                 dst[f]              = re * c + im * s;
                 dst[f + freq_count] = im * c - re * s;
             }
@@ -455,8 +503,9 @@ void triattention_invert_rope(
                 float angle = omega[f] * pos;
                 float c = cosf(angle);
                 float s = sinf(angle);
-                float re = src[2 * f];
-                float im = src[2 * f + 1];
+                const float scale = freq_scale_sq ? sqrtf(fmaxf(freq_scale_sq[f], 1e-30f)) : 1.0f;
+                float re = src[2 * f] / scale;
+                float im = src[2 * f + 1] / scale;
                 dst[f]              = re * c + im * s;
                 dst[f + freq_count] = im * c - re * s;
             }
@@ -524,7 +573,7 @@ void triattention_score_keys(
 
         // Precompute per-frequency quantities for this key
         // Using "half" layout: k_re = k[f], k_im = k[f + freq_count]
-        // (interleaved would be k[2f], k[2f+1] — handled at invert_rope stage,
+        // (even-odd would be k[2f], k[2f+1] — handled at invert_rope stage,
         //  output from invert_rope is always in half layout for scoring)
 
         if (!disable_trig) {
@@ -817,6 +866,14 @@ struct triattention_scorer::impl {
     // Get or create GPU state for a specific (device, k_type) combination.
     // Returns nullptr if initialization fails.
     triattention_gpu_state * get_gpu_state(int device_id, ggml_type k_type) {
+        const bool need_wht_inv = k_type == GGML_TYPE_TURBO2_0 || k_type == GGML_TYPE_TURBO3_0;
+        if (need_wht_inv && (cal->head_dim != 128 || cal->rotary_dim != cal->head_dim)) {
+            // The current CUDA scorer can cooperatively invert exactly one
+            // 128-wide WHT block. Fall back to the backend-read CPU scorer for
+            // partial-RoPE or wider TurboQuant heads instead of scoring bad K.
+            return nullptr;
+        }
+
         const uint64_t key = (uint64_t)device_id * 1000 + (uint64_t)k_type;
         auto it = gpu_states.find(key);
         if (it != gpu_states.end()) {
@@ -830,8 +887,9 @@ struct triattention_scorer::impl {
         gcfg.n_kv_heads    = cal->num_kv_heads;
         gcfg.n_sampled     = cal->n_sampled;
         gcfg.n_offsets     = n_offsets;
+        gcfg.rope_style    = cal->rope_style;
         gcfg.k_type        = k_type;
-        gcfg.need_wht_inv  = (k_type == GGML_TYPE_TURBO2_0 || k_type == GGML_TYPE_TURBO3_0);
+        gcfg.need_wht_inv  = need_wht_inv;
         gcfg.disable_trig  = cfg.disable_trig;
 
         // Build per-head calibration arrays
@@ -891,7 +949,11 @@ triattention_scorer::triattention_scorer(
     const triattention_scorer_config & cfg,
     double rope_theta,
     uint32_t head_dim,
-    uint32_t n_kv_heads)
+    uint32_t n_kv_heads,
+    uint32_t runtime_rotary_dim,
+    const float * runtime_omega,
+    const float * runtime_freq_scale_sq,
+    int32_t expected_rope_style)
 {
     pimpl = std::make_unique<impl>();
     pimpl->cfg = cfg;
@@ -915,6 +977,21 @@ triattention_scorer::triattention_scorer(
         triattention_free_calibration(cal);
         return;
     }
+    if (runtime_rotary_dim != 0 && cal->rotary_dim != runtime_rotary_dim) {
+        fprintf(stderr, "[TriAttention] ERROR: rotary_dim mismatch (calibration=%u, model=%u)\n",
+                cal->rotary_dim, runtime_rotary_dim);
+        triattention_free_calibration(cal);
+        return;
+    }
+    if (expected_rope_style >= 0 && cal->rope_style != (uint32_t) expected_rope_style) {
+        fprintf(stderr,
+                "[TriAttention] ERROR: RoPE pairing mismatch (calibration=%s, model=%s). "
+                "Regenerate calibration with the current collector.\n",
+                cal->rope_style == 0 ? "half/NeoX" : "even-odd",
+                expected_rope_style == 0 ? "half/NeoX" : "even-odd");
+        triattention_free_calibration(cal);
+        return;
+    }
     // Warn if rope_theta differs significantly (>1% relative)
     if (fabs(cal->rope_theta - rope_theta) / fmax(cal->rope_theta, 1.0) > 0.01) {
         fprintf(stderr, "[TriAttention] WARNING: rope_theta mismatch (calibration=%.1f, model=%.1f)\n",
@@ -927,10 +1004,15 @@ triattention_scorer::triattention_scorer(
 
     // Build precomputed arrays
     pimpl->omega = new float[fc];
-    triattention_build_omega(pimpl->omega, fc, cal->rotary_dim, rope_theta);
-
     pimpl->freq_scale_sq = new float[fc];
-    triattention_build_freq_scale_sq(pimpl->freq_scale_sq, pimpl->omega, fc);
+    if (runtime_omega && runtime_freq_scale_sq) {
+        memcpy(pimpl->omega, runtime_omega, fc * sizeof(float));
+        memcpy(pimpl->freq_scale_sq, runtime_freq_scale_sq, fc * sizeof(float));
+    } else {
+        // Legacy/test fallback: exact only for unscaled RoPE without frequency factors.
+        triattention_build_omega(pimpl->omega, fc, cal->rotary_dim, rope_theta);
+        std::fill(pimpl->freq_scale_sq, pimpl->freq_scale_sq + fc, 1.0f);
+    }
 
     // Geometric offsets — max 17 elements for offset_max=65536
     pimpl->offsets = new float[32];  // generous allocation
@@ -1120,6 +1202,7 @@ void triattention_scorer::score_sampled_head(
         dequant_buf.data(),
         positions,
         pimpl->omega,
+        pimpl->freq_scale_sq,
         n_candidates,
         padded_hd,
         cal->rotary_dim,
@@ -1270,6 +1353,7 @@ void triattention_scorer::score_combined(
                 kv_head, n_candidates, storage_hd, need_wht_inv);
             triattention_invert_rope(
                 unrot_buf.data(), dequant_buf.data(), positions, pimpl->omega,
+                pimpl->freq_scale_sq,
                 n_candidates, storage_hd, cal->rotary_dim, fc, cal->rope_style);
 
             // Ornith maps eight sampled Q heads to each KV head. Score those
@@ -1413,7 +1497,7 @@ void triattention_scorer::print_info(FILE * stream) const {
     fprintf(stream, "  KV heads:         %u\n", cal->num_kv_heads);
     fprintf(stream, "  KV groups:        %u\n", cal->num_kv_groups);
     fprintf(stream, "  RoPE theta:       %.1f\n", cal->rope_theta);
-    fprintf(stream, "  RoPE style:       %s\n", cal->rope_style == 0 ? "half" : "interleaved");
+    fprintf(stream, "  RoPE pairing:     %s\n", cal->rope_style == 0 ? "half/NeoX" : "even-odd");
     fprintf(stream, "  Sampled heads:    %u of %u\n", cal->n_sampled, cal->num_attn_heads);
     fprintf(stream, "  Freq count:       %u\n", cal->freq_count);
     fprintf(stream, "  ---\n");
