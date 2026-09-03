@@ -651,6 +651,24 @@ static void zscore_normalize_ref(float * scores, uint32_t n) {
     }
 }
 
+static void test_score_max_pooling() {
+    fprintf(stderr, "--- test_score_max_pooling ---\n");
+
+    const float scores[] = {1.0f, 5.0f, 2.0f, 3.0f, 1.0f};
+    const int32_t positions[] = {0, 1, 2, 4, 5};
+    float pooled[5] = {};
+
+    triattention_max_pool_scores(pooled, scores, positions, 5, 1);
+
+    const float expected[] = {5.0f, 5.0f, 5.0f, 3.0f, 3.0f};
+    for (uint32_t i = 0; i < 5; ++i) {
+        TEST_ASSERT_MSG(float_eq(pooled[i], expected[i]),
+            "max pooling must spread scores only to contiguous neighboring positions");
+    }
+
+    fprintf(stderr, "  PASSED\n");
+}
+
 static void test_zscore_normalization() {
     fprintf(stderr, "--- test_zscore_normalization ---\n");
 
@@ -825,6 +843,7 @@ int main() {
     test_rope_inversion();
     test_scoring();
     test_combined_uses_exact_sampled_head();
+    test_score_max_pooling();
     test_zscore_normalization();
 
     fprintf(stderr, "\n=== Results: %d failure(s) ===\n", g_test_failures);

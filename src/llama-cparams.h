@@ -56,8 +56,7 @@ struct llama_cparams {
     bool kv_unified;
     bool kv_size_explicit;
     bool triattention_enabled = false;
-    uint32_t triattention_target_num = 3;
-    uint32_t triattention_target_den = 32;
+    double triattention_ratio = 3.0 / 32.0;
     uint32_t triattention_recent_window = 128;
     bool pipeline_parallel;
 

@@ -2252,7 +2252,7 @@ private:
                     }
 
                     const uint32_t logical_tokens = (uint32_t) slot.prompt.n_tokens();
-                    const uint32_t target = std::max<uint32_t>(128, (uint32_t) (((uint64_t) logical_tokens * 3 + 31) / 32));
+                    const uint32_t target = std::max<uint32_t>(128, (uint32_t) std::ceil((double) logical_tokens * params_base.triattention_ratio));
                     const uint32_t resident = llama_memory_seq_get_kv_used(mem_tgt, slot.id);
                     if (resident > target + 128) {
                         tri_maintenance_due = true;
@@ -2286,7 +2286,7 @@ private:
                 llama_memory_kv_reclaim_request req;
                 // required_free is a deficit, not the whole incoming batch.
                 // drain_to_floor still makes the initial pressure event perform
-                // the fixed 3/32 drain regardless of the deficit size.
+                // the configured-ratio drain regardless of the deficit size.
                 req.required_free = kv_deficit_tgt;
                 req.drain_to_floor = true;
                 req.seq_hints = std::move(seq_hints);

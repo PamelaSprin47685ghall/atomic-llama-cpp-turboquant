@@ -413,8 +413,9 @@ extern "C" {
 
         uint32_t n_ctx_kv; // unified KV capacity, 0 = n_ctx; ignored when kv_unified is false
 
-        bool triattention;              // enable TriAttention KV cache eviction
+        bool triattention;               // enable TriAttention KV cache eviction
         const char * triattention_stats; // path to .triattention calibration file
+        double triattention_ratio;       // fraction of logical tokens retained by TriAttention
     };
 
     struct llama_model_tensor_override {

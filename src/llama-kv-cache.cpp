@@ -1280,17 +1280,19 @@ void llama_kv_cache::compact() {
     }
 }
 
-void llama_kv_cache::init_triattention(const char * stats_path, uint32_t target_num, uint32_t target_den, uint32_t recent_window) {
+void llama_kv_cache::init_triattention(const char * stats_path, double ratio, uint32_t recent_window) {
     if (!stats_path || stats_path[0] == '\0') {
         throw std::runtime_error("TriAttention stats path cannot be empty");
     }
+    if (!std::isfinite(ratio) || ratio <= 0.0 || ratio > 1.0) {
+        throw std::runtime_error("TriAttention ratio must be finite and in (0, 1]");
+    }
 
-    tri_target_num = target_num;
-    tri_target_den = target_den;
+    tri_ratio = ratio;
     tri_recent_window = recent_window;
 
     triattention_scorer_config cfg;
-    cfg.agg = TRIATTENTION_AGG_MAX;
+    cfg.agg = TRIATTENTION_AGG_MEAN;
     cfg.normalize_scores = true;
     cfg.disable_mlr = false;
     cfg.disable_trig = false;
@@ -1371,8 +1373,8 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
         const uint32_t tail_guard = hint.tail_guard > 0 ? hint.tail_guard : tri_recent_window;
         const uint32_t logical_tokens = hint.logical_tokens > 0 ? hint.logical_tokens : (uint32_t) (max_pos + 1);
 
-        // Target retention based on 3/32 ratio (or configured target_num / target_den)
-        uint32_t target_retention = (uint32_t) std::ceil((double) logical_tokens * (double) tri_target_num / (double) tri_target_den);
+        // Target retention based on the configured ratio.
+        uint32_t target_retention = (uint32_t) std::ceil((double) logical_tokens * tri_ratio);
         target_retention = std::max(target_retention, tail_guard);
 
         result.target_references += target_retention;
@@ -1423,6 +1425,10 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
             cand_positions.data(),
             n_candidates,
             (int64_t) max_pos);
+        std::vector<float> pooled_scores(n_candidates);
+        triattention_max_pool_scores(
+            pooled_scores.data(), scores.data(), cand_positions.data(), n_candidates, 2);
+        scores.swap(pooled_scores);
         result.score_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_score_start);
 
         // Select top candidates to keep (highest score first)

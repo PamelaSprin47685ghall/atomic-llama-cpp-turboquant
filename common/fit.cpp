@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cassert>
+#include <cmath>
 #include <stdexcept>
 #include <cinttypes>
 #include <set>
@@ -1090,12 +1091,11 @@ common_params_fit_status common_fit_kv_cache(
     }
 
     // When TriAttention is enabled, the physical KV only needs to cover the
-    // 3/32 residency floor plus operational overhead (recent window + ubatch),
+    // configured residency floor plus operational overhead (recent window + ubatch),
     // not the full per-sequence context. This allows physical KV << logical context.
     uint32_t n_min;
     if (cparams->triattention) {
-        // tri_floor = ceil(n_ctx_seq * 3 / 32)
-        const uint32_t tri_floor = (uint32_t) ((uint64_t(n_ctx_seq) * 3 + 31) / 32);
+        const uint32_t tri_floor = (uint32_t) std::ceil((double) n_ctx_seq * cparams->triattention_ratio);
         // operational_floor = recent_window(128) + n_ubatch, aligned
         const uint32_t op_floor = cparams->n_ubatch + 128;
         n_min = std::max<uint32_t>(n_align, (uint32_t) (((uint64_t) std::max(tri_floor, op_floor) + n_align - 1) / n_align * n_align));

@@ -101,7 +101,7 @@ struct triattention_calibration {
 
 struct triattention_scorer_config {
     uint32_t offset_max = 65536;    // max geometric offset for scoring
-    enum triattention_agg agg = TRIATTENTION_AGG_MAX;  // default MAX per AGENTS.md
+    enum triattention_agg agg = TRIATTENTION_AGG_MEAN; // paper default: mean over future offsets
     bool normalize_scores = true;   // z-score per head (AGENTS.md: normalize=on)
     bool disable_mlr = false;       // ablation
     bool disable_trig = false;      // ablation
@@ -186,6 +186,15 @@ private:
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
+
+// Spread a strong token score to contiguous neighboring positions. This avoids
+// selecting only fragments of multi-token facts such as numbers and identifiers.
+void triattention_max_pool_scores(
+    float * pooled,
+    const float * scores,
+    const int32_t * positions,
+    uint32_t n_candidates,
+    uint32_t radius);
 
 // ============================================================================
 // Core scoring functions (CPU implementations)

@@ -175,6 +175,22 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK);
 
+    {
+        common_params tri_params;
+        assert(tri_params.triattention_ratio == 3.0 / 32.0);
+
+        argv = {"binary_name", "--triattention-ratio", "0.125"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), tri_params, LLAMA_EXAMPLE_SERVER));
+        assert(tri_params.triattention_ratio == 0.125);
+
+        const char * invalid_ratios[] = {"0", "-0.1", "1.1", "nan", "inf", "0.125x"};
+        for (const char * ratio : invalid_ratios) {
+            common_params invalid_tri_params;
+            argv = {"binary_name", "--triattention-ratio", ratio};
+            assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), invalid_tri_params, LLAMA_EXAMPLE_SERVER));
+        }
+    }
+
     argv = {"binary_name", "-lm", "dio"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);

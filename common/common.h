@@ -578,6 +578,7 @@ struct common_params : wanxiangqi_common_params {
     bool kv_unified        = false; // enable unified KV cache
     bool triattention_enabled = false;
     std::string triattention_stats;
+    double triattention_ratio = 3.0 / 32.0;
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation

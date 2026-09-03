@@ -291,6 +291,7 @@ llama_context::llama_context(
     cparams.kv_unified = params.kv_unified;
     cparams.kv_size_explicit = params.n_ctx_kv != 0;
     cparams.triattention_enabled = params.triattention;
+    cparams.triattention_ratio = params.triattention_ratio;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -447,8 +448,7 @@ llama_context::llama_context(
             auto init_tri = [&](llama_kv_cache * kv) {
                 if (kv) {
                     kv->init_triattention(params.triattention_stats,
-                        cparams.triattention_target_num, cparams.triattention_target_den,
-                        cparams.triattention_recent_window);
+                        cparams.triattention_ratio, cparams.triattention_recent_window);
                     initialized = true;
                 }
             };
@@ -3772,6 +3772,7 @@ llama_context_params llama_context_default_params() {
         /*.n_ctx_kv                    =*/ 0,
         /*.triattention                =*/ false,
         /*.triattention_stats          =*/ nullptr,
+        /*.triattention_ratio          =*/ 3.0 / 32.0,
     };
 
     return result;

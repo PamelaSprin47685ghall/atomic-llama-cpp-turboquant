@@ -162,7 +162,7 @@ public:
     // llama_kv_cache specific API
     //
 
-    void init_triattention(const char * stats_path, uint32_t target_num, uint32_t target_den, uint32_t recent_window);
+    void init_triattention(const char * stats_path, double ratio, uint32_t recent_window);
 
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
@@ -323,8 +323,7 @@ private:
 
     // TriAttention importance scorer and configuration
     std::unique_ptr<triattention_scorer> tri_scorer;
-    uint32_t tri_target_num = 3;
-    uint32_t tri_target_den = 32;
+    double tri_ratio = 3.0 / 32.0;
     uint32_t tri_recent_window = 128;
 
     // TurboQuant rotation matrices (128x128, row-major stored)

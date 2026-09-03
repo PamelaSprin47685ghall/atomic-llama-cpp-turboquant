@@ -24,9 +24,13 @@ TriAttention ON
 target residency = 3/32 = 9.375%
 virtual factor   = 32/3 ≈ 10.67x
 recent window    = 128
-aggregation      = normalized max/union
+future offsets   = mean
+head aggregation = normalized max/union
+local clustering = max pool, kernel 5
 protect prefill  = false
 ```
+
+`--triattention-ratio` 只用于显式实验和 A/B；生产基线仍固定为 `3/32`。任何非默认 ratio 都必须由启动参数明确指定并记录，runtime 不得根据质量、压力或模型输出自行修改。
 
 每个 sequence 的目标：
 

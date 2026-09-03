@@ -1235,17 +1235,11 @@ static uint32_t common_dynamic_recurrent_target(const llama_context_params & cpa
     // Their expected KV residency is n_ctx / 2, so provision recurrent state for
     // the nearest integer expected concurrency instead of filling spare VRAM.
     //
-    // When TriAttention is enabled, the expected KV residency per sequence drops
-    // from n_ctx/2 to approximately 3*n_ctx/64 (the expected value of
-    // max(128, ceil(3L/32)) for L uniform on [0, n_ctx], which converges to
-    // 3*n_ctx/64 for large n_ctx). This yields a ~10.67x increase in expected
-    // concurrency.
+    // When TriAttention is enabled, expected KV residency per sequence is
+    // ratio*n_ctx/2 for lengths uniformly distributed in [0, n_ctx].
     if (cparams.triattention) {
-        // expected_resident = 3*n_ctx/64 (TriAttention 3/32 target, halved by uniform avg)
-        // expected_concurrency = n_ctx_kv / expected_resident = 64*n_ctx_kv / (3*n_ctx)
-        const uint64_t scaled = 64ull * n_ctx_kv;
-        const uint64_t denom  = 3ull * n_ctx;
-        const uint64_t rounded = (scaled + denom / 2u) / denom;
+        const double expected_concurrency = 2.0 * n_ctx_kv / (cparams.triattention_ratio * n_ctx);
+        const uint64_t rounded = (uint64_t) std::llround(expected_concurrency);
         return std::max(1u, std::min<uint32_t>((uint32_t) std::min<uint64_t>(rounded, UINT32_MAX), n_seq_max));
     }
 
@@ -1834,6 +1828,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.kv_unified        = params.kv_unified;
     cparams.triattention        = params.triattention_enabled;
     cparams.triattention_stats  = params.triattention_stats.c_str();
+    cparams.triattention_ratio  = params.triattention_ratio;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

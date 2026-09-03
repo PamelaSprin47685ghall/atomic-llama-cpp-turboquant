@@ -1646,6 +1646,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_TRIATTENTION_STATS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--triattention-ratio"}, "RATIO",
+        string_format("fraction of logical tokens retained by TriAttention (default: %.6f)", params.triattention_ratio),
+        [](common_params & params, const std::string & value) {
+            size_t pos = 0;
+            const double ratio = std::stod(value, &pos);
+            if (pos != value.size() || !std::isfinite(ratio) || ratio <= 0.0 || ratio > 1.0) {
+                throw std::invalid_argument("TriAttention ratio must be finite and in (0, 1]");
+            }
+            params.triattention_ratio = ratio;
+        }
+    ).set_env("LLAMA_ARG_TRIATTENTION_RATIO").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION

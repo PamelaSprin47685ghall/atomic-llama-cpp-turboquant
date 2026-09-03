@@ -35,6 +35,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
 #include <thread>
 #include <vector>
 
@@ -1322,6 +1323,46 @@ void triattention_scorer::score_combined(
     }
     if (!any_valid) {
         memset(combined, 0, n_candidates * sizeof(float));
+    }
+}
+
+void triattention_max_pool_scores(
+    float * pooled,
+    const float * scores,
+    const int32_t * positions,
+    uint32_t n_candidates,
+    uint32_t radius)
+{
+    if (n_candidates == 0) {
+        return;
+    }
+
+    std::vector<uint32_t> order(n_candidates);
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        return positions[a] < positions[b];
+    });
+
+    for (uint32_t rank = 0; rank < n_candidates; ++rank) {
+        const uint32_t candidate = order[rank];
+        const int64_t center = positions[candidate];
+        float best = scores[candidate];
+
+        for (uint32_t left = rank; left > 0; --left) {
+            const uint32_t neighbor = order[left - 1];
+            if (center - positions[neighbor] > radius) {
+                break;
+            }
+            best = std::max(best, scores[neighbor]);
+        }
+        for (uint32_t right = rank + 1; right < n_candidates; ++right) {
+            const uint32_t neighbor = order[right];
+            if ((int64_t) positions[neighbor] - center > radius) {
+                break;
+            }
+            best = std::max(best, scores[neighbor]);
+        }
+        pooled[candidate] = best;
     }
 }
 
