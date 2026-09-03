@@ -339,7 +339,8 @@ public:
         int response_task_id,
         int physical_slot,
         llama_seq_id exec_seq,
-        llama_pos storage_pos_next);
+        llama_pos storage_pos_next,
+        uint64_t requested_episode_id = 0);
 
     void release_slot(int physical_slot);
 
@@ -371,8 +372,25 @@ public:
         llama_pos storage_pos,
         std::string_view token_bytes);
 
+    // Final-fence continuation. The planner and private end-marker parsers are
+    // permanently retired at this point; body/tool tokens remain PUBLIC so
+    // segmented DDVR continues to expose the stable shared document.
+    std::optional<server_rerot_token_plan> plan_serial_token(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id,
+        llama_pos storage_pos);
+
     // Install sequence-scoped write/view control immediately before decode.
     bool install_token_plan(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id,
+        const server_rerot_token_plan & plan,
+        size_t * span_count_out = nullptr);
+
+    // Before the first fork the root owns one ordinary contiguous sequence.
+    // Tag writes transactionally but leave its stock membership attention
+    // path intact; DDVR is activated only once archive/foreign runs exist.
+    bool install_token_plan_write_only(
         uint64_t episode_id,
         llama_rerot_node_id node_id,
         const server_rerot_token_plan & plan);
@@ -394,6 +412,11 @@ public:
     // keeper; recurrent state gets parked COW ids; physical server slots are
     // freed without moving K/V.
     bool freeze_fork_parent(uint64_t episode_id, llama_rerot_node_id parent_id);
+    // Materialize one archive ownership ref for every currently resident
+    // PUBLIC run. Used by TriAttention as the episode's single semantic union.
+    bool sync_public_archive(
+        uint64_t episode_id,
+        std::vector<llama_seq_id> * semantic_seq_ids_out = nullptr);
     bool admit_next_child(
         uint64_t episode_id,
         int physical_slot,

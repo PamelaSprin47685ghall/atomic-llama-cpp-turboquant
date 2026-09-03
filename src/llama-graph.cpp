@@ -1380,7 +1380,16 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    // The dedicated RERoT attention op consumes the resolved visibility/span
+    // tensors instead of the ordinary membership mask. ggml therefore prunes
+    // self_kq_mask from that graph and leaves its input tensor unallocated.
+    // Keep the strict ordinary-path assertion in set_input_kq_mask(), but do
+    // not write an intentionally unused input.
+    if (inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    } else {
+        GGML_ASSERT(inp_attn->rerot_active());
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);

@@ -767,8 +767,8 @@ struct common_params : wanxiangqi_common_params {
 // include/llama.h. Nothing here declares competing prototypes; these helpers
 // only validate CLI/request configuration and size host scratch so the
 // runtime (tools/server/server-rerot.*, core src/llama-rerot.*) can consume
-// the frozen API. When ContextGlue relaxes the TriAttention/MTP/context-shift
-// gates, only common_rerot_validate_stage0 needs to change.
+// frozen API. Dynamic Tri/speculation/state compatibility lives in the server
+// runtime; this helper validates only static process configuration.
 // RERoT OFF: every helper below is a trivial predicate returning
 // false/zero/ok with no allocation and no logging.
 
@@ -793,10 +793,10 @@ inline bool common_rerot_effective_for_request(bool global_enabled, bool is_embe
     return global_enabled && !is_embedding_or_rerank;
 }
 
-// Stage-0 configuration gate. Requires kv_unified; rejects
-// TriAttention / speculative / context-shift with a clean unsupported error
-// until ContextGlue lands (then allow). Multimodal prompts are allowed:
-// RERoT fork happens prelude-then-fork after the shared multimodal prefill
+// Static configuration gate. Requires kv_unified. TriAttention remains a
+// legal memory layer; speculative draft pauses on RERoT frontiers and active
+// state-save/context-shift operations fail closed in the server runtime.
+// Multimodal prompts are allowed: RERoT fork happens after shared prefill
 // and DDVR never remaps visual positions (A.18), so no gate here.
 // RERoT OFF: returns ok with no allocation.
 inline common_rerot_gate common_rerot_validate_stage0(const common_params & params) {

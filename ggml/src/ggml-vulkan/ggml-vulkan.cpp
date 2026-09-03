@@ -4488,17 +4488,19 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                 !fa_ds, !fa_ds ? fa_sgs : 0);
     }
 
-    // RERoT-DDVR indexed variant: the same scalar FA modules host a second
-    // entry point (rerot_main), so rerot states get their own pipelines here.
-    // Ordinary pipelines skip rerot states above; the coopmat loops skip them
-    // via the path check (rerot is scalar-only).
+    // RERoT-DDVR indexed variant. GLSL exposes a single SPIR-V entry point
+    // named "main"; specialization constant RerotMode selects the dedicated
+    // rerot_main() body at pipeline compile time. Asking Vulkan for the helper
+    // function as an entry point is invalid SPIR-V and crashed RADV during
+    // first-use pipeline creation.
     for (auto &fa : device->pipeline_flash_attn_f32_f16) {
         if (fa.first.path != FA_SCALAR || !fa.first.rerot) continue;
         const bool f32acc = fa.first.f32acc;
         const void * spv_data = nullptr;
         size_t spv_size = 0;
-        // Module selection mirrors the ordinary scalar loop above (both entry
-        // points live in the same modules); rerot_main is variant-agnostic.
+        // Module selection mirrors the ordinary scalar loop above; the
+        // RerotMode specialization makes the selected main() path variant-
+        // agnostic.
         if (fa.first.k_type == GGML_TYPE_BF16) {
             spv_data = flash_attn_f32_f16_fp32_data;
             spv_size = flash_attn_f32_f16_fp32_len;
@@ -4526,7 +4528,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 spv_size = flash_attn_f32_f16_fp32_len;
             }
         }
-        ggml_vk_create_pipeline(device, fa.second, "flash_attn_rerot", spv_size, spv_data, "rerot_main", 9,
+        ggml_vk_create_pipeline(device, fa.second, "flash_attn_rerot", spv_size, spv_data, "main", 9,
                                 sizeof(vk_flash_attn_push_constants), {1, 1, 1},
                                 get_fa_spec_constants(fa.first), 1, true, false, 0);
     }
@@ -11473,17 +11475,16 @@ static void ggml_vk_flash_attn_rerot(ggml_backend_vk_context * ctx, vk_context &
     // Compile early to initialize wg_denoms.
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
-    // Entry-split parallelism mirrors split-K: each query range is sharded
-    // into S chunks combined by the existing split-K reduce. Sinks force the
-    // single-split path (the reduce indexes sinks per row).
     uint32_t split_k = 1;
-    const uint32_t n_rows = n_queries * n_head_q;
-    const uint32_t shader_core_count = ctx->device->shader_core_count ? ctx->device->shader_core_count : 16;
-    if (sinks == nullptr && n_rows < shader_core_count * 2) {
-        split_k = (shader_core_count * 2) / n_rows;
-    }
-    if (split_k < 1) {
-        split_k = 1;
+    if (sinks == nullptr && n_queries > 0 && n_entries > 0) {
+        // Keep enough independent workgroups to occupy the device. The indexed
+        // shader writes [Dv, flattened(query, head), split] partials, exactly
+        // the layout consumed by flash_attn_split_k_reduce.
+        const uint32_t shader_cores = ctx->device->shader_core_count ? ctx->device->shader_core_count : 16;
+        const uint32_t rows = n_queries * n_head_q;
+        const uint32_t desired = std::max(1u, (shader_cores * 2u) / std::max(1u, rows));
+        const uint32_t entries_per_query = std::max(1u, n_entries / n_queries);
+        split_k = std::min(desired, entries_per_query);
     }
 
     const uint64_t n_flat = (uint64_t)n_queries * n_head_q;
@@ -11512,7 +11513,7 @@ static void ggml_vk_flash_attn_rerot(ggml_backend_vk_context * ctx, vk_context &
                                               HSV, n_head_q, n_queries,
                                               n_head_q, 1, n_head_kv, 1, n_head_v, 1,
                                               n_entries, n_groups, 1,
-                                              q_stride, (uint32_t)nbq2, 0,
+                                              q_stride, (uint32_t)(nbq2 / sizeof(float)), 0,
                                               k_stride, (uint32_t)nbk2, 0,
                                               v_stride, (uint32_t)nbv2, 0,
                                               scale, 0.0f, logit_softcap,

@@ -926,9 +926,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         ));
     }
 
-    // RERoT Stage-0 gates (§§18,26,A.13-A.20). OFF: no-op, no allocation.
-    // TriAttention / speculative / context-shift rejections live here until
-    // ContextGlue relaxes them; only common_rerot_validate_stage0 changes then.
+    // RERoT static gate (§§18,26,A.13-A.20). OFF: no-op, no allocation.
+    // Dynamic Tri/speculation/state compatibility is server-runtime owned.
     if (params.rerot_enabled) {
         const common_rerot_gate gate = common_rerot_validate_stage0(params);
         if (!gate.warning.empty()) {
@@ -1686,8 +1685,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_TRIATTENTION_RATIO").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--rerot"},
-        "enable Recursive Elastic Ring-of-Thought shared-memory reasoning (Stage-0: requires --kv-unified, text reasoning only; "
-        "TriAttention / speculative / context-shift are rejected until ContextGlue lands)",
+        "enable Recursive Elastic Ring-of-Thought shared-memory reasoning (requires --kv-unified; "
+        "parallel frontiers pause speculative draft and active unsupported state operations fail closed)",
         [](common_params & params) {
             params.rerot_enabled = true;
             params.kv_unified = true;

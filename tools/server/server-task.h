@@ -110,9 +110,9 @@ struct task_params {
 
     // Fill rerot_* from the server-global base params. No-op when base OFF.
     void apply_rerot_defaults(const common_params & base);
-    // Stage-0 per-request gate. Returns false + error for unsupported
-    // combinations (Tri/MTP/context-shift until ContextGlue; see
-    // common_rerot_validate_stage0). Embedding/rerank requests never enter
+    // Per-request static gate. Dynamic Tri/speculation/state compatibility is
+    // enforced by the active runtime; see common_rerot_validate_stage0.
+    // Embedding/rerank requests never enter
     // RERoT (A.19) and pass with effective() == false, not an error.
     // OFF requests always pass with no allocation.
     bool rerot_validate_request(server_task_type task_type, bool has_media, std::string & error) const;
@@ -261,6 +261,10 @@ struct server_task {
     // stale callbacks carry an older generation and must be dropped.
     uint64_t rerot_episode_id = 0;
     uint64_t rerot_generation = 0;
+    // Exact last real user text for the private final-acquire instruction.
+    // This is never published as a RERoT run; the original prompt remains the
+    // causal source. Empty for non-chat/multimedia-only requests.
+    std::string rerot_original_user_text;
 
     server_rerot_episode_key rerot_key() const;
     bool rerot_key_matches(int task, uint64_t episode, uint64_t gen) const;
@@ -342,6 +346,7 @@ struct server_task {
         // episode ids afterwards; episode 0 must never be shared.
         copy.rerot_episode_id = 0;
         copy.rerot_generation = rerot_generation;
+        copy.rerot_original_user_text = rerot_original_user_text;
 
         // use different sampling seed for each child
         // note: https://github.com/ggml-org/llama.cpp/pull/18700#discussion_r2675115723

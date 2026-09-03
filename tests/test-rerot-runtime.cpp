@@ -132,6 +132,11 @@ static void test_n1_no_fork_disarm_forever() {
     CHECK(episode && episode->document.node_count() == 1);
     const auto * logical = episode ? episode->document.node(0) : nullptr;
     CHECK(logical && logical->state == llama_rerot_node_state::terminal_running);
+    // The structural record starts PENDING but is accounted as PUBLIC after
+    // atomic N=1 publication; the forced/private prelude remains separate.
+    CHECK(episode && episode->pending_tokens == 0);
+    CHECK(episode && episode->generated_private_tokens == 1);
+    CHECK(episode && episode->generated_public_tokens == 2);
 
     auto frontier = runtime.finish_frontier(episode_id);
     CHECK(frontier.forked.empty());
@@ -446,6 +451,10 @@ static void test_hard_abort_cancels_everything() {
     const auto * episode = runtime.episode(episode_id);
     CHECK(episode && episode->hard_aborted);
     CHECK(episode && episode->abort_reason.find("rerot_resource_exhausted") != std::string::npos);
+    const std::string original_reason = episode ? episode->abort_reason : std::string();
+    CHECK(!runtime.hard_abort(episode_id, "generic wrapper must not replace first cause"));
+    episode = runtime.episode(episode_id);
+    CHECK(episode && episode->abort_reason == original_reason);
     CHECK(episode && episode->running.empty() && episode->ready_queue.empty());
     CHECK(!runtime.begin_frontier(episode_id));
 
@@ -455,6 +464,25 @@ static void test_hard_abort_cancels_everything() {
     CHECK(frontier.final_node == LLAMA_REROT_NODE_INVALID);
     CHECK(!runtime.refresh_final_fence(episode_id, 0, nullptr));
     CHECK(runtime.erase_episode(episode_id));
+}
+
+static void test_requested_episode_ids_are_stable() {
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
+
+    const uint64_t requested = runtime.adopt_root(165, 165, 0, 0, 0, 42);
+    CHECK(requested == 42);
+    CHECK(runtime.episode(42) != nullptr);
+    std::vector<llama_seq_id> semantic_seq_ids;
+    CHECK(runtime.sync_public_archive(42, &semantic_seq_ids));
+    CHECK(semantic_seq_ids.size() == 2);
+    CHECK(std::find(semantic_seq_ids.begin(), semantic_seq_ids.end(), 0) !=
+          semantic_seq_ids.end());
+    CHECK(runtime.adopt_root(166, 166, 1, 1, 0, 42) == 0);
+    CHECK(runtime.erase_episode(42));
+
+    const uint64_t automatic = runtime.adopt_root(167, 167, 0, 0, 0);
+    CHECK(automatic == 43);
+    CHECK(runtime.erase_episode(automatic));
 }
 
 static void test_queue_budget_aborts_instead_of_truncating() {
@@ -566,6 +594,128 @@ static void test_same_frontier_exit_tie_break() {
     CHECK(runtime.erase_episode(episode_id));
 }
 
+static server_rerot_state_fingerprints test_state_fingerprints() {
+    server_rerot_state_fingerprints fp;
+    fp.caps =
+        LLAMA_REROT_STATE_CAP_REROT |
+        LLAMA_REROT_STATE_CAP_REROT_TREE |
+        LLAMA_REROT_STATE_CAP_REROT_PRIVATE |
+        LLAMA_REROT_STATE_CAP_REROT_MTP |
+        LLAMA_REROT_STATE_CAP_HYBRID_REC |
+        LLAMA_REROT_STATE_CAP_SPARSE_KV |
+        LLAMA_REROT_STATE_CAP_TRIATTENTION;
+    fp.model_fp = 0x1122334455667788ULL;
+    fp.rope_fp = 0x8877665544332211ULL;
+    fp.tri_fp = 0x0f1e2d3c4b5a6978ULL;
+    return fp;
+}
+
+static void test_episode_state_round_trip_and_fingerprint() {
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
+    const uint64_t episode_id = runtime.adopt_root(280, 281, 0, 0, 10, 77);
+    CHECK(episode_id == 77);
+    CHECK(commit_private(runtime, episode_id, 0, 10));
+    CHECK(commit_generated(runtime, episode_id, 0, 11,
+        "<ol><li>Persist this terminal task</li></ol>"));
+
+    auto * lane = runtime.node(episode_id, 0);
+    CHECK(lane != nullptr);
+    if (lane) {
+        lane->sampler_blob = {1, 2, 3, 4};
+        lane->mtp_blob = {9, 8, 7};
+        lane->view_stamp = {4, 5, 6};
+    }
+
+    const auto fp = test_state_fingerprints();
+    std::vector<uint8_t> blob;
+    std::string error;
+    CHECK(runtime.save_episode(episode_id, fp, &blob, &error));
+    CHECK(!blob.empty());
+    CHECK(error.empty());
+
+    server_rerot_runtime restored(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
+    uint64_t restored_id = 0;
+    CHECK(restored.load_episode(blob.data(), blob.size(), fp, &restored_id, &error));
+    CHECK(restored_id == episode_id);
+    const auto * restored_episode = restored.episode(restored_id);
+    const auto * restored_lane = restored.node(restored_id, 0);
+    CHECK(restored_episode != nullptr);
+    CHECK(restored_episode && restored_episode->root_task_id == 280);
+    CHECK(restored_episode && restored_episode->response_task_id == 281);
+    CHECK(restored_episode && restored_episode->base_prefix_end == 10);
+    CHECK(restored_lane != nullptr);
+    CHECK(restored_lane && restored_lane->sampler_blob == std::vector<uint8_t>({1, 2, 3, 4}));
+    CHECK(restored_lane && restored_lane->mtp_blob == std::vector<uint8_t>({9, 8, 7}));
+    CHECK(restored_lane && restored_lane->view_stamp.topology_epoch == 4);
+    CHECK(restored_lane && restored_lane->view_stamp.publish_epoch == 5);
+    CHECK(restored_lane && restored_lane->view_stamp.layout_epoch == 6);
+    CHECK(restored_episode && restored_episode->document.validate(&error));
+
+    server_rerot_runtime wrong_model(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
+    auto wrong_fp = fp;
+    ++wrong_fp.model_fp;
+    error.clear();
+    CHECK(!wrong_model.load_episode(blob.data(), blob.size(), wrong_fp, nullptr, &error));
+    CHECK(error.find("model fingerprint mismatch") != std::string::npos);
+
+    server_rerot_runtime wrong_caps(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
+    wrong_fp = fp;
+    wrong_fp.caps &= ~LLAMA_REROT_STATE_CAP_REROT_MTP;
+    error.clear();
+    CHECK(!wrong_caps.load_episode(blob.data(), blob.size(), wrong_fp, nullptr, &error));
+    CHECK(error.find("capability bitmap mismatch") != std::string::npos);
+
+    wrong_fp = fp;
+    wrong_fp.caps = LLAMA_REROT_STATE_CAP_NONE;
+    blob.clear();
+    error.clear();
+    CHECK(!runtime.save_episode(episode_id, wrong_fp, &blob, &error));
+    CHECK(error.find("capability bitmap") != std::string::npos);
+    CHECK(blob.empty());
+}
+
+static void test_context_shift_truncates_only_unpinned_public_runs() {
+    server_rerot_episode episode(290);
+    server_rerot_node_runtime root;
+    root.id = 0;
+    episode.nodes.push_back(std::move(root));
+    episode.base_prefix_end = 10;
+    episode.publish_epoch = 3;
+    episode.layout_epoch = 7;
+
+    const auto prefix = episode.document.append_run(
+        0, llama_rerot_visibility::public_live, 0, 10, 1);
+    const auto old_public = episode.document.append_run(
+        0, llama_rerot_visibility::public_live, 10, 4, 2);
+    const auto active_public = episode.document.append_run(
+        0, llama_rerot_visibility::public_live, 14, 3, 3);
+    CHECK(prefix != LLAMA_REROT_RUN_INVALID);
+    CHECK(old_public != LLAMA_REROT_RUN_INVALID);
+    CHECK(active_public != LLAMA_REROT_RUN_INVALID);
+    episode.nodes[0].public_run = active_public;
+
+    server_rerot_shift_result result;
+    std::string error;
+    CHECK(server_rerot_truncate_oldest_public(episode, 3, &result, &error));
+    CHECK(error.empty());
+    CHECK(result.tokens_removed == 4);
+    CHECK(result.runs_truncated == 1);
+    CHECK(result.runs_emptied == 1);
+    CHECK(result.new_layout_epoch == 8);
+    CHECK(result.new_publish_epoch == 4);
+    CHECK(episode.topology_barrier_pending);
+    CHECK(episode.document.run(prefix)->token_count == 10);
+    CHECK(episode.document.run(old_public)->token_count == 0);
+    CHECK(episode.document.run(active_public)->token_count == 3);
+
+    const uint64_t layout_after = episode.layout_epoch;
+    const uint64_t publish_after = episode.publish_epoch;
+    CHECK(server_rerot_truncate_oldest_public(episode, 100, &result, &error));
+    CHECK(result.tokens_removed == 0);
+    CHECK(episode.layout_epoch == layout_after);
+    CHECK(episode.publish_epoch == publish_after);
+}
+
 static void test_internal_seq_exhaustion_aborts_whole_episode() {
     // One archive id plus two child parked ids are required, but only two ids
     // are available. This is a hard global-resource failure, not truncation of
@@ -596,9 +746,12 @@ int main() {
     test_lag1_delays_same_frontier_peer();
     test_final_fence_sees_last_sibling_write();
     test_hard_abort_cancels_everything();
+    test_requested_episode_ids_are_stable();
     test_queue_budget_aborts_instead_of_truncating();
     test_recursive_queue_and_last_survivor();
     test_same_frontier_exit_tie_break();
+    test_episode_state_round_trip_and_fingerprint();
+    test_context_shift_truncates_only_unpinned_public_runs();
     test_internal_seq_exhaustion_aborts_whole_episode();
     std::fprintf(stderr, "=== Results: %d failure(s) ===\n", g_failures);
     return g_failures == 0 ? 0 : 1;

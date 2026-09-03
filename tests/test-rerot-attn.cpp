@@ -270,7 +270,12 @@ static std::vector<float> run_indexed_op(int d, int dv, int ng, int nkv, int hq,
                                          const std::vector<float> & v_data,
                                          const std::vector<int32_t> & entries,
                                          const std::vector<int32_t> & offsets,
-                                         float scale) {
+                                         float scale,
+                                         ggml_backend_t backend_override = nullptr,
+                                         ggml_type k_type = GGML_TYPE_F32,
+                                         ggml_type v_type = GGML_TYPE_F32,
+                                         const std::vector<float> * sink_data = nullptr) {
+    CHECK(nq == int(offsets.size()) - 1);
     ggml_init_params params = {
         /*.mem_size   =*/ 16 * 1024 * 1024,
         /*.mem_buffer =*/ nullptr,
@@ -284,46 +289,82 @@ static std::vector<float> run_indexed_op(int d, int dv, int ng, int nkv, int hq,
     }
 
     ggml_tensor * q = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d, ng, hq, 1);
-    ggml_tensor * k = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d, nkv, hkv, 1);
-    ggml_tensor * v = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, dv, nkv, hkv, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx.get(), k_type, d, nkv, hkv, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx.get(), v_type, dv, nkv, hkv, 1);
     ggml_tensor * e = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 2, entries.size() / 2);
     ggml_tensor * o = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, offsets.size());
-    ggml_tensor * out = ggml_flash_attn_ext_rerot(ctx.get(), q, k, v, e, o, nullptr, scale, 0.0f);
+    ggml_tensor * s = sink_data && !sink_data->empty()
+        ? ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, sink_data->size())
+        : nullptr;
+    ggml_tensor * out = ggml_flash_attn_ext_rerot(ctx.get(), q, k, v, e, o, s, scale, 0.0f);
     ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
 
-    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_backend_t backend = backend_override;
+    const bool owns_backend = backend == nullptr;
     if (!backend) {
-        std::fprintf(stderr, "cpu backend init failed\n");
+        backend = ggml_backend_cpu_init();
+    }
+    if (!backend) {
+        std::fprintf(stderr, "backend init failed\n");
         ++failures;
         return {};
     }
     if (!ggml_backend_supports_op(backend, out)) {
         std::fprintf(stderr, "backend does not support rerot op\n");
         ++failures;
-        ggml_backend_free(backend);
+        if (owns_backend) {
+            ggml_backend_free(backend);
+        }
         return {};
     }
     ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
 
     ggml_backend_tensor_set(q, q_data.data(), 0, q_data.size() * sizeof(float));
-    ggml_backend_tensor_set(k, k_data.data(), 0, k_data.size() * sizeof(float));
-    ggml_backend_tensor_set(v, v_data.data(), 0, v_data.size() * sizeof(float));
+    std::vector<uint8_t> k_quant;
+    std::vector<uint8_t> v_quant;
+    if (k_type == GGML_TYPE_F32) {
+        ggml_backend_tensor_set(k, k_data.data(), 0, k_data.size() * sizeof(float));
+    } else {
+        k_quant.resize(ggml_nbytes(k));
+        const size_t written = ggml_quantize_chunk(
+            k_type, k_data.data(), k_quant.data(), 0, int64_t(nkv) * hkv, d, nullptr);
+        CHECK(written == k_quant.size());
+        ggml_backend_tensor_set(k, k_quant.data(), 0, k_quant.size());
+    }
+    if (v_type == GGML_TYPE_F32) {
+        ggml_backend_tensor_set(v, v_data.data(), 0, v_data.size() * sizeof(float));
+    } else {
+        v_quant.resize(ggml_nbytes(v));
+        const size_t written = ggml_quantize_chunk(
+            v_type, v_data.data(), v_quant.data(), 0, int64_t(nkv) * hkv, dv, nullptr);
+        CHECK(written == v_quant.size());
+        ggml_backend_tensor_set(v, v_quant.data(), 0, v_quant.size());
+    }
     ggml_backend_tensor_set(e, entries.data(), 0, entries.size() * sizeof(int32_t));
     ggml_backend_tensor_set(o, offsets.data(), 0, offsets.size() * sizeof(int32_t));
+    if (s) {
+        ggml_backend_tensor_set(s, sink_data->data(), 0, sink_data->size() * sizeof(float));
+    }
 
     ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 32, false);
     ggml_build_forward_expand(graph, out);
     if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "graph compute failed\n");
         ++failures;
-        ggml_backend_free(backend);
+        buffer.reset();
+        if (owns_backend) {
+            ggml_backend_free(backend);
+        }
         return {};
     }
     ggml_backend_synchronize(backend);
 
     std::vector<float> actual(ggml_nelements(out));
     ggml_backend_tensor_get(out, actual.data(), 0, actual.size() * sizeof(float));
-    ggml_backend_free(backend);
+    buffer.reset();
+    if (owns_backend) {
+        ggml_backend_free(backend);
+    }
     return actual;
 }
 
@@ -661,6 +702,198 @@ static void test_frontier_strong_vs_lag1() {
     CHECK(max_abs_diff(cpu_front_lag1, exp_lag1) < 1e-4f);
 }
 
+static std::vector<float> run_standard_op(
+        int d,
+        int dv,
+        int nkv,
+        int hq,
+        int hkv,
+        const std::vector<float> & q_data,
+        const std::vector<float> & k_data,
+        const std::vector<float> & v_data,
+        float scale,
+        ggml_backend_t backend,
+        ggml_type k_type,
+        ggml_type v_type,
+        const std::vector<float> & sink_data) {
+    ggml_init_params params = {
+        /* .mem_size = */ ggml_tensor_overhead() * 24 + ggml_graph_overhead_custom(24, false),
+        /* .mem_base = */ nullptr,
+        /* .no_alloc = */ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    ggml_tensor * q = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d, 1, hq, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx.get(), k_type, d, nkv, hkv, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx.get(), v_type, dv, nkv, hkv, 1);
+    ggml_tensor * m = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, nkv, 1, 1, 1);
+    ggml_tensor * s = sink_data.empty()
+        ? nullptr
+        : ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, sink_data.size());
+    ggml_tensor * out = ggml_flash_attn_ext(ctx.get(), q, k, v, m, scale, 0.0f, 0.0f);
+    if (s) {
+        ggml_flash_attn_ext_add_sinks(out, s);
+    }
+    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    CHECK(ggml_backend_supports_op(backend, out));
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+
+    ggml_backend_tensor_set(q, q_data.data(), 0, q_data.size() * sizeof(float));
+    std::vector<uint8_t> k_quant(ggml_nbytes(k));
+    std::vector<uint8_t> v_quant(ggml_nbytes(v));
+    ggml_quantize_chunk(k_type, k_data.data(), k_quant.data(), 0, int64_t(nkv) * hkv, d, nullptr);
+    ggml_quantize_chunk(v_type, v_data.data(), v_quant.data(), 0, int64_t(nkv) * hkv, dv, nullptr);
+    ggml_backend_tensor_set(k, k_quant.data(), 0, k_quant.size());
+    ggml_backend_tensor_set(v, v_quant.data(), 0, v_quant.size());
+    std::vector<ggml_fp16_t> mask(size_t(nkv), ggml_fp32_to_fp16(0.0f));
+    ggml_backend_tensor_set(m, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+    if (s) {
+        ggml_backend_tensor_set(s, sink_data.data(), 0, sink_data.size() * sizeof(float));
+    }
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 24, false);
+    ggml_build_forward_expand(graph, out);
+    CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_synchronize(backend);
+    std::vector<float> actual(ggml_nelements(out));
+    ggml_backend_tensor_get(out, actual.data(), 0, actual.size() * sizeof(float));
+    return actual;
+}
+
+static void test_vulkan_indexed_parity() {
+    ggml_backend_load_all();
+    ggml_backend_dev_t device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!device) {
+        std::puts("SKIP: no GPU backend for RERoT indexed parity");
+        return;
+    }
+    ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
+    CHECK(backend != nullptr);
+    if (!backend) {
+        return;
+    }
+
+    constexpr int d = 64;
+    constexpr int dv = 64;
+    constexpr int ng = 1;
+    constexpr int nkv = 2;
+    constexpr int hq = 1;
+    constexpr int hkv = 1;
+    const std::vector<int32_t> entries = { 0, 0, 1, 0 };
+    const std::vector<int32_t> offsets = { 0, 2 };
+    std::vector<float> q(size_t(d) * ng * hq, 0.0f);
+    std::vector<float> k(size_t(d) * nkv * hkv, 0.0f);
+    std::vector<float> v(size_t(dv) * nkv * hkv, 0.0f);
+    q[0] = 1.0f;
+    k[0] = 1.0f;
+    v[0] = 1.0f;
+    v[size_t(dv) + 1] = 1.0f;
+
+    const auto cpu = run_indexed_op(
+        d, dv, ng, nkv, hq, hkv, 1, q, k, v, entries, offsets, 1.0f);
+    const auto gpu = run_indexed_op(
+        d, dv, ng, nkv, hq, hkv, 1, q, k, v, entries, offsets, 1.0f, backend);
+    CHECK(cpu.size() == gpu.size());
+    if (cpu.size() == gpu.size()) {
+        const float error = max_abs_diff(cpu, gpu);
+        if (error >= 2.0e-4f) {
+            std::fprintf(stderr, "GPU indexed RERoT parity error = %.9g\n", error);
+        }
+        CHECK(error < 2.0e-4f);
+    }
+
+    constexpr int td = 256;
+    constexpr int tdv = 256;
+    constexpr int tng = 1;
+    constexpr int tnkv = 3;
+    constexpr int thq = 2;
+    constexpr int thkv = 1;
+    const std::vector<int32_t> tentries = { 0, 0, 2, 0, 1, 0 };
+    const std::vector<int32_t> toffsets = { 0, 3 };
+    std::vector<float> tq(size_t(td) * tng * thq);
+    std::vector<float> tk(size_t(td) * tnkv * thkv);
+    std::vector<float> tv(size_t(tdv) * tnkv * thkv);
+    for (size_t i = 0; i < tq.size(); ++i) tq[i] = std::sin(float(i + 1) * 0.013f);
+    for (size_t i = 0; i < tk.size(); ++i) tk[i] = std::cos(float(i + 3) * 0.017f);
+    for (size_t i = 0; i < tv.size(); ++i) tv[i] = std::sin(float(i + 5) * 0.019f);
+    const auto kcpu = run_indexed_op(
+        td, tdv, tng, tnkv, thq, thkv, 1, tq, tk, tv, tentries, toffsets,
+        1.0f / std::sqrt(float(td)), nullptr, GGML_TYPE_TURBO4_0, GGML_TYPE_F32);
+    const auto kgpu = run_indexed_op(
+        td, tdv, tng, tnkv, thq, thkv, 1, tq, tk, tv, tentries, toffsets,
+        1.0f / std::sqrt(float(td)), backend, GGML_TYPE_TURBO4_0, GGML_TYPE_F32);
+    const float kerror = max_abs_diff(kcpu, kgpu);
+    std::fprintf(stderr, "GPU Turbo4/F32 RERoT parity error = %.9g h0=[%.6g %.6g]/[%.6g %.6g] h1=[%.6g %.6g]/[%.6g %.6g]\n",
+        kerror, kcpu[0], kcpu[1], kgpu[0], kgpu[1],
+        kcpu[tdv], kcpu[tdv + 1], kgpu[tdv], kgpu[tdv + 1]);
+    CHECK(kcpu.size() == kgpu.size());
+    CHECK(kerror < 2.0e-4f);
+
+    const auto fcpu = run_indexed_op(
+        td, tdv, tng, tnkv, thq, thkv, 1, tq, tk, tv, tentries, toffsets,
+        1.0f / std::sqrt(float(td)));
+    const auto fgpu = run_indexed_op(
+        td, tdv, tng, tnkv, thq, thkv, 1, tq, tk, tv, tentries, toffsets,
+        1.0f / std::sqrt(float(td)), backend);
+    const float ferror = max_abs_diff(fcpu, fgpu);
+    std::fprintf(stderr, "GPU F32/F32 GQA RERoT parity error = %.9g h1=[%.6g %.6g]/[%.6g %.6g]\n",
+        ferror, fcpu[tdv], fcpu[tdv + 1], fgpu[tdv], fgpu[tdv + 1]);
+    CHECK(fcpu.size() == fgpu.size());
+    CHECK(ferror < 2.0e-4f);
+
+    const auto vcpu = run_indexed_op(
+        td, tdv, tng, tnkv, thq, thkv, 1, tq, tk, tv, tentries, toffsets,
+        1.0f / std::sqrt(float(td)), nullptr, GGML_TYPE_F32, GGML_TYPE_TURBO2_0);
+    const auto vgpu = run_indexed_op(
+        td, tdv, tng, tnkv, thq, thkv, 1, tq, tk, tv, tentries, toffsets,
+        1.0f / std::sqrt(float(td)), backend, GGML_TYPE_F32, GGML_TYPE_TURBO2_0);
+    const float verror = max_abs_diff(vcpu, vgpu);
+    std::fprintf(stderr, "GPU F32/Turbo2 RERoT parity error = %.9g h0=[%.6g %.6g]/[%.6g %.6g] h1=[%.6g %.6g]/[%.6g %.6g]\n",
+        verror, vcpu[0], vcpu[1], vgpu[0], vgpu[1],
+        vcpu[tdv], vcpu[tdv + 1], vgpu[tdv], vgpu[tdv + 1]);
+    CHECK(vcpu.size() == vgpu.size());
+    CHECK(verror < 1.0e-3f);
+
+    const float tscale = 1.0f / std::sqrt(float(td));
+    const std::vector<float> sinks = { -0.3f, 0.2f };
+    const auto tcpu = run_indexed_op(
+        td, tdv, tng, tnkv, thq, thkv, 1, tq, tk, tv, tentries, toffsets,
+        tscale, nullptr, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0, &sinks);
+    const auto tgpu = run_indexed_op(
+        td, tdv, tng, tnkv, thq, thkv, 1, tq, tk, tv, tentries, toffsets,
+        tscale, backend, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0, &sinks);
+    ggml_backend_t cpu_backend = ggml_backend_cpu_init();
+    const auto scpu = run_standard_op(
+        td, tdv, tnkv, thq, thkv, tq, tk, tv, tscale,
+        cpu_backend, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0, sinks);
+    const auto sgpu = run_standard_op(
+        td, tdv, tnkv, thq, thkv, tq, tk, tv, tscale,
+        backend, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0, sinks);
+    ggml_backend_free(cpu_backend);
+    CHECK(tcpu.size() == tgpu.size());
+    if (tcpu.size() == tgpu.size()) {
+        const float error = max_abs_diff(tcpu, tgpu);
+        if (error >= 4.0e-3f) {
+            std::fprintf(stderr, "GPU Turbo4/Turbo2 RERoT parity error = %.9g\n", error);
+        }
+        CHECK(error < 4.0e-3f);
+    }
+
+    CHECK(scpu.size() == tcpu.size());
+    CHECK(sgpu.size() == tgpu.size());
+    if (scpu.size() == tcpu.size()) {
+        const float error = max_abs_diff(scpu, tcpu);
+        std::fprintf(stderr, "CPU ordinary/indexed Turbo+sinks gap = %.9g\n", error);
+        CHECK(error < 4.0e-3f);
+    }
+    if (sgpu.size() == tgpu.size()) {
+        const float error = max_abs_diff(sgpu, tgpu);
+        std::fprintf(stderr, "GPU ordinary/indexed Turbo+sinks gap = %.9g\n", error);
+        CHECK(error < 4.0e-3f);
+    }
+
+    ggml_backend_free(backend);
+}
+
 static void test_cpu_helper_matches_op() {
     std::puts("--- ggml-cpu DDVR helper vs indexed op ---");
 
@@ -755,6 +988,7 @@ int main() {
     test_indexed_basic();
     test_ddvr_imrope_via_indexed_op();
     test_frontier_strong_vs_lag1();
+    test_vulkan_indexed_parity();
     test_cpu_helper_matches_op();
     std::printf("=== Results: %d failure(s) ===\n", failures);
     return failures == 0 ? 0 : 1;

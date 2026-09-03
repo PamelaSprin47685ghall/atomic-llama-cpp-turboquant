@@ -183,29 +183,20 @@ bool task_params::rerot_effective(server_task_type task_type) const {
 
 bool task_params::rerot_validate_request(server_task_type task_type, bool has_media, std::string & error) const {
     (void) has_media; // multimodal is allowed (prelude-then-fork, A.18): no gate
+    (void) error;
     if (!rerot_enabled) {
         return true; // OFF: no-op, no allocation
     }
     if (!rerot_effective(task_type)) {
         return true; // A.19: silently inert for embedding/rerank, not an error
     }
-    // Stage-0 gates for the effective path mirror the CLI gate. Tri/MTP/
-    // context-shift stay rejected until ContextGlue relaxes them; only this
-    // function (and common_rerot_validate_stage0) changes then.
-    for (const auto t : speculative.types) {
-        if (t != COMMON_SPECULATIVE_TYPE_NONE) {
-            error = "RERoT + speculative decoding is not yet supported for this request (Stage-0 gate §§24/A.6; ContextGlue pending)";
-            return false;
-        }
-    }
-    if (n_cache_reuse != 0) {
-        error = "RERoT + KV-shift cache reuse (n_cache_reuse) is not yet supported for this request (Stage-0 gate §§25/A.9-A.10; ContextGlue pending)";
-        return false;
-    }
-    // ctx_shift / TriAttention globals are validated at startup via
-    // common_rerot_validate_stage0; per-request speculative/cache-reuse above
-    // covers the request-overridable surface. Tool/grammar/LoRA checks live
-    // in their dedicated helpers below.
+
+    // Combination policy belongs to the active episode, not request
+    // validation. MTP drafts are epoch-bound, cache reuse is restricted to
+    // the ordinary prefix, and context shift truncates the shared semantic
+    // log. Rejecting these options here made the production-compatible
+    // runtime unreachable even though the lower layers already expose the
+    // required invalidation and selective-memory operations.
     return true;
 }
 

@@ -311,7 +311,7 @@ void gqaStore(const in uint32_t r, const in uint32_t c, const in O_TYPEV4 elems,
 // so they are excluded via that. Ordinary pipelines are unaffected: they use
 // entry point main(), never call rerot_main(), and leave RerotMode at 0.
 // ============================================================================
-#if !defined(COOPMAT) && !defined(GL_NV_cooperative_matrix2)
+#if !defined(COOPMAT) && !defined(COOPMAT2)
 
 // constant_id 16 appends the FA specialization list (see
 // get_fa_spec_constants): 0 = ordinary FA (default, so existing pipelines keep
@@ -388,7 +388,7 @@ const uint32_t REROT_MAXC = (Bc + WorkGroupSize - 1u) / WorkGroupSize;
 
 // Use -FLT_MAX/2 rather than -inf to reduce the possibility of NaNs, matching
 // the ordinary path's convention.
-const float REROT_NEG = uintBitsToFloat(0xFEFFFFFFu);
+const float REROT_NEG = -1.7014117e38;
 
 void rerot_main() {
     if (RerotMode != 1u) {

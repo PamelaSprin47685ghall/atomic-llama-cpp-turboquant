@@ -1661,6 +1661,10 @@ void server_rerot_apply_request_json(server_task & task, const json & data, cons
             task.params.rerot_enabled = false;
             task.params.rerot_trace = false;
         } else {
+            if (!base.rerot_enabled) {
+                throw std::invalid_argument(
+                    "Field 'rerot': server was not started with --rerot");
+            }
             task.params.rerot_enabled = true;
             // frontier/trace keep base values unless overridden below
         }
@@ -1670,6 +1674,10 @@ void server_rerot_apply_request_json(server_task & task, const json & data, cons
         const json & v = data.at("rerot_frontier");
         if (!v.is_string()) {
             throw std::invalid_argument("Field 'rerot_frontier': expected 'strong' or 'lag1'");
+        }
+        if (!base.rerot_enabled) {
+            throw std::invalid_argument(
+                "Field 'rerot_frontier': server was not started with --rerot");
         }
         const std::string mode = v.get<std::string>();
         if (mode == "strong") {
@@ -1689,6 +1697,10 @@ void server_rerot_apply_request_json(server_task & task, const json & data, cons
         }
         const bool want_trace = v.get<bool>();
         if (want_trace) {
+            if (!base.rerot_enabled) {
+                throw std::invalid_argument(
+                    "Field 'rerot_trace': server was not started with --rerot");
+            }
             task.params.rerot_enabled = true;
             task.params.rerot_trace = true;
         } else {
@@ -1699,6 +1711,50 @@ void server_rerot_apply_request_json(server_task & task, const json & data, cons
     if (!task.params.rerot_enabled && task.params.rerot_trace) {
         // Trace without reasoning is meaningless; keep OFF zero-regression.
         task.params.rerot_trace = false;
+    }
+
+    task.rerot_original_user_text.clear();
+    if (task.params.rerot_enabled) {
+        // oaicompat_chat_params_parse preserves the original messages beside
+        // the rendered prompt. Capture only the last real user text so the
+        // final acquire cannot confuse the surviving Lane's local assignment
+        // with the outer request. Text parts are joined; media stays in the
+        // already-evaluated shared prelude and is not duplicated here.
+        const auto messages_it = data.find("messages");
+        if (messages_it != data.end() && messages_it->is_array()) {
+            for (auto it = messages_it->rbegin(); it != messages_it->rend(); ++it) {
+                if (!it->is_object() ||
+                    json_value(*it, "role", std::string()) != "user" ||
+                    !it->contains("content")) {
+                    continue;
+                }
+                const json & content = it->at("content");
+                if (content.is_string()) {
+                    task.rerot_original_user_text = content.get<std::string>();
+                } else if (content.is_array()) {
+                    for (const auto & part : content) {
+                        if (!part.is_object() ||
+                            json_value(part, "type", std::string()) != "text") {
+                            continue;
+                        }
+                        const std::string text = json_value(part, "text", std::string());
+                        if (text.empty()) {
+                            continue;
+                        }
+                        if (!task.rerot_original_user_text.empty()) {
+                            task.rerot_original_user_text.push_back('\n');
+                        }
+                        task.rerot_original_user_text += text;
+                    }
+                }
+                break;
+            }
+        } else {
+            const auto prompt_it = data.find("prompt");
+            if (prompt_it != data.end() && prompt_it->is_string()) {
+                task.rerot_original_user_text = prompt_it->get<std::string>();
+            }
+        }
     }
 }
 

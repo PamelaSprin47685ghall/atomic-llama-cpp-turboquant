@@ -408,7 +408,9 @@ static void test_qwen35_text_imrope() {
     config.head_dim = 256;
     config.rotary_dim = 64;
     config.theta = 10000000.0;
-    config.layout = llama_rerot_rope_layout::interleaved;
+    // ggml IMROPE interleaves position sections, not embedding coordinates:
+    // Qwen3.5 still rotates front/back (NeoX-style) vector pairs.
+    config.layout = llama_rerot_rope_layout::half;
     config.axis_pair_count = { 11, 11, 10, 0 };
 
     const std::vector<llama_rerot_ddvr_span> spans = {
@@ -458,7 +460,7 @@ static void test_imrope_fourth_axis_untouched() {
     config.head_dim = 64;
     config.rotary_dim = 32;
     config.theta = 10000000.0;
-    config.layout = llama_rerot_rope_layout::interleaved;
+    config.layout = llama_rerot_rope_layout::half;
     config.axis_pair_count = { 6, 5, 5, 0 };
 
     std::mt19937 rng(0x40a5u);
@@ -595,7 +597,7 @@ static void test_gqa_imrope() {
     config.head_dim = 32;
     config.rotary_dim = 16;
     config.theta = 10000000.0;
-    config.layout = llama_rerot_rope_layout::interleaved;
+    config.layout = llama_rerot_rope_layout::half;
     config.axis_pair_count = { 3, 3, 2, 0 };
 
     constexpr uint32_t n_keys = 6;

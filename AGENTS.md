@@ -70,19 +70,27 @@ target(L) = max(128, ceil(3L/32))
 - 每个 decoded batch 只做一次 `llama_synchronize()`；
 - 无 per-layer graph cut 或 per-layer synchronize。
 
-2026-09 pairing/scaled-RoPE correctness 修复后，下列旧校准**不再可信且不得部署**：
+2026-09 pairing/scaled-RoPE correctness 修复后，旧校准
+`7fbfcdcfc7903e11efba96d7c13bea0ae9d60ff81c75475d54ee613bae2b3cc7`
+已删除，**不再可信且不得部署**。原因：该 v2 文件的 `rope_style=1`，由旧
+collector 把 IMRoPE 的 section interleaving 错当成 even/odd vector pairing
+生成。当前 runtime 会 fail-closed 拒绝该文件；旧文件中的 `q_abs_mean` 已按
+错误 pair 聚合，不能从现有 aggregate 无损重排修复。
+
+修正后重新采集并部署的可信校准：
 
 ```text
-source artifact: /tmp/ornith-1.5-35b-async.triattention
+source artifact: /tmp/ornith-1.5-35b.triattention
 deployed path:   /opt/llama/data/ornith-1.5-35b.triattention
-SHA-256:         7fbfcdcfc7903e11efba96d7c13bea0ae9d60ff81c75475d54ee613bae2b3cc7
+SHA-256:         e95dae507d1f4a64e29be160c5281f8a4308a3332dc9c9176e1a3a0af32e50e2
+file size:       83,288 bytes
+format:          version 2, rope_style=0, rotary_dim=64, freq_count=32
+model:           Ornith-1.5-35B-Uncensored-YMQ-S-MTP
 ```
 
-原因：该 v2 文件的 `rope_style=1`，由旧 collector 把 IMRoPE 的 section
-interleaving 错当成 even/odd vector pairing 生成。当前 runtime 会 fail-closed
-拒绝该文件；必须用修正后的 collector 重新采集（Qwen3.5/Ornith 应写
-`rope_style=0`）。旧文件中的 `q_abs_mean` 已按错误 pair 聚合，不能从现有
-aggregate 无损重排修复。
+源文件与部署文件已逐字节 checksum 一致。文件长度与 160 个 sampled-head
+entry 的二进制布局精确一致；10 个 full-attention layer 各包含 16 个唯一 Q
+head entry。
 
 采集结果：
 
@@ -96,7 +104,9 @@ peak host snapshots   = 2.18 GiB
 full-attn layers      = 3,7,11,15,19,23,27,31,35,39
 ```
 
-`/tmp/ornith-1.5-35b.triattention` 是早期发生 tensor-pointer 生命周期问题的旧产物，不得部署。
+同名 `/tmp/ornith-1.5-35b.triattention` 曾存在早期 tensor-pointer 生命周期
+问题产物；该文件已删除并由上述 checksum 的新采集结果替换。不得仅凭路径
+判断可信度，必须核对 SHA-256。
 
 ### Runtime pressure 与 state 行为
 

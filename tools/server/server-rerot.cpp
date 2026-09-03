@@ -433,16 +433,14 @@ server_rerot_marker_step server_rerot_marker_parser::consume(std::string_view by
 
 std::string_view server_rerot_planner_prompt() {
     static constexpr std::string_view prompt =
-        "让我先分析这个问题的规模与难度，并在分析完成后用\n"
-        "<ol>\n"
-        "<li>Lane 1 部分的问题描述</li>\n"
-        "<li>Lane 2 部分的问题描述</li>\n"
-        "...\n"
-        "</ol>\n"
-        "的方式多线程推理。如果问题简单也可以只有一个 Lane。\n\n"
-        "各 Lane 应尽量是可以并行推进的互补部分；共同前提、依赖关系和必要定义应先在列表前说明。\n"
-        "公开推理引用其他部分时，请使用章节标题、命题、公式或具体结论，不依赖“上面、下面、前者、后一段”等版面相对指代。\n"
-        "完整输出 </ol> 后立即停止规划，不继续展开 Lane 正文。";
+        "请先判断当前问题的规模、难度、共同前提和依赖关系，然后把问题拆成可以并行推进、彼此互补的具体推理任务。\n"
+        "只输出一个完整、平面的 HTML 有序列表；输出必须以 <ol> 开始、以 </ol> 结束，列表中的每个 <li> 必须直接写一个可独立推进的具体任务，并在需要时把共同前提写入第一个任务。\n"
+        "禁止嵌套列表，禁止输出省略号、Lane N、任务 N、待补充等占位文字，禁止解释格式。\n"
+        "只要存在两个可独立产出、最后必须汇合的实质互补维度就应拆分；简单问答、一次运算或单一判断必须使用一个条目。\n"
+        "不要把前提复述、格式说明、结果验证或同一工作的不同步骤单独伪装成并行任务。\n"
+        "如果当前章节已经是上级列表定义的单一原子任务，且继续拆分只会换一种措辞重复同一工作，就必须使用一个条目直接完成，不得递归制造重复任务。\n"
+        "公开推理引用其他部分时，请使用章节标题、命题、公式或具体结论，不依赖版面相对指代。\n"
+        "完整输出 </ol> 后立即停止规划，不继续展开任何任务正文。\n";
     return prompt;
 }
 
@@ -465,16 +463,25 @@ uint64_t server_rerot_runtime::adopt_root(
         int response_task_id,
         int physical_slot,
         llama_seq_id exec_seq,
-        llama_pos storage_pos_next) {
+        llama_pos storage_pos_next,
+        uint64_t requested_episode_id) {
     if (physical_slot < 0 || exec_seq < 0 || storage_pos_next < 0) {
         return 0;
     }
 
     release_slot(physical_slot);
 
-    uint64_t episode_id = next_episode_id_++;
+    uint64_t episode_id = requested_episode_id;
     if (episode_id == 0) {
         episode_id = next_episode_id_++;
+        if (episode_id == 0) {
+            episode_id = next_episode_id_++;
+        }
+    } else if (episode_id >= next_episode_id_) {
+        next_episode_id_ = episode_id + 1;
+        if (next_episode_id_ == 0) {
+            next_episode_id_ = 1;
+        }
     }
 
     auto inserted = episodes_.emplace(episode_id, server_rerot_episode(episode_id));
@@ -731,6 +738,24 @@ std::optional<server_rerot_token_plan> server_rerot_runtime::plan_generated_toke
     return plan;
 }
 
+std::optional<server_rerot_token_plan> server_rerot_runtime::plan_serial_token(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id,
+        llama_pos storage_pos) {
+    auto * current = episode(episode_id);
+    auto * current_node = node(episode_id, node_id);
+    if (!current || !current_node || current->hard_aborted || !current->serial_tail ||
+        current->serial_node != node_id || storage_pos < 0) {
+        return std::nullopt;
+    }
+
+    server_rerot_token_plan plan;
+    plan.storage_pos = storage_pos;
+    plan.visibility = llama_rerot_visibility::public_live;
+    plan.run_id = ensure_run(*current, *current_node, plan.visibility, storage_pos);
+    return plan.valid() ? std::optional<server_rerot_token_plan>(std::move(plan)) : std::nullopt;
+}
+
 bool server_rerot_runtime::build_reader_view_desc(
         const server_rerot_episode & episode,
         const server_rerot_node_runtime & node,
@@ -765,7 +790,8 @@ bool server_rerot_runtime::build_reader_view_desc(
 bool server_rerot_runtime::install_token_plan(
         uint64_t episode_id,
         llama_rerot_node_id node_id,
-        const server_rerot_token_plan & plan) {
+        const server_rerot_token_plan & plan,
+        size_t * span_count_out) {
     auto * current = episode(episode_id);
     auto * current_node = node(episode_id, node_id);
     if (!current || !current_node || current->hard_aborted || !plan.valid()) {
@@ -792,15 +818,69 @@ bool server_rerot_runtime::install_token_plan(
         visibility,
     };
     if (!llama_memory_rerot_set_write_tag(memory_, current_node->exec_seq, &tag)) {
+        std::fprintf(stderr,
+            "RERoT install failed: episode=%llu node=%u seq=%d run=%u stage=write_tag\n",
+            static_cast<unsigned long long>(current->id),
+            current_node->id, current_node->exec_seq, plan.run_id);
         return fail_episode(*current, "failed to install RERoT KV write tag");
     }
 
     std::vector<uint32_t> ordered_runs;
     llama_rerot_reader_view_desc desc = {};
-    if (!build_reader_view_desc(*current, *current_node, plan.run_id, ordered_runs, desc) ||
-        !llama_memory_rerot_set_reader_view(memory_, current_node->exec_seq, &desc)) {
+    if (!build_reader_view_desc(*current, *current_node, plan.run_id, ordered_runs, desc)) {
+        std::fprintf(stderr,
+            "RERoT install failed: episode=%llu node=%u seq=%d run=%u stage=build_view\n",
+            static_cast<unsigned long long>(current->id),
+            current_node->id, current_node->exec_seq, plan.run_id);
+        llama_memory_rerot_clear_write_tag(memory_, current_node->exec_seq);
+        return fail_episode(*current, "failed to build RERoT reader view");
+    }
+    if (span_count_out) {
+        *span_count_out = ordered_runs.size();
+    }
+    if (!llama_memory_rerot_set_reader_view(memory_, current_node->exec_seq, &desc)) {
+        std::fprintf(stderr,
+            "RERoT install failed: episode=%llu node=%u seq=%d run=%u stage=set_view ordered=%zu\n",
+            static_cast<unsigned long long>(current->id),
+            current_node->id, current_node->exec_seq, plan.run_id, ordered_runs.size());
         llama_memory_rerot_clear_write_tag(memory_, current_node->exec_seq);
         return fail_episode(*current, "failed to install RERoT reader view");
+    }
+    return true;
+}
+
+bool server_rerot_runtime::install_token_plan_write_only(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id,
+        const server_rerot_token_plan & plan) {
+    auto * current = episode(episode_id);
+    auto * current_node = node(episode_id, node_id);
+    if (!current || !current_node || current->hard_aborted || !plan.valid()) {
+        return false;
+    }
+    if (!memory_) {
+        return true;
+    }
+
+    llama_rerot_kv_visibility visibility = LLAMA_REROT_KV_PUBLIC_LIVE;
+    switch (plan.visibility) {
+        case llama_rerot_visibility::public_live:     visibility = LLAMA_REROT_KV_PUBLIC_LIVE; break;
+        case llama_rerot_visibility::private_control: visibility = LLAMA_REROT_KV_PRIVATE_CONTROL; break;
+        case llama_rerot_visibility::pending_record:  visibility = LLAMA_REROT_KV_PENDING_RECORD; break;
+        case llama_rerot_visibility::normal: return false;
+    }
+
+    llama_memory_rerot_clear_reader_view(memory_, current_node->exec_seq);
+    const llama_rerot_kv_write_tag tag = {
+        current->id,
+        current_node->id,
+        plan.run_id,
+        plan.visibility == llama_rerot_visibility::public_live ? current->publish_epoch : 0,
+        current->frontier,
+        visibility,
+    };
+    if (!llama_memory_rerot_set_write_tag(memory_, current_node->exec_seq, &tag)) {
+        return fail_episode(*current, "failed to install RERoT write-only tag");
     }
     return true;
 }
@@ -869,16 +949,22 @@ bool server_rerot_runtime::publish_pending_run(
     if (publish_epoch == 0) {
         return false;
     }
+    const uint64_t published_tokens = run->token_count;
 
     if (memory_) {
         const size_t changed = llama_memory_rerot_publish_run(memory_, episode.id, run_id, publish_epoch);
-        if (changed == 0) {
-            return fail_episode(episode, "failed to atomically publish a pending RERoT run");
+        if (changed != run->token_count) {
+            return fail_episode(episode, "failed to atomically publish the complete pending RERoT run");
         }
     }
     if (!episode.document.publish_run(run_id, publish_epoch)) {
         return fail_episode(episode, "logical pending-run publication failed");
     }
+    if (episode.pending_tokens < published_tokens) {
+        return fail_episode(episode, "pending token accounting underflow during publication");
+    }
+    episode.pending_tokens -= published_tokens;
+    episode.generated_public_tokens += published_tokens;
 
     node.pending_record.reset();
     node.public_run = run_id;
@@ -908,10 +994,11 @@ bool server_rerot_runtime::finalize_exit_marker(
             LLAMA_REROT_KV_PENDING_RECORD,
             LLAMA_REROT_KV_PRIVATE_CONTROL,
             0);
-        if (changed == 0) {
-            return fail_episode(episode, "failed to atomically privatize </think>");
+        if (changed != run->token_count) {
+            return fail_episode(episode, "failed to atomically privatize the complete </think> run");
         }
     }
+    const uint64_t privatized_tokens = run->token_count;
     if (!episode.document.reclassify_run(
             run_id,
             llama_rerot_visibility::pending_record,
@@ -919,6 +1006,11 @@ bool server_rerot_runtime::finalize_exit_marker(
             0)) {
         return fail_episode(episode, "logical </think> privatization failed");
     }
+    if (episode.pending_tokens < privatized_tokens) {
+        return fail_episode(episode, "pending token accounting underflow during privatization");
+    }
+    episode.pending_tokens -= privatized_tokens;
+    episode.generated_private_tokens += privatized_tokens;
 
     node.pending_record.reset();
     node.private_run = run_id;
@@ -1028,6 +1120,47 @@ bool server_rerot_runtime::ensure_archive_seq(
     if (memory_ && episode.base_prefix_end > 0) {
         llama_memory_seq_cp_attention(
             memory_, source_seq, episode.archive_seq, 0, episode.base_prefix_end);
+    }
+    return true;
+}
+
+bool server_rerot_runtime::sync_public_archive(
+        uint64_t episode_id,
+        std::vector<llama_seq_id> * semantic_seq_ids_out) {
+    auto * current = episode(episode_id);
+    if (!current || current->hard_aborted) {
+        return false;
+    }
+
+    if (current->archive_seq < 0) {
+        const auto source = std::find_if(
+            current->nodes.begin(), current->nodes.end(),
+            [](const server_rerot_node_runtime & node) {
+                return node.exec_seq >= 0;
+            });
+        if (source == current->nodes.end() ||
+            !ensure_archive_seq(*current, source->exec_seq)) {
+            return false;
+        }
+    }
+
+    if (semantic_seq_ids_out) {
+        semantic_seq_ids_out->clear();
+        semantic_seq_ids_out->push_back(current->archive_seq);
+    }
+    for (const auto & node : current->nodes) {
+        if (node.exec_seq >= 0) {
+            archive_public_runs(*current, node, current->archive_seq);
+            if (semantic_seq_ids_out) {
+                semantic_seq_ids_out->push_back(node.exec_seq);
+            }
+        }
+    }
+    if (semantic_seq_ids_out) {
+        std::sort(semantic_seq_ids_out->begin(), semantic_seq_ids_out->end());
+        semantic_seq_ids_out->erase(
+            std::unique(semantic_seq_ids_out->begin(), semantic_seq_ids_out->end()),
+            semantic_seq_ids_out->end());
     }
     return true;
 }
@@ -1532,6 +1665,14 @@ void server_rerot_runtime::clear_sequence_control(llama_seq_id seq_id) {
 }
 
 bool server_rerot_runtime::fail_episode(server_rerot_episode & episode, std::string reason) {
+    // Preserve the first failure. Follow-up cleanup paths commonly observe the
+    // failed operation and call hard_abort() again with a generic wrapper;
+    // replacing the original parser/backend/resource cause makes diagnosis
+    // impossible and can repeat destructive sequence cleanup.
+    if (episode.hard_aborted) {
+        return false;
+    }
+
     // Episode-level HARD_ABORT (§20): cancel RUNNING and STARTING, drop QUEUED
     // descriptors, release parked/archive refs, choose no survivor, emit no
     // answer. The logical tree is kept for diagnostics until erase_episode.
@@ -1582,9 +1723,11 @@ bool server_rerot_runtime::fail_episode(server_rerot_episode & episode, std::str
 
 bool server_rerot_runtime::check_hard_limits(server_rerot_episode & episode) {
     const auto & limits = episode.hard_limits;
+    // Visibility counters are mutually exclusive. Forced headings are tracked
+    // as a diagnostic subset of PENDING tokens, so adding that counter again
+    // would charge every heading twice.
     const uint64_t total_tokens = episode.generated_public_tokens +
                                   episode.generated_private_tokens +
-                                  episode.forced_heading_tokens +
                                   episode.pending_tokens;
     if (limits.max_total_tokens != 0 && total_tokens > limits.max_total_tokens) {
         fail_episode(episode, "rerot_resource_exhausted: episode token budget exceeded");
@@ -2026,6 +2169,13 @@ std::vector<uint8_t> server_rerot_episode_save(
         rerot_state_set_error(error_out, "RERoT episode save refused: episode id is zero");
         return {};
     }
+    if ((fp.caps & ~k_rerot_known_caps) != 0 ||
+        (fp.caps & LLAMA_REROT_STATE_CAP_REROT) == 0) {
+        rerot_state_set_error(
+            error_out,
+            "RERoT episode save refused: capability bitmap is unknown or lacks the REROT bit");
+        return {};
+    }
     if (episode.nodes.size() != episode.document.node_count()) {
         rerot_state_set_error(error_out, "RERoT episode save refused: node runtime/document alignment lost");
         return {};
@@ -2249,6 +2399,12 @@ bool server_rerot_episode_load(
     }
     if ((caps & LLAMA_REROT_STATE_CAP_REROT) == 0) {
         return rerot_state_set_error(error_out, "RERoT episode load refused: blob lacks the REROT capability bit");
+    }
+    if (caps != expected_fp.caps) {
+        return rerot_state_set_error(
+            error_out,
+            "RERoT episode load refused: state capability bitmap mismatch "
+            "(saved mechanisms differ from the active runtime); refusing best-effort restore");
     }
     if (model_fp != expected_fp.model_fp) {
         return rerot_state_set_error(error_out, "RERoT episode load refused: model fingerprint mismatch "

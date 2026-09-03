@@ -1487,7 +1487,37 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
             }
 
             const llama_pos pos = cells.pos_get(i);
-            if (pos >= recent_threshold) {
+            const auto & rerot_meta = cells.rerot_get(i);
+            // A PENDING structural record is all-or-nothing: it may become
+            // PUBLIC at the closing token. Reclaiming any prefix cell before
+            // that publication would make the logical run denser than its
+            // physical K/V and violate atomic visibility.
+            const bool rerot_pending =
+                rerot_meta.active() &&
+                rerot_meta.visibility == llama_rerot_visibility::pending_record;
+            const bool semantic_foreign_tag =
+                hint.semantic_episode_id != 0 &&
+                rerot_meta.active() &&
+                (rerot_meta.episode_id != hint.semantic_episode_id ||
+                 rerot_meta.visibility != llama_rerot_visibility::public_live);
+            bool semantic_reader_tail = false;
+            if (hint.semantic_episode_id != 0) {
+                for (const llama_seq_id ref : hint.semantic_seq_ids) {
+                    if (ref == seq_id || !cells.seq_has(i, ref)) {
+                        continue;
+                    }
+                    const llama_pos ref_max = cells.seq_pos_max(ref);
+                    const llama_pos ref_recent = ref_max >= (llama_pos) tail_guard
+                        ? ref_max - (llama_pos) tail_guard + 1
+                        : 0;
+                    if (pos >= ref_recent) {
+                        semantic_reader_tail = true;
+                        break;
+                    }
+                }
+            }
+            if (pos >= recent_threshold || rerot_pending ||
+                semantic_foreign_tag || semantic_reader_tail) {
                 n_protected++;
             } else {
                 cand_indices.push_back(i);
@@ -1546,8 +1576,27 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
                 const uint32_t cand_idx = order[k];
                 const uint32_t cell_i   = cand_indices[cand_idx];
 
-                cells.seq_rm(cell_i, seq_id);
-                result.references_removed++;
+                const auto rerot_meta = cells.rerot_get(cell_i);
+                const bool semantic_cell =
+                    hint.semantic_episode_id != 0 &&
+                    (!rerot_meta.active() ||
+                     (rerot_meta.episode_id == hint.semantic_episode_id &&
+                      rerot_meta.visibility == llama_rerot_visibility::public_live));
+                if (semantic_cell) {
+                    // The archive hint represents one semantic base/PUBLIC
+                    // cell regardless of archive/exec bookkeeping refs. Remove
+                    // only this episode's refs; another outer completion may
+                    // legally retain the same physical base-prefix cell.
+                    for (const llama_seq_id ref : hint.semantic_seq_ids) {
+                        if (!cells.is_empty(cell_i) && cells.seq_has(cell_i, ref)) {
+                            cells.seq_rm(cell_i, ref);
+                            result.references_removed++;
+                        }
+                    }
+                } else {
+                    cells.seq_rm(cell_i, seq_id);
+                    result.references_removed++;
+                }
             }
         }
     }
