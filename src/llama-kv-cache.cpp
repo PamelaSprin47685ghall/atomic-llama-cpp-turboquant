@@ -1951,20 +1951,7 @@ size_t llama_kv_cache::rerot_publish_run(
     }
 
     std::vector<std::pair<uint32_t, uint32_t>> matches;
-    for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
-        const auto & cells = v_cells[stream];
-        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-            if (cells.is_empty(cell)) {
-                continue;
-            }
-            const auto & meta = cells.rerot_get(cell);
-            if (meta.episode_id == episode_id && meta.run_id == run_id) {
-                matches.emplace_back(stream, cell);
-            }
-        }
-    }
-
-    GGML_ASSERT(matches.size() == count);
+    GGML_ASSERT(rerot_find_run_cells(episode_id, run_id, &matches) == count);
 
     for (const auto & match : matches) {
         const bool published = v_cells[match.first].rerot_publish(
@@ -1988,20 +1975,7 @@ size_t llama_kv_cache::rerot_reclassify_run(
     }
 
     std::vector<std::pair<uint32_t, uint32_t>> matches;
-    for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
-        const auto & cells = v_cells[stream];
-        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-            if (cells.is_empty(cell)) {
-                continue;
-            }
-            const auto & meta = cells.rerot_get(cell);
-            if (meta.episode_id == episode_id && meta.run_id == run_id) {
-                matches.emplace_back(stream, cell);
-            }
-        }
-    }
-
-    GGML_ASSERT(matches.size() == count);
+    GGML_ASSERT(rerot_find_run_cells(episode_id, run_id, &matches) == count);
 
     for (const auto & match : matches) {
         const bool changed = v_cells[match.first].rerot_reclassify(
@@ -2079,6 +2053,110 @@ size_t llama_kv_cache::rerot_add_run_ref(
 
     GGML_ASSERT(seen == count);
     return seen;
+}
+
+size_t llama_kv_cache::rerot_find_run_cells(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        std::vector<std::pair<uint32_t, uint32_t>> * out) const {
+    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID) {
+        return 0;
+    }
+
+    size_t count = 0;
+    for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
+        std::vector<uint32_t> idxs;
+        count += v_cells[stream].rerot_collect_run(episode_id, run_id, idxs);
+        if (out != nullptr) {
+            for (const uint32_t cell : idxs) {
+                out->emplace_back(stream, cell);
+            }
+        }
+    }
+    return count;
+}
+
+bool llama_kv_cache::rerot_can_freeze_to_archive(
+        uint64_t episode_id,
+        llama_seq_id exec_seq,
+        llama_seq_id archive_seq,
+        size_t * count) const {
+    if (count != nullptr) {
+        *count = 0;
+    }
+    if (episode_id == 0 || exec_seq < 0 || archive_seq < 0 || exec_seq == archive_seq ||
+        (size_t) exec_seq >= seq_to_stream.size() || (size_t) archive_seq >= seq_to_stream.size()) {
+        return false;
+    }
+    if (other != nullptr || seq_to_stream[exec_seq] != seq_to_stream[archive_seq]) {
+        return false;
+    }
+
+    size_t kept = 0;
+    const auto & cells = v_cells[seq_to_stream[exec_seq]];
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i) || !cells.seq_has(i, exec_seq)) {
+            continue;
+        }
+        const auto & meta = cells.rerot_get(i);
+        if (meta.active() && meta.episode_id == episode_id &&
+            meta.visibility == llama_rerot_visibility::public_live && meta.publish_epoch != 0) {
+            ++kept;
+        }
+    }
+
+    if (count != nullptr) {
+        *count = kept;
+    }
+    return true;
+}
+
+size_t llama_kv_cache::rerot_freeze_to_archive(
+        uint64_t episode_id,
+        llama_seq_id exec_seq,
+        llama_seq_id archive_seq) {
+    size_t count = 0;
+    if (!rerot_can_freeze_to_archive(episode_id, exec_seq, archive_seq, &count)) {
+        return 0;
+    }
+
+    auto & cells = v_cells[seq_to_stream[exec_seq]];
+    const size_t kept = cells.rerot_freeze_to_archive(episode_id, exec_seq, archive_seq);
+
+    GGML_ASSERT(kept == count);
+    return kept;
+}
+
+bool llama_kv_cache::rerot_blocks_state_save(llama_seq_id seq_id) const {
+    if (seq_id == -1) {
+        for (const auto & tag : rerot_write_tags) {
+            if (tag.active()) {
+                return true;
+            }
+        }
+        for (const auto & view : rerot_reader_views) {
+            if (view.active()) {
+                return true;
+            }
+        }
+        for (const auto & cells : v_cells) {
+            if (cells.rerot_has_active()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+    if ((size_t) seq_id < rerot_write_tags.size() && rerot_write_tags[seq_id].active()) {
+        return true;
+    }
+    if ((size_t) seq_id < rerot_reader_views.size() && rerot_reader_views[seq_id].active()) {
+        return true;
+    }
+    return v_cells[seq_to_stream[seq_id]].rerot_has_active_seq(seq_id);
 }
 
 bool llama_kv_cache::rerot_can_reclassify_run(
@@ -3198,6 +3276,18 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
     GGML_UNUSED(flags);
 
+    // v1 rule (§5.5/§25): the serialized cell format carries no per-cell
+    // episode/node/run/visibility classification and no write-tag/reader-view
+    // control state. Refuse explicitly instead of persisting bytes that would
+    // restore as silently wrong ordinary KV. Ordinary untagged state is
+    // unaffected: rerot_blocks_state_save() is false when OFF.
+    if (rerot_blocks_state_save(seq_id)) {
+        throw std::runtime_error(
+            "llama_kv_cache::state_write: refusing slot save / prompt-cache persist while a RERoT "
+            "episode is active (resident classified cells, write tags, or reader views present). "
+            "v1 does not support persisting RERoT episodes; clear the episode first.");
+    }
+
     io.write(&n_stream, sizeof(n_stream));
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -3445,6 +3535,13 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
     if (dest_seq_id != -1) {
         // single sequence
         seq_rm(dest_seq_id, -1, -1);
+
+        // Restored bytes are ordinary KV with no RERoT classification: drop
+        // any write tag/reader view so apply_ubatch() below cannot mis-tag
+        // them. (Whole-cache restore goes through clear(), which already
+        // resets cells, tags, and views.)
+        rerot_clear_write_tag(dest_seq_id);
+        rerot_clear_reader_view(dest_seq_id);
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 

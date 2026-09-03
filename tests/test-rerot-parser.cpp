@@ -49,6 +49,23 @@ static void test_split_open_and_close() {
     CHECK(parser.complete());
 }
 
+static void test_byte_by_byte_record() {
+    // Tokenization boundaries may fall anywhere, including inside every tag.
+    server_rerot_planner_parser parser;
+    const std::string bytes = "pre <ol><li>A</li><li>B</li></ol>";
+    server_rerot_parser_step step;
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        step = parser.consume(bytes.substr(i, 1));
+        CHECK(!step.malformed);
+        if (i + 1 < bytes.size()) {
+            CHECK(!step.record_closed);
+        }
+    }
+    CHECK(step.record_closed);
+    CHECK(step.items == std::vector<std::string>({"A", "B"}));
+    CHECK(parser.complete());
+}
+
 static void test_false_prefix_release() {
     server_rerot_planner_parser parser;
 
@@ -119,6 +136,26 @@ static void test_malformed_records() {
     }
 }
 
+static void test_bytes_after_complete_are_malformed() {
+    // The planner grammar disarms at </ol>: emitting more planner bytes is a
+    // protocol violation, never a second fork record.
+    server_rerot_planner_parser parser;
+    const auto closed = parser.consume("<ol><li>A</li></ol>");
+    CHECK(closed.record_closed);
+    CHECK(parser.complete());
+    const auto extra = parser.consume("trailing");
+    CHECK(extra.malformed);
+    CHECK(!extra.error.empty());
+}
+
+static void test_planner_prompt_shape() {
+    const std::string prompt(server_rerot_planner_prompt());
+    CHECK(!prompt.empty());
+    CHECK(prompt.find("<ol>") != std::string::npos);
+    CHECK(prompt.find("<li>") != std::string::npos);
+    CHECK(prompt.find("</ol>") != std::string::npos);
+}
+
 static void test_private_marker_split() {
     server_rerot_marker_parser parser;
 
@@ -153,19 +190,32 @@ static void test_private_marker_rejects_trailing_body() {
     CHECK(parser.failed());
 }
 
+static void test_private_marker_after_complete_is_malformed() {
+    server_rerot_marker_parser parser;
+    const auto closed = parser.consume("done </think>");
+    CHECK(closed.marker_closed);
+    CHECK(parser.complete());
+    const auto extra = parser.consume("more");
+    CHECK(extra.malformed);
+    CHECK(!extra.error.empty());
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT Planner Parser Tests ===\n");
     test_plain_public_text();
     test_split_open_and_close();
+    test_byte_by_byte_record();
     test_false_prefix_release();
     test_false_prefix_then_new_record_same_token();
     test_complete_record_one_token();
     test_non_candidate_angle_text_stays_public();
     test_malformed_records();
+    test_bytes_after_complete_are_malformed();
+    test_planner_prompt_shape();
     test_private_marker_split();
     test_private_marker_false_prefix();
     test_private_marker_rejects_trailing_body();
+    test_private_marker_after_complete_is_malformed();
     std::fprintf(stderr, "=== Results: %d failure(s) ===\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }
-

@@ -16,17 +16,388 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+// Episode persistence contract shared with the server control plane (§§25,
+// A.8-A.10). Declares the fingerprint/envelope/shift helpers implemented
+// below; the logical episode blob itself lives in tools/server/server-rerot.*.
+#include "../tools/server/server-rerot.h"
+
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 //
 // llama_context
 //
+
+// ---------------------------------------------------------------------------
+// RERoT experimental context-side state (Stage 7 + compat core, §§11,17,20,
+// 25,A.6-A.11). All helpers below are gated by cparams.rerot_enabled +
+// episode-active. When RERoT is OFF (or no episode is active) every helper
+// returns a safe default without touching KV/recurrent/sampler/graph state,
+// so ordinary decode / state / shift / reclaim paths stay byte-identical.
+// llama_context's header is owned elsewhere, so per-context RERoT control
+// state lives in this translation-unit registry keyed by context pointer.
+// Physical KV ownership stays in llama_kv_cells; logical tree/scheduler
+// stays in tools/server/server-rerot.*. This file only tracks write tags
+// (forwarded to memory), reader-view stamps (for MTP binding), and
+// topology/publish/layout epochs (for barrier refresh + caps/fingerprint).
+// ---------------------------------------------------------------------------
+
+// Forward declaration: capability bitmap, defined alongside the other RERoT
+// context glue below. Declared early so the envelope writer (below) sees it.
+uint32_t llama_rerot_state_caps(const struct llama_context * ctx);
+
+namespace {
+
+struct llama_rerot_ctx_state {
+    bool active = false;
+    uint64_t episode_id = 0;
+    uint64_t topology_epoch = 1;
+    uint64_t publish_epoch = 1;
+    uint64_t layout_epoch = 1;
+    llama_rerot_frontier_mode frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+    // Per-exec-seq MTP binding stamps installed by set_frontier_views.
+    std::map<llama_seq_id, llama_rerot_view_stamp> view_stamps;
+    llama_memory_t mem = nullptr;
+};
+
+std::mutex g_rerot_mu;
+std::unordered_map<const llama_context *, llama_rerot_ctx_state> g_rerot_states;
+
+bool llama_rerot_ctx_enabled(const llama_context * ctx) {
+    return ctx != nullptr && ctx->get_cparams().rerot_enabled;
+}
+
+bool llama_rerot_ctx_is_active(const llama_context * ctx, uint64_t episode_id = 0) {
+    if (!llama_rerot_ctx_enabled(ctx)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_rerot_mu);
+    auto it = g_rerot_states.find(ctx);
+    if (it == g_rerot_states.end() || !it->second.active) {
+        return false;
+    }
+    return episode_id == 0 || it->second.episode_id == episode_id;
+}
+
+bool llama_rerot_mem_is_active(llama_memory_t mem) {
+    if (mem == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_rerot_mu);
+    for (const auto & kv : g_rerot_states) {
+        if (kv.second.active && kv.second.mem == mem) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Versioned state fingerprint (A.8.1/A.25): model arch + RoPE config + Tri
+// calibration + RERoT version. Old binaries meeting new RERoT state must
+// reject (magic/version mismatch); new binaries keep the ordinary path when
+// no RERoT episode is active. v1 never persists RERoT episodes (explicit
+// refusal below); the fingerprint is reserved for the future episode format
+// and for caps diagnostics.
+uint64_t llama_rerot_ctx_fingerprint(const llama_context * ctx) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    const auto & cparams = ctx->get_cparams();
+    const auto & model = ctx->get_model();
+    uint64_t h = 0xcbf29ce484222325ull;
+    const auto mix = [&](uint64_t v) {
+        h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    };
+    mix((uint64_t) model.arch);
+    mix((uint64_t) model.hparams.n_ctx_train);
+    {
+        uint32_t u = 0;
+        std::memcpy(&u, &cparams.rope_freq_base, sizeof(u));
+        mix(u);
+        std::memcpy(&u, &cparams.rope_freq_scale, sizeof(u));
+        mix(u);
+    }
+    {
+        uint64_t u = 0;
+        std::memcpy(&u, &cparams.triattention_ratio, sizeof(u));
+        mix(u);
+        mix(cparams.triattention_enabled ? 0x9e3779b9ull : 0);
+    }
+    mix(LLAMA_REROT_STATE_MAGIC);
+    mix(LLAMA_REROT_STATE_VERSION);
+    return h == 0 ? 1 : h;
+}
+
+uint64_t llama_rerot_ctx_mix_fp(uint64_t h, uint64_t v) {
+    h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    return h;
+}
+
+// Fingerprint triple (§A.8.1): model arch + ctx-train size, RoPE base/scale,
+// Tri ratio/enabled calibration. Each mixes in the state magic/version so a
+// version skew also flips the triple (defense in depth; the envelope checks
+// the version explicitly first and names the offending domain on mismatch).
+uint64_t llama_rerot_ctx_fp_model(const llama_context * ctx) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    const auto & model = ctx->get_model();
+    uint64_t h = 0xcbf29ce484222325ull;
+    h = llama_rerot_ctx_mix_fp(h, (uint64_t) model.arch);
+    h = llama_rerot_ctx_mix_fp(h, (uint64_t) model.hparams.n_ctx_train);
+    h = llama_rerot_ctx_mix_fp(h, (uint64_t) LLAMA_REROT_STATE_MAGIC);
+    h = llama_rerot_ctx_mix_fp(h, (uint64_t) LLAMA_REROT_STATE_VERSION);
+    return h == 0 ? 1 : h;
+}
+
+uint64_t llama_rerot_ctx_fp_rope(const llama_context * ctx) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    const auto & cparams = ctx->get_cparams();
+    uint64_t h = 0xcbf29ce484222325ull;
+    {
+        uint32_t u = 0;
+        std::memcpy(&u, &cparams.rope_freq_base, sizeof(u));
+        h = llama_rerot_ctx_mix_fp(h, u);
+        std::memcpy(&u, &cparams.rope_freq_scale, sizeof(u));
+        h = llama_rerot_ctx_mix_fp(h, u);
+    }
+    h = llama_rerot_ctx_mix_fp(h, (uint64_t) LLAMA_REROT_STATE_MAGIC);
+    h = llama_rerot_ctx_mix_fp(h, (uint64_t) LLAMA_REROT_STATE_VERSION);
+    return h == 0 ? 1 : h;
+}
+
+uint64_t llama_rerot_ctx_fp_tri(const llama_context * ctx) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    const auto & cparams = ctx->get_cparams();
+    uint64_t h = 0xcbf29ce484222325ull;
+    {
+        uint64_t u = 0;
+        std::memcpy(&u, &cparams.triattention_ratio, sizeof(u));
+        h = llama_rerot_ctx_mix_fp(h, u);
+        h = llama_rerot_ctx_mix_fp(h, cparams.triattention_enabled ? 0x9e3779b9ull : 0);
+    }
+    h = llama_rerot_ctx_mix_fp(h, (uint64_t) LLAMA_REROT_STATE_MAGIC);
+    h = llama_rerot_ctx_mix_fp(h, (uint64_t) LLAMA_REROT_STATE_VERSION);
+    return h == 0 ? 1 : h;
+}
+
+bool llama_rerot_ctx_fail(std::string * error, const std::string & message) {
+    if (error) {
+        *error = message;
+    }
+    return false;
+}
+
+// Parsed RERoT context envelope (arch string consumed separately by the
+// caller, exactly like the ordinary state path).
+struct llama_rerot_ctx_envelope {
+    uint64_t episode_id = 0;
+    uint64_t topology_epoch = 0;
+    uint64_t publish_epoch = 0;
+    uint64_t layout_epoch = 0;
+    llama_rerot_frontier_mode frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+    std::map<llama_seq_id, llama_rerot_view_stamp> stamps;
+};
+
+// Versioned context envelope writer (§A.8.1). Emits the arch string (same
+// prefix bytes as the ordinary path) followed by magic/version/caps/
+// fingerprint triple/control state. Carries NO tensor bytes: resident
+// classified cells, write tags, and reader views are transient execution
+// state (episode-level demotion — the logical episode in the server blob plus
+// this envelope is authoritative, and views/tags are reinstalled via
+// set_write_tag / set_frontier_views before decode). Throws std::runtime_error
+// with an explicit reason for corrupt control state; the caller (a member
+// function) additionally refuses backend-sampler-bound exec seqs, whose
+// RNG/history state has no byte-serializable form here.
+void llama_rerot_ctx_write_envelope_body(llama_context * ctx, llama_io_write_i & io) {
+    uint64_t episode_id = 0;
+    uint64_t topology_epoch = 0;
+    uint64_t publish_epoch = 0;
+    uint64_t layout_epoch = 0;
+    llama_rerot_frontier_mode frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+    std::map<llama_seq_id, llama_rerot_view_stamp> stamps;
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        const auto it = g_rerot_states.find(ctx);
+        if (it == g_rerot_states.end() || !it->second.active) {
+            throw std::runtime_error("RERoT envelope write refused: no active episode on this context");
+        }
+        episode_id     = it->second.episode_id;
+        topology_epoch = it->second.topology_epoch;
+        publish_epoch  = it->second.publish_epoch;
+        layout_epoch   = it->second.layout_epoch;
+        frontier_mode  = it->second.frontier_mode;
+        stamps         = it->second.view_stamps;
+    }
+    if (episode_id == 0 || topology_epoch == 0 || publish_epoch == 0 || layout_epoch == 0) {
+        throw std::runtime_error("RERoT envelope write refused: corrupt episode control state (zero id/epoch)");
+    }
+    const std::string arch_str = llm_arch_name(ctx->get_model().arch);
+    io.write_string(arch_str);
+
+    const uint32_t magic   = LLAMA_REROT_STATE_MAGIC;
+    const uint32_t version = LLAMA_REROT_STATE_VERSION;
+    const uint32_t caps    = llama_rerot_state_caps(ctx);
+    const uint64_t fp_model = llama_rerot_ctx_fp_model(ctx);
+    const uint64_t fp_rope  = llama_rerot_ctx_fp_rope(ctx);
+    const uint64_t fp_tri   = llama_rerot_ctx_fp_tri(ctx);
+    const int32_t mode = static_cast<int32_t>(frontier_mode);
+    const uint64_t n_stamps = static_cast<uint64_t>(stamps.size());
+    io.write(&magic,    sizeof(magic));
+    io.write(&version,  sizeof(version));
+    io.write(&caps,     sizeof(caps));
+    io.write(&fp_model, sizeof(fp_model));
+    io.write(&fp_rope,  sizeof(fp_rope));
+    io.write(&fp_tri,   sizeof(fp_tri));
+    io.write(&episode_id,     sizeof(episode_id));
+    io.write(&topology_epoch, sizeof(topology_epoch));
+    io.write(&publish_epoch,  sizeof(publish_epoch));
+    io.write(&layout_epoch,   sizeof(layout_epoch));
+    io.write(&mode, sizeof(mode));
+    io.write(&n_stamps, sizeof(n_stamps));
+    for (const auto & kv : stamps) {
+        const int32_t seq = kv.first;
+        io.write(&seq, sizeof(seq));
+        io.write(&kv.second.topology_epoch, sizeof(uint64_t));
+        io.write(&kv.second.publish_epoch,  sizeof(uint64_t));
+        io.write(&kv.second.layout_epoch,   sizeof(uint64_t));
+    }
+    const uint8_t omitted = 1; // memory tensor bytes omitted by design (see above)
+    io.write(&omitted, sizeof(omitted));
+}
+
+// Versioned context envelope reader. Validates the arch string, then the
+// magic/version/caps/fingerprint triple with an explicit reason per failure
+// (old-binary-new-state, legacy, unknown-feature, or the offending
+// model/rope/Tri domain — never best-effort). Ordinary state bytes offered
+// here fail closed at the magic check: restoring them atop an active episode
+// would orphan tree/run/epoch/parked/archive/MTP lineage.
+void llama_rerot_ctx_read_envelope_body(
+        const llama_context * ctx,
+        llama_io_read_i & io,
+        llama_rerot_ctx_envelope & env_out) {
+    const std::string cur_arch_str = llm_arch_name(ctx->get_model().arch);
+    std::string arch_str;
+    io.read_string(arch_str);
+    if (cur_arch_str != arch_str) {
+        throw std::runtime_error("RERoT envelope load refused: wrong model arch");
+    }
+    uint32_t magic = 0;
+    io.read(&magic, sizeof(magic));
+    if (magic != LLAMA_REROT_STATE_MAGIC) {
+        throw std::runtime_error("RERoT envelope load refused: magic mismatch "
+            "(ordinary state bytes cannot restore atop an active episode — they would orphan "
+            "tree/run/epoch/parked/archive/MTP lineage; clear the episode first or restore the "
+            "matching RERoT envelope)");
+    }
+    uint32_t version = 0;
+    io.read(&version, sizeof(version));
+    if (version != LLAMA_REROT_STATE_VERSION) {
+        if (version > LLAMA_REROT_STATE_VERSION) {
+            throw std::runtime_error("RERoT envelope load refused: old binary cannot read new RERoT state "
+                "(upgrade the binary, never best-effort restore)");
+        }
+        throw std::runtime_error("RERoT envelope load refused: legacy RERoT state is unsupported "
+            "(refusing best-effort upgrade)");
+    }
+    uint32_t caps = 0;
+    uint64_t fp_model = 0, fp_rope = 0, fp_tri = 0;
+    io.read(&caps,     sizeof(caps));
+    io.read(&fp_model, sizeof(fp_model));
+    io.read(&fp_rope,  sizeof(fp_rope));
+    io.read(&fp_tri,   sizeof(fp_tri));
+    constexpr uint32_t known_caps =
+        LLAMA_REROT_STATE_CAP_REROT | LLAMA_REROT_STATE_CAP_REROT_TREE |
+        LLAMA_REROT_STATE_CAP_REROT_PRIVATE | LLAMA_REROT_STATE_CAP_REROT_MTP |
+        LLAMA_REROT_STATE_CAP_HYBRID_REC | LLAMA_REROT_STATE_CAP_SPARSE_KV |
+        LLAMA_REROT_STATE_CAP_TRIATTENTION;
+    if ((caps & ~known_caps) != 0) {
+        throw std::runtime_error("RERoT envelope load refused: unknown state capability bits "
+            "(envelope needs a newer feature set)");
+    }
+    if ((caps & LLAMA_REROT_STATE_CAP_REROT) == 0) {
+        throw std::runtime_error("RERoT envelope load refused: blob lacks the REROT capability bit");
+    }
+    if (fp_model != llama_rerot_ctx_fp_model(ctx)) {
+        throw std::runtime_error("RERoT envelope load refused: model fingerprint mismatch "
+            "(different arch or context-train size); refusing best-effort restore");
+    }
+    if (fp_rope != llama_rerot_ctx_fp_rope(ctx)) {
+        throw std::runtime_error("RERoT envelope load refused: RoPE fingerprint mismatch "
+            "(different rope base/scale); refusing best-effort restore");
+    }
+    if (fp_tri != llama_rerot_ctx_fp_tri(ctx)) {
+        throw std::runtime_error("RERoT envelope load refused: Tri-calibration fingerprint mismatch "
+            "(different Tri ratio/enabled state); refusing best-effort restore");
+    }
+    llama_rerot_ctx_envelope env;
+    int32_t mode = -1;
+    uint64_t n_stamps = 0;
+    io.read(&env.episode_id,     sizeof(env.episode_id));
+    io.read(&env.topology_epoch, sizeof(env.topology_epoch));
+    io.read(&env.publish_epoch,  sizeof(env.publish_epoch));
+    io.read(&env.layout_epoch,   sizeof(env.layout_epoch));
+    io.read(&mode,     sizeof(mode));
+    io.read(&n_stamps, sizeof(n_stamps));
+    if (env.episode_id == 0 || env.topology_epoch == 0 || env.publish_epoch == 0 || env.layout_epoch == 0) {
+        throw std::runtime_error("RERoT envelope load refused: zero episode id or epoch");
+    }
+    if (mode != static_cast<int32_t>(LLAMA_REROT_FRONTIER_STRONG) &&
+        mode != static_cast<int32_t>(LLAMA_REROT_FRONTIER_LAG1)) {
+        throw std::runtime_error("RERoT envelope load refused: corrupt frontier mode");
+    }
+    env.frontier_mode = static_cast<llama_rerot_frontier_mode>(mode);
+    if (n_stamps > static_cast<uint64_t>(LLAMA_MAX_SEQ)) {
+        throw std::runtime_error("RERoT envelope load refused: corrupt view-stamp count");
+    }
+    for (uint64_t i = 0; i < n_stamps; ++i) {
+        int32_t seq = -1;
+        llama_rerot_view_stamp stamp{0, 0, 0};
+        io.read(&seq, sizeof(seq));
+        io.read(&stamp.topology_epoch, sizeof(uint64_t));
+        io.read(&stamp.publish_epoch,  sizeof(uint64_t));
+        io.read(&stamp.layout_epoch,   sizeof(uint64_t));
+        if (seq < 0 || seq >= LLAMA_MAX_SEQ ||
+            stamp.topology_epoch == 0 || stamp.publish_epoch == 0 || stamp.layout_epoch == 0) {
+            throw std::runtime_error("RERoT envelope load refused: corrupt view stamp");
+        }
+        if (!env.stamps.emplace(seq, stamp).second) {
+            throw std::runtime_error("RERoT envelope load refused: duplicate view stamp");
+        }
+    }
+    uint8_t omitted = 0;
+    io.read(&omitted, sizeof(omitted));
+    if (omitted != 1) {
+        throw std::runtime_error("RERoT envelope load refused: corrupt memory-omission marker");
+    }
+    env_out = std::move(env);
+}
+
+llama_rerot_visibility llama_rerot_ctx_convert_visibility(llama_rerot_kv_visibility v, bool * ok) {
+    switch (v) {
+        case LLAMA_REROT_KV_PUBLIC_LIVE:     if (ok) *ok = true;  return llama_rerot_visibility::public_live;
+        case LLAMA_REROT_KV_PRIVATE_CONTROL: if (ok) *ok = true;  return llama_rerot_visibility::private_control;
+        case LLAMA_REROT_KV_PENDING_RECORD:  if (ok) *ok = true;  return llama_rerot_visibility::pending_record;
+        default: break;
+    }
+    if (ok) *ok = false;
+    return llama_rerot_visibility::normal;
+}
+
+} // namespace
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -286,6 +657,7 @@ llama_context::llama_context(
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
+    cparams.n_outputs_max = std::max(cparams.n_outputs_max, cparams.n_seq_max);
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
@@ -561,6 +933,12 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    // RERoT: drop per-context episode gate so a destroyed context never leaves
+    // a dangling registry key. OFF: map is empty, single lookup, no behavior change.
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        g_rerot_states.erase(this);
+    }
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -1998,14 +2376,41 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     if (!did_optimize) {
                         did_optimize = true;
 
-                        // Try TriAttention reclaim first (if enabled)
+                        // Try TriAttention reclaim first (if enabled).
+                        // RERoT compat (§A.11.3/A.27): recurrent-only
+                        // pressure must NOT trigger Tri KV reclaim. When a
+                        // RERoT episode is active and KV has room for this
+                        // batch but recurrent state does not, bypass Tri and
+                        // fall through to the stock recurrent victim path.
+                        // Whole-episode atomicity (§19.3) and episode-aware
+                        // preemption/demotion (§A.11/A.27): a RERoT frontier
+                        // either decodes fully or HARD_ABORTs; never commit
+                        // a partial Lane subset (the server gate enforces
+                        // this via begin_frontier, and whole-episode
+                        // preemption/demotion lives server-side via
+                        // rerot_propagate_hard_abort; this guard only avoids
+                        // lossy Tri work that the episode cannot use).
                         if (cparams.triattention_enabled) {
-                            llama_memory_kv_reclaim_request req;
-                            req.drain_to_floor = true;
-                            req.required_free = balloc->get_n_tokens();
-                            auto result = memory_reclaim_kv(req);
-                            if (result.changed) {
-                                continue;
+                            bool rerot_recurrent_only = false;
+                            if (cparams.rerot_enabled && llama_rerot_ctx_is_active(this)) {
+                                const uint32_t kv_cap  = memory ? memory->get_kv_capacity() : 0;
+                                const uint32_t kv_used = memory ? memory->get_kv_used() : 0;
+                                const uint32_t rc_cap  = memory ? memory->get_recurrent_capacity() : 0;
+                                const uint32_t rc_used = memory ? memory->get_recurrent_used() : 0;
+                                const uint32_t need = balloc->get_n_tokens();
+                                if (rc_cap > 0 && kv_cap > 0 && kv_used + need <= kv_cap && rc_used >= rc_cap) {
+                                    rerot_recurrent_only = true;
+                                    LLAMA_LOG_DEBUG("%s: RERoT recurrent-only pressure - bypassing TriAttention reclaim\n", __func__);
+                                }
+                            }
+                            if (!rerot_recurrent_only) {
+                                llama_memory_kv_reclaim_request req;
+                                req.drain_to_floor = true;
+                                req.required_free = balloc->get_n_tokens();
+                                auto result = memory_reclaim_kv(req);
+                                if (result.changed) {
+                                    continue;
+                                }
                             }
                         }
 
@@ -3399,6 +3804,41 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
 size_t llama_context::state_write_data(llama_io_write_i & io) {
     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
 
+    // RERoT versioned episode persistence (§§25,A.8): an active episode saves
+    // a control envelope (arch + REROT_STATE_MAGIC/VERSION + caps + model/
+    // rope/Tri fingerprints + epochs + per-seq MTP view stamps) instead of
+    // ordinary tensor bytes. The logical episode (server blob + this envelope)
+    // is authoritative; resident classified cells, write tags, and reader
+    // views are transient execution state reinstalled via set_write_tag /
+    // set_frontier_views (episode-level demotion). OFF stays untouched: the
+    // gate below is false unless rerot_enabled + episode-active.
+    if (cparams.rerot_enabled && llama_rerot_ctx_is_active(this)) {
+        // Narrow refusal: backend sampler state bound to an episode exec seq
+        // has no byte-serializable form here. Common (non-backend) sampling
+        // rows live server-side and persist via the episode sampler_blob.
+        std::vector<llama_seq_id> stamped_seqs;
+        {
+            std::lock_guard<std::mutex> lock(g_rerot_mu);
+            const auto it = g_rerot_states.find(this);
+            if (it != g_rerot_states.end()) {
+                for (const auto & kv : it->second.view_stamps) {
+                    stamped_seqs.push_back(kv.first);
+                }
+            }
+        }
+        for (const auto seq : stamped_seqs) {
+            const auto jt = sampling.samplers.find(seq);
+            if (jt != sampling.samplers.end() && jt->second != nullptr) {
+                throw std::runtime_error(
+                    "llama_context::state_write_data: refusing RERoT persist with backend sampler state bound to "
+                    "exec seq " + std::to_string(seq) + " (sampler RNG/history has no serial form here; quiesce "
+                    "backend sampling for RERoT lanes or checkpoint the sampler server-side)");
+            }
+        }
+        llama_rerot_ctx_write_envelope_body(this, io);
+        return io.n_bytes();
+    }
+
     // write model info
     {
         LLAMA_LOG_DEBUG("%s: - writing model info\n", __func__);
@@ -3418,6 +3858,46 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
+
+    // RERoT versioned episode restore (§§25,A.8): atop an active episode only
+    // a matching envelope restores (exact episode id, magic/version/caps/
+    // fingerprint triple validated inside, never best-effort). Ordinary bytes
+    // fail closed at the magic check — they would orphan tree/run/epoch/
+    // parked/archive/MTP lineage. Memory tensor state is not touched here:
+    // pair with the server runtime load_episode for the logical tree, then
+    // reinstall views before decode. OFF is untouched.
+    if (cparams.rerot_enabled && llama_rerot_ctx_is_active(this)) {
+        uint64_t active_id = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_rerot_mu);
+            const auto it = g_rerot_states.find(this);
+            if (it != g_rerot_states.end()) {
+                active_id = it->second.episode_id;
+            }
+        }
+        llama_rerot_ctx_envelope env;
+        llama_rerot_ctx_read_envelope_body(this, io, env);
+        if (env.episode_id != active_id) {
+            throw std::runtime_error(
+                "llama_context::state_read_data: RERoT envelope is for episode " + std::to_string(env.episode_id) +
+                " but episode " + std::to_string(active_id) + " is active; end the active episode first");
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_rerot_mu);
+            const auto it = g_rerot_states.find(this);
+            if (it == g_rerot_states.end() || !it->second.active || it->second.episode_id != active_id) {
+                throw std::runtime_error(
+                    "llama_context::state_read_data: RERoT episode ended during restore; refusing partial install");
+            }
+            it->second.topology_epoch = env.topology_epoch;
+            it->second.publish_epoch  = env.publish_epoch;
+            it->second.layout_epoch   = env.layout_epoch;
+            it->second.frontier_mode  = env.frontier_mode;
+            it->second.view_stamps    = std::move(env.stamps);
+            it->second.mem            = memory.get();
+        }
+        return io.n_bytes();
+    }
 
     // read model info
     {
@@ -3443,6 +3923,19 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
 }
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // RERoT granularity guard (§§25,A.8): a single seq's bytes cannot capture
+    // shared episode state (tree topology, run visibility/epochs, parked
+    // recurrent lineage, archive refs, MTP view stamps). Per-seq slot save is
+    // therefore genuinely unserializable while an episode is active — persist
+    // the whole episode instead (state_write_data envelope plus the server
+    // server_rerot save_episode blob; episode-level demotion preferred over
+    // per-lane swap). OFF untouched (gate false).
+    if (cparams.rerot_enabled && llama_rerot_ctx_is_active(this)) {
+        throw std::runtime_error(
+            "llama_context::state_seq_write_data: refusing per-seq slot save while a RERoT episode is active "
+            "(shared visibility/epochs/lineage need whole-episode persist: state_write_data envelope + "
+            "server_rerot save_episode; per-seq bytes would silently drop them)");
+    }
     GGML_UNUSED(seq_id);
 
     if (memory) {
@@ -3453,6 +3946,16 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // RERoT granularity guard: no per-seq restore into an active episode (it
+    // would orphan the shared run table/epochs/lineage). Restore the whole
+    // episode instead (matching state_read_data envelope plus the server
+    // server_rerot load_episode blob, with magic/version/caps/fingerprint
+    // triple validated and mismatches explicitly rejected).
+    if (cparams.rerot_enabled && llama_rerot_ctx_is_active(this)) {
+        throw std::runtime_error(
+            "llama_context::state_seq_read_data: refusing per-seq slot restore while a RERoT episode is active "
+            "(shared episode state needs whole-episode restore; per-seq bytes would orphan lineage)");
+    }
     GGML_UNUSED(seq_id);
 
     if (memory) {
@@ -4398,6 +4901,527 @@ void llama_memory_rerot_clear_reader_view(
     }
 }
 
+//
+// RERoT experimental context glue (Stage 7 + compat core)
+// All entries are gated by rerot_enabled + episode-active; OFF returns safe
+// defaults with no state touched.
+//
+
+bool llama_rerot_episode_begin(
+        llama_context * ctx,
+               uint64_t episode_id,
+    const llama_rerot_episode_params * params) {
+    if (!llama_rerot_ctx_enabled(ctx) || episode_id == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_rerot_mu);
+    auto & st = g_rerot_states[ctx];
+    if (st.active) {
+        LLAMA_LOG_ERROR("%s: episode %" PRIu64 " already active (current %" PRIu64 ")\n",
+            __func__, episode_id, st.episode_id);
+        return false;
+    }
+    st.active = true;
+    st.episode_id = episode_id;
+    st.topology_epoch = params ? params->topology_epoch : 1;
+    st.publish_epoch  = params ? params->publish_epoch  : 1;
+    st.layout_epoch   = params ? params->layout_epoch   : 1;
+    if (st.topology_epoch == 0) { st.topology_epoch = 1; }
+    if (st.publish_epoch  == 0) { st.publish_epoch  = 1; }
+    if (st.layout_epoch   == 0) { st.layout_epoch   = 1; }
+    st.frontier_mode = params ? params->frontier_mode : ctx->get_cparams().rerot_frontier;
+    st.view_stamps.clear();
+    st.mem = ctx->get_memory();
+    return true;
+}
+
+void llama_rerot_episode_end(llama_context * ctx, uint64_t episode_id) {
+    if (!llama_rerot_ctx_enabled(ctx) || episode_id == 0) {
+        return;
+    }
+    llama_memory_t mem = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        auto it = g_rerot_states.find(ctx);
+        if (it == g_rerot_states.end() || !it->second.active || it->second.episode_id != episode_id) {
+            return;
+        }
+        mem = it->second.mem;
+        g_rerot_states.erase(it);
+    }
+    // Clear episode control state so OFF-equivalent behavior resumes. Best
+    // effort: ignore per-seq failures (memory may already be cleared).
+    if (mem) {
+        for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            mem->rerot_clear_write_tag(s);
+            mem->rerot_clear_reader_view(s);
+        }
+    }
+}
+
+bool llama_rerot_set_write_tag(
+        llama_context * ctx,
+          llama_seq_id seq_id,
+    const llama_rerot_write_tag * tag) {
+    if (!llama_rerot_ctx_enabled(ctx) || tag == nullptr) {
+        return false;
+    }
+    if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ) {
+        return false;
+    }
+    uint64_t episode_id = 0;
+    llama_memory_t mem = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        auto it = g_rerot_states.find(ctx);
+        if (it == g_rerot_states.end() || !it->second.active) {
+            return false;
+        }
+        episode_id = it->second.episode_id;
+        mem = it->second.mem;
+    }
+    if (tag->episode_id == 0 || tag->episode_id != episode_id) {
+        return false;
+    }
+    if (mem == nullptr) {
+        mem = ctx->get_memory();
+    }
+    if (mem == nullptr) {
+        return false;
+    }
+    bool ok = false;
+    const llama_rerot_visibility internal_vis = llama_rerot_ctx_convert_visibility(tag->visibility, &ok);
+    if (!ok) {
+        return false;
+    }
+    // Publication-epoch contract mirrors the KV rules: only PUBLIC_LIVE
+    // carries a non-zero epoch. apply_ubatch() copies this tag into each
+    // newly allocated cell (§11.2 hook point).
+    if ((internal_vis == llama_rerot_visibility::public_live) == (tag->publish_epoch == 0)) {
+        return false;
+    }
+    llama_rerot_kv_write_tag mem_tag;
+    mem_tag.episode_id = tag->episode_id;
+    mem_tag.node_id = tag->node_id;
+    mem_tag.run_id = tag->run_id;
+    mem_tag.publish_epoch = tag->publish_epoch;
+    mem_tag.frontier = tag->frontier;
+    mem_tag.visibility = tag->visibility;
+    return llama_memory_rerot_set_write_tag(mem, seq_id, &mem_tag);
+}
+
+size_t llama_rerot_publish_run(
+        llama_context * ctx,
+    const llama_rerot_publish * req) {
+    if (!llama_rerot_ctx_enabled(ctx) || req == nullptr || req->episode_id == 0 || req->publish_epoch == 0) {
+        return 0;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        auto it = g_rerot_states.find(ctx);
+        if (it == g_rerot_states.end() || !it->second.active || it->second.episode_id != req->episode_id) {
+            return 0;
+        }
+        if (req->publish_epoch < it->second.publish_epoch) {
+            // Stale publish: epochs only move forward (§A.6).
+            return 0;
+        }
+        it->second.publish_epoch = req->publish_epoch;
+    }
+    llama_memory_t mem = ctx->get_memory();
+    if (mem == nullptr) {
+        return 0;
+    }
+    return llama_memory_rerot_publish_run(mem, req->episode_id, req->run_id, req->publish_epoch);
+}
+
+bool llama_rerot_set_frontier_views(
+        llama_context * ctx,
+    const llama_rerot_frontier_reader_view * views,
+                  size_t n_views) {
+    if (!llama_rerot_ctx_enabled(ctx) || views == nullptr || n_views == 0) {
+        return false;
+    }
+    uint64_t episode_id = 0;
+    llama_memory_t mem = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        auto it = g_rerot_states.find(ctx);
+        if (it == g_rerot_states.end() || !it->second.active) {
+            return false;
+        }
+        episode_id = it->second.episode_id;
+        mem = it->second.mem;
+    }
+    if (mem == nullptr) {
+        mem = ctx->get_memory();
+    }
+    if (mem == nullptr) {
+        return false;
+    }
+    // Validate all descriptors before mutating any (all-or-nothing frontier
+    // installation for graph-reuse stability, §A.21).
+    for (size_t i = 0; i < n_views; ++i) {
+        const auto & v = views[i];
+        if (v.episode_id == 0 || v.episode_id != episode_id || v.ordered_run_ids == nullptr ||
+            v.n_ordered_runs == 0 || v.reader_node_id == UINT32_MAX || v.query_run_id == UINT32_MAX ||
+            v.seq_id < 0 || v.seq_id >= LLAMA_MAX_SEQ) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < n_views; ++i) {
+        const auto & v = views[i];
+        llama_rerot_reader_view_desc desc;
+        desc.episode_id = v.episode_id;
+        desc.reader_node_id = v.reader_node_id;
+        desc.query_run_id = v.query_run_id;
+        desc.frontier = v.frontier;
+        desc.frontier_mode = v.frontier_mode;
+        desc.stamp = v.stamp;
+        desc.ordered_run_ids = v.ordered_run_ids;
+        desc.n_ordered_runs = v.n_ordered_runs;
+        if (!llama_memory_rerot_set_reader_view(mem, v.seq_id, &desc)) {
+            return false;
+        }
+    }
+    // Record stamps for MTP staleness binding (§A.6) only after all views
+    // installed successfully.
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        auto it = g_rerot_states.find(ctx);
+        if (it == g_rerot_states.end() || !it->second.active || it->second.episode_id != episode_id) {
+            return false;
+        }
+        for (size_t i = 0; i < n_views; ++i) {
+            it->second.view_stamps[views[i].seq_id] = views[i].stamp;
+            if (views[i].stamp.topology_epoch > it->second.topology_epoch) {
+                it->second.topology_epoch = views[i].stamp.topology_epoch;
+            }
+            if (views[i].stamp.publish_epoch > it->second.publish_epoch) {
+                it->second.publish_epoch = views[i].stamp.publish_epoch;
+            }
+            if (views[i].stamp.layout_epoch > it->second.layout_epoch) {
+                it->second.layout_epoch = views[i].stamp.layout_epoch;
+            }
+        }
+    }
+    return true;
+}
+
+bool llama_rerot_freeze_to_archive(
+        llama_context * ctx,
+               uint64_t episode_id,
+             llama_seq_id exec_seq,
+             llama_seq_id archive_seq,
+                   size_t * kept_out) {
+    if (kept_out) {
+        *kept_out = 0;
+    }
+    if (!llama_rerot_ctx_enabled(ctx) || episode_id == 0 || exec_seq < 0 || archive_seq < 0 ||
+        exec_seq == archive_seq || exec_seq >= LLAMA_MAX_SEQ || archive_seq >= LLAMA_MAX_SEQ) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        auto it = g_rerot_states.find(ctx);
+        if (it == g_rerot_states.end() || !it->second.active || it->second.episode_id != episode_id) {
+            return false;
+        }
+    }
+    llama_memory_t mem = ctx->get_memory();
+    if (mem == nullptr) {
+        return false;
+    }
+    // Direct KV path (§7.2): PUBLIC_LIVE cells gain archive_seq as keeper,
+    // exec_seq attention refs are released without moving K/V and without
+    // touching visibility metadata. Hybrid models additionally release the
+    // recurrent exec handle (lane-local COW lineage already parked by the
+    // server runtime via seq_cp_recurrent).
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        size_t kept = 0;
+        if (!kv->rerot_can_freeze_to_archive(episode_id, exec_seq, archive_seq, &kept)) {
+            return false;
+        }
+        kept = kv->rerot_freeze_to_archive(episode_id, exec_seq, archive_seq);
+        // Recurrent side is a no-op for pure-attention memory (vacuously
+        // successful per llama_memory_i defaults); hybrid callers release
+        // recurrent exec refs via seq_rm_recurrent separately.
+        mem->seq_rm_recurrent(exec_seq, -1, -1);
+        if (kept_out) {
+            *kept_out = kept;
+        }
+        return true;
+    }
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        llama_kv_cache * attn = hybrid->get_mem_attn();
+        if (attn == nullptr || !attn->rerot_can_freeze_to_archive(episode_id, exec_seq, archive_seq, nullptr)) {
+            return false;
+        }
+        const size_t kept = attn->rerot_freeze_to_archive(episode_id, exec_seq, archive_seq);
+        if (!mem->seq_rm_recurrent(exec_seq, -1, -1)) {
+            return false;
+        }
+        if (kept_out) {
+            *kept_out = kept;
+        }
+        return true;
+    }
+    // ISWA and other composites have no direct freeze helper; the server
+    // runtime performs the equivalent archive via rerot_add_run_ref per
+    // PUBLIC run + seq_rm_attention/recurrent, so report unsupported here
+    // rather than silently dropping public history.
+    return false;
+}
+
+uint32_t llama_rerot_state_caps(const llama_context * ctx) {
+    if (!llama_rerot_ctx_enabled(ctx)) {
+        return (uint32_t) LLAMA_REROT_STATE_CAP_NONE;
+    }
+    uint32_t caps = 0;
+    bool active = false;
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        auto it = g_rerot_states.find(ctx);
+        active = it != g_rerot_states.end() && it->second.active;
+    }
+    if (active) {
+        caps |= (uint32_t) LLAMA_REROT_STATE_CAP_REROT;
+        caps |= (uint32_t) LLAMA_REROT_STATE_CAP_REROT_TREE;
+        caps |= (uint32_t) LLAMA_REROT_STATE_CAP_REROT_PRIVATE;
+        caps |= (uint32_t) LLAMA_REROT_STATE_CAP_REROT_MTP;
+    }
+    llama_memory_t mem = ctx->get_memory();
+    if (mem) {
+        if (mem->get_recurrent_capacity() > 0) {
+            caps |= (uint32_t) LLAMA_REROT_STATE_CAP_HYBRID_REC;
+        }
+        if (mem->positions_are_sparse()) {
+            caps |= (uint32_t) LLAMA_REROT_STATE_CAP_SPARSE_KV;
+        }
+    }
+    if (ctx->get_cparams().triattention_enabled) {
+        caps |= (uint32_t) LLAMA_REROT_STATE_CAP_TRIATTENTION;
+    }
+    return caps;
+}
+
+bool llama_rerot_refresh_barrier(llama_context * ctx, uint64_t episode_id) {
+    // Topology-barrier read-only refresh (§17.3): after <ol> publication,
+    // parent freeze, heading publication, or child admission, active lanes
+    // must refresh next-token logits from the latest view. This entry
+    // performs no public token write and allocates no KV cell; it only
+    // synchronizes (so in-flight async copies complete) and validates that
+    // the installed frontier views are still current. If a future refresh
+    // query implementation disturbs recurrent state, it must checkpoint via
+    // state_seq save and restore around the query (v1 prototype path);
+    // the dedicated no-commit graph (LLM_GRAPH_TYPE_REROT_REFRESH) remains
+    // future work. OFF returns false with no side effects.
+    if (!llama_rerot_ctx_enabled(ctx) || episode_id == 0) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        auto it = g_rerot_states.find(ctx);
+        if (it == g_rerot_states.end() || !it->second.active || it->second.episode_id != episode_id) {
+            return false;
+        }
+    }
+    ctx->synchronize();
+    return true;
+}
+
+bool llama_rerot_mtp_is_stale(
+        llama_context * ctx,
+          llama_seq_id seq_id,
+    const llama_rerot_view_stamp * stamp) {
+    // MTP draft binding (§A.6): a draft is bound to the (topology, publish,
+    // layout) stamp observed at draft time. Any peer PUBLIC commit, topology
+    // change, or layout change (context shift / Tri eviction repack) moves
+    // the installed stamp; the old draft must be invalidated, its checkpoint
+    // restored, uncommitted draft KV/recurrent dropped, and re-drafted from
+    // the latest view. The draft window is always within the last stable
+    // publish epoch and never crosses an uncommitted frontier. OFF or
+    // unknown seq returns false (no RERoT-induced staleness).
+    if (!llama_rerot_ctx_enabled(ctx) || stamp == nullptr || seq_id < 0 || seq_id >= LLAMA_MAX_SEQ) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_rerot_mu);
+    auto it = g_rerot_states.find(ctx);
+    if (it == g_rerot_states.end() || !it->second.active) {
+        return false;
+    }
+    auto jt = it->second.view_stamps.find(seq_id);
+    if (jt == it->second.view_stamps.end()) {
+        return false;
+    }
+    const auto & cur = jt->second;
+    return cur.topology_epoch != stamp->topology_epoch ||
+           cur.publish_epoch  != stamp->publish_epoch  ||
+           cur.layout_epoch   != stamp->layout_epoch;
+}
+
+// ---------------------------------------------------------------------------
+// RERoT episode persistence + shift entry points (§§25,A.8-A.10, declared in
+// tools/server/server-rerot.h). All gated by rerot_enabled + episode-active;
+// OFF returns safe defaults with no state touched.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct llama_rerot_ctx_vec_io : public llama_io_write_i {
+    std::vector<uint8_t> buf;
+    void write(const void * src, size_t size) override {
+        const auto * b = static_cast<const uint8_t *>(src);
+        buf.insert(buf.end(), b, b + size);
+    }
+    void write_tensor(ggml_tensor *, size_t, size_t) override {
+        throw std::runtime_error("RERoT envelope carries no tensor bytes");
+    }
+    size_t n_bytes() override {
+        return buf.size();
+    }
+};
+
+} // namespace
+
+server_rerot_state_fingerprints llama_rerot_context_fingerprints(const struct llama_context * ctx) {
+    server_rerot_state_fingerprints fp;
+    if (ctx == nullptr || !ctx->get_cparams().rerot_enabled) {
+        return fp;
+    }
+    fp.caps     = llama_rerot_state_caps(ctx);
+    fp.model_fp = llama_rerot_ctx_fp_model(ctx);
+    fp.rope_fp  = llama_rerot_ctx_fp_rope(ctx);
+    fp.tri_fp   = llama_rerot_ctx_fp_tri(ctx);
+    return fp;
+}
+
+bool llama_rerot_context_save_envelope(
+        struct llama_context * ctx,
+        std::vector<uint8_t> & blob_out,
+        std::string * error_out) {
+    if (ctx == nullptr) {
+        return llama_rerot_ctx_fail(error_out, "RERoT envelope save refused: null context");
+    }
+    if (!llama_rerot_ctx_enabled(ctx)) {
+        return llama_rerot_ctx_fail(error_out, "RERoT envelope save refused: RERoT is disabled on this context");
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        const auto it = g_rerot_states.find(ctx);
+        if (it == g_rerot_states.end() || !it->second.active) {
+            return llama_rerot_ctx_fail(error_out, "RERoT envelope save refused: no active episode on this context");
+        }
+    }
+    // Precondition (enforced on the state_write_data path, which sees the
+    // private sampler table): no backend sampler may be bound to an episode
+    // exec seq — its RNG/history state has no byte-serializable form here.
+    // Direct callers with backend sampling must quiesce those samplers first.
+    try {
+        llama_rerot_ctx_vec_io io;
+        llama_rerot_ctx_write_envelope_body(ctx, io);
+        blob_out = std::move(io.buf);
+        return true;
+    } catch (const std::exception & ex) {
+        return llama_rerot_ctx_fail(error_out, ex.what());
+    }
+}
+
+bool llama_rerot_context_load_envelope(
+        struct llama_context * ctx,
+        const uint8_t * data,
+        size_t size,
+        std::string * error_out) {
+    if (ctx == nullptr || data == nullptr || size == 0) {
+        return llama_rerot_ctx_fail(error_out, "RERoT envelope load refused: empty blob or null target");
+    }
+    if (!llama_rerot_ctx_enabled(ctx)) {
+        return llama_rerot_ctx_fail(error_out, "RERoT envelope load refused: RERoT is disabled on this context "
+            "(envelope restore requires rerot_enabled; ordinary state stays on the ordinary path)");
+    }
+    try {
+        llama_io_read_host io(data, size);
+        llama_rerot_ctx_envelope env;
+        llama_rerot_ctx_read_envelope_body(ctx, io, env);
+        if (io.n_bytes() != size) {
+            return llama_rerot_ctx_fail(error_out, "RERoT envelope load refused: trailing garbage after envelope");
+        }
+        // Memory tensor state is deliberately not touched: pair with the
+        // server runtime load_episode for the logical tree, then reinstall
+        // write tags and frontier views before decode (episode-level
+        // demotion: logical state authoritative, physical state transient).
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        const auto it = g_rerot_states.find(ctx);
+        if (it != g_rerot_states.end() && it->second.active && it->second.episode_id != env.episode_id) {
+            return llama_rerot_ctx_fail(error_out, "RERoT envelope load refused: episode " +
+                std::to_string(env.episode_id) + " cannot restore atop active episode " +
+                std::to_string(it->second.episode_id) + "; end the active episode first");
+        }
+        llama_rerot_ctx_state st;
+        st.active = true;
+        st.episode_id = env.episode_id;
+        st.topology_epoch = env.topology_epoch;
+        st.publish_epoch = env.publish_epoch;
+        st.layout_epoch = env.layout_epoch;
+        st.frontier_mode = env.frontier_mode;
+        st.view_stamps = std::move(env.stamps);
+        st.mem = ctx->get_memory();
+        g_rerot_states[ctx] = std::move(st);
+        return true;
+    } catch (const std::exception & ex) {
+        return llama_rerot_ctx_fail(error_out, ex.what());
+    }
+}
+
+bool llama_rerot_context_apply_shift(
+        struct llama_context * ctx,
+        uint64_t episode_id,
+        uint64_t tokens_removed,
+        uint64_t new_layout_epoch,
+        uint64_t new_publish_epoch,
+        std::string * error_out) {
+    // OFF: no mutation — the ordinary linear seq_add/seq_div shift path stays
+    // solely responsible for non-RERoT position shifts.
+    if (ctx == nullptr || !llama_rerot_ctx_enabled(ctx)) {
+        return false;
+    }
+    if (episode_id == 0 || new_layout_epoch == 0 || new_publish_epoch == 0) {
+        return llama_rerot_ctx_fail(error_out, "RERoT shift apply refused: zero episode id or epoch");
+    }
+    std::lock_guard<std::mutex> lock(g_rerot_mu);
+    const auto it = g_rerot_states.find(ctx);
+    if (it == g_rerot_states.end() || !it->second.active || it->second.episode_id != episode_id) {
+        return llama_rerot_ctx_fail(error_out, "RERoT shift apply refused: no matching active episode on this context");
+    }
+    auto & st = it->second;
+    // Adopt, never rewind: epochs only move forward (§A.6), so a replayed or
+    // reordered shift notification cannot resurrect stale drafts.
+    if (new_layout_epoch > st.layout_epoch) {
+        st.layout_epoch = new_layout_epoch;
+    }
+    if (new_publish_epoch > st.publish_epoch) {
+        st.publish_epoch = new_publish_epoch;
+    }
+    if (tokens_removed == 0) {
+        return true; // server no-op (nothing eligible): epochs already idempotent
+    }
+    // Roll every installed per-seq view stamp forward. Drafts bound to
+    // pre-shift stamps now report stale via llama_rerot_mtp_is_stale, so the
+    // caller restores its checkpoint, drops uncommitted draft KV/recurrent
+    // state, and re-drafts from the latest view. No seq data is touched —
+    // active private causal state is never cut — and Tri reclaim is never
+    // invoked: Tri eviction stays physical-only and separate.
+    for (auto & kv : st.view_stamps) {
+        if (kv.second.publish_epoch < new_publish_epoch) {
+            kv.second.publish_epoch = new_publish_epoch;
+        }
+        if (kv.second.layout_epoch < new_layout_epoch) {
+            kv.second.layout_epoch = new_layout_epoch;
+        }
+    }
+    return true;
+}
+
 void llama_memory_seq_keep(
         llama_memory_t mem,
           llama_seq_id seq_id) {
@@ -4418,6 +5442,16 @@ void llama_memory_seq_add(
         return;
     }
 
+    // RERoT compat (§§A.9-A.10): active DDVR PUBLIC runs must never use the
+    // ordinary linear seq_add shift path (virtual positions are reader views,
+    // not storage positions). v1 refuses the shift with an explicit log and
+    // performs no mutation. OFF is untouched (mem-active is false).
+    if (llama_rerot_mem_is_active(mem)) {
+        LLAMA_LOG_ERROR("%s: refusing KV shift (seq_add) while a RERoT episode is active "
+            "(v1: shared-memory log truncation only via episode-aware shift; ordinary n_cache_reuse forbidden)\n", __func__);
+        return;
+    }
+
     mem->seq_add(seq_id, p0, p1, delta);
 }
 
@@ -4428,6 +5462,13 @@ void llama_memory_seq_div(
              llama_pos p1,
                    int d) {
     if (!mem) {
+        return;
+    }
+
+    // Same RERoT shift guard as seq_add (§§A.9-A.10): no ordinary position
+    // division on active shared-memory views. OFF untouched.
+    if (llama_rerot_mem_is_active(mem)) {
+        LLAMA_LOG_ERROR("%s: refusing KV shift (seq_div) while a RERoT episode is active (v1 unsupported)\n", __func__);
         return;
     }
 
@@ -4502,6 +5543,14 @@ uint32_t llama_memory_seq_get_recurrent_used(llama_memory_t mem, llama_seq_id se
 
 bool llama_memory_can_shift(llama_memory_t mem) {
     if (!mem) {
+        return false;
+    }
+
+    // RERoT compat (§A.10.3): ordinary chunk-reuse shifting is only legal on
+    // serial prefixes / frozen ordinary coordinates. While an episode is
+    // active report not-shiftable so server cache-reuse gates stay OFF.
+    // OFF untouched (mem-active is false).
+    if (llama_rerot_mem_is_active(mem)) {
         return false;
     }
 

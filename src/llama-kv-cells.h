@@ -555,6 +555,101 @@ public:
         return true;
     }
 
+    // Physical lookup of one logical run within this stream. Appends the
+    // physical indices of every resident (non-empty) cell whose RERoT
+    // metadata matches (episode_id, run_id), in ascending cell order.
+    // Returns the number of appended indices. This is the only sanctioned
+    // way to translate a stable run id to physical locations; callers must
+    // never cache the result across compaction, eviction, or restore.
+    uint32_t rerot_collect_run(
+            uint64_t episode_id,
+            llama_rerot_run_id run_id,
+            std::vector<uint32_t> & out) const {
+        if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID) {
+            return 0;
+        }
+
+        uint32_t count = 0;
+        for (const uint32_t i : used) {
+            const auto & meta = rerot[i];
+            if (meta.episode_id == episode_id && meta.run_id == run_id) {
+                out.push_back(i);
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    // True when any resident cell carries RERoT metadata. Used by the v1
+    // persistence guard: such classification has no stable serialized form.
+    bool rerot_has_active() const {
+        for (const uint32_t i : used) {
+            if (rerot[i].active()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // True when any resident cell referenced by seq_id carries RERoT metadata.
+    bool rerot_has_active_seq(llama_seq_id seq_id) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+
+        for (const uint32_t i : used) {
+            if (rerot[i].active() && seq[i].test(seq_id)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Attention-only archive freeze of one execution sequence (§7.2). Every
+    // resident cell referenced by exec_seq is visited: PUBLIC_LIVE cells of
+    // episode_id gain archive_seq as a keeper ref (when not already present)
+    // so their K/V survives; PRIVATE/PENDING/ordinary cells gain no new ref.
+    // All exec_seq refs are then removed, freeing the execution handle
+    // without moving any K/V data or touching visibility metadata. Returns
+    // the number of public cells now kept alive by archive_seq.
+    // Note: ordinary shared-prefix cells survive only when archive_seq
+    // already references them (the caller archives the serial prefix
+    // separately); cells left without any seq ref are freed, which is the
+    // intended release for private/pending history.
+    size_t rerot_freeze_to_archive(
+            uint64_t episode_id,
+            llama_seq_id exec_seq,
+            llama_seq_id archive_seq) {
+        assert(episode_id != 0);
+        assert(exec_seq >= 0 && exec_seq < LLAMA_MAX_SEQ);
+        assert(archive_seq >= 0 && archive_seq < LLAMA_MAX_SEQ);
+        assert(exec_seq != archive_seq);
+
+        std::vector<uint32_t> touched;
+        for (const uint32_t i : used) {
+            if (seq[i].test(exec_seq)) {
+                touched.push_back(i);
+            }
+        }
+
+        size_t kept = 0;
+        for (const uint32_t i : touched) {
+            const auto & meta = rerot[i];
+            const bool keep = meta.active() && meta.episode_id == episode_id &&
+                meta.visibility == llama_rerot_visibility::public_live &&
+                meta.publish_epoch != 0;
+
+            if (keep) {
+                if (!seq[i].test(archive_seq)) {
+                    seq[i].set(archive_seq);
+                    seq_pos_inc(archive_seq, pos[i]);
+                }
+                ++kept;
+            }
+
+            seq_rm(i, exec_seq);
+        }
+        return kept;
+    }
+
     // note: call only if the cell is not empty
     llama_pos get_shift(uint32_t i) const {
         assert(i < pos.size());

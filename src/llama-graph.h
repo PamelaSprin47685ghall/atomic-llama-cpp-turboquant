@@ -316,6 +316,145 @@ public:
     const llama_cparams cparams;
 };
 
+// RERoT DDVR graph input (Stage 5 remainder, §§9-12, 21).
+//
+// Frozen DDVR contract (owned by src/llama-rerot.* + GGML_OP_FLASH_ATTN_EXT_REROT;
+// consumed here, never redefined):
+// - Q arrives at the DDVR kernel PRE-PHASED per group graph-side:
+//     effective = query_virtual + storage_base - virtual_base.
+// - Qwen3.5 text IMRoPE is a 4-tuple (p, p, p, 0); the delta applies to the
+//   first three coordinates only, the fourth stays 0.
+// - RoPE runs BEFORE Turbo WHT; K storage is never moved, not one byte.
+// - Kernels consume span descriptors (entries [2, E] + offsets [n_queries+1])
+//   with one global online softmax per query range. Strong-frontier visibility
+//   is resolved layout-side by entry pre-filtering (strong vs lag1), never by
+//   the kernel and never by ordinary seq-membership masks.
+// - Span metadata / offsets / visibility are INPUT TENSOR DATA, not graph
+//   topology: the reuse key covers only (n_token rows, span capacity bucket,
+//   kernel variant, rerot on/off, frontier mode). Changes to virtual_pos0,
+//   storage_pos0, counts (within capacity) or visibility refresh tensor data
+//   via fill and must not force a rebuild.
+// - Pipeline-parallel lifetime: staging buffers are owned per input instance
+//   (never statics); fill uploads a snapshot after the previous frontier's
+//   graph has completed, following the same discipline as k_idxs/kq_mask.
+//   No use-after-overwrite of span tables across frontiers.
+// - First-CPU-prototype hatch: LLAMA_REROT_DISABLE_GRAPH_REUSE=1 forces a
+//   rebuild whenever RERoT is active. The capacity-bucketed reuse-key design
+//   stays authoritative regardless.
+// - Unsupported backends (no RERoT kernel today: CUDA / Metal / RPC) take an
+//   explicit capability-error path (throw), never silent stock attention.
+// RERoT OFF: none of this runs; ordinary graph construction is byte-identical.
+//
+
+enum class llm_rerot_kernel_variant : uint8_t {
+    REROT_KERNEL_CPU = 0,
+    REROT_KERNEL_VULKAN_FUSED = 1,
+    REROT_KERNEL_UNSUPPORTED = 2,
+};
+
+struct llm_rerot_span_reuse_key {
+    uint32_t n_tokens  = 0;
+    uint32_t group_cap = 0;
+    uint32_t entry_cap = 0;
+    llm_rerot_kernel_variant variant = llm_rerot_kernel_variant::REROT_KERNEL_CPU;
+    bool rerot_on = false;
+    llama_rerot_frontier_mode frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+
+    bool operator==(const llm_rerot_span_reuse_key & o) const {
+        return n_tokens == o.n_tokens && group_cap == o.group_cap && entry_cap == o.entry_cap &&
+               variant == o.variant && rerot_on == o.rerot_on && frontier_mode == o.frontier_mode;
+    }
+    bool operator!=(const llm_rerot_span_reuse_key & o) const {
+        return !(*this == o);
+    }
+};
+
+// Backend-neutral span-descriptor lifecycle for the RERoT DDVR path.
+// Converts per-reader PAC-DFS logical views (llama_rerot_set_frontier_views
+// state, resolved layout-side into llama_rerot_attn_layout) into input tensor
+// data: physical key index / Q-group index entries, per-group effective RoPE
+// positions, and per-query entry offsets. Visibility (strong vs lag1) is
+// already baked into the entry set by the layout builder.
+class llm_graph_input_attn_rerot {
+public:
+    static constexpr uint32_t SPAN_BUCKET = 256;
+
+    static uint32_t capacity_bucket(uint32_t n);
+    static bool graph_reuse_disabled();
+    static bool is_supported_arch(const llama_hparams & hparams);
+    static llm_rerot_kernel_variant select_variant(ggml_backend_sched_t sched);
+    static void require_supported(
+            ggml_backend_sched_t sched,
+            const llama_hparams & hparams,
+            const char * where);
+    static llm_rerot_span_reuse_key make_key(
+            uint32_t n_tokens,
+            uint32_t n_groups,
+            uint32_t n_entries,
+            llm_rerot_kernel_variant variant,
+            bool rerot_on,
+            llama_rerot_frontier_mode mode);
+
+    llm_graph_input_attn_rerot() = default;
+
+    // Allocate capacity-bucketed span tensors (topology) and record the reuse
+    // key. Data is uploaded later by fill_spans, so virtual_pos0 /
+    // storage_pos0 / count / visibility churn within capacity never rebuilds.
+    void build_span_tensors(
+            ggml_context * ctx0,
+            ggml_tensor *& q_indices,
+            ggml_tensor *& q_pos,
+            ggml_tensor *& entries,
+            ggml_tensor *& offsets,
+            const llama_ubatch & ubatch,
+            const llama_hparams & hparams,
+            const llama_cparams & cparams,
+            const llama_kv_cache_context * attn,
+            ggml_backend_sched_t sched);
+
+    bool spans_can_reuse(
+            const llama_ubatch & ubatch,
+            const llama_hparams & hparams,
+            const llama_cparams & cparams,
+            const llama_kv_cache_context * attn,
+            ggml_backend_sched_t sched,
+            const ggml_tensor * q_indices,
+            const ggml_tensor * q_pos,
+            const ggml_tensor * entries,
+            const ggml_tensor * offsets) const;
+
+    // Snapshot the current layout into owned staging, then upload. Only the
+    // exact prefix carries live descriptors; tails are zeroed so padded Q
+    // gathers stay in-bounds and deterministic. q_pos uses the tensor's own
+    // group-capacity stride (coordinate k lives at k * group_cap), matching
+    // how ggml_rope reads multi-pos; the IMRoPE text rule (p, p, p, 0) is
+    // preserved with the fourth coordinate pinned to 0.
+    void fill_spans(
+            ggml_tensor * q_indices,
+            ggml_tensor * q_pos,
+            ggml_tensor * entries,
+            ggml_tensor * offsets,
+            const llama_kv_cache_context * attn,
+            uint32_t n_pos);
+
+    const llm_rerot_span_reuse_key & reuse_key() const { return key; }
+    bool has_key() const { return key_valid; }
+    uint64_t applied_epoch() const { return epoch; }
+
+private:
+    llm_rerot_span_reuse_key key;
+    bool key_valid = false;
+    uint64_t epoch = 0;
+
+    // Pipeline-parallel lifetime: per-instance staging snapshot. Never a
+    // static; never an alias of layout internals. Overwrites happen only via
+    // fill_spans, ordered after the previous frontier's graph completion.
+    std::vector<int32_t> st_q_indices;
+    std::vector<int32_t> st_q_pos;
+    std::vector<int32_t> st_entries;
+    std::vector<int32_t> st_offsets;
+};
+
 class llm_graph_input_attn_kv : public llm_graph_input_i {
 public:
     llm_graph_input_attn_kv(
@@ -349,10 +488,21 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
-    ggml_tensor * self_rerot_q_indices = nullptr; // I32 [n_query_groups]
-    ggml_tensor * self_rerot_q_pos     = nullptr; // I32 [n_query_groups*n_pos]
-    ggml_tensor * self_rerot_entries   = nullptr; // I32 [2, n_visible_entries]
-    ggml_tensor * self_rerot_offsets   = nullptr; // I32 [n_queries + 1]
+    ggml_tensor * self_rerot_q_indices = nullptr; // I32 [group_cap] (capacity-bucketed, see llm_graph_input_attn_rerot)
+    ggml_tensor * self_rerot_q_pos     = nullptr; // I32 [group_cap*n_pos] (capacity stride, IMRoPE 4-tuple)
+    ggml_tensor * self_rerot_entries   = nullptr; // I32 [2, entry_cap] (capacity-bucketed span descriptors)
+    ggml_tensor * self_rerot_offsets   = nullptr; // I32 [n_queries + 1] (exact: keyed by n_token rows)
+
+    // RERoT DDVR span lifecycle: capacity-bucketed reuse key + per-instance
+    // staging for pipeline-parallel lifetime. Ordinary path never touches it.
+    llm_graph_input_attn_rerot rerot_spans;
+
+    bool rerot_spans_can_reuse(
+            const llama_ubatch & ubatch,
+            ggml_backend_sched_t sched,
+            const llama_cparams & cparams,
+            const llama_kv_cache_context * attn) const;
+    void rerot_spans_fill(const llama_ubatch * ubatch, const llama_kv_cache_context * attn);
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;

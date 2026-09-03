@@ -581,6 +581,9 @@ struct common_params : wanxiangqi_common_params {
     double triattention_ratio = 3.0 / 32.0;
     bool rerot_enabled = false;
     llama_rerot_frontier_mode rerot_frontier = LLAMA_REROT_FRONTIER_STRONG;
+    // Explicit opt-in for RERoT lane-trace SSE events (rerot.trace.*). Default off:
+    // streaming stays a single assistant response with one finish event + [DONE].
+    bool rerot_trace = false;
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation
@@ -756,6 +759,80 @@ struct common_params : wanxiangqi_common_params {
 
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
 };
+
+// RERoT outer compatibility, Stage-0 gates (§§18,26,A.13-A.20).
+//
+// Ownership note: the llama_rerot_* C-API (episode begin/end, write tags,
+// publish, frontier views, freeze-to-archive, caps) is owned by ContextGlue in
+// include/llama.h. Nothing here declares competing prototypes; these helpers
+// only validate CLI/request configuration and size host scratch so the
+// runtime (tools/server/server-rerot.*, core src/llama-rerot.*) can consume
+// the frozen API. When ContextGlue relaxes the TriAttention/MTP/context-shift
+// gates, only common_rerot_validate_stage0 needs to change.
+// RERoT OFF: every helper below is a trivial predicate returning
+// false/zero/ok with no allocation and no logging.
+
+struct common_rerot_gate {
+    bool ok = true;
+    std::string error;
+    std::string warning;
+};
+
+inline bool common_rerot_speculative_active(const common_params & params) {
+    for (const auto t : params.speculative.types) {
+        if (t != COMMON_SPECULATIVE_TYPE_NONE) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Effective per-request switch. Embedding/rerank (and any non-generation
+// path) never enters RERoT even when globally enabled (A.19). No allocation.
+inline bool common_rerot_effective_for_request(bool global_enabled, bool is_embedding_or_rerank) {
+    return global_enabled && !is_embedding_or_rerank;
+}
+
+// Stage-0 configuration gate. Requires kv_unified; rejects
+// TriAttention / speculative / context-shift with a clean unsupported error
+// until ContextGlue lands (then allow). Multimodal prompts are allowed:
+// RERoT fork happens prelude-then-fork after the shared multimodal prefill
+// and DDVR never remaps visual positions (A.18), so no gate here.
+// RERoT OFF: returns ok with no allocation.
+inline common_rerot_gate common_rerot_validate_stage0(const common_params & params) {
+    common_rerot_gate gate;
+    if (!params.rerot_enabled) {
+        return gate;
+    }
+    if (!params.kv_unified) {
+        gate.ok = false;
+        gate.error = "RERoT requires unified KV (--kv-unified); refusing to run without it";
+        return gate;
+    }
+    if (params.embedding) {
+        gate.warning = "RERoT is enabled globally but ignored for embedding mode (A.19: embeddings never enter RERoT)";
+    }
+    // ContextGlue + TriIntegration + EpisodePersist compat:
+    // TriAttention acts as legal lossy reclaimer for RERoT shared KV (§§23, A.4).
+    // Speculative decoding / MTP drafts are epoch-bound and force n_draft_max=0 on active lanes (§§24, A.6).
+    // Context shift and cache reuse are intercepted per-episode via shared-memory log truncation (§§25, A.9).
+    return gate;
+}
+
+// Worst-case RERoT runtime scratch to include in auto-fit reserve accounting
+// (A.12): span-table/DDVR phase inputs, frontier query rows, parked-recurrent
+// metadata descriptors, episode host metadata. Large recurrent state itself
+// stays under the existing recurrent capacity and is not double-counted.
+// RERoT OFF: returns 0 (no reservation, no allocation).
+inline size_t common_rerot_scratch_reserve_bytes(const common_params & params) {
+    if (!params.rerot_enabled) {
+        return 0;
+    }
+    // 8 MiB per process covers the metadata-scale scratch above; KV/recurrent
+    // payloads are sized by the existing fit paths. Kept constant (not scaled
+    // by n_parallel) so the estimate stays stable across server slot counts.
+    return 8ull * 1024ull * 1024ull;
+}
 
 // call once at the start of a program if it uses libcommon
 // initializes the logging system and prints info about the build

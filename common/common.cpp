@@ -1802,9 +1802,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     // live recurrent state per physical server slot. The context keeps these
     // capacities separate so the seq-id arena does not multiply recurrent VRAM.
     cparams.n_seq_recurrent   = params.rerot_enabled ? params.n_parallel : 0;
-    cparams.n_outputs_max     = params.n_outputs_max;
-    cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
+    if (params.rerot_enabled) {
+        cparams.n_outputs_max = std::max<uint32_t>(cparams.n_outputs_max, cparams.n_seq_max);
+    }
+    cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;

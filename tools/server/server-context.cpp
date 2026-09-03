@@ -4,6 +4,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
+#include "server-rerot.h"
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
@@ -96,7 +97,7 @@ llama_tokens server_token_hack::after_block(const llama_tokens & confirmed_block
 
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch = params.n_batch;
-    const uint32_t n_seq_max = std::max(1, params.n_parallel);
+    const uint32_t n_seq_max = std::max(1, params.rerot_enabled ? LLAMA_MAX_SEQ : params.n_parallel);
 
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -274,6 +275,19 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+
+    // RERoT thin glue (§18.2): a physical slot is never a logical Lane id.
+    // These fields only tag which episode/node (if any) currently borrows
+    // this slot as its execution handle; the tree/queue/frontier truth lives
+    // in server_rerot_runtime. OFF: all remain at their sentinels.
+    bool rerot_internal = false;
+    uint64_t rerot_episode_id = 0;
+    uint32_t rerot_node_id = UINT32_MAX;
+    llama_seq_id rerot_exec_seq = -1;
+    // MTP draft binding stamp (§A.6) captured when this slot started drafting
+    // under a RERoT view; checked for staleness before accept.
+    struct llama_rerot_view_stamp rerot_draft_stamp = {0, 0, 0};
+    bool rerot_has_draft_stamp = false;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -469,6 +483,16 @@ struct server_slot {
 
         // clear multimodal state
         mbatch.reset();
+
+        // RERoT: physical slot released, logical Lane mapping (if any) is
+        // owned by the runtime (detach/erase); just drop the local tags.
+        // OFF: sentinels already, no behavior change.
+        rerot_internal = false;
+        rerot_episode_id = 0;
+        rerot_node_id = UINT32_MAX;
+        rerot_exec_seq = -1;
+        rerot_draft_stamp = {0, 0, 0};
+        rerot_has_draft_stamp = false;
     }
 
     void init_sampler() const {
@@ -1131,6 +1155,103 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // RERoT thin glue (Stage 7 + compat core, §§18-21,A.11): the logical
+    // episode/tree/queue/frontier truth lives in server_rerot_runtime (already
+    // implemented in server-rerot.*). This context only holds the runtime and
+    // calls it from four gated hook points below. OFF: rerot stays null and
+    // every hook returns immediately, so scheduling stays byte-identical.
+    std::unique_ptr<server_rerot_runtime> rerot;
+    uint64_t rerot_episode_id = 0;
+
+    bool rerot_active() const {
+        return rerot != nullptr && rerot_episode_id != 0 && rerot->episode(rerot_episode_id) != nullptr;
+    }
+
+    const server_rerot_episode * rerot_active_episode() const {
+        return rerot_active() ? rerot->episode(rerot_episode_id) : nullptr;
+    }
+
+    // Frontier scheduling entry (§§19-20): one frontier is one atomic budget
+    // unit. Delegates to runtime::begin_frontier; on hard-limit breach the
+    // runtime takes whole-episode HARD_ABORT (no survivor/answer/tool call)
+    // and this hook propagates it to slots. Returns false when aborted.
+    bool rerot_frontier_enter() {
+        if (!rerot_active()) {
+            return true;
+        }
+        if (rerot->begin_frontier(rerot_episode_id)) {
+            return true;
+        }
+        rerot_propagate_hard_abort();
+        return false;
+    }
+
+    // Topology-barrier refresh trigger (§17): after a frontier commits with a
+    // topology change, re-observe stable shared memory via a read-only
+    // context refresh (no public token write; recurrent checkpoint/restore
+    // handled inside llama_rerot_refresh_barrier when needed).
+    void rerot_on_topology_barrier(bool barrier) {
+        if (!rerot_active() || !barrier || ctx_tgt == nullptr) {
+            return;
+        }
+        if (!llama_rerot_refresh_barrier(ctx_tgt, rerot_episode_id)) {
+            rerot_propagate_hard_abort();
+        }
+    }
+
+    // Final-fence serial transition (§§21-22): rebuilds the survivor view on
+    // stable shared memory (acquire fence) then retires the parallel
+    // scheduler so ordinary tool-call / body decode continues from the fence
+    // survivor on the root response stream. Failures propagate as hard abort.
+    void rerot_on_final_fence(llama_rerot_node_id final_node) {
+        if (!rerot_active() || final_node == LLAMA_REROT_NODE_INVALID || ctx_tgt == nullptr) {
+            return;
+        }
+        std::vector<uint32_t> fence_runs;
+        if (!rerot->refresh_final_fence(rerot_episode_id, final_node, &fence_runs)) {
+            rerot_propagate_hard_abort();
+            return;
+        }
+        if (!rerot->complete_serial_tail(rerot_episode_id, final_node)) {
+            rerot_propagate_hard_abort();
+        }
+    }
+
+    // Hard-abort propagation (§20): whole-episode HARD_ABORT with
+    // finish_reason rerot_resource_exhausted. Releases all lane execution
+    // handles via the runtime (parked/archive lineage included), ends the
+    // context episode gate, and fails every lane slot with one explicit
+    // transport error (no pseudo final answer, single termination event).
+    void rerot_propagate_hard_abort() {
+        if (!rerot_active()) {
+            return;
+        }
+        const server_rerot_episode * ep = rerot->episode(rerot_episode_id);
+        const std::string reason = (ep && !ep->abort_reason.empty())
+            ? ep->abort_reason : "rerot_resource_exhausted";
+        rerot->hard_abort(rerot_episode_id, reason);
+        if (ctx_tgt != nullptr) {
+            llama_rerot_episode_end(ctx_tgt, rerot_episode_id);
+        }
+        for (auto & slot : slots) {
+            if (slot.rerot_internal && slot.rerot_episode_id == rerot_episode_id && slot.is_processing()) {
+                send_error(slot, "RERoT episode hard-aborted: " + reason, ERROR_TYPE_SERVER);
+                slot.release();
+            }
+        }
+        rerot->erase_episode(rerot_episode_id);
+        rerot_episode_id = 0;
+    }
+
+    // Episode-aware slot test (§A.11): a physical slot currently borrowed by
+    // the active episode must never be preempted/demoted/shifted alone.
+    bool rerot_owns_slot(int id_slot) const {
+        if (!rerot_active()) {
+            return false;
+        }
+        return rerot->episode_for_slot(id_slot) != nullptr;
+    }
+
     wanxiangqi_server_token_dump request_token_dump;
 
     server_metrics metrics;
@@ -1170,6 +1291,15 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // RERoT: end any active context episode gate before tearing down the
+        // context, then drop the runtime (which releases parked/archive
+        // lineage). OFF: both branches no-op.
+        if (rerot_active() && ctx_tgt != nullptr) {
+            llama_rerot_episode_end(ctx_tgt, rerot_episode_id);
+        }
+        rerot.reset();
+        rerot_episode_id = 0;
+
         spec.reset();
         spec_init.reset();
 
@@ -1586,6 +1716,23 @@ private:
             slot.reset();
         }
 
+        // RERoT runtime holder (OFF: stays null, every hook below no-ops).
+        // Logical seq arena is LLAMA_MAX_SEQ; physical recurrent capacity
+        // stays at n_parallel (see common.cpp wiring). Internal parked/
+        // archive ids allocate from [n_parallel, LLAMA_MAX_SEQ).
+        if (params_base.rerot_enabled) {
+            llama_memory_t mem = ctx_tgt != nullptr ? llama_get_memory(ctx_tgt) : nullptr;
+            rerot = std::make_unique<server_rerot_runtime>(
+                mem, params_base.rerot_frontier,
+                (uint32_t) std::max(0, params_base.n_parallel), (uint32_t) LLAMA_MAX_SEQ);
+            rerot_episode_id = 0;
+            SRV_INF("RERoT runtime armed (frontier=%s)\n",
+                llama_rerot_frontier_mode_name(params_base.rerot_frontier));
+        } else {
+            rerot.reset();
+            rerot_episode_id = 0;
+        }
+
         {
             const char * LLAMA_TRACE = getenv("LLAMA_TRACE");
             trace = LLAMA_TRACE ? atoi(LLAMA_TRACE) : 0;
@@ -1995,6 +2142,14 @@ private:
             if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
                 continue;
             }
+            // RERoT episode-aware idle demotion (§A.11.2): the episode is the
+            // minimum reliable unit. Never demote a single Lane slot alone;
+            // idle slots never belong to an active episode (lanes are
+            // processing, queued children hold no physical slot), so this
+            // only skips on a race. OFF: rerot_owns_slot false.
+            if (rerot_owns_slot(slot.id)) {
+                continue;
+            }
             if (victim == nullptr || slot.t_last_used < victim->t_last_used) {
                 victim = &slot;
             }
@@ -2023,6 +2178,16 @@ private:
 
         for (auto & slot : slots) {
             if (slot.id == id_slot_protected || slot.state != SLOT_STATE_GENERATING || !slot.task) {
+                continue;
+            }
+            // RERoT episode-aware active preemption (§A.11.1/A.27): never
+            // leave an orphan Lane. A borrowed Lane slot is not independently
+            // preemptible; the whole episode is the resource unit (freeze /
+            // cancel all writers, release all exec/parked/pending handles
+            // together via rerot_propagate_hard_abort or a whole-episode
+            // retry). Skipping here forces the pressure planner to treat the
+            // episode as one atomic victim. OFF: false.
+            if (rerot_owns_slot(slot.id)) {
                 continue;
             }
             ++n_preemptible;
@@ -2082,6 +2247,16 @@ private:
 
     bool preempt_slot(server_slot & slot) {
         if (!slot.task || slot.state != SLOT_STATE_GENERATING) {
+            return false;
+        }
+
+        // RERoT: refuse single-Lane preemption (§A.11.1). Whole-episode
+        // handling lives in rerot_propagate_hard_abort / future whole-episode
+        // retry; preempting one Lane would orphan siblings and leak
+        // parked/archive lineage. OFF: false.
+        if (rerot_owns_slot(slot.id)) {
+            SLT_WRN(slot, "%s", "refusing single-Lane preemption while a RERoT episode is active "
+                "(whole-episode unit; use rerot_propagate_hard_abort)\n");
             return false;
         }
 
@@ -3321,6 +3496,15 @@ private:
                         break;
                     }
 
+                    // RERoT v1 refusal (§§25,A.8): no per-slot persist of an
+                    // active episode Lane (tree/run/epoch/parked/archive/MTP
+                    // lineage has no versioned format yet). OFF: false.
+                    if (rerot_owns_slot(id_slot)) {
+                        send_error(task, "RERoT episode active: manual slot save is unsupported in v1 "
+                            "(no versioned RERoT state with REROT_STATE_MAGIC/VERSION + fingerprint)", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
                     const int64_t t_start = ggml_time_us();
 
                     std::string filename = task.slot_action.filename;
@@ -3355,6 +3539,15 @@ private:
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    // RERoT v1 refusal (§§25,A.8): no manual restore into an
+                    // active episode Lane; future restores must match
+                    // REROT_STATE_MAGIC/VERSION + model/rope/Tri fingerprint.
+                    // OFF: false.
+                    if (rerot_owns_slot(id_slot)) {
+                        send_error(task, "RERoT episode active: manual slot restore is unsupported in v1", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
 
@@ -3490,6 +3683,13 @@ private:
     void abort_all_slots(const std::string & reason) {
         retry_states.clear();
 
+        // RERoT hard-abort propagation (§20): a fatal scheduler error while
+        // an episode is active must not leave parked/archive lineage or a
+        // context episode gate behind. OFF: rerot_active false, no change.
+        if (rerot_active()) {
+            rerot_propagate_hard_abort();
+        }
+
         for (auto & slot : slots) {
             if (slot.is_processing()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
@@ -3606,6 +3806,13 @@ private:
 
         update_inference_mode();
 
+        // RERoT frontier entry (§§19.3,20): one frontier is one atomic budget
+        // unit; when hard limits are crossed the whole episode HARD_ABORTs
+        // here instead of running a partial Lane subset. OFF: no-op true.
+        if (!rerot_frontier_enter()) {
+            return;
+        }
+
         if (!ensure_next_kv_capacity()) {
             return;
         }
@@ -3680,6 +3887,28 @@ private:
                 break; // stop any further processing
             }
         }
+
+        // RERoT barrier/fence poll (Stage 7, §§17,21): all gates inside are
+        // episode-active checks, so OFF costs one null + one zero compare.
+        // The full per-token frontier loop (plan/commit/finish_frontier) will
+        // drive these flags; this poll only ensures a pending barrier still
+        // refreshes read-only logits and a finalized single survivor still
+        // takes the acquire fence + serial-tail transition even if the loop
+        // lands in a later slice.
+        if (rerot_active()) {
+            if (const server_rerot_episode * ep = rerot_active_episode()) {
+                if (ep->topology_barrier_pending && !ep->hard_aborted && !ep->serial_tail) {
+                    rerot_on_topology_barrier(true);
+                }
+                if (ep->finalizing && !ep->hard_aborted && !ep->serial_tail &&
+                    ep->ready_queue.empty() && ep->starting.empty() && ep->running.size() == 1) {
+                    rerot_on_final_fence(*ep->running.begin());
+                }
+                if (ep->hard_aborted) {
+                    rerot_propagate_hard_abort();
+                }
+            }
+        }
     }
 
     void pre_decode() {
@@ -3707,6 +3936,18 @@ private:
 
                 if (slot.task->is_parent() || slot.task->is_child()) {
                     send_error(slot, "context shift cannot be used for shared prompt", ERROR_TYPE_SERVER);
+                    slot.release();
+                    return;
+                }
+
+                // RERoT v1 refusal (§§25,A.9): no linear seq_rm/seq_add shift
+                // on an active episode Lane. Shared history needs episode-aware
+                // semantic truncation (oldest PUBLIC region dropped for all
+                // readers + run-table repack + layout/publish bump + MTP
+                // invalidation, recurrent state never rewritten). OFF: false.
+                if (rerot_owns_slot(slot.id)) {
+                    send_error(slot, "RERoT episode active: context shift is unsupported in v1 "
+                        "(needs shared-memory log truncation with layout/publish bump, not linear shift)", ERROR_TYPE_SERVER);
                     slot.release();
                     return;
                 }
@@ -3783,6 +4024,35 @@ private:
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
 
                 if (!slot.token_append_chunk.empty()) {
+                    return;
+                }
+
+                // RERoT MTP compat (§A.6): drafts bind to the reader view
+                // stamp (topology/publish/layout). While a Lane borrows this
+                // slot, a stale draft (peer PUBLIC commit / topology or
+                // layout change since draft time) must be invalidated with
+                // checkpoint restore before any new draft. v1 prototype also
+                // forces n_draft_max=0 for episode Lanes (frontier-local
+                // speculative only); the stale check below stays so the
+                // epoch-aware path is already wired when drafting re-enables.
+                // OFF: rerot_owns_slot false, no behavior change.
+                if (rerot_owns_slot(slot.id)) {
+                    if (slot.rerot_has_draft_stamp && ctx_tgt != nullptr &&
+                        llama_rerot_mtp_is_stale(ctx_tgt, slot.id, &slot.rerot_draft_stamp)) {
+                        // Stale: restore checkpoint, drop uncommitted draft
+                        // KV/recurrent, re-draft from the latest view next
+                        // frontier (here: just drop; next frontier re-drafts).
+                        slot.spec_ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        if (slot.ctx_dft) {
+                            slot.spec_ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        }
+                        common_speculative_set_state(spec.get(), slot.id, slot.spec_ckpt.data_spec);
+                        slot.mem.seq_rm(slot.id, slot.spec_ckpt.pos_max + 1, -1);
+                        slot.spec_draft.clear();
+                        slot.spec_i_batch.clear();
+                        slot.rerot_has_draft_stamp = false;
+                    }
+                    // v1: no cross-frontier speculative window for RERoT lanes.
                     return;
                 }
 
@@ -4022,9 +4292,17 @@ private:
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
+                                // RERoT compat (§A.10.3): ordinary chunk-reuse
+                                // shifting is only legal on serial prefixes /
+                                // frozen ordinary coordinates, never on active
+                                // DDVR PUBLIC runs. llama_memory_can_shift
+                                // already returns false while an episode is
+                                // active; this explicit lane check keeps the
+                                // refusal obvious at the call site. OFF: false.
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                    !slot.prompt.tokens.has_mtmd &&
+                                    !rerot_owns_slot(slot.id);
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
@@ -4736,6 +5014,24 @@ private:
         // speculative decoding - main model sample and accept
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
+                return;
+            }
+
+            // RERoT MTP epoch invalidation (§A.6): a draft bound to an old
+            // view stamp must not verify against new shared memory. Drop it,
+            // restore the checkpoint, and re-draft next frontier. OFF: false.
+            if (rerot_owns_slot(slot.id) && slot.rerot_has_draft_stamp && ctx_tgt != nullptr &&
+                llama_rerot_mtp_is_stale(ctx_tgt, slot.id, &slot.rerot_draft_stamp)) {
+                slot.spec_ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (slot.ctx_dft) {
+                    slot.spec_ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                }
+                common_speculative_set_state(spec.get(), slot.id, slot.spec_ckpt.data_spec);
+                slot.mem.seq_rm(slot.id, slot.spec_ckpt.pos_max + 1, -1);
+                slot.prompt.tokens.keep_first(slot.spec_ckpt.n_tokens);
+                slot.spec_draft.clear();
+                slot.spec_i_batch.clear();
+                slot.rerot_has_draft_stamp = false;
                 return;
             }
 

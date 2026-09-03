@@ -10,6 +10,8 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <algorithm>
+
 using json = nlohmann::ordered_json;
 
 //
@@ -83,6 +85,9 @@ json task_params::to_json(bool only_metrics) const {
             {"post_sampling_probs",       post_sampling_probs},
             {"backend_sampling",          sampling.backend_sampling},
             {"lora",                      lora},
+            {"rerot_enabled",             rerot_enabled},
+            {"rerot_frontier",            std::string(llama_rerot_frontier_mode_name(rerot_frontier))},
+            {"rerot_trace",               rerot_trace},
         };
     }
 
@@ -142,7 +147,304 @@ json task_params::to_json(bool only_metrics) const {
         {"post_sampling_probs",       post_sampling_probs},
         {"backend_sampling",          sampling.backend_sampling},
         {"lora",                      lora},
+        {"rerot_enabled",             rerot_enabled},
+        {"rerot_frontier",            std::string(llama_rerot_frontier_mode_name(rerot_frontier))},
+        {"rerot_trace",               rerot_trace},
     };
+}
+
+// RERoT outer compatibility (§§18,26,A.13-A.20)
+//
+
+void task_params::apply_rerot_defaults(const common_params & base) {
+    if (!base.rerot_enabled) {
+        return; // OFF stays OFF: no allocation, no state change beyond defaults
+    }
+    rerot_enabled = base.rerot_enabled;
+    rerot_frontier = base.rerot_frontier;
+    rerot_trace = base.rerot_trace;
+}
+
+bool task_params::rerot_effective(server_task_type task_type) const {
+    if (!rerot_enabled) {
+        return false;
+    }
+    // A.19: embedding/rerank (and any non-generation path) never enters RERoT
+    // even when globally enabled. COMPLETION/INFILL stay eligible; multimodal
+    // prompts stay eligible via prelude-then-fork (A.18).
+    switch (task_type) {
+        case SERVER_TASK_TYPE_EMBEDDING:
+        case SERVER_TASK_TYPE_RERANK:
+            return false;
+        default:
+            return true;
+    }
+}
+
+bool task_params::rerot_validate_request(server_task_type task_type, bool has_media, std::string & error) const {
+    (void) has_media; // multimodal is allowed (prelude-then-fork, A.18): no gate
+    if (!rerot_enabled) {
+        return true; // OFF: no-op, no allocation
+    }
+    if (!rerot_effective(task_type)) {
+        return true; // A.19: silently inert for embedding/rerank, not an error
+    }
+    // Stage-0 gates for the effective path mirror the CLI gate. Tri/MTP/
+    // context-shift stay rejected until ContextGlue relaxes them; only this
+    // function (and common_rerot_validate_stage0) changes then.
+    for (const auto t : speculative.types) {
+        if (t != COMMON_SPECULATIVE_TYPE_NONE) {
+            error = "RERoT + speculative decoding is not yet supported for this request (Stage-0 gate §§24/A.6; ContextGlue pending)";
+            return false;
+        }
+    }
+    if (n_cache_reuse != 0) {
+        error = "RERoT + KV-shift cache reuse (n_cache_reuse) is not yet supported for this request (Stage-0 gate §§25/A.9-A.10; ContextGlue pending)";
+        return false;
+    }
+    // ctx_shift / TriAttention globals are validated at startup via
+    // common_rerot_validate_stage0; per-request speculative/cache-reuse above
+    // covers the request-overridable surface. Tool/grammar/LoRA checks live
+    // in their dedicated helpers below.
+    return true;
+}
+
+bool server_rerot_metrics::empty() const {
+    return episode_total == 0 && episode_active == 0
+        && nodes_created == 0 && nodes_started == 0 && nodes_retired == 0 && nodes_queued == 0
+        && queue_max == 0 && forks_total == 0 && max_depth == 0 && max_live_lanes == 0
+        && public_tokens == 0 && private_tokens == 0 && pending_tokens == 0
+        && frontiers == 0 && topology_barriers == 0 && refresh_total == 0
+        && mtp_invalidations == 0 && context_shifts == 0
+        && hard_aborts == 0 && final_fences == 0
+        && span_count == 0 && parked_total == 0 && archive_total == 0
+        && ddvr_seconds == 0.0;
+}
+
+json server_rerot_metrics::to_json() const {
+    // Empty metrics must not be emitted (OFF: no metric emission). Callers
+    // check empty() first; this still returns a valid object when called.
+    return json {
+        { "rerot_episode_total",       episode_total },
+        { "rerot_episode_active",      episode_active },
+        { "rerot_nodes_created",       nodes_created },
+        { "rerot_nodes_started",       nodes_started },
+        { "rerot_nodes_retired",       nodes_retired },
+        { "rerot_nodes_queued",        nodes_queued },
+        { "rerot_queue_max",           queue_max },
+        { "rerot_forks_total",         forks_total },
+        { "rerot_max_depth",           max_depth },
+        { "rerot_max_live_lanes",      max_live_lanes },
+        { "rerot_public_tokens",       public_tokens },
+        { "rerot_private_tokens",      private_tokens },
+        { "rerot_pending_tokens",      pending_tokens },
+        { "rerot_frontiers",           frontiers },
+        { "rerot_topology_barriers",   topology_barriers },
+        { "rerot_refresh_total",       refresh_total },
+        { "rerot_mtp_invalidations",   mtp_invalidations },
+        { "rerot_context_shifts",      context_shifts },
+        { "rerot_hard_aborts",         hard_aborts },
+        { "rerot_final_fences",        final_fences },
+        { "rerot_span_count",          span_count },
+        { "rerot_parked_total",        parked_total },
+        { "rerot_archive_total",       archive_total },
+        { "rerot_ddvr_seconds",        ddvr_seconds },
+    };
+}
+
+void server_rerot_metrics::accumulate(const server_rerot_metrics & delta) {
+    if (delta.empty()) {
+        return; // OFF/no-op delta: no work
+    }
+    episode_total       += delta.episode_total;
+    episode_active       = delta.episode_active; // gauge: last writer wins
+    nodes_created       += delta.nodes_created;
+    nodes_started       += delta.nodes_started;
+    nodes_retired       += delta.nodes_retired;
+    nodes_queued        += delta.nodes_queued;
+    queue_max            = std::max(queue_max, delta.queue_max);
+    forks_total         += delta.forks_total;
+    max_depth            = std::max(max_depth, delta.max_depth);
+    max_live_lanes       = std::max(max_live_lanes, delta.max_live_lanes);
+    public_tokens       += delta.public_tokens;
+    private_tokens      += delta.private_tokens;
+    pending_tokens      += delta.pending_tokens;
+    frontiers           += delta.frontiers;
+    topology_barriers   += delta.topology_barriers;
+    refresh_total       += delta.refresh_total;
+    mtp_invalidations   += delta.mtp_invalidations;
+    context_shifts      += delta.context_shifts;
+    hard_aborts         += delta.hard_aborts;
+    final_fences        += delta.final_fences;
+    span_count          += delta.span_count;
+    parked_total        += delta.parked_total;
+    archive_total       += delta.archive_total;
+    ddvr_seconds        += delta.ddvr_seconds;
+}
+
+server_rerot_episode_key server_task::rerot_key() const {
+    return server_rerot_episode_key { id, rerot_episode_id, rerot_generation };
+}
+
+bool server_task::rerot_key_matches(int task, uint64_t episode, uint64_t gen) const {
+    if (rerot_episode_id == 0) {
+        return false; // no episode: every callback key is stale by definition
+    }
+    return id == task && rerot_episode_id == episode && rerot_generation == gen;
+}
+
+void server_task::rerot_bump_generation() {
+    ++rerot_generation;
+    for (auto & child : child_tasks) {
+        ++child.rerot_generation;
+    }
+}
+
+void server_task::assign_rerot_episodes(uint64_t & next_episode_id, uint64_t generation) {
+    if (!params.rerot_effective(type)) {
+        return; // OFF or A.19-inert: leave every episode id at 0, no allocation
+    }
+    if (next_episode_id == 0) {
+        next_episode_id = 1;
+    }
+    rerot_generation = generation;
+    rerot_episode_id = next_episode_id++;
+    if (rerot_episode_id == 0) {
+        rerot_episode_id = next_episode_id++; // never hand out episode 0 (means "none")
+    }
+    for (auto & child : child_tasks) {
+        child.rerot_generation = generation;
+        child.rerot_episode_id = next_episode_id++;
+        if (child.rerot_episode_id == 0) {
+            child.rerot_episode_id = next_episode_id++;
+        }
+    }
+    // Cross-check the visibility-domain invariant while we hold the ids:
+    // different outer completions in one n_cmpl group must never share an
+    // episode id (outer shared prompt cells stay shared as the untagged
+    // prefix; visibility diverges only via distinct episode ids).
+    GGML_ASSERT(child_tasks.empty() || rerot_episode_id != child_tasks.front().rerot_episode_id);
+}
+
+int server_task::rerot_response_owner() const {
+    // §18.3: the HTTP/SSE stream belongs to the outer completion task, never
+    // to an internal lane. Each outer completion (parent or child) owns its
+    // own response id; internal lanes map through this id and never emit.
+    return id;
+}
+
+bool server_task::rerot_effective() const {
+    return params.rerot_effective(type) && rerot_episode_id != 0;
+}
+
+common_grammar server_rerot_take_user_grammar(task_params & params) {
+    // A.16.1: snapshot the user/tool grammar before planner <ol> injection so
+    // the planner constraint can never pollute it. Cheap move, no parse.
+    common_grammar saved = std::move(params.sampling.grammar);
+    params.sampling.grammar = common_grammar{};
+    return saved;
+}
+
+void server_rerot_restore_user_grammar(task_params & params, const common_grammar & saved) {
+    // Restore the stock user/tool path after the final fence (§26). The planner
+    // grammar is discarded; the serial tail decodes with the original sampler.
+    params.sampling.grammar = saved;
+}
+
+bool server_rerot_tool_calls_allowed(bool serial_tail_done) {
+    // §26: no tool execution during concurrent reasoning; only the final
+    // acquire fence + serial tail restores the stock tool path. A new RERoT
+    // episode starts after tool results return; old episodes never revive.
+    return serial_tail_done;
+}
+
+bool server_rerot_check_lora_inheritance(
+    const std::vector<common_adapter_lora_info> & root_loras,
+    const std::vector<common_adapter_lora_info> & lane_loras,
+    std::string & error) {
+    // A.17.1: every lane inherits the identical adapter set/scale, otherwise
+    // shared PUBLIC KV would mix adapter domains. are_lora_equal compares
+    // (scale, ptr) per slot; OFF/empty sets are trivially compatible.
+    if (are_lora_equal(root_loras, lane_loras)) {
+        return true;
+    }
+    error = "RERoT LoRA mismatch: all lanes in one episode must use the identical adapter set/scale (A.17.1)";
+    return false;
+}
+
+bool server_rerot_can_batch_with(const task_params & a, const task_params & b) {
+    // A.17.3: the existing adapter batching constraint stays in force; never
+    // force incompatible LoRA requests into one RERoT batch. Different
+    // episodes may share a physical batch only when adapters are compatible:
+    // episode_id still separates their KV visibility domains.
+    if (a.lora.size() != b.lora.size()) {
+        return false;
+    }
+    for (const auto & kv : a.lora) {
+        const auto it = b.lora.find(kv.first);
+        if (it == b.lora.end() || it->second != kv.second) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool server_rerot_visual_remap_allowed() {
+    // A.18.1: DDVR remaps reasoning text runs only; visual spatial positions
+    // keep their native multi-axis layout. Always false by construction.
+    return false;
+}
+
+bool server_rerot_fork_ready(bool has_media, bool prelude_done) {
+    // A.18 prelude-then-fork: text-only requests fork immediately; multimodal
+    // requests fork only after the shared multimodal prefill prelude.
+    if (!has_media) {
+        return true;
+    }
+    return prelude_done;
+}
+
+bool server_rerot_trace_allowed(const task_params & params) {
+    // A.14.2: lane-trace visibility is opt-in only. Default off keeps the
+    // client contract at one assistant response, one finish event, [DONE].
+    return params.rerot_enabled && params.rerot_trace;
+}
+
+json server_rerot_trace_event(
+    const std::string & kind,
+    uint64_t episode_id,
+    uint64_t node_id,
+    uint64_t frontier,
+    const json & data) {
+    // Callers must check trace_allowed() first; this still guards so OFF
+    // never allocates event payloads beyond this small object.
+    if (episode_id == 0 || kind.empty()) {
+        return json(nullptr);
+    }
+    json evt = json {
+        { "type",       "rerot.trace." + kind },
+        { "episode_id", episode_id },
+        { "node_id",    node_id },
+        { "frontier",   frontier },
+    };
+    if (!data.is_null() && !data.empty()) {
+        evt["data"] = data;
+    }
+    return evt;
+}
+
+std::vector<int> server_rerot_cancel_targets(const server_task & root) {
+    // A.15: cancelling a RERoT request clears the whole episode atomically.
+    // OFF/unassigned roots yield just their own id (no extra allocation
+    // beyond the single entry). Shared outer prompt refs are preserved by the
+    // runtime when other requests still use them.
+    std::vector<int> ids;
+    ids.reserve(1 + root.child_tasks.size());
+    ids.push_back(root.id);
+    for (const auto & child : root.child_tasks) {
+        ids.push_back(child.id);
+    }
+    return ids;
 }
 
 //
@@ -1539,7 +1841,7 @@ json server_task_result_error::to_json() {
 // server_task_result_metrics
 //
 json server_task_result_metrics::to_json() {
-    return json {
+    json out = json {
         { "idle",                            n_idle_slots },
         { "processing",                      n_processing_slots },
         { "deferred",                        n_tasks_deferred },
@@ -1578,6 +1880,16 @@ json server_task_result_metrics::to_json() {
 
         { "slots",                           slots_data },
     };
+    // RERoT suite (§A.26) is additive to Tri metrics. OFF (empty) emits
+    // nothing: no allocation for the rerot block and the pre-RERoT schema is
+    // byte-identical. Tri key meanings are unchanged.
+    if (!rerot.empty()) {
+        const json rj = rerot.to_json();
+        for (const auto & kv : rj.items()) {
+            out[kv.key()] = kv.value();
+        }
+    }
+    return out;
 }
 
 //

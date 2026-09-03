@@ -37,6 +37,7 @@
 #include <cstring>
 #include <numeric>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 // For timing
@@ -1423,4 +1424,274 @@ void triattention_scorer::print_info(FILE * stream) const {
     fprintf(stream, "  Disable MLR:       %s\n", cfg.disable_mlr ? "on" : "off");
     fprintf(stream, "  Disable trig:      %s\n", cfg.disable_trig ? "on" : "off");
     fprintf(stream, "===========================\n\n");
+}
+
+// ============================================================================
+// RERoT shared-memory reclaim policy (Stage 10 part 1 — §§23, A.4)
+//
+// Pure helpers only: no KV access, no scoring, no metrics. The caller keeps
+// physical ownership (llama_kv_cells), visibility semantics (layout builder),
+// and tri_* accounting; these functions only make the keeper-deduped target,
+// the pressure gate, the phase order, and the sparse-safe view order
+// assertable in one place.
+// ============================================================================
+
+double tri_rerot_default_ratio() {
+    return 3.0 / 32.0;
+}
+
+uint32_t tri_rerot_target_retention(uint32_t logical_tokens, double ratio, uint32_t tail_guard) {
+    // Guard the ratio exactly like init_triattention(): finite (0, 1].
+    if (!(ratio > 0.0) || !(ratio <= 1.0) || ratio != ratio) {
+        ratio = tri_rerot_default_ratio();
+    }
+    const double scaled = (double) logical_tokens * ratio;
+    uint32_t target = (uint32_t) ceil(scaled);
+    if (target < tail_guard) {
+        target = tail_guard;
+    }
+    return target;
+}
+
+tri_rerot_pressure tri_rerot_classify_pressure(bool kv_pressure, bool recurrent_pressure, bool maintenance_due) {
+    if (kv_pressure && recurrent_pressure) {
+        return TRI_REROT_PRESSURE_BOTH;
+    }
+    if (kv_pressure) {
+        return TRI_REROT_PRESSURE_KV;
+    }
+    if (recurrent_pressure) {
+        return TRI_REROT_PRESSURE_RECURRENT;
+    }
+    if (maintenance_due) {
+        return TRI_REROT_PRESSURE_MAINTENANCE;
+    }
+    return TRI_REROT_PRESSURE_NONE;
+}
+
+bool tri_rerot_should_reclaim(bool kv_pressure, bool recurrent_pressure, bool maintenance_due) {
+    // TriAttention reclaims KV cells only. Recurrent-only pressure must flow
+    // to the recurrent/atomic fallback without scoring or evicting anything.
+    (void) recurrent_pressure;
+    return kv_pressure || maintenance_due;
+}
+
+tri_rerot_phase tri_rerot_phase_after_reclaim(bool changed, bool floor_reached, bool capacity_satisfied) {
+    if (!changed) {
+        return TRI_REROT_PHASE_FLOOR_EXHAUSTED;
+    }
+    if (floor_reached && !capacity_satisfied) {
+        return TRI_REROT_PHASE_FLOOR_EXHAUSTED;
+    }
+    return TRI_REROT_PHASE_STICKY;
+}
+
+const char * tri_rerot_phase_name(tri_rerot_phase phase) {
+    switch (phase) {
+        case TRI_REROT_PHASE_FILL_FIRST:      return "fill-first";
+        case TRI_REROT_PHASE_DRAIN_TO_FLOOR:  return "drain-to-floor";
+        case TRI_REROT_PHASE_STICKY:          return "sticky";
+        case TRI_REROT_PHASE_FLOOR_EXHAUSTED: return "floor-exhausted";
+        case TRI_REROT_PHASE_ATOMIC_FALLBACK: return "atomic-fallback";
+        default:                              return "unknown";
+    }
+}
+
+uint32_t tri_rerot_dedup_candidates(
+    const uint32_t * cells,
+    const int32_t  * positions,
+    uint32_t n,
+    uint32_t * out_cells,
+    int32_t  * out_positions) {
+    if (n == 0) {
+        return 0;
+    }
+    if (cells == nullptr || positions == nullptr) {
+        return 0;
+    }
+    std::unordered_set<uint32_t> seen;
+    seen.reserve((size_t) n * 2);
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!seen.insert(cells[i]).second) {
+            continue;  // same physical cell via another keeper ref: score once
+        }
+        if (out_cells != nullptr) {
+            out_cells[kept] = cells[i];
+        }
+        if (out_positions != nullptr) {
+            out_positions[kept] = positions[i];
+        }
+        ++kept;
+    }
+    return kept;
+}
+
+uint32_t tri_rerot_count_distinct_positions(const int32_t * positions, uint32_t n) {
+    if (n == 0 || positions == nullptr) {
+        return 0;
+    }
+    std::unordered_set<int32_t> seen;
+    seen.reserve((size_t) n * 2);
+    for (uint32_t i = 0; i < n; ++i) {
+        seen.insert(positions[i]);
+    }
+    return (uint32_t) seen.size();
+}
+
+void tri_rerot_order_by_storage(
+    const int32_t  * storage_pos,
+    const uint64_t * frontier_or_null,
+    const uint32_t * cells_or_null,
+    uint32_t n,
+    uint32_t * order) {
+    if (n == 0) {
+        return;
+    }
+    if (storage_pos == nullptr || order == nullptr) {
+        return;
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+        order[i] = i;
+    }
+    std::stable_sort(order, order + n, [&](uint32_t a, uint32_t b) {
+        if (storage_pos[a] != storage_pos[b]) {
+            return storage_pos[a] < storage_pos[b];
+        }
+        const uint64_t fa = frontier_or_null != nullptr ? frontier_or_null[a] : 0;
+        const uint64_t fb = frontier_or_null != nullptr ? frontier_or_null[b] : 0;
+        if (fa != fb) {
+            return fa < fb;
+        }
+        const uint32_t ca = cells_or_null != nullptr ? cells_or_null[a] : a;
+        const uint32_t cb = cells_or_null != nullptr ? cells_or_null[b] : b;
+        if (ca != cb) {
+            return ca < cb;
+        }
+        return a < b;
+    });
+}
+
+bool tri_rerot_policy_selfcheck() {
+    // 1. Archive/exec/parked fan-out must not inflate the scored set: one
+    //    PUBLIC cell held by three keeper refs folds to one candidate.
+    {
+        const uint32_t cells[]     = { 5, 5, 5, 9 };
+        const int32_t  positions[] = { 42, 42, 42, 43 };
+        uint32_t out_cells[4] = {};
+        int32_t  out_pos[4]   = {};
+        const uint32_t kept = tri_rerot_dedup_candidates(cells, positions, 4, out_cells, out_pos);
+        if (kept != 2 || out_cells[0] != 5 || out_cells[1] != 9 ||
+            out_pos[0] != 42 || out_pos[1] != 43) {
+            fprintf(stderr, "[TriAttention] selfcheck: keeper-ref dedup failed (kept=%u)\n", kept);
+            return false;
+        }
+        // Counting mode (null outputs) must agree.
+        if (tri_rerot_dedup_candidates(cells, positions, 4, nullptr, nullptr) != 2) {
+            fprintf(stderr, "[TriAttention] selfcheck: dedup counting mode failed\n");
+            return false;
+        }
+    }
+
+    // 2. Target sizes over distinct logical history, not ref multiplicity:
+    //    the triple-held cell above is one logical token, not three.
+    {
+        const int32_t positions[] = { 42, 42, 42, 43 };
+        if (tri_rerot_count_distinct_positions(positions, 4) != 2) {
+            fprintf(stderr, "[TriAttention] selfcheck: distinct-position count failed\n");
+            return false;
+        }
+        // 320 logical tokens at 3/32 keep 30, raised to the 128 tail guard;
+        // 2048 logical tokens keep 192. Keeper refs never enter this path.
+        if (tri_rerot_target_retention(320, tri_rerot_default_ratio(), 128) != 128) {
+            fprintf(stderr, "[TriAttention] selfcheck: floor target failed\n");
+            return false;
+        }
+        if (tri_rerot_target_retention(2048, tri_rerot_default_ratio(), 128) != 192) {
+            fprintf(stderr, "[TriAttention] selfcheck: ratio target failed\n");
+            return false;
+        }
+        // Degenerate ratio falls back to the configured floor instead of 0.
+        if (tri_rerot_target_retention(2048, 0.0, 128) != 192) {
+            fprintf(stderr, "[TriAttention] selfcheck: ratio fallback failed\n");
+            return false;
+        }
+    }
+
+    // 3. Recurrent-only pressure never triggers Tri reclaim; KV pressure and
+    //    sticky maintenance do; idle does nothing.
+    {
+        if (tri_rerot_should_reclaim(false, true, false)) {
+            fprintf(stderr, "[TriAttention] selfcheck: recurrent-only pressure must not reclaim\n");
+            return false;
+        }
+        if (!tri_rerot_should_reclaim(true, false, false) ||
+            !tri_rerot_should_reclaim(true, true, false) ||
+            !tri_rerot_should_reclaim(false, false, true)) {
+            fprintf(stderr, "[TriAttention] selfcheck: KV/maintenance pressure must reclaim\n");
+            return false;
+        }
+        if (tri_rerot_should_reclaim(false, false, false)) {
+            fprintf(stderr, "[TriAttention] selfcheck: idle must not reclaim\n");
+            return false;
+        }
+        if (tri_rerot_classify_pressure(false, true, false) != TRI_REROT_PRESSURE_RECURRENT ||
+            tri_rerot_classify_pressure(true, true, false)  != TRI_REROT_PRESSURE_BOTH ||
+            tri_rerot_classify_pressure(false, false, true) != TRI_REROT_PRESSURE_MAINTENANCE ||
+            tri_rerot_classify_pressure(false, false, false) != TRI_REROT_PRESSURE_NONE) {
+            fprintf(stderr, "[TriAttention] selfcheck: pressure classification failed\n");
+            return false;
+        }
+    }
+
+    // 4. Phase order: satisfying reclaim parks at sticky; empty or
+    //    floor-without-capacity advances to floor-exhausted (caller fallback).
+    {
+        if (tri_rerot_phase_after_reclaim(true, true, true) != TRI_REROT_PHASE_STICKY ||
+            tri_rerot_phase_after_reclaim(false, true, false) != TRI_REROT_PHASE_FLOOR_EXHAUSTED ||
+            tri_rerot_phase_after_reclaim(true, true, false) != TRI_REROT_PHASE_FLOOR_EXHAUSTED) {
+            fprintf(stderr, "[TriAttention] selfcheck: phase transition failed\n");
+            return false;
+        }
+    }
+
+    // 5. Reclaim-then-view: sparse storage (gaps, no continuity) orders by
+    //    storage_pos and packs dense virtual [0, L); evicting one resident
+    //    and re-enumerating keeps the remainder dense with no span holes.
+    {
+        const int32_t  storage[]  = { 100, 5, 50, 7 };
+        const uint64_t frontier[] = { 3, 1, 2, 1 };
+        const uint32_t cells[]    = { 11, 4, 8, 6 };
+        uint32_t order[4] = {};
+        tri_rerot_order_by_storage(storage, frontier, cells, 4, order);
+        // Expect storage order 5(c4,f1), 7(c6,f1), 50(c8,f2), 100(c11,f3).
+        const uint32_t expect[] = { 1, 3, 2, 0 };
+        for (uint32_t r = 0; r < 4; ++r) {
+            if (order[r] != expect[r]) {
+                fprintf(stderr, "[TriAttention] selfcheck: sparse order failed at rank %u\n", r);
+                return false;
+            }
+        }
+        // Dense virtual pack: rank index itself; storage gaps vanish.
+        for (uint32_t v = 0; v < 4; ++v) {
+            if (order[v] >= 4) {
+                fprintf(stderr, "[TriAttention] selfcheck: virtual pack out of range\n");
+                return false;
+            }
+        }
+        // Simulate post-reclaim residents (storage 50 evicted): the view
+        // re-enumerates only survivors and stays dense [0, 3).
+        const int32_t storage2[] = { 100, 5, 7 };
+        uint32_t order2[3] = {};
+        tri_rerot_order_by_storage(storage2, nullptr, nullptr, 3, order2);
+        const uint32_t expect2[] = { 1, 2, 0 };
+        for (uint32_t r = 0; r < 3; ++r) {
+            if (order2[r] != expect2[r]) {
+                fprintf(stderr, "[TriAttention] selfcheck: post-reclaim repack failed\n");
+                return false;
+            }
+        }
+    }
+
+    return true;
 }

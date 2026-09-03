@@ -135,10 +135,14 @@ struct llama_memory_i {
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
 
-    // Component-selective operations used by RERoT. Attention-only memory is
-    // the common case, so the default delegates to the ordinary sequence op;
-    // recurrent-only defaults to a successful no-op. Recurrent and hybrid
-    // memory implementations override these methods explicitly.
+    // Component-selective operations used by RERoT (§6.3). Attention-only
+    // memory is the common case, so the default delegates to the ordinary
+    // sequence op; recurrent-only defaults to a successful no-op. Recurrent
+    // and hybrid memory implementations override these methods explicitly
+    // (hybrid forwards each side to its sub-memory). The inapplicable side
+    // must stay vacuously successful: release paths call both sides
+    // unconditionally, so a failure default would break retire on
+    // single-component memories.
     virtual bool seq_rm_attention(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         return seq_rm(seq_id, p0, p1);
     }

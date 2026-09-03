@@ -86,8 +86,11 @@ struct llama_rerot_run {
     llama_pos storage_pos0 = 0;
     uint32_t token_count = 0;
 
-    // Zero means that the run has not crossed a publication barrier. Normal
-    // and private runs do not require a non-zero publish epoch.
+    // Publication-epoch contract (enforced by append_run and validate,
+    // mirroring the KV cell rules): public_live requires a non-zero publish
+    // epoch, while normal, private_control, and pending_record require zero.
+    // A pending run becomes public only through publish_run/reclassify_run,
+    // which assign the epoch atomically with the visibility change.
     uint64_t publish_epoch = 0;
 };
 
@@ -107,6 +110,13 @@ struct llama_rerot_node {
 };
 
 struct llama_rerot_view_run {
+    // Logical span triple (run_id, virtual_pos0, token_count) flattened from
+    // one PAC-DFS reader view. This struct is the only view-to-layout input
+    // and MUST never carry physical KV indices (cell/key/seq ids): the KV
+    // cache resolves run_ids to resident cells itself, so TriAttention
+    // compaction never invalidates a previously built view. The remaining
+    // fields mirror the source run for span flattening without consulting
+    // physical state.
     llama_rerot_run_id run_id = LLAMA_REROT_RUN_INVALID;
     llama_rerot_node_id owner = LLAMA_REROT_NODE_INVALID;
 
@@ -249,9 +259,23 @@ public:
     bool is_ancestor(llama_rerot_node_id ancestor, llama_rerot_node_id descendant) const;
     std::vector<uint32_t> tree_path(llama_rerot_node_id node_id) const;
 
+    // Path-Anchored Cyclic DFS render of the whole tree for one reader: at
+    // every node on the reader path the reader-branch child renders last and
+    // preceding/following siblings keep document order; off-path subtrees
+    // render in stable document order. The render depends only on tree
+    // topology, run ownership/visibility, and token counts -- never on node
+    // scheduling state (queued/running/retired) or queue order. Output runs
+    // densely tile virtual positions [0, L) with each visible run exactly
+    // once; query_virtual_pos == L. Throws std::out_of_range for an unknown
+    // reader.
     llama_rerot_reader_view build_view(llama_rerot_node_id reader) const;
 
-    // Returns false and optionally describes the first violated invariant.
+    // Verifies episode/node/run id density and backlinks, the
+    // publish-epoch/visibility contract, and -- for EVERY node as reader --
+    // PAC-DFS density ([0, L), no overlap), exactly-once/completeness of
+    // visible runs, view/source field fidelity, and sibling-block ordering
+    // with own-subtree-last. Returns false and describes the first violated
+    // invariant.
     bool validate(std::string * error = nullptr) const;
 
 private:

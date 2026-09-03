@@ -236,6 +236,39 @@ public:
         llama_rerot_run_id run_id,
         llama_seq_id seq_id) override;
 
+    // Physical lookup of one logical run across all streams. Appends
+    // (stream, cell) pairs in (stream, cell) order and returns the count.
+    // KV-internal: the server scheduler stores run ids only and must never
+    // cache physical indices across compaction, eviction, or restore.
+    size_t rerot_find_run_cells(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        std::vector<std::pair<uint32_t, uint32_t>> * out) const;
+
+    // Attention-only archive freeze (§7.2) for one execution sequence: every
+    // PUBLIC_LIVE resident cell of episode_id referenced by exec_seq gains
+    // archive_seq as keeper, then exec_seq is fully released. No K/V data
+    // moves and visibility metadata is untouched. The returned kept count
+    // may be zero (e.g. purely private history) while exec_seq is still
+    // released. Returns 0 without touching anything when the ids are
+    // invalid, cross different streams, or address a view cache.
+    bool rerot_can_freeze_to_archive(
+        uint64_t episode_id,
+        llama_seq_id exec_seq,
+        llama_seq_id archive_seq,
+        size_t * count) const;
+
+    size_t rerot_freeze_to_archive(
+        uint64_t episode_id,
+        llama_seq_id exec_seq,
+        llama_seq_id archive_seq);
+
+    // v1 persistence guard (§5.5/§25): true when saving seq_id (or the whole
+    // cache for -1) would silently drop RERoT classification, in which case
+    // state_write() refuses with an explicit error instead. Ordinary,
+    // untagged state never triggers this.
+    bool rerot_blocks_state_save(llama_seq_id seq_id) const;
+
     bool rerot_set_reader_view(llama_seq_id seq_id, const llama_rerot_reader_state & view) override;
     void rerot_clear_reader_view(llama_seq_id seq_id) override;
 

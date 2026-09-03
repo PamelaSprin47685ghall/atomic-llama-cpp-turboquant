@@ -216,6 +216,13 @@ llama_rerot_run_id llama_rerot_document::append_run(
     if (storage_pos0 < 0) {
         throw std::invalid_argument("RERoT storage positions must be non-negative");
     }
+    // Publication-epoch contract, mirroring reclassify_run and the KV cell
+    // rules: only public_live carries a non-zero epoch; pending runs gain
+    // theirs atomically at publish/reclassify time.
+    const bool wants_epoch = visibility == llama_rerot_visibility::public_live;
+    if (wants_epoch == (publish_epoch == 0)) {
+        throw std::invalid_argument("RERoT run publish epoch does not match its visibility");
+    }
 
     llama_rerot_run run;
     run.id = static_cast<llama_rerot_run_id>(runs_.size());
@@ -428,6 +435,9 @@ bool llama_rerot_document::validate(std::string * error) const {
         if (current.id != i) {
             return set_error(error, "node ids must be dense and stable");
         }
+        if (static_cast<uint8_t>(current.state) > static_cast<uint8_t>(llama_rerot_node_state::retired)) {
+            return set_error(error, "node state is out of range");
+        }
         if (i != 0) {
             if (current.parent >= nodes_.size()) {
                 return set_error(error, "node parent is out of range");
@@ -471,32 +481,123 @@ bool llama_rerot_document::validate(std::string * error) const {
         if (current.storage_pos0 < 0) {
             return set_error(error, "run storage position must be non-negative");
         }
-        if (current.visibility == llama_rerot_visibility::pending_record && current.publish_epoch != 0) {
-            return set_error(error, "pending run cannot have a publish epoch");
+        // Publication-epoch contract: only public_live carries a non-zero
+        // epoch; pending runs gain theirs atomically at publish time.
+        const bool has_epoch = current.publish_epoch != 0;
+        const bool wants_epoch = current.visibility == llama_rerot_visibility::public_live;
+        if (has_epoch != wants_epoch) {
+            return set_error(error, "run publish epoch does not match its visibility");
         }
     }
 
-    for (const auto & current : nodes_) {
-        if (!current.children.empty()) {
-            continue;
+    // PAC-DFS verification with every node as reader: dense virtual positions
+    // [0, L) with no overlap, each visible run exactly once, view/source
+    // field fidelity, and sibling-block ordering with the reader branch last.
+    // Scheduling state is deliberately not consulted: the render must be
+    // queue-independent.
+    for (const auto & reader_node : nodes_) {
+        const auto reader = reader_node.id;
+        const auto view = build_view(reader);
+        if (view.episode_id != episode_id_ || view.reader != reader) {
+            return set_error(error, "reader view carries the wrong episode or reader");
         }
-        const auto view = build_view(current.id);
-        llama_pos expected = 0;
-        std::unordered_set<llama_rerot_run_id> visible_runs;
+        std::unordered_set<llama_rerot_run_id> expected_runs;
+        for (const auto & candidate : runs_) {
+            if (candidate.token_count != 0 && run_visible_to(candidate, reader)) {
+                expected_runs.insert(candidate.id);
+            }
+        }
+        llama_pos expected_pos = 0;
+        std::unordered_set<llama_rerot_run_id> seen_runs;
         for (const auto & view_run : view.runs) {
-            if (view_run.virtual_pos0 != expected || view_run.token_count == 0) {
+            if (view_run.run_id >= runs_.size()) {
+                return set_error(error, "reader view references an unknown run");
+            }
+            const auto & source = runs_[view_run.run_id];
+            if (view_run.owner != source.owner || view_run.storage_pos0 != source.storage_pos0 ||
+                view_run.token_count != source.token_count || view_run.publish_epoch != source.publish_epoch) {
+                return set_error(error, "reader view run does not mirror its source run");
+            }
+            if (!run_visible_to(source, reader)) {
+                return set_error(error, "reader view exposes a run that is not visible to the reader");
+            }
+            if (view_run.virtual_pos0 != expected_pos || view_run.token_count == 0) {
                 return set_error(error, "reader view is not densely packed");
             }
-            if (!visible_runs.insert(view_run.run_id).second) {
+            if (!seen_runs.insert(view_run.run_id).second) {
                 return set_error(error, "reader view contains a run more than once");
             }
-            expected += static_cast<llama_pos>(view_run.token_count);
+            expected_pos += static_cast<llama_pos>(view_run.token_count);
         }
-        if (view.query_virtual_pos != expected) {
+        if (view.query_virtual_pos != expected_pos) {
             return set_error(error, "reader query position does not follow the final visible token");
         }
+        if (seen_runs != expected_runs) {
+            return set_error(error, "reader view omits a visible run");
+        }
+        for (const auto & parent : nodes_) {
+            if (parent.children.empty()) {
+                continue;
+            }
+            size_t reader_child = parent.children.size();
+            for (size_t i = 0; i < parent.children.size(); ++i) {
+                if (is_ancestor(parent.children[i], reader)) {
+                    reader_child = i;
+                    break;
+                }
+            }
+            std::vector<size_t> expected_order;
+            expected_order.reserve(parent.children.size());
+            if (reader_child == parent.children.size()) {
+                for (size_t i = 0; i < parent.children.size(); ++i) {
+                    expected_order.push_back(i);
+                }
+            } else {
+                for (size_t i = reader_child + 1; i < parent.children.size(); ++i) {
+                    expected_order.push_back(i);
+                }
+                for (size_t i = 0; i < reader_child; ++i) {
+                    expected_order.push_back(i);
+                }
+                expected_order.push_back(reader_child);
+            }
+            std::vector<size_t> observed_order;
+            std::vector<bool> block_seen(parent.children.size(), false);
+            bool block_started = false;
+            for (const auto & view_run : view.runs) {
+                if (view_run.owner == parent.id) {
+                    if (block_started) {
+                        return set_error(error, "node runs do not precede their subtree in the reader view");
+                    }
+                    continue;
+                }
+                if (!is_ancestor(parent.id, view_run.owner)) {
+                    continue;
+                }
+                llama_rerot_node_id block = view_run.owner;
+                while (nodes_[block].parent != parent.id) {
+                    block = nodes_[block].parent;
+                }
+                const size_t tag = nodes_[block].child_index;
+                if (!block_seen[tag]) {
+                    block_seen[tag] = true;
+                    observed_order.push_back(tag);
+                } else if (observed_order.back() != tag) {
+                    return set_error(error, "child subtree runs are not contiguous in the reader view");
+                }
+                block_started = true;
+            }
+            std::vector<size_t> nonempty_expected;
+            for (const size_t tag : expected_order) {
+                if (block_seen[tag]) {
+                    nonempty_expected.push_back(tag);
+                }
+            }
+            if (observed_order != nonempty_expected) {
+                return set_error(error, "reader view sibling order breaks own-subtree-last PAC-DFS");
+            }
+        }
     }
-
     return true;
 }
 
