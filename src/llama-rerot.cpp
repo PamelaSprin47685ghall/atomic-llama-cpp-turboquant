@@ -252,6 +252,28 @@ bool llama_rerot_document::publish_run(llama_rerot_run_id run_id, uint64_t publi
     return true;
 }
 
+bool llama_rerot_document::reclassify_run(
+        llama_rerot_run_id run_id,
+        llama_rerot_visibility expected,
+        llama_rerot_visibility replacement,
+        uint64_t publish_epoch) {
+    if (run_id >= runs_.size() || expected == llama_rerot_visibility::normal ||
+        replacement == llama_rerot_visibility::normal) {
+        return false;
+    }
+    auto & current = runs_[run_id];
+    if (current.visibility != expected) {
+        return false;
+    }
+    if ((replacement == llama_rerot_visibility::public_live && publish_epoch == 0) ||
+        (replacement != llama_rerot_visibility::public_live && publish_epoch != 0)) {
+        return false;
+    }
+    current.visibility = replacement;
+    current.publish_epoch = replacement == llama_rerot_visibility::public_live ? publish_epoch : 0;
+    return true;
+}
+
 bool llama_rerot_document::set_node_state(llama_rerot_node_id node_id, llama_rerot_node_state state) {
     if (node_id >= nodes_.size()) {
         return false;

@@ -188,12 +188,42 @@ struct llama_memory_i {
         }
         return false;
     }
+    virtual bool rerot_can_reclassify_run(
+            uint64_t episode_id,
+            llama_rerot_run_id run_id,
+            llama_rerot_visibility expected,
+            llama_rerot_visibility replacement,
+            uint64_t publish_epoch,
+            size_t * count) const {
+        GGML_UNUSED(episode_id);
+        GGML_UNUSED(run_id);
+        GGML_UNUSED(expected);
+        GGML_UNUSED(replacement);
+        GGML_UNUSED(publish_epoch);
+        if (count) {
+            *count = 0;
+        }
+        return false;
+    }
     virtual size_t rerot_publish_run(
             uint64_t episode_id,
             llama_rerot_run_id run_id,
             uint64_t publish_epoch) {
         GGML_UNUSED(episode_id);
         GGML_UNUSED(run_id);
+        GGML_UNUSED(publish_epoch);
+        return 0;
+    }
+    virtual size_t rerot_reclassify_run(
+            uint64_t episode_id,
+            llama_rerot_run_id run_id,
+            llama_rerot_visibility expected,
+            llama_rerot_visibility replacement,
+            uint64_t publish_epoch) {
+        GGML_UNUSED(episode_id);
+        GGML_UNUSED(run_id);
+        GGML_UNUSED(expected);
+        GGML_UNUSED(replacement);
         GGML_UNUSED(publish_epoch);
         return 0;
     }

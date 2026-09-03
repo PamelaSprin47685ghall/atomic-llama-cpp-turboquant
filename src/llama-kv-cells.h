@@ -530,6 +530,31 @@ public:
         return true;
     }
 
+    bool rerot_reclassify(
+            uint32_t i,
+            uint64_t episode_id,
+            llama_rerot_run_id run_id,
+            llama_rerot_visibility expected,
+            llama_rerot_visibility replacement,
+            uint64_t publish_epoch) {
+        assert(i < rerot.size());
+
+        auto & meta = rerot[i];
+        if (pos[i] == -1 || expected == llama_rerot_visibility::normal ||
+            replacement == llama_rerot_visibility::normal || meta.episode_id != episode_id ||
+            meta.run_id != run_id || meta.visibility != expected) {
+            return false;
+        }
+        if ((replacement == llama_rerot_visibility::public_live && publish_epoch == 0) ||
+            (replacement != llama_rerot_visibility::public_live && publish_epoch != 0)) {
+            return false;
+        }
+
+        meta.visibility = replacement;
+        meta.publish_epoch = replacement == llama_rerot_visibility::public_live ? publish_epoch : 0;
+        return true;
+    }
+
     // note: call only if the cell is not empty
     llama_pos get_shift(uint32_t i) const {
         assert(i < pos.size());

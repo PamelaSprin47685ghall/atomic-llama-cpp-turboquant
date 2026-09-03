@@ -312,6 +312,12 @@ int main() {
         assert(cells.rerot_get(8) == pending);
 
         assert(!cells.rerot_publish(8, 91, 8, 14));
+        assert(!cells.rerot_reclassify(
+            8, 91, 7,
+            llama_rerot_visibility::pending_record,
+            llama_rerot_visibility::private_control,
+            14));
+        assert(cells.rerot_get(8) == pending);
         assert(cells.rerot_publish(8, 91, 7, 14));
         const auto published = cells.rerot_get(8);
         assert(published.visibility == llama_rerot_visibility::public_live);

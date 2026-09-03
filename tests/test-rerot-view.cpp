@@ -87,6 +87,33 @@ static void test_visibility() {
     CHECK(view_b.query_virtual_pos == 8);
 }
 
+static void test_reclassify_run_validation() {
+    llama_rerot_document doc(8);
+    const auto owner = doc.create_child(doc.root(), "owner");
+    const auto run = doc.append_run(owner, llama_rerot_visibility::pending_record, 4, 2);
+
+    CHECK(!doc.reclassify_run(
+        run,
+        llama_rerot_visibility::public_live,
+        llama_rerot_visibility::private_control));
+    CHECK(doc.run(run)->visibility == llama_rerot_visibility::pending_record);
+
+    CHECK(!doc.reclassify_run(
+        run,
+        llama_rerot_visibility::pending_record,
+        llama_rerot_visibility::private_control,
+        7));
+    CHECK(doc.run(run)->visibility == llama_rerot_visibility::pending_record);
+
+    CHECK(doc.reclassify_run(
+        run,
+        llama_rerot_visibility::pending_record,
+        llama_rerot_visibility::public_live,
+        7));
+    CHECK(doc.run(run)->visibility == llama_rerot_visibility::public_live);
+    CHECK(doc.run(run)->publish_epoch == 7);
+}
+
 static void collect_leaves(
         const llama_rerot_document & doc,
         llama_rerot_node_id node_id,
@@ -216,6 +243,7 @@ int main() {
     std::fprintf(stderr, "=== RERoT View Tests ===\n");
     test_manual_pac_dfs();
     test_visibility();
+    test_reclassify_run_validation();
     test_randomized_invariants();
     test_query_layout_frontiers();
     std::fprintf(stderr, "=== Results: %d failure(s) ===\n", g_failures);

@@ -1975,6 +1975,82 @@ size_t llama_kv_cache::rerot_publish_run(
     return matches.size();
 }
 
+size_t llama_kv_cache::rerot_reclassify_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_rerot_visibility expected,
+        llama_rerot_visibility replacement,
+        uint64_t publish_epoch) {
+    size_t count = 0;
+    if (!rerot_can_reclassify_run(
+            episode_id, run_id, expected, replacement, publish_epoch, &count)) {
+        return 0;
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> matches;
+    for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
+        const auto & cells = v_cells[stream];
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (cells.is_empty(cell)) {
+                continue;
+            }
+            const auto & meta = cells.rerot_get(cell);
+            if (meta.episode_id == episode_id && meta.run_id == run_id) {
+                matches.emplace_back(stream, cell);
+            }
+        }
+    }
+
+    GGML_ASSERT(matches.size() == count);
+
+    for (const auto & match : matches) {
+        const bool changed = v_cells[match.first].rerot_reclassify(
+            match.second, episode_id, run_id, expected, replacement, publish_epoch);
+        GGML_ASSERT(changed);
+    }
+    return matches.size();
+}
+
+bool llama_kv_cache::rerot_can_reclassify_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_rerot_visibility expected,
+        llama_rerot_visibility replacement,
+        uint64_t publish_epoch,
+        size_t * count) const {
+    if (count) {
+        *count = 0;
+    }
+    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID ||
+        expected == llama_rerot_visibility::normal || replacement == llama_rerot_visibility::normal ||
+        (replacement == llama_rerot_visibility::public_live && publish_epoch == 0) ||
+        (replacement != llama_rerot_visibility::public_live && publish_epoch != 0)) {
+        return false;
+    }
+
+    size_t matches = 0;
+    for (const auto & cells : v_cells) {
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (cells.is_empty(cell)) {
+                continue;
+            }
+            const auto & meta = cells.rerot_get(cell);
+            if (meta.episode_id != episode_id || meta.run_id != run_id) {
+                continue;
+            }
+            if (meta.visibility != expected) {
+                return false;
+            }
+            ++matches;
+        }
+    }
+
+    if (count) {
+        *count = matches;
+    }
+    return matches > 0;
+}
+
 bool llama_kv_cache::rerot_can_publish_run(
         uint64_t episode_id,
         llama_rerot_run_id run_id,

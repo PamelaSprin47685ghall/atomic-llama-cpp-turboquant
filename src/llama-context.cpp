@@ -4335,6 +4335,28 @@ size_t llama_memory_rerot_publish_run(
     return mem->rerot_publish_run(episode_id, run_id, publish_epoch);
 }
 
+size_t llama_memory_rerot_reclassify_run(
+        llama_memory_t mem,
+        uint64_t episode_id,
+        uint32_t run_id,
+        llama_rerot_kv_visibility expected,
+        llama_rerot_kv_visibility replacement,
+        uint64_t publish_epoch) {
+    if (!mem) {
+        return 0;
+    }
+    const auto convert = [](llama_rerot_kv_visibility value) {
+        switch (value) {
+            case LLAMA_REROT_KV_PUBLIC_LIVE:    return llama_rerot_visibility::public_live;
+            case LLAMA_REROT_KV_PRIVATE_CONTROL:return llama_rerot_visibility::private_control;
+            case LLAMA_REROT_KV_PENDING_RECORD: return llama_rerot_visibility::pending_record;
+        }
+        return llama_rerot_visibility::normal;
+    };
+    return mem->rerot_reclassify_run(
+        episode_id, run_id, convert(expected), convert(replacement), publish_epoch);
+}
+
 bool llama_memory_rerot_set_reader_view(
         llama_memory_t mem,
           llama_seq_id seq_id,

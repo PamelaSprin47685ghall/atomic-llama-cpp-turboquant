@@ -173,6 +173,26 @@ bool llama_kv_cache_iswa::rerot_can_publish_run(
     return base_ok && swa_ok;
 }
 
+bool llama_kv_cache_iswa::rerot_can_reclassify_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_rerot_visibility expected,
+        llama_rerot_visibility replacement,
+        uint64_t publish_epoch,
+        size_t * count) const {
+    size_t count_base = 0;
+    size_t count_swa = 0;
+    const bool base_ok = kv_base->rerot_can_reclassify_run(
+        episode_id, run_id, expected, replacement, publish_epoch, &count_base);
+    const bool swa_ok = kv_swa->rerot_can_reclassify_run(
+        episode_id, run_id, expected, replacement, publish_epoch, &count_swa);
+
+    if (count) {
+        *count = base_ok && swa_ok ? count_base + count_swa : 0;
+    }
+    return base_ok && swa_ok;
+}
+
 size_t llama_kv_cache_iswa::rerot_publish_run(
         uint64_t episode_id,
         llama_rerot_run_id run_id,
@@ -184,6 +204,26 @@ size_t llama_kv_cache_iswa::rerot_publish_run(
 
     const size_t base_count = kv_base->rerot_publish_run(episode_id, run_id, publish_epoch);
     const size_t swa_count = kv_swa->rerot_publish_run(episode_id, run_id, publish_epoch);
+    GGML_ASSERT(base_count + swa_count == count);
+    return count;
+}
+
+size_t llama_kv_cache_iswa::rerot_reclassify_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_rerot_visibility expected,
+        llama_rerot_visibility replacement,
+        uint64_t publish_epoch) {
+    size_t count = 0;
+    if (!rerot_can_reclassify_run(
+            episode_id, run_id, expected, replacement, publish_epoch, &count)) {
+        return 0;
+    }
+
+    const size_t base_count = kv_base->rerot_reclassify_run(
+        episode_id, run_id, expected, replacement, publish_epoch);
+    const size_t swa_count = kv_swa->rerot_reclassify_run(
+        episode_id, run_id, expected, replacement, publish_epoch);
     GGML_ASSERT(base_count + swa_count == count);
     return count;
 }

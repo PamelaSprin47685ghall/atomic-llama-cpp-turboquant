@@ -860,6 +860,19 @@ extern "C" {
                    uint32_t run_id,
                    uint64_t publish_epoch);
 
+    // Atomically change all resident cells in one run from the expected
+    // visibility to a replacement visibility. This is used by the byte-level
+    // parser after a cross-token structural prefix is resolved. A replacement
+    // of PUBLIC_LIVE requires a non-zero publish epoch; other replacements
+    // require zero. Returns zero without changing any cells if validation fails.
+    LLAMA_API size_t llama_memory_rerot_reclassify_run(
+            llama_memory_t mem,
+                   uint64_t episode_id,
+                   uint32_t run_id,
+        enum llama_rerot_kv_visibility expected,
+        enum llama_rerot_kv_visibility replacement,
+                   uint64_t publish_epoch);
+
     // Install/clear the reader-specific PAC-DFS run order used by subsequent
     // decode calls for `seq_id`. Returns false for invalid descriptors or
     // memory implementations without an attention component.

@@ -203,11 +203,26 @@ public:
         llama_rerot_run_id run_id,
         size_t * count) const override;
 
+    bool rerot_can_reclassify_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_rerot_visibility expected,
+        llama_rerot_visibility replacement,
+        uint64_t publish_epoch,
+        size_t * count) const override;
+
     // Atomically publish every resident cell of a pending logical run. Returns
     // the number of cells transitioned; zero means no matching pending cells.
     size_t rerot_publish_run(
         uint64_t episode_id,
         llama_rerot_run_id run_id,
+        uint64_t publish_epoch) override;
+
+    size_t rerot_reclassify_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_rerot_visibility expected,
+        llama_rerot_visibility replacement,
         uint64_t publish_epoch) override;
 
     bool rerot_set_reader_view(llama_seq_id seq_id, const llama_rerot_reader_state & view) override;

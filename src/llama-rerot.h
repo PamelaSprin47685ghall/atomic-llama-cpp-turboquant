@@ -233,6 +233,11 @@ public:
 
     bool set_run_token_count(llama_rerot_run_id run_id, uint32_t token_count);
     bool publish_run(llama_rerot_run_id run_id, uint64_t publish_epoch);
+    bool reclassify_run(
+        llama_rerot_run_id run_id,
+        llama_rerot_visibility expected,
+        llama_rerot_visibility replacement,
+        uint64_t publish_epoch = 0);
     bool set_node_state(llama_rerot_node_id node_id, llama_rerot_node_state state);
 
     const llama_rerot_node * node(llama_rerot_node_id node_id) const;
