@@ -188,6 +188,24 @@ size_t llama_kv_cache_iswa::rerot_publish_run(
     return count;
 }
 
+bool llama_kv_cache_iswa::rerot_set_reader_view(
+        llama_seq_id seq_id,
+        const llama_rerot_reader_state & view) {
+    if (!kv_base->rerot_set_reader_view(seq_id, view)) {
+        return false;
+    }
+    if (!kv_swa->rerot_set_reader_view(seq_id, view)) {
+        kv_base->rerot_clear_reader_view(seq_id);
+        return false;
+    }
+    return true;
+}
+
+void llama_kv_cache_iswa::rerot_clear_reader_view(llama_seq_id seq_id) {
+    kv_base->rerot_clear_reader_view(seq_id);
+    kv_swa->rerot_clear_reader_view(seq_id);
+}
+
 llama_pos llama_kv_cache_iswa::seq_pos_min(llama_seq_id seq_id) const {
     // the base cache is a superset of the SWA cache, so we can just check the SWA cache
     return kv_swa->seq_pos_min(seq_id);

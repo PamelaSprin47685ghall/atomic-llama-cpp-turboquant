@@ -820,6 +820,26 @@ extern "C" {
         enum llama_rerot_kv_visibility visibility;
     };
 
+    struct llama_rerot_view_stamp {
+        uint64_t topology_epoch;
+        uint64_t publish_epoch;
+        uint64_t layout_epoch;
+    };
+
+    // Reader-specific logical ordering installed on one execution sequence.
+    // `ordered_run_ids` is copied by the runtime and may be released after the
+    // call returns. The query run identifies the currently growing Lane run.
+    struct llama_rerot_reader_view_desc {
+        uint64_t episode_id;
+        uint32_t reader_node_id;
+        uint32_t query_run_id;
+        uint64_t frontier;
+        enum llama_rerot_frontier_mode frontier_mode;
+        struct llama_rerot_view_stamp stamp;
+        const uint32_t * ordered_run_ids;
+        size_t n_ordered_runs;
+    };
+
     // Classify future KV writes by a sequence. Existing cells are unchanged.
     // Returns false when the memory has no compatible attention KV component or
     // the tag is invalid.
@@ -839,6 +859,18 @@ extern "C" {
                    uint64_t episode_id,
                    uint32_t run_id,
                    uint64_t publish_epoch);
+
+    // Install/clear the reader-specific PAC-DFS run order used by subsequent
+    // decode calls for `seq_id`. Returns false for invalid descriptors or
+    // memory implementations without an attention component.
+    LLAMA_API bool llama_memory_rerot_set_reader_view(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+        const struct llama_rerot_reader_view_desc * view);
+
+    LLAMA_API void llama_memory_rerot_clear_reader_view(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
 
     // Removes all tokens that do not belong to the specified sequence
     LLAMA_API void llama_memory_seq_keep(

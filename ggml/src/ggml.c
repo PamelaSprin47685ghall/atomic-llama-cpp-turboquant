@@ -1108,6 +1108,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_EXT_BANDED",
+    "FLASH_ATTN_EXT_REROT",
     "FLASH_ATTN_BACK",
     "SSM_CONV",
     "SSM_SCAN",
@@ -1142,7 +1143,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1225,6 +1226,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "flash_attn_ext(x)",
     "flash_attn_ext_banded(x)",
+    "flash_attn_ext_rerot(x)",
     "flash_attn_back(x)",
     "ssm_conv(x)",
     "ssm_scan(x)",
@@ -1259,7 +1261,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5537,10 +5539,52 @@ struct ggml_tensor * ggml_flash_attn_ext_banded(
     return result;
 }
 
+struct ggml_tensor * ggml_flash_attn_ext_rerot(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q_groups,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * entries,
+        struct ggml_tensor  * offsets,
+        struct ggml_tensor  * sinks,
+        float                 scale,
+        float                 logit_softcap) {
+    GGML_ASSERT(q_groups != NULL && k != NULL && v != NULL && entries != NULL && offsets != NULL);
+    GGML_ASSERT(q_groups->type == GGML_TYPE_F32);
+    GGML_ASSERT(q_groups->ne[0] == k->ne[0]);
+    GGML_ASSERT(q_groups->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1);
+    GGML_ASSERT(k->ne[1] == v->ne[1]);
+    GGML_ASSERT(q_groups->ne[2] % k->ne[2] == 0);
+    GGML_ASSERT(q_groups->ne[2] % v->ne[2] == 0);
+
+    GGML_ASSERT(entries->type == GGML_TYPE_I32);
+    GGML_ASSERT(entries->ne[0] == 2 && entries->ne[2] == 1 && entries->ne[3] == 1);
+    GGML_ASSERT(offsets->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_vector(offsets) && offsets->ne[0] >= 2);
+
+    const int64_t n_queries = offsets->ne[0] - 1;
+    int64_t ne[4] = { v->ne[0], q_groups->ne[2], n_queries, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    float params[] = { scale, 0.0f, logit_softcap };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_FLASH_ATTN_EXT_REROT;
+    result->src[0] = q_groups;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = entries;
+    result->src[4] = offsets;
+    result->src[5] = sinks;
+
+    return result;
+}
+
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_BANDED ||
+                a->op == GGML_OP_FLASH_ATTN_EXT_REROT);
 
     const int32_t prec_i32 = (int32_t) prec;
 
@@ -5549,7 +5593,8 @@ void ggml_flash_attn_ext_set_prec(
 
 enum ggml_prec ggml_flash_attn_ext_get_prec(
         const struct ggml_tensor * a) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_BANDED ||
+                a->op == GGML_OP_FLASH_ATTN_EXT_REROT);
 
     const int32_t prec_i32 = ggml_get_op_params_i32(a, 3);
 

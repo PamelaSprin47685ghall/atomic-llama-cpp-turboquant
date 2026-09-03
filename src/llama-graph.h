@@ -337,11 +337,22 @@ public:
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
+    bool rerot_active() const { return self_rerot_q_indices != nullptr; }
+    ggml_tensor * get_rerot_q_indices() const { return self_rerot_q_indices; }
+    ggml_tensor * get_rerot_q_pos() const { return self_rerot_q_pos; }
+    ggml_tensor * get_rerot_entries() const { return self_rerot_entries; }
+    ggml_tensor * get_rerot_offsets() const { return self_rerot_offsets; }
+
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    ggml_tensor * self_rerot_q_indices = nullptr; // I32 [n_query_groups]
+    ggml_tensor * self_rerot_q_pos     = nullptr; // I32 [n_query_groups*n_pos]
+    ggml_tensor * self_rerot_entries   = nullptr; // I32 [2, n_visible_entries]
+    ggml_tensor * self_rerot_offsets   = nullptr; // I32 [n_queries + 1]
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -1161,6 +1172,25 @@ struct llm_graph_context {
                     int   il) const;
 
     llm_graph_input_attn_kv * build_attn_inp_kv() const;
+
+    ggml_tensor * build_rerot_q_groups(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * q_raw,
+            ggml_tensor * freq_factors,
+            int sections[GGML_MROPE_SECTIONS],
+            int il) const;
+
+    ggml_tensor * build_attn_rerot(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_groups,
+            ggml_tensor * k_cur,
+            ggml_tensor * v_cur,
+            ggml_tensor * sinks,
+                  float   kq_scale,
+                    int   il) const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv * inp,

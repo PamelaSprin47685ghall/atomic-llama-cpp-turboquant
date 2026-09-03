@@ -210,6 +210,18 @@ public:
         llama_rerot_run_id run_id,
         uint64_t publish_epoch) override;
 
+    bool rerot_set_reader_view(llama_seq_id seq_id, const llama_rerot_reader_state & view) override;
+    void rerot_clear_reader_view(llama_seq_id seq_id) override;
+
+    // Build the indexed, query-grouped layout consumed by the backend-neutral
+    // RERoT attention op. The returned key indices address the K/V view for the
+    // current unified stream.
+    llama_rerot_attn_layout rerot_build_attn_layout(
+        const llama_ubatch & ubatch,
+        uint32_t n_kv) const;
+
+    bool rerot_batch_active(const llama_ubatch & ubatch) const;
+
     // Resolve a logical PAC-DFS view after any TriAttention eviction or cache
     // compaction. Resident cells are ordered by the logical run sequence and
     // densely repacked in virtual address space.
@@ -357,6 +369,7 @@ private:
     // Current per-sequence write classification. These are control-plane
     // values, not physical-cell metadata, and are reset on cache clear.
     std::vector<llama_kv_rerot_meta> rerot_write_tags;
+    std::vector<llama_rerot_reader_state> rerot_reader_views;
 
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
@@ -492,8 +505,21 @@ public:
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
+    bool rerot_active() const;
+    const llama_rerot_attn_layout & get_rerot_attn_layout() const;
+
+    ggml_tensor * build_input_rerot_q_indices(ggml_context * ctx) const;
+    ggml_tensor * build_input_rerot_q_pos(ggml_context * ctx, uint32_t n_pos) const;
+    ggml_tensor * build_input_rerot_entries(ggml_context * ctx) const;
+    ggml_tensor * build_input_rerot_offsets(ggml_context * ctx) const;
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    void set_input_rerot_q_indices(ggml_tensor * dst) const;
+    void set_input_rerot_q_pos(ggml_tensor * dst, uint32_t n_pos) const;
+    void set_input_rerot_entries(ggml_tensor * dst) const;
+    void set_input_rerot_offsets(ggml_tensor * dst) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
@@ -535,4 +561,7 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    mutable bool rerot_layout_ready = false;
+    mutable llama_rerot_attn_layout rerot_layout;
 };

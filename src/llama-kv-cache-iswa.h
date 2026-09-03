@@ -81,6 +81,8 @@ public:
     void rerot_clear_write_tag(llama_seq_id seq_id) override;
     bool rerot_can_publish_run(uint64_t episode_id, llama_rerot_run_id run_id, size_t * count) const override;
     size_t rerot_publish_run(uint64_t episode_id, llama_rerot_run_id run_id, uint64_t publish_epoch) override;
+    bool rerot_set_reader_view(llama_seq_id seq_id, const llama_rerot_reader_state & view) override;
+    void rerot_clear_reader_view(llama_seq_id seq_id) override;
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;

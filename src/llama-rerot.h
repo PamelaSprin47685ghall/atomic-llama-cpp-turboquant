@@ -123,6 +123,92 @@ struct llama_rerot_reader_view {
     llama_pos query_virtual_pos = 0;
 };
 
+// A reader view installed on an execution sequence. The logical document is
+// owned by the scheduler; the KV cache only needs the stable ordered run ids
+// and enough clock information to decide current-frontier visibility.
+struct llama_rerot_reader_state {
+    uint64_t episode_id = 0;
+    llama_rerot_node_id reader = LLAMA_REROT_NODE_INVALID;
+    llama_rerot_run_id query_run = LLAMA_REROT_RUN_INVALID;
+    uint64_t frontier = 0;
+
+    uint64_t topology_epoch = 0;
+    uint64_t publish_epoch = 0;
+    uint64_t layout_epoch = 0;
+
+    llama_rerot_frontier_mode frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+    std::vector<llama_rerot_run_id> ordered_runs;
+
+    void reset() {
+        episode_id = 0;
+        reader = LLAMA_REROT_NODE_INVALID;
+        query_run = LLAMA_REROT_RUN_INVALID;
+        frontier = 0;
+        topology_epoch = 0;
+        publish_epoch = 0;
+        layout_epoch = 0;
+        frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+        ordered_runs.clear();
+    }
+
+    bool active() const {
+        return episode_id != 0;
+    }
+};
+
+// Backend-neutral indexed attention layout. Each group is one copy of an
+// original query evaluated at an effective RoPE position. Entries select a
+// physical K/V row and the query group to use for that row. Query offsets make
+// all entries for one output query contiguous, allowing one global online
+// softmax per query/head without materializing or rephasing K.
+struct llama_rerot_attn_group {
+    uint32_t query_index = 0;
+    llama_pos effective_pos = 0;
+};
+
+struct llama_rerot_attn_entry {
+    uint32_t key_index = 0;
+    uint32_t group_index = 0;
+};
+
+struct llama_rerot_attn_layout {
+    uint32_t n_queries = 0;
+    std::vector<llama_rerot_attn_group> groups;
+    std::vector<llama_rerot_attn_entry> entries;
+    std::vector<uint32_t> query_offsets;
+
+    bool empty() const {
+        return n_queries == 0;
+    }
+
+    bool validate(uint32_t n_keys, std::string * error = nullptr) const;
+};
+
+// Minimal physical-key description used by the pure layout builder. The KV
+// cache fills `owned_by_reader` from sequence references; no physical-cell
+// registry is retained by the logical scheduler.
+struct llama_rerot_key_record {
+    uint32_t key_index = 0;
+    llama_pos storage_pos = 0;
+    bool owned_by_reader = false;
+    llama_kv_rerot_meta meta;
+};
+
+struct llama_rerot_query_layout {
+    std::vector<llama_rerot_attn_group> groups;
+    std::vector<llama_rerot_attn_entry> entries;
+    llama_pos query_virtual_pos = 0;
+};
+
+// Build the layout for one query token. Untagged keys form the common/serial
+// prefix; tagged keys are ordered by `reader.ordered_runs`. The returned query
+// groups are local to this query and are remapped when multiple query layouts
+// are combined by the KV cache.
+llama_rerot_query_layout llama_rerot_build_query_layout(
+    const llama_rerot_reader_state & reader,
+    llama_pos query_storage_pos,
+    const std::vector<llama_rerot_key_record> & keys);
+
 // Pure logical document/tree model. It never stores physical KV indices.
 class llama_rerot_document {
 public:

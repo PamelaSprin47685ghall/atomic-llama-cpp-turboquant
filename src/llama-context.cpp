@@ -4335,6 +4335,36 @@ size_t llama_memory_rerot_publish_run(
     return mem->rerot_publish_run(episode_id, run_id, publish_epoch);
 }
 
+bool llama_memory_rerot_set_reader_view(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+    const llama_rerot_reader_view_desc * view) {
+    if (!mem || !view || !view->ordered_run_ids || view->n_ordered_runs == 0 ||
+        view->episode_id == 0 || view->reader_node_id == UINT32_MAX || view->query_run_id == UINT32_MAX) {
+        return false;
+    }
+
+    llama_rerot_reader_state internal;
+    internal.episode_id = view->episode_id;
+    internal.reader = view->reader_node_id;
+    internal.query_run = view->query_run_id;
+    internal.frontier = view->frontier;
+    internal.topology_epoch = view->stamp.topology_epoch;
+    internal.publish_epoch = view->stamp.publish_epoch;
+    internal.layout_epoch = view->stamp.layout_epoch;
+    internal.frontier_mode = view->frontier_mode;
+    internal.ordered_runs.assign(view->ordered_run_ids, view->ordered_run_ids + view->n_ordered_runs);
+    return mem->rerot_set_reader_view(seq_id, internal);
+}
+
+void llama_memory_rerot_clear_reader_view(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    if (mem) {
+        mem->rerot_clear_reader_view(seq_id);
+    }
+}
+
 void llama_memory_seq_keep(
         llama_memory_t mem,
           llama_seq_id seq_id) {

@@ -146,11 +146,78 @@ static void test_randomized_invariants() {
     }
 }
 
+static llama_kv_rerot_meta public_meta(
+        uint64_t episode,
+        llama_rerot_node_id node,
+        llama_rerot_run_id run,
+        uint64_t frontier) {
+    llama_kv_rerot_meta result;
+    result.episode_id = episode;
+    result.node_id = node;
+    result.run_id = run;
+    result.frontier = frontier;
+    result.visibility = llama_rerot_visibility::public_live;
+    return result;
+}
+
+static void test_query_layout_frontiers() {
+    constexpr uint64_t episode = 99;
+    constexpr llama_rerot_node_id node_a = 1;
+    constexpr llama_rerot_node_id node_b = 2;
+    constexpr llama_rerot_run_id run_a = 11;
+    constexpr llama_rerot_run_id run_b = 12;
+
+    llama_rerot_reader_state reader;
+    reader.episode_id = episode;
+    reader.reader = node_a;
+    reader.query_run = run_a;
+    reader.frontier = 1;
+    reader.frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+    reader.ordered_runs = { run_b, run_a };
+
+    const std::vector<llama_rerot_key_record> keys = {
+        { 0, 0, true,  {} },
+        { 1, 1, true,  {} },
+        { 2, 2, false, public_meta(episode, node_b, run_b, 0) },
+        { 3, 3, false, public_meta(episode, node_b, run_b, 1) },
+        { 4, 2, true,  public_meta(episode, node_a, run_a, 0) },
+        { 5, 3, true,  public_meta(episode, node_a, run_a, 1) },
+    };
+
+    const auto strong = llama_rerot_build_query_layout(reader, 3, keys);
+    CHECK(strong.query_virtual_pos == 5);
+    CHECK(strong.entries.size() == 6);
+    CHECK(strong.groups.size() == 2);
+    CHECK(strong.groups[0].effective_pos == 3);
+    CHECK(strong.groups[1].effective_pos == 5);
+
+    std::set<uint32_t> strong_keys;
+    for (const auto & entry : strong.entries) {
+        strong_keys.insert(entry.key_index);
+    }
+    CHECK(strong_keys == std::set<uint32_t>({0, 1, 2, 3, 4, 5}));
+
+    reader.frontier_mode = LLAMA_REROT_FRONTIER_LAG1;
+    const auto lag1 = llama_rerot_build_query_layout(reader, 3, keys);
+    CHECK(lag1.query_virtual_pos == 4);
+    CHECK(lag1.entries.size() == 5);
+    CHECK(lag1.groups.size() == 2);
+    CHECK(lag1.groups[0].effective_pos == 3);
+    CHECK(lag1.groups[1].effective_pos == 4);
+
+    std::set<uint32_t> lag1_keys;
+    for (const auto & entry : lag1.entries) {
+        lag1_keys.insert(entry.key_index);
+    }
+    CHECK(lag1_keys == std::set<uint32_t>({0, 1, 2, 4, 5}));
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT View Tests ===\n");
     test_manual_pac_dfs();
     test_visibility();
     test_randomized_invariants();
+    test_query_layout_frontiers();
     std::fprintf(stderr, "=== Results: %d failure(s) ===\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

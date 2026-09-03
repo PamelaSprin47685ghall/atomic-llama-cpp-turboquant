@@ -231,6 +231,16 @@ size_t llama_memory_hybrid_iswa::rerot_publish_run(
     return mem_attn->rerot_publish_run(episode_id, run_id, publish_epoch);
 }
 
+bool llama_memory_hybrid_iswa::rerot_set_reader_view(
+        llama_seq_id seq_id,
+        const llama_rerot_reader_state & view) {
+    return mem_attn->rerot_set_reader_view(seq_id, view);
+}
+
+void llama_memory_hybrid_iswa::rerot_clear_reader_view(llama_seq_id seq_id) {
+    mem_attn->rerot_clear_reader_view(seq_id);
+}
+
 void llama_memory_hybrid_iswa::seq_keep(llama_seq_id seq_id) {
     mem_attn->seq_keep(seq_id);
     mem_recr->seq_keep(seq_id);

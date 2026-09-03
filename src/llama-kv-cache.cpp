@@ -214,6 +214,7 @@ llama_kv_cache::llama_kv_cache(
     }
 
     rerot_write_tags.resize(LLAMA_MAX_SEQ);
+    rerot_reader_views.resize(LLAMA_MAX_SEQ);
 
     // [TAG_V_CACHE_VARIABLE]
     if (v_trans && hparams.is_n_embd_v_gqa_variable()) {
@@ -606,6 +607,9 @@ void llama_kv_cache::clear(bool data) {
 
     for (auto & tag : rerot_write_tags) {
         tag.reset();
+    }
+    for (auto & view : rerot_reader_views) {
+        view.reset();
     }
 
     if (data) {
@@ -2003,6 +2007,116 @@ bool llama_kv_cache::rerot_can_publish_run(
         *count = matches;
     }
     return matches > 0;
+}
+
+bool llama_kv_cache::rerot_set_reader_view(
+        llama_seq_id seq_id,
+        const llama_rerot_reader_state & view) {
+    if (seq_id < 0 || (size_t) seq_id >= rerot_reader_views.size() || !view.active() ||
+        view.reader == LLAMA_REROT_NODE_INVALID || view.query_run == LLAMA_REROT_RUN_INVALID ||
+        view.ordered_runs.empty()) {
+        return false;
+    }
+
+    std::unordered_set<llama_rerot_run_id> seen;
+    seen.reserve(view.ordered_runs.size());
+    bool query_run_seen = false;
+    for (const auto run_id : view.ordered_runs) {
+        if (run_id == LLAMA_REROT_RUN_INVALID || !seen.insert(run_id).second) {
+            return false;
+        }
+        query_run_seen |= run_id == view.query_run;
+    }
+    if (!query_run_seen) {
+        return false;
+    }
+
+    rerot_reader_views[seq_id] = view;
+    return true;
+}
+
+void llama_kv_cache::rerot_clear_reader_view(llama_seq_id seq_id) {
+    if (seq_id >= 0 && (size_t) seq_id < rerot_reader_views.size()) {
+        rerot_reader_views[seq_id].reset();
+    }
+}
+
+bool llama_kv_cache::rerot_batch_active(const llama_ubatch & ubatch) const {
+    bool any = false;
+    bool all = true;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (!ubatch.seq_id || !ubatch.seq_id[i] || ubatch.n_seq_id[i] < 1) {
+            all = false;
+            continue;
+        }
+        const llama_seq_id seq_id = ubatch.seq_id[i][0];
+        const bool active = seq_id >= 0 && (size_t) seq_id < rerot_reader_views.size() &&
+                            rerot_reader_views[seq_id].active();
+        any |= active;
+        all &= active;
+    }
+    if (any && !all) {
+        throw std::runtime_error("RERoT and ordinary query rows cannot share one ubatch");
+    }
+    return any;
+}
+
+llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
+        const llama_ubatch & ubatch,
+        uint32_t n_kv) const {
+    llama_rerot_attn_layout result;
+    if (!rerot_batch_active(ubatch)) {
+        return result;
+    }
+    if (n_stream != 1 || v_cells.size() != 1) {
+        throw std::runtime_error("RERoT indexed attention requires unified KV");
+    }
+
+    const auto & cells = v_cells[0];
+    if (n_kv > cells.size()) {
+        throw std::runtime_error("RERoT attention layout exceeds KV cache size");
+    }
+
+    result.n_queries = ubatch.n_tokens;
+    result.query_offsets.reserve(size_t(result.n_queries) + 1);
+    result.query_offsets.push_back(0);
+
+    for (uint32_t query = 0; query < ubatch.n_tokens; ++query) {
+        const llama_seq_id seq_id = ubatch.seq_id[query][0];
+        const auto & reader = rerot_reader_views.at(seq_id);
+
+        std::vector<llama_rerot_key_record> keys;
+        keys.reserve(n_kv);
+        for (uint32_t key = 0; key < n_kv; ++key) {
+            if (cells.is_empty(key)) {
+                continue;
+            }
+            keys.push_back({
+                key,
+                cells.pos_get(key),
+                cells.seq_has(key, seq_id),
+                cells.rerot_get(key),
+            });
+        }
+
+        auto query_layout = llama_rerot_build_query_layout(reader, ubatch.pos[query], keys);
+        const uint32_t group_base = static_cast<uint32_t>(result.groups.size());
+        for (auto group : query_layout.groups) {
+            group.query_index = query;
+            result.groups.push_back(group);
+        }
+        for (auto entry : query_layout.entries) {
+            entry.group_index += group_base;
+            result.entries.push_back(entry);
+        }
+        result.query_offsets.push_back(static_cast<uint32_t>(result.entries.size()));
+    }
+
+    std::string error;
+    if (!result.validate(n_kv, &error)) {
+        throw std::runtime_error("invalid RERoT attention layout: " + error);
+    }
+    return result;
 }
 
 llama_kv_cache::rerot_resolved_view llama_kv_cache::rerot_resolve_view(
@@ -3523,6 +3637,9 @@ bool llama_kv_cache_context::next() {
         return false;
     }
 
+    rerot_layout_ready = false;
+    rerot_layout = {};
+
     return true;
 }
 
@@ -3538,6 +3655,8 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
+    rerot_layout_ready = false;
+    rerot_layout = {};
 
     // InnerQ: check if CUDA calibration finalized and tensor needs update
     if (kv->get_turbo_innerq_scale_inv() != nullptr && turbo_innerq_needs_tensor_update()) {
@@ -3641,6 +3760,53 @@ ggml_tensor * llama_kv_cache_context::build_input_v_rot(ggml_context * ctx) cons
     return kv->build_input_v_rot(ctx);
 }
 
+bool llama_kv_cache_context::rerot_active() const {
+    return !ubatches.empty() && i_cur < ubatches.size() && kv->rerot_batch_active(ubatches[i_cur]);
+}
+
+const llama_rerot_attn_layout & llama_kv_cache_context::get_rerot_attn_layout() const {
+    if (!rerot_layout_ready) {
+        rerot_layout = rerot_active()
+            ? kv->rerot_build_attn_layout(ubatches[i_cur], n_kv)
+            : llama_rerot_attn_layout{};
+        rerot_layout_ready = true;
+    }
+    return rerot_layout;
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_rerot_q_indices(ggml_context * ctx) const {
+    const auto & layout = get_rerot_attn_layout();
+    GGML_ASSERT(!layout.empty() && !layout.groups.empty());
+    auto * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, layout.groups.size());
+    ggml_set_input(result);
+    return result;
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_rerot_q_pos(ggml_context * ctx, uint32_t n_pos) const {
+    const auto & layout = get_rerot_attn_layout();
+    GGML_ASSERT(!layout.empty() && !layout.groups.empty());
+    GGML_ASSERT(n_pos == 1 || n_pos == 4);
+    auto * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, layout.groups.size() * n_pos);
+    ggml_set_input(result);
+    return result;
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_rerot_entries(ggml_context * ctx) const {
+    const auto & layout = get_rerot_attn_layout();
+    GGML_ASSERT(!layout.empty() && !layout.entries.empty());
+    auto * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, layout.entries.size());
+    ggml_set_input(result);
+    return result;
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_rerot_offsets(ggml_context * ctx) const {
+    const auto & layout = get_rerot_attn_layout();
+    GGML_ASSERT(!layout.empty());
+    auto * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, layout.query_offsets.size());
+    ggml_set_input(result);
+    return result;
+}
+
 void llama_kv_cache_context::set_input_k_shift(ggml_tensor * dst) const {
     kv->set_input_k_shift(dst);
 }
@@ -3651,6 +3817,56 @@ void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::set_input_rerot_q_indices(ggml_tensor * dst) const {
+    const auto & layout = get_rerot_attn_layout();
+    GGML_ASSERT(dst && dst->type == GGML_TYPE_I32 && (size_t) dst->ne[0] == layout.groups.size());
+    std::vector<int32_t> data(layout.groups.size());
+    for (size_t i = 0; i < layout.groups.size(); ++i) {
+        data[i] = static_cast<int32_t>(layout.groups[i].query_index);
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, data.size() * sizeof(data[0]));
+}
+
+void llama_kv_cache_context::set_input_rerot_q_pos(ggml_tensor * dst, uint32_t n_pos) const {
+    const auto & layout = get_rerot_attn_layout();
+    GGML_ASSERT(dst && dst->type == GGML_TYPE_I32 && (n_pos == 1 || n_pos == 4));
+    GGML_ASSERT((size_t) dst->ne[0] == layout.groups.size() * n_pos);
+    std::vector<int32_t> data(layout.groups.size() * n_pos, 0);
+    for (size_t i = 0; i < layout.groups.size(); ++i) {
+        const auto pos = layout.groups[i].effective_pos;
+        data[i] = pos;
+        if (n_pos == 4) {
+            data[layout.groups.size() + i] = pos;
+            data[2 * layout.groups.size() + i] = pos;
+            data[3 * layout.groups.size() + i] = 0;
+        }
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, data.size() * sizeof(data[0]));
+}
+
+void llama_kv_cache_context::set_input_rerot_entries(ggml_tensor * dst) const {
+    const auto & layout = get_rerot_attn_layout();
+    GGML_ASSERT(dst && dst->type == GGML_TYPE_I32 && dst->ne[0] == 2 &&
+        (size_t) dst->ne[1] == layout.entries.size());
+    std::vector<int32_t> data(layout.entries.size() * 2);
+    for (size_t i = 0; i < layout.entries.size(); ++i) {
+        data[2 * i + 0] = static_cast<int32_t>(layout.entries[i].key_index);
+        data[2 * i + 1] = static_cast<int32_t>(layout.entries[i].group_index);
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, data.size() * sizeof(data[0]));
+}
+
+void llama_kv_cache_context::set_input_rerot_offsets(ggml_tensor * dst) const {
+    const auto & layout = get_rerot_attn_layout();
+    GGML_ASSERT(dst && dst->type == GGML_TYPE_I32 &&
+        (size_t) dst->ne[0] == layout.query_offsets.size());
+    std::vector<int32_t> data(layout.query_offsets.size());
+    for (size_t i = 0; i < layout.query_offsets.size(); ++i) {
+        data[i] = static_cast<int32_t>(layout.query_offsets[i]);
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, data.size() * sizeof(data[0]));
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {

@@ -197,6 +197,14 @@ struct llama_memory_i {
         GGML_UNUSED(publish_epoch);
         return 0;
     }
+    virtual bool rerot_set_reader_view(llama_seq_id seq_id, const llama_rerot_reader_state & view) {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(view);
+        return false;
+    }
+    virtual void rerot_clear_reader_view(llama_seq_id seq_id) {
+        GGML_UNUSED(seq_id);
+    }
 
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;

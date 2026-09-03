@@ -565,6 +565,7 @@ extern "C" {
 
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_EXT_BANDED,
+        GGML_OP_FLASH_ATTN_EXT_REROT,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -2447,6 +2448,26 @@ extern "C" {
             struct ggml_tensor  * rel_logits,
             float                 scale,
             int64_t               rel_extent);
+
+    // Indexed RERoT attention. q_groups contains one fully position-encoded
+    // query row for each distinct reader-relative effective position:
+    //   q_groups: [n_embd_k, n_groups, n_head, 1]
+    //   k:        [n_embd_k, n_kv, n_head_kv, 1]
+    //   v:        [n_embd_v, n_kv, n_head_kv, 1]
+    //   entries:  I32 [2, n_entries], (physical_k_index, q_group_index)
+    //   offsets:  I32 [n_queries + 1], entry range per output query
+    //   result:   [n_embd_v, n_head, n_queries, 1]
+    // All entries in one query range participate in a single global softmax.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_rerot(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q_groups,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * entries,
+            struct ggml_tensor  * offsets,
+            struct ggml_tensor  * sinks,
+            float                 scale,
+            float                 logit_softcap);
 
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,

@@ -482,6 +482,13 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot && self_v_rot->buffer) {
         mctx->set_input_v_rot(self_v_rot);
     }
+
+    if (self_rerot_q_indices) {
+        mctx->set_input_rerot_q_indices(self_rerot_q_indices);
+        mctx->set_input_rerot_q_pos(self_rerot_q_pos, hparams.n_pos_per_embd());
+        mctx->set_input_rerot_entries(self_rerot_entries);
+        mctx->set_input_rerot_offsets(self_rerot_offsets);
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -495,6 +502,18 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    const bool had_rerot = self_rerot_q_indices != nullptr;
+    const bool has_rerot = mctx->rerot_active();
+    res &= had_rerot == has_rerot;
+    if (had_rerot && has_rerot) {
+        const auto & layout = mctx->get_rerot_attn_layout();
+        res &= (size_t) self_rerot_q_indices->ne[0] == layout.groups.size();
+        res &= (size_t) self_rerot_q_pos->ne[0] == layout.groups.size() * hparams.n_pos_per_embd();
+        res &= self_rerot_entries->ne[0] == 2;
+        res &= (size_t) self_rerot_entries->ne[1] == layout.entries.size();
+        res &= (size_t) self_rerot_offsets->ne[0] == layout.query_offsets.size();
+    }
 
     return res;
 }
@@ -2816,6 +2835,13 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
+    if (mctx_cur->rerot_active()) {
+        inp->self_rerot_q_indices = mctx_cur->build_input_rerot_q_indices(ctx0);
+        inp->self_rerot_q_pos     = mctx_cur->build_input_rerot_q_pos(ctx0, hparams.n_pos_per_embd());
+        inp->self_rerot_entries   = mctx_cur->build_input_rerot_entries(ctx0);
+        inp->self_rerot_offsets   = mctx_cur->build_input_rerot_offsets(ctx0);
+    }
+
     return inp;
 }
 
@@ -2825,6 +2851,148 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
+}
+
+ggml_tensor * llm_graph_context::build_rerot_q_groups(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * q_raw,
+        ggml_tensor * freq_factors,
+        int sections[GGML_MROPE_SECTIONS],
+        int il) const {
+    GGML_ASSERT(inp && inp->rerot_active());
+    GGML_ASSERT(q_raw && q_raw->ne[2] == n_tokens);
+
+    if (!ggml_is_contiguous(q_raw)) {
+        q_raw = ggml_cont(ctx0, q_raw);
+    }
+
+    const int64_t head_dim = q_raw->ne[0];
+    const int64_t heads = q_raw->ne[1];
+    const int64_t groups = inp->get_rerot_q_indices()->ne[0];
+
+    ggml_tensor * q_flat = ggml_reshape_2d(ctx0, q_raw, head_dim * heads, n_tokens);
+    ggml_tensor * q_grouped = ggml_get_rows(ctx0, q_flat, inp->get_rerot_q_indices());
+    q_grouped = ggml_reshape_3d(ctx0, q_grouped, head_dim, heads, groups);
+    cb(q_grouped, "rerot_q_grouped_raw", il);
+
+    const int mode = static_cast<int>(rope_type);
+    if (mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE || mode == GGML_ROPE_TYPE_VISION) {
+        GGML_ASSERT(sections != nullptr);
+        q_grouped = ggml_rope_multi(
+            ctx0, q_grouped, inp->get_rerot_q_pos(), freq_factors,
+            n_rot, sections, mode, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    } else {
+        q_grouped = ggml_rope_ext(
+            ctx0, q_grouped, inp->get_rerot_q_pos(), freq_factors,
+            n_rot, mode, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    }
+    cb(q_grouped, "rerot_q_grouped", il);
+    return q_grouped;
+}
+
+ggml_tensor * llm_graph_context::build_attn_rerot(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * wo_s,
+        ggml_tensor * q_groups,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * sinks,
+        float kq_scale,
+        int il) const {
+    GGML_ASSERT(inp && inp->rerot_active());
+    GGML_ASSERT(q_groups && k_cur && v_cur);
+
+    if (inp->self_k_rot) {
+        q_groups = llama_mul_mat_hadamard(ctx0, q_groups, inp->self_k_rot);
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+    }
+    if (inp->self_v_rot) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    }
+
+    ggml_build_forward_expand(gf, q_groups);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il));
+
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * q = q_groups;
+
+    // TurboQuant caches hold WHT-domain K/V. Transform each RERoT query group
+    // once, after reader-relative RoPE, so all keys in that group reuse it.
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        if (q->ne[0] % 128 != 0) {
+            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
+            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
+        }
+        if (!ggml_is_contiguous(q)) {
+            q = ggml_cont(ctx0, q);
+        }
+        q = ggml_turbo_wht(ctx0, q, 0, 0, mctx_cur->get_turbo_innerq_scale_inv());
+    }
+
+    const bool v_trans = v->nb[1] > v->nb[2];
+    q = ggml_permute(ctx0, q, 0, 2, 1, 3); // [D, group, head, 1]
+    k = ggml_permute(ctx0, k, 0, 2, 1, 3); // [D, key,   head, 1]
+    v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+    if (v_trans) {
+        v = ggml_transpose(ctx0, v);
+    }
+
+    ggml_tensor * cur = ggml_flash_attn_ext_rerot(
+        ctx0, q, k, v,
+        inp->get_rerot_entries(), inp->get_rerot_offsets(), sinks,
+        kq_scale, hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+    ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+    cb(cur, "rerot_indexed_attn", il);
+
+    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
+        const bool k_is_turbo = k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0;
+        const ggml_tensor * group_src = k_is_turbo ? k : v;
+        const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
+        if (cur->ne[0] % turbo_group == 0) {
+            if (!ggml_is_contiguous(cur)) {
+                cur = ggml_cont(ctx0, cur);
+            }
+            cur = ggml_turbo_wht(ctx0, cur, 1, turbo_group, mctx_cur->get_turbo_innerq_scale_inv());
+        }
+    }
+
+    const int64_t padded_v_head = v->ne[0];
+    const int64_t orig_v_head = hparams.n_embd_head_v(il);
+    const int64_t n_queries = inp->get_rerot_offsets()->ne[0] - 1;
+    if (padded_v_head != orig_v_head) {
+        const int64_t n_head_v = hparams.n_head(il);
+        cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_queries);
+        cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_queries,
+                           cur->nb[1], cur->nb[2], 0);
+        cur = ggml_cont(ctx0, cur);
+    }
+    cur = ggml_reshape_2d(ctx0, cur, orig_v_head * hparams.n_head(il), n_queries);
+
+    if (inp->self_v_rot) {
+        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+    }
+    if (wo) {
+        cur = build_lora_mm(wo, cur, wo_s);
+    }
+    if (wo_b) {
+        cur = ggml_add(ctx0, cur, wo_b);
+    }
+
+    if (!cparams.offload_kqv) {
+        ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+    }
+    ggml_build_forward_expand(gf, cur);
+    return cur;
 }
 
 ggml_tensor * llm_graph_context::build_attn(
