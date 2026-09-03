@@ -227,6 +227,28 @@ struct llama_memory_i {
         GGML_UNUSED(publish_epoch);
         return 0;
     }
+    virtual bool rerot_can_add_run_ref(
+            uint64_t episode_id,
+            llama_rerot_run_id run_id,
+            llama_seq_id seq_id,
+            size_t * count) const {
+        GGML_UNUSED(episode_id);
+        GGML_UNUSED(run_id);
+        GGML_UNUSED(seq_id);
+        if (count) {
+            *count = 0;
+        }
+        return false;
+    }
+    virtual size_t rerot_add_run_ref(
+            uint64_t episode_id,
+            llama_rerot_run_id run_id,
+            llama_seq_id seq_id) {
+        GGML_UNUSED(episode_id);
+        GGML_UNUSED(run_id);
+        GGML_UNUSED(seq_id);
+        return 0;
+    }
     virtual bool rerot_set_reader_view(llama_seq_id seq_id, const llama_rerot_reader_state & view) {
         GGML_UNUSED(seq_id);
         GGML_UNUSED(view);

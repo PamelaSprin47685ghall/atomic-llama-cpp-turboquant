@@ -4357,6 +4357,17 @@ size_t llama_memory_rerot_reclassify_run(
         episode_id, run_id, convert(expected), convert(replacement), publish_epoch);
 }
 
+size_t llama_memory_rerot_add_run_ref(
+        llama_memory_t mem,
+        uint64_t episode_id,
+        uint32_t run_id,
+        llama_seq_id seq_id) {
+    if (!mem) {
+        return 0;
+    }
+    return mem->rerot_add_run_ref(episode_id, run_id, seq_id);
+}
+
 bool llama_memory_rerot_set_reader_view(
         llama_memory_t mem,
           llama_seq_id seq_id,

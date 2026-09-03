@@ -201,6 +201,11 @@ static void test(void) {
         assert(rerot_params.rerot_enabled);
         assert(rerot_params.kv_unified);
         assert(rerot_params.rerot_frontier == LLAMA_REROT_FRONTIER_STRONG);
+        rerot_params.n_parallel = 6;
+        const auto rerot_cparams = common_context_params_to_llama(rerot_params);
+        assert(rerot_cparams.n_seq_max == LLAMA_MAX_SEQ);
+        assert(rerot_cparams.n_seq_recurrent == 6);
+        assert(rerot_cparams.kv_unified);
 
         common_params lag1_params;
         argv = {"binary_name", "--rerot-frontier", "lag1"};

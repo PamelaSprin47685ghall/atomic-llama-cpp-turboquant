@@ -2011,6 +2011,76 @@ size_t llama_kv_cache::rerot_reclassify_run(
     return matches.size();
 }
 
+bool llama_kv_cache::rerot_can_add_run_ref(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_seq_id seq_id,
+        size_t * count) const {
+    if (count) {
+        *count = 0;
+    }
+    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID ||
+        seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+
+    const uint32_t dst_stream = seq_to_stream[seq_id];
+    size_t matches = 0;
+    for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
+        const auto & cells = v_cells[stream];
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (cells.is_empty(cell)) {
+                continue;
+            }
+            const auto & meta = cells.rerot_get(cell);
+            if (meta.episode_id != episode_id || meta.run_id != run_id) {
+                continue;
+            }
+            // A logical run cannot be copied between independent KV streams,
+            // and only an atomically published run is eligible for a keeper.
+            if (stream != dst_stream || meta.visibility != llama_rerot_visibility::public_live ||
+                meta.publish_epoch == 0) {
+                return false;
+            }
+            ++matches;
+        }
+    }
+
+    if (count) {
+        *count = matches;
+    }
+    return matches > 0;
+}
+
+size_t llama_kv_cache::rerot_add_run_ref(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_seq_id seq_id) {
+    size_t count = 0;
+    if (!rerot_can_add_run_ref(episode_id, run_id, seq_id, &count)) {
+        return 0;
+    }
+
+    auto & cells = v_cells[seq_to_stream[seq_id]];
+    size_t seen = 0;
+    for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+        if (cells.is_empty(cell)) {
+            continue;
+        }
+        const auto & meta = cells.rerot_get(cell);
+        if (meta.episode_id != episode_id || meta.run_id != run_id) {
+            continue;
+        }
+        if (!cells.seq_has(cell, seq_id)) {
+            cells.seq_add(cell, seq_id);
+        }
+        ++seen;
+    }
+
+    GGML_ASSERT(seen == count);
+    return seen;
+}
+
 bool llama_kv_cache::rerot_can_reclassify_run(
         uint64_t episode_id,
         llama_rerot_run_id run_id,

@@ -126,8 +126,12 @@ static void test_recursive_queue_and_last_survivor() {
     request_exit(runtime, episode_id, 1);
     frontier = runtime.finish_frontier(episode_id);
     CHECK(frontier.retired.size() == 1 && frontier.retired[0] == 1);
+    CHECK(frontier.released_slots.size() == 1 && frontier.released_slots[0] == 0);
     CHECK(!frontier.natural_final());
-    CHECK(runtime.detach_node(episode_id, 1));
+    const auto * retired_first = runtime.node(episode_id, 1);
+    CHECK(retired_first != nullptr);
+    CHECK(retired_first && retired_first->physical_slot == -1);
+    CHECK(retired_first && retired_first->exec_seq == -1);
 
     start_child(runtime, episode_id, 0, 2);
     make_terminal(runtime, episode_id, 2);
@@ -135,7 +139,19 @@ static void test_recursive_queue_and_last_survivor() {
     frontier = runtime.finish_frontier(episode_id);
     CHECK(frontier.natural_final());
     CHECK(frontier.final_node == 2);
-    CHECK(runtime.detach_node(episode_id, 2));
+    CHECK(frontier.retired.empty());
+    CHECK(frontier.released_slots.empty());
+    episode = runtime.episode(episode_id);
+    CHECK(episode && episode->finalizing);
+    CHECK(episode && episode->running.size() == 1 && episode->running.count(2) == 1);
+    const auto * final_lane = runtime.node(episode_id, 2);
+    CHECK(final_lane != nullptr);
+    CHECK(final_lane && final_lane->physical_slot == 0);
+    CHECK(final_lane && final_lane->exec_seq == 0);
+    CHECK(final_lane && final_lane->exit_intent);
+    const auto * final_doc = episode ? episode->document.node(2) : nullptr;
+    CHECK(final_doc != nullptr);
+    CHECK(final_doc && final_doc->state == llama_rerot_node_state::terminal_running);
 
     CHECK(runtime.erase_episode(episode_id));
     CHECK(runtime.episode(episode_id) == nullptr);
@@ -159,11 +175,20 @@ static void test_same_frontier_exit_tie_break() {
     request_exit(runtime, episode_id, 1);
 
     frontier = runtime.finish_frontier(episode_id);
-    CHECK(frontier.retired.size() == 2);
+    CHECK(frontier.retired.size() == 1);
     CHECK(frontier.retired[0] == 1);
-    CHECK(frontier.retired[1] == 2);
+    CHECK(frontier.released_slots.size() == 1 && frontier.released_slots[0] == 0);
     CHECK(frontier.final_node == 2);
     CHECK(frontier.natural_final());
+
+    const auto * episode = runtime.episode(episode_id);
+    CHECK(episode != nullptr);
+    CHECK(episode && episode->running.size() == 1 && episode->running.count(2) == 1);
+    const auto * first = runtime.node(episode_id, 1);
+    const auto * second = runtime.node(episode_id, 2);
+    CHECK(first && first->physical_slot == -1 && first->exec_seq == -1);
+    CHECK(second && second->physical_slot == 1 && second->exec_seq == 1);
+    CHECK(second && second->exit_intent);
     CHECK(runtime.erase_episode(episode_id));
 }
 

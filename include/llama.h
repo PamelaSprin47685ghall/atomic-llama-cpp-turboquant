@@ -36,6 +36,11 @@
 
 #define LLAMA_DEFAULT_SEED 0xFFFFFFFF
 
+// Maximum logical sequence-id arena supported by the cache metadata. Normal
+// callers typically use far fewer sequences; RERoT separates this logical
+// arena from the number of physically resident recurrent states.
+#define LLAMA_MAX_SEQ 256
+
 #define LLAMA_TOKEN_NULL -1
 
 #define LLAMA_FILE_MAGIC_GGLA 0x67676c61u // 'ggla'
@@ -872,6 +877,17 @@ extern "C" {
         enum llama_rerot_kv_visibility expected,
         enum llama_rerot_kv_visibility replacement,
                    uint64_t publish_epoch);
+
+    // Adds `seq_id` as a keeper/reference to every resident attention KV cell
+    // belonging to one PUBLIC RERoT run. The run is selected by stable logical
+    // metadata, not by physical index or position range, so this remains valid
+    // after TriAttention eviction and cache compaction. Returns the number of
+    // matching resident cells; zero means validation failed or no cells remain.
+    LLAMA_API size_t llama_memory_rerot_add_run_ref(
+            llama_memory_t mem,
+                   uint64_t episode_id,
+                   uint32_t run_id,
+               llama_seq_id seq_id);
 
     // Install/clear the reader-specific PAC-DFS run order used by subsequent
     // decode calls for `seq_id`. Returns false for invalid descriptors or

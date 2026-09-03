@@ -168,6 +168,7 @@ struct server_rerot_frontier_result {
     uint64_t completed_frontier = 0;
     std::vector<llama_rerot_node_id> forked;
     std::vector<llama_rerot_node_id> retired;
+    std::vector<int> released_slots;
     llama_rerot_node_id final_node = LLAMA_REROT_NODE_INVALID;
     bool topology_barrier = false;
     bool hard_aborted = false;
@@ -208,13 +209,6 @@ struct server_rerot_episode {
     explicit server_rerot_episode(uint64_t episode_id = 1)
         : id(episode_id), document(episode_id) {
     }
-};
-
-struct server_rerot_exit_resolution {
-    std::vector<llama_rerot_node_id> retired;
-    std::vector<int> released_slots;
-    llama_rerot_node_id final_survivor = LLAMA_REROT_NODE_INVALID;
-    bool hard_aborted = false;
 };
 
 // Logical/server control plane for RERoT. It owns no physical KV indices.
@@ -295,10 +289,6 @@ public:
         llama_seq_id exec_seq,
         llama_rerot_node_id * admitted_node);
 
-    bool activate_node(uint64_t episode_id, llama_rerot_node_id node_id);
-    bool mark_exit_intent(uint64_t episode_id, llama_rerot_node_id node_id);
-    server_rerot_exit_resolution resolve_exit_intents(uint64_t episode_id);
-
     // Marks a fully injected child heading as RUNNING. The private planner
     // prefix may be injected before or after this transition, but ordinary
     // generated tokens are only legal once the node is RUNNING.
@@ -359,7 +349,8 @@ private:
     bool ensure_archive_seq(server_rerot_episode & episode, llama_seq_id source_seq);
     void archive_public_runs(
         server_rerot_episode & episode,
-        const server_rerot_node_runtime & node);
+        const server_rerot_node_runtime & node,
+        llama_seq_id archive_seq);
 
     bool finalize_exit_marker(
         server_rerot_episode & episode,

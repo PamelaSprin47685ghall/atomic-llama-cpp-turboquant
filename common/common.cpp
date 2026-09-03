@@ -1796,9 +1796,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_ctx_kv          = params.n_ctx_kv;
-    cparams.n_seq_max         = params.n_parallel;
+    cparams.n_seq_max         = params.rerot_enabled ? LLAMA_MAX_SEQ : params.n_parallel;
     cparams.n_seq_max_pp      = params.n_parallel_pp;
-    cparams.n_seq_recurrent   = 0;
+    // RERoT needs many logical ids for parked/archive sequences, but only one
+    // live recurrent state per physical server slot. The context keeps these
+    // capacities separate so the seq-id arena does not multiply recurrent VRAM.
+    cparams.n_seq_recurrent   = params.rerot_enabled ? params.n_parallel : 0;
     cparams.n_outputs_max     = params.n_outputs_max;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
@@ -1825,7 +1828,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
-    cparams.kv_unified        = params.kv_unified;
+    cparams.kv_unified        = params.rerot_enabled ? true : params.kv_unified;
     cparams.triattention        = params.triattention_enabled;
     cparams.triattention_stats  = params.triattention_stats.c_str();
     cparams.triattention_ratio  = params.triattention_ratio;

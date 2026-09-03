@@ -228,6 +228,37 @@ size_t llama_kv_cache_iswa::rerot_reclassify_run(
     return count;
 }
 
+bool llama_kv_cache_iswa::rerot_can_add_run_ref(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_seq_id seq_id,
+        size_t * count) const {
+    size_t count_base = 0;
+    size_t count_swa = 0;
+    const bool base_ok = kv_base->rerot_can_add_run_ref(
+        episode_id, run_id, seq_id, &count_base);
+    const bool swa_ok = kv_swa->rerot_can_add_run_ref(
+        episode_id, run_id, seq_id, &count_swa);
+    if (count) {
+        *count = base_ok && swa_ok ? count_base + count_swa : 0;
+    }
+    return base_ok && swa_ok;
+}
+
+size_t llama_kv_cache_iswa::rerot_add_run_ref(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_seq_id seq_id) {
+    size_t count = 0;
+    if (!rerot_can_add_run_ref(episode_id, run_id, seq_id, &count)) {
+        return 0;
+    }
+    const size_t base_count = kv_base->rerot_add_run_ref(episode_id, run_id, seq_id);
+    const size_t swa_count = kv_swa->rerot_add_run_ref(episode_id, run_id, seq_id);
+    GGML_ASSERT(base_count + swa_count == count);
+    return count;
+}
+
 bool llama_kv_cache_iswa::rerot_set_reader_view(
         llama_seq_id seq_id,
         const llama_rerot_reader_state & view) {

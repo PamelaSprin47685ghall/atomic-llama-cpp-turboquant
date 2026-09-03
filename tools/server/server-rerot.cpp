@@ -984,6 +984,98 @@ void server_rerot_runtime::free_internal_seq(llama_seq_id seq_id) {
     }
 }
 
+bool server_rerot_runtime::ensure_archive_seq(
+        server_rerot_episode & episode,
+        llama_seq_id source_seq) {
+    if (episode.archive_seq >= 0) {
+        return true;
+    }
+
+    const auto archive_seq = alloc_internal_seq();
+    if (!archive_seq.has_value()) {
+        return fail_episode(episode, "RERoT internal seq-id arena exhausted while creating archive");
+    }
+    episode.archive_seq = *archive_seq;
+
+    if (memory_ && episode.base_prefix_end > 0) {
+        llama_memory_seq_cp_attention(
+            memory_, source_seq, episode.archive_seq, 0, episode.base_prefix_end);
+    }
+    return true;
+}
+
+void server_rerot_runtime::archive_public_runs(
+        server_rerot_episode & episode,
+        const server_rerot_node_runtime & node,
+        llama_seq_id archive_seq) {
+    if (!memory_ || archive_seq < 0 || node.exec_seq < 0) {
+        return;
+    }
+
+    const auto * doc_node = episode.document.node(node.id);
+    if (!doc_node) {
+        return;
+    }
+    for (const auto run_id : doc_node->runs) {
+        const auto * run = episode.document.run(run_id);
+        if (!run || run->visibility != llama_rerot_visibility::public_live || run->token_count == 0) {
+            continue;
+        }
+        // Select by stable logical metadata rather than storage ranges. The
+        // physical KV layout may already have changed under TriAttention, but
+        // every still-resident cell of this published run keeps its
+        // (episode_id, run_id) identity across eviction/compaction.
+        llama_memory_rerot_add_run_ref(memory_, episode.id, run_id, archive_seq);
+    }
+}
+
+bool server_rerot_runtime::retire_node(
+        server_rerot_episode & episode,
+        server_rerot_node_runtime & node,
+        int * released_slot) {
+    if (released_slot) {
+        *released_slot = -1;
+    }
+    if (node.physical_slot < 0 || node.exec_seq < 0 || node.pending_record.has_value()) {
+        return fail_episode(episode, "invalid RERoT Lane retirement state");
+    }
+    if (!ensure_archive_seq(episode, node.exec_seq)) {
+        return false;
+    }
+
+    archive_public_runs(episode, node, episode.archive_seq);
+    if (memory_) {
+        if (!llama_memory_seq_rm_attention(memory_, node.exec_seq, -1, -1) ||
+            !llama_memory_seq_rm_recurrent(memory_, node.exec_seq, -1, -1)) {
+            return fail_episode(episode, "failed to release retiring RERoT execution sequence");
+        }
+        clear_sequence_control(node.exec_seq);
+    }
+
+    const int physical_slot = node.physical_slot;
+    const auto slot_it = slot_to_episode_.find(physical_slot);
+    if (slot_it != slot_to_episode_.end() && slot_it->second == episode.id) {
+        slot_to_episode_.erase(slot_it);
+    }
+
+    episode.running.erase(node.id);
+    episode.starting.erase(node.id);
+    node.exit_intent = false;
+    node.physical_slot = -1;
+    node.exec_seq = -1;
+    if (!episode.document.set_node_state(node.id, llama_rerot_node_state::retired)) {
+        return fail_episode(episode, "failed to mark retiring RERoT Lane as RETIRED");
+    }
+
+    episode.topology_barrier_pending = true;
+    ++episode.topology_epoch;
+    ++episode.layout_epoch;
+    if (released_slot) {
+        *released_slot = physical_slot;
+    }
+    return true;
+}
+
 bool server_rerot_runtime::freeze_fork_parent(
         uint64_t episode_id,
         llama_rerot_node_id parent_id) {
@@ -1031,15 +1123,7 @@ bool server_rerot_runtime::freeze_fork_parent(
                 memory_, parent->exec_seq, archive_seq, 0, current->base_prefix_end);
         }
 
-        for (const auto run_id : parent_doc->runs) {
-            const auto * run = current->document.run(run_id);
-            if (!run || run->visibility != llama_rerot_visibility::public_live || run->token_count == 0) {
-                continue;
-            }
-            const llama_pos p0 = run->storage_pos0;
-            const llama_pos p1 = p0 + static_cast<llama_pos>(run->token_count);
-            llama_memory_seq_cp_attention(memory_, parent->exec_seq, archive_seq, p0, p1);
-        }
+        archive_public_runs(*current, *parent, archive_seq);
 
         for (const auto & child : parked) {
             llama_memory_seq_cp_recurrent(memory_, parent->exec_seq, child.second, -1, -1);
@@ -1106,6 +1190,33 @@ bool server_rerot_runtime::admit_next_child(
             llama_memory_seq_cp_attention(
                 memory_, current->archive_seq, exec_seq, 0, current->base_prefix_end);
         }
+
+        // The copied recurrent state is positioned at the parent's final
+        // planner token. Add a reference to the latest PUBLIC parent run so
+        // attention and recurrent seq_pos_max stay aligned even though the
+        // intervening private planner prompt is intentionally invisible.
+        const auto * parent_doc = current->document.node(child_doc->parent);
+        const llama_rerot_run * anchor = nullptr;
+        if (parent_doc) {
+            for (const auto run_id : parent_doc->runs) {
+                const auto * run = current->document.run(run_id);
+                if (!run || run->visibility != llama_rerot_visibility::public_live || run->token_count == 0) {
+                    continue;
+                }
+                const int64_t end = int64_t(run->storage_pos0) + int64_t(run->token_count);
+                const int64_t anchor_end = anchor
+                    ? int64_t(anchor->storage_pos0) + int64_t(anchor->token_count)
+                    : -1;
+                if (end > anchor_end) {
+                    anchor = run;
+                }
+            }
+        }
+        if (!anchor || int64_t(anchor->storage_pos0) + int64_t(anchor->token_count) != child->storage_pos_next ||
+            llama_memory_rerot_add_run_ref(memory_, current->id, anchor->id, exec_seq) == 0) {
+            return fail_episode(*current, "RERoT child admission could not anchor the fork frontier");
+        }
+
         llama_memory_seq_cp_recurrent(memory_, child->parked_seq, exec_seq, -1, -1);
         if (!llama_memory_seq_rm_recurrent(memory_, child->parked_seq, -1, -1)) {
             return fail_episode(*current, "failed to release parked recurrent sequence after admission");
@@ -1182,27 +1293,45 @@ server_rerot_frontier_result server_rerot_runtime::finish_frontier(uint64_t epis
         return current->document.tree_path(lhs) < current->document.tree_path(rhs);
     });
 
+    llama_rerot_node_id final_candidate = LLAMA_REROT_NODE_INVALID;
+    if (!exits.empty() &&
+        exits.size() == current->running.size() &&
+        current->ready_queue.empty() &&
+        current->starting.empty()) {
+        // Same-frontier simultaneous exits are not judged. Stable tree-path
+        // order alone chooses the Lane that remains live for the final acquire
+        // fence. It must not be retired before Stage 7 refreshes its logits.
+        final_candidate = exits.back();
+    }
+
     for (const auto node_id : exits) {
+        if (node_id == final_candidate) {
+            continue;
+        }
         auto * current_node = node(episode_id, node_id);
         if (!current_node) {
             fail_episode(*current, "RERoT exit set references a missing node");
             break;
         }
-        current_node->exit_intent = false;
-        current->running.erase(node_id);
-        if (!current->document.set_node_state(node_id, llama_rerot_node_state::retired)) {
-            fail_episode(*current, "failed to retire RERoT Lane");
+        int released_slot = -1;
+        if (!retire_node(*current, *current_node, &released_slot)) {
             break;
         }
         result.retired.push_back(node_id);
+        if (released_slot >= 0) {
+            result.released_slots.push_back(released_slot);
+        }
     }
 
-    if (!current->hard_aborted && !exits.empty() &&
-        current->ready_queue.empty() && current->starting.empty() && current->running.empty()) {
-        // Tree-path order is the deterministic tie-break for same-frontier
-        // exits. No answer-quality judgment is hidden here.
-        result.final_node = exits.back();
+    if (!current->hard_aborted && final_candidate != LLAMA_REROT_NODE_INVALID) {
+        result.final_node = final_candidate;
         current->finalizing = true;
+        const auto * survivor = node(episode_id, final_candidate);
+        if (!survivor || !survivor->exit_intent ||
+            current->running.find(final_candidate) == current->running.end()) {
+            fail_episode(*current, "RERoT final survivor lost its live execution state");
+            result.final_node = LLAMA_REROT_NODE_INVALID;
+        }
     }
 
     result.topology_barrier = current->topology_barrier_pending;

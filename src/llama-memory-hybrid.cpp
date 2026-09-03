@@ -247,6 +247,21 @@ size_t llama_memory_hybrid::rerot_reclassify_run(
         episode_id, run_id, expected, replacement, publish_epoch);
 }
 
+bool llama_memory_hybrid::rerot_can_add_run_ref(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_seq_id seq_id,
+        size_t * count) const {
+    return mem_attn->rerot_can_add_run_ref(episode_id, run_id, seq_id, count);
+}
+
+size_t llama_memory_hybrid::rerot_add_run_ref(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_seq_id seq_id) {
+    return mem_attn->rerot_add_run_ref(episode_id, run_id, seq_id);
+}
+
 bool llama_memory_hybrid::rerot_set_reader_view(
         llama_seq_id seq_id,
         const llama_rerot_reader_state & view) {
