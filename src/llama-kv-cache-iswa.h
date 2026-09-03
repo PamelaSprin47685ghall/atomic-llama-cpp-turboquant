@@ -77,6 +77,11 @@ public:
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
+    bool rerot_set_write_tag(llama_seq_id seq_id, const llama_kv_rerot_meta & tag) override;
+    void rerot_clear_write_tag(llama_seq_id seq_id) override;
+    bool rerot_can_publish_run(uint64_t episode_id, llama_rerot_run_id run_id, size_t * count) const override;
+    size_t rerot_publish_run(uint64_t episode_id, llama_rerot_run_id run_id, uint64_t publish_epoch) override;
+
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 

@@ -20,6 +20,21 @@ struct llama_context;
 
 class llama_kv_cache : public llama_memory_i {
 public:
+    struct rerot_resolved_cell {
+        uint32_t stream = 0;
+        uint32_t cell = 0;
+        llama_pos storage_pos = 0;
+        llama_pos virtual_pos = 0;
+        llama_kv_rerot_meta meta;
+    };
+
+    struct rerot_resolved_view {
+        uint64_t episode_id = 0;
+        llama_rerot_node_id reader = LLAMA_REROT_NODE_INVALID;
+        llama_pos query_virtual_pos = 0;
+        std::vector<rerot_resolved_cell> cells;
+    };
+
     struct stream_copy_info {
         bool empty() const {
             assert(ssrc.size() == sdst.size());
@@ -177,6 +192,29 @@ public:
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
+    // RERoT write tags are sequence-scoped control state. apply_ubatch() copies
+    // the active tag into each newly allocated physical cell. Ordinary
+    // sequences have a cleared tag and therefore retain stock behavior.
+    bool rerot_set_write_tag(llama_seq_id seq_id, const llama_kv_rerot_meta & tag) override;
+    void rerot_clear_write_tag(llama_seq_id seq_id) override;
+
+    bool rerot_can_publish_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        size_t * count) const override;
+
+    // Atomically publish every resident cell of a pending logical run. Returns
+    // the number of cells transitioned; zero means no matching pending cells.
+    size_t rerot_publish_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        uint64_t publish_epoch) override;
+
+    // Resolve a logical PAC-DFS view after any TriAttention eviction or cache
+    // compaction. Resident cells are ordered by the logical run sequence and
+    // densely repacked in virtual address space.
+    rerot_resolved_view rerot_resolve_view(const llama_rerot_reader_view & view) const;
+
     //
     // graph_build API
     //
@@ -315,6 +353,10 @@ private:
 
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;
+
+    // Current per-sequence write classification. These are control-plane
+    // values, not physical-cell metadata, and are reset on cache clear.
+    std::vector<llama_kv_rerot_meta> rerot_write_tags;
 
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;

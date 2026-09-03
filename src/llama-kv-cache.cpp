@@ -213,6 +213,8 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    rerot_write_tags.resize(LLAMA_MAX_SEQ);
+
     // [TAG_V_CACHE_VARIABLE]
     if (v_trans && hparams.is_n_embd_v_gqa_variable()) {
         LLAMA_LOG_WARN("%s: the V embeddings have different sizes across layers and FA is not enabled - padding V cache to %d\n",
@@ -602,6 +604,10 @@ void llama_kv_cache::clear(bool data) {
         v_heads[s] = 0;
     }
 
+    for (auto & tag : rerot_write_tags) {
+        tag.reset();
+    }
+
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
@@ -773,6 +779,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
             }
 
             v_cells[s1].ext_set(i, ext);
+            v_cells[s1].rerot_set(i, v_cells[s0].rerot_get(i));
         }
     }
 
@@ -1763,6 +1770,26 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
                 cells.seq_add(idx, ubatch.seq_id[i][s]);
             }
+
+            llama_kv_rerot_meta write_tag;
+            bool has_write_tag = false;
+            for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                const llama_seq_id seq_id = ubatch.seq_id[i][j];
+                GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < rerot_write_tags.size());
+
+                const auto & candidate = rerot_write_tags[seq_id];
+                if (!candidate.active()) {
+                    continue;
+                }
+
+                GGML_ASSERT(!has_write_tag || candidate == write_tag);
+                write_tag = candidate;
+                has_write_tag = true;
+            }
+
+            if (has_write_tag) {
+                cells.rerot_set(idx, write_tag);
+            }
         }
     }
 
@@ -1881,6 +1908,155 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     return v_cells[seq_to_stream[seq_id]];
+}
+
+bool llama_kv_cache::rerot_set_write_tag(
+        llama_seq_id seq_id,
+        const llama_kv_rerot_meta & tag) {
+    if (seq_id < 0 || (size_t) seq_id >= rerot_write_tags.size()) {
+        return false;
+    }
+
+    if (tag.active()) {
+        if (tag.node_id == LLAMA_REROT_NODE_INVALID || tag.run_id == LLAMA_REROT_RUN_INVALID ||
+            tag.visibility == llama_rerot_visibility::normal ||
+            (tag.visibility == llama_rerot_visibility::pending_record && tag.publish_epoch != 0)) {
+            return false;
+        }
+        rerot_write_tags[seq_id] = tag;
+    } else {
+        rerot_write_tags[seq_id].reset();
+    }
+
+    return true;
+}
+
+void llama_kv_cache::rerot_clear_write_tag(llama_seq_id seq_id) {
+    if (seq_id >= 0 && (size_t) seq_id < rerot_write_tags.size()) {
+        rerot_write_tags[seq_id].reset();
+    }
+}
+
+size_t llama_kv_cache::rerot_publish_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        uint64_t publish_epoch) {
+    size_t count = 0;
+    if (publish_epoch == 0 || !rerot_can_publish_run(episode_id, run_id, &count)) {
+        return 0;
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> matches;
+    for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
+        const auto & cells = v_cells[stream];
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (cells.is_empty(cell)) {
+                continue;
+            }
+            const auto & meta = cells.rerot_get(cell);
+            if (meta.episode_id == episode_id && meta.run_id == run_id) {
+                matches.emplace_back(stream, cell);
+            }
+        }
+    }
+
+    GGML_ASSERT(matches.size() == count);
+
+    for (const auto & match : matches) {
+        const bool published = v_cells[match.first].rerot_publish(
+            match.second, episode_id, run_id, publish_epoch);
+        GGML_ASSERT(published);
+    }
+
+    return matches.size();
+}
+
+bool llama_kv_cache::rerot_can_publish_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        size_t * count) const {
+    if (count) {
+        *count = 0;
+    }
+    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID) {
+        return false;
+    }
+
+    size_t matches = 0;
+    for (const auto & cells : v_cells) {
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (cells.is_empty(cell)) {
+                continue;
+            }
+            const auto & meta = cells.rerot_get(cell);
+            if (meta.episode_id != episode_id || meta.run_id != run_id) {
+                continue;
+            }
+            if (meta.visibility != llama_rerot_visibility::pending_record) {
+                return false;
+            }
+            ++matches;
+        }
+    }
+
+    if (count) {
+        *count = matches;
+    }
+    return matches > 0;
+}
+
+llama_kv_cache::rerot_resolved_view llama_kv_cache::rerot_resolve_view(
+        const llama_rerot_reader_view & view) const {
+    rerot_resolved_view result;
+    result.episode_id = view.episode_id;
+    result.reader = view.reader;
+
+    for (const auto & logical_run : view.runs) {
+        std::vector<rerot_resolved_cell> run_cells;
+
+        for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
+            const auto & cells = v_cells[stream];
+            for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+                if (cells.is_empty(cell)) {
+                    continue;
+                }
+
+                const auto & meta = cells.rerot_get(cell);
+                if (meta.episode_id != view.episode_id || meta.run_id != logical_run.run_id ||
+                    meta.node_id != logical_run.owner) {
+                    continue;
+                }
+
+                run_cells.push_back({
+                    stream,
+                    cell,
+                    cells.pos_get(cell),
+                    0,
+                    meta,
+                });
+            }
+        }
+
+        std::stable_sort(run_cells.begin(), run_cells.end(), [](const auto & lhs, const auto & rhs) {
+            if (lhs.storage_pos != rhs.storage_pos) {
+                return lhs.storage_pos < rhs.storage_pos;
+            }
+            if (lhs.meta.frontier != rhs.meta.frontier) {
+                return lhs.meta.frontier < rhs.meta.frontier;
+            }
+            if (lhs.stream != rhs.stream) {
+                return lhs.stream < rhs.stream;
+            }
+            return lhs.cell < rhs.cell;
+        });
+
+        for (auto & resolved : run_cells) {
+            resolved.virtual_pos = result.query_virtual_pos++;
+            result.cells.push_back(std::move(resolved));
+        }
+    }
+
+    return result;
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {

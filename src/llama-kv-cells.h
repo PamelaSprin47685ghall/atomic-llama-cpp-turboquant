@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "llama-cparams.h"
+#include "llama-rerot.h"
 
 #include <bitset>
 #include <cassert>
@@ -51,6 +52,7 @@ public:
             ext[i].reset();
             shift[i] =  0;
             seq[i].reset();
+            rerot[i].reset();
         }
 
         has_shift = false;
@@ -80,6 +82,7 @@ public:
         ext.resize(n);
         shift.resize(n);
         seq.resize(n);
+        rerot.resize(n);
 
         reset();
     }
@@ -145,6 +148,7 @@ public:
             res.pos[j] = pos[idx];
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
+            res.rerot[j] = rerot[idx];
 
             assert(shift[idx] == 0);
         }
@@ -164,6 +168,7 @@ public:
             res.pos[j] = pos[idx];
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
+            res.rerot[j] = rerot[idx];
 
             assert(shift[idx] == 0);
         }
@@ -193,6 +198,7 @@ public:
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
+            rerot[idx] = other.rerot[j];
 
             if (pos[idx] != -1) {
                 seq_pos_add(i + j);
@@ -224,6 +230,7 @@ public:
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
+            rerot[idx] = other.rerot[j];
 
             if (pos[idx] != -1) {
                 seq_pos_add(idx);
@@ -244,6 +251,7 @@ public:
         pos[i] = -1;
         ext[i].reset();
         shift[i] = 0;
+        rerot[i].reset();
 
         used.erase(i);
     }
@@ -287,6 +295,7 @@ public:
         std::vector<llama_kv_cell_ext> saved_ext  (n);
         std::vector<seq_set_t>         saved_seq  (n);
         std::vector<llama_pos>         saved_shift(n);
+        std::vector<llama_kv_rerot_meta> saved_rerot(n);
 
         uint32_t dst = 0;
         for (const auto & move : plan.moves) {
@@ -296,6 +305,7 @@ public:
                 saved_ext  [dst] = ext  [src];
                 saved_seq  [dst] = seq  [src];
                 saved_shift[dst] = shift[src];
+                saved_rerot[dst] = rerot[src];
                 ++dst;
             }
         }
@@ -307,6 +317,7 @@ public:
             pos  [idx] = -1;
             ext  [idx].reset();
             shift[idx] =  0;
+            rerot[idx].reset();
         }
         used.clear();
 
@@ -316,6 +327,7 @@ public:
             ext  [i] = saved_ext  [i];
             seq  [i] = saved_seq  [i];
             shift[i] = saved_shift[i];
+            rerot[i] = saved_rerot[i];
             used.insert(i);
             seq_pos_add(i);
         }
@@ -336,6 +348,7 @@ public:
             pos[i] = -1;
             ext[i].reset();
             shift[i] = 0;
+            rerot[i].reset();
 
             used.erase(i);
 
@@ -366,6 +379,7 @@ public:
             pos[i] = -1;
             ext[i].reset();
             shift[i] = 0;
+            rerot[i].reset();
 
             used.erase(i);
 
@@ -469,6 +483,53 @@ public:
         return ext[i];
     }
 
+    const llama_kv_rerot_meta & rerot_get(uint32_t i) const {
+        assert(i < rerot.size());
+        return rerot[i];
+    }
+
+    // Attach a complete RERoT write tag to a non-empty cell. A zero episode id
+    // is reserved for ordinary KV and therefore clears the metadata.
+    void rerot_set(uint32_t i, llama_kv_rerot_meta meta) {
+        assert(i < rerot.size());
+        assert(pos[i] != -1);
+
+        if (!meta.active()) {
+            meta.reset();
+        } else {
+            assert(meta.node_id != LLAMA_REROT_NODE_INVALID);
+            assert(meta.run_id != LLAMA_REROT_RUN_INVALID);
+            assert(meta.visibility != llama_rerot_visibility::normal);
+            if (meta.visibility == llama_rerot_visibility::pending_record) {
+                assert(meta.publish_epoch == 0);
+            }
+        }
+        rerot[i] = meta;
+    }
+
+    void rerot_reset(uint32_t i) {
+        assert(i < rerot.size());
+        rerot[i].reset();
+    }
+
+    bool rerot_publish(
+            uint32_t i,
+            uint64_t episode_id,
+            llama_rerot_run_id run_id,
+            uint64_t publish_epoch) {
+        assert(i < rerot.size());
+
+        auto & meta = rerot[i];
+        if (pos[i] == -1 || publish_epoch == 0 || meta.episode_id != episode_id ||
+            meta.run_id != run_id || meta.visibility != llama_rerot_visibility::pending_record) {
+            return false;
+        }
+
+        meta.visibility = llama_rerot_visibility::public_live;
+        meta.publish_epoch = publish_epoch;
+        return true;
+    }
+
     // note: call only if the cell is not empty
     llama_pos get_shift(uint32_t i) const {
         assert(i < pos.size());
@@ -493,6 +554,7 @@ public:
         assert(seq[i].none());
 
         pos[i] = p;
+        rerot[i].reset();
 
         used.insert(i);
     }
@@ -520,6 +582,7 @@ public:
             seq[i].reset();
             pos[i] = -1;
             shift[i] = 0;
+            rerot[i].reset();
 
             used.erase(i);
 
@@ -582,6 +645,11 @@ private:
 
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;
+
+    // RERoT metadata is part of the physical cell lifecycle. It must never be
+    // mirrored in server-side physical-index tables because TriAttention
+    // compaction can move cells.
+    std::vector<llama_kv_rerot_meta> rerot;
 
     // the set seq_pos[s][p] tells us how many times the position p is currently present for sequence s
     // if the position p is not present, seq_pos[s][p] is not set

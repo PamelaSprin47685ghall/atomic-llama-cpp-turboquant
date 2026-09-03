@@ -579,6 +579,8 @@ struct common_params : wanxiangqi_common_params {
     bool triattention_enabled = false;
     std::string triattention_stats;
     double triattention_ratio = 3.0 / 32.0;
+    bool rerot_enabled = false;
+    llama_rerot_frontier_mode rerot_frontier = LLAMA_REROT_FRONTIER_STRONG;
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation

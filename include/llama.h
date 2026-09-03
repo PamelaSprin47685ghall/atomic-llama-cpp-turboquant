@@ -220,6 +220,18 @@ extern "C" {
         LLAMA_CONTEXT_TYPE_MTP     = 1,
     };
 
+    enum llama_rerot_frontier_mode {
+        // Tokens selected from the previous frontier can attend peer tokens of
+        // the current frontier at each transformer layer.
+        LLAMA_REROT_FRONTIER_STRONG = 0,
+
+        // Current-frontier peer tokens become visible on the next frontier.
+        // This is the conservative ablation and debugging mode.
+        LLAMA_REROT_FRONTIER_LAG1 = 1,
+    };
+
+    LLAMA_API const char * llama_rerot_frontier_mode_name(enum llama_rerot_frontier_mode mode);
+
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
     typedef struct llama_token_data {
         llama_token id; // token id
@@ -416,6 +428,9 @@ extern "C" {
         bool triattention;               // enable TriAttention KV cache eviction
         const char * triattention_stats; // path to .triattention calibration file
         double triattention_ratio;       // fraction of logical tokens retained by TriAttention
+
+        bool rerot;                                      // enable Recursive Elastic Ring-of-Thought execution support
+        enum llama_rerot_frontier_mode rerot_frontier;  // shared-memory visibility timing
     };
 
     struct llama_model_tensor_override {
@@ -759,6 +774,71 @@ extern "C" {
               llama_seq_id seq_id_dst,
                  llama_pos p0,
                  llama_pos p1);
+
+    // Component-selective variants for hybrid-memory runtimes. On an
+    // attention-only model these are equivalent to the ordinary KV operation;
+    // on a recurrent-only model the attention variants are no-ops. The inverse
+    // applies to recurrent variants.
+    LLAMA_API bool llama_memory_seq_rm_attention(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    LLAMA_API void llama_memory_seq_cp_attention(
+            llama_memory_t mem,
+              llama_seq_id seq_id_src,
+              llama_seq_id seq_id_dst,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    LLAMA_API bool llama_memory_seq_rm_recurrent(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    LLAMA_API void llama_memory_seq_cp_recurrent(
+            llama_memory_t mem,
+              llama_seq_id seq_id_src,
+              llama_seq_id seq_id_dst,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    enum llama_rerot_kv_visibility {
+        LLAMA_REROT_KV_PUBLIC_LIVE = 1,
+        LLAMA_REROT_KV_PRIVATE_CONTROL = 2,
+        LLAMA_REROT_KV_PENDING_RECORD = 3,
+    };
+
+    struct llama_rerot_kv_write_tag {
+        uint64_t episode_id;
+        uint32_t node_id;
+        uint32_t run_id;
+        uint64_t publish_epoch;
+        uint64_t frontier;
+        enum llama_rerot_kv_visibility visibility;
+    };
+
+    // Classify future KV writes by a sequence. Existing cells are unchanged.
+    // Returns false when the memory has no compatible attention KV component or
+    // the tag is invalid.
+    LLAMA_API bool llama_memory_rerot_set_write_tag(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+        const struct llama_rerot_kv_write_tag * tag);
+
+    LLAMA_API void llama_memory_rerot_clear_write_tag(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    // Atomically publish all currently resident cells of a pending run. A zero
+    // return means validation failed or the run has no resident pending cells.
+    LLAMA_API size_t llama_memory_rerot_publish_run(
+            llama_memory_t mem,
+                   uint64_t episode_id,
+                   uint32_t run_id,
+                   uint64_t publish_epoch);
 
     // Removes all tokens that do not belong to the specified sequence
     LLAMA_API void llama_memory_seq_keep(

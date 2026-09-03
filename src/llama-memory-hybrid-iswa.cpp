@@ -56,7 +56,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         type_s,
         offload,
         rs_size,
-        n_seq_max,
+        unified ? LLAMA_MAX_SEQ : n_seq_max,
         n_rs_seq,
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
@@ -181,6 +181,54 @@ bool llama_memory_hybrid_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_p
 void llama_memory_hybrid_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_memory_hybrid_iswa::seq_rm_attention(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return mem_attn->seq_rm(seq_id, p0, p1);
+}
+
+void llama_memory_hybrid_iswa::seq_cp_attention(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst,
+        llama_pos p0,
+        llama_pos p1) {
+    mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_memory_hybrid_iswa::seq_rm_recurrent(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return mem_recr->seq_rm(seq_id, p0, p1);
+}
+
+void llama_memory_hybrid_iswa::seq_cp_recurrent(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst,
+        llama_pos p0,
+        llama_pos p1) {
+    mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_memory_hybrid_iswa::rerot_set_write_tag(
+        llama_seq_id seq_id,
+        const llama_kv_rerot_meta & tag) {
+    return mem_attn->rerot_set_write_tag(seq_id, tag);
+}
+
+void llama_memory_hybrid_iswa::rerot_clear_write_tag(llama_seq_id seq_id) {
+    mem_attn->rerot_clear_write_tag(seq_id);
+}
+
+bool llama_memory_hybrid_iswa::rerot_can_publish_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        size_t * count) const {
+    return mem_attn->rerot_can_publish_run(episode_id, run_id, count);
+}
+
+size_t llama_memory_hybrid_iswa::rerot_publish_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        uint64_t publish_epoch) {
+    return mem_attn->rerot_publish_run(episode_id, run_id, publish_epoch);
 }
 
 void llama_memory_hybrid_iswa::seq_keep(llama_seq_id seq_id) {

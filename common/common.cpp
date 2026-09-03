@@ -1829,6 +1829,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.triattention        = params.triattention_enabled;
     cparams.triattention_stats  = params.triattention_stats.c_str();
     cparams.triattention_ratio  = params.triattention_ratio;
+    cparams.rerot               = params.rerot_enabled;
+    cparams.rerot_frontier      = params.rerot_frontier;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

@@ -2,6 +2,23 @@
 
 #include <cassert>
 
+static llama_kv_rerot_meta make_rerot_meta(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id,
+        llama_rerot_run_id run_id,
+        llama_rerot_visibility visibility,
+        uint64_t publish_epoch,
+        uint64_t frontier) {
+    llama_kv_rerot_meta result;
+    result.episode_id = episode_id;
+    result.node_id = node_id;
+    result.run_id = run_id;
+    result.visibility = visibility;
+    result.publish_epoch = publish_epoch;
+    result.frontier = frontier;
+    return result;
+}
+
 int main() {
     llama_kv_cells cells;
     cells.resize(4);
@@ -272,6 +289,56 @@ int main() {
         assert(cells.pos_get(2) == 3);
         assert(cells.ext_get(2).x == 7);
         assert(cells.ext_get(2).y == 8);
+    }
+
+    // Test 7: RERoT metadata follows the physical cell through copy/restore,
+    // publication, compaction, and final reference removal.
+    {
+        llama_kv_cells cells;
+        cells.resize(12);
+
+        cells.pos_set(2, 17);
+        cells.seq_add(2, 3);
+        const auto pending = make_rerot_meta(
+            91, 4, 7, llama_rerot_visibility::pending_record, 0, 13);
+        cells.rerot_set(2, pending);
+        assert(cells.rerot_get(2) == pending);
+
+        const auto saved = cells.cp(2, 1);
+        cells.rm(2);
+        assert(!cells.rerot_get(2).active());
+        cells.set(8, saved);
+        assert(cells.pos_get(8) == 17);
+        assert(cells.rerot_get(8) == pending);
+
+        assert(!cells.rerot_publish(8, 91, 8, 14));
+        assert(cells.rerot_publish(8, 91, 7, 14));
+        const auto published = cells.rerot_get(8);
+        assert(published.visibility == llama_rerot_visibility::public_live);
+        assert(published.publish_epoch == 14);
+
+        cells.pos_set(10, 23);
+        cells.seq_add(10, 4);
+        const auto private_meta = make_rerot_meta(
+            91, 6, 9, llama_rerot_visibility::private_control, 0, 14);
+        cells.rerot_set(10, private_meta);
+
+        const auto plan = cells.make_pack_plan();
+        assert(plan.retained_count == 2);
+        cells.apply_pack(plan);
+
+        assert(cells.pos_get(0) == 17);
+        assert(cells.rerot_get(0) == published);
+        assert(cells.pos_get(1) == 23);
+        assert(cells.rerot_get(1) == private_meta);
+
+        assert(cells.seq_rm(0, 3));
+        assert(cells.is_empty(0));
+        assert(!cells.rerot_get(0).active());
+
+        assert(cells.pos_add(1, -24));
+        assert(cells.is_empty(1));
+        assert(!cells.rerot_get(1).active());
     }
 
     return 0;

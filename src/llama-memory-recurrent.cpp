@@ -269,6 +269,42 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
     }
 }
 
+bool llama_memory_recurrent::seq_rm_attention(
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1) {
+    GGML_UNUSED(seq_id);
+    GGML_UNUSED(p0);
+    GGML_UNUSED(p1);
+    return true;
+}
+
+void llama_memory_recurrent::seq_cp_attention(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst,
+        llama_pos p0,
+        llama_pos p1) {
+    GGML_UNUSED(seq_id_src);
+    GGML_UNUSED(seq_id_dst);
+    GGML_UNUSED(p0);
+    GGML_UNUSED(p1);
+}
+
+bool llama_memory_recurrent::seq_rm_recurrent(
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1) {
+    return seq_rm(seq_id, p0, p1);
+}
+
+void llama_memory_recurrent::seq_cp_recurrent(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst,
+        llama_pos p0,
+        llama_pos p1) {
+    seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
     uint32_t new_head = size;
 

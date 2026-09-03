@@ -139,6 +139,55 @@ void llama_kv_cache_iswa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p
     kv_swa ->seq_div(seq_id, p0, p1, d);
 }
 
+bool llama_kv_cache_iswa::rerot_set_write_tag(
+        llama_seq_id seq_id,
+        const llama_kv_rerot_meta & tag) {
+    // Validate both sides before making either write tag visible.
+    if (!kv_base->rerot_set_write_tag(seq_id, tag)) {
+        return false;
+    }
+    if (!kv_swa->rerot_set_write_tag(seq_id, tag)) {
+        kv_base->rerot_clear_write_tag(seq_id);
+        return false;
+    }
+    return true;
+}
+
+void llama_kv_cache_iswa::rerot_clear_write_tag(llama_seq_id seq_id) {
+    kv_base->rerot_clear_write_tag(seq_id);
+    kv_swa->rerot_clear_write_tag(seq_id);
+}
+
+bool llama_kv_cache_iswa::rerot_can_publish_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        size_t * count) const {
+    size_t count_base = 0;
+    size_t count_swa = 0;
+    const bool base_ok = kv_base->rerot_can_publish_run(episode_id, run_id, &count_base);
+    const bool swa_ok = kv_swa->rerot_can_publish_run(episode_id, run_id, &count_swa);
+
+    if (count) {
+        *count = base_ok && swa_ok ? count_base + count_swa : 0;
+    }
+    return base_ok && swa_ok;
+}
+
+size_t llama_kv_cache_iswa::rerot_publish_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        uint64_t publish_epoch) {
+    size_t count = 0;
+    if (publish_epoch == 0 || !rerot_can_publish_run(episode_id, run_id, &count)) {
+        return 0;
+    }
+
+    const size_t base_count = kv_base->rerot_publish_run(episode_id, run_id, publish_epoch);
+    const size_t swa_count = kv_swa->rerot_publish_run(episode_id, run_id, publish_epoch);
+    GGML_ASSERT(base_count + swa_count == count);
+    return count;
+}
+
 llama_pos llama_kv_cache_iswa::seq_pos_min(llama_seq_id seq_id) const {
     // the base cache is a superset of the SWA cache, so we can just check the SWA cache
     return kv_swa->seq_pos_min(seq_id);

@@ -292,6 +292,8 @@ llama_context::llama_context(
     cparams.kv_size_explicit = params.n_ctx_kv != 0;
     cparams.triattention_enabled = params.triattention;
     cparams.triattention_ratio = params.triattention_ratio;
+    cparams.rerot_enabled = params.rerot;
+    cparams.rerot_frontier = params.rerot_frontier;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -355,6 +357,10 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+    LLAMA_LOG_INFO("%s: rerot         = %s\n",   __func__, cparams.rerot_enabled ? "true" : "false");
+    if (cparams.rerot_enabled) {
+        LLAMA_LOG_INFO("%s: rerot frontier= %s\n", __func__, llama_rerot_frontier_mode_name(cparams.rerot_frontier));
+    }
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq      = %u\n",   __func__, cparams.n_rs_seq);
@@ -3773,6 +3779,8 @@ llama_context_params llama_context_default_params() {
         /*.triattention                =*/ false,
         /*.triattention_stats          =*/ nullptr,
         /*.triattention_ratio          =*/ 3.0 / 32.0,
+        /*.rerot                       =*/ false,
+        /*.rerot_frontier              =*/ LLAMA_REROT_FRONTIER_STRONG,
     };
 
     return result;
@@ -4223,6 +4231,108 @@ void llama_memory_seq_cp(
     }
 
     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_memory_seq_rm_attention(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return true;
+    }
+
+    return mem->seq_rm_attention(seq_id, p0, p1);
+}
+
+void llama_memory_seq_cp_attention(
+        llama_memory_t mem,
+          llama_seq_id seq_id_src,
+          llama_seq_id seq_id_dst,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return;
+    }
+
+    mem->seq_cp_attention(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_memory_seq_rm_recurrent(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return true;
+    }
+
+    return mem->seq_rm_recurrent(seq_id, p0, p1);
+}
+
+void llama_memory_seq_cp_recurrent(
+        llama_memory_t mem,
+          llama_seq_id seq_id_src,
+          llama_seq_id seq_id_dst,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return;
+    }
+
+    mem->seq_cp_recurrent(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_memory_rerot_set_write_tag(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+    const llama_rerot_kv_write_tag * tag) {
+    if (!mem || !tag) {
+        return false;
+    }
+
+    llama_rerot_visibility visibility;
+    switch (tag->visibility) {
+        case LLAMA_REROT_KV_PUBLIC_LIVE:
+            visibility = llama_rerot_visibility::public_live;
+            break;
+        case LLAMA_REROT_KV_PRIVATE_CONTROL:
+            visibility = llama_rerot_visibility::private_control;
+            break;
+        case LLAMA_REROT_KV_PENDING_RECORD:
+            visibility = llama_rerot_visibility::pending_record;
+            break;
+        default:
+            return false;
+    }
+
+    llama_kv_rerot_meta internal;
+    internal.episode_id = tag->episode_id;
+    internal.node_id = tag->node_id;
+    internal.run_id = tag->run_id;
+    internal.publish_epoch = tag->publish_epoch;
+    internal.frontier = tag->frontier;
+    internal.visibility = visibility;
+    return mem->rerot_set_write_tag(seq_id, internal);
+}
+
+void llama_memory_rerot_clear_write_tag(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    if (mem) {
+        mem->rerot_clear_write_tag(seq_id);
+    }
+}
+
+size_t llama_memory_rerot_publish_run(
+        llama_memory_t mem,
+        uint64_t episode_id,
+        uint32_t run_id,
+        uint64_t publish_epoch) {
+    if (!mem) {
+        return 0;
+    }
+    return mem->rerot_publish_run(episode_id, run_id, publish_epoch);
 }
 
 void llama_memory_seq_keep(

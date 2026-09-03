@@ -58,6 +58,8 @@ struct llama_cparams {
     bool triattention_enabled = false;
     double triattention_ratio = 3.0 / 32.0;
     uint32_t triattention_recent_window = 128;
+    bool rerot_enabled = false;
+    llama_rerot_frontier_mode rerot_frontier = LLAMA_REROT_FRONTIER_STRONG;
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer

@@ -1658,6 +1658,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_TRIATTENTION_RATIO").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--rerot"},
+        "enable Recursive Elastic Ring-of-Thought shared-memory reasoning",
+        [](common_params & params) {
+            params.rerot_enabled = true;
+            params.kv_unified = true;
+        }
+    ).set_env("LLAMA_ARG_REROT").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--rerot-frontier"}, "strong|lag1",
+        string_format("RERoT frontier visibility mode (default: %s)",
+            llama_rerot_frontier_mode_name(params.rerot_frontier)),
+        [](common_params & params, const std::string & value) {
+            if (value == "strong") {
+                params.rerot_frontier = LLAMA_REROT_FRONTIER_STRONG;
+            } else if (value == "lag1") {
+                params.rerot_frontier = LLAMA_REROT_FRONTIER_LAG1;
+            } else {
+                throw std::invalid_argument("RERoT frontier mode must be 'strong' or 'lag1'");
+            }
+            params.rerot_enabled = true;
+            params.kv_unified = true;
+        }
+    ).set_env("LLAMA_ARG_REROT_FRONTIER").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
             ex == LLAMA_EXAMPLE_COMPLETION
