@@ -159,6 +159,11 @@ struct server_rerot_metrics {
     uint64_t public_tokens = 0;
     uint64_t private_tokens = 0;
     uint64_t pending_tokens = 0;
+    uint64_t completed_episodes = 0;
+    uint64_t completed_model_tokens = 0;
+    uint64_t parallel_model_tokens = 0;
+    double completed_episode_seconds = 0.0;
+    double parallel_seconds = 0.0;
     uint64_t frontiers = 0;
     uint64_t topology_barriers = 0;
     uint64_t refresh_total = 0;

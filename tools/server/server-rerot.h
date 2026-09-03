@@ -357,6 +357,11 @@ public:
         uint64_t episode_id,
         llama_rerot_node_id node_id,
         llama_pos storage_pos);
+    std::optional<std::vector<server_rerot_token_plan>> plan_private_span(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id,
+        llama_pos storage_pos,
+        size_t token_count);
 
     // Forced headings are kept PENDING until every heading token has decoded.
     std::optional<server_rerot_token_plan> plan_heading_token(

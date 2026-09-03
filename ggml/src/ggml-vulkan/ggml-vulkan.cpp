@@ -11060,18 +11060,20 @@ static bool ggml_vk_flash_attn_rerot_shmem_support(const vk_device & device, con
 }
 
 // Derives the RERoT-DDVR tuning from the ordinary scalar tuning for the same
-// dims, then pins the rerot_main contract: single-row workgroups (Br = 1),
-// full-D dots (D_split = 1), shared-memory-only reductions (no subgroups).
+// dims, then pins the rerot_main contract to single-row workgroups (Br = 1).
+// Subgroup-capable pipelines preserve scalar D_split so K/V dimensions are
+// distributed across lanes; the shared-memory fallback uses D_split = 1.
 // Falls back from K/V staging to direct loads when staging would overflow
 // shmem. Returns false when no viable config exists (the caller falls back to
 // CPU, preserving parity).
 static bool ggml_vk_flash_attn_rerot_tune(const vk_device & device, uint32_t hsk, uint32_t hsv, uint32_t n_kv, ggml_type k_type, ggml_type v_type, vk_fa_tuning_params & out) {
     vk_fa_tuning_params params = get_fa_tuning_params_scalar(device, hsk, hsv, 1, n_kv, k_type, v_type, true);
     params.block_rows = 1;
+    params.block_cols = 128;
     params.row_split = 1;
-    params.d_split = 1;
-    params.disable_subgroups = true;
-    params.subgroup_size = 0;
+    if (params.disable_subgroups) {
+        params.d_split = 1;
+    }
     if (!ggml_vk_flash_attn_rerot_shmem_support(device, params, hsk, hsv)) {
         params.shmem_staging = false;
         if (!ggml_vk_flash_attn_rerot_shmem_support(device, params, hsk, hsv)) {

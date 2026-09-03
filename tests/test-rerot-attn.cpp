@@ -891,6 +891,42 @@ static void test_vulkan_indexed_parity() {
         CHECK(error < 4.0e-3f);
     }
 
+    // Production heads and more than two 128-entry tiles exercise D_split,
+    // online-softmax carry, multiple Q groups, and split-K reduction together.
+    constexpr int lnkv = 257;
+    constexpr int lng = 3;
+    constexpr int lnq = 2;
+    std::vector<float> lq(size_t(td) * lng * thq);
+    std::vector<float> lk(size_t(td) * lnkv * thkv);
+    std::vector<float> lv(size_t(tdv) * lnkv * thkv);
+    for (size_t i = 0; i < lq.size(); ++i) lq[i] = std::sin(float(i + 7) * 0.007f);
+    for (size_t i = 0; i < lk.size(); ++i) lk[i] = std::cos(float(i + 11) * 0.009f);
+    for (size_t i = 0; i < lv.size(); ++i) lv[i] = std::sin(float(i + 13) * 0.011f);
+
+    std::vector<int32_t> lentries;
+    lentries.reserve(size_t(2 * lnq * lnkv));
+    for (int e = 0; e < lnkv; ++e) {
+        lentries.push_back((e * 37) % lnkv);
+        lentries.push_back(e < 129 ? 0 : 1);
+    }
+    for (int e = 0; e < lnkv; ++e) {
+        lentries.push_back(lnkv - 1 - ((e * 53) % lnkv));
+        lentries.push_back(e < 170 ? 2 : 1);
+    }
+    const std::vector<int32_t> loffsets = { 0, lnkv, 2 * lnkv };
+    const auto lcpu = run_indexed_op(
+        td, tdv, lng, lnkv, thq, thkv, lnq, lq, lk, lv, lentries, loffsets,
+        tscale, nullptr, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0);
+    const auto lgpu = run_indexed_op(
+        td, tdv, lng, lnkv, thq, thkv, lnq, lq, lk, lv, lentries, loffsets,
+        tscale, backend, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0);
+    CHECK(lcpu.size() == lgpu.size());
+    if (lcpu.size() == lgpu.size()) {
+        const float error = max_abs_diff(lcpu, lgpu);
+        std::fprintf(stderr, "GPU multi-tile D_split RERoT parity error = %.9g\n", error);
+        CHECK(error < 4.0e-3f);
+    }
+
     ggml_backend_free(backend);
 }
 

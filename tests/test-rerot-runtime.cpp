@@ -111,6 +111,33 @@ static bool view_contains_run(const llama_rerot_reader_view & view, llama_rerot_
     return false;
 }
 
+static void test_private_span_reserves_one_contiguous_run() {
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
+    const uint64_t episode_id = runtime.adopt_root(99, 99, 0, 0, 10);
+    const auto plans = runtime.plan_private_span(episode_id, 0, 10, 4);
+    CHECK(plans.has_value());
+    CHECK(plans && plans->size() == 4);
+    CHECK(!runtime.plan_private_span(episode_id, 0, 10, 0).has_value());
+    if (!plans || plans->size() != 4) {
+        return;
+    }
+
+    const llama_rerot_run_id run_id = plans->front().run_id;
+    for (size_t i = 0; i < plans->size(); ++i) {
+        CHECK((*plans)[i].run_id == run_id);
+        CHECK((*plans)[i].storage_pos == 10 + static_cast<llama_pos>(i));
+        CHECK(runtime.commit_token(episode_id, 0, (*plans)[i]));
+    }
+
+    const auto * episode = runtime.episode(episode_id);
+    const auto * node = runtime.node(episode_id, 0);
+    const auto * run = episode ? episode->document.run(run_id) : nullptr;
+    CHECK(run && run->token_count == 4);
+    CHECK(node && node->storage_pos_next == 14);
+    CHECK(episode && episode->generated_private_tokens == 4);
+    CHECK(runtime.erase_episode(episode_id));
+}
+
 static void test_n1_no_fork_disarm_forever() {
     server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
     const uint64_t episode_id = runtime.adopt_root(100, 101, 0, 0, 10);
@@ -738,6 +765,7 @@ static void test_internal_seq_exhaustion_aborts_whole_episode() {
 
 int main() {
     std::fprintf(stderr, "=== RERoT Runtime Tests ===\n");
+    test_private_span_reserves_one_contiguous_run();
     test_n1_no_fork_disarm_forever();
     test_n2_strong_uptake();
     test_queue_fifo_five_children_one_slot();

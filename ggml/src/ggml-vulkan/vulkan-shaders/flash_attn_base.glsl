@@ -299,10 +299,9 @@ void gqaStore(const in uint32_t r, const in uint32_t c, const in O_TYPEV4 elems,
 //     phase; V is consumed as stored).
 //   * GQA via head-index division; head_dim padding flows through HSK/HSV
 //     (never assumed 128); sinks / logit-softcap mirror the ordinary path.
-//   * Single-row workgroups (host forces Br = 1, D_split = 1,
-//     SubGroupSize = 0) and shared-memory-only reductions (no subgroup
-//     ops), so this compiles into every scalar FA module variant
-//     (fp16 / fp32 / dot2 / int8).
+//   * Single-row workgroups (host forces Br = 1). On subgroup-capable scalar
+//     pipelines D_split partitions K/V dimensions across cooperating lanes;
+//     devices that disable subgroups retain D_split = 1 and the shared tree.
 //
 // Build note: this block is scalar-module-only. Coopmat1 modules are excluded
 // via COOPMAT; coopmat2 modules enable GL_NV_cooperative_matrix2 before
@@ -371,20 +370,23 @@ vec4 rerot_load_v(const in uint key, const in uint dvec, const in uint v_stride,
     return vec4(dequantize4(coord / BLOCK_SIZE_V, coord % BLOCK_SIZE_V, v_offset, BINDING_IDX_V));
 }
 
-// Shmem sized for the host-enforced config (Br = 1, D_split = 1): one staged
-// Q row, one staged K/V block reused for K then V, plus reduction scratch.
+// Shmem sized for the host-enforced single-row config: one staged Q row, one
+// staged K/V block reused for K then V, plus reduction scratch.
 const uint32_t REROT_Q_WORDS = HSK / 4u + 1u;
 const uint32_t REROT_D = HSK > HSV ? HSK : HSV;
 const uint32_t REROT_KV_STRIDE = REROT_D / 4u + 1u;
+const uint32_t REROT_NUM_SUBGROUPS = SubGroupSize == 0u ? 0u : WorkGroupSize / SubGroupSize;
+const uint32_t REROT_COL_GROUPS = WorkGroupSize / D_split;
+const uint32_t REROT_HSV4_PER_THREAD = (HSV / 4u + D_split - 1u) / D_split;
 shared vec4 rerot_qf[REROT_Q_WORDS];
 shared vec4 rerot_kvsh[SHMEM_STAGING != 0 ? Bc * REROT_KV_STRIDE : 1];
 shared float rerot_tmpsh[WorkGroupSize];
 shared vec4 rerot_tmpv4[WorkGroupSize];
 shared vec4 rerot_occlim[LIMIT_OCCUPANCY_SHMEM > 0 ? LIMIT_OCCUPANCY_SHMEM : 1];
 
-// Max columns owned by one thread when Bc entry-columns are dealt strided
-// across the workgroup. Spec-constant arithmetic like the ordinary tmpsh_size.
-const uint32_t REROT_MAXC = (Bc + WorkGroupSize - 1u) / WorkGroupSize;
+// Each D_split-lane group owns strided entry-columns. Every lane in a group
+// retains the group's scores but only its HSV/D_split output slice.
+const uint32_t REROT_MAXC = (Bc + REROT_COL_GROUPS - 1u) / REROT_COL_GROUPS;
 
 // Use -FLT_MAX/2 rather than -inf to reduce the possibility of NaNs, matching
 // the ordinary path's convention.
@@ -402,6 +404,8 @@ void rerot_main() {
 
     const uint tid = gl_LocalInvocationIndex;
     const uint WGS = gl_WorkGroupSize.x;
+    const uint d_tid = tid % D_split;
+    const uint col_group = tid / D_split;
 
     if (LIMIT_OCCUPANCY_SHMEM > 0) {
         // Same occupancy-throttle idiom as the ordinary path.
@@ -452,9 +456,9 @@ void rerot_main() {
     // range (never per-span/per-block softmax).
     float Lf = 0.0f;
     float Mf = REROT_NEG;
-    vec4 Of[HSV4];
-    for (uint d = 0; d < HSV4; ++d) {
-        Of[d] = vec4(0.0);
+    vec4 Of[REROT_HSV4_PER_THREAD];
+    for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+        Of[di] = vec4(0.0);
     }
 
     float scol[REROT_MAXC];
@@ -502,9 +506,11 @@ void rerot_main() {
                 barrier();
             }
 
-            // Scores for strided-owned columns.
+            // D_split lanes cooperate on each strided-owned column. This keeps
+            // each lane's K dot and V accumulator slice small enough to stay
+            // in registers at the 256-dimensional production head size.
             uint ncol = 0u;
-            for (uint c = tid; c < Bc; c += WGS) {
+            for (uint c = col_group; c < Bc; c += REROT_COL_GROUPS) {
                 const uint e = b + c;
                 float sc = REROT_NEG;
                 bool ok = false;
@@ -513,15 +519,20 @@ void rerot_main() {
                     if (KV_bounds_check == false || key < p.KV) {
                         vec4 acc = vec4(0.0);
                         if (SHMEM_STAGING != 0) {
-                            for (uint d = 0u; d < HSK4; ++d) {
+                            for (uint d = d_tid; d < HSK4; d += D_split) {
                                 acc = fma(rerot_qf[d], rerot_kvsh[c * REROT_KV_STRIDE + d], acc);
                             }
                         } else {
-                            for (uint d = 0u; d < HSK4; ++d) {
+                            for (uint d = d_tid; d < HSK4; d += D_split) {
                                 acc = fma(rerot_qf[d], rerot_load_k(key, d, k_stride, k_offset), acc);
                             }
                         }
                         sc = rerot_hsum(acc);
+                        if (SubGroupSize > 0u) {
+                            for (uint st = 1u; st < D_split; st <<= 1u) {
+                                sc += subgroupShuffleXor(sc, st);
+                            }
+                        }
                         if (LOGIT_SOFTCAP) {
                             sc = p.logit_softcap * tanh(sc);
                         }
@@ -533,26 +544,45 @@ void rerot_main() {
                 ++ncol;
             }
 
-            // Block max across threads (shared-memory tree; no subgroup ops).
+            // Block max across threads. Subgroups collapse each wave first,
+            // leaving only one shared value per subgroup; devices that
+            // disable subgroups retain the full shared-memory tree.
             float local_max = REROT_NEG;
             for (uint t = 0u; t < ncol; ++t) {
                 local_max = max(local_max, scol[t]);
             }
-            rerot_tmpsh[tid] = local_max;
-            barrier();
-            for (uint st = WGS / 2u; st > 0u; st >>= 1u) {
-                if (tid < st) {
-                    rerot_tmpsh[tid] = max(rerot_tmpsh[tid], rerot_tmpsh[tid + st]);
+            float bmax = REROT_NEG;
+            if (SubGroupSize > 0u) {
+                for (uint st = 1u; st < SubGroupSize; st <<= 1u) {
+                    local_max = max(local_max, subgroupShuffleXor(local_max, st));
                 }
                 barrier();
+                if (gl_SubgroupInvocationID == 0u) {
+                    rerot_tmpsh[gl_SubgroupID] = local_max;
+                }
+                barrier();
+                bmax = rerot_tmpsh[0];
+                for (uint sg = 1u; sg < REROT_NUM_SUBGROUPS; ++sg) {
+                    bmax = max(bmax, rerot_tmpsh[sg]);
+                }
+            } else {
+                barrier();
+                rerot_tmpsh[tid] = local_max;
+                barrier();
+                for (uint st = WGS / 2u; st > 0u; st >>= 1u) {
+                    if (tid < st) {
+                        rerot_tmpsh[tid] = max(rerot_tmpsh[tid], rerot_tmpsh[tid + st]);
+                    }
+                    barrier();
+                }
+                bmax = rerot_tmpsh[0];
             }
-            const float bmax = rerot_tmpsh[0];
             const float Mold = Mf;
             Mf = max(bmax, Mold);
             const float eM = exp(Mold - Mf);
             Lf *= eM;
-            for (uint d = 0u; d < HSV4; ++d) {
-                Of[d] *= eM;
+            for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+                Of[di] *= eM;
             }
 
             if (SHMEM_STAGING != 0) {
@@ -574,13 +604,19 @@ void rerot_main() {
             }
 
             uint t = 0u;
-            for (uint c = tid; c < Bc; c += WGS) {
+            for (uint c = col_group; c < Bc; c += REROT_COL_GROUPS) {
                 const uint e = b + c;
                 const float Pw = cvalid[t] ? exp(scol[t] - Mf) : 0.0;
                 ++t;
-                Lf += Pw;
+                if (d_tid == 0u) {
+                    Lf += Pw;
+                }
                 const vec4 Pwv = vec4(Pw);
-                for (uint d = 0u; d < HSV4; ++d) {
+                for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+                    const uint d = di * D_split + d_tid;
+                    if (d >= HSV4) {
+                        continue;
+                    }
                     vec4 Vv;
                     if (SHMEM_STAGING != 0) {
                         Vv = rerot_kvsh[c * REROT_KV_STRIDE + d];
@@ -593,7 +629,7 @@ void rerot_main() {
                             }
                         }
                     }
-                    Of[d] = fma(Pwv, Vv, Of[d]);
+                    Of[di] = fma(Pwv, Vv, Of[di]);
                 }
             }
         }
@@ -602,47 +638,60 @@ void rerot_main() {
         run_b = run_e;
     }
 
-    // Reduce per-thread partials across the workgroup (same rescaling algebra
-    // as the ordinary cross-thread reduce, over disjoint column sets).
-    rerot_tmpsh[tid] = Mf;
-    barrier();
-    for (uint st = WGS / 2u; st > 0u; st >>= 1u) {
-        if (tid < st) {
-            rerot_tmpsh[tid] = max(rerot_tmpsh[tid], rerot_tmpsh[tid + st]);
+    // Every block max was workgroup-wide, so Mf is already identical across
+    // threads. Reduce only the disjoint L/O column partials.
+    if (SubGroupSize > 0u) {
+        for (uint st = 1u; st < SubGroupSize; st <<= 1u) {
+            Lf += subgroupShuffleXor(Lf, st);
         }
         barrier();
-    }
-    {
-        const float Mnew = rerot_tmpsh[0];
-        const float eM = exp(Mf - Mnew);
-        Mf = Mnew;
-        Lf *= eM;
-        for (uint d = 0u; d < HSV4; ++d) {
-            Of[d] *= eM;
-        }
-    }
-    barrier();
-    rerot_tmpsh[tid] = Lf;
-    barrier();
-    for (uint st = WGS / 2u; st > 0u; st >>= 1u) {
-        if (tid < st) {
-            rerot_tmpsh[tid] += rerot_tmpsh[tid + st];
+        if (gl_SubgroupInvocationID == 0u) {
+            rerot_tmpsh[gl_SubgroupID] = Lf;
         }
         barrier();
-    }
-    Lf = rerot_tmpsh[0];
-    barrier();
-    for (uint d = 0u; d < HSV4; ++d) {
-        rerot_tmpv4[tid] = Of[d];
+        Lf = rerot_tmpsh[0];
+        for (uint sg = 1u; sg < REROT_NUM_SUBGROUPS; ++sg) {
+            Lf += rerot_tmpsh[sg];
+        }
+
+        for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+            for (uint st = D_split; st < SubGroupSize; st <<= 1u) {
+                Of[di] += subgroupShuffleXor(Of[di], st);
+            }
+            barrier();
+            if (gl_SubgroupInvocationID == d_tid) {
+                rerot_tmpv4[gl_SubgroupID * D_split + d_tid] = Of[di];
+            }
+            barrier();
+            Of[di] = rerot_tmpv4[d_tid];
+            for (uint sg = 1u; sg < REROT_NUM_SUBGROUPS; ++sg) {
+                Of[di] += rerot_tmpv4[sg * D_split + d_tid];
+            }
+        }
+    } else {
+        barrier();
+        rerot_tmpsh[tid] = Lf;
         barrier();
         for (uint st = WGS / 2u; st > 0u; st >>= 1u) {
             if (tid < st) {
-                rerot_tmpv4[tid] += rerot_tmpv4[tid + st];
+                rerot_tmpsh[tid] += rerot_tmpsh[tid + st];
             }
             barrier();
         }
-        Of[d] = rerot_tmpv4[0];
-        barrier();
+        Lf = rerot_tmpsh[0];
+
+        for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+            barrier();
+            rerot_tmpv4[tid] = Of[di];
+            barrier();
+            for (uint st = WGS / 2u; st > 0u; st >>= 1u) {
+                if (tid < st) {
+                    rerot_tmpv4[tid] += rerot_tmpv4[tid + st];
+                }
+                barrier();
+            }
+            Of[di] = rerot_tmpv4[0];
+        }
     }
 
     if (S == 1u && (p.mask_n_head_log2 & SINK_ENABLE_BIT) != 0u) {
@@ -653,8 +702,8 @@ void rerot_main() {
         float vs = 1.0f;
         if (sink > Mf) {
             ms = exp(Mf - sink);
-            for (uint d = 0u; d < HSV4; ++d) {
-                Of[d] *= ms;
+            for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+                Of[di] *= ms;
             }
         } else {
             vs = exp(sink - Mf);
@@ -668,8 +717,13 @@ void rerot_main() {
     if (S == 1u) {
         // Contiguous dst [Dv, n_head_q, n_queries] (asserted host-side).
         const uint o_base = ((q * p.ne2) + h) * HSV4;
-        for (uint d = tid; d < HSV4; d += WGS) {
-            data_ov4[o_base + d] = D_TYPEV4(Of[d] * rcp);
+        if (col_group == 0u) {
+            for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+                const uint d = di * D_split + d_tid;
+                if (d < HSV4) {
+                    data_ov4[o_base + d] = D_TYPEV4(Of[di] * rcp);
+                }
+            }
         }
         return;
     }
@@ -679,8 +733,13 @@ void rerot_main() {
     const uint Nflat = p.ne2 * p.N;
     const uint n = h + p.ne2 * q;
     const uint o_base = HSV * Nflat * s + HSV * n;
-    for (uint d = tid; d < HSV4; d += WGS) {
-        data_ov4[o_base / 4u + d] = D_TYPEV4(Of[d]);
+    if (col_group == 0u) {
+        for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+            const uint d = di * D_split + d_tid;
+            if (d < HSV4) {
+                data_ov4[o_base / 4u + d] = D_TYPEV4(Of[di]);
+            }
+        }
     }
     if (tid == 0u) {
         const uint lm_base = HSV * Nflat * S + 2u * Nflat * s + n;

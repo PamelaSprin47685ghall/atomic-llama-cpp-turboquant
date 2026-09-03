@@ -656,17 +656,42 @@ std::optional<server_rerot_token_plan> server_rerot_runtime::plan_private_token(
         uint64_t episode_id,
         llama_rerot_node_id node_id,
         llama_pos storage_pos) {
+    auto plans = plan_private_span(episode_id, node_id, storage_pos, 1);
+    if (!plans.has_value()) {
+        return std::nullopt;
+    }
+    return std::move(plans->front());
+}
+
+std::optional<std::vector<server_rerot_token_plan>> server_rerot_runtime::plan_private_span(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id,
+        llama_pos storage_pos,
+        size_t token_count) {
     auto * current = episode(episode_id);
     auto * current_node = node(episode_id, node_id);
-    if (!current || !current_node || current->hard_aborted || storage_pos < 0) {
+    if (!current || !current_node || current->hard_aborted || storage_pos < 0 ||
+        token_count == 0 ||
+        token_count > size_t(std::numeric_limits<llama_pos>::max() - storage_pos) + 1) {
         return std::nullopt;
     }
 
-    server_rerot_token_plan plan;
-    plan.storage_pos = storage_pos;
-    plan.visibility = llama_rerot_visibility::private_control;
-    plan.run_id = ensure_run(*current, *current_node, plan.visibility, storage_pos);
-    return plan.valid() ? std::optional<server_rerot_token_plan>(std::move(plan)) : std::nullopt;
+    const llama_rerot_run_id run_id = ensure_run(
+        *current, *current_node, llama_rerot_visibility::private_control, storage_pos);
+    if (run_id == LLAMA_REROT_RUN_INVALID) {
+        return std::nullopt;
+    }
+
+    std::vector<server_rerot_token_plan> plans;
+    plans.reserve(token_count);
+    for (size_t i = 0; i < token_count; ++i) {
+        server_rerot_token_plan plan;
+        plan.storage_pos = storage_pos + static_cast<llama_pos>(i);
+        plan.visibility = llama_rerot_visibility::private_control;
+        plan.run_id = run_id;
+        plans.push_back(std::move(plan));
+    }
+    return plans;
 }
 
 std::optional<server_rerot_token_plan> server_rerot_runtime::plan_heading_token(

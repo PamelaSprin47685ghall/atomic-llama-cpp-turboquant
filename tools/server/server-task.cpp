@@ -205,6 +205,9 @@ bool server_rerot_metrics::empty() const {
         && nodes_created == 0 && nodes_started == 0 && nodes_retired == 0 && nodes_queued == 0
         && queue_max == 0 && forks_total == 0 && max_depth == 0 && max_live_lanes == 0
         && public_tokens == 0 && private_tokens == 0 && pending_tokens == 0
+        && completed_episodes == 0 && completed_model_tokens == 0
+        && parallel_model_tokens == 0 && completed_episode_seconds == 0.0
+        && parallel_seconds == 0.0
         && frontiers == 0 && topology_barriers == 0 && refresh_total == 0
         && mtp_invalidations == 0 && context_shifts == 0
         && hard_aborts == 0 && final_fences == 0
@@ -226,10 +229,15 @@ json server_rerot_metrics::to_json() const {
         { "rerot_forks_total",         forks_total },
         { "rerot_max_depth",           max_depth },
         { "rerot_max_live_lanes",      max_live_lanes },
-        { "rerot_public_tokens",       public_tokens },
-        { "rerot_private_tokens",      private_tokens },
-        { "rerot_pending_tokens",      pending_tokens },
-        { "rerot_frontiers",           frontiers },
+        { "rerot_public_tokens",              public_tokens },
+        { "rerot_private_tokens",             private_tokens },
+        { "rerot_pending_tokens",             pending_tokens },
+        { "rerot_completed_episodes",         completed_episodes },
+        { "rerot_completed_model_tokens",     completed_model_tokens },
+        { "rerot_parallel_model_tokens",      parallel_model_tokens },
+        { "rerot_completed_episode_seconds",  completed_episode_seconds },
+        { "rerot_parallel_seconds",           parallel_seconds },
+        { "rerot_frontiers",                  frontiers },
         { "rerot_topology_barriers",   topology_barriers },
         { "rerot_refresh_total",       refresh_total },
         { "rerot_mtp_invalidations",   mtp_invalidations },
@@ -257,10 +265,15 @@ void server_rerot_metrics::accumulate(const server_rerot_metrics & delta) {
     forks_total         += delta.forks_total;
     max_depth            = std::max(max_depth, delta.max_depth);
     max_live_lanes       = std::max(max_live_lanes, delta.max_live_lanes);
-    public_tokens       += delta.public_tokens;
-    private_tokens      += delta.private_tokens;
-    pending_tokens      += delta.pending_tokens;
-    frontiers           += delta.frontiers;
+    public_tokens              += delta.public_tokens;
+    private_tokens             += delta.private_tokens;
+    pending_tokens             += delta.pending_tokens;
+    completed_episodes         += delta.completed_episodes;
+    completed_model_tokens     += delta.completed_model_tokens;
+    parallel_model_tokens      += delta.parallel_model_tokens;
+    completed_episode_seconds  += delta.completed_episode_seconds;
+    parallel_seconds           += delta.parallel_seconds;
+    frontiers                  += delta.frontiers;
     topology_barriers   += delta.topology_barriers;
     refresh_total       += delta.refresh_total;
     mtp_invalidations   += delta.mtp_invalidations;
