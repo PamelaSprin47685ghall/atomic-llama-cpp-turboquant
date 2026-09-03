@@ -168,6 +168,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-rerot-parser PRIVATE
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server)
+    llama_build_and_test(test-rerot-runtime.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-rerot.cpp)
+    target_include_directories(test-rerot-runtime PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
     llama_build_and_test(test-triattention-score.cpp)
     target_include_directories(test-triattention-score PRIVATE ${PROJECT_SOURCE_DIR}/src)
 

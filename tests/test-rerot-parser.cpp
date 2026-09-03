@@ -119,6 +119,40 @@ static void test_malformed_records() {
     }
 }
 
+static void test_private_marker_split() {
+    server_rerot_marker_parser parser;
+
+    auto step = parser.consume("conclusion </thi");
+    CHECK(step.write_visibility == llama_rerot_visibility::pending_record);
+    CHECK(!step.marker_closed);
+    CHECK(parser.state() == server_rerot_marker_state::marker_candidate);
+
+    step = parser.consume("nk>\n");
+    CHECK(step.write_visibility == llama_rerot_visibility::pending_record);
+    CHECK(step.marker_closed);
+    CHECK(!step.malformed);
+    CHECK(parser.complete());
+}
+
+static void test_private_marker_false_prefix() {
+    server_rerot_marker_parser parser;
+
+    auto step = parser.consume("ordinary <");
+    CHECK(step.write_visibility == llama_rerot_visibility::pending_record);
+
+    step = parser.consume("x remains public");
+    CHECK(step.release_previous_pending);
+    CHECK(step.write_visibility == llama_rerot_visibility::public_live);
+    CHECK(!step.marker_closed);
+}
+
+static void test_private_marker_rejects_trailing_body() {
+    server_rerot_marker_parser parser;
+    const auto step = parser.consume("</think>answer in same tokenizer token");
+    CHECK(step.malformed);
+    CHECK(parser.failed());
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT Planner Parser Tests ===\n");
     test_plain_public_text();
@@ -128,6 +162,9 @@ int main() {
     test_complete_record_one_token();
     test_non_candidate_angle_text_stays_public();
     test_malformed_records();
+    test_private_marker_split();
+    test_private_marker_false_prefix();
+    test_private_marker_rejects_trailing_body();
     std::fprintf(stderr, "=== Results: %d failure(s) ===\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }
