@@ -24,13 +24,13 @@
 //
 // Header:
 //   magic          uint32  0x54524941 ("TRIA")
-//   version        uint32  1
+//   version        uint32  1 or 2
 //   head_dim       uint32  e.g. 128
 //   num_layers     uint32  e.g. 36
 //   num_attn_heads uint32  e.g. 36  (total attention heads, not KV heads)
 //   num_kv_heads   uint32  e.g. 4   (grouped query attention KV heads)
 //   rope_theta     float64 e.g. 10000.0
-//   rope_style     uint32  0=half, 1=interleaved
+//   rope_style     uint32  0=half/NeoX pairing, 1=even-odd pairing
 //   n_sampled      uint32  number of (layer, head) pairs with stats
 //   freq_count     uint32  head_dim / 2
 //   name_len       uint32  length of model name string (including null)
@@ -120,7 +120,11 @@ public:
                         const triattention_scorer_config & cfg,
                         double rope_theta,
                         uint32_t head_dim,
-                        uint32_t n_kv_heads);
+                        uint32_t n_kv_heads,
+                        uint32_t runtime_rotary_dim = 0,
+                        const float * runtime_omega = nullptr,
+                        const float * runtime_freq_scale_sq = nullptr,
+                        int32_t expected_rope_style = -1);
     ~triattention_scorer();
 
     bool valid() const;
@@ -196,6 +200,23 @@ void triattention_max_pool_scores(
     uint32_t n_candidates,
     uint32_t radius);
 
+// Build the effective phase frequency and magnitude scale used by ggml RoPE.
+// `freq_factors` follows ggml_rope_ext semantics: theta is divided by the
+// corresponding factor when present. The YaRN branch mirrors ggml's phase
+// interpolation and mscale behavior.
+bool triattention_build_rope_tables(
+    float * omega,
+    float * freq_scale_sq,
+    uint32_t rotary_dim,
+    float freq_base,
+    float freq_scale,
+    int32_t n_ctx_orig,
+    float ext_factor,
+    float attn_factor,
+    float beta_fast,
+    float beta_slow,
+    const float * freq_factors);
+
 // ============================================================================
 // Core scoring functions (CPU implementations)
 // ============================================================================
@@ -211,7 +232,9 @@ extern "C" {
 //   out[f]           = in[f]*cos(w_f*pos) + in[f+fc]*sin(w_f*pos)
 //   out[f+fc]        = in[f+fc]*cos(w_f*pos) - in[f]*sin(w_f*pos)
 //
-// For "interleaved" style: pairs are (2f, 2f+1) in input, converted to half layout in output
+// For adjacent/even-odd style (ggml NORMAL): pairs are (2f, 2f+1) in input,
+// converted to half layout in output. ggml IMROPE is not this style; its
+// vector pairing remains NeoX/half.
 //   out[f]           = in[2f]*cos(w_f*pos) + in[2f+1]*sin(w_f*pos)
 //   out[f+fc]        = in[2f+1]*cos(w_f*pos) - in[2f]*sin(w_f*pos)
 //
@@ -225,16 +248,18 @@ extern "C" {
 //   post_rope_k   — [n_keys, head_dim] post-RoPE K input (dequantized)
 //   positions     — [n_keys] absolute positions of each key
 //   omega         — [freq_count] RoPE frequencies
+//   freq_scale_sq — [freq_count] squared RoPE magnitude scaling (nullptr => 1)
 //   n_keys        — number of keys to process
 //   head_dim      — full head dimension (for buffer sizing)
 //   rotary_dim    — dimensions with RoPE applied (<= head_dim)
 //   freq_count    — rotary_dim / 2
-//   rope_style    — 0=half, 1=interleaved
+//   rope_style    — 0=half/NeoX, 1=adjacent even-odd
 void triattention_invert_rope(
     float       * out,
     const float * post_rope_k,
     const int32_t * positions,
     const float * omega,
+    const float * freq_scale_sq,
     uint32_t n_keys,
     uint32_t head_dim,
     uint32_t rotary_dim,

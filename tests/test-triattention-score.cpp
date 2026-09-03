@@ -275,6 +275,15 @@ static void test_calibration_loading() {
         p.rope_theta, p.head_dim, 8);  // wrong n_kv_heads
     TEST_ASSERT(!mismatch_scorer2.valid());
 
+    // Runtime pairing semantics must match calibration. This prevents old
+    // Qwen3.5/IMROPE calibration files that mislabeled section interleaving as
+    // even/odd vector pairing from being used silently.
+    triattention_scorer rope_style_mismatch(
+        tmp_path, cfg,
+        p.rope_theta, p.head_dim, p.num_kv_heads,
+        p.head_dim, nullptr, nullptr, 1);
+    TEST_ASSERT(!rope_style_mismatch.valid());
+
     remove(tmp_path);
     fprintf(stderr, "  PASSED\n");
 }
@@ -328,6 +337,7 @@ static void test_rope_inversion() {
         k_post.data(),
         positions.data(),
         omega.data(),
+        nullptr,
         1,           // n_keys
         head_dim,
         head_dim,    // rotary_dim = head_dim (full RoPE)
@@ -371,6 +381,7 @@ static void test_rope_inversion() {
         k_post_multi.data(),
         pos_multi.data(),
         omega.data(),
+        nullptr,
         n_keys,
         head_dim,
         head_dim,    // rotary_dim = head_dim (full RoPE)
@@ -389,8 +400,9 @@ static void test_rope_inversion() {
         }
     }
 
-    // Partial, interleaved RoPE must convert the rotated prefix to the scorer's
-    // half layout while preserving non-rotary dimensions byte-for-byte.
+    // Partial adjacent/even-odd RoPE (ggml NORMAL semantics) must convert the
+    // rotated prefix to the scorer's half layout while preserving non-rotary
+    // dimensions byte-for-byte.
     {
         const uint32_t partial_head_dim = 8;
         const uint32_t rotary_dim = 4;
@@ -429,6 +441,7 @@ static void test_rope_inversion() {
             post.data(),
             &partial_pos,
             partial_omega.data(),
+            nullptr,
             1,
             partial_head_dim,
             rotary_dim,
@@ -439,6 +452,61 @@ static void test_rope_inversion() {
             TEST_ASSERT_MSG(
                 float_eq(recovered[d], expected_half[d], 1e-4f),
                 "Partial interleaved RoPE inversion failed");
+        }
+    }
+
+    // Scaled RoPE: inversion must remove both the effective phase scaling and
+    // the rotary magnitude scaling. Use explicit frequency factors to exercise
+    // the same `theta / factor` convention as ggml_rope_ext.
+    {
+        const uint32_t scaled_dim = 8;
+        const uint32_t scaled_fc = scaled_dim / 2;
+        const float freq_base = 10000.0f;
+        const float freq_scale = 0.5f;
+        const float attn_factor = 1.25f;
+        const int32_t scaled_pos = 13;
+        const float factors[scaled_fc] = {1.0f, 2.0f, 4.0f, 8.0f};
+
+        std::vector<float> scaled_omega(scaled_fc);
+        std::vector<float> scaled_scale_sq(scaled_fc);
+        TEST_ASSERT(triattention_build_rope_tables(
+            scaled_omega.data(), scaled_scale_sq.data(), scaled_dim,
+            freq_base, freq_scale, 4096,
+            0.0f, attn_factor, 32.0f, 1.0f, factors));
+
+        for (uint32_t f = 0; f < scaled_fc; ++f) {
+            const float expected_w =
+                powf(freq_base, -2.0f * (float) f / (float) scaled_dim) /
+                factors[f] * freq_scale;
+            TEST_ASSERT_MSG(float_eq(scaled_omega[f], expected_w, 1e-6f),
+                "Scaled RoPE effective omega mismatch");
+            TEST_ASSERT_MSG(float_eq(scaled_scale_sq[f], attn_factor * attn_factor, 1e-6f),
+                "Scaled RoPE magnitude scale mismatch");
+        }
+
+        const std::vector<float> pre = {
+            0.2f, 0.4f, 0.6f, 0.8f,
+           -0.3f, 0.5f, -0.7f, 0.9f,
+        };
+        std::vector<float> post(scaled_dim);
+        for (uint32_t f = 0; f < scaled_fc; ++f) {
+            const float angle = scaled_omega[f] * (float) scaled_pos;
+            const float c = cosf(angle);
+            const float s = sinf(angle);
+            const float scale = sqrtf(scaled_scale_sq[f]);
+            post[f] = scale * (pre[f] * c - pre[f + scaled_fc] * s);
+            post[f + scaled_fc] = scale * (pre[f] * s + pre[f + scaled_fc] * c);
+        }
+
+        std::vector<float> recovered(scaled_dim);
+        triattention_invert_rope(
+            recovered.data(), post.data(), &scaled_pos,
+            scaled_omega.data(), scaled_scale_sq.data(),
+            1, scaled_dim, scaled_dim, scaled_fc, 0);
+
+        for (uint32_t d = 0; d < scaled_dim; ++d) {
+            TEST_ASSERT_MSG(float_eq(recovered[d], pre[d], 1e-4f),
+                "Scaled RoPE inversion failed");
         }
     }
 

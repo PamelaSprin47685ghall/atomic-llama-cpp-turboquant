@@ -185,6 +185,7 @@ static __global__ void triattention_score_kernel(
     const float  * __restrict__ q_mean_abs,      // [freq_count]
     const float  * __restrict__ extra_weight,    // [freq_count]
     const uint32_t              freq_count,
+    const uint32_t              rope_style,
     const int                   agg_mode)        // 0=mean, 1=max
 {
     const int cell_idx_local = blockIdx.x;  // which cell we're scoring
@@ -233,6 +234,8 @@ static __global__ void triattention_score_kernel(
     // K is stored post-RoPE. To get pre-RoPE K, apply RoPE^{-1}.
     // In "half" layout: k_re = K[f], k_im = K[f + freq_count]
     // RoPE^{-1}: multiply by rotation(-θ) where θ = omega[f] * position
+    float pre_re = 0.0f;
+    float pre_im = 0.0f;
     {
         const int32_t pos = positions[cell_idx_local];
         const float w = omega[f];
@@ -240,23 +243,22 @@ static __global__ void triattention_score_kernel(
         const float cos_t = cosf(theta);
         const float sin_t = sinf(theta);
 
-        float k_re = k_smem[f];
-        float k_im = k_smem[f + freq_count];
+        const uint32_t re_idx = rope_style == 0 ? (uint32_t) f : 2u * (uint32_t) f;
+        const uint32_t im_idx = rope_style == 0 ? (uint32_t) f + freq_count : 2u * (uint32_t) f + 1u;
+        const float scale = sqrtf(fmaxf(freq_scale_sq[f], 1e-30f));
+        const float k_re = k_smem[re_idx] / scale;
+        const float k_im = k_smem[im_idx] / scale;
 
         // Inverse rotation: angle = -theta
         // k_re' =  k_re * cos(θ) + k_im * sin(θ)
         // k_im' = -k_re * sin(θ) + k_im * cos(θ)
-        float pre_re =  k_re * cos_t + k_im * sin_t;
-        float pre_im = -k_re * sin_t + k_im * cos_t;
-
-        k_smem[f]              = pre_re;
-        k_smem[f + freq_count] = pre_im;
+        pre_re =  k_re * cos_t + k_im * sin_t;
+        pre_im = -k_re * sin_t + k_im * cos_t;
     }
-    __syncthreads();
 
     // ---- Step 4: Compute score ----
-    const float k_re = k_smem[f];
-    const float k_im = k_smem[f + freq_count];
+    const float k_re = pre_re;
+    const float k_im = pre_im;
     const float k_mag = sqrtf(k_re * k_re + k_im * k_im);
 
     float total_score;
@@ -359,7 +361,7 @@ static void launch_score_kernel(
             scores_out, k_data, n_embd_k_gqa, row_bytes, head_off, hd, \
             cell_indices, positions, n_cells, round_start, \
             state->d_omega, state->d_freq_scale_sq, state->d_offsets, cfg.n_offsets, \
-            qmr, qmi, qma, ew, fc, agg_mode)
+            qmr, qmi, qma, ew, fc, cfg.rope_style, agg_mode)
 
     if (cfg.disable_trig) {
         switch (cfg.k_type) {

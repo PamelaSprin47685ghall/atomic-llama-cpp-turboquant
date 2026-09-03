@@ -1280,7 +1280,11 @@ void llama_kv_cache::compact() {
     }
 }
 
-void llama_kv_cache::init_triattention(const char * stats_path, double ratio, uint32_t recent_window) {
+void llama_kv_cache::init_triattention(
+        const char * stats_path,
+        double ratio,
+        uint32_t recent_window,
+        const llama_cparams & cparams) {
     if (!stats_path || stats_path[0] == '\0') {
         throw std::runtime_error("TriAttention stats path cannot be empty");
     }
@@ -1297,11 +1301,91 @@ void llama_kv_cache::init_triattention(const char * stats_path, double ratio, ui
     cfg.disable_mlr = false;
     cfg.disable_trig = false;
 
-    const double rope_theta = (double) hparams.rope_freq_base_train;
     const uint32_t head_dim = n_embd_head_k_all > 0 ? (uint32_t) n_embd_head_k_all : hparams.n_embd_head_k(0);
     const uint32_t n_kv_heads = hparams.n_head_kv(0);
 
-    tri_scorer = std::make_unique<triattention_scorer>(stats_path, cfg, rope_theta, head_dim, n_kv_heads);
+    if (layers.empty()) {
+        throw std::runtime_error("TriAttention requires at least one KV attention layer");
+    }
+
+    uint32_t expected_rope_style = 0;
+    switch (llama_model_rope_type(&model)) {
+        case LLAMA_ROPE_TYPE_NORM:
+            expected_rope_style = 1; // adjacent even/odd vector pairs
+            break;
+        case LLAMA_ROPE_TYPE_NEOX:
+        case LLAMA_ROPE_TYPE_MROPE:
+        case LLAMA_ROPE_TYPE_IMROPE:
+            expected_rope_style = 0; // front/back NeoX vector pairs
+            break;
+        case LLAMA_ROPE_TYPE_NONE:
+        case LLAMA_ROPE_TYPE_VISION:
+            throw std::runtime_error("TriAttention does not support this RoPE layout");
+    }
+
+    const uint32_t rotary_dim = hparams.n_rot(layers.front().il);
+    if (rotary_dim == 0 || rotary_dim > head_dim || (rotary_dim & 1u) != 0) {
+        throw std::runtime_error("TriAttention requires a valid even rotary dimension");
+    }
+    const uint32_t freq_count = rotary_dim / 2;
+    const double rope_theta = (double) model.get_rope_freq_base(cparams, layers.front().il);
+
+    auto build_layer_rope = [&](uint32_t il, std::vector<float> & omega, std::vector<float> & scale_sq) {
+        if (hparams.n_rot(il) != rotary_dim) {
+            throw std::runtime_error("TriAttention does not yet support heterogeneous rotary dimensions across KV layers");
+        }
+
+        std::vector<float> factors;
+        const float * factor_ptr = nullptr;
+        if (ggml_tensor * factor_tensor = model.get_rope_factors(cparams, il)) {
+            if (factor_tensor->type != GGML_TYPE_F32 || factor_tensor->ne[0] < (int64_t) freq_count) {
+                throw std::runtime_error("TriAttention requires F32 RoPE factors with sufficient frequency entries");
+            }
+            factors.resize(freq_count);
+            ggml_backend_tensor_get(factor_tensor, factors.data(), 0, freq_count * sizeof(float));
+            factor_ptr = factors.data();
+        }
+
+        omega.resize(freq_count);
+        scale_sq.resize(freq_count);
+        if (!triattention_build_rope_tables(
+                omega.data(), scale_sq.data(), rotary_dim,
+                model.get_rope_freq_base(cparams, il),
+                model.get_rope_freq_scale(cparams, il),
+                (int32_t) cparams.n_ctx_orig_yarn,
+                cparams.yarn_ext_factor,
+                cparams.yarn_attn_factor,
+                cparams.yarn_beta_fast,
+                cparams.yarn_beta_slow,
+                factor_ptr)) {
+            throw std::runtime_error("failed to derive exact RoPE tables for TriAttention");
+        }
+    };
+
+    std::vector<float> runtime_omega;
+    std::vector<float> runtime_scale_sq;
+    build_layer_rope(layers.front().il, runtime_omega, runtime_scale_sq);
+
+    // score_combined currently uses one frequency basis for every sampled
+    // attention layer. Fail closed if the model's actual KV layers differ.
+    for (size_t l = 1; l < layers.size(); ++l) {
+        std::vector<float> layer_omega;
+        std::vector<float> layer_scale_sq;
+        build_layer_rope(layers[l].il, layer_omega, layer_scale_sq);
+        for (uint32_t f = 0; f < freq_count; ++f) {
+            const float omega_tol = 1e-6f * std::max(1.0f, std::abs(runtime_omega[f]));
+            const float scale_tol = 1e-6f * std::max(1.0f, std::abs(runtime_scale_sq[f]));
+            if (std::abs(layer_omega[f] - runtime_omega[f]) > omega_tol ||
+                std::abs(layer_scale_sq[f] - runtime_scale_sq[f]) > scale_tol) {
+                throw std::runtime_error(
+                    "TriAttention does not yet support heterogeneous RoPE frequency/scaling tables across KV layers");
+            }
+        }
+    }
+
+    tri_scorer = std::make_unique<triattention_scorer>(
+        stats_path, cfg, rope_theta, head_dim, n_kv_heads,
+        rotary_dim, runtime_omega.data(), runtime_scale_sq.data(), (int32_t) expected_rope_style);
     if (!tri_scorer || !tri_scorer->valid()) {
         tri_scorer.reset();
         throw std::runtime_error(std::string("failed to initialize TriAttention scorer from: ") + stats_path);

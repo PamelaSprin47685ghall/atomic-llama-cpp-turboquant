@@ -34,6 +34,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -47,7 +48,7 @@ struct model_config {
     int32_t  n_head_kv     = 0;    // KV heads
     int32_t  head_dim      = 0;
     double   rope_theta    = 0.0;
-    uint32_t rope_style    = 1;    // 0=half, 1=interleaved (Qwen3.5 uses interleaved M-RoPE)
+    uint32_t rope_style    = 0;    // 0=half/NeoX pairing, 1=even-odd pairing
     uint32_t rotary_dim    = 0;    // partial RoPE dimension
     uint32_t freq_count    = 0;    // rotary_dim / 2
     std::vector<int> full_attn_layers;  // layer indices with standard attention
@@ -97,17 +98,20 @@ static model_config get_model_config(llama_model * model) {
         }
     }
 
-    // rope_style: M-RoPE → interleaved
-    {
-        char buf[256];
-        const char * prefixes[] = {"qwen35moe", "qwen3", nullptr};
-        for (int i = 0; prefixes[i]; ++i) {
-            std::string key = std::string(prefixes[i]) + ".rope.dimension_sections";
-            if (llama_model_meta_val_str(model, key.c_str(), buf, sizeof(buf))) {
-                mc.rope_style = 1;  // interleaved (M-RoPE)
-                break;
-            }
-        }
+    // Pairing follows ggml's vector rotation layout, not M-RoPE section order.
+    // IMROPE interleaves position sections but still uses NeoX/front-back pairs.
+    switch (llama_model_rope_type(model)) {
+        case LLAMA_ROPE_TYPE_NORM:
+            mc.rope_style = 1;
+            break;
+        case LLAMA_ROPE_TYPE_NEOX:
+        case LLAMA_ROPE_TYPE_MROPE:
+        case LLAMA_ROPE_TYPE_IMROPE:
+            mc.rope_style = 0;
+            break;
+        case LLAMA_ROPE_TYPE_NONE:
+        case LLAMA_ROPE_TYPE_VISION:
+            throw std::runtime_error("TriAttention calibration does not support this RoPE layout");
     }
 
     // rotary_dim: use architecture-specific rope.dimension_count

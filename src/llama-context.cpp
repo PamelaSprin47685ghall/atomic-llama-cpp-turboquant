@@ -448,7 +448,7 @@ llama_context::llama_context(
             auto init_tri = [&](llama_kv_cache * kv) {
                 if (kv) {
                     kv->init_triattention(params.triattention_stats,
-                        cparams.triattention_ratio, cparams.triattention_recent_window);
+                        cparams.triattention_ratio, cparams.triattention_recent_window, cparams);
                     initialized = true;
                 }
             };

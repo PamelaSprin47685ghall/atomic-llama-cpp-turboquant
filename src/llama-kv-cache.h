@@ -162,7 +162,7 @@ public:
     // llama_kv_cache specific API
     //
 
-    void init_triattention(const char * stats_path, double ratio, uint32_t recent_window);
+    void init_triattention(const char * stats_path, double ratio, uint32_t recent_window, const llama_cparams & cparams);
 
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;

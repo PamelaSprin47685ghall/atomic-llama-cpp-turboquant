@@ -46,7 +46,8 @@ target(L) = max(128, ceil(3L/32))
 
 - `src/llama-triattention.{h,cpp}` 已实现纯 scorer。
 - calibration format 当前为 version 2；version 1 loader 保持兼容。
-- 已支持 Ornith/Qwen hybrid 的 partial interleaved RoPE：
+- 已支持 Ornith/Qwen hybrid 的 partial IMRoPE；注意 IMRoPE 的 position sections
+  是 interleaved，但 ggml 的向量旋转配对仍是 NeoX/front-back half：
   - `head_dim = 256`
   - `rotary_dim = 64`
   - `freq_count = 32`
@@ -69,13 +70,19 @@ target(L) = max(128, ceil(3L/32))
 - 每个 decoded batch 只做一次 `llama_synchronize()`；
 - 无 per-layer graph cut 或 per-layer synchronize。
 
-当前可信校准：
+2026-09 pairing/scaled-RoPE correctness 修复后，下列旧校准**不再可信且不得部署**：
 
 ```text
 source artifact: /tmp/ornith-1.5-35b-async.triattention
 deployed path:   /opt/llama/data/ornith-1.5-35b.triattention
 SHA-256:         7fbfcdcfc7903e11efba96d7c13bea0ae9d60ff81c75475d54ee613bae2b3cc7
 ```
+
+原因：该 v2 文件的 `rope_style=1`，由旧 collector 把 IMRoPE 的 section
+interleaving 错当成 even/odd vector pairing 生成。当前 runtime 会 fail-closed
+拒绝该文件；必须用修正后的 collector 重新采集（Qwen3.5/Ornith 应写
+`rope_style=0`）。旧文件中的 `q_abs_mean` 已按错误 pair 聚合，不能从现有
+aggregate 无损重排修复。
 
 采集结果：
 
@@ -126,6 +133,10 @@ active slot preemption
 - Vulkan memmove scratch 已纳入 auto-fit reserve。
 
 ### 已通过的受控验证
+
+以下真实 Ornith runtime/smoke 记录使用的是上述旧 calibration，因此只能视为
+历史工程验证，不能作为 pairing/scaled-RoPE correctness 修复后的 release gate；
+必须在新 calibration 生成后重跑。
 
 1. Scorer：`build/bin/test-triattention-score`，0 failures。
 2. Cell metadata：`build/bin/test-kv-cells`，exit 0。
@@ -211,6 +222,10 @@ SHA-256 = 9fcd58b10b9b26c80482f1087b1e53a46933818ed81098aca06b664edc7e7694
 注意：以上 server hash 仅作为该次验证记录。重新构建后必须以新 build/deploy checksum 一致为准，不得把此值当成永久常量。
 
 ### 2026-09-02 delivery candidate 部署状态
+
+> 历史状态：下述 calibration 使用旧 `rope_style=1` pairing，已被 2026-09
+> correctness 修复判定为不兼容。不要用当前源码 + 该 calibration 启动
+> TriAttention；先重新采集并重跑 release gates。
 
 当前 build 与生产部署：
 
