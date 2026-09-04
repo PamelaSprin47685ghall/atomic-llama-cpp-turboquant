@@ -1472,18 +1472,18 @@ private:
         if (assigned_task.empty()) {
             prompt = std::string(server_rerot_planner_prompt());
         } else {
-            prompt = "我当前在推进【";
+            prompt = "我当前在推进目标：“";
             prompt.append(assigned_task);
-            prompt += "】。我直接用单个 li 确认该目标并用 /ol 闭合，随后展开具体推导；只有这项任务确实包含多个需要并行的独立子环节时，才拆成多个 li。\n";
+            prompt += "”。我直接用单个 li 确认该目标并用 /ol 闭合，随后展开具体推导；只有这项任务确实包含多个需要并行的独立子环节时，才拆成多个 li。\n";
         }
         return prompt;
     }
 
     std::string rerot_worker_control_prompt(std::string_view assigned_task) const {
-        std::string prompt = "我围绕【";
+        std::string prompt = "我围绕目标：“";
         prompt.append(assigned_task);
         prompt +=
-            "】在此展开具体深入的推理分析。推导完毕后，我以 &lt;/think&gt; 结束本任务；"
+            "”在此展开具体深入的推理分析。推导完毕后，我以 &lt;/think&gt; 结束本任务；"
             "若确有必要开启并行的子子任务，我才仿照父节点的 ol 列表继续拆分。\n";
         return prompt;
     }
