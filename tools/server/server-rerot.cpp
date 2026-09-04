@@ -585,7 +585,7 @@ server_rerot_stream_lines server_rerot_line_mux::drain_lane(
 
 std::string_view server_rerot_planner_prompt() {
     static constexpr std::string_view prompt =
-        "我把完成请求所需的目标按依赖分组：彼此独立的目标分成多个 li，相互依赖的内容合在一个 li。每个 li 只写具体、可完成的目标，不展开答案、理由或前后流程。列表以 ol 开头，以 /ol 结尾；无法独立拆分就保留一个 li。\n";
+        "我按依赖把请求归成合理粒度的并行目标：独立才分成多个 li，有依赖就合在一个 li。每个 li 需要一段实质推理，只写具体目标，不展开答案；同一方案的并列要点归在一起。以 ol 开头、/ol 结尾；不能并行就一个 li。\n";
     return prompt;
 }
 

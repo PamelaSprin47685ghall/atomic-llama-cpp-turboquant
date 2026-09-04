@@ -1217,6 +1217,7 @@ private:
         server_rerot_line_mux line_mux;
         server_rerot_control_tag_filter final_content_filter;
         std::string streamed_reasoning;
+        size_t final_content_offset = 0;
         uint64_t streamed_lines = 0;
         uint64_t sampled_tokens = 0;
         uint32_t root_seed = LLAMA_DEFAULT_SEED;
@@ -1488,14 +1489,14 @@ private:
     std::string rerot_worker_control_prompt(std::string_view assigned_task) const {
         std::string prompt = "当前目标：";
         prompt.append(assigned_task);
-        prompt += "。\n我直接给出结论和必要依据。\n<blockquote>\n";
+        prompt += "。\n我直接用自然语言给出结论和必要依据，结尾另起一行。\n<blockquote>\n";
         return prompt;
     }
 
     static std::string rerot_finalizer_control_prompt(std::string_view original_user_text) {
-        std::string prompt = "综合已有结论，继续完成原始请求：";
+        std::string prompt = "推导已经足够。原始请求：";
         prompt.append(original_user_text);
-        prompt += "\n";
+        prompt += "\n完整结果：\n";
         return prompt;
     }
 
@@ -2266,6 +2267,7 @@ private:
         slot.smpl = std::move(final_sampler);
         llama_set_sampler(ctx_tgt, slot.id, nullptr);
         slot.generated_text = std::move(response_reasoning);
+        transport_it->second->final_content_offset = slot.generated_text.size();
         slot.generated_tokens.clear();
         slot.generated_token_probs.clear();
         slot.n_sent_text = slot.generated_text.size();
@@ -4552,6 +4554,15 @@ private:
         if (slot.task->params.stream) {
             res->content     = "";
             res->tokens      = llama_tokens{};
+        } else if (slot.rerot_serial_tail) {
+            const auto transport_it = rerot_transport.find(slot.rerot_episode_id);
+            GGML_ASSERT(transport_it != rerot_transport.end());
+            const size_t offset = transport_it->second->final_content_offset;
+            GGML_ASSERT(offset <= slot.generated_text.size());
+            res->rerot_reasoning = slot.generated_text.substr(0, offset);
+            res->content = slot.generated_text.substr(offset);
+            res->rerot_explicit_channels = true;
+            res->tokens = std::move(slot.generated_tokens);
         } else {
             res->content     = std::move(slot.generated_text);
             res->tokens      = std::move(slot.generated_tokens);

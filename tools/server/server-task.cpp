@@ -542,6 +542,26 @@ common_chat_msg task_result_state::update_chat_msg(
     return chat_msg;
 }
 
+common_chat_msg task_result_state::update_rerot_msg(
+        const std::string & reasoning,
+        const std::string & content,
+        std::vector<common_chat_msg_diff> & diffs) {
+    generated_text += content;
+    auto msg_prv_copy = chat_msg;
+    auto parser_params = chat_parser_params;
+    parser_params.generation_prompt.clear();
+
+    auto new_msg = common_chat_parse(generated_text, false, parser_params);
+    if (new_msg.role.empty()) {
+        new_msg.role = "assistant";
+    }
+    new_msg.reasoning_content = reasoning;
+    new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
+    chat_msg = std::move(new_msg);
+    diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
+    return chat_msg;
+}
+
 //
 
 // result_timings
