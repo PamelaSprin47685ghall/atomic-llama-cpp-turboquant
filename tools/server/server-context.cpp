@@ -1490,7 +1490,7 @@ private:
 
     static std::string rerot_finalizer_control_prompt(std::string_view original_user_text) {
         GGML_UNUSED(original_user_text);
-        return "\n\n";
+        return "各部分的思考已经完成。我综合前面的所有推导与结论，直接按照原始请求完成最终交付：\n";
     }
 
     bool rerot_set_injection(
