@@ -520,6 +520,10 @@ server_rerot_stream_lines server_rerot_line_mux::drain_lane(
              newline = lane.partial_line.find('\n')) {
             std::string line = lane.partial_line.substr(0, newline + 1);
             lane.partial_line.erase(0, newline + 1);
+            const size_t open_think_pos = line.find("<think>");
+            if (open_think_pos != std::string::npos) {
+                line.erase(open_think_pos, 7);
+            }
             const size_t marker_pos = line.find("</think>");
             if (marker_pos != std::string::npos) {
                 line.erase(marker_pos, 8);
@@ -531,6 +535,10 @@ server_rerot_stream_lines server_rerot_line_mux::drain_lane(
     }
 
     if (finish && !lane.partial_line.empty()) {
+        const size_t open_think_pos = lane.partial_line.find("<think>");
+        if (open_think_pos != std::string::npos) {
+            lane.partial_line.erase(open_think_pos, 7);
+        }
         const size_t marker_prefix_len = trailing_marker_prefix(lane.partial_line, "</think>");
         if (marker_prefix_len > 0) {
             lane.partial_line.erase(lane.partial_line.size() - marker_prefix_len);
@@ -919,10 +927,17 @@ std::optional<server_rerot_token_plan> server_rerot_runtime::plan_generated_toke
 
         parser_step = current_node->parser.consume(token_bytes);
         if (parser_step.malformed) {
-            fail_episode(*current, parser_step.error.empty()
-                ? "malformed RERoT planner record"
-                : parser_step.error);
-            return std::nullopt;
+            // Free-form worker thought may contain nested lists or imperfect
+            // markup. Never crash the whole episode with HTTP 500: disarm the
+            // planner, release any pending bytes as public text, and let the
+            // lane continue reasoning.
+            current_node->planner_armed = false;
+            if (current_node->pending_record.has_value() &&
+                !release_false_pending(*current, *current_node)) {
+                return std::nullopt;
+            }
+            parser_step.write_visibility = llama_rerot_visibility::public_live;
+            parser_step.malformed = false;
         }
 
         const bool candidate_alive =

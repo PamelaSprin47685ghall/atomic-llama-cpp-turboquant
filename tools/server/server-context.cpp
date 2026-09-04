@@ -1483,8 +1483,8 @@ private:
         std::string prompt = "我在此展开具体深入的推理分析，目标是：";
         prompt.append(assigned_task);
         prompt +=
-            "。推导完毕后，我以 &lt;/think&gt; 结束本任务；"
-            "若确有必要开启并行的子子任务，我才仿照父节点的 ol 列表继续拆分。\n";
+            "。推导完毕后，我以 /think 标记结束本任务；"
+            "若确有必要开启并行的子子任务，我才仿照父节点的 ol 列表继续拆分。\n<think>\n";
         return prompt;
     }
 
