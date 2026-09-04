@@ -1822,6 +1822,10 @@ private:
         task.params.sampling.seed = rerot_lane_seed(
             *episode, node_id, transport_it->second->root_seed);
         task.rerot_episode_id = episode_id;
+        task.params.antiprompt.push_back("</blockquote>");
+        if (task.params.sampling.penalty_repeat <= 1.0f) {
+            task.params.sampling.penalty_repeat = 1.05f;
+        }
 
         try {
             slot.smpl.reset(common_sampler_init(
@@ -2475,7 +2479,8 @@ private:
         slot.t_token_generation = std::max<int64_t>(1, now - slot.t_start_generation) / 1e3;
 
         if (!slot.rerot_serial_tail) {
-            if (llama_vocab_is_eog(vocab, id)) {
+            const bool is_stop_word = slot.stop == STOP_TYPE_WORD && slot.stopping_word == "</blockquote>";
+            if (llama_vocab_is_eog(vocab, id) || is_stop_word) {
                 const auto * episode = rerot->episode(slot.rerot_episode_id);
                 const auto * document_node = episode
                     ? episode->document.node(slot.rerot_node_id)
