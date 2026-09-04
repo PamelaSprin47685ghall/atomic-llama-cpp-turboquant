@@ -1489,7 +1489,7 @@ private:
     std::string rerot_worker_control_prompt(std::string_view assigned_task) const {
         std::string prompt = "当前目标：";
         prompt.append(assigned_task);
-        prompt += "。\n我直接用自然语言给出结论和必要依据，结尾另起一行。\n<blockquote>\n";
+        prompt += "。\n我直接用自然语言给出结论和必要依据，随后另起一行写 </blockquote>。\n<blockquote>\n";
         return prompt;
     }
 
