@@ -559,6 +559,10 @@ struct server_task_result_cmpl_partial : server_task_result {
     bool is_updated = false;
     bool first_chunk = false;
 
+    // RERoT explicit stream delta routing: completely bypasses <think></think> parsing
+    bool is_rerot_reasoning = false;
+    bool is_rerot_content   = false;
+
     // Streaming state copied from task_result_state for this chunk
     bool thinking_block_started = false;
     bool text_block_started     = false;

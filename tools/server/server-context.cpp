@@ -1284,6 +1284,7 @@ private:
             res->id = transport.response_task.id;
             res->index = transport.response_task.index;
             res->content = line;
+            res->is_rerot_reasoning = true;
             res->n_decoded = static_cast<int32_t>(std::min<uint64_t>(
                 transport.sampled_tokens,
                 std::numeric_limits<int32_t>::max()));
@@ -4511,6 +4512,9 @@ private:
         } else {
             res->content = tkn.text_to_send;
             res->tokens  = { tkn.tok };
+            if (slot.rerot_serial_tail) {
+                res->is_rerot_content = true;
+            }
         }
 
         res->n_decoded             = slot.n_decoded;

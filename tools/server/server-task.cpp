@@ -1326,6 +1326,29 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     }
     first_chunk = !state.stream_started;
     state.stream_started = true;
+
+    if (is_rerot_reasoning) {
+        state.chat_msg.reasoning_content += content;
+        common_chat_msg_diff diff;
+        diff.reasoning_content_delta = content;
+        oaicompat_msg_diffs.push_back(std::move(diff));
+        state.thinking_block_started = true;
+        thinking_block_started = true;
+        text_block_started = state.text_block_started;
+        return;
+    }
+
+    if (is_rerot_content) {
+        state.chat_msg.content += content;
+        common_chat_msg_diff diff;
+        diff.content_delta = content;
+        oaicompat_msg_diffs.push_back(std::move(diff));
+        state.text_block_started = true;
+        thinking_block_started = state.thinking_block_started;
+        text_block_started = true;
+        return;
+    }
+
     state.update_chat_msg(content, true, oaicompat_msg_diffs);
 
     // Copy current state for use in to_json_*() (reflects state BEFORE this chunk)
