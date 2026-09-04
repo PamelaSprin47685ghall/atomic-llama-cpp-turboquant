@@ -1380,11 +1380,14 @@ common_rerot_fit_result common_fit_rerot_capacities(
                 }
             }
 
-            const int64_t total_margin = (int64_t) data[i].context + (int64_t) data[i].compute + (int64_t) reserved;
-            const int64_t diff = data[i].free - total_margin;
-            if (diff < 0) {
+            constexpr uint64_t MiB = 1024ull * 1024ull;
+            const uint64_t runtime_headroom = std::min<uint64_t>(
+                256ull * MiB, std::max<uint64_t>(32ull * MiB, data[i].total / 100ull));
+            const uint64_t used = data[i].model + data[i].context + data[i].compute + reserved + runtime_headroom;
+            if (data[i].free <= 0 || used > (uint64_t) data[i].free) {
                 return false;
             }
+            const int64_t diff = (int64_t) data[i].free - (int64_t) used;
             if (diff < min_margin) {
                 min_margin = diff;
             }

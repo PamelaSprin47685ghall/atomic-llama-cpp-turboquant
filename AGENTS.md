@@ -332,9 +332,9 @@ hybrid recurrent 最终为 3 个 physical slots，server 将 `-np 6` 安全收�
    ```text
    build binary: build-vulkan-localhost/bin/llama-server
    SHA-256:      9fcd58b10b9b26c80482f1087b1e53a46933818ed81098aca06b664edc7e7694
-   libllama-server-impl.so:  da706dfa8dd9cf5661c985e7ae4d350c94eef35e5a850437d523e804358fd9fe
-   libllama.so.0.0.10788:    9ebe165ddfed49e1fe196ef193b4306e7fe519c9902983ff17f1761aaed3bd50
-   libllama-common.so.0.0.10788: 2c38db96f620ad6876b6c81c13500ee9b19f5c27f1488b37bdd20b7236c3561e
+   libllama-server-impl.so:  2ca88ec059bcba725a1c96a6b832d72ddad2ffd7897485c3f69c6be5e1bdb93d
+   libllama.so.0.0.10788:    700d75c9551742ad042ae6fe429b81b63db90a02f573a236a90c96ac5dabce07
+   libllama-common.so.0.0.10788: 34bee5593bcf5a61888212e384f80d684de991e1cecc91a914c9aa0e9eb52e86
    libmtmd.so.0.0.10788:     e632f7d92deb26403902a4df0c6dfaa6973d7e14723cd8ec2060d09d39d6ad55
    libggml-vulkan.so.0.18.1: b2198c4f3cdc36ca18ffc38973126cbdeb3bae69c5b188e31d2407734b516c38
    libggml-cpu.so.0.18.1:    6985432492209e53a7c59c8b74bb6bc75e15a41254a35ede1747d55af0d92970

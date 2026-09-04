@@ -1414,7 +1414,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
     }
 
-    if (dynamic_kv) {
+    if (dynamic_kv && !params.rerot_enabled) {
         const auto status = common_fit_recurrent_cache(
             params.model.path.c_str(), &mparams, &cparams, params.n_ctx_kv_reserve,
             extra_cparams,
