@@ -1,3 +1,9 @@
+// This test uses assert() as its failure mechanism. Keep those checks active
+// when the surrounding project is configured with CMAKE_BUILD_TYPE=Release.
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
+
 #include "../src/llama-kv-cells.h"
 
 #include <cassert>
