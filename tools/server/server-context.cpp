@@ -1468,57 +1468,32 @@ private:
     }
 
     std::string rerot_planner_control_prompt(std::string_view assigned_task = {}) const {
-        std::string prompt = "</think>\n<|im_end|>\n<|im_start|>user\n";
+        std::string prompt;
         if (assigned_task.empty()) {
-            prompt += std::string(server_rerot_planner_prompt());
+            prompt = std::string(server_rerot_planner_prompt());
         } else {
-            prompt += "我当前在推进【";
+            prompt = "我当前在推进【";
             prompt.append(assigned_task);
             prompt += "】。我直接用单个 li 确认该目标并用 /ol 闭合，随后展开具体推导；只有这项任务确实包含多个需要并行的独立子环节时，才拆成多个 li。\n";
         }
-        prompt += "<|im_end|>\n<|im_start|>assistant\n<think>\n";
         return prompt;
     }
 
     std::string rerot_worker_control_prompt(std::string_view assigned_task) const {
-        std::string prompt =
-            "</think>\n<|im_end|>\n<|im_start|>user\n"
-            "我当前负责推进子任务【";
+        std::string prompt = "我当前负责推进子任务【";
         prompt.append(assigned_task);
         prompt +=
             "】。我看到上面父节点已经完成了结构规划并给出了 ol 列表。"
             "当前已经是具体子任务，我直接在此深入推导并得出结论；"
-            "除非确实很有必要开启并行的子子任务，我才仿照父节点使用 ol 格式拆分子子任务。否则我直接写出完整推理过程并在完成后结束思考。\n"
-            "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+            "除非确实很有必要开启并行的子子任务，我才仿照父节点使用 ol 格式拆分子子任务。否则我直接写出完整推理过程。\n";
         return prompt;
     }
 
     static std::string rerot_finalizer_control_prompt(std::string_view original_user_text) {
-        // The hidden planner is a synthetic user turn. Close it and restore a
-        // normal assistant turn so the final survivor continues the original
-        // request instead of mistaking one planner item for the whole scope.
-        std::string quoted_request;
-        quoted_request.reserve(original_user_text.size());
-        for (const char ch : original_user_text) {
-            switch (ch) {
-                case '&': quoted_request += "&amp;"; break;
-                case '<': quoted_request += "&lt;";  break;
-                case '>': quoted_request += "&gt;";  break;
-                default:  quoted_request.push_back(ch); break;
-            }
-        }
-
-        std::string prompt =
-            "<|im_end|>\n<|im_start|>user\n";
-        if (!quoted_request.empty()) {
-            prompt += "原始请求：【";
-            prompt += quoted_request;
-            prompt += "】\n";
-        }
-        prompt +=
-            "各部分的思考已经完成。我综合前面的所有推导与结论，直接按照原始请求完成最终交付，不再重复思考过程。\n"
-            "<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n\n";
-        return prompt;
+        GGML_UNUSED(original_user_text);
+        // Pure <think></think> layer boundary: closing thinking transitions
+        // directly to the final assistant response body.
+        return "</think>\n\n";
     }
 
     bool rerot_set_injection(
@@ -2366,6 +2341,23 @@ private:
             if (!rerot->freeze_fork_parent(episode_id, parent_id)) {
                 return false;
             }
+
+            // Scale thinking budget by number of sub-lanes, bounded by context window
+            const uint64_t context_limit = std::max<uint64_t>(1, llama_n_ctx(ctx_tgt));
+            const uint64_t base_budget = transport_it->second->response_task.params.n_predict > 0
+                ? std::min<uint64_t>(context_limit, (uint64_t) transport_it->second->response_task.params.n_predict)
+                : context_limit;
+            const uint64_t sublanes = std::max<uint64_t>(1, episode->document.node_count());
+            const uint64_t scaled_budget = std::min<uint64_t>(context_limit, base_budget * sublanes);
+            const uint64_t internal_seq_budget =
+                LLAMA_MAX_SEQ > slots.size() ? LLAMA_MAX_SEQ - slots.size() : 1;
+            rerot->set_hard_limits(episode_id, {
+                scaled_budget,
+                std::max<uint64_t>(64, internal_seq_budget * 16),
+                internal_seq_budget,
+                scaled_budget,
+            });
+
             transport_it->second->segmented_active = true;
             transport_it->second->triattention_compressed |=
                 parent_slot.triattention_compressed;
