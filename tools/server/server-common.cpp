@@ -9,6 +9,7 @@
 
 #include "server-common.h"
 #include "server-task.h"
+#include "server-rerot.h"
 
 #include <random>
 #include <sstream>
@@ -1070,6 +1071,21 @@ json oaicompat_chat_params_parse(
 
     common_chat_templates_inputs inputs;
     inputs.messages               = common_chat_msgs_parse_oaicompat(messages);
+
+    // Reconcile client-returned chronicle reasoning back to canonical PAC-DFS.
+    // Streamed episodes emit completion-order chunks; when the client sends
+    // them back in history, exact known chronicle strings are mapped back to
+    // the canonical document order so prompt caching and KV reuse succeed.
+    // Unseen or tampered reasoning is strictly preserved as-is.
+    for (auto & msg : inputs.messages) {
+        if (msg.role == "assistant" && !msg.reasoning_content.empty()) {
+            auto canonical = server_rerot_resolve_canonical_reasoning(msg.reasoning_content);
+            if (canonical.has_value()) {
+                msg.reasoning_content = std::move(*canonical);
+            }
+        }
+    }
+
     inputs.tools                  = common_chat_tools_parse_oaicompat(tools);
     inputs.tool_choice            = common_chat_tool_choice_parse_oaicompat(tool_choice);
     inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();

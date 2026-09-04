@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <limits>
+#include <mutex>
 #include <utility>
 
 namespace {
@@ -3188,5 +3189,130 @@ bool server_rerot_runtime::demote_episode(uint64_t episode_id) {
     }
     server_rerot_episode_demote_to_logical(*current);
     return true;
+}
+
+namespace {
+
+class server_rerot_chronicle_registry {
+public:
+    static server_rerot_chronicle_registry & instance() {
+        static server_rerot_chronicle_registry reg;
+        return reg;
+    }
+
+    void register_mapping(
+            std::string_view chronicle,
+            std::string_view canonical,
+            std::string_view content,
+            uint64_t episode_id) {
+        if (chronicle.empty() || canonical.empty() || chronicle == canonical) {
+            return;
+        }
+
+        std::string norm_chronicle = normalize_for_lookup(chronicle);
+        const uint64_t key = hash_text(norm_chronicle);
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (entries_.size() >= MAX_ENTRIES) {
+            evict_oldest();
+        }
+
+        entry_t e;
+        e.chronicle_normalized = std::move(norm_chronicle);
+        e.canonical_reasoning = std::string(canonical);
+        e.final_content = std::string(content);
+        e.episode_id = episode_id;
+        e.timestamp_us = ggml_time_us();
+
+        entries_[key] = std::move(e);
+        lru_order_.push_back(key);
+    }
+
+    std::optional<std::string> resolve(std::string_view incoming) const {
+        if (incoming.empty()) {
+            return std::nullopt;
+        }
+
+        std::string norm_incoming = normalize_for_lookup(incoming);
+        const uint64_t key = hash_text(norm_incoming);
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = entries_.find(key);
+        if (it == entries_.end()) {
+            return std::nullopt;
+        }
+
+        // Exact byte-for-byte match to guarantee zero false mappings on unrecorded or modified thoughts
+        if (it->second.chronicle_normalized != norm_incoming) {
+            return std::nullopt;
+        }
+
+        return it->second.canonical_reasoning;
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        entries_.clear();
+        lru_order_.clear();
+    }
+
+private:
+    static constexpr size_t MAX_ENTRIES = 1024;
+
+    struct entry_t {
+        std::string chronicle_normalized;
+        std::string canonical_reasoning;
+        std::string final_content;
+        uint64_t episode_id = 0;
+        int64_t timestamp_us = 0;
+    };
+
+    static std::string normalize_for_lookup(std::string_view text) {
+        return trim_ascii_space(text);
+    }
+
+    static uint64_t hash_text(std::string_view text) {
+        uint64_t h = 0xcbf29ce484222325ULL;
+        for (unsigned char c : text) {
+            h = (h ^ c) * 0x100000001b3ULL;
+        }
+        return h;
+    }
+
+    mutable std::mutex mutex_;
+    std::unordered_map<uint64_t, entry_t> entries_;
+    std::vector<uint64_t> lru_order_;
+
+    void evict_oldest() {
+        while (!lru_order_.empty()) {
+            const uint64_t old_key = lru_order_.front();
+            lru_order_.erase(lru_order_.begin());
+            auto it = entries_.find(old_key);
+            if (it != entries_.end()) {
+                entries_.erase(it);
+                break;
+            }
+        }
+    }
+};
+
+} // namespace
+
+void server_rerot_register_chronicle_mapping(
+        std::string_view chronicle_reasoning,
+        std::string_view canonical_reasoning,
+        std::string_view final_content,
+        uint64_t episode_id) {
+    server_rerot_chronicle_registry::instance().register_mapping(
+        chronicle_reasoning, canonical_reasoning, final_content, episode_id);
+}
+
+std::optional<std::string> server_rerot_resolve_canonical_reasoning(
+        std::string_view incoming_reasoning) {
+    return server_rerot_chronicle_registry::instance().resolve(incoming_reasoning);
+}
+
+void server_rerot_clear_chronicle_registry() {
+    server_rerot_chronicle_registry::instance().clear();
 }
 

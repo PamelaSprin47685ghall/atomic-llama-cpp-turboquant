@@ -774,3 +774,20 @@ bool llama_rerot_context_apply_shift(
     uint64_t new_publish_epoch,
     std::string * error_out = nullptr);
 
+// Multi-turn history reconciliation (§A.14):
+// Clients stream thinking in real-time completion order ("chronicle"). When the
+// client returns this chronicle text in subsequent conversation turns, the
+// server maps it back to the canonical PAC-DFS document order and internal KV
+// representation. Unknown, tampered, or edited reasoning is rejected (returns
+// nullopt) to prevent false mappings.
+void server_rerot_register_chronicle_mapping(
+    std::string_view chronicle_reasoning,
+    std::string_view canonical_reasoning,
+    std::string_view final_content,
+    uint64_t episode_id);
+
+std::optional<std::string> server_rerot_resolve_canonical_reasoning(
+    std::string_view incoming_reasoning);
+
+void server_rerot_clear_chronicle_registry();
+

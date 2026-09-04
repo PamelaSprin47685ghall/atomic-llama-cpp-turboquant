@@ -2226,6 +2226,17 @@ private:
                 "rerot_stream_error: final fence reached with unfinished Lane lines");
             return false;
         }
+        if (chronological_stream &&
+            !transport_it->second->streamed_reasoning.empty() &&
+            !logical_reasoning.empty() &&
+            transport_it->second->streamed_reasoning != logical_reasoning) {
+            server_rerot_register_chronicle_mapping(
+                transport_it->second->streamed_reasoning,
+                logical_reasoning,
+                "",
+                episode_id);
+        }
+
         const size_t reasoning_bytes_sent =
             chronological_stream ? transport_it->second->streamed_reasoning.size() : 0;
         std::string response_reasoning = chronological_stream

@@ -970,8 +970,52 @@ static void test_internal_seq_exhaustion_aborts_whole_episode() {
     CHECK(runtime.erase_episode(episode_id));
 }
 
+static void test_chronicle_to_canonical_mapping_registry() {
+    server_rerot_clear_chronicle_registry();
+
+    const std::string chronicle =
+        "<ol>\n<li>Task B</li>\n<li>Task A</li>\n</ol>\n"
+        "<h1>Task B</h1>\nResult B\n"
+        "<h1>Task A</h1>\nResult A\n";
+    const std::string canonical =
+        "<ol>\n<li>Task A</li>\n<li>Task B</li>\n</ol>\n"
+        "<h1>Task A</h1>\nResult A\n"
+        "<h1>Task B</h1>\nResult B\n";
+
+    // Unregistered thoughts return nullopt (never blindly mapped)
+    CHECK(!server_rerot_resolve_canonical_reasoning(chronicle).has_value());
+    CHECK(!server_rerot_resolve_canonical_reasoning("completely unknown thought").has_value());
+    CHECK(!server_rerot_resolve_canonical_reasoning("").has_value());
+
+    // Register mapping
+    server_rerot_register_chronicle_mapping(chronicle, canonical, "Final answer", 42);
+
+    // Exact match resolves to canonical PAC-DFS document
+    auto resolved = server_rerot_resolve_canonical_reasoning(chronicle);
+    CHECK(resolved.has_value());
+    CHECK(resolved.value() == canonical);
+
+    // Whitespace trimming variations match safely
+    CHECK(server_rerot_resolve_canonical_reasoning("  \n" + chronicle + "\n  ").value() == canonical);
+
+    // Tampered or modified thoughts are strictly rejected (no false mappings)
+    const std::string tampered =
+        "<ol>\n<li>Task B</li>\n<li>Task A</li>\n</ol>\n"
+        "<h1>Task B</h1>\nTampered Result B\n"
+        "<h1>Task A</h1>\nResult A\n";
+    CHECK(!server_rerot_resolve_canonical_reasoning(tampered).has_value());
+
+    // Identical chronicle and canonical are skipped as no-ops
+    server_rerot_register_chronicle_mapping("same", "same", "", 43);
+    CHECK(!server_rerot_resolve_canonical_reasoning("same").has_value());
+
+    server_rerot_clear_chronicle_registry();
+    CHECK(!server_rerot_resolve_canonical_reasoning(chronicle).has_value());
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT Runtime Tests ===\n");
+    test_chronicle_to_canonical_mapping_registry();
     test_line_mux_completion_order_and_visibility();
     test_split_pending_record_resolution();
     test_private_span_reserves_one_contiguous_run();
