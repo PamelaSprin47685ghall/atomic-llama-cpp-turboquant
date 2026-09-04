@@ -111,6 +111,213 @@ static bool view_contains_run(const llama_rerot_reader_view & view, llama_rerot_
     return false;
 }
 
+static void test_line_mux_completion_order_and_visibility() {
+    llama_rerot_document document(7);
+    const auto lane_a = document.create_child(document.root(), "A");
+    const auto lane_b = document.create_child(document.root(), "B");
+    const auto public_a = document.append_run(
+        lane_a, llama_rerot_visibility::public_live, 0, 1, 1);
+    const auto public_b = document.append_run(
+        lane_b, llama_rerot_visibility::public_live, 0, 1, 1);
+
+    server_rerot_line_mux mux;
+    std::vector<std::string> observed;
+    auto collect = [&](std::string label, server_rerot_stream_lines result) {
+        CHECK(result.ok);
+        for (auto & line : result.lines) {
+            observed.push_back(label + ":" + line);
+        }
+    };
+
+    collect("A", mux.append(lane_a, public_a, "A partial", document));
+    collect("B", mux.append(lane_b, public_b, "B first\nB second", document));
+    collect("A", mux.append(lane_a, public_a, " done\n", document));
+    collect("B", mux.append(lane_b, public_b, "\n", document));
+    CHECK(observed == std::vector<std::string>({
+        "B:B first\n",
+        "A:A partial done\n",
+        "B:B second\n",
+    }));
+
+    const auto hidden = document.append_run(
+        lane_a, llama_rerot_visibility::pending_record, 10, 1);
+    collect("A", mux.append(lane_a, hidden, "<ol>\n", document));
+    CHECK(document.reclassify_run(
+        hidden,
+        llama_rerot_visibility::pending_record,
+        llama_rerot_visibility::private_control));
+    collect("A", mux.drain(lane_a, document));
+    CHECK(observed.size() == 3);
+
+    const auto delayed = document.append_run(
+        lane_a, llama_rerot_visibility::pending_record, 11, 1);
+    collect("A", mux.append(lane_a, delayed, "delayed", document));
+    CHECK(document.reclassify_run(
+        delayed,
+        llama_rerot_visibility::pending_record,
+        llama_rerot_visibility::public_live,
+        2));
+    collect("A", mux.drain(lane_a, document));
+    CHECK(observed.size() == 3);
+    collect("A", mux.append(lane_a, delayed, " line\n", document));
+    CHECK(observed.back() == "A:delayed line\n");
+
+    const auto tail = document.append_run(
+        lane_b, llama_rerot_visibility::public_live, 20, 1, 3);
+    collect("B", mux.append(lane_b, tail, "terminal remainder", document));
+    collect("B", mux.finish(lane_b, document));
+    CHECK(observed.back() == "B:terminal remainder\n");
+    CHECK(mux.empty());
+
+    server_rerot_line_mux invalid;
+    const auto missing = invalid.append(lane_a, 9999, "bad\n", document);
+    CHECK(!missing.ok);
+}
+
+static void test_split_pending_record_resolution() {
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
+    const uint64_t episode_id = runtime.adopt_root(98, 98, 0, 0, 10);
+    server_rerot_line_mux mux;
+    std::vector<std::string> emitted;
+
+    auto first = runtime.plan_generated_token(
+        episode_id, 0, 10, "<ol>\n<li>split ");
+    CHECK(first.has_value());
+    CHECK(first && runtime.commit_token(episode_id, 0, *first));
+    if (!first) {
+        return;
+    }
+    auto ready = mux.append(0, first->run_id, "<ol>\n<li>split ",
+        runtime.episode(episode_id)->document);
+    CHECK(ready.ok && ready.lines.empty());
+
+    auto closing = runtime.plan_generated_token(
+        episode_id, 0, 12, "record</li></ol>\n");
+    CHECK(closing.has_value());
+    CHECK(closing && closing->run_id != first->run_id);
+    CHECK(closing && closing->parser_step.record_closed);
+    CHECK(closing && runtime.commit_token(episode_id, 0, *closing));
+    if (!closing) {
+        return;
+    }
+    ready = mux.append(0, closing->run_id, "record</li></ol>\n",
+        runtime.episode(episode_id)->document);
+    CHECK(ready.ok);
+    emitted.insert(emitted.end(), ready.lines.begin(), ready.lines.end());
+    CHECK(emitted == std::vector<std::string>({
+        "<ol>\n",
+        "<li>split record</li></ol>\n",
+    }));
+
+    const auto * episode = runtime.episode(episode_id);
+    CHECK(episode && episode->pending_tokens == 0);
+    CHECK(episode && episode->generated_public_tokens == 2);
+    CHECK(episode && episode->document.run(first->run_id)->visibility ==
+        llama_rerot_visibility::public_live);
+    CHECK(episode && episode->document.run(closing->run_id)->visibility ==
+        llama_rerot_visibility::public_live);
+
+    auto * node = runtime.node(episode_id, 0);
+    CHECK(node != nullptr);
+    auto public_line = runtime.plan_generated_token(
+        episode_id, 0, node->storage_pos_next, "public line\n");
+    CHECK(public_line.has_value());
+    CHECK(public_line && runtime.commit_token(episode_id, 0, *public_line));
+    if (!public_line) {
+        return;
+    }
+    ready = mux.append(0, public_line->run_id, "public line\n",
+        runtime.episode(episode_id)->document);
+    CHECK(ready.ok && ready.lines == std::vector<std::string>({"public line\n"}));
+
+    node = runtime.node(episode_id, 0);
+    auto marker_a = runtime.plan_generated_token(
+        episode_id, 0, node->storage_pos_next, "</thi");
+    CHECK(marker_a.has_value());
+    CHECK(marker_a && runtime.commit_token(episode_id, 0, *marker_a));
+    if (!marker_a) {
+        return;
+    }
+    ready = mux.append(0, marker_a->run_id, "</thi",
+        runtime.episode(episode_id)->document);
+    CHECK(ready.ok && ready.lines.empty());
+
+    node = runtime.node(episode_id, 0);
+    auto marker_b = runtime.plan_generated_token(
+        episode_id, 0, node->storage_pos_next + 1, "nk>");
+    CHECK(marker_b.has_value());
+    CHECK(marker_b && marker_b->run_id != marker_a->run_id);
+    CHECK(marker_b && marker_b->marker_step.marker_closed);
+    CHECK(marker_b && runtime.commit_token(episode_id, 0, *marker_b));
+    if (!marker_b) {
+        return;
+    }
+    ready = mux.append(0, marker_b->run_id, "nk>",
+        runtime.episode(episode_id)->document);
+    CHECK(ready.ok && ready.lines.empty());
+    CHECK(mux.empty());
+
+    episode = runtime.episode(episode_id);
+    CHECK(episode && episode->pending_tokens == 0);
+    CHECK(episode && episode->generated_private_tokens == 2);
+    CHECK(episode && episode->document.run(marker_a->run_id)->visibility ==
+        llama_rerot_visibility::private_control);
+    CHECK(episode && episode->document.run(marker_b->run_id)->visibility ==
+        llama_rerot_visibility::private_control);
+    CHECK(runtime.erase_episode(episode_id));
+
+    server_rerot_runtime prefix_runtime(
+        nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
+    const uint64_t prefix_episode = prefix_runtime.adopt_root(97, 97, 0, 0, 20);
+    server_rerot_line_mux prefix_mux;
+
+    auto prefix_a = prefix_runtime.plan_generated_token(
+        prefix_episode, 0, 20, "ordinary <");
+    CHECK(prefix_a.has_value());
+    CHECK(prefix_a && prefix_runtime.commit_token(prefix_episode, 0, *prefix_a));
+    if (!prefix_a) {
+        return;
+    }
+    ready = prefix_mux.append(0, prefix_a->run_id, "ordinary <",
+        prefix_runtime.episode(prefix_episode)->document);
+    CHECK(ready.ok && ready.lines.empty());
+
+    auto prefix_b = prefix_runtime.plan_generated_token(
+        prefix_episode, 0, 22, "o");
+    CHECK(prefix_b.has_value());
+    CHECK(prefix_b && prefix_b->run_id != prefix_a->run_id);
+    CHECK(prefix_b && prefix_runtime.commit_token(prefix_episode, 0, *prefix_b));
+    if (!prefix_b) {
+        return;
+    }
+    ready = prefix_mux.append(0, prefix_b->run_id, "o",
+        prefix_runtime.episode(prefix_episode)->document);
+    CHECK(ready.ok && ready.lines.empty());
+
+    auto released = prefix_runtime.plan_generated_token(
+        prefix_episode, 0, 24, "x\n");
+    CHECK(released.has_value());
+    CHECK(released && released->parser_step.release_previous_pending);
+    CHECK(released && prefix_runtime.commit_token(prefix_episode, 0, *released));
+    if (!released) {
+        return;
+    }
+    ready = prefix_mux.append(0, released->run_id, "x\n",
+        prefix_runtime.episode(prefix_episode)->document);
+    CHECK(ready.ok);
+    CHECK(ready.lines == std::vector<std::string>({"ordinary <ox\n"}));
+    CHECK(prefix_mux.empty());
+
+    episode = prefix_runtime.episode(prefix_episode);
+    CHECK(episode && episode->pending_tokens == 0);
+    CHECK(episode && episode->generated_public_tokens == 3);
+    CHECK(episode && episode->document.run(prefix_a->run_id)->visibility ==
+        llama_rerot_visibility::public_live);
+    CHECK(episode && episode->document.run(prefix_b->run_id)->visibility ==
+        llama_rerot_visibility::public_live);
+    CHECK(prefix_runtime.erase_episode(prefix_episode));
+}
+
 static void test_private_span_reserves_one_contiguous_run() {
     server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
     const uint64_t episode_id = runtime.adopt_root(99, 99, 0, 0, 10);
@@ -765,6 +972,8 @@ static void test_internal_seq_exhaustion_aborts_whole_episode() {
 
 int main() {
     std::fprintf(stderr, "=== RERoT Runtime Tests ===\n");
+    test_line_mux_completion_order_and_visibility();
+    test_split_pending_record_resolution();
     test_private_span_reserves_one_contiguous_run();
     test_n1_no_fork_disarm_forever();
     test_n2_strong_uptake();

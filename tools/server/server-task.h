@@ -191,6 +191,10 @@ struct task_result_state {
     std::vector<std::string> generated_tool_call_ids;
     std::unordered_set<size_t> sent_tool_call_names;
 
+    // The first payload chunk owns the assistant role / message-start event.
+    // A begin marker only flushes HTTP headers and does not consume this flag.
+    bool stream_started = false;
+
     // for OpenAI Responses and Anthropic streaming API:
     // track output item / content block state across chunks
     bool thinking_block_started = false;
@@ -553,6 +557,7 @@ struct server_task_result_cmpl_partial : server_task_result {
     std::string        oaicompat_cmpl_id;
     std::vector<common_chat_msg_diff> oaicompat_msg_diffs; // to be populated by update()
     bool is_updated = false;
+    bool first_chunk = false;
 
     // Streaming state copied from task_result_state for this chunk
     bool thinking_block_started = false;
@@ -725,8 +730,9 @@ bool server_rerot_can_batch_with(const task_params & a, const task_params & b);
 bool server_rerot_visual_remap_allowed();
 bool server_rerot_fork_ready(bool has_media, bool prelude_done);
 
-// Streaming (A.14): internal lane text never enters content deltas; the only
-// optional lane visibility is rerot.trace.* events under the explicit flag.
+// Streaming (A.14): committed PUBLIC Lane text is emitted as complete
+// reasoning lines in actual completion order. PENDING/PRIVATE bytes never
+// enter client deltas; rerot.trace.* remains separate and explicitly opt-in.
 bool server_rerot_trace_allowed(const task_params & params);
 json server_rerot_trace_event(
     const std::string & kind,

@@ -1324,6 +1324,8 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     if (is_begin) {
         return; // begin marker only flushes headers, skip parsing
     }
+    first_chunk = !state.stream_started;
+    state.stream_started = true;
     state.update_chat_msg(content, true, oaicompat_msg_diffs);
 
     // Copy current state for use in to_json_*() (reflects state BEFORE this chunk)
@@ -1339,7 +1341,7 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     // track if the accumulated message has any reasoning content
     anthropic_has_reasoning = !state.chat_msg.reasoning_content.empty();
 
-    if (res_type == TASK_RESPONSE_TYPE_OAI_RESP && !state.oai_resp_created && (is_progress || n_decoded == 1)) {
+    if (res_type == TASK_RESPONSE_TYPE_OAI_RESP && !state.oai_resp_created && (is_progress || first_chunk)) {
         state.oai_resp_created = true;
     }
 
@@ -1443,7 +1445,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat() {
 }
 
 json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
-    bool first = n_decoded == 1;
+    const bool first = first_chunk;
     std::time_t t = std::time(0);
     json choices;
 
@@ -1657,7 +1659,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_asr() {
 
 json server_task_result_cmpl_partial::to_json_anthropic() {
     json events = json::array();
-    bool first = (n_decoded == 1);
+    const bool first = first_chunk;
     // use member variables to track block state across streaming calls
     // (anthropic_thinking_block_started, anthropic_text_block_started)
 

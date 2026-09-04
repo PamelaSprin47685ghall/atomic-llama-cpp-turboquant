@@ -202,6 +202,53 @@ struct server_rerot_token_plan {
     }
 };
 
+struct server_rerot_stream_lines {
+    bool ok = true;
+    std::vector<std::string> lines;
+    std::string error;
+};
+
+// Per-Lane newline assembler for the external reasoning stream. Call order is
+// the global completion order; the mux never reorders across insertion points.
+// PENDING bytes block only their own Lane until the document resolves the run
+// PUBLIC or PRIVATE. PRIVATE bytes and their newlines never become boundaries.
+class server_rerot_line_mux {
+public:
+    server_rerot_stream_lines append(
+        llama_rerot_node_id node_id,
+        llama_rerot_run_id run_id,
+        std::string_view bytes,
+        const llama_rerot_document & document);
+    server_rerot_stream_lines drain(
+        llama_rerot_node_id node_id,
+        const llama_rerot_document & document);
+    // A Lane terminal or fork is the only non-newline boundary. Its visible
+    // remainder is emitted with one synthesized newline so every external
+    // chunk remains a complete line.
+    server_rerot_stream_lines finish(
+        llama_rerot_node_id node_id,
+        const llama_rerot_document & document);
+
+    bool empty() const;
+
+private:
+    struct segment {
+        llama_rerot_run_id run_id = LLAMA_REROT_RUN_INVALID;
+        std::string bytes;
+    };
+    struct lane_state {
+        std::deque<segment> blocked;
+        std::string partial_line;
+    };
+
+    server_rerot_stream_lines drain_lane(
+        llama_rerot_node_id node_id,
+        const llama_rerot_document & document,
+        bool finish);
+
+    std::unordered_map<llama_rerot_node_id, lane_state> lanes_;
+};
+
 struct server_rerot_node_runtime {
     llama_rerot_node_id id = LLAMA_REROT_NODE_INVALID;
     int physical_slot = -1;
@@ -516,6 +563,14 @@ private:
     bool release_false_pending(
         server_rerot_episode & episode,
         server_rerot_node_runtime & node);
+
+    bool resolve_pending_record_runs(
+        server_rerot_episode & episode,
+        server_rerot_node_runtime & node,
+        llama_rerot_run_id current_run_id,
+        llama_rerot_visibility replacement,
+        uint64_t publish_epoch,
+        uint64_t & resolved_tokens);
 
     bool publish_pending_record(
         server_rerot_episode & episode,

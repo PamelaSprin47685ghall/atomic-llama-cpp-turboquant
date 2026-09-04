@@ -1213,6 +1213,9 @@ private:
         std::vector<common_adapter_lora_info> lora;
         std::unordered_map<llama_rerot_node_id, server_tokens> lineage_tokens;
         std::unordered_map<llama_rerot_run_id, std::string> run_bytes;
+        server_rerot_line_mux line_mux;
+        std::string streamed_reasoning;
+        uint64_t streamed_lines = 0;
         uint64_t sampled_tokens = 0;
         uint32_t root_seed = LLAMA_DEFAULT_SEED;
         int32_t prompt_tokens_processed = 0;
@@ -1257,6 +1260,104 @@ private:
             SERVER_REROT_PRIVATE_BATCH,
             fair_batch_capacity,
         });
+    }
+
+    void rerot_emit_reasoning_lines(
+            uint64_t episode_id,
+            rerot_transport_state & transport,
+            server_rerot_stream_lines && ready) {
+        if (!ready.ok) {
+            if (rerot && episode_id != 0) {
+                rerot->hard_abort(
+                    episode_id,
+                    "rerot_stream_error: " + ready.error);
+            }
+            return;
+        }
+        if (!transport.response_task.params.stream) {
+            return;
+        }
+
+        for (auto & line : ready.lines) {
+            auto res = std::make_unique<server_task_result_cmpl_partial>();
+            res->id = transport.response_task.id;
+            res->index = transport.response_task.index;
+            res->content = line;
+            res->n_decoded = static_cast<int32_t>(std::min<uint64_t>(
+                transport.sampled_tokens,
+                std::numeric_limits<int32_t>::max()));
+            res->n_prompt_tokens = transport.response_task.n_tokens();
+            res->n_prompt_tokens_cache = transport.prompt_tokens_cache_response;
+            res->post_sampling_probs = transport.response_task.params.post_sampling_probs;
+            res->verbose = transport.response_task.params.verbose;
+            res->res_type = transport.response_task.params.res_type;
+            res->oaicompat_model = transport.response_task.params.oaicompat_model;
+            res->oaicompat_cmpl_id = transport.response_task.params.oaicompat_cmpl_id;
+            queue_results.send(std::move(res));
+
+            transport.streamed_reasoning += line;
+            ++transport.streamed_lines;
+        }
+    }
+
+    bool rerot_stream_commit(
+            uint64_t episode_id,
+            llama_rerot_node_id node_id,
+            llama_rerot_run_id run_id,
+            std::string_view bytes) {
+        auto transport_it = rerot_transport.find(episode_id);
+        auto * episode = rerot ? rerot->episode(episode_id) : nullptr;
+        if (transport_it == rerot_transport.end() || !episode) {
+            return false;
+        }
+        auto & transport = *transport_it->second;
+        if (!transport.response_task.params.stream) {
+            return true;
+        }
+
+        auto ready = transport.line_mux.append(
+            node_id, run_id, bytes, episode->document);
+        const bool ok = ready.ok;
+        rerot_emit_reasoning_lines(episode_id, transport, std::move(ready));
+        return ok;
+    }
+
+    bool rerot_stream_visibility_changed(
+            uint64_t episode_id,
+            llama_rerot_node_id node_id) {
+        auto transport_it = rerot_transport.find(episode_id);
+        auto * episode = rerot ? rerot->episode(episode_id) : nullptr;
+        if (transport_it == rerot_transport.end() || !episode) {
+            return false;
+        }
+        auto & transport = *transport_it->second;
+        if (!transport.response_task.params.stream) {
+            return true;
+        }
+
+        auto ready = transport.line_mux.drain(node_id, episode->document);
+        const bool ok = ready.ok;
+        rerot_emit_reasoning_lines(episode_id, transport, std::move(ready));
+        return ok;
+    }
+
+    bool rerot_stream_finish_lane(
+            uint64_t episode_id,
+            llama_rerot_node_id node_id) {
+        auto transport_it = rerot_transport.find(episode_id);
+        auto * episode = rerot ? rerot->episode(episode_id) : nullptr;
+        if (transport_it == rerot_transport.end() || !episode) {
+            return false;
+        }
+        auto & transport = *transport_it->second;
+        if (!transport.response_task.params.stream) {
+            return true;
+        }
+
+        auto ready = transport.line_mux.finish(node_id, episode->document);
+        const bool ok = ready.ok;
+        rerot_emit_reasoning_lines(episode_id, transport, std::move(ready));
+        return ok;
     }
 
     void rerot_note_parallel_start(uint64_t episode_id) {
@@ -1978,6 +2079,12 @@ private:
                 return false;
             }
             transport_it->second->run_bytes[current_plan.run_id] += bytes;
+            if (!slot.rerot_serial_tail &&
+                current_plan.visibility != llama_rerot_visibility::private_control &&
+                !rerot_stream_commit(
+                    episode_id, node_id, current_plan.run_id, bytes)) {
+                return false;
+            }
             ++transport_it->second->model_tokens;
             if (transport_it->second->parallel_started_us != 0 &&
                 !transport_it->second->parallel_finished) {
@@ -2009,6 +2116,12 @@ private:
         const bool terminal_plan =
             plan.parser_step.record_closed &&
             plan.parser_step.items.size() == 1;
+        const bool lane_finished =
+            plan.marker_step.marker_closed ||
+            (plan.parser_step.record_closed && !terminal_plan);
+        if (lane_finished && !rerot_stream_finish_lane(episode_id, node_id)) {
+            return false;
+        }
 
         slot.rerot_inflight_plan.reset();
         slot.rerot_inflight_bytes.clear();
@@ -2072,7 +2185,11 @@ private:
                 : nullptr;
             if (!document_node ||
                 !rerot->publish_heading(episode_id, node_id, plan.run_id) ||
-                !rerot->complete_admission(episode_id, node_id) ||
+                !rerot->complete_admission(episode_id, node_id)) {
+                rerot->hard_abort(episode_id, "rerot_protocol_error: child heading publication failed");
+                return false;
+            }
+            if (!rerot_stream_visibility_changed(episode_id, node_id) ||
                 !rerot_set_injection(
                     slot,
                     server_rerot_injection_kind::planner,
@@ -2133,19 +2250,34 @@ private:
         }
         rerot_note_parallel_end(episode_id, ggml_time_us());
 
-        std::string reasoning = rerot_render_public_document(episode_id, final_node);
+        std::string logical_reasoning =
+            rerot_render_public_document(episode_id, final_node);
         if (slot.task && slot.task->params.rerot_trace) {
             SRV_INF("rerot.trace.document: episode=%" PRIu64 " node=%u bytes=%zu text=%s\n",
-                episode_id, final_node, reasoning.size(), reasoning.c_str());
+                episode_id, final_node, logical_reasoning.size(), logical_reasoning.c_str());
         }
-        reasoning += "</think>\n\n";
+
+        const bool chronological_stream = final_task.params.stream;
+        if (chronological_stream && !transport_it->second->line_mux.empty()) {
+            rerot->hard_abort(
+                episode_id,
+                "rerot_stream_error: final fence reached with unfinished Lane lines");
+            return false;
+        }
+        const size_t reasoning_bytes_sent =
+            chronological_stream ? transport_it->second->streamed_reasoning.size() : 0;
+        std::string response_reasoning = chronological_stream
+            ? transport_it->second->streamed_reasoning
+            : std::move(logical_reasoning);
+        response_reasoning += "</think>\n\n";
+
         slot.task = std::make_unique<const server_task>(std::move(final_task));
         slot.smpl = std::move(final_sampler);
         llama_set_sampler(ctx_tgt, slot.id, nullptr);
-        slot.generated_text = std::move(reasoning);
+        slot.generated_text = std::move(response_reasoning);
         slot.generated_tokens.clear();
         slot.generated_token_probs.clear();
-        slot.n_sent_text = 0;
+        slot.n_sent_text = reasoning_bytes_sent;
         slot.n_prompt_tokens_original = transport_it->second->response_task.n_tokens();
         slot.n_prompt_tokens_processed = transport_it->second->prompt_tokens_processed;
         slot.n_prompt_tokens_processed_accum =
@@ -2170,8 +2302,13 @@ private:
 
         ++rerot_metrics.final_fences;
         ++rerot_metrics.refresh_total;
-        SRV_INF("RERoT final fence: episode=%" PRIu64 " node=%u slot=%d public_bytes=%zu\n",
-            episode_id, final_node, slot.id, slot.generated_text.size());
+        SRV_INF("RERoT final fence: episode=%" PRIu64
+                " node=%u slot=%d public_bytes=%zu streamed_lines=%" PRIu64 "\n",
+            episode_id,
+            final_node,
+            slot.id,
+            slot.generated_text.size(),
+            transport_it->second->streamed_lines);
         return true;
     }
 

@@ -431,6 +431,107 @@ server_rerot_marker_step server_rerot_marker_parser::consume(std::string_view by
     return step;
 }
 
+server_rerot_stream_lines server_rerot_line_mux::append(
+        llama_rerot_node_id node_id,
+        llama_rerot_run_id run_id,
+        std::string_view bytes,
+        const llama_rerot_document & document) {
+    server_rerot_stream_lines result;
+    if (node_id == LLAMA_REROT_NODE_INVALID || run_id == LLAMA_REROT_RUN_INVALID) {
+        result.ok = false;
+        result.error = "invalid RERoT line-stream node/run";
+        return result;
+    }
+
+    auto & lane = lanes_[node_id];
+    if (!bytes.empty()) {
+        if (!lane.blocked.empty() && lane.blocked.back().run_id == run_id) {
+            lane.blocked.back().bytes.append(bytes);
+        } else {
+            lane.blocked.push_back({run_id, std::string(bytes)});
+        }
+    }
+    return drain_lane(node_id, document, false);
+}
+
+server_rerot_stream_lines server_rerot_line_mux::drain(
+        llama_rerot_node_id node_id,
+        const llama_rerot_document & document) {
+    return drain_lane(node_id, document, false);
+}
+
+server_rerot_stream_lines server_rerot_line_mux::finish(
+        llama_rerot_node_id node_id,
+        const llama_rerot_document & document) {
+    return drain_lane(node_id, document, true);
+}
+
+bool server_rerot_line_mux::empty() const {
+    return lanes_.empty();
+}
+
+server_rerot_stream_lines server_rerot_line_mux::drain_lane(
+        llama_rerot_node_id node_id,
+        const llama_rerot_document & document,
+        bool finish) {
+    server_rerot_stream_lines result;
+    const auto lane_it = lanes_.find(node_id);
+    if (lane_it == lanes_.end()) {
+        return result;
+    }
+
+    auto & lane = lane_it->second;
+    while (!lane.blocked.empty()) {
+        const auto * run = document.run(lane.blocked.front().run_id);
+        if (!run) {
+            result.ok = false;
+            result.error = "RERoT line stream references a missing run";
+            return result;
+        }
+        if (run->visibility == llama_rerot_visibility::pending_record) {
+            if (finish) {
+                result.ok = false;
+                result.error =
+                    "RERoT Lane finished with unresolved streaming bytes: node=" +
+                    std::to_string(node_id) +
+                    " run=" + std::to_string(run->id) +
+                    " blocked_segments=" + std::to_string(lane.blocked.size()) +
+                    " blocked_bytes=" + std::to_string(lane.blocked.front().bytes.size()) +
+                    " partial_bytes=" + std::to_string(lane.partial_line.size());
+            }
+            return result;
+        }
+
+        std::string bytes = std::move(lane.blocked.front().bytes);
+        lane.blocked.pop_front();
+        if (run->visibility == llama_rerot_visibility::private_control) {
+            continue;
+        }
+        if (run->visibility != llama_rerot_visibility::public_live) {
+            result.ok = false;
+            result.error = "RERoT line stream encountered normal visibility";
+            return result;
+        }
+
+        lane.partial_line += bytes;
+        for (size_t newline = lane.partial_line.find('\n');
+             newline != std::string::npos;
+             newline = lane.partial_line.find('\n')) {
+            result.lines.push_back(lane.partial_line.substr(0, newline + 1));
+            lane.partial_line.erase(0, newline + 1);
+        }
+    }
+
+    if (finish && !lane.partial_line.empty()) {
+        lane.partial_line.push_back('\n');
+        result.lines.push_back(std::move(lane.partial_line));
+    }
+    if (finish || (lane.blocked.empty() && lane.partial_line.empty())) {
+        lanes_.erase(lane_it);
+    }
+    return result;
+}
+
 std::string_view server_rerot_planner_prompt() {
     static constexpr std::string_view prompt =
         "请先判断当前问题的规模、难度、共同前提和依赖关系，然后把问题拆成可以并行推进、彼此互补的具体推理任务。\n"
@@ -596,6 +697,9 @@ llama_rerot_run_id server_rerot_runtime::ensure_run(
             int64_t(current_run->storage_pos0) + int64_t(current_run->token_count) == int64_t(storage_pos)) {
             return current_run->id;
         }
+        // Rejected speculative tokens can leave storage-position gaps. A
+        // logical pending record may therefore span several physical runs;
+        // its resolution handles every pending run owned by this Lane.
         active->reset();
     }
 
@@ -608,6 +712,81 @@ llama_rerot_run_id server_rerot_runtime::ensure_run(
     return run_id;
 }
 
+bool server_rerot_runtime::resolve_pending_record_runs(
+        server_rerot_episode & episode,
+        server_rerot_node_runtime & node,
+        llama_rerot_run_id current_run_id,
+        llama_rerot_visibility replacement,
+        uint64_t publish_epoch,
+        uint64_t & resolved_tokens) {
+    resolved_tokens = 0;
+    if (!node.pending_record.has_value() ||
+        *node.pending_record != current_run_id ||
+        (replacement != llama_rerot_visibility::public_live &&
+         replacement != llama_rerot_visibility::private_control) ||
+        (replacement == llama_rerot_visibility::public_live) != (publish_epoch != 0)) {
+        return fail_episode(episode, "invalid pending-record resolution request");
+    }
+
+    const auto * logical_node = episode.document.node(node.id);
+    if (!logical_node) {
+        return fail_episode(episode, "pending-record owner is missing");
+    }
+
+    std::vector<std::pair<llama_rerot_run_id, uint32_t>> pending_runs;
+    bool found_current = false;
+    for (const auto candidate_id : logical_node->runs) {
+        const auto * candidate = episode.document.run(candidate_id);
+        if (!candidate) {
+            return fail_episode(episode, "pending-record run is missing");
+        }
+        if (candidate->visibility != llama_rerot_visibility::pending_record) {
+            continue;
+        }
+        if (candidate->token_count == 0) {
+            return fail_episode(episode, "pending-record run is empty");
+        }
+        pending_runs.emplace_back(candidate_id, candidate->token_count);
+        found_current = found_current || candidate_id == current_run_id;
+        resolved_tokens += candidate->token_count;
+    }
+    if (!found_current || pending_runs.empty() || episode.pending_tokens < resolved_tokens) {
+        return fail_episode(episode, "pending-record run set is incomplete");
+    }
+
+    if (memory_) {
+        const auto replacement_kv =
+            replacement == llama_rerot_visibility::public_live
+                ? LLAMA_REROT_KV_PUBLIC_LIVE
+                : LLAMA_REROT_KV_PRIVATE_CONTROL;
+        for (const auto & pending : pending_runs) {
+            const size_t changed = llama_memory_rerot_reclassify_run(
+                memory_, episode.id, pending.first,
+                LLAMA_REROT_KV_PENDING_RECORD,
+                replacement_kv,
+                publish_epoch);
+            if (changed != pending.second) {
+                return fail_episode(
+                    episode,
+                    "failed to resolve every physical run in a pending RERoT record");
+            }
+        }
+    }
+
+    for (const auto & pending : pending_runs) {
+        if (!episode.document.reclassify_run(
+                pending.first,
+                llama_rerot_visibility::pending_record,
+                replacement,
+                publish_epoch)) {
+            return fail_episode(
+                episode,
+                "failed to resolve every logical run in a pending RERoT record");
+        }
+    }
+    return true;
+}
+
 bool server_rerot_runtime::release_false_pending(
         server_rerot_episode & episode,
         server_rerot_node_runtime & node) {
@@ -616,34 +795,21 @@ bool server_rerot_runtime::release_false_pending(
     }
 
     const auto run_id = *node.pending_record;
-    const auto * run = episode.document.run(run_id);
-    if (!run || run->visibility != llama_rerot_visibility::pending_record || run->token_count == 0) {
-        return fail_episode(episode, "RERoT parser released an invalid pending run");
-    }
-
     const uint64_t publish_epoch = next_publish_epoch(episode);
     if (publish_epoch == 0) {
         return false;
     }
 
-    if (memory_) {
-        const size_t changed = llama_memory_rerot_reclassify_run(
-            memory_, episode.id, run_id,
-            LLAMA_REROT_KV_PENDING_RECORD,
-            LLAMA_REROT_KV_PUBLIC_LIVE,
-            publish_epoch);
-        if (changed == 0) {
-            return fail_episode(episode, "failed to atomically release a false control-marker prefix");
-        }
-    }
-
-    if (!episode.document.reclassify_run(
-            run_id,
-            llama_rerot_visibility::pending_record,
+    uint64_t published_tokens = 0;
+    if (!resolve_pending_record_runs(
+            episode, node, run_id,
             llama_rerot_visibility::public_live,
-            publish_epoch)) {
-        return fail_episode(episode, "logical false-marker publication failed");
+            publish_epoch,
+            published_tokens)) {
+        return false;
     }
+    episode.pending_tokens -= published_tokens;
+    episode.generated_public_tokens += published_tokens;
 
     node.pending_record.reset();
     node.public_run = run_id;
@@ -962,31 +1128,18 @@ bool server_rerot_runtime::publish_pending_run(
         server_rerot_node_runtime & node,
         llama_rerot_run_id run_id,
         bool topology_change) {
-    if (!node.pending_record.has_value() || *node.pending_record != run_id) {
-        return fail_episode(episode, "attempted to publish a non-current pending run");
-    }
-    const auto * run = episode.document.run(run_id);
-    if (!run || run->visibility != llama_rerot_visibility::pending_record || run->token_count == 0) {
-        return fail_episode(episode, "attempted to publish an empty or invalid pending run");
-    }
-
     const uint64_t publish_epoch = next_publish_epoch(episode);
     if (publish_epoch == 0) {
         return false;
     }
-    const uint64_t published_tokens = run->token_count;
 
-    if (memory_) {
-        const size_t changed = llama_memory_rerot_publish_run(memory_, episode.id, run_id, publish_epoch);
-        if (changed != run->token_count) {
-            return fail_episode(episode, "failed to atomically publish the complete pending RERoT run");
-        }
-    }
-    if (!episode.document.publish_run(run_id, publish_epoch)) {
-        return fail_episode(episode, "logical pending-run publication failed");
-    }
-    if (episode.pending_tokens < published_tokens) {
-        return fail_episode(episode, "pending token accounting underflow during publication");
+    uint64_t published_tokens = 0;
+    if (!resolve_pending_record_runs(
+            episode, node, run_id,
+            llama_rerot_visibility::public_live,
+            publish_epoch,
+            published_tokens)) {
+        return false;
     }
     episode.pending_tokens -= published_tokens;
     episode.generated_public_tokens += published_tokens;
@@ -1005,34 +1158,13 @@ bool server_rerot_runtime::finalize_exit_marker(
         server_rerot_episode & episode,
         server_rerot_node_runtime & node,
         llama_rerot_run_id run_id) {
-    if (!node.pending_record.has_value() || *node.pending_record != run_id) {
-        return fail_episode(episode, "private end marker does not own the current pending run");
-    }
-    const auto * run = episode.document.run(run_id);
-    if (!run || run->visibility != llama_rerot_visibility::pending_record || run->token_count == 0) {
-        return fail_episode(episode, "private end marker run is empty or invalid");
-    }
-
-    if (memory_) {
-        const size_t changed = llama_memory_rerot_reclassify_run(
-            memory_, episode.id, run_id,
-            LLAMA_REROT_KV_PENDING_RECORD,
-            LLAMA_REROT_KV_PRIVATE_CONTROL,
-            0);
-        if (changed != run->token_count) {
-            return fail_episode(episode, "failed to atomically privatize the complete </think> run");
-        }
-    }
-    const uint64_t privatized_tokens = run->token_count;
-    if (!episode.document.reclassify_run(
-            run_id,
-            llama_rerot_visibility::pending_record,
+    uint64_t privatized_tokens = 0;
+    if (!resolve_pending_record_runs(
+            episode, node, run_id,
             llama_rerot_visibility::private_control,
-            0)) {
-        return fail_episode(episode, "logical </think> privatization failed");
-    }
-    if (episode.pending_tokens < privatized_tokens) {
-        return fail_episode(episode, "pending token accounting underflow during privatization");
+            0,
+            privatized_tokens)) {
+        return false;
     }
     episode.pending_tokens -= privatized_tokens;
     episode.generated_private_tokens += privatized_tokens;
