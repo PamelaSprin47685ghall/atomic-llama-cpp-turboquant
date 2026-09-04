@@ -1517,6 +1517,9 @@ private:
         }
 
         server_task root_lane_task = rerot_clone_task(*slot.task);
+        root_lane_task.params.sampling.reasoning_budget_start.clear();
+        root_lane_task.params.sampling.reasoning_budget_end.clear();
+        root_lane_task.params.sampling.reasoning_budget_tokens = -1;
         rerot_install_planner_grammar(root_lane_task.params);
         if (root_lane_task.params.sampling.seed != LLAMA_DEFAULT_SEED &&
             root_lane_task.index > 0) {
@@ -1813,6 +1816,9 @@ private:
 
         server_task task = rerot_clone_task(transport_it->second->response_task);
         rerot_remove_planner_grammar(task.params);
+        task.params.sampling.reasoning_budget_start.clear();
+        task.params.sampling.reasoning_budget_end.clear();
+        task.params.sampling.reasoning_budget_tokens = -1;
         task.params.sampling.seed = rerot_lane_seed(
             *episode, node_id, transport_it->second->root_seed);
         task.rerot_episode_id = episode_id;
@@ -2189,6 +2195,9 @@ private:
 
         server_task final_task =
             rerot_clone_task(transport_it->second->response_task);
+        final_task.params.sampling.reasoning_budget_start.clear();
+        final_task.params.sampling.reasoning_budget_end.clear();
+        final_task.params.sampling.reasoning_budget_tokens = -1;
         final_task.params.sampling.seed = slot.task->params.sampling.seed;
         common_sampler_ptr final_sampler;
         try {
