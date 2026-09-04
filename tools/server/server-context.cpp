@@ -2187,6 +2187,15 @@ private:
                 rerot->hard_abort(episode_id, "rerot_protocol_error: child heading/worker admission failed");
                 return false;
             }
+        } else if (injection == server_rerot_injection_kind::planner) {
+            // Only root planner opens <ol>\n<li> automatically to begin the parallel ring.
+            if (!rerot_set_injection(
+                    slot,
+                    server_rerot_injection_kind::planner_open,
+                    "<ol>\n<li>")) {
+                rerot->hard_abort(episode_id, "rerot_protocol_error: failed to arm planner list");
+                return false;
+            }
         }
         return true;
     }
