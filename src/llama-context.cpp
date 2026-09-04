@@ -3951,7 +3951,10 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
     // episode instead (matching state_read_data envelope plus the server
     // server_rerot load_episode blob, with magic/version/caps/fingerprint
     // triple validated and mismatches explicitly rejected).
-    if (cparams.rerot_enabled && llama_rerot_ctx_is_active(this)) {
+    // PARTIAL_ONLY (recurrent state only) is explicitly permitted to support
+    // queued parent state restoration without pinning GPU VRAM.
+    if (cparams.rerot_enabled && llama_rerot_ctx_is_active(this) &&
+        (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         throw std::runtime_error(
             "llama_context::state_seq_read_data: refusing per-seq slot restore while a RERoT episode is active "
             "(shared episode state needs whole-episode restore; per-seq bytes would orphan lineage)");

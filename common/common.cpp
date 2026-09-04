@@ -1329,6 +1329,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
 
         // Search downwards from the initial recurrent target to find the largest capacity that fits.
+        cparams.triattention       = params.triattention_enabled;
+        cparams.triattention_ratio = params.triattention_ratio;
+        cparams.triattention_stats = params.triattention_stats.c_str();
         uint32_t target_recurrent = common_dynamic_recurrent_target(cparams);
         while (target_recurrent > 1) {
             cparams.n_seq_recurrent = target_recurrent;
@@ -1378,6 +1381,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 llama_model_free(meta_model);
             }
         }
+        cparams.triattention       = params.triattention_enabled;
+        cparams.triattention_ratio = params.triattention_ratio;
+        cparams.triattention_stats = params.triattention_stats.c_str();
         cparams.n_seq_recurrent = common_dynamic_recurrent_target(cparams);
         if (extra_cparams != nullptr) {
             cparams_mtp.n_seq_recurrent = cparams.n_seq_recurrent;

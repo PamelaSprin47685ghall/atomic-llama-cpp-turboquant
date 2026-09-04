@@ -1212,6 +1212,7 @@ private:
         server_task response_task;
         std::vector<common_adapter_lora_info> lora;
         std::unordered_map<llama_rerot_node_id, server_tokens> lineage_tokens;
+        std::unordered_map<llama_rerot_node_id, std::vector<uint8_t>> parent_recurrent_snapshots;
         std::unordered_map<llama_rerot_run_id, std::string> run_bytes;
         server_rerot_line_mux line_mux;
         std::string streamed_reasoning;
@@ -1482,10 +1483,11 @@ private:
     std::string rerot_worker_control_prompt(std::string_view assigned_task) const {
         std::string prompt =
             "</think>\n<|im_end|>\n<|im_start|>user\n"
-            "我开始推导【";
+            "我当前负责推进子任务【";
         prompt.append(assigned_task);
         prompt +=
-            "】。我结合已有推导直接写出分析与结论，完成后结束思考。\n"
+            "】。当前已经是具体子任务，我直接在此深入推导并得出结论，不再继续细分；"
+            "除非确实很有必要开启并行的子子任务，我才使用 <ol> 拆分子子任务。否则我直接写出完整推理过程并在完成后结束思考。\n"
             "<|im_end|>\n<|im_start|>assistant\n<think>\n";
         return prompt;
     }
@@ -1837,7 +1839,7 @@ private:
         }
 
         server_task task = rerot_clone_task(transport_it->second->response_task);
-        rerot_install_planner_grammar(task.params);
+        rerot_remove_planner_grammar(task.params);
         task.params.sampling.seed = rerot_lane_seed(
             *episode, node_id, transport_it->second->root_seed);
         task.rerot_episode_id = episode_id;
@@ -1895,6 +1897,20 @@ private:
         slot.rerot_inflight_forced = false;
         slot.triattention_compressed = transport_it->second->triattention_compressed;
 
+        const auto * child_doc = episode->document.node(node_id);
+        if (child_doc && ctx_tgt) {
+            auto snap_it = transport_it->second->parent_recurrent_snapshots.find(child_doc->parent);
+            if (snap_it != transport_it->second->parent_recurrent_snapshots.end() &&
+                !snap_it->second.empty()) {
+                llama_state_seq_set_data_ext(
+                    ctx_tgt,
+                    snap_it->second.data(),
+                    snap_it->second.size(),
+                    slot.id,
+                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+        }
+
         const std::string heading = rerot->heading_text(episode_id, node_id);
         if (!rerot_set_injection(slot, server_rerot_injection_kind::heading, heading)) {
             return false;
@@ -1931,12 +1947,9 @@ private:
                 const uint64_t required_after_cow =
                     recurrent.used + episode->starting.size() + 1;
                 if (required_after_cow > recurrent.capacity) {
-                    if (episode->running.empty() && episode->starting.empty()) {
-                        rerot->hard_abort(
-                            episode_id,
-                            "rerot_resource_exhausted: recurrent fork lineages fill physical capacity");
-                        return false;
-                    }
+                    // Physical recurrent capacity temporarily saturated;
+                    // queued children remain safely in ready_queue waiting for
+                    // running slots to complete. Never abort!
                     break;
                 }
             }
@@ -2162,24 +2175,16 @@ private:
                 rerot->hard_abort(episode_id, "rerot_protocol_error: child heading publication failed");
                 return false;
             }
+            // Child and grandchild nodes default to direct worker reasoning.
+            // They do not automatically start with <ol> or planner grammar;
+            // if the LLM itself generates a valid <ol></ol>, the runtime
+            // parser detects it and continues tree branching.
             if (!rerot_stream_visibility_changed(episode_id, node_id) ||
                 !rerot_set_injection(
                     slot,
-                    server_rerot_injection_kind::planner,
-                    rerot_planner_control_prompt(document_node->title))) {
-                rerot->hard_abort(episode_id, "rerot_protocol_error: child heading/planner admission failed");
-                return false;
-            }
-        } else if (injection == server_rerot_injection_kind::planner) {
-            // The model is now inside a fresh hidden assistant reasoning turn.
-            // Force only the structural opener; title text and the complete
-            // list remain model-generated, while the byte parser holds the
-            // record PENDING until the first real </ol>.
-            if (!rerot_set_injection(
-                    slot,
-                    server_rerot_injection_kind::planner_open,
-                    "<ol>\n<li>")) {
-                rerot->hard_abort(episode_id, "rerot_protocol_error: failed to arm planner list");
+                    server_rerot_injection_kind::worker,
+                    rerot_worker_control_prompt(document_node->title))) {
+                rerot->hard_abort(episode_id, "rerot_protocol_error: child heading/worker admission failed");
                 return false;
             }
         }
@@ -2318,6 +2323,20 @@ private:
             for (const auto child_id : parent_doc->children) {
                 transport_it->second->lineage_tokens.insert_or_assign(
                     child_id, parent_slot.prompt.tokens.clone());
+            }
+
+            if (ctx_tgt) {
+                const size_t snap_sz = llama_state_seq_get_size_ext(
+                    ctx_tgt, parent_slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (snap_sz > 0) {
+                    std::vector<uint8_t> snap(snap_sz);
+                    if (llama_state_seq_get_data_ext(
+                            ctx_tgt, snap.data(), snap_sz, parent_slot.id,
+                            LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) > 0) {
+                        transport_it->second->parent_recurrent_snapshots.insert_or_assign(
+                            parent_id, std::move(snap));
+                    }
+                }
             }
 
             ++rerot_metrics.forks_total;

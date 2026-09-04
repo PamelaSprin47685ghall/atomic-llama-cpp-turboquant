@@ -885,6 +885,16 @@ std::optional<server_rerot_token_plan> server_rerot_runtime::plan_generated_toke
     server_rerot_parser_step parser_step;
     server_rerot_marker_step marker_step;
     if (current_node->planner_armed) {
+        // A node may fork via <ol>...</ol> OR conclude directly with </think>.
+        // Both detectors track the token stream in parallel.
+        marker_step = current_node->exit_parser.consume(token_bytes);
+        if (marker_step.malformed) {
+            fail_episode(*current, marker_step.error.empty()
+                ? "malformed RERoT private end marker"
+                : marker_step.error);
+            return std::nullopt;
+        }
+
         parser_step = current_node->parser.consume(token_bytes);
         if (parser_step.malformed) {
             fail_episode(*current, parser_step.error.empty()
@@ -892,8 +902,32 @@ std::optional<server_rerot_token_plan> server_rerot_runtime::plan_generated_toke
                 : parser_step.error);
             return std::nullopt;
         }
-        if (parser_step.release_previous_pending && !release_false_pending(*current, *current_node)) {
-            return std::nullopt;
+
+        const bool candidate_alive =
+            current_node->exit_parser.state() == server_rerot_marker_state::marker_candidate ||
+            current_node->parser.state() == server_rerot_parser_state::opening_candidate ||
+            current_node->parser.state() == server_rerot_parser_state::list_pending;
+
+        const bool release_pending =
+            (marker_step.release_previous_pending || parser_step.release_previous_pending) &&
+            !candidate_alive;
+
+        if (release_pending) {
+            parser_step.release_previous_pending = true;
+            if (!release_false_pending(*current, *current_node)) {
+                return std::nullopt;
+            }
+        }
+
+        if (marker_step.marker_closed) {
+            current_node->planner_armed = false;
+            parser_step.write_visibility = marker_step.write_visibility;
+        } else if (parser_step.record_closed) {
+            // Completed <ol> record; visibility handled by parser_step
+        } else if (candidate_alive) {
+            parser_step.write_visibility = llama_rerot_visibility::pending_record;
+        } else {
+            parser_step.write_visibility = llama_rerot_visibility::public_live;
         }
     } else {
         marker_step = current_node->exit_parser.consume(token_bytes);
