@@ -269,8 +269,31 @@ private:
     std::unordered_map<llama_rerot_node_id, lane_state> lanes_;
 };
 
+// Person and pen identifiers (§§B.0, B.4, B.8, B.13 Phase 1)
+using rerot_person_id = uint64_t;
+using rerot_pen_id = int32_t;
+
+enum class server_pen_state : uint8_t {
+    free = 0,
+    allocated,
+    running,
+    suspended,
+};
+
+struct server_pen {
+    rerot_pen_id id = -1;
+    rerot_person_id person = 0;
+    uint64_t episode_id = 0;
+    llama_rerot_node_id node_id = LLAMA_REROT_NODE_INVALID;
+    llama_seq_id exec_seq = -1;
+    server_pen_state state = server_pen_state::free;
+};
+
 struct server_rerot_node_runtime {
     llama_rerot_node_id id = LLAMA_REROT_NODE_INVALID;
+    // Pen binding (§§B.4.2, B.13 Phase 1). physical_slot aliases pen_id for backward compatibility
+    // with external slot callers and serialized episode state.
+    rerot_pen_id pen_id = -1;
     int physical_slot = -1;
     llama_seq_id exec_seq = -1;
     llama_seq_id parked_seq = -1;
@@ -287,12 +310,15 @@ struct server_rerot_node_runtime {
     // frontier. Admission order is (enqueue_frontier, tree_path); no scoring.
     uint64_t enqueue_frontier = 0;
     bool exit_intent = false;
+    bool last_write_public = true;
 
     // A.8 opaque per-lane extension state. Filled by the server integration
     // (sampler bytes, MTP checkpoint); empty means none. Persisted verbatim
     // and never interpreted here.
     std::vector<uint8_t> sampler_blob;
     std::vector<uint8_t> mtp_blob;
+    // Shared fork hand seed (§§16.1, 16.4, B.6.4). Holds parent conv tail and private S.
+    std::vector<uint8_t> hand_seed;
     // Last installed frontier-view stamp for this Lane's exec seq (A.6 MTP
     // binding). All-zero means no view installed yet.
     llama_rerot_view_stamp view_stamp = {0, 0, 0};
@@ -357,6 +383,7 @@ struct server_rerot_episode {
     std::deque<llama_rerot_node_id> ready_queue;
     std::set<llama_rerot_node_id> running;
     std::set<llama_rerot_node_id> starting;
+    std::set<llama_rerot_node_id> suspended;
 
     llama_seq_id archive_seq = -1;
 
@@ -495,6 +522,36 @@ public:
         llama_seq_id exec_seq,
         llama_rerot_node_id * admitted_node);
 
+    // Fixed P pen arena management (§§B.0, B.4.2, B.8, B.13 Phase 1)
+    void set_pen_capacity(uint32_t total_pens);
+    uint32_t pen_capacity() const;
+    uint32_t pens_allocated() const;
+    uint32_t pens_running() const;
+    uint32_t pens_suspended() const;
+    uint32_t pen_queue_depth() const;
+
+    const server_pen * pen(rerot_pen_id id) const;
+    server_pen * pen(rerot_pen_id id);
+    std::vector<rerot_pen_id> pens_for_person(rerot_person_id person) const;
+
+    // Allocate a pen from the pool for a given person/episode/node
+    std::optional<rerot_pen_id> allocate_pen(rerot_person_id person, uint64_t episode_id, llama_rerot_node_id node_id);
+    void free_pen(rerot_pen_id pen_id);
+
+    // Frontier-boundary pen suspension & resumption (§B.8.4)
+    bool suspend_pen(rerot_pen_id pen_id);
+    bool resume_pen(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id,
+        rerot_pen_id pen_id,
+        llama_seq_id exec_seq);
+
+    // Two-pass pen scheduler (§B.8.2 / Phase 1):
+    // Pass 1: Allocate 1 pen to each runnable person currently having 0 pens (by age) until P exhausted.
+    // Pass 2: Round-robin across people with ready children until P exhausted.
+    // If only 1 person, Pass 2 gives all P pens to that person.
+    size_t schedule_pens(const std::vector<uint64_t> & ready_people);
+
     // Marks a fully injected child heading as RUNNING. The private planner
     // prefix may be injected before or after this transition, but ordinary
     // generated tokens are only legal once the node is RUNNING.
@@ -540,6 +597,19 @@ public:
     // keeps writing the episode root response stream.
     bool complete_serial_tail(uint64_t episode_id, llama_rerot_node_id node_id);
 
+    // Coordinate freeze and validation (§22): verifies all serial tail invariants,
+    // ensuring the survivor reader view is complete, queue is empty, and
+    // coordinates are stable for serial forward.
+    bool validate_serial_tail_state(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id,
+        std::string * error_out = nullptr) const;
+
+    bool freeze_serial_coordinates(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id,
+        std::string * error_out = nullptr);
+
     // Response ownership (§18.3): the HTTP/SSE stream belongs to the episode
     // root request, never to an internal Lane slot.
     int response_task_id(uint64_t episode_id) const;
@@ -567,6 +637,15 @@ public:
     // RUNNING/STARTING members await re-admission. Returns false for unknown
     // episodes.
     bool demote_episode(uint64_t episode_id);
+
+    // Episode-level semantic context shift (§25.2, §A.9): drops the oldest
+    // unpinned public region for all readers and bumps layout/publish epochs.
+    // Recurrent state is never rewritten; MTP view stamps report stale.
+    bool context_shift(
+        uint64_t episode_id,
+        uint64_t max_tokens_to_remove,
+        server_rerot_shift_result * result_out = nullptr,
+        std::string * error_out = nullptr);
 
     void advance_frontier(uint64_t episode_id);
     void clear_sequence_control(llama_seq_id seq_id);
@@ -643,6 +722,7 @@ private:
     std::deque<llama_seq_id> free_internal_seqs_;
     std::unordered_map<uint64_t, server_rerot_episode> episodes_;
     std::unordered_map<int, uint64_t> slot_to_episode_;
+    std::vector<server_pen> pens_;
 };
 
 // ---------------------------------------------------------------------------
@@ -759,6 +839,12 @@ server_rerot_state_fingerprints llama_rerot_context_fingerprints(const struct ll
 // to an episode exec seq, which has no byte-serializable form here).
 bool llama_rerot_context_save_envelope(
     struct llama_context * ctx,
+    std::vector<uint8_t> & blob_out,
+    std::string * error_out = nullptr);
+
+bool llama_rerot_context_save_envelope_episode(
+    struct llama_context * ctx,
+    uint64_t episode_id,
     std::vector<uint8_t> & blob_out,
     std::string * error_out = nullptr);
 

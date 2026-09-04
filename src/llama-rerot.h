@@ -76,6 +76,7 @@ enum class llama_rerot_node_state : uint8_t {
     starting,
     running,
     retired,
+    ready_suspended,
 };
 
 struct llama_rerot_run {

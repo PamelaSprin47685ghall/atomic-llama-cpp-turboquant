@@ -1,4 +1,6 @@
 #include "server-rerot.h"
+#include "llama-context.h"
+#include "llama-model.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -1029,6 +1031,760 @@ static void test_internal_seq_exhaustion_aborts_whole_episode() {
     CHECK(runtime.erase_episode(episode_id));
 }
 
+static void test_people_pen_scheduler() {
+    // Phase 1 acceptance gate (§§B.0, B.4.2, B.8, B.13 Phase 1)
+    // 1. B=3, P=9: single person can take all 9 pens (no per-person cap)
+    {
+        server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 10, 100);
+        runtime.set_pen_capacity(9);
+        CHECK(runtime.pen_capacity() == 9);
+        CHECK(runtime.pens_allocated() == 0);
+
+        const uint64_t ep_a = runtime.adopt_root(101, 101, 0, 10, 0, 1);
+        CHECK(ep_a == 1);
+        CHECK(runtime.pens_allocated() == 1);
+
+        // Fork into 10 children
+        std::string list_xml = "<ol>";
+        for (int i = 0; i < 10; ++i) {
+            list_xml += "<li>Task A" + std::to_string(i) + "</li>";
+        }
+        list_xml += "</ol>";
+        CHECK(commit_generated(runtime, ep_a, 0, 0, list_xml));
+        runtime.finish_frontier(ep_a);
+        CHECK(runtime.freeze_fork_parent(ep_a, 0));
+        // Parent frozen: pen 0 is freed, 10 children in ready_queue
+        CHECK(runtime.pens_allocated() == 0);
+        const auto * ep_a_ptr = runtime.episode(ep_a);
+        CHECK(ep_a_ptr && ep_a_ptr->ready_queue.size() == 10);
+
+        // Schedule pens for Person A: should get all 9 pens
+        const size_t admitted = runtime.schedule_pens({ep_a});
+        CHECK(admitted == 9);
+        CHECK(runtime.pens_allocated() == 9);
+        CHECK(runtime.pens_for_person(ep_a).size() == 9);
+        // 10th child remains safely in ready_queue with zero descriptor loss
+        CHECK(ep_a_ptr->ready_queue.size() == 1);
+        CHECK(runtime.has_ready_nodes(ep_a));
+        CHECK(runtime.erase_episode(ep_a));
+        CHECK(runtime.pens_allocated() == 0);
+    }
+
+    // 2. B=3, P=9: three people progress 3/3/3
+    {
+        server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 10, 100);
+        runtime.set_pen_capacity(9);
+
+        const uint64_t ep1 = runtime.adopt_root(1, 1, 0, 10, 0, 10);
+        const uint64_t ep2 = runtime.adopt_root(2, 2, 1, 11, 0, 20);
+        const uint64_t ep3 = runtime.adopt_root(3, 3, 2, 12, 0, 30);
+        CHECK(runtime.pens_allocated() == 3);
+
+        // Each forks into 4 children
+        for (uint64_t ep : {ep1, ep2, ep3}) {
+            CHECK(commit_generated(runtime, ep, 0, 0, "<ol><li>1</li><li>2</li><li>3</li><li>4</li></ol>"));
+            runtime.finish_frontier(ep);
+            CHECK(runtime.freeze_fork_parent(ep, 0));
+        }
+        CHECK(runtime.pens_allocated() == 0);
+
+        // Schedule across all 3 people with P=9:
+        // Pass 1: 1/1/1 (3 pens)
+        // Pass 2: +1/+1/+1 (6 pens), then +1/+1/+1 (9 pens) -> 3/3/3!
+        const size_t admitted = runtime.schedule_pens({ep1, ep2, ep3});
+        CHECK(admitted == 9);
+        CHECK(runtime.pens_allocated() == 9);
+        CHECK(runtime.pens_for_person(ep1).size() == 3);
+        CHECK(runtime.pens_for_person(ep2).size() == 3);
+        CHECK(runtime.pens_for_person(ep3).size() == 3);
+
+        // Each person has exactly 1 child remaining in ready_queue
+        CHECK(runtime.episode(ep1)->ready_queue.size() == 1);
+        CHECK(runtime.episode(ep2)->ready_queue.size() == 1);
+        CHECK(runtime.episode(ep3)->ready_queue.size() == 1);
+
+        CHECK(runtime.erase_episode(ep1));
+        CHECK(runtime.erase_episode(ep2));
+        CHECK(runtime.erase_episode(ep3));
+        CHECK(runtime.pens_allocated() == 0);
+    }
+
+    // 3. B=3, P=5: sum of allocated pens is always <= 5
+    {
+        server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 10, 100);
+        runtime.set_pen_capacity(5);
+        CHECK(runtime.pen_capacity() == 5);
+
+        const uint64_t ep1 = runtime.adopt_root(1, 1, 0, 10, 0, 100);
+        const uint64_t ep2 = runtime.adopt_root(2, 2, 1, 11, 0, 200);
+        const uint64_t ep3 = runtime.adopt_root(3, 3, 2, 12, 0, 300);
+
+        for (uint64_t ep : {ep1, ep2, ep3}) {
+            CHECK(commit_generated(runtime, ep, 0, 0, "<ol><li>A</li><li>B</li><li>C</li><li>D</li></ol>"));
+            runtime.finish_frontier(ep);
+            CHECK(runtime.freeze_fork_parent(ep, 0));
+        }
+
+        const size_t admitted = runtime.schedule_pens({ep1, ep2, ep3});
+        CHECK(admitted == 5);
+        CHECK(runtime.pens_allocated() == 5);
+        CHECK(runtime.pens_allocated() <= 5);
+
+        // Total pens across all people is exactly 5
+        const size_t sum_pens = runtime.pens_for_person(ep1).size() +
+                                runtime.pens_for_person(ep2).size() +
+                                runtime.pens_for_person(ep3).size();
+        CHECK(sum_pens == 5);
+
+        // 4. Pen return when person has no ready work:
+        // When a node finishes, its pen is returned immediately
+        auto p1_pens = runtime.pens_for_person(ep1);
+        CHECK(!p1_pens.empty());
+        const int p1_slot = p1_pens[0];
+        runtime.release_slot(p1_slot);
+        CHECK(runtime.pens_allocated() == 4);
+        CHECK(runtime.pen(p1_slot)->state == server_pen_state::free);
+
+        // New work can immediately acquire the returned pen
+        const size_t re_admitted = runtime.schedule_pens({ep1});
+        CHECK(re_admitted == 1);
+        CHECK(runtime.pens_allocated() == 5);
+
+        CHECK(runtime.erase_episode(ep1));
+        CHECK(runtime.erase_episode(ep2));
+        CHECK(runtime.erase_episode(ep3));
+        CHECK(runtime.pens_allocated() == 0);
+    }
+
+    // 5. Child count far larger than P (50 children, P=4): zero descriptor loss
+    {
+        server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 10, 200);
+        runtime.set_pen_capacity(4);
+
+        const uint64_t ep = runtime.adopt_root(1, 1, 0, 10, 0, 500);
+        std::string big_list = "<ol>";
+        for (int i = 0; i < 50; ++i) {
+            big_list += "<li>Task " + std::to_string(i) + "</li>";
+        }
+        big_list += "</ol>";
+
+        CHECK(commit_generated(runtime, ep, 0, 0, big_list));
+        runtime.finish_frontier(ep);
+        CHECK(runtime.freeze_fork_parent(ep, 0));
+
+        const auto * ep_ptr = runtime.episode(ep);
+        CHECK(ep_ptr && ep_ptr->ready_queue.size() == 50);
+
+        // Schedule: exactly 4 admitted, 46 remain queued
+        size_t admitted = runtime.schedule_pens({ep});
+        CHECK(admitted == 4);
+        CHECK(runtime.pens_allocated() == 4);
+        CHECK(ep_ptr->ready_queue.size() == 46);
+
+        // Verify descriptors are strictly intact in FIFO order
+        for (size_t i = 0; i < 46; ++i) {
+            llama_rerot_node_id q_node = ep_ptr->ready_queue[i];
+            const auto * node_doc = ep_ptr->document.node(q_node);
+            CHECK(node_doc != nullptr);
+            std::string expected_title = "Task " + std::to_string(i + 4);
+            CHECK(node_doc->title == expected_title);
+        }
+
+        CHECK(runtime.erase_episode(ep));
+        CHECK(runtime.pens_allocated() == 0);
+    }
+}
+
+struct test_stub_model : public llama_model {
+    test_stub_model() : llama_model(llama_model_default_params()) {
+        hparams.n_ctx_train = 4096;
+        arch = LLM_ARCH_QWEN35;
+    }
+    void load_stats(llama_model_loader &) override {}
+    void load_hparams(llama_model_loader &) override {}
+    void load_vocab(llama_model_loader &) override {}
+    bool load_tensors(llama_model_loader &) override { return true; }
+    void load_arch_hparams(llama_model_loader &) override {}
+    void load_arch_tensors(llama_model_loader &) override {}
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params &) const override {
+        return nullptr;
+    }
+};
+
+static void test_context_multi_episode_isolation() {
+    // Phase 2 acceptance gate (§§B.5, B.13 Phase 2)
+    test_stub_model model;
+    llama_cparams cparams = {};
+    cparams.rerot_enabled = true;
+    cparams.rerot_frontier = LLAMA_REROT_FRONTIER_STRONG;
+    llama_context ctx(model, cparams, true);
+
+    // 1. Same context simultaneously begins 3 episodes
+    CHECK(llama_rerot_episode_begin(&ctx, 101, nullptr));
+    CHECK(llama_rerot_episode_begin(&ctx, 102, nullptr));
+    CHECK(llama_rerot_episode_begin(&ctx, 103, nullptr));
+
+    CHECK(llama_rerot_is_active(&ctx, 101));
+    CHECK(llama_rerot_is_active(&ctx, 102));
+    CHECK(llama_rerot_is_active(&ctx, 103));
+    CHECK(!llama_rerot_is_active(&ctx, 999));
+
+    // Duplicate begin of already active episode fails
+    CHECK(!llama_rerot_episode_begin(&ctx, 101, nullptr));
+
+    // 2. Sequence binding constraint: same seq cannot be bound to two different people/episodes
+    llama_rerot_write_tag tag101 = {};
+    tag101.episode_id = 101;
+    tag101.node_id = 1;
+    tag101.run_id = 1;
+    tag101.publish_epoch = 1;
+    tag101.frontier = 1;
+    tag101.visibility = LLAMA_REROT_KV_PUBLIC_LIVE;
+    CHECK(llama_rerot_set_write_tag(&ctx, 5, &tag101));
+
+    llama_rerot_write_tag tag102 = {};
+    tag102.episode_id = 102;
+    tag102.node_id = 2;
+    tag102.run_id = 2;
+    tag102.publish_epoch = 1;
+    tag102.frontier = 1;
+    tag102.visibility = LLAMA_REROT_KV_PUBLIC_LIVE;
+    CHECK(!llama_rerot_set_write_tag(&ctx, 5, &tag102)); // Rejected: seq 5 bound to episode 101
+
+    uint32_t run_ids[] = {1};
+    llama_rerot_frontier_reader_view v102 = {5, 102, 2, 2, 1, LLAMA_REROT_FRONTIER_STRONG, {1, 1, 1}, run_ids, 1};
+    CHECK(!llama_rerot_set_frontier_views(&ctx, &v102, 1)); // Rejected: seq 5 bound to episode 101
+
+    // 3. Ending A does not clear B/C views/tags/stamps
+    llama_rerot_frontier_reader_view v_ep102 = {6, 102, 1, 1, 1, LLAMA_REROT_FRONTIER_STRONG, {10, 20, 30}, run_ids, 1};
+    CHECK(llama_rerot_set_frontier_views(&ctx, &v_ep102, 1));
+    llama_rerot_frontier_reader_view v_ep103 = {7, 103, 1, 1, 1, LLAMA_REROT_FRONTIER_STRONG, {15, 25, 35}, run_ids, 1};
+    CHECK(llama_rerot_set_frontier_views(&ctx, &v_ep103, 1));
+
+    // End episode 101
+    llama_rerot_episode_end(&ctx, 101);
+    CHECK(!llama_rerot_is_active(&ctx, 101));
+    CHECK(llama_rerot_is_active(&ctx, 102));
+    CHECK(llama_rerot_is_active(&ctx, 103));
+
+    // Stamps for 102 and 103 are untouched
+    llama_rerot_view_stamp stamp102 = {10, 20, 30};
+    CHECK(!llama_rerot_mtp_is_stale(&ctx, 6, &stamp102));
+    llama_rerot_view_stamp stamp103 = {15, 25, 35};
+    CHECK(!llama_rerot_mtp_is_stale(&ctx, 7, &stamp103));
+
+    // 4. A topology bump in 102 does not make 103 MTP stale
+    llama_rerot_frontier_reader_view v_ep102_bump = {6, 102, 1, 1, 2, LLAMA_REROT_FRONTIER_STRONG, {11, 20, 30}, run_ids, 1};
+    CHECK(llama_rerot_set_frontier_views(&ctx, &v_ep102_bump, 1));
+    CHECK(llama_rerot_mtp_is_stale(&ctx, 6, &stamp102)); // Seq 6 is stale
+    CHECK(!llama_rerot_mtp_is_stale(&ctx, 7, &stamp103)); // Seq 7 is NOT stale!
+
+    // 5. Each episode can independently save, load, and end
+    std::vector<uint8_t> env102;
+    std::string err;
+    CHECK(llama_rerot_context_save_envelope_episode(&ctx, 102, env102, &err));
+    CHECK(!env102.empty());
+
+    std::vector<uint8_t> env103;
+    CHECK(llama_rerot_context_save_envelope_episode(&ctx, 103, env103, &err));
+    CHECK(!env103.empty());
+
+    // End episode 102
+    llama_rerot_episode_end(&ctx, 102);
+    CHECK(!llama_rerot_is_active(&ctx, 102));
+    CHECK(llama_rerot_is_active(&ctx, 103));
+
+    // Restore episode 102: restores alongside active 103
+    CHECK(llama_rerot_context_load_envelope(&ctx, env102.data(), env102.size(), &err));
+    CHECK(llama_rerot_is_active(&ctx, 102));
+    CHECK(llama_rerot_is_active(&ctx, 103));
+
+    llama_rerot_view_stamp restored_stamp102 = {11, 20, 30};
+    CHECK(!llama_rerot_mtp_is_stale(&ctx, 6, &restored_stamp102));
+    CHECK(!llama_rerot_mtp_is_stale(&ctx, 7, &stamp103));
+
+    llama_rerot_episode_end(&ctx, 102);
+    llama_rerot_episode_end(&ctx, 103);
+    CHECK(!llama_rerot_is_active(&ctx, 0));
+}
+
+static void test_multi_person_multi_pen_bxp_stress() {
+    std::fprintf(stderr, "--- test_multi_person_multi_pen_bxp_stress (§B.0, §B.8, §B.12, §B.16) ---\n");
+    // B=6 people, P=18 pens
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 10, 250);
+    runtime.set_pen_capacity(18);
+    CHECK(runtime.pen_capacity() == 18);
+
+    std::vector<uint64_t> people;
+    const std::vector<int> child_counts = { 5, 2, 4, 1, 3, 3 }; // ragged distribution
+    for (size_t i = 0; i < child_counts.size(); ++i) {
+        const uint64_t ep = runtime.adopt_root(
+            int(i + 1), int(i + 1), int(i), llama_seq_id(10 + i), 0, uint64_t(100 + i));
+        people.push_back(ep);
+    }
+    CHECK(runtime.pens_allocated() == 6);
+
+    // People 0, 1, 2, 4, 5 fork into their respective child counts. Person 3 (N=1) continues terminal.
+    for (size_t i = 0; i < people.size(); ++i) {
+        const uint64_t ep = people[i];
+        const int n_children = child_counts[i];
+        if (n_children == 1) {
+            // N=1: commit single item, disarms planner forever
+            CHECK(commit_generated(runtime, ep, 0, 0, "<ol><li>Single task</li></ol>"));
+            runtime.finish_frontier(ep);
+            CHECK(runtime.episode(ep)->document.node(0)->state == llama_rerot_node_state::terminal_running);
+            continue;
+        }
+
+        std::string xml = "<ol>";
+        for (int c = 0; c < n_children; ++c) {
+            xml += "<li>Task " + std::to_string(c) + "</li>";
+        }
+        xml += "</ol>";
+        CHECK(commit_generated(runtime, ep, 0, 0, xml));
+        runtime.finish_frontier(ep);
+        CHECK(runtime.freeze_fork_parent(ep, 0));
+    }
+
+    // Schedule pens across all people:
+    // Person 3 holds 1 pen.
+    // Persons 0 (5), 1 (2), 2 (4), 4 (3), 5 (3) need 17 pens.
+    // Total pens allocated = 1 + 17 = 18 pens (exactly P=18!).
+    const size_t admitted = runtime.schedule_pens(people);
+    CHECK(admitted == 17);
+    CHECK(runtime.pens_allocated() == 18);
+    CHECK(runtime.pens_allocated() <= runtime.pen_capacity());
+
+    for (size_t i = 0; i < people.size(); ++i) {
+        const uint64_t ep = people[i];
+        const auto p_pens = runtime.pens_for_person(ep);
+        if (child_counts[i] == 1) {
+            CHECK(p_pens.size() == 1);
+        } else {
+            CHECK(p_pens.size() == size_t(child_counts[i]));
+            for (size_t c = 1; c <= size_t(child_counts[i]); ++c) {
+                CHECK(runtime.complete_admission(ep, llama_rerot_node_id(c)));
+            }
+        }
+    }
+
+    // Advance 3 frontiers and simulate completion of children
+    for (size_t i = 0; i < people.size(); ++i) {
+        const uint64_t ep = people[i];
+        const auto p_pens = runtime.pens_for_person(ep);
+        if (child_counts[i] == 1) {
+            make_terminal(runtime, ep, 0);
+            request_exit(runtime, ep, 0);
+            auto f = runtime.finish_frontier(ep);
+            CHECK(f.natural_final());
+        } else {
+            // Retire all children except the last one
+            for (size_t c = 1; c < size_t(child_counts[i]); ++c) {
+                make_terminal(runtime, ep, llama_rerot_node_id(c));
+                request_exit(runtime, ep, llama_rerot_node_id(c));
+            }
+            auto f = runtime.finish_frontier(ep);
+            CHECK(f.retired.size() == size_t(child_counts[i] - 1));
+
+            // Retire the final child
+            const llama_rerot_node_id last_child = llama_rerot_node_id(child_counts[i]);
+            make_terminal(runtime, ep, last_child);
+            request_exit(runtime, ep, last_child);
+            auto final_f = runtime.finish_frontier(ep);
+            CHECK(final_f.natural_final());
+            CHECK(final_f.final_node == last_child);
+        }
+    }
+
+    // Erase all episodes and verify full pen reclamation
+    for (uint64_t ep : people) {
+        CHECK(runtime.erase_episode(ep));
+    }
+    CHECK(runtime.pens_allocated() == 0);
+    CHECK(runtime.pens_running() == 0);
+}
+
+static void test_triattention_multi_person_pressure() {
+    std::fprintf(stderr, "--- test_triattention_multi_person_pressure (§B.9, §B.11, §B.13 Phase 7) ---\n");
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 10, 100);
+    runtime.set_pen_capacity(9);
+
+    const uint64_t ep1 = runtime.adopt_root(1, 1, 0, 10, 0, 201);
+    const uint64_t ep2 = runtime.adopt_root(2, 2, 1, 11, 0, 202);
+    const uint64_t ep3 = runtime.adopt_root(3, 3, 2, 12, 0, 203);
+    CHECK(runtime.pens_allocated() == 3);
+
+    // Person 1 creates 500 public tokens, Person 2 creates 200, Person 3 creates 800
+    auto * ep1_ptr = runtime.episode(ep1);
+    auto * ep2_ptr = runtime.episode(ep2);
+    auto * ep3_ptr = runtime.episode(ep3);
+    CHECK(ep1_ptr && ep2_ptr && ep3_ptr);
+
+    const auto r1 = ep1_ptr->document.append_run(0, llama_rerot_visibility::public_live, 0, 500, 1);
+    const auto r1_active = ep1_ptr->document.append_run(0, llama_rerot_visibility::public_live, 500, 10, 2);
+    runtime.node(ep1, 0)->public_run = r1_active;
+
+    const auto r2 = ep2_ptr->document.append_run(0, llama_rerot_visibility::public_live, 0, 200, 1);
+    const auto r3 = ep3_ptr->document.append_run(0, llama_rerot_visibility::public_live, 0, 800, 1);
+    CHECK(r1 != LLAMA_REROT_RUN_INVALID && r2 != LLAMA_REROT_RUN_INVALID && r3 != LLAMA_REROT_RUN_INVALID);
+
+    // Simulate TriAttention truncation on Person 1 only (drain 500 tokens)
+    server_rerot_shift_result shift_res;
+    std::string err;
+    CHECK(server_rerot_truncate_oldest_public(*ep1_ptr, 450, &shift_res, &err));
+    CHECK(shift_res.tokens_removed == 500);
+    CHECK(ep1_ptr->document.run(r1)->token_count == 0);
+
+    // Invariant: Person 2 and Person 3 public runs and token counts remain completely intact
+    CHECK(ep2_ptr->document.run(r2)->token_count == 200);
+    CHECK(ep3_ptr->document.run(r3)->token_count == 800);
+
+    // Invariant: Recurrent pen queueing / shortage does NOT invoke TriAttention reclaim (§B.9.1)
+    // Add 10 queued children to Person 2 with pen_capacity=9. Total pens needed = 13 > 9.
+    std::string list_xml = "<ol>";
+    for (int i = 0; i < 10; ++i) list_xml += "<li>Subtask " + std::to_string(i) + "</li>";
+    list_xml += "</ol>";
+    CHECK(commit_generated(runtime, ep2, 0, 200, list_xml));
+    runtime.finish_frontier(ep2);
+    CHECK(runtime.freeze_fork_parent(ep2, 0));
+
+    // Ready queue contains 10 children. Scheduling allocates remaining pens without touching KV runs!
+    const size_t admitted = runtime.schedule_pens({ep1, ep2, ep3});
+    CHECK(admitted > 0);
+    CHECK(runtime.pens_allocated() <= runtime.pen_capacity());
+    CHECK(ep2_ptr->document.run(r2)->token_count == 200); // KV untouched!
+    CHECK(ep3_ptr->document.run(r3)->token_count == 800); // KV untouched!
+
+    CHECK(runtime.erase_episode(ep1));
+    CHECK(runtime.erase_episode(ep2));
+    CHECK(runtime.erase_episode(ep3));
+    CHECK(runtime.pens_allocated() == 0);
+}
+
+static void test_shared_prefix_multi_branch_union_and_preemption() {
+    std::fprintf(stderr, "--- test_shared_prefix_multi_branch_union_and_preemption (§A.8, §A.11, §A.24, §B.8) ---\n");
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 10, 100);
+    runtime.set_pen_capacity(8);
+
+    // 1. Setup 3 branches sharing a common prefix (e.g. 100 prefix tokens)
+    const uint64_t ep1 = runtime.adopt_root(1, 1, 0, 10, 100, 101);
+    const uint64_t ep2 = runtime.adopt_root(2, 2, 1, 11, 100, 102);
+    const uint64_t ep3 = runtime.adopt_root(3, 3, 2, 12, 100, 103);
+    CHECK(runtime.pens_allocated() == 3);
+
+    // Branch 1 forks into 3 children, Branch 2 forks into 2 children
+    CHECK(commit_generated(runtime, ep1, 0, 100, "<ol><li>B1-1</li><li>B1-2</li><li>B1-3</li></ol>"));
+    CHECK(commit_generated(runtime, ep2, 0, 100, "<ol><li>B2-1</li><li>B2-2</li></ol>"));
+    runtime.finish_frontier(ep1);
+    runtime.finish_frontier(ep2);
+
+    CHECK(runtime.freeze_fork_parent(ep1, 0));
+    CHECK(runtime.freeze_fork_parent(ep2, 0));
+
+    // Ep3 remains running (1 pen). Ep1 needs 3 pens, Ep2 needs 2 pens. Total needed = 6 pens.
+    size_t admitted = runtime.schedule_pens({ep1, ep2, ep3});
+    CHECK(admitted == 5); // 3 for ep1 + 2 for ep2
+    CHECK(runtime.pens_allocated() == 6); // 1 for ep3 + 3 for ep1 + 2 for ep2
+
+    CHECK(runtime.pens_for_person(ep1).size() == 3);
+    CHECK(runtime.pens_for_person(ep2).size() == 2);
+    CHECK(runtime.pens_for_person(ep3).size() == 1);
+
+    // Complete admission for all children
+    CHECK(runtime.complete_admission(ep1, 1));
+    CHECK(runtime.complete_admission(ep1, 2));
+    CHECK(runtime.complete_admission(ep1, 3));
+    CHECK(runtime.complete_admission(ep2, 1));
+    CHECK(runtime.complete_admission(ep2, 2));
+
+    // 2. Preemption / demotion of Episode 2 (§A.8.2, §A.11):
+    // Episode 2 is demoted to logical state. Its physical pen bindings are released.
+    auto * ep2_ptr = runtime.episode(ep2);
+    CHECK(ep2_ptr != nullptr);
+    for (int pen_id : runtime.pens_for_person(ep2)) {
+        runtime.release_slot(pen_id);
+    }
+    server_rerot_episode_demote_to_logical(*ep2_ptr);
+    CHECK(runtime.pens_allocated() == 4); // 3 for ep1 + 1 for ep3
+    CHECK(runtime.pens_for_person(ep2).empty());
+
+    // Verify Ep1 and Ep3 are completely untouched and can continue
+    CHECK(runtime.pens_for_person(ep1).size() == 3);
+    CHECK(runtime.pens_for_person(ep3).size() == 1);
+
+    // 3. Cancellation of Episode 1 (§A.15):
+    // Hard-abort and erase Episode 1. All its pens must be cleanly returned.
+    runtime.hard_abort(ep1, "test_cancelled");
+    CHECK(runtime.erase_episode(ep1));
+    CHECK(runtime.pens_allocated() == 1); // Only Ep3 remains
+    CHECK(runtime.pens_for_person(ep3).size() == 1);
+
+    // Ep3 finishes naturally
+    make_terminal(runtime, ep3, 0);
+    request_exit(runtime, ep3, 0);
+    auto f3 = runtime.finish_frontier(ep3);
+    CHECK(f3.natural_final());
+    CHECK(f3.final_node == 0);
+
+    CHECK(runtime.erase_episode(ep2));
+    CHECK(runtime.erase_episode(ep3));
+    CHECK(runtime.pens_allocated() == 0);
+}
+
+static void test_hand_seed_and_final_fence_continuation() {
+    std::fprintf(stderr, "--- test_hand_seed_and_final_fence_continuation (§16.1, §21.4, §22) ---\n");
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 10, 100);
+    runtime.set_pen_capacity(4);
+
+    const uint64_t ep = runtime.adopt_root(1, 1, 0, 10, 0, 1234);
+    CHECK(runtime.pens_allocated() == 1);
+
+    // Give parent node a fake hand_seed (mock conv tail bytes)
+    const std::vector<uint8_t> expected_seed = { 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04 };
+    auto * parent_node = runtime.node(ep, 0);
+    CHECK(parent_node != nullptr);
+    parent_node->hand_seed = expected_seed;
+
+    // Fork into 2 children
+    CHECK(commit_generated(runtime, ep, 0, 0, "<ol><li>Child 1</li><li>Child 2</li></ol>"));
+    runtime.finish_frontier(ep);
+
+    // Freeze parent
+    CHECK(runtime.freeze_fork_parent(ep, 0));
+    CHECK(runtime.pens_allocated() == 0);
+
+    const auto * ep_ptr = runtime.episode(ep);
+    CHECK(ep_ptr != nullptr);
+    CHECK(ep_ptr->ready_queue.size() == 2);
+
+    // Verify child descriptors inherited parent hand_seed
+    for (const auto child_id : ep_ptr->ready_queue) {
+        const auto * c_rt = runtime.node(ep, child_id);
+        CHECK(c_rt != nullptr && c_rt->hand_seed == expected_seed);
+    }
+
+    // Test Episode Save & Load roundtrip with hand_seed
+    server_rerot_state_fingerprints fp;
+    fp.caps = LLAMA_REROT_STATE_CAP_REROT | LLAMA_REROT_STATE_CAP_REROT_TREE |
+              LLAMA_REROT_STATE_CAP_REROT_PRIVATE | LLAMA_REROT_STATE_CAP_REROT_MTP |
+              LLAMA_REROT_STATE_CAP_HYBRID_REC | LLAMA_REROT_STATE_CAP_SPARSE_KV |
+              LLAMA_REROT_STATE_CAP_TRIATTENTION;
+    fp.model_fp = 0x1111;
+    fp.rope_fp = 0x2222;
+    fp.tri_fp = 0x3333;
+
+    std::string err;
+    const auto blob = server_rerot_episode_save(*ep_ptr, fp, &err);
+    CHECK(err.empty());
+    CHECK(!blob.empty());
+
+    server_rerot_episode loaded_ep;
+    CHECK(server_rerot_episode_load(blob.data(), blob.size(), fp, &loaded_ep, &err));
+    CHECK(err.empty());
+
+    // Verify nodes in loaded episode preserve hand_seed
+    for (const auto & n : loaded_ep.nodes) {
+        if (n.id == 0 || n.id == 1 || n.id == 2) {
+            CHECK(n.hand_seed == expected_seed);
+        }
+    }
+
+    // Schedule pens for children
+    const size_t admitted = runtime.schedule_pens({ep});
+    CHECK(admitted == 2);
+    CHECK(runtime.pens_allocated() == 2);
+
+    // Complete admission for child 1 (node 1) and child 2 (node 2)
+    CHECK(runtime.complete_admission(ep, 1));
+    CHECK(runtime.complete_admission(ep, 2));
+
+    // Finish child 1
+    make_terminal(runtime, ep, 1);
+    request_exit(runtime, ep, 1);
+    auto f1 = runtime.finish_frontier(ep);
+    CHECK(f1.retired.size() == 1 && f1.retired[0] == 1);
+    CHECK(f1.released_slots.size() == 1);
+
+    // Child 2 marks exit intent and initiates final fence
+    make_terminal(runtime, ep, 2);
+    request_exit(runtime, ep, 2);
+    auto f2 = runtime.finish_frontier(ep);
+    CHECK(f2.natural_final());
+    CHECK(f2.final_node == 2);
+
+    auto * mut_ep = runtime.episode(ep);
+    CHECK(mut_ep && mut_ep->finalizing);
+
+    std::vector<uint32_t> ordered_runs;
+    CHECK(runtime.refresh_final_fence(ep, 2, &ordered_runs));
+    CHECK(mut_ep->fence_refreshed);
+
+    // Complete serial tail transition
+    CHECK(runtime.complete_serial_tail(ep, 2));
+    CHECK(mut_ep->serial_tail);
+    CHECK(mut_ep->serial_node == 2);
+
+    CHECK(runtime.erase_episode(ep));
+}
+
+static void test_frontier_boundary_pen_yield_and_resume() {
+    // §B.8.4, §B.15, Phase 1 & 2: Frontier-boundary pen yield and resume
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 10, 100);
+    runtime.set_pen_capacity(2);
+    CHECK(runtime.pen_capacity() == 2);
+    CHECK(runtime.pens_allocated() == 0);
+    CHECK(runtime.pens_suspended() == 0);
+
+    const uint64_t ep = runtime.adopt_root(1, 1, 0, 10, 0, 1000);
+    CHECK(runtime.pens_allocated() == 1);
+
+    CHECK(commit_generated(runtime, ep, 0, 0, "<ol><li>Child 1</li><li>Child 2</li></ol>"));
+    runtime.finish_frontier(ep);
+    CHECK(runtime.freeze_fork_parent(ep, 0));
+    CHECK(runtime.pens_allocated() == 0);
+
+    // Schedule: both children get pens (0 and 1)
+    const size_t admitted = runtime.schedule_pens({ep});
+    CHECK(admitted == 2);
+    CHECK(runtime.pens_allocated() == 2);
+    CHECK(runtime.pens_running() == 0); // STARTING
+
+    // Complete admission for both
+    CHECK(runtime.complete_admission(ep, 1));
+    CHECK(runtime.complete_admission(ep, 2));
+    CHECK(runtime.pens_running() == 2);
+    CHECK(runtime.pens_suspended() == 0);
+
+    const auto * ep_ptr = runtime.episode(ep);
+    CHECK(ep_ptr->running.count(1) == 1);
+    CHECK(ep_ptr->running.count(2) == 1);
+    CHECK(ep_ptr->suspended.empty());
+
+    // Child 1 yields pen 0 at frontier boundary (§B.8.4)
+    CHECK(runtime.suspend_pen(0));
+    CHECK(runtime.pens_suspended() == 1);
+    CHECK(runtime.pens_running() == 1);
+    CHECK(runtime.pens_allocated() == 1);
+    CHECK(ep_ptr->running.count(1) == 0);
+    CHECK(ep_ptr->running.count(2) == 1);
+    CHECK(ep_ptr->suspended.count(1) == 1);
+    CHECK(runtime.node(ep, 1)->pen_id == -1);
+    CHECK(runtime.node(ep, 1)->physical_slot == -1);
+    CHECK(ep_ptr->document.node(1)->state == llama_rerot_node_state::ready_suspended);
+    CHECK(runtime.has_ready_nodes(ep));
+
+    // Finish a normal frontier without exits: Child 1 stays suspended
+    auto f1 = runtime.finish_frontier(ep);
+    CHECK(!f1.natural_final());
+    CHECK(f1.final_node == LLAMA_REROT_NODE_INVALID);
+
+    // Now resume Child 1 with pen 0
+    auto pen0_opt = runtime.allocate_pen(ep, ep, 1);
+    CHECK(pen0_opt.has_value() && *pen0_opt == 0);
+    CHECK(runtime.resume_pen(ep, 1, 0, 10));
+    CHECK(runtime.pens_suspended() == 0);
+    CHECK(runtime.pens_running() == 2);
+    CHECK(runtime.pens_allocated() == 2);
+    CHECK(ep_ptr->suspended.empty());
+    CHECK(ep_ptr->running.count(1) == 1);
+    CHECK(runtime.node(ep, 1)->pen_id == 0);
+
+    // Both children mark exit intent
+    request_exit(runtime, ep, 1);
+    request_exit(runtime, ep, 2);
+    auto f2 = runtime.finish_frontier(ep);
+    CHECK(f2.natural_final());
+    CHECK(f2.final_node == 2); // tie-break survivor
+
+    CHECK(runtime.erase_episode(ep));
+    CHECK(runtime.pens_allocated() == 0);
+    CHECK(runtime.pens_suspended() == 0);
+}
+
+static void test_multi_person_b_greater_than_p_fairness() {
+    // §B.8.4, §B.8.2: 4 runnable child lanes across 2 people competing for P=2 pens
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 10, 100);
+    runtime.set_pen_capacity(2);
+    CHECK(runtime.pen_capacity() == 2);
+
+    const uint64_t ep1 = runtime.adopt_root(1, 1, 0, 10, 0, 101);
+    const uint64_t ep2 = runtime.adopt_root(2, 2, 1, 11, 0, 102);
+    CHECK(runtime.pens_allocated() == 2);
+
+    // Fork both into 2 children each
+    CHECK(commit_generated(runtime, ep1, 0, 0, "<ol><li>P1-A</li><li>P1-B</li></ol>"));
+    runtime.finish_frontier(ep1);
+    CHECK(runtime.freeze_fork_parent(ep1, 0));
+
+    CHECK(commit_generated(runtime, ep2, 0, 0, "<ol><li>P2-A</li><li>P2-B</li></ol>"));
+    runtime.finish_frontier(ep2);
+    CHECK(runtime.freeze_fork_parent(ep2, 0));
+    CHECK(runtime.pens_allocated() == 0);
+
+    // Schedule across {ep1, ep2}:
+    // Pass 1 allocates pen 0 to ep1 (child 1) and pen 1 to ep2 (child 1)
+    const size_t admitted1 = runtime.schedule_pens({ep1, ep2});
+    CHECK(admitted1 == 2);
+    CHECK(runtime.pens_allocated() == 2);
+    CHECK(runtime.pens_for_person(ep1).size() == 1);
+    CHECK(runtime.pens_for_person(ep2).size() == 1);
+
+    // Complete admission for both
+    CHECK(runtime.complete_admission(ep1, 1));
+    CHECK(runtime.complete_admission(ep2, 1));
+    CHECK(runtime.pens_running() == 2);
+
+    // Both ep1 and ep2 still have 1 child in ready_queue (P1-B and P2-B)
+    CHECK(runtime.episode(ep1)->ready_queue.size() == 1);
+    CHECK(runtime.episode(ep2)->ready_queue.size() == 1);
+
+    // Ep1 yields pen 0 at frontier boundary (§B.8.4)
+    const auto p1_pens = runtime.pens_for_person(ep1);
+    CHECK(p1_pens.size() == 1);
+    CHECK(runtime.suspend_pen(p1_pens[0]));
+    CHECK(runtime.pens_suspended() == 1);
+    CHECK(runtime.pens_allocated() == 1);
+    CHECK(runtime.pens_for_person(ep1).empty());
+
+    // Schedule across {ep2}: ep2 gets pen 0 for its second child (child 2)
+    const size_t admitted2 = runtime.schedule_pens({ep2});
+    CHECK(admitted2 == 1);
+    CHECK(runtime.pens_allocated() == 2);
+    CHECK(runtime.pens_for_person(ep2).size() == 2); // ep2 now owns both pens
+    CHECK(runtime.episode(ep2)->ready_queue.empty());
+    CHECK(runtime.complete_admission(ep2, 2));
+    CHECK(runtime.pens_running() == 2);
+
+    // Ep2 child 1 and child 2 exit
+    request_exit(runtime, ep2, 1);
+    request_exit(runtime, ep2, 2);
+    auto f2 = runtime.finish_frontier(ep2);
+    CHECK(f2.natural_final());
+    CHECK(runtime.erase_episode(ep2));
+    CHECK(runtime.pens_allocated() == 0); // both pens free
+
+    // Now ep1 schedules: resumes suspended child 1 and admits child 2
+    CHECK(runtime.pens_suspended() == 1);
+    CHECK(runtime.episode(ep1)->ready_queue.size() == 1);
+    const size_t admitted3 = runtime.schedule_pens({ep1});
+    CHECK(admitted3 == 2); // 1 resumed + 1 admitted
+    CHECK(runtime.pens_allocated() == 2);
+    CHECK(runtime.pens_suspended() == 0); // suspended child 1 was resumed!
+    CHECK(runtime.episode(ep1)->ready_queue.empty()); // child 2 admitted!
+    CHECK(runtime.complete_admission(ep1, 2));
+    CHECK(runtime.pens_running() == 2);
+
+    // Ep1 completes both children
+    request_exit(runtime, ep1, 1);
+    request_exit(runtime, ep1, 2);
+    auto f1 = runtime.finish_frontier(ep1);
+    CHECK(f1.natural_final());
+    CHECK(runtime.erase_episode(ep1));
+
+    CHECK(runtime.pens_allocated() == 0);
+    CHECK(runtime.pens_suspended() == 0);
+}
+
 static void test_chronicle_to_canonical_mapping_registry() {
     server_rerot_clear_chronicle_registry();
 
@@ -1072,8 +1828,197 @@ static void test_chronicle_to_canonical_mapping_registry() {
     CHECK(!server_rerot_resolve_canonical_reasoning(chronicle).has_value());
 }
 
+static void test_pen_capacity_and_multi_episode_allocation() {
+    // 1. Constructor auto-initializes pen capacity from first_internal_seq
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 4, 32);
+    CHECK(runtime.pen_capacity() == 4);
+    CHECK(runtime.pens_allocated() == 0);
+    CHECK(runtime.pens_running() == 0);
+    CHECK(runtime.pens_suspended() == 0);
+
+    // 2. Explicit capacity expansion
+    runtime.set_pen_capacity(6);
+    CHECK(runtime.pen_capacity() == 6);
+    for (int32_t i = 0; i < 6; ++i) {
+        const auto * p = runtime.pen(i);
+        CHECK(p != nullptr);
+        CHECK(p->id == i);
+        CHECK(p->state == server_pen_state::free);
+    }
+
+    // 3. Adopt root for Episode 1 on slot 0
+    const uint64_t ep1 = runtime.adopt_root(10, 10, 0, 0, 0);
+    CHECK(ep1 != 0);
+    CHECK(runtime.pens_allocated() == 1);
+    CHECK(runtime.pens_running() == 1);
+    const auto * p0 = runtime.pen(0);
+    CHECK(p0 && p0->state == server_pen_state::running);
+    CHECK(p0 && p0->person == ep1 && p0->episode_id == ep1);
+
+    // 4. Adopt root for Episode 2 on slot 1
+    const uint64_t ep2 = runtime.adopt_root(20, 20, 1, 1, 0);
+    CHECK(ep2 != 0);
+    CHECK(ep2 != ep1);
+    CHECK(runtime.pens_allocated() == 2);
+    CHECK(runtime.pens_running() == 2);
+    const auto * p1 = runtime.pen(1);
+    CHECK(p1 && p1->state == server_pen_state::running);
+    CHECK(p1 && p1->person == ep2 && p1->episode_id == ep2);
+
+    CHECK(runtime.pens_for_person(ep1).size() == 1);
+    CHECK(runtime.pens_for_person(ep2).size() == 1);
+
+    // 5. Suspend Pen 0 (Episode 1 yields pen row back to free pool, node enters suspended set)
+    CHECK(runtime.suspend_pen(0));
+    CHECK(runtime.pens_suspended() == 1);
+    CHECK(runtime.pens_running() == 1);
+    CHECK(runtime.pens_allocated() == 1); // Pen 0 is free for another lane/person; only Pen 1 allocated
+    CHECK(runtime.pen(0)->state == server_pen_state::free);
+
+    // 6. Release slot 1 (Episode 2 finishes)
+    runtime.release_slot(1);
+    CHECK(runtime.pen(1)->state == server_pen_state::free);
+    CHECK(runtime.pens_for_person(ep2).empty());
+    CHECK(runtime.pens_running() == 0);
+
+    // 7. Resume Episode 1 suspended node onto slot 1
+    CHECK(runtime.resume_pen(ep1, 0, 1, 1));
+    CHECK(runtime.pens_suspended() == 0);
+    CHECK(runtime.pens_running() == 1);
+    CHECK(runtime.pens_allocated() == 1);
+    CHECK(runtime.pen(1)->state == server_pen_state::running);
+    CHECK(runtime.pen(1)->person == ep1);
+
+    // Cleanup
+    CHECK(runtime.erase_episode(ep1));
+    CHECK(runtime.erase_episode(ep2));
+}
+
+static void test_recurrent_only_pressure_isolation() {
+    std::fprintf(stderr, "--- test_recurrent_only_pressure_isolation (§B.9, Gate 13 of DoD A.30) ---\n");
+    // P=2 pens, 2 episodes running
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 2, 32);
+    const uint64_t ep1 = runtime.adopt_root(10, 10, 0, 0, 0, 301);
+    const uint64_t ep2 = runtime.adopt_root(11, 11, 1, 1, 0, 302);
+    CHECK(runtime.pens_allocated() == 2);
+    CHECK(runtime.pens_running() == 2);
+
+    auto * ep1_ptr = runtime.episode(ep1);
+    auto * ep2_ptr = runtime.episode(ep2);
+    CHECK(ep1_ptr && ep2_ptr);
+
+    // Episode 1 has 400 public tokens, Episode 2 has 300 public tokens
+    const auto r1 = ep1_ptr->document.append_run(0, llama_rerot_visibility::public_live, 0, 400, 1);
+    const auto r2 = ep2_ptr->document.append_run(0, llama_rerot_visibility::public_live, 0, 300, 1);
+    CHECK(r1 != LLAMA_REROT_RUN_INVALID && r2 != LLAMA_REROT_RUN_INVALID);
+
+    // Episode 1 forks 6 children. Total demand = 7 pens, but P=2.
+    // This is purely recurrent pen shortage.
+    std::string list_xml = "<ol>";
+    for (int i = 0; i < 6; ++i) {
+        list_xml += "<li>Recurrent task " + std::to_string(i) + "</li>";
+    }
+    list_xml += "</ol>";
+    CHECK(commit_generated(runtime, ep1, 0, 400, list_xml));
+    runtime.finish_frontier(ep1);
+    CHECK(runtime.freeze_fork_parent(ep1, 0));
+
+    // Queue depth must be 6
+    CHECK(ep1_ptr->ready_queue.size() == 6);
+    CHECK(runtime.pen_queue_depth() == 6);
+
+    // Invariant (Gate 13 of DoD A.30): recurrent-only shortage must NOT trigger TriAttention KV reclaim!
+    // All token counts and runs across ep1 and ep2 remain 100% intact.
+    CHECK(ep1_ptr->document.run(r1)->token_count == 400);
+    CHECK(ep2_ptr->document.run(r2)->token_count == 300);
+
+    // Try scheduling: 1 pen was freed by parent freeze, so 1 child admitted
+    size_t admitted = runtime.schedule_pens({ep1, ep2});
+    CHECK(admitted == 1);
+    CHECK(runtime.pens_allocated() == 2);
+    CHECK(ep1_ptr->ready_queue.size() == 5);
+    CHECK(runtime.pen_queue_depth() == 5);
+
+    // Invariant: still no KV reclaim!
+    CHECK(ep1_ptr->document.run(r1)->token_count == 400);
+    CHECK(ep2_ptr->document.run(r2)->token_count == 300);
+
+    CHECK(runtime.erase_episode(ep1));
+    CHECK(runtime.erase_episode(ep2));
+}
+
+static void test_multi_episode_concurrent_final_fence_and_coordinate_freeze() {
+    std::fprintf(stderr, "--- test_multi_episode_concurrent_final_fence_and_coordinate_freeze (§21.4, §22) ---\n");
+    // 4 pens
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 4, 32);
+    const uint64_t ep1 = runtime.adopt_root(20, 20, 0, 0, 0, 401);
+    const uint64_t ep2 = runtime.adopt_root(21, 21, 1, 1, 0, 402);
+    CHECK(runtime.pens_allocated() == 2);
+
+    auto * ep1_ptr = runtime.episode(ep1);
+    auto * ep2_ptr = runtime.episode(ep2);
+    CHECK(ep1_ptr && ep2_ptr);
+
+    // Episode 1 finishes planning with N=1 (no fork)
+    std::string n1_xml = "<ol><li>Single task</li></ol>";
+    CHECK(commit_generated(runtime, ep1, 0, 0, n1_xml));
+    runtime.finish_frontier(ep1);
+
+    // Episode 1 survivor plans a generated token and emits </think>
+    CHECK(commit_generated(runtime, ep1, 0, 10, "conclusion"));
+    runtime.finish_frontier(ep1);
+
+    auto * node1 = runtime.node(ep1, 0);
+    CHECK(node1 != nullptr);
+    node1->exit_intent = true;
+    ep1_ptr->finalizing = true;
+
+    // Refresh final fence on Episode 1
+    std::vector<uint32_t> fence_runs;
+    CHECK(runtime.refresh_final_fence(ep1, 0, &fence_runs));
+    CHECK(!fence_runs.empty());
+    CHECK(runtime.complete_serial_tail(ep1, 0));
+
+    // Validate serial tail state and execute coordinate freeze on Episode 1
+    std::string err;
+    CHECK(runtime.validate_serial_tail_state(ep1, 0, &err));
+    const uint64_t ep1_old_epoch = ep1_ptr->layout_epoch;
+    CHECK(runtime.freeze_serial_coordinates(ep1, 0, &err));
+    CHECK(ep1_ptr->layout_epoch == ep1_old_epoch + 1);
+
+    // While Episode 1 is in serial tail, Episode 2 continues running concurrently
+    CHECK(ep2_ptr->serial_tail == false);
+    CHECK(commit_generated(runtime, ep2, 0, 0, "concurrent reasoning in ep2"));
+    runtime.finish_frontier(ep2);
+
+    // Invariant: Episode 1 serial tail is not corrupted by Episode 2 execution
+    CHECK(runtime.validate_serial_tail_state(ep1, 0, &err));
+
+    // Now Episode 2 finishes its reasoning and reaches final fence
+    auto * node2 = runtime.node(ep2, 0);
+    CHECK(node2 != nullptr);
+    node2->exit_intent = true;
+    ep2_ptr->finalizing = true;
+
+    std::vector<uint32_t> ep2_fence_runs;
+    CHECK(runtime.refresh_final_fence(ep2, 0, &ep2_fence_runs));
+    CHECK(runtime.complete_serial_tail(ep2, 0));
+    CHECK(runtime.validate_serial_tail_state(ep2, 0, &err));
+    CHECK(runtime.freeze_serial_coordinates(ep2, 0, &err));
+
+    // Both episodes reached serial tail independently
+    CHECK(ep1_ptr->serial_tail == true);
+    CHECK(ep2_ptr->serial_tail == true);
+
+    CHECK(runtime.erase_episode(ep1));
+    CHECK(runtime.erase_episode(ep2));
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT Runtime Tests ===\n");
+    test_recurrent_only_pressure_isolation();
+    test_multi_episode_concurrent_final_fence_and_coordinate_freeze();
+    test_pen_capacity_and_multi_episode_allocation();
     test_chronicle_to_canonical_mapping_registry();
     test_line_mux_completion_order_and_visibility();
     test_marker_token_preserves_public_prefix();
@@ -1094,6 +2039,14 @@ int main() {
     test_episode_state_round_trip_and_fingerprint();
     test_context_shift_truncates_only_unpinned_public_runs();
     test_internal_seq_exhaustion_aborts_whole_episode();
+    test_people_pen_scheduler();
+    test_context_multi_episode_isolation();
+    test_hand_seed_and_final_fence_continuation();
+    test_shared_prefix_multi_branch_union_and_preemption();
+    test_multi_person_multi_pen_bxp_stress();
+    test_triattention_multi_person_pressure();
+    test_frontier_boundary_pen_yield_and_resume();
+    test_multi_person_b_greater_than_p_fairness();
     std::fprintf(stderr, "=== Results: %d failure(s) ===\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

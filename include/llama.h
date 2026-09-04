@@ -436,6 +436,8 @@ extern "C" {
 
         bool rerot;                                      // enable Recursive Elastic Ring-of-Thought execution support
         enum llama_rerot_frontier_mode rerot_frontier;  // shared-memory visibility timing
+        uint32_t n_person_max;                          // RERoT auto-selected B (0 = default/legacy)
+        uint32_t n_pen_max;                             // RERoT auto-selected P (0 = default/legacy)
     };
 
     struct llama_model_tensor_override {
@@ -901,6 +903,29 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
+    // Shared fork hand seed (§§16.1, 16.4, B.6.4).
+    // Passing dst == NULL returns required size in bytes (or 0 if unsupported/invalid).
+    LLAMA_API size_t llama_memory_rerot_capture_hand_seed(
+            llama_memory_t mem,
+              llama_seq_id source_seq,
+                   uint8_t * dst,
+                    size_t   size);
+
+    LLAMA_API bool llama_memory_rerot_apply_hand_seed(
+            llama_memory_t mem,
+              llama_seq_id dest_seq,
+             const uint8_t * src,
+                    size_t   size);
+
+    // Order-free RBB frontier commit (§14.1, §14.1.2, §B.6)
+    // Synchronizes the candidate pen recurrent states to the person's global brain row.
+    LLAMA_API bool llama_memory_rerot_commit_rbb_frontier(
+            llama_memory_t mem,
+                  uint32_t person_id,
+        const llama_seq_id * candidate_seqs,
+             const uint8_t * is_public_write,
+                    size_t n_candidates);
+
     //
     // RERoT experimental context glue (Stage 7 + compat core, §§11,17,20,25,A.6-A.11)
     //
@@ -913,7 +938,7 @@ extern "C" {
     //
 
     #define LLAMA_REROT_STATE_MAGIC   0x52524f54u // 'RROT'
-    #define LLAMA_REROT_STATE_VERSION 1u
+    #define LLAMA_REROT_STATE_VERSION 2u
 
     enum llama_rerot_state_cap {
         LLAMA_REROT_STATE_CAP_NONE          = 0,
@@ -975,6 +1000,11 @@ extern "C" {
     LLAMA_API void llama_rerot_episode_end(
             struct llama_context * ctx,
                    uint64_t episode_id);
+
+    // Query whether an episode (or any episode if episode_id == 0) is currently active (§§B.5, B.13 Phase 2).
+    LLAMA_API bool llama_rerot_is_active(
+            const struct llama_context * ctx,
+            uint64_t episode_id);
 
     // Classify future KV writes by one execution sequence. Forwards to the
     // memory write-tag table; existing cells are unchanged. Returns false
@@ -1047,6 +1077,12 @@ extern "C" {
     LLAMA_API void llama_memory_seq_keep(
             llama_memory_t mem,
               llama_seq_id seq_id);
+
+    // Grouped recurrent memory queries (§§B.3.2, B.6, B.13 Phase 3)
+    LLAMA_API uint32_t llama_memory_get_brain_capacity(const struct llama_context * ctx);
+    LLAMA_API uint32_t llama_memory_get_hand_capacity (const struct llama_context * ctx);
+    LLAMA_API uint32_t llama_memory_get_brain_used    (const struct llama_context * ctx);
+    LLAMA_API uint32_t llama_memory_get_hand_used     (const struct llama_context * ctx);
 
     // Adds relative position "delta" to all tokens that belong to the specified sequence and have positions in [p0, p1)
     // p0 < 0 : [0,  p1]

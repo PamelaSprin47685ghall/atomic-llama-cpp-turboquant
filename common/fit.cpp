@@ -1277,6 +1277,244 @@ common_params_fit_status common_fit_recurrent_cache(
     return COMMON_PARAMS_FIT_STATUS_SUCCESS;
 }
 
+common_rerot_fit_result common_fit_rerot_capacities(
+                         const char * path_model,
+           const llama_model_params * mparams,
+               llama_context_params * cparams,
+        const std::vector<std::pair<ggml_backend_dev_t, size_t>> & reserve,
+        const llama_context_params * extra_cparams,
+                     ggml_log_level   log_level) {
+    common_rerot_fit_result best;
+    best.status = COMMON_PARAMS_FIT_STATUS_FAILURE;
+
+    // Read model context training size C if not set
+    uint32_t c_context = cparams->n_ctx;
+    if (c_context == 0) {
+        llama_model_params meta_mparams = *mparams;
+        meta_mparams.no_alloc = true;
+        meta_mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+        llama_model * meta_model = llama_model_load_from_file(path_model, meta_mparams);
+        if (meta_model) {
+            int32_t n_train = llama_model_n_ctx_train(meta_model);
+            if (n_train > 0) {
+                c_context = (uint32_t) n_train;
+            }
+            llama_model_free(meta_model);
+        }
+        if (c_context == 0) {
+            c_context = 4096;
+        }
+    }
+
+    const double rho = cparams->triattention ? cparams->triattention_ratio : 1.0;
+    const uint32_t n_align = 256;
+    uint32_t k_min = 0;
+    if (cparams->triattention) {
+        uint32_t needed = std::max<uint32_t>(
+            static_cast<uint32_t>(std::ceil(rho * double(c_context))),
+            cparams->n_ubatch + 128);
+        k_min = (needed + n_align - 1) / n_align * n_align;
+    } else {
+        k_min = (c_context + n_align - 1) / n_align * n_align;
+    }
+    best.k_min = k_min;
+
+    const double e_k = std::max(1.0, (rho * double(c_context)) / 2.0);
+
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0;
+    uint32_t hp_n_ctx_train = 0;
+    uint32_t hp_n_expert = 0;
+
+    auto test_fit = [&](uint32_t b, uint32_t p, uint32_t k_val, int64_t & min_margin_out) -> bool {
+        llama_context_params test = *cparams;
+        test.n_ctx_kv = k_val;
+        test.n_person_max = b;
+        test.n_pen_max = p;
+        test.n_seq_recurrent = b;
+        test.n_seq_max = LLAMA_MAX_SEQ;
+
+        common_device_memory_data_vec data;
+        try {
+            data = common_get_device_memory_data(path_model, mparams, &test, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+        } catch (const std::exception & e) {
+            LOG_TRC("%s: probe failed for B=%u P=%u K=%u: %s\n", __func__, b, p, k_val, e.what());
+            return false;
+        }
+
+        if (devs.empty()) {
+            return false;
+        }
+
+        common_device_memory_data_vec extra_data;
+        std::vector<ggml_backend_dev_t> extra_devs;
+        if (extra_cparams != nullptr) {
+            llama_context_params extra = *extra_cparams;
+            extra.n_ctx_kv = k_val;
+            extra.n_person_max = b;
+            extra.n_pen_max = p;
+            extra.n_seq_recurrent = b;
+            uint32_t extra_ngl = 0;
+            uint32_t extra_n_ctx_train = 0;
+            uint32_t extra_n_expert = 0;
+            try {
+                extra_data = common_get_device_memory_data(
+                    path_model, mparams, &extra, extra_devs,
+                    extra_ngl, extra_n_ctx_train, extra_n_expert, log_level);
+            } catch (const std::exception & e) {
+                return false;
+            }
+        }
+
+        int64_t min_margin = INT64_MAX;
+        for (size_t i = 0; i < devs.size(); ++i) {
+            uint64_t reserved = 0;
+            for (const auto & [dev, bytes] : reserve) {
+                if (dev == devs[i]) {
+                    reserved += bytes;
+                }
+            }
+            for (size_t j = 0; j < extra_devs.size(); ++j) {
+                if (extra_devs[j] == devs[i]) {
+                    reserved += extra_data[j].context;
+                }
+            }
+
+            const int64_t total_margin = (int64_t) data[i].context + (int64_t) data[i].compute + (int64_t) reserved;
+            const int64_t diff = data[i].free - total_margin;
+            if (diff < 0) {
+                return false;
+            }
+            if (diff < min_margin) {
+                min_margin = diff;
+            }
+        }
+        min_margin_out = min_margin;
+        return true;
+    };
+
+    auto search_max_k = [&](uint32_t b, uint32_t p, uint32_t & max_k_out, int64_t & max_k_margin_out) -> bool {
+        int64_t test_margin = 0;
+        if (!test_fit(b, p, k_min, test_margin)) {
+            return false;
+        }
+
+        uint32_t low = k_min;
+        uint32_t high = k_min * 16;
+        if (high < 65536) high = 65536;
+
+        while (high > low && test_fit(b, p, high, test_margin)) {
+            low = high;
+            if (high > UINT32_MAX / 2) {
+                break;
+            }
+            high *= 2;
+        }
+
+        while (high - low > n_align) {
+            uint32_t mid = low + (high - low) / 2;
+            mid = (mid / n_align) * n_align;
+            if (mid <= low) {
+                break;
+            }
+            if (test_fit(b, p, mid, test_margin)) {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        max_k_out = low;
+        test_fit(b, p, max_k_out, max_k_margin_out);
+        return true;
+    };
+
+    // Negative feedback probing (§B.10 / user feedback model):
+    // Fixed 6 pens per person: P = 6 * B. Pens are dynamically allocated first-come, first-served
+    // at runtime up to the total pen capacity P.
+    // Expected KV capacity per person is E_K = rho * C / 2 (ctx / 2).
+    // No hardcoded candidate arrays:
+    // 1. Initial baseline probe at (B=1, P=6) establishes maximum possible physical KV capacity K1.
+    // 2. K1 / E_K directly establishes the physical upper bound B_max without arbitrary constants.
+    // 3. Negative feedback bisection on B:
+    //    - If (B, 6B, K_min) overflows VRAM -> overcommit negative feedback pulls high bound down.
+    //    - If it fits, observed K yields actual support capacity B_supported = floor(K / E_K).
+    //      - If B <= B_supported -> capacity is sustainable! Record best and probe higher.
+    //      - If B > B_supported  -> KV deficit negative feedback pulls high bound down to min(B-1, B_supported).
+    const uint32_t pens_per_person = 6;
+
+    // Step 1: Baseline probe at B=1, P=6
+    uint32_t k1_found = 0;
+    int64_t  m1_margin = 0;
+    if (search_max_k(1, pens_per_person, k1_found, m1_margin) && k1_found >= k_min) {
+        best.status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
+        best.b_people = 1;
+        best.p_pens = pens_per_person;
+        best.k_tokens = k1_found;
+        best.min_device_margin = m1_margin;
+
+        // Theoretical physical ceiling: more people take more brain/hand memory, so K(B) <= K1.
+        // Therefore B cannot physically exceed floor(K1 / E_K), nor LLAMA_MAX_SEQ / pens_per_person.
+        const uint32_t max_seq_people = (uint32_t) (LLAMA_MAX_SEQ / pens_per_person);
+        const uint32_t b_ceiling = std::max(1u, (uint32_t) (double(k1_found) / e_k));
+        const uint32_t b_upper = std::min(max_seq_people, b_ceiling);
+
+        uint32_t low = 2;
+        uint32_t high = b_upper;
+
+        while (low <= high) {
+            const uint32_t mid = low + (high - low + 1) / 2;
+            const uint32_t p_mid = mid * pens_per_person;
+
+            uint32_t k_mid = 0;
+            int64_t  margin_mid = 0;
+            if (!search_max_k(mid, p_mid, k_mid, margin_mid) || k_mid < k_min) {
+                // VRAM overflow: overcommit negative feedback pulls high down
+                high = mid - 1;
+            } else {
+                const uint32_t b_supported = std::max(1u, (uint32_t) std::round(double(k_mid) / e_k));
+                if (mid <= b_supported) {
+                    // Sustainable candidate: record and probe higher
+                    best.b_people = mid;
+                    best.p_pens = p_mid;
+                    best.k_tokens = k_mid;
+                    best.min_device_margin = margin_mid;
+                    low = mid + 1;
+                } else {
+                    // KV deficit: observed KV capacity only supports b_supported people.
+                    // Negative feedback pulls high down directly to min(mid - 1, b_supported).
+                    high = std::min(mid - 1, b_supported);
+                }
+            }
+        }
+
+        LOG_INF("RERoT auto-fit selected (feedback probe): B=%u people, P=%u pens, K=%u tokens (K_min=%u, min_margin=%lld B)\n",
+            best.b_people, best.p_pens, best.k_tokens, best.k_min, (long long) best.min_device_margin);
+        return best;
+    }
+
+    // Step 2: Safety fallback for ultra-constrained devices where even (B=1, P=6) does not fit:
+    for (uint32_t p_fallback = pens_per_person - 1; p_fallback >= 1; --p_fallback) {
+        uint32_t k_found = 0;
+        int64_t margin_found = 0;
+        if (!search_max_k(1, p_fallback, k_found, margin_found)) {
+            continue;
+        }
+        if (k_found < k_min) {
+            continue;
+        }
+        best.status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
+        best.b_people = 1;
+        best.p_pens = p_fallback;
+        best.k_tokens = k_found;
+        best.min_device_margin = margin_found;
+        LOG_INF("RERoT auto-fit fallback selected: B=1 person, P=%u pens, K=%u tokens (K_min=%u, min_margin=%lld B)\n",
+            best.p_pens, best.k_tokens, best.k_min, (long long) best.min_device_margin);
+        return best;
+    }
+
+    return best;
+}
+
 void common_fit_print(
         const char * path_model,
         llama_model_params * mparams,

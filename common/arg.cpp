@@ -936,6 +936,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         if (!gate.ok) {
             throw std::invalid_argument(string_format("error: %s\n", gate.error.c_str()));
         }
+        if (params.n_ctx_kv_auto) {
+            LOG_INF("RERoT capacity mode: full-auto (--total-kv auto joint B/P/K); transition period maintains existing runtime\n");
+        } else {
+            LOG_INF("RERoT capacity mode: manual KV capacity (%u tokens)\n", params.n_ctx_kv);
+        }
         // Auto-fit reserve accounting (A.12): worst-case RERoT scratch is
         // added to the per-device reserve by the fit path via
         // common_rerot_scratch_reserve_bytes(). Touch it here so the CLI
@@ -2611,6 +2616,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                     throw std::invalid_argument("error: invalid value for n_parallel\n");
                 }
                 params.n_parallel = value;
+                params.n_parallel_explicit = true;
             }
         ).set_env("LLAMA_ARG_N_PARALLEL").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
@@ -2619,6 +2625,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             string_format("number of parallel sequences to decode (default: %d)", params.n_parallel),
             [](common_params & params, int value) {
                 params.n_parallel = value;
+                params.n_parallel_explicit = true;
             }
         ).set_env("LLAMA_ARG_N_PARALLEL"));
     }

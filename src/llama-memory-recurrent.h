@@ -70,6 +70,55 @@ public:
     uint32_t get_recurrent_used()     const override;
     uint32_t get_recurrent_seq_used(llama_seq_id seq_id) const override;
 
+    // RERoT grouped layout queries (§§B.3.2, B.6, B.13 Phase 3)
+    uint32_t get_brain_capacity() const override;
+    uint32_t get_hand_capacity()  const override;
+    uint32_t get_brain_used()     const override;
+    uint32_t get_hand_used()      const override;
+
+    void set_grouped_layout(uint32_t n_brains, uint32_t n_hands);
+    bool is_grouped_layout() const { return n_brain_rows > 0 && n_hand_rows > 0; }
+
+    // RBB frontier mean commit (§14.1, §B.6):
+    // Deterministically reduces valid PUBLIC candidate hand rows to update S_global for this person.
+    // N=1: exact identity with single candidate.
+    // PRIVATE/PENDING: excluded from global S commit.
+    // Isolation: S_global[person_a] and S_global[person_b] are in separate rows.
+    bool commit_rbb_frontier_mean(
+        uint32_t person_id,
+        const std::vector<int32_t> & candidate_hand_rows,
+        const std::vector<bool> & is_public_write);
+
+    // Parallel Delta order-free block DeltaNet update (§14.1.2):
+    // Combines concurrent candidate writes to shared S without dilution.
+    // N=1: exact identity with single candidate.
+    // N>1: regularized Gram solve over orthogonal write components.
+    bool commit_rbb_frontier_parallel_delta(
+        uint32_t person_id,
+        const std::vector<int32_t> & candidate_hand_rows,
+        const std::vector<bool> & is_public_write,
+        const std::vector<float> & candidate_log_decays = {});
+
+    // Shared fork hand seed (§B.6.4):
+    // Materializes/captures immutable fork seed for queued children without duplicating full recurrent rows.
+    struct hand_seed {
+        uint64_t fork_id = 0;
+        int32_t source_hand_row = -1;
+        std::vector<std::vector<uint8_t>> conv_tail_bytes; // layer -> conv state bytes
+        std::vector<std::vector<uint8_t>> private_s_bytes; // layer -> R0-R2 private S bytes
+    };
+
+    std::shared_ptr<hand_seed> capture_hand_seed(uint64_t fork_id, llama_seq_id source_seq);
+    bool apply_hand_seed(llama_seq_id dest_seq, const std::shared_ptr<hand_seed> & seed);
+
+    bool rerot_capture_hand_seed(llama_seq_id source_seq, std::vector<uint8_t> & seed_out) override;
+    bool rerot_apply_hand_seed(llama_seq_id dest_seq, const std::vector<uint8_t> & seed_in) override;
+    bool rerot_commit_rbb_frontier(
+            uint32_t person_id,
+            const llama_seq_id * candidate_seqs,
+            const uint8_t * is_public_write,
+            size_t n_candidates) override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -78,6 +127,12 @@ public:
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
+
+    // RERoT grouped layout fields (§§B.6, B.13 Phase 3)
+    uint32_t n_brain_rows = 0;
+    uint32_t n_hand_rows  = 0;
+    uint32_t brain_capacity = 0;
+    uint32_t hand_capacity  = 0;
 
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;

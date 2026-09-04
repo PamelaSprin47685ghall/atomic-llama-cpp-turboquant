@@ -212,7 +212,12 @@ bool server_rerot_metrics::empty() const {
         && mtp_invalidations == 0 && context_shifts == 0
         && hard_aborts == 0 && final_fences == 0
         && span_count == 0 && parked_total == 0 && archive_total == 0
-        && ddvr_seconds == 0.0;
+        && ddvr_seconds == 0.0
+        && people_capacity == 0 && people_resident == 0 && people_runnable == 0 && people_waiting == 0
+        && pens_capacity == 0 && pens_allocated == 0 && pens_running == 0 && pens_suspended == 0
+        && pen_queue_depth == 0 && pens_per_person_max_observed == 0 && pen_utilization == 0.0
+        && batch_people == 0 && batch_pens == 0 && frontier_rows == 0
+        && brain_bytes == 0 && hand_bytes == 0 && grouped_scratch_bytes == 0;
 }
 
 json server_rerot_metrics::to_json() const {
@@ -248,6 +253,27 @@ json server_rerot_metrics::to_json() const {
         { "rerot_parked_total",        parked_total },
         { "rerot_archive_total",       archive_total },
         { "rerot_ddvr_seconds",        ddvr_seconds },
+
+        { "rerot_people_capacity",     people_capacity },
+        { "rerot_people_resident",     people_resident },
+        { "rerot_people_runnable",     people_runnable },
+        { "rerot_people_waiting",      people_waiting },
+
+        { "rerot_pens_capacity",       pens_capacity },
+        { "rerot_pens_allocated",      pens_allocated },
+        { "rerot_pens_running",        pens_running },
+        { "rerot_pens_suspended",      pens_suspended },
+        { "rerot_pen_queue_depth",     pen_queue_depth },
+        { "rerot_pens_per_person_max_observed", pens_per_person_max_observed },
+        { "rerot_pen_utilization",     pen_utilization },
+
+        { "rerot_batch_people",        batch_people },
+        { "rerot_batch_pens",          batch_pens },
+        { "rerot_frontier_rows",       frontier_rows },
+
+        { "rerot_brain_bytes",         brain_bytes },
+        { "rerot_hand_bytes",          hand_bytes },
+        { "rerot_grouped_scratch_bytes", grouped_scratch_bytes },
     };
 }
 
@@ -284,6 +310,27 @@ void server_rerot_metrics::accumulate(const server_rerot_metrics & delta) {
     parked_total        += delta.parked_total;
     archive_total       += delta.archive_total;
     ddvr_seconds        += delta.ddvr_seconds;
+
+    people_capacity     = delta.people_capacity;
+    people_resident     = delta.people_resident;
+    people_runnable     = delta.people_runnable;
+    people_waiting      = delta.people_waiting;
+
+    pens_capacity       = delta.pens_capacity;
+    pens_allocated      = delta.pens_allocated;
+    pens_running        = delta.pens_running;
+    pens_suspended      = delta.pens_suspended;
+    pen_queue_depth     = delta.pen_queue_depth;
+    pens_per_person_max_observed = std::max(pens_per_person_max_observed, delta.pens_per_person_max_observed);
+    pen_utilization     = delta.pen_utilization;
+
+    batch_people        = delta.batch_people;
+    batch_pens          = delta.batch_pens;
+    frontier_rows       += delta.frontier_rows;
+
+    brain_bytes         = delta.brain_bytes;
+    hand_bytes          = delta.hand_bytes;
+    grouped_scratch_bytes = delta.grouped_scratch_bytes;
 }
 
 server_rerot_episode_key server_task::rerot_key() const {

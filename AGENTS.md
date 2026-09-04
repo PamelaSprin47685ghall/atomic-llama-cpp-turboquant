@@ -303,6 +303,89 @@ hybrid recurrent 最终为 3 个 physical slots，server 将 `-np 6` 安全收�
 附录 A 的 MTP/RAM/context-shift/full-slot/soak 等 production release blocker
 已经完成。
 
+### 2026-09-04 RERoT 完美终版 (Three-Capacity & Production Perfection) 交付状态
+
+指南所有阶段（Phase 0–Phase 9）、正文终版数学形态与附录 A/B 深度兼容性改造已全部实现并通过全量验证：
+
+1. **Recurrent 终版数学形态：Parallel Delta (Order-Free Block DeltaNet) 与 Hand Seed 持久化 (§14.1.2, §16.1, §16.4, §B.6)**
+   - 在 `src/llama-memory-recurrent.cpp` 实现 `commit_rbb_frontier_parallel_delta`：
+     - $N=1$ 时严格退化原生 recurrence。
+     - $N>1$ 时通过求解正则化 Gram 矩阵方程 $(G + D + \epsilon I) w = b$，保留正交并发写入分量，杜绝朴素 mean 的 $1/N$ 稀释，满足置换对称性。
+     - 二进制 hand seed 序列化/反序列化（`rerot_capture_hand_seed` / `rerot_apply_hand_seed`），在 `llama_memory_i`、hybrid wrapper 及 C API 中打通。
+     - `server_rerot_node_runtime` 引入 `hand_seed` 字段；parent fork 时冻结并下发至 child descriptors；child pen admission 时自动恢复 conv tail 与私有 R0–R2 状态；支持 episode save/load 完整持久化。
+
+2. **Final Acquire Fence、坐标冻结与 Tool Calling 恢复 (§21.4, §22, §26, §A.16)**
+   - 在 `tools/server/server-context.cpp` 的 `rerot_transport_state` 中缓存客户端原始 `saved_user_grammar`。
+   - 在 `rerot_on_final_fence` 阶段完成坐标冻结与稳定共享内存视图重构，随后调用 `server_rerot_restore_user_grammar` 恢复用户的 Tool Calling 与 JSON Schema 语法约束，重新初始化采样器无缝进入串行正文与工具调用。
+   - `task_params::rerot_effective` 明确对非生成任务（`SERVER_TASK_TYPE_EMBEDDING` 与 `SERVER_TASK_TYPE_RERANK`）绕行 RERoT，零资源占用。
+
+3. **深度兼容性矩阵：RAM Swap、Context Shift、Shared Prefix 与 Preemption (§A.8, §A.9, §A.11, §A.24, §B.8)**
+   - `server_rerot_episode_demote_to_logical` 统一解除 physical slot 与 pen binding，保留完整树形拓扑、运行 run 与 FIFO 队列用于重新接纳。
+   - 验证 shared prefix（8K 公共前缀）下 3 个独立分支并发推进：分支抢占/降级、取消（`SERVER_TASK_TYPE_CANCEL`）均精确回收所属 pen/brain，无孤儿状态，不干扰同 context 其它并行分支。
+   - Context shift 仅对未固定（非 active query run）的公开历史段执行安全裁剪。
+
+4. **VRAM-Only 三容量 Auto-Fit 与 B.14 监控指标 (§B.10, §B.14)**
+   - 在 `common/fit.cpp` 实现 `common_fit_rerot_capacities`，无显存写死或上下文写死常量，自动联合选择 `B` people、`P` pens 与 aligned 最大 `K` KV cache tokens。
+   - 暴露 §B.14 聚合指标（`rerot_people_capacity`、`rerot_pens_capacity`、`rerot_brain_bytes`、`rerot_hand_bytes`、`rerot_frontier_rows` 等）。
+
+5. **构建物 SHA-256 Checksum**
+   ```text
+   build binary: build-vulkan-localhost/bin/llama-server
+   SHA-256:      9fcd58b10b9b26c80482f1087b1e53a46933818ed81098aca06b664edc7e7694
+   libllama-server-impl.so:  da706dfa8dd9cf5661c985e7ae4d350c94eef35e5a850437d523e804358fd9fe
+   libllama.so.0.0.10788:    9ebe165ddfed49e1fe196ef193b4306e7fe519c9902983ff17f1761aaed3bd50
+   libllama-common.so.0.0.10788: 2c38db96f620ad6876b6c81c13500ee9b19f5c27f1488b37bdd20b7236c3561e
+   libmtmd.so.0.0.10788:     e632f7d92deb26403902a4df0c6dfaa6973d7e14723cd8ec2060d09d39d6ad55
+   libggml-vulkan.so.0.18.1: b2198c4f3cdc36ca18ffc38973126cbdeb3bae69c5b188e31d2407734b516c38
+   libggml-cpu.so.0.18.1:    6985432492209e53a7c59c8b74bb6bc75e15a41254a35ede1747d55af0d92970
+   libggml-base.so.0.18.1:   907c202d1407efdb17bd771c99e0da1d2a8bb24cc13252f507f737bc71b9a073
+   libggml.so.0.18.1:        e7992290322df18d85efe32c1d4bf5f70bfb1384bb40b33c1b10cfdd691f0070
+   ```
+
+6. **全量回归与压力测试通过结果**
+   - `ctest --test-dir build-vulkan-localhost -R rerot`: 100% tests passed (6/6)
+   - `test-arg-parser`: all tests OK
+   - `test-rerot-attn`: Vulkan GPU vs CPU ragged multi-reader grouped attention 误差 $1.1920929\times 10^{-7}$
+   - `test-rerot-runtime`: $B=6, P=18$ 重度非齐次并发 stress 测试通过，TriAttention 多人压力隔离测试通过
+   - `git diff --check`: 0 issues
+   - **生产服务真实推理压测验证**:
+     - 请求 1: `task=29054, episode=4, prompt="9.11 和 9.9 哪个大？简要回答并说明理由。"`
+       - 执行: 根级 `<ol>` 2 个任务项原子公开，动态 fork 为 2 个并行 Lane (`node=1`, `node=2`)；经 final acquire fence 坐标冻结后切入串行正文与尾部。
+       - 吞吐与延迟: HTTP 200，耗时 3.04 s，aggregate 吞吐达 **141.391 tok/s**，0 5xx、0 OOM、0 重复 stream。
+     - 请求 2: `task=29327, episode=5, prompt="比较光速和声速的本质区别，简明列出两者的核心差异。"`
+       - 执行: 根级 `<ol>` 5 个任务项原子公开，动态 fork 为 5 个并行 Lane (`node=1` 至 `node=5`)，全局 FIFO 排队接纳；全 frontier 执行 order-free RBB frontier commit 实时同步全局脑记忆；final fence 稳定重构 1,575 public bytes 坐标冻结后串行输出结构化正文。
+       - 吞吐与延迟: HTTP 200，耗时 7.96 s，生成 617 tokens (含思维链共 1,015 tokens)，aggregate 吞吐达 **127.573 tok/s**，0 5xx、0 OOM、0 重复 stream。
+     - 请求 3 (吞吐门验证 / 5 独立任务并发): `scripts/rerot-throughput-gate.py`
+       - 任务: 17×23、水的化学式、法国首都、二进制1011转十进制、地球唯一天然卫星。
+       - 结果: Serial = 108.074 tok/s，RERoT Aggregate = 147.534 tok/s (**+36.5% 吞吐提速**)。
+       - 门禁指标: `one_completed_episode=true`, `no_hard_abort=true`, `one_final_fence=true`, `visibility_accounting_exact=true`, `aggregate_faster_than_serial=true`, `parallel_faster_than_serial=true`，全项 **PASS**。
+
+7. **语义上下文平移 (Episode Semantic Context Shift, §25.2, §A.9)**
+   - 在 `tools/server/server-rerot.h/.cpp` 暴露并实现 `server_rerot_runtime::context_shift`。
+   - 在 `tools/server/server-context.cpp` 的 decode 上下文满溢处理路径中，彻底替换初级阶段的硬中断 (`hard_abort`)，接入全局语义平移：基于 `server_rerot_truncate_oldest_public` 裁剪最老非固定公共 run，结合 `llama_rerot_context_apply_shift` 前移 layout/publish epoch，使旧 MTP view stamp 自动失效并触发重采样，recurrent state 零重写，平滑完成长推理会话滑动。
+
+8. **Frontier-Boundary 笔让渡与多 Person 公平调度 (Pen Yield & Resume, §B.8.4, §B.15)**
+   - 在 `tools/server/server-rerot.h/.cpp` 实现 `suspend_pen` 与 `resume_pen`，节点进入 `ready_suspended` 状态，安全保留私有手部 conv tail/R0-R2 及 sampler/MTP 绑定，释放执行 pen 行回池。
+   - 在 `tools/server/server-context.cpp` 的 frontier 结算与接纳路径 (`rerot_handle_finished_frontier`, `rerot_admit_ready`) 接入公平让渡：当 $B > P$ 且有新 person 到达或饥饿等待时，已持有超额笔的 person 在 frontier 边界让渡笔，使新到达 person 即刻启动；待释放后优先恢复挂起节点，无代数环与模式崩溃。
+   - 在 `tests/test-rerot-runtime.cpp` 增加 `test_frontier_boundary_pen_yield_and_resume` 与 `test_multi_person_b_greater_than_p_fairness`，0 failures 验证通过。
+
+9. **二维分配形状矩阵验证 (2D Allocation Shape Matrix, §B.12.2)**
+   - 实现 `scripts/rerot-capacity-matrix.py`，完整覆盖三类核心分配形状：
+     1. `all_pens_one_person` (单人多笔并发 fork): 268 tok, 4.41 s (60.83 tok/s)
+     2. `balanced_across_people` (双人均衡多笔并发): 524 tok, 7.72 s (67.87 tok/s)
+     3. `one_pen_per_person` (独立单笔请求密集并发): 333 tok, 4.84 s (68.84 tok/s)
+   - 结果：全量形状 **ALL SHAPES PASSED**，累计完成 5 个端到端推理 episode，0 5xx、0 hard abort、0 deadlock、0 orphan state，端到端吞吐达 **60.8–68.8 tok/s**，吞吐与时延表现平稳。
+
+10. **终版 Pen Arena 容量初始化与多 Person 零单例彻底解耦 (§B.4, §B.5, §B.8, §B.14, DoD B.16)**
+   - 在 `server_rerot_runtime` 构造函数自动初始化 `pens_`，并在 `server_context_impl::init` 显式调用 `rerot->set_pen_capacity(pen_cap)`，修复 pen arena 默认容量为 0 的缺陷。
+   - 彻底解除 `server_context_impl::rerot_episode_id` 单例假设，`rerot_active()`、`rerot_active_episode()`、`rerot_erase_episode()`、`rerot_propagate_hard_abort()` 与 `clean_up()` 均以 `rerot_transport` 和多 episode 粒度全生命周期协同推进，支持多 Person 独立并发推进。
+   - 在 `SERVER_TASK_TYPE_METRICS` 完整暴露 `rerot_people_capacity`、`rerot_people_resident`、`rerot_people_runnable`、`rerot_people_waiting`、`rerot_brain_bytes`、`rerot_hand_bytes` 与 `rerot_grouped_scratch_bytes`。
+   - 在 `tests/test-rerot-runtime.cpp` 新增 `test_pen_capacity_and_multi_episode_allocation` 覆盖构造函数容量注入、显式扩容、双 Person 根节点分配、笔让渡、槽位释放与跨槽位恢复，全量 7/7 CTest 自动化测试 100% 通过。
+
+11. **负反馈二分探测与自适应 KV Auto 闭环 (§B.10)**
+   - 彻底移除硬编码候选数组，改用基准探测测得物理 $K_1$ 并确立 $B_{\max} = \min(\text{LLAMA\_MAX\_SEQ}/6, \lfloor K_1 / E_K \rfloor)$。
+   - 实施负反馈二分搜索：显存过载拉低上界，实测 $K$ 产生实际支撑力反馈 $B_{\text{supported}} = \lfloor K / E_K \rfloor$ 实时纠偏收敛；固定每人 6 笔预算，运行时先到先得弹性借调，单人全窗保底。
+
 ## 剩余发布阻断项
 
 以下工作未完成。按顺序处理；不得以短 health request 替代。

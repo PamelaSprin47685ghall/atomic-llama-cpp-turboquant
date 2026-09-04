@@ -1307,63 +1307,87 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     if (params.n_ctx_kv_auto) {
-        // When TriAttention is enabled, the CUDA scoring scratch (calibration
-        // copies, candidate index buffers, score chunks, pack graph reserve)
-        // needs ~16 MiB per device. The runtime_headroom in fit_kv already
-        // provides 32-256 MiB of headroom (min 32 MiB, scaled to 1% of total),
-        // which covers this. A more precise per-device reserve can be added
-        // in a future iteration when the calibration header is read pre-fit.
-
-        auto fit_kv = [&]() {
-            return common_fit_kv_cache(
+        if (params.rerot_enabled) {
+            // §B.10 / Phase 8: VRAM-only Three-Capacity Auto-fit for RERoT
+            auto fit_res = common_fit_rerot_capacities(
                 params.model.path.c_str(), &mparams, &cparams,
-                params.n_ctx_kv_reserve,
-                extra_cparams,
+                params.n_ctx_kv_reserve, extra_cparams,
                 params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
-        };
-
-        auto status = fit_kv();
-        if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
-            COM_ERR("%s", "failed to size unified KV cache automatically\n");
-            return;
-        }
-
-        // Search downwards from the initial recurrent target to find the largest capacity that fits.
-        cparams.triattention       = params.triattention_enabled;
-        cparams.triattention_ratio = params.triattention_ratio;
-        cparams.triattention_stats = params.triattention_stats.c_str();
-        uint32_t target_recurrent = common_dynamic_recurrent_target(cparams);
-        while (target_recurrent > 1) {
-            cparams.n_seq_recurrent = target_recurrent;
-            if (extra_cparams != nullptr) {
-                cparams_mtp.n_seq_recurrent = target_recurrent;
-            }
-
-            status = fit_kv();
-            if (status == COMMON_PARAMS_FIT_STATUS_SUCCESS) {
-                const uint32_t supported_recurrent = common_dynamic_recurrent_target(cparams);
-                if (supported_recurrent >= target_recurrent) {
-                    break;
-                }
-                target_recurrent = std::min(target_recurrent - 1, supported_recurrent);
-            } else {
-                target_recurrent--;
-            }
-        }
-
-        if (cparams.n_seq_recurrent != target_recurrent || status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
-            cparams.n_seq_recurrent = target_recurrent;
-            if (extra_cparams != nullptr) {
-                cparams_mtp.n_seq_recurrent = target_recurrent;
-            }
-            status = fit_kv();
-            if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
-                COM_ERR("%s", "failed to size unified KV cache for recurrent target\n");
+            if (fit_res.status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                COM_ERR("%s", "failed to size RERoT B/P/K capacities automatically\n");
                 return;
             }
-        }
+            params.n_parallel = fit_res.b_people;
+            params.rerot_person_max = fit_res.b_people;
+            params.rerot_pen_max = fit_res.p_pens;
+            params.rerot_brain_rows = fit_res.b_people;
+            params.rerot_hand_rows = fit_res.p_pens;
+            params.n_ctx_kv = fit_res.k_tokens;
 
-        params.n_ctx_kv = cparams.n_ctx_kv;
+            cparams.n_person_max = fit_res.b_people;
+            cparams.n_pen_max = fit_res.p_pens;
+            cparams.n_ctx_kv = fit_res.k_tokens;
+            cparams.n_seq_recurrent = fit_res.b_people;
+            cparams.n_seq_max = LLAMA_MAX_SEQ;
+            if (extra_cparams != nullptr) {
+                cparams_mtp.n_person_max = fit_res.b_people;
+                cparams_mtp.n_pen_max = fit_res.p_pens;
+                cparams_mtp.n_ctx_kv = fit_res.k_tokens;
+                cparams_mtp.n_seq_recurrent = fit_res.b_people;
+            }
+        } else {
+            // Ordinary (RERoT OFF) auto-fit remains 100% untouched
+            auto fit_kv = [&]() {
+                return common_fit_kv_cache(
+                    params.model.path.c_str(), &mparams, &cparams,
+                    params.n_ctx_kv_reserve,
+                    extra_cparams,
+                    params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            };
+
+            auto status = fit_kv();
+            if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                COM_ERR("%s", "failed to size unified KV cache automatically\n");
+                return;
+            }
+
+            // Search downwards from the initial recurrent target to find the largest capacity that fits.
+            cparams.triattention       = params.triattention_enabled;
+            cparams.triattention_ratio = params.triattention_ratio;
+            cparams.triattention_stats = params.triattention_stats.c_str();
+            uint32_t target_recurrent = common_dynamic_recurrent_target(cparams);
+            while (target_recurrent > 1) {
+                cparams.n_seq_recurrent = target_recurrent;
+                if (extra_cparams != nullptr) {
+                    cparams_mtp.n_seq_recurrent = target_recurrent;
+                }
+
+                status = fit_kv();
+                if (status == COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                    const uint32_t supported_recurrent = common_dynamic_recurrent_target(cparams);
+                    if (supported_recurrent >= target_recurrent) {
+                        break;
+                    }
+                    target_recurrent = std::min(target_recurrent - 1, supported_recurrent);
+                } else {
+                    target_recurrent--;
+                }
+            }
+
+            if (cparams.n_seq_recurrent != target_recurrent || status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                cparams.n_seq_recurrent = target_recurrent;
+                if (extra_cparams != nullptr) {
+                    cparams_mtp.n_seq_recurrent = target_recurrent;
+                }
+                status = fit_kv();
+                if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                    COM_ERR("%s", "failed to size unified KV cache for recurrent target\n");
+                    return;
+                }
+            }
+
+            params.n_ctx_kv = cparams.n_ctx_kv;
+        }
     } else if (dynamic_kv) {
         // When --fit is off and the user did not specify -c, resolve n_ctx
         // from the model's training context so that common_dynamic_recurrent_target
@@ -1842,6 +1866,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.triattention_ratio  = params.triattention_ratio;
     cparams.rerot               = params.rerot_enabled;
     cparams.rerot_frontier      = params.rerot_frontier;
+    cparams.n_person_max        = params.rerot_person_max;
+    cparams.n_pen_max           = params.rerot_pen_max;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

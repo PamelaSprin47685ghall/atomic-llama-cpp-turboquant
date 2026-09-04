@@ -62,6 +62,10 @@ struct llama_cparams {
     uint32_t triattention_recent_window = 128;
     bool rerot_enabled = false;
     llama_rerot_frontier_mode rerot_frontier = LLAMA_REROT_FRONTIER_STRONG;
+    uint32_t n_person_max = 0; // auto-selected B (people / independent brains, B.3.2)
+    uint32_t n_pen_max    = 0; // auto-selected P (pens / execution states, B.3.2)
+    uint32_t n_brain_rows = 0; // derived from B
+    uint32_t n_hand_rows  = 0; // derived from P
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer

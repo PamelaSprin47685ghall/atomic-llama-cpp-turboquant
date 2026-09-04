@@ -292,6 +292,179 @@ int main() {
     CHECK(snap_seq(mem, B) == snapB1);
     CHECK(snap_seq(mem, H) == snapH1);
 
+    // 10. Phase 3 acceptance gate (§§B.6, B.13 Phase 3):
+    // Recurrent brain/hand arenas, grouped layout, and reference RBB mean commit
+    {
+        llama_memory_recurrent gmem(model, GGML_TYPE_F32, GGML_TYPE_F32,
+            false, /*mem_size=*/ 16, /*n_seq_max=*/ 16, /*n_rs_seq=*/ 0, nullptr);
+
+        gmem.set_grouped_layout(3, 9);
+        CHECK(gmem.is_grouped_layout());
+        CHECK(gmem.get_brain_capacity() == 3);
+        CHECK(gmem.get_hand_capacity() == 9);
+
+        // N=1: exact bitwise/tolerance identity with native recurrence
+        // Admit row 1 and row 2
+        CHECK(admit(gmem, 1, 0, 1));
+        CHECK(admit(gmem, 2, 0, 1));
+        stamp_seq(gmem, 1, 0x11, 0x12);
+        stamp_seq(gmem, 2, 0x21, 0x22);
+
+        llama_pos pos = -1;
+        const int32_t r1 = resolved_row(gmem, 1, pos);
+        const int32_t r2 = resolved_row(gmem, 2, pos);
+        CHECK(r1 >= 0 && r2 >= 0);
+
+        // Commit N=1 candidate r1 to person 0 (brain row 0)
+        CHECK(gmem.commit_rbb_frontier_mean(0, {r1}, {true}));
+        const size_t s_row_size = ggml_row_size(gmem.s_l[0]->type, gmem.s_l[0]->ne[0]);
+        std::vector<uint8_t> s_brain0(s_row_size);
+        std::vector<uint8_t> s_r1(s_row_size);
+        ggml_backend_tensor_get(gmem.s_l[0], s_brain0.data(), 0, s_row_size);
+        ggml_backend_tensor_get(gmem.s_l[0], s_r1.data(), (size_t) r1 * s_row_size, s_row_size);
+        CHECK(s_brain0 == s_r1); // Exact identity!
+
+        // Permutation symmetry across N=1,2,3,5 candidate hand rows
+        // Create 5 sequences with known values
+        std::vector<int32_t> cand_rows;
+        for (int seq = 3; seq <= 7; ++seq) {
+            CHECK(admit(gmem, seq, 0, 1));
+            stamp_seq(gmem, seq, 0x01 * seq, 0x10 * seq);
+            cand_rows.push_back(resolved_row(gmem, seq, pos));
+        }
+
+        // Run permutation 1: order [3, 4, 5]
+        std::vector<int32_t> perm1 = {cand_rows[0], cand_rows[1], cand_rows[2]};
+        std::vector<bool> pub1 = {true, true, true};
+        CHECK(gmem.commit_rbb_frontier_mean(0, perm1, pub1));
+        std::vector<uint8_t> snap_perm1(s_row_size);
+        ggml_backend_tensor_get(gmem.s_l[0], snap_perm1.data(), 0, s_row_size);
+
+        // Run permutation 2: order [5, 3, 4]
+        std::vector<int32_t> perm2 = {cand_rows[2], cand_rows[0], cand_rows[1]};
+        CHECK(gmem.commit_rbb_frontier_mean(0, perm2, pub1));
+        std::vector<uint8_t> snap_perm2(s_row_size);
+        ggml_backend_tensor_get(gmem.s_l[0], snap_perm2.data(), 0, s_row_size);
+
+        // Run permutation 3: order [4, 5, 3]
+        std::vector<int32_t> perm3 = {cand_rows[1], cand_rows[2], cand_rows[0]};
+        CHECK(gmem.commit_rbb_frontier_mean(0, perm3, pub1));
+        std::vector<uint8_t> snap_perm3(s_row_size);
+        ggml_backend_tensor_get(gmem.s_l[0], snap_perm3.data(), 0, s_row_size);
+
+        CHECK(snap_perm1 == snap_perm2);
+        CHECK(snap_perm2 == snap_perm3); // Exact permutation symmetry!
+
+        // Different persons S never mutate each other
+        CHECK(gmem.commit_rbb_frontier_mean(1, {cand_rows[3]}, {true})); // Person 1 -> brain row 1
+        CHECK(gmem.commit_rbb_frontier_mean(2, {cand_rows[4]}, {true})); // Person 2 -> brain row 2
+
+        std::vector<uint8_t> snap_b0(s_row_size);
+        std::vector<uint8_t> snap_b1(s_row_size);
+        std::vector<uint8_t> snap_b2(s_row_size);
+        ggml_backend_tensor_get(gmem.s_l[0], snap_b0.data(), 0 * s_row_size, s_row_size);
+        ggml_backend_tensor_get(gmem.s_l[0], snap_b1.data(), 1 * s_row_size, s_row_size);
+        ggml_backend_tensor_get(gmem.s_l[0], snap_b2.data(), 2 * s_row_size, s_row_size);
+
+        CHECK(snap_b0 == snap_perm1); // Brain row 0 was untouched by persons 1 and 2
+        CHECK(snap_b1 != snap_b0);
+        CHECK(snap_b2 != snap_b1);
+
+        // PRIVATE/PENDING never enter global S
+        // Candidate 0 is PRIVATE (secret 0xFF), Candidate 1 is PUBLIC (0x10)
+        stamp_seq(gmem, 3, 0xFF, 0xFF);
+        std::vector<int32_t> mixed_rows = {cand_rows[0], cand_rows[1]};
+        std::vector<bool> mixed_pub = {false, true}; // candidate 0 is PRIVATE
+        CHECK(gmem.commit_rbb_frontier_mean(0, mixed_rows, mixed_pub));
+        ggml_backend_tensor_get(gmem.s_l[0], snap_b0.data(), 0, s_row_size);
+        std::vector<uint8_t> snap_pub_only(s_row_size);
+        ggml_backend_tensor_get(gmem.s_l[0], snap_pub_only.data(), (size_t) cand_rows[1] * s_row_size, s_row_size);
+        CHECK(snap_b0 == snap_pub_only); // Exactly equals the public candidate; private secret was never committed!
+
+        // One person with multiple pens only uses 1 global S row
+        CHECK(gmem.commit_rbb_frontier_mean(0, {cand_rows[1], cand_rows[2], cand_rows[3], cand_rows[4]}, {true, true, true, true}));
+        ggml_backend_tensor_get(gmem.s_l[0], snap_b1.data(), 1 * s_row_size, s_row_size);
+        ggml_backend_tensor_get(gmem.s_l[0], snap_b2.data(), 2 * s_row_size, s_row_size);
+        // Person 1 and 2 brain rows remain untouched
+        std::vector<uint8_t> snap_b1_after(s_row_size);
+        ggml_backend_tensor_get(gmem.s_l[0], snap_b1_after.data(), 1 * s_row_size, s_row_size);
+        CHECK(snap_b1_after == snap_b1);
+
+        // Shared fork hand seed (§B.6.4):
+        // Capture parent hand seed from sequence 1
+        auto seed = gmem.capture_hand_seed(999, 1);
+        CHECK(seed != nullptr);
+        CHECK(seed->fork_id == 999);
+        CHECK(!seed->conv_tail_bytes.empty());
+
+        // Apply shared seed to sequence 8 and 9
+        CHECK(admit(gmem, 8, 0, 1));
+        CHECK(admit(gmem, 9, 0, 1));
+        CHECK(gmem.apply_hand_seed(8, seed));
+        CHECK(gmem.apply_hand_seed(9, seed));
+
+        const int32_t r8 = resolved_row(gmem, 8, pos);
+        const int32_t r9 = resolved_row(gmem, 9, pos);
+        CHECK(r8 >= 0 && r9 >= 0 && r8 != r9);
+
+        // Verify both received identical conv state matching the parent seed
+        const size_t r_row_size = ggml_row_size(gmem.r_l[0]->type, gmem.r_l[0]->ne[0]);
+        std::vector<uint8_t> conv8(r_row_size);
+        std::vector<uint8_t> conv9(r_row_size);
+        ggml_backend_tensor_get(gmem.r_l[0], conv8.data(), (size_t) r8 * r_row_size, r_row_size);
+        ggml_backend_tensor_get(gmem.r_l[0], conv9.data(), (size_t) r9 * r_row_size, r_row_size);
+        CHECK(conv8 == seed->conv_tail_bytes[0]);
+        CHECK(conv9 == seed->conv_tail_bytes[0]);
+        CHECK(conv8 == conv9);
+
+        // Serialized blob capture/apply roundtrip (§B.6.4)
+        std::vector<uint8_t> seed_blob;
+        CHECK(gmem.rerot_capture_hand_seed(1, seed_blob));
+        CHECK(!seed_blob.empty());
+
+        CHECK(admit(gmem, 10, 0, 1));
+        const int32_t r10 = resolved_row(gmem, 10, pos);
+        CHECK(r10 >= 0);
+        CHECK(gmem.rerot_apply_hand_seed(10, seed_blob));
+        std::vector<uint8_t> conv10(r_row_size);
+        ggml_backend_tensor_get(gmem.r_l[0], conv10.data(), (size_t) r10 * r_row_size, r_row_size);
+        CHECK(conv10 == conv8);
+
+        // --- Parallel Delta block DeltaNet test (§14.1.2) ---
+        // N=1 identity: single candidate update is bitwise equivalent
+        CHECK(gmem.commit_rbb_frontier_parallel_delta(0, {cand_rows[0]}, {true}));
+        std::vector<uint8_t> pdelta_n1(s_row_size);
+        ggml_backend_tensor_get(gmem.s_l[0], pdelta_n1.data(), 0, s_row_size);
+        std::vector<uint8_t> cand0_bytes(s_row_size);
+        ggml_backend_tensor_get(gmem.s_l[0], cand0_bytes.data(), (size_t) cand_rows[0] * s_row_size, s_row_size);
+        CHECK(pdelta_n1 == cand0_bytes);
+
+        // Permutation symmetry for Parallel Delta:
+        // Order [c0, c1, c2] vs [c2, c0, c1]
+        std::vector<int32_t> pd_perm1 = {cand_rows[0], cand_rows[1], cand_rows[2]};
+        std::vector<int32_t> pd_perm2 = {cand_rows[2], cand_rows[0], cand_rows[1]};
+        std::vector<bool> pd_pub = {true, true, true};
+
+        CHECK(gmem.commit_rbb_frontier_parallel_delta(0, pd_perm1, pd_pub));
+        std::vector<float> pd_out1(s_row_size / sizeof(float));
+        ggml_backend_tensor_get(gmem.s_l[0], pd_out1.data(), 0, s_row_size);
+
+        CHECK(gmem.commit_rbb_frontier_parallel_delta(0, pd_perm2, pd_pub));
+        std::vector<float> pd_out2(s_row_size / sizeof(float));
+        ggml_backend_tensor_get(gmem.s_l[0], pd_out2.data(), 0, s_row_size);
+
+        float max_diff = 0.0f;
+        for (size_t k = 0; k < pd_out1.size(); ++k) {
+            max_diff = std::max(max_diff, std::abs(pd_out1[k] - pd_out2[k]));
+        }
+        CHECK(max_diff < 1e-6f); // Permutation symmetric!
+
+        // --- Test rerot_commit_rbb_frontier interface (§14.1, §14.1.2) ---
+        llama_seq_id cand_seqs[3] = {1, 2, 3};
+        uint8_t pub_flags[3] = {1, 1, 1};
+        CHECK(gmem.rerot_commit_rbb_frontier(0, cand_seqs, pub_flags, 3));
+    }
+
     std::fprintf(stderr, "=== Results: %d failure(s) ===\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

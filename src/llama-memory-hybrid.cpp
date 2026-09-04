@@ -272,6 +272,22 @@ void llama_memory_hybrid::rerot_clear_reader_view(llama_seq_id seq_id) {
     mem_attn->rerot_clear_reader_view(seq_id);
 }
 
+bool llama_memory_hybrid::rerot_capture_hand_seed(llama_seq_id source_seq, std::vector<uint8_t> & seed_out) {
+    return mem_recr ? mem_recr->rerot_capture_hand_seed(source_seq, seed_out) : false;
+}
+
+bool llama_memory_hybrid::rerot_apply_hand_seed(llama_seq_id dest_seq, const std::vector<uint8_t> & seed_in) {
+    return mem_recr ? mem_recr->rerot_apply_hand_seed(dest_seq, seed_in) : false;
+}
+
+bool llama_memory_hybrid::rerot_commit_rbb_frontier(
+        uint32_t person_id,
+        const llama_seq_id * candidate_seqs,
+        const uint8_t * is_public_write,
+        size_t n_candidates) {
+    return mem_recr ? mem_recr->rerot_commit_rbb_frontier(person_id, candidate_seqs, is_public_write, n_candidates) : false;
+}
+
 void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
     mem_attn->seq_keep(seq_id);
     mem_recr->seq_keep(seq_id);

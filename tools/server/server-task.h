@@ -176,6 +176,28 @@ struct server_rerot_metrics {
     uint64_t archive_total = 0;
     double ddvr_seconds = 0.0;
 
+    // Multi-capacity and grouped scheduler metrics (§B.14)
+    uint64_t people_capacity = 0;
+    uint64_t people_resident = 0;
+    uint64_t people_runnable = 0;
+    uint64_t people_waiting = 0;
+
+    uint64_t pens_capacity = 0;
+    uint64_t pens_allocated = 0;
+    uint64_t pens_running = 0;
+    uint64_t pens_suspended = 0;
+    uint64_t pen_queue_depth = 0;
+    uint64_t pens_per_person_max_observed = 0;
+    double   pen_utilization = 0.0;
+
+    uint64_t batch_people = 0;
+    uint64_t batch_pens = 0;
+    uint64_t frontier_rows = 0;
+
+    uint64_t brain_bytes = 0;
+    uint64_t hand_bytes = 0;
+    uint64_t grouped_scratch_bytes = 0;
+
     bool empty() const;
     json to_json() const;
     void accumulate(const server_rerot_metrics & delta);

@@ -1019,6 +1019,101 @@ static void test_cpu_helper_matches_op() {
     CHECK(max_abs_diff(op_out, cpu_qside) < 1e-4f);
 }
 
+static void test_ragged_multi_reader_grouped_attention() {
+    std::puts("--- ragged multi-reader grouped attention (§B.7, §B.13 Phase 4) ---");
+
+    constexpr int d = 16;
+    constexpr int dv = 8;
+    constexpr int hq = 4;
+    constexpr int hkv = 2;
+
+    // Ragged configuration: 3 people with 3, 1, 2 readers -> total 6 readers (no 3x3=9 padding!)
+    const std::vector<uint32_t> person_offsets = { 0, 3, 4, 6 };
+    const int nq = 6;
+
+    // Person 0 keys: 0..7 (8 keys)
+    // Person 1 keys: 8..11 (4 keys)
+    // Person 2 keys: 12..17 (6 keys)
+    const int nkv = 18;
+
+    std::vector<int32_t> entries;
+    std::vector<int32_t> offsets;
+    offsets.push_back(0);
+
+    // Build entries per reader respecting person boundaries
+    // Readers 0, 1, 2 belong to Person 0 -> read keys 0..7
+    for (int r = 0; r < 3; ++r) {
+        for (int k = 0; k < 8; ++k) {
+            entries.push_back(k);
+            entries.push_back(r); // group/reader local
+        }
+        offsets.push_back(int(entries.size() / 2));
+    }
+
+    // Reader 3 belongs to Person 1 -> reads keys 8..11
+    for (int k = 8; k < 12; ++k) {
+        entries.push_back(k);
+        entries.push_back(3);
+    }
+    offsets.push_back(int(entries.size() / 2));
+
+    // Readers 4, 5 belong to Person 2 -> read keys 12..17
+    for (int r = 0; r < 2; ++r) {
+        for (int k = 12; k < 18; ++k) {
+            entries.push_back(k);
+            entries.push_back(4 + r);
+        }
+        offsets.push_back(int(entries.size() / 2));
+    }
+
+    CHECK(offsets.size() == size_t(nq + 1));
+
+    // Generate deterministic test vectors matching 4D tensor strides [(h*ng + g)*d + id]
+    std::vector<float> q(size_t(d) * nq * hq);
+    std::vector<float> k(size_t(d) * nkv * hkv);
+    std::vector<float> v(size_t(dv) * nkv * hkv);
+
+    for (int h = 0; h < hq; ++h) {
+        for (int g = 0; g < nq; ++g) {
+            for (int id = 0; id < d; ++id) {
+                q[(size_t(h) * nq + g) * d + id] = value_q(g, h, id);
+            }
+        }
+    }
+    for (int h = 0; h < hkv; ++h) {
+        for (int key = 0; key < nkv; ++key) {
+            for (int id = 0; id < d; ++id) {
+                k[(size_t(h) * nkv + key) * d + id] = value_k(key, h, id);
+            }
+            for (int id = 0; id < dv; ++id) {
+                v[(size_t(h) * nkv + key) * dv + id] = value_v(key, h, id);
+            }
+        }
+    }
+
+    const float scale = 1.0f / std::sqrt(float(d));
+    const auto ref_out = reference(d, dv, hq, hkv, nq, entries, offsets, scale, 0.0f, {});
+    const auto op_out = run_indexed_op(d, dv, nq, nkv, hq, hkv, nq, q, k, v, entries, offsets, scale);
+
+    CHECK(op_out.size() == ref_out.size());
+    const float err = max_abs_diff(op_out, ref_out);
+    CHECK(err < 1e-4f);
+    std::printf("ragged multi-reader grouped attention CPU error = %.9g\n", err);
+
+    ggml_backend_dev_t device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (device) {
+        ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
+        if (backend) {
+            const auto gpu_op_out = run_indexed_op(d, dv, nq, nkv, hq, hkv, nq, q, k, v, entries, offsets, scale, backend);
+            CHECK(gpu_op_out.size() == ref_out.size());
+            const float gpu_err = max_abs_diff(gpu_op_out, ref_out);
+            CHECK(gpu_err < 2e-4f);
+            std::printf("ragged multi-reader grouped attention GPU parity error = %.9g\n", gpu_err);
+            ggml_backend_free(backend);
+        }
+    }
+}
+
 int main() {
     std::puts("=== RERoT indexed attention test ===");
     test_indexed_basic();
@@ -1026,6 +1121,7 @@ int main() {
     test_frontier_strong_vs_lag1();
     test_vulkan_indexed_parity();
     test_cpu_helper_matches_op();
+    test_ragged_multi_reader_grouped_attention();
     std::printf("=== Results: %d failure(s) ===\n", failures);
     return failures == 0 ? 0 : 1;
 }

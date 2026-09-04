@@ -122,6 +122,12 @@ struct llama_memory_i {
     virtual uint32_t get_recurrent_used()     const { return 0; }
     virtual uint32_t get_recurrent_seq_used(llama_seq_id seq_id) const { GGML_UNUSED(seq_id); return 0; }
 
+    // RERoT grouped layout queries (§§B.3.2, B.6, B.13 Phase 3)
+    virtual uint32_t get_brain_capacity() const { return get_recurrent_capacity(); }
+    virtual uint32_t get_hand_capacity()  const { return get_recurrent_capacity(); }
+    virtual uint32_t get_brain_used()     const { return get_recurrent_used(); }
+    virtual uint32_t get_hand_used()      const { return get_recurrent_used(); }
+
     //
     // ops
     //
@@ -260,6 +266,30 @@ struct llama_memory_i {
     }
     virtual void rerot_clear_reader_view(llama_seq_id seq_id) {
         GGML_UNUSED(seq_id);
+    }
+
+    // Shared fork hand seed (§16.1, §16.4, §B.6.4)
+    virtual bool rerot_capture_hand_seed(llama_seq_id source_seq, std::vector<uint8_t> & seed_out) {
+        GGML_UNUSED(source_seq);
+        GGML_UNUSED(seed_out);
+        return false;
+    }
+    virtual bool rerot_apply_hand_seed(llama_seq_id dest_seq, const std::vector<uint8_t> & seed_in) {
+        GGML_UNUSED(dest_seq);
+        GGML_UNUSED(seed_in);
+        return false;
+    }
+
+    virtual bool rerot_commit_rbb_frontier(
+            uint32_t person_id,
+            const llama_seq_id * candidate_seqs,
+            const uint8_t * is_public_write,
+            size_t n_candidates) {
+        GGML_UNUSED(person_id);
+        GGML_UNUSED(candidate_seqs);
+        GGML_UNUSED(is_public_write);
+        GGML_UNUSED(n_candidates);
+        return false;
     }
 
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;

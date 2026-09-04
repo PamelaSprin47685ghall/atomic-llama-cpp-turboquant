@@ -61,11 +61,22 @@ struct llama_ubatch {
         std::vector<int32_t>        seq_idx;
         std::vector<int8_t>         output;
 
+        // RERoT variable-N grouped metadata storage
+        std::vector<uint32_t>       person_id;
+        std::vector<int32_t>        pen_id;
+        std::vector<uint32_t>       person_offsets;
+
         std::vector<llama_seq_id> seq_id_data;
     };
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+
+    // RERoT Variable-N grouped batch metadata (§B.4.4, §B.6.2, §B.7, §B.13 Phase 4)
+    uint32_t     *  person_id      = nullptr; // [n_tokens] person/episode identity
+    int32_t      *  pen_id         = nullptr; // [n_tokens] pen/lane-local identity
+    uint32_t        n_people       = 0;       // number of active people in this ubatch
+    uint32_t     *  person_offsets = nullptr; // [n_people + 1] ragged offsets: person i's pens span [offsets[i], offsets[i+1])
 };
 
 // a helper for sanitizing, fulfilling and splitting a batch

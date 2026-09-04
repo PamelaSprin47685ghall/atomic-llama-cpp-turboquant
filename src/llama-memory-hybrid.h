@@ -66,6 +66,11 @@ public:
     uint32_t get_recurrent_used()     const override;
     uint32_t get_recurrent_seq_used(llama_seq_id seq_id) const override;
 
+    uint32_t get_brain_capacity() const override { return mem_recr ? mem_recr->get_brain_capacity() : 0; }
+    uint32_t get_hand_capacity()  const override { return mem_recr ? mem_recr->get_hand_capacity()  : 0; }
+    uint32_t get_brain_used()     const override { return mem_recr ? mem_recr->get_brain_used()     : 0; }
+    uint32_t get_hand_used()      const override { return mem_recr ? mem_recr->get_hand_used()      : 0; }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -94,6 +99,14 @@ public:
         llama_seq_id seq_id) override;
     bool rerot_set_reader_view(llama_seq_id seq_id, const llama_rerot_reader_state & view) override;
     void rerot_clear_reader_view(llama_seq_id seq_id) override;
+
+    bool rerot_capture_hand_seed(llama_seq_id source_seq, std::vector<uint8_t> & seed_out) override;
+    bool rerot_apply_hand_seed(llama_seq_id dest_seq, const std::vector<uint8_t> & seed_in) override;
+    bool rerot_commit_rbb_frontier(
+            uint32_t person_id,
+            const llama_seq_id * candidate_seqs,
+            const uint8_t * is_public_write,
+            size_t n_candidates) override;
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;

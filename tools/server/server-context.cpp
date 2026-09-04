@@ -1236,6 +1236,7 @@ private:
         int64_t parallel_started_us = 0;
         uint64_t parallel_elapsed_us = 0;
         bool parallel_finished = false;
+        common_grammar saved_user_grammar;
 
         explicit rerot_transport_state(server_task && task)
             : response_task(std::move(task)) {
@@ -1244,12 +1245,30 @@ private:
 
     std::unordered_map<uint64_t, std::unique_ptr<rerot_transport_state>> rerot_transport;
 
-    bool rerot_active() const {
-        return rerot != nullptr && rerot_episode_id != 0 && rerot->episode(rerot_episode_id) != nullptr;
+    bool rerot_active(uint64_t episode_id = 0) const {
+        if (!rerot) {
+            return false;
+        }
+        if (episode_id != 0) {
+            return rerot->episode(episode_id) != nullptr;
+        }
+        return !rerot_transport.empty() || (rerot_episode_id != 0 && rerot->episode(rerot_episode_id) != nullptr);
     }
 
-    const server_rerot_episode * rerot_active_episode() const {
-        return rerot_active() ? rerot->episode(rerot_episode_id) : nullptr;
+    const server_rerot_episode * rerot_active_episode(uint64_t episode_id = 0) const {
+        if (!rerot) {
+            return nullptr;
+        }
+        if (episode_id != 0) {
+            return rerot->episode(episode_id);
+        }
+        if (rerot_episode_id != 0 && rerot->episode(rerot_episode_id)) {
+            return rerot->episode(rerot_episode_id);
+        }
+        if (!rerot_transport.empty()) {
+            return rerot->episode(rerot_transport.begin()->first);
+        }
+        return nullptr;
     }
 
     size_t rerot_private_batch_size(const server_slot & slot) const {
@@ -1520,8 +1539,7 @@ private:
 
     bool rerot_start_root(server_slot & slot) {
         if (!rerot || !ctx_tgt || !slot.task ||
-            !slot.task->params.rerot_effective(slot.task->type) ||
-            rerot_active()) {
+            !slot.task->params.rerot_effective(slot.task->type)) {
             return false;
         }
 
@@ -1603,6 +1621,7 @@ private:
         transport->prompt_processing_ms = slot.t_prompt_processing;
         transport->triattention_compressed = slot.triattention_compressed;
         transport->started_us = ggml_time_us();
+        transport->saved_user_grammar = slot.task->params.sampling.grammar;
         rerot_transport.emplace(episode_id, std::move(transport));
 
         slot.task = std::make_unique<const server_task>(std::move(root_lane_task));
@@ -1932,7 +1951,7 @@ private:
             return false;
         }
 
-        while (!episode->ready_queue.empty()) {
+        while (!episode->suspended.empty() || !episode->ready_queue.empty()) {
             llama_memory_kv_usage recurrent = {};
             if (llama_memory_get_recurrent_usage(llama_get_memory(ctx_tgt), &recurrent)) {
                 // Already-running Lanes are included in recurrent.used.
@@ -1963,6 +1982,16 @@ private:
             // the execution seq, so clear those refs before recurrent/base
             // prefix state is installed.
             free_slot->prompt_clear();
+
+            if (!episode->suspended.empty()) {
+                const llama_rerot_node_id suspended_id = *episode->suspended.begin();
+                if (!rerot->resume_pen(episode_id, suspended_id, free_slot->id, free_slot->id) ||
+                    !rerot_prepare_child_slot(episode_id, suspended_id, *free_slot)) {
+                    rerot->hard_abort(episode_id, "rerot_state_error: suspended pen resumption failed");
+                    return false;
+                }
+                continue;
+            }
 
             llama_rerot_node_id admitted = LLAMA_REROT_NODE_INVALID;
             if (!rerot->admit_next_child(
@@ -2020,12 +2049,12 @@ private:
             --rerot_metrics.episode_active;
         }
         if (rerot_episode_id == episode_id) {
-            rerot_episode_id = 0;
+            rerot_episode_id = rerot_transport.empty() ? 0 : rerot_transport.begin()->first;
         }
     }
 
     void rerot_start_next_waiting_root() {
-        if (!rerot || rerot_active()) {
+        if (!rerot) {
             return;
         }
         for (auto & waiting : slots) {
@@ -2034,7 +2063,7 @@ private:
                 continue;
             }
             if (rerot_start_root(waiting)) {
-                return;
+                continue;
             }
             send_error(waiting, "failed to start queued RERoT episode", ERROR_TYPE_SERVER);
             waiting.prompt.clear();
@@ -2473,6 +2502,34 @@ private:
             }
         }
 
+        // §B.8.4: Frontier-boundary pen yield for multi-person fairness when B > P
+        if (rerot && rerot_transport.size() > 1) {
+            for (const auto & [other_ep_id, other_transport] : rerot_transport) {
+                if (other_ep_id == episode_id) continue;
+                auto * other_ep = rerot->episode(other_ep_id);
+                if (other_ep && !other_ep->hard_aborted && rerot->has_ready_nodes(other_ep_id) &&
+                    rerot->pens_for_person(other_ep_id).empty()) {
+                    const auto my_pens = rerot->pens_for_person(episode_id);
+                    if (my_pens.size() > 1) {
+                        const rerot_pen_id yield_pen_id = my_pens.back();
+                        if (yield_pen_id >= 0 && (size_t) yield_pen_id < slots.size()) {
+                            auto & yield_slot = slots[yield_pen_id];
+                            if (yield_slot.is_processing() && !yield_slot.rerot_serial_tail &&
+                                yield_slot.rerot_injection == server_rerot_injection_kind::none) {
+                                if (rerot->suspend_pen(yield_pen_id)) {
+                                    rerot_make_slot_idle(yield_slot);
+                                    SLT_INF(yield_slot, "RERoT episode %" PRIu64 " yielded pen %d to episode %" PRIu64 "\n",
+                                        episode_id, yield_pen_id, other_ep_id);
+                                    rerot_admit_ready(other_ep_id);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if (!rerot_admit_ready(episode_id)) {
             return false;
         }
@@ -2616,30 +2673,41 @@ private:
     // runtime takes whole-episode HARD_ABORT (no survivor/answer/tool call)
     // and this hook propagates it to slots. Returns false when aborted.
     bool rerot_frontier_enter() {
-        if (!rerot_active()) {
+        if (!rerot || rerot_transport.empty()) {
             return true;
         }
-        const auto * episode = rerot_active_episode();
-        if (episode && episode->serial_tail) {
-            return true;
+        for (const auto & kv : rerot_transport) {
+            const uint64_t ep_id = kv.first;
+            const auto * episode = rerot->episode(ep_id);
+            if (episode && episode->serial_tail) {
+                continue;
+            }
+            if (episode && !rerot->begin_frontier(ep_id)) {
+                rerot_propagate_hard_abort(ep_id);
+                return false;
+            }
         }
-        if (rerot->begin_frontier(rerot_episode_id)) {
-            return true;
-        }
-        rerot_propagate_hard_abort();
-        return false;
+        return true;
     }
 
     // Topology-barrier refresh trigger (§17): after a frontier commits with a
     // topology change, re-observe stable shared memory via a read-only
     // context refresh (no public token write; recurrent checkpoint/restore
     // handled inside llama_rerot_refresh_barrier when needed).
-    void rerot_on_topology_barrier(bool barrier) {
-        if (!rerot_active() || !barrier || ctx_tgt == nullptr) {
+    void rerot_on_topology_barrier(bool barrier, uint64_t episode_id = 0) {
+        if (!rerot || !barrier || ctx_tgt == nullptr) {
             return;
         }
-        if (!llama_rerot_refresh_barrier(ctx_tgt, rerot_episode_id)) {
-            rerot_propagate_hard_abort();
+        if (episode_id != 0) {
+            if (!llama_rerot_refresh_barrier(ctx_tgt, episode_id)) {
+                rerot_propagate_hard_abort(episode_id);
+            }
+        } else {
+            for (const auto & kv : rerot_transport) {
+                if (!llama_rerot_refresh_barrier(ctx_tgt, kv.first)) {
+                    rerot_propagate_hard_abort(kv.first);
+                }
+            }
         }
     }
 
@@ -2647,17 +2715,54 @@ private:
     // stable shared memory (acquire fence) then retires the parallel
     // scheduler so ordinary tool-call / body decode continues from the fence
     // survivor on the root response stream. Failures propagate as hard abort.
-    void rerot_on_final_fence(llama_rerot_node_id final_node) {
-        if (!rerot_active() || final_node == LLAMA_REROT_NODE_INVALID || ctx_tgt == nullptr) {
+    void rerot_on_final_fence(llama_rerot_node_id final_node, uint64_t episode_id = 0) {
+        if (!rerot || final_node == LLAMA_REROT_NODE_INVALID || ctx_tgt == nullptr) {
             return;
+        }
+        if (episode_id == 0) {
+            if (!rerot_transport.empty()) {
+                episode_id = rerot_transport.begin()->first;
+            } else {
+                return;
+            }
         }
         std::vector<uint32_t> fence_runs;
-        if (!rerot->refresh_final_fence(rerot_episode_id, final_node, &fence_runs)) {
-            rerot_propagate_hard_abort();
+        if (!rerot->refresh_final_fence(episode_id, final_node, &fence_runs)) {
+            rerot_propagate_hard_abort(episode_id);
             return;
         }
-        if (!rerot->complete_serial_tail(rerot_episode_id, final_node)) {
-            rerot_propagate_hard_abort();
+        if (!rerot->complete_serial_tail(episode_id, final_node)) {
+            rerot_propagate_hard_abort(episode_id);
+            return;
+        }
+
+        const auto * lane = rerot->node(episode_id, final_node);
+        std::string freeze_err;
+        if (!rerot->freeze_serial_coordinates(episode_id, final_node, &freeze_err)) {
+            if (lane && lane->physical_slot >= 0 && (size_t) lane->physical_slot < slots.size()) {
+                SLT_WRN(slots[lane->physical_slot],
+                    "RERoT serial coordinate freeze warning: %s\n", freeze_err.c_str());
+            }
+        }
+
+        // Restore stock user/tool grammar for serial continuation (§26, §A.16)
+        auto transport_it = rerot_transport.find(episode_id);
+        if (transport_it != rerot_transport.end() && lane && lane->physical_slot >= 0 &&
+            (size_t) lane->physical_slot < slots.size()) {
+            auto & survivor_slot = slots[lane->physical_slot];
+            if (survivor_slot.task) {
+                auto mut_task = std::make_unique<server_task>(rerot_clone_task(*survivor_slot.task));
+                server_rerot_restore_user_grammar(mut_task->params, transport_it->second->saved_user_grammar);
+                try {
+                    survivor_slot.smpl.reset(common_sampler_init(
+                        model_tgt,
+                        mut_task->params.sampling,
+                        (int32_t) llama_n_ctx(ctx_tgt)));
+                } catch (const std::exception &) {
+                    // Fallback to existing sampler if re-init fails
+                }
+                survivor_slot.task = std::move(mut_task);
+            }
         }
     }
 
@@ -2665,55 +2770,72 @@ private:
     // release every internal Lane and every parked/archive reference. Lane
     // clones share the root task id, so emitting once per slot would violate
     // the single-termination response contract.
-    void rerot_propagate_hard_abort() {
-        if (!rerot || rerot_episode_id == 0 || !rerot->episode(rerot_episode_id)) {
+    void rerot_propagate_hard_abort(uint64_t target_episode_id = 0) {
+        if (!rerot) {
             return;
         }
-        const uint64_t episode_id = rerot_episode_id;
-        ++rerot_metrics.hard_aborts;
-        const server_rerot_episode * ep = rerot->episode(episode_id);
-        const std::string reason = (ep && !ep->abort_reason.empty())
-            ? ep->abort_reason : "rerot_resource_exhausted";
-        rerot->hard_abort(episode_id, reason);
-
-        const server_task * response_task = nullptr;
-        const auto transport_it = rerot_transport.find(episode_id);
-        if (transport_it != rerot_transport.end() && transport_it->second) {
-            response_task = &transport_it->second->response_task;
-        }
-
-        server_slot * response_slot = nullptr;
-        for (auto & slot : slots) {
-            if (slot.rerot_internal && slot.rerot_episode_id == episode_id && slot.is_processing()) {
-                if (!response_slot) {
-                    response_slot = &slot;
+        std::vector<uint64_t> to_abort;
+        if (target_episode_id != 0) {
+            if (rerot->episode(target_episode_id)) {
+                to_abort.push_back(target_episode_id);
+            }
+        } else {
+            for (const auto & kv : rerot_transport) {
+                const auto * ep = rerot->episode(kv.first);
+                if (ep && ep->hard_aborted) {
+                    to_abort.push_back(kv.first);
                 }
             }
-        }
-        if (response_slot) {
-            send_error(*response_slot, "RERoT episode hard-aborted: " + reason, ERROR_TYPE_SERVER);
-        } else if (response_task) {
-            // Fork publication may have already released the last physical
-            // Lane before child admission discovers recurrent exhaustion.
-            // The transport owns the original response task until episode
-            // teardown, so it remains the authoritative HTTP/SSE endpoint.
-            send_error(*response_task, "RERoT episode hard-aborted: " + reason, ERROR_TYPE_SERVER);
-        }
-
-        for (auto & slot : slots) {
-            if (slot.rerot_internal && slot.rerot_episode_id == episode_id && slot.is_processing()) {
-                slot.prompt.clear();
-                slot.release();
+            if (to_abort.empty() && rerot_episode_id != 0 && rerot->episode(rerot_episode_id)) {
+                to_abort.push_back(rerot_episode_id);
             }
         }
-        rerot_erase_episode(episode_id);
-        rerot_start_next_waiting_root();
+        for (uint64_t episode_id : to_abort) {
+            ++rerot_metrics.hard_aborts;
+            const server_rerot_episode * ep = rerot->episode(episode_id);
+            const std::string reason = (ep && !ep->abort_reason.empty())
+                ? ep->abort_reason : "rerot_resource_exhausted";
+            rerot->hard_abort(episode_id, reason);
+
+            const server_task * response_task = nullptr;
+            const auto transport_it = rerot_transport.find(episode_id);
+            if (transport_it != rerot_transport.end() && transport_it->second) {
+                response_task = &transport_it->second->response_task;
+            }
+
+            server_slot * response_slot = nullptr;
+            for (auto & slot : slots) {
+                if (slot.rerot_internal && slot.rerot_episode_id == episode_id && slot.is_processing()) {
+                    if (!response_slot) {
+                        response_slot = &slot;
+                    }
+                }
+            }
+            if (response_slot) {
+                send_error(*response_slot, "RERoT episode hard-aborted: " + reason, ERROR_TYPE_SERVER);
+            } else if (response_task) {
+                // Fork publication may have already released the last physical
+                // Lane before child admission discovers recurrent exhaustion.
+                // The transport owns the original response task until episode
+                // teardown, so it remains the authoritative HTTP/SSE endpoint.
+                send_error(*response_task, "RERoT episode hard-aborted: " + reason, ERROR_TYPE_SERVER);
+            }
+
+            for (auto & slot : slots) {
+                if (slot.rerot_internal && slot.rerot_episode_id == episode_id && slot.is_processing()) {
+                    slot.prompt.clear();
+                    slot.release();
+                }
+            }
+            rerot_erase_episode(episode_id);
+            rerot_start_next_waiting_root();
+        }
     }
 
     // Episode-aware slot test (§A.11): a physical slot currently borrowed by
-    // the active episode must never be preempted/demoted/shifted alone.
+    // an episode must never be preempted/demoted/shifted alone.
     bool rerot_owns_slot(int id_slot) const {
-        if (!rerot_active()) {
+        if (!rerot) {
             return false;
         }
         return rerot->episode_for_slot(id_slot) != nullptr;
@@ -2763,7 +2885,12 @@ private:
         // context, then drop the runtime (which releases parked/archive
         // lineage). OFF: both branches no-op.
         if (rerot_active() && ctx_tgt != nullptr) {
-            llama_rerot_episode_end(ctx_tgt, rerot_episode_id);
+            for (const auto & kv : rerot_transport) {
+                llama_rerot_episode_end(ctx_tgt, kv.first);
+            }
+            if (rerot_episode_id != 0) {
+                llama_rerot_episode_end(ctx_tgt, rerot_episode_id);
+            }
         }
         rerot.reset();
         rerot_episode_id = 0;
@@ -3193,9 +3320,13 @@ private:
             rerot = std::make_unique<server_rerot_runtime>(
                 mem, params_base.rerot_frontier,
                 (uint32_t) std::max(0, params_base.n_parallel), (uint32_t) LLAMA_MAX_SEQ);
+            const uint32_t pen_cap = params_base.rerot_pen_max > 0
+                ? params_base.rerot_pen_max
+                : (params_base.n_parallel > 0 ? (uint32_t) params_base.n_parallel : (uint32_t) slots.size());
+            rerot->set_pen_capacity(pen_cap);
             rerot_episode_id = 0;
-            SRV_INF("RERoT runtime armed (frontier=%s)\n",
-                llama_rerot_frontier_mode_name(params_base.rerot_frontier));
+            SRV_INF("RERoT runtime armed (frontier=%s, pen_capacity=%u)\n",
+                llama_rerot_frontier_mode_name(params_base.rerot_frontier), pen_cap);
         } else {
             rerot.reset();
             rerot_episode_id = 0;
@@ -3893,20 +4024,17 @@ private:
 
             bool tri_maintenance_due = false;
             if (params_base.triattention_enabled && !kv_pressure) {
-                const auto * maintenance_episode = rerot_active_episode();
-                const auto maintenance_transport_it = maintenance_episode
-                    ? rerot_transport.find(maintenance_episode->id)
-                    : rerot_transport.end();
-                if (maintenance_episode &&
-                    maintenance_transport_it != rerot_transport.end() &&
-                    maintenance_transport_it->second->triattention_compressed) {
-                    const uint64_t synced =
-                        maintenance_transport_it->second->triattention_synced_public_tokens;
-                    const uint64_t current =
-                        maintenance_episode->generated_public_tokens;
+                // Multi-person Tri maintenance check (§§B.9.3, B.13 Phase 7)
+                for (const auto & kv : rerot_transport) {
+                    const auto * ep = rerot ? rerot->episode(kv.first) : nullptr;
+                    if (!ep || !kv.second || !kv.second->triattention_compressed) {
+                        continue;
+                    }
+                    const uint64_t synced = kv.second->triattention_synced_public_tokens;
+                    const uint64_t current = ep->generated_public_tokens;
                     if (current > synced) {
                         const uint64_t base = static_cast<uint64_t>(
-                            std::max<llama_pos>(0, maintenance_episode->base_prefix_end));
+                            std::max<llama_pos>(0, ep->base_prefix_end));
                         const uint64_t old_target = std::max<uint64_t>(
                             128,
                             static_cast<uint64_t>(std::ceil(
@@ -3916,8 +4044,10 @@ private:
                             static_cast<uint64_t>(std::ceil(
                                 double(base + current) * params_base.triattention_ratio)));
                         const uint64_t target_growth = new_target - old_target;
-                        tri_maintenance_due =
-                            current - synced > target_growth + 128;
+                        if (current - synced > target_growth + 128) {
+                            tri_maintenance_due = true;
+                            break;
+                        }
                     }
                 }
                 for (const auto & slot : slots) {
@@ -3946,20 +4076,43 @@ private:
                 // Initial pressure drains every resident sequence. Maintenance only
                 // touches sequences that have already entered compressed mode.
                 std::vector<llama_memory_kv_reclaim_seq_hint> seq_hints;
-                std::vector<llama_seq_id> rerot_semantic_seq_ids;
-                const auto * rerot_episode = rerot_active_episode();
-                if (rerot_episode && !rerot->sync_public_archive(
-                        rerot_episode->id, &rerot_semantic_seq_ids)) {
-                    rerot->hard_abort(
-                        rerot_episode->id,
-                        "rerot_state_error: failed to synchronize PUBLIC archive before TriAttention reclaim");
-                    rerot_propagate_hard_abort();
-                    return false;
+
+                // Sync public archive and build hints for every active person/episode (§B.9.3)
+                for (const auto & kv : rerot_transport) {
+                    const auto * ep = rerot ? rerot->episode(kv.first) : nullptr;
+                    if (!ep || !kv.second) {
+                        continue;
+                    }
+                    std::vector<llama_seq_id> rerot_semantic_seq_ids;
+                    if (!rerot->sync_public_archive(ep->id, &rerot_semantic_seq_ids)) {
+                        rerot->hard_abort(
+                            ep->id,
+                            "rerot_state_error: failed to synchronize PUBLIC archive before TriAttention reclaim");
+                        rerot_propagate_hard_abort(ep->id);
+                        return false;
+                    }
+                    if (ep->archive_seq >= 0 &&
+                        (kv_pressure || kv.second->triattention_compressed) &&
+                        llama_memory_seq_get_kv_used(mem_tgt, ep->archive_seq) > 0) {
+                        const uint64_t logical_u64 =
+                            uint64_t(std::max<llama_pos>(0, ep->base_prefix_end)) +
+                            ep->generated_public_tokens;
+                        llama_memory_kv_reclaim_seq_hint hint;
+                        hint.seq_id = ep->archive_seq;
+                        hint.logical_tokens = static_cast<uint32_t>(
+                            std::min<uint64_t>(UINT32_MAX, logical_u64));
+                        hint.tail_guard = 128;
+                        hint.eligible = true;
+                        hint.semantic_episode_id = ep->id;
+                        hint.semantic_seq_ids = std::move(rerot_semantic_seq_ids);
+                        seq_hints.push_back(std::move(hint));
+                    }
                 }
+
+                // Add non-internal slot hints
                 for (auto & slot : slots) {
                     if (slot.prompt.n_tokens() == 0 ||
-                        (rerot_episode && slot.rerot_internal &&
-                         slot.rerot_episode_id == rerot_episode->id) ||
+                        slot.rerot_internal ||
                         (!kv_pressure && !slot.triattention_compressed)) {
                         continue;
                     }
@@ -3969,27 +4122,6 @@ private:
                     hint.tail_guard = 128; // recent window
                     hint.eligible = true;
                     seq_hints.push_back(hint);
-                }
-                const auto * active_episode = rerot_active_episode();
-                const auto transport_it = active_episode
-                    ? rerot_transport.find(active_episode->id)
-                    : rerot_transport.end();
-                if (active_episode && active_episode->archive_seq >= 0 &&
-                    transport_it != rerot_transport.end() &&
-                    (kv_pressure || transport_it->second->triattention_compressed) &&
-                    llama_memory_seq_get_kv_used(mem_tgt, active_episode->archive_seq) > 0) {
-                    const uint64_t logical_u64 =
-                        uint64_t(std::max<llama_pos>(0, active_episode->base_prefix_end)) +
-                        active_episode->generated_public_tokens;
-                    llama_memory_kv_reclaim_seq_hint hint;
-                    hint.seq_id = active_episode->archive_seq;
-                    hint.logical_tokens = static_cast<uint32_t>(
-                        std::min<uint64_t>(UINT32_MAX, logical_u64));
-                    hint.tail_guard = 128;
-                    hint.eligible = true;
-                    hint.semantic_episode_id = active_episode->id;
-                    hint.semantic_seq_ids = rerot_semantic_seq_ids;
-                    seq_hints.push_back(std::move(hint));
                 }
 
                 llama_memory_kv_reclaim_request req;
@@ -4020,12 +4152,10 @@ private:
                     tri_score_us_total    += result_tgt.score_us;
                     tri_pack_us_total     += result_tgt.pack_us;
 
-                    if (rerot_episode) {
-                        const auto sync_transport_it =
-                            rerot_transport.find(rerot_episode->id);
-                        if (sync_transport_it != rerot_transport.end()) {
-                            sync_transport_it->second->triattention_synced_public_tokens =
-                                rerot_episode->generated_public_tokens;
+                    for (const auto & kv : rerot_transport) {
+                        const auto * ep = rerot ? rerot->episode(kv.first) : nullptr;
+                        if (ep && kv.second) {
+                            kv.second->triattention_synced_public_tokens = ep->generated_public_tokens;
                         }
                     }
 
@@ -4045,24 +4175,22 @@ private:
                                 slot.triattention_compressed = true;
                             }
                         }
-                        const auto * active_episode = rerot_active_episode();
-                        const auto transport_it = active_episode
-                            ? rerot_transport.find(active_episode->id)
-                            : rerot_transport.end();
-                        if (active_episode && transport_it != rerot_transport.end()) {
-                            for (const auto & slot : slots) {
-                                if (slot.rerot_internal &&
-                                    slot.rerot_episode_id == active_episode->id &&
-                                    slot.triattention_compressed) {
-                                    transport_it->second->triattention_compressed = true;
-                                    break;
+                        for (const auto & kv : rerot_transport) {
+                            const auto * ep = rerot ? rerot->episode(kv.first) : nullptr;
+                            if (ep && kv.second) {
+                                for (const auto & slot : slots) {
+                                    if (slot.rerot_internal &&
+                                        slot.rerot_episode_id == ep->id &&
+                                        slot.triattention_compressed) {
+                                        kv.second->triattention_compressed = true;
+                                        break;
+                                    }
+                                }
+                                if (ep->archive_seq >= 0 &&
+                                    llama_memory_seq_get_kv_used(mem_tgt, ep->archive_seq) > 0) {
+                                    kv.second->triattention_compressed = true;
                                 }
                             }
-                        }
-                        if (active_episode && active_episode->archive_seq >= 0 &&
-                            transport_it != rerot_transport.end() &&
-                            llama_memory_seq_get_kv_used(mem_tgt, active_episode->archive_seq) > 0) {
-                            transport_it->second->triattention_compressed = true;
                         }
                     }
 
@@ -5105,7 +5233,62 @@ private:
                     res->tri_target_references  = tri_target_references;
                     res->tri_hard_keep          = tri_hard_keep;
                     res->tri_shared_keep        = tri_shared_keep;
-                    res->rerot                  = rerot_metrics;
+
+                    if (rerot) {
+                        const uint32_t people_cap = params_base.rerot_person_max > 0
+                            ? params_base.rerot_person_max
+                            : (params_base.n_parallel > 0 ? (uint32_t) params_base.n_parallel : (uint32_t) slots.size());
+                        rerot_metrics.people_capacity = people_cap;
+                        rerot_metrics.people_resident = rerot_transport.size();
+                        uint64_t runnable_people = 0;
+                        uint64_t waiting_people = 0;
+                        for (const auto & [ep_id, ep_trans] : rerot_transport) {
+                            const auto * episode = rerot->episode(ep_id);
+                            if (episode && (!episode->running.empty() || !episode->ready_queue.empty() || !episode->suspended.empty())) {
+                                ++runnable_people;
+                            }
+                        }
+                        for (const auto & waiting : slots) {
+                            if (waiting.state == SLOT_STATE_DONE_PROMPT && waiting.task &&
+                                waiting.task->params.rerot_effective(waiting.task->type)) {
+                                ++waiting_people;
+                            }
+                        }
+                        rerot_metrics.people_runnable = runnable_people;
+                        rerot_metrics.people_waiting = waiting_people;
+
+                        rerot_metrics.pens_capacity = rerot->pen_capacity();
+                        rerot_metrics.pens_allocated = rerot->pens_allocated();
+                        rerot_metrics.pens_running = rerot->pens_running();
+                        rerot_metrics.pens_suspended = rerot->pens_suspended();
+                        uint64_t total_queue = 0;
+                        uint64_t max_pens_person = 0;
+                        for (const auto & [ep_id, ep] : rerot_transport) {
+                            const auto * episode = rerot->episode(ep_id);
+                            if (episode) {
+                                total_queue += episode->ready_queue.size();
+                            }
+                            const auto p_count = rerot->pens_for_person(ep_id).size();
+                            if (p_count > max_pens_person) {
+                                max_pens_person = p_count;
+                            }
+                        }
+                        rerot_metrics.pen_queue_depth = total_queue;
+                        rerot_metrics.pens_per_person_max_observed = std::max(rerot_metrics.pens_per_person_max_observed, max_pens_person);
+                        if (rerot_metrics.pens_capacity > 0) {
+                            rerot_metrics.pen_utilization = (double) rerot_metrics.pens_allocated / (double) rerot_metrics.pens_capacity;
+                        }
+
+                        // Recurrent brain and hand byte estimates (§§B.1.4, B.14)
+                        if (ctx_tgt) {
+                            const uint32_t b_resident = std::max<uint32_t>(1, (uint32_t) rerot_metrics.people_resident);
+                            const uint32_t p_alloc = std::max<uint32_t>(1, (uint32_t) rerot_metrics.pens_allocated);
+                            rerot_metrics.brain_bytes = (uint64_t) b_resident * 54ULL * 1024ULL * 1024ULL;
+                            rerot_metrics.hand_bytes = (uint64_t) p_alloc * 6ULL * 1024ULL * 1024ULL;
+                            rerot_metrics.grouped_scratch_bytes = (uint64_t) p_alloc * 2ULL * 1024ULL * 1024ULL;
+                        }
+                    }
+                    res->rerot = rerot_metrics;
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -5301,7 +5484,7 @@ private:
                     rerot->hard_abort(
                         slot.rerot_episode_id,
                         std::string("rerot_backend_error: ") + e.what());
-                    rerot_propagate_hard_abort();
+                    rerot_propagate_hard_abort(slot.rerot_episode_id);
                 } else {
                     send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
                     slot.release();
@@ -5321,7 +5504,7 @@ private:
                     rerot->hard_abort(
                         slot->rerot_episode_id,
                         std::string("rerot_backend_error: ") + e.what());
-                    rerot_propagate_hard_abort();
+                    rerot_propagate_hard_abort(slot->rerot_episode_id);
                 } else {
                     send_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
                     slot->release();
@@ -5546,16 +5729,26 @@ private:
         // takes the acquire fence + serial-tail transition even if the loop
         // lands in a later slice.
         if (rerot_active()) {
-            if (const server_rerot_episode * ep = rerot_active_episode()) {
-                if (ep->topology_barrier_pending && !ep->hard_aborted && !ep->serial_tail) {
-                    rerot_on_topology_barrier(true);
+            std::vector<uint64_t> active_eps;
+            if (!rerot_transport.empty()) {
+                for (const auto & kv : rerot_transport) {
+                    active_eps.push_back(kv.first);
                 }
-                if (ep->finalizing && !ep->hard_aborted && !ep->serial_tail &&
-                    ep->ready_queue.empty() && ep->starting.empty() && ep->running.size() == 1) {
-                    rerot_on_final_fence(*ep->running.begin());
-                }
-                if (ep->hard_aborted) {
-                    rerot_propagate_hard_abort();
+            } else if (rerot_episode_id != 0) {
+                active_eps.push_back(rerot_episode_id);
+            }
+            for (uint64_t ep_id : active_eps) {
+                if (const server_rerot_episode * ep = rerot->episode(ep_id)) {
+                    if (ep->topology_barrier_pending && !ep->hard_aborted && !ep->serial_tail) {
+                        rerot_on_topology_barrier(true, ep_id);
+                    }
+                    if (ep->finalizing && !ep->hard_aborted && !ep->serial_tail &&
+                        ep->ready_queue.empty() && ep->starting.empty() && ep->running.size() == 1) {
+                        rerot_on_final_fence(*ep->running.begin(), ep_id);
+                    }
+                    if (ep->hard_aborted) {
+                        rerot_propagate_hard_abort(ep_id);
+                    }
                 }
             }
         }
@@ -5590,16 +5783,38 @@ private:
                     return;
                 }
 
-                // RERoT v1 refusal (§§25,A.9): no linear seq_rm/seq_add shift
-                // on an active episode Lane. Shared history needs episode-aware
+                // RERoT semantic context shift (§25.2, §A.9): no linear seq_rm/seq_add shift
+                // on an active episode Lane. Shared history uses episode-aware
                 // semantic truncation (oldest PUBLIC region dropped for all
                 // readers + run-table repack + layout/publish bump + MTP
                 // invalidation, recurrent state never rewritten). OFF: false.
                 if (rerot_owns_slot(slot.id)) {
+                    server_rerot_shift_result shift_res;
+                    std::string shift_err;
+                    const int n_left = slot.prompt.n_tokens() - 4;
+                    const int n_discard = slot.task->params.n_discard ? slot.task->params.n_discard : std::max(1, n_left / 2);
+                    if (rerot->context_shift(slot.rerot_episode_id, (uint64_t) n_discard, &shift_res, &shift_err)) {
+                        if (shift_res.tokens_removed > 0) {
+                            if (ctx_tgt) {
+                                llama_rerot_context_apply_shift(
+                                    ctx_tgt,
+                                    slot.rerot_episode_id,
+                                    shift_res.tokens_removed,
+                                    shift_res.new_layout_epoch,
+                                    shift_res.new_publish_epoch);
+                            }
+                            ++rerot_metrics.context_shifts;
+                            SLT_INF(slot, "RERoT episode %" PRIu64 " context shifted: removed %" PRIu64 " tokens, %u runs truncated\n",
+                                slot.rerot_episode_id, shift_res.tokens_removed, shift_res.runs_truncated);
+                            rerot_on_topology_barrier(true, slot.rerot_episode_id);
+                            return;
+                        }
+                    }
+                    // If no unpinned public tokens could be removed, then context is genuinely exhausted.
                     rerot->hard_abort(
                         slot.rerot_episode_id,
-                        "rerot_resource_exhausted: active episode reached context-shift boundary");
-                    rerot_propagate_hard_abort();
+                        "rerot_resource_exhausted: active episode reached context-shift boundary with no unpinned public tokens");
+                    rerot_propagate_hard_abort(slot.rerot_episode_id);
                     return;
                 }
 
@@ -6440,7 +6655,16 @@ private:
                 const std::string reason = ret == 1
                     ? "rerot_resource_exhausted: memory cannot commit the complete frontier"
                     : "rerot_backend_error: complete frontier decode failed";
-                rerot->hard_abort(rerot_episode_id, reason);
+                std::vector<uint64_t> active_to_abort;
+                for (const auto & kv : rerot_transport) {
+                    active_to_abort.push_back(kv.first);
+                }
+                if (active_to_abort.empty() && rerot_episode_id != 0) {
+                    active_to_abort.push_back(rerot_episode_id);
+                }
+                for (uint64_t ep_id : active_to_abort) {
+                    rerot->hard_abort(ep_id, reason);
+                }
                 rerot_propagate_hard_abort();
                 throw std::runtime_error(reason);
             }
@@ -7577,6 +7801,27 @@ void server_routes::init_routes() {
             emit_rerot("counter", "rerot_parked_total", "RERoT recurrent lineages parked.", r.parked_total);
             emit_rerot("counter", "rerot_archive_total", "RERoT public runs archived.", r.archive_total);
             emit_rerot("counter", "rerot_ddvr_seconds", "Wall time spent building RERoT DDVR views.", r.ddvr_seconds);
+
+            emit_rerot("gauge", "rerot_people_capacity", "Maximum concurrent people / independent brains (B).", r.people_capacity);
+            emit_rerot("gauge", "rerot_people_resident", "Currently resident people / independent brains.", r.people_resident);
+            emit_rerot("gauge", "rerot_people_runnable", "Currently runnable people / independent brains.", r.people_runnable);
+            emit_rerot("gauge", "rerot_people_waiting", "Currently waiting people in admission queue.", r.people_waiting);
+
+            emit_rerot("gauge", "rerot_pens_capacity", "Total execution pens / decode rows (P).", r.pens_capacity);
+            emit_rerot("gauge", "rerot_pens_allocated", "Currently allocated pens.", r.pens_allocated);
+            emit_rerot("gauge", "rerot_pens_running", "Currently running pens.", r.pens_running);
+            emit_rerot("gauge", "rerot_pens_suspended", "Currently suspended pens awaiting resume.", r.pens_suspended);
+            emit_rerot("gauge", "rerot_pen_queue_depth", "Current queue depth of unadmitted children awaiting pens.", r.pen_queue_depth);
+            emit_rerot("gauge", "rerot_pens_per_person_max_observed", "Maximum pens observed allocated to a single person.", r.pens_per_person_max_observed);
+            emit_rerot("gauge", "rerot_pen_utilization", "Fraction of pen capacity currently allocated.", r.pen_utilization);
+
+            emit_rerot("gauge", "rerot_batch_people", "People present in last decoded batch.", r.batch_people);
+            emit_rerot("gauge", "rerot_batch_pens", "Pens / rows present in last decoded batch.", r.batch_pens);
+            emit_rerot("counter", "rerot_frontier_rows", "Cumulative frontier rows decoded across all pens.", r.frontier_rows);
+
+            emit_rerot("gauge", "rerot_brain_bytes", "Estimated recurrent brain memory in bytes.", r.brain_bytes);
+            emit_rerot("gauge", "rerot_hand_bytes", "Estimated recurrent hand memory in bytes.", r.hand_bytes);
+            emit_rerot("gauge", "rerot_grouped_scratch_bytes", "Estimated grouped multi-reader / RBB scratch in bytes.", r.grouped_scratch_bytes);
         }
 
         // Labeled fallback counter is emitted separately because the compact

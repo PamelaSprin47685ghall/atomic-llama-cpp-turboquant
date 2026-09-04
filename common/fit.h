@@ -43,6 +43,25 @@ common_params_fit_status common_fit_recurrent_cache(
         const llama_context_params * extra_cparams,
                      ggml_log_level   log_level);
 
+struct common_rerot_fit_result {
+    common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_FAILURE;
+    uint32_t b_people = 0;
+    uint32_t p_pens = 0;
+    uint32_t k_tokens = 0;
+    uint32_t k_min = 0;
+    int64_t  min_device_margin = 0;
+};
+
+// VRAM-only Three-Capacity Auto-Fit for RERoT (§§B.0, B.10, B.13 Phase 8):
+// Jointly selects people B, pens P, and maximum feasible aligned KV capacity K without user capacity knobs.
+common_rerot_fit_result common_fit_rerot_capacities(
+                         const char * path_model,
+           const llama_model_params * mparams,
+               llama_context_params * cparams,
+        const std::vector<std::pair<ggml_backend_dev_t, size_t>> & reserve,
+        const llama_context_params * extra_cparams,
+                     ggml_log_level   log_level);
+
 // print estimated memory to stdout
 void common_fit_print(
                          const char * path_model,

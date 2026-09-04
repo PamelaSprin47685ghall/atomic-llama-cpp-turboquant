@@ -174,7 +174,10 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--warmup, --no-warmup` | whether to perform warmup with an empty run (default: enabled) |
 | `--spm-infill` | use Suffix/Prefix/Middle pattern for infill (instead of Prefix/Suffix/Middle) as some models prefer this. (default: disabled) |
 | `--pooling {none,mean,cls,last,rank}` | pooling type for embeddings, use model default if unspecified<br/>(env: LLAMA_ARG_POOLING) |
-| `-np, --parallel N` | number of server slots (default: -1, -1 = auto)<br/>(env: LLAMA_ARG_N_PARALLEL) |
+| `-np, --parallel N` | number of server slots (default: -1, -1 = auto)<br/>(env: LLAMA_ARG_N_PARALLEL)<br/>*Note*: In RERoT full-auto mode (`--rerot --total-kv auto`), omit `-np` as people B and pens P are derived automatically; explicit `-np` triggers a fail-fast error. |
+| `--rerot` | enable Recursive Elastic Ring-of-Thought (RERoT) shared-memory concurrent reasoning (requires `--kv-unified`)<br/>(env: LLAMA_ARG_REROT) |
+| `--rerot-frontier {strong,lag1}` | RERoT frontier visibility timing (default: strong; implies `--rerot`)<br/>(env: LLAMA_ARG_REROT_FRONTIER) |
+| `--rerot-trace` | emit optional RERoT lane-trace SSE events (`rerot.trace.*`); streaming stays a single response with one finish event + `[DONE]` (implies `--rerot`)<br/>(env: LLAMA_ARG_REROT_TRACE) |
 | `-cb, --cont-batching, -nocb, --no-cont-batching` | whether to enable continuous batching (a.k.a dynamic batching) (default: enabled)<br/>(env: LLAMA_ARG_CONT_BATCHING) |
 | `-mm, --mmproj FILE` | path to a multimodal projector file. see tools/mtmd/README.md<br/>note: if -hf is used, this argument can be omitted<br/>(env: LLAMA_ARG_MMPROJ) |
 | `-mmu, --mmproj-url URL` | URL to a multimodal projector file. see tools/mtmd/README.md<br/>(env: LLAMA_ARG_MMPROJ_URL) |

@@ -45,6 +45,12 @@ struct llama_context {
             const llama_model & model,
                   llama_context_params params);
 
+    // Lightweight constructor for control-plane and unit tests (skips sched_reserve) (§B.13 Phase 2)
+    llama_context(
+            const llama_model & model,
+            const llama_cparams & cparams,
+            bool /* test_only */);
+
     ~llama_context();
 
     // reserve a new backend scheduler (if needed)

@@ -625,6 +625,9 @@ server_rerot_runtime::server_rerot_runtime(
     for (uint32_t seq = first_internal_seq_; seq < max_seq_; ++seq) {
         free_internal_seqs_.push_back(static_cast<llama_seq_id>(seq));
     }
+    if (first_internal_seq_ > 0) {
+        set_pen_capacity(first_internal_seq_);
+    }
 }
 
 uint64_t server_rerot_runtime::adopt_root(
@@ -665,14 +668,276 @@ uint64_t server_rerot_runtime::adopt_root(
 
     server_rerot_node_runtime root;
     root.id = current.document.root();
+    root.pen_id = physical_slot;
     root.physical_slot = physical_slot;
     root.exec_seq = exec_seq;
     root.storage_pos_next = storage_pos_next;
     current.nodes.push_back(std::move(root));
     current.running.insert(current.document.root());
 
+    if (physical_slot >= 0 && (size_t) physical_slot < pens_.size()) {
+        pens_[physical_slot].state = server_pen_state::running;
+        pens_[physical_slot].person = episode_id;
+        pens_[physical_slot].episode_id = episode_id;
+        pens_[physical_slot].node_id = current.document.root();
+        pens_[physical_slot].exec_seq = exec_seq;
+    }
+
     slot_to_episode_[physical_slot] = episode_id;
     return episode_id;
+}
+
+void server_rerot_runtime::set_pen_capacity(uint32_t total_pens) {
+    pens_.clear();
+    pens_.resize(total_pens);
+    for (uint32_t i = 0; i < total_pens; ++i) {
+        pens_[i].id = static_cast<rerot_pen_id>(i);
+        pens_[i].state = server_pen_state::free;
+        pens_[i].exec_seq = first_internal_seq_ + i < max_seq_ ? first_internal_seq_ + i : i;
+    }
+}
+
+uint32_t server_rerot_runtime::pen_capacity() const {
+    return static_cast<uint32_t>(pens_.size());
+}
+
+uint32_t server_rerot_runtime::pens_allocated() const {
+    uint32_t count = 0;
+    for (const auto & p : pens_) {
+        if (p.state != server_pen_state::free) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+uint32_t server_rerot_runtime::pens_running() const {
+    uint32_t count = 0;
+    for (const auto & p : pens_) {
+        if (p.state == server_pen_state::running) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+const server_pen * server_rerot_runtime::pen(rerot_pen_id id) const {
+    if (id >= 0 && (size_t) id < pens_.size()) {
+        return &pens_[id];
+    }
+    return nullptr;
+}
+
+server_pen * server_rerot_runtime::pen(rerot_pen_id id) {
+    if (id >= 0 && (size_t) id < pens_.size()) {
+        return &pens_[id];
+    }
+    return nullptr;
+}
+
+std::vector<rerot_pen_id> server_rerot_runtime::pens_for_person(rerot_person_id person) const {
+    std::vector<rerot_pen_id> result;
+    for (const auto & p : pens_) {
+        if (p.state != server_pen_state::free && p.person == person) {
+            result.push_back(p.id);
+        }
+    }
+    return result;
+}
+
+std::optional<rerot_pen_id> server_rerot_runtime::allocate_pen(
+        rerot_person_id person,
+        uint64_t episode_id,
+        llama_rerot_node_id node_id) {
+    for (auto & p : pens_) {
+        if (p.state == server_pen_state::free) {
+            p.state = server_pen_state::allocated;
+            p.person = person;
+            p.episode_id = episode_id;
+            p.node_id = node_id;
+            return p.id;
+        }
+    }
+    return std::nullopt;
+}
+
+void server_rerot_runtime::free_pen(rerot_pen_id pen_id) {
+    if (pen_id >= 0 && (size_t) pen_id < pens_.size()) {
+        pens_[pen_id].state = server_pen_state::free;
+        pens_[pen_id].person = 0;
+        pens_[pen_id].episode_id = 0;
+        pens_[pen_id].node_id = LLAMA_REROT_NODE_INVALID;
+    }
+}
+
+uint32_t server_rerot_runtime::pens_suspended() const {
+    uint32_t count = 0;
+    for (const auto & [_, ep] : episodes_) {
+        count += ep.suspended.size();
+    }
+    return count;
+}
+
+uint32_t server_rerot_runtime::pen_queue_depth() const {
+    uint32_t count = 0;
+    for (const auto & [_, ep] : episodes_) {
+        count += static_cast<uint32_t>(ep.ready_queue.size());
+    }
+    return count;
+}
+
+bool server_rerot_runtime::suspend_pen(rerot_pen_id pen_id) {
+    if (pen_id < 0 || (size_t) pen_id >= pens_.size()) {
+        return false;
+    }
+    auto & p = pens_[pen_id];
+    if (p.state == server_pen_state::free) {
+        return false;
+    }
+    const uint64_t ep_id = p.episode_id;
+    const llama_rerot_node_id nid = p.node_id;
+    auto * ep = episode(ep_id);
+    auto * n = node(ep_id, nid);
+    if (!ep || !n || ep->hard_aborted) {
+        return false;
+    }
+
+    // Preserve hand/private state + sampler/MTP binding in the node runtime (§B.8.4)
+    ep->running.erase(nid);
+    ep->starting.erase(nid);
+    ep->suspended.insert(nid);
+    ep->document.set_node_state(nid, llama_rerot_node_state::ready_suspended);
+
+    n->pen_id = -1;
+    n->physical_slot = -1;
+    n->exec_seq = -1;
+
+    // Release pen row back to free pool so another person or child can allocate it
+    p.state = server_pen_state::free;
+    p.person = 0;
+    p.episode_id = 0;
+    p.node_id = LLAMA_REROT_NODE_INVALID;
+    slot_to_episode_.erase(pen_id);
+
+    ep->topology_barrier_pending = true;
+    ++ep->topology_epoch;
+    ++ep->layout_epoch;
+    return true;
+}
+
+bool server_rerot_runtime::resume_pen(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id,
+        rerot_pen_id pen_id,
+        llama_seq_id exec_seq) {
+    if (pen_id < 0 || (size_t) pen_id >= pens_.size() || exec_seq < 0) {
+        return false;
+    }
+    auto * ep = episode(episode_id);
+    auto * n = node(episode_id, node_id);
+    if (!ep || !n || ep->hard_aborted || ep->suspended.count(node_id) == 0) {
+        return false;
+    }
+    auto & p = pens_[pen_id];
+    if (p.state != server_pen_state::allocated && p.state != server_pen_state::free) {
+        return false;
+    }
+
+    p.state = server_pen_state::running;
+    p.person = episode_id;
+    p.episode_id = episode_id;
+    p.node_id = node_id;
+    p.exec_seq = exec_seq;
+    slot_to_episode_[pen_id] = episode_id;
+
+    n->pen_id = pen_id;
+    n->physical_slot = pen_id;
+    n->exec_seq = exec_seq;
+
+    ep->suspended.erase(node_id);
+    ep->running.insert(node_id);
+    ep->document.set_node_state(
+        node_id,
+        n->planner_armed ? llama_rerot_node_state::planning : llama_rerot_node_state::terminal_running);
+
+    ep->topology_barrier_pending = true;
+    ++ep->topology_epoch;
+    ++ep->layout_epoch;
+    return true;
+}
+
+size_t server_rerot_runtime::schedule_pens(const std::vector<uint64_t> & ready_people) {
+    if (pens_.empty() || ready_people.empty()) {
+        return 0;
+    }
+    size_t newly_admitted = 0;
+
+    auto try_fill_one = [&](uint64_t person_id, server_rerot_episode * ep) -> bool {
+        if (!ep->suspended.empty()) {
+            const llama_rerot_node_id suspended_nid = *ep->suspended.begin();
+            auto pen_opt = allocate_pen(person_id, person_id, suspended_nid);
+            if (!pen_opt) {
+                return false;
+            }
+            const llama_seq_id seq = pens_[*pen_opt].exec_seq;
+            if (resume_pen(person_id, suspended_nid, *pen_opt, seq)) {
+                ++newly_admitted;
+                return true;
+            }
+            free_pen(*pen_opt);
+            return false;
+        }
+        if (!ep->ready_queue.empty()) {
+            auto pen_opt = allocate_pen(person_id, person_id, ep->ready_queue.front());
+            if (!pen_opt) {
+                return false;
+            }
+            llama_rerot_node_id admitted = LLAMA_REROT_NODE_INVALID;
+            const llama_seq_id seq = pens_[*pen_opt].exec_seq;
+            if (admit_next_child(person_id, *pen_opt, seq, &admitted)) {
+                ++newly_admitted;
+                return true;
+            }
+            free_pen(*pen_opt);
+            return false;
+        }
+        return false;
+    };
+
+    // Pass 1 (§B.8.2): For each runnable person currently having 0 pens (by arrival/age), allocate 1 pen
+    for (uint64_t person_id : ready_people) {
+        auto * ep = episode(person_id);
+        if (!ep || ep->hard_aborted || !has_ready_nodes(person_id)) {
+            continue;
+        }
+        if (!pens_for_person(person_id).empty()) {
+            continue; // already has at least one pen
+        }
+        if (!try_fill_one(person_id, ep)) {
+            if (pens_allocated() >= pens_.size()) {
+                return newly_admitted; // all pens exhausted
+            }
+        }
+    }
+
+    // Pass 2 (§B.8.2): Round-robin across people with ready children until P exhausted or no runnable work
+    bool any_admitted = true;
+    while (any_admitted) {
+        any_admitted = false;
+        for (uint64_t person_id : ready_people) {
+            auto * ep = episode(person_id);
+            if (!ep || ep->hard_aborted || !has_ready_nodes(person_id)) {
+                continue;
+            }
+            if (pens_allocated() >= pens_.size()) {
+                return newly_admitted; // all P pens exhausted
+            }
+            if (try_fill_one(person_id, ep)) {
+                any_admitted = true;
+            }
+        }
+    }
+    return newly_admitted;
 }
 
 void server_rerot_runtime::release_slot(int physical_slot) {
@@ -692,9 +957,17 @@ void server_rerot_runtime::release_slot(int physical_slot) {
             clear_sequence_control(current_node.exec_seq);
             current.running.erase(current_node.id);
             current.starting.erase(current_node.id);
+            current_node.pen_id = -1;
             current_node.physical_slot = -1;
             current_node.exec_seq = -1;
         }
+    }
+
+    if (physical_slot >= 0 && (size_t) physical_slot < pens_.size()) {
+        pens_[physical_slot].state = server_pen_state::free;
+        pens_[physical_slot].person = 0;
+        pens_[physical_slot].episode_id = 0;
+        pens_[physical_slot].node_id = LLAMA_REROT_NODE_INVALID;
     }
 
     slot_to_episode_.erase(slot_it);
@@ -1305,6 +1578,7 @@ bool server_rerot_runtime::commit_token(
         return fail_episode(*current, "failed to extend RERoT logical run");
     }
     current_node->storage_pos_next = plan.storage_pos + 1;
+    current_node->last_write_public = (plan.visibility == llama_rerot_visibility::public_live);
 
     // Episode-level hard-resource accounting (§20). Planner injection,
     // headings, and model tokens all draw from one global budget.
@@ -1485,9 +1759,17 @@ bool server_rerot_runtime::retire_node(
         slot_to_episode_.erase(slot_it);
     }
 
+    if (physical_slot >= 0 && (size_t) physical_slot < pens_.size()) {
+        pens_[physical_slot].state = server_pen_state::free;
+        pens_[physical_slot].person = 0;
+        pens_[physical_slot].episode_id = 0;
+        pens_[physical_slot].node_id = LLAMA_REROT_NODE_INVALID;
+    }
+
     episode.running.erase(node.id);
     episode.starting.erase(node.id);
     node.exit_intent = false;
+    node.pen_id = -1;
     node.physical_slot = -1;
     node.exec_seq = -1;
     if (!episode.document.set_node_state(node.id, llama_rerot_node_state::retired)) {
@@ -1563,6 +1845,15 @@ bool server_rerot_runtime::freeze_fork_parent(
         clear_sequence_control(parent->exec_seq);
     }
 
+    std::vector<uint8_t> parent_seed = parent->hand_seed;
+    if (memory_) {
+        const size_t sz = llama_memory_rerot_capture_hand_seed(memory_, parent->exec_seq, nullptr, 0);
+        if (sz > 0) {
+            parent_seed.resize(sz);
+            llama_memory_rerot_capture_hand_seed(memory_, parent->exec_seq, parent_seed.data(), sz);
+        }
+    }
+
     if (need_archive) {
         current->archive_seq = archive_seq;
     }
@@ -1573,12 +1864,20 @@ bool server_rerot_runtime::freeze_fork_parent(
         }
         child_runtime->parked_seq = child.second;
         child_runtime->storage_pos_next = parent->storage_pos_next;
+        child_runtime->hand_seed = parent_seed;
     }
 
     const int released_slot = parent->physical_slot;
+    parent->pen_id = -1;
     parent->physical_slot = -1;
     parent->exec_seq = -1;
     current->running.erase(parent_id);
+    if (released_slot >= 0 && (size_t) released_slot < pens_.size()) {
+        pens_[released_slot].state = server_pen_state::free;
+        pens_[released_slot].person = 0;
+        pens_[released_slot].episode_id = 0;
+        pens_[released_slot].node_id = LLAMA_REROT_NODE_INVALID;
+    }
     slot_to_episode_.erase(released_slot);
     current->topology_barrier_pending = true;
     ++current->topology_epoch;
@@ -1671,10 +1970,15 @@ bool server_rerot_runtime::admit_next_child(
         if (!llama_memory_seq_rm_recurrent(memory_, child->parked_seq, -1, -1)) {
             return fail_episode(*current, "failed to release parked recurrent sequence after admission");
         }
+
+        if (!child->hand_seed.empty()) {
+            llama_memory_rerot_apply_hand_seed(memory_, exec_seq, child->hand_seed.data(), child->hand_seed.size());
+        }
     }
 
     free_internal_seq(child->parked_seq);
     child->parked_seq = -1;
+    child->pen_id = physical_slot;
     child->physical_slot = physical_slot;
     child->exec_seq = exec_seq;
 
@@ -1682,6 +1986,13 @@ bool server_rerot_runtime::admit_next_child(
     current->starting.insert(child_id);
     if (!current->document.set_node_state(child_id, llama_rerot_node_state::starting)) {
         return fail_episode(*current, "failed to enter RERoT child STARTING state");
+    }
+    if (physical_slot >= 0 && (size_t) physical_slot < pens_.size()) {
+        pens_[physical_slot].state = server_pen_state::allocated;
+        pens_[physical_slot].person = episode_id;
+        pens_[physical_slot].episode_id = episode_id;
+        pens_[physical_slot].node_id = child_id;
+        pens_[physical_slot].exec_seq = exec_seq;
     }
     slot_to_episode_[physical_slot] = episode_id;
     if (admitted_node) {
@@ -1704,6 +2015,9 @@ bool server_rerot_runtime::complete_admission(
 
     current->starting.erase(node_id);
     current->running.insert(node_id);
+    if (child->pen_id >= 0 && (size_t) child->pen_id < pens_.size()) {
+        pens_[child->pen_id].state = server_pen_state::running;
+    }
     if (!current->document.set_node_state(node_id, llama_rerot_node_state::planning)) {
         return fail_episode(*current, "failed to enter RERoT child PLANNING state");
     }
@@ -1740,6 +2054,28 @@ server_rerot_frontier_result server_rerot_runtime::finish_frontier(uint64_t epis
     }
 
     result.completed_frontier = current->frontier;
+
+    // Order-free RBB frontier commit (§14.1, §14.1.2, §B.6):
+    // Collect all candidate running pens for this person and commit their states to the global brain.
+    if (memory_ && !current->running.empty()) {
+        std::vector<llama_seq_id> candidate_seqs;
+        std::vector<uint8_t> is_public_write;
+        candidate_seqs.reserve(current->running.size());
+        is_public_write.reserve(current->running.size());
+        for (const auto nid : current->running) {
+            const auto * n = node(episode_id, nid);
+            if (n && n->exec_seq >= 0) {
+                candidate_seqs.push_back(n->exec_seq);
+                is_public_write.push_back(n->last_write_public ? 1 : 0);
+            }
+        }
+        if (!candidate_seqs.empty()) {
+            llama_memory_rerot_commit_rbb_frontier(
+                memory_, (uint32_t) current->root_task_id,
+                candidate_seqs.data(), is_public_write.data(), candidate_seqs.size());
+        }
+    }
+
     result.forked = std::move(current->forked_this_frontier);
     current->forked_this_frontier.clear();
     std::sort(result.forked.begin(), result.forked.end(), [&](auto lhs, auto rhs) {
@@ -1762,7 +2098,8 @@ server_rerot_frontier_result server_rerot_runtime::finish_frontier(uint64_t epis
     if (!exits.empty() &&
         exits.size() == current->running.size() &&
         current->ready_queue.empty() &&
-        current->starting.empty()) {
+        current->starting.empty() &&
+        current->suspended.empty()) {
         // Same-frontier simultaneous exits are not judged. Stable tree-path
         // order alone chooses the Lane that remains live for the final acquire
         // fence. It must not be retired before Stage 7 refreshes its logits.
@@ -1823,11 +2160,18 @@ bool server_rerot_runtime::detach_node(
     const int physical_slot = current_node->physical_slot;
     const llama_seq_id exec_seq = current_node->exec_seq;
     clear_sequence_control(exec_seq);
+    current_node->pen_id = -1;
     current_node->physical_slot = -1;
     current_node->exec_seq = -1;
     current->running.erase(node_id);
     current->starting.erase(node_id);
     if (physical_slot >= 0) {
+        if ((size_t) physical_slot < pens_.size()) {
+            pens_[physical_slot].state = server_pen_state::free;
+            pens_[physical_slot].person = 0;
+            pens_[physical_slot].episode_id = 0;
+            pens_[physical_slot].node_id = LLAMA_REROT_NODE_INVALID;
+        }
         const auto it = slot_to_episode_.find(physical_slot);
         if (it != slot_to_episode_.end() && it->second == episode_id) {
             slot_to_episode_.erase(it);
@@ -1873,13 +2217,21 @@ bool server_rerot_runtime::erase_episode(uint64_t episode_id) {
             ++slot_it;
         }
     }
+    for (auto & p : pens_) {
+        if (p.episode_id == episode_id || p.person == episode_id) {
+            p.state = server_pen_state::free;
+            p.person = 0;
+            p.episode_id = 0;
+            p.node_id = LLAMA_REROT_NODE_INVALID;
+        }
+    }
     episodes_.erase(it);
     return true;
 }
 
 bool server_rerot_runtime::has_ready_nodes(uint64_t episode_id) const {
     const auto * current = episode(episode_id);
-    return current && !current->ready_queue.empty();
+    return current && (!current->ready_queue.empty() || !current->suspended.empty());
 }
 
 bool server_rerot_runtime::parent_has_unadmitted_children(
@@ -1951,6 +2303,7 @@ bool server_rerot_runtime::fail_episode(server_rerot_episode & episode, std::str
     episode.ready_queue.clear();
     episode.starting.clear();
     episode.running.clear();
+    episode.suspended.clear();
     episode.forked_this_frontier.clear();
     episode.topology_barrier_pending = false;
     for (auto & current_node : episode.nodes) {
@@ -1970,10 +2323,17 @@ bool server_rerot_runtime::fail_episode(server_rerot_episode & episode, std::str
             current_node.parked_seq = -1;
         }
         if (current_node.physical_slot >= 0) {
+            if ((size_t) current_node.physical_slot < pens_.size()) {
+                pens_[current_node.physical_slot].state = server_pen_state::free;
+                pens_[current_node.physical_slot].person = 0;
+                pens_[current_node.physical_slot].episode_id = 0;
+                pens_[current_node.physical_slot].node_id = LLAMA_REROT_NODE_INVALID;
+            }
             const auto slot_it = slot_to_episode_.find(current_node.physical_slot);
             if (slot_it != slot_to_episode_.end() && slot_it->second == episode.id) {
                 slot_to_episode_.erase(slot_it);
             }
+            current_node.pen_id = -1;
             current_node.physical_slot = -1;
         }
     }
@@ -2054,8 +2414,8 @@ bool server_rerot_runtime::refresh_final_fence(
         return false;
     }
     // The natural-final preconditions (§21.2) must still hold on stable shared
-    // memory: nothing queued or starting, exactly this Lane still RUNNING.
-    if (!current->ready_queue.empty() || !current->starting.empty() ||
+    // memory: nothing queued, starting, or suspended, exactly this Lane still RUNNING.
+    if (!current->ready_queue.empty() || !current->starting.empty() || !current->suspended.empty() ||
         current->running.size() != 1 || current->running.count(node_id) != 1 ||
         !survivor->exit_intent || survivor->exec_seq < 0) {
         return fail_episode(*current, "RERoT final fence lost its single-survivor precondition");
@@ -2100,6 +2460,66 @@ bool server_rerot_runtime::complete_serial_tail(uint64_t episode_id, llama_rerot
     }
     current->serial_tail = true;
     current->serial_node = node_id;
+    return true;
+}
+
+bool server_rerot_runtime::validate_serial_tail_state(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id,
+        std::string * error_out) const {
+    const auto * current = episode(episode_id);
+    if (!current) {
+        if (error_out) *error_out = "episode not found";
+        return false;
+    }
+    if (current->hard_aborted) {
+        if (error_out) *error_out = "episode is hard aborted";
+        return false;
+    }
+    if (!current->serial_tail || current->serial_node != node_id) {
+        if (error_out) *error_out = "episode is not in serial tail state for this node";
+        return false;
+    }
+    if (!current->ready_queue.empty() || !current->starting.empty() || !current->suspended.empty()) {
+        if (error_out) *error_out = "serial tail has unadmitted or suspended nodes";
+        return false;
+    }
+    if (current->running.size() != 1 || current->running.count(node_id) != 1) {
+        if (error_out) *error_out = "serial tail must have exactly one survivor running";
+        return false;
+    }
+    const auto * survivor = node(episode_id, node_id);
+    if (!survivor || survivor->exec_seq < 0) {
+        if (error_out) *error_out = "survivor node or exec seq invalid";
+        return false;
+    }
+    return true;
+}
+
+bool server_rerot_runtime::freeze_serial_coordinates(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id,
+        std::string * error_out) {
+    if (!validate_serial_tail_state(episode_id, node_id, error_out)) {
+        return false;
+    }
+    auto * current = episode(episode_id);
+    auto * survivor = node(episode_id, node_id);
+    if (!current || !survivor) {
+        return false;
+    }
+    // Increment layout epoch to freeze survivor virtual coordinates (§22)
+    ++current->layout_epoch;
+    if (memory_) {
+        const auto * doc_node = current->document.node(node_id);
+        if (doc_node && !doc_node->runs.empty()) {
+            std::vector<uint32_t> ordered_runs;
+            llama_rerot_reader_view_desc desc = {};
+            if (build_reader_view_desc(*current, *survivor, doc_node->runs.back(), ordered_runs, desc)) {
+                llama_memory_rerot_set_reader_view(memory_, survivor->exec_seq, &desc);
+            }
+        }
+    }
     return true;
 }
 
@@ -2252,7 +2672,7 @@ bool rerot_visibility_from_u8(uint8_t v, llama_rerot_visibility & out) {
 }
 
 bool rerot_node_state_from_u8(uint8_t v, llama_rerot_node_state & out) {
-    if (v > static_cast<uint8_t>(llama_rerot_node_state::retired)) {
+    if (v > static_cast<uint8_t>(llama_rerot_node_state::ready_suspended)) {
         return false;
     }
     out = static_cast<llama_rerot_node_state>(v);
@@ -2428,10 +2848,11 @@ bool server_rerot_marker_parser::restore(const server_rerot_marker_snapshot & sn
 }
 
 void server_rerot_episode_demote_to_logical(server_rerot_episode & episode) {
-    // Episode-level demotion (A.8.2): transient physical slot bindings go,
+    // Episode-level demotion (A.8.2): transient physical slot/pen bindings go,
     // logical membership and lineage stay for re-admission.
     for (auto & node : episode.nodes) {
         node.physical_slot = -1;
+        node.pen_id = -1;
     }
 }
 
@@ -2534,6 +2955,7 @@ std::vector<uint8_t> server_rerot_episode_save(
     }
     write_id_vec(episode.running);
     write_id_vec(episode.starting);
+    write_id_vec(episode.suspended);
 
     w.u32(static_cast<uint32_t>(episode.document.node_count()));
     for (size_t i = 0; i < episode.document.node_count(); ++i) {
@@ -2584,6 +3006,7 @@ std::vector<uint8_t> server_rerot_episode_save(
         w.u8(node.exit_intent ? 1 : 0);
         w.blob(node.sampler_blob);
         w.blob(node.mtp_blob);
+        w.blob(node.hand_seed);
         w.u64(node.view_stamp.topology_epoch);
         w.u64(node.view_stamp.publish_epoch);
         w.u64(node.view_stamp.layout_epoch);
@@ -2627,6 +3050,7 @@ struct rerot_runtime_blob {
     bool exit_intent = false;
     std::vector<uint8_t> sampler_blob;
     std::vector<uint8_t> mtp_blob;
+    std::vector<uint8_t> hand_seed;
     llama_rerot_view_stamp view_stamp = {0, 0, 0};
 };
 
@@ -2736,7 +3160,7 @@ bool server_rerot_episode_load(
             out[i] = r.u32();
         }
     };
-    std::vector<llama_rerot_node_id> forked, running_vec, starting_vec;
+    std::vector<llama_rerot_node_id> forked, running_vec, starting_vec, suspended_vec;
     read_id_vec(forked);
     const uint32_t n_ready = r.u32();
     std::deque<llama_rerot_node_id> ready;
@@ -2749,6 +3173,7 @@ bool server_rerot_episode_load(
     }
     read_id_vec(running_vec);
     read_id_vec(starting_vec);
+    read_id_vec(suspended_vec);
     if (!r.ok) {
         return rerot_state_set_error(error_out, "RERoT episode load refused: truncated queue/membership lists");
     }
@@ -2852,6 +3277,7 @@ bool server_rerot_episode_load(
         rb.exit_intent = r.u8() != 0;
         rb.sampler_blob = r.blob();
         rb.mtp_blob = r.blob();
+        rb.hand_seed = r.blob();
         rb.view_stamp.topology_epoch = r.u64();
         rb.view_stamp.publish_epoch = r.u64();
         rb.view_stamp.layout_epoch = r.u64();
@@ -2982,6 +3408,7 @@ bool server_rerot_episode_load(
         }
         server_rerot_node_runtime node;
         node.id = sb.id;
+        node.pen_id = sb.physical_slot;
         node.physical_slot = sb.physical_slot;
         node.exec_seq = sb.exec_seq;
         node.parked_seq = sb.parked_seq;
@@ -3001,6 +3428,7 @@ bool server_rerot_episode_load(
         node.exit_intent = sb.exit_intent;
         node.sampler_blob = sb.sampler_blob;
         node.mtp_blob = sb.mtp_blob;
+        node.hand_seed = sb.hand_seed;
         node.view_stamp = sb.view_stamp;
         const auto check_ref = [&](const std::optional<llama_rerot_run_id> & ref, llama_rerot_visibility want) {
             if (!ref.has_value()) {
@@ -3028,6 +3456,7 @@ bool server_rerot_episode_load(
     rebuilt.ready_queue = std::move(ready);
     rebuilt.running = std::set<llama_rerot_node_id>(running_vec.begin(), running_vec.end());
     rebuilt.starting = std::set<llama_rerot_node_id>(starting_vec.begin(), starting_vec.end());
+    rebuilt.suspended = std::set<llama_rerot_node_id>(suspended_vec.begin(), suspended_vec.end());
     rebuilt.archive_seq = archive_seq;
     rebuilt.topology_barrier_pending = (flags & k_rerot_flag_barrier) != 0;
     rebuilt.finalizing = (flags & k_rerot_flag_finalize) != 0;
@@ -3249,6 +3678,12 @@ bool server_rerot_runtime::demote_episode(uint64_t episode_id) {
     }
     for (const auto & node : current->nodes) {
         if (node.physical_slot >= 0) {
+            if ((size_t) node.physical_slot < pens_.size()) {
+                pens_[node.physical_slot].state = server_pen_state::free;
+                pens_[node.physical_slot].person = 0;
+                pens_[node.physical_slot].episode_id = 0;
+                pens_[node.physical_slot].node_id = LLAMA_REROT_NODE_INVALID;
+            }
             const auto it = slot_to_episode_.find(node.physical_slot);
             if (it != slot_to_episode_.end() && it->second == episode_id) {
                 slot_to_episode_.erase(it);
@@ -3256,6 +3691,34 @@ bool server_rerot_runtime::demote_episode(uint64_t episode_id) {
         }
     }
     server_rerot_episode_demote_to_logical(*current);
+    return true;
+}
+
+bool server_rerot_runtime::context_shift(
+        uint64_t episode_id,
+        uint64_t max_tokens_to_remove,
+        server_rerot_shift_result * result_out,
+        std::string * error_out) {
+    auto * current = episode(episode_id);
+    if (current == nullptr) {
+        return rerot_state_set_error(error_out, "RERoT context shift failed: unknown episode");
+    }
+    if (current->hard_aborted) {
+        return rerot_state_set_error(error_out, "RERoT context shift failed: episode is hard aborted");
+    }
+
+    server_rerot_shift_result local_res;
+    if (!server_rerot_truncate_oldest_public(*current, max_tokens_to_remove, &local_res, error_out)) {
+        return false;
+    }
+
+    if (local_res.tokens_removed > 0) {
+        current->topology_barrier_pending = true;
+    }
+
+    if (result_out) {
+        *result_out = local_res;
+    }
     return true;
 }
 

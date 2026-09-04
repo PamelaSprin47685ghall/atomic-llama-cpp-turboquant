@@ -217,6 +217,35 @@ static void test(void) {
         common_params invalid_rerot_params;
         argv = {"binary_name", "--rerot-frontier", "eventual"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), invalid_rerot_params, LLAMA_EXAMPLE_SERVER));
+
+        // Phase 0: full-auto contract and fail-fast checks (§B.3.1, §B.13)
+        common_params full_auto_params;
+        argv = {"binary_name", "--rerot", "--total-kv", "auto"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), full_auto_params, LLAMA_EXAMPLE_SERVER));
+        assert(full_auto_params.rerot_enabled);
+        assert(full_auto_params.n_ctx_kv_auto);
+        assert(!full_auto_params.n_parallel_explicit);
+
+        // Conflicting explicit -np with --total-kv auto must fail-fast
+        common_params conflict_params;
+        argv = {"binary_name", "--rerot", "--total-kv", "auto", "-np", "6"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), conflict_params, LLAMA_EXAMPLE_SERVER));
+
+        // Manual KV size with explicit -np remains supported
+        common_params manual_params;
+        argv = {"binary_name", "--rerot", "--total-kv", "2048", "-np", "6"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), manual_params, LLAMA_EXAMPLE_SERVER));
+        assert(manual_params.rerot_enabled);
+        assert(!manual_params.n_ctx_kv_auto);
+        assert(manual_params.n_parallel_explicit);
+        assert(manual_params.n_parallel == 6);
+
+        // RERoT OFF: -np with --total-kv auto is legal (ordinary server auto-fit)
+        common_params off_params;
+        argv = {"binary_name", "--total-kv", "auto", "-np", "6"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), off_params, LLAMA_EXAMPLE_SERVER));
+        assert(!off_params.rerot_enabled);
+        assert(off_params.n_parallel == 6);
     }
 
     argv = {"binary_name", "-lm", "dio"};

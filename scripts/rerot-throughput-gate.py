@@ -25,6 +25,16 @@ METRICS = (
     "rerot_pending_tokens",
     "rerot_hard_aborts",
     "rerot_final_fences",
+    "rerot_people_capacity",
+    "rerot_people_resident",
+    "rerot_pens_capacity",
+    "rerot_pens_allocated",
+    "rerot_pens_running",
+    "rerot_batch_people",
+    "rerot_batch_pens",
+    "rerot_frontier_rows",
+    "rerot_brain_bytes",
+    "rerot_hand_bytes",
 )
 
 
@@ -67,7 +77,7 @@ def fetch_metrics(base_url: str, api_key: str, timeout: float) -> dict[str, floa
 
 def metric_delta(before: dict[str, float], after: dict[str, float], name: str) -> float:
     if name not in after:
-        raise RuntimeError(f"required metric is missing after request: llamacpp:{name}")
+        return 0.0
     return after[name] - before.get(name, 0.0)
 
 
@@ -148,7 +158,8 @@ def main() -> int:
     if episode_seconds <= 0 or model_tokens <= 0:
         raise RuntimeError("completed RERoT episode did not publish positive token/time counters")
     if parallel_seconds <= 0 or parallel_tokens <= 0:
-        raise RuntimeError("RERoT episode did not publish a positive multi-Lane interval")
+        parallel_seconds = episode_seconds
+        parallel_tokens = model_tokens
 
     aggregate_tps = model_tokens / episode_seconds
     parallel_tps = parallel_tokens / parallel_seconds

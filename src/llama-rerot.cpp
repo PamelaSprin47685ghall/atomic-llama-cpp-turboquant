@@ -435,7 +435,7 @@ bool llama_rerot_document::validate(std::string * error) const {
         if (current.id != i) {
             return set_error(error, "node ids must be dense and stable");
         }
-        if (static_cast<uint8_t>(current.state) > static_cast<uint8_t>(llama_rerot_node_state::retired)) {
+        if (static_cast<uint8_t>(current.state) > static_cast<uint8_t>(llama_rerot_node_state::ready_suspended)) {
             return set_error(error, "node state is out of range");
         }
         if (i != 0) {

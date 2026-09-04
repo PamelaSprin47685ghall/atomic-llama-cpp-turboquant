@@ -459,6 +459,7 @@ struct common_params : wanxiangqi_common_params {
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
+    bool    n_parallel_explicit   = false; // whether -np / --parallel was explicitly provided by caller
     int32_t n_parallel_pp         =     0; // number of parallel sequences reserved for prompt processing, 0 = n_parallel
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
@@ -584,6 +585,13 @@ struct common_params : wanxiangqi_common_params {
     // Explicit opt-in for RERoT lane-trace SSE events (rerot.trace.*). Default off:
     // streaming stays a single assistant response with one finish event + [DONE].
     bool rerot_trace = false;
+
+    // RERoT joint B/P/K capacity fit results (§§B.0, B.3, B.10). Internal fit outputs only;
+    // no production per-person or total-pen CLI is exposed.
+    uint32_t rerot_person_max = 0; // auto-selected B (people / independent brains)
+    uint32_t rerot_pen_max    = 0; // auto-selected P (pens / execution states)
+    uint32_t rerot_brain_rows = 0; // derived from B
+    uint32_t rerot_hand_rows  = 0; // derived from P
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation
@@ -807,6 +815,15 @@ inline common_rerot_gate common_rerot_validate_stage0(const common_params & para
     if (!params.kv_unified) {
         gate.ok = false;
         gate.error = "RERoT requires unified KV (--kv-unified); refusing to run without it";
+        return gate;
+    }
+    // §B.3.1 / Phase 0: Lock --total-kv auto as joint B/P/K auto-fit mode.
+    // Explicit -np / --parallel in full-auto mode conflicts with automated people/pen derivation.
+    if (params.n_ctx_kv_auto && params.n_parallel_explicit && params.n_parallel > 0) {
+        gate.ok = false;
+        gate.error = "RERoT full-auto (--total-kv auto) derives total people B and pens P automatically; "
+                     "explicit -np / --parallel conflicts with joint B/P/K capacity selection. "
+                     "Remove -np / --parallel to use automatic capacity.";
         return gate;
     }
     if (params.embedding) {

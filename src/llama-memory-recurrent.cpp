@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -765,6 +766,471 @@ uint32_t llama_memory_recurrent::get_recurrent_capacity() const {
 
 uint32_t llama_memory_recurrent::get_recurrent_used() const {
     return used;
+}
+
+void llama_memory_recurrent::set_grouped_layout(uint32_t n_brains, uint32_t n_hands) {
+    n_brain_rows = n_brains;
+    n_hand_rows = n_hands;
+    brain_capacity = n_brains;
+    hand_capacity = n_hands;
+}
+
+uint32_t llama_memory_recurrent::get_brain_capacity() const {
+    return is_grouped_layout() ? brain_capacity : get_recurrent_capacity();
+}
+
+uint32_t llama_memory_recurrent::get_hand_capacity() const {
+    return is_grouped_layout() ? hand_capacity : get_recurrent_capacity();
+}
+
+uint32_t llama_memory_recurrent::get_brain_used() const {
+    if (!is_grouped_layout()) {
+        return get_recurrent_used();
+    }
+    return std::min(get_recurrent_used(), brain_capacity);
+}
+
+uint32_t llama_memory_recurrent::get_hand_used() const {
+    if (!is_grouped_layout()) {
+        return get_recurrent_used();
+    }
+    return std::min(get_recurrent_used(), hand_capacity);
+}
+
+bool llama_memory_recurrent::commit_rbb_frontier_mean(
+        uint32_t person_id,
+        const std::vector<int32_t> & candidate_hand_rows,
+        const std::vector<bool> & is_public_write) {
+    if (candidate_hand_rows.empty() || candidate_hand_rows.size() != is_public_write.size()) {
+        return false;
+    }
+
+    // Filter valid PUBLIC candidate hand rows (§14.1, §B.6.2): PRIVATE/PENDING never enter global S
+    std::vector<int32_t> valid_rows;
+    for (size_t i = 0; i < candidate_hand_rows.size(); ++i) {
+        if (is_public_write[i] && candidate_hand_rows[i] >= 0 && (uint32_t) candidate_hand_rows[i] < size) {
+            valid_rows.push_back(candidate_hand_rows[i]);
+        }
+    }
+
+    if (valid_rows.empty()) {
+        return true;
+    }
+
+    const uint32_t b_cap = get_brain_capacity();
+    const uint32_t target_brain_row = b_cap > 0 ? (person_id % b_cap) : 0;
+
+    for (size_t il = 0; il < s_l.size(); ++il) {
+        ggml_tensor * s = s_l[il];
+        if (!s) {
+            continue;
+        }
+
+        const size_t row_size = ggml_row_size(s->type, s->ne[0]);
+        const size_t n_elem = s->ne[0];
+
+        // N=1: exact identity with single candidate (bitwise/tolerance equivalent to native recurrence)
+        if (valid_rows.size() == 1) {
+            const int32_t src_row = valid_rows[0];
+            if ((uint32_t) src_row == target_brain_row) {
+                continue;
+            }
+            std::vector<uint8_t> buf(row_size);
+            ggml_backend_tensor_get(s, buf.data(), (size_t) src_row * row_size, row_size);
+            ggml_backend_tensor_set(s, buf.data(), (size_t) target_brain_row * row_size, row_size);
+            continue;
+        }
+
+        // N > 1: Deterministic mean reduction across all valid candidate rows
+        // Order-free / permutation symmetric (§14.1, §B.6.3)
+        if (s->type == GGML_TYPE_F32) {
+            std::vector<float> acc(n_elem, 0.0f);
+            std::vector<float> row_buf(n_elem);
+
+            std::vector<int32_t> sorted_rows = valid_rows;
+            std::sort(sorted_rows.begin(), sorted_rows.end());
+
+            for (int32_t src_row : sorted_rows) {
+                ggml_backend_tensor_get(s, row_buf.data(), (size_t) src_row * row_size, row_size);
+                for (size_t k = 0; k < n_elem; ++k) {
+                    acc[k] += row_buf[k];
+                }
+            }
+
+            const float inv_n = 1.0f / float(sorted_rows.size());
+            for (size_t k = 0; k < n_elem; ++k) {
+                acc[k] *= inv_n;
+            }
+
+            ggml_backend_tensor_set(s, acc.data(), (size_t) target_brain_row * row_size, row_size);
+        } else {
+            std::vector<uint8_t> buf(row_size);
+            ggml_backend_tensor_get(s, buf.data(), (size_t) valid_rows[0] * row_size, row_size);
+            ggml_backend_tensor_set(s, buf.data(), (size_t) target_brain_row * row_size, row_size);
+        }
+    }
+
+    return true;
+}
+
+std::shared_ptr<llama_memory_recurrent::hand_seed> llama_memory_recurrent::capture_hand_seed(
+        uint64_t fork_id,
+        llama_seq_id source_seq) {
+    if (source_seq < 0 || (size_t) source_seq >= tails.size() || tails[(size_t) source_seq] < 0) {
+        return nullptr;
+    }
+
+    const int32_t row = tails[(size_t) source_seq];
+    auto seed = std::make_shared<hand_seed>();
+    seed->fork_id = fork_id;
+    seed->source_hand_row = row;
+    seed->conv_tail_bytes.resize(r_l.size());
+    seed->private_s_bytes.resize(s_l.size());
+
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        if (r_l[il]) {
+            const size_t row_size = ggml_row_size(r_l[il]->type, r_l[il]->ne[0]);
+            seed->conv_tail_bytes[il].resize(row_size);
+            ggml_backend_tensor_get(r_l[il], seed->conv_tail_bytes[il].data(), (size_t) row * row_size, row_size);
+        }
+    }
+    const size_t prefix_limit = std::min<size_t>(3, s_l.size());
+    for (size_t il = 0; il < prefix_limit; ++il) {
+        if (s_l[il]) {
+            const size_t row_size = ggml_row_size(s_l[il]->type, s_l[il]->ne[0]);
+            seed->private_s_bytes[il].resize(row_size);
+            ggml_backend_tensor_get(s_l[il], seed->private_s_bytes[il].data(), (size_t) row * row_size, row_size);
+        }
+    }
+
+    return seed;
+}
+
+bool llama_memory_recurrent::apply_hand_seed(
+        llama_seq_id dest_seq,
+        const std::shared_ptr<hand_seed> & seed) {
+    if (!seed || dest_seq < 0 || (size_t) dest_seq >= tails.size() || tails[(size_t) dest_seq] < 0) {
+        return false;
+    }
+
+    const int32_t row = tails[(size_t) dest_seq];
+    for (size_t il = 0; il < seed->conv_tail_bytes.size() && il < r_l.size(); ++il) {
+        if (r_l[il] && !seed->conv_tail_bytes[il].empty()) {
+            const size_t row_size = ggml_row_size(r_l[il]->type, r_l[il]->ne[0]);
+            ggml_backend_tensor_set(r_l[il], seed->conv_tail_bytes[il].data(), (size_t) row * row_size, row_size);
+        }
+    }
+    for (size_t il = 0; il < seed->private_s_bytes.size() && il < s_l.size(); ++il) {
+        if (s_l[il] && !seed->private_s_bytes[il].empty()) {
+            const size_t row_size = ggml_row_size(s_l[il]->type, s_l[il]->ne[0]);
+            ggml_backend_tensor_set(s_l[il], seed->private_s_bytes[il].data(), (size_t) row * row_size, row_size);
+        }
+    }
+
+    return true;
+}
+
+bool llama_memory_recurrent::rerot_capture_hand_seed(llama_seq_id source_seq, std::vector<uint8_t> & seed_out) {
+    seed_out.clear();
+    auto seed = capture_hand_seed(0, source_seq);
+    if (!seed) {
+        return false;
+    }
+
+    const uint32_t magic = 0x53454544; // 'SEED'
+    const uint32_t n_conv = uint32_t(seed->conv_tail_bytes.size());
+    const uint32_t n_priv = uint32_t(seed->private_s_bytes.size());
+
+    size_t total_bytes = sizeof(magic) + sizeof(n_conv) + sizeof(n_priv);
+    for (const auto & b : seed->conv_tail_bytes) {
+        total_bytes += sizeof(uint32_t) + b.size();
+    }
+    for (const auto & b : seed->private_s_bytes) {
+        total_bytes += sizeof(uint32_t) + b.size();
+    }
+
+    seed_out.reserve(total_bytes);
+    auto append_u32 = [&](uint32_t v) {
+        const uint8_t * p = reinterpret_cast<const uint8_t *>(&v);
+        seed_out.insert(seed_out.end(), p, p + sizeof(uint32_t));
+    };
+
+    append_u32(magic);
+    append_u32(n_conv);
+    for (const auto & b : seed->conv_tail_bytes) {
+        append_u32(uint32_t(b.size()));
+        seed_out.insert(seed_out.end(), b.begin(), b.end());
+    }
+    append_u32(n_priv);
+    for (const auto & b : seed->private_s_bytes) {
+        append_u32(uint32_t(b.size()));
+        seed_out.insert(seed_out.end(), b.begin(), b.end());
+    }
+
+    return true;
+}
+
+bool llama_memory_recurrent::rerot_apply_hand_seed(llama_seq_id dest_seq, const std::vector<uint8_t> & seed_in) {
+    if (seed_in.size() < sizeof(uint32_t) * 3) {
+        return false;
+    }
+
+    size_t offset = 0;
+    auto read_u32 = [&](uint32_t & v) -> bool {
+        if (offset + sizeof(uint32_t) > seed_in.size()) return false;
+        std::memcpy(&v, seed_in.data() + offset, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        return true;
+    };
+
+    uint32_t magic = 0;
+    if (!read_u32(magic) || magic != 0x53454544) {
+        return false;
+    }
+
+    uint32_t n_conv = 0;
+    if (!read_u32(n_conv)) return false;
+
+    auto seed = std::make_shared<hand_seed>();
+    seed->conv_tail_bytes.resize(n_conv);
+    for (uint32_t i = 0; i < n_conv; ++i) {
+        uint32_t len = 0;
+        if (!read_u32(len)) return false;
+        if (offset + len > seed_in.size()) return false;
+        seed->conv_tail_bytes[i].assign(seed_in.data() + offset, seed_in.data() + offset + len);
+        offset += len;
+    }
+
+    uint32_t n_priv = 0;
+    if (!read_u32(n_priv)) return false;
+
+    seed->private_s_bytes.resize(n_priv);
+    for (uint32_t i = 0; i < n_priv; ++i) {
+        uint32_t len = 0;
+        if (!read_u32(len)) return false;
+        if (offset + len > seed_in.size()) return false;
+        seed->private_s_bytes[i].assign(seed_in.data() + offset, seed_in.data() + offset + len);
+        offset += len;
+    }
+
+    return apply_hand_seed(dest_seq, seed);
+}
+
+bool llama_memory_recurrent::rerot_commit_rbb_frontier(
+        uint32_t person_id,
+        const llama_seq_id * candidate_seqs,
+        const uint8_t * is_public_write,
+        size_t n_candidates) {
+    if (!candidate_seqs || !is_public_write || n_candidates == 0) {
+        return false;
+    }
+
+    std::vector<int32_t> candidate_rows;
+    std::vector<bool> public_flags;
+    candidate_rows.reserve(n_candidates);
+    public_flags.reserve(n_candidates);
+
+    for (size_t i = 0; i < n_candidates; ++i) {
+        const llama_seq_id seq = candidate_seqs[i];
+        if (seq >= 0 && (size_t) seq < tails.size() && tails[(size_t) seq] >= 0) {
+            candidate_rows.push_back(tails[(size_t) seq]);
+            public_flags.push_back(is_public_write[i] != 0);
+        }
+    }
+
+    if (candidate_rows.empty()) {
+        return true;
+    }
+
+    // Parallel Delta order-free block DeltaNet update (§14.1.2, §B.6)
+    return commit_rbb_frontier_parallel_delta(person_id, candidate_rows, public_flags);
+}
+
+bool llama_memory_recurrent::commit_rbb_frontier_parallel_delta(
+        uint32_t person_id,
+        const std::vector<int32_t> & candidate_hand_rows,
+        const std::vector<bool> & is_public_write,
+        const std::vector<float> & candidate_log_decays) {
+    if (candidate_hand_rows.empty() || candidate_hand_rows.size() != is_public_write.size()) {
+        return false;
+    }
+
+    std::vector<int32_t> valid_rows;
+    std::vector<float> valid_decays;
+    for (size_t i = 0; i < candidate_hand_rows.size(); ++i) {
+        if (is_public_write[i] && candidate_hand_rows[i] >= 0 && (uint32_t) candidate_hand_rows[i] < size) {
+            valid_rows.push_back(candidate_hand_rows[i]);
+            if (i < candidate_log_decays.size()) {
+                valid_decays.push_back(candidate_log_decays[i]);
+            } else {
+                valid_decays.push_back(0.0f);
+            }
+        }
+    }
+
+    if (valid_rows.empty()) {
+        return true;
+    }
+
+    const uint32_t b_cap = get_brain_capacity();
+    const uint32_t target_brain_row = b_cap > 0 ? (person_id % b_cap) : 0;
+
+    for (size_t il = 0; il < s_l.size(); ++il) {
+        ggml_tensor * s = s_l[il];
+        if (!s) {
+            continue;
+        }
+
+        const size_t row_size = ggml_row_size(s->type, s->ne[0]);
+        const size_t n_elem = s->ne[0];
+
+        // N = 1: exact identity with single candidate (§14.1.2)
+        if (valid_rows.size() == 1) {
+            const int32_t src_row = valid_rows[0];
+            if ((uint32_t) src_row != target_brain_row) {
+                std::vector<uint8_t> buf(row_size);
+                ggml_backend_tensor_get(s, buf.data(), (size_t) src_row * row_size, row_size);
+                ggml_backend_tensor_set(s, buf.data(), (size_t) target_brain_row * row_size, row_size);
+            }
+            continue;
+        }
+
+        if (s->type != GGML_TYPE_F32) {
+            // Fallback to mean for non-FP32
+            commit_rbb_frontier_mean(person_id, candidate_hand_rows, is_public_write);
+            continue;
+        }
+
+        const size_t N = valid_rows.size();
+
+        // Sort rows for strict deterministic permutation symmetry (§14.1.2)
+        std::vector<size_t> p(N);
+        for (size_t i = 0; i < N; ++i) p[i] = i;
+        std::sort(p.begin(), p.end(), [&](size_t a, size_t b) {
+            return valid_rows[a] < valid_rows[b];
+        });
+
+        // 1. Read S_old from target brain row
+        std::vector<float> S_old(n_elem);
+        ggml_backend_tensor_get(s, S_old.data(), (size_t) target_brain_row * row_size, row_size);
+
+        // Average log-decay: g_bar = mean(g_i), alpha = exp(g_bar)
+        float g_sum = 0.0f;
+        for (size_t i = 0; i < N; ++i) {
+            g_sum += valid_decays[p[i]];
+        }
+        const float g_bar = g_sum / float(N);
+        const float alpha = std::exp(std::min(0.0f, g_bar));
+
+        // S_bar = alpha * S_old
+        std::vector<float> S_bar(n_elem);
+        for (size_t k = 0; k < n_elem; ++k) {
+            S_bar[k] = alpha * S_old[k];
+        }
+
+        // 2. Read candidate rows and compute deltas: Delta_i = S_i - S_bar
+        std::vector<std::vector<float>> deltas(N, std::vector<float>(n_elem));
+        std::vector<float> row_buf(n_elem);
+        for (size_t i = 0; i < N; ++i) {
+            ggml_backend_tensor_get(s, row_buf.data(), (size_t) valid_rows[p[i]] * row_size, row_size);
+            for (size_t k = 0; k < n_elem; ++k) {
+                deltas[i][k] = row_buf[k] - S_bar[k];
+            }
+        }
+
+        // 3. Compute Gram matrix G_ij = <Delta_i, Delta_j>
+        std::vector<float> G(N * N, 0.0f);
+        for (size_t i = 0; i < N; ++i) {
+            for (size_t j = i; j < N; ++j) {
+                double dot = 0.0;
+                for (size_t k = 0; k < n_elem; ++k) {
+                    dot += double(deltas[i][k]) * double(deltas[j][k]);
+                }
+                G[i * N + j] = float(dot);
+                G[j * N + i] = float(dot);
+            }
+        }
+
+        // 4. Regularized solve: M = G + D + eps * I where D is ridge
+        std::vector<float> M = G;
+        const float eps = 1e-4f;
+        for (size_t i = 0; i < N; ++i) {
+            M[i * N + i] += eps * (1.0f + G[i * N + i]);
+        }
+
+        std::vector<float> b(N);
+        for (size_t i = 0; i < N; ++i) {
+            b[i] = G[i * N + i];
+        }
+
+        std::vector<float> w(N, 1.0f / float(N));
+        bool solve_ok = true;
+        // Gaussian elimination with partial pivoting for small N (N <= 16)
+        std::vector<float> A = M;
+        for (size_t i = 0; i < N; ++i) {
+            size_t max_row = i;
+            float max_val = std::abs(A[i * N + i]);
+            for (size_t r = i + 1; r < N; ++r) {
+                if (std::abs(A[r * N + i]) > max_val) {
+                    max_val = std::abs(A[r * N + i]);
+                    max_row = r;
+                }
+            }
+            if (max_val < 1e-7f) {
+                solve_ok = false;
+                break;
+            }
+            if (max_row != i) {
+                for (size_t c = i; c < N; ++c) std::swap(A[i * N + c], A[max_row * N + c]);
+                std::swap(b[i], b[max_row]);
+            }
+            const float pivot = A[i * N + i];
+            for (size_t r = i + 1; r < N; ++r) {
+                const float factor = A[r * N + i] / pivot;
+                for (size_t c = i; c < N; ++c) {
+                    A[r * N + c] -= factor * A[i * N + c];
+                }
+                b[r] -= factor * b[i];
+            }
+        }
+
+        if (solve_ok) {
+            for (int i = int(N) - 1; i >= 0; --i) {
+                float sum = b[size_t(i)];
+                for (size_t c = size_t(i) + 1; c < N; ++c) {
+                    sum -= A[size_t(i) * N + c] * w[c];
+                }
+                w[size_t(i)] = sum / A[size_t(i) * N + size_t(i)];
+            }
+        }
+
+        // Clamp weights to prevent extreme amplification
+        float total_w = 0.0f;
+        for (size_t i = 0; i < N; ++i) {
+            if (!std::isfinite(w[i]) || w[i] < 0.0f) w[i] = 0.0f;
+            if (w[i] > 1.0f) w[i] = 1.0f;
+            total_w += w[i];
+        }
+        if (total_w < 1e-6f) {
+            for (size_t i = 0; i < N; ++i) w[i] = 1.0f / float(N);
+        } else if (total_w > float(N)) {
+            const float scale = float(N) / total_w;
+            for (size_t i = 0; i < N; ++i) w[i] *= scale;
+        }
+
+        // 5. Commit S' = S_bar + sum_i w_i * Delta_i
+        std::vector<float> S_prime = S_bar;
+        for (size_t i = 0; i < N; ++i) {
+            const float weight = w[i];
+            for (size_t k = 0; k < n_elem; ++k) {
+                S_prime[k] += weight * deltas[i][k];
+            }
+        }
+
+        ggml_backend_tensor_set(s, S_prime.data(), (size_t) target_brain_row * row_size, row_size);
+    }
+
+    return true;
 }
 
 uint32_t llama_memory_recurrent::get_recurrent_seq_used(llama_seq_id seq_id) const {
