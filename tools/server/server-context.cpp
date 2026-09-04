@@ -1481,32 +1481,21 @@ private:
         }
     }
 
-    std::string rerot_planner_control_prompt(std::string_view assigned_task = {}) const {
-        std::string prompt;
-        if (assigned_task.empty()) {
-            prompt = std::string(server_rerot_planner_prompt());
-        } else {
-            prompt = "当前目标：";
-            prompt.append(assigned_task);
-            prompt += "。它若包含多个可并行、彼此自足的目标，我用多个 li；否则用一个 li 保持完整目标。话题和前后步骤不单独成项。\n";
-        }
-        return prompt;
+    std::string rerot_planner_control_prompt() const {
+        return std::string(server_rerot_planner_prompt());
     }
 
     std::string rerot_worker_control_prompt(std::string_view assigned_task) const {
         std::string prompt = "当前目标：";
         prompt.append(assigned_task);
-        prompt +=
-            "。我直接完成它，先给结果，再补足必要依据；"
-            "若它还能分成彼此自足的并行目标，我才用 ol/li 继续拆分。"
-            "末尾另起一行写 </blockquote>。\n<blockquote>\n";
+        prompt += "。\n我直接给出结论和必要依据。\n<blockquote>\n";
         return prompt;
     }
 
     static std::string rerot_finalizer_control_prompt(std::string_view original_user_text) {
-        std::string prompt = "原始请求：";
+        std::string prompt = "综合已有结论，继续完成原始请求：";
         prompt.append(original_user_text);
-        prompt += "\n已有推导足够。我只保留有用结论，完整、直接地完成这个请求：\n";
+        prompt += "\n";
         return prompt;
     }
 
