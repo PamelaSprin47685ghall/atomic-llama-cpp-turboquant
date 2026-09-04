@@ -169,6 +169,17 @@ private:
     std::string error_;
 };
 
+// Removes private RERoT delimiters from serial output across arbitrary
+// tokenizer boundaries. Instances exist only for active episodes.
+class server_rerot_control_tag_filter {
+public:
+    void consume(std::string & bytes);
+    void reset();
+
+private:
+    std::string pending_;
+};
+
 // Fixed private control prompt injected after the user's ordinary prompt and
 // before planner-visible generation. Its prose is deliberately phrased as the
 // model's first-person introspection rather than an external command. It is

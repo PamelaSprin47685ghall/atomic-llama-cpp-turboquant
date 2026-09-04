@@ -12,6 +12,7 @@ constexpr std::string_view k_open_ol  = "<ol>";
 constexpr std::string_view k_close_ol = "</ol>";
 constexpr std::string_view k_open_li  = "<li>";
 constexpr std::string_view k_close_li = "</li>";
+constexpr std::string_view k_private_control_tags[] = {"<blockquote>", "</blockquote>"};
 
 bool ascii_space(unsigned char ch) {
     return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v';
@@ -426,6 +427,44 @@ server_rerot_marker_step server_rerot_marker_parser::consume(std::string_view by
     return step;
 }
 
+void server_rerot_control_tag_filter::consume(std::string & bytes) {
+    if (!pending_.empty()) {
+        pending_.append(bytes);
+        bytes.swap(pending_);
+        pending_.clear();
+    }
+
+    while (!bytes.empty()) {
+        size_t first = std::string::npos;
+        std::string_view matched;
+        for (const auto tag : k_private_control_tags) {
+            const size_t pos = bytes.find(tag);
+            if (pos < first) {
+                first = pos;
+                matched = tag;
+            }
+        }
+        if (first != std::string::npos) {
+            bytes.erase(first, matched.size());
+            continue;
+        }
+
+        size_t hold = 0;
+        for (const auto tag : k_private_control_tags) {
+            hold = std::max(hold, trailing_marker_prefix(bytes, tag));
+        }
+        if (hold != 0) {
+            pending_.assign(bytes, bytes.size() - hold, hold);
+            bytes.resize(bytes.size() - hold);
+        }
+        return;
+    }
+}
+
+void server_rerot_control_tag_filter::reset() {
+    pending_.clear();
+}
+
 server_rerot_stream_lines server_rerot_line_mux::append(
         llama_rerot_node_id node_id,
         llama_rerot_run_id run_id,
@@ -546,7 +585,7 @@ server_rerot_stream_lines server_rerot_line_mux::drain_lane(
 
 std::string_view server_rerot_planner_prompt() {
     static constexpr std::string_view prompt =
-        "我把请求拆成可并行的独立目标，以 ol 开头，每个 li 是一个可判定的动词目标加交付标准，以 /ol 结尾。li 只写目标，不写开放话题。不必拆就只写一个 li。\n";
+        "这个请求有哪些可并行、彼此自足且共同必要的目标？我用平面的 HTML 有序列表梳理：以 ol 开头，每个 li 写一个完成后直接推进原请求的目标，以 /ol 结尾。话题和前后步骤不单独成项；无法并行拆分时只写一个 li。\n";
     return prompt;
 }
 

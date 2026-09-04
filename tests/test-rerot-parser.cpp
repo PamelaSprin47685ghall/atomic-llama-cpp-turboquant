@@ -156,6 +156,9 @@ static void test_planner_prompt_shape() {
     CHECK(prompt.find("/ol") != std::string::npos);
     CHECK(prompt.find("请先") == std::string::npos);
     CHECK(prompt.find("禁止") == std::string::npos);
+    CHECK(prompt.find("目标") != std::string::npos);
+    CHECK(prompt.find("子答案") == std::string::npos);
+    CHECK(prompt.find("简单问题") == std::string::npos);
     CHECK(prompt.size() < 300);
 }
 
@@ -204,6 +207,51 @@ static void test_private_marker_after_complete_is_ignored() {
     CHECK(!extra.malformed);
 }
 
+static void test_control_tag_filter_across_tokens() {
+    server_rerot_control_tag_filter filter;
+
+    std::string bytes = "<";
+    filter.consume(bytes);
+    CHECK(bytes.empty());
+
+    bytes = "blockquote";
+    filter.consume(bytes);
+    CHECK(bytes.empty());
+
+    bytes = ">answer</block";
+    filter.consume(bytes);
+    CHECK(bytes == "answer");
+
+    bytes = "quote>tail";
+    filter.consume(bytes);
+    CHECK(bytes == "tail");
+
+    bytes = "one<blockquote>two</blockquote>three";
+    filter.consume(bytes);
+    CHECK(bytes == "onetwothree");
+}
+
+static void test_control_tag_filter_false_prefix() {
+    server_rerot_control_tag_filter filter;
+
+    std::string bytes = "prefix <";
+    filter.consume(bytes);
+    CHECK(bytes == "prefix ");
+
+    bytes = "b> remains";
+    filter.consume(bytes);
+    CHECK(bytes == "<b> remains");
+
+    bytes = "</block";
+    filter.consume(bytes);
+    CHECK(bytes.empty());
+    filter.reset();
+
+    bytes = "safe";
+    filter.consume(bytes);
+    CHECK(bytes == "safe");
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT Planner Parser Tests ===\n");
     test_plain_public_text();
@@ -220,6 +268,8 @@ int main() {
     test_private_marker_false_prefix();
     test_private_marker_closes_with_trailing_body();
     test_private_marker_after_complete_is_ignored();
+    test_control_tag_filter_across_tokens();
+    test_control_tag_filter_false_prefix();
     std::fprintf(stderr, "=== Results: %d failure(s) ===\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

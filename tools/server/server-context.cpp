@@ -1215,6 +1215,7 @@ private:
         std::unordered_map<llama_rerot_node_id, std::vector<uint8_t>> parent_recurrent_snapshots;
         std::unordered_map<llama_rerot_run_id, std::string> run_bytes;
         server_rerot_line_mux line_mux;
+        server_rerot_control_tag_filter final_content_filter;
         std::string streamed_reasoning;
         uint64_t streamed_lines = 0;
         uint64_t sampled_tokens = 0;
@@ -1485,25 +1486,28 @@ private:
         if (assigned_task.empty()) {
             prompt = std::string(server_rerot_planner_prompt());
         } else {
-            prompt = "我当前在此推进目标，目标是：";
+            prompt = "当前目标：";
             prompt.append(assigned_task);
-            prompt += "。我直接用单个 li 承接该目标并用 /ol 闭合；只有确实包含多个可并行的独立子目标时才拆成多个 li，每个 li 同样是可判定的目标，不是开放话题。\n";
+            prompt += "。它若包含多个可并行、彼此自足的目标，我用多个 li；否则用一个 li 保持完整目标。话题和前后步骤不单独成项。\n";
         }
         return prompt;
     }
 
     std::string rerot_worker_control_prompt(std::string_view assigned_task) const {
-        std::string prompt = "我在此展开具体深入的推理分析，目标是：";
+        std::string prompt = "当前目标：";
         prompt.append(assigned_task);
         prompt +=
-            "。推导完毕后，我以 </blockquote> 结束本部分；"
-            "若确有必要开启并行的子子任务，我才仿照父节点的 ol 列表继续拆分。\n<blockquote>\n";
+            "。我直接完成它，先给结果，再补足必要依据；"
+            "若它还能分成彼此自足的并行目标，我才用 ol/li 继续拆分。"
+            "末尾另起一行写 </blockquote>。\n<blockquote>\n";
         return prompt;
     }
 
     static std::string rerot_finalizer_control_prompt(std::string_view original_user_text) {
-        GGML_UNUSED(original_user_text);
-        return "各部分的思考已经完成。我综合前面的所有推导与结论，直接按照原始请求完成最终交付：\n";
+        std::string prompt = "原始请求：";
+        prompt.append(original_user_text);
+        prompt += "\n已有推导足够。我只保留有用结论，完整、直接地完成这个请求：\n";
+        return prompt;
     }
 
     bool rerot_set_injection(
@@ -2289,6 +2293,7 @@ private:
         slot.stop = STOP_TYPE_NONE;
         slot.stopping_word.clear();
         slot.rerot_serial_tail = true;
+        transport_it->second->final_content_filter.reset();
         if (!rerot_set_injection(
                 slot,
                 server_rerot_injection_kind::finalizer,
@@ -2531,13 +2536,14 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(id) !=
                     slot.task->params.sampling.preserved_tokens.end());
         if (slot.rerot_serial_tail) {
-            for (const std::string_view tag : {"<blockquote>", "</blockquote>"}) {
-                for (size_t pos = output.text_to_send.find(tag);
-                     pos != std::string::npos;
-                     pos = output.text_to_send.find(tag)) {
-                    output.text_to_send.erase(pos, tag.size());
-                }
+            const auto transport_it = rerot_transport.find(slot.rerot_episode_id);
+            if (transport_it == rerot_transport.end()) {
+                rerot->hard_abort(
+                    slot.rerot_episode_id,
+                    "rerot_state_error: serial tail has no transport state");
+                return false;
             }
+            transport_it->second->final_content_filter.consume(output.text_to_send);
         }
         output.prob = 1.0f;
         if (slot.task->params.sampling.n_probs > 0) {
