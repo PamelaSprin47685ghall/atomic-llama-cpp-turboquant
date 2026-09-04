@@ -120,6 +120,8 @@ def main() -> int:
     endpoint = f"{args.base_url.rstrip('/')}/v1/chat/completions"
     serial_payload = dict(payload)
     serial_payload.update({"stream": False, "rerot": False, "rerot_trace": False})
+    # An explicit frontier selects RERoT even when rerot=false.
+    serial_payload.pop("rerot_frontier", None)
     rerot_payload = dict(payload)
     rerot_payload.update({"stream": False, "rerot": True, "rerot_trace": False})
 
