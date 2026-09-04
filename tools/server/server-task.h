@@ -221,6 +221,12 @@ struct task_result_state {
         const std::string & parse_prefix,
         const std::string & content,
         std::vector<common_chat_msg_diff> & diffs);
+
+    common_chat_msg update_rerot_content(
+        const std::string & parse_prefix,
+        const std::string & text_added,
+        bool is_partial,
+        std::vector<common_chat_msg_diff> & diffs);
 };
 
 struct server_task {
@@ -515,9 +521,16 @@ struct server_task_result_cmpl_final : server_task_result {
 
     virtual void update(task_result_state & state) override {
         is_updated = true;
-        oaicompat_msg = rerot_explicit_channels
-            ? state.update_rerot_msg(rerot_reasoning, rerot_parse_prefix, content, oaicompat_msg_diffs)
-            : state.update_chat_msg(content, false, oaicompat_msg_diffs);
+        if (rerot_explicit_channels) {
+            oaicompat_msg = stream
+                ? state.update_rerot_content(
+                    rerot_parse_prefix, content, false, oaicompat_msg_diffs)
+                : state.update_rerot_msg(
+                    rerot_reasoning, rerot_parse_prefix, content, oaicompat_msg_diffs);
+        } else {
+            oaicompat_msg =
+                state.update_chat_msg(content, false, oaicompat_msg_diffs);
+        }
 
         oai_resp_id = state.oai_resp_id;
         oai_resp_reasoning_id = state.oai_resp_reasoning_id;
@@ -570,9 +583,11 @@ struct server_task_result_cmpl_partial : server_task_result {
     bool is_updated = false;
     bool first_chunk = false;
 
-    // RERoT explicit stream delta routing: completely bypasses <think></think> parsing
+    // RERoT reasoning is already structured. Final-answer bytes still pass
+    // through the request chat parser so tool calls retain their API shape.
     bool is_rerot_reasoning = false;
     bool is_rerot_content   = false;
+    std::string rerot_parse_prefix;
 
     // Streaming state copied from task_result_state for this chunk
     bool thinking_block_started = false;

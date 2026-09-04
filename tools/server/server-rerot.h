@@ -118,6 +118,9 @@ enum class server_rerot_marker_state : uint8_t {
 
 struct server_rerot_marker_step {
     llama_rerot_visibility write_visibility = llama_rerot_visibility::public_live;
+    // Bytes before a marker prefix remain public for presentation even though
+    // the containing tokenizer token stays PENDING in KV.
+    size_t public_prefix_bytes = 0;
     bool release_previous_pending = false;
     bool marker_closed = false;
     bool malformed = false;
@@ -152,6 +155,7 @@ public:
     bool failed() const;
     const std::string & error() const;
     const std::string & marker() const;
+    std::string_view completion_suffix() const;
 
     server_rerot_marker_snapshot snapshot() const;
     // Restore a snapshot produced by snapshot(). Returns false when the
@@ -232,7 +236,8 @@ public:
         llama_rerot_node_id node_id,
         llama_rerot_run_id run_id,
         std::string_view bytes,
-        const llama_rerot_document & document);
+        const llama_rerot_document & document,
+        size_t public_prefix_bytes = 0);
     server_rerot_stream_lines drain(
         llama_rerot_node_id node_id,
         const llama_rerot_document & document);
@@ -249,6 +254,7 @@ private:
     struct segment {
         llama_rerot_run_id run_id = LLAMA_REROT_RUN_INVALID;
         std::string bytes;
+        bool presentation_public = false;
     };
     struct lane_state {
         std::deque<segment> blocked;

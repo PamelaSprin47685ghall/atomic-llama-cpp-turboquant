@@ -410,6 +410,7 @@ server_rerot_marker_step server_rerot_marker_parser::consume(std::string_view by
         candidate_.clear();
         state_ = server_rerot_marker_state::complete;
         step.write_visibility = llama_rerot_visibility::pending_record;
+        step.public_prefix_bytes = full;
         step.marker_closed = true;
         return step;
     }
@@ -419,6 +420,7 @@ server_rerot_marker_step server_rerot_marker_parser::consume(std::string_view by
         candidate_.assign(scan.substr(scan.size() - suffix));
         state_ = server_rerot_marker_state::marker_candidate;
         step.write_visibility = llama_rerot_visibility::pending_record;
+        step.public_prefix_bytes = scan.size() - suffix;
         return step;
     }
 
@@ -469,22 +471,32 @@ server_rerot_stream_lines server_rerot_line_mux::append(
         llama_rerot_node_id node_id,
         llama_rerot_run_id run_id,
         std::string_view bytes,
-        const llama_rerot_document & document) {
+        const llama_rerot_document & document,
+        size_t public_prefix_bytes) {
     server_rerot_stream_lines result;
-    if (node_id == LLAMA_REROT_NODE_INVALID || run_id == LLAMA_REROT_RUN_INVALID) {
+    if (node_id == LLAMA_REROT_NODE_INVALID ||
+        run_id == LLAMA_REROT_RUN_INVALID ||
+        public_prefix_bytes > bytes.size()) {
         result.ok = false;
-        result.error = "invalid RERoT line-stream node/run";
+        result.error = "invalid RERoT line-stream node/run or public prefix";
         return result;
     }
 
     auto & lane = lanes_[node_id];
-    if (!bytes.empty()) {
-        if (!lane.blocked.empty() && lane.blocked.back().run_id == run_id) {
-            lane.blocked.back().bytes.append(bytes);
-        } else {
-            lane.blocked.push_back({run_id, std::string(bytes)});
+    const auto append_segment = [&](std::string_view segment_bytes, bool presentation_public) {
+        if (segment_bytes.empty()) {
+            return;
         }
-    }
+        if (!lane.blocked.empty() &&
+            lane.blocked.back().run_id == run_id &&
+            lane.blocked.back().presentation_public == presentation_public) {
+            lane.blocked.back().bytes.append(segment_bytes);
+        } else {
+            lane.blocked.push_back({run_id, std::string(segment_bytes), presentation_public});
+        }
+    };
+    append_segment(bytes.substr(0, public_prefix_bytes), true);
+    append_segment(bytes.substr(public_prefix_bytes), false);
     return drain_lane(node_id, document, false);
 }
 
@@ -516,13 +528,15 @@ server_rerot_stream_lines server_rerot_line_mux::drain_lane(
 
     auto & lane = lane_it->second;
     while (!lane.blocked.empty()) {
+        const bool presentation_public = lane.blocked.front().presentation_public;
         const auto * run = document.run(lane.blocked.front().run_id);
         if (!run) {
             result.ok = false;
             result.error = "RERoT line stream references a missing run";
             return result;
         }
-        if (run->visibility == llama_rerot_visibility::pending_record) {
+        if (!presentation_public &&
+            run->visibility == llama_rerot_visibility::pending_record) {
             if (finish) {
                 result.ok = false;
                 result.error =
@@ -538,10 +552,12 @@ server_rerot_stream_lines server_rerot_line_mux::drain_lane(
 
         std::string bytes = std::move(lane.blocked.front().bytes);
         lane.blocked.pop_front();
-        if (run->visibility == llama_rerot_visibility::private_control) {
+        if (!presentation_public &&
+            run->visibility == llama_rerot_visibility::private_control) {
             continue;
         }
-        if (run->visibility != llama_rerot_visibility::public_live) {
+        if (!presentation_public &&
+            run->visibility != llama_rerot_visibility::public_live) {
             result.ok = false;
             result.error = "RERoT line stream encountered normal visibility";
             return result;
@@ -2360,6 +2376,14 @@ bool server_rerot_planner_parser::restore(const server_rerot_planner_snapshot & 
 
 const std::string & server_rerot_marker_parser::marker() const {
     return marker_;
+}
+
+std::string_view server_rerot_marker_parser::completion_suffix() const {
+    if (state_ == server_rerot_marker_state::complete ||
+        state_ == server_rerot_marker_state::failed) {
+        return {};
+    }
+    return std::string_view(marker_).substr(candidate_.size());
 }
 
 server_rerot_marker_snapshot server_rerot_marker_parser::snapshot() const {

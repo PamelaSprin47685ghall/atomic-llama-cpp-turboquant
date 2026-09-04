@@ -174,6 +174,65 @@ static void test_line_mux_completion_order_and_visibility() {
     CHECK(!missing.ok);
 }
 
+static void test_marker_token_preserves_public_prefix() {
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
+    const uint64_t episode_id = runtime.adopt_root(96, 96, 0, 0, 0);
+    server_rerot_line_mux mux;
+
+    auto plan = runtime.plan_generated_token(
+        episode_id, 0, 0, "answer</p");
+    CHECK(plan.has_value());
+    CHECK(plan && runtime.commit_token(episode_id, 0, *plan));
+    if (!plan) {
+        return;
+    }
+    auto ready = mux.append(
+        0, plan->run_id, "answer</p", runtime.episode(episode_id)->document);
+    CHECK(ready.ok && ready.lines.empty());
+
+    auto * node = runtime.node(episode_id, 0);
+    CHECK(node != nullptr);
+    plan = runtime.plan_generated_token(
+        episode_id, 0, node ? node->storage_pos_next : 1, "></");
+    CHECK(plan.has_value());
+    CHECK(plan && plan->marker_step.public_prefix_bytes == 1);
+    CHECK(plan && runtime.commit_token(episode_id, 0, *plan));
+    if (!plan) {
+        return;
+    }
+    ready = mux.append(
+        0,
+        plan->run_id,
+        "></",
+        runtime.episode(episode_id)->document,
+        plan->marker_step.public_prefix_bytes);
+    CHECK(ready.ok && ready.lines.empty());
+
+    node = runtime.node(episode_id, 0);
+    CHECK(node != nullptr);
+    plan = runtime.plan_generated_token(
+        episode_id, 0, node ? node->storage_pos_next : 2, "blockquote>");
+    CHECK(plan.has_value());
+    CHECK(plan && plan->marker_step.marker_closed);
+    CHECK(plan && runtime.commit_token(episode_id, 0, *plan));
+    if (!plan) {
+        return;
+    }
+    ready = mux.append(
+        0,
+        plan->run_id,
+        "blockquote>",
+        runtime.episode(episode_id)->document,
+        plan->marker_step.public_prefix_bytes);
+    CHECK(ready.ok && ready.lines.empty());
+
+    ready = mux.finish(0, runtime.episode(episode_id)->document);
+    CHECK(ready.ok);
+    CHECK(ready.lines == std::vector<std::string>({"answer</p>\n"}));
+    CHECK(mux.empty());
+    CHECK(runtime.erase_episode(episode_id));
+}
+
 static void test_split_pending_record_resolution() {
     server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
     const uint64_t episode_id = runtime.adopt_root(98, 98, 0, 0, 10);
@@ -1017,6 +1076,7 @@ int main() {
     std::fprintf(stderr, "=== RERoT Runtime Tests ===\n");
     test_chronicle_to_canonical_mapping_registry();
     test_line_mux_completion_order_and_visibility();
+    test_marker_token_preserves_public_prefix();
     test_split_pending_record_resolution();
     test_private_span_reserves_one_contiguous_run();
     test_n1_no_fork_disarm_forever();

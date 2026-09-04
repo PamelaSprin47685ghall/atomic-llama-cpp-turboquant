@@ -8,7 +8,9 @@
 #include "../src/llama-grammar.h"
 #include "../src/unicode.h"
 #include "../tools/server/server-chat.h"
+#include "../tools/server/server-task.h"
 #include "chat-auto-parser.h"
+#include "chat-peg-parser.h"
 #include "chat.h"
 #include "common.h"
 #include "ggml.h"
@@ -7175,6 +7177,86 @@ static void test_reasoning_budget_message_per_request() {
     }
 }
 
+static void test_rerot_stream_preserves_tool_calls() {
+    LOG_DBG("%s\n", __func__);
+
+    const auto tools_json =
+        common_chat_tools_to_json_oaicompat({special_function_tool});
+    const auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+        auto reasoning = p.optional(
+            "<think>" + p.reasoning(p.until("</think>")) +
+            "</think>" + p.space());
+        auto tool_call = p.standard_json_tools(
+            "<tool_call>[", "]</tool_call>", tools_json, false, false);
+        return p.sequence({
+            reasoning,
+            p.content(p.until("<tool_call>")),
+            p.optional(p.space() + tool_call),
+            p.space(),
+            p.end(),
+        });
+    });
+
+    common_chat_parser_params parser_params;
+    parser_params.format = COMMON_CHAT_FORMAT_PEG_NATIVE;
+    parser_params.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    parser_params.generation_prompt = "<think>";
+    parser_params.parser.load(parser.save());
+    task_result_state state(parser_params);
+
+    server_task_result_cmpl_partial reasoning;
+    reasoning.res_type = TASK_RESPONSE_TYPE_OAI_RESP;
+    reasoning.is_rerot_reasoning = true;
+    reasoning.content = "lane reasoning\n";
+    reasoning.update(state);
+    assert_equals(false, reasoning.thinking_block_started);
+    assert_equals(true, state.thinking_block_started);
+    assert_equals(std::string("lane reasoning\n"), state.chat_msg.reasoning_content);
+
+    std::string leaked_content;
+    const auto collect_content = [&](const std::vector<common_chat_msg_diff> & diffs) {
+        for (const auto & diff : diffs) {
+            leaked_content += diff.content_delta;
+        }
+    };
+
+    server_task_result_cmpl_partial first;
+    first.is_rerot_content = true;
+    first.rerot_parse_prefix = "</think>\n\n";
+    first.content =
+        R"(<tool_call>[{"name":"special_function","arguments":{"arg1":)";
+    first.update(state);
+    collect_content(first.oaicompat_msg_diffs);
+
+    server_task_result_cmpl_partial second;
+    second.is_rerot_content = true;
+    second.rerot_parse_prefix = "</think>\n\n";
+    second.content = R"(1}}]</tool_call>)";
+    second.update(state);
+    collect_content(second.oaicompat_msg_diffs);
+
+    server_task_result_cmpl_final final;
+    final.stream = true;
+    final.rerot_explicit_channels = true;
+    final.rerot_parse_prefix = "</think>\n\n";
+    final.update(state);
+    collect_content(final.oaicompat_msg_diffs);
+
+    assert_not_contains(leaked_content, "<tool_call>");
+    assert_equals(std::string("lane reasoning\n"), final.oaicompat_msg.reasoning_content);
+    assert_equals(std::string(), final.oaicompat_msg.content);
+    assert_equals(size_t(1), final.oaicompat_msg.tool_calls.size());
+    assert_equals(
+        std::string("special_function"),
+        final.oaicompat_msg.tool_calls.front().name);
+    assert_equals(
+        json({{"arg1", 1}}),
+        json::parse(final.oaicompat_msg.tool_calls.front().arguments));
+    if (final.oaicompat_msg.tool_calls.front().id.empty()) {
+        throw std::runtime_error("RERoT streamed tool call is missing its ID");
+    }
+}
+
 static void test_msg_diffs_compute() {
     LOG_DBG("%s\n", __func__);
     {
@@ -7325,6 +7407,7 @@ int main(int argc, char ** argv) {
     } else
 #endif
     {
+        test_rerot_stream_preserves_tool_calls();
         test_msg_diffs_compute();
         test_msgs_oaicompat_json_conversion();
         test_msg_token_delimiters_split();

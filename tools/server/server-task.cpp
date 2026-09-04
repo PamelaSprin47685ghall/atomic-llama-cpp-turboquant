@@ -562,6 +562,31 @@ common_chat_msg task_result_state::update_rerot_msg(
     return chat_msg;
 }
 
+common_chat_msg task_result_state::update_rerot_content(
+        const std::string & parse_prefix,
+        const std::string & text_added,
+        bool is_partial,
+        std::vector<common_chat_msg_diff> & diffs) {
+    if (generated_text.empty()) {
+        generated_text = parse_prefix;
+    }
+    generated_text += text_added;
+    auto msg_prv_copy = chat_msg;
+
+    auto new_msg =
+        common_chat_parse(generated_text, is_partial, chat_parser_params);
+    if (!new_msg.empty()) {
+        if (new_msg.role.empty()) {
+            new_msg.role = "assistant";
+        }
+        new_msg.reasoning_content = msg_prv_copy.reasoning_content;
+        new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
+        chat_msg = std::move(new_msg);
+        diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
+    }
+    return chat_msg;
+}
+
 //
 
 // result_timings
@@ -1348,28 +1373,19 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     state.stream_started = true;
 
     if (is_rerot_reasoning) {
+        if (state.chat_msg.role.empty()) {
+            state.chat_msg.role = "assistant";
+        }
         state.chat_msg.reasoning_content += content;
         common_chat_msg_diff diff;
         diff.reasoning_content_delta = content;
         oaicompat_msg_diffs.push_back(std::move(diff));
-        state.thinking_block_started = true;
-        thinking_block_started = true;
-        text_block_started = state.text_block_started;
-        return;
+    } else if (is_rerot_content) {
+        state.update_rerot_content(
+            rerot_parse_prefix, content, true, oaicompat_msg_diffs);
+    } else {
+        state.update_chat_msg(content, true, oaicompat_msg_diffs);
     }
-
-    if (is_rerot_content) {
-        state.chat_msg.content += content;
-        common_chat_msg_diff diff;
-        diff.content_delta = content;
-        oaicompat_msg_diffs.push_back(std::move(diff));
-        state.text_block_started = true;
-        thinking_block_started = state.thinking_block_started;
-        text_block_started = true;
-        return;
-    }
-
-    state.update_chat_msg(content, true, oaicompat_msg_diffs);
 
     // Copy current state for use in to_json_*() (reflects state BEFORE this chunk)
     thinking_block_started = state.thinking_block_started;

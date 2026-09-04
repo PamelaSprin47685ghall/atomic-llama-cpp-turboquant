@@ -1215,6 +1215,7 @@ private:
         std::unordered_map<llama_rerot_node_id, server_tokens> lineage_tokens;
         std::unordered_map<llama_rerot_node_id, std::vector<uint8_t>> parent_recurrent_snapshots;
         std::unordered_map<llama_rerot_run_id, std::string> run_bytes;
+        std::unordered_map<llama_rerot_run_id, std::string> run_public_prefixes;
         server_rerot_line_mux line_mux;
         server_rerot_control_tag_filter final_content_filter;
         std::string streamed_reasoning;
@@ -1309,7 +1310,8 @@ private:
             uint64_t episode_id,
             llama_rerot_node_id node_id,
             llama_rerot_run_id run_id,
-            std::string_view bytes) {
+            std::string_view bytes,
+            size_t public_prefix_bytes) {
         auto transport_it = rerot_transport.find(episode_id);
         auto * episode = rerot ? rerot->episode(episode_id) : nullptr;
         if (transport_it == rerot_transport.end() || !episode) {
@@ -1321,7 +1323,7 @@ private:
         }
 
         auto ready = transport.line_mux.append(
-            node_id, run_id, bytes, episode->document);
+            node_id, run_id, bytes, episode->document, public_prefix_bytes);
         const bool ok = ready.ok;
         rerot_emit_reasoning_lines(episode_id, transport, std::move(ready));
         return ok;
@@ -1987,7 +1989,15 @@ private:
         std::string result;
         for (const auto & view_run : view.runs) {
             const auto * run = episode->document.run(view_run.run_id);
-            if (!run || run->visibility != llama_rerot_visibility::public_live) {
+            if (!run) {
+                continue;
+            }
+            const auto prefix_it =
+                transport_it->second->run_public_prefixes.find(run->id);
+            if (prefix_it != transport_it->second->run_public_prefixes.end()) {
+                result += prefix_it->second;
+            }
+            if (run->visibility != llama_rerot_visibility::public_live) {
                 continue;
             }
             const auto text_it = transport_it->second->run_bytes.find(run->id);
@@ -2053,14 +2063,41 @@ private:
 
         const auto commit_one = [&](const server_rerot_token_plan & current_plan,
                                     const std::string & bytes) {
+            const size_t public_prefix_bytes =
+                current_plan.marker_step.public_prefix_bytes;
+            if (public_prefix_bytes > bytes.size()) {
+                rerot->hard_abort(
+                    episode_id,
+                    "rerot_state_error: marker public prefix exceeds token bytes");
+                return false;
+            }
             if (!rerot->commit_token(episode_id, node_id, current_plan)) {
                 return false;
             }
-            transport_it->second->run_bytes[current_plan.run_id] += bytes;
+
+            auto & transport = *transport_it->second;
+            if (public_prefix_bytes != 0) {
+                const auto * node = rerot->node(episode_id, node_id);
+                if (node && node->public_run.has_value() &&
+                    *node->public_run != current_plan.run_id) {
+                    transport.run_bytes[*node->public_run].append(
+                        bytes.data(), public_prefix_bytes);
+                } else {
+                    transport.run_public_prefixes[current_plan.run_id].append(
+                        bytes.data(), public_prefix_bytes);
+                }
+            }
+            transport.run_bytes[current_plan.run_id].append(
+                bytes.data() + public_prefix_bytes,
+                bytes.size() - public_prefix_bytes);
             if (!slot.rerot_serial_tail &&
                 current_plan.visibility != llama_rerot_visibility::private_control &&
                 !rerot_stream_commit(
-                    episode_id, node_id, current_plan.run_id, bytes)) {
+                    episode_id,
+                    node_id,
+                    current_plan.run_id,
+                    bytes,
+                    public_prefix_bytes)) {
                 return false;
             }
             ++transport_it->second->model_tokens;
@@ -2495,14 +2532,20 @@ private:
                 const auto * document_node = episode
                     ? episode->document.node(slot.rerot_node_id)
                     : nullptr;
+                const auto * runtime_node =
+                    rerot->node(slot.rerot_episode_id, slot.rerot_node_id);
+                const std::string close_suffix = runtime_node
+                    ? std::string(runtime_node->exit_parser.completion_suffix())
+                    : std::string();
                 if (document_node &&
                     (document_node->state == llama_rerot_node_state::terminal_running ||
                      document_node->state == llama_rerot_node_state::planning) &&
                     slot.rerot_injection == server_rerot_injection_kind::none &&
+                    !close_suffix.empty() &&
                     rerot_set_injection(
                         slot,
                         server_rerot_injection_kind::worker_close,
-                        "</blockquote>")) {
+                        close_suffix)) {
                     SRV_INF("RERoT Lane EOG normalized to record close: episode=%" PRIu64
                             " node=%u slot=%d\n",
                         slot.rerot_episode_id, slot.rerot_node_id, slot.id);
@@ -4511,6 +4554,7 @@ private:
             res->tokens  = { tkn.tok };
             if (slot.rerot_serial_tail) {
                 res->is_rerot_content = true;
+                res->rerot_parse_prefix = SERVER_REROT_REASONING_END;
             }
         }
 
@@ -4552,8 +4596,12 @@ private:
 
         // in stream mode, content and tokens are already in last partial chunk
         if (slot.task->params.stream) {
-            res->content     = "";
-            res->tokens      = llama_tokens{};
+            res->content = "";
+            res->tokens = llama_tokens{};
+            if (slot.rerot_serial_tail) {
+                res->rerot_parse_prefix = SERVER_REROT_REASONING_END;
+                res->rerot_explicit_channels = true;
+            }
         } else if (slot.rerot_serial_tail) {
             const auto transport_it = rerot_transport.find(slot.rerot_episode_id);
             GGML_ASSERT(transport_it != rerot_transport.end());

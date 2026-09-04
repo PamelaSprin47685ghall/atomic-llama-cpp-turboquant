@@ -203,14 +203,34 @@ static void test_private_marker_split() {
 
     auto step = parser.consume("conclusion </blockquo");
     CHECK(step.write_visibility == llama_rerot_visibility::pending_record);
+    CHECK(step.public_prefix_bytes == std::string("conclusion ").size());
     CHECK(!step.marker_closed);
     CHECK(parser.state() == server_rerot_marker_state::marker_candidate);
 
     step = parser.consume("te>\n");
     CHECK(step.write_visibility == llama_rerot_visibility::pending_record);
+    CHECK(step.public_prefix_bytes == 0);
     CHECK(step.marker_closed);
     CHECK(!step.malformed);
     CHECK(parser.complete());
+}
+
+static void test_private_marker_completion_suffix() {
+    server_rerot_marker_parser parser;
+    CHECK(parser.completion_suffix() == "</blockquote>");
+
+    auto step = parser.consume("></");
+    CHECK(step.public_prefix_bytes == 1);
+    CHECK(parser.completion_suffix() == "blockquote>");
+
+    step = parser.consume("blockquote");
+    CHECK(step.public_prefix_bytes == 0);
+    CHECK(parser.completion_suffix() == ">");
+
+    step = parser.consume(">");
+    CHECK(step.marker_closed);
+    CHECK(parser.complete());
+    CHECK(parser.completion_suffix().empty());
 }
 
 static void test_private_marker_false_prefix() {
@@ -302,6 +322,7 @@ int main() {
     test_planner_prompt_shape();
     test_planner_grammar_rejects_empty_items();
     test_private_marker_split();
+    test_private_marker_completion_suffix();
     test_private_marker_false_prefix();
     test_private_marker_closes_with_trailing_body();
     test_private_marker_after_complete_is_ignored();
