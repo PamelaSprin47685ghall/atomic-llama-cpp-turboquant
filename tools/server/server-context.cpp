@@ -138,6 +138,7 @@ enum class server_rerot_injection_kind : uint8_t {
 };
 
 static constexpr size_t SERVER_REROT_PRIVATE_BATCH = 32;
+static constexpr std::string_view SERVER_REROT_REASONING_END = "</think>\n\n";
 
 static bool server_rerot_private_microbatch(server_rerot_injection_kind injection) {
     return injection == server_rerot_injection_kind::planner ||
@@ -1496,7 +1497,8 @@ private:
     static std::string rerot_finalizer_control_prompt(std::string_view original_user_text) {
         std::string prompt = "推导已经足够。回到原始请求：";
         prompt.append(original_user_text);
-        prompt += "\n</think>\n\n";
+        prompt.push_back('\n');
+        prompt.append(SERVER_REROT_REASONING_END);
         return prompt;
     }
 
@@ -4560,6 +4562,7 @@ private:
             const size_t offset = transport_it->second->final_content_offset;
             GGML_ASSERT(offset <= slot.generated_text.size());
             res->rerot_reasoning = slot.generated_text.substr(0, offset);
+            res->rerot_parse_prefix = SERVER_REROT_REASONING_END;
             res->content = slot.generated_text.substr(offset);
             res->rerot_explicit_channels = true;
             res->tokens = std::move(slot.generated_tokens);

@@ -218,6 +218,7 @@ struct task_result_state {
 
     common_chat_msg update_rerot_msg(
         const std::string & reasoning,
+        const std::string & parse_prefix,
         const std::string & content,
         std::vector<common_chat_msg_diff> & diffs);
 };
@@ -467,6 +468,7 @@ struct completion_token_output {
 struct server_task_result_cmpl_final : server_task_result {
     std::string content;
     std::string rerot_reasoning;
+    std::string rerot_parse_prefix;
     bool rerot_explicit_channels = false;
     llama_tokens tokens;
 
@@ -514,7 +516,7 @@ struct server_task_result_cmpl_final : server_task_result {
     virtual void update(task_result_state & state) override {
         is_updated = true;
         oaicompat_msg = rerot_explicit_channels
-            ? state.update_rerot_msg(rerot_reasoning, content, oaicompat_msg_diffs)
+            ? state.update_rerot_msg(rerot_reasoning, rerot_parse_prefix, content, oaicompat_msg_diffs)
             : state.update_chat_msg(content, false, oaicompat_msg_diffs);
 
         oai_resp_id = state.oai_resp_id;
