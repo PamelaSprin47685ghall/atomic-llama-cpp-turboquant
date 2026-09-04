@@ -585,7 +585,7 @@ server_rerot_stream_lines server_rerot_line_mux::drain_lane(
 
 std::string_view server_rerot_planner_prompt() {
     static constexpr std::string_view prompt =
-        "我按依赖把请求归成并行目标。只有无需其他项结果也能完成的目标才分开；有依赖就合并，例如“确定对象”和“分析该对象”是一项。每个 li 只写目标，不展开答案，同一目标的并列细节归在一起。以 ol 开头、/ol 结尾。\n";
+        "我按依赖把请求归成并行目标：遮住其他 li 后仍能完成的目标才分开，否则合并。每个 li 只写目标，不展开答案；同一目标的并列细节归在一起。以 ol 开头、/ol 结尾。\n";
     return prompt;
 }
 
