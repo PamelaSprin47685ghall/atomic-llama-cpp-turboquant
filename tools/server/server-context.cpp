@@ -1487,7 +1487,7 @@ private:
         } else {
             prompt = "我当前在此推进目标，目标是：";
             prompt.append(assigned_task);
-            prompt += "。我直接用单个 li 确认该目标并用 /ol 闭合，随后展开具体推导；只有这项任务确实包含多个需要并行的独立子环节时，才拆成多个 li。\n";
+            prompt += "。我直接用单个 li 承接该目标并用 /ol 闭合；只有确实包含多个可并行的独立子目标时才拆成多个 li，每个 li 同样是可判定的目标，不是开放话题。\n";
         }
         return prompt;
     }
