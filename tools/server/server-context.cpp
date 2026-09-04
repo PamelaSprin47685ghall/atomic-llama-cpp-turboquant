@@ -1485,7 +1485,7 @@ private:
         prompt +=
             "】。我看到上面父节点已经完成了结构规划并给出了 ol 列表。"
             "当前已经是具体子任务，我直接在此深入推导并得出结论；"
-            "除非确实很有必要开启并行的子子任务，我才仿照父节点使用 ol 格式拆分子子任务。否则我直接写出完整推理过程。\n";
+            "除非确实很有必要开启并行的子子任务，我才仿照父节点使用 ol 格式拆分子子任务。否则我直接写出完整推理过程，并在完成本任务后输出 &lt;/think&gt; 结束。\n";
         return prompt;
     }
 
@@ -2464,7 +2464,8 @@ private:
                     ? episode->document.node(slot.rerot_node_id)
                     : nullptr;
                 if (document_node &&
-                    document_node->state == llama_rerot_node_state::terminal_running &&
+                    (document_node->state == llama_rerot_node_state::terminal_running ||
+                     document_node->state == llama_rerot_node_state::planning) &&
                     slot.rerot_injection == server_rerot_injection_kind::none &&
                     rerot_set_injection(
                         slot,
