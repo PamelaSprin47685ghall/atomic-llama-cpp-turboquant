@@ -546,7 +546,7 @@ server_rerot_stream_lines server_rerot_line_mux::drain_lane(
 
 std::string_view server_rerot_planner_prompt() {
     static constexpr std::string_view prompt =
-        "我把请求拆成可并行的独立子答案，以 ol 开头，每个 li 是一个直接回答用户的子问题，以 /ol 结尾。li 写子答案，不写开放话题，不写工作步骤。简单问题只写一个 li 直接答。\n";
+        "我把请求拆成可并行的独立目标，以 ol 开头，每个 li 是一个可判定的动词目标加交付标准，以 /ol 结尾。li 只写目标，不写开放话题。不必拆就只写一个 li。\n";
     return prompt;
 }
 
