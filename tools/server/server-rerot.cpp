@@ -517,14 +517,35 @@ server_rerot_stream_lines server_rerot_line_mux::drain_lane(
         for (size_t newline = lane.partial_line.find('\n');
              newline != std::string::npos;
              newline = lane.partial_line.find('\n')) {
-            result.lines.push_back(lane.partial_line.substr(0, newline + 1));
+            std::string line = lane.partial_line.substr(0, newline + 1);
             lane.partial_line.erase(0, newline + 1);
+            const size_t marker_pos = line.find("</think>");
+            if (marker_pos != std::string::npos) {
+                line.erase(marker_pos, 8);
+            }
+            if (!line.empty() && line != "\n") {
+                result.lines.push_back(std::move(line));
+            }
         }
     }
 
     if (finish && !lane.partial_line.empty()) {
-        lane.partial_line.push_back('\n');
-        result.lines.push_back(std::move(lane.partial_line));
+        const size_t marker_prefix_len = trailing_marker_prefix(lane.partial_line, "</think>");
+        if (marker_prefix_len > 0) {
+            lane.partial_line.erase(lane.partial_line.size() - marker_prefix_len);
+        }
+        const size_t marker_pos = lane.partial_line.find("</think>");
+        if (marker_pos != std::string::npos) {
+            lane.partial_line.erase(marker_pos, 8);
+        }
+        while (!lane.partial_line.empty() &&
+               (lane.partial_line.back() == '<' || lane.partial_line.back() == '/')) {
+            lane.partial_line.pop_back();
+        }
+        if (!lane.partial_line.empty() && !only_ascii_space(lane.partial_line)) {
+            lane.partial_line.push_back('\n');
+            result.lines.push_back(std::move(lane.partial_line));
+        }
     }
     if (finish || (lane.blocked.empty() && lane.partial_line.empty())) {
         lanes_.erase(lane_it);

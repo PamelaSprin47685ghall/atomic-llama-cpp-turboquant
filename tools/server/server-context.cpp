@@ -1480,12 +1480,11 @@ private:
     }
 
     std::string rerot_worker_control_prompt(std::string_view assigned_task) const {
-        std::string prompt = "我当前负责推进子任务【";
+        std::string prompt = "我围绕【";
         prompt.append(assigned_task);
         prompt +=
-            "】。我看到上面父节点已经完成了结构规划并给出了 ol 列表。"
-            "当前已经是具体子任务，我直接在此深入推导并得出结论；"
-            "除非确实很有必要开启并行的子子任务，我才仿照父节点使用 ol 格式拆分子子任务。否则我直接写出完整推理过程，并在完成本任务后输出 &lt;/think&gt; 结束。\n";
+            "】在此展开具体深入的推理分析。推导完毕后，我以 &lt;/think&gt; 结束本任务；"
+            "若确有必要开启并行的子子任务，我才仿照父节点的 ol 列表继续拆分。\n";
         return prompt;
     }
 
@@ -2494,6 +2493,12 @@ private:
             params_base.special ||
                 slot.task->params.sampling.preserved_tokens.find(id) !=
                     slot.task->params.sampling.preserved_tokens.end());
+        if (slot.rerot_serial_tail) {
+            const size_t think_pos = output.text_to_send.find("</think>");
+            if (think_pos != std::string::npos) {
+                output.text_to_send.erase(think_pos, 8);
+            }
+        }
         output.prob = 1.0f;
         if (slot.task->params.sampling.n_probs > 0) {
             populate_token_probs(
