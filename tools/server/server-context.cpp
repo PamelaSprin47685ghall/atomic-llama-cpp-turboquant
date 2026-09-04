@@ -4168,6 +4168,11 @@ private:
 
         // initialize samplers
         if (task.need_sampling()) {
+            if (params_base.rerot_enabled && task.params.rerot_enabled) {
+                task.params.sampling.reasoning_budget_start.clear();
+                task.params.sampling.reasoning_budget_end.clear();
+                task.params.sampling.reasoning_budget_tokens = -1;
+            }
             try {
                 slot.smpl.reset(common_sampler_init(
                         model_tgt, task.params.sampling, (int32_t) llama_n_ctx(ctx_tgt)));

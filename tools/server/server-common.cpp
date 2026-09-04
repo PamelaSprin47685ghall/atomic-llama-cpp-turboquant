@@ -1173,8 +1173,9 @@ json oaicompat_chat_params_parse(
 
     llama_params["message_delimiters"] = chat_params.message_delimiters.to_json();
 
-    // Reasoning budget: pass parameters through to sampling layer
-    {
+    // Reasoning budget: pass parameters through to sampling layer.
+    // For RERoT, sublanes manage their own blockquote delimiters and never force think tags.
+    if (!json_value(body, "rerot", false)) {
         int reasoning_budget = json_value(body, "reasoning_budget_tokens",
                                json_value(body, "thinking_budget_tokens", -1));
         if (reasoning_budget == -1) {
