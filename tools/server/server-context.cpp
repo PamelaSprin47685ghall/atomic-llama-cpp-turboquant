@@ -1444,15 +1444,13 @@ private:
 
     static common_grammar rerot_planner_remainder_grammar() {
         // The structural opener "<ol>\n<li>" is injected before model
-        // sampling. Constrain exactly the remainder: one non-empty text item,
-        // then zero or more flat sibling items, then the single closing tag.
-        // Excluding '<' from item text prevents </think> or nested markup from
-        // entering an otherwise still-PENDING planner record.
+        // sampling. Constrain exactly the remainder: one text item containing
+        // a non-whitespace character, then zero or more flat sibling items,
+        // then the single closing tag. Excluding '<' from item text prevents
+        // </think> or nested markup from entering a still-PENDING record.
         return {
             COMMON_GRAMMAR_TYPE_USER,
-            "root ::= item-text \"</li>\" ws (\"<li>\" item-text \"</li>\" ws)* \"</ol>\"\n"
-            "item-text ::= [^<]+\n"
-            "ws ::= [ \\t\\r\\n]*\n",
+            std::string(server_rerot_planner_grammar()),
         };
     }
 

@@ -1,5 +1,9 @@
 #include "server-rerot.h"
 
+#include "../src/llama-grammar.h"
+#include "../src/unicode.h"
+
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -162,6 +166,38 @@ static void test_planner_prompt_shape() {
     CHECK(prompt.size() < 300);
 }
 
+static bool planner_grammar_accepts(const std::string & input) {
+    const std::string grammar_text(server_rerot_planner_grammar());
+    llama_grammar * grammar = llama_grammar_init_impl(
+        nullptr, grammar_text.c_str(), "root", false, nullptr, 0, nullptr, 0);
+    CHECK(grammar != nullptr);
+    if (!grammar) {
+        return false;
+    }
+
+    auto & stacks = llama_grammar_get_stacks(grammar);
+    for (const auto cpt : unicode_cpts_from_utf8(input)) {
+        llama_grammar_accept(grammar, cpt);
+        if (stacks.empty()) {
+            llama_grammar_free_impl(grammar);
+            return false;
+        }
+    }
+
+    const bool complete = std::any_of(
+        stacks.begin(), stacks.end(), [](const auto & stack) { return stack.empty(); });
+    llama_grammar_free_impl(grammar);
+    return complete;
+}
+
+static void test_planner_grammar_rejects_empty_items() {
+    CHECK(planner_grammar_accepts("目标</li>\n</ol>"));
+    CHECK(planner_grammar_accepts("\n  目标  \n</li>\n<li>另一个目标</li>\n</ol>"));
+    CHECK(!planner_grammar_accepts("\n</li>\n</ol>"));
+    CHECK(!planner_grammar_accepts(" \t </li>\n</ol>"));
+    CHECK(!planner_grammar_accepts("目标</li>\n<li>\n</li>\n</ol>"));
+}
+
 static void test_private_marker_split() {
     server_rerot_marker_parser parser;
 
@@ -264,6 +300,7 @@ int main() {
     test_malformed_records();
     test_bytes_after_complete_are_malformed();
     test_planner_prompt_shape();
+    test_planner_grammar_rejects_empty_items();
     test_private_marker_split();
     test_private_marker_false_prefix();
     test_private_marker_closes_with_trailing_body();

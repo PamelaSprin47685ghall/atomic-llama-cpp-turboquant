@@ -186,6 +186,7 @@ private:
 // tokenized by the server so the runtime stays independent of tokenizer and
 // chat-template machinery.
 std::string_view server_rerot_planner_prompt();
+std::string_view server_rerot_planner_grammar();
 
 struct server_rerot_hard_limits {
     // Zero means unbounded. When any bound is crossed the whole episode takes

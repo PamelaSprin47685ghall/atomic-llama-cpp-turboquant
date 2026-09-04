@@ -585,8 +585,16 @@ server_rerot_stream_lines server_rerot_line_mux::drain_lane(
 
 std::string_view server_rerot_planner_prompt() {
     static constexpr std::string_view prompt =
-        "我按依赖把请求归成并行目标：遮住其他 li 后仍能完成的目标才分开，否则合并。每个 li 只写目标，不展开答案；同一目标的并列细节归在一起。以 ol 开头、/ol 结尾。\n";
+        "我把完成请求所需的推理目标按依赖分组：每项通过思考得到结论，不是执行计划或产物清单。只有遮住其他 li 后仍能完成的目标才分开，否则合并。每个 li 只写目标，不展开答案。以 ol 开头、/ol 结尾。\n";
     return prompt;
+}
+
+std::string_view server_rerot_planner_grammar() {
+    static constexpr std::string_view grammar =
+        "root ::= item-text \"</li>\" ws (\"<li>\" item-text \"</li>\" ws)* \"</ol>\"\n"
+        "item-text ::= [^<]* [^< \\t\\r\\n] [^<]*\n"
+        "ws ::= [ \\t\\r\\n]*\n";
+    return grammar;
 }
 
 server_rerot_runtime::server_rerot_runtime(
