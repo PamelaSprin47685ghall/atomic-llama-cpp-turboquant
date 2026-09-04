@@ -1494,9 +1494,9 @@ private:
     }
 
     static std::string rerot_finalizer_control_prompt(std::string_view original_user_text) {
-        std::string prompt = "推导已经足够。原始请求：";
+        std::string prompt = "推导已经足够。回到原始请求：";
         prompt.append(original_user_text);
-        prompt += "\n完整结果：\n";
+        prompt += "\n</think>\n\n";
         return prompt;
     }
 
