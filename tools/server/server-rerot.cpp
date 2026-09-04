@@ -369,7 +369,8 @@ server_rerot_marker_step server_rerot_marker_parser::consume(std::string_view by
         return step;
     }
     if (state_ == server_rerot_marker_state::complete) {
-        fail(step, "RERoT Lane emitted bytes after its private end marker");
+        step.marker_closed = true;
+        step.write_visibility = llama_rerot_visibility::pending_record;
         return step;
     }
 
@@ -388,10 +389,6 @@ server_rerot_marker_step server_rerot_marker_parser::consume(std::string_view by
         }
 
         if (scan.size() >= marker_.size() && scan.substr(0, marker_.size()) == marker_) {
-            if (!only_ascii_space(scan.substr(marker_.size()))) {
-                fail(step, "RERoT Lane emitted non-whitespace bytes after its private end marker");
-                return step;
-            }
             candidate_.clear();
             state_ = server_rerot_marker_state::complete;
             step.write_visibility = llama_rerot_visibility::pending_record;
@@ -409,10 +406,7 @@ server_rerot_marker_step server_rerot_marker_parser::consume(std::string_view by
 
     const size_t full = scan.find(marker_);
     if (full != std::string_view::npos) {
-        if (!only_ascii_space(scan.substr(full + marker_.size()))) {
-            fail(step, "RERoT Lane emitted non-whitespace bytes after its private end marker");
-            return step;
-        }
+        candidate_.clear();
         state_ = server_rerot_marker_state::complete;
         step.write_visibility = llama_rerot_visibility::pending_record;
         step.marker_closed = true;

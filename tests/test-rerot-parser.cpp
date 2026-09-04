@@ -186,21 +186,22 @@ static void test_private_marker_false_prefix() {
     CHECK(!step.marker_closed);
 }
 
-static void test_private_marker_rejects_trailing_body() {
+static void test_private_marker_closes_with_trailing_body() {
     server_rerot_marker_parser parser;
     const auto step = parser.consume("</blockquote>answer in same tokenizer token");
-    CHECK(step.malformed);
-    CHECK(parser.failed());
+    CHECK(step.marker_closed);
+    CHECK(!step.malformed);
+    CHECK(parser.complete());
 }
 
-static void test_private_marker_after_complete_is_malformed() {
+static void test_private_marker_after_complete_is_ignored() {
     server_rerot_marker_parser parser;
     const auto closed = parser.consume("done </blockquote>");
     CHECK(closed.marker_closed);
     CHECK(parser.complete());
     const auto extra = parser.consume("more");
-    CHECK(extra.malformed);
-    CHECK(!extra.error.empty());
+    CHECK(extra.marker_closed);
+    CHECK(!extra.malformed);
 }
 
 int main() {
@@ -217,8 +218,8 @@ int main() {
     test_planner_prompt_shape();
     test_private_marker_split();
     test_private_marker_false_prefix();
-    test_private_marker_rejects_trailing_body();
-    test_private_marker_after_complete_is_malformed();
+    test_private_marker_closes_with_trailing_body();
+    test_private_marker_after_complete_is_ignored();
     std::fprintf(stderr, "=== Results: %d failure(s) ===\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }
