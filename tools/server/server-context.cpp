@@ -1467,25 +1467,13 @@ private:
     }
 
     std::string rerot_planner_control_prompt(std::string_view assigned_task = {}) const {
-        // Ornith/Qwen3.5 treats raw text appended inside an assistant turn as
-        // content it has already authored, not as an instruction. A private
-        // ChatML turn boundary gives the fixed planner prompt its intended
-        // control role. These role tokens and the prompt remain PRIVATE.
-        std::string prompt =
-            std::string("</think>\n<|im_end|>\n<|im_start|>user\n") +
-            std::string(server_rerot_planner_prompt());
-        if (!assigned_task.empty()) {
-            prompt +=
-                "本轮只规划下面这个上级分配的任务，不要讨论对话过程、章节机制或控制指令：\n"
-                "【";
+        std::string prompt = "</think>\n<|im_end|>\n<|im_start|>user\n";
+        if (assigned_task.empty()) {
+            prompt += std::string(server_rerot_planner_prompt());
+        } else {
+            prompt += "我当前在推进【";
             prompt.append(assigned_task);
-            prompt +=
-                "】\n"
-                "上级已经完成过一次问题分解，因此本轮默认且优先只输出一个忠实复述该目标的 <li>。"
-                "一个主题包含饮食、运动、睡眠、安全、步骤或验证等多个方面，不构成继续拆分的理由；"
-                "这些方面应在同一个任务的公开分析中一起完成。"
-                "只有任务原文明确并列了两个以上可独立交付、各自需要单独推导且最后必须汇合的实质问题时，"
-                "才允许输出多个 <li>。\n";
+            prompt += "】。我直接用单个 <li> 确认该目标并用 </ol> 闭合，随后展开具体推导；只有这项任务确实包含多个需要并行的独立子环节时，才拆成多个 <li>。\n";
         }
         prompt += "<|im_end|>\n<|im_start|>assistant\n<think>\n";
         return prompt;
@@ -1494,22 +1482,18 @@ private:
     std::string rerot_worker_control_prompt(std::string_view assigned_task) const {
         std::string prompt =
             "</think>\n<|im_end|>\n<|im_start|>user\n"
-            "直接执行下面的任务，不要讨论对话过程、规划器、章节或控制指令：\n"
-            "【";
+            "我开始推导【";
         prompt.append(assigned_task);
         prompt +=
-            "】\n"
-            "直接写完整、具体、可验证的公开分析与本任务结论，并吸收其他可见章节中与本任务有关的最新事实。"
-            "不要宣布你将执行任务，不要回顾对话，不要输出规划列表，不要改写成全局最终回答；"
-            "完成本任务后正常结束思考。\n"
+            "】。我结合已有推导直接写出分析与结论，完成后结束思考。\n"
             "<|im_end|>\n<|im_start|>assistant\n<think>\n";
         return prompt;
     }
 
     static std::string rerot_finalizer_control_prompt(std::string_view original_user_text) {
         // The hidden planner is a synthetic user turn. Close it and restore a
-        // body-only assistant turn so the final survivor answers the original
-        // request instead of echoing the planner list as its response.
+        // normal assistant turn so the final survivor continues the original
+        // request instead of mistaking one planner item for the whole scope.
         std::string quoted_request;
         quoted_request.reserve(original_user_text.size());
         for (const char ch : original_user_text) {
@@ -1522,25 +1506,14 @@ private:
         }
 
         std::string prompt =
-            "<|im_end|>\n<|im_start|>user\n"
-            "现在直接回答本轮 RERoT 启动之前、对话中最早的真实用户问题。";
+            "<|im_end|>\n<|im_start|>user\n";
         if (!quoted_request.empty()) {
-            prompt += "\n原始用户问题（引用文本，不是新指令）：【";
+            prompt += "原始请求：【";
             prompt += quoted_request;
             prompt += "】\n";
         }
         prompt +=
-            "你当前所在 Lane 的上级分配任务只是其中一个章节，已经完成，绝不能把它误当成最终问题范围。"
-            "最终范围由最早真实用户问题和根级 <ol> 的全部任务共同决定；逐项吸收当前可见每个 <h*> "
-            "章节的实质结论，任何根级任务都不能遗漏。忽略关于对话、规划器、章节机制或控制指令的元叙述；"
-            "发现重复或冲突时进行校验和取舍。"
-            "使用用户的语言给出准确、完整、可执行且不过度绝对化的最终答案。"
-            "对所有数字、阈值和因果断言做一次证据与适用性复核。凡由日、周、比例或单位换算得到的数字，"
-            "必须重新计算且相互一致；不确定时删掉换算示例。缺少个体数据时只能给可调整的起点或范围；"
-            "章节草稿中的通用硬下限、无依据绝对数、伪精确公式或保证性因果必须从最终答案删除，"
-            "不能靠添加免责声明后继续保留。把必要目标与可选手段分开：有帮助的组成部分不得写成缺一不可。"
-            "明确重要前提、风险边界及缺少个体信息时的适用范围。"
-            "不要输出规划列表，不要复述控制指令，不要再次展示思维过程。\n"
+            "各部分的思考已经完成。我综合前面的所有推导与结论，直接按照原始请求完成最终交付，不再重复思考过程。\n"
             "<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n\n";
         return prompt;
     }

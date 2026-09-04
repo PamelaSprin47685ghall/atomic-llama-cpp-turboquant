@@ -154,6 +154,9 @@ static void test_planner_prompt_shape() {
     CHECK(prompt.find("<ol>") != std::string::npos);
     CHECK(prompt.find("<li>") != std::string::npos);
     CHECK(prompt.find("</ol>") != std::string::npos);
+    CHECK(prompt.find("请先") == std::string::npos);
+    CHECK(prompt.find("禁止") == std::string::npos);
+    CHECK(prompt.size() < 300);
 }
 
 static void test_private_marker_split() {

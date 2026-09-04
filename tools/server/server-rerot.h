@@ -170,8 +170,10 @@ private:
 };
 
 // Fixed private control prompt injected after the user's ordinary prompt and
-// before planner-visible generation. It is tokenized by the server so the
-// runtime stays independent of tokenizer/chat-template machinery.
+// before planner-visible generation. Its prose is deliberately phrased as the
+// model's first-person introspection rather than an external command. It is
+// tokenized by the server so the runtime stays independent of tokenizer and
+// chat-template machinery.
 std::string_view server_rerot_planner_prompt();
 
 struct server_rerot_hard_limits {
