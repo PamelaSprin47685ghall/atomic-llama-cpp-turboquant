@@ -2248,8 +2248,6 @@ private:
                 episode_id);
         }
 
-        const size_t reasoning_bytes_sent =
-            chronological_stream ? transport_it->second->streamed_reasoning.size() : 0;
         std::string response_reasoning = chronological_stream
             ? transport_it->second->streamed_reasoning
             : std::move(logical_reasoning);
@@ -2261,7 +2259,7 @@ private:
         slot.generated_text = std::move(response_reasoning);
         slot.generated_tokens.clear();
         slot.generated_token_probs.clear();
-        slot.n_sent_text = reasoning_bytes_sent;
+        slot.n_sent_text = slot.generated_text.size();
         slot.n_prompt_tokens_original = transport_it->second->response_task.n_tokens();
         slot.n_prompt_tokens_processed = transport_it->second->prompt_tokens_processed;
         slot.n_prompt_tokens_processed_accum =
