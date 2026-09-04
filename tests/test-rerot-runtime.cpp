@@ -93,11 +93,11 @@ static void request_exit(
         return;
     }
     CHECK(commit_generated(runtime, episode_id, node_id, node->storage_pos_next,
-        "final observation </thi"));
+        "final observation </blockquo"));
     node = runtime.node(episode_id, node_id);
     CHECK(node != nullptr);
     if (node) {
-        CHECK(commit_generated(runtime, episode_id, node_id, node->storage_pos_next, "nk>"));
+        CHECK(commit_generated(runtime, episode_id, node_id, node->storage_pos_next, "te>"));
         CHECK(node->exit_intent);
     }
 }
@@ -232,19 +232,19 @@ static void test_split_pending_record_resolution() {
 
     node = runtime.node(episode_id, 0);
     auto marker_a = runtime.plan_generated_token(
-        episode_id, 0, node->storage_pos_next, "</thi");
+        episode_id, 0, node->storage_pos_next, "</blockquo");
     CHECK(marker_a.has_value());
     CHECK(marker_a && runtime.commit_token(episode_id, 0, *marker_a));
     if (!marker_a) {
         return;
     }
-    ready = mux.append(0, marker_a->run_id, "</thi",
+    ready = mux.append(0, marker_a->run_id, "</blockquo",
         runtime.episode(episode_id)->document);
     CHECK(ready.ok && ready.lines.empty());
 
     node = runtime.node(episode_id, 0);
     auto marker_b = runtime.plan_generated_token(
-        episode_id, 0, node->storage_pos_next + 1, "nk>");
+        episode_id, 0, node->storage_pos_next + 1, "te>");
     CHECK(marker_b.has_value());
     CHECK(marker_b && marker_b->run_id != marker_a->run_id);
     CHECK(marker_b && marker_b->marker_step.marker_closed);
@@ -252,7 +252,7 @@ static void test_split_pending_record_resolution() {
     if (!marker_b) {
         return;
     }
-    ready = mux.append(0, marker_b->run_id, "nk>",
+    ready = mux.append(0, marker_b->run_id, "te>",
         runtime.episode(episode_id)->document);
     CHECK(ready.ok && ready.lines.empty());
     CHECK(mux.empty());

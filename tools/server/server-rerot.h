@@ -142,7 +142,7 @@ struct server_rerot_marker_snapshot {
 // the marker is either completed or disproved.
 class server_rerot_marker_parser {
 public:
-    explicit server_rerot_marker_parser(std::string marker = "</think>");
+    explicit server_rerot_marker_parser(std::string marker = "</blockquote>");
 
     void reset();
     server_rerot_marker_step consume(std::string_view bytes);

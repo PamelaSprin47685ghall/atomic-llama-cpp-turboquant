@@ -162,12 +162,12 @@ static void test_planner_prompt_shape() {
 static void test_private_marker_split() {
     server_rerot_marker_parser parser;
 
-    auto step = parser.consume("conclusion </thi");
+    auto step = parser.consume("conclusion </blockquo");
     CHECK(step.write_visibility == llama_rerot_visibility::pending_record);
     CHECK(!step.marker_closed);
     CHECK(parser.state() == server_rerot_marker_state::marker_candidate);
 
-    step = parser.consume("nk>\n");
+    step = parser.consume("te>\n");
     CHECK(step.write_visibility == llama_rerot_visibility::pending_record);
     CHECK(step.marker_closed);
     CHECK(!step.malformed);
@@ -188,14 +188,14 @@ static void test_private_marker_false_prefix() {
 
 static void test_private_marker_rejects_trailing_body() {
     server_rerot_marker_parser parser;
-    const auto step = parser.consume("</think>answer in same tokenizer token");
+    const auto step = parser.consume("</blockquote>answer in same tokenizer token");
     CHECK(step.malformed);
     CHECK(parser.failed());
 }
 
 static void test_private_marker_after_complete_is_malformed() {
     server_rerot_marker_parser parser;
-    const auto closed = parser.consume("done </think>");
+    const auto closed = parser.consume("done </blockquote>");
     CHECK(closed.marker_closed);
     CHECK(parser.complete());
     const auto extra = parser.consume("more");

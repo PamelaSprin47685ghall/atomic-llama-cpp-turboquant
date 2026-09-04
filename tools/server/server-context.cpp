@@ -1483,16 +1483,14 @@ private:
         std::string prompt = "我在此展开具体深入的推理分析，目标是：";
         prompt.append(assigned_task);
         prompt +=
-            "。推导完毕后，我以 /think 标记结束本任务；"
-            "若确有必要开启并行的子子任务，我才仿照父节点的 ol 列表继续拆分。\n<think>\n";
+            "。推导完毕后，我以 </blockquote> 结束本部分；"
+            "若确有必要开启并行的子子任务，我才仿照父节点的 ol 列表继续拆分。\n<blockquote>\n";
         return prompt;
     }
 
     static std::string rerot_finalizer_control_prompt(std::string_view original_user_text) {
         GGML_UNUSED(original_user_text);
-        // Pure <think></think> layer boundary: closing thinking transitions
-        // directly to the final assistant response body.
-        return "</think>\n\n";
+        return "\n\n";
     }
 
     bool rerot_set_injection(
@@ -2242,7 +2240,7 @@ private:
         std::string response_reasoning = chronological_stream
             ? transport_it->second->streamed_reasoning
             : std::move(logical_reasoning);
-        response_reasoning += "</think>\n\n";
+        response_reasoning += "\n\n";
 
         slot.task = std::make_unique<const server_task>(std::move(final_task));
         slot.smpl = std::move(final_sampler);
@@ -2480,7 +2478,7 @@ private:
                     rerot_set_injection(
                         slot,
                         server_rerot_injection_kind::worker_close,
-                        "</think>")) {
+                        "</blockquote>")) {
                     SRV_INF("RERoT Lane EOG normalized to record close: episode=%" PRIu64
                             " node=%u slot=%d\n",
                         slot.rerot_episode_id, slot.rerot_node_id, slot.id);
@@ -2505,9 +2503,12 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(id) !=
                     slot.task->params.sampling.preserved_tokens.end());
         if (slot.rerot_serial_tail) {
-            const size_t think_pos = output.text_to_send.find("</think>");
-            if (think_pos != std::string::npos) {
-                output.text_to_send.erase(think_pos, 8);
+            for (const std::string_view tag : {"<blockquote>", "</blockquote>"}) {
+                for (size_t pos = output.text_to_send.find(tag);
+                     pos != std::string::npos;
+                     pos = output.text_to_send.find(tag)) {
+                    output.text_to_send.erase(pos, tag.size());
+                }
             }
         }
         output.prob = 1.0f;

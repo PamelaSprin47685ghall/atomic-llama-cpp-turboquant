@@ -520,13 +520,10 @@ server_rerot_stream_lines server_rerot_line_mux::drain_lane(
              newline = lane.partial_line.find('\n')) {
             std::string line = lane.partial_line.substr(0, newline + 1);
             lane.partial_line.erase(0, newline + 1);
-            const size_t open_think_pos = line.find("<think>");
-            if (open_think_pos != std::string::npos) {
-                line.erase(open_think_pos, 7);
-            }
-            const size_t marker_pos = line.find("</think>");
-            if (marker_pos != std::string::npos) {
-                line.erase(marker_pos, 8);
+            for (const std::string_view tag : {"<blockquote>", "</blockquote>"}) {
+                for (size_t pos = line.find(tag); pos != std::string::npos; pos = line.find(tag)) {
+                    line.erase(pos, tag.size());
+                }
             }
             if (!line.empty() && line != "\n") {
                 result.lines.push_back(std::move(line));
@@ -535,17 +532,16 @@ server_rerot_stream_lines server_rerot_line_mux::drain_lane(
     }
 
     if (finish && !lane.partial_line.empty()) {
-        const size_t open_think_pos = lane.partial_line.find("<think>");
-        if (open_think_pos != std::string::npos) {
-            lane.partial_line.erase(open_think_pos, 7);
-        }
-        const size_t marker_prefix_len = trailing_marker_prefix(lane.partial_line, "</think>");
-        if (marker_prefix_len > 0) {
-            lane.partial_line.erase(lane.partial_line.size() - marker_prefix_len);
-        }
-        const size_t marker_pos = lane.partial_line.find("</think>");
-        if (marker_pos != std::string::npos) {
-            lane.partial_line.erase(marker_pos, 8);
+        for (const std::string_view tag : {"<blockquote>", "</blockquote>"}) {
+            for (size_t pos = lane.partial_line.find(tag);
+                 pos != std::string::npos;
+                 pos = lane.partial_line.find(tag)) {
+                lane.partial_line.erase(pos, tag.size());
+            }
+            const size_t prefix_len = trailing_marker_prefix(lane.partial_line, tag);
+            if (prefix_len > 0) {
+                lane.partial_line.erase(lane.partial_line.size() - prefix_len);
+            }
         }
         while (!lane.partial_line.empty() &&
                (lane.partial_line.back() == '<' || lane.partial_line.back() == '/')) {
