@@ -4915,11 +4915,19 @@ private:
                     // parked state atomically; releasing only the first clone
                     // would orphan siblings under the same response task id.
                     uint64_t cancelled_episode = 0;
-                    for (const auto & slot : slots) {
-                        if (slot.task && slot.task->id == task.id_target &&
-                            slot.rerot_internal) {
-                            cancelled_episode = slot.rerot_episode_id;
+                    for (const auto & entry : rerot_transport) {
+                        if (entry.second && entry.second->response_task.id == task.id_target) {
+                            cancelled_episode = entry.first;
                             break;
+                        }
+                    }
+                    if (cancelled_episode == 0) {
+                        for (const auto & slot : slots) {
+                            if (slot.task && slot.task->id == task.id_target &&
+                                slot.rerot_internal) {
+                                cancelled_episode = slot.rerot_episode_id;
+                                break;
+                            }
                         }
                     }
                     if (cancelled_episode != 0 && rerot &&
