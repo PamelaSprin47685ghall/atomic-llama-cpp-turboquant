@@ -36,6 +36,7 @@ add_library(llama
             llama-model-saver.cpp
             llama-model.cpp
             llama-quant.cpp
+            llama-rerot.cpp
             llama-sampler.cpp
             llama-triattention.cpp
             llama-vocab.cpp

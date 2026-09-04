@@ -213,6 +213,9 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    rerot_write_tags.resize(LLAMA_MAX_SEQ);
+    rerot_reader_views.resize(LLAMA_MAX_SEQ);
+
     // [TAG_V_CACHE_VARIABLE]
     if (v_trans && hparams.is_n_embd_v_gqa_variable()) {
         LLAMA_LOG_WARN("%s: the V embeddings have different sizes across layers and FA is not enabled - padding V cache to %d\n",
@@ -602,6 +605,13 @@ void llama_kv_cache::clear(bool data) {
         v_heads[s] = 0;
     }
 
+    for (auto & tag : rerot_write_tags) {
+        tag.reset();
+    }
+    for (auto & view : rerot_reader_views) {
+        view.reset();
+    }
+
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
@@ -773,6 +783,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
             }
 
             v_cells[s1].ext_set(i, ext);
+            v_cells[s1].rerot_set(i, v_cells[s0].rerot_get(i));
         }
     }
 
@@ -1476,7 +1487,37 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
             }
 
             const llama_pos pos = cells.pos_get(i);
-            if (pos >= recent_threshold) {
+            const auto & rerot_meta = cells.rerot_get(i);
+            // A PENDING structural record is all-or-nothing: it may become
+            // PUBLIC at the closing token. Reclaiming any prefix cell before
+            // that publication would make the logical run denser than its
+            // physical K/V and violate atomic visibility.
+            const bool rerot_pending =
+                rerot_meta.active() &&
+                rerot_meta.visibility == llama_rerot_visibility::pending_record;
+            const bool semantic_foreign_tag =
+                hint.semantic_episode_id != 0 &&
+                rerot_meta.active() &&
+                (rerot_meta.episode_id != hint.semantic_episode_id ||
+                 rerot_meta.visibility != llama_rerot_visibility::public_live);
+            bool semantic_reader_tail = false;
+            if (hint.semantic_episode_id != 0) {
+                for (const llama_seq_id ref : hint.semantic_seq_ids) {
+                    if (ref == seq_id || !cells.seq_has(i, ref)) {
+                        continue;
+                    }
+                    const llama_pos ref_max = cells.seq_pos_max(ref);
+                    const llama_pos ref_recent = ref_max >= (llama_pos) tail_guard
+                        ? ref_max - (llama_pos) tail_guard + 1
+                        : 0;
+                    if (pos >= ref_recent) {
+                        semantic_reader_tail = true;
+                        break;
+                    }
+                }
+            }
+            if (pos >= recent_threshold || rerot_pending ||
+                semantic_foreign_tag || semantic_reader_tail) {
                 n_protected++;
             } else {
                 cand_indices.push_back(i);
@@ -1535,8 +1576,27 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
                 const uint32_t cand_idx = order[k];
                 const uint32_t cell_i   = cand_indices[cand_idx];
 
-                cells.seq_rm(cell_i, seq_id);
-                result.references_removed++;
+                const auto rerot_meta = cells.rerot_get(cell_i);
+                const bool semantic_cell =
+                    hint.semantic_episode_id != 0 &&
+                    (!rerot_meta.active() ||
+                     (rerot_meta.episode_id == hint.semantic_episode_id &&
+                      rerot_meta.visibility == llama_rerot_visibility::public_live));
+                if (semantic_cell) {
+                    // The archive hint represents one semantic base/PUBLIC
+                    // cell regardless of archive/exec bookkeeping refs. Remove
+                    // only this episode's refs; another outer completion may
+                    // legally retain the same physical base-prefix cell.
+                    for (const llama_seq_id ref : hint.semantic_seq_ids) {
+                        if (!cells.is_empty(cell_i) && cells.seq_has(cell_i, ref)) {
+                            cells.seq_rm(cell_i, ref);
+                            result.references_removed++;
+                        }
+                    }
+                } else {
+                    cells.seq_rm(cell_i, seq_id);
+                    result.references_removed++;
+                }
             }
         }
     }
@@ -1847,6 +1907,26 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
                 cells.seq_add(idx, ubatch.seq_id[i][s]);
             }
+
+            llama_kv_rerot_meta write_tag;
+            bool has_write_tag = false;
+            for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                const llama_seq_id seq_id = ubatch.seq_id[i][j];
+                GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < rerot_write_tags.size());
+
+                const auto & candidate = rerot_write_tags[seq_id];
+                if (!candidate.active()) {
+                    continue;
+                }
+
+                GGML_ASSERT(!has_write_tag || candidate == write_tag);
+                write_tag = candidate;
+                has_write_tag = true;
+            }
+
+            if (has_write_tag) {
+                cells.rerot_set(idx, write_tag);
+            }
         }
     }
 
@@ -1965,6 +2045,489 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     return v_cells[seq_to_stream[seq_id]];
+}
+
+bool llama_kv_cache::rerot_set_write_tag(
+        llama_seq_id seq_id,
+        const llama_kv_rerot_meta & tag) {
+    if (seq_id < 0 || (size_t) seq_id >= rerot_write_tags.size()) {
+        return false;
+    }
+
+    if (tag.active()) {
+        if (tag.node_id == LLAMA_REROT_NODE_INVALID || tag.run_id == LLAMA_REROT_RUN_INVALID ||
+            tag.visibility == llama_rerot_visibility::normal ||
+            (tag.visibility == llama_rerot_visibility::pending_record && tag.publish_epoch != 0)) {
+            return false;
+        }
+        rerot_write_tags[seq_id] = tag;
+    } else {
+        rerot_write_tags[seq_id].reset();
+    }
+
+    return true;
+}
+
+void llama_kv_cache::rerot_clear_write_tag(llama_seq_id seq_id) {
+    if (seq_id >= 0 && (size_t) seq_id < rerot_write_tags.size()) {
+        rerot_write_tags[seq_id].reset();
+    }
+}
+
+size_t llama_kv_cache::rerot_publish_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        uint64_t publish_epoch) {
+    size_t count = 0;
+    if (publish_epoch == 0 || !rerot_can_publish_run(episode_id, run_id, &count)) {
+        return 0;
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> matches;
+    GGML_ASSERT(rerot_find_run_cells(episode_id, run_id, &matches) == count);
+
+    for (const auto & match : matches) {
+        const bool published = v_cells[match.first].rerot_publish(
+            match.second, episode_id, run_id, publish_epoch);
+        GGML_ASSERT(published);
+    }
+
+    return matches.size();
+}
+
+size_t llama_kv_cache::rerot_reclassify_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_rerot_visibility expected,
+        llama_rerot_visibility replacement,
+        uint64_t publish_epoch) {
+    size_t count = 0;
+    if (!rerot_can_reclassify_run(
+            episode_id, run_id, expected, replacement, publish_epoch, &count)) {
+        return 0;
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> matches;
+    GGML_ASSERT(rerot_find_run_cells(episode_id, run_id, &matches) == count);
+
+    for (const auto & match : matches) {
+        const bool changed = v_cells[match.first].rerot_reclassify(
+            match.second, episode_id, run_id, expected, replacement, publish_epoch);
+        GGML_ASSERT(changed);
+    }
+    return matches.size();
+}
+
+bool llama_kv_cache::rerot_can_add_run_ref(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_seq_id seq_id,
+        size_t * count) const {
+    if (count) {
+        *count = 0;
+    }
+    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID ||
+        seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+
+    const uint32_t dst_stream = seq_to_stream[seq_id];
+    size_t matches = 0;
+    for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
+        const auto & cells = v_cells[stream];
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (cells.is_empty(cell)) {
+                continue;
+            }
+            const auto & meta = cells.rerot_get(cell);
+            if (meta.episode_id != episode_id || meta.run_id != run_id) {
+                continue;
+            }
+            // A logical run cannot be copied between independent KV streams,
+            // and only an atomically published run is eligible for a keeper.
+            if (stream != dst_stream || meta.visibility != llama_rerot_visibility::public_live ||
+                meta.publish_epoch == 0) {
+                return false;
+            }
+            ++matches;
+        }
+    }
+
+    if (count) {
+        *count = matches;
+    }
+    return matches > 0;
+}
+
+size_t llama_kv_cache::rerot_add_run_ref(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_seq_id seq_id) {
+    size_t count = 0;
+    if (!rerot_can_add_run_ref(episode_id, run_id, seq_id, &count)) {
+        return 0;
+    }
+
+    auto & cells = v_cells[seq_to_stream[seq_id]];
+    size_t seen = 0;
+    for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+        if (cells.is_empty(cell)) {
+            continue;
+        }
+        const auto & meta = cells.rerot_get(cell);
+        if (meta.episode_id != episode_id || meta.run_id != run_id) {
+            continue;
+        }
+        if (!cells.seq_has(cell, seq_id)) {
+            cells.seq_add(cell, seq_id);
+        }
+        ++seen;
+    }
+
+    GGML_ASSERT(seen == count);
+    return seen;
+}
+
+size_t llama_kv_cache::rerot_find_run_cells(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        std::vector<std::pair<uint32_t, uint32_t>> * out) const {
+    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID) {
+        return 0;
+    }
+
+    size_t count = 0;
+    for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
+        std::vector<uint32_t> idxs;
+        count += v_cells[stream].rerot_collect_run(episode_id, run_id, idxs);
+        if (out != nullptr) {
+            for (const uint32_t cell : idxs) {
+                out->emplace_back(stream, cell);
+            }
+        }
+    }
+    return count;
+}
+
+bool llama_kv_cache::rerot_can_freeze_to_archive(
+        uint64_t episode_id,
+        llama_seq_id exec_seq,
+        llama_seq_id archive_seq,
+        size_t * count) const {
+    if (count != nullptr) {
+        *count = 0;
+    }
+    if (episode_id == 0 || exec_seq < 0 || archive_seq < 0 || exec_seq == archive_seq ||
+        (size_t) exec_seq >= seq_to_stream.size() || (size_t) archive_seq >= seq_to_stream.size()) {
+        return false;
+    }
+    if (other != nullptr || seq_to_stream[exec_seq] != seq_to_stream[archive_seq]) {
+        return false;
+    }
+
+    size_t kept = 0;
+    const auto & cells = v_cells[seq_to_stream[exec_seq]];
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i) || !cells.seq_has(i, exec_seq)) {
+            continue;
+        }
+        const auto & meta = cells.rerot_get(i);
+        if (meta.active() && meta.episode_id == episode_id &&
+            meta.visibility == llama_rerot_visibility::public_live && meta.publish_epoch != 0) {
+            ++kept;
+        }
+    }
+
+    if (count != nullptr) {
+        *count = kept;
+    }
+    return true;
+}
+
+size_t llama_kv_cache::rerot_freeze_to_archive(
+        uint64_t episode_id,
+        llama_seq_id exec_seq,
+        llama_seq_id archive_seq) {
+    size_t count = 0;
+    if (!rerot_can_freeze_to_archive(episode_id, exec_seq, archive_seq, &count)) {
+        return 0;
+    }
+
+    auto & cells = v_cells[seq_to_stream[exec_seq]];
+    const size_t kept = cells.rerot_freeze_to_archive(episode_id, exec_seq, archive_seq);
+
+    GGML_ASSERT(kept == count);
+    return kept;
+}
+
+bool llama_kv_cache::rerot_blocks_state_save(llama_seq_id seq_id) const {
+    if (seq_id == -1) {
+        for (const auto & tag : rerot_write_tags) {
+            if (tag.active()) {
+                return true;
+            }
+        }
+        for (const auto & view : rerot_reader_views) {
+            if (view.active()) {
+                return true;
+            }
+        }
+        for (const auto & cells : v_cells) {
+            if (cells.rerot_has_active()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+    if ((size_t) seq_id < rerot_write_tags.size() && rerot_write_tags[seq_id].active()) {
+        return true;
+    }
+    if ((size_t) seq_id < rerot_reader_views.size() && rerot_reader_views[seq_id].active()) {
+        return true;
+    }
+    return v_cells[seq_to_stream[seq_id]].rerot_has_active_seq(seq_id);
+}
+
+bool llama_kv_cache::rerot_can_reclassify_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_rerot_visibility expected,
+        llama_rerot_visibility replacement,
+        uint64_t publish_epoch,
+        size_t * count) const {
+    if (count) {
+        *count = 0;
+    }
+    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID ||
+        expected == llama_rerot_visibility::normal || replacement == llama_rerot_visibility::normal ||
+        (replacement == llama_rerot_visibility::public_live && publish_epoch == 0) ||
+        (replacement != llama_rerot_visibility::public_live && publish_epoch != 0)) {
+        return false;
+    }
+
+    size_t matches = 0;
+    for (const auto & cells : v_cells) {
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (cells.is_empty(cell)) {
+                continue;
+            }
+            const auto & meta = cells.rerot_get(cell);
+            if (meta.episode_id != episode_id || meta.run_id != run_id) {
+                continue;
+            }
+            if (meta.visibility != expected) {
+                return false;
+            }
+            ++matches;
+        }
+    }
+
+    if (count) {
+        *count = matches;
+    }
+    return matches > 0;
+}
+
+bool llama_kv_cache::rerot_can_publish_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        size_t * count) const {
+    if (count) {
+        *count = 0;
+    }
+    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID) {
+        return false;
+    }
+
+    size_t matches = 0;
+    for (const auto & cells : v_cells) {
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (cells.is_empty(cell)) {
+                continue;
+            }
+            const auto & meta = cells.rerot_get(cell);
+            if (meta.episode_id != episode_id || meta.run_id != run_id) {
+                continue;
+            }
+            if (meta.visibility != llama_rerot_visibility::pending_record) {
+                return false;
+            }
+            ++matches;
+        }
+    }
+
+    if (count) {
+        *count = matches;
+    }
+    return matches > 0;
+}
+
+bool llama_kv_cache::rerot_set_reader_view(
+        llama_seq_id seq_id,
+        const llama_rerot_reader_state & view) {
+    if (seq_id < 0 || (size_t) seq_id >= rerot_reader_views.size() || !view.active() ||
+        view.reader == LLAMA_REROT_NODE_INVALID || view.query_run == LLAMA_REROT_RUN_INVALID ||
+        view.ordered_runs.empty()) {
+        return false;
+    }
+
+    std::unordered_set<llama_rerot_run_id> seen;
+    seen.reserve(view.ordered_runs.size());
+    bool query_run_seen = false;
+    for (const auto run_id : view.ordered_runs) {
+        if (run_id == LLAMA_REROT_RUN_INVALID || !seen.insert(run_id).second) {
+            return false;
+        }
+        query_run_seen |= run_id == view.query_run;
+    }
+    if (!query_run_seen) {
+        return false;
+    }
+
+    rerot_reader_views[seq_id] = view;
+    return true;
+}
+
+void llama_kv_cache::rerot_clear_reader_view(llama_seq_id seq_id) {
+    if (seq_id >= 0 && (size_t) seq_id < rerot_reader_views.size()) {
+        rerot_reader_views[seq_id].reset();
+    }
+}
+
+bool llama_kv_cache::rerot_batch_active(const llama_ubatch & ubatch) const {
+    bool any = false;
+    bool all = true;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (!ubatch.seq_id || !ubatch.seq_id[i] || ubatch.n_seq_id[i] < 1) {
+            all = false;
+            continue;
+        }
+        const llama_seq_id seq_id = ubatch.seq_id[i][0];
+        const bool active = seq_id >= 0 && (size_t) seq_id < rerot_reader_views.size() &&
+                            rerot_reader_views[seq_id].active();
+        any |= active;
+        all &= active;
+    }
+    if (any && !all) {
+        throw std::runtime_error("RERoT and ordinary query rows cannot share one ubatch");
+    }
+    return any;
+}
+
+llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
+        const llama_ubatch & ubatch,
+        uint32_t n_kv) const {
+    llama_rerot_attn_layout result;
+    if (!rerot_batch_active(ubatch)) {
+        return result;
+    }
+    if (n_stream != 1 || v_cells.size() != 1) {
+        throw std::runtime_error("RERoT indexed attention requires unified KV");
+    }
+
+    const auto & cells = v_cells[0];
+    if (n_kv > cells.size()) {
+        throw std::runtime_error("RERoT attention layout exceeds KV cache size");
+    }
+
+    result.n_queries = ubatch.n_tokens;
+    result.query_offsets.reserve(size_t(result.n_queries) + 1);
+    result.query_offsets.push_back(0);
+
+    for (uint32_t query = 0; query < ubatch.n_tokens; ++query) {
+        const llama_seq_id seq_id = ubatch.seq_id[query][0];
+        const auto & reader = rerot_reader_views.at(seq_id);
+
+        std::vector<llama_rerot_key_record> keys;
+        keys.reserve(n_kv);
+        for (uint32_t key = 0; key < n_kv; ++key) {
+            if (cells.is_empty(key)) {
+                continue;
+            }
+            keys.push_back({
+                key,
+                cells.pos_get(key),
+                cells.seq_has(key, seq_id),
+                cells.rerot_get(key),
+            });
+        }
+
+        auto query_layout = llama_rerot_build_query_layout(reader, ubatch.pos[query], keys);
+        const uint32_t group_base = static_cast<uint32_t>(result.groups.size());
+        for (auto group : query_layout.groups) {
+            group.query_index = query;
+            result.groups.push_back(group);
+        }
+        for (auto entry : query_layout.entries) {
+            entry.group_index += group_base;
+            result.entries.push_back(entry);
+        }
+        result.query_offsets.push_back(static_cast<uint32_t>(result.entries.size()));
+    }
+
+    std::string error;
+    if (!result.validate(n_kv, &error)) {
+        throw std::runtime_error("invalid RERoT attention layout: " + error);
+    }
+    return result;
+}
+
+llama_kv_cache::rerot_resolved_view llama_kv_cache::rerot_resolve_view(
+        const llama_rerot_reader_view & view) const {
+    rerot_resolved_view result;
+    result.episode_id = view.episode_id;
+    result.reader = view.reader;
+
+    for (const auto & logical_run : view.runs) {
+        std::vector<rerot_resolved_cell> run_cells;
+
+        for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
+            const auto & cells = v_cells[stream];
+            for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+                if (cells.is_empty(cell)) {
+                    continue;
+                }
+
+                const auto & meta = cells.rerot_get(cell);
+                if (meta.episode_id != view.episode_id || meta.run_id != logical_run.run_id ||
+                    meta.node_id != logical_run.owner) {
+                    continue;
+                }
+
+                run_cells.push_back({
+                    stream,
+                    cell,
+                    cells.pos_get(cell),
+                    0,
+                    meta,
+                });
+            }
+        }
+
+        std::stable_sort(run_cells.begin(), run_cells.end(), [](const auto & lhs, const auto & rhs) {
+            if (lhs.storage_pos != rhs.storage_pos) {
+                return lhs.storage_pos < rhs.storage_pos;
+            }
+            if (lhs.meta.frontier != rhs.meta.frontier) {
+                return lhs.meta.frontier < rhs.meta.frontier;
+            }
+            if (lhs.stream != rhs.stream) {
+                return lhs.stream < rhs.stream;
+            }
+            return lhs.cell < rhs.cell;
+        });
+
+        for (auto & resolved : run_cells) {
+            resolved.virtual_pos = result.query_virtual_pos++;
+            result.cells.push_back(std::move(resolved));
+        }
+    }
+
+    return result;
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
@@ -2846,6 +3409,18 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
     GGML_UNUSED(flags);
 
+    // v1 rule (§5.5/§25): the serialized cell format carries no per-cell
+    // episode/node/run/visibility classification and no write-tag/reader-view
+    // control state. Refuse explicitly instead of persisting bytes that would
+    // restore as silently wrong ordinary KV. Ordinary untagged state is
+    // unaffected: rerot_blocks_state_save() is false when OFF.
+    if (rerot_blocks_state_save(seq_id)) {
+        throw std::runtime_error(
+            "llama_kv_cache::state_write: refusing slot save / prompt-cache persist while a RERoT "
+            "episode is active (resident classified cells, write tags, or reader views present). "
+            "v1 does not support persisting RERoT episodes; clear the episode first.");
+    }
+
     io.write(&n_stream, sizeof(n_stream));
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -3093,6 +3668,13 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
     if (dest_seq_id != -1) {
         // single sequence
         seq_rm(dest_seq_id, -1, -1);
+
+        // Restored bytes are ordinary KV with no RERoT classification: drop
+        // any write tag/reader view so apply_ubatch() below cannot mis-tag
+        // them. (Whole-cache restore goes through clear(), which already
+        // resets cells, tags, and views.)
+        rerot_clear_write_tag(dest_seq_id);
+        rerot_clear_reader_view(dest_seq_id);
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
@@ -3431,6 +4013,9 @@ bool llama_kv_cache_context::next() {
         return false;
     }
 
+    rerot_layout_ready = false;
+    rerot_layout = {};
+
     return true;
 }
 
@@ -3446,6 +4031,8 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
+    rerot_layout_ready = false;
+    rerot_layout = {};
 
     // InnerQ: check if CUDA calibration finalized and tensor needs update
     if (kv->get_turbo_innerq_scale_inv() != nullptr && turbo_innerq_needs_tensor_update()) {
@@ -3549,6 +4136,53 @@ ggml_tensor * llama_kv_cache_context::build_input_v_rot(ggml_context * ctx) cons
     return kv->build_input_v_rot(ctx);
 }
 
+bool llama_kv_cache_context::rerot_active() const {
+    return !ubatches.empty() && i_cur < ubatches.size() && kv->rerot_batch_active(ubatches[i_cur]);
+}
+
+const llama_rerot_attn_layout & llama_kv_cache_context::get_rerot_attn_layout() const {
+    if (!rerot_layout_ready) {
+        rerot_layout = rerot_active()
+            ? kv->rerot_build_attn_layout(ubatches[i_cur], n_kv)
+            : llama_rerot_attn_layout{};
+        rerot_layout_ready = true;
+    }
+    return rerot_layout;
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_rerot_q_indices(ggml_context * ctx) const {
+    const auto & layout = get_rerot_attn_layout();
+    GGML_ASSERT(!layout.empty() && !layout.groups.empty());
+    auto * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, layout.groups.size());
+    ggml_set_input(result);
+    return result;
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_rerot_q_pos(ggml_context * ctx, uint32_t n_pos) const {
+    const auto & layout = get_rerot_attn_layout();
+    GGML_ASSERT(!layout.empty() && !layout.groups.empty());
+    GGML_ASSERT(n_pos == 1 || n_pos == 4);
+    auto * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, layout.groups.size() * n_pos);
+    ggml_set_input(result);
+    return result;
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_rerot_entries(ggml_context * ctx) const {
+    const auto & layout = get_rerot_attn_layout();
+    GGML_ASSERT(!layout.empty() && !layout.entries.empty());
+    auto * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, layout.entries.size());
+    ggml_set_input(result);
+    return result;
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_rerot_offsets(ggml_context * ctx) const {
+    const auto & layout = get_rerot_attn_layout();
+    GGML_ASSERT(!layout.empty());
+    auto * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, layout.query_offsets.size());
+    ggml_set_input(result);
+    return result;
+}
+
 void llama_kv_cache_context::set_input_k_shift(ggml_tensor * dst) const {
     kv->set_input_k_shift(dst);
 }
@@ -3559,6 +4193,56 @@ void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_v_idxs(dst, ubatch, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::set_input_rerot_q_indices(ggml_tensor * dst) const {
+    const auto & layout = get_rerot_attn_layout();
+    GGML_ASSERT(dst && dst->type == GGML_TYPE_I32 && (size_t) dst->ne[0] == layout.groups.size());
+    std::vector<int32_t> data(layout.groups.size());
+    for (size_t i = 0; i < layout.groups.size(); ++i) {
+        data[i] = static_cast<int32_t>(layout.groups[i].query_index);
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, data.size() * sizeof(data[0]));
+}
+
+void llama_kv_cache_context::set_input_rerot_q_pos(ggml_tensor * dst, uint32_t n_pos) const {
+    const auto & layout = get_rerot_attn_layout();
+    GGML_ASSERT(dst && dst->type == GGML_TYPE_I32 && (n_pos == 1 || n_pos == 4));
+    GGML_ASSERT((size_t) dst->ne[0] == layout.groups.size() * n_pos);
+    std::vector<int32_t> data(layout.groups.size() * n_pos, 0);
+    for (size_t i = 0; i < layout.groups.size(); ++i) {
+        const auto pos = layout.groups[i].effective_pos;
+        data[i] = pos;
+        if (n_pos == 4) {
+            data[layout.groups.size() + i] = pos;
+            data[2 * layout.groups.size() + i] = pos;
+            data[3 * layout.groups.size() + i] = 0;
+        }
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, data.size() * sizeof(data[0]));
+}
+
+void llama_kv_cache_context::set_input_rerot_entries(ggml_tensor * dst) const {
+    const auto & layout = get_rerot_attn_layout();
+    GGML_ASSERT(dst && dst->type == GGML_TYPE_I32 && dst->ne[0] == 2 &&
+        (size_t) dst->ne[1] == layout.entries.size());
+    std::vector<int32_t> data(layout.entries.size() * 2);
+    for (size_t i = 0; i < layout.entries.size(); ++i) {
+        data[2 * i + 0] = static_cast<int32_t>(layout.entries[i].key_index);
+        data[2 * i + 1] = static_cast<int32_t>(layout.entries[i].group_index);
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, data.size() * sizeof(data[0]));
+}
+
+void llama_kv_cache_context::set_input_rerot_offsets(ggml_tensor * dst) const {
+    const auto & layout = get_rerot_attn_layout();
+    GGML_ASSERT(dst && dst->type == GGML_TYPE_I32 &&
+        (size_t) dst->ne[0] == layout.query_offsets.size());
+    std::vector<int32_t> data(layout.query_offsets.size());
+    for (size_t i = 0; i < layout.query_offsets.size(); ++i) {
+        data[i] = static_cast<int32_t>(layout.query_offsets[i]);
+    }
+    ggml_backend_tensor_set(dst, data.data(), 0, data.size() * sizeof(data[0]));
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {

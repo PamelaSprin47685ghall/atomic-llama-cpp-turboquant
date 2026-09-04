@@ -546,10 +546,17 @@ struct vk_fa_pipeline_state {
     uint32_t limit_occupancy_shmem;
     ggml_type k_type;
     ggml_type v_type;
+    // RERoT-DDVR indexed variant (entry point rerot_main in the scalar FA
+    // modules). False for every ordinary pipeline; defaulted so existing
+    // aggregate constructions are untouched.
+    bool rerot = false;
 
+    // Note: rerot participates so the indexed variant never collides with an
+    // ordinary pipeline in the shared map; ordinary-vs-ordinary ordering is
+    // unchanged (both false).
     bool operator<(const vk_fa_pipeline_state &b) const {
-        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type) <
-               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type);
+        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type, rerot) <
+               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type, b.rerot);
     }
 };
 
@@ -2093,6 +2100,13 @@ static uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
         const ggml_tensor * v = node->src[2];
         return 2ull * q->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]) * k->ne[1] * q->ne[3];
     }
+    if (node->op == GGML_OP_FLASH_ATTN_EXT_REROT) {
+        const ggml_tensor * q = node->src[0];
+        const ggml_tensor * k = node->src[1];
+        const ggml_tensor * v = node->src[2];
+        const ggml_tensor * entries = node->src[3];
+        return 2ull * entries->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]);
+    }
     return 0;
 }
 
@@ -2202,6 +2216,22 @@ class vk_perf_logger {
                 " k(" << k->ne[0] << "," << k->ne[1] << "," << k->ne[2] << "," << k->ne[3] << "), " <<
                 " v(" << v->ne[0] << "," << v->ne[1] << "," << v->ne[2] << "," << v->ne[3] << "), " <<
                 " m(" << (m?m->ne[0]:0) << "," << (m?m->ne[1]:0) << "," << (m?m->ne[2]:0) << "," << (m?m->ne[3]:0) << ")";
+            return name.str();
+        }
+        if (node->op == GGML_OP_FLASH_ATTN_EXT_REROT) {
+            const ggml_tensor * dst = node;
+            const ggml_tensor * q = node->src[0];
+            const ggml_tensor * k = node->src[1];
+            const ggml_tensor * v = node->src[2];
+            const ggml_tensor * e = node->src[3];
+            std::stringstream name;
+            name << fusion_str;
+            name << ggml_op_name(node->op) <<
+                " dst(" << dst->ne[0] << "," << dst->ne[1] << "," << dst->ne[2] << "," << dst->ne[3] << "), " <<
+                " q(" << q->ne[0] << "," << q->ne[1] << "," << q->ne[2] << "," << q->ne[3] << "), " <<
+                " k(" << k->ne[0] << "," << k->ne[1] << "," << k->ne[2] << "," << k->ne[3] << "), " <<
+                " v(" << v->ne[0] << "," << v->ne[1] << "," << v->ne[2] << "," << v->ne[3] << "), " <<
+                " e(" << e->ne[0] << "," << e->ne[1] << ")";
             return name.str();
         }
         if (node->op == GGML_OP_TOP_K) {
@@ -3799,7 +3829,7 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
 }
 
 static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
-                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type) {
+                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type, bool rerot = false) {
     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
 
@@ -3810,7 +3840,9 @@ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
-    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type};
+    vk_fa_pipeline_state state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type};
+    state.rerot = rerot;
+    return state;
 }
 
 static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& state) {
@@ -3818,7 +3850,7 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
         if (t == GGML_TYPE_F32) return 16u;
         return (uint32_t) ggml_type_size(t);
     };
-    return {
+    std::vector<uint32_t> out = {
         /* 0 WorkGroupSize   */ state.workgroup_size,
         /* 1 Br              */ state.Br,
         /* 2 Bc              */ state.Bc,
@@ -3834,8 +3866,40 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
         /*12 FaTypeK         */ static_cast<uint32_t>(state.k_type),
         /*13 FaTypeV         */ static_cast<uint32_t>(state.v_type),
         /*14 FaBlockBytesK   */ fa_block_bytes(state.k_type),
-        /*15 FaBlockBytesV   */ fa_block_bytes(state.v_type),
+        /*15 FaBlockBytesV   */         fa_block_bytes(state.v_type),
     };
+    // constant_id 16 (RerotMode) is declared only by the scalar FA modules,
+    // the sole users of rerot pipelines. Ordinary pipelines keep exactly 16
+    // entries: zero behavioral change, including for coopmat modules.
+    if (state.rerot) {
+        out.push_back(1u);
+    }
+    return out;
+}
+
+// K/V element types admissible to the FA family, including TurboQuant (fused
+// dequantize4 / faDecode paths: the graph applies forward WHT to Q
+// pre-attention and inverse WHT to FA output, so dequant returns
+// centroid * norm). Shared by the ordinary FLASH_ATTN_EXT and RERoT-DDVR
+// support checks; behavior of the ordinary path is unchanged.
+static bool ggml_vk_fa_kv_type_ok(ggml_type t) {
+    switch (t) {
+    case GGML_TYPE_F32:
+    case GGML_TYPE_F16:
+    case GGML_TYPE_BF16:
+    case GGML_TYPE_Q8_0:
+    case GGML_TYPE_Q5_1:
+    case GGML_TYPE_Q5_0:
+    case GGML_TYPE_Q4_1:
+    case GGML_TYPE_Q4_0:
+    case GGML_TYPE_IQ4_NL:
+    case GGML_TYPE_TURBO2_0:
+    case GGML_TYPE_TURBO3_0:
+    case GGML_TYPE_TURBO4_0:
+        return true;
+    default:
+        return false;
+    }
 }
 
 static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
@@ -4375,6 +4439,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     for (auto &fa : device->pipeline_flash_attn_f32_f16) {
         if (fa.first.path != FA_SCALAR) continue;
+        if (fa.first.rerot) continue;
         const uint32_t Br = fa.first.Br;
         const uint32_t Bc = fa.first.Bc;
         const bool aligned = fa.first.aligned;
@@ -4421,6 +4486,51 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                 sizeof(vk_flash_attn_push_constants), {Br, 1, 1},
                                 get_fa_spec_constants(fa.first), aligned ? Bc : 1, true,
                                 !fa_ds, !fa_ds ? fa_sgs : 0);
+    }
+
+    // RERoT-DDVR indexed variant. GLSL exposes a single SPIR-V entry point
+    // named "main"; specialization constant RerotMode selects the dedicated
+    // rerot_main() body at pipeline compile time. Asking Vulkan for the helper
+    // function as an entry point is invalid SPIR-V and crashed RADV during
+    // first-use pipeline creation.
+    for (auto &fa : device->pipeline_flash_attn_f32_f16) {
+        if (fa.first.path != FA_SCALAR || !fa.first.rerot) continue;
+        const bool f32acc = fa.first.f32acc;
+        const void * spv_data = nullptr;
+        size_t spv_size = 0;
+        // Module selection mirrors the ordinary scalar loop above; the
+        // RerotMode specialization makes the selected main() path variant-
+        // agnostic.
+        if (fa.first.k_type == GGML_TYPE_BF16) {
+            spv_data = flash_attn_f32_f16_fp32_data;
+            spv_size = flash_attn_f32_f16_fp32_len;
+        } else if (ggml_vk_fa_scalar_uses_mmq(device, fa.first.k_type, fa.first.v_type)) {
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+            if (device->fp16) {
+                if (f32acc) { spv_data = flash_attn_f32_f16_int8_data;        spv_size = flash_attn_f32_f16_int8_len; }
+                else        { spv_data = flash_attn_f32_f16_f16acc_int8_data; spv_size = flash_attn_f32_f16_f16acc_int8_len; }
+            } else {
+                spv_data = flash_attn_f32_f16_fp32_int8_data;
+                spv_size = flash_attn_f32_f16_fp32_int8_len;
+            }
+#endif
+        } else {
+            if (device->fp16) {
+                if (device->dot2_f16) {
+                    if (f32acc) { spv_data = flash_attn_f32_f16_dot2_data;        spv_size = flash_attn_f32_f16_dot2_len; }
+                    else        { spv_data = flash_attn_f32_f16_dot2_f16acc_data; spv_size = flash_attn_f32_f16_dot2_f16acc_len; }
+                } else {
+                    if (f32acc) { spv_data = flash_attn_f32_f16_data;        spv_size = flash_attn_f32_f16_len; }
+                    else        { spv_data = flash_attn_f32_f16_f16acc_data; spv_size = flash_attn_f32_f16_f16acc_len; }
+                }
+            } else {
+                spv_data = flash_attn_f32_f16_fp32_data;
+                spv_size = flash_attn_f32_f16_fp32_len;
+            }
+        }
+        ggml_vk_create_pipeline(device, fa.second, "flash_attn_rerot", spv_size, spv_data, "main", 9,
+                                sizeof(vk_flash_attn_push_constants), {1, 1, 1},
+                                get_fa_spec_constants(fa.first), 1, true, false, 0);
     }
 
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
@@ -10931,6 +11041,49 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     return supported;
 }
 
+// Shared-memory estimate for the RERoT-DDVR kernel (rerot_main): f32-only
+// math, one staged Q row, one K/V block reused for K then V, no mask, no MMQ
+// workspace. Conservative on the IQ4_NL table (f16 there). Must be kept in
+// sync with the rerot block in flash_attn_base.glsl.
+static bool ggml_vk_flash_attn_rerot_shmem_support(const vk_device & device, const vk_fa_tuning_params & params, uint32_t hsk, uint32_t hsv) {
+    const uint32_t wg_size = params.workgroup_size;
+    const uint32_t Bc = params.block_cols;
+    const uint32_t D = std::max(hsk, hsv);
+    const uint32_t tmpsh = wg_size * sizeof(float);
+    const uint32_t tmpshv4 = wg_size * 4 * sizeof(float);
+    const uint32_t iq_shmem = 16 * sizeof(float);
+    const uint32_t Qf = (hsk / 4 + 1) * 4 * sizeof(float);
+    const uint32_t kvsh = params.shmem_staging ? Bc * (D / 4 + 1) * 4 * sizeof(float) : 4 * sizeof(float);
+    const uint32_t occ = params.limit_occupancy_shmem * 4 * sizeof(float);
+    const uint64_t total_size = (uint64_t)tmpsh + tmpshv4 + iq_shmem + Qf + kvsh + occ;
+    return total_size <= device->properties.limits.maxComputeSharedMemorySize;
+}
+
+// Derives the RERoT-DDVR tuning from the ordinary scalar tuning for the same
+// dims, then pins the rerot_main contract to single-row workgroups (Br = 1).
+// Subgroup-capable pipelines preserve scalar D_split so K/V dimensions are
+// distributed across lanes; the shared-memory fallback uses D_split = 1.
+// Falls back from K/V staging to direct loads when staging would overflow
+// shmem. Returns false when no viable config exists (the caller falls back to
+// CPU, preserving parity).
+static bool ggml_vk_flash_attn_rerot_tune(const vk_device & device, uint32_t hsk, uint32_t hsv, uint32_t n_kv, ggml_type k_type, ggml_type v_type, vk_fa_tuning_params & out) {
+    vk_fa_tuning_params params = get_fa_tuning_params_scalar(device, hsk, hsv, 1, n_kv, k_type, v_type, true);
+    params.block_rows = 1;
+    params.block_cols = 128;
+    params.row_split = 1;
+    if (params.disable_subgroups) {
+        params.d_split = 1;
+    }
+    if (!ggml_vk_flash_attn_rerot_shmem_support(device, params, hsk, hsv)) {
+        params.shmem_staging = false;
+        if (!ggml_vk_flash_attn_rerot_shmem_support(device, params, hsk, hsv)) {
+            return false;
+        }
+    }
+    out = params;
+    return true;
+}
+
 static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
@@ -11225,6 +11378,174 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
                                     {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf},
                                     pc, { workgroups_x, workgroups_y, workgroups_z });
+    }
+}
+
+// RERoT-DDVR indexed FlashAttention dispatch (GGML_OP_FLASH_ATTN_EXT_REROT).
+//
+// Consumes exactly the frozen indexed-op tensors (see ggml_flash_attn_ext_rerot
+// and the CPU reference ggml_compute_forward_flash_attn_ext_rerot): q_groups
+// F32 [D, n_groups, n_head] (graph-side pre-phased per group, pre-WHT when K
+// is Turbo), k/v at writer storage phase, entries I32 [2, n_entries], offsets
+// I32 [n_queries+1], optional sinks F32 [n_head]. One global online softmax
+// per query range happens inside rerot_main(); entry-splits combine through
+// the existing fa_split_k_reduce kernel. When RERoT is off this function is
+// never reached and ggml_vk_flash_attn above is the same code as before.
+static void ggml_vk_flash_attn_rerot(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v,
+        const ggml_tensor * entries, const ggml_tensor * offsets, const ggml_tensor * sinks, ggml_tensor * dst) {
+    GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
+    GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
+    GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
+
+    const uint32_t HSK = (uint32_t) nek0;
+    const uint32_t HSV = (uint32_t) nev0;
+    const uint32_t n_head_q  = (uint32_t) neq2;
+    const uint32_t n_head_kv = (uint32_t) nek2;
+    const uint32_t n_head_v  = (uint32_t) nev2;
+    const uint32_t n_groups  = (uint32_t) neq1;
+    const uint32_t n_kv      = (uint32_t) nek1;
+    const uint32_t n_entries = (uint32_t) entries->ne[1];
+    const uint32_t n_queries = (uint32_t) (offsets->ne[0] - 1);
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(entries->type == GGML_TYPE_I32 && entries->ne[0] == 2);
+    GGML_ASSERT(offsets->type == GGML_TYPE_I32);
+    GGML_ASSERT(neq0 == HSK);
+    GGML_ASSERT(nev1 == nek1);
+    GGML_ASSERT(ne0 == HSV);
+    GGML_ASSERT(ne1 == n_head_q && ne2 == n_queries);
+    GGML_ASSERT(neq3 == 1 && nek3 == 1 && nev3 == 1 && ne3 == 1);
+    GGML_ASSERT(n_head_q % n_head_kv == 0 && n_head_q % n_head_v == 0);
+    // Dim 3 is a size-1 batch dim the indexed kernel never strides.
+    GGML_UNUSED(nbq3);
+    GGML_UNUSED(nbk3);
+    GGML_UNUSED(nbv3);
+    GGML_UNUSED(nb3);
+    GGML_ASSERT(nbq0 == sizeof(float) && nbk0 == ggml_type_size(k->type) && nbv0 == ggml_type_size(v->type));
+    GGML_ASSERT(nbq1 % sizeof(float) == 0 && nbq2 % sizeof(float) == 0);
+    GGML_ASSERT(entries->nb[0] == sizeof(int32_t) && offsets->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(nb0 == sizeof(float) && nb1 == (size_t)ne0 * sizeof(float) && nb2 == (size_t)ne0 * (size_t)ne1 * sizeof(float));
+    GGML_ASSERT(sinks == nullptr || sinks->type == GGML_TYPE_F32);
+
+    float scale = 1.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+
+    vk_fa_tuning_params tuning_params;
+    GGML_ASSERT(ggml_vk_flash_attn_rerot_tune(ctx->device, HSK, HSV, n_kv, k->type, v->type, tuning_params));
+
+    // Strides in ordinary FA units (see the rerot_main push-constant overlay
+    // in flash_attn_base.glsl).
+    const uint32_t q_stride = (uint32_t)(nbq1 / sizeof(float));
+    uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
+    uint32_t v_stride = (uint32_t)(nbv1 / ggml_type_size(v->type));
+    // For F32, the shader treats a row as vec4 blocks, mirroring the ordinary
+    // path.
+    if (k->type == GGML_TYPE_F32) {
+        k_stride /= 4;
+    }
+    if (v->type == GGML_TYPE_F32) {
+        v_stride /= 4;
+    }
+
+    vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV,
+        false, true, false, false, logit_softcap != 0.0f, k->type, v->type, true);
+
+    vk_pipeline pipeline = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
+        auto &pipelines = ctx->device->pipeline_flash_attn_f32_f16;
+        auto it = pipelines.find(fa_pipeline_state);
+        if (it != pipelines.end()) {
+            pipeline = it->second;
+        } else {
+            pipelines[fa_pipeline_state] = pipeline = std::make_shared<vk_pipeline_struct>();
+        }
+    }
+    assert(pipeline);
+    // Compile early to initialize wg_denoms.
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    uint32_t split_k = 1;
+    if (sinks == nullptr && n_queries > 0 && n_entries > 0) {
+        // Keep enough independent workgroups to occupy the device. The indexed
+        // shader writes [Dv, flattened(query, head), split] partials, exactly
+        // the layout consumed by flash_attn_split_k_reduce.
+        const uint32_t shader_cores = ctx->device->shader_core_count ? ctx->device->shader_core_count : 16;
+        const uint32_t rows = n_queries * n_head_q;
+        const uint32_t desired = std::max(1u, (shader_cores * 2u) / std::max(1u, rows));
+        const uint32_t entries_per_query = std::max(1u, n_entries / n_queries);
+        split_k = std::min(desired, entries_per_query);
+    }
+
+    const uint64_t n_flat = (uint64_t)n_queries * n_head_q;
+    const uint64_t split_k_size = split_k > 1 ? (HSV * n_flat + 2 * n_flat) * split_k * sizeof(float) : 0;
+    if (split_k_size > ctx->device->properties.limits.maxStorageBufferRange) {
+        GGML_ABORT("Requested preallocation size is too large");
+    }
+    if (ctx->prealloc_size_split_k < split_k_size) {
+        ctx->prealloc_size_split_k = split_k_size;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+
+    const uint32_t n_head_log2 = 1u << (uint32_t) floorf(log2f((float) n_head_q));
+    const uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
+
+    vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
+    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
+    vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
+    vk_subbuffer entries_buf = ggml_vk_tensor_subbuffer(ctx, entries);
+    vk_subbuffer offsets_buf = ggml_vk_tensor_subbuffer(ctx, offsets);
+
+    // Push-constant overlay documented on rerot_main(): the stock 128 B block.
+    const vk_flash_attn_push_constants pc = { n_queries, n_kv,
+                                              HSV, n_head_q, n_queries,
+                                              n_head_q, 1, n_head_kv, 1, n_head_v, 1,
+                                              n_entries, n_groups, 1,
+                                              q_stride, (uint32_t)(nbq2 / sizeof(float)), 0,
+                                              k_stride, (uint32_t)nbk2, 0,
+                                              v_stride, (uint32_t)nbv2, 0,
+                                              scale, 0.0f, logit_softcap,
+                                              mask_n_head_log2, 0.0f, 0.0f,
+                                              1, 1, split_k };
+
+    // Bindings 0..8: Q, K, V, dummy (mask), sinks, dst-or-partials, dummy
+    // (mask_opt), entries, offsets.
+    if (split_k > 1) {
+        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
+
+        if (ctx->prealloc_split_k_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+
+        vk_subbuffer split_k_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                    {q_buf, k_buf, v_buf, q_buf, sinks_buf, split_k_buf, q_buf, entries_buf, offsets_buf},
+                                    pc, { n_queries * split_k, n_head_q, 1 });
+
+        ggml_vk_sync_buffers(ctx, subctx);
+        const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t)n_flat, 1, 1, split_k, 0 };
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
+                                    {split_k_buf, q_buf, dst_buf},
+                                    pc2, { (uint32_t)n_flat, HSV, 1 });
+        ctx->prealloc_split_k_need_sync = true;
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                    {q_buf, k_buf, v_buf, q_buf, sinks_buf, dst_buf, q_buf, entries_buf, offsets_buf},
+                                    pc, { n_queries, n_head_q, 1 });
     }
 }
 
@@ -15870,6 +16191,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_FLASH_ATTN_EXT_REROT:
+        ggml_vk_flash_attn_rerot(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node->src[5], node);
+
+        break;
+
     case GGML_OP_RWKV_WKV6:
         ggml_vk_rwkv_wkv6(ctx, compute_ctx, node);
 
@@ -18370,30 +18696,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (op->src[3] && op->src[3]->type != GGML_TYPE_F16) {
                     return false;
                 }
-                auto fa_kv_ok = [](ggml_type t) {
-                    switch (t) {
-                    case GGML_TYPE_F32:
-                    case GGML_TYPE_F16:
-                    case GGML_TYPE_BF16:
-                    case GGML_TYPE_Q8_0:
-                    case GGML_TYPE_Q5_1:
-                    case GGML_TYPE_Q5_0:
-                    case GGML_TYPE_Q4_1:
-                    case GGML_TYPE_Q4_0:
-                    case GGML_TYPE_IQ4_NL:
-                        return true;
-                    // TurboQuant K/V flash attention: dequant is fused into the
-                    // scalar/coopmat1 FA shaders via dequantize4() (flash_attn_dequant.glsl),
-                    // so the standard f16 FA pipeline handles turbo K/V.
-                    case GGML_TYPE_TURBO2_0:
-                    case GGML_TYPE_TURBO3_0:
-                    case GGML_TYPE_TURBO4_0:
-                        return true;
-                    default:
-                        return false;
-                    }
-                };
-                if (!fa_kv_ok(op->src[1]->type) || !fa_kv_ok(op->src[2]->type)) {
+                // TurboQuant K/V flash attention: dequant is fused into the
+                // scalar/coopmat1 FA shaders via dequantize4() (flash_attn_dequant.glsl),
+                // so the standard f16 FA pipeline handles turbo K/V
+                // (see ggml_vk_fa_kv_type_ok).
+                if (!ggml_vk_fa_kv_type_ok(op->src[1]->type) || !ggml_vk_fa_kv_type_ok(op->src[2]->type)) {
                     return false;
                 }
                 if ((op->src[1]->type == GGML_TYPE_BF16) != (op->src[2]->type == GGML_TYPE_BF16)) {
@@ -18401,6 +18708,73 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 if (!coopmat2 && !(device->subgroup_shuffle && device->subgroup_vote)) {
                     // scalar/coopmat1 FA uses subgroupShuffle/subgroupAll
+                    return false;
+                }
+                return true;
+            }
+        case GGML_OP_FLASH_ATTN_EXT_REROT:
+            {
+                // Indexed DDVR variant: the same K/V type envelope as ordinary
+                // FA (fused dequant paths, Turbo included); Q is F32 groups,
+                // entries/offsets carry the pre-filtered visible set.
+                const ggml_tensor * q = op->src[0];
+                const ggml_tensor * k = op->src[1];
+                const ggml_tensor * v = op->src[2];
+                const ggml_tensor * entries = op->src[3];
+                const ggml_tensor * offsets = op->src[4];
+                const ggml_tensor * sinks = op->src[5];
+                if (q == nullptr || k == nullptr || v == nullptr || entries == nullptr || offsets == nullptr) {
+                    return false;
+                }
+                if (q->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                if (entries->type != GGML_TYPE_I32 || entries->ne[0] != 2) {
+                    return false;
+                }
+                if (offsets->type != GGML_TYPE_I32 || !ggml_is_vector(offsets) || offsets->ne[0] < 2) {
+                    return false;
+                }
+                if (sinks != nullptr && sinks->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                if (q->ne[0] != k->ne[0] || k->ne[1] != v->ne[1]) {
+                    return false;
+                }
+                if (q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1) {
+                    return false;
+                }
+                if (k->ne[2] < 1 || v->ne[2] < 1 || q->ne[2] % k->ne[2] != 0 || q->ne[2] % v->ne[2] != 0) {
+                    return false;
+                }
+                if (q->nb[0] != sizeof(float) || entries->nb[0] != sizeof(int32_t) || offsets->nb[0] != sizeof(int32_t)) {
+                    return false;
+                }
+                if (k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type)) {
+                    return false;
+                }
+                if (q->nb[1] % sizeof(float) != 0 || q->nb[2] % sizeof(float) != 0) {
+                    return false;
+                }
+                const uint32_t HSK = (uint32_t) k->ne[0];
+                const uint32_t HSV = (uint32_t) v->ne[0];
+                if ((HSK % 8) != 0 || (HSV % 8) != 0) {
+                    return false;
+                }
+                if (!ggml_vk_fa_kv_type_ok(k->type) || !ggml_vk_fa_kv_type_ok(v->type)) {
+                    return false;
+                }
+                if ((k->type == GGML_TYPE_BF16) != (v->type == GGML_TYPE_BF16)) {
+                    return false;
+                }
+                if (!(device->subgroup_shuffle && device->subgroup_vote)) {
+                    // RERoT-DDVR runs on the scalar FA family: its kernel uses
+                    // shared-memory reductions only, but keep the family
+                    // requirement for v1.
+                    return false;
+                }
+                vk_fa_tuning_params rerot_tuning;
+                if (!ggml_vk_flash_attn_rerot_tune(device, HSK, HSV, (uint32_t) k->ne[1], k->type, v->type, rerot_tuning)) {
                     return false;
                 }
                 return true;
@@ -19375,6 +19749,12 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_flash_attn_ext(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3], params[0], params[1], params[2]);
             if (src_clone[4]) {
                 ggml_flash_attn_ext_add_sinks(tensor_clone, src_clone[4]);
+            }
+        } else if (tensor->op == GGML_OP_FLASH_ATTN_EXT_REROT) {
+            const float * params = (const float *)tensor->op_params;
+            tensor_clone = ggml_flash_attn_ext_rerot(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3], src_clone[4], params[0], params[2]);
+            if (src_clone[5]) {
+                ggml_flash_attn_ext_add_sinks(tensor_clone, src_clone[5]);
             }
         } else if (tensor->op == GGML_OP_MUL_MAT) {
             tensor_clone = ggml_mul_mat(ggml_ctx, src_clone[0], src_clone[1]);

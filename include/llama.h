@@ -36,6 +36,11 @@
 
 #define LLAMA_DEFAULT_SEED 0xFFFFFFFF
 
+// Maximum logical sequence-id arena supported by the cache metadata. Normal
+// callers typically use far fewer sequences; RERoT separates this logical
+// arena from the number of physically resident recurrent states.
+#define LLAMA_MAX_SEQ 256
+
 #define LLAMA_TOKEN_NULL -1
 
 #define LLAMA_FILE_MAGIC_GGLA 0x67676c61u // 'ggla'
@@ -219,6 +224,18 @@ extern "C" {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
         LLAMA_CONTEXT_TYPE_MTP     = 1,
     };
+
+    enum llama_rerot_frontier_mode {
+        // Tokens selected from the previous frontier can attend peer tokens of
+        // the current frontier at each transformer layer.
+        LLAMA_REROT_FRONTIER_STRONG = 0,
+
+        // Current-frontier peer tokens become visible on the next frontier.
+        // This is the conservative ablation and debugging mode.
+        LLAMA_REROT_FRONTIER_LAG1 = 1,
+    };
+
+    LLAMA_API const char * llama_rerot_frontier_mode_name(enum llama_rerot_frontier_mode mode);
 
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
     typedef struct llama_token_data {
@@ -416,6 +433,9 @@ extern "C" {
         bool triattention;               // enable TriAttention KV cache eviction
         const char * triattention_stats; // path to .triattention calibration file
         double triattention_ratio;       // fraction of logical tokens retained by TriAttention
+
+        bool rerot;                                      // enable Recursive Elastic Ring-of-Thought execution support
+        enum llama_rerot_frontier_mode rerot_frontier;  // shared-memory visibility timing
     };
 
     struct llama_model_tensor_override {
@@ -759,6 +779,269 @@ extern "C" {
               llama_seq_id seq_id_dst,
                  llama_pos p0,
                  llama_pos p1);
+
+    // Component-selective variants for hybrid-memory runtimes. On an
+    // attention-only model these are equivalent to the ordinary KV operation;
+    // on a recurrent-only model the attention variants are no-ops. The inverse
+    // applies to recurrent variants.
+    LLAMA_API bool llama_memory_seq_rm_attention(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    LLAMA_API void llama_memory_seq_cp_attention(
+            llama_memory_t mem,
+              llama_seq_id seq_id_src,
+              llama_seq_id seq_id_dst,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    LLAMA_API bool llama_memory_seq_rm_recurrent(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    LLAMA_API void llama_memory_seq_cp_recurrent(
+            llama_memory_t mem,
+              llama_seq_id seq_id_src,
+              llama_seq_id seq_id_dst,
+                 llama_pos p0,
+                 llama_pos p1);
+
+    enum llama_rerot_kv_visibility {
+        LLAMA_REROT_KV_PUBLIC_LIVE = 1,
+        LLAMA_REROT_KV_PRIVATE_CONTROL = 2,
+        LLAMA_REROT_KV_PENDING_RECORD = 3,
+    };
+
+    struct llama_rerot_kv_write_tag {
+        uint64_t episode_id;
+        uint32_t node_id;
+        uint32_t run_id;
+        uint64_t publish_epoch;
+        uint64_t frontier;
+        enum llama_rerot_kv_visibility visibility;
+    };
+
+    struct llama_rerot_view_stamp {
+        uint64_t topology_epoch;
+        uint64_t publish_epoch;
+        uint64_t layout_epoch;
+    };
+
+    // Reader-specific logical ordering installed on one execution sequence.
+    // `ordered_run_ids` is copied by the runtime and may be released after the
+    // call returns. The query run identifies the currently growing Lane run.
+    struct llama_rerot_reader_view_desc {
+        uint64_t episode_id;
+        uint32_t reader_node_id;
+        uint32_t query_run_id;
+        uint64_t frontier;
+        enum llama_rerot_frontier_mode frontier_mode;
+        struct llama_rerot_view_stamp stamp;
+        const uint32_t * ordered_run_ids;
+        size_t n_ordered_runs;
+    };
+
+    // Classify future KV writes by a sequence. Existing cells are unchanged.
+    // Returns false when the memory has no compatible attention KV component or
+    // the tag is invalid.
+    LLAMA_API bool llama_memory_rerot_set_write_tag(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+        const struct llama_rerot_kv_write_tag * tag);
+
+    LLAMA_API void llama_memory_rerot_clear_write_tag(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    // Atomically publish all currently resident cells of a pending run. A zero
+    // return means validation failed or the run has no resident pending cells.
+    LLAMA_API size_t llama_memory_rerot_publish_run(
+            llama_memory_t mem,
+                   uint64_t episode_id,
+                   uint32_t run_id,
+                   uint64_t publish_epoch);
+
+    // Atomically change all resident cells in one run from the expected
+    // visibility to a replacement visibility. This is used by the byte-level
+    // parser after a cross-token structural prefix is resolved. A replacement
+    // of PUBLIC_LIVE requires a non-zero publish epoch; other replacements
+    // require zero. Returns zero without changing any cells if validation fails.
+    LLAMA_API size_t llama_memory_rerot_reclassify_run(
+            llama_memory_t mem,
+                   uint64_t episode_id,
+                   uint32_t run_id,
+        enum llama_rerot_kv_visibility expected,
+        enum llama_rerot_kv_visibility replacement,
+                   uint64_t publish_epoch);
+
+    // Adds `seq_id` as a keeper/reference to every resident attention KV cell
+    // belonging to one PUBLIC RERoT run. The run is selected by stable logical
+    // metadata, not by physical index or position range, so this remains valid
+    // after TriAttention eviction and cache compaction. Returns the number of
+    // matching resident cells; zero means validation failed or no cells remain.
+    LLAMA_API size_t llama_memory_rerot_add_run_ref(
+            llama_memory_t mem,
+                   uint64_t episode_id,
+                   uint32_t run_id,
+               llama_seq_id seq_id);
+
+    // Install/clear the reader-specific PAC-DFS run order used by subsequent
+    // decode calls for `seq_id`. Returns false for invalid descriptors or
+    // memory implementations without an attention component.
+    LLAMA_API bool llama_memory_rerot_set_reader_view(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+        const struct llama_rerot_reader_view_desc * view);
+
+    LLAMA_API void llama_memory_rerot_clear_reader_view(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    //
+    // RERoT experimental context glue (Stage 7 + compat core, §§11,17,20,25,A.6-A.11)
+    //
+    // All calls are gated by rerot_enabled + episode-active. When RERoT is
+    // disabled (or no episode is active on the context) every entry is a
+    // no-op returning a safe default (false / 0) and touches no KV,
+    // recurrent, sampler, or graph state, so RERoT OFF stays byte-identical.
+    // Ownership: ContextGlue owns these declarations; no other header may
+    // declare competing llama_rerot_* context prototypes.
+    //
+
+    #define LLAMA_REROT_STATE_MAGIC   0x52524f54u // 'RROT'
+    #define LLAMA_REROT_STATE_VERSION 1u
+
+    enum llama_rerot_state_cap {
+        LLAMA_REROT_STATE_CAP_NONE          = 0,
+        LLAMA_REROT_STATE_CAP_REROT         = 1u << 0,
+        LLAMA_REROT_STATE_CAP_REROT_TREE    = 1u << 1,
+        LLAMA_REROT_STATE_CAP_REROT_PRIVATE = 1u << 2,
+        LLAMA_REROT_STATE_CAP_REROT_MTP     = 1u << 3,
+        LLAMA_REROT_STATE_CAP_HYBRID_REC    = 1u << 4,
+        LLAMA_REROT_STATE_CAP_SPARSE_KV     = 1u << 5,
+        LLAMA_REROT_STATE_CAP_TRIATTENTION  = 1u << 6,
+    };
+
+    struct llama_rerot_episode_params {
+        enum llama_rerot_frontier_mode frontier_mode;
+        uint64_t topology_epoch;
+        uint64_t publish_epoch;
+        uint64_t layout_epoch;
+    };
+
+    struct llama_rerot_write_tag {
+        uint64_t episode_id;
+        uint32_t node_id;
+        uint32_t run_id;
+        uint64_t publish_epoch;
+        uint64_t frontier;
+        enum llama_rerot_kv_visibility visibility;
+    };
+
+    struct llama_rerot_publish {
+        uint64_t episode_id;
+        uint32_t run_id;
+        uint64_t publish_epoch;
+    };
+
+    // One frontier reader view bound to one execution sequence. The ordered
+    // run list is copied by the runtime; the caller may release it on return.
+    // The stamp binds MTP drafts to (topology, publish, layout) epochs (§A.6).
+    struct llama_rerot_frontier_reader_view {
+        llama_seq_id seq_id;
+        uint64_t episode_id;
+        uint32_t reader_node_id;
+        uint32_t query_run_id;
+        uint64_t frontier;
+        enum llama_rerot_frontier_mode frontier_mode;
+        struct llama_rerot_view_stamp stamp;
+        const uint32_t * ordered_run_ids;
+        size_t n_ordered_runs;
+    };
+
+    // Begin/end one RERoT episode on this context. Begin registers the
+    // episode-active gate consumed by decode / state / shift / preemption
+    // paths; end clears all write tags and reader views installed by the
+    // episode. Returns false when RERoT is disabled or params are invalid.
+    LLAMA_API bool llama_rerot_episode_begin(
+            struct llama_context * ctx,
+                   uint64_t episode_id,
+        const struct llama_rerot_episode_params * params);
+
+    LLAMA_API void llama_rerot_episode_end(
+            struct llama_context * ctx,
+                   uint64_t episode_id);
+
+    // Classify future KV writes by one execution sequence. Forwards to the
+    // memory write-tag table; existing cells are unchanged. Returns false
+    // when RERoT is disabled, no episode is active, or the tag is invalid.
+    LLAMA_API bool llama_rerot_set_write_tag(
+            struct llama_context * ctx,
+              llama_seq_id seq_id,
+        const struct llama_rerot_write_tag * tag);
+
+    // Atomically publish one pending run. Forwards to the memory publish
+    // path. Returns 0 when disabled/inactive/invalid or when no resident
+    // pending cells remain.
+    LLAMA_API size_t llama_rerot_publish_run(
+            struct llama_context * ctx,
+        const struct llama_rerot_publish * req);
+
+    // Install the PAC-DFS frontier views for the next decode. Each entry is
+    // validated then forwarded to the memory reader-view table, and its
+    // stamp is recorded for MTP staleness checks. Returns false when
+    // disabled/inactive or when any descriptor is invalid.
+    LLAMA_API bool llama_rerot_set_frontier_views(
+            struct llama_context * ctx,
+        const struct llama_rerot_frontier_reader_view * views,
+                      size_t n_views);
+
+    // Attention-only archive freeze (§7.2) forwarding: every PUBLIC_LIVE
+    // resident cell of episode_id referenced by exec_seq gains archive_seq
+    // as keeper, then exec_seq attention refs are released (recurrent exec
+    // refs are released via the recurrent path by the caller/runtime). No
+    // K/V data moves; visibility metadata is untouched. Returns false when
+    // disabled/inactive/invalid. On success *kept_out (if non-null) holds
+    // the number of public cells now kept alive (may be zero for purely
+    // private history while exec_seq is still released).
+    LLAMA_API bool llama_rerot_freeze_to_archive(
+            struct llama_context * ctx,
+                   uint64_t episode_id,
+                 llama_seq_id exec_seq,
+                 llama_seq_id archive_seq,
+                       size_t * kept_out);
+
+    // Capability bitmap for this context (A.25). Returns 0 when RERoT is
+    // disabled. When an episode is active the REROT/TREE/PRIVATE/MTP bits
+    // are set; HYBRID/SPARSE/TRI bits reflect the underlying memory/model.
+    LLAMA_API uint32_t llama_rerot_state_caps(
+            const struct llama_context * ctx);
+
+    // Topology-barrier read-only refresh (§17.3): re-installs the current
+    // frontier views so the next decode observes stable shared memory.
+    // Writes no public token and allocates no new KV cell. If a refresh
+    // query would disturb recurrent state the implementation must
+    // checkpoint and restore it (v1 prototype path). Returns false when
+    // disabled/inactive.
+    LLAMA_API bool llama_rerot_refresh_barrier(
+            struct llama_context * ctx,
+                   uint64_t episode_id);
+
+    // MTP draft staleness query (§A.6): true when the draft bound to
+    // (seq_id, stamp) must be invalidated because the reader view epochs
+    // moved (topology/publish/layout change or peer PUBLIC commit), in
+    // which case the caller must restore its checkpoint, drop uncommitted
+    // draft KV/recurrent state, and re-draft from the latest view. Returns
+    // false when RERoT is disabled/inactive (no RERoT-induced staleness)
+    // or when the stamp still matches the installed view.
+    LLAMA_API bool llama_rerot_mtp_is_stale(
+            struct llama_context * ctx,
+              llama_seq_id seq_id,
+        const struct llama_rerot_view_stamp * stamp);
 
     // Removes all tokens that do not belong to the specified sequence
     LLAMA_API void llama_memory_seq_keep(

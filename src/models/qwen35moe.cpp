@@ -302,6 +302,8 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     // Apply Q normalization
     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "Qcur_normed", il);
+    // RERoT: expose the raw pre-RoPE Q (full-attention layers only; this helper
+    // runs only for non-recurrent layers) for host-side inspection when enabled.
     if (cparams.attention_q_pre_rope[il]) {
         res->t_attn_q_pre_rope[il] = Qcur;
     }
@@ -326,29 +328,47 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
 
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
-    // Apply IMRoPE
-    Qcur = ggml_rope_multi(
-            ctx0, Qcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow
-            );
-
     Kcur = ggml_rope_multi(
             ctx0, Kcur, inp_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow
             );
 
-    cb(Qcur, "Qcur", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
 
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp,
-                nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    // RERoT v1 (text-only Ornith/Qwen3.5 hybrid): this full-attention layer consumes
+    // the raw pre-RoPE Q above. The reader-relative IMRoPE/DDVR transform
+    // ((p+delta, p+delta, p+delta, 0); 4th axis always 0 for text runs) is applied
+    // inside build_rerot_q_groups via the per-group virtual positions, using this
+    // episode's fixed RoPE params (n_rot/sections/rope_type/freq_* below).
+    // Partial/interleaved dims (head_dim 256 / rotary_dim 64) ride along via n_rot +
+    // sections; TurboQuant Q-WHT ordering (RoPE -> WHT -> dot) and head_dim padding
+    // use the actual tensor type/ne/nb inside build_attn_rerot, so Q passes through
+    // unpadded here. Image/audio embedding batches never take the DDVR path: they
+    // fall through to ordinary serial IMRoPE below and visual spatial positions are
+    // never remapped (graph-input side additionally guarantees rerot_active()==false
+    // for those batches).
+    const bool rerot_text = inp->rerot_active() && ubatch.token != nullptr && ubatch.embd == nullptr;
+    if (rerot_text) {
+        ggml_tensor * Qgroups = build_rerot_q_groups(inp, Qcur, nullptr, sections, il);
+        cur = build_attn_rerot(inp,
+                    nullptr, nullptr, nullptr,
+                    Qgroups, Kcur, Vcur, nullptr, kq_scale, il);
+    } else {
+        Qcur = ggml_rope_multi(
+                ctx0, Qcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow
+                );
+        cb(Qcur, "Qcur", il);
+        cur = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    }
     cb(cur, "attn_pregate", il);
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);

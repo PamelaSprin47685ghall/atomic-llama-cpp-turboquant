@@ -33,11 +33,16 @@ llama_memory_recurrent::llama_memory_recurrent(
     used = 0;
 
     this->n_rs_seq = n_rs_seq;
-    rs_idx.assign(n_seq_max, 0);
+
+    // RERoT logical seq-id capacity (§6.5): the parked/recursive-fork lineage
+    // may reference any id in [0, LLAMA_MAX_SEQ), while the physical state
+    // tensors stay at mem_size cells. Only these logical maps grow; no tensor
+    // is widened. Ordinary (RERoT OFF) ids are unaffected.
+    rs_idx.assign(LLAMA_MAX_SEQ, 0);
 
     cells.clear();
     cells.resize(mem_size);
-    tails.assign(n_seq_max, -1);
+    tails.assign(LLAMA_MAX_SEQ, -1);
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -171,7 +176,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 
     // models like Mamba or RWKV can't have a state partially erased at the end
     // of the sequence because their state isn't preserved for previous tokens
-    if (seq_id >= (int64_t) n_seq_max) {
+    // NOTE: gated on the logical capacity (LLAMA_MAX_SEQ), not the configured
+    // n_seq_max, so parked RERoT lineages remain addressable. Physical cells
+    // are still bounded by `size`.
+    if (seq_id >= (int64_t) LLAMA_MAX_SEQ) {
         return false;
     }
     if (0 <= seq_id) {
@@ -246,7 +254,12 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
         p1 = std::numeric_limits<llama_pos>::max();
     }
 
-    if ((uint32_t) seq_id_dst < n_seq_max && (uint32_t) seq_id_src < n_seq_max) {
+    // RERoT parking: the child only joins the parent tail cell's ref set, so
+    // many parked children share one tail with no tensor copy. The first real
+    // write after admission allocates an exclusive cell in find_slot() (COW).
+    // Releasing an exec id later drops just its own ref, leaving parked
+    // siblings (and recursive-fork grandchildren) undisturbed.
+    if ((uint32_t) seq_id_dst < LLAMA_MAX_SEQ && (uint32_t) seq_id_src < LLAMA_MAX_SEQ) {
         int32_t & tail_src = tails[(size_t) seq_id_src];
         int32_t & tail_dst = tails[(size_t) seq_id_dst];
         if (tail_dst >= 0) {
@@ -267,6 +280,44 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             tail_dst = tail_src;
         }
     }
+}
+
+bool llama_memory_recurrent::seq_rm_attention(
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1) {
+    // recurrent-only memory holds no attention state: the attention-side op is
+    // vacuously successful so uniform two-sided release paths keep working.
+    GGML_UNUSED(seq_id);
+    GGML_UNUSED(p0);
+    GGML_UNUSED(p1);
+    return true;
+}
+
+void llama_memory_recurrent::seq_cp_attention(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst,
+        llama_pos p0,
+        llama_pos p1) {
+    GGML_UNUSED(seq_id_src);
+    GGML_UNUSED(seq_id_dst);
+    GGML_UNUSED(p0);
+    GGML_UNUSED(p1);
+}
+
+bool llama_memory_recurrent::seq_rm_recurrent(
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1) {
+    return seq_rm(seq_id, p0, p1);
+}
+
+void llama_memory_recurrent::seq_cp_recurrent(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst,
+        llama_pos p0,
+        llama_pos p1) {
+    seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
@@ -324,7 +375,7 @@ void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
     }
 
     // for Mamba-like or RWKV models, only the pos needs to be shifted
-    if (0 <= seq_id && seq_id < (int64_t) n_seq_max) {
+    if (0 <= seq_id && seq_id < (int64_t) LLAMA_MAX_SEQ) {
         const int32_t tail_id = tails[(size_t) seq_id];
         if (tail_id >= 0) {
             auto & cell = cells[tail_id];
@@ -354,7 +405,7 @@ void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
     }
 
     // for Mamba-like or RWKV models, only the pos needs to be changed
-    if (0 <= seq_id && seq_id < (int64_t) n_seq_max) {
+    if (0 <= seq_id && seq_id < (int64_t) LLAMA_MAX_SEQ) {
         const int32_t tail_id = tails[(size_t) seq_id];
         if (tail_id >= 0) {
             auto & cell = cells[tail_id];
@@ -515,8 +566,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         for (uint32_t j = 0; j < n_seq_id; ++j) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];
 
-            if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
-                LLAMA_LOG_ERROR("%s: seq_id=%d >= n_seq_max=%u\n", __func__, seq_id, n_seq_max);
+            if (seq_id < 0 || (uint32_t) seq_id >= LLAMA_MAX_SEQ) {
+                LLAMA_LOG_ERROR("%s: seq_id=%d >= LLAMA_MAX_SEQ=%u\n", __func__, seq_id, (unsigned) LLAMA_MAX_SEQ);
                 return false;
             }
             if (j > 0) {
@@ -538,7 +589,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 #ifndef NDEBUG
     {
         std::vector<int32_t> tails_verif;
-        tails_verif.assign(n_seq_max, -1);
+        tails_verif.assign(tails.size(), -1);
         for (uint32_t i = 0; i < size; ++i) {
             auto & cell = cells[i];
             for (llama_seq_id seq_id : cell.seq_id) {
@@ -548,7 +599,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 tails_verif[seq_id] = i;
             }
         }
-        for (uint32_t i = 0; i < n_seq_max; ++i) {
+        for (uint32_t i = 0; i < tails.size(); ++i) {
             if (tails_verif[i] != tails[i]) {
                 LLAMA_LOG_ERROR("%s: wrong tail for seq_id %d, (%d instead of %d)\n", __func__, i, tails[i], tails_verif[i]);
             }
@@ -1037,8 +1088,8 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
                 llama_seq_id seq_id;
                 io.read(&seq_id, sizeof(seq_id));
 
-                if (seq_id < 0 || (uint32_t) seq_id >= this->n_seq_max) {
-                    LLAMA_LOG_ERROR("%s: invalid seq_id, %d is out of range [0, %u)\n", __func__, seq_id, this->n_seq_max);
+                if (seq_id < 0 || (uint32_t) seq_id >= LLAMA_MAX_SEQ) {
+                    LLAMA_LOG_ERROR("%s: invalid seq_id, %d is out of range [0, %u)\n", __func__, seq_id, (unsigned) LLAMA_MAX_SEQ);
                     return false;
                 }
 

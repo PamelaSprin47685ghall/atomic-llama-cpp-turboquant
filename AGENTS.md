@@ -268,6 +268,41 @@ system fingerprint: b10724-f0b7765e7
 
 因此当前状态是：**代码与轻量真实模型验证达到 delivery-candidate，可提交/推送；下面列出的重型门仍是正式 production release 验收项。**
 
+### 2026-09-04 RERoT 整改部署状态
+
+RERoT 整改提交与生产部署：
+
+```text
+branch commit:   2ab7223c6
+build binary:    build-vulkan/bin/llama-server
+deployed binary: /opt/llama/bin/llama-server
+binary SHA-256:  ac626f7726386977d28e6e9316c7444e16298d45b3854210ddb1ff9a6903c740
+calibration:     /opt/llama/data/ornith-1.5-35b.triattention
+calib SHA-256:   e95dae507d1f4a64e29be160c5281f8a4308a3332dc9c9176e1a3a0af32e50e2
+```
+
+binary、`libllama-server-impl`、llama/common/mtmd 及全部 ggml CPU/Vulkan
+共享库已逐项核对 build/deploy SHA-256 一致；生产进程的 `/proc/<pid>/maps`
+确认实际从 `/opt/llama/bin` 加载这些新库，不再误用 `/opt/llama/lib` 的旧副本。
+
+生产 unit 已：
+
+- 删除违规实验参数 `--triattention-ratio 0.5`，恢复固定 `3/32`；
+- 启用 `--rerot --rerot-frontier strong`；
+- 将 `/opt/llama/bin` 放在 `LD_LIBRARY_PATH` 首位。
+
+本次启动 auto-fit 日志包含 `automatic unified KV capacity = 34816 tokens`；
+hybrid recurrent 最终为 3 个 physical slots，server 将 `-np 6` 安全收敛为
+3 个 slots，每槽 context 262,144。日志确认 `RERoT runtime armed
+(frontier=strong)`、`model loaded`；`/health` 返回 `{"status":"ok"}`。
+
+生产真实请求 `"如何减肥?"` 返回 HTTP 200、`finish_reason=stop`，包含根级
+`<ol>`、5 个公开章节、10,161 字符 reasoning 与 1,635 字符最终答案；
+共 3,747 completion tokens，wall time 约 96.97 s。MTP speculative 当前未在
+该 unit 启用；这仍是指南 Phase 1 的 correctness-first 部署，不得据此宣称
+附录 A 的 MTP/RAM/context-shift/full-slot/soak 等 production release blocker
+已经完成。
+
 ## 剩余发布阻断项
 
 以下工作未完成。按顺序处理；不得以短 health request 替代。

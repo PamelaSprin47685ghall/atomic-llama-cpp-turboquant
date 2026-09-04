@@ -46,6 +46,16 @@ const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_ty
     GGML_ABORT("fatal error");
 }
 
+const char * llama_rerot_frontier_mode_name(enum llama_rerot_frontier_mode mode) {
+    switch (mode) {
+        case LLAMA_REROT_FRONTIER_STRONG:
+            return "strong";
+        case LLAMA_REROT_FRONTIER_LAG1:
+            return "lag1";
+    }
+    GGML_ABORT("fatal error");
+}
+
 const char * llama_load_mode_name(enum llama_load_mode load_mode) {
     switch (load_mode) {
         case LLAMA_LOAD_MODE_NONE:

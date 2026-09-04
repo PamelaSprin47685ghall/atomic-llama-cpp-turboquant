@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-graph.h"
 #include "llama-ext.h"
+#include "llama-rerot.h"
 
 #include <map>
 #include <memory>
@@ -133,6 +134,133 @@ struct llama_memory_i {
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
+
+    // Component-selective operations used by RERoT (§6.3). Attention-only
+    // memory is the common case, so the default delegates to the ordinary
+    // sequence op; recurrent-only defaults to a successful no-op. Recurrent
+    // and hybrid memory implementations override these methods explicitly
+    // (hybrid forwards each side to its sub-memory). The inapplicable side
+    // must stay vacuously successful: release paths call both sides
+    // unconditionally, so a failure default would break retire on
+    // single-component memories.
+    virtual bool seq_rm_attention(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+        return seq_rm(seq_id, p0, p1);
+    }
+    virtual void seq_cp_attention(
+            llama_seq_id seq_id_src,
+            llama_seq_id seq_id_dst,
+            llama_pos p0,
+            llama_pos p1) {
+        seq_cp(seq_id_src, seq_id_dst, p0, p1);
+    }
+    virtual bool seq_rm_recurrent(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(p0);
+        GGML_UNUSED(p1);
+        return true;
+    }
+    virtual void seq_cp_recurrent(
+            llama_seq_id seq_id_src,
+            llama_seq_id seq_id_dst,
+            llama_pos p0,
+            llama_pos p1) {
+        GGML_UNUSED(seq_id_src);
+        GGML_UNUSED(seq_id_dst);
+        GGML_UNUSED(p0);
+        GGML_UNUSED(p1);
+    }
+
+    // RERoT physical-cell classification. Implementations with no attention
+    // cache report unsupported. Composite memories must validate publication
+    // across all attention components before mutating any component.
+    virtual bool rerot_set_write_tag(llama_seq_id seq_id, const llama_kv_rerot_meta & tag) {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(tag);
+        return false;
+    }
+    virtual void rerot_clear_write_tag(llama_seq_id seq_id) {
+        GGML_UNUSED(seq_id);
+    }
+    virtual bool rerot_can_publish_run(
+            uint64_t episode_id,
+            llama_rerot_run_id run_id,
+            size_t * count) const {
+        GGML_UNUSED(episode_id);
+        GGML_UNUSED(run_id);
+        if (count) {
+            *count = 0;
+        }
+        return false;
+    }
+    virtual bool rerot_can_reclassify_run(
+            uint64_t episode_id,
+            llama_rerot_run_id run_id,
+            llama_rerot_visibility expected,
+            llama_rerot_visibility replacement,
+            uint64_t publish_epoch,
+            size_t * count) const {
+        GGML_UNUSED(episode_id);
+        GGML_UNUSED(run_id);
+        GGML_UNUSED(expected);
+        GGML_UNUSED(replacement);
+        GGML_UNUSED(publish_epoch);
+        if (count) {
+            *count = 0;
+        }
+        return false;
+    }
+    virtual size_t rerot_publish_run(
+            uint64_t episode_id,
+            llama_rerot_run_id run_id,
+            uint64_t publish_epoch) {
+        GGML_UNUSED(episode_id);
+        GGML_UNUSED(run_id);
+        GGML_UNUSED(publish_epoch);
+        return 0;
+    }
+    virtual size_t rerot_reclassify_run(
+            uint64_t episode_id,
+            llama_rerot_run_id run_id,
+            llama_rerot_visibility expected,
+            llama_rerot_visibility replacement,
+            uint64_t publish_epoch) {
+        GGML_UNUSED(episode_id);
+        GGML_UNUSED(run_id);
+        GGML_UNUSED(expected);
+        GGML_UNUSED(replacement);
+        GGML_UNUSED(publish_epoch);
+        return 0;
+    }
+    virtual bool rerot_can_add_run_ref(
+            uint64_t episode_id,
+            llama_rerot_run_id run_id,
+            llama_seq_id seq_id,
+            size_t * count) const {
+        GGML_UNUSED(episode_id);
+        GGML_UNUSED(run_id);
+        GGML_UNUSED(seq_id);
+        if (count) {
+            *count = 0;
+        }
+        return false;
+    }
+    virtual size_t rerot_add_run_ref(
+            uint64_t episode_id,
+            llama_rerot_run_id run_id,
+            llama_seq_id seq_id) {
+        GGML_UNUSED(episode_id);
+        GGML_UNUSED(run_id);
+        GGML_UNUSED(seq_id);
+        return 0;
+    }
+    virtual bool rerot_set_reader_view(llama_seq_id seq_id, const llama_rerot_reader_state & view) {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(view);
+        return false;
+    }
+    virtual void rerot_clear_reader_view(llama_seq_id seq_id) {
+        GGML_UNUSED(seq_id);
+    }
 
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;

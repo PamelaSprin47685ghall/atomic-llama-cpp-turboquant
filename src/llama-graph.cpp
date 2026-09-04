@@ -16,9 +16,11 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 
@@ -465,6 +467,309 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// llm_graph_input_attn_rerot (RERoT DDVR graph input, §§9-12, 21)
+// ---------------------------------------------------------------------------
+
+uint32_t llm_graph_input_attn_rerot::capacity_bucket(uint32_t n) {
+    if (n == 0) {
+        return 0;
+    }
+    return ((n + SPAN_BUCKET - 1) / SPAN_BUCKET) * SPAN_BUCKET;
+}
+
+bool llm_graph_input_attn_rerot::graph_reuse_disabled() {
+    const char * env = getenv("LLAMA_REROT_DISABLE_GRAPH_REUSE");
+    return env != nullptr && env[0] != '\0' && !(env[0] == '0' && env[1] == '\0');
+}
+
+bool llm_graph_input_attn_rerot::is_supported_arch(const llama_hparams & hparams) {
+    // v1 is text-only. Multimodal embedding batches fall back to the ordinary
+    // serial path model-side (ubatch.embd); only VISION RoPE is a hard error.
+    return hparams.rope_type != LLAMA_ROPE_TYPE_VISION;
+}
+
+llm_rerot_kernel_variant llm_graph_input_attn_rerot::select_variant(ggml_backend_sched_t sched) {
+    if (sched == nullptr) {
+        return llm_rerot_kernel_variant::REROT_KERNEL_CPU;
+    }
+    const int n = ggml_backend_sched_get_n_backends(sched);
+    bool seen_vulkan = false;
+    for (int i = 0; i < n; ++i) {
+        ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+        if (b == nullptr) {
+            continue;
+        }
+        const char * name = ggml_backend_name(b);
+        if (name == nullptr) {
+            continue;
+        }
+        const std::string s(name);
+        if (s.find("CUDA") != std::string::npos ||
+            s.find("Metal") != std::string::npos ||
+            s.find("RPC") != std::string::npos) {
+            return llm_rerot_kernel_variant::REROT_KERNEL_UNSUPPORTED;
+        }
+        if (s.find("Vulkan") != std::string::npos || s.find("vulkan") != std::string::npos) {
+            seen_vulkan = true;
+        }
+    }
+    return seen_vulkan
+        ? llm_rerot_kernel_variant::REROT_KERNEL_VULKAN_FUSED
+        : llm_rerot_kernel_variant::REROT_KERNEL_CPU;
+}
+
+void llm_graph_input_attn_rerot::require_supported(
+        ggml_backend_sched_t sched,
+        const llama_hparams & hparams,
+        const char * where) {
+    if (!is_supported_arch(hparams)) {
+        throw std::runtime_error(
+            std::string("RERoT DDVR: unsupported RoPE architecture in ") + where +
+            " (multimodal/VISION is outside the text-only v1 scope;"
+            " refusing silent stock attention)");
+    }
+    if (select_variant(sched) == llm_rerot_kernel_variant::REROT_KERNEL_UNSUPPORTED) {
+        std::string names;
+        if (sched != nullptr) {
+            const int n = ggml_backend_sched_get_n_backends(sched);
+            for (int i = 0; i < n; ++i) {
+                ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+                if (b == nullptr) {
+                    continue;
+                }
+                const char * name = ggml_backend_name(b);
+                if (name == nullptr) {
+                    continue;
+                }
+                if (!names.empty()) {
+                    names += ",";
+                }
+                names += name;
+            }
+        }
+        throw std::runtime_error(
+            "RERoT DDVR: no RERoT kernel for backend(s) [" + names + "] in " +
+            where + " (CUDA/Metal/RPC today); refusing silent stock attention");
+    }
+}
+
+llm_rerot_span_reuse_key llm_graph_input_attn_rerot::make_key(
+        uint32_t n_tokens,
+        uint32_t n_groups,
+        uint32_t n_entries,
+        llm_rerot_kernel_variant variant,
+        bool rerot_on,
+        llama_rerot_frontier_mode mode) {
+    llm_rerot_span_reuse_key k;
+    k.n_tokens   = n_tokens;
+    k.group_cap  = capacity_bucket(n_groups);
+    k.entry_cap  = capacity_bucket(n_entries);
+    k.variant    = variant;
+    k.rerot_on   = rerot_on;
+    k.frontier_mode = mode;
+    return k;
+}
+
+void llm_graph_input_attn_rerot::build_span_tensors(
+        ggml_context * ctx0,
+        ggml_tensor *& q_indices,
+        ggml_tensor *& q_pos,
+        ggml_tensor *& entries,
+        ggml_tensor *& offsets,
+        const llama_ubatch & ubatch,
+        const llama_hparams & hparams,
+        const llama_cparams & cparams,
+        const llama_kv_cache_context * attn,
+        ggml_backend_sched_t sched) {
+    GGML_ASSERT(attn && attn->rerot_active());
+    const auto & layout = attn->get_rerot_attn_layout();
+    if (layout.empty() || layout.groups.empty() || layout.entries.empty()) {
+        throw std::runtime_error(
+            "RERoT DDVR: active batch produced an empty span layout;"
+            " refusing silent stock attention");
+    }
+    const uint32_t n_pos = hparams.n_pos_per_embd();
+    if (n_pos != 1 && n_pos != 4) {
+        throw std::runtime_error("RERoT DDVR: unsupported position width (text-only v1 supports 1 or 4)");
+    }
+    if (layout.query_offsets.size() != (size_t) ubatch.n_tokens + 1) {
+        throw std::runtime_error("RERoT DDVR: query offsets do not cover the ubatch rows");
+    }
+    // Backend support itself is enforced at op selection (require_supported);
+    // the variant is recorded here so a backend change forces a rebuild.
+    key = make_key(
+        ubatch.n_tokens,
+        (uint32_t) layout.groups.size(),
+        (uint32_t) layout.entries.size(),
+        select_variant(sched), true, cparams.rerot_frontier);
+    key_valid = true;
+
+    q_indices = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, key.group_cap);
+    ggml_set_input(q_indices);
+
+    q_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) key.group_cap * n_pos);
+    ggml_set_input(q_pos);
+
+    entries = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 2, key.entry_cap);
+    ggml_set_input(entries);
+
+    offsets = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) ubatch.n_tokens + 1);
+    ggml_set_input(offsets);
+}
+
+bool llm_graph_input_attn_rerot::spans_can_reuse(
+        const llama_ubatch & ubatch,
+        const llama_hparams & hparams,
+        const llama_cparams & cparams,
+        const llama_kv_cache_context * attn,
+        ggml_backend_sched_t sched,
+        const ggml_tensor * q_indices,
+        const ggml_tensor * q_pos,
+        const ggml_tensor * entries,
+                    const ggml_tensor * offsets) const {
+    const bool has = attn && attn->rerot_active();
+    const bool had = q_indices != nullptr;
+    if (!had && !has) {
+        return true;
+    }
+    if (had != has) {
+        return false;
+    }
+    if (!key_valid) {
+        return false;
+    }
+    // Explicit first-CPU-prototype hatch: disable reuse while RERoT is active.
+    // The capacity-bucketed key design above stays authoritative regardless.
+    if (graph_reuse_disabled()) {
+        return false;
+    }
+    const auto & layout = attn->get_rerot_attn_layout();
+    if (layout.empty() || layout.groups.empty() || layout.entries.empty()) {
+        return false;
+    }
+    const auto cur = make_key(
+        ubatch.n_tokens,
+        (uint32_t) layout.groups.size(),
+        (uint32_t) layout.entries.size(),
+        select_variant(sched), true, cparams.rerot_frontier);
+    if (cur != key) {
+        return false;
+    }
+    // Sanity: topology must equal the recorded capacity buckets. Span data
+    // churn (virtual_pos0 / storage_pos0 / counts within capacity /
+    // visibility) intentionally does not appear here.
+    const uint32_t n_pos = hparams.n_pos_per_embd();
+    if (q_indices->ne[0] != (int64_t) key.group_cap) {
+        return false;
+    }
+    if (q_pos == nullptr || q_pos->ne[0] != (int64_t) key.group_cap * n_pos) {
+        return false;
+    }
+    if (entries == nullptr || entries->ne[0] != 2 || entries->ne[1] != (int64_t) key.entry_cap) {
+        return false;
+    }
+    if (offsets == nullptr || offsets->ne[0] != (int64_t) key.n_tokens + 1) {
+        return false;
+    }
+    return true;
+}
+
+void llm_graph_input_attn_rerot::fill_spans(
+        ggml_tensor * q_indices,
+        ggml_tensor * q_pos,
+        ggml_tensor * entries,
+        ggml_tensor * offsets,
+        const llama_kv_cache_context * attn,
+        uint32_t n_pos) {
+    GGML_ASSERT(q_indices && q_pos && entries && offsets && attn);
+    GGML_ASSERT(n_pos == 1 || n_pos == 4);
+    const auto & layout = attn->get_rerot_attn_layout();
+    if (layout.empty() || layout.groups.empty() || layout.entries.empty()) {
+        throw std::runtime_error("RERoT DDVR: cannot fill span tensors from an empty layout");
+    }
+    const size_t n_groups  = layout.groups.size();
+    const size_t n_entries = layout.entries.size();
+    const size_t n_offsets = layout.query_offsets.size();
+    const int64_t group_cap = q_indices->ne[0];
+    if ((int64_t) n_groups > group_cap) {
+        throw std::runtime_error(
+            "RERoT DDVR: span layout exceeds tensor capacity (stale reuse key);"
+            " rebuild required, refusing to truncate");
+    }
+    if (q_pos->ne[0] != group_cap * (int64_t) n_pos) {
+        throw std::runtime_error("RERoT DDVR: q_pos capacity does not match q_indices capacity");
+    }
+    if (entries->ne[0] != 2 || entries->ne[1] < (int64_t) n_entries) {
+        throw std::runtime_error(
+            "RERoT DDVR: entry layout exceeds tensor capacity;"
+            " rebuild required, refusing to truncate");
+    }
+    if (offsets->ne[0] != (int64_t) n_offsets) {
+        throw std::runtime_error("RERoT DDVR: query offsets do not match tensor shape");
+    }
+
+    // Per-instance staging snapshot: no statics, no aliasing of layout
+    // internals, so a later frontier cannot overwrite span tables still
+    // referenced by an in-flight graph. Callers order fill_spans after the
+    // previous frontier's graph has completed (same discipline as k_idxs).
+    st_q_indices.assign((size_t) group_cap, 0);
+    for (size_t i = 0; i < n_groups; ++i) {
+        st_q_indices[i] = (int32_t) layout.groups[i].query_index;
+    }
+
+    // q_pos uses the tensor's own group-capacity stride (coordinate k lives at
+    // k * group_cap), matching how ggml_rope reads multi-pos. IMRoPE text
+    // rule: (p, p, p, 0) with the delta on the first three coordinates only.
+    st_q_pos.assign((size_t) group_cap * n_pos, 0);
+    for (size_t i = 0; i < n_groups; ++i) {
+        const int32_t p = (int32_t) layout.groups[i].effective_pos;
+        st_q_pos[i] = p;
+        if (n_pos == 4) {
+            st_q_pos[(size_t) group_cap + i]     = p;
+            st_q_pos[(size_t) group_cap * 2 + i] = p;
+            st_q_pos[(size_t) group_cap * 3 + i] = 0;
+        }
+    }
+
+    st_entries.assign((size_t) entries->ne[1] * 2, 0);
+    for (size_t i = 0; i < n_entries; ++i) {
+        st_entries[2 * i + 0] = (int32_t) layout.entries[i].key_index;
+        st_entries[2 * i + 1] = (int32_t) layout.entries[i].group_index;
+    }
+
+    st_offsets.assign(n_offsets, 0);
+    for (size_t i = 0; i < n_offsets; ++i) {
+        st_offsets[i] = (int32_t) layout.query_offsets[i];
+    }
+
+    ggml_backend_tensor_set(q_indices, st_q_indices.data(), 0, ggml_nbytes(q_indices));
+    ggml_backend_tensor_set(q_pos,     st_q_pos.data(),     0, ggml_nbytes(q_pos));
+    ggml_backend_tensor_set(entries,   st_entries.data(),   0, ggml_nbytes(entries));
+    ggml_backend_tensor_set(offsets,   st_offsets.data(),   0, ggml_nbytes(offsets));
+
+    ++epoch;
+}
+
+bool llm_graph_input_attn_kv::rerot_spans_can_reuse(
+        const llama_ubatch & ubatch,
+        ggml_backend_sched_t sched,
+        const llama_cparams & cparams,
+        const llama_kv_cache_context * attn) const {
+    return rerot_spans.spans_can_reuse(
+        ubatch, hparams, cparams, attn, sched,
+        self_rerot_q_indices, self_rerot_q_pos, self_rerot_entries, self_rerot_offsets);
+}
+
+void llm_graph_input_attn_kv::rerot_spans_fill(
+        const llama_ubatch * ubatch,
+        const llama_kv_cache_context * attn) {
+    GGML_UNUSED(ubatch);
+    rerot_spans.fill_spans(
+        self_rerot_q_indices, self_rerot_q_pos, self_rerot_entries, self_rerot_offsets,
+        attn, hparams.n_pos_per_embd());
+}
+
 void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
@@ -482,6 +787,12 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot && self_v_rot->buffer) {
         mctx->set_input_v_rot(self_v_rot);
     }
+
+    if (self_rerot_q_indices) {
+        // RERoT DDVR span data refresh (input tensor data, not topology).
+        // Ordinary k/v/mask fills above are untouched; OFF batches never enter.
+        rerot_spans_fill(ubatch, mctx);
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -495,6 +806,13 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    // RERoT DDVR: span metadata/offsets/visibility are input tensor data, not
+    // topology. The reuse key covers only (n_token rows, span capacity bucket,
+    // kernel variant, rerot on/off, frontier mode); virtual_pos0 /
+    // storage_pos0 / count (within capacity) / visibility churn refreshes data
+    // without forcing a rebuild. OFF pairs (!had && !has) reuse as before.
+    res &= rerot_spans_can_reuse(params.ubatch, params.sched, params.cparams, mctx);
 
     return res;
 }
@@ -1062,7 +1380,16 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    // The dedicated RERoT attention op consumes the resolved visibility/span
+    // tensors instead of the ordinary membership mask. ggml therefore prunes
+    // self_kq_mask from that graph and leaves its input tensor unallocated.
+    // Keep the strict ordinary-path assertion in set_input_kq_mask(), but do
+    // not write an intentionally unused input.
+    if (inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    } else {
+        GGML_ASSERT(inp_attn->rerot_active());
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -1070,6 +1397,13 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     if (inp_attn->self_v_rot) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
+    }
+
+    if (inp_attn->rerot_active()) {
+        // RERoT DDVR span data for hybrid full-attention layers. Recurrent
+        // state above stays lane-local; only the shared-attention span tables
+        // refresh here. OFF batches never enter.
+        inp_attn->rerot_spans_fill(ubatch, mctx->get_attn());
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -1096,6 +1430,12 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+
+    // RERoT DDVR span reuse: same capacity-bucketed key as the plain KV path
+    // (n_token rows, span capacity bucket, kernel variant, on/off, frontier
+    // mode). Span data churn alone must not force a rebuild.
+    res &= inp_attn->rerot_spans_can_reuse(
+        params.ubatch, params.sched, params.cparams, mctx->get_attn());
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2799,7 +3139,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+    const llama_kv_cache_context * mctx_cur,
+          ggml_backend_sched_t sched) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
 
@@ -2816,15 +3157,182 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
+    if (mctx_cur->rerot_active()) {
+        // RERoT DDVR span descriptors: capacity-bucketed topology. The reuse
+        // key (n_token rows, span capacity bucket, kernel variant, on/off,
+        // frontier mode) is recorded inside; per-frontier PAC-DFS churn lands
+        // in tensor data via fill_spans, not in topology.
+        inp->rerot_spans.build_span_tensors(
+            ctx0,
+            inp->self_rerot_q_indices, inp->self_rerot_q_pos,
+            inp->self_rerot_entries, inp->self_rerot_offsets,
+            ubatch, hparams, cparams, mctx_cur, sched);
+    }
+
     return inp;
 }
 
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur);
+    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, sched);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
+}
+
+ggml_tensor * llm_graph_context::build_rerot_q_groups(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * q_raw,
+        ggml_tensor * freq_factors,
+        int sections[GGML_MROPE_SECTIONS],
+        int il) const {
+    GGML_ASSERT(inp && inp->rerot_active());
+    GGML_ASSERT(q_raw && q_raw->ne[2] == n_tokens);
+
+    // DDVR Q pre-phasing gate: per-group effective RoPE (query_virtual +
+    // storage_base - virtual_base; IMRoPE text delta on the first three
+    // coords, fourth pinned 0 by fill_spans) is applied here, BEFORE Turbo
+    // WHT (see build_attn_rerot). K storage is never moved. Unsupported
+    // backends throw below, never silent stock attention.
+    llm_graph_input_attn_rerot::require_supported(sched, hparams, "build_rerot_q_groups");
+
+    if (!ggml_is_contiguous(q_raw)) {
+        q_raw = ggml_cont(ctx0, q_raw);
+    }
+
+    const int64_t head_dim = q_raw->ne[0];
+    const int64_t heads = q_raw->ne[1];
+    const int64_t groups = inp->get_rerot_q_indices()->ne[0];
+
+    ggml_tensor * q_flat = ggml_reshape_2d(ctx0, q_raw, head_dim * heads, n_tokens);
+    ggml_tensor * q_grouped = ggml_get_rows(ctx0, q_flat, inp->get_rerot_q_indices());
+    q_grouped = ggml_reshape_3d(ctx0, q_grouped, head_dim, heads, groups);
+    cb(q_grouped, "rerot_q_grouped_raw", il);
+
+    const int mode = static_cast<int>(rope_type);
+    if (mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE || mode == GGML_ROPE_TYPE_VISION) {
+        GGML_ASSERT(sections != nullptr);
+        q_grouped = ggml_rope_multi(
+            ctx0, q_grouped, inp->get_rerot_q_pos(), freq_factors,
+            n_rot, sections, mode, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    } else {
+        q_grouped = ggml_rope_ext(
+            ctx0, q_grouped, inp->get_rerot_q_pos(), freq_factors,
+            n_rot, mode, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    }
+    cb(q_grouped, "rerot_q_grouped", il);
+    return q_grouped;
+}
+
+ggml_tensor * llm_graph_context::build_attn_rerot(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * wo_s,
+        ggml_tensor * q_groups,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * sinks,
+        float kq_scale,
+        int il) const {
+    GGML_ASSERT(inp && inp->rerot_active());
+    GGML_ASSERT(q_groups && k_cur && v_cur);
+
+    // Capability gate: CUDA/Metal/RPC have no RERoT kernel today and throw
+    // here instead of silently running stock attention. Downstream
+    // GGML_OP_FLASH_ATTN_EXT_REROT keeps one global online softmax per query
+    // entry range over the pre-filtered span descriptors.
+    llm_graph_input_attn_rerot::require_supported(sched, hparams, "build_attn_rerot");
+
+    if (inp->self_k_rot) {
+        q_groups = llama_mul_mat_hadamard(ctx0, q_groups, inp->self_k_rot);
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+    }
+    if (inp->self_v_rot) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    }
+
+    ggml_build_forward_expand(gf, q_groups);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il));
+
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+    ggml_tensor * q = q_groups;
+
+    // TurboQuant caches hold WHT-domain K/V. Transform each RERoT query group
+    // once, after reader-relative RoPE, so all keys in that group reuse it.
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        if (q->ne[0] % 128 != 0) {
+            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
+            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
+        }
+        if (!ggml_is_contiguous(q)) {
+            q = ggml_cont(ctx0, q);
+        }
+        q = ggml_turbo_wht(ctx0, q, 0, 0, mctx_cur->get_turbo_innerq_scale_inv());
+    }
+
+    const bool v_trans = v->nb[1] > v->nb[2];
+    q = ggml_permute(ctx0, q, 0, 2, 1, 3); // [D, group, head, 1]
+    k = ggml_permute(ctx0, k, 0, 2, 1, 3); // [D, key,   head, 1]
+    v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+    if (v_trans) {
+        v = ggml_transpose(ctx0, v);
+    }
+
+    ggml_tensor * cur = ggml_flash_attn_ext_rerot(
+        ctx0, q, k, v,
+        inp->get_rerot_entries(), inp->get_rerot_offsets(), sinks,
+        kq_scale, hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+    ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+    cb(cur, "rerot_indexed_attn", il);
+
+    if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {
+        const bool k_is_turbo = k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0;
+        const ggml_tensor * group_src = k_is_turbo ? k : v;
+        const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
+        if (cur->ne[0] % turbo_group == 0) {
+            if (!ggml_is_contiguous(cur)) {
+                cur = ggml_cont(ctx0, cur);
+            }
+            cur = ggml_turbo_wht(ctx0, cur, 1, turbo_group, mctx_cur->get_turbo_innerq_scale_inv());
+        }
+    }
+
+    const int64_t padded_v_head = v->ne[0];
+    const int64_t orig_v_head = hparams.n_embd_head_v(il);
+    const int64_t n_queries = inp->get_rerot_offsets()->ne[0] - 1;
+    if (padded_v_head != orig_v_head) {
+        const int64_t n_head_v = hparams.n_head(il);
+        cur = ggml_reshape_3d(ctx0, cur, padded_v_head, n_head_v, n_queries);
+        cur = ggml_view_3d(ctx0, cur, orig_v_head, n_head_v, n_queries,
+                           cur->nb[1], cur->nb[2], 0);
+        cur = ggml_cont(ctx0, cur);
+    }
+    cur = ggml_reshape_2d(ctx0, cur, orig_v_head * hparams.n_head(il), n_queries);
+
+    if (inp->self_v_rot) {
+        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+    }
+    if (wo) {
+        cur = build_lora_mm(wo, cur, wo_s);
+    }
+    if (wo_b) {
+        cur = ggml_add(ctx0, cur, wo_b);
+    }
+
+    if (!cparams.offload_kqv) {
+        ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
+    }
+    ggml_build_forward_expand(gf, cur);
+    return cur;
 }
 
 ggml_tensor * llm_graph_context::build_attn(
@@ -3656,7 +4164,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), sched);
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 

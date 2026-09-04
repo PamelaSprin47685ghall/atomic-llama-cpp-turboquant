@@ -141,6 +141,12 @@ struct llama_memory_kv_reclaim_seq_hint {
     uint32_t     logical_tokens;  // total committed logical tokens for this seq
     uint32_t     tail_guard;      // recent window + in-flight guard (hard-protected)
     bool         eligible;        // whether this seq can be TriAttention-compressed
+    // Nonzero only for a RERoT archive hint. The archive is the semantic
+    // owner: eviction removes every listed bookkeeping ref from a discarded
+    // base/PUBLIC cell so archive/exec sharing cannot count the same memory
+    // twice. Refs owned by another outer completion are not listed or removed.
+    uint64_t     semantic_episode_id = 0;
+    std::vector<llama_seq_id> semantic_seq_ids;
 };
 
 // Request to reclaim KV cells

@@ -8,6 +8,7 @@
 #include "base64.hpp"
 
 #include "server-common.h"
+#include "server-task.h"
 
 #include <random>
 #include <sstream>
@@ -1625,4 +1626,141 @@ server_tokens format_prompt_rerank(
     }
 
     return result;
+}
+
+//
+// RERoT outer compatibility: request plumbing (§§18,26,A.13-A.20)
+//
+// server-schema.cpp ignores unknown keys, so per-request RERoT overrides
+// ("rerot", "rerot_frontier", "rerot_trace") are applied here after
+// eval_llama_cmpl_schema(), starting from the server-global common_params.
+// Call sequence for server-context (owns the call site, not this file):
+//   task.params = eval_llama_cmpl_schema(...);
+//   task.params.apply_rerot_defaults(params_base);  // or next fn (includes it)
+//   server_rerot_apply_request_json(task, data, params_base);
+//   if (!server_rerot_validate_task(task, error)) -> 400 invalid_request.
+// The frozen llama_rerot_* C-API itself (ContextGlue, include/llama.h) is
+// consumed by tools/server/server-rerot.*; nothing here redeclares it.
+// RERoT OFF and embedding/rerank paths are no-ops with no allocation.
+
+void server_rerot_apply_request_json(server_task & task, const json & data, const common_params & base) {
+    task.params.apply_rerot_defaults(base);
+
+    auto has_value = [](const json & body, const char * key) {
+        const auto it = body.find(key);
+        return it != body.end() && !it->is_null();
+    };
+
+    if (has_value(data, "rerot")) {
+        const json & v = data.at("rerot");
+        if (!v.is_boolean()) {
+            throw std::invalid_argument("Field 'rerot': expected boolean");
+        }
+        const bool want = v.get<bool>();
+        if (!want) {
+            task.params.rerot_enabled = false;
+            task.params.rerot_trace = false;
+        } else {
+            if (!base.rerot_enabled) {
+                throw std::invalid_argument(
+                    "Field 'rerot': server was not started with --rerot");
+            }
+            task.params.rerot_enabled = true;
+            // frontier/trace keep base values unless overridden below
+        }
+    }
+
+    if (has_value(data, "rerot_frontier")) {
+        const json & v = data.at("rerot_frontier");
+        if (!v.is_string()) {
+            throw std::invalid_argument("Field 'rerot_frontier': expected 'strong' or 'lag1'");
+        }
+        if (!base.rerot_enabled) {
+            throw std::invalid_argument(
+                "Field 'rerot_frontier': server was not started with --rerot");
+        }
+        const std::string mode = v.get<std::string>();
+        if (mode == "strong") {
+            task.params.rerot_frontier = LLAMA_REROT_FRONTIER_STRONG;
+        } else if (mode == "lag1") {
+            task.params.rerot_frontier = LLAMA_REROT_FRONTIER_LAG1;
+        } else {
+            throw std::invalid_argument("Field 'rerot_frontier': expected 'strong' or 'lag1'");
+        }
+        task.params.rerot_enabled = true;
+    }
+
+    if (has_value(data, "rerot_trace")) {
+        const json & v = data.at("rerot_trace");
+        if (!v.is_boolean()) {
+            throw std::invalid_argument("Field 'rerot_trace': expected boolean");
+        }
+        const bool want_trace = v.get<bool>();
+        if (want_trace) {
+            if (!base.rerot_enabled) {
+                throw std::invalid_argument(
+                    "Field 'rerot_trace': server was not started with --rerot");
+            }
+            task.params.rerot_enabled = true;
+            task.params.rerot_trace = true;
+        } else {
+            task.params.rerot_trace = false;
+        }
+    }
+
+    if (!task.params.rerot_enabled && task.params.rerot_trace) {
+        // Trace without reasoning is meaningless; keep OFF zero-regression.
+        task.params.rerot_trace = false;
+    }
+
+    task.rerot_original_user_text.clear();
+    if (task.params.rerot_enabled) {
+        // oaicompat_chat_params_parse preserves the original messages beside
+        // the rendered prompt. Capture only the last real user text so the
+        // final acquire cannot confuse the surviving Lane's local assignment
+        // with the outer request. Text parts are joined; media stays in the
+        // already-evaluated shared prelude and is not duplicated here.
+        const auto messages_it = data.find("messages");
+        if (messages_it != data.end() && messages_it->is_array()) {
+            for (auto it = messages_it->rbegin(); it != messages_it->rend(); ++it) {
+                if (!it->is_object() ||
+                    json_value(*it, "role", std::string()) != "user" ||
+                    !it->contains("content")) {
+                    continue;
+                }
+                const json & content = it->at("content");
+                if (content.is_string()) {
+                    task.rerot_original_user_text = content.get<std::string>();
+                } else if (content.is_array()) {
+                    for (const auto & part : content) {
+                        if (!part.is_object() ||
+                            json_value(part, "type", std::string()) != "text") {
+                            continue;
+                        }
+                        const std::string text = json_value(part, "text", std::string());
+                        if (text.empty()) {
+                            continue;
+                        }
+                        if (!task.rerot_original_user_text.empty()) {
+                            task.rerot_original_user_text.push_back('\n');
+                        }
+                        task.rerot_original_user_text += text;
+                    }
+                }
+                break;
+            }
+        } else {
+            const auto prompt_it = data.find("prompt");
+            if (prompt_it != data.end() && prompt_it->is_string()) {
+                task.rerot_original_user_text = prompt_it->get<std::string>();
+            }
+        }
+    }
+}
+
+bool server_rerot_validate_task(const server_task & task, std::string & error) {
+    // A.19 + multimodal (A.18) need the media flag; has_media() is a cheap
+    // map-empty check with no allocation. OFF tasks always pass.
+    const bool has_media = task.tokens.has_media();
+    return task.params.rerot_validate_request(task.type, has_media, error);
 }

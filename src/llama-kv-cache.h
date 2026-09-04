@@ -20,6 +20,21 @@ struct llama_context;
 
 class llama_kv_cache : public llama_memory_i {
 public:
+    struct rerot_resolved_cell {
+        uint32_t stream = 0;
+        uint32_t cell = 0;
+        llama_pos storage_pos = 0;
+        llama_pos virtual_pos = 0;
+        llama_kv_rerot_meta meta;
+    };
+
+    struct rerot_resolved_view {
+        uint64_t episode_id = 0;
+        llama_rerot_node_id reader = LLAMA_REROT_NODE_INVALID;
+        llama_pos query_virtual_pos = 0;
+        std::vector<rerot_resolved_cell> cells;
+    };
+
     struct stream_copy_info {
         bool empty() const {
             assert(ssrc.size() == sdst.size());
@@ -177,6 +192,100 @@ public:
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
+    // RERoT write tags are sequence-scoped control state. apply_ubatch() copies
+    // the active tag into each newly allocated physical cell. Ordinary
+    // sequences have a cleared tag and therefore retain stock behavior.
+    bool rerot_set_write_tag(llama_seq_id seq_id, const llama_kv_rerot_meta & tag) override;
+    void rerot_clear_write_tag(llama_seq_id seq_id) override;
+
+    bool rerot_can_publish_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        size_t * count) const override;
+
+    bool rerot_can_reclassify_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_rerot_visibility expected,
+        llama_rerot_visibility replacement,
+        uint64_t publish_epoch,
+        size_t * count) const override;
+
+    // Atomically publish every resident cell of a pending logical run. Returns
+    // the number of cells transitioned; zero means no matching pending cells.
+    size_t rerot_publish_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        uint64_t publish_epoch) override;
+
+    size_t rerot_reclassify_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_rerot_visibility expected,
+        llama_rerot_visibility replacement,
+        uint64_t publish_epoch) override;
+
+    bool rerot_can_add_run_ref(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_seq_id seq_id,
+        size_t * count) const override;
+
+    size_t rerot_add_run_ref(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_seq_id seq_id) override;
+
+    // Physical lookup of one logical run across all streams. Appends
+    // (stream, cell) pairs in (stream, cell) order and returns the count.
+    // KV-internal: the server scheduler stores run ids only and must never
+    // cache physical indices across compaction, eviction, or restore.
+    size_t rerot_find_run_cells(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        std::vector<std::pair<uint32_t, uint32_t>> * out) const;
+
+    // Attention-only archive freeze (§7.2) for one execution sequence: every
+    // PUBLIC_LIVE resident cell of episode_id referenced by exec_seq gains
+    // archive_seq as keeper, then exec_seq is fully released. No K/V data
+    // moves and visibility metadata is untouched. The returned kept count
+    // may be zero (e.g. purely private history) while exec_seq is still
+    // released. Returns 0 without touching anything when the ids are
+    // invalid, cross different streams, or address a view cache.
+    bool rerot_can_freeze_to_archive(
+        uint64_t episode_id,
+        llama_seq_id exec_seq,
+        llama_seq_id archive_seq,
+        size_t * count) const;
+
+    size_t rerot_freeze_to_archive(
+        uint64_t episode_id,
+        llama_seq_id exec_seq,
+        llama_seq_id archive_seq);
+
+    // v1 persistence guard (§5.5/§25): true when saving seq_id (or the whole
+    // cache for -1) would silently drop RERoT classification, in which case
+    // state_write() refuses with an explicit error instead. Ordinary,
+    // untagged state never triggers this.
+    bool rerot_blocks_state_save(llama_seq_id seq_id) const;
+
+    bool rerot_set_reader_view(llama_seq_id seq_id, const llama_rerot_reader_state & view) override;
+    void rerot_clear_reader_view(llama_seq_id seq_id) override;
+
+    // Build the indexed, query-grouped layout consumed by the backend-neutral
+    // RERoT attention op. The returned key indices address the K/V view for the
+    // current unified stream.
+    llama_rerot_attn_layout rerot_build_attn_layout(
+        const llama_ubatch & ubatch,
+        uint32_t n_kv) const;
+
+    bool rerot_batch_active(const llama_ubatch & ubatch) const;
+
+    // Resolve a logical PAC-DFS view after any TriAttention eviction or cache
+    // compaction. Resident cells are ordered by the logical run sequence and
+    // densely repacked in virtual address space.
+    rerot_resolved_view rerot_resolve_view(const llama_rerot_reader_view & view) const;
+
     //
     // graph_build API
     //
@@ -316,6 +425,11 @@ private:
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;
 
+    // Current per-sequence write classification. These are control-plane
+    // values, not physical-cell metadata, and are reset on cache clear.
+    std::vector<llama_kv_rerot_meta> rerot_write_tags;
+    std::vector<llama_rerot_reader_state> rerot_reader_views;
+
     // pending stream copies that will be applied during the next update
     stream_copy_info sc_info;
 
@@ -450,8 +564,21 @@ public:
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
+    bool rerot_active() const;
+    const llama_rerot_attn_layout & get_rerot_attn_layout() const;
+
+    ggml_tensor * build_input_rerot_q_indices(ggml_context * ctx) const;
+    ggml_tensor * build_input_rerot_q_pos(ggml_context * ctx, uint32_t n_pos) const;
+    ggml_tensor * build_input_rerot_entries(ggml_context * ctx) const;
+    ggml_tensor * build_input_rerot_offsets(ggml_context * ctx) const;
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    void set_input_rerot_q_indices(ggml_tensor * dst) const;
+    void set_input_rerot_q_pos(ggml_tensor * dst, uint32_t n_pos) const;
+    void set_input_rerot_entries(ggml_tensor * dst) const;
+    void set_input_rerot_offsets(ggml_tensor * dst) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
@@ -493,4 +620,7 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+
+    mutable bool rerot_layout_ready = false;
+    mutable llama_rerot_attn_layout rerot_layout;
 };

@@ -191,6 +191,34 @@ static void test(void) {
         }
     }
 
+    {
+        common_params rerot_params;
+        assert(!rerot_params.rerot_enabled);
+        assert(rerot_params.rerot_frontier == LLAMA_REROT_FRONTIER_STRONG);
+
+        argv = {"binary_name", "--rerot"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), rerot_params, LLAMA_EXAMPLE_SERVER));
+        assert(rerot_params.rerot_enabled);
+        assert(rerot_params.kv_unified);
+        assert(rerot_params.rerot_frontier == LLAMA_REROT_FRONTIER_STRONG);
+        rerot_params.n_parallel = 6;
+        const auto rerot_cparams = common_context_params_to_llama(rerot_params);
+        assert(rerot_cparams.n_seq_max == LLAMA_MAX_SEQ);
+        assert(rerot_cparams.n_seq_recurrent == 6);
+        assert(rerot_cparams.kv_unified);
+
+        common_params lag1_params;
+        argv = {"binary_name", "--rerot-frontier", "lag1"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), lag1_params, LLAMA_EXAMPLE_SERVER));
+        assert(lag1_params.rerot_enabled);
+        assert(lag1_params.kv_unified);
+        assert(lag1_params.rerot_frontier == LLAMA_REROT_FRONTIER_LAG1);
+
+        common_params invalid_rerot_params;
+        argv = {"binary_name", "--rerot-frontier", "eventual"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), invalid_rerot_params, LLAMA_EXAMPLE_SERVER));
+    }
+
     argv = {"binary_name", "-lm", "dio"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);

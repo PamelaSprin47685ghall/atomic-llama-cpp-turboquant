@@ -4,6 +4,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
+#include "server-rerot.h"
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
@@ -96,7 +97,7 @@ llama_tokens server_token_hack::after_block(const llama_tokens & confirmed_block
 
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch = params.n_batch;
-    const uint32_t n_seq_max = std::max(1, params.n_parallel);
+    const uint32_t n_seq_max = std::max(1, params.rerot_enabled ? LLAMA_MAX_SEQ : params.n_parallel);
 
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -124,6 +125,26 @@ enum server_inference_mode {
     SERVER_INFERENCE_MODE_DECODE,
     SERVER_INFERENCE_MODE_PREFILL,
 };
+
+enum class server_rerot_injection_kind : uint8_t {
+    none = 0,
+    planner,
+    planner_open,
+    heading,
+    refresh,
+    worker,
+    worker_close,
+    finalizer,
+};
+
+static constexpr size_t SERVER_REROT_PRIVATE_BATCH = 32;
+
+static bool server_rerot_private_microbatch(server_rerot_injection_kind injection) {
+    return injection == server_rerot_injection_kind::planner ||
+           injection == server_rerot_injection_kind::refresh ||
+           injection == server_rerot_injection_kind::worker ||
+           injection == server_rerot_injection_kind::finalizer;
+}
 
 struct server_slot; // forward declaration
 
@@ -274,6 +295,32 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+
+    // RERoT thin glue (§18.2): a physical slot is never a logical Lane id.
+    // These fields only tag which episode/node (if any) currently borrows
+    // this slot as its execution handle; the tree/queue/frontier truth lives
+    // in server_rerot_runtime. OFF: all remain at their sentinels.
+    bool rerot_internal = false;
+    uint64_t rerot_episode_id = 0;
+    uint32_t rerot_node_id = UINT32_MAX;
+    llama_seq_id rerot_exec_seq = -1;
+    // MTP draft binding stamp (§A.6) captured when this slot started drafting
+    // under a RERoT view; checked for staleness before accept.
+    struct llama_rerot_view_stamp rerot_draft_stamp = {0, 0, 0};
+    bool rerot_has_draft_stamp = false;
+
+    // Each sampled/public Lane contributes one token per frontier. Contiguous
+    // PRIVATE control spans may use multiple causal rows in the same decode;
+    // they are invisible to peers and commit only after the last row succeeds.
+    server_rerot_injection_kind rerot_injection = server_rerot_injection_kind::none;
+    llama_tokens rerot_injection_tokens;
+    size_t rerot_injection_cursor = 0;
+    std::optional<server_rerot_token_plan> rerot_inflight_plan;
+    std::string rerot_inflight_bytes;
+    std::vector<server_rerot_token_plan> rerot_inflight_extra_plans;
+    std::vector<std::string> rerot_inflight_extra_bytes;
+    bool rerot_inflight_forced = false;
+    bool rerot_serial_tail = false;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -469,6 +516,25 @@ struct server_slot {
 
         // clear multimodal state
         mbatch.reset();
+
+        // RERoT: physical slot released, logical Lane mapping (if any) is
+        // owned by the runtime (detach/erase); just drop the local tags.
+        // OFF: sentinels already, no behavior change.
+        rerot_internal = false;
+        rerot_episode_id = 0;
+        rerot_node_id = UINT32_MAX;
+        rerot_exec_seq = -1;
+        rerot_draft_stamp = {0, 0, 0};
+        rerot_has_draft_stamp = false;
+        rerot_injection = server_rerot_injection_kind::none;
+        rerot_injection_tokens.clear();
+        rerot_injection_cursor = 0;
+        rerot_inflight_plan.reset();
+        rerot_inflight_bytes.clear();
+        rerot_inflight_extra_plans.clear();
+        rerot_inflight_extra_bytes.clear();
+        rerot_inflight_forced = false;
+        rerot_serial_tail = false;
     }
 
     void init_sampler() const {
@@ -520,6 +586,7 @@ struct server_slot {
         GGML_ASSERT(task);
 
         return task->type == other_slot.task->type
+            && rerot_internal == other_slot.rerot_internal
             && inp_embd.size() == other_slot.inp_embd.size()
             && are_lora_equal(lora, other_slot.lora);
     }
@@ -1131,9 +1198,1451 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // RERoT thin glue (Stage 7 + compat core, §§18-21,A.11): the logical
+    // episode/tree/queue/frontier truth lives in server_rerot_runtime (already
+    // implemented in server-rerot.*). This context only holds the runtime and
+    // calls it from four gated hook points below. OFF: rerot stays null and
+    // every hook returns immediately, so scheduling stays byte-identical.
+    std::unique_ptr<server_rerot_runtime> rerot;
+    uint64_t rerot_episode_id = 0;
+    uint64_t rerot_task_episode_id_next = 1;
+    uint64_t rerot_task_generation_next = 1;
+
+    struct rerot_transport_state {
+        server_task response_task;
+        std::vector<common_adapter_lora_info> lora;
+        std::unordered_map<llama_rerot_node_id, server_tokens> lineage_tokens;
+        std::unordered_map<llama_rerot_run_id, std::string> run_bytes;
+        server_rerot_line_mux line_mux;
+        std::string streamed_reasoning;
+        uint64_t streamed_lines = 0;
+        uint64_t sampled_tokens = 0;
+        uint32_t root_seed = LLAMA_DEFAULT_SEED;
+        int32_t prompt_tokens_processed = 0;
+        int32_t prompt_tokens_processed_accum = 0;
+        int32_t prompt_tokens_cache_response = 0;
+        double prompt_processing_ms = 0.0;
+        bool segmented_active = false;
+        bool triattention_compressed = false;
+        uint64_t triattention_synced_public_tokens = 0;
+        uint64_t model_tokens = 0;
+        uint64_t parallel_model_tokens = 0;
+        int64_t started_us = 0;
+        int64_t parallel_started_us = 0;
+        uint64_t parallel_elapsed_us = 0;
+        bool parallel_finished = false;
+
+        explicit rerot_transport_state(server_task && task)
+            : response_task(std::move(task)) {
+        }
+    };
+
+    std::unordered_map<uint64_t, std::unique_ptr<rerot_transport_state>> rerot_transport;
+
+    bool rerot_active() const {
+        return rerot != nullptr && rerot_episode_id != 0 && rerot->episode(rerot_episode_id) != nullptr;
+    }
+
+    const server_rerot_episode * rerot_active_episode() const {
+        return rerot_active() ? rerot->episode(rerot_episode_id) : nullptr;
+    }
+
+    size_t rerot_private_batch_size(const server_slot & slot) const {
+        if (!ctx_tgt ||
+            !server_rerot_private_microbatch(slot.rerot_injection) ||
+            slot.rerot_injection_cursor >= slot.rerot_injection_tokens.size()) {
+            return 1;
+        }
+        const size_t fair_batch_capacity = std::max<size_t>(
+            1, llama_n_batch(ctx_tgt) / std::max<size_t>(1, slots.size()));
+        return std::min({
+            slot.rerot_injection_tokens.size() - slot.rerot_injection_cursor,
+            SERVER_REROT_PRIVATE_BATCH,
+            fair_batch_capacity,
+        });
+    }
+
+    void rerot_emit_reasoning_lines(
+            uint64_t episode_id,
+            rerot_transport_state & transport,
+            server_rerot_stream_lines && ready) {
+        if (!ready.ok) {
+            if (rerot && episode_id != 0) {
+                rerot->hard_abort(
+                    episode_id,
+                    "rerot_stream_error: " + ready.error);
+            }
+            return;
+        }
+        if (!transport.response_task.params.stream) {
+            return;
+        }
+
+        for (auto & line : ready.lines) {
+            auto res = std::make_unique<server_task_result_cmpl_partial>();
+            res->id = transport.response_task.id;
+            res->index = transport.response_task.index;
+            res->content = line;
+            res->n_decoded = static_cast<int32_t>(std::min<uint64_t>(
+                transport.sampled_tokens,
+                std::numeric_limits<int32_t>::max()));
+            res->n_prompt_tokens = transport.response_task.n_tokens();
+            res->n_prompt_tokens_cache = transport.prompt_tokens_cache_response;
+            res->post_sampling_probs = transport.response_task.params.post_sampling_probs;
+            res->verbose = transport.response_task.params.verbose;
+            res->res_type = transport.response_task.params.res_type;
+            res->oaicompat_model = transport.response_task.params.oaicompat_model;
+            res->oaicompat_cmpl_id = transport.response_task.params.oaicompat_cmpl_id;
+            queue_results.send(std::move(res));
+
+            transport.streamed_reasoning += line;
+            ++transport.streamed_lines;
+        }
+    }
+
+    bool rerot_stream_commit(
+            uint64_t episode_id,
+            llama_rerot_node_id node_id,
+            llama_rerot_run_id run_id,
+            std::string_view bytes) {
+        auto transport_it = rerot_transport.find(episode_id);
+        auto * episode = rerot ? rerot->episode(episode_id) : nullptr;
+        if (transport_it == rerot_transport.end() || !episode) {
+            return false;
+        }
+        auto & transport = *transport_it->second;
+        if (!transport.response_task.params.stream) {
+            return true;
+        }
+
+        auto ready = transport.line_mux.append(
+            node_id, run_id, bytes, episode->document);
+        const bool ok = ready.ok;
+        rerot_emit_reasoning_lines(episode_id, transport, std::move(ready));
+        return ok;
+    }
+
+    bool rerot_stream_visibility_changed(
+            uint64_t episode_id,
+            llama_rerot_node_id node_id) {
+        auto transport_it = rerot_transport.find(episode_id);
+        auto * episode = rerot ? rerot->episode(episode_id) : nullptr;
+        if (transport_it == rerot_transport.end() || !episode) {
+            return false;
+        }
+        auto & transport = *transport_it->second;
+        if (!transport.response_task.params.stream) {
+            return true;
+        }
+
+        auto ready = transport.line_mux.drain(node_id, episode->document);
+        const bool ok = ready.ok;
+        rerot_emit_reasoning_lines(episode_id, transport, std::move(ready));
+        return ok;
+    }
+
+    bool rerot_stream_finish_lane(
+            uint64_t episode_id,
+            llama_rerot_node_id node_id) {
+        auto transport_it = rerot_transport.find(episode_id);
+        auto * episode = rerot ? rerot->episode(episode_id) : nullptr;
+        if (transport_it == rerot_transport.end() || !episode) {
+            return false;
+        }
+        auto & transport = *transport_it->second;
+        if (!transport.response_task.params.stream) {
+            return true;
+        }
+
+        auto ready = transport.line_mux.finish(node_id, episode->document);
+        const bool ok = ready.ok;
+        rerot_emit_reasoning_lines(episode_id, transport, std::move(ready));
+        return ok;
+    }
+
+    void rerot_note_parallel_start(uint64_t episode_id) {
+        auto transport_it = rerot_transport.find(episode_id);
+        if (transport_it == rerot_transport.end() ||
+            transport_it->second->parallel_started_us != 0 ||
+            transport_it->second->parallel_finished) {
+            return;
+        }
+        transport_it->second->parallel_started_us = ggml_time_us();
+    }
+
+    void rerot_note_parallel_end(uint64_t episode_id, int64_t now_us) {
+        auto transport_it = rerot_transport.find(episode_id);
+        if (transport_it == rerot_transport.end() ||
+            transport_it->second->parallel_started_us == 0 ||
+            transport_it->second->parallel_finished) {
+            return;
+        }
+        transport_it->second->parallel_elapsed_us =
+            static_cast<uint64_t>(std::max<int64_t>(
+                0, now_us - transport_it->second->parallel_started_us));
+        transport_it->second->parallel_finished = true;
+    }
+
+    void rerot_record_completed_episode(uint64_t episode_id) {
+        auto transport_it = rerot_transport.find(episode_id);
+        if (transport_it == rerot_transport.end()) {
+            return;
+        }
+
+        const int64_t now_us = ggml_time_us();
+        rerot_note_parallel_end(episode_id, now_us);
+        const auto & transport = *transport_it->second;
+        const double episode_seconds = static_cast<double>(
+            std::max<int64_t>(0, now_us - transport.started_us)) / 1.0e6;
+        const double parallel_seconds =
+            static_cast<double>(transport.parallel_elapsed_us) / 1.0e6;
+
+        ++rerot_metrics.completed_episodes;
+        rerot_metrics.completed_model_tokens += transport.model_tokens;
+        rerot_metrics.parallel_model_tokens += transport.parallel_model_tokens;
+        rerot_metrics.completed_episode_seconds += episode_seconds;
+        rerot_metrics.parallel_seconds += parallel_seconds;
+
+        const double aggregate_tps = episode_seconds > 0.0
+            ? static_cast<double>(transport.model_tokens) / episode_seconds
+            : 0.0;
+        const double parallel_tps = parallel_seconds > 0.0
+            ? static_cast<double>(transport.parallel_model_tokens) / parallel_seconds
+            : 0.0;
+        SRV_INF("RERoT throughput: episode=%" PRIu64
+                " model_tokens=%" PRIu64 " wall_s=%.6f aggregate_tps=%.3f"
+                " parallel_tokens=%" PRIu64 " parallel_s=%.6f parallel_tps=%.3f\n",
+            episode_id,
+            transport.model_tokens,
+            episode_seconds,
+            aggregate_tps,
+            transport.parallel_model_tokens,
+            parallel_seconds,
+            parallel_tps);
+    }
+
+    server_task rerot_clone_task(const server_task & source) const {
+        server_task copy(source.type);
+        copy.id = source.id;
+        copy.index = source.index;
+        copy.id_slot = -1;
+        copy.id_parent = source.id_parent;
+        copy.params = source.params;
+        copy.tokens = source.tokens.clone();
+        copy.is_retry = false;
+        copy.cache_key.clear();
+        copy.rerot_episode_id = source.rerot_episode_id;
+        copy.rerot_generation = source.rerot_generation;
+        copy.rerot_original_user_text = source.rerot_original_user_text;
+        return copy;
+    }
+
+    static common_grammar rerot_planner_remainder_grammar() {
+        // The structural opener "<ol>\n<li>" is injected before model
+        // sampling. Constrain exactly the remainder: one non-empty text item,
+        // then zero or more flat sibling items, then the single closing tag.
+        // Excluding '<' from item text prevents </think> or nested markup from
+        // entering an otherwise still-PENDING planner record.
+        return {
+            COMMON_GRAMMAR_TYPE_USER,
+            "root ::= item-text \"</li>\" ws (\"<li>\" item-text \"</li>\" ws)* \"</ol>\"\n"
+            "item-text ::= [^<]+\n"
+            "ws ::= [ \\t\\r\\n]*\n",
+        };
+    }
+
+    static void rerot_install_planner_grammar(task_params & params) {
+        (void) server_rerot_take_user_grammar(params);
+        params.sampling.grammar = rerot_planner_remainder_grammar();
+        params.sampling.grammar_lazy = false;
+        params.sampling.grammar_triggers.clear();
+        params.sampling.preserved_tokens.clear();
+    }
+
+    static void rerot_remove_planner_grammar(task_params & params) {
+        params.sampling.grammar = common_grammar{};
+        params.sampling.grammar_lazy = false;
+        params.sampling.grammar_triggers.clear();
+        params.sampling.preserved_tokens.clear();
+    }
+
+    std::string rerot_planner_control_prompt(std::string_view assigned_task = {}) const {
+        // Ornith/Qwen3.5 treats raw text appended inside an assistant turn as
+        // content it has already authored, not as an instruction. A private
+        // ChatML turn boundary gives the fixed planner prompt its intended
+        // control role. These role tokens and the prompt remain PRIVATE.
+        std::string prompt =
+            std::string("</think>\n<|im_end|>\n<|im_start|>user\n") +
+            std::string(server_rerot_planner_prompt());
+        if (!assigned_task.empty()) {
+            prompt +=
+                "本轮只规划下面这个上级分配的任务，不要讨论对话过程、章节机制或控制指令：\n"
+                "【";
+            prompt.append(assigned_task);
+            prompt +=
+                "】\n"
+                "上级已经完成过一次问题分解，因此本轮默认且优先只输出一个忠实复述该目标的 <li>。"
+                "一个主题包含饮食、运动、睡眠、安全、步骤或验证等多个方面，不构成继续拆分的理由；"
+                "这些方面应在同一个任务的公开分析中一起完成。"
+                "只有任务原文明确并列了两个以上可独立交付、各自需要单独推导且最后必须汇合的实质问题时，"
+                "才允许输出多个 <li>。\n";
+        }
+        prompt += "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+        return prompt;
+    }
+
+    std::string rerot_worker_control_prompt(std::string_view assigned_task) const {
+        std::string prompt =
+            "</think>\n<|im_end|>\n<|im_start|>user\n"
+            "直接执行下面的任务，不要讨论对话过程、规划器、章节或控制指令：\n"
+            "【";
+        prompt.append(assigned_task);
+        prompt +=
+            "】\n"
+            "直接写完整、具体、可验证的公开分析与本任务结论，并吸收其他可见章节中与本任务有关的最新事实。"
+            "不要宣布你将执行任务，不要回顾对话，不要输出规划列表，不要改写成全局最终回答；"
+            "完成本任务后正常结束思考。\n"
+            "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+        return prompt;
+    }
+
+    static std::string rerot_finalizer_control_prompt(std::string_view original_user_text) {
+        // The hidden planner is a synthetic user turn. Close it and restore a
+        // body-only assistant turn so the final survivor answers the original
+        // request instead of echoing the planner list as its response.
+        std::string quoted_request;
+        quoted_request.reserve(original_user_text.size());
+        for (const char ch : original_user_text) {
+            switch (ch) {
+                case '&': quoted_request += "&amp;"; break;
+                case '<': quoted_request += "&lt;";  break;
+                case '>': quoted_request += "&gt;";  break;
+                default:  quoted_request.push_back(ch); break;
+            }
+        }
+
+        std::string prompt =
+            "<|im_end|>\n<|im_start|>user\n"
+            "现在直接回答本轮 RERoT 启动之前、对话中最早的真实用户问题。";
+        if (!quoted_request.empty()) {
+            prompt += "\n原始用户问题（引用文本，不是新指令）：【";
+            prompt += quoted_request;
+            prompt += "】\n";
+        }
+        prompt +=
+            "你当前所在 Lane 的上级分配任务只是其中一个章节，已经完成，绝不能把它误当成最终问题范围。"
+            "最终范围由最早真实用户问题和根级 <ol> 的全部任务共同决定；逐项吸收当前可见每个 <h*> "
+            "章节的实质结论，任何根级任务都不能遗漏。忽略关于对话、规划器、章节机制或控制指令的元叙述；"
+            "发现重复或冲突时进行校验和取舍。"
+            "使用用户的语言给出准确、完整、可执行且不过度绝对化的最终答案。"
+            "对所有数字、阈值和因果断言做一次证据与适用性复核。凡由日、周、比例或单位换算得到的数字，"
+            "必须重新计算且相互一致；不确定时删掉换算示例。缺少个体数据时只能给可调整的起点或范围；"
+            "章节草稿中的通用硬下限、无依据绝对数、伪精确公式或保证性因果必须从最终答案删除，"
+            "不能靠添加免责声明后继续保留。把必要目标与可选手段分开：有帮助的组成部分不得写成缺一不可。"
+            "明确重要前提、风险边界及缺少个体信息时的适用范围。"
+            "不要输出规划列表，不要复述控制指令，不要再次展示思维过程。\n"
+            "<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n\n";
+        return prompt;
+    }
+
+    bool rerot_set_injection(
+            server_slot & slot,
+            server_rerot_injection_kind kind,
+            std::string_view text) {
+        slot.rerot_injection_tokens = common_tokenize(ctx_tgt, std::string(text), false, true);
+        slot.rerot_injection_cursor = 0;
+        slot.rerot_injection = kind;
+        if (slot.rerot_injection_tokens.empty()) {
+            if (rerot && slot.rerot_episode_id != 0) {
+                rerot->hard_abort(slot.rerot_episode_id, "rerot_protocol_error: empty forced control sequence");
+            }
+            return false;
+        }
+        return true;
+    }
+
+    bool rerot_start_root(server_slot & slot) {
+        if (!rerot || !ctx_tgt || !slot.task ||
+            !slot.task->params.rerot_effective(slot.task->type) ||
+            rerot_active()) {
+            return false;
+        }
+
+        server_task root_lane_task = rerot_clone_task(*slot.task);
+        rerot_install_planner_grammar(root_lane_task.params);
+        if (root_lane_task.params.sampling.seed != LLAMA_DEFAULT_SEED &&
+            root_lane_task.index > 0) {
+            uint64_t mixed = root_lane_task.params.sampling.seed ^
+                (uint64_t(root_lane_task.index) * 0x9e3779b97f4a7c15ULL);
+            mixed ^= mixed >> 33;
+            mixed *= 0xff51afd7ed558ccdULL;
+            mixed ^= mixed >> 33;
+            root_lane_task.params.sampling.seed = static_cast<uint32_t>(mixed);
+            if (root_lane_task.params.sampling.seed == LLAMA_DEFAULT_SEED) {
+                --root_lane_task.params.sampling.seed;
+            }
+        }
+        common_sampler_ptr root_lane_sampler;
+        try {
+            root_lane_sampler.reset(common_sampler_init(
+                model_tgt,
+                root_lane_task.params.sampling,
+                (int32_t) llama_n_ctx(ctx_tgt)));
+        } catch (const std::exception &) {
+            return false;
+        }
+
+        const uint64_t episode_id = rerot->adopt_root(
+            slot.task->id,
+            slot.task->rerot_response_owner(),
+            slot.id,
+            slot.id,
+            slot.prompt.tokens.pos_next(),
+            slot.task->rerot_episode_id);
+        if (episode_id == 0) {
+            return false;
+        }
+
+        llama_rerot_episode_params episode_params = {
+            slot.task->params.rerot_frontier,
+            1,
+            1,
+            1,
+        };
+        if (!llama_rerot_episode_begin(ctx_tgt, episode_id, &episode_params)) {
+            rerot->erase_episode(episode_id);
+            return false;
+        }
+
+        // Bound total work at episode scope, never per child/depth and never
+        // by reserving a synthetic final-answer quota. The logical token cap
+        // is the request's normal completion budget bounded by context; queue
+        // pressure follows the internal sequence-id arena used by lineages.
+        const uint64_t context_limit = std::max<uint64_t>(1, llama_n_ctx(ctx_tgt));
+        const uint64_t context_budget = slot.task->params.n_predict > 0
+            ? std::min<uint64_t>(context_limit, slot.task->params.n_predict)
+            : context_limit;
+        const uint64_t internal_seq_budget =
+            LLAMA_MAX_SEQ > slots.size() ? LLAMA_MAX_SEQ - slots.size() : 1;
+        rerot->set_hard_limits(episode_id, {
+            context_budget,
+            std::max<uint64_t>(64, internal_seq_budget * 16),
+            internal_seq_budget,
+            context_budget,
+        });
+
+        auto transport = std::make_unique<rerot_transport_state>(
+            rerot_clone_task(*slot.task));
+        transport->lora = slot.lora;
+        transport->lineage_tokens.emplace(0, slot.prompt.tokens.clone());
+        transport->root_seed = common_sampler_get_seed(root_lane_sampler.get());
+        transport->prompt_tokens_processed = slot.n_prompt_tokens_processed;
+        transport->prompt_tokens_processed_accum = slot.n_prompt_tokens_processed_accum;
+        transport->prompt_tokens_cache_response = slot.n_prompt_tokens_cache_response;
+        transport->prompt_processing_ms = slot.t_prompt_processing;
+        transport->triattention_compressed = slot.triattention_compressed;
+        transport->started_us = ggml_time_us();
+        rerot_transport.emplace(episode_id, std::move(transport));
+
+        slot.task = std::make_unique<const server_task>(std::move(root_lane_task));
+        slot.smpl = std::move(root_lane_sampler);
+        llama_set_sampler(ctx_tgt, slot.id, nullptr);
+
+        ++rerot_metrics.episode_total;
+        ++rerot_metrics.episode_active;
+        ++rerot_metrics.nodes_created;
+        ++rerot_metrics.nodes_started;
+        rerot_metrics.max_live_lanes = std::max<uint64_t>(
+            rerot_metrics.max_live_lanes, 1);
+
+        rerot_episode_id = episode_id;
+        slot.rerot_internal = true;
+        slot.rerot_episode_id = episode_id;
+        slot.rerot_node_id = 0;
+        slot.rerot_exec_seq = slot.id;
+        slot.rerot_serial_tail = false;
+        slot.rerot_inflight_plan.reset();
+        slot.rerot_inflight_bytes.clear();
+        slot.rerot_inflight_extra_plans.clear();
+        slot.rerot_inflight_extra_bytes.clear();
+        slot.rerot_inflight_forced = false;
+        slot.state = SLOT_STATE_GENERATING;
+        slot.i_batch = -1;
+        slot.spec_draft.clear();
+        slot.spec_i_batch.clear();
+        if (spec) {
+            common_speculative_set_state(spec.get(), slot.id, {});
+        }
+
+        if (!rerot_set_injection(
+                slot,
+                server_rerot_injection_kind::planner,
+                rerot_planner_control_prompt())) {
+            rerot_propagate_hard_abort();
+            return false;
+        }
+
+        SRV_INF("RERoT episode start: request=%d episode=%" PRIu64 " root_slot=%d frontier=%s\n",
+            slot.task->id, episode_id, slot.id,
+            llama_rerot_frontier_mode_name(slot.task->params.rerot_frontier));
+        return true;
+    }
+
+    bool rerot_plan_next_token(server_slot & slot) {
+        if (!slot.rerot_internal || !rerot || slot.rerot_episode_id == 0 ||
+            slot.rerot_inflight_plan.has_value() ||
+            !slot.rerot_inflight_extra_plans.empty()) {
+            return false;
+        }
+
+        auto * lane = rerot->node(slot.rerot_episode_id, slot.rerot_node_id);
+        if (!lane || lane->exec_seq != slot.id || lane->physical_slot != slot.id) {
+            rerot->hard_abort(slot.rerot_episode_id, "rerot_state_error: slot/Lane mapping drift");
+            return false;
+        }
+
+        const bool forced =
+            slot.rerot_injection != server_rerot_injection_kind::none &&
+            slot.rerot_injection_cursor < slot.rerot_injection_tokens.size();
+        const llama_token token = forced
+            ? slot.rerot_injection_tokens[slot.rerot_injection_cursor]
+            : slot.sampled;
+        const std::string bytes = common_token_to_piece(ctx_tgt, token, true);
+
+        std::optional<server_rerot_token_plan> plan;
+        if (forced && server_rerot_private_microbatch(slot.rerot_injection)) {
+            auto plans = rerot->plan_private_span(
+                slot.rerot_episode_id,
+                slot.rerot_node_id,
+                lane->storage_pos_next,
+                rerot_private_batch_size(slot));
+            if (plans.has_value() && !plans->empty()) {
+                plan = std::move(plans->front());
+                for (size_t i = 1; i < plans->size(); ++i) {
+                    slot.rerot_inflight_extra_plans.push_back(std::move((*plans)[i]));
+                    slot.rerot_inflight_extra_bytes.push_back(common_token_to_piece(
+                        ctx_tgt,
+                        slot.rerot_injection_tokens[slot.rerot_injection_cursor + i],
+                        true));
+                }
+            }
+        } else if (forced &&
+                   (slot.rerot_injection == server_rerot_injection_kind::planner_open ||
+                    slot.rerot_injection == server_rerot_injection_kind::worker_close)) {
+            plan = rerot->plan_generated_token(
+                slot.rerot_episode_id, slot.rerot_node_id, lane->storage_pos_next, bytes);
+        } else if (forced && slot.rerot_injection == server_rerot_injection_kind::heading) {
+            plan = rerot->plan_heading_token(
+                slot.rerot_episode_id, slot.rerot_node_id, lane->storage_pos_next);
+        } else if (slot.rerot_serial_tail) {
+            plan = rerot->plan_serial_token(
+                slot.rerot_episode_id, slot.rerot_node_id, lane->storage_pos_next);
+        } else {
+            plan = rerot->plan_generated_token(
+                slot.rerot_episode_id, slot.rerot_node_id, lane->storage_pos_next, bytes);
+        }
+
+        if (!plan.has_value()) {
+            SRV_ERR("RERoT plan failed: episode=%" PRIu64
+                    " node=%u serial=%d forced=%d pos=%d token=%d\n",
+                slot.rerot_episode_id, slot.rerot_node_id,
+                slot.rerot_serial_tail ? 1 : 0, forced ? 1 : 0,
+                lane->storage_pos_next, token);
+            rerot->hard_abort(slot.rerot_episode_id, "rerot_protocol_error: failed to plan Lane token");
+            return false;
+        }
+
+        slot.rerot_inflight_plan = std::move(plan);
+        slot.rerot_inflight_bytes = bytes;
+        slot.rerot_inflight_forced = forced;
+        return true;
+    }
+
+    bool rerot_append_planned_token(server_slot & slot) {
+        if (!slot.rerot_internal || !slot.rerot_inflight_plan.has_value() || !rerot) {
+            return false;
+        }
+        auto transport_it = rerot_transport.find(slot.rerot_episode_id);
+        const bool segmented =
+            transport_it != rerot_transport.end() &&
+            transport_it->second->segmented_active;
+        size_t span_count = 0;
+        const int64_t ddvr_started_us = segmented ? ggml_time_us() : 0;
+        const bool installed = segmented
+            ? rerot->install_token_plan(
+                slot.rerot_episode_id,
+                slot.rerot_node_id,
+                *slot.rerot_inflight_plan,
+                &span_count)
+            : rerot->install_token_plan_write_only(
+                slot.rerot_episode_id,
+                slot.rerot_node_id,
+                *slot.rerot_inflight_plan);
+        if (segmented && installed) {
+            rerot_metrics.span_count += span_count;
+            rerot_metrics.ddvr_seconds +=
+                static_cast<double>(ggml_time_us() - ddvr_started_us) / 1.0e6;
+        }
+        if (!installed) {
+            SRV_ERR("RERoT install failed in server: episode=%" PRIu64
+                    " node=%u serial=%d run=%u pos=%d\n",
+                slot.rerot_episode_id, slot.rerot_node_id,
+                slot.rerot_serial_tail ? 1 : 0,
+                slot.rerot_inflight_plan->run_id,
+                slot.rerot_inflight_plan->storage_pos);
+            return false;
+        }
+
+        const size_t n_plans = 1 + slot.rerot_inflight_extra_plans.size();
+        for (size_t i = 0; i < n_plans; ++i) {
+            const auto & plan = i == 0
+                ? *slot.rerot_inflight_plan
+                : slot.rerot_inflight_extra_plans[i - 1];
+            const llama_token token = slot.rerot_inflight_forced
+                ? slot.rerot_injection_tokens.at(slot.rerot_injection_cursor)
+                : slot.sampled;
+            const bool forced_last = slot.rerot_inflight_forced &&
+                slot.rerot_injection_cursor + 1 == slot.rerot_injection_tokens.size();
+            const bool needs_logits = !slot.rerot_inflight_forced ||
+                (forced_last &&
+                 slot.rerot_injection != server_rerot_injection_kind::heading &&
+                 slot.rerot_injection != server_rerot_injection_kind::planner &&
+                 slot.rerot_injection != server_rerot_injection_kind::worker_close);
+            const int32_t i_batch = batch.size();
+            if (!batch.add(slot.id, token, plan.storage_pos, needs_logits)) {
+                rerot->hard_abort(
+                    slot.rerot_episode_id,
+                    "rerot_resource_exhausted: private microbatch capacity");
+                return false;
+            }
+
+            slot.i_batch = i_batch;
+            slot.prompt.tokens.push_back(token);
+            if (slot.rerot_inflight_forced) {
+                ++slot.rerot_injection_cursor;
+            }
+        }
+        return true;
+    }
+
+    uint32_t rerot_lane_seed(
+            const server_rerot_episode & episode,
+            llama_rerot_node_id node_id,
+            uint32_t root_seed) const {
+        uint64_t hash = root_seed;
+        for (const uint32_t component : episode.document.tree_path(node_id)) {
+            hash ^= uint64_t(component) + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2);
+        }
+        hash ^= hash >> 33;
+        hash *= 0xff51afd7ed558ccdULL;
+        hash ^= hash >> 33;
+        return static_cast<uint32_t>(hash);
+    }
+
+    void rerot_make_slot_idle(server_slot & slot) {
+        slot.prompt.clear();
+        slot.state = SLOT_STATE_IDLE;
+        slot.reset();
+    }
+
+    bool rerot_prepare_child_slot(
+            uint64_t episode_id,
+            llama_rerot_node_id node_id,
+            server_slot & slot) {
+        auto transport_it = rerot_transport.find(episode_id);
+        auto * episode = rerot ? rerot->episode(episode_id) : nullptr;
+        auto * lane = rerot ? rerot->node(episode_id, node_id) : nullptr;
+        if (transport_it == rerot_transport.end() || !episode || !lane ||
+            lane->physical_slot != slot.id || lane->exec_seq != slot.id) {
+            return false;
+        }
+
+        auto lineage_it = transport_it->second->lineage_tokens.find(node_id);
+        if (lineage_it == transport_it->second->lineage_tokens.end()) {
+            rerot->hard_abort(episode_id, "rerot_state_error: missing child lineage token tape");
+            return false;
+        }
+
+        server_task task = rerot_clone_task(transport_it->second->response_task);
+        rerot_install_planner_grammar(task.params);
+        task.params.sampling.seed = rerot_lane_seed(
+            *episode, node_id, transport_it->second->root_seed);
+        task.rerot_episode_id = episode_id;
+
+        try {
+            slot.smpl.reset(common_sampler_init(
+                model_tgt, task.params.sampling, (int32_t) llama_n_ctx(ctx_tgt)));
+        } catch (const std::exception & e) {
+            rerot->hard_abort(episode_id, std::string("rerot_sampler_error: ") + e.what());
+            return false;
+        }
+
+        slot.task = std::make_unique<const server_task>(std::move(task));
+        llama_set_sampler(ctx_tgt, slot.id, nullptr);
+        slot.lora = transport_it->second->lora;
+        slot.prompt.clear();
+        slot.prompt.tokens = lineage_it->second.clone();
+        slot.response_prompt.clear();
+        slot.generated_text.clear();
+        slot.generated_tokens.clear();
+        slot.generated_token_probs.clear();
+        slot.n_sent_text = 0;
+        slot.n_decoded = 0;
+        slot.n_decoded_start = 0;
+        slot.n_remaining = -1;
+        slot.n_prompt_tokens_original = transport_it->second->response_task.n_tokens();
+        slot.n_prompt_tokens_processed = 0;
+        slot.n_prompt_tokens_processed_accum = 0;
+        slot.t_start_process_prompt = transport_it->second->started_us;
+        slot.t_start_generation = transport_it->second->started_us;
+        slot.has_next_token = true;
+        slot.has_new_line = false;
+        slot.truncated = false;
+        slot.stop = STOP_TYPE_NONE;
+        slot.stopping_word.clear();
+        slot.state = SLOT_STATE_GENERATING;
+        slot.i_batch = -1;
+        slot.sampled = LLAMA_TOKEN_NULL;
+        slot.spec_draft.clear();
+        slot.spec_i_batch.clear();
+        if (spec) {
+            common_speculative_set_state(spec.get(), slot.id, {});
+        }
+        llama_set_sampler(ctx_tgt, slot.id, nullptr);
+
+        slot.rerot_internal = true;
+        slot.rerot_episode_id = episode_id;
+        slot.rerot_node_id = node_id;
+        slot.rerot_exec_seq = slot.id;
+        slot.rerot_serial_tail = false;
+        slot.rerot_inflight_plan.reset();
+        slot.rerot_inflight_bytes.clear();
+        slot.rerot_inflight_extra_plans.clear();
+        slot.rerot_inflight_extra_bytes.clear();
+        slot.rerot_inflight_forced = false;
+        slot.triattention_compressed = transport_it->second->triattention_compressed;
+
+        const std::string heading = rerot->heading_text(episode_id, node_id);
+        if (!rerot_set_injection(slot, server_rerot_injection_kind::heading, heading)) {
+            return false;
+        }
+
+        ++rerot_metrics.nodes_started;
+        rerot_metrics.queue_max = std::max<uint64_t>(
+            rerot_metrics.queue_max, episode->ready_queue.size());
+        const uint64_t live_lanes =
+            episode->running.size() + episode->starting.size();
+        rerot_metrics.max_live_lanes = std::max<uint64_t>(
+            rerot_metrics.max_live_lanes, live_lanes);
+        if (live_lanes > 1) {
+            rerot_note_parallel_start(episode_id);
+        }
+
+        SRV_INF("RERoT Lane admitted: episode=%" PRIu64 " node=%u slot=%d queued=%zu\n",
+            episode_id, node_id, slot.id, episode->ready_queue.size());
+        return true;
+    }
+
+    bool rerot_admit_ready(uint64_t episode_id) {
+        auto * episode = rerot ? rerot->episode(episode_id) : nullptr;
+        if (!episode || episode->hard_aborted) {
+            return false;
+        }
+
+        while (!episode->ready_queue.empty()) {
+            llama_memory_kv_usage recurrent = {};
+            if (llama_memory_get_recurrent_usage(llama_get_memory(ctx_tgt), &recurrent)) {
+                // Already-running Lanes are included in recurrent.used.
+                // STARTING Lanes still share parked tails and each may need
+                // one new physical COW cell on its first joint frontier.
+                const uint64_t required_after_cow =
+                    recurrent.used + episode->starting.size() + 1;
+                if (required_after_cow > recurrent.capacity) {
+                    if (episode->running.empty() && episode->starting.empty()) {
+                        rerot->hard_abort(
+                            episode_id,
+                            "rerot_resource_exhausted: recurrent fork lineages fill physical capacity");
+                        return false;
+                    }
+                    break;
+                }
+            }
+
+            server_slot * free_slot = nullptr;
+            for (auto & candidate : slots) {
+                if (!candidate.is_processing()) {
+                    free_slot = &candidate;
+                    break;
+                }
+            }
+            if (!free_slot) {
+                break;
+            }
+
+            // Idle slots may retain ordinary prompt-cache refs. Admission owns
+            // the execution seq, so clear those refs before recurrent/base
+            // prefix state is installed.
+            free_slot->prompt_clear();
+
+            llama_rerot_node_id admitted = LLAMA_REROT_NODE_INVALID;
+            if (!rerot->admit_next_child(
+                    episode_id, free_slot->id, free_slot->id, &admitted) ||
+                admitted == LLAMA_REROT_NODE_INVALID ||
+                !rerot_prepare_child_slot(episode_id, admitted, *free_slot)) {
+                rerot->hard_abort(episode_id, "rerot_state_error: child admission failed");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::string rerot_render_public_document(
+            uint64_t episode_id,
+            llama_rerot_node_id reader) const {
+        const auto * episode = rerot ? rerot->episode(episode_id) : nullptr;
+        const auto transport_it = rerot_transport.find(episode_id);
+        if (!episode || transport_it == rerot_transport.end()) {
+            return {};
+        }
+
+        const auto view = episode->document.build_view(reader);
+        std::string result;
+        for (const auto & view_run : view.runs) {
+            const auto * run = episode->document.run(view_run.run_id);
+            if (!run || run->visibility != llama_rerot_visibility::public_live) {
+                continue;
+            }
+            const auto text_it = transport_it->second->run_bytes.find(run->id);
+            if (text_it != transport_it->second->run_bytes.end()) {
+                result += text_it->second;
+            }
+        }
+        return result;
+    }
+
+    void rerot_erase_episode(uint64_t episode_id) {
+        if (ctx_tgt) {
+            llama_rerot_episode_end(ctx_tgt, episode_id);
+        }
+        if (rerot) {
+            rerot->erase_episode(episode_id);
+        }
+        rerot_transport.erase(episode_id);
+        if (rerot_metrics.episode_active > 0) {
+            --rerot_metrics.episode_active;
+        }
+        if (rerot_episode_id == episode_id) {
+            rerot_episode_id = 0;
+        }
+    }
+
+    void rerot_start_next_waiting_root() {
+        if (!rerot || rerot_active()) {
+            return;
+        }
+        for (auto & waiting : slots) {
+            if (waiting.state != SLOT_STATE_DONE_PROMPT || !waiting.task ||
+                !waiting.task->params.rerot_effective(waiting.task->type)) {
+                continue;
+            }
+            if (rerot_start_root(waiting)) {
+                return;
+            }
+            send_error(waiting, "failed to start queued RERoT episode", ERROR_TYPE_SERVER);
+            waiting.prompt.clear();
+            waiting.release();
+        }
+    }
+
+    bool rerot_commit_inflight(server_slot & slot) {
+        if (!rerot || !slot.rerot_inflight_plan.has_value()) {
+            return false;
+        }
+
+        const server_rerot_token_plan plan = *slot.rerot_inflight_plan;
+        const uint64_t episode_id = slot.rerot_episode_id;
+        const llama_rerot_node_id node_id = slot.rerot_node_id;
+        auto transport_it = rerot_transport.find(episode_id);
+        if (transport_it == rerot_transport.end()) {
+            rerot->hard_abort(episode_id, "rerot_state_error: missing transport state at commit");
+            return false;
+        }
+        if (slot.rerot_inflight_extra_plans.size() !=
+            slot.rerot_inflight_extra_bytes.size()) {
+            rerot->hard_abort(episode_id, "rerot_state_error: private microbatch plan drift");
+            return false;
+        }
+
+        const auto commit_one = [&](const server_rerot_token_plan & current_plan,
+                                    const std::string & bytes) {
+            if (!rerot->commit_token(episode_id, node_id, current_plan)) {
+                return false;
+            }
+            transport_it->second->run_bytes[current_plan.run_id] += bytes;
+            if (!slot.rerot_serial_tail &&
+                current_plan.visibility != llama_rerot_visibility::private_control &&
+                !rerot_stream_commit(
+                    episode_id, node_id, current_plan.run_id, bytes)) {
+                return false;
+            }
+            ++transport_it->second->model_tokens;
+            if (transport_it->second->parallel_started_us != 0 &&
+                !transport_it->second->parallel_finished) {
+                ++transport_it->second->parallel_model_tokens;
+            }
+            switch (current_plan.visibility) {
+                case llama_rerot_visibility::public_live:     ++rerot_metrics.public_tokens;  break;
+                case llama_rerot_visibility::private_control: ++rerot_metrics.private_tokens; break;
+                case llama_rerot_visibility::pending_record:  ++rerot_metrics.pending_tokens; break;
+                case llama_rerot_visibility::normal: break;
+            }
+            return true;
+        };
+        if (!commit_one(plan, slot.rerot_inflight_bytes)) {
+            return false;
+        }
+        for (size_t i = 0; i < slot.rerot_inflight_extra_plans.size(); ++i) {
+            if (!commit_one(
+                    slot.rerot_inflight_extra_plans[i],
+                    slot.rerot_inflight_extra_bytes[i])) {
+                return false;
+            }
+        }
+
+        const bool forced = slot.rerot_inflight_forced;
+        const auto injection = slot.rerot_injection;
+        const bool forced_complete = forced &&
+            slot.rerot_injection_cursor == slot.rerot_injection_tokens.size();
+        const bool terminal_plan =
+            plan.parser_step.record_closed &&
+            plan.parser_step.items.size() == 1;
+        const bool lane_finished =
+            plan.marker_step.marker_closed ||
+            (plan.parser_step.record_closed && !terminal_plan);
+        if (lane_finished && !rerot_stream_finish_lane(episode_id, node_id)) {
+            return false;
+        }
+
+        slot.rerot_inflight_plan.reset();
+        slot.rerot_inflight_bytes.clear();
+        slot.rerot_inflight_extra_plans.clear();
+        slot.rerot_inflight_extra_bytes.clear();
+        slot.rerot_inflight_forced = false;
+
+        if (terminal_plan) {
+            const auto * document_node = rerot->episode(episode_id)
+                ? rerot->episode(episode_id)->document.node(node_id)
+                : nullptr;
+            const std::string_view assigned_task =
+                document_node && !document_node->title.empty()
+                    ? std::string_view(document_node->title)
+                    : std::string_view(plan.parser_step.items.front());
+
+            // The planner grammar is complete at </ol> and must not constrain
+            // the terminal worker. Rebuild only this Lane's sampler with the
+            // same deterministic seed and no user/tool grammar; the original
+            // request sampler is restored separately after the final fence.
+            server_task worker_task = rerot_clone_task(*slot.task);
+            rerot_remove_planner_grammar(worker_task.params);
+            common_sampler_ptr worker_sampler;
+            try {
+                worker_sampler.reset(common_sampler_init(
+                    model_tgt,
+                    worker_task.params.sampling,
+                    (int32_t) llama_n_ctx(ctx_tgt)));
+            } catch (const std::exception & e) {
+                rerot->hard_abort(
+                    episode_id,
+                    std::string("rerot_sampler_error: failed to leave planner grammar: ") + e.what());
+                return false;
+            }
+            slot.task = std::make_unique<const server_task>(std::move(worker_task));
+            slot.smpl = std::move(worker_sampler);
+            llama_set_sampler(ctx_tgt, slot.id, nullptr);
+
+            if (!rerot_set_injection(
+                    slot,
+                    server_rerot_injection_kind::worker,
+                    rerot_worker_control_prompt(assigned_task))) {
+                rerot->hard_abort(episode_id, "rerot_protocol_error: failed to arm terminal Lane work");
+                return false;
+            }
+            return true;
+        }
+
+        if (!forced_complete) {
+            return true;
+        }
+
+        slot.rerot_injection_tokens.clear();
+        slot.rerot_injection_cursor = 0;
+        slot.rerot_injection = server_rerot_injection_kind::none;
+
+        if (injection == server_rerot_injection_kind::heading) {
+            const auto * episode = rerot->episode(episode_id);
+            const auto * document_node = episode
+                ? episode->document.node(node_id)
+                : nullptr;
+            if (!document_node ||
+                !rerot->publish_heading(episode_id, node_id, plan.run_id) ||
+                !rerot->complete_admission(episode_id, node_id)) {
+                rerot->hard_abort(episode_id, "rerot_protocol_error: child heading publication failed");
+                return false;
+            }
+            if (!rerot_stream_visibility_changed(episode_id, node_id) ||
+                !rerot_set_injection(
+                    slot,
+                    server_rerot_injection_kind::planner,
+                    rerot_planner_control_prompt(document_node->title))) {
+                rerot->hard_abort(episode_id, "rerot_protocol_error: child heading/planner admission failed");
+                return false;
+            }
+        } else if (injection == server_rerot_injection_kind::planner) {
+            // The model is now inside a fresh hidden assistant reasoning turn.
+            // Force only the structural opener; title text and the complete
+            // list remain model-generated, while the byte parser holds the
+            // record PENDING until the first real </ol>.
+            if (!rerot_set_injection(
+                    slot,
+                    server_rerot_injection_kind::planner_open,
+                    "<ol>\n<li>")) {
+                rerot->hard_abort(episode_id, "rerot_protocol_error: failed to arm planner list");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool rerot_begin_serial_tail(
+            uint64_t episode_id,
+            llama_rerot_node_id final_node) {
+        auto * lane = rerot ? rerot->node(episode_id, final_node) : nullptr;
+        if (!lane || lane->physical_slot < 0 ||
+            lane->physical_slot >= static_cast<int>(slots.size())) {
+            return false;
+        }
+        auto & slot = slots[lane->physical_slot];
+        auto transport_it = rerot_transport.find(episode_id);
+        if (transport_it == rerot_transport.end() || !slot.task) {
+            return false;
+        }
+
+        server_task final_task =
+            rerot_clone_task(transport_it->second->response_task);
+        final_task.params.sampling.seed = slot.task->params.sampling.seed;
+        common_sampler_ptr final_sampler;
+        try {
+            final_sampler.reset(common_sampler_init(
+                model_tgt,
+                final_task.params.sampling,
+                (int32_t) llama_n_ctx(ctx_tgt)));
+        } catch (const std::exception &) {
+            rerot->hard_abort(episode_id, "rerot_state_error: failed to restore final sampler grammar");
+            return false;
+        }
+
+        std::vector<uint32_t> fence_runs;
+        if (!rerot->refresh_final_fence(episode_id, final_node, &fence_runs) ||
+            !llama_rerot_refresh_barrier(ctx_tgt, episode_id) ||
+            !rerot->complete_serial_tail(episode_id, final_node)) {
+            rerot->hard_abort(episode_id, "rerot_state_error: final acquire fence failed");
+            return false;
+        }
+        rerot_note_parallel_end(episode_id, ggml_time_us());
+
+        std::string logical_reasoning =
+            rerot_render_public_document(episode_id, final_node);
+        if (slot.task && slot.task->params.rerot_trace) {
+            SRV_INF("rerot.trace.document: episode=%" PRIu64 " node=%u bytes=%zu text=%s\n",
+                episode_id, final_node, logical_reasoning.size(), logical_reasoning.c_str());
+        }
+
+        const bool chronological_stream = final_task.params.stream;
+        if (chronological_stream && !transport_it->second->line_mux.empty()) {
+            rerot->hard_abort(
+                episode_id,
+                "rerot_stream_error: final fence reached with unfinished Lane lines");
+            return false;
+        }
+        const size_t reasoning_bytes_sent =
+            chronological_stream ? transport_it->second->streamed_reasoning.size() : 0;
+        std::string response_reasoning = chronological_stream
+            ? transport_it->second->streamed_reasoning
+            : std::move(logical_reasoning);
+        response_reasoning += "</think>\n\n";
+
+        slot.task = std::make_unique<const server_task>(std::move(final_task));
+        slot.smpl = std::move(final_sampler);
+        llama_set_sampler(ctx_tgt, slot.id, nullptr);
+        slot.generated_text = std::move(response_reasoning);
+        slot.generated_tokens.clear();
+        slot.generated_token_probs.clear();
+        slot.n_sent_text = reasoning_bytes_sent;
+        slot.n_prompt_tokens_original = transport_it->second->response_task.n_tokens();
+        slot.n_prompt_tokens_processed = transport_it->second->prompt_tokens_processed;
+        slot.n_prompt_tokens_processed_accum =
+            transport_it->second->prompt_tokens_processed_accum;
+        slot.n_prompt_tokens_cache_response =
+            transport_it->second->prompt_tokens_cache_response;
+        slot.t_prompt_processing = transport_it->second->prompt_processing_ms;
+        slot.n_decoded = 0;
+        slot.n_decoded_start = 0;
+        slot.has_next_token = true;
+        slot.stop = STOP_TYPE_NONE;
+        slot.stopping_word.clear();
+        slot.rerot_serial_tail = true;
+        if (!rerot_set_injection(
+                slot,
+                server_rerot_injection_kind::finalizer,
+                rerot_finalizer_control_prompt(
+                    transport_it->second->response_task.rerot_original_user_text))) {
+            rerot->hard_abort(episode_id, "rerot_protocol_error: failed to inject finalizer turn");
+            return false;
+        }
+
+        ++rerot_metrics.final_fences;
+        ++rerot_metrics.refresh_total;
+        SRV_INF("RERoT final fence: episode=%" PRIu64
+                " node=%u slot=%d public_bytes=%zu streamed_lines=%" PRIu64 "\n",
+            episode_id,
+            final_node,
+            slot.id,
+            slot.generated_text.size(),
+            transport_it->second->streamed_lines);
+        return true;
+    }
+
+    bool rerot_handle_finished_frontier(uint64_t episode_id) {
+        auto result = rerot->finish_frontier(episode_id);
+        ++rerot_metrics.frontiers;
+        if (result.topology_barrier) {
+            ++rerot_metrics.topology_barriers;
+            ++rerot_metrics.refresh_total;
+        }
+        if (result.hard_aborted) {
+            return false;
+        }
+
+        auto transport_it = rerot_transport.find(episode_id);
+        auto * episode = rerot->episode(episode_id);
+        if (transport_it == rerot_transport.end() || !episode) {
+            rerot->hard_abort(episode_id, "rerot_state_error: missing episode after frontier");
+            return false;
+        }
+
+        rerot_metrics.nodes_retired += result.retired.size();
+        rerot_metrics.archive_total += result.retired.size();
+        for (const auto parent_id : result.forked) {
+            auto * parent = rerot->node(episode_id, parent_id);
+            const auto * parent_doc = episode->document.node(parent_id);
+            if (!parent || !parent_doc || parent->physical_slot < 0 ||
+                parent->physical_slot >= static_cast<int>(slots.size())) {
+                rerot->hard_abort(episode_id, "rerot_state_error: fork parent lost physical slot");
+                return false;
+            }
+
+            auto & parent_slot = slots[parent->physical_slot];
+            for (const auto child_id : parent_doc->children) {
+                transport_it->second->lineage_tokens.insert_or_assign(
+                    child_id, parent_slot.prompt.tokens.clone());
+            }
+
+            ++rerot_metrics.forks_total;
+            ++rerot_metrics.archive_total;
+            rerot_metrics.parked_total += parent_doc->children.size();
+            rerot_metrics.nodes_created += parent_doc->children.size();
+            rerot_metrics.nodes_queued += parent_doc->children.size();
+            rerot_metrics.queue_max = std::max<uint64_t>(
+                rerot_metrics.queue_max, episode->ready_queue.size());
+            for (const auto child_id : parent_doc->children) {
+                rerot_metrics.max_depth = std::max<uint64_t>(
+                    rerot_metrics.max_depth,
+                    episode->document.tree_path(child_id).size());
+            }
+
+            const int released_slot = parent->physical_slot;
+            if (!rerot->freeze_fork_parent(episode_id, parent_id)) {
+                return false;
+            }
+            transport_it->second->segmented_active = true;
+            transport_it->second->triattention_compressed |=
+                parent_slot.triattention_compressed;
+            rerot_make_slot_idle(slots[released_slot]);
+
+            SRV_INF("RERoT fork: episode=%" PRIu64 " parent=%u children=%zu released_slot=%d\n",
+                episode_id, parent_id, parent_doc->children.size(), released_slot);
+        }
+
+        for (const int released_slot : result.released_slots) {
+            if (released_slot >= 0 && released_slot < static_cast<int>(slots.size())) {
+                rerot_make_slot_idle(slots[released_slot]);
+            }
+        }
+
+        if (result.topology_barrier) {
+            if (!llama_rerot_refresh_barrier(ctx_tgt, episode_id)) {
+                rerot->hard_abort(episode_id, "rerot_state_error: topology barrier failed");
+                return false;
+            }
+            // Existing next-token logits were produced while the structural
+            // record was still PENDING. A private one-token control refresh
+            // re-evaluates each otherwise-idle Lane on the newly published
+            // PAC-DFS view before sampling. Lanes already entering a forced
+            // heading/planner/worker sequence refresh on that sequence.
+            for (auto & lane_slot : slots) {
+                if (!lane_slot.rerot_internal ||
+                    lane_slot.rerot_episode_id != episode_id ||
+                    lane_slot.rerot_serial_tail ||
+                    lane_slot.rerot_injection != server_rerot_injection_kind::none) {
+                    continue;
+                }
+                const auto * lane_node = episode->document.node(lane_slot.rerot_node_id);
+                if (!lane_node ||
+                    lane_node->state == llama_rerot_node_state::forked ||
+                    lane_node->state == llama_rerot_node_state::retired) {
+                    continue;
+                }
+                if (!rerot_set_injection(
+                        lane_slot,
+                        server_rerot_injection_kind::refresh,
+                        "\n")) {
+                    return false;
+                }
+            }
+        }
+
+        if (!rerot_admit_ready(episode_id)) {
+            return false;
+        }
+
+        if (result.natural_final() &&
+            !rerot_begin_serial_tail(episode_id, result.final_node)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    bool rerot_sample_slot(server_slot & slot, int tok_idx) {
+        if (!slot.smpl || tok_idx < 0) {
+            SRV_ERR("RERoT sample unavailable: episode=%" PRIu64
+                    " node=%u sampler=%d tok_idx=%d i_batch=%d\n",
+                slot.rerot_episode_id, slot.rerot_node_id,
+                slot.smpl ? 1 : 0, tok_idx, slot.i_batch);
+            if (rerot && slot.rerot_episode_id != 0) {
+                rerot->hard_abort(
+                    slot.rerot_episode_id,
+                    string_format(
+                        "rerot_state_error: invalid sampler/logit row (sampler=%d tok_idx=%d i_batch=%d)",
+                        slot.smpl ? 1 : 0, tok_idx, slot.i_batch));
+            }
+            return false;
+        }
+
+        llama_token id;
+        {
+            scoped_timer timer(t_sampl, n_sampl);
+            id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+        }
+        if (slot.task && slot.task->params.rerot_trace) {
+            SRV_INF("rerot.trace.sample: episode=%" PRIu64 " node=%u serial=%d tok_idx=%d token=%d piece=%s\n",
+                slot.rerot_episode_id, slot.rerot_node_id, slot.rerot_serial_tail ? 1 : 0,
+                tok_idx, id, common_token_to_piece(slot.ctx_tgt, id, true).c_str());
+        }
+        common_sampler_accept(slot.smpl.get(), id, true);
+        slot.i_batch = -1;
+        if (const auto transport_it = rerot_transport.find(slot.rerot_episode_id);
+            transport_it != rerot_transport.end()) {
+            ++transport_it->second->sampled_tokens;
+        }
+
+        const int64_t now = ggml_time_us();
+        if (slot.t_start_generation == 0) {
+            slot.t_start_generation = now;
+        }
+        ++slot.n_decoded;
+        slot.t_token_generation = std::max<int64_t>(1, now - slot.t_start_generation) / 1e3;
+
+        if (!slot.rerot_serial_tail) {
+            if (llama_vocab_is_eog(vocab, id)) {
+                const auto * episode = rerot->episode(slot.rerot_episode_id);
+                const auto * document_node = episode
+                    ? episode->document.node(slot.rerot_node_id)
+                    : nullptr;
+                if (document_node &&
+                    document_node->state == llama_rerot_node_state::terminal_running &&
+                    slot.rerot_injection == server_rerot_injection_kind::none &&
+                    rerot_set_injection(
+                        slot,
+                        server_rerot_injection_kind::worker_close,
+                        "</think>")) {
+                    SRV_INF("RERoT Lane EOG normalized to record close: episode=%" PRIu64
+                            " node=%u slot=%d\n",
+                        slot.rerot_episode_id, slot.rerot_node_id, slot.id);
+                    return true;
+                }
+                rerot->hard_abort(
+                    slot.rerot_episode_id,
+                    "rerot_protocol_error: Lane reached EOG outside terminal record");
+                return false;
+            }
+            slot.sampled = id;
+            return true;
+        }
+
+        slot.sampled = id;
+        completion_token_output output;
+        output.tok = id;
+        output.text_to_send = common_token_to_piece(
+            slot.ctx_tgt,
+            id,
+            params_base.special ||
+                slot.task->params.sampling.preserved_tokens.find(id) !=
+                    slot.task->params.sampling.preserved_tokens.end());
+        output.prob = 1.0f;
+        if (slot.task->params.sampling.n_probs > 0) {
+            populate_token_probs(
+                slot, output, slot.task->params.post_sampling_probs,
+                params_base.special, tok_idx);
+        }
+
+        if (process_token(output, slot)) {
+            slot.print_timings_tg();
+            return true;
+        }
+
+        const uint64_t episode_id = slot.rerot_episode_id;
+        if (const auto transport_it = rerot_transport.find(episode_id);
+            transport_it != rerot_transport.end()) {
+            slot.n_decoded = static_cast<int32_t>(std::min<uint64_t>(
+                transport_it->second->sampled_tokens,
+                std::numeric_limits<int32_t>::max()));
+        }
+        SRV_INF("RERoT serial tail complete: episode=%" PRIu64 " node=%u token=%d stop=%d\n",
+            episode_id, slot.rerot_node_id, id, slot.stop);
+        rerot_record_completed_episode(episode_id);
+        slot.print_timings();
+        send_final_response(slot);
+        metrics.on_prediction(slot);
+        rerot_erase_episode(episode_id);
+        slot.prompt.clear();
+        slot.release();
+        rerot_start_next_waiting_root();
+        return true;
+    }
+
+    // Frontier scheduling entry (§§19-20): one frontier is one atomic budget
+    // unit. Delegates to runtime::begin_frontier; on hard-limit breach the
+    // runtime takes whole-episode HARD_ABORT (no survivor/answer/tool call)
+    // and this hook propagates it to slots. Returns false when aborted.
+    bool rerot_frontier_enter() {
+        if (!rerot_active()) {
+            return true;
+        }
+        const auto * episode = rerot_active_episode();
+        if (episode && episode->serial_tail) {
+            return true;
+        }
+        if (rerot->begin_frontier(rerot_episode_id)) {
+            return true;
+        }
+        rerot_propagate_hard_abort();
+        return false;
+    }
+
+    // Topology-barrier refresh trigger (§17): after a frontier commits with a
+    // topology change, re-observe stable shared memory via a read-only
+    // context refresh (no public token write; recurrent checkpoint/restore
+    // handled inside llama_rerot_refresh_barrier when needed).
+    void rerot_on_topology_barrier(bool barrier) {
+        if (!rerot_active() || !barrier || ctx_tgt == nullptr) {
+            return;
+        }
+        if (!llama_rerot_refresh_barrier(ctx_tgt, rerot_episode_id)) {
+            rerot_propagate_hard_abort();
+        }
+    }
+
+    // Final-fence serial transition (§§21-22): rebuilds the survivor view on
+    // stable shared memory (acquire fence) then retires the parallel
+    // scheduler so ordinary tool-call / body decode continues from the fence
+    // survivor on the root response stream. Failures propagate as hard abort.
+    void rerot_on_final_fence(llama_rerot_node_id final_node) {
+        if (!rerot_active() || final_node == LLAMA_REROT_NODE_INVALID || ctx_tgt == nullptr) {
+            return;
+        }
+        std::vector<uint32_t> fence_runs;
+        if (!rerot->refresh_final_fence(rerot_episode_id, final_node, &fence_runs)) {
+            rerot_propagate_hard_abort();
+            return;
+        }
+        if (!rerot->complete_serial_tail(rerot_episode_id, final_node)) {
+            rerot_propagate_hard_abort();
+        }
+    }
+
+    // Hard-abort propagation (§20): one external error for the episode, then
+    // release every internal Lane and every parked/archive reference. Lane
+    // clones share the root task id, so emitting once per slot would violate
+    // the single-termination response contract.
+    void rerot_propagate_hard_abort() {
+        if (!rerot || rerot_episode_id == 0 || !rerot->episode(rerot_episode_id)) {
+            return;
+        }
+        const uint64_t episode_id = rerot_episode_id;
+        ++rerot_metrics.hard_aborts;
+        const server_rerot_episode * ep = rerot->episode(episode_id);
+        const std::string reason = (ep && !ep->abort_reason.empty())
+            ? ep->abort_reason : "rerot_resource_exhausted";
+        rerot->hard_abort(episode_id, reason);
+
+        const server_task * response_task = nullptr;
+        const auto transport_it = rerot_transport.find(episode_id);
+        if (transport_it != rerot_transport.end() && transport_it->second) {
+            response_task = &transport_it->second->response_task;
+        }
+
+        server_slot * response_slot = nullptr;
+        for (auto & slot : slots) {
+            if (slot.rerot_internal && slot.rerot_episode_id == episode_id && slot.is_processing()) {
+                if (!response_slot) {
+                    response_slot = &slot;
+                }
+            }
+        }
+        if (response_slot) {
+            send_error(*response_slot, "RERoT episode hard-aborted: " + reason, ERROR_TYPE_SERVER);
+        } else if (response_task) {
+            // Fork publication may have already released the last physical
+            // Lane before child admission discovers recurrent exhaustion.
+            // The transport owns the original response task until episode
+            // teardown, so it remains the authoritative HTTP/SSE endpoint.
+            send_error(*response_task, "RERoT episode hard-aborted: " + reason, ERROR_TYPE_SERVER);
+        }
+
+        for (auto & slot : slots) {
+            if (slot.rerot_internal && slot.rerot_episode_id == episode_id && slot.is_processing()) {
+                slot.prompt.clear();
+                slot.release();
+            }
+        }
+        rerot_erase_episode(episode_id);
+        rerot_start_next_waiting_root();
+    }
+
+    // Episode-aware slot test (§A.11): a physical slot currently borrowed by
+    // the active episode must never be preempted/demoted/shifted alone.
+    bool rerot_owns_slot(int id_slot) const {
+        if (!rerot_active()) {
+            return false;
+        }
+        return rerot->episode_for_slot(id_slot) != nullptr;
+    }
+
     wanxiangqi_server_token_dump request_token_dump;
 
     server_metrics metrics;
+    server_rerot_metrics rerot_metrics;
 
     uint64_t tri_drain_count = 0;
     uint64_t tri_maintenance_count = 0;
@@ -1170,6 +2679,15 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // RERoT: end any active context episode gate before tearing down the
+        // context, then drop the runtime (which releases parked/archive
+        // lineage). OFF: both branches no-op.
+        if (rerot_active() && ctx_tgt != nullptr) {
+            llama_rerot_episode_end(ctx_tgt, rerot_episode_id);
+        }
+        rerot.reset();
+        rerot_episode_id = 0;
+
         spec.reset();
         spec_init.reset();
 
@@ -1586,6 +3104,23 @@ private:
             slot.reset();
         }
 
+        // RERoT runtime holder (OFF: stays null, every hook below no-ops).
+        // Logical seq arena is LLAMA_MAX_SEQ; physical recurrent capacity
+        // stays at n_parallel (see common.cpp wiring). Internal parked/
+        // archive ids allocate from [n_parallel, LLAMA_MAX_SEQ).
+        if (params_base.rerot_enabled) {
+            llama_memory_t mem = ctx_tgt != nullptr ? llama_get_memory(ctx_tgt) : nullptr;
+            rerot = std::make_unique<server_rerot_runtime>(
+                mem, params_base.rerot_frontier,
+                (uint32_t) std::max(0, params_base.n_parallel), (uint32_t) LLAMA_MAX_SEQ);
+            rerot_episode_id = 0;
+            SRV_INF("RERoT runtime armed (frontier=%s)\n",
+                llama_rerot_frontier_mode_name(params_base.rerot_frontier));
+        } else {
+            rerot.reset();
+            rerot_episode_id = 0;
+        }
+
         {
             const char * LLAMA_TRACE = getenv("LLAMA_TRACE");
             trace = LLAMA_TRACE ? atoi(LLAMA_TRACE) : 0;
@@ -1995,6 +3530,14 @@ private:
             if (slot.is_processing() || slot.prompt.n_tokens() == 0) {
                 continue;
             }
+            // RERoT episode-aware idle demotion (§A.11.2): the episode is the
+            // minimum reliable unit. Never demote a single Lane slot alone;
+            // idle slots never belong to an active episode (lanes are
+            // processing, queued children hold no physical slot), so this
+            // only skips on a race. OFF: rerot_owns_slot false.
+            if (rerot_owns_slot(slot.id)) {
+                continue;
+            }
             if (victim == nullptr || slot.t_last_used < victim->t_last_used) {
                 victim = &slot;
             }
@@ -2023,6 +3566,16 @@ private:
 
         for (auto & slot : slots) {
             if (slot.id == id_slot_protected || slot.state != SLOT_STATE_GENERATING || !slot.task) {
+                continue;
+            }
+            // RERoT episode-aware active preemption (§A.11.1/A.27): never
+            // leave an orphan Lane. A borrowed Lane slot is not independently
+            // preemptible; the whole episode is the resource unit (freeze /
+            // cancel all writers, release all exec/parked/pending handles
+            // together via rerot_propagate_hard_abort or a whole-episode
+            // retry). Skipping here forces the pressure planner to treat the
+            // episode as one atomic victim. OFF: false.
+            if (rerot_owns_slot(slot.id)) {
                 continue;
             }
             ++n_preemptible;
@@ -2085,6 +3638,16 @@ private:
             return false;
         }
 
+        // RERoT: refuse single-Lane preemption (§A.11.1). Whole-episode
+        // handling lives in rerot_propagate_hard_abort / future whole-episode
+        // retry; preempting one Lane would orphan siblings and leak
+        // parked/archive lineage. OFF: false.
+        if (rerot_owns_slot(slot.id)) {
+            SLT_WRN(slot, "%s", "refusing single-Lane preemption while a RERoT episode is active "
+                "(whole-episode unit; use rerot_propagate_hard_abort)\n");
+            return false;
+        }
+
         const int id_task = slot.task->id;
         server_task retry = make_retry_task(slot);
 
@@ -2139,7 +3702,11 @@ private:
                 }
 
                 uint32_t n = 1;
-                if (!slot.token_append_chunk.empty()) {
+                if (slot.rerot_internal &&
+                    server_rerot_private_microbatch(slot.rerot_injection) &&
+                    slot.rerot_injection_cursor < slot.rerot_injection_tokens.size()) {
+                    n = static_cast<uint32_t>(rerot_private_batch_size(slot));
+                } else if (!slot.token_append_chunk.empty()) {
                     n += slot.token_append_chunk.size();
                 } else if (slot.can_speculate() && n_draft_cfg > 0) {
                     n += std::min(n_draft_cfg, std::max(0, slot.get_n_draft_max()));
@@ -2246,8 +3813,36 @@ private:
 
             bool tri_maintenance_due = false;
             if (params_base.triattention_enabled && !kv_pressure) {
+                const auto * maintenance_episode = rerot_active_episode();
+                const auto maintenance_transport_it = maintenance_episode
+                    ? rerot_transport.find(maintenance_episode->id)
+                    : rerot_transport.end();
+                if (maintenance_episode &&
+                    maintenance_transport_it != rerot_transport.end() &&
+                    maintenance_transport_it->second->triattention_compressed) {
+                    const uint64_t synced =
+                        maintenance_transport_it->second->triattention_synced_public_tokens;
+                    const uint64_t current =
+                        maintenance_episode->generated_public_tokens;
+                    if (current > synced) {
+                        const uint64_t base = static_cast<uint64_t>(
+                            std::max<llama_pos>(0, maintenance_episode->base_prefix_end));
+                        const uint64_t old_target = std::max<uint64_t>(
+                            128,
+                            static_cast<uint64_t>(std::ceil(
+                                double(base + synced) * params_base.triattention_ratio)));
+                        const uint64_t new_target = std::max<uint64_t>(
+                            128,
+                            static_cast<uint64_t>(std::ceil(
+                                double(base + current) * params_base.triattention_ratio)));
+                        const uint64_t target_growth = new_target - old_target;
+                        tri_maintenance_due =
+                            current - synced > target_growth + 128;
+                    }
+                }
                 for (const auto & slot : slots) {
-                    if (!slot.is_processing() || !slot.triattention_compressed) {
+                    if (!slot.is_processing() || !slot.triattention_compressed ||
+                        slot.rerot_internal) {
                         continue;
                     }
 
@@ -2271,8 +3866,21 @@ private:
                 // Initial pressure drains every resident sequence. Maintenance only
                 // touches sequences that have already entered compressed mode.
                 std::vector<llama_memory_kv_reclaim_seq_hint> seq_hints;
+                std::vector<llama_seq_id> rerot_semantic_seq_ids;
+                const auto * rerot_episode = rerot_active_episode();
+                if (rerot_episode && !rerot->sync_public_archive(
+                        rerot_episode->id, &rerot_semantic_seq_ids)) {
+                    rerot->hard_abort(
+                        rerot_episode->id,
+                        "rerot_state_error: failed to synchronize PUBLIC archive before TriAttention reclaim");
+                    rerot_propagate_hard_abort();
+                    return false;
+                }
                 for (auto & slot : slots) {
-                    if (slot.prompt.n_tokens() == 0 || (!kv_pressure && !slot.triattention_compressed)) {
+                    if (slot.prompt.n_tokens() == 0 ||
+                        (rerot_episode && slot.rerot_internal &&
+                         slot.rerot_episode_id == rerot_episode->id) ||
+                        (!kv_pressure && !slot.triattention_compressed)) {
                         continue;
                     }
                     llama_memory_kv_reclaim_seq_hint hint;
@@ -2281,6 +3889,27 @@ private:
                     hint.tail_guard = 128; // recent window
                     hint.eligible = true;
                     seq_hints.push_back(hint);
+                }
+                const auto * active_episode = rerot_active_episode();
+                const auto transport_it = active_episode
+                    ? rerot_transport.find(active_episode->id)
+                    : rerot_transport.end();
+                if (active_episode && active_episode->archive_seq >= 0 &&
+                    transport_it != rerot_transport.end() &&
+                    (kv_pressure || transport_it->second->triattention_compressed) &&
+                    llama_memory_seq_get_kv_used(mem_tgt, active_episode->archive_seq) > 0) {
+                    const uint64_t logical_u64 =
+                        uint64_t(std::max<llama_pos>(0, active_episode->base_prefix_end)) +
+                        active_episode->generated_public_tokens;
+                    llama_memory_kv_reclaim_seq_hint hint;
+                    hint.seq_id = active_episode->archive_seq;
+                    hint.logical_tokens = static_cast<uint32_t>(
+                        std::min<uint64_t>(UINT32_MAX, logical_u64));
+                    hint.tail_guard = 128;
+                    hint.eligible = true;
+                    hint.semantic_episode_id = active_episode->id;
+                    hint.semantic_seq_ids = rerot_semantic_seq_ids;
+                    seq_hints.push_back(std::move(hint));
                 }
 
                 llama_memory_kv_reclaim_request req;
@@ -2311,6 +3940,15 @@ private:
                     tri_score_us_total    += result_tgt.score_us;
                     tri_pack_us_total     += result_tgt.pack_us;
 
+                    if (rerot_episode) {
+                        const auto sync_transport_it =
+                            rerot_transport.find(rerot_episode->id);
+                        if (sync_transport_it != rerot_transport.end()) {
+                            sync_transport_it->second->triattention_synced_public_tokens =
+                                rerot_episode->generated_public_tokens;
+                        }
+                    }
+
                     SRV_INF("TriAttention %s: before=%u after=%u freed=%u refs_removed=%u deficit=%u target_refs=%u hard_keep=%u shared_keep=%u score_ms=%.3f pack_ms=%.3f floor_reached=%s\n",
                             kv_pressure ? "drain" : "maintenance",
                             result_tgt.physical_before, result_tgt.physical_after, result_tgt.physical_freed,
@@ -2326,6 +3964,25 @@ private:
                                 llama_memory_seq_get_kv_used(mem_tgt, slot.id) > 0) {
                                 slot.triattention_compressed = true;
                             }
+                        }
+                        const auto * active_episode = rerot_active_episode();
+                        const auto transport_it = active_episode
+                            ? rerot_transport.find(active_episode->id)
+                            : rerot_transport.end();
+                        if (active_episode && transport_it != rerot_transport.end()) {
+                            for (const auto & slot : slots) {
+                                if (slot.rerot_internal &&
+                                    slot.rerot_episode_id == active_episode->id &&
+                                    slot.triattention_compressed) {
+                                    transport_it->second->triattention_compressed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (active_episode && active_episode->archive_seq >= 0 &&
+                            transport_it != rerot_transport.end() &&
+                            llama_memory_seq_get_kv_used(mem_tgt, active_episode->archive_seq) > 0) {
+                            transport_it->second->triattention_compressed = true;
                         }
                     }
 
@@ -3118,6 +4775,18 @@ private:
                             break;
                         }
                     }
+                    if (task.params.rerot_effective(task.type) &&
+                        task.rerot_episode_id == 0) {
+                        uint64_t generation = rerot_task_generation_next++;
+                        if (generation == 0) {
+                            generation = rerot_task_generation_next++;
+                        }
+                        task.assign_rerot_episodes(
+                            rerot_task_episode_id_next, generation);
+                    } else if (task.params.rerot_effective(task.type) &&
+                               task.is_retry) {
+                        task.rerot_bump_generation();
+                    }
 
                     const int id_slot = task.id_slot;
                     const int id_task = task.id;
@@ -3193,7 +4862,35 @@ private:
                 {
                     retry_states.erase(task.id_target);
 
-                    // release slot linked with the task id
+                    // A request owns the whole RERoT episode, not one cloned
+                    // Lane slot. Cancel every writer and release archive/
+                    // parked state atomically; releasing only the first clone
+                    // would orphan siblings under the same response task id.
+                    uint64_t cancelled_episode = 0;
+                    for (const auto & slot : slots) {
+                        if (slot.task && slot.task->id == task.id_target &&
+                            slot.rerot_internal) {
+                            cancelled_episode = slot.rerot_episode_id;
+                            break;
+                        }
+                    }
+                    if (cancelled_episode != 0 && rerot &&
+                        rerot->episode(cancelled_episode)) {
+                        rerot->hard_abort(cancelled_episode, "rerot_cancelled");
+                        for (auto & slot : slots) {
+                            if (slot.rerot_internal &&
+                                slot.rerot_episode_id == cancelled_episode) {
+                                slot.prompt.clear();
+                                slot.release();
+                            }
+                        }
+                        rerot_erase_episode(cancelled_episode);
+                        rerot_start_next_waiting_root();
+                        break;
+                    }
+
+                    // Ordinary requests and queued (not-yet-started) RERoT
+                    // roots retain the stock one-task/one-slot cancellation.
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
                             slot.release();
@@ -3297,6 +4994,7 @@ private:
                     res->tri_target_references  = tri_target_references;
                     res->tri_hard_keep          = tri_hard_keep;
                     res->tri_shared_keep        = tri_shared_keep;
+                    res->rerot                  = rerot_metrics;
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -3318,6 +5016,15 @@ private:
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    // RERoT v1 refusal (§§25,A.8): no per-slot persist of an
+                    // active episode Lane (tree/run/epoch/parked/archive/MTP
+                    // lineage has no versioned format yet). OFF: false.
+                    if (rerot_owns_slot(id_slot)) {
+                        send_error(task, "RERoT episode active: manual slot save is unsupported in v1 "
+                            "(no versioned RERoT state with REROT_STATE_MAGIC/VERSION + fingerprint)", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
 
@@ -3355,6 +5062,15 @@ private:
                         // if requested slot is unavailable, we defer this task for processing later
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    // RERoT v1 refusal (§§25,A.8): no manual restore into an
+                    // active episode Lane; future restores must match
+                    // REROT_STATE_MAGIC/VERSION + model/rope/Tri fingerprint.
+                    // OFF: false.
+                    if (rerot_owns_slot(id_slot)) {
+                        send_error(task, "RERoT episode active: manual slot restore is unsupported in v1", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
 
@@ -3469,8 +5185,16 @@ private:
                 callback(slot);
             } catch (const std::exception & e) {
                 SLT_ERR(slot, "got exception: %s\n", e.what());
-                send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
-                slot.release();
+                if (slot.rerot_internal && rerot &&
+                    rerot->episode(slot.rerot_episode_id)) {
+                    rerot->hard_abort(
+                        slot.rerot_episode_id,
+                        std::string("rerot_backend_error: ") + e.what());
+                    rerot_propagate_hard_abort();
+                } else {
+                    send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+                    slot.release();
+                }
             }
         }
     }
@@ -3481,14 +5205,29 @@ private:
                 callback(*slot);
             } catch (const std::exception & e) {
                 SLT_ERR(*slot, "got exception: %s\n", e.what());
-                send_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
-                slot->release();
+                if (slot->rerot_internal && rerot &&
+                    rerot->episode(slot->rerot_episode_id)) {
+                    rerot->hard_abort(
+                        slot->rerot_episode_id,
+                        std::string("rerot_backend_error: ") + e.what());
+                    rerot_propagate_hard_abort();
+                } else {
+                    send_error(*slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+                    slot->release();
+                }
             }
         }
     }
 
     void abort_all_slots(const std::string & reason) {
         retry_states.clear();
+
+        // RERoT hard-abort propagation (§20): a fatal scheduler error while
+        // an episode is active must not leave parked/archive lineage or a
+        // context episode gate behind. OFF: rerot_active false, no change.
+        if (rerot_active()) {
+            rerot_propagate_hard_abort();
+        }
 
         for (auto & slot : slots) {
             if (slot.is_processing()) {
@@ -3606,6 +5345,13 @@ private:
 
         update_inference_mode();
 
+        // RERoT frontier entry (§§19.3,20): one frontier is one atomic budget
+        // unit; when hard limits are crossed the whole episode HARD_ABORTs
+        // here instead of running a partial Lane subset. OFF: no-op true.
+        if (!rerot_frontier_enter()) {
+            return;
+        }
+
         if (!ensure_next_kv_capacity()) {
             return;
         }
@@ -3680,6 +5426,28 @@ private:
                 break; // stop any further processing
             }
         }
+
+        // RERoT barrier/fence poll (Stage 7, §§17,21): all gates inside are
+        // episode-active checks, so OFF costs one null + one zero compare.
+        // The full per-token frontier loop (plan/commit/finish_frontier) will
+        // drive these flags; this poll only ensures a pending barrier still
+        // refreshes read-only logits and a finalized single survivor still
+        // takes the acquire fence + serial-tail transition even if the loop
+        // lands in a later slice.
+        if (rerot_active()) {
+            if (const server_rerot_episode * ep = rerot_active_episode()) {
+                if (ep->topology_barrier_pending && !ep->hard_aborted && !ep->serial_tail) {
+                    rerot_on_topology_barrier(true);
+                }
+                if (ep->finalizing && !ep->hard_aborted && !ep->serial_tail &&
+                    ep->ready_queue.empty() && ep->starting.empty() && ep->running.size() == 1) {
+                    rerot_on_final_fence(*ep->running.begin());
+                }
+                if (ep->hard_aborted) {
+                    rerot_propagate_hard_abort();
+                }
+            }
+        }
     }
 
     void pre_decode() {
@@ -3708,6 +5476,19 @@ private:
                 if (slot.task->is_parent() || slot.task->is_child()) {
                     send_error(slot, "context shift cannot be used for shared prompt", ERROR_TYPE_SERVER);
                     slot.release();
+                    return;
+                }
+
+                // RERoT v1 refusal (§§25,A.9): no linear seq_rm/seq_add shift
+                // on an active episode Lane. Shared history needs episode-aware
+                // semantic truncation (oldest PUBLIC region dropped for all
+                // readers + run-table repack + layout/publish bump + MTP
+                // invalidation, recurrent state never rewritten). OFF: false.
+                if (rerot_owns_slot(slot.id)) {
+                    rerot->hard_abort(
+                        slot.rerot_episode_id,
+                        "rerot_resource_exhausted: active episode reached context-shift boundary");
+                    rerot_propagate_hard_abort();
                     return;
                 }
 
@@ -3783,6 +5564,35 @@ private:
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
 
                 if (!slot.token_append_chunk.empty()) {
+                    return;
+                }
+
+                // RERoT MTP compat (§A.6): drafts bind to the reader view
+                // stamp (topology/publish/layout). While a Lane borrows this
+                // slot, a stale draft (peer PUBLIC commit / topology or
+                // layout change since draft time) must be invalidated with
+                // checkpoint restore before any new draft. v1 prototype also
+                // forces n_draft_max=0 for episode Lanes (frontier-local
+                // speculative only); the stale check below stays so the
+                // epoch-aware path is already wired when drafting re-enables.
+                // OFF: rerot_owns_slot false, no behavior change.
+                if (rerot_owns_slot(slot.id)) {
+                    if (slot.rerot_has_draft_stamp && ctx_tgt != nullptr &&
+                        llama_rerot_mtp_is_stale(ctx_tgt, slot.id, &slot.rerot_draft_stamp)) {
+                        // Stale: restore checkpoint, drop uncommitted draft
+                        // KV/recurrent, re-draft from the latest view next
+                        // frontier (here: just drop; next frontier re-drafts).
+                        slot.spec_ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        if (slot.ctx_dft) {
+                            slot.spec_ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        }
+                        common_speculative_set_state(spec.get(), slot.id, slot.spec_ckpt.data_spec);
+                        slot.mem.seq_rm(slot.id, slot.spec_ckpt.pos_max + 1, -1);
+                        slot.spec_draft.clear();
+                        slot.spec_i_batch.clear();
+                        slot.rerot_has_draft_stamp = false;
+                    }
+                    // v1: no cross-frontier speculative window for RERoT lanes.
                     return;
                 }
 
@@ -3883,10 +5693,34 @@ private:
             }
         });
 
-        // update the batch with the sampled/drafted tokens
+        // Plan every Lane first, then install every reader view. This
+        // two-phase ordering is required for strong-frontier visibility: the
+        // first reader's PAC-DFS order must already contain peer runs created
+        // later in the same frontier.
+        bool rerot_plan_ok = true;
         iterate(generating, [&](server_slot & slot) {
-            slot.handle_last_sampled_token(batch);
+            if (slot.rerot_internal && !rerot_plan_next_token(slot)) {
+                rerot_plan_ok = false;
+            }
         });
+        if (!rerot_plan_ok) {
+            rerot_propagate_hard_abort();
+            return;
+        }
+
+        iterate(generating, [&](server_slot & slot) {
+            if (slot.rerot_internal) {
+                if (!rerot_append_planned_token(slot)) {
+                    rerot_plan_ok = false;
+                }
+            } else {
+                slot.handle_last_sampled_token(batch);
+            }
+        });
+        if (!rerot_plan_ok) {
+            rerot_propagate_hard_abort();
+            return;
+        }
 
         // process in chunks of params.n_batch, capped when the pressure planner
         // can only fit a partial prefill batch at the TriAttention floor.
@@ -4022,9 +5856,17 @@ private:
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
+                                // RERoT compat (§A.10.3): ordinary chunk-reuse
+                                // shifting is only legal on serial prefixes /
+                                // frozen ordinary coordinates, never on active
+                                // DDVR PUBLIC runs. llama_memory_can_shift
+                                // already returns false while an episode is
+                                // active; this explicit lane check keeps the
+                                // refusal obvious at the call site. OFF: false.
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                    !slot.prompt.tokens.has_mtmd &&
+                                    !rerot_owns_slot(slot.id);
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
@@ -4483,6 +6325,14 @@ private:
         metrics.on_decoded(slots);
 
         if (ret != 0) {
+            if (rerot_active() && batch.slot_batched && batch.slot_batched->rerot_internal) {
+                const std::string reason = ret == 1
+                    ? "rerot_resource_exhausted: memory cannot commit the complete frontier"
+                    : "rerot_backend_error: complete frontier decode failed";
+                rerot->hard_abort(rerot_episode_id, reason);
+                rerot_propagate_hard_abort();
+                throw std::runtime_error(reason);
+            }
             if (ret == 1 && n_batch == 1 && params_base.kv_unified && params_base.n_ctx_kv > 0 && try_clear_idle_slots()) {
                 return false;
             }
@@ -4588,6 +6438,106 @@ private:
             }
         });
 
+        // RERoT owns its token lifecycle: first commit every physical KV
+        // write in the frontier, then mutate topology/retire/admit, and only
+        // then sample the next token from the jointly produced logits.
+        std::set<uint64_t> rerot_committed_episodes;
+        bool rerot_ok = true;
+        iterate(slots, [&](server_slot & slot) {
+            if (!is_inside_view(slot.i_batch)) {
+                return;
+            }
+
+            if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task &&
+                slot.task->params.rerot_effective(slot.task->type)) {
+                // The context-level memory registry currently executes one
+                // RERoT visibility domain at a time. Keep additional outer
+                // n_cmpl/concurrent roots parked at their completed prelude;
+                // completion/abort starts the next root without re-prefill.
+                if (rerot_active()) {
+                    return;
+                }
+                if (!rerot_start_root(slot)) {
+                    send_error(slot, "failed to start RERoT episode", ERROR_TYPE_SERVER);
+                    slot.release();
+                    rerot_ok = false;
+                }
+                return;
+            }
+
+            if (slot.state == SLOT_STATE_GENERATING && slot.rerot_internal &&
+                slot.rerot_inflight_plan.has_value()) {
+                const uint64_t episode_id = slot.rerot_episode_id;
+                if (!rerot_commit_inflight(slot)) {
+                    rerot_ok = false;
+                    return;
+                }
+                rerot_committed_episodes.insert(episode_id);
+            }
+        });
+
+        if (rerot_ok) {
+            for (const uint64_t episode_id : rerot_committed_episodes) {
+                if (!rerot_handle_finished_frontier(episode_id)) {
+                    rerot_ok = false;
+                    break;
+                }
+            }
+        }
+
+        if (!rerot_ok) {
+            rerot_propagate_hard_abort();
+            return;
+        } else {
+            iterate(slots, [&](server_slot & slot) {
+                if (slot.rerot_internal && slot.task && slot.task->params.rerot_trace) {
+                    SRV_INF("rerot.trace.post_sample_check: episode=%" PRIu64
+                            " node=%u state=%d i_batch=%d off=%d n=%d inside=%d injection=%d serial=%d\n",
+                        slot.rerot_episode_id, slot.rerot_node_id, slot.state,
+                        slot.i_batch, off, n_batch_tokens,
+                        is_inside_view(slot.i_batch) ? 1 : 0,
+                        static_cast<int>(slot.rerot_injection),
+                        slot.rerot_serial_tail ? 1 : 0);
+                }
+                if (!slot.rerot_internal || slot.state != SLOT_STATE_GENERATING ||
+                    !is_inside_view(slot.i_batch)) {
+                    return;
+                }
+
+                if (slot.rerot_injection != server_rerot_injection_kind::none) {
+                    slot.i_batch = -1;
+                    return;
+                }
+
+                const auto * episode = rerot ? rerot->episode(slot.rerot_episode_id) : nullptr;
+                const auto * logical = episode
+                    ? episode->document.node(slot.rerot_node_id)
+                    : nullptr;
+                if (!episode || !logical || episode->hard_aborted ||
+                    logical->state == llama_rerot_node_state::forked ||
+                    logical->state == llama_rerot_node_state::retired) {
+                    if (slot.task && slot.task->params.rerot_trace) {
+                        SRV_INF("rerot.trace.post_sample_skip: episode=%" PRIu64
+                                " node=%u episode=%d hard_abort=%d logical_state=%d\n",
+                            slot.rerot_episode_id, slot.rerot_node_id,
+                            episode ? 1 : 0,
+                            episode && episode->hard_aborted ? 1 : 0,
+                            logical ? static_cast<int>(logical->state) : -1);
+                    }
+                    return;
+                }
+
+                const int tok_idx = slot.i_batch - off;
+                if (!rerot_sample_slot(slot, tok_idx)) {
+                    rerot_ok = false;
+                }
+            });
+            if (!rerot_ok) {
+                rerot_propagate_hard_abort();
+                return;
+            }
+        }
+
         auto accept_special_token = [&](server_slot & slot, llama_token token) {
             return params_base.special ||
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
@@ -4631,6 +6581,12 @@ private:
         };
 
         iterate(slots, [&](server_slot & slot) {
+            if (slot.rerot_internal ||
+                (slot.state == SLOT_STATE_DONE_PROMPT && slot.task &&
+                 slot.task->params.rerot_effective(slot.task->type))) {
+                return;
+            }
+
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
                 if (slot.task->params.stream && slot.task->params.return_progress && slot.n_decoded_start == 0) {
@@ -4736,6 +6692,24 @@ private:
         // speculative decoding - main model sample and accept
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
+                return;
+            }
+
+            // RERoT MTP epoch invalidation (§A.6): a draft bound to an old
+            // view stamp must not verify against new shared memory. Drop it,
+            // restore the checkpoint, and re-draft next frontier. OFF: false.
+            if (rerot_owns_slot(slot.id) && slot.rerot_has_draft_stamp && ctx_tgt != nullptr &&
+                llama_rerot_mtp_is_stale(ctx_tgt, slot.id, &slot.rerot_draft_stamp)) {
+                slot.spec_ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (slot.ctx_dft) {
+                    slot.spec_ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                }
+                common_speculative_set_state(spec.get(), slot.id, slot.spec_ckpt.data_spec);
+                slot.mem.seq_rm(slot.id, slot.spec_ckpt.pos_max + 1, -1);
+                slot.prompt.tokens.keep_first(slot.spec_ckpt.n_tokens);
+                slot.spec_draft.clear();
+                slot.spec_i_batch.clear();
+                slot.rerot_has_draft_stamp = false;
                 return;
             }
 
@@ -5055,6 +7029,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     meta->slot_n_ctx,
                     meta->logit_bias_eog,
                     data);
+            server_rerot_apply_request_json(task, data, params);
+
+            std::string rerot_error;
+            if (!server_rerot_validate_task(task, rerot_error)) {
+                throw std::invalid_argument(rerot_error);
+            }
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
 
@@ -5444,6 +7424,48 @@ void server_routes::init_routes() {
                             << "# TYPE llamacpp:" << name << " " << type  << "\n"
                             << "llamacpp:"        << name << " " << value << "\n";
             }
+        }
+
+        if (!res_task->rerot.empty()) {
+            const auto emit_rerot = [&prometheus](
+                    const char * type,
+                    const char * name,
+                    const char * help,
+                    const auto & value) {
+                prometheus << "# HELP llamacpp:" << name << " " << help << "\n"
+                           << "# TYPE llamacpp:" << name << " " << type << "\n"
+                           << "llamacpp:" << name << " " << value << "\n";
+            };
+            const auto & r = res_task->rerot;
+            emit_rerot("counter", "rerot_episode_total", "RERoT episodes started.", r.episode_total);
+            emit_rerot("gauge", "rerot_episode_active", "RERoT episodes currently active.", r.episode_active);
+            emit_rerot("counter", "rerot_nodes_created", "RERoT logical nodes created.", r.nodes_created);
+            emit_rerot("counter", "rerot_nodes_started", "RERoT logical nodes admitted to execution.", r.nodes_started);
+            emit_rerot("counter", "rerot_nodes_retired", "RERoT logical nodes retired.", r.nodes_retired);
+            emit_rerot("counter", "rerot_nodes_queued", "RERoT logical nodes enqueued.", r.nodes_queued);
+            emit_rerot("gauge", "rerot_queue_max", "Largest observed RERoT ready queue.", r.queue_max);
+            emit_rerot("counter", "rerot_forks_total", "RERoT fork publications.", r.forks_total);
+            emit_rerot("gauge", "rerot_max_depth", "Largest observed RERoT tree depth.", r.max_depth);
+            emit_rerot("gauge", "rerot_max_live_lanes", "Largest observed concurrent RERoT Lane count.", r.max_live_lanes);
+            emit_rerot("counter", "rerot_public_tokens", "RERoT PUBLIC tokens committed.", r.public_tokens);
+            emit_rerot("counter", "rerot_private_tokens", "RERoT PRIVATE control tokens committed.", r.private_tokens);
+            emit_rerot("counter", "rerot_pending_tokens", "RERoT PENDING record tokens committed.", r.pending_tokens);
+            emit_rerot("counter", "rerot_completed_episode_total", "RERoT episodes that produced a final response.", r.completed_episodes);
+            emit_rerot("counter", "rerot_completed_model_tokens", "Model-forward tokens committed by completed RERoT episodes; includes PUBLIC, PRIVATE, and PENDING tokens.", r.completed_model_tokens);
+            emit_rerot("counter", "rerot_parallel_model_tokens", "Model-forward tokens committed between first multi-Lane admission and the final acquire fence.", r.parallel_model_tokens);
+            emit_rerot("counter", "rerot_completed_episode_seconds", "RERoT episode wall time after prompt prefill; divide completed model tokens by this value for aggregate throughput.", r.completed_episode_seconds);
+            emit_rerot("counter", "rerot_parallel_seconds", "Multi-Lane phase wall time; divide parallel model tokens by this value for parallel aggregate throughput.", r.parallel_seconds);
+            emit_rerot("counter", "rerot_frontiers", "RERoT frontiers committed.", r.frontiers);
+            emit_rerot("counter", "rerot_topology_barriers", "RERoT topology barriers completed.", r.topology_barriers);
+            emit_rerot("counter", "rerot_refresh_total", "RERoT view refreshes completed.", r.refresh_total);
+            emit_rerot("counter", "rerot_mtp_invalidations", "RERoT-stale speculative drafts invalidated.", r.mtp_invalidations);
+            emit_rerot("counter", "rerot_context_shifts", "RERoT shared-log context shifts completed.", r.context_shifts);
+            emit_rerot("counter", "rerot_hard_aborts", "RERoT episodes atomically aborted.", r.hard_aborts);
+            emit_rerot("counter", "rerot_final_fences", "RERoT final acquire fences completed.", r.final_fences);
+            emit_rerot("counter", "rerot_span_count", "DDVR spans rendered for RERoT views.", r.span_count);
+            emit_rerot("counter", "rerot_parked_total", "RERoT recurrent lineages parked.", r.parked_total);
+            emit_rerot("counter", "rerot_archive_total", "RERoT public runs archived.", r.archive_total);
+            emit_rerot("counter", "rerot_ddvr_seconds", "Wall time spent building RERoT DDVR views.", r.ddvr_seconds);
         }
 
         // Labeled fallback counter is emitted separately because the compact

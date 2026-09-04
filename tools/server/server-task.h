@@ -3,10 +3,12 @@
 #include "common.h"
 #include "llama.h"
 
+#include <cstdint>
 #include <string>
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <vector>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -97,8 +99,86 @@ struct task_params {
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
 
+    // RERoT outer compatibility (§§18,26,A.13-A.20). Per-request overrides.
+    // Defaults come from the server-global common_params via
+    // apply_rerot_defaults() after schema eval (server-schema.cpp ignores
+    // unknown keys, so the post-step in server-common.cpp applies the raw
+    // request JSON). RERoT OFF: all false/strong, no allocation.
+    bool rerot_enabled = false;
+    llama_rerot_frontier_mode rerot_frontier = LLAMA_REROT_FRONTIER_STRONG;
+    bool rerot_trace = false; // explicit opt-in for rerot.trace.* SSE events; default off
+
+    // Fill rerot_* from the server-global base params. No-op when base OFF.
+    void apply_rerot_defaults(const common_params & base);
+    // Per-request static gate. Dynamic Tri/speculation/state compatibility is
+    // enforced by the active runtime; see common_rerot_validate_stage0.
+    // Embedding/rerank requests never enter
+    // RERoT (A.19) and pass with effective() == false, not an error.
+    // OFF requests always pass with no allocation.
+    bool rerot_validate_request(server_task_type task_type, bool has_media, std::string & error) const;
+    // Effective switch for this request (A.19): EMBEDDING/RERANK never enter
+    // RERoT even when globally enabled. Multimodal prompts stay effective:
+    // fork happens prelude-then-fork and DDVR never remaps visual positions.
+    bool rerot_effective(server_task_type task_type) const;
+
     json format_logit_bias(const std::vector<llama_logit_bias> & logit_bias) const;
     json to_json(bool only_metrics = false) const;
+};
+
+// RERoT episode key for ABA-safe runtime callbacks (§A.15). Every callback
+// carries (task id, episode id, generation); a callback whose key does not
+// match the current task state is stale (e.g. cancel/retry raced an in-flight
+// frontier commit) and must be dropped without touching KV.
+struct server_rerot_episode_key {
+    int task_id = -1;
+    uint64_t episode_id = 0;
+    uint64_t generation = 0;
+
+    bool valid() const {
+        return task_id >= 0 && episode_id != 0;
+    }
+    bool matches(int task, uint64_t episode, uint64_t gen) const {
+        return task_id == task && episode_id == episode && generation == gen;
+    }
+};
+
+// RERoT metrics suite (§A.26), additive to the existing Tri metrics.
+// Counters are cumulative for the process lifetime. All zero when RERoT OFF
+// (no runtime allocation, no metric emission: to_json omits the rerot block).
+struct server_rerot_metrics {
+    uint64_t episode_total = 0;
+    uint64_t episode_active = 0;
+    uint64_t nodes_created = 0;
+    uint64_t nodes_started = 0;
+    uint64_t nodes_retired = 0;
+    uint64_t nodes_queued = 0;
+    uint64_t queue_max = 0;
+    uint64_t forks_total = 0;
+    uint64_t max_depth = 0;
+    uint64_t max_live_lanes = 0;
+    uint64_t public_tokens = 0;
+    uint64_t private_tokens = 0;
+    uint64_t pending_tokens = 0;
+    uint64_t completed_episodes = 0;
+    uint64_t completed_model_tokens = 0;
+    uint64_t parallel_model_tokens = 0;
+    double completed_episode_seconds = 0.0;
+    double parallel_seconds = 0.0;
+    uint64_t frontiers = 0;
+    uint64_t topology_barriers = 0;
+    uint64_t refresh_total = 0;
+    uint64_t mtp_invalidations = 0;
+    uint64_t context_shifts = 0;
+    uint64_t hard_aborts = 0;
+    uint64_t final_fences = 0;
+    uint64_t span_count = 0;
+    uint64_t parked_total = 0;
+    uint64_t archive_total = 0;
+    double ddvr_seconds = 0.0;
+
+    bool empty() const;
+    json to_json() const;
+    void accumulate(const server_rerot_metrics & delta);
 };
 
 // struct for tracking the state of a task (e.g., for streaming)
@@ -110,6 +190,10 @@ struct task_result_state {
     std::string generated_text; // append new chunks of generated text here
     std::vector<std::string> generated_tool_call_ids;
     std::unordered_set<size_t> sent_tool_call_names;
+
+    // The first payload chunk owns the assistant role / message-start event.
+    // A begin marker only flushes HTTP headers and does not consume this flag.
+    bool stream_started = false;
 
     // for OpenAI Responses and Anthropic streaming API:
     // track output item / content block state across chunks
@@ -177,6 +261,35 @@ struct server_task {
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
 
+    // RERoT episode bookkeeping (A.13-A.15, §18). episode_id is the visibility
+    // domain: 0 = no episode assigned (RERoT OFF or not yet adopted). Each
+    // outer completion (this task plus each child from n_cmpl) owns an
+    // independent episode; different completions never share an episode id,
+    // while outer shared prompt cells stay shared as the untagged prefix.
+    // generation guards runtime callbacks against ABA across cancel/retry:
+    // stale callbacks carry an older generation and must be dropped.
+    uint64_t rerot_episode_id = 0;
+    uint64_t rerot_generation = 0;
+    // Exact last real user text for the private final-acquire instruction.
+    // This is never published as a RERoT run; the original prompt remains the
+    // causal source. Empty for non-chat/multimedia-only requests.
+    std::string rerot_original_user_text;
+
+    server_rerot_episode_key rerot_key() const;
+    bool rerot_key_matches(int task, uint64_t episode, uint64_t gen) const;
+    void rerot_bump_generation();
+    // Assign independent episode ids to this task and every child (A.13.1).
+    // Outer shared prompt cells stay shared; visibility diverges only after
+    // the fork point via distinct episode ids. No-op when params RERoT is not
+    // effective for this task type. Consumes ids from next_episode_id (never 0).
+    void assign_rerot_episodes(uint64_t & next_episode_id, uint64_t generation = 1);
+    // Response ownership (§18.3): the HTTP/SSE stream belongs to the outer
+    // completion task id, never to an internal lane. Internal lanes must map
+    // their output through this id and must never emit SSE/HTTP themselves.
+    int rerot_response_owner() const;
+    // Effective switch for this task instance (params + type gate, A.19).
+    bool rerot_effective() const;
+
     server_task() = default;
 
     server_task(server_task_type type) : type(type) {}
@@ -237,6 +350,12 @@ struct server_task {
         copy.tokens    = tokens.clone();
         copy.id_slot   = -1; // child tasks cannot specify slot
         copy.cache_key.clear();
+        // Outer n_cmpl isolation (A.13.1): the child starts with no episode.
+        // assign_rerot_episodes() gives parent and each child independent
+        // episode ids afterwards; episode 0 must never be shared.
+        copy.rerot_episode_id = 0;
+        copy.rerot_generation = rerot_generation;
+        copy.rerot_original_user_text = rerot_original_user_text;
 
         // use different sampling seed for each child
         // note: https://github.com/ggml-org/llama.cpp/pull/18700#discussion_r2675115723
@@ -438,6 +557,7 @@ struct server_task_result_cmpl_partial : server_task_result {
     std::string        oaicompat_cmpl_id;
     std::vector<common_chat_msg_diff> oaicompat_msg_diffs; // to be populated by update()
     bool is_updated = false;
+    bool first_chunk = false;
 
     // Streaming state copied from task_result_state for this chunk
     bool thinking_block_started = false;
@@ -555,12 +675,77 @@ struct server_task_result_metrics : server_task_result {
     uint64_t tri_hard_keep          = 0;
     uint64_t tri_shared_keep        = 0;
 
+    // RERoT metrics (§A.26), additive to Tri metrics. Empty (all zero) when
+    // RERoT OFF: to_json omits every rerot_* key, so OFF responses keep the
+    // exact pre-RERoT schema with no allocation for the rerot block.
+    server_rerot_metrics rerot;
+
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();
 
     virtual json to_json() override;
 };
+
+// --- RERoT outer-compat free helpers (defined in server-task.cpp unless noted) ---
+//
+// Ownership: episode scheduling, KV visibility, and the frozen llama_rerot_*
+// C-API (ContextGlue, include/llama.h) are consumed by
+// tools/server/server-rerot.*. The helpers below are the outer-compat surface
+// only: request plumbing (server-common.cpp), grammar/tool isolation, LoRA
+// inheritance, multimodal/embedding gates, response ownership, streaming trace
+// gating, cancellation fan-out, and metrics merging. Every helper early-outs
+// with no allocation when RERoT is not effective.
+
+// Apply raw request JSON rerot keys ("rerot", "rerot_frontier",
+// "rerot_trace") onto task.params after schema eval, starting from base
+// globals. Unknown/absent keys keep schema/base values. Defined in
+// server-common.cpp (request plumbing lives with the oaicompat parsers).
+void server_rerot_apply_request_json(server_task & task, const json & data, const common_params & base);
+
+// Validate the task's effective RERoT request (Stage-0 gates + A.19).
+// Defined in server-common.cpp.
+bool server_rerot_validate_task(const server_task & task, std::string & error);
+
+// Grammar isolation (§26/A.16.1): the planner <ol> constraint must never
+// pollute the user grammar. Save the user grammar before planner injection,
+// restore the stock tool/JSON path after the final fence.
+common_grammar server_rerot_take_user_grammar(task_params & params);
+void server_rerot_restore_user_grammar(task_params & params, const common_grammar & saved);
+// Tool execution is disabled during concurrent reasoning; only the final
+// acquire fence + serial tail restores the stock tool path (§26).
+bool server_rerot_tool_calls_allowed(bool serial_tail_done);
+
+// LoRA inheritance (A.17): all lanes share the root adapters; batching honors
+// the existing adapter constraints. Returns false + error on mismatch.
+bool server_rerot_check_lora_inheritance(
+    const std::vector<common_adapter_lora_info> & root_loras,
+    const std::vector<common_adapter_lora_info> & lane_loras,
+    std::string & error);
+bool server_rerot_can_batch_with(const task_params & a, const task_params & b);
+
+// Multimodal prelude-then-fork (A.18): fork is allowed only after the shared
+// multimodal prefill; DDVR never remaps visual positions. Returns false for
+// visual-remap attempts (unsupported-error at the call site).
+bool server_rerot_visual_remap_allowed();
+bool server_rerot_fork_ready(bool has_media, bool prelude_done);
+
+// Streaming (A.14): committed PUBLIC Lane text is emitted as complete
+// reasoning lines in actual completion order. PENDING/PRIVATE bytes never
+// enter client deltas; rerot.trace.* remains separate and explicitly opt-in.
+bool server_rerot_trace_allowed(const task_params & params);
+json server_rerot_trace_event(
+    const std::string & kind,
+    uint64_t episode_id,
+    uint64_t node_id,
+    uint64_t frontier,
+    const json & data = json::object());
+
+// Cancellation/retry fan-out (§A.15): collect every outer task id in the
+// episode rooted at root (root id + child ids). The runtime clears queued
+// children, parked lineage, pending XML, and episode KV refs atomically;
+// shared outer prompt refs survive when other requests still use them.
+std::vector<int> server_rerot_cancel_targets(const server_task & root);
 
 struct server_task_result_slot_save_load : server_task_result {
     std::string filename;

@@ -276,3 +276,476 @@ void gqaStore(const in uint32_t r, const in uint32_t c, const in O_TYPEV4 elems,
     uint32_t offset = (iq2 + r) * HSV / 4 + c;
     data_ov4[o_offset + offset] = D_TYPEV4(elems);
 }
+
+// ============================================================================
+// RERoT-DDVR indexed FlashAttention (fused variant, entry point rerot_main).
+//
+// Production contract (frozen with the CPU reference
+// ggml_compute_forward_flash_attn_ext_rerot in ggml/src/ggml-cpu/ops.cpp):
+//   * src0 q_groups F32 [D, n_groups, n_head] holds queries ALREADY rotated to
+//     their reader-relative effective phase by the graph
+//     (effective = query_virtual + storage_pos - virtual_pos, IMRoPE text
+//     position (p, p, p, 0); a TurboQuant build then applies forward WHT, so
+//     this kernel rotates nothing itself: re-deriving the delta in-shader
+//     would double-rotate. The buffers below ARE the DDVR spans in indexed
+//     form: entry = (physical key index, Q-group index)).
+//   * src3 entries I32 [2, n_entries], src4 offsets I32 [n_queries+1]: every
+//     entry of one query range shares ONE global online softmax (m, L, O
+//     accumulation across spans). The layout builder pre-filters entries to
+//     the strong-frontier visible set, so this kernel applies no mask.
+//   * Turbo2/3/4 + Q4/Q5/Q8/IQ4_NL K/V flow through dequantize4(), exactly
+//     like the ordinary scalar FA path (Q is pre-WHT when K is Turbo, per the
+//     frozen Q-side order RoPE -> WHT -> dot; K stays at writer storage
+//     phase; V is consumed as stored).
+//   * GQA via head-index division; head_dim padding flows through HSK/HSV
+//     (never assumed 128); sinks / logit-softcap mirror the ordinary path.
+//   * Single-row workgroups (host forces Br = 1). On subgroup-capable scalar
+//     pipelines D_split partitions K/V dimensions across cooperating lanes;
+//     devices that disable subgroups retain D_split = 1 and the shared tree.
+//
+// Build note: this block is scalar-module-only. Coopmat1 modules are excluded
+// via COOPMAT; coopmat2 modules enable GL_NV_cooperative_matrix2 before
+// including this file, which glslc predefines as a macro (the same idiom
+// flash_attn_cm2.comp itself uses for GL_NV_cooperative_matrix_decode_vector),
+// so they are excluded via that. Ordinary pipelines are unaffected: they use
+// entry point main(), never call rerot_main(), and leave RerotMode at 0.
+// ============================================================================
+#if !defined(COOPMAT) && !defined(COOPMAT2)
+
+// constant_id 16 appends the FA specialization list (see
+// get_fa_spec_constants): 0 = ordinary FA (default, so existing pipelines keep
+// working unchanged), 1 = RERoT-DDVR path (entry point rerot_main).
+layout (constant_id = 16) const uint32_t RerotMode = 0;
+
+// Q-group views (F32). Aliased at bindings 0/1/2 exactly like the quant views
+// in flash_attn_dequant.glsl; unique block names keep them distinct.
+layout (binding = 0) readonly buffer RQ_F32   { float     rerot_q[]; };
+layout (binding = 0) readonly buffer RQV4     { vec4      rerot_qv4[]; };
+// Direct F16 views for FaTypeK/V == F16 (USE_DECODE_* false), mirroring the
+// data_kv4 / data_vv4 declarations of flash_attn.comp.
+layout (binding = 1) readonly buffer RK_F16   { float16_t rerot_k[]; };
+layout (binding = 1) readonly buffer RK_F16V4 { f16vec4   rerot_kv4[]; };
+layout (binding = 2) readonly buffer RV_F16   { float16_t rerot_v[]; };
+layout (binding = 2) readonly buffer RV_F16V4 { f16vec4   rerot_vv4[]; };
+// DDVR span descriptors: entries[2*e+0] = physical key index,
+// entries[2*e+1] = Q-group index; offsets[q]..offsets[q+1] is query q's entry
+// range (one global softmax per range).
+layout (binding = 7) readonly buffer RE_ENTRIES { int rerot_entries[]; };
+layout (binding = 8) readonly buffer RO_OFFSETS { int rerot_offsets[]; };
+
+// Defined by flash_attn_dequant.glsl (included after this file in scalar
+// modules); declared here so rerot_main() below can reference it. Modules
+// without the definition never call rerot_main().
+FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx);
+
+// Push-constant overlay for rerot_main(): the SAME vk_flash_attn_push_constants
+// block (128 B, layout unchanged), reinterpreted as built by
+// ggml_vk_flash_attn_rerot(): N = n_queries, KV = n_kv_physical, ne1 = Dv,
+// ne2 = n_head_q, ne3 = n_queries, neq2 = n_head_q, nek2 = n_head_kv,
+// nev2 = n_head_v, nem1 = n_entries, nem2 = n_groups, nb01/nb02 = Q
+// group/head strides, nb11/nb12 and nb21/nb22 = K/V key/head strides in
+// ordinary units, k_num = entry-split count. max_bias/m0/m1 are unused
+// (no ALiBi/mask in the indexed op).
+
+// Horizontal sum in f32. RERoT forces f32 accumulation (the graph pins the op
+// to GGML_PREC_F32 and all quantized K/V already require it), so unlike the
+// ordinary path there is no f16acc variant to preserve.
+float rerot_hsum(vec4 a) {
+    return a.x + a.y + a.z + a.w;
+}
+
+vec4 rerot_load_k(const in uint key, const in uint dvec, const in uint k_stride, const in uint k_offset) {
+    if (USE_DECODE_K == false) {
+        return vec4(rerot_kv4[k_offset / 4u + key * k_stride / 4u + dvec]);
+    }
+    uint coord = key * k_stride * BLOCK_SIZE_K + 4u * dvec;
+    return vec4(dequantize4(coord / BLOCK_SIZE_K, coord % BLOCK_SIZE_K, k_offset, BINDING_IDX_K));
+}
+
+vec4 rerot_load_v(const in uint key, const in uint dvec, const in uint v_stride, const in uint v_offset) {
+    if (USE_DECODE_V == false) {
+        return vec4(rerot_vv4[v_offset / 4u + key * v_stride / 4u + dvec]);
+    }
+    uint coord = key * v_stride * BLOCK_SIZE_V + 4u * dvec;
+    return vec4(dequantize4(coord / BLOCK_SIZE_V, coord % BLOCK_SIZE_V, v_offset, BINDING_IDX_V));
+}
+
+// Shmem sized for the host-enforced single-row config: one staged Q row, one
+// staged K/V block reused for K then V, plus reduction scratch.
+const uint32_t REROT_Q_WORDS = HSK / 4u + 1u;
+const uint32_t REROT_D = HSK > HSV ? HSK : HSV;
+const uint32_t REROT_KV_STRIDE = REROT_D / 4u + 1u;
+const uint32_t REROT_NUM_SUBGROUPS = SubGroupSize == 0u ? 0u : WorkGroupSize / SubGroupSize;
+const uint32_t REROT_COL_GROUPS = WorkGroupSize / D_split;
+const uint32_t REROT_HSV4_PER_THREAD = (HSV / 4u + D_split - 1u) / D_split;
+shared vec4 rerot_qf[REROT_Q_WORDS];
+shared vec4 rerot_kvsh[SHMEM_STAGING != 0 ? Bc * REROT_KV_STRIDE : 1];
+shared float rerot_tmpsh[WorkGroupSize];
+shared vec4 rerot_tmpv4[WorkGroupSize];
+shared vec4 rerot_occlim[LIMIT_OCCUPANCY_SHMEM > 0 ? LIMIT_OCCUPANCY_SHMEM : 1];
+
+// Each D_split-lane group owns strided entry-columns. Every lane in a group
+// retains the group's scores but only its HSV/D_split output slice.
+const uint32_t REROT_MAXC = (Bc + REROT_COL_GROUPS - 1u) / REROT_COL_GROUPS;
+
+// Use -FLT_MAX/2 rather than -inf to reduce the possibility of NaNs, matching
+// the ordinary path's convention.
+const float REROT_NEG = -1.7014117e38;
+
+void rerot_main() {
+    if (RerotMode != 1u) {
+        return;
+    }
+#ifdef NEEDS_INIT_IQ_SHMEM
+    if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
+        init_iq_shmem(gl_WorkGroupSize);
+    }
+#endif
+
+    const uint tid = gl_LocalInvocationIndex;
+    const uint WGS = gl_WorkGroupSize.x;
+    const uint d_tid = tid % D_split;
+    const uint col_group = tid / D_split;
+
+    if (LIMIT_OCCUPANCY_SHMEM > 0) {
+        // Same occupancy-throttle idiom as the ordinary path.
+        rerot_occlim[tid] = vec4(float(tid));
+
+        barrier();
+
+        if (rerot_occlim[tid] == vec4(99999.0)) {
+            data_ov4[0] = D_TYPEV4(rerot_occlim[tid]);
+        }
+    }
+
+    // Grid: x = n_queries * n_splits, y = n_head_q, z = 1 (Br = 1: one query
+    // row per workgroup; heads are unfolded, GQA maps h -> kv head below).
+    const uint S = p.k_num > 0u ? p.k_num : 1u;
+    const uint q = gl_WorkGroupID.x / S;
+    const uint s = gl_WorkGroupID.x % S;
+    const uint h = gl_WorkGroupID.y;
+    if (q >= p.N || h >= p.neq2) {
+        return;
+    }
+
+    const uint gqa_div = (p.nek2 > 0u) ? (p.neq2 / p.nek2) : 1u;
+    const uint vdiv    = (p.nev2 > 0u) ? (p.neq2 / p.nev2) : 1u;
+    const uint kh = (gqa_div > 0u) ? (h / gqa_div) : h;
+    const uint vh = (vdiv    > 0u) ? (h / vdiv)    : h;
+
+    // This query's global entry range, split across entry-splits. Splits of an
+    // empty range stay empty; their partials (L = 0) are identity elements for
+    // the split-K reduce.
+    const int off_b = rerot_offsets[q];
+    const int off_e = rerot_offsets[q + 1u];
+    const uint len  = (off_e > off_b && off_b >= 0) ? uint(off_e - off_b) : 0u;
+    const uint base = (off_b > 0) ? uint(off_b) : 0u;
+    const uint chunk = (len + S - 1u) / S;
+    const uint my_b = base + s * chunk;
+    const uint my_e = min(base + len, base + (s + 1u) * chunk);
+
+    const uint HSK4 = HSK / 4u;
+    const uint HSV4 = HSV / 4u;
+    const uint q_grp_stride = p.nb01 / 4u;
+    const uint k_stride = p.nb11;
+    const uint v_stride = p.nb21;
+    const uint k_offset = (kh * p.nb12) / FaBlockBytesK;
+    const uint v_offset = (vh * p.nb22) / FaBlockBytesV;
+
+    // Single-row online accumulators: one global softmax over the whole entry
+    // range (never per-span/per-block softmax).
+    float Lf = 0.0f;
+    float Mf = REROT_NEG;
+    vec4 Of[REROT_HSV4_PER_THREAD];
+    for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+        Of[di] = vec4(0.0);
+    }
+
+    float scol[REROT_MAXC];
+    bool cvalid[REROT_MAXC];
+
+    // Group runs: entries of one Q-group share the staged Q row, so each run
+    // stages Q once. Run detection is uniform across the workgroup.
+    uint run_b = my_b;
+    while (run_b < my_e) {
+        const uint g = uint(rerot_entries[2u * run_b + 1u]);
+        uint run_e = run_b + 1u;
+        while (run_e < my_e && uint(rerot_entries[2u * run_e + 1u]) == g) {
+            ++run_e;
+        }
+        // Out-of-range groups are excluded (treated as -inf); the layout
+        // builder never emits them, this only guards against garbage.
+        const bool run_ok = (g < p.nem2);
+
+        if (run_ok) {
+            const uint q_base = g * q_grp_stride + (h * p.nb02) / 4u;
+            for (uint d = tid; d < HSK4; d += WGS) {
+                rerot_qf[d] = rerot_qv4[q_base + d] * p.scale;
+            }
+        }
+        barrier();
+
+        for (uint b = run_b; b < run_e; b += Bc) {
+            const uint b_end = min(b + Bc, run_e);
+
+            if (SHMEM_STAGING != 0) {
+                barrier();
+                for (uint idx = tid; idx < Bc * HSK4; idx += WGS) {
+                    const uint c = idx / HSK4;
+                    const uint d = idx % HSK4;
+                    const uint e = b + c;
+                    vec4 Kv = vec4(0.0);
+                    if (e < b_end && run_ok) {
+                        const uint key = uint(rerot_entries[2u * e]);
+                        if (KV_bounds_check == false || key < p.KV) {
+                            Kv = rerot_load_k(key, d, k_stride, k_offset);
+                        }
+                    }
+                    rerot_kvsh[c * REROT_KV_STRIDE + d] = Kv;
+                }
+                barrier();
+            }
+
+            // D_split lanes cooperate on each strided-owned column. This keeps
+            // each lane's K dot and V accumulator slice small enough to stay
+            // in registers at the 256-dimensional production head size.
+            uint ncol = 0u;
+            for (uint c = col_group; c < Bc; c += REROT_COL_GROUPS) {
+                const uint e = b + c;
+                float sc = REROT_NEG;
+                bool ok = false;
+                if (e < b_end && run_ok) {
+                    const uint key = uint(rerot_entries[2u * e]);
+                    if (KV_bounds_check == false || key < p.KV) {
+                        vec4 acc = vec4(0.0);
+                        if (SHMEM_STAGING != 0) {
+                            for (uint d = d_tid; d < HSK4; d += D_split) {
+                                acc = fma(rerot_qf[d], rerot_kvsh[c * REROT_KV_STRIDE + d], acc);
+                            }
+                        } else {
+                            for (uint d = d_tid; d < HSK4; d += D_split) {
+                                acc = fma(rerot_qf[d], rerot_load_k(key, d, k_stride, k_offset), acc);
+                            }
+                        }
+                        sc = rerot_hsum(acc);
+                        if (SubGroupSize > 0u) {
+                            for (uint st = 1u; st < D_split; st <<= 1u) {
+                                sc += subgroupShuffleXor(sc, st);
+                            }
+                        }
+                        if (LOGIT_SOFTCAP) {
+                            sc = p.logit_softcap * tanh(sc);
+                        }
+                        ok = true;
+                    }
+                }
+                scol[ncol] = sc;
+                cvalid[ncol] = ok;
+                ++ncol;
+            }
+
+            // Block max across threads. Subgroups collapse each wave first,
+            // leaving only one shared value per subgroup; devices that
+            // disable subgroups retain the full shared-memory tree.
+            float local_max = REROT_NEG;
+            for (uint t = 0u; t < ncol; ++t) {
+                local_max = max(local_max, scol[t]);
+            }
+            float bmax = REROT_NEG;
+            if (SubGroupSize > 0u) {
+                for (uint st = 1u; st < SubGroupSize; st <<= 1u) {
+                    local_max = max(local_max, subgroupShuffleXor(local_max, st));
+                }
+                barrier();
+                if (gl_SubgroupInvocationID == 0u) {
+                    rerot_tmpsh[gl_SubgroupID] = local_max;
+                }
+                barrier();
+                bmax = rerot_tmpsh[0];
+                for (uint sg = 1u; sg < REROT_NUM_SUBGROUPS; ++sg) {
+                    bmax = max(bmax, rerot_tmpsh[sg]);
+                }
+            } else {
+                barrier();
+                rerot_tmpsh[tid] = local_max;
+                barrier();
+                for (uint st = WGS / 2u; st > 0u; st >>= 1u) {
+                    if (tid < st) {
+                        rerot_tmpsh[tid] = max(rerot_tmpsh[tid], rerot_tmpsh[tid + st]);
+                    }
+                    barrier();
+                }
+                bmax = rerot_tmpsh[0];
+            }
+            const float Mold = Mf;
+            Mf = max(bmax, Mold);
+            const float eM = exp(Mold - Mf);
+            Lf *= eM;
+            for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+                Of[di] *= eM;
+            }
+
+            if (SHMEM_STAGING != 0) {
+                barrier();
+                for (uint idx = tid; idx < Bc * HSV4; idx += WGS) {
+                    const uint c = idx / HSV4;
+                    const uint d = idx % HSV4;
+                    const uint e = b + c;
+                    vec4 Vv = vec4(0.0);
+                    if (e < b_end && run_ok) {
+                        const uint key = uint(rerot_entries[2u * e]);
+                        if (KV_bounds_check == false || key < p.KV) {
+                            Vv = rerot_load_v(key, d, v_stride, v_offset);
+                        }
+                    }
+                    rerot_kvsh[c * REROT_KV_STRIDE + d] = Vv;
+                }
+                barrier();
+            }
+
+            uint t = 0u;
+            for (uint c = col_group; c < Bc; c += REROT_COL_GROUPS) {
+                const uint e = b + c;
+                const float Pw = cvalid[t] ? exp(scol[t] - Mf) : 0.0;
+                ++t;
+                if (d_tid == 0u) {
+                    Lf += Pw;
+                }
+                const vec4 Pwv = vec4(Pw);
+                for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+                    const uint d = di * D_split + d_tid;
+                    if (d >= HSV4) {
+                        continue;
+                    }
+                    vec4 Vv;
+                    if (SHMEM_STAGING != 0) {
+                        Vv = rerot_kvsh[c * REROT_KV_STRIDE + d];
+                    } else {
+                        Vv = vec4(0.0);
+                        if (e < b_end && run_ok) {
+                            const uint key = uint(rerot_entries[2u * e]);
+                            if (KV_bounds_check == false || key < p.KV) {
+                                Vv = rerot_load_v(key, d, v_stride, v_offset);
+                            }
+                        }
+                    }
+                    Of[di] = fma(Pwv, Vv, Of[di]);
+                }
+            }
+        }
+
+        barrier();
+        run_b = run_e;
+    }
+
+    // Every block max was workgroup-wide, so Mf is already identical across
+    // threads. Reduce only the disjoint L/O column partials.
+    if (SubGroupSize > 0u) {
+        for (uint st = 1u; st < SubGroupSize; st <<= 1u) {
+            Lf += subgroupShuffleXor(Lf, st);
+        }
+        barrier();
+        if (gl_SubgroupInvocationID == 0u) {
+            rerot_tmpsh[gl_SubgroupID] = Lf;
+        }
+        barrier();
+        Lf = rerot_tmpsh[0];
+        for (uint sg = 1u; sg < REROT_NUM_SUBGROUPS; ++sg) {
+            Lf += rerot_tmpsh[sg];
+        }
+
+        for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+            for (uint st = D_split; st < SubGroupSize; st <<= 1u) {
+                Of[di] += subgroupShuffleXor(Of[di], st);
+            }
+            barrier();
+            if (gl_SubgroupInvocationID == d_tid) {
+                rerot_tmpv4[gl_SubgroupID * D_split + d_tid] = Of[di];
+            }
+            barrier();
+            Of[di] = rerot_tmpv4[d_tid];
+            for (uint sg = 1u; sg < REROT_NUM_SUBGROUPS; ++sg) {
+                Of[di] += rerot_tmpv4[sg * D_split + d_tid];
+            }
+        }
+    } else {
+        barrier();
+        rerot_tmpsh[tid] = Lf;
+        barrier();
+        for (uint st = WGS / 2u; st > 0u; st >>= 1u) {
+            if (tid < st) {
+                rerot_tmpsh[tid] += rerot_tmpsh[tid + st];
+            }
+            barrier();
+        }
+        Lf = rerot_tmpsh[0];
+
+        for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+            barrier();
+            rerot_tmpv4[tid] = Of[di];
+            barrier();
+            for (uint st = WGS / 2u; st > 0u; st >>= 1u) {
+                if (tid < st) {
+                    rerot_tmpv4[tid] += rerot_tmpv4[tid + st];
+                }
+                barrier();
+            }
+            Of[di] = rerot_tmpv4[0];
+        }
+    }
+
+    if (S == 1u && (p.mask_n_head_log2 & SINK_ENABLE_BIT) != 0u) {
+        // Sink handling mirrors the ordinary path (split-K + sinks forces the
+        // single-split path host-side, so the reduce never sees sinks).
+        const float sink = float(data_s[h]);
+        float ms = 1.0f;
+        float vs = 1.0f;
+        if (sink > Mf) {
+            ms = exp(Mf - sink);
+            for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+                Of[di] *= ms;
+            }
+        } else {
+            vs = exp(sink - Mf);
+        }
+        Lf = Lf * ms + vs;
+    }
+
+    // Empty ranges (Lf == 0) yield zeros, matching the CPU reference.
+    const float rcp = (Lf == 0.0f) ? 0.0f : (1.0f / Lf);
+
+    if (S == 1u) {
+        // Contiguous dst [Dv, n_head_q, n_queries] (asserted host-side).
+        const uint o_base = ((q * p.ne2) + h) * HSV4;
+        if (col_group == 0u) {
+            for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+                const uint d = di * D_split + d_tid;
+                if (d < HSV4) {
+                    data_ov4[o_base + d] = D_TYPEV4(Of[di] * rcp);
+                }
+            }
+        }
+        return;
+    }
+
+    // Entry-split partials in flash_attn_split_k_reduce layout with flattened
+    // rows n = h + n_head_q * q (ne1 = n_queries * n_head_q, ne2 = ne3 = 1).
+    const uint Nflat = p.ne2 * p.N;
+    const uint n = h + p.ne2 * q;
+    const uint o_base = HSV * Nflat * s + HSV * n;
+    if (col_group == 0u) {
+        for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+            const uint d = di * D_split + d_tid;
+            if (d < HSV4) {
+                data_ov4[o_base / 4u + d] = D_TYPEV4(Of[di]);
+            }
+        }
+    }
+    if (tid == 0u) {
+        const uint lm_base = HSV * Nflat * S + 2u * Nflat * s + n;
+        data_o[lm_base] = D_TYPE(Lf);
+        data_o[lm_base + Nflat] = D_TYPE(Mf);
+    }
+}
+
+#endif // !defined(COOPMAT) && !defined(GL_NV_cooperative_matrix2)

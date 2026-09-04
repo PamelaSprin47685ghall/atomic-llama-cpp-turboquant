@@ -1,5 +1,7 @@
 #version 450
 
+#define COOPMAT2 1
+
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
 

@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "llama-cparams.h"
+#include "llama-rerot.h"
 
 #include <bitset>
 #include <cassert>
@@ -51,6 +52,7 @@ public:
             ext[i].reset();
             shift[i] =  0;
             seq[i].reset();
+            rerot[i].reset();
         }
 
         has_shift = false;
@@ -80,6 +82,7 @@ public:
         ext.resize(n);
         shift.resize(n);
         seq.resize(n);
+        rerot.resize(n);
 
         reset();
     }
@@ -145,6 +148,7 @@ public:
             res.pos[j] = pos[idx];
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
+            res.rerot[j] = rerot[idx];
 
             assert(shift[idx] == 0);
         }
@@ -164,6 +168,7 @@ public:
             res.pos[j] = pos[idx];
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
+            res.rerot[j] = rerot[idx];
 
             assert(shift[idx] == 0);
         }
@@ -193,6 +198,7 @@ public:
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
+            rerot[idx] = other.rerot[j];
 
             if (pos[idx] != -1) {
                 seq_pos_add(i + j);
@@ -224,6 +230,7 @@ public:
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
+            rerot[idx] = other.rerot[j];
 
             if (pos[idx] != -1) {
                 seq_pos_add(idx);
@@ -244,6 +251,7 @@ public:
         pos[i] = -1;
         ext[i].reset();
         shift[i] = 0;
+        rerot[i].reset();
 
         used.erase(i);
     }
@@ -287,6 +295,7 @@ public:
         std::vector<llama_kv_cell_ext> saved_ext  (n);
         std::vector<seq_set_t>         saved_seq  (n);
         std::vector<llama_pos>         saved_shift(n);
+        std::vector<llama_kv_rerot_meta> saved_rerot(n);
 
         uint32_t dst = 0;
         for (const auto & move : plan.moves) {
@@ -296,6 +305,7 @@ public:
                 saved_ext  [dst] = ext  [src];
                 saved_seq  [dst] = seq  [src];
                 saved_shift[dst] = shift[src];
+                saved_rerot[dst] = rerot[src];
                 ++dst;
             }
         }
@@ -307,6 +317,7 @@ public:
             pos  [idx] = -1;
             ext  [idx].reset();
             shift[idx] =  0;
+            rerot[idx].reset();
         }
         used.clear();
 
@@ -316,6 +327,7 @@ public:
             ext  [i] = saved_ext  [i];
             seq  [i] = saved_seq  [i];
             shift[i] = saved_shift[i];
+            rerot[i] = saved_rerot[i];
             used.insert(i);
             seq_pos_add(i);
         }
@@ -336,6 +348,7 @@ public:
             pos[i] = -1;
             ext[i].reset();
             shift[i] = 0;
+            rerot[i].reset();
 
             used.erase(i);
 
@@ -366,6 +379,7 @@ public:
             pos[i] = -1;
             ext[i].reset();
             shift[i] = 0;
+            rerot[i].reset();
 
             used.erase(i);
 
@@ -469,6 +483,173 @@ public:
         return ext[i];
     }
 
+    const llama_kv_rerot_meta & rerot_get(uint32_t i) const {
+        assert(i < rerot.size());
+        return rerot[i];
+    }
+
+    // Attach a complete RERoT write tag to a non-empty cell. A zero episode id
+    // is reserved for ordinary KV and therefore clears the metadata.
+    void rerot_set(uint32_t i, llama_kv_rerot_meta meta) {
+        assert(i < rerot.size());
+        assert(pos[i] != -1);
+
+        if (!meta.active()) {
+            meta.reset();
+        } else {
+            assert(meta.node_id != LLAMA_REROT_NODE_INVALID);
+            assert(meta.run_id != LLAMA_REROT_RUN_INVALID);
+            assert(meta.visibility != llama_rerot_visibility::normal);
+            if (meta.visibility == llama_rerot_visibility::pending_record) {
+                assert(meta.publish_epoch == 0);
+            }
+        }
+        rerot[i] = meta;
+    }
+
+    void rerot_reset(uint32_t i) {
+        assert(i < rerot.size());
+        rerot[i].reset();
+    }
+
+    bool rerot_publish(
+            uint32_t i,
+            uint64_t episode_id,
+            llama_rerot_run_id run_id,
+            uint64_t publish_epoch) {
+        assert(i < rerot.size());
+
+        auto & meta = rerot[i];
+        if (pos[i] == -1 || publish_epoch == 0 || meta.episode_id != episode_id ||
+            meta.run_id != run_id || meta.visibility != llama_rerot_visibility::pending_record) {
+            return false;
+        }
+
+        meta.visibility = llama_rerot_visibility::public_live;
+        meta.publish_epoch = publish_epoch;
+        return true;
+    }
+
+    bool rerot_reclassify(
+            uint32_t i,
+            uint64_t episode_id,
+            llama_rerot_run_id run_id,
+            llama_rerot_visibility expected,
+            llama_rerot_visibility replacement,
+            uint64_t publish_epoch) {
+        assert(i < rerot.size());
+
+        auto & meta = rerot[i];
+        if (pos[i] == -1 || expected == llama_rerot_visibility::normal ||
+            replacement == llama_rerot_visibility::normal || meta.episode_id != episode_id ||
+            meta.run_id != run_id || meta.visibility != expected) {
+            return false;
+        }
+        if ((replacement == llama_rerot_visibility::public_live && publish_epoch == 0) ||
+            (replacement != llama_rerot_visibility::public_live && publish_epoch != 0)) {
+            return false;
+        }
+
+        meta.visibility = replacement;
+        meta.publish_epoch = replacement == llama_rerot_visibility::public_live ? publish_epoch : 0;
+        return true;
+    }
+
+    // Physical lookup of one logical run within this stream. Appends the
+    // physical indices of every resident (non-empty) cell whose RERoT
+    // metadata matches (episode_id, run_id), in ascending cell order.
+    // Returns the number of appended indices. This is the only sanctioned
+    // way to translate a stable run id to physical locations; callers must
+    // never cache the result across compaction, eviction, or restore.
+    uint32_t rerot_collect_run(
+            uint64_t episode_id,
+            llama_rerot_run_id run_id,
+            std::vector<uint32_t> & out) const {
+        if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID) {
+            return 0;
+        }
+
+        uint32_t count = 0;
+        for (const uint32_t i : used) {
+            const auto & meta = rerot[i];
+            if (meta.episode_id == episode_id && meta.run_id == run_id) {
+                out.push_back(i);
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    // True when any resident cell carries RERoT metadata. Used by the v1
+    // persistence guard: such classification has no stable serialized form.
+    bool rerot_has_active() const {
+        for (const uint32_t i : used) {
+            if (rerot[i].active()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // True when any resident cell referenced by seq_id carries RERoT metadata.
+    bool rerot_has_active_seq(llama_seq_id seq_id) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+
+        for (const uint32_t i : used) {
+            if (rerot[i].active() && seq[i].test(seq_id)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Attention-only archive freeze of one execution sequence (§7.2). Every
+    // resident cell referenced by exec_seq is visited: PUBLIC_LIVE cells of
+    // episode_id gain archive_seq as a keeper ref (when not already present)
+    // so their K/V survives; PRIVATE/PENDING/ordinary cells gain no new ref.
+    // All exec_seq refs are then removed, freeing the execution handle
+    // without moving any K/V data or touching visibility metadata. Returns
+    // the number of public cells now kept alive by archive_seq.
+    // Note: ordinary shared-prefix cells survive only when archive_seq
+    // already references them (the caller archives the serial prefix
+    // separately); cells left without any seq ref are freed, which is the
+    // intended release for private/pending history.
+    size_t rerot_freeze_to_archive(
+            uint64_t episode_id,
+            llama_seq_id exec_seq,
+            llama_seq_id archive_seq) {
+        assert(episode_id != 0);
+        assert(exec_seq >= 0 && exec_seq < LLAMA_MAX_SEQ);
+        assert(archive_seq >= 0 && archive_seq < LLAMA_MAX_SEQ);
+        assert(exec_seq != archive_seq);
+
+        std::vector<uint32_t> touched;
+        for (const uint32_t i : used) {
+            if (seq[i].test(exec_seq)) {
+                touched.push_back(i);
+            }
+        }
+
+        size_t kept = 0;
+        for (const uint32_t i : touched) {
+            const auto & meta = rerot[i];
+            const bool keep = meta.active() && meta.episode_id == episode_id &&
+                meta.visibility == llama_rerot_visibility::public_live &&
+                meta.publish_epoch != 0;
+
+            if (keep) {
+                if (!seq[i].test(archive_seq)) {
+                    seq[i].set(archive_seq);
+                    seq_pos_inc(archive_seq, pos[i]);
+                }
+                ++kept;
+            }
+
+            seq_rm(i, exec_seq);
+        }
+        return kept;
+    }
+
     // note: call only if the cell is not empty
     llama_pos get_shift(uint32_t i) const {
         assert(i < pos.size());
@@ -493,6 +674,7 @@ public:
         assert(seq[i].none());
 
         pos[i] = p;
+        rerot[i].reset();
 
         used.insert(i);
     }
@@ -520,6 +702,7 @@ public:
             seq[i].reset();
             pos[i] = -1;
             shift[i] = 0;
+            rerot[i].reset();
 
             used.erase(i);
 
@@ -582,6 +765,11 @@ private:
 
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;
+
+    // RERoT metadata is part of the physical cell lifecycle. It must never be
+    // mirrored in server-side physical-index tables because TriAttention
+    // compaction can move cells.
+    std::vector<llama_kv_rerot_meta> rerot;
 
     // the set seq_pos[s][p] tells us how many times the position p is currently present for sequence s
     // if the position p is not present, seq_pos[s][p] is not set

@@ -159,6 +159,22 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-batch-alloc.cpp)
     llama_build_and_test(test-kv-cells.cpp)
+    llama_build_and_test(test-rerot-view.cpp)
+    target_include_directories(test-rerot-view PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-rerot-ddvr.cpp)
+    target_include_directories(test-rerot-ddvr PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-rerot-recurrent.cpp)
+    target_include_directories(test-rerot-recurrent PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test-rerot-recurrent PRIVATE llama)
+    llama_build_and_test(test-rerot-attn.cpp)
+    llama_build_and_test(test-rerot-parser.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-rerot.cpp)
+    target_include_directories(test-rerot-parser PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
+    llama_build_and_test(test-rerot-runtime.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-rerot.cpp)
+    target_include_directories(test-rerot-runtime PRIVATE
+        ${PROJECT_SOURCE_DIR}/src
+        ${PROJECT_SOURCE_DIR}/tools/server)
     llama_build_and_test(test-triattention-score.cpp)
     target_include_directories(test-triattention-score PRIVATE ${PROJECT_SOURCE_DIR}/src)
 

@@ -977,6 +977,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_FLASH_ATTN_EXT_BANDED: {
                 split_state = handle_flash_attn_ext_banded(src_ss);
             } break;
+            case GGML_OP_FLASH_ATTN_EXT_REROT: {
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
             case GGML_OP_FLASH_ATTN_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;

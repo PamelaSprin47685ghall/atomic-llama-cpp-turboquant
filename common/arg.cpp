@@ -926,6 +926,32 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         ));
     }
 
+    // RERoT static gate (§§18,26,A.13-A.20). OFF: no-op, no allocation.
+    // Dynamic Tri/speculation/state compatibility is server-runtime owned.
+    if (params.rerot_enabled) {
+        const common_rerot_gate gate = common_rerot_validate_stage0(params);
+        if (!gate.warning.empty()) {
+            LOG_WRN("%s\n", gate.warning.c_str());
+        }
+        if (!gate.ok) {
+            throw std::invalid_argument(string_format("error: %s\n", gate.error.c_str()));
+        }
+        // Auto-fit reserve accounting (A.12): worst-case RERoT scratch is
+        // added to the per-device reserve by the fit path via
+        // common_rerot_scratch_reserve_bytes(). Touch it here so the CLI
+        // translation unit references the accounting helper directly.
+        const size_t rerot_reserve = common_rerot_scratch_reserve_bytes(params);
+        (void) rerot_reserve;
+        if (params.rerot_trace) {
+            LOG_WRN("RERoT lane-trace events enabled (--rerot-trace); internal lane text is emitted only as rerot.trace.* events, never as content deltas\n");
+        }
+    } else if (params.rerot_trace) {
+        // Defensive: trace without reasoning is meaningless; keep OFF zero-regression
+        // by ignoring the flag rather than enabling the runtime.
+        LOG_WRN("warning: --rerot-trace without --rerot has no effect; RERoT stays OFF\n");
+        params.rerot_trace = false;
+    }
+
     return true;
 }
 
@@ -1657,6 +1683,40 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.triattention_ratio = ratio;
         }
     ).set_env("LLAMA_ARG_TRIATTENTION_RATIO").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--rerot"},
+        "enable Recursive Elastic Ring-of-Thought shared-memory reasoning (requires --kv-unified; "
+        "parallel frontiers pause speculative draft and active unsupported state operations fail closed)",
+        [](common_params & params) {
+            params.rerot_enabled = true;
+            params.kv_unified = true;
+        }
+    ).set_env("LLAMA_ARG_REROT").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--rerot-frontier"}, "strong|lag1",
+        string_format("RERoT frontier visibility mode (default: %s; implies --rerot)",
+            llama_rerot_frontier_mode_name(params.rerot_frontier)),
+        [](common_params & params, const std::string & value) {
+            if (value == "strong") {
+                params.rerot_frontier = LLAMA_REROT_FRONTIER_STRONG;
+            } else if (value == "lag1") {
+                params.rerot_frontier = LLAMA_REROT_FRONTIER_LAG1;
+            } else {
+                throw std::invalid_argument("RERoT frontier mode must be 'strong' or 'lag1'");
+            }
+            params.rerot_enabled = true;
+            params.kv_unified = true;
+        }
+    ).set_env("LLAMA_ARG_REROT_FRONTIER").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--rerot-trace"},
+        "emit optional RERoT lane-trace SSE events (rerot.trace.*); default off, streaming stays a single finish event + [DONE] (implies --rerot)",
+        [](common_params & params) {
+            params.rerot_enabled = true;
+            params.kv_unified = true;
+            params.rerot_trace = true;
+        }
+    ).set_env("LLAMA_ARG_REROT_TRACE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(

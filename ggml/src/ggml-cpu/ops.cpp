@@ -9280,6 +9280,151 @@ void ggml_compute_forward_flash_attn_ext(
     }
 }
 
+void ggml_compute_forward_flash_attn_ext_rerot(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q       = dst->src[0];
+    const ggml_tensor * k       = dst->src[1];
+    const ggml_tensor * v       = dst->src[2];
+    const ggml_tensor * entries = dst->src[3];
+    const ggml_tensor * offsets = dst->src[4];
+    const ggml_tensor * sinks   = dst->src[5];
+
+    GGML_ASSERT(q && k && v && entries && offsets);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(entries->type == GGML_TYPE_I32 && entries->ne[0] == 2);
+    GGML_ASSERT(offsets->type == GGML_TYPE_I32 && ggml_is_vector(offsets));
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(k->ne[1] == v->ne[1]);
+    GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1 && dst->ne[3] == 1);
+
+    const int64_t DK        = k->ne[0];
+    const int64_t DV        = v->ne[0];
+    const int64_t n_kv      = k->ne[1];
+    const int64_t n_head    = q->ne[2];
+    const int64_t n_head_k  = k->ne[2];
+    const int64_t n_head_v  = v->ne[2];
+    const int64_t n_queries = offsets->ne[0] - 1;
+    const int64_t n_entries = entries->ne[1];
+
+    GGML_ASSERT(dst->ne[0] == DV && dst->ne[1] == n_head && dst->ne[2] == n_queries);
+    GGML_ASSERT(n_head % n_head_k == 0 && n_head % n_head_v == 0);
+
+    float scale = 1.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+
+    const ggml_type k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
+    const ggml_from_float_t q_to_vec_dot = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
+    const ggml_vec_dot_t kq_vec_dot = ggml_get_type_traits_cpu(k->type)->vec_dot;
+    const ggml_to_float_t v_to_float = ggml_get_type_traits(v->type)->to_float;
+
+    GGML_ASSERT(q_to_vec_dot && kq_vec_dot && "RERoT attention: unsupported K type");
+    GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float) && "RERoT attention: unsupported V type");
+
+    const size_t q_row_size = ggml_row_size(k_vec_dot_type, DK);
+    const size_t q_row_padded = GGML_PAD(q_row_size, CACHE_LINE_SIZE);
+    const size_t accum_bytes = size_t(DV) * sizeof(float);
+    const size_t temp_bytes = size_t(DV) * sizeof(float);
+    const size_t per_thread = q_row_padded + accum_bytes + temp_bytes + CACHE_LINE_SIZE;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    char * scratch = (char *) params->wdata + size_t(ith) * per_thread;
+    void * q_buf = scratch;
+    float * accum = (float *) (scratch + q_row_padded);
+    float * v_tmp = accum + DV;
+
+    const int32_t * entry_data = (const int32_t *) entries->data;
+    const int32_t * offset_data = (const int32_t *) offsets->data;
+
+    const int64_t n_rows = n_queries * n_head;
+    for (int64_t row = ith; row < n_rows; row += nth) {
+        const int64_t query = row / n_head;
+        const int64_t head  = row % n_head;
+        const int64_t k_head = head / (n_head / n_head_k);
+        const int64_t v_head = head / (n_head / n_head_v);
+
+        const int32_t begin = offset_data[query];
+        const int32_t end   = offset_data[query + 1];
+        GGML_ASSERT(begin >= 0 && end >= begin && end <= n_entries);
+
+        float sum = 0.0f;
+        float max_score = -INFINITY;
+        memset(accum, 0, accum_bytes);
+
+        int32_t loaded_group = -1;
+        for (int32_t ie = begin; ie < end; ++ie) {
+            const int32_t key_index   = entry_data[2 * ie + 0];
+            const int32_t group_index = entry_data[2 * ie + 1];
+            GGML_ASSERT(key_index >= 0 && key_index < n_kv);
+            GGML_ASSERT(group_index >= 0 && group_index < q->ne[1]);
+
+            if (loaded_group != group_index) {
+                const float * q_data = (const float *) ((const char *) q->data +
+                    size_t(group_index) * q->nb[1] + size_t(head) * q->nb[2]);
+                q_to_vec_dot(q_data, q_buf, DK);
+                loaded_group = group_index;
+            }
+
+            const char * k_data = (const char *) k->data +
+                size_t(key_index) * k->nb[1] + size_t(k_head) * k->nb[2];
+            float score = 0.0f;
+            kq_vec_dot(DK, &score, 0, k_data, 0, q_buf, 0, 1);
+            score *= scale;
+            if (logit_softcap != 0.0f) {
+                score = logit_softcap * tanhf(score);
+            }
+
+            const float old_max = max_score;
+            float old_scale = 1.0f;
+            float value_scale = 1.0f;
+            if (score > max_score) {
+                max_score = score;
+                old_scale = expf(old_max - max_score);
+                ggml_vec_scale_f32(DV, accum, old_scale);
+            } else {
+                value_scale = expf(score - max_score);
+            }
+
+            const char * v_data = (const char *) v->data +
+                size_t(key_index) * v->nb[1] + size_t(v_head) * v->nb[2];
+            if (v->type == GGML_TYPE_F32) {
+                ggml_vec_mad_f32(DV, accum, (const float *) v_data, value_scale);
+            } else {
+                v_to_float(v_data, v_tmp, DV);
+                ggml_vec_mad_f32(DV, accum, v_tmp, value_scale);
+            }
+            sum = sum * old_scale + value_scale;
+        }
+
+        if (sinks) {
+            GGML_ASSERT(sinks->type == GGML_TYPE_F32 && sinks->ne[0] == n_head);
+            const float score = ((const float *) sinks->data)[head];
+            float old_scale = 1.0f;
+            float value_scale = 1.0f;
+            if (score > max_score) {
+                old_scale = expf(max_score - score);
+                max_score = score;
+                ggml_vec_scale_f32(DV, accum, old_scale);
+            } else {
+                value_scale = expf(score - max_score);
+            }
+            sum = sum * old_scale + value_scale;
+        }
+
+        if (sum != 0.0f) {
+            ggml_vec_scale_f32(DV, accum, 1.0f / sum);
+        }
+        memcpy((char *) dst->data + size_t(head) * dst->nb[1] + size_t(query) * dst->nb[2],
+               accum, accum_bytes);
+    }
+}
+
 // ggml_compute_forward_flash_attn_back
 
 static void ggml_compute_forward_flash_attn_back_f32(
