@@ -1467,6 +1467,18 @@ private:
         params.sampling.preserved_tokens.clear();
     }
 
+    static void rerot_ban_think_tokens(task_params & params, const llama_vocab * vocab) {
+        if (!vocab) {
+            return;
+        }
+        for (const char * tag : {"<think>", "</think>"}) {
+            const auto ids = common_tokenize(vocab, tag, false, true);
+            for (const auto id : ids) {
+                params.sampling.logit_bias.push_back({id, -INFINITY});
+            }
+        }
+    }
+
     std::string rerot_planner_control_prompt(std::string_view assigned_task = {}) const {
         std::string prompt;
         if (assigned_task.empty()) {
@@ -1520,6 +1532,7 @@ private:
         root_lane_task.params.sampling.reasoning_budget_start.clear();
         root_lane_task.params.sampling.reasoning_budget_end.clear();
         root_lane_task.params.sampling.reasoning_budget_tokens = -1;
+        rerot_ban_think_tokens(root_lane_task.params, vocab);
         rerot_install_planner_grammar(root_lane_task.params);
         if (root_lane_task.params.sampling.seed != LLAMA_DEFAULT_SEED &&
             root_lane_task.index > 0) {
@@ -1819,6 +1832,7 @@ private:
         task.params.sampling.reasoning_budget_start.clear();
         task.params.sampling.reasoning_budget_end.clear();
         task.params.sampling.reasoning_budget_tokens = -1;
+        rerot_ban_think_tokens(task.params, vocab);
         task.params.sampling.seed = rerot_lane_seed(
             *episode, node_id, transport_it->second->root_seed);
         task.rerot_episode_id = episode_id;
@@ -2202,6 +2216,7 @@ private:
         final_task.params.sampling.reasoning_budget_start.clear();
         final_task.params.sampling.reasoning_budget_end.clear();
         final_task.params.sampling.reasoning_budget_tokens = -1;
+        rerot_ban_think_tokens(final_task.params, vocab);
         final_task.params.sampling.seed = slot.task->params.sampling.seed;
         common_sampler_ptr final_sampler;
         try {
