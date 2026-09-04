@@ -538,14 +538,6 @@ server_rerot_stream_lines server_rerot_line_mux::drain_lane(
                  pos = lane.partial_line.find(tag)) {
                 lane.partial_line.erase(pos, tag.size());
             }
-            const size_t prefix_len = trailing_marker_prefix(lane.partial_line, tag);
-            if (prefix_len > 0) {
-                lane.partial_line.erase(lane.partial_line.size() - prefix_len);
-            }
-        }
-        while (!lane.partial_line.empty() &&
-               (lane.partial_line.back() == '<' || lane.partial_line.back() == '/')) {
-            lane.partial_line.pop_back();
         }
         if (!lane.partial_line.empty() && !only_ascii_space(lane.partial_line)) {
             lane.partial_line.push_back('\n');
