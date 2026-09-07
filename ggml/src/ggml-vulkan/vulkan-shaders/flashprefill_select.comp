@@ -92,8 +92,7 @@ uint upper_bound_row(uint n_row, uint row_off, int t, int h) {
     return lo;
 }
 
-void main() {
-    uint t = gl_WorkGroupID.x;
+void select_tile(uint t) {
     uint h = gl_WorkGroupID.y;
     uint tid = gl_LocalInvocationIndex;
     bool is_init = (p.phase == 0u);
@@ -653,4 +652,26 @@ void main() {
     if (old_lo + pair_vis < old_lo) atomicAdd(data_plan[FP_PH_VIS_HI], 1);
     uint old_e = uint(atomicAdd(data_plan[FP_PH_EXACT_TOK_LO], int(etok)));
     if (old_e + etok < old_e) atomicAdd(data_plan[FP_PH_EXACT_TOK_HI], 1);
+}
+
+void main() {
+    if (p.phase == 0u) {
+        select_tile(gl_WorkGroupID.x);
+        return;
+    }
+    if (gl_LocalInvocationIndex != 0u || p.plan_words < FP_PLAN_HDR_WORDS) return;
+    if (data_plan[FP_PH_MAGIC] != int(FP_MAGIC_PLAN) ||
+        data_plan[FP_PH_VERSION] != int(FP_VERSION) ||
+        atomicAdd(data_plan[FP_PH_ERROR], 0) != int(FP_OK)) return;
+    uint tiles = uint(data_plan[FP_PH_N_TILES]);
+    if (tiles == 0u || tiles > p.r_cap + 1u) {
+        atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_LAYOUT));
+        return;
+    }
+    // The host dispatches a bounded grid based only on Q's allocated shape.
+    // Grid-stride traversal covers ALL actual tiles, even when a query has
+    // more packed tiles than Q groups. Each (tile,head) still has one owner.
+    for (uint t = gl_WorkGroupID.x; t < tiles; t += gl_NumWorkGroups.x) {
+        select_tile(t);
+    }
 }

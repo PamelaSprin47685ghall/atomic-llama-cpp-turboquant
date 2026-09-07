@@ -11954,8 +11954,12 @@ static void ggml_vk_flash_prefill_select(ggml_backend_vk_context * ctx, vk_conte
         GGML_ABORT("ggml_vulkan: flashprefill select row bound out of range");
     }
     const uint32_t rows_b = (uint32_t) rb;
-    // +1 covers device tile-max+1 (see supports_op); guarded on-device.
-    const uint32_t grid_x = rows_b + 1u;
+    // A byte-derived row bound includes use-table slack and can launch tens
+    // of thousands of empty workgroups for only a handful of actual tiles.
+    // Bound the grid by Q groups and let the shader stride over device T.
+    // This is a scheduling bound, never a truncation of metadata or work.
+    const uint32_t grid_x = (uint32_t) std::min({ (uint64_t) rows_b + 1u,
+        (uint64_t) q->ne[1], (uint64_t) ctx->device->properties.limits.maxComputeWorkGroupCount[0] });
     const uint32_t hkv = (uint32_t) pool->ne[1];
     vk_pipeline pipeline = ggml_vk_ensure_flash_prefill(ctx, ctx->device->pipeline_flash_prefill_select);
     // The init and selection phases are separate dispatches, each consuming
@@ -19551,15 +19555,15 @@ static bool ggml_vk_flash_prefill_select_ok(const vk_device & device, const ggml
     if (meta->ne[0] < FP_META_HDR_WORDS || op->ne[0] < FP_PLAN_HDR_WORDS) {
         return false;
     }
-    // Dispatch cap-grid {rows_bound+1, hkv} (init + select) must fit. The +1
-    // covers device tile-max+1 (tiles index rows and uses, so T <=
-    // max(n_row,n_use)+1 <= rows_bound+1); over-dispatch is guarded
-    // on-device by t>=T. Degenerate owner input still flags explicit plan
-    // errors via the pairs that do run (never silent).
+    // Scheduling and validation bounds are independent: device actuals are
+    // still validated against the complete row bound, while grid-stride
+    // traversal visits every actual tile with at most Q-group-count CTAs.
     {
         const uint64_t rb = ggml_vk_flash_prefill_row_bound((uint64_t) meta->ne[0], (uint64_t) pool->ne[2]);
+        const uint64_t grid_x = std::min({ rb + 1u, (uint64_t) q->ne[1],
+            (uint64_t) device->properties.limits.maxComputeWorkGroupCount[0] });
         if (rb == 0 || rb + 1u > 0xffffffffULL ||
-            !ggml_vk_flash_prefill_grid_ok(device, rb + 1u, (uint64_t) pool->ne[1])) {
+            !ggml_vk_flash_prefill_grid_ok(device, grid_x, (uint64_t) pool->ne[1])) {
             return false;
         }
     }
