@@ -1667,6 +1667,89 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
     return true;
 }
 
+static void test_backend_coverage_lanes(ggml_backend_t backend, const BackendSel & sel) {
+    // Exercise the actual ATTN coverage scan at workgroup boundaries. Use a
+    // leaf plan, not SELECT, so missing/duplicate entries reach the consumer.
+    for (int nf : {1, 63, 64, 65, 129}) {
+        constexpr int dim = 64, hq = 2;
+        std::vector<int32_t> meta;
+        int64_t nt = 0, pw = 0;
+        FP_CHECK(fp_build_meta(meta, dim, dim, 1, hq, 1, nf,
+                    std::vector<int>(nf, 1), std::vector<int>(nf, 0), std::vector<int>(nf, 0), nt));
+        FP_CHECK(ggml_flashprefill_plan_words(1, 1, nf, &pw) == GGML_FLASHPREFILL_OK);
+        ggml_context_ptr ctx(ggml_init({16 * 1024 * 1024, nullptr, true}));
+        ggml_tensor * q = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, dim, 1, hq);
+        ggml_tensor * k = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, dim, nf, 1);
+        ggml_tensor * v = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, dim, nf, 1);
+        ggml_tensor * pool = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 2 * dim, 1, nf);
+        ggml_tensor * mt = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, meta.size());
+        ggml_tensor * plan = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, pw);
+        ggml_tensor * out = ggml_flash_prefill_attn(ctx.get(), q, k, v, pool, plan, mt, nullptr,
+                1, hq, dim, 1.0f, 0.0f, true);
+        if (!out || !ggml_backend_supports_op(backend, out)) {
+            FP_CHECK_MSG(false, "coverage ATTN unsupported on %s", sel.name.c_str());
+            return;
+        }
+        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+        if (!buffer) { FP_CHECK(false); return; }
+        std::vector<float> qdata(dim * hq, 0), pooldata(2 * dim * nf, 0);
+        std::vector<ggml_fp16_t> kdata(dim * nf, ggml_fp32_to_fp16(0)), vdata(dim * nf);
+        // K=Q=0 makes every token equally likely. V is exactly representable
+        // in F16, so the independent reference is a simple arithmetic mean.
+        for (int f = 0; f < nf; ++f) for (int d = 0; d < dim; ++d) {
+            const float value = (f + d) * 0.125f;
+            vdata[f * dim + d] = ggml_fp32_to_fp16(value);
+            pooldata[f * 2 * dim + dim + d] = value;
+        }
+        ggml_backend_tensor_set(q, qdata.data(), 0, ggml_nbytes(q));
+        ggml_backend_tensor_set(k, kdata.data(), 0, ggml_nbytes(k));
+        ggml_backend_tensor_set(v, vdata.data(), 0, ggml_nbytes(v));
+        ggml_backend_tensor_set(pool, pooldata.data(), 0, ggml_nbytes(pool));
+        ggml_backend_tensor_set(mt, meta.data(), 0, ggml_nbytes(mt));
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 32, false);
+        ggml_build_forward_expand(graph, out);
+        for (int mode = 0; mode < 5; ++mode) {
+            const bool corrupt = mode >= 3;
+            // CPU deliberately aborts on corrupt plans; Vulkan reports the
+            // error in the plan. Negative cases test that GPU protocol only.
+            if (corrupt && sel.is_cpu) continue;
+            if (mode == 4 && nf == 1) continue;
+            std::vector<int32_t> wire((size_t) pw);
+            FP_CHECK(ggml_flashprefill_plan_init(wire.data(), pw, 1, 1, nf, 0) == GGML_FLASHPREFILL_OK);
+            int ne = 0, np = 0;
+            for (int u = 0; u < nf; ++u) {
+                if (mode == 3 && u == nf - 1) continue; // omit the last lane's use
+                if (mode == 2 && u % 2) wire[wire[7] + np++] = u;
+                else wire[wire[6] + ne++] = mode == 1 ? nf - 1 - u : u;
+            }
+            if (mode == 4) wire[wire[6] + nf - 1] = 0; // duplicate, missing tail
+            wire[wire[8]] = ne;
+            wire[wire[8] + 1] = np;
+            ggml_backend_tensor_set(plan, wire.data(), 0, ggml_nbytes(plan));
+            const ggml_status status = ggml_backend_graph_compute(backend, graph);
+            FP_CHECK_MSG(corrupt ? status != GGML_STATUS_SUCCESS : status == GGML_STATUS_SUCCESS,
+                    "coverage execution status nf=%d mode=%d status=%d", nf, mode, int(status));
+            ggml_backend_tensor_get(plan, wire.data(), 0, ggml_nbytes(plan));
+            if (corrupt) {
+                FP_CHECK_MSG(wire[10] != GGML_FLASHPREFILL_OK,
+                        "missing/duplicate use accepted: nf=%d mode=%d", nf, mode);
+            } else {
+                FP_CHECK_MSG(wire[10] == GGML_FLASHPREFILL_OK,
+                        "valid coverage rejected: nf=%d mode=%d error=%d", nf, mode, wire[10]);
+                std::vector<float> got(dim * hq);
+                ggml_backend_tensor_get(out, got.data(), 0, ggml_nbytes(out));
+                for (int h = 0; h < hq; ++h) for (int d = 0; d < dim; ++d) {
+                    const float expected = ((nf - 1) * 0.5f + d) * 0.125f;
+                    FP_CHECK_MSG(std::isfinite(got[h * dim + d]) &&
+                            std::abs(got[h * dim + d] - expected) < 5e-4f,
+                            "coverage output mismatch nf=%d mode=%d h=%d d=%d", nf, mode, h, d);
+                }
+            }
+        }
+    }
+    std::printf("test_backend_coverage_lanes done (%s)\n", sel.name.c_str());
+}
+
 static void test_backend_exactall(ggml_backend_t backend, const BackendSel & sel) {
     // Exact-all over same cached bytes vs dense oracle (same dequantized data).
     fp_backend_sparse_once(backend, sel, 64, 64, 1, 2, 2,
@@ -1768,6 +1851,7 @@ int main(int argc, char ** argv) {
     test_backend_sparse(backend, sel);
     // Quant backend coverage is best-effort: SKIP when unsupported.
     test_backend_quant(backend, sel);
+    test_backend_coverage_lanes(backend, sel);
     ggml_backend_free(backend);
 
     if (g_failures == 0) {

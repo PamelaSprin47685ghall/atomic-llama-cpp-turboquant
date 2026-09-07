@@ -56,6 +56,7 @@ layout(binding = 10) buffer SCR_O { float data_scr_o[]; };
 layout(push_constant) uniform FpAttnPushBlock { FP_ATTN_PUSH_FIELDS } p;
 
 shared float attn_sh[256];
+shared uint attn_coverage_bad;
 
 float attn_q_at(uint q_group, uint q_head, uint d) {
     return data_q[(q_group * p.q_nb1 + q_head * p.q_nb2) / 4u + d];
@@ -235,8 +236,12 @@ void main() {
         if (tid == 0u) atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_PLAN_COVERAGE));
         return;
     }
-    // Per-row coverage: every matching use appears exactly once (bounded).
-    for (uint u = 0u; u < n_use; ++u) {
+    // Check the same complete metadata set, but partition it across lanes.
+    // Previously all 64 invocations redundantly scanned every use and both
+    // plan lists. The shared result keeps subsequent barrier control uniform.
+    if (tid == 0u) attn_coverage_bad = 0u;
+    barrier();
+    for (uint u = tid; u < n_use; u += wgsize) {
         uint ub = use_off + u * 8u;
         if (data_meta[ub + FP_UW_TILE] != int(u_tile)) continue;
         if (data_meta[ub + FP_UW_KV_HEAD] != int(u_kv)) continue;
@@ -249,12 +254,16 @@ void main() {
             if (data_plan[proxy_off + pair * max_sel + uint(k)] == int(u)) found++;
         }
         if (found != 1) {
-            for (uint d = tid; d < p.dv; d += wgsize) {
-                data_out[d + p.dv * (u_hq + Hq * u_sq)] = 0.0f;
-            }
-            if (tid == 0u) atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_PLAN_COVERAGE));
-            return;
+            atomicOr(attn_coverage_bad, 1u);
         }
+    }
+    barrier();
+    if (attn_coverage_bad != 0u) {
+        for (uint d = tid; d < p.dv; d += wgsize) {
+            data_out[d + p.dv * (u_hq + Hq * u_sq)] = 0.0f;
+        }
+        if (tid == 0u) atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_PLAN_COVERAGE));
+        return;
     }
 
     float sink_logit = 0.0f;
