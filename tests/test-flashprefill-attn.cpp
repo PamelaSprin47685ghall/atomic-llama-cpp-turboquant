@@ -1335,7 +1335,7 @@ static bool fp_build_meta(std::vector<int32_t> & meta,
                           int nfrag, const std::vector<int> & frag_counts,
                           const std::vector<int> & frag_mandatory,
                           const std::vector<int> & frag_qgroup,
-                          int64_t & out_n_tiles) {
+                          int64_t & out_n_tiles, bool padded_uses = false) {
     meta.clear();
     out_n_tiles = 0;
     if (dk < 1 || dv < 1 || hkv < 1 || hq < 1 || ngroups < 1 || nfrag < 1) return false;
@@ -1348,6 +1348,7 @@ static bool fp_build_meta(std::vector<int32_t> & meta,
     int nrow = hq; // Nq=1, one row per head, sq=0
     int nuse = nfrag; // one use per fragment, sq=0, tile=0, kvh=0
     int64_t f_cap = nfrag, r_cap = nrow, u_cap = nuse, c_cap = ncell;
+    if (padded_uses) u_cap = std::max<int64_t>(u_cap, 128);
     int64_t words = 0;
     if (ggml_flashprefill_metadata_words(f_cap, r_cap, u_cap, c_cap, &words) != GGML_FLASHPREFILL_OK) return false;
     meta.assign((size_t) words, 0);
@@ -1384,7 +1385,8 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
                                    ggml_type ktype, ggml_type vtype,
                                    float scale, float softcap, float alpha, int exact_all,
                                    bool use_sink, float sink_val,
-                                   const std::string & label, double atol, double rtol) {
+                                   const std::string & label, double atol, double rtol,
+                                   bool padded_uses = false) {
     (void) sel;
     // Fixture: Nk=8 in 2 fragments (4+4), frag0 mandatory (sink block),
     // frag0 g0, frag1 g1 (two phases, one denominator).
@@ -1394,7 +1396,7 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
     std::vector<int> qgroups = {0 % ngroups, 1 % ngroups};
     std::vector<int32_t> meta;
     int64_t n_tiles = 0;
-    if (!fp_build_meta(meta, dk, dv, hkv, hq, ngroups, 2, counts, mandatory, qgroups, n_tiles)) {
+    if (!fp_build_meta(meta, dk, dv, hkv, hq, ngroups, 2, counts, mandatory, qgroups, n_tiles, padded_uses)) {
         FP_CHECK_MSG(false, "%s: meta build failed", label.c_str());
         return false;
     }
@@ -1534,6 +1536,19 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
     }
     ggml_backend_synchronize(backend);
 
+    if (padded_uses && sel.name.find("Vulkan") != std::string::npos) {
+        using scratch_fn = ggml_status (*)(ggml_backend_t, uint64_t *, uint64_t *);
+        auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        auto scratch = reinterpret_cast<scratch_fn>(ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_vk_flashprefill_scratch"));
+        uint64_t current = 0, peak = 0;
+        FP_CHECK(scratch != nullptr);
+        if (scratch) {
+            FP_CHECK(scratch(backend, &current, &peak) == GGML_STATUS_SUCCESS);
+            FP_CHECK_MSG(current > 0 && peak >= current, "%s did not execute split-K", label.c_str());
+        }
+    }
+
     // Read back ACTUAL pool + plan + output after completion.
     int64_t pool_ne = ggml_nelements(tpool);
     std::vector<float> pool_got((size_t) pool_ne, 0.0f);
@@ -1548,7 +1563,7 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
     // Validate plan encoding + coverage against metadata (strict).
     FP_CHECK(ggml_flashprefill_plan_validate(plan_got.data(), plan_ne) == GGML_FLASHPREFILL_OK);
     FP_CHECK(ggml_flashprefill_plan_validate_against_metadata(plan_got.data(), plan_ne, meta.data(), (int64_t) meta.size()) == GGML_FLASHPREFILL_OK);
-    struct ggml_flashprefill_plan_stats stats;
+    struct ggml_flashprefill_plan_stats stats = {};
     FP_CHECK(ggml_flashprefill_plan_get_stats(plan_got.data(), plan_ne, &stats) == GGML_FLASHPREFILL_OK);
     // Exact-all must have zero proxy uses; sparse must have coverage.
     if (exact_all) {
@@ -1660,6 +1675,12 @@ static void test_backend_exactall(ggml_backend_t backend, const BackendSel & sel
     fp_backend_sparse_once(backend, sel, 64, 32, 1, 2, 2,
             GGML_TYPE_F16, GGML_TYPE_F16, 0.25f, 0.0f, 0.1f, 1, true, 0.4f,
             "backend-exactall-sink-dkdv", 2e-3, 2e-2);
+    // The Vulkan split heuristic uses metadata capacity. Padding forces
+    // split-K plus MERGE, including empty splits, without a large fixture.
+    // This also catches under-reservation of ATTN descriptor sets.
+    fp_backend_sparse_once(backend, sel, 128, 128, 1, 2, 2,
+            GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0, 0.25f, 0.0f, 0.1f, 1, true, 0.4f,
+            "backend-exactall-split-turbo4-turbo2", 5e-3, 5e-2, true);
 }
 
 static void test_backend_sparse(ggml_backend_t backend, const BackendSel & sel) {

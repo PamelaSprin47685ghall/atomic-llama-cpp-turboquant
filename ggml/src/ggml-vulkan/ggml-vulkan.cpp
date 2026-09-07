@@ -2050,7 +2050,13 @@ static bool ggml_vk_flash_prefill_unpack_params(const ggml_tensor * dst, int32_t
     if (!std::isfinite(alpha) || !std::isfinite(scale) || !std::isfinite(softcap)) {
         return false;
     }
-    if (alpha <= 0.0f || alpha > 1.0f || scale == 0.0f || softcap < 0.0f) {
+    // Only SELECT consumes alpha. POOL constructors store alpha=scale=0,
+    // and ATTN stores alpha=0; rejecting those unused fields disables the
+    // entire Vulkan path. A finite zero attention scale is legal as well.
+    if (fp_op < FP_OP_POOL || fp_op > FP_OP_ATTN || softcap < 0.0f) {
+        return false;
+    }
+    if (fp_op == FP_OP_SELECT && (alpha <= 0.0f || alpha > 1.0f)) {
         return false;
     }
     if (exact_all != 0 && exact_all != 1) {
@@ -11952,7 +11958,9 @@ static void ggml_vk_flash_prefill_select(ggml_backend_vk_context * ctx, vk_conte
     const uint32_t grid_x = rows_b + 1u;
     const uint32_t hkv = (uint32_t) pool->ne[1];
     vk_pipeline pipeline = ggml_vk_ensure_flash_prefill(ctx, ctx->device->pipeline_flash_prefill_select);
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    // The init and selection phases are separate dispatches, each consuming
+    // its own descriptor set from the graph-wide pool.
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 2);
     vk_subbuffer q_buf    = ggml_vk_tensor_subbuffer(ctx, q);
     vk_subbuffer pool_buf = ggml_vk_tensor_subbuffer(ctx, pool);
     vk_subbuffer meta_buf = ggml_vk_tensor_subbuffer(ctx, meta);
@@ -11977,11 +11985,11 @@ static void ggml_vk_flash_prefill_select(ggml_backend_vk_context * ctx, vk_conte
     pc_init.alpha       = alpha;
     pc_init.scale       = scale;
     pc_init.softcap     = softcap;
-    // Init grid covers cap pairs (each workgroup zeroes its own slice;
-    // header words only by (0,0)); over-dispatch guarded on-device.
+    // Initialize the output header once from device metadata. Pair slices
+    // are initialized by their owner in phase 1, after this barrier.
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { q_buf, q_buf, q_buf, pool_buf, plan_buf, meta_buf, q_buf, plan_buf },
-        pc_init, { grid_x, hkv, 1 });
+        pc_init, { 1, 1, 1 });
     // Cross-dispatch barrier: init writes must be visible before any
     // selection workgroup runs; selection only sets error/counters.
     ggml_vk_sync_buffers(ctx, subctx);
@@ -12127,6 +12135,9 @@ static void ggml_vk_flash_prefill_attn(ggml_backend_vk_context * ctx, vk_context
         vk_subbuffer scr_m = { ctx->prealloc_split_k, 0, (size_t) rows_cap * ml_pitch };
         vk_subbuffer scr_l = { ctx->prealloc_split_k, (size_t) rows_cap * ml_pitch, (size_t) rows_cap * ml_pitch };
         vk_subbuffer scr_o = { ctx->prealloc_split_k, (size_t) 2u * (size_t) rows_cap * ml_pitch, (size_t) rows_cap * (size_t) n_splits * (size_t) dv_u * sizeof(float) };
+        // The first set was reserved above. Each additional partial dispatch
+        // also consumes a set; the merge has its own reservation below.
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, n_splits - 1u);
         for (uint32_t s = 0; s < n_splits; ++s) {
             FpAttnPush pc = base;
             pc.split_phase = 1;
@@ -19510,7 +19521,9 @@ static bool ggml_vk_flash_prefill_select_ok(const vk_device & device, const ggml
     if (fp_op != 1) {
         return false;
     }
-    if (!ggml_vk_flash_prefill_dims_ok(dk, dv)) {
+    // SELECT uses scalar F32 loads; it does not inherit K/V vector-width
+    // restrictions from POOL/ATTN (e.g. the Dk=8, Dv=4 selector fixture).
+    if (dk < 1 || dv < 1 || dk > 65536 || dv > 65536) {
         return false;
     }
     if (!ggml_vk_flash_prefill_common_ok(device, q, GGML_TYPE_F32, false)) {

@@ -11,10 +11,11 @@
 // K/V stay at bindings 1/2 to reuse flash_attn_dequant.glsl; Q=0, pool=3,
 // plan=4 (unused in POOL/SELECT pipelines), meta=5, sinks=6, dst=7.
 // SELECT dispatch is two-phased inside one op (VulkanDispatch):
-//   phase 0 = init (parallel slice zeroing, header only by workgroup 0),
+//   phase 0 = init (one workgroup constructs/validates the output header),
 //   barrier (ggml_vk_sync_buffers, no host sync),
-//   phase 1 = select (only atomicMax error / atomicAdd counters, never clears).
-// ATTN only reads plan error, never writes it. Workgroup barrier is never
+//   phase 1 = select (each pair clears its own lists; shared counters/error
+//   use atomics and are never reset by another pair).
+// ATTN may atomically raise a plan error. Workgroup barrier is never
 // global; no cross-workgroup sync assumed. No subgroup-size assumption.
 
 #ifdef __cplusplus
