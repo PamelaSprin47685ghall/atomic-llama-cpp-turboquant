@@ -13,10 +13,6 @@
 #include <cfloat>
 #include <cmath>
 
-extern "C" {
-GGML_API int turbo3_cpu_wht_group_size;
-}
-
 // ggml_compute_forward_dup
 
 static void ggml_compute_forward_dup_same_cont(
@@ -5139,11 +5135,13 @@ static void ggml_compute_forward_set_rows_impl(
 
     ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
 
-    // For turbo types: communicate WHT group size to the quantize function via global
+    // KV heads are padded to complete 128-element Turbo blocks. Do not pass
+    // per-operation geometry through a process-global variable: independent
+    // contexts and SET_ROWS workers may execute concurrently.
     if (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO2_0) {
         int gs = 0;
         memcpy(&gs, dst->op_params, sizeof(int));
-        turbo3_cpu_wht_group_size = (gs == 64 || gs == 128) ? gs : 0;
+        GGML_ASSERT(gs == 0 || gs == 128);
     }
 
     for (int64_t i03 = 0; i03 < ne03; ++i03) {

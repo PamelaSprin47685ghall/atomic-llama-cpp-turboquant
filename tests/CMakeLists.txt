@@ -117,6 +117,14 @@ function(llama_build_and_test source)
 endfunction()
 
 # build test-tokenizer-0 target once and add many tests
+add_executable(test-turbo-quant test-turbo-quant.c)
+target_include_directories(test-turbo-quant PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+target_link_libraries(test-turbo-quant PRIVATE ggml-base)
+if (NOT MSVC)
+    target_link_libraries(test-turbo-quant PRIVATE m)
+endif()
+llama_test(test-turbo-quant)
+
 llama_build(test-tokenizer-0.cpp)
 
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-bert-bge          ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-bert-bge.gguf)
