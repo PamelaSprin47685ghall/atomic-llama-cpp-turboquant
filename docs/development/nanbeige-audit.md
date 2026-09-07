@@ -41,7 +41,12 @@ These are operator correctness checks, not model-quality scores.
 The standard-library-only runner starts a private loopback listener with an
 ephemeral authentication key and stops it in a `finally` block. It stores
 per-request responses, checked answers, timing, sampled GPU memory, and server
-logs. GPU memory is a sampled, device-wide observation, not an exact allocation
+logs. Finish the build before probing. The runner fingerprints the executable
+and local shared libraries before/after each run and rejects changed artifacts;
+these hashes do not cover driver or system libraries outside the binary directory.
+It records the process exit status **before** its cleanup signal, so a server
+crash is distinguishable from the runner stopping a still-live process after
+an HTTP failure. GPU memory is a sampled, device-wide observation, not an exact allocation
 peak or proof that all graph operations stayed on the GPU.
 
 ```sh

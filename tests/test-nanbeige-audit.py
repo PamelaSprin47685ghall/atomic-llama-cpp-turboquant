@@ -134,6 +134,59 @@ class AuditTests(unittest.TestCase):
         with mock.patch.object(audit, "request", return_value={"tokens": []}), self.assertRaises(ValueError):
             audit.prepare(self.args, "local", "key", {"config": self.config})
 
+    def test_process_signal_preserved_before_cleanup(self):
+        self.args.server = self.root / "server"
+        self.args.server.touch()
+        self.args.model = self.root / "model"
+        self.args.startup_timeout = 1
+        for crashed in (False, True):
+            with self.subTest(crashed=crashed):
+                proc = mock.Mock(returncode=-11 if crashed else -15)
+                proc.poll.side_effect = [None, -11 if crashed else None]
+                result = {}
+                with mock.patch.object(audit.socket, "socket") as sock, \
+                        mock.patch.object(audit.subprocess, "Popen", return_value=proc), \
+                        mock.patch.object(audit.threading, "Thread"), \
+                        mock.patch.object(audit, "request", return_value={"status": "ok"}):
+                    sock.return_value.__enter__.return_value.getsockname.return_value = ("127.0.0.1", 12345)
+                    with self.assertRaisesRegex(RuntimeError, "HTTP disconnected"):
+                        with audit.server(self.args, self.config, result):
+                            raise RuntimeError("HTTP disconnected")
+                self.assertEqual(result["server_exit_before_cleanup"], -11 if crashed else None)
+                self.assertEqual(result["server_returncode"], -11 if crashed else -15)
+                self.assertEqual(result["server_terminated_by_runner"], not crashed)
+                self.assertEqual(proc.terminate.call_count, 0 if crashed else 1)
+                self.assertFalse(result["artifacts_changed"])
+
+    def test_changed_library_fingerprint(self):
+        binary = self.root / "server"
+        binary.write_bytes(b"server")
+        library = self.root / "libfixture.so.1"
+        library.write_bytes(b"old")
+        (self.root / "libfixture.so").symlink_to(library.name)
+        before = audit.artifact_fingerprint(binary)
+        self.assertEqual(len(before), 2)
+        library.write_bytes(b"new")
+        self.assertNotEqual(before, audit.artifact_fingerprint(binary))
+
+    def test_changed_artifacts_cannot_pass(self):
+        binary = self.root / "server"
+        binary.touch()
+
+        @contextlib.contextmanager
+        def changed_server(args, config, result):
+            result["artifacts_changed"] = True
+            yield "local", "key"
+
+        with mock.patch.object(audit, "server", changed_server), \
+                mock.patch.object(audit, "probe"), contextlib.redirect_stdout(io.StringIO()):
+            code = audit.main(["probe", "--server", str(binary), "--model", str(binary),
+                               "--out", str(self.root)])
+        self.assertEqual(code, 1)
+        saved = json.loads((self.root / "baseline.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["status"], "failed")
+        self.assertIn("artifacts changed", saved["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

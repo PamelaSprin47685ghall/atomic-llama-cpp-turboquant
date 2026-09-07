@@ -33,8 +33,25 @@ def request(base, key, path, data=None, timeout=240):
         return json.load(response)
 
 
+def artifact_fingerprint(binary):
+    """Fingerprint local build products, deduplicating shared-library symlinks."""
+    binary = binary.resolve()
+    paths = {binary}
+    for pattern in ("lib*.so*", "*.dylib", "*.dll"):
+        paths.update(path.resolve() for path in binary.parent.glob(pattern) if path.is_file())
+    result = {}
+    for path in sorted(paths):
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+        result[str(path)] = digest.hexdigest()
+    return result
+
+
 @contextlib.contextmanager
 def server(args, config, result):
+    result["artifacts_before"] = artifact_fingerprint(args.server)
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -91,19 +108,32 @@ def server(args, config, result):
             result["startup_seconds"] = time.monotonic() - started
             yield base, key
     finally:
-        if proc is not None and proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=10)
+        if proc is not None:
+            # Preserve the original exit/signal before cleanup. Otherwise a
+            # disconnected HTTP request cannot distinguish a crashed server
+            # from a live server whose connection timed out.
+            result["server_exit_before_cleanup"] = proc.poll()
+            result["server_terminated_by_runner"] = result["server_exit_before_cleanup"] is None
+            if result["server_terminated_by_runner"]:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=10)
+            result["server_returncode"] = proc.returncode
         stop.set()
         watcher.join(timeout=6)
         result["peak_gpu_mib"] = max(samples) if samples else None
         result["gpu_samples"] = len(samples)
         result["gpu_monitor_errors"] = errors
         result["elapsed_seconds"] = time.monotonic() - started
+        try:
+            result["artifacts_after"] = artifact_fingerprint(args.server)
+            result["artifacts_changed"] = result["artifacts_before"] != result["artifacts_after"]
+        except OSError as exc:
+            result["artifacts_changed"] = True
+            result["artifact_fingerprint_error"] = str(exc)
 
 
 def prepare(args, base, key, result):
@@ -282,6 +312,8 @@ def main(argv=None):
         try:
             with server(args, config, result) as (base, key):
                 (prepare if args.mode == "prepare" else probe)(args, base, key, result)
+            if result.get("artifacts_changed"):
+                raise RuntimeError("build artifacts changed during the probe; result is not valid")
             result["status"] = "completed"
         except Exception as exc:
             failed = True
