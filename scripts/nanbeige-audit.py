@@ -23,14 +23,14 @@ import urllib.error
 import urllib.request
 
 
-def request(base, key, path, data=None, timeout=240):
+def request(base, key, path, data=None, timeout=240, *, as_text=False):
     req = urllib.request.Request(
         base + path,
         data=None if data is None else json.dumps(data).encode(),
         headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
     )
     with urllib.request.urlopen(req, timeout=timeout) as response:
-        return json.load(response)
+        return response.read().decode("utf-8") if as_text else json.load(response)
 
 
 def artifact_fingerprint(binary):
@@ -64,6 +64,8 @@ def server(args, config, result):
                "-ctk", config["k"], "-ctv", config["v"], "-t", "4", "-tb", "4",
                "--host", "127.0.0.1", "--port", str(port), "--api-key", key,
                "-lv", "4"] + config.get("extra", [])
+    if config.get("require_flashprefill_plan", False):
+        command.append("--metrics")
     result["command"] = ["<ephemeral-key>" if v == key else v for v in command]
     result["config"] = config
     env = dict(os.environ, LD_LIBRARY_PATH=str(args.server.resolve().parent),
@@ -232,14 +234,42 @@ def probe(args, base, key, result):
         result["requests"].append(response)
     # One final request also verifies recovery after the preceding workloads.
     result["final_health"] = request(base, key, "/health", timeout=5)
+    if result["config"].get("require_flashprefill_plan", False):
+        result["metrics_text"] = request(base, key, "/metrics", timeout=5, as_text=True)
     if result["final_health"].get("status") != "ok":
         raise RuntimeError("server was not healthy after the probes")
     if any(not check["passed"] for check in result["quality_checks"]):
         raise RuntimeError("quality checks failed; see saved per-case results")
 
 
+def check_flashprefill_evidence(config, result):
+    """Only completed plan counters prove that the sparse implementation ran."""
+    if not config.get("require_flashprefill_plan", False):
+        return
+    fields = ("sparse_rows", "dense_packed_rows", "selected_blocks", "corrected_blocks",
+              "visible_tokens", "exact_tokens")
+    counters = {}
+    for field in fields:
+        name = "llamacpp:flashprefill_" + field + "_total"
+        matches = re.findall(r"^" + re.escape(name) + r"\s+(\S+)\s*$",
+                             result.get("metrics_text", ""), re.MULTILINE)
+        if len(matches) != 1:
+            raise RuntimeError("missing or ambiguous FlashPrefill counter: " + name)
+        value = float(matches[0])
+        if not math.isfinite(value) or value < 0 or not value.is_integer():
+            raise RuntimeError("invalid FlashPrefill counter: " + name)
+        counters[field] = int(value)
+    result["flashprefill_counters"] = counters
+    if (counters["sparse_rows"] + counters["dense_packed_rows"] <= 0 or
+            counters["selected_blocks"] <= 0 or counters["visible_tokens"] <= 0):
+        raise RuntimeError("expected completed FlashPrefill plans, but no plan work was recorded")
+    if counters["exact_tokens"] > counters["visible_tokens"]:
+        raise RuntimeError("inconsistent FlashPrefill token accounting")
+
+
 def check_runtime_evidence(config, result):
     """Pressure gates must observe real reclaim, not merely HTTP success."""
+    check_flashprefill_evidence(config, result)
     required = config.get("require_tri_drain", False)
     ceiling = config.get("max_tri_score_ms")
     if not required and ceiling is None:
@@ -305,6 +335,8 @@ def validate_configs(configs):
             raise ValueError("env must map strings to strings")
         if type(config.get("require_tri_drain", False)) is not bool:
             raise ValueError("require_tri_drain must be boolean")
+        if type(config.get("require_flashprefill_plan", False)) is not bool:
+            raise ValueError("require_flashprefill_plan must be boolean")
         ceiling = config.get("max_tri_score_ms")
         if ceiling is not None and (type(ceiling) not in (int, float) or not math.isfinite(ceiling) or ceiling < 0):
             raise ValueError("max_tri_score_ms must be finite and nonnegative")

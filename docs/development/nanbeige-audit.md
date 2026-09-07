@@ -82,6 +82,28 @@ check before/after/freed accounting, and save the observed events. Do not use
 the zero-score bound for general ranked eviction, which legitimately scores
 candidates. HTTP success alone does not satisfy a requested pressure gate.
 
+Set `"require_flashprefill_plan": true` to require completed FlashPrefill
+plan work. The runner enables `/metrics`, saves the response, and validates
+finite integral row/block/token counters. Exact-all plans count as real
+execution; a switch that ultimately routes all work to ordinary attention
+does not. This proves path coverage, not approximate-attention quality.
+
+For the graph integration regression, use a 768-token prompt with
+`ctx=4096`, `kv=512`, `batch=ubatch=128`, K4/V2, actual model calibration,
+and both evidence gates. The small KV ensures a real drain; early prompt
+batches also exercise tensor views narrower than the allocated cache.
+FlashPrefill flags for that **exact-all correctness** probe are:
+
+```text
+--flashprefill required --flashprefill-min-kv 128
+--flashprefill-dense-tail-tiles 0 --flashprefill-full-attn-layers 0
+--flashprefill-exact-all
+```
+
+Keep `max_tri_score_ms=0` only for this floor-only scenario. It tests the
+equivalent fast path when hard guards consume the entire target; it does
+not disable scoring when any non-protected candidate must be retained.
+
 For calibration preparation, use `prepare` instead of `probe` with an explicit
 **training** corpus. The runner tokenizes with the supplied model and writes a
 prefix-deduplicated trie for `wanxiangqi-trie-triattention-calib`. Each matrix

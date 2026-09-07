@@ -97,6 +97,31 @@ class AuditTests(unittest.TestCase):
                 audit.validate_configs(matrix)
         audit.validate_configs([self.config, dict(self.config, name="auto", kv="auto")])
 
+    def test_flashprefill_requires_observed_plan_work(self):
+        config = dict(self.config, require_flashprefill_plan=True)
+        metrics = {"sparse_rows": 0, "dense_packed_rows": 384, "selected_blocks": 12,
+                   "corrected_blocks": 0, "visible_tokens": 768, "exact_tokens": 768}
+
+        def result_for(values):
+            return {"metrics_text": "".join("llamacpp:flashprefill_" + k + "_total " + str(v) + "\n"
+                                            for k, v in values.items())}
+
+        result = result_for(metrics)
+        audit.check_runtime_evidence(config, result)  # exact-all is still real plan work
+        self.assertEqual(result["flashprefill_counters"], metrics)
+        for change in ({"selected_blocks": 0}, {"dense_packed_rows": 0},
+                       {"visible_tokens": 0}, {"exact_tokens": 769},
+                       {"sparse_rows": -1}, {"visible_tokens": "NaN"},
+                       {"selected_blocks": "Inf"}, {"selected_blocks": 0.5}):
+            with self.subTest(change=change), self.assertRaises(RuntimeError):
+                audit.check_runtime_evidence(config, result_for(dict(metrics, **change)))
+        with self.assertRaises(RuntimeError):
+            audit.check_runtime_evidence(config, {})
+        with self.assertRaises(RuntimeError):
+            audit.check_runtime_evidence(config, {"metrics_text": result_for(metrics)["metrics_text"] * 2})
+        with self.assertRaises(ValueError):
+            audit.validate_configs([dict(self.config, require_flashprefill_plan="true")])
+
     def test_invalid_matrix_never_starts_server(self):
         model = self.root / "fixture.gguf"
         model.touch()
