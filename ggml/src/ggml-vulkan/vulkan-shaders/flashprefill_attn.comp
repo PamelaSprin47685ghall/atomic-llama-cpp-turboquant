@@ -204,7 +204,10 @@ void main() {
         // No safe output mapping (row unreadable or plan flagged); raise the
         // writable plan error so the failure propagates before any client
         // output is consumed (backend barrier), instead of valid zeros.
-        if (p.plan_words >= FP_PLAN_HDR_WORDS + 10u && tid == 0u) {
+        // ERROR is word 10 INSIDE the 24-word header. Requiring 34 words
+        // silently accepted malformed metadata with a one-use (28-word)
+        // plan, leaving the caller to consume an unwritten output tensor.
+        if (p.plan_words >= FP_PLAN_HDR_WORDS && tid == 0u) {
             atomicMax(data_plan[FP_PH_ERROR], bad_code);
         }
         return;

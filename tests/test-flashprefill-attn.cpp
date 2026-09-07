@@ -1708,7 +1708,7 @@ static void test_backend_coverage_lanes(ggml_backend_t backend, const BackendSel
         ggml_backend_tensor_set(mt, meta.data(), 0, ggml_nbytes(mt));
         ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 32, false);
         ggml_build_forward_expand(graph, out);
-        for (int mode = 0; mode < 5; ++mode) {
+        for (int mode = 0; mode < 6; ++mode) {
             const bool corrupt = mode >= 3;
             // CPU deliberately aborts on corrupt plans; Vulkan reports the
             // error in the plan. Negative cases test that GPU protocol only.
@@ -1725,6 +1725,9 @@ static void test_backend_coverage_lanes(ggml_backend_t backend, const BackendSel
             if (mode == 4) wire[wire[6] + nf - 1] = 0; // duplicate, missing tail
             wire[wire[8]] = ne;
             wire[wire[8] + 1] = np;
+            auto meta_input = meta;
+            if (mode == 5) meta_input[0] = 0; // invalid header on a small, otherwise valid plan
+            ggml_backend_tensor_set(mt, meta_input.data(), 0, ggml_nbytes(mt));
             ggml_backend_tensor_set(plan, wire.data(), 0, ggml_nbytes(plan));
             const ggml_status status = ggml_backend_graph_compute(backend, graph);
             FP_CHECK_MSG(corrupt ? status != GGML_STATUS_SUCCESS : status == GGML_STATUS_SUCCESS,
