@@ -2043,6 +2043,14 @@ ggml_type llama_kv_cache::type_v() const {
     return layers[0].v->type;
 }
 
+ggml_type llama_kv_cache::layer_type_k(int32_t il) const {
+    return layers.at(map_layer_ids.at(il)).k->type;
+}
+
+ggml_type llama_kv_cache::layer_type_v(int32_t il) const {
+    return layers.at(map_layer_ids.at(il)).v->type;
+}
+
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
     std::vector<uint32_t> res;
     res.reserve(layers.size());
@@ -5431,6 +5439,14 @@ ggml_type llama_kv_cache_context::type_k() const {
 
 ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
+}
+
+ggml_type llama_kv_cache_context::layer_type_k(int32_t il) const {
+    return kv->layer_type_k(il);
+}
+
+ggml_type llama_kv_cache_context::layer_type_v(int32_t il) const {
+    return kv->layer_type_v(il);
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {

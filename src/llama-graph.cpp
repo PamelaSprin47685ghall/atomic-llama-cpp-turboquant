@@ -5801,8 +5801,9 @@ std::unique_ptr<llm_graph_input_attn_flashprefill> llm_graph_input_attn_flashpre
     if (!llm_fp_reserve_caps_for(cfg, n_ctx_cells, q_rsv, hq, hkv, gqa, &rsv, &rsv_err)) {
         throw std::runtime_error(std::string("flashprefill reserve: ") + rsv_err);
     }
-    // Cache tensor dims/dtype at build (uniform per context; per-layer
-    // enforcement in try_build throws on drift, every mode).
+    // Metadata dimensions are shared; storage types are per layer. In
+    // particular, Turbo boundary layers may store Q8_0 V while interior
+    // layers store Turbo2. That is not a dtype drift or a corrupt cache.
     ggml_tensor * k_probe = mctx_cur->get_k(ctx0, il_first);
     ggml_tensor * v_probe = mctx_cur->get_v(ctx0, il_first);
     const int32_t dk = (int32_t) k_probe->ne[0];
@@ -5817,6 +5818,14 @@ std::unique_ptr<llm_graph_input_attn_flashprefill> llm_graph_input_attn_flashpre
     const int variant = llm_fp_backend_variant(sched, nullptr);
     auto out = std::make_unique<llm_graph_input_attn_flashprefill>(hparams, cparams, mctx_cur);
     out->cur_rows = cparams.flashprefill_rows;
+    out->key.layer_kv_types.assign(hparams.n_layer(), {-1, -1});
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        if (llm_fp_layer_eligible(hparams, (int) il)) {
+            out->key.layer_kv_types[il] = {
+                (int32_t) mctx_cur->layer_type_k((int32_t) il),
+                (int32_t) mctx_cur->layer_type_v((int32_t) il)};
+        }
+    }
     if (want_reserve) {
         // Reserve sizing: worst-case caps, zero counts, never runs. No
         // layout build (the synthetic ubatch was never applied); unknown
@@ -6527,6 +6536,17 @@ bool llm_graph_input_attn_flashprefill::can_reuse(const llm_graph_params & param
     if (params.flashprefill_reserve_sizing != key.reserve_sizing) {
         return false; // reserve graphs never alias live graphs
     }
+    if (mctx == nullptr || params.hparams.n_layer() != key.layer_kv_types.size()) {
+        return false;
+    }
+    for (uint32_t il = 0; il < params.hparams.n_layer(); ++il) {
+        if (llm_fp_layer_eligible(params.hparams, (int) il) &&
+            !key.matches_layer_types((int32_t) il,
+                (int32_t) mctx->layer_type_k((int32_t) il),
+                (int32_t) mctx->layer_type_v((int32_t) il))) {
+            return false;
+        }
+    }
     const llama_ubatch & ub = params.ubatch;
     const uint32_t expect_n = key.reserve_sizing
         ? key.n_tokens
@@ -6884,9 +6904,9 @@ ggml_tensor * llm_graph_context::try_build_attn_flashprefill(
     if (k->ne[3] != 1 || v_cache->ne[3] != 1) {
         return need_throw("flashprefill: multi-stream cache keeps dense (required)");
     }
-    // Dtype enforcement vs the build-time key (context-fixed; drift throws,
-    // every mode — never silently confused).
-    if (k->type != (ggml_type) key.k_type || v_cache->type != (ggml_type) key.v_type) {
+    // Compare with this layer's build-time type, not the first layer's.
+    // Real same-layer drift still fails closed in every mode.
+    if (!key.matches_layer_types(il, (int32_t) k->type, (int32_t) v_cache->type)) {
         throw std::runtime_error("flashprefill: KV dtype drifted (corrupt cache)");
     }
     if ((int64_t) k->ne[0] != (int64_t) key.dk || (int64_t) v_cache->ne[0] != (int64_t) key.dv) {

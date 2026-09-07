@@ -23,6 +23,7 @@
 #include "../src/llama-flashprefill.h"
 #include "../src/llama-context.h"
 #include "../src/llama-model.h"
+#include "../src/llama-graph.h"
 
 #include <cassert>
 #include <cstdint>
@@ -383,6 +384,25 @@ static void test_fingerprint_and_names(void) {
 } // namespace
 
 int main(void) {
+    // One shared metadata input must support the actual Nanbeige boundary
+    // V policy without disabling detection of genuine per-layer changes.
+    llm_graph_fp_key key;
+    key.k_type = GGML_TYPE_TURBO4_0;
+    key.v_type = GGML_TYPE_Q8_0; // first layer is not the interior format
+    key.layer_kv_types = {{GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0},
+                          {GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0}, {-1, -1}};
+    TEST_ASSERT(key.matches_layer_types(0, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
+    TEST_ASSERT(key.matches_layer_types(1, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0));
+    TEST_ASSERT(!key.matches_layer_types(0, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0));
+    TEST_ASSERT(!key.matches_layer_types(1, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
+    TEST_ASSERT(!key.matches_layer_types(2, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
+    TEST_ASSERT(!key.matches_layer_types(-1, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
+    TEST_ASSERT(!key.matches_layer_types(3, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0));
+    auto changed = key;
+    TEST_ASSERT(changed == key);
+    changed.layer_kv_types[1].second = GGML_TYPE_Q8_0;
+    TEST_ASSERT(changed != key);
+
     test_defaults();
     test_role_gate();
     test_call_tail_edges();
