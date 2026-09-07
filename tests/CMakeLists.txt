@@ -120,9 +120,11 @@ endfunction()
 # availability. Its tests use only the Python standard library.
 find_package(Python3 QUIET COMPONENTS Interpreter)
 if (Python3_Interpreter_FOUND)
-    add_test(NAME test-nanbeige-audit
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-nanbeige-audit.py)
-    set_tests_properties(test-nanbeige-audit PROPERTIES LABELS "python" TIMEOUT 30)
+    foreach(check nanbeige-audit nanbeige-report)
+        add_test(NAME test-${check}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-${check}.py)
+        set_tests_properties(test-${check} PROPERTIES LABELS "python" TIMEOUT 30)
+    endforeach()
 endif()
 
 # build test-tokenizer-0 target once and add many tests
