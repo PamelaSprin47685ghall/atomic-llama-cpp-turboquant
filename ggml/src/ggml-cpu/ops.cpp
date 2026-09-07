@@ -12445,7 +12445,9 @@ void ggml_compute_forward_flash_prefill_pool(
     if (dst->ne[0] != Dk + Dv) {
         GGML_ABORT("flash_prefill_pool: pool row mismatch");
     }
-    if (ggml_n_dims(K) < 3 || ggml_n_dims(V) < 3) {
+    // ggml_n_dims drops trailing singleton dimensions. [D,N,1] is still a
+    // legal one-KV-head cache, not an invalid two-dimensional tensor.
+    if (K->ne[3] != 1 || V->ne[3] != 1) {
         GGML_ABORT("flash_prefill_pool: K/V rank");
     }
     const int64_t Hkv = dst->ne[1];
@@ -13258,7 +13260,9 @@ void ggml_compute_forward_flash_prefill_attn(
     int32_t param_rc = ggml_flashprefill_op_params_unpack(dst->op_params, &pp);
     const int64_t Dv_out = dst ? dst->ne[0] : 0;
     const int64_t Hq_out = dst ? dst->ne[1] : 0;
-    const int64_t Nq_out = (dst && ggml_n_dims(dst) >= 3) ? dst->ne[2] : 0;
+    // A single output query has ne[2]=1 even though ggml_n_dims(dst)==2.
+    // Treating it as zero left the entire output buffer uninitialized.
+    const int64_t Nq_out = dst ? dst->ne[2] : 0;
     // Per-thread scratch: decoded K row + decoded V row + MLO accum + MLO tmp.
     const int64_t Dk = (param_rc == GGML_FLASHPREFILL_OK) ? (int64_t)pp.dk : 0;
     const int64_t Dv = (param_rc == GGML_FLASHPREFILL_OK) ? (int64_t)pp.dv : Dv_out;

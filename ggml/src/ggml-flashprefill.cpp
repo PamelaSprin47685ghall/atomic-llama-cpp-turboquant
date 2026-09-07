@@ -247,7 +247,10 @@ int32_t fp_parse_plan(const int32_t * plan, int64_t n_words, FpPlanView * v) {
     rc = fp_mul_ok(th, plan[5], &pair); if (rc) return rc;
     rc = fp_add_ok(exact_off, pair, &proxy_off); if (rc) return rc;
     rc = fp_mul_ok(th, 2, &t); if (rc) return rc;
-    rc = fp_add_ok(proxy_off, t, &counts_off); if (rc) return rc;
+    // Both exact and proxy tables contain th * max_sel entries. Counts
+    // contain th * 2 entries; using that size for the proxy table only
+    // happened to work when max_sel==2.
+    rc = fp_add_ok(proxy_off, pair, &counts_off); if (rc) return rc;
     rc = fp_add_ok(counts_off, t, &total); if (rc) return rc;
     if (plan[6] != (int32_t)exact_off || plan[7] != (int32_t)proxy_off ||
         plan[8] != (int32_t)counts_off || plan[9] != (int32_t)total) {

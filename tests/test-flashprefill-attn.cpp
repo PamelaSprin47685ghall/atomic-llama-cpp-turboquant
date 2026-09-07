@@ -344,7 +344,7 @@ static bool host_select(
         bool partial = !cand_full[(size_t) j];
         bool kept = false;
         if (!partial && any_scored) kept = (s[(size_t) j] >= thr);
-        bool exact = partial || kept || cand_mandatory[(size_t) j] || exact_all;
+        bool exact = !any_scored || partial || kept || cand_mandatory[(size_t) j] || exact_all;
         if (exact) out_exact.push_back(j);
         else out_proxy.push_back(j);
     }
@@ -665,7 +665,9 @@ static void test_softcap_ordering(void) {
         std::vector<std::vector<float>> ke(1, std::vector<float>(2, 1.0f));
         std::vector<std::vector<float>> ve(1, std::vector<float>(1, 1.0f));
         fp_oracle::ProxyFrag p;
-        p.kbar = {1.0f, 1.0f};
+        // Different raw logits are essential: applying the same softcap to
+        // identical exact/proxy logits cancels from their relative weights.
+        p.kbar = {0.1f, 0.1f};
         p.vbar = {2.0f};
         p.count = 4;
         std::vector<float> q = {5.0f, 5.0f};
@@ -1000,7 +1002,7 @@ static void test_quant_storage(void) {
         {
             std::vector<float> q((size_t) D, 0.2f);
             // Q in storage domain: forward-WHT when K is turbo2/3.
-            bool k_needs_wht = (c.kt == GGML_TYPE_TURBO2_0 || c.kt == GGML_TYPE_TURBO3_0);
+            bool k_needs_wht = (c.kt == GGML_TYPE_TURBO2_0 || c.kt == GGML_TYPE_TURBO3_0 || c.kt == GGML_TYPE_TURBO4_0);
             std::vector<float> q_storage = q;
             if (k_needs_wht) fp_wht_rows(q_storage, D, fp_wht_group_for_dim(D), false);
             std::vector<std::vector<float>> ke_m, ve_m, ke_s, ve_s;
@@ -1024,7 +1026,7 @@ static void test_quant_storage(void) {
             }
             // V turbo2/3 storage output needs single inverse to reach model
             // output: verify inverse-once differs from zero/twice inverses.
-            bool v_needs_inv = (c.vt == GGML_TYPE_TURBO2_0 || c.vt == GGML_TYPE_TURBO3_0);
+            bool v_needs_inv = (c.vt == GGML_TYPE_TURBO2_0 || c.vt == GGML_TYPE_TURBO3_0 || c.vt == GGML_TYPE_TURBO4_0);
             if (v_needs_inv) {
                 std::vector<float> once = o_storage, twice = o_storage;
                 fp_wht_rows(once, D, fp_wht_group_for_dim(D), true);
@@ -1264,10 +1266,12 @@ struct BackendSel {
     std::string name;
     std::string desc;
     bool is_cpu = true;
+    bool required = false;
 };
 
 static BackendSel fp_pick_device(const std::string & want_backend, const std::string & required_backend, bool & failed) {
     BackendSel sel;
+    sel.required = !required_backend.empty();
     failed = false;
     ggml_backend_load_all();
     size_t n = ggml_backend_dev_count();
@@ -1431,7 +1435,7 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
     }
     // Storage domain for Q when K is turbo2/3 (forward WHT per head-group row).
     std::vector<float> q_storage = qhost;
-    bool k_needs_wht = (ktype == GGML_TYPE_TURBO2_0 || ktype == GGML_TYPE_TURBO3_0);
+    bool k_needs_wht = (ktype == GGML_TYPE_TURBO2_0 || ktype == GGML_TYPE_TURBO3_0 || ktype == GGML_TYPE_TURBO4_0);
     if (k_needs_wht) {
         // Q tensor layout [Dk,ngroups,Hq]: rows are (h*ngroups+g) vectors.
         fp_wht_rows(q_storage, dk, fp_wht_group_for_dim(dk), false);
@@ -1498,6 +1502,11 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
     if (!ggml_backend_supports_op(backend, tpool) ||
         !ggml_backend_supports_op(backend, tplan) ||
         !ggml_backend_supports_op(backend, tout)) {
+        if (sel.required) {
+            FP_CHECK_MSG(false, "%s: required backend '%s' lacks FLASH_PREFILL support",
+                    label.c_str(), sel.name.c_str());
+            return false;
+        }
         std::printf("SKIP %s: backend '%s' lacks FLASH_PREFILL support\n", label.c_str(), sel.name.c_str());
         ++g_skips;
         return true;
@@ -1597,52 +1606,37 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
         // use's q_group (frag0->g0, frag1->g1). Exact tokens use kd/vd rows;
         // proxy uses pool means with count=4.
         std::vector<float> ref_all((size_t) dv * (size_t) hq, 0.0f);
-        bool v_needs_inv = (vtype == GGML_TYPE_TURBO2_0 || vtype == GGML_TYPE_TURBO3_0);
         for (int h = 0; h < hq; ++h) {
-            // Gather per-use Q: need q_group per use from metadata.
-            // Uses were built as frag f -> qgroup f%ngroups.
-            std::vector<std::vector<float>> ke;
-            std::vector<std::vector<float>> ve;
-            std::vector<fp_oracle::ProxyFrag> proxies;
-            // Exact uses: expand to token rows.
+            // Each fragment has its own RoPE phase/Q group. Accumulate all
+            // exact tokens and proxies into ONE independent denominator.
+            fp_oracle::Mlo state = fp_oracle::mlo_init(dv);
+            bool ok = false;
             for (int u : exact_uses) {
-                int f = u; // use idx == frag id in this fixture
+                const int f = u;
+                const float * qh = q_storage.data() + ((size_t) h * ngroups + f % ngroups) * dk;
                 for (int i = 0; i < 4; ++i) {
-                    int tok = f * 4 + i;
-                    std::vector<float> kr((size_t) dk), vr((size_t) dv);
-                    for (int d = 0; d < dk; ++d) kr[(size_t) d] = kd[(size_t) tok * (size_t) dk + (size_t) d];
-                    for (int d = 0; d < dv; ++d) vr[(size_t) d] = vd[(size_t) tok * (size_t) dv + (size_t) d];
-                    ke.push_back(kr);
-                    ve.push_back(vr);
+                    const int tok = f * 4 + i;
+                    double dot = 0;
+                    for (int d = 0; d < dk; ++d) dot += (double) qh[d] * kd[(size_t) tok * dk + d];
+                    FP_CHECK(fp_oracle::mlo_add(state, scale * dot, vd.data() + (size_t) tok * dv,
+                            1, 1.0, softcap, ok) && ok);
                 }
             }
             for (int u : proxy_uses) {
-                int f = u;
-                fp_oracle::ProxyFrag pr;
-                pr.kbar.assign((size_t) dk, 0.0f);
-                pr.vbar.assign((size_t) dv, 0.0f);
-                for (int d = 0; d < dk; ++d) pr.kbar[(size_t) d] = pool_got[(size_t)(f * hkv + 0) * (size_t)(dk + dv) + (size_t) d];
-                for (int d = 0; d < dv; ++d) pr.vbar[(size_t) d] = pool_got[(size_t)(f * hkv + 0) * (size_t)(dk + dv) + (size_t)(dk + d)];
-                pr.count = 4;
-                proxies.push_back(pr);
+                const int f = u;
+                const float * qh = q_storage.data() + ((size_t) h * ngroups + f % ngroups) * dk;
+                const float * mean = pool_got.data() + (size_t) f * hkv * (dk + dv);
+                double dot = 0;
+                for (int d = 0; d < dk; ++d) dot += (double) qh[d] * mean[d];
+                FP_CHECK(fp_oracle::mlo_add(state, scale * dot, mean + dk, 4, 1.0, softcap, ok) && ok);
             }
-            // Q selection per head: if any proxy/exact mix spans groups, the
-            // single-denominator oracle needs per-fragment Q. Our fixture has
-            // frag0 g0 and frag1 g1; for simplicity use the Q variant of the
-            // first exact fragment when all-exact, else merge with per-fragment
-            // Q via manual Mlo (mirrors phase test). Here both fragments share
-            // similar Q (constructed alike), so head Q g0 is representative;
-            // strict phase coverage is in the host test. Use g0 Q for oracle.
-            const float * qh = q_storage.data() + ((size_t) h * (size_t) ngroups + 0) * (size_t) dk;
+            if (use_sink) {
+                FP_CHECK(fp_oracle::mlo_add_sink(state, sink_val, ok) && ok);
+            }
             std::vector<float> out;
-            bool has_sink = use_sink;
-            double slog = use_sink ? (double) sink_val : 0.0;
-            FP_CHECK(fp_oracle::attend_row(qh, dk, ke, ve, proxies, dv, scale, softcap, has_sink, slog, out));
-            if (v_needs_inv) {
-                // Backend output is model domain (single inverse applied);
-                // bring storage oracle to model domain for comparison.
-                fp_wht_rows(out, dv, fp_wht_group_for_dim(dv), true);
-            }
+            FP_CHECK(fp_oracle::mlo_finalize(state, out, ok) && ok);
+            // The raw ATTN op returns the stored V domain. The llama graph
+            // applies inverse WHT afterwards; do not rotate only the oracle.
             for (int d = 0; d < dv; ++d) ref_all[(size_t) h * (size_t) dv + (size_t) d] = out[(size_t) d];
         }
         // Backend output layout [Dv,Hq,1]: (d,h,0).
@@ -1681,6 +1675,16 @@ static void test_backend_quant(ggml_backend_t backend, const BackendSel & sel) {
     fp_backend_sparse_once(backend, sel, 128, 128, 1, 2, 2,
             GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, 0.25f, 0.0f, 0.15f, 0, false, 0.0f,
             "backend-sparse-turbo3", 5e-3, 5e-2);
+    // Mixed K/V storage is the deployment case, not just equal-bit caches.
+    for (ggml_type ktype : { GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0 }) {
+        for (int exact_all : { 0, 1 }) {
+            const std::string label = std::string(exact_all ? "backend-exactall-" : "backend-sparse-") +
+                ggml_type_name(ktype) + "-turbo2";
+            fp_backend_sparse_once(backend, sel, 128, 128, 1, 2, 2,
+                    ktype, GGML_TYPE_TURBO2_0, 0.25f, 0.0f, 0.15f, exact_all, false, 0.0f,
+                    label, 5e-3, 5e-2);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

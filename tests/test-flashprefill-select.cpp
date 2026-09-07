@@ -294,23 +294,17 @@ static void test_packgqa_mapping() {
                     SELECT_CHECK_MSG(pos * g + sub == r, "G=%lld pack round trip r=%lld",
                             (long long) g, (long long) r);
                 }
-                // Boundary-split prediction: tile t>0 starts mid-group iff
-                // (t*BM) % G != 0; such a tile must span two positions.
+                // Starting mid-group means sharing a position with the
+                // preceding tile, not necessarily spanning two positions
+                // within this tile (BM=1 is an immediate counterexample).
                 for (int64_t t = 0; t < ntiles; ++t) {
                     const int64_t start = t * bm;
                     const int64_t end = std::min(start + bm, npack);
                     const bool predicted_split = (t > 0) && ((start % g) != 0);
-                    const bool observed_split = (start / g) != ((end - 1) / g);
-                    if (predicted_split) {
-                        SELECT_CHECK_MSG(observed_split,
-                                "G=%lld BM=%lld nt=%lld tile %lld starts mid-group but shows no split",
-                                (long long) g, (long long) bm, (long long) nt, (long long) t);
-                    }
-                    if (!predicted_split && (end - start) <= g) {
-                        SELECT_CHECK_MSG(!observed_split,
-                                "G=%lld BM=%lld nt=%lld tile %lld aligned but split",
-                                (long long) g, (long long) bm, (long long) nt, (long long) t);
-                    }
+                    const bool observed_split = start > 0 && start / g == (start - 1) / g;
+                    SELECT_CHECK(predicted_split == observed_split);
+                    const int64_t positions = (start % g + end - start + g - 1) / g;
+                    SELECT_CHECK(positions == (end - 1) / g - start / g + 1);
                 }
                 // Partial tail tile holds exactly the remainder rows.
                 const int64_t tail = npack - (ntiles - 1) * bm;
@@ -403,21 +397,22 @@ static bool check_oracle_vs_ref(const char * what,
 
 // Global-max discriminator: spiky fragment (strong in one row, weak in the
 // other) beats a uniformly mediocre fragment under tile-energy, while a
-// per-row-top-1-union or a mean-logit rule would keep the mediocre one.
+// per-row-top-1-union would also retain a weak candidate.
 static void test_energy_global_max_not_head_topk() {
     std::puts("--- energy: global max over rows, not head top-k / mean ---");
     constexpr int32_t dk = 4;
     constexpr int32_t n_rows = 2;
     constexpr int32_t n_cand = 3; // A spiky, B flat, C weak
-    // row0 Q = +8*e0, row1 Q = -8*e0; kbarA=+8*e0, kbarB=0, kbarC=-8*e0.
-    // scale=1/8: z(A)=(8,-8) M=8; S[A]=1+e^-16~=1, S[B]=2e^-8~=0.00067,
-    // S[C]=2e^-16~=0. alpha=0.5 keeps A only. Union-of-top-1 keeps {A,C}
-    // (C is row1's top-1); mean-logit ties A/B/C at 0. Energy keeps A.
+    // row0 Q = +8*e0, row1 Q = -4*e0; kbarA=+8*e0, kbarB=0, kbarC=-8*e0.
+    // scale=1/8: z(A)=(8,-4), z(C)=(-8,4), M=8.
+    // S[A]=1+e^-12, S[B]=2e^-8, S[C]=e^-16+e^-4. alpha=.5 keeps A
+    // only, unlike the row-top-1 union {A,C}. Symmetric +/-8 queries would
+    // give A and C equal energy and cannot discriminate these algorithms.
     std::vector<float> qpair((size_t) n_rows * n_cand * dk, 0.0f);
     std::vector<float> kbar((size_t) n_cand * dk, 0.0f);
     for (int32_t j = 0; j < n_cand; ++j) {
         qpair[((size_t) 0 * n_cand + j) * dk + 0] = 8.0f;
-        qpair[((size_t) 1 * n_cand + j) * dk + 0] = -8.0f;
+        qpair[((size_t) 1 * n_cand + j) * dk + 0] = -4.0f;
     }
     kbar[0 * dk + 0] = 8.0f;   // A: +e0
     kbar[2 * dk + 0] = -8.0f;  // C: -e0 (B stays zero)
@@ -1038,11 +1033,12 @@ static void test_metadata_rejections() {
                         GGML_FLASHPREFILL_ERR_DUP_KEY,
                 "dup row key rejected");
     }
-    // Duplicate token in one triple: point frag 1's use at frag 0's cells.
+    // Duplicate physical token in one triple while keeping each use inside
+    // its own fragment's legal cell-index range.
     {
         std::vector<int32_t> bad = fx.meta;
-        SELECT_CHECK(ggml_flashprefill_metadata_set_use(bad.data(), fx.meta_words, 1,
-                1, 0, 0, 0, 0, 2, 0, 0) == GGML_FLASHPREFILL_OK);
+        SELECT_CHECK(ggml_flashprefill_metadata_set_cell(bad.data(), fx.meta_words, 2, 0) ==
+                GGML_FLASHPREFILL_OK);
         SELECT_CHECK_MSG(ggml_flashprefill_metadata_validate(bad.data(), fx.meta_words) ==
                         GGML_FLASHPREFILL_ERR_DUP_TOKEN,
                 "dup token rejected");
