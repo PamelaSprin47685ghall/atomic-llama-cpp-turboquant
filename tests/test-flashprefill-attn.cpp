@@ -1386,12 +1386,14 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
                                    float scale, float softcap, float alpha, int exact_all,
                                    bool use_sink, float sink_val,
                                    const std::string & label, double atol, double rtol,
-                                   bool padded_uses = false, bool mean_correction = true) {
+                                   bool padded_uses = false, bool mean_correction = true,
+                                   int tokens_per_frag = 4) {
     (void) sel;
-    // Fixture: Nk=8 in 2 fragments (4+4), frag0 mandatory (sink block),
+    // Fixture: two equal fragments, frag0 mandatory (sink block),
     // frag0 g0, frag1 g1 (two phases, one denominator).
-    const int Nk = 8;
-    std::vector<int> counts = {4, 4};
+    FP_CHECK(tokens_per_frag > 0);
+    const int Nk = 2 * tokens_per_frag;
+    std::vector<int> counts = {tokens_per_frag, tokens_per_frag};
     std::vector<int> mandatory = {1, 0};
     std::vector<int> qgroups = {0 % ngroups, 1 % ngroups};
     std::vector<int32_t> meta;
@@ -1424,12 +1426,12 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
     // Make Q resemble frag0 direction: copy frag0 model mean + small noise.
     {
         std::vector<double> m0((size_t) dk, 0.0);
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < tokens_per_frag; ++i)
             for (int d = 0; d < dk; ++d) m0[(size_t) d] += km[(size_t) i * (size_t) dk + (size_t) d];
         for (int g = 0; g < ngroups; ++g) {
             for (int h = 0; h < hq; ++h) {
                 for (int d = 0; d < dk; ++d) {
-                    float base = (float)(m0[(size_t) d] / 4.0);
+                    float base = (float)(m0[(size_t) d] / (double) tokens_per_frag);
                     qhost[((size_t) h * (size_t) ngroups + (size_t) g) * (size_t) dk + (size_t) d] = base * 0.8f + qhost[((size_t) h * (size_t) ngroups + (size_t) g) * (size_t) dk + (size_t) d] * 0.2f;
                 }
             }
@@ -1578,18 +1580,18 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
         // Pool layout: pool[(f*Hkv+h)*(Dk+Dv)+d], K rows [0,Dk), V [Dk,Dk+Dv).
         double max_abs = 0.0;
         for (int f = 0; f < 2; ++f) {
-            // Fragment f covers tokens [f*4,4).
+            // Fragment f covers one contiguous token range.
             for (int d = 0; d < dk; ++d) {
                 double acc = 0.0;
-                for (int i = 0; i < 4; ++i) acc += kd[(size_t)(f * 4 + i) * (size_t) dk + (size_t) d];
-                float want = (float)(acc / 4.0);
+                for (int i = 0; i < tokens_per_frag; ++i) acc += kd[(size_t)(f * tokens_per_frag + i) * (size_t) dk + (size_t) d];
+                float want = (float)(acc / (double) tokens_per_frag);
                 float got = pool_got[(size_t)(f * hkv + 0) * (size_t)(dk + dv) + (size_t) d];
                 max_abs = std::max(max_abs, std::abs((double) got - (double) want));
             }
             for (int d = 0; d < dv; ++d) {
                 double acc = 0.0;
-                for (int i = 0; i < 4; ++i) acc += vd[(size_t)(f * 4 + i) * (size_t) dv + (size_t) d];
-                float want = (float)(acc / 4.0);
+                for (int i = 0; i < tokens_per_frag; ++i) acc += vd[(size_t)(f * tokens_per_frag + i) * (size_t) dv + (size_t) d];
+                float want = (float)(acc / (double) tokens_per_frag);
                 float got = pool_got[(size_t)(f * hkv + 0) * (size_t)(dk + dv) + (size_t)(dk + d)];
                 max_abs = std::max(max_abs, std::abs((double) got - (double) want));
             }
@@ -1629,8 +1631,8 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
             for (int u : exact_uses) {
                 const int f = u;
                 const float * qh = q_storage.data() + ((size_t) h * ngroups + f % ngroups) * dk;
-                for (int i = 0; i < 4; ++i) {
-                    const int tok = f * 4 + i;
+                for (int i = 0; i < tokens_per_frag; ++i) {
+                    const int tok = f * tokens_per_frag + i;
                     double dot = 0;
                     for (int d = 0; d < dk; ++d) dot += (double) qh[d] * kd[(size_t) tok * dk + d];
                     FP_CHECK(fp_oracle::mlo_add(state, scale * dot, vd.data() + (size_t) tok * dv,
@@ -1644,7 +1646,7 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
                 const float * mean = pool_got.data() + (size_t) f * hkv * (dk + dv);
                 double dot = 0;
                 for (int d = 0; d < dk; ++d) dot += (double) qh[d] * mean[d];
-                FP_CHECK(fp_oracle::mlo_add(state, scale * dot, mean + dk, 4, 1.0, softcap, ok) && ok);
+                FP_CHECK(fp_oracle::mlo_add(state, scale * dot, mean + dk, tokens_per_frag, 1.0, softcap, ok) && ok);
             }
             if (use_sink) {
                 FP_CHECK(fp_oracle::mlo_add_sink(state, sink_val, ok) && ok);
@@ -1808,6 +1810,16 @@ static void test_backend_value_accumulation(ggml_backend_t backend, const Backen
     fp_backend_sparse_once(backend, sel, 128, 256, 1, 2, 2,
             GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0, 8.0f, 1.5f, 1.0f, 0, true, 2.0f,
             "backend-values-turbo4-turbo2-dv256", 5e-3, 5e-2, true);
+
+    // Long online-softmax accumulation: one full exact fragment plus one
+    // proxy fragment. Repeated M/L/O rescaling must stay close to the same
+    // double-precision oracle, including split-K partial merge.
+    for (bool split : {false, true}) {
+        fp_backend_sparse_once(backend, sel, 64, 128, 1, 2, 2,
+                GGML_TYPE_F16, GGML_TYPE_F16, 8.0f, 1.5f, 1.0f, 0, true, 2.0f,
+                std::string("backend-values-long128-") + (split ? "split" : "single"),
+                3e-4, 3e-3, split, true, 128);
+    }
     // The default boundary-layer V policy uses Q8, even with --ctv turbo2.
     for (int exact : {0, 1}) for (bool split : {false, true}) {
         fp_backend_sparse_once(backend, sel, 128, 128, 1, 2, 2,
