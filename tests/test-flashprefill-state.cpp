@@ -1878,7 +1878,9 @@ static void test_ordinary_foreign_isolation() {
     // cell (ext.y far beyond pos) that must neither poison the build nor
     // inflate F once the pool is restricted to active query membership.
     llama_kv_cells base;
-    base.resize(130);
+    // resize() resets every cell; reserve the foreign-cell range before
+    // populating A rather than clearing the copied snapshot below.
+    base.resize(200);
     base.set_generation_enabled(true);
     for (uint32_t i = 0; i < 128; ++i) {
         if (i == 40 || i == 41) {
@@ -1891,7 +1893,7 @@ static void test_ordinary_foreign_isolation() {
     base.seq_add(11, 6);
 
     llama_kv_cells with_foreign = base; // copy keeps A physical indices
-    with_foreign.resize(200);
+    CHECK(with_foreign.seq_get_used(5) == 126);
     for (uint32_t k = 0; k < 64; ++k) {
         const uint32_t i = 130 + k;
         with_foreign.pos_set(i, (llama_pos) (1000 + k));
@@ -1900,6 +1902,8 @@ static void test_ordinary_foreign_isolation() {
     with_foreign.pos_set(194, 2000);
     with_foreign.seq_add(194, 6);
     with_foreign.ext_set(194, {(llama_pos) 0, (llama_pos) 3000}); // image pattern: ext.y >> pos
+    CHECK(with_foreign.seq_get_used(5) == 126);
+    CHECK(with_foreign.get_used() == 191);
 
     // One stream; queries ask seq 5 only. B (seq 6) is never queried.
     std::vector<uint32_t> seq_to_stream(8, 0);
