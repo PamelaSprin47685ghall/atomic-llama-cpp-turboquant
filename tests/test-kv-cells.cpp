@@ -5,8 +5,6 @@
 #endif
 
 #include "../src/llama-kv-cells.h"
-#include "../src/llama-turbo-config.h"
-
 #include <cassert>
 
 static llama_kv_rerot_meta make_rerot_meta(
@@ -27,16 +25,6 @@ static llama_kv_rerot_meta make_rerot_meta(
 }
 
 int main() {
-    // Layer-adaptive resolution is per cache instance. A turbo2-V cache may
-    // auto-enable boundary-Q8 mode 7, but a later turbo3-V cache in the same
-    // process must not inherit that choice.
-    assert(llama_turbo_layer_adaptive_mode(GGML_TYPE_TURBO2_0, 44, nullptr) == 7);
-    assert(llama_turbo_layer_adaptive_mode(GGML_TYPE_TURBO3_0, 44, nullptr) == 0);
-    assert(llama_turbo_layer_adaptive_mode(GGML_TYPE_TURBO4_0, 44, nullptr) == 0);
-    assert(llama_turbo_layer_adaptive_mode(GGML_TYPE_TURBO2_0, 7,  nullptr) == 0);
-    assert(llama_turbo_layer_adaptive_mode(GGML_TYPE_TURBO2_0, 44, "0") == 0);
-    assert(llama_turbo_layer_adaptive_mode(GGML_TYPE_TURBO3_0, 44, "5") == 5);
-
     llama_kv_cells cells;
     cells.resize(4);
 

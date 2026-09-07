@@ -136,6 +136,10 @@ if (NOT MSVC)
 endif()
 llama_test(test-turbo-quant)
 
+add_executable(test-turbo-config test-turbo-config.cpp)
+target_link_libraries(test-turbo-config PRIVATE ggml-base)
+llama_test(test-turbo-config)
+
 llama_build(test-tokenizer-0.cpp)
 
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-bert-bge          ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-bert-bge.gguf)
