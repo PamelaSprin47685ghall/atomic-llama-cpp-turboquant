@@ -1866,7 +1866,7 @@ bool server_rerot_runtime::freeze_fork_parent(
     }
 
     std::vector<uint8_t> parent_seed = parent->hand_seed;
-    if (memory_ && parent_seed.empty()) {
+    if (memory_) {
         const size_t seed_size =
             llama_memory_rerot_capture_hand_seed(
                 memory_, parent->exec_seq, nullptr, 0);
@@ -1885,11 +1885,12 @@ bool server_rerot_runtime::freeze_fork_parent(
                 *current,
                 "failed to capture the parent recurrent hand seed");
         }
+        parent->hand_seed = parent_seed;
+
         if (need_archive && current->base_prefix_end > 0) {
             llama_memory_seq_cp_attention(
                 memory_, parent->exec_seq, archive_seq, 0, current->base_prefix_end);
         }
-
         archive_public_runs(*current, *parent, archive_seq);
 
         if (!llama_memory_seq_rm_attention(memory_, parent->exec_seq, -1, -1) ||
@@ -1910,22 +1911,6 @@ bool server_rerot_runtime::freeze_fork_parent(
         child_runtime->parked_seq = child.second;
         child_runtime->storage_pos_next = parent->storage_pos_next;
         child_runtime->hand_seed = parent_seed;
-        if (child_runtime->hand_seed.size() >=
-            sizeof(uint32_t) + sizeof(llama_pos)) {
-            uint32_t seed_magic = 0;
-            std::memcpy(
-                &seed_magic,
-                child_runtime->hand_seed.data(),
-                sizeof(seed_magic));
-            if (seed_magic == 0x32454553) {
-                const llama_pos seed_pos =
-                    std::max<llama_pos>(0, parent->storage_pos_next - 1);
-                std::memcpy(
-                    child_runtime->hand_seed.data() + sizeof(uint32_t),
-                    &seed_pos,
-                    sizeof(seed_pos));
-            }
-        }
     }
 
     const int released_slot = parent->physical_slot;
@@ -2012,6 +1997,37 @@ bool server_rerot_runtime::admit_next_child(
             return fail_episode(
                 *current,
                 "failed to transfer parked attention state during admission");
+        }
+
+        const auto * parent_doc = current->document.node(child_doc->parent);
+        const llama_rerot_run * anchor = nullptr;
+        if (parent_doc) {
+            for (const auto run_id : parent_doc->runs) {
+                const auto * run = current->document.run(run_id);
+                if (!run ||
+                    run->visibility != llama_rerot_visibility::public_live ||
+                    run->token_count == 0) {
+                    continue;
+                }
+                const int64_t end =
+                    int64_t(run->storage_pos0) + int64_t(run->token_count);
+                const int64_t anchor_end = anchor
+                    ? int64_t(anchor->storage_pos0) +
+                        int64_t(anchor->token_count)
+                    : -1;
+                if (end > anchor_end) {
+                    anchor = run;
+                }
+            }
+        }
+        if (!anchor ||
+            int64_t(anchor->storage_pos0) + int64_t(anchor->token_count) !=
+                child->storage_pos_next ||
+            llama_memory_rerot_add_run_ref(
+                memory_, current->id, anchor->id, exec_seq) == 0) {
+            return fail_episode(
+                *current,
+                "RERoT child admission could not anchor the fork frontier");
         }
 
         if (child->hand_seed.empty() ||

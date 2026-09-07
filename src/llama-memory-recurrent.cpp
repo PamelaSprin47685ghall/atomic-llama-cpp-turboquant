@@ -1025,10 +1025,70 @@ std::shared_ptr<llama_memory_recurrent::hand_seed> llama_memory_recurrent::captu
             read_row(r_l[il], seed->conv_tail_bytes[il]);
         }
     }
+    const int32_t brain_row = brain_row_for_seq(source_seq);
+    const bool private_planner =
+        is_grouped_layout() &&
+        brain_row >= 0 &&
+        seq_episode[(size_t) source_seq] != 0 &&
+        seq_node[(size_t) source_seq] == 0 &&
+        seq_public_write[(size_t) source_seq] == 0;
+
     for (size_t il = 0; il < s_l.size(); ++il) {
-        if (s_l[il] && !is_s_shared((int32_t) il)) {
-            read_row(s_l[il], seed->state_bytes[il]);
+        if (!s_l[il]) {
+            continue;
         }
+        if (!is_s_shared((int32_t) il)) {
+            read_row(s_l[il], seed->state_bytes[il]);
+            continue;
+        }
+
+        ggml_tensor * hand_state = d_l[il];
+        if (!private_planner) {
+            read_row(hand_state, seed->state_bytes[il]);
+            continue;
+        }
+
+        ggml_tensor * brain_state = s_l[il];
+        if (brain_state->type != GGML_TYPE_F32 ||
+            hand_state->type != GGML_TYPE_F16 ||
+            brain_state->ne[0] != hand_state->ne[0]) {
+            return nullptr;
+        }
+        const size_t n = (size_t) brain_state->ne[0];
+        const size_t brain_row_size =
+            ggml_row_size(brain_state->type, brain_state->ne[0]);
+        const size_t hand_row_size =
+            ggml_row_size(hand_state->type, hand_state->ne[0]);
+        std::vector<float> public_brain(n);
+        std::vector<float> private_brain(n);
+        std::vector<ggml_fp16_t> planner_hand(n);
+        std::vector<ggml_fp16_t> child_hand(n);
+        ggml_backend_tensor_get(
+            brain_state,
+            public_brain.data(),
+            (size_t) brain_row * brain_row_size,
+            brain_row_size);
+        ggml_backend_tensor_get(
+            brain_state,
+            private_brain.data(),
+            ((size_t) n_brain_rows + (size_t) brain_row) * brain_row_size,
+            brain_row_size);
+        ggml_backend_tensor_get(
+            hand_state,
+            planner_hand.data(),
+            (size_t) row * hand_row_size,
+            hand_row_size);
+        for (size_t i = 0; i < n; ++i) {
+            child_hand[i] = ggml_fp32_to_fp16(
+                private_brain[i] +
+                ggml_fp16_to_fp32(planner_hand[i]) -
+                public_brain[i]);
+        }
+        seed->state_bytes[il].resize(hand_row_size);
+        std::memcpy(
+            seed->state_bytes[il].data(),
+            child_hand.data(),
+            hand_row_size);
     }
     if (backend_sched) {
         ggml_backend_sched_synchronize(backend_sched);
@@ -1102,11 +1162,18 @@ bool llama_memory_recurrent::apply_hand_seed(
     for (size_t il = 0; il < s_l.size(); ++il) {
         if (is_s_shared((int32_t) il)) {
             ggml_tensor * hand_echo = d_l[il];
-            const size_t row_size =
-                ggml_row_size(hand_echo->type, hand_echo->ne[0]);
-            zero_row.assign(row_size, 0);
-            if (!write_row(hand_echo, zero_row)) {
-                return false;
+            if (il < seed->state_bytes.size() &&
+                !seed->state_bytes[il].empty()) {
+                if (!write_row(hand_echo, seed->state_bytes[il])) {
+                    return false;
+                }
+            } else {
+                const size_t row_size =
+                    ggml_row_size(hand_echo->type, hand_echo->ne[0]);
+                zero_row.assign(row_size, 0);
+                if (!write_row(hand_echo, zero_row)) {
+                    return false;
+                }
             }
         } else if (il < seed->state_bytes.size() &&
                    s_l[il] &&
@@ -1138,8 +1205,11 @@ size_t llama_memory_recurrent::rerot_hand_seed_size(llama_seq_id source_seq) con
     }
     for (size_t il = 0; il < s_l.size(); ++il) {
         total_bytes += sizeof(uint32_t);
-        if (s_l[il] && !is_s_shared((int32_t) il)) {
-            total_bytes += ggml_row_size(s_l[il]->type, s_l[il]->ne[0]);
+        ggml_tensor * hand_state =
+            is_s_shared((int32_t) il) ? d_l[il] : s_l[il];
+        if (hand_state) {
+            total_bytes +=
+                ggml_row_size(hand_state->type, hand_state->ne[0]);
         }
     }
     return total_bytes;
