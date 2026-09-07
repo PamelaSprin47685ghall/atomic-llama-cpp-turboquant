@@ -899,6 +899,14 @@ void process_shaders() {
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
 
+    // FlashPrefill V2 (single F32 variant per op; K/V runtime specialization
+    // via FaTypeK/V + FaBlockBytes spec constants like FA, no coopmat dupes).
+    // DATA_A_IQ4_NL provides the shared LUT for IQ4_NL K/V decode.
+    string_to_spv("flashprefill_pool", "flashprefill_pool.comp", {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV4", "vec4"}, {"DATA_A_IQ4_NL", "1"}});
+    string_to_spv("flashprefill_select", "flashprefill_select.comp", {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV4", "vec4"}, {"DATA_A_IQ4_NL", "1"}});
+    string_to_spv("flashprefill_attn", "flashprefill_attn.comp", {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV4", "vec4"}, {"DATA_A_IQ4_NL", "1"}});
+    string_to_spv("flashprefill_merge", "flashprefill_merge.comp", {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV4", "vec4"}});
+
     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});
     string_to_spv("quantize_q8_1_subgroup", "quantize_q8_1.comp", {{"USE_SUBGROUPS", "1"}});
 

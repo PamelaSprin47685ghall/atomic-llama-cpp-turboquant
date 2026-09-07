@@ -6039,6 +6039,10 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
             return op->src[0]->ne[0] <= SYCL_SOLVE_TRI_MAX_N && op->src[1]->ne[0] <= SYCL_SOLVE_TRI_MAX_K;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_sycl_flash_attn_ext_supported(device, op);
+        case GGML_OP_FLASH_PREFILL_POOL:
+        case GGML_OP_FLASH_PREFILL_SELECT:
+        case GGML_OP_FLASH_PREFILL_ATTN:
+            return false;
         default:
             return false;
     }

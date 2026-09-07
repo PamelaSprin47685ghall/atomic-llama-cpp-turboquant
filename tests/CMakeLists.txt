@@ -178,6 +178,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-triattention-score.cpp)
     target_include_directories(test-triattention-score PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
+    foreach(component routing select attn state)
+        llama_build_and_test(test-flashprefill-${component}.cpp)
+        target_include_directories(test-flashprefill-${component} PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    endforeach()
+    # test-flashprefill-state exercises the real RERoT runtime (chains B/E/G:
+    # episode codec, context shift, pen suspend/resume) — same extra source
+    # and include dir as test-rerot-runtime.
+    target_sources(test-flashprefill-state PRIVATE ${PROJECT_SOURCE_DIR}/tools/server/server-rerot.cpp)
+    target_include_directories(test-flashprefill-state PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+
     llama_build_and_test(test-backend-memmove.cpp)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)

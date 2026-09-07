@@ -2121,6 +2121,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
             } break;
+        case GGML_OP_FLASH_PREFILL_POOL:
+            {
+                ggml_compute_forward_flash_prefill_pool(params, tensor);
+            } break;
+        case GGML_OP_FLASH_PREFILL_SELECT:
+            {
+                ggml_compute_forward_flash_prefill_select(params, tensor);
+            } break;
+        case GGML_OP_FLASH_PREFILL_ATTN:
+            {
+                ggml_compute_forward_flash_prefill_attn(params, tensor);
+            } break;
         case GGML_OP_DSV4_HC_COMB:
             {
                 ggml_compute_forward_dsv4_hc_comb(params, tensor);
@@ -2460,6 +2472,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
+        case GGML_OP_FLASH_PREFILL_POOL:
+        case GGML_OP_FLASH_PREFILL_SELECT:
+        case GGML_OP_FLASH_PREFILL_ATTN:
             {
                 n_tasks = n_threads;
             } break;
@@ -3028,6 +3043,71 @@ struct ggml_cplan ggml_graph_plan(
                         const enum ggml_type vec_dot_type = type_traits_cpu[node->src[1]->type].vec_dot_type;
                         const size_t q_row = GGML_PAD(ggml_row_size(vec_dot_type, DK), CACHE_LINE_SIZE);
                         cur += (q_row + 2 * sizeof(float) * DV + CACHE_LINE_SIZE) * n_tasks;
+                    } break;
+                case GGML_OP_FLASH_PREFILL_POOL:
+                    {
+                        // Per-thread: decoded K row + decoded V row (F32) +
+                        // double means accumulators. Dk+Dv == dst ne0.
+                        // CPU-ref reserve only (never feeds GPU fitting);
+                        // checked multiplication saturates instead of
+                        // wrapping to an under-allocation.
+                        const int64_t DkDv = node->ne[0] > 0 ? node->ne[0] : 0;
+                        const size_t fbytes = (size_t)DkDv * sizeof(float);
+                        const size_t sums_off = (fbytes + 7u) & ~7u;
+                        size_t per_thread = sums_off + 64u;
+                        if ((size_t)DkDv > (SIZE_MAX - per_thread) / sizeof(double)) {
+                            cur = SIZE_MAX;
+                        } else {
+                            per_thread += (size_t)DkDv * sizeof(double);
+                            if (n_tasks > 0 && per_thread > (SIZE_MAX - cur) / (size_t)n_tasks) {
+                                cur = SIZE_MAX;
+                            } else {
+                                cur += per_thread * (size_t)n_tasks;
+                            }
+                        }
+                    } break;
+                case GGML_OP_FLASH_PREFILL_SELECT:
+                    {
+                        // Per-thread: aggregates + S energies + use/frag index
+                        // buffers, conservatively bounded by plan words
+                        // (max_sel_pair <= plan words). Matches ops.cpp.
+                        // CPU-ref reserve only; checked multiplication.
+                        const int64_t W = node->ne[0] > 0 ? node->ne[0] : 0;
+                        const size_t stride = sizeof(double) + 2u * sizeof(int32_t);
+                        if ((size_t)W > (SIZE_MAX - 128u) / stride) {
+                            cur = SIZE_MAX;
+                        } else {
+                            const size_t per_thread = 128u + (size_t)W * stride;
+                            if (n_tasks > 0 && per_thread > (SIZE_MAX - cur) / (size_t)n_tasks) {
+                                cur = SIZE_MAX;
+                            } else {
+                                cur += per_thread * (size_t)n_tasks;
+                            }
+                        }
+                    } break;
+                case GGML_OP_FLASH_PREFILL_ATTN:
+                    {
+                        // Per-thread: decoded K row + decoded V row + MLO
+                        // accum + finalize tmp. Dk from Q, Dv from dst.
+                        // CPU-ref reserve only; checked multiplication.
+                        const int64_t DK = (node->src[0] && node->src[0]->ne[0] > 0) ? node->src[0]->ne[0] : 0;
+                        const int64_t DV = node->ne[0] > 0 ? node->ne[0] : 0;
+                        size_t per_thread = 64u;
+                        if ((size_t)DK > (SIZE_MAX - per_thread) / sizeof(float)) {
+                            cur = SIZE_MAX;
+                        } else {
+                            per_thread += (size_t)DK * sizeof(float);
+                            if ((size_t)DV > (SIZE_MAX - per_thread) / (sizeof(float) * 3u)) {
+                                cur = SIZE_MAX;
+                            } else {
+                                per_thread += (size_t)DV * sizeof(float) * 3u;
+                                if (n_tasks > 0 && per_thread > (SIZE_MAX - cur) / (size_t)n_tasks) {
+                                    cur = SIZE_MAX;
+                                } else {
+                                    cur += per_thread * (size_t)n_tasks;
+                                }
+                            }
+                        }
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {

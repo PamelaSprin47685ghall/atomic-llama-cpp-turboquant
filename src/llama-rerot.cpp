@@ -955,3 +955,115 @@ std::vector<float> llama_rerot_ddvr_attention_qside(
     return softmax_weighted_values(scores, values, value_dim);
 }
 
+// ---------------------------------------------------------------------------
+// FlashPrefill legal-fragment table helpers (CacheFragments; pure, no owner)
+// ---------------------------------------------------------------------------
+
+std::vector<llama_rerot_table_fragment> llama_rerot_split_table_fragments(
+        const llama_rerot_table_member * members,
+        size_t n,
+        llama_pos virtual_pos0,
+        uint32_t block_k) {
+    if (block_k == 0) {
+        throw std::invalid_argument("RERoT table block_k must be non-zero");
+    }
+    std::vector<llama_rerot_table_fragment> out;
+    if (n == 0) {
+        return out;
+    }
+    if (!members) {
+        throw std::invalid_argument("RERoT table members must not be null");
+    }
+    if (virtual_pos0 < 0 || uint64_t(virtual_pos0) + uint64_t(n) > uint64_t(std::numeric_limits<llama_pos>::max()) + 1u) {
+        throw std::overflow_error("RERoT table virtual positions exceed llama_pos range");
+    }
+    out.reserve(n);
+
+    const auto cut_key = [&](size_t i, int64_t & phase_bias, uint64_t & vblock) {
+        if (members[i].storage_pos < 0) {
+            throw std::invalid_argument("RERoT table storage position must be non-negative");
+        }
+        const llama_pos virt = virtual_pos0 + static_cast<llama_pos>(i);
+        phase_bias = int64_t(members[i].storage_pos) - int64_t(virt);
+        vblock = uint64_t(virt) / uint64_t(block_k);
+    };
+
+    uint32_t frag_begin = 0;
+    int64_t prev_bias = 0;
+    uint64_t prev_block = 0;
+    cut_key(0, prev_bias, prev_block);
+
+    for (size_t i = 1; i < n; ++i) {
+        int64_t bias = 0;
+        uint64_t block = 0;
+        cut_key(i, bias, block);
+        const bool cut = block != prev_block || bias != prev_bias ||
+                         members[i].visibility != members[i - 1].visibility ||
+                         members[i].gated != members[i - 1].gated;
+        if (cut) {
+            out.push_back({ frag_begin, static_cast<uint32_t>(i),
+                            virtual_pos0 + static_cast<llama_pos>(frag_begin),
+                            prev_bias, members[i - 1].visibility, members[i - 1].gated });
+            frag_begin = static_cast<uint32_t>(i);
+            prev_bias = bias;
+            prev_block = block;
+        }
+    }
+    out.push_back({ frag_begin, static_cast<uint32_t>(n),
+                    virtual_pos0 + static_cast<llama_pos>(frag_begin),
+                    prev_bias, members[n - 1].visibility, members[n - 1].gated });
+    return out;
+}
+
+bool llama_rerot_cell_visible_public_full(
+        const llama_kv_rerot_meta & meta,
+        const llama_rerot_reader_state & reader) {
+    if (!meta.active() || meta.visibility != llama_rerot_visibility::public_live) {
+        return false;
+    }
+    if (meta.episode_id != reader.episode_id) {
+        return false;
+    }
+    if (meta.frontier < reader.frontier) {
+        return true;
+    }
+    if (meta.frontier == reader.frontier && meta.node_id != reader.reader &&
+        reader.frontier_mode == LLAMA_REROT_FRONTIER_STRONG) {
+        return true;
+    }
+    return false;
+}
+
+bool llama_rerot_cell_visible_gated(
+        const llama_kv_rerot_meta & meta,
+        const llama_rerot_reader_state & reader,
+        bool is_untagged_base,
+        bool owned_by_reader,
+        llama_pos storage_pos,
+        llama_pos query_storage_pos) {
+    if (!owned_by_reader || storage_pos < 0 || query_storage_pos < 0) {
+        return false;
+    }
+    if (storage_pos > query_storage_pos) {
+        return false;
+    }
+    if (is_untagged_base) {
+        return true;
+    }
+    if (!meta.active() || meta.episode_id != reader.episode_id) {
+        return false;
+    }
+    switch (meta.visibility) {
+        case llama_rerot_visibility::public_live:
+            // Own-node frontier-equal arm only; older-frontier and strong
+            // foreign-node cases are covered by the FULL predicate above.
+            return meta.frontier == reader.frontier && meta.node_id == reader.reader;
+        case llama_rerot_visibility::private_control:
+        case llama_rerot_visibility::pending_record:
+            return meta.node_id == reader.reader;
+        case llama_rerot_visibility::normal:
+            return false;
+    }
+    return false;
+}
+

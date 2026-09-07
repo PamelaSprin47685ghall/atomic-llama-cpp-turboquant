@@ -5,6 +5,15 @@
 #include "llama-hparams.h"
 #include "llama-adapter.h"
 
+// FlashPrefill V2 contracts (GraphIntegration consumes, never redefines):
+// - PolicyCore: public policy/roles/routes + internal route/pack/scratch helpers.
+// - CacheFragments: legal-fragment layout, compact uses, build key, budgets.
+#include "llama-flashprefill.h"
+#include "llama-flashprefill-layout.h"
+
+class llm_graph_result; // metrics recording target (defined below)
+class llm_graph_input_attn_flashprefill; // companion input (defined below)
+
 #include <cstdint>
 #include <vector>
 #include <memory>
@@ -104,6 +113,9 @@ public:
     }
 
     virtual ~llm_graph_input_i() = default;
+
+    // FlashPrefill companion discovery (internal only, default null).
+    virtual llm_graph_input_attn_flashprefill * get_fp_input() { return nullptr; }
 
     virtual void set_input(const llama_ubatch * ubatch) = 0;
 
@@ -468,6 +480,264 @@ private:
     std::vector<int32_t> st_offsets;
 };
 
+// FlashPrefill V2 sparse-path graph input (GraphIntegration).
+//
+// Owns the GGML wire metadata tensor (I32) plus the per-group Q-position
+// tensor, with per-instance CPU staging. The pool (F32 means) and plan (I32
+// select output) tensors are op outputs, not inputs. No Q*K expansion is
+// ever packed here: rows/uses come from the CacheFragments compact layout
+// (uses/use_offsets, O(Q*F)), never from exact_rows (oracle-only).
+//
+// Pack order (frozen with VulkanShaders/selector): uses AND rows sorted by
+// (tile_id, kv_head), secondary (source_query, fragment_id). The wire stays
+// order-agnostic; the selector binary-searches these ranges and raises
+// BAD_LAYOUT on violation. Only descriptors are sorted: Q rows, output IDs
+// (wire source_query), recurrent state and sampling rows are never reordered.
+//
+// Reuse key (topology only): policy/mode/route-shape fields, role, block_k,
+// capacity buckets, dtype tags, kernel variant, head/dim mapping. Epochs,
+// counts within caps, stamps and physical maps are tensor DATA refreshed by
+// set_input, never topology.
+struct llm_graph_fp_key {
+    // policy topology (frozen v1 fields affecting the sparse topology)
+    int32_t  mode            = LLAMA_FLASHPREFILL_MODE_OFF;
+    int32_t  tail_scope      = LLAMA_FLASHPREFILL_TAIL_LOGICAL_PROMPT;
+    uint32_t block_q         = 0;
+    uint32_t block_k         = 0;
+    uint32_t sink_blocks     = 0;
+    uint32_t window_blocks   = 0;
+    uint32_t dense_tail_tiles = 0;
+    uint32_t min_kv          = 0;
+    uint32_t full_attn_layers = 0;
+    bool     mean_correction = true;
+    bool     exact_all       = false;
+    // route shape
+    int32_t  role          = LLAMA_FLASHPREFILL_ROLE_UNKNOWN; // single role of this ubatch (mixed => inactive)
+    bool     is_rerot      = false;
+    bool     reserve_sizing = false; // worst-case caps, never runs
+    // capacities (bucketed)
+    uint32_t n_tokens      = 0;
+    uint32_t f_cap         = 0;
+    uint32_t r_cap         = 0;
+    uint32_t u_cap         = 0;
+    uint32_t c_cap         = 0;
+    uint32_t n_tiles       = 0;
+    uint32_t max_sel_pair  = 0; // bucketed actual worst pair (wire: sized from worst pair)
+    uint32_t u_layout_cap  = 0; // bucketed layout-uses count (pair-distribution stability)
+    uint32_t n_groups      = 0;
+    // head/dim/dtype mapping
+    int32_t  dk = 0;
+    int32_t  dv = 0;
+    int32_t  n_kv_heads = 0;
+    int32_t  n_q_heads  = 0;
+    int32_t  k_type = -1; // ggml_type tag of the K cache tensor at build
+    int32_t  v_type = -1; // ggml_type tag of the V cache tensor at build
+    int32_t  n_pos  = 1;  // positions per token (model-fixed; q_pos stride)
+    int32_t  backend_variant = 0; // 0 = unset, 1 = CPU reference, 2 = Vulkan fused
+
+    bool operator==(const llm_graph_fp_key & o) const {
+        return mode == o.mode && tail_scope == o.tail_scope && block_q == o.block_q &&
+               block_k == o.block_k && sink_blocks == o.sink_blocks &&
+               window_blocks == o.window_blocks && dense_tail_tiles == o.dense_tail_tiles &&
+               min_kv == o.min_kv && full_attn_layers == o.full_attn_layers &&
+               mean_correction == o.mean_correction && exact_all == o.exact_all &&
+               role == o.role && is_rerot == o.is_rerot && reserve_sizing == o.reserve_sizing &&
+               n_tokens == o.n_tokens && f_cap == o.f_cap && r_cap == o.r_cap &&
+               u_cap == o.u_cap && c_cap == o.c_cap && n_tiles == o.n_tiles &&
+               max_sel_pair == o.max_sel_pair && u_layout_cap == o.u_layout_cap && n_groups == o.n_groups &&
+               dk == o.dk && dv == o.dv && n_kv_heads == o.n_kv_heads &&
+               n_q_heads == o.n_q_heads && k_type == o.k_type && v_type == o.v_type &&
+               n_pos == o.n_pos && backend_variant == o.backend_variant;
+    }
+    bool operator!=(const llm_graph_fp_key & o) const { return !(*this == o); }
+};
+
+// CPU-side per-build summary (no GPU sync, no KV readback). Counters mirror
+// the plan-header semantics (per source_query rows, proxy fan-out uncounted).
+// Ubatch-level dense reason for the summary (frozen, bounded): the PolicyCore
+// route value when the whole-ubatch decision maps to one, else >= 100 (wire
+// routes are single-digit). Recorded even when no companion exists, so
+// metrics never mislabels a plan-less graph: 0 = sparse-active (or reserve),
+// DENSE_OFF = policy off / no rows, DENSE_ROLE = mixed/ineligible roles,
+// DENSE_UNSUPPORTED = backend/shape, DENSE_SHORT_CONTEXT = min_kv,
+// DENSE_UNKNOWN_BOUNDARY = unknown live bounds, DENSE_CAPACITY = wire-domain
+// overflow, HIGH_COST = admission bound (would-be F32 mirror),
+// NO_LAYOUT = layout unavailable/ineligible without hard error.
+enum llm_fp_dense_reason : int32_t {
+    LLM_FP_DENSE_SPARSE_ACTIVE = 0,
+    LLM_FP_DENSE_HIGH_COST     = 100, // admission bound exceeded
+    LLM_FP_DENSE_NO_LAYOUT     = 101, // layout unavailable/ineligible, no hard error
+    LLM_FP_DENSE_FULL_PREFIX   = 102, // every handled layer designed-dense (full prefix/SWA)
+};
+
+struct llm_graph_flashprefill_summary {
+    int32_t sparse_layers = 0; // layers that built pool/select/attn
+    int32_t dense_layers  = 0; // eligible-arch full-attention layers kept dense
+    int32_t sparse_rows   = 0; // (query,head) rows on the sparse select path
+    int32_t dense_rows    = 0; // DENSE_FORCE (exact tail) rows through the new op
+    int32_t n_tiles       = 0;
+    int32_t n_fragments   = 0;
+    // Metadata/count caps summary of the last sparse build (bucketed caps +
+    // actual counts; fit/metrics size from here, never GPU readback).
+    int32_t n_rows     = 0;
+    int32_t n_uses     = 0;
+    int32_t n_cells    = 0;
+    int32_t n_groups   = 0;
+    int32_t max_sel_pair = 0;
+    int32_t f_cap = 0;
+    int32_t r_cap = 0;
+    int32_t u_cap = 0;
+    int32_t c_cap = 0;
+    // Real generation cost + bytes (builder/fill only, never whole-graph
+    // wall): layout build + wire pack microseconds. scratch_bytes is the
+    // true pinned total, maintained incrementally with checked 64-bit math:
+    // shared meta/group-input bytes ONCE (no per-layer multiplier) + the SUM
+    // of every pinned per-layer plan + the MAX live pool per backend
+    // (pools are transient; plans are pinned). Split-K scratch is unused
+    // here (n_splits=1); any native split extra is reported separately via
+    // Metrics/Vulkan. pool_bytes exposes the live-pool peak component.
+    // No estimates, no readback.
+    int64_t  layout_us    = 0;
+    uint64_t scratch_bytes = 0;
+    uint64_t pool_bytes    = 0;
+    uint64_t meta_bytes    = 0; // shared meta/group inputs, counted once
+    uint64_t plans_bytes   = 0; // sum of pinned per-layer plans
+    // Ubatch-level dense reason, recorded even when no companion exists
+    // (0 = sparse-active/reserve; route values or LLM_FP_DENSE_* above).
+    int32_t  dense_reason = 0;
+    // Authoritative per-ubatch route data for Metrics (never re-derived
+    // from physical KV size): ubatch token count, resident+visible+legal
+    // incidences, and expected sparse/forced candidate rows from the latest
+    // pack — present even with zero recorded plans. Layers dense for
+    // designed reasons (SWA / full-attention prefix) count separately;
+    // required mode throws capability fallbacks instead of counting them.
+    int32_t  ubatch_tokens = 0;
+    int64_t  visible_tokens = 0;
+    int32_t  expected_sparse_rows = 0;
+    int32_t  expected_forced_rows = 0;
+    int32_t  designed_dense_layers = 0;
+    // Sum of actual n_tokens*n_head(il) over designed-dense full-prefix
+    // layers (checked 64-bit, non-negative; sign-check safe). Separate from
+    // new-plan forced rows (those ride dense_rows via record) to avoid
+    // double count. FULL_PREFIX buckets with zero plans read this, never
+    // physical KV. Additive with plan totals on partial spans (a layer is
+    // either designed-dense or plan-recorded, never both).
+    int64_t designed_dense_rows = 0;
+};
+
+class llm_graph_input_attn_flashprefill : public llm_graph_input_i {
+public:
+    llm_graph_input_attn_flashprefill(
+            const llama_hparams & hparams,
+            const llama_cparams & cparams,
+            const llama_kv_cache_context * mctx) :
+        hparams(hparams),
+        cparams(cparams),
+        mctx(mctx) {
+    }
+    ~llm_graph_input_attn_flashprefill() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    // Had-none stability probe: answers whether these params would carry a
+    // companion, running the shared owner-building probe (prescreen, owner
+    // layout build, visible/admission/tail/caps gates) so fixed-capacity
+    // dense->sparse transitions rebuild instead of reusing dense forever,
+    // while steady deny-states reuse without rebuild churn. Never guesses
+    // from global padded KV.
+    static bool wants_companion(
+            const llm_graph_params & params,
+            const llama_kv_cache_context * attn);
+
+    // Build the companion once per graph (null when the sparse path is
+    // inactive): live routing packs the CacheFragments compact layout into
+    // wire metadata; reserve sizing allocates worst-case caps with zero
+    // counts. Never expands Q*K, never touches exact_rows. Throws fail-closed
+    // on corrupt/overflowing construction (any mode); returns null for
+    // policy-dense (OFF, roles, bypasses, shape gates).
+    // Shape-gated, never arch-whitelisted: any model whose ordinary
+    // prefill matches the supported shape (GQA, F32-ready Q, single-pos,
+    // no special bias) can opt in by calling try_build_attn_flashprefill;
+    // other archs simply never call it and stay dense (their graphs carry
+    // one unused metadata tensor only when the policy is enabled).
+    static std::unique_ptr<llm_graph_input_attn_flashprefill> build_if_wanted(
+            ggml_context * ctx0,
+      const llama_ubatch & ubatch,
+     const llama_hparams & hparams,
+     const llama_cparams & cparams,
+     const llama_kv_cache_context * mctx_cur,
+           ggml_backend_sched_t sched,
+                      bool reserve_sizing,
+            llm_graph_result * res);
+
+    bool active() const { return meta != nullptr; }
+    // Reserve graphs carry worst-case caps with zero counts and never run.
+    bool is_reserve() const { return active() && key.reserve_sizing; }
+    // True once a sparse layer actually consumed the metadata (pool/select
+    // nodes reference it). Uploads are skipped until set: an active but
+    // unconsumed companion is an orphan input the scheduler never
+    // allocates, and uploading to it would hit a null buffer. Set at build
+    // time only; reuse replays the same graph, so the route never flips.
+    bool used_by_graph = false;
+    void mark_used_by_graph() { used_by_graph = true; }
+
+    ggml_tensor * get_metadata() const { return meta; }
+    ggml_tensor * get_q_pos()    const { return q_pos; }
+
+    const llm_graph_fp_key & reuse_key() const { return key; }
+    bool has_key() const { return key_valid; }
+
+    // Cheap submit-time guards (freshness, key topology, n_kv, counts<=caps).
+    // Full layout validation + checked packing run once at build (plan
+    // generation); the expensive GGML metadata validator never runs per
+    // layer/submit (oracle/tests only).
+    bool submit_guards_ok(const llama_ubatch & ubatch, std::string * error) const;
+
+    ggml_tensor * meta     = nullptr; // I32 [meta_words] wire metadata
+    ggml_tensor * q_pos    = nullptr; // I32 [g_cap * n_pos] per-group Q positions, coord k at k*g_cap (rerot only)
+    ggml_tensor * q_gather = nullptr; // I32 [g_cap] group->query gather indices (rerot only)
+
+    const llama_hparams hparams;
+    const llama_cparams cparams;
+
+    const llama_kv_cache_context * mctx;
+
+private:
+    llm_graph_fp_key key;
+    bool key_valid = false;
+
+    // Pipeline-parallel lifetime: per-instance staging snapshot, never a
+    // static, never aliasing layout internals. Overwritten only by the fill
+    // path ordered after the previous submit's graph completion (same
+    // discipline as k_idxs/kq_mask/rerot spans).
+    std::vector<int32_t> st_meta;
+    std::vector<int32_t> st_qpos;
+    std::vector<int32_t> st_gather; // RERoT group->query gather indices (ordinary: unused)
+
+    // Freshness observed at build (topology-excluded, data-validated).
+    uint64_t built_cells_epoch = 0;
+    uint32_t built_n_kv = 0;
+
+    // Current per-ubatch row snapshot, refreshed from the reuse params on
+    // every can_reuse (never the stale build-time cparams copy): tail
+    // coordinates/epochs/counts are submit data, not topology. Shared
+    // ownership keeps the rows alive across async execution.
+    std::shared_ptr<const std::vector<struct llama_flashprefill_row>> cur_rows;
+
+    // Last submit pack outcome (plan recording + submit guards).
+    int32_t last_sparse_rows = 0;
+    int32_t last_forced_rows = 0;
+    // Build-time caps/counts snapshot for the result summary (no sync).
+    llm_graph_flashprefill_summary built_summary;
+    // Accumulated layout+pack generation time, builder/fill only.
+    int64_t stat_layout_us = 0;
+
+    friend struct llm_graph_context;
+    friend class llm_graph_result;
+};
+
 class llm_graph_input_attn_kv : public llm_graph_input_i {
 public:
     llm_graph_input_attn_kv(
@@ -484,12 +754,26 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    // FlashPrefill sparse-path companion input (null when the sparse path is
+    // inactive for this graph). Built once alongside this input, shared by
+    // every full-attention layer; per-layer dense/sparse choice stays in the
+    // attention builder. Other memory wrappers (MSA/DSA/ISWA/DSV4) keep their
+    // pre-existing inputs untouched.
+    llm_graph_input_attn_flashprefill * get_fp() const { return fp.get(); }
+    llm_graph_input_attn_flashprefill * get_fp_input() override { return fp.get(); }
+
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
     bool rerot_active() const { return self_rerot_q_indices != nullptr; }
+    // Cache-state RERoT (semantic): true when the KV context carries RERoT
+    // batch state, independent of whether legacy DDVR span tensors were
+    // built. Out-of-line (full cache type visible in graph.cpp); model hooks
+    // use this, never mctx directly (incomplete type in model TUs). Legacy
+    // span-index callers keep using rerot_active() above.
+    bool rerot_semantic() const;
     ggml_tensor * get_rerot_q_indices() const { return self_rerot_q_indices; }
     ggml_tensor * get_rerot_q_pos() const { return self_rerot_q_pos; }
     ggml_tensor * get_rerot_entries() const { return self_rerot_entries; }
@@ -509,6 +793,11 @@ public:
     // RERoT DDVR span lifecycle: capacity-bucketed reuse key + per-instance
     // staging for pipeline-parallel lifetime. Ordinary path never touches it.
     llm_graph_input_attn_rerot rerot_spans;
+
+    // FlashPrefill sparse-path companion (null when inactive). Built once in
+    // build_attn_inp_kv_impl, shared by every full-attention layer of this
+    // graph. OFF graphs never allocate it (no extra nodes, no extra inputs).
+    std::unique_ptr<llm_graph_input_attn_flashprefill> fp;
 
     bool rerot_spans_can_reuse(
             const llama_ubatch & ubatch,
@@ -820,6 +1109,9 @@ public:
 
     llm_graph_input_attn_kv * get_attn() const { return inp_attn.get(); }
     llm_graph_input_rs      * get_recr() const { return inp_rs.get(); }
+    llm_graph_input_attn_flashprefill * get_fp_input() override {
+        return inp_attn ? inp_attn->get_fp() : nullptr;
+    }
 
     const llama_cparams cparams;
 
@@ -950,6 +1242,63 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // FlashPrefill reserve sizing (GraphIntegration). False for every live
+    // decode graph. True only for synthetic reserve/probe graphs built to
+    // measure worst-case sparse capacities (StatePolicy reserve snapshot or
+    // FittingIntegration probes set it). Part of the reuse key: reserve
+    // graphs never alias live graphs.
+    bool flashprefill_reserve_sizing = false;
+
+    // FlashPrefill per-ubatch row snapshots compare equal (same routing
+    // topology) or not. Shared ownership keeps both sides alive; null means
+    // "route dense". Compares presence, size, role and known flag only:
+    // seq/reader identities, logical positions and interval bounds are
+    // submit DATA (refreshed per call into flags/counts), never topology, so
+    // advancing chunks or new readers must not force rebuilds. Epochs/counts
+    // are likewise data. The companion refreshes its owned snapshot from the
+    // current params on every can_reuse before set_input.
+    static bool flashprefill_rows_equal(
+            const std::shared_ptr<const std::vector<struct llama_flashprefill_row>> & lhs,
+            const std::shared_ptr<const std::vector<struct llama_flashprefill_row>> & rhs) {
+        if (lhs == rhs) {
+            return true;
+        }
+        if (!lhs || !rhs) {
+            return false;
+        }
+        if (lhs->size() != rhs->size()) {
+            return false;
+        }
+        for (size_t i = 0; i < lhs->size(); ++i) {
+            const auto & a = (*lhs)[i];
+            const auto & b = (*rhs)[i];
+            if (a.role          != b.role ||
+                a.prefill_known != b.prefill_known) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool flashprefill_config_equal(
+            const struct llama_flashprefill_config & a,
+            const struct llama_flashprefill_config & b) {
+        return a.version           == b.version           &&
+               a.struct_size       == b.struct_size       &&
+               a.mode              == b.mode              &&
+               a.tail_scope        == b.tail_scope        &&
+               a.alpha             == b.alpha             &&
+               a.block_q           == b.block_q           &&
+               a.block_k           == b.block_k           &&
+               a.sink_blocks       == b.sink_blocks       &&
+               a.window_blocks     == b.window_blocks     &&
+               a.dense_tail_tiles  == b.dense_tail_tiles  &&
+               a.min_kv            == b.min_kv            &&
+               a.full_attn_layers  == b.full_attn_layers  &&
+               a.mean_correction   == b.mean_correction   &&
+               a.exact_all         == b.exact_all;
+    }
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -1011,6 +1360,33 @@ struct llm_graph_params {
             return false;
         }
 
+        // FlashPrefill topology (GraphIntegration): reserve graphs never
+        // alias live graphs; policy fields and per-ubatch roles/boundaries
+        // select the sparse/dense topology. Epochs, counts within caps and
+        // physical maps are tensor data, excluded here, refreshed per submit.
+        // OFF isolation: when both sides are OFF there is no sparse topology
+        // (no rows, no scratch), so a single mode check preserves the legacy
+        // comparison path bit-for-bit with no multi-field validation on
+        // every normal OFF decode reuse. Reserve sizing is always false OFF.
+        if (cparams.flashprefill.mode == LLAMA_FLASHPREFILL_MODE_OFF &&
+            other.cparams.flashprefill.mode == LLAMA_FLASHPREFILL_MODE_OFF) {
+            if (flashprefill_reserve_sizing || other.flashprefill_reserve_sizing) {
+                return false; // corrupt: reserve must never be set while OFF
+            }
+        } else {
+            if (flashprefill_reserve_sizing != other.flashprefill_reserve_sizing) {
+                return false;
+            }
+
+            if (!flashprefill_config_equal(cparams.flashprefill, other.cparams.flashprefill)) {
+                return false;
+            }
+
+            if (!flashprefill_rows_equal(cparams.flashprefill_rows, other.cparams.flashprefill_rows)) {
+                return false;
+            }
+        }
+
         return
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
@@ -1068,6 +1444,23 @@ public:
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
 
+    // FlashPrefill plan nodes (GraphIntegration; consumed by
+    // ContextIntegration/ServerRouting/MetricsIntegration, never edited by
+    // them). One SELECT-output plan tensor per sparse layer, in build order.
+    // Stats (incl. the plan-header error word) are read once at the graph
+    // completion boundary via ggml_flashprefill_plan_get_stats, never synced
+    // per layer. CPU-side build routing counts need no sync at all.
+    // Records one sparse layer: pins the plan (completion-boundary read),
+    // accumulates layer/row counts, adds this plan's real bytes to the
+    // scratch total and max-tracks this pool's bytes per backend. Pool may
+    // be null only when the plan carries no pool (never in this slice).
+    void record_flashprefill_plan(ggml_tensor * plan, ggml_tensor * pool, ggml_backend_t backend,
+            int il, int32_t sparse_rows, int32_t dense_rows);
+
+    const std::vector<ggml_tensor *> & get_flashprefill_plans() const { return flashprefill_plans; }
+    const std::vector<int> & get_flashprefill_plan_ils() const { return flashprefill_plan_ils; }
+    const llm_graph_flashprefill_summary & get_flashprefill_summary() const { return flashprefill_summary; }
+
     void set_params(const llm_graph_params & params);
 
     // important graph nodes
@@ -1088,6 +1481,14 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+
+    // FlashPrefill per-graph plan state (see record/get accessors above).
+    // Cleared by reset(); accumulated during graph construction only.
+    std::vector<ggml_tensor *> flashprefill_plans;
+    std::vector<int> flashprefill_plan_ils;
+    // Per-backend live-pool peaks (backend, bytes) backing summary.pool_bytes.
+    std::vector<std::pair<ggml_backend_t, uint64_t>> flashprefill_pool_peaks;
+    llm_graph_flashprefill_summary flashprefill_summary;
 
     ggml_context_ptr ctx_compute;
 
@@ -1168,6 +1569,10 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+
+    // FlashPrefill reserve sizing (GraphIntegration): mirrors
+    // llm_graph_params.flashprefill_reserve_sizing for input construction.
+    const bool fp_reserve_sizing;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1368,6 +1773,64 @@ struct llm_graph_context {
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
                     int   il) const;
+
+    // FlashPrefill V2 sparse attention (GraphIntegration).
+    //
+    // Returns the pre-gate attention output for layer il through the new
+    // pool/select/attn ops, or nullptr when this layer must keep the
+    // pre-existing dense path. Null is also returned for reserve graphs
+    // (reserve carries worst-case sparse CAPACITIES in the fp input, while
+    // routing stays dense there; reserve measurement never executes).
+    //
+    // Contract (explicit Q forms, never re-RoPEd here): ordinary route
+    // consumes q_roped (model-rope-applied Q, single group per query) plus
+    // the same WHT; RERoT route consumes q_raw (pre-RoPE) through the
+    // existing rawQ->phase grouping once, BEFORE Turbo WHT. k_roped is
+    // storage-domain K (RoPE applied, never moved, never re-phased); v is
+    // raw V. Order preserved: RoPE->WHT->dot, InnerQ scale, V inverse-WHT,
+    // asymmetric V trim, k/v_rot; LoRA/gating stay in the caller-shared
+    // tail. One global softmax per (query,head) row. The model hook passes
+    // explicitly raw (rerot branch) or explicitly roped (ordinary branch) Q;
+    // a missing required form throws fail-closed. Generic build_attn (Q
+    // already roped) is untouched.
+    //
+    // Error discipline (frozen): corrupt layout, invalid metadata, stale
+    // physical mapping and cross-reader corruption THROW in every mode
+    // (never a correctness fallback). Capacity overflow beyond the wire
+    // domain and unsupported backends/unavailable layouts throw in REQUIRED
+    // and route dense in AUTO. Designed policy-dense reasons (roles, short
+    // context, dense tail, full-attention prefix, SWA/recurrent/MTP paths,
+    // special bias) stay dense in every mode. All throws happen
+    // before graph execution.
+    ggml_tensor * try_build_attn_flashprefill(
+            llm_graph_input_attn_kv * inp,
+            ggml_tensor * q_raw_or_null,
+            ggml_tensor * q_roped_or_null,
+            ggml_tensor * k_roped,
+            ggml_tensor * v,
+            int *         sections_or_null,
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,
+                  float   kq_scale,
+                    int   il) const;
+
+    // Counts eligible FULL-attention layers below il (recurrent, SWA and
+    // structurally incompatible layers never count). full_attn_layers keeps
+    // the FIRST N eligible layers dense by this index, not by model index;
+    // hybrid models supported.
+    int flashprefill_eligible_full_index(int il) const;
+
+    // True for the StatePolicy reserve snapshot (rows present, source map
+    // absent, all PREFILL/seq0/unknown-pos/known=false): route dense, size
+    // worst-case sparse caps natively. Live unknown-boundary rows (source
+    // map present) also route dense but size nothing. Never guesses known.
+    bool flashprefill_is_reserve_snapshot() const;
+
+    // CPU + Vulkan run the sparse kernels; every other backend (CUDA, Metal,
+    // RPC, ...) is unsupported (dense in AUTO, throw in REQUIRED). Mirrors
+    // the RERoT backend scan; the native kernel matrix itself is owned by
+    // VulkanDispatch/CpuKernels.
+    bool flashprefill_backend_supported() const;
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 

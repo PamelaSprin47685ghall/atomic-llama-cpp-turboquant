@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "meta": {
+    "purpose": "FlashPrefill V2 state-chain harness legs (PREFILL.md 17.3). Example runnable matrix specification for scripts/flashprefill-matrix.py. Status: NOT RUN. Unvalidated (no validation runs performed here; parent owns compilation/verification).",
+    "runnable": "python3 scripts/flashprefill-matrix.py --matrix scripts/flashprefill-state-matrix.json --requests <requests.json> --output-dir <out>",
+    "required_server_profile": "Candidate binary with FlashPrefill enabled (required mode, mean correction on), TriAttention enabled with trusted calibration, RERoT disabled (keeps these legs deterministic), KV capacity comfortably above the long-probe length (default min_kv 1024 assumed; long probes are ~2500 tokens). Short probes route dense_short_context; long probes route sparse with mean correction.",
+    "requests_companion": "The --requests file must define every id listed in meta.required_requests with the given endpoint/stream/timeout shape. Full example payloads are shown in meta.requests_example (documentation only; this file carries no request bodies). Long prompts are repeated neutral lines (~10 tokens/line x 256 lines) so resident-visible length deterministically exceeds min_kv.",
+    "required_requests": [
+      {"id": "state-long-a", "endpoint": "/completion", "stream": false, "timeout_s": 600.0},
+      {"id": "state-long-b", "endpoint": "/completion", "stream": false, "timeout_s": 600.0},
+      {"id": "state-append-b", "endpoint": "/completion", "stream": false, "timeout_s": 120.0},
+      {"id": "state-stream-a", "endpoint": "/completion", "stream": true, "timeout_s": 180.0},
+      {"id": "state-stream-cancel", "endpoint": "/completion", "stream": true, "timeout_s": 120.0}
+    ],
+    "requests_example": {
+      "schema_version": 1,
+      "requests": [
+        {"id": "state-long-a", "endpoint": "/completion", "payload": {"prompt": "GEN:256:Record %04d: neutral reference material for state pressure.\n", "n_predict": 16, "temperature": 0.0, "seed": 42, "stream": false, "cache_prompt": false}, "timeout_s": 600.0, "description": "GEN:256 expands to 256 numbered neutral lines (~2500 tokens, exceeds default min_kv 1024). The operator materializes the literal prompt text when writing requests.json."},
+        {"id": "state-long-b", "endpoint": "/completion", "payload": {"prompt": "GEN:256:Follow-up %04d: neutral reference material for state pressure.\n", "n_predict": 16, "temperature": 0.0, "seed": 43, "stream": false, "cache_prompt": false}, "timeout_s": 600.0, "description": "Same expansion rule as state-long-a with distinct seed/content."},
+        {"id": "state-append-b", "endpoint": "/completion", "payload": {"prompt": "State chain interleave probe: follow-up reference material.", "n_predict": 16, "temperature": 0.0, "seed": 44, "stream": false, "cache_prompt": false}, "timeout_s": 120.0},
+        {"id": "state-stream-a", "endpoint": "/completion", "payload": {"prompt": "State chain stream probe: neutral reference material.", "n_predict": 32, "temperature": 0.0, "seed": 45, "stream": true, "cache_prompt": false}, "timeout_s": 180.0},
+        {"id": "state-stream-cancel", "endpoint": "/completion", "payload": {"prompt": "State chain cancel probe: long neutral reference material, repeated. ", "n_predict": 128, "temperature": 0.0, "seed": 46, "stream": true, "cache_prompt": false}, "timeout_s": 120.0}
+      ]
+    },
+    "metric_names": "flashprefill_* names are the guide section 12.2 names MetricsIntegration exposes (missing series FAIL the case; no skip allowlist by design). Bare names sum all label series. Tri names below are verbatim /metrics series (tools/server/server-context.cpp): tri_drain_total, tri_maintenance_total, tri_floor_exhausted_total, tri_cells_freed_total, tri_score_seconds, tri_pack_seconds, tri_cells_before, tri_cells_after, tri_cells_freed, tri_references_removed, tri_target_references, tri_hard_keep, tri_shared_keep (tri_shared_keep evidences shared-prefix retention on drain legs). rerot_hard_aborts is NOT a /metrics series (it lives in task-result metrics only) and is therefore never referenced in expects.",
+    "chain_map": {
+      "A drain-save-restore-append": {"harness": "state-a-drain-save-restore-append (FULL leg: save/erase/restore/append over long probes; expects sparse+corrected+rebuild+invalidation growth with both guide invariants)", "cpp": "compact_remap, save_restore_remapped, shared_ref"},
+      "C ram-cell-reuse": {"harness": "state-c-ram-reuse-restore (PARTIAL leg: interleaved reuse + restore + long append; demotion proper has no endpoint)", "cpp": "clear_reuse, save_restore_remapped, shared_ref"},
+      "F batchretry-streaming": {"harness": "state-f-retry-streaming (PARTIAL leg: streaming terminal contract; shortage inducement has no endpoint)", "cpp": "overflow_capacity_rejects (wire+budget capacity rejects)"},
+      "H midprefillcancel-reuse": {"harness": "state-h-cancel-reuse (FULL leg: cancel evidence + reuse + health)", "cpp": "clear_reuse, policy_identity (serial domain)"}
+    },
+    "harness_incomplete": {
+      "B mtp-partial-accept-rollback": "No HTTP endpoint performs MTP draft/partial-accept/rollback. C++ only: test_rerot_checkpoint_accept_reject (save_episode/load_episode accept-vs-reject incl. opaque mtp_blob checkpoint). Per-draft staleness predicate needs a live context (see test-rerot-runtime.cpp).",
+      "D rerot-publication": "No HTTP endpoint performs RERoT private/public commit or view installation. C++ only: rerot_set/publish/reclassify/collect + generation invalidation in the state test.",
+      "E contextshift": "No HTTP endpoint performs RERoT context shift. C++ only: test_context_shift_runtime_api (server_rerot_runtime::context_shift + truncate_oldest_public). Per-seq stamp roll-forward (llama_rerot_context_apply_shift) needs a live context.",
+      "G pensuspend-resume": "No HTTP endpoint suspends/resumes RERoT pens. C++ only: test_pen_suspend_resume (suspend_pen/resume_pen + scheduler counts)."
+    },
+    "no_fake_endpoints": "Only documented step kinds (request, stream_request, slot_save, slot_restore, slot_erase, cancel_stream, health_check) and the documented /completion endpoint are used."
+  },
+  "servers": [
+    {
+      "id": "state-candidate",
+      "endpoint": {"base_url": "http://127.0.0.1:18086"},
+      "request_timeout_s": 600.0,
+      "metrics_timeout_s": 30.0,
+      "api_key": "",
+      "cache_domain": "state-cache-a"
+    }
+  ],
+  "cases": [
+    {
+      "id": "state-a-drain-save-restore-append",
+      "server": "state-candidate",
+      "description": "Chain A FULL harness leg: long prefill, slot save, erase, restore, second long prefill (rebuild+sparse after restore), health. Expects sparse/corrected/pool-rebuild/plan-invalidation/visible growth plus both guide invariants (visible>=exact; sparse=>corrected).",
+      "steps": [
+        {"kind": "request", "request": "state-long-a", "timeout_s": 600.0},
+        {"kind": "slot_save", "slot_id": 0, "filename": "state-a.bin", "timeout_s": 60.0},
+        {"kind": "slot_erase", "slot_id": 0, "timeout_s": 60.0},
+        {"kind": "slot_restore", "slot_id": 0, "filename": "state-a.bin", "timeout_s": 60.0},
+        {"kind": "request", "request": "state-long-b", "timeout_s": 600.0},
+        {"kind": "health_check", "timeout_s": 30.0}
+      ],
+      "expect": {
+        "require_metrics": {
+          "flashprefill_sparse_rows_total": {"min_delta": 1.0},
+          "flashprefill_corrected_blocks_total": {"min_delta": 1.0},
+          "flashprefill_pool_rebuild_total": {"min_delta": 1.0},
+          "flashprefill_plan_invalidations_total": {"min_delta": 1.0},
+          "flashprefill_visible_tokens_total": {"min_delta": 1.0}
+        },
+        "invariants": {"visible_ge_exact": true, "corrected_positive_if_sparse": true},
+        "skip_if_metrics_missing": []
+      }
+    },
+    {
+      "id": "state-c-ram-reuse-restore",
+      "server": "state-candidate",
+      "description": "Chain C PARTIAL harness leg: long prefill, save, interleaved other-request cell reuse, restore, long append. Same growth expects as chain A; RAM demotion proper has no endpoint (see meta.harness_incomplete only for B/D/E/G; C demotion internals are C++ clear_reuse).",
+      "steps": [
+        {"kind": "request", "request": "state-long-a", "timeout_s": 600.0},
+        {"kind": "slot_save", "slot_id": 0, "filename": "state-c.bin", "timeout_s": 60.0},
+        {"kind": "request", "request": "state-append-b", "timeout_s": 120.0},
+        {"kind": "slot_restore", "slot_id": 0, "filename": "state-c.bin", "timeout_s": 60.0},
+        {"kind": "request", "request": "state-long-b", "timeout_s": 600.0},
+        {"kind": "health_check", "timeout_s": 30.0}
+      ],
+      "expect": {
+        "require_metrics": {
+          "flashprefill_sparse_rows_total": {"min_delta": 1.0},
+          "flashprefill_corrected_blocks_total": {"min_delta": 1.0},
+          "flashprefill_pool_rebuild_total": {"min_delta": 1.0},
+          "flashprefill_plan_invalidations_total": {"min_delta": 1.0},
+          "flashprefill_visible_tokens_total": {"min_delta": 1.0}
+        },
+        "invariants": {"visible_ge_exact": true, "corrected_positive_if_sparse": true},
+        "skip_if_metrics_missing": []
+      }
+    },
+    {
+      "id": "state-f-retry-streaming",
+      "server": "state-candidate",
+      "description": "Chain F PARTIAL harness leg: streaming completion with the harness-enforced /completion terminal contract (exactly one stop:true, zero [DONE], no trace/content leak). Short probe routes dense; expects dense-row growth only. Shortage inducement has no endpoint.",
+      "steps": [
+        {"kind": "stream_request", "request": "state-stream-a", "timeout_s": 180.0, "expect_stream": "success"},
+        {"kind": "health_check", "timeout_s": 30.0}
+      ],
+      "expect": {
+        "require_metrics": {
+          "flashprefill_dense_rows_total": {"min_delta": 1.0}
+        },
+        "skip_if_metrics_missing": []
+      }
+    },
+    {
+      "id": "state-h-cancel-reuse",
+      "server": "state-candidate",
+      "description": "Chain H FULL harness leg: mid-prefill client-side cancel (evidence captured), new-request slot reuse, server healthy. Reuse is a short probe and routes dense; expects dense-row growth.",
+      "steps": [
+        {"kind": "cancel_stream", "request": "state-stream-cancel", "timeout_s": 120.0, "cancel_after_s": 2.0},
+        {"kind": "request", "request": "state-append-b", "timeout_s": 120.0},
+        {"kind": "health_check", "timeout_s": 30.0}
+      ],
+      "expect": {
+        "require_metrics": {
+          "flashprefill_dense_rows_total": {"min_delta": 1.0}
+        },
+        "skip_if_metrics_missing": []
+      }
+    }
+  ],
+  "comparisons": []
+}

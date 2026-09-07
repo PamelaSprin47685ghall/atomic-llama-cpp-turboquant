@@ -5,6 +5,7 @@
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
+#include "ggml-flashprefill.h"
 #include "unary-ops.h"
 #include "vec.h"
 
@@ -12309,5 +12310,1243 @@ void ggml_compute_forward_lightning_indexer(
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FlashPrefill V2 CPU forwards (frozen v1 wire schema).
+//
+// Domains: Q is F32 [Dk,n_groups,Hq,1] already in the graph's WHT/InnerQ
+// domain; K/V cache bytes are decoded in their STORED domain (Turbo
+// centroid*norm, no inverse WHT) so dots/means match the cached values the
+// GPU pool/select/attn observe. V accumulation stays in the stored domain;
+// the graph applies the inverse WHT after attention. Internal dot/mean
+// accumulation is double, rounded once to float on store; the (m,l,o)
+// online merge reproduces the frozen MLO equations (sink mass once,
+// softcap before ln(count), one denominator over exact + proxies + phases).
+// No full KV float mirror: per-pair/per-output decoded-row scratch plus
+// bounded per-tile selection scratch only. Errors fail closed (finite
+// zeros / plan error, never silent dense); empty rows yield zeros.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Turbo KV cache types store WHT-rotated centroid*norm; their to_float is
+// already the stored domain (see ggml-turbo-quant.c: no inverse WHT on
+// dequant, inverse applied later via GGML_OP_TURBO_WHT). Weight-only
+// RHT types (TQ3_1S/TQ4_1S) inverse-transform in to_float and must never
+// be consumed as KV here.
+static bool fp_is_inverse_wht_weight_type(enum ggml_type t) {
+    return t == GGML_TYPE_TQ3_1S || t == GGML_TYPE_TQ4_1S;
+}
+
+static bool fp_finite_f32(float x) {
+    return std::isfinite(x) != 0;
+}
+
+// Decode one KV row (D elements) from a strided row pointer into contiguous
+// F32 scratch in the STORED domain. Rejects inverse-WHT weight types.
+// Returns frozen error code (0 ok).
+static int32_t fp_decode_kv_row(const char * src_row, enum ggml_type type, float * dst_f32, int64_t D) {
+    if (!src_row || !dst_f32 || D < 1) {
+        return GGML_FLASHPREFILL_ERR_BAD_ARG;
+    }
+    if (fp_is_inverse_wht_weight_type(type)) {
+        return GGML_FLASHPREFILL_ERR_BAD_ARG;
+    }
+    if (type == GGML_TYPE_F32) {
+        memcpy(dst_f32, src_row, (size_t)D * sizeof(float));
+    } else {
+        ggml_to_float_t to_float = ggml_get_type_traits(type)->to_float;
+        if (!to_float) {
+            return GGML_FLASHPREFILL_ERR_BAD_ARG;
+        }
+        // For Turbo KV types this is centroid*norm (stored domain, no
+        // inverse WHT); for F16/BF16/Q8_0/etc it is the ordinary dequant.
+        to_float(src_row, dst_f32, D);
+    }
+    for (int64_t d = 0; d < D; d++) {
+        if (!fp_finite_f32(dst_f32[d])) {
+            return GGML_FLASHPREFILL_ERR_BAD_INPUT;
+        }
+    }
+    return GGML_FLASHPREFILL_OK;
+}
+
+static double fp_dot_f32(const float * a, const float * b, int64_t n) {
+    double s = 0.0;
+    for (int64_t i = 0; i < n; i++) {
+        s += (double)a[i] * (double)b[i];
+    }
+    return s;
+}
+
+static void fp_zero_f32(float * p, int64_t n) {
+    for (int64_t i = 0; i < n; i++) {
+        p[i] = 0.0f;
+    }
+}
+
+// Metadata field accessors (frozen v1 offsets). Row8 =
+// [source_query,kv_head,logical_pos,tile,prompt_begin,prompt_end,flags,q_head].
+// Use8 = [frag,tile,kv_head,q_group,sub_off,sub_count,flags,source_query].
+// Frag8 = [cell_off,cell_count,logical_block,domain,flags,0,0,0].
+static const int32_t * fp_meta_row(const int32_t * base, int64_t row_off, int64_t r) {
+    return base + row_off + r * GGML_FLASHPREFILL_ROW_WORDS;
+}
+
+static const int32_t * fp_meta_use(const int32_t * base, int64_t use_off, int64_t u) {
+    return base + use_off + u * GGML_FLASHPREFILL_USE_WORDS;
+}
+
+static const int32_t * fp_meta_frag(const int32_t * base, int64_t frag_off, int64_t f) {
+    return base + frag_off + f * GGML_FLASHPREFILL_FRAG_WORDS;
+}
+
+} // namespace
+
+void ggml_compute_forward_flash_prefill_pool(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * K = dst->src[0];
+    const ggml_tensor * V = dst->src[1];
+    const ggml_tensor * MT = dst->src[2];
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // Failure propagation: POOL has no error channel, and zero means would
+    // look valid downstream. Malformed internal metadata/dims therefore
+    // abort loudly (GGML_ABORT) instead of emitting a fake answer. The
+    // graph owner builds metadata from the cell owner and validates at
+    // construction; compute-time invalidity is an internal bug, never a
+    // user-tolerable fallback. Zeros are written ONLY for unused pool
+    // slices (f >= n_frag) and empty frags (no tokens, means unused).
+    struct ggml_flashprefill_op_params pp;
+    int32_t rc = ggml_flashprefill_op_params_unpack(dst->op_params, &pp);
+    if (rc != GGML_FLASHPREFILL_OK || pp.op != GGML_FLASHPREFILL_OP_POOL ||
+        pp.version != GGML_FLASHPREFILL_VERSION) {
+        GGML_ABORT("flash_prefill_pool: bad op params");
+    }
+    const int64_t Dk = pp.dk;
+    const int64_t Dv = pp.dv;
+    if (Dk < 1 || Dv < 1 || Dk > GGML_FLASHPREFILL_HEAD_DIM_MAX || Dv > GGML_FLASHPREFILL_HEAD_DIM_MAX) {
+        GGML_ABORT("flash_prefill_pool: bad head dims");
+    }
+    if (!K || !V || !MT || !dst) {
+        GGML_ABORT("flash_prefill_pool: null tensor");
+    }
+    if (dst->type != GGML_TYPE_F32 || MT->type != GGML_TYPE_I32) {
+        GGML_ABORT("flash_prefill_pool: bad tensor types");
+    }
+    if (dst->nb[0] != sizeof(float)) {
+        GGML_ABORT("flash_prefill_pool: pool rows must be contiguous F32");
+    }
+    if (K->ne[0] != Dk || V->ne[0] != Dv) {
+        GGML_ABORT("flash_prefill_pool: K/V head dim mismatch");
+    }
+    if (dst->ne[0] != Dk + Dv) {
+        GGML_ABORT("flash_prefill_pool: pool row mismatch");
+    }
+    if (ggml_n_dims(K) < 3 || ggml_n_dims(V) < 3) {
+        GGML_ABORT("flash_prefill_pool: K/V rank");
+    }
+    const int64_t Hkv = dst->ne[1];
+    const int64_t Fcap = dst->ne[2];
+    if (Hkv < 1 || Fcap < 1) {
+        GGML_ABORT("flash_prefill_pool: bad pool shape");
+    }
+    if (K->ne[2] != Hkv || V->ne[2] != Hkv) {
+        GGML_ABORT("flash_prefill_pool: K/V head count mismatch");
+    }
+    if (fp_is_inverse_wht_weight_type(K->type) || fp_is_inverse_wht_weight_type(V->type)) {
+        GGML_ABORT("flash_prefill_pool: inverse-WHT weight type as KV");
+    }
+    if (ggml_is_quantized(K->type) && (Dk % ggml_blck_size(K->type) != 0)) {
+        GGML_ABORT("flash_prefill_pool: K dim vs block size");
+    }
+    if (ggml_is_quantized(V->type) && (Dv % ggml_blck_size(V->type) != 0)) {
+        GGML_ABORT("flash_prefill_pool: V dim vs block size");
+    }
+    if (MT->nb[0] != sizeof(int32_t)) {
+        GGML_ABORT("flash_prefill_pool: metadata rows must be contiguous I32");
+    }
+    const int32_t * meta = (const int32_t *)MT->data;
+    const int64_t meta_words = ggml_nelements(MT);
+    rc = ggml_flashprefill_metadata_validate(meta, meta_words);
+    if (rc != GGML_FLASHPREFILL_OK) {
+        GGML_ABORT("flash_prefill_pool: invalid metadata");
+    }
+    // Header fields needed for bounds (validated above).
+    const int64_t n_frag = meta[3];
+    const int64_t frag_off = meta[11];
+    const int64_t cell_off = meta[14];
+    // Pool Fcap must cover metadata fragments.
+    if (Fcap < n_frag) {
+        GGML_ABORT("flash_prefill_pool: pool capacity under metadata fragments");
+    }
+    if (meta[18] != (int32_t)Dk || meta[19] != (int32_t)Dv || meta[20] != (int32_t)Hkv) {
+        GGML_ABORT("flash_prefill_pool: metadata dims vs params");
+    }
+    const int64_t DkDv = Dk + Dv;
+    const size_t float_bytes = (size_t)DkDv * sizeof(float);
+    const size_t sums_off = (float_bytes + 7u) & ~7u;
+    const size_t per_thread = sums_off + (size_t)DkDv * sizeof(double) + 64u;
+    char * scratch = params->wdata ? (char *)params->wdata + (size_t)ith * per_thread : nullptr;
+    float * k_row = scratch ? (float *)scratch : nullptr;
+    float * v_row = scratch ? (float *)(scratch + (size_t)Dk * sizeof(float)) : nullptr;
+    double * sums = scratch ? (double *)(scratch + sums_off) : nullptr;
+    // Fallback tiny stack buffers when wdata is absent (single-threaded ref path).
+    float stack_k[256];
+    float stack_v[256];
+    double stack_s[512];
+    if (!scratch) {
+        if (DkDv > 256) {
+            GGML_ABORT("flash_prefill_pool: no scratch for head dims");
+        }
+        k_row = stack_k;
+        v_row = stack_v;
+        sums = stack_s;
+    }
+
+    const int64_t total = Fcap * Hkv;
+    for (int64_t p = ith; p < total; p += nth) {
+        const int64_t f = p / Hkv;
+        const int64_t h = p % Hkv;
+        float * prow = (float *)((char *)dst->data + (size_t)f * dst->nb[2] + (size_t)h * dst->nb[1]);
+        if (f >= n_frag) {
+            fp_zero_f32(prow, DkDv);
+            continue;
+        }
+        const int32_t * fr = fp_meta_frag(meta, frag_off, f);
+        const int64_t f_begin = fr[0];
+        const int64_t f_count = fr[1];
+        if (f_count <= 0) {
+            fp_zero_f32(prow, DkDv);
+            continue;
+        }
+        for (int64_t d = 0; d < DkDv; d++) {
+            sums[d] = 0.0;
+        }
+        const int32_t * cells = meta + cell_off;
+        for (int64_t j = 0; j < f_count; j++) {
+            const int32_t phys = cells[f_begin + j];
+            if (phys < 0 || (int64_t)phys >= K->ne[1] || (int64_t)phys >= V->ne[1]) {
+                GGML_ABORT("flash_prefill_pool: physical cell out of KV range");
+            }
+            const char * k_ptr = (const char *)K->data + (size_t)phys * K->nb[1] + (size_t)h * K->nb[2];
+            const char * v_ptr = (const char *)V->data + (size_t)phys * V->nb[1] + (size_t)h * V->nb[2];
+            if (fp_decode_kv_row(k_ptr, K->type, k_row, Dk) != GGML_FLASHPREFILL_OK ||
+                fp_decode_kv_row(v_ptr, V->type, v_row, Dv) != GGML_FLASHPREFILL_OK) {
+                GGML_ABORT("flash_prefill_pool: KV decode failed");
+            }
+            for (int64_t d = 0; d < Dk; d++) {
+                sums[d] += (double)k_row[d];
+            }
+            for (int64_t d = 0; d < Dv; d++) {
+                sums[Dk + d] += (double)v_row[d];
+            }
+        }
+        const double inv = 1.0 / (double)f_count;
+        for (int64_t d = 0; d < DkDv; d++) {
+            double m = sums[d] * inv;
+            prow[d] = (float)m;
+            if (!fp_finite_f32(prow[d])) {
+                GGML_ABORT("flash_prefill_pool: non-finite mean");
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_flash_prefill_select(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * POOL = dst->src[1];
+    const ggml_tensor * MT = dst->src[2];
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    struct ggml_flashprefill_op_params pp;
+    int32_t param_rc = ggml_flashprefill_op_params_unpack(dst->op_params, &pp);
+    // Local per-thread aggregates live in wdata header; global header is
+    // written once by ith==0 after a barrier (no racy shared mutable).
+    const int64_t plan_words_total = dst ? ggml_nelements(dst) : 0;
+    // Conservative per-thread scratch bound (max_sel <= plan words).
+    int64_t scratch_max = plan_words_total > 0 ? plan_words_total : 1;
+    if (scratch_max < 1) {
+        scratch_max = 1;
+    }
+    const size_t agg_bytes = 64u;
+    const size_t s_bytes = (size_t)scratch_max * sizeof(double);
+    const size_t use_bytes = (size_t)scratch_max * sizeof(int32_t);
+    const size_t per_thread = agg_bytes + s_bytes + use_bytes + (size_t)scratch_max * sizeof(int32_t) + 64u;
+    char * base = params->wdata ? (char *)params->wdata + (size_t)ith * per_thread : nullptr;
+    int32_t * agg_err = base ? (int32_t *)base : nullptr;
+    double * S = base ? (double *)(base + agg_bytes) : nullptr;
+    int32_t * tmp_uses = base ? (int32_t *)(base + agg_bytes + s_bytes) : nullptr;
+    int32_t * tmp_frags = base ? (int32_t *)(base + agg_bytes + s_bytes + use_bytes) : nullptr;
+    int32_t local_err = GGML_FLASHPREFILL_OK;
+    if (agg_err) {
+        agg_err[0] = GGML_FLASHPREFILL_OK;
+    }
+
+    // Early fail-closed when params/tensors are unusable. We still need a
+    // valid plan header for downstream fail-closed, so ith==0 writes a
+    // minimal zero header when possible and all threads return.
+    bool early_bad = false;
+    if (param_rc != GGML_FLASHPREFILL_OK || pp.op != GGML_FLASHPREFILL_OP_SELECT ||
+        pp.version != GGML_FLASHPREFILL_VERSION) {
+        local_err = GGML_FLASHPREFILL_ERR_BAD_ARG;
+        early_bad = true;
+    }
+    if (!early_bad) {
+        if (!Q || !POOL || !MT || !dst) {
+            local_err = GGML_FLASHPREFILL_ERR_BAD_ARG;
+            early_bad = true;
+        } else if (Q->type != GGML_TYPE_F32 || POOL->type != GGML_TYPE_F32 ||
+                   MT->type != GGML_TYPE_I32 || dst->type != GGML_TYPE_I32) {
+            local_err = GGML_FLASHPREFILL_ERR_BAD_ARG;
+            early_bad = true;
+        } else if (Q->nb[0] != sizeof(float) || POOL->nb[0] != sizeof(float) ||
+                   MT->nb[0] != sizeof(int32_t) || dst->nb[0] != sizeof(int32_t)) {
+            local_err = GGML_FLASHPREFILL_ERR_BAD_LAYOUT;
+            early_bad = true;
+        } else if (!fp_finite_f32(pp.alpha) || !(pp.alpha > 0.0f) || !(pp.alpha <= 1.0f) ||
+                   !fp_finite_f32(pp.scale) || !fp_finite_f32(pp.softcap) || pp.softcap < 0.0f) {
+            local_err = GGML_FLASHPREFILL_ERR_BAD_CONFIG;
+            early_bad = true;
+        } else if (pp.dk < 1 || pp.dv < 1) {
+            local_err = GGML_FLASHPREFILL_ERR_BAD_ARG;
+            early_bad = true;
+        }
+    }
+    const int32_t * meta = (!early_bad) ? (const int32_t *)MT->data : nullptr;
+    const int64_t meta_words = (!early_bad) ? ggml_nelements(MT) : 0;
+    int32_t meta_rc = early_bad ? local_err : ggml_flashprefill_metadata_validate(meta, meta_words);
+    if (meta_rc != GGML_FLASHPREFILL_OK) {
+        local_err = meta_rc;
+        early_bad = true;
+    }
+    int64_t T = 0;
+    int64_t H = 0;
+    int64_t max_sel = 0;
+    int64_t exact_off = 0;
+    int64_t proxy_off = 0;
+    int64_t counts_off = 0;
+    int64_t Dk = 0;
+    int64_t Hq = 0;
+    int64_t n_groups = 0;
+    if (!early_bad) {
+        Dk = pp.dk;
+        H = meta[20];
+        n_groups = meta[22];
+        Hq = meta[23];
+        if (Q->ne[0] != Dk || POOL->ne[0] != Dk + (int64_t)pp.dv) {
+            local_err = GGML_FLASHPREFILL_ERR_BAD_LAYOUT;
+            early_bad = true;
+        } else if (Q->ne[1] < n_groups || Q->ne[2] != Hq) {
+            // Graph reuse capacity bucket: Q.ne1 may pad dummy groups above
+            // the actual metadata n_groups; uses still bound q_group below.
+            local_err = GGML_FLASHPREFILL_ERR_BAD_LAYOUT;
+            early_bad = true;
+        } else if (H < 1 || Hq < 1 || n_groups < 1 || Hq % H != 0) {
+            local_err = GGML_FLASHPREFILL_ERR_BAD_LAYOUT;
+            early_bad = true;
+        } else if (POOL->ne[1] != H) {
+            local_err = GGML_FLASHPREFILL_ERR_BAD_LAYOUT;
+            early_bad = true;
+        } else if (POOL->ne[2] < meta[3]) {
+            local_err = GGML_FLASHPREFILL_ERR_BAD_LAYOUT;
+            early_bad = true;
+        } else if (!base) {
+            local_err = GGML_FLASHPREFILL_ERR_BAD_LAYOUT;
+            early_bad = true;
+        } else if (ggml_flashprefill_metadata_n_tiles(meta, meta_words, &T) != GGML_FLASHPREFILL_OK || T < 1) {
+            local_err = GGML_FLASHPREFILL_ERR_BAD_LAYOUT;
+            early_bad = true;
+        } else {
+            // Derive max_sel_pair from the sized plan tensor.
+            const int64_t total = plan_words_total;
+            const int64_t denom = (T > 0 && H > 0) ? (int64_t)2 * T * H : 0;
+            if (denom <= 0 || total < GGML_FLASHPREFILL_PLAN_HEADER_WORDS) {
+                local_err = GGML_FLASHPREFILL_ERR_BAD_LAYOUT;
+                early_bad = true;
+            } else {
+                const int64_t rem = total - GGML_FLASHPREFILL_PLAN_HEADER_WORDS - denom;
+                if (rem < 0 || rem % denom != 0) {
+                    local_err = GGML_FLASHPREFILL_ERR_BAD_LAYOUT;
+                    early_bad = true;
+                } else {
+                    max_sel = rem / denom;
+                    exact_off = GGML_FLASHPREFILL_PLAN_HEADER_WORDS;
+                    proxy_off = exact_off + T * H * max_sel;
+                    counts_off = proxy_off + T * H * max_sel;
+                    if (max_sel < 0 || max_sel > scratch_max) {
+                        local_err = GGML_FLASHPREFILL_ERR_CAP_EXCEEDED;
+                        early_bad = true;
+                    }
+                }
+            }
+        }
+    }
+    int32_t * plan = dst ? (int32_t *)dst->data : nullptr;
+    if (early_bad) {
+        if (agg_err) {
+            agg_err[0] = local_err != GGML_FLASHPREFILL_OK ? local_err : GGML_FLASHPREFILL_ERR_BAD_ARG;
+        }
+        ggml_barrier(params->threadpool);
+        if (ith == 0 && plan && plan_words_total >= GGML_FLASHPREFILL_PLAN_HEADER_WORDS) {
+            // Minimal fail-closed header when the full layout is unknown.
+            // Downstream ATTN treats bad magic/dims as execution errors.
+            for (int64_t i = 0; i < plan_words_total; i++) {
+                plan[i] = 0;
+            }
+            plan[0] = GGML_FLASHPREFILL_PLAN_MAGIC;
+            plan[1] = GGML_FLASHPREFILL_VERSION;
+            plan[2] = GGML_FLASHPREFILL_PLAN_HEADER_WORDS;
+            plan[10] = agg_err ? agg_err[0] : GGML_FLASHPREFILL_ERR_BAD_ARG;
+        }
+        return;
+    }
+
+    const int64_t n_frag = meta[3];
+    const int64_t n_row = meta[5];
+    const int64_t n_use = meta[7];
+    const int64_t frag_off = meta[11];
+    const int64_t row_off = meta[12];
+    const int64_t use_off = meta[13];
+    const float alpha = pp.alpha;
+    const float scale = pp.scale;
+    const float softcap = pp.softcap;
+    const int32_t exact_all = pp.exact_all;
+
+    const int64_t npair = T * H;
+    // Each thread classifies its disjoint (tile,head) pairs. Tables for
+    // untouched pairs are initialized here per-thread for owned pairs only.
+    for (int64_t p = ith; p < npair; p += nth) {
+        const int64_t tile = p / H;
+        const int64_t head = p % H;
+        int32_t * counts = plan + counts_off + p * 2;
+        int32_t * exact_tab = plan + exact_off + p * max_sel;
+        int32_t * proxy_tab = plan + proxy_off + p * max_sel;
+        for (int64_t s = 0; s < max_sel; s++) {
+            exact_tab[s] = -1;
+            proxy_tab[s] = -1;
+        }
+        counts[0] = 0;
+        counts[1] = 0;
+        // Collect uses of this pair in increasing use order (deterministic).
+        // Table capacity is PER ROLE (exact and proxy tables each hold
+        // max_sel), so no total pre-gate here: e.g. max_sel=2 with 2 exact
+        // + 1 proxy is schema-valid. Collection is bounded by scratch
+        // (scratch_max >= 2*max_sel always); beyond that the tables cannot
+        // hold the pair even split across roles. The per-role gate after
+        // classification enforces exact/proxy table bounds.
+        int64_t n_pair_uses = 0;
+        for (int64_t u = 0; u < n_use; u++) {
+            const int32_t * ur = fp_meta_use(meta, use_off, u);
+            if (ur[1] == (int32_t)tile && ur[2] == (int32_t)head) {
+                if (n_pair_uses < scratch_max) {
+                    tmp_uses[n_pair_uses] = (int32_t)u;
+                }
+                n_pair_uses++;
+            }
+        }
+        if (n_pair_uses > scratch_max) {
+            local_err = GGML_FLASHPREFILL_ERR_OVER_CAPACITY;
+            continue;
+        }
+        if (n_pair_uses == 0) {
+            continue;
+        }
+        // Count matched rows; every use must match >=1 row (validated
+        // globally, rechecked per-pair for fail-closed execution).
+        int64_t n_rows = 0;
+        for (int64_t r = 0; r < n_row; r++) {
+            const int32_t * rr = fp_meta_row(meta, row_off, r);
+            if (rr[3] == (int32_t)tile && rr[1] == (int32_t)head) {
+                n_rows++;
+            }
+        }
+        if (n_rows < 1) {
+            local_err = GGML_FLASHPREFILL_ERR_ORPHAN_USE;
+            continue;
+        }
+        // Distinct fragments in increasing frag order (deterministic).
+        int64_t n_cand = 0;
+        for (int64_t k = 0; k < n_pair_uses; k++) {
+            const int32_t * ur = fp_meta_use(meta, use_off, tmp_uses[k]);
+            const int32_t f = ur[0];
+            bool seen = false;
+            for (int64_t j = 0; j < n_cand; j++) {
+                if (tmp_frags[j] == f) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                tmp_frags[n_cand++] = f;
+            }
+        }
+        // Sort candidate frags increasing for deterministic energy order.
+        for (int64_t a = 0; a < n_cand; a++) {
+            for (int64_t b = a + 1; b < n_cand; b++) {
+                if (tmp_frags[b] < tmp_frags[a]) {
+                    int32_t t = tmp_frags[a];
+                    tmp_frags[a] = tmp_frags[b];
+                    tmp_frags[b] = t;
+                }
+            }
+        }
+        // Per-fragment mandatory/full flags.
+        bool pair_bad = false;
+        for (int64_t j = 0; j < n_cand && !pair_bad; j++) {
+            const int32_t f = tmp_frags[j];
+            if (f < 0 || (int64_t)f >= n_frag) {
+                local_err = GGML_FLASHPREFILL_ERR_BAD_RANGE;
+                pair_bad = true;
+                break;
+            }
+        }
+        if (pair_bad) {
+            continue;
+        }
+        // Selector legality invariant (Main single rule, mirrored by ref):
+        // a candidate whose fragment is not full across this tile (any
+        // matched use a partial subset) is mandatory exact AND excluded
+        // entirely from energy M/Smax (cand_full==0 masks the whole
+        // column), so its whole-fragment mean — possibly containing tokens
+        // future/invisible for some tile rows — can never shift M/smax or
+        // flip other candidates' keep decisions. Fully legal candidates
+        // score valid row pairs only (row's source_query must use the
+        // fragment here; that use is then necessarily full). Mandatory full
+        // candidates stay scored (legal means). All-excluded => all exact,
+        // finite, no sparse. Unscored energy candidates (S==0, no legal
+        // pair) are exact and move nothing.
+        if (exact_all) {
+            // All-exact needs the whole pair in the exact table (per-role).
+            if (n_pair_uses > max_sel) {
+                local_err = GGML_FLASHPREFILL_ERR_OVER_CAPACITY;
+                continue;
+            }
+            for (int64_t k = 0; k < n_pair_uses; k++) {
+                exact_tab[k] = tmp_uses[k];
+            }
+            counts[0] = (int32_t)n_pair_uses;
+            counts[1] = 0;
+            continue;
+        }
+        // Partition tmp_frags: full candidates first (energy set).
+        int64_t n_energy = 0;
+        for (int64_t j = 0; j < n_cand; j++) {
+            const int32_t f = tmp_frags[j];
+            const int32_t * fr = fp_meta_frag(meta, frag_off, f);
+            bool full = true;
+            for (int64_t k = 0; k < n_pair_uses; k++) {
+                const int32_t * ur = fp_meta_use(meta, use_off, tmp_uses[k]);
+                if (ur[0] != f) {
+                    continue;
+                }
+                if (!(ur[4] == fr[0] && ur[5] == fr[1])) {
+                    full = false;
+                    break;
+                }
+            }
+            if (full) {
+                int32_t t = tmp_frags[n_energy];
+                tmp_frags[n_energy] = tmp_frags[j];
+                tmp_frags[j] = t;
+                n_energy++;
+            }
+        }
+        if (n_energy == 0) {
+            // Every candidate partial: all exact, nothing to score.
+            if (n_pair_uses > max_sel) {
+                local_err = GGML_FLASHPREFILL_ERR_OVER_CAPACITY;
+                continue;
+            }
+            for (int64_t k = 0; k < n_pair_uses; k++) {
+                exact_tab[k] = tmp_uses[k];
+            }
+            counts[0] = (int32_t)n_pair_uses;
+            counts[1] = 0;
+            continue;
+        }
+        // Tile max-energy over legal (row, fragment) pairs of the energy
+        // set. A pair is legal when the row's source_query uses the fragment
+        // in this tile/head (effective phase from that use); energy-set
+        // membership already guarantees fullness. Illegal pairs are excluded
+        // from M and S (masked, never scored).
+        double M = -INFINITY;
+        // Pass 1: global max.
+        for (int64_t r = 0; r < n_row && local_err == GGML_FLASHPREFILL_OK; r++) {
+            const int32_t * rr = fp_meta_row(meta, row_off, r);
+            if (rr[3] != (int32_t)tile || rr[1] != (int32_t)head) {
+                continue;
+            }
+            const int32_t sq = rr[0];
+            const int32_t qh = rr[7];
+            if (qh < 0 || (int64_t)qh >= Hq) {
+                local_err = GGML_FLASHPREFILL_ERR_BAD_RANGE;
+                break;
+            }
+            for (int64_t j = 0; j < n_energy; j++) {
+                const int32_t f = tmp_frags[j];
+                int32_t g = -1;
+                for (int64_t k = 0; k < n_pair_uses; k++) {
+                    const int32_t * ur = fp_meta_use(meta, use_off, tmp_uses[k]);
+                    if (ur[0] == f && ur[7] == sq) {
+                        g = ur[3];
+                        break;
+                    }
+                }
+                if (g < 0) {
+                    continue;
+                }
+                if ((int64_t)g >= n_groups) {
+                    local_err = GGML_FLASHPREFILL_ERR_BAD_RANGE;
+                    break;
+                }
+                const float * qv = (const float *)((const char *)Q->data + (size_t)g * Q->nb[1] + (size_t)qh * Q->nb[2]);
+                const float * kb = (const float *)((const char *)POOL->data + (size_t)f * POOL->nb[2] + (size_t)head * POOL->nb[1]);
+                for (int64_t d = 0; d < Dk; d++) {
+                    if (!fp_finite_f32(qv[d]) || !fp_finite_f32(kb[d])) {
+                        local_err = GGML_FLASHPREFILL_ERR_BAD_INPUT;
+                        break;
+                    }
+                }
+                if (local_err != GGML_FLASHPREFILL_OK) {
+                    break;
+                }
+                const double z = ggml_flashprefill_softcap_apply((double)scale * fp_dot_f32(qv, kb, Dk), (double)softcap);
+                if (!(z > -INFINITY) || !(z < INFINITY)) {
+                    local_err = GGML_FLASHPREFILL_ERR_BAD_INPUT;
+                    break;
+                }
+                if (z > M) {
+                    M = z;
+                }
+            }
+        }
+        if (local_err != GGML_FLASHPREFILL_OK) {
+            continue;
+        }
+        if (!(M > -INFINITY)) {
+            // No legal pair scored in the energy set (unscored): exact.
+            // Invalid pairs move neither M nor Smax nor decisions.
+            if (n_pair_uses > max_sel) {
+                local_err = GGML_FLASHPREFILL_ERR_OVER_CAPACITY;
+                continue;
+            }
+            for (int64_t k = 0; k < n_pair_uses; k++) {
+                exact_tab[k] = tmp_uses[k];
+            }
+            counts[0] = (int32_t)n_pair_uses;
+            counts[1] = 0;
+            continue;
+        }
+        // Pass 2: per-fragment energies (energy set only).
+        double smax = 0.0;
+        for (int64_t j = 0; j < n_energy; j++) {
+            const int32_t f = tmp_frags[j];
+            double s = 0.0;
+            for (int64_t r = 0; r < n_row; r++) {
+                const int32_t * rr = fp_meta_row(meta, row_off, r);
+                if (rr[3] != (int32_t)tile || rr[1] != (int32_t)head) {
+                    continue;
+                }
+                const int32_t sq = rr[0];
+                const int32_t qh = rr[7];
+                int32_t g = -1;
+                for (int64_t k = 0; k < n_pair_uses; k++) {
+                    const int32_t * ur = fp_meta_use(meta, use_off, tmp_uses[k]);
+                    if (ur[0] == f && ur[7] == sq) {
+                        g = ur[3];
+                        break;
+                    }
+                }
+                if (g < 0) {
+                    continue;
+                }
+                const float * qv = (const float *)((const char *)Q->data + (size_t)g * Q->nb[1] + (size_t)qh * Q->nb[2]);
+                const float * kb = (const float *)((const char *)POOL->data + (size_t)f * POOL->nb[2] + (size_t)head * POOL->nb[1]);
+                const double z = ggml_flashprefill_softcap_apply((double)scale * fp_dot_f32(qv, kb, Dk), (double)softcap);
+                s += exp(z - M);
+            }
+            // s == 0.0 means no legal pair scored for this candidate
+            // (unscored => exact, per pair_valid mask rule); only NaN/inf
+            // indicate corruption.
+            if (!(s >= 0.0) || !(s < INFINITY)) {
+                local_err = GGML_FLASHPREFILL_ERR_BAD_INPUT;
+                break;
+            }
+            S[j] = s;
+            if (s > smax) {
+                smax = s;
+            }
+        }
+        if (local_err != GGML_FLASHPREFILL_OK) {
+            continue;
+        }
+        const double thr = (double)alpha * smax;
+        // Fragment decisions over the partitioned layout [full | partial]:
+        // j < n_energy are scored full candidates (kept | mandatory);
+        // j >= n_energy are partial (never scored, always exact). tmp scratch
+        // stays read-only; kept is recomputed from S on the fly.
+        auto frag_is_exact = [&](int64_t j) -> bool {
+            if (j >= n_energy) {
+                return true; // partial: excluded from energy, forced exact
+            }
+            if (S[j] == 0.0) {
+                return true; // unscored (no legal pair): exact, moves nothing
+            }
+            const int32_t f = tmp_frags[j];
+            if ((S[j] >= thr) || exact_all) {
+                return true;
+            }
+            bool mand = false;
+            for (int64_t k2 = 0; k2 < n_pair_uses; k2++) {
+                const int32_t * ur2 = fp_meta_use(meta, use_off, tmp_uses[k2]);
+                if (ur2[0] != f) {
+                    continue;
+                }
+                if (ur2[6] & GGML_FLASHPREFILL_USE_FLAG_MANDATORY) {
+                    mand = true;
+                    break;
+                }
+            }
+            return mand;
+        };
+        // Expand fragment decisions to uses in increasing use order.
+        int64_t n_exact = 0;
+        int64_t n_proxy = 0;
+        for (int64_t k = 0; k < n_pair_uses; k++) {
+            const int32_t u = tmp_uses[k];
+            const int32_t * ur = fp_meta_use(meta, use_off, u);
+            const int32_t f = ur[0];
+            int64_t j = 0;
+            for (; j < n_cand; j++) {
+                if (tmp_frags[j] == f) {
+                    break;
+                }
+            }
+            if (j >= n_cand) {
+                local_err = GGML_FLASHPREFILL_ERR_BAD_LAYOUT;
+                break;
+            }
+            if (frag_is_exact(j)) {
+                n_exact++;
+            } else {
+                n_proxy++;
+            }
+        }
+        if (local_err != GGML_FLASHPREFILL_OK) {
+            continue;
+        }
+        if (n_exact > max_sel || n_proxy > max_sel) {
+            local_err = GGML_FLASHPREFILL_ERR_OVER_CAPACITY;
+            continue;
+        }
+        // Write entries in increasing use order (deterministic).
+        int64_t ie = 0;
+        int64_t ip = 0;
+        for (int64_t k = 0; k < n_pair_uses; k++) {
+            const int32_t u = tmp_uses[k];
+            const int32_t * ur = fp_meta_use(meta, use_off, u);
+            const int32_t f = ur[0];
+            int64_t j = 0;
+            for (; j < n_cand; j++) {
+                if (tmp_frags[j] == f) {
+                    break;
+                }
+            }
+            if (frag_is_exact(j)) {
+                exact_tab[ie++] = u;
+            } else {
+                proxy_tab[ip++] = u;
+            }
+        }
+        counts[0] = (int32_t)ie;
+        counts[1] = (int32_t)ip;
+    }
+    if (agg_err) {
+        agg_err[0] = local_err;
+    }
+    ggml_barrier(params->threadpool);
+    if (ith == 0) {
+        int32_t global_err = GGML_FLASHPREFILL_OK;
+        // Deterministic first-error scan over per-thread slots.
+        for (int t = 0; t < nth; t++) {
+            char * bp = (char *)params->wdata + (size_t)t * per_thread;
+            const int32_t e = bp ? *(const int32_t *)bp : GGML_FLASHPREFILL_OK;
+            if (e != GGML_FLASHPREFILL_OK && global_err == GGML_FLASHPREFILL_OK) {
+                global_err = e;
+            }
+        }
+        // Publish header dims + error before stats accumulation.
+        plan[0] = GGML_FLASHPREFILL_PLAN_MAGIC;
+        plan[1] = GGML_FLASHPREFILL_VERSION;
+        plan[2] = GGML_FLASHPREFILL_PLAN_HEADER_WORDS;
+        plan[3] = (int32_t)T;
+        plan[4] = (int32_t)H;
+        plan[5] = (int32_t)max_sel;
+        plan[6] = (int32_t)exact_off;
+        plan[7] = (int32_t)proxy_off;
+        plan[8] = (int32_t)counts_off;
+        plan[9] = (int32_t)plan_words_total;
+        plan[10] = global_err;
+        plan[11] = 0;
+        plan[12] = 0;
+        plan[13] = 0;
+        plan[14] = 0;
+        plan[15] = exact_all;
+        plan[16] = 0;
+        plan[17] = 0;
+        plan[18] = 0;
+        plan[19] = 0;
+        plan[20] = 0;
+        plan[21] = 0;
+        plan[22] = 0;
+        plan[23] = 0;
+        if (global_err == GGML_FLASHPREFILL_OK) {
+            // Counters from actual tables (checked 64-bit, never capacities).
+            // Units: selected/corrected count USE records (per source_query);
+            // sparse/dense count ROWS (source_query,q_head): a row is sparse
+            // iff its matched (source_query,tile,kv_head) triple owns at
+            // least one proxy use (unselected fragment, even when ATTN runs
+            // with mean_correction==0 ablation skipping proxy mass).
+            // exact_all / all-selected rows count dense. A metadata use of
+            // the pair listed in NEITHER table is a coverage gap: INVALID
+            // (BAD_PLAN_COVERAGE), never fake-dense.
+            int64_t sel = 0;
+            int64_t corr = 0;
+            for (int64_t p = 0; p < npair; p++) {
+                const int64_t ne = plan[counts_off + p * 2];
+                const int64_t np = plan[counts_off + p * 2 + 1];
+                if (ne < 0 || np < 0 || ne > max_sel || np > max_sel) {
+                    global_err = GGML_FLASHPREFILL_ERR_BAD_LAYOUT;
+                    break;
+                }
+                sel += ne;
+                corr += np;
+            }
+            for (int64_t p = 0; p < npair && global_err == GGML_FLASHPREFILL_OK; p++) {
+                const int64_t tile = p / H;
+                const int64_t head = p % H;
+                const int64_t ne = plan[counts_off + p * 2];
+                const int64_t np = plan[counts_off + p * 2 + 1];
+                const int32_t * et = plan + exact_off + p * max_sel;
+                const int32_t * xt = plan + proxy_off + p * max_sel;
+                for (int64_t u = 0; u < n_use && global_err == GGML_FLASHPREFILL_OK; u++) {
+                    const int32_t * ur = fp_meta_use(meta, use_off, u);
+                    if (ur[1] != (int32_t)tile || ur[2] != (int32_t)head) {
+                        continue;
+                    }
+                    bool in_exact = false;
+                    bool in_proxy = false;
+                    for (int64_t k = 0; k < ne; k++) {
+                        if (et[k] == (int32_t)u) {
+                            in_exact = true;
+                            break;
+                        }
+                    }
+                    for (int64_t k = 0; k < np; k++) {
+                        if (xt[k] == (int32_t)u) {
+                            in_proxy = true;
+                            break;
+                        }
+                    }
+                    if (in_exact == in_proxy) {
+                        global_err = GGML_FLASHPREFILL_ERR_BAD_PLAN_COVERAGE;
+                        break;
+                    }
+                }
+            }
+            int64_t sparse = 0;
+            int64_t dense = 0;
+            for (int64_t r = 0; r < n_row && global_err == GGML_FLASHPREFILL_OK; r++) {
+                const int32_t * rr = fp_meta_row(meta, row_off, r);
+                const int64_t tile = rr[3];
+                const int64_t head = rr[1];
+                const int32_t sq = rr[0];
+                if (tile < 0 || tile >= T || head < 0 || head >= H) {
+                    global_err = GGML_FLASHPREFILL_ERR_BAD_RANGE;
+                    break;
+                }
+                const int64_t p = tile * H + head;
+                const int64_t np = plan[counts_off + p * 2 + 1];
+                const int32_t * xt = plan + proxy_off + p * max_sel;
+                bool has_proxy = false;
+                for (int64_t k = 0; k < np; k++) {
+                    const int64_t u = xt[k];
+                    if (u < 0 || u >= n_use) {
+                        global_err = GGML_FLASHPREFILL_ERR_BAD_RANGE;
+                        break;
+                    }
+                    if (fp_meta_use(meta, use_off, u)[7] == sq) {
+                        has_proxy = true;
+                        break;
+                    }
+                }
+                if (global_err != GGML_FLASHPREFILL_OK) {
+                    break;
+                }
+                if (has_proxy) {
+                    sparse++;
+                } else {
+                    dense++;
+                }
+            }
+            int64_t visible = 0;
+            for (int64_t u = 0; u < n_use && global_err == GGML_FLASHPREFILL_OK; u++) {
+                const int32_t * ur = fp_meta_use(meta, use_off, u);
+                if (ur[5] <= 0) {
+                    global_err = GGML_FLASHPREFILL_ERR_BAD_RANGE;
+                    break;
+                }
+                visible += (int64_t)ur[5];
+                if (visible < 0) {
+                    global_err = GGML_FLASHPREFILL_ERR_OVERFLOW;
+                    break;
+                }
+            }
+            int64_t exact_tok = 0;
+            for (int64_t p = 0; p < npair && global_err == GGML_FLASHPREFILL_OK; p++) {
+                const int64_t ne = plan[counts_off + p * 2];
+                const int32_t * et = plan + exact_off + p * max_sel;
+                for (int64_t k = 0; k < ne; k++) {
+                    const int64_t u = et[k];
+                    if (u < 0 || u >= n_use) {
+                        global_err = GGML_FLASHPREFILL_ERR_BAD_RANGE;
+                        break;
+                    }
+                    exact_tok += (int64_t)fp_meta_use(meta, use_off, u)[5];
+                    if (exact_tok < 0) {
+                        global_err = GGML_FLASHPREFILL_ERR_OVERFLOW;
+                        break;
+                    }
+                }
+            }
+            if (global_err == GGML_FLASHPREFILL_OK) {
+                plan[11] = (int32_t)sparse;
+                plan[12] = (int32_t)dense;
+                plan[13] = (int32_t)sel;
+                plan[14] = (int32_t)corr;
+                plan[16] = (int32_t)(visible & 0xFFFFFFFFLL);
+                plan[17] = (int32_t)((visible >> 32) & 0xFFFFFFFFLL);
+                plan[18] = (int32_t)(exact_tok & 0xFFFFFFFFLL);
+                plan[19] = (int32_t)((exact_tok >> 32) & 0xFFFFFFFFLL);
+            } else {
+                plan[10] = global_err;
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_flash_prefill_attn(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * POOL = dst->src[3];
+    const ggml_tensor * PLAN = dst->src[4];
+    const ggml_tensor * MT = dst->src[5];
+    const ggml_tensor * SINKS = dst->src[6];
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    struct ggml_flashprefill_op_params pp;
+    int32_t param_rc = ggml_flashprefill_op_params_unpack(dst->op_params, &pp);
+    const int64_t Dv_out = dst ? dst->ne[0] : 0;
+    const int64_t Hq_out = dst ? dst->ne[1] : 0;
+    const int64_t Nq_out = (dst && ggml_n_dims(dst) >= 3) ? dst->ne[2] : 0;
+    // Per-thread scratch: decoded K row + decoded V row + MLO accum + MLO tmp.
+    const int64_t Dk = (param_rc == GGML_FLASHPREFILL_OK) ? (int64_t)pp.dk : 0;
+    const int64_t Dv = (param_rc == GGML_FLASHPREFILL_OK) ? (int64_t)pp.dv : Dv_out;
+    const size_t per_thread = (Dk > 0 && Dv > 0)
+        ? ((size_t)Dk * sizeof(float) + (size_t)Dv * sizeof(float) * 3u + 64u)
+        : 64u;
+    char * scratch = (params->wdata && Dk > 0 && Dv > 0)
+        ? (char *)params->wdata + (size_t)ith * per_thread
+        : nullptr;
+    float * k_row = scratch ? (float *)scratch : nullptr;
+    float * v_row = scratch ? (float *)(scratch + (size_t)Dk * sizeof(float)) : nullptr;
+    float * accum = scratch ? (float *)(scratch + ((size_t)Dk + (size_t)Dv) * sizeof(float)) : nullptr;
+    float * out_tmp = scratch ? (float *)(scratch + ((size_t)Dk + (size_t)2 * (size_t)Dv) * sizeof(float)) : nullptr;
+
+    // Failure propagation: ATTN has no error channel, and zero vectors would
+    // look like valid attention output. Globally malformed inputs therefore
+    // abort loudly; only legitimately empty outputs (no row descriptor, or a
+    // row with no tokens and no sink) yield finite zeros. The request-level
+    // failure signal for bad plans is SELECT's plan header error, which the
+    // context must check before trusting ATTN output.
+    if (param_rc != GGML_FLASHPREFILL_OK || pp.op != GGML_FLASHPREFILL_OP_ATTN ||
+        pp.version != GGML_FLASHPREFILL_VERSION) {
+        GGML_ABORT("flash_prefill_attn: bad op params");
+    }
+    if (!Q || !K || !V || !POOL || !PLAN || !MT || !dst) {
+        GGML_ABORT("flash_prefill_attn: null tensor");
+    }
+    if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        POOL->type != GGML_TYPE_F32 || PLAN->type != GGML_TYPE_I32 ||
+        MT->type != GGML_TYPE_I32) {
+        GGML_ABORT("flash_prefill_attn: bad tensor types");
+    }
+    if (Q->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
+        POOL->nb[0] != sizeof(float) || PLAN->nb[0] != sizeof(int32_t) ||
+        MT->nb[0] != sizeof(int32_t)) {
+        GGML_ABORT("flash_prefill_attn: rows must be contiguous");
+    }
+    if (Dk < 1 || Dv < 1 || Dv != Dv_out) {
+        GGML_ABORT("flash_prefill_attn: bad head dims");
+    }
+    if (!fp_finite_f32(pp.scale) || !fp_finite_f32(pp.softcap) || pp.softcap < 0.0f) {
+        GGML_ABORT("flash_prefill_attn: bad scale/softcap");
+    }
+    if (pp.mean_correction != 0 && pp.mean_correction != 1) {
+        GGML_ABORT("flash_prefill_attn: bad mean_correction");
+    }
+    if (Q->ne[0] != Dk || Q->ne[2] != Hq_out || dst->ne[0] != Dv || dst->ne[1] != Hq_out) {
+        GGML_ABORT("flash_prefill_attn: Q/output shape mismatch");
+    }
+    if (K->ne[0] != Dk || V->ne[0] != Dv) {
+        GGML_ABORT("flash_prefill_attn: K/V head dim mismatch");
+    }
+    if (fp_is_inverse_wht_weight_type(K->type) || fp_is_inverse_wht_weight_type(V->type)) {
+        GGML_ABORT("flash_prefill_attn: inverse-WHT weight type as KV");
+    }
+    if (ggml_is_quantized(K->type) && (Dk % ggml_blck_size(K->type) != 0)) {
+        GGML_ABORT("flash_prefill_attn: K dim vs block size");
+    }
+    if (ggml_is_quantized(V->type) && (Dv % ggml_blck_size(V->type) != 0)) {
+        GGML_ABORT("flash_prefill_attn: V dim vs block size");
+    }
+    if (SINKS && (SINKS->type != GGML_TYPE_F32 || SINKS->nb[0] != sizeof(float) || SINKS->ne[0] != Hq_out)) {
+        GGML_ABORT("flash_prefill_attn: bad sinks tensor");
+    }
+    const int32_t * meta = nullptr;
+    const int32_t * plan = nullptr;
+    int64_t meta_words = 0;
+    int64_t plan_words = 0;
+    int32_t meta_rc = GGML_FLASHPREFILL_ERR_BAD_ARG;
+    int32_t plan_rc = GGML_FLASHPREFILL_ERR_BAD_ARG;
+    int32_t joint_rc = GGML_FLASHPREFILL_ERR_BAD_ARG;
+    int64_t T = 0;
+    int64_t H = 0;
+    int64_t max_sel = 0;
+    int64_t exact_off = 0;
+    int64_t proxy_off = 0;
+    int64_t counts_off = 0;
+    int64_t n_groups = 0;
+    int64_t n_frag = 0;
+    int64_t n_row = 0;
+    int64_t n_use = 0;
+    int64_t row_off = 0;
+    int64_t use_off = 0;
+    int64_t cell_off = 0;
+    int64_t G = 0;
+    meta = (const int32_t *)MT->data;
+    plan = (const int32_t *)PLAN->data;
+    meta_words = ggml_nelements(MT);
+    plan_words = ggml_nelements(PLAN);
+    meta_rc = ggml_flashprefill_metadata_validate(meta, meta_words);
+    plan_rc = ggml_flashprefill_plan_validate(plan, plan_words);
+    joint_rc = (meta_rc == GGML_FLASHPREFILL_OK && plan_rc == GGML_FLASHPREFILL_OK)
+        ? ggml_flashprefill_plan_validate_against_metadata(plan, plan_words, meta, meta_words)
+        : (meta_rc != GGML_FLASHPREFILL_OK ? meta_rc : plan_rc);
+    if (joint_rc != GGML_FLASHPREFILL_OK) {
+        GGML_ABORT("flash_prefill_attn: metadata/plan validation failed");
+    }
+    T = plan[3];
+    H = plan[4];
+    max_sel = plan[5];
+    exact_off = plan[6];
+    proxy_off = plan[7];
+    counts_off = plan[8];
+    n_groups = meta[22];
+    n_frag = meta[3];
+    n_row = meta[5];
+    n_use = meta[7];
+    row_off = meta[12];
+    use_off = meta[13];
+    cell_off = meta[14];
+    // Graph reuse capacity bucket: Q.ne1 may pad dummy groups above actual
+    // metadata n_groups; use q_group bounds below stay at actual n_groups.
+    if (Q->ne[1] < n_groups || meta[18] != (int32_t)Dk || meta[19] != (int32_t)Dv ||
+        meta[20] != (int32_t)H || POOL->ne[0] != Dk + Dv || POOL->ne[1] != H) {
+        GGML_ABORT("flash_prefill_attn: metadata dims vs tensors");
+    }
+    if (H < 1 || Hq_out < 1 || Hq_out % H != 0) {
+        GGML_ABORT("flash_prefill_attn: head grouping");
+    }
+    G = Hq_out / H;
+    // Fallback scratch when wdata is absent (single thread, tiny dims).
+    if (!scratch && (Dk + 3 * Dv > 768 || nth != 1)) {
+        GGML_ABORT("flash_prefill_attn: no scratch for head dims");
+    }
+    const int64_t ntotal = Hq_out * Nq_out;
+    // Thread-local fallback buffers when wdata is absent.
+    float fb_k[256];
+    float fb_v[256];
+    float fb_a[256];
+    float fb_o[256];
+    if (!scratch) {
+        if (Dk > 256 || Dv > 256) {
+            GGML_ABORT("flash_prefill_attn: no scratch for head dims");
+        }
+        k_row = fb_k;
+        v_row = fb_v;
+        accum = fb_a;
+        out_tmp = fb_o;
+    }
+    for (int64_t o = ith; o < ntotal; o += nth) {
+        const int64_t h = (Hq_out > 0) ? (o % Hq_out) : 0;
+        const int64_t q = (Hq_out > 0) ? (o / Hq_out) : 0;
+        // Locate the single row for (source_query=q, q_head=h). A missing
+        // row descriptor is a legitimate empty (schema-legal omission):
+        // finite zeros, never NaN.
+        const int32_t * row = nullptr;
+        for (int64_t r = 0; r < n_row; r++) {
+            const int32_t * rr = fp_meta_row(meta, row_off, r);
+            if (rr[0] == (int32_t)q && rr[7] == (int32_t)h) {
+                row = rr;
+                break;
+            }
+        }
+        float * out_ptr = (float *)((char *)dst->data + (size_t)h * dst->nb[1] + (size_t)q * dst->nb[2]);
+        if (!row) {
+            fp_zero_f32(out_ptr, Dv);
+            continue;
+        }
+        const int64_t tile = row[3];
+        const int64_t hkv = row[1];
+        if (tile < 0 || tile >= T || hkv < 0 || hkv >= H || hkv != h / G) {
+            GGML_ABORT("flash_prefill_attn: row tile/head mismatch");
+        }
+        const int64_t p = tile * H + hkv;
+        const int64_t n_exact = plan[counts_off + p * 2];
+        const int64_t n_proxy = plan[counts_off + p * 2 + 1];
+        if (n_exact < 0 || n_proxy < 0 || n_exact > max_sel || n_proxy > max_sel) {
+            GGML_ABORT("flash_prefill_attn: plan counts out of range");
+        }
+        const int32_t * exact_tab = plan + exact_off + p * max_sel;
+        const int32_t * proxy_tab = plan + proxy_off + p * max_sel;
+        struct ggml_flashprefill_mlo_state st;
+        if (ggml_flashprefill_mlo_init(&st, accum, (int32_t)Dv) != GGML_FLASHPREFILL_OK) {
+            GGML_ABORT("flash_prefill_attn: mlo init");
+        }
+        // Exact tokens: one stable denominator term per physical token.
+        for (int64_t k = 0; k < n_exact; k++) {
+            const int64_t u = exact_tab[k];
+            if (u < 0 || u >= n_use) {
+                GGML_ABORT("flash_prefill_attn: exact use index out of range");
+            }
+            const int32_t * ur = fp_meta_use(meta, use_off, u);
+            if (ur[1] != (int32_t)tile || ur[2] != (int32_t)hkv) {
+                GGML_ABORT("flash_prefill_attn: exact use pair mismatch");
+            }
+            if (ur[7] != (int32_t)q) {
+                continue; // use of another query sharing this tile/head
+            }
+            const int32_t g = ur[3];
+            if (g < 0 || (int64_t)g >= n_groups) {
+                GGML_ABORT("flash_prefill_attn: exact q_group out of range");
+            }
+            const float * qv = (const float *)((const char *)Q->data + (size_t)g * Q->nb[1] + (size_t)h * Q->nb[2]);
+            for (int64_t d = 0; d < Dk; d++) {
+                if (!fp_finite_f32(qv[d])) {
+                    GGML_ABORT("flash_prefill_attn: non-finite Q");
+                }
+            }
+            const int64_t sub_off = ur[4];
+            const int64_t sub_count = ur[5];
+            if (sub_count <= 0) {
+                GGML_ABORT("flash_prefill_attn: exact sub_count");
+            }
+            const int32_t * cells = meta + cell_off;
+            for (int64_t j = 0; j < sub_count; j++) {
+                const int32_t phys = cells[sub_off + j];
+                if (phys < 0 || (int64_t)phys >= K->ne[1] || (int64_t)phys >= V->ne[1]) {
+                    GGML_ABORT("flash_prefill_attn: physical cell out of KV range");
+                }
+                const char * k_ptr = (const char *)K->data + (size_t)phys * K->nb[1] + (size_t)hkv * K->nb[2];
+                const char * v_ptr = (const char *)V->data + (size_t)phys * V->nb[1] + (size_t)hkv * V->nb[2];
+                if (fp_decode_kv_row(k_ptr, K->type, k_row, Dk) != GGML_FLASHPREFILL_OK ||
+                    fp_decode_kv_row(v_ptr, V->type, v_row, Dv) != GGML_FLASHPREFILL_OK) {
+                    GGML_ABORT("flash_prefill_attn: KV decode failed");
+                }
+                const double logit = ggml_flashprefill_softcap_apply((double)pp.scale * fp_dot_f32(qv, k_row, Dk), (double)pp.softcap);
+                if (ggml_flashprefill_mlo_add(&st, accum, logit, v_row, 1) != GGML_FLASHPREFILL_OK) {
+                    GGML_ABORT("flash_prefill_attn: exact mlo add");
+                }
+            }
+        }
+        // Proxy correction (skipped under explicit mean_correction ablation).
+        for (int64_t k = 0; k < n_proxy; k++) {
+            if (pp.mean_correction == 0) {
+                break;
+            }
+            const int64_t u = proxy_tab[k];
+            if (u < 0 || u >= n_use) {
+                GGML_ABORT("flash_prefill_attn: proxy use index out of range");
+            }
+            const int32_t * ur = fp_meta_use(meta, use_off, u);
+            if (ur[1] != (int32_t)tile || ur[2] != (int32_t)hkv) {
+                GGML_ABORT("flash_prefill_attn: proxy use pair mismatch");
+            }
+            if (ur[7] != (int32_t)q) {
+                continue;
+            }
+            const int32_t f = ur[0];
+            const int32_t g = ur[3];
+            const int64_t cnt = ur[5];
+            if (f < 0 || (int64_t)f >= n_frag || g < 0 || (int64_t)g >= n_groups || cnt <= 0) {
+                GGML_ABORT("flash_prefill_attn: proxy use bounds");
+            }
+            if ((int64_t)f >= POOL->ne[2]) {
+                GGML_ABORT("flash_prefill_attn: proxy frag outside pool");
+            }
+            const float * qv = (const float *)((const char *)Q->data + (size_t)g * Q->nb[1] + (size_t)h * Q->nb[2]);
+            const float * prow = (const float *)((const char *)POOL->data + (size_t)f * POOL->nb[2] + (size_t)hkv * POOL->nb[1]);
+            const float * kbar = prow;
+            const float * vbar = prow + Dk;
+            for (int64_t d = 0; d < Dk + Dv; d++) {
+                if (!fp_finite_f32(prow[d])) {
+                    GGML_ABORT("flash_prefill_attn: non-finite pool");
+                }
+            }
+            for (int64_t d = 0; d < Dk; d++) {
+                if (!fp_finite_f32(qv[d])) {
+                    GGML_ABORT("flash_prefill_attn: non-finite Q");
+                }
+            }
+            const double logit = ggml_flashprefill_softcap_apply((double)pp.scale * fp_dot_f32(qv, kbar, Dk), (double)pp.softcap);
+            if (ggml_flashprefill_mlo_add(&st, accum, logit, vbar, cnt) != GGML_FLASHPREFILL_OK) {
+                GGML_ABORT("flash_prefill_attn: proxy mlo add");
+            }
+        }
+        // Model softmax sink exactly once (mass only, no value).
+        if (SINKS) {
+            const float s = *(const float *)((const char *)SINKS->data + (size_t)h * SINKS->nb[0]);
+            if (!fp_finite_f32(s)) {
+                GGML_ABORT("flash_prefill_attn: non-finite sink");
+            }
+            if (ggml_flashprefill_mlo_add_sink(&st, accum, (double)s) != GGML_FLASHPREFILL_OK) {
+                GGML_ABORT("flash_prefill_attn: sink mlo add");
+            }
+        }
+        // Legitimately empty outputs (row with no tokens and no sink) yield
+        // finite zeros via the MLO empty identity; anything else failing to
+        // finalize is corruption, not an empty.
+        if (ggml_flashprefill_mlo_finalize(&st, accum, out_tmp) != GGML_FLASHPREFILL_OK) {
+            GGML_ABORT("flash_prefill_attn: mlo finalize");
+        }
+        for (int64_t d = 0; d < Dv; d++) {
+            if (!fp_finite_f32(out_tmp[d])) {
+                GGML_ABORT("flash_prefill_attn: non-finite output");
+            }
+        }
+        memcpy(out_ptr, out_tmp, (size_t)Dv * sizeof(float));
     }
 }

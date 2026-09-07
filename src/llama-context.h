@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-ext.h"
 #include "llama-cparams.h"
+#include "llama-flashprefill-metrics.h"
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
@@ -11,6 +12,8 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <array>
+#include <deque>
 #include <map>
 #include <vector>
 
@@ -133,7 +136,12 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
-    void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+    // Returns false (refusing with zero mutation) when the change is effective
+    // but cannot be applied safely: FlashPrefill enabled atop an active RERoT
+    // episode, where clearing stale KV would orphan episode lineage. Identical
+    // sets are a no-op success (true). True also covers every OFF / inactive /
+    // successfully-applied case.
+    bool set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -156,6 +164,85 @@ struct llama_context {
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+
+    // FlashPrefill V2 explicit execution path (ContextIntegration owner).
+    // ABI-safe: `exec` is a borrowed versioned view (PolicyCore: struct
+    // llama_flashprefill_exec); rows are validated and copied into owned
+    // context storage before any async graph work, so no dangling arrays.
+    // NULL exec == ordinary dense (same as decode). Mismatched version,
+    // struct size, or n_rows != batch.n_tokens is rejected with -1 before
+    // any memory/graph state mutates. Ordinary decode() always routes
+    // unknown/dense. Declared publicly by ConfigIntegration in llama.h.
+    int decode_with_flashprefill(
+            const llama_batch & batch_inp,
+            const struct llama_flashprefill_exec * exec);
+
+    // Immutable policy fingerprint for later state/cache isolation and
+    // metrics (StatePolicy consumer). Deterministic over the frozen policy
+    // fields plus model identity (see .cpp for exact sources); 0 on error.
+    // Never changes over the context lifetime.
+    uint64_t flashprefill_policy_fingerprint() const;
+
+    // Conservative per-context identity token. Assigned (process-unique) only
+    // when the policy is enabled; 0 when OFF (OFF contexts use the legacy
+    // stateless path and carry no isolation identity). State contract:
+    // within-context RAM/checkpoint round-trips observe the same serial
+    // (allowed with a matching policy fingerprint and adapter generation);
+    // cross-context durable restore observes a different serial and is
+    // rejected (model.desc is not a weight hash, so no verifiable durable
+    // identity exists today). Never changes after construction.
+    uint64_t flashprefill_context_serial() const;
+
+    // Effective adapter generation for FlashPrefill state identity
+    // (StatePolicy owner). Starts at 1; bumped on every effective LoRA
+    // set/remove/scale or cvec mutation (no-op calls that change nothing do
+    // not bump). Saturates at UINT64_MAX, which is always-invalid (consumers
+    // must treat MAX as never-reusable, like CellGeneration). Bumped on the
+    // rare adapter-mutation path only — zero decode-path cost.
+    uint64_t flashprefill_adapter_generation() const;
+
+    // Persistent state/cache key getter (StatePolicy-owned, ServerRouting-
+    // called; single source of truth for RAM-cache stamps and slot sidecars).
+    // Mixes the policy fingerprint, context serial, and adapter generation
+    // (see llama_flashprefill_state::state_cache_key). Returns 0 when the
+    // policy is OFF or the fingerprint is unavailable (no isolation identity
+    // needed: OFF uses the legacy stateless path). Never changes for a fixed
+    // adapter set; changes on every effective adapter mutation (stale stores
+    // are rejected, never silently reused).
+    uint64_t flashprefill_state_cache_key() const;
+
+    // Immutable policy accessor (references cparams storage; valid for the
+    // context lifetime; default OFF).
+    const struct llama_flashprefill_config & get_flashprefill_config() const;
+
+    // Owned call-level row count from the last validated exec (0 when no
+    // exec is attached, the policy is OFF, or the call was bypassed).
+    uint32_t flashprefill_call_rows() const;
+
+    // Owned per-ubatch row snapshot for the most recently prepared ubatch,
+    // sliced via the BatchIdentity source-row map (never guessed).
+    // Returns nullptr with *n_rows_out == 0 when unavailable (OFF, bypassed,
+    // legacy decode, or no source map for the ubatch) — the caller must route
+    // dense. Valid until the next decode/graph_reserve call on this context;
+    // never freed by the caller. GraphIntegration hook for the next slice.
+    const struct llama_flashprefill_row * flashprefill_ubatch_rows(uint32_t * n_rows_out) const;
+
+    // FlashPrefill metrics snapshot (MetricsIntegration owner; append-only
+    // block, disjoint from StatePolicy state/adapter/builder lines).
+    // Cumulative COMMITTED-call totals (see llama-flashprefill-metrics.h for
+    // units and merge discipline; per-ubatch deltas stage during the call
+    // and publish only when the whole decode_impl succeeds). OFF contexts
+    // return an empty accum (no allocation, no timers, no reads ever
+    // queued). Cheap copy-out; single-threaded decode ordering assumed
+    // (same as the decode path).
+    llama_flashprefill_metrics::accum flashprefill_metrics_snapshot() const;
+
+    // Drain-once handoff for the server post_decode path: delta = snapshot
+    // minus the last drained watermark, then the watermark advances.
+    // Returns false with `out` cleared when OFF or when nothing new committed
+    // since the last drain (server merges nothing then). Failed/retried
+    // calls never commit, so they are never drained (transactional).
+    bool flashprefill_metrics_consume(llama_flashprefill_metrics::slice_delta & out);
 
     //
     // state save/load
@@ -271,6 +358,65 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    // FlashPrefill internals (all no-ops / empty when the policy is OFF).
+    int decode_impl(const llama_batch & batch_inp);
+    void flashprefill_clear_call();
+    bool flashprefill_attach_call(
+            const llama_batch & batch_inp,
+            const struct llama_flashprefill_exec * exec);
+    // Slices fp_rows_call into fp_rows_ubatch via the BatchIdentity
+    // source-row map and publishes the graph-visible snapshot. Returns true
+    // on success (including legitimate dense: inactive/bypassed/empty calls
+    // and synthetic map-less ubatches with no live rows). Returns false on a
+    // corrupt map for an enabled live call (map missing while rows are live,
+    // ubatch wider than the call, or an out-of-range source row): the caller
+    // must fail the execution explicitly (decode error code) with no half
+    // snapshot left behind — never silent fallback to dense.
+    bool flashprefill_build_ubatch(const llama_ubatch & ubatch);
+    // True when this call must stay dense regardless of row roles: MTP
+    // contexts (draft/verify keep the pre-existing attention path) and
+    // embedding/rerank pooling (non-generation path).
+    bool flashprefill_bypassed() const;
+    // MetricsIntegration: build + stage one successful-ubatch delta for this
+    // ubatch (owned rows + authoritative graph verdict; plans dock at the
+    // end-of-call fold when reads were queued). graph_dense_reason is the
+    // graph summary verdict for this ubatch (recorded even with zero plans).
+    // plans_deferred must equal whether this ubatch queued plan reads.
+    // Returns 0 on success (delta staged, possibly empty); nonzero stats
+    // error means the caller must fail the slice with no successful output
+    // and stage nothing. The staged deltas commit into the ledger only when
+    // the whole decode_impl succeeds. OFF and ordinary dense calls without
+    // an exec are cheap no-ops. Never infers routing from global KV fullness
+    // or guessed backend support; required enforcement lives graph-side.
+    int flashprefill_note_slice_success(
+            const llama_ubatch & ubatch, uint64_t layout_us, bool has_layout_us, bool plans_deferred,
+            int32_t graph_dense_reason);
+    // MetricsIntegration: queue one 96B async plan-header read per plan of
+    // this ubatch's completed-submit graph into the owned per-call snapshot
+    // (no wait). Returns 1 when reads were queued, 0 when the graph built no
+    // plans (dense ubatch), <0 on malformed plan tensors (fail the slice
+    // closed — never queue a short/OOB read).
+    int flashprefill_queue_plan_reads(const llm_graph_result & res, bool & out_queued);
+    // MetricsIntegration: after the single end-of-call synchronize, parse ALL
+    // queued headers (header-only parser, no full-tensor reads) and fold
+    // plan-confirmed totals + pool + actual scratch into `out`. Returns 0, or
+    // the first plan/parse error with `out` cleared (fail the call closed).
+    int flashprefill_fold_plan_reads(llama_flashprefill_metrics::slice_delta & out);
+    // MetricsIntegration: snapshot per-backend GPU phase counters at call
+    // start, before the first submit (enabled-only, host reads, no waits).
+    // Baselines the end-of-call difference so the first FP call counts as
+    // measured instead of being dropped; never assumes counters begin at 0
+    // or share the context lifetime.
+    void flashprefill_snapshot_gpu_phases();
+    // MetricsIntegration: sample the VulkanDispatch phase counters
+    // post-sync (proc address resolved on demand, null-safe) and stage this
+    // call's GPU dispatch times into pending. No extra waits, no-ops without
+    // queued plans or without the producer hook.
+    void flashprefill_sample_gpu_phases();
+    // MetricsIntegration: clear per-call staging (pending + plan log) for a
+    // failed call. Committed ledger and server watermark are untouched.
+    void flashprefill_metrics_clear_call_state();
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -289,6 +435,40 @@ private:
 
     size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
     size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
+
+    // FlashPrefill state envelope (StatePolicy owner). Writes the framed
+    // identity header (small length-prefixed marker + 64-byte body) when the
+    // policy is enabled (no-op when OFF, preserving
+    // legacy bytes). Reads + fail-closed-validates it before any KV bytes
+    // are consumed or context/memory state mutates; throws
+    // std::runtime_error naming the domain + re-prefill path on
+    // missing/unknown/mismatching headers (converted to a 0 return by the
+    // existing state wrappers). scope is kScopeFull/kScopeSeq respectively.
+    void flashprefill_state_write_envelope(llama_io_write_i & io, uint32_t scope);
+    void flashprefill_state_read_envelope(llama_io_read_i & io, uint32_t expected_scope);
+
+    // Bumps fp_adapter_gen once (saturates at MAX, never wraps). Called only
+    // on effective adapter mutations; no-op calls that change nothing, and
+    // failed cvec applies, do not bump.
+    void flashprefill_bump_adapter_generation();
+
+    // Gate for effective adapter changes: false iff the policy is enabled and
+    // a RERoT episode is active, where swapping the effective adapters has no
+    // safe re-resolution path for episode-bound derived state — the caller
+    // must refuse BEFORE applying, with zero mutation, leaving the coherent
+    // graph untouched. True in every other case (OFF or no active episode);
+    // identical (no-op) changes never reach the gate. Normal (non-episode)
+    // switching keeps baseline KV semantics: this gate never deletes KV.
+    bool flashprefill_adapter_change_allowed() const;
+
+    // Effective-adapter-change coordinator: bumps the adapter generation so
+    // pre-switch saved blobs and RAM entries reject on load (they pin the old
+    // generation). Never deletes KV: resident history keeps baseline semantics
+    // and the server owns per-slot LoRA/prompt compatibility; graph/scheduler
+    // re-reservation happens in the setters (sched_need_reserve) and derived
+    // means rebuild per graph under the new generation. OFF behaves
+    // identically (bump only).
+    void flashprefill_on_adapter_change();
 
     //
     // members
@@ -363,6 +543,106 @@ private:
     std::vector<swap_info> output_swaps;
 
     bool sched_need_reserve = true;
+
+    // FlashPrefill V2 owned execution snapshot (ContextIntegration owner).
+    // fp_rows_call: validated owned copy of the call's source rows, taken
+    //   before any async graph work (never a borrowed pointer, never null
+    //   when active). Empty unless an exec passed validation with the policy
+    //   enabled and the call bypassed neither MTP nor embedding/rerank.
+    // fp_rows_ubatch: this ubatch's owned slice of fp_rows_call, keyed by the
+    //   BatchIdentity source-row map after internal splits/retries. Empty
+    //   means "route dense" (never a guess).
+    // fp_exec_active: an owned snapshot is attached to the in-flight call.
+    // fp_serial: per-context identity, unique within the process (nonzero
+    //   only when the policy is enabled, 0 when OFF). NEVER cross-process
+    //   identity on its own: the counter restarts at 1 in every process.
+    // fp_nonce0/1: the fixed 128-bit process nonce at construction time
+    //   (nonzero only when the policy is enabled, 0 when OFF). Envelope
+    //   compare is exact on (nonce, serial) jointly, so cross-restart reuse
+    //   is probabilistically impossible even when serial/policy/adapter
+    //   coincide. Probabilistic anti-collision, not a secret.
+    // fp_adapter_gen: effective adapter generation for state identity (see
+    //   flashprefill_adapter_generation()). Starts at 1; MAX is sticky and
+    //   always-invalid. Bumped only on effective adapter mutations.
+    // OFF cost: empty members + null snapshot + zero identity (no buffers,
+    // maps, randomness, or synchronization on any OFF path).
+    std::vector<struct llama_flashprefill_row> fp_rows_call;
+    std::vector<struct llama_flashprefill_row> fp_rows_ubatch;
+    bool     fp_exec_active = false;
+    uint64_t fp_serial      = 0;
+    uint64_t fp_nonce0      = 0;
+    uint64_t fp_nonce1      = 0;
+    uint64_t fp_adapter_gen = 1;
+
+    // FlashPrefill reserve-sizing scope (StatePolicy writer, GraphIntegration
+    // reader). True only while graph_reserve() builds the synthetic sizing
+    // graph; false for every live decode graph. Read by graph_params() into
+    // llm_graph_params.flashprefill_reserve_sizing (reuse-keyed, so reserve
+    // graphs never alias live graphs). Toggled only through the RAII guard in
+    // graph_reserve(), which restores the prior value on all exits including
+    // early returns and exceptions. OFF cost: one bool store per reserve.
+    bool fp_reserve_sizing_active = false;
+
+    // FlashPrefill metrics ledger (MetricsIntegration owner; append-only).
+    // fp_metrics_pending: per-call staging; each successful ubatch merges
+    //   here, and decode_impl commits it into fp_metrics_accum exactly once
+    //   on return 0, or discards it on every failure return. A narrowed-batch
+    //   retry therefore recounts only re-executed work — never double.
+    // fp_metrics_accum: cumulative committed-call totals (server drains this).
+    // fp_metrics_mark: server drain watermark for flashprefill_metrics_consume.
+    // fp_plan_headers: lazily built deque with one stable 24-word slot per
+    //   queued plan (deque element references never invalidate on push, so
+    //   queued async copies survive later pushes/ubatches until a scheduler
+    //   sync completes them; freed only post-sync on success, or post-sync
+    //   in clear_call_state on failure — never freed with copies
+    //   outstanding). Null until the first actual plan read is queued: OFF
+    //   performs no heap allocation here (a bare deque can allocate its map
+    //   even when empty; the unique_ptr keeps OFF at exactly nullptr).
+    // fp_plan_counts: plan count per queued ubatch, in loop order.
+    // fp_plan_expected: expected full-tensor word count per queued plan
+    //   (header total_words is validated against it; no whole-plan readback).
+    // fp_plan_summaries: per-queued-ubatch CPU build summary (no sync).
+    // fp_plan_reads_pending: true from the first async queue until a scheduler
+    //   sync completes the reads (success end-sync or failure-clear sync).
+    //   Tracks outstanding copies — not container fullness — so a later clear
+    //   never re-syncs already-completed reads. Headers are retained for
+    //   parsing after the completing sync; freed separately.
+    // fp_gpu_last_by_backend: last per-backend phase sample; baselined at
+    //   call start (snapshot, enabled-only) so the first call counts.
+    // fp_met_call_pos_min: reusable call-wide hygiene range (per-sequence
+    //   minima for fail-closed cleanup). Sized once while enabled and reused
+    //   across calls; stays empty while OFF (immutable config: OFF allocates
+    //   nothing here, ever).
+    // OFF cost: zeroed structs + empty containers (no buffers, no timers, no sync).
+    bool fp_plan_reads_pending = false;
+    std::vector<llama_pos> fp_met_call_pos_min;
+    llama_flashprefill_metrics::slice_delta fp_metrics_pending;
+    llama_flashprefill_metrics::accum fp_metrics_accum;
+    llama_flashprefill_metrics::accum fp_metrics_mark;
+    // Owned per-call plan-header snapshot log. Each queued plan owns one
+    // stable 24-word slot: std::deque never invalidates element references
+    // on push, so a queued async GPU copy stays valid across later pushes
+    // and later ubatches until a scheduler sync completes it. Slots are
+    // freed only after completion: on the success path the end-of-call sync
+    // covers them before parsing; on every failure path clear_call_state
+    // syncs first (direct scheduler sync, never the stats wrapper).
+    std::unique_ptr<std::deque<std::array<int32_t, 24>>> fp_plan_headers;
+    std::vector<uint32_t> fp_plan_counts;
+    std::vector<uint64_t> fp_plan_expected;
+    std::vector<llm_graph_flashprefill_summary> fp_plan_summaries;
+    // Last per-backend GPU phase sample (VulkanDispatch producer). Keyed by
+    // live backend pointer; entries for dead backends are pruned at each
+    // finalize. Unknown backends stamp without contributing (never attribute
+    // pre-existing cumulative time). OFF cost: empty map.
+    struct fp_gpu_backend_last {
+        uint64_t pool_ns = 0;
+        uint64_t select_ns = 0;
+        uint64_t attn_ns = 0;
+        bool     stamped = false;
+        uint64_t split_cur_b = 0;
+        uint64_t split_peak_b = 0;
+    };
+    std::map<ggml_backend_t, fp_gpu_backend_last> fp_gpu_last_by_backend;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

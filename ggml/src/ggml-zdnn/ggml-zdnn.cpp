@@ -113,6 +113,11 @@ static bool ggml_zdnn_supports_op(const ggml_backend_zdnn_device_context * ctx_d
                 }
             } break;
 
+        case GGML_OP_FLASH_PREFILL_POOL:
+        case GGML_OP_FLASH_PREFILL_SELECT:
+        case GGML_OP_FLASH_PREFILL_ATTN:
+            return false;
+
         default:
             return false;
     }

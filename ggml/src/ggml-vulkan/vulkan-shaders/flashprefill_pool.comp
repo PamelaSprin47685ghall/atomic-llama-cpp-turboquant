@@ -1,0 +1,249 @@
+#version 450
+// FlashPrefill V2 POOL: per-(fragment, kv_head) K/V means over the fragment's
+// valid cell list. Native bounded GPU kernel, no full float mirror: each
+// needed K/V element is decoded on the fly via flash_attn_dequant.glsl
+// (F32/F16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/IQ4_NL/BF16/Turbo2/3/4 asymmetric).
+// Q tensor unused. Pool layout F32 [(f*H+h)*(Dk+Dv)+d], K rows [0,Dk).
+//
+// Dispatch (VulkanDispatch): 2D grid X=f_cap, Y=n_heads (exact, no CEIL pad
+// beyond caps; shader guards f>=n_frag). One workgroup per (frag,head),
+// threads cooperate over vec4 dim groups (Dk+Dv up to 65536, typical
+// 64/128/256 + legal padding). F32 sums, rounded once on store.
+// Invalid metadata/cells: write zeros for assigned dims, never OOB. Pool has
+// no error channel; SELECT flags the same invalid metadata in the plan
+// header so ATTN never silently answers dense.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+#include "types.glsl"
+#include "flashprefill-interface.h"
+
+layout(local_size_x_id = FP_SPEC_WGSIZE, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = FP_SPEC_WGSIZE) const uint WorkGroupSize = 64;
+layout(constant_id = FP_SPEC_FATYPE_K) const uint FaTypeK = 0;
+layout(constant_id = FP_SPEC_FATYPE_V) const uint FaTypeV = 0;
+layout(constant_id = FP_SPEC_FBLOCKB_K) const uint FaBlockBytesK = 2;
+layout(constant_id = FP_SPEC_FBLOCKB_V) const uint FaBlockBytesV = 2;
+
+#define FLOAT_TYPE float
+#define FLOAT_TYPEV4 vec4
+#define BINDING_IDX_K 0
+#define BINDING_IDX_V 1
+
+// F16 direct views (USE_DECODE false path); quant/F32/BF16/turbo via dequant.
+layout(binding = FP_BIND_K) readonly buffer K_F16 { float16_t data_k[]; };
+layout(binding = FP_BIND_K) readonly buffer K_F16V4 { f16vec4 data_kv4[]; };
+layout(binding = FP_BIND_V) readonly buffer V_F16 { float16_t data_v[]; };
+layout(binding = FP_BIND_V) readonly buffer V_F16V4 { f16vec4 data_vv4[]; };
+
+#include "flash_attn_dequant.glsl"
+
+layout(binding = FP_BIND_META) readonly buffer META { int data_meta[]; };
+layout(binding = FP_BIND_DST) writeonly buffer POOL { float data_pool[]; };
+
+layout(push_constant) uniform FpPoolPushBlock { FP_POOL_PUSH_FIELDS } p;
+
+// Load one vec4 of K (dims base..base+3, base%4==0) for token t, head h.
+vec4 fp_load_k4(uint t, uint h, uint base) {
+    if (FaTypeK == FP_FA_TYPE_F16) {
+        uint byte_base = t * p.k_nb1 + h * p.k_nb2 + base * 2u;
+        uint vi = byte_base / 8u;
+        // Fast vec4 path needs 8B alignment; else scalar fallback.
+        if ((byte_base & 7u) == 0u) {
+            return vec4(data_kv4[vi]);
+        }
+        uint ei = byte_base / 2u;
+        return vec4(float(data_k[ei]), float(data_k[ei+1u]), float(data_k[ei+2u]), float(data_k[ei+3u]));
+    }
+    uint blk = fp_block_elems(FaTypeK);
+    uint bb = FaBlockBytesK;
+    uint total = (t * p.k_nb1 + h * p.k_nb2) / bb + base / blk;
+    uint iqs = base % blk;
+    return vec4(dequantize4(total, iqs, 0u, BINDING_IDX_K));
+}
+
+vec4 fp_load_v4(uint t, uint h, uint base) {
+    if (FaTypeV == FP_FA_TYPE_F16) {
+        uint byte_base = t * p.v_nb1 + h * p.v_nb2 + base * 2u;
+        uint vi = byte_base / 8u;
+        if ((byte_base & 7u) == 0u) {
+            return vec4(data_vv4[vi]);
+        }
+        uint ei = byte_base / 2u;
+        return vec4(float(data_v[ei]), float(data_v[ei+1u]), float(data_v[ei+2u]), float(data_v[ei+3u]));
+    }
+    uint blk = fp_block_elems(FaTypeV);
+    uint bb = FaBlockBytesV;
+    uint total = (t * p.v_nb1 + h * p.v_nb2) / bb + base / blk;
+    uint iqs = base % blk;
+    return vec4(dequantize4(total, iqs, 0u, BINDING_IDX_V));
+}
+
+void main() {
+    uint f = gl_WorkGroupID.x;
+    uint h = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationIndex;
+    uint wgsize = gl_WorkGroupSize.x;
+
+#ifdef NEEDS_INIT_IQ_SHMEM
+    if (fp_type_needs_shmem(FaTypeK) || fp_type_needs_shmem(FaTypeV)) {
+        init_iq_shmem(gl_WorkGroupSize);
+    }
+#endif
+
+    uint dk = p.dk;
+    uint dv = p.dv;
+    // Caps from push (host tensor shapes); actuals from device headers.
+    uint Hcap = p.h_cap;
+    uint Fcap = p.f_cap;
+    uint dtot = dk + dv;
+    bool header_ok = true;
+    uint n_frag = 0u;
+    uint H = 0u;
+    uint cell_base = 0u;
+    uint cell_cnt = 0u;
+
+    // ---- validate metadata header (bounds-checked, never OOB) ----
+    if (p.meta_words < FP_META_HDR_WORDS) {
+        header_ok = false;
+    } else {
+        int magic = data_meta[FP_MH_MAGIC];
+        int ver = data_meta[FP_MH_VERSION];
+        int hw = data_meta[FP_MH_HDR_WORDS];
+        int fw = data_meta[FP_MH_FRAG_WORDS];
+        int rw = data_meta[FP_MH_ROW_WORDS];
+        int uw = data_meta[FP_MH_USE_WORDS];
+        n_frag = uint(data_meta[FP_MH_N_FRAG]);
+        uint mf_fcap = uint(data_meta[FP_MH_F_CAP]);
+        uint mf_dk = uint(data_meta[FP_MH_DK]);
+        uint mf_dv = uint(data_meta[FP_MH_DV]);
+        H = uint(data_meta[FP_MH_N_HKV]);
+        if (magic != int(FP_MAGIC_META) || ver != int(FP_VERSION)) header_ok = false;
+        if (hw != int(FP_META_HDR_WORDS) || fw != int(FP_FRAG_WORDS)) header_ok = false;
+        if (rw != int(FP_ROW_WORDS) || uw != int(FP_USE_WORDS)) header_ok = false;
+        // Dims must match exactly; counts bounded by caps.
+        if (mf_dk != dk || mf_dv != dv) header_ok = false;
+        if (H != Hcap) header_ok = false;
+        if (mf_fcap != Fcap) header_ok = false;
+        if (uint(data_meta[FP_MH_FRAG_OFF]) != 32u) header_ok = false;
+        uint n_use = uint(data_meta[FP_MH_N_USE]);
+        uint u_cap = uint(data_meta[FP_MH_U_CAP]);
+        uint n_cell = uint(data_meta[FP_MH_N_CELL]);
+        uint c_cap = uint(data_meta[FP_MH_C_CAP]);
+        uint n_row = uint(data_meta[FP_MH_N_ROW]);
+        uint r_cap = uint(data_meta[FP_MH_R_CAP]);
+        if (n_frag > Fcap || n_use > u_cap || n_cell > c_cap || n_row > r_cap) header_ok = false;
+        uint row_off = uint(data_meta[FP_MH_ROW_OFF]);
+        uint use_off = uint(data_meta[FP_MH_USE_OFF]);
+        uint ctab = uint(data_meta[FP_MH_CELL_OFF]);
+        uint total = uint(data_meta[FP_MH_TOTAL]);
+        if (row_off != 32u + 8u * Fcap) header_ok = false;
+        if (use_off != row_off + 8u * r_cap) header_ok = false;
+        if (ctab != use_off + 8u * u_cap) header_ok = false;
+        if (total != ctab + c_cap) header_ok = false;
+        if (p.meta_words < total) header_ok = false;
+        if (dk == 0u || dv == 0u || H == 0u) header_ok = false;
+        if (p.n_kv == 0u) header_ok = false;
+    }
+
+    // Cap grid (f_cap x h_cap); shader guards to actuals. Frags past n_frag
+    // and heads past H write zeros so the full Fcap pool is defined.
+    bool in_grid = (f < Fcap && h < Hcap);
+    uint ngroups = (dtot + 3u) / 4u;
+
+    if (!in_grid) return;
+
+    // Frags past n_frag: define pool as zeros (host sizes Fcap).
+    // Malformed header/cells: quiet-NaN poison (not silent zero) so SELECT
+    // flags BAD_INPUT via its finite check; plan error propagates before
+    // any client output (backend barrier POOL->SELECT->ATTN).
+    float bad_val = header_ok ? 0.0f : uintBitsToFloat(0x7FC00000u);
+    if (!header_ok || f >= n_frag) {
+        for (uint g = tid; g < ngroups; g += wgsize) {
+            uint base = g * 4u;
+            uint out_idx = (f * Hcap + h) * dtot + base;
+            for (uint k = 0u; k < 4u; ++k) {
+                if (base + k < dtot) data_pool[out_idx + k] = bad_val;
+            }
+        }
+        return;
+    }
+
+    uint frag_off = uint(data_meta[FP_MH_FRAG_OFF]);
+    uint ctab = uint(data_meta[FP_MH_CELL_OFF]);
+    uint c_cap = uint(data_meta[FP_MH_C_CAP]);
+    uint fb = frag_off + f * 8u;
+    int fco = data_meta[fb + FP_FR_CELL_OFF];
+    int fcc = data_meta[fb + FP_FR_CELL_CNT];
+    bool frag_ok = true;
+    if (fco < 0 || fcc <= 0) frag_ok = false;
+    else if (uint(fco) + uint(fcc) > c_cap) frag_ok = false;
+    else { cell_base = ctab + uint(fco); cell_cnt = uint(fcc); }
+
+    // Validate every cell index before touching K/V (no partial sums).
+    if (frag_ok) {
+        for (uint i = 0u; i < cell_cnt; ++i) {
+            int cell = data_meta[cell_base + i];
+            if (cell < 0 || uint(cell) >= p.n_kv) { frag_ok = false; break; }
+        }
+    }
+    if (FaTypeK == 0xFFFFFFFFu || FaTypeV == 0xFFFFFFFFu) frag_ok = false;
+
+    if (!frag_ok) {
+        for (uint g = tid; g < ngroups; g += wgsize) {
+            uint base = g * 4u;
+            uint out_idx = (f * Hcap + h) * dtot + base;
+            for (uint k = 0u; k < 4u; ++k) {
+                if (base + k < dtot) data_pool[out_idx + k] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    // Each thread owns strided vec4 groups; sequential over valid tokens.
+    for (uint g = tid; g < ngroups; g += wgsize) {
+        uint base = g * 4u;
+        vec4 acc = vec4(0.0f);
+        bool is_k = base < dk;
+        // Groups never straddle the K/V boundary when Dk%4==0 (all legal
+        // dims 64/128/256); straddling groups fall back per-lane below.
+        bool straddle = (base < dk) && (base + 3u >= dk);
+        if (!straddle) {
+            for (uint i = 0u; i < cell_cnt; ++i) {
+                uint t = uint(data_meta[cell_base + i]);
+                vec4 v = is_k ? fp_load_k4(t, h, base) : fp_load_v4(t, h, base - dk);
+                // Guard tail lanes past Dk/Dv (legal padding).
+                for (uint k = 0u; k < 4u; ++k) {
+                    uint d = base + k;
+                    bool valid = is_k ? (d < dk) : (d < dtot);
+                    if (!valid) v[k] = 0.0f;
+                }
+                acc += v;
+            }
+        } else {
+            // Rare straddle (Dk%4 != 0): accumulate lane by lane.
+            acc = vec4(0.0f);
+            for (uint k = 0u; k < 4u; ++k) {
+                uint d = base + k;
+                if (d >= dtot) continue;
+                float s = 0.0f;
+                for (uint i = 0u; i < cell_cnt; ++i) {
+                    uint t = uint(data_meta[cell_base + i]);
+                    vec4 v = (d < dk) ? fp_load_k4(t, h, d & ~3u) : fp_load_v4(t, h, (d - dk) & ~3u);
+                    s += v[d & 3u];
+                }
+                acc[k] = s;
+            }
+        }
+        float inv = 1.0f / float(cell_cnt);
+        vec4 mean = acc * inv;
+        uint out_idx = (f * Hcap + h) * dtot + base;
+        for (uint k = 0u; k < 4u; ++k) {
+            if (base + k < dtot) data_pool[out_idx + k] = mean[k];
+        }
+    }
+}

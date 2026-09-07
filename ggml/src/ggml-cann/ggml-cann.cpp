@@ -2695,6 +2695,10 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SOLVE_TRI:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_FLASH_PREFILL_POOL:
+        case GGML_OP_FLASH_PREFILL_SELECT:
+        case GGML_OP_FLASH_PREFILL_ATTN:
+            return false;
         default:
             return false;
     }

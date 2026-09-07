@@ -600,6 +600,7 @@ llama_kv_cache::llama_kv_cache(
 }
 
 void llama_kv_cache::clear(bool data) {
+    fp_bump();
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -638,6 +639,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (other) {
         return true;
     }
+
+    fp_bump();
 
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
@@ -706,6 +709,8 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     if (other) {
         return;
     }
+
+    fp_bump();
 
     GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
     GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
@@ -800,6 +805,8 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
         return;
     }
 
+    fp_bump();
+
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
@@ -826,6 +833,8 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     if (other) {
         return;
     }
+
+    fp_bump();
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
@@ -876,6 +885,8 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     if (other) {
         return;
     }
+
+    fp_bump();
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_div() is only supported for n_pos_per_embd() == 1");
@@ -1074,6 +1085,8 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
         return true;
     }
 
+    fp_bump();
+
     bool updated = false;
 
     auto * sched = lctx->get_sched();
@@ -1154,6 +1167,8 @@ void llama_kv_cache::compact() {
     if (other) {
         return;
     }
+
+    fp_bump();
 
     for (uint32_t s = 0; s < n_stream; ++s) {
         auto & cells = v_cells[s];
@@ -1411,6 +1426,8 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
     if (other) {
         return other->reclaim_kv(request);
     }
+
+    fp_bump();
 
     if (!tri_scorer || !tri_scorer->valid()) {
         result.supported = false;
@@ -1866,6 +1883,8 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         return;
     }
 
+    fp_bump();
+
     // keep track of the max sequence position that we would overwrite with this ubatch
     // for non-SWA cache, this would be always empty
     llama_seq_id seq_pos_max_rm[LLAMA_MAX_SEQ];
@@ -2054,6 +2073,8 @@ bool llama_kv_cache::rerot_set_write_tag(
         return false;
     }
 
+    fp_bump();
+
     if (tag.active()) {
         if (tag.node_id == LLAMA_REROT_NODE_INVALID || tag.run_id == LLAMA_REROT_RUN_INVALID ||
             tag.visibility == llama_rerot_visibility::normal ||
@@ -2069,6 +2090,7 @@ bool llama_kv_cache::rerot_set_write_tag(
 }
 
 void llama_kv_cache::rerot_clear_write_tag(llama_seq_id seq_id) {
+    fp_bump();
     if (seq_id >= 0 && (size_t) seq_id < rerot_write_tags.size()) {
         rerot_write_tags[seq_id].reset();
     }
@@ -2082,6 +2104,8 @@ size_t llama_kv_cache::rerot_publish_run(
     if (publish_epoch == 0 || !rerot_can_publish_run(episode_id, run_id, &count)) {
         return 0;
     }
+
+    fp_bump();
 
     std::vector<std::pair<uint32_t, uint32_t>> matches;
     GGML_ASSERT(rerot_find_run_cells(episode_id, run_id, &matches) == count);
@@ -2106,6 +2130,8 @@ size_t llama_kv_cache::rerot_reclassify_run(
             episode_id, run_id, expected, replacement, publish_epoch, &count)) {
         return 0;
     }
+
+    fp_bump();
 
     std::vector<std::pair<uint32_t, uint32_t>> matches;
     GGML_ASSERT(rerot_find_run_cells(episode_id, run_id, &matches) == count);
@@ -2167,6 +2193,8 @@ size_t llama_kv_cache::rerot_add_run_ref(
     if (!rerot_can_add_run_ref(episode_id, run_id, seq_id, &count)) {
         return 0;
     }
+
+    fp_bump();
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     size_t seen = 0;
@@ -2252,6 +2280,8 @@ size_t llama_kv_cache::rerot_freeze_to_archive(
     if (!rerot_can_freeze_to_archive(episode_id, exec_seq, archive_seq, &count)) {
         return 0;
     }
+
+    fp_bump();
 
     auto & cells = v_cells[seq_to_stream[exec_seq]];
     const size_t kept = cells.rerot_freeze_to_archive(episode_id, exec_seq, archive_seq);
@@ -2369,6 +2399,7 @@ bool llama_kv_cache::rerot_can_publish_run(
 bool llama_kv_cache::rerot_set_reader_view(
         llama_seq_id seq_id,
         const llama_rerot_reader_state & view) {
+    fp_bump();
     if (seq_id < 0 || (size_t) seq_id >= rerot_reader_views.size() || !view.active() ||
         view.reader == LLAMA_REROT_NODE_INVALID || view.query_run == LLAMA_REROT_RUN_INVALID ||
         view.ordered_runs.empty()) {
@@ -2393,6 +2424,7 @@ bool llama_kv_cache::rerot_set_reader_view(
 }
 
 void llama_kv_cache::rerot_clear_reader_view(llama_seq_id seq_id) {
+    fp_bump();
     if (seq_id >= 0 && (size_t) seq_id < rerot_reader_views.size()) {
         rerot_reader_views[seq_id].reset();
     }
@@ -2528,6 +2560,1219 @@ llama_kv_cache::rerot_resolved_view llama_kv_cache::rerot_resolve_view(
     }
 
     return result;
+}
+
+// FlashPrefill legal-fragment planning (CacheFragments)
+//
+
+static bool fp_stamp_usable(const llama_flashprefill_cell_stamp & s) {
+    return s.stamp != 0 && s.stamp != std::numeric_limits<uint64_t>::max() &&
+           s.generation != std::numeric_limits<uint64_t>::max();
+}
+
+void llama_kv_cache::flashprefill_enable_tracking() const {
+    // One-time lazy opt-in on the flash path only (OFF never reaches here).
+    // Idempotent; the enable itself bumps each stream once, and every build
+    // captures stamps afterwards, so no pre-enable state can validate.
+    fp_active = true;
+    for (auto & cells : v_cells) {
+        const_cast<llama_kv_cells &>(cells).set_generation_enabled(true);
+    }
+}
+
+// Text-pattern partial IMRoPE (Qwen35/Ornith text): n_pos>=3 rows whose extra
+// coords replicate the sequence position ([p,p,p] + zero fourth) are exactly
+// 1D-equivalent for legality. Only genuinely non-text rows gate out.
+static bool fp_row_is_text_pattern(const llama_ubatch & ubatch, uint32_t q) {
+    if (ubatch.n_pos < 3) {
+        return true;
+    }
+    if (ubatch.n_pos > 4) {
+        return false;
+    }
+    const uint32_t n = ubatch.n_tokens;
+    const llama_pos p = ubatch.pos[q];
+    if (ubatch.pos[q + n] != p || ubatch.pos[q + 2 * n] != p) {
+        return false;
+    }
+    if (ubatch.n_pos >= 4 && ubatch.pos[q + 3 * n] != 0) {
+        return false;
+    }
+    return true;
+}
+
+// A member cell that can never flip a p0==p1 tiebreak against a text-pattern
+// row: the mask skips iff ext.y>P || (==P && ext.x>P), which is exactly the
+// complement below. 1D-written cells carry ext {0,0} and always qualify.
+static bool fp_cell_text_compatible(const llama_kv_cells & cells, uint32_t idx, llama_pos pos) {
+    const llama_kv_cell_ext & ext = cells.ext_get(idx);
+    return ext.y < pos || (ext.y == pos && ext.x <= pos);
+}
+
+bool llama_kv_cache::flashprefill_tracking_enabled() const {
+    for (const auto & cells : v_cells) {
+        if (!cells.get_generation_enabled()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void llama_kv_cache::flashprefill_cell_stamps(std::vector<llama_flashprefill_cell_stamp> & out) const {
+    out.clear();
+    out.reserve(v_cells.size());
+    for (const auto & cells : v_cells) {
+        out.push_back({ cells.get_generation_stamp(), cells.get_generation() });
+    }
+}
+
+uint32_t llama_kv_cache::flashprefill_n_streams() const {
+    return (uint32_t) v_cells.size();
+}
+
+bool llama_flashprefill_layout::validate(uint32_t scan_width, std::string * error) const {
+    const auto fail = [&](const char * msg) -> bool {
+        if (error) { *error = msg; }
+        return false;
+    };
+    if (!eligible) {
+        if (!queries.empty() || !fragments.empty() || !cell_refs.empty() || !groups.empty() ||
+            !group_offsets.empty() || !uses.empty() || !use_offsets.empty() || !exact_rows.empty() ||
+            !exact_groups.empty() || !exact_flags.empty() || !exact_offsets.empty()) {
+            return fail("flashprefill layout: ineligible layout carries payload");
+        }
+        return true;
+    }
+    const uint64_t sizes[] = {
+        queries.size(), fragments.size(), cell_refs.size(), groups.size(), group_offsets.size(),
+        uses.size(), use_offsets.size(), exact_rows.size(), exact_groups.size(), exact_flags.size(),
+        exact_offsets.size(),
+    };
+    for (uint64_t s : sizes) {
+        if (s > uint64_t(std::numeric_limits<int32_t>::max())) {
+            return fail("flashprefill layout: size exceeds I32 wire domain");
+        }
+    }
+    const uint32_t nq = (uint32_t) queries.size();
+    if (group_offsets.size() != size_t(nq) + 1 || use_offsets.size() != size_t(nq) + 1) {
+        return fail("flashprefill layout: per-query offset size mismatch");
+    }
+    if (group_offsets.front() != 0 || group_offsets.back() != groups.size()) {
+        return fail("flashprefill layout: group offsets inconsistent");
+    }
+    if (use_offsets.front() != 0 || use_offsets.back() != uses.size()) {
+        return fail("flashprefill layout: use offsets inconsistent");
+    }
+    for (uint32_t q = 0; q < nq; ++q) {
+        if (group_offsets[q] > group_offsets[q + 1] || use_offsets[q] > use_offsets[q + 1]) {
+            return fail("flashprefill layout: offsets not monotonic");
+        }
+        for (uint32_t g = group_offsets[q]; g < group_offsets[q + 1]; ++g) {
+            if (groups[g].query_index != q) {
+                return fail("flashprefill layout: group references another query");
+            }
+            if (groups[g].effective_pos < 0) {
+                return fail("flashprefill layout: negative effective position");
+            }
+        }
+    }
+    for (const auto & frag : fragments) {
+        if (frag.token_count == 0) {
+            return fail("flashprefill layout: empty fragment");
+        }
+        if (frag.logical_end < frag.logical_begin) {
+            return fail("flashprefill layout: fragment logical range inverted");
+        }
+        if (frag.contiguous) {
+            if (frag.cell_ref_offset != UINT32_MAX) {
+                return fail("flashprefill layout: contiguous fragment carries ref offset");
+            }
+            if (uint64_t(frag.cell_begin) + uint64_t(frag.token_count) > scan_width) {
+                return fail("flashprefill layout: fragment range out of bounds");
+            }
+        } else {
+            if (uint64_t(frag.cell_ref_offset) + uint64_t(frag.token_count) > cell_refs.size()) {
+                return fail("flashprefill layout: fragment refs out of bounds");
+            }
+            for (uint32_t k = 0; k < frag.token_count; ++k) {
+                if (cell_refs[frag.cell_ref_offset + k] >= scan_width) {
+                    return fail("flashprefill layout: fragment ref out of bounds");
+                }
+            }
+        }
+    }
+    // (query, fragment) uniqueness over uses.
+    {
+        std::vector<uint64_t> keys;
+        keys.reserve(uses.size());
+        for (const auto & use : uses) {
+            if (use.fragment >= fragments.size() || use.query >= nq) {
+                return fail("flashprefill layout: use references unknown query/fragment");
+            }
+            if (use.group >= groups.size() || groups[use.group].query_index != use.query) {
+                return fail("flashprefill layout: use references another query's group");
+            }
+            if (use.sub_count == 0) {
+                return fail("flashprefill layout: empty use");
+            }
+            const auto & frag = fragments[use.fragment];
+            if (uint64_t(use.sub_off) + uint64_t(use.sub_count) > frag.token_count) {
+                return fail("flashprefill layout: use subrange outside fragment");
+            }
+            if (use.flags & ~llama_flashprefill_use::FLAG_MANDATORY) {
+                return fail("flashprefill layout: use flag out of range");
+            }
+            keys.push_back((uint64_t(use.query) << 32) | use.fragment);
+        }
+        std::sort(keys.begin(), keys.end());
+        for (size_t i = 1; i < keys.size(); ++i) {
+            if (keys[i] == keys[i - 1]) {
+                return fail("flashprefill layout: duplicate (query, fragment) use");
+            }
+        }
+    }
+    // Oracle exact rows: offset exactness, group ownership, flag domain, per-row dedup.
+    if (!exact_offsets.empty()) {
+        if (exact_rows.size() != exact_groups.size() || exact_rows.size() != exact_flags.size()) {
+            return fail("flashprefill layout: exact payload size mismatch");
+        }
+        if (exact_offsets.size() != size_t(nq) + 1 || exact_offsets.front() != 0 ||
+            exact_offsets.back() != exact_rows.size()) {
+            return fail("flashprefill layout: exact offsets inconsistent");
+        }
+        for (uint32_t q = 0; q < nq; ++q) {
+            if (exact_offsets[q] > exact_offsets[q + 1]) {
+                return fail("flashprefill layout: exact offsets not monotonic");
+            }
+            std::vector<uint32_t> row;
+            row.reserve(exact_offsets[q + 1] - exact_offsets[q]);
+            for (uint32_t e = exact_offsets[q]; e < exact_offsets[q + 1]; ++e) {
+                if (exact_rows[e] >= scan_width) {
+                    return fail("flashprefill layout: exact row out of bounds");
+                }
+                if (exact_groups[e] >= groups.size() || groups[exact_groups[e]].query_index != q) {
+                    return fail("flashprefill layout: exact row references another query's group");
+                }
+                if (exact_flags[e] & ~llama_flashprefill_use::FLAG_MANDATORY) {
+                    return fail("flashprefill layout: exact flag out of range");
+                }
+                row.push_back(exact_rows[e]);
+            }
+            std::sort(row.begin(), row.end());
+            for (size_t i = 1; i < row.size(); ++i) {
+                if (row[i] == row[i - 1]) {
+                    return fail("flashprefill layout: duplicate physical token in query row");
+                }
+            }
+        }
+    } else if (!exact_rows.empty() || !exact_groups.empty() || !exact_flags.empty()) {
+        return fail("flashprefill layout: exact payload without offsets");
+    }
+    return true;
+}
+
+// Coverage of one fragment's logical span for one query row: 0 = no legal
+// member, 1 = partial (a strict non-empty subset), 2 = full. Edge tests only,
+// O(1): masking is monotone over the causal prefix for every supported SWA
+// shape, and member order is position-ascending, so span endpoints decide.
+static int fp_ord_coverage(
+        bool causal, uint32_t n_swa, llama_swa_type swa_type,
+        llama_pos mn, llama_pos mx, llama_pos qpos) {
+    if (causal && mn > qpos) {
+        return 0;
+    }
+    const bool causal_full = !causal || mx <= qpos;
+    bool swa_none = false;
+    bool swa_full = true;
+    if (swa_type != LLAMA_SWA_TYPE_NONE && n_swa != 0) {
+        // monotone: masked(min) => all masked; !masked(max) => none masked.
+        swa_none = llama_hparams::is_masked_swa(n_swa, swa_type, mn, qpos);
+        swa_full = !llama_hparams::is_masked_swa(n_swa, swa_type, mx, qpos);
+    }
+    if (swa_none) {
+        return 0;
+    }
+    if (causal_full && swa_full) {
+        return 2;
+    }
+    return 1;
+}
+
+struct fp_ord_member {
+    uint32_t idx = 0;
+    llama_pos pos = 0;
+};
+
+struct fp_ord_frag_work {
+    std::bitset<LLAMA_MAX_SEQ> sig;
+    std::vector<fp_ord_member> members; // sorted by (pos, idx) before emission
+    llama_pos mn = 0;
+    llama_pos mx = -1;
+};
+
+// Ordinary-path fragment planning over resident owned cells. Partition key is
+// (stream, logical BN block, exact membership signature); members are emitted
+// in (pos, idx) order so every query's legal set is one contiguous interval.
+llama_flashprefill_build_status llama_flashprefill_build_ordinary_plan(
+        const llama_kv_cells_vec & v_cells,
+        const std::vector<uint32_t> & seq_to_stream,
+        uint32_t n_swa,
+        llama_swa_type swa_type,
+        bool causal,
+        bool require_text_cells,
+        const llama_ubatch & ubatch,
+        const llama_flashprefill_layout_params & params,
+        llama_flashprefill_layout & L,
+        std::string * error) {
+    const auto hard_error = [&](const std::string & msg) -> llama_flashprefill_build_status {
+        if (error) { *error = msg; }
+        return llama_flashprefill_build_status::HARD_ERROR;
+    };
+
+    const uint32_t n_streams = (uint32_t) v_cells.size();
+    if (n_streams == 0) {
+        return hard_error("flashprefill layout: no KV streams");
+    }
+
+    // Queried primary sequences per stream: the ONLY seqs that can appear in
+    // any query row (ubatch seq_id[q][0], matching the KQ-mask and qr.seq_id
+    // convention). Membership signatures draw exclusively from these, so
+    // foreign idle/private KV never splits fragments, never trips
+    // text-compat, and never shifts counts or admission. Unique + validated;
+    // unrelated seq refs on a cell are ignored for partitioning.
+    std::vector<std::vector<llama_seq_id>> queried(n_streams);
+    for (uint32_t q = 0; q < ubatch.n_tokens; ++q) {
+        if (ubatch.n_seq_id[q] < 1 || ubatch.seq_id[q] == nullptr) {
+            return hard_error("flashprefill layout: query row without sequence");
+        }
+        const llama_seq_id seq = ubatch.seq_id[q][0];
+        if (seq < 0 || (size_t) seq >= seq_to_stream.size() || (size_t) seq >= LLAMA_MAX_SEQ) {
+            return hard_error("flashprefill layout: query sequence out of range");
+        }
+        const uint32_t stream = seq_to_stream[seq];
+        if (stream >= n_streams) {
+            return hard_error("flashprefill layout: query stream out of range");
+        }
+        auto & vec = queried[stream];
+        if (std::find(vec.begin(), vec.end(), seq) == vec.end()) {
+            vec.push_back(seq);
+        }
+    }
+
+    // Partition. Outer vector per stream; inner map BN block -> frags by sig.
+    std::vector<std::map<uint32_t, std::vector<fp_ord_frag_work>>> table(n_streams);
+    for (uint32_t s = 0; s < n_streams; ++s) {
+        const auto & cells = v_cells[s];
+        for (uint32_t idx = 0; idx < cells.size(); ++idx) {
+            if (cells.is_empty(idx)) {
+                continue;
+            }
+            const llama_pos pos = cells.pos_get(idx);
+            if (pos < 0) {
+                return hard_error("flashprefill layout: resident cell with negative position");
+            }
+            std::bitset<LLAMA_MAX_SEQ> sig;
+            for (const llama_seq_id seq : queried[s]) {
+                if (cells.seq_has(idx, seq)) {
+                    sig.set((size_t) seq);
+                }
+            }
+            if (sig.none()) {
+                continue; // referenced by no queried sequence: invisible to
+                          // every row; skipped BEFORE any text/layout check so
+                          // foreign content can neither gate nor split
+            }
+            if (require_text_cells && !fp_cell_text_compatible(cells, idx, pos)) {
+                // Image-pattern resident content: the stock KQ mask applies a
+                // 2-D tiebreak this 1D-equivalent legality cannot reproduce.
+                if (error) { *error = "flashprefill layout: image-pattern cell keeps the stock path"; }
+                return llama_flashprefill_build_status::INELIGIBLE;
+            }
+            const uint32_t block = uint32_t(pos) / params.block_k;
+            auto & bucket = table[s][block];
+            fp_ord_frag_work * work = nullptr;
+            for (auto & cand : bucket) {
+                if (cand.sig == sig) {
+                    work = &cand;
+                    break;
+                }
+            }
+            if (!work) {
+                bucket.push_back(fp_ord_frag_work{});
+                work = &bucket.back();
+                work->sig = sig;
+                work->mn = pos;
+                work->mx = pos;
+            }
+            work->members.push_back({ idx, pos });
+            if (pos < work->mn) { work->mn = pos; }
+            if (pos > work->mx) { work->mx = pos; }
+        }
+    }
+
+    // Emit fragments stream-major. Members sorted by (pos, idx); contiguous
+    // range form only when idx-consecutive in that order (positions then
+    // ascend by construction).
+    std::vector<uint32_t> stream_begin(n_streams + 1, 0);
+    for (uint32_t s = 0; s < n_streams; ++s) {
+        stream_begin[s] = (uint32_t) L.fragments.size();
+        for (auto & block_it : table[s]) {
+            for (auto & work : block_it.second) {
+                auto & members = work.members;
+                std::sort(members.begin(), members.end(), [](const fp_ord_member & a, const fp_ord_member & b) {
+                    if (a.pos != b.pos) { return a.pos < b.pos; }
+                    return a.idx < b.idx;
+                });
+                if (work.mx == std::numeric_limits<llama_pos>::max()) {
+                    return hard_error("flashprefill layout: logical position at INT32_MAX");
+                }
+                llama_flashprefill_fragment frag;
+                frag.domain = llama_flashprefill_fragment_domain::ORDINARY;
+                frag.stream = s;
+                frag.boundary_partial = false;
+                frag.token_count = (uint32_t) members.size();
+                frag.logical_block = block_it.first;
+                frag.logical_begin = work.mn;
+                frag.logical_end = work.mx + 1;
+                frag.members = work.sig;
+                frag.gated = true;
+                bool contiguous = true;
+                for (size_t k = 1; k < members.size(); ++k) {
+                    if (members[k].idx != members[k - 1].idx + 1) {
+                        contiguous = false;
+                        break;
+                    }
+                }
+                if (contiguous) {
+                    frag.contiguous = true;
+                    frag.cell_begin = members.front().idx;
+                    frag.cell_ref_offset = UINT32_MAX;
+                } else {
+                    frag.contiguous = false;
+                    frag.cell_begin = 0;
+                    frag.cell_ref_offset = (uint32_t) L.cell_refs.size();
+                    for (const auto & m : members) {
+                        L.cell_refs.push_back(m.idx);
+                    }
+                }
+                L.fragments.push_back(frag);
+            }
+        }
+    }
+    stream_begin[n_streams] = (uint32_t) L.fragments.size();
+
+    // Queries.
+    for (uint32_t q = 0; q < ubatch.n_tokens; ++q) {
+        if (ubatch.n_seq_id[q] < 1 || ubatch.seq_id[q] == nullptr) {
+            return hard_error("flashprefill layout: query row without sequence");
+        }
+        const llama_seq_id seq = ubatch.seq_id[q][0];
+        if (seq < 0 || (size_t) seq >= seq_to_stream.size()) {
+            return hard_error("flashprefill layout: query sequence out of range");
+        }
+        const uint32_t stream = seq_to_stream[seq];
+        if (stream >= n_streams) {
+            return hard_error("flashprefill layout: query stream out of range");
+        }
+        const llama_pos qpos = ubatch.pos[q];
+        if (qpos < 0) {
+            return hard_error("flashprefill layout: query with negative position");
+        }
+        llama_flashprefill_query qr;
+        qr.query_index = q;
+        qr.seq_id = seq;
+        qr.stream = stream;
+        qr.query_pos = qpos;
+        qr.query_virtual_pos = -1;
+        L.queries.push_back(qr);
+    }
+
+    // Per-query emission: one group + uses over the query's stream range.
+    L.group_offsets.push_back(0);
+    L.use_offsets.push_back(0);
+    if (params.want_exact_rows) {
+        L.exact_offsets.push_back(0);
+    }
+    uint64_t exact_total = 0;
+    for (uint32_t q = 0; q < (uint32_t) L.queries.size(); ++q) {
+        const auto & qr = L.queries[q];
+        llama_rerot_attn_group group;
+        group.query_index = q;
+        group.effective_pos = qr.query_pos;
+        L.groups.push_back(group);
+        const uint32_t gid = (uint32_t) L.groups.size() - 1;
+        L.group_offsets.push_back((uint32_t) L.groups.size());
+
+        for (uint32_t f = stream_begin[qr.stream]; f < stream_begin[qr.stream + 1]; ++f) {
+            auto & frag = L.fragments[f];
+            if (!frag.members.test((size_t) qr.seq_id)) {
+                continue;
+            }
+            const int cov = fp_ord_coverage(
+                causal, n_swa, swa_type, frag.logical_begin, frag.logical_end - 1, qr.query_pos);
+            if (cov == 0) {
+                continue;
+            }
+            uint32_t sub_off = 0;
+            uint32_t sub_count = frag.token_count;
+            uint32_t flags = 0;
+            if (cov == 1) {
+                // Interval scan over member order (position-ascending): the
+                // legal set must be one contiguous interval; anything else is
+                // an ordering bug and fails closed.
+                const auto & cells = v_cells[qr.stream];
+                uint32_t first = frag.token_count;
+                uint32_t last = frag.token_count;
+                bool seen_illegal = false;
+                for (uint32_t k = 0; k < frag.token_count; ++k) {
+                    const uint32_t idx = frag.contiguous ? frag.cell_begin + k
+                                                         : L.cell_refs[frag.cell_ref_offset + k];
+                    const llama_pos p = cells.pos_get(idx);
+                    const bool legal = (!causal || p <= qr.query_pos) &&
+                        (swa_type == LLAMA_SWA_TYPE_NONE || n_swa == 0 ||
+                         !llama_hparams::is_masked_swa(n_swa, swa_type, p, qr.query_pos));
+                    if (legal) {
+                        if (seen_illegal) {
+                            return hard_error("flashprefill layout: non-interval legal subset");
+                        }
+                        if (first == frag.token_count) {
+                            first = k;
+                        }
+                        last = k;
+                    } else {
+                        seen_illegal = first != frag.token_count;
+                    }
+                }
+                if (first == frag.token_count) {
+                    return hard_error("flashprefill layout: partial fragment with empty subset");
+                }
+                sub_off = first;
+                sub_count = last - first + 1;
+                flags = llama_flashprefill_use::FLAG_MANDATORY;
+                frag.boundary_partial = true;
+            }
+            llama_flashprefill_use use;
+            use.query = q;
+            use.fragment = f;
+            use.group = gid;
+            use.sub_off = sub_off;
+            use.sub_count = sub_count;
+            use.flags = flags;
+            L.uses.push_back(use);
+
+            if (params.want_exact_rows) {
+                if (exact_total + sub_count > params.exact_cap) {
+                    return hard_error("flashprefill layout: exact row capacity exceeded");
+                }
+                const auto & cells = v_cells[qr.stream];
+                for (uint32_t k = 0; k < sub_count; ++k) {
+                    const uint32_t idx = frag.contiguous ? frag.cell_begin + sub_off + k
+                                                         : L.cell_refs[frag.cell_ref_offset + sub_off + k];
+                    (void) cells;
+                    L.exact_rows.push_back(idx);
+                    L.exact_groups.push_back(gid);
+                    L.exact_flags.push_back(flags);
+                }
+                exact_total += sub_count;
+            }
+        }
+        L.use_offsets.push_back((uint32_t) L.uses.size());
+        if (params.want_exact_rows) {
+            L.exact_offsets.push_back((uint32_t) L.exact_rows.size());
+        }
+    }
+    return llama_flashprefill_build_status::OK;
+}
+
+struct fp_rerot_view_key {
+    uint64_t episode = 0;
+    llama_rerot_node_id reader = LLAMA_REROT_NODE_INVALID;
+    llama_rerot_run_id query_run = LLAMA_REROT_RUN_INVALID;
+    uint64_t frontier = 0;
+    uint64_t topology_epoch = 0;
+    uint64_t publish_epoch = 0;
+    uint64_t layout_epoch = 0;
+    llama_rerot_frontier_mode frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+    std::vector<llama_rerot_run_id> ordered_runs;
+
+    bool operator==(const fp_rerot_view_key & o) const {
+        return episode == o.episode && reader == o.reader && query_run == o.query_run &&
+               frontier == o.frontier && topology_epoch == o.topology_epoch &&
+               publish_epoch == o.publish_epoch && layout_epoch == o.layout_epoch &&
+               frontier_mode == o.frontier_mode && ordered_runs == o.ordered_runs;
+    }
+};
+
+struct fp_tagged_member {
+    uint32_t idx = 0;
+    llama_pos storage = 0;
+    uint64_t frontier = 0;
+    llama_rerot_visibility vis = llama_rerot_visibility::normal;
+    bool gated = true;
+    std::bitset<LLAMA_MAX_SEQ> sig;
+};
+
+struct fp_base_member {
+    uint32_t idx = 0;
+    llama_pos storage = 0;
+    std::bitset<LLAMA_MAX_SEQ> sig;
+};
+
+// RERoT-path fragment planning. One reusable run/span table per distinct
+// reader view (O(K) each); per-query work then touches fragments only
+// (O(Q*F)). Visibility mirrors llama_rerot_build_query_layout exactly: FULL
+// members (position-independent public) are legal for every sharing query,
+// gated members (base, private/pending, own-node frontier-equal public) keep
+// per-query ownership+causal checks. The old per-query full-KV expansion is
+// never built on this path.
+llama_flashprefill_build_status llama_flashprefill_build_rerot_plan(
+        const llama_kv_cells & cells,
+        const std::vector<llama_rerot_reader_state> & views,
+        const llama_ubatch & ubatch,
+        const llama_flashprefill_layout_params & params,
+        llama_flashprefill_layout & L,
+        std::string * error) {
+    const auto hard_error = [&](const std::string & msg) -> llama_flashprefill_build_status {
+        if (error) { *error = msg; }
+        return llama_flashprefill_build_status::HARD_ERROR;
+    };
+
+    // Live sequences for ownership signatures (unified stream).
+    std::vector<llama_seq_id> live;
+    for (llama_seq_id seq = 0; seq < LLAMA_MAX_SEQ; ++seq) {
+        if (cells.seq_get_used(seq) > 0) {
+            live.push_back(seq);
+        }
+    }
+    const auto member_sig = [&](uint32_t idx) {
+        std::bitset<LLAMA_MAX_SEQ> sig;
+        for (const llama_seq_id seq : live) {
+            if (cells.seq_has(idx, seq)) {
+                sig.set((size_t) seq);
+            }
+        }
+        return sig;
+    };
+
+    struct view_group {
+        fp_rerot_view_key key;
+        const llama_rerot_reader_state * view = nullptr;
+        std::vector<uint32_t> rows; // ubatch rows, in order
+    };
+    std::vector<view_group> vgroups;
+    for (uint32_t q = 0; q < ubatch.n_tokens; ++q) {
+        if (ubatch.n_seq_id[q] < 1 || ubatch.seq_id[q] == nullptr) {
+            return hard_error("flashprefill layout: query row without sequence");
+        }
+        const llama_seq_id seq = ubatch.seq_id[q][0];
+        if (seq < 0 || (size_t) seq >= views.size() || !views[seq].active()) {
+            return hard_error("flashprefill layout: query without active reader view");
+        }
+        const auto & view = views[seq];
+        fp_rerot_view_key key;
+        key.episode = view.episode_id;
+        key.reader = view.reader;
+        key.query_run = view.query_run;
+        key.frontier = view.frontier;
+        key.topology_epoch = view.topology_epoch;
+        key.publish_epoch = view.publish_epoch;
+        key.layout_epoch = view.layout_epoch;
+        key.frontier_mode = view.frontier_mode;
+        key.ordered_runs = view.ordered_runs;
+        view_group * group = nullptr;
+        for (auto & cand : vgroups) {
+            if (cand.key == key) {
+                group = &cand;
+                break;
+            }
+        }
+        if (!group) {
+            vgroups.push_back(view_group{});
+            group = &vgroups.back();
+            group->key = std::move(key);
+            group->view = &view;
+        }
+        group->rows.push_back(q);
+    }
+
+    struct frag_range {
+        uint32_t begin = 0;
+        uint32_t end = 0;
+    };
+    std::vector<frag_range> vgroup_frags;
+    vgroup_frags.reserve(vgroups.size());
+    std::vector<std::map<llama_seq_id, std::unordered_map<llama_pos, std::pair<uint32_t, uint32_t>>>> own_by_vgroup;
+    own_by_vgroup.reserve(vgroups.size());
+
+    // Reusable table per distinct view.
+    for (const auto & vg : vgroups) {
+        const auto & view = *vg.view;
+        const uint32_t fbegin = (uint32_t) L.fragments.size();
+        // Physical key -> (fragment, fragment-local index), for own-cell
+        // lookup without rescanning tables per query.
+        std::vector<uint32_t> key_frag(cells.size(), UINT32_MAX);
+        std::vector<uint32_t> key_local(cells.size(), UINT32_MAX);
+
+        std::unordered_map<llama_rerot_run_id, uint32_t> rank;
+        rank.reserve(view.ordered_runs.size());
+        for (uint32_t r = 0; r < view.ordered_runs.size(); ++r) {
+            const auto run = view.ordered_runs[r];
+            if (run == LLAMA_REROT_RUN_INVALID || !rank.emplace(run, r).second) {
+                return hard_error("flashprefill layout: reader view with invalid/duplicate run");
+            }
+        }
+
+        std::vector<fp_base_member> base;
+        std::vector<std::vector<fp_tagged_member>> runs(view.ordered_runs.size());
+        for (uint32_t idx = 0; idx < cells.size(); ++idx) {
+            if (cells.is_empty(idx)) {
+                continue;
+            }
+            const llama_pos storage = cells.pos_get(idx);
+            if (storage < 0) {
+                return hard_error("flashprefill layout: resident cell with negative position");
+            }
+            const auto & meta = cells.rerot_get(idx);
+            if (!meta.active()) {
+                auto sig = member_sig(idx);
+                if (sig.none()) {
+                    continue;
+                }
+                base.push_back({ idx, storage, sig });
+                continue;
+            }
+            if (meta.episode_id != view.episode_id) {
+                continue;
+            }
+            const auto rank_it = rank.find(meta.run_id);
+            if (rank_it == rank.end()) {
+                continue;
+            }
+            const bool full = llama_rerot_cell_visible_public_full(meta, view);
+            bool maybe = false;
+            if (!full) {
+                if (meta.visibility == llama_rerot_visibility::public_live) {
+                    maybe = meta.frontier == view.frontier && meta.node_id == view.reader;
+                } else if (meta.visibility == llama_rerot_visibility::private_control ||
+                           meta.visibility == llama_rerot_visibility::pending_record) {
+                    maybe = meta.node_id == view.reader;
+                }
+            }
+            if (!full && !maybe) {
+                continue;
+            }
+            runs[rank_it->second].push_back({ idx, storage, meta.frontier, meta.visibility, !full, member_sig(idx) });
+        }
+
+        auto by_storage = [](const auto & a, const auto & b) {
+            if (a.storage != b.storage) { return a.storage < b.storage; }
+            return a.idx < b.idx;
+        };
+        std::sort(base.begin(), base.end(), by_storage);
+        for (auto & run : runs) {
+            std::sort(run.begin(), run.end(), [](const fp_tagged_member & a, const fp_tagged_member & b) {
+                if (a.storage != b.storage) { return a.storage < b.storage; }
+                if (a.frontier != b.frontier) { return a.frontier < b.frontier; }
+                return a.idx < b.idx;
+            });
+        }
+
+        // Dense virtualization: base first, then runs in view order.
+        if (base.size() > uint64_t(std::numeric_limits<llama_pos>::max()) + 1u) {
+            return hard_error("flashprefill layout: base exceeds llama_pos range");
+        }
+        std::vector<llama_pos> run_v0(runs.size(), 0);
+        int64_t cursor = (int64_t) base.size();
+        for (size_t r = 0; r < runs.size(); ++r) {
+            if (cursor > std::numeric_limits<llama_pos>::max()) {
+                return hard_error("flashprefill layout: virtual positions exceed llama_pos range");
+            }
+            run_v0[r] = (llama_pos) cursor;
+            cursor += (int64_t) runs[r].size();
+        }
+        if (cursor > int64_t(std::numeric_limits<llama_pos>::max()) + 1) {
+            return hard_error("flashprefill layout: virtual positions exceed llama_pos range");
+        }
+
+        const auto emit_members = [&](llama_flashprefill_fragment & frag, const std::vector<uint32_t> & idxs) {
+            frag.token_count = (uint32_t) idxs.size();
+            bool contiguous = true;
+            for (size_t k = 1; k < idxs.size(); ++k) {
+                if (idxs[k] != idxs[k - 1] + 1) {
+                    contiguous = false;
+                    break;
+                }
+            }
+            if (contiguous) {
+                frag.contiguous = true;
+                frag.cell_begin = idxs.front();
+                frag.cell_ref_offset = UINT32_MAX;
+            } else {
+                frag.contiguous = false;
+                frag.cell_begin = 0;
+                frag.cell_ref_offset = (uint32_t) L.cell_refs.size();
+                for (uint32_t idx : idxs) {
+                    L.cell_refs.push_back(idx);
+                }
+            }
+        };
+
+        // Base fragments: cut on membership-signature, virtual-BN, and phase-bias changes.
+        {
+            size_t start = 0;
+            const auto cut_before = [&](size_t i) {
+                if (base[i].sig != base[i - 1].sig) { return true; }
+                if (uint64_t(i) / params.block_k != uint64_t(i - 1) / params.block_k) { return true; }
+                return (int64_t(base[i].storage) - int64_t(i)) != (int64_t(base[i - 1].storage) - int64_t(i - 1));
+            };
+            const auto emit_base = [&](size_t b, size_t e) {
+                std::vector<uint32_t> idxs;
+                idxs.reserve(e - b);
+                for (size_t k = b; k < e; ++k) { idxs.push_back(base[k].idx); }
+                llama_flashprefill_fragment frag;
+                frag.domain = llama_flashprefill_fragment_domain::REROT_BASE;
+                frag.stream = 0;
+                frag.boundary_partial = false;
+                frag.logical_block = uint32_t(uint64_t(b) / params.block_k);
+                frag.logical_begin = (llama_pos) b;
+                frag.logical_end = (llama_pos) e;
+                frag.members = base[b].sig;
+                frag.episode_id = view.episode_id;
+                frag.virtual_pos0 = (llama_pos) b;
+                // Table-phase constant P = storage - piece-local index. The
+                // cut keeps (storage - base_index) fixed over base indices,
+                // so P == base[b].storage exactly.
+                frag.phase_bias = int64_t(base[b].storage);
+                frag.gated = true;
+                emit_members(frag, idxs);
+                {
+                    const uint32_t new_frag = (uint32_t) L.fragments.size();
+                    for (size_t k = 0; k < idxs.size(); ++k) {
+                        key_frag[idxs[k]] = new_frag;
+                        key_local[idxs[k]] = (uint32_t) k;
+                    }
+                }
+                L.fragments.push_back(frag);
+            };
+            for (size_t i = 1; i <= base.size(); ++i) {
+                if (i == base.size() || cut_before(i)) {
+                    if (i > start) { emit_base(start, i); }
+                    start = i;
+                }
+            }
+        }
+
+        // Run fragments: reusable split once per run, then membership post-split for gated pieces.
+        for (size_t r = 0; r < runs.size(); ++r) {
+            const auto & run = runs[r];
+            if (run.empty()) {
+                continue;
+            }
+            std::vector<llama_rerot_table_member> tm;
+            tm.reserve(run.size());
+            for (const auto & t : run) {
+                tm.push_back({ t.idx, t.storage, t.frontier, t.vis, t.gated });
+            }
+            std::vector<llama_rerot_table_fragment> splits;
+            try {
+                splits = llama_rerot_split_table_fragments(tm.data(), tm.size(), run_v0[r], params.block_k);
+            } catch (const std::exception & e) {
+                return hard_error(std::string("flashprefill layout: run split failed: ") + e.what());
+            }
+            for (const auto & sp : splits) {
+                size_t pstart = sp.begin;
+                while (pstart < sp.end) {
+                    size_t pend = pstart + 1;
+                    if (sp.gated) {
+                        while (pend < sp.end && run[pend].sig == run[pstart].sig) { ++pend; }
+                    } else {
+                        pend = sp.end;
+                    }
+                    std::vector<uint32_t> idxs;
+                    idxs.reserve(pend - pstart);
+                    for (size_t k = pstart; k < pend; ++k) { idxs.push_back(run[k].idx); }
+                    const llama_pos vp0 = run_v0[r] + (llama_pos) pstart;
+                    llama_flashprefill_fragment frag;
+                    frag.domain = llama_flashprefill_fragment_domain::REROT_RUN;
+                    frag.stream = 0;
+                    frag.boundary_partial = false;
+                    frag.logical_block = uint32_t(uint64_t(vp0) / params.block_k);
+                    frag.logical_begin = vp0;
+                    frag.logical_end = vp0 + (llama_pos) idxs.size();
+                    if (sp.gated) { frag.members = run[pstart].sig; }
+                    frag.episode_id = view.episode_id;
+                    frag.run_id = view.ordered_runs[r];
+                    frag.visibility = sp.visibility;
+                    frag.run_rank = (uint32_t) r;
+                    frag.virtual_pos0 = vp0;
+                    // Table-phase constant P = split bias + run table origin
+                    // + piece start: storage minus piece-local index.
+                    frag.phase_bias = sp.phase_bias + int64_t(run_v0[r]) + int64_t(pstart);
+                    frag.gated = sp.gated;
+                    emit_members(frag, idxs);
+                    {
+                        const uint32_t new_frag = (uint32_t) L.fragments.size();
+                        for (size_t k = 0; k < idxs.size(); ++k) {
+                            key_frag[idxs[k]] = new_frag;
+                            key_local[idxs[k]] = (uint32_t) k;
+                        }
+                    }
+                    L.fragments.push_back(frag);
+                    pstart = pend;
+                }
+            }
+        }
+
+        vgroup_frags.push_back({ fbegin, (uint32_t) L.fragments.size() });
+
+        // Per-(query-seq) data inside this view: ownership is fixed, so the
+        // own-cell last-match locations are built once per seq, not per query.
+        // Map: query storage -> (fragment, fragment-local index), overwrite
+        // wins, replicating the old builder's last-match scan over global
+        // order. Per-query virtuals are derived from these in the emission
+        // pass below, AFTER that query's own filtering — never from fixed
+        // table virtuals.
+        std::map<llama_seq_id, std::vector<uint32_t>> rows_by_seq;
+        for (uint32_t q : vg.rows) {
+            rows_by_seq[ubatch.seq_id[q][0]].push_back(q);
+        }
+        std::map<llama_seq_id, std::unordered_map<llama_pos, std::pair<uint32_t, uint32_t>>> own_by_seq;
+        for (const auto & seq_rows : rows_by_seq) {
+            const llama_seq_id qseq = seq_rows.first;
+            if (qseq < 0 || (size_t) qseq >= views.size()) {
+                return hard_error("flashprefill layout: query sequence out of range");
+            }
+            const auto rank_qr = rank.find(view.query_run);
+            if (rank_qr == rank.end()) {
+                return hard_error("flashprefill layout: query run absent from reader view");
+            }
+            std::unordered_map<llama_pos, std::pair<uint32_t, uint32_t>> own_match;
+            const auto & qrun = runs[rank_qr->second];
+            for (size_t j = 0; j < qrun.size(); ++j) {
+                const uint32_t idx = qrun[j].idx;
+                const auto & meta = cells.rerot_get(idx);
+                if (meta.node_id == view.reader && cells.seq_has(idx, qseq)) {
+                    own_match[qrun[j].storage] = { key_frag[idx], key_local[idx] };
+                }
+            }
+            own_by_seq[qseq] = std::move(own_match);
+            for (uint32_t q : seq_rows.second) {
+                const llama_pos qpos = ubatch.pos[q];
+                if (qpos < 0) {
+                    return hard_error("flashprefill layout: query with negative position");
+                }
+                llama_flashprefill_query qr;
+                qr.query_index = q;
+                qr.seq_id = qseq;
+                qr.stream = 0;
+                qr.query_pos = qpos;
+                qr.query_virtual_pos = -1; // filled per query in the emission pass
+                L.queries.push_back(qr);
+            }
+        }
+        own_by_vgroup.push_back(std::move(own_by_seq));
+    }
+
+    // Queries were appended view-major; restore ubatch order for dense
+    // per-query ranges (groups/uses stay query-indexed either way).
+    std::sort(L.queries.begin(), L.queries.end(), [](const llama_flashprefill_query & a, const llama_flashprefill_query & b) {
+        return a.query_index < b.query_index;
+    });
+
+    // Per-query emission over the query's own view range.
+    L.group_offsets.push_back(0);
+    L.use_offsets.push_back(0);
+    if (params.want_exact_rows) {
+        L.exact_offsets.push_back(0);
+    }
+    uint64_t exact_total = 0;
+    // ubatch row -> vgroup index.
+    std::vector<uint32_t> row_vgroup(ubatch.n_tokens, UINT32_MAX);
+    for (uint32_t v = 0; v < vgroups.size(); ++v) {
+        for (uint32_t q : vgroups[v].rows) { row_vgroup[q] = v; }
+    }
+    for (uint32_t qi = 0; qi < (uint32_t) L.queries.size(); ++qi) {
+        auto & qr = L.queries[qi];
+        const uint32_t v = row_vgroup[qr.query_index];
+        std::map<llama_pos, uint32_t> eff2group;
+        const auto group_for = [&](int64_t eff, std::string & msg) -> int64_t {
+            if (eff < 0 || eff > std::numeric_limits<llama_pos>::max()) {
+                msg = "flashprefill layout: effective query position out of range";
+                return -1;
+            }
+            const llama_pos e = (llama_pos) eff;
+            const auto it = eff2group.find(e);
+            if (it != eff2group.end()) { return (int64_t) it->second; }
+            llama_rerot_attn_group group;
+            group.query_index = qi;
+            group.effective_pos = e;
+            L.groups.push_back(group);
+            const uint32_t gid = (uint32_t) L.groups.size() - 1;
+            eff2group[e] = gid;
+            return (int64_t) gid;
+        };
+        // Pass A: legality + legal counts in global fragment order. This is
+        // the per-query filtering the old builder performs BEFORE dense
+        // virtualization: base ownership, gated causal edges, and future-key
+        // exclusion all shape the virtual address space of THIS query.
+        const uint32_t use_begin = (uint32_t) L.uses.size();
+        int64_t total = 0;
+        for (uint32_t f = vgroup_frags[v].begin; f < vgroup_frags[v].end; ++f) {
+            auto & frag = L.fragments[f];
+            uint32_t sub_off = 0;
+            uint32_t sub_count = frag.token_count;
+            uint32_t flags = 0;
+            if (!frag.gated) {
+                // FULL: visible to every sharing query, whole fragment legal.
+            } else {
+                if (!frag.members.test((size_t) qr.seq_id)) {
+                    continue;
+                }
+                // Storage span: smin is the table-phase constant (first
+                // member storage exactly); smax is ground truth off the last
+                // member. Gaps inside the span only shrink the legal prefix.
+                const int64_t smin = frag.phase_bias;
+                const uint32_t last_idx = frag.contiguous
+                    ? frag.cell_begin + frag.token_count - 1
+                    : L.cell_refs[frag.cell_ref_offset + frag.token_count - 1];
+                const int64_t smax = cells.pos_get(last_idx);
+                if (smin > qr.query_pos) {
+                    continue;
+                }
+                if (smax > qr.query_pos) {
+                    // Prefix scan in storage order: legal prefix then illegal
+                    // tail; anything else fails closed.
+                    uint32_t k = 0;
+                    for (; k < frag.token_count; ++k) {
+                        const uint32_t idx = frag.contiguous ? frag.cell_begin + k
+                                                             : L.cell_refs[frag.cell_ref_offset + k];
+                        if (cells.pos_get(idx) > qr.query_pos) { break; }
+                    }
+                    for (uint32_t t = k; t < frag.token_count; ++t) {
+                        const uint32_t idx = frag.contiguous ? frag.cell_begin + t
+                                                             : L.cell_refs[frag.cell_ref_offset + t];
+                        if (cells.pos_get(idx) <= qr.query_pos) {
+                            return hard_error("flashprefill layout: non-interval gated subset");
+                        }
+                    }
+                    if (k == 0) {
+                        return hard_error("flashprefill layout: gated fragment with empty subset");
+                    }
+                    sub_count = k;
+                    flags = llama_flashprefill_use::FLAG_MANDATORY;
+                    frag.boundary_partial = true;
+                }
+            }
+            llama_flashprefill_use use;
+            use.query = qi;
+            use.fragment = f;
+            use.group = UINT32_MAX; // assigned in pass B once qvirt is known
+            use.sub_off = sub_off;
+            use.sub_count = sub_count;
+            use.flags = flags;
+            L.uses.push_back(use);
+            total += sub_count;
+        }
+        // Own virtual position: prefix count of legal members before the
+        // own fragment plus the fragment-local index — or the legal total
+        // when the query has no resident own cell (read-only refresh). The
+        // uses are fragment-ordered, so one linear prefix scan suffices.
+        int64_t qvirt = total;
+        {
+            const auto & own_by_seq = own_by_vgroup[v];
+            const auto seq_it = own_by_seq.find(qr.seq_id);
+            if (seq_it != own_by_seq.end()) {
+                const auto oit = seq_it->second.find(qr.query_pos);
+                if (oit != seq_it->second.end()) {
+                    const uint32_t frag_o = oit->second.first;
+                    const uint32_t local_o = oit->second.second;
+                    int64_t c = 0;
+                    bool found = false;
+                    for (uint32_t u = use_begin; u < (uint32_t) L.uses.size(); ++u) {
+                        const auto & uu = L.uses[u];
+                        if (uu.fragment < frag_o) {
+                            c += uu.sub_count;
+                            continue;
+                        }
+                        if (uu.fragment == frag_o) {
+                            found = true;
+                        }
+                        break;
+                    }
+                    if (!found) {
+                        return hard_error("flashprefill layout: own cell without covering use");
+                    }
+                    qvirt = c + local_o;
+                }
+            }
+        }
+        if (qvirt > std::numeric_limits<llama_pos>::max()) {
+            return hard_error("flashprefill layout: query virtual position out of range");
+        }
+        qr.query_virtual_pos = (llama_pos) qvirt;
+        // Pass B: phase groups + oracle expansion. Effective position of a
+        // use is qvirt + P - C, where P is the fragment's table-phase
+        // constant (storage minus piece-local index, uniform by split) and C
+        // is the legal prefix count before the fragment for THIS query.
+        {
+            int64_t c = 0;
+            for (uint32_t u = use_begin; u < (uint32_t) L.uses.size(); ++u) {
+                auto & uu = L.uses[u];
+                const auto & frag = L.fragments[uu.fragment];
+                std::string gmsg;
+                const int64_t gid = group_for(qvirt + frag.phase_bias - c, gmsg);
+                if (gid < 0) {
+                    return hard_error(gmsg);
+                }
+                uu.group = (uint32_t) gid;
+                if (params.want_exact_rows) {
+                    if (exact_total + uu.sub_count > params.exact_cap) {
+                        return hard_error("flashprefill layout: exact row capacity exceeded");
+                    }
+                    for (uint32_t k = 0; k < uu.sub_count; ++k) {
+                        const uint32_t idx = frag.contiguous ? frag.cell_begin + uu.sub_off + k
+                                                             : L.cell_refs[frag.cell_ref_offset + uu.sub_off + k];
+                        L.exact_rows.push_back(idx);
+                        L.exact_groups.push_back((uint32_t) gid);
+                        L.exact_flags.push_back(uu.flags);
+                    }
+                    exact_total += uu.sub_count;
+                }
+                c += uu.sub_count;
+            }
+        }
+        L.group_offsets.push_back((uint32_t) L.groups.size());
+        L.use_offsets.push_back((uint32_t) L.uses.size());
+        if (params.want_exact_rows) {
+            L.exact_offsets.push_back((uint32_t) L.exact_rows.size());
+        }
+    }
+    return llama_flashprefill_build_status::OK;
+}
+
+bool llama_kv_cache::flashprefill_build_layout(
+        const llama_ubatch & ubatch,
+        int32_t role,
+        const llama_flashprefill_layout_params & params,
+        llama_flashprefill_layout & out,
+        std::string * error) const {
+    out.clear();
+    const auto hard_error = [&](const std::string & msg) -> bool {
+        out.clear();
+        out.eligible = false;
+        out.error = msg;
+        if (error) { *error = msg; }
+        return false;
+    };
+    const auto ineligible = [&](int32_t reason, const std::string & msg) -> bool {
+        out.clear();
+        out.eligible = false;
+        out.dense_reason = reason;
+        if (error) { *error = msg; }
+        return false;
+    };
+
+    if (params.block_k == 0) {
+        return hard_error("flashprefill layout: block_k must be non-zero");
+    }
+    if (ubatch.n_tokens == 0 || ubatch.pos == nullptr || ubatch.seq_id == nullptr || ubatch.n_seq_id == nullptr) {
+        return hard_error("flashprefill layout: ubatch carries no positions/sequences");
+    }
+    // Qwen35/Ornith text partial IMRoPE (n_pos==4, [p,p,p,0]) is 1D-equivalent
+    // and stays eligible; only genuinely non-text rows/cells gate out below.
+    // The RERoT indexed path consumes the scalar slot-0 coordinate exactly
+    // like the old builder, so it needs no pattern gate for oracle equality.
+    const bool ubatch_2d = ubatch.is_pos_2d();
+    if (hparams.use_alibi) {
+        return ineligible(LLAMA_FLASHPREFILL_ROUTE_DENSE_UNSUPPORTED,
+            "flashprefill layout: ALiBi bias keeps the stock path");
+    }
+    const bool want_rerot = (role == LLAMA_FLASHPREFILL_ROLE_REROT_TEACHER_FORCED);
+    if (role != LLAMA_FLASHPREFILL_ROLE_PREFILL && !want_rerot) {
+        return ineligible(LLAMA_FLASHPREFILL_ROUTE_DENSE_ROLE,
+            "flashprefill layout: role is not prefill-eligible");
+    }
+    // Existing mixed-ubatch contract: throws when RERoT and ordinary rows mix.
+    const bool rerot_on = rerot_batch_active(ubatch);
+    if (want_rerot && !rerot_on) {
+        return ineligible(LLAMA_FLASHPREFILL_ROUTE_DENSE_ROLE,
+            "flashprefill layout: ordinary ubatch with RERoT-teacher role");
+    }
+    if (!want_rerot && rerot_on) {
+        return ineligible(LLAMA_FLASHPREFILL_ROUTE_DENSE_ROLE,
+            "flashprefill layout: RERoT-active ubatch needs the RERoT-teacher role");
+    }
+
+    // Lazy CellGeneration opt-in: the flash path only. OFF never reaches here.
+    flashprefill_enable_tracking();
+
+    std::string msg;
+    llama_flashprefill_build_status st = llama_flashprefill_build_status::HARD_ERROR;
+    if (want_rerot) {
+        if (n_stream != 1 || v_cells.size() != 1) {
+            return ineligible(LLAMA_FLASHPREFILL_ROUTE_DENSE_UNSUPPORTED,
+                "flashprefill layout: RERoT fragments require unified KV");
+        }
+        if (n_swa != 0 || swa_type != LLAMA_SWA_TYPE_NONE) {
+            return ineligible(LLAMA_FLASHPREFILL_ROUTE_DENSE_UNSUPPORTED,
+                "flashprefill layout: RERoT+SWA has no indexed legality; stock path");
+        }
+        out.is_rerot = 1;
+        out.causal = 1;
+        out.swa_window = 0;
+        out.swa_type = 0;
+        st = llama_flashprefill_build_rerot_plan(v_cells[0], rerot_reader_views, ubatch, params, out, &msg);
+    } else {
+        if (!params.causal && n_swa != 0 && swa_type != LLAMA_SWA_TYPE_NONE) {
+            return ineligible(LLAMA_FLASHPREFILL_ROUTE_DENSE_UNSUPPORTED,
+                "flashprefill layout: non-causal SWA keeps the stock path");
+        }
+        if (ubatch_2d) {
+            for (uint32_t q = 0; q < ubatch.n_tokens; ++q) {
+                if (!fp_row_is_text_pattern(ubatch, q)) {
+                    return ineligible(LLAMA_FLASHPREFILL_ROUTE_DENSE_UNSUPPORTED,
+                        "flashprefill layout: non-text 2-D row keeps the stock path");
+                }
+            }
+        }
+        out.is_rerot = 0;
+        out.causal = params.causal ? 1u : 0u;
+        out.swa_window = n_swa;
+        out.swa_type = (uint32_t) swa_type;
+        st = llama_flashprefill_build_ordinary_plan(v_cells, seq_to_stream, n_swa, swa_type, params.causal, ubatch_2d,
+            ubatch, params, out, &msg);
+    }
+    if (st == llama_flashprefill_build_status::INELIGIBLE) {
+        return ineligible(LLAMA_FLASHPREFILL_ROUTE_DENSE_UNSUPPORTED, msg);
+    }
+    if (st != llama_flashprefill_build_status::OK) {
+        out.clear();
+        out.eligible = false;
+        out.error = msg;
+        if (error) { *error = msg; }
+        return false;
+    }
+
+    uint32_t width = 0;
+    for (const auto & cells : v_cells) {
+        width = std::max(width, cells.size());
+    }
+    out.block_k = params.block_k;
+    out.cells_epoch = fp_epoch;
+    flashprefill_cell_stamps(out.cell_stamps);
+    out.n_kv_at_build = width;
+    out.requires_cache_writes = true;
+    out.eligible = true;
+
+    std::string vmsg;
+    if (!out.validate(width, &vmsg)) {
+        out.clear();
+        out.eligible = false;
+        out.error = "flashprefill layout: invalid derived layout: " + vmsg;
+        if (error) { *error = out.error; }
+        return false;
+    }
+    return true;
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
@@ -3489,6 +4734,8 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
         return;
     }
 
+    fp_bump();
+
     GGML_UNUSED(flags);
 
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
@@ -4016,6 +5263,10 @@ bool llama_kv_cache_context::next() {
     rerot_layout_ready = false;
     rerot_layout = {};
 
+    fp_key_valid = false;
+    fp_layout.clear();
+    fp_cell_stamps.clear();
+
     return true;
 }
 
@@ -4033,6 +5284,10 @@ bool llama_kv_cache_context::apply() {
     n_kv = kv->get_n_kv(sinfos[i_cur]);
     rerot_layout_ready = false;
     rerot_layout = {};
+
+    fp_key_valid = false;
+    fp_layout.clear();
+    fp_cell_stamps.clear();
 
     // InnerQ: check if CUDA calibration finalized and tensor needs update
     if (kv->get_turbo_innerq_scale_inv() != nullptr && turbo_innerq_needs_tensor_update()) {
@@ -4059,6 +5314,100 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
+}
+
+bool llama_kv_cache_context::flashprefill_build_layout(
+        uint32_t ubatch_index,
+        int32_t role,
+        const llama_flashprefill_layout_params & params,
+        std::string * error) const {
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS || kv == nullptr) {
+        if (error) { *error = "flashprefill layout: no memory context"; }
+        return false;
+    }
+    if (ubatches.empty() || sinfos.empty() || ubatch_index >= ubatches.size()) {
+        if (error) { *error = "flashprefill layout: ubatch index out of range"; }
+        return false;
+    }
+    const llama_ubatch & ub = ubatches[ubatch_index];
+
+    llama_flashprefill_build_key key;
+    key.ubatch_index = ubatch_index;
+    key.role = role;
+    key.block_k = params.block_k;
+    key.causal = params.causal ? 1u : 0u;
+    key.want_exact_rows = params.want_exact_rows ? 1u : 0u;
+    key.n_tokens = ub.n_tokens;
+    key.exact_cap_bucket = llama_flashprefill_layout_params::bucket_for(params.exact_cap);
+
+    // Reuse the owned planning when topology matches and owner stamps are fresh.
+    if (fp_key_valid && fp_key.ubatch_index == key.ubatch_index && fp_key.role == key.role &&
+        fp_key.block_k == key.block_k && fp_key.causal == key.causal &&
+        fp_key.want_exact_rows == key.want_exact_rows && fp_key.n_tokens == key.n_tokens &&
+        fp_key.exact_cap_bucket == key.exact_cap_bucket && flashprefill_layout_is_fresh()) {
+        return fp_layout.eligible;
+    }
+
+    std::string msg;
+    const bool eligible = kv->flashprefill_build_layout(ub, role, params, fp_layout, &msg);
+
+    // Finalize the topology key post-build (group capacity and path are known now).
+    key.group_cap_bucket = llama_flashprefill_layout_params::bucket_for(fp_layout.n_groups());
+    key.is_rerot = fp_layout.is_rerot;
+    fp_key = key;
+    fp_key_valid = true;
+    fp_cells_epoch = kv->flashprefill_epoch();
+    kv->flashprefill_cell_stamps(fp_cell_stamps);
+
+    if (error) { *error = msg; }
+    return eligible;
+}
+
+bool llama_kv_cache_context::flashprefill_build_current_layout(
+        int32_t role,
+        const llama_flashprefill_layout_params & params,
+        std::string * error) const {
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS || kv == nullptr) {
+        if (error) { *error = "flashprefill layout: no memory context"; }
+        return false;
+    }
+    if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size()) {
+        if (error) { *error = "flashprefill layout: no current ubatch"; }
+        return false;
+    }
+    return flashprefill_build_layout((uint32_t) i_cur, role, params, error);
+}
+
+const llama_flashprefill_layout & llama_kv_cache_context::flashprefill_get_layout() const {
+    return fp_layout;
+}
+
+bool llama_kv_cache_context::flashprefill_layout_is_fresh() const {
+    if (!fp_key_valid || kv == nullptr) {
+        return false;
+    }
+    if (fp_cells_epoch != kv->flashprefill_epoch()) {
+        return false;
+    }
+    std::vector<llama_flashprefill_cell_stamp> cur;
+    kv->flashprefill_cell_stamps(cur);
+    if (cur.size() != fp_cell_stamps.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < cur.size(); ++i) {
+        if (cur[i].stamp != fp_cell_stamps[i].stamp ||
+            cur[i].generation != fp_cell_stamps[i].generation) {
+            return false;
+        }
+        if (!fp_stamp_usable(cur[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+const llama_flashprefill_build_key & llama_kv_cache_context::flashprefill_layout_key() const {
+    return fp_key;
 }
 
 uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {

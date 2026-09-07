@@ -2,7 +2,13 @@
 
 #include "llama.h"
 
+// Public FlashPrefill policy contract (PolicyCore owner). Resolves via the
+// include path to include/llama-flashprefill.h, or via the src-internal
+// forwarding header when built from src/. Never includes llama.h (no cycle).
+#include "llama-flashprefill.h"
+
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #ifndef LLAMA_MAX_SEQ
@@ -66,6 +72,24 @@ struct llama_cparams {
     uint32_t n_pen_max    = 0; // auto-selected P (pens / execution states, B.3.2)
     uint32_t n_brain_rows = 0; // derived from B
     uint32_t n_hand_rows  = 0; // derived from P
+    // FlashPrefill V2 policy (PolicyCore: struct llama_flashprefill_config).
+    // Immutable for the context lifetime; validated on construction; default
+    // OFF (no scratch, no new graph nodes, no routing work when disabled).
+    // Copied verbatim into llm_graph_params, so the graph slice always sees
+    // the same policy without extra plumbing. No per-row arrays here: the
+    // per-call/per-ubatch row snapshot lives owned by llama_context.
+    struct llama_flashprefill_config flashprefill;
+    // FlashPrefill per-ubatch owned row snapshot for the graph slice.
+    // Shared ownership: llm_graph_params copies cparams by value, so every
+    // graph copy keeps its own snapshot alive across async execution — never
+    // a borrowed pointer, no dangling arrays. Null means "route dense"
+    // (OFF, bypassed, legacy decode, or no source map for the ubatch).
+    // Populated enabled-only: set per ubatch in the decode loop from the
+    // context-owned snapshot, and to a validated synthetic eligible snapshot
+    // in graph_reserve (sizing needs eligible shape, not dense). Consumers
+    // read gparams.cparams.flashprefill_rows; GraphIntegration owns any
+    // further graph.h-side interpretation.
+    std::shared_ptr<const std::vector<struct llama_flashprefill_row>> flashprefill_rows;
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer

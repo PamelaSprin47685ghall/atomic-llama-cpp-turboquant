@@ -358,3 +358,64 @@ std::vector<float> llama_rerot_ddvr_attention_qside(
     const llama_rerot_rope_config & config,
     float scale = 0.0f);
 
+// ---------------------------------------------------------------------------
+// FlashPrefill legal-fragment table helpers (CacheFragments; pure, no owner)
+// ---------------------------------------------------------------------------
+//
+// Reusable per-view run tables for the FlashPrefill fragment path. The KV
+// cache (cell owner) scans physical cells once per distinct reader view into
+// member arrays, then splits each run ONCE via llama_rerot_split_table_
+// fragments; per-query work afterwards touches fragments (F), never the full
+// physical width (K). Visibility predicates mirror llama_rerot_build_query_
+// layout exactly; any semantic change there must be mirrored here (the KV
+// oracle test expands fragments back to per-query entries and compares).
+
+struct llama_rerot_table_member {
+    uint32_t key_index = 0; // physical K/V row
+    llama_pos storage_pos = 0;
+    uint64_t frontier = 0;
+    llama_rerot_visibility visibility = llama_rerot_visibility::normal;
+    // True when per-query ownership+causal gating still applies (private /
+    // pending, own-node frontier-equal public, untagged base). False when the
+    // member is visible to every query sharing the reader view (public with
+    // older frontier, or strong-mode frontier-equal foreign node).
+    bool gated = true;
+};
+
+struct llama_rerot_table_fragment {
+    uint32_t begin = 0; // [begin, end) into the caller's member array
+    uint32_t end = 0;
+    llama_pos virtual_pos0 = 0; // first virtual position covered
+    int64_t phase_bias = 0;     // storage_pos - virtual_pos, constant over [begin, end)
+    llama_rerot_visibility visibility = llama_rerot_visibility::normal;
+    bool gated = true;
+};
+
+// Split one run's members (sorted by storage, then frontier, then key) into
+// fragments cut at virtual-BN edges, phase-bias changes, and visibility /
+// gating changes. virtual_pos0 is the virtual position of members[0]; member
+// i gets virtual_pos0 + i (members of one run occupy consecutive virtuals).
+// Throws std::invalid_argument on block_k == 0 or member overflow.
+std::vector<llama_rerot_table_fragment> llama_rerot_split_table_fragments(
+    const llama_rerot_table_member * members,
+    size_t n,
+    llama_pos virtual_pos0,
+    uint32_t block_k);
+
+// Position/ownership-independent arm of the public_live visibility rule:
+// visible to every query sharing the reader view, no causal check needed.
+bool llama_rerot_cell_visible_public_full(
+    const llama_kv_rerot_meta & meta,
+    const llama_rerot_reader_state & reader);
+
+// Owner-gated arm (private_control / pending_record, own-node frontier-equal
+// public_live, untagged base): owner match plus owned-by-query plus causal
+// bound. Mirrors the corresponding arms of llama_rerot_build_query_layout.
+bool llama_rerot_cell_visible_gated(
+    const llama_kv_rerot_meta & meta,
+    const llama_rerot_reader_state & reader,
+    bool is_untagged_base,
+    bool owned_by_reader,
+    llama_pos storage_pos,
+    llama_pos query_storage_pos);
+

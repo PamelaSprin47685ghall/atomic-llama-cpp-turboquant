@@ -1630,7 +1630,12 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     }
 
     if (!params.lora_init_without_apply) {
-        common_set_adapter_lora(lctx, params.lora_adapters);
+        // A pre-apply refusal is init failure (unreachable on a fresh context
+        // with no active episode, but the contract is checked, not assumed).
+        if (!common_set_adapter_lora(lctx, params.lora_adapters)) {
+            COM_ERR("failed to apply LoRA adapters for model '%s'\n", params.model.path.c_str());
+            return res;
+        }
     }
 
     if (params.warmup) {
@@ -1790,7 +1795,7 @@ void common_memory::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, lla
     }
 }
 
-void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora) {
+bool common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora) {
     std::vector<llama_adapter_lora *> loras;
     std::vector<float> scales;
 
@@ -1799,7 +1804,10 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
         scales.push_back(la.scale);
     }
 
-    llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
+    // Forward the core contract (0 applied or identical no-op, -1 pre-apply
+    // refusal with zero mutation). No gate is duplicated here: the refusal
+    // decision lives entirely in llama_context::set_adapters_lora.
+    return llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data()) == 0;
 }
 
 struct llama_model_params common_model_params_to_llama(common_params & params) {
@@ -1884,6 +1892,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.rerot_frontier      = params.rerot_frontier;
     cparams.n_person_max        = params.rerot_person_max;
     cparams.n_pen_max           = params.rerot_pen_max;
+    // FlashPrefill V2 policy: immutable value copy for the context lifetime.
+    // OFF (the default) preserves the pre-existing attention path exactly.
+    cparams.flashprefill        = params.flashprefill;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

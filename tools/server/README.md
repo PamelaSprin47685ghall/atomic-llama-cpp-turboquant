@@ -2015,6 +2015,134 @@ Note that the following endpoints are exempt from being considered as incoming t
 - `GET /props`
 - `GET /models`
 
+## FlashPrefill V2 sparse prefill (experimental, opt-in)
+
+FlashPrefill V2 adds block selection with mean correction for eligible prefill
+attention. It is **off by default** and configured only via server startup
+flags (immutable for the context lifetime). There is **no per-request API**:
+all requests use the same policy, and A/B comparisons must use separate server
+instances with isolated cache directories (see `scripts/flashprefill-matrix.py`
+`cache_domain` and `scripts/flashprefill-quality.py` per-config `cache_dir`).
+
+Full contract, including the acceptance gates that have **not** been run
+(implementation and compile delivered; runtime acceptance NOT RUN), lives in
+[PREFILL.md](../../PREFILL.md).
+
+### CLI flags
+
+All flags are also settable via the shown environment variables (see `--help`
+output above, auto-generated — do not edit that table by hand):
+
+| Flag | Default | Meaning |
+| ---- | ------- | ------- |
+| `--flashprefill off\|auto\|required` (`LLAMA_ARG_FLASHPREFILL`) | `off` | `auto` selects eligible prefill attention; `required` reports supported-yet-unhandled eligible cases as errors instead of dense fallback |
+| `--flashprefill-alpha F` (`LLAMA_ARG_FLASHPREFILL_ALPHA`) | `0.1` | Tile-energy threshold factor, finite and in `(0, 1]`. Not a sparsity ratio and not a residency target |
+| `--flashprefill-block-q N` (`LLAMA_ARG_FLASHPREFILL_BLOCK_Q`) | `128` | BM: packed Q rows per tile (`token * GQA + subhead`), `1..256`. Not query tokens |
+| `--flashprefill-block-k N` (`LLAMA_ARG_FLASHPREFILL_BLOCK_K`) | `128` | BN: logical K block for selection/mean stats, multiple of 64 in `[64, 1024]` |
+| `--flashprefill-sink-blocks N` (`LLAMA_ARG_FLASHPREFILL_SINK_BLOCKS`) | `2` | Mandatory exact prefix blocks |
+| `--flashprefill-window-blocks N` (`LLAMA_ARG_FLASHPREFILL_WINDOW_BLOCKS`) | `4` | Mandatory exact local/partial-visibility blocks |
+| `--flashprefill-dense-tail-tiles N` (`LLAMA_ARG_FLASHPREFILL_DENSE_TAIL_TILES`) | `8` | Trailing packed-Q tiles kept dense, interpreted with `--flashprefill-tail-scope` |
+| `--flashprefill-tail-scope call\|logical-prompt` (`LLAMA_ARG_FLASHPREFILL_TAIL_SCOPE`) | `logical-prompt` | `call` measures the dense tail against this call's query range (reference alignment); `logical-prompt` against the frozen logical prefill range (production long-prompt mode). Unknown boundaries stay dense, never guessed |
+| `--flashprefill-min-kv N` (`LLAMA_ARG_FLASHPREFILL_MIN_KV`) | `1024` | Eligibility floor on resident-visible tokens (never physical capacity or Tri-deleted history) |
+| `--flashprefill-full-attn-layers N` (`LLAMA_ARG_FLASHPREFILL_FULL_ATTN_LAYERS`) | `0` | First N *eligible full-attention* layers kept dense — not the first N model layers |
+| `--flashprefill-mean-correction on\|off` (`LLAMA_ARG_FLASHPREFILL_MEAN_CORRECTION`) | `on` | Production mode is `on`; `off` is ablation only |
+| `--flashprefill-exact-all` (`LLAMA_ARG_FLASHPREFILL_EXACT_ALL`) | off | Debug gate: route through the new prefill path with all legal fragments exact |
+
+### What runs sparse, what stays dense
+
+Sparse-eligible: ordinary prompt prefill and RERoT teacher-forced injections
+with a known frozen boundary, on supported backends. Ordinary sparse dispatch
+is shared (`build_attn` over supported ordinary KV shapes, no per-architecture
+hook); raw-Q RERoT hooks stay Qwen3.5 dense/MoE only (`qwen35` / `qwen35moe`,
+including the current Ornith weights; shape-gated, no per-model dimension
+hardcodes). Out-of-family RERoT and unsupported shapes keep the pre-existing
+attention path with no sparse routing; this is the honest current envelope,
+not a temporary note.
+Everything else keeps the pre-existing attention path: per-token decode, MTP
+draft/verify, speculative replay, RERoT frontier generation, embeddings,
+rerank, multimodal sections, recurrent and SWA layers, transposed-V or
+multi-stream KV layouts, special KQ bias, and external `llama_decode()` calls
+without role information. The baseline RERoT active-lane MTP drafting pause
+is preserved as-is. TriAttention semantics (`3/32`, recent window `128`,
+fill-first, sticky maintenance) are unchanged — FlashPrefill only
+approximates over the resident-and-visible set and never restores evicted
+history. Supported: CPU reference and Vulkan native kernels. CUDA/Metal have
+no native kernels and take the designed dense route.
+
+### Metrics and verification harnesses
+
+The server always exposes FlashPrefill counters on `GET /metrics` (all with
+the existing `llamacpp:` prefix; zeros while OFF at no counting cost — only
+`flashprefill_policy_fingerprint_info` is policy-gated). Every
+GPU-determined total is merged transactionally — exactly once per
+**successful** graph slice, read after the existing completion boundary;
+retries, partial failures, and cancels are never counted. Commit happens at a
+single end-of-call sync after all plan errors are inspected: a true plan
+error fails the call (`-3`) with no output and nothing merged. Required-mode
+enforcement lives graph-side (throws); metrics only counts. The `short`,
+`unsupported`, and `highcost` dense reasons record the graph's authoritative
+per-ubatch verdict (even with zero plans), never an inference from global KV
+fullness:
+
+| Series | What it counts |
+| ------ | -------------- |
+| `flashprefill_eligible_rows_total` | Source rows with an eligible role and a known frozen boundary |
+| `flashprefill_sparse_rows_total` | Packed rows confirmed sparse by the plan (actual GPU sparse work) |
+| `flashprefill_dense_packed_rows_total` | Packed rows the plan left dense (packed-unit denominator) |
+| `flashprefill_dense_rows_total{reason}` | Packed dense rows by 10 presentation reasons: `decode`, `mtp_verify`, `role_other`, `short`, `tail`, `unknown`, `unsupported`, `highcost`, `no_plan`, `full_attention_layer` (designed-dense full-prefix/SWA layers from graph summary actuals, zero-plan included, also in the `dense_packed` denominator; never `NO_PLAN`/invalidation) |
+| `flashprefill_server_dense_rows_total{reason}` | Server-side dense rows by the 7 frozen routes (`DENSE_OFF`..`DENSE_CAPACITY`) |
+| `flashprefill_selected_blocks_total` | Plan exact uses |
+| `flashprefill_corrected_blocks_total` | Plan proxy (mean-corrected) uses |
+| `flashprefill_visible_tokens_total` | Plan use-record token sum (64-bit) |
+| `flashprefill_exact_tokens_total` | Plan exact-use token sum (64-bit) |
+| `flashprefill_pool_rebuild_total{reason}` | Pool rebuilds: `slice`, `exact_all` |
+| `flashprefill_plan_invalidations_total{reason}` | `bypassed`, `empty_snapshot`, `no_plan` (the `no_plan` series always reads zero — every plan-less outcome carries an authoritative verdict, so there is nothing to invalidate; residual unclassified rows count in the dense-rows `no_plan` bucket instead) |
+| `flashprefill_scratch_bytes` / `flashprefill_scratch_peak_bytes` | Live (last slice) / peak scratch from actual slice sizing |
+| `flashprefill_layout_seconds` | Host-measured layout time only (omitted when unmeasured, never faked as zero) |
+| `flashprefill_pool_seconds` | GPU pool-dispatch time (0 until the timestamp hook reports — unmeasured, not zero-cost) |
+| `flashprefill_select_seconds` | GPU select-dispatch time (same) |
+| `flashprefill_attention_seconds` | GPU attention-dispatch time, merge included (same) |
+| `flashprefill_policy_fingerprint_info{fingerprint}` | Single-series policy identity for cache/state isolation (only when a policy is active) |
+
+Keep ratio denominators in one unit: `sparse/(sparse+dense_packed)` over
+packed rows, or `exact_tokens/visible_tokens` over tokens. Per-layer waits
+stay forbidden — per-ubatch 96-byte plan-header snapshots queue alongside the
+existing output reads, one end-of-call sync parses them all, and per-backend
+Vulkan timestamp queries (`ggml_backend_vk_flashprefill_times`, attention
+includes merge) sample the three GPU dispatch times. A backend that has not
+reported yet reads 0 (unmeasured, not zero-cost). No sequence IDs, prompt
+text, or unbounded reader IDs appear in labels. `NO_PLAN` is residual-only
+(dense with no plan and no classified reason) plus AUTO fallback. The fold
+keeps zero-plan summaries, and the finalize sync runs only for outstanding
+reads.
+
+> Build status: implementation and compile delivered — server, 4 new tests
+> and 7 existing test targets all compile/link clean
+> (`build-prefill/bin/llama-server`; baseline frozen separately). Tests are
+> compiled only; benchmarks and production release gates are NOT RUN. Do not
+> report quality, performance, or pass/fail claims for this feature.
+
+State restores across contexts, processes, or restarts are deliberately
+rejected: the enabled-only 64-byte policy envelope (policy fingerprint +
+random 128-bit process nonce + context serial + adapter generation) must match
+exactly or the caller re-prefills. There is no `.flashprefill` sidecar file.
+An effective adapter change atop an active RERoT episode is refused before
+applying (the request errors; old-weight KV is never silently reused).
+
+- `scripts/flashprefill-matrix.py --matrix <matrix.json> --requests <requests.jsonl> --output-dir <dir>`:
+  full-compatibility matrix. Both inputs are `schema_version: 1` JSON; unknown
+  keys are rejected. Request `payload` objects pass through verbatim (no new
+  request fields); policy differences are expressed via per-server startup
+  `argv` plus distinct `cache_domain` labels, which the harness enforces for
+  every comparison pair.
+- `scripts/flashprefill-quality.py --plan <plan.json> --dataset <dataset.jsonl> --output-dir <dir> [--dry-run]`:
+  paired quality/performance comparison over four configs
+  (A = FullKV+dense, B = FullKV+sparse, C = Tri+dense, D = Tri+sparse, RERoT
+  fixed OFF) plus optional paired RERoT/MTP extras. Thresholds must be
+  declared in the plan before execution; `--dry-run` validates without
+  touching any endpoint. Every config declares its server startup `argv`
+  verbatim for audit; identical request payloads go to every config.
+
 ## More examples
 
 ### Interactive mode

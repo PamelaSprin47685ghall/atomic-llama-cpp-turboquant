@@ -14,11 +14,18 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+// FlashPrefill V2 wire schema + reference math (WireReference owner;
+// GraphIntegration consumes the I32 metadata/plan pack helpers only).
+#include "ggml-flashprefill.h"
+
+#include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
+#include <tuple>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -848,6 +855,16 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         // Ordinary k/v/mask fills above are untouched; OFF batches never enter.
         rerot_spans_fill(ubatch, mctx);
     }
+
+    if (fp) {
+        // FlashPrefill wire metadata refresh (counts/epochs/physical maps as
+        // tensor data, never topology). Inactive (null) graphs skip entirely.
+        fp->set_input(ubatch);
+    }
+}
+
+bool llm_graph_input_attn_kv::rerot_semantic() const {
+    return mctx != nullptr && mctx->rerot_active();
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -868,6 +885,21 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     // storage_pos0 / count (within capacity) / visibility churn refreshes data
     // without forcing a rebuild. OFF pairs (!had && !has) reuse as before.
     res &= rerot_spans_can_reuse(params.ubatch, params.sched, params.cparams, mctx);
+
+    // FlashPrefill: topology key (policy/mode/role/buckets/dtype/variant)
+    // decides reuse; the companion refreshes its row snapshot from the
+    // current params (never the stale build-time copy) before set_input.
+    if (fp) {
+        fp->mctx = mctx;
+        res &= fp->can_reuse(params);
+    } else {
+        // No companion reuses only against params that also build none.
+        // wants_companion runs the shared owner-building probe (not a
+        // get-only peek), so a fixed-capacity dense->sparse transition
+        // actually rebuilds instead of reusing dense forever; steady
+        // deny-states keep reusing without rebuild churn.
+        res &= !llm_graph_input_attn_flashprefill::wants_companion(params, mctx);
+    }
 
     return res;
 }
@@ -1461,6 +1493,12 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         inp_attn->rerot_spans_fill(ubatch, mctx->get_attn());
     }
 
+    if (inp_attn->fp) {
+        // FlashPrefill wire metadata refresh (same data-not-topology
+        // discipline as the span tables above).
+        inp_attn->fp->set_input(ubatch);
+    }
+
     inp_rs->set_input_recurrent(mctx->get_recr(), ubatch);
 }
 
@@ -1481,6 +1519,16 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     // mode). Span data churn alone must not force a rebuild.
     res &= inp_attn->rerot_spans_can_reuse(
         params.ubatch, params.sched, params.cparams, mctx->get_attn());
+
+    // FlashPrefill companion (same had-none stability rule as the plain KV
+    // path above: owner-building probe, no rebuild loops, no forced
+    // rebuilds as a substitute for per-submit data refresh).
+    if (inp_attn->fp) {
+        inp_attn->fp->mctx = mctx->get_attn();
+        res &= inp_attn->fp->can_reuse(params);
+    } else {
+        res &= !llm_graph_input_attn_flashprefill::wants_companion(params, mctx->get_attn());
+    }
 
     res &= inp_rs->can_reuse_recurrent(mctx->get_recr(), params.ubatch);
 
@@ -1661,6 +1709,10 @@ void llm_graph_result::reset() {
 
     inputs.clear();
     fused_nodes.clear();
+    flashprefill_plans.clear();
+    flashprefill_plan_ils.clear();
+    flashprefill_pool_peaks.clear();
+    flashprefill_summary = llm_graph_flashprefill_summary{};
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
@@ -1675,9 +1727,34 @@ void llm_graph_result::reset() {
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
 }
 
+// Eligible FULL-attention layer count (defined with the FlashPrefill
+// section below; declared here for the post-build gate in set_outputs).
+static int32_t llm_fp_count_full_layers(const llama_hparams & hparams);
+
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     for (auto & input : inputs) {
         input->set_input(ubatch);
+    }
+    // FlashPrefill submit refresh: per-submit route/visible/candidate
+    // counts refresh from the latest pack even on reuse (no rebuild), so
+    // the summary always describes the ubatch actually submitted. Layer and
+    // plan accumulators (sparse/dense layers/rows, plans, byte sums) are
+    // never clobbered here — only the pack-level route data.
+    for (auto & input : inputs) {
+        llm_graph_input_attn_flashprefill * fp =
+            input ? input->get_fp_input() : nullptr;
+        if (fp == nullptr || !fp->active() || fp->is_reserve()) {
+            continue;
+        }
+        flashprefill_summary.visible_tokens       = fp->built_summary.visible_tokens;
+        flashprefill_summary.expected_sparse_rows = fp->built_summary.expected_sparse_rows;
+        flashprefill_summary.expected_forced_rows = fp->built_summary.expected_forced_rows;
+        flashprefill_summary.ubatch_tokens        = fp->built_summary.ubatch_tokens;
+        flashprefill_summary.n_rows    = fp->built_summary.n_rows;
+        flashprefill_summary.n_uses    = fp->built_summary.n_uses;
+        flashprefill_summary.n_cells   = fp->built_summary.n_cells;
+        flashprefill_summary.n_groups  = fp->built_summary.n_groups;
+        break; // single companion per graph
     }
 }
 
@@ -1730,6 +1807,44 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     for (auto & [seq_id, t] : t_candidates) {
         if (t != nullptr) {
             ggml_set_output(t);
+        }
+    }
+
+    // FlashPrefill post-build consumption gate (GraphIntegration): an
+    // active companion with zero recorded plans means no layer consumed it.
+    // All-designed (designed_dense_layers covers every eligible full layer,
+    // no capability dense, no sparse) records FULL_PREFIX authoritatively in
+    // both modes. Anything else throws unsupported in REQUIRED here, before
+    // execution — unwired architectures or unhandled capability fallbacks
+    // must never surface as a Metrics-inferred NO_PLAN. AUTO records
+    // UNSUPPORTED for the unconsumed case. Metrics must trust
+    // dense_reason/designed_dense_layers/expected_* and never re-route from
+    // physical KV size. Reserve companions never participate.
+    {
+        bool any_active = false;
+        for (auto & input : inputs) {
+            llm_graph_input_attn_flashprefill * fp =
+                input ? input->get_fp_input() : nullptr;
+            if (fp != nullptr && fp->active() && !fp->is_reserve()) {
+                any_active = true;
+                break;
+            }
+        }
+        if (any_active && flashprefill_plans.empty()) {
+            const int32_t n_full = llm_fp_count_full_layers(params.hparams);
+            const bool all_designed =
+                n_full > 0 &&
+                flashprefill_summary.designed_dense_layers >= n_full &&
+                flashprefill_summary.dense_layers == 0 &&
+                flashprefill_summary.sparse_layers == 0;
+            if (all_designed) {
+                flashprefill_summary.dense_reason = LLM_FP_DENSE_FULL_PREFIX;
+            } else if (params.cparams.flashprefill.mode == LLAMA_FLASHPREFILL_MODE_REQUIRED) {
+                throw std::runtime_error(
+                    "flashprefill: wanted companion but no handled layers/plans (required, unsupported)");
+            } else {
+                flashprefill_summary.dense_reason = LLAMA_FLASHPREFILL_ROUTE_DENSE_UNSUPPORTED;
+            }
         }
     }
 }
@@ -1820,6 +1935,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    fp_reserve_sizing(params.flashprefill_reserve_sizing),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -3147,7 +3263,9 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     const llama_hparams & hparams,
     const llama_cparams & cparams,
     const llama_kv_cache_context * mctx_cur,
-          ggml_backend_sched_t sched) {
+          ggml_backend_sched_t sched,
+                     bool fp_reserve_sizing,
+          llm_graph_result * res) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
 
@@ -3164,7 +3282,25 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
-    if (mctx_cur->rerot_active()) {
+    // FlashPrefill sparse-path companion FIRST (built once here, shared by
+    // every full-attention layer). Inactive (null) unless the policy is
+    // enabled with routable per-ubatch rows, or for reserve sizing
+    // (worst-case caps, zero counts, never runs). OFF costs nothing.
+    inp->fp = llm_graph_input_attn_flashprefill::build_if_wanted(
+        ctx0, ubatch, hparams, cparams, mctx_cur, sched, fp_reserve_sizing, res);
+
+    // Legacy RERoT DDVR spans LAZILY: only when an actual dense RERoT layer
+    // needs them. Skipped solely for committed sparse-rerot (rerot layout +
+    // rerot cache state + full_attn_layers==0), where the hook routes sparse
+    // or heals via the lazy ensure in build_rerot_q_groups. Every other
+    // combination (ordinary layouts even under rerot state, fp-null
+    // fallbacks, full-N prefixes) keeps the correct legacy path, so
+    // span-hooked architectures outside the sparse hook keep DDVR intact.
+    // Reserve may over-cover spans (safe direction, single charge).
+    const bool fp_covers_all_rerot = (inp->fp != nullptr) && !inp->fp->is_reserve() &&
+        cparams.flashprefill.full_attn_layers == 0 &&
+        inp->fp->reuse_key().is_rerot && mctx_cur->rerot_active();
+    if (mctx_cur->rerot_active() && !fp_covers_all_rerot) {
         // RERoT DDVR span descriptors: capacity-bucketed topology. The reuse
         // key (n_token rows, span capacity bucket, kernel variant, on/off,
         // frontier mode) is recorded inside; per-frontier PAC-DFS churn lands
@@ -3182,7 +3318,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, sched);
+    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, sched, fp_reserve_sizing, res);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -3193,6 +3329,24 @@ ggml_tensor * llm_graph_context::build_rerot_q_groups(
         ggml_tensor * freq_factors,
         int sections[GGML_MROPE_SECTIONS],
         int il) const {
+    GGML_ASSERT(inp != nullptr);
+    if (inp->get_rerot_q_indices() == nullptr) {
+        // Lazy legacy spans for an actual dense RERoT fallback: the input
+        // builder skipped them (fp active, full_attn_layers==0) but an AUTO
+        // fallback needs them now. The sparse branch never calls here, so
+        // O(QK) entry lists materialize only on the real fallback path;
+        // prebuilt inputs (full prefix, fp-null fallbacks) skip this as a
+        // cheap null-check no-op. Null mctx falls through to the loud
+        // asserts below (never silent stock attention).
+        const auto * attn = inp->mctx;
+        if (attn != nullptr) {
+            inp->rerot_spans.build_span_tensors(
+                ctx0,
+                inp->self_rerot_q_indices, inp->self_rerot_q_pos,
+                inp->self_rerot_entries, inp->self_rerot_offsets,
+                ubatch, hparams, cparams, attn, sched);
+        }
+    }
     GGML_ASSERT(inp && inp->rerot_active());
     GGML_ASSERT(q_raw && q_raw->ne[2] == n_tokens);
 
@@ -3357,6 +3511,20 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
 
+    // FlashPrefill generic ordinary entry (guide-required): every common-KV
+    // caller reaches the sparse pool/select/attn ops here, not only hooked
+    // architectures, so required mode can never go silent through an
+    // unhooked path. Non-RERoT semantic views only, with the model-roped Q
+    // consumed directly (q_raw=null; never re-roped). RERoT batches keep
+    // their dedicated raw-Q hooks. Dense old body runs only on nullptr;
+    // both converge on the common projection tail below (GLM4/JAIS2 intact).
+    ggml_tensor * cur = nullptr;
+    if (inp != nullptr && !inp->rerot_semantic()) {
+        cur = try_build_attn_flashprefill(inp,
+                nullptr, q_cur, k_cur, v_cur, nullptr, kq_b, sinks, kq_scale, il);
+    }
+    if (cur == nullptr) {
+
     if (inp->self_k_rot) {
         q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
         k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
@@ -3404,7 +3572,7 @@ ggml_tensor * llm_graph_context::build_attn(
         q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size from q->ne[0]
     }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // TurboQuant: if V was padded, the output has padded dimensions.
@@ -3436,6 +3604,11 @@ ggml_tensor * llm_graph_context::build_attn(
         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
     }
 
+    } // end dense old body (skipped when the sparse route above produced cur)
+
+    // Common projection tail (both routes, preserved EXACTLY): GLM4/JAIS2
+    // F32 special projection, then wo_b. try_build returns finished pregate
+    // (inverse/trim already applied), so no duplicate tail work here.
     if (wo) {
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
@@ -4200,7 +4373,7 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), sched);
+    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), sched, fp_reserve_sizing, res);
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
@@ -4487,4 +4660,2398 @@ int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buck
     relative_bucket += (relative_position < max_exact ? relative_position : relative_position_if_large);
 
     return relative_bucket;
+}
+
+// ============================================================================
+// FlashPrefill V2 sparse attention (GraphIntegration)
+//
+// Ordinary attention KV + RERoT full-attention paths consume the
+// CacheFragments compact layout (uses/use_offsets, O(Q*F)) directly: no old
+// Q*K expansion anywhere on the new path, exact_rows never touched
+// (oracle-only), exact_all routes through identical metadata with the select
+// exact_all flag. Per-ubatch roles come from cparams.flashprefill_rows
+// (ContextIntegration/StatePolicy, shared ownership); source mapping from
+// llama_ubatch::source_row (BatchIdentity, never guessed).
+//
+// Spread of responsibilities (no duplicate writers):
+// - PolicyCore owns route/pack/scratch math (called, never redefined).
+// - CacheFragments owns fragments/groups/uses/epochs (built, never mutated).
+// - WireReference owns the I32 schema (packed via ggml helpers, offsets
+//   never hand-rolled).
+// - OpRegistration owns pool/select/attn constructors (called with real
+//   src[] edges; cpy_k/cpy_v outputs ride pool src[3]/src[4] ordering edges).
+// - VulkanDispatch/Shaders/CpuKernels own kernel numerics and the backend
+//   matrix (queried here by backend-name scan only).
+// - FittingIntegration owns common/fit (same scratch helper inputs; graph
+//   tensors ride the existing graph reserve, never double-charged).
+//
+// Data-vs-topology split: capacity buckets, policy/mode, role, dtype tags
+// and kernel variant are topology (reuse key). Epochs, counts within caps,
+// stamps, physical maps and per-call tail coordinates are submit data
+// (refreshed every set_input from the current rows + fresh layout).
+// Corruption (bad ranges, dup keys, stale mapping, cross-reader mismatch)
+// throws in EVERY mode; only designed policy-dense reasons stay dense.
+//
+// Supported envelope (shape-gated, never arch-whitelisted): ordinary GQA
+// full-attention prefill with F32 Q, single position per token, no additive
+// KQ bias, no ALiBi, unified or single-stream KV, backbone cache dtypes the
+// kernels dequant (F32/F16/quants/Turbo). RERoT teacher-forced adds phased
+// groups via the layout fragment-group mapping. Outside the envelope the
+// layer keeps its pre-existing dense path: recurrent, SWA, MTP,
+// decode/verify/frontier/embedding roles, mixed ubatches, unknown live
+// boundaries, short context, dense-tail rows (exact through the new op),
+// unsupported backends and over-admission shapes are all explicit dense
+// reasons (summary dense_rows/dense_layers); REQUIRED turns the
+// unsupported/capacity class into throws. Any model file opts in with the
+// 3-line try_build hook (qwen35/qwen35moe wired); unwired archs stay dense.
+
+namespace {
+
+// Slice bucketing (matches the layout CAP_BUCKET discipline).
+inline uint32_t llm_fp_bucket(uint32_t n) {
+    return llama_flashprefill_layout_params::bucket_for(n);
+}
+
+// Sound tile fan-out bound: the distinct packed-Q tiles touched by one
+// query's kv-head group (gqa consecutive packed rows). Tight for sane
+// block_q (<=2 tiles), exact for degenerate ones (up to gqa at block_q=1).
+// Used by reserve/can_reuse/submit capacity estimates; the packer itself
+// computes exact ranges with no bound.
+inline uint32_t llm_fp_tile_fanout(uint32_t gqa, uint32_t block_q) {
+    if (gqa == 0 || block_q == 0) {
+        return 0;
+    }
+    const uint64_t f = (uint64_t) gqa / (uint64_t) block_q + 2u;
+    return f > (uint64_t) gqa ? gqa : (uint32_t) f;
+}
+
+// Single layout-params construction (callers must stay identical so the
+// owner planning cache hits across probe and build).
+inline llama_flashprefill_layout_params llm_fp_layout_params_for(
+        const llama_flashprefill_config & cfg, const llama_cparams & cparams) {
+    llama_flashprefill_layout_params lp;
+    lp.block_k = cfg.block_k;
+    lp.causal = cparams.causal_attn;
+    lp.want_exact_rows = false; // production: compact uses only, no E expansion
+    return lp;
+}
+
+inline bool llm_fp_is_enabled(const llama_cparams & cparams) {
+    return llama_flashprefill_is_enabled(&cparams.flashprefill);
+}
+
+inline const std::vector<llama_flashprefill_row> * llm_fp_rows_of(const llama_cparams & cparams) {
+    const auto & p = cparams.flashprefill_rows;
+    return p ? p.get() : nullptr;
+}
+
+// Uniform eligible role (whole ubatch), or UNKNOWN when mixed/ineligible.
+// Only PREFILL (ordinary, incl. Tri sparse-position) and
+// REROT_TEACHER_FORCED ever route sparse; decode/MTP/verify/replay/
+// frontier/embedding/rerank/multimodal/unknown stay dense, never reordered.
+int32_t llm_fp_uniform_role(const std::vector<llama_flashprefill_row> & rows) {
+    if (rows.empty()) {
+        return LLAMA_FLASHPREFILL_ROLE_UNKNOWN;
+    }
+    const int32_t r0 = rows[0].role;
+    if (r0 != LLAMA_FLASHPREFILL_ROLE_PREFILL &&
+        r0 != LLAMA_FLASHPREFILL_ROLE_REROT_TEACHER_FORCED) {
+        return LLAMA_FLASHPREFILL_ROLE_UNKNOWN;
+    }
+    for (const auto & r : rows) {
+        if (r.role != r0) {
+            return LLAMA_FLASHPREFILL_ROLE_UNKNOWN;
+        }
+    }
+    return r0;
+}
+
+// StatePolicy reserve snapshot: rows present, no source map
+// (ubatch_reserve never carries one), all PREFILL/seq0/unknown-pos/known=false.
+// Live unknown-boundary rows (source map present) also route dense but size
+// nothing; only the snapshot (or the explicit reserve flag) sizes caps.
+bool llm_fp_is_snapshot_rows(const std::vector<llama_flashprefill_row> & rows, const llama_ubatch & ubatch) {
+    if (rows.size() != (size_t) ubatch.n_tokens || ubatch.n_tokens == 0) {
+        return false;
+    }
+    if (ubatch.source_row != nullptr) {
+        return false;
+    }
+    for (const auto & r : rows) {
+        if (r.role        != LLAMA_FLASHPREFILL_ROLE_PREFILL ||
+            r.seq_id      != 0 ||
+            r.logical_pos != LLAMA_FLASHPREFILL_POS_UNKNOWN ||
+            r.prefill_known) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Backend scan mirroring the RERoT variant discipline. CUDA/Metal/RPC have
+// no sparse kernels (unsupported); CPU reference + Vulkan fused supported.
+// Returns 0 = unsupported, 1 = CPU reference, 2 = Vulkan fused.
+int llm_fp_backend_variant(ggml_backend_sched_t sched, bool * supported_out) {
+    bool supported = true;
+    bool vulkan = false;
+    if (sched != nullptr) {
+        const int n = ggml_backend_sched_get_n_backends(sched);
+        for (int i = 0; i < n; ++i) {
+            ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+            if (b == nullptr) {
+                continue;
+            }
+            const char * name = ggml_backend_name(b);
+            if (name == nullptr) {
+                continue;
+            }
+            const std::string s(name);
+            if (s.find("CUDA")  != std::string::npos ||
+                s.find("Metal") != std::string::npos ||
+                s.find("RPC")   != std::string::npos) {
+                supported = false;
+            }
+            if (s.find("Vulkan") != std::string::npos ||
+                s.find("vulkan") != std::string::npos) {
+                vulkan = true;
+            }
+        }
+    }
+    if (supported_out != nullptr) {
+        *supported_out = supported;
+    }
+    if (!supported) {
+        return 0;
+    }
+    return vulkan ? 2 : 1;
+}
+
+} // namespace
+
+bool llm_graph_context::flashprefill_is_reserve_snapshot() const {
+    const auto * rows = llm_fp_rows_of(cparams);
+    if (rows == nullptr) {
+        return false;
+    }
+    return llm_fp_is_snapshot_rows(*rows, ubatch);
+}
+
+bool llm_graph_context::flashprefill_backend_supported() const {
+    bool supported = true;
+    llm_fp_backend_variant(sched, &supported);
+    return supported;
+}
+
+// Eligible FULL-attention layer predicate (single definition for counting
+// and gating): recurrent, SWA and structurally incompatible layers never
+// count — only actual full-normal layers do (contract-general; first target
+// Qwen has neither SWA nor malformed layers).
+static bool llm_fp_layer_eligible(const llama_hparams & hparams, int il) {
+    if (hparams.is_recr(il) || hparams.is_swa(il)) {
+        return false;
+    }
+    const uint32_t hj  = hparams.n_head(il);
+    const uint32_t hkv = hparams.n_head_kv(il);
+    return hj != 0 && hkv != 0 && hj % hkv == 0;
+}
+
+static int32_t llm_fp_count_full_layers(const llama_hparams & hparams) {
+    int32_t n = 0;
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        if (llm_fp_layer_eligible(hparams, (int) il)) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+int llm_graph_context::flashprefill_eligible_full_index(int il) const {
+    // full_attn_layers counts eligible FULL-attention layers, not model
+    // index, so hybrid intervals keep working when layers shift.
+    int idx = 0;
+    for (int j = 0; j < il; ++j) {
+        if (llm_fp_layer_eligible(hparams, j)) {
+            ++idx;
+        }
+    }
+    return idx;
+}
+
+void llm_graph_result::record_flashprefill_plan(
+        ggml_tensor * plan, ggml_tensor * pool, ggml_backend_t backend,
+        int il, int32_t sparse_rows, int32_t dense_rows) {
+    if (plan == nullptr) {
+        return; // fail-closed upstream: the vector never holds nulls
+    }
+    // Main-directed: pin the plan for the completion-boundary metrics read
+    // (single end-sync, never per-layer). OFF/dense graphs record nothing.
+    ggml_set_output(plan);
+    flashprefill_plans.push_back(plan);
+    flashprefill_plan_ils.push_back(il);
+    flashprefill_summary.sparse_layers += 1;
+    flashprefill_summary.sparse_rows   += sparse_rows;
+    flashprefill_summary.dense_rows    += dense_rows;
+    // Pinned total: every plan stays live (sum), pools are transient
+    // (max per backend). Checked 64-bit; tensor capacities, never estimates.
+    flashprefill_summary.scratch_bytes += (uint64_t) ggml_nbytes(plan);
+    flashprefill_summary.plans_bytes   += (uint64_t) ggml_nbytes(plan);
+    if (pool != nullptr) {
+        const uint64_t pb = (uint64_t) ggml_nbytes(pool);
+        bool found = false;
+        for (auto & e : flashprefill_pool_peaks) {
+            if (e.first == backend) {
+                found = true;
+                if (pb > e.second) {
+                    flashprefill_summary.scratch_bytes += pb - e.second;
+                    flashprefill_summary.pool_bytes    += pb - e.second;
+                    e.second = pb;
+                }
+                break;
+            }
+        }
+        if (!found) {
+            flashprefill_pool_peaks.emplace_back(backend, pb);
+            flashprefill_summary.scratch_bytes += pb;
+            flashprefill_summary.pool_bytes    += pb;
+        }
+    }
+}
+
+// Worst-case caps, pure in (config, model, probe inputs). Same shape as the
+// FittingIntegration accounting (identical scratch helper inputs); graph
+// tensors ride the existing graph reserve, never double-charged. All math
+// checked 64-bit; false + reason on overflow (caller throws fail-closed).
+struct llm_fp_reserve_caps {
+    uint32_t f = 0;      // fragments (actual bound, pre-bucket)
+    uint32_t u = 0;      // wire uses incl. kv-head fan-out + tile straddle
+    uint32_t c = 0;      // cells
+    uint32_t r = 0;      // rows
+    uint32_t t = 0;      // packed-Q tiles
+    uint32_t g = 0;      // Q groups (ordinary: one per query)
+    uint32_t maxsel = 0; // per-(tile,head) sound bound: F * queries-per-tile
+    uint32_t q_rsv = 0;  // reserve query bound used throughout
+};
+
+static bool llm_fp_reserve_caps_for(
+        const llama_flashprefill_config & cfg,
+        uint32_t n_ctx_cells,
+        uint32_t q_rsv,
+        uint32_t hq,
+        uint32_t hkv,
+        uint32_t gqa,
+        llm_fp_reserve_caps * out,
+        std::string * error) {
+    if (out == nullptr) {
+        return false;
+    }
+    *out = llm_fp_reserve_caps{};
+    if (cfg.block_q == 0 || cfg.block_k == 0 || hq == 0 || hkv == 0 || gqa == 0 || q_rsv == 0) {
+        if (error != nullptr) {
+            *error = "flashprefill reserve: zero block/head/query bound";
+        }
+        return false;
+    }
+    llama_flashprefill_fragment_budget budget;
+    if (!llama_flashprefill_admission_budget_for(
+                n_ctx_cells, cfg.block_k, LLAMA_FLASHPREFILL_ADMISSION_STREAMS_UNIFIED,
+                q_rsv, &budget, error)) {
+        return false;
+    }
+    const uint64_t F = budget.n_fragments;
+    // Wire uses fan out per kv head and tile straddle (sound bound shared
+    // with the can_reuse/submit estimates).
+    const uint64_t U = F * (uint64_t) q_rsv * (uint64_t) hkv * (uint64_t) llm_fp_tile_fanout(gqa, cfg.block_q);
+    const uint64_t C = F * (uint64_t) cfg.block_k;
+    const uint64_t R = (uint64_t) q_rsv * (uint64_t) hq;
+    const uint64_t T = ((uint64_t) q_rsv * (uint64_t) gqa + (uint64_t) cfg.block_q - 1u) / (uint64_t) cfg.block_q;
+    // Distinct queries sharing one packed-Q tile: packed rows of a query run
+    // gqa-consecutive, so at most block_q/gqa + 2 queries meet in a tile.
+    const uint64_t q_per_tile = (uint64_t) cfg.block_q / (uint64_t) gqa + 2u;
+    const uint64_t maxsel = F * (q_per_tile > (uint64_t) q_rsv ? (uint64_t) q_rsv : q_per_tile);
+    for (uint64_t v : {U, C, R, T, maxsel}) {
+        if (v > (uint64_t) INT32_MAX) {
+            if (error != nullptr) {
+                *error = "flashprefill reserve exceeds I32 wire domain";
+            }
+            return false;
+        }
+    }
+    if (T == 0) {
+        if (error != nullptr) {
+            *error = "flashprefill reserve: zero tiles";
+        }
+        return false;
+    }
+    out->f      = (uint32_t) F;
+    out->u      = (uint32_t) U;
+    out->c      = (uint32_t) C;
+    out->r      = (uint32_t) R;
+    out->t      = (uint32_t) T;
+    out->g      = q_rsv;
+    out->maxsel = (uint32_t) maxsel;
+    out->q_rsv  = q_rsv;
+    return true;
+}
+
+// Reserve probe inputs from live params (no layout, no rows needed).
+static bool llm_fp_reserve_probe_inputs(
+        const llama_cparams & cparams,
+        const llama_hparams & hparams,
+        const llama_ubatch  & ubatch,
+        uint32_t * n_ctx_cells_out,
+        uint32_t * q_rsv_out) {
+    uint32_t n_ctx_cells = cparams.n_ctx_kv != 0 ? cparams.n_ctx_kv : cparams.n_ctx;
+    uint32_t q_rsv = cparams.n_ubatch != 0 ? cparams.n_ubatch : ubatch.n_tokens;
+    if (n_ctx_cells == 0 || q_rsv == 0) {
+        return false;
+    }
+    GGML_UNUSED(hparams);
+    *n_ctx_cells_out = n_ctx_cells;
+    *q_rsv_out       = q_rsv;
+    return true;
+}
+
+// ---- checked wire pack (plan generation) ----
+//
+// Packs the CacheFragments compact layout (uses/use_offsets, O(Q*F)) plus
+// per-ubatch roles into GGML wire rows/uses/cells. Never expands Q*K, never
+// reads exact_rows, never reads KV bytes, never reorders real rows/Q/output
+// IDs: only descriptors are sorted. Tile ids are ubatch-relative
+// (0-based over this ubatch's packed rows) in every tail scope; only the
+// dense-tail DECISION uses scope-absolute coordinates. Runs once per graph
+// build (and per submit refill); the expensive GGML full validator never
+// runs here (oracle/tests only) — checked construction below rejects
+// corruption fail-closed instead.
+struct llm_fp_rowrec {
+    int32_t domain  = -1; // visibility domain ordinal (selection-privacy partition)
+    int32_t src_q   = 0; // ubatch row (output query id, never reordered)
+    int32_t kv_head = 0;
+    int32_t q_head  = 0;
+    int32_t tile    = 0; // ubatch-relative packed-Q tile
+    int32_t log_pos = 0;
+    int32_t pbegin  = 0;
+    int32_t pend    = 0;
+    bool    forced  = false; // DENSE_FORCE: exact tail/short row through the new op
+};
+
+struct llm_fp_userec {
+    int32_t domain   = -1; // visibility domain ordinal (matches row domain)
+    int32_t frag     = 0;
+    int32_t tile     = 0;
+    int32_t kv_head  = 0;
+    int32_t q_group  = 0; // effective phase for this query+fragment
+    int64_t sub_off  = 0; // absolute cell-table offset inside the fragment range
+    int64_t sub_count = 0; // > 0
+    int32_t flags    = 0;
+    int32_t src_q    = 0;
+};
+
+struct llm_fp_pack {
+    std::vector<llm_fp_rowrec> rows; // sorted (tile,kv_head,src_q,q_head)
+    std::vector<llm_fp_userec> uses; // sorted (tile,kv_head,src_q,frag)
+    std::vector<int32_t> cells;      // concatenated fragment member cells
+    std::vector<uint32_t> frag_base; // [F] cell-table base per fragment
+    int64_t n_tiles = 0;
+    int64_t max_sel = 0; // max actual per-(tile,head) use count
+    int32_t n_groups = 0;
+    std::vector<int32_t> qpos; // [G] per-group Q RoPE positions (rerot only)
+    int32_t sparse_rows = 0;
+    int32_t forced_rows = 0;
+    uint64_t visible_tokens = 0; // sum of per-query resident+visible+legal incidences
+};
+
+enum llm_fp_pack_rc {
+    LL_FP_PACK_OK       = 0, // packed, counts fit I32
+    LL_FP_PACK_CORRUPT  = 1, // invalid layout/rows/mapping: caller throws, every mode
+    LL_FP_PACK_OVERFLOW = 2, // counts exceed I32 wire domain: sizing path (dense AUTO, throw REQUIRED)
+};
+
+// Selection privacy: a packed tile must never mix distinct seq/reader
+// visibility domains, even under one role. Tile-energy aggregates over the
+// packed rows of a tile, so cross-domain sharing would let one domain's
+// (possibly huge) values change another domain's selected set — a pollution
+// violation despite per-row attention legality. Tiles are therefore
+// partitioned by frozen (seq, reader, prompt interval) domain: tile ids are
+// assigned per domain (densely compacted, no padding waste) and verified
+// disjoint. Pool means stay shared (fragment K/V means are Q-independent);
+// phase groups stay per query. Q rows, outputs and recurrent state never
+// move (descriptors only). Single-domain batches (all ordinary server
+// prefills) number identically to plain packed order: zero regression.
+struct llm_fp_domain_key {
+    int32_t seq_id;
+    uint32_t reader_id;
+    int32_t pbegin;
+    int32_t pend;
+    uint32_t uniq; // query index when seq unknown (each its own domain), else 0
+
+    bool operator<(const llm_fp_domain_key & o) const {
+        if (seq_id    != o.seq_id)    return seq_id    < o.seq_id;
+        if (reader_id != o.reader_id) return reader_id < o.reader_id;
+        if (pbegin    != o.pbegin)    return pbegin    < o.pbegin;
+        if (pend      != o.pend)      return pend      < o.pend;
+        return uniq < o.uniq;
+    }
+};
+
+// Domain-aware tile layout (exact): domains in first-appearance order,
+// packed rows per domain in ubatch order, tiles numbered densely across
+// domains (no padding waste). Shared by the packer and the reuse tile-count
+// check so numbering can never diverge. Returns false on degenerate config.
+static bool llm_fp_domain_layout(
+        const std::vector<llama_flashprefill_row> & rows,
+        uint32_t block_q,
+        uint32_t gqa,
+        std::vector<int64_t> * q_tile_base_out,
+        std::vector<int64_t> * q_local_out,
+        std::vector<int> * q_domain_out,
+        uint64_t * n_tiles_out) {
+    if (block_q == 0 || gqa == 0) {
+        return false;
+    }
+    std::map<llm_fp_domain_key, int> domain_ord;
+    std::vector<int> q_domain(rows.size(), -1);
+    for (size_t q = 0; q < rows.size(); ++q) {
+        const auto & r = rows[q];
+        llm_fp_domain_key k{r.seq_id, r.reader_id, r.prefill_begin, r.prefill_end,
+            r.seq_id == LLAMA_FLASHPREFILL_SEQ_UNKNOWN ? (uint32_t) q : 0u};
+        auto it = domain_ord.find(k);
+        int ord;
+        if (it == domain_ord.end()) {
+            ord = (int) domain_ord.size();
+            domain_ord[k] = ord;
+        } else {
+            ord = it->second;
+        }
+        q_domain[(size_t) q] = ord;
+    }
+    std::vector<uint64_t> dom_seen(domain_ord.size(), 0);
+    std::vector<int64_t> q_local(rows.size(), 0);
+    for (size_t q = 0; q < rows.size(); ++q) {
+        const int d = q_domain[q];
+        q_local[q] = (int64_t) (dom_seen[(size_t) d] * (uint64_t) gqa);
+        dom_seen[(size_t) d] += 1;
+    }
+    std::vector<uint64_t> dom_packed(domain_ord.size(), 0);
+    for (size_t d = 0; d < domain_ord.size(); ++d) {
+        dom_packed[d] = dom_seen[d] * (uint64_t) gqa;
+    }
+    std::vector<int64_t> q_tile_base(rows.size(), 0);
+    uint64_t base = 0;
+    std::vector<uint64_t> dom_base(domain_ord.size(), 0);
+    for (size_t d = 0; d < domain_ord.size(); ++d) {
+        dom_base[d] = base;
+        base += (dom_packed[d] + (uint64_t) block_q - 1u) / (uint64_t) block_q;
+    }
+    for (size_t q = 0; q < rows.size(); ++q) {
+        q_tile_base[q] = (int64_t) dom_base[(size_t) q_domain[q]];
+    }
+    if (q_tile_base_out != nullptr) {
+        *q_tile_base_out = q_tile_base;
+    }
+    if (q_local_out != nullptr) {
+        *q_local_out = q_local;
+    }
+    if (q_domain_out != nullptr) {
+        *q_domain_out = q_domain;
+    }
+    if (n_tiles_out != nullptr) {
+        *n_tiles_out = base;
+    }
+    return true;
+}
+
+static llm_fp_pack_rc llm_fp_pack_live(
+        const llama_flashprefill_layout & layout,
+        const std::vector<llama_flashprefill_row> & rows,
+        const llama_flashprefill_config & cfg,
+        uint32_t hq,
+        uint32_t hkv,
+        uint32_t gqa,
+        uint32_t n_tokens,
+        llm_fp_pack * out,
+        std::string * error,
+        bool dry_run = false) {
+    if (out == nullptr) {
+        return LL_FP_PACK_CORRUPT;
+    }
+    *out = llm_fp_pack{};
+    auto fail = [&](const char * msg) {
+        if (error != nullptr) {
+            *error = msg;
+        }
+        return LL_FP_PACK_CORRUPT;
+    };
+    const uint32_t Q = layout.n_queries();
+    const uint32_t F = layout.n_fragments();
+    const uint32_t G = layout.n_groups();
+    if (Q != n_tokens || Q == 0) {
+        return fail("flashprefill pack: layout queries != ubatch rows");
+    }
+    if (rows.size() != (size_t) n_tokens) {
+        return fail("flashprefill pack: row snapshot != ubatch rows");
+    }
+    if (hq == 0 || hkv == 0 || gqa == 0 || hq % hkv != 0 || hq / hkv != gqa) {
+        return fail("flashprefill pack: GQA mapping inconsistent");
+    }
+    if (cfg.block_q == 0) {
+        return fail("flashprefill pack: zero block_q");
+    }
+    // Dense query identity: the builder emits one query per ubatch row in
+    // order; wire source_query is that index (output query id, retained).
+    for (uint32_t q = 0; q < Q; ++q) {
+        if (layout.queries[q].query_index != q) {
+            return fail("flashprefill pack: non-dense query identity");
+        }
+        const auto & row = rows[q];
+        if (row.prefill_begin >= row.prefill_end) {
+            return fail("flashprefill pack: invalid prefill interval");
+        }
+        if (row.logical_pos != LLAMA_FLASHPREFILL_POS_UNKNOWN &&
+            (row.logical_pos < row.prefill_begin || row.logical_pos >= row.prefill_end)) {
+            return fail("flashprefill pack: logical pos outside interval");
+        }
+        if (layout.use_offsets.size() != (size_t) Q + 1) {
+            return fail("flashprefill pack: use offsets != Q+1");
+        }
+    }
+    if (layout.group_offsets.size() != (G == 0 ? (size_t) 0 : (size_t) Q + 1)) {
+        // Ordinary layouts carry no groups (identity: one group per query);
+        // RERoT layouts carry per-query group ranges. Anything else is corrupt.
+        if (!(G == 0 && layout.group_offsets.empty())) {
+            return fail("flashprefill pack: group offsets != Q+1");
+        }
+    }
+    const bool use_groups = (G != 0);
+    if (use_groups) {
+        for (uint32_t g = 0; g < G; ++g) {
+            if (layout.groups[g].query_index >= Q) {
+                return fail("flashprefill pack: group query out of range");
+            }
+        }
+    }
+    // Per-query resident-visible-legal counts from the compact uses (never
+    // physical capacity, never Tri-deleted history).
+    std::vector<uint64_t> vcount(Q, 0);
+    for (uint32_t q = 0; q < Q; ++q) {
+        const uint32_t b = layout.use_offsets[q];
+        const uint32_t e = layout.use_offsets[q + 1];
+        if (b > e || (uint64_t) e > (uint64_t) layout.uses.size()) {
+            return fail("flashprefill pack: use range out of bounds");
+        }
+        uint32_t prev_frag = UINT32_MAX;
+        for (uint32_t i = b; i < e; ++i) {
+            const auto & u = layout.uses[i];
+            if (u.query != q) {
+                return fail("flashprefill pack: use query mismatch");
+            }
+            if (u.fragment >= F) {
+                return fail("flashprefill pack: use fragment out of range");
+            }
+            if (u.sub_count == 0) {
+                return fail("flashprefill pack: empty use");
+            }
+            // Frozen planning guarantee: fragment ids strictly ascending
+            // within each query (at most one use per pair, in order).
+            if (i > b && u.fragment <= prev_frag) {
+                return fail("flashprefill pack: unordered/duplicate (query,fragment)");
+            }
+            prev_frag = u.fragment;
+            const auto & fr = layout.fragments[u.fragment];
+            if (fr.token_count == 0) {
+                return fail("flashprefill pack: empty fragment");
+            }
+            // Subrange inside the fragment member range, member order
+            // (positions/storage ascending): legal subsets are prefixes, so
+            // the wire offset is base + relative.
+            const uint64_t membase = fr.contiguous ? fr.cell_begin : fr.cell_ref_offset;
+            if (!fr.contiguous && fr.cell_ref_offset == UINT32_MAX) {
+                return fail("flashprefill pack: fragment addressing invalid");
+            }
+            const uint64_t rel_end = (uint64_t) u.sub_off + (uint64_t) u.sub_count;
+            if (u.sub_off < membase || rel_end > membase + (uint64_t) fr.token_count) {
+                return fail("flashprefill pack: use subrange outside fragment");
+            }
+            if (!fr.contiguous &&
+                (uint64_t) fr.cell_ref_offset + (uint64_t) fr.token_count > (uint64_t) layout.cell_refs.size()) {
+                return fail("flashprefill pack: cell refs out of bounds");
+            }
+            if (u.flags & ~llama_flashprefill_use::FLAG_MANDATORY) {
+                return fail("flashprefill pack: use flag out of range");
+            }
+            vcount[q] += (uint64_t) u.sub_count;
+            if (vcount[q] > (uint64_t) INT32_MAX) {
+                if (error != nullptr) {
+                    *error = "flashprefill pack: per-query tokens exceed I32";
+                }
+                return LL_FP_PACK_OVERFLOW;
+            }
+        }
+        if (vcount[q] == 0) {
+            // The builder must cover V(r) (non-empty: at least the query's
+            // own KV). Empty coverage is a builder-contract breach, never a
+            // silent exact-over-nothing.
+            return fail("flashprefill pack: empty query coverage");
+        }
+        out->visible_tokens += vcount[q];
+    }
+    // Packed-Q geometry (exact; BM may not divide G). Call-scope totals are
+    // validated (overflow-safe); tile NUMBERING is domain-partitioned (see
+    // llm_fp_domain_layout): tiles never mix seq/reader visibility domains,
+    // numbered densely per domain in first-appearance order. The tail
+    // DECISION alone uses scope-absolute coordinates (call range or frozen
+    // logical interval). Single-domain batches number identically to plain
+    // packed order.
+    uint32_t total_packed = 0;
+    {
+        uint32_t tmp_total = 0, tmp_tiles = 0;
+        if (llama_flashprefill::packed_layout_checked(
+                    n_tokens, gqa, cfg.block_q, &tmp_total, &tmp_tiles) != LLAMA_FLASHPREFILL_OK) {
+            if (error != nullptr) {
+                *error = "flashprefill pack: packed layout overflow";
+            }
+            return LL_FP_PACK_OVERFLOW;
+        }
+        total_packed = tmp_total;
+        (void) tmp_tiles;
+    }
+    std::vector<int64_t> q_tile_base;
+    std::vector<int64_t> q_local;
+    std::vector<int> q_domain;
+    uint64_t n_tiles_dom = 0;
+    if (!llm_fp_domain_layout(rows, cfg.block_q, gqa, &q_tile_base, &q_local, &q_domain, &n_tiles_dom)) {
+        return fail("flashprefill pack: domain layout failed");
+    }
+    if (n_tiles_dom == 0 || n_tiles_dom > (uint64_t) INT32_MAX) {
+        if (error != nullptr) {
+            *error = "flashprefill pack: tile count out of I32 range";
+        }
+        return LL_FP_PACK_OVERFLOW;
+    }
+    out->n_tiles = (int64_t) n_tiles_dom;
+    const bool logical_scope = (cfg.tail_scope == LLAMA_FLASHPREFILL_TAIL_LOGICAL_PROMPT);
+    const bool exact_all_cfg = cfg.exact_all;
+    // Row records (unsorted): one per (query, head); tail/short evaluated
+    // per packed row. UNKNOWN logical positions force exact (position-free)
+    // rather than guessing a tail.
+    std::vector<llm_fp_rowrec> rows_u;
+    if (!dry_run) {
+        rows_u.reserve((size_t) n_tokens * (size_t) hq);
+    }
+    std::vector<char> forced_flat;
+    forced_flat.reserve((size_t) n_tokens * (size_t) hq);
+    int32_t sparse_rows = 0;
+    int32_t forced_rows = 0;
+    for (uint32_t q = 0; q < Q; ++q) {
+        const auto & row = rows[q];
+        for (uint32_t h = 0; h < hq; ++h) {
+            const uint32_t s = h % gqa;
+            const uint32_t kh = h / gqa;
+            const uint64_t pr_call = (uint64_t) q * (uint64_t) gqa + (uint64_t) s;
+            // Domain-partitioned tile (never shared across visibility
+            // domains); pr_call stays call-scope-absolute for routing only.
+            const int32_t tile = (int32_t) (q_tile_base[(size_t) q] +
+                (q_local[(size_t) q] + (int64_t) s) / (int64_t) cfg.block_q);
+            bool forced = false;
+            if (!exact_all_cfg) {
+                if (logical_scope) {
+                    if (row.logical_pos == LLAMA_FLASHPREFILL_POS_UNKNOWN) {
+                        forced = true;
+                    } else {
+                        const int64_t off = (int64_t) row.logical_pos - (int64_t) row.prefill_begin;
+                        const uint64_t pr_pre = (uint64_t) off * (uint64_t) gqa + (uint64_t) s;
+                        const uint64_t total_pre =
+                            (uint64_t) ((int64_t) row.prefill_end - (int64_t) row.prefill_begin) * (uint64_t) gqa;
+                        if (pr_pre > (uint64_t) UINT32_MAX || total_pre > (uint64_t) UINT32_MAX ||
+                            total_pre == 0 || pr_pre >= total_pre) {
+                            if (error != nullptr) {
+                                *error = "flashprefill pack: logical packed range overflow/empty";
+                            }
+                            return LL_FP_PACK_OVERFLOW;
+                        }
+                        const auto r = llama_flashprefill::route_row_logical(
+                            &cfg, &row, (uint32_t) vcount[q], true,
+                            (uint32_t) pr_pre, (uint32_t) total_pre);
+                        if (r == LLAMA_FLASHPREFILL_ROUTE_DENSE_TAIL ||
+                            r == LLAMA_FLASHPREFILL_ROUTE_DENSE_SHORT_CONTEXT) {
+                            forced = true;
+                        } else if (r != LLAMA_FLASHPREFILL_ROUTE_SPARSE &&
+                                   r != LLAMA_FLASHPREFILL_ROUTE_EXACT_ALL) {
+                            return fail("flashprefill pack: unexpected per-row route");
+                        }
+                    }
+                } else {
+                    const auto r = llama_flashprefill::route_row_call(
+                        &cfg, &row, (uint32_t) vcount[q], true,
+                        (uint32_t) pr_call, total_packed);
+                    if (r == LLAMA_FLASHPREFILL_ROUTE_DENSE_TAIL ||
+                        r == LLAMA_FLASHPREFILL_ROUTE_DENSE_SHORT_CONTEXT) {
+                        forced = true;
+                    } else if (r != LLAMA_FLASHPREFILL_ROUTE_SPARSE &&
+                               r != LLAMA_FLASHPREFILL_ROUTE_EXACT_ALL) {
+                        return fail("flashprefill pack: unexpected per-row route");
+                    }
+                }
+            }
+            forced_flat.push_back(forced ? 1 : 0);
+            if (forced) {
+                ++forced_rows;
+            } else {
+                ++sparse_rows;
+            }
+            if (dry_run) {
+                continue;
+            }
+            llm_fp_rowrec rec;
+            rec.domain  = (int32_t) q_domain[(size_t) q];
+            rec.src_q   = (int32_t) q;
+            rec.kv_head = (int32_t) kh;
+            rec.q_head  = (int32_t) h;
+            rec.tile    = tile;
+            rec.log_pos = row.logical_pos;
+            rec.pbegin  = row.prefill_begin;
+            rec.pend    = row.prefill_end;
+            rec.forced  = forced;
+            rows_u.push_back(rec);
+        }
+    }
+    out->sparse_rows = sparse_rows;
+    out->forced_rows = forced_rows;
+    if (dry_run) {
+        // Eligibility probe: route/tail outcome only (counts + visible +
+        // tiles already recorded), no wire emission.
+        return LL_FP_PACK_OK;
+    }
+    // Per-(query,tile,kv_head) forced triples: any forced row forces every
+    // use of its triple to MANDATORY (wire: triples touching a DENSE_FORCE
+    // row are all-mandatory).
+    std::map<std::tuple<int32_t, int32_t, int32_t>, bool> triple_forced;
+    for (const auto & r : rows_u) {
+        if (r.forced) {
+            triple_forced[{r.src_q, r.tile, r.kv_head}] = true;
+        }
+    }
+    // Cell table: fragments concatenated in frag_id order.
+    std::vector<int32_t> cells;
+    std::vector<uint32_t> frag_base(F, 0);
+    {
+        uint64_t base = 0;
+        for (uint32_t f = 0; f < F; ++f) {
+            const auto & fr = layout.fragments[f];
+            if (base + fr.token_count > (uint64_t) INT32_MAX) {
+                if (error != nullptr) {
+                    *error = "flashprefill pack: cells exceed I32";
+                }
+                return LL_FP_PACK_OVERFLOW;
+            }
+            frag_base[f] = (uint32_t) base;
+            if (fr.contiguous) {
+                for (uint32_t i = 0; i < fr.token_count; ++i) {
+                    const uint64_t cell = (uint64_t) fr.cell_begin + i;
+                    if (cell > (uint64_t) INT32_MAX) {
+                        return fail("flashprefill pack: cell out of I32 range");
+                    }
+                    cells.push_back((int32_t) cell);
+                }
+            } else {
+                for (uint32_t i = 0; i < fr.token_count; ++i) {
+                    const uint32_t cell = layout.cell_refs[(size_t) fr.cell_ref_offset + i];
+                    if ((uint64_t) cell > (uint64_t) INT32_MAX) {
+                        return fail("flashprefill pack: cell ref out of I32 range");
+                    }
+                    cells.push_back((int32_t) cell);
+                }
+            }
+            base += fr.token_count;
+        }
+    }
+    // Use fan-out: one wire use per (use, distinct tile, kv head). Heads of
+    // one kv group share a use only when their packed rows share the tile
+    // (triple key); the sort below groups them for the selector.
+    std::vector<llm_fp_userec> uses_u;
+    uses_u.reserve(layout.uses.size() > 0 ? layout.uses.size() : 1);
+    for (uint32_t q = 0; q < Q; ++q) {
+        const uint32_t b = layout.use_offsets[q];
+        const uint32_t e = layout.use_offsets[q + 1];
+        for (uint32_t kh = 0; kh < hkv; ++kh) {
+            // Exact tile range for this (query, kv-head) pair: its gqa
+            // packed rows are consecutive, so touched tiles run contiguously
+            // first..last in the same domain numbering as the row records
+            // above (no array bound, no fail-closed truncation).
+            const int64_t plo = q_tile_base[(size_t) q] +
+                (q_local[(size_t) q] + (int64_t) kh * (int64_t) gqa) / (int64_t) cfg.block_q;
+            int64_t last_s = (int64_t) kh * (int64_t) gqa + (int64_t) gqa - 1;
+            if (last_s >= (int64_t) hq) {
+                last_s = (int64_t) hq - 1;
+            }
+            const int64_t phi = q_tile_base[(size_t) q] +
+                (q_local[(size_t) q] + last_s) / (int64_t) cfg.block_q;
+            if (plo > phi || plo > (int64_t) INT32_MAX || phi > (int64_t) INT32_MAX) {
+                return fail("flashprefill pack: tile range out of I32 range");
+            }
+            for (int64_t t = plo; t <= phi; ++t) {
+                const int32_t tile = (int32_t) t;
+            for (uint32_t i = b; i < e; ++i) {
+                const auto & u = layout.uses[i];
+                const auto & fr = layout.fragments[u.fragment];
+                const uint64_t membase = fr.contiguous ? fr.cell_begin : fr.cell_ref_offset;
+                const uint64_t wsub = (uint64_t) frag_base[u.fragment] + ((uint64_t) u.sub_off - membase);
+                if (wsub > (uint64_t) INT32_MAX ||
+                    (uint64_t) u.sub_count > (uint64_t) INT32_MAX) {
+                    return fail("flashprefill pack: wire subrange out of I32 range");
+                }
+                if ((int64_t) u.group >= (use_groups ? (int64_t) G : (int64_t) Q)) {
+                    return fail("flashprefill pack: use group out of range");
+                }
+                llm_fp_userec w;
+                w.domain    = (int32_t) q_domain[(size_t) q];
+                w.frag      = (int32_t) u.fragment;
+                w.tile      = tile;
+                w.kv_head   = (int32_t) kh;
+                w.q_group   = use_groups ? (int32_t) u.group : (int32_t) q;
+                w.sub_off   = (int64_t) wsub;
+                w.sub_count = (int64_t) u.sub_count;
+                w.flags     = (int32_t) u.flags;
+                w.src_q     = (int32_t) q;
+                auto it = triple_forced.find({w.src_q, w.tile, w.kv_head});
+                if (it != triple_forced.end() && it->second) {
+                    w.flags |= (int32_t) llama_flashprefill_use::FLAG_MANDATORY;
+                }
+                uses_u.push_back(w);
+            }
+            }
+        }
+    }
+    if (uses_u.size() > (size_t) INT32_MAX || rows_u.size() > (size_t) INT32_MAX ||
+        cells.size() > (size_t) INT32_MAX) {
+        if (error != nullptr) {
+            *error = "flashprefill pack: rows/uses/cells exceed I32";
+        }
+        return LL_FP_PACK_OVERFLOW;
+    }
+    // Canonical pack order (frozen with the selector): domain first, then
+    // (tile, kv_head), secondary (source_query, fragment_id / q_head).
+    // Tiles are disjoint across domains by construction (verified below),
+    // so the selector's (tile,kv_head) binary search stays valid.
+    // Descriptors only; Q rows, outputs and recurrent state never move.
+    std::sort(uses_u.begin(), uses_u.end(), [](const llm_fp_userec & a, const llm_fp_userec & b) {
+        if (a.domain  != b.domain)  return a.domain  < b.domain;
+        if (a.tile    != b.tile)    return a.tile    < b.tile;
+        if (a.kv_head != b.kv_head) return a.kv_head < b.kv_head;
+        if (a.src_q   != b.src_q)   return a.src_q   < b.src_q;
+        return a.frag < b.frag;
+    });
+    std::sort(rows_u.begin(), rows_u.end(), [](const llm_fp_rowrec & a, const llm_fp_rowrec & b) {
+        if (a.domain  != b.domain)  return a.domain  < b.domain;
+        if (a.tile    != b.tile)    return a.tile    < b.tile;
+        if (a.kv_head != b.kv_head) return a.kv_head < b.kv_head;
+        if (a.src_q   != b.src_q)   return a.src_q   < b.src_q;
+        return a.q_head < b.q_head;
+    });
+    // Selection-privacy verification: no tile is ever shared across
+    // visibility domains (pollution isolation). Construction guarantees it;
+    // this sweep rejects any violation fail-closed, every mode.
+    {
+        std::map<int32_t, int32_t> tile_domain;
+        for (const auto & r : rows_u) {
+            auto it = tile_domain.find(r.tile);
+            if (it == tile_domain.end()) {
+                tile_domain[r.tile] = r.domain;
+            } else if (it->second != r.domain) {
+                return fail("flashprefill pack: tile shared across domains");
+            }
+        }
+        for (const auto & u : uses_u) {
+            auto it = tile_domain.find(u.tile);
+            if (it == tile_domain.end()) {
+                tile_domain[u.tile] = u.domain;
+            } else if (it->second != u.domain) {
+                return fail("flashprefill pack: use tile shared across domains");
+            }
+        }
+    }
+    // Per-(tile,head) use counts: plan max_sel_pair is the worst actual pair.
+    int64_t max_sel = 0;
+    {
+        size_t i = 0;
+        while (i < uses_u.size()) {
+            size_t j = i + 1;
+            while (j < uses_u.size() &&
+                   uses_u[j].tile == uses_u[i].tile &&
+                   uses_u[j].kv_head == uses_u[i].kv_head) {
+                ++j;
+            }
+            const int64_t cnt = (int64_t) (j - i);
+            if (cnt > max_sel) {
+                max_sel = cnt;
+            }
+            i = j;
+        }
+        if (max_sel > (int64_t) INT32_MAX) {
+            if (error != nullptr) {
+                *error = "flashprefill pack: pair count exceeds I32";
+            }
+            return LL_FP_PACK_OVERFLOW;
+        }
+    }
+    // Group RoPE positions (rerot only; ordinary uses identity + inp_pos).
+    std::vector<int32_t> qpos;
+    if (use_groups) {
+        qpos.assign(G, 0);
+        for (uint32_t g = 0; g < G; ++g) {
+            const int64_t p = (int64_t) layout.groups[g].effective_pos;
+            if (p < (int64_t) INT32_MIN || p > (int64_t) INT32_MAX) {
+                return fail("flashprefill pack: group pos out of I32 range");
+            }
+            qpos[g] = (int32_t) p;
+        }
+    }
+    out->rows.swap(rows_u);
+    out->uses.swap(uses_u);
+    out->cells.swap(cells);
+    out->frag_base.swap(frag_base);
+    out->max_sel = max_sel;
+    out->n_groups = use_groups ? (int32_t) G : (int32_t) Q;
+    out->qpos.swap(qpos);
+    out->sparse_rows = sparse_rows;
+    out->forced_rows = forced_rows;
+    return LL_FP_PACK_OK;
+}
+
+// ---- build prescreen (no layout build): shapes/roles/config/global gates ----
+
+enum class llm_fp_pre {
+    WANT,        // proceed to layout build
+    DENSE,       // designed-dense (silent, every mode)
+    UNSUPPORTED, // backend only: caller maps by mode (throw REQUIRED, dense AUTO)
+};
+
+static llm_fp_pre llm_fp_prescreen(
+        const llama_ubatch & ubatch,
+        const llama_hparams & hparams,
+        const llama_cparams & cparams,
+        ggml_backend_sched_t sched,
+        const std::vector<llama_flashprefill_row> * rows,
+        int32_t * role_out,
+        bool * backend_out,
+        int32_t * reason_out = nullptr) {
+    auto note = [&](int32_t reason) {
+        if (reason_out != nullptr) {
+            *reason_out = reason;
+        }
+    };
+    if (role_out != nullptr) {
+        *role_out = LLAMA_FLASHPREFILL_ROLE_UNKNOWN;
+    }
+    if (backend_out != nullptr) {
+        *backend_out = false;
+    }
+    if (rows == nullptr) {
+        note(LLAMA_FLASHPREFILL_ROUTE_DENSE_OFF);
+        return llm_fp_pre::DENSE;
+    }
+    if (rows->size() != (size_t) ubatch.n_tokens || ubatch.n_tokens == 0) {
+        throw std::runtime_error("flashprefill: row snapshot size != ubatch rows (corrupt source map)");
+    }
+    const uint32_t hq  = hparams.n_head();
+    const uint32_t hkv = hparams.n_head_kv();
+    if (hq == 0 || hkv == 0 || hq % hkv != 0) {
+        note(LLAMA_FLASHPREFILL_ROUTE_DENSE_UNSUPPORTED);
+        return llm_fp_pre::DENSE;
+    }
+    if (hparams.n_embd_head_k() == 0 || hparams.n_embd_head_v() == 0) {
+        note(LLAMA_FLASHPREFILL_ROUTE_DENSE_UNSUPPORTED);
+        return llm_fp_pre::DENSE;
+    }
+    const int32_t role = llm_fp_uniform_role(*rows);
+    if (role == LLAMA_FLASHPREFILL_ROLE_UNKNOWN) {
+        // Mixed or non-eligible roles (decode/MTP/verify/frontier/
+        // embedding/...): conservative dense, never reordered.
+        note(LLAMA_FLASHPREFILL_ROUTE_DENSE_ROLE);
+        return llm_fp_pre::DENSE;
+    }
+    // Bounds are required to pack honest wire rows in every tail scope;
+    // unknown live boundaries route dense, never guessed.
+    for (const auto & r : *rows) {
+        if (!r.prefill_known) {
+            note(LLAMA_FLASHPREFILL_ROUTE_DENSE_UNKNOWN_BOUNDARY);
+            return llm_fp_pre::DENSE;
+        }
+        if (r.prefill_begin >= r.prefill_end) {
+            throw std::runtime_error("flashprefill: invalid prefill interval (corrupt rows)");
+        }
+        if (r.logical_pos != LLAMA_FLASHPREFILL_POS_UNKNOWN &&
+            (r.logical_pos < r.prefill_begin || r.logical_pos >= r.prefill_end)) {
+            throw std::runtime_error("flashprefill: logical pos outside interval (corrupt rows)");
+        }
+    }
+    bool supported = true;
+    llm_fp_backend_variant(sched, &supported);
+    if (backend_out != nullptr) {
+        *backend_out = supported;
+    }
+    if (!supported) {
+        return llm_fp_pre::UNSUPPORTED;
+    }
+    // Designed-dense global gates (silent, every mode): MTP contexts,
+    // embedding/pooling paths, ALiBi-style max bias, multi-pos batches.
+    // Recurrent layers and the MTP draft graph never reach try_build.
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        note(LLAMA_FLASHPREFILL_ROUTE_DENSE_ROLE);
+        return llm_fp_pre::DENSE;
+    }
+    if (cparams.embeddings || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE || ubatch.embd != nullptr) {
+        note(LLAMA_FLASHPREFILL_ROUTE_DENSE_ROLE);
+        return llm_fp_pre::DENSE;
+    }
+    if (hparams.f_max_alibi_bias != 0.0f) {
+        note(LLAMA_FLASHPREFILL_ROUTE_DENSE_UNSUPPORTED);
+        return llm_fp_pre::DENSE;
+    }
+    // Single-pos and IMRoPE 4-pos batches (text (p,p,p,0) discipline); wider
+    // position layouts keep the pre-existing dense path.
+    if (hparams.n_pos_per_embd() != 1 && hparams.n_pos_per_embd() != 4) {
+        note(LLAMA_FLASHPREFILL_ROUTE_DENSE_UNSUPPORTED);
+        return llm_fp_pre::DENSE;
+    }
+    if (role_out != nullptr) {
+        *role_out = role;
+    }
+    return llm_fp_pre::WANT;
+}
+
+static bool llm_fp_is_required(const llama_flashprefill_config & cfg) {
+    return cfg.mode == LLAMA_FLASHPREFILL_MODE_REQUIRED;
+}
+
+// ---- companion factory ----
+
+// Whole-ubatch dense decision with no companion: records the bounded reason
+// plus full-layer dense counts into the result summary (so metrics never
+// mislabels a plan-less graph), allocates nothing, syncs nothing.
+static std::unique_ptr<llm_graph_input_attn_flashprefill> llm_fp_deny(
+        llm_graph_result * res, const llama_hparams & hparams,
+        const llama_ubatch & ubatch, int32_t reason) {
+    if (res != nullptr) {
+        // Authoritative per-ubatch route data even with zero plans, so
+        // Metrics never re-derives from physical KV size: short sequences
+        // surrounded by idle KV report their own small shape + SHORT reason,
+        // not the global cache width. Visible/candidates stay 0 (no layout
+        // built); the reason explains why.
+        res->flashprefill_summary.dense_reason = reason;
+        res->flashprefill_summary.dense_layers = llm_fp_count_full_layers(hparams);
+        res->flashprefill_summary.ubatch_tokens = (int32_t) ubatch.n_tokens;
+        if (reason == LLM_FP_DENSE_FULL_PREFIX) {
+            // Actual handled rows for the FULL_PREFIX bucket (generic layer
+            // loop over eligible full layers), so the dense total grows even
+            // with no companion and zero plans. Never physical-KV derived.
+            int64_t dr = 0;
+            for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                if (llm_fp_layer_eligible(hparams, (int) il)) {
+                    dr += (int64_t) ubatch.n_tokens * (int64_t) hparams.n_head(il);
+                }
+            }
+            res->flashprefill_summary.designed_dense_rows = dr;
+        }
+    }
+    return nullptr;
+}
+
+std::unique_ptr<llm_graph_input_attn_flashprefill> llm_graph_input_attn_flashprefill::build_if_wanted(
+        ggml_context * ctx0,
+        const llama_ubatch & ubatch,
+        const llama_hparams & hparams,
+        const llama_cparams & cparams,
+        const llama_kv_cache_context * mctx_cur,
+        ggml_backend_sched_t sched,
+        bool reserve_sizing,
+        llm_graph_result * res) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const llama_flashprefill_config & cfg = cparams.flashprefill;
+    if (!llm_fp_is_enabled(cparams) || mctx_cur == nullptr || ubatch.n_tokens == 0) {
+        return llm_fp_deny(res, hparams, ubatch, LLAMA_FLASHPREFILL_ROUTE_DENSE_OFF);
+    }
+    const auto * rows = llm_fp_rows_of(cparams);
+    const bool snapshot = (rows != nullptr) && llm_fp_is_snapshot_rows(*rows, ubatch);
+    const bool want_reserve = reserve_sizing || snapshot;
+    const uint32_t hq  = hparams.n_head();
+    const uint32_t hkv = hparams.n_head_kv();
+    if (hq == 0 || hkv == 0 || hq % hkv != 0) {
+        return llm_fp_deny(res, hparams, ubatch, LLAMA_FLASHPREFILL_ROUTE_DENSE_UNSUPPORTED);
+    }
+    const uint32_t gqa = hq / hkv;
+    // First full-attention layer fixes the uniform head dims for the key;
+    // per-layer enforcement in try_build keeps non-uniform models dense.
+    int il_first = -1;
+    for (int il = 0; (uint32_t) il < hparams.n_layer(); ++il) {
+        if (!hparams.is_recr(il) && !hparams.is_swa(il)) {
+            il_first = il;
+            break;
+        }
+    }
+    if (il_first < 0) {
+        return llm_fp_deny(res, hparams, ubatch, LLAMA_FLASHPREFILL_ROUTE_DENSE_OFF); // no full-attention layer
+    }
+    // Reserve probe inputs (pure; also reused for the live-vs-reserve fit).
+    uint32_t n_ctx_cells = 0, q_rsv = 0;
+    if (!llm_fp_reserve_probe_inputs(cparams, hparams, ubatch, &n_ctx_cells, &q_rsv)) {
+        return llm_fp_deny(res, hparams, ubatch, LLAMA_FLASHPREFILL_ROUTE_DENSE_OFF);
+    }
+    llm_fp_reserve_caps rsv;
+    std::string rsv_err;
+    if (!llm_fp_reserve_caps_for(cfg, n_ctx_cells, q_rsv, hq, hkv, gqa, &rsv, &rsv_err)) {
+        throw std::runtime_error(std::string("flashprefill reserve: ") + rsv_err);
+    }
+    // Cache tensor dims/dtype at build (uniform per context; per-layer
+    // enforcement in try_build throws on drift, every mode).
+    ggml_tensor * k_probe = mctx_cur->get_k(ctx0, il_first);
+    ggml_tensor * v_probe = mctx_cur->get_v(ctx0, il_first);
+    const int32_t dk = (int32_t) k_probe->ne[0];
+    const int32_t dv = (int32_t) v_probe->ne[0];
+    const int32_t k_type = (int32_t) k_probe->type;
+    const int32_t v_type = (int32_t) v_probe->type;
+    if (dk <= 0 || dv <= 0) {
+        // Degenerate cache dims are corruption, not policy: always loud,
+        // so the can_reuse probe can never disagree with the build.
+        throw std::runtime_error("flashprefill: degenerate KV head dims (corrupt cache)");
+    }
+    const int variant = llm_fp_backend_variant(sched, nullptr);
+    auto out = std::make_unique<llm_graph_input_attn_flashprefill>(hparams, cparams, mctx_cur);
+    out->cur_rows = cparams.flashprefill_rows;
+    if (want_reserve) {
+        // Reserve sizing: worst-case caps, zero counts, never runs. No
+        // layout build (the synthetic ubatch was never applied); unknown
+        // boundaries are sized, never guessed known. Tensor and key share
+        // identical bucketed caps (never raw vs bucketed mixes).
+        const uint32_t rf = llm_fp_bucket(rsv.f);
+        const uint32_t rr = llm_fp_bucket(rsv.r);
+        const uint32_t ru = llm_fp_bucket(rsv.u);
+        const uint32_t rc = llm_fp_bucket(rsv.c);
+        int64_t meta_words = 0;
+        if (ggml_flashprefill_metadata_words(rf, rr, ru, rc, &meta_words) != GGML_FLASHPREFILL_OK) {
+            throw std::runtime_error("flashprefill reserve: metadata words overflow");
+        }
+        out->meta = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, meta_words);
+        ggml_set_input(out->meta);
+        out->st_meta.assign((size_t) meta_words, 0);
+        if (ggml_flashprefill_metadata_init(out->st_meta.data(), meta_words,
+                    (int64_t) rf, (int64_t) rr, (int64_t) ru, (int64_t) rc,
+                    dk, dv, (int32_t) hkv, (int32_t) q_rsv, (int32_t) hq) != GGML_FLASHPREFILL_OK) {
+            throw std::runtime_error("flashprefill reserve: metadata init failed");
+        }
+        if (ggml_flashprefill_metadata_set_counts(out->st_meta.data(), meta_words, 0, 0, 0, 0) != GGML_FLASHPREFILL_OK) {
+            throw std::runtime_error("flashprefill reserve: zero counts failed");
+        }
+        out->key.mode = cfg.mode;
+        out->key.tail_scope = cfg.tail_scope;
+        out->key.block_q = cfg.block_q;
+        out->key.block_k = cfg.block_k;
+        out->key.sink_blocks = cfg.sink_blocks;
+        out->key.window_blocks = cfg.window_blocks;
+        out->key.dense_tail_tiles = cfg.dense_tail_tiles;
+        out->key.min_kv = cfg.min_kv;
+        out->key.full_attn_layers = cfg.full_attn_layers;
+        out->key.mean_correction = cfg.mean_correction;
+        out->key.exact_all = cfg.exact_all;
+        out->key.role = LLAMA_FLASHPREFILL_ROLE_PREFILL;
+        out->key.is_rerot = false;
+        out->key.reserve_sizing = true;
+        out->key.n_tokens = q_rsv;
+        out->key.f_cap = rf;
+        out->key.r_cap = rr;
+        out->key.u_cap = ru;
+        out->key.c_cap = rc;
+        out->key.n_tiles = rsv.t;
+        out->key.max_sel_pair = llm_fp_bucket(rsv.maxsel);
+        out->key.u_layout_cap = llm_fp_bucket(rsv.u);
+        out->key.n_groups = q_rsv;
+        out->key.dk = dk;
+        out->key.dv = dv;
+        out->key.n_kv_heads = (int32_t) hkv;
+        out->key.n_q_heads = (int32_t) hq;
+        out->key.k_type = k_type;
+        out->key.v_type = v_type;
+        out->key.n_pos = (int32_t) hparams.n_pos_per_embd();
+        out->key.backend_variant = variant;
+        out->key_valid = true;
+        out->built_summary.n_tiles = (int32_t) rsv.t;
+        out->built_summary.f_cap = (int32_t) out->key.f_cap;
+        out->built_summary.r_cap = (int32_t) out->key.r_cap;
+        out->built_summary.u_cap = (int32_t) out->key.u_cap;
+        out->built_summary.c_cap = (int32_t) out->key.c_cap;
+        out->built_summary.max_sel_pair = (int32_t) rsv.maxsel;
+        out->built_summary.n_groups = 0; // reserve never runs: counts stay zero, caps above
+        out->built_summary.ubatch_tokens = (int32_t) ubatch.n_tokens;
+        out->built_summary.scratch_bytes = (uint64_t) ggml_nbytes(out->meta); // shared meta only
+        const auto t1 = std::chrono::steady_clock::now();
+        out->stat_layout_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        return out;
+    }
+    // Live path.
+    int32_t role = LLAMA_FLASHPREFILL_ROLE_UNKNOWN;
+    bool backend_ok = false;
+    int32_t pre_reason = LLAMA_FLASHPREFILL_ROUTE_DENSE_OFF;
+    const llm_fp_pre pre = llm_fp_prescreen(ubatch, hparams, cparams, sched, rows, &role, &backend_ok, &pre_reason);
+    if (pre == llm_fp_pre::DENSE) {
+        return llm_fp_deny(res, hparams, ubatch, pre_reason);
+    }
+    if (pre == llm_fp_pre::UNSUPPORTED) {
+        if (llm_fp_is_required(cfg)) {
+            throw std::runtime_error("flashprefill: eligible prefill has no sparse backend (required)");
+        }
+        return llm_fp_deny(res, hparams, ubatch, LLAMA_FLASHPREFILL_ROUTE_DENSE_UNSUPPORTED);
+    }
+    // NOTE: no min_kv gate here on global padded get_n_kv — idle KV is not
+    // visible coverage. The honest visible gate runs post-pack on
+    // layout-derived incidences below, mirroring the can_reuse probe.
+    // Full-prefix early deny (orphan-input guard): full_attn_layers covers
+    // every eligible full layer, so no layer could consume a companion.
+    // Deny with FULL_PREFIX instead of building metadata no op references
+    // (the scheduler would never allocate it). Designed dense in every
+    // mode, including REQUIRED.
+    {
+        const int32_t n_full = llm_fp_count_full_layers(hparams);
+        if (n_full > 0 && (uint64_t) n_full <= (uint64_t) cfg.full_attn_layers) {
+            return llm_fp_deny(res, hparams, ubatch, LLM_FP_DENSE_FULL_PREFIX);
+        }
+    }
+    const llama_flashprefill_layout_params lp = llm_fp_layout_params_for(cfg, cparams);
+    std::string build_err;
+    if (!mctx_cur->flashprefill_build_current_layout(role, lp, &build_err)) {
+        const std::string why = mctx_cur->flashprefill_get_layout().error;
+        if (!why.empty()) {
+            throw std::runtime_error(std::string("flashprefill layout: ") + why);
+        }
+        if (llm_fp_is_required(cfg)) {
+            throw std::runtime_error("flashprefill: eligible prefill has no sparse layout (required)");
+        }
+        return llm_fp_deny(res, hparams, ubatch, LLM_FP_DENSE_NO_LAYOUT);
+    }
+    const llama_flashprefill_layout & layout = mctx_cur->flashprefill_get_layout();
+    if (!layout.eligible) {
+        if (!layout.error.empty()) {
+            throw std::runtime_error(std::string("flashprefill layout: ") + layout.error);
+        }
+        if (llm_fp_is_required(cfg)) {
+            throw std::runtime_error("flashprefill: eligible prefill has no sparse layout (required)");
+        }
+        return llm_fp_deny(res, hparams, ubatch, LLM_FP_DENSE_NO_LAYOUT);
+    }
+    {
+        std::string verr;
+        if (!layout.validate(layout.n_kv_at_build, &verr)) {
+            throw std::runtime_error(std::string("flashprefill layout invalid: ") + verr);
+        }
+    }
+    // Admission bound (resource invariant): the pool must stay summary-scale,
+    // never a full F32 KV mirror (Fworst == K is forbidden). Admitted shapes
+    // are bounded by the fragment budget at ACTUAL resident K with the same
+    // seam/run allowances as reserve (4 membership/phase/visibility seams
+    // per BN block + 65 run heads + base); at BN=128 the worst admitted pool
+    // is ~4/128 of the resident KV token count times the F32/quant width
+    // ratio. Beyond bound: dense AUTO (high estimated cost), explicit
+    // resource error REQUIRED. All legal refs retained via dense fallback;
+    // descriptors are never truncated. Reserve uses the identical bound at
+    // n_ctx probe width, so live admission implies reserve fit.
+    {
+        uint32_t n_streams = 1;
+        for (const auto & fr : layout.fragments) {
+            if (fr.stream + 1 > n_streams) {
+                n_streams = fr.stream + 1;
+            }
+        }
+        llama_flashprefill_fragment_budget admit;
+        std::string admit_err;
+        if (!llama_flashprefill_admission_budget_for(layout.n_kv_at_build, cfg.block_k,
+                    n_streams, ubatch.n_tokens, &admit, &admit_err)) {
+            if (llm_fp_is_required(cfg)) {
+                throw std::runtime_error(std::string("flashprefill admission overflow (required): ") + admit_err);
+            }
+            return llm_fp_deny(res, hparams, ubatch, LLAMA_FLASHPREFILL_ROUTE_DENSE_CAPACITY);
+        }
+        if (layout.n_fragments() > admit.n_fragments) {
+            if (llm_fp_is_required(cfg)) {
+                throw std::runtime_error("flashprefill: fragment count beyond admitted bound (required, resource)");
+            }
+            return llm_fp_deny(res, hparams, ubatch, LLM_FP_DENSE_HIGH_COST); // highly fragmented: dense keeps every ref
+        }
+    }
+    if (layout.block_k != cfg.block_k || layout.n_queries() != ubatch.n_tokens) {
+        throw std::runtime_error("flashprefill: layout/policy shape mismatch (stale layout)");
+    }
+    llm_fp_pack pack;
+    std::string pack_err;
+    const llm_fp_pack_rc prc = llm_fp_pack_live(layout, *rows, cfg, hq, hkv, gqa, ubatch.n_tokens, &pack, &pack_err);
+    if (prc == LL_FP_PACK_CORRUPT) {
+        throw std::runtime_error(std::string("flashprefill pack: ") + pack_err);
+    }
+    if (prc == LL_FP_PACK_OVERFLOW) {
+        if (llm_fp_is_required(cfg)) {
+            throw std::runtime_error(std::string("flashprefill pack overflow (required): ") + pack_err);
+        }
+        return llm_fp_deny(res, hparams, ubatch, LLAMA_FLASHPREFILL_ROUTE_DENSE_CAPACITY);
+    }
+    // Visible gate on layout-derived incidences (pack.visible_tokens), never
+    // the global padded get_n_kv: short sequences surrounded by idle KV
+    // report their own small shape. Mirrors the can_reuse probe exactly.
+    {
+        const uint32_t vis32 = pack.visible_tokens > (uint64_t) UINT32_MAX
+            ? UINT32_MAX : (uint32_t) pack.visible_tokens;
+        const auto rr = llama_flashprefill::route_for_role(&cfg, role, vis32, backend_ok);
+        if (rr != LLAMA_FLASHPREFILL_ROUTE_SPARSE && rr != LLAMA_FLASHPREFILL_ROUTE_EXACT_ALL) {
+            return llm_fp_deny(res, hparams, ubatch, rr);
+        }
+    }
+    // All-forced (zero sparse rows, no exact_all): every row is exact-tail,
+    // so the new path would do dense work at sparse overhead. Stay dense
+    // like the probe; exact_all keeps the new path (rows are EXACT_ALL).
+    if (pack.sparse_rows == 0 && !cfg.exact_all) {
+        return llm_fp_deny(res, hparams, ubatch, LLAMA_FLASHPREFILL_ROUTE_DENSE_TAIL);
+    }
+    // Bucketed caps; live actuals must fit the reserve measurement or the
+    // submit could not have been reserved (dense AUTO, throw REQUIRED).
+    const uint32_t f_cap = llm_fp_bucket((uint32_t) layout.n_fragments());
+    const uint32_t r_cap = llm_fp_bucket((uint32_t) pack.rows.size());
+    const uint32_t u_cap = llm_fp_bucket((uint32_t) pack.uses.size());
+    const uint32_t c_cap = llm_fp_bucket((uint32_t) pack.cells.size());
+    const uint32_t maxsel_cap = llm_fp_bucket((uint32_t) pack.max_sel);
+    const uint32_t g_cap = llm_fp_bucket((uint32_t) pack.n_groups);
+    const uint32_t u_layout_cap = llm_fp_bucket(layout.n_uses());
+    if (f_cap > llm_fp_bucket(rsv.f) || r_cap > llm_fp_bucket(rsv.r) ||
+        u_cap > llm_fp_bucket(rsv.u) || c_cap > llm_fp_bucket(rsv.c)) {
+        if (llm_fp_is_required(cfg)) {
+            throw std::runtime_error("flashprefill: live caps exceed reserve (required, DENSE_CAPACITY)");
+        }
+        return llm_fp_deny(res, hparams, ubatch, LLAMA_FLASHPREFILL_ROUTE_DENSE_CAPACITY);
+    }
+    int64_t meta_words = 0;
+    if (ggml_flashprefill_metadata_words(f_cap, r_cap, u_cap, c_cap, &meta_words) != GGML_FLASHPREFILL_OK) {
+        if (llm_fp_is_required(cfg)) {
+            throw std::runtime_error("flashprefill: metadata words overflow (required)");
+        }
+        return llm_fp_deny(res, hparams, ubatch, LLAMA_FLASHPREFILL_ROUTE_DENSE_CAPACITY);
+    }
+    const bool has_groups = !pack.qpos.empty();
+    const uint32_t n_tiles = (uint32_t) pack.n_tiles;
+    // Group positions use the native DDVR pairing: q_pos is [g_cap, n_pos]
+    // flattened with coordinate k at k*g_cap (IMRoPE text rule (p,p,p,0) for
+    // n_pos==4); the Q gather covers the full capacity with zero tails.
+    const int64_t n_pos = (int64_t) hparams.n_pos_per_embd();
+    if (has_groups && n_pos != 1 && n_pos != 4) {
+        throw std::runtime_error("flashprefill: group positions need n_pos 1 or 4");
+    }
+    out->meta = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, meta_words);
+    ggml_set_input(out->meta);
+    if (has_groups) {
+        out->q_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) g_cap * n_pos);
+        ggml_set_input(out->q_pos);
+        out->q_gather = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) g_cap);
+        ggml_set_input(out->q_gather);
+    }
+    out->st_meta.assign((size_t) meta_words, 0);
+    if (has_groups) {
+        out->st_qpos.assign((size_t) g_cap * (size_t) n_pos, 0);
+        out->st_gather.assign((size_t) g_cap, 0);
+    }
+    int32_t * md = out->st_meta.data();
+    if (ggml_flashprefill_metadata_init(md, meta_words,
+                (int64_t) f_cap, (int64_t) r_cap, (int64_t) u_cap, (int64_t) c_cap,
+                dk, dv, (int32_t) hkv, pack.n_groups, (int32_t) hq) != GGML_FLASHPREFILL_OK) {
+        throw std::runtime_error("flashprefill: metadata init failed (corrupt caps)");
+    }
+    if (ggml_flashprefill_metadata_set_counts(md, meta_words,
+                (int64_t) layout.n_fragments(), (int64_t) pack.rows.size(),
+                (int64_t) pack.uses.size(), (int64_t) pack.cells.size()) != GGML_FLASHPREFILL_OK) {
+        throw std::runtime_error("flashprefill: metadata counts failed (corrupt pack)");
+    }
+    for (uint32_t f = 0; f < layout.n_fragments(); ++f) {
+        const auto & fr = layout.fragments[f];
+        if (fr.logical_block > (uint32_t) INT32_MAX) {
+            throw std::runtime_error("flashprefill: logical block out of I32 range");
+        }
+        // Wire fragments are uniform membership/phase: the global boundary
+        // flag stays 0 even when the owner diagnostic (boundary_partial) is
+        // set for some query. Partial visibility rides per-use subrange +
+        // MANDATORY, from which selectors derive tile-level cand_full and
+        // force partial columns. A global flag would wrongly force exact in
+        // every tile, including later fully-legal ones (upstream call
+        // selector breaks on large ubatches). The owner diagnostic is left
+        // untouched (never erased); only the wire encoding stays uniform.
+        const int32_t flags = 0;
+        if (ggml_flashprefill_metadata_set_frag(md, meta_words, (int64_t) f,
+                    (int64_t) pack.frag_base[f],
+                    (int64_t) fr.token_count, (int32_t) fr.logical_block,
+                    (int32_t) llama_flashprefill_layout::wire_domain(fr.domain), flags) != GGML_FLASHPREFILL_OK) {
+            throw std::runtime_error("flashprefill: metadata frag failed (corrupt pack)");
+        }
+    }
+    for (size_t i = 0; i < pack.rows.size(); ++i) {
+        const auto & r = pack.rows[i];
+        const int32_t flags = r.forced ? GGML_FLASHPREFILL_ROW_FLAG_DENSE_FORCE : 0;
+        if (ggml_flashprefill_metadata_set_row(md, meta_words, (int64_t) i,
+                    r.src_q, r.kv_head, r.log_pos, r.tile, r.pbegin, r.pend, flags, r.q_head) != GGML_FLASHPREFILL_OK) {
+            throw std::runtime_error("flashprefill: metadata row failed (corrupt pack)");
+        }
+    }
+    for (size_t i = 0; i < pack.uses.size(); ++i) {
+        const auto & u = pack.uses[i];
+        int32_t flags = u.flags;
+        if (flags != GGML_FLASHPREFILL_USE_FLAG_MANDATORY && flags != 0) {
+            throw std::runtime_error("flashprefill: metadata use flag corrupt");
+        }
+        if (ggml_flashprefill_metadata_set_use(md, meta_words, (int64_t) i,
+                    u.frag, u.tile, u.kv_head, u.q_group, u.sub_off, u.sub_count, flags, u.src_q) != GGML_FLASHPREFILL_OK) {
+            throw std::runtime_error("flashprefill: metadata use failed (corrupt pack)");
+        }
+    }
+    for (size_t i = 0; i < pack.cells.size(); ++i) {
+        if (ggml_flashprefill_metadata_set_cell(md, meta_words, (int64_t) i, pack.cells[i]) != GGML_FLASHPREFILL_OK) {
+            throw std::runtime_error("flashprefill: metadata cell failed (corrupt pack)");
+        }
+    }
+    if (has_groups) {
+        // Native DDVR pairing: coordinate k lives at k*g_cap (IMRoPE text
+        // rule (p,p,p,0) for n_pos==4); gather tails stay 0 (query 0,
+        // deterministic, unreferenced by actual use groups).
+        const size_t gc = (size_t) g_cap;
+        for (int32_t g = 0; g < pack.n_groups; ++g) {
+            const int32_t p = pack.qpos[(size_t) g];
+            out->st_qpos[(size_t) g] = p;
+            if (n_pos == 4) {
+                out->st_qpos[gc + (size_t) g]         = p;
+                out->st_qpos[gc * 2 + (size_t) g]     = p;
+                out->st_qpos[gc * 3 + (size_t) g]     = 0;
+            }
+            out->st_gather[(size_t) g] = (int32_t) layout.groups[(size_t) g].query_index;
+        }
+    }
+    out->key.mode = cfg.mode;
+    out->key.tail_scope = cfg.tail_scope;
+    out->key.block_q = cfg.block_q;
+    out->key.block_k = cfg.block_k;
+    out->key.sink_blocks = cfg.sink_blocks;
+    out->key.window_blocks = cfg.window_blocks;
+    out->key.dense_tail_tiles = cfg.dense_tail_tiles;
+    out->key.min_kv = cfg.min_kv;
+    out->key.full_attn_layers = cfg.full_attn_layers;
+    out->key.mean_correction = cfg.mean_correction;
+    out->key.exact_all = cfg.exact_all;
+    out->key.role = role;
+    out->key.is_rerot = layout.is_rerot != 0;
+    out->key.reserve_sizing = false;
+    out->key.n_tokens = ubatch.n_tokens;
+    out->key.f_cap = f_cap;
+    out->key.r_cap = r_cap;
+    out->key.u_cap = u_cap;
+    out->key.c_cap = c_cap;
+    out->key.n_tiles = n_tiles;
+    out->key.max_sel_pair = maxsel_cap;
+    out->key.u_layout_cap = u_layout_cap;
+    out->key.n_groups = (uint32_t) pack.n_groups;
+    out->key.dk = dk;
+    out->key.dv = dv;
+    out->key.n_kv_heads = (int32_t) hkv;
+    out->key.n_q_heads = (int32_t) hq;
+    out->key.k_type = k_type;
+    out->key.v_type = v_type;
+    out->key.n_pos = (int32_t) hparams.n_pos_per_embd();
+    out->key.backend_variant = variant;
+    out->key_valid = true;
+    out->built_cells_epoch = layout.cells_epoch;
+    out->built_n_kv = layout.n_kv_at_build;
+    out->last_sparse_rows = pack.sparse_rows;
+    out->last_forced_rows = pack.forced_rows;
+    out->built_summary.n_tiles = (int32_t) n_tiles;
+    out->built_summary.n_fragments = (int32_t) layout.n_fragments();
+    out->built_summary.sparse_rows = pack.sparse_rows;
+    out->built_summary.dense_rows = pack.forced_rows;
+    out->built_summary.ubatch_tokens = (int32_t) ubatch.n_tokens;
+    out->built_summary.visible_tokens = (int64_t) pack.visible_tokens;
+    out->built_summary.expected_sparse_rows = pack.sparse_rows;
+    out->built_summary.expected_forced_rows = pack.forced_rows;
+    out->built_summary.n_rows = (int32_t) pack.rows.size();
+    out->built_summary.n_uses = (int32_t) pack.uses.size();
+    out->built_summary.n_cells = (int32_t) pack.cells.size();
+    out->built_summary.n_groups = pack.n_groups;
+    out->built_summary.max_sel_pair = (int32_t) pack.max_sel;
+    out->built_summary.f_cap = (int32_t) f_cap;
+    out->built_summary.r_cap = (int32_t) r_cap;
+    out->built_summary.u_cap = (int32_t) u_cap;
+    out->built_summary.c_cap = (int32_t) c_cap;
+    // Shared-input bytes only (real tensor capacities; per-layer pinned
+    // plans and live pools accumulate via record, never multiplied here).
+    out->built_summary.scratch_bytes =
+        (uint64_t) ggml_nbytes(out->meta) +
+        (out->q_pos   != nullptr ? (uint64_t) ggml_nbytes(out->q_pos)   : 0u) +
+        (out->q_gather != nullptr ? (uint64_t) ggml_nbytes(out->q_gather) : 0u);
+    const auto t1 = std::chrono::steady_clock::now();
+    out->stat_layout_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    return out;
+}
+
+bool llm_graph_input_attn_flashprefill::wants_companion(
+        const llm_graph_params & params,
+        const llama_kv_cache_context * attn) {
+    // Had-none stability probe: answers whether these params would carry a
+    // companion, so a missing companion reuses instead of rebuild-looping —
+    // and so a fixed-capacity dense->sparse transition actually happens.
+    // Eligibility can NOT depend on a layout cache populated only by graph
+    // rebuilds (that deadlocks: dense reuses forever because no layout was
+    // ever built). So when the cheap gates pass, this probe triggers the
+    // shared owner build (build_current_layout; the later rebuild hits the
+    // same keyed planning cache, no duplicate planning work), then applies
+    // the same pure policy checks as the build path, with layout-derived
+    // visible counts (never the global padded get_n_kv). Returns true only
+    // for an actual new sparse route; short/tail/full-N/caps stay dense.
+    // Hard errors return true to force a rebuild, where the build throws
+    // loudly instead of hiding inside a dense reuse.
+    const llama_cparams & cparams = params.cparams;
+    const llama_ubatch & ubatch = params.ubatch;
+    const llama_hparams & hparams = params.hparams;
+    const llama_flashprefill_config & cfg = cparams.flashprefill;
+    const bool required = llm_fp_is_required(cfg);
+    if (!llm_fp_is_enabled(cparams) || attn == nullptr || ubatch.n_tokens == 0) {
+        return false;
+    }
+    const auto * rows = llm_fp_rows_of(cparams);
+    int32_t role = LLAMA_FLASHPREFILL_ROLE_UNKNOWN;
+    bool backend_ok = false;
+    if (llm_fp_prescreen(ubatch, hparams, cparams, params.sched, rows, &role, &backend_ok) != llm_fp_pre::WANT) {
+        return false;
+    }
+    if (!backend_ok) {
+        return required; // build would throw-required; force the rebuild so it does
+    }
+    const uint32_t hq  = hparams.n_head();
+    const uint32_t hkv = hparams.n_head_kv();
+    if (hq == 0 || hkv == 0 || hq % hkv != 0) {
+        return false;
+    }
+    const uint32_t gqa = hq / hkv;
+    {
+        // Mirror the build's layer gates exactly (or dense reuses loop
+        // against a denying build): no full layers at all, or the full
+        // prefix covers everything — both deny with no companion.
+        bool any_full = false;
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (!hparams.is_recr(il) && !hparams.is_swa(il)) {
+                any_full = true;
+                break;
+            }
+        }
+        if (!any_full) {
+            return false;
+        }
+        const int32_t n_full = llm_fp_count_full_layers(hparams);
+        if (n_full > 0 && (uint64_t) n_full <= (uint64_t) cfg.full_attn_layers) {
+            return false; // full prefix covers everything: deny, no companion
+        }
+    }
+    const llama_flashprefill_layout_params lp = llm_fp_layout_params_for(cfg, cparams);
+    std::string build_err;
+    if (!attn->flashprefill_build_current_layout(role, lp, &build_err)) {
+        if (!attn->flashprefill_get_layout().error.empty()) {
+            return true; // hard error: rebuild surfaces it loudly
+        }
+        return required; // ineligible layout: build throws-required, else stay dense
+    }
+    const llama_flashprefill_layout & layout = attn->flashprefill_get_layout();
+    if (!layout.eligible) {
+        if (!layout.error.empty()) {
+            return true;
+        }
+        return required;
+    }
+    {
+        std::string verr;
+        if (!layout.validate(layout.n_kv_at_build, &verr)) {
+            return true; // corrupt: rebuild throws loudly
+        }
+    }
+    if (layout.block_k != cfg.block_k || layout.n_queries() != ubatch.n_tokens) {
+        return true; // stale shape: rebuild throws loudly
+    }
+    // Admission bound (same call as build).
+    {
+        uint32_t n_streams = 1;
+        for (const auto & fr : layout.fragments) {
+            if (fr.stream + 1 > n_streams) {
+                n_streams = fr.stream + 1;
+            }
+        }
+        llama_flashprefill_fragment_budget admit;
+        std::string admit_err;
+        if (!llama_flashprefill_admission_budget_for(layout.n_kv_at_build, cfg.block_k,
+                    n_streams, ubatch.n_tokens, &admit, &admit_err)) {
+            return required;
+        }
+        if (layout.n_fragments() > admit.n_fragments) {
+            return required;
+        }
+    }
+    // Tail shape: all-forced (zero sparse rows) stays dense like the build
+    // deny; anything else proceeds. Full dry pack (no wire emission).
+    {
+        llm_fp_pack probe;
+        std::string probe_err;
+        const llm_fp_pack_rc prc = llm_fp_pack_live(
+            layout, *rows, cfg, hq, hkv, gqa, ubatch.n_tokens, &probe, &probe_err, true);
+        if (prc == LL_FP_PACK_CORRUPT) {
+            return true; // corrupt: rebuild throws loudly
+        }
+        if (prc == LL_FP_PACK_OVERFLOW) {
+            return required;
+        }
+        // Visible gate on the dry pack's layout-derived incidences (the exact
+        // value the build will see) — never the global padded get_n_kv, so
+        // short sequences surrounded by idle KV report honestly.
+        {
+            const uint32_t vis32 = probe.visible_tokens > (uint64_t) UINT32_MAX
+                ? UINT32_MAX : (uint32_t) probe.visible_tokens;
+            const auto rr = llama_flashprefill::route_for_role(&cfg, role, vis32, backend_ok);
+            if (rr != LLAMA_FLASHPREFILL_ROUTE_SPARSE && rr != LLAMA_FLASHPREFILL_ROUTE_EXACT_ALL) {
+                return false;
+            }
+        }
+        if (probe.sparse_rows == 0 && !cfg.exact_all) {
+            return false;
+        }
+        // Capacity estimates vs reserve (same bounds as build): exceed keeps
+        // the dense graph in AUTO, forces the rebuild-throw in REQUIRED.
+        uint32_t n_ctx_cells = 0, q_rsv = 0;
+        if (!llm_fp_reserve_probe_inputs(cparams, hparams, ubatch, &n_ctx_cells, &q_rsv)) {
+            return false;
+        }
+        llm_fp_reserve_caps rsv;
+        std::string rsv_err;
+        if (!llm_fp_reserve_caps_for(cfg, n_ctx_cells, q_rsv, hq, hkv, gqa, &rsv, &rsv_err)) {
+            return required;
+        }
+        // Same bucket discipline as build (monotonic: estimate-fits implies
+        // actual-fits, so no rebuild loop; estimate-miss stays dense, safe).
+        const uint64_t w_est = (uint64_t) layout.uses.size() * (uint64_t) hkv *
+            (uint64_t) llm_fp_tile_fanout(gqa, cfg.block_k);
+        const uint64_t c_est = (uint64_t) layout.n_fragments() * (uint64_t) cfg.block_k;
+        const uint64_t r_exact = (uint64_t) ubatch.n_tokens * (uint64_t) hq;
+        bool over = llm_fp_bucket(layout.n_fragments()) > llm_fp_bucket(rsv.f);
+        over = over || r_exact > (uint64_t) UINT32_MAX ||
+            llm_fp_bucket((uint32_t) r_exact) > llm_fp_bucket(rsv.r);
+        over = over || w_est > (uint64_t) UINT32_MAX ||
+            llm_fp_bucket((uint32_t) w_est) > llm_fp_bucket(rsv.u);
+        over = over || c_est > (uint64_t) UINT32_MAX ||
+            llm_fp_bucket((uint32_t) c_est) > llm_fp_bucket(rsv.c);
+        if (over) {
+            return required;
+        }
+    }
+    return true;
+}
+
+bool llm_graph_input_attn_flashprefill::submit_guards_ok(const llama_ubatch & ubatch, std::string * error) const {
+    // Cheap submit-time guards (freshness, key topology, n_kv, counts<=caps).
+    // Full layout validation + checked packing ran once at plan generation;
+    // the expensive GGML validator never runs per submit (oracle/tests only).
+    auto fail = [&](const char * msg) {
+        if (error != nullptr) {
+            *error = msg;
+        }
+        return false;
+    };
+    if (!active() || mctx == nullptr) {
+        return fail("flashprefill submit: inactive input");
+    }
+    if (ubatch.n_tokens != key.n_tokens && !key.reserve_sizing) {
+        return fail("flashprefill submit: token count changed");
+    }
+    const llama_flashprefill_layout & layout = mctx->flashprefill_get_layout();
+    if (!layout.eligible || !mctx->flashprefill_layout_is_fresh()) {
+        return fail("flashprefill submit: stale layout");
+    }
+    if (mctx->get_n_kv() != built_n_kv) {
+        return fail("flashprefill submit: n_kv drifted");
+    }
+    if (layout.n_queries() != ubatch.n_tokens) {
+        return fail("flashprefill submit: query count changed");
+    }
+    if (layout.n_fragments() > key.f_cap) {
+        return fail("flashprefill submit: fragments exceed cap");
+    }
+    {
+        // Same wire-use estimate as reuse (compact uses x kv-head fan-out x
+        // sound tile straddle, checked 64-bit).
+        const uint32_t gqa_now =
+            (key.n_kv_heads > 0 && key.n_q_heads > 0) ? (uint32_t) key.n_q_heads / (uint32_t) key.n_kv_heads : 1u;
+        const uint64_t west = (uint64_t) layout.uses.size() *
+            (uint64_t) (key.n_kv_heads > 0 ? key.n_kv_heads : 1) *
+            (uint64_t) llm_fp_tile_fanout(gqa_now, cparams.flashprefill.block_q);
+        if (west > (uint64_t) key.u_cap) {
+            return fail("flashprefill submit: uses exceed cap");
+        }
+    }
+    return true;
+}
+
+void llm_graph_input_attn_flashprefill::set_input(const llama_ubatch * ubatch) {
+    if (!active() || key.reserve_sizing || ubatch == nullptr) {
+        return; // reserve graphs never run; inactive graphs skip entirely
+    }
+    if (!used_by_graph) {
+        // No sparse layer consumed the metadata (all-designed dense or AUTO
+        // fallback): the scheduler never allocated it, so uploading would
+        // hit a null buffer. Skip silently; the summary reason (FULL_PREFIX
+        // / UNSUPPORTED) already describes the route.
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string guard_err;
+    if (!submit_guards_ok(*ubatch, &guard_err)) {
+        throw std::runtime_error(std::string("flashprefill submit: ") + guard_err);
+    }
+    const llama_flashprefill_layout & layout = mctx->flashprefill_get_layout();
+    const auto & rows_ptr = (cur_rows != nullptr) ? cur_rows : cparams.flashprefill_rows;
+    if (rows_ptr == nullptr || rows_ptr->size() != (size_t) ubatch->n_tokens) {
+        throw std::runtime_error("flashprefill submit: row snapshot unavailable (stale reuse)");
+    }
+    const uint32_t hq  = (uint32_t) key.n_q_heads;
+    const uint32_t hkv = (uint32_t) key.n_kv_heads;
+    const uint32_t gqa = hq / hkv;
+    llm_fp_pack pack;
+    std::string pack_err;
+    const llm_fp_pack_rc prc = llm_fp_pack_live(
+        layout, *rows_ptr, cparams.flashprefill, hq, hkv, gqa, ubatch->n_tokens, &pack, &pack_err);
+    if (prc != LL_FP_PACK_OK) {
+        // Submit cannot fall back (topology fixed): any pack failure is a
+        // fail-closed throw, every mode. Reuse should have rebuilt first.
+        throw std::runtime_error(std::string("flashprefill submit pack: ") + pack_err);
+    }
+    // Exact submit guards against the build-time caps/buckets.
+    if ((uint32_t) pack.rows.size()  > key.r_cap ||
+        (uint32_t) pack.uses.size()  > key.u_cap ||
+        (uint32_t) pack.cells.size() > key.c_cap ||
+        (uint32_t) pack.max_sel > key.max_sel_pair ||
+        pack.n_tiles != (int64_t) key.n_tiles ||
+        (uint32_t) pack.n_groups > ((q_pos != nullptr) ? (uint32_t) q_pos->ne[0] : (uint32_t) key.n_groups)) {
+        throw std::runtime_error("flashprefill submit: repack exceeds build caps (stale reuse)");
+    }
+    std::fill(st_meta.begin(), st_meta.end(), 0);
+    int32_t * md = st_meta.data();
+    const int64_t meta_words = (int64_t) st_meta.size();
+    if (ggml_flashprefill_metadata_init(md, meta_words,
+                (int64_t) key.f_cap, (int64_t) key.r_cap, (int64_t) key.u_cap, (int64_t) key.c_cap,
+                key.dk, key.dv, key.n_kv_heads, pack.n_groups, key.n_q_heads) != GGML_FLASHPREFILL_OK) {
+        throw std::runtime_error("flashprefill submit: metadata init failed");
+    }
+    if (ggml_flashprefill_metadata_set_counts(md, meta_words,
+                (int64_t) layout.n_fragments(), (int64_t) pack.rows.size(),
+                (int64_t) pack.uses.size(), (int64_t) pack.cells.size()) != GGML_FLASHPREFILL_OK) {
+        throw std::runtime_error("flashprefill submit: metadata counts failed");
+    }
+    for (uint32_t f = 0; f < layout.n_fragments(); ++f) {
+        const auto & fr = layout.fragments[f];
+        // Uniform wire fragments (see build site): global boundary flag 0;
+        // partial visibility rides per-use MANDATORY. Owner flag untouched.
+        const int32_t flags = 0;
+        if (ggml_flashprefill_metadata_set_frag(md, meta_words, (int64_t) f,
+                    (int64_t) pack.frag_base[f], (int64_t) fr.token_count,
+                    (int32_t) fr.logical_block,
+                    (int32_t) llama_flashprefill_layout::wire_domain(fr.domain), flags) != GGML_FLASHPREFILL_OK) {
+            throw std::runtime_error("flashprefill submit: metadata frag failed");
+        }
+    }
+    for (size_t i = 0; i < pack.rows.size(); ++i) {
+        const auto & r = pack.rows[i];
+        const int32_t flags = r.forced ? GGML_FLASHPREFILL_ROW_FLAG_DENSE_FORCE : 0;
+        if (ggml_flashprefill_metadata_set_row(md, meta_words, (int64_t) i,
+                    r.src_q, r.kv_head, r.log_pos, r.tile, r.pbegin, r.pend, flags, r.q_head) != GGML_FLASHPREFILL_OK) {
+            throw std::runtime_error("flashprefill submit: metadata row failed");
+        }
+    }
+    for (size_t i = 0; i < pack.uses.size(); ++i) {
+        const auto & u = pack.uses[i];
+        if (ggml_flashprefill_metadata_set_use(md, meta_words, (int64_t) i,
+                    u.frag, u.tile, u.kv_head, u.q_group, u.sub_off, u.sub_count, u.flags, u.src_q) != GGML_FLASHPREFILL_OK) {
+            throw std::runtime_error("flashprefill submit: metadata use failed");
+        }
+    }
+    for (size_t i = 0; i < pack.cells.size(); ++i) {
+        if (ggml_flashprefill_metadata_set_cell(md, meta_words, (int64_t) i, pack.cells[i]) != GGML_FLASHPREFILL_OK) {
+            throw std::runtime_error("flashprefill submit: metadata cell failed");
+        }
+    }
+    ggml_backend_tensor_set(meta, st_meta.data(), 0, ggml_nbytes(meta));
+    if (q_pos != nullptr && q_gather != nullptr && !pack.qpos.empty()) {
+        // Native strided pairing (coordinate k at k*g_cap, IMRoPE text rule
+        // for n_pos==4); tails stay zeroed (deterministic, unreferenced).
+        if ((uint32_t) pack.n_groups > (uint32_t) q_pos->ne[0] / (uint32_t) key.n_pos) {
+            throw std::runtime_error("flashprefill submit: groups exceed qpos capacity");
+        }
+        std::fill(st_qpos.begin(), st_qpos.end(), 0);
+        std::fill(st_gather.begin(), st_gather.end(), 0);
+        const size_t gc = (size_t) q_pos->ne[0] / (size_t) key.n_pos;
+        for (int32_t g = 0; g < pack.n_groups; ++g) {
+            const int32_t p = pack.qpos[(size_t) g];
+            st_qpos[(size_t) g] = p;
+            if (key.n_pos == 4) {
+                st_qpos[gc + (size_t) g]     = p;
+                st_qpos[gc * 2 + (size_t) g] = p;
+                st_qpos[gc * 3 + (size_t) g] = 0;
+            }
+            st_gather[(size_t) g] = (int32_t) layout.groups[(size_t) g].query_index;
+        }
+        ggml_backend_tensor_set(q_pos, st_qpos.data(), 0, ggml_nbytes(q_pos));
+        ggml_backend_tensor_set(q_gather, st_gather.data(), 0, ggml_nbytes(q_gather));
+    }
+    last_sparse_rows = pack.sparse_rows;
+    last_forced_rows = pack.forced_rows;
+    built_summary.sparse_rows = pack.sparse_rows;
+    built_summary.dense_rows = pack.forced_rows;
+    built_summary.visible_tokens = (int64_t) pack.visible_tokens;
+    built_summary.expected_sparse_rows = pack.sparse_rows;
+    built_summary.expected_forced_rows = pack.forced_rows;
+    built_summary.n_rows = (int32_t) pack.rows.size();
+    built_summary.n_uses = (int32_t) pack.uses.size();
+    built_summary.n_cells = (int32_t) pack.cells.size();
+    built_summary.n_groups = pack.n_groups;
+    built_summary.max_sel_pair = (int32_t) pack.max_sel;
+    const auto t1 = std::chrono::steady_clock::now();
+    stat_layout_us += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+}
+
+bool llm_graph_input_attn_flashprefill::can_reuse(const llm_graph_params & params) {
+    // Refresh the owned row snapshot from the CURRENT params first (Main):
+    // tail coordinates/epochs/counts are submit data, never topology, and
+    // must never pin the prior ubatch through the stale build-time copy.
+    cur_rows = params.cparams.flashprefill_rows;
+    if (!key_valid) {
+        return false;
+    }
+    if (params.flashprefill_reserve_sizing != key.reserve_sizing) {
+        return false; // reserve graphs never alias live graphs
+    }
+    const llama_ubatch & ub = params.ubatch;
+    const uint32_t expect_n = key.reserve_sizing
+        ? key.n_tokens
+        : ub.n_tokens;
+    if (key.reserve_sizing) {
+        uint32_t n_ctx_cells = 0, q_rsv = 0;
+        if (!llm_fp_reserve_probe_inputs(params.cparams, params.hparams, ub, &n_ctx_cells, &q_rsv)) {
+            return false;
+        }
+        if (q_rsv != expect_n) {
+            return false;
+        }
+    } else if (ub.n_tokens != expect_n) {
+        return false;
+    }
+    {
+        // Policy topology vs the build-time key (allow_reuse compared the
+        // full configs first; this keeps the input self-consistent).
+        const auto & fc = params.cparams.flashprefill;
+        if (fc.mode != key.mode || fc.tail_scope != key.tail_scope || fc.block_q != key.block_q ||
+            fc.block_k != key.block_k || fc.sink_blocks != key.sink_blocks ||
+            fc.window_blocks != key.window_blocks || fc.dense_tail_tiles != key.dense_tail_tiles ||
+            fc.min_kv != key.min_kv || fc.full_attn_layers != key.full_attn_layers ||
+            fc.mean_correction != key.mean_correction || fc.exact_all != key.exact_all) {
+            return false;
+        }
+    }
+    if (key.reserve_sizing) {
+        // Reserve graphs never run and never build a layout: caps are pure
+        // in (config, ctx cells, reserve queries, dims). Reuse on those
+        // alone; the synthetic snapshot is covered by allow_reuse already.
+        if (params.cparams.n_ctx_kv != cparams.n_ctx_kv ||
+            params.cparams.n_ctx    != cparams.n_ctx    ||
+            params.cparams.n_ubatch != cparams.n_ubatch) {
+            return false;
+        }
+        if ((int64_t) params.hparams.n_head()    != (int64_t) key.n_q_heads  ||
+            (int64_t) params.hparams.n_head_kv() != (int64_t) key.n_kv_heads ||
+            (int64_t) params.hparams.n_embd_head_k() != (int64_t) key.dk     ||
+            (int64_t) params.hparams.n_embd_head_v() != (int64_t) key.dv ||
+            (int64_t) params.hparams.n_pos_per_embd() != (int64_t) key.n_pos) {
+            return false;
+        }
+        bool backend_ok = false;
+        if (llm_fp_backend_variant(params.sched, &backend_ok) != key.backend_variant || !backend_ok) {
+            return false;
+        }
+        return true;
+    }
+    // Rows topology: presence, size, role, known flag. Coordinates and
+    // intervals are submit data (refreshed above), never topology. Tile
+    // numbering is domain-partitioned, so recompute the exact tile count
+    // from the current rows (cheap, no layout): a different domain
+    // partition must rebuild even inside the same buckets.
+    if (cur_rows == nullptr || cur_rows->size() != (size_t) ub.n_tokens) {
+        return false;
+    }
+    {
+        if (key.n_kv_heads <= 0 || key.n_q_heads <= 0 || key.block_q == 0) {
+            return false;
+        }
+        const uint32_t gqa_now = (uint32_t) key.n_q_heads / (uint32_t) key.n_kv_heads;
+        uint64_t tiles_now = 0;
+        if (gqa_now == 0 ||
+            !llm_fp_domain_layout(*cur_rows, (uint32_t) key.block_q, gqa_now, nullptr, nullptr, nullptr, &tiles_now)) {
+            return false;
+        }
+        if (tiles_now != (uint64_t) key.n_tiles) {
+            return false;
+        }
+    }
+    if (llm_fp_uniform_role(*cur_rows) != key.role) {
+        return false;
+    }
+    // Layout topology (get-only): fresh, eligible, same buckets/role/shape.
+    if (mctx == nullptr) {
+        return false;
+    }
+    const llama_flashprefill_layout & layout = mctx->flashprefill_get_layout();
+    if (!layout.eligible || !mctx->flashprefill_layout_is_fresh()) {
+        return false;
+    }
+    const auto & lkey = mctx->flashprefill_layout_key();
+    if (lkey.role != key.role || lkey.block_k != params.cparams.flashprefill.block_k ||
+        lkey.n_tokens != ub.n_tokens || lkey.want_exact_rows != 0) {
+        return false;
+    }
+    if ((layout.is_rerot != 0) != key.is_rerot) {
+        return false;
+    }
+    if (llm_fp_bucket(layout.n_fragments()) != key.f_cap) {
+        return false;
+    }
+    {
+        // Wire-use estimate (uses x kv-head fan-out x sound tile straddle,
+        // checked 64-bit): exceeding the cap forces a rebuild.
+        const uint32_t gqa_now =
+            (key.n_kv_heads > 0 && key.n_q_heads > 0) ? (uint32_t) key.n_q_heads / (uint32_t) key.n_kv_heads : 0u;
+        const uint64_t west = (uint64_t) layout.uses.size() *
+            (uint64_t) (key.n_kv_heads > 0 ? key.n_kv_heads : 1) *
+            (uint64_t) llm_fp_tile_fanout(gqa_now, params.cparams.flashprefill.block_q);
+        if (west > (uint64_t) key.u_cap) {
+            return false;
+        }
+    }
+    {
+        uint64_t cells_est = (uint64_t) layout.n_fragments() * (uint64_t) cparams.flashprefill.block_k;
+        if (cells_est > (uint64_t) key.c_cap) {
+            return false;
+        }
+    }
+    if ((uint64_t) ub.n_tokens * (uint64_t) key.n_q_heads > (uint64_t) key.r_cap) {
+        return false;
+    }
+    if (llm_fp_bucket((uint32_t) layout.uses.size()) != key.u_layout_cap) {
+        return false;
+    }
+    {
+        // Capacity-static Q: gather/pos tensors are g_cap-shaped with zero
+        // tails, so the actual group count is submit data (refilled), not
+        // topology. Presence must match the build (tensor set) and the count
+        // must fit the cap; kernels bound by the header actual.
+        const bool has_groups_now = layout.n_groups() != 0;
+        if (has_groups_now != (q_pos != nullptr)) {
+            return false;
+        }
+        const uint32_t g_now = has_groups_now ? layout.n_groups() : (uint32_t) ub.n_tokens;
+        if (g_now > llm_fp_bucket(key.n_groups)) {
+            return false;
+        }
+    }
+    // Head/dim mapping + backend variant (topology).
+    if ((int64_t) params.hparams.n_head()    != (int64_t) key.n_q_heads  ||
+        (int64_t) params.hparams.n_head_kv() != (int64_t) key.n_kv_heads ||
+        (int64_t) params.hparams.n_embd_head_k() != (int64_t) key.dk     ||
+        (int64_t) params.hparams.n_embd_head_v() != (int64_t) key.dv ||
+        (int64_t) params.hparams.n_pos_per_embd() != (int64_t) key.n_pos) {
+        return false;
+    }
+    bool backend_ok = false;
+    if (llm_fp_backend_variant(params.sched, &backend_ok) != key.backend_variant || !backend_ok) {
+        return false;
+    }
+    return true;
+}
+
+// ---- sparse attention dispatch (per full-attention layer) ----
+
+ggml_tensor * llm_graph_context::try_build_attn_flashprefill(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor * q_raw_or_null,
+        ggml_tensor * q_roped_or_null,
+        ggml_tensor * k_roped,
+        ggml_tensor * v,
+        int *         sections_or_null,
+        ggml_tensor * kq_b,
+        ggml_tensor * sinks,
+        float         kq_scale,
+        int           il) const {
+    llm_graph_input_attn_flashprefill * fp = (inp != nullptr) ? inp->get_fp() : nullptr;
+    if (fp == nullptr || !fp->active() || k_roped == nullptr || v == nullptr) {
+        return nullptr; // OFF / shape-gated / policy-dense: no footprint, no counts
+    }
+    const llm_graph_fp_key & key = fp->reuse_key();
+    const llama_flashprefill_config & cfg = cparams.flashprefill;
+    const bool required = llm_fp_is_required(cfg);
+    const bool reserve = fp->is_reserve();
+    // Dense counters only for live graphs (reserve graphs are discarded).
+    // Designed reasons (SWA / full-attention prefix) count separately and
+    // authoritatively; capability fallbacks count under dense_layers (and
+    // throw in required mode via need_throw instead of arriving silent).
+    // A rerot fallback with absent legacy spans is safe: build_rerot_q_groups
+    // lazily ensures them on the real fallback path (never on sparse).
+    auto use_dense = [&](bool count, bool designed = false) -> ggml_tensor * {
+        if (count && !reserve) {
+            if (designed) {
+                res->flashprefill_summary.designed_dense_layers += 1;
+                res->flashprefill_summary.designed_dense_rows +=
+                    (int64_t) ubatch.n_tokens * (int64_t) hparams.n_head(il);
+            } else {
+                res->flashprefill_summary.dense_layers += 1;
+            }
+        }
+        return nullptr;
+    };
+    auto need_throw = [&](const char * msg) -> ggml_tensor * {
+        if (required) {
+            throw std::runtime_error(msg);
+        }
+        return use_dense(true);
+    };
+    // Designed-dense per-layer gates (silent, every mode). Recurrent layers
+    // never arrive here (separate linear helper); the check is a backstop.
+    if (hparams.is_recr(il)) {
+        return use_dense(false);
+    }
+    if (hparams.is_swa(il)) {
+        return use_dense(true, true);
+    }
+    // Widened compare (never narrow the user count): a huge prefix keeps
+    // every eligible layer dense; eligible_index is small and non-negative.
+    if ((uint32_t) flashprefill_eligible_full_index(il) < cfg.full_attn_layers) {
+        return use_dense(true, true);
+    }
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return use_dense(false); // bypassed upstream; backstop
+    }
+    if (cparams.embeddings || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE || ubatch.embd != nullptr) {
+        return use_dense(false);
+    }
+    if (kq_b != nullptr) {
+        // Special KQ bias (ALiBi-style addends and friends): the sparse
+        // kernels take scale/softcap only, never additive bias.
+        return need_throw("flashprefill: special KQ bias keeps dense (required)");
+    }
+    const uint32_t Hq  = hparams.n_head(il);
+    const uint32_t Hkv = hparams.n_head_kv(il);
+    if (Hq == 0 || Hkv == 0 || Hq % Hkv != 0) {
+        return need_throw("flashprefill: non-GQA layer (required)");
+    }
+    if ((int64_t) Hq != (int64_t) key.n_q_heads || (int64_t) Hkv != (int64_t) key.n_kv_heads) {
+        // Non-uniform head mapping across layers: shapes genuinely differ,
+        // so dense is correct (the shared input was keyed for il_first).
+        return need_throw("flashprefill: head mapping drifted (required)");
+    }
+    const bool is_rerot = key.is_rerot;
+    if (is_rerot && q_raw_or_null == nullptr) {
+        throw std::runtime_error("flashprefill: rerot route missing raw Q (hook bug)");
+    }
+    if (!is_rerot && q_roped_or_null == nullptr) {
+        throw std::runtime_error("flashprefill: ordinary route missing roped Q (hook bug)");
+    }
+    // Reserve mirrors live shapes: no sparse nodes where live stays dense.
+    if (!flashprefill_backend_supported()) {
+        return need_throw("flashprefill: eligible prefill has no sparse backend (required)");
+    }
+    const auto * mctx_cur = inp->mctx;
+    if (mctx_cur == nullptr) {
+        throw std::runtime_error("flashprefill: null KV context (hook bug)");
+    }
+    // Q form checks (ordinary: model-roped, single group per query). Head
+    // dim is enforced here so a mismatch routes dense/throws instead of
+    // tripping the constructor asserts below.
+    const int64_t Dk_exp = (int64_t) hparams.n_embd_head_k(il);
+    if (!is_rerot) {
+        if (q_roped_or_null->type != GGML_TYPE_F32) {
+            return need_throw("flashprefill: non-F32 Q (required)");
+        }
+        if (q_roped_or_null->ne[0] != Dk_exp ||
+            q_roped_or_null->ne[1] != (int64_t) Hq || q_roped_or_null->ne[2] != n_tokens) {
+            return need_throw("flashprefill: Q shape mismatch (required)");
+        }
+    } else {
+        if (reserve) {
+            throw std::runtime_error("flashprefill: reserve never takes the rerot route (hook bug)");
+        }
+        if (q_raw_or_null->type != GGML_TYPE_F32) {
+            return need_throw("flashprefill: non-F32 Q (required)");
+        }
+        if (q_raw_or_null->ne[0] != Dk_exp ||
+            q_raw_or_null->ne[1] != (int64_t) Hq || q_raw_or_null->ne[2] != n_tokens) {
+            return need_throw("flashprefill: Q shape mismatch (required)");
+        }
+        if (sections_or_null == nullptr) {
+            return need_throw("flashprefill: rerot route needs rope sections (required)");
+        }
+    }
+    // Fresh layout for live builds (cheap guards only; full validation ran
+    // once at plan generation). Group counts are submit data (Q tensors are
+    // capacity-static); only eligibility/freshness/shape bind the build.
+    if (!reserve) {
+        const llama_flashprefill_layout & layout = mctx_cur->flashprefill_get_layout();
+        if (!layout.eligible || !mctx_cur->flashprefill_layout_is_fresh()) {
+            throw std::runtime_error("flashprefill: stale layout at attention build");
+        }
+        if (layout.n_queries() != (uint32_t) n_tokens) {
+            throw std::runtime_error("flashprefill: layout/ubatch drift at attention build");
+        }
+        if (mctx_cur->get_n_kv() != fp->built_n_kv) {
+            throw std::runtime_error("flashprefill: n_kv drift at attention build");
+        }
+    }
+    // K/V rotations mirror build_attn (kv): k_rot on Q(resolved below) and
+    // K, v_rot on V pre-copy, inverse v_rot post-attention.
+    ggml_tensor * q_base = is_rerot ? q_raw_or_null : q_roped_or_null;
+    ggml_tensor * k_cur  = k_roped;
+    ggml_tensor * v_cur  = v;
+    if (inp->self_k_rot != nullptr) {
+        // Ordinary Q is already roped; rerot Q is roped per group below, so
+        // the InnerQ-style rotation applies after grouping in that branch.
+        if (!is_rerot) {
+            q_base = llama_mul_mat_hadamard(ctx0, q_base, inp->self_k_rot);
+        }
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+    }
+    if (inp->self_v_rot != nullptr) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    }
+    // Grouped Q [D, H, G]: ordinary identity (already roped, never
+    // re-roped) or rerot gather + single phased RoPE (never double).
+    ggml_tensor * q_grouped = nullptr;
+    if (!is_rerot) {
+        q_grouped = q_base;
+    } else {
+        // Capacity-static Q (native DDVR pairing): gather + RoPE cover the
+        // full group capacity; unused rows are 0/pos-0 (deterministic,
+        // unreferenced by actual use groups). Kernels bound by the header
+        // actual (meta.n_groups <= Q.ne[1]).
+        if (fp->q_gather == nullptr || fp->q_pos == nullptr) {
+            throw std::runtime_error("flashprefill: rerot route missing group tensors (hook bug)");
+        }
+        const int64_t head_dim = q_base->ne[0];
+        const int64_t g_cap = fp->q_gather->ne[0];
+        ggml_tensor * q_flat = ggml_reshape_2d(ctx0, q_base, head_dim * (int64_t) Hq, n_tokens);
+        ggml_tensor * qg = ggml_get_rows(ctx0, q_flat, fp->q_gather);
+        qg = ggml_reshape_3d(ctx0, qg, head_dim, (int64_t) Hq, g_cap);
+        cb(qg, "flashprefill_q_grouped_raw", il);
+        const int mode = static_cast<int>(rope_type);
+        // Full-capacity pos tensor (native pairing, no slicing): coordinate
+        // k at k*g_cap, IMRoPE text (p,p,p,0) for n_pos==4.
+        if (mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE || mode == GGML_ROPE_TYPE_VISION) {
+            qg = ggml_rope_multi(ctx0, qg, fp->q_pos, nullptr,
+                    n_rot, sections_or_null, mode, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow);
+        } else {
+            qg = ggml_rope_ext(ctx0, qg, fp->q_pos, nullptr,
+                    n_rot, mode, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow);
+        }
+        cb(qg, "flashprefill_q_grouped", il);
+        if (inp->self_k_rot != nullptr) {
+            qg = llama_mul_mat_hadamard(ctx0, qg, inp->self_k_rot);
+        }
+        q_grouped = qg;
+    }
+    // Store to KV cache; the pool ordering edges (k_dep/v_dep) carry the
+    // dependency as real graph edges, never source-order assumption.
+    // Nothing is expanded yet: co-expansion happens after the capability
+    // probe below, so an AUTO-dense fallback leaves no stray nodes behind
+    // (the dense path expands its own copies).
+    ggml_tensor * k_dep = mctx_cur->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il);
+    ggml_tensor * v_dep = mctx_cur->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il);
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v_cache = mctx_cur->get_v(ctx0, il);
+    // FA-convention layout mirror (build_attn_mha): the wire ops consume
+    // permuted K/V ([D, n_kv, Hkv, streams]), never raw cache views.
+    // Transposed-V caches stay dense (ctor ne-shape discipline; future
+    // kernel stride work), as do multi-stream caches (ctors require
+    // ne[3]==1; hybrid unified is 1).
+    if (v_cache->nb[1] > v_cache->nb[2]) {
+        return need_throw("flashprefill: transposed V cache keeps dense (required)");
+    }
+    k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+    v_cache = ggml_permute(ctx0, v_cache, 0, 2, 1, 3);
+    if (k->ne[3] != 1 || v_cache->ne[3] != 1) {
+        return need_throw("flashprefill: multi-stream cache keeps dense (required)");
+    }
+    // Dtype enforcement vs the build-time key (context-fixed; drift throws,
+    // every mode — never silently confused).
+    if (k->type != (ggml_type) key.k_type || v_cache->type != (ggml_type) key.v_type) {
+        throw std::runtime_error("flashprefill: KV dtype drifted (corrupt cache)");
+    }
+    if ((int64_t) k->ne[0] != (int64_t) key.dk || (int64_t) v_cache->ne[0] != (int64_t) key.dv) {
+        return need_throw("flashprefill: KV head dims drifted (required)");
+    }
+    // TurboQuant Q forward WHT mirrors the dense path exactly (RoPE -> WHT
+    // -> dot): pad per-head D to the 128 multiple, then forward transform
+    // with the inverse InnerQ scale. Non-turbo caches skip untouched.
+    ggml_tensor * q_wht = q_grouped;
+    const bool k_turbo =
+        k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0;
+    if (k_turbo) {
+        if (q_wht->ne[0] % 128 != 0) {
+            const int64_t pad = ((q_wht->ne[0] + 127) / 128) * 128 - q_wht->ne[0];
+            q_wht = ggml_pad(ctx0, q_wht, pad, 0, 0, 0);
+        }
+        if (!ggml_is_contiguous(q_wht)) {
+            q_wht = ggml_cont(ctx0, q_wht);
+        }
+        q_wht = ggml_turbo_wht(ctx0, q_wht, 0, 0, mctx_cur->get_turbo_innerq_scale_inv());
+    }
+    // Agreed wire Q: F32 [Dk, n_groups, Hq, 1]; O: [Dv, Hq, Nq, 1].
+    ggml_tensor * q4d = ggml_permute(ctx0, q_wht, 0, 2, 1, 3);
+    const int32_t dk = (int32_t) k->ne[0];
+    const int32_t dv = (int32_t) v_cache->ne[0];
+    const float softcap = hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f;
+    ggml_tensor * pool = ggml_flash_prefill_pool(ctx0, k, v_cache, fp->meta, k_dep, v_dep,
+            dk, dv, (int32_t) Hkv, (int64_t) key.f_cap);
+    cb(pool, "flashprefill_pool", il);
+    ggml_tensor * plan = ggml_flash_prefill_select(ctx0, q4d, pool, fp->meta,
+            (int64_t) key.n_tiles, (int64_t) Hkv, (int64_t) key.max_sel_pair,
+            kq_scale, cfg.alpha, softcap, cfg.exact_all ? 1 : 0, cfg.mean_correction);
+    cb(plan, "flashprefill_plan", il);
+    ggml_tensor * cur = ggml_flash_prefill_attn(ctx0, q4d, k, v_cache, pool, plan, fp->meta, sinks,
+            n_tokens, (int64_t) Hq, dv, kq_scale, softcap, cfg.mean_correction);
+    cb(cur, "flashprefill_attn", il);
+    // Backend op capability (frozen): real supports_op probes for all three
+    // ops on the intended side — never name-only. The intended side follows
+    // actual placement, not the offload preference alone (offload_kqv stays
+    // true by default even on CPU-only contexts): a GPU backend existing
+    // plus offload means GPU-resident K/V; otherwise CPU. Requiring the
+    // wrong side would falsely reject CPU references or scheduler-fallback
+    // across devices with full-KV transfers, so REQUIRED throws and AUTO
+    // keeps dense. Capable tensors are explicitly pinned (no mere
+    // any-GPU-supported + scheduler fallback). A null scheduler (unit
+    // tests) skips the probe as CPU-oracle.
+    ggml_backend_t fp_sel = nullptr;
+    if (sched != nullptr) {
+        bool cpu_ok = false, gpu_ok = false, gpu_present = false;
+        ggml_backend_t cpu_sel = nullptr, gpu_sel = nullptr;
+        const int nb = ggml_backend_sched_get_n_backends(sched);
+        for (int bi = 0; bi < nb; ++bi) {
+            ggml_backend_t b = ggml_backend_sched_get_backend(sched, bi);
+            if (b == nullptr) {
+                continue;
+            }
+            const char * nm = ggml_backend_name(b);
+            const bool is_cpu = (nm != nullptr && std::string(nm).find("CPU") != std::string::npos);
+            gpu_present = gpu_present || !is_cpu;
+            const bool all3 = ggml_backend_supports_op(b, pool) &&
+                              ggml_backend_supports_op(b, plan) &&
+                              ggml_backend_supports_op(b, cur);
+            if (!all3) {
+                continue;
+            }
+            if (is_cpu) {
+                cpu_ok = true;
+                if (cpu_sel == nullptr) {
+                    cpu_sel = b;
+                }
+            } else {
+                gpu_ok = true;
+                if (gpu_sel == nullptr) {
+                    gpu_sel = b;
+                }
+            }
+        }
+        const bool want_gpu = gpu_present && cparams.offload_kqv;
+        ggml_backend_t sel = want_gpu ? gpu_sel : cpu_sel;
+        const bool ok = want_gpu ? gpu_ok : cpu_ok;
+        if (!ok || sel == nullptr) {
+            return need_throw("flashprefill: no capable backend for pool/select/attn (required)");
+        }
+        fp_sel = sel;
+        ggml_backend_sched_set_tensor_backend(sched, pool, sel);
+        ggml_backend_sched_set_tensor_backend(sched, plan, sel);
+        ggml_backend_sched_set_tensor_backend(sched, cur, sel);
+    }
+    // The metadata is now referenced by live sparse nodes: mark consumed so
+    // submit uploads it. Layers that never reach here (dense fallbacks)
+    // leave it unmarked and submit skips the orphan upload.
+    fp->mark_used_by_graph();
+    // Co-expansion (split discipline): producers, copies and sparse nodes
+    // ride one graph region; k_dep/v_dep edges order cpy before pool.
+    ggml_build_forward_expand(gf, q_grouped);
+    ggml_build_forward_expand(gf, k_cur);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_dep);
+    ggml_build_forward_expand(gf, v_dep);
+    ggml_build_forward_expand(gf, pool);
+    ggml_build_forward_expand(gf, plan);
+    // TurboQuant V inverse WHT + asymmetric trim mirror the dense paths:
+    // undo the V rotation on the attention output, then extract the original
+    // V head dim (padded storage vs logical dim).
+    if (v_cache->type == GGML_TYPE_TURBO3_0 || v_cache->type == GGML_TYPE_TURBO4_0 ||
+        v_cache->type == GGML_TYPE_TURBO2_0) {
+        const bool k_is_turbo =
+            k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0;
+        const ggml_tensor * group_src = k_is_turbo ? k : v_cache;
+        const int turbo_group = (group_src->ne[0] % 128 == 0) ? 128 : 64;
+        if (cur->ne[0] % turbo_group == 0) {
+            if (!ggml_is_contiguous(cur)) {
+                cur = ggml_cont(ctx0, cur);
+            }
+            cur = ggml_turbo_wht(ctx0, cur, 1, turbo_group, mctx_cur->get_turbo_innerq_scale_inv());
+        }
+    }
+    {
+        const int64_t padded_v_head = v_cache->ne[0];
+        const int64_t orig_v_head = hparams.n_embd_head_v(il);
+        if (padded_v_head != orig_v_head) {
+            cur = ggml_reshape_3d(ctx0, cur, padded_v_head, (int64_t) Hq, n_tokens);
+            cur = ggml_view_3d(ctx0, cur, orig_v_head, (int64_t) Hq, n_tokens,
+                    cur->nb[1], cur->nb[2], 0);
+            cur = ggml_cont(ctx0, cur);
+            cur = ggml_reshape_2d(ctx0, cur, orig_v_head * (int64_t) Hq, n_tokens);
+        } else {
+            cur = ggml_reshape_2d(ctx0, cur, (int64_t) dv * (int64_t) Hq, n_tokens);
+        }
+    }
+    if (inp->self_v_rot != nullptr) {
+        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+    }
+    if (reserve) {
+        // Reserve measurement: identical route including transforms (same
+        // tensor lifetime/live ranges as runtime ON), zero metadata counts,
+        // never executed. Plan output-marked like live; no metrics, no
+        // summary pollution, no extra dense route from the caller.
+        ggml_set_output(plan);
+        return cur;
+    }
+    // First sparse layer seeds the shared-input bytes once (no per-layer
+    // multiplier on shared meta) plus caps/counts; every layer then records
+    // its pinned plan + live pool. Metrics reads plan headers once at the
+    // completion boundary; the scratch total needs no sync.
+    if (res->get_flashprefill_plans().empty()) {
+        res->flashprefill_summary.scratch_bytes = fp->built_summary.scratch_bytes;
+        res->flashprefill_summary.meta_bytes    = fp->built_summary.scratch_bytes;
+        res->flashprefill_summary.ubatch_tokens = fp->built_summary.ubatch_tokens;
+        res->flashprefill_summary.visible_tokens = fp->built_summary.visible_tokens;
+        res->flashprefill_summary.expected_sparse_rows = fp->built_summary.expected_sparse_rows;
+        res->flashprefill_summary.expected_forced_rows = fp->built_summary.expected_forced_rows;
+        res->flashprefill_summary.n_tiles = (int32_t) key.n_tiles;
+        res->flashprefill_summary.n_fragments = fp->built_summary.n_fragments;
+        res->flashprefill_summary.n_rows = fp->built_summary.n_rows;
+        res->flashprefill_summary.n_uses = fp->built_summary.n_uses;
+        res->flashprefill_summary.n_cells = fp->built_summary.n_cells;
+        res->flashprefill_summary.n_groups = fp->built_summary.n_groups;
+        res->flashprefill_summary.max_sel_pair = (int32_t) key.max_sel_pair;
+        res->flashprefill_summary.f_cap = (int32_t) key.f_cap;
+        res->flashprefill_summary.r_cap = (int32_t) key.r_cap;
+        res->flashprefill_summary.u_cap = (int32_t) key.u_cap;
+        res->flashprefill_summary.c_cap = (int32_t) key.c_cap;
+        res->flashprefill_summary.layout_us = fp->stat_layout_us;
+    }
+    res->record_flashprefill_plan(plan, pool, fp_sel, il, fp->last_sparse_rows, fp->last_forced_rows);
+    return cur;
 }

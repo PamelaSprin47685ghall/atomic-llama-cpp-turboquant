@@ -409,6 +409,9 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
     udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
     udata->output    .resize(n_tokens);
 
+    // NOTE: synthetic rows have no source batch, so source_row stays empty/null even when
+    // tracking is enabled. this also guarantees reserve reuse cannot observe a prior map.
+
     for (uint32_t s = 0; s < n_seqs; ++s) {
         udata->seq_idx[s] = s;
         udata->seq_id_unq.push_back(s);
@@ -438,6 +441,14 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
 
 const llama_batch & llama_batch_allocr::get_batch() const {
     return batch;
+}
+
+void llama_batch_allocr::set_source_row_tracking(bool enabled) {
+    track_source_rows = enabled;
+}
+
+bool llama_batch_allocr::get_source_row_tracking() const {
+    return track_source_rows;
 }
 
 uint32_t llama_batch_allocr::get_n_tokens() const {
@@ -721,6 +732,8 @@ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
 }
 
 void llama_batch_allocr::clear() {
+    // NOTE: track_source_rows is intentionally preserved here. the per-ubatch map lives
+    // only in each ubatch's data_t, so init/retry/reserve reuse cannot see a prior map.
     n_outputs = 0;
 
     batch = {};
@@ -764,6 +777,11 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->seq_id_unq.resize(0);
     udata->seq_idx   .resize(LLAMA_MAX_SEQ, -1);
     udata->output    .resize(n_tokens);
+
+    // OFF: no map allocation at all. ON: exact copy of the split indices, no reorder.
+    if (track_source_rows) {
+        udata->source_row.resize(n_tokens);
+    }
 
     udata->seq_id_data.reserve(n_tokens);
 
@@ -815,6 +833,14 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         }
     }
 
+    // single guarded copy: OFF executes no per-row work and allocates nothing.
+    // ON copies the split indices verbatim, preserving original input order per ubatch row.
+    if (track_source_rows) {
+        for (size_t i = 0; i < idxs.size(); ++i) {
+            udata->source_row[i] = idxs[i];
+        }
+    }
+
     llama_ubatch res {
         /*.b_equal_seqs =*/ equal_seqs,
         /*.n_tokens     =*/ n_tokens,
@@ -833,6 +859,12 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.output       =*/ udata->output.data(),
         /*.data         =*/ std::move(udata),
     };
+
+    // shared_ptr ownership matches the other ubatch arrays: the map lives in data and
+    // stays valid across moves and async graph execution. null when tracking is off.
+    if (track_source_rows && n_tokens > 0) {
+        res.source_row = res.data->source_row.data();
+    }
 
     if (debug > 0) {
         LLAMA_LOG_DEBUG("%s: added ubatch to split:\n", __func__);
@@ -880,6 +912,7 @@ void llama_batch_allocr::ubatch_print(const llama_ubatch & ubatch, int debug) {
         LLAMA_LOG_DEBUG("%s:   seq_id_unq = %s\n", __func__, ss_seq_id_unq.str().c_str());
         LLAMA_LOG_DEBUG("%s:   seq_idx    = %s\n", __func__, ss_seq_idx.str().c_str());
         LLAMA_LOG_DEBUG("%s:   output     = %p\n", __func__, (void *) ubatch.output);
+        LLAMA_LOG_DEBUG("%s:   source_row = %p\n", __func__, (void *) ubatch.source_row);
         LLAMA_LOG_DEBUG("%s:   n_outputs  = %d\n", __func__, n_outputs);
 
         if (debug > 0) {

@@ -2558,6 +2558,38 @@ int32_t llama_model_n_swa(const llama_model * model) {
     return model->hparams.n_swa;
 }
 
+// FlashPrefill fit sizing: maximum of one per-layer hparams value over the
+// KV-carrying layers (has_kv); 0 when no layer carries KV.
+static uint32_t llama_model_max_over_kv_layers(const llama_model * model, uint32_t (llama_hparams::*value)(uint32_t) const) {
+    uint32_t max_v = 0;
+    for (uint32_t il = 0; il < model->hparams.n_layer_all; ++il) {
+        if (!model->hparams.has_kv(il)) {
+            continue;
+        }
+        const uint32_t v = (model->hparams.*value)(il);
+        if (v > max_v) {
+            max_v = v;
+        }
+    }
+    return max_v;
+}
+
+int32_t llama_model_n_head_kv_max(const llama_model * model) {
+    return (int32_t) llama_model_max_over_kv_layers(model, &llama_hparams::n_head_kv);
+}
+
+int32_t llama_model_n_embd_head_k(const llama_model * model) {
+    return (int32_t) llama_model_max_over_kv_layers(model, &llama_hparams::n_embd_head_k);
+}
+
+int32_t llama_model_n_embd_head_v(const llama_model * model) {
+    return (int32_t) llama_model_max_over_kv_layers(model, &llama_hparams::n_embd_head_v);
+}
+
+int32_t llama_model_n_gqa_max(const llama_model * model) {
+    return (int32_t) llama_model_max_over_kv_layers(model, &llama_hparams::n_gqa);
+}
+
 
 uint32_t llama_model_n_cls_out(const struct llama_model * model) {
     return model->hparams.n_cls_out;

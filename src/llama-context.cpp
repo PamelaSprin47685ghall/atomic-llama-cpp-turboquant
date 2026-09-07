@@ -5,6 +5,11 @@
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
+// FlashPrefill V2 policy contract (PolicyCore owner). The src-internal header
+// forwards to the public include/llama-flashprefill.h; only the public C
+// structs/helpers are used here (no internal routing dependency in this slice).
+#include "llama-flashprefill.h"
+#include "llama-flashprefill-state.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-kv-cache.h"
@@ -21,16 +26,22 @@
 // below; the logical episode blob itself lives in tools/server/server-rerot.*.
 #include "../tools/server/server-rerot.h"
 
+#include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <numeric>
+#include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 //
@@ -468,6 +479,70 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+namespace {
+
+// Process-wide conservative context identity for FlashPrefill state
+// isolation. Shared by both constructors so every context in the process
+// gets a unique serial; 0 is never issued (reserved as "unknown"). The
+// serial is unique WITHIN this process only — it restarts at 1 in every
+// process, so it can never authorize a restore on its own (see the process
+// nonce below).
+uint64_t flashprefill_next_serial() {
+    static std::atomic<uint64_t> s_serial{1};
+    uint64_t id = s_serial.fetch_add(1, std::memory_order_relaxed);
+    if (id == 0) {
+        id = s_serial.fetch_add(1, std::memory_order_relaxed);
+    }
+    return id;
+}
+
+// Fixed 128-bit process nonce for FlashPrefill state identity (StatePolicy).
+// Generated once per process, and ONLY on first use by an enabled context —
+// OFF contexts never reach this function, so OFF pays no randomness cost.
+// Probabilistic anti-collision, clearly labeled: NOT a secret and NOT a
+// security boundary, just unguessable restart discrimination so the same
+// (serial, policy, adapter) tuple from a previous process lifetime (restart,
+// or another instance over the same model.desc string) cannot validate.
+// std::random_device preferred; hardened with time/address/counter/thread
+// entropy in case the device is deterministic on the platform. Zero words are
+// remapped to 1 (zero is reserved as never-initialized everywhere).
+std::pair<uint64_t, uint64_t> flashprefill_process_nonce() {
+    static const std::pair<uint64_t, uint64_t> nonce = [] {
+        uint64_t words[2] = {0, 0};
+        try {
+            std::random_device rd;
+            for (int w = 0; w < 2; ++w) {
+                for (int k = 0; k < 2; ++k) {
+                    words[w] = (words[w] << 32) | (uint64_t) rd();
+                }
+            }
+        } catch (...) {
+            words[0] = 0;
+            words[1] = 0;
+        }
+        // Harden: mix wall time, object addresses, thread id, and a counter
+        // through splitmix64 so even a deterministic rd() still separates
+        // processes and restarts.
+        static std::atomic<uint64_t> s_mix_ctr{0x9e3779b97f4a7c15ull};
+        for (int w = 0; w < 2; ++w) {
+            uint64_t z = words[w];
+            z += (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count();
+            z += (uint64_t) (uintptr_t) &words[w];
+            z += std::hash<std::thread::id>{}(std::this_thread::get_id());
+            z += s_mix_ctr.fetch_add(0x9e3779b97f4a7c15ull, std::memory_order_relaxed);
+            z += 0x9e3779b97f4a7c15ull;
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+            z =  z ^ (z >> 31);
+            words[w] = z != 0 ? z : 1u;
+        }
+        return std::make_pair(words[0], words[1]);
+    }();
+    return nonce;
+}
+
+} // namespace
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -686,6 +761,30 @@ llama_context::llama_context(
     cparams.n_pen_max = params.n_pen_max;
     cparams.n_brain_rows = params.n_person_max;
     cparams.n_hand_rows = params.n_pen_max;
+
+    // FlashPrefill V2 policy: immutable for the context lifetime.
+    // ConfigIntegration owns params.flashprefill (default OFF via
+    // llama_flashprefill_default_config()); strict-validate here so a broken
+    // config fails context creation instead of silently routing dense later.
+    cparams.flashprefill = params.flashprefill;
+    if (const llama_flashprefill_error fp_err = llama_flashprefill_validate_config(&cparams.flashprefill);
+            fp_err != LLAMA_FLASHPREFILL_OK) {
+        throw std::runtime_error(format("invalid flashprefill config: %s", llama_flashprefill_error_name(fp_err)));
+    }
+
+    // Conservative per-context identity: assigned only when the policy is
+    // enabled, 0 when OFF (OFF contexts use the legacy stateless path and
+    // carry no isolation identity — including no randomness: the process
+    // nonce is only generated for enabled contexts). The serial is unique
+    // within this process; the nonce fixes the process lifetime, and the
+    // envelope compares both exact. Construction-time only; no decode-path
+    // synchronization is introduced.
+    if (llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        fp_serial = flashprefill_next_serial();
+        const auto fp_nonce = flashprefill_process_nonce();
+        fp_nonce0 = fp_nonce.first;
+        fp_nonce1 = fp_nonce.second;
+    }
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -959,6 +1058,19 @@ llama_context::llama_context(const llama_model & model_in, const llama_cparams &
       t_load_us(0) {
     cparams.rerot_enabled = cp.rerot_enabled;
     cparams.rerot_frontier = cp.rerot_frontier;
+    // FlashPrefill: unit-test cparams may be zero-initialized (version 0),
+    // which is not a valid config. Normalize to default OFF instead of
+    // throwing so legacy control-plane tests keep working; the production
+    // constructor above strictly validates instead.
+    if (llama_flashprefill_validate_config(&cparams.flashprefill) != LLAMA_FLASHPREFILL_OK) {
+        cparams.flashprefill = llama_flashprefill_default_config();
+    }
+    if (llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        fp_serial = flashprefill_next_serial();
+        const auto fp_nonce = flashprefill_process_nonce();
+        fp_nonce0 = fp_nonce.first;
+        fp_nonce1 = fp_nonce.second;
+    }
     sched_need_reserve = false;
 }
 
@@ -1843,11 +1955,34 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     return true;
 }
 
-void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
+bool llama_context::flashprefill_adapter_change_allowed() const {
+    // Refuse only the genuinely unsafe combination: an enabled policy (stale
+    // KV would be consumed by approximate paths) atop an active episode
+    // (clearing would orphan lineage, leaving it would mix old-weight KV with
+    // new adapters). Everything else has a safe landing (OFF legacy behavior,
+    // or enabled-only clear + re-prefill), so it is allowed.
+    if (llama_flashprefill_is_enabled(&cparams.flashprefill) &&
+        cparams.rerot_enabled && llama_rerot_ctx_is_active(this)) {
+        return false;
+    }
+    return true;
+}
+
+bool llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
     if (adapters_lora_are_same(adapters, n_adapters, scales)) {
-        return;
+        return true;
+    }
+
+    // Effective change with nowhere safe to land: refuse BEFORE applying, with
+    // zero mutation (adapters, generation, KV, graph, and schedule untouched),
+    // so the in-flight coherent graph stays valid. The caller surfaces the
+    // existing error contract (C API: -1).
+    if (!flashprefill_adapter_change_allowed()) {
+        LLAMA_LOG_ERROR("%s: refusing LoRA change: FlashPrefill is enabled atop an active RERoT episode, where stale KV can neither be cleared nor reused — end the episode (or disable the policy) and retry\n",
+                __func__);
+        return false;
     }
 
     loras.reset(new llama_adapter_loras());
@@ -1858,7 +1993,14 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
         }
     }
 
+    // Effective adapter set changed: retire the FlashPrefill state identity
+    // (pre-switch blobs/RAM reject on load). Resident KV keeps baseline
+    // semantics — never deleted here; the server owns per-slot compatibility.
+    flashprefill_on_adapter_change();
+
     sched_need_reserve = true;
+
+    return true;
 }
 
 bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
@@ -1895,7 +2037,25 @@ bool llama_context::set_adapter_cvec(
                 int32_t   il_end) {
     LLAMA_LOG_DEBUG("%s: il_start = %d, il_end = %d\n", __func__, il_start, il_end);
 
+    // Same pre-apply refusal as set_adapters_lora: an effective cvec change
+    // with nowhere safe to land is refused with zero mutation (existing bool
+    // error contract: false). cvec has no identical-set fast path, so every
+    // call counts as effective once it would apply.
+    if (!flashprefill_adapter_change_allowed()) {
+        LLAMA_LOG_ERROR("%s: refusing cvec change: FlashPrefill is enabled atop an active RERoT episode, where stale KV can neither be cleared nor reused — end the episode (or disable the policy) and retry\n",
+                __func__);
+        return false;
+    }
+
     bool res = cvec->apply(model, data, len, n_embd, il_start, il_end);
+
+    // Only a successful apply mutates the effective adapters: failed applies
+    // change nothing and must not invalidate saved state. On success retire
+    // the FlashPrefill state identity (same rule as set_adapters_lora above;
+    // resident KV keeps baseline semantics, never deleted).
+    if (res) {
+        flashprefill_on_adapter_change();
+    }
 
     sched_need_reserve = true;
 
@@ -2296,6 +2456,703 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    // Ordinary external path: unknown execution role, conservative dense.
+    // Any snapshot from a previous explicit call never leaks into this one.
+    // OFF-gated single mode check: the config is immutable and validated at
+    // construction, so OFF implies empty snapshots/rows (no stale rows
+    // possible) and the clear is skipped entirely on the normal API path.
+    if (cparams.flashprefill.mode != LLAMA_FLASHPREFILL_MODE_OFF) {
+        flashprefill_clear_call();
+    }
+    return decode_impl(batch_inp);
+}
+
+int llama_context::decode_with_flashprefill(const llama_batch & batch_inp, const llama_flashprefill_exec * exec) {
+    // Explicit versioned path (public declaration owned by ConfigIntegration).
+    flashprefill_clear_call();
+    if (exec == nullptr) {
+        // NULL == ordinary dense (unknown roles); matches legacy decode.
+        return decode_impl(batch_inp);
+    }
+    // Validate + copy before any memory/graph state mutates or async work
+    // submits. Rejection returns -1 with the context untouched.
+    if (!flashprefill_attach_call(batch_inp, exec)) {
+        return -1;
+    }
+    return decode_impl(batch_inp);
+}
+
+void llama_context::flashprefill_clear_call() {
+    fp_rows_call.clear();
+    fp_rows_ubatch.clear();
+    fp_exec_active = false;
+    // Drop the graph-visible snapshot as well: every consumption site sets it
+    // before building graph params, so no stale rows can leak across calls.
+    cparams.flashprefill_rows.reset();
+}
+
+bool llama_context::flashprefill_bypassed() const {
+    // MTP contexts keep the pre-existing draft/verify attention path, and
+    // embedding/rerank pooling keeps the generation-independent path, no
+    // matter what row roles an explicit exec carries. Existing stage-specific
+    // MTP behavior and the TriAttention lifecycle are otherwise untouched.
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return true;
+    }
+    if (cparams.embeddings || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
+        return true;
+    }
+    return false;
+}
+
+bool llama_context::flashprefill_attach_call(const llama_batch & batch_inp, const llama_flashprefill_exec * exec) {
+    // Precondition: state cleared by the caller; exec non-NULL.
+    if (exec->version != LLAMA_FLASHPREFILL_EXEC_VERSION) {
+        LLAMA_LOG_ERROR("%s: flashprefill exec version mismatch (got %u, want %u)\n",
+                __func__, exec->version, (uint32_t) LLAMA_FLASHPREFILL_EXEC_VERSION);
+        return false;
+    }
+    if (exec->struct_size != sizeof(llama_flashprefill_exec)) {
+        LLAMA_LOG_ERROR("%s: flashprefill exec struct_size mismatch (got %u, want %zu)\n",
+                __func__, exec->struct_size, sizeof(llama_flashprefill_exec));
+        return false;
+    }
+    if (batch_inp.n_tokens < 0 || exec->n_rows != (uint32_t) batch_inp.n_tokens) {
+        LLAMA_LOG_ERROR("%s: flashprefill exec n_rows (%u) != batch n_tokens (%d)\n",
+                __func__, exec->n_rows, batch_inp.n_tokens);
+        return false;
+    }
+    if (llama_flashprefill_validate_exec(exec) != LLAMA_FLASHPREFILL_OK) {
+        LLAMA_LOG_ERROR("%s: flashprefill exec failed validation\n", __func__);
+        return false;
+    }
+    if (exec->n_rows == 0) {
+        return true; // empty view: nothing to copy, dense by construction
+    }
+    // Bypassed calls and OFF policy allocate no per-row arrays: dense path.
+    if (flashprefill_bypassed() || !llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        return true;
+    }
+    // Per-row validation: role/interval well-formedness plus sequence
+    // identity and logical-prompt boundary checks against this batch.
+    for (uint32_t i = 0; i < exec->n_rows; ++i) {
+        const llama_flashprefill_row & row = exec->rows[i];
+        if (llama_flashprefill_validate_row(&row) != LLAMA_FLASHPREFILL_OK) {
+            LLAMA_LOG_ERROR("%s: flashprefill row %u failed validation\n", __func__, i);
+            return false;
+        }
+        if (row.seq_id != LLAMA_FLASHPREFILL_SEQ_UNKNOWN) {
+            bool seq_match = false;
+            if (batch_inp.seq_id != nullptr && batch_inp.seq_id[i] != nullptr) {
+                const int32_t n_sid = batch_inp.n_seq_id != nullptr ? batch_inp.n_seq_id[i] : 1;
+                for (int32_t s = 0; s < n_sid; ++s) {
+                    if (row.seq_id == batch_inp.seq_id[i][s]) {
+                        seq_match = true;
+                        break;
+                    }
+                }
+            } else {
+                seq_match = (row.seq_id == 0); // batch default sequence is 0
+            }
+            if (!seq_match) {
+                LLAMA_LOG_ERROR("%s: flashprefill row %u seq_id %d not in batch row %u\n",
+                        __func__, i, row.seq_id, i);
+                return false;
+            }
+        }
+        if (row.prefill_known) {
+            if (row.prefill_begin < 0 || row.prefill_end <= row.prefill_begin) {
+                LLAMA_LOG_ERROR("%s: flashprefill row %u has invalid prefill interval [%d, %d)\n",
+                        __func__, i, row.prefill_begin, row.prefill_end);
+                return false;
+            }
+            if (row.logical_pos != LLAMA_FLASHPREFILL_POS_UNKNOWN &&
+                    (row.logical_pos < row.prefill_begin || row.logical_pos >= row.prefill_end)) {
+                LLAMA_LOG_ERROR("%s: flashprefill row %u logical_pos %d outside prefill interval [%d, %d)\n",
+                        __func__, i, row.logical_pos, row.prefill_begin, row.prefill_end);
+                return false;
+            }
+        }
+    }
+    // Owned copy before any async execution: the borrowed view may leave
+    // scope while GPU work is still in flight. Never stored as a pointer.
+    fp_rows_call.assign(exec->rows, exec->rows + exec->n_rows);
+    fp_exec_active = true;
+    return true;
+}
+
+bool llama_context::flashprefill_build_ubatch(const llama_ubatch & ubatch) {
+    fp_rows_ubatch.clear();
+    // Reset first: each ubatch publishes exactly its own rows, so a map-less
+    // ubatch can never inherit the previous ubatch's snapshot in its graph.
+    cparams.flashprefill_rows.reset();
+    if (!fp_exec_active || flashprefill_bypassed()) {
+        return true;
+    }
+    // Empty views and empty ubatches are legitimate dense (never a guess):
+    // an empty exec carries no rows, and synthetic reserve ubatches carry no
+    // source batch. Only a map-less ubatch WITH live rows is corruption.
+    if (fp_rows_call.empty() || ubatch.n_tokens == 0) {
+        return true;
+    }
+    // BatchIdentity owns the optional source-row map (llama_ubatch::source_row,
+    // nullptr == unavailable). A live enabled call without it cannot know
+    // which call rows survived a split/retry: explicit execution failure, not
+    // a silent fallback to dense (a corrupt-metadata error must never pass
+    // unnoticed). No half snapshot is left behind (cleared + reset above).
+    if (ubatch.source_row == nullptr) {
+        LLAMA_LOG_ERROR("%s: flashprefill source-row map missing for %u live rows (tracking disabled or synthetic reuse in the decode path)\n",
+                __func__, ubatch.n_tokens);
+        return false;
+    }
+    if (ubatch.n_tokens > fp_rows_call.size()) {
+        LLAMA_LOG_ERROR("%s: flashprefill ubatch wider than the call (%u tokens > %zu rows)\n",
+                __func__, ubatch.n_tokens, fp_rows_call.size());
+        fp_rows_ubatch.clear();
+        return false;
+    }
+    fp_rows_ubatch.reserve(ubatch.n_tokens);
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const int32_t src = ubatch.source_row[i];
+        if (src < 0 || (uint32_t) src >= fp_rows_call.size()) {
+            // Corrupt map entry: explicit execution failure with no half
+            // snapshot left behind — never silent fallback to dense.
+            LLAMA_LOG_ERROR("%s: flashprefill source-row %d out of range for ubatch row %u (%zu call rows)\n",
+                    __func__, src, i, fp_rows_call.size());
+            fp_rows_ubatch.clear();
+            cparams.flashprefill_rows.reset();
+            return false;
+        }
+        fp_rows_ubatch.push_back(fp_rows_call[(uint32_t) src]);
+    }
+    // Publish the owned snapshot to the graph slice: llm_graph_params copies
+    // cparams by value, so this ubatch's graph keeps its rows alive across
+    // async execution. Enabled-only; empty stays null (route dense).
+    if (!fp_rows_ubatch.empty()) {
+        cparams.flashprefill_rows =
+            std::make_shared<const std::vector<llama_flashprefill_row>>(fp_rows_ubatch);
+    }
+    return true;
+}
+
+uint64_t llama_context::flashprefill_policy_fingerprint() const {
+    // Sources: every approximation policy field (via PolicyCore's stable FNV
+    // over the frozen field order) + model identity (model desc string, which
+    // covers arch/type/params — a cfg-only key is explicitly NOT used, and the
+    // RERoT shape hash alone would not identify weights). Adapter domain is
+    // empty here by design: adapters attach mutably post-construction, so
+    // they cannot join this immutable lifetime key — adapter-aware identity
+    // lives in the state envelope (flashprefill_adapter_generation()) and
+    // the state cache key (flashprefill_state_cache_key()), owned by the
+    // StatePolicy slice. NOTE: model.desc() is NOT a weight hash and proves
+    // nothing about weights; cross-context durable restore is therefore
+    // rejected by the context-serial check in the envelope, and
+    // within-context RAM/checkpoint round-trips additionally require equal
+    // serial, fingerprint, and adapter generation.
+    const std::string model_id = model.desc();
+    uint64_t out = 0;
+    if (llama_flashprefill_fingerprint(&cparams.flashprefill, model_id.c_str(), nullptr, &out) !=
+            LLAMA_FLASHPREFILL_OK) {
+        return 0;
+    }
+    return out;
+}
+
+uint64_t llama_context::flashprefill_context_serial() const {
+    return fp_serial;
+}
+
+uint64_t llama_context::flashprefill_adapter_generation() const {
+    return fp_adapter_gen;
+}
+
+void llama_context::flashprefill_bump_adapter_generation() {
+    // Saturate at MAX instead of wrapping: consumers treat MAX as
+    // always-invalid (same discipline as CellGeneration), so a wrap would
+    // silently resurrect a stale identity. Bumping is idempotent-safe and
+    // touches one integer on the rare adapter-mutation path only.
+    if (fp_adapter_gen != std::numeric_limits<uint64_t>::max()) {
+        ++fp_adapter_gen;
+    }
+}
+
+void llama_context::flashprefill_on_adapter_change() {
+    // Identity bump only — FlashPrefill never deletes KV. Resident history
+    // keeps baseline semantics (the server owns per-slot LoRA/prompt
+    // compatibility; normal adapter switching neither clears nor re-prefills).
+    // Isolation across the switch comes from the retired generation: saved
+    // blobs pin the old generation and reject on load, the RAM prompt cache
+    // is dropped server-side via the retired state key, the setters below
+    // force graph/scheduler re-reservation (sched_need_reserve, baseline
+    // invalidation), and derived means are rebuilt per graph under the new
+    // generation. No sync, no clear; OFF behaves identically.
+    flashprefill_bump_adapter_generation();
+}
+
+uint64_t llama_context::flashprefill_state_cache_key() const {
+    // OFF contexts carry no isolation identity (legacy stateless path).
+    if (!llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        return 0;
+    }
+    const uint64_t policy_fp = flashprefill_policy_fingerprint();
+    if (policy_fp == 0 || fp_serial == 0 || fp_adapter_gen == 0) {
+        return 0;
+    }
+    return llama_flashprefill_state::state_cache_key(policy_fp, fp_serial, fp_adapter_gen);
+}
+
+const struct llama_flashprefill_config & llama_context::get_flashprefill_config() const {
+    return cparams.flashprefill;
+}
+
+uint32_t llama_context::flashprefill_call_rows() const {
+    return fp_exec_active ? (uint32_t) fp_rows_call.size() : 0;
+}
+
+const struct llama_flashprefill_row * llama_context::flashprefill_ubatch_rows(uint32_t * n_rows_out) const {
+    if (n_rows_out != nullptr) {
+        *n_rows_out = (uint32_t) fp_rows_ubatch.size();
+    }
+    return fp_rows_ubatch.empty() ? nullptr : fp_rows_ubatch.data();
+}
+
+llama_flashprefill_metrics::accum llama_context::flashprefill_metrics_snapshot() const {
+    return fp_metrics_accum;
+}
+
+bool llama_context::flashprefill_metrics_consume(llama_flashprefill_metrics::slice_delta & out) {
+    namespace fpmet = llama_flashprefill_metrics;
+    out = fpmet::slice_delta();
+    if (!llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        fp_metrics_mark = fp_metrics_accum;
+        return false;
+    }
+    const fpmet::slice_delta d = fpmet::accum_delta_since(fp_metrics_accum, fp_metrics_mark);
+    if (fpmet::slice_is_empty(d)) {
+        return false;
+    }
+    fp_metrics_mark = fp_metrics_accum;
+    out = d;
+    return true;
+}
+
+int llama_context::flashprefill_note_slice_success(
+        const llama_ubatch & ubatch, uint64_t layout_us, bool has_layout_us, bool plans_deferred,
+        int32_t graph_dense_reason) {
+    namespace fpmet = llama_flashprefill_metrics;
+    // OFF: no counting, no sizing work, no timer reads beyond the caller's
+    // single is_enabled check.
+    if (!llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        return 0;
+    }
+    const bool bypassed = flashprefill_bypassed();
+    if (!fp_exec_active && !bypassed) {
+        return 0; // ordinary dense call without an exec: not a flashprefill slice
+    }
+    // Model GQA fan-out for packed-row units (frozen dims; exact for the
+    // uniform-GQA models the sparse path admits). No KV reads here: SHORT
+    // and friends arrive as the authoritative graph verdict below, never
+    // inferred from global resident counts.
+    int32_t gqa_i = llama_model_n_gqa_max(&model);
+    if (gqa_i <= 0) {
+        gqa_i = 1;
+    }
+    const struct llama_flashprefill_row * rows =
+        fp_rows_ubatch.empty() ? nullptr : fp_rows_ubatch.data();
+    const uint32_t n_rows = (uint32_t) fp_rows_ubatch.size();
+    // Row-side staging only: plan totals/pool/scratch resolve at the
+    // end-of-call fold from this ubatch's queued reads (plans_deferred tells
+    // build_slice to skip the residual verdict). Dense verdicts come solely
+    // from graph_dense_reason (recorded for every ubatch, zero-plan ones
+    // included); required enforcement lives graph-side and is never
+    // second-guessed here.
+    fpmet::slice_delta delta;
+    const int32_t rc = fpmet::build_slice(delta, &cparams.flashprefill, rows, n_rows,
+            graph_dense_reason, (uint32_t) gqa_i, bypassed,
+            nullptr, 0, false, 0, 0, layout_us, has_layout_us,
+            plans_deferred);
+    if (rc != 0) {
+        LLAMA_LOG_ERROR("%s: flashprefill metrics slice failed (error %d), failing ubatch\n",
+                __func__, rc);
+        return rc;
+    }
+    // Stage (do NOT commit): the call-level commit below publishes pending
+    // into the cumulative ledger only when the whole decode_impl succeeds.
+    // A narrowed-batch retry after a partial failure therefore recounts only
+    // re-executed work — failed-call executions are never published. The
+    // empty guard also protects the live gauge from a zero overwrite.
+    if (fpmet::slice_is_empty(delta)) {
+        return 0;
+    }
+    fpmet::delta_merge(fp_metrics_pending, delta);
+    (void) ubatch;
+    return 0;
+}
+
+int llama_context::flashprefill_queue_plan_reads(const llm_graph_result & res, bool & out_queued) {
+    out_queued = false;
+    // Authoritative per-ubatch outcome (verdict + counts) is recorded for
+    // EVERY ubatch — including zero-plan dense ones — so the row staging
+    // below and the fold never mislabel a plan-less graph. Only actual plan
+    // tensors queue reads (and owe the end-sync).
+    fp_plan_summaries.push_back(res.get_flashprefill_summary());
+    fp_plan_counts.push_back(0);
+    const std::vector<ggml_tensor *> & plans = res.get_flashprefill_plans();
+    if (plans.empty()) {
+        return 0; // dense ubatch: verdict recorded, no reads, no sync owed
+    }
+    fp_plan_counts.back() = (uint32_t) plans.size();
+    // Validate everything BEFORE queueing anything: a short/OOB read must
+    // fail the slice closed, never partially queue.
+    for (auto * plan : plans) {
+        if (plan == nullptr || !ggml_is_contiguous(plan) || ggml_nelements(plan) < 24) {
+            return -1;
+        }
+        if (ggml_backend_sched_get_tensor_backend(sched.get(), plan) == nullptr) {
+            return -1;
+        }
+    }
+    // Reads queue now (validated above): stream-ordered after this ubatch's
+    // compute on each plan's backend. Each destination is a stable deque
+    // slot: later pushes (this or later ubatches) never invalidate it, so
+    // the queued copy stays valid until the end-of-call sync completes it.
+    // The pending flag is set before the first async queue so every later
+    // clear/sync decision sees it. (Summary + zeroed count already recorded
+    // above for every ubatch, plan-less ones included.)
+    fp_plan_reads_pending = true;
+    if (!fp_plan_headers) {
+        fp_plan_headers = std::make_unique<std::deque<std::array<int32_t, 24>>>();
+    }
+    for (auto * plan : plans) {
+        ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sched.get(), plan);
+        fp_plan_expected.push_back((uint64_t) ggml_nelements(plan));
+        fp_plan_headers->emplace_back();
+        fp_plan_headers->back().fill(0);
+        ggml_backend_tensor_get_async(be, plan, fp_plan_headers->back().data(), 0, 24 * sizeof(int32_t));
+    }
+    out_queued = true;
+    return 0;
+}
+
+int llama_context::flashprefill_fold_plan_reads(llama_flashprefill_metrics::slice_delta & out) {
+    namespace fpmet = llama_flashprefill_metrics;
+    out = fpmet::slice_delta();
+    // Structural precheck: the log is append-only within one call, so any
+    // mismatch is an internal bug — fail closed before interpreting a word.
+    size_t n_plans = 0;
+    for (const uint32_t c : fp_plan_counts) {
+        n_plans += (size_t) c;
+    }
+    // Header storage is required only when headers were queued; all-zero
+    // counts (pure designed-dense call) parse nothing but still consume the
+    // per-span summary actuals below.
+    if (n_plans > 0) {
+        if (!fp_plan_headers || n_plans != fp_plan_expected.size() || n_plans != fp_plan_headers->size()) {
+            return GGML_FLASHPREFILL_ERR_BAD_ARG;
+        }
+    }
+    size_t pi = 0;
+    int32_t first_error = 0;
+    for (size_t s = 0; s < fp_plan_counts.size(); ++s) {
+        const uint32_t n = fp_plan_counts[s];
+        bool span_exact_all = false;
+        for (uint32_t p = 0; p < n; ++p) {
+            ggml_flashprefill_plan_stats st = {};
+            // Header-only parse (WireReference: no list read, no full-tensor
+            // readback). Inspects every layer; the first error wins but all
+            // headers are still read for a complete diagnosis.
+            const int32_t rc = fpmet::parse_plan_header_stats(
+                    (*fp_plan_headers)[pi].data(), fp_plan_expected[pi], &st);
+            pi += 1;
+            if (rc != 0) {
+                if (first_error == 0) {
+                    first_error = rc;
+                }
+                continue;
+            }
+            if (st.error != 0) {
+                // SELECT/ATTN-reported failure (NaN poison, orphan/gap,
+                // OOB, overflow): nothing from this plan is trustworthy.
+                if (first_error == 0) {
+                    first_error = st.error;
+                }
+                continue;
+            }
+            if (st.req_exact_all != 0) {
+                span_exact_all = true;
+            }
+            fpmet::slice_delta one;
+            one.sparse_rows      = (uint64_t) st.sparse_rows;
+            one.dense_packed     = (uint64_t) st.dense_rows;
+            one.selected_blocks  = (uint64_t) st.selected_total;
+            // Executed corrections only (see build_slice): the ablation
+            // classifies proxy uses but ATTN skips them — report 0.
+            if (cparams.flashprefill.mean_correction) {
+                one.corrected_blocks = (uint64_t) st.corrected_total;
+            }
+            one.visible_tokens   = (uint64_t) st.visible_tokens;
+            one.exact_tokens     = (uint64_t) st.exact_tokens;
+            fpmet::delta_merge(out, one);
+        }
+        // Designed-dense actuals (FULL_PREFIX zero-plan spans AND partial
+        // spans alongside plan totals): authoritative query-head-layer
+        // incidences from the graph summary, same unit as plan row totals.
+        // Counted in the full_attention_layer bucket and in dense_packed
+        // (actual exec denominator); disjoint from plan layers by
+        // construction, never NO_PLAN, never invalidation.
+        {
+            const auto draws = fp_plan_summaries[s].designed_dense_rows;
+            if (draws > 0) {
+                const uint64_t v = (uint64_t) draws;
+                fpmet::slice_delta dd;
+                dd.dense_rows[fpmet::DENSE_BUCKET_FULL_PREFIX] = v;
+                dd.dense_packed = v;
+                fpmet::delta_merge(out, dd);
+            }
+        }
+        // Zero-plan spans (dense ubatches: verdict recorded, nothing built)
+        // contribute no pool or scratch — only spans that queued plans did.
+        if (n > 0 && first_error == 0) {
+            // One pool construction per executed span: this ubatch's graph
+            // ran pool/select/attn, so its pool means were (re)built here —
+            // counted once per span, never per layer. Scratch is the
+            // build's own total (shared meta once + pinned plans + max
+            // pool, real tensor capacities via ggml_nbytes, checked u64):
+            // consumed verbatim, never estimated, never maxima. Live
+            // overwrites per span (current build residency); peak maxes, so
+            // repeated ubatches on one build never double count.
+            fpmet::slice_delta t;
+            t.pool_rebuild[span_exact_all ? fpmet::POOL_REASON_EXACT_ALL : fpmet::POOL_REASON_SLICE] = 1;
+            // Sign-checked before narrowing: a corrupt negative total (if the
+            // field is signed) must read as absent, never wrap huge.
+            const auto build_raw = fp_plan_summaries[s].scratch_bytes;
+            if (build_raw > 0) {
+                const uint64_t build_bytes = (uint64_t) build_raw;
+                t.scratch_live_bytes = build_bytes;
+                t.scratch_peak_bytes = build_bytes;
+            }
+            fpmet::delta_merge(out, t);
+        }
+    }
+    if (first_error != 0) {
+        out = fpmet::slice_delta();
+        return first_error;
+    }
+    return 0;
+}
+
+void llama_context::flashprefill_sample_gpu_phases() {
+    namespace fpmet = llama_flashprefill_metrics;
+    if (!fp_plan_reads_pending) {
+        return; // no FP GPU reads queued this call: nothing to attribute
+    }
+    using phase_times_fn_t = fpmet::gpu_phase_sampler_fn;
+    // Per scheduler backend (VulkanDispatch: cumulative ns since that
+    // backend's init, post-fence; FAILED iff not a Vulkan backend — skipped,
+    // never an error). Unknown backends stamp without contributing, so a
+    // recycled backend pointer can never attribute pre-existing time; dead
+    // entries are pruned below. Backward steps contribute zero, never fail.
+    fpmet::slice_delta d;
+    d.has_gpu_us = false;
+    for (const auto & be : backends) {
+        if (!be) {
+            continue;
+        }
+        ggml_backend_t backend = be.get();
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (dev == nullptr) {
+            continue;
+        }
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == nullptr) {
+            continue;
+        }
+        auto * fn = (phase_times_fn_t) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_vk_flashprefill_times");
+        if (fn == nullptr) {
+            continue; // producer hook absent here: skip (omit, never fake)
+        }
+        uint64_t pool_ns = 0, select_ns = 0, attn_ns = 0;
+        if (fn(backend, &pool_ns, &select_ns, &attn_ns) != GGML_STATUS_SUCCESS) {
+            continue; // not a Vulkan backend for FP timing: skip
+        }
+        auto it = fp_gpu_last_by_backend.find(backend);
+        if (it == fp_gpu_last_by_backend.end()) {
+            // First sighting: stamp the baseline without contributing, so
+            // pre-existing cumulative time is never attributed to this call.
+            fp_gpu_last_by_backend[backend] = {pool_ns, select_ns, attn_ns, true};
+            continue;
+        }
+        fp_gpu_backend_last & last = it->second;
+        d.gpu_pool_us   += pool_ns   >= last.pool_ns   ? (pool_ns   - last.pool_ns)   / 1000u : 0u;
+        d.gpu_select_us += select_ns >= last.select_ns ? (select_ns - last.select_ns) / 1000u : 0u;
+        d.gpu_attn_us   += attn_ns   >= last.attn_ns   ? (attn_ns   - last.attn_ns)   / 1000u : 0u;
+        last.pool_ns = pool_ns;
+        last.select_ns = select_ns;
+        last.attn_ns = attn_ns;
+        last.stamped = true;
+        d.has_gpu_us = true;
+    }
+    // Prune dead backends (sched_reserve rebuilds): keeps the map bounded
+    // and drops recycled-pointer state.
+    for (auto it = fp_gpu_last_by_backend.begin(); it != fp_gpu_last_by_backend.end();) {
+        bool live = false;
+        for (const auto & be : backends) {
+            if (be && be.get() == it->first) {
+                live = true;
+                break;
+            }
+        }
+        if (!live) {
+            it = fp_gpu_last_by_backend.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (d.has_gpu_us && !fpmet::slice_is_empty(d)) {
+        // Preserve the folded graph residency: the gpu-times delta carries
+        // no scratch of its own, and a blind merge would overwrite live with
+        // zero. Relay first, then merge (peak max is already idempotent).
+        d.scratch_live_bytes = fp_metrics_pending.scratch_live_bytes;
+        d.scratch_peak_bytes = fp_metrics_pending.scratch_peak_bytes;
+        fpmet::delta_merge(fp_metrics_pending, d);
+    }
+    // Backend split-workspace residency (VulkanDispatch: exact bytes chosen
+    // for this backend — 0 when the split path is inactive; peak monotonic
+    // max; FAILED iff not Vulkan). Combines with graph capacities without
+    // double counting (disjoint tensors by construction): live adds the
+    // current residency; peak takes the max over live and call peak-deltas.
+    {
+        using scratch_fn_t = ggml_status (*)(ggml_backend_t, uint64_t *, uint64_t *);
+        uint64_t split_cur_sum = 0, split_peak_add = 0;
+        bool split_seen = false;
+        for (const auto & be : backends) {
+            if (!be) {
+                continue;
+            }
+            ggml_backend_t backend = be.get();
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            if (dev == nullptr) {
+                continue;
+            }
+            auto * reg = ggml_backend_dev_backend_reg(dev);
+            if (reg == nullptr) {
+                continue;
+            }
+            auto * sfn = (scratch_fn_t) ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_vk_flashprefill_scratch");
+            if (sfn == nullptr) {
+                continue;
+            }
+            uint64_t cur_b = 0, peak_b = 0;
+            if (sfn(backend, &cur_b, &peak_b) != GGML_STATUS_SUCCESS) {
+                continue;
+            }
+            auto it = fp_gpu_last_by_backend.find(backend);
+            if (it == fp_gpu_last_by_backend.end()) {
+                fp_gpu_backend_last base = {};
+                base.split_cur_b = cur_b;
+                base.split_peak_b = peak_b;
+                base.stamped = true;
+                fp_gpu_last_by_backend[backend] = base;
+                split_seen = true;
+                continue;
+            }
+            fp_gpu_backend_last & last = it->second;
+            split_cur_sum = split_cur_sum > UINT64_MAX - cur_b ? UINT64_MAX : split_cur_sum + cur_b;
+            if (peak_b >= last.split_peak_b) {
+                const uint64_t pd = peak_b - last.split_peak_b;
+                split_peak_add = split_peak_add > UINT64_MAX - pd ? UINT64_MAX : split_peak_add + pd;
+            }
+            last.split_cur_b = cur_b;
+            last.split_peak_b = peak_b;
+            split_seen = true;
+        }
+        if (split_seen) {
+            uint64_t live = fp_metrics_pending.scratch_live_bytes;
+            live = live > UINT64_MAX - split_cur_sum ? UINT64_MAX : live + split_cur_sum;
+            fp_metrics_pending.scratch_live_bytes = live;
+            uint64_t peak = fp_metrics_pending.scratch_peak_bytes;
+            if (split_peak_add > peak) {
+                peak = split_peak_add;
+            }
+            if (live > peak) {
+                peak = live;
+            }
+            fp_metrics_pending.scratch_peak_bytes = peak;
+        }
+    }
+}
+
+void llama_context::flashprefill_metrics_clear_call_state() {
+    // Immutable OFF: staging/reads cannot exist, so return before touching
+    // anything — no stat writes, no container churn, no sync.
+    if (!llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        return;
+    }
+    // Failure-path ownership: queued async copies may still be in flight
+    // (prior ubatches). Complete them with a direct scheduler sync — never
+    // the stats wrapper, which skips when n_queued_tokens==0 — before the
+    // destination slots are freed. Gated on the pending flag (outstanding
+    // copies), not container fullness: completed reads are never re-synced.
+    // OFF and dense-only calls never sync here. The success path never calls
+    // this (its end-sync already covered); no per-layer waits anywhere.
+    if (fp_plan_reads_pending && sched) {
+        ggml_backend_sched_synchronize(sched.get());
+        fp_plan_reads_pending = false;
+    }
+    fp_metrics_pending = llama_flashprefill_metrics::slice_delta();
+    fp_plan_headers.reset();
+    fp_plan_counts.clear();
+    fp_plan_expected.clear();
+    fp_plan_summaries.clear();
+}
+
+void llama_context::flashprefill_snapshot_gpu_phases() {
+    // Baseline unconditionally (caller gates on enabled): the first FP
+    // call's GPU time counts as measured instead of being dropped. Host-side
+    // counter reads only — no waits, no submits. Split-workspace baselines
+    // ride the same pass so backend peak deltas never attribute history.
+    using phase_times_fn_t = llama_flashprefill_metrics::gpu_phase_sampler_fn;
+    using scratch_fn_t = ggml_status (*)(ggml_backend_t, uint64_t *, uint64_t *);
+    for (const auto & be : backends) {
+        if (!be) {
+            continue;
+        }
+        ggml_backend_t backend = be.get();
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (dev == nullptr) {
+            continue;
+        }
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == nullptr) {
+            continue;
+        }
+        fp_gpu_backend_last & last = fp_gpu_last_by_backend[backend];
+        auto * fn = (phase_times_fn_t) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_vk_flashprefill_times");
+        if (fn != nullptr) {
+            uint64_t pool_ns = 0, select_ns = 0, attn_ns = 0;
+            if (fn(backend, &pool_ns, &select_ns, &attn_ns) == GGML_STATUS_SUCCESS) {
+                last.pool_ns = pool_ns;
+                last.select_ns = select_ns;
+                last.attn_ns = attn_ns;
+                last.stamped = true;
+            }
+        }
+        auto * sfn = (scratch_fn_t) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_vk_flashprefill_scratch");
+        if (sfn != nullptr) {
+            uint64_t cur_b = 0, peak_b = 0;
+            if (sfn(backend, &cur_b, &peak_b) == GGML_STATUS_SUCCESS) {
+                last.split_cur_b = cur_b;
+                last.split_peak_b = peak_b;
+            }
+        }
+    }
+}
+
+int llama_context::decode_impl(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -2345,6 +3202,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 }
             }
         }
+    }
+
+    // FlashPrefill: opt into the BatchIdentity source-row map only when a
+    // validated exec is attached. OFF/legacy calls keep split semantics and
+    // allocation behavior bit-identical (no tracking, no extra storage).
+    if (fp_exec_active) {
+        balloc->set_source_row_tracking(true);
     }
 
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
@@ -2481,9 +3345,53 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    // FlashPrefill metrics call-wide state (MetricsIntegration): hygiene
+    // range reset plus GPU phase baselining, enabled-only. OFF allocates and
+    // touches nothing here (the member stays empty for the context lifetime).
+    // Single mode check (immutable validated config: OFF == disabled).
+    if (cparams.flashprefill.mode != LLAMA_FLASHPREFILL_MODE_OFF) {
+        if (fp_met_call_pos_min.size() != (size_t) LLAMA_MAX_SEQ) {
+            fp_met_call_pos_min.assign(LLAMA_MAX_SEQ, std::numeric_limits<llama_pos>::max());
+        } else {
+            std::fill(fp_met_call_pos_min.begin(), fp_met_call_pos_min.end(),
+                    std::numeric_limits<llama_pos>::max());
+        }
+        // Baseline GPU phase counters before the first submit: the end-of-
+        // call difference then measures this call — including the first FP
+        // call — instead of dropping it. Host reads, no waits.
+        flashprefill_snapshot_gpu_phases();
+    }
+
     do {
         const auto & ubatch = mctx->get_ubatch();
         llama_compute_guard compute_guard(sched.get());
+
+        // FlashPrefill metrics layout timer (MetricsIntegration): host-only
+        // timestamp around the slice build. OFF cost is one mode check
+        // (no allocation, no sync). Unmeasured slices report has_layout=false
+        // downstream (omitted, never fake zero).
+        const bool fp_met_enabled = cparams.flashprefill.mode != LLAMA_FLASHPREFILL_MODE_OFF;
+        const int64_t fp_met_t0 = fp_met_enabled ? ggml_time_us() : 0;
+
+        // FlashPrefill: attach this ubatch's owned row snapshot (sliced via
+        // the source-row map so internal splits/retries keep exact identity).
+        // Empty snapshot == route dense. No-op when no exec is attached. A
+        // corrupt map is an explicit execution failure (-3, the existing
+        // compute-failure code): call snapshots are cleared first so no half
+        // rows can leak into a retry, and the failure is visible instead of
+        // a silent fallback to dense.
+        if (fp_exec_active) {
+            if (!flashprefill_build_ubatch(ubatch)) {
+                flashprefill_clear_call();
+                // MetricsIntegration: failed call, staged state discarded.
+                flashprefill_metrics_clear_call_state();
+                return -3;
+            }
+        }
+
+        // Host layout time for this slice (meaningful only when measured).
+        const uint64_t fp_met_layout_us =
+            fp_met_enabled ? (uint64_t) (ggml_time_us() - fp_met_t0) : 0;
 
         // count the outputs in this ubatch
         {
@@ -2527,6 +3435,81 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 memory->seq_rm(s, pos_min[s], -1);
             }
+
+            // MetricsIntegration: this call fails, so staged ubatch deltas
+            // and queued plan reads are discarded (never published); a retry
+            // recounts re-executed work only.
+            flashprefill_metrics_clear_call_state();
+
+            switch (status) {
+                case GGML_STATUS_ABORTED:      return  2;
+                case GGML_STATUS_ALLOC_FAILED: return -2;
+                case GGML_STATUS_FAILED:       return -3;
+                case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+            }
+        }
+
+        // FlashPrefill metrics (MetricsIntegration): per-ubatch staging. The
+        // compute above only SUBMITTED async GPU work — nothing GPU-side may
+        // be read as completed here. Row-side data stages now (host-owned, no
+        // wait) against the graph's authoritative per-ubatch verdict
+        // (recorded for every ubatch, zero-plan ones included — never
+        // re-derived from global KV fullness); each plan header queues a 96B
+        // async read into the owned per-call snapshot (no wait — the single
+        // end-of-call synchronize below completes them). Plan errors are
+        // inspected once after that sync, before anything commits. A nonzero
+        // status here fails like a compute failure (status rerouted into the
+        // existing cleanup path).
+        if (res && fp_met_enabled) {
+            for (uint32_t fp_met_i = 0; fp_met_i < ubatch.n_tokens; ++fp_met_i) {
+                const auto fp_met_seq = ubatch.seq_id[fp_met_i][0];
+                if (ubatch.pos[fp_met_i] < fp_met_call_pos_min[fp_met_seq]) {
+                    fp_met_call_pos_min[fp_met_seq] = ubatch.pos[fp_met_i];
+                }
+            }
+            bool fp_met_queued = false;
+            int fp_met_rc = flashprefill_queue_plan_reads(*res, fp_met_queued);
+            if (fp_met_rc == 0) {
+                fp_met_rc = flashprefill_note_slice_success(ubatch, fp_met_layout_us, true, fp_met_queued,
+                        res->get_flashprefill_summary().dense_reason);
+            }
+            if (fp_met_rc != 0) {
+                LLAMA_LOG_ERROR("%s: flashprefill slice metrics failed (error %d), failing ubatch\n",
+                        __func__, fp_met_rc);
+                res = nullptr;
+                status = GGML_STATUS_FAILED;
+            }
+        }
+
+        if (!res) {
+            // the plan check above reroutes here on metrics failure: remove
+            // the ubatch's memory entries exactly like a compute failure so
+            // no half-committed rows or partial metrics leak into a retry.
+            llama_pos fp_met_pos_min[LLAMA_MAX_SEQ];
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                fp_met_pos_min[s] = std::numeric_limits<llama_pos>::max();
+            }
+
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                const auto & seq_id = ubatch.seq_id[i][0];
+
+                fp_met_pos_min[seq_id] = std::min(fp_met_pos_min[seq_id], ubatch.pos[i]);
+            }
+
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (fp_met_pos_min[s] == std::numeric_limits<llama_pos>::max()) {
+                    continue;
+                }
+
+                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, fp_met_pos_min[s]);
+
+                memory->seq_rm(s, fp_met_pos_min[s], -1);
+            }
+
+            // MetricsIntegration: queue/note failure discards staged deltas
+            // plus queued reads exactly like a compute failure (no partial
+            // publication, no orphaned snapshots).
+            flashprefill_metrics_clear_call_state();
 
             switch (status) {
                 case GGML_STATUS_ABORTED:      return  2;
@@ -2663,6 +3646,64 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
 
+    // FlashPrefill metrics finalize (MetricsIntegration): the single
+    // completion boundary for the call. Plan reads were queued per ubatch
+    // (no waits); iff any reads are outstanding, synchronize ONCE here —
+    // consuming the would-be getter wait (getters later early-out; stats
+    // attributed once) — then inspect ALL headers before committing
+    // anything. OFF and dense-only calls skip the sync entirely (no extra
+    // waits). Any plan error fails the call (return -3 + call-wide hygiene)
+    // before downstream sampling/output/state success handling. Required-
+    // mode enforcement lives graph-side (it throws authoritatively); metrics
+    // never fails for routing — designed-dense and deny-verdict rows only
+    // count.
+    {
+        namespace fpmet = llama_flashprefill_metrics;
+        bool fp_met_call_failed = false;
+        // Per-ubatch outcome spans were recorded (summaries always, headers
+        // only for queued reads). Sync strictly for outstanding reads; the
+        // fold then consumes summaries too, so pure designed-dense calls
+        // (zero reads) resolve with no wait at all.
+        if (!fp_plan_counts.empty()) {
+            const bool fp_met_had_reads = fp_plan_reads_pending;
+            if (fp_met_had_reads) {
+                synchronize();
+                // Sample while the flag still shows outstanding reads (the
+                // sampler's own gate), then clear it: later clears must not
+                // sync again. Headers are retained for parsing below.
+                flashprefill_sample_gpu_phases();
+                fp_plan_reads_pending = false;
+            }
+            fpmet::slice_delta fp_met_plan_delta;
+            const int32_t fp_met_plan_rc = flashprefill_fold_plan_reads(fp_met_plan_delta);
+            fp_plan_headers.reset();
+            fp_plan_counts.clear();
+            fp_plan_expected.clear();
+            fp_plan_summaries.clear();
+            if (fp_met_plan_rc == 0) {
+                if (!fpmet::slice_is_empty(fp_met_plan_delta)) {
+                    fpmet::delta_merge(fp_metrics_pending, fp_met_plan_delta);
+                }
+            } else {
+                LLAMA_LOG_ERROR("%s: flashprefill plan validation failed (error %d), failing call\n",
+                        __func__, fp_met_plan_rc);
+                fp_met_call_failed = true;
+            }
+        }
+        if (fp_met_call_failed) {
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (fp_met_call_pos_min[s] == std::numeric_limits<llama_pos>::max()) {
+                    continue;
+                }
+                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n",
+                        __func__, s, fp_met_call_pos_min[s]);
+                memory->seq_rm(s, fp_met_call_pos_min[s], -1);
+            }
+            flashprefill_metrics_clear_call_state();
+            return -3;
+        }
+    }
+
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
 
@@ -2715,6 +3756,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    // MetricsIntegration commit: the whole call succeeded, so publish the
+    // staged per-ubatch deltas into the cumulative ledger exactly once.
+    // Failure returns above discarded them; a narrowed-batch retry recounts
+    // only re-executed work — never double.
+    if (!llama_flashprefill_metrics::slice_is_empty(fp_metrics_pending)) {
+        if (!fp_metrics_accum.has_policy) {
+            const uint64_t fp_met_fp = flashprefill_policy_fingerprint();
+            if (fp_met_fp != 0) {
+                fp_metrics_accum.policy_fingerprint = fp_met_fp;
+                fp_metrics_accum.has_policy = true;
+            }
+        }
+        llama_flashprefill_metrics::accum_merge(fp_metrics_accum, fp_metrics_pending);
+    }
+    fp_metrics_pending = llama_flashprefill_metrics::slice_delta();
 
     return 0;
 }
@@ -3073,6 +4130,28 @@ ggml_cgraph * llama_context::graph_reserve(
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
+    // FlashPrefill reserve-sizing scope (StatePolicy): this whole function
+    // builds the synthetic sizing graph (ubatch_reserve has no source batch),
+    // so mark it for graph_params() -> llm_graph_params.
+    // flashprefill_reserve_sizing (reuse-keyed: reserve never aliases live).
+    // RAII restores the prior value on every exit — early returns, error
+    // nullptr paths, and exception unwind — so a failed reserve can never
+    // leak "synthetic" into a later live graph. Live decode graphs never pass
+    // through here and always observe false. No row guessing: the synthetic
+    // eligible snapshot below keeps prefill_known=false (dense-routed).
+    struct fp_reserve_sizing_guard {
+        llama_context & ctx;
+        bool saved;
+        explicit fp_reserve_sizing_guard(llama_context & c)
+            : ctx(c), saved(c.fp_reserve_sizing_active) {
+            ctx.fp_reserve_sizing_active = true;
+        }
+        ~fp_reserve_sizing_guard() {
+            ctx.fp_reserve_sizing_active = saved;
+        }
+    };
+    const fp_reserve_sizing_guard fp_reserve_guard(*this);
+
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
@@ -3092,6 +4171,10 @@ ggml_cgraph * llama_context::graph_reserve(
     llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
 
+    // FlashPrefill: reserve builds a synthetic sizing ubatch with no source
+    // rows and no decode snapshot (fp_rows_ubatch is never consumed here).
+    // A validated synthetic eligible snapshot is installed for this reserve
+    // graph below; per-decode row snapshots exist only in the ubatch loop.
     // set one output token per sequence in order to activate all backend samplers
     std::vector<llama_seq_id> seq_ids(n_seqs);
     for (uint32_t i = 0; i < n_seqs; ++i) {
@@ -3103,7 +4186,36 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
+    // FlashPrefill: install a validated synthetic eligible snapshot so this
+    // reserve graph carries eligible-shaped rows for scratch sizing (sizing
+    // needs eligible shape, not dense). Enabled-only and never bypassed
+    // (MTP/embeddings stay null); OFF costs one null store. The live member
+    // is saved/restored around the gparams copy below: reserve must never
+    // disturb an in-flight decode snapshot, while the copied graph params
+    // keep their own shared ownership for async safety.
+    auto fp_rows_saved = cparams.flashprefill_rows;
+    if (ubatch.n_tokens > 0 &&
+            llama_flashprefill_is_enabled(&cparams.flashprefill) &&
+            !flashprefill_bypassed()) {
+        llama_flashprefill_row fp_synth;
+        std::memset(&fp_synth, 0, sizeof(fp_synth));
+        fp_synth.version       = LLAMA_FLASHPREFILL_ROW_VERSION;
+        fp_synth.struct_size   = (uint32_t) sizeof(fp_synth);
+        fp_synth.role          = LLAMA_FLASHPREFILL_ROLE_PREFILL;
+        fp_synth.seq_id        = 0;
+        fp_synth.reader_id     = LLAMA_FLASHPREFILL_READER_NONE;
+        fp_synth.logical_pos   = LLAMA_FLASHPREFILL_POS_UNKNOWN;
+        fp_synth.prefill_known = false;
+        GGML_ASSERT(llama_flashprefill_validate_row(&fp_synth) == LLAMA_FLASHPREFILL_OK);
+        cparams.flashprefill_rows = std::make_shared<const std::vector<llama_flashprefill_row>>(
+            ubatch.n_tokens, fp_synth);
+    } else {
+        cparams.flashprefill_rows.reset();
+    }
+
     const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+
+    cparams.flashprefill_rows = std::move(fp_rows_saved);
 
     res->reset();
 
@@ -3132,6 +4244,18 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
+    // FlashPrefill: the frozen policy config rides into the graph via the
+    // .cparams copy below (immutable, OFF by default), and the per-ubatch
+    // owned rows ride as cparams.flashprefill_rows (shared ownership, so
+    // each graph copy stays alive across async execution). Null means route
+    // dense. GraphIntegration reads gparams.cparams.flashprefill_rows; the
+    // flashprefill_ubatch_rows() accessor exposes the same snapshot for
+    // non-graph consumers. No borrowed pointers cross this call.
+    // Reserve sizing: fp_reserve_sizing_active is true only inside
+    // graph_reserve()'s RAII scope (synthetic sizing graphs, including
+    // FittingIntegration probes, which build through graph_reserve), so the
+    // flag is set with no per-probe opt-in and never leaks into live decode
+    // graphs built here via process_ubatch().
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -3148,6 +4272,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.flashprefill_reserve_sizing =*/ fp_reserve_sizing_active,
     };
 }
 
@@ -3645,10 +4770,82 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
+// Enabled-only distinct outer magic for per-sequence state blobs (StatePolicy).
+// Selected by the immutable context policy at every seq write/read site below;
+// OFF writers/readers retain io_magic verbatim (no OFF format bump). An OFF/old
+// reader therefore rejects an enabled blob at the 4-byte outer prefix — before
+// any memory reader runs, with no allocation and no KV mutation — and an
+// enabled reader rejects a legacy blob with a re-prefill error at the same
+// point. 'FPS1' is disjoint from the envelope body magic ('FPS0'), io_magic,
+// the RERoT/file magics, and DSV4. Prefix widths are unchanged (u32 magic +
+// seq_id) on both paths.
+static constexpr uint32_t fp_io_magic_seq = 0x46505331u; // 'FPS1'
+static_assert(sizeof(io_magic) == 4, "seq outer prefix stays one 4-byte magic word");
+
+// Enabled-only distinct sequence-file container (StatePolicy). OFF files retain
+// LLAMA_STATE_SEQ_MAGIC/VERSION verbatim (no OFF format bump, no compat shim:
+// unreleased v1 was never deployed, so legacy files under an enabled policy
+// are re-prefilled, and enabled files under OFF are rejected as unknown).
+static constexpr uint32_t fp_seq_file_magic   = 0x46505153u; // 'FPQS'
+static constexpr uint32_t fp_seq_file_version = 1u;
+
+// Tripwire assertions for the OOM audit: the framed body stays 64 bytes and
+// the marker stays tiny, so no legacy read_string ever allocates on our bytes.
+static_assert(llama_flashprefill_state::kEnvelopeBytes == 64u,
+        "envelope body width is load-bearing for the read_string blast radius");
+static_assert(llama_flashprefill_state::kFrameMarker.size() > 0 &&
+              llama_flashprefill_state::kFrameMarker.size() < 64,
+        "framing marker stays a small distinct string");
+
+// Selects the seq outer magic for this context. File-static (not a member) so
+// no header churn: the policy bit is passed in at each of the four sites.
+static uint32_t fp_seq_outer_magic_for(bool flashprefill_enabled) {
+    return flashprefill_enabled ? fp_io_magic_seq : io_magic;
+}
+
+// Reader matrix for FlashPrefill-enabled bytes (framed marker + 64-byte body),
+// traced from the actual readers — exact safe order per path:
+//
+// FULL path (no outer magic; framing is the mechanism):
+// - OFF ordinary reader: read_string reads u32 len = marker length (21, tiny
+//   alloc), yields the marker, fails cleanly at the arch-string mismatch
+//   BEFORE any memory byte is touched. The old raw layout would have read the
+//   body magic as a ~1.18 GB length (vector alloc before bounds check).
+// - OFF RERoT-active reader: identical, via its own read_string arch check
+//   ("wrong model arch"), before magic/version/caps/fingerprint checks.
+// - Enabled reader, legacy bytes: one bounded kFramedBytes read (short input
+//   throws -> missing-header), then length-word mismatch (arch_len != 21, or
+//   marker-bytes mismatch on coincidence) -> reject with re-prefill. No
+//   unbounded read_string anywhere on this path.
+// - Enabled reader, unreleased raw-64B bytes: length word reads as the body
+//   magic (~1.18 GB != 21) -> foreign-header reject. No compat shim.
+//
+// SEQ path (distinct outer magic gates BEFORE any memory reader):
+// - OFF reader + enabled blob: 4-byte outer-magic compare fails ("wrong
+//   sequence state magic", text unchanged) before the memory reader runs —
+//   no allocation, no KV mutation. Same on the ON_DEVICE temp pre-read.
+// - Enabled reader + legacy blob: outer-magic compare fails the other way ->
+//   re-prefill throw, before the framed read.
+// - Enabled reader + enabled blob: outer magic OK -> one bounded framed read
+//   (marker + body validated, identity matched) -> memory reader. Legacy and
+//   foreign bytes never reach the memory reader through this path.
+// - Memory-reader first words (defense in depth only, reachable solely by
+//   crafted blobs carrying a valid outer magic): attn-family readers
+//   (llama_kv_cache, hybrid/iswA/msa via kv_base) compare the first u32
+//   against the live n_stream (1 or n_seq_max) and throw pre-mutation on
+//   mismatch; dsv4 compares DSV4_STATE_MAGIC first and throws pre-mutation;
+//   recurrent readers take the count word into small bounded validated parses
+//   (seq path: n_seq_id==0 per-cell gate fails deterministically on marker
+//   bytes; then n_layer/type/row-size equalities) and fail via the
+//   pre-existing wipe-target + throw corrupt-input path — loud, never silent.
+//   Arbitrary-corrupt-blob robustness beyond cross-policy confusion is the
+//   pre-existing per-reader contract, unchanged by this slice.
+
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
-        io.write(&io_magic, sizeof(io_magic));
+        const uint32_t outer_magic = fp_seq_outer_magic_for(llama_flashprefill_is_enabled(&cparams.flashprefill));
+        io.write(&outer_magic, sizeof(outer_magic));
         io.write(&seq_id, sizeof(seq_id));
 
         return state_seq_write_data(io, seq_id, flags);
@@ -3667,7 +4864,8 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     }
 
     try {
-        io->write(&io_magic, sizeof(io_magic));
+        const uint32_t outer_magic = fp_seq_outer_magic_for(llama_flashprefill_is_enabled(&cparams.flashprefill));
+        io->write(&outer_magic, sizeof(outer_magic));
         io->write(&seq_id, sizeof(seq_id));
 
         return state_seq_write_data(*io, seq_id, flags);
@@ -3685,7 +4883,12 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 
         uint32_t magic_read;
         io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
+        const uint32_t outer_magic = fp_seq_outer_magic_for(llama_flashprefill_is_enabled(&cparams.flashprefill));
+        if (outer_magic != magic_read) {
+            if (llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+                throw std::runtime_error(
+                    "llama_context: wrong sequence state magic for a FlashPrefill-enabled context (legacy OFF blob or foreign state); re-prefill under the current policy instead of reusing this state");
+            }
             throw std::runtime_error("wrong sequence state magic");
         }
 
@@ -3702,7 +4905,12 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     try {
         uint32_t magic_read;
         io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
+        const uint32_t outer_magic = fp_seq_outer_magic_for(llama_flashprefill_is_enabled(&cparams.flashprefill));
+        if (outer_magic != magic_read) {
+            if (llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+                throw std::runtime_error(
+                    "llama_context: wrong sequence state magic for a FlashPrefill-enabled context (legacy OFF blob or foreign state); re-prefill under the current policy instead of reusing this state");
+            }
             throw std::runtime_error("wrong sequence state magic");
         }
 
@@ -3779,12 +4987,21 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
 size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     llama_file file(filepath, "rb");
 
-    // version checks
+    // version checks: the container pair is selected by the immutable policy.
+    // OFF keeps the legacy pair verbatim (no OFF format bump); enabled expects
+    // its distinct pair and rejects legacy files with a re-prefill error (no
+    // compat shim: unreleased v1 was never deployed). Rejection happens before
+    // any state byte is consumed.
     {
         const uint32_t magic   = file.read_u32();
         const uint32_t version = file.read_u32();
 
-        if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
+        if (llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+            if (magic != fp_seq_file_magic || version != fp_seq_file_version) {
+                LLAMA_LOG_ERROR("%s: sequence state file was produced under a different policy (legacy OFF container %08x/%08x); re-prefill under the current policy instead of restoring\n", __func__, magic, version);
+                return 0;
+            }
+        } else if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
             LLAMA_LOG_ERROR("%s: unknown (magic, version) for sequence state file: %08x, %08x\n", __func__, magic, version);
             return 0;
         }
@@ -3822,8 +5039,15 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
 size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
     llama_file file(filepath, "wb");
 
-    file.write_u32(LLAMA_STATE_SEQ_MAGIC);
-    file.write_u32(LLAMA_STATE_SEQ_VERSION);
+    // Container pair selected by the immutable policy (OFF keeps the legacy
+    // pair verbatim). Prefix widths unchanged (two u32 words either way).
+    if (llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        file.write_u32(fp_seq_file_magic);
+        file.write_u32(fp_seq_file_version);
+    } else {
+        file.write_u32(LLAMA_STATE_SEQ_MAGIC);
+        file.write_u32(LLAMA_STATE_SEQ_VERSION);
+    }
 
     // save the prompt
     file.write_u32((uint32_t) n_token_count);
@@ -3837,6 +5061,85 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     GGML_ASSERT(res == sizeof(uint32_t) * 3 + sizeof(llama_token) * n_token_count + io.n_bytes());
 
     return res;
+}
+
+void llama_context::flashprefill_state_write_envelope(llama_io_write_i & io, uint32_t scope) {
+    // OFF: no-op, legacy bytes unchanged (no envelope, no sizing delta).
+    if (!llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        return;
+    }
+    namespace fpst = llama_flashprefill_state;
+    if (scope != fpst::kScopeFull && scope != fpst::kScopeSeq) {
+        throw std::runtime_error(
+            "llama_context::flashprefill_state_write_envelope: refusing save with unknown scope; re-prefill instead of persisting unidentified state");
+    }
+    const uint64_t policy_fp = flashprefill_policy_fingerprint();
+    if (policy_fp == 0) {
+        throw std::runtime_error(
+            "llama_context::flashprefill_state_write_envelope: refusing save with unavailable policy fingerprint; re-prefill instead of persisting unidentified state");
+    }
+    // The serial alone is never identity (it restarts at 1 per process): the
+    // fixed process nonce must accompany it, and both must be nonzero.
+    if (fp_nonce0 == 0 || fp_nonce1 == 0 || fp_serial == 0) {
+        throw std::runtime_error(
+            "llama_context::flashprefill_state_write_envelope: refusing save with no process nonce/context serial; re-prefill instead of persisting unidentified state");
+    }
+    constexpr uint64_t kMax = std::numeric_limits<uint64_t>::max();
+    if (fp_adapter_gen == 0 || fp_adapter_gen == kMax) {
+        throw std::runtime_error(
+            "llama_context::flashprefill_state_write_envelope: refusing save with invalid adapter generation; re-prefill under the current adapters instead of persisting unidentified state");
+    }
+    const fpst::envelope env = fpst::make_envelope(scope, policy_fp, fp_nonce0, fp_nonce1, fp_serial, fp_adapter_gen);
+    uint8_t buf[fpst::kFramedBytes];
+    if (!fpst::encode_framed_envelope(env, buf, sizeof(buf))) {
+        throw std::runtime_error(
+            "llama_context::flashprefill_state_write_envelope: refusing save: envelope encode failed; re-prefill instead of persisting unidentified state");
+    }
+    io.write(buf, sizeof(buf));
+    LLAMA_LOG_DEBUG("%s: wrote FlashPrefill %s\n", __func__, fpst::describe_envelope(env).c_str());
+    // NOTE (OOM audit): the framing's length-prefixed marker comes first, so
+    // an OFF/old reader's read_string sees a SMALL length, allocates a few
+    // bytes, and fails cleanly at its arch-string mismatch. Under the old raw
+    // layout the body magic would have been misread as a ~1.18 GB length
+    // (allocation before bounds check in llama-io.cpp). OFF read code stays
+    // byte-identical — no silent load is possible, and no unbounded allocation
+    // either. Seq blobs additionally carry the distinct outer magic above, so
+    // OFF seq readers reject before any memory reader runs.
+}
+
+void llama_context::flashprefill_state_read_envelope(llama_io_read_i & io, uint32_t expected_scope) {
+    // OFF: no-op, legacy read path unchanged (full: its read_string arch check
+    // rejects enabled bytes fail-closed on the small marker; seq: the outer
+    // magic check above rejects before any memory reader runs).
+    if (!llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        return;
+    }
+    namespace fpst = llama_flashprefill_state;
+    // One bounded fixed-size read — never read_string (which allocates on the
+    // streamed length before bounds-checking). Short/truncated input throws
+    // here and becomes the missing-header error below, before any KV byte is
+    // consumed or any context/memory state mutates.
+    uint8_t buf[fpst::kFramedBytes];
+    try {
+        io.read(buf, sizeof(buf));
+    } catch (const std::exception & err) {
+        throw std::runtime_error(
+            std::string("llama_context: flashprefill state missing/truncated policy header; re-prefill under the current policy instead of reusing this state (read failed: ") + err.what() + ")");
+    }
+    fpst::envelope stored;
+    std::string error;
+    if (!fpst::decode_framed_envelope(buf, sizeof(buf), &stored, nullptr, &error)) {
+        throw std::runtime_error(std::string("llama_context: ") + error);
+    }
+    const uint64_t policy_fp = flashprefill_policy_fingerprint();
+    if (policy_fp == 0) {
+        throw std::runtime_error(
+            "llama_context: flashprefill state cannot validate: live policy fingerprint unavailable; re-prefill under the current policy instead of reusing this state");
+    }
+    if (!fpst::match_envelope(stored, expected_scope, policy_fp, fp_nonce0, fp_nonce1, fp_serial, fp_adapter_gen, &error)) {
+        throw std::runtime_error(std::string("llama_context: ") + error);
+    }
+    LLAMA_LOG_DEBUG("%s: accepted FlashPrefill %s\n", __func__, fpst::describe_envelope(stored).c_str());
 }
 
 size_t llama_context::state_write_data(llama_io_write_i & io) {
@@ -3875,9 +5178,21 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
                     "backend sampling for RERoT lanes or checkpoint the sampler server-side)");
             }
         }
+        // FlashPrefill policy envelope (StatePolicy): enabled-only identity
+        // header ahead of every byte below (RERoT envelope included), placed
+        // AFTER the refusal above so a refused save emits no bytes at all.
+        // OFF is a no-op — legacy bytes unchanged. Throws (converted to a 0
+        // return by the state_get_size/get_data/save_file wrappers) when the
+        // identity is unavailable, so unidentified state is never persisted.
+        flashprefill_state_write_envelope(io, llama_flashprefill_state::kScopeFull);
         llama_rerot_ctx_write_envelope_body(this, io);
         return io.n_bytes();
     }
+
+    // Same framed envelope on the ordinary path: enabled-only marker + body
+    // ahead of the arch string + memory bytes (OFF read_string trips on the
+    // small marker, never on the body magic). OFF is a no-op.
+    flashprefill_state_write_envelope(io, llama_flashprefill_state::kScopeFull);
 
     // write model info
     {
@@ -3898,6 +5213,15 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
+
+    // FlashPrefill policy envelope (StatePolicy): enabled-only prevalidation
+    // BEFORE any KV byte is consumed or context/memory state mutates. Missing
+    // header (legacy OFF bytes), unknown version/scope, or any identity
+    // mismatch throws (converted to a 0 return by the state_set_data/
+    // load_file wrappers) with a re-prefill path — the original Tri/RERoT
+    // checks below run unchanged afterwards and keep their own diagnostics.
+    // OFF is a no-op — legacy read path unchanged.
+    flashprefill_state_read_envelope(io, llama_flashprefill_state::kScopeFull);
 
     // RERoT versioned episode restore (§§25,A.8): atop an active episode only
     // a matching envelope restores (exact episode id, magic/version/caps/
@@ -3967,6 +5291,12 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
     }
     GGML_UNUSED(seq_id);
 
+    // FlashPrefill policy envelope (StatePolicy): enabled-only framed identity
+    // header after the outer magic+seq_id prefix (distinct enabled magic, so
+    // OFF readers already rejected above), ahead of the memory seq bytes. OFF
+    // is a no-op — legacy seq bytes unchanged.
+    flashprefill_state_write_envelope(io, llama_flashprefill_state::kScopeSeq);
+
     if (memory) {
         memory->state_write(io, seq_id, flags);
     }
@@ -3982,6 +5312,13 @@ size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq
     // triple validated and mismatches explicitly rejected).
     // PARTIAL_ONLY (recurrent state only) is explicitly permitted to support
     // queued parent state restoration without pinning GPU VRAM.
+    // FlashPrefill policy envelope (StatePolicy): enabled-only prevalidation
+    // BEFORE the memory seq bytes are consumed (the distinct outer magic+seq_id
+    // prefix was already consumed and checked by the caller). Missing/unknown/mismatching
+    // headers throw with a re-prefill path; OFF is a no-op. Runs before the
+    // RERoT granularity guard so unidentified bytes never reach it.
+    flashprefill_state_read_envelope(io, llama_flashprefill_state::kScopeSeq);
+
     if (cparams.rerot_enabled && llama_rerot_ctx_is_active(this) &&
         (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         throw std::runtime_error(
@@ -4318,6 +5655,7 @@ llama_context_params llama_context_default_params() {
         /*.rerot_frontier              =*/ LLAMA_REROT_FRONTIER_STRONG,
         /*.n_person_max                =*/ 0,
         /*.n_pen_max                   =*/ 0,
+        /*.flashprefill                =*/ llama_flashprefill_default_config(),
     };
 
     return result;
@@ -4720,9 +6058,10 @@ int32_t llama_set_adapters_lora(
         GGML_ASSERT(n_adapters == 0 && "invalid llama_set_adapters_lora call");
     }
 
-    ctx->set_adapters_lora(adapters, n_adapters, scales);
-
-    return 0;
+    // Existing int32_t error contract: 0 applied (or identical no-op), -1
+    // refused (effective change unsafe: FlashPrefill enabled atop an active
+    // RERoT episode — zero mutation, coherent graph untouched).
+    return ctx->set_adapters_lora(adapters, n_adapters, scales) ? 0 : -1;
 }
 
 int32_t llama_set_adapter_cvec(
@@ -5810,6 +7149,43 @@ int32_t llama_decode(
     }
 
     return ret;
+}
+
+// FlashPrefill V2 explicit execution path (public declaration owned by
+// ConfigIntegration in include/llama.h; versioned + counted contract there).
+int32_t llama_decode_with_flashprefill(
+        llama_context * ctx,
+          llama_batch   batch,
+            const llama_flashprefill_exec * exec) {
+    if (ctx == nullptr) {
+        LLAMA_LOG_ERROR("%s: context cannot be NULL\n", __func__);
+        return -1;
+    }
+    const int ret = ctx->decode_with_flashprefill(batch, exec);
+    if (ret != 0 && ret != 1) {
+        LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
+    }
+
+    return ret;
+}
+
+// Immutable policy fingerprint for state/cache isolation and metrics
+// (public declaration owned by ConfigIntegration in include/llama.h).
+uint64_t llama_flashprefill_policy_fingerprint(const llama_context * ctx) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    return ctx->flashprefill_policy_fingerprint();
+}
+
+// Persistent state/cache key: policy fingerprint + context serial + adapter
+// generation (StatePolicy owner; public declaration in include/llama.h next
+// to the fingerprint getter above).
+uint64_t llama_flashprefill_state_cache_key(const llama_context * ctx) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    return ctx->flashprefill_state_cache_key();
 }
 
 //

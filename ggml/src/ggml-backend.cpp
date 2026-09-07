@@ -1000,6 +1000,8 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
 
     // skip FLASH_ATTN_EXT since the sinks tensor is too small to choose a based based on it
     allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT;
+    // same for flash prefill attn: sinks (src[6]) is a tiny per-head bias, not a placement weight
+    allow = allow && tensor->op != GGML_OP_FLASH_PREFILL_ATTN;
 
     if (allow) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {

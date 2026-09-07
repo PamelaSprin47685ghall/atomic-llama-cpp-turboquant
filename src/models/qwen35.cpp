@@ -328,22 +328,40 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // fall through to ordinary serial IMRoPE below and visual spatial positions are
     // never remapped (graph-input side additionally guarantees rerot_active()==false
     // for those batches).
-    const bool rerot_text = inp->rerot_active() && ubatch.token != nullptr && ubatch.embd == nullptr;
+    // Semantic RERoT activation (cache state, not span-tensor presence): the
+    // compact sparse path never builds the legacy O(QK) entry lists merely
+    // to mark RERoT active. Legacy DDVR spans are built lazily, only when an
+    // actual dense RERoT fallback layer demands them (see
+    // build_attn_inp_kv_impl).
+    const bool rerot_text = inp->rerot_semantic() &&
+        ubatch.token != nullptr && ubatch.embd == nullptr;
+    // FlashPrefill V2 sparse path (GraphIntegration): RERoT route keeps the
+    // dedicated raw-Q hook (phased groups, single shared softmax); the
+    // ordinary route ropes exactly once below and lets the shared build_attn
+    // try the sparse path internally (single try, no double fallback).
+    // Null = dense (OFF, mixed roles, decode/MTP/embedding, special bias,
+    // SWA, unsupported). Gating + wo tail below are shared unchanged.
     if (rerot_text) {
-        ggml_tensor * Qgroups = build_rerot_q_groups(inp, Qcur, nullptr, sections, il);
-        cur = build_attn_rerot(inp,
-                    nullptr, nullptr, nullptr,
-                    Qgroups, Kcur, Vcur, nullptr, kq_scale, il);
+        if (ggml_tensor * fp_cur = try_build_attn_flashprefill(inp,
+                    Qcur, nullptr,
+                    Kcur, Vcur, sections, nullptr, nullptr, kq_scale, il)) {
+            cur = fp_cur;
+        } else {
+            ggml_tensor * Qgroups = build_rerot_q_groups(inp, Qcur, nullptr, sections, il);
+            cur = build_attn_rerot(inp,
+                        nullptr, nullptr, nullptr,
+                        Qgroups, Kcur, Vcur, nullptr, kq_scale, il);
+        }
     } else {
-        Qcur = ggml_rope_multi(
+        ggml_tensor * Qroped = ggml_rope_multi(
                 ctx0, Qcur, inp_pos, nullptr,
                 n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
                 ext_factor, attn_factor, beta_fast, beta_slow
                 );
-        cb(Qcur, "Qcur", il);
+        cb(Qroped, "Qcur", il);
         cur = build_attn(inp,
                     nullptr, nullptr, nullptr,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+                    Qroped, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     }
     cb(cur, "attn_pregate", il);
 

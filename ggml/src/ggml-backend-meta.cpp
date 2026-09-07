@@ -1005,6 +1005,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DSV4_HC_POST: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
+            case GGML_OP_FLASH_PREFILL_POOL:
+            case GGML_OP_FLASH_PREFILL_SELECT:
+            case GGML_OP_FLASH_PREFILL_ATTN: {
+                // Pool/select/attn each run as an actual graph op with a backend
+                // barrier; never split across devices (counts live in op_params
+                // and explicit host capacities, invalid metadata is an execution
+                // error, not a silent dense fallback).
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;

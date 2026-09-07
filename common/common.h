@@ -586,6 +586,13 @@ struct common_params : wanxiangqi_common_params {
     // streaming stays a single assistant response with one finish event + [DONE].
     bool rerot_trace = false;
 
+    // FlashPrefill V2 policy (PREFILL.md §12). Initialized from the PolicyCore
+    // frozen defaults (mode OFF); transferred by value into
+    // llama_context_params by common_context_params_to_llama() and immutable
+    // for the context lifetime. CLI handlers below only mutate this struct and
+    // never touch Tri/RERoT/speculative state.
+    struct llama_flashprefill_config flashprefill = llama_flashprefill_default_config();
+
     // RERoT joint B/P/K capacity fit results (§§B.0, B.3, B.10). Internal fit outputs only;
     // no production per-person or total-pen CLI is exposed.
     uint32_t rerot_person_max = 0; // auto-selected B (people / independent brains)
@@ -1047,7 +1054,11 @@ struct llama_context_params   common_context_params_to_llama(const common_params
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
-void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
+// returns true when applied (or already identical, a no-op); false when the
+// core refused the change before applying anything (FlashPrefill enabled atop
+// an active RERoT episode). On false the context still carries the previous
+// adapters, so callers must fail the request, never decode under them.
+bool common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
 
 // model endpoint from env
 std::string common_get_model_endpoint();

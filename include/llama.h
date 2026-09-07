@@ -6,6 +6,9 @@
 #include "ggml-backend.h"
 #include "ggml-opt.h"
 #include "gguf.h"
+// FlashPrefill V2 public policy types (C-compatible, forward declarations only;
+// never includes llama.h, so no circular dependency and no LLAMA_API coupling).
+#include "llama-flashprefill.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -438,6 +441,12 @@ extern "C" {
         enum llama_rerot_frontier_mode rerot_frontier;  // shared-memory visibility timing
         uint32_t n_person_max;                          // RERoT auto-selected B (0 = default/legacy)
         uint32_t n_pen_max;                             // RERoT auto-selected P (0 = default/legacy)
+
+        // FlashPrefill V2 policy (PREFILL.md §12). Immutable for the context
+        // lifetime; default is OFF (see llama_flashprefill_default_config).
+        // Initialized by llama_context_default_params(); copied by value from
+        // common_params by common_context_params_to_llama().
+        struct llama_flashprefill_config flashprefill;
     };
 
     struct llama_model_tensor_override {
@@ -615,6 +624,14 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_head       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa        (const struct llama_model * model);
+
+    // Maximum per-layer attention geometry over KV-carrying layers (layers for
+    // which has_kv holds); 0 when no layer carries KV. Used for FlashPrefill
+    // fit sizing so scratch covers the largest KV layer.
+    LLAMA_API int32_t llama_model_n_head_kv_max (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_embd_head_k(const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_embd_head_v(const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_gqa_max    (const struct llama_model * model);
 
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
@@ -1324,6 +1341,78 @@ extern "C" {
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
               struct llama_batch   batch);
+
+    // Process a batch of tokens with an explicit FlashPrefill V2 execution
+    // descriptor (PREFILL.md §5). The descriptor is versioned and borrowed:
+    // version must equal LLAMA_FLASHPREFILL_EXEC_VERSION, struct_size must
+    // equal sizeof(struct llama_flashprefill_exec), and a non-NULL rows view
+    // must cover exactly batch.n_tokens entries (n_rows == 0 with rows == NULL
+    // is the empty view). A NULL exec is the ordinary dense path: every row
+    // takes the pre-existing attention route as if its role were UNKNOWN.
+    // The context policy (cparams.flashprefill) is fixed at context creation
+    // and is never mutated by this call. Return codes match llama_decode().
+    // NOTE: no field is added to the public llama_batch ABI by this API.
+    LLAMA_API int32_t llama_decode_with_flashprefill(
+            struct llama_context * ctx,
+              struct llama_batch   batch,
+            const struct llama_flashprefill_exec * exec);
+
+    // Stable FlashPrefill policy fingerprint for a live context (FNV-1a over
+    // the frozen v1 policy fields; see llama_flashprefill_fingerprint for the
+    // field order). The policy is fixed at context creation, so this value is
+    // constant for the context lifetime. Implemented alongside the context;
+    // declared here because include/llama.h owns public C API declarations.
+    LLAMA_API uint64_t llama_flashprefill_policy_fingerprint(const struct llama_context * ctx);
+
+    // FlashPrefill persistent state/cache key for a live context (StatePolicy
+    // owner; single source of truth for RAM-cache stamps and slot sidecars —
+    // ServerRouting calls this, never a duplicate mix). Combines the policy
+    // fingerprint, the per-context serial, and the adapter generation, so any
+    // effective LoRA/cvec mutation retires the key. 0 when the policy is OFF
+    // (legacy stateless path needs no isolation identity), on NULL context,
+    // or when the fingerprint is unavailable. Changes only on effective
+    // adapter mutations; the core state envelope (inside the state bytes)
+    // stays authoritative on every restore — this key is the fast-path stamp.
+    LLAMA_API uint64_t llama_flashprefill_state_cache_key(const struct llama_context * ctx);
+
+    // FlashPrefill GPU metrics slice (MetricsIntegration owner of the
+    // aggregator; this struct + drain decl live here so the server can use
+    // them without including src/ headers). Plain C99 value type, fixed-width
+    // integers only; zero-initialized == empty. Bucket index orders:
+    // dense_rows[10]: 0 decode, 1 mtp_verify, 2 role_other, 3 short_context,
+    //   4 dense_tail, 5 unknown_boundary, 6 unsupported, 7 high_cost, 8 no_plan,
+    //   9 full_attention_layer.
+    // pool_rebuild[2]: 0 slice, 1 exact_all.
+    // plan_invalidations[3]: 0 bypassed, 1 empty_snapshot, 2 no_plan.
+    typedef struct llama_flashprefill_metrics_slice {
+        uint64_t eligible_rows;
+        uint64_t sparse_rows;
+        uint64_t dense_packed;
+        uint64_t dense_rows[10];
+        uint64_t selected_blocks;
+        uint64_t corrected_blocks;
+        uint64_t visible_tokens;
+        uint64_t exact_tokens;
+        uint64_t pool_rebuild[2];
+        uint64_t plan_invalidations[3];
+        uint64_t scratch_live_bytes;
+        uint64_t scratch_peak_bytes;
+        uint64_t layout_us;
+        uint8_t  has_layout_us;
+        // GPU dispatch microseconds per phase, sampled post-completion
+        // (0/unset until the VulkanDispatch hook reports).
+        uint64_t gpu_pool_us;
+        uint64_t gpu_select_us;
+        uint64_t gpu_attn_us;
+        uint8_t  has_gpu_us;
+    } llama_flashprefill_metrics_slice;
+
+    // Drain one consumed metrics delta from a live context into caller-owned
+    // `out`. Returns 0 when a non-empty delta was drained (out filled),
+    // 1 when empty or the policy is OFF (out zeroed), -1 on NULL ctx/out.
+    LLAMA_API int32_t llama_flashprefill_metrics_drain(
+            struct llama_context * ctx,
+            llama_flashprefill_metrics_slice * out);
 
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)

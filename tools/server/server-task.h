@@ -730,6 +730,42 @@ struct server_task_result_metrics : server_task_result {
     // exact pre-RERoT schema with no allocation for the rerot block.
     server_rerot_metrics rerot;
 
+    // FlashPrefill V2 GPU-determined totals (MetricsIntegration owner).
+    // Copied from server_metrics (context drain merged post_decode,
+    // successful-only) by the SERVER_TASK_TYPE_METRICS handler. All zero
+    // while OFF (serializer emits no flashprefill series then). dense_rows
+    // index order: 0 decode, 1 mtp_verify, 2 role_other, 3 short_context,
+    // 4 dense_tail, 5 unknown_boundary, 6 unsupported, 7 high_cost, 8 no_plan,
+    // 9 full_attention_layer (graph summary actuals);
+    // pool_rebuild: 0 slice, 1 exact_all; plan_invalidations: 0 bypassed,
+    // 1 empty_snapshot, 2 no_plan. Server-side eligible/dense-reason totals
+    // ride the existing fp_eligible_rows/fp_dense_by_reason fields below
+    // (ServerRouting owner) and are not duplicated here.
+    uint64_t fp_sparse_rows = 0;
+    uint64_t fp_dense_packed = 0;
+    uint64_t fp_dense_rows[10] = {};
+    uint64_t fp_selected_blocks = 0;
+    uint64_t fp_corrected_blocks = 0;
+    uint64_t fp_visible_tokens = 0;
+    uint64_t fp_exact_tokens = 0;
+    uint64_t fp_pool_rebuild[2] = {};
+    uint64_t fp_plan_invalidations[3] = {};
+    uint64_t fp_scratch_live_bytes = 0;
+    uint64_t fp_scratch_peak_bytes = 0;
+    uint64_t fp_layout_us_total = 0;
+    uint64_t fp_layout_slices_measured = 0;
+    uint64_t fp_gpu_pool_us_total = 0;
+    uint64_t fp_gpu_select_us_total = 0;
+    uint64_t fp_gpu_attn_us_total = 0;
+    uint64_t fp_gpu_slices_measured = 0;
+
+    // FlashPrefill server-side attribution (ServerRouting owner; copied here
+    // for the serializer, same as the Tri fields above).
+    uint64_t fp_eligible_rows = 0;
+    uint64_t fp_dense_by_reason[7] = {};
+    uint64_t fp_policy_fingerprint = 0;
+    bool     fp_has_policy = false;
+
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result
     json slots_data = json::array();

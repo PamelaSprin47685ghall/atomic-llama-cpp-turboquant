@@ -10,6 +10,7 @@ file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
 
 add_library(llama
             ../include/llama.h
+            ../include/llama-flashprefill.h
             llama.cpp
             llama-adapter.cpp
             llama-arch.cpp
@@ -17,6 +18,12 @@ add_library(llama
             llama-chat.cpp
             llama-context.cpp
             llama-cparams.cpp
+            llama-flashprefill.h
+            llama-flashprefill.cpp
+            llama-flashprefill-metrics.h
+            llama-flashprefill-metrics.cpp
+            llama-flashprefill-state.h
+            llama-flashprefill-state.cpp
             llama-grammar.cpp
             llama-graph.cpp
             llama-hparams.cpp

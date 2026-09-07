@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama-batch.h"
+#include "llama-flashprefill-layout.h"
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
@@ -287,6 +288,51 @@ public:
     rerot_resolved_view rerot_resolve_view(const llama_rerot_reader_view & view) const;
 
     //
+    // FlashPrefill legal-fragment planning (CacheFragments)
+    //
+    // Owner-derived short-lived layout: legal fragments, query phase groups
+    // (same structure as the existing graph RoPE input; K is never re-phased)
+    // and deduped exact rows. The old indexed rerot_build_attn_layout() above
+    // is preserved untouched as the dense/oracle OFF path; building this
+    // layout never forces old entries generation.
+    //
+    // role uses the frozen llama_flashprefill_role values; only PREFILL
+    // (ordinary) and REROT_TEACHER_FORCED are ever eligible, everything else
+    // yields an ineligible layout carrying its dense reason (never sparse on
+    // doubt). block_k/BN, causal, and capacities come from params (caller
+    // maps policy/wire config); SWA/alibi/2-D capability gates are evaluated
+    // here from owner state. out is always assigned (cleared first).
+    // Returns true iff the layout is eligible. Hard errors set error and
+    // return false; policy ineligibility is not an error.
+    bool flashprefill_build_layout(
+        const llama_ubatch & ubatch,
+        int32_t role,
+        const llama_flashprefill_layout_params & params,
+        llama_flashprefill_layout & out,
+        std::string * error = nullptr) const;
+
+    // Owner cache-side mutation epoch. Bumped on every metadata mutation
+    // (append, seq_rm/cp/keep/add/div, reclaim, compact, shift update,
+    // restore, publish/reclassify/ref/freeze, view/tag writes) once the flash
+    // path is active; OFF performs no counter writes at all. Layouts stamp
+    // this value plus the per-stream CellGeneration pairs; any mismatch means
+    // stale (fail-closed).
+    uint64_t flashprefill_epoch() const { return fp_epoch; }
+
+    // Lazily opt into CellGeneration tracking on every stream. Called from the
+    // flash path only (first build); OFF never calls it, so OFF keeps zero
+    // generation overhead. Idempotent.
+    void flashprefill_enable_tracking() const;
+
+    bool flashprefill_tracking_enabled() const;
+
+    // Per-stream CellGeneration (stamp, generation) pairs for freshness keys.
+    // Never exact-+1 compares; saturated (MAX) either means always-invalid.
+    void flashprefill_cell_stamps(std::vector<llama_flashprefill_cell_stamp> & out) const;
+
+    uint32_t flashprefill_n_streams() const;
+
+    //
     // graph_build API
     //
 
@@ -404,6 +450,23 @@ private:
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
+
+    // FlashPrefill owner mutation epoch (see flashprefill_epoch()). Bumped by
+    // fp_bump() on every metadata mutation listed on the accessor, but ONLY
+    // once the flash path has activated (fp_active): OFF keeps zero
+    // per-mutation overhead — a single predictable branch, no counter write,
+    // no allocation, no scheduling effect. Starts at 1 so a zero epoch
+    // unambiguously means "never stamped". Activation happens exclusively via
+    // flashprefill_enable_tracking(), which the flash build calls first and
+    // captures stamps afterwards, so no pre-activation state can validate.
+    uint64_t fp_epoch = 1;
+    mutable bool fp_active = false;
+
+    void fp_bump() {
+        if (fp_active) {
+            ++fp_epoch;
+        }
+    }
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
@@ -567,6 +630,46 @@ public:
     bool rerot_active() const;
     const llama_rerot_attn_layout & get_rerot_attn_layout() const;
 
+    //
+    // FlashPrefill legal-fragment planning (CacheFragments)
+    //
+    // Explicit build/get accessor keyed by the OWNED ubatch (index into this
+    // context's ubatch vector; the ubatch storage is owned here via shared
+    // data, so no borrowed-pointer lifetime hazard) plus role and capacities.
+    // The role is a frozen llama_flashprefill_role value supplied by the
+    // caller (ContextIntegration descriptor when available); capacities come
+    // from params. Existing memory-context wrappers call build directly from
+    // the graph attention KV input; groups() output feeds raw-Q RoPE.
+    //
+    // build returns true iff the layout is eligible and fresh. False means
+    // either policy-ineligible (reason in get_layout().dense_reason, no error
+    // text) or a hard error (get_layout().error set, error out-param set
+    // when provided). get returns the last built layout (cleared/ineligible
+    // when nothing was built). is_fresh revalidates owner stamps without
+    // rebuilding. Layouts never outlive mutation: next()/apply() drop them
+    // (conservative per-graph rebuild) and every owner mutation advances the
+    // stamps they are validated against.
+    bool flashprefill_build_layout(
+        uint32_t ubatch_index,
+        int32_t role,
+        const llama_flashprefill_layout_params & params,
+        std::string * error = nullptr) const;
+
+    // Graph-attention entry point: builds for the CURRENT owned ubatch
+    // (i_cur), since graph KV inputs only see get_ubatch() and never the
+    // index. Identical keying/freshness semantics to the indexed overload;
+    // fails closed (false + reason) on full/update contexts without ubatches.
+    bool flashprefill_build_current_layout(
+        int32_t role,
+        const llama_flashprefill_layout_params & params,
+        std::string * error = nullptr) const;
+
+    const llama_flashprefill_layout & flashprefill_get_layout() const;
+
+    bool flashprefill_layout_is_fresh() const;
+
+    const llama_flashprefill_build_key & flashprefill_layout_key() const;
+
     ggml_tensor * build_input_rerot_q_indices(ggml_context * ctx) const;
     ggml_tensor * build_input_rerot_q_pos(ggml_context * ctx, uint32_t n_pos) const;
     ggml_tensor * build_input_rerot_entries(ggml_context * ctx) const;
@@ -623,4 +726,13 @@ private:
 
     mutable bool rerot_layout_ready = false;
     mutable llama_rerot_attn_layout rerot_layout;
+
+    // FlashPrefill planning cache (mutable so const graph KV inputs can build;
+    // same discipline as rerot_layout above). Keyed by owned ubatch + role +
+    // capacities; validated against owner stamps on every use.
+    mutable bool fp_key_valid = false;
+    mutable llama_flashprefill_build_key fp_key;
+    mutable llama_flashprefill_layout fp_layout;
+    mutable uint64_t fp_cells_epoch = 0;
+    mutable std::vector<llama_flashprefill_cell_stamp> fp_cell_stamps;
 };

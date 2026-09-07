@@ -61,6 +61,11 @@ struct llama_ubatch {
         std::vector<int32_t>        seq_idx;
         std::vector<int8_t>         output;
 
+        // optional source-row map: source_row[i] is the original batch row for ubatch row i.
+        // empty when source-row tracking is disabled or unavailable. owned here so the
+        // ubatch pointer below stays valid as long as data is alive (async safe).
+        std::vector<int32_t>        source_row;
+
         // RERoT variable-N grouped metadata storage
         std::vector<uint32_t>       person_id;
         std::vector<int32_t>        pen_id;
@@ -77,6 +82,12 @@ struct llama_ubatch {
     int32_t      *  pen_id         = nullptr; // [n_tokens] pen/lane-local identity
     uint32_t        n_people       = 0;       // number of active people in this ubatch
     uint32_t     *  person_offsets = nullptr; // [n_people + 1] ragged offsets: person i's pens span [offsets[i], offsets[i+1])
+
+    // optional source-row map: source_row[i] is the original batch row (index into the
+    // llama_batch passed to init) for ubatch row i. nullptr means unavailable (tracking
+    // disabled via set_source_row_tracking(false) or synthetic ubatch via ubatch_reserve).
+    // never a guessed coordinate. when non-null, points into data->source_row.
+    int32_t      *  source_row     = nullptr; // [n_tokens] original batch row, nullptr if unavailable
 };
 
 // a helper for sanitizing, fulfilling and splitting a batch
@@ -95,6 +106,13 @@ public:
             bool output_all);
 
     const llama_batch & get_batch() const;
+
+    // opt-in source-row tracking: when enabled before init(), each ubatch produced by
+    // split_simple/equal/seq carries source_row[i] = original batch row for ubatch row i.
+    // default disabled: no map allocation, split semantics unchanged, ubatch.source_row == nullptr.
+    // ubatch_reserve() never carries a map (synthetic rows, no source batch).
+    void set_source_row_tracking(bool enabled);
+    bool get_source_row_tracking() const;
 
     uint32_t get_n_tokens()  const;
     uint32_t get_n_outputs() const;
@@ -180,6 +198,10 @@ private:
 
     // used[i] indicates if token i has already been used in a previous ubatch
     std::vector<bool> used;
+
+    // opt-in flag only; the per-ubatch map itself lives in each ubatch's data_t so no
+    // prior-batch map can leak across init/retry/reserve reuse. preserved by clear().
+    bool track_source_rows = false;
 
     int debug;
 };

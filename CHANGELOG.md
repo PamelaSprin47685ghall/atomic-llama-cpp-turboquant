@@ -10,6 +10,48 @@ commit list underneath.
 
 Releases before `b10269-1.5.0` predate this file; see the git history.
 
+## Unreleased
+
+### Added
+
+- **FlashPrefill V2 sparse prefill (experimental, opt-in, default off;
+  implementation and compile delivered, runtime acceptance NOT RUN).**
+  New `--flashprefill off|auto|required` policy plus tuning flags
+  (`--flashprefill-alpha`, `--flashprefill-block-q`, `--flashprefill-block-k`,
+  `--flashprefill-sink-blocks`, `--flashprefill-window-blocks`,
+  `--flashprefill-dense-tail-tiles`, `--flashprefill-tail-scope`,
+  `--flashprefill-min-kv`, `--flashprefill-full-attn-layers`,
+  `--flashprefill-mean-correction`, `--flashprefill-exact-all`), backed by new
+  GGML ops (`GGML_OP_FLASH_PREFILL_POOL/SELECT/ATTN`), CPU reference kernels,
+  Vulkan native kernels, always-emitted `/metrics` series
+  (`llamacpp:flashprefill_*`, zeros while OFF; GPU totals merged only after
+  successful graph slices; GPU dispatch times 0 until the timestamp hook
+  reports; required-mode enforcement is graph-side, metrics only counts),
+  and `scripts/flashprefill-matrix.py` /
+  `scripts/flashprefill-quality.py` harnesses. Only ordinary prefill and
+  bounded RERoT teacher-forced injections are sparse-eligible (ordinary
+  dispatch shared over supported KV shapes; raw-Q RERoT hooks Qwen3.5
+  dense/MoE only, including current Ornith weights); decode, MTP
+  draft/verify,
+  embeddings, rerank, out-of-family RERoT, recurrent/SWA layers,
+  transposed-V or multi-stream layouts, special KQ bias, and unsupported
+  backends keep the existing dense path. TriAttention (`3/32`) semantics and the RERoT
+  active-lane MTP pause are unchanged. See `PREFILL.md`.
+
+### Notes
+
+- **Acceptance not run.** The server, 4 new tests and 7 existing test
+  targets all compile/link clean (`build-prefill/bin/llama-server`;
+  baseline frozen separately), but no tests, benchmarks, quality gates, or
+  deployment have been executed. No performance or quality claims are made;
+  the Definition-of-Done checklist in `PREFILL.md` §21.3 remains fully
+  unchecked. Hashes: see `build-prefill-evidence/manifest.json` and
+  `binary-libraries.sha256`.
+- State restores across contexts/processes/restarts are deliberately rejected
+  (enabled-only 64-byte policy envelope; re-prefill on mismatch; no sidecar
+  file). Qwen3.5 dense/MoE family only; other architectures get no automatic
+  sparse routing.
+
 ## b10269-1.5.1
 
 ### Fixed

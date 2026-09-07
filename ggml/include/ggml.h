@@ -599,6 +599,10 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_FLASH_PREFILL_POOL,
+        GGML_OP_FLASH_PREFILL_SELECT,
+        GGML_OP_FLASH_PREFILL_ATTN,
+
         GGML_OP_COUNT,
     };
 
@@ -1375,6 +1379,74 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 alpha,
             float                 limit);
+
+    // FlashPrefill V2 exact-all / sparse-correction ops (separate identities, not RERoT).
+    // All capacities are explicit host scalars; backends must not read GPU counts to size outputs.
+    // op_params carry a 16x int32 (64 B) ggml_flashprefill_op_params by value, no host pointers.
+    //   POOL:   src[0]=K (cache), src[1]=V (cache), src[2]=metadata (I32),
+    //           src[3]=k_dep (optional ordering edge on K write, else NULL),
+    //           src[4]=v_dep (optional ordering edge on V write, else NULL) -> pool F32
+    //   SELECT: src[0]=Q (F32), src[1]=pool (F32), src[2]=metadata (I32) -> plan I32
+    //   ATTN:   src[0]=Q (F32), src[1]=K, src[2]=V, src[3]=pool (F32),
+    //           src[4]=plan (I32), src[5]=metadata (I32),
+    //           src[6]=sinks (optional F32, NULL when absent) -> output F32
+    // Agreed shapes (RERoT-style): Q F32 [Dk, n_groups, Hq, 1];
+    // K/V actual cache [D, nkv, Hkv, 1]; pool F32 [Dk+Dv, Hkv, Fcap];
+    // output F32 [Dv, Hq, n_output_queries, 1]. max_sel is the maximum
+    // actual per (tile, head) use count, not the global use count.
+    // k_dep/v_dep are ordering-only; backends must honor the edge, never read contents.
+    GGML_API struct ggml_tensor * ggml_flash_prefill_pool(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * metadata,
+            struct ggml_tensor  * k_dep,
+            struct ggml_tensor  * v_dep,
+            int32_t               dk,
+            int32_t               dv,
+            int32_t               n_kv_heads,
+            int64_t               f_cap);
+
+    GGML_API struct ggml_tensor * ggml_flash_prefill_select(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * pool,
+            struct ggml_tensor  * metadata,
+            int64_t               n_tiles,
+            int64_t               n_kv_heads,
+            int64_t               max_sel,
+            float                 scale,
+            float                 alpha,
+            float                 softcap,
+            int32_t               exact_all,
+            bool                  mean_correction);
+
+    GGML_API struct ggml_tensor * ggml_flash_prefill_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * pool,
+            struct ggml_tensor  * plan,
+            struct ggml_tensor  * metadata,
+            struct ggml_tensor  * sinks,
+            int64_t               n_output_queries,
+            int64_t               n_heads,
+            int32_t               dv,
+            float                 scale,
+            float                 softcap,
+            bool                  mean_correction);
+
+    GGML_API void ggml_flash_prefill_select_set_mean_correction(
+            struct ggml_tensor * t,
+            bool                 mean_correction);
+    GGML_API bool ggml_flash_prefill_select_get_mean_correction(
+            const struct ggml_tensor * t);
+    GGML_API void ggml_flash_prefill_attn_set_mean_correction(
+            struct ggml_tensor * t,
+            bool                 mean_correction);
+    GGML_API bool ggml_flash_prefill_attn_get_mean_correction(
+            const struct ggml_tensor * t);
 
     // normalize along rows
     GGML_API struct ggml_tensor * ggml_norm(

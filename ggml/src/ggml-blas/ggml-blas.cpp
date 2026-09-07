@@ -438,6 +438,11 @@ static bool ggml_backend_blas_device_supports_op(ggml_backend_dev_t dev, const s
                    (ggml_is_contiguous(src1) || ggml_is_transposed(src1)) &&
                    (src0->type == GGML_TYPE_F32 || ggml_get_type_traits(src0->type)->to_float != NULL);
 
+        case GGML_OP_FLASH_PREFILL_POOL:
+        case GGML_OP_FLASH_PREFILL_SELECT:
+        case GGML_OP_FLASH_PREFILL_ATTN:
+            return false;
+
         default:
             return false;
 

@@ -1,0 +1,661 @@
+#version 450
+// FlashPrefill V2 SELECT: per-(tile, kv_head) max-energy classification.
+// Scalable bounded design (Main): owner provides uses AND rows sorted by
+// (tile, kv_head) (CacheFragments canonical; schema version unchanged).
+// Each workgroup binary-searches its pair range (O(log U), O(log R)) and
+// touches only its bounded range: per-pair uses P<=max_sel (device plan
+// header), per-pair rows Rp (block_q<=256 packed sources x Hq, bounded).
+// No global n_use/n_row scans per inner loop: distinct-frag dedup is O(P^2)
+// local, phase lookup scans P (not U_global), dots are scalar single-thread
+// (tid0) over Dk. Each phase QK dot computed once in a single online
+// max-energy pass (M + rescaled S[f] in proxy-slice score buffer, reused
+// safely: init barrier before, own slice only, sequential in-workgroup).
+// Deterministic tie>=, mandatory/partial/full rules, exact_all, increasing
+// use order, OVER_CAPACITY never truncates. Counters per WireReference:
+// sparse_rows = packed rows with >=1 proxy-listed matched use (exact_all,
+// all-exact, empty/no-use rows dense; empty never sparse); visible_tokens =
+// sum over ALL metadata uses; exact_tokens = exact-listed only; token unit
+// counts each use once. 32-bit atomics with lo/carry/hi only (no INT64
+// atomics; no uint64_t arithmetic) for AMD CeramicScanner.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+#include "types.glsl"
+#include "flashprefill-interface.h"
+
+layout(local_size_x_id = FP_SPEC_WGSIZE, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = FP_SPEC_WGSIZE) const uint WorkGroupSize = 64;
+
+layout(binding = FP_BIND_Q) readonly buffer QBUF { float data_q[]; };
+layout(binding = FP_BIND_POOL) readonly buffer POOLB { float data_pool[]; };
+layout(binding = FP_BIND_META) readonly buffer METAB { int data_meta[]; };
+layout(binding = FP_BIND_DST) buffer PLANB { int data_plan[]; };
+
+layout(push_constant) uniform FpSelectPushBlock { FP_SELECT_PUSH_FIELDS } p;
+
+// (tile,head) lexicographic compare of use i vs (t,h). Requires uses sorted
+// by (tile,kv_head) (owner canonical). Returns -1/0/+1.
+int use_pair_cmp(uint idx, uint use_off, int t, int h) {
+    int ut = data_meta[use_off + idx * 8u + FP_UW_TILE];
+    int uh = data_meta[use_off + idx * 8u + FP_UW_KV_HEAD];
+    if (ut != t) return ut < t ? -1 : 1;
+    if (uh != h) return uh < h ? -1 : 1;
+    return 0;
+}
+
+int row_pair_cmp(uint idx, uint row_off, int t, int h) {
+    int rt = data_meta[row_off + idx * 8u + FP_RW_TILE];
+    int rh = data_meta[row_off + idx * 8u + FP_RW_KV_HEAD];
+    if (rt != t) return rt < t ? -1 : 1;
+    if (rh != h) return rh < h ? -1 : 1;
+    return 0;
+}
+
+uint lower_bound_use(uint n_use, uint use_off, int t, int h) {
+    uint lo = 0u, hi = n_use;
+    while (lo < hi) {
+        uint mid = lo + (hi - lo) / 2u;
+        if (use_pair_cmp(mid, use_off, t, h) < 0) lo = mid + 1u;
+        else hi = mid;
+    }
+    return lo;
+}
+
+uint upper_bound_use(uint n_use, uint use_off, int t, int h) {
+    uint lo = 0u, hi = n_use;
+    while (lo < hi) {
+        uint mid = lo + (hi - lo) / 2u;
+        if (use_pair_cmp(mid, use_off, t, h) <= 0) lo = mid + 1u;
+        else hi = mid;
+    }
+    return lo;
+}
+
+uint lower_bound_row(uint n_row, uint row_off, int t, int h) {
+    uint lo = 0u, hi = n_row;
+    while (lo < hi) {
+        uint mid = lo + (hi - lo) / 2u;
+        if (row_pair_cmp(mid, row_off, t, h) < 0) lo = mid + 1u;
+        else hi = mid;
+    }
+    return lo;
+}
+
+uint upper_bound_row(uint n_row, uint row_off, int t, int h) {
+    uint lo = 0u, hi = n_row;
+    while (lo < hi) {
+        uint mid = lo + (hi - lo) / 2u;
+        if (row_pair_cmp(mid, row_off, t, h) <= 0) lo = mid + 1u;
+        else hi = mid;
+    }
+    return lo;
+}
+
+void main() {
+    uint t = gl_WorkGroupID.x;
+    uint h = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationIndex;
+    uint wgsize = gl_WorkGroupSize.x;
+    bool is_init = (p.phase == 0u);
+
+    // ---- common: read device metadata header (bounds-checked) ----
+    // For init, plan header is uninitialized: do not read it.
+    if (p.meta_words < FP_META_HDR_WORDS) {
+        return; // cannot even flag; dispatch sized output valid anyway
+    }
+    if (data_meta[FP_MH_MAGIC] != int(FP_MAGIC_META)) return;
+    if (data_meta[FP_MH_VERSION] != int(FP_VERSION)) return;
+    uint n_frag = uint(data_meta[FP_MH_N_FRAG]);
+    uint f_cap = uint(data_meta[FP_MH_F_CAP]);
+    uint n_row = uint(data_meta[FP_MH_N_ROW]);
+    uint r_cap = uint(data_meta[FP_MH_R_CAP]);
+    uint n_use = uint(data_meta[FP_MH_N_USE]);
+    uint u_cap = uint(data_meta[FP_MH_U_CAP]);
+    uint n_cell = uint(data_meta[FP_MH_N_CELL]);
+    uint c_cap = uint(data_meta[FP_MH_C_CAP]);
+    uint frag_off = uint(data_meta[FP_MH_FRAG_OFF]);
+    uint row_off = uint(data_meta[FP_MH_ROW_OFF]);
+    uint use_off = uint(data_meta[FP_MH_USE_OFF]);
+    uint ctab = uint(data_meta[FP_MH_CELL_OFF]);
+    uint dk_dev = uint(data_meta[FP_MH_DK]);
+    uint Hdev = uint(data_meta[FP_MH_N_HKV]);
+    uint n_groups_dev = uint(data_meta[FP_MH_N_GROUPS]);
+    uint n_qheads_dev = uint(data_meta[FP_MH_N_QHEADS]);
+    // Validate caps (push) vs device actuals. Dims exact, counts bounded.
+    if (dk_dev != p.dk) return;
+    if (n_groups_dev > p.q_groups_cap || n_qheads_dev > p.q_heads_cap) return;
+    if (Hdev > p.hkv_cap) return;
+    if (f_cap != p.f_cap || r_cap > p.r_cap || u_cap > p.u_cap || c_cap > p.c_cap) {
+        // Device caps exceed host allocation caps: cannot safely proceed.
+        // Init cannot flag (plan uninit); select flags via atomicMax below.
+        if (!is_init && tid == 0u) {
+            // Plan header may still be readable; best-effort flag.
+            if (p.plan_words >= FP_PLAN_HDR_WORDS + 10u) {
+                atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_CAP_EXCEEDED));
+            }
+        }
+        return;
+    }
+    if (n_frag > f_cap || n_row > r_cap || n_use > u_cap || n_cell > c_cap) return;
+    if (frag_off != 32u || row_off != 32u + 8u * f_cap) return;
+    if (use_off != row_off + 8u * r_cap) return;
+    if (ctab != use_off + 8u * u_cap) return;
+    if (p.meta_words < ctab + c_cap) return;
+    uint Tdev = 0u;
+    // n_tiles actual = max tile+1 over rows and uses (device). Bounded by r_cap.
+    for (uint r = 0u; r < n_row; ++r) {
+        int tt = data_meta[row_off + r * 8u + FP_RW_TILE];
+        if (tt >= 0 && uint(tt) + 1u > Tdev) Tdev = uint(tt) + 1u;
+    }
+    for (uint u = 0u; u < n_use; ++u) {
+        int tt = data_meta[use_off + u * 8u + FP_UW_TILE];
+        if (tt >= 0 && uint(tt) + 1u > Tdev) Tdev = uint(tt) + 1u;
+    }
+    // max_sel actual = max per-(tile,head) use count (device). Needs pair
+    // histogram; bounded single pass over uses with small T/H? T*H may be
+    // large (r_cap x H). Instead bound: max_sel <= n_use (trivially) and
+    // host plan was sized with plan_max_sel_for_meta at build time. Init
+    // recomputes exact max via per-pair binary-search counts below? That
+    // needs T/H loops. Cheaper: init grid covers caps; each init workgroup
+    // handles one (t,h) cap pair and counts via binary search (O(log U)),
+    // then atomicMax to a header slot? No cross-workgroup init race for
+    // max (atomicMax safe, never cleared). But header T/max_sel must be
+    // written once. Two-step init within phase 0: step A (all cap pairs
+    // count + atomicMax max_sel slot + atomicMax T slot), barrier? No global
+    // barrier! atomics only. Step B (workgroup 0 spins waiting for all? No).
+    // Cannot safely finalize header in phase 0 without a barrier between
+    // counting and publishing. Resolution: host plan_init already published
+    // T/H/max_sel/offsets at build time (host knew actuals then); device
+    // init must NOT recompute them, only zero error/counters/tables. So init
+    // reads T/H/max_sel from the device plan header (host-written), exactly
+    // like select. No recomputation, no race beyond header-only-by-(0,0).
+    if (is_init) {
+        if (p.plan_words < FP_PLAN_HDR_WORDS) return;
+        // Cap grid guard: actuals read after validation below.
+        uint T = uint(data_plan[FP_PH_N_TILES]);
+        uint H = uint(data_plan[FP_PH_N_HEADS]);
+        uint max_sel = uint(data_plan[FP_PH_MAX_SEL]);
+        if (data_plan[FP_PH_MAGIC] != int(FP_MAGIC_PLAN)) return;
+        if (data_plan[FP_PH_VERSION] != int(FP_VERSION)) return;
+        if (T == 0u || H == 0u || H != Hdev) {
+            // Header mismatch: only (0,0) flags to avoid atomic storms.
+            if (t == 0u && h == 0u && tid == 0u) {
+                data_plan[FP_PH_ERROR] = int(FP_ERR_BAD_LAYOUT);
+            }
+            return;
+        }
+        if (t >= T || h >= H) return; // cap-grid over-dispatch guard
+        uint exact_off = uint(data_plan[FP_PH_EXACT_OFF]);
+        uint proxy_off = uint(data_plan[FP_PH_PROXY_OFF]);
+        uint counts_off = uint(data_plan[FP_PH_COUNTS_OFF]);
+        uint pair = t * H + h;
+        for (uint s = tid; s < max_sel; s += wgsize) {
+            data_plan[exact_off + pair * max_sel + s] = -1;
+            data_plan[proxy_off + pair * max_sel + s] = -1;
+        }
+        for (uint k = tid; k < 2u; k += wgsize) {
+            data_plan[counts_off + pair * 2u + k] = 0;
+        }
+        if (t == 0u && h == 0u) {
+            // Header zeroing: single workgroup, strided threads, no race
+            // (no other workgroup touches header words in init).
+            if (tid == 0u) {
+                data_plan[FP_PH_ERROR] = int(FP_OK);
+                data_plan[FP_PH_SPARSE_ROWS] = 0;
+                data_plan[FP_PH_DENSE_ROWS] = 0;
+                data_plan[FP_PH_SELECTED] = 0;
+                data_plan[FP_PH_CORRECTED] = 0;
+                data_plan[FP_PH_VIS_LO] = 0;
+                data_plan[FP_PH_VIS_HI] = 0;
+                data_plan[FP_PH_EXACT_TOK_LO] = 0;
+                data_plan[FP_PH_EXACT_TOK_HI] = 0;
+                // req_exact_all echo + offsets/total untouched (host-set).
+            }
+        }
+        return;
+    }
+
+    // ---- phase 1: select ----
+    // Single-thread control (tid0); others idle (no subgroup assumption).
+    if (tid != 0u) return;
+    if (p.plan_words < FP_PLAN_HDR_WORDS) return;
+    uint T = uint(data_plan[FP_PH_N_TILES]);
+    uint H = uint(data_plan[FP_PH_N_HEADS]);
+    uint max_sel = uint(data_plan[FP_PH_MAX_SEL]);
+    uint exact_off = uint(data_plan[FP_PH_EXACT_OFF]);
+    uint proxy_off = uint(data_plan[FP_PH_PROXY_OFF]);
+    uint counts_off = uint(data_plan[FP_PH_COUNTS_OFF]);
+    if (data_plan[FP_PH_MAGIC] != int(FP_MAGIC_PLAN)) return;
+    if (data_plan[FP_PH_VERSION] != int(FP_VERSION)) return;
+    if (data_plan[FP_PH_HDR_WORDS] != int(FP_PLAN_HDR_WORDS)) {
+        atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_LAYOUT));
+        return;
+    }
+    if (T == 0u || H == 0u || H != Hdev || T != Tdev) {
+        atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_LAYOUT));
+        return;
+    }
+    if (t >= T || h >= H) return; // cap-grid guard
+    if (exact_off != 24u || proxy_off != 24u + T * H * max_sel) {
+        atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_LAYOUT));
+        return;
+    }
+    if (counts_off != proxy_off + T * H * max_sel) {
+        atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_LAYOUT));
+        return;
+    }
+    if (p.plan_words < counts_off + 2u * T * H) {
+        atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_CAP_EXCEEDED));
+        return;
+    }
+    if (p.alpha <= 0.0f || p.alpha > 1.0f) {
+        atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_CONFIG));
+        return;
+    }
+    uint pair = t * H + h;
+
+    // Canonical ranges via binary search (owner sorted by (tile,kv_head)).
+    uint u_lo = lower_bound_use(n_use, use_off, int(t), int(h));
+    uint u_hi = upper_bound_use(n_use, use_off, int(t), int(h));
+    uint r_lo = lower_bound_row(n_row, row_off, int(t), int(h));
+    uint r_hi = upper_bound_row(n_row, row_off, int(t), int(h));
+    // Boundary validation: neighbors outside ranges must not match (else
+    // unsorted -> execution error, never silent subset).
+    if (u_lo > 0u && use_pair_cmp(u_lo - 1u, use_off, int(t), int(h)) == 0) {
+        data_plan[counts_off + pair * 2u + 0u] = 0;
+        data_plan[counts_off + pair * 2u + 1u] = 0;
+        atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_LAYOUT));
+        return;
+    }
+    if (u_hi < n_use && use_pair_cmp(u_hi, use_off, int(t), int(h)) == 0) {
+        data_plan[counts_off + pair * 2u + 0u] = 0;
+        data_plan[counts_off + pair * 2u + 1u] = 0;
+        atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_LAYOUT));
+        return;
+    }
+    if (r_lo > 0u && row_pair_cmp(r_lo - 1u, row_off, int(t), int(h)) == 0) {
+        data_plan[counts_off + pair * 2u + 0u] = 0;
+        data_plan[counts_off + pair * 2u + 1u] = 0;
+        atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_LAYOUT));
+        return;
+    }
+    if (r_hi < n_row && row_pair_cmp(r_hi, row_off, int(t), int(h)) == 0) {
+        data_plan[counts_off + pair * 2u + 0u] = 0;
+        data_plan[counts_off + pair * 2u + 1u] = 0;
+        atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_LAYOUT));
+        return;
+    }
+    // In-range match validation (bounded P/Rp, not global).
+    for (uint u = u_lo; u < u_hi; ++u) {
+        if (use_pair_cmp(u, use_off, int(t), int(h)) != 0) {
+            data_plan[counts_off + pair * 2u + 0u] = 0;
+            data_plan[counts_off + pair * 2u + 1u] = 0;
+            atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_LAYOUT));
+            return;
+        }
+    }
+    uint P = u_hi - u_lo;
+    uint Rp = r_hi - r_lo;
+    if (P > max_sel) {
+        data_plan[counts_off + pair * 2u + 0u] = 0;
+        data_plan[counts_off + pair * 2u + 1u] = 0;
+        atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_OVER_CAPACITY));
+        return;
+    }
+
+    // Per-use validation over local range only (bounded). Builds pair_vis
+    // (sum over ALL pair uses for visible_tokens) with 32-bit adds locally;
+    // global 64-bit via lo/carry/hi atomics at the end (no int64).
+    uint pair_vis = 0u;
+    for (uint k = 0u; k < P; ++k) {
+        uint u = u_lo + k;
+        uint ub = use_off + u * 8u;
+        int frag = data_meta[ub + FP_UW_FRAG];
+        int qg = data_meta[ub + FP_UW_Q_GROUP];
+        int so = data_meta[ub + FP_UW_SUB_OFF];
+        int sc = data_meta[ub + FP_UW_SUB_CNT];
+        int fl = data_meta[ub + FP_UW_FLAGS];
+        int sq = data_meta[ub + FP_UW_SRC_Q];
+        if (frag < 0 || uint(frag) >= n_frag || qg < 0 || uint(qg) >= n_groups_dev) {
+            data_plan[counts_off + pair * 2u + 0u] = 0;
+            data_plan[counts_off + pair * 2u + 1u] = 0;
+            atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_RANGE));
+            return;
+        }
+        if (sc <= 0 || so < 0 || (fl & ~FP_USE_FLAG_MANDATORY) != 0 || sq < 0) {
+            data_plan[counts_off + pair * 2u + 0u] = 0;
+            data_plan[counts_off + pair * 2u + 1u] = 0;
+            atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_RANGE));
+            return;
+        }
+        uint fb = frag_off + uint(frag) * 8u;
+        int fco = data_meta[fb + FP_FR_CELL_OFF];
+        int fcc = data_meta[fb + FP_FR_CELL_CNT];
+        int ffl = data_meta[fb + FP_FR_FLAGS];
+        if (fco < 0 || fcc <= 0 || uint(fco) + uint(fcc) > c_cap) {
+            data_plan[counts_off + pair * 2u + 0u] = 0;
+            data_plan[counts_off + pair * 2u + 1u] = 0;
+            atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_RANGE));
+            return;
+        }
+        if ((ffl & ~FP_FRAG_FLAG_BOUNDARY_PARTIAL) != 0) {
+            data_plan[counts_off + pair * 2u + 0u] = 0;
+            data_plan[counts_off + pair * 2u + 1u] = 0;
+            atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_FLAG));
+            return;
+        }
+        if (uint(so) + uint(sc) > c_cap || so < fco || uint(so) + uint(sc) > uint(fco) + uint(fcc)) {
+            data_plan[counts_off + pair * 2u + 0u] = 0;
+            data_plan[counts_off + pair * 2u + 1u] = 0;
+            atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_RANGE));
+            return;
+        }
+        // Orphan check within local row range (source match).
+        bool matched = false;
+        bool dense_touch = false;
+        for (uint j = 0u; j < Rp; ++j) {
+            uint rb = row_off + (r_lo + j) * 8u;
+            if (data_meta[rb + FP_RW_SRC_Q] != sq) continue;
+            matched = true;
+            if ((data_meta[rb + FP_RW_FLAGS] & FP_ROW_FLAG_DENSE_FORCE) != 0) dense_touch = true;
+        }
+        if (!matched) {
+            data_plan[counts_off + pair * 2u + 0u] = 0;
+            data_plan[counts_off + pair * 2u + 1u] = 0;
+            atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_ORPHAN_USE));
+            return;
+        }
+        if (dense_touch && (fl & FP_USE_FLAG_MANDATORY) == 0) {
+            data_plan[counts_off + pair * 2u + 0u] = 0;
+            data_plan[counts_off + pair * 2u + 1u] = 0;
+            atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_DENSE_ROW_PROXY));
+            return;
+        }
+        pair_vis += uint(sc);
+    }
+    // Row validation over local range (bounded).
+    uint n_dense_pair = 0u;
+    for (uint j = 0u; j < Rp; ++j) {
+        uint rb = row_off + (r_lo + j) * 8u;
+        int qh = data_meta[rb + FP_RW_Q_HEAD];
+        int sq = data_meta[rb + FP_RW_SRC_Q];
+        int pb = data_meta[rb + FP_RW_PBEGIN];
+        int pe = data_meta[rb + FP_RW_PEND];
+        int fl = data_meta[rb + FP_RW_FLAGS];
+        if (qh < 0 || uint(qh) >= n_qheads_dev || sq < 0 || pb < 0 || pe <= pb) {
+            data_plan[counts_off + pair * 2u + 0u] = 0;
+            data_plan[counts_off + pair * 2u + 1u] = 0;
+            atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_RANGE));
+            return;
+        }
+        if ((fl & ~FP_ROW_FLAG_DENSE_FORCE) != 0) {
+            data_plan[counts_off + pair * 2u + 0u] = 0;
+            data_plan[counts_off + pair * 2u + 1u] = 0;
+            atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_FLAG));
+            return;
+        }
+        if ((fl & FP_ROW_FLAG_DENSE_FORCE) != 0) n_dense_pair++;
+    }
+
+    if (P == 0u) {
+        // No candidates: empty lists, rows (if any) dense, never sparse.
+        data_plan[counts_off + pair * 2u + 0u] = 0;
+        data_plan[counts_off + pair * 2u + 1u] = 0;
+        atomicAdd(data_plan[FP_PH_DENSE_ROWS], int(Rp));
+        return;
+    }
+
+    if (p.exact_all != 0) {
+        // All-exact: dense by definition (no skipped work), never sparse.
+        data_plan[counts_off + pair * 2u + 0u] = 0;
+        data_plan[counts_off + pair * 2u + 1u] = 0;
+        // P<=max_sel checked above.
+        for (uint k = 0u; k < P; ++k) {
+            data_plan[exact_off + pair * max_sel + k] = int(u_lo + k);
+        }
+        data_plan[counts_off + pair * 2u + 0u] = int(P);
+        data_plan[counts_off + pair * 2u + 1u] = 0;
+        atomicAdd(data_plan[FP_PH_SELECTED], int(P));
+        atomicAdd(data_plan[FP_PH_DENSE_ROWS], int(Rp));
+        uint old_lo = uint(atomicAdd(data_plan[FP_PH_VIS_LO], int(pair_vis)));
+        if (old_lo + pair_vis < old_lo) atomicAdd(data_plan[FP_PH_VIS_HI], 1);
+        uint old_e = uint(atomicAdd(data_plan[FP_PH_EXACT_TOK_LO], int(pair_vis)));
+        if (old_e + pair_vis < old_e) atomicAdd(data_plan[FP_PH_EXACT_TOK_HI], 1);
+        return;
+    }
+
+    // ---- sparse online single pass (each phase QK dot once) ----
+    // Score buffer: proxy slice reinterpreted as float S[frag-slot].
+    // Own slice only, sequential, barrier-separated from init dispatch.
+    // Steps: enumerate distinct frags in local order into exact slice as
+    // frag-id scratch? No: keep frag order implicit via first-use index.
+    // S buffer slots indexed by distinct-ordinal d (0..F-1), stored at
+    // proxy_off+pair*max_sel+d as float bits. F<=P<=max_sel fits.
+    uint F = 0u;
+    // First: distinct frag ordinals via local dedup (O(P^2) bounded).
+    // Store frag ids temporarily in exact slice (scratch, overwritten later
+    // by final exact list; safe: same workgroup, sequential).
+    for (uint k = 0u; k < P; ++k) {
+        uint u = u_lo + k;
+        int frag = data_meta[use_off + u * 8u + FP_UW_FRAG];
+        bool seen = false;
+        for (uint d = 0u; d < F; ++d) {
+            int pf = data_plan[exact_off + pair * max_sel + d];
+            if (pf == frag) { seen = true; break; }
+        }
+        if (!seen) {
+            data_plan[exact_off + pair * max_sel + F] = frag;
+            // Init score slot to 0.0 bits.
+            data_plan[proxy_off + pair * max_sel + F] = int(0);
+            F++;
+        }
+    }
+    const float NEGH = uintBitsToFloat(0xFEFFFFFFu);
+    float M = NEGH;
+    bool have = false;
+    uint dtot = p.dk + p.dv_cap;
+    // Single rule (frozen): candidate not full across the tile =>
+    // mandatory exact AND the entire column excluded from energy M/Smax
+    // (cand_full==0 masks the column). Fully legal candidates score valid
+    // row pairs only. Conservative partial-boundary extension: prevents any
+    // pollutant future/hidden input from altering legal plan/output, and
+    // matches CPU. Unscored (excluded) fragments go exact below.
+    // Single online pass over distinct frags x rows (local ranges only);
+    // each phase QK dot computed once.
+    for (uint d = 0u; d < F; ++d) {
+        int frag = data_plan[exact_off + pair * max_sel + d];
+        // Column-full: every local use carrying this frag is full-fragment.
+        bool col_full = true;
+        for (uint k = 0u; k < P; ++k) {
+            uint u = u_lo + k;
+            uint uub = use_off + u * 8u;
+            if (data_meta[uub + FP_UW_FRAG] != frag) continue;
+            int so = data_meta[uub + FP_UW_SUB_OFF];
+            int sc = data_meta[uub + FP_UW_SUB_CNT];
+            uint fb = frag_off + uint(frag) * 8u;
+            bool full = (so == data_meta[fb + FP_FR_CELL_OFF])
+                     && (sc == data_meta[fb + FP_FR_CELL_CNT]);
+            if (!full) { col_full = false; break; }
+        }
+        if (!col_full) continue; // excluded column: exact, no energy
+        for (uint j = 0u; j < Rp; ++j) {
+            uint rb = row_off + (r_lo + j) * 8u;
+            int rsq = data_meta[rb + FP_RW_SRC_Q];
+            uint rqh = uint(data_meta[rb + FP_RW_Q_HEAD]);
+            // Phase for (frag,source): unique local use (key uniqueness).
+            // Column is full, so any present pair is fully legal; missing
+            // pairs (frag illegal for this query) are skipped.
+            int qg = -1;
+            for (uint k = 0u; k < P; ++k) {
+                uint u = u_lo + k;
+                uint uub = use_off + u * 8u;
+                if (data_meta[uub + FP_UW_FRAG] != frag) continue;
+                if (data_meta[uub + FP_UW_SRC_Q] != rsq) continue;
+                qg = data_meta[uub + FP_UW_Q_GROUP];
+                break;
+            }
+            if (qg < 0) continue; // frag not legal for this row's query
+            float dot = 0.0f;
+            for (uint dd = 0u; dd < p.dk; ++dd) {
+                uint q_idx = (uint(qg) * p.q_nb1 + rqh * p.q_nb2) / 4u + dd;
+                uint pb_idx = (uint(frag) * H + h) * dtot + dd;
+                dot += data_q[q_idx] * data_pool[pb_idx];
+            }
+            float z = fp_softcap_apply(p.scale * dot, p.softcap);
+            if (!fp_isfinite(z)) {
+                data_plan[counts_off + pair * 2u + 0u] = 0;
+                data_plan[counts_off + pair * 2u + 1u] = 0;
+                atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_INPUT));
+                return;
+            }
+            if (!have) {
+                M = z; have = true;
+                float cur = uintBitsToFloat(uint(data_plan[proxy_off + pair * max_sel + d]));
+                cur += 1.0f; // exp(z-M)=1 for the max element itself
+                data_plan[proxy_off + pair * max_sel + d] = int(floatBitsToUint(cur));
+            } else if (z > M) {
+                // Rescale all accumulated S by exp(oldM-newM), then add.
+                float rescale = exp(M - z);
+                for (uint dd2 = 0u; dd2 < F; ++dd2) {
+                    float s = uintBitsToFloat(uint(data_plan[proxy_off + pair * max_sel + dd2]));
+                    s *= rescale;
+                    data_plan[proxy_off + pair * max_sel + dd2] = int(floatBitsToUint(s));
+                }
+                M = z;
+                float cur = uintBitsToFloat(uint(data_plan[proxy_off + pair * max_sel + d]));
+                cur += 1.0f;
+                data_plan[proxy_off + pair * max_sel + d] = int(floatBitsToUint(cur));
+            } else {
+                float cur = uintBitsToFloat(uint(data_plan[proxy_off + pair * max_sel + d]));
+                cur += exp(z - M);
+                data_plan[proxy_off + pair * max_sel + d] = int(floatBitsToUint(cur));
+            }
+        }
+    }
+    if (!have) {
+        // No legal energy pairs. P==0 handled earlier (empty lists); here
+        // P>0 with every pair skipped as partial/illegal. Partial uses MUST
+        // be exact (never proxy, never unlistedINVALID): classify all exact.
+        // No proxy work skipped, so rows dense, never sparse.
+        for (uint k = 0u; k < P; ++k) {
+            data_plan[exact_off + pair * max_sel + k] = int(u_lo + k);
+        }
+        data_plan[counts_off + pair * 2u + 0u] = int(P);
+        data_plan[counts_off + pair * 2u + 1u] = 0;
+        atomicAdd(data_plan[FP_PH_SELECTED], int(P));
+        atomicAdd(data_plan[FP_PH_DENSE_ROWS], int(Rp));
+        uint et_all = 0u;
+        for (uint k = 0u; k < P; ++k) {
+            et_all += uint(data_meta[use_off + (u_lo + k) * 8u + FP_UW_SUB_CNT]);
+        }
+        uint old_lo0 = uint(atomicAdd(data_plan[FP_PH_VIS_LO], int(pair_vis)));
+        if (old_lo0 + pair_vis < old_lo0) atomicAdd(data_plan[FP_PH_VIS_HI], 1);
+        uint old_e0 = uint(atomicAdd(data_plan[FP_PH_EXACT_TOK_LO], int(et_all)));
+        if (old_e0 + et_all < old_e0) atomicAdd(data_plan[FP_PH_EXACT_TOK_HI], 1);
+        return;
+    }
+    float maxS = 0.0f;
+    for (uint d = 0u; d < F; ++d) {
+        float s = uintBitsToFloat(uint(data_plan[proxy_off + pair * max_sel + d]));
+        maxS = max(maxS, s);
+    }
+    float thresh = p.alpha * maxS;
+
+    // Final classification in increasing use order (deterministic, single
+    // pass). Frag ordinals recomputed on the fly in first-use order (same
+    // order used for score slots); proxy score slots (Sf>=thresh <=> keep)
+    // are read but never overwritten until the proxy write for that same
+    // slot position below, and ordinal lookup does not touch exact-slice
+    // frag scratch, so there is no scratch-clobber hazard.
+    uint e = 0u, px = 0u, etok = 0u;
+    // Per-row sparse flags: Rp bounded, track via proxy-presence per row.
+    // Use exact slice [0..P) as row-sparse bytes? Row count Rp unbounded by
+    // max_sel. Instead compute sparse rows in the same loop: for each row,
+    // scan P uses for a proxy-listed match (O(Rp*P) bounded local).
+    for (uint k = 0u; k < P; ++k) {
+        uint u = u_lo + k;
+        uint ub = use_off + u * 8u;
+        int frag = data_meta[ub + FP_UW_FRAG];
+        int fl = data_meta[ub + FP_UW_FLAGS];
+        int sc = data_meta[ub + FP_UW_SUB_CNT];
+        int so = data_meta[ub + FP_UW_SUB_OFF];
+        bool mandatory = (fl & FP_USE_FLAG_MANDATORY) != 0;
+        uint fb = frag_off + uint(frag) * 8u;
+        bool full = (so == data_meta[fb + FP_FR_CELL_OFF]) && (sc == data_meta[fb + FP_FR_CELL_CNT]);
+        // Column-full (single rule): any partial use of this frag in the
+        // pair excludes the whole column from energy and forces all its
+        // uses exact. Unscored fragments are exact, never proxy.
+        bool col_full = true;
+        for (uint kc = 0u; kc < P; ++kc) {
+            uint uc = u_lo + kc;
+            if (data_meta[use_off + uc * 8u + FP_UW_FRAG] != frag) continue;
+            int soc = data_meta[use_off + uc * 8u + FP_UW_SUB_OFF];
+            int scc = data_meta[use_off + uc * 8u + FP_UW_SUB_CNT];
+            if ((soc != data_meta[fb + FP_FR_CELL_OFF])
+                || (scc != data_meta[fb + FP_FR_CELL_CNT])) {
+                col_full = false;
+                break;
+            }
+        }
+        // Recompute ordinal deterministically (first-use order over local P).
+        uint ord = 0u;
+        for (uint kk = 0u; kk < P; ++kk) {
+            uint uu = u_lo + kk;
+            int ff = data_meta[use_off + uu * 8u + FP_UW_FRAG];
+            bool seen = false;
+            for (uint k2 = 0u; k2 < kk; ++k2) {
+                if (data_meta[use_off + (u_lo + k2) * 8u + FP_UW_FRAG] == ff) { seen = true; break; }
+            }
+            if (!seen) {
+                if (ff == frag) break;
+                ord++;
+            }
+        }
+        float Sf = uintBitsToFloat(uint(data_plan[proxy_off + pair * max_sel + ord]));
+        bool keep = (Sf >= thresh);
+        bool exact = mandatory || !full || !col_full || keep;
+        if (exact) {
+            if (e >= max_sel) {
+                data_plan[counts_off + pair * 2u + 0u] = 0;
+                data_plan[counts_off + pair * 2u + 1u] = 0;
+                atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_OVER_CAPACITY));
+                return;
+            }
+            data_plan[exact_off + pair * max_sel + e] = int(u);
+            e++;
+            etok += uint(sc);
+        } else {
+            if (px >= max_sel) {
+                data_plan[counts_off + pair * 2u + 0u] = 0;
+                data_plan[counts_off + pair * 2u + 1u] = 0;
+                atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_OVER_CAPACITY));
+                return;
+            }
+            data_plan[proxy_off + pair * max_sel + px] = int(u);
+            px++;
+        }
+    }
+    data_plan[counts_off + pair * 2u + 0u] = int(e);
+    data_plan[counts_off + pair * 2u + 1u] = int(px);
+    atomicAdd(data_plan[FP_PH_SELECTED], int(e));
+    atomicAdd(data_plan[FP_PH_CORRECTED], int(px));
+    // Sparse rows: packed rows with >=1 proxy-listed matched use.
+    uint n_sparse = 0u;
+    for (uint j = 0u; j < Rp; ++j) {
+        uint rb = row_off + (r_lo + j) * 8u;
+        int rsq = data_meta[rb + FP_RW_SRC_Q];
+        bool is_sparse = false;
+        for (uint kk = 0u; kk < px; ++kk) {
+            uint uu = uint(data_plan[proxy_off + pair * max_sel + kk]);
+            if (data_meta[use_off + uu * 8u + FP_UW_SRC_Q] == rsq) { is_sparse = true; break; }
+        }
+        if (is_sparse) n_sparse++;
+    }
+    atomicAdd(data_plan[FP_PH_SPARSE_ROWS], int(n_sparse));
+    atomicAdd(data_plan[FP_PH_DENSE_ROWS], int(Rp - n_sparse));
+    uint old_lo = uint(atomicAdd(data_plan[FP_PH_VIS_LO], int(pair_vis)));
+    if (old_lo + pair_vis < old_lo) atomicAdd(data_plan[FP_PH_VIS_HI], 1);
+    uint old_e = uint(atomicAdd(data_plan[FP_PH_EXACT_TOK_LO], int(etok)));
+    if (old_e + etok < old_e) atomicAdd(data_plan[FP_PH_EXACT_TOK_HI], 1);
+}

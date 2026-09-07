@@ -1722,6 +1722,153 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.rerot_trace = true;
         }
     ).set_env("LLAMA_ARG_REROT_TRACE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    // FlashPrefill V2 policy (PREFILL.md §12). Defaults are OFF with the frozen
+    // v1 policy values; every handler below mutates only params.flashprefill and
+    // never enables Tri/RERoT nor disables speculative decoding/MTP routing.
+    add_opt(common_arg(
+        {"--flashprefill"}, "off|auto|required",
+        "FlashPrefill V2 sparse prefill policy (default: off; auto selects eligible prefill attention, required reports unsupported eligible cases as errors; decode, draft, verify and embedding paths stay dense)",
+        [](common_params & params, const std::string & value) {
+            if (value == "off") {
+                params.flashprefill.mode = LLAMA_FLASHPREFILL_MODE_OFF;
+            } else if (value == "auto") {
+                params.flashprefill.mode = LLAMA_FLASHPREFILL_MODE_AUTO;
+            } else if (value == "required") {
+                params.flashprefill.mode = LLAMA_FLASHPREFILL_MODE_REQUIRED;
+            } else {
+                throw std::invalid_argument("FlashPrefill mode must be 'off', 'auto' or 'required'");
+            }
+        }
+    ).set_env("LLAMA_ARG_FLASHPREFILL").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--flashprefill-alpha"}, "F",
+        string_format("FlashPrefill tile-energy threshold factor, finite and in (0, 1], not a sparsity ratio (default: %g)", (double) params.flashprefill.alpha),
+        [](common_params & params, const std::string & value) {
+            size_t pos = 0;
+            const double alpha = std::stod(value, &pos);
+            if (pos != value.size() || !std::isfinite(alpha) || alpha <= 0.0 || alpha > 1.0) {
+                throw std::invalid_argument("FlashPrefill alpha must be finite and in (0, 1]");
+            }
+            params.flashprefill.alpha = (float) alpha;
+        }
+    ).set_env("LLAMA_ARG_FLASHPREFILL_ALPHA").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--flashprefill-block-q"}, "N",
+        string_format("FlashPrefill BM: packed Q rows per tile, integer in [1, 256], not query tokens (default: %u)", params.flashprefill.block_q),
+        [](common_params & params, const std::string & value) {
+            size_t pos = 0;
+            const long long block_q = std::stoll(value, &pos);
+            if (pos != value.size() || block_q < 1 || block_q > 256) {
+                throw std::invalid_argument("FlashPrefill block-q (BM) must be an integer in [1, 256]");
+            }
+            params.flashprefill.block_q = (uint32_t) block_q;
+        }
+    ).set_env("LLAMA_ARG_FLASHPREFILL_BLOCK_Q").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--flashprefill-block-k"}, "N",
+        string_format("FlashPrefill BN: logical K block for selection/mean stats, multiple of 64 in [64, 1024] (default: %u)", params.flashprefill.block_k),
+        [](common_params & params, const std::string & value) {
+            size_t pos = 0;
+            const long long block_k = std::stoll(value, &pos);
+            if (pos != value.size() || block_k < 64 || block_k > 1024 || block_k % 64 != 0) {
+                throw std::invalid_argument("FlashPrefill block-k (BN) must be a multiple of 64 in [64, 1024]");
+            }
+            params.flashprefill.block_k = (uint32_t) block_k;
+        }
+    ).set_env("LLAMA_ARG_FLASHPREFILL_BLOCK_K").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--flashprefill-sink-blocks"}, "N",
+        string_format("FlashPrefill mandatory exact prefix blocks, non-negative integer (default: %u)", params.flashprefill.sink_blocks),
+        [](common_params & params, const std::string & value) {
+            size_t pos = 0;
+            const long long sink_blocks = std::stoll(value, &pos);
+            if (pos != value.size() || sink_blocks < 0 || sink_blocks > (long long) UINT32_MAX) {
+                throw std::invalid_argument("FlashPrefill sink-blocks must be a non-negative integer");
+            }
+            params.flashprefill.sink_blocks = (uint32_t) sink_blocks;
+        }
+    ).set_env("LLAMA_ARG_FLASHPREFILL_SINK_BLOCKS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--flashprefill-window-blocks"}, "N",
+        string_format("FlashPrefill mandatory exact local/partial-visibility blocks, non-negative integer (default: %u)", params.flashprefill.window_blocks),
+        [](common_params & params, const std::string & value) {
+            size_t pos = 0;
+            const long long window_blocks = std::stoll(value, &pos);
+            if (pos != value.size() || window_blocks < 0 || window_blocks > (long long) UINT32_MAX) {
+                throw std::invalid_argument("FlashPrefill window-blocks must be a non-negative integer");
+            }
+            params.flashprefill.window_blocks = (uint32_t) window_blocks;
+        }
+    ).set_env("LLAMA_ARG_FLASHPREFILL_WINDOW_BLOCKS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--flashprefill-dense-tail-tiles"}, "N",
+        string_format("FlashPrefill trailing packed-Q tiles kept dense, non-negative integer, interpreted with --flashprefill-tail-scope (default: %u)", params.flashprefill.dense_tail_tiles),
+        [](common_params & params, const std::string & value) {
+            size_t pos = 0;
+            const long long tail_tiles = std::stoll(value, &pos);
+            if (pos != value.size() || tail_tiles < 0 || tail_tiles > (long long) UINT32_MAX) {
+                throw std::invalid_argument("FlashPrefill dense-tail-tiles must be a non-negative integer");
+            }
+            params.flashprefill.dense_tail_tiles = (uint32_t) tail_tiles;
+        }
+    ).set_env("LLAMA_ARG_FLASHPREFILL_DENSE_TAIL_TILES").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--flashprefill-tail-scope"}, "call|logical-prompt",
+        "FlashPrefill dense-tail scope: call measures the tail against this call's query range (reference alignment), logical-prompt against the frozen logical prefill range (production long-prompt mode) (default: logical-prompt)",
+        [](common_params & params, const std::string & value) {
+            if (value == "call") {
+                params.flashprefill.tail_scope = LLAMA_FLASHPREFILL_TAIL_CALL;
+            } else if (value == "logical-prompt") {
+                params.flashprefill.tail_scope = LLAMA_FLASHPREFILL_TAIL_LOGICAL_PROMPT;
+            } else {
+                throw std::invalid_argument("FlashPrefill tail-scope must be 'call' or 'logical-prompt'");
+            }
+        }
+    ).set_env("LLAMA_ARG_FLASHPREFILL_TAIL_SCOPE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--flashprefill-min-kv"}, "N",
+        string_format("FlashPrefill eligibility floor on resident-visible tokens, non-negative integer (default: %u)", params.flashprefill.min_kv),
+        [](common_params & params, const std::string & value) {
+            size_t pos = 0;
+            const long long min_kv = std::stoll(value, &pos);
+            if (pos != value.size() || min_kv < 0 || min_kv > (long long) UINT32_MAX) {
+                throw std::invalid_argument("FlashPrefill min-kv must be a non-negative integer");
+            }
+            params.flashprefill.min_kv = (uint32_t) min_kv;
+        }
+    ).set_env("LLAMA_ARG_FLASHPREFILL_MIN_KV").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--flashprefill-full-attn-layers"}, "N",
+        string_format("FlashPrefill count of first eligible full-attention layers kept dense, not first N model layers, non-negative integer (default: %u)", params.flashprefill.full_attn_layers),
+        [](common_params & params, const std::string & value) {
+            size_t pos = 0;
+            const long long full_attn_layers = std::stoll(value, &pos);
+            if (pos != value.size() || full_attn_layers < 0 || full_attn_layers > (long long) UINT32_MAX) {
+                throw std::invalid_argument("FlashPrefill full-attn-layers must be a non-negative integer");
+            }
+            params.flashprefill.full_attn_layers = (uint32_t) full_attn_layers;
+        }
+    ).set_env("LLAMA_ARG_FLASHPREFILL_FULL_ATTN_LAYERS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--flashprefill-mean-correction"}, "on|off",
+        "FlashPrefill mean correction: on is the production mode, off is ablation only and never completes V2 (default: on)",
+        [](common_params & params, const std::string & value) {
+            if (value == "on") {
+                params.flashprefill.mean_correction = true;
+            } else if (value == "off") {
+                params.flashprefill.mean_correction = false;
+            } else {
+                throw std::invalid_argument("FlashPrefill mean-correction must be 'on' or 'off'");
+            }
+        }
+    ).set_env("LLAMA_ARG_FLASHPREFILL_MEAN_CORRECTION").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--flashprefill-exact-all"},
+        "FlashPrefill debug gate: route through the new prefill path with all legal fragments exact (default: off)",
+        [](common_params & params) {
+            params.flashprefill.exact_all = true;
+        }
+    ).set_env("LLAMA_ARG_FLASHPREFILL_EXACT_ALL").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(

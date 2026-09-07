@@ -121,6 +121,9 @@ void ggml_compute_forward_opt_step_adamw(const struct ggml_compute_params * para
 void ggml_compute_forward_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_fwht(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_opt_step_sgd(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_flash_prefill_pool(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_flash_prefill_select(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_flash_prefill_attn(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 #ifdef __cplusplus
 }
 #endif

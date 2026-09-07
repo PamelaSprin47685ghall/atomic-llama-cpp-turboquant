@@ -177,6 +177,16 @@ struct server_batch {
     float  alora_scale       = -1.0f;
     size_t alora_disabled_id = 0;
 
+    // FlashPrefill V2 routing sidecar (ServerRouting ownership).
+    // Parallel to tokens[]: fp_rows[i] describes tokens[i] with a frozen
+    // llama_flashprefill_row (role + seq/reader identity + logical pos +
+    // frozen prefill interval). Same clear() lifetime as tokens, same off
+    // slicing as get_view(). OFF (default): stays empty forever — no
+    // allocation, no split/sync change. Context-internal source-row mapping
+    // (BatchIdentity) is not needed here; the server slices by off only and
+    // the context validates n_rows == batch.n_tokens on its copy.
+    std::vector<llama_flashprefill_row> fp_rows;
+
     server_batch() {
         batch.pos = nullptr; // sentinel: uninitialized batch
     }
@@ -220,6 +230,9 @@ struct server_batch {
     void clear() {
         tokens.clear();
         embd.clear();
+        fp_rows.clear();
+        // OFF: fp_rows never reserved; enabled path reserves at most
+        // n_tokens_alloc once per iteration (no per-row growth).
         common_batch_clear(batch);
         slot_batched      = nullptr;
         alora_scale       = -1.0f;
@@ -241,9 +254,18 @@ struct server_batch {
         tokens[idx].output = output;
     }
 
+    // Push one frozen row parallel to the last add()ed token. Caller (impl)
+    // gates on fp_enabled, so OFF never allocates here. Must be called
+    // exactly once per successful add() while enabled to keep row identity.
+    void fp_push_row(const llama_flashprefill_row & row) {
+        fp_rows.push_back(row);
+    }
+
     void render() {
         GGML_ASSERT(!batch_rendered);
         GGML_ASSERT(batch.pos != nullptr);
+        // Row identity: enabled => exactly one row per token; OFF => no rows.
+        GGML_ASSERT(fp_rows.empty() || fp_rows.size() == tokens.size());
         common_batch_clear(batch);
         for (int32_t i = 0; i < size(); i++) {
             const auto & t = tokens[i];
@@ -276,6 +298,30 @@ struct server_batch {
         };
 
         return view;
+    }
+
+    // Borrowed versioned execution view sliced by the same off/n as get_view().
+    // Lifetime: valid until the next clear()/render(), exactly like the batch
+    // view (the callee must copy before async submit; the context does).
+    // OFF: returns an empty view (n_rows==0, rows==NULL) — the decode path
+    // then takes the ordinary llama_decode() dense route with zero new work.
+    llama_flashprefill_exec fp_exec_view(int32_t off, int32_t n_tokens) const {
+        llama_flashprefill_exec exec = {};
+        exec.version = LLAMA_FLASHPREFILL_EXEC_VERSION;
+        exec.struct_size = (uint32_t) sizeof(llama_flashprefill_exec);
+        if (fp_rows.empty()) {
+            exec.n_rows = 0;
+            exec.reserved0 = 0;
+            exec.rows = nullptr;
+            return exec;
+        }
+        GGML_ASSERT(batch_rendered);
+        GGML_ASSERT(off >= 0 && off + n_tokens <= (int32_t) fp_rows.size());
+        GGML_ASSERT(n_tokens > 0);
+        exec.n_rows = (uint32_t) n_tokens;
+        exec.reserved0 = 0;
+        exec.rows = fp_rows.data() + off;
+        return exec;
     }
 };
 
@@ -469,6 +515,20 @@ struct server_slot {
     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
 
+    // FlashPrefill V2 per-slot routing state (ServerRouting ownership).
+    // fp_boundary: frozen ordinary logical-prefill suffix, set once after the
+    //   prefix-cache final n_past decision (STARTED path) and persisted across
+    //   ubatches until reset/release. New requests must not inherit it.
+    // fp_eligible_rows / fp_dense_by_reason: per-request (slot-lifetime)
+    //   successful-only distribution, indexed by fp_dense_reason_index().
+    //   Incremented exclusively from the post_decode success path; retry,
+    //   fatal-error, and cancel paths never touch them. OFF: boundary stays
+    //   unknown and all counters stay zero (no allocation beyond these inline
+    //   fields, no behavior change).
+    server_flashprefill_routing::fp_slot_boundary fp_boundary;
+    uint64_t fp_eligible_rows = 0;
+    uint64_t fp_dense_by_reason[7] = {};
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -539,6 +599,14 @@ struct server_slot {
         rerot_inflight_extra_bytes.clear();
         rerot_inflight_forced = false;
         rerot_serial_tail = false;
+
+        // FlashPrefill: new requests must not inherit the previous request's
+        // frozen interval or its successful-only distribution.
+        fp_boundary = server_flashprefill_routing::fp_slot_boundary();
+        fp_eligible_rows = 0;
+        for (int i = 0; i < 7; ++i) {
+            fp_dense_by_reason[i] = 0;
+        }
     }
 
     void init_sampler() const {
@@ -652,9 +720,26 @@ struct server_slot {
     }
 
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
-    void handle_last_sampled_token(server_batch & batch) {
+    // fp_enabled gates the FlashPrefill sidecar: OFF leaves batch.fp_rows empty
+    // (no allocation, no split/sync change). When enabled, exactly one frozen
+    // row is pushed per successful add() to keep row identity. All decode rows
+    // below are conservative dense (never sparse): ordinary decode, MTP/target
+    // verification, and speculative replay all keep the pre-existing attention
+    // path, and the existing active-lane MTP pause is untouched (this function
+    // never drafts for rerot_internal slots; those go through
+    // rerot_append_planned_token).
+    void handle_last_sampled_token(server_batch & batch, bool fp_enabled) {
+        namespace fp = server_flashprefill_routing;
         bool add_ok = true;
         bool handled_append_chunk = false;
+        // Dense row template for decode-phase rows: unknown boundary forbids
+        // any logical-prompt tail guessing; decode position is irrelevant to
+        // routing so logical_pos stays UNKNOWN.
+        const fp::fp_slot_boundary fp_unknown;
+        auto fp_decode_row = [&](int32_t role) {
+            return fp::make_row(role, id, LLAMA_FLASHPREFILL_READER_NONE,
+                LLAMA_FLASHPREFILL_POS_UNKNOWN, fp_unknown);
+        };
         if (!token_append_chunk.empty()) {
             GGML_ASSERT(spec_draft.empty());
             GGML_ASSERT(token_append_anchor != LLAMA_TOKEN_NULL);
@@ -665,8 +750,15 @@ struct server_slot {
             const int32_t batch0 = batch.size();
 
             add_ok &= batch.add(id, token_append_anchor, pos0++, false);
+            if (fp_enabled && add_ok) {
+                batch.fp_push_row(fp_decode_row(LLAMA_FLASHPREFILL_ROLE_DECODE));
+            }
             for (size_t i = 0; i < token_append_chunk.size(); ++i) {
-                add_ok &= batch.add(id, token_append_chunk[i], pos0++, i + 1 == token_append_chunk.size());
+                const bool ok = batch.add(id, token_append_chunk[i], pos0++, i + 1 == token_append_chunk.size());
+                add_ok &= ok;
+                if (fp_enabled && ok) {
+                    batch.fp_push_row(fp_decode_row(LLAMA_FLASHPREFILL_ROLE_DECODE));
+                }
             }
 
             i_batch = batch0 + (int32_t) token_append_chunk.size();
@@ -685,6 +777,9 @@ struct server_slot {
             } else {
                 add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true);
             }
+            if (fp_enabled && add_ok) {
+                batch.fp_push_row(fp_decode_row(LLAMA_FLASHPREFILL_ROLE_DECODE));
+            }
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
                     sampled, n_ctx, prompt.n_tokens(), truncated);
@@ -701,9 +796,24 @@ struct server_slot {
 
             auto pos0 = prompt.tokens.pos_next();
 
+            // Target-verification batch (sampled + drafts): must never route
+            // sparse. Replay-after-restore uses SPECULATIVE_REPLAY, all other
+            // verification batches use MTP_VERIFY (covers MTP draft/target
+            // verification; external-draft verification is equally dense and
+            // shares the same DENSE_ROLE server reason).
+            const int32_t verify_role = spec_is_replay
+                ? LLAMA_FLASHPREFILL_ROLE_SPECULATIVE_REPLAY
+                : LLAMA_FLASHPREFILL_ROLE_MTP_VERIFY;
             add_ok &= batch.add(id, sampled, pos0++, true);
+            if (fp_enabled && add_ok) {
+                batch.fp_push_row(fp_decode_row(verify_role));
+            }
             for (auto token : spec_draft) {
-                add_ok &= batch.add(this->id, token, pos0++, true);
+                const bool ok = batch.add(this->id, token, pos0++, true);
+                add_ok &= ok;
+                if (fp_enabled && ok) {
+                    batch.fp_push_row(fp_decode_row(verify_role));
+                }
             }
         }
 
@@ -1032,11 +1142,49 @@ struct server_slot {
     }
 };
 
-
-
 //
 // server_metrics
 //
+
+// Saturating once-per-successful-slice merge of one context drain delta
+// (MetricsIntegration owner; declared in server-context.h). Gauges:
+// scratch_live overwrites (buffers reused), scratch_peak maxes, layout time
+// sums measured slices only (unmeasured slices contribute nothing).
+void server_flashprefill_routing::fp_gpu_merge_slice(
+        fp_gpu_deltas & acc, const struct llama_flashprefill_metrics_slice & d) {
+    const auto sat_add = [](uint64_t a, uint64_t b) {
+        return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+    };
+    acc.sparse_rows     = sat_add(acc.sparse_rows, d.sparse_rows);
+    acc.dense_packed    = sat_add(acc.dense_packed, d.dense_packed);
+    acc.selected_blocks = sat_add(acc.selected_blocks, d.selected_blocks);
+    acc.corrected_blocks = sat_add(acc.corrected_blocks, d.corrected_blocks);
+    acc.visible_tokens  = sat_add(acc.visible_tokens, d.visible_tokens);
+    acc.exact_tokens    = sat_add(acc.exact_tokens, d.exact_tokens);
+    for (int i = 0; i < 10; ++i) {
+        acc.dense_rows[i] = sat_add(acc.dense_rows[i], d.dense_rows[i]);
+    }
+    for (int i = 0; i < 2; ++i) {
+        acc.pool_rebuild[i] = sat_add(acc.pool_rebuild[i], d.pool_rebuild[i]);
+    }
+    for (int i = 0; i < 3; ++i) {
+        acc.plan_invalidations[i] = sat_add(acc.plan_invalidations[i], d.plan_invalidations[i]);
+    }
+    acc.scratch_live_bytes = d.scratch_live_bytes;
+    if (d.scratch_peak_bytes > acc.scratch_peak_bytes) {
+        acc.scratch_peak_bytes = d.scratch_peak_bytes;
+    }
+    if (d.has_layout_us) {
+        acc.layout_us_total = sat_add(acc.layout_us_total, d.layout_us);
+        acc.layout_slices_measured += 1;
+    }
+    if (d.has_gpu_us) {
+        acc.gpu_pool_us_total   = sat_add(acc.gpu_pool_us_total, d.gpu_pool_us);
+        acc.gpu_select_us_total = sat_add(acc.gpu_select_us_total, d.gpu_select_us);
+        acc.gpu_attn_us_total   = sat_add(acc.gpu_attn_us_total, d.gpu_attn_us);
+        acc.gpu_slices_measured += 1;
+    }
+}
 
 struct server_metrics {
     int64_t t_start = 0;
@@ -1056,6 +1204,39 @@ struct server_metrics {
 
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
+
+    // FlashPrefill V2 metrics accumulator contract (ServerRouting ownership).
+    // Successful-only, cumulative for the process lifetime, all zero while OFF
+    // (no series emitted, no GPU work counted):
+    //   fp_eligible_rows: rows constructed with a sparse-eligible role
+    //     (PREFILL or REROT_TEACHER_FORCED) and a known frozen boundary,
+    //     counted once per successful decode slice covering the row.
+    //   fp_dense_by_reason[7]: server-attributable dense rows by bounded
+    //     DENSE_* route label, indexed by fp_dense_reason_index()
+    //     (DENSE_OFF..DENSE_CAPACITY). Today the server fills DENSE_ROLE
+    //     (decode / MTP verify / replay / frontier / embedding / rerank /
+    //     multimodal) and DENSE_UNKNOWN_BOUNDARY (eligible role but no known
+    //     interval); SHORT/T tail/UNSUPPORTED/CAPACITY refinements arrive via
+    //     the pending GPU aggregate hook (never faked here).
+    //   fp_policy_fingerprint / fp_has_policy: policy identity for state and
+    //     cache isolation (llama_flashprefill_fingerprint over config +
+    //     model/adapter ids). OFF (default): fp_has_policy==false, omitted.
+    // GPU-determined totals (MetricsIntegration owner): sparse/dense-packed
+    // plan counts, granular dense buckets, selected/corrected blocks,
+    // visible/exact tokens, pool/plan bounded reasons, scratch live/peak,
+    // host layout time. Producer: the context drain
+    // (llama_flashprefill_metrics_drain) merged in fp_merge_gpu_slice() on
+    // the post_decode success path with the same once-per-slice discipline
+    // as fp_count_slice_success (saturating addition; see fp_gpu_deltas in
+    // server-context.h). All zero while OFF (serializer emits zeros then at
+    // no counting cost, per the matrix off_baseline contract); GPU work is
+    // counted only after successful graph completion, never from theoretical
+    // eligibility.
+    uint64_t fp_eligible_rows = 0;
+    uint64_t fp_dense_by_reason[7] = {};
+    uint64_t fp_policy_fingerprint = 0;
+    bool     fp_has_policy = false;
+    server_flashprefill_routing::fp_gpu_deltas fp_gpu;
 
     void init() {
         t_start = ggml_time_us();
@@ -1199,6 +1380,172 @@ private:
 
     server_inference_mode inference_mode = SERVER_INFERENCE_MODE_DECODE;
     int32_t id_slot_prefill = -1;
+
+    // FlashPrefill V2 server policy (ServerRouting ownership).
+    // Default is always OFF (llama_flashprefill_default_config): fp_enabled
+    // false, sidecar never allocated, scheduling byte-identical to baseline.
+    // Remaining dependencies (not guessed here): ConfigIntegration declares
+    // llama_context_params.flashprefill + llama_decode_with_flashprefill in
+    // llama.h and the CLI plumbing; ContextIntegration implements the decode
+    // copy semantics + llama_flashprefill_policy_fingerprint getter and the
+    // per-ubatch GPU-delta producer. Until those land, the impl builds and
+    // validates the borrowed exec view per slice but keeps calling the
+    // ordinary llama_decode() dense route (see decode()).
+    llama_flashprefill_config fp_config = llama_flashprefill_default_config();
+    bool fp_enabled = false;
+
+    // Store identity for isolation (StatePolicy core key, not just diagnostics).
+    // fp_current_fingerprint/fp_has_policy are stamped at load_model from the
+    // live context (llama_flashprefill_policy_fingerprint) and never change
+    // afterwards: the policy is immutable for the context lifetime. They feed
+    // metrics/diagnostics only.
+    // fp_current_state_key/fp_has_state_key are the store identity, refreshed
+    // from llama_flashprefill_state_cache_key() every iteration (not just at
+    // load): policy fingerprint + context serial + adapter generation. Any
+    // effective LoRA/cvec mutation retires the key, so the RAM cache can never
+    // silently reuse KV produced under older adapters. Durable authority on
+    // every restore is the 64-byte core envelope inside the state bytes (the
+    // key itself is an in-memory fast-path stamp, never serialized); the RAM
+    // stamp below is keyed on this same value. 0 == no isolation identity
+    // (OFF: legacy path).
+    // fp_cache_key/fp_cache_key_stamped record which identity the RAM prompt
+    // cache contents were produced under; fp_guard_prompt_cache() drops the
+    // whole cache when the stamp disagrees, so sparse-prefill KV can never be
+    // consumed as dense-prefill KV (or across any adapter/policy change).
+    uint64_t fp_current_fingerprint = 0;
+    bool     fp_has_policy = false;
+    uint64_t fp_current_state_key = 0;
+    bool     fp_has_state_key = false;
+    uint64_t fp_cache_key = 0;
+    bool     fp_cache_key_stamped = false;
+
+    // Drop RAM prompt-cache contents produced under a different store identity.
+    // Cheap (one compare) and OFF-safe: OFF has no state key, so this keeps
+    // exact old behavior and never spurious-clears. Must run before any decode
+    // or cache use in the iteration; called at the top of update_slots(). The
+    // cache is process-lifetime with a single policy today, so this only fires
+    // on a genuine identity disagreement (policy change, adapter mutation, or
+    // context replacement) — which is exactly when reuse would silently mix
+    // approximate and exact KV lineages.
+    void fp_guard_prompt_cache() {
+        if (!prompt_cache) {
+            return;
+        }
+        // Refresh the live store identity every iteration (not just at load):
+        // LoRA apply/cvec on the live context (per-batch slot LoRA, POST
+        // /lora-adapters) retires the StatePolicy core key via the context
+        // adapter generation, and the guard must observe that retirement here
+        // or stale RAM entries would survive an adapter switch. Cheap single
+        // key recompute per iteration; OFF stays 0 (legacy behavior, never
+        // spurious-clears). Slot sidecar writes later in this same iteration
+        // therefore also stamp the current identity.
+        if (ctx_tgt != nullptr) {
+            fp_current_state_key = llama_flashprefill_state_cache_key(ctx_tgt);
+            fp_has_state_key = (fp_current_state_key != 0);
+        }
+        if (!fp_has_state_key) {
+            // No identity to enforce by (pre-load, OFF, or key unavailable):
+            // keep exact old behavior, never spurious-clear.
+            return;
+        }
+        namespace fp = server_flashprefill_routing;
+        if (!fp_cache_key_stamped) {
+            fp_cache_key = fp_current_state_key;
+            fp_cache_key_stamped = true;
+            return;
+        }
+        if (fp::fp_isolate_store(fp_cache_key, true, fp_current_state_key, true)
+                != fp::FP_STORE_USABLE) {
+            SRV_WRN("flashprefill store identity changed (cache %016llx vs current %016llx): dropping %zu RAM-cached prompts\n",
+                (unsigned long long) fp_cache_key,
+                (unsigned long long) fp_current_state_key,
+                prompt_cache->states.size());
+            prompt_cache->states.clear();
+            fp_cache_key = fp_current_state_key;
+        }
+    }
+
+    // Manual slot files carry NO companion sidecar: the single authority for
+    // store isolation is the 64-byte StatePolicy core envelope inside the
+    // state bytes themselves (policy fingerprint + process nonce + context
+    // serial + adapter generation, validated before any KV is consumed on
+    // load). No v1/v2 ".flashprefill" scheme is written or read — a redundant
+    // file sidecar would be a second source of truth that can disagree with
+    // the envelope. Restores under a mismatched identity fail at load
+    // (nread == 0 below) with a re-prefill error; OFF restores keep exact old
+    // behavior (no envelope in either direction).
+
+    // True for the two sparse-eligible roles with a known frozen boundary.
+    // Everything else is a server-attributable dense row (DENSE_ROLE, or
+    // DENSE_UNKNOWN_BOUNDARY when an eligible role lacks its interval).
+    bool fp_row_is_eligible(const llama_flashprefill_row & row) const {
+        if (!server_flashprefill_routing::role_is_sparse_eligible(row.role)) {
+            return false;
+        }
+        return row.prefill_known;
+    }
+
+    int32_t fp_server_dense_reason(const llama_flashprefill_row & row) const {
+        if (server_flashprefill_routing::role_is_sparse_eligible(row.role) && !row.prefill_known) {
+            return LLAMA_FLASHPREFILL_ROUTE_DENSE_UNKNOWN_BOUNDARY;
+        }
+        return LLAMA_FLASHPREFILL_ROUTE_DENSE_ROLE;
+    }
+
+    // Successful-only accounting for one slice [off, off+n). Called at the top
+    // of post_decode (which runs only after its decode returned 0), so each
+    // row is counted exactly once; retries, throws, and cancels never arrive
+    // here. Attributes rows to slots via batch.tokens (row identity intact).
+    void fp_count_slice_success(int32_t off, int32_t n) {
+        if (!fp_enabled || batch.fp_rows.empty()) {
+            return;
+        }
+        GGML_ASSERT(off >= 0 && off + n <= (int32_t) batch.fp_rows.size());
+        GGML_ASSERT(off >= 0 && off + n <= (int32_t) batch.tokens.size());
+        for (int32_t i = 0; i < n; ++i) {
+            const int32_t idx = off + i;
+            const auto & row = batch.fp_rows[idx];
+            const int32_t id_slot = batch.tokens[idx].id_slot;
+            server_slot * slot = get_slot_by_id(id_slot);
+            if (fp_row_is_eligible(row)) {
+                metrics.fp_eligible_rows += 1;
+                if (slot != nullptr) {
+                    slot->fp_eligible_rows += 1;
+                }
+            } else {
+                const int32_t reason = fp_server_dense_reason(row);
+                const int32_t ridx = server_flashprefill_routing::fp_dense_reason_index(reason);
+                GGML_ASSERT(ridx >= 0);
+                metrics.fp_dense_by_reason[ridx] += 1;
+                if (slot != nullptr) {
+                    slot->fp_dense_by_reason[ridx] += 1;
+                }
+            }
+        }
+    }
+
+    // GPU-determined merge for one successful slice (MetricsIntegration
+    // owner; called in post_decode right after fp_count_slice_success, so the
+    // same once-per-slice discipline covers both). Drains the target-context
+    // ledger (transactional: failed/retried calls never commit context-side,
+    // and the drain is consume-once, so narrowed-batch retries cannot double
+    // count). The speculative draft context (ctx_dft) is deliberately not
+    // drained: its re-eval traffic stays uncounted rather than risk double
+    // attribution against the target ledger. OFF or empty drain merges
+    // nothing. The drain's eligible_rows field is deliberately ignored here
+    // (server-side fp_eligible_rows above stays canonical; merging both
+    // would double count the same rows).
+    void fp_merge_gpu_slice() {
+        if (!fp_enabled || ctx_tgt == nullptr) {
+            return;
+        }
+        llama_flashprefill_metrics_slice d = {};
+        const int32_t rc = llama_flashprefill_metrics_drain(ctx_tgt, &d);
+        if (rc != 0) {
+            return; // 1: empty/OFF (zeroed); -1 impossible with non-null args
+        }
+        server_flashprefill_routing::fp_gpu_merge_slice(metrics.fp_gpu, d);
+    }
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
@@ -1814,12 +2161,19 @@ private:
             const auto & plan = i == 0
                 ? *slot.rerot_inflight_plan
                 : slot.rerot_inflight_extra_plans[i - 1];
-            const llama_token token = slot.rerot_inflight_forced
+            // Capture the forced flag and injection offset before the cursor
+            // advances: each row keeps its exact known interval identity, and
+            // frontier generation rows (not forced) stay distinguishable.
+            const bool row_forced = slot.rerot_inflight_forced;
+            const int32_t inject_offset = row_forced
+                ? (int32_t) slot.rerot_injection_cursor
+                : LLAMA_FLASHPREFILL_POS_UNKNOWN;
+            const llama_token token = row_forced
                 ? slot.rerot_injection_tokens.at(slot.rerot_injection_cursor)
                 : slot.sampled;
-            const bool forced_last = slot.rerot_inflight_forced &&
+            const bool forced_last = row_forced &&
                 slot.rerot_injection_cursor + 1 == slot.rerot_injection_tokens.size();
-            const bool needs_logits = !slot.rerot_inflight_forced ||
+            const bool needs_logits = !row_forced ||
                 (forced_last &&
                  slot.rerot_injection != server_rerot_injection_kind::heading &&
                  slot.rerot_injection != server_rerot_injection_kind::child_open &&
@@ -1831,10 +2185,38 @@ private:
                     "rerot_resource_exhausted: private microbatch capacity");
                 return false;
             }
+            if (fp_enabled) {
+                // Exact known teacher-forced interval: the whole injection was
+                // tokenized up front, so [0, size) is known before the first
+                // frontier commits. Frontier generation rows (row_forced false,
+                // including serial-tail and planner_open generations) use an
+                // unknown boundary and the REROT_FRONTIER dense role — they
+                // are never mistaken for prefill, even when several share a frontier.
+                llama_flashprefill_row row = {};
+                row.version = LLAMA_FLASHPREFILL_ROW_VERSION;
+                row.struct_size = (uint32_t) sizeof(llama_flashprefill_row);
+                row.seq_id = slot.id;
+                row.reader_id = slot.rerot_node_id;
+                if (row_forced) {
+                    row.role = LLAMA_FLASHPREFILL_ROLE_REROT_TEACHER_FORCED;
+                    row.logical_pos = inject_offset;
+                    row.prefill_begin = 0;
+                    row.prefill_end = (int32_t) slot.rerot_injection_tokens.size();
+                    row.prefill_known = true;
+                } else {
+                    row.role = LLAMA_FLASHPREFILL_ROLE_REROT_FRONTIER;
+                    row.logical_pos = LLAMA_FLASHPREFILL_POS_UNKNOWN;
+                    row.prefill_begin = LLAMA_FLASHPREFILL_SEQ_UNKNOWN;
+                    row.prefill_end = LLAMA_FLASHPREFILL_SEQ_UNKNOWN;
+                    row.prefill_known = false;
+                }
+                GGML_ASSERT(llama_flashprefill_validate_row(&row) == LLAMA_FLASHPREFILL_OK);
+                batch.fp_push_row(row);
+            }
 
             slot.i_batch = i_batch;
             slot.prompt.tokens.push_back(token);
-            if (slot.rerot_inflight_forced) {
+            if (row_forced) {
                 ++slot.rerot_injection_cursor;
             }
         }
@@ -3123,6 +3505,34 @@ private:
 
         if (ctx_tgt == nullptr) {
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
+            return false;
+        }
+
+        // FlashPrefill: adopt the context policy as the single source of truth
+        // (ConfigIntegration plumbed params_base.flashprefill through
+        // common_context_params_to_llama; the context strict-validated it at
+        // creation). fp_enabled gates the sidecar; OFF (default) keeps every
+        // path byte-identical to baseline. The live-context fingerprint is the
+        // policy identity for RAM-cache and slot-file isolation below (never a
+        // bare diagnostic: mismatched stores are rejected, not just counted).
+        fp_config = params_base.flashprefill;
+        fp_enabled = llama_flashprefill_is_enabled(&fp_config);
+        fp_current_fingerprint = llama_flashprefill_policy_fingerprint(ctx_tgt);
+        fp_has_policy = (fp_current_fingerprint != 0);
+        // Authoritative store identity (StatePolicy core key): stamped from
+        // the live context alongside the fingerprint and retired on every
+        // effective adapter mutation. OFF keeps key 0 (legacy path, no
+        // isolation identity needed).
+        fp_current_state_key = llama_flashprefill_state_cache_key(ctx_tgt);
+        fp_has_state_key = (fp_current_state_key != 0);
+        metrics.fp_policy_fingerprint = fp_current_fingerprint;
+        metrics.fp_has_policy = fp_has_policy;
+        if (fp_enabled && !fp_has_policy) {
+            SRV_ERR("%s", "flashprefill enabled but policy fingerprint unavailable\n");
+            return false;
+        }
+        if (fp_enabled && !fp_has_state_key) {
+            SRV_ERR("%s", "flashprefill enabled but state cache key unavailable (no context serial or adapter identity)\n");
             return false;
         }
 
@@ -5268,6 +5678,39 @@ private:
                     res->tri_hard_keep          = tri_hard_keep;
                     res->tri_shared_keep        = tri_shared_keep;
 
+                    // FlashPrefill (MetricsIntegration owner for the GPU
+                    // totals; ServerRouting owner for eligible/dense/policy).
+                    // Successful-only cumulative totals; all zero while OFF.
+                    res->fp_sparse_rows            = metrics.fp_gpu.sparse_rows;
+                    res->fp_dense_packed           = metrics.fp_gpu.dense_packed;
+                    for (int i = 0; i < 10; ++i) {
+                        res->fp_dense_rows[i] = metrics.fp_gpu.dense_rows[i];
+                    }
+                    res->fp_selected_blocks        = metrics.fp_gpu.selected_blocks;
+                    res->fp_corrected_blocks       = metrics.fp_gpu.corrected_blocks;
+                    res->fp_visible_tokens         = metrics.fp_gpu.visible_tokens;
+                    res->fp_exact_tokens           = metrics.fp_gpu.exact_tokens;
+                    for (int i = 0; i < 2; ++i) {
+                        res->fp_pool_rebuild[i] = metrics.fp_gpu.pool_rebuild[i];
+                    }
+                    for (int i = 0; i < 3; ++i) {
+                        res->fp_plan_invalidations[i] = metrics.fp_gpu.plan_invalidations[i];
+                    }
+                    res->fp_scratch_live_bytes     = metrics.fp_gpu.scratch_live_bytes;
+                    res->fp_scratch_peak_bytes     = metrics.fp_gpu.scratch_peak_bytes;
+                    res->fp_layout_us_total        = metrics.fp_gpu.layout_us_total;
+                    res->fp_layout_slices_measured = metrics.fp_gpu.layout_slices_measured;
+                    res->fp_gpu_pool_us_total      = metrics.fp_gpu.gpu_pool_us_total;
+                    res->fp_gpu_select_us_total    = metrics.fp_gpu.gpu_select_us_total;
+                    res->fp_gpu_attn_us_total      = metrics.fp_gpu.gpu_attn_us_total;
+                    res->fp_gpu_slices_measured    = metrics.fp_gpu.gpu_slices_measured;
+                    res->fp_eligible_rows          = metrics.fp_eligible_rows;
+                    for (int i = 0; i < 7; ++i) {
+                        res->fp_dense_by_reason[i] = metrics.fp_dense_by_reason[i];
+                    }
+                    res->fp_policy_fingerprint     = metrics.fp_policy_fingerprint;
+                    res->fp_has_policy             = metrics.fp_has_policy;
+
                     if (rerot) {
                         const uint32_t people_cap = params_base.rerot_person_max > 0
                             ? params_base.rerot_person_max
@@ -5365,6 +5808,12 @@ private:
                     const size_t token_count = tokens.size();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
 
+                    // FlashPrefill store isolation: when enabled, the saved KV
+                    // bytes carry the 64-byte core envelope (store identity)
+                    // ahead of the memory payload, validated before any KV is
+                    // consumed on restore. No sidecar is written: the envelope
+                    // is the single authority. OFF: legacy bytes unchanged.
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -5402,6 +5851,13 @@ private:
                         break;
                     }
 
+                    // FlashPrefill store isolation: no pre-check here — the
+                    // single authority is the core envelope validated inside
+                    // the load below (before any KV is consumed). A mismatched
+                    // identity (policy, process, context, or adapter) fails
+                    // the load (nread == 0) with a re-prefill error; OFF loads
+                    // keep exact old behavior. Rejected restores leave the
+                    // slot salvageable so the client can re-prefill.
                     const int64_t t_start = ggml_time_us();
 
                     std::string filename = task.slot_action.filename;
@@ -5413,7 +5869,11 @@ private:
                     size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
                     if (nread == 0) {
                         slot->prompt.clear(); // KV may already been invalidated?
-                        send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
+                        if (fp_enabled) {
+                            send_error(task, "Unable to restore slot: save file was produced under a different FlashPrefill store identity (policy, process, context, or adapter mismatch) or the cache is full: re-prefill instead of restoring", ERROR_TYPE_INVALID_REQUEST);
+                        } else {
+                            send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
+                        }
                         break;
                     }
                     tokens.resize(token_count);
@@ -5673,6 +6133,10 @@ private:
 
         update_inference_mode();
 
+        // FlashPrefill store isolation: enforce the RAM prompt-cache policy
+        // stamp before building or consuming any batch in this iteration.
+        fp_guard_prompt_cache();
+
         // RERoT frontier entry (§§19.3,20): one frontier is one atomic budget
         // unit; when hard limits are crossed the whole episode HARD_ABORTs
         // here instead of running a partial Lane subset. OFF: no-op true.
@@ -5702,7 +6166,28 @@ private:
 
             // TODO @ngxson : alora handling is too messy, need to refactor it to be more clear and maintainable
             // apply lora, only need to do it once per batch
-            common_set_adapter_lora(ctx_tgt, slot_batched->lora);
+            // A refusal (FlashPrefill enabled atop an active RERoT episode) is
+            // a request failure, never silent: the core applied nothing, so the
+            // batched slots must not decode under the stale adapters. Fail
+            // exactly the batched (same-lora) slots and return; the next
+            // iteration rebuilds the batch from the survivors. OFF and
+            // identical-set calls always succeed, so this path is unreachable
+            // for them and old behavior is byte-identical.
+            if (!common_set_adapter_lora(ctx_tgt, slot_batched->lora)) {
+                std::set<int32_t> refused;
+                for (int32_t i = 0; i < batch.size(); ++i) {
+                    refused.insert(batch.tokens[i].id_slot);
+                }
+                for (const int32_t id_slot : refused) {
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot != nullptr && slot->is_processing()) {
+                        send_error(*slot, "LoRA adapter change refused: FlashPrefill is enabled atop an active RERoT episode — end the episode (or disable the policy) and retry");
+                        slot->prompt_clear();
+                        slot->release();
+                    }
+                }
+                return;
+            }
 
             // if the lora is temporarily disabled for an alora, re-enable it
             // for next time
@@ -5724,7 +6209,15 @@ private:
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch_view = batch.get_view(off, n_tokens);
-                bool ok = decode(n_batch, off, batch_view);
+                // FlashPrefill: borrowed exec view sliced by the same off/n
+                // as the batch view, so every retry keeps stage, token
+                // offset, output row, sequence, and reader view aligned to
+                // the same source row. OFF: empty view (no allocation).
+                // decode() validates the view and dispatches to
+                // llama_decode_with_flashprefill() (ContextIntegration owns
+                // the pre-async copy + per-ubatch propagation).
+                const llama_flashprefill_exec fp_exec = batch.fp_exec_view(off, n_tokens);
+                bool ok = decode(n_batch, off, batch_view, fp_exec);
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
@@ -5894,6 +6387,11 @@ private:
 
         // start populating the batch for this iteration
         batch.clear();
+        // FlashPrefill: bound the sidecar once per iteration while enabled so
+        // per-row pushes never regrow; OFF skips this entirely (no alloc).
+        if (fp_enabled && batch.n_tokens_alloc > 0) {
+            batch.fp_rows.reserve((size_t) batch.n_tokens_alloc);
+        }
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -6074,7 +6572,7 @@ private:
                     rerot_plan_ok = false;
                 }
             } else {
-                slot.handle_last_sampled_token(batch);
+                slot.handle_last_sampled_token(batch, fp_enabled);
             }
         });
         if (!rerot_plan_ok) {
@@ -6409,6 +6907,20 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
+                        // FlashPrefill: freeze the ordinary logical-prefill
+                        // suffix AFTER every prefix-cache adjustment above
+                        // (common prefix, alora clamp, chunk-reuse shifts,
+                        // checkpoint restore, TAG_PROMPT_LOGITS). The frozen
+                        // [n_past, task.n_tokens) interval persists on the
+                        // slot across ubatches; later chunk boundaries must
+                        // not re-derive it from n_tokens>1 guessing, and the
+                        // three lengths (cached count, batch count, dialogue
+                        // length) must not be conflated. OFF: untouched.
+                        if (fp_enabled) {
+                            slot.fp_boundary = server_flashprefill_routing::freeze_prefill_boundary(
+                                (int32_t) n_past, slot.task->n_tokens());
+                        }
+
                         slot.n_prompt_tokens_cache = n_past;
                         if (slot.n_decoded_start == 0) {
                             slot.n_prompt_tokens_cache_response = n_past;
@@ -6550,10 +7062,37 @@ private:
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
-                        add_ok &= batch.add(slot.id,
-                            cur_tok,
-                            slot.prompt.tokens.pos_next(),
-                            slot.need_embd());
+                        {
+                            const bool ok = batch.add(slot.id,
+                                cur_tok,
+                                slot.prompt.tokens.pos_next(),
+                                slot.need_embd());
+                            add_ok &= ok;
+                            // FlashPrefill: only true prompt rows are eligible,
+                            // with the frozen suffix interval above. Embedding,
+                            // rerank, and multimodal rows take explicit dense
+                            // roles with a reason; never guessed from the
+                            // batch size. OFF: no push, no allocation.
+                            if (fp_enabled && ok) {
+                                namespace fp = server_flashprefill_routing;
+                                fp::fp_row_inputs in;
+                                in.is_embedding = slot.task->type == SERVER_TASK_TYPE_EMBEDDING;
+                                in.is_rerank = slot.task->type == SERVER_TASK_TYPE_RERANK;
+                                in.has_mtmd = has_mtmd || slot.prompt.tokens.has_mtmd;
+                                in.rerot_internal = false;
+                                in.rerot_forced = false;
+                                in.is_mtp_verify = false;
+                                in.is_spec_replay = false;
+                                in.is_prompt_row = true;
+                                const int32_t role = fp::classify_row_role(in);
+                                const int32_t logical_pos = (int32_t) slot.prompt.n_tokens();
+                                const llama_flashprefill_row row = fp::make_row(
+                                    role, slot.id, LLAMA_FLASHPREFILL_READER_NONE,
+                                    logical_pos, slot.fp_boundary);
+                                GGML_ASSERT(llama_flashprefill_validate_row(&row) == LLAMA_FLASHPREFILL_OK);
+                                batch.fp_push_row(row);
+                            }
+                        }
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
@@ -6656,7 +7195,15 @@ private:
 
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
-    bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
+    // fp_exec is the borrowed versioned execution view for this slice
+    // (same off/n as batch_view; empty while OFF). It is validated here so
+    // every narrowed-batch retry keeps role/boundary alignment, then
+    // dispatched below: non-empty views go through llama_decode_with_flash-
+    // prefill (ContextIntegration owns validation/copy/propagation), empty
+    // views keep the ordinary llama_decode() path. All roles — MTP draft/
+    // target verification and speculative replay included — ride without a
+    // new global disable and with the active-lane pause unchanged.
+    bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view, const llama_flashprefill_exec & fp_exec) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
         if (batch.size() == 0) {
@@ -6671,6 +7218,26 @@ private:
             n_empty_consecutive = 0;
         }
 
+        // FlashPrefill view validation (cheap, OFF-empty passes): version and
+        // struct size must match the frozen contract, and a non-empty view
+        // must cover exactly this slice's rows. A mismatch is a routing bug,
+        // not a performance fallback, so it fails loudly like the existing
+        // speculative-index check in post_decode.
+        if (fp_exec.version != LLAMA_FLASHPREFILL_EXEC_VERSION ||
+            fp_exec.struct_size != (uint32_t) sizeof(llama_flashprefill_exec)) {
+            throw std::runtime_error("flashprefill exec view has wrong version/size");
+        }
+        if (!batch.fp_rows.empty()) {
+            if (fp_exec.n_rows != (uint32_t) batch_view.n_tokens || fp_exec.rows == nullptr) {
+                throw std::runtime_error("flashprefill exec view does not match batch slice");
+            }
+            if (llama_flashprefill_validate_exec(&fp_exec) != LLAMA_FLASHPREFILL_OK) {
+                throw std::runtime_error("flashprefill exec view failed validation");
+            }
+        } else if (fp_exec.n_rows != 0 || fp_exec.rows != nullptr) {
+            throw std::runtime_error("flashprefill exec view must be empty while OFF");
+        }
+
         // TODO @ngxson : dft model may have different n_embd than the tgt model, so we check & reject if that's the case
         // this case is not currently used by any models, but may need to be supported in the future
         if (spec && batch.has_embd) {
@@ -6680,7 +7247,17 @@ private:
             }
         }
 
-        const int ret = llama_decode(ctx_tgt, batch_view);
+        // Versioned execution dispatch (ContextIntegration owns the copy
+        // semantics + per-ubatch propagation; ConfigIntegration declares the
+        // C API in llama.h). Non-empty views carry every submission slice's
+        // roles/boundaries with row identity intact; the context validates
+        // version/size/n_rows and copies rows before async work. Empty views
+        // (OFF) keep the ordinary dense route. MTP draft/target verification
+        // and speculative replay rows are dense by role, so they ride the same
+        // call without a global disable and with the active-lane pause intact.
+        const int ret = batch.fp_rows.empty()
+            ? llama_decode(ctx_tgt, batch_view)
+            : llama_decode_with_flashprefill(ctx_tgt, batch_view, &fp_exec);
 
         metrics.on_decoded(slots);
 
@@ -6796,6 +7373,19 @@ private:
         auto is_inside_view = [&](int32_t idx) {
             return idx >= off && idx < off + n_batch_tokens;
         };
+
+        // FlashPrefill successful-only accounting: this runs solely after its
+        // decode slice returned 0, so each row in [off, off+n) is counted
+        // exactly once. Narrowed-batch retries (decode false), fatal errors
+        // (throw + abort_all_slots), and slot cancel/release paths never reach
+        // here, so canceled/failed/retried rows are never double counted.
+        // No GPU work is claimed here (see fp_gpu_deltas); only eligible vs
+        // server-dense attribution.
+        fp_count_slice_success(off, n_batch_tokens);
+        // GPU-determined drain for the same successful slice (consume-once:
+        // narrowed-batch retries can never double count). OFF or empty drain
+        // merges nothing.
+        fp_merge_gpu_slice();
 
         // TODO @ngxson : it's tricky to make sub-batch compatible with common_sampler_sample_and_accept_n,
         // so for now we will throw an error in this case: https://github.com/ggml-org/llama.cpp/issues/24840
@@ -7885,6 +8475,105 @@ void server_routes::init_routes() {
                    << res_task->tri_atomic_fallback_kv_total << "\n"
                    << "llamacpp:tri_atomic_fallback_total{reason=\"recurrent\"} "
                    << res_task->tri_atomic_fallback_recurrent_total << "\n";
+
+        // FlashPrefill V2 series (MetricsIntegration owner; ServerRouting
+        // owns the eligible/dense-reason source rows). Always emitted —
+        // including zeros while OFF, which cost no GPU work or counting
+        // overhead (the matrix off_baseline expects the counters present);
+        // only the fingerprint info is policy-gated (no value while OFF).
+        // All labels are bounded (9 granular dense reasons, 7 frozen server
+        // reasons, 2 pool reasons, 3 plan reasons, one fingerprint value);
+        // no sequence ids, prompt text, or unbounded reader ids. Units:
+        // sparse/dense_packed are packed execution rows (plan-confirmed);
+        // dense breakdowns are packed rows by reason; selected/corrected are
+        // plan use counts; visible/exact are 64-bit use-record token sums.
+        // Keep one unit per ratio: sparse/(sparse+dense_packed), or
+        // exact/visible. Timings: layout is host-measured; pool/select/
+        // attention are GPU dispatch times sampled post-completion from the
+        // VulkanDispatch timestamp hook (0 until it reports — never faked).
+        {
+            const auto emit_fp = [&prometheus](
+                    const char * type,
+                    const char * name,
+                    const char * help,
+                    const auto & value) {
+                prometheus << "# HELP llamacpp:" << name << " " << help << "\n"
+                           << "# TYPE llamacpp:" << name << " " << type << "\n"
+                           << "llamacpp:" << name << " " << value << "\n";
+            };
+            namespace fp = server_flashprefill_routing;
+            emit_fp("counter", "flashprefill_eligible_rows_total",
+                    "Source rows presented with a sparse-eligible role and known boundary.",
+                    res_task->fp_eligible_rows);
+            emit_fp("counter", "flashprefill_sparse_rows_total",
+                    "Packed execution rows confirmed sparse by the plan headers after successful completion.",
+                    res_task->fp_sparse_rows);
+            emit_fp("counter", "flashprefill_dense_packed_rows_total",
+                    "Packed execution rows the plans ran dense.",
+                    res_task->fp_dense_packed);
+            emit_fp("counter", "flashprefill_selected_blocks_total",
+                    "Plan exact uses summed over layers.",
+                    res_task->fp_selected_blocks);
+            emit_fp("counter", "flashprefill_corrected_blocks_total",
+                    "Plan proxy (mean-corrected) uses summed over layers.",
+                    res_task->fp_corrected_blocks);
+            emit_fp("counter", "flashprefill_visible_tokens_total",
+                    "Plan use-record token sum over layers (64-bit, subhead fan-out not multiplied).",
+                    res_task->fp_visible_tokens);
+            emit_fp("counter", "flashprefill_exact_tokens_total",
+                    "Plan exact-use token sum over layers (64-bit).",
+                    res_task->fp_exact_tokens);
+            emit_fp("gauge", "flashprefill_scratch_bytes",
+                    "Live FlashPrefill scratch bytes from the last successful slice.",
+                    res_task->fp_scratch_live_bytes);
+            emit_fp("gauge", "flashprefill_scratch_peak_bytes",
+                    "Peak FlashPrefill scratch bytes over successful slices.",
+                    res_task->fp_scratch_peak_bytes);
+            emit_fp("counter", "flashprefill_layout_seconds",
+                    "Host layout time over measured slices.",
+                    res_task->fp_layout_us_total / 1.e6);
+            emit_fp("counter", "flashprefill_pool_seconds",
+                    "GPU pool-dispatch time over sampled calls (0 until the timestamp hook reports).",
+                    res_task->fp_gpu_pool_us_total / 1.e6);
+            emit_fp("counter", "flashprefill_select_seconds",
+                    "GPU select-dispatch time over sampled calls (0 until the timestamp hook reports).",
+                    res_task->fp_gpu_select_us_total / 1.e6);
+            emit_fp("counter", "flashprefill_attention_seconds",
+                    "GPU attention-dispatch time over sampled calls, merge included (0 until the timestamp hook reports).",
+                    res_task->fp_gpu_attn_us_total / 1.e6);
+            prometheus << "# HELP llamacpp:flashprefill_dense_rows_total Packed rows executed dense by granular reason.\n"
+                       << "# TYPE llamacpp:flashprefill_dense_rows_total counter\n";
+            for (int i = 0; i < 10; ++i) {
+                prometheus << "llamacpp:flashprefill_dense_rows_total{reason=\""
+                           << fp::fp_gpu_dense_name(i) << "\"} " << res_task->fp_dense_rows[i] << "\n";
+            }
+            prometheus << "# HELP llamacpp:flashprefill_server_dense_rows_total Source rows routed dense by frozen server reason.\n"
+                       << "# TYPE llamacpp:flashprefill_server_dense_rows_total counter\n";
+            for (int i = 0; i < 7; ++i) {
+                const int32_t route = fp::fp_dense_index_to_route(i);
+                prometheus << "llamacpp:flashprefill_server_dense_rows_total{reason=\""
+                           << llama_flashprefill_route_name(route) << "\"} "
+                           << res_task->fp_dense_by_reason[i] << "\n";
+            }
+            prometheus << "# HELP llamacpp:flashprefill_pool_rebuild_total Pool-mean rebuilds by reason.\n"
+                       << "# TYPE llamacpp:flashprefill_pool_rebuild_total counter\n";
+            for (int i = 0; i < 2; ++i) {
+                prometheus << "llamacpp:flashprefill_pool_rebuild_total{reason=\""
+                           << fp::fp_gpu_pool_name(i) << "\"} " << res_task->fp_pool_rebuild[i] << "\n";
+            }
+            prometheus << "# HELP llamacpp:flashprefill_plan_invalidations_total Plan invalidations by reason.\n"
+                       << "# TYPE llamacpp:flashprefill_plan_invalidations_total counter\n";
+            for (int i = 0; i < 3; ++i) {
+                prometheus << "llamacpp:flashprefill_plan_invalidations_total{reason=\""
+                           << fp::fp_gpu_plan_name(i) << "\"} " << res_task->fp_plan_invalidations[i] << "\n";
+            }
+            if (res_task->fp_has_policy) {
+                const std::string fphex = string_format("%016" PRIx64, (uint64_t) res_task->fp_policy_fingerprint);
+                prometheus << "# HELP llamacpp:flashprefill_policy_fingerprint_info Active FlashPrefill policy fingerprint (single series).\n"
+                           << "# TYPE llamacpp:flashprefill_policy_fingerprint_info gauge\n"
+                           << "llamacpp:flashprefill_policy_fingerprint_info{fingerprint=\"" << fphex << "\"} 1\n";
+            }
+        }
 
         res->headers["Process-Start-Time-Unix"] = std::to_string(res_task->t_start);
         res->content_type = "text/plain; version=0.0.4";

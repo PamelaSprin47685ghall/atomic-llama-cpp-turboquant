@@ -1561,6 +1561,11 @@ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggm
             // No computation needed, just memory management
             supported = true;
             break;
+        case GGML_OP_FLASH_PREFILL_POOL:
+        case GGML_OP_FLASH_PREFILL_SELECT:
+        case GGML_OP_FLASH_PREFILL_ATTN:
+            supported = false;
+            break;
         default:
             supported = false;
             break;
