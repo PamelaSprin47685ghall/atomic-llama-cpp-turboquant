@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import secrets
 import socket
+import statistics
 import struct
 import subprocess
 import threading
@@ -175,6 +176,27 @@ def prepare(args, base, key, result):
                              "source_sha256": hashlib.sha256(args.corpus.read_bytes()).hexdigest()}
 
 
+def summarize_timings(timings):
+    """Keep process-first latency separate; never assume driver caches are cold."""
+    if not timings:
+        raise ValueError("no timing samples")
+    rates = []
+    for timing in timings:
+        sample = {}
+        for field in ("prompt_per_second", "predicted_per_second"):
+            value = timing.get(field)
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise ValueError("missing or invalid timing: " + field)
+            sample[field] = value
+        rates.append(sample)
+    repeated = {"count": len(rates) - 1}
+    for field in rates[0]:
+        values = [sample[field] for sample in rates[1:]]
+        repeated[field] = ({"min": min(values), "median": statistics.median(values), "max": max(values)}
+                           if values else None)
+    return {"first_request": rates[0], "repeated_requests": repeated}
+
+
 def probe(args, base, key, result):
     result["requests"] = []
     text = args.corpus.read_text(encoding="utf-8") if args.corpus else (
@@ -197,10 +219,11 @@ def probe(args, base, key, result):
             raise RuntimeError("completion did not generate the requested token budget")
         for field in ("prompt_per_second", "predicted_per_second"):
             value = timings.get(field)
-            if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
                 raise RuntimeError("missing or invalid timing: " + field)
         print(json.dumps({"config": result["config"]["name"], "repeat": repeat,
                           "timings": response.get("timings")}), flush=True)
+    result["timing_summary"] = summarize_timings([response["timings"] for response in result["requests"]])
     questions = [] if args.no_chat else [
         ("arithmetic", "只回答计算结果，不要解释：17乘以23等于多少？", [391]),
         ("extract", "记录：北仓有7箱茶，南仓有12箱茶。只输出南仓的箱数，不要解释。", [12]),

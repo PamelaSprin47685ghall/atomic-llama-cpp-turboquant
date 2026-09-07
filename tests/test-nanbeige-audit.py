@@ -52,6 +52,30 @@ class AuditTests(unittest.TestCase):
         result = self.run_probe()
         self.assertTrue(all(case["passed"] for case in result["quality_checks"]))
         self.assertEqual(len(result["requests"]), 4)
+        self.assertEqual(result["timing_summary"]["repeated_requests"]["count"], 0)
+
+    def test_first_request_is_not_mixed_into_repeated_rates(self):
+        samples = [{"prompt_per_second": pp, "predicted_per_second": tg}
+                   for pp, tg in [(30, 5), (2000, 70), (2200, 80), (2100, 75)]]
+        summary = audit.summarize_timings(samples)
+        self.assertEqual(summary["first_request"], samples[0])
+        self.assertEqual(summary["repeated_requests"]["count"], 3)
+        self.assertEqual(summary["repeated_requests"]["prompt_per_second"],
+                         {"min": 2000, "median": 2100, "max": 2200})
+        self.assertEqual(summary["repeated_requests"]["predicted_per_second"]["median"], 75)
+        self.assertEqual(samples[0]["prompt_per_second"], 30)  # input evidence preserved
+
+    def test_single_sample_has_no_invented_warm_rate(self):
+        summary = audit.summarize_timings([{"prompt_per_second": 30, "predicted_per_second": 70}])
+        self.assertEqual(summary["repeated_requests"],
+                         {"count": 0, "prompt_per_second": None, "predicted_per_second": None})
+
+    def test_invalid_timing_summaries(self):
+        with self.assertRaises(ValueError):
+            audit.summarize_timings([])
+        for bad in (None, True, "123", float("nan"), float("inf"), 0, -1):
+            with self.subTest(value=bad), self.assertRaises(ValueError):
+                audit.summarize_timings([{"prompt_per_second": bad, "predicted_per_second": 70}])
 
     def test_wrong_answer_and_cutoff_are_failures(self):
         for kwargs in ({"answer": "392"}, {"finish": "length"}):
@@ -59,7 +83,7 @@ class AuditTests(unittest.TestCase):
                 self.run_probe(**kwargs)
 
     def test_incomplete_completion_and_nonfinite_timings(self):
-        for kwargs in ({"budget": 1}, {"speed": float("nan")}, {"speed": float("inf")}, {"speed": 0}):
+        for kwargs in ({"budget": 1}, {"speed": float("nan")}, {"speed": float("inf")}, {"speed": 0}, {"speed": True}):
             with self.subTest(kwargs=kwargs), self.assertRaises(RuntimeError):
                 self.run_probe(**kwargs)
 

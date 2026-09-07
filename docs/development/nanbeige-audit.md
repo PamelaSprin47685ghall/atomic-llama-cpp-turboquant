@@ -80,6 +80,16 @@ exit nonzero. Per-case evidence is saved even when checks fail. `--no-chat`
 disables short QA checks; it must not be described as a quality evaluation.
 The three built-in numeric questions are smoke checks, not a benchmark suite.
 
+Use `--repeats 3` or more for performance comparisons. The result's
+`timing_summary.first_request` preserves the process-first request separately;
+`repeated_requests` reports count and min/median/max rates for later requests.
+All original responses remain present. A one-request probe has null repeated
+rates, not an invented warmed-up measurement. Driver disk caches can survive
+process restarts, so "first request" does not by itself prove a cold cache.
+Compare identical prompts, physical KV, flags and sampling, with no concurrent
+build or inference workload. Profiling modes alter scheduling; do not compare
+their wall times directly with normal execution.
+
 A matrix entry can set `"require_tri_drain": true` to require an observed
 drain that actually frees physical cells. `"max_tri_score_ms": 0` additionally
 checks the floor-only fast path, where hard guards already fill the target
