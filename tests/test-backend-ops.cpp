@@ -6867,31 +6867,32 @@ struct test_turbo_wht_roundtrip : public test_case {
 
 // Test SET_ROWS with turbo3 destination, then dequantize and compare.
 // This validates the full quantization pipeline: f32 -> WHT -> PolarQuant -> turbo3
-// followed by dequantization: turbo3 -> f32. The round-trip error should be bounded.
-// Unlike the generic SET_ROWS test (which compares raw quantized bytes), this test
-// compares the dequantized f32 output, tolerating the lossy quantization error.
+// Compare decoded stored bytes from independent CPU/GPU quantizers. Both
+// sides quantize the same input; quantization loss is NOT a reason to allow
+// large disagreement between the two implementations.
 struct test_set_rows_turbo3 : public test_case {
+    const ggml_type type_dst;
     const ggml_type type_idx;
     const int64_t ne0; // head dim (must be multiple of 128)
     const int64_t ne1; // rows in dst
     const int r;       // rows to write
 
     std::string vars() override {
-        return VARS_TO_STR4(type_idx, ne0, ne1, r);
+        return VARS_TO_STR5(type_dst, type_idx, ne0, ne1, r);
     }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "SET_ROWS_TURBO3";
+        return "SET_ROWS_TURBO";
     }
 
     test_set_rows_turbo3(ggml_type type_idx = GGML_TYPE_I32,
-            int64_t ne0 = 128, int64_t ne1 = 8, int r = 4)
-        : type_idx(type_idx), ne0(ne0), ne1(ne1), r(r) {}
+            int64_t ne0 = 128, int64_t ne1 = 8, int r = 4, ggml_type type_dst = GGML_TYPE_TURBO3_0)
+        : type_dst(type_dst), type_idx(type_idx), ne0(ne0), ne1(ne1), r(r) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // dst: the turbo3 KV cache buffer
-        ggml_tensor * dst = ggml_new_tensor_2d(ctx, GGML_TYPE_TURBO3_0, ne0, ne1);
+        ggml_tensor * dst = ggml_new_tensor_2d(ctx, type_dst, ne0, ne1);
         ggml_set_name(dst, "dst");
 
         // src: f32 values to quantize into the cache
@@ -6905,10 +6906,11 @@ struct test_set_rows_turbo3 : public test_case {
         // Write f32 data into turbo3 dst via SET_ROWS (includes WHT + quantize)
         ggml_tensor * written = ggml_set_rows(ctx, dst, src, row_idxs);
 
-        // Read it back by dequantizing the written rows to f32
-        ggml_tensor * out = ggml_cpy(ctx, written, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1));
-        ggml_set_name(out, "out");
-        return out;
+        // The comparison harness reads and dequantizes each backend's stored
+        // bytes on the host. A GPU CPY-to-F32 requirement is unrelated to KV
+        // writes and previously caused every Vulkan test to be skipped.
+        ggml_set_name(written, "out");
+        return written;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -6923,10 +6925,9 @@ struct test_set_rows_turbo3 : public test_case {
     }
 
     double max_nmse_err() override {
-        // turbo3 is 3-bit quantization with WHT rotation.
-        // The round-trip error (f32 -> turbo3 -> f32) is higher than q8_0
-        // but bounded. Empirically ~0.02 NMSE for uniform[-1,1] data.
-        return 0.05;
+        // Allow only floating-point reduction / centroid-boundary effects,
+        // not the old 5% tolerance that even hid unwritten sparse rows.
+        return 1e-4;
     }
 };
 
@@ -9894,6 +9895,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // SET_ROWS with turbo3 destination: quantize then dequant round-trip
+    for (ggml_type type : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+        for (ggml_type idx : {GGML_TYPE_I32, GGML_TYPE_I64}) {
+            for (int r : {1, 128}) {
+                test_cases.emplace_back(new test_set_rows_turbo3(idx, 1024, 512, r, type));
+            }
+        }
+    }
     // Small tensors (single-dim dispatch)
     for (ggml_type idx_type : {GGML_TYPE_I32, GGML_TYPE_I64}) {
         for (int64_t ne0 : {128, 256, 512}) {
@@ -9973,6 +9981,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // mixed quant and Q1_0 test cases
+    // Actual Nanbeige GQA ratio (48 Q heads / 8 KV heads), both prefill and
+    // decode, including mixed Turbo storage. Missing CM2 decoders used to
+    // return zero silently for every Turbo format on NVIDIA.
+    for (ggml_type kt : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+        for (ggml_type vt : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0, GGML_TYPE_F16}) {
+            for (int nb : {1, 128}) {
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {6, 1}, 512, nb,
+                            true, false, 0, 0, GGML_PREC_F32, kt, vt));
+            }
+        }
+    }
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 4, {1, 1}, 96, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0));
