@@ -152,8 +152,8 @@ struct llama_flashprefill_use {
     uint32_t query    = 0; // index into layout.queries (dense 0..nq-1)
     uint32_t fragment = 0; // frag_id into layout.fragments
     uint32_t group    = 0; // q_group: consuming Q phase group for this pair
-    uint32_t sub_off  = 0; // absolute offset inside the fragment's member
-                           // range (cell_begin-based or cell_refs-based)
+    uint32_t sub_off  = 0; // fragment-relative offset in member order;
+                           // add cell_begin/cell_ref_offset only when addressing storage
     uint32_t sub_count = 0; // > 0, inside the fragment range
     uint32_t flags    = 0; // bit0 MANDATORY (partial subset, must classify exact)
 

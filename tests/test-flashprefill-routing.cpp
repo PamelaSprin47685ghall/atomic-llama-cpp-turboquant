@@ -24,12 +24,17 @@
 #include "../src/llama-context.h"
 #include "../src/llama-model.h"
 #include "../src/llama-graph.h"
+#include "../src/llama-flashprefill-pack.h"
+#include "../src/llama-flashprefill-fixture.h"
+#include "../src/llama-kv-cells.h"
 
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <map>
+#include <tuple>
 
 namespace {
 
@@ -383,7 +388,115 @@ static void test_fingerprint_and_names(void) {
 
 } // namespace
 
+static void test_real_graph_pack() {
+    // Real owner planner AND graph packer, without model weights. Nonzero
+    // storage offsets, sparse holes and multiple fragments expose address
+    // mistakes that zero-based, one-fragment fixtures cannot detect.
+    constexpr int nq = 128, phys_base = 7;
+    for (bool split_domains : {false, true}) {
+        llama_kv_cells cells;
+        cells.resize(512);
+        for (int q = 0; q < nq; ++q) {
+            if (q == 40 || q == 41) continue;
+            cells.pos_set(phys_base + q, q);
+            cells.seq_add(phys_base + q, 0);
+            if (split_domains) cells.seq_add(phys_base + q, 1);
+        }
+        std::vector<llama_pos> pos(nq);
+        std::vector<int32_t> nseq(nq, 1);
+        std::vector<llama_seq_id> seq(nq);
+        std::vector<llama_seq_id *> seqptr(nq);
+        std::vector<llama_flashprefill_row> rows;
+        for (int q = 0; q < nq; ++q) {
+            pos[q] = q;
+            seq[q] = split_domains ? q % 2 : 0;
+            seqptr[q] = &seq[q];
+            rows.push_back(make_row(LLAMA_FLASHPREFILL_ROLE_PREFILL, seq[q], q, 0, nq, true));
+        }
+        llama_ubatch ub{};
+        ub.n_tokens = nq; ub.pos = pos.data(); ub.n_seq_id = nseq.data(); ub.seq_id = seqptr.data();
+        llama_flashprefill_layout_params params;
+        params.block_k = 64;
+        params.want_exact_rows = true;
+        llama_flashprefill_layout layout;
+        std::string error;
+        if (!llama_flashprefill_fixture_build_ordinary({cells}, {0, 0}, ub, params, layout, &error)) {
+            std::fprintf(stderr, "graph-pack fixture: %s\n", error.c_str());
+            TEST_ASSERT(false);
+            continue;
+        }
+        TEST_ASSERT(layout.n_groups() == nq);
+        for (uint32_t gqa : {1u, 6u, 8u}) for (uint32_t hkv : {1u, 8u}) {
+            for (uint32_t bm : {5u, 64u, 128u}) {
+                auto cfg = make_auto(LLAMA_FLASHPREFILL_TAIL_CALL);
+                cfg.block_q = bm; cfg.block_k = 64; cfg.exact_all = true;
+                llm_fp_pack pack;
+                const auto rc = llm_fp_pack_live(layout, rows, cfg, gqa*hkv, hkv, gqa, nq, &pack, &error);
+                if (rc != LL_FP_PACK_OK) {
+                    std::fprintf(stderr, "graph pack G=%u Hkv=%u BM=%u: %s\n", gqa, hkv, bm, error.c_str());
+                    TEST_ASSERT(rc == LL_FP_PACK_OK);
+                    continue;
+                }
+                TEST_ASSERT(pack.qpos.empty()); // ordinary Q is already roped
+                TEST_ASSERT(pack.n_groups == nq);
+                TEST_ASSERT(pack.cells.size() == nq - 2);
+                TEST_ASSERT(pack.rows.size() == nq * gqa * hkv);
+                const int64_t tiles_per_domain = ((split_domains ? nq / 2 : nq) * gqa + bm - 1) / bm;
+                TEST_ASSERT(pack.n_tiles == tiles_per_domain * (split_domains ? 2 : 1));
+                std::map<std::tuple<int32_t,int32_t,int32_t>, std::vector<int32_t>> addressed;
+                for (const auto & u : pack.uses) {
+                    TEST_ASSERT(u.tile >= 0 && u.tile < pack.n_tiles);
+                    TEST_ASSERT(u.q_group == u.src_q);
+                    if (u.sub_off < 0 || u.sub_count <= 0 ||
+                        uint64_t(u.sub_off + u.sub_count) > pack.cells.size()) {
+                        TEST_ASSERT(false);
+                        continue;
+                    }
+                    auto & keys = addressed[{u.src_q, u.tile, u.kv_head}];
+                    keys.insert(keys.end(), pack.cells.begin() + u.sub_off,
+                                pack.cells.begin() + u.sub_off + u.sub_count);
+                }
+                for (const auto & r : pack.rows) {
+                    const int local_q = split_domains ? r.src_q / 2 : r.src_q;
+                    const int domain = split_domains ? r.src_q % 2 : 0;
+                    const int64_t tile = domain * tiles_per_domain +
+                        (local_q * gqa + (uint32_t) r.q_head % gqa) / bm;
+                    TEST_ASSERT(r.tile == tile);
+                    TEST_ASSERT(r.kv_head == r.q_head / (int32_t) gqa);
+                    std::vector<int32_t> expected;
+                    for (int p = 0; p <= r.src_q; ++p) {
+                        if (p != 40 && p != 41) expected.push_back(phys_base + p);
+                    }
+                    // Exact key coverage per actual row, with no duplicates,
+                    // missing keys, foreign-domain keys, or resurrected holes.
+                    TEST_ASSERT((addressed[{r.src_q, r.tile, r.kv_head}] == expected));
+                }
+            }
+        }
+        auto cfg = make_auto(LLAMA_FLASHPREFILL_TAIL_CALL);
+        cfg.exact_all = true;
+        cfg.block_k = 64;
+        llm_fp_pack pack;
+        auto bad = layout;
+        bad.groups[0].query_index = 1;
+        TEST_ASSERT(llm_fp_pack_live(bad, rows, cfg, 48, 8, 6, nq, &pack, &error) == LL_FP_PACK_CORRUPT);
+        bad = layout;
+        bad.uses[0].group = 1;
+        TEST_ASSERT(llm_fp_pack_live(bad, rows, cfg, 48, 8, 6, nq, &pack, &error) == LL_FP_PACK_CORRUPT);
+        bad = layout;
+        bad.uses[0].sub_off = bad.fragments[bad.uses[0].fragment].token_count;
+        TEST_ASSERT(llm_fp_pack_live(bad, rows, cfg, 48, 8, 6, nq, &pack, &error) == LL_FP_PACK_CORRUPT);
+        // Phase-bearing graphs still need their Q positions; suppressing
+        // ordinary identity uploads must not discard RERoT's phase data.
+        auto phased = layout;
+        phased.is_rerot = 1;
+        TEST_ASSERT(llm_fp_pack_live(phased, rows, cfg, 48, 8, 6, nq, &pack, &error) == LL_FP_PACK_OK);
+        TEST_ASSERT(pack.qpos == pos);
+    }
+}
+
 int main(void) {
+    test_real_graph_pack();
     // One shared metadata input must support the actual Nanbeige boundary
     // V policy without disabling detection of genuine per-layer changes.
     llm_graph_fp_key key;

@@ -4,6 +4,7 @@
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
+#include "llama-flashprefill-pack.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -5022,50 +5023,6 @@ static bool llm_fp_reserve_probe_inputs(
 // build (and per submit refill); the expensive GGML full validator never
 // runs here (oracle/tests only) — checked construction below rejects
 // corruption fail-closed instead.
-struct llm_fp_rowrec {
-    int32_t domain  = -1; // visibility domain ordinal (selection-privacy partition)
-    int32_t src_q   = 0; // ubatch row (output query id, never reordered)
-    int32_t kv_head = 0;
-    int32_t q_head  = 0;
-    int32_t tile    = 0; // ubatch-relative packed-Q tile
-    int32_t log_pos = 0;
-    int32_t pbegin  = 0;
-    int32_t pend    = 0;
-    bool    forced  = false; // DENSE_FORCE: exact tail/short row through the new op
-};
-
-struct llm_fp_userec {
-    int32_t domain   = -1; // visibility domain ordinal (matches row domain)
-    int32_t frag     = 0;
-    int32_t tile     = 0;
-    int32_t kv_head  = 0;
-    int32_t q_group  = 0; // effective phase for this query+fragment
-    int64_t sub_off  = 0; // absolute cell-table offset inside the fragment range
-    int64_t sub_count = 0; // > 0
-    int32_t flags    = 0;
-    int32_t src_q    = 0;
-};
-
-struct llm_fp_pack {
-    std::vector<llm_fp_rowrec> rows; // sorted (tile,kv_head,src_q,q_head)
-    std::vector<llm_fp_userec> uses; // sorted (tile,kv_head,src_q,frag)
-    std::vector<int32_t> cells;      // concatenated fragment member cells
-    std::vector<uint32_t> frag_base; // [F] cell-table base per fragment
-    int64_t n_tiles = 0;
-    int64_t max_sel = 0; // max actual per-(tile,head) use count
-    int32_t n_groups = 0;
-    std::vector<int32_t> qpos; // [G] per-group Q RoPE positions (rerot only)
-    int32_t sparse_rows = 0;
-    int32_t forced_rows = 0;
-    uint64_t visible_tokens = 0; // sum of per-query resident+visible+legal incidences
-};
-
-enum llm_fp_pack_rc {
-    LL_FP_PACK_OK       = 0, // packed, counts fit I32
-    LL_FP_PACK_CORRUPT  = 1, // invalid layout/rows/mapping: caller throws, every mode
-    LL_FP_PACK_OVERFLOW = 2, // counts exceed I32 wire domain: sizing path (dense AUTO, throw REQUIRED)
-};
-
 // Selection privacy: a packed tile must never mix distinct seq/reader
 // visibility domains, even under one role. Tile-energy aggregates over the
 // packed rows of a tile, so cross-domain sharing would let one domain's
@@ -5160,7 +5117,7 @@ static bool llm_fp_domain_layout(
     return true;
 }
 
-static llm_fp_pack_rc llm_fp_pack_live(
+llm_fp_pack_rc llm_fp_pack_live(
         const llama_flashprefill_layout & layout,
         const std::vector<llama_flashprefill_row> & rows,
         const llama_flashprefill_config & cfg,
@@ -5170,7 +5127,7 @@ static llm_fp_pack_rc llm_fp_pack_live(
         uint32_t n_tokens,
         llm_fp_pack * out,
         std::string * error,
-        bool dry_run = false) {
+        bool dry_run) {
     if (out == nullptr) {
         return LL_FP_PACK_CORRUPT;
     }
@@ -5221,7 +5178,22 @@ static llm_fp_pack_rc llm_fp_pack_live(
             return fail("flashprefill pack: group offsets != Q+1");
         }
     }
-    const bool use_groups = (G != 0);
+    // Ordinary plans may carry one identity group per query for the owner
+    // oracle. Their Q is already roped by the model: do not allocate/upload
+    // unused gather/position tensors or rotate Q again. Only RERoT consumes
+    // real phase groups in the graph.
+    const bool use_groups = layout.is_rerot && G != 0;
+    if (!layout.is_rerot && G != 0) {
+        if (G != Q) {
+            return fail("flashprefill pack: ordinary groups are not identity");
+        }
+        for (uint32_t q = 0; q < Q; ++q) {
+            if (layout.groups[q].query_index != q ||
+                layout.group_offsets[q] != q || layout.group_offsets[q + 1] != q + 1) {
+                return fail("flashprefill pack: ordinary group mapping is not identity");
+            }
+        }
+    }
     if (use_groups) {
         for (uint32_t g = 0; g < G; ++g) {
             if (layout.groups[g].query_index >= Q) {
@@ -5244,6 +5216,9 @@ static llm_fp_pack_rc llm_fp_pack_live(
             if (u.query != q) {
                 return fail("flashprefill pack: use query mismatch");
             }
+            if (!layout.is_rerot && G != 0 && u.group != q) {
+                return fail("flashprefill pack: ordinary use group is not identity");
+            }
             if (u.fragment >= F) {
                 return fail("flashprefill pack: use fragment out of range");
             }
@@ -5263,12 +5238,11 @@ static llm_fp_pack_rc llm_fp_pack_live(
             // Subrange inside the fragment member range, member order
             // (positions/storage ascending): legal subsets are prefixes, so
             // the wire offset is base + relative.
-            const uint64_t membase = fr.contiguous ? fr.cell_begin : fr.cell_ref_offset;
             if (!fr.contiguous && fr.cell_ref_offset == UINT32_MAX) {
                 return fail("flashprefill pack: fragment addressing invalid");
             }
             const uint64_t rel_end = (uint64_t) u.sub_off + (uint64_t) u.sub_count;
-            if (u.sub_off < membase || rel_end > membase + (uint64_t) fr.token_count) {
+            if (rel_end > (uint64_t) fr.token_count) {
                 return fail("flashprefill pack: use subrange outside fragment");
             }
             if (!fr.contiguous &&
@@ -5477,12 +5451,13 @@ static llm_fp_pack_rc llm_fp_pack_live(
             // packed rows are consecutive, so touched tiles run contiguously
             // first..last in the same domain numbering as the row records
             // above (no array bound, no fail-closed truncation).
+            // KV heads are a separate plan axis. Every KV head uses the
+            // same query-local subhead range [0, gqa), as the row records
+            // above do via h % gqa. Adding kh*gqa shifts uses away from
+            // their rows (and can create tiles past n_tiles).
             const int64_t plo = q_tile_base[(size_t) q] +
-                (q_local[(size_t) q] + (int64_t) kh * (int64_t) gqa) / (int64_t) cfg.block_q;
-            int64_t last_s = (int64_t) kh * (int64_t) gqa + (int64_t) gqa - 1;
-            if (last_s >= (int64_t) hq) {
-                last_s = (int64_t) hq - 1;
-            }
+                q_local[(size_t) q] / (int64_t) cfg.block_q;
+            const int64_t last_s = (int64_t) gqa - 1;
             const int64_t phi = q_tile_base[(size_t) q] +
                 (q_local[(size_t) q] + last_s) / (int64_t) cfg.block_q;
             if (plo > phi || plo > (int64_t) INT32_MAX || phi > (int64_t) INT32_MAX) {
@@ -5492,9 +5467,8 @@ static llm_fp_pack_rc llm_fp_pack_live(
                 const int32_t tile = (int32_t) t;
             for (uint32_t i = b; i < e; ++i) {
                 const auto & u = layout.uses[i];
-                const auto & fr = layout.fragments[u.fragment];
-                const uint64_t membase = fr.contiguous ? fr.cell_begin : fr.cell_ref_offset;
-                const uint64_t wsub = (uint64_t) frag_base[u.fragment] + ((uint64_t) u.sub_off - membase);
+                [[maybe_unused]] const auto & fr = layout.fragments[u.fragment];
+                const uint64_t wsub = (uint64_t) frag_base[u.fragment] + (uint64_t) u.sub_off;
                 if (wsub > (uint64_t) INT32_MAX ||
                     (uint64_t) u.sub_count > (uint64_t) INT32_MAX) {
                     return fail("flashprefill pack: wire subrange out of I32 range");
@@ -5999,6 +5973,16 @@ std::unique_ptr<llm_graph_input_attn_flashprefill> llm_graph_input_attn_flashpre
         }
         return llm_fp_deny(res, hparams, ubatch, LLAMA_FLASHPREFILL_ROUTE_DENSE_CAPACITY);
     }
+    // The layout scans the physical cache capacity, whereas attention views
+    // end at the padded resident high-water mark. They need not be equal
+    // (e.g. 512 allocated cells, a 256-wide view, and 128 live cells).
+    // Every referenced cell must nevertheless fit the actual tensor view.
+    const uint32_t view_n_kv = mctx_cur->get_n_kv();
+    for (const auto cell : pack.cells) {
+        if (cell < 0 || (uint64_t) cell >= view_n_kv) {
+            throw std::runtime_error("flashprefill: packed cell outside KV tensor view");
+        }
+    }
     // Visible gate on layout-derived incidences (pack.visible_tokens), never
     // the global padded get_n_kv: short sequences surrounded by idle KV
     // report their own small shape. Mirrors the can_reuse probe exactly.
@@ -6166,7 +6150,7 @@ std::unique_ptr<llm_graph_input_attn_flashprefill> llm_graph_input_attn_flashpre
     out->key.backend_variant = variant;
     out->key_valid = true;
     out->built_cells_epoch = layout.cells_epoch;
-    out->built_n_kv = layout.n_kv_at_build;
+    out->built_n_kv = view_n_kv;
     out->last_sparse_rows = pack.sparse_rows;
     out->last_forced_rows = pack.forced_rows;
     out->built_summary.n_tiles = (int32_t) n_tiles;
@@ -6384,18 +6368,11 @@ bool llm_graph_input_attn_flashprefill::submit_guards_ok(const llama_ubatch & ub
     if (layout.n_fragments() > key.f_cap) {
         return fail("flashprefill submit: fragments exceed cap");
     }
-    {
-        // Same wire-use estimate as reuse (compact uses x kv-head fan-out x
-        // sound tile straddle, checked 64-bit).
-        const uint32_t gqa_now =
-            (key.n_kv_heads > 0 && key.n_q_heads > 0) ? (uint32_t) key.n_q_heads / (uint32_t) key.n_kv_heads : 1u;
-        const uint64_t west = (uint64_t) layout.uses.size() *
-            (uint64_t) (key.n_kv_heads > 0 ? key.n_kv_heads : 1) *
-            (uint64_t) llm_fp_tile_fanout(gqa_now, cparams.flashprefill.block_q);
-        if (west > (uint64_t) key.u_cap) {
-            return fail("flashprefill submit: uses exceed cap");
-        }
-    }
+    // u_cap is allocated from the EXACT packed use count. A worst-case
+    // fan-out estimate may exceed it for a valid fresh graph (GQA=6 with
+    // BM=128 is one example). set_input repacks and checks every exact
+    // count against its cap before any upload; do not reject using an
+    // upper bound as though it were the actual number of writes.
     return true;
 }
 
@@ -6482,6 +6459,9 @@ void llm_graph_input_attn_flashprefill::set_input(const llama_ubatch * ubatch) {
         }
     }
     for (size_t i = 0; i < pack.cells.size(); ++i) {
+        if (pack.cells[i] < 0 || (uint64_t) pack.cells[i] >= built_n_kv) {
+            throw std::runtime_error("flashprefill submit: packed cell outside KV tensor view");
+        }
         if (ggml_flashprefill_metadata_set_cell(md, meta_words, (int64_t) i, pack.cells[i]) != GGML_FLASHPREFILL_OK) {
             throw std::runtime_error("flashprefill submit: metadata cell failed");
         }
@@ -6538,6 +6518,9 @@ bool llm_graph_input_attn_flashprefill::can_reuse(const llm_graph_params & param
     }
     if (mctx == nullptr || params.hparams.n_layer() != key.layer_kv_types.size()) {
         return false;
+    }
+    if (!key.reserve_sizing && mctx->get_n_kv() != built_n_kv) {
+        return false; // tensor shapes changed; rebuild rather than fail at submit
     }
     for (uint32_t il = 0; il < params.hparams.n_layer(); ++il) {
         if (llm_fp_layer_eligible(params.hparams, (int) il) &&
@@ -6669,7 +6652,7 @@ bool llm_graph_input_attn_flashprefill::can_reuse(const llm_graph_params & param
         // tails, so the actual group count is submit data (refilled), not
         // topology. Presence must match the build (tensor set) and the count
         // must fit the cap; kernels bound by the header actual.
-        const bool has_groups_now = layout.n_groups() != 0;
+        const bool has_groups_now = layout.is_rerot && layout.n_groups() != 0;
         if (has_groups_now != (q_pos != nullptr)) {
             return false;
         }

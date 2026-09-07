@@ -37,6 +37,12 @@ query batches 1/128 plus the K4/V2 and K4/Q8 256-token prefill shapes),
 33 Turbo SET_ROWS cases, and 81 CPU round trips.
 These are operator correctness checks, not model-quality scores.
 
+The routing test also calls the real cache planner and graph packer in 36
+model-free shapes: GQA=1/6/8, KV heads=1/8, query tiles=5/64/128, and one/two
+visibility domains. It checks each row's exact physical key set with sparse
+holes and a nonzero physical offset. Ordinary identity Q groups do not
+produce unused RoPE inputs; phase-bearing graphs retain their position data.
+
 ## Bounded model probes
 
 The standard-library-only runner starts a private loopback listener with an
