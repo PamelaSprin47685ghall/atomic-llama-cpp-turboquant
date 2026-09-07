@@ -136,7 +136,7 @@ struct llama_rerot_reader_view {
 
 // A reader view installed on an execution sequence. The logical document is
 // owned by the scheduler; the KV cache only needs the stable ordered run ids
-// and enough clock information to decide current-frontier visibility.
+// and enough clock information to decide staged frontier visibility.
 struct llama_rerot_reader_state {
     uint64_t episode_id = 0;
     llama_rerot_node_id reader = LLAMA_REROT_NODE_INVALID;

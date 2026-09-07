@@ -198,12 +198,27 @@ static void test_child_grammar_requires_exact_random_close() {
     CHECK(grammar_accepts(
         grammar, "原生标签只是正文</think>\n</AbCdEfG0>"));
     CHECK(grammar_accepts(grammar, "事实清单。</AbCdEfG0>"));
+    CHECK(grammar_accepts(grammar, "事实清单。包含更多标点符号，任意写！\n</AbCdEfG0>"));
     CHECK(grammar_accepts(grammar, "one sentence.</AbCdEfG0>"));
+    CHECK(grammar_accepts(grammar, "one sentence. with more words.\n</AbCdEfG0>"));
     CHECK(grammar_accepts(grammar, "推导正文\n</AbCdEfG0>"));
+    CHECK(grammar_accepts(grammar, "<ol><li>递归列表</li></ol>\n</AbCdEfG0>"));
+    CHECK(grammar_accepts(grammar, "<ol><li>递归列表</li></ol></AbCdEfG0>"));
     CHECK(!grammar_accepts(grammar, "</AbCdEfG0>"));
     CHECK(!grammar_accepts(grammar, " \n\n</AbCdEfG0>"));
     CHECK(!grammar_accepts(grammar, "推导正文"));
     CHECK(!grammar_accepts(grammar, "推导正文</AbCdEfG1>"));
+    CHECK(grammar_accepts(grammar, "推导第一行\n第二行继续推导\n</AbCdEfG0>"));
+    CHECK(grammar_accepts(grammar, "第一段。\n\n第二段。\r\n```cpp\nint x = 1;\n```\n</AbCdEfG0>"));
+    CHECK(grammar_accepts(grammar, "<ol>\n<li>递归任务一</li>\n<li>递归任务二</li>\n</ol>\n</AbCdEfG0>"));
+    CHECK(!grammar_accepts(grammar, "第一行\n第二行\n"));
+    CHECK(!grammar_accepts(grammar, "第一行\n第二行</AbCdEfG1>"));
+    CHECK(!grammar_accepts(grammar, "正文</AbCdEfG0>闭合后不能续写"));
+    std::string long_body = "长推导";
+    for (int i = 0; i < 256; ++i) {
+        long_body += "\n继续核对另一项事实，不以行数或长度代替任务完成。";
+    }
+    CHECK(grammar_accepts(grammar, long_body + TEST_CHILD_CLOSE));
     CHECK(server_rerot_child_grammar("</think>").empty());
 }
 

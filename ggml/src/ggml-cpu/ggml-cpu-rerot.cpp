@@ -174,10 +174,11 @@ bool SpansCoverAll(const Span * spans, size_t n_spans, uint32_t n_keys) {
     return true;
 }
 
-// Frontier visibility for one key. Keys behind the query frontier are always
-// visible; current-frontier peers are visible only in strong mode (lag1 hides
-// them until the next frontier); future keys are never visible. The extra
-// mask (nullptr = all pass) models private-gap filtering on top.
+// Frontier visibility for PEER keys. A query's own current token is handled by
+// the layout builder before this helper is relevant. Strong exposes every
+// committed prior frontier; lag1 adds one extra committed-frontier delay.
+// Same-frontier peers are never visible: they belong to the write stage of the
+// current synchronous frontier, not the read stage of the same token.
 bool KeyVisible(uint64_t key_frontier,
                 uint64_t query_frontier,
                 FrontierMode mode,
@@ -185,13 +186,10 @@ bool KeyVisible(uint64_t key_frontier,
     if (!extra_mask_pass) {
         return false;
     }
-    if (key_frontier < query_frontier) {
-        return true;
+    if (mode == FrontierMode::Strong) {
+        return key_frontier < query_frontier;
     }
-    if (key_frontier == query_frontier) {
-        return mode == FrontierMode::Strong;
-    }
-    return false;
+    return query_frontier > 0 && key_frontier < query_frontier - 1;
 }
 
 // Single-head materialized baseline: K rephased storage -> virtual, Q at

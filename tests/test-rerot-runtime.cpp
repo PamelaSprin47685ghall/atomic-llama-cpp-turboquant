@@ -32,7 +32,60 @@ static bool commit_generated(
         llama_pos pos,
         const std::string & bytes) {
     const auto plan = runtime.plan_generated_token(episode_id, node_id, pos, bytes);
-    return plan.has_value() && runtime.commit_token(episode_id, node_id, *plan);
+    return plan.has_value() && runtime.track_fence_token(episode_id, node_id, *plan, 1000 + pos) &&
+        runtime.commit_token(episode_id, node_id, *plan);
+}
+
+static void replay_final_fence(server_rerot_runtime & runtime, uint64_t ep, llama_rerot_node_id node) {
+    auto * episode = runtime.episode(ep);
+    const auto before = *episode;
+    // Installing a reader view alone may not unlock serial continuation.
+    server_rerot_runtime rejected(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 128);
+    CHECK(rejected.adopt_root(0, 0, 0, 0, 0, ep) == ep);
+    *rejected.episode(ep) = before;
+    CHECK(!rejected.complete_serial_tail(ep, node));
+    CHECK(runtime.prepare_final_fence(ep, node));
+    CHECK(!runtime.prepare_final_fence(ep, node)); // No second rewind.
+    const auto original = runtime.node(ep, node)->fence.rows;
+    CHECK(original.size() == 2); // request_exit spans two actual tokenizer rows
+    size_t replayed = 0;
+    while (const auto plan = runtime.plan_final_fence_token(ep, node)) {
+        CHECK(plan->storage_pos == original[replayed].pos);
+        CHECK(plan->run_id == original[replayed].run);
+        CHECK(plan->visibility == llama_rerot_visibility::private_control);
+        CHECK(runtime.commit_final_fence_token(ep, node, *plan));
+        ++replayed;
+        if (replayed == 1) {
+            // A mid-fence episode checkpoint retains the original token tape,
+            // cursor and pre-marker local state, not a retokenized delimiter.
+            server_rerot_state_fingerprints fp;
+            fp.caps = LLAMA_REROT_STATE_CAP_REROT | LLAMA_REROT_STATE_CAP_REROT_TREE |
+                LLAMA_REROT_STATE_CAP_REROT_PRIVATE;
+            std::string err;
+            const auto blob = server_rerot_episode_save(*episode, fp, &err);
+            server_rerot_episode loaded;
+            CHECK(!blob.empty());
+            CHECK(server_rerot_episode_load(blob.data(), blob.size(), fp, &loaded, &err));
+            CHECK(loaded.nodes[node].fence.cursor == 1);
+            CHECK(loaded.nodes[node].fence.prepared);
+            CHECK(loaded.nodes[node].fence.rows.size() == original.size());
+            for (size_t i = 0; i < original.size(); ++i) {
+                CHECK(loaded.nodes[node].fence.rows[i].token == original[i].token);
+                CHECK(loaded.nodes[node].fence.rows[i].pos == original[i].pos);
+                CHECK(loaded.nodes[node].fence.rows[i].run == original[i].run);
+            }
+        }
+    }
+    CHECK(replayed == original.size());
+    CHECK(runtime.node(ep, node)->fence.complete());
+    CHECK(episode->generated_public_tokens == before.generated_public_tokens);
+    CHECK(episode->generated_private_tokens == before.generated_private_tokens);
+    CHECK(episode->pending_tokens == before.pending_tokens);
+    CHECK(episode->document.run_count() == before.document.run_count());
+    CHECK(episode->nodes[node].storage_pos_next == before.nodes[node].storage_pos_next);
+    CHECK(episode->publish_epoch == before.publish_epoch);
+    CHECK(episode->layout_epoch == before.layout_epoch);
+    CHECK(episode->frontier == before.frontier);
 }
 
 static void start_child(
@@ -57,9 +110,7 @@ static void start_child(
                (ch >= 'a' && ch <= 'z');
     }));
     CHECK(node->exit_parser.marker() == "</" + std::string(id) + ">");
-    CHECK(node->control_open() ==
-        "<" + std::string(id) +
-        " note=\"Start of private child work block.\">");
+    CHECK(node->control_open() == "<" + std::string(id) + ">");
 
     const auto heading = runtime.plan_heading_token(
         episode_id, admitted, node->storage_pos_next);
@@ -77,6 +128,8 @@ static void start_child(
         CHECK(commit_private(runtime, episode_id, admitted, node->storage_pos_next));
     }
     CHECK(runtime.complete_admission(episode_id, admitted));
+    node = runtime.node(episode_id, admitted);
+    CHECK(node && !node->planner_armed);
 }
 
 static void make_terminal(
@@ -87,6 +140,15 @@ static void make_terminal(
     CHECK(node != nullptr);
     if (!node) {
         return;
+    }
+    const auto * logical_before = runtime.episode(episode_id)->document.node(node_id);
+    if (logical_before && logical_before->state == llama_rerot_node_state::terminal_running) {
+        return;
+    }
+    if (!node->planner_armed) {
+        CHECK(runtime.arm_planner(episode_id, node_id));
+        node = runtime.node(episode_id, node_id);
+        CHECK(node && node->planner_armed);
     }
     CHECK(commit_generated(runtime, episode_id, node_id, node->storage_pos_next,
         "<ol><li>Lane 1: directly solve this section</li></ol>"));
@@ -245,11 +307,12 @@ static void test_marker_token_preserves_public_prefix() {
     const std::string id(child->control_id());
     server_rerot_line_mux mux;
 
+    // In KISS architecture, ordinary child tokens are public_live immediately.
     auto plan = runtime.plan_generated_token(
         episode_id, 1, child->storage_pos_next, "answer</p");
     CHECK(plan.has_value());
     CHECK(plan && plan->visibility ==
-        llama_rerot_visibility::pending_record);
+        llama_rerot_visibility::public_live);
     CHECK(plan && runtime.commit_token(episode_id, 1, *plan));
     if (!plan) {
         return;
@@ -258,15 +321,17 @@ static void test_marker_token_preserves_public_prefix() {
     const auto * body_before =
         runtime.episode(episode_id)->document.run(body_run);
     CHECK(body_before && body_before->visibility ==
-        llama_rerot_visibility::pending_record);
+        llama_rerot_visibility::public_live);
     auto ready = mux.append(
         1, plan->run_id, "answer</p", runtime.episode(episode_id)->document);
     CHECK(ready.ok && ready.lines.empty());
 
     child = runtime.node(episode_id, 1);
+    // Token containing ">" then candidate start "</" is pending_record for the candidate part.
     plan = runtime.plan_generated_token(
         episode_id, 1, child ? child->storage_pos_next : 1, "></");
     CHECK(plan.has_value());
+    CHECK(plan && plan->visibility == llama_rerot_visibility::pending_record);
     CHECK(plan && plan->marker_step.public_prefix_bytes == 1);
     const auto * body_after =
         runtime.episode(episode_id)->document.run(body_run);
@@ -286,10 +351,12 @@ static void test_marker_token_preserves_public_prefix() {
 
     child = runtime.node(episode_id, 1);
     CHECK(child != nullptr);
+    // Closing marker completes: becomes private_control
     plan = runtime.plan_generated_token(
         episode_id, 1, child ? child->storage_pos_next : 2, id + ">");
     CHECK(plan.has_value());
     CHECK(plan && plan->marker_step.marker_closed);
+    CHECK(plan && plan->visibility == llama_rerot_visibility::private_control);
     CHECK(plan && runtime.commit_token(episode_id, 1, *plan));
     if (!plan) {
         return;
@@ -306,6 +373,56 @@ static void test_marker_token_preserves_public_prefix() {
     CHECK(ready.ok);
     CHECK(ready.lines == std::vector<std::string>({"answer</p>\n"}));
     CHECK(mux.empty());
+    CHECK(runtime.erase_episode(episode_id));
+}
+
+static void test_child_public_live_visibility_and_exit_marker() {
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
+    const uint64_t episode_id = runtime.adopt_root(150, 150, 0, 0, 0);
+    CHECK(commit_generated(runtime, episode_id, 0, 0,
+        "<ol><li>Task 1</li><li>Task 2</li></ol>"));
+    runtime.finish_frontier(episode_id);
+    CHECK(runtime.freeze_fork_parent(episode_id, 0));
+    start_child(runtime, episode_id, 0, 1);
+
+    auto * child = runtime.node(episode_id, 1);
+    CHECK(child != nullptr);
+    if (!child) {
+        return;
+    }
+    const std::string id(child->control_id());
+
+    // 1. Regular text (single/multi-line) is public_live immediately
+    auto plan = runtime.plan_generated_token(
+        episode_id, 1, child->storage_pos_next, "line 1 text with punctuation: 1.0, and words.\n");
+    CHECK(plan.has_value());
+    CHECK(plan && plan->visibility == llama_rerot_visibility::public_live);
+    CHECK(plan && runtime.commit_token(episode_id, 1, *plan));
+
+    // 2. Illegal or partial candidate prefix that gets disproved returns to public_live
+    child = runtime.node(episode_id, 1);
+    plan = runtime.plan_generated_token(episode_id, 1, child->storage_pos_next, "<");
+    CHECK(plan.has_value());
+    CHECK(plan && plan->visibility == llama_rerot_visibility::pending_record);
+    CHECK(plan && runtime.commit_token(episode_id, 1, *plan));
+
+    child = runtime.node(episode_id, 1);
+    plan = runtime.plan_generated_token(episode_id, 1, child->storage_pos_next, "illegal_not_marker>");
+    CHECK(plan.has_value());
+    CHECK(plan && plan->visibility == llama_rerot_visibility::public_live);
+    CHECK(plan && runtime.commit_token(episode_id, 1, *plan));
+
+    // 3. Outputting legal close marker marks it private_control and triggers exit intent
+    child = runtime.node(episode_id, 1);
+    const std::string close_tag = "</" + id + ">";
+    plan = runtime.plan_generated_token(episode_id, 1, child->storage_pos_next, close_tag);
+    CHECK(plan.has_value());
+    CHECK(plan && plan->visibility == llama_rerot_visibility::private_control);
+    CHECK(plan && plan->marker_step.marker_closed);
+    CHECK(plan && runtime.commit_token(episode_id, 1, *plan));
+    child = runtime.node(episode_id, 1);
+    CHECK(child && child->exit_intent);
+
     CHECK(runtime.erase_episode(episode_id));
 }
 
@@ -511,6 +628,25 @@ static void test_n2_strong_uptake() {
     start_child(runtime, episode_id, 0, 1);
     start_child(runtime, episode_id, 1, 2);
 
+    // An explicit private task contract may QUOTE the closing delimiter.
+    // Decoding that instruction is not a sampled exit and it stays owner-only.
+    auto * controlled = runtime.node(episode_id, 1);
+    const std::string contract = server_rerot_child_contract(
+        "Alpha", controlled->exit_parser.marker());
+    CHECK(!contract.empty());
+    const uint64_t public_before = runtime.episode(episode_id)->generated_public_tokens;
+    const auto forced_contract = runtime.plan_private_span(episode_id, 1, controlled->storage_pos_next, 3);
+    CHECK(forced_contract.has_value());
+    if (forced_contract) {
+        for (const auto & plan : *forced_contract) CHECK(runtime.commit_token(episode_id, 1, plan));
+        const auto & doc = runtime.episode(episode_id)->document;
+        CHECK(view_contains_run(doc.build_view(1), forced_contract->front().run_id));
+        CHECK(!view_contains_run(doc.build_view(2), forced_contract->front().run_id));
+    }
+    CHECK(!controlled->exit_intent);
+    CHECK(!controlled->last_write_public);
+    CHECK(runtime.episode(episode_id)->generated_public_tokens == public_before);
+
     // Lane 1 publishes one PUBLIC finding plus PRIVATE control state.
     auto * lane1 = runtime.node(episode_id, 1);
     CHECK(lane1 != nullptr);
@@ -581,6 +717,9 @@ static void test_nested_fork_keeps_fifo() {
     // A recursively forks two grandchildren while B is still queued.
     auto * lane_a = runtime.node(episode_id, 1);
     CHECK(lane_a != nullptr);
+    CHECK(runtime.arm_planner(episode_id, 1));
+    lane_a = runtime.node(episode_id, 1);
+    CHECK(lane_a && lane_a->planner_armed);
     CHECK(commit_generated(runtime, episode_id, 1, lane_a->storage_pos_next,
         "<ol><li>A1</li><li>A2</li></ol>"));
     const auto * episode = runtime.episode(episode_id);
@@ -618,6 +757,48 @@ static void test_nested_fork_keeps_fifo() {
     CHECK(runtime.erase_episode(episode_id));
 }
 
+static void test_child_content_list_is_not_scheduler_control() {
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
+    const uint64_t episode_id = runtime.adopt_root(135, 135, 0, 0, 0);
+    CHECK(commit_generated(runtime, episode_id, 0, 0,
+        "<ol><li>Only child</li><li>Sibling</li></ol>"));
+    CHECK(runtime.finish_frontier(episode_id).forked.size() == 1);
+    CHECK(runtime.freeze_fork_parent(episode_id, 0));
+    start_child(runtime, episode_id, 0, 1);
+
+    const auto * logical = runtime.episode(episode_id)->document.node(1);
+    CHECK(logical && logical->title == "Only child");
+    const auto * lane = runtime.node(episode_id, 1);
+    const std::string contract = server_rerot_child_contract(
+        logical ? logical->title : std::string_view{},
+        lane ? lane->exit_parser.marker() : std::string_view{});
+    CHECK(contract.find("Only child") != std::string::npos);
+    CHECK(contract.find("Sibling") == std::string::npos);
+    const std::string planner = server_rerot_child_planner_prompt(
+        logical ? logical->title : std::string_view{});
+    CHECK(planner.find("Only child") != std::string::npos);
+    const std::string worker = server_rerot_child_worker_prompt(
+        logical ? logical->title : std::string_view{},
+        lane ? lane->exit_parser.marker() : std::string_view{});
+    CHECK(worker.find("Only child") != std::string::npos);
+    CHECK(worker.find("整个用户问题") != std::string::npos);
+
+    // Explicit planner phase returns N=1 and is then permanently disarmed.
+    make_terminal(runtime, episode_id, 1);
+    lane = runtime.node(episode_id, 1);
+    CHECK(lane && !lane->planner_armed);
+    const size_t nodes_before = runtime.episode(episode_id)->document.node_count();
+    const llama_pos pos = lane ? lane->storage_pos_next : 0;
+    CHECK(commit_generated(runtime, episode_id, 1, pos,
+        "正文可以自然使用 <ol><li>事实甲</li><li>事实乙</li></ol> 而不改变拓扑。"));
+    const auto * episode = runtime.episode(episode_id);
+    const auto * after = episode ? episode->document.node(1) : nullptr;
+    CHECK(episode && episode->document.node_count() == nodes_before);
+    CHECK(after && after->state == llama_rerot_node_state::terminal_running);
+    CHECK(runtime.node(episode_id, 1) && !runtime.node(episode_id, 1)->planner_armed);
+    CHECK(runtime.erase_episode(episode_id));
+}
+
 static void test_pending_invisible_until_atomic_publish() {
     server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
     const uint64_t episode_id = runtime.adopt_root(140, 140, 0, 0, 0);
@@ -630,7 +811,10 @@ static void test_pending_invisible_until_atomic_publish() {
 
     // Lane 1 opens a nested planner record but has not closed it: PENDING.
     auto * lane1 = runtime.node(episode_id, 1);
-    CHECK(commit_generated(runtime, episode_id, 1, lane1->storage_pos_next, "intro <ol><li>sub"));
+    CHECK(runtime.arm_planner(episode_id, 1));
+    lane1 = runtime.node(episode_id, 1);
+    CHECK(lane1 && lane1->planner_armed);
+    CHECK(commit_generated(runtime, episode_id, 1, lane1->storage_pos_next, "<ol><li>sub"));
     lane1 = runtime.node(episode_id, 1);
     CHECK(lane1 && lane1->pending_record.has_value());
     const auto pending_run = *lane1->pending_record;
@@ -692,19 +876,26 @@ static void test_lag1_delays_same_frontier_peer() {
 
     const auto strong = llama_rerot_build_query_layout(
         make_reader(LLAMA_REROT_FRONTIER_STRONG, 5), 0, keys);
-    CHECK(strong.entries.size() == 2);
+    CHECK(strong.entries.size() == 1); // own current only; peer is still in write stage
 
     const auto lag_same = llama_rerot_build_query_layout(
         make_reader(LLAMA_REROT_FRONTIER_LAG1, 5), 0, keys);
     CHECK(lag_same.entries.size() == 1);
 
-    // Next frontier the lag1 reader takes up the same peer write.
+    // STRONG takes the peer at the next read frontier; LAG1 deliberately waits
+    // one additional committed frontier.
+    const auto strong_next = llama_rerot_build_query_layout(
+        make_reader(LLAMA_REROT_FRONTIER_STRONG, 6), 0, keys);
+    CHECK(strong_next.entries.size() == 2);
     const auto lag_next = llama_rerot_build_query_layout(
         make_reader(LLAMA_REROT_FRONTIER_LAG1, 6), 0, keys);
-    CHECK(lag_next.entries.size() == 2);
+    CHECK(lag_next.entries.size() == 1);
+    const auto lag_after = llama_rerot_build_query_layout(
+        make_reader(LLAMA_REROT_FRONTIER_LAG1, 7), 0, keys);
+    CHECK(lag_after.entries.size() == 2);
 
     std::string error;
-    CHECK(strong.query_virtual_pos == 1);
+    CHECK(strong.query_virtual_pos == 0);
 
     // The runtime threads the configured mode into every installed view.
     server_rerot_runtime strong_rt(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
@@ -750,6 +941,7 @@ static void test_final_fence_sees_last_sibling_write() {
     std::vector<uint32_t> fence_runs;
     CHECK(runtime.refresh_final_fence(episode_id, 2, &fence_runs));
     CHECK(std::find(fence_runs.begin(), fence_runs.end(), secret_run) != fence_runs.end());
+    replay_final_fence(runtime, episode_id, 2);
     CHECK(runtime.complete_serial_tail(episode_id, 2));
     const auto * episode = runtime.episode(episode_id);
     CHECK(episode && episode->serial_tail && episode->serial_node == 2);
@@ -1660,6 +1852,7 @@ static void test_hand_seed_and_final_fence_continuation() {
     CHECK(mut_ep->fence_refreshed);
 
     // Complete serial tail transition
+    replay_final_fence(runtime, ep, 2);
     CHECK(runtime.complete_serial_tail(ep, 2));
     CHECK(mut_ep->serial_tail);
     CHECK(mut_ep->serial_node == 2);
@@ -2049,12 +2242,14 @@ int main() {
     test_line_mux_completion_order_and_visibility();
     test_list_marker_prefixes_remain_atomic();
     test_marker_token_preserves_public_prefix();
+    test_child_public_live_visibility_and_exit_marker();
     test_split_pending_record_resolution();
     test_private_span_reserves_one_contiguous_run();
     test_n1_no_fork_disarm_forever();
     test_n2_strong_uptake();
     test_queue_fifo_five_children_one_slot();
     test_nested_fork_keeps_fifo();
+    test_child_content_list_is_not_scheduler_control();
     test_pending_invisible_until_atomic_publish();
     test_lag1_delays_same_frontier_peer();
     test_final_fence_sees_last_sibling_write();

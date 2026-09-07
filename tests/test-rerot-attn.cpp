@@ -2,14 +2,19 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 #include "ggml-cpu.h"
+#include "../ggml/src/ggml-impl.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <fstream>
+#include <sstream>
+#include <string>
 #include <vector>
 
 // Declarations for the correctness-only CPU segmented DDVR helpers in
@@ -597,8 +602,11 @@ static void test_frontier_strong_vs_lag1() {
     };
     const int ng = int(spans.size());
 
-    // Frontiers: keys 0..2 behind (epoch 7), keys 3..4 current peers (epoch 8).
-    const std::vector<uint64_t> frontiers = { 7, 7, 7, 8, 8 };
+    // Staged visibility at query frontier 8:
+    // - epoch 6 is visible to strong and lag1
+    // - epoch 7 is visible to strong only
+    // - epoch 8 is current write-stage peer data and visible to neither.
+    const std::vector<uint64_t> frontiers = { 6, 6, 7, 8, 8 };
     constexpr uint64_t q_frontier = 8;
 
     std::mt19937 rng(0xf20au);
@@ -643,8 +651,8 @@ static void test_frontier_strong_vs_lag1() {
         return run_indexed_op(d, dv, ng, nkv, hq, hkv, 1, q_data, k_data, raw_v, entries, offsets, scale);
     };
 
-    std::vector<uint8_t> vis_strong(nkv, 1); // strong: all peers visible
-    std::vector<uint8_t> vis_lag1 = { 1, 1, 1, 0, 0 }; // lag1: current peers hidden
+    std::vector<uint8_t> vis_strong = { 1, 1, 1, 0, 0 };
+    std::vector<uint8_t> vis_lag1   = { 1, 1, 0, 0, 0 };
     const std::vector<float> out_strong = run_with_mask(vis_strong);
     const std::vector<float> out_lag1 = run_with_mask(vis_lag1);
 
@@ -672,10 +680,8 @@ static void test_frontier_strong_vs_lag1() {
     std::vector<ggml_cpu_rerot::Span> cpu_spans = { { 0, 3, 0, 0 }, { 3, 2, 10, 3 } };
     std::vector<float> cpu_out_strong(size_t(hq) * dv, 0.0f);
     std::vector<float> cpu_out_lag1(size_t(hq) * dv, 0.0f);
-    std::vector<uint8_t> mask_all(nkv, 1);
-    std::vector<uint8_t> mask_lag(nkv, 1);
-    mask_lag[3] = 0;
-    mask_lag[4] = 0;
+    std::vector<uint8_t> mask_all = vis_strong;
+    std::vector<uint8_t> mask_lag = vis_lag1;
     CHECK(ggml_cpu_rerot::DdvrQsideGqa(raw_q.data(), raw_k.data(), raw_v.data(), nkv, dv, hq, hkv,
                                        q_virtual, cpu_spans.data(), cpu_spans.size(), cpu_rope, 0.0f,
                                        nullptr, 0, ggml_cpu_rerot::FrontierMode::Strong, mask_all.data(),
@@ -1116,14 +1122,71 @@ static void test_ragged_multi_reader_grouped_attention() {
     }
 }
 
-static void test_vulkan_parallel_delta_gdn(int N, bool correlated) {
-    std::puts("--- Vulkan RERoT Parallel Delta GDN ---");
+static void test_full_size_multi_reader_attention() {
+    constexpr int d = 256, dv = 256, hq = 16, hkv = 2, nq = 8, ng = 32, nkv = 385;
+    const float scale = 1.0f / std::sqrt(float(d));
+    std::vector<float> q(size_t(d) * ng * hq), k(size_t(d) * nkv * hkv), v(size_t(dv) * nkv * hkv);
+    for (size_t i = 0; i < q.size(); ++i) q[i] = std::sin(float(i % 997) * 0.173f);
+    for (size_t i = 0; i < k.size(); ++i) k[i] = std::cos(float(i % 991) * 0.137f);
+    for (size_t i = 0; i < v.size(); ++i) v[i] = std::sin(float(i % 983) * 0.193f);
+    std::vector<int32_t> entries, offsets{0};
+    for (int row = 0; row < nq; ++row) {
+        for (int j = 0; j < nkv - 13 * row; ++j) {
+            const int key = (37 * j + 11 * row) % nkv;
+            entries.push_back(key);
+            entries.push_back(3 * row + key % 3);
+        }
+        offsets.push_back(int(entries.size() / 2));
+    }
+    // Independent double-precision global softmax, not another backend call.
+    std::vector<float> expected(size_t(dv) * hq * nq);
+    for (int row = 0; row < nq; ++row) {
+        for (int h = 0; h < hq; ++h) {
+            const int kh = h / (hq / hkv);
+            std::vector<double> scores;
+            double maximum = -INFINITY;
+            for (int e = offsets[row]; e < offsets[row + 1]; ++e) {
+                const int key = entries[2 * e], group = entries[2 * e + 1];
+                double score = 0.0;
+                for (int c = 0; c < d; ++c) score += double(q[(size_t(h) * ng + group) * d + c]) * k[(size_t(kh) * nkv + key) * d + c];
+                scores.push_back(score * scale);
+                maximum = std::max(maximum, scores.back());
+            }
+            double denominator = 0.0;
+            for (double & score : scores) { score = std::exp(score - maximum); denominator += score; }
+            for (int c = 0; c < dv; ++c) {
+                double out = 0.0;
+                for (int e = offsets[row]; e < offsets[row + 1]; ++e) out += scores[size_t(e - offsets[row])] * v[(size_t(kh) * nkv + entries[2 * e]) * dv + c];
+                expected[(size_t(row) * hq + h) * dv + c] = float(out / denominator);
+            }
+        }
+    }
+    const auto cpu = run_indexed_op(d, dv, ng, nkv, hq, hkv, nq, q, k, v, entries, offsets, scale);
+    CHECK(max_abs_diff(cpu, expected) < 2e-5f);
+    ggml_backend_load_all();
+    const auto device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!device) { std::puts("SKIP full-size attention GPU: no GPU"); return; }
+    ggml_backend_t gpu = ggml_backend_dev_init(device, nullptr);
+    CHECK(gpu != nullptr);
+    if (!gpu) return;
+    const auto actual = run_indexed_op(d, dv, ng, nkv, hq, hkv, nq, q, k, v, entries, offsets, scale, gpu);
+    const auto qcpu = run_indexed_op(d, dv, ng, nkv, hq, hkv, nq, q, k, v, entries, offsets, scale, nullptr, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0);
+    const auto qgpu = run_indexed_op(d, dv, ng, nkv, hq, hkv, nq, q, k, v, entries, offsets, scale, gpu, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0);
+    const float ferror = max_abs_diff(actual, expected), qerror = max_abs_diff(qcpu, qgpu);
+    CHECK(ferror < 2e-4f);
+    CHECK(qerror < 1e-3f);
+    std::printf("full-size 8-reader/16-head/385-key attention: f32=%g turbo4/turbo2=%g\n", ferror, qerror);
+    ggml_backend_free(gpu);
+}
+
+static void test_parallel_delta_gdn(int N, bool correlated, int gate_case, bool on_cpu, bool density_norm = false) {
+    std::puts(on_cpu ? "--- CPU RERoT Parallel Delta GDN ---" : "--- Vulkan RERoT Parallel Delta GDN ---");
 
     ggml_backend_load_all();
     ggml_backend_dev_t device =
-        ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        ggml_backend_dev_by_type(on_cpu ? GGML_BACKEND_DEVICE_TYPE_CPU : GGML_BACKEND_DEVICE_TYPE_GPU);
     if (!device) {
-        std::puts("SKIP: no GPU backend for Parallel Delta GDN");
+        std::puts("SKIP: requested backend unavailable for Parallel Delta GDN");
         return;
     }
     ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
@@ -1171,10 +1234,68 @@ static void test_vulkan_parallel_delta_gdn(int N, bool correlated) {
         }
     }
 
+    // A closed write gate must stay closed, including in the singleton
+    // native path. Large but finite values make a hidden beta floor visible.
+    if (gate_case == 1 || gate_case == 2) {
+        const int writer = N == 1 ? 0 : 1;
+        beta[writer] = gate_case == 2 ? 1.0e-8f : 0.0f;
+        for (int col = 0; col < D; ++col) {
+            v[(size_t) writer * D + col] = 1024.0f;
+        }
+    }
+    if (gate_case == 3) {
+        // Repeated evidence is not one native write: it increases effective
+        // delta gain even though mean log-decay stays fixed. This is a
+        // mathematical behavior check, not a claim of serial equivalence.
+        std::fill(q.begin(), q.end(), 0.0f);
+        std::fill(k.begin(), k.end(), 0.0f);
+        for (int seq = 0; seq < N; ++seq) {
+            q[size_t(seq) * D] = k[size_t(seq) * D] = 1.0f;
+            g[seq] = -0.1f;
+            beta[seq] = 0.3f;
+            for (int col = 0; col < D; ++col) v[size_t(seq) * D + col] = 0.01f * float(col + 1);
+        }
+    }
+    if (gate_case == 4) {
+        // Ill-conditioned, correlated rows with saturated but valid gates.
+        // Runs without external model/snapshot fixtures in normal CTest.
+        for (int seq = 0; seq < N; ++seq) {
+            beta[seq] = 0.99f + 0.001f * float(seq % 9);
+            double norm = 0.0;
+            for (int row = 0; row < D; ++row) {
+                const float value = 1.0f + 0.03f * std::sin(float((seq + 1) * (row + 3)) * 0.17f);
+                k[size_t(seq) * D + row] = value;
+                norm += double(value) * value;
+            }
+            for (int row = 0; row < D; ++row) k[size_t(seq) * D + row] /= std::sqrt(norm);
+        }
+    }
+
     // Exact regularized Parallel DeltaNet block update. The GPU solves the
     // same state-column system with matrix-free preconditioned CG; pivoted
     // elimination supplies an independent numerical reference.
+    std::vector<float> native_state((size_t) N * state.size());
+    for (int seq = 0; seq < N; ++seq) {
+        for (size_t i = 0; i < state.size(); ++i) {
+            const float overlay = N == 1 || seq % 2 != 0
+                ? 0.015625f * float(int((i + seq) % 7) - 3)
+                : 0.0f;
+            native_state[(size_t) seq * state.size() + i] = state[i] + overlay;
+        }
+    }
     std::vector<float> expected_state((size_t) D * D, 0.0f);
+    std::vector<double> density(N, 1.0);
+    if (density_norm) {
+        for (int i = 0; i < N; ++i) for (int j = 0; j < N; ++j) {
+            if (i == j || beta[j] == 0.0f) continue;
+            double dot = 0.0, ni = 0.0, nj = 0.0;
+            for (int row = 0; row < D; ++row) {
+                const double ki = k[size_t(i) * D + row], kj = k[size_t(j) * D + row];
+                dot += ki * kj; ni += ki * ki; nj += kj * kj;
+            }
+            if (ni * nj > 1e-20) density[i] += dot * dot / (ni * nj);
+        }
+    }
     std::vector<double> expected_output((size_t) D * N, 0.0);
     std::vector<float> expected_hand((size_t) D * D * N, 0.0f);
     double mean_log_decay = 0.0;
@@ -1203,7 +1324,15 @@ static void test_vulkan_parallel_delta_gdn(int N, bool correlated) {
         } else {
             std::vector<double> matrix((size_t) N * N, 0.0);
             for (int i = 0; i < N; ++i) {
+                if (beta[i] == 0.0f) {
+                    matrix[(size_t) i * N + i] = 1.0;
+                    rhs[(size_t) i] = 0.0;
+                    continue;
+                }
                 for (int j = i; j < N; ++j) {
+                    if (beta[j] == 0.0f) {
+                        continue;
+                    }
                     double dot = 0.0;
                     for (int row = 0; row < D; ++row) {
                         dot += k[(size_t) i * D + row] *
@@ -1213,7 +1342,7 @@ static void test_vulkan_parallel_delta_gdn(int N, bool correlated) {
                     matrix[(size_t) j * N + i] = dot;
                 }
                 matrix[(size_t) i * N + i] +=
-                    (1.0 - beta[i]) / beta[i] + 1.0e-4;
+                    density[i] * ((1.0 - beta[i]) / beta[i] + 1.0e-4);
             }
 
             std::vector<double> solve_rhs = rhs;
@@ -1269,19 +1398,19 @@ static void test_vulkan_parallel_delta_gdn(int N, bool correlated) {
             }
         }
 
-        std::vector<double> native_delta((size_t) N, 0.0);
+        std::vector<double> overlay_projection((size_t) N, 0.0);
+        std::vector<double> native_projection((size_t) N, 0.0);
         for (int seq = 0; seq < N; ++seq) {
-            const double alpha = std::exp(double(g[seq]));
-            double projected = 0.0;
             for (int row = 0; row < D; ++row) {
-                projected += alpha *
-                    state[(size_t) col * D + row] *
+                const size_t index = (size_t) col * D + row;
+                overlay_projection[seq] += std::exp(double(g[seq])) *
+                    (double(native_state[(size_t) seq * state.size() + index]) - state[index]) *
+                    k[(size_t) seq * D + row];
+                native_projection[seq] += std::exp(double(g[seq])) *
+                    double(native_state[(size_t) seq * state.size() + index]) *
                     k[(size_t) seq * D + row];
             }
-            native_delta[(size_t) seq] = beta[seq] *
-                (v[(size_t) seq * D + col] - projected);
         }
-
         for (int row = 0; row < D; ++row) {
             double merged =
                 base_alpha * state[(size_t) col * D + row];
@@ -1291,17 +1420,27 @@ static void test_vulkan_parallel_delta_gdn(int N, bool correlated) {
             }
             expected_state[(size_t) col * D + row] = float(merged);
             for (int seq = 0; seq < N; ++seq) {
-                const double candidate =
-                    std::exp(double(g[seq])) *
-                    state[(size_t) col * D + row] +
-                    k[(size_t) seq * D + row] *
-                    native_delta[(size_t) seq];
+                const size_t index = (size_t) col * D + row;
+                const double local_hand = std::exp(double(g[seq])) *
+                    (double(native_state[(size_t) seq * state.size() + index]) - state[index]) -
+                    beta[seq] * k[(size_t) seq * D + row] * overlay_projection[seq];
+                const double shared_write = merged - base_alpha * state[index];
+                const double self_echo = N == 1 ? 0.0 :
+                    k[(size_t) seq * D + row] * weights[(size_t) seq] - shared_write / double(N);
+                const double hand = local_hand + self_echo;
+                // Commit and current-token read are separate: persist the
+                // shared block + centered echo, but emit this Lane's exact
+                // native GDN transition for the current token.
+                const double native_delta = beta[seq] *
+                    (v[(size_t) seq * D + col] - native_projection[seq]);
+                const double native_candidate = std::exp(double(g[seq])) *
+                    double(native_state[(size_t) seq * state.size() + index]) +
+                    k[(size_t) seq * D + row] * native_delta;
                 expected_output[(size_t) seq * D + col] +=
-                    candidate * q[(size_t) seq * D + row] /
-                    std::sqrt(double(D));
+                    native_candidate * q[(size_t) seq * D + row] / std::sqrt(double(D));
                 expected_hand[
                     ((size_t) seq * D + col) * D + row] =
-                    float(candidate - merged);
+                    float(hand);
             }
         }
     }
@@ -1322,6 +1461,8 @@ static void test_vulkan_parallel_delta_gdn(int N, bool correlated) {
     ggml_tensor * tn = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, D, H, N);
     ggml_tensor * out =
         ggml_gated_delta_net_rbb(ctx, tq, tk, tv, tg, tb, ts, tn);
+    CHECK(ggml_get_op_params_i32(out, 2) == 1);
+    ggml_set_op_params_i32(out, 2, density_norm ? 1 : 0);
 
     CHECK(ggml_backend_supports_op(backend, out));
     ggml_backend_buffer_ptr buffer(
@@ -1338,13 +1479,7 @@ static void test_vulkan_parallel_delta_gdn(int N, bool correlated) {
     ggml_backend_tensor_set(tg, g.data(), 0, g.size() * sizeof(float));
     ggml_backend_tensor_set(tb, beta.data(), 0, beta.size() * sizeof(float));
     ggml_backend_tensor_set(ts, state.data(), 0, state.size() * sizeof(float));
-    for (int seq = 0; seq < N; ++seq) {
-        ggml_backend_tensor_set(
-            tn,
-            state.data(),
-            (size_t) seq * state.size() * sizeof(float),
-            state.size() * sizeof(float));
-    }
+    ggml_backend_tensor_set(tn, native_state.data(), 0, native_state.size() * sizeof(float));
 
     ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32, false);
     ggml_build_forward_expand(graph, out);
@@ -1362,18 +1497,21 @@ static void test_vulkan_parallel_delta_gdn(int N, bool correlated) {
     float output_error = 0.0f;
     float hand_error = 0.0f;
     for (size_t i = 0; i < expected_state.size(); ++i) {
+        CHECK(std::isfinite(actual[state_offset + i]));
         state_error = std::max(
             state_error, std::abs(actual[state_offset + i] - expected_state[i]));
     }
     for (int seq = 0; seq < N; ++seq) {
         for (int col = 0; col < D; ++col) {
             const size_t index = (size_t) seq * D + col;
+            CHECK(std::isfinite(actual[index]));
             output_error = std::max(
                 output_error,
                 float(std::abs(actual[index] - expected_output[index])));
         }
     }
     for (size_t i = 0; i < expected_hand.size(); ++i) {
+        CHECK(std::isfinite(actual[hand_offset + i]));
         hand_error = std::max(
             hand_error,
             std::abs(actual[hand_offset + i] - expected_hand[i]));
@@ -1381,15 +1519,100 @@ static void test_vulkan_parallel_delta_gdn(int N, bool correlated) {
     CHECK(state_error < 2e-4f);
     CHECK(output_error < 2e-5f);
     CHECK(hand_error < 2e-4f);
+    if (gate_case == 3) {
+        const double beta_eff = N == 1 ? double(beta[0]) :
+            N * double(beta[0]) / (N * double(beta[0]) + density[0] * (1.0 - beta[0] + 1e-4 * double(beta[0])));
+        const double old = std::exp(double(g[0])) * state[0];
+        CHECK(std::abs(actual[state_offset] - (old + beta_eff * (v[0] - old))) < 2e-6);
+        std::printf("duplicate writers N=%d density_mode=%d: beta=%g effective_beta=%.9g\n", N, density_norm, beta[0], beta_eff);
+    }
     std::printf(
-        "Parallel Delta GDN N=%d correlated=%d state error = %.9g, output error = %.9g, hand error = %.9g\n",
-        N, correlated, state_error, output_error, hand_error);
+        "Parallel Delta GDN N=%d correlated=%d gate_case=%d state error = %.9g, output error = %.9g, hand error = %.9g\n",
+        N, correlated, gate_case, state_error, output_error, hand_error);
 
     buffer.reset();
     ggml_backend_free(backend);
 }
 
-int main() {
+// Replay real, strided input tensors captured immediately after the RBB op,
+// before any persistent-state copy. CPU double Cholesky and Vulkan CG see
+// identical values; this avoids confounding two autoregressive trajectories.
+static int replay_rbb_snapshot(const std::string & directory) {
+    struct input_data { int64_t ne[4]; std::vector<float> values; };
+    std::array<input_data, 7> inputs;
+    int32_t density_mode = 0;
+    std::ifstream mode_file(directory + "/density-mode.txt");
+    if (mode_file && (!(mode_file >> density_mode) || (density_mode != 0 && density_mode != 1))) return 2;
+    std::ifstream meta(directory + "/tensors.tsv");
+    if (!meta) return 2;
+    for (int i = 0; i < 7; ++i) {
+        std::string line, name, type;
+        if (!std::getline(meta, line)) return 2;
+        std::istringstream fields(line);
+        size_t nb[4], bytes = 0;
+        fields >> name >> type;
+        for (auto & d : inputs[i].ne) fields >> d;
+        for (auto & stride : nb) fields >> stride;
+        fields >> bytes;
+        if (!fields || name != "src" + std::to_string(i) || type != "f32" || bytes > 256 * 1024 * 1024) return 2;
+        std::vector<uint8_t> raw(bytes);
+        std::ifstream file(directory + "/" + name + ".bin", std::ios::binary);
+        if (!file.read(reinterpret_cast<char *>(raw.data()), std::streamsize(bytes))) return 2;
+        const auto * ne = inputs[i].ne;
+        for (int d = 0; d < 4; ++d) if (ne[d] <= 0 || ne[d] > 65536) return 2;
+        for (int64_t w = 0; w < ne[3]; ++w) for (int64_t z = 0; z < ne[2]; ++z)
+            for (int64_t y = 0; y < ne[1]; ++y) for (int64_t x = 0; x < ne[0]; ++x) {
+                const size_t off = size_t(w)*nb[3] + size_t(z)*nb[2] + size_t(y)*nb[1] + size_t(x)*nb[0];
+                if (off + sizeof(float) > bytes) return 2;
+                float value;
+                std::memcpy(&value, raw.data() + off, sizeof(value));
+                inputs[i].values.push_back(value);
+            }
+    }
+    ggml_backend_load_all();
+    auto run = [&](enum ggml_backend_dev_type type) {
+        std::vector<float> values;
+        const auto device = ggml_backend_dev_by_type(type);
+        if (!device) { ++failures; return values; }
+        ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
+        ggml_context_ptr ctx(ggml_init({16 * 1024 * 1024, nullptr, true}));
+        std::array<ggml_tensor *, 7> in;
+        for (size_t i = 0; i < in.size(); ++i) in[i] = ggml_new_tensor(ctx.get(), GGML_TYPE_F32, 4, inputs[i].ne);
+        ggml_tensor * result = ggml_gated_delta_net_rbb(ctx.get(), in[0], in[1], in[2], in[3], in[4], in[5], in[6]);
+        ggml_set_op_params_i32(result, 2, density_mode);
+        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+        for (size_t i = 0; i < in.size(); ++i) ggml_backend_tensor_set(in[i], inputs[i].values.data(), 0, inputs[i].values.size() * sizeof(float));
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 32, false);
+        ggml_build_forward_expand(graph, result);
+        CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+        const size_t dim = size_t(in[2]->ne[0]), heads = size_t(in[2]->ne[1]), n = size_t(in[2]->ne[3]);
+        values.resize(dim * heads * n + dim * dim * heads * (n + 1));
+        ggml_backend_tensor_get(result, values.data(), 0, values.size() * sizeof(float));
+        buffer.reset();
+        ggml_backend_free(backend);
+        return values;
+    };
+    const auto cpu = run(GGML_BACKEND_DEVICE_TYPE_CPU), gpu = run(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (cpu.empty() || gpu.size() != cpu.size()) return 2;
+    const size_t d = size_t(inputs[2].ne[0]), h = size_t(inputs[2].ne[1]), n = size_t(inputs[2].ne[3]);
+    const size_t bounds[] = {0, d*h*n, d*h*n + d*d*h, cpu.size()};
+    const char * names[] = {"output", "brain", "hand"};
+    for (size_t part = 0; part < 3; ++part) {
+        double err = 0.0, ref = 0.0, err2 = 0.0, ref2 = 0.0;
+        for (size_t i = bounds[part]; i < bounds[part + 1]; ++i) {
+            CHECK(std::isfinite(gpu[i]));
+            const double delta = double(gpu[i]) - cpu[i];
+            err = std::max(err, std::abs(delta)); ref = std::max(ref, std::abs(double(cpu[i])));
+            err2 += delta * delta; ref2 += double(cpu[i]) * cpu[i];
+        }
+        CHECK(err <= 2e-4 * std::max(1.0, ref));
+        std::printf("RBB replay %s: max_error=%g reference_max=%g relative_l2=%g\n", names[part], err, ref, std::sqrt(err2 / std::max(1e-30, ref2)));
+    }
+    return failures ? 1 : 0;
+}
+
+int main(int argc, char ** argv) {
+    if (argc == 3 && std::strcmp(argv[1], "--rbb-replay") == 0) return replay_rbb_snapshot(argv[2]);
     std::puts("=== RERoT indexed attention test ===");
     test_indexed_basic();
     test_ddvr_imrope_via_indexed_op();
@@ -1397,11 +1620,29 @@ int main() {
     test_vulkan_indexed_parity();
     test_cpu_helper_matches_op();
     test_ragged_multi_reader_grouped_attention();
-    test_vulkan_parallel_delta_gdn(1, false);
-    test_vulkan_parallel_delta_gdn(3, false);
-    test_vulkan_parallel_delta_gdn(12, true);
-    test_vulkan_parallel_delta_gdn(32, true);
-    test_vulkan_parallel_delta_gdn(64, true);
+    test_full_size_multi_reader_attention();
+    for (const bool on_cpu : {true, false}) {
+        test_parallel_delta_gdn(1, false, 3, on_cpu);
+        test_parallel_delta_gdn(8, false, 3, on_cpu);
+        test_parallel_delta_gdn(4, true, 4, on_cpu);
+        test_parallel_delta_gdn(7, true, 4, on_cpu);
+        test_parallel_delta_gdn(1, false, 3, on_cpu, true);
+        test_parallel_delta_gdn(8, false, 3, on_cpu, true);
+        test_parallel_delta_gdn(3, false, 0, on_cpu, true);
+        test_parallel_delta_gdn(7, true, 4, on_cpu, true);
+        test_parallel_delta_gdn(3, true, 1, on_cpu, true);
+    }
+    for (bool on_cpu : {true, false}) {
+        test_parallel_delta_gdn(1, false, 0, on_cpu);
+        test_parallel_delta_gdn(3, false, 0, on_cpu);
+        test_parallel_delta_gdn(12, true, 0, on_cpu);
+        test_parallel_delta_gdn(32, true, 0, on_cpu);
+        test_parallel_delta_gdn(64, true, 0, on_cpu);
+        test_parallel_delta_gdn(1, false, 1, on_cpu);
+        test_parallel_delta_gdn(1, false, 2, on_cpu);
+        test_parallel_delta_gdn(3, false, 1, on_cpu);
+        test_parallel_delta_gdn(3, true, 2, on_cpu);
+    }
     std::printf("=== Results: %d failure(s) ===\n", failures);
     return failures == 0 ? 0 : 1;
 }

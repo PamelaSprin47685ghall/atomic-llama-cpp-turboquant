@@ -494,8 +494,10 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
         }
         ggml_tensor * hand_echo =
             build_rs(inp, hand_echo_all, hparams.n_embd_s(), n_seqs);
-        state = ggml_add(
-            ctx0, state_base_rows, ggml_cast(ctx0, hand_echo, GGML_TYPE_F32));
+        // Group count/brain row cannot identify an ordinary root: two real
+        // episodes may have exactly that shape. Ordinary hands are zero;
+        // every row obeys the same effective-state contract B + H.
+        state = ggml_add(ctx0, state_base_rows, ggml_cast(ctx0, hand_echo, GGML_TYPE_F32));
     } else {
         state = build_rs(
             inp, ssm_states_all, hparams.n_embd_s(), n_seqs);

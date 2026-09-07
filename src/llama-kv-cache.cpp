@@ -1177,6 +1177,7 @@ void llama_kv_cache::compact() {
         const auto plan = cells.make_pack_plan();
 
         if (plan.moves.empty()) {
+            head = 0;
             continue;
         }
 
@@ -1189,6 +1190,7 @@ void llama_kv_cache::compact() {
             }
         }
         if (!needs_compaction) {
+            head = plan.retained_count;
             continue;
         }
 
@@ -1485,9 +1487,8 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
         const uint32_t tail_guard = hint.tail_guard > 0 ? hint.tail_guard : tri_recent_window;
         const uint32_t logical_tokens = hint.logical_tokens > 0 ? hint.logical_tokens : (uint32_t) (max_pos + 1);
 
-        // Target retention based on the configured ratio.
-        uint32_t target_retention = (uint32_t) std::ceil((double) logical_tokens * tri_ratio);
-        target_retention = std::max(target_retention, tail_guard);
+        // Target retention based on the configured ratio (§B.9, §B.11).
+        uint32_t target_retention = tri_rerot_target_retention(logical_tokens, tri_ratio, tail_guard);
 
         result.target_references += target_retention;
 
@@ -1513,9 +1514,9 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
                 rerot_meta.active() &&
                 rerot_meta.visibility == llama_rerot_visibility::pending_record;
             const bool semantic_foreign_tag =
-                hint.semantic_episode_id != 0 &&
                 rerot_meta.active() &&
-                (rerot_meta.episode_id != hint.semantic_episode_id ||
+                (hint.semantic_episode_id == 0 ||
+                 rerot_meta.episode_id != hint.semantic_episode_id ||
                  rerot_meta.visibility != llama_rerot_visibility::public_live);
             bool semantic_reader_tail = false;
             if (hint.semantic_episode_id != 0) {
@@ -1593,6 +1594,10 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
                 const uint32_t cand_idx = order[k];
                 const uint32_t cell_i   = cand_indices[cand_idx];
 
+                if (cells.is_empty(cell_i)) {
+                    continue;
+                }
+
                 const auto rerot_meta = cells.rerot_get(cell_i);
                 const bool semantic_cell =
                     hint.semantic_episode_id != 0 &&
@@ -1604,15 +1609,23 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
                     // cell regardless of archive/exec bookkeeping refs. Remove
                     // only this episode's refs; another outer completion may
                     // legally retain the same physical base-prefix cell.
+                    bool removed_any = false;
                     for (const llama_seq_id ref : hint.semantic_seq_ids) {
                         if (!cells.is_empty(cell_i) && cells.seq_has(cell_i, ref)) {
                             cells.seq_rm(cell_i, ref);
                             result.references_removed++;
+                            removed_any = true;
                         }
                     }
+                    if (!removed_any && !cells.is_empty(cell_i) && cells.seq_has(cell_i, seq_id)) {
+                        cells.seq_rm(cell_i, seq_id);
+                        result.references_removed++;
+                    }
                 } else {
-                    cells.seq_rm(cell_i, seq_id);
-                    result.references_removed++;
+                    if (!cells.is_empty(cell_i) && cells.seq_has(cell_i, seq_id)) {
+                        cells.seq_rm(cell_i, seq_id);
+                        result.references_removed++;
+                    }
                 }
             }
         }

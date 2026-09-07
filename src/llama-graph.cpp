@@ -4237,8 +4237,10 @@ ggml_tensor * llm_graph_context::build_rs(
 
     // Clear a single state which will then be copied to the other cleared states.
     // Note that this is a no-op when the view is zero-sized.
-    ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
-    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    if (s->type == GGML_TYPE_F32) {
+        ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
+        ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    }
 
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
@@ -4323,6 +4325,7 @@ ggml_tensor * llm_graph_context::build_rs_shared(
     GGML_ASSERT((int64_t) n_seqs == inp->brain_copy->ne[0]);
 
     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+
     ggml_tensor * output_states = ggml_get_rows(ctx0, states, inp->brain_copy);
     ggml_build_forward_expand(gf, output_states);
     return output_states;

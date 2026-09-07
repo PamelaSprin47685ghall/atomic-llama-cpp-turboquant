@@ -229,12 +229,12 @@ extern "C" {
     };
 
     enum llama_rerot_frontier_mode {
-        // Tokens selected from the previous frontier can attend peer tokens of
-        // the current frontier at each transformer layer.
+        // Synchronous staged visibility: a token may read its own current K/V,
+        // while peer PUBLIC writes become visible immediately after the current
+        // frontier barrier (therefore on the next frontier).
         LLAMA_REROT_FRONTIER_STRONG = 0,
 
-        // Current-frontier peer tokens become visible on the next frontier.
-        // This is the conservative ablation and debugging mode.
+        // Adds one extra committed-frontier delay beyond STRONG.
         LLAMA_REROT_FRONTIER_LAG1 = 1,
     };
 
@@ -955,7 +955,7 @@ extern "C" {
     //
 
     #define LLAMA_REROT_STATE_MAGIC   0x52524f54u // 'RROT'
-    #define LLAMA_REROT_STATE_VERSION 2u
+    #define LLAMA_REROT_STATE_VERSION 3u
 
     enum llama_rerot_state_cap {
         LLAMA_REROT_STATE_CAP_NONE          = 0,

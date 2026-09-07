@@ -78,6 +78,8 @@ json task_params::to_json(bool only_metrics) const {
             {"min_keep",                  sampling.min_keep},
             {"chat_format",               common_chat_format_name(chat_parser_params.format)},
             {"reasoning_format",          common_reasoning_format_name(chat_parser_params.reasoning_format)},
+            {"reasoning_effort",          reasoning_effort},
+            {"reasoning_budget_tokens",   sampling.reasoning_budget_tokens},
             {"reasoning_in_content",      chat_parser_params.reasoning_in_content},
             {"generation_prompt",         chat_parser_params.generation_prompt},
             {"samplers",                  samplers},
@@ -140,6 +142,8 @@ json task_params::to_json(bool only_metrics) const {
         {"preserved_tokens",          sampling.preserved_tokens},
         {"chat_format",               common_chat_format_name(chat_parser_params.format)},
         {"reasoning_format",          common_reasoning_format_name(chat_parser_params.reasoning_format)},
+        {"reasoning_effort",          reasoning_effort},
+        {"reasoning_budget_tokens",   sampling.reasoning_budget_tokens},
         {"reasoning_in_content",      chat_parser_params.reasoning_in_content},
         {"generation_prompt",         chat_parser_params.generation_prompt},
         {"samplers",                  samplers},
@@ -842,7 +846,11 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
 json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     std::string finish_reason = "length";
     common_chat_msg msg;
-    if (!oaicompat_msg.empty()) {
+    if (rerot_explicit_channels) {
+        msg.role = "assistant";
+        msg.content = content;
+        msg.reasoning_content = rerot_reasoning;
+    } else if (!oaicompat_msg.empty()) {
         msg = oaicompat_msg;
     } else {
         msg.role = "assistant";
@@ -955,7 +963,11 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
 
 json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     common_chat_msg msg;
-    if (!oaicompat_msg.empty()) {
+    if (rerot_explicit_channels) {
+        msg.role = "assistant";
+        msg.content = content;
+        msg.reasoning_content = rerot_reasoning;
+    } else if (!oaicompat_msg.empty()) {
         msg = oaicompat_msg;
     } else {
         msg.role = "assistant";
@@ -1165,7 +1177,11 @@ json server_task_result_cmpl_final::to_json_anthropic() {
     json content_blocks = json::array();
 
     common_chat_msg msg;
-    if (!oaicompat_msg.empty()) {
+    if (rerot_explicit_channels) {
+        msg.role = "assistant";
+        msg.content = content;
+        msg.reasoning_content = rerot_reasoning;
+    } else if (!oaicompat_msg.empty()) {
         msg = oaicompat_msg;
     } else {
         msg.role = "assistant";

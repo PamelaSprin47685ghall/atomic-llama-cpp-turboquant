@@ -8,6 +8,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <unordered_set>
 #include <utility>
 
 namespace {
@@ -579,21 +580,55 @@ std::string_view server_rerot_planner_prompt() {
     return prompt;
 }
 
+std::string server_rerot_child_contract(
+        std::string_view title,
+        std::string_view close_marker) {
+    if (!valid_child_close_marker(close_marker)) return {};
+    const std::string clean_title = normalize_lane_title(title);
+    if (clean_title.empty()) return {};
+    return "\n当前 Lane 的唯一任务是：『" + clean_title + "』。"
+        "其他公开章节只能作为参考，不能把它们接管成自己的任务。"
+        "如果稍后进入单独的 PRIVATE planner 阶段，只在那个阶段做递归拆分；"
+        "进入正文阶段后，普通 <ol>/<li> 只是内容格式，不再具有调度含义。"
+        "正文可以多行、多段。完成这个唯一任务后输出 " + std::string(close_marker) +
+        " 结束当前工作块，不继续其他章节。\n";
+}
+
+std::string server_rerot_child_planner_prompt(std::string_view title) {
+    const std::string clean_title = normalize_lane_title(title);
+    if (clean_title.empty()) return {};
+    return "只针对当前唯一任务『" + clean_title + "』判断是否还存在两个或更多可以并行、"
+        "彼此独立展开的子任务。输出一个平面的 HTML 有序列表：以 <ol> 开头，"
+        "每项只写一个简短 <li> 标题，不展开内容，以 </ol> 结尾。"
+        "如果不需要继续拆分，也必须只输出一个 <li>，其标题概括当前任务。"
+        "不要列出兄弟章节，不要重述整个用户问题。";
+}
+
+std::string server_rerot_child_worker_prompt(
+        std::string_view title,
+        std::string_view close_marker) {
+    if (!valid_child_close_marker(close_marker)) return {};
+    const std::string clean_title = normalize_lane_title(title);
+    if (clean_title.empty()) return {};
+    return "\n规划阶段已经结束。现在进入正文阶段。当前唯一任务仍然是：『" + clean_title + "』。"
+        "只完成这一项；其他公开章节只可引用为背景，不得接管，不得重新回答整个用户问题。"
+        "普通列表、标题和代码块现在都只是正文内容，不具有调度含义。"
+        "完成这一项后输出 " + std::string(close_marker) +
+        " 结束当前工作块，不要继续其他章节、总题总结或下一个标题。\n";
+}
+
 std::string server_rerot_child_grammar(std::string_view close_marker) {
     if (!valid_child_close_marker(close_marker)) {
         return {};
     }
     const std::string close(close_marker);
     auto arena = build_peg_parser([&](common_peg_parser_builder & builder) {
-        auto terminator = builder.choice({
-            builder.literal("\n"),
-            builder.literal("。"),
-            builder.literal("."),
-        });
+        // Newlines are ordinary content, not a scheduler boundary. Only this
+        // child's exact closing marker ends the thread; no line/token budget
+        // can stand in for completing its assigned work.
         return builder.sequence({
-            builder.chars("[^ \\t\\r\\n<]", 1, 1),
-            builder.until_one_of({"\n", "。", "."}),
-            terminator,
+            builder.chars("[^ \\t\\r\\n]", 1, 1),
+            builder.until_one_of({close}),
             builder.literal(close),
             builder.end(),
         });
@@ -1062,7 +1097,7 @@ bool server_rerot_runtime::resolve_pending_record_runs(
         uint64_t & resolved_tokens) {
     resolved_tokens = 0;
     if (!node.pending_record.has_value() ||
-        *node.pending_record != current_run_id ||
+        (current_run_id != LLAMA_REROT_RUN_INVALID && *node.pending_record != current_run_id) ||
         (replacement != llama_rerot_visibility::public_live &&
          replacement != llama_rerot_visibility::private_control) ||
         (replacement == llama_rerot_visibility::public_live) != (publish_epoch != 0)) {
@@ -1232,10 +1267,8 @@ std::optional<server_rerot_token_plan> server_rerot_runtime::plan_generated_toke
 
     server_rerot_parser_step parser_step;
     server_rerot_marker_step marker_step;
-    const auto marker_state_before =
-        current_node->exit_parser.state();
     if (current_node->planner_armed) {
-        // A child may recursively fork or close its own random delimiter.
+        // A child or root may recursively fork or close its own random delimiter.
         // Both detectors track the token stream in parallel.
         marker_step = current_node->exit_parser.consume(token_bytes);
         if (marker_step.malformed) {
@@ -1275,29 +1308,26 @@ std::optional<server_rerot_token_plan> server_rerot_runtime::plan_generated_toke
             current_node->parser.state() == server_rerot_parser_state::list_pending;
 
         const bool release_pending =
-            current_node->control_id().empty() &&
             (marker_step.release_previous_pending || parser_step.release_previous_pending) &&
             !candidate_alive;
 
         if (release_pending) {
             parser_step.release_previous_pending = true;
-            if (!release_false_pending(*current, *current_node)) {
+            if (current_node->pending_record.has_value() &&
+                !release_false_pending(*current, *current_node)) {
                 return std::nullopt;
             }
         }
 
         if (marker_step.marker_closed) {
             current_node->planner_armed = false;
-            parser_step.write_visibility = marker_step.write_visibility;
+            parser_step.write_visibility = llama_rerot_visibility::private_control;
         } else if (parser_step.record_closed) {
-            // Completed <ol> record; visibility handled by parser_step
+            // Completed <ol> record; visibility handled by parser_step (pending_record, will be published in commit_token)
         } else if (candidate_alive) {
             parser_step.write_visibility = llama_rerot_visibility::pending_record;
         } else {
-            parser_step.write_visibility =
-                current_node->control_id().empty()
-                    ? llama_rerot_visibility::public_live
-                    : llama_rerot_visibility::pending_record;
+            parser_step.write_visibility = llama_rerot_visibility::public_live;
         }
     } else {
         marker_step = current_node->exit_parser.consume(token_bytes);
@@ -1308,32 +1338,23 @@ std::optional<server_rerot_token_plan> server_rerot_runtime::plan_generated_toke
             return std::nullopt;
         }
 
-        if (!current_node->control_id().empty()) {
-            // A child work block is atomic: its body stays PENDING and is
-            // visible only to its owning query run. Once the exact close
-            // marker begins, the completed body is published in one step;
-            // marker tokens remain PENDING until finalized PRIVATE.
-            parser_step.write_visibility =
-                llama_rerot_visibility::pending_record;
-        } else {
-            if (marker_step.release_previous_pending &&
+        const bool candidate_alive =
+            current_node->exit_parser.state() == server_rerot_marker_state::marker_candidate;
+
+        if (marker_step.release_previous_pending && !candidate_alive) {
+            if (current_node->pending_record.has_value() &&
                 !release_false_pending(*current, *current_node)) {
                 return std::nullopt;
             }
-            parser_step.write_visibility = marker_step.write_visibility;
         }
-    }
 
-    const bool child_marker_started =
-        !current_node->control_id().empty() &&
-        marker_state_before == server_rerot_marker_state::public_text &&
-        (current_node->exit_parser.state() ==
-             server_rerot_marker_state::marker_candidate ||
-         marker_step.marker_closed);
-    if (child_marker_started &&
-        current_node->pending_record.has_value() &&
-        !release_false_pending(*current, *current_node)) {
-        return std::nullopt;
+        if (marker_step.marker_closed) {
+            parser_step.write_visibility = llama_rerot_visibility::private_control;
+        } else if (candidate_alive) {
+            parser_step.write_visibility = llama_rerot_visibility::pending_record;
+        } else {
+            parser_step.write_visibility = llama_rerot_visibility::public_live;
+        }
     }
 
     server_rerot_token_plan plan;
@@ -1376,7 +1397,19 @@ bool server_rerot_runtime::build_reader_view_desc(
     const auto view = episode.document.build_view(node.id);
     ordered_runs.clear();
     ordered_runs.reserve(view.runs.size() + 1);
+    // Explicit research control, never selected as an automatic fallback.
+    // With local-state this separates lexical sharing from native branch
+    // continuation while leaving storage, DDVR and execution batching intact.
+    const bool ancestors_only = std::getenv("LLAMA_REROT_ANCESTORS_ONLY") != nullptr;
+    std::unordered_set<llama_rerot_node_id> ancestors;
+    if (ancestors_only) {
+        const auto * ancestor = episode.document.node(node.id);
+        while (ancestor && ancestors.insert(ancestor->id).second) {
+            ancestor = episode.document.node(ancestor->parent);
+        }
+    }
     for (const auto & current_run : view.runs) {
+        if (ancestors_only && ancestors.count(current_run.owner) == 0) continue;
         ordered_runs.push_back(current_run.run_id);
     }
     if (std::find(ordered_runs.begin(), ordered_runs.end(), query_run) == ordered_runs.end()) {
@@ -1533,6 +1566,9 @@ bool server_rerot_runtime::publish_pending_record(
         server_rerot_node_runtime child;
         child.id = child_id;
         child.exit_parser = server_rerot_marker_parser("</" + random_string(8) + ">");
+        // A child does not infer scheduler intent from ordinary HTML. Recursive
+        // planning is armed only by the explicit PRIVATE planner phase.
+        child.planner_armed = false;
         child.enqueue_frontier = episode.frontier;
         episode.nodes.push_back(std::move(child));
         episode.ready_queue.push_back(child_id);
@@ -1579,18 +1615,20 @@ bool server_rerot_runtime::finalize_exit_marker(
         server_rerot_episode & episode,
         server_rerot_node_runtime & node,
         llama_rerot_run_id run_id) {
-    uint64_t privatized_tokens = 0;
-    if (!resolve_pending_record_runs(
-            episode, node, run_id,
-            llama_rerot_visibility::private_control,
-            0,
-            privatized_tokens)) {
-        return false;
+    if (node.pending_record.has_value()) {
+        uint64_t privatized_tokens = 0;
+        if (!resolve_pending_record_runs(
+                episode, node, *node.pending_record,
+                llama_rerot_visibility::private_control,
+                0,
+                privatized_tokens)) {
+            return false;
+        }
+        episode.pending_tokens -= privatized_tokens;
+        episode.generated_private_tokens += privatized_tokens;
+        node.pending_record.reset();
     }
-    episode.pending_tokens -= privatized_tokens;
-    episode.generated_private_tokens += privatized_tokens;
 
-    node.pending_record.reset();
     node.private_run = run_id;
     node.exit_intent = true;
     ++episode.layout_epoch;
@@ -1808,6 +1846,7 @@ bool server_rerot_runtime::retire_node(
     episode.running.erase(node.id);
     episode.starting.erase(node.id);
     node.exit_intent = false;
+    node.fence = {};
     node.pen_id = -1;
     node.physical_slot = -1;
     node.exec_seq = -1;
@@ -2093,6 +2132,22 @@ bool server_rerot_runtime::complete_admission(
     return true;
 }
 
+bool server_rerot_runtime::arm_planner(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id) {
+    auto * current = episode(episode_id);
+    auto * lane = node(episode_id, node_id);
+    const auto * logical = current ? current->document.node(node_id) : nullptr;
+    if (!current || !lane || !logical || current->hard_aborted ||
+        logical->state != llama_rerot_node_state::planning ||
+        lane->planner_armed || lane->pending_record.has_value()) {
+        return false;
+    }
+    lane->parser.reset();
+    lane->planner_armed = true;
+    return true;
+}
+
 server_rerot_frontier_result server_rerot_runtime::finish_frontier(uint64_t episode_id) {
     server_rerot_frontier_result result;
     result.episode_id = episode_id;
@@ -2285,6 +2340,12 @@ bool server_rerot_runtime::erase_episode(uint64_t episode_id) {
     }
     for (auto & p : pens_) {
         if (p.episode_id == episode_id || p.person == episode_id) {
+            if (p.exec_seq >= 0) {
+                clear_sequence_control(p.exec_seq);
+                if (memory_) {
+                    llama_memory_seq_rm(memory_, p.exec_seq, -1, -1);
+                }
+            }
             p.state = server_pen_state::free;
             p.person = 0;
             p.episode_id = 0;
@@ -2323,6 +2384,7 @@ std::string server_rerot_runtime::heading_text(
     if (!current_node || node_id == current->document.root()) {
         return {};
     }
+    // Guide §4.3: root child (depth 1 in document tree) corresponds to <h1>, depth 2 to <h2>, etc.
     const uint32_t heading_level = std::min<uint32_t>(6, std::max<uint32_t>(1, current_node->depth));
     const std::string tag = "h" + std::to_string(heading_level);
     return "<" + tag + ">" + normalize_lane_title(current_node->title) + "</" + tag + ">\n";
@@ -2467,6 +2529,125 @@ void server_rerot_runtime::set_hard_limits(uint64_t episode_id, server_rerot_har
     check_hard_limits(*current);
 }
 
+bool server_rerot_runtime::track_fence_token(
+        uint64_t episode_id, llama_rerot_node_id node_id,
+        const server_rerot_token_plan & plan, llama_token token) {
+    auto * current = episode(episode_id);
+    auto * lane = node(episode_id, node_id);
+    if (!current || !lane || current->hard_aborted || !plan.valid()) {
+        return false;
+    }
+    if (lane->control_id().empty()) {
+        return true;
+    }
+    const bool candidate = lane->exit_parser.state() == server_rerot_marker_state::marker_candidate ||
+        plan.marker_step.marker_closed;
+    if (!candidate || plan.marker_step.release_previous_pending) {
+        lane->fence = {};
+    }
+    if (!candidate) {
+        return true;
+    }
+    auto & fence = lane->fence;
+    if (fence.prepared || (plan.visibility != llama_rerot_visibility::pending_record &&
+        plan.visibility != llama_rerot_visibility::private_control)) {
+        return fail_episode(*current, "invalid RERoT closing-marker checkpoint row");
+    }
+    if (fence.rows.empty() && memory_ && llama_memory_seq_get_recurrent_used(memory_, lane->exec_seq) > 0) {
+        const size_t size = llama_memory_rerot_capture_hand_seed(memory_, lane->exec_seq, nullptr, 0);
+        if (size == 0) {
+            return fail_episode(*current, "cannot capture RERoT pre-marker hand");
+        }
+        fence.hand.resize(size);
+        if (llama_memory_rerot_capture_hand_seed(memory_, lane->exec_seq,
+                fence.hand.data(), size) != size) {
+            return fail_episode(*current, "incomplete RERoT pre-marker hand");
+        }
+    }
+    if (!fence.rows.empty() && plan.storage_pos != fence.rows.back().pos + 1) {
+        return fail_episode(*current, "non-contiguous RERoT closing-marker checkpoint");
+    }
+    fence.rows.push_back({token, plan.storage_pos, plan.run_id});
+    return true;
+}
+
+bool server_rerot_runtime::prepare_final_fence(uint64_t episode_id, llama_rerot_node_id node_id) {
+    auto * current = episode(episode_id);
+    auto * lane = node(episode_id, node_id);
+    if (!current || !lane || current->hard_aborted || current->serial_tail ||
+        !current->finalizing || !current->fence_refreshed || lane->fence.prepared ||
+        !lane->exit_intent || lane->fence.rows.empty() ||
+        !current->ready_queue.empty() || !current->starting.empty() || !current->suspended.empty() ||
+        current->running.size() != 1 || current->running.count(node_id) != 1) {
+        return false;
+    }
+    auto & fence = lane->fence;
+    // Every original row must now be PRIVATE, including partial marker rows
+    // that were PENDING during sampling. No public write may be replayed.
+    for (size_t i = 0; i < fence.rows.size(); ++i) {
+        const auto & row = fence.rows[i];
+        const auto * run = current->document.run(row.run);
+        if (!run || run->owner != node_id || run->visibility != llama_rerot_visibility::private_control ||
+            row.pos < run->storage_pos0 || int64_t(row.pos) >= int64_t(run->storage_pos0) + run->token_count ||
+            (i && row.pos != fence.rows[i - 1].pos + 1)) {
+            return fail_episode(*current, "RERoT fence would replay a non-private or missing row");
+        }
+    }
+    if (fence.rows.back().pos + 1 != lane->storage_pos_next) {
+        return fail_episode(*current, "RERoT fence is not the survivor's exact suffix");
+    }
+    if (memory_) {
+        const bool recurrent = llama_memory_seq_get_recurrent_used(memory_, lane->exec_seq) > 0;
+        if (recurrent && (fence.hand.empty() || !llama_memory_rerot_apply_hand_seed(
+                memory_, lane->exec_seq, fence.hand.data(), fence.hand.size()))) {
+            return fail_episode(*current, "failed to restore RERoT pre-marker hand");
+        }
+        // Only this Lane's private suffix is removed. PUBLIC archive refs,
+        // other people and the current shared brain are not rolled back.
+        if (!llama_memory_seq_rm_attention(memory_, lane->exec_seq,
+                fence.rows.front().pos, lane->storage_pos_next)) {
+            return fail_episode(*current, "failed to replace RERoT fence KV suffix");
+        }
+    }
+    fence.cursor = 0;
+    fence.prepared = true;
+    return true;
+}
+
+std::optional<server_rerot_token_plan> server_rerot_runtime::plan_final_fence_token(
+        uint64_t episode_id, llama_rerot_node_id node_id) const {
+    const auto * current = episode(episode_id);
+    const auto * lane = node(episode_id, node_id);
+    if (!current || !lane || current->hard_aborted || current->serial_tail ||
+        !current->finalizing || !current->fence_refreshed || !lane->fence.prepared ||
+        lane->fence.cursor >= lane->fence.rows.size()) {
+        return std::nullopt;
+    }
+    const auto & row = lane->fence.rows[lane->fence.cursor];
+    server_rerot_token_plan plan;
+    plan.storage_pos = row.pos;
+    plan.run_id = row.run;
+    plan.visibility = llama_rerot_visibility::private_control;
+    return plan;
+}
+
+bool server_rerot_runtime::commit_final_fence_token(
+        uint64_t episode_id, llama_rerot_node_id node_id, const server_rerot_token_plan & plan) {
+    const auto expected = plan_final_fence_token(episode_id, node_id);
+    if (!expected || plan.storage_pos != expected->storage_pos || plan.run_id != expected->run_id ||
+        plan.visibility != llama_rerot_visibility::private_control) {
+        return false;
+    }
+    // Numerical re-evaluation only: no parser event, logical token, run
+    // extension, publish/frontier epoch or client-visible stream is added.
+    auto & fence = node(episode_id, node_id)->fence;
+    ++fence.cursor;
+    if (fence.complete()) {
+        std::vector<uint8_t>().swap(fence.hand);
+    }
+    return true;
+}
+
 bool server_rerot_runtime::refresh_final_fence(
         uint64_t episode_id,
         llama_rerot_node_id node_id,
@@ -2486,9 +2667,10 @@ bool server_rerot_runtime::refresh_final_fence(
         !survivor->exit_intent || survivor->exec_seq < 0) {
         return fail_episode(*current, "RERoT final fence lost its single-survivor precondition");
     }
-    // Stable-view re-evaluation (§21.4): the fence decode observes every
-    // public write committed through the final frontier, including the last
-    // writes of already-retired sibling Lanes.
+    // Install the stable view through the final public frontier. This method
+    // does NOT decode/re-evaluate the closing sequence; neither does the core
+    // refresh barrier (synchronize only). Full §21.4 close replay still needs
+    // a causal checkpoint and must not double-apply recurrent transitions.
     const auto view = current->document.build_view(node_id);
     if (ordered_runs_out) {
         ordered_runs_out->clear();
@@ -2519,7 +2701,7 @@ bool server_rerot_runtime::complete_serial_tail(uint64_t episode_id, llama_rerot
     if (!current || !survivor) {
         return false;
     }
-    if (current->hard_aborted || !current->finalizing || !current->fence_refreshed ||
+    if (current->hard_aborted || !current->finalizing || !current->fence_refreshed || !survivor->fence.complete() ||
         current->serial_tail || current->running.size() != 1 ||
         current->running.count(node_id) != 1) {
         return current ? fail_episode(*current, "invalid RERoT serial tail transition") : false;
@@ -3092,6 +3274,15 @@ std::vector<uint8_t> server_rerot_episode_save(
         w.blob(node.sampler_blob);
         w.blob(node.mtp_blob);
         w.blob(node.hand_seed);
+        w.blob(node.fence.hand);
+        w.u8(node.fence.prepared ? 1 : 0);
+        w.u32(static_cast<uint32_t>(node.fence.cursor));
+        w.u32(static_cast<uint32_t>(node.fence.rows.size()));
+        for (const auto & row : node.fence.rows) {
+            w.i32(row.token);
+            w.i32(row.pos);
+            w.u32(row.run);
+        }
         w.u64(node.view_stamp.topology_epoch);
         w.u64(node.view_stamp.publish_epoch);
         w.u64(node.view_stamp.layout_epoch);
@@ -3136,6 +3327,7 @@ struct rerot_runtime_blob {
     std::vector<uint8_t> sampler_blob;
     std::vector<uint8_t> mtp_blob;
     std::vector<uint8_t> hand_seed;
+    server_rerot_fence_checkpoint fence;
     llama_rerot_view_stamp view_stamp = {0, 0, 0};
 };
 
@@ -3363,6 +3555,34 @@ bool server_rerot_episode_load(
         rb.sampler_blob = r.blob();
         rb.mtp_blob = r.blob();
         rb.hand_seed = r.blob();
+        rb.fence.hand = r.blob();
+        const uint8_t fence_prepared = r.u8();
+        rb.fence.prepared = fence_prepared != 0;
+        rb.fence.cursor = r.u32();
+        const uint32_t n_fence_rows = r.u32();
+        if (!r.ok || fence_prepared > 1 || rb.fence.cursor > n_fence_rows ||
+            n_fence_rows > (r.n - r.off) / 12 ||
+            (!rb.fence.prepared && rb.fence.cursor != 0) ||
+            (rb.fence.prepared && (!rb.exit_intent || n_fence_rows == 0))) {
+            r.ok = false;
+            break;
+        }
+        for (uint32_t j = 0; j < n_fence_rows; ++j) {
+            server_rerot_fence_row row;
+            row.token = r.i32();
+            row.pos = r.i32();
+            row.run = r.u32();
+            if (!r.ok || row.token < 0 || row.pos < 0 || row.run >= run_blobs.size() ||
+                run_blobs[row.run].owner != rb.id ||
+                row.pos < run_blobs[row.run].storage_pos0 ||
+                int64_t(row.pos) >= int64_t(run_blobs[row.run].storage_pos0) + run_blobs[row.run].token_count ||
+                (j && int64_t(row.pos) != int64_t(rb.fence.rows.back().pos) + 1) ||
+                (rb.fence.prepared && run_blobs[row.run].visibility != llama_rerot_visibility::private_control)) {
+                r.ok = false;
+                break;
+            }
+            rb.fence.rows.push_back(row);
+        }
         rb.view_stamp.topology_epoch = r.u64();
         rb.view_stamp.publish_epoch = r.u64();
         rb.view_stamp.layout_epoch = r.u64();
@@ -3514,6 +3734,7 @@ bool server_rerot_episode_load(
         node.sampler_blob = sb.sampler_blob;
         node.mtp_blob = sb.mtp_blob;
         node.hand_seed = sb.hand_seed;
+        node.fence = sb.fence;
         node.view_stamp = sb.view_stamp;
         const auto check_ref = [&](const std::optional<llama_rerot_run_id> & ref, llama_rerot_visibility want) {
             if (!ref.has_value()) {

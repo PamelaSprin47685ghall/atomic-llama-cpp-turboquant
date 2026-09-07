@@ -1051,7 +1051,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_gated_linear_attn_f32;
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
-    vk_pipeline pipeline_gated_delta_net_rbb[4];
+    vk_pipeline pipeline_gated_delta_net_rbb[4][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -6069,21 +6069,23 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column, gdn_workgroup_size, 0u}, 1, true, use_subgroup_ops, device->subgroup_size);
             }
+            for (uint32_t density_mode = 0; density_mode < 2; ++density_mode) {
             ggml_vk_create_pipeline(
                 device,
-                device->pipeline_gated_delta_net_rbb[si],
-                (std::string(gdn_names[si][0]) + "_rbb").c_str(),
+                device->pipeline_gated_delta_net_rbb[si][density_mode],
+                (std::string(gdn_names[si][0]) + (density_mode ? "_rbb_coherence" : "_rbb")).c_str(),
                 gdn_len,
                 gdn_data,
                 "main",
                 8,
                 sizeof(vk_op_gated_delta_net_push_constants),
                 wg_denoms,
-                {S_V, 0u, device->subgroup_size, lanes_per_column, gdn_workgroup_size, 1u},
+                {S_V, 0u, device->subgroup_size, lanes_per_column, gdn_workgroup_size, 1u + density_mode},
                 1,
                 true,
                 use_subgroup_ops,
                 device->subgroup_size);
+            }
         }
     }
 
@@ -12714,7 +12716,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 default: return nullptr;
             }
             if (ggml_get_op_params_i32(dst, 1) != 0) {
-                return ctx->device->pipeline_gated_delta_net_rbb[si];
+                const int32_t density_mode = ggml_get_op_params_i32(dst, 2);
+                GGML_ASSERT(density_mode == 0 || density_mode == 1);
+                return ctx->device->pipeline_gated_delta_net_rbb[si][density_mode];
             }
             return ctx->device->pipeline_gated_delta_net[si][kda];
         }

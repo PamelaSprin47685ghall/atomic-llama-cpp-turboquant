@@ -284,8 +284,8 @@ public:
         const llama_memory_recurrent_context * current,
         const llama_ubatch & ubatch);
 
-    ggml_tensor * s_copy;      // I32 [n_rs]
-    ggml_tensor * brain_copy;  // I32 [n_seqs], grouped shared-S rows
+    ggml_tensor * s_copy = nullptr;      // I32 [n_rs]
+    ggml_tensor * brain_copy = nullptr;  // I32 [n_seqs], absent outside grouped layout
 
     struct rbb_group_input {
         int32_t brain_row = -1;
@@ -295,14 +295,14 @@ public:
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
-    ggml_tensor * s_copy_main;   // I32 [n_seqs]
-    ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
+    ggml_tensor * s_copy_main = nullptr;   // I32 [n_seqs]
+    ggml_tensor * s_copy_extra = nullptr;  // I32 [n_rs - n_seqs]
 
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
-    uint32_t head;
-    int32_t rs_z;
+    uint32_t head = 0;
+    int32_t rs_z = 0;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -351,7 +351,7 @@ public:
 //   first three coordinates only, the fourth stays 0.
 // - RoPE runs BEFORE Turbo WHT; K storage is never moved, not one byte.
 // - Kernels consume span descriptors (entries [2, E] + offsets [n_queries+1])
-//   with one global online softmax per query range. Strong-frontier visibility
+//   with one global online softmax per query range. Staged frontier visibility
 //   is resolved layout-side by entry pre-filtering (strong vs lag1), never by
 //   the kernel and never by ordinary seq-membership masks.
 // - Span metadata / offsets / visibility are INPUT TENSOR DATA, not graph

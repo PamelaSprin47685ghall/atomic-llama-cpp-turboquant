@@ -109,14 +109,16 @@ void rbb_main() {
 
     // Eight runtime-sized vectors per (head, state column). The block solve
     // uses one common decay, one residual per writer, and the exact
-    // (K K^T + D + eps I) operator from Parallel DeltaNet.
+    // Parallel DeltaNet operator, symmetrically scaled by sqrt(beta):
+    // A = C K K^T C + diag(1-beta) + eps C^2, rhs = C(V-K Sbar).
+    // This is equivalent for beta>0 and has an exact beta=0 limit.
     const uint candidate_off = s_off + H * S_V * S_V;
     const uint scratch_stride = 8u * n_seqs;
     const uint scratch_base =
         candidate_off + n_seqs * H * S_V * S_V +
         (head_id * S_V + col) * scratch_stride;
-    const uint beta_off          = scratch_base;
-    const uint rhs_off           = beta_off + n_seqs;
+    const uint regularizer_off   = scratch_base;
+    const uint rhs_off           = regularizer_off + n_seqs;
     const uint solution_off      = rhs_off + n_seqs;
     const uint residual_off      = solution_off + n_seqs;
     const uint direction_off     = residual_off + n_seqs;
@@ -140,10 +142,7 @@ void rbb_main() {
     float residual_product = 0.0;
     for (uint writer = 0u; writer < n_seqs; ++writer) {
         const uint qk_off = (writer / rq3) * sq3 + qk_head * sq1;
-        const float beta = clamp(
-            float(data_beta[writer * sb3 + head_id * sb1]),
-            1.0e-6,
-            1.0);
+        const float beta = float(data_beta[writer * sb3 + head_id * sb1]);
         float projected = 0.0;
         float key_norm = 0.0;
         [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; ++r) {
@@ -156,18 +155,41 @@ void rbb_main() {
         key_norm = float(reduce_partial(FLOAT_TYPE(key_norm)));
         const float rhs =
             float(data_v[writer * sv3 + head_id * sv1 + col]) - projected;
+        float evidence_density = 1.0;
+        // RBB=2 is the default mathematical contract: correct redundant
+        // evidence without averaging orthogonal writes. Orthogonal keys keep
+        // density 1; identical active keys have density N. RBB=1 remains an
+        // explicit raw-redundant research control. PRIVATE overlays still use
+        // the native beta.
+        if (RBB == 2u && n_seqs > 1u) {
+            for (uint other = 0u; other < n_seqs; ++other) {
+                if (other == writer || float(data_beta[other * sb3 + head_id * sb1]) == 0.0) continue;
+                const uint other_off = (other / rq3) * sq3 + qk_head * sq1;
+                float cross = 0.0, other_norm = 0.0;
+                [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; ++r) {
+                    const uint d = r * LANES_PER_COLUMN + lane;
+                    const float ki = float(data_k[qk_off + d]), kj = float(data_k[other_off + d]);
+                    cross += ki * kj;
+                    other_norm += kj * kj;
+                }
+                cross = float(reduce_partial(FLOAT_TYPE(cross)));
+                other_norm = float(reduce_partial(FLOAT_TYPE(other_norm)));
+                if (key_norm * other_norm > 1.0e-20) evidence_density += cross * cross / (key_norm * other_norm);
+            }
+        }
         const float regularizer =
-            n_seqs == 1u ? 0.0 : (1.0 - beta) / beta + 1.0e-4;
-        const float diagonal = key_norm + regularizer;
+            n_seqs == 1u ? 0.0 : evidence_density * (1.0 - beta + 1.0e-4 * beta);
+        const float diagonal =
+            n_seqs == 1u ? key_norm : beta * key_norm + regularizer;
         const float solution =
             n_seqs == 1u ? beta * rhs : 0.0;
         const float residual =
-            n_seqs == 1u ? 0.0 : rhs;
+            n_seqs == 1u ? 0.0 : sqrt(beta) * rhs;
         const float preconditioned =
             diagonal > 1.0e-20 ? residual / diagonal : 0.0;
 
         if (lane == 0u) {
-            data_dst[beta_off + writer] = FLOAT_TYPE(beta);
+            data_dst[regularizer_off + writer] = FLOAT_TYPE(regularizer);
             data_dst[rhs_off + writer] = FLOAT_TYPE(rhs);
             data_dst[solution_off + writer] = FLOAT_TYPE(solution);
             data_dst[residual_off + writer] = FLOAT_TYPE(residual);
@@ -182,12 +204,50 @@ void rbb_main() {
         barrier();
     }
 
-    // Matrix-free preconditioned CG. The operator is shared by every state
-    // column, while rhs and solution are column-specific. N steps are exact
-    // in exact arithmetic; wider frontiers get finite-precision refinement.
+    // Matrix-free preconditioned CG. N steps are exact only in exact
+    // arithmetic: real correlated keys lost conjugacy even at N=4. Refine
+    // every frontier size and replace the recursively accumulated residual
+    // with b-Ax between Krylov cycles. The common loop bound keeps workgroup
+    // barriers uniform even when columns converge at different times.
     const uint iteration_count =
-        n_seqs == 1u ? 0u : (n_seqs <= 32u ? n_seqs : 4u * n_seqs);
+        n_seqs == 1u ? 0u : 4u * n_seqs;
     for (uint iteration = 0u; iteration < iteration_count; ++iteration) {
+        if (iteration > 0u && iteration % n_seqs == 0u) {
+            float solution_keys[ROWS_PER_LANE];
+            [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; ++r) {
+                const uint d = r * LANES_PER_COLUMN + lane;
+                float value = 0.0;
+                for (uint writer = 0u; writer < n_seqs; ++writer) {
+                    const uint qk_off = (writer / rq3) * sq3 + qk_head * sq1;
+                    value += sqrt(float(data_beta[writer * sb3 + head_id * sb1])) *
+                        float(data_dst[solution_off + writer]) * float(data_k[qk_off + d]);
+                }
+                solution_keys[r] = value;
+            }
+            if (lane == 0u) residual_product = 0.0;
+            for (uint writer = 0u; writer < n_seqs; ++writer) {
+                const uint qk_off = (writer / rq3) * sq3 + qk_head * sq1;
+                float dot = 0.0;
+                [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; ++r) {
+                    const uint d = r * LANES_PER_COLUMN + lane;
+                    dot += float(data_k[qk_off + d]) * solution_keys[r];
+                }
+                dot = float(reduce_partial(FLOAT_TYPE(dot)));
+                if (lane == 0u) {
+                    const float beta = float(data_beta[writer * sb3 + head_id * sb1]);
+                    const float regularizer = float(data_dst[regularizer_off + writer]);
+                    const float residual = sqrt(beta) * (float(data_dst[rhs_off + writer]) - dot) -
+                        regularizer * float(data_dst[solution_off + writer]);
+                    const float z = residual / float(data_dst[diagonal_off + writer]);
+                    data_dst[residual_off + writer] = FLOAT_TYPE(residual);
+                    data_dst[preconditioned_off + writer] = FLOAT_TYPE(z);
+                    data_dst[direction_off + writer] = FLOAT_TYPE(z);
+                    residual_product += residual * z;
+                }
+            }
+            memoryBarrierBuffer();
+            barrier();
+        }
         float projected_keys[ROWS_PER_LANE];
         [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; ++r) {
             const uint d = r * LANES_PER_COLUMN + lane;
@@ -195,7 +255,8 @@ void rbb_main() {
             for (uint writer = 0u; writer < n_seqs; ++writer) {
                 const uint qk_off =
                     (writer / rq3) * sq3 + qk_head * sq1;
-                value += float(data_dst[direction_off + writer]) *
+                value += sqrt(float(data_beta[writer * sb3 + head_id * sb1])) *
+                    float(data_dst[direction_off + writer]) *
                     float(data_k[qk_off + d]);
             }
             projected_keys[r] = value;
@@ -212,11 +273,11 @@ void rbb_main() {
             dot = float(reduce_partial(FLOAT_TYPE(dot)));
             if (lane == 0u) {
                 const float beta =
-                    float(data_dst[beta_off + writer]);
+                    float(data_beta[writer * sb3 + head_id * sb1]);
                 const float regularizer =
-                    (1.0 - beta) / beta + 1.0e-4;
+                    float(data_dst[regularizer_off + writer]);
                 data_dst[product_off + writer] = FLOAT_TYPE(
-                    dot + regularizer *
+                    sqrt(beta) * dot + regularizer *
                         float(data_dst[direction_off + writer]));
             }
         }
@@ -266,18 +327,6 @@ void rbb_main() {
         barrier();
     }
 
-    if (lane == 0u) {
-        for (uint writer = 0u; writer < n_seqs; ++writer) {
-            const float solution =
-                float(data_dst[solution_off + writer]);
-            if (isnan(solution) || isinf(solution)) {
-                data_dst[solution_off + writer] = FLOAT_TYPE(0.0);
-            }
-        }
-    }
-    memoryBarrierBuffer();
-    barrier();
-
     float merged_shard[ROWS_PER_LANE];
     [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; ++r) {
         const uint d = r * LANES_PER_COLUMN + lane;
@@ -285,49 +334,64 @@ void rbb_main() {
         for (uint writer = 0u; writer < n_seqs; ++writer) {
             const uint qk_off =
                 (writer / rq3) * sq3 + qk_head * sq1;
-            merged += float(data_k[qk_off + d]) *
+            const float unscale = n_seqs == 1u
+                ? 1.0 : sqrt(float(data_beta[writer * sb3 + head_id * sb1]));
+            merged += float(data_k[qk_off + d]) * unscale *
                 float(data_dst[solution_off + writer]);
         }
         merged_shard[r] = merged;
         data_dst[s_off + state_base + d] = FLOAT_TYPE(merged);
     }
 
-    // Advance each Lane's native brain+hand state once. The public brain stays
-    // order-free; the stored residual exactly reconstructs this native state
-    // for the Lane's next token without a second GDN dispatch.
+    // Evolve the private overlay H and retain the writer's zero-mean share of
+    // the block write. If Delta=sum_i C_i, store C_i-Delta/N in each hand.
+    // These echoes sum to zero, identical writers receive zero echo, and N=1
+    // stays exactly native. This preserves writer identity without moving the
+    // shared brain or introducing a tunable self-echo coefficient.
     for (uint writer = 0u; writer < n_seqs; ++writer) {
         const uint qk_off = (writer / rq3) * sq3 + qk_head * sq1;
         const uint native_base =
             ((writer * H + head_id) * S_V + col) * S_V;
         const float alpha =
             exp(float(data_g[writer * sb3 + head_id * sb1]));
-        const float beta = clamp(
-            float(data_beta[writer * sb3 + head_id * sb1]),
-            1.0e-6,
-            1.0);
+        const float beta = float(data_beta[writer * sb3 + head_id * sb1]);
         float projected = 0.0;
+        float projected_native = 0.0;
         [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; ++r) {
             const uint d = r * LANES_PER_COLUMN + lane;
-            projected +=
-                alpha * float(data_native_state[native_base + d]) *
-                float(data_k[qk_off + d]);
+            const float native_value = float(data_native_state[native_base + d]);
+            const float key = float(data_k[qk_off + d]);
+            projected += alpha * (native_value - base_shard[r]) * key;
+            projected_native += alpha * native_value * key;
         }
         projected = float(reduce_partial(FLOAT_TYPE(projected)));
-        const float delta = beta *
-            (float(data_v[writer * sv3 + head_id * sv1 + col]) -
-             projected);
+        projected_native = float(reduce_partial(FLOAT_TYPE(projected_native)));
+        const float delta = -beta * projected;
+        const float native_delta = beta *
+            (float(data_v[writer * sv3 + head_id * sv1 + col]) - projected_native);
 
         float attn = 0.0;
         [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; ++r) {
             const uint d = r * LANES_PER_COLUMN + lane;
-            const float candidate =
-                alpha * float(data_native_state[native_base + d]) +
+            const float local_hand =
+                alpha * (float(data_native_state[native_base + d]) - base_shard[r]) +
                 float(data_k[qk_off + d]) * delta;
+            const float unscale = n_seqs == 1u
+                ? 1.0 : sqrt(float(data_beta[writer * sb3 + head_id * sb1]));
+            const float self_write = float(data_k[qk_off + d]) * unscale *
+                float(data_dst[solution_off + writer]);
+            const float shared_write = merged_shard[r] - base_alpha * base_shard[r];
+            const float self_echo = n_seqs == 1u ? 0.0 :
+                self_write - shared_write / float(n_seqs);
+            const float hand = local_hand + self_echo;
             data_dst[
                 candidate_off +
                 ((writer * H + head_id) * S_V + col) * S_V + d] =
-                FLOAT_TYPE(candidate - merged_shard[r]);
-            attn += candidate * float(data_q[qk_off + d]);
+                FLOAT_TYPE(hand);
+            const float native_candidate =
+                alpha * float(data_native_state[native_base + d]) +
+                float(data_k[qk_off + d]) * native_delta;
+            attn += native_candidate * float(data_q[qk_off + d]);
         }
         attn = float(reduce_partial(FLOAT_TYPE(attn)));
         if (lane == 0u) {

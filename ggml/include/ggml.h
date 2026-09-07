@@ -2699,9 +2699,18 @@ extern "C" {
             int64_t               K);
 
     // RERoT Parallel Delta: concurrent PUBLIC writers advance one shared brain
-    // through the regularized (K K^T + D + eps I) block update. native_state
-    // preserves each Lane's causal readout and the result carries its residual
-    // against the committed brain. N=1 preserves native recurrence exactly.
+    // through a coherence-normalized regularized block update. Writer i uses
+    // density_i = sum_j cos^2(k_i,k_j) over active writers; orthogonal writes
+    // retain the native strength while duplicate evidence does not become N
+    // times more confident merely because N pens emitted it. native_state is
+    // brain_state + private hand H. The current-token output is the exact
+    // native transition T_i(B+H_i); the shared block B' is committed for the
+    // next frontier and is not read instantaneously by peer queries in the
+    // same recurrent layer. The result carries the propagated private
+    // overlay plus the writer's centered block contribution C_i-mean(C), whose
+    // sum over writers is exactly zero; this preserves per-pen write identity
+    // without changing the shared brain. N=1 is a strict native-recurrence
+    // special case (no regularization and zero centered contribution).
     GGML_API struct ggml_tensor * ggml_gated_delta_net_rbb(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,

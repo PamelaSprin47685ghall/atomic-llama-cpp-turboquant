@@ -1852,6 +1852,8 @@ static void test_convert_responses_to_chatcmpl() {
         // Verify other fields preserved
         assert_equals(std::string("gpt-5-mini"), result.at("model").get<std::string>());
         assert_equals(false, result.at("stream").get<bool>());
+        assert_equals(std::string("medium"), result.at("reasoning_effort").get<std::string>());
+        assert_equals(false, result.contains("reasoning"));
     }
 
     // Test string input
@@ -7144,6 +7146,95 @@ static void test_reasoning_budget_tokens_per_request() {
     }
 }
 
+static void test_reasoning_effort_per_request() {
+    LOG_DBG("%s\n", __func__);
+
+    // First prove the OAI field reaches templates that natively understand it.
+    {
+        auto tmpls = read_templates("models/templates/openai-gpt-oss-120b.jinja");
+        server_chat_params opt;
+        opt.tmpls = std::move(tmpls);
+        opt.use_jinja = true;
+        opt.enable_thinking = true;
+        opt.n_predict = 8192;
+
+        for (const std::string effort : {"low", "medium", "high", "xhigh", "max"}) {
+            json body = {
+                {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
+                {"reasoning_effort", effort},
+                {"max_tokens", 8192},
+            };
+            std::vector<raw_buffer> out_files;
+            auto llama_params = oaicompat_chat_params_parse(body, opt, out_files);
+            assert_contains(llama_params.at("prompt").get<std::string>(), "Reasoning: " + effort);
+        }
+    }
+
+    // Then prove the generic budget fallback is monotone when a template
+    // exposes explicit thinking start/end markers.
+    {
+        auto tmpls = read_templates("models/templates/Qwen-Qwen3-0.6B.jinja");
+        server_chat_params opt;
+        opt.tmpls = std::move(tmpls);
+        opt.use_jinja = true;
+        opt.enable_thinking = true;
+        opt.reasoning_budget = -1;
+        opt.n_predict = 8192;
+
+        const std::vector<std::pair<std::string, int>> expected = {
+            {"low", 1638}, {"medium", 4096}, {"high", 6553},
+            {"xhigh", 7782}, {"max", 8191},
+        };
+        for (const auto & [effort, budget] : expected) {
+            json body = {
+                {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
+                {"reasoning_effort", effort},
+                {"max_completion_tokens", 8192},
+            };
+            std::vector<raw_buffer> out_files;
+            auto llama_params = oaicompat_chat_params_parse(body, opt, out_files);
+            assert_equals(budget, llama_params.at("reasoning_budget_tokens").get<int>());
+        }
+
+        // No finite output cap => do not manufacture an absolute budget from
+        // the effort name. Native effort-aware templates still receive the
+        // effort kwarg; budget-only fallback remains unrestricted/default.
+        opt.n_predict = -1;
+        json unbounded_body = {
+            {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
+            {"reasoning_effort", "high"},
+        };
+        std::vector<raw_buffer> unbounded_files;
+        auto unbounded_params = oaicompat_chat_params_parse(unbounded_body, opt, unbounded_files);
+        assert_equals(-1, unbounded_params.at("reasoning_budget_tokens").get<int>());
+        opt.n_predict = 8192;
+
+        // Exact token budgets are the lower-level escape hatch and always win.
+        json explicit_body = {
+            {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
+            {"reasoning_effort", "max"},
+            {"max_tokens", 8192},
+            {"reasoning_budget_tokens", 777},
+        };
+        std::vector<raw_buffer> explicit_files;
+        auto explicit_params = oaicompat_chat_params_parse(explicit_body, opt, explicit_files);
+        assert_equals(777, explicit_params.at("reasoning_budget_tokens").get<int>());
+
+        bool rejected = false;
+        try {
+            json invalid_body = {
+                {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
+                {"reasoning_effort", "ultra"},
+            };
+            std::vector<raw_buffer> invalid_files;
+            (void) oaicompat_chat_params_parse(invalid_body, opt, invalid_files);
+        } catch (const std::invalid_argument &) {
+            rejected = true;
+        }
+        assert_equals(true, rejected);
+    }
+}
+
 static void test_reasoning_budget_message_per_request() {
     LOG_DBG("%s\n", __func__);
     // Same code path as test_reasoning_budget_tokens_per_request: the Qwen3 template's
@@ -7416,6 +7507,7 @@ int main(int argc, char ** argv) {
         test_deepseek_v4_thinking_retention();
         test_deepseek_v4_tool_result_ordering();
         test_template_generation_prompt();
+        test_reasoning_effort_per_request();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
         test_template_output_peg_parsers(detailed_debug);

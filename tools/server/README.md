@@ -1254,7 +1254,7 @@ The `response_format` parameter supports both plain JSON output (e.g. `{"type": 
 
 `chat_template_kwargs`: Allows sending additional parameters to the json templating system. For example: `{"enable_thinking": false}`
 
-`reasoning_effort`: If set to `none`, reasoning will be disabled for this request. Other values (e.g., `low`, `max`) have no effect on reasoning.
+`reasoning_effort`: OpenAI-compatible per-request reasoning level. Accepted values are `none`, `low`, `medium`, `high`, `xhigh`, and `max`. The value is forwarded unchanged to `reasoning_effort`-aware chat templates. For legacy/budget-only reasoning templates, and only when no explicit `reasoning_budget_tokens` / `thinking_budget_tokens` is provided, a finite output cap uses the common open-source ladder `low=20%`, `medium=50%`, `high=80%`, `xhigh=95%`, `max=100%`. OpenRouter currently maps both `xhigh` and `max` to 95%, while Cline keeps `max=100%`; llama.cpp keeps the two exposed levels distinct. The final reasoning budget is capped at 128000 tokens and normally at least 1024 tokens while still staying strictly below the output cap (`max` therefore becomes at most `max_tokens-1`). If there is no finite output cap, no synthetic absolute thinking budget is invented. Explicit token budgets always take precedence. Responses API `reasoning.effort` is converted to the same setting. This budget conversion is a compatibility fallback, not a claim that native effort-aware models use fixed token quotas.
 
 `reasoning_format`: The reasoning format to be parsed. If set to `none`, it will output the raw generated text.
 

@@ -202,6 +202,7 @@ private:
     int32_t brain_row_for_seq(llama_seq_id seq_id) const;
     int32_t acquire_brain_row(uint64_t episode_id, llama_seq_id seq_id);
     void clear_brain_row(int32_t brain_row);
+    void clear_hand_row(int32_t hand_row);
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {
@@ -249,6 +250,7 @@ public:
     int32_t s_copy(int i) const;
     int32_t brain_copy(int i) const;
     bool is_public_write(int i) const;
+    bool is_child_row(int i) const;
     std::map<int32_t, std::vector<int32_t>> public_brain_groups() const;
 
 private:

@@ -269,6 +269,8 @@ export interface ApiChatCompletionRequest {
 	tools?: ApiChatCompletionTool[];
 	// Reasoning parameters
 	reasoning_format?: string;
+	reasoning_effort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+	reasoning_budget_tokens?: number;
 	// Generation parameters
 	temperature?: number;
 	max_tokens?: number;

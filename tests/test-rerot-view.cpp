@@ -215,31 +215,152 @@ static void test_query_layout_frontiers() {
     };
 
     const auto strong = llama_rerot_build_query_layout(reader, 3, keys);
-    CHECK(strong.query_virtual_pos == 5);
-    CHECK(strong.entries.size() == 6);
+    CHECK(strong.query_virtual_pos == 4);
+    CHECK(strong.entries.size() == 5);
     CHECK(strong.groups.size() == 2);
     CHECK(strong.groups[0].effective_pos == 3);
-    CHECK(strong.groups[1].effective_pos == 5);
+    CHECK(strong.groups[1].effective_pos == 4);
 
     std::set<uint32_t> strong_keys;
     for (const auto & entry : strong.entries) {
         strong_keys.insert(entry.key_index);
     }
-    CHECK(strong_keys == std::set<uint32_t>({0, 1, 2, 3, 4, 5}));
+    CHECK(strong_keys == std::set<uint32_t>({0, 1, 2, 4, 5}));
 
     reader.frontier_mode = LLAMA_REROT_FRONTIER_LAG1;
     const auto lag1 = llama_rerot_build_query_layout(reader, 3, keys);
-    CHECK(lag1.query_virtual_pos == 4);
-    CHECK(lag1.entries.size() == 5);
-    CHECK(lag1.groups.size() == 2);
+    CHECK(lag1.query_virtual_pos == 3);
+    CHECK(lag1.entries.size() == 4);
+    CHECK(lag1.groups.size() == 1);
     CHECK(lag1.groups[0].effective_pos == 3);
-    CHECK(lag1.groups[1].effective_pos == 4);
 
     std::set<uint32_t> lag1_keys;
     for (const auto & entry : lag1.entries) {
         lag1_keys.insert(entry.key_index);
     }
-    CHECK(lag1_keys == std::set<uint32_t>({0, 1, 2, 4, 5}));
+    CHECK(lag1_keys == std::set<uint32_t>({0, 1, 4, 5}));
+}
+
+static void test_concurrent_sibling_readers_strong() {
+    // Audit scenario: Multiple sibling lanes concurrently generate PUBLIC tokens.
+    // Ensure that:
+    // 1. Each reader's own virtual positions are strictly continuous, no gaps, no overlaps.
+    // 2. STRONG does NOT expose same-frontier peer rows; own current K/V stays visible.
+    constexpr uint64_t episode = 2026;
+    llama_rerot_document doc(episode);
+    const auto root = doc.root();
+    const auto lane_a = doc.create_child(root, "LaneA");
+    const auto lane_b = doc.create_child(root, "LaneB");
+    const auto lane_c = doc.create_child(root, "LaneC");
+
+    // Common prefix
+    doc.append_run(root, llama_rerot_visibility::normal, 0, 4);
+
+    // Each lane writes public tokens
+    const auto run_a = doc.append_run(lane_a, llama_rerot_visibility::public_live, 4, 3, 10);
+    const auto run_b = doc.append_run(lane_b, llama_rerot_visibility::public_live, 4, 2, 11);
+    const auto run_c = doc.append_run(lane_c, llama_rerot_visibility::public_live, 4, 4, 12);
+
+    std::string err;
+    CHECK(doc.validate(&err));
+
+    const auto view_a = doc.build_view(lane_a);
+    const auto view_b = doc.build_view(lane_b);
+    const auto view_c = doc.build_view(lane_c);
+
+    // Verify virtual position continuity for all concurrent readers
+    for (const auto & view : { view_a, view_b, view_c }) {
+        llama_pos pos = 0;
+        for (const auto & r : view.runs) {
+            CHECK(r.virtual_pos0 == pos);
+            CHECK(r.token_count > 0);
+            pos += r.token_count;
+        }
+        CHECK(view.query_virtual_pos == pos);
+        CHECK(view.query_virtual_pos == 4 + 3 + 2 + 4); // 13 tokens total
+    }
+
+    // PAC-DFS sibling ordering: reader's own branch must be LAST
+    CHECK(view_a.runs.back().owner == lane_a);
+    CHECK(view_b.runs.back().owner == lane_b);
+    CHECK(view_c.runs.back().owner == lane_c);
+
+    // Physical key setup across lanes in unified KV cache
+    std::vector<llama_rerot_key_record> keys;
+    // Prefix keys 0..3 (storage 0..3)
+    for (uint32_t i = 0; i < 4; ++i) {
+        keys.push_back({ i, static_cast<llama_pos>(i), true, {} });
+    }
+    // Lane A keys (storage 4..6, frontier 1)
+    for (uint32_t i = 0; i < 3; ++i) {
+        keys.push_back({ 4 + i, static_cast<llama_pos>(4 + i), false,
+            public_meta(episode, lane_a, run_a, 1) });
+    }
+    // Lane B keys (storage 4..5, frontier 1)
+    for (uint32_t i = 0; i < 2; ++i) {
+        keys.push_back({ 7 + i, static_cast<llama_pos>(4 + i), false,
+            public_meta(episode, lane_b, run_b, 1) });
+    }
+    // Lane C keys (storage 4..7, frontier 1)
+    for (uint32_t i = 0; i < 4; ++i) {
+        keys.push_back({ 9 + i, static_cast<llama_pos>(4 + i), false,
+            public_meta(episode, lane_c, run_c, 1) });
+    }
+
+    // Test Reader A querying at storage_pos = 6 (its 3rd token) in STRONG mode
+    {
+        llama_rerot_reader_state reader_a;
+        reader_a.episode_id = episode;
+        reader_a.reader = lane_a;
+        reader_a.query_run = run_a;
+        reader_a.frontier = 1;
+        reader_a.frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+        for (const auto & r : view_a.runs) {
+            reader_a.ordered_runs.push_back(r.run_id);
+        }
+
+        // Reader A owns its own keys
+        auto keys_a = keys;
+        for (uint32_t i = 0; i < 3; ++i) {
+            keys_a[4 + i].owned_by_reader = true;
+        }
+
+        const auto layout_a = llama_rerot_build_query_layout(reader_a, 6, keys_a);
+        // Prefix + own 3 current rows. Current B/C rows are write-stage peers.
+        CHECK(layout_a.entries.size() == 7);
+        CHECK(layout_a.query_virtual_pos == 6);
+
+        // Effective position must never be negative or invert RoPE
+        for (const auto & group : layout_a.groups) {
+            CHECK(group.effective_pos >= 0);
+        }
+    }
+
+    // Test Reader B querying at storage_pos = 5 (its 2nd token) in STRONG mode
+    {
+        llama_rerot_reader_state reader_b;
+        reader_b.episode_id = episode;
+        reader_b.reader = lane_b;
+        reader_b.query_run = run_b;
+        reader_b.frontier = 1;
+        reader_b.frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+        for (const auto & r : view_b.runs) {
+            reader_b.ordered_runs.push_back(r.run_id);
+        }
+
+        auto keys_b = keys;
+        for (uint32_t i = 0; i < 2; ++i) {
+            keys_b[7 + i].owned_by_reader = true;
+        }
+
+        const auto layout_b = llama_rerot_build_query_layout(reader_b, 5, keys_b);
+        CHECK(layout_b.entries.size() == 6);
+        CHECK(layout_b.query_virtual_pos == 5);
+
+        for (const auto & group : layout_b.groups) {
+            CHECK(group.effective_pos >= 0);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -712,6 +833,7 @@ int main() {
     test_reclassify_run_validation();
     test_randomized_invariants();
     test_query_layout_frontiers();
+    test_concurrent_sibling_readers_strong();
     test_structured_kary_trees();
     test_off_path_stability();
     test_queue_independence();

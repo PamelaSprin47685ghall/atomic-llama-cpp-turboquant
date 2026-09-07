@@ -11096,11 +11096,167 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 }
 
 
+// Correctness implementation of the RBB block operator. Solve in double
+// precision using Cholesky, independently of Vulkan's matrix-free CG.
+// sqrt(beta) scaling makes beta=0 an exact no-write without dividing by beta.
+static void ggml_compute_forward_gated_delta_net_rbb_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * g = dst->src[3];
+    const ggml_tensor * b = dst->src[4];
+    const auto * brain = (const float *) dst->src[5]->data;
+    const auto * native = (const float *) dst->src[6]->data;
+    auto * out = (float *) dst->data;
+    const int64_t S = v->ne[0], H = v->ne[1], N = v->ne[3];
+    const int64_t state_size = S * S * H;
+    const int64_t brain_off = S * H * N;
+    const int64_t hand_off = brain_off + state_size;
+    const double scale = 1.0 / std::sqrt(double(S));
+    auto at = [](const ggml_tensor * t, int64_t d, int64_t h, int64_t n) {
+        return double(*(const float *) ((const char *) t->data +
+            d * t->nb[0] + h * t->nb[1] + n * t->nb[3]));
+    };
+
+    for (int64_t h = params->ith; h < H; h += params->nth) {
+        std::vector<double> keys(N * S), queries(N * S), beta(N), root_beta(N), alpha(N);
+        double log_decay = 0.0;
+        for (int64_t n = 0; n < N; ++n) {
+            beta[n] = at(b, 0, h, n);
+            GGML_ASSERT(std::isfinite(beta[n]) && beta[n] >= 0.0 && beta[n] <= 1.0);
+            root_beta[n] = std::sqrt(beta[n]);
+            const double gn = at(g, 0, h, n);
+            alpha[n] = std::exp(gn);
+            log_decay += gn;
+            for (int64_t d = 0; d < S; ++d) {
+                keys[n * S + d] = at(k, d, h % k->ne[1], n / (N / k->ne[3]));
+                queries[n * S + d] = at(q, d, h % q->ne[1], n / (N / q->ne[3]));
+            }
+        }
+        const double decay = std::exp(log_decay / double(N));
+        std::vector<double> density(N, 1.0);
+        if (ggml_get_op_params_i32(dst, 2) == 1 && N > 1) {
+            for (int64_t i = 0; i < N; ++i) {
+                for (int64_t j = 0; j < N; ++j) {
+                    if (i == j || beta[j] == 0.0) continue;
+                    double dot = 0.0, ni = 0.0, nj = 0.0;
+                    for (int64_t d = 0; d < S; ++d) {
+                        const double ki = keys[i * S + d], kj = keys[j * S + d];
+                        dot += ki * kj; ni += ki * ki; nj += kj * kj;
+                    }
+                    if (ni * nj > 1e-20) density[i] += dot * dot / (ni * nj);
+                }
+            }
+        }
+        std::vector<double> lower(N * N, 0.0);
+        if (N > 1) {
+            for (int64_t i = 0; i < N; ++i) {
+                for (int64_t j = 0; j <= i; ++j) {
+                    double value = 0.0;
+                    for (int64_t d = 0; d < S; ++d) {
+                        value += keys[i * S + d] * keys[j * S + d];
+                    }
+                    value *= root_beta[i] * root_beta[j];
+                    if (i == j) {
+                        value += density[i] * (1.0 - beta[i] + 1.0e-4 * beta[i]);
+                    }
+                    for (int64_t j0 = 0; j0 < j; ++j0) {
+                        value -= lower[i * N + j0] * lower[j * N + j0];
+                    }
+                    if (i == j) {
+                        GGML_ASSERT(std::isfinite(value) && value > 0.0);
+                        lower[i * N + j] = std::sqrt(value);
+                    } else {
+                        lower[i * N + j] = value / lower[j * N + j];
+                    }
+                }
+            }
+        }
+        std::vector<double> weights(N), merged(S);
+        for (int64_t col = 0; col < S; ++col) {
+            const int64_t base = (h * S + col) * S;
+            for (int64_t n = 0; n < N; ++n) {
+                double residual = at(v, col, h, n);
+                for (int64_t d = 0; d < S; ++d) {
+                    residual -= keys[n * S + d] * decay * brain[base + d];
+                }
+                weights[n] = (N == 1 ? beta[n] : root_beta[n]) * residual;
+            }
+            if (N > 1) {
+                for (int64_t i = 0; i < N; ++i) {
+                    for (int64_t j = 0; j < i; ++j) {
+                        weights[i] -= lower[i * N + j] * weights[j];
+                    }
+                    weights[i] /= lower[i * N + i];
+                }
+                for (int64_t i = N; i-- > 0;) {
+                    for (int64_t j = i + 1; j < N; ++j) {
+                        weights[i] -= lower[j * N + i] * weights[j];
+                    }
+                    weights[i] /= lower[i * N + i];
+                }
+                for (int64_t i = 0; i < N; ++i) {
+                    weights[i] *= root_beta[i];
+                }
+            }
+            for (int64_t d = 0; d < S; ++d) {
+                merged[d] = decay * brain[base + d];
+                for (int64_t n = 0; n < N; ++n) {
+                    merged[d] += keys[n * S + d] * weights[n];
+                }
+                out[brain_off + base + d] = float(merged[d]);
+            }
+            for (int64_t n = 0; n < N; ++n) {
+                double projected_hand = 0.0;
+                double projected_native = 0.0;
+                for (int64_t d = 0; d < S; ++d) {
+                    const double native_value = double(native[n * state_size + base + d]);
+                    projected_hand += keys[n * S + d] * (native_value - brain[base + d]);
+                    projected_native += keys[n * S + d] * alpha[n] * native_value;
+                }
+                const double native_delta = beta[n] *
+                    (at(v, col, h, n) - projected_native);
+                double readout = 0.0;
+                for (int64_t d = 0; d < S; ++d) {
+                    const double local_hand = alpha[n] * (
+                        double(native[n * state_size + base + d]) - brain[base + d] -
+                        beta[n] * keys[n * S + d] * projected_hand);
+                    // Parameter-free self-echo. The block write decomposes as
+                    //   Delta = sum_i C_i, C_i = k_i w_i^T.
+                    // Preserve each pen's centered contribution C_i-Delta/N
+                    // in H. The echoes sum to zero, so B remains the exact
+                    // shared brain; duplicate writers get zero echo; N=1 is
+                    // strictly native recurrence. Unlike an arbitrary lambda
+                    // blend this follows from the contribution decomposition.
+                    const double shared_write = merged[d] - decay * brain[base + d];
+                    const double self_echo = N == 1 ? 0.0 :
+                        keys[n * S + d] * weights[n] - shared_write / double(N);
+                    const double hand = local_hand + self_echo;
+                    out[hand_off + n * state_size + base + d] = float(hand);
+                    // Synchronous frontier semantics: this token's model
+                    // output is its exact native GDN transition from the
+                    // pre-frontier local state. B' is a commit for future
+                    // tokens, not an instantaneous peer write visible inside
+                    // the same recurrent layer.
+                    const double native_candidate =
+                        alpha[n] * double(native[n * state_size + base + d]) +
+                        keys[n * S + d] * native_delta;
+                    readout += queries[n * S + d] * native_candidate;
+                }
+                out[(n * H + h) * S + col] = float(readout * scale);
+            }
+        }
+    }
+}
+
 static void ggml_compute_forward_gated_delta_net_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     if (ggml_get_op_params_i32(dst, 1) != 0) {
-        GGML_ABORT("RERoT GDN requires a supported GPU backend");
+        ggml_compute_forward_gated_delta_net_rbb_f32(params, dst);
+        return;
     }
 
     ggml_tensor * V = dst->src[2];

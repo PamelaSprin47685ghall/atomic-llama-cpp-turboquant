@@ -5247,6 +5247,9 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
             ep_st.layout_epoch   = env.layout_epoch;
             ep_st.frontier_mode  = env.frontier_mode;
             ep_st.view_stamps    = std::move(env.stamps);
+            for (const auto & kv : ep_st.view_stamps) {
+                it->second.exec_bindings[kv.first] = {env.episode_id, 0, (int32_t) kv.first};
+            }
             it->second.mem       = memory.get();
         }
         return io.n_bytes();
@@ -6596,6 +6599,7 @@ bool llama_rerot_freeze_to_archive(
             return false;
         }
         it->second.exec_bindings.erase(exec_seq);
+        it->second.episodes[episode_id].view_stamps.erase(exec_seq);
     }
     llama_memory_t mem = ctx->get_memory();
     if (mem == nullptr) {
@@ -6693,7 +6697,12 @@ bool llama_rerot_mtp_is_stale(
         llama_context * ctx,
           llama_seq_id seq_id,
     const llama_rerot_view_stamp * stamp) {
+    // Fast path: if RERoT is disabled, stamp is null, uninitialized ({0, 0, 0}),
+    // or seq_id is out of range, this path incurs zero overhead and returns false (§A.6, §A.12).
     if (!llama_rerot_ctx_enabled(ctx) || stamp == nullptr || seq_id < 0 || seq_id >= LLAMA_MAX_SEQ) {
+        return false;
+    }
+    if (stamp->topology_epoch == 0 && stamp->publish_epoch == 0 && stamp->layout_epoch == 0) {
         return false;
     }
     std::lock_guard<std::mutex> lock(g_rerot_mu);
@@ -6701,12 +6710,21 @@ bool llama_rerot_mtp_is_stale(
     if (it == g_rerot_states.end() || it->second.episodes.empty()) {
         return false;
     }
+    // Check execution binding first to isolate this sequence to its owning episode (§§B.5, A.6).
     auto bit = it->second.exec_bindings.find(seq_id);
     if (bit != it->second.exec_bindings.end()) {
         auto ep_it = it->second.episodes.find(bit->second.episode_id);
         if (ep_it != it->second.episodes.end()) {
-            auto jt = ep_it->second.view_stamps.find(seq_id);
-            if (jt != ep_it->second.view_stamps.end()) {
+            const auto & ep_st = ep_it->second;
+            // Any newer peer PUBLIC commit or topology/layout epoch advance in the owning episode
+            // invalidates the draft (§A.6.1, §A.6.2).
+            if (ep_st.publish_epoch > stamp->publish_epoch ||
+                ep_st.topology_epoch > stamp->topology_epoch ||
+                ep_st.layout_epoch > stamp->layout_epoch) {
+                return true;
+            }
+            auto jt = ep_st.view_stamps.find(seq_id);
+            if (jt != ep_st.view_stamps.end()) {
                 const auto & cur = jt->second;
                 return cur.topology_epoch != stamp->topology_epoch ||
                        cur.publish_epoch  != stamp->publish_epoch  ||
@@ -6714,9 +6732,16 @@ bool llama_rerot_mtp_is_stale(
             }
         }
     }
+    // Fallback search across episodes for sequences not explicitly bound in exec_bindings
     for (const auto & ep_kv : it->second.episodes) {
-        auto jt = ep_kv.second.view_stamps.find(seq_id);
-        if (jt != ep_kv.second.view_stamps.end()) {
+        const auto & ep_st = ep_kv.second;
+        auto jt = ep_st.view_stamps.find(seq_id);
+        if (jt != ep_st.view_stamps.end()) {
+            if (ep_st.publish_epoch > stamp->publish_epoch ||
+                ep_st.topology_epoch > stamp->topology_epoch ||
+                ep_st.layout_epoch > stamp->layout_epoch) {
+                return true;
+            }
             const auto & cur = jt->second;
             return cur.topology_epoch != stamp->topology_epoch ||
                    cur.publish_epoch  != stamp->publish_epoch  ||
@@ -6828,6 +6853,9 @@ bool llama_rerot_context_load_envelope(
         ep_st.layout_epoch = env.layout_epoch;
         ep_st.frontier_mode = env.frontier_mode;
         ep_st.view_stamps = std::move(env.stamps);
+        for (const auto & kv : ep_st.view_stamps) {
+            ctx_st.exec_bindings[kv.first] = {env.episode_id, 0, (int32_t) kv.first};
+        }
         ctx_st.episodes[env.episode_id] = std::move(ep_st);
         ctx_st.mem = ctx->get_memory();
         return true;

@@ -303,6 +303,18 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ctx.params.chat_parser_params.reasoning_in_content = ctx.params.stream && (reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY);
         }));
 
+    add((new field_str("reasoning_effort"))
+        ->set_desc("Reasoning effort: none, low, medium, high, xhigh, or max")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            const std::string effort = data.at("reasoning_effort").get<std::string>();
+            if (effort != "none" && effort != "low" && effort != "medium" &&
+                effort != "high" && effort != "xhigh" && effort != "max") {
+                throw std::invalid_argument(
+                    "expected one of: none, low, medium, high, xhigh, max");
+            }
+            ctx.params.reasoning_effort = effort;
+        }));
+
     add((new field_str("generation_prompt"))
         ->set_desc("Generation prompt appended to the chat template output")
         ->set_handler([&](field_eval_context & ctx, const json & data) {

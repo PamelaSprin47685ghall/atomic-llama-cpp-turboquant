@@ -928,6 +928,23 @@ json oaicompat_chat_params_parse(
 {
     json llama_params;
 
+    const auto parse_reasoning_effort = [&]() -> std::string {
+        if (!body.contains("reasoning_effort") || body.at("reasoning_effort").is_null()) {
+            return {};
+        }
+        if (!body.at("reasoning_effort").is_string()) {
+            throw std::invalid_argument("reasoning_effort must be a string");
+        }
+        const std::string effort = body.at("reasoning_effort").get<std::string>();
+        if (effort != "none" && effort != "low" && effort != "medium" &&
+            effort != "high" && effort != "xhigh" && effort != "max") {
+            throw std::invalid_argument(
+                "reasoning_effort must be one of: none, low, medium, high, xhigh, max");
+        }
+        return effort;
+    };
+    const std::string reasoning_effort = parse_reasoning_effort();
+
     auto tools = json_value(body, "tools", json());
     auto has_tools = tools.is_array() && !tools.empty();
     auto stream = json_value(body, "stream", false);
@@ -1120,12 +1137,13 @@ json oaicompat_chat_params_parse(
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
 
-    // Parse also the OAI "reasoning_effort": "none" specific value
-    if (body.contains("reasoning_effort")) {
-        auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
-        if (reasoning_effort == "none") {
-            inputs.enable_thinking = false;
-        } // other reasoning_effort values are model-specific and not yet handled
+    // OpenAI-compatible reasoning effort is authoritative over an equivalent
+    // template kwarg. Templates that understand reasoning_effort receive it
+    // verbatim; the generic reasoning-budget sampler below supplies a
+    // deterministic fallback for templates exposing thinking start/end tags.
+    if (!reasoning_effort.empty()) {
+        inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
+        inputs.enable_thinking = reasoning_effort != "none";
     }
 
     inputs.force_pure_content = opt.force_pure_content;
@@ -1157,13 +1175,41 @@ json oaicompat_chat_params_parse(
 
     llama_params["message_delimiters"] = chat_params.message_delimiters.to_json();
 
-    // Reasoning budget: pass parameters through to sampling layer.
-    // RERoT manages private thought exits under its episode-wide budget.
+    // Reasoning budget: explicit token budgets win. Native effort-aware chat
+    // templates receive reasoning_effort directly above. Only when a backend
+    // needs a legacy token budget do we translate named effort using the
+    // de-facto open-source compatibility ladder for budget-only models:
+    //   low=.20, medium=.50, high=.80, xhigh=.95, max=1.00.
+    // Cline keeps max distinct at 1.00; OpenRouter currently collapses xhigh
+    // and max to .95 to reserve answer space. We expose both names, so keeping
+    // them distinct is less surprising; the max_tokens-1 clamp below still
+    // reserves at least one token outside the thinking budget.
+    // This is NOT Anthropic's native semantics: current Claude effort is a
+    // soft behavioral signal, not a strict token allocation. Do not invent an
+    // absolute budget when the request has no finite output cap.
+    // RERoT continues to own its private random-ID lifecycle.
     if (!json_value(body, "rerot", false)) {
+        const bool explicit_budget =
+            (body.contains("reasoning_budget_tokens") && !body.at("reasoning_budget_tokens").is_null()) ||
+            (body.contains("thinking_budget_tokens") && !body.at("thinking_budget_tokens").is_null());
         int reasoning_budget = json_value(body, "reasoning_budget_tokens",
-                               json_value(body, "thinking_budget_tokens", -1));
-        if (reasoning_budget == -1) {
-            reasoning_budget = opt.reasoning_budget;
+                               json_value(body, "thinking_budget_tokens", opt.reasoning_budget));
+        if (!explicit_budget && !reasoning_effort.empty()) {
+            int output_budget = json_value(body, "max_completion_tokens",
+                                json_value(body, "max_tokens",
+                                json_value(body, "n_predict", opt.n_predict)));
+            if (reasoning_effort == "none") {
+                reasoning_budget = 0;
+            } else if (output_budget > 0) {
+                int ratio_per_mille = 200;
+                if (reasoning_effort == "medium") ratio_per_mille = 500;
+                if (reasoning_effort == "high")   ratio_per_mille = 800;
+                if (reasoning_effort == "xhigh")  ratio_per_mille = 950;
+                if (reasoning_effort == "max")    ratio_per_mille = 1000;
+                const int64_t mapped = (int64_t(output_budget) * ratio_per_mille) / 1000;
+                const int upper = std::max(1, std::min(128000, output_budget - 1));
+                reasoning_budget = std::min(upper, std::max(1024, int(mapped)));
+            }
         }
 
         if (!chat_params.thinking_end_tags.empty()) {

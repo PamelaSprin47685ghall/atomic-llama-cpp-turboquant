@@ -712,14 +712,18 @@ llama_rerot_query_layout llama_rerot_build_query_layout(
         bool visible = false;
         switch (meta.visibility) {
             case llama_rerot_visibility::public_live:
-                if (meta.frontier < reader.frontier) {
-                    visible = true;
-                } else if (meta.frontier == reader.frontier) {
-                    if (meta.node_id == reader.reader) {
-                        visible = key.owned_by_reader && key.storage_pos <= query_storage_pos;
-                    } else {
-                        visible = reader.frontier_mode == LLAMA_REROT_FRONTIER_STRONG;
-                    }
+                if (meta.node_id == reader.reader) {
+                    // A Lane's own causal history is never delayed by a peer
+                    // frontier policy. This includes its current decode row.
+                    visible = meta.frontier <= reader.frontier && key.owned_by_reader &&
+                              key.storage_pos <= query_storage_pos;
+                } else if (reader.frontier_mode == LLAMA_REROT_FRONTIER_STRONG) {
+                    // Strong means immediately after the frontier barrier,
+                    // not same-forward penetration.
+                    visible = meta.frontier < reader.frontier;
+                } else if (reader.frontier > 0) {
+                    // Lag1 is one additional committed-frontier delay.
+                    visible = meta.frontier < reader.frontier - 1;
                 }
                 break;
             case llama_rerot_visibility::private_control:

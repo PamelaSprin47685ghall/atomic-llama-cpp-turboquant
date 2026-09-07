@@ -177,6 +177,15 @@ std::string_view server_rerot_planner_grammar();
 // Eager grammar for one child: arbitrary text must eventually terminate with
 // that child's exact random delimiter before EOG can be sampled.
 std::string server_rerot_child_grammar(std::string_view close_marker);
+// Research-only, topic-independent scope/termination instruction. The caller
+// must inject it as PRIVATE control, never as shared text or a forced close.
+std::string server_rerot_child_contract(
+    std::string_view title,
+    std::string_view close_marker);
+std::string server_rerot_child_planner_prompt(std::string_view title);
+std::string server_rerot_child_worker_prompt(
+    std::string_view title,
+    std::string_view close_marker);
 
 struct server_rerot_hard_limits {
     // Zero means unbounded. When any bound is crossed the whole episode takes
@@ -275,6 +284,21 @@ struct server_pen {
     server_pen_state state = server_pen_state::free;
 };
 
+struct server_rerot_fence_row {
+    llama_token token = LLAMA_TOKEN_NULL;
+    llama_pos pos = -1;
+    llama_rerot_run_id run = LLAMA_REROT_RUN_INVALID;
+};
+
+struct server_rerot_fence_checkpoint {
+    std::vector<uint8_t> hand;
+    std::vector<server_rerot_fence_row> rows;
+    size_t cursor = 0;
+    bool prepared = false;
+
+    bool complete() const { return prepared && !rows.empty() && cursor == rows.size(); }
+};
+
 struct server_rerot_node_runtime {
     llama_rerot_node_id id = LLAMA_REROT_NODE_INVALID;
     // Pen binding (§§B.4.2, B.13 Phase 1). physical_slot aliases pen_id for backward compatibility
@@ -301,8 +325,7 @@ struct server_rerot_node_runtime {
         if (id.empty()) {
             return {};
         }
-        return "<" + std::string(id) +
-            " note=\"Start of private child work block.\">";
+        return "<" + std::string(id) + ">";
     }
     bool planner_armed = true;
     // Global FIFO key (§16.2). Assigned at fork publication from the current
@@ -318,6 +341,9 @@ struct server_rerot_node_runtime {
     std::vector<uint8_t> mtp_blob;
     // Shared fork hand seed (§§16.1, 16.4, B.6.4). Holds parent conv tail and private S.
     std::vector<uint8_t> hand_seed;
+    // Exact local frontier before the first tokenizer row of a possible
+    // closing marker. It travels with the logical Lane, not its physical pen.
+    server_rerot_fence_checkpoint fence;
     // Last installed frontier-view stamp for this Lane's exec seq (A.6 MTP
     // binding). All-zero means no view installed yet.
     llama_rerot_view_stamp view_stamp = {0, 0, 0};
@@ -555,6 +581,7 @@ public:
     // prefix may be injected before or after this transition, but ordinary
     // generated tokens are only legal once the node is RUNNING.
     bool complete_admission(uint64_t episode_id, llama_rerot_node_id node_id);
+    bool arm_planner(uint64_t episode_id, llama_rerot_node_id node_id);
 
     // Apply all EXIT_INTENTs after every token in a frontier has committed.
     // Simultaneous exits use stable tree-path ordering. If no queued, starting,
@@ -590,6 +617,16 @@ public:
         uint64_t episode_id,
         llama_rerot_node_id node_id,
         std::vector<uint32_t> * ordered_runs_out);
+
+    // Called before decoding a sampled row, after plan_generated_token.
+    // Records original token identities; false marker candidates are dropped.
+    bool track_fence_token(uint64_t episode_id, llama_rerot_node_id node_id,
+        const server_rerot_token_plan & plan, llama_token token);
+    bool prepare_final_fence(uint64_t episode_id, llama_rerot_node_id node_id);
+    std::optional<server_rerot_token_plan> plan_final_fence_token(
+        uint64_t episode_id, llama_rerot_node_id node_id) const;
+    bool commit_final_fence_token(uint64_t episode_id, llama_rerot_node_id node_id,
+        const server_rerot_token_plan & plan);
 
     // Serial tail transition (§22). Disables the parallel scheduler and pins
     // ordinary tool-call / body decode to the fence survivor. The survivor

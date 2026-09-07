@@ -6495,8 +6495,8 @@ struct ggml_tensor * ggml_gated_delta_net_rbb(
     const int64_t S_v = v->ne[0];
     const int64_t H = v->ne[1];
     const int64_t n_seqs = v->ne[3];
-    // The result packs native Lane readouts, one merged brain state, per-Lane
-    // hand residuals against that brain, then device-local work vectors for
+    // The result packs shared-brain-plus-hand readouts, one merged brain,
+    // evolved private hand overlays, then device-local work vectors for
     // the exact order-free Parallel Delta solve.
     const int64_t candidate_rows = S_v * n_seqs;
     const int64_t scratch_rows = 8 * n_seqs;
@@ -6509,6 +6509,11 @@ struct ggml_tensor * ggml_gated_delta_net_rbb(
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
     ggml_set_op_params_i32(result, 0, 1);
     ggml_set_op_params_i32(result, 1, 1);
+    // Explicit research-only key-coherence weighting, off by default.
+    // Coherence-normalized evidence is the mathematical contract. Raw
+    // redundant-evidence accumulation is available only as an explicit
+    // research override in the model graph builder.
+    ggml_set_op_params_i32(result, 2, 1);
 
     result->op     = GGML_OP_GATED_DELTA_NET;
     result->src[0] = q;
