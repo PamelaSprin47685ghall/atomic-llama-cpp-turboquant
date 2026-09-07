@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""Bounded, local-only llama-server probes and model-tokenized calibration.
+
+Uses only the Python standard library. Every launched server is stopped in a
+finally block. Results are measurements, not an automatic production approval.
+"""
+
+import argparse
+import contextlib
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import secrets
+import socket
+import struct
+import subprocess
+import threading
+import time
+import urllib.error
+import urllib.request
+
+
+def request(base, key, path, data=None, timeout=240):
+    req = urllib.request.Request(
+        base + path,
+        data=None if data is None else json.dumps(data).encode(),
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.load(response)
+
+
+@contextlib.contextmanager
+def server(args, config, result):
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    key = secrets.token_hex(16)
+    base = "http://127.0.0.1:" + str(port)
+    command = [str(args.server.resolve()), "-m", str(args.model.resolve()),
+               "-ngl", "999", "-np", "1", "-fa", "on", "--fit", "off",
+               "-c", str(config["ctx"]), "--total-kv", str(config.get("kv", config["ctx"])),
+               "-b", str(config["batch"]), "-ub", str(config["ubatch"]),
+               "-ctk", config["k"], "-ctv", config["v"], "-t", "4", "-tb", "4",
+               "--host", "127.0.0.1", "--port", str(port), "--api-key", key,
+               "-lv", "4"] + config.get("extra", [])
+    result["command"] = ["<ephemeral-key>" if v == key else v for v in command]
+    result["config"] = config
+    env = dict(os.environ, LD_LIBRARY_PATH=str(args.server.resolve().parent),
+               TURBO_AUTO_ASYMMETRIC="0")
+    env.update(config.get("env", {}))
+    stop = threading.Event()
+    samples = []
+    errors = []
+
+    def monitor():
+        while not stop.is_set():
+            try:
+                value = subprocess.check_output([
+                    "nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"
+                ], text=True, timeout=4)
+                samples.append(int(value.splitlines()[0]))
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                errors.append(str(exc))
+            stop.wait(0.5)
+
+    log_path = args.out / (config["name"] + ".server.log")
+    result["server_log"] = str(log_path)
+    started = time.monotonic()
+    proc = None
+    watcher = threading.Thread(target=monitor, daemon=True)
+    watcher.start()
+    try:
+        with log_path.open("w") as log:
+            proc = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env)
+            deadline = time.monotonic() + args.startup_timeout
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    raise RuntimeError("server exited during startup: " + str(proc.returncode))
+                try:
+                    if request(base, key, "/health", timeout=2).get("status") == "ok":
+                        break
+                except (OSError, urllib.error.URLError, ValueError):
+                    pass
+                time.sleep(0.25)
+            else:
+                raise TimeoutError("server health deadline exceeded")
+            result["startup_seconds"] = time.monotonic() - started
+            yield base, key
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+        stop.set()
+        watcher.join(timeout=6)
+        result["peak_gpu_mib"] = max(samples) if samples else None
+        result["gpu_samples"] = len(samples)
+        result["gpu_monitor_errors"] = errors
+        result["elapsed_seconds"] = time.monotonic() - started
+
+
+def prepare(args, base, key, result):
+    text = args.corpus.read_text(encoding="utf-8")
+    if not text.strip():
+        raise ValueError("calibration corpus is empty")
+    # Training text only; evaluation must use a different file/split.
+    documents = [text[i:i + 12000] for i in range(0, min(len(text), 96000), 12000)]
+    trie = args.out / (result["config"]["name"] + ".calibration-trie")
+    trie.mkdir(exist_ok=True)
+    nodes = bytearray(struct.pack("<8sIIQ", b"CLTNOD01", 1, 16, 0))
+    reqs = bytearray(struct.pack("<8sIIQ", b"CLTREQ01", 1, 24, 0))
+    count = 0
+    lengths = []
+    edges = {}
+    for document in documents:
+        tokens = request(base, key, "/tokenize", {"content": document, "add_special": True})["tokens"]
+        tokens = tokens[:1024]
+        if not tokens:
+            continue
+        parent = 0
+        for token in tokens:
+            edge = (parent, token)
+            if edge not in edges:
+                nodes.extend(struct.pack("<QiI", parent, token, 0))
+                count += 1
+                edges[edge] = count
+            parent = edges[edge]
+        reqs.extend(struct.pack("<QIIQ", parent, len(tokens), 0, 0))
+        lengths.append(len(tokens))
+    if not lengths:
+        raise ValueError("calibration tokenizer returned no tokens")
+    (trie / "nodes-000000.bin").write_bytes(nodes)
+    (trie / "requests-000000.bin").write_bytes(reqs)
+    result["calibration"] = {"nodes": count, "lengths": lengths, "trie": str(trie),
+                             "source": str(args.corpus),
+                             "source_sha256": hashlib.sha256(args.corpus.read_bytes()).hexdigest()}
+
+
+def probe(args, base, key, result):
+    result["requests"] = []
+    text = args.corpus.read_text(encoding="utf-8") if args.corpus else (
+        "A careful test records its inputs and checks its outputs. " * 4096)
+    tokens = request(base, key, "/tokenize", {"content": text, "add_special": True})["tokens"]
+    if len(tokens) < args.prompt_tokens:
+        raise ValueError("corpus is shorter than the requested prompt")
+    for repeat in range(args.repeats):
+        started = time.monotonic()
+        response = request(base, key, "/completion", {
+            "prompt": tokens[:args.prompt_tokens], "n_predict": args.predict,
+            "temperature": 0, "seed": 1234, "cache_prompt": False,
+            "ignore_eos": True, "n_probs": 0,
+        }, timeout=args.request_timeout)
+        response["wall_seconds"] = time.monotonic() - started
+        response["case"] = "prefill-decode-" + str(repeat)
+        result["requests"].append(response)
+        timings = response.get("timings", {})
+        if response.get("tokens_predicted") != args.predict:
+            raise RuntimeError("completion did not generate the requested token budget")
+        for field in ("prompt_per_second", "predicted_per_second"):
+            value = timings.get(field)
+            if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise RuntimeError("missing or invalid timing: " + field)
+        print(json.dumps({"config": result["config"]["name"], "repeat": repeat,
+                          "timings": response.get("timings")}), flush=True)
+    questions = [] if args.no_chat else [
+        ("arithmetic", "只回答计算结果，不要解释：17乘以23等于多少？", [391]),
+        ("extract", "记录：北仓有7箱茶，南仓有12箱茶。只输出南仓的箱数，不要解释。", [12]),
+        ("sort", "Sort these integers in ascending order. Output only the list: 7, -3, 11, 0, 2.", [-3, 0, 2, 7, 11]),
+    ]
+    if args.needle_tokens:
+        if len(tokens) < args.needle_tokens:
+            raise ValueError("corpus is shorter than the requested retrieval fixture")
+        filler = request(base, key, "/detokenize", {"tokens": tokens[:args.needle_tokens]})["content"]
+        fact = "档案中的唯一验收编号为593174。"
+        questions.append(("retrieval", "请记住下列档案事实。" + fact + "\n下面是无关资料：\n" +
+                          filler + "\n请只输出档案的六位验收编号，不要解释。", [593174]))
+    result["quality_checks"] = []
+    for name, question, expected in questions:
+        response = request(base, key, "/v1/chat/completions", {
+            "messages": [{"role": "user", "content": question}],
+            "temperature": 0, "seed": 1234, "max_tokens": 384,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }, timeout=args.request_timeout)
+        response["case"] = name
+        choices = response.get("choices", [])
+        if len(choices) != 1 or not isinstance(choices[0], dict):
+            result["requests"].append(response)
+            raise RuntimeError("chat response must contain exactly one choice")
+        choice = choices[0]
+        content = choice.get("message", {}).get("content", "") or ""
+        actual = [int(x) for x in re.findall(r"-?\d+", content)]
+        result["quality_checks"].append({"case": name, "expected": expected, "actual": actual,
+                                        "finish_reason": choice.get("finish_reason"),
+                                        "passed": actual == expected and choice.get("finish_reason") == "stop"})
+        result["requests"].append(response)
+    # One final request also verifies recovery after the preceding workloads.
+    result["final_health"] = request(base, key, "/health", timeout=5)
+    if result["final_health"].get("status") != "ok":
+        raise RuntimeError("server was not healthy after the probes")
+    if any(not check["passed"] for check in result["quality_checks"]):
+        raise RuntimeError("quality checks failed; see saved per-case results")
+
+
+def validate_configs(configs):
+    """Reject ambiguous matrices before starting servers or writing results."""
+    if not isinstance(configs, list) or not configs:
+        raise ValueError("configs must be a nonempty list")
+    names = set()
+    types = {"f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl",
+             "q5_0", "q5_1", "turbo2", "turbo3", "turbo4"}
+    for config in configs:
+        if not isinstance(config, dict):
+            raise ValueError("each config must be an object")
+        name = config.get("name", "")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            raise ValueError("config names must use ASCII letters, digits, hyphens or underscores")
+        if name in names:
+            raise ValueError("duplicate config name: " + name)
+        names.add(name)
+        for field in ("ctx", "batch", "ubatch"):
+            if type(config.get(field)) is not int or config[field] <= 0:
+                raise ValueError(field + " must be a positive integer")
+        kv = config.get("kv", config["ctx"])
+        if kv != "auto" and (type(kv) is not int or kv <= 0):
+            raise ValueError("kv must be a positive integer or auto")
+        for field in ("k", "v"):
+            if not isinstance(config.get(field), str) or config[field] not in types:
+                raise ValueError("unsupported KV type for " + field)
+        extra = config.get("extra", [])
+        if not isinstance(extra, list) or not all(isinstance(arg, str) for arg in extra):
+            raise ValueError("extra must be a list of argument strings")
+        # Keep probes local and authenticated even with caller-supplied flags.
+        reserved = {"--host", "--port", "--api-key", "--api-key-file"}
+        if any(arg.split("=", 1)[0].replace("_", "-") in reserved for arg in extra):
+            raise ValueError("extra may not override the probe listener or authentication")
+        env = config.get("env", {})
+        if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
+            raise ValueError("env must map strings to strings")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", choices=["prepare", "probe"])
+    parser.add_argument("--server", type=Path, required=True)
+    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--configs", type=Path)
+    parser.add_argument("--corpus", type=Path)
+    parser.add_argument("--prompt-tokens", type=int, default=2048)
+    parser.add_argument("--predict", type=int, default=64)
+    parser.add_argument("--repeats", type=int, default=2)
+    parser.add_argument("--no-chat", action="store_true", help="throughput/stress only; no short QA checks")
+    parser.add_argument("--needle-tokens", type=int, default=0, help="additional long-context retrieval fixture")
+    parser.add_argument("--startup-timeout", type=int, default=180)
+    parser.add_argument("--request-timeout", type=int, default=240)
+    args = parser.parse_args(argv)
+    if not args.server.is_file() or not args.model.is_file():
+        parser.error("server and model must be existing files")
+    if args.mode == "prepare" and args.corpus is None:
+        parser.error("prepare requires an explicit training corpus")
+    if min(args.prompt_tokens, args.predict, args.repeats, args.startup_timeout, args.request_timeout) <= 0:
+        parser.error("token counts, repeat counts and timeouts must be positive")
+    if args.needle_tokens < 0:
+        parser.error("needle token count cannot be negative")
+    try:
+        configs = json.loads(args.configs.read_text(encoding="utf-8")) if args.configs else [
+            {"name": "baseline", "ctx": 8192, "batch": 256, "ubatch": 256, "k": "turbo4", "v": "turbo2"}]
+        validate_configs(configs)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+    args.out.mkdir(parents=True, exist_ok=True)
+    failed = False
+    for config in configs:
+        result = {"started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        try:
+            with server(args, config, result) as (base, key):
+                (prepare if args.mode == "prepare" else probe)(args, base, key, result)
+            result["status"] = "completed"
+        except Exception as exc:
+            failed = True
+            result["status"] = "failed"
+            result["error"] = str(exc)
+        finally:
+            (args.out / (config["name"] + ".json")).write_text(
+                json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(json.dumps({k: result.get(k) for k in ["config", "status", "error", "peak_gpu_mib", "elapsed_seconds"]}), flush=True)
+    return int(failed)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

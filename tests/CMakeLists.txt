@@ -116,6 +116,15 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+# The probe runner must fail on failed checks, independently of GPU/model
+# availability. Its tests use only the Python standard library.
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if (Python3_Interpreter_FOUND)
+    add_test(NAME test-nanbeige-audit
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-nanbeige-audit.py)
+    set_tests_properties(test-nanbeige-audit PROPERTIES LABELS "python" TIMEOUT 30)
+endif()
+
 # build test-tokenizer-0 target once and add many tests
 add_executable(test-turbo-quant test-turbo-quant.c)
 target_include_directories(test-turbo-quant PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
