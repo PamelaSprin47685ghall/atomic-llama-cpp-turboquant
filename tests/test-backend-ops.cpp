@@ -9985,12 +9985,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // decode, including mixed Turbo storage. Missing CM2 decoders used to
     // return zero silently for every Turbo format on NVIDIA.
     for (ggml_type kt : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
-        for (ggml_type vt : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0, GGML_TYPE_F16}) {
+        for (ggml_type vt : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0, GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
             for (int nb : {1, 128}) {
                 test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {6, 1}, 512, nb,
                             true, false, 0, 0, GGML_PREC_F32, kt, vt));
             }
         }
+    }
+    // Boundary-V mode keeps the first/last layers at Q8_0 even for a Turbo2
+    // request. Include the first full prefill microbatch geometry as well.
+    for (ggml_type vt : {GGML_TYPE_TURBO2_0, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {6, 1}, 256, 256,
+                    true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, vt));
     }
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_F16));
