@@ -25,7 +25,12 @@
 #include "flashprefill-interface.h"
 
 layout(local_size_x_id = FP_SPEC_WGSIZE, local_size_y = 1, local_size_z = 1) in;
-layout(constant_id = FP_SPEC_WGSIZE) const uint WorkGroupSize = 64;
+// SELECT is intentionally scalar: all phase-0/phase-1 work is owned by
+// lane 0 and the shader has no subgroup or workgroup barrier dependency.
+// The SELECT pipeline does not override this specialization constant, so a
+// 64-lane default reserved two NVIDIA warps while 63 lanes returned at the
+// entry guard. POOL/ATTN use separately specialized workgroup sizes.
+layout(constant_id = FP_SPEC_WGSIZE) const uint WorkGroupSize = 1;
 
 layout(binding = FP_BIND_Q) readonly buffer QBUF { float data_q[]; };
 layout(binding = FP_BIND_POOL) readonly buffer POOLB { float data_pool[]; };
