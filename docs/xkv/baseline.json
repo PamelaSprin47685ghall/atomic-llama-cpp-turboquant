@@ -1,0 +1,102 @@
+{
+  "version": 1,
+  "description": "Frozen production baseline specification, historical/expected fingerprints, candidate configurations, and quality/compression gates for xKV-SR integration",
+  "target_commit": "5298ea46061c4780d173de866bdbba42f5918135",
+  "model": {
+    "name": "Ornith-1.5-35B-Uncensored-YMQ-S-MTP",
+    "expected_path": "/opt/llama/data/Ornith-1.5-35B-Uncensored-YMQ-S-MTP.gguf",
+    "notes": "Model architecture, layer counts, dimensions, and GQA shapes below are candidate specifications from repository documentation; unverified locally and marked not_evaluated until measured directly.",
+    "architecture_candidate": "unknown",
+    "full_attention_layers_candidate": [3, 7, 11, 15, 19, 23, 27, 31, 35, 39],
+    "full_attention_layer_count_candidate": 10,
+    "local_model_file_present": "not_evaluated",
+    "measured_architecture": "not_evaluated",
+    "measured_n_layer": "not_evaluated",
+    "measured_n_head": "not_evaluated",
+    "measured_n_head_kv": "not_evaluated",
+    "measured_d_k": "not_evaluated",
+    "measured_d_v": "not_evaluated",
+    "measured_head_dim": "not_evaluated",
+    "measured_rotary_dim": "not_evaluated"
+  },
+  "deployed_artifacts": {
+    "server_binary": {
+      "expected_path": "/opt/llama/bin/llama-server",
+      "historical_expected_sha256": "9fcd58b10b9b26c80482f1087b1e53a46933818ed81098aca06b664edc7e7694",
+      "historical_build_path": "build-vulkan-localhost/bin/llama-server",
+      "notes": "Server binary SHA256 is a historical validation reference from AGENTS.md; current local deployed binary is not asserted as verified ground truth.",
+      "local_binary_present": "not_evaluated",
+      "local_binary_sha256_match": "not_evaluated"
+    },
+    "triattention_calibration": {
+      "expected_path": "/opt/llama/data/ornith-1.5-35b.triattention",
+      "historical_expected_sha256": "e95dae507d1f4a64e29be160c5281f8a4308a3332dc9c9176e1a3a0af32e50e2",
+      "historical_expected_file_size": 83288,
+      "historical_expected_format_version": 2,
+      "historical_expected_rope_style": 0,
+      "historical_expected_rotary_dim": 64,
+      "historical_expected_freq_count": 32,
+      "historical_expected_sampled_heads": 160,
+      "historical_rejected_legacy_sha256": "7fbfcdcfc7903e11efba96d7c13bea0ae9d60ff81c75475d54ee613bae2b3cc7",
+      "notes": "Calibration SHA256 is the expected trusted artifact from AGENTS.md; the rejected legacy hash is recorded for fail-closed detection; local presence and exact hash match remain not_evaluated.",
+      "local_calibration_present": "not_evaluated",
+      "local_calibration_sha256_match": "not_evaluated"
+    }
+  },
+  "runtime_baseline_specification": {
+    "backend": "vulkan",
+    "k_type": "turbo4_0",
+    "v_type": "turbo2_0",
+    "triattention": {
+      "enabled": true,
+      "target_residency_ratio": 0.09375,
+      "target_residency_fraction": "3/32",
+      "recent_window": 128,
+      "future_offsets": "mean",
+      "head_aggregation": "normalized_max_union",
+      "local_clustering": "max_pool_k5",
+      "protect_prefill": false,
+      "experimental_ratio_override_allowed": false
+    },
+    "rerot": {
+      "enabled": true,
+      "frontier": "strong"
+    },
+    "mtp": {
+      "enabled": true,
+      "draft_max": 2
+    }
+  },
+  "gate_thresholds": {
+    "min_factored_byte_coverage": 0.75,
+    "min_saved_fraction": 0.10,
+    "allow_dense_mirror": false,
+    "max_workspace_peak_ratio_vs_baseline": 1.15,
+    "quality_ppl_max_degradation_pct": 5.0,
+    "quality_context_scaling_min_ratio": 0.95,
+    "require_speculative_acceptance_parity": true,
+    "require_triattention_compatibility": true,
+    "require_rerot_compatibility": true,
+    "require_state_code_stream_exact": true,
+    "require_allocator_byte_accounting": true,
+    "require_fingerprints": true
+  },
+  "local_evidence": {
+    "model_inspection": "not_evaluated",
+    "server_binary_verification": "not_evaluated",
+    "triattention_calibration_verification": "not_evaluated",
+    "fullkv_vs_triattention_quality_ab": "not_evaluated",
+    "aime24_25_score": "not_evaluated",
+    "math_500_score": "not_evaluated",
+    "long_context_retrieval": "not_evaluated",
+    "multi_turn_chat": "not_evaluated",
+    "code_repo_qa": "not_evaluated",
+    "production_auto_fit_full_slot_pressure": "not_evaluated",
+    "shared_prefix_three_branch_union": "not_evaluated",
+    "recurrent_only_pressure_reclaim_bypass": "not_evaluated",
+    "sparse_state_ram_swap_matrix": "not_evaluated",
+    "multi_hour_soak_stability": "not_evaluated",
+    "four_stream_vulkan_reconstruction": "not_evaluated",
+    "landmark_turbo4_quality_gate": "not_evaluated"
+  }
+}

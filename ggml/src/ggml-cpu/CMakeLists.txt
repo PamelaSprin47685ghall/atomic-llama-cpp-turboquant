@@ -52,6 +52,11 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/vec.cpp
         ggml-cpu/ops.h
         ggml-cpu/ops.cpp
+        ggml-cpu/ggml-cpu-xkv.cpp
+        ggml-cpu/ggml-cpu-xkv-attention.cpp
+        ggml-cpu/ggml-cpu-xkv-factor.cpp
+        ggml-cpu/ggml-cpu-xkv-landmark.cpp
+        ggml-cpu/ggml-cpu-xkv-landmark-build.cpp
         ggml-cpu/ggml-cpu-rerot.cpp
         )
 

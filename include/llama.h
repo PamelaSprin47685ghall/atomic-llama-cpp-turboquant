@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <string.h>
 
 #ifdef LLAMA_SHARED
 #    if defined(_WIN32) && !defined(__MINGW32__)
@@ -240,6 +241,224 @@ extern "C" {
 
     LLAMA_API const char * llama_rerot_frontier_mode_name(enum llama_rerot_frontier_mode mode);
 
+    // XKV §16 modes and options
+    enum llama_xkv_mode {
+        LLAMA_XKV_MODE_OFF    = 0,
+        LLAMA_XKV_MODE_SHADOW = 1,
+        LLAMA_XKV_MODE_DENSE  = 2,
+        LLAMA_XKV_MODE_SR     = 3,
+    };
+
+    enum llama_xkv_storage_profile {
+        LLAMA_XKV_STORAGE_PROFILE_REFERENCE              = 0,
+        LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS             = 1,
+        LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS   = 2,
+    };
+
+    enum llama_xkv_source {
+        LLAMA_XKV_SOURCE_DECODED_HOT     = 0,
+        LLAMA_XKV_SOURCE_PREROPE_CAPTURE = 1,
+    };
+
+    enum llama_xkv_factor_balance {
+        LLAMA_XKV_FACTOR_BALANCE_UPSTREAM = 0,
+        LLAMA_XKV_FACTOR_BALANCE_SQRT     = 1,
+        LLAMA_XKV_FACTOR_BALANCE_DIAGONAL = 2,
+    };
+
+    enum llama_xkv_landmark_refine {
+        LLAMA_XKV_LANDMARK_REFINE_NONE     = 0,
+        LLAMA_XKV_LANDMARK_REFINE_BOUNDARY = 1,
+    };
+
+    enum llama_xkv_factorizer {
+        LLAMA_XKV_FACTORIZER_CPU_REFERENCE = 0,
+        LLAMA_XKV_FACTORIZER_VULKAN        = 1,
+        LLAMA_XKV_FACTORIZER_VULKAN_HYBRID = 2,
+        LLAMA_XKV_FACTORIZER_CUDA          = 3,
+    };
+
+    struct llama_xkv_params {
+        enum llama_xkv_mode            mode;
+        enum llama_xkv_storage_profile storage_profile;
+        uint32_t                       group_size;
+        uint32_t                       rank_k;
+        uint32_t                       rank_v;
+        uint32_t                       segment_tokens;
+        uint32_t                       chunk_tokens;
+        uint32_t                       sr_budget;
+        enum llama_xkv_source          source;
+        enum ggml_type                 factor_a_k;
+        enum ggml_type                 factor_b_k;
+        enum ggml_type                 factor_a_v;
+        enum ggml_type                 factor_b_v;
+        enum llama_xkv_factor_balance  factor_balance;
+        enum ggml_type                 landmark_type;
+        enum llama_xkv_landmark_refine landmark_refine;
+        uint32_t                       landmark_refine_max_rows;
+        uint32_t                       workspace_mib;
+        uint32_t                       decode_cache_mib;
+        uint32_t                       store_mib;
+        uint64_t                       seed;
+        double                         min_saving;
+        double                         min_factor_coverage;
+        enum llama_xkv_factorizer      factorizer;
+    };
+
+    static inline const char * llama_xkv_mode_name(enum llama_xkv_mode mode) {
+        switch (mode) {
+            case LLAMA_XKV_MODE_OFF:    return "off";
+            case LLAMA_XKV_MODE_SHADOW: return "shadow";
+            case LLAMA_XKV_MODE_DENSE:  return "dense";
+            case LLAMA_XKV_MODE_SR:     return "sr";
+        }
+        return "unknown";
+    }
+
+    static inline const char * llama_xkv_storage_profile_name(enum llama_xkv_storage_profile profile) {
+        switch (profile) {
+            case LLAMA_XKV_STORAGE_PROFILE_REFERENCE:            return "reference";
+            case LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS:           return "tq-factors";
+            case LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS: return "tq-factors-landmarks";
+        }
+        return "unknown";
+    }
+
+    static inline const char * llama_xkv_source_name(enum llama_xkv_source source) {
+        switch (source) {
+            case LLAMA_XKV_SOURCE_DECODED_HOT:     return "decoded-hot";
+            case LLAMA_XKV_SOURCE_PREROPE_CAPTURE: return "prerope-capture";
+        }
+        return "unknown";
+    }
+
+    static inline const char * llama_xkv_factor_balance_name(enum llama_xkv_factor_balance balance) {
+        switch (balance) {
+            case LLAMA_XKV_FACTOR_BALANCE_UPSTREAM: return "upstream";
+            case LLAMA_XKV_FACTOR_BALANCE_SQRT:     return "sqrt";
+            case LLAMA_XKV_FACTOR_BALANCE_DIAGONAL: return "diagonal";
+        }
+        return "unknown";
+    }
+
+    static inline const char * llama_xkv_landmark_refine_name(enum llama_xkv_landmark_refine refine) {
+        switch (refine) {
+            case LLAMA_XKV_LANDMARK_REFINE_NONE:     return "none";
+            case LLAMA_XKV_LANDMARK_REFINE_BOUNDARY: return "boundary";
+        }
+        return "unknown";
+    }
+
+    static inline const char * llama_xkv_factorizer_name(enum llama_xkv_factorizer factorizer) {
+        switch (factorizer) {
+            case LLAMA_XKV_FACTORIZER_CPU_REFERENCE: return "cpu-reference";
+            case LLAMA_XKV_FACTORIZER_VULKAN:        return "vulkan";
+            case LLAMA_XKV_FACTORIZER_VULKAN_HYBRID: return "vulkan-hybrid";
+            case LLAMA_XKV_FACTORIZER_CUDA:          return "cuda";
+        }
+        return "unknown";
+    }
+
+    // Effective XKV residency predicate (single source of truth): device-owned
+    // uploads happen only for production TQ profiles on a device factorizer.
+    // Every other combination — reference profile, CPU reference factorizer,
+    // or unknown values — is host-resident. Fit charging, runtime residency
+    // expectations, and metrics residency splits must all derive from this,
+    // never from the storage profile alone (tq-* + cpu-reference is host).
+    static inline bool llama_xkv_profile_is_device_owned(
+            enum llama_xkv_storage_profile profile,
+            enum llama_xkv_factorizer factorizer) {
+        const bool tq_profile =
+            profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS ||
+            profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS;
+        const bool device_factorizer =
+            factorizer == LLAMA_XKV_FACTORIZER_VULKAN ||
+            factorizer == LLAMA_XKV_FACTORIZER_VULKAN_HYBRID ||
+            factorizer == LLAMA_XKV_FACTORIZER_CUDA;
+        return tq_profile && device_factorizer;
+    }
+
+    static inline enum llama_xkv_mode llama_xkv_mode_from_str(const char * str) {
+        if (!str)                       { return LLAMA_XKV_MODE_OFF;    }
+        if (strcmp(str, "off") == 0)    { return LLAMA_XKV_MODE_OFF;    }
+        if (strcmp(str, "shadow") == 0) { return LLAMA_XKV_MODE_SHADOW; }
+        if (strcmp(str, "dense") == 0)  { return LLAMA_XKV_MODE_DENSE;  }
+        if (strcmp(str, "sr") == 0)     { return LLAMA_XKV_MODE_SR;     }
+        return (enum llama_xkv_mode)(-1);
+    }
+
+    static inline enum llama_xkv_storage_profile llama_xkv_storage_profile_from_str(const char * str) {
+        if (!str)                                     { return LLAMA_XKV_STORAGE_PROFILE_REFERENCE;            }
+        if (strcmp(str, "reference") == 0)            { return LLAMA_XKV_STORAGE_PROFILE_REFERENCE;            }
+        if (strcmp(str, "tq-factors") == 0)           { return LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS;           }
+        if (strcmp(str, "tq-factors-landmarks") == 0) { return LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS; }
+        return (enum llama_xkv_storage_profile)(-1);
+    }
+
+    static inline enum llama_xkv_source llama_xkv_source_from_str(const char * str) {
+        if (!str)                                { return LLAMA_XKV_SOURCE_DECODED_HOT;     }
+        if (strcmp(str, "decoded-hot") == 0)     { return LLAMA_XKV_SOURCE_DECODED_HOT;     }
+        if (strcmp(str, "prerope-capture") == 0) { return LLAMA_XKV_SOURCE_PREROPE_CAPTURE; }
+        return (enum llama_xkv_source)(-1);
+    }
+
+    static inline enum llama_xkv_factor_balance llama_xkv_factor_balance_from_str(const char * str) {
+        if (!str)                         { return LLAMA_XKV_FACTOR_BALANCE_UPSTREAM; }
+        if (strcmp(str, "upstream") == 0) { return LLAMA_XKV_FACTOR_BALANCE_UPSTREAM; }
+        if (strcmp(str, "sqrt") == 0)     { return LLAMA_XKV_FACTOR_BALANCE_SQRT;     }
+        if (strcmp(str, "diagonal") == 0) { return LLAMA_XKV_FACTOR_BALANCE_DIAGONAL; }
+        return (enum llama_xkv_factor_balance)(-1);
+    }
+
+    static inline enum llama_xkv_landmark_refine llama_xkv_landmark_refine_from_str(const char * str) {
+        if (!str)                         { return LLAMA_XKV_LANDMARK_REFINE_NONE;     }
+        if (strcmp(str, "none") == 0)     { return LLAMA_XKV_LANDMARK_REFINE_NONE;     }
+        if (strcmp(str, "boundary") == 0) { return LLAMA_XKV_LANDMARK_REFINE_BOUNDARY; }
+        return (enum llama_xkv_landmark_refine)(-1);
+    }
+
+    static inline enum llama_xkv_factorizer llama_xkv_factorizer_from_str(const char * str) {
+        if (!str)                              { return LLAMA_XKV_FACTORIZER_CPU_REFERENCE; }
+        if (strcmp(str, "cpu-reference") == 0) { return LLAMA_XKV_FACTORIZER_CPU_REFERENCE; }
+        if (strcmp(str, "vulkan") == 0)        { return LLAMA_XKV_FACTORIZER_VULKAN;        }
+        if (strcmp(str, "vulkan-hybrid") == 0) { return LLAMA_XKV_FACTORIZER_VULKAN_HYBRID; }
+        if (strcmp(str, "cuda") == 0)          { return LLAMA_XKV_FACTORIZER_CUDA;          }
+        return (enum llama_xkv_factorizer)(-1);
+    }
+
+    static inline bool llama_xkv_is_enabled(enum llama_xkv_mode mode) {
+        return mode != LLAMA_XKV_MODE_OFF;
+    }
+
+    static inline struct llama_xkv_params llama_xkv_default_params(void) {
+        struct llama_xkv_params result;
+        result.mode                     = LLAMA_XKV_MODE_OFF;
+        result.storage_profile          = LLAMA_XKV_STORAGE_PROFILE_REFERENCE;
+        result.group_size               = 4;
+        result.rank_k                   = 384;
+        result.rank_v                   = 576;
+        result.segment_tokens           = 4096;
+        result.chunk_tokens             = 8;
+        result.sr_budget                = 0;
+        result.source                   = LLAMA_XKV_SOURCE_DECODED_HOT;
+        result.factor_a_k               = GGML_TYPE_TURBO4_0;
+        result.factor_b_k               = GGML_TYPE_TURBO4_0;
+        result.factor_a_v               = GGML_TYPE_TURBO4_0;
+        result.factor_b_v               = GGML_TYPE_TURBO4_0;
+        result.factor_balance           = LLAMA_XKV_FACTOR_BALANCE_UPSTREAM;
+        result.landmark_type            = GGML_TYPE_Q8_0;
+        result.landmark_refine          = LLAMA_XKV_LANDMARK_REFINE_NONE;
+        result.landmark_refine_max_rows = 64;
+        result.workspace_mib            = 256;
+        result.decode_cache_mib         = 64;
+        result.store_mib                = 0;
+        result.seed                     = 6362273814452121649ULL; // 0x584b565352303031 ("XKVSR001")
+        result.min_saving               = 0.10;
+        result.min_factor_coverage      = 0.50;
+        result.factorizer               = LLAMA_XKV_FACTORIZER_CPU_REFERENCE;
+        return result;
+    }
+
     // TODO: simplify (https://github.com/ggml-org/llama.cpp/pull/9294#pullrequestreview-2286561979)
     typedef struct llama_token_data {
         llama_token id; // token id
@@ -447,6 +666,31 @@ extern "C" {
         // Initialized by llama_context_default_params(); copied by value from
         // common_params by common_context_params_to_llama().
         struct llama_flashprefill_config flashprefill;
+        // XKV (§16) parameters
+        enum llama_xkv_mode            xkv_mode;
+        enum llama_xkv_storage_profile xkv_storage_profile;
+        uint32_t                       xkv_group_size;
+        uint32_t                       xkv_rank_k;
+        uint32_t                       xkv_rank_v;
+        uint32_t                       xkv_segment_tokens;
+        uint32_t                       xkv_chunk_tokens;
+        uint32_t                       xkv_sr_budget;
+        enum llama_xkv_source          xkv_source;
+        enum ggml_type                 xkv_factor_a_k;
+        enum ggml_type                 xkv_factor_b_k;
+        enum ggml_type                 xkv_factor_a_v;
+        enum ggml_type                 xkv_factor_b_v;
+        enum llama_xkv_factor_balance  xkv_factor_balance;
+        enum ggml_type                 xkv_landmark_type;
+        enum llama_xkv_landmark_refine xkv_landmark_refine;
+        uint32_t                       xkv_landmark_refine_max_rows;
+        uint32_t                       xkv_workspace_mib;
+        uint32_t                       xkv_decode_cache_mib;
+        uint32_t                       xkv_store_mib;
+        uint64_t                       xkv_seed;
+        double                         xkv_min_saving;
+        double                         xkv_min_factor_coverage;
+        enum llama_xkv_factorizer      xkv_factorizer;
     };
 
     struct llama_model_tensor_override {
@@ -677,6 +921,13 @@ extern "C" {
     // Returns the total size of all the tensors in the model in bytes
     LLAMA_API uint64_t llama_model_size(const struct llama_model * model);
 
+    // Exact source-artifact content SHA-256 (cached after first computation).
+    // Writes 32 bytes to out and returns true on success; returns false and
+    // leaves out untouched when the source bytes are unavailable (e.g.
+    // memory/file-object loads). Content identity only: never expose or
+    // compare absolute paths as model identity.
+    LLAMA_API bool llama_model_source_artifact_sha256(const struct llama_model * model, uint8_t out_sha256[32]);
+
     // Get the default chat template. Returns nullptr if not available
     // If name is NULL, returns the default chat template
     LLAMA_API const char * llama_model_chat_template(const struct llama_model * model, const char * name);
@@ -774,7 +1025,15 @@ extern "C" {
 
     // Clear the memory contents
     // If data == true, the data buffers will also be cleared together with the metadata
+    // Legacy entry: logs an explicit refusal and returns unchanged on
+    // failure. Never throws.
     LLAMA_API void llama_memory_clear(
+            llama_memory_t mem,
+                      bool data);
+
+    // Failure-reporting clear: returns false (with no exception escaping)
+    // when the clear is refused; true means every subsystem cleared.
+    LLAMA_API bool llama_memory_try_clear(
             llama_memory_t mem,
                       bool data);
 
@@ -1140,6 +1399,233 @@ extern "C" {
         uint32_t capacity;
         uint32_t used;
     };
+
+    // Stable limiting-reason enum for the admission snapshot below.
+    // Values are part of the public ABI: never renumber, only append.
+    enum llama_memory_limit_reason {
+        LLAMA_MEMORY_LIMIT_NONE          = 0, // unknown snapshot: no admission info
+        LLAMA_MEMORY_LIMIT_LOGICAL_CELLS = 1, // logical cell registry is the tightest bound
+        LLAMA_MEMORY_LIMIT_HOT_SLOTS     = 2, // hot backing free slots are the tightest bound
+        LLAMA_MEMORY_LIMIT_FACTOR_STORE  = 3, // factor store token bound is the tightest
+        LLAMA_MEMORY_LIMIT_WORKSPACE     = 4, // workspace token bound is the tightest
+        LLAMA_MEMORY_LIMIT_RECURRENT     = 5, // reserved: recurrent slots gate new sequences only
+                                               // (see recurrent_blocks_new_seq); never a token reason
+    };
+
+    // POD admission snapshot describing how much more input the memory can
+    // safely admit. Wrapper memories (hybrid / iSWA) combine the attention
+    // and recurrent resource domains into one snapshot. XKV OFF memories
+    // report exact legacy-derived values and zero store/workspace bytes.
+    //
+    // Field contract for fillers (base defaults, KV-cache overrides):
+    // - hot_free is authoritative and already excludes hot_reserved.
+    //   Finalization uses hot_free as provided; it never recomputes
+    //   capacity minus used, so reserved slots are never over-admitted.
+    // - factor_safe_tokens / workspace_safe_tokens are conservative token
+    //   bounds from the next-segment/batch planners. UINT32_MAX means
+    //   unconstrained. Nonzero free bytes may still bind: only these token
+    //   bounds limit the byte domains, never the raw byte counts.
+    // - safe_next_ubatch is the minimum over all finite domains and may be
+    //   0 for a genuinely exhausted domain. limit_reason always names the
+    //   minimum-bound (tightest) domain; NONE means unknown snapshot only.
+    // - Recurrent capacity holds sequence slots, not token slots: it never
+    //   enters the token minimum. recurrent_blocks_new_seq gates admission
+    //   of a NEW sequence/person only; continuation batches on full
+    //   recurrent slots remain valid and proceed on the token bound.
+    // Consumers: a zero bound with a real reason must NOT be clamped to 1
+    // and decoded; it means do not decode (maintain / fallback / preempt /
+    // error). Only an unknown snapshot (NONE) defers to the legacy size.
+    struct llama_memory_admission_snapshot {
+        uint32_t logical_capacity; // logical KV cells (legacy get_kv_capacity)
+        uint32_t logical_used;     // resident logical cells (legacy get_kv_used)
+        uint32_t hot_capacity;     // physical hot slots across streams
+        uint32_t hot_used;         // committed hot slots
+        uint32_t hot_free;         // writable hot slots, excluding reserved
+        uint32_t hot_reserved;     // hot slots held by in-flight reservations
+        uint64_t factor_live_bytes;     // live factor store payload bytes
+        uint64_t factor_reserved_bytes; // allocated factor store bytes
+        uint64_t factor_budget_bytes;   // configured factor store budget (0 = unconstrained)
+        uint64_t factor_free_bytes;     // budget minus live (informational only)
+        uint32_t factor_safe_tokens;    // planner token bound (UINT32_MAX = unconstrained)
+        uint64_t workspace_live_bytes;   // currently leased workspace bytes
+        uint64_t workspace_peak_bytes;   // high-water mark of leased workspace
+        uint64_t workspace_budget_bytes; // configured workspace budget (0 = unconstrained)
+        uint64_t workspace_free_bytes;   // budget minus live (informational only)
+        uint32_t workspace_safe_tokens;  // planner token bound (UINT32_MAX = unconstrained)
+        uint32_t recurrent_capacity; // recurrent slots (legacy get_recurrent_capacity)
+        uint32_t recurrent_used;     // resident recurrent slots
+        bool recurrent_blocks_new_seq; // true when no free recurrent slot for a new sequence
+        uint32_t safe_next_ubatch;   // minimum over finite domains (raw, may be 0)
+        enum llama_memory_limit_reason limit_reason; // tightest domain (NONE = unknown)
+    };
+    // Human-readable name for a limiting reason ("none", "logical_cells", ...).
+    // Never returns nullptr.
+    LLAMA_API const char * llama_memory_limit_reason_name(enum llama_memory_limit_reason reason);
+
+    // Fill a POD admission snapshot. Returns false when mem is null, out is
+    // null, or the memory exposes neither an attention nor a recurrent domain.
+    // Never changes legacy get_kv_capacity()/get_kv_used() semantics.
+    LLAMA_API bool llama_memory_get_admission_snapshot(
+            llama_memory_t mem,
+            struct llama_memory_admission_snapshot * out);
+
+    // Observed XKV runtime/store snapshot. Filled ONLY by a bound runtime
+    // from actual store accounting, runtime stats, backend handles, and the
+    // immutable effective config: never synthesized from the request.
+    // `armed` false (or a false return) means missing/failed runtime: the
+    // caller must report empty/not_evaluated, never copy request values.
+    // Skip reasons use the public enum below (same order as the store's
+    // internal codes); counts are indexed by code, no char arrays.
+    enum llama_memory_xkv_skip_reason {
+        LLAMA_MEMORY_XKV_SKIP_NONE                   = 0,
+        LLAMA_MEMORY_XKV_SKIP_NOT_COMMITTED          = 1,
+        LLAMA_MEMORY_XKV_SKIP_UNSUPPORTED_CONFIG     = 2,
+        LLAMA_MEMORY_XKV_SKIP_PREFLIGHT_OOM          = 3,
+        LLAMA_MEMORY_XKV_SKIP_FACTORIZATION_FAILED   = 4,
+        LLAMA_MEMORY_XKV_SKIP_CODEC_ERROR            = 5,
+        LLAMA_MEMORY_XKV_SKIP_ERROR_THRESHOLD        = 6,
+        LLAMA_MEMORY_XKV_SKIP_NO_SAVING              = 7,
+        LLAMA_MEMORY_XKV_SKIP_ABORTED                = 8,
+        LLAMA_MEMORY_XKV_SKIP_LANDMARK_REQUIRED      = 9,
+        LLAMA_MEMORY_XKV_SKIP_REASON_COUNT           = 10,
+    };
+
+    // Skip-reason short name ("no_saving", ...). Never returns nullptr.
+    LLAMA_API const char * llama_memory_xkv_skip_reason_name(enum llama_memory_xkv_skip_reason reason);
+
+    struct llama_memory_xkv_runtime_snapshot {
+        uint32_t struct_size; // sizeof this struct (set by filler)
+        uint32_t version;     // must be 1 (set by filler; caller checks)
+        bool armed; // runtime bound and publishing observations
+        enum llama_xkv_mode mode; // observed mode (profile cannot tell SHADOW/DENSE/SR)
+        enum llama_xkv_storage_profile effective_profile; // observed, not requested
+        enum llama_xkv_source source;                     // observed source
+        uint32_t rank_k;       // observed factor ranks
+        uint32_t rank_v;
+        uint64_t factor_streams; // actual encoded streams (never assumed)
+        uint64_t codec_fingerprint;
+        uint64_t backend_fingerprint; // backend handle identity
+        uint64_t source_fingerprint;
+        uint64_t profile_fingerprint;
+        uint64_t hot_bytes;
+        uint64_t flat_bytes;
+        uint64_t factor_ak_bytes;
+        uint64_t factor_bk_bytes;
+        uint64_t factor_av_bytes;
+        uint64_t factor_bv_bytes;
+        uint64_t factor_payload_bytes;
+        uint64_t factor_metadata_bytes;
+        uint64_t factor_padding_bytes;
+        uint64_t landmark_payload_bytes;
+        uint64_t landmark_metadata_bytes;
+        uint64_t landmark_exception_bytes;
+        uint64_t index_bytes;
+        uint64_t codec_shared_bytes;
+        uint64_t decode_tile_cache_bytes;
+        uint64_t capture_bytes;
+        uint64_t candidate_bytes;
+        uint64_t snapshot_pinned_bytes;
+        uint64_t allocator_live_bytes;
+        uint64_t allocator_reserved_bytes;
+        uint64_t device_peak_bytes;
+        uint64_t host_peak_bytes;
+        uint64_t unique_payloads;
+        uint64_t aliased_payloads;
+        uint64_t baseline_covered_bytes;   // exact covered baseline bytes
+        uint64_t covered_compressed_bytes; // compressed bytes covering them
+        double   factored_baseline_byte_coverage;
+        double   factor_quant_ratio;
+        double   net_extra_compression_ratio;
+        double   seal_seconds;
+        double   factor_quant_seconds;
+        double   landmark_quant_seconds;
+        double   select_seconds;
+        double   refine_seconds;
+        double   reconstruct_seconds;
+        double   read_seconds;
+        double   pack_seconds;
+        uint64_t segments_sealed;
+        // Skip counts indexed by enum llama_memory_xkv_skip_reason.
+        uint64_t skip_counts[LLAMA_MEMORY_XKV_SKIP_REASON_COUNT];
+        uint64_t sr_selected_rows;
+        uint64_t sr_fragments;
+        uint64_t effective_chunk_size;
+        uint64_t landmark_refine_rows;
+        uint64_t landmark_refine_cap_hits;
+        uint64_t spec_stale_total;
+        uint64_t transaction_abort_total;
+        uint64_t synchronize_total;
+        bool     compression_goal_met;
+        // Live/reserved ratio pair (§16: never mixed). Reserved variant uses
+        // reserved (allocated + arena capacity) as the compressed denominator.
+        double   net_extra_compression_ratio_reserved;
+        // Explicit evaluated status: false means not_evaluated (missing
+        // denominators / no accumulated timers). Callers must render these
+        // as JSON null / Prometheus NaN, never as 0.0 pass values.
+        bool     ratios_evaluated;       // coverage + quant + net ratios comparable
+        bool     seal_timers_evaluated;  // seal_seconds accumulated live
+        bool     quant_timers_evaluated; // factor/landmark quant seconds accumulated live
+        // Effective codec profile spec (observed ggml_type / profile codes).
+        // Opaque fingerprints alone cannot verify the four requested/effective
+        // codecs: the evaluator compares these exact codes. Zero-init = unset.
+        int32_t  codec_a_k;      // ggml_type code for A_K
+        int32_t  codec_b_k;      // ggml_type code for B_K
+        int32_t  codec_a_v;      // ggml_type code for A_V
+        int32_t  codec_b_v;      // ggml_type code for B_V
+        int32_t  codec_landmark; // ggml_type code for landmarks
+        int32_t  codec_factorizer; // llama_xkv_factorizer code
+        int32_t  codec_balance;    // llama_xkv_factor_balance code
+        // Tri identity (observed): calibration content fingerprint (0 = no
+        // valid scorer), configured ratio (default 3/32), recent window
+        // (default 128), and scorer-created state.
+        uint64_t tri_calibration_fingerprint;
+        uint8_t  tri_calibration_sha256[32]; // exact 32-byte content SHA-256 (0 = invalid/none)
+        double   tri_ratio;
+        uint32_t tri_recent_window;
+        bool     tri_scorer_valid;
+        // Effective factorization seed (observed from runtime/store config):
+        uint64_t factor_seed;
+        // Tri-state compression goal: true iff compression_goal_met is evaluated.
+        // When false, compression_goal_met must render as JSON null / Prometheus
+        // NaN (not_evaluated), never as false masquerading as an evaluated verdict.
+        bool     compression_goal_evaluated;
+        // Graph & maintenance timing/counter evaluated flags:
+        // Graph-side execution (select, refine, reconstruct, read) and transaction
+        // pack / abort / spec counters have no live server hooks and are marked
+        // unevaluated rather than reporting deceptive zero gauges.
+        bool     graph_timings_evaluated;
+        bool     pack_timer_evaluated;
+        bool     sr_counters_evaluated;
+        bool     spec_counters_evaluated;
+    };
+
+    // Fill the observed runtime snapshot. Returns false (zeroing *out)
+    // when mem is null, out is null, or no runtime is bound: the caller
+    // reports empty/not_evaluated in that case.
+    LLAMA_API bool llama_memory_get_xkv_runtime_snapshot(
+            llama_memory_t mem,
+            struct llama_memory_xkv_runtime_snapshot * out);
+
+    // Stable maintenance status. Values are part of the public ABI: never
+    // renumber, only append. Distinguishes "did work" from "floor" from
+    // "failure" so callers never mask a codec/workspace error as success.
+    enum llama_memory_maintenance_status {
+        LLAMA_MEMORY_MAINTENANCE_PROGRESS       = 0, // did work; re-query the snapshot
+        LLAMA_MEMORY_MAINTENANCE_NO_ACTION      = 1, // nothing to do (XKV OFF no-op)
+        LLAMA_MEMORY_MAINTENANCE_FLOOR_EXHAUSTED = 2, // at residency floor; caller may run Tri/atomic fallback
+        LLAMA_MEMORY_MAINTENANCE_RETRY_STALE    = 3, // state moved; re-query then retry planning
+        LLAMA_MEMORY_MAINTENANCE_ERROR          = 4, // codec/workspace failure; never proceed silently
+    };
+
+    // Human-readable maintenance status name. Never returns nullptr.
+    LLAMA_API const char * llama_memory_maintenance_status_name(enum llama_memory_maintenance_status status);
+
+    // Attempt cache-owned safe-boundary maintenance (reclaim / pack / seal
+    // at a safe boundary) before legacy TriAttention reclaim or slot
+    // preemption. The server proceeds to Tri/atomic fallback only on
+    // FLOOR_EXHAUSTED or NO_ACTION; ERROR must take the error path and
+    // never be masked. XKV OFF is always a no-op returning NO_ACTION.
+    LLAMA_API enum llama_memory_maintenance_status llama_memory_maintain_safe_boundary(llama_memory_t mem);
 
     // Returns false when the memory does not expose an attention KV cache.
     LLAMA_API bool llama_memory_get_kv_usage(llama_memory_t mem, struct llama_memory_kv_usage * usage);

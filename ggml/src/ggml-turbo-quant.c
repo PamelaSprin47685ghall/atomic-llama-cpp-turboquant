@@ -22,7 +22,8 @@
 
 /* Forward declarations for GGML_API symbols defined in this file (satisfies
  * -Wmissing-prototypes under upstream CI's -Werror policy). */
-GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size);
+GGML_API void ggml_turbo_wht_row(float * x, int group_size);
+GGML_API void ggml_turbo_wht_inverse_row(float * x, int group_size);
 
 /* Retained for ABI compatibility only. Turbo blocks and padded KV heads are
  * now always 128 elements; quantizers must not depend on mutable global state. */
@@ -218,7 +219,7 @@ static const float turbo_cpu_s2[128] = {
 
 /* ---------- CPU forward WHT (in-place, group_size elements) ---------- */
 
-static void turbo_cpu_fwht(float * x, int group_size) {
+GGML_API void ggml_turbo_wht_row(float * x, int group_size) {
     const float * s1 = turbo_cpu_s1;
     const float * s2 = turbo_cpu_s2;
     const float inv_sqrt = (group_size == 128) ? 0.08838834764831845f : 0.125f;
@@ -249,7 +250,7 @@ static void turbo_cpu_fwht(float * x, int group_size) {
  * The inverse therefore has the same structure with s1 and s2 swapped:
  *     x = D(s1) * N * H * D(s2) * y
  */
-GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size) {
+GGML_API void ggml_turbo_wht_inverse_row(float * x, int group_size) {
     const float * s1 = turbo_cpu_s1;
     const float * s2 = turbo_cpu_s2;
     const float inv_sqrt = (group_size == 128) ? 0.08838834764831845f : 0.125f;
@@ -277,6 +278,13 @@ GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size) {
 void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k) {
     GGML_ASSERT(k % QK_TURBO3 == 0);
     const int group_size = QK_TURBO3_GROUP;
+static void quantize_row_turbo3_0_group(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k, int group_size) {
+    assert(k % QK_TURBO3 == 0);
+    if (group_size != 64 && group_size != 128) {
+        group_size = (k % 128 == 0) ? 128 : 64;
+    }
+    if (k % group_size != 0) group_size = (group_size == 128) ? 64 : 128;
+    assert(k % group_size == 0);
 
     const int n_groups = k / group_size;
     const int blocks_per_group = group_size / QK_TURBO3;
@@ -299,7 +307,7 @@ void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * G
         for (int j = 0; j < group_size; j++) buf[j] *= inv_norm;
 
         // 3. Forward WHT rotation
-        turbo_cpu_fwht(buf, group_size);
+        ggml_turbo_wht_row(buf, group_size);
 
         // 4. Quantize + pack into sub-blocks
         float recon_sq = 0.0f;
@@ -327,6 +335,16 @@ void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * G
             grp_dst[b].norm = GGML_FP32_TO_FP16(corrected);
         }
     }
+}
+
+void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO3 == 0);
+
+    // Read WHT group size from global (set by CPU SET_ROWS handler before each call).
+    // Fallback: 128 if row is 128-aligned, else 64.
+    extern int turbo3_cpu_wht_group_size;
+    int group_size = turbo3_cpu_wht_group_size;
+    quantize_row_turbo3_0_group(x, y, k, group_size);
 }
 
 void dequantize_row_turbo3_0(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
@@ -360,11 +378,221 @@ size_t quantize_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     return nrows * row_size;
 }
 
+/* Forward declarations for static Turbo group helpers */
+static void quantize_row_turbo2_0_group(const float * GGML_RESTRICT x, block_turbo2_0 * GGML_RESTRICT y, int64_t k, int group_size);
+static void quantize_row_turbo3_0_group(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k, int group_size);
+
+/* ---------- Public re-entrant TurboQuant row quantize/dequantize API ---------- */
+
+bool ggml_quantize_turbo_row(
+        enum ggml_type   type,
+        const float    * src,
+        void           * dst,
+        int64_t          n_elements,
+        int              group_size) {
+    if (!src || !dst || n_elements <= 0 || n_elements % 128 != 0) {
+        return false;
+    }
+    if (group_size != 128) {
+        return false;
+    }
+    int64_t n_groups = n_elements / 128;
+    uint8_t * dst_bytes = (uint8_t *)dst;
+
+    // Stride contract: TURBO2/3/4 all use one block per 128-element rotation
+    // group, so the total encoded bytes must equal ggml_row_size exactly.
+    // Per-group memcpy keeps misaligned dst safe (no wide stores).
+    if (type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0) {
+        assert((size_t)n_groups * ggml_row_size(type, 128) == ggml_row_size(type, n_elements));
+    }
+
+    switch (type) {
+        case GGML_TYPE_TURBO2_0: {
+            const size_t grp_bytes = sizeof(block_turbo2_0);
+            assert(grp_bytes == ggml_row_size(type, 128));
+            for (int64_t g = 0; g < n_groups; ++g) {
+                block_turbo2_0 local_block;
+                quantize_row_turbo2_0_group(src + g * 128, &local_block, 128, 128);
+                memcpy(dst_bytes + g * grp_bytes, &local_block, grp_bytes);
+            }
+            return true;
+        }
+        case GGML_TYPE_TURBO3_0: {
+            const size_t grp_bytes = sizeof(block_turbo3_0);
+            assert(grp_bytes == ggml_row_size(type, 128));
+            for (int64_t g = 0; g < n_groups; ++g) {
+                block_turbo3_0 local_block;
+                quantize_row_turbo3_0_group(src + g * 128, &local_block, 128, 128);
+                memcpy(dst_bytes + g * grp_bytes, &local_block, grp_bytes);
+            }
+            return true;
+        }
+        case GGML_TYPE_TURBO4_0: {
+            const size_t grp_bytes = sizeof(block_turbo4_0);
+            assert(grp_bytes == ggml_row_size(type, 128));
+            for (int64_t g = 0; g < n_groups; ++g) {
+                block_turbo4_0 local_block;
+                quantize_row_turbo4_0_ref(src + g * 128, &local_block, 128);
+                memcpy(dst_bytes + g * grp_bytes, &local_block, grp_bytes);
+            }
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+bool ggml_dequantize_turbo_row(
+        enum ggml_type   type,
+        const void     * src,
+        float          * dst,
+        int64_t          n_elements,
+        int              group_size,
+        enum ggml_turbo_decode_domain domain) {
+    if (!src || !dst || n_elements <= 0 || n_elements % 128 != 0) {
+        return false;
+    }
+    if (group_size != 128) {
+        return false;
+    }
+    if (domain != GGML_TURBO_DECODE_ROTATED && domain != GGML_TURBO_DECODE_CANONICAL) {
+        return false;
+    }
+    int64_t n_groups = n_elements / 128;
+    const uint8_t * src_bytes = (const uint8_t *)src;
+
+    // Stride contract mirrors quantize: exactly ggml_row_size bytes are read,
+    // one block per 128 elements. Per-group memcpy keeps misaligned src safe
+    // (no wide loads past row_bytes).
+    if (type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0) {
+        assert((size_t)n_groups * ggml_row_size(type, 128) == ggml_row_size(type, n_elements));
+    }
+
+    switch (type) {
+        case GGML_TYPE_TURBO2_0: {
+            const size_t grp_bytes = sizeof(block_turbo2_0);
+            assert(grp_bytes == ggml_row_size(type, 128));
+            for (int64_t g = 0; g < n_groups; ++g) {
+                block_turbo2_0 local_block;
+                memcpy(&local_block, src_bytes + g * grp_bytes, grp_bytes);
+                dequantize_row_turbo2_0(&local_block, dst + g * 128, 128);
+            }
+            break;
+        }
+        case GGML_TYPE_TURBO3_0: {
+            const size_t grp_bytes = sizeof(block_turbo3_0);
+            assert(grp_bytes == ggml_row_size(type, 128));
+            for (int64_t g = 0; g < n_groups; ++g) {
+                block_turbo3_0 local_block;
+                memcpy(&local_block, src_bytes + g * grp_bytes, grp_bytes);
+                dequantize_row_turbo3_0(&local_block, dst + g * 128, 128);
+            }
+            break;
+        }
+        case GGML_TYPE_TURBO4_0: {
+            const size_t grp_bytes = sizeof(block_turbo4_0);
+            assert(grp_bytes == ggml_row_size(type, 128));
+            for (int64_t g = 0; g < n_groups; ++g) {
+                block_turbo4_0 local_block;
+                memcpy(&local_block, src_bytes + g * grp_bytes, grp_bytes);
+                dequantize_row_turbo4_0(&local_block, dst + g * 128, 128);
+            }
+            break;
+        }
+        default:
+            return false;
+    }
+
+    if (domain == GGML_TURBO_DECODE_CANONICAL) {
+        for (int64_t g = 0; g < n_groups; ++g) {
+            ggml_turbo_wht_inverse_row(dst + g * 128, 128);
+        }
+    }
+    return true;
+}
+
+GGML_API uint64_t ggml_turbo_layout_fingerprint(enum ggml_type type) {
+    uint64_t hash = 14695981039346656037ULL;
+    #define TQ_HASH_BYTE(b) do { hash ^= (uint8_t)(b); hash *= 1099511628211ULL; } while (0)
+    #define TQ_HASH_U64(v) do { \
+        uint64_t _val = (uint64_t)(v); \
+        for (int _i = 0; _i < 8; ++_i) { TQ_HASH_BYTE((uint8_t)(_val >> (_i * 8))); } \
+    } while (0)
+    #define TQ_HASH_FLOAT(f) do { \
+        float _f = (f); \
+        uint32_t _u; \
+        memcpy(&_u, &_f, sizeof(_u)); \
+        for (int _i = 0; _i < 4; ++_i) { TQ_HASH_BYTE((uint8_t)(_u >> (_i * 8))); } \
+    } while (0)
+
+    TQ_HASH_U64((uint64_t)type);
+    TQ_HASH_U64(TURBO_SEED_ROTATION);
+    TQ_HASH_U64(TURBO_D);
+
+    // Include WHT sign tables
+    for (int i = 0; i < 128; ++i) {
+        TQ_HASH_FLOAT(turbo_cpu_s1[i]);
+        TQ_HASH_FLOAT(turbo_cpu_s2[i]);
+    }
+
+    switch (type) {
+        case GGML_TYPE_TURBO2_0: {
+            TQ_HASH_U64(sizeof(block_turbo2_0));
+            TQ_HASH_U64(QK_TURBO2);
+            for (int i = 0; i < 4; ++i) {
+                TQ_HASH_FLOAT(CENTROIDS_2BIT[i]);
+            }
+            break;
+        }
+        case GGML_TYPE_TURBO3_0: {
+            TQ_HASH_U64(sizeof(block_turbo3_0));
+            TQ_HASH_U64(QK_TURBO3);
+            for (int i = 0; i < 8; ++i) {
+                TQ_HASH_FLOAT(CENTROIDS_3BIT[i]);
+            }
+            break;
+        }
+        case GGML_TYPE_TURBO4_0: {
+#if !TURBO4_USE_4BIT
+            // Legacy 3-bit + QJL layout is incompatible with XKV v1 public row API
+            return 0;
+#else
+            TQ_HASH_U64(sizeof(block_turbo4_0));
+            TQ_HASH_U64(QK_TURBO4);
+            TQ_HASH_U64(1); // 4-bit mode active
+            static const float CENTROIDS_4BIT_FP[16] = {
+                -0.173926f, -0.117195f, -0.089527f, -0.068756f,
+                -0.051262f, -0.035597f, -0.020989f, -0.006938f,
+                 0.006938f,  0.020989f,  0.035597f,  0.051262f,
+                 0.068756f,  0.089527f,  0.117195f,  0.173926f
+            };
+            for (int i = 0; i < 16; ++i) {
+                TQ_HASH_FLOAT(CENTROIDS_4BIT_FP[i]);
+            }
+            break;
+#endif
+        }
+        default:
+            return 0;
+    }
+    #undef TQ_HASH_BYTE
+    #undef TQ_HASH_U64
+    #undef TQ_HASH_FLOAT
+    return hash;
+}
+
 /* ---------- TURBO2_0: 2-bit PolarQuant (no QJL) ---------- */
 
 void quantize_row_turbo2_0_ref(const float * GGML_RESTRICT x, block_turbo2_0 * GGML_RESTRICT y, int64_t k) {
     GGML_ASSERT(k % QK_TURBO2 == 0);
     const int group_size = QK_TURBO2_GROUP;
+static void quantize_row_turbo2_0_group(const float * GGML_RESTRICT x, block_turbo2_0 * GGML_RESTRICT y, int64_t k, int group_size) {
+    assert(k % QK_TURBO2 == 0);
+    if (group_size != 64 && group_size != 128) {
+        group_size = (k % 128 == 0) ? 128 : 64;
+    }
+    if (k % group_size != 0) group_size = (group_size == 128) ? 64 : 128;
+    assert(k % group_size == 0);
 
     const int n_groups = k / group_size;
     const int blocks_per_group = group_size / QK_TURBO2;
@@ -387,7 +615,7 @@ void quantize_row_turbo2_0_ref(const float * GGML_RESTRICT x, block_turbo2_0 * G
         for (int j = 0; j < group_size; j++) buf[j] *= inv_norm;
 
         /* 3. Forward WHT rotation */
-        turbo_cpu_fwht(buf, group_size);
+        ggml_turbo_wht_row(buf, group_size);
 
         /* 4. Quantize + pack into sub-blocks */
         float recon_sq = 0.0f;
@@ -411,6 +639,14 @@ void quantize_row_turbo2_0_ref(const float * GGML_RESTRICT x, block_turbo2_0 * G
             grp_dst[b].norm = GGML_FP32_TO_FP16(corrected);
         }
     }
+}
+
+void quantize_row_turbo2_0_ref(const float * GGML_RESTRICT x, block_turbo2_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TURBO2 == 0);
+
+    extern int turbo3_cpu_wht_group_size;
+    int group_size = turbo3_cpu_wht_group_size;
+    quantize_row_turbo2_0_group(x, y, k, group_size);
 }
 
 void dequantize_row_turbo2_0(const block_turbo2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
@@ -473,7 +709,7 @@ void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * G
         /* Step 2: Forward WHT rotation (matches CUDA set_rows) */
         float rotated[TURBO_D];
         memcpy(rotated, normalized, d * sizeof(float));
-        turbo_cpu_fwht(rotated, d);
+        ggml_turbo_wht_row(rotated, d);
 
 #if TURBO4_USE_4BIT
         /* Step 3: 4-bit quantization (16 centroids) */

@@ -93,6 +93,10 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include "ggml-xkv.h"
+#include "ggml-xkv-factor.h"
+#include "ggml-vulkan-landmark.h"
+
 #include "ggml-vulkan-shaders.hpp"
 #include "vulkan-shaders/flashprefill-interface.h"
 
@@ -1047,6 +1051,15 @@ struct vk_device_struct {
     vk_pipeline pipeline_pool1d_f32;
     vk_pipeline pipeline_pool2d_f32;
     vk_pipeline pipeline_turbo_wht;
+    vk_pipeline pipeline_xkv_reconstruct;
+    vk_pipeline pipeline_xkv_attention;
+    vk_pipeline pipeline_xkv_factorize;
+    vk_pipeline pipeline_xkv_canonicalize;
+    vk_pipeline pipeline_xkv_landmark_score;
+    vk_pipeline pipeline_xkv_landmark_select;
+    vk_pipeline pipeline_xkv_landmark_build;
+    vk_pipeline pipeline_xkv_landmark_rows;
+    vk_pipeline pipeline_xkv_landmark_merge;
     vk_pipeline pipeline_rwkv_wkv6_f32;
     vk_pipeline pipeline_rwkv_wkv7_f32;
     vk_pipeline pipeline_gated_linear_attn_f32;
@@ -2224,6 +2237,16 @@ static uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
         const ggml_tensor * entries = node->src[3];
         return 2ull * entries->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]);
     }
+    if (node->op == GGML_OP_XKV_ATTENTION) {
+        ggml_xkv_attention_params p;
+        memcpy(&p, node->op_params, sizeof(p));
+        return 2ull * p.n_entries * p.gqa_ratio * (p.dim_k + p.dim_v);
+    }
+    if (node->op == GGML_OP_XKV_LANDMARK) {
+        ggml_xkv_landmark_params p;
+        memcpy(&p, node->op_params, sizeof(p));
+        return 2ull * p.n_queries * p.n_frags * p.head_dim * p.n_q_heads;
+    }
     return 0;
 }
 
@@ -2933,7 +2956,9 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
     if (device->float_controls_rte_fp16 || device->float_controls_denorm_preserve_fp16) {
         const uint32_t* spv_words = reinterpret_cast<const uint32_t *>(spv_data);
         size_t word_count = spv_size / sizeof(uint32_t);
-        spirv.assign(spv_words, spv_words + word_count);
+        if (spv_words && word_count > 0) {
+            spirv.assign(spv_words, spv_words + word_count);
+        }
 
         // Find insertion points respecting SPIR-V layout order:
         //   Header(5) -> OpCapability -> OpExtension -> ... -> OpEntryPoint -> OpExecutionMode -> ...
@@ -5725,6 +5750,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q8_0], "cpy_q8_0_f32", cpy_q8_0_f32_len, cpy_q8_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q8_0), 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_IQ4_NL], "cpy_iq4_nl_f32", cpy_iq4_nl_f32_len, cpy_iq4_nl_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_IQ4_NL), 1, 1}, {}, 1);
 
+    // TurboQuant dequantize-to-F32 (bounded hot-row rephasing read path).
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_TURBO2_0], "cpy_turbo2_0_f32", cpy_turbo2_0_f32_len, cpy_turbo2_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_TURBO2_0), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_TURBO3_0], "cpy_turbo3_0_f32", cpy_turbo3_0_f32_len, cpy_turbo3_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_TURBO3_0), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_TURBO4_0], "cpy_turbo4_0_f32", cpy_turbo4_0_f32_len, cpy_turbo4_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_TURBO4_0), 1, 1}, {}, 1);
+
     auto get_suffix = [](bool src0_f16, bool src1_f16, bool dst_f16) {
         std::string s;
         s += std::string(src0_f16 ? "_f16" : "_f32");
@@ -5987,6 +6017,33 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     // TurboQuant WHT (forward / inverse rotation, 128-element block)
     ggml_vk_create_pipeline(device, device->pipeline_turbo_wht, "turbo_wht", turbo_wht_len, turbo_wht_data, "main", 2, 3 * sizeof(uint32_t), {128, 1, 1}, {}, 1);
+
+    // XKV selected-row factor reconstruction: 10 bindings, 84B push constants, one dispatch per op
+    ggml_vk_create_pipeline(device, device->pipeline_xkv_reconstruct, "xkv_reconstruct", xkv_reconstruct_len, xkv_reconstruct_data, "main", 10, 84, {64, 1, 1}, {}, 1);
+
+    // XKV dual-source indexed attention: 11 bindings, 112B push constants, one dispatch per KV head.
+    ggml_vk_create_pipeline(device, device->pipeline_xkv_attention, "xkv_attention", xkv_attention_len, xkv_attention_data, "main", 11, 112, {1, 1, 1}, {}, 1);
+
+    // XKV device-local factorization: 5 bindings, 96B push constants
+    ggml_vk_create_pipeline(device, device->pipeline_xkv_factorize, "xkv_factorize", xkv_factorize_len, xkv_factorize_data, "main", 5, 96, {256, 1, 1}, {}, 1);
+
+    // XKV canonicalize-hot: 7 bindings, 52B push constants
+    ggml_vk_create_pipeline(device, device->pipeline_xkv_canonicalize, "xkv_canonicalize", xkv_canonicalize_len, xkv_canonicalize_data, "main", 7, 56, {64, 1, 1}, {}, 1);
+
+    // XKV landmark score: 8 bindings, 64B push constants, 2D dispatch over [n_frags, n_queries]
+    ggml_vk_create_pipeline(device, device->pipeline_xkv_landmark_score, "xkv_landmark_score", xkv_landmark_score_len, xkv_landmark_score_data, "main", 8, 76, {64, 1, 1}, {}, 1);
+
+    // XKV landmark select: 7 bindings, 64B push constants, one workgroup per query (+1-group fold)
+    ggml_vk_create_pipeline(device, device->pipeline_xkv_landmark_select, "xkv_landmark_select", xkv_landmark_select_len, xkv_landmark_select_data, "main", 7, 76, {64, 1, 1}, {}, 1);
+
+    // XKV landmark construction: 11 bindings, 88B push constants (owned by XkvNativeLandmarkBuild)
+    ggml_vk_create_pipeline(device, device->pipeline_xkv_landmark_build, "xkv_landmark_build", xkv_landmark_build_len, xkv_landmark_build_data, "main", 11, 88, {64, 1, 1}, {}, 1);
+
+    // XKV landmark rows: 11 bindings, 64B push constants (words 0..14 params, word 15 status_flag)
+    ggml_vk_create_pipeline(device, device->pipeline_xkv_landmark_rows, "xkv_landmark_rows", xkv_landmark_rows_len, xkv_landmark_rows_data, "main", 11, 64, {64, 1, 1}, {}, 1);
+
+    // XKV landmark merge: 6 bindings, 32B push constants
+    ggml_vk_create_pipeline(device, device->pipeline_xkv_landmark_merge, "xkv_landmark_merge", xkv_landmark_merge_len, xkv_landmark_merge_data, "main", 6, 32, {64, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv6_f32, "rwkv_wkv6_f32", rwkv_wkv6_f32_len, rwkv_wkv6_f32_data, "main", 7, sizeof(vk_op_rwkv_wkv6_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
 
@@ -9305,6 +9362,12 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
+            return ctx->device->pipeline_cpy_quant_f32[src->type];
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
+            // Bounded hot-row rephasing read path only; all other Turbo
+            // consumers keep their dedicated kernels.
             return ctx->device->pipeline_cpy_quant_f32[src->type];
         default:
             break;
@@ -14280,6 +14343,307 @@ static void ggml_vk_silu_back(ggml_backend_vk_context * ctx, vk_context& subctx,
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_SILU_BACK, { (uint32_t)ggml_nelements(src0), 0, 0.0f, 0.0f, 0.0f, 0.0f });
 }
 
+// XKV selected-row factor reconstruction: single dispatch per op, code streams
+// stay device-resident. Host validates shapes/fingerprints via
+// ggml_xkv_reconstruct_supports(); bounds poison NaN in-shader (no host mirror).
+struct vk_op_xkv_push {
+    uint32_t n_sel, n_groups, rank_k, rank_v, dim_k, dim_v, rotary_dim, rope_mode;
+    uint32_t a_k_type, b_k_type, a_v_type, b_v_type;
+    uint32_t a_k_stride, b_k_stride, a_v_stride, b_v_stride;
+    uint32_t prk, prv;
+    uint32_t n_rows_a, b_k_rows, b_v_rows;
+};
+static_assert(sizeof(vk_op_xkv_push) == 84, "xkv push must be 84B");
+static void ggml_vk_xkv_reconstruct(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * a_k, const ggml_tensor * b_k,
+        const ggml_tensor * a_v, const ggml_tensor * b_v,
+        const ggml_tensor * refs, const ggml_tensor * positions,
+        const ggml_tensor * group_meta, const ggml_tensor * layer_meta,
+        const ggml_tensor * rope_tables, ggml_tensor * dst) {
+    ggml_xkv_reconstruct_params p;
+    memcpy(&p, dst->op_params, sizeof(p));
+    char err[256] = {0};
+    GGML_ASSERT(ggml_xkv_reconstruct_supports(a_k, b_k, a_v, b_v, refs, positions, group_meta,
+                                              layer_meta, rope_tables, dst, &p, err, sizeof(err)));
+    vk_op_xkv_push pc;
+    pc.n_sel = p.n_sel; pc.n_groups = p.n_groups;
+    pc.rank_k = p.rank_k; pc.rank_v = p.rank_v;
+    pc.dim_k = p.dim_k; pc.dim_v = p.dim_v;
+    pc.rotary_dim = p.rotary_dim; pc.rope_mode = p.rope_mode;
+    pc.a_k_type = (uint32_t)a_k->type; pc.b_k_type = (uint32_t)b_k->type;
+    pc.a_v_type = (uint32_t)a_v->type; pc.b_v_type = (uint32_t)b_v->type;
+    pc.a_k_stride = (uint32_t)ggml_row_size(a_k->type, a_k->ne[0]);
+    pc.b_k_stride = (uint32_t)ggml_row_size(b_k->type, b_k->ne[0]);
+    pc.a_v_stride = (uint32_t)ggml_row_size(a_v->type, a_v->ne[0]);
+    pc.b_v_stride = (uint32_t)ggml_row_size(b_v->type, b_v->ne[0]);
+    pc.prk = (uint32_t)a_k->ne[0]; pc.prv = (uint32_t)a_v->ne[0];
+    pc.n_rows_a = (uint32_t)a_k->ne[1]; pc.b_k_rows = (uint32_t)b_k->ne[1]; pc.b_v_rows = (uint32_t)b_v->ne[1];
+    vk_pipeline pipeline = ctx->device->pipeline_xkv_reconstruct;
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    vk_subbuffer ba_k = ggml_vk_tensor_subbuffer(ctx, a_k, false);
+    vk_subbuffer bb_k = ggml_vk_tensor_subbuffer(ctx, b_k, false);
+    vk_subbuffer ba_v = ggml_vk_tensor_subbuffer(ctx, a_v, false);
+    vk_subbuffer bb_v = ggml_vk_tensor_subbuffer(ctx, b_v, false);
+    vk_subbuffer bref = ggml_vk_tensor_subbuffer(ctx, refs, false);
+    vk_subbuffer bpos = ggml_vk_tensor_subbuffer(ctx, positions, false);
+    vk_subbuffer bmeta = ggml_vk_tensor_subbuffer(ctx, group_meta, false);
+    vk_subbuffer blmeta = ggml_vk_tensor_subbuffer(ctx, layer_meta, false);
+    vk_subbuffer brope = ggml_vk_tensor_subbuffer(ctx, rope_tables, false);
+    vk_subbuffer bdst = ggml_vk_tensor_subbuffer(ctx, dst, false);
+    ggml_vk_sync_buffers(ctx, subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ba_k, bb_k, ba_v, bb_v, bref, bpos, bmeta, blmeta, brope, bdst }, pc, { p.n_sel, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+}
+
+// XKV factorize/canonicalize device kernels (owned by XkvVulkanFactorizer;
+// shared-switch integration owned here). Uses ggml-xkv-factor.h declarations.
+#include "ggml-vulkan-xkv-factor.inl"
+
+// XKV landmark build device kernel (owned by XkvNativeLandmarkBuild).
+#include "ggml-xkv-landmark-build.h"
+#include "ggml-vulkan-xkv-landmark-build.inl"
+
+// ---- XKV dual-source indexed attention dispatch (GGML_OP_XKV_ATTENTION) ----
+// One dispatch per KV head over (query, GQA) rows; single global online
+// softmax per row across hot + cold entries. All code streams stay
+// device-resident; no host decode/readback, no per-decode re-upload.
+struct vk_op_xkv_attn_push {
+    uint32_t dim_k, dim_v, gqa, n_groups;
+    uint32_t n_queries, hot_rows, n_cold, n_entries;
+    uint32_t kv_head, stream, flags, entry_stride;
+    float    scale, softcap;
+    uint32_t k_hot_type, v_hot_type, k_cold_type, v_cold_type;
+    uint32_t q_nb1, q_nb2;
+    uint32_t kh_nb1, kh_nb2, kh_nb3;
+    uint32_t vh_nb1, vh_nb2, vh_nb3;
+    uint32_t kc_nb1, vc_nb1;
+};
+static_assert(sizeof(vk_op_xkv_attn_push) == 112, "xkv attn push must be 112B");
+
+static void ggml_vk_xkv_attention(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * q, const ggml_tensor * k_hot, const ggml_tensor * v_hot,
+        const ggml_tensor * k_cold, const ggml_tensor * v_cold,
+        const ggml_tensor * entries, const ggml_tensor * offsets,
+        const ggml_tensor * sinks, const ggml_tensor * status, const ggml_tensor * carry, ggml_tensor * dst) {
+    ggml_xkv_attention_params p;
+    memcpy(&p, dst->op_params, sizeof(p));
+    char err[256] = {0};
+    GGML_ASSERT(ggml_xkv_attention_supports(q, k_hot, v_hot, k_cold, v_cold, entries,
+                                             offsets, sinks, status, carry, dst, &p, err, sizeof(err)));
+    vk_op_xkv_attn_push pc;
+    pc.dim_k = p.dim_k; pc.dim_v = p.dim_v; pc.gqa = p.gqa_ratio; pc.n_groups = p.n_groups;
+    pc.n_queries = p.n_queries; pc.hot_rows = p.hot_rows; pc.n_cold = p.n_cold;
+    pc.n_entries = p.n_entries;
+    pc.kv_head = p.kv_head; pc.stream = p.stream;
+    pc.flags = (p.flags & GGML_XKV_ATTN_FLAG_REJECT_DUPES ? 1u : 0u) |
+               (entries->ne[0] == 2 ? 2u : 0u) |
+               (sinks ? 4u : 0u) |
+               (p.flags & GGML_XKV_ATTN_FLAG_FIRST_TILE ? 8u : 0u) |
+               (carry ? 16u : 0u) |
+               (p.flags & GGML_XKV_ATTN_FLAG_FINAL_TILE ? 32u : 0u);
+    pc.entry_stride = (uint32_t)entries->ne[0];
+    pc.scale = p.scale; pc.softcap = p.logit_softcap;
+    pc.k_hot_type = (uint32_t)k_hot->type; pc.v_hot_type = (uint32_t)v_hot->type;
+    pc.k_cold_type = (uint32_t)k_cold->type; pc.v_cold_type = (uint32_t)v_cold->type;
+    pc.q_nb1 = (uint32_t)q->nb[1]; pc.q_nb2 = (uint32_t)q->nb[2];
+    pc.kh_nb1 = (uint32_t)k_hot->nb[1]; pc.kh_nb2 = (uint32_t)k_hot->nb[2]; pc.kh_nb3 = (uint32_t)k_hot->nb[3];
+    pc.vh_nb1 = (uint32_t)v_hot->nb[1]; pc.vh_nb2 = (uint32_t)v_hot->nb[2]; pc.vh_nb3 = (uint32_t)v_hot->nb[3];
+    pc.kc_nb1 = (uint32_t)k_cold->nb[1]; pc.vc_nb1 = (uint32_t)v_cold->nb[1];
+    vk_pipeline pipeline = ctx->device->pipeline_xkv_attention;
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    vk_subbuffer bq   = ggml_vk_tensor_subbuffer(ctx, q, false);
+    vk_subbuffer bst  = ggml_vk_tensor_subbuffer(ctx, status, false);
+    // Zero-row tensors are legal for the CPU oracle, but Vulkan storage
+    // descriptors require a nonzero range. Bind the sticky status word as a
+    // dummy; shader bounds guarantee these bindings are never read.
+    vk_subbuffer bkh  = p.hot_rows  ? ggml_vk_tensor_subbuffer(ctx, k_hot, false)  : bst;
+    vk_subbuffer bvh  = p.hot_rows  ? ggml_vk_tensor_subbuffer(ctx, v_hot, false)  : bst;
+    vk_subbuffer bkc  = p.n_cold    ? ggml_vk_tensor_subbuffer(ctx, k_cold, false) : bst;
+    vk_subbuffer bvc  = p.n_cold    ? ggml_vk_tensor_subbuffer(ctx, v_cold, false) : bst;
+    vk_subbuffer bent = p.n_entries ? ggml_vk_tensor_subbuffer(ctx, entries, false) : bst;
+    vk_subbuffer boff = ggml_vk_tensor_subbuffer(ctx, offsets, false);
+    // Optional sinks: bind the offsets buffer as a dummy when absent (the
+    // shader never reads binding 7 unless the has-sinks flag is set).
+    vk_subbuffer bsnk = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks, false) : boff;
+    vk_subbuffer bdst = ggml_vk_tensor_subbuffer(ctx, dst, false);
+    vk_subbuffer bcar = carry ? ggml_vk_tensor_subbuffer(ctx, carry, false) : bdst;
+    // The first tile initializes the sticky status word. Later tiles preserve
+    // an earlier failure; their explicit carry dependency orders the write.
+    if (p.flags & GGML_XKV_ATTN_FLAG_FIRST_TILE) {
+        ggml_vk_buffer_memset_async(subctx, bst.buffer, bst.offset, 0, sizeof(int32_t));
+    }
+    ggml_vk_sync_buffers(ctx, subctx);
+    const uint32_t rows = p.n_queries * p.gqa_ratio;
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { bq, bkh, bvh, bkc, bvc, bent, boff, bsnk, bst, bdst, bcar }, pc, { rows, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+}
+
+// ---- XKV landmark dispatch (GGML_OP_XKV_LANDMARK) ----
+// Score kernel (2D over [n_frags, n_queries]) -> device barrier -> select
+// pass 1 (one workgroup per query) -> barrier -> select pass 2 (1-workgroup
+// CSR/status fold). Code streams stay device-resident; caller-owned scratch
+// carries scores + disjoint select regions (see workspace_bytes layout).
+// No host decode, no readback, no per-decode re-upload.
+struct vk_op_xkv_landmark_push {
+    uint32_t n_queries, n_frags, head_dim, padded_dim;
+    uint32_t rotary_dim, rope_mode, landmark_type, top_k;
+    uint32_t max_top_k, refine_cap, frag_size;
+    float    scale;
+    uint32_t n_q_heads, n_rows_total, landmark_row_stride_bytes, status_flag;
+    uint32_t fstride, qstride, flags;
+};
+static_assert(sizeof(vk_op_xkv_landmark_push) == 76, "xkv landmark push must be 76B");
+
+static void ggml_vk_xkv_landmark(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * q, const ggml_tensor * landmarks,
+        const ggml_tensor * frag_positions, const ggml_tensor * frag_meta,
+        const ggml_tensor * query_meta, const ggml_tensor * rope_tables,
+        const ggml_tensor * scratch, const ggml_tensor * csr_ptrs,
+        const ggml_tensor * topk_scores, const ggml_tensor * status, ggml_tensor * dst) {
+    ggml_xkv_landmark_params p;
+    memcpy(&p, dst->op_params, sizeof(p));
+    char err[256] = {0};
+    GGML_ASSERT(ggml_xkv_landmark_supports(q, landmarks, frag_positions, frag_meta, query_meta,
+                                            rope_tables, scratch, csr_ptrs, topk_scores, status,
+                                            dst, &p, err, sizeof(err)));
+    vk_op_xkv_landmark_push pc;
+    pc.n_queries = p.n_queries; pc.n_frags = p.n_frags;
+    pc.head_dim = p.head_dim; pc.padded_dim = p.padded_dim;
+    pc.rotary_dim = p.rotary_dim; pc.rope_mode = p.rope_mode;
+    pc.landmark_type = p.landmark_type; pc.top_k = p.top_k;
+    pc.max_top_k = p.max_top_k; pc.refine_cap = p.refine_cap; pc.frag_size = p.frag_size;
+    pc.scale = p.scale; pc.n_q_heads = p.n_q_heads; pc.n_rows_total = p.n_rows_total;
+    // Strided full-group views: per-head score indexes rows by this byte stride.
+    // The binding base already carries the view byte offset. Validated in
+    // supports (>= encoded row bytes, codec-block aligned) and in-shader.
+    pc.landmark_row_stride_bytes = (uint32_t)landmarks->nb[1];
+    pc.status_flag = 0;
+    pc.fstride = (uint32_t)frag_meta->ne[0];
+    pc.qstride = (uint32_t)query_meta->ne[0];
+    pc.flags = p._reserved;
+    vk_subbuffer bq     = ggml_vk_tensor_subbuffer(ctx, q, false);
+    vk_subbuffer bland  = ggml_vk_tensor_subbuffer(ctx, landmarks, false);
+    vk_subbuffer bfpos  = ggml_vk_tensor_subbuffer(ctx, frag_positions, false);
+    vk_subbuffer bfmeta = ggml_vk_tensor_subbuffer(ctx, frag_meta, false);
+    vk_subbuffer bqmeta = ggml_vk_tensor_subbuffer(ctx, query_meta, false);
+    vk_subbuffer brope  = ggml_vk_tensor_subbuffer(ctx, rope_tables, false);
+    vk_subbuffer bscr   = ggml_vk_tensor_subbuffer(ctx, scratch, false);
+    vk_subbuffer bptr   = ggml_vk_tensor_subbuffer(ctx, csr_ptrs, false);
+    vk_subbuffer bsc    = ggml_vk_tensor_subbuffer(ctx, topk_scores, false);
+    vk_subbuffer bst    = ggml_vk_tensor_subbuffer(ctx, status, false);
+    vk_subbuffer bdst   = ggml_vk_tensor_subbuffer(ctx, dst, false);
+    // Zero the I32[4] status device-side (no host write into device memory).
+    ggml_vk_buffer_memset_async(subctx, bst.buffer, bst.offset, 0, 4 * sizeof(int32_t));
+    ggml_vk_sync_buffers(ctx, subctx);
+    vk_pipeline pscore = ctx->device->pipeline_xkv_landmark_score;
+    vk_pipeline psel   = ctx->device->pipeline_xkv_landmark_select;
+    GGML_ASSERT(pscore != nullptr && psel != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pscore, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, psel, 2);
+    pc.status_flag = 0;
+    ggml_vk_dispatch_pipeline(ctx, subctx, pscore,
+        { bq, bland, bfpos, bfmeta, bqmeta, brope, bscr, bst }, pc,
+        { p.n_queries * 64u, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, psel,
+        { bscr, bfmeta, bptr, bdst, bsc, bst, bscr }, pc, { p.n_queries * 64u, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+    pc.status_flag = 1;
+    ggml_vk_dispatch_pipeline(ctx, subctx, psel,
+        { bscr, bfmeta, bptr, bdst, bsc, bst, bscr }, pc, { 1, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+}
+
+struct vk_op_xkv_landmark_rows_push {
+    uint32_t version;
+    uint32_t n_queries;
+    uint32_t top_k;
+    uint32_t n_frags;
+    uint32_t refine_cap;
+    uint32_t fstride;
+    uint32_t flags;
+    uint32_t max_frag_rows;
+    uint32_t n_rows_total;
+    uint32_t n_parent_queries;
+    uint32_t has_query_map;
+    uint32_t arena_filter;
+    uint32_t global_row_base;
+    uint32_t arena_row_count;
+    uint32_t output_row_begin;
+    uint32_t status_flag; // word 15: 0 = emit, 1 = fold & compact (replaces _reserved)
+};
+static_assert(sizeof(vk_op_xkv_landmark_rows_push) == 64, "xkv rows push must be 64B");
+
+static void ggml_vk_xkv_landmark_rows(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * sel_idx, const ggml_tensor * frag_meta,
+        const ggml_tensor * frag_row_off, const ggml_tensor * frag_row_ids,
+        const ggml_tensor * frag_kv, const ggml_tensor * row_pos,
+        const ggml_tensor * row_ptrs, const ggml_tensor * row_out_pos, const ggml_tensor * row_entries,
+        const ggml_tensor * row_status, ggml_tensor * dst) {
+    ggml_xkv_landmark_rows_params p;
+    memcpy(&p, dst->op_params, sizeof(p));
+    char err[256] = {0};
+    GGML_ASSERT(ggml_xkv_landmark_rows_supports(sel_idx, frag_meta, frag_row_off, frag_row_ids,
+                                                frag_kv, row_pos, row_ptrs, dst, row_out_pos, row_entries,
+                                                row_status, &p, err, sizeof(err)));
+    vk_pipeline prows = ctx->device->pipeline_xkv_landmark_rows;
+    GGML_ASSERT(prows != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, prows, 2);
+    vk_subbuffer bsel    = ggml_vk_tensor_subbuffer(ctx, sel_idx, false);
+    vk_subbuffer bmeta   = ggml_vk_tensor_subbuffer(ctx, frag_meta, false);
+    vk_subbuffer boff    = ggml_vk_tensor_subbuffer(ctx, frag_row_off, false);
+    vk_subbuffer bids    = ggml_vk_tensor_subbuffer(ctx, frag_row_ids, false);
+    vk_subbuffer bkv     = ggml_vk_tensor_subbuffer(ctx, frag_kv, false);
+    vk_subbuffer bpos    = ggml_vk_tensor_subbuffer(ctx, row_pos, false);
+    vk_subbuffer bptrs   = ggml_vk_tensor_subbuffer(ctx, row_ptrs, false);
+    vk_subbuffer bdst    = ggml_vk_tensor_subbuffer(ctx, dst, false);
+    vk_subbuffer boutpos = ggml_vk_tensor_subbuffer(ctx, row_out_pos, false);
+    vk_subbuffer bentries= ggml_vk_tensor_subbuffer(ctx, row_entries, false);
+    vk_subbuffer bst     = ggml_vk_tensor_subbuffer(ctx, row_status, false);
+    ggml_vk_buffer_memset_async(subctx, bst.buffer, bst.offset, 0, 4 * sizeof(int32_t));
+    ggml_vk_sync_buffers(ctx, subctx);
+    vk_op_xkv_landmark_rows_push pc;
+    static_assert(sizeof(pc) == sizeof(p), "rows push must match rows params size");
+    memcpy(&pc, &p, sizeof(p));
+    pc.status_flag = 0;
+    ggml_vk_dispatch_pipeline(ctx, subctx, prows,
+        { bsel, bmeta, boff, bids, bkv, bpos, bptrs, bdst, boutpos, bentries, bst }, pc, { p.n_queries * 64u, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+    pc.status_flag = 1;
+    ggml_vk_dispatch_pipeline(ctx, subctx, prows,
+        { bsel, bmeta, boff, bids, bkv, bpos, bptrs, bdst, boutpos, bentries, bst }, pc, { 1, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+}
+
+static void ggml_vk_xkv_landmark_merge(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * set_idx, const ggml_tensor * set_sc,
+        const ggml_tensor * set_base, const ggml_tensor * out_sc,
+        const ggml_tensor * status, ggml_tensor * dst) {
+    ggml_xkv_landmark_merge_params p;
+    memcpy(&p, dst->op_params, sizeof(p));
+    char err[256] = {0};
+    GGML_ASSERT(ggml_xkv_landmark_merge_supports(set_idx, set_sc, set_base, out_sc,
+                                                 status, dst, &p, err, sizeof(err)));
+    vk_pipeline pmerge = ctx->device->pipeline_xkv_landmark_merge;
+    GGML_ASSERT(pmerge != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pmerge, 1);
+    vk_subbuffer bidx    = ggml_vk_tensor_subbuffer(ctx, set_idx, false);
+    vk_subbuffer bsc     = ggml_vk_tensor_subbuffer(ctx, set_sc, false);
+    vk_subbuffer bbase   = set_base ? ggml_vk_tensor_subbuffer(ctx, set_base, false) : bidx;
+    vk_subbuffer bdst    = ggml_vk_tensor_subbuffer(ctx, dst, false);
+    vk_subbuffer boutsc  = ggml_vk_tensor_subbuffer(ctx, out_sc, false);
+    vk_subbuffer bst     = ggml_vk_tensor_subbuffer(ctx, status, false);
+    ggml_vk_buffer_memset_async(subctx, bst.buffer, bst.offset, 0, 4 * sizeof(int32_t));
+    ggml_vk_sync_buffers(ctx, subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pmerge,
+        { bidx, bsc, bbase, bdst, boutsc, bst }, p, { p.n_queries * 64u, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+}
+
 static void ggml_vk_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     float * op_params = (float *)dst->op_params;
     vk_op_unary_push_constants p = vk_op_unary_push_constants_init(src0, dst);
@@ -16650,6 +17014,43 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_TURBO_WHT:
         ggml_vk_turbo_wht(ctx, compute_ctx, src0, node);
 
+        break;
+    case GGML_OP_XKV_RECONSTRUCT:
+        ggml_vk_xkv_reconstruct(ctx, compute_ctx, src0, src1, src2, src3,
+            node->src[4], node->src[5], node->src[6], node->src[7], node->src[8], node);
+
+        break;
+    case GGML_OP_XKV_ATTENTION:
+        ggml_vk_xkv_attention(ctx, compute_ctx, src0, src1, src2, src3,
+            node->src[4], node->src[5], node->src[6], node->src[7], node->src[8], node->src[9], node);
+
+        break;
+    case GGML_OP_XKV_FACTORIZE:
+        ggml_vk_xkv_factorize(ctx, compute_ctx, src0, src1, src2, src3, node);
+
+        break;
+    case GGML_OP_XKV_CANONICALIZE:
+        ggml_vk_xkv_canonicalize(ctx, compute_ctx, src0, src1, src2, src3,
+            node->src[4], node->src[5], node);
+
+        break;
+    case GGML_OP_XKV_LANDMARK:
+        ggml_vk_xkv_landmark(ctx, compute_ctx, src0, src1, src2, src3,
+            node->src[4], node->src[5], node->src[6], node->src[7], node->src[8], node->src[9], node);
+
+        break;
+    case GGML_OP_XKV_LANDMARK_BUILD:
+        ggml_vk_xkv_landmark_build(ctx, compute_ctx, src0, src1, src2, src3,
+            node->src[4], node->src[5], node->src[6], node->src[7], node->src[8], node->src[9], node);
+
+        break;
+    case GGML_OP_XKV_LANDMARK_ROWS:
+        ggml_vk_xkv_landmark_rows(ctx, compute_ctx, src0, src1, src2, src3,
+            node->src[4], node->src[5], node->src[6], node->src[7], node->src[8], node->src[9], node);
+        break;
+    case GGML_OP_XKV_LANDMARK_MERGE:
+        ggml_vk_xkv_landmark_merge(ctx, compute_ctx, src0, src1, src2, src3,
+            node->src[4], node);
         break;
     case GGML_OP_SILU_BACK:
         ggml_vk_silu_back(ctx, compute_ctx, src0, src1, node);
@@ -19748,6 +20149,23 @@ static bool ggml_vk_flash_prefill_attn_ok(const vk_device & device, const ggml_t
     if (!ggml_vk_flash_prefill_aligned(device, q) || !ggml_vk_flash_prefill_aligned(device, k) ||
         !ggml_vk_flash_prefill_aligned(device, v) || !ggml_vk_flash_prefill_aligned(device, op)) {
         return false;
+// XKV device-affinity gate (parent directive): factor/attention/landmark nodes
+// carry backend-resident code-stream handles with an owning backend. When
+// placement is already known (allocated buffers), every tensor of the node
+// must live on THIS Vulkan device. A group silently spanning devices is
+// rejected here so the Runtime splits (or fails) multi-device graphs
+// upstream — never implicit D2D copies, readback, or unaccounted B
+// duplication inside the kernel. Unknown placement (null buffers) passes
+// through; the scheduler then assigns single-device or explicit copies.
+static bool ggml_vk_xkv_single_device(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    for (int i = -1; i < GGML_MAX_SRC; ++i) {
+        const ggml_tensor * t = (i < 0) ? op : op->src[i];
+        if (!t) continue;
+        const ggml_tensor * root = t;
+        while (root->view_src) root = root->view_src;
+        if (!root->buffer) continue;
+        if (ggml_backend_buffer_is_host(root->buffer)) return false;
+        if (ggml_backend_buft_get_device(root->buffer->buft) != dev) return false;
     }
     return true;
 }
@@ -20306,6 +20724,164 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_TURBO_WHT:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 128 == 0;
+        case GGML_OP_XKV_RECONSTRUCT:
+            {
+                // 9 srcs: A_K,B_K,A_V,B_V,refs,positions,group_meta,layer_meta,rope_tables. Mixed
+                // Turbo/canonical explicitly unsupported on Vulkan v1 (CPU
+                // oracle covers mixed via canonical decode).
+                if (!op->src[0] || !op->src[1] || !op->src[2] || !op->src[3] ||
+                    !op->src[4] || !op->src[5] || !op->src[6] || !op->src[7] || !op->src[8]) {
+                    return false;
+                }
+                ggml_xkv_reconstruct_params p;
+                memcpy(&p, op->op_params, sizeof(p));
+                char err[256] = {0};
+                if (!ggml_xkv_reconstruct_supports(op->src[0], op->src[1], op->src[2],
+                    op->src[3], op->src[4], op->src[5], op->src[6], op->src[7], op->src[8], op, &p,
+                    err, sizeof(err))) {
+                    return false;
+                }
+                // Vulkan v1 kernel subset: matched Turbo pairs and canonical
+                // pairs only; mixed Turbo/canonical explicitly unsupported
+                // (CPU oracle covers mixed via canonical decode).
+                auto is_turbo = [](enum ggml_type t) {
+                    return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+                };
+                bool kak = is_turbo(op->src[0]->type), kbk = is_turbo(op->src[1]->type);
+                bool kav = is_turbo(op->src[2]->type), kbv = is_turbo(op->src[3]->type);
+                if ((kak != kbk) || (kav != kbv)) {
+                    return false;
+                }
+                return true;
+            }
+        case GGML_OP_XKV_ATTENTION:
+            {
+                // q,k_hot,v_hot,k_cold,v_cold,entries,offsets,sinks?,status,carry?.
+                if (!op->src[0] || !op->src[1] || !op->src[2] || !op->src[3] ||
+                    !op->src[4] || !op->src[5] || !op->src[6] || !op->src[8]) {
+                    return false;
+                }
+                if (!ggml_vk_xkv_single_device(dev, op)) return false;
+                ggml_xkv_attention_params p;
+                memcpy(&p, op->op_params, sizeof(p));
+                char err[256] = {0};
+                if (!ggml_xkv_attention_supports(op->src[0], op->src[1], op->src[2],
+                    op->src[3], op->src[4], op->src[5], op->src[6], op->src[7], op->src[8], op->src[9], op, &p,
+                    err, sizeof(err))) {
+                    return false;
+                }
+                // Index/output tensors must be densely packed for flat shader indexing.
+                if (!ggml_is_contiguous(op->src[5]) || !ggml_is_contiguous(op->src[6]) ||
+                    !ggml_is_contiguous(op->src[8]) || !ggml_is_contiguous(op)) {
+                    return false;
+                }
+                if (op->src[7] && !ggml_is_contiguous(op->src[7])) return false;
+                if (op->src[9] && !ggml_is_contiguous(op->src[9])) return false;
+                if ((p.flags & (GGML_XKV_ATTN_FLAG_FIRST_TILE | GGML_XKV_ATTN_FLAG_FINAL_TILE)) ==
+                        (GGML_XKV_ATTN_FLAG_FIRST_TILE | GGML_XKV_ATTN_FLAG_FINAL_TILE) &&
+                    p.n_cold > GGML_XKV_ATTN_DENSE_COLD_MAX) {
+                    return false;
+                }
+                return true;
+            }
+        case GGML_OP_XKV_FACTORIZE:
+            {
+                if (!op->src[0] || !op->src[1] || !op->src[2] || !op->src[3]) return false;
+                if (!ggml_vk_xkv_single_device(dev, op)) return false;
+                ggml_xkv_factorize_params p;
+                memcpy(&p, op->op_params, sizeof(p));
+                char err[256] = {0};
+                return ggml_xkv_factorize_supports(op->src[0], op->src[1], op->src[2],
+                    op->src[3], op, &p, err, sizeof(err));
+            }
+        case GGML_OP_XKV_CANONICALIZE:
+            {
+                if (!op->src[0] || !op->src[1] || !op->src[2] || !op->src[3] ||
+                    !op->src[4] || !op->src[5]) return false;
+                if (!ggml_vk_xkv_single_device(dev, op)) return false;
+                ggml_xkv_canonicalize_params p;
+                memcpy(&p, op->op_params, sizeof(p));
+                char err[256] = {0};
+                return ggml_xkv_canonicalize_supports(op->src[0], op->src[1], op->src[2],
+                    op->src[3], op->src[4], op->src[5], op, &p, err, sizeof(err));
+            }
+        case GGML_OP_XKV_LANDMARK:
+            {
+                // 10 srcs: q,landmarks,frag_pos,frag_meta,query_meta,rope,scratch,
+                // csr_ptrs,topk_scores,status.
+                for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                    if (!op->src[i]) return false;
+                }
+                if (!ggml_vk_xkv_single_device(dev, op)) return false;
+                ggml_xkv_landmark_params p;
+                memcpy(&p, op->op_params, sizeof(p));
+                char err[256] = {0};
+                if (!ggml_xkv_landmark_supports(op->src[0], op->src[1], op->src[2],
+                    op->src[3], op->src[4], op->src[5], op->src[6], op->src[7],
+                    op->src[8], op->src[9], op, &p, err, sizeof(err))) {
+                    return false;
+                }
+                // Device kernel subset: Q8_0/Turbo4 only (host gates first),
+                // Turbo4 requires whole 128-groups, shader register file <= 1024,
+                // and the refine hit-bit packs into the refined word (< 2^31).
+                if (p.landmark_type != (uint32_t)GGML_TYPE_Q8_0 &&
+                    p.landmark_type != (uint32_t)GGML_TYPE_TURBO4_0) {
+                    return false;
+                }
+                if (p.padded_dim == 0 || p.padded_dim > 1024) return false;
+                if (p.landmark_type == (uint32_t)GGML_TYPE_TURBO4_0 && p.padded_dim % 128u != 0) {
+                    return false;
+                }
+                if (p.refine_cap >= 0x80000000u) return false;
+                return true;
+            }
+        case GGML_OP_XKV_LANDMARK_BUILD:
+            {
+                for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                    if (!op->src[i]) return false;
+                }
+                if (!ggml_vk_xkv_single_device(dev, op)) return false;
+                ggml_xkv_landmark_build_params p;
+                memcpy(&p, op->op_params, sizeof(p));
+                char err[256] = {0};
+                if (!ggml_xkv_landmark_build_supports(op->src[0], op->src[1], op->src[2],
+                    op->src[3], op->src[4], op->src[5], op->src[6], op->src[7],
+                    op->src[8], op->src[9], op, &p, err, sizeof(err))) {
+                    return false;
+                }
+                // Vulkan v1 factor codecs: F32/F16/Q8_0/Turbo4_0 only
+                bool fok = (p.a_type == (uint32_t)GGML_TYPE_F32 || p.a_type == (uint32_t)GGML_TYPE_F16 ||
+                            p.a_type == (uint32_t)GGML_TYPE_Q8_0 || p.a_type == (uint32_t)GGML_TYPE_TURBO4_0) &&
+                           (p.b_type == (uint32_t)GGML_TYPE_F32 || p.b_type == (uint32_t)GGML_TYPE_F16 ||
+                            p.b_type == (uint32_t)GGML_TYPE_Q8_0 || p.b_type == (uint32_t)GGML_TYPE_TURBO4_0);
+                if (!fok) return false;
+                return true;
+            }
+        case GGML_OP_XKV_LANDMARK_ROWS:
+            {
+                if (!ggml_vk_xkv_single_device(dev, op)) return false;
+                ggml_xkv_landmark_rows_params p;
+                memcpy(&p, op->op_params, sizeof(p));
+                char err[256] = {0};
+                if (!ggml_xkv_landmark_rows_supports(op->src[0], op->src[1], op->src[2],
+                    op->src[3], op->src[4], op->src[5], op->src[6], op, op->src[7],
+                    op->src[8], op->src[9], &p, err, sizeof(err))) {
+                    return false;
+                }
+                return true;
+            }
+        case GGML_OP_XKV_LANDMARK_MERGE:
+            {
+                if (!ggml_vk_xkv_single_device(dev, op)) return false;
+                ggml_xkv_landmark_merge_params p;
+                memcpy(&p, op->op_params, sizeof(p));
+                char err[256] = {0};
+                if (!ggml_xkv_landmark_merge_supports(op->src[0], op->src[1], op->src[2],
+                    op->src[3], op->src[4], op, &p, err, sizeof(err))) {
+                    return false;
+                }
+                return true;
+            }
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             return true; // all inputs are contiguous, see ggml.c
@@ -21060,6 +21636,49 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                 tensor_clone->src[i] = src_clone[i];
             }
             memcpy(tensor_clone->op_params, tensor->op_params, sizeof(tensor_clone->op_params));
+        } else if (tensor->op == GGML_OP_XKV_RECONSTRUCT) {
+            ggml_xkv_reconstruct_params p;
+            memcpy(&p, tensor->op_params, sizeof(p));
+            tensor_clone = ggml_xkv_reconstruct(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                src_clone[3], src_clone[4], src_clone[5], src_clone[6], src_clone[7], src_clone[8], &p);
+        } else if (tensor->op == GGML_OP_XKV_ATTENTION) {
+            ggml_xkv_attention_params p;
+            memcpy(&p, tensor->op_params, sizeof(p));
+            tensor_clone = ggml_xkv_attention(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                src_clone[3], src_clone[4], src_clone[5], src_clone[6], src_clone[7], src_clone[8], src_clone[9], &p);
+        } else if (tensor->op == GGML_OP_XKV_FACTORIZE) {
+            ggml_xkv_factorize_params p;
+            memcpy(&p, tensor->op_params, sizeof(p));
+            tensor_clone = ggml_xkv_factorize(ggml_ctx, src_clone[0], src_clone[1],
+                src_clone[2], src_clone[3], &p);
+        } else if (tensor->op == GGML_OP_XKV_CANONICALIZE) {
+            ggml_xkv_canonicalize_params p;
+            memcpy(&p, tensor->op_params, sizeof(p));
+            tensor_clone = ggml_xkv_canonicalize(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                src_clone[3], src_clone[4], src_clone[5], &p);
+        } else if (tensor->op == GGML_OP_XKV_LANDMARK) {
+            ggml_xkv_landmark_params p;
+            memcpy(&p, tensor->op_params, sizeof(p));
+            tensor_clone = ggml_xkv_landmark(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                src_clone[3], src_clone[4], src_clone[5], src_clone[6], src_clone[7],
+                src_clone[8], src_clone[9], &p);
+        } else if (tensor->op == GGML_OP_XKV_LANDMARK_BUILD) {
+            ggml_xkv_landmark_build_params p;
+            memcpy(&p, tensor->op_params, sizeof(p));
+            tensor_clone = ggml_xkv_landmark_build(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                src_clone[3], src_clone[4], src_clone[5], src_clone[6], src_clone[7],
+                src_clone[8], src_clone[9], &p);
+        } else if (tensor->op == GGML_OP_XKV_LANDMARK_ROWS) {
+            ggml_xkv_landmark_rows_params p;
+            memcpy(&p, tensor->op_params, sizeof(p));
+            tensor_clone = ggml_xkv_landmark_rows(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                src_clone[3], src_clone[4], src_clone[5], src_clone[6], src_clone[7],
+                src_clone[8], src_clone[9], &p);
+        } else if (tensor->op == GGML_OP_XKV_LANDMARK_MERGE) {
+            ggml_xkv_landmark_merge_params p;
+            memcpy(&p, tensor->op_params, sizeof(p));
+            tensor_clone = ggml_xkv_landmark_merge(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                src_clone[3], src_clone[4], &p);
         } else if (tensor->op == GGML_OP_MUL_MAT) {
             tensor_clone = ggml_mul_mat(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_MUL_MAT_ID) {

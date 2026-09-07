@@ -5,6 +5,8 @@
 #include "../src/llama-ext.h"
 #include "../src/llama-flashprefill.h"
 #include "../src/llama-flashprefill-layout.h"
+#include "../src/llama-model.h"
+#include "../src/llama-xkv-factor.h"
 
 #include <array>
 #include <cassert>
@@ -223,6 +225,295 @@ static bool common_fp_dims_from_model(const llama_model * model, const llama_con
     }
     if (is_turbo(cparams->type_v) && out.dv % 128 != 0) {
         out.dv = ((out.dv + 127) / 128) * 128;
+static bool xkv_checked_mul_u64(uint64_t a, uint64_t b, uint64_t & out) {
+    if (a == 0 || b == 0) {
+        out = 0;
+        return true;
+    }
+    if (a > UINT64_MAX / b) {
+        return false;
+    }
+    out = a * b;
+    return true;
+}
+
+static bool xkv_checked_add_u64(uint64_t a, uint64_t b, uint64_t & out) {
+    if (UINT64_MAX - a < b) {
+        return false;
+    }
+    out = a + b;
+    return true;
+}
+
+static bool xkv_checked_sum_fit_bytes(uint64_t model, uint64_t context, uint64_t compute,
+        uint64_t reserved, uint64_t headroom, uint64_t & out) {
+    uint64_t sum = 0;
+    return xkv_checked_add_u64(model, context, sum) &&
+           xkv_checked_add_u64(sum, compute, sum) &&
+           xkv_checked_add_u64(sum, reserved, sum) &&
+           xkv_checked_add_u64(sum, headroom, out);
+}
+
+bool common_xkv_fit_reserve_bytes(const llama_context_params * cparams, uint64_t scratch_bytes,
+        common_xkv_fit_reserve * out) {
+    if (out == nullptr) {
+        return false;
+    }
+    *out = {};
+    if (cparams == nullptr || !llama_xkv_is_enabled(cparams->xkv_mode)) {
+        return true;
+    }
+    constexpr uint64_t MiB = 1024ull * 1024ull;
+    uint64_t workspace = 0;
+    uint64_t decode_cache = 0;
+    // Any overflow fails closed: the caller treats it as "does not fit".
+    if (!xkv_checked_mul_u64((uint64_t) cparams->xkv_workspace_mib, MiB, workspace) ||
+        !xkv_checked_mul_u64((uint64_t) cparams->xkv_decode_cache_mib, MiB, decode_cache)) {
+        *out = {};
+        out->total_bytes = UINT64_MAX;
+        return false;
+    }
+    if (workspace == 0) {
+        *out = {};
+        out->total_bytes = UINT64_MAX;
+        return false; // transient budget is required when XKV is enabled
+    }
+    // Sub-budget discipline: the decode sub-budget plus the exact seal
+    // scratch must fit inside the one workspace allocation (or an explicit
+    // shared-eviction protocol, which does not exist: fail closed).
+    uint64_t concurrent = 0;
+    if (!xkv_checked_add_u64(decode_cache, scratch_bytes, concurrent) || concurrent > workspace) {
+        *out = {};
+        out->total_bytes = UINT64_MAX;
+        return false;
+    }
+    out->workspace_bytes       = workspace;
+    out->decode_cache_bytes    = decode_cache;
+    out->factor_scratch_bytes  = scratch_bytes;
+    out->total_bytes           = workspace; // once: never the sum
+    return true;
+}
+
+uint32_t common_xkv_store_mib_for_bytes(uint64_t dense_ctx_bytes, double min_saving) {
+    constexpr uint64_t MiB = 1024ull * 1024ull;
+    if (dense_ctx_bytes == 0) {
+        return 0;
+    }
+    // Invalid min_saving must fail at caller (return 0), not silently change
+    // policy in production helper.
+    if (!std::isfinite(min_saving) || min_saving < 0.0 || min_saving >= 1.0) {
+        return 0;
+    }
+    // Compute conservative ceil bytes with long double (never underbudget
+    // exactly at MiB boundaries due to float truncation):
+    const long double ld_dense = (long double) dense_ctx_bytes;
+    const long double ld_factor = (long double) 1.0 - (long double) min_saving;
+    const long double ld_exact_target = ld_dense * ld_factor;
+    if (!std::isfinite(ld_exact_target) || ld_exact_target <= 0.0L || ld_exact_target > (long double) UINT64_MAX) {
+        return 0;
+    }
+    // std::ceil ensures we never underbudget mathematical target by even 1 byte
+    const long double ld_ceil_bytes = std::ceil(ld_exact_target);
+    if (ld_ceil_bytes > (long double) UINT64_MAX) {
+        return 0;
+    }
+    uint64_t est_bytes = (uint64_t) ld_ceil_bytes;
+    if (est_bytes < MiB) {
+        est_bytes = MiB; // minimum 1 MiB nonzero budget
+    }
+    // Checked ceil MiB division
+    uint64_t mib_num = 0;
+    if (!xkv_checked_add_u64(est_bytes, MiB - 1, mib_num)) {
+        return 0;
+    }
+    const uint64_t mib = mib_num / MiB;
+    if (mib == 0 || mib > UINT32_MAX) {
+        return 0;
+    }
+    return (uint32_t) mib;
+}
+
+uint32_t common_xkv_store_mib_with_overlap(
+        uint64_t dense_ctx_bytes,
+        double min_saving,
+        uint32_t seg_tokens,
+        uint32_t k_tokens) {
+    const uint32_t base = common_xkv_store_mib_for_bytes(dense_ctx_bytes, min_saving);
+    if (base == 0 || seg_tokens == 0 || k_tokens == 0) {
+        return base;
+    }
+    // One segment's dense share, same factored ratio, capped at the base:
+    // an in-flight COW replacement holds old + new versions of one segment.
+    uint64_t seg_dense = 0;
+    if (!xkv_checked_mul_u64(dense_ctx_bytes, seg_tokens, seg_dense)) {
+        return 0;
+    }
+    seg_dense = seg_dense / k_tokens;
+    if (seg_dense > dense_ctx_bytes) {
+        seg_dense = dense_ctx_bytes;
+    }
+    const uint32_t seg_mib = common_xkv_store_mib_for_bytes(seg_dense, min_saving);
+    uint64_t total_mib = base;
+    if (seg_mib > 0) {
+        uint64_t sum = 0;
+        if (!xkv_checked_add_u64(base, seg_mib > base ? base : seg_mib, sum) || sum > UINT32_MAX) {
+            return 0;
+        }
+        total_mib = sum;
+    }
+    return (uint32_t) total_mib;
+}
+
+bool common_xkv_partition_budget(uint64_t total, const uint64_t * weights, uint64_t * shares, size_t n) {
+    if (n == 0) {
+        return true;
+    }
+    if (weights == nullptr || shares == nullptr) {
+        return false;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        shares[i] = 0;
+    }
+    if (total == 0) {
+        return true;
+    }
+    uint64_t wsum = 0;
+    size_t imax = 0;
+    for (size_t i = 0; i < n; ++i) {
+        uint64_t next = 0;
+        if (!xkv_checked_add_u64(wsum, weights[i], next)) {
+            return false; // weight sums never overflow in practice; fail closed
+        }
+        wsum = next;
+        if (weights[i] > weights[imax]) {
+            imax = i;
+        }
+    }
+    if (wsum == 0) {
+        // No placement info: split equally, remainder to shares[0].
+        const uint64_t q = total / n;
+        uint64_t acc = 0;
+        for (size_t i = 0; i < n; ++i) {
+            shares[i] = q;
+            acc += q;
+        }
+        shares[0] += total - acc;
+        return true;
+    }
+    // Exact-sum partition: floor shares plus the whole remainder (which is
+    // < n) to the largest weight, so the shares sum to exactly total.
+    __uint128_t acc = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (i == imax) {
+            continue;
+        }
+        shares[i] = (uint64_t) ((__uint128_t) total * weights[i] / wsum);
+        acc += shares[i];
+    }
+    shares[imax] = total - (uint64_t) acc;
+    return true;
+}
+
+bool common_xkv_scratch_for_group(
+        uint32_t seg_tokens,
+        uint32_t chunk_tokens,
+        uint64_t feat_k,
+        uint64_t feat_v,
+        uint32_t rank_k,
+        uint32_t rank_v,
+        ggml_type landmark_type,
+        uint64_t * out_bytes) {
+    if (out_bytes == nullptr) {
+        return false;
+    }
+    *out_bytes = 0;
+    if (seg_tokens == 0 || feat_k == 0 || feat_v == 0 || rank_k == 0 || rank_v == 0) {
+        return false;
+    }
+    if (landmark_type != GGML_TYPE_F32 && landmark_type != GGML_TYPE_F16 &&
+        landmark_type != GGML_TYPE_Q8_0 && landmark_type != GGML_TYPE_TURBO4_0) {
+        return false;
+    }
+    const int64_t lm_blck = ggml_blck_size(landmark_type);
+    if (lm_blck <= 0 || (int64_t) feat_k % lm_blck != 0) {
+        return false;
+    }
+    const uint32_t chunk = chunk_tokens == 0 ? 1 : chunk_tokens;
+    std::string err;
+    // Exact rSVD factorize peaks per stream (outputs + live scratch).
+    uint64_t ws_k = 0;
+    uint64_t ws_v = 0;
+    uint64_t out_k = 0;
+    if (!llama_xkv::estimate_factorize_matrix_workspace_bytes(seg_tokens, feat_k, rank_k, 16, 2, &ws_k, &err) ||
+        !llama_xkv::estimate_factorize_matrix_workspace_bytes(seg_tokens, feat_v, rank_v, 16, 2, &ws_v, &err) ||
+        !llama_xkv::estimate_factor_output_bytes(seg_tokens, feat_k, rank_k, &out_k, &err)) {
+        return false;
+    }
+    // Simultaneous K+V peak (K output live during V factorization), same
+    // terms as estimate_factorize_kv_workspace_bytes.
+    uint64_t term2 = 0;
+    uint64_t ws_fact = ws_k;
+    if (!xkv_checked_add_u64(out_k, ws_v, term2)) {
+        return false;
+    }
+    ws_fact = std::max(ws_fact, term2);
+    // Quantized-shadow streaming tile extra beyond the FP outputs above
+    // (4 encoded streams only shrink vs FP; the tile streams alongside).
+    uint64_t rank_sum = 0;
+    uint64_t tile_elems = 0;
+    uint64_t tile_extra = 0;
+    if (!xkv_checked_add_u64(rank_k, rank_v, rank_sum) ||
+        !xkv_checked_mul_u64(chunk, rank_sum, tile_elems) ||
+        !xkv_checked_mul_u64(tile_elems, sizeof(float), tile_extra)) {
+        return false;
+    }
+    // Canonical pre-RoPE capture peak (F32 K+V rows for the segment).
+    uint64_t feat_sum = 0;
+    uint64_t cap_elems = 0;
+    uint64_t capture = 0;
+    if (!xkv_checked_add_u64(feat_k, feat_v, feat_sum) ||
+        !xkv_checked_mul_u64(seg_tokens, feat_sum, cap_elems) ||
+        !xkv_checked_mul_u64(cap_elems, sizeof(float), capture)) {
+        return false;
+    }
+    // Landmark stream bound: one pooled vector per fragment. Landmarks
+    // summarize reconstructed K only (never K+V): row size is ggml_row_size
+    // over feat_k, not feat_sum. Exact, not estimated.
+    const uint64_t n_frag = ((uint64_t) seg_tokens + chunk - 1) / chunk;
+    if (feat_k > (uint64_t) INT64_MAX) {
+        return false;
+    }
+    const size_t lm_row = ggml_row_size(landmark_type, (int64_t) feat_k);
+    uint64_t landmark = 0;
+    if (lm_row == 0 || !xkv_checked_mul_u64(n_frag, (uint64_t) lm_row, landmark)) {
+        return false;
+    }
+    // Telemetry and staging metadata scratch:
+    // Status tensors, singular value vectors S, landmark error bounds eb,
+    // source fingerprints srcfp, and staging context overhead.
+    uint64_t n_frag_eb = 0;
+    uint64_t n_frag_srcfp = 0;
+    uint64_t telem_staging = 0;
+    if (!xkv_checked_mul_u64(n_frag, sizeof(float), n_frag_eb) ||
+        !xkv_checked_mul_u64(n_frag, sizeof(uint64_t), n_frag_srcfp) ||
+        !xkv_checked_add_u64(n_frag_eb, n_frag_srcfp, telem_staging) ||
+        !xkv_checked_add_u64(telem_staging, 4096, telem_staging)) {
+        return false;
+    }
+    // Backend stream allocator alignment padding (e.g. 256-byte alignment per stream
+    // across the 5 destination streams: A_K, B_K, A_V, B_V, and landmark).
+    constexpr uint64_t stream_alloc_align = 5ull * 256ull;
+
+    // Conservative simultaneous sum: peaks may not fully coincide, but
+    // under-reserving seal-time workspace is the unsafe direction.
+    uint64_t total = 0;
+    uint64_t tmp = 0;
+    if (!xkv_checked_add_u64(ws_fact, tile_extra, tmp) ||
+        !xkv_checked_add_u64(tmp, capture, total) ||
+        !xkv_checked_add_u64(total, landmark, total) ||
+        !xkv_checked_add_u64(total, telem_staging, total) ||
+        !xkv_checked_add_u64(total, stream_alloc_align, *out_bytes)) {
+        return false;
     }
     return true;
 }
@@ -278,6 +569,221 @@ static void common_fp_log_fit_result(
     LOG_INF("%s: FlashPrefill enabled, fitted %s K=%u tokens (Hkv=%u Dk=%u Dv=%u GQA=%u ubatch=%u BN=%u F=%u); worst-case eligible scratch peak=%llu KiB\n",
         __func__, what, n_ctx_kv, dims.hkv, dims.dk, dims.dv, dims.gqa, cparams->n_ubatch, cparams->flashprefill.block_k, frags,
         (unsigned long long) (bytes / KiB));
+bool common_xkv_scratch_bytes(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        uint64_t * out_bytes) {
+    if (out_bytes == nullptr) {
+        return false;
+    }
+    *out_bytes = 0;
+    if (path_model == nullptr || mparams == nullptr || cparams == nullptr) {
+        return false;
+    }
+    if (!llama_xkv_is_enabled(cparams->xkv_mode)) {
+        return true; // OFF: no scratch
+    }
+    const uint32_t group = cparams->xkv_group_size;
+    if (group == 0 || cparams->xkv_segment_tokens == 0 ||
+        cparams->xkv_rank_k == 0 || cparams->xkv_rank_v == 0) {
+        return false;
+    }
+    // Metadata-only model (never XKV runtime) for hparams geometry.
+    llama_model_params meta_mparams = *mparams;
+    meta_mparams.no_alloc = true;
+    meta_mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+    llama_model * meta_model = llama_model_load_from_file(path_model, meta_mparams);
+    if (meta_model == nullptr) {
+        return false;
+    }
+    uint64_t dk_max = 0;
+    uint64_t dv_max = 0;
+    bool any_trunk = false;
+    const auto & hp = meta_model->hparams;
+    const uint32_t n_layer = hp.n_layer();
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (hp.is_recr(il) || hp.is_swa(il)) {
+            continue;
+        }
+        // Dedup owning layers when model specifies layer KV sharing
+        // (e.g. Gemma3n / Gemma4 assistant where layers beyond n_layer_kv_from_start
+        // share/reuse earlier KV storage; other architectures have independent layers).
+        if (hp.n_layer_kv_from_start >= 0 && il >= (uint32_t) hp.n_layer_kv_from_start) {
+            continue; // Reused layer: storage is already accounted under owning layer
+        }
+        if (!hp.has_kv(il)) {
+            continue;
+        }
+        const uint64_t dk = hp.n_embd_k_gqa(il);
+        const uint64_t dv = hp.n_embd_v_gqa(il);
+        if (dk == 0 || dv == 0) {
+            continue; // no KV (projection-only layer)
+        }
+        any_trunk = true;
+        dk_max = std::max(dk_max, dk);
+        dv_max = std::max(dv_max, dv);
+    }
+    llama_model_free(meta_model);
+    if (!any_trunk) {
+        return false;
+    }
+    // Largest alias-dedup group bound: every member is at most the per-layer
+    // max, so group_size * max bounds any spliced group the store builds.
+    uint64_t feat_k = 0;
+    uint64_t feat_v = 0;
+    if (!xkv_checked_mul_u64(group, dk_max, feat_k) ||
+        !xkv_checked_mul_u64(group, dv_max, feat_v)) {
+        return false;
+    }
+    return common_xkv_scratch_for_group(
+        cparams->xkv_segment_tokens, cparams->xkv_chunk_tokens,
+        feat_k, feat_v, cparams->xkv_rank_k, cparams->xkv_rank_v,
+        cparams->xkv_landmark_type, out_bytes);
+}
+
+uint64_t common_xkv_store_budget_bytes(const llama_context_params * cparams) {
+    if (cparams == nullptr || !llama_xkv_is_enabled(cparams->xkv_mode)) {
+        return 0;
+    }
+    // SHADOW is evaluate-only with no segment publication for every profile.
+    if (cparams->xkv_mode == LLAMA_XKV_MODE_SHADOW) {
+        return 0;
+    }
+    if (cparams->xkv_store_mib == 0) {
+        return 0; // auto-derive placeholder, resolved after auto-fit
+    }
+    uint64_t bytes = 0;
+    if (!xkv_checked_mul_u64((uint64_t) cparams->xkv_store_mib, 1024ull * 1024ull, bytes)) {
+        return UINT64_MAX;
+    }
+    return bytes;
+}
+
+uint64_t common_xkv_store_device_bytes(const llama_context_params * cparams, uint64_t store_bytes) {
+    if (cparams == nullptr) {
+        return 0;
+    }
+    // Same effective residency predicate the runtime enforces
+    // (llama_xkv_profile_is_device_owned): profile alone never decides.
+    if (!llama_xkv_profile_is_device_owned(cparams->xkv_storage_profile, cparams->xkv_factorizer)) {
+        return 0;
+    }
+    return store_bytes;
+}
+
+uint32_t common_xkv_derive_store_mib(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        uint32_t n_ctx_kv_fit,
+        ggml_log_level log_level) {
+    if (path_model == nullptr || mparams == nullptr || cparams == nullptr || n_ctx_kv_fit == 0) {
+        return 0;
+    }
+    if (!llama_xkv_is_enabled(cparams->xkv_mode)) {
+        return 0;
+    }
+    (void) log_level;
+    // Genuine dense KV equivalent: exact same-row original K/V bytes only
+    // across all owning attention layers (excluding non-KV context/compute
+    // memory). Derived directly from model hparams and effective K/V tensor
+    // row sizes × n_ctx_kv_fit.
+    llama_model_params meta_mparams = *mparams;
+    meta_mparams.no_alloc = true;
+    meta_mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+    llama_model * meta_model = llama_model_load_from_file(path_model, meta_mparams);
+    if (meta_model == nullptr) {
+        return 0;
+    }
+    const auto & hp = meta_model->hparams;
+    const uint32_t n_layer = hp.n_layer();
+    const ggml_type type_k = cparams->type_k;
+    const ggml_type type_v = cparams->type_v;
+    const bool k_is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
+    const bool v_is_turbo = (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0);
+
+    uint64_t single_token_kv_bytes = 0;
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (hp.is_recr(il) || hp.is_swa(il)) {
+            continue;
+        }
+        // Dedup owning layers when model specifies layer KV sharing
+        // (e.g. Gemma3n / Gemma4 assistant where layers beyond n_layer_kv_from_start
+        // share/reuse earlier KV storage; other architectures have independent layers).
+        if (hp.n_layer_kv_from_start >= 0 && il >= (uint32_t) hp.n_layer_kv_from_start) {
+            continue; // Reused layer: storage is already accounted under owning layer
+        }
+        if (!hp.has_kv(il)) {
+            continue;
+        }
+        const uint64_t head_k = (uint64_t) hp.n_embd_head_k(il);
+        const uint64_t head_v = (uint64_t) hp.n_embd_head_v(il);
+        const uint64_t n_head_kv = (uint64_t) hp.n_head_kv(il);
+        if (head_k == 0 || head_v == 0 || n_head_kv == 0) {
+            continue;
+        }
+        // Checked rounding for Turbo 128-alignment (never uint32 overflow):
+        uint64_t head_k_eff = head_k;
+        if (k_is_turbo && head_k % 128 != 0) {
+            uint64_t sum_pad = 0;
+            if (!xkv_checked_add_u64(head_k, 127, sum_pad)) {
+                llama_model_free(meta_model);
+                return 0;
+            }
+            head_k_eff = (sum_pad / 128) * 128;
+        }
+        uint64_t head_v_eff = head_v;
+        if (v_is_turbo && head_v % 128 != 0) {
+            uint64_t sum_pad = 0;
+            if (!xkv_checked_add_u64(head_v, 127, sum_pad)) {
+                llama_model_free(meta_model);
+                return 0;
+            }
+            head_v_eff = (sum_pad / 128) * 128;
+        }
+        // Checked multiplication and INT64_MAX validation before ggml_row_size:
+        uint64_t ne_k_u64 = 0;
+        uint64_t ne_v_u64 = 0;
+        if (!xkv_checked_mul_u64(n_head_kv, head_k_eff, ne_k_u64) ||
+            !xkv_checked_mul_u64(n_head_kv, head_v_eff, ne_v_u64) ||
+            ne_k_u64 > (uint64_t) INT64_MAX || ne_v_u64 > (uint64_t) INT64_MAX) {
+            llama_model_free(meta_model);
+            return 0;
+        }
+        const int64_t blck_k = ggml_blck_size(type_k);
+        const int64_t blck_v = ggml_blck_size(type_v);
+        if (blck_k <= 0 || blck_v <= 0 || (int64_t) ne_k_u64 % blck_k != 0 || (int64_t) ne_v_u64 % blck_v != 0) {
+            // Reject unsupported type or non-divisible block geometry without asserts
+            llama_model_free(meta_model);
+            return 0;
+        }
+        const size_t row_k = ggml_row_size(type_k, (int64_t) ne_k_u64);
+        const size_t row_v = ggml_row_size(type_v, (int64_t) ne_v_u64);
+        if (row_k == 0 || row_v == 0) {
+            llama_model_free(meta_model);
+            return 0;
+        }
+        uint64_t layer_row = 0;
+        if (!xkv_checked_add_u64((uint64_t) row_k, (uint64_t) row_v, layer_row) ||
+            !xkv_checked_add_u64(single_token_kv_bytes, layer_row, single_token_kv_bytes)) {
+            llama_model_free(meta_model);
+            return 0;
+        }
+    }
+    llama_model_free(meta_model);
+    if (single_token_kv_bytes == 0) {
+        return 0;
+    }
+    uint64_t dense_ctx = 0;
+    if (!xkv_checked_mul_u64(single_token_kv_bytes, (uint64_t) n_ctx_kv_fit, dense_ctx)) {
+        return 0;
+    }
+    // Worst-case one-segment seal/COW overlap included, so runtime never
+    // refuses maintenance at pressure for lack of budgeted overlap bytes.
+    // Backend alignment is covered by the MiB round-up.
+    return common_xkv_store_mib_with_overlap(
+        dense_ctx, cparams->xkv_min_saving, cparams->xkv_segment_tokens, n_ctx_kv_fit);
 }
 
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
@@ -1241,6 +1747,58 @@ common_params_fit_status common_fit_kv_cache(
     // OFF: no load, fp_nat_have=false, probes add zero.
     common_fp_dims fp_nat_dims;
     const bool fp_nat_have = common_fp_load_dims(path_model, mparams, cparams, fp_nat_dims);
+    // XKV reserve is computed exactly once per fit invocation (not per
+    // probe). workspace_mib is the TOTAL transient budget (once); the exact
+    // seal scratch must fit the remainder after the decode sub-budget.
+    // OFF yields zeros and changes nothing.
+    uint64_t xkv_scratch_once = 0;
+    if (llama_xkv_is_enabled(cparams->xkv_mode)) {
+        if (!common_xkv_scratch_bytes(path_model, mparams, cparams, &xkv_scratch_once) ||
+            xkv_scratch_once == 0) {
+            LOG_WRN("%s: XKV scratch estimation failed, aborting auto-fit\n", __func__);
+            return COMMON_PARAMS_FIT_STATUS_FAILURE;
+        }
+    }
+    common_xkv_fit_reserve xkv_res = {};
+    if (!common_xkv_fit_reserve_bytes(cparams, xkv_scratch_once, &xkv_res)) {
+        LOG_WRN("%s: XKV reserve accounting failed (overflow or scratch exceeds workspace-decode), aborting auto-fit\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+    if (xkv_res.total_bytes != 0) {
+        LOG_INF("%s: XKV auto-fit reserve: workspace=%llu (once) decode_cache=%llu (inside) factor_scratch=%llu (inside)\n",
+            __func__,
+            (unsigned long long) xkv_res.workspace_bytes,
+            (unsigned long long) xkv_res.decode_cache_bytes,
+            (unsigned long long) xkv_res.factor_scratch_bytes);
+    }
+
+    // Persistent factor store budget (explicit configuration only) is
+    // accounted separately from transient seal-time peaks above: it caps
+    // persistent device bytes, not scratch. Derived budgets resolve after
+    // auto-fit and are capped at the dense equivalent, so they add nothing.
+    const uint64_t xkv_store_once_bytes = common_xkv_store_budget_bytes(cparams);
+    if (xkv_store_once_bytes == UINT64_MAX) {
+        LOG_WRN("%s: XKV store budget accounting overflow, aborting auto-fit\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+    if (xkv_store_once_bytes != 0) {
+        LOG_INF("%s: XKV persistent store reserve: %llu bytes (once per device, separate from transient peaks)\n",
+            __func__, (unsigned long long) xkv_store_once_bytes);
+    }
+
+    // Device-owned store share from the effective residency predicate: the
+    // reference profile and every cpu-reference TQ configuration stay
+    // host-resident (charged once below under unlimited-host fit); only TQ
+    // profiles on device factorizers are device-owned and partitioned here.
+    const uint64_t xkv_store_dev_total = common_xkv_store_device_bytes(cparams, xkv_store_once_bytes);
+    {
+        uint64_t host_charge = 0;
+        if (xkv_checked_add_u64(xkv_res.total_bytes,
+                xkv_store_once_bytes - xkv_store_dev_total, host_charge)) {
+            LOG_INF("%s: XKV host-charged (once, unlimited-host fit): %llu bytes\n",
+                __func__, (unsigned long long) host_charge);
+        }
+    }
 
     auto get_data = [&](uint32_t n_ctx_kv, common_device_memory_data_vec & data) {
         llama_context_params test = *cparams;
@@ -1275,6 +1833,17 @@ common_params_fit_status common_fit_kv_cache(
                 LOG_TRC("%s: extra context KV size %u probe failed: %s\n", __func__, n_ctx_kv, e.what());
                 return false;
             }
+        }
+
+        uint64_t xkv_global = 0;
+        std::vector<uint64_t> xkv_wts(devs.size(), 0);
+        std::vector<uint64_t> xkv_shares(devs.size(), 0);
+        for (size_t i = 0; i < devs.size(); ++i) {
+            xkv_wts[i] = (uint64_t) data[i].context;
+        }
+        if (!xkv_checked_add_u64(xkv_res.total_bytes, xkv_store_dev_total, xkv_global) ||
+            !common_xkv_partition_budget(xkv_global, xkv_wts.data(), xkv_shares.data(), xkv_shares.size())) {
+            return false;
         }
 
         for (size_t i = 0; i < devs.size(); ++i) {
@@ -1318,12 +1887,30 @@ common_params_fit_status common_fit_kv_cache(
             constexpr uint64_t MiB = 1024ull * 1024ull;
             const uint64_t runtime_headroom = std::min<uint64_t>(
                 256ull * MiB, std::max<uint64_t>(32ull * MiB, data[i].total / 100ull));
-            const uint64_t used = data[i].model + data[i].context + data[i].compute + reserved + runtime_headroom;
+            // XKV reserve is accounted exactly once per device evaluation
+            // (not once per reserve entry): configured workspace, decode
+            // cache, and factor scratch headroom for seal/factorize peaks.
+            // Global XKV budgets are partitioned by target-layer placement
+            // (per-device context bytes) so device shares sum to exactly the
+            // total instead of over-reserving N× on N devices.
+            // Partitioned global is workspace (once, scratch inside) plus the
+            // device-owned store share; scratch is never added outside.
+            uint64_t reserved_all = 0;
+            if (!xkv_checked_add_u64(reserved, xkv_shares[i], reserved_all)) {
+                LOG_WRN("%s: KV size %u does not fit: XKV share accounting overflow\n",
+                    __func__, n_ctx_kv);
+                return false;
+            }
+            uint64_t used = 0;
+            if (!xkv_checked_sum_fit_bytes(data[i].model, data[i].context, data[i].compute,
+                    reserved_all, runtime_headroom, used)) {
+                return false;
+            }
             if (data[i].free <= 0 || used > (uint64_t) data[i].free) {
                 LOG_WRN("%s: KV size %u does not fit: model=%llu context=%llu compute=%llu reserved=%llu headroom=%llu used=%llu free=%lld\n",
                     __func__, n_ctx_kv,
                     (unsigned long long)data[i].model, (unsigned long long)data[i].context,
-                    (unsigned long long)data[i].compute, (unsigned long long)reserved,
+                    (unsigned long long)data[i].compute, (unsigned long long)reserved_all,
                     (unsigned long long)runtime_headroom, (unsigned long long)used,
                     (long long)data[i].free);
                 return false;
@@ -1460,6 +2047,28 @@ common_params_fit_status common_fit_recurrent_cache(
     uint32_t hp_n_ctx_train = 0;
     uint32_t hp_n_expert = 0;
 
+    // XKV reserve is computed exactly once per fit invocation (not per
+    // probe): configured workspace, decode cache, and factor scratch.
+    uint64_t xkv_scratch_once = 0;
+    if (llama_xkv_is_enabled(cparams->xkv_mode)) {
+        if (!common_xkv_scratch_bytes(path_model, mparams, cparams, &xkv_scratch_once) ||
+            xkv_scratch_once == 0) {
+            LOG_WRN("%s: XKV scratch estimation failed, aborting auto-fit\n", __func__);
+            return COMMON_PARAMS_FIT_STATUS_FAILURE;
+        }
+    }
+    common_xkv_fit_reserve xkv_res = {};
+    if (!common_xkv_fit_reserve_bytes(cparams, xkv_scratch_once, &xkv_res)) {
+        LOG_WRN("%s: XKV reserve accounting failed, aborting auto-fit\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+    const uint64_t xkv_store_once_bytes = common_xkv_store_budget_bytes(cparams);
+    if (xkv_store_once_bytes == UINT64_MAX) {
+        LOG_WRN("%s: XKV store budget accounting overflow, aborting auto-fit\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+    const uint64_t xkv_store_dev_total = common_xkv_store_device_bytes(cparams, xkv_store_once_bytes);
+
     auto fits = [&](uint32_t n_seq_recurrent) {
         llama_context_params test = *cparams;
         test.n_seq_recurrent = n_seq_recurrent;
@@ -1496,11 +2105,31 @@ common_params_fit_status common_fit_recurrent_cache(
             }
         }
 
+        uint64_t xkv_global = 0;
+        std::vector<uint64_t> xkv_wts(devs.size(), 0);
+        std::vector<uint64_t> xkv_shares(devs.size(), 0);
+        for (size_t i = 0; i < devs.size(); ++i) {
+            xkv_wts[i] = (uint64_t) data[i].context;
+        }
+        if (!xkv_checked_add_u64(xkv_res.total_bytes, xkv_store_dev_total, xkv_global) ||
+            !common_xkv_partition_budget(xkv_global, xkv_wts.data(), xkv_shares.data(), xkv_shares.size())) {
+            LOG_WRN("%s: KV size %u does not fit: XKV partition accounting overflow\n",
+                __func__, n_ctx_kv);
+            return false;
+        }
+
         for (size_t i = 0; i < devs.size(); ++i) {
             uint64_t reserved = 0;
             for (const auto & [dev, bytes] : reserve) {
                 if (dev == devs[i]) {
                     reserved += bytes;
+                }
+            }
+            if (cparams->triattention) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(devs[i]);
+                const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+                if (reg_name && std::string(reg_name).find("Vulkan") != std::string::npos) {
+                    reserved += 8ull * 1024ull * 1024ull;
                 }
             }
             for (size_t j = 0; j < extra_devs.size(); ++j) {
@@ -1509,7 +2138,19 @@ common_params_fit_status common_fit_recurrent_cache(
                 }
             }
 
-            const uint64_t used = data[i].model + data[i].context + data[i].compute + reserved;
+            constexpr uint64_t MiB = 1024ull * 1024ull;
+            const uint64_t runtime_headroom = std::min<uint64_t>(
+                256ull * MiB, std::max<uint64_t>(32ull * MiB, data[i].total / 100ull));
+            uint64_t reserved_all = 0;
+            if (!xkv_checked_add_u64(reserved, xkv_shares[i], reserved_all)) {
+                return false;
+            }
+
+            uint64_t used = 0;
+            if (!xkv_checked_sum_fit_bytes(data[i].model, data[i].context, data[i].compute,
+                    reserved_all, runtime_headroom, used)) {
+                return false;
+            }
             if (data[i].free <= 0 || used > (uint64_t) data[i].free) {
                 return false;
             }
@@ -1598,6 +2239,30 @@ common_rerot_fit_result common_fit_rerot_capacities(
 
     const double e_k = std::max(1.0, (rho * double(c_context)) / 2.0);
 
+    // XKV reserve is computed exactly once per fit invocation (not per
+    // probe): configured workspace, decode cache, and factor scratch.
+    uint64_t xkv_scratch_rerot = 0;
+    if (llama_xkv_is_enabled(cparams->xkv_mode)) {
+        if (!common_xkv_scratch_bytes(path_model, mparams, cparams, &xkv_scratch_rerot) ||
+            xkv_scratch_rerot == 0) {
+            LOG_WRN("%s: XKV scratch estimation failed, aborting auto-fit\n", __func__);
+            return best;
+        }
+    }
+    common_xkv_fit_reserve xkv_res_rerot = {};
+    if (!common_xkv_fit_reserve_bytes(cparams, xkv_scratch_rerot, &xkv_res_rerot)) {
+        LOG_WRN("%s: XKV reserve accounting failed, aborting auto-fit\n", __func__);
+        return best;
+    }
+    // Persistent store budget (explicit only), separate from the one
+    // workspace allocation above.
+    const uint64_t xkv_store_rerot_bytes = common_xkv_store_budget_bytes(cparams);
+    if (xkv_store_rerot_bytes == UINT64_MAX) {
+        LOG_WRN("%s: XKV store budget accounting overflow, aborting auto-fit\n", __func__);
+        return best;
+    }
+    const uint64_t xkv_store_rerot_dev = common_xkv_store_device_bytes(cparams, xkv_store_rerot_bytes);
+
     std::vector<ggml_backend_dev_t> devs;
     uint32_t hp_ngl = 0;
     uint32_t hp_n_ctx_train = 0;
@@ -1655,6 +2320,17 @@ common_rerot_fit_result common_fit_rerot_capacities(
             }
         }
 
+        uint64_t xkv_global = 0;
+        std::vector<uint64_t> xkv_wts(devs.size(), 0);
+        std::vector<uint64_t> xkv_shares(devs.size(), 0);
+        for (size_t i = 0; i < devs.size(); ++i) {
+            xkv_wts[i] = (uint64_t) data[i].context;
+        }
+        if (!xkv_checked_add_u64(xkv_res_rerot.total_bytes, xkv_store_rerot_dev, xkv_global) ||
+            !common_xkv_partition_budget(xkv_global, xkv_wts.data(), xkv_shares.data(), xkv_shares.size())) {
+            return false;
+        }
+
         int64_t min_margin = INT64_MAX;
         for (size_t i = 0; i < devs.size(); ++i) {
             uint64_t reserved = 0;
@@ -1674,6 +2350,12 @@ common_rerot_fit_result common_fit_rerot_capacities(
                     return false;
                 }
                 reserved += nat_bytes;
+            if (cparams->triattention) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(devs[i]);
+                const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+                if (reg_name && std::string(reg_name).find("Vulkan") != std::string::npos) {
+                    reserved += 8ull * 1024ull * 1024ull;
+                }
             }
             for (size_t j = 0; j < extra_devs.size(); ++j) {
                 if (extra_devs[j] == devs[i]) {
@@ -1684,7 +2366,16 @@ common_rerot_fit_result common_fit_rerot_capacities(
             constexpr uint64_t MiB = 1024ull * 1024ull;
             const uint64_t runtime_headroom = std::min<uint64_t>(
                 256ull * MiB, std::max<uint64_t>(32ull * MiB, data[i].total / 100ull));
-            const uint64_t used = data[i].model + data[i].context + data[i].compute + reserved + runtime_headroom;
+            uint64_t reserved_all = 0;
+            if (!xkv_checked_add_u64(reserved, xkv_shares[i], reserved_all)) {
+                return false;
+            }
+            uint64_t used = 0;
+            if (!xkv_checked_sum_fit_bytes(data[i].model, data[i].context, data[i].compute,
+                    reserved_all, runtime_headroom, used)) {
+                LOG_WRN("%s: KV size %u does not fit: memory total overflow\n", __func__, n_ctx_kv);
+                return false;
+            }
             if (data[i].free <= 0 || used > (uint64_t) data[i].free) {
                 return false;
             }

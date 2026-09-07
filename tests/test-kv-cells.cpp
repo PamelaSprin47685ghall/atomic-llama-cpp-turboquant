@@ -716,6 +716,142 @@ int main() {
         assert(cells.rerot_freeze_to_archive(99, 0, 1) == 0);
         assert(cells.get_generation() != g);
         assert(cells.is_empty(0));
+    // Test 8: Stable payload ID and storage generation lifecycle
+    {
+        llama_kv_cells cells;
+        cells.resize(10);
+
+        // Empty cells must have 0 payload_id and 0 generation
+        for (uint32_t i = 0; i < 10; ++i) {
+            assert(cells.is_empty(i));
+            assert(cells.payload_id_get(i) == 0);
+            assert(cells.storage_generation_get(i) == 0);
+        }
+
+        // Nonzero unique ID allocated on occupancy, generation initialized to 1
+        cells.pos_set(1, 100);
+        cells.seq_add(1, 0);
+        const uint64_t pid1 = cells.payload_id_get(1);
+        const uint64_t gen1 = cells.storage_generation_get(1);
+        assert(pid1 != 0);
+        assert(gen1 == 1);
+
+        cells.pos_set(3, 101);
+        cells.seq_add(3, 0);
+        const uint64_t pid3 = cells.payload_id_get(3);
+        const uint64_t gen3 = cells.storage_generation_get(3);
+        assert(pid3 != 0);
+        assert(gen3 == 1);
+        assert(pid1 != pid3);
+
+        // Same-cell seq_cp sharing: adding another sequence to an occupied cell must not change payload_id or generation
+        cells.seq_add(1, 1);
+        assert(cells.payload_id_get(1) == pid1);
+        assert(cells.storage_generation_get(1) == gen1);
+
+        // Storage generation increment preserved
+        cells.storage_generation_inc(1);
+        assert(cells.storage_generation_get(1) == gen1 + 1);
+        const uint64_t gen1_inc = cells.storage_generation_get(1);
+
+        // Exact preservation through cp / set
+        const auto cp1 = cells.cp(1, 1);
+        assert(cp1.payload_id_get(0) == pid1);
+        assert(cp1.storage_generation_get(0) == gen1_inc);
+
+        // Exact preservation through compaction (make_pack_plan / apply_pack)
+        cells.pos_set(7, 102);
+        cells.seq_add(7, 2);
+        const uint64_t pid7 = cells.payload_id_get(7);
+        const uint64_t gen7 = cells.storage_generation_get(7);
+        assert(pid7 != 0 && pid7 != pid1 && pid7 != pid3);
+
+        auto plan = cells.make_pack_plan();
+        assert(plan.retained_count == 3);
+        cells.apply_pack(plan);
+
+        // Cells [1, 3, 7] packed to [0, 1, 2]
+        assert(cells.get_used() == 3);
+        assert(cells.payload_id_get(0) == pid1);
+        assert(cells.storage_generation_get(0) == gen1_inc);
+        assert(cells.payload_id_get(1) == pid3);
+        assert(cells.storage_generation_get(1) == gen3);
+        assert(cells.payload_id_get(2) == pid7);
+        assert(cells.storage_generation_get(2) == gen7);
+        for (uint32_t i = 3; i < 10; ++i) {
+            assert(cells.is_empty(i));
+            assert(cells.payload_id_get(i) == 0);
+            assert(cells.storage_generation_get(i) == 0);
+        }
+
+        // Empty-only reset: removing sequence without making cell empty keeps payload_id and generation
+        assert(!cells.seq_rm(0, 0)); // seq 1 remains on cell 0
+        assert(cells.payload_id_get(0) == pid1);
+        assert(cells.storage_generation_get(0) == gen1_inc);
+
+        // Removing last sequence empties cell: resets payload_id and generation to 0
+        assert(cells.seq_rm(0, 1));
+        assert(cells.is_empty(0));
+        assert(cells.payload_id_get(0) == 0);
+        assert(cells.storage_generation_get(0) == 0);
+
+        // seq_keep that retains sequence preserves payload_id and generation
+        assert(!cells.seq_keep(1, 0));
+        assert(cells.payload_id_get(1) == pid3);
+        assert(cells.storage_generation_get(1) == gen3);
+
+        // seq_keep that empties cell resets payload_id and generation to 0
+        assert(cells.seq_keep(2, 5)); // seq 5 not present in cell 2 (which had seq 2)
+        assert(cells.is_empty(2));
+        assert(cells.payload_id_get(2) == 0);
+        assert(cells.storage_generation_get(2) == 0);
+
+        // Explicit rm resets to 0
+        cells.rm(1);
+        assert(cells.is_empty(1));
+        assert(cells.payload_id_get(1) == 0);
+        assert(cells.storage_generation_get(1) == 0);
+
+        // New content allocated in previously cleared cell gets a fresh new ID
+        cells.pos_set(0, 200);
+        cells.seq_add(0, 0);
+        const uint64_t pid_new = cells.payload_id_get(0);
+        assert(pid_new != 0);
+        assert(pid_new != pid1);
+        assert(cells.storage_generation_get(0) == 1);
+
+        // Full reset resets all payload_ids and generations
+        cells.reset();
+        for (uint32_t i = 0; i < 10; ++i) {
+            assert(cells.is_empty(i));
+            assert(cells.payload_id_get(i) == 0);
+            assert(cells.storage_generation_get(i) == 0);
+        }
+    }
+
+    // Test 9: Same-stream vs distinct cross-stream copy identity semantics
+    {
+        llama_kv_cells src_cells;
+        src_cells.resize(4);
+        src_cells.pos_set(0, 10);
+        src_cells.seq_add(0, 0);
+        const uint64_t pid0 = src_cells.payload_id_get(0);
+        const uint64_t gen0 = src_cells.storage_generation_get(0);
+        assert(pid0 != 0);
+
+        // Same-stream reference addition: payload_id and storage_generation unchanged
+        src_cells.seq_add(0, 1);
+        assert(src_cells.payload_id_get(0) == pid0);
+        assert(src_cells.storage_generation_get(0) == gen0);
+
+        // Cross-stream distinct physical copy: fresh allocation via pos_set gives distinct payload_id
+        llama_kv_cells dst_cells;
+        dst_cells.resize(4);
+        dst_cells.pos_set(0, src_cells.pos_get(0));
+        dst_cells.seq_add(0, 2);
+        const uint64_t pid_dst = dst_cells.payload_id_get(0);
+        assert(pid_dst != 0);
+        assert(pid_dst != pid0); // Fresh identity for distinct physical copy
     }
 
     // =========================================================================

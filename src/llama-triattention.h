@@ -130,8 +130,20 @@ public:
                         int32_t expected_rope_style = -1);
     ~triattention_scorer();
 
+
     bool valid() const;
     bool matches_layers(const int32_t * layer_map, uint32_t n_layers) const;
+
+    // Immutable content fingerprint of the validated calibration: FNV-1a over
+    // exact dims, rope params, sampled layer/head ids, all head-stats floats,
+    // and the model name. Zero when invalid. Two same-shape files with
+    // different stats hash differently; identical content hashes identically.
+    uint64_t calibration_content_fingerprint() const;
+
+    // SHA-256 over the canonical serialization of the same validated content
+    // (trusted provenance digest for state persistence). Returns false and
+    // leaves out untouched when invalid.
+    bool calibration_content_sha256(uint8_t out[32]) const;
 
     // Score candidates for a single (layer, head) pair
     // out_scores: [n_candidates] importance scores
@@ -172,6 +184,9 @@ public:
     uint32_t get_n_sampled() const;
     uint32_t get_freq_count() const;
     const char * get_model_name() const;
+    const triattention_calibration * get_calibration() const;
+    const float * get_omega() const;
+    const float * get_freq_scale_sq() const;
 
     // Print calibration info to stream
     void print_info(FILE * stream) const;

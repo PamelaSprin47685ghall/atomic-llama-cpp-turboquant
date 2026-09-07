@@ -26,9 +26,10 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) :
+        const  layer_share_cb & share,
+        const llama_cparams   * cparams) :
     llama_kv_cache_iswa(model, model.hparams, type_k, type_v, v_trans, offload, swa_full, unified,
-            kv_size, n_seq_max, n_ubatch, n_pad, mem_other, filter, reuse, share) {
+            kv_size, n_seq_max, n_ubatch, n_pad, mem_other, filter, reuse, share, cparams) {
 }
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
@@ -47,7 +48,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) : unified(unified) {
+    const  layer_share_cb & share,
+    const llama_cparams   * cparams) : unified(unified) {
 
     // chain filters
     const layer_filter_cb filter_base = [&](int32_t il) {
@@ -95,19 +97,26 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     kv_base = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_base, n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share);
+            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share, cparams);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 
     kv_swa = std::make_unique<llama_kv_cache>(
             model, hparams, type_k, type_v,
             v_trans, offload, unified, size_swa, n_seq_max, n_pad,
-            hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share);
+            hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share, nullptr);
 }
 
 void llama_kv_cache_iswa::clear(bool data) {
     kv_base->clear(data);
     kv_swa ->clear(data);
+}
+
+bool llama_kv_cache_iswa::try_clear(bool data, std::string * err) {
+    if (!kv_base->try_clear(data, err)) {
+        return false;
+    }
+    return kv_swa->try_clear(data, err);
 }
 
 bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -334,8 +343,21 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         assert(sinfos_base.size() == sinfos_swa.size());
 
+        // Target (base) attention uses real hot reservations when bounded;
+        // the SWA cache is constructed unbounded and takes none. A reservation
+        // failure fails prepare with zero residue (helper rolls back).
+        std::vector<llama_xkv::xkv_hot_reservation> hot_res_base;
+        {
+            std::string res_err;
+            if (!kv_base->reserve_hot_slots(sinfos_base, ubatches, hot_res_base, &res_err)) {
+                LLAMA_LOG_WARN("%s: %s\n", __func__, res_err.c_str());
+                break;
+            }
+        }
+
         return std::make_unique<llama_kv_cache_iswa_context>(
-                this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches));
+                this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches),
+                std::move(hot_res_base));
     } while (false);
 
     // if it fails, try equal split
@@ -370,8 +392,20 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_batch(llama_batch_allocr & ba
 
         assert(sinfos_base.size() == sinfos_swa.size());
 
+        // Target (base) attention uses real hot reservations when bounded;
+        // the SWA cache is constructed unbounded and takes none.
+        std::vector<llama_xkv::xkv_hot_reservation> hot_res_base;
+        {
+            std::string res_err;
+            if (!kv_base->reserve_hot_slots(sinfos_base, ubatches, hot_res_base, &res_err)) {
+                LLAMA_LOG_WARN("%s: %s\n", __func__, res_err.c_str());
+                break;
+            }
+        }
+
         return std::make_unique<llama_kv_cache_iswa_context>(
-                this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches));
+                this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches),
+                std::move(hot_res_base));
     } while (false);
 
     // TODO: if we fail again, we should attempt different splitting strategies
@@ -409,6 +443,18 @@ bool llama_kv_cache_iswa::get_can_shift() const {
 
 uint32_t llama_kv_cache_iswa::get_kv_capacity() const {
     return kv_base->get_kv_capacity();
+}
+
+uint32_t llama_kv_cache_iswa::get_kv_hot_capacity() const {
+    return kv_base->get_kv_hot_capacity();
+}
+
+bool llama_kv_cache_iswa::can_use_legacy_attention() const {
+    return kv_base->can_use_legacy_attention() && kv_swa->can_use_legacy_attention();
+}
+
+bool llama_kv_cache_iswa::is_xkv_bounded_hot() const {
+    return kv_base->is_xkv_bounded_hot() || kv_swa->is_xkv_bounded_hot();
 }
 
 uint32_t llama_kv_cache_iswa::get_kv_used() const {
@@ -477,10 +523,12 @@ llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(
         llama_kv_cache_iswa * kv,
         slot_info_vec_t sinfos_base,
         slot_info_vec_t sinfos_swa,
-        std::vector<llama_ubatch> ubatches) :
+        std::vector<llama_ubatch> ubatches,
+        std::vector<llama_xkv::xkv_hot_reservation> hot_res_base) :
     ubatches(std::move(ubatches)),
     // note: here we copy the ubatches. not sure if this is ideal
-    ctx_base(new llama_kv_cache_context(kv->get_base(), std::move(sinfos_base), this->ubatches)),
+    // Target attention receives the real hot reservations; SWA takes none.
+    ctx_base(new llama_kv_cache_context(kv->get_base(), std::move(sinfos_base), this->ubatches, std::move(hot_res_base))),
     ctx_swa (new llama_kv_cache_context(kv->get_swa (), std::move(sinfos_swa),  this->ubatches)),
     status(llama_memory_status_combine(ctx_base->get_status(), ctx_swa->get_status())) {
 }
@@ -509,6 +557,45 @@ bool llama_kv_cache_iswa_context::apply() {
     res = res & ctx_swa ->apply();
 
     return res;
+}
+
+bool llama_kv_cache_iswa_context::postcompute_success() {
+    // Exactly-once forward to target + SWA (null-guarded for failure-status
+    // contexts). Mirrors inner finalization: a failed success leaves the
+    // forward open so postcompute_failure (or a retry) may still run.
+    if (postcompute_finalized) {
+        return postcompute_ok;
+    }
+    const bool ok_base = ctx_base ? ctx_base->postcompute_success() : true;
+    const bool ok_swa  = ctx_swa  ? ctx_swa->postcompute_success()  : true;
+    postcompute_ok = ok_base && ok_swa;
+    if (postcompute_ok) {
+    postcompute_finalized = true;
+    }
+    return postcompute_ok;
+    }
+
+bool llama_kv_cache_iswa_context::postcompute_failure() {
+    if (postcompute_finalized) {
+        return postcompute_ok;
+    }
+    const bool ok_base = ctx_base ? ctx_base->postcompute_failure() : true;
+    const bool ok_swa  = ctx_swa  ? ctx_swa->postcompute_failure()  : true;
+    postcompute_ok = ok_base && ok_swa;
+    // A failed rollback leaves the forward open for retry; only spent states
+    // finalize.
+    if (postcompute_ok) {
+    postcompute_finalized = true;
+    }
+    return postcompute_ok;
+    }
+
+ggml_tensor * llama_kv_cache_iswa_context::get_xkv_hot_k(ggml_context * ctx, int32_t il) const {
+    return ctx_base ? ctx_base->get_xkv_hot_k(ctx, il) : nullptr;
+}
+
+ggml_tensor * llama_kv_cache_iswa_context::get_xkv_hot_v(ggml_context * ctx, int32_t il) const {
+    return ctx_base ? ctx_base->get_xkv_hot_v(ctx, il) : nullptr;
 }
 
 llama_memory_status llama_kv_cache_iswa_context::get_status() const {

@@ -16,6 +16,8 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
+#include "llama-xkv-cache.h"
+#include "llama-xkv-runtime.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -421,8 +423,6 @@ llama_rerot_visibility llama_rerot_ctx_convert_visibility(llama_rerot_kv_visibil
     return llama_rerot_visibility::normal;
 }
 
-} // namespace
-
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
@@ -542,6 +542,159 @@ std::pair<uint64_t, uint64_t> flashprefill_process_nonce() {
 }
 
 } // namespace
+
+static void llama_xkv_validate_cparams(const llama_cparams & cparams) {
+    if ((int)cparams.xkv_mode < (int)LLAMA_XKV_MODE_OFF || (int)cparams.xkv_mode > (int)LLAMA_XKV_MODE_SR) {
+        throw std::invalid_argument("XKV mode enum value is out of range");
+    }
+
+    if (cparams.xkv_mode == LLAMA_XKV_MODE_OFF) {
+        return;
+    }
+
+    if ((int)cparams.xkv_storage_profile < (int)LLAMA_XKV_STORAGE_PROFILE_REFERENCE ||
+        (int)cparams.xkv_storage_profile > (int)LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS) {
+        throw std::invalid_argument("XKV storage profile enum value is out of range");
+    }
+
+    if ((int)cparams.xkv_source < (int)LLAMA_XKV_SOURCE_DECODED_HOT ||
+        (int)cparams.xkv_source > (int)LLAMA_XKV_SOURCE_PREROPE_CAPTURE) {
+        throw std::invalid_argument("XKV source enum value is out of range");
+    }
+
+    if ((int)cparams.xkv_factor_balance < (int)LLAMA_XKV_FACTOR_BALANCE_UPSTREAM ||
+        (int)cparams.xkv_factor_balance > (int)LLAMA_XKV_FACTOR_BALANCE_DIAGONAL) {
+        throw std::invalid_argument("XKV factor balance enum value is out of range");
+    }
+
+    if ((int)cparams.xkv_landmark_refine < (int)LLAMA_XKV_LANDMARK_REFINE_NONE ||
+        (int)cparams.xkv_landmark_refine > (int)LLAMA_XKV_LANDMARK_REFINE_BOUNDARY) {
+        throw std::invalid_argument("XKV landmark refine enum value is out of range");
+    }
+
+    if ((int)cparams.xkv_factorizer < (int)LLAMA_XKV_FACTORIZER_CPU_REFERENCE ||
+        (int)cparams.xkv_factorizer > (int)LLAMA_XKV_FACTORIZER_CUDA) {
+        throw std::invalid_argument("XKV factorizer enum value is out of range");
+    }
+
+    // Accepted factor types (§16): only F32, F16, Q8_0, Turbo2, Turbo3, Turbo4 (reject q4/q5/bf16 etc.)
+    auto is_accepted_factor_type = [](ggml_type t) {
+        return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 ||
+               t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+    };
+
+    if (!is_accepted_factor_type(cparams.xkv_factor_a_k) ||
+        !is_accepted_factor_type(cparams.xkv_factor_b_k) ||
+        !is_accepted_factor_type(cparams.xkv_factor_a_v) ||
+        !is_accepted_factor_type(cparams.xkv_factor_b_v)) {
+        throw std::invalid_argument("XKV factor codec type is not accepted (must be F32, F16, Q8_0, Turbo2, Turbo3, or Turbo4)");
+    }
+
+    // Landmark types allowed in reference/general mode: F32, F16, Q8_0, Turbo4
+    auto is_accepted_landmark_type = [](ggml_type t) {
+        return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 ||
+               t == GGML_TYPE_TURBO4_0;
+    };
+    if (!is_accepted_landmark_type(cparams.xkv_landmark_type)) {
+        throw std::invalid_argument("XKV landmark codec type is not accepted (must be F32, F16, Q8_0, or Turbo4)");
+    }
+
+    // Enabled mode enforces unified KV
+    if (!cparams.kv_unified) {
+        throw std::invalid_argument("XKV enabled requires unified KV; refusing to run without it");
+    }
+
+    // Enabled sizes must be positive
+    if (cparams.xkv_group_size == 0) {
+        throw std::invalid_argument("XKV group size must be positive (> 0)");
+    }
+    if (cparams.xkv_rank_k == 0) {
+        throw std::invalid_argument("XKV rank K must be positive (> 0)");
+    }
+    if (cparams.xkv_rank_v == 0) {
+        throw std::invalid_argument("XKV rank V must be positive (> 0)");
+    }
+    if (cparams.xkv_segment_tokens == 0) {
+        throw std::invalid_argument("XKV segment tokens must be positive (> 0)");
+    }
+    if (cparams.xkv_chunk_tokens == 0) {
+        throw std::invalid_argument("XKV chunk tokens must be positive (> 0)");
+    }
+    // chunk_tokens <= segment_tokens
+    if (cparams.xkv_chunk_tokens > cparams.xkv_segment_tokens) {
+        throw std::invalid_argument("XKV chunk tokens must be less than or equal to segment tokens (chunk_tokens <= segment_tokens)");
+    }
+    // SR mode requires sr_budget > 0
+    if (cparams.xkv_mode == LLAMA_XKV_MODE_SR && cparams.xkv_sr_budget == 0) {
+        throw std::invalid_argument("XKV SR mode requires sr_budget > 0 (--xkv-sr-budget)");
+    }
+    // Boundary refinement requires max_rows > 0
+    if (cparams.xkv_landmark_refine == LLAMA_XKV_LANDMARK_REFINE_BOUNDARY && cparams.xkv_landmark_refine_max_rows == 0) {
+        throw std::invalid_argument("XKV boundary landmark refinement requires landmark_refine_max_rows > 0");
+    }
+    if (cparams.xkv_workspace_mib == 0) {
+        throw std::invalid_argument("XKV workspace size must be positive (> 0 MiB)");
+    }
+
+    // cache <= workspace
+    if (cparams.xkv_decode_cache_mib > cparams.xkv_workspace_mib) {
+        throw std::invalid_argument("XKV decode-cache size must be less than or equal to workspace size (cache <= workspace)");
+    }
+
+    // Fractions finite and in range [0.0, 1.0]
+    if (!std::isfinite(cparams.xkv_min_saving) || cparams.xkv_min_saving < 0.0 || cparams.xkv_min_saving > 1.0) {
+        throw std::invalid_argument("XKV min saving fraction must be finite and within [0.0, 1.0]");
+    }
+    if (!std::isfinite(cparams.xkv_min_factor_coverage) || cparams.xkv_min_factor_coverage < 0.0 || cparams.xkv_min_factor_coverage > 1.0) {
+        throw std::invalid_argument("XKV min factor coverage fraction must be finite and within [0.0, 1.0]");
+    }
+
+    // Persistent store budget validation: store_mib cannot overflow bytes
+    if (cparams.xkv_store_mib > 0) {
+        if ((uint64_t)cparams.xkv_store_mib > UINT64_MAX / (1024ULL * 1024ULL)) {
+            throw std::invalid_argument("XKV store_mib budget overflows 64-bit integer bytes");
+        }
+    }
+    // Resolution contract: only common auto-fit resolves 0. By context
+    // creation DENSE/SR must carry a nonzero fitted budget (C API callers
+    // provide it directly); 0 is never unbounded. SHADOW/OFF keep none.
+    if (cparams.xkv_mode == LLAMA_XKV_MODE_DENSE || cparams.xkv_mode == LLAMA_XKV_MODE_SR) {
+        if (cparams.xkv_store_mib == 0) {
+            throw std::invalid_argument(
+                "XKV DENSE/SR requires a nonzero factor store budget (xkv_store_mib): "
+                "C API callers must provide the fitted budget from common auto-fit");
+        }
+    } else if (cparams.xkv_store_mib != 0) {
+        throw std::invalid_argument("XKV store budget requires DENSE/SR mode (SHADOW/OFF must use xkv_store_mib == 0)");
+    }
+
+    // CUDA factorizer rejected
+    if (cparams.xkv_factorizer == LLAMA_XKV_FACTORIZER_CUDA) {
+        throw std::invalid_argument("XKV CUDA factorizer is not supported; rejected");
+    }
+
+    auto is_turbo_type = [](ggml_type t) {
+        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+    };
+
+    // Production factor profiles require four Turbo2/3/4 streams
+    if (cparams.xkv_storage_profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS ||
+        cparams.xkv_storage_profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS) {
+        if (!is_turbo_type(cparams.xkv_factor_a_k) ||
+            !is_turbo_type(cparams.xkv_factor_b_k) ||
+            !is_turbo_type(cparams.xkv_factor_a_v) ||
+            !is_turbo_type(cparams.xkv_factor_b_v)) {
+            throw std::invalid_argument("XKV production factor profiles (tq-factors / tq-factors-landmarks) require four Turbo2/3/4 streams for A_K, B_K, A_V, and B_V");
+        }
+    }
+
+    // Production landmarks require exactly Q8_0 or Turbo4
+    if (cparams.xkv_storage_profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS) {
+        const bool valid_lm = (cparams.xkv_landmark_type == GGML_TYPE_Q8_0 || cparams.xkv_landmark_type == GGML_TYPE_TURBO4_0);
+        if (!valid_lm) {
+            throw std::invalid_argument("XKV production landmarks profile requires exactly Q8_0 (q8_0) or Turbo4 (turbo4_0) landmark type");
+        }
+    }
 
 llama_context::llama_context(
         const llama_model & model,
@@ -785,6 +938,37 @@ llama_context::llama_context(
         fp_nonce0 = fp_nonce.first;
         fp_nonce1 = fp_nonce.second;
     }
+    // XKV (§16) parameters
+    cparams.xkv_mode                     = params.xkv_mode;
+    cparams.xkv_storage_profile          = params.xkv_storage_profile;
+    cparams.xkv_group_size               = params.xkv_group_size;
+    cparams.xkv_rank_k                   = params.xkv_rank_k;
+    cparams.xkv_rank_v                   = params.xkv_rank_v;
+    cparams.xkv_segment_tokens           = params.xkv_segment_tokens;
+    cparams.xkv_chunk_tokens             = params.xkv_chunk_tokens;
+    cparams.xkv_sr_budget                = params.xkv_sr_budget;
+    cparams.xkv_source                   = params.xkv_source;
+    cparams.xkv_factor_a_k               = params.xkv_factor_a_k;
+    cparams.xkv_factor_b_k               = params.xkv_factor_b_k;
+    cparams.xkv_factor_a_v               = params.xkv_factor_a_v;
+    cparams.xkv_factor_b_v               = params.xkv_factor_b_v;
+    cparams.xkv_factor_balance           = params.xkv_factor_balance;
+    cparams.xkv_landmark_type            = params.xkv_landmark_type;
+    cparams.xkv_landmark_refine          = params.xkv_landmark_refine;
+    cparams.xkv_landmark_refine_max_rows = params.xkv_landmark_refine_max_rows;
+    cparams.xkv_workspace_mib            = params.xkv_workspace_mib;
+    cparams.xkv_decode_cache_mib         = params.xkv_decode_cache_mib;
+    cparams.xkv_store_mib                = params.xkv_store_mib;
+    cparams.xkv_seed                     = params.xkv_seed;
+    cparams.xkv_min_saving               = params.xkv_min_saving;
+    cparams.xkv_min_factor_coverage      = params.xkv_min_factor_coverage;
+    cparams.xkv_factorizer               = params.xkv_factorizer;
+
+    if (llama_xkv_is_enabled(cparams.xkv_mode)) {
+        cparams.kv_unified = true;
+    }
+
+    llama_xkv_validate_cparams(cparams);
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -851,6 +1035,26 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: rerot         = %s\n",   __func__, cparams.rerot_enabled ? "true" : "false");
     if (cparams.rerot_enabled) {
         LLAMA_LOG_INFO("%s: rerot frontier= %s\n", __func__, llama_rerot_frontier_mode_name(cparams.rerot_frontier));
+    }
+    if (llama_xkv_is_enabled(cparams.xkv_mode)) {
+        LLAMA_LOG_INFO("%s: xkv requested mode     = %s\n", __func__, llama_xkv_mode_name(params.xkv_mode));
+        LLAMA_LOG_INFO("%s: xkv effective mode     = %s\n", __func__, llama_xkv_mode_name(cparams.xkv_mode));
+        LLAMA_LOG_INFO("%s: xkv requested profile  = %s\n", __func__, llama_xkv_storage_profile_name(params.xkv_storage_profile));
+        LLAMA_LOG_INFO("%s: xkv effective profile  = %s\n", __func__, llama_xkv_storage_profile_name(cparams.xkv_storage_profile));
+        LLAMA_LOG_INFO("%s: xkv requested source   = %s\n", __func__, llama_xkv_source_name(params.xkv_source));
+        LLAMA_LOG_INFO("%s: xkv effective source   = %s\n", __func__, llama_xkv_source_name(cparams.xkv_source));
+        LLAMA_LOG_INFO("%s: xkv requested codecs   = A_K:%s, B_K:%s, A_V:%s, B_V:%s, landmark:%s\n", __func__,
+            ggml_type_name(params.xkv_factor_a_k), ggml_type_name(params.xkv_factor_b_k),
+            ggml_type_name(params.xkv_factor_a_v), ggml_type_name(params.xkv_factor_b_v),
+            ggml_type_name(params.xkv_landmark_type));
+        LLAMA_LOG_INFO("%s: xkv effective codecs   = A_K:%s, B_K:%s, A_V:%s, B_V:%s, landmark:%s\n", __func__,
+            ggml_type_name(cparams.xkv_factor_a_k), ggml_type_name(cparams.xkv_factor_b_k),
+            ggml_type_name(cparams.xkv_factor_a_v), ggml_type_name(cparams.xkv_factor_b_v),
+            ggml_type_name(cparams.xkv_landmark_type));
+        LLAMA_LOG_INFO("%s: xkv requested budgets  = workspace:%u MiB, decode_cache:%u MiB, sr_budget:%u\n", __func__,
+            params.xkv_workspace_mib, params.xkv_decode_cache_mib, params.xkv_sr_budget);
+        LLAMA_LOG_INFO("%s: xkv effective budgets  = workspace:%u MiB, decode_cache:%u MiB, sr_budget:%u\n", __func__,
+            cparams.xkv_workspace_mib, cparams.xkv_decode_cache_mib, cparams.xkv_sr_budget);
     }
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
@@ -932,6 +1136,11 @@ llama_context::llama_context(
             /*.mem_other            =*/ llama_get_memory(cparams.ctx_other),
             /*.triattention_enabled =*/ params.triattention,
             /*.triattention_stats   =*/ params.triattention_stats,
+            /*.xkv_mode             =*/ cparams.xkv_mode,
+            /*.xkv_segment_tokens   =*/ cparams.xkv_segment_tokens,
+            /*.xkv_chunk_tokens     =*/ cparams.xkv_chunk_tokens,
+            /*.n_ubatch             =*/ cparams.n_ubatch,
+            /*.n_batch              =*/ cparams.n_batch,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -966,6 +1175,39 @@ llama_context::llama_context(
                 throw std::runtime_error("Failed to find KV cache for TriAttention initialization");
             }
         }
+
+        if (cparams.xkv_mode != LLAMA_XKV_MODE_OFF) {
+            if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                // MTP draft context cache contains only speculative tail layers:
+                // null store/pool and zero XKV allocation.
+            } else {
+            bool initialized = false;
+            auto init_xkv = [&](llama_kv_cache * kv) {
+                if (kv) {
+                    kv->init_xkv_store(cparams);
+                    initialized = true;
+                }
+            };
+
+            if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
+                init_xkv(kv);
+            } else if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
+                init_xkv(iswa->get_base());
+            } else if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+                init_xkv(hyb->get_mem_attn());
+            } else if (auto * hyb_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get())) {
+                if (auto * iswa = hyb_iswa->get_mem_attn()) {
+                    init_xkv(iswa->get_base());
+                }
+            }
+
+            if (!initialized) {
+                throw std::runtime_error("Failed to find KV cache for XKV initialization");
+            }
+            }
+        }
+    } else if (cparams.xkv_mode != LLAMA_XKV_MODE_OFF) {
+        throw std::runtime_error("Failed to find KV cache for XKV initialization");
     }
 
     // init backends
@@ -1071,6 +1313,35 @@ llama_context::llama_context(const llama_model & model_in, const llama_cparams &
         fp_nonce0 = fp_nonce.first;
         fp_nonce1 = fp_nonce.second;
     }
+
+    // Ensure test-only ctor initializes/validates no XKV/store resources
+    const struct llama_xkv_params xkv_defaults = llama_xkv_default_params();
+    cparams.xkv_mode                     = LLAMA_XKV_MODE_OFF;
+    cparams.xkv_storage_profile          = xkv_defaults.storage_profile;
+    cparams.xkv_group_size               = xkv_defaults.group_size;
+    cparams.xkv_rank_k                   = xkv_defaults.rank_k;
+    cparams.xkv_rank_v                   = xkv_defaults.rank_v;
+    cparams.xkv_segment_tokens           = xkv_defaults.segment_tokens;
+    cparams.xkv_chunk_tokens             = xkv_defaults.chunk_tokens;
+    cparams.xkv_sr_budget                = xkv_defaults.sr_budget;
+    cparams.xkv_source                   = xkv_defaults.source;
+    cparams.xkv_factor_a_k               = xkv_defaults.factor_a_k;
+    cparams.xkv_factor_b_k               = xkv_defaults.factor_b_k;
+    cparams.xkv_factor_a_v               = xkv_defaults.factor_a_v;
+    cparams.xkv_factor_b_v               = xkv_defaults.factor_b_v;
+    cparams.xkv_factor_balance           = xkv_defaults.factor_balance;
+    cparams.xkv_landmark_type            = xkv_defaults.landmark_type;
+    cparams.xkv_landmark_refine          = xkv_defaults.landmark_refine;
+    cparams.xkv_landmark_refine_max_rows = xkv_defaults.landmark_refine_max_rows;
+    cparams.xkv_workspace_mib            = xkv_defaults.workspace_mib;
+    cparams.xkv_decode_cache_mib         = xkv_defaults.decode_cache_mib;
+    cparams.xkv_store_mib                = xkv_defaults.store_mib;
+    cparams.xkv_seed                     = xkv_defaults.seed;
+    cparams.xkv_min_saving               = xkv_defaults.min_saving;
+    cparams.xkv_min_factor_coverage      = xkv_defaults.min_factor_coverage;
+    cparams.xkv_factorizer               = xkv_defaults.factorizer;
+
+    opt_ctx = nullptr;
     sched_need_reserve = false;
 }
 
@@ -1088,7 +1359,7 @@ llama_context::~llama_context() {
         ggml_backend_sched_reset(sched.get());
     }
 
-    if (!model.hparams.no_alloc) {
+    if (sched && !model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
             ggml_backend_buffer_type_t buft    = backend_buft[i];
@@ -1104,7 +1375,10 @@ llama_context::~llama_context() {
             }
         }
     }
-    ggml_opt_free(opt_ctx);
+    if (opt_ctx) {
+        ggml_opt_free(opt_ctx);
+        opt_ctx = nullptr;
+    }
 
     if (sched) {
         ggml_backend_sched_reset(sched.get());
@@ -2081,12 +2355,34 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    struct postcompute_guard {
+        llama_memory_context_i * mctx;
+        bool dismissed = false;
+        ~postcompute_guard() {
+            if (!dismissed && mctx) {
+                mctx->postcompute_failure();
+            }
+        }
+    } guard{mctx, false};
+
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+
+    // Bounded-XKV stale retry: snapshot+graph are rebuilt WITHOUT re-applying
+    // mctx/cells (apply() ran once above; KV writes re-execute idempotently
+    // into the same cells). Bounded graphs never reuse
+    // (llm_graph_input_xkv::can_reuse is false), so every attempt rebuilds
+    // with fresh stamps. Exhaustion fails stale at the outer batch boundary;
+    // stale output is never committed.
+    constexpr int kXkvStaleMaxRetries = 2;
+    int xkv_stale_left = kXkvStaleMaxRetries;
+    bool xkv_retry = false;
+    do {
+        xkv_retry = false;
 
     if (!graph_reuse_disable && ggml_backend_sched_is_allocated(sched.get()) && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -2139,6 +2435,56 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // graph_compute submits asynchronously: fence the scheduler so KV writes
+    // (and graph callbacks) are byte-complete before postcompute_success may
+    // transition hot rows to hot_committed. MTP sealing/state depend on it.
+    // Byte-complete fence for bounded XKV only: xkv_has_bounded gates the
+    // extra sync so OFF/SHADOW preserve baseline synchronization exactly.
+    // The fence is counted as part of the commit protocol (hot_committed
+    // means K/V bytes complete; never expose committed bytes in flight).
+    const bool xkv_bounded = res->xkv_has_bounded();
+    if (xkv_bounded) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+
+    // Bounded-XKV post-sync poll: stale/codec/workspace callback status must
+    // turn into retry/hard failure here, before postcompute_success may
+    // commit. A zeroed attention tensor alone is never success.
+    if (xkv_bounded) {
+        std::string xkv_err;
+        const int xkv_action = res->xkv_poll_postcompute(&xkv_err);
+        if (xkv_action == 2) {
+            LLAMA_LOG_ERROR("%s: XKV postcompute hard failure: %s\n", __func__, xkv_err.c_str());
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        if (xkv_action == 1) {
+            if (xkv_stale_left-- > 0) {
+                LLAMA_LOG_WARN("%s: XKV stale stamp, rebuilding snapshot/graph without re-applying cells (%d retries left)\n",
+                    __func__, xkv_stale_left);
+                xkv_retry = true;
+                continue;
+            }
+            LLAMA_LOG_ERROR("%s: XKV stale stamp, retry budget exhausted, failing at outer batch boundary: %s\n",
+                __func__, xkv_err.c_str());
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+    }
+    } while (xkv_retry);
+
+    if (mctx) {
+        // Dismissal happens only after a successful commit. On false the
+        // guard stays armed and runs the idempotent postcompute_failure
+        // rollback; the batch is treated as failed, never as decoded.
+        if (!mctx->postcompute_success()) {
+            LLAMA_LOG_ERROR("%s: postcompute commit failed\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        guard.dismissed = true;
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -3772,6 +4118,14 @@ int llama_context::decode_impl(const llama_batch & batch_inp) {
         llama_flashprefill_metrics::accum_merge(fp_metrics_accum, fp_metrics_pending);
     }
     fp_metrics_pending = llama_flashprefill_metrics::slice_delta();
+    // XKV sealing note: no maintain() runs at the generic decode tail by design.
+    // Target verification rows committed by kv-cache-context postcompute_success
+    // are still tentative here — the speculative caller has not decided the
+    // accepted prefix yet, so sealing now could seal rows later rejected via
+    // seq_rm. Publication (sealing) happens only (a) at the pre-batch admission
+    // pressure boundary, or (b) at the speculative acceptance boundary in the
+    // server after the rejected suffix is rolled back via seq_rm. MTP draft,
+    // XKV OFF, recurrent math, and RERoT control are untouched.
 
     return 0;
 }
@@ -5548,6 +5902,11 @@ void llama_context::opt_epoch_iter(
                 }
             }
             ggml_opt_eval(opt_ctx, result);
+            // Training must not advance on an uncommitted cache state.
+            if (!mctx->postcompute_success()) {
+                LLAMA_LOG_ERROR("%s: postcompute commit failed, aborting epoch\n", __func__);
+                break;
+            }
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
             }
@@ -5611,6 +5970,8 @@ void llama_context::opt_epoch(
 //
 
 llama_context_params llama_context_default_params() {
+    const struct llama_xkv_params xkv_defaults = llama_xkv_default_params();
+
     llama_context_params result = {
         /*.n_ctx                       =*/ 512,
         /*.n_batch                     =*/ 2048,
@@ -5659,6 +6020,30 @@ llama_context_params llama_context_default_params() {
         /*.n_person_max                =*/ 0,
         /*.n_pen_max                   =*/ 0,
         /*.flashprefill                =*/ llama_flashprefill_default_config(),
+        /*.xkv_mode                    =*/ xkv_defaults.mode,
+        /*.xkv_storage_profile         =*/ xkv_defaults.storage_profile,
+        /*.xkv_group_size              =*/ xkv_defaults.group_size,
+        /*.xkv_rank_k                  =*/ xkv_defaults.rank_k,
+        /*.xkv_rank_v                  =*/ xkv_defaults.rank_v,
+        /*.xkv_segment_tokens          =*/ xkv_defaults.segment_tokens,
+        /*.xkv_chunk_tokens            =*/ xkv_defaults.chunk_tokens,
+        /*.xkv_sr_budget               =*/ xkv_defaults.sr_budget,
+        /*.xkv_source                  =*/ xkv_defaults.source,
+        /*.xkv_factor_a_k              =*/ xkv_defaults.factor_a_k,
+        /*.xkv_factor_b_k              =*/ xkv_defaults.factor_b_k,
+        /*.xkv_factor_a_v              =*/ xkv_defaults.factor_a_v,
+        /*.xkv_factor_b_v              =*/ xkv_defaults.factor_b_v,
+        /*.xkv_factor_balance          =*/ xkv_defaults.factor_balance,
+        /*.xkv_landmark_type           =*/ xkv_defaults.landmark_type,
+        /*.xkv_landmark_refine         =*/ xkv_defaults.landmark_refine,
+        /*.xkv_landmark_refine_max_rows=*/ xkv_defaults.landmark_refine_max_rows,
+        /*.xkv_workspace_mib           =*/ xkv_defaults.workspace_mib,
+        /*.xkv_decode_cache_mib        =*/ xkv_defaults.decode_cache_mib,
+        /*.xkv_store_mib               =*/ xkv_defaults.store_mib,
+        /*.xkv_seed                    =*/ xkv_defaults.seed,
+        /*.xkv_min_saving              =*/ xkv_defaults.min_saving,
+        /*.xkv_min_factor_coverage     =*/ xkv_defaults.min_factor_coverage,
+        /*.xkv_factorizer              =*/ xkv_defaults.factorizer,
     };
 
     return result;
@@ -6084,11 +6469,39 @@ int32_t llama_set_adapter_cvec(
 //
 
 void llama_memory_clear(llama_memory_t mem, bool data) {
-    if (!mem) {
-        return;
+    // Truly noexcept: the whole body is guarded; the catch path uses only a
+    // static message (no allocation while reporting). Legacy void entry:
+    // logs an explicit refusal and returns unchanged. Callers that must
+    // branch use llama_memory_try_clear.
+    try {
+        if (!mem) {
+            return;
+        }
+        std::string err;
+        if (!mem->try_clear(data, &err)) {
+            LLAMA_LOG_ERROR("%s: memory clear refused: %s\n", __func__, err.c_str());
+        }
+    } catch (...) {
+        LLAMA_LOG_ERROR("llama_memory_clear failed with exception\n");
     }
+}
 
-    mem->clear(data);
+bool llama_memory_try_clear(llama_memory_t mem, bool data) {
+    // Truly noexcept: guarded throughout; the catch path allocates nothing
+    // and reports false.
+    try {
+        if (!mem) {
+            return false;
+        }
+        std::string err;
+        if (!mem->try_clear(data, &err)) {
+            LLAMA_LOG_ERROR("%s: memory clear failed: %s\n", __func__, err.c_str());
+            return false;
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 bool llama_memory_seq_rm(
@@ -7020,6 +7433,69 @@ uint32_t llama_memory_seq_get_recurrent_used(llama_memory_t mem, llama_seq_id se
     }
 
     return mem->get_recurrent_seq_used(seq_id);
+}
+
+const char * llama_memory_limit_reason_name(enum llama_memory_limit_reason reason) {
+    switch (reason) {
+        case LLAMA_MEMORY_LIMIT_NONE:          return "none";
+        case LLAMA_MEMORY_LIMIT_LOGICAL_CELLS: return "logical_cells";
+        case LLAMA_MEMORY_LIMIT_HOT_SLOTS:     return "hot_slots";
+        case LLAMA_MEMORY_LIMIT_FACTOR_STORE:  return "factor_store";
+        case LLAMA_MEMORY_LIMIT_WORKSPACE:     return "workspace";
+        case LLAMA_MEMORY_LIMIT_RECURRENT:     return "recurrent";
+        default:                               return "unknown";
+    }
+}
+
+bool llama_memory_get_admission_snapshot(llama_memory_t mem, llama_memory_admission_snapshot * out) {
+    if (!mem || !out) {
+        return false;
+    }
+
+    return mem->get_admission_snapshot(out);
+}
+
+bool llama_memory_get_xkv_runtime_snapshot(llama_memory_t mem, llama_memory_xkv_runtime_snapshot * out) {
+    if (!mem || !out) {
+        return false;
+    }
+
+    return mem->get_xkv_runtime_snapshot(out);
+}
+
+llama_memory_maintenance_status llama_memory_maintain_safe_boundary(llama_memory_t mem) {
+    if (!mem) {
+        return LLAMA_MEMORY_MAINTENANCE_NO_ACTION;
+    }
+
+    return mem->maintain_safe_boundary();
+}
+
+const char * llama_memory_maintenance_status_name(enum llama_memory_maintenance_status status) {
+    switch (status) {
+        case LLAMA_MEMORY_MAINTENANCE_PROGRESS:        return "progress";
+        case LLAMA_MEMORY_MAINTENANCE_NO_ACTION:       return "no_action";
+        case LLAMA_MEMORY_MAINTENANCE_FLOOR_EXHAUSTED:  return "floor_exhausted";
+        case LLAMA_MEMORY_MAINTENANCE_RETRY_STALE:     return "retry_stale";
+        case LLAMA_MEMORY_MAINTENANCE_ERROR:           return "error";
+        default:                                        return "unknown";
+    }
+}
+
+const char * llama_memory_xkv_skip_reason_name(enum llama_memory_xkv_skip_reason reason) {
+    switch (reason) {
+        case LLAMA_MEMORY_XKV_SKIP_NONE:                 return "none";
+        case LLAMA_MEMORY_XKV_SKIP_NOT_COMMITTED:        return "not_committed";
+        case LLAMA_MEMORY_XKV_SKIP_UNSUPPORTED_CONFIG:   return "unsupported_config";
+        case LLAMA_MEMORY_XKV_SKIP_PREFLIGHT_OOM:        return "preflight_oom";
+        case LLAMA_MEMORY_XKV_SKIP_FACTORIZATION_FAILED: return "factorization_failed";
+        case LLAMA_MEMORY_XKV_SKIP_CODEC_ERROR:          return "codec_error";
+        case LLAMA_MEMORY_XKV_SKIP_ERROR_THRESHOLD:      return "error_threshold_exceeded";
+        case LLAMA_MEMORY_XKV_SKIP_NO_SAVING:            return "no_saving";
+        case LLAMA_MEMORY_XKV_SKIP_ABORTED:              return "aborted";
+        case LLAMA_MEMORY_XKV_SKIP_LANDMARK_REQUIRED:    return "landmark_required";
+        default:                                          return "unknown";
+    }
 }
 
 bool llama_memory_can_shift(llama_memory_t mem) {

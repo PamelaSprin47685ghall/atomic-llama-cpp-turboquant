@@ -4538,6 +4538,17 @@ private:
     bool ensure_next_kv_capacity() {
         kv_batch_limit = UINT32_MAX;
 
+        // XKV maintenance runs inside the loop below, after admission and
+        // required cells are known (fill-first): sealing a full segment while
+        // hot slots remain would violate Tri fill-first. OFF: zero change.
+        llama_memory_maintenance_status xkv_maintain_status = LLAMA_MEMORY_MAINTENANCE_NO_ACTION;
+        int xkv_maintain_attempts = 0;
+        bool xkv_tri_allowed = true;
+        // Checked progress: hot_free before the last maintain, to detect
+        // unchanged (no-progress) maintenance and fall through to Tri.
+        uint32_t xkv_last_hot_free = 0;
+        bool xkv_have_last_hot = false;
+
         if (!params_base.kv_unified || params_base.n_ctx_kv == 0) {
             return true;
         }
@@ -4573,12 +4584,120 @@ private:
             const uint64_t available_recurrent_tgt = has_recurrent_tgt ? usage_recurrent_tgt.capacity - std::min(usage_recurrent_tgt.capacity, usage_recurrent_tgt.used) : UINT64_MAX;
             const uint64_t available_recurrent_dft = has_recurrent_dft ? usage_recurrent_dft.capacity - std::min(usage_recurrent_dft.capacity, usage_recurrent_dft.used) : UINT64_MAX;
 
-            const bool kv_pressure = required_kv > available_tgt || required_kv > available_dft;
-            const bool recurrent_pressure = required_recurrent_tgt > available_recurrent_tgt ||
-                                            required_recurrent_dft > available_recurrent_dft;
-            const uint32_t kv_deficit_tgt = has_tgt_usage && required_kv > available_tgt
+            bool kv_pressure = required_kv > available_tgt || required_kv > available_dft;
+            bool recurrent_pressure = required_recurrent_tgt > available_recurrent_tgt ||
+                                        required_recurrent_dft > available_recurrent_dft;
+
+            // XKV admission snapshot (enabled + attention domain only:
+            // recurrent-only memories bypass). The token bound tightens the
+            // batch below; recurrent sequence slots never enter the token
+            // minimum. A new sequence/person needs a free recurrent slot;
+            // continuation batches on full recurrent slots stay valid.
+            llama_memory_admission_snapshot xkv_snap = {};
+            bool have_xkv_snap = false;
+            if (llama_xkv_is_enabled(params_base.xkv_mode) && (has_tgt_usage || has_dft_usage)) {
+                llama_memory_t mem_snap = has_tgt_usage ? mem_tgt : mem_dft;
+                have_xkv_snap = mem_snap && llama_memory_get_admission_snapshot(mem_snap, &xkv_snap);
+            }
+            if (have_xkv_snap &&
+                (required_recurrent_tgt > 0 || required_recurrent_dft > 0) &&
+                xkv_snap.recurrent_blocks_new_seq) {
+                recurrent_pressure = true;
+            }
+            // Fill-first XKV maintenance: sealing runs only when hot slots
+            // cannot cover the upcoming batch (SHADOW evaluate-only always
+            // runs). After maintenance the snapshot is re-queried fresh;
+            // PROGRESS re-plans and maintains again only if still
+            // insufficient; RETRY_STALE bounded-retries with a fresh snapshot
+            // instead of skipping into a zero-bound error.
+            if (llama_xkv_is_enabled(params_base.xkv_mode)) {
+                const bool is_shadow = params_base.xkv_mode == LLAMA_XKV_MODE_SHADOW;
+                // Deficit-derived bound (no fixed constant): seals ~one
+                // segment per run, so allow ceil(deficit/seg) + domains.
+                const uint64_t xkv_max = server_task_result_metrics::xkv_maintain_max_attempts(
+                    true, have_xkv_snap,
+                    have_xkv_snap ? xkv_snap.hot_free : 0, have_xkv_snap ? xkv_snap.hot_capacity : 0,
+                    required_kv, params_base.xkv_segment_tokens);
+                // Unchanged maintenance (PROGRESS with identical hot_free and
+                // still insufficient) is not progress: stop and fall through.
+                const bool xkv_unchanged =
+                    xkv_have_last_hot && have_xkv_snap && xkv_snap.hot_free == xkv_last_hot_free &&
+                    xkv_snap.hot_free < required_kv;
+                if (!xkv_unchanged &&
+                    (server_task_result_metrics::xkv_should_maintain(true, is_shadow, have_xkv_snap,
+                         have_xkv_snap ? xkv_snap.hot_free : 0, required_kv,
+                         (uint64_t) xkv_maintain_attempts, xkv_max) ||
+                     (xkv_maintain_status == LLAMA_MEMORY_MAINTENANCE_RETRY_STALE &&
+                      (uint64_t) xkv_maintain_attempts < xkv_max))) {
+                    xkv_maintain_attempts++;
+                    if (have_xkv_snap) {
+                        xkv_last_hot_free = xkv_snap.hot_free;
+                        xkv_have_last_hot = true;
+                    }
+                    auto run_maintain = [](llama_memory_t m) {
+                        return m ? llama_memory_maintain_safe_boundary(m)
+                                 : LLAMA_MEMORY_MAINTENANCE_NO_ACTION;
+                    };
+                    auto st = run_maintain(has_tgt_usage ? mem_tgt : nullptr);
+                    if (mem_dft && mem_dft != mem_tgt) {
+                        const auto st_dft = run_maintain(has_dft_usage ? mem_dft : nullptr);
+                        if (st_dft == LLAMA_MEMORY_MAINTENANCE_ERROR ||
+                            st == LLAMA_MEMORY_MAINTENANCE_ERROR) {
+                            st = LLAMA_MEMORY_MAINTENANCE_ERROR;
+                        } else if (st_dft == LLAMA_MEMORY_MAINTENANCE_PROGRESS ||
+                                   st == LLAMA_MEMORY_MAINTENANCE_PROGRESS) {
+                            st = LLAMA_MEMORY_MAINTENANCE_PROGRESS;
+                        } else if (st_dft == LLAMA_MEMORY_MAINTENANCE_RETRY_STALE ||
+                                   st == LLAMA_MEMORY_MAINTENANCE_RETRY_STALE) {
+                            st = LLAMA_MEMORY_MAINTENANCE_RETRY_STALE;
+                        } else if (!(st_dft == LLAMA_MEMORY_MAINTENANCE_FLOOR_EXHAUSTED &&
+                                     st == LLAMA_MEMORY_MAINTENANCE_FLOOR_EXHAUSTED)) {
+                            st = LLAMA_MEMORY_MAINTENANCE_NO_ACTION;
+                        }
+                    }
+                    xkv_maintain_status = st;
+                    if (st == LLAMA_MEMORY_MAINTENANCE_ERROR) {
+                        SRV_ERR("%s", "XKV safe-boundary maintenance failed; refusing decode rather than masking the failure\n");
+                        const int32_t err_id = id_slot_protected >= 0 ? id_slot_protected : id_slot_prefill;
+                        if (err_id >= 0) {
+                            if (server_slot * err_slot = get_slot_by_id(err_id)) {
+                                if (err_slot->is_processing()) {
+                                    send_error(*err_slot, "XKV maintenance failed (codec/workspace); cannot proceed safely");
+                                    err_slot->release();
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                    // Fresh snapshot after maintenance for the replan below.
+                    if (has_tgt_usage || has_dft_usage) {
+                        llama_memory_t mem_snap2 = has_tgt_usage ? mem_tgt : mem_dft;
+                        have_xkv_snap = mem_snap2 && llama_memory_get_admission_snapshot(mem_snap2, &xkv_snap);
+                    }
+                    if (st == LLAMA_MEMORY_MAINTENANCE_RETRY_STALE ||
+                        st == LLAMA_MEMORY_MAINTENANCE_PROGRESS) {
+                        continue; // replan against the fresh snapshot (bounded above)
+                    }
+                }
+            }
+            xkv_tri_allowed = !llama_xkv_is_enabled(params_base.xkv_mode) ||
+                xkv_maintain_status == LLAMA_MEMORY_MAINTENANCE_NO_ACTION ||
+                xkv_maintain_status == LLAMA_MEMORY_MAINTENANCE_FLOOR_EXHAUSTED;
+            uint32_t kv_deficit_tgt = has_tgt_usage && required_kv > available_tgt
                 ? (uint32_t) std::min<uint64_t>(UINT32_MAX, (uint64_t) required_kv - available_tgt)
                 : 0;
+            // XKV hot pressure (bounded hot): logical capacity stays huge while
+            // physical hot slots exhaust, so the hot deficit from the fresh
+            // snapshot joins overall KV pressure, deficit, Tri trigger, floor
+            // logging/counters, fallback, and batch limiting. Draft/legacy
+            // logical capacity is never conflated: only the target XKV deficit.
+            if (have_xkv_snap && required_kv > xkv_snap.hot_free) {
+                kv_pressure = true;
+                const uint64_t hot_d = (uint64_t) required_kv - xkv_snap.hot_free;
+                const uint32_t hot_deficit =
+                    (uint32_t) std::min<uint64_t>(hot_d, UINT32_MAX);
+                kv_deficit_tgt = std::max(kv_deficit_tgt, hot_deficit);
+            }
             const uint32_t kv_deficit_dft = has_dft_usage && required_kv > available_dft
                 ? (uint32_t) std::min<uint64_t>(UINT32_MAX, (uint64_t) required_kv - available_dft)
                 : 0;
@@ -4633,7 +4752,10 @@ private:
 
             // TriAttention only reclaims KV. Recurrent-only pressure must go directly
             // to the existing recurrent fallback path.
-            if (params_base.triattention_enabled && (kv_pressure || tri_maintenance_due)) {
+            // XKV: Tri/atomic runs only on confirmed floor/no-action; a new
+            // sequence blocked on recurrent slots goes to the recurrent
+            // victim path below without Tri (Tri reclaims KV, not recurrent).
+            if (params_base.triattention_enabled && xkv_tri_allowed && (kv_pressure || tri_maintenance_due)) {
                 // Initial pressure drains every resident sequence. Maintenance only
                 // touches sequences that have already entered compressed mode.
                 std::vector<llama_memory_kv_reclaim_seq_hint> seq_hints;
@@ -4841,6 +4963,49 @@ private:
                     if (kv_batch_limit > 0) {
                         SRV_INF("KV floor exhausted during prefill; limiting next batch to %u cells\n", kv_batch_limit);
                     }
+                }
+                // XKV admission (snapshot taken above): tighten the next batch
+                // to the live token bound. A zero bound with a real reason
+                // means do NOT decode — with no preemption victim left, error
+                // the protected prefill slot instead of clamping to one cell.
+                // Only an unknown snapshot (NONE) defers to the legacy size.
+                // Recurrent gating needs no batch tightening: continuation
+                // batches proceed, and a blocked new sequence with no victim
+                // takes the same no-decode error path here.
+                if (have_xkv_snap && xkv_snap.limit_reason != LLAMA_MEMORY_LIMIT_NONE) {
+                    if (xkv_snap.safe_next_ubatch == 0) {
+                        SRV_ERR("XKV admission exhausted (%s); refusing decode\n",
+                            llama_memory_limit_reason_name(xkv_snap.limit_reason));
+                        if (id_slot_protected >= 0) {
+                            if (server_slot * stuck = get_slot_by_id(id_slot_protected)) {
+                                if (stuck->is_processing()) {
+                                    send_error(*stuck, "Context size has been exceeded.");
+                                    stuck->release();
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                    const uint32_t cap = (uint32_t) std::min<uint64_t>(
+                        xkv_snap.safe_next_ubatch, (uint64_t) llama_n_batch(ctx_tgt));
+                    if (cap < kv_batch_limit) {
+                        kv_batch_limit = cap;
+                        SRV_INF("XKV admission (%s): limiting next batch to %u cells\n",
+                            llama_memory_limit_reason_name(xkv_snap.limit_reason), kv_batch_limit);
+                    }
+                }
+                if (have_xkv_snap && xkv_snap.recurrent_blocks_new_seq &&
+                    (required_recurrent_tgt > 0 || required_recurrent_dft > 0)) {
+                    SRV_ERR("%s", "XKV recurrent admission: no free recurrent slot for the new sequence\n");
+                    if (id_slot_protected >= 0) {
+                        if (server_slot * stuck = get_slot_by_id(id_slot_protected)) {
+                            if (stuck->is_processing()) {
+                                send_error(*stuck, "Context size has been exceeded.");
+                                stuck->release();
+                            }
+                        }
+                    }
+                    return false;
                 }
                 return true;
             }
@@ -5859,6 +6024,237 @@ private:
                     }
                     res->fp_policy_fingerprint     = metrics.fp_policy_fingerprint;
                     res->fp_has_policy             = metrics.fp_has_policy;
+                    // XKV admission snapshot (enabled only). Store/runtime
+                    // counters stay zero until the XKV runtime fills them;
+                    // OFF leaves res->xkv empty so the schema is unchanged.
+                    if (llama_xkv_is_enabled(params_base.xkv_mode)) {
+                        llama_memory_admission_snapshot snap = {};
+                        llama_memory_t mem_metrics = ctx_tgt ? llama_get_memory(ctx_tgt) : nullptr;
+                        if (mem_metrics && llama_memory_get_admission_snapshot(mem_metrics, &snap)) {
+                            auto & xm = res->xkv;
+                            xm.has_admission = true;
+                            xm.safe_next_ubatch = snap.safe_next_ubatch;
+                            xm.limit_reason = llama_memory_limit_reason_name(snap.limit_reason);
+                            xm.logical_capacity = snap.logical_capacity;
+                            xm.logical_used = snap.logical_used;
+                            xm.hot_capacity = snap.hot_capacity;
+                            xm.hot_used = snap.hot_used;
+                            xm.hot_free = snap.hot_free;
+                            xm.hot_reserved = snap.hot_reserved;
+                            xm.factor_live_bytes = snap.factor_live_bytes;
+                            xm.factor_reserved_bytes = snap.factor_reserved_bytes;
+                            xm.factor_budget_bytes = snap.factor_budget_bytes;
+                            xm.factor_free_bytes = snap.factor_free_bytes;
+                            xm.factor_safe_tokens = snap.factor_safe_tokens;
+                            xm.workspace_live_bytes = snap.workspace_live_bytes;
+                            xm.workspace_peak_bytes = snap.workspace_peak_bytes;
+                            xm.workspace_budget_bytes = snap.workspace_budget_bytes;
+                            xm.workspace_free_bytes = snap.workspace_free_bytes;
+                            xm.workspace_safe_tokens = snap.workspace_safe_tokens;
+                            xm.recurrent_capacity = snap.recurrent_capacity;
+                            xm.recurrent_used = snap.recurrent_used;
+                            xm.requested_profile = llama_xkv_storage_profile_name(params_base.xkv_storage_profile);
+                            xm.requested_mode = llama_xkv_mode_name(params_base.xkv_mode);
+                            xm.requested_a_k = ggml_type_name(params_base.xkv_factor_a_k);
+                            xm.requested_b_k = ggml_type_name(params_base.xkv_factor_b_k);
+                            xm.requested_a_v = ggml_type_name(params_base.xkv_factor_a_v);
+                            xm.requested_b_v = ggml_type_name(params_base.xkv_factor_b_v);
+                            xm.requested_landmark = ggml_type_name(params_base.xkv_landmark_type);
+                            xm.requested_factorizer = llama_xkv_factorizer_name(params_base.xkv_factorizer);
+                            xm.requested_balance = llama_xkv_factor_balance_name(params_base.xkv_factor_balance);
+                            {
+                                std::ostringstream s;
+                                s << "0x" << std::hex << std::nouppercase << std::setw(16) << std::setfill('0') << params_base.xkv_seed;
+                                xm.requested_seed = s.str();
+                            }
+                            {
+                                // Canonical landmark codec table seed (777). No CLI
+                                // override exists; the seal path uses this default
+                                // verbatim, so requested == effective constant.
+                                std::ostringstream s_lm;
+                                s_lm << "0x" << std::hex << std::nouppercase << std::setw(16) << std::setfill('0') << (uint64_t) 777;
+                                xm.requested_landmark_seed = s_lm.str();
+                            }
+                            if (std::fabs(params_base.triattention_ratio - (3.0 / 32.0)) < 1e-6) {
+                                xm.tri_ratio_str = "3/32";
+                            } else {
+                                std::ostringstream s_ratio;
+                                s_ratio << params_base.triattention_ratio;
+                                xm.tri_ratio_str = s_ratio.str();
+                            }
+                            xm.tri_recent_window = 128;
+                            if (model_tgt != nullptr) {
+                                uint8_t msha[32] = {};
+                                if (llama_model_source_artifact_sha256(model_tgt, msha)) {
+                                    std::ostringstream ss;
+                                    for (int i = 0; i < 32; ++i) {
+                                        ss << std::hex << std::nouppercase << std::setw(2) << std::setfill('0') << (int) msha[i];
+                                    }
+                                    xm.model_sha256 = ss.str();
+                                }
+                            }
+                            // Requested profile is the request; effective config comes
+                            // ONLY from the observed runtime snapshot when armed.
+                            // Missing/failed runtime => not_evaluated (fields stay
+                            // zero), never a copy of the request.
+                            llama_memory_xkv_runtime_snapshot rsnap = {};
+                            // Zero-init contract: the filler sets struct_size and
+                            // version; anything else is not_evaluated.
+                            // observed marks XKV-enabled with a runtime present even
+                            // when no snapshot is armed yet: ratios/timers then render
+                            // as null/NaN (not_evaluated) instead of 0.0. Fully
+                            // unobserved (OFF) snapshots keep exact all-zero output.
+                            auto & xr0 = res->xkv;
+                            xr0.observed = (mem_metrics != nullptr);
+                            if (mem_metrics && llama_memory_get_xkv_runtime_snapshot(mem_metrics, &rsnap) &&
+                                rsnap.armed && rsnap.version == 1 &&
+                                rsnap.struct_size == sizeof(rsnap)) {
+                                auto & xr = res->xkv;
+                                xr.effective_profile = llama_xkv_storage_profile_name(rsnap.effective_profile);
+                                xr.effective_mode = llama_xkv_mode_name(rsnap.mode);
+                                if (rsnap.codec_a_k >= 0 && rsnap.codec_a_k < GGML_TYPE_COUNT) {
+                                    xr.effective_a_k = ggml_type_name((enum ggml_type) rsnap.codec_a_k);
+                                }
+                                if (rsnap.codec_b_k >= 0 && rsnap.codec_b_k < GGML_TYPE_COUNT) {
+                                    xr.effective_b_k = ggml_type_name((enum ggml_type) rsnap.codec_b_k);
+                                }
+                                if (rsnap.codec_a_v >= 0 && rsnap.codec_a_v < GGML_TYPE_COUNT) {
+                                    xr.effective_a_v = ggml_type_name((enum ggml_type) rsnap.codec_a_v);
+                                }
+                                if (rsnap.codec_b_v >= 0 && rsnap.codec_b_v < GGML_TYPE_COUNT) {
+                                    xr.effective_b_v = ggml_type_name((enum ggml_type) rsnap.codec_b_v);
+                                }
+                                if (rsnap.codec_landmark >= 0 && rsnap.codec_landmark < GGML_TYPE_COUNT) {
+                                    xr.effective_landmark = ggml_type_name((enum ggml_type) rsnap.codec_landmark);
+                                }
+                                if (rsnap.codec_factorizer >= 0 && rsnap.codec_factorizer <= (int) LLAMA_XKV_FACTORIZER_CUDA) {
+                                    xr.effective_factorizer = llama_xkv_factorizer_name((enum llama_xkv_factorizer) rsnap.codec_factorizer);
+                                }
+                                if (rsnap.codec_balance >= 0 && rsnap.codec_balance <= (int) LLAMA_XKV_FACTOR_BALANCE_DIAGONAL) {
+                                    xr.effective_balance = llama_xkv_factor_balance_name((enum llama_xkv_factor_balance) rsnap.codec_balance);
+                                }
+                                xr.tri_calibration_fingerprint = rsnap.tri_calibration_fingerprint;
+                                bool has_tri_sha = false;
+                                for (int i = 0; i < 32; ++i) {
+                                    if (rsnap.tri_calibration_sha256[i] != 0) { has_tri_sha = true; break; }
+                                }
+                                if (has_tri_sha) {
+                                    std::ostringstream ss_tsha;
+                                    for (int i = 0; i < 32; ++i) {
+                                        ss_tsha << std::hex << std::nouppercase << std::setw(2) << std::setfill('0') << (int) rsnap.tri_calibration_sha256[i];
+                                    }
+                                    xr.tri_calibration_sha256 = ss_tsha.str();
+                                }
+                                if (std::fabs(rsnap.tri_ratio - (3.0 / 32.0)) < 1e-6) {
+                                    xr.tri_ratio_str = "3/32";
+                                } else if (rsnap.tri_ratio > 0.0) {
+                                    std::ostringstream s_ratio;
+                                    s_ratio << rsnap.tri_ratio;
+                                    xr.tri_ratio_str = s_ratio.str();
+                                }
+                                xr.tri_recent_window = rsnap.tri_recent_window;
+                                xr.tri_scorer_valid = rsnap.tri_scorer_valid;
+                                xr.graph_timings_evaluated = rsnap.graph_timings_evaluated;
+                                xr.pack_timer_evaluated = rsnap.pack_timer_evaluated;
+                                xr.sr_counters_evaluated = rsnap.sr_counters_evaluated;
+                                xr.spec_counters_evaluated = rsnap.spec_counters_evaluated;
+                                {
+                                    std::ostringstream s_eff_seed;
+                                    s_eff_seed << "0x" << std::hex << std::nouppercase << std::setw(16) << std::setfill('0') << rsnap.factor_seed;
+                                    xr.effective_seed = s_eff_seed.str();
+                                }
+                                {
+                                    std::ostringstream s_eff_lm;
+                                    s_eff_lm << "0x" << std::hex << std::nouppercase << std::setw(16) << std::setfill('0') << (uint64_t) 777;
+                                    xr.effective_landmark_seed = s_eff_lm.str();
+                                }
+                                xr.compression_goal_evaluated = rsnap.compression_goal_evaluated;
+                                xr.source = llama_xkv_source_name(rsnap.source);
+                                xr.rank_k = rsnap.rank_k;
+                                xr.rank_v = rsnap.rank_v;
+                                xr.factor_streams = rsnap.factor_streams;
+                                xr.codec_fingerprint = rsnap.codec_fingerprint;
+                                xr.backend_fingerprint = rsnap.backend_fingerprint;
+                                xr.source_fingerprint = rsnap.source_fingerprint;
+                                xr.profile_fingerprint = rsnap.profile_fingerprint;
+                                xr.config_fingerprint = rsnap.profile_fingerprint;
+                                xr.actual_bytes = rsnap.factor_payload_bytes + rsnap.landmark_payload_bytes;
+                                xr.nominal_bytes = rsnap.baseline_covered_bytes;
+                                xr.hot_bytes = rsnap.hot_bytes;
+                                xr.flat_bytes = rsnap.flat_bytes;
+                                xr.factor_ak_bytes = rsnap.factor_ak_bytes;
+                                xr.factor_bk_bytes = rsnap.factor_bk_bytes;
+                                xr.factor_av_bytes = rsnap.factor_av_bytes;
+                                xr.factor_bv_bytes = rsnap.factor_bv_bytes;
+                                xr.factor_payload_bytes = rsnap.factor_payload_bytes;
+                                xr.factor_metadata_bytes = rsnap.factor_metadata_bytes;
+                                xr.factor_padding_bytes = rsnap.factor_padding_bytes;
+                                xr.landmark_payload_bytes = rsnap.landmark_payload_bytes;
+                                xr.landmark_metadata_bytes = rsnap.landmark_metadata_bytes;
+                                xr.landmark_exception_bytes = rsnap.landmark_exception_bytes;
+                                xr.index_bytes = rsnap.index_bytes;
+                                xr.codec_shared_bytes = rsnap.codec_shared_bytes;
+                                xr.decode_tile_cache_bytes = rsnap.decode_tile_cache_bytes;
+                                xr.capture_bytes = rsnap.capture_bytes;
+                                xr.candidate_bytes = rsnap.candidate_bytes;
+                                // No separate staging ring in decoded-hot mode: transient
+                                // staging lives inside the workspace arena / candidate
+                                // scratch, so observed staging is 0 (never inferred).
+                                xr.staging_bytes = 0;
+                                xr.snapshot_pinned_bytes = rsnap.snapshot_pinned_bytes;
+                                xr.allocator_live_bytes = rsnap.allocator_live_bytes;
+                                xr.allocator_reserved_bytes = rsnap.allocator_reserved_bytes;
+                                xr.device_peak_bytes = rsnap.device_peak_bytes;
+                                xr.host_peak_bytes = rsnap.host_peak_bytes;
+                                xr.unique_payloads = rsnap.unique_payloads;
+                                xr.aliased_payloads = rsnap.aliased_payloads;
+                                xr.baseline_same_rows_bytes = rsnap.baseline_covered_bytes;
+                                xr.covered_compressed_bytes = rsnap.covered_compressed_bytes;
+                                xr.factored_baseline_byte_coverage = rsnap.factored_baseline_byte_coverage;
+                                xr.factor_quant_ratio = rsnap.factor_quant_ratio;
+                                xr.net_extra_compression_ratio = rsnap.net_extra_compression_ratio;
+                                xr.net_extra_compression_ratio_reserved = rsnap.net_extra_compression_ratio_reserved;
+                                {
+                                    const uint64_t peak_alloc = rsnap.device_peak_bytes + rsnap.host_peak_bytes;
+                                    xr.net_extra_compression_ratio_peak =
+                                        (rsnap.baseline_covered_bytes > 0 && peak_alloc > 0)
+                                            ? (double) rsnap.baseline_covered_bytes / (double) peak_alloc
+                                            : 0.0;
+                                }
+                                xr.ratios_evaluated = rsnap.ratios_evaluated;
+                                xr.seal_timers_evaluated = rsnap.seal_timers_evaluated;
+                                xr.quant_timers_evaluated = rsnap.quant_timers_evaluated;
+                                xr.seal_seconds = rsnap.seal_seconds;
+                                xr.factor_quant_seconds = rsnap.factor_quant_seconds;
+                                xr.landmark_quant_seconds = rsnap.landmark_quant_seconds;
+                                xr.select_seconds = rsnap.select_seconds;
+                                xr.refine_seconds = rsnap.refine_seconds;
+                                xr.reconstruct_seconds = rsnap.reconstruct_seconds;
+                                xr.read_seconds = rsnap.read_seconds;
+                                xr.pack_seconds = rsnap.pack_seconds;
+                                xr.segments_sealed = rsnap.segments_sealed;
+                                for (int ri = 0; ri < LLAMA_MEMORY_XKV_SKIP_REASON_COUNT; ++ri) {
+                                    const uint64_t c = rsnap.skip_counts[ri];
+                                    if (c > 0) {
+                                        xr.segments_skipped_by_reason[llama_memory_xkv_skip_reason_name(
+                                            (enum llama_memory_xkv_skip_reason) ri)] += c;
+                                    }
+                                }
+                                xr.sr_selected_rows = rsnap.sr_selected_rows;
+                                xr.sr_fragments = rsnap.sr_fragments;
+                                xr.effective_chunk_size = rsnap.effective_chunk_size;
+                                xr.landmark_refine_rows = rsnap.landmark_refine_rows;
+                                xr.landmark_refine_cap_hits = rsnap.landmark_refine_cap_hits;
+                                xr.spec_stale_total = rsnap.spec_stale_total;
+                                xr.transaction_abort_total = rsnap.transaction_abort_total;
+                                xr.synchronize_total = rsnap.synchronize_total;
+                                xr.compression_goal_met = rsnap.compression_goal_met;
+                            }
+                            if (snap.limit_reason != LLAMA_MEMORY_LIMIT_NONE) {
+                                xm.throttle_reason = xm.limit_reason;
+                            }
+                        }
+                    }
 
                     if (rerot) {
                         const uint32_t people_cap = params_base.rerot_person_max > 0
@@ -6613,6 +7009,8 @@ private:
                         slot.spec_draft.clear();
                         slot.spec_i_batch.clear();
                         slot.rerot_has_draft_stamp = false;
+                        // XKV abort side: the seq_rm above is the full rollback;
+                        // sealing is forbidden here by design.
                     }
                     // v1: no cross-frontier speculative window for RERoT lanes.
                     return;
@@ -7874,6 +8272,8 @@ private:
                 slot.spec_draft.clear();
                 slot.spec_i_batch.clear();
                 slot.rerot_has_draft_stamp = false;
+                // XKV abort side: the seq_rm above is the full rollback (no
+                // accepted prefix exists); sealing is forbidden here by design.
                 return;
             }
 
@@ -7926,6 +8326,10 @@ private:
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         slot.smpl = std::move(smpl_save);
 
+                        // XKV abort side: checkpoint restore + seq_rm reset the
+                        // tentative rows; no accepted prefix exists yet, so no
+                        // sealing may run on this path.
+
                         return;
                     }
                 }
@@ -7970,6 +8374,33 @@ private:
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+
+            // XKV settle at the acceptance decision boundary. The seq_rm above
+            // rolled back the rejected suffix (fail-closed: common_memory aborts
+            // on removal failure), so only accepted-prefix rows remain
+            // hot_committed. Publication (sealing) is legal only from this point
+            // on — never at the generic decode tail before acceptance. Seal here
+            // only when hot pressure is actually due (hot_free == 0 mirrors the
+            // old fill-first trigger), so no unconditional sync happens when
+            // maintenance is not needed; the pre-batch admission path remains
+            // the primary seal driver. Errors are logged, never masking the
+            // already-accepted decode.
+            if (llama_xkv_is_enabled(params_base.xkv_mode)) {
+                if (llama_memory_t mem_settle = llama_get_memory(slot.ctx_tgt)) {
+                    llama_memory_admission_snapshot snap = {};
+                    if (llama_memory_get_admission_snapshot(mem_settle, &snap) && snap.hot_free == 0) {
+                        const auto mst = llama_memory_maintain_safe_boundary(mem_settle);
+                        if (mst == LLAMA_MEMORY_MAINTENANCE_RETRY_STALE) {
+                            const auto mst2 = llama_memory_maintain_safe_boundary(mem_settle);
+                            if (mst2 == LLAMA_MEMORY_MAINTENANCE_ERROR) {
+                                SLT_ERR(slot, "%s", "XKV settle maintain retry failed (decode already accepted; continuing without sealing)\n");
+                            }
+                        } else if (mst == LLAMA_MEMORY_MAINTENANCE_ERROR) {
+                            SLT_ERR(slot, "%s", "XKV settle maintain failed (decode already accepted; continuing without sealing)\n");
+                        }
+                    }
+                }
+            }
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
@@ -8653,6 +9084,11 @@ void server_routes::init_routes() {
             emit_rerot("gauge", "rerot_grouped_scratch_bytes", "Estimated grouped multi-reader / RBB scratch in bytes.", r.grouped_scratch_bytes);
         }
 
+        // XKV suite (§16): additive; OFF (empty) emits nothing.
+        if (!res_task->xkv.empty()) {
+            res_task->xkv.to_prometheus(prometheus);
+        }
+
         // Labeled fallback counter is emitted separately because the compact
         // metric-definition helper above intentionally models unlabeled series.
         prometheus << "# HELP llamacpp:tri_atomic_fallback_total Atomic fallback entries after dynamic-memory pressure, by reason.\n"
@@ -8887,6 +9323,38 @@ void server_routes::init_routes() {
             { "is_sleeping",                 queue_tasks.is_sleeping() },
             { "cors_proxy_enabled",          params.ui_mcp_proxy },
         };
+
+        // Evaluator identity keys: content-checksum model identity (never path),
+        // exact XKV mode, factorization seed, Tri calibration identity, RERoT
+        // frontier mode, and speculative draft bounds.
+        const llama_model * pmodel = this->ctx_server.model_tgt;
+        if (pmodel != nullptr) {
+            uint8_t msha[32] = {};
+            if (llama_model_source_artifact_sha256(pmodel, msha)) {
+                std::ostringstream ss;
+                for (int i = 0; i < 32; ++i) {
+                    ss << std::hex << std::nouppercase << std::setw(2) << std::setfill('0') << (int) msha[i];
+                }
+                props["model_sha256"] = ss.str();
+            }
+        }
+        props["xkv_mode"] = llama_xkv_mode_name(params.xkv_mode);
+        {
+            std::ostringstream ss;
+            ss << "0x" << std::hex << std::nouppercase << std::setw(16) << std::setfill('0') << params.xkv_seed;
+            props["xkv_seed"] = ss.str();
+            props["xkv_factor_seed"] = ss.str();
+        }
+        props["xkv_storage_profile"] = llama_xkv_storage_profile_name(params.xkv_storage_profile);
+        {
+            std::ostringstream ss_lm;
+            ss_lm << "0x" << std::hex << std::nouppercase << std::setw(16) << std::setfill('0') << (uint64_t) 777;
+            props["xkv_landmark_seed"] = ss_lm.str();
+        }
+        props["rerot_frontier"] = std::string(llama_rerot_frontier_mode_name(params.rerot_frontier));
+        props["spec_draft_n_max"] = params.speculative.draft.n_max;
+        props["triattention_ratio"] = "3/32";
+        props["tri_recent_window"] = 128;
         if (params.use_jinja) {
             if (!tmpl_tools.empty()) {
                 props["chat_template_tool_use"] = tmpl_tools;

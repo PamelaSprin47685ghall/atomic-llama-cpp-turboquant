@@ -1320,6 +1320,26 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     if (params.n_ctx_kv_auto) {
+        // XKV auto-fit reserve accounting (§16): computed exactly once here
+        // for visibility and overflow validation; the per-device addition
+        // itself happens inside the fit probes (fit.cpp).
+        if (llama_xkv_is_enabled(cparams.xkv_mode)) {
+            common_xkv_fit_reserve xkv_reserve = {};
+            uint64_t xkv_log_scratch = 0;
+            if (!common_xkv_scratch_bytes(params.model.path.c_str(), &mparams, &cparams, &xkv_log_scratch)) {
+                COM_ERR("%s", "XKV scratch estimation failed, aborting auto-fit\n");
+                return;
+            }
+            if (!common_xkv_fit_reserve_bytes(&cparams, xkv_log_scratch, &xkv_reserve)) {
+                COM_ERR("%s", "XKV reserve accounting overflow, aborting auto-fit\n");
+                return;
+            }
+            COM_INF("XKV auto-fit reserve: workspace=%llu MiB decode_cache=%llu MiB factor_scratch=%llu MiB total=%llu MiB (accounted once per device)\n",
+                (unsigned long long) (xkv_reserve.workspace_bytes       / (1024ull * 1024ull)),
+                (unsigned long long) (xkv_reserve.decode_cache_bytes   / (1024ull * 1024ull)),
+                (unsigned long long) (xkv_reserve.factor_scratch_bytes / (1024ull * 1024ull)),
+                (unsigned long long) (xkv_reserve.total_bytes            / (1024ull * 1024ull)));
+        }
         if (params.rerot_enabled) {
             // §B.10 / Phase 8: VRAM-only Three-Capacity Auto-fit for RERoT
             auto fit_res = common_fit_rerot_capacities(
@@ -1353,6 +1373,57 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 cparams_mtp.n_seq_max = fit_res.p_pens;
                 cparams_mtp.n_seq_recurrent = fit_res.p_pens;
                 cparams_mtp.n_outputs_max = fit_res.p_pens;
+            }
+            // XKV store feedback (three-capacity fit): same derive -> refit
+            // -> pin discipline as the KV branch, so the final store plus
+            // transient budgets fit every device. DENSE/SR only.
+            if (cparams.xkv_mode == LLAMA_XKV_MODE_DENSE || cparams.xkv_mode == LLAMA_XKV_MODE_SR) {
+                if (cparams.xkv_store_mib == 0) {
+                    const ggml_log_level xkv_log = params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR;
+                    uint32_t store0 = common_xkv_derive_store_mib(
+                        params.model.path.c_str(), &mparams, &cparams, cparams.n_ctx_kv, xkv_log);
+                    if (store0 == 0) {
+                        COM_ERR("%s", "XKV DENSE/SR requires a nonzero factor store budget: auto-derivation failed, set --xkv-store-mib explicitly\n");
+                        return;
+                    }
+                    cparams.xkv_store_mib = store0;
+                    params.xkv_store_mib = store0;
+                    fit_res = common_fit_rerot_capacities(
+                        params.model.path.c_str(), &mparams, &cparams,
+                        params.n_ctx_kv_reserve, extra_cparams, xkv_log);
+                    if (fit_res.status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                        COM_ERR("%s", "XKV DENSE/SR store budget does not fit: reduce --xkv-store-mib or free device memory\n");
+                        return;
+                    }
+                    params.n_parallel = fit_res.b_people;
+                    params.rerot_person_max = fit_res.b_people;
+                    params.rerot_pen_max = fit_res.p_pens;
+                    params.rerot_brain_rows = fit_res.b_people;
+                    params.rerot_hand_rows = fit_res.p_pens;
+                    params.n_ctx_kv = fit_res.k_tokens;
+                    cparams.n_person_max = fit_res.b_people;
+                    cparams.n_pen_max = fit_res.p_pens;
+                    cparams.n_ctx_kv = fit_res.k_tokens;
+                    cparams.n_seq_recurrent = fit_res.b_people;
+                    if (extra_cparams != nullptr) {
+                        cparams_mtp.n_person_max = fit_res.b_people;
+                        cparams_mtp.n_pen_max = fit_res.p_pens;
+                        cparams_mtp.n_ctx_kv = fit_res.k_tokens;
+                        cparams_mtp.n_seq_recurrent = fit_res.b_people;
+                    }
+                    uint32_t store1 = common_xkv_derive_store_mib(
+                        params.model.path.c_str(), &mparams, &cparams, cparams.n_ctx_kv, xkv_log);
+                    if (store1 == 0) {
+                        COM_ERR("%s", "XKV DENSE/SR requires a nonzero factor store budget: auto-derivation failed, set --xkv-store-mib explicitly\n");
+                        return;
+                    }
+                    if (store1 < cparams.xkv_store_mib) {
+                        cparams.xkv_store_mib = store1;
+                        params.xkv_store_mib = store1;
+                    }
+                }
+                COM_INF("XKV store budget resolved: %u MiB for %u KV tokens\n",
+                    cparams.xkv_store_mib, cparams.n_ctx_kv);
             }
         } else {
             // Ordinary (RERoT OFF) auto-fit remains 100% untouched
@@ -1406,7 +1477,49 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             }
 
             params.n_ctx_kv = cparams.n_ctx_kv;
+        // XKV store feedback: the provisional fit above reserved no
+        // persistent bytes. Derive the budget from the fitted capacity,
+        // refit once with it reserved (K only shrinks), then pin the final
+        // budget at or below the reserved amount so VRAM cannot overcommit.
+        // DENSE/SR only; SHADOW publishes nothing and stays zero.
+        if (cparams.xkv_mode == LLAMA_XKV_MODE_DENSE || cparams.xkv_mode == LLAMA_XKV_MODE_SR) {
+            // Explicit budgets are honored as configured (already reserved in
+            // the probes); only auto (zero) budgets resolve here.
+            if (cparams.xkv_store_mib == 0) {
+                const uint32_t store0 = common_xkv_derive_store_mib(
+                    params.model.path.c_str(), &mparams, &cparams, cparams.n_ctx_kv,
+                    params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+                if (store0 == 0) {
+                    COM_ERR("%s", "XKV DENSE/SR requires a nonzero factor store budget: auto-derivation failed, set --xkv-store-mib explicitly\n");
+                    return;
+                }
+                cparams.xkv_store_mib = store0;
+                params.xkv_store_mib = store0;
+                status = fit_kv();
+                if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                    COM_ERR("%s", "XKV DENSE/SR store budget does not fit: reduce --xkv-store-mib or free device memory\n");
+                    return;
+                }
+                params.n_ctx_kv = cparams.n_ctx_kv;
+                const uint32_t store1 = common_xkv_derive_store_mib(
+                    params.model.path.c_str(), &mparams, &cparams, cparams.n_ctx_kv,
+                    params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+                if (store1 == 0) {
+                    COM_ERR("%s", "XKV DENSE/SR requires a nonzero factor store budget: auto-derivation failed, set --xkv-store-mib explicitly\n");
+                    return;
+                }
+                // Final budget never exceeds the reserved (refit) amount:
+                // the refit reserved store0, and store1 <= store0 since K
+                // only shrank.
+                if (store1 < cparams.xkv_store_mib) {
+                    cparams.xkv_store_mib = store1;
+                    params.xkv_store_mib = store1;
+                }
+            }
+            COM_INF("XKV store budget resolved: %u MiB for %u KV tokens\n",
+                cparams.xkv_store_mib, cparams.n_ctx_kv);
         }
+        } // end non-RERoT else (XKV feedback above uses branch-local fit_kv)
     } else if (dynamic_kv) {
         // When --fit is off and the user did not specify -c, resolve n_ctx
         // from the model's training context so that common_dynamic_recurrent_target
@@ -1430,6 +1543,31 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_seq_recurrent = common_dynamic_recurrent_target(cparams);
         if (extra_cparams != nullptr) {
             cparams_mtp.n_seq_recurrent = cparams.n_seq_recurrent;
+        }
+    }
+
+    // Persistent XKV store budget (§16): production DENSE/SR requires a
+    // nonzero resolved budget. An explicit --xkv-store-mib was already
+    // reserved per-device inside the fit probes above; a zero here is an
+    // auto-fit-derived placeholder resolved from the fitted KV capacity
+    // (dense-equivalent context scaled by min_saving). SHADOW reference
+    // keeps no persistent store and stays zero by gate construction.
+    // NOTE: the MTP/draft copy (extra_cparams) intentionally keeps 0: the
+    // draft cache is excluded from XKV persistence.
+    if (dynamic_kv &&
+        (cparams.xkv_mode == LLAMA_XKV_MODE_DENSE || cparams.xkv_mode == LLAMA_XKV_MODE_SR)) {
+        if (cparams.xkv_store_mib == 0) {
+            const uint32_t derived = common_xkv_derive_store_mib(
+                params.model.path.c_str(), &mparams, &cparams, cparams.n_ctx_kv,
+                params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            if (derived == 0) {
+                COM_ERR("%s", "XKV DENSE/SR requires a nonzero factor store budget: auto-derivation failed, set --xkv-store-mib explicitly\n");
+                return;
+            }
+            cparams.xkv_store_mib = derived;
+            params.xkv_store_mib = derived;
+            COM_INF("XKV store budget auto-derived: %u MiB for %u KV tokens (dense-equivalent scaled by min_saving)\n",
+                derived, cparams.n_ctx_kv);
         }
     }
 
@@ -1885,6 +2023,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.rerot_enabled ? true : params.kv_unified;
+    if (llama_xkv_is_enabled(params.xkv_mode)) {
+        cparams.kv_unified    = true;
+    }
     cparams.triattention        = params.triattention_enabled;
     cparams.triattention_stats  = params.triattention_stats.c_str();
     cparams.triattention_ratio  = params.triattention_ratio;
@@ -1895,6 +2036,32 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     // FlashPrefill V2 policy: immutable value copy for the context lifetime.
     // OFF (the default) preserves the pre-existing attention path exactly.
     cparams.flashprefill        = params.flashprefill;
+
+    // XKV (§16) parameters
+    cparams.xkv_mode                     = params.xkv_mode;
+    cparams.xkv_storage_profile          = params.xkv_storage_profile;
+    cparams.xkv_group_size               = params.xkv_group_size;
+    cparams.xkv_rank_k                   = params.xkv_rank_k;
+    cparams.xkv_rank_v                   = params.xkv_rank_v;
+    cparams.xkv_segment_tokens           = params.xkv_segment_tokens;
+    cparams.xkv_chunk_tokens             = params.xkv_chunk_tokens;
+    cparams.xkv_sr_budget                = params.xkv_sr_budget;
+    cparams.xkv_source                   = params.xkv_source;
+    cparams.xkv_factor_a_k               = params.xkv_factor_a_k;
+    cparams.xkv_factor_b_k               = params.xkv_factor_b_k;
+    cparams.xkv_factor_a_v               = params.xkv_factor_a_v;
+    cparams.xkv_factor_b_v               = params.xkv_factor_b_v;
+    cparams.xkv_factor_balance           = params.xkv_factor_balance;
+    cparams.xkv_landmark_type            = params.xkv_landmark_type;
+    cparams.xkv_landmark_refine          = params.xkv_landmark_refine;
+    cparams.xkv_landmark_refine_max_rows = params.xkv_landmark_refine_max_rows;
+    cparams.xkv_workspace_mib            = params.xkv_workspace_mib;
+    cparams.xkv_decode_cache_mib         = params.xkv_decode_cache_mib;
+    cparams.xkv_store_mib                = params.xkv_store_mib;
+    cparams.xkv_seed                     = params.xkv_seed;
+    cparams.xkv_min_saving               = params.xkv_min_saving;
+    cparams.xkv_min_factor_coverage      = params.xkv_min_factor_coverage;
+    cparams.xkv_factorizer               = params.xkv_factorizer;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

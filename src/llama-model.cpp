@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-xkv-state.h"  // xkv_source_files_sha256 for source_artifact_sha256
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1722,6 +1723,29 @@ size_t llama_model::size() const {
     return pimpl->n_bytes;
 }
 
+bool llama_model::source_artifact_sha256(uint8_t out[32]) const {
+    if (out == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(source_digest_mu);
+    if (source_digest_cached) {
+        std::memcpy(out, source_digest_cache, 32);
+        return true;
+    }
+    if (source_paths.empty()) {
+        return false;
+    }
+    uint8_t digest[32];
+    std::string err;
+    if (!llama_xkv::xkv_source_files_sha256(source_paths, digest, &err)) {
+        return false;
+    }
+    std::memcpy(source_digest_cache, digest, 32);
+    source_digest_cached = true;
+    std::memcpy(out, digest, 32);
+    return true;
+}
+
 size_t llama_model::n_tensors() const {
     return tensors_by_name.size();
 }
@@ -2323,7 +2347,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* cparams           */ (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) ? &cparams : nullptr);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -2344,7 +2369,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* cparams           */ (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) ? &cparams : nullptr);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -2407,7 +2433,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     mem_other,
                                     filter,
                                     reuse,
-                                    share);
+                                    share,
+                                    (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) ? &cparams : nullptr);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -2424,7 +2451,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     nullptr,
                                     filter,
                                     reuse,
-                                    share);
+                                    share,
+                                    (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) ? &cparams : nullptr);
                         }
                     } else {
                         res = new llama_kv_cache(
@@ -2443,7 +2471,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 nullptr,
                                 filter,
                                 nullptr,
-                                nullptr);
+                                nullptr,
+                                (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) ? &cparams : nullptr);
                     }
                 }
             }
@@ -2865,6 +2894,13 @@ llama_ftype llama_model_ftype(const llama_model * model) {
 
 uint64_t llama_model_size(const llama_model * model) {
     return model->size();
+}
+
+bool llama_model_source_artifact_sha256(const llama_model * model, uint8_t out_sha256[32]) {
+    if (model == nullptr) {
+        return false;
+    }
+    return model->source_artifact_sha256(out_sha256);
 }
 
 const char * llama_model_chat_template(const llama_model * model, const char * name) {

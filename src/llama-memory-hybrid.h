@@ -41,7 +41,8 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+    const llama_cparams   * cparams = nullptr);
 
     ~llama_memory_hybrid() = default;
 
@@ -63,6 +64,22 @@ public:
     uint32_t get_kv_capacity() const override;
     uint32_t get_kv_used()     const override;
     uint32_t get_kv_seq_used(llama_seq_id seq_id) const override;
+
+    // Failure-reporting clear forwarded to attention then recurrent.
+    bool try_clear(bool data, std::string * err = nullptr) override;
+
+    // Bounded-hot state propagates from the attention cache: legacy defaults
+    // here would bypass hot reservations entirely.
+    uint32_t get_kv_hot_capacity() const override;
+    bool can_use_legacy_attention() const override;
+    bool is_xkv_bounded_hot() const override;
+
+    // Admission combines the attention token domains with the recurrent
+    // domain (sequence slots never enter the token minimum); legacy
+    // get_kv_capacity() meaning is unchanged.
+    bool get_admission_snapshot(struct llama_memory_admission_snapshot * out) const override;
+    llama_memory_maintenance_status maintain_safe_boundary() override;
+    bool get_xkv_runtime_snapshot(struct llama_memory_xkv_runtime_snapshot * out) const override;
 
     uint32_t get_recurrent_capacity() const override;
     uint32_t get_recurrent_used()     const override;
@@ -165,12 +182,22 @@ public:
     llama_memory_hybrid_context(
               llama_memory_hybrid * mem,
                   slot_info_vec_t   sinfos_attn,
-        std::vector<llama_ubatch>   ubatches);
+        std::vector<llama_ubatch>   ubatches,
+        std::vector<llama_xkv::xkv_hot_reservation> hot_res_attn = {});
 
     ~llama_memory_hybrid_context() = default;
 
     bool next()  override;
     bool apply() override;
+
+    // Forward hot-commit/rollback to attention and recurrent exactly once
+    // each (null-guarded for failure-status contexts).
+    bool postcompute_success() override;
+    bool postcompute_failure() override;
+
+    // Graph-facing bounded-hot views, forwarded to attention.
+    ggml_tensor * get_xkv_hot_k(ggml_context * ctx, int32_t il) const override;
+    ggml_tensor * get_xkv_hot_v(ggml_context * ctx, int32_t il) const override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -195,6 +222,10 @@ private:
 
     const llama_memory_context_ptr ctx_attn;
     const llama_memory_context_ptr ctx_recr;
+
+    // Exactly-once postcompute forward flag.
+    bool postcompute_finalized = false;
+    bool postcompute_ok = false;
 
     const llama_memory_status status;
 };

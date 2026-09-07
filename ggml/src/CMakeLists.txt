@@ -209,6 +209,15 @@ add_library(ggml-base
             ggml-quants.c
             ggml-quants.h
             ggml-turbo-quant.c
+            ggml-xkv-reconstruct.cpp
+            ../include/ggml-xkv.h
+            ggml-xkv-attention.cpp
+            ggml-vulkan-landmark.cpp
+            ggml-xkv-landmark-build.cpp
+            ggml-xkv-factor.cpp
+            ../include/ggml-xkv-factor.h
+            ../include/ggml-vulkan-landmark.h
+            ../include/ggml-xkv-landmark-build.h
             gguf.cpp)
 
 set_target_properties(ggml-base PROPERTIES

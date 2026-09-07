@@ -12,6 +12,7 @@
 
 #include "llama-triattention.h"
 #include "llama-kv-transform.h"
+#include "llama-xkv-state.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -1061,6 +1062,70 @@ bool triattention_scorer::matches_layers(const int32_t * layer_map, uint32_t n_l
     return false;
 }
 
+// Canonical little-endian serialization of validated calibration content for
+// fingerprinting (dims, rope params, sampled ids, all stats floats, name).
+static void triattention_calibration_serialize(const triattention_calibration * cal,
+                                               std::vector<uint8_t> & out) {
+    auto pu32 = [&](uint32_t v) {
+        for (int i = 0; i < 4; ++i) {
+            out.push_back((uint8_t) ((v >> (i * 8)) & 0xFF));
+        }
+    };
+    auto pf = [&](float v) {
+        uint32_t b = 0;
+        std::memcpy(&b, &v, sizeof(b));
+        pu32(b);
+    };
+    auto pd = [&](double v) {
+        uint64_t b = 0;
+        std::memcpy(&b, &v, sizeof(b));
+        for (int i = 0; i < 8; ++i) {
+            out.push_back((uint8_t) ((b >> (i * 8)) & 0xFF));
+        }
+    };
+    pu32(cal->head_dim);
+    pu32(cal->num_layers);
+    pu32(cal->num_attn_heads);
+    pu32(cal->num_kv_heads);
+    pu32(cal->num_kv_groups);
+    pd(cal->rope_theta);
+    pu32(cal->rope_style);
+    pu32(cal->freq_count);
+    pu32(cal->rotary_dim);
+    pu32(cal->n_sampled);
+    for (uint32_t i = 0; i < cal->n_sampled; ++i) {
+        pu32(cal->sampled_layer[i]);
+        pu32(cal->sampled_head[i]);
+        for (uint32_t f = 0; f < cal->freq_count; ++f) {
+            pf(cal->head_stats[i].q_mean_real[f]);
+            pf(cal->head_stats[i].q_mean_imag[f]);
+            pf(cal->head_stats[i].q_abs_mean[f]);
+        }
+    }
+    for (int i = 0; i < 256 && cal->model_name[i] != '\0'; ++i) {
+        out.push_back((uint8_t) cal->model_name[i]);
+    }
+}
+
+uint64_t triattention_scorer::calibration_content_fingerprint() const {
+    if (!valid() || !pimpl->cal) {
+        return 0;
+    }
+    std::vector<uint8_t> buf;
+    triattention_calibration_serialize(pimpl->cal, buf);
+    return llama_xkv::xkv_state_checksum(buf.data(), buf.size());
+}
+
+bool triattention_scorer::calibration_content_sha256(uint8_t out[32]) const {
+    if (out == nullptr || !valid() || !pimpl->cal) {
+        return false;
+    }
+    std::vector<uint8_t> buf;
+    triattention_calibration_serialize(pimpl->cal, buf);
+    llama_xkv::xkv_sha256(buf.data(), buf.size(), out);
+    return true;
+}
+
 void triattention_scorer::score_head(
     float * out_scores,
     const ggml_tensor * k_tensor,
@@ -1516,6 +1581,18 @@ uint32_t triattention_scorer::get_freq_count() const {
 
 const char * triattention_scorer::get_model_name() const {
     return pimpl && pimpl->cal ? pimpl->cal->model_name : "";
+}
+
+const triattention_calibration * triattention_scorer::get_calibration() const {
+    return pimpl ? pimpl->cal : nullptr;
+}
+
+const float * triattention_scorer::get_omega() const {
+    return pimpl ? pimpl->omega : nullptr;
+}
+
+const float * triattention_scorer::get_freq_scale_sq() const {
+    return pimpl ? pimpl->freq_scale_sq : nullptr;
 }
 
 // ============================================================================

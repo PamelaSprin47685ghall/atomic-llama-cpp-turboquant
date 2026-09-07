@@ -8,6 +8,9 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <ostream>
+#include <sstream>
+#include <iomanip>
 #include <vector>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
@@ -202,6 +205,586 @@ struct server_rerot_metrics {
     bool empty() const;
     json to_json() const;
     void accumulate(const server_rerot_metrics & delta);
+};
+
+// XKV metrics suite (§16), additive to the Tri/RERoT metrics.
+// All zero/empty when XKV OFF: to_json() output is omitted by the caller
+// and to_prometheus() emits nothing, so OFF responses keep the exact
+// pre-XKV schema. Store/runtime counters stay zero until the XKV runtime
+// fills them; admission fields are populated from the live snapshot.
+struct server_xkv_metrics {
+    bool        has_admission = false;
+    uint32_t    safe_next_ubatch = 0;
+    std::string limit_reason;
+    uint32_t    logical_capacity = 0;
+    uint32_t    logical_used = 0;
+    uint32_t    hot_capacity = 0;
+    uint32_t    hot_used = 0;
+    uint32_t    hot_free = 0;
+    uint32_t    hot_reserved = 0;
+    uint64_t    factor_live_bytes = 0;
+    uint64_t    factor_reserved_bytes = 0;
+    uint64_t    factor_budget_bytes = 0;
+    uint64_t    factor_free_bytes = 0;
+    uint32_t    factor_safe_tokens = UINT32_MAX; // planner bound (MAX = unconstrained)
+    uint64_t    workspace_live_bytes = 0;
+    uint64_t    workspace_peak_bytes = 0;
+    uint64_t    workspace_budget_bytes = 0;
+    uint64_t    workspace_free_bytes = 0;
+    uint32_t    workspace_safe_tokens = UINT32_MAX; // planner bound (MAX = unconstrained)
+    uint32_t    recurrent_capacity = 0;
+    uint32_t    recurrent_used = 0;
+    std::string requested_profile;
+    std::string effective_profile;
+    // Requested/effective XKV mode (off|shadow|dense|sr). Storage profile
+    // stays separate: mode tells R2-dense apart from R4-SR on the same family.
+    std::string requested_mode;
+    std::string effective_mode;
+    std::string source; // observed source, never assumed
+    // Codec identity (strings): requested from params, effective from runtime.
+    std::string requested_a_k, effective_a_k;
+    std::string requested_b_k, effective_b_k;
+    std::string requested_a_v, effective_a_v;
+    std::string requested_b_v, effective_b_v;
+    std::string requested_landmark, effective_landmark;
+    std::string requested_factorizer, effective_factorizer;
+    std::string requested_balance, effective_balance;
+    // Factorization seed (exact hex/string; never float gauge >2^53).
+    std::string requested_seed, effective_seed;
+    // Canonical landmark codec table seeds (exact hex/string). Factor seeds
+    // derive per-group (seed + group*1000); landmark tables use the canonical
+    // codec seed (777). Requested is the configured default; effective is the
+    // observed runtime value. Separate from factor seeds; never conflated.
+    std::string requested_landmark_seed, effective_landmark_seed;
+    // Tri identity:
+    uint64_t    tri_calibration_fingerprint = 0;
+    std::string tri_calibration_sha256;
+    std::string tri_ratio_str;
+    uint32_t    tri_recent_window = 0;
+    bool        tri_scorer_valid = false;
+    // Tri-state compression goal: true iff evaluated
+    bool        compression_goal_evaluated = false;
+    // Evaluator model SHA-256 (exact lowercase hex from llama_model):
+    std::string model_sha256;
+    uint64_t    codec_fingerprint = 0;
+    uint64_t    backend_fingerprint = 0;
+    uint64_t    source_fingerprint = 0;
+    uint64_t    profile_fingerprint = 0;
+    // Full §16 effective config fingerprint. The runtime stamps segments with
+    // config_fingerprint() (see profile_fingerprint); exposed separately so the
+    // evaluator need not guess which fingerprint carries the config.
+    uint64_t    config_fingerprint = 0;
+    uint32_t    rank_k = 0;
+    uint32_t    rank_v = 0;
+    uint64_t    factor_streams = 0;
+    uint64_t    actual_bytes = 0;
+    uint64_t    nominal_bytes = 0;
+    uint64_t    hot_bytes = 0;
+    uint64_t    flat_bytes = 0;
+    uint64_t    factor_ak_bytes = 0;
+    uint64_t    factor_bk_bytes = 0;
+    uint64_t    factor_av_bytes = 0;
+    uint64_t    factor_bv_bytes = 0;
+    uint64_t    factor_payload_bytes = 0;
+    uint64_t    factor_metadata_bytes = 0;
+    uint64_t    factor_padding_bytes = 0;
+    uint64_t    landmark_payload_bytes = 0;
+    uint64_t    landmark_metadata_bytes = 0;
+    uint64_t    landmark_exception_bytes = 0;
+    uint64_t    index_bytes = 0;
+    uint64_t    codec_shared_bytes = 0;
+    uint64_t    decode_tile_cache_bytes = 0;
+    uint64_t    capture_bytes = 0;
+    uint64_t    candidate_bytes = 0;
+    // Transient device staging reservation (live bytes). No separate staging
+    // ring exists in decoded-hot mode: transient staging lives inside the
+    // workspace arena / candidate scratch, so this is 0 when none is held.
+    // Exposed explicitly so "staging" is observed, never inferred.
+    uint64_t    staging_bytes = 0;
+    uint64_t    snapshot_pinned_bytes = 0;
+    uint64_t    allocator_live_bytes = 0;
+    uint64_t    allocator_reserved_bytes = 0;
+    uint64_t    device_peak_bytes = 0;
+    uint64_t    host_peak_bytes = 0;
+    uint64_t    unique_payloads = 0;
+    uint64_t    aliased_payloads = 0;
+    uint64_t    baseline_same_rows_bytes = 0;
+    uint64_t    covered_compressed_bytes = 0; // compressed bytes covering the baseline
+    double      factored_baseline_byte_coverage = 0.0;
+    double      factor_quant_ratio = 0.0;
+    double      net_extra_compression_ratio = 0.0;
+    double      net_extra_compression_ratio_reserved = 0.0;
+    // Peak-basis net extra compression ratio (§11.1 "running peak" pair member):
+    // same-row live baseline / peak allocated bytes
+    // (device_peak + host_peak high-water). Gated by ratios_evaluated like the
+    // live/reserved pair; never mixed with them.
+    double      net_extra_compression_ratio_peak = 0.0;
+    // Explicit evaluated status (not_evaluated renders as JSON null /
+    // Prometheus NaN, never as 0.0). Transport-only:
+    bool        ratios_evaluated = false;
+    bool        seal_timers_evaluated = false;
+    bool        quant_timers_evaluated = false;
+    bool        graph_timings_evaluated = false;
+    bool        pack_timer_evaluated = false;
+    bool        sr_counters_evaluated = false;
+    bool        spec_counters_evaluated = false;
+    // Transport-only: XKV was enabled and a runtime was present, even if no
+    // snapshot was armed. False preserves exact OFF all-zero output. Excluded
+    // from empty() so unobserved snapshots stay silent on Prometheus.
+    bool        observed = false;
+    double      seal_seconds = 0.0;
+    double      factor_quant_seconds = 0.0;
+    double      landmark_quant_seconds = 0.0;
+    double      select_seconds = 0.0;
+    double      refine_seconds = 0.0;
+    double      reconstruct_seconds = 0.0;
+    double      read_seconds = 0.0;
+    double      pack_seconds = 0.0;
+    uint64_t    segments_sealed = 0;
+    std::map<std::string, uint64_t> segments_skipped_by_reason;
+    uint64_t    sr_selected_rows = 0;
+    uint64_t    sr_fragments = 0;
+    uint64_t    effective_chunk_size = 0;
+    uint64_t    landmark_refine_rows = 0;
+    uint64_t    landmark_refine_cap_hits = 0;
+    uint64_t    spec_stale_total = 0;
+    uint64_t    transaction_abort_total = 0;
+    uint64_t    synchronize_total = 0;
+    bool        compression_goal_met = false;
+    uint64_t    throttle_total = 0;
+    std::string throttle_reason;
+
+    bool empty() const {
+        return !has_admission
+            && requested_profile.empty() && effective_profile.empty()
+            && requested_mode.empty() && effective_mode.empty()
+            && source.empty()
+            && codec_fingerprint == 0 && backend_fingerprint == 0
+            && source_fingerprint == 0 && profile_fingerprint == 0
+            && config_fingerprint == 0
+            && rank_k == 0 && rank_v == 0 && factor_streams == 0
+            && actual_bytes == 0 && nominal_bytes == 0
+            && hot_bytes == 0 && flat_bytes == 0
+            && factor_ak_bytes == 0 && factor_bk_bytes == 0
+            && factor_av_bytes == 0 && factor_bv_bytes == 0
+            && factor_payload_bytes == 0 && factor_metadata_bytes == 0 && factor_padding_bytes == 0
+            && landmark_payload_bytes == 0 && landmark_metadata_bytes == 0 && landmark_exception_bytes == 0
+            && index_bytes == 0 && codec_shared_bytes == 0
+            && decode_tile_cache_bytes == 0 && capture_bytes == 0 && candidate_bytes == 0
+            && staging_bytes == 0
+            && snapshot_pinned_bytes == 0
+            && allocator_live_bytes == 0 && allocator_reserved_bytes == 0
+            && device_peak_bytes == 0 && host_peak_bytes == 0
+            && unique_payloads == 0 && aliased_payloads == 0
+            && baseline_same_rows_bytes == 0 && factored_baseline_byte_coverage == 0.0
+            && covered_compressed_bytes == 0
+            && factor_quant_ratio == 0.0 && net_extra_compression_ratio == 0.0
+            && net_extra_compression_ratio_reserved == 0.0
+            && net_extra_compression_ratio_peak == 0.0
+            && seal_seconds == 0.0 && factor_quant_seconds == 0.0 && landmark_quant_seconds == 0.0
+            && select_seconds == 0.0 && refine_seconds == 0.0 && reconstruct_seconds == 0.0
+            && read_seconds == 0.0 && pack_seconds == 0.0
+            && segments_sealed == 0 && segments_skipped_by_reason.empty()
+            && sr_selected_rows == 0 && sr_fragments == 0 && effective_chunk_size == 0
+            && landmark_refine_rows == 0 && landmark_refine_cap_hits == 0
+            && spec_stale_total == 0 && transaction_abort_total == 0
+            && synchronize_total == 0 && !compression_goal_met
+            && throttle_total == 0 && throttle_reason.empty()
+            && safe_next_ubatch == 0 && limit_reason.empty()
+            && logical_capacity == 0 && logical_used == 0
+            && hot_capacity == 0 && hot_used == 0 && hot_free == 0 && hot_reserved == 0
+            && factor_live_bytes == 0 && factor_reserved_bytes == 0
+            && factor_budget_bytes == 0 && factor_free_bytes == 0
+            && factor_safe_tokens == UINT32_MAX
+            && workspace_live_bytes == 0 && workspace_peak_bytes == 0
+            && workspace_budget_bytes == 0 && workspace_free_bytes == 0
+            && workspace_safe_tokens == UINT32_MAX
+            && recurrent_capacity == 0 && recurrent_used == 0;
+    }
+
+    json to_json() const {
+        json adm = json::object();
+        if (has_admission) {
+            adm = json {
+                { "safe_next_ubatch",  safe_next_ubatch },
+                { "limit_reason",      limit_reason },
+                { "logical_capacity",  logical_capacity },
+                { "logical_used",      logical_used },
+                { "hot_capacity",      hot_capacity },
+                { "hot_used",          hot_used },
+                { "hot_free",          hot_free },
+                { "hot_reserved",      hot_reserved },
+                { "factor_live_bytes",     factor_live_bytes },
+                { "factor_reserved_bytes", factor_reserved_bytes },
+                { "factor_budget_bytes",   factor_budget_bytes },
+                { "factor_free_bytes",     factor_free_bytes },
+                { "factor_safe_tokens",    factor_safe_tokens },
+                { "workspace_live_bytes",   workspace_live_bytes },
+                { "workspace_peak_bytes",   workspace_peak_bytes },
+                { "workspace_budget_bytes", workspace_budget_bytes },
+                { "workspace_free_bytes",   workspace_free_bytes },
+                { "workspace_safe_tokens",  workspace_safe_tokens },
+                { "recurrent_capacity", recurrent_capacity },
+                { "recurrent_used",     recurrent_used },
+            };
+        }
+        json skipped = json::object();
+        for (const auto & kv : segments_skipped_by_reason) {
+            skipped[kv.first] = kv.second;
+        }
+        return json {
+            { "xkv_admission",               adm },
+            { "xkv_requested_profile",       requested_profile },
+            { "xkv_effective_profile",       effective_profile },
+            { "xkv_requested_mode",          requested_mode },
+            { "xkv_effective_mode",          effective_mode },
+            { "xkv_requested_a_k",           requested_a_k },
+            { "xkv_effective_a_k",           effective_a_k },
+            { "xkv_requested_b_k",           requested_b_k },
+            { "xkv_effective_b_k",           effective_b_k },
+            { "xkv_requested_a_v",           requested_a_v },
+            { "xkv_effective_a_v",           effective_a_v },
+            { "xkv_requested_b_v",           requested_b_v },
+            { "xkv_effective_b_v",           effective_b_v },
+            { "xkv_requested_landmark",      requested_landmark },
+            { "xkv_effective_landmark",      effective_landmark },
+            { "xkv_requested_factorizer",    requested_factorizer },
+            { "xkv_effective_factorizer",    effective_factorizer },
+            { "xkv_requested_balance",       requested_balance },
+            { "xkv_effective_balance",       effective_balance },
+            { "xkv_requested_seed",          requested_seed },
+            { "xkv_effective_seed",          effective_seed },
+            { "xkv_requested_landmark_seed", requested_landmark_seed },
+            { "xkv_effective_landmark_seed", effective_landmark_seed },
+            { "xkv_model_sha256",            model_sha256 },
+            { "tri_calibration_fingerprint", tri_calibration_fingerprint },
+            { "tri_calibration_sha256",      tri_calibration_sha256 },
+            { "tri_ratio",                   tri_ratio_str },
+            { "tri_recent_window",           tri_recent_window },
+            { "tri_scorer_valid",            tri_scorer_valid },
+            { "xkv_compression_goal_evaluated", compression_goal_evaluated },
+            { "xkv_compression_goal_met",    !observed || compression_goal_evaluated ? json(compression_goal_met) : json(nullptr) },
+            { "xkv_source",                  source },
+            { "xkv_codec_fingerprint",       codec_fingerprint },
+            { "xkv_backend_fingerprint",     backend_fingerprint },
+            { "xkv_source_fingerprint",      source_fingerprint },
+            { "xkv_profile_fingerprint",     profile_fingerprint },
+            { "xkv_config_fingerprint",      config_fingerprint },
+            { "xkv_rank_k",                  rank_k },
+            { "xkv_rank_v",                  rank_v },
+            { "xkv_factor_streams",          factor_streams },
+            { "xkv_actual_bytes",            actual_bytes },
+            { "xkv_nominal_bytes",           nominal_bytes },
+            { "xkv_hot_bytes",               hot_bytes },
+            { "xkv_flat_bytes",              flat_bytes },
+            { "xkv_factor_ak_bytes",         factor_ak_bytes },
+            { "xkv_factor_bk_bytes",         factor_bk_bytes },
+            { "xkv_factor_av_bytes",         factor_av_bytes },
+            { "xkv_factor_bv_bytes",         factor_bv_bytes },
+            { "xkv_factor_payload_bytes",    factor_payload_bytes },
+            { "xkv_factor_metadata_bytes",   factor_metadata_bytes },
+            { "xkv_factor_padding_bytes",    factor_padding_bytes },
+            { "xkv_landmark_payload_bytes",  landmark_payload_bytes },
+            { "xkv_landmark_metadata_bytes", landmark_metadata_bytes },
+            { "xkv_landmark_exception_bytes", landmark_exception_bytes },
+            { "xkv_index_bytes",             index_bytes },
+            { "xkv_codec_shared_bytes",      codec_shared_bytes },
+            { "xkv_decode_tile_cache_bytes", decode_tile_cache_bytes },
+            { "xkv_capture_bytes",           capture_bytes },
+            { "xkv_candidate_bytes",         candidate_bytes },
+            { "xkv_staging_bytes",           staging_bytes },
+            { "xkv_snapshot_pinned_bytes",   snapshot_pinned_bytes },
+            { "xkv_allocator_live_bytes",    allocator_live_bytes },
+            { "xkv_allocator_reserved_bytes", allocator_reserved_bytes },
+            { "xkv_device_peak_bytes",       device_peak_bytes },
+            { "xkv_host_peak_bytes",         host_peak_bytes },
+            { "xkv_unique_payloads",         unique_payloads },
+            { "xkv_aliased_payloads",        aliased_payloads },
+            { "xkv_baseline_same_rows_bytes", baseline_same_rows_bytes },
+            { "xkv_covered_compressed_bytes", covered_compressed_bytes },
+            // Unevaluated doubles render as JSON null (not_evaluated), never
+            // as 0.0 — but only once XKV was observed. Unobserved (OFF)
+            // snapshots keep exact legacy zeros. select/refine/reconstruct/
+            // read/pack have no live hooks yet and are always unevaluated.
+            { "xkv_factored_baseline_byte_coverage", !observed || ratios_evaluated ? json(factored_baseline_byte_coverage) : json(nullptr) },
+            { "xkv_factor_quant_ratio",      !observed || ratios_evaluated ? json(factor_quant_ratio) : json(nullptr) },
+            { "xkv_net_extra_compression_ratio", !observed || ratios_evaluated ? json(net_extra_compression_ratio) : json(nullptr) },
+            { "xkv_net_extra_compression_ratio_reserved", !observed || ratios_evaluated ? json(net_extra_compression_ratio_reserved) : json(nullptr) },
+            { "xkv_net_extra_compression_ratio_peak", !observed || ratios_evaluated ? json(net_extra_compression_ratio_peak) : json(nullptr) },
+            { "xkv_ratios_evaluated",        observed && ratios_evaluated },
+            { "xkv_seal_timers_evaluated",   observed && seal_timers_evaluated },
+            { "xkv_quant_timers_evaluated",  observed && quant_timers_evaluated },
+            { "xkv_seal_seconds",            !observed || seal_timers_evaluated ? json(seal_seconds) : json(nullptr) },
+            { "xkv_factor_quant_seconds",    !observed || quant_timers_evaluated ? json(factor_quant_seconds) : json(nullptr) },
+            { "xkv_landmark_quant_seconds",  !observed || quant_timers_evaluated ? json(landmark_quant_seconds) : json(nullptr) },
+            { "xkv_select_seconds",          !observed ? json(select_seconds) : json(nullptr) },
+            { "xkv_refine_seconds",          !observed ? json(refine_seconds) : json(nullptr) },
+            { "xkv_reconstruct_seconds",     !observed ? json(reconstruct_seconds) : json(nullptr) },
+            { "xkv_read_seconds",            !observed ? json(read_seconds) : json(nullptr) },
+            { "xkv_pack_seconds",            !observed ? json(pack_seconds) : json(nullptr) },
+            { "xkv_segments_sealed",         segments_sealed },
+            { "xkv_segments_skipped_by_reason", skipped },
+            { "xkv_sr_selected_rows",        sr_selected_rows },
+            { "xkv_sr_fragments",            sr_fragments },
+            { "xkv_effective_chunk_size",    effective_chunk_size },
+            { "xkv_landmark_refine_rows",    landmark_refine_rows },
+            { "xkv_landmark_refine_cap_hits", landmark_refine_cap_hits },
+            { "xkv_spec_stale_total",        spec_stale_total },
+            { "xkv_transaction_abort_total", transaction_abort_total },
+            { "xkv_synchronize_total",       synchronize_total },
+            { "xkv_throttle_total",          throttle_total },
+            { "xkv_throttle_reason",         throttle_reason },
+        };
+    }
+
+    void to_prometheus(std::ostream & os) const {
+        if (empty()) {
+            return;
+        }
+        const auto emit = [&os](const char * type, const char * name, const char * help, const auto & value) {
+            os << "# HELP llamacpp:" << name << " " << help << "\n"
+               << "# TYPE llamacpp:" << name << " " << type << "\n"
+               << "llamacpp:" << name << " " << value << "\n";
+        };
+        const auto label_escape = [](const std::string & s) {
+            std::string out;
+            for (char c : s) {
+                if (c == '\\' || c == '"') { out += '\\'; }
+                out += c;
+            }
+            return out;
+        };
+        if (has_admission) {
+            emit("gauge", "xkv_safe_next_ubatch", "Tokens safe to admit next.", safe_next_ubatch);
+            emit("gauge", "xkv_logical_capacity", "Logical KV cells.", logical_capacity);
+            emit("gauge", "xkv_logical_used", "Resident logical cells.", logical_used);
+            emit("gauge", "xkv_hot_capacity", "Physical hot slots across streams.", hot_capacity);
+            emit("gauge", "xkv_hot_used", "Committed hot slots.", hot_used);
+            emit("gauge", "xkv_hot_free", "Immediately writable hot slots.", hot_free);
+            emit("gauge", "xkv_hot_reserved", "Hot slots held by in-flight reservations.", hot_reserved);
+            emit("gauge", "xkv_factor_live_bytes", "Live factor store payload bytes.", factor_live_bytes);
+            emit("gauge", "xkv_factor_reserved_bytes", "Allocated factor store bytes.", factor_reserved_bytes);
+            emit("gauge", "xkv_factor_budget_bytes", "Configured factor store budget.", factor_budget_bytes);
+            emit("gauge", "xkv_factor_free_bytes", "Factor store budget headroom.", factor_free_bytes);
+            emit("gauge", "xkv_factor_safe_tokens", "Factor store planner token bound.", factor_safe_tokens);
+            emit("gauge", "xkv_workspace_live_bytes", "Currently leased workspace bytes.", workspace_live_bytes);
+            emit("gauge", "xkv_workspace_peak_bytes", "Workspace high-water mark.", workspace_peak_bytes);
+            emit("gauge", "xkv_workspace_budget_bytes", "Configured workspace budget.", workspace_budget_bytes);
+            emit("gauge", "xkv_workspace_free_bytes", "Workspace budget headroom.", workspace_free_bytes);
+            emit("gauge", "xkv_workspace_safe_tokens", "Workspace planner token bound.", workspace_safe_tokens);
+            emit("gauge", "xkv_recurrent_capacity", "Recurrent slots.", recurrent_capacity);
+            emit("gauge", "xkv_recurrent_used", "Resident recurrent slots.", recurrent_used);
+            os << "# HELP llamacpp:xkv_limit_reason Admission limiting reason.\n"
+               << "# TYPE llamacpp:xkv_limit_reason gauge\n"
+               << "llamacpp:xkv_limit_reason{reason=\"" << label_escape(limit_reason) << "\"} 1\n";
+        }
+        if (!requested_profile.empty() || !effective_profile.empty()) {
+            os << "# HELP llamacpp:xkv_profile_info Configured XKV profiles.\n"
+               << "# TYPE llamacpp:xkv_profile_info gauge\n"
+               << "llamacpp:xkv_profile_info{requested=\"" << label_escape(requested_profile)
+               << "\",effective=\"" << label_escape(effective_profile) << "\"} 1\n";
+        }
+        if (!requested_mode.empty() || !effective_mode.empty()) {
+            os << "# HELP llamacpp:xkv_mode_info Configured XKV modes (R2 dense vs R4 SR).\n"
+               << "# TYPE llamacpp:xkv_mode_info gauge\n"
+               << "llamacpp:xkv_mode_info{requested_mode=\"" << label_escape(requested_mode)
+               << "\",effective_mode=\"" << label_escape(effective_mode) << "\"} 1\n";
+            // Evaluator gate alias: xkv_mode{mode="..."}
+            const std::string effective_or_req = !effective_mode.empty() ? effective_mode : requested_mode;
+            os << "# HELP llamacpp:xkv_mode Effective XKV operational mode.\n"
+               << "# TYPE llamacpp:xkv_mode gauge\n"
+               << "llamacpp:xkv_mode{mode=\"" << label_escape(effective_or_req) << "\"} 1\n";
+        }
+        if (!effective_a_k.empty() || !requested_a_k.empty()) {
+            os << "# HELP llamacpp:xkv_codec_profile_info Effective factor and landmark codec types.\n"
+               << "# TYPE llamacpp:xkv_codec_profile_info gauge\n"
+               << "llamacpp:xkv_codec_profile_info{"
+               << "a_k=\"" << label_escape(!effective_a_k.empty() ? effective_a_k : requested_a_k) << "\","
+               << "b_k=\"" << label_escape(!effective_b_k.empty() ? effective_b_k : requested_b_k) << "\","
+               << "a_v=\"" << label_escape(!effective_a_v.empty() ? effective_a_v : requested_a_v) << "\","
+               << "b_v=\"" << label_escape(!effective_b_v.empty() ? effective_b_v : requested_b_v) << "\","
+               << "landmark=\"" << label_escape(!effective_landmark.empty() ? effective_landmark : requested_landmark) << "\","
+               << "factorizer=\"" << label_escape(!effective_factorizer.empty() ? effective_factorizer : requested_factorizer) << "\","
+               << "balance=\"" << label_escape(!effective_balance.empty() ? effective_balance : requested_balance) << "\""
+               << "} 1\n";
+        }
+        if (!effective_seed.empty() || !requested_seed.empty()) {
+            const std::string eff_seed = !effective_seed.empty() ? effective_seed : requested_seed;
+            os << "# HELP llamacpp:xkv_seed_info Factorization seed hex.\n"
+               << "# TYPE llamacpp:xkv_seed_info gauge\n"
+               << "llamacpp:xkv_seed_info{seed=\"" << label_escape(eff_seed) << "\"} 1\n";
+        }
+        if (!effective_landmark_seed.empty() || !requested_landmark_seed.empty()) {
+            const std::string eff_lm = !effective_landmark_seed.empty() ? effective_landmark_seed : requested_landmark_seed;
+            os << "# HELP llamacpp:xkv_landmark_seed_info Landmark codec table seed hex.\n"
+               << "# TYPE llamacpp:xkv_landmark_seed_info gauge\n"
+               << "llamacpp:xkv_landmark_seed_info{seed=\"" << label_escape(eff_lm) << "\"} 1\n";
+        }
+        if (!model_sha256.empty()) {
+            os << "# HELP llamacpp:model_artifact_info Model artifact content digest (SHA-256).\n"
+               << "# TYPE llamacpp:model_artifact_info gauge\n"
+               << "llamacpp:model_artifact_info{sha256=\"" << label_escape(model_sha256) << "\"} 1\n";
+        }
+        if (tri_scorer_valid || tri_calibration_fingerprint != 0 || !tri_ratio_str.empty()) {
+            std::ostringstream ss_cal;
+            ss_cal << std::hex << std::nouppercase << std::setw(16) << std::setfill('0') << tri_calibration_fingerprint;
+            os << "# HELP llamacpp:tri_calibration_info Tri calibration content fingerprint and presence.\n"
+               << "# TYPE llamacpp:tri_calibration_info gauge\n"
+               << "llamacpp:tri_calibration_info{fingerprint=\"" << ss_cal.str() << "\",valid=\""
+               << (tri_scorer_valid ? "true" : "false") << "\"";
+            if (!tri_calibration_sha256.empty()) {
+                os << ",sha256=\"" << label_escape(tri_calibration_sha256) << "\"";
+            }
+            os << "} 1\n";
+            os << "# HELP llamacpp:tri_config_info Tri configured retention ratio and recent window.\n"
+               << "# TYPE llamacpp:tri_config_info gauge\n"
+               << "llamacpp:tri_config_info{ratio=\"" << label_escape(tri_ratio_str.empty() ? "3/32" : tri_ratio_str)
+               << "\",recent_window=\"" << tri_recent_window << "\"} 1\n";
+        }
+        if (!source.empty()) {
+            os << "# HELP llamacpp:xkv_source_info Observed XKV source.\n"
+               << "# TYPE llamacpp:xkv_source_info gauge\n"
+               << "llamacpp:xkv_source_info{source=\"" << label_escape(source) << "\"} 1\n";
+        }
+        // 64-bit fingerprints lose precision as Prometheus numbers (>2^53):
+        // emit exact lowercase hex in info series (JSON retains uint64).
+        const auto emit_fp = [&os, &label_escape](const char * name, const char * help, uint64_t fp) {
+            std::ostringstream ss;
+            ss << std::hex << std::nouppercase << std::setw(16) << std::setfill('0') << fp;
+            os << "# HELP llamacpp:" << name << " " << help << "\n"
+               << "# TYPE llamacpp:" << name << " gauge\n"
+               << "llamacpp:" << name << "{fingerprint=\"" << ss.str() << "\"} 1\n";
+            (void) label_escape;
+        };
+        emit_fp("xkv_codec_info", "Factor codec fingerprint.", codec_fingerprint);
+        emit_fp("xkv_backend_info", "Backend fingerprint.", backend_fingerprint);
+        // NOTE: the source fingerprint series is xkv_source_fingerprint_info
+        // (not xkv_source_info, which already carries the {source} label).
+        // Emitting both HELP/TYPE blocks under one name is a duplicate.
+        emit_fp("xkv_source_fingerprint_info", "Source fingerprint.", source_fingerprint);
+        emit_fp("xkv_profile_fingerprint_info", "Profile fingerprint.", profile_fingerprint);
+        emit_fp("xkv_config_fingerprint_info", "Effective config fingerprint.", config_fingerprint);
+        emit("gauge", "xkv_rank_k", "Factor rank K.", rank_k);
+        emit("gauge", "xkv_rank_v", "Factor rank V.", rank_v);
+        emit("gauge", "xkv_factor_streams", "Encoded factor streams.", factor_streams);
+        emit("gauge", "xkv_actual_bytes", "Actual XKV bytes.", actual_bytes);
+        emit("gauge", "xkv_nominal_bytes", "Nominal XKV bytes.", nominal_bytes);
+        emit("gauge", "xkv_hot_bytes", "Hot KV cache bytes.", hot_bytes);
+        emit("gauge", "xkv_flat_bytes", "Flat quantized bytes.", flat_bytes);
+        emit("gauge", "xkv_factor_ak_bytes", "Factor A_K bytes.", factor_ak_bytes);
+        emit("gauge", "xkv_factor_bk_bytes", "Factor B_K bytes.", factor_bk_bytes);
+        emit("gauge", "xkv_factor_av_bytes", "Factor A_V bytes.", factor_av_bytes);
+        emit("gauge", "xkv_factor_bv_bytes", "Factor B_V bytes.", factor_bv_bytes);
+        emit("gauge", "xkv_factor_payload_bytes", "Factor payload bytes.", factor_payload_bytes);
+        emit("gauge", "xkv_factor_metadata_bytes", "Factor metadata bytes.", factor_metadata_bytes);
+        emit("gauge", "xkv_factor_padding_bytes", "Factor padding bytes.", factor_padding_bytes);
+        emit("gauge", "xkv_landmark_payload_bytes", "Landmark payload bytes.", landmark_payload_bytes);
+        emit("gauge", "xkv_landmark_metadata_bytes", "Landmark metadata bytes.", landmark_metadata_bytes);
+        emit("gauge", "xkv_landmark_exception_bytes", "Landmark exception bytes.", landmark_exception_bytes);
+        emit("gauge", "xkv_index_bytes", "Index bytes.", index_bytes);
+        emit("gauge", "xkv_codec_shared_bytes", "Shared codec table bytes.", codec_shared_bytes);
+        emit("gauge", "xkv_decode_tile_cache_bytes", "Decode tile cache bytes.", decode_tile_cache_bytes);
+        emit("gauge", "xkv_capture_bytes", "Source capture bytes.", capture_bytes);
+        emit("gauge", "xkv_candidate_bytes", "Candidate encoding scratch bytes.", candidate_bytes);
+        emit("gauge", "xkv_staging_bytes", "Transient device staging bytes.", staging_bytes);
+        emit("gauge", "xkv_snapshot_pinned_bytes", "Snapshot pinned bytes.", snapshot_pinned_bytes);
+        emit("gauge", "xkv_allocator_live_bytes", "Allocator live bytes.", allocator_live_bytes);
+        emit("gauge", "xkv_allocator_reserved_bytes", "Allocator reserved bytes.", allocator_reserved_bytes);
+        emit("gauge", "xkv_device_peak_bytes", "Device peak bytes.", device_peak_bytes);
+        emit("gauge", "xkv_host_peak_bytes", "Host peak bytes.", host_peak_bytes);
+        emit("gauge", "xkv_unique_payloads", "Unique payloads.", unique_payloads);
+        emit("gauge", "xkv_aliased_payloads", "Aliased payloads.", aliased_payloads);
+        emit("gauge", "xkv_baseline_same_rows_bytes", "Baseline same-rows bytes.", baseline_same_rows_bytes);
+        emit("gauge", "xkv_covered_compressed_bytes", "Compressed bytes covering the baseline.", covered_compressed_bytes);
+        // Unevaluated doubles render as NaN (not_evaluated), never 0.0 — but
+        // only once XKV was observed; unobserved snapshots keep legacy output.
+        // select/refine/reconstruct/read/pack have no live hooks (always NaN
+        // once observed). NaN is valid Prometheus exposition; Go/Python
+        // parsers accept it case-insensitively.
+        const auto emit_opt = [&](const char * type, const char * name, const char * help,
+                                  double value, bool evaluated) {
+            if (!observed || evaluated) {
+                emit(type, name, help, value);
+            } else {
+                os << "# HELP llamacpp:" << name << " " << help << "\n"
+                   << "# TYPE llamacpp:" << name << " " << type << "\n"
+                   << "llamacpp:" << name << " NaN\n";
+            }
+        };
+        emit_opt("gauge", "xkv_factored_baseline_byte_coverage", "Factored baseline byte coverage.", factored_baseline_byte_coverage, ratios_evaluated);
+        emit_opt("gauge", "xkv_factor_quant_ratio", "Factor quantization ratio.", factor_quant_ratio, ratios_evaluated);
+        emit_opt("gauge", "xkv_net_extra_compression_ratio", "Net extra compression ratio.", net_extra_compression_ratio, ratios_evaluated);
+        emit_opt("gauge", "xkv_net_extra_compression_ratio_reserved", "Net extra compression ratio (reserved basis).", net_extra_compression_ratio_reserved, ratios_evaluated);
+        emit_opt("gauge", "xkv_net_extra_compression_ratio_peak", "Net extra compression ratio (peak basis).", net_extra_compression_ratio_peak, ratios_evaluated);
+        emit_opt("counter", "xkv_seal_seconds", "Wall time sealing segments.", seal_seconds, seal_timers_evaluated);
+        emit_opt("counter", "xkv_factor_quant_seconds", "Wall time quantizing factors.", factor_quant_seconds, quant_timers_evaluated);
+        emit_opt("counter", "xkv_landmark_quant_seconds", "Wall time quantizing landmarks.", landmark_quant_seconds, quant_timers_evaluated);
+        emit_opt("counter", "xkv_select_seconds", "Wall time selecting rows.", select_seconds, graph_timings_evaluated);
+        emit_opt("counter", "xkv_refine_seconds", "Wall time refining landmarks.", refine_seconds, graph_timings_evaluated);
+        emit_opt("counter", "xkv_reconstruct_seconds", "Wall time reconstructing rows.", reconstruct_seconds, graph_timings_evaluated);
+        emit_opt("counter", "xkv_read_seconds", "Wall time reading segments.", read_seconds, graph_timings_evaluated);
+        emit_opt("counter", "xkv_pack_seconds", "Wall time packing segments.", pack_seconds, pack_timer_evaluated);
+        os << "# HELP llamacpp:xkv_ratios_evaluated Ratios comparable (not not_evaluated).\n"
+           << "# TYPE llamacpp:xkv_ratios_evaluated gauge\n"
+           << "llamacpp:xkv_ratios_evaluated " << (observed && ratios_evaluated ? 1 : 0) << "\n";
+        os << "# HELP llamacpp:xkv_timers_evaluated Seal/quant timers accumulated live.\n"
+           << "# TYPE llamacpp:xkv_timers_evaluated gauge\n"
+           << "llamacpp:xkv_timers_evaluated " << (observed && (seal_timers_evaluated || quant_timers_evaluated) ? 1 : 0) << "\n";
+        os << "# HELP llamacpp:xkv_graph_timings_evaluated Graph execution timings accumulated live.\n"
+           << "# TYPE llamacpp:xkv_graph_timings_evaluated gauge\n"
+           << "llamacpp:xkv_graph_timings_evaluated " << (observed && graph_timings_evaluated ? 1 : 0) << "\n";
+        os << "# HELP llamacpp:xkv_pack_timer_evaluated Segment pack timings accumulated live.\n"
+           << "# TYPE llamacpp:xkv_pack_timer_evaluated gauge\n"
+           << "llamacpp:xkv_pack_timer_evaluated " << (observed && pack_timer_evaluated ? 1 : 0) << "\n";
+        os << "# HELP llamacpp:xkv_sr_counters_evaluated SR fragments and row counters evaluated.\n"
+           << "# TYPE llamacpp:xkv_sr_counters_evaluated gauge\n"
+           << "llamacpp:xkv_sr_counters_evaluated " << (observed && sr_counters_evaluated ? 1 : 0) << "\n";
+        os << "# HELP llamacpp:xkv_spec_counters_evaluated Speculative draft counters evaluated.\n"
+           << "# TYPE llamacpp:xkv_spec_counters_evaluated gauge\n"
+           << "llamacpp:xkv_spec_counters_evaluated " << (observed && spec_counters_evaluated ? 1 : 0) << "\n";
+        emit("counter", "xkv_segments_sealed", "Segments sealed.", segments_sealed);
+        os << "# HELP llamacpp:xkv_segments_skipped_total Segments skipped by reason.\n"
+           << "# TYPE llamacpp:xkv_segments_skipped_total counter\n";
+        for (const auto & kv : segments_skipped_by_reason) {
+            os << "llamacpp:xkv_segments_skipped_total{reason=\"" << label_escape(kv.first) << "\"} " << kv.second << "\n";
+        }
+        if (!observed || sr_counters_evaluated) {
+            emit("gauge", "xkv_sr_selected_rows", "SR selected rows.", sr_selected_rows);
+            emit("gauge", "xkv_sr_fragments", "SR fragments.", sr_fragments);
+            emit("gauge", "xkv_landmark_refine_rows", "Landmark refine rows.", landmark_refine_rows);
+            emit("gauge", "xkv_landmark_refine_cap_hits", "Landmark refine cap hits.", landmark_refine_cap_hits);
+        } else {
+            os << "# HELP llamacpp:xkv_sr_selected_rows SR selected rows.\n# TYPE llamacpp:xkv_sr_selected_rows gauge\nllamacpp:xkv_sr_selected_rows NaN\n";
+            os << "# HELP llamacpp:xkv_sr_fragments SR fragments.\n# TYPE llamacpp:xkv_sr_fragments gauge\nllamacpp:xkv_sr_fragments NaN\n";
+            os << "# HELP llamacpp:xkv_landmark_refine_rows Landmark refine rows.\n# TYPE llamacpp:xkv_landmark_refine_rows gauge\nllamacpp:xkv_landmark_refine_rows NaN\n";
+            os << "# HELP llamacpp:xkv_landmark_refine_cap_hits Landmark refine cap hits.\n# TYPE llamacpp:xkv_landmark_refine_cap_hits gauge\nllamacpp:xkv_landmark_refine_cap_hits NaN\n";
+        }
+        if (!observed || spec_counters_evaluated) {
+            emit("counter", "xkv_spec_stale_total", "Stale speculative drafts.", spec_stale_total);
+            emit("counter", "xkv_transaction_abort_total", "Transaction aborts.", transaction_abort_total);
+        } else {
+            os << "# HELP llamacpp:xkv_spec_stale_total Stale speculative drafts.\n# TYPE llamacpp:xkv_spec_stale_total counter\nllamacpp:xkv_spec_stale_total NaN\n";
+            os << "# HELP llamacpp:xkv_transaction_abort_total Transaction aborts.\n# TYPE llamacpp:xkv_transaction_abort_total counter\nllamacpp:xkv_transaction_abort_total NaN\n";
+        }
+        emit("gauge", "xkv_effective_chunk_size", "Effective chunk size.", effective_chunk_size);
+        emit("counter", "xkv_synchronize_total", "Backend synchronizations.", synchronize_total);
+        if (!observed || compression_goal_evaluated) {
+            emit("gauge", "xkv_compression_goal_met", "Compression goal met.", compression_goal_met ? 1 : 0);
+        } else {
+            os << "# HELP llamacpp:xkv_compression_goal_met Compression goal met.\n"
+               << "# TYPE llamacpp:xkv_compression_goal_met gauge\n"
+               << "llamacpp:xkv_compression_goal_met NaN\n";
+        }
+        os << "# HELP llamacpp:xkv_compression_goal_evaluated Compression goal evaluated.\n"
+           << "# TYPE llamacpp:xkv_compression_goal_evaluated gauge\n"
+           << "llamacpp:xkv_compression_goal_evaluated " << (observed && compression_goal_evaluated ? 1 : 0) << "\n";
+        emit("counter", "xkv_throttle_total", "Admission throttles.", throttle_total);
+        if (!throttle_reason.empty()) {
+            os << "# HELP llamacpp:xkv_throttle_reason Current admission throttle reason.\n"
+               << "# TYPE llamacpp:xkv_throttle_reason gauge\n"
+               << "llamacpp:xkv_throttle_reason{reason=\"" << label_escape(throttle_reason) << "\"} 1\n";
+        }
+    }
 };
 
 // struct for tracking the state of a task (e.g., for streaming)
@@ -685,6 +1268,50 @@ struct server_task_result_error : server_task_result {
 };
 
 struct server_task_result_metrics : server_task_result {
+    // XKV planner policy (§16), inline for unit tests. Fill-first: sealing
+    // maintenance runs only when hot slots cannot cover the upcoming batch
+    // (or the snapshot is unknown); SHADOW evaluate-only always runs.
+    // No fixed attempt constant: one maintain seals ~one segment, so the
+    // bound derives from the deficit: ceil(deficit/segment_tokens) plus one
+    // per eligible token domain. Unknown snapshots fall back to the domain
+    // count (or hot_capacity/segment when known).
+    static uint64_t xkv_maintain_max_attempts(bool xkv_enabled, bool have_snapshot,
+                                               uint32_t hot_free, uint32_t hot_capacity,
+                                               uint32_t required_kv, uint32_t seg_tokens) {
+        if (!xkv_enabled) {
+            return 0;
+        }
+        constexpr uint64_t kDomains = 4; // logical/hot/factor/workspace
+        if (!have_snapshot) {
+            if (hot_capacity > 0 && seg_tokens > 0) {
+                return hot_capacity / seg_tokens + kDomains;
+            }
+            return kDomains;
+        }
+        if (required_kv <= hot_free) {
+            return 0;
+        }
+        const uint64_t deficit = (uint64_t) required_kv - hot_free;
+        if (seg_tokens == 0) {
+            return kDomains;
+        }
+        return (deficit + seg_tokens - 1) / seg_tokens + kDomains;
+    }
+    static bool xkv_should_maintain(bool xkv_enabled, bool is_shadow, bool have_snapshot,
+                                      uint32_t hot_free, uint32_t required_kv,
+                                      uint64_t attempts, uint64_t max_attempts) {
+        if (!xkv_enabled || attempts >= max_attempts) {
+            return false;
+        }
+        if (is_shadow) {
+            return true;
+        }
+        if (!have_snapshot) {
+            return true;
+        }
+        return hot_free < required_kv;
+    }
+
     int n_idle_slots;
     int n_processing_slots;
     int n_tasks_deferred;
@@ -767,6 +1394,10 @@ struct server_task_result_metrics : server_task_result {
     uint64_t fp_dense_by_reason[7] = {};
     uint64_t fp_policy_fingerprint = 0;
     bool     fp_has_policy = false;
+    // XKV metrics (§16), additive to Tri/RERoT metrics. Empty when XKV OFF:
+    // to_json omits every xkv_* key, so OFF responses keep the exact
+    // pre-XKV schema.
+    server_xkv_metrics xkv;
 
     // while we can also use std::vector<server_slot> this requires copying the slot object which can be quite messy
     // therefore, we use json to temporarily store the slot.to_json() result

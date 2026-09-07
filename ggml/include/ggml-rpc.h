@@ -17,6 +17,16 @@ extern "C" {
 // Bumped patch version because adding an op shifts the GGML_OP enum used in the RPC
 // wire protocol.
 static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+#define RPC_PROTO_PATCH_VERSION    9
+
+#ifdef  __cplusplus
+// 106 = upstream 101 + the fork's GGML_OP_TURBO_WHT,
+// GGML_OP_FLASH_ATTN_EXT_BANDED, GGML_OP_FLASH_ATTN_EXT_REROT,
+// GGML_OP_XKV_RECONSTRUCT, GGML_OP_XKV_ATTENTION/FACTORIZE/CANONICALIZE, and
+// GGML_OP_XKV_LANDMARK/BUILD/ROWS/MERGE.
+// Bumped patch version because adding an op shifts the GGML_OP enum used in the RPC
+// wire protocol.
+static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

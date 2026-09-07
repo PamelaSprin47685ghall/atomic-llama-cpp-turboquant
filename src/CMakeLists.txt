@@ -47,6 +47,20 @@ add_library(llama
             llama-sampler.cpp
             llama-triattention.cpp
             llama-vocab.cpp
+            llama-xkv-backend.cpp
+            llama-xkv-cache.cpp
+            llama-xkv-canonical.cpp
+            llama-xkv-codec.cpp
+            llama-xkv-factor.cpp
+            llama-xkv-graph-ref.cpp
+            llama-xkv-hot.cpp
+            llama-xkv-landmark.cpp
+            llama-xkv-reader.cpp
+            llama-xkv-transaction.cpp
+            llama-xkv-state.cpp
+            llama-xkv-runtime.cpp
+            llama-xkv-tri.cpp
+            llama-xkv-seal.cpp
             unicode-data.cpp
             unicode.cpp
             unicode.h

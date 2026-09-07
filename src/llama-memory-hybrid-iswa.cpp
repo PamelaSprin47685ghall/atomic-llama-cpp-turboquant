@@ -31,7 +31,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+    const llama_cparams   * cparams) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache_iswa(
         model,
@@ -50,7 +51,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
         nullptr,
-        nullptr
+        nullptr,
+        cparams
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -124,8 +126,20 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_batch(llama_batch_allocr
             return std::make_unique<llama_memory_hybrid_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
+        // Target (base) attention uses real hot reservations when bounded;
+        // the SWA cache is constructed unbounded and takes none.
+        std::vector<llama_xkv::xkv_hot_reservation> hot_res_base;
+        {
+            std::string res_err;
+            if (!mem_attn->get_base()->reserve_hot_slots(sinfos_base, ubatches, hot_res_base, &res_err)) {
+                LLAMA_LOG_ERROR("%s: %s\n", __func__, res_err.c_str());
+                return std::make_unique<llama_memory_hybrid_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+            }
+        }
+
         return std::make_unique<llama_memory_hybrid_iswa_context>(
-                this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches));
+                this, std::move(sinfos_base), std::move(sinfos_swa), std::move(ubatches),
+                std::move(hot_res_base));
     } while(false);
 
     return std::make_unique<llama_memory_hybrid_iswa_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -152,6 +166,45 @@ uint32_t llama_memory_hybrid_iswa::get_kv_used() const {
     return mem_attn->get_kv_used();
 }
 
+uint32_t llama_memory_hybrid_iswa::get_kv_hot_capacity() const {
+    return mem_attn ? mem_attn->get_kv_hot_capacity() : get_kv_capacity();
+}
+
+bool llama_memory_hybrid_iswa::can_use_legacy_attention() const {
+    return mem_attn ? mem_attn->can_use_legacy_attention() : true;
+}
+
+bool llama_memory_hybrid_iswa::is_xkv_bounded_hot() const {
+    return mem_attn ? mem_attn->is_xkv_bounded_hot() : false;
+}
+
+bool llama_memory_hybrid_iswa::get_admission_snapshot(struct llama_memory_admission_snapshot * out) const {
+    if (out == nullptr) {
+        return false;
+    }
+    llama_memory_admission_snapshot attn = {};
+    if (mem_attn != nullptr && !mem_attn->get_admission_snapshot(&attn)) {
+        attn = {};
+    }
+    const uint32_t recr_cap  = mem_recr ? mem_recr->get_recurrent_capacity() : 0;
+    const uint32_t recr_used = mem_recr ? mem_recr->get_recurrent_used()     : 0;
+    *out = llama_memory_admission_combine(attn, recr_cap, recr_used);
+    return out->logical_capacity != 0 || out->recurrent_capacity != 0;
+}
+
+llama_memory_maintenance_status llama_memory_hybrid_iswa::maintain_safe_boundary() {
+    return mem_attn ? mem_attn->maintain_safe_boundary()
+                      : LLAMA_MEMORY_MAINTENANCE_NO_ACTION;
+}
+
+bool llama_memory_hybrid_iswa::get_xkv_runtime_snapshot(
+        struct llama_memory_xkv_runtime_snapshot * out) const {
+    if (out == nullptr) {
+        return false;
+    }
+    return mem_attn ? mem_attn->get_xkv_runtime_snapshot(out) : false;
+}
+
 uint32_t llama_memory_hybrid_iswa::get_kv_seq_used(llama_seq_id seq_id) const {
     return mem_attn->get_kv_seq_used(seq_id);
 }
@@ -171,6 +224,13 @@ uint32_t llama_memory_hybrid_iswa::get_recurrent_seq_used(llama_seq_id seq_id) c
 void llama_memory_hybrid_iswa::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);
+}
+
+bool llama_memory_hybrid_iswa::try_clear(bool data, std::string * err) {
+    if (!mem_attn->try_clear(data, err)) {
+        return false;
+    }
+    return mem_recr->try_clear(data, err);
 }
 
 bool llama_memory_hybrid_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -377,10 +437,12 @@ llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(
            llama_memory_hybrid_iswa * mem,
                     slot_info_vec_t   sinfos_base,
                     slot_info_vec_t   sinfos_swa,
-          std::vector<llama_ubatch>   ubatches) :
+          std::vector<llama_ubatch>   ubatches,
+          std::vector<llama_xkv::xkv_hot_reservation> hot_res_base) :
     ubatches(std::move(ubatches)),
     // note: here we copy the ubatches. not sure if this is ideal
-    ctx_attn(new llama_kv_cache_iswa_context(mem->get_mem_attn(), std::move(sinfos_base), std::move(sinfos_swa), this->ubatches)),
+    // Target attention receives the real hot reservations.
+    ctx_attn(new llama_kv_cache_iswa_context(mem->get_mem_attn(), std::move(sinfos_base), std::move(sinfos_swa), this->ubatches, std::move(hot_res_base))),
     ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
@@ -407,6 +469,41 @@ bool llama_memory_hybrid_iswa_context::apply() {
     res = res & ctx_recr->apply();
 
     return res;
+}
+
+bool llama_memory_hybrid_iswa_context::postcompute_success() {
+    if (postcompute_finalized) {
+        return postcompute_ok;
+    }
+    const bool ok_attn = ctx_attn ? ctx_attn->postcompute_success() : true;
+    const bool ok_recr = ctx_recr ? ctx_recr->postcompute_success() : true;
+    postcompute_ok = ok_attn && ok_recr;
+    // A failed success leaves the forward open for the failure path.
+    if (postcompute_ok) {
+    postcompute_finalized = true;
+    }
+    return postcompute_ok;
+    }
+
+bool llama_memory_hybrid_iswa_context::postcompute_failure() {
+    if (postcompute_finalized) {
+        return postcompute_ok;
+    }
+    const bool ok_attn = ctx_attn ? ctx_attn->postcompute_failure() : true;
+    const bool ok_recr = ctx_recr ? ctx_recr->postcompute_failure() : true;
+    postcompute_ok = ok_attn && ok_recr;
+    if (postcompute_ok) {
+    postcompute_finalized = true;
+    }
+    return postcompute_ok;
+    }
+
+ggml_tensor * llama_memory_hybrid_iswa_context::get_xkv_hot_k(ggml_context * ctx, int32_t il) const {
+    return ctx_attn ? ctx_attn->get_xkv_hot_k(ctx, il) : nullptr;
+}
+
+ggml_tensor * llama_memory_hybrid_iswa_context::get_xkv_hot_v(ggml_context * ctx, int32_t il) const {
+    return ctx_attn ? ctx_attn->get_xkv_hot_v(ctx, il) : nullptr;
 }
 
 llama_memory_status llama_memory_hybrid_iswa_context::get_status() const {

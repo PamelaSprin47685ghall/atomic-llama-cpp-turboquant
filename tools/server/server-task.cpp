@@ -2050,6 +2050,15 @@ json server_task_result_metrics::to_json() {
     // FlashPrefill keys above are always present (zero while OFF, matching
     // the Tri convention of unconditional cumulative keys); the Prometheus
     // serializer likewise always emits the series (zeros while OFF).
+    // XKV suite (§16) is additive the same way. OFF (empty) emits nothing:
+    // the pre-XKV schema is byte-identical and admission behavior is
+    // unchanged.
+    if (!xkv.empty()) {
+        const json xj = xkv.to_json();
+        for (const auto & kv : xj.items()) {
+            out[kv.key()] = kv.value();
+        }
+    }
     return out;
 }
 

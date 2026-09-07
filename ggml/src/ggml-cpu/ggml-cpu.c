@@ -14,6 +14,10 @@
 #include "vec.h"
 #include "ops.h"
 #include "ggml.h"
+#include "ggml-xkv.h"
+#include "ggml-cpu-xkv-factor.h"
+#include "ggml-cpu-xkv-landmark-build.h"
+#include "ggml-cpu-xkv-landmark.h"
 #include "common.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -2057,6 +2061,38 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_flash_attn_ext_rerot(params, tensor);
             } break;
+        case GGML_OP_XKV_RECONSTRUCT:
+            {
+                ggml_compute_forward_xkv_reconstruct(params, tensor);
+            } break;
+        case GGML_OP_XKV_ATTENTION:
+            {
+                ggml_compute_forward_xkv_attention(params, tensor);
+            } break;
+        case GGML_OP_XKV_FACTORIZE:
+            {
+                ggml_compute_forward_xkv_factorize(params, tensor);
+            } break;
+        case GGML_OP_XKV_CANONICALIZE:
+            {
+                ggml_compute_forward_xkv_canonicalize(params, tensor);
+            } break;
+        case GGML_OP_XKV_LANDMARK:
+            {
+                ggml_compute_forward_xkv_landmark(params, tensor);
+            } break;
+        case GGML_OP_XKV_LANDMARK_BUILD:
+            {
+                ggml_compute_forward_xkv_landmark_build(params, tensor);
+            } break;
+        case GGML_OP_XKV_LANDMARK_ROWS:
+            {
+                ggml_compute_forward_xkv_landmark_rows(params, tensor);
+            } break;
+        case GGML_OP_XKV_LANDMARK_MERGE:
+            {
+                ggml_compute_forward_xkv_landmark_merge(params, tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {
                 int32_t t = ggml_get_op_params_i32(tensor, 0);
@@ -2480,6 +2516,20 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_PREFILL_ATTN:
             {
                 n_tasks = n_threads;
+            } break;
+        case GGML_OP_XKV_RECONSTRUCT:
+            {
+                n_tasks = 1;
+            } break;
+        case GGML_OP_XKV_ATTENTION:
+        case GGML_OP_XKV_FACTORIZE:
+        case GGML_OP_XKV_CANONICALIZE:
+        case GGML_OP_XKV_LANDMARK:
+        case GGML_OP_XKV_LANDMARK_BUILD:
+        case GGML_OP_XKV_LANDMARK_ROWS:
+        case GGML_OP_XKV_LANDMARK_MERGE:
+            {
+                n_tasks = 1;
             } break;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_GATED_LINEAR_ATTN:
@@ -3112,6 +3162,29 @@ struct ggml_cplan ggml_graph_plan(
                                     cur += per_thread * (size_t)n_tasks;
                                 }
                             }
+                case GGML_OP_XKV_RECONSTRUCT:
+                    {
+                        // Bounded workspace for the no-heap core (see ggml-cpu-xkv.cpp).
+                        ggml_xkv_reconstruct_params p;
+                        memcpy(&p, node->op_params, sizeof(p));
+                        size_t need = 0;
+                        if (ggml_xkv_core_scratch_floats(&p, node->src[0]->ne[0], node->src[2]->ne[0],
+                                                         &need, NULL, 0)) {
+                            cur += need * sizeof(float);
+                        } else {
+                            cur += (size_t)4096 * sizeof(float);
+                        }
+                    } break;
+                case GGML_OP_XKV_ATTENTION:
+                    {
+                        // Bounded tmp (Dk+Dv floats, see ggml-cpu-xkv-attention.cpp).
+                        ggml_xkv_attention_params p;
+                        memcpy(&p, node->op_params, sizeof(p));
+                        size_t need = 0;
+                        if (ggml_xkv_attn_tmp_floats(&p, &need, NULL, 0)) {
+                            cur += need * sizeof(float);
+                        } else {
+                            cur += (size_t)2048 * sizeof(float);
                         }
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:

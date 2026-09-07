@@ -253,12 +253,20 @@ public:
     }
 
     void reset() {
+        if (payload_id.size() < pos.size()) {
+            payload_id.resize(pos.size(), 0);
+            storage_generation.resize(pos.size(), 0);
+        }
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
             ext[i].reset();
             shift[i] =  0;
             seq[i].reset();
             rerot[i].reset();
+            if (i < payload_id.size()) {
+                payload_id[i] = 0;
+                storage_generation[i] = 0;
+            }
         }
 
         has_shift = false;
@@ -299,6 +307,8 @@ public:
         shift.resize(n);
         seq.resize(n);
         rerot.resize(n);
+        payload_id.resize(n, 0);
+        storage_generation.resize(n, 0);
 
         // Single invalidation via reset(). Preserves enabled+stamp, bumps.
         reset();
@@ -369,6 +379,8 @@ public:
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
             res.rerot[j] = rerot[idx];
+            res.payload_id[j] = idx < payload_id.size() ? payload_id[idx] : 0;
+            res.storage_generation[j] = idx < storage_generation.size() ? storage_generation[idx] : 0;
 
             assert(shift[idx] == 0);
         }
@@ -396,6 +408,8 @@ public:
             res.ext[j] = ext[idx];
             res.seq[j] = seq[idx];
             res.rerot[j] = rerot[idx];
+            res.payload_id[j] = idx < payload_id.size() ? payload_id[idx] : 0;
+            res.storage_generation[j] = idx < storage_generation.size() ? storage_generation[idx] : 0;
 
             assert(shift[idx] == 0);
         }
@@ -415,6 +429,10 @@ public:
     void set(uint32_t i, const llama_kv_cells & other) {
         assert(i + other.pos.size() <= pos.size());
 
+        if (payload_id.size() < pos.size()) {
+            payload_id.resize(pos.size(), 0);
+            storage_generation.resize(pos.size(), 0);
+        }
         if (other.pos.empty()) {
             return;
         }
@@ -438,6 +456,8 @@ public:
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
             rerot[idx] = other.rerot[j];
+            payload_id[idx] = j < other.payload_id.size() ? other.payload_id[j] : 0;
+            storage_generation[idx] = j < other.storage_generation.size() ? other.storage_generation[j] : 0;
 
             if (pos[idx] != -1) {
                 seq_pos_add(i + j);
@@ -454,6 +474,10 @@ public:
     void set(const std::vector<uint32_t> & idxs, const llama_kv_cells & other) {
         assert(idxs.size() == other.pos.size());
 
+        if (payload_id.size() < pos.size()) {
+            payload_id.resize(pos.size(), 0);
+            storage_generation.resize(pos.size(), 0);
+        }
         if (idxs.empty()) {
             return;
         }
@@ -477,6 +501,8 @@ public:
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
             rerot[idx] = other.rerot[j];
+            payload_id[idx] = j < other.payload_id.size() ? other.payload_id[j] : 0;
+            storage_generation[idx] = j < other.storage_generation.size() ? other.storage_generation[j] : 0;
 
             if (pos[idx] != -1) {
                 seq_pos_add(idx);
@@ -500,6 +526,10 @@ public:
         ext[i].reset();
         shift[i] = 0;
         rerot[i].reset();
+        if (i < payload_id.size()) {
+            payload_id[i] = 0;
+            storage_generation[i] = 0;
+        }
 
         used.erase(i);
 
@@ -542,6 +572,11 @@ public:
             return;
         }
 
+        if (payload_id.size() < pos.size()) {
+            payload_id.resize(pos.size(), 0);
+            storage_generation.resize(pos.size(), 0);
+        }
+
         const uint32_t n = plan.retained_count;
 
         // Save metadata for all retained cells in ascending source order
@@ -550,6 +585,8 @@ public:
         std::vector<seq_set_t>         saved_seq  (n);
         std::vector<llama_pos>         saved_shift(n);
         std::vector<llama_kv_rerot_meta> saved_rerot(n);
+        std::vector<uint64_t>          saved_payload_id(n);
+        std::vector<uint64_t>          saved_storage_gen(n);
 
         uint32_t dst = 0;
         for (const auto & move : plan.moves) {
@@ -560,6 +597,8 @@ public:
                 saved_seq  [dst] = seq  [src];
                 saved_shift[dst] = shift[src];
                 saved_rerot[dst] = rerot[src];
+                saved_payload_id [dst] = src < payload_id.size() ? payload_id[src] : 0;
+                saved_storage_gen[dst] = src < storage_generation.size() ? storage_generation[src] : 0;
                 ++dst;
             }
         }
@@ -572,6 +611,10 @@ public:
             ext  [idx].reset();
             shift[idx] =  0;
             rerot[idx].reset();
+            if (idx < payload_id.size()) {
+                payload_id[idx] = 0;
+                storage_generation[idx] = 0;
+            }
         }
         used.clear();
 
@@ -582,6 +625,8 @@ public:
             seq  [i] = saved_seq  [i];
             shift[i] = saved_shift[i];
             rerot[i] = saved_rerot[i];
+            payload_id[i] = saved_payload_id[i];
+            storage_generation[i] = saved_storage_gen[i];
             used.insert(i);
             seq_pos_add(i);
         }
@@ -608,6 +653,10 @@ public:
             ext[i].reset();
             shift[i] = 0;
             rerot[i].reset();
+            if (i < payload_id.size()) {
+                payload_id[i] = 0;
+                storage_generation[i] = 0;
+            }
 
             used.erase(i);
 
@@ -648,6 +697,10 @@ public:
             ext[i].reset();
             shift[i] = 0;
             rerot[i].reset();
+            if (i < payload_id.size()) {
+                payload_id[i] = 0;
+                storage_generation[i] = 0;
+            }
 
             used.erase(i);
 
@@ -702,6 +755,31 @@ public:
         }
 
         return -1;
+    }
+
+    // Exact full multi-ref seq snapshot for overwrite-victim save/restore.
+    // Unlike seq_get (single-ref only), this preserves every reference so a
+    // restored cell is bit-identical in sequence membership.
+    using seq_snapshot_t = std::bitset<LLAMA_MAX_SEQ>;
+
+    seq_snapshot_t seq_snapshot(uint32_t i) const {
+        assert(i < pos.size());
+        assert(pos[i] != -1);
+
+        return seq[i];
+    }
+
+    // Restore a previously snapshotted seq set onto an empty cell whose pos
+    // is already set (e.g. after rm + pos_set). Rebuilds seq_pos bookkeeping
+    // exactly as seq_add would for each member.
+    void seq_restore(uint32_t i, const seq_snapshot_t & set) {
+        assert(i < pos.size());
+        assert(pos[i] != -1);
+        assert(seq[i].none());
+        assert(!set.none());
+
+        seq[i] = set;
+        seq_pos_add(i);
     }
 
     // the minimum position of sequence seq_id currently present in any of the cells
@@ -978,8 +1056,15 @@ public:
         assert(pos[i] == -1);
         assert(seq[i].none());
 
+        if (payload_id.size() < pos.size()) {
+            payload_id.resize(pos.size(), 0);
+            storage_generation.resize(pos.size(), 0);
+        }
+
         pos[i] = p;
         rerot[i].reset();
+        payload_id[i] = allocate_payload_id();
+        storage_generation[i] = 1;
 
         used.insert(i);
 
@@ -992,6 +1077,53 @@ public:
         ext[i] = p;
 
         bump_gen();
+    }
+
+    uint64_t payload_id_get(uint32_t i) const {
+        return i < payload_id.size() ? payload_id[i] : 0;
+    }
+
+    uint64_t storage_generation_get(uint32_t i) const {
+        return i < storage_generation.size() ? storage_generation[i] : 0;
+    }
+
+    void payload_id_set(uint32_t i, uint64_t pid, uint64_t gen = 1) {
+        if (i >= payload_id.size()) {
+            payload_id.resize(std::max<size_t>(i + 1, pos.size()), 0);
+            storage_generation.resize(std::max<size_t>(i + 1, pos.size()), 0);
+        }
+        payload_id[i] = pid;
+        storage_generation[i] = gen;
+    }
+
+    void storage_generation_inc(uint32_t i) {
+        if (i < storage_generation.size()) {
+            storage_generation[i]++;
+        }
+    }
+
+    // Restore preflight: advance the process-wide payload counter past max_pid
+    // so future allocate_payload_id() calls cannot collide with restored ids.
+    // Only moves forward (CAS loop); fails closed with zero mutation when
+    // max_pid is UINT64_MAX or the counter is already saturated (wrap can
+    // never be represented). Monotonic under concurrency. Cells remain the
+    // sole metadata owner: the counter lives here and is never reset.
+    static bool reserve_payload_ids_through(uint64_t max_pid) {
+        if (max_pid == UINT64_MAX) {
+            return false;
+        }
+        std::atomic<uint64_t> & ctr = payload_id_counter();
+        uint64_t cur = ctr.load(std::memory_order_relaxed);
+        while (cur <= max_pid) {
+            if (cur == UINT64_MAX) {
+                return false;
+            }
+            // Target max_pid + 1 cannot wrap: max_pid < UINT64_MAX here.
+            if (ctr.compare_exchange_weak(cur, max_pid + 1, std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+        return true; // already past max_pid: nothing to do
     }
 
     // pos[i] = pos[i] + d
@@ -1016,6 +1148,10 @@ public:
             pos[i] = -1;
             shift[i] = 0;
             rerot[i].reset();
+            if (i < payload_id.size()) {
+                payload_id[i] = 0;
+                storage_generation[i] = 0;
+            }
 
             used.erase(i);
 
@@ -1086,6 +1222,27 @@ private:
     // mirrored in server-side physical-index tables because TriAttention
     // compaction can move cells.
     std::vector<llama_kv_rerot_meta> rerot;
+
+    // Stable payload ID and storage generation.
+    // Owned exclusively by cells; compaction/moves preserve them; occupied cells have nonzero payload_id.
+    std::vector<uint64_t> payload_id;
+    std::vector<uint64_t> storage_generation;
+
+    // Single process-wide payload counter backing allocate + reserve.
+    // One accessor (no duplicate function-local statics) so reservation and
+    // allocation can never observe different counters.
+    static std::atomic<uint64_t> & payload_id_counter() {
+        static std::atomic<uint64_t> ctr{1};
+        return ctr;
+    }
+
+    static inline uint64_t allocate_payload_id() {
+        uint64_t id = payload_id_counter().fetch_add(1, std::memory_order_relaxed);
+        if (id == 0) {
+            id = payload_id_counter().fetch_add(1, std::memory_order_relaxed);
+        }
+        return id;
+    }
 
     // the set seq_pos[s][p] tells us how many times the position p is currently present for sequence s
     // if the position p is not present, seq_pos[s][p] is not set

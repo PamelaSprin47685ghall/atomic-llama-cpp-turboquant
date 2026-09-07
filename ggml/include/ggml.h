@@ -602,6 +602,14 @@ extern "C" {
         GGML_OP_FLASH_PREFILL_POOL,
         GGML_OP_FLASH_PREFILL_SELECT,
         GGML_OP_FLASH_PREFILL_ATTN,
+        GGML_OP_XKV_RECONSTRUCT,
+        GGML_OP_XKV_ATTENTION,
+        GGML_OP_XKV_FACTORIZE,
+        GGML_OP_XKV_CANONICALIZE,
+        GGML_OP_XKV_LANDMARK,
+        GGML_OP_XKV_LANDMARK_BUILD,
+        GGML_OP_XKV_LANDMARK_ROWS,
+        GGML_OP_XKV_LANDMARK_MERGE,
 
         GGML_OP_COUNT,
     };
@@ -2730,6 +2738,41 @@ extern "C" {
             int                   direction,
             int                   group_size,    // 0 = auto (64 or 128 from ne[0])
             struct ggml_tensor  * scale);        // NULL = no InnerQ scaling
+
+    // TurboQuant decoding target domain
+    enum ggml_turbo_decode_domain {
+        GGML_TURBO_DECODE_ROTATED   = 0, // raw centroids in WHT-rotated domain
+        GGML_TURBO_DECODE_CANONICAL = 1, // inverse WHT applied to recover canonical floats
+    };
+
+    // Re-entrant row quantization/dequantization for TurboQuant types (CPU)
+    // Supported types: GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0.
+    // For XKV v1, group_size must be 128; n_elements must be a positive multiple of 128.
+    // dequantize direction: 0 = rotated domain (raw centroids), 1 = canonical domain (inverts WHT).
+    // Returns true on success, false on invalid argument / unsupported type.
+    GGML_API bool ggml_quantize_turbo_row(
+            enum ggml_type   type,
+            const float    * src,
+            void           * dst,
+            int64_t          n_elements,
+            int              group_size);
+
+    GGML_API bool ggml_dequantize_turbo_row(
+            enum ggml_type   type,
+            const void     * src,
+            float          * dst,
+            int64_t          n_elements,
+            int              group_size,
+            enum ggml_turbo_decode_domain domain);
+
+    // Return compiled layout/table fingerprint for TurboQuant type, or 0 if unsupported for XKV.
+    // Hashes compiled block size, struct size, centroids, WHT signs, and compilation mode.
+    GGML_API uint64_t ggml_turbo_layout_fingerprint(enum ggml_type type);
+
+    // Re-entrant forward and inverse Walsh-Hadamard transform row helpers for group_size (128).
+    // In XKV v1, group_size must be 128; x must contain at least group_size elements.
+    GGML_API void ggml_turbo_wht_row(float * x, int group_size);
+    GGML_API void ggml_turbo_wht_inverse_row(float * x, int group_size);
 
     // DSA lightning indexer
     //
