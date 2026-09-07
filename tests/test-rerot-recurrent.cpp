@@ -399,10 +399,74 @@ int main() {
                 restored.data(),
                 (size_t) r10 * row_size,
                 row_size);
-            CHECK(seed->state_bytes[il].empty());
+            CHECK(seed->state_bytes[il].size() == row_size);
+            CHECK(restored == seed->state_bytes[il]);
+        }
+
+        // A PRIVATE root planner writes into its private brain row. Forking
+        // must preserve the effective state as a child hand delta relative to
+        // the still-unmodified public brain.
+        llama_kv_rerot_meta planner_tag;
+        planner_tag.episode_id = 888;
+        planner_tag.node_id = 0;
+        planner_tag.visibility = llama_rerot_visibility::private_control;
+        CHECK(gmem.rerot_set_write_tag(1, planner_tag));
+        const int32_t planner_brain = gmem.episode_brain.at(888);
+        for (size_t il = 0; il < gmem.s_l.size(); ++il) {
+            if (!gmem.is_s_shared((int32_t) il)) {
+                continue;
+            }
+            const size_t n = (size_t) gmem.s_l[il]->ne[0];
+            const size_t brain_row_size =
+                ggml_row_size(gmem.s_l[il]->type, gmem.s_l[il]->ne[0]);
+            const size_t hand_row_size =
+                ggml_row_size(gmem.d_l[il]->type, gmem.d_l[il]->ne[0]);
+            const std::vector<float> public_state(n, 1.0f);
+            const std::vector<float> private_state(n, 4.0f);
+            const std::vector<ggml_fp16_t> planner_delta(
+                n, ggml_fp32_to_fp16(2.0f));
+            ggml_backend_tensor_set(
+                gmem.s_l[il],
+                public_state.data(),
+                (size_t) planner_brain * brain_row_size,
+                brain_row_size);
+            ggml_backend_tensor_set(
+                gmem.s_l[il],
+                private_state.data(),
+                ((size_t) gmem.get_brain_capacity() +
+                    (size_t) planner_brain) * brain_row_size,
+                brain_row_size);
+            ggml_backend_tensor_set(
+                gmem.d_l[il],
+                planner_delta.data(),
+                (size_t) r1 * hand_row_size,
+                hand_row_size);
+        }
+
+        auto planner_seed = gmem.capture_hand_seed(1000, 1);
+        CHECK(planner_seed != nullptr);
+        CHECK(gmem.apply_hand_seed(11, planner_seed));
+        const int32_t r11 = resolved_row(gmem, 11, pos);
+        CHECK(r11 >= 0);
+        for (size_t il = 0; il < gmem.d_l.size(); ++il) {
+            if (!gmem.d_l[il]) {
+                continue;
+            }
+            const size_t n = (size_t) gmem.d_l[il]->ne[0];
+            const size_t row_size =
+                ggml_row_size(gmem.d_l[il]->type, gmem.d_l[il]->ne[0]);
+            std::vector<ggml_fp16_t> restored(n);
+            ggml_backend_tensor_get(
+                gmem.d_l[il],
+                restored.data(),
+                (size_t) r11 * row_size,
+                row_size);
             CHECK(std::all_of(
                 restored.begin(), restored.end(),
-                [](uint8_t value) { return value == 0; }));
+                [](ggml_fp16_t value) {
+                    return std::abs(
+                        ggml_fp16_to_fp32(value) - 5.0f) < 1.0e-6f;
+                }));
         }
 
         // Child PUBLIC writes must reach the shared brain just like root
@@ -508,11 +572,14 @@ int main() {
             std::vector<ggml_fp16_t> hand(D * 3);
             ggml_backend_tensor_get(
                 graph_mem.d_l[3], hand.data(), 0, hand.size() * sizeof(ggml_fp16_t));
-            CHECK(std::all_of(hand.begin(), hand.begin() + 2 * D, [](ggml_fp16_t value) {
+            CHECK(std::all_of(hand.begin(), hand.begin() + D, [](ggml_fp16_t value) {
                 return ggml_fp16_to_fp32(value) == 0.0f;
             }));
+            CHECK(std::all_of(hand.begin() + D, hand.begin() + 2 * D, [](ggml_fp16_t value) {
+                return std::abs(ggml_fp16_to_fp32(value) - 0.5f) < 1.0e-6f;
+            }));
             CHECK(std::all_of(hand.begin() + 2 * D, hand.end(), [](ggml_fp16_t value) {
-                return std::abs(ggml_fp16_to_fp32(value) - 2.0f) < 1.0e-6f;
+                return std::abs(ggml_fp16_to_fp32(value) - 3.0f) < 1.0e-6f;
             }));
             ggml_backend_buffer_free(graph_buffer);
             ggml_backend_free(cpu);

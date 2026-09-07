@@ -1272,19 +1272,10 @@ private:
         return nullptr;
     }
 
-    size_t rerot_private_batch_size(const server_slot & slot) const {
-        if (!ctx_tgt ||
-            !server_rerot_private_microbatch(slot.rerot_injection) ||
-            slot.rerot_injection_cursor >= slot.rerot_injection_tokens.size()) {
-            return 1;
-        }
-        const size_t fair_batch_capacity = std::max<size_t>(
-            1, llama_n_batch(ctx_tgt) / std::max<size_t>(1, slots.size()));
-        return std::min({
-            slot.rerot_injection_tokens.size() - slot.rerot_injection_cursor,
-            SERVER_REROT_PRIVATE_BATCH,
-            fair_batch_capacity,
-        });
+    size_t rerot_private_batch_size(const server_slot &) const {
+        // Recurrent PRIVATE spans require a state commit between logical
+        // timesteps. Batch equal frontiers across Lanes, never time within one.
+        return 1;
     }
 
     void rerot_emit_reasoning_lines(
