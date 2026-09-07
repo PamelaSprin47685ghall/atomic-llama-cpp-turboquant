@@ -22,6 +22,22 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_control_flow_attributes : enable
 
+// Cody-Waite range reduction of pos * omega to [-pi, pi] using double-precision
+// splitting of 2*pi (PI2_HI + PI2_LO = 2*pi exact to 48 bits). Eliminates
+// GPU hardware range-reduction divergence on large angles (|pos| <= 4096)
+// so v_sin_f32 / v_cos_f32 operate in their near-exact [-pi, pi] domain.
+void rope_trig_cody_waite(float pos_f, float omega, out float out_c, out float out_s) {
+    const float INV_TWO_PI = 0.15915494309189535; // 1 / (2*pi)
+    const float TWO_PI_HI  = 6.2831854820251465;  // high 24 bits
+    const float TWO_PI_LO  = -1.748455588302094e-7; // low bits
+    float ang = pos_f * omega;
+    float k_cycles = round(ang * INV_TWO_PI);
+    float red_ang = fma(k_cycles, -TWO_PI_HI, ang);
+    red_ang = fma(k_cycles, -TWO_PI_LO, red_ang);
+    out_c = cos(red_ang);
+    out_s = sin(red_ang);
+}
+
 layout (local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout (push_constant) uniform BuildPush {
@@ -313,7 +329,8 @@ void main() {
                             float om = rope[roff + head_local];
                             float mg = rope[roff + fc + head_local];
                             if (mg <= 0.0) mg = 1.0;
-                            float ang = om * fpos, c = cos(ang), sn = sin(ang);
+                            float c, sn;
+                            rope_trig_cody_waite(fpos, om, c, sn);
                             phased_val = (re * c - im * sn) * mg;
                         } else {
                             float im = dot_val;
@@ -322,7 +339,8 @@ void main() {
                             float om = rope[roff + f];
                             float mg = rope[roff + fc + f];
                             if (mg <= 0.0) mg = 1.0;
-                            float ang = om * fpos, c = cos(ang), sn = sin(ang);
+                            float c, sn;
+                            rope_trig_cody_waite(fpos, om, c, sn);
                             phased_val = (re * sn + im * c) * mg;
                         }
                     } else { // INTERLEAVED mode
@@ -330,7 +348,8 @@ void main() {
                         float om = rope[roff + pair_idx];
                         float mg = rope[roff + fc + pair_idx];
                         if (mg <= 0.0) mg = 1.0;
-                        float ang = om * fpos, c = cos(ang), sn = sin(ang);
+                        float c, sn;
+                        rope_trig_cody_waite(fpos, om, c, sn);
                         if ((head_local & 1u) == 0u) {
                             float re = dot_val;
                             float im = reconstruct_value(ar, feat + 1u);

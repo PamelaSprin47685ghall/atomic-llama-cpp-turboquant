@@ -53,16 +53,61 @@ static llama_cparams test_cparams() {
     return c;
 }
 
-static void build_canonical(uint64_t rows, uint64_t cols,
-                            std::vector<float> & k_out, std::vector<float> & v_out) {
-    k_out.resize((size_t) rows * cols);
-    v_out.resize((size_t) rows * cols);
+static uint64_t xkv_test_rng_next(uint64_t & s) {
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    return s;
+}
+
+// Genuine rank-true_rank fixture: K = U.V^T + noise, V = 0.5.K.
+// All true_rank components carry signal, so a rank-true_rank seal measures
+// real factorization/quantization error at the quality gate. (A sin/cos outer
+// product is exactly rank-1 and leaves degenerate zero-signal columns.)
+static void build_low_rank_canonical(uint64_t rows, uint64_t cols, uint32_t true_rank,
+                                     float noise_scale, uint64_t seed,
+                                     std::vector<float> & k_out, std::vector<float> & v_out) {
+    uint64_t s = seed ? seed : 0x243F6A8885A308D3ULL;
+    auto rnd = [&]() -> float {
+        xkv_test_rng_next(s);
+        return ((float)(s & 0x7FFFFFFF) / (float)0x7FFFFFFF) * 2.0f - 1.0f;
+    };
+    std::vector<float> u((size_t)rows * true_rank), vv((size_t)cols * true_rank);
+    for (float & x : u) x = rnd();
+    for (float & x : vv) x = rnd();
+    k_out.assign((size_t)rows * cols, 0.0f);
     for (uint64_t r = 0; r < rows; ++r) {
         for (uint64_t c = 0; c < cols; ++c) {
-            const float v = std::sin((float) r * 0.3f) * std::cos((float) c * 0.2f);
-            k_out[(size_t) r * cols + c] = v;
-            v_out[(size_t) r * cols + c] = v * 0.5f;
+            double sum = 0.0;
+            for (uint32_t k = 0; k < true_rank; ++k) {
+                sum += (double)u[(size_t)r * true_rank + k] * (double)vv[(size_t)c * true_rank + k];
+            }
+            k_out[(size_t)r * cols + c] = (float)sum;
         }
+    }
+    if (noise_scale > 0.0f) {
+        for (float & x : k_out) x += rnd() * noise_scale;
+    }
+    v_out.resize((size_t)rows * cols);
+    for (size_t i = 0; i < v_out.size(); ++i) v_out[i] = k_out[i] * 0.5f;
+}
+
+static void build_canonical(uint64_t rows, uint64_t cols,
+                            std::vector<float> & k_out, std::vector<float> & v_out) {
+    build_low_rank_canonical(rows, cols, 8, 0.001f, 777, k_out, v_out);
+}
+
+// Exact measured source row bytes per owning layer: ggml_row_size over the
+// live hot tensor type/ne for each layer feature width. The types must match
+// landmark_params()' flat_type_k/v (F16); never hand-entered.
+static void fill_hot_row_bytes(xkv_factor_group_input & g, ggml_type type_k, ggml_type type_v) {
+    g.hot_bytes_per_row_k.clear();
+    g.hot_bytes_per_row_v.clear();
+    for (uint32_t d : g.layer_feature_dims_k) {
+        g.hot_bytes_per_row_k.push_back((uint64_t) ggml_row_size(type_k, (int64_t) d));
+    }
+    for (uint32_t d : g.layer_feature_dims_v) {
+        g.hot_bytes_per_row_v.push_back((uint64_t) ggml_row_size(type_v, (int64_t) d));
     }
 }
 
@@ -88,11 +133,12 @@ static xkv_factor_group_input make_input(const float * k_data, const float * v_d
     for (uint64_t i = 0; i < rows; ++i) {
         g.row_positions[(size_t) i] = (int64_t) i;
     }
+    fill_hot_row_bytes(g, GGML_TYPE_F16, GGML_TYPE_F16);
     return g;
 }
 
 // Real post-factor landmark factory for the current encoded-stream contract:
-// chunk-mean landmarks over reconstructed K, decoded tile-by-tile from the
+// chunk-mean landmarks over reconstructed K, streamed in row tiles from the
 // FINAL ENCODED A_K/B_K streams using only the supplied scratch span.
 // Zero heap allocation (no std::vector temporaries); carve failure or any
 // shape/domain violation fails closed.
@@ -135,7 +181,12 @@ static xkv_group_landmark_factory_fn test_landmark_factory() {
         if (n_rows > max_u64 / sizeof(uint64_t)) return fail("landmark factory: index overflow");
         if (n_rows > max_u64 / pad_a / sizeof(float)) return fail("landmark factory: A decode overflow");
         if (feat > max_u64 / pad_b / sizeof(float)) return fail("landmark factory: B decode overflow");
-        if (n_rows > max_u64 / feat / sizeof(float)) return fail("landmark factory: K recon overflow");
+        // Row-tile streaming: A is decoded 32 rows at a time and each K row is
+        // accumulated straight into its chunk sum, so no n x feat K tile exists.
+        // Peak stays B_full + one A tile + sums, fitting the production-sized
+        // factor/shadow lease at every exercised geometry (no oversized buffer).
+        constexpr uint64_t kTileRows = 32;
+        if (kTileRows > max_u64 / pad_a / sizeof(float)) return fail("landmark factory: A tile overflow");
         uint8_t * p = (uint8_t *) scratch.data;
         size_t remain = scratch.size_bytes;
         auto carve = [&](size_t need, void *& out) -> bool {
@@ -153,34 +204,13 @@ static xkv_group_landmark_factory_fn test_landmark_factory() {
         }
         uint64_t * idx = (uint64_t *) idx_mem;
         for (uint64_t i = 0; i < n_rows; ++i) idx[i] = i;
-        // Decode A_K [n x pad_a] and B_K^T [feat x pad_b] into scratch.
-        void * a_mem = nullptr;
-        if (!carve((size_t) (n_rows * pad_a * sizeof(float)), a_mem)) {
-            return fail("landmark factory: scratch too small for A tile");
-        }
+        // Decode B_K^T [feat x pad_b] once (reused by every row tile).
         void * b_mem = nullptr;
         if (!carve((size_t) (feat * pad_b * sizeof(float)), b_mem)) {
             return fail("landmark factory: scratch too small for B tile");
         }
-        float * a_dec = (float *) a_mem;
         float * b_dec = (float *) b_mem;
-        decode_rows(enc_a_k, idx, (size_t) n_rows, a_dec, (size_t) (n_rows * pad_a));
         decode_rows(enc_b_k, idx, (size_t) feat, b_dec, (size_t) (feat * pad_b));
-        // Reconstruct K = A @ B^T [n x feat] in scratch.
-        void * k_mem = nullptr;
-        if (!carve((size_t) (n_rows * feat * sizeof(float)), k_mem)) {
-            return fail("landmark factory: scratch too small for K tile");
-        }
-        float * k_rec = (float *) k_mem;
-        for (uint64_t i = 0; i < n_rows; ++i) {
-            for (uint64_t j = 0; j < feat; ++j) {
-                double sum = 0.0;
-                for (uint64_t k = 0; k < rank; ++k) {
-                    sum += (double) a_dec[i * pad_a + k] * (double) b_dec[j * pad_b + k];
-                }
-                k_rec[i * feat + j] = (float) sum;
-            }
-        }
         // Phase-aware chunking: chunk = storage_position / 8. Two passes so
         // the sums/counts carve is exact.
         uint64_t n_chunks = 0;
@@ -207,11 +237,27 @@ static xkv_group_landmark_factory_fn test_landmark_factory() {
         uint64_t * counts = (uint64_t *) counts_mem;
         std::memset(sums, 0, (size_t) (n_chunks * feat * sizeof(float)));
         std::memset(counts, 0, (size_t) (n_chunks * sizeof(uint64_t)));
-        for (uint64_t i = 0; i < n_rows; ++i) {
-            const uint64_t ch = (uint64_t) row_positions[i] / 8u;
-            counts[ch] += 1;
-            for (uint64_t j = 0; j < feat; ++j) {
-                sums[ch * feat + j] += k_rec[i * feat + j];
+        // Stream A_K tile by tile; each reconstructed K row accumulates
+        // straight into its chunk sum in row order (bit-identical sums).
+        void * a_mem = nullptr;
+        if (!carve((size_t) (kTileRows * pad_a * sizeof(float)), a_mem)) {
+            return fail("landmark factory: scratch too small for A tile");
+        }
+        float * a_tile = (float *) a_mem;
+        for (uint64_t t = 0; t < n_rows; t += kTileRows) {
+            const uint64_t tn = (t + kTileRows <= n_rows) ? kTileRows : (n_rows - t);
+            decode_rows(enc_a_k, idx + t, (size_t) tn, a_tile, (size_t) (tn * pad_a));
+            for (uint64_t ii = 0; ii < tn; ++ii) {
+                const uint64_t i = t + ii;
+                const uint64_t ch = (uint64_t) row_positions[i] / 8u;
+                counts[ch] += 1;
+                for (uint64_t j = 0; j < feat; ++j) {
+                    double sum = 0.0;
+                    for (uint64_t k = 0; k < rank; ++k) {
+                        sum += (double) a_tile[ii * pad_a + k] * (double) b_dec[j * pad_b + k];
+                    }
+                    sums[ch * feat + j] += (float) sum;
+                }
             }
         }
         for (uint64_t ch = 0; ch < n_chunks; ++ch) {
@@ -357,6 +403,10 @@ int main() {
     llama_xkv_cache_store store_big(test_cparams());
     register_payloads(store_big, 256, 1000);
     xkv_sealing_result ok_big = run_evaluate(store_big, 256, make_pids(256, 1000));
+    if (!ok_big.success) {
+        std::fprintf(stderr, "workspace-bound evaluate-256 failed: %s (skip=%d)\n", ok_big.message.c_str(), (int) ok_big.skip_reason);
+        return 1;
+    }
     CHECK(ok_big.success);
     const size_t P = store_big.get_arena().get_peak_bytes();
     CHECK(P > 64); // the seal+landmark path really acquired arena scratch
@@ -366,7 +416,14 @@ int main() {
     llama_xkv_cache_store store_T(test_cparams());
     CHECK(store_T.get_arena().set_capacity_bytes(P));
     register_payloads(store_T, 256, 1000);
-    CHECK(run_evaluate(store_T, 256, make_pids(256, 1000)).success);
+    {
+        xkv_sealing_result rT = run_evaluate(store_T, 256, make_pids(256, 1000));
+        if (!rT.success) {
+            std::fprintf(stderr, "workspace-bound exact-T evaluate failed: %s (skip=%d)\n", rT.message.c_str(), (int) rT.skip_reason);
+            return 1;
+        }
+        CHECK(rT.success);
+    }
 
     // T minus one accounting unit: the same production op must refuse.
     // (A bypass bug that never counts arena bytes would succeed here.)
@@ -396,6 +453,10 @@ int main() {
     llama_xkv_cache_store store_128(test_cparams());
     register_payloads(store_128, 128, 2000);
     xkv_sealing_result ok_128 = run_evaluate(store_128, 128, make_pids(128, 2000));
+    if (!ok_128.success) {
+        std::fprintf(stderr, "workspace-bound evaluate-128 failed: %s (skip=%d)\n", ok_128.message.c_str(), (int) ok_128.skip_reason);
+        return 1;
+    }
     CHECK(ok_128.success);
     const size_t P128 = store_128.get_arena().get_peak_bytes();
     CHECK(P128 > 0 && P128 < P);
@@ -407,11 +468,16 @@ int main() {
     std::vector<uint64_t> pub_pids = make_pids(256, 3000);
     std::vector<uint64_t> pub_gens(256, 1);
     xkv_sealing_result sealed = store_pub.seal_segment_bundle({gpub}, pub_pids, pub_gens, landmark_params());
+    if (!sealed.success) {
+        std::fprintf(stderr, "workspace-bound publish-256 seal failed: %s (skip=%d)\n", sealed.message.c_str(), (int) sealed.skip_reason);
+        return 1;
+    }
     CHECK(sealed.success);
     const uint64_t seg_id = sealed.segment_id;
     {
         auto seg = store_pub.get_segment(seg_id);
         CHECK(seg != nullptr);
+        if (seg == nullptr) return 1;
         CHECK(seg->groups[0].bytes_landmark > 0); // landmark path produced output
     }
 
@@ -521,6 +587,202 @@ int main() {
         CHECK(r.status == xkv_read_status::workspace_exceeded);
         CHECK(r.output.empty());
         CHECK(ws_small.live_bytes() == 0);
+    }
+
+    // ---- Layer D: workspace/cache independent of segment count and reader fan-out ----
+    {
+        llama_xkv_cache_store store_multi(test_cparams());
+        // 128 rows: fixed B-stream cost amortizes to ~17% saving, clearing the
+        // 10% production saving gate. (64 rows cannot: fixed B bytes exceed the
+        // 64-row flat source regardless of data quality.)
+        const uint32_t seg_rows = 128;
+        std::vector<uint64_t> seg_ids;
+        for (uint64_t s = 0; s < 3; ++s) {
+            const uint64_t base = 5000 + s * 1000;
+            register_payloads(store_multi, seg_rows, base);
+            xkv_factor_group_input g = make_input(k256.data(), v256.data(), seg_rows);
+            std::vector<uint64_t> pids = make_pids(seg_rows, base);
+            std::vector<uint64_t> gens(seg_rows, 1);
+            xkv_sealing_result sr = store_multi.seal_segment_bundle({g}, pids, gens, landmark_params());
+            if (!sr.success) {
+                std::fprintf(stderr, "workspace-bound multi-seg seal failed: %s (skip=%d)\n", sr.message.c_str(), (int) sr.skip_reason);
+                return 1;
+            }
+            CHECK(sr.success);
+            seg_ids.push_back(sr.segment_id);
+        }
+        CHECK(store_multi.get_arena().get_live_bytes() == 0);
+        {
+            const xkv_accounting acc = store_multi.get_accounting();
+            CHECK(acc.active_segments == 3);
+            CHECK(acc.arena_live_bytes == 0);
+            CHECK(acc.reserved_bytes == acc.allocated_bytes + acc.arena_reserved_bytes + acc.dedup_scratch_bytes);
+            CHECK(acc.workspace_budget_bytes == acc.arena_capacity_bytes);
+        }
+        auto make_multi_views = [&](uint32_t rows_per_seg) {
+            std::vector<xkv_segment_read_view> views;
+            for (uint64_t sid : seg_ids) {
+                xkv_segment_read_view view;
+                view.pin = store_multi.pin_segment(sid);
+                CHECK(bool(view.pin));
+                view.segment_version_id = view.pin->segment_version;
+                view.storage_generation = 1;
+                view.owning_layer = 0;
+                view.factor_group_index = 0;
+                for (uint32_t i = 0; i < rows_per_seg; ++i) {
+                    view.selected_rows.push_back(i);
+                    view.storage_positions.push_back((int64_t) i);
+                    view.group_indices.push_back(0);
+                }
+                views.push_back(std::move(view));
+            }
+            return views;
+        };
+        // Chained read across all 3 segments in one call: tile streaming reuses
+        // the same bounded workspace; peak never exceeds the pre-warmed cap.
+        {
+            std::vector<xkv_segment_read_view> views = make_multi_views(seg_rows);
+            xkv_reader_config rcfg;
+            rcfg.workspace = &ws_fit;
+            rcfg.tile_size = 32;
+            const size_t peak_before = ws_fit.peak_bytes();
+            xkv_read_result r = xkv_read_attention(query, {}, views, nullptr,
+                                                  store_multi.current_stamp(), &store_multi, rcfg);
+            CHECK(r.status == xkv_read_status::success);
+            CHECK(r.output.size() == 16);
+            for (float v : r.output) CHECK(std::isfinite(v));
+            CHECK(ws_fit.live_bytes() == 0);
+            CHECK(ws_fit.peak_bytes() <= ws_fit.capacity_bytes());
+            CHECK(ws_fit.peak_bytes() >= peak_before);
+        }
+        // Reader fan-out over time (sequential readers, concurrent-head query):
+        // peak stays bounded, live returns to zero after every reader.
+        xkv_query_input q4 = query;
+        q4.n_q_heads = 4;
+        q4.q_vec.assign((size_t) 4 * 16, 0.1f);
+        for (int rep = 0; rep < 4; ++rep) {
+            std::vector<xkv_segment_read_view> views = make_multi_views(seg_rows);
+            xkv_reader_config rcfg;
+            rcfg.workspace = &ws_fit;
+            rcfg.tile_size = 32;
+            xkv_read_result r = xkv_read_attention(q4, {}, views, nullptr,
+                                                  store_multi.current_stamp(), &store_multi, rcfg);
+            CHECK(r.status == xkv_read_status::success);
+            CHECK(r.output.size() == (size_t) 4 * 16);
+            CHECK(ws_fit.live_bytes() == 0);
+            CHECK(ws_fit.peak_bytes() <= ws_fit.capacity_bytes());
+        }
+        CHECK(store_multi.get_arena().get_live_bytes() == 0);
+    }
+
+    // ---- Layer E: non-divisible / one-row reads, head geometries, zero-capacity refusal ----
+    {
+        // Non-divisible row selections over the published 256-row segment.
+        for (uint32_t n : {7u, 19u, 100u, 1u}) {
+            std::vector<xkv_segment_read_view> views = make_views({n});
+            xkv_reader_config rcfg;
+            rcfg.workspace = &ws_fit;
+            rcfg.tile_size = 32; // 7/19/100/1 all leave tail tiles
+            xkv_read_result r = xkv_read_attention(query, {}, views, nullptr,
+                                                  store_pub.current_stamp(), &store_pub, rcfg);
+            CHECK(r.status == xkv_read_status::success);
+            CHECK(r.output.size() == 16);
+            for (float v : r.output) CHECK(std::isfinite(v));
+            CHECK(ws_fit.live_bytes() == 0);
+            CHECK(ws_fit.peak_bytes() <= ws_fit.capacity_bytes());
+        }
+        // Workspace layout grows with head geometry (16 < 128 < 256 partial-IMRoPE width).
+        {
+            xkv_reader_workspace_config c16, c128, c256;
+            c16.max_head_dim_k = 16;
+            c16.max_head_dim_v = 16;
+            c128.max_head_dim_k = 128;
+            c128.max_head_dim_v = 128;
+            c256.max_head_dim_k = 256;
+            c256.max_head_dim_v = 256;
+            size_t t16 = 0, t128 = 0, t256 = 0;
+            CHECK(xkv_estimate_workspace_layout(c16, t16, &lerr));
+            CHECK(xkv_estimate_workspace_layout(c128, t128, &lerr));
+            CHECK(xkv_estimate_workspace_layout(c256, t256, &lerr));
+            CHECK(t16 > 0 && t128 > t16 && t256 > t128);
+            c256.capacity_bytes = t256;
+            xkv_reader_workspace ws256;
+            CHECK(ws256.warmup(c256, &lerr));
+            CHECK(ws256.capacity_bytes() == t256);
+            // Zero-capacity reader workspace must refuse warmup (empty boundary).
+            xkv_reader_workspace_config cz = c16;
+            cz.capacity_bytes = 0;
+            xkv_reader_workspace wsz;
+            CHECK(!wsz.warmup(cz, &lerr));
+            CHECK(!wsz.is_warmed_up());
+        }
+        // Group tail seal (full 8-layer group + 1-layer tail) still preflights exactly.
+        {
+            llama_xkv_cache_store store_tail(test_cparams());
+            // 132 rows: non-divisible by 8 (partial 4-row tail chunk) while the
+            // fixed B-stream cost still amortizes past the 10% saving gate.
+            // 128-wide full group (8x16 layers): two A-stream sets cost ~272 B/row
+            // against a ~576 B/row flat source (~48% saving). A 64+16 two-group
+            // shape caps at ~9% and can never clear the 10% gate.
+            const uint32_t n = 132;
+            register_payloads(store_tail, n, 9000);
+            std::vector<float> kw, vw;
+            build_low_rank_canonical(n, 128, 8, 0.001f, 779, kw, vw);
+            xkv_factor_group_input g0;
+            g0.group_index = 0;
+            g0.owning_layers = {0, 1, 2, 3, 4, 5, 6, 7};
+            g0.rank_k = 8;
+            g0.rank_v = 8;
+            g0.total_dim_k = 128;
+            g0.total_dim_v = 128;
+            g0.layer_feature_offsets_k = {0, 16, 32, 48, 64, 80, 96, 112};
+            g0.layer_feature_dims_k = {16, 16, 16, 16, 16, 16, 16, 16};
+            g0.layer_feature_offsets_v = {0, 16, 32, 48, 64, 80, 96, 112};
+            g0.layer_feature_dims_v = {16, 16, 16, 16, 16, 16, 16, 16};
+            g0.canonical_k_data = kw.data();
+            g0.k_rows = n;
+            g0.k_cols = 128;
+            g0.canonical_v_data = vw.data();
+            g0.v_rows = n;
+            g0.v_cols = 128;
+            g0.row_positions.resize((size_t) n);
+            for (uint64_t i = 0; i < n; ++i) g0.row_positions[(size_t) i] = (int64_t) i;
+            fill_hot_row_bytes(g0, GGML_TYPE_F16, GGML_TYPE_F16);
+            std::vector<float> kt, vt;
+            build_low_rank_canonical(n, 16, 8, 0.001f, 778, kt, vt);
+            xkv_factor_group_input g1;
+            g1.group_index = 1;
+            g1.owning_layers = {8};
+            g1.rank_k = 8;
+            g1.rank_v = 8;
+            g1.total_dim_k = 16;
+            g1.total_dim_v = 16;
+            g1.layer_feature_offsets_k = {0};
+            g1.layer_feature_dims_k = {16};
+            g1.layer_feature_offsets_v = {0};
+            g1.layer_feature_dims_v = {16};
+            g1.canonical_k_data = kt.data();
+            g1.k_rows = n;
+            g1.k_cols = 16;
+            g1.canonical_v_data = vt.data();
+            g1.v_rows = n;
+            g1.v_cols = 16;
+            g1.row_positions.resize((size_t) n);
+            for (uint64_t i = 0; i < n; ++i) g1.row_positions[(size_t) i] = (int64_t) i;
+            fill_hot_row_bytes(g1, GGML_TYPE_F16, GGML_TYPE_F16);
+            xkv_sealing_result tr = store_tail.seal_segment_bundle({g0, g1}, make_pids(n, 9000),
+                                                                   std::vector<uint64_t>(n, 1), landmark_params());
+            if (!tr.success) {
+                std::fprintf(stderr, "workspace-bound tail seal failed: %s (skip=%d)\n", tr.message.c_str(), (int) tr.skip_reason);
+            }
+            CHECK(tr.success);
+            if (!tr.success) return 1;
+            CHECK(store_tail.get_arena().get_live_bytes() == 0);
+            auto segt = store_tail.get_segment(tr.segment_id);
+            CHECK(segt != nullptr);
+            if (segt == nullptr) return 1;
+            CHECK(segt->groups.size() == 2);
+        }
     }
 
     if (g_failures != 0) {

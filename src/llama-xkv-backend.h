@@ -411,7 +411,6 @@ private:
         const xkv_backend_store_reservation * reservation);
 
     xkv_allocation_id_generator * id_gen_ = nullptr;
-    xkv_allocation_id_generator default_id_gen_;
     std::vector<xkv_backend_stream_input> streams_;
     // Device-tensor adopt worker (free function below delegates here).
     static bool adopt_impl(

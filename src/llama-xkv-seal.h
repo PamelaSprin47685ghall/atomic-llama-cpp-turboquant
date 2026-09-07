@@ -164,8 +164,8 @@ struct xkv_native_seal_config {
     std::string placement_identity;                // must equal backend/executor name if nonempty
     // Publish gate: device-measured A+B final-codec relative error must not
     // exceed this (Sealer sets from profile max_relative_error; required > 0).
-    // A-only/B-only residuals are measured and reported for diagnostics;
-    // only the A+B product gates publication.
+    // A-only/B-only residuals are evaluated device-side for diagnostics;
+    // only the A+B product is reported and gates publication.
     double max_rel_error = 0.25;
 };
 

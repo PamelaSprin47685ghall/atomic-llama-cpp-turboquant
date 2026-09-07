@@ -91,7 +91,14 @@ bool codec_desc::validate(std::string * err) const {
 
     if (type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && type != GGML_TYPE_Q8_0 &&
         type != GGML_TYPE_TURBO2_0 && type != GGML_TYPE_TURBO3_0 && type != GGML_TYPE_TURBO4_0) {
-        if (err) *err = "unsupported ggml_type for xkv codec: " + std::string(ggml_type_name(type));
+        // ggml_type_name returns nullptr for out-of-range/corrupt types; never
+        // construct std::string from null (would throw std::logic_error and
+        // abort fail-closed validation). Report the raw integer instead.
+        const char * type_name = (type >= 0 && type < GGML_TYPE_COUNT) ? ggml_type_name(type) : nullptr;
+        if (err) {
+            *err = "unsupported ggml_type for xkv codec: ";
+            *err += (type_name != nullptr ? type_name : ("type#" + std::to_string((int) type)));
+        }
         return false;
     }
 
@@ -635,9 +642,23 @@ bool deserialize_desc(const uint8_t * data, size_t size, codec_desc & out_desc, 
         if (err) *err = "deserialize_desc: v1 descriptor rejected (missing required format_revision / 100-byte layout)";
         return false;
     }
-    d.role = (factor_role)read_u32_le(data + 8);
+    // Canonical-form gate: role/orient/domains are uint8_t enums serialized as
+    // u32, so upper bytes must be zero. Without this, high-byte corruption
+    // (e.g. desc_bytes[10] ^= 0xFF) truncates silently on narrowing cast and
+    // validates as the original value. Reject fail-closed before casting.
+    const uint32_t raw_role = read_u32_le(data + 8);
+    if (raw_role > (uint32_t) factor_role::landmark) {
+        if (err) *err = "deserialize_desc: non-canonical corrupt factor_role";
+        return false;
+    }
+    d.role = (factor_role) raw_role;
     d.type = (ggml_type)read_u32_le(data + 12);
-    d.orient = (orientation)read_u32_le(data + 16);
+    const uint32_t raw_orient = read_u32_le(data + 16);
+    if (raw_orient > (uint32_t) orientation::feature_major_transposed) {
+        if (err) *err = "deserialize_desc: non-canonical corrupt orientation";
+        return false;
+    }
+    d.orient = (orientation) raw_orient;
 
     d.logical_shape.rows = read_u64_le(data + 20);
     d.logical_shape.cols = read_u64_le(data + 28);
@@ -651,8 +672,18 @@ bool deserialize_desc(const uint8_t * data, size_t size, codec_desc & out_desc, 
     d.seed = read_u64_le(data + 68);
     d.table_fingerprint = read_u64_le(data + 76);
 
-    d.stored_domain = (value_domain)read_u32_le(data + 84);
-    d.decoded_domain = (value_domain)read_u32_le(data + 88);
+    const uint32_t raw_stored = read_u32_le(data + 84);
+    if (raw_stored > (uint32_t) value_domain::turbo_rotated) {
+        if (err) *err = "deserialize_desc: non-canonical corrupt stored_domain";
+        return false;
+    }
+    d.stored_domain = (value_domain) raw_stored;
+    const uint32_t raw_decoded = read_u32_le(data + 88);
+    if (raw_decoded > (uint32_t) value_domain::turbo_rotated) {
+        if (err) *err = "deserialize_desc: non-canonical corrupt decoded_domain";
+        return false;
+    }
+    d.decoded_domain = (value_domain) raw_decoded;
     d.format_revision = read_u64_le(data + 92);
 
     if (!d.validate(err)) {

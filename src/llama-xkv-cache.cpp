@@ -29,6 +29,15 @@ static inline bool checked_mul_u64(uint64_t a, uint64_t b, uint64_t & out) {
     return true;
 }
 
+// Checked addition of two uint64_t values; returns false on overflow
+static inline bool checked_add_u64(uint64_t a, uint64_t b, uint64_t & out) {
+    if (a > std::numeric_limits<uint64_t>::max() - b) {
+        return false;
+    }
+    out = a + b;
+    return true;
+}
+
 // Checked addition of two size_t values; returns false on overflow
 static inline bool checked_add_size(size_t a, size_t b, size_t & out) {
     if (a > std::numeric_limits<size_t>::max() - b) {
@@ -36,6 +45,25 @@ static inline bool checked_add_size(size_t a, size_t b, size_t & out) {
     }
     out = a + b;
     return true;
+}
+
+// COW pack helpers: atomic bundle cloning must never decode or memcpy
+// DEVICE_OWNED bytes on host. Any landmark stream presence (any profile)
+// requires a semantic rebuild; otherwise stale chunk summaries would be
+// silently truncated. Host row-byte sizes are validated before any memcpy
+// so corrupt sizes fail closed instead of reading out of bounds.
+inline bool segment_needs_landmark_rebuild(const xkv_segment & seg) {
+    if (seg.profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS) {
+        return true;
+    }
+    for (const auto & g : seg.groups) {
+        if (!g.landmark_chunks.empty() || g.landmark_table_fingerprint != 0 ||
+            g.landmark.desc.logical_shape.rows > 0 || !g.landmark.bytes.empty() ||
+            g.bytes_landmark > 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Helper to extract unpadded row-major float matrix from decoded row-padded vector
@@ -133,6 +161,13 @@ void xkv_factor_group_payload::update_byte_counters() {
     bytes_b_v = (b_v && b_v->desc.logical_shape.rows > 0) ? encoded_matrix_bytes(b_v->desc) : (b_v ? b_v->bytes.size() : 0);
     bytes_landmark = landmark.desc.logical_shape.rows > 0 ? encoded_matrix_bytes(landmark.desc) : landmark.bytes.size();
 
+    // Size-based (never capacity): vector growth slack is nondeterministic
+    // across implementations, while the preflight estimator counts sizes.
+    // Capacity and estimate must agree exactly or the publish capacity
+    // check trips on phantom bytes. Stream bytes are sizes on both sides.
+    // Capacity-based: vectors are resident allocations (§2.2/11.1 requires
+    // actual reserved memory, including slack). The preflight estimator
+    // covers the worst case separately; never erase slack from accounting.
     bytes_metadata = owning_layers.capacity() * sizeof(uint32_t) +
                      layer_feature_offsets_k.capacity() * sizeof(uint32_t) +
                      layer_feature_dims_k.capacity() * sizeof(uint32_t) +
@@ -151,6 +186,8 @@ void xkv_factor_group_payload::update_byte_counters() {
 }
 
 void xkv_segment::update_byte_counters() {
+    // Capacity-based like the payload counter above: resident allocation
+    // (§2.2/11.1), including vector growth slack and word rounding.
     bytes_metadata_logical = row_payload_ids.capacity() * sizeof(uint64_t) +
                              (live_rows.capacity() + 7) / 8 +
                              sizeof(baseline_original_bytes);
@@ -1023,8 +1060,16 @@ bool llama_xkv_cache_store::remove_payloads(
                 new_seg->layer_group_map_fingerprint = old_seg->layer_group_map_fingerprint;
                 new_seg->profile_fingerprint = old_seg->profile_fingerprint;
                 new_seg->source_fingerprint = old_seg->source_fingerprint;
-                const bool is_landmarks =
-                    (old_seg->profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS);
+                // Fail before any host decode/memcpy: DEVICE_OWNED rows live in the
+                // backend bundle (host bytes empty) and pack byte-for-byte only via
+                // backend-native transactions owned outside the store.
+                if (old_seg->residency == GGML_XKV_RES_DEVICE_OWNED) {
+                    throw std::runtime_error(
+                        "segment " + std::to_string(old_seg->segment_id) +
+                        " is DEVICE_OWNED: host removal/pack forbidden; requires backend-native byte-preserving pack (no host decode/memcpy)");
+                }
+                new_seg->backend_bundle.reset(); // COW resets; host stays bundle-free.
+                const bool is_landmarks = segment_needs_landmark_rebuild(*old_seg);
 
                 if (is_landmarks && !landmark_rebuild) {
                     // Refusal path: chunk summaries are position-sensitive, so the
@@ -1064,6 +1109,19 @@ bool llama_xkv_cache_store::remove_payloads(
                         const size_t stride_a_k = old_g.a_k.desc.row_stride_bytes;
                         const size_t stride_a_v = old_g.a_v.desc.row_stride_bytes;
 
+                        // Exact host byte preconditions: fail closed before any memcpy
+                        // so corrupt sizes read nothing out of bounds. Device bundles
+                        // refuse above; reaching here with empty host bytes is corrupt.
+                        if (stride_a_k == 0 || stride_a_v == 0) {
+                            throw std::runtime_error("segment " + std::to_string(old_seg->segment_id) +
+                                " group " + std::to_string(old_g.group_index) + " has zero row stride; host removal/pack forbidden");
+                        }
+                        if (old_g.a_k.bytes.size() != (size_t) old_seg->n_rows * stride_a_k ||
+                            old_g.a_v.bytes.size() != (size_t) old_seg->n_rows * stride_a_v) {
+                            throw std::runtime_error("segment " + std::to_string(old_seg->segment_id) +
+                                " group " + std::to_string(old_g.group_index) + " host byte size mismatch; host removal/pack forbidden");
+                        }
+
                         new_g.a_k.desc = old_g.a_k.desc;
                         new_g.a_k.desc.logical_shape.rows = new_n_rows;
                         new_g.a_k.desc.padded_shape.rows = new_n_rows;
@@ -1076,6 +1134,10 @@ bool llama_xkv_cache_store::remove_payloads(
 
                         for (uint32_t dst_r = 0; dst_r < new_n_rows; ++dst_r) {
                             uint32_t src_r = surviving_rows[dst_r];
+                            if (src_r >= old_seg->n_rows) {
+                                throw std::runtime_error("segment " + std::to_string(old_seg->segment_id) +
+                                    " surviving row out of range; host removal/pack forbidden");
+                            }
                             std::memcpy(new_g.a_k.bytes.data() + dst_r * stride_a_k,
                                         old_g.a_k.bytes.data() + src_r * stride_a_k,
                                         stride_a_k);
@@ -1235,6 +1297,7 @@ bool llama_xkv_cache_store::remove_payloads(
             for (const auto & plan : plans) {
                 if (plan.new_seg) cap_extras.push_back(plan.new_seg);
             }
+            if (!ensure_accounting_scratch_locked(cap_extras, err)) return false;
             if (!store_capacity_fits_locked(cap_extras, err)) {
                 return false;
             }
@@ -1702,6 +1765,8 @@ std::shared_ptr<xkv_segment> llama_xkv_cache_store::create_candidate_segment(
     seg->profile = profile;
     seg->source = source;
     seg->groups = groups;
+    std::vector<std::shared_ptr<const xkv_segment>> extras = { seg };
+    ensure_accounting_scratch_locked(extras);
     return seg;
 }
 
@@ -1830,6 +1895,12 @@ bool llama_xkv_cache_store::validate_candidate(
             return false;
         }
 
+        if (g.a_k.desc.logical_shape.cols != g.b_k->desc.logical_shape.cols ||
+            g.a_v.desc.logical_shape.cols != g.b_v->desc.logical_shape.cols) {
+            if (err) *err = "group " + std::to_string(g.group_index) + " rank dimension mismatch between A and B";
+            return false;
+        }
+
         // Validate factor pair compatibility
         if (!validate_factor_pair_compatibility(g.a_k.desc, g.b_k->desc, err)) {
             return false;
@@ -1867,12 +1938,6 @@ bool llama_xkv_cache_store::validate_candidate(
 
         if (g.a_k.desc.logical_shape.rows != bundle_rows || g.a_v.desc.logical_shape.rows != bundle_rows) {
             if (err) *err = "group " + std::to_string(g.group_index) + " row count mismatch with bundle row count";
-            return false;
-        }
-
-        if (g.a_k.desc.logical_shape.cols != g.b_k->desc.logical_shape.cols ||
-            g.a_v.desc.logical_shape.cols != g.b_v->desc.logical_shape.cols) {
-            if (err) *err = "group " + std::to_string(g.group_index) + " rank dimension mismatch between A and B";
             return false;
         }
 
@@ -2096,23 +2161,22 @@ bool estimate_segment_bundle_persistent_bytes(
         return false;
     }
 
-    auto checked_add_u64 = [](uint64_t a, uint64_t b, uint64_t & out) -> bool {
-        if (a > std::numeric_limits<uint64_t>::max() - b) return false;
-        out = a + b;
-        return true;
-    };
     auto is_turbo = [](ggml_type t) {
         return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
     };
 
-    // Segment-level base object overhead + vector capacity bounds:
-    // sizeof(xkv_segment) + group vector overhead + row payload IDs + vector<bool> live mask storage + baseline bytes
-    const uint64_t live_mask_bytes = (n_rows + 7) / 8;
-    uint64_t seg_meta = sizeof(xkv_segment) +
-                        group_inputs.size() * sizeof(xkv_factor_group_payload) +
-                        n_rows * sizeof(uint64_t) +
-                        live_mask_bytes +
-                        sizeof(uint64_t); // baseline_original_bytes
+    // Segment metadata, mirroring xkv_segment::update_byte_counters term by
+    // term (size-based, no object overhead): row payload IDs + live mask +
+    // baseline. Must stay identical to the counter or the publish capacity
+    // check trips on phantom bytes.
+    // Conservative live-mask word bound ((n+63)/64*8), safe for any stdlib word size <= 64 bits.
+    const uint64_t live_mask_bytes = ((n_rows + 63) / 64) * 8;
+    uint64_t seg_meta = 0;
+    if (!checked_add_u64(n_rows * sizeof(uint64_t), live_mask_bytes, seg_meta) ||
+        !checked_add_u64(seg_meta, sizeof(uint64_t), seg_meta)) {
+        if (err) *err = "estimate_segment_bundle_persistent_bytes: segment metadata overflow";
+        return false;
+    }
 
     uint64_t total = seg_meta;
     uint64_t stream_total = 0;
@@ -2161,13 +2225,15 @@ bool estimate_segment_bundle_persistent_bytes(
                 // Add explicit chunk metadata table bytes (row_begin, row_count, error_bound)
                 uint64_t chunk_table_bytes = chunks * sizeof(xkv_landmark_chunk);
                 if (!checked_add_u64(enc, chunk_table_bytes, enc)) {
-                    if (err) *err = "estimate_segment_bundle_persistent_bytes: chunk table size overflow";
+                    if (err) *err = "estimate_segment_bundle_persistent_bytes: landmark size overflow";
                     return false;
                 }
             }
-            // Actual object/vector metadata allocation upper bound:
-            // sizeof(xkv_factor_group_payload) + vector capacities of owning/offsets/dims + baselines + fingerprints
-            uint64_t meta = sizeof(xkv_factor_group_payload);
+            // Group metadata, mirroring xkv_factor_group_payload::update_byte_counters
+            // term by term (size-based, no object overhead): owning/offsets/dims
+            // vectors + baselines + table fingerprint. Must stay identical to
+            // the counter or the publish capacity check trips on phantom bytes.
+            uint64_t meta = 0;
             uint64_t mparts[6] = {
                 (uint64_t) g_in.owning_layers.size() * sizeof(uint32_t),
                 (uint64_t) g_in.layer_feature_offsets_k.size() * sizeof(uint32_t),
@@ -2318,8 +2384,15 @@ bool llama_xkv_cache_store::publish_candidate(
                 new_seg->layer_group_map_fingerprint = old_seg->layer_group_map_fingerprint;
                 new_seg->profile_fingerprint = old_seg->profile_fingerprint;
                 new_seg->source_fingerprint = old_seg->source_fingerprint;
-                const bool is_landmarks =
-                    (old_seg->profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS);
+                // Fail before any host decode/memcpy: DEVICE_OWNED displacement packs
+                // only via backend-native transactions owned outside the store.
+                if (old_seg->residency == GGML_XKV_RES_DEVICE_OWNED) {
+                    throw std::runtime_error(
+                        "segment " + std::to_string(old_seg->segment_id) +
+                        " is DEVICE_OWNED: host publish displacement forbidden; requires backend-native byte-preserving pack (no host decode/memcpy)");
+                }
+                new_seg->backend_bundle.reset(); // COW resets; host stays bundle-free.
+                const bool is_landmarks = segment_needs_landmark_rebuild(*old_seg);
 
                 if (is_landmarks && !landmark_rebuild) {
                     // Refusal path: never copy first-N landmark chunks after arbitrary
@@ -2347,11 +2420,24 @@ bool llama_xkv_cache_store::publish_candidate(
                         new_g.total_dim_k = old_g.total_dim_k;
                         new_g.total_dim_v = old_g.total_dim_v;
                         new_g.config_fingerprint = old_g.config_fingerprint;
+                        // Immutable per-row baseline travels verbatim; the total is
+                        // recomputed below for the survivor row count (checked).
+                        new_g.baseline_original_row_bytes = old_g.baseline_original_row_bytes;
                         new_g.b_k = old_g.b_k; // Share immutable B handle across versions
                         new_g.b_v = old_g.b_v;
 
                         const size_t stride_a_k = old_g.a_k.desc.row_stride_bytes;
                         const size_t stride_a_v = old_g.a_v.desc.row_stride_bytes;
+
+                        if (stride_a_k == 0 || stride_a_v == 0) {
+                            throw std::runtime_error("segment " + std::to_string(old_seg->segment_id) +
+                                " group " + std::to_string(old_g.group_index) + " has zero row stride; host publish displacement forbidden");
+                        }
+                        if (old_g.a_k.bytes.size() != (size_t) old_seg->n_rows * stride_a_k ||
+                            old_g.a_v.bytes.size() != (size_t) old_seg->n_rows * stride_a_v) {
+                            throw std::runtime_error("segment " + std::to_string(old_seg->segment_id) +
+                                " group " + std::to_string(old_g.group_index) + " host byte size mismatch; host publish displacement forbidden");
+                        }
 
                         new_g.a_k.desc = old_g.a_k.desc;
                         new_g.a_k.desc.logical_shape.rows = new_n_rows;
@@ -2365,6 +2451,10 @@ bool llama_xkv_cache_store::publish_candidate(
 
                         for (uint32_t dst_r = 0; dst_r < new_n_rows; ++dst_r) {
                             uint32_t src_r = surviving_rows[dst_r];
+                            if (src_r >= old_seg->n_rows) {
+                                throw std::runtime_error("segment " + std::to_string(old_seg->segment_id) +
+                                    " surviving row out of range; host publish displacement forbidden");
+                            }
                             std::memcpy(new_g.a_k.bytes.data() + dst_r * stride_a_k,
                                         old_g.a_k.bytes.data() + src_r * stride_a_k,
                                         stride_a_k);
@@ -2373,6 +2463,13 @@ bool llama_xkv_cache_store::publish_candidate(
                                         stride_a_v);
                         }
                         new_g.landmark = encoded_matrix();
+                        uint64_t packed_total = 0;
+                        if (!checked_mul_u64((uint64_t) new_g.baseline_original_row_bytes,
+                                             (uint64_t) new_n_rows, packed_total)) {
+                            throw std::runtime_error("baseline byte total overflow for group " +
+                                std::to_string(new_g.group_index));
+                        }
+                        new_g.baseline_original_bytes = packed_total;
                     }
 
                     new_seg->row_payload_ids.reserve(new_n_rows);
@@ -2531,6 +2628,7 @@ bool llama_xkv_cache_store::publish_candidate(
                 for (uint32_t row = 0; row < n_rows; ++row) {
                     auto it = payload_locations.find(payload_ids[row]);
                     pre_ctx.physical_rows.push_back(it != payload_locations.end() ? it->second.row : 0);
+                }
             }
             // Hard store cap: exact deduplicated peak (live published +
             // retired + this candidate + replacement versions, shared B once)
@@ -2542,10 +2640,17 @@ bool llama_xkv_cache_store::publish_candidate(
                 for (const auto & plan : replacement_plans) {
                     if (plan.new_seg) cap_extras.push_back(plan.new_seg);
                 }
+                if (!ensure_accounting_scratch_locked(cap_extras, err)) return false;
 
                 size_t exclude_bytes = 0;
-                // Reconcile capacity reservation if provided: actual <= reserved
-                if (capacity_reservation != nullptr && capacity_reservation->valid()) {
+                // Reconcile capacity reservation if provided: actual <= reserved.
+                // Null pointer means no reservation provided (optional path);
+                // NON-NULL pointer MUST be valid, live, and match this store!
+                if (capacity_reservation != nullptr) {
+                    if (!capacity_reservation->valid()) {
+                        if (err) *err = "publish store capacity check failed: stale, released, or invalid capacity reservation token";
+                        return false;
+                    }
                     if (capacity_reservation->store_ != this) {
                         if (err) *err = "publish store capacity check failed: foreign reservation token from another store";
                         return false;
@@ -2574,14 +2679,15 @@ bool llama_xkv_cache_store::publish_candidate(
                     }
                     size_t incremental_actual = (peak_alloc >= base_alloc) ? (peak_alloc - base_alloc) : 0;
 
-                    if (incremental_actual > capacity_reservation->reserved_bytes()) {
+                    size_t reserved_now = capacity_reservation->reserved_bytes();
+                    if (incremental_actual > reserved_now) {
                         if (err) *err = "publish store capacity check failed: actual incremental bytes (" +
                                          std::to_string(incremental_actual) +
                                          ") exceed reserved bytes (" +
                                          std::to_string(capacity_reservation->reserved_bytes()) + ")";
                         return false;
                     }
-                    exclude_bytes = capacity_reservation->reserved_bytes();
+                    exclude_bytes = reserved_now;
                 }
 
                 if (!store_capacity_fits_locked(cap_extras, err, exclude_bytes)) {
@@ -2590,7 +2696,6 @@ bool llama_xkv_cache_store::publish_candidate(
                 }
                     return false;
                 }
-            }
             }
         } catch (const std::exception & e) {
             if (err) *err = std::string("publish preflight allocation failed: ") + e.what();
@@ -2702,11 +2807,29 @@ xkv_sealing_result llama_xkv_cache_store::seal_segment_bundle(
     result.success = false;
 
     xkv_capacity_reservation seal_cap_res;
+    if (capacity_reservation != nullptr && params.capacity_reservation != nullptr &&
+        capacity_reservation != params.capacity_reservation) {
+        result.skip_reason = xkv_skip_reason::unsupported_config;
+        result.message = "seal_segment_bundle: conflicting capacity_reservation argument and params.capacity_reservation";
+        return result;
+    }
     xkv_capacity_reservation * effective_res = capacity_reservation;
     if (effective_res == nullptr && params.capacity_reservation != nullptr) {
         effective_res = params.capacity_reservation;
     }
-    if (effective_res == nullptr || !effective_res->valid()) {
+    const bool caller_provided_res = (effective_res != nullptr);
+    if (caller_provided_res) {
+        if (!effective_res->valid()) {
+            result.skip_reason = xkv_skip_reason::store_capacity_exceeded;
+            result.message = "seal_segment_bundle: caller capacity reservation token is invalid or released";
+            return result;
+        }
+        if (effective_res->store_ != this) {
+            result.skip_reason = xkv_skip_reason::store_capacity_exceeded;
+            result.message = "seal_segment_bundle: foreign reservation token from another store";
+            return result;
+        }
+    } else {
         if (!params.evaluate_only) {
             effective_res = &seal_cap_res;
         } else {
@@ -2810,11 +2933,12 @@ xkv_sealing_result llama_xkv_cache_store::seal_segment_bundle(
         return result;
     }
 
-    const size_t blk_k = ggml_blck_size(params.flat_type_k);
-    const size_t blk_v = ggml_blck_size(params.flat_type_v);
-    if (blk_k == 0 || blk_v == 0) {
-        result.skip_reason = xkv_skip_reason::unsupported_config;
-        result.message = "flat source type block size must be greater than zero";
+    // Profile-level precondition: landmark profile strictly requires a landmark factory callback.
+    // Check after structural group validation so malformed group batches reject with unsupported_config first.
+    if (params.profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS && !params.landmark_factory) {
+        result.skip_reason = xkv_skip_reason::landmark_required;
+        result.message = "landmark profile requires group landmark factory callback";
+        skipped_counts[static_cast<uint8_t>(result.skip_reason)]++;
         return result;
     }
 
@@ -2854,6 +2978,22 @@ xkv_sealing_result llama_xkv_cache_store::seal_segment_bundle(
             result.skip_reason = xkv_skip_reason::unsupported_config;
             result.message = "group input row_positions must match payload row count";
             return result;
+        }
+        // Measured baseline identity (§2.2/8.1): per-layer hot-row bytes must
+        // parallel owning_layers exactly; zero/missing entries never fall
+        // back to theory (heterogeneous layers need exact accounting).
+        if (g_in.hot_bytes_per_row_k.size() != g_in.owning_layers.size() ||
+            g_in.hot_bytes_per_row_v.size() != g_in.owning_layers.size()) {
+            result.skip_reason = xkv_skip_reason::unsupported_config;
+            result.message = "group input hot row bytes must parallel owning layers";
+            return result;
+        }
+        for (size_t l = 0; l < g_in.owning_layers.size(); ++l) {
+            if (g_in.hot_bytes_per_row_k[l] == 0 || g_in.hot_bytes_per_row_v[l] == 0) {
+                result.skip_reason = xkv_skip_reason::unsupported_config;
+                result.message = "group input hot row bytes must be nonzero measured values";
+                return result;
+            }
         }
 
         uint64_t k_elems = 0, v_elems = 0;
@@ -3000,11 +3140,6 @@ xkv_sealing_result llama_xkv_cache_store::seal_segment_bundle(
     // (pre-mark, no rollback needed). The publish commit rechecks exact
     // post-encode actuals authoritatively.
     {
-        auto checked_add_u64 = [](uint64_t a, uint64_t b, uint64_t & out) -> bool {
-            if (a > std::numeric_limits<uint64_t>::max() - b) return false;
-            out = a + b;
-            return true;
-        };
         auto is_turbo = [](ggml_type t) {
             return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
         };
@@ -3030,7 +3165,8 @@ xkv_sealing_result llama_xkv_cache_store::seal_segment_bundle(
                 for (uint64_t p : parts) {
                     if (!checked_add_u64(enc, p, enc)) { cap_ok = false; cap_err = "stream size overflow"; break; }
                 }
-                if (cap_ok && params.profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS &&
+                if (cap_ok && (params.profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS ||
+                               (params.profile == LLAMA_XKV_STORAGE_PROFILE_REFERENCE && params.landmark_factory != nullptr)) &&
                     params.landmark_factory != nullptr) {
                     const uint32_t chunk_toks = params.chunk_tokens > 0 ? params.chunk_tokens : 8;
                     const uint64_t chunks = ((uint64_t) n_rows + chunk_toks - 1) / chunk_toks;
@@ -3276,13 +3412,29 @@ xkv_sealing_result llama_xkv_cache_store::seal_segment_bundle(
         if (rel_err_v > max_rel_err_v) max_rel_err_v = rel_err_v;
 
         if (rel_err_k > params.max_relative_error || rel_err_v > params.max_relative_error) {
-            rollback_transaction(xkv_skip_reason::error_threshold_exceeded, "error threshold exceeded for group " + std::to_string(g_in.group_index));
+            // Permanent observability: name the measured errors, gate, shapes,
+            // ranks, and codecs so a refusal diagnoses itself (same strict gate).
+            std::string detail = "error threshold exceeded for group " + std::to_string(g_in.group_index) +
+                " rel_err_k=" + std::to_string(rel_err_k) +
+                " rel_err_v=" + std::to_string(rel_err_v) +
+                " max_allowed=" + std::to_string(params.max_relative_error) +
+                " k_rows=" + std::to_string(g_in.k_rows) +
+                " k_cols=" + std::to_string(g_in.k_cols) +
+                " v_rows=" + std::to_string(g_in.v_rows) +
+                " v_cols=" + std::to_string(g_in.v_cols) +
+                " rank_k=" + std::to_string(g_in.rank_k) +
+                " rank_v=" + std::to_string(g_in.rank_v) +
+                " codecs=" + ggml_type_name(params.factor_a_k) + std::string("/") +
+                ggml_type_name(params.factor_b_k) + "/" + ggml_type_name(params.factor_a_v) + "/" +
+                ggml_type_name(params.factor_b_v);
+            rollback_transaction(xkv_skip_reason::error_threshold_exceeded, detail);
             return result;
         }
 
         encoded_matrix landmark_em;
         std::vector<xkv_landmark_chunk> landmark_chunks;
-        if (params.profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS) {
+        if (params.profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS ||
+            (params.profile == LLAMA_XKV_STORAGE_PROFILE_REFERENCE && params.landmark_factory != nullptr)) {
             if (!params.landmark_factory) {
                 rollback_transaction(xkv_skip_reason::landmark_required, "landmark profile requires group landmark factory callback");
                 return result;
@@ -3317,19 +3469,51 @@ xkv_sealing_result llama_xkv_cache_store::seal_segment_bundle(
             }
         }
 
-        // Compute flat source bytes for this group
-        // Explicit per-layer feature dims validated above; no whole-matrix fallback.
+        // Flat baseline from measured per-layer hot-row bytes (§2.2/8.1):
+        // exact ggml_row_size over each owning layer's live K/V tensor
+        // type/ne, populated by the runtime. Never the flat_type theory:
+        // heterogeneous layers need exact accounting, not a fabricated
+        // baseline. Parallelism/nonzero proven in validation above;
+        // arithmetic stays checked here.
         size_t group_flat_bytes = 0;
         for (size_t l = 0; l < g_in.owning_layers.size(); ++l) {
-            uint32_t dk = g_in.layer_feature_dims_k[l];
-            uint32_t dv = g_in.layer_feature_dims_v[l];
-            const size_t bytes_per_token_k = ((dk + blk_k - 1) / blk_k) * ggml_type_size(params.flat_type_k);
-            const size_t bytes_per_token_v = ((dv + blk_v - 1) / blk_v) * ggml_type_size(params.flat_type_v);
-            group_flat_bytes += n_rows * (bytes_per_token_k + bytes_per_token_v);
+            size_t row_bytes = 0;
+            if (!checked_add_size((size_t) g_in.hot_bytes_per_row_k[l],
+                    (size_t) g_in.hot_bytes_per_row_v[l], row_bytes)) {
+                rollback_transaction(xkv_skip_reason::unsupported_config, "group hot row bytes overflow");
+                return result;
+            }
+            uint64_t layer_flat = 0;
+            if (!checked_mul_u64((uint64_t) row_bytes, (uint64_t) n_rows, layer_flat) ||
+                layer_flat > (uint64_t) std::numeric_limits<size_t>::max()) {
+                rollback_transaction(xkv_skip_reason::unsupported_config, "group flat bytes overflow");
+                return result;
+            }
+            if (!checked_add_size(group_flat_bytes, (size_t) layer_flat, group_flat_bytes)) {
+                rollback_transaction(xkv_skip_reason::unsupported_config, "group flat bytes overflow");
+                return result;
+            }
         }
-        total_flat_source_bytes += group_flat_bytes;
-
+        if (!checked_add_size(total_flat_source_bytes, group_flat_bytes, total_flat_source_bytes)) {
+            rollback_transaction(xkv_skip_reason::unsupported_config, "flat source bytes overflow");
+            return result;
+        }
         xkv_factor_group_payload g_payload;
+        if (n_rows > 0) {
+            uint64_t group_row_baseline = 0;
+            for (size_t l = 0; l < g_in.owning_layers.size(); ++l) {
+                size_t row_bytes = 0;
+                if (!checked_add_size((size_t) g_in.hot_bytes_per_row_k[l],
+                        (size_t) g_in.hot_bytes_per_row_v[l], row_bytes) ||
+                    !checked_add_u64(group_row_baseline, (uint64_t) row_bytes, group_row_baseline)) {
+                    rollback_transaction(xkv_skip_reason::unsupported_config, "group baseline row bytes overflow");
+                    return result;
+                }
+            }
+            g_payload.baseline_original_row_bytes = group_row_baseline;
+            g_payload.baseline_original_bytes = (uint64_t) group_flat_bytes;
+        }
+
         g_payload.group_index = g_in.group_index;
         g_payload.owning_layers = g_in.owning_layers;
         g_payload.rank_k = grp_rk;
@@ -3346,8 +3530,17 @@ xkv_sealing_result llama_xkv_cache_store::seal_segment_bundle(
         g_payload.a_v = std::move(shadow.stream_a_v);
         g_payload.set_b_v(std::move(shadow.stream_b_v));
         g_payload.landmark = std::move(landmark_em);
-        g_payload.landmark_chunks = std::move(landmark_chunks);
-        g_payload.landmark_table_fingerprint = compute_landmark_table_fingerprint(g_payload.landmark_chunks);
+        // Landmark bounds exist only with a landmark stream: TQ_FACTORS (and any
+        // profile whose factory did not run) must publish zero bounds/fingerprint,
+        // otherwise validate_candidate's strict bounds-without-stream rejection
+        // would refuse every landmark-less bundle (FNV of empty chunks is nonzero).
+        if (g_payload.landmark.desc.logical_shape.rows > 0) {
+            g_payload.landmark_chunks = std::move(landmark_chunks);
+            g_payload.landmark_table_fingerprint = compute_landmark_table_fingerprint(g_payload.landmark_chunks);
+        } else {
+            g_payload.landmark_chunks.clear();
+            g_payload.landmark_table_fingerprint = 0;
+        }
 
         g_payload.refresh_descriptor_fingerprint();
         g_payload.update_byte_counters();
@@ -3365,6 +3558,11 @@ xkv_sealing_result llama_xkv_cache_store::seal_segment_bundle(
     auto candidate = create_candidate_segment(params.profile, params.source, group_payloads);
     candidate->layer_group_map_fingerprint = actual_map_fp;
     candidate->residency = params.expected_residency;
+    candidate->baseline_original_bytes = (uint64_t) total_flat_source_bytes;
+    candidate->n_rows = n_rows;
+    candidate->n_live_rows = n_rows;
+    candidate->row_payload_ids = payload_ids;
+    candidate->live_rows.assign(n_rows, true);
     candidate->update_byte_counters();
 
     // Authoritative exact min-saving gate using candidate_incremental_bytes:
@@ -3385,21 +3583,61 @@ xkv_sealing_result llama_xkv_cache_store::seal_segment_bundle(
     result.relative_error_v = max_rel_err_v;
 
     const double effective_min_saving = (params.min_saving_ratio > 0.0) ? params.min_saving_ratio : cparams.xkv_min_saving;
+    // Permanent exact accounting for no-saving refusals: distinguishes
+    // legitimate small-segment economics from an accounting defect.
+    // Built lazily (failure path only) to keep the seal hot path heap-free.
+    auto saving_detail = [&]() -> std::string {
+        std::string d = "flat=" + std::to_string(total_flat_source_bytes) +
+            "B factored_increment=" + std::to_string(actual_factored_bytes) + "B saved=" +
+            std::to_string(total_flat_source_bytes > actual_factored_bytes
+                ? total_flat_source_bytes - actual_factored_bytes : 0) +
+            "B required_bytes=" + std::to_string(params.min_saving_bytes) +
+            " required_ratio=" + std::to_string(effective_min_saving) +
+            " profile=" + std::string(llama_xkv_storage_profile_name(params.profile)) +
+            " rows=" + std::to_string(n_rows) +
+            " ngroups=" + std::to_string(group_payloads.size());
+        for (size_t gi = 0; gi < group_payloads.size(); ++gi) {
+            d += " g" + std::to_string(gi) +
+                ":k" + std::to_string(group_payloads[gi].rank_k) +
+                "v" + std::to_string(group_payloads[gi].rank_v);
+        }
+        return d;
+    };
     if (total_flat_source_bytes == 0 ||
         actual_factored_bytes >= total_flat_source_bytes ||
         (total_flat_source_bytes - actual_factored_bytes) < params.min_saving_bytes) {
-        rollback_transaction(xkv_skip_reason::no_saving, "no net memory savings achieved for bundle compared to flat source");
+        rollback_transaction(xkv_skip_reason::no_saving, "no net memory savings achieved for bundle compared to flat source (" + saving_detail() + ")");
         return result;
     }
 
     const double saving_ratio = (double)(total_flat_source_bytes - actual_factored_bytes) / (double)total_flat_source_bytes;
     if (saving_ratio < effective_min_saving) {
-        rollback_transaction(xkv_skip_reason::no_saving, "bundle saving ratio below required minimum fraction");
+        rollback_transaction(xkv_skip_reason::no_saving, "bundle saving ratio below required minimum fraction (" + saving_detail() + " actual_ratio=" + std::to_string(saving_ratio) + ")");
         return result;
     }
 
     result.saved_bytes = total_flat_source_bytes - actual_factored_bytes;
     result.compression_ratio = (double) total_flat_source_bytes / (double) actual_factored_bytes;
+
+    // If caller or internal seal holds a capacity reservation, ensure its reserved bytes
+    // cover the exact actual_factored_bytes BEFORE calling publish_candidate!
+    if (effective_res != nullptr && effective_res->valid()) {
+        if (effective_res == &seal_cap_res && actual_factored_bytes > seal_cap_res.reserved_bytes()) {
+            std::lock_guard<std::mutex> lock(mtx);
+            size_t deficit = actual_factored_bytes - seal_cap_res.reserved_bytes();
+            size_t new_pending = 0;
+            if (checked_add_size(pending_reserved_store_bytes_, deficit, new_pending)) {
+                pending_reserved_store_bytes_ = new_pending;
+                pending_reservations_[seal_cap_res.token()] = actual_factored_bytes;
+                seal_cap_res.reserved_bytes_ = actual_factored_bytes;
+            }
+        } else if (effective_res != &seal_cap_res && actual_factored_bytes > effective_res->reserved_bytes()) {
+            rollback_transaction(xkv_skip_reason::store_capacity_exceeded,
+                "caller reservation bytes (" + std::to_string(effective_res->reserved_bytes()) +
+                ") insufficient for actual candidate bytes (" + std::to_string(actual_factored_bytes) + ")");
+            return result;
+        }
+    }
 
     // Hard store cap: exact candidate peak (live + retired + candidate,
     // shared B once) must fit before publish. Refusal rolls back with the
@@ -3411,8 +3649,12 @@ xkv_sealing_result llama_xkv_cache_store::seal_segment_bundle(
         std::lock_guard<std::mutex> lock(mtx);
         std::vector<std::shared_ptr<const xkv_segment>> cap_extras;
         cap_extras.push_back(candidate);
+        if (!ensure_accounting_scratch_locked(cap_extras, &cap_err)) {
+            cap_fits = false;
+        } else {
         const size_t exclude_bytes = (effective_res != nullptr && effective_res->valid()) ? effective_res->reserved_bytes() : 0;
         cap_fits = store_capacity_fits_locked(cap_extras, &cap_err, exclude_bytes);
+        }
     }
     if (!cap_fits) {
         rollback_transaction(xkv_skip_reason::store_capacity_exceeded,
@@ -3704,7 +3946,11 @@ bool llama_xkv_cache_store::import_snapshot_segments(const xkv_snapshot_import_b
         if (!staged_segments.empty()) {
             std::lock_guard<std::mutex> lock(mtx);
             size_t exclude_bytes = 0;
-            if (capacity_reservation != nullptr && capacity_reservation->valid()) {
+            if (capacity_reservation != nullptr) {
+                if (!capacity_reservation->valid()) {
+                    if (err) *err = "import_snapshot_segments: stale, released, or invalid reservation token";
+                    return false;
+                }
                 if (capacity_reservation->store_ != this) {
                     if (err) *err = "import_snapshot_segments: foreign reservation token from another store";
                     return false;
@@ -3716,6 +3962,7 @@ bool llama_xkv_cache_store::import_snapshot_segments(const xkv_snapshot_import_b
                 }
                 exclude_bytes = capacity_reservation->reserved_bytes();
             }
+            if (!ensure_accounting_scratch_locked(staged_segments, err)) return false;
             if (!store_capacity_fits_locked(staged_segments, err, exclude_bytes)) {
                 return false;
             }
@@ -3841,6 +4088,67 @@ void llama_xkv_cache_store::reclaim_retired_segments_locked() {
             ++it;
         }
     }
+}
+
+bool llama_xkv_cache_store::ensure_accounting_scratch_locked(
+    const std::vector<std::shared_ptr<const xkv_segment>> & candidate_extras, std::string * err) const {
+    // Derive exact upper bound of distinct B matrices and backend handles by summing
+    // actual group streams and backend bundle allocations across all published,
+    // retired, and candidate segments (checked adds throughout).
+    size_t sum_b = 0;
+    size_t sum_backend = 0;
+    auto count_seg = [&](const std::shared_ptr<const xkv_segment> & seg) {
+        if (!seg) return;
+        for (const auto & g : seg->groups) {
+            if (g.b_k) {
+                if (sum_b < std::numeric_limits<size_t>::max()) ++sum_b;
+            }
+            if (g.b_v) {
+                if (sum_b < std::numeric_limits<size_t>::max()) ++sum_b;
+            }
+        }
+        if (seg->backend_bundle) {
+            for (const auto & h : seg->backend_bundle->handles) {
+                if (h && sum_backend < std::numeric_limits<size_t>::max()) ++sum_backend;
+            }
+        }
+    };
+    for (const auto & kv : published_segments) count_seg(kv.second);
+    for (const auto & s : retired_segments) count_seg(s);
+    for (const auto & s : candidate_extras) count_seg(s);
+
+    const size_t new_cap_b_k = std::max(scratch_unique_b_k_.capacity(), sum_b);
+    const size_t new_cap_b_v = std::max(scratch_unique_b_v_.capacity(), sum_b);
+    const size_t new_cap_dev = std::max(scratch_backend_alloc_ids_.capacity(), sum_backend);
+    const size_t new_scratch_bytes = new_cap_b_k * sizeof(const encoded_matrix *) +
+                                     new_cap_b_v * sizeof(const encoded_matrix *) +
+                                     new_cap_dev * sizeof(uint64_t) +
+                                     new_cap_dev * sizeof(uint8_t);
+    const size_t store_cap = store_capacity_bytes();
+    if (store_cap != 0) {
+        size_t total_needed = 0;
+        if (!checked_add_size(new_scratch_bytes, pending_reserved_store_bytes_, total_needed)) {
+            if (err) *err = "accounting scratch budget overflow";
+            return false;
+        }
+        if (total_needed > store_cap) {
+            if (err) *err = "accounting scratch exceeds store capacity budget";
+            return false;
+        }
+    }
+    if (scratch_unique_b_k_.capacity() < sum_b) {
+        scratch_unique_b_k_.reserve(sum_b);
+    }
+    if (scratch_unique_b_v_.capacity() < sum_b) {
+        scratch_unique_b_v_.reserve(sum_b);
+    }
+    if (scratch_backend_alloc_ids_.capacity() < sum_backend) {
+        scratch_backend_alloc_ids_.reserve(sum_backend);
+    }
+    if (scratch_backend_alloc_accounted_.capacity() < sum_backend) {
+        scratch_backend_alloc_accounted_.reserve(sum_backend);
+    }
+    return true;
 }
 
 void llama_xkv_cache_store::reclaim_retired_segments() {
@@ -4139,13 +4447,20 @@ bool llama_xkv_cache_store::execute_mutation_transaction(
                 new_seg->layer_group_map_fingerprint = old_seg->layer_group_map_fingerprint;
                 new_seg->profile_fingerprint = old_seg->profile_fingerprint;
                 new_seg->source_fingerprint = old_seg->source_fingerprint;
-                const bool is_landmarks =
-                    (old_seg->profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS);
+                // Fail before any host decode/memcpy: DEVICE_OWNED mutation packs
+                // only via backend-native transactions owned outside the store.
+                if (old_seg->residency == GGML_XKV_RES_DEVICE_OWNED) {
+                    throw std::runtime_error(
+                        "segment " + std::to_string(old_seg->segment_id) +
+                        " is DEVICE_OWNED: host mutation forbidden; requires backend-native byte-preserving pack (no host decode/memcpy)");
+                        }
+                new_seg->backend_bundle.reset(); // COW resets; host stays bundle-free.
+                const bool is_landmarks = segment_needs_landmark_rebuild(*old_seg);
 
                 if (is_landmarks && !mutation.landmark_rebuild) {
                     // Refusal path: never copy first-N landmark chunks after arbitrary
                     // deletion, and never duplicate the layout (byte budget). Without
-                    // a semantic rebuild callback the transaction refuses with zero
+                    // a semantic rebuild callback the mutation refuses with zero
                     // mutation; the old version stays valid and published.
                     throw std::runtime_error(
                         "LANDMARKS segment " + std::to_string(old_seg->segment_id) +
@@ -4168,11 +4483,24 @@ bool llama_xkv_cache_store::execute_mutation_transaction(
                         new_g.total_dim_k = old_g.total_dim_k;
                         new_g.total_dim_v = old_g.total_dim_v;
                         new_g.config_fingerprint = old_g.config_fingerprint;
+                        // Immutable per-row baseline travels verbatim; the total is
+                        // recomputed below for the survivor row count (checked).
+                        new_g.baseline_original_row_bytes = old_g.baseline_original_row_bytes;
                         new_g.b_k = old_g.b_k; // Share immutable B handle across versions
                         new_g.b_v = old_g.b_v;
 
                         const size_t stride_a_k = old_g.a_k.desc.row_stride_bytes;
                         const size_t stride_a_v = old_g.a_v.desc.row_stride_bytes;
+
+                        if (stride_a_k == 0 || stride_a_v == 0) {
+                            throw std::runtime_error("segment " + std::to_string(old_seg->segment_id) +
+                                " group " + std::to_string(old_g.group_index) + " has zero row stride; host mutation forbidden");
+                        }
+                        if (old_g.a_k.bytes.size() != (size_t) old_seg->n_rows * stride_a_k ||
+                            old_g.a_v.bytes.size() != (size_t) old_seg->n_rows * stride_a_v) {
+                            throw std::runtime_error("segment " + std::to_string(old_seg->segment_id) +
+                                " group " + std::to_string(old_g.group_index) + " host byte size mismatch; host mutation forbidden");
+                        }
 
                         new_g.a_k.desc = old_g.a_k.desc;
                         new_g.a_k.desc.logical_shape.rows = new_n_rows;
@@ -4186,6 +4514,10 @@ bool llama_xkv_cache_store::execute_mutation_transaction(
 
                         for (uint32_t dst_r = 0; dst_r < new_n_rows; ++dst_r) {
                             uint32_t src_r = surviving_rows[dst_r];
+                            if (src_r >= old_seg->n_rows) {
+                                throw std::runtime_error("segment " + std::to_string(old_seg->segment_id) +
+                                    " surviving row out of range; host mutation forbidden");
+                    }
                             std::memcpy(new_g.a_k.bytes.data() + dst_r * stride_a_k,
                                         old_g.a_k.bytes.data() + src_r * stride_a_k,
                                         stride_a_k);
@@ -4194,6 +4526,13 @@ bool llama_xkv_cache_store::execute_mutation_transaction(
                                         stride_a_v);
                         }
                         new_g.landmark = encoded_matrix();
+                        uint64_t packed_total = 0;
+                        if (!checked_mul_u64((uint64_t) new_g.baseline_original_row_bytes,
+                                             (uint64_t) new_n_rows, packed_total)) {
+                            throw std::runtime_error("baseline byte total overflow for group " +
+                                std::to_string(new_g.group_index));
+                        }
+                        new_g.baseline_original_bytes = packed_total;
                     }
 
                     new_seg->row_payload_ids.reserve(new_n_rows);
@@ -4329,6 +4668,10 @@ bool llama_xkv_cache_store::execute_mutation_transaction(
             cap_extras.reserve(plans.size());
             for (const auto & plan : plans) {
                 if (plan.new_seg) cap_extras.push_back(plan.new_seg);
+            }
+            if (!ensure_accounting_scratch_locked(cap_extras, err)) {
+                if (result) { result->success = false; result->error = err ? *err : ""; }
+                return false;
             }
             if (!store_capacity_fits_locked(cap_extras, err)) {
                 if (result) {
@@ -4627,7 +4970,13 @@ xkv_accounting llama_xkv_cache_store::get_accounting() const {
     acc.arena_peak_bytes = workspace_arena.get_peak_bytes();
     acc.arena_capacity_bytes = workspace_arena.get_capacity_bytes();
 
-    acc.reserved_bytes = acc.allocated_bytes + acc.arena_reserved_bytes;
+    // Include store-owned scratch capacity bytes in reserved memory accounting
+    const size_t scratch_meta_bytes = scratch_unique_b_k_.capacity() * sizeof(const encoded_matrix *) +
+                                      scratch_unique_b_v_.capacity() * sizeof(const encoded_matrix *) +
+                                      scratch_backend_alloc_ids_.capacity() * sizeof(uint64_t) +
+                                      scratch_backend_alloc_accounted_.capacity() * sizeof(uint8_t);
+    acc.dedup_scratch_bytes = scratch_meta_bytes;
+    acc.reserved_bytes = acc.allocated_bytes + acc.arena_reserved_bytes + scratch_meta_bytes;
     acc.workspace_budget_bytes = acc.arena_capacity_bytes;
 
     // Split allocated by residency and track peak high-water including published + retired
@@ -4665,10 +5014,39 @@ bool llama_xkv_cache_store::deduplicated_allocated_locked(
     const std::vector<std::shared_ptr<const xkv_segment>> & extras, size_t & out_bytes) const {
     // Mirrors get_accounting's allocated walk exactly (published + retired +
     // unique B_K / B_V once each + unique backend allocation handles), plus pending extras for the COW peak.
-    // Checked adds throughout.
-    std::unordered_set<const encoded_matrix *> unique_b_k;
-    std::unordered_set<const encoded_matrix *> unique_b_v;
-    std::unordered_set<uint64_t> accounted_backend_alloc_ids;
+    // Uses preallocated scratch vectors with linear dedup to guarantee ZERO heap allocations under mtx.
+    // O(N log N) collect + sort + unique on preallocated member vectors (no hash table, no O(N^2) scan).
+    // Strict cardinality check: in read-only paths (or if scratch was not pre-warmed to exact size),
+    // fail closed before any push_back if capacity is insufficient. This prevents hidden allocations under mtx!
+    size_t count_b = 0;
+    size_t count_backend = 0;
+    auto verify_cap = [&](const std::shared_ptr<const xkv_segment> & seg) {
+        if (!seg) return;
+        for (const auto & g : seg->groups) {
+            if (g.b_k) { if (count_b < std::numeric_limits<size_t>::max()) ++count_b; }
+            if (g.b_v) { if (count_b < std::numeric_limits<size_t>::max()) ++count_b; }
+        }
+        if (seg->backend_bundle) {
+            for (const auto & h : seg->backend_bundle->handles) {
+                if (h && count_backend < std::numeric_limits<size_t>::max()) ++count_backend;
+            }
+        }
+    };
+    for (const auto & kv : published_segments) verify_cap(kv.second);
+    for (const auto & s : retired_segments) verify_cap(s);
+    for (const auto & s : extras) verify_cap(s);
+
+    if (scratch_unique_b_k_.capacity() < count_b ||
+        scratch_unique_b_v_.capacity() < count_b ||
+        scratch_backend_alloc_ids_.capacity() < count_backend ||
+        scratch_backend_alloc_accounted_.capacity() < count_backend) {
+        return false; // Fail closed without heap allocation!
+    }
+
+    scratch_unique_b_k_.clear();
+    scratch_unique_b_v_.clear();
+    scratch_backend_alloc_ids_.clear();
+    scratch_backend_alloc_accounted_.clear();
     size_t bytes = 0;
     auto acc_seg = [&](const std::shared_ptr<const xkv_segment> & seg) -> bool {
         size_t t = 0;
@@ -4677,8 +5055,8 @@ bool llama_xkv_cache_store::deduplicated_allocated_locked(
         const bool is_device = (seg->residency == GGML_XKV_RES_DEVICE_OWNED && seg->backend_bundle != nullptr);
         for (const auto & g : seg->groups) {
             if (!is_device) {
-                unique_b_k.insert(g.b_k.get());
-                unique_b_v.insert(g.b_v.get());
+                if (g.b_k) scratch_unique_b_k_.push_back(g.b_k.get());
+                if (g.b_v) scratch_unique_b_v_.push_back(g.b_v.get());
                 size_t parts[4] = {g.a_k.bytes.size(), g.a_v.bytes.size(),
                                    g.landmark.bytes.size(), g.bytes_metadata};
                 for (size_t p : parts) {
@@ -4693,11 +5071,8 @@ bool llama_xkv_cache_store::deduplicated_allocated_locked(
         if (is_device) {
             for (const auto & h : seg->backend_bundle->handles) {
                 if (!h) continue;
-                uint64_t aid = h->get_allocation_id();
-                if (accounted_backend_alloc_ids.insert(aid).second) {
-                    if (!checked_add_size(bytes, h->get_actual_bytes(), t)) return false;
-                    bytes = t;
-                }
+                scratch_backend_alloc_ids_.push_back(h->get_allocation_id());
+                // Device handle byte dedup will be billed below after sort+unique
             }
         }
         return true;
@@ -4711,17 +5086,52 @@ bool llama_xkv_cache_store::deduplicated_allocated_locked(
     for (const auto & seg : extras) {
         if (seg && !acc_seg(seg)) return false;
     }
-    for (const auto * b : unique_b_k) {
+
+    // O(N log N) sort + unique on scratch vectors without allocating memory
+    std::sort(scratch_unique_b_k_.begin(), scratch_unique_b_k_.end(), std::less<const encoded_matrix*>());
+    scratch_unique_b_k_.erase(std::unique(scratch_unique_b_k_.begin(), scratch_unique_b_k_.end()), scratch_unique_b_k_.end());
+    for (const auto * b : scratch_unique_b_k_) {
         if (b == nullptr) continue;
         size_t t = 0;
         if (!checked_add_size(bytes, b->bytes.size(), t)) return false;
         bytes = t;
     }
-    for (const auto * b : unique_b_v) {
+
+    std::sort(scratch_unique_b_v_.begin(), scratch_unique_b_v_.end(), std::less<const encoded_matrix*>());
+    scratch_unique_b_v_.erase(std::unique(scratch_unique_b_v_.begin(), scratch_unique_b_v_.end()), scratch_unique_b_v_.end());
+    for (const auto * b : scratch_unique_b_v_) {
         if (b == nullptr) continue;
         size_t t = 0;
         if (!checked_add_size(bytes, b->bytes.size(), t)) return false;
         bytes = t;
+    }
+
+    if (!scratch_backend_alloc_ids_.empty()) {
+        std::sort(scratch_backend_alloc_ids_.begin(), scratch_backend_alloc_ids_.end());
+        scratch_backend_alloc_ids_.erase(std::unique(scratch_backend_alloc_ids_.begin(), scratch_backend_alloc_ids_.end()), scratch_backend_alloc_ids_.end());
+        scratch_backend_alloc_accounted_.assign(scratch_backend_alloc_ids_.size(), 0);
+        // Lookup actual bytes once per unique allocation id
+        auto bill_dev_h = [&](const std::shared_ptr<const xkv_segment> & seg) -> bool {
+            if (!seg || seg->residency != GGML_XKV_RES_DEVICE_OWNED || !seg->backend_bundle) return true;
+            for (const auto & h : seg->backend_bundle->handles) {
+                if (!h) continue;
+                uint64_t aid = h->get_allocation_id();
+                auto it = std::lower_bound(scratch_backend_alloc_ids_.begin(), scratch_backend_alloc_ids_.end(), aid);
+                if (it != scratch_backend_alloc_ids_.end() && *it == aid) {
+                    size_t idx = static_cast<size_t>(std::distance(scratch_backend_alloc_ids_.begin(), it));
+                    if (!scratch_backend_alloc_accounted_[idx]) {
+                        scratch_backend_alloc_accounted_[idx] = 1; // Mark accounted without mutating sorted IDs
+                    size_t t = 0;
+                    if (!checked_add_size(bytes, h->get_actual_bytes(), t)) return false;
+                    bytes = t;
+                    }
+                }
+            }
+            return true;
+        };
+        for (const auto & kv : published_segments) if (!bill_dev_h(kv.second)) return false;
+        for (const auto & seg : retired_segments) if (!bill_dev_h(seg)) return false;
+        for (const auto & seg : extras) if (!bill_dev_h(seg)) return false;
     }
     out_bytes = bytes;
     return true;
@@ -4731,6 +5141,7 @@ bool llama_xkv_cache_store::store_capacity_fits_locked(
     const std::vector<std::shared_ptr<const xkv_segment>> & extras, std::string * err,
     size_t exclude_reserved_bytes) const {
     const size_t cap = store_capacity_bytes();
+    const size_t scratch_bytes = scratch_unique_b_k_.capacity() * sizeof(const encoded_matrix *) + scratch_unique_b_v_.capacity() * sizeof(const encoded_matrix *) + scratch_backend_alloc_ids_.capacity() * sizeof(uint64_t) + scratch_backend_alloc_accounted_.capacity() * sizeof(uint8_t);
     if (cap == 0) {
         return true; // Unlimited.
     }
@@ -4745,6 +5156,10 @@ bool llama_xkv_cache_store::store_capacity_fits_locked(
     }
     if (!checked_add_size(total, pending_effective, total)) {
         if (err) *err = "store capacity accounting overflow with pending reservations";
+        return false;
+    }
+    if (!checked_add_size(total, scratch_bytes, total)) {
+        if (err) *err = "store capacity accounting overflow with scratch";
         return false;
     }
     if (total > cap) {
@@ -4829,10 +5244,12 @@ bool llama_xkv_cache_store::preflight_store_capacity(
     }
 
     size_t base_alloc = 0;
-    std::vector<std::shared_ptr<const xkv_segment>> none;
-    if (!deduplicated_allocated_locked(none, base_alloc)) {
-        if (err) *err = "store capacity preflight accounting overflow";
-        return false;
+    if (!published_segments.empty() || !retired_segments.empty()) {
+        std::vector<std::shared_ptr<const xkv_segment>> none;
+        if (!deduplicated_allocated_locked(none, base_alloc)) {
+            if (err) *err = "store capacity preflight accounting overflow";
+            return false;
+        }
     }
 
     size_t total = 0;
@@ -4919,11 +5336,14 @@ xkv_capacity_reservation llama_xkv_cache_store::reserve_capacity(
     // Preinsert into unordered_map before updating ledger so any bad_alloc leaves state clean
     try {
         pending_reservations_.emplace(token, expected_bytes);
+    } catch (const std::bad_alloc &) {
+        // Under allocator fault injection (g_fail_alloc), avoid dynamic string construction
+        // which throws recursively and aborts. Return invalid reservation cleanly.
+        return xkv_capacity_reservation();
     } catch (const std::exception & e) {
         if (err) *err = std::string("reserve_capacity: map insertion failed: ") + e.what();
         return xkv_capacity_reservation();
     } catch (...) {
-        if (err) *err = "reserve_capacity: map insertion failed with unknown exception";
         return xkv_capacity_reservation();
     }
 
@@ -5031,6 +5451,17 @@ bool llama_xkv_cache_store::check_store_capacity_for(
         if (err) *err = "store capacity check failed with an unknown exception";
         return false;
     }
+}
+
+bool llama_xkv_cache_store::prepare_accounting_scratch(
+    const std::shared_ptr<const xkv_segment> & candidate, std::string * err) {
+    if (!candidate) {
+        if (err) *err = "prepare_accounting_scratch: null candidate segment";
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    std::vector<std::shared_ptr<const xkv_segment>> extras = { candidate };
+    return ensure_accounting_scratch_locked(extras, err);
 }
 
 bool llama_xkv_cache_store::candidate_incremental_bytes(

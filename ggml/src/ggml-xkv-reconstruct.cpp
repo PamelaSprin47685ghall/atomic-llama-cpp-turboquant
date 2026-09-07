@@ -152,11 +152,21 @@ static bool xkv_check_types_shapes(const xkv_shapes & s, const ggml_xkv_reconstr
     if (pk <= 0 || pk_b <= 0 || pv <= 0 || pv_b <= 0) {
         xkv_err(err, n, "xkv: bad padded rank"); return false;
     }
-    if (pk != pk_b || pv != pv_b) {
+    // Pair width: matched pairs must share per-type padding; mixed
+    // Turbo+canonical pairs (CPU canonical decode) store the canonical side
+    // padded to the Turbo width so the shared prk dot loop stays in-bounds.
+    // The Vulkan support hook still rejects mixed pairs explicitly.
+    const bool k_mixed = (ak_t != bk_t), v_mixed = (av_t != bv_t);
+    if (!k_mixed && pk != pk_b) {
         xkv_err(err, n, "xkv: per-pair padded rank mismatch"); return false;
     }
-    if (s.a_k_n0 != pk || s.b_k_n0 != pk || s.a_v_n0 != pv || s.b_v_n0 != pv) {
-        xkv_err(err, n, "xkv: tensor ne0 != padded rank (bad layout)"); return false;
+    if (!v_mixed && pv != pv_b) {
+        xkv_err(err, n, "xkv: per-pair padded rank mismatch"); return false;
+    }
+    const int32_t pair_k = k_mixed ? (ak_t ? pk : pk_b) : pk;
+    const int32_t pair_v = v_mixed ? (av_t ? pv : pv_b) : pv;
+    if (s.a_k_n0 != pair_k || s.b_k_n0 != pair_k || s.a_v_n0 != pair_v || s.b_v_n0 != pair_v) {
+        xkv_err(err, n, "xkv: tensor ne0 != pair width (bad layout)"); return false;
     }
     if (s.refs_t != GGML_TYPE_I32 || s.refs_n0 != GGML_XKV_REF_STRIDE || s.refs_n1 != (int64_t)p->n_sel) {
         xkv_err(err, n, "xkv: refs must be I32[4,n_sel]"); return false;
@@ -248,20 +258,44 @@ static bool xkv_check_contents(const int32_t * refs, const int32_t * pos, const 
             xkv_err(err, n, "xkv: per-group rank mismatch"); return false;
         }
         if (bko < 0 || bvo < 0 || bkr <= 0 || bvr <= 0) { xkv_err(err, n, "xkv: bad feature slice"); return false; }
-        // Checked integer arithmetic for feature extents.
-        if ((int64_t)nl > INT64_MAX / nh) { xkv_err(err, n, "xkv: feature extent overflow"); return false; }
-        int64_t heads = (int64_t)nl * nh;
-        if (heads > INT64_MAX / (int64_t)p->dim_k || heads > INT64_MAX / (int64_t)p->dim_v) {
-            xkv_err(err, n, "xkv: feature extent overflow"); return false;
+        if ((int64_t)nl > n_layers) { xkv_err(err, n, "xkv: group layers exceed layer_meta"); return false; }
+        // Group envelope must exactly cover the union of its layers'
+        // absolute spans (aliases share offsets; tail/unequal dims and gaps
+        // honored). Uniform nl*nh*dim sizing is NOT assumed: heads pack per
+        // layer at absolute offsets, never slot*nh*dim (core, Vulkan shader,
+        // and Tri fetch all consume the explicit per-layer map).
+        int64_t min_ok = INT64_MAX, min_ov = INT64_MAX;
+        int64_t max_end_k = -1, max_end_v = -1;
+        for (int64_t ls = 0; ls < (int64_t)nl; ++ls) {
+            const int32_t * L = lm + (size_t)ls * GGML_XKV_LAYER_META_STRIDE;
+            int64_t lok = L[0], ldk = L[1], lov = L[2], ldv = L[3], lnh = L[4];
+            if (ldk <= 0 || ldv <= 0 || lnh <= 0) { xkv_err(err, n, "xkv: bad layer dims/heads"); return false; }
+            if (ldk > 1024 || ldv > 1024) { xkv_err(err, n, "xkv: layer dim exceeds bound"); return false; }
+            if (ldk > (int64_t)p->dim_k || ldv > (int64_t)p->dim_v) {
+                xkv_err(err, n, "xkv: layer dim exceeds op maxima"); return false;
+            }
+            if (lok < 0 || lov < 0) { xkv_err(err, n, "xkv: bad layer offsets"); return false; }
+            if (lnh > INT64_MAX / ldk || lnh > INT64_MAX / ldv) {
+                xkv_err(err, n, "xkv: layer extent overflow"); return false;
+            }
+            int64_t span_k = lnh * ldk, span_v = lnh * ldv;
+            if (lok > INT64_MAX - span_k || lov > INT64_MAX - span_v) {
+                xkv_err(err, n, "xkv: layer span overflow"); return false;
+            }
+            if (lok < min_ok) min_ok = lok;
+            if (lov < min_ov) min_ov = lov;
+            if (lok + span_k > max_end_k) max_end_k = lok + span_k;
+            if (lov + span_v > max_end_v) max_end_v = lov + span_v;
         }
-        int64_t need_k = heads * p->dim_k;
-        int64_t need_v = heads * p->dim_v;
-        if (bkr != need_k || bvr != need_v) { xkv_err(err, n, "xkv: feature slice rows mismatch"); return false; }
+        if (min_ok != (int64_t)bko || min_ov != (int64_t)bvo ||
+            max_end_k != (int64_t)bko + (int64_t)bkr ||
+            max_end_v != (int64_t)bvo + (int64_t)bvr) {
+            xkv_err(err, n, "xkv: group envelope must exactly cover layer spans"); return false;
+        }
         if (bkr > INT64_MAX - bko || bvr > INT64_MAX - bvo) { xkv_err(err, n, "xkv: slice overflow"); return false; }
         if ((int64_t)bko + bkr > s.b_k_n1 || (int64_t)bvo + bvr > s.b_v_n1) {
             xkv_err(err, n, "xkv: feature slice out of bounds"); return false;
         }
-        if ((int64_t)nl > n_layers) { xkv_err(err, n, "xkv: group layers exceed layer_meta"); return false; }
     }
     for (uint32_t i = 0; i < p->n_sel; ++i) {
         int32_t ar = refs[i * 4 + 0], g = refs[i * 4 + 1], ls = refs[i * 4 + 2], h = refs[i * 4 + 3];
@@ -404,20 +438,34 @@ static void xkv_rope_apply(float * vec, uint32_t dim, uint32_t rotary_dim, uint3
     // in place; the tail (rotary_dim..dim) passes through untouched.
     (void)dim;
     uint32_t fc = rotary_dim / 2;
+    // Cody-Waite range reduction of pos * omega to [-pi, pi] matching the
+    // GPU shader rope_trig_cody_waite helper. Pre-reducing to [-pi, pi]
+    // eliminates GPU hardware trig range-reduction divergence.
+    auto trig_cody_waite = [](float pos_f, float om, float & out_c, float & out_s) {
+        const float INV_TWO_PI = 0.15915494309189535f;
+        const float TWO_PI_HI  = 6.2831854820251465f;
+        const float TWO_PI_LO  = -1.748455588302094e-7f;
+        float ang = pos_f * om;
+        float k_cycles = std::round(ang * INV_TWO_PI);
+        float red_ang = std::fma(k_cycles, -TWO_PI_HI, ang);
+        red_ang = std::fma(k_cycles, -TWO_PI_LO, red_ang);
+        out_c = std::cos(red_ang);
+        out_s = std::sin(red_ang);
+    };
     if (mode == GGML_XKV_ROPE_HALF) {
         for (uint32_t f = 0; f < fc; ++f) {
-            float ang = (float)pos * omega[f];
             float mg = mag ? mag[f] : 1.0f;
-            float c = cosf(ang), s = sinf(ang);
+            float c, s;
+            trig_cody_waite((float)pos, omega[f], c, s);
             float re = vec[f], im = vec[f + fc];
             vec[f] = (re * c - im * s) * mg;
             vec[f + fc] = (re * s + im * c) * mg;
         }
     } else {
         for (uint32_t f = 0; f < fc; ++f) {
-            float ang = (float)pos * omega[f];
             float mg = mag ? mag[f] : 1.0f;
-            float c = cosf(ang), s = sinf(ang);
+            float c, s;
+            trig_cody_waite((float)pos, omega[f], c, s);
             float re = vec[2 * f], im = vec[2 * f + 1];
             vec[2 * f] = (re * c - im * s) * mg;
             vec[2 * f + 1] = (re * s + im * c) * mg;

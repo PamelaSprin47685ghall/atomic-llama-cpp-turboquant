@@ -170,6 +170,21 @@ bool native_group_geometry_checked(
         const uint64_t want_v = is_turbo(layer.hot_v->type)
             ? ((uint64_t)layer.head_dim_v + 127u) / 128u * 128u : layer.head_dim_v;
         if (phk64 != want_k || phv64 != want_v) return fail("hot padded width mismatch");
+        // Selected rows must address allocated hot storage on every owning
+        // layer (fail closed before any backend work, IDs, or publication).
+        if (layer.hot_k->ne[1] <= 0 || layer.hot_v->ne[1] <= 0) {
+            return fail("hot height degenerate");
+        }
+        if (config.physical_rows.size() != config.n_rows) {
+            return fail("rows length mismatch");
+        }
+        for (uint32_t i = 0; i < config.n_rows; ++i) {
+            if ((int64_t)config.physical_rows[i] < 0 ||
+                (int64_t)config.physical_rows[i] >= layer.hot_k->ne[1] ||
+                (int64_t)config.physical_rows[i] >= layer.hot_v->ne[1]) {
+                return fail("physical row out of range");
+            }
+        }
 
         const uint32_t freq_count = layer.rotary_dim_k / 2;
         if ((layer.rotary_dim_k & 1u) || layer.rotary_dim_k > layer.head_dim_k) {
@@ -419,6 +434,11 @@ bool xkv_native_seal_estimate(
     }
     if (config.n_rows == 0 || config.groups.empty()) {
         seal_err(err, "estimate: empty rows or groups");
+        return false;
+    }
+    if (config.physical_rows.size() != config.n_rows ||
+        config.storage_positions.size() != config.n_rows) {
+        seal_err(err, "estimate: rows/positions length mismatch");
         return false;
     }
     uint32_t n = config.n_rows;
@@ -1398,6 +1418,15 @@ bool xkv_native_seal_build(
             seal_err(err, "seal: adoption handle count mismatch");
             return false;
         }
+        bundle.adopt_sync_count = 0;
+        bundle.executor = config.executor;
+        // Convert adoption result into a genuine committed/success batch result
+        // with the real backend executor owner preserved BEFORE distributing handles:
+        bundle.backend_bundle = ares.make_batch_result(backend, config.executor);
+        if (!bundle.backend_bundle || !bundle.backend_bundle->is_success() || !bundle.backend_bundle->is_committed()) {
+            seal_err(err, "seal: adoption batch result construction failed");
+            return false;
+        }
         for (size_t i = 0; i < pending.size(); ++i) {
             auto & bg = bundle.groups[pending[i].gi];
             std::shared_ptr<xkv_backend_allocation> h = std::move(ares.handles[i]);
@@ -1409,15 +1438,6 @@ bool xkv_native_seal_build(
                 case 3: bg.b_v.handle = std::move(h); break;
                 default: bg.landmark.handle = std::move(h); break;
             }
-        }
-        bundle.adopt_sync_count = 0;
-        bundle.executor = config.executor;
-        // Convert adoption result into a genuine committed/success batch result
-        // with the real backend executor owner preserved:
-        bundle.backend_bundle = ares.make_batch_result(backend, config.executor);
-        if (!bundle.backend_bundle || !bundle.backend_bundle->is_success() || !bundle.backend_bundle->is_committed()) {
-            seal_err(err, "seal: adoption batch result construction failed");
-            return false;
         }
     }
 
@@ -1606,6 +1626,13 @@ bool xkv_native_landmark_rebuild(
     if ((lm_need % 4) != 0 || lm_need > (uint64_t)INT64_MAX * 4u) {
         seal_err(err, "lm_rebuild: scratch size misaligned or overflowed"); return false;
     }
+    // Full preflight before any allocation: the transient gate precedes the
+    // persistent context/buffer below, so short reservations refuse with
+    // zero mutation, zero IDs, and `out` untouched.
+    if (req.staging_reservation && lm_need > req.staging_reservation->reserved_bytes()) {
+        seal_err(err, "lm_rebuild: staging reservation short for transient scratch (T-1 refused)");
+        return false;
+    }
 
     // ---- stream-only persistent context: holds ONLY the final landmark stream.
     uint64_t out_ctx_u64 = 0;
@@ -1645,12 +1672,6 @@ bool xkv_native_landmark_rebuild(
         seal_err(err, "lm_rebuild: persistent buffer allocation/size mismatch"); return false;
     }
 
-    if (req.staging_reservation) {
-        if (lm_need > req.staging_reservation->reserved_bytes()) {
-            seal_err(err, "lm_rebuild: staging reservation short for transient scratch (T-1 refused)");
-            return false;
-        }
-    }
 
     // ---- transient context: inputs, scratch, telemetry, and the transient build node.
     uint64_t tr_ctx_u64 = 0;

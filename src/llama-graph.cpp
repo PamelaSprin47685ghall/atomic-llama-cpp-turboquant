@@ -22,6 +22,7 @@
 #include "ggml-flashprefill.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -337,12 +338,27 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
-    set_input_recurrent(mctx, ubatch);
+    if (mctx) {
+        set_input_recurrent(mctx, ubatch);
+    }
 }
+
+// StateCarryFix instrumented-run stash storage (decls in llama-graph.h).
+// Plain data copy: no graph-tensor lifetime coupling across TUs.
+namespace {
+int     sc_dbg_ntokens = -1;
+int32_t sc_dbg_vals[64];
+int     sc_dbg_n = 0;
+} // namespace
+
+int sc_dbg_scopy_ntokens() { return sc_dbg_ntokens; }
+int sc_dbg_scopy_n() { return sc_dbg_n; }
+int32_t sc_dbg_scopy(int i) { return (i >= 0 && i < sc_dbg_n) ? sc_dbg_vals[i] : -1; }
 
 void llm_graph_input_rs::set_input_recurrent(
         const llama_memory_recurrent_context * current,
         const llama_ubatch * ubatch) {
+    if (!current) return;
     GGML_UNUSED(ubatch);
     mctx = current;
 
@@ -350,9 +366,9 @@ void llm_graph_input_rs::set_input_recurrent(
 
     // Read rollback-aware brain indices before s_copy() consumes and resets
     // each sequence's rollback selector.
-    if (brain_copy && brain_copy->buffer != nullptr) {
+    if (brain_copy && brain_copy->buffer != nullptr && brain_copy->data != nullptr) {
         GGML_ASSERT(ggml_backend_buffer_is_host(brain_copy->buffer));
-        int32_t * data = (int32_t *) brain_copy->data;
+        int32_t * data = (int32_t *) (brain_copy->data ? brain_copy->data : ggml_get_data(brain_copy));
         for (uint32_t i = 0; i < mctx->get_ubatch().n_seqs; ++i) {
             data[i] = mctx->brain_copy((int32_t) i);
             GGML_ASSERT(data[i] >= 0);
@@ -396,7 +412,7 @@ void llm_graph_input_rs::set_input_recurrent(
         }
     }
 
-    if (s_copy) {
+    if (s_copy && s_copy->buffer != nullptr && s_copy->data != nullptr) {
         GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
         int32_t * data = (int32_t *) s_copy->data;
 
@@ -404,6 +420,13 @@ void llm_graph_input_rs::set_input_recurrent(
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->s_copy(i);
         }
+        // StateCarryFix instrumented run: s_copy(0) must be read here, not at
+        // build time (s_copy() resets rollback selectors).
+        LLAMA_LOG_ERROR("[statecarry] set_input n_tokens=%d n_rs=%lld s_copy(0)=%d\n",
+            ubatch ? ubatch->n_tokens : -1, (long long) n_rs, n_rs > 0 ? data[0] : -1);
+        sc_dbg_ntokens = ubatch ? ubatch->n_tokens : -1;
+        sc_dbg_n = 0;
+        for (uint32_t sc_i = 0; sc_i < n_rs && sc_dbg_n < 64; ++sc_i) sc_dbg_vals[sc_dbg_n++] = data[sc_i];
     }
 }
 
@@ -1014,7 +1037,7 @@ bool llm_graph_input_xkv::can_reuse(const llm_graph_params & params) {
     live.storage_profile = static_cast<int>(params.cparams.xkv_storage_profile);
     live.cpu_branch = llm_xkv_backend_is_cpu(params.sched);
     if (build_mctx_ != nullptr) {
-        if (!params.mctx || params.mctx != static_cast<const llama_memory_context_i *>(build_mctx_)) {
+        if (!params.mctx || params.mctx != build_mctx_) {
             return false;
         }
     }
@@ -1037,7 +1060,8 @@ void llm_graph_input_xkv::adopt(std::shared_ptr<void> handle, std::function<int(
     std::function<bool()> validity_fn,
     std::function<void()> release_fn,
     std::function<bool(std::string &)> acquire_fn,
-    std::function<void()> fill_fn) {
+    std::function<void()> fill_fn,
+    llama_xkv::xkv_graph_snapshot * snapshot) {
     entry e;
     e.handle = std::move(handle);
     e.status_fn = std::move(status_fn);
@@ -1046,6 +1070,7 @@ void llm_graph_input_xkv::adopt(std::shared_ptr<void> handle, std::function<int(
     e.release_fn = std::move(release_fn);
     e.acquire_fn = std::move(acquire_fn);
     e.fill_fn = std::move(fill_fn);
+    e.snapshot = snapshot;
     entries.push_back(std::move(e));
 }
 
@@ -1079,9 +1104,18 @@ bool llm_graph_input_xkv::postcompute_ok(std::string * err) {
         }
         const int a = e.status_fn ? e.status_fn() : 2;
         if (a != 0) {
-            if (err) {
-                *err = "xkv op " + e.label + (a == 1 ? ": stale stamp (retry)" : ": hard failure");
-            }
+                std::string detail = " (no snapshot attached)";
+                if (e.snapshot) {
+                    detail = " [is_computed=" + std::to_string((int)e.snapshot->is_computed) +
+                             " status=" + std::to_string((int)e.snapshot->last_status) +
+                             " force_retry=" + std::to_string((int)e.snapshot->force_retry_stale) +
+                             " error=" + e.snapshot->last_error + "]";
+                }
+                std::string msg = "xkv op " + e.label + (a == 1 ? ": stale stamp (retry)" : ": hard failure") + detail;
+                LLAMA_LOG_ERROR("[llm_graph_input_xkv] %s\n", msg.c_str());
+                if (err && err->empty()) {
+                    *err = msg;
+                }
             ok = false;
         }
     }
@@ -1114,7 +1148,12 @@ static bool llm_xkv_layer_enabled(const llama_kv_cache_context * mctx, int il) {
 
 // True iff this layer takes the bounded-hot XKV path (mode + layer gate).
 static bool llm_xkv_route_layer(const llama_cparams & cparams, const llama_kv_cache_context * mctx, int il) {
-    return llama_xkv::xkv_use_bounded_path(static_cast<int>(cparams.xkv_mode), llm_xkv_layer_enabled(mctx, il));
+    bool enabled = llm_xkv_layer_enabled(mctx, il);
+    bool bounded = llama_xkv::xkv_use_bounded_path(static_cast<int>(cparams.xkv_mode), enabled);
+    if (il == 3 || il == 7) {
+        LLAMA_LOG_ERROR("[llm_xkv_route_layer] il=%d mode=%d enabled=%d -> bounded=%d\n", il, (int)cparams.xkv_mode, (int)enabled, (int)bounded);
+    }
+    return bounded;
 }
 
 // Backend-specific native registration sniffing (P0-6): any sched backend
@@ -1192,7 +1231,8 @@ static llama_xkv::xkv_graph_build_caps llm_xkv_make_caps(
 // closures delegate to the snapshot exactly like the reference path.
 struct llm_xkv_native_lane {
     std::shared_ptr<llama_xkv::xkv_graph_snapshot> snap;
-    std::vector<ggml_tensor *> status_tensors;
+    std::vector<llama_xkv::xkv_native_status_item> status_tensors;
+    ggml_backend_sched_t sched = nullptr;
     std::vector<llama_xkv::xkv_native_fill_item> fills;
 };
 
@@ -1200,14 +1240,33 @@ struct llm_xkv_native_lane {
 // (nonzero = hard failure, never silent zeros), then store stamp (stale =
 // retry). Unreadable status tensor = hard failure. Readbacks synchronize.
 static int llm_xkv_native_head_status(
-    const std::vector<ggml_tensor *> & status_tensors,
-    const llama_xkv::xkv_graph_snapshot * snap) {
+    const std::vector<llama_xkv::xkv_native_status_item> & status_tensors,
+    const llama_xkv::xkv_graph_snapshot * snap,
+    ggml_backend_sched_t sched) {
     if (snap && snap->force_retry_stale) return 1;
-    for (const auto * t : status_tensors) {
-        if (!t || !t->buffer) return 2;
-        int32_t code = -1;
-        ggml_backend_tensor_get(t, &code, 0, sizeof(code));
-        if (code != 0) return 2;
+    std::vector<std::array<int32_t, 4>> values(status_tensors.size());
+    std::vector<ggml_backend_t> backends;
+    backends.reserve(status_tensors.size());
+    for (size_t i = 0; i < status_tensors.size(); ++i) {
+        const auto & item = status_tensors[i];
+        ggml_tensor * t = item.tensor;
+        if (!t || !t->buffer || t->type != GGML_TYPE_I32 || ggml_nelements(t) < 1 ||
+            (item.policy == llama_xkv::xkv_native_status_policy::rows_clamp_retry && ggml_nelements(t) < 4)) {
+            return 2;
+        }
+        ggml_backend_t backend = sched ? ggml_backend_sched_get_tensor_backend(sched, t) : nullptr;
+        if (!backend) return 2;
+        const size_t n = item.policy == llama_xkv::xkv_native_status_policy::rows_clamp_retry ? 4 : 1;
+        ggml_backend_tensor_get_async(backend, t, values[i].data(), 0, n * sizeof(int32_t));
+        if (std::find(backends.begin(), backends.end(), backend) == backends.end()) backends.push_back(backend);
+    }
+    for (ggml_backend_t backend : backends) ggml_backend_synchronize(backend);
+    for (size_t i = 0; i < status_tensors.size(); ++i) {
+        if (values[i][0] != 0) return 2;
+        if (status_tensors[i].policy == llama_xkv::xkv_native_status_policy::rows_clamp_retry &&
+            values[i][2] != 0) {
+            return 1;
+        }
     }
     if (snap && snap->store) {
         if (snap->store->current_stamp() != snap->expected_stamp) return 1;
@@ -1333,7 +1392,7 @@ static ggml_tensor * llm_build_attn_xkv(
     xkey.xkv_mode = static_cast<int>(g->cparams.xkv_mode);
     xkey.storage_profile = static_cast<int>(g->cparams.xkv_storage_profile);
     xkey.cpu_branch = (branch == xkv_exec_branch::cpu_reference);
-    xkv_inp->set_key(xkey, mctx_cur);
+    xkv_inp->set_key(xkey, g->mctx);
 
     std::vector<ggml_tensor *> outs;
     outs.reserve(n_head_kv);
@@ -1349,6 +1408,12 @@ static ggml_tensor * llm_build_attn_xkv(
         ggml_tensor * q_h = ggml_view_3d(ctx0, q_canonical, q_canonical->ne[0], gqa, q_canonical->ne[2],
             q_canonical->nb[1], q_canonical->nb[2], off);
         q_h = ggml_cont(ctx0, q_h);
+        if (il == 3 && h == 0) {
+            LLAMA_LOG_ERROR("[llm_build_attn_xkv] il3h0: q_canonical [%lld, %lld, %lld, %lld] q_h [%lld, %lld, %lld, %lld] snap->n_queries=%u snap->hot_data.size=%zu\n",
+                (long long)q_canonical->ne[0], (long long)q_canonical->ne[1], (long long)q_canonical->ne[2], (long long)q_canonical->ne[3],
+                (long long)q_h->ne[0], (long long)q_h->ne[1], (long long)q_h->ne[2], (long long)q_h->ne[3],
+                snap->n_queries, snap->hot_data.size());
+        }
         std::vector<ggml_tensor *> deps = { k_store, v_store, w_k, w_v };
         snap->k_storage_dep = 1;
         snap->v_storage_dep = 2;
@@ -1362,7 +1427,7 @@ static ggml_tensor * llm_build_attn_xkv(
             // Broadcast-only sink slice for this head's Q group (per-query
             // sinks are unrepresentable in the single F32[gqa] op input).
             ggml_tensor * sinks_h = llm_xkv_native_sink_head(ctx0, sinks, n_head, h, gqa);
-            std::vector<ggml_tensor *> statuses;
+            std::vector<llama_xkv::xkv_native_status_item> statuses;
             std::vector<llama_xkv::xkv_native_fill_item> fills;
             out = llama_xkv::xkv_build_attention_native(ctx0, q_h, *snap,
                 k_store, v_store, sinks_h, caps.backend_is_cpu, statuses, fills, &err);
@@ -1372,6 +1437,7 @@ static ggml_tensor * llm_build_attn_xkv(
             auto lane = std::make_shared<llm_xkv_native_lane>();
             lane->snap = std::shared_ptr<llama_xkv::xkv_graph_snapshot>(std::move(snap));
             lane->status_tensors = std::move(statuses);
+            lane->sched = g->sched;
             lane->fills = std::move(fills);
             // Runtime snapshot refresh installation: enables capacity-checked graph reuse.
             if (mctx_cur && lane->snap) {
@@ -1390,7 +1456,7 @@ static ggml_tensor * llm_build_attn_xkv(
                     });
             }
             xkv_inp->adopt(lane,
-                [lane]() { return llm_xkv_native_head_status(lane->status_tensors, lane->snap.get()); },
+                [lane]() { return llm_xkv_native_head_status(lane->status_tensors, lane->snap.get(), lane->sched); },
                 "il" + std::to_string(il) + "h" + std::to_string(h) + "n",
                 [lane]() {
                     const auto * s = lane->snap.get();
@@ -1418,7 +1484,7 @@ static ggml_tensor * llm_build_attn_xkv(
                             ggml_backend_tensor_set(f.tensor, f.bytes.data(), 0, f.bytes.size());
                         }
                     }
-                });
+                }, lane->snap.get());
             xkv_inp->note_snapshot(lane->snap.get());
         } else {
         std::shared_ptr<xkv_graph_op_handle> handle;
@@ -1443,12 +1509,39 @@ static ggml_tensor * llm_build_attn_xkv(
                     return true;
                 });
         }
-        xkv_inp->adopt(handle, [handle]() {
+        LLAMA_LOG_ERROR("[xkv_attach] attached CPU-ref probe on il%dh%d (out_cpu %p, branch=%s)\n",
+            il, h, (void*)out_cpu, native_branch ? "native" : "cpu_ref");
+
+        xkv_inp->adopt(handle, [handle, il, h, out_cpu]() {
             // Forced stale retry (failed refresh) reports before status.
             if (const auto * s = handle->snapshot()) {
                 if (s->force_retry_stale) return 1;
             }
-            return static_cast<int>(xkv_graph_postcompute_action(handle->status()));
+            // (i) H1 probe: per-query finite check on the CPU-ref attention
+            // output. Runs at poll time, after graph compute fenced, so
+            // out_cpu holds this ubatch's values. Silence = all rows finite.
+            if (out_cpu && out_cpu->data && out_cpu->type == GGML_TYPE_F32 &&
+                out_cpu->ne[0] > 0 && out_cpu->ne[1] > 0) {
+                const int64_t w = out_cpu->ne[0];
+                const int64_t nq = out_cpu->ne[1];
+                for (int64_t q = 0; q < nq; ++q) {
+                    const float * row = (const float *) ((const char *) out_cpu->data + q * out_cpu->nb[1]);
+                    int64_t bad = 0, first = -1;
+                    for (int64_t d = 0; d < w; ++d) {
+                        if (!std::isfinite(row[d])) { if (bad == 0) first = d; ++bad; }
+                    }
+                    if (bad > 0) {
+                        LLAMA_LOG_ERROR("[xkv_out_probe] op il%dh%d query %lld: %lld/%lld elems non-finite (first %lld)\n",
+                            il, h, (long long) q, (long long) bad, (long long) w, (long long) first);
+                    }
+                }
+            }
+            int act = static_cast<int>(xkv_graph_postcompute_action(handle->status()));
+            if (act != 0 && handle->snapshot()) {
+                LLAMA_LOG_ERROR("[xkv_graph_postcompute] op il%dh%d status=%d action=%d error=%s\n",
+                    il, h, (int)handle->status(), act, handle->snapshot()->last_error.c_str());
+            }
+            return act;
         }, "il" + std::to_string(il) + "h" + std::to_string(h), [handle]() {
             // Snapshot freshness: identical store stamps prove the derived
             // content is unchanged (epochs bump on every mutation). Storeless
@@ -1468,7 +1561,7 @@ static ggml_tensor * llm_build_attn_xkv(
             auto * s = handle->snapshot();
             if (!s) { e = "XKV attention: snapshot gone during guard acquire"; return false; }
             return s->acquire_reader_guard(e);
-        });
+        }, {}, handle->snapshot());
         xkv_inp->note_snapshot(handle->snapshot());
         }
         outs.push_back(out);
@@ -2063,7 +2156,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     if (inp_attn->self_kq_mask->buffer) {
         mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
     } else {
-        GGML_ASSERT(inp_attn->rerot_active());
+        GGML_ASSERT(inp_attn->rerot_active() || llama_xkv::xkv_use_bounded_path(static_cast<int>(cparams.xkv_mode), true));
     }
 
     if (inp_attn->self_k_rot) {
@@ -2087,7 +2180,9 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         inp_attn->fp->set_input(ubatch);
     }
 
-    inp_rs->set_input_recurrent(mctx->get_recr(), ubatch);
+    if (inp_rs && mctx && mctx->get_recr()) {
+        inp_rs->set_input_recurrent(mctx->get_recr(), ubatch);
+    }
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -2118,7 +2213,12 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
         res &= !llm_graph_input_attn_flashprefill::wants_companion(params, mctx->get_attn());
     }
 
-    res &= inp_rs->can_reuse_recurrent(mctx->get_recr(), params.ubatch);
+    if (inp_rs) {
+        if (!mctx || !mctx->get_recr()) {
+            return false;
+        }
+        res = res && inp_rs->can_reuse_recurrent(mctx->get_recr(), params.ubatch);
+    }
 
     return res;
 }
@@ -2488,7 +2588,9 @@ int llm_graph_result::xkv_poll_postcompute(std::string * err) {
         auto * x = dynamic_cast<llm_graph_input_xkv *>(input.get());
         if (!x) continue;
         std::string one;
-        if (!x->postcompute_ok(&one)) {
+        bool ok = x->postcompute_ok(&one);
+        if (!ok) {
+            LLAMA_LOG_ERROR("[xkv_poll_postcompute] postcompute_ok failed: %s\n", one.c_str());
             if (err && err->empty()) *err = one;
         }
         worst = std::max(worst, x->post_action());
@@ -4022,7 +4124,9 @@ ggml_tensor * llm_graph_context::build_attn_rerot(
     // and the XKV op consumes it canonically with exact DDVR group offsets
     // from the snapshot builder. KV writes are preserved inside.
     // Layer-aware gate: SWA/recurrent/MTP layers stay stock (P0-10).
-    if (llm_xkv_route_layer(cparams, inp->mctx, il)) {
+    const bool takes_xkv_rerot = llm_xkv_route_layer(cparams, inp->mctx, il);
+    LLAMA_LOG_ERROR("[build_attn_rerot] layer %d takes_xkv=%d\n", il, (int)takes_xkv_rerot);
+    if (takes_xkv_rerot) {
         return llm_build_attn_xkv(this, inp, wo, wo_b, wo_s, q_groups, k_cur, v_cur,
             nullptr, sinks, kq_scale, il);
     }
@@ -4136,7 +4240,10 @@ ggml_tensor * llm_graph_context::build_attn(
     // canonically; exact physical hot slots are gathered inside compute after
     // the preserved KV writes. OFF/SHADOW fall through to the stock path.
     // Layer-aware gate: SWA/recurrent/MTP layers stay stock (P0-10).
-    if (llm_xkv_route_layer(cparams, inp->mctx, il)) {
+    const bool takes_xkv = llm_xkv_route_layer(cparams, inp->mctx, il);
+    LLAMA_LOG_ERROR("[build_attn] layer %d takes_xkv=%d (mode=%d, mctx=%p)\n",
+        il, (int)takes_xkv, (int)cparams.xkv_mode, (const void*)inp->mctx);
+    if (takes_xkv) {
         return llm_build_attn_xkv(this, inp, wo, wo_b, wo_s, q_cur, k_cur, v_cur,
             kq_b, sinks, kq_scale, il);
     }

@@ -617,6 +617,8 @@ public:
     // errors without touching cells.
     bool release_collected_victims(const xkv_overwrite_victims & victims, std::string * err = nullptr);
 
+    void verify_bound_hot_rows(const std::vector<xkv_applied_entry> & entries);
+
     // Restore victim cells from snapshots (pool/store victim entries are still
     // bound on every path that calls this). Used by apply/store-register
     // failure and by postcompute_failure before the next decode.

@@ -547,8 +547,15 @@ bool xkv_backend_batch_result::commit_host_release(std::string * err) {
 // Batch builder
 // ---------------------------------------------------------------------------
 
+namespace {
+xkv_allocation_id_generator & get_default_id_gen() {
+    static xkv_allocation_id_generator s_default_id_gen;
+    return s_default_id_gen;
+}
+} // namespace
+
 xkv_backend_batch_builder::xkv_backend_batch_builder(xkv_allocation_id_generator * id_gen)
-    : id_gen_(id_gen != nullptr ? id_gen : &default_id_gen_) {}
+    : id_gen_(id_gen != nullptr ? id_gen : &get_default_id_gen()) {}
 
 void xkv_backend_batch_builder::add_stream(const codec_desc & desc, const uint8_t * data, size_t size,
                                            std::function<void()> release_fn) {
@@ -1717,6 +1724,11 @@ bool xkv_backend_batch_builder::pack_impl(
                                             v.row_bytes, (size_t) dst_off);
             if (sv == nullptr || dv == nullptr) {
                 set_err(err, "xkv_backend pack request " + std::to_string(i) + ": view create failed");
+                return false;
+            }
+            if (ggml_backend_view_init(sv) != GGML_STATUS_SUCCESS ||
+                ggml_backend_view_init(dv) != GGML_STATUS_SUCCESS) {
+                set_err(err, "xkv_backend pack request " + std::to_string(i) + ": view init failed");
                 return false;
             }
             if (!ggml_are_same_shape(sv, dv) || ggml_nbytes(sv) != v.row_bytes ||
@@ -2894,7 +2906,6 @@ bool xkv_backend_hot_readback_batch(
     const xkv_backend_hot_readback_request & req,
     xkv_backend_hot_readback_result & out,
     std::string * err) {
-    out = xkv_backend_hot_readback_result();
     uint64_t total = 0;
     if (!mul_ok_u64((uint64_t) req.n_slots, (uint64_t) req.row_stride_bytes, total) ||
         total > (uint64_t) std::numeric_limits<size_t>::max()) {

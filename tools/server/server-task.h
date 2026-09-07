@@ -524,16 +524,24 @@ struct server_xkv_metrics {
             { "xkv_pack_seconds",            !observed ? json(pack_seconds) : json(nullptr) },
             { "xkv_segments_sealed",         segments_sealed },
             { "xkv_segments_skipped_by_reason", skipped },
-            { "xkv_sr_selected_rows",        sr_selected_rows },
-            { "xkv_sr_fragments",            sr_fragments },
+            // Observed-but-unevaluated counters render as JSON null
+            // (not_evaluated), never 0-as-measured; unobserved (OFF)
+            // snapshots keep exact legacy zeros. Mirrors the Prometheus
+            // NaN branches below.
+            { "xkv_sr_selected_rows",        !observed || sr_counters_evaluated ? json(sr_selected_rows) : json(nullptr) },
+            { "xkv_sr_fragments",            !observed || sr_counters_evaluated ? json(sr_fragments) : json(nullptr) },
             { "xkv_effective_chunk_size",    effective_chunk_size },
-            { "xkv_landmark_refine_rows",    landmark_refine_rows },
-            { "xkv_landmark_refine_cap_hits", landmark_refine_cap_hits },
-            { "xkv_spec_stale_total",        spec_stale_total },
-            { "xkv_transaction_abort_total", transaction_abort_total },
+            { "xkv_landmark_refine_rows",    !observed || sr_counters_evaluated ? json(landmark_refine_rows) : json(nullptr) },
+            { "xkv_landmark_refine_cap_hits", !observed || sr_counters_evaluated ? json(landmark_refine_cap_hits) : json(nullptr) },
+            { "xkv_spec_stale_total",        !observed || spec_counters_evaluated ? json(spec_stale_total) : json(nullptr) },
+            { "xkv_transaction_abort_total", !observed || spec_counters_evaluated ? json(transaction_abort_total) : json(nullptr) },
             { "xkv_synchronize_total",       synchronize_total },
             { "xkv_throttle_total",          throttle_total },
             { "xkv_throttle_reason",         throttle_reason },
+            { "xkv_graph_timings_evaluated", graph_timings_evaluated },
+            { "xkv_pack_timer_evaluated",    pack_timer_evaluated },
+            { "xkv_sr_counters_evaluated",   sr_counters_evaluated },
+            { "xkv_spec_counters_evaluated", spec_counters_evaluated },
         };
     }
 
@@ -1429,8 +1437,20 @@ bool server_rerot_validate_task(const server_task & task, std::string & error);
 // Grammar isolation (§26/A.16.1): the planner <ol> constraint must never
 // pollute the user grammar. Save the user grammar before planner injection,
 // restore the stock tool/JSON path after the final fence.
-common_grammar server_rerot_take_user_grammar(task_params & params);
-void server_rerot_restore_user_grammar(task_params & params, const common_grammar & saved);
+inline common_grammar server_rerot_take_user_grammar(task_params & params) {
+    // A.16.1: snapshot the user/tool grammar before planner <ol> injection so
+    // the planner constraint can never pollute it. Cheap move, no parse.
+    common_grammar saved = std::move(params.sampling.grammar);
+    params.sampling.grammar = common_grammar{};
+    return saved;
+}
+
+inline void server_rerot_restore_user_grammar(task_params & params, const common_grammar & saved) {
+    // Restore the stock user/tool path after the final fence (§26). The planner
+    // grammar is discarded; the serial tail decodes with the original sampler.
+    params.sampling.grammar = saved;
+}
+
 // Tool execution is disabled during concurrent reasoning; only the final
 // acquire fence + serial tail restores the stock tool path (§26).
 bool server_rerot_tool_calls_allowed(bool serial_tail_done);

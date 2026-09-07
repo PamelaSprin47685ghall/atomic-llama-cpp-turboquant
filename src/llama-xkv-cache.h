@@ -405,6 +405,7 @@ struct xkv_accounting {
     size_t aliased_payloads = 0;        // Count of payloads mapped via layer aliases
     size_t host_peak_bytes = 0;         // High-water mark of host-resident allocated bytes
     size_t device_peak_bytes = 0;       // High-water mark of device-resident allocated bytes
+    size_t dedup_scratch_bytes = 0;     // Store-owned scratch vector capacity bytes for zero-allocation accounting
 
     bool operator==(const xkv_accounting & o) const {
         return live_payload_bytes == o.live_payload_bytes &&
@@ -419,6 +420,7 @@ struct xkv_accounting {
                pinned_segments == o.pinned_segments &&
                unique_b_matrices == o.unique_b_matrices &&
                shared_b_bytes == o.shared_b_bytes &&
+               dedup_scratch_bytes == o.dedup_scratch_bytes &&
                arena_live_bytes == o.arena_live_bytes &&
                arena_reserved_bytes == o.arena_reserved_bytes &&
                arena_peak_bytes == o.arena_peak_bytes &&
@@ -1188,16 +1190,23 @@ public:
         std::string * err = nullptr
     ) const;
 
-    // Byte-preserving encoded-A pack with immutable shared B
-    // LANDMARKS segments require a semantic landmark rebuild callback for atomic
-    // rechunking and refuse without one (zero mutation, old version intact).
+    // Byte-preserving encoded-A pack with immutable shared B. Survivor A rows are
+    // copied verbatim (no re-encode); per-row baselines travel verbatim with the
+    // total recomputed for survivors. DEVICE_OWNED segments refuse before any host
+    // decode/memcpy and require a backend-native byte-preserving transaction.
+    // Any landmark stream presence (any profile) requires a semantic landmark
+    // rebuild callback for atomic rechunking and refuses without one (zero
+    // mutation, old version intact). Retired versions are preserved until the
+    // last pin releases; metadata commits only after every data move succeeds.
     bool pack_segment(
         uint64_t segment_id,
         std::string * err = nullptr,
         xkv_landmark_rebuild_fn landmark_rebuild = nullptr
     );
 
-    // Two-phase batch COW transaction API
+    // Two-phase batch COW transaction API (prepare off-lock, commit under lock).
+    // Same DEVICE_OWNED/landmark/host-byte preconditions as pack_segment; every
+    // failure path preserves published bytes, epochs, and handles.
     bool execute_mutation_transaction(
         const xkv_batch_mutation & mutation,
         xkv_mutation_result * result = nullptr,
@@ -1236,6 +1245,9 @@ public:
     bool candidate_incremental_bytes(const std::shared_ptr<const xkv_segment> & candidate,
                                      size_t * out_bytes,
                                      std::string * err = nullptr) const;
+    // Prepares accounting scratch buffers for a candidate segment (including attached backend bundle).
+    // Safe to call before candidate_incremental_bytes or publish_candidate.
+    bool prepare_accounting_scratch(const std::shared_ptr<const xkv_segment> & candidate, std::string * err = nullptr);
 
     // Atomic preflight & RAII store capacity reservation (xkv_store_mib hard cap)
     bool preflight_store_capacity(size_t expected_bytes, size_t * out_deficit = nullptr,
@@ -1257,6 +1269,7 @@ public:
 
 private:
     void reclaim_retired_segments_locked();
+    bool ensure_accounting_scratch_locked(const std::vector<std::shared_ptr<const xkv_segment>> & candidate_extras, std::string * err = nullptr) const;
     friend class xkv_capacity_reservation;
     friend class xkv_device_staging_reservation;
     void release_capacity_reservation_locked(uint64_t token) noexcept;
@@ -1329,6 +1342,12 @@ private:
     // Transient device staging reservation tracking
     size_t device_staging_reserved_bytes_ = 0;
     size_t device_staging_peak_bytes_ = 0;
+
+    // Bounded reusable scratch buffers for zero-allocation accounting walks under mtx
+    mutable std::vector<const encoded_matrix *> scratch_unique_b_k_;
+    mutable std::vector<const encoded_matrix *> scratch_unique_b_v_;
+    mutable std::vector<uint64_t> scratch_backend_alloc_ids_;
+    mutable std::vector<uint8_t> scratch_backend_alloc_accounted_;
 };
 
 } // namespace llama_xkv

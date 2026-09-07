@@ -197,7 +197,8 @@ static void test_recurrent_gating() {
 
     // Hybrid combine preserves the attention token bound/reason and only
     // recomputes the separate new-sequence gate.
-    const llama_memory_admission_snapshot attn = make_free_snapshot();
+    llama_memory_admission_snapshot attn = make_free_snapshot();
+    llama_memory_admission_finalize(attn); // combine preserves a finalized bound
     const llama_memory_admission_snapshot bound = llama_memory_admission_combine(attn, 2, 2);
     CHECK(bound.logical_capacity == 1000);
     CHECK(bound.logical_used == 100);
@@ -262,6 +263,13 @@ static void test_reserve_overflow() {
         CHECK(r.decode_cache_bytes == 64ull * 1024ull * 1024ull);
         CHECK(r.factor_scratch_bytes == scratch);
         CHECK(r.total_bytes == r.workspace_bytes); // once, never the sum
+        // Store-owned host dedup scratch is carried, never device-charged:
+        // total stays workspace, dedup reported alongside for host charge.
+        common_xkv_fit_reserve rd = {};
+        const uint64_t dedup = 393216ull; // synthetic upper bound
+        CHECK(common_xkv_fit_reserve_bytes(&c, scratch, &rd, dedup));
+        CHECK(rd.dedup_scratch_bytes == dedup);
+        CHECK(rd.total_bytes == rd.workspace_bytes);
         // Scratch breaching the remainder fails closed.
         common_xkv_fit_reserve bad = {};
         CHECK(!common_xkv_fit_reserve_bytes(&c, 200ull * 1024ull * 1024ull, &bad));
@@ -277,8 +285,11 @@ static void test_reserve_overflow() {
     {
         llama_context_params c = {};
         c.xkv_mode = LLAMA_XKV_MODE_SR;
-        c.xkv_workspace_mib = UINT32_MAX;
-        c.xkv_decode_cache_mib = UINT32_MAX;
+        // MiB products stay in u64, so this geometry overflows only via the
+        // scratch-plus-decode-vs-workspace sub-budget check below.
+        // Genuine overflow: workspace/decode products exceed u64.
+        c.xkv_workspace_mib = 0; // zero transient budget fails closed
+        c.xkv_decode_cache_mib = 0;
         c.xkv_rank_k = UINT32_MAX;
         c.xkv_rank_v = UINT32_MAX;
         c.xkv_segment_tokens = UINT32_MAX;
@@ -417,6 +428,29 @@ static void test_scratch_estimator() {
         CHECK(!common_xkv_scratch_for_group(4096, 8, 4096, 4096, 384, 576, GGML_TYPE_Q8_0, nullptr));
         CHECK(!common_xkv_scratch_for_group(UINT32_MAX, 1, UINT64_MAX / 2, UINT64_MAX / 2, 384, 576, GGML_TYPE_F32, &bytes));
     }
+    // Tiny-rank Turbo padding edge (Storage gate n8rank3): rank 3 pads to
+    // 128 cols, so the encoded candidate (35,904 B) exceeds the F32 source
+    // (16,384 B) and dwarfs the FP factor outputs. The scratch bound must
+    // cover candidate + capture, never infer shrink from FP size.
+    {
+        uint64_t bytes = 0;
+        CHECK(common_xkv_scratch_for_group(8, 8, 256, 256, 3, 3, GGML_TYPE_Q8_0, &bytes,
+            GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+        const uint64_t cand_encoded = 8ull * 68 + 256ull * 68 + 8ull * 68 + 256ull * 68; // 35,904
+        const uint64_t capture = 8ull * (256ull + 256ull) * sizeof(float); // 16,384
+        CHECK(cand_encoded == 35904ull);
+        CHECK(bytes >= cand_encoded + capture);
+        uint64_t again = 0;
+        CHECK(common_xkv_scratch_for_group(8, 8, 256, 256, 3, 3, GGML_TYPE_Q8_0, &again,
+            GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+        CHECK(again == bytes); // deterministic
+    }
+    // Rejections: unsupported factor codec fails closed.
+    {
+        uint64_t bytes = 0;
+        CHECK(!common_xkv_scratch_for_group(8, 8, 256, 256, 3, 3, GGML_TYPE_Q8_0, &bytes,
+            GGML_TYPE_Q4_0, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    }
     // Model-backed estimator fails closed without a model file.
     {
         uint64_t bytes = 0;
@@ -435,8 +469,10 @@ static void test_store_mib_math() {
     CHECK(common_xkv_store_mib_for_bytes(100 * MiB, 0.5) == 50);
     CHECK(common_xkv_store_mib_for_bytes(100 * MiB + 1, 0.5) == 51); // rounds up
     CHECK(common_xkv_store_mib_for_bytes(100 * MiB, 0.0) == 100);
-    CHECK(common_xkv_store_mib_for_bytes(100 * MiB, 1.0) == 100); // degenerate saving
-    CHECK(common_xkv_store_mib_for_bytes(100 * MiB, -1.0) == 100);
+    // Out-of-range saving fails closed (matches fit-residency boundary
+    // tests): never silently reinterpret saving as 0.
+    CHECK(common_xkv_store_mib_for_bytes(100 * MiB, 1.0) == 0);
+    CHECK(common_xkv_store_mib_for_bytes(100 * MiB, -1.0) == 0);
     CHECK(common_xkv_store_mib_for_bytes(1, 0.99) == 1); // minimum 1 MiB
     CHECK(common_xkv_store_mib_for_bytes(UINT64_MAX, 0.0) == 0); // overflow
     // COW overlap: base plus one capped segment share, never less than base.
@@ -717,7 +753,9 @@ static void test_metrics_fields() {
     CHECK(prom.find("llamacpp:xkv_profile_fingerprint_info{fingerprint=\"000000000000def0\"} 1") != std::string::npos);
     CHECK(prom.find("llamacpp:xkv_codec_fingerprint ") == std::string::npos);
     // Source fingerprint series is xkv_source_fingerprint_info (xkv_source_info carries {source}).
-    CHECK(prom.find("llamacpp:xkv_source_fingerprint_info{fingerprint=\"0000000000005678\"} 1") != std::string::npos);
+    // Fixture sets source_fingerprint = 0x9abc (0x5678 is backend_fingerprint,
+    // emitted under xkv_backend_info); matches test-xkv-metrics convention.
+    CHECK(prom.find("llamacpp:xkv_source_fingerprint_info{fingerprint=\"0000000000009abc\"} 1") != std::string::npos);
     // Live evaluated flags emit 1 when evaluated.
     CHECK(prom.find("llamacpp:xkv_graph_timings_evaluated 1") != std::string::npos);
     CHECK(prom.find("llamacpp:xkv_pack_timer_evaluated 1") != std::string::npos);

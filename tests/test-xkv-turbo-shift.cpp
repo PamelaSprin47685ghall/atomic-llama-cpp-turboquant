@@ -66,16 +66,14 @@ struct shift_case {
     int32_t delta[4] = {5, 0, -3, 7}; // row 1 unshifted: byte-identity probe
 };
 
-static uint64_t lcg_state = 0x12345678u;
+static uint64_t lcg_state = 0x12345678ULL;
 static float frand() {
-    lcg_state = lcg_state * 1664525u + 1013904223u;
-    uint32_t u = (lcg_state >> 9) | 0x3f800000u;
-    float f;
-    std::memcpy(&f, &u, 4);
-    return (f - 1.0f) * 2.0f - 1.0f; // ~[-3, 1]
+    lcg_state = lcg_state * 6364136223846793005ULL + 1442695040888963407ULL;
+    return (float)((lcg_state >> 33) & 0xffffff) / (float)0x800000 - 1.0f;
 }
 
 static std::vector<float> make_canonical(const shift_case & c) {
+    lcg_state = 0x12345678ULL;
     std::vector<float> v(size_t(c.D * c.H * c.R));
     for (auto & x : v) x = frand() * 0.5f;
     return v;
@@ -122,37 +120,47 @@ static bool rope_rows(ggml_backend_t backend, const std::vector<float> & src,
 static bool turbo_shift_graph(ggml_backend_t backend, ggml_type ktype,
         const std::vector<uint8_t> & stored, int64_t D, int64_t H, int64_t R,
         int64_t n_rot, int rope_mode, const std::vector<int32_t> & deltas,
-        const std::vector<int64_t> & idxs, float freq_base, float freq_scale,
+        const std::vector<int32_t> & idxs, float freq_base, float freq_scale,
         std::vector<uint8_t> & out_stored) {
     const size_t row_bytes = ggml_row_size(ktype, (size_t)D);
     ggml_init_params ip = { ggml_tensor_overhead() * 32 + ggml_graph_overhead_custom(32, false), nullptr, true };
     ggml_context_ptr ctx(ggml_init(ip));
-    ggml_tensor * k = ggml_new_tensor_3d(ctx.get(), ktype, D, H, R);
-    ggml_tensor * dec = ggml_cast(ctx.get(), k, GGML_TYPE_F32);
-    if (!ggml_backend_supports_op(backend, dec)) return false;
+    // 2D storage matching llama_kv_cache layer.k [D*H, R]: set_rows writes
+    // directly back to k (a.ne0 == b.ne0 == D*H) with no reshape intermediary.
+    ggml_tensor * k = ggml_new_tensor_2d(ctx.get(), ktype, D * H, R);
+    ggml_tensor * kfull = ggml_view_3d(ctx.get(), k, D, H, R,
+        ggml_row_size(ktype, D), ggml_row_size(ktype, D * H), 0);
+    ggml_tensor * dec = ggml_cast(ctx.get(), kfull, GGML_TYPE_F32);
+    if (!ggml_backend_supports_op(backend, dec)) { std::fprintf(stderr, "turbo_shift: unsupported %s cast %s->%s ne0=%lld\n", ggml_backend_name(backend), ggml_type_name(dec->src[0]->type), ggml_type_name(dec->type), (long long)dec->ne[0]); return false; }
     ggml_tensor * canon = ggml_turbo_wht(ctx.get(), dec, 1, 128, nullptr);
+    if (!ggml_backend_supports_op(backend, canon)) { std::fprintf(stderr, "turbo_shift: unsupported %s turbo_wht(inv) src0=%s ne0=%lld\n", ggml_backend_name(backend), ggml_type_name(canon->src[0]->type), (long long)canon->ne[0]); return false; }
     ggml_tensor * dp = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, R);
-    ggml_tensor * sec = ggml_view_3d(ctx.get(), canon, n_rot, H, R,
-        canon->nb[1], canon->nb[2], 0);
-    ggml_tensor * roped = ggml_rope_ext(ctx.get(), sec, dp, nullptr, n_rot, rope_mode,
+    // Rope must chain into forward WHT: ggml_rope_ext is out-of-place (dup),
+    // so discarding it orphans ROPE from the graph (CPU no-op). Rope full
+    // canon rows inplace with n_rot (first n_rot cols only) and feed the
+    // result directly to the forward WHT.
+    ggml_tensor * roped = ggml_rope_ext_inplace(ctx.get(), canon, dp, nullptr, n_rot, rope_mode,
         1024, freq_base, freq_scale, 0.0f, 1.0f, 0.0f, 0.0f);
-    (void) roped; // in place on sec/canon storage
-    ggml_tensor * rot = ggml_turbo_wht(ctx.get(), canon, 0, 128, nullptr);
-    ggml_tensor * flat = ggml_view_2d(ctx.get(), rot, D * H, R, rot->nb[2], 0);
-    ggml_tensor * ix = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I64, (int64_t)idxs.size());
+    if (!ggml_backend_supports_op(backend, roped)) { std::fprintf(stderr, "turbo_shift: unsupported %s rope op=%d src0=%s ne0=%lld n_rot=%lld\n", ggml_backend_name(backend), (int)roped->op, ggml_type_name(roped->src[0]->type), (long long)roped->ne[0], (long long)n_rot); return false; }
+    // set_rows with wht_group=128 applies forward WHT inside quantization
+    // (both CPU ggml_compute_forward_set_rows and Vulkan copy_to_quant.comp).
+    // Feeding it already-WHT-rotated input applies WHT twice! Feed canonical roped.
+    ggml_tensor * flat = ggml_view_2d(ctx.get(), roped, D * H, R, roped->nb[2], 0);
+    ggml_tensor * ix = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, (int64_t)idxs.size());
     ggml_tensor * sub = ggml_get_rows(ctx.get(), flat, ix);
+    if (!ggml_backend_supports_op(backend, sub)) { std::fprintf(stderr, "turbo_shift: unsupported %s get_rows src0=%s ne0=%lld\n", ggml_backend_name(backend), ggml_type_name(sub->src[0]->type), (long long)sub->ne[0]); return false; }
     ggml_tensor * back = ggml_set_rows(ctx.get(), k, sub, ix);
     int32_t wht_group = 128;
     std::memcpy(back->op_params, &wht_group, sizeof(int32_t));
-    if (!ggml_backend_supports_op(backend, back)) return false;
+    if (!ggml_backend_supports_op(backend, back)) { std::fprintf(stderr, "turbo_shift: unsupported %s set_rows dst=%s src0=%s ne0=%lld\n", ggml_backend_name(backend), ggml_type_name(back->type), ggml_type_name(back->src[0]->type), (long long)back->ne[0]); return false; }
     ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
-    if (!buf) return false;
+    if (!buf) { std::fprintf(stderr, "turbo_shift: %s graph alloc failed\n", ggml_backend_name(backend)); return false; }
     ggml_backend_tensor_set(k, stored.data(), 0, stored.size());
     ggml_backend_tensor_set(dp, deltas.data(), 0, deltas.size() * 4);
-    ggml_backend_tensor_set(ix, idxs.data(), 0, idxs.size() * 8);
+    ggml_backend_tensor_set(ix, idxs.data(), 0, idxs.size() * sizeof(int32_t));
     ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), 32, false);
     ggml_build_forward_expand(gf, back);
-    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) return false;
+    { ggml_status st = ggml_backend_graph_compute(backend, gf); if (st != GGML_STATUS_SUCCESS) { std::fprintf(stderr, "turbo_shift: %s graph compute status=%d nodes=%d\n", ggml_backend_name(backend), (int)st, ggml_graph_n_nodes(gf)); return false; } }
     out_stored.assign(stored.size(), 0);
     ggml_backend_tensor_get(k, out_stored.data(), 0, out_stored.size());
     return true;
@@ -192,12 +200,12 @@ static void run_case(ggml_backend_t backend, const char * tag, bool is_vk,
     std::vector<float> canon = make_canonical(c);
     std::vector<int32_t> pos(c.R), deltas(c.R);
     std::vector<int32_t> pos_shifted(c.R);
-    std::vector<int64_t> idxs;
+    std::vector<int32_t> idxs;
     for (int64_t r = 0; r < c.R; ++r) {
         pos[r] = c.pos[r];
         deltas[r] = c.delta[r];
         pos_shifted[r] = c.pos[r] + c.delta[r];
-        if (c.delta[r] != 0) idxs.push_back(r); // single head-stream layout: flat row == hot row
+        if (c.delta[r] != 0) idxs.push_back((int32_t)r); // single head-stream layout: flat row == hot row
     }
     // NOTE: multi-head rows share one position each (shift is per-row,
     // head-independent), matching K-shift semantics.
@@ -230,12 +238,22 @@ static void run_case(ggml_backend_t backend, const char * tag, bool is_vk,
     }
     const float base = max_abs_diff(roundtrip.data(), at_p.data(), n_el);
     const float tol = 4.0f * base + 1e-4f;
-    std::printf("    requant base=%.3e tol=%.3e\n", (double)base, (double)tol);
+    float canon_norm = 0.0f, at_p_norm = 0.0f, roundtrip_norm = 0.0f;
+    for (size_t i = 0; i < std::min(n_el, (size_t)8); ++i) {
+        canon_norm += std::fabs(canon[i]);
+        at_p_norm += std::fabs(at_p[i]);
+        roundtrip_norm += std::fabs(roundtrip[i]);
+    }
+    std::printf("    requant base=%.3e tol=%.3e (canon_first8=%.3e at_p_first8=%.3e roundtrip_first8=%.3e stored[0..3]=%02x %02x %02x %02x)\n",
+        (double)base, (double)tol, (double)canon_norm, (double)at_p_norm, (double)roundtrip_norm,
+        stored[0], stored[1], stored[2], stored[3]);
 
     // Shift graph under test.
     std::vector<uint8_t> shifted;
-    CHECK(turbo_shift_graph(backend, ktype, stored, c.D, c.H, c.R, c.n_rot,
-        c.rope_mode, deltas, idxs, c.freq_base, c.freq_scale, shifted));
+    bool shift_ok = turbo_shift_graph(backend, ktype, stored, c.D, c.H, c.R, c.n_rot,
+        c.rope_mode, deltas, idxs, c.freq_base, c.freq_scale, shifted);
+    CHECK(shift_ok);
+    if (!shift_ok) return; // fail-fast before decode to avoid cascade
 
     // Decode result to canonical and compare with absolute truth.
     std::vector<float> got(n_el);
@@ -243,8 +261,12 @@ static void run_case(ggml_backend_t backend, const char * tag, bool is_vk,
         CHECK(ggml_dequantize_turbo_row(ktype, shifted.data() + b,
             got.data() + (b / row_bytes) * (size_t)c.D,
             c.D, 128, GGML_TURBO_DECODE_CANONICAL));
+
     }
     CHECK(max_abs_diff(got.data(), expected.data(), n_el) <= tol);
+    { const float d_exp = max_abs_diff(got.data(), expected.data(), n_el);
+      const float d_mov = max_abs_diff(got.data(), roundtrip.data(), n_el);
+      std::printf("    shift err-vs-expected=%.3e moved-vs-roundtrip=%.3e base=%.3e\n", (double)d_exp, (double)d_mov, (double)base); }
 
     // Shifted rows must actually have moved (guards vacuous no-op passes).
     CHECK(max_abs_diff(got.data(), roundtrip.data(), n_el) > base);

@@ -984,11 +984,264 @@ static void test_ten_group_peak() {
     std::printf("  independent T/T-1 tests OK\n");
 }
 
+// Injected group failure + rollback: a single bad group (or row) among 10
+// refuses the whole bundle atomically — out untouched, no IDs burned — and
+// restoring it seals exactly once with sync_count==1/adopt_sync==0.
+static void test_injected_group_failure_and_rollback() {
+    std::printf("[seal] injected group failure + rollback ...\n");
+    std::shared_ptr<struct ggml_backend> cpu_owner(ggml_backend_cpu_init(), ggml_backend_free);
+    ggml_backend_t cpu = cpu_owner.get();
+    CHECK(cpu != nullptr);
+    const uint32_t n_phys = 40, n = 32;
+    std::vector<int32_t> prows(n);
+    std::vector<int64_t> spos(n);
+    for (uint32_t i = 0; i < n; ++i) { prows[i] = (int32_t)i; spos[i] = (int64_t)(500 + i); }
+    std::vector<hot_tensors> hk(10), hv(10);
+    tseed(9090);
+    for (int i = 0; i < 10; ++i) {
+        std::vector<float> tk(size_t(n_phys) * 32), tv(size_t(n_phys) * 32);
+        for (auto & x : tk) x = tuni();
+        for (auto & x : tv) x = tuni();
+        std::string herr;
+        CHECK(build_hot_layer(cpu, GGML_TYPE_F32, 1, 32, 0, {}, {}, tk, false, false, n_phys, hk[i], herr));
+        CHECK(build_hot_layer(cpu, GGML_TYPE_F32, 1, 32, 0, {}, {}, tv, false, false, n_phys, hv[i], herr));
+    }
+    xkv_native_seal_config cfg;
+    cfg.executor = cpu_owner;
+    cfg.backend = cpu;
+    cfg.buft = ggml_backend_get_default_buffer_type(cpu);
+    cfg.residency = GGML_XKV_RES_REFERENCE_HOST;
+    cfg.max_rel_error = 0.90;
+    cfg.n_rows = n;
+    cfg.physical_rows = prows;
+    cfg.storage_positions = spos;
+    for (int i = 0; i < 10; ++i) {
+        xkv_native_seal_group g;
+        g.group_index = (uint32_t)i;
+        g.rank_k = 4; g.rank_v = 4;
+        g.codec_a_k = GGML_TYPE_F32; g.codec_b_k = GGML_TYPE_F32;
+        g.codec_a_v = GGML_TYPE_F32; g.codec_b_v = GGML_TYPE_F32;
+        g.seed_k = (uint64_t)(100 + i * 2); g.seed_v = (uint64_t)(101 + i * 2);
+        xkv_native_seal_hot_layer L;
+        L.n_heads = 1; L.head_dim_k = 32; L.head_dim_v = 32;
+        L.rotary_dim_k = 0;
+        L.hot_k = hk[i].k; L.hot_v = hv[i].k;
+        g.layers.push_back(L);
+        cfg.groups.push_back(g);
+    }
+    xkv_allocation_id_generator id_gen;
+    cfg.id_gen = &id_gen;
+    xkv_backend_store_reservation res;
+    res.reserved_bytes = 1ULL << 30; res.cap_bytes = 1ULL << 30;
+    cfg.store_reservation = &res;
+    const uint64_t id_before = id_gen.current_id();
+    auto expect_atomic_fail = [&]() {
+        xkv_native_seal_bundle no;
+        no.bundle_fingerprint = 0xDEADBEEF;
+        std::string e2;
+        CHECK(!xkv_native_seal_build(cfg, no, &e2));
+        CHECK(!e2.empty());
+        CHECK(no.bundle_fingerprint == 0xDEADBEEF);
+        CHECK(no.groups.empty());
+        CHECK(no.backend_bundle == nullptr);
+        CHECK(id_gen.current_id() == id_before);
+    };
+    // Fault 1: zero rank deep in the list (group 6).
+    cfg.groups[6].rank_k = 0;
+    expect_atomic_fail();
+    cfg.groups[6].rank_k = 4;
+    // Fault 2: selected row outside hot storage (n_phys=40).
+    cfg.physical_rows[3] = 999;
+    {
+        xkv_native_seal_bundle no;
+        no.bundle_fingerprint = 0xDEADBEEF;
+        std::string e2;
+        CHECK(!xkv_native_seal_build(cfg, no, &e2));
+        CHECK(e2.find("out of range") != std::string::npos);
+        CHECK(no.bundle_fingerprint == 0xDEADBEEF);
+        CHECK(no.groups.empty());
+        CHECK(id_gen.current_id() == id_before);
+    }
+    cfg.physical_rows[3] = 3;
+    // Rollback: the restored config seals exactly once.
+    {
+        xkv_native_seal_bundle ok;
+        std::string err;
+        CHECK(xkv_native_seal_build(cfg, ok, &err));
+        CHECK(ok.groups.size() == 10);
+        CHECK(ok.sync_count == 1);
+        CHECK(ok.adopt_sync_count == 0);
+        CHECK(ok.backend_bundle != nullptr && ok.backend_bundle->is_success());
+        CHECK(id_gen.current_id() > id_before);
+    }
+    std::printf("  injected failure + rollback OK\n");
+}
+
+// Shared persistent buffer ownership lifetime: every adopted stream views the
+// single stream-only buffer, and kept handles stay readable after the bundle
+// (and its batch result) is destroyed.
+static void test_shared_buffer_lifetime() {
+    std::printf("[seal] shared persistent buffer ownership lifetime ...\n");
+    std::shared_ptr<struct ggml_backend> cpu_owner(ggml_backend_cpu_init(), ggml_backend_free);
+    ggml_backend_t cpu = cpu_owner.get();
+    CHECK(cpu != nullptr);
+    seal_case c;
+    std::vector<hot_tensors> hotk, hotv;
+    std::string err;
+    CHECK(build_case(cpu_owner, c, err, hotk, hotv));
+    c.cfg.residency = GGML_XKV_RES_REFERENCE_HOST;
+    c.cfg.placement_identity = ggml_backend_name(cpu);
+    xkv_backend_store_reservation res;
+    res.reserved_bytes = 1ULL << 30; res.cap_bytes = 1ULL << 30;
+    c.cfg.store_reservation = &res;
+    std::shared_ptr<xkv_backend_allocation> kept_a, kept_b;
+    std::vector<uint8_t> expect_a, expect_b;
+    ggml_backend_buffer_t shared_buf = nullptr;
+    {
+        xkv_native_seal_bundle out;
+        CHECK(xkv_native_seal_build(c.cfg, out, &err));
+        CHECK(out.groups.size() == 2);
+        kept_a = out.groups[0].a_k.handle;
+        kept_b = out.groups[1].b_v.handle;
+        CHECK(kept_a != nullptr && kept_b != nullptr);
+        expect_a = handle_bytes(cpu, kept_a);
+        expect_b = handle_bytes(cpu, kept_b);
+        CHECK(!expect_a.empty() && !expect_b.empty());
+        shared_buf = kept_a->get_buffer();
+        CHECK(shared_buf != nullptr);
+        CHECK(kept_a->get_ctx() == kept_b->get_ctx());
+        for (const auto & bg : out.groups) {
+            CHECK(bg.a_k.handle->get_buffer() == shared_buf);
+            CHECK(bg.b_k.handle->get_buffer() == shared_buf);
+            CHECK(bg.a_v.handle->get_buffer() == shared_buf);
+            CHECK(bg.b_v.handle->get_buffer() == shared_buf);
+            if (bg.has_landmarks) CHECK(bg.landmark.handle->get_buffer() == shared_buf);
+        }
+    }
+    // Bundle gone: kept handles still own the store.
+    CHECK(kept_a->get_tensor() != nullptr);
+    CHECK(kept_a->get_buffer() == shared_buf);
+    CHECK(kept_a->get_ctx() != nullptr);
+    CHECK(kept_a->is_immutable() && kept_b->is_immutable());
+    CHECK(handle_bytes(cpu, kept_a) == expect_a);
+    CHECK(handle_bytes(cpu, kept_b) == expect_b);
+    std::printf("  lifetime OK\n");
+}
+
+// Standalone native partial landmark rebuild: subset rows of sealed A_K/B_K
+// rebuild landmarks zero-copy with nonzero fingerprints; bad rows and short
+// reservations refuse with out untouched.
+static void test_landmark_rebuild() {
+    std::printf("[seal] standalone partial landmark rebuild ...\n");
+    std::shared_ptr<struct ggml_backend> cpu_owner(ggml_backend_cpu_init(), ggml_backend_free);
+    ggml_backend_t cpu = cpu_owner.get();
+    CHECK(cpu != nullptr);
+    seal_case c;
+    std::vector<hot_tensors> hotk, hotv;
+    std::string err;
+    CHECK(build_case(cpu_owner, c, err, hotk, hotv));
+    c.cfg.residency = GGML_XKV_RES_REFERENCE_HOST;
+    c.cfg.placement_identity = ggml_backend_name(cpu);
+    xkv_backend_store_reservation res;
+    res.reserved_bytes = 1ULL << 30; res.cap_bytes = 1ULL << 30;
+    c.cfg.store_reservation = &res;
+    xkv_native_seal_bundle out;
+    CHECK(xkv_native_seal_build(c.cfg, out, &err));
+    CHECK(out.groups.size() == 2);
+    CHECK(out.groups[0].has_landmarks);
+    xkv_native_landmark_rebuild_request req;
+    req.a_k = out.groups[0].a_k.handle;
+    req.b_k = out.groups[0].b_k.handle;
+    for (uint32_t i = 0; i < 8; ++i) {
+        req.surviving_rows.push_back((int32_t)i);
+        req.storage_positions.push_back(c.cfg.storage_positions[i]);
+    }
+    req.chunk_tokens = 8;
+    req.landmark_type = GGML_TYPE_Q8_0;
+    req.seed = 777;
+    req.phase_tx_fingerprint = 0x12345678ULL;
+    req.layers = c.cfg.groups[0].layers;
+    req.executor = cpu_owner;
+    req.buft = ggml_backend_get_default_buffer_type(cpu);
+    req.id_gen = &c.id_gen;
+    xkv_backend_store_reservation lres;
+    lres.reserved_bytes = 1ULL << 30; lres.cap_bytes = 1ULL << 30;
+    req.store_reservation = &lres;
+    xkv_native_landmark_rebuild_result r1;
+    CHECK(xkv_native_landmark_rebuild(req, r1, &err));
+    CHECK(r1.landmark_handle != nullptr);
+    CHECK(r1.landmark_handle->is_immutable());
+    CHECK(r1.desc.validate());
+    CHECK(r1.stream_fingerprint != 0);
+    CHECK(r1.stream_fingerprint == r1.desc.fingerprint());
+    CHECK(r1.exact_bytes == ggml_nbytes(r1.landmark_handle->get_tensor()));
+    CHECK(r1.transient_bytes > 0);
+    CHECK(r1.sync_count == 1);
+    CHECK(r1.table_fingerprint != 0);
+    CHECK(r1.chunks.size() == 1);
+    CHECK(r1.chunks[0].row_begin == 0 && r1.chunks[0].row_count == 8);
+    CHECK(std::isfinite(r1.chunks[0].error_bound) && r1.chunks[0].error_bound > 0.0f);
+    CHECK(r1.chunks[0].source_fingerprint != 0);
+    // Deterministic: an identical rebuild yields identical bytes.
+    {
+        xkv_native_landmark_rebuild_result r2;
+        CHECK(xkv_native_landmark_rebuild(req, r2, &err));
+        CHECK(handle_bytes(cpu, r1.landmark_handle) == handle_bytes(cpu, r2.landmark_handle));
+    }
+    // Exact staging reservation sized from the reported transient peak seals.
+    {
+        llama_cparams scp = {};
+        scp.xkv_workspace_mib = 64;
+        llama_xkv_cache_store staging_store(scp);
+        std::string rerr;
+        xkv_device_staging_reservation staging_ok =
+            staging_store.reserve_device_staging(r1.transient_bytes, &rerr, nullptr);
+        CHECK(staging_ok.valid());
+        xkv_native_landmark_rebuild_request req_ok = req;
+        req_ok.staging_reservation = &staging_ok;
+        xkv_native_landmark_rebuild_result r3;
+        CHECK(xkv_native_landmark_rebuild(req_ok, r3, &err));
+        CHECK(handle_bytes(cpu, r1.landmark_handle) == handle_bytes(cpu, r3.landmark_handle));
+    }
+    // Out-of-range row refuses with out untouched.
+    {
+        xkv_native_landmark_rebuild_request bad = req;
+        bad.surviving_rows[3] = 9999;
+        xkv_native_landmark_rebuild_result no;
+        no.exact_bytes = 0xDEADBEEF;
+        no.sync_count = 77;
+        std::string e2;
+        CHECK(!xkv_native_landmark_rebuild(bad, no, &e2));
+        CHECK(!e2.empty());
+        CHECK(no.landmark_handle == nullptr);
+        CHECK(no.exact_bytes == 0xDEADBEEF);
+        CHECK(no.sync_count == 77);
+    }
+    // T-1 store short refuses with out untouched.
+    {
+        xkv_backend_store_reservation short_lres;
+        short_lres.reserved_bytes = r1.exact_bytes - 1;
+        xkv_native_landmark_rebuild_request bad = req;
+        bad.store_reservation = &short_lres;
+        xkv_native_landmark_rebuild_result no;
+        no.exact_bytes = 0xDEADBEEF;
+        std::string e2;
+        CHECK(!xkv_native_landmark_rebuild(bad, no, &e2));
+        CHECK(e2.find("store reservation") != std::string::npos);
+        CHECK(no.landmark_handle == nullptr);
+        CHECK(no.exact_bytes == 0xDEADBEEF);
+    }
+    std::printf("  landmark rebuild OK\n");
+}
+
 int main() {
     test_cpu_bridge();
     test_faults();
     test_store_validate_and_publish();
     test_ten_group_peak();
+    test_injected_group_failure_and_rollback();
+    test_shared_buffer_lifetime();
+    test_landmark_rebuild();
     test_vulkan_bridge();
     if (failures == 0) {
         std::printf("PASS: test-xkv-native-seal\n");

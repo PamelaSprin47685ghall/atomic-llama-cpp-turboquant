@@ -239,7 +239,7 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * out_ids; // I32 [n_outputs]
+    ggml_tensor * out_ids = nullptr; // I32 [n_outputs]
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -254,7 +254,7 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    ggml_tensor * mean; // F32 [n_batch, n_batch]
+    ggml_tensor * mean = nullptr; // F32 [n_batch, n_batch]
 
     const llama_cparams cparams;
 };
@@ -266,7 +266,7 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    ggml_tensor * cls; // I32 [n_batch]
+    ggml_tensor * cls = nullptr; // I32 [n_batch]
 
     const llama_cparams cparams;
     const llm_arch arch;
@@ -311,12 +311,19 @@ public:
     ggml_tensor * s_copy_main = nullptr;   // I32 [n_seqs]
     ggml_tensor * s_copy_extra = nullptr;  // I32 [n_rs - n_seqs]
 
-    const llama_memory_recurrent_context * mctx;
+    const llama_memory_recurrent_context * mctx = nullptr;
 
     // used in view offsets, need to match for valid graph reuse
     uint32_t head = 0;
     int32_t rs_z = 0;
 };
+
+// StateCarryFix instrumented-run stash: s_copy values copied at set_input
+// time (llama-graph.cpp), consumed post-fence in llama-context.cpp. Plain
+// data (not tensor pointers), so no graph-lifetime coupling across TUs.
+int     sc_dbg_scopy_ntokens();
+int     sc_dbg_scopy_n();
+int32_t sc_dbg_scopy(int i);
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
 public:
@@ -326,7 +333,7 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    ggml_tensor * cross_embd; // F32 [n_embd, n_outputs_enc]
+    ggml_tensor * cross_embd = nullptr; // F32 [n_embd, n_outputs_enc]
 
     const llama_cross * cross;
 };
@@ -887,7 +894,8 @@ public:
         // Fill hook for graph-created metadata tensors (native path): replays
         // exact precomputed bytes into set_input-marked tensors; throws on
         // capacity overflow (rebuild required, refusing to truncate).
-        std::function<void()> fill_fn = {});
+        std::function<void()> fill_fn = {},
+        llama_xkv::xkv_graph_snapshot * snapshot = nullptr);
     // Snapshot sidecar for refresh/freshness (non-owning; lifetime held by
     // handle). Passed explicitly to avoid type-erased round-trip casts.
     void note_snapshot(llama_xkv::xkv_graph_snapshot * snap);
@@ -899,7 +907,7 @@ public:
     // surfaces as hard error at the next poll. Non-const: polling mutates
     // lease state.
     void release_reader_leases();
-    void set_key(xkv_reuse_key key, const llama_kv_cache_context * mctx) {
+    void set_key(xkv_reuse_key key, const llama_memory_context_i * mctx) {
         key_ = key;
         key_valid_ = true;
         build_mctx_ = mctx;
@@ -927,7 +935,7 @@ private:
     bool bounded_active = false;
     xkv_reuse_key key_;
     bool key_valid_ = false;
-    const llama_kv_cache_context * build_mctx_ = nullptr;
+    const llama_memory_context_i * build_mctx_ = nullptr;
     std::vector<entry> entries;
     // Last ubatch seen in set_input (defensive record; refresh hook point).
     uint32_t last_n_tokens_ = 0;

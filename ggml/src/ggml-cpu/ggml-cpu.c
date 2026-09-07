@@ -3010,14 +3010,14 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_SET_ROWS:
                     {
                         if (node->src[0]->type == GGML_TYPE_F16 && node->type != GGML_TYPE_F16) {
-                            cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
+                            cur = (ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] + CACHE_LINE_SIZE) * n_tasks;
                         }
                     } break;
                 case GGML_OP_SOFT_MAX:
                 case GGML_OP_ROPE:
                 case GGML_OP_ROPE_BACK:
                     {
-                        cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
+                        cur = (ggml_type_size(GGML_TYPE_F32) * (node->ne[0] + CACHE_LINE_SIZE_F32)) * n_tasks + CACHE_LINE_SIZE;
                     } break;
                 case GGML_OP_CONV_TRANSPOSE_1D:
                     {
@@ -3213,7 +3213,7 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t S_v = node->src[2]->ne[0];
                         const int64_t K   = ggml_get_op_params_i32(node, 0);
                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
-                        cur = per_thread * sizeof(float) * n_tasks;
+                        cur = (per_thread + CACHE_LINE_SIZE_F32) * sizeof(float) * n_tasks;
                     } break;
                 case GGML_OP_TURBO_WHT:
                     {

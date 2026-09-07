@@ -288,7 +288,7 @@ static void test_maintenance_exclusion() {
 }
 
 static void test_reader_drain_final_fence() {
-    std::cout << "[Test] reader drain / final fence..." << std::endl;
+    std::cout << "[Test] reader drain / final fence / maintenance publication..." << std::endl;
     xkv_transaction_coordinator c;
     std::string err;
     xkv_quiesce_options no_wait;
@@ -302,8 +302,14 @@ static void test_reader_drain_final_fence() {
         assert(c.final_fence(v, no_wait, &err) == xkv_tx_status::busy);
         assert(c.wait_for_readers_drained(no_wait, &err) == xkv_tx_status::busy);
         assert(c.apply_context_shift(v, no_wait, &err) == xkv_tx_status::busy);
+        assert(!c.maintenance_allowed());
+        assert(c.begin_maintenance(xkv_maintenance_op::seal, 901, &err) == xkv_tx_status::busy);
+        assert(c.begin_maintenance(xkv_maintenance_op::pack, 902, &err) == xkv_tx_status::busy);
+        assert(c.begin_maintenance(xkv_maintenance_op::relocate, 903, &err) == xkv_tx_status::busy);
+        assert(c.begin_maintenance(xkv_maintenance_op::landmark_publish, 904, &err) == xkv_tx_status::busy);
     }
     assert(c.active_reader_count() == 0);
+    assert(c.maintenance_allowed());
     assert(c.wait_for_readers_drained(no_wait, &err) == xkv_tx_status::ok);
     llama_rerot_view_stamp stable{7, 8, 9};
     assert(c.final_fence(stable, no_wait, &err) == xkv_tx_status::ok);

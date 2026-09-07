@@ -119,7 +119,9 @@ static std::shared_ptr<xkv_segment> create_test_segment_f32(
         pids[i] = seed_base * 1000 + i + 1;
         store.register_hot_payload(pids[i], i, gens[i], xkv_state::hot_committed);
     }
-    bool marked = store.mark_seal_candidates(pids);
+    uint64_t nonce = 0;
+    std::string mark_err;
+    bool marked = store.mark_seal_candidates(pids, gens, &nonce, &mark_err);
     assert(marked);
     std::string err;
     bool ok = store.publish_candidate(seg, pids, gens, &err);
@@ -1584,40 +1586,40 @@ static void test_graph_second_group_exact_resolution() {
     g0.owning_layers = {0, 1};
     g0.rank_k = rank;
     g0.rank_v = rank;
-    g0.total_dim_k = head_dim;
-    g0.total_dim_v = head_dim;
-    g0.layer_feature_offsets_k = {0, head_dim / 2};
-    g0.layer_feature_dims_k = {head_dim / 2, head_dim / 2};
-    g0.layer_feature_offsets_v = {0, head_dim / 2};
-    g0.layer_feature_dims_v = {head_dim / 2, head_dim / 2};
+    g0.total_dim_k = 2 * head_dim;
+    g0.total_dim_v = 2 * head_dim;
+    g0.layer_feature_offsets_k = {0, head_dim};
+    g0.layer_feature_dims_k = {head_dim, head_dim};
+    g0.layer_feature_offsets_v = {0, head_dim};
+    g0.layer_feature_dims_v = {head_dim, head_dim};
     std::vector<float> a_k0 = generate_deterministic_floats(n_rows * rank, 5101);
-    std::vector<float> b_k0 = generate_deterministic_floats(head_dim * rank, 5102);
+    std::vector<float> b_k0 = generate_deterministic_floats(2 * head_dim * rank, 5102);
     std::vector<float> a_v0 = generate_deterministic_floats(n_rows * rank, 5103);
-    std::vector<float> b_v0 = generate_deterministic_floats(head_dim * rank, 5104);
+    std::vector<float> b_v0 = generate_deterministic_floats(2 * head_dim * rank, 5104);
     g0.a_k = encode_matrix(make_codec_desc(factor_role::a_k, GGML_TYPE_F32, orientation::token_major, {n_rows, rank}, 0, 5101), a_k0.data(), a_k0.size());
-    g0.set_b_k(encode_matrix(make_codec_desc(factor_role::b_k, GGML_TYPE_F32, orientation::feature_major_transposed, {head_dim, rank}, 0, 5102), b_k0.data(), b_k0.size()));
+    g0.set_b_k(encode_matrix(make_codec_desc(factor_role::b_k, GGML_TYPE_F32, orientation::feature_major_transposed, {2 * head_dim, rank}, 0, 5102), b_k0.data(), b_k0.size()));
     g0.a_v = encode_matrix(make_codec_desc(factor_role::a_v, GGML_TYPE_F32, orientation::token_major, {n_rows, rank}, 0, 5103), a_v0.data(), a_v0.size());
-    g0.set_b_v(encode_matrix(make_codec_desc(factor_role::b_v, GGML_TYPE_F32, orientation::feature_major_transposed, {head_dim, rank}, 0, 5104), b_v0.data(), b_v0.size()));
+    g0.set_b_v(encode_matrix(make_codec_desc(factor_role::b_v, GGML_TYPE_F32, orientation::feature_major_transposed, {2 * head_dim, rank}, 0, 5104), b_v0.data(), b_v0.size()));
 
     xkv_factor_group_payload g1;
     g1.group_index = 1;
     g1.owning_layers = {2, 3};
     g1.rank_k = rank;
     g1.rank_v = rank;
-    g1.total_dim_k = head_dim;
-    g1.total_dim_v = head_dim;
-    g1.layer_feature_offsets_k = {0, head_dim / 2};
-    g1.layer_feature_dims_k = {head_dim / 2, head_dim / 2};
-    g1.layer_feature_offsets_v = {0, head_dim / 2};
-    g1.layer_feature_dims_v = {head_dim / 2, head_dim / 2};
+    g1.total_dim_k = 2 * head_dim;
+    g1.total_dim_v = 2 * head_dim;
+    g1.layer_feature_offsets_k = {0, head_dim};
+    g1.layer_feature_dims_k = {head_dim, head_dim};
+    g1.layer_feature_offsets_v = {0, head_dim};
+    g1.layer_feature_dims_v = {head_dim, head_dim};
     std::vector<float> a_k1 = generate_deterministic_floats(n_rows * rank, 5201);
-    std::vector<float> b_k1 = generate_deterministic_floats(head_dim * rank, 5202);
+    std::vector<float> b_k1 = generate_deterministic_floats(2 * head_dim * rank, 5202);
     std::vector<float> a_v1 = generate_deterministic_floats(n_rows * rank, 5203);
-    std::vector<float> b_v1 = generate_deterministic_floats(head_dim * rank, 5204);
+    std::vector<float> b_v1 = generate_deterministic_floats(2 * head_dim * rank, 5204);
     g1.a_k = encode_matrix(make_codec_desc(factor_role::a_k, GGML_TYPE_F32, orientation::token_major, {n_rows, rank}, 0, 5201), a_k1.data(), a_k1.size());
-    g1.set_b_k(encode_matrix(make_codec_desc(factor_role::b_k, GGML_TYPE_F32, orientation::feature_major_transposed, {head_dim, rank}, 0, 5202), b_k1.data(), b_k1.size()));
+    g1.set_b_k(encode_matrix(make_codec_desc(factor_role::b_k, GGML_TYPE_F32, orientation::feature_major_transposed, {2 * head_dim, rank}, 0, 5202), b_k1.data(), b_k1.size()));
     g1.a_v = encode_matrix(make_codec_desc(factor_role::a_v, GGML_TYPE_F32, orientation::token_major, {n_rows, rank}, 0, 5203), a_v1.data(), a_v1.size());
-    g1.set_b_v(encode_matrix(make_codec_desc(factor_role::b_v, GGML_TYPE_F32, orientation::feature_major_transposed, {head_dim, rank}, 0, 5204), b_v1.data(), b_v1.size()));
+    g1.set_b_v(encode_matrix(make_codec_desc(factor_role::b_v, GGML_TYPE_F32, orientation::feature_major_transposed, {2 * head_dim, rank}, 0, 5204), b_v1.data(), b_v1.size()));
 
     auto seg = store.create_candidate_segment(
         LLAMA_XKV_STORAGE_PROFILE_REFERENCE,
@@ -1632,7 +1634,9 @@ static void test_graph_second_group_exact_resolution() {
         pids[i] = 52000 + i + 1;
         store.register_hot_payload(pids[i], i, gens[i], xkv_state::hot_committed);
     }
-    assert(store.mark_seal_candidates(pids));
+    uint64_t nonce = 0;
+    std::string mark_err;
+    assert(store.mark_seal_candidates(pids, gens, &nonce, &mark_err));
     std::string pub_err;
     assert(store.publish_candidate(seg, pids, gens, &pub_err));
 
@@ -1680,6 +1684,9 @@ static void test_graph_second_group_exact_resolution() {
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out_tensor);
     ggml_graph_compute_with_ctx(ctx, gf, 1);
+    if (!op_handle->succeeded()) {
+        std::cerr << "op_handle error: " << op_handle->error_message() << std::endl;
+    }
     assert(op_handle->succeeded());
 
     // Dense oracle from group-1 streams only: a first-group fallback would mismatch.

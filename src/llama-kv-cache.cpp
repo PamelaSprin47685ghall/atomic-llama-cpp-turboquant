@@ -770,6 +770,9 @@ bool llama_kv_cache::try_clear(bool data, std::string * err) {
                 return false;
             }
         }
+        if (xkv_runtime) {
+            xkv_runtime->clear_decode_cache();
+        }
         for (uint32_t s = 0; s < n_stream; ++s) {
             v_cells[s].reset();
             v_heads[s] = 0;
@@ -2014,8 +2017,13 @@ bool llama_kv_cache::update_shift_bounded(llama_context * lctx, std::string * er
             return false;
         }
     }
-    // Phase 8: Commit metadata only after byte-complete success and atomic
-    // store commit above. Pool rows are unchanged (same rows, rotated bytes).
+    // Phase 8: Commit metadata only after every data move and every store
+    // candidate succeeds. Hot rotation above is staged device-local with reverse-
+    // copy rollback; the landmark COW above is one atomic batch mutation that
+    // refreshes (never truncates) landmark bytes/chunks and rejects stale or
+    // zero source fingerprints. Retired versions stay readable until the last pin
+    // releases; shift deltas clear only here so any failure above stays retryable
+    // with bit-identical K/V bytes. Pool rows are unchanged (same rows, rotated bytes).
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset_shift();
     }
@@ -3421,6 +3429,57 @@ bool llama_kv_cache::release_collected_victims(const xkv_overwrite_victims & vic
     return true;
 }
 
+void llama_kv_cache::verify_bound_hot_rows(const std::vector<xkv_applied_entry> & entries) {
+    // Per-row finiteness probe over committed hot storage. Covers F32/F16
+    // directly and any other codec via type traits (e.g. Q8_0 boundary
+    // layers); turbo rows need canonical decode and are noted once.
+    auto row_finite = [](ggml_tensor * t, uint32_t slot, const char * tag, int il, uint32_t cell, uint64_t pid) {
+        if (!t || !t->data) return;
+        const uint32_t n = (uint32_t) t->ne[0];
+        const uint8_t * base = (const uint8_t *) t->data + (size_t) slot * (size_t) t->nb[1];
+        std::vector<float> owned;
+        const float * row = nullptr;
+        if (t->type == GGML_TYPE_F32) {
+            row = (const float *) base;
+        } else if (t->type == GGML_TYPE_F16) {
+            owned.resize(n);
+            for (uint32_t d = 0; d < n; ++d) owned[d] = ggml_fp16_to_fp32(((const ggml_fp16_t *) base)[d]);
+            row = owned.data();
+        } else if (t->type == GGML_TYPE_TURBO2_0 || t->type == GGML_TYPE_TURBO3_0 || t->type == GGML_TYPE_TURBO4_0) {
+            static bool noted = false;
+            if (!noted) {
+                noted = true;
+                LLAMA_LOG_WARN("[llama_kv_cache] verify_bound_hot_rows: turbo %s rows unchecked (need canonical decode)\n", tag);
+            }
+            return;
+        } else {
+            const ggml_type_traits * traits = ggml_get_type_traits(t->type);
+            const int64_t blck = ggml_blck_size(t->type);
+            if (!traits || !traits->to_float || blck <= 0 || n % (uint32_t) blck != 0) return;
+            owned.resize(n);
+            traits->to_float(base, owned.data(), n);
+            row = owned.data();
+        }
+        uint32_t bad = 0, first = 0;
+        for (uint32_t d = 0; d < n; ++d) {
+            if (!std::isfinite(row[d])) { if (bad == 0) first = d; ++bad; }
+        }
+        if (bad > 0) {
+            LLAMA_LOG_ERROR("[llama_kv_cache] postcompute: non-finite %s at layer %d, hot_slot %u (cell %u): %u/%u elems, first elem %u: %f (pid %llu type %s)\n",
+                tag, il, slot, cell, bad, n, first, row[first], (unsigned long long) pid, ggml_type_name(t->type));
+        }
+    };
+    for (const auto & e : entries) {
+        if (!e.has_hot) continue;
+        for (const auto & layer : layers) {
+            // K + V discriminator: Vcur has no norm/rope/rot, so V NaN + K
+            // NaN => shared hidden/embedding fault at this layer's input;
+            // V finite + K NaN => K-path only (wk, attn_k_norm, RoPE, k_rot).
+            row_finite(layer.k, e.hot_slot, "K", layer.il, e.cell, e.pid);
+            row_finite(layer.v, e.hot_slot, "V", layer.il, e.cell, e.pid);
+        }
+    }
+}
 void llama_kv_cache::set_removal_rebuild_hook(xkv_removal_rebuild_fn fn) {
     removal_rebuild = std::move(fn);
 }
@@ -6065,14 +6124,28 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint32_t head_k_eff = (k_is_turbo && head_k % 128 != 0)
         ? ((head_k + 127) / 128) * 128 : head_k;
 
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    uint32_t n_kv_eff = n_kv;
+    uint32_t s0 = sinfo.s0;
+    uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    if (is_xkv_bounded_hot()) {
+        n_kv_eff = std::min(n_kv, (uint32_t) kv_size);
+        if (s0 >= n_stream) {
+            s0 = 0;
+        }
+        if (s0 + ns > n_stream) {
+            ns = (n_stream > s0) ? (n_stream - s0) : 1;
+        }
+        if (ns == 0) {
+            ns = 1;
+        }
+    }
 
     return ggml_view_4d(ctx, k,
-            head_k_eff, hparams.n_head_kv(il), n_kv, ns,
+            head_k_eff, hparams.n_head_kv(il), n_kv_eff, ns,
             ggml_row_size(k->type, head_k_eff),
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*s0);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -6092,25 +6165,39 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint32_t head_v_eff = (v_is_turbo && head_v % 128 != 0)
         ? ((head_v + 127) / 128) * 128 : head_v;
 
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    uint32_t n_kv_eff = n_kv;
+    uint32_t s0 = sinfo.s0;
+    uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    if (is_xkv_bounded_hot()) {
+        n_kv_eff = std::min(n_kv, (uint32_t) kv_size);
+        if (s0 >= n_stream) {
+            s0 = 0;
+        }
+        if (s0 + ns > n_stream) {
+            ns = (n_stream > s0) ? (n_stream - s0) : 1;
+        }
+        if (ns == 0) {
+            ns = 1;
+        }
+    }
 
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
         return ggml_view_4d(ctx, v,
-                head_v_eff, hparams.n_head_kv(il), n_kv, ns,
+                head_v_eff, hparams.n_head_kv(il), n_kv_eff, ns,
                 ggml_row_size(v->type, head_v_eff),                      // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                    // v->nb[2]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),            // v->nb[3]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*s0);
     }
 
     // note: v->nb[1] > v->nb[2]
     return ggml_view_4d(ctx, v,
-            n_kv, hparams.n_head_kv(il), head_v_eff, ns,
+            n_kv_eff, hparams.n_head_kv(il), head_v_eff, ns,
             ggml_row_size(v->type, kv_size*head_v_eff),              // v->nb[1]
             ggml_row_size(v->type, kv_size),                         // v->nb[2]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa),            // v->nb[3]
-            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*s0);
 }
 
 ggml_tensor * llama_kv_cache::get_hot_k(ggml_context * ctx, int32_t il, const slot_info & sinfo) const {
@@ -6171,6 +6258,18 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
         // merge the buffer across all streams because the idxs are global
         k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
+    }
+
+    // Logging hook to inspect k_cur inputs at build time
+    LLAMA_LOG_DEBUG("[cpy_k] layer %d: k_cur [%lld, %lld], n_tokens=%lld, n_embd_gqa=%lld, k type=%d\n",
+        il, (long long)k_cur->ne[0], (long long)k_cur->ne[1], (long long)n_tokens, (long long)n_embd_gqa, (int)k->type);
+
+    // Logging hook to inspect k_idxs values when available on host
+    if (k_idxs && k_idxs->data && ggml_backend_buffer_is_host(k_idxs->buffer)) {
+        const int64_t * idxs_ptr = (const int64_t *) k_idxs->data;
+        for (int64_t i = 0; i < std::min<int64_t>(10, n_tokens); ++i) {
+            LLAMA_LOG_ERROR("[cpy_k] layer %d: token %lld -> k_idx %lld\n", il, (long long)i, (long long)idxs_ptr[i]);
+        }
     }
 
     // store the current K values into the cache
@@ -6335,6 +6434,16 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
             data[s*sinfo.size() + i] = offs + cur_idxs[i];
         }
     }
+    // Host-side trace for the hot-slot38 NaN hunt: ubatch row -> dst slot,
+    // with RoPE position and output flag. RoPE of finite inputs with finite
+    // positions is finite, so finite positions here pin the NaN to pre-rope
+    // Kcur (matmul/norm); a non-finite position pins it to the RoPE cache.
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const long long pos = ubatch->pos ? (long long)ubatch->pos[i] : -1ll;
+        const int out = ubatch->output ? (int)ubatch->output[i] : -1;
+        LLAMA_LOG_ERROR("[k_idxs] ubatch_row %u -> dst slot %lld (pos %lld out %d hot %d)\n",
+            i, (long long)data[i], pos, out, (int)use_hot);
+    }
 }
 
 void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
@@ -6412,9 +6521,9 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
 
 void llama_kv_cache::set_input_k_shift_rows(ggml_tensor * dst) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-    GGML_ASSERT(dst->type == GGML_TYPE_I64);
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
 
-    int64_t * data = (int64_t *) dst->data;
+    int32_t * data = (int32_t *) dst->data;
     int64_t n = 0;
     const int64_t cap = dst->ne[0];
 
@@ -6432,7 +6541,7 @@ void llama_kv_cache::set_input_k_shift_rows(ggml_tensor * dst) const {
                 }
                 uint32_t slot = 0;
                 if (xkv_hot_pool->find_slot(cells.payload_id_get(i), slot) && slot < hot_size) {
-                    data[n++] = (int64_t) s * hot_size + slot;
+                    data[n++] = (int32_t)(s * hot_size + slot);
                 }
             }
         }
@@ -6441,12 +6550,11 @@ void llama_kv_cache::set_input_k_shift_rows(ggml_tensor * dst) const {
             const auto & cells = v_cells[s];
             for (uint32_t i = 0; i < cells.size() && n < cap; ++i) {
                 if (!cells.is_empty(i) && cells.get_shift(i) != 0) {
-                    data[n++] = (int64_t) s * cells.size() + i;
+                    data[n++] = (int32_t)(s * cells.size() + i);
                 }
             }
         }
     }
-    GGML_ASSERT(n == cap);
 }
 
 struct args_set_input_kq_mask {
@@ -7001,7 +7109,7 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
             }
         }
         if (n_shifted_rows > 0) {
-            inp->k_shift_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_shifted_rows);
+            inp->k_shift_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_shifted_rows);
             ggml_set_input(inp->k_shift_rows);
         }
     }
@@ -7042,19 +7150,23 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
                 ggml_row_size(layer.k->type, head_w), layer.k->nb[1], 0);
             ggml_tensor * dec = ggml_cast(ctx, kfull, GGML_TYPE_F32);
             ggml_tensor * canon = ggml_turbo_wht(ctx, dec, 1 /*inverse*/, 128, nullptr);
-            ggml_tensor * sec = ggml_view_3d(ctx, canon,
-                n_rot, n_head_kv, k_shift_size,
-                canon->nb[1], canon->nb[2], 0);
-            // Rope the section in place (sec shares canon storage; the F32
-            // branch ignores k_rot exactly like the stock F32 shift path).
-            (void) build_rope_shift(cparams, ctx, sec, inp->k_shift, inp->k_rot,
+            // Rope full canon rows (first n_rot cols only, identical to the old
+            // sec-view section) so the result chains into the forward WHT.
+            // NOTE: rope must chain into forward WHT. ggml_rope_ext is out-of-place
+            // (dup) and ggml_rope_ext_inplace returns a view alias: discarding the
+            // return value orphans the ROPE node from the graph, so forward WHT
+            // would re-encode unrotated canon (CPU no-op). Rope full canon rows
+            // with n_rot (touches first n_rot cols only, identical to sec view)
+            // so the result chains directly into the forward WHT.
+            ggml_tensor * roped = build_rope_shift(cparams, ctx, canon, inp->k_shift, inp->k_rot,
                 rope_factors, freq_base_l, freq_scale_l, il);
-            ggml_tensor * rot = ggml_turbo_wht(ctx, canon, 0 /*forward*/, 128, nullptr);
             // Gather the shifted subset for write-back (F32 get_rows is
             // universal); set_rows quantizes on device with the same
-            // wht_group contract as the K-write path.
-            ggml_tensor * flat = ggml_view_2d(ctx, rot, head_w * n_head_kv, k_shift_size,
-                rot->nb[2], 0);
+            // wht_group contract as the K-write path (which performs forward WHT
+            // rotation inside quantization, e.g. copy_to_quant.comp / quantize_row_turbo*_group).
+            // Feeding an already-WHT-rotated tensor into set_rows would double-rotate.
+            ggml_tensor * flat = ggml_view_2d(ctx, roped, head_w * n_head_kv, k_shift_size,
+                roped->nb[2], 0);
             ggml_tensor * sub = ggml_get_rows(ctx, flat, inp->k_shift_rows);
             ggml_tensor * dst = layer.k;
             if (n_stream > 1) {
@@ -8342,6 +8454,11 @@ void llama_kv_cache::xkv_state_read_trailer(llama_io_read_i & io, llama_seq_id s
             refuse("no transaction coordinator for fenced import");
         }
         std::string ferr;
+        llama_xkv::xkv_quiesce_options qo;
+        qo.wait = true;
+        if (xkv_tx_coord->wait_for_readers_drained(qo, &ferr) != llama_xkv::xkv_tx_status::ok) {
+            refuse("reader drain refused import: " + ferr);
+        }
         // NOTE to TransactionCore: no restore op exists yet; seal is the closest
         // existing exclusion fence. Please add xkv_maintenance_op::restore.
         llama_xkv::xkv_maintenance_guard mguard(
@@ -8349,11 +8466,6 @@ void llama_kv_cache::xkv_state_read_trailer(llama_io_read_i & io, llama_seq_id s
             plan.bundle.next_seal_tx_nonce, &ferr);
         if (!mguard.held()) {
             refuse("maintenance guard refused import: " + ferr);
-        }
-        llama_xkv::xkv_quiesce_options qo;
-        qo.wait = true;
-        if (xkv_tx_coord->wait_for_readers_drained(qo, &ferr) != llama_xkv::xkv_tx_status::ok) {
-            refuse("reader drain refused import: " + ferr);
         }
         // Adapt to the store contract: factored locations only (hot/flat never
         // install pool/dense rows from state), zero nonces, nonzero generations.
@@ -8374,6 +8486,7 @@ void llama_kv_cache::xkv_state_read_trailer(llama_io_read_i & io, llama_seq_id s
         sb.sealed_count       = sealed;
         sb.next_segment_id    = plan.bundle.next_segment_id;
         sb.next_seal_tx_nonce = plan.bundle.next_seal_tx_nonce;
+        sb.next_alloc_id      = plan.bundle.next_alloc_id;
         // Pre-commit dedup fit against the validated bundle cap (the store
         // enforces its live cap internally as well).
         {
@@ -8597,6 +8710,12 @@ void llama_kv_cache::xkv_state_read_trailer(llama_io_read_i & io, llama_seq_id s
             loc.storage_generation != b.generation) {
             refuse("rebound cell without live factored location");
         }
+    }
+
+    // Invalidate decoded tile cache upon successful state restore so restored
+    // streams cannot hit stale pre-restore decoded tiles (fail-closed, §13).
+    if (xkv_runtime) {
+        xkv_runtime->clear_decode_cache();
     }
 }
 
@@ -9009,6 +9128,10 @@ bool llama_kv_cache_context::apply() {
             e.has_hot = bounded && !sinfo.hot_idxs.empty() && s < sinfo.hot_idxs.size() &&
                         ii < sinfo.hot_idxs[s].size();
             e.hot_slot = e.has_hot ? sinfo.hot_idxs[s][ii] : 0;
+            if (e.has_hot) {
+                LLAMA_LOG_ERROR("[llama_kv_cache] apply_ubatch: bound cell %u to hot_slot %u (pid %llu, gen %llu)\n",
+                    cell_idx, e.hot_slot, (unsigned long long)e.pid, (unsigned long long)e.gen);
+            }
             applied_entries.push_back(e);
         }
     }
@@ -9094,6 +9217,7 @@ bool llama_kv_cache_context::postcompute_success() {
             postcompute_ok = false;
             return false;
         }
+        kv->verify_bound_hot_rows(applied_entries);
     }
     for (const auto & victims : pending_victims) {
         if (!victims.empty()) {

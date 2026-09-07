@@ -55,6 +55,22 @@ layout (binding = 8, std430) readonly buffer ROPE { float rope[]; };
 layout (binding = 9, std430) buffer DST { float dst[]; };
 
 const float C2[4] = float[4](-0.133462, -0.039994, 0.039994, 0.133462);
+
+// Cody-Waite range reduction of pos * omega to [-pi, pi] using double-precision
+// splitting of 2*pi (PI2_HI + PI2_LO = 2*pi exact to 48 bits). Eliminates
+// GPU hardware range-reduction divergence on large angles (|pos| <= 4096)
+// so v_sin_f32 / v_cos_f32 operate in their near-exact [-pi, pi] domain.
+void rope_trig_cody_waite(float pos_f, float omega, out float out_c, out float out_s) {
+    const float INV_TWO_PI = 0.15915494309189535; // 1 / (2*pi)
+    const float TWO_PI_HI  = 6.2831854820251465;  // high 24 bits
+    const float TWO_PI_LO  = -1.748455588302094e-7; // low bits
+    float ang = pos_f * omega;
+    float k_cycles = round(ang * INV_TWO_PI);
+    float red_ang = fma(k_cycles, -TWO_PI_HI, ang);
+    red_ang = fma(k_cycles, -TWO_PI_LO, red_ang);
+    out_c = cos(red_ang);
+    out_s = sin(red_ang);
+}
 const float C3[8] = float[8](
     -0.190685, -0.117832, -0.065717, -0.021460,
      0.021460,  0.065717,  0.117832,  0.190685);
@@ -323,8 +339,8 @@ void main() {
             for (uint f = 0u; f < fc; ++f) {
                 float omega = rope[f];
                 float mg = rope[fc0 + f];
-                float ang = float(pos) * omega;
-                float c = cos(ang), s = sin(ang);
+                float c, s;
+                rope_trig_cody_waite(float(pos), omega, c, s);
                 float re = dst[dst_base + f], im = dst[dst_base + f + fc];
                 dst[dst_base + f] = (re * c - im * s) * mg;
                 dst[dst_base + f + fc] = (re * s + im * c) * mg;
@@ -333,8 +349,8 @@ void main() {
             for (uint f = 0u; f < fc; ++f) {
                 float omega = rope[f];
                 float mg = rope[fc0 + f];
-                float ang = float(pos) * omega;
-                float c = cos(ang), s = sin(ang);
+                float c, s;
+                rope_trig_cody_waite(float(pos), omega, c, s);
                 float re = dst[dst_base + 2u * f], im = dst[dst_base + 2u * f + 1u];
                 dst[dst_base + 2u * f] = (re * c - im * s) * mg;
                 dst[dst_base + 2u * f + 1u] = (re * s + im * c) * mg;

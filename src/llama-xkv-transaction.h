@@ -28,7 +28,10 @@
 //     tx per seq_id; multiple active seq_ids concurrently.
 //   - no one slot commit stales valid peer transactions.
 //   - maintenance, final fence, and context shift are excluded while ANY active
-//     transaction or removal callback is in flight.
+//     transaction, removal callback, or reader snapshot is in flight.
+//     Publication (seal/pack/relocate/landmark_publish) must run only after
+//     snapshot pins are released (§10.2: release pins before reclaim/pack/seal
+//     and epoch/view publication; §10.3 COW/pin).
 //   - all public mutators catch std::bad_alloc / exceptions and roll back safely,
 //     never throwing into C ABI or leaving half-modified coordinator state.
 

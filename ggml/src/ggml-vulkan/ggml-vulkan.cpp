@@ -14609,10 +14609,6 @@ static void ggml_vk_xkv_landmark_rows(ggml_backend_vk_context * ctx, vk_context 
     vk_op_xkv_landmark_rows_push pc;
     static_assert(sizeof(pc) == sizeof(p), "rows push must match rows params size");
     memcpy(&pc, &p, sizeof(p));
-    pc.status_flag = 0;
-    ggml_vk_dispatch_pipeline(ctx, subctx, prows,
-        { bsel, bmeta, boff, bids, bkv, bpos, bptrs, bdst, boutpos, bentries, bst }, pc, { p.n_queries * 64u, 1, 1 });
-    ggml_vk_sync_buffers(ctx, subctx);
     pc.status_flag = 1;
     ggml_vk_dispatch_pipeline(ctx, subctx, prows,
         { bsel, bmeta, boff, bids, bkv, bpos, bptrs, bdst, boutpos, bentries, bst }, pc, { 1, 1, 1 });
@@ -20515,6 +20511,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         break;
                     }
                 }
+                // Turbo->F32 dequantize is pipeline-backed (cpy_quant_f32); the
+                // reverse F32->Turbo direction has no CPY pipeline and stays rejected.
                 if (src1_type == GGML_TYPE_F32) {
                     switch (src0_type) {
                     case GGML_TYPE_F16:
@@ -20527,6 +20525,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_IQ4_NL:
+                    case GGML_TYPE_TURBO2_0:
+                    case GGML_TYPE_TURBO3_0:
+                    case GGML_TYPE_TURBO4_0:
                         return true;
                     default:
                         break;

@@ -1007,6 +1007,10 @@ xkv_tx_status xkv_transaction_coordinator::begin_maintenance(xkv_maintenance_op 
         set_err(err, "begin_maintenance: verification/frontier commit active");
         return xkv_tx_status::tx_active;
     }
+    if (active_readers_ > 0) {
+        set_err(err, "begin_maintenance: reader snapshot active");
+        return xkv_tx_status::busy;
+    }
     if (maintenance_active_) {
         set_err(err, "begin_maintenance: maintenance already active");
         return xkv_tx_status::busy;
@@ -1035,7 +1039,7 @@ xkv_tx_status xkv_transaction_coordinator::end_maintenance(uint64_t maint_id, st
 
 bool xkv_transaction_coordinator::maintenance_allowed() const {
     std::lock_guard<std::mutex> lock(mtx_);
-    return active_txs_.empty() && !maintenance_active_;
+    return active_txs_.empty() && !maintenance_active_ && active_readers_ == 0;
 }
 
 bool xkv_transaction_coordinator::has_active_maintenance() const {

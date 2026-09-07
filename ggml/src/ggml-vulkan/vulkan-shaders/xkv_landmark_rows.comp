@@ -217,9 +217,9 @@ void main() {
 
             if (use_list) {
                 list_off = frag_row_off[f];
-                if (list_off >= 0) {
-                    list_nxt = frag_row_off[f + 1u];
-                    if (list_nxt < list_off || uint(list_nxt - list_off) > p.max_frag_rows) {
+                list_nxt = frag_row_off[f + 1u];
+                if (list_off >= 0 && list_nxt > list_off) {
+                    if (uint(list_nxt - list_off) > p.max_frag_rows) {
                         row_status[0] = 2;
                         row_status[1] = 0; row_status[2] = 0; row_status[3] = 0;
                         return;

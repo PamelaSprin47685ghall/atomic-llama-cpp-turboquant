@@ -927,7 +927,10 @@ bool ggml_xkv_landmark_rows_cpu_oracle(
                 // Arena filter before cap accounting: frag_kv[1] is the arena ordinal.
                 const uint32_t frag_arena = (uint32_t)frag_kv[(size_t)f * 3 + 1];
                 if (!filter_all && frag_arena != arena_filter) continue;
-                if (!sparse || frag_row_off[f] < 0) {
+                // Sparse fragments: if frag_row_off[f] < 0 or frag_row_off[f+1] <= frag_row_off[f],
+                // this fragment has empty/non-existent sparse list and falls back to contiguous [rb, rb+rc).
+                const bool has_sparse_list = sparse && (frag_row_off[f] >= 0) && (frag_row_off[f + 1] > frag_row_off[f]);
+                if (!has_sparse_list) {
                     const int32_t rb = frag_meta[(size_t)f * frag_meta_stride + 0];
                     const int32_t rc = frag_meta[(size_t)f * frag_meta_stride + 1];
                     if (rb < 0 || rc <= 0 || rc > (int32_t)GGML_XKV_LANDMARK_MAX_FRAG_ROWS ||
@@ -946,7 +949,7 @@ bool ggml_xkv_landmark_rows_cpu_oracle(
                 } else {
                     const int32_t off = frag_row_off[f];
                     const int32_t nxt = frag_row_off[f + 1];
-                    if (off < 0 || nxt < off || nxt - off > (int32_t)GGML_XKV_LANDMARK_MAX_FRAG_ROWS) {
+                    if (off < 0 || nxt <= off || nxt - off > (int32_t)GGML_XKV_LANDMARK_MAX_FRAG_ROWS) {
                         xvk_err(err, err_size, "xkv rows: sparse list above maximum"); return false;
                     }
                     for (int32_t k = off; k < nxt; ++k) {

@@ -401,7 +401,10 @@ inline landmark_fragment_view view_of_fragment(const legal_fragment & f) {
     v.error_bound = f.error_bound;
     v.base_landmark = f.base_landmark ? f.base_landmark.get() : nullptr;
     v.base_landmark_row = f.base_landmark_row;
-    v.group_index = f.parent_group_id != 0 ? f.parent_group_id : f.key.ddvr_group;
+    // Explicit per-(parent, slot) assignment rides through verbatim (slot 0
+    // included); shared/unconstrained fragments stay UINT32_MAX
+    // (unspecified), matching the reference batch which fills invalid.
+    v.group_index = (f.parent_query_id != UINT32_MAX) ? f.parent_group_id : UINT32_MAX;
     return v;
 }
 class landmark_workspace {

@@ -213,7 +213,7 @@ struct vec_read : public llama_io_read_i {
 // precondition, nonzero generations, unique ids, high-water max() (never
 // derived down), dedup bytes vs min(bundle cap, live cap), all-or-none.
 struct fake_store {
-    std::map<uint64_t, std::shared_ptr<const xkv_segment>> segs;
+    std::map<std::pair<uint64_t, uint64_t>, std::shared_ptr<const xkv_segment>> segs;
     std::map<uint64_t, xkv_location> locs;
     xkv_snapshot_stamp stamp;
     uint64_t next_seg = 1;
@@ -241,7 +241,7 @@ struct fake_store {
         uint64_t max_seg = 0, max_nonce = 0, dedup = 0;
         std::map<const encoded_matrix *, size_t> seen_b;
         for (const auto & s : b.segments) {
-            if (s == nullptr || s->segment_id == 0 || segs.count(s->segment_id) != 0) {
+            if (s == nullptr || s->segment_id == 0 || segs.count({s->segment_id, s->segment_version}) != 0) {
                 return fail("import refused: bad/duplicate segment id");
             }
             if (s->segment_id > max_seg) {
@@ -278,7 +278,7 @@ struct fake_store {
             return fail("import refused: high-water closure violated");
         }
         for (const auto & s : b.segments) {
-            segs[s->segment_id] = s;
+            segs[{s->segment_id, s->segment_version}] = s;
         }
         for (const auto & pl : b.locations) {
             locs[pl.first] = pl.second;
@@ -516,9 +516,13 @@ int main() {
         std::vector<std::shared_ptr<const xkv_segment>> segs = {s5v1, s5v2};
         std::vector<xkv_hot_payload_binding> hot = {{901, 5, 3, xkv_state::hot_committed}};
         std::vector<xkv_state_payload> pays;
-        pays.push_back(live_payload(100, 5, 1, 0, 9));
-        pays.push_back(live_payload(101, 5, 1, 1, 9));
-        pays.push_back(live_payload(103, 5, 1, 3, 9));
+        for (const auto & seg : segs) {
+            for (uint32_t r = 0; r < 4; ++r) {
+                if (!seg->live_rows[r]) continue;
+                pays.push_back(live_payload(seg->row_payload_ids[r], 5, seg->segment_version, r, 9));
+            }
+        }
+        std::sort(pays.begin(), pays.end(), [](const auto & a, const auto & b) { return a.payload_id < b.payload_id; });
         xkv_state_image derived;
         CHECK(capture_image(segs, hot, pays, test_accounting(), 16, 8, zero_hw, test_fps(),
                             test_prov(), test_stamp(), test_limits(), derived, nullptr, &err));
@@ -882,7 +886,15 @@ int main() {
         // Known-answer spot check (SHA-256 of "abc").
         uint8_t abc[32];
         xkv_sha256((const uint8_t *) "abc", 3, abc);
-        CHECK(abc[0] == 0xBA && abc[1] == 0x78 && abc[31] == 0xC3);
+        // Full RFC 6234 known-answer test vector for SHA-256("abc"):
+        // ba7816bf 8f01cfea 414140de 5dae2223 b00361a3 96177a9c b410ff61 f20015ad
+        static const uint8_t expected_abc[32] = {
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+            0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+            0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+            0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
+        };
+        CHECK(std::memcmp(abc, expected_abc, 32) == 0);
     }
 
     // --- Bridge: exact source-file content digests ---
@@ -1155,6 +1167,8 @@ int main() {
         // real device handles (simulated with REFERENCE_HOST handles or dummy backend allocations).
         auto dev_seg = make_segment(30, 1, 3000);
         dev_seg->residency = GGML_XKV_RES_DEVICE_OWNED;
+        encoded_matrix orig_lm = make_stream(factor_role::landmark, orientation::token_major, 2, 8, 305);
+        dev_seg->groups[0].landmark = orig_lm;
 
         // Populate landmark chunks so chunk verification passes
         dev_seg->groups[0].landmark_chunks = {
@@ -1163,13 +1177,15 @@ int main() {
         };
         dev_seg->groups[0].landmark_table_fingerprint =
             compute_landmark_table_fingerprint(dev_seg->groups[0].landmark_chunks);
+        dev_seg->groups[0].refresh_descriptor_fingerprint();
+        dev_seg->update_byte_counters();
 
         // Keep a copy of original stream bytes for readback verification
         std::vector<uint8_t> orig_ak_bytes = dev_seg->groups[0].a_k.bytes;
         std::vector<uint8_t> orig_bk_bytes = dev_seg->groups[0].b_k->bytes;
         std::vector<uint8_t> orig_av_bytes = dev_seg->groups[0].a_v.bytes;
         std::vector<uint8_t> orig_bv_bytes = dev_seg->groups[0].b_v->bytes;
-        std::vector<uint8_t> orig_lm_bytes = dev_seg->groups[0].landmark.bytes;
+        std::vector<uint8_t> orig_lm_bytes = orig_lm.bytes;
 
         // DEVICE_OWNED: host stream bytes are cleared post-upload
         dev_seg->groups[0].a_k.bytes.clear();
@@ -1408,9 +1424,9 @@ int main() {
         xkv_state_image cback;
         CHECK(decode_image(cwire.data(), cwire.size(), cback, test_fps(), test_prov(), test_limits(), &cerr));
         CHECK(cback.segments[0].n_rows == 5);
-        CHECK(cback.allocations[0].bytes == cg.a_k.bytes);
-        CHECK(cback.allocations[2].bytes == cg.a_v.bytes);
-        CHECK(cback.allocations[4].bytes == cg.landmark.bytes);
+        CHECK(cback.allocations[cback.segments[0].groups[0].stream_ak].bytes == cseg->groups[0].a_k.bytes);
+        CHECK(cback.allocations[cback.segments[0].groups[0].stream_av].bytes == cseg->groups[0].a_v.bytes);
+        CHECK(cback.allocations[cback.segments[0].groups[0].stream_landmark].bytes == cseg->groups[0].landmark.bytes);
     }
 
     // --- Bridge: Negative test: same-descriptor but different A-factor content rejected ---

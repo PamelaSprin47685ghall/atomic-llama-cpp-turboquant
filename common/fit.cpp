@@ -7,6 +7,7 @@
 #include "../src/llama-flashprefill-layout.h"
 #include "../src/llama-model.h"
 #include "../src/llama-xkv-factor.h"
+#include "../src/llama-xkv-codec.h"
 
 #include <array>
 #include <cassert>
@@ -255,7 +256,7 @@ static bool xkv_checked_sum_fit_bytes(uint64_t model, uint64_t context, uint64_t
 }
 
 bool common_xkv_fit_reserve_bytes(const llama_context_params * cparams, uint64_t scratch_bytes,
-        common_xkv_fit_reserve * out) {
+        common_xkv_fit_reserve * out, uint64_t dedup_scratch_bytes) {
     if (out == nullptr) {
         return false;
     }
@@ -290,6 +291,10 @@ bool common_xkv_fit_reserve_bytes(const llama_context_params * cparams, uint64_t
     out->workspace_bytes       = workspace;
     out->decode_cache_bytes    = decode_cache;
     out->factor_scratch_bytes  = scratch_bytes;
+    // Store-owned host dedup vectors live outside the workspace arena:
+    // carried for host-charge accounting, never device-partitioned and
+    // never double-counted against the workspace sub-budget above.
+    out->dedup_scratch_bytes   = dedup_scratch_bytes;
     out->total_bytes           = workspace; // once: never the sum
     return true;
 }
@@ -422,7 +427,11 @@ bool common_xkv_scratch_for_group(
         uint32_t rank_k,
         uint32_t rank_v,
         ggml_type landmark_type,
-        uint64_t * out_bytes) {
+        uint64_t * out_bytes,
+        ggml_type type_a_k,
+        ggml_type type_b_k,
+        ggml_type type_a_v,
+        ggml_type type_b_v) {
     if (out_bytes == nullptr) {
         return false;
     }
@@ -440,13 +449,16 @@ bool common_xkv_scratch_for_group(
     }
     const uint32_t chunk = chunk_tokens == 0 ? 1 : chunk_tokens;
     std::string err;
-    // Exact rSVD factorize peaks per stream (outputs + live scratch).
+    // Exact rSVD factorize peaks per stream (outputs + live scratch), plus
+    // both FP factor outputs (K and V stay live into shadow evaluation).
     uint64_t ws_k = 0;
     uint64_t ws_v = 0;
     uint64_t out_k = 0;
+    uint64_t out_v = 0;
     if (!llama_xkv::estimate_factorize_matrix_workspace_bytes(seg_tokens, feat_k, rank_k, 16, 2, &ws_k, &err) ||
         !llama_xkv::estimate_factorize_matrix_workspace_bytes(seg_tokens, feat_v, rank_v, 16, 2, &ws_v, &err) ||
-        !llama_xkv::estimate_factor_output_bytes(seg_tokens, feat_k, rank_k, &out_k, &err)) {
+        !llama_xkv::estimate_factor_output_bytes(seg_tokens, feat_k, rank_k, &out_k, &err) ||
+        !llama_xkv::estimate_factor_output_bytes(seg_tokens, feat_v, rank_v, &out_v, &err)) {
         return false;
     }
     // Simultaneous K+V peak (K output live during V factorization), same
@@ -457,16 +469,83 @@ bool common_xkv_scratch_for_group(
         return false;
     }
     ws_fact = std::max(ws_fact, term2);
-    // Quantized-shadow streaming tile extra beyond the FP outputs above
-    // (4 encoded streams only shrink vs FP; the tile streams alongside).
-    uint64_t rank_sum = 0;
-    uint64_t tile_elems = 0;
-    uint64_t tile_extra = 0;
-    if (!xkv_checked_add_u64(rank_k, rank_v, rank_sum) ||
-        !xkv_checked_mul_u64(chunk, rank_sum, tile_elems) ||
-        !xkv_checked_mul_u64(tile_elems, sizeof(float), tile_extra)) {
+    // Exact candidate encoded bytes via the canonical codec descriptors
+    // (same recipe the seal path preflights). Turbo rank-128 padding is
+    // included: encoded can EXCEED FP at tiny rank, never inferred from FP
+    // logical size.
+    auto xkv_is_turbo = [](ggml_type t) {
+        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+    };
+    const uint32_t grp_k = xkv_is_turbo(type_a_k) ? 128 : 0;
+    const uint32_t grp_v = xkv_is_turbo(type_a_v) ? 128 : 0;
+    uint64_t enc_ak = 0;
+    uint64_t enc_bk = 0;
+    uint64_t enc_av = 0;
+    uint64_t enc_bv = 0;
+    uint64_t pad_ra = 0;
+    uint64_t pad_rb = 0;
+    size_t dec_tmp_ak = 0;
+    size_t dec_tmp_bk = 0;
+    size_t dec_tmp_av = 0;
+    size_t dec_tmp_bv = 0;
+    try {
+        using namespace llama_xkv;
+        const codec_desc d_ak = make_codec_desc(factor_role::a_k, type_a_k,
+            orientation::token_major, matrix_shape{(uint64_t) seg_tokens, (uint64_t) rank_k}, grp_k, 42);
+        const codec_desc d_bk = make_codec_desc(factor_role::b_k, type_b_k,
+            orientation::feature_major_transposed, matrix_shape{feat_k, (uint64_t) rank_k}, grp_k, 42);
+        const codec_desc d_av = make_codec_desc(factor_role::a_v, type_a_v,
+            orientation::token_major, matrix_shape{(uint64_t) seg_tokens, (uint64_t) rank_v}, grp_v, 43);
+        const codec_desc d_bv = make_codec_desc(factor_role::b_v, type_b_v,
+            orientation::feature_major_transposed, matrix_shape{feat_v, (uint64_t) rank_v}, grp_v, 43);
+        enc_ak = encoded_matrix_bytes(d_ak);
+        enc_bk = encoded_matrix_bytes(d_bk);
+        enc_av = encoded_matrix_bytes(d_av);
+        enc_bv = encoded_matrix_bytes(d_bv);
+            pad_ra = std::max(d_ak.padded_shape.cols, d_av.padded_shape.cols);
+            pad_rb = std::max(d_bk.padded_shape.cols, d_bv.padded_shape.cols);
+            if (!decode_rows_scratch_bytes(d_ak, dec_tmp_ak) ||
+                !decode_rows_scratch_bytes(d_bk, dec_tmp_bk) ||
+                !decode_rows_scratch_bytes(d_av, dec_tmp_av) ||
+                !decode_rows_scratch_bytes(d_bv, dec_tmp_bv)) {
+                return false;
+            }
+        } catch (...) {
+            return false;
+        }
+    uint64_t cand_encoded = 0;
+    if (!xkv_checked_add_u64(enc_ak, enc_bk, cand_encoded) ||
+        !xkv_checked_add_u64(cand_encoded, enc_av, cand_encoded) ||
+        !xkv_checked_add_u64(cand_encoded, enc_bv, cand_encoded)) {
         return false;
     }
+    // Quantized-shadow peak mirrors estimate_quantized_shadow_workspace_bytes:
+    // live FP factors + exact encoded streams + decode tile scratch (tile
+    // buffers sized by the padded ranks above, never the logical ranks).
+    uint64_t fp_live = 0;
+    uint64_t tile_a = 0;
+    uint64_t tile_b = 0;
+    uint64_t tile_idx = 0;
+    uint64_t ws_shadow = 0;
+    const uint64_t max_dec_tmp = (uint64_t) std::max(std::max(dec_tmp_ak, dec_tmp_bk),
+        std::max(dec_tmp_av, dec_tmp_bv));
+    uint64_t dec_tmp_budget = 0;
+    if (!xkv_checked_add_u64(out_k, out_v, fp_live) ||
+        !xkv_checked_mul_u64(64, sizeof(float), tile_a) ||
+        !xkv_checked_mul_u64(tile_a, pad_ra, tile_a) ||
+        !xkv_checked_mul_u64(64, sizeof(float), tile_b) ||
+        !xkv_checked_mul_u64(tile_b, pad_rb, tile_b) ||
+        !xkv_checked_mul_u64(128, sizeof(uint64_t), tile_idx) ||
+        !xkv_checked_add_u64(max_dec_tmp, 1024, dec_tmp_budget) ||
+        !xkv_checked_add_u64(fp_live, cand_encoded, ws_shadow) ||
+        !xkv_checked_add_u64(ws_shadow, tile_a, ws_shadow) ||
+        !xkv_checked_add_u64(ws_shadow, tile_b, ws_shadow) ||
+        !xkv_checked_add_u64(ws_shadow, tile_idx, ws_shadow) ||
+        !xkv_checked_add_u64(ws_shadow, dec_tmp_budget, ws_shadow)) {
+        return false;
+    }
+    // Group peak is the worse of factorize vs shadow (arena lease grows).
+    const uint64_t ws_group_peak = std::max(ws_fact, ws_shadow);
     // Canonical pre-RoPE capture peak (F32 K+V rows for the segment).
     uint64_t feat_sum = 0;
     uint64_t cap_elems = 0;
@@ -477,15 +556,19 @@ bool common_xkv_scratch_for_group(
         return false;
     }
     // Landmark stream bound: one pooled vector per fragment. Landmarks
-    // summarize reconstructed K only (never K+V): row size is ggml_row_size
-    // over feat_k, not feat_sum. Exact, not estimated.
+    // summarize reconstructed K only (never K+V) over feat_k, via the
+    // canonical descriptor so Turbo landmark padding matches the seal path.
     const uint64_t n_frag = ((uint64_t) seg_tokens + chunk - 1) / chunk;
-    if (feat_k > (uint64_t) INT64_MAX) {
+    if (feat_k > (uint64_t) INT64_MAX || n_frag > (uint64_t) INT64_MAX) {
         return false;
     }
-    const size_t lm_row = ggml_row_size(landmark_type, (int64_t) feat_k);
     uint64_t landmark = 0;
-    if (lm_row == 0 || !xkv_checked_mul_u64(n_frag, (uint64_t) lm_row, landmark)) {
+    try {
+        using namespace llama_xkv;
+        const codec_desc d_lm = make_codec_desc(factor_role::landmark, landmark_type,
+            orientation::token_major, matrix_shape{n_frag, feat_k}, 0, 777);
+        landmark = encoded_matrix_bytes(d_lm);
+    } catch (...) {
         return false;
     }
     // Telemetry and staging metadata scratch:
@@ -507,9 +590,7 @@ bool common_xkv_scratch_for_group(
     // Conservative simultaneous sum: peaks may not fully coincide, but
     // under-reserving seal-time workspace is the unsafe direction.
     uint64_t total = 0;
-    uint64_t tmp = 0;
-    if (!xkv_checked_add_u64(ws_fact, tile_extra, tmp) ||
-        !xkv_checked_add_u64(tmp, capture, total) ||
+    if (!xkv_checked_add_u64(ws_group_peak, capture, total) ||
         !xkv_checked_add_u64(total, landmark, total) ||
         !xkv_checked_add_u64(total, telem_staging, total) ||
         !xkv_checked_add_u64(total, stream_alloc_align, *out_bytes)) {
@@ -573,11 +654,15 @@ bool common_xkv_scratch_bytes(
         const char * path_model,
         const llama_model_params * mparams,
         const llama_context_params * cparams,
-        uint64_t * out_bytes) {
+        uint64_t * out_bytes,
+        uint64_t * out_dedup_scratch_bytes) {
     if (out_bytes == nullptr) {
         return false;
     }
     *out_bytes = 0;
+    if (out_dedup_scratch_bytes != nullptr) {
+        *out_dedup_scratch_bytes = 0;
+    }
     if (path_model == nullptr || mparams == nullptr || cparams == nullptr) {
         return false;
     }
@@ -600,6 +685,7 @@ bool common_xkv_scratch_bytes(
     uint64_t dk_max = 0;
     uint64_t dv_max = 0;
     bool any_trunk = false;
+    uint64_t n_attn_layers = 0;
     const auto & hp = meta_model->hparams;
     const uint32_t n_layer = hp.n_layer();
     for (uint32_t il = 0; il < n_layer; ++il) {
@@ -621,12 +707,21 @@ bool common_xkv_scratch_bytes(
             continue; // no KV (projection-only layer)
         }
         any_trunk = true;
+        n_attn_layers++;
         dk_max = std::max(dk_max, dk);
         dv_max = std::max(dv_max, dv);
     }
     llama_model_free(meta_model);
     if (!any_trunk) {
-        return false;
+        // Hybrid/MoE model with no full-attention trunk layers (or all
+        // recurrent/SWA/sharing layers): XKV factor scratch is zero. Never
+        // abort auto-fit; degrade to zero reserve with an explicit warning.
+        LOG_WRN("%s: no full-attention trunk layers found in model; degrading XKV scratch reserve to 0\n", __func__);
+        *out_bytes = 0;
+        if (out_dedup_scratch_bytes != nullptr) {
+            *out_dedup_scratch_bytes = 0;
+        }
+        return true;
     }
     // Largest alias-dedup group bound: every member is at most the per-layer
     // max, so group_size * max bounds any spliced group the store builds.
@@ -636,10 +731,45 @@ bool common_xkv_scratch_bytes(
         !xkv_checked_mul_u64(group, dv_max, feat_v)) {
         return false;
     }
+    // Store-owned host dedup-scratch upper bound from the fit topology
+    // (mirrors ensure_accounting_scratch_locked): 8 B per B-matrix pointer
+    // in each of the two unique vectors plus 8 B per backend handle, over
+    // published + one retired + one candidate segment.
+    if (out_dedup_scratch_bytes != nullptr) {
+        // When called before KV capacity fitting (e.g. initial recurrent probe),
+        // n_ctx_kv and n_ctx may both be 0: fall back to 512 tokens minimum.
+        const uint64_t k_raw = std::max(cparams->n_ctx_kv, cparams->n_ctx);
+        const uint64_t k_tokens = k_raw > 0 ? k_raw : 512;
+        const uint64_t seg = cparams->xkv_segment_tokens;
+        uint64_t n_seg = 0;
+        uint64_t n_groups = 0;
+        uint64_t sum_b = 0;
+        uint64_t sum_backend = 0;
+        uint64_t dedup = 0;
+        if (seg == 0 || group == 0 ||
+            !xkv_checked_add_u64((k_tokens + seg - 1) / seg, 2, n_seg) ||
+            (n_groups = (n_attn_layers + group - 1) / group) == 0 ||
+            !xkv_checked_mul_u64(2, n_groups, sum_b) ||
+            !xkv_checked_mul_u64(sum_b, n_seg, sum_b) ||
+            !xkv_checked_mul_u64(8, n_groups, sum_backend) ||
+            !xkv_checked_mul_u64(sum_backend, n_seg, sum_backend) ||
+            !xkv_checked_add_u64(sum_b, sum_b, dedup) ||
+            !xkv_checked_add_u64(dedup, sum_backend, dedup) ||
+            !xkv_checked_mul_u64(dedup, 8, dedup)) {
+            return false;
+        }
+        // Floor at the store's initial reservation (64 + 64 ptrs + 128 ids).
+        if (dedup < 2048) {
+            dedup = 2048;
+        }
+        *out_dedup_scratch_bytes = dedup;
+    }
     return common_xkv_scratch_for_group(
         cparams->xkv_segment_tokens, cparams->xkv_chunk_tokens,
         feat_k, feat_v, cparams->xkv_rank_k, cparams->xkv_rank_v,
-        cparams->xkv_landmark_type, out_bytes);
+        cparams->xkv_landmark_type, out_bytes,
+        cparams->xkv_factor_a_k, cparams->xkv_factor_b_k,
+        cparams->xkv_factor_a_v, cparams->xkv_factor_b_v);
 }
 
 uint64_t common_xkv_store_budget_bytes(const llama_context_params * cparams) {
@@ -808,7 +938,10 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
         const user_data_t * ud = (const user_data_t *) user_data;
-        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
+        // Forward all ERROR and WARN messages unconditionally so context creation
+        // failures are visible regardless of probe min_level.
+        const ggml_log_level level_eff = (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN || level >= ud->min_level)
+            ? level : GGML_LOG_LEVEL_DEBUG;
         ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
     }, &ud);
 
@@ -1137,7 +1270,8 @@ static void common_params_fit_impl(
     }
 
     if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
-        throw common_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");
+        LOG_INF("%s: n_gpu_layers already set by user to %d; skipping parameter fitting\n", __func__, mparams->n_gpu_layers);
+        return;
     }
     if (nd > 1) {
         if (!tensor_split) {
@@ -1752,24 +1886,26 @@ common_params_fit_status common_fit_kv_cache(
     // seal scratch must fit the remainder after the decode sub-budget.
     // OFF yields zeros and changes nothing.
     uint64_t xkv_scratch_once = 0;
+    uint64_t xkv_dedup_once = 0;
     if (llama_xkv_is_enabled(cparams->xkv_mode)) {
-        if (!common_xkv_scratch_bytes(path_model, mparams, cparams, &xkv_scratch_once) ||
-            xkv_scratch_once == 0) {
-            LOG_WRN("%s: XKV scratch estimation failed, aborting auto-fit\n", __func__);
-            return COMMON_PARAMS_FIT_STATUS_FAILURE;
+        if (!common_xkv_scratch_bytes(path_model, mparams, cparams, &xkv_scratch_once, &xkv_dedup_once)) {
+            LOG_WRN("%s: XKV scratch estimation failed; degrading scratch reserve to 0\n", __func__);
+            xkv_scratch_once = 0;
+            xkv_dedup_once = 0;
         }
     }
     common_xkv_fit_reserve xkv_res = {};
-    if (!common_xkv_fit_reserve_bytes(cparams, xkv_scratch_once, &xkv_res)) {
+    if (!common_xkv_fit_reserve_bytes(cparams, xkv_scratch_once, &xkv_res, xkv_dedup_once)) {
         LOG_WRN("%s: XKV reserve accounting failed (overflow or scratch exceeds workspace-decode), aborting auto-fit\n", __func__);
         return COMMON_PARAMS_FIT_STATUS_FAILURE;
     }
     if (xkv_res.total_bytes != 0) {
-        LOG_INF("%s: XKV auto-fit reserve: workspace=%llu (once) decode_cache=%llu (inside) factor_scratch=%llu (inside)\n",
+        LOG_INF("%s: XKV auto-fit reserve: workspace=%llu (once) decode_cache=%llu (inside) factor_scratch=%llu (inside) dedup_scratch=%llu (host)\n",
             __func__,
             (unsigned long long) xkv_res.workspace_bytes,
             (unsigned long long) xkv_res.decode_cache_bytes,
-            (unsigned long long) xkv_res.factor_scratch_bytes);
+            (unsigned long long) xkv_res.factor_scratch_bytes,
+            (unsigned long long) xkv_res.dedup_scratch_bytes);
     }
 
     // Persistent factor store budget (explicit configuration only) is
@@ -1793,8 +1929,13 @@ common_params_fit_status common_fit_kv_cache(
     const uint64_t xkv_store_dev_total = common_xkv_store_device_bytes(cparams, xkv_store_once_bytes);
     {
         uint64_t host_charge = 0;
-        if (xkv_checked_add_u64(xkv_res.total_bytes,
-                xkv_store_once_bytes - xkv_store_dev_total, host_charge)) {
+        // Host bucket: store-owned dedup vectors plus the host share of the
+        // persistent store. Device xkv_global below carries only workspace +
+        // device store (no double count; dedup never lives in the arena).
+        uint64_t host_store = 0;
+        if (xkv_checked_add_u64(xkv_res.dedup_scratch_bytes,
+                xkv_store_once_bytes - xkv_store_dev_total, host_store) &&
+            xkv_checked_add_u64(xkv_res.total_bytes, host_store, host_charge)) {
             LOG_INF("%s: XKV host-charged (once, unlimited-host fit): %llu bytes\n",
                 __func__, (unsigned long long) host_charge);
         }
@@ -1806,7 +1947,7 @@ common_params_fit_status common_fit_kv_cache(
         try {
             data = common_get_device_memory_data(path_model, mparams, &test, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
         } catch (const std::exception & e) {
-            LOG_TRC("%s: KV size %u probe failed: %s\n", __func__, n_ctx_kv, e.what());
+            LOG_WRN("%s: KV size %u probe threw exception: %s\n", __func__, n_ctx_kv, e.what());
             return false;
         }
 
@@ -1830,7 +1971,7 @@ common_params_fit_status common_fit_kv_cache(
                     path_model, mparams, &extra, extra_devs,
                     extra_ngl, extra_n_ctx_train, extra_n_expert, log_level);
             } catch (const std::exception & e) {
-                LOG_TRC("%s: extra context KV size %u probe failed: %s\n", __func__, n_ctx_kv, e.what());
+                LOG_WRN("%s: extra context KV size %u probe threw exception: %s\n", __func__, n_ctx_kv, e.what());
                 return false;
             }
         }
@@ -2050,15 +2191,18 @@ common_params_fit_status common_fit_recurrent_cache(
     // XKV reserve is computed exactly once per fit invocation (not per
     // probe): configured workspace, decode cache, and factor scratch.
     uint64_t xkv_scratch_once = 0;
+    uint64_t xkv_dedup_once = 0;
     if (llama_xkv_is_enabled(cparams->xkv_mode)) {
-        if (!common_xkv_scratch_bytes(path_model, mparams, cparams, &xkv_scratch_once) ||
-            xkv_scratch_once == 0) {
-            LOG_WRN("%s: XKV scratch estimation failed, aborting auto-fit\n", __func__);
-            return COMMON_PARAMS_FIT_STATUS_FAILURE;
+        if (!common_xkv_scratch_bytes(path_model, mparams, cparams, &xkv_scratch_once, &xkv_dedup_once)) {
+            LOG_WRN("%s: XKV scratch estimation failed; degrading scratch reserve to 0\n", __func__);
+            xkv_scratch_once = 0;
+            xkv_dedup_once = 0;
         }
     }
     common_xkv_fit_reserve xkv_res = {};
-    if (!common_xkv_fit_reserve_bytes(cparams, xkv_scratch_once, &xkv_res)) {
+    // Dedup vectors are host-resident (carried in the reserve); device
+    // probes below carry workspace + device store only, no double count.
+    if (!common_xkv_fit_reserve_bytes(cparams, xkv_scratch_once, &xkv_res, xkv_dedup_once)) {
         LOG_WRN("%s: XKV reserve accounting failed, aborting auto-fit\n", __func__);
         return COMMON_PARAMS_FIT_STATUS_FAILURE;
     }
@@ -2078,7 +2222,7 @@ common_params_fit_status common_fit_recurrent_cache(
             data = common_get_device_memory_data(
                 path_model, mparams, &test, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
         } catch (const std::exception & e) {
-            LOG_TRC("%s: recurrent capacity %u probe failed: %s\n", __func__, n_seq_recurrent, e.what());
+            LOG_WRN("%s: recurrent capacity %u probe threw exception: %s\n", __func__, n_seq_recurrent, e.what());
             return false;
         }
 
@@ -2100,7 +2244,7 @@ common_params_fit_status common_fit_recurrent_cache(
                     path_model, mparams, &extra, extra_devs,
                     extra_ngl, extra_n_ctx_train, extra_n_expert, log_level);
             } catch (const std::exception & e) {
-                LOG_TRC("%s: extra context recurrent probe failed: %s\n", __func__, e.what());
+                LOG_WRN("%s: extra context recurrent probe threw exception: %s\n", __func__, e.what());
                 return false;
             }
         }
@@ -2113,8 +2257,8 @@ common_params_fit_status common_fit_recurrent_cache(
         }
         if (!xkv_checked_add_u64(xkv_res.total_bytes, xkv_store_dev_total, xkv_global) ||
             !common_xkv_partition_budget(xkv_global, xkv_wts.data(), xkv_shares.data(), xkv_shares.size())) {
-            LOG_WRN("%s: KV size %u does not fit: XKV partition accounting overflow\n",
-                __func__, n_ctx_kv);
+            LOG_WRN("%s: recurrent capacity %u does not fit: XKV partition accounting overflow\n",
+                __func__, n_seq_recurrent);
             return false;
         }
 
@@ -2152,6 +2296,12 @@ common_params_fit_status common_fit_recurrent_cache(
                 return false;
             }
             if (data[i].free <= 0 || used > (uint64_t) data[i].free) {
+                LOG_WRN("%s: recurrent capacity %u does not fit on device %zu (%s): used=%llu (model=%llu ctx=%llu comp=%llu res=%llu headroom=%llu) > free=%lld\n",
+                    __func__, n_seq_recurrent, i, ggml_backend_dev_name(devs[i]),
+                    (unsigned long long) used, (unsigned long long) data[i].model,
+                    (unsigned long long) data[i].context, (unsigned long long) data[i].compute,
+                    (unsigned long long) reserved_all, (unsigned long long) runtime_headroom,
+                    (long long) data[i].free);
                 return false;
             }
         }
@@ -2242,15 +2392,16 @@ common_rerot_fit_result common_fit_rerot_capacities(
     // XKV reserve is computed exactly once per fit invocation (not per
     // probe): configured workspace, decode cache, and factor scratch.
     uint64_t xkv_scratch_rerot = 0;
+    uint64_t xkv_dedup_rerot = 0;
     if (llama_xkv_is_enabled(cparams->xkv_mode)) {
-        if (!common_xkv_scratch_bytes(path_model, mparams, cparams, &xkv_scratch_rerot) ||
-            xkv_scratch_rerot == 0) {
-            LOG_WRN("%s: XKV scratch estimation failed, aborting auto-fit\n", __func__);
-            return best;
+        if (!common_xkv_scratch_bytes(path_model, mparams, cparams, &xkv_scratch_rerot, &xkv_dedup_rerot)) {
+            LOG_WRN("%s: XKV scratch estimation failed; degrading scratch reserve to 0\n", __func__);
+            xkv_scratch_rerot = 0;
+            xkv_dedup_rerot = 0;
         }
     }
     common_xkv_fit_reserve xkv_res_rerot = {};
-    if (!common_xkv_fit_reserve_bytes(cparams, xkv_scratch_rerot, &xkv_res_rerot)) {
+    if (!common_xkv_fit_reserve_bytes(cparams, xkv_scratch_rerot, &xkv_res_rerot, xkv_dedup_rerot)) {
         LOG_WRN("%s: XKV reserve accounting failed, aborting auto-fit\n", __func__);
         return best;
     }
@@ -2373,7 +2524,7 @@ common_rerot_fit_result common_fit_rerot_capacities(
             uint64_t used = 0;
             if (!xkv_checked_sum_fit_bytes(data[i].model, data[i].context, data[i].compute,
                     reserved_all, runtime_headroom, used)) {
-                LOG_WRN("%s: KV size %u does not fit: memory total overflow\n", __func__, n_ctx_kv);
+                LOG_WRN("%s: KV size %u does not fit: memory total overflow\n", __func__, k_val);
                 return false;
             }
             if (data[i].free <= 0 || used > (uint64_t) data[i].free) {

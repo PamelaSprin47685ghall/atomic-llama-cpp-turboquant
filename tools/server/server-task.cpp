@@ -390,21 +390,7 @@ int server_task::rerot_response_owner() const {
 }
 
 bool server_task::rerot_effective() const {
-    return params.rerot_effective(type) && rerot_episode_id != 0;
-}
-
-common_grammar server_rerot_take_user_grammar(task_params & params) {
-    // A.16.1: snapshot the user/tool grammar before planner <ol> injection so
-    // the planner constraint can never pollute it. Cheap move, no parse.
-    common_grammar saved = std::move(params.sampling.grammar);
-    params.sampling.grammar = common_grammar{};
-    return saved;
-}
-
-void server_rerot_restore_user_grammar(task_params & params, const common_grammar & saved) {
-    // Restore the stock user/tool path after the final fence (§26). The planner
-    // grammar is discarded; the serial tail decodes with the original sampler.
-    params.sampling.grammar = saved;
+    return params.rerot_effective(type);
 }
 
 bool server_rerot_tool_calls_allowed(bool serial_tail_done) {

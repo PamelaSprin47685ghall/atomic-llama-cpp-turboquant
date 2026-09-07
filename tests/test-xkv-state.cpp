@@ -572,10 +572,15 @@ static void test_landmark_profile_rules() {
         assert(capture_world(w, img, &err));
         auto & g = img.segments[0].groups[0];
         assert(g.has_landmark);
-        // Populate landmark chunks table: 2 chunks of 2 rows each
+        // Populate landmark chunks table: 4 one-row chunks covering the 4
+        // segment rows. Production invariant is landmark stream rows ==
+        // n_chunks (one summary row per chunk); the fixture landmark stream
+        // has 4 rows, so 2 chunks would trip that gate spuriously.
         g.landmark_chunks = {
-            xkv_state_landmark_chunk::make(0, 2, 0.25f, 0xCAFEFEED0001ULL),
-            xkv_state_landmark_chunk::make(2, 2, 0.75f, 0xCAFEFEED0002ULL)
+            xkv_state_landmark_chunk::make(0, 1, 0.25f, 0xCAFEFEED0001ULL),
+            xkv_state_landmark_chunk::make(1, 1, 0.35f, 0xCAFEFEED0002ULL),
+            xkv_state_landmark_chunk::make(2, 1, 0.55f, 0xCAFEFEED0003ULL),
+            xkv_state_landmark_chunk::make(3, 1, 0.75f, 0xCAFEFEED0004ULL)
         };
         std::vector<int64_t> test_pos(img.segments[0].n_rows, 0);
         const uint64_t lm_fp = img.allocations[g.stream_landmark].desc.fingerprint();
@@ -589,9 +594,11 @@ static void test_landmark_profile_rules() {
         xkv_state_image back;
         assert(decode_image(bytes.data(), bytes.size(), back, test_fps(), test_prov(), test_limits(), &err));
         const auto & back_g = back.segments[0].groups[0];
-        assert(back_g.landmark_chunks.size() == 2);
+        assert(back_g.landmark_chunks.size() == 4);
         assert(back_g.landmark_chunks[0].source_fingerprint == 0xCAFEFEED0001ULL);
         assert(back_g.landmark_chunks[1].source_fingerprint == 0xCAFEFEED0002ULL);
+        assert(back_g.landmark_chunks[2].source_fingerprint == 0xCAFEFEED0003ULL);
+        assert(back_g.landmark_chunks[3].source_fingerprint == 0xCAFEFEED0004ULL);
         assert(back_g.landmark_chunks == g.landmark_chunks);
         assert(back_g.landmark_chunks_fingerprint == g.landmark_chunks_fingerprint);
 
@@ -625,9 +632,16 @@ static void test_provenance_match() {
     const std::vector<uint8_t> bytes = encode_world();
     std::string err;
     xkv_state_image out;
-    // All-zero expected entries are unavailable and skipped.
+    // Factored state requires explicit model provenance (fail-closed policy):
+    // all-zero expected model digest refuses instead of skipping identity.
+    // Non-model provenance (tri calibration, source) still skips when all-zero.
+    xkv_state_provenance partial = test_prov();
+    std::memset(partial.tri_calibration_sha256, 0, 32);
+    std::memset(partial.source_sha256, 0, 32);
+    assert(decode_image(bytes.data(), bytes.size(), out, test_fps(), partial, test_limits(), &err));
     xkv_state_provenance none;
-    assert(decode_image(bytes.data(), bytes.size(), out, test_fps(), none, test_limits(), &err));
+    assert(!decode_image(bytes.data(), bytes.size(), out, test_fps(), none, test_limits(), &err));
+    assert(std::string(err).find("provenance") != std::string::npos);
     // Single-byte flips in any digest refuse, destination unchanged.
     const int offs[3] = {0, 17, 31};
     for (int h = 0; h < 3; ++h) {
@@ -637,12 +651,12 @@ static void test_provenance_match() {
         assert(!decode_image(bytes.data(), bytes.size(), out, test_fps(), wrong, test_limits(), &err));
         assert(image_matches_bytes(out, bytes.data(), bytes.size(), test_limits()));
     }
-    // Zeroed image digest vs nonzero expectation refuses at encode.
+    // Zeroed model digest vs nonzero expectation refuses at encode (factored state policy).
     {
         test_world w = make_world();
         xkv_state_image img;
         assert(capture_world(w, img, &err));
-        std::memset(img.provenance.source_sha256, 0, 32);
+        std::memset(img.provenance.model_sha256, 0, 32);
         std::vector<uint8_t> sink;
         assert(!validate_image(img, test_fps(), test_prov(), test_limits(), &err));
         assert(!encode_image(img, sink, test_limits(), &err));
@@ -1444,6 +1458,42 @@ static void test_pid_reservation() {
     assert(tail2.payload_id_get(0) > b);
 }
 
+static void test_import_plan_high_waters_and_reservations() {
+    std::cout << "[Test] import plan high-waters and capacity reservations..." << std::endl;
+    test_world w = make_world();
+    xkv_state_image img;
+    std::string err;
+    assert(capture_world(w, img, &err));
+    img.config.next_segment_id = 55;
+    img.config.next_alloc_id = 77;
+    img.config.next_seal_tx_nonce = 33;
+
+    xkv_state_import_plan plan;
+    assert(build_import_plan(img, test_limits(), plan, &err));
+    assert(plan.bundle.next_segment_id == 55);
+    assert(plan.bundle.next_alloc_id == 77);
+    assert(plan.bundle.next_seal_tx_nonce == 33);
+    assert(plan.bundle.store_cap_bytes == test_limits().max_store_bytes);
+    assert(!plan.bundle.segments.empty());
+    assert(!plan.bundle.locations.empty());
+
+    // Commit with missing import_fn refuses fail-closed
+    assert(!commit_import_plan(plan, nullptr, &err));
+    assert(std::string(err).find("no store import function") != std::string::npos);
+
+    // Commit propagation
+    bool called = false;
+    auto mock_import = [&](const xkv_state_import_bundle & b, std::string * e) {
+        called = true;
+        assert(b.next_segment_id == 55);
+        assert(b.next_alloc_id == 77);
+        assert(b.next_seal_tx_nonce == 33);
+        return true;
+    };
+    assert(commit_import_plan(plan, mock_import, &err));
+    assert(called);
+}
+
 static void test_config_compatible_matrix() {
     std::cout << "[Test] config compatibility matrix..." << std::endl;
     std::string err;
@@ -1572,6 +1622,7 @@ int main() {
     test_codec_fingerprints();
     test_zero_model_digest_refusal();
     test_pid_reservation();
+    test_import_plan_high_waters_and_reservations();
     std::cout << "All XKV state tests passed." << std::endl;
     return 0;
 }

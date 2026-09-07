@@ -4559,6 +4559,48 @@ private:
         bool counted_kv_fallback = false;
         bool counted_recurrent_fallback = false;
 
+        // Combined XKV admission across the resident attention memories.
+        // The batch must fit every memory it runs on (target + split draft
+        // context): the combined token/hot bound is the tighter side, the
+        // new-sequence gate is the OR. Querying only the target over-admits
+        // whenever the draft memory is the tighter one. Recurrent-only
+        // memories bypass (attention domain only).
+        struct xkv_admission_pair {
+            llama_memory_admission_snapshot tgt = {};
+            llama_memory_admission_snapshot dft = {};
+            llama_memory_admission_snapshot combined = {};
+            bool have_tgt = false;
+            bool have_dft = false;
+            bool have_combined = false;
+        };
+        auto query_xkv_admission = [&](llama_memory_t mem_t, llama_memory_t mem_d,
+                bool has_t, bool has_d) {
+            xkv_admission_pair out;
+            if (!llama_xkv_is_enabled(params_base.xkv_mode) || (!has_t && !has_d)) {
+                return out;
+            }
+            out.have_tgt = has_t && mem_t &&
+                llama_memory_get_admission_snapshot(mem_t, &out.tgt);
+            out.have_dft = has_d && mem_d && mem_d != mem_t &&
+                llama_memory_get_admission_snapshot(mem_d, &out.dft);
+            if (out.have_tgt && out.have_dft) {
+                out.combined = out.tgt.safe_next_ubatch <= out.dft.safe_next_ubatch
+                    ? out.tgt : out.dft;
+                out.combined.hot_free =
+                    std::min(out.tgt.hot_free, out.dft.hot_free);
+                out.combined.recurrent_blocks_new_seq =
+                    out.tgt.recurrent_blocks_new_seq || out.dft.recurrent_blocks_new_seq;
+                out.have_combined = true;
+            } else if (out.have_tgt) {
+                out.combined = out.tgt;
+                out.have_combined = true;
+            } else if (out.have_dft) {
+                out.combined = out.dft;
+                out.have_combined = true;
+            }
+            return out;
+        };
+
         while (true) {
             llama_memory_kv_usage usage_tgt = {};
             llama_memory_kv_usage usage_dft = {};
@@ -4588,20 +4630,19 @@ private:
             bool recurrent_pressure = required_recurrent_tgt > available_recurrent_tgt ||
                                         required_recurrent_dft > available_recurrent_dft;
 
-            // XKV admission snapshot (enabled + attention domain only:
-            // recurrent-only memories bypass). The token bound tightens the
-            // batch below; recurrent sequence slots never enter the token
-            // minimum. A new sequence/person needs a free recurrent slot;
-            // continuation batches on full recurrent slots stay valid.
-            llama_memory_admission_snapshot xkv_snap = {};
-            bool have_xkv_snap = false;
-            if (llama_xkv_is_enabled(params_base.xkv_mode) && (has_tgt_usage || has_dft_usage)) {
-                llama_memory_t mem_snap = has_tgt_usage ? mem_tgt : mem_dft;
-                have_xkv_snap = mem_snap && llama_memory_get_admission_snapshot(mem_snap, &xkv_snap);
-            }
-            if (have_xkv_snap &&
-                (required_recurrent_tgt > 0 || required_recurrent_dft > 0) &&
-                xkv_snap.recurrent_blocks_new_seq) {
+            // Combined target + draft admission: the batch must fit each
+            // resident attention memory. Recurrent sequence slots never enter
+            // the token minimum; each memory gates only its own new-sequence
+            // demand, while continuation batches on full recurrent slots stay
+            // valid.
+            xkv_admission_pair xkv_adm =
+                query_xkv_admission(mem_tgt, mem_dft, has_tgt_usage, has_dft_usage);
+            llama_memory_admission_snapshot xkv_snap = xkv_adm.combined;
+            bool have_xkv_snap = xkv_adm.have_combined;
+            if ((xkv_adm.have_tgt && required_recurrent_tgt > 0 &&
+                    xkv_adm.tgt.recurrent_blocks_new_seq) ||
+                (xkv_adm.have_dft && required_recurrent_dft > 0 &&
+                    xkv_adm.dft.recurrent_blocks_new_seq)) {
                 recurrent_pressure = true;
             }
             // Fill-first XKV maintenance: sealing runs only when hot slots
@@ -4671,8 +4712,9 @@ private:
                     }
                     // Fresh snapshot after maintenance for the replan below.
                     if (has_tgt_usage || has_dft_usage) {
-                        llama_memory_t mem_snap2 = has_tgt_usage ? mem_tgt : mem_dft;
-                        have_xkv_snap = mem_snap2 && llama_memory_get_admission_snapshot(mem_snap2, &xkv_snap);
+                        xkv_adm = query_xkv_admission(mem_tgt, mem_dft, has_tgt_usage, has_dft_usage);
+                        xkv_snap = xkv_adm.combined;
+                        have_xkv_snap = xkv_adm.have_combined;
                     }
                     if (st == LLAMA_MEMORY_MAINTENANCE_RETRY_STALE ||
                         st == LLAMA_MEMORY_MAINTENANCE_PROGRESS) {
@@ -4689,18 +4731,25 @@ private:
             // XKV hot pressure (bounded hot): logical capacity stays huge while
             // physical hot slots exhaust, so the hot deficit from the fresh
             // snapshot joins overall KV pressure, deficit, Tri trigger, floor
-            // logging/counters, fallback, and batch limiting. Draft/legacy
-            // logical capacity is never conflated: only the target XKV deficit.
-            if (have_xkv_snap && required_kv > xkv_snap.hot_free) {
+            // logging/counters, fallback, and batch limiting. Each memory sizes
+            // its own Tri reclaim request; legacy logical capacity is never
+            // conflated: only XKV hot deficits.
+            if (xkv_adm.have_tgt && required_kv > xkv_adm.tgt.hot_free) {
                 kv_pressure = true;
-                const uint64_t hot_d = (uint64_t) required_kv - xkv_snap.hot_free;
+                const uint64_t hot_d = (uint64_t) required_kv - xkv_adm.tgt.hot_free;
                 const uint32_t hot_deficit =
                     (uint32_t) std::min<uint64_t>(hot_d, UINT32_MAX);
                 kv_deficit_tgt = std::max(kv_deficit_tgt, hot_deficit);
             }
-            const uint32_t kv_deficit_dft = has_dft_usage && required_kv > available_dft
+            uint32_t kv_deficit_dft = has_dft_usage && required_kv > available_dft
                 ? (uint32_t) std::min<uint64_t>(UINT32_MAX, (uint64_t) required_kv - available_dft)
                 : 0;
+            if (xkv_adm.have_dft && required_kv > xkv_adm.dft.hot_free) {
+                kv_pressure = true;
+                const uint64_t hot_d = (uint64_t) required_kv - xkv_adm.dft.hot_free;
+                kv_deficit_dft = std::max(kv_deficit_dft,
+                    (uint32_t) std::min<uint64_t>(hot_d, UINT32_MAX));
+            }
 
             bool tri_maintenance_due = false;
             if (params_base.triattention_enabled && !kv_pressure) {
@@ -4992,10 +5041,15 @@ private:
                         kv_batch_limit = cap;
                         SRV_INF("XKV admission (%s): limiting next batch to %u cells\n",
                             llama_memory_limit_reason_name(xkv_snap.limit_reason), kv_batch_limit);
-                    }
                 }
-                if (have_xkv_snap && xkv_snap.recurrent_blocks_new_seq &&
-                    (required_recurrent_tgt > 0 || required_recurrent_dft > 0)) {
+                }
+                // Per-memory gate (matches the pressure planning above): a new
+                // sequence blocked on either memory with no victim left refuses
+                // decode instead of clamping to one cell.
+                if ((xkv_adm.have_tgt && required_recurrent_tgt > 0 &&
+                        xkv_adm.tgt.recurrent_blocks_new_seq) ||
+                    (xkv_adm.have_dft && required_recurrent_dft > 0 &&
+                        xkv_adm.dft.recurrent_blocks_new_seq)) {
                     SRV_ERR("%s", "XKV recurrent admission: no free recurrent slot for the new sequence\n");
                     if (id_slot_protected >= 0) {
                         if (server_slot * stuck = get_slot_by_id(id_slot_protected)) {

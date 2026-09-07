@@ -1420,7 +1420,7 @@ static void test_take_device_tensors(cpu_env & e) {
             ggml_init_params ip = {ctx_mem_size, storage->context_memory.data(), true};
             storage->ctx = ggml_init(ip);
         } else {
-            ggml_init_params ip = {ctx_mem_size, nullptr, false};
+            ggml_init_params ip = {ctx_mem_size, nullptr, true};
             storage->ctx = ggml_init(ip);
         }
         CHECK(storage->ctx != nullptr);
@@ -1518,7 +1518,7 @@ static void test_take_device_tensors(cpu_env & e) {
         xkv_backend_adopt_result tr;
         tr.stats.sync_count = 777; // sentinel
         const uint64_t before_id = gen.current_id();
-        CHECK(!xkv_backend_take_device_tensors(e.backend, e.buft, storage, {sa, sb}, cfg, gen, tr, &err, &short_rsv));
+        CHECK(!xkv_backend_take_device_tensors(e.backend, e.buft, std::move(storage), {sa, sb}, cfg, gen, tr, &err, &short_rsv));
         CHECK(!err.empty());
         CHECK(tr.handles.empty());
         CHECK(tr.stats.sync_count == 777); // output unchanged
@@ -1536,7 +1536,7 @@ static void test_take_device_tensors(cpu_env & e) {
         xkv_backend_adopt_result tr;
         tr.stats.sync_count = 888;
         const uint64_t before_id = gen.current_id();
-        CHECK(!xkv_backend_take_device_tensors(e.backend, e.buft, storage, {sa1, sa2}, cfg, gen, tr, &err));
+        CHECK(!xkv_backend_take_device_tensors(e.backend, e.buft, std::move(storage), {sa1, sa2}, cfg, gen, tr, &err));
         CHECK(!err.empty());
         CHECK(tr.handles.empty());
         CHECK(tr.stats.sync_count == 888);
@@ -1550,7 +1550,7 @@ static void test_take_device_tensors(cpu_env & e) {
         auto storage = make_take_storage(dest_bytes, ta, tb);
 
         // Foreign tensor in separate context/buffer
-        ggml_init_params fip = {2 * ggml_tensor_overhead() + 64, nullptr, false};
+        ggml_init_params fip = {2 * ggml_tensor_overhead() + 64, nullptr, true};
         ggml_context * fctx = ggml_init(fip);
         CHECK(fctx != nullptr);
         ggml_tensor * foreign_t = ggml_new_tensor_2d(fctx, GGML_TYPE_TURBO4_0, 128, 8);
@@ -1563,7 +1563,7 @@ static void test_take_device_tensors(cpu_env & e) {
         xkv_backend_adopt_result tr;
         tr.stats.sync_count = 555;
         const uint64_t before_id = gen.current_id();
-        CHECK(!xkv_backend_take_device_tensors(e.backend, e.buft, storage, {s_foreign, sb}, cfg, gen, tr, &err));
+        CHECK(!xkv_backend_take_device_tensors(e.backend, e.buft, std::move(storage), {s_foreign, sb}, cfg, gen, tr, &err));
         CHECK(!err.empty());
         CHECK(tr.handles.empty());
         CHECK(tr.stats.sync_count == 555);
@@ -1604,7 +1604,7 @@ static void test_take_device_tensors(cpu_env & e) {
         xkv_backend_adopt_result tr;
         tr.stats.sync_count = 333;
         const uint64_t before_id = gen.current_id();
-        CHECK(!xkv_backend_take_device_tensors(e.backend, e.buft, storage, {sa, sb}, cfg, gen, tr, &err));
+        CHECK(!xkv_backend_take_device_tensors(e.backend, e.buft, std::move(storage), {sa, sb}, cfg, gen, tr, &err));
         CHECK(!err.empty());
         CHECK(tr.handles.empty());
         CHECK(tr.stats.sync_count == 333);
@@ -1625,7 +1625,7 @@ static void test_take_device_tensors(cpu_env & e) {
         xkv_backend_adopt_result tr;
         tr.stats.sync_count = 222;
         const uint64_t before_id = gen.current_id();
-        CHECK(!xkv_backend_take_device_tensors(e.backend, e.buft, storage, {sa, sb}, fail_cfg, gen, tr, &err));
+        CHECK(!xkv_backend_take_device_tensors(e.backend, e.buft, std::move(storage), {sa, sb}, fail_cfg, gen, tr, &err));
         CHECK(!err.empty());
         CHECK(tr.handles.empty());
         CHECK(tr.stats.sync_count == 222);
@@ -2125,8 +2125,18 @@ static void test_tri_fetch_selected_k(cpu_env & e) {
     const uint32_t n_seg_rows = 16;
     codec_desc dak = make_desc(factor_role::a_k, GGML_TYPE_TURBO4_0, n_seg_rows, rank);
     codec_desc dbk = make_desc(factor_role::b_k, GGML_TYPE_TURBO4_0, head_dim * 2, rank);
-    std::vector<uint8_t> bak = make_bytes(dak);
-    std::vector<uint8_t> bbk = make_bytes(dbk);
+    std::vector<float> a_src((size_t)n_seg_rows * rank);
+    for (size_t i = 0; i < a_src.size(); ++i) {
+        a_src[i] = std::sin((float)i * 0.05f) * 0.5f;
+    }
+    std::vector<float> b_src((size_t)head_dim * 2 * rank);
+    for (size_t i = 0; i < b_src.size(); ++i) {
+        b_src[i] = std::cos((float)i * 0.03f) * 0.5f;
+    }
+    encoded_matrix em_a = encode_matrix(dak, a_src.data(), a_src.size());
+    encoded_matrix em_b = encode_matrix(dbk, b_src.data(), b_src.size());
+    const auto & bak = em_a.bytes;
+    const auto & bbk = em_b.bytes;
 
     xkv_backend_batch_builder b;
     b.add_stream(dak, bak.data(), bak.size());
@@ -2152,21 +2162,30 @@ static void test_tri_fetch_selected_k(cpu_env & e) {
         dst.data(), dst.size(), &err));
 
     // Compare with direct reference matrix dot: K_pre = A_row @ B_feat^T
-    std::vector<float> a_dec = decode_matrix(encoded_matrix{dak, bak}, value_domain::canonical);
-    std::vector<float> b_dec = decode_matrix(encoded_matrix{dbk, bbk}, value_domain::canonical);
+    // B indexing derived from the encoded descriptors: feature rows start at
+    // head_start = kv_head * head_dim + feature_offset_k inside the B stream,
+    // strides from padded shapes, rank from logical cols. The reference
+    // decodes in the turbo-rotated domain — the exact domain the reconstruct
+    // core dots in (orthonormal WHT preserves the dot, so this observes the
+    // K_pre contract without WHT-roundtrip noise).
+    const uint64_t head_start = 0; // kv_head(0) * head_dim + feature_offset_k(0) per call above
+    std::vector<float> a_dec = decode_matrix(encoded_matrix{dak, bak}, value_domain::turbo_rotated);
+    std::vector<float> b_dec = decode_matrix(encoded_matrix{dbk, bbk}, value_domain::turbo_rotated);
     const uint64_t a_cols = dak.padded_shape.cols;
     const uint64_t b_cols = dbk.padded_shape.cols;
+    const uint64_t n_rank = dak.logical_shape.cols;
+    CHECK(head_start + head_dim <= dbk.logical_shape.rows);
     for (uint32_t i = 0; i < n_rows; ++i) {
         const uint32_t r = rows[i];
-        const float * a_row = a_dec.data() + r * a_cols;
+        const float * a_row = a_dec.data() + (uint64_t)r * a_cols;
         for (uint32_t d = 0; d < head_dim; ++d) {
-            const float * b_row = b_dec.data() + d * b_cols;
-            float sum = 0.0f;
-            for (uint32_t k = 0; k < rank; ++k) {
-                sum += a_row[k] * b_row[k];
+            const float * b_row = b_dec.data() + (head_start + d) * b_cols;
+            double sum = 0.0;
+            for (uint64_t k = 0; k < n_rank; ++k) {
+                sum += (double)a_row[k] * (double)b_row[k];
             }
-            const float actual = dst[i * head_dim + d];
-            CHECK(std::fabs(actual - sum) < 1e-3f);
+            const float actual = dst[(size_t)i * head_dim + d];
+            CHECK(std::fabs(actual - (float)sum) < 1e-3f);
         }
     }
 

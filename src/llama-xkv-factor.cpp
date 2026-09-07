@@ -1168,6 +1168,16 @@ bool factorize_matrix(
                 }
             }
         }
+        // V_d must start as exact identity: this carver reuses shared workspace
+        // across sequential K/V factorizations, so stale off-diagonals would
+        // corrupt V's singular vectors (Jacobi accumulates rotations into V_d).
+        // Zero the full tm*tm matrix with overflow check first (Branch 2 memsets
+        // VT_c the same way).
+        if (tm > 0 && tm > SIZE_MAX / tm / sizeof(double)) {
+            if (err) *err = "factorize_matrix: integer overflow computing V_d byte count";
+            return false;
+        }
+        std::memset(V_d, 0, (size_t)(tm * tm * sizeof(double)));
         for (uint64_t i = 0; i < tm; ++i) V_d[i * tm + i] = 1.0;
 
         if (!jacobi_svd_tall_double(U_d, V_d, tn, tm, nullptr, tolerance, max_sweeps, err, col_sq_buf, s_out_buf)) {

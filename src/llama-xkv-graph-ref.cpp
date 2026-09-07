@@ -10,6 +10,7 @@
 #include <set>
 
 #include "ggml-backend.h"
+#include "llama-impl.h"
 #include "ggml-xkv-landmark-build.h"
 // Device SR selection/merge/rows operators.
 #include "ggml-vulkan-landmark.h"
@@ -207,18 +208,30 @@ bool xkv_graph_snapshot::validate_hot_rows(std::string * err) const {
 
         // Validate DDVR group visibility
         if (hd.is_valid) {
+            if (!hd.query_group_indices.empty() && hd.query_group_indices.size() != n_queries) {
+                if (err) *err = "hot row " + std::to_string(i) + " query_group_indices size (" +
+                    std::to_string(hd.query_group_indices.size()) + ") != n_queries (" +
+                    std::to_string(n_queries) + ")";
+                return false;
+            }
             for (uint32_t q = 0; q < n_queries; ++q) {
                 if (hd.is_visible_to_query(q)) {
                     uint32_t q_groups = get_query_group_count(q);
-                    if (q_groups > 0 && hd.group_index >= q_groups) {
+                    uint32_t g = hd.query_group_indices.empty() ? hd.group_index : hd.query_group_indices[q];
+                    if (g == UINT32_MAX) {
+                        if (err) *err = "hot row " + std::to_string(i) + " visible query " +
+                            std::to_string(q) + " has invalid group";
+                        return false;
+                    }
+                    if (q_groups > 0 && g >= q_groups) {
                         if (err) *err = "hot row " + std::to_string(i) + " group_index (" +
-                            std::to_string(hd.group_index) + ") exceeds query " +
+                            std::to_string(g) + ") exceeds query " +
                             std::to_string(q) + " group count (" + std::to_string(q_groups) + ")";
                         return false;
                     }
-                    if (q_groups == 0 && hd.group_index != 0) {
+                    if (q_groups == 0 && g != 0) {
                         if (err) *err = "hot row " + std::to_string(i) + " non-zero group_index (" +
-                            std::to_string(hd.group_index) + ") without DDVR groups on query " +
+                            std::to_string(g) + ") without DDVR groups on query " +
                             std::to_string(q);
                         return false;
                     }
@@ -436,7 +449,9 @@ xkv_graph_op_handle::~xkv_graph_op_handle() {
 
 void xkv_graph_op_handle::ggml_custom_op_callback(struct ggml_tensor * dst, int ith, int nth, void * userdata) {
     (void) nth;
+    LLAMA_LOG_ERROR("[xkv_graph_op_handle] ggml_custom_op_callback: ith=%d nth=%d userdata=%p\n", ith, nth, userdata);
     if (!userdata) {
+        LLAMA_LOG_ERROR("[xkv_graph_op_handle] ggml_custom_op_callback: null userdata\n");
         if (dst && dst->data) {
             std::memset(dst->data, 0, ggml_nbytes(dst));
         }
@@ -445,6 +460,8 @@ void xkv_graph_op_handle::ggml_custom_op_callback(struct ggml_tensor * dst, int 
 
     auto * handle = static_cast<xkv_graph_op_handle *>(userdata);
     if (handle->magic != HANDLE_MAGIC) {
+        LLAMA_LOG_ERROR("[xkv_graph_op_handle] ggml_custom_op_callback: bad magic 0x%llx\n",
+            (unsigned long long) handle->magic);
         if (dst && dst->data) {
             std::memset(dst->data, 0, ggml_nbytes(dst));
         }
@@ -456,6 +473,7 @@ void xkv_graph_op_handle::ggml_custom_op_callback(struct ggml_tensor * dst, int 
 void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) noexcept {
     (void) nth;
     // Only thread task 0 performs execution to ensure deterministic reference behavior
+    LLAMA_LOG_ERROR("[xkv_graph_op_handle] compute ith=%d nth=%d snapshot=%p\n", ith, nth, (void*)snapshot_.get());
     if (ith != 0) {
         return;
     }
@@ -470,7 +488,7 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
     auto & snap = *snapshot_;
     snap.is_computed = true;
     snap.last_status = xkv_read_status::invalid_argument;
-    snap.last_error = "compute failed";
+    snap.last_error = "compute entered without error update";
 
     // Fail-closed initialization: zero out the output destination tensor completely
     if (dst && dst->data) {
@@ -505,12 +523,14 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
         snap.last_error = "invalid destination shape or type: expected [" +
             std::to_string(expected_ne0) + ", " + std::to_string(expected_ne1) + "], got [" +
             std::to_string(dst->ne[0]) + ", " + std::to_string(dst->ne[1]) + "]";
+        LLAMA_LOG_ERROR("[xkv_graph_op_handle] %s\n", snap.last_error.c_str());
         return;
     }
 
     if (!ggml_is_contiguous(dst)) {
         snap.last_status = xkv_read_status::invalid_argument;
         snap.last_error = "destination tensor must be contiguous";
+        LLAMA_LOG_ERROR("[xkv_graph_op_handle] %s\n", snap.last_error.c_str());
         return;
     }
 
@@ -532,6 +552,7 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
     if (!q_tensor || !q_tensor->data) {
         snap.last_status = xkv_read_status::invalid_argument;
         snap.last_error = "missing or null source q_tensor";
+        LLAMA_LOG_ERROR("[xkv_graph_op_handle] %s\n", snap.last_error.c_str());
         return;
     }
 
@@ -562,11 +583,13 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
         if (!actual_dep || actual_dep != expected_dep) {
             snap.last_status = xkv_read_status::invalid_argument;
             snap.last_error = "explicit dependency mismatch or null at index " + std::to_string(1 + d);
+            LLAMA_LOG_ERROR("[xkv_graph_op_handle] %s\n", snap.last_error.c_str());
             return;
         }
         if (!actual_dep->data) {
             snap.last_status = xkv_read_status::invalid_argument;
             snap.last_error = "explicit dependency data null at index " + std::to_string(1 + d);
+            LLAMA_LOG_ERROR("[xkv_graph_op_handle] %s\n", snap.last_error.c_str());
             return;
         }
     }
@@ -576,6 +599,7 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
     if (!snap.validate_hot_rows(&hot_err)) {
         snap.last_status = xkv_read_status::invalid_argument;
         snap.last_error = "hot rows validation failed: " + hot_err;
+        LLAMA_LOG_ERROR("[xkv_graph_op_handle] %s\n", snap.last_error.c_str());
         return;
     }
 
@@ -610,11 +634,13 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
         if (!snap.workspace_ready()) {
             snap.last_status = xkv_read_status::workspace_exceeded;
             snap.last_error = "bounded snapshot without backing workspace (budget>0, null workspace)";
+            LLAMA_LOG_ERROR("[xkv_graph_op_handle] %s\n", snap.last_error.c_str());
             return;
         }
         if (!snap.reader_config.workspace) {
             snap.last_status = xkv_read_status::workspace_exceeded;
             snap.last_error = "bounded snapshot without reader workspace";
+            LLAMA_LOG_ERROR("[xkv_graph_op_handle] %s\n", snap.last_error.c_str());
             return;
         }
         // Region consistency: every slice must fit inside the declared total.
@@ -763,11 +789,13 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
             if (k_storage->type != snap.hot_layout.k_type || v_storage->type != snap.hot_layout.v_type) {
                 snap.last_status = xkv_read_status::invalid_argument;
                 snap.last_error = "storage tensor type does not match hot layout descriptor";
+                LLAMA_LOG_ERROR("[xkv_graph_op_handle] %s\n", snap.last_error.c_str());
                 return;
             }
             if (snap.hot_layout.head_dim_k != snap.head_dim_k || snap.hot_layout.head_dim_v != snap.head_dim_v) {
                 snap.last_status = xkv_read_status::invalid_argument;
                 snap.last_error = "hot layout head dims do not match snapshot dims";
+                LLAMA_LOG_ERROR("[xkv_graph_op_handle] %s\n", snap.last_error.c_str());
                 return;
             }
             if (is_turbo_type(k_storage->type) && snap.expected_turbo_fp_k != 0 &&
@@ -790,6 +818,7 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
     if (!snap.validate_hot_store_bindings(&binding_err)) {
         snap.last_status = xkv_read_status::invalid_argument;
         snap.last_error = "hot store bindings pre-validation failed: " + binding_err;
+        LLAMA_LOG_ERROR("[xkv_graph_op_handle] %s\n", snap.last_error.c_str());
         return;
     }
 
@@ -799,6 +828,7 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
         if (current_stamp != snap.expected_stamp) {
             snap.last_status = xkv_read_status::retry_stale_stamp;
             snap.last_error = "snapshot stamp mismatch before compute (stale stamp)";
+            LLAMA_LOG_ERROR("[xkv_graph_op_handle] %s\n", snap.last_error.c_str());
             return;
         }
     }
@@ -828,6 +858,7 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
             if (!snap.build_query_inputs(q_raw, q_nelements, queries_heap, &err)) {
                 snap.last_status = xkv_read_status::invalid_argument;
                 snap.last_error = "build_query_inputs failed: " + err;
+                LLAMA_LOG_ERROR("[xkv_graph_op_handle] %s\n", snap.last_error.c_str());
                 return;
             }
             queries_ptr = &queries_heap;
@@ -892,8 +923,8 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
 
         // Gather exact physical hot slots from the scheduler-visible storage
         // tensors now, after writes have executed. Fallback rows keep owned data.
-        std::vector<std::vector<float>> gather_k(snap.hot_data.size());
-        std::vector<std::vector<float>> gather_v(snap.hot_data.size());
+        std::vector<std::vector<float>> gather_k;
+        std::vector<std::vector<float>> gather_v;
         if (needs_gather) {
             uint32_t pad_k = snap.hot_layout.eff_padded_k();
             uint32_t pad_v = snap.hot_layout.eff_padded_v();
@@ -1092,7 +1123,17 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
                     std::memcpy(ov, hv, (size_t) snap.head_dim_v * sizeof(float));
                     for (uint32_t d = 0; d < snap.head_dim_k; ++d) if (!std::isfinite(ok[d])) {
                         snap.last_status = xkv_read_status::codec_error;
-                        snap.last_error = "hot gather produced non-finite K";
+                        std::string err_msg = "hot gather produced non-finite K (span_mode, row " + std::to_string(i) +
+                            ", cell " + std::to_string(snap.hot_data[i].cell) + ", pid " + std::to_string(snap.hot_data[i].payload_id) +
+                            ", pos " + std::to_string(snap.hot_data[i].storage_pos) + ", d " + std::to_string(d) +
+                            ", val " + std::to_string(ok[d]) + ")";
+                        LLAMA_LOG_ERROR("[xkv_graph_ref] %s\n", err_msg.c_str());
+                        char hex[128] = {0};
+                        for (size_t b = 0; b < std::min<size_t>(16, (size_t)snap.head_dim_k * sizeof(float)); ++b) {
+                            snprintf(hex + b * 3, sizeof(hex) - b * 3, "%02x ", ((const uint8_t *)ok)[b]);
+                        }
+                        LLAMA_LOG_ERROR("[xkv_graph_ref] span ok hex: %s\n", hex);
+                        snap.last_error = err_msg;
                         return;
                     }
                     for (uint32_t d = 0; d < snap.head_dim_v; ++d) if (!std::isfinite(ov[d])) {
@@ -1104,6 +1145,8 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
                     hot_rows[i].v_ptr = ov;
                 }
             } else {
+            gather_k.resize(snap.hot_data.size());
+            gather_v.resize(snap.hot_data.size());
             {
                 std::string gerr0;
                 if (!fetch_hot_storage_rows(k_storage, gather_cells, snap.hot_storage_host_resident, bulk_k, &gerr0) ||
@@ -1143,8 +1186,29 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
                 const std::vector<uint8_t> & raw_k = bulk_k[bp];
                 const std::vector<uint8_t> & raw_v = bulk_v[bp];
                 std::vector<float> row_k, row_v;
-                if (!dequant_storage_row(k_storage->type, raw_k.data(), nk_floats, row_k, &gerr) ||
-                    !dequant_storage_row(v_storage->type, raw_v.data(), nv_floats, row_v, &gerr)) {
+                if (!dequant_storage_row(k_storage->type, raw_k.data(), nk_floats, row_k, &gerr)) {
+                    snap.last_status = xkv_read_status::codec_error;
+                    snap.last_error = "hot gather dequant K failed: " + gerr;
+                    return;
+                }
+                bool k_nan = false;
+                for (size_t di = 0; di < row_k.size(); ++di) {
+                    if (!std::isfinite(row_k[di])) {
+                        k_nan = true;
+                        LLAMA_LOG_ERROR("[xkv_graph_ref] dequant raw K row %zu (bp=%zu, cell=%lld, pid=%llu, pos=%lld) has non-finite at elem %zu: %f\n",
+                            i, bp, (long long)hd.cell, (unsigned long long)hd.payload_id, (long long)hd.storage_pos, di, row_k[di]);
+                        break;
+                    }
+                }
+                if (k_nan) {
+                    // Log first 16 bytes of raw_k
+                    char hex[128] = {0};
+                    for (size_t b = 0; b < std::min<size_t>(16, raw_k.size()); ++b) {
+                        snprintf(hex + b * 3, sizeof(hex) - b * 3, "%02x ", raw_k[b]);
+                    }
+                    LLAMA_LOG_ERROR("[xkv_graph_ref] raw_k hex bytes: %s (type=%d)\n", hex, (int)k_storage->type);
+                }
+                if (!dequant_storage_row(v_storage->type, raw_v.data(), nv_floats, row_v, &gerr)) {
                     snap.last_status = xkv_read_status::codec_error;
                     snap.last_error = "hot gather dequant failed: " + gerr;
                     return;
@@ -1189,7 +1253,20 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
                 hv.resize(snap.head_dim_v);
                 for (float v : hk) if (!std::isfinite(v)) {
                     snap.last_status = xkv_read_status::codec_error;
-                    snap.last_error = "hot gather produced non-finite K";
+                    std::string err_msg = "hot gather produced non-finite K (heap_mode, row " + std::to_string(i) +
+                        ", cell " + std::to_string(snap.hot_data[i].cell) + ", pid " + std::to_string(snap.hot_data[i].payload_id) +
+                        ", kv_head " + std::to_string(hd.kv_head) + " of " + std::to_string(k_storage->ne[1]) +
+                        ", pad_k " + std::to_string(pad_k) + ", nk_floats " + std::to_string(nk_floats) +
+                        ", raw_k_bytes " + std::to_string(raw_k.size()) +
+                        ", pos " + std::to_string(snap.hot_data[i].storage_pos) +
+                        ", val " + std::to_string(v) + ")";
+                    LLAMA_LOG_ERROR("[xkv_graph_ref] %s\n", err_msg.c_str());
+                    char hex[128] = {0};
+                    for (size_t b = 0; b < std::min<size_t>(16, hk.size() * sizeof(float)); ++b) {
+                        snprintf(hex + b * 3, sizeof(hex) - b * 3, "%02x ", ((const uint8_t *)hk.data())[b]);
+                    }
+                    LLAMA_LOG_ERROR("[xkv_graph_ref] heap hk hex: %s\n", hex);
+                    snap.last_error = err_msg;
                     return;
                 }
                 for (float v : hv) if (!std::isfinite(v)) {
@@ -1229,6 +1306,7 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
         snap.last_status = res.status;
         snap.last_error = res.error_message;
         snap.peak_workspace_bytes = res.peak_workspace_bytes;
+        if (res.status != xkv_read_status::success) { LLAMA_LOG_ERROR("[xkv_graph_op_handle] dense attention failed: status=%d error=%s\n", (int)res.status, res.error_message.c_str()); }
 
         if (res.status != xkv_read_status::success) {
             // Already zeroed out; keep zeroed out
@@ -1239,6 +1317,7 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
         if (!snap.validate_hot_store_bindings(&binding_err)) {
             snap.last_status = xkv_read_status::invalid_argument;
             snap.last_error = "hot store bindings post-validation failed: " + binding_err;
+            LLAMA_LOG_ERROR("[xkv_graph_op_handle] %s\n", snap.last_error.c_str());
             if (dst && dst->data) {
                 std::memset(dst->data, 0, ggml_nbytes(dst));
             }
@@ -1255,6 +1334,14 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
             if (q < res.per_query.size() && !res.per_query[q].output.empty()) {
                 const auto & q_out = res.per_query[q].output;
                 size_t copy_elems = std::min(query_out_elems, q_out.size());
+                int bad = 0;
+                for (size_t di = 0; di < copy_elems; ++di) {
+                    if (!std::isfinite(q_out[di])) ++bad;
+                }
+                if (bad > 0) {
+                    LLAMA_LOG_ERROR("[xkv_compute] query %u (snap kv_head %u): %d/%zu output elems non-finite (res status=%d)\n",
+                        q, snap.kv_head_index, bad, copy_elems, (int)res.per_query[q].status);
+                }
                 std::memcpy(dst_ptr + q * query_out_elems, q_out.data(), copy_elems * sizeof(float));
             }
         }
@@ -1263,12 +1350,14 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
     } catch (const std::exception & e) {
         snap.last_status = xkv_read_status::codec_error;
         snap.last_error = std::string("compute exception: ") + e.what();
+        LLAMA_LOG_ERROR("[xkv_graph_op_handle] %s\n", snap.last_error.c_str());
         if (dst && dst->data) {
             std::memset(dst->data, 0, ggml_nbytes(dst));
         }
     } catch (...) {
         snap.last_status = xkv_read_status::codec_error;
         snap.last_error = "unknown compute exception";
+        LLAMA_LOG_ERROR("[xkv_graph_op_handle] %s\n", snap.last_error.c_str());
         if (dst && dst->data) {
             std::memset(dst->data, 0, ggml_nbytes(dst));
         }
@@ -1366,20 +1455,23 @@ bool storage_row_geometry(const ggml_tensor * t, size_t & row_bytes, size_t & ce
         if (err) *err = "storage_row_geometry: row element count overflow";
         return false;
     }
-    size_t expect = ggml_row_size(t->type, t->ne[0] * t->ne[1]);
-    if (expect == 0) {
+    // Full cell row spans all heads contiguously: logical row bytes cover
+    // ne[0]*ne[1] elements, strided by nb[2]; nb[1] is one head's bytes.
+    size_t expect_full = ggml_row_size(t->type, t->ne[0] * t->ne[1]);
+    size_t expect_head = ggml_row_size(t->type, t->ne[0]);
+    if (expect_full == 0 || expect_head == 0) {
         if (err) *err = "storage_row_geometry: zero row bytes";
         return false;
     }
-    if (static_cast<size_t>(t->nb[1]) != expect) {
-        if (err) *err = "storage_row_geometry: row stride does not match full-row bytes (view is not head-contiguous)";
+    if (static_cast<size_t>(t->nb[1]) != expect_head) {
+        if (err) *err = "storage_row_geometry: head stride does not match head bytes (view is not head-contiguous)";
         return false;
     }
-    if (static_cast<size_t>(t->nb[2]) < static_cast<size_t>(t->nb[1])) {
-        if (err) *err = "storage_row_geometry: cell stride smaller than row bytes (overlapping rows)";
+    if (static_cast<size_t>(t->nb[2]) < expect_full) {
+        if (err) *err = "storage_row_geometry: cell stride smaller than full-row bytes (overlapping rows)";
         return false;
     }
-    row_bytes = static_cast<size_t>(t->nb[1]);
+    row_bytes = expect_full;
     cell_stride = static_cast<size_t>(t->nb[2]);
     return true;
 }
@@ -1456,6 +1548,17 @@ bool dequant_storage_row_ptr(ggml_type type, const uint8_t * raw, int64_t n_elem
     if (n_elements <= 0 || !raw || !out) {
         if (err) *err = "dequant_storage_row: non-positive element count or null buffer";
         return false;
+    }
+    // Decoded hot F32 rows are already canonical floats: gather directly.
+    // Only encoded factor codecs (Turbo/quantized) go through dequantize.
+    if (type == GGML_TYPE_F32) {
+        size_t nbytes = 0;
+        if (!safe_mul((size_t) n_elements, sizeof(float), nbytes)) {
+            if (err) *err = "dequant_storage_row: F32 byte size overflow";
+            return false;
+        }
+        std::memcpy(out, raw, nbytes);
+        return true;
     }
     if (is_turbo_type(type)) {
         if (n_elements % 128 != 0) {
@@ -1656,6 +1759,10 @@ bool xkv_graph_snapshot::preallocate_compute_state(std::string * err) {
         return false;
     }
     query_cache.resize(n_queries);
+    // Sink presence must mirror the heap path exactly: the reader treats
+    // non-empty sink_logits as an active sink term. Forcing [nq][nh] zeros
+    // when the builder declared no sinks would add a spurious exp(0) term.
+    const bool want_sink = !query_sink_logits.empty() || sink_dep >= 0;
     for (uint32_t q = 0; q < n_queries; ++q) {
         auto & qq = query_cache[q];
         qq.query_index = q;
@@ -1671,7 +1778,11 @@ bool xkv_graph_snapshot::preallocate_compute_state(std::string * err) {
             qq.q_vec.resize(per_head);
             qq.q_groups.clear();
         }
+        if (want_sink) {
         qq.sink_logits.resize(n_q_heads);
+        } else {
+            qq.sink_logits.clear();
+        }
     }
     hot_cache.resize(hot_data.size());
     for (size_t i = 0; i < hot_data.size(); ++i) {
@@ -1691,8 +1802,10 @@ bool xkv_graph_snapshot::preallocate_compute_state(std::string * err) {
     // Sized without disturbing builder-prefilled values
     // (compute refreshes from the sink dep when present; otherwise the
     // prefilled values flow exactly as on the heap path).
-    if (query_sink_logits.size() != n_queries) query_sink_logits.resize(n_queries);
-    for (uint32_t q = 0; q < n_queries; ++q) query_sink_logits[q].resize(n_q_heads);
+    if (want_sink) {
+        if (query_sink_logits.size() != n_queries) query_sink_logits.resize(n_queries);
+        for (uint32_t q = 0; q < n_queries; ++q) query_sink_logits[q].resize(n_q_heads);
+    }
     gather_pos_cache.assign(hot_data.size(), -1);
     for (size_t i = 0; i < hot_data.size(); ++i) {
         const auto & hd = hot_data[i];
@@ -1818,6 +1931,7 @@ bool xkv_graph_snapshot::compute_caches_valid(std::string * err) const {
         return false;
     }
     size_t per_head = static_cast<size_t>(n_q_heads) * head_dim_k;
+    const bool want_sink_cached = !query_sink_logits.empty() || sink_dep >= 0;
     for (uint32_t q = 0; q < n_queries; ++q) {
         const auto & qq = query_cache[q];
         if (qq.n_q_heads != n_q_heads || qq.head_dim_k != head_dim_k || qq.head_dim_v != head_dim_v) {
@@ -1846,7 +1960,7 @@ bool xkv_graph_snapshot::compute_caches_valid(std::string * err) const {
             if (err) *err = "compute_caches_valid: query vec floats mismatch";
             return false;
         }
-        if (qq.sink_logits.size() != n_q_heads) {
+        if (qq.sink_logits.size() != (want_sink_cached ? n_q_heads : 0)) {
             if (err) *err = "compute_caches_valid: sink logits mismatch";
             return false;
         }
@@ -1855,14 +1969,18 @@ bool xkv_graph_snapshot::compute_caches_valid(std::string * err) const {
         if (err) *err = "compute_caches_valid: hot count mismatch";
         return false;
     }
-    if (query_sink_logits.size() != n_queries) {
-        if (err) *err = "compute_caches_valid: sink query count mismatch";
-        return false;
-    }
-    for (uint32_t q = 0; q < n_queries; ++q) {
-        if (query_sink_logits[q].size() != n_q_heads) {
-            if (err) *err = "compute_caches_valid: sink head count mismatch";
+    if (want_sink_cached) {
+        if (query_sink_logits.size() != n_queries) {
+            if (err) *err = "compute_caches_valid: sink query count mismatch";
             return false;
+        }
+    }
+    if (want_sink_cached) {
+        for (uint32_t q = 0; q < n_queries; ++q) {
+            if (query_sink_logits[q].size() != n_q_heads) {
+                if (err) *err = "compute_caches_valid: sink head count mismatch";
+                return false;
+            }
         }
     }
     for (size_t i = 0; i < hot_data.size(); ++i) {
@@ -2507,6 +2625,11 @@ bool xkv_validate_build_caps(const xkv_graph_build_caps & caps, std::string * er
     }
     for (int side = 0; side < 2; ++side) {
         ggml_type t = (side == 0) ? caps.k_type : caps.v_type;
+        if (t == GGML_TYPE_F32) continue; // standard float hot storage
+        if (t < 0 || t >= GGML_TYPE_COUNT) {
+            if (err) *err = "xkv_validate_build_caps: codec out of range";
+            return false;
+        }
         if (is_turbo_type(t)) {
             if (ggml_turbo_layout_fingerprint(t) == 0) {
                 if (err) *err = std::string("xkv_validate_build_caps: unsupported turbo layout ") + ggml_type_name(t);
@@ -3035,7 +3158,7 @@ ggml_tensor * build_native_sr_selection(
         ggml_tensor * rope_tables,
         uint32_t top_k,
         float scale,
-        std::vector<ggml_tensor *> & out_status_tensors,
+        std::vector<xkv_native_status_item> & out_status_tensors,
         std::vector<xkv_native_fill_item> & out_fills,
         std::string * err) {
     auto fail = [&](const std::string & message) -> ggml_tensor * {
@@ -3222,7 +3345,7 @@ ggml_tensor * build_native_sr_selection(
                     landmarks, &bp, msg, sizeof(msg))) {
                 return fail(std::string("native landmark rebuild unsupported: ") + msg);
             }
-            out_status_tensors.push_back(build_status);
+            out_status_tensors.push_back({build_status, xkv_native_status_policy::code_only});
         }
 
         std::vector<int32_t> frag_meta((size_t) set.fragment_count * 8, 0);
@@ -3261,7 +3384,7 @@ ggml_tensor * build_native_sr_selection(
                 rope_tables, score_scratch, csr_ptrs, scores, status, indices, &p, msg, sizeof(msg))) {
             return fail(std::string("selector unsupported: ") + msg);
         }
-        out_status_tensors.push_back(status);
+        out_status_tensors.push_back({status, xkv_native_status_policy::code_only});
 
         if (p.top_k < top_k) {
             const uint32_t tail = top_k - p.top_k;
@@ -3317,7 +3440,7 @@ ggml_tensor * build_native_sr_selection(
                     merged_scores, merge_status, merged_idx, &mp, msg, sizeof(msg))) {
                 return fail(std::string("merge unsupported: ") + msg);
             }
-            out_status_tensors.push_back(merge_status);
+            out_status_tensors.push_back({merge_status, xkv_native_status_policy::code_only});
             next.push_back({merged_idx, merged_scores, 0});
         }
         if (next.size() == 1) return next[0].indices;
@@ -3425,7 +3548,7 @@ ggml_tensor * xkv_build_attention_native(
     ggml_tensor * v_store,
     ggml_tensor * sinks_head,
     bool backend_is_cpu,
-    std::vector<ggml_tensor *> & out_status_tensors,
+    std::vector<xkv_native_status_item> & out_status_tensors,
     std::vector<xkv_native_fill_item> & out_fills,
     std::string * err) {
     auto fail = [&](const std::string & m) -> ggml_tensor * {
@@ -3675,6 +3798,29 @@ ggml_tensor * xkv_build_attention_native(
             sub_snap.expected_stamp = snap.expected_stamp;
             sub_snap.store = snap.store;
             sub_snap.n_queries = sub_nq;
+            sub_snap.sr_feature_offset = snap.sr_feature_offset;
+            sub_snap.sr_feature_dim = snap.sr_feature_dim;
+            sub_snap.sr_phase_fingerprint = snap.sr_phase_fingerprint;
+            sub_snap.native_landmark_rebuild_requests = snap.native_landmark_rebuild_requests;
+            // Remap precomputed sr_selection to sub-queries if present
+            if (!snap.sr_selection.csr_ptrs.empty()) {
+                sub_snap.sr_selection.gather_rows = snap.sr_selection.gather_rows;
+                sub_snap.sr_selection.csr_ptrs.assign(sub_nq + 1, 0);
+                for (uint32_t sub_q = 0; sub_q < sub_nq; ++sub_q) {
+                    uint32_t orig_q = q_indices[sub_q];
+                    if (orig_q < snap.sr_selection.csr_ptrs.size() - 1) {
+                        uint32_t c_begin = snap.sr_selection.csr_ptrs[orig_q];
+                        uint32_t c_end = snap.sr_selection.csr_ptrs[orig_q + 1];
+                        for (uint32_t c = c_begin; c < c_end && c < snap.sr_selection.csr_indices.size(); ++c) {
+                            sub_snap.sr_selection.csr_indices.push_back(snap.sr_selection.csr_indices[c]);
+                            if (c < snap.sr_selection.csr_group_indices.size()) {
+                                sub_snap.sr_selection.csr_group_indices.push_back(snap.sr_selection.csr_group_indices[c]);
+                            }
+                        }
+                    }
+                    sub_snap.sr_selection.csr_ptrs[sub_q + 1] = (uint32_t) sub_snap.sr_selection.csr_indices.size();
+                }
+            }
 
             for (uint32_t sub_q = 0; sub_q < sub_nq; ++sub_q) {
                 uint32_t orig_q = q_indices[sub_q];
@@ -3687,6 +3833,10 @@ ggml_tensor * xkv_build_attention_native(
                 if (orig_q < snap.query_ddvr_group_counts.size()) {
                     sub_snap.query_ddvr_group_counts.push_back(snap.query_ddvr_group_counts[orig_q]);
                 }
+                // When sub_q_tensor is constructed by slicing each query's exact group slots
+                // and concatenating them along dim 2, the sub-DAG query slots become contiguous
+                // [0, sub_slots_total). Leaving sub_snap.query_ddvr_group_offsets empty ensures
+                // build_native_qslots correctly assigns contiguous local slot indices starting at 0.
             }
             // Filter hot data visibility to sub-queries
             sub_snap.hot_data.clear();
@@ -3711,23 +3861,25 @@ ggml_tensor * xkv_build_attention_native(
             }
 
             // Build sub-DAG Q view: for continuous or single query subsets
-            // Build a contiguous query tensor for the sub-DAG
+            // Slice all Q slots belonging to this stream's queries and concatenate along dim 2
+            // so sub_q_tensor's slots match the remapped local Q slots [0, sub_slots_total).
             ggml_tensor * sub_q_tensor = nullptr;
-            if (sub_nq == 1) {
-                const size_t off = (size_t) q_indices[0] * (size_t) q_h->nb[2];
-                sub_q_tensor = ggml_view_3d(ctx, q_h, q_h->ne[0], q_h->ne[1], 1,
-                    q_h->nb[1], q_h->nb[2], off);
-            } else {
-                // Concatenate individual query slices along dim 2
-                ggml_tensor * cur_cat = nullptr;
-                for (uint32_t sub_q = 0; sub_q < sub_nq; ++sub_q) {
-                    const size_t off = (size_t) q_indices[sub_q] * (size_t) q_h->nb[2];
+            ggml_tensor * cur_cat = nullptr;
+            for (uint32_t sub_q = 0; sub_q < sub_nq; ++sub_q) {
+                uint32_t orig_q = q_indices[sub_q];
+                for (uint32_t slot : qslots[orig_q]) {
+                    const size_t off = (size_t) slot * (size_t) q_h->nb[2];
                     ggml_tensor * slice = ggml_view_3d(ctx, q_h, q_h->ne[0], q_h->ne[1], 1,
                         q_h->nb[1], q_h->nb[2], off);
                     cur_cat = (cur_cat == nullptr) ? slice : ggml_concat(ctx, cur_cat, slice, 2);
                 }
-                sub_q_tensor = cur_cat;
             }
+            if (!cur_cat) return fail("empty sub-DAG query tensor");
+            sub_q_tensor = cur_cat;
+
+            // sub_snap's local slots are packed consecutively per sub-query according to
+            // sub_snap.query_ddvr_group_counts (or n_ddvr_groups), so query_ddvr_group_offsets
+            // must be empty to use contiguous local slot offsets starting at 0.
             sub_q_tensor = ggml_cont(ctx, sub_q_tensor);
 
             ggml_tensor * sub_out = xkv_build_attention_native(ctx, sub_q_tensor, sub_snap,
@@ -3953,7 +4105,7 @@ ggml_tensor * xkv_build_attention_native(
                             row_entries, row_status, &row_p, row_msg, sizeof(row_msg))) {
                         return fail(std::string("ggml_xkv_landmark_rows unsupported: ") + row_msg);
                     }
-                    out_status_tensors.push_back(row_status);
+                    out_status_tensors.push_back({row_status, xkv_native_status_policy::rows_clamp_retry});
                     device_rows_tiles.push_back({a, tile_capacity, row_refs, row_positions,
                         row_entries, row_ptrs, row_status});
                 }
@@ -3999,7 +4151,7 @@ ggml_tensor * xkv_build_attention_native(
         int64_t limit = q < snap.query_causal_limits.size() ? snap.query_causal_limits[q] : -1;
         auto emit_for_view_row = [&](size_t v, size_t i, uint32_t j) -> bool {
             if (j >= qslots[q].size()) return true; // mirror reference null-Q skip
-            cold_by_qv[q][v].push_back({v, (uint32_t) i, qslots[q][j]});
+            cold_by_qv[q][v].push_back({v, (uint32_t) i, 0, qslots[q][j]});
             return true;
         };
         if (has_csr) {
@@ -4011,6 +4163,10 @@ ggml_tensor * xkv_build_attention_native(
                 size_t v = 0, idx = 0;
                 if (!resolve_native_csr_ref(snap, sel.gather_rows[gi], v, idx, err)) return nullptr;
                 const auto & vw = snap.segment_views[v];
+                if (!vw.membership_mask.empty()) {
+                    if (idx >= vw.membership_mask.size()) return fail("membership mask index out of range");
+                    if (!vw.membership_mask[idx]) continue;
+                }
                 if (limit >= 0 && vw.storage_positions[idx] > limit) continue;
                 uint32_t j = 0;
                 if (has_groups) {
@@ -4480,7 +4636,7 @@ ggml_tensor * xkv_build_attention_native(
             if (err) *err = std::string("xkv_build_attention_native: attention unsupported: ") + asup_msg;
             return nullptr;
         }
-        out_status_tensors.push_back(st);
+        out_status_tensors.push_back({st, xkv_native_status_policy::code_only});
         carry = node;
         final_dst = node;
     }

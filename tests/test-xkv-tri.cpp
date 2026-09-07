@@ -2721,6 +2721,546 @@ static void test_server_pressure_integration_order() {
     std::cout << "[test_xkv_tri] test_server_pressure_integration_order PASSED." << std::endl;
 }
 
+// -----------------------------------------------------------------------------
+// Test 28: Partial IMRoPE head_dim=256 / rotary_dim=64 vs dense final-factor oracle
+// -----------------------------------------------------------------------------
+static void test_partial_imrope_256_64_vs_dense_oracle() {
+    std::cout << "[test_xkv_tri] test_partial_imrope_256_64_vs_dense_oracle..." << std::endl;
+
+    const uint32_t head_dim = 256;
+    const uint32_t rotary_dim = 64;
+    const uint32_t rank_k = 128;
+    const uint32_t total_dim_k = 256;
+    const uint32_t n_rows = 16;
+
+    triattention_calibration cal = create_test_calib(head_dim, 1, 2, 1, 2, rotary_dim);
+    TEST_ASSERT(cal.rotary_dim == 64);
+    TEST_ASSERT(cal.freq_count == 32);
+    std::vector<float> omega, fsq;
+    compute_test_omega_and_fsq(cal, omega, fsq);
+    TEST_ASSERT(omega.size() == 32);
+
+    xkv_tri_config cfg;
+    cfg.tile_size = 8;
+    cfg.recent_window = 4;
+    cfg.ratio = 0.5;
+    cfg.normalize_scores = true;
+    cfg.pool_radius = 2;
+
+    xkv_tri_adapter adapter(cal, omega.data(), fsq.data(), cfg);
+    TEST_ASSERT(adapter.valid());
+
+    llama_cparams cparams = {};
+    llama_xkv_cache_store store(cparams);
+
+    xkv_factor_group_payload g;
+    g.group_index = 0;
+    g.owning_layers = {0};
+    g.rank_k = rank_k;
+    g.rank_v = rank_k;
+    g.total_dim_k = total_dim_k;
+    g.total_dim_v = total_dim_k;
+    g.layer_feature_offsets_k = {0};
+    g.layer_feature_dims_k = {total_dim_k};
+    g.layer_feature_offsets_v = {0};
+    g.layer_feature_dims_v = {total_dim_k};
+
+    codec_desc desc_a = make_codec_desc(factor_role::a_k, GGML_TYPE_TURBO4_0, orientation::token_major, {n_rows, rank_k}, 128);
+    std::vector<float> data_a(n_rows * rank_k);
+    for (size_t i = 0; i < data_a.size(); ++i) data_a[i] = 0.05f * std::sin((float) i * 0.17f);
+    g.a_k = encode_matrix(desc_a, data_a.data(), data_a.size());
+    codec_desc desc_b = make_codec_desc(factor_role::b_k, GGML_TYPE_TURBO4_0, orientation::feature_major_transposed, {total_dim_k, rank_k}, 128);
+    std::vector<float> data_b(total_dim_k * rank_k);
+    for (size_t i = 0; i < data_b.size(); ++i) data_b[i] = 0.05f * std::cos((float) i * 0.23f);
+    g.set_b_k(encode_matrix(desc_b, data_b.data(), data_b.size()));
+    codec_desc desc_av = make_codec_desc(factor_role::a_v, GGML_TYPE_TURBO4_0, orientation::token_major, {n_rows, rank_k}, 128);
+    g.a_v = encode_matrix(desc_av, data_a.data(), data_a.size());
+    codec_desc desc_bv = make_codec_desc(factor_role::b_v, GGML_TYPE_TURBO4_0, orientation::feature_major_transposed, {total_dim_k, rank_k}, 128);
+    g.set_b_v(encode_matrix(desc_bv, data_b.data(), data_b.size()));
+
+    auto cand_seg = store.create_candidate_segment(LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS, LLAMA_XKV_SOURCE_DECODED_HOT, {g});
+    cand_seg->layer_group_map_fingerprint = compute_layer_group_map_fingerprint(cand_seg->groups);
+    std::vector<uint64_t> pids(n_rows);
+    std::vector<uint64_t> gens(n_rows, 1);
+    for (uint32_t i = 0; i < n_rows; ++i) {
+        pids[i] = 31000 + i;
+        store.register_hot_payload(pids[i], i, gens[i], xkv_state::hot_committed);
+    }
+    TEST_ASSERT(tri_mark_sealed(store, pids, gens));
+    std::string err;
+    if (!store.publish_candidate(cand_seg, pids, gens, &err)) {
+        fprintf(stderr, "test_partial_imrope_256_64 publish failed: %s\n", err.c_str());
+        TEST_ASSERT(false);
+        return;
+    }
+    uint64_t seg_id = cand_seg->segment_id;
+
+    std::vector<xkv_tri_candidate> candidates(n_rows);
+    std::vector<int32_t> positions(n_rows);
+    for (uint32_t i = 0; i < n_rows; ++i) {
+        candidates[i].cell_index = i;
+        candidates[i].storage_pos = (int32_t)(i * 5);
+        candidates[i].payload_id = pids[i];
+        candidates[i].storage_generation = 1;
+        candidates[i].location.kind = xkv_location_kind::factored;
+        candidates[i].location.segment_id = seg_id;
+        candidates[i].location.row = i;
+        candidates[i].seq_ids = {0};
+        positions[i] = candidates[i].storage_pos;
+    }
+
+    xkv_layer_slice slice = {};
+    slice.model_layer = 0;
+    slice.owning_layer = 0;
+    slice.feature_offset_k = 0;
+    slice.feature_dim_k = total_dim_k;
+    slice.head_dim = head_dim;
+    slice.rotary_dim = rotary_dim;
+    slice.rope_style = 0;
+    slice.n_kv_heads = 1;
+
+    const auto * oracle_g = cand_seg->find_group(0);
+    TEST_ASSERT(oracle_g != nullptr);
+    TEST_ASSERT(oracle_g->b_k != nullptr);
+    std::vector<float> decoded_a = decode_matrix(oracle_g->a_k, value_domain::canonical);
+    std::vector<float> decoded_b = decode_matrix(*oracle_g->b_k, value_domain::canonical);
+    std::vector<float> dense_k(n_rows * head_dim, 0.0f);
+    uint64_t a_pad = oracle_g->a_k.desc.padded_shape.cols;
+    uint64_t b_pad = oracle_g->b_k->desc.padded_shape.cols;
+    for (uint32_t r = 0; r < n_rows; ++r)
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            float sum = 0.0f;
+            for (uint64_t k = 0; k < rank_k; ++k) sum += decoded_a[r * a_pad + k] * decoded_b[d * b_pad + k];
+            dense_k[r * head_dim + d] = sum;
+        }
+
+    std::vector<float> offsets;
+    for (uint32_t d = 1; d <= 65536; d *= 2) offsets.push_back((float) d);
+    const int64_t frontier_pos = positions.back() + 10;
+    std::vector<float> oracle_combined(n_rows, -1e30f);
+    std::vector<float> temp_scores(n_rows);
+    for (uint32_t sh = 0; sh < cal.n_sampled; ++sh) {
+        triattention_score_keys(temp_scores.data(), dense_k.data(), &cal.head_stats[sh], omega.data(), fsq.data(),
+                                 offsets.data(), positions.data(), frontier_pos, n_rows, head_dim, rotary_dim / 2,
+                                 (uint32_t) offsets.size(), cfg.agg, cfg.disable_trig);
+        double sum = 0.0;
+        for (float v : temp_scores) sum += v;
+        double mean = sum / n_rows;
+        double var = 0.0;
+        for (float v : temp_scores) var += (v - mean) * (v - mean);
+        double std = std::sqrt(var / n_rows);
+        if (std < 1e-10) std = 1e-10;
+        for (float & v : temp_scores) v = (float)((v - mean) / std);
+        for (uint32_t i = 0; i < n_rows; ++i) oracle_combined[i] = std::max(oracle_combined[i], temp_scores[i]);
+    }
+    std::vector<float> oracle_pooled(n_rows);
+    triattention_max_pool_scores(oracle_pooled.data(), oracle_combined.data(), positions.data(), n_rows, cfg.pool_radius);
+
+    std::vector<float> adapter_raw(n_rows), adapter_pooled(n_rows);
+    std::vector<uint32_t> all_indices(n_rows);
+    std::iota(all_indices.begin(), all_indices.end(), 0);
+    adapter.score_candidate_subset(candidates, all_indices, {slice}, store, frontier_pos, adapter_pooled.data(), adapter_raw.data());
+    for (uint32_t i = 0; i < n_rows; ++i) {
+        TEST_ASSERT_MSG(std::fabs(adapter_raw[i] - oracle_combined[i]) < 1e-5f, "Raw 256/64 partial-IMRoPE mismatch");
+        TEST_ASSERT_MSG(std::fabs(adapter_pooled[i] - oracle_pooled[i]) < 1e-5f, "Pooled 256/64 partial-IMRoPE mismatch");
+    }
+
+    // Unsupported geometries fail closed (never silently scored).
+    {
+        triattention_calibration bad = cal;
+        bad.rope_style = 1;
+        bool threw = false;
+        try {
+            xkv_tri_adapter bad_adapter(bad, omega.data(), fsq.data(), cfg);
+        } catch (const std::invalid_argument &) { threw = true; }
+        TEST_ASSERT_MSG(threw, "rope_style=1 must be rejected");
+    }
+    {
+        xkv_layer_slice bad_slice = slice;
+        bad_slice.rotary_dim = head_dim + 1;
+        std::vector<float> out(n_rows);
+        bool threw = false;
+        try {
+            adapter.score_candidate_subset(candidates, all_indices, {bad_slice}, store, frontier_pos, out.data());
+        } catch (const std::invalid_argument &) { threw = true; }
+        TEST_ASSERT_MSG(threw, "rotary_dim > head_dim must be rejected");
+    }
+    {
+        xkv_layer_slice zero_slice = slice;
+        zero_slice.rotary_dim = 0;
+        std::vector<float> out(n_rows);
+        bool threw = false;
+        try {
+            adapter.score_candidate_subset(candidates, all_indices, {zero_slice}, store, frontier_pos, out.data());
+        } catch (const std::invalid_argument &) { threw = true; }
+        TEST_ASSERT_MSG(threw, "rotary_dim=0 must be rejected");
+    }
+
+    free_test_calib(cal);
+    std::cout << "[test_xkv_tri] test_partial_imrope_256_64_vs_dense_oracle PASSED." << std::endl;
+}
+
+// -----------------------------------------------------------------------------
+// Test 29: Layer-group sizes 4/2/1 with a size-1 tail across one segment
+// -----------------------------------------------------------------------------
+static void test_group_sizes_1_2_4_and_tail() {
+    std::cout << "[test_xkv_tri] test_group_sizes_1_2_4_and_tail..." << std::endl;
+
+    const uint32_t head_dim = 64, rank = 16, n_rows = 8, total = 64;
+    triattention_calibration cal = create_test_calib(head_dim, 1, 1, 1, 1, head_dim);
+    std::vector<float> omega, fsq;
+    compute_test_omega_and_fsq(cal, omega, fsq);
+    xkv_tri_adapter adapter(cal, omega.data(), fsq.data());
+    llama_cparams cparams = {};
+    llama_xkv_cache_store store(cparams);
+
+    auto mk_group = [&](uint32_t gidx, std::vector<uint32_t> owners, std::vector<uint32_t> offs,
+                          std::vector<uint32_t> dims, float base) {
+        xkv_factor_group_payload gp;
+        gp.group_index = gidx;
+        gp.owning_layers = std::move(owners);
+        gp.rank_k = rank;
+        gp.rank_v = rank;
+        gp.total_dim_k = total;
+        gp.total_dim_v = total;
+        gp.layer_feature_offsets_k = offs;
+        gp.layer_feature_dims_k = dims;
+        gp.layer_feature_offsets_v = offs;
+        gp.layer_feature_dims_v = dims;
+        codec_desc da = make_codec_desc(factor_role::a_k, GGML_TYPE_F32, orientation::token_major, {n_rows, rank});
+        std::vector<float> adata(n_rows * rank);
+        for (size_t i = 0; i < adata.size(); ++i) adata[i] = (float)((i * 3 + 5) % 97) * 0.01f + base;
+        gp.a_k = encode_matrix(da, adata.data(), adata.size());
+        codec_desc db = make_codec_desc(factor_role::b_k, GGML_TYPE_F32, orientation::feature_major_transposed, {total, rank});
+        std::vector<float> bdata(total * rank);
+        for (size_t i = 0; i < bdata.size(); ++i) bdata[i] = (float)((i * 7 + 11) % 89) * 0.01f + base;
+        gp.set_b_k(encode_matrix(db, bdata.data(), bdata.size()));
+        codec_desc dav = make_codec_desc(factor_role::a_v, GGML_TYPE_F32, orientation::token_major, {n_rows, rank});
+        gp.a_v = encode_matrix(dav, adata.data(), adata.size());
+        codec_desc dbv = make_codec_desc(factor_role::b_v, GGML_TYPE_F32, orientation::feature_major_transposed, {total, rank});
+        gp.set_b_v(encode_matrix(dbv, bdata.data(), bdata.size()));
+        return gp;
+    };
+    xkv_factor_group_payload g0 = mk_group(0, {0, 1, 2, 3}, {0, 16, 32, 48}, {16, 16, 16, 16}, 0.0f);
+    xkv_factor_group_payload g1 = mk_group(1, {4, 5}, {0, 32}, {32, 32}, 1.0f);
+    xkv_factor_group_payload g2 = mk_group(2, {6}, {0}, {64}, 2.0f); // size-1 tail
+
+    auto seg = store.create_candidate_segment(LLAMA_XKV_STORAGE_PROFILE_REFERENCE, LLAMA_XKV_SOURCE_DECODED_HOT, {g0, g1, g2});
+    seg->layer_group_map_fingerprint = compute_layer_group_map_fingerprint(seg->groups);
+    std::vector<uint64_t> pids(n_rows);
+    std::vector<uint64_t> gens(n_rows, 1);
+    for (uint32_t i = 0; i < n_rows; ++i) {
+        pids[i] = 62000 + i;
+        store.register_hot_payload(pids[i], i, gens[i], xkv_state::hot_committed);
+    }
+    TEST_ASSERT(tri_mark_sealed(store, pids, gens));
+    std::string err;
+    if (!store.publish_candidate(seg, pids, gens, &err)) {
+        fprintf(stderr, "test_group_sizes_1_2_4_and_tail publish failed: %s\n", err.c_str());
+        TEST_ASSERT(false);
+        return;
+    }
+    auto published = store.get_segment(seg->segment_id);
+    TEST_ASSERT(published != nullptr);
+    if (published == nullptr) return;
+    TEST_ASSERT(published->groups.size() == 3);
+    // Tail routing resolves per owning layer, never falls back to group 0.
+    TEST_ASSERT(published->find_group_for_layer(0) == published->find_group(0));
+    TEST_ASSERT(published->find_group_for_layer(4) == published->find_group(1));
+    TEST_ASSERT(published->find_group_for_layer(6) == published->find_group(2));
+
+    std::vector<xkv_tri_candidate> candidates(n_rows);
+    for (uint32_t i = 0; i < n_rows; ++i) {
+        candidates[i].cell_index = i;
+        candidates[i].storage_pos = (int32_t) i;
+        candidates[i].payload_id = pids[i];
+        candidates[i].location.kind = xkv_location_kind::factored;
+        candidates[i].location.segment_id = seg->segment_id;
+        candidates[i].location.row = i;
+        candidates[i].row_ref.segment_id = seg->segment_id;
+        candidates[i].row_ref.row = i;
+        candidates[i].seq_ids = {0};
+    }
+    xkv_layer_slice s0 = {0, 0, 0, total, 0, total, 1, head_dim, head_dim, 0};
+    xkv_layer_slice s1 = {4, 4, 0, total, 0, total, 1, head_dim, head_dim, 0};
+    xkv_layer_slice s2 = {6, 6, 0, total, 0, total, 1, head_dim, head_dim, 0};
+    std::vector<float> pooled(n_rows);
+    std::vector<uint32_t> idx(n_rows);
+    std::iota(idx.begin(), idx.end(), 0);
+    adapter.score_candidate_subset(candidates, idx, {s0, s1, s2}, store, 10, pooled.data());
+    for (uint32_t i = 0; i < n_rows; ++i) TEST_ASSERT(std::isfinite(pooled[i]));
+
+    xkv_tri_seq_info seq0 = {0, n_rows, 7, 2, true, 0, {}};
+    xkv_tri_pressure_state pressure = {true, false, false};
+    hot_k_provider_fn no_hot = nullptr;
+    auto plan = adapter.build_mutation_plan(candidates, {seq0}, {s0, s1, s2}, store, pressure, no_hot);
+    // Every candidate lands in exactly one of survivors/evicted (union, no loss/duplication).
+    TEST_ASSERT(plan.survivor_payloads.size() + plan.evicted_payloads.size() == n_rows);
+    for (uint64_t pid : pids) {
+        bool s = std::find(plan.survivor_payloads.begin(), plan.survivor_payloads.end(), pid) != plan.survivor_payloads.end();
+        bool e = std::find(plan.evicted_payloads.begin(), plan.evicted_payloads.end(), pid) != plan.evicted_payloads.end();
+        TEST_ASSERT(s != e);
+    }
+    // Fixed 3/32 policy: L=8, guard 2 -> max(2, ceil(8*3/32)=1) = 2 references targeted.
+    TEST_ASSERT_MSG(plan.target_references == 2, "default 3/32 target for L=8/guard=2 must be 2");
+
+    free_test_calib(cal);
+    std::cout << "[test_xkv_tri] test_group_sizes_1_2_4_and_tail PASSED." << std::endl;
+}
+
+// -----------------------------------------------------------------------------
+// Test 30: Empty / one-row / non-divisible candidate boundaries
+// -----------------------------------------------------------------------------
+static void test_empty_single_row_and_nondivisible_candidates() {
+    std::cout << "[test_xkv_tri] test_empty_single_row_and_nondivisible_candidates..." << std::endl;
+
+    const uint32_t head_dim = 64;
+    triattention_calibration cal = create_test_calib(head_dim, 1, 1, 1, 1, head_dim);
+    std::vector<float> omega, fsq;
+    compute_test_omega_and_fsq(cal, omega, fsq);
+    xkv_tri_config cfg8, cfg32;
+    cfg8.tile_size = 8;
+    cfg32.tile_size = 32;
+    xkv_tri_adapter adapter8(cal, omega.data(), fsq.data(), cfg8);
+    xkv_tri_adapter adapter32(cal, omega.data(), fsq.data(), cfg32);
+    llama_cparams cparams = {};
+    llama_xkv_cache_store store(cparams);
+    xkv_layer_slice slice = {0, 0, 0, head_dim, 0, head_dim, 1, head_dim, head_dim, 0};
+    xkv_tri_pressure_state pressure = {true, false, false};
+    hot_k_provider_fn prov = [](uint32_t ml, uint32_t, const std::vector<uint32_t> & cells, float * dst, size_t) {
+        for (size_t ci = 0; ci < cells.size(); ++ci)
+            for (size_t d = 0; d < 64; ++d)
+                dst[ci * 64 + d] = (ml == 0) ? (0.05f * std::sin((float)(cells[ci] * 3 + d))) : (0.05f * std::cos((float)(cells[ci] * 2 + d)));
+        return true;
+    };
+
+    // Empty boundary: no candidates — no crash, no survivors, no removals.
+    {
+        std::vector<xkv_tri_candidate> empty;
+        std::vector<uint32_t> no_idx;
+        adapter8.score_candidate_subset(empty, no_idx, {slice}, store, 0, nullptr, nullptr, prov);
+        xkv_tri_seq_info seq0 = {0, 4, 3, 2, true, 0, {}};
+        auto plan = adapter8.build_mutation_plan(empty, {seq0}, {slice}, store, pressure, prov);
+        TEST_ASSERT(!plan.changed);
+        TEST_ASSERT(plan.survivor_payloads.empty());
+        TEST_ASSERT(plan.evicted_payloads.empty());
+        TEST_ASSERT(plan.ref_removals.empty());
+        TEST_ASSERT(plan.physical_freed == 0);
+    }
+
+    // One-row boundary: the lone cell is recent-guarded and survives.
+    {
+        std::vector<xkv_tri_candidate> one(1);
+        one[0].cell_index = 0;
+        one[0].storage_pos = 0;
+        one[0].payload_id = 7000;
+        one[0].seq_ids = {0};
+        std::vector<float> pooled(1), raw(1);
+        std::vector<uint32_t> idx = {0};
+        adapter8.score_candidate_subset(one, idx, {slice}, store, 0, pooled.data(), raw.data(), prov);
+        TEST_ASSERT(std::isfinite(pooled[0]) && std::isfinite(raw[0]));
+        xkv_tri_seq_info seq0 = {0, 1, 0, 2, true, 0, {}};
+        auto plan = adapter8.build_mutation_plan(one, {seq0}, {slice}, store, pressure, prov);
+        TEST_ASSERT(plan.survivor_payloads.size() == 1);
+        TEST_ASSERT(plan.evicted_payloads.empty());
+    }
+
+    // Non-divisible 17 (= 2x8+1): tile 8 vs 32 agree; chunk/page tails score finitely.
+    {
+        const uint32_t n = 17;
+        std::vector<xkv_tri_candidate> cands(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            cands[i].cell_index = i;
+            cands[i].storage_pos = (int32_t) i;
+            cands[i].payload_id = 7100 + i;
+            cands[i].seq_ids = {0};
+        }
+        std::vector<uint32_t> idx(n);
+        std::iota(idx.begin(), idx.end(), 0);
+        std::vector<float> p8(n), r8(n), p32(n), r32(n);
+        adapter8.score_candidate_subset(cands, idx, {slice}, store, 20, p8.data(), r8.data(), prov);
+        adapter32.score_candidate_subset(cands, idx, {slice}, store, 20, p32.data(), r32.data(), prov);
+        for (uint32_t i = 0; i < n; ++i) {
+            TEST_ASSERT(std::isfinite(p8[i]) && std::isfinite(p32[i]));
+            TEST_ASSERT_MSG(std::fabs(p8[i] - p32[i]) < 1e-6f, "tail tile must not change pooled score");
+            TEST_ASSERT_MSG(std::fabs(r8[i] - r32[i]) < 1e-6f, "tail tile must not change raw score");
+        }
+    }
+
+    free_test_calib(cal);
+    std::cout << "[test_xkv_tri] test_empty_single_row_and_nondivisible_candidates PASSED." << std::endl;
+}
+
+// -----------------------------------------------------------------------------
+// Test 31: Shared references carry single importance; fixed 3/32 survivor targets
+// -----------------------------------------------------------------------------
+static void test_shared_reference_single_importance_and_fixed_ratio() {
+    std::cout << "[test_xkv_tri] test_shared_reference_single_importance_and_fixed_ratio..." << std::endl;
+
+    const uint32_t head_dim = 64;
+    triattention_calibration cal = create_test_calib(head_dim, 1, 1, 1, 1, head_dim);
+    std::vector<float> omega, fsq;
+    compute_test_omega_and_fsq(cal, omega, fsq);
+    xkv_tri_adapter adapter(cal, omega.data(), fsq.data());
+    TEST_ASSERT(xkv_tri_config().ratio == 3.0 / 32.0);
+    llama_cparams cparams = {};
+    llama_xkv_cache_store store(cparams);
+    xkv_layer_slice slice = {0, 0, 0, head_dim, 0, head_dim, 1, head_dim, head_dim, 0};
+    xkv_tri_pressure_state pressure = {true, false, false};
+    hot_k_provider_fn prov = [](uint32_t, uint32_t, const std::vector<uint32_t> & cells, float * dst, size_t) {
+        for (size_t ci = 0; ci < cells.size(); ++ci)
+            for (size_t d = 0; d < 64; ++d)
+                dst[ci * 64 + d] = 0.05f * std::sin((float)(cells[ci] * 3 + d));
+        return true;
+    };
+
+    auto mk4 = [](bool shared) {
+        std::vector<xkv_tri_candidate> v(4);
+        for (uint32_t i = 0; i < 4; ++i) {
+            v[i].cell_index = i;
+            v[i].storage_pos = (int32_t) i;
+            v[i].payload_id = 8000 + i;
+            v[i].seq_ids = {0};
+        }
+        if (shared) v[3].seq_ids = {0, 1, 2};
+        return v;
+    };
+    std::vector<xkv_tri_candidate> v1 = mk4(false);
+    std::vector<xkv_tri_candidate> v2 = mk4(true);
+    std::vector<uint32_t> idx = {0, 1, 2, 3};
+    std::vector<float> p1(4), r1(4), p2(4), r2(4);
+    adapter.score_candidate_subset(v1, idx, {slice}, store, 10, p1.data(), r1.data(), prov);
+    adapter.score_candidate_subset(v2, idx, {slice}, store, 10, p2.data(), r2.data(), prov);
+    // Adding two extra sequence references to a cell must not change any score.
+    TEST_ASSERT(p1 == p2);
+    TEST_ASSERT(r1 == r2);
+
+    // Physical union: the shared cell survives once (recent-guarded) and is never evicted.
+    xkv_tri_seq_info s0 = {0, 4, 3, 2, true, 0, {}};
+    xkv_tri_seq_info s1 = {1, 4, 3, 2, true, 0, {}};
+    xkv_tri_seq_info s2 = {2, 4, 3, 2, true, 0, {}};
+    auto plan = adapter.build_mutation_plan(v2, {s0, s1, s2}, {slice}, store, pressure, prov);
+    TEST_ASSERT(plan.survivor_payloads.size() + plan.evicted_payloads.size() == 4);
+    {
+        std::vector<uint64_t> s = plan.survivor_payloads;
+        std::sort(s.begin(), s.end());
+        TEST_ASSERT(std::adjacent_find(s.begin(), s.end()) == s.end()); // no double-counted survivor
+    }
+    TEST_ASSERT(std::find(plan.survivor_payloads.begin(), plan.survivor_payloads.end(), 8003) != plan.survivor_payloads.end());
+    TEST_ASSERT(std::find(plan.evicted_payloads.begin(), plan.evicted_payloads.end(), 8003) == plan.evicted_payloads.end());
+
+    // Fixed 3/32 survivor targets through the real planning path (matches Tri selfcheck).
+    {
+        std::vector<xkv_tri_candidate> cands(4);
+        for (uint32_t i = 0; i < 4; ++i) {
+            cands[i].cell_index = i;
+            cands[i].storage_pos = (int32_t) i;
+            cands[i].payload_id = 8100 + i;
+            cands[i].seq_ids = {0};
+        }
+        xkv_tri_seq_info big = {0, 2048, 2047, 128, true, 0, {}};
+        auto pb = adapter.build_mutation_plan(cands, {big}, {slice}, store, pressure, prov);
+        TEST_ASSERT_MSG(pb.target_references == 192, "L=2048/guard=128 at 3/32 must target 192");
+        xkv_tri_seq_info small = {0, 320, 319, 128, true, 0, {}};
+        auto ps = adapter.build_mutation_plan(cands, {small}, {slice}, store, pressure, prov);
+        TEST_ASSERT_MSG(ps.target_references == 128, "L=320/guard=128 at 3/32 must target floor 128");
+    }
+
+    free_test_calib(cal);
+    std::cout << "[test_xkv_tri] test_shared_reference_single_importance_and_fixed_ratio PASSED." << std::endl;
+}
+
+// -----------------------------------------------------------------------------
+// Test 32: Tiny two-row pack preserves survivor bytes and B identity
+// -----------------------------------------------------------------------------
+static void test_tiny_two_row_pack_byte_preservation() {
+    std::cout << "[test_xkv_tri] test_tiny_two_row_pack_byte_preservation..." << std::endl;
+
+    llama_cparams cparams = {};
+    llama_xkv_cache_store store(cparams);
+    const uint32_t n_rows = 2, rank = 16, total_dim = 64;
+    xkv_factor_group_payload g;
+    g.group_index = 0;
+    g.owning_layers = {0};
+    g.rank_k = rank;
+    g.rank_v = rank;
+    g.total_dim_k = total_dim;
+    g.total_dim_v = total_dim;
+    g.layer_feature_offsets_k = {0};
+    g.layer_feature_dims_k = {total_dim};
+    g.layer_feature_offsets_v = {0};
+    g.layer_feature_dims_v = {total_dim};
+    codec_desc desc_a = make_codec_desc(factor_role::a_k, GGML_TYPE_F32, orientation::token_major, {n_rows, rank});
+    std::vector<float> data_a(n_rows * rank);
+    for (size_t r = 0; r < n_rows; ++r)
+        for (size_t c = 0; c < rank; ++c) data_a[r * rank + c] = (float)(r * 100 + c + 1);
+    g.a_k = encode_matrix(desc_a, data_a.data(), data_a.size());
+    codec_desc desc_b = make_codec_desc(factor_role::b_k, GGML_TYPE_F32, orientation::feature_major_transposed, {total_dim, rank});
+    std::vector<float> data_b(total_dim * rank);
+    for (size_t i = 0; i < data_b.size(); ++i) data_b[i] = (float)(i + 77);
+    auto b_encoded = encode_matrix(desc_b, data_b.data(), data_b.size());
+    g.set_b_k(b_encoded);
+    codec_desc desc_av = make_codec_desc(factor_role::a_v, GGML_TYPE_F32, orientation::token_major, {n_rows, rank});
+    g.a_v = encode_matrix(desc_av, data_a.data(), data_a.size());
+    codec_desc desc_bv = make_codec_desc(factor_role::b_v, GGML_TYPE_F32, orientation::feature_major_transposed, {total_dim, rank});
+    g.set_b_v(encode_matrix(desc_bv, data_b.data(), data_b.size()));
+    auto cand_seg = store.create_candidate_segment(LLAMA_XKV_STORAGE_PROFILE_REFERENCE, LLAMA_XKV_SOURCE_DECODED_HOT, {g});
+    cand_seg->layer_group_map_fingerprint = compute_layer_group_map_fingerprint(cand_seg->groups);
+    std::vector<uint64_t> pids = {7100, 7101};
+    std::vector<uint64_t> gens = {1, 1};
+    for (uint32_t r = 0; r < n_rows; ++r) store.register_hot_payload(pids[r], r, gens[r], xkv_state::hot_committed);
+    TEST_ASSERT(tri_mark_sealed(store, pids, gens));
+    std::string err;
+    if (!store.publish_candidate(cand_seg, pids, gens, &err)) {
+        fprintf(stderr, "test_tiny_two_row_pack publish failed: %s\n", err.c_str());
+        TEST_ASSERT(false);
+        return;
+    }
+    uint64_t seg_id = cand_seg->segment_id;
+    auto published_seg = store.get_segment(seg_id);
+    if (published_seg == nullptr) {
+        fprintf(stderr, "test_tiny_two_row_pack: published segment missing\n");
+        TEST_ASSERT(false);
+        return;
+    }
+    const auto * pub_g0 = published_seg->find_group(0);
+    TEST_ASSERT(pub_g0 != nullptr && pub_g0->b_k != nullptr);
+    const size_t row_bytes = pub_g0->a_k.desc.row_stride_bytes;
+    std::vector<uint8_t> survivor_row(row_bytes);
+    std::memcpy(survivor_row.data(), pub_g0->a_k.bytes.data() + row_bytes, row_bytes); // row 1 survives
+    const void * orig_b_ptr = pub_g0->b_k->bytes.data();
+    uint64_t orig_binding = store.binding_epoch();
+    uint64_t orig_content = store.content_epoch();
+    landmark_table lm_table(1024 * 1024);
+    xkv_tri_mutation_plan plan;
+    plan.evicted_payloads.push_back(pids[0]);
+    plan.affected_segments = {seg_id};
+    triattention_calibration cal = create_test_calib();
+    std::vector<float> omega, fsq;
+    compute_test_omega_and_fsq(cal, omega, fsq);
+    xkv_tri_adapter adapter(cal, omega.data(), fsq.data());
+    auto proposal = adapter.create_mutation_proposal(plan, store);
+    if (!proposal.apply(store, &lm_table, &err)) {
+        fprintf(stderr, "test_tiny_two_row_pack apply failed: %s\n", err.c_str());
+        TEST_ASSERT(false);
+        return;
+    }
+    auto repacked = store.get_segment(seg_id);
+    TEST_ASSERT(repacked != nullptr);
+    if (repacked == nullptr) return;
+    TEST_ASSERT_MSG(repacked->n_rows == 1, "two-row pack evicting one must leave one row");
+    const auto * rep_g0 = repacked->find_group(0);
+    TEST_ASSERT(rep_g0 != nullptr && rep_g0->b_k != nullptr);
+    TEST_ASSERT_MSG(rep_g0->b_k->bytes == b_encoded.bytes, "B_K bytes identical after tiny pack");
+    TEST_ASSERT_MSG(rep_g0->b_k->bytes.data() == orig_b_ptr, "B_K shared pointer preserved after tiny pack");
+    TEST_ASSERT_MSG(repacked->row_payload_ids[0] == pids[1], "survivor identity preserved");
+    TEST_ASSERT_MSG(std::memcmp(rep_g0->a_k.bytes.data(), survivor_row.data(), row_bytes) == 0, "survivor A row byte-identical");
+    TEST_ASSERT_MSG(store.binding_epoch() > orig_binding, "binding_epoch must advance");
+    TEST_ASSERT_MSG(store.content_epoch() == orig_content, "content_epoch unchanged on physical pack");
+    free_test_calib(cal);
+    std::cout << "[test_xkv_tri] test_tiny_two_row_pack_byte_preservation PASSED." << std::endl;
+}
+
 int main() {
     std::cout << "========================================" << std::endl;
     std::cout << "Running XKV TriAttention Data Adapter Tests" << std::endl;
@@ -2754,6 +3294,11 @@ int main() {
     test_estimator_tile_a_exact_and_descriptor_derived();
     test_server_pressure_integration_order();
     test_proposal_arena_heap_allocation_delta();
+    test_partial_imrope_256_64_vs_dense_oracle();
+    test_group_sizes_1_2_4_and_tail();
+    test_empty_single_row_and_nondivisible_candidates();
+    test_shared_reference_single_importance_and_fixed_ratio();
+    test_tiny_two_row_pack_byte_preservation();
 
     if (g_test_failures == 0) {
         std::cout << "ALL XKV TRI TESTS PASSED!" << std::endl;

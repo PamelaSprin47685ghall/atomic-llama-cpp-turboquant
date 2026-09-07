@@ -1,5 +1,7 @@
 #include "server-rerot.h"
+#include "server-task.h"
 #include "llama-context.h"
+#include "llama-grammar.h"
 #include "llama-model.h"
 #include "llama-memory-recurrent.h"
 
@@ -2717,6 +2719,142 @@ static void test_phase7_runtime_production_stress_and_pressure() {
     CHECK(runtime.pens_running() == 0);
 }
 
+static void test_final_fence_user_grammar_restoration() {
+    std::fprintf(stderr, "--- test_final_fence_user_grammar_restoration (§26, §A.16.1) ---\n");
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
+    const uint64_t ep = runtime.adopt_root(150, 151, 0, 0, 0, 501);
+    CHECK(ep == 501);
+    CHECK(runtime.response_task_id(ep) == 151);
+
+    // 1. Simulate incoming user task with user/tool JSON schema grammar
+    task_params params;
+    const std::string user_grammar_source = "root ::= \"{\\\"name\\\":\\\"\" [a-z]+ \"\\\"}\"";
+    params.sampling.grammar = {
+        COMMON_GRAMMAR_TYPE_USER,
+        user_grammar_source
+    };
+
+    // 2. Take user grammar before planner <ol> injection (server_rerot_take_user_grammar)
+    const common_grammar saved_grammar = server_rerot_take_user_grammar(params);
+    CHECK(!saved_grammar.empty());
+    CHECK(!common_grammar_value(saved_grammar).empty());
+    CHECK(common_grammar_value(saved_grammar) == user_grammar_source);
+    CHECK(saved_grammar.type == COMMON_GRAMMAR_TYPE_USER);
+    CHECK(params.sampling.grammar.empty());
+
+    // 3. Sibling children fork, run to completion, and initiate final fence (mirroring test_final_fence_sees_last_sibling_write)
+    CHECK(commit_generated(runtime, ep, 0, 0, "<ol><li>Alpha</li><li>Beta</li></ol>"));
+    CHECK(runtime.finish_frontier(ep).forked.size() == 1);
+    CHECK(runtime.freeze_fork_parent(ep, 0));
+
+    start_child(runtime, ep, 0, 1);
+    start_child(runtime, ep, 1, 2);
+    make_terminal(runtime, ep, 1);
+    make_terminal(runtime, ep, 2);
+    request_exit(runtime, ep, 1);
+    request_exit(runtime, ep, 2);
+
+    const auto frontier = runtime.finish_frontier(ep);
+    CHECK(frontier.natural_final());
+    CHECK(frontier.final_node == 2);
+    CHECK(frontier.retired.size() == 1 && frontier.retired[0] == 1);
+
+    std::vector<uint32_t> ordered_runs;
+    CHECK(runtime.refresh_final_fence(ep, 2, &ordered_runs));
+    CHECK(runtime.complete_serial_tail(ep, 2));
+    const auto * ep_ptr = runtime.episode(ep);
+    CHECK(ep_ptr != nullptr && ep_ptr->serial_tail && ep_ptr->serial_node == 2);
+    CHECK(runtime.response_task_id(ep) == 151);
+
+    // 4. Restore user grammar on serial tail entry (server_rerot_restore_user_grammar)
+    server_rerot_restore_user_grammar(params, saved_grammar);
+    CHECK(!params.sampling.grammar.empty());
+    CHECK(params.sampling.grammar.type == COMMON_GRAMMAR_TYPE_USER);
+    CHECK(params.sampling.grammar.type == saved_grammar.type);
+    CHECK(common_grammar_value(params.sampling.grammar) == user_grammar_source);
+    CHECK(common_grammar_value(params.sampling.grammar) == common_grammar_value(saved_grammar));
+
+    // 5. Invariant: Restored grammar compiles cleanly via real grammar init used elsewhere in repo tests
+    llama_grammar * compiled = llama_grammar_init_impl(
+        nullptr, common_grammar_value(params.sampling.grammar).c_str(), "root", false, nullptr, 0, nullptr, 0);
+    CHECK(compiled != nullptr);
+    if (compiled) {
+        llama_grammar_free_impl(compiled);
+    }
+
+    CHECK(runtime.erase_episode(ep));
+}
+
+static void test_ram_restore_context_shift_and_preemption() {
+    std::fprintf(stderr, "--- test_ram_restore_context_shift_and_preemption (§15.2, §21.4, §25, §A.8-A.9) ---\n");
+    // 1. Create episode with public root (pos 10 prefix) and forked children (mirroring test_episode_state_round_trip_and_fingerprint)
+    server_rerot_runtime rt1(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
+    const uint64_t ep1 = rt1.adopt_root(280, 281, 0, 0, 10, 701);
+    CHECK(ep1 == 701);
+
+    // Public unpinned text committed at pos 10
+    CHECK(commit_generated(rt1, ep1, 0, 10, "unpinned text "));
+    // Planner record committed at pos 11, forking into 2 children
+    CHECK(commit_generated(rt1, ep1, 0, 11, "<ol><li>Child A</li><li>Child B</li></ol>"));
+    CHECK(rt1.finish_frontier(ep1).forked.size() == 1);
+    CHECK(rt1.freeze_fork_parent(ep1, 0));
+    start_child(rt1, ep1, 0, 1);
+
+    auto * child1 = rt1.node(ep1, 1);
+    CHECK(child1 != nullptr);
+
+    // 2. Save via existing episode save API with fingerprints
+    const auto fp = test_state_fingerprints();
+    std::vector<uint8_t> ram_blob;
+    std::string err;
+    CHECK(rt1.save_episode(ep1, fp, &ram_blob, &err));
+    CHECK(!ram_blob.empty());
+    CHECK(err.empty());
+
+    // 3. Restore into fresh runtime with pen capacity forced to 1 to trigger preemption pressure
+    server_rerot_runtime rt2(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
+    uint64_t restored_ep = 0;
+    CHECK(rt2.load_episode(ram_blob.data(), ram_blob.size(), fp, &restored_ep, &err));
+    CHECK(restored_ep == ep1);
+    auto * restored_ep_ptr = rt2.episode(restored_ep);
+    CHECK(restored_ep_ptr != nullptr);
+    CHECK(restored_ep_ptr->document.validate(&err));
+    CHECK(restored_ep_ptr->ready_queue.size() == 1);
+
+    // 4. Apply existing context shift on restored episode
+    server_rerot_shift_result shift_res;
+    err.clear();
+    CHECK(rt2.context_shift(restored_ep, 1, &shift_res, &err));
+    CHECK(err.empty());
+    CHECK(shift_res.tokens_removed == 1);
+    CHECK(shift_res.runs_truncated == 1);
+    CHECK(shift_res.runs_emptied == 1);
+    CHECK(restored_ep_ptr->topology_barrier_pending);
+
+    // Assert restored episode state validity/unpinned truncation behavior consistent with existing shift test
+    CHECK(restored_ep_ptr->document.validate(&err));
+    const auto * truncated_run = restored_ep_ptr->document.run(0);
+    CHECK(truncated_run != nullptr);
+    CHECK(truncated_run->token_count == 0);
+    CHECK(truncated_run->storage_pos0 == 10);
+
+    // 5. Set pen capacity to 1 (preemption constraint) and schedule pens
+    rt2.set_pen_capacity(1);
+    CHECK(rt2.pen_capacity() == 1);
+    // Slot 0 was freed by demoting or releasing before schedule
+    rt2.release_slot(0);
+    CHECK(rt2.pens_allocated() == 0);
+    const size_t scheduled = rt2.schedule_pens({restored_ep});
+    CHECK(scheduled == 1);
+    CHECK(rt2.pens_allocated() == 1);
+    CHECK(rt2.pens_allocated() <= rt2.pen_capacity());
+    CHECK(restored_ep_ptr->ready_queue.empty());
+
+    // 6. Clean episode erase
+    CHECK(rt2.erase_episode(restored_ep));
+    CHECK(rt1.erase_episode(ep1));
+    CHECK(rt2.pens_allocated() == 0);
+}
 int main() {
     std::fprintf(stderr, "=== RERoT Runtime Tests ===\n");
     test_recurrent_only_pressure_isolation();
@@ -2756,6 +2894,8 @@ int main() {
     test_frontier_boundary_pen_yield_and_resume();
     test_multi_person_b_greater_than_p_fairness();
     test_phase7_runtime_production_stress_and_pressure();
+    test_final_fence_user_grammar_restoration();
+    test_ram_restore_context_shift_and_preemption();
     std::fprintf(stderr, "=== Results: %d failure(s) ===\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

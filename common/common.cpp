@@ -1323,22 +1323,25 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         // XKV auto-fit reserve accounting (§16): computed exactly once here
         // for visibility and overflow validation; the per-device addition
         // itself happens inside the fit probes (fit.cpp).
-        if (llama_xkv_is_enabled(cparams.xkv_mode)) {
-            common_xkv_fit_reserve xkv_reserve = {};
-            uint64_t xkv_log_scratch = 0;
-            if (!common_xkv_scratch_bytes(params.model.path.c_str(), &mparams, &cparams, &xkv_log_scratch)) {
-                COM_ERR("%s", "XKV scratch estimation failed, aborting auto-fit\n");
-                return;
-            }
-            if (!common_xkv_fit_reserve_bytes(&cparams, xkv_log_scratch, &xkv_reserve)) {
-                COM_ERR("%s", "XKV reserve accounting overflow, aborting auto-fit\n");
-                return;
-            }
-            COM_INF("XKV auto-fit reserve: workspace=%llu MiB decode_cache=%llu MiB factor_scratch=%llu MiB total=%llu MiB (accounted once per device)\n",
-                (unsigned long long) (xkv_reserve.workspace_bytes       / (1024ull * 1024ull)),
-                (unsigned long long) (xkv_reserve.decode_cache_bytes   / (1024ull * 1024ull)),
-                (unsigned long long) (xkv_reserve.factor_scratch_bytes / (1024ull * 1024ull)),
-                (unsigned long long) (xkv_reserve.total_bytes            / (1024ull * 1024ull)));
+            if (llama_xkv_is_enabled(cparams.xkv_mode)) {
+                common_xkv_fit_reserve xkv_reserve = {};
+                uint64_t xkv_log_scratch = 0;
+                uint64_t xkv_log_dedup = 0;
+                if (!common_xkv_scratch_bytes(params.model.path.c_str(), &mparams, &cparams, &xkv_log_scratch, &xkv_log_dedup)) {
+                    COM_WRN("%s", "XKV scratch estimation failed; degrading scratch reserve to 0\n");
+                    xkv_log_scratch = 0;
+                    xkv_log_dedup = 0;
+                }
+                if (!common_xkv_fit_reserve_bytes(&cparams, xkv_log_scratch, &xkv_reserve, xkv_log_dedup)) {
+                    COM_ERR("%s", "XKV reserve accounting overflow, aborting auto-fit\n");
+                    return;
+                }
+                COM_INF("XKV auto-fit reserve: workspace=%llu MiB decode_cache=%llu MiB factor_scratch=%llu MiB dedup_scratch=%llu MiB total=%llu MiB (workspace once per device; dedup host)\n",
+                    (unsigned long long) (xkv_reserve.workspace_bytes       / (1024ull * 1024ull)),
+                    (unsigned long long) (xkv_reserve.decode_cache_bytes   / (1024ull * 1024ull)),
+                    (unsigned long long) (xkv_reserve.factor_scratch_bytes / (1024ull * 1024ull)),
+                    (unsigned long long) (xkv_reserve.dedup_scratch_bytes   / (1024ull * 1024ull)),
+                    (unsigned long long) (xkv_reserve.total_bytes            / (1024ull * 1024ull)));
         }
         if (params.rerot_enabled) {
             // §B.10 / Phase 8: VRAM-only Three-Capacity Auto-fit for RERoT

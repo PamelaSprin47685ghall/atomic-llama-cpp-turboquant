@@ -229,6 +229,9 @@ public:
     bool next()  override;
     bool apply() override;
 
+    // POSTCOMPUTE committed-state audit (split-ubatch carry debug).
+    bool postcompute_success() override;
+
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 

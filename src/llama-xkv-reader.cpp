@@ -2928,6 +2928,12 @@ xkv_batch_read_result xkv_read_attention_batch(
                 for (uint32_t qh = 0; qh < query.n_q_heads; ++qh) {
                     const float * q_ptr = get_q_ptr(query, hr_group, qh);
                     if (!q_ptr) continue;
+                    if (!std::isfinite(q_ptr[0])) {
+                        static int q_nan_logged = 0;
+                        if (q_nan_logged++ < 5) {
+                            fprintf(stderr, "[xkv_read_attention_batch] Q vector for query %zu (qh %u, hr_group %u) elem0 is NaN: %f\n", q, qh, hr_group, q_ptr[0]);
+                        }
+                    }
 
                     float score = dot_product(q_ptr, hr.k_ptr, query.head_dim_k) * scale;
                     if (query.logit_softcap > 0.0f) {
@@ -3309,6 +3315,13 @@ xkv_batch_read_result xkv_read_attention_batch(
             batch_res.per_query[q].b_cache_hit = any_b_cache_hit;
             for (uint32_t qh = 0; qh < query.n_q_heads; ++qh) {
                 base_states[fin_head_base + qh].finalize(batch_res.per_query[q].output.data() + qh * query.head_dim_v, query.head_dim_v);
+                float val0 = batch_res.per_query[q].output[qh * query.head_dim_v];
+                if (!std::isfinite(val0)) {
+                    float max_s = base_states[fin_head_base + qh].max_score;
+                    float sum_e = base_states[fin_head_base + qh].sum_exp;
+                    fprintf(stderr, "[xkv_finalize] query %zu qh %u: finalized to non-finite %f! max_score=%f sum_exp=%f\n",
+                        q, qh, val0, max_s, sum_e);
+                }
             }
             fin_head_base += query.n_q_heads;
         }

@@ -215,6 +215,10 @@ bool invert_rope_k(
         if (err) *err = "positions pointer is null (required for text-only RoPE inversion)";
         return false;
     }
+    if (rotary_dim == 0) {
+        std::memcpy(out, post_rope_k, (size_t) n_cells * head_dim * sizeof(float));
+        return true;
+    }
     if (rotary_dim == 0 || (rotary_dim & 1u) != 0 || rotary_dim > head_dim) {
         if (err) *err = "invalid or odd rotary_dim: " + std::to_string(rotary_dim);
         return false;
@@ -412,12 +416,15 @@ bool xkv_canonical_layer_kv_snapshot::init(
     }
 
     if (need_k) {
+        rotary_dim = (hparams.rope_type == LLAMA_ROPE_TYPE_NONE) ? 0 : hparams.n_rot(il);
+        if (hparams.rope_type == LLAMA_ROPE_TYPE_NONE || rotary_dim == 0) {
+            rotary_dim = 0;
+        } else {
         if (hparams.rope_type != LLAMA_ROPE_TYPE_NEOX && hparams.rope_type != LLAMA_ROPE_TYPE_IMROPE) {
             if (err) *err = "unsupported RoPE type for canonical reading (only NeoX and text-only IMRoPE supported)";
             return false;
         }
 
-        rotary_dim = hparams.n_rot(il);
         if (rotary_dim == 0 || (rotary_dim & 1u) != 0 || rotary_dim > head_dim_k) {
             if (err) *err = "invalid or odd rotary_dim " + std::to_string(rotary_dim) + " for layer " + std::to_string(il);
             return false;
@@ -453,19 +460,22 @@ bool xkv_canonical_layer_kv_snapshot::init(
                 }
             }
 
+            const float freq_base = (cparams.rope_freq_base > 0.0f) ? model.get_rope_freq_base(cparams, (int) il) : model.hparams.rope_freq_base_train;
+            const float freq_scale = (cparams.rope_freq_scale > 0.0f) ? model.get_rope_freq_scale(cparams, (int) il) : 1.0f;
+            const float attn_factor = (cparams.yarn_attn_factor > 0.0f) ? cparams.yarn_attn_factor : 1.0f;
             if (!triattention_build_rope_tables(
                     omega.data(), freq_scale_sq.data(), rotary_dim,
-                    model.get_rope_freq_base(cparams, (int) il),
-                    model.get_rope_freq_scale(cparams, (int) il),
+                    freq_base, freq_scale,
                     (int32_t) cparams.n_ctx_orig_yarn,
                     cparams.yarn_ext_factor,
-                    cparams.yarn_attn_factor,
+                    attn_factor,
                     cparams.yarn_beta_fast,
                     cparams.yarn_beta_slow,
                     factor_ptr)) {
                 if (err) *err = "triattention_build_rope_tables failed for layer " + std::to_string(il);
                 return false;
             }
+        }
         }
     }
 

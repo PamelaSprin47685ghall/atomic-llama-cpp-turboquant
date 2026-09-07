@@ -6,6 +6,8 @@
 
 #include "../src/llama-kv-cells.h"
 #include <cassert>
+#include <cstdint>
+#include <vector>
 
 static llama_kv_rerot_meta make_rerot_meta(
         uint64_t episode_id,
@@ -854,7 +856,7 @@ int main() {
         assert(pid_dst != pid0); // Fresh identity for distinct physical copy
     }
 
-    // =========================================================================
+// =========================================================================
     // Phase 7: Shared-prefix physical cell union stress test (§A.24, Gate 24 of DoD A.30)
     // 8K common prefix ├ A ├ B └ C
     // Verifies 3 layers of sharing:
@@ -994,6 +996,186 @@ int main() {
         // Suffix tokens of B and C are still completely intact and correct
         assert(cells.seq_get_used(seq_cmpl_b) == 32);
         assert(cells.seq_get_used(seq_cmpl_c) == 32);
+    }
+
+    // Test 10: reserve_payload_ids_through preflight monotonicity and fail-closed saturation
+    {
+        llama_kv_cells c;
+        c.resize(4);
+        c.pos_set(0, 1);
+        const uint64_t pid_initial = c.payload_id_get(0);
+        assert(pid_initial > 0);
+
+        // Advancing past a higher target: next allocation must strictly exceed target
+        const uint64_t target_pid = pid_initial + 1000;
+        assert(llama_kv_cells::reserve_payload_ids_through(target_pid));
+        c.pos_set(1, 2);
+        const uint64_t pid_after_reserve = c.payload_id_get(1);
+        assert(pid_after_reserve > target_pid);
+
+        // Monotonicity: reserving a smaller value than current counter succeeds without decrementing
+        assert(llama_kv_cells::reserve_payload_ids_through(pid_initial));
+        c.pos_set(2, 3);
+        const uint64_t pid_after_lower = c.payload_id_get(2);
+        assert(pid_after_lower > pid_after_reserve);
+
+        // Fail-closed at UINT64_MAX: cannot wrap, returns false
+        assert(!llama_kv_cells::reserve_payload_ids_through(UINT64_MAX));
+    }
+
+    // Test 11: RERoT freeze to archive and shared reference union without double importance
+    {
+        llama_kv_cells c;
+        c.resize(8);
+
+        const uint64_t ep = 42;
+        const llama_seq_id exec_seq = 0;
+        const llama_seq_id archive_seq = 1;
+        const llama_seq_id foreign_seq = 2;
+
+        // Cell 0: PUBLIC_LIVE in exec_seq -> should be archived (gains archive_seq, loses exec_seq)
+        c.pos_set(0, 10);
+        c.seq_add(0, exec_seq);
+        c.rerot_set(0, make_rerot_meta(ep, 1, 101, llama_rerot_visibility::pending_record, 0, 10));
+        assert(c.rerot_publish(0, ep, 101, 5));
+
+        // Cell 1: PRIVATE_CONTROL in exec_seq -> should NOT be archived; exec_seq removed -> becomes empty
+        c.pos_set(1, 11);
+        c.seq_add(1, exec_seq);
+        c.rerot_set(1, make_rerot_meta(ep, 2, 102, llama_rerot_visibility::private_control, 0, 11));
+
+        // Cell 2: PENDING_RECORD in exec_seq -> should NOT be archived; exec_seq removed -> becomes empty
+        c.pos_set(2, 12);
+        c.seq_add(2, exec_seq);
+        c.rerot_set(2, make_rerot_meta(ep, 3, 103, llama_rerot_visibility::pending_record, 0, 12));
+
+        // Cell 3: PUBLIC_LIVE already shared with archive_seq -> gains no duplicate reference, loses exec_seq, keeps archive_seq
+        c.pos_set(3, 13);
+        c.seq_add(3, exec_seq);
+        c.seq_add(3, archive_seq);
+        c.rerot_set(3, make_rerot_meta(ep, 4, 104, llama_rerot_visibility::pending_record, 0, 13));
+        assert(c.rerot_publish(3, ep, 104, 5));
+
+        // Cell 4: foreign sequence cell -> completely untouched
+        c.pos_set(4, 14);
+        c.seq_add(4, foreign_seq);
+
+        assert(c.seq_get_used(exec_seq) == 4);
+        assert(c.seq_get_used(archive_seq) == 1);
+        assert(c.seq_get_used(foreign_seq) == 1);
+
+        // Physical run lookup before freeze
+        std::vector<uint32_t> run_cells;
+        assert(c.rerot_collect_run(ep, 101, run_cells) == 1);
+        assert(run_cells[0] == 0);
+        run_cells.clear();
+        assert(c.rerot_collect_run(0, 101, run_cells) == 0); // ep=0 returns 0
+
+        // Freeze exec_seq to archive_seq
+        size_t kept = c.rerot_freeze_to_archive(ep, exec_seq, archive_seq);
+        assert(kept == 2); // Cell 0 and Cell 3
+
+        // Exec seq has 0 cells left
+        assert(c.seq_get_used(exec_seq) == 0);
+
+        // Cell 0 survived under archive_seq
+        assert(!c.is_empty(0));
+        assert(c.seq_has(0, archive_seq));
+        assert(!c.seq_has(0, exec_seq));
+        assert(c.seq_count(0) == 1);
+        assert(c.rerot_get(0).visibility == llama_rerot_visibility::public_live);
+
+        // Cells 1 and 2 emptied (private and pending dropped)
+        assert(c.is_empty(1));
+        assert(c.payload_id_get(1) == 0);
+        assert(c.is_empty(2));
+        assert(c.payload_id_get(2) == 0);
+
+        // Cell 3 survived under archive_seq without double importance
+        assert(!c.is_empty(3));
+        assert(c.seq_has(3, archive_seq));
+        assert(!c.seq_has(3, exec_seq));
+        assert(c.seq_count(3) == 1); // No double count for archive_seq
+
+        // Cell 4 unaffected
+        assert(!c.is_empty(4));
+        assert(c.seq_has(4, foreign_seq));
+
+        assert(c.seq_get_used(archive_seq) == 2);
+        assert(c.seq_get_used(foreign_seq) == 1);
+    }
+
+    // Test 12: Exact multi-ref sequence snapshot/restore for overwrite-victim lifecycle
+    {
+        llama_kv_cells c;
+        c.resize(6);
+
+        c.pos_set(1, 50);
+        c.seq_add(1, 0);
+        c.seq_add(1, 2);
+        c.seq_add(1, 5);
+
+        assert(c.seq_get_used(0) == 1);
+        assert(c.seq_get_used(2) == 1);
+        assert(c.seq_get_used(5) == 1);
+
+        const auto snap = c.seq_snapshot(1);
+        assert(snap.count() == 3);
+        assert(snap.test(0) && snap.test(2) && snap.test(5));
+
+        // Remove cell 1
+        c.rm(1);
+        assert(c.is_empty(1));
+        assert(c.seq_get_used(0) == 0);
+        assert(c.seq_get_used(2) == 0);
+        assert(c.seq_get_used(5) == 0);
+
+        // Restore onto cell 3 with pos_set then seq_restore
+        c.pos_set(3, 50);
+        c.seq_restore(3, snap);
+
+        assert(!c.is_empty(3));
+        assert(c.seq_count(3) == 3);
+        assert(c.seq_has(3, 0) && c.seq_has(3, 2) && c.seq_has(3, 5));
+        assert(c.seq_get_used(0) == 1);
+        assert(c.seq_get_used(2) == 1);
+        assert(c.seq_get_used(5) == 1);
+        assert(c.seq_pos_min(0) == 50 && c.seq_pos_max(0) == 50);
+        assert(c.seq_pos_min(2) == 50 && c.seq_pos_max(2) == 50);
+        assert(c.seq_pos_min(5) == 50 && c.seq_pos_max(5) == 50);
+    }
+
+    // Test 13: One-row boundary and non-divisible compaction preservation
+    {
+        llama_kv_cells c;
+        c.resize(17); // prime size / non-divisible
+
+        // Single isolated row at the very end
+        c.pos_set(16, 999);
+        c.seq_add(16, 3);
+        const uint64_t single_pid = c.payload_id_get(16);
+        const uint64_t single_gen = c.storage_generation_get(16);
+
+        auto plan = c.make_pack_plan();
+        assert(plan.retained_count == 1);
+        assert(plan.moves.size() == 1);
+        assert(plan.moves[0].src_begin == 16);
+        assert(plan.moves[0].dst_begin == 0);
+        assert(plan.moves[0].length == 1);
+
+        c.apply_pack(plan);
+        assert(c.get_used() == 1);
+        assert(c.used_min() == 0);
+        assert(c.used_max_p1() == 1);
+        assert(!c.is_empty(0));
+        assert(c.pos_get(0) == 999);
+        assert(c.seq_has(0, 3));
+        assert(c.payload_id_get(0) == single_pid);
+        assert(c.storage_generation_get(0) == single_gen);
+        for (uint32_t i = 1; i < 17; ++i) {
+            assert(c.is_empty(i));
+            assert(c.payload_id_get(i) == 0);
+        }
     }
 
     return 0;

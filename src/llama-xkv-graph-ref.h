@@ -581,15 +581,26 @@ struct xkv_native_fill_item {
     std::vector<uint8_t> bytes;     // exact ggml_nbytes(tensor) content
 };
 
+enum class xkv_native_status_policy : uint8_t {
+    code_only,
+    rows_clamp_retry,
+};
+
+struct xkv_native_status_item {
+    ggml_tensor * tensor = nullptr;
+    xkv_native_status_policy policy = xkv_native_status_policy::code_only;
+};
+
 // Builds the native tiled XKV attention chain for one KV head (ggml-xkv.h).
 // Consumes the snapshot as borrowed config: hot storage views and sink head
 // tensor are explicit graph tensors; cold code streams come from
 // snap.native_group_arenas (borrowed backend-resident, builder-wired).
 // Small per-build metadata (refs/positions/group_meta/layer_meta/entries/
 // offsets/cold-dummy) is created in ctx as set_input tensors; their exact
-// bytes are returned in out_fills for set_input application. One I32[1]
-// status tensor per attention tile is appended to out_status_tensors for
-// postcompute validation (nonzero status = hard failure, never silent).
+// bytes are returned in out_fills for set_input application. Typed status
+// tensors are appended for postcompute validation: nonzero status[0] is hard
+// failure; ROWS status[2] requests a fresh larger-cap snapshot rather than
+// silently truncating selected rows.
 // Returns per-head output [head_dim_v_logic * n_q_heads, n_queries] F32,
 // identical in shape to the reference builder output. Fail-closed: returns
 // nullptr with err on any unsupported/mismatched input (SR-after-Q mode,
@@ -608,7 +619,7 @@ struct ggml_tensor * xkv_build_attention_native(
     struct ggml_tensor * v_store,
     struct ggml_tensor * sinks_head,
     bool backend_is_cpu,
-    std::vector<struct ggml_tensor *> & out_status_tensors,
+    std::vector<xkv_native_status_item> & out_status_tensors,
     std::vector<xkv_native_fill_item> & out_fills,
     std::string * err = nullptr);
 

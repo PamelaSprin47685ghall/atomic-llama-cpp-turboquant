@@ -10,6 +10,7 @@
 
 #include "llama-xkv-cache.h"
 #include "llama-xkv-codec.h"
+#include "llama-xkv-backend.h"
 #include "llama-cparams.h"
 #include "ggml.h"
 
@@ -91,7 +92,7 @@ int main() {
         g.a_v = encode_matrix(dv, srcv.data(), srcv.size());
 
         codec_desc bk = make_codec_desc(factor_role::b_k, GGML_TYPE_TURBO4_0,
-                                        orientation::feature_major_transposed, {dim, rank}, 128, 503);
+                                        orientation::feature_major_transposed, {dim, rank}, 128, 501);
         std::vector<float> srcbk((size_t) dim * rank, 0.3f);
         g.set_b_k(encode_matrix(bk, srcbk.data(), srcbk.size()));
 
@@ -141,6 +142,13 @@ int main() {
     const codec_desc orig_desc_ak = seg->groups[0].a_k.desc;
     const codec_desc orig_desc_av = seg->groups[0].a_v.desc;
 
+    codec_desc packed_desc_ak = orig_desc_ak;
+    packed_desc_ak.logical_shape.rows = 3;
+    packed_desc_ak.padded_shape.rows = 3;
+    codec_desc packed_desc_av = orig_desc_av;
+    packed_desc_av.logical_shape.rows = 3;
+    packed_desc_av.padded_shape.rows = 3;
+
     std::string err;
     CHECK(store.publish_candidate(seg, pids, gens, &err));
 
@@ -152,6 +160,7 @@ int main() {
 
     auto packed = store.get_segment(seg_id);
     CHECK(packed != nullptr);
+    if (packed != nullptr) {
     CHECK(packed->n_rows == 3);
     CHECK(packed->n_live_rows == 3);
     CHECK((packed->row_payload_ids == std::vector<uint64_t>({10, 30, 60})));
@@ -162,8 +171,8 @@ int main() {
     CHECK(packed->groups[0].b_k->bytes == orig_bk->bytes);
 
     // Survivor A bytes are verbatim copies — no re-encode.
-    CHECK(packed->groups[0].a_k.desc == orig_desc_ak);
-    CHECK(packed->groups[0].a_v.desc == orig_desc_av);
+    CHECK(packed->groups[0].a_k.desc == packed_desc_ak);
+    CHECK(packed->groups[0].a_v.desc == packed_desc_av);
     CHECK(std::memcmp(packed->groups[0].a_k.bytes.data() + 0 * stride_k, row0_k.data(), stride_k) == 0);
     CHECK(std::memcmp(packed->groups[0].a_k.bytes.data() + 1 * stride_k, row2_k.data(), stride_k) == 0);
     CHECK(std::memcmp(packed->groups[0].a_k.bytes.data() + 2 * stride_k, row5_k.data(), stride_k) == 0);
@@ -184,6 +193,7 @@ int main() {
         for (float v : dec_v) {
             CHECK(std::isfinite(v));
         }
+    }
     }
 
 
@@ -214,11 +224,11 @@ int main() {
                                             orientation::token_major, {lm_rows, rank}, 128, 602);
             gl.a_v = encode_matrix(dv, srcv.data(), srcv.size());
             codec_desc bk = make_codec_desc(factor_role::b_k, GGML_TYPE_TURBO4_0,
-                                            orientation::feature_major_transposed, {dim, rank}, 128, 603);
+                                            orientation::feature_major_transposed, {dim, rank}, 128, 601);
             std::vector<float> srcbk((size_t) dim * rank, 0.3f);
             gl.set_b_k(encode_matrix(bk, srcbk.data(), srcbk.size()));
-            codec_desc bv = make_codec_desc(factor_role::b_v, GGML_TYPE_Q8_0,
-                                            orientation::feature_major_transposed, {dim, rank}, 0, 604);
+            codec_desc bv = make_codec_desc(factor_role::b_v, GGML_TYPE_TURBO2_0,
+                                            orientation::feature_major_transposed, {dim, rank}, 128, 602);
             std::vector<float> srcbv((size_t) dim * rank, 0.05f);
             gl.set_b_v(encode_matrix(bv, srcbv.data(), srcbv.size()));
             codec_desc dlm = make_codec_desc(factor_role::landmark, GGML_TYPE_TURBO4_0,
@@ -262,6 +272,7 @@ int main() {
         CHECK(!store.pack_segment(seg2_id, &err));
         auto kept = store.get_segment(seg2_id);
         CHECK(kept != nullptr);
+        if (kept != nullptr) {
         CHECK(kept->segment_version == ver2);
         CHECK(kept->n_rows == lm_rows);
         CHECK((kept->row_payload_ids == lpids));
@@ -270,6 +281,76 @@ int main() {
         CHECK(kept->groups[0].landmark.bytes == lm_bytes);
         CHECK(kept->groups[0].landmark_chunks == lm_chunks);
         CHECK(kept->groups[0].landmark_table_fingerprint == lm_table);
+        }
+    }
+
+    // Device-owned refusal: a DEVICE_OWNED candidate without a committed backend
+    // bundle fails before mutation with the exact reason; published bytes, epochs,
+    // handles, and allocator high-water are bit-identical. Production native
+    // mutation travels only via backend-native transactions (backend pack tests).
+    {
+        // Six rows to match the reused 6-row quantized group payload g.
+        const std::vector<uint64_t> dpids = {201, 202, 203, 204, 205, 206};
+        const std::vector<uint64_t> dgens = {21, 22, 23, 24, 25, 26};
+        for (size_t i = 0; i < dpids.size(); ++i) {
+            CHECK(store.register_hot_payload(dpids[i], (uint32_t) i, dgens[i], xkv_state::hot_committed));
+        }
+        CHECK(store.mark_seal_candidates(dpids, dgens, nullptr));
+        auto dseg = store.create_candidate_segment(LLAMA_XKV_STORAGE_PROFILE_REFERENCE,
+                                                     LLAMA_XKV_SOURCE_DECODED_HOT, {g});
+        dseg->residency = GGML_XKV_RES_DEVICE_OWNED;
+        // Device residency forbids host bytes (A streams cleared; B handles keep
+        // their host bytes so validation refuses on the device rule first).
+        // Either refusal is fail-closed before mutation, never a host fallback.
+        for (auto & dg : dseg->groups) {
+            dg.a_k.bytes.clear();
+            dg.a_v.bytes.clear();
+            dg.landmark.bytes.clear();
+        }
+        const auto dstamp = store.current_stamp();
+        const auto dacc = store.get_accounting();
+        const uint64_t did_before = store.allocation_id_generator().current_id();
+        std::string derr;
+        CHECK(!store.publish_candidate(dseg, dpids, dgens, &derr));
+        CHECK(!derr.empty());
+        CHECK(store.get_segment(dseg->segment_id) == nullptr);
+        CHECK(store.current_stamp() == dstamp);
+        CHECK(store.get_accounting() == dacc);
+        CHECK(store.allocation_id_generator().current_id() == did_before);
+        for (uint64_t pid : dpids) {
+            xkv_state st;
+            CHECK(store.find_payload_state(pid, st) && st == xkv_state::seal_candidate);
+        }
+    }
+
+    // Shared aliases + allocator/pin lifetime: B stays pointer-identical across a
+    // host pack, retired buffers survive the last pin, and repeated packs retain
+    // K/V/factor identity with reclaimed obsolete versions.
+    {
+        store.register_layer_alias(9, 1);
+        CHECK(store.resolve_owning_layer(9) == 1);
+        CHECK(store.resolve_owning_layer(2) == 2);
+        auto pinned = store.pin_segment(seg_id);
+        CHECK(pinned);
+        const auto pbk = pinned->groups[0].b_k;
+        const std::vector<uint8_t> pak = pinned->groups[0].a_k.bytes;
+        const uint64_t did = store.allocation_id_generator().current_id();
+        const std::vector<uint8_t> before_ak = store.get_segment(seg_id)->groups[0].a_k.bytes;
+        CHECK(store.pack_segment(seg_id, &err));
+        auto after = store.get_segment(seg_id);
+        CHECK(after != nullptr);
+        CHECK(after->groups[0].b_k == pbk);
+        CHECK(after->groups[0].a_k.bytes == before_ak);
+        CHECK(after->groups[0].a_k.bytes == pak);
+        CHECK(store.allocation_id_generator().current_id() == did);
+        auto retired = store.get_segment_version(seg_id, pinned->segment_version);
+        CHECK(retired != nullptr);
+        CHECK(retired->groups[0].a_k.bytes == pak);
+        pinned.release();
+        retired.reset();
+        store.reclaim_retired_segments();
+        CHECK(store.get_segment(seg_id) != nullptr);
+        CHECK(store.get_segment(seg_id)->groups[0].b_k == pbk);
     }
 
     if (g_failures != 0) {

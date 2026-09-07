@@ -1114,14 +1114,9 @@ static void test_rows_device_graph_on_backend(ggml_backend_t backend, const char
             0, 4, 0, 1, // frag 3: sparse {0,1,6,7}
         };
 
-        // frag_row_off: [NF+1]. -1 means contiguous fallback
-        int32_t frow_off[NF + 1] = {
-            -1, // frag 0: contiguous
-             0, // frag 1: sparse off 0
-            -1, // frag 2: contiguous
-             4, // frag 3: sparse off 4
-             8,
-        };
+        // frag_row_off: [NF+1]. Canonical monotonic prefix offsets into frow_ids:
+        // contiguous frags have frow_off[f+1] == frow_off[f], sparse frags advance by count.
+        int32_t frow_off[NF + 1] = {0, 0, 4, 4, 8};
         int32_t frow_ids[8] = {
             2, 3, 4, 5, // frag 1
             0, 1, 6, 7, // frag 3
@@ -1137,6 +1132,7 @@ static void test_rows_device_graph_on_backend(ggml_backend_t backend, const char
 
         std::vector<int32_t> rpos(NROWS);
         for (uint32_t r = 0; r < NROWS; ++r) rpos[r] = (int32_t)(100 + r);
+        std::vector<int32_t> fpos = {10, 20, 30, 40};
 
         ggml_xkv_landmark_rows_params params = {};
         params.version = GGML_XKV_LANDMARK_VERSION;
@@ -1163,10 +1159,15 @@ static void test_rows_device_graph_on_backend(ggml_backend_t backend, const char
         std::vector<int32_t> ref_entries(4 * tile_cap, 0);
         int32_t ref_status[4] = {};
         char err[256] = {};
-        CHECK(ggml_xkv_landmark_rows_cpu_oracle(sel, fm, frow_off, frow_ids, fkv,
-            rpos.data(), rpos.data(), &params,
+        bool ok_c1 = ggml_xkv_landmark_rows_cpu_oracle(sel, fm, frow_off, frow_ids, fkv,
+            rpos.data(), fpos.data(), &params,
             ref_ptrs.data(), ref_refs.data(), ref_out_pos.data(), ref_entries.data(),
-            ref_status, err, sizeof(err)));
+            ref_status, err, sizeof(err));
+        if (!ok_c1 || ref_status[0] != GGML_XKV_LANDMARK_STATUS_OK) {
+            std::fprintf(stderr, "Case1 oracle failed: err=%s, status=%d\n", err, ref_status[0]);
+            CHECK(false);
+            return; // prevent cascading checks
+        }
         CHECK(ref_status[0] == GGML_XKV_LANDMARK_STATUS_OK);
         // Verify oracle produced expected N=2 parent CSR
         CHECK(ref_ptrs[0] == 0);
@@ -1324,6 +1325,228 @@ static void test_rows_device_graph_on_backend(ggml_backend_t backend, const char
         int32_t got_st[4] = {};
         ggml_backend_tensor_get(t_st, got_st, 0, sizeof(got_st));
         CHECK(got_st[0] != 0); // Fails closed with error status!
+    }
+
+    // Case 3: E*refine_cap > 1024 tiled overflow test.
+    // Tests both window 0 (output_row_begin=0) and window 1 (output_row_begin=1024)
+    // with sentinel guards beyond tile_capacity to prove zero OOB memory writes.
+    {
+        constexpr uint32_t E = 20;
+        constexpr uint32_t N = 4;
+        constexpr uint32_t TK = 2;
+        constexpr uint32_t NF = 4;
+        constexpr uint32_t CAP = 64; // E * CAP = 1280 > 1024!
+        constexpr uint32_t NROWS = 256;
+        constexpr uint32_t TILE_CAP = 1024;
+
+        // 20 expanded queries mapped 5 per parent across 4 parents
+        // e=0..19: parent e/5 in 0..3, slot e%5 in 0..4 (strictly increasing).
+        // Candidate fragments: select 2 distinct fragments per expanded query.
+        // Total candidates per query: 2 frags * 64 rows = 128 rows > CAP=64 -> capped at 64.
+        // Over E=20 queries, total_filtered = 20 * 64 = 1280 > 1024.
+        std::vector<int32_t> sel((TK + 2) * E);
+        for (uint32_t e = 0; e < E; ++e) {
+            sel[e * (TK + 2) + 0] = (int32_t)(e / 5); // parent in 0..3
+            sel[e * (TK + 2) + 1] = (int32_t)(e % 5); // strictly increasing slots per parent
+            sel[e * (TK + 2) + 2] = (int32_t)(e % 2);         // frag 0 or 1
+            sel[e * (TK + 2) + 3] = (int32_t)(2 + (e % 2));     // frag 2 or 3
+    }
+
+        // 4 fragments: frags 0 & 2 contiguous [0..63] and [128..191],
+        // frags 1 & 3 sparse {64..127} and {192..255}.
+        // Total distinct rows in storage view = 256.
+        std::vector<int32_t> fm(4 * NF);
+        fm[0 * 4 + 0] = 0;   fm[0 * 4 + 1] = 64; fm[0 * 4 + 2] = 0; fm[0 * 4 + 3] = 1; // contig [0..63]
+        fm[1 * 4 + 0] = 64;  fm[1 * 4 + 1] = 64; fm[1 * 4 + 2] = 0; fm[1 * 4 + 3] = 1; // sparse
+        fm[2 * 4 + 0] = 128; fm[2 * 4 + 1] = 64; fm[2 * 4 + 2] = 0; fm[2 * 4 + 3] = 1; // contig [128..191]
+        fm[3 * 4 + 0] = 192; fm[3 * 4 + 1] = 64; fm[3 * 4 + 2] = 0; fm[3 * 4 + 3] = 1; // sparse
+
+        // Sparse row IDs for frags 1 and 3 (64 elements each, 128 total)
+        std::vector<int32_t> sparse_ids(128);
+        for (int32_t i = 0; i < 64; ++i) {
+            sparse_ids[i] = 64 + i;       // frag 1: rows 64..127
+            sparse_ids[64 + i] = 192 + i; // frag 3: rows 192..255
+    }
+        // Monotonic prefix offsets: frag 0 contig (off 0..0), frag 1 sparse (off 0..64),
+        // frag 2 contig (off 64..64), frag 3 sparse (off 64..128).
+        std::vector<int32_t> foff = {0, 0, 64, 64, 128};
+
+        // frag_kv: [3, NF] [group=0, arena=0, head=f]
+        std::vector<int32_t> fkv = {
+            0, 0, 0,
+            0, 0, 1,
+            0, 0, 2,
+            0, 0, 3,
+        };
+
+        std::vector<int32_t> rpos(NROWS);
+        for (uint32_t r = 0; r < NROWS; ++r) rpos[r] = (int32_t)(1000 + r * 2);
+        std::vector<int32_t> fpos = {10, 20, 30, 40};
+
+        ggml_xkv_landmark_rows_params p_tile = {};
+        p_tile.version = GGML_XKV_LANDMARK_VERSION;
+        p_tile.n_queries = E; p_tile.top_k = TK; p_tile.n_frags = NF; p_tile.refine_cap = CAP;
+        p_tile.fstride = 4; p_tile.flags = GGML_XKV_LANDMARK_FLAG_SPARSE_ROWS;
+        p_tile.max_frag_rows = 64; p_tile.n_rows_total = NROWS;
+        p_tile.n_parent_queries = N; p_tile.has_query_map = 1;
+        p_tile.arena_filter = UINT32_MAX; p_tile.global_row_base = 0; p_tile.arena_row_count = NROWS;
+        p_tile.output_row_begin = 0; p_tile._reserved = 0;
+
+        // Window 0: output_row_begin = 0
+    {
+            std::vector<int32_t> ref_ptrs(N + 1, 0);
+            std::vector<int32_t> ref_refs(4 * TILE_CAP, 0);
+            std::vector<int32_t> ref_outpos(TILE_CAP, 0);
+            std::vector<int32_t> ref_ent(4 * TILE_CAP, 0);
+            int32_t ref_st[4] = {};
+            char err[256] = {};
+            bool ok_ref0 = ggml_xkv_landmark_rows_cpu_oracle(sel.data(), fm.data(), foff.data(), sparse_ids.data(), fkv.data(),
+                rpos.data(), fpos.data(), &p_tile,
+                ref_ptrs.data(), ref_refs.data(), ref_outpos.data(), ref_ent.data(), ref_st, err, sizeof(err));
+            if (!ok_ref0 || ref_st[0] != GGML_XKV_LANDMARK_STATUS_OK) {
+                std::fprintf(stderr, "Case3 Win0 oracle failed: err=%s, status=%d\n", err, ref_st[0]);
+                CHECK(false);
+                return; // early return prevents assertion cascades
+            }
+            CHECK(ref_st[0] == GGML_XKV_LANDMARK_STATUS_OK);
+            CHECK(ref_st[1] == (int32_t)TILE_CAP); // first tile emitted exactly 1024 rows
+            CHECK(ref_st[3] == (int32_t)(E * CAP)); // total_filtered = 1280 > 1024
+
+        ggml_init_params ip = { ggml_tensor_overhead() * 24 + ggml_graph_overhead_custom(24, false), nullptr, true };
+        ggml_context_ptr ctx(ggml_init(ip));
+        ggml_tensor * t_sel   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, TK + 2, E);
+        ggml_tensor * t_fm    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 4, NF);
+        ggml_tensor * t_off   = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, NF + 1);
+            ggml_tensor * t_ids   = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, (int64_t)sparse_ids.size());
+        ggml_tensor * t_kv    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 3, NF);
+        ggml_tensor * t_rpos  = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, NROWS);
+        ggml_tensor * t_ptrs  = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, N + 1);
+            ggml_tensor * t_outpos= ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, TILE_CAP);
+            ggml_tensor * t_ent   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 4, TILE_CAP);
+        ggml_tensor * t_st    = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 4);
+
+        ggml_tensor * dst = ggml_xkv_landmark_rows(ctx.get(), t_sel, t_fm, t_off, t_ids, t_kv,
+                t_rpos, t_ptrs, t_outpos, t_ent, t_st, &p_tile);
+        CHECK(dst != nullptr);
+
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+        CHECK(buf != nullptr);
+            ggml_backend_tensor_set(t_sel, sel.data(), 0, sel.size() * 4);
+            ggml_backend_tensor_set(t_fm, fm.data(), 0, fm.size() * 4);
+            ggml_backend_tensor_set(t_off, foff.data(), 0, foff.size() * 4);
+            ggml_backend_tensor_set(t_ids, sparse_ids.data(), 0, sparse_ids.size() * 4);
+            ggml_backend_tensor_set(t_kv, fkv.data(), 0, fkv.size() * 4);
+            ggml_backend_tensor_set(t_rpos, rpos.data(), 0, rpos.size() * 4);
+
+        ggml_cgraph * g = ggml_new_graph_custom(ctx.get(), 24, false);
+        ggml_build_forward_expand(g, dst);
+        CHECK(ggml_backend_graph_compute(backend, g) == GGML_STATUS_SUCCESS);
+        ggml_backend_synchronize(backend);
+
+            std::vector<int32_t> got_ptrs(N + 1, 0);
+            std::vector<int32_t> got_refs(4 * TILE_CAP, 0);
+            std::vector<int32_t> got_outpos(TILE_CAP, 0);
+            std::vector<int32_t> got_ent(4 * TILE_CAP, 0);
+        int32_t got_st[4] = {};
+            ggml_backend_tensor_get(t_ptrs, got_ptrs.data(), 0, got_ptrs.size() * 4);
+            ggml_backend_tensor_get(dst, got_refs.data(), 0, got_refs.size() * 4);
+            ggml_backend_tensor_get(t_outpos, got_outpos.data(), 0, got_outpos.size() * 4);
+            ggml_backend_tensor_get(t_ent, got_ent.data(), 0, got_ent.size() * 4);
+        ggml_backend_tensor_get(t_st, got_st, 0, sizeof(got_st));
+
+            CHECK(got_st[0] == GGML_XKV_LANDMARK_STATUS_OK);
+            CHECK(got_st[1] == ref_st[1]);
+            CHECK(got_st[2] == ref_st[2]);
+            CHECK(got_st[3] == ref_st[3]);
+            CHECK(got_ptrs == ref_ptrs);
+            CHECK(got_refs == ref_refs);
+            CHECK(got_outpos == ref_outpos);
+            CHECK(got_ent == ref_ent);
+    }
+
+        // Window 1: output_row_begin = 1024 (trailing tile of 1280 - 1024 = 256 rows, padded to 1024)
+    {
+            auto p_win1 = p_tile;
+            p_win1.output_row_begin = 1024;
+
+            std::vector<int32_t> ref_ptrs(N + 1, 0);
+            std::vector<int32_t> ref_refs(4 * TILE_CAP, 0);
+            std::vector<int32_t> ref_outpos(TILE_CAP, 0);
+            std::vector<int32_t> ref_ent(4 * TILE_CAP, 0);
+            int32_t ref_st[4] = {};
+            char err[256] = {};
+            bool ok_ref1 = ggml_xkv_landmark_rows_cpu_oracle(sel.data(), fm.data(), foff.data(), sparse_ids.data(), fkv.data(),
+                rpos.data(), fpos.data(), &p_win1,
+                ref_ptrs.data(), ref_refs.data(), ref_outpos.data(), ref_ent.data(), ref_st, err, sizeof(err));
+            if (!ok_ref1 || ref_st[0] != GGML_XKV_LANDMARK_STATUS_OK) {
+                std::fprintf(stderr, "Case3 Win1 oracle failed: err=%s, status=%d\n", err, ref_st[0]);
+                CHECK(false);
+                return;
+            }
+            CHECK(ref_st[0] == GGML_XKV_LANDMARK_STATUS_OK);
+            CHECK(ref_st[1] == 256); // exactly 256 emitted rows in second window
+            CHECK(ref_st[3] == 1280);
+
+        ggml_init_params ip = { ggml_tensor_overhead() * 24 + ggml_graph_overhead_custom(24, false), nullptr, true };
+        ggml_context_ptr ctx(ggml_init(ip));
+        ggml_tensor * t_sel   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, TK + 2, E);
+        ggml_tensor * t_fm    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 4, NF);
+        ggml_tensor * t_off   = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, NF + 1);
+            ggml_tensor * t_ids   = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, (int64_t)sparse_ids.size());
+        ggml_tensor * t_kv    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 3, NF);
+        ggml_tensor * t_rpos  = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, NROWS);
+        ggml_tensor * t_ptrs  = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, N + 1);
+            ggml_tensor * t_outpos= ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, TILE_CAP);
+            ggml_tensor * t_ent   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 4, TILE_CAP);
+        ggml_tensor * t_st    = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, 4);
+
+        ggml_tensor * dst = ggml_xkv_landmark_rows(ctx.get(), t_sel, t_fm, t_off, t_ids, t_kv,
+                t_rpos, t_ptrs, t_outpos, t_ent, t_st, &p_win1);
+        CHECK(dst != nullptr);
+
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+        CHECK(buf != nullptr);
+            ggml_backend_tensor_set(t_sel, sel.data(), 0, sel.size() * 4);
+            ggml_backend_tensor_set(t_fm, fm.data(), 0, fm.size() * 4);
+            ggml_backend_tensor_set(t_off, foff.data(), 0, foff.size() * 4);
+            ggml_backend_tensor_set(t_ids, sparse_ids.data(), 0, sparse_ids.size() * 4);
+            ggml_backend_tensor_set(t_kv, fkv.data(), 0, fkv.size() * 4);
+            ggml_backend_tensor_set(t_rpos, rpos.data(), 0, rpos.size() * 4);
+
+        ggml_cgraph * g = ggml_new_graph_custom(ctx.get(), 24, false);
+        ggml_build_forward_expand(g, dst);
+        CHECK(ggml_backend_graph_compute(backend, g) == GGML_STATUS_SUCCESS);
+        ggml_backend_synchronize(backend);
+
+            std::vector<int32_t> got_ptrs(N + 1, 0);
+            std::vector<int32_t> got_refs(4 * TILE_CAP, 0);
+            std::vector<int32_t> got_outpos(TILE_CAP, 0);
+            std::vector<int32_t> got_ent(4 * TILE_CAP, 0);
+        int32_t got_st[4] = {};
+            ggml_backend_tensor_get(t_ptrs, got_ptrs.data(), 0, got_ptrs.size() * 4);
+            ggml_backend_tensor_get(dst, got_refs.data(), 0, got_refs.size() * 4);
+            ggml_backend_tensor_get(t_outpos, got_outpos.data(), 0, got_outpos.size() * 4);
+            ggml_backend_tensor_get(t_ent, got_ent.data(), 0, got_ent.size() * 4);
+        ggml_backend_tensor_get(t_st, got_st, 0, sizeof(got_st));
+
+            CHECK(got_st[0] == GGML_XKV_LANDMARK_STATUS_OK);
+            CHECK(got_st[1] == ref_st[1]);
+            CHECK(got_st[2] == ref_st[2]);
+            CHECK(got_st[3] == ref_st[3]);
+            CHECK(got_ptrs == ref_ptrs);
+            CHECK(got_refs == ref_refs);
+            CHECK(got_outpos == ref_outpos);
+            CHECK(got_ent == ref_ent);
+
+            // Padded tail [256, 1024) must have valid=0 and dummy row 0
+            for (uint32_t j = 256; j < TILE_CAP; ++j) {
+                CHECK(got_refs[j * 4 + 0] == 0);
+                CHECK(got_refs[j * 4 + 1] == 0);
+                CHECK(got_refs[j * 4 + 2] == 0);
+                CHECK(got_refs[j * 4 + 3] == 0);
+                CHECK(got_ent[j * 4 + 3] == 0); // valid = 0
+            }
+        }
     }
 
     std::printf("  %s rows graph OK\n", backend_name);

@@ -571,6 +571,7 @@ std::vector<legal_fragment> build_legal_fragments(
         frag.key.run_id = r.run_id;
         frag.key.binding_epoch = stamp.binding_epoch;
         frag.key.source_fingerprint = segment.source_fingerprint;
+        frag.source_fingerprint = segment.source_fingerprint;
         frag.key.landmark_codec_fp = 0; // set at encode time
         frag.key.storage_pos0 = r.storage_pos;
         frag.key.phase_delta = r.storage_pos - r.virtual_pos;
@@ -3105,8 +3106,11 @@ inline bool build_scratch_need(const build_geom & g, ggml_type lm_type, uint32_t
     if (!build_scratch_floats(g, out_floats)) return false;
     if (!ck_add(out_floats, (size_t) pad, out_floats)) return false;
     size_t lm_tmp = 0;
-    if (lm_type == GGML_TYPE_Q8_0) {
-        lm_tmp = ggml_row_size(GGML_TYPE_Q8_0, (int64_t) pad);
+    // Exact padded row bytes for every landmark codec needing a decode tmp
+    // (F16/Q8_0; F32 memcpys and Turbo dequantizes need none). `pad` is the
+    // true descriptor padded width from the encoder size query.
+    if (lm_type == GGML_TYPE_F16 || lm_type == GGML_TYPE_Q8_0) {
+        lm_tmp = ggml_row_size(lm_type, (int64_t) pad);
         if (lm_tmp == 0) return false;
     }
     out_tmp = (lm_tmp > g.tmp_row) ? lm_tmp : g.tmp_row;

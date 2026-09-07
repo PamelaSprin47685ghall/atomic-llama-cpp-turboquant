@@ -340,6 +340,7 @@ struct xkv_maintain_control_scratch {
     bool initialized = false;
     size_t capacity_rows = 0;
     size_t capacity_groups = 0;
+    size_t capacity_head_dim = 0;
 
     void init(size_t max_rows, size_t max_groups, size_t max_head_dim);
     void clear_for_run();

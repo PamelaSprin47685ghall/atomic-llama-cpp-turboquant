@@ -151,7 +151,11 @@ void xkv_maintain_control_scratch::init(size_t max_rows, size_t max_groups, size
     phase_specs.reserve(capacity_groups);
     slices.reserve(capacity_groups);
 
-    head_scratch.reserve(head_cap);
+    // Head scratch is consumed via data()/size() as a fixed buffer, so it
+    // must be sized (not merely reserved): the stream reader fail-closes
+    // on size(). Retains storage across runs; re-sized only on growth.
+    head_scratch.assign(head_cap, 0.0f);
+    capacity_head_dim = max_head_dim;
     initialized = true;
 }
 
@@ -164,8 +168,6 @@ void xkv_maintain_control_scratch::clear_for_run() {
     gens.clear();
     positions.clear();
     physical_rows.clear();
-    inputs.clear();
-    phase_specs.clear();
     slices.clear();
 }
 
@@ -1212,6 +1214,7 @@ xkv_maintenance_outcome llama_xkv_runtime::maintain(
         const uint32_t hot_free = pool->get_free();
         const uint32_t req = upcoming_tokens > 0 ? upcoming_tokens : 1;
         if (hot_free >= req) {
+            stats_.deferred_runs++;
             return xkv_maintain_no_action; // fill-first: preserve dense hot rows while space exists
         }
     }
@@ -1251,7 +1254,7 @@ xkv_maintenance_outcome llama_xkv_runtime::maintain(
         }
         const size_t need_groups = std::max<size_t>(groups_.groups.size(), 1);
         if (!scratch_.initialized || scratch_.capacity_rows < kv.get_hot_size() ||
-            scratch_.capacity_groups < need_groups) {
+            scratch_.capacity_groups < need_groups || scratch_.capacity_head_dim < max_hd) {
             scratch_.init(kv.get_hot_size(), need_groups, max_hd);
         }
     }
@@ -1504,6 +1507,8 @@ xkv_maintenance_outcome llama_xkv_runtime::maintain(
                            hparams.rope_type == LLAMA_ROPE_TYPE_MROPE ||
                            hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE) {
                     lay.rope_mode_k = GGML_XKV_ROPE_HALF;
+                } else if (hparams.rope_type == LLAMA_ROPE_TYPE_NONE || lay.rotary_dim_k == 0) {
+                    lay.rope_mode_k = GGML_XKV_ROPE_HALF; // rotary_dim_k == 0 governs passthrough
                 } else {
                     if (err) *err = "maintain: unsupported rope type for native seal";
                     return xkv_maintain_error;
@@ -1511,13 +1516,15 @@ xkv_maintenance_outcome llama_xkv_runtime::maintain(
                 const uint32_t fc = lay.rotary_dim_k / 2;
                 lay.rope_omega_k.assign(fc, 0.0f);
                 lay.rope_mag_k.assign(fc, 1.0f);
-                if (fc > 0) {
+                if (fc > 0 && hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
+                    const float freq_base = (cparams_.rope_freq_base > 0.0f) ? kv.get_model().get_rope_freq_base(cparams_, (int) ol) : hparams.rope_freq_base_train;
+                    const float freq_scale = (cparams_.rope_freq_scale > 0.0f) ? kv.get_model().get_rope_freq_scale(cparams_, (int) ol) : 1.0f;
+                    const float attn_factor = (cparams_.yarn_attn_factor > 0.0f) ? cparams_.yarn_attn_factor : 1.0f;
                     if (!triattention_build_rope_tables(
                         lay.rope_omega_k.data(), lay.rope_mag_k.data(), lay.rotary_dim_k,
-                        kv.get_model().get_rope_freq_base(cparams_, (int) ol),
-                        kv.get_model().get_rope_freq_scale(cparams_, (int) ol),
+                        freq_base, freq_scale,
                         (int32_t) cparams_.n_ctx_orig_yarn,
-                        cparams_.yarn_ext_factor, cparams_.yarn_attn_factor,
+                        cparams_.yarn_ext_factor, attn_factor,
                         cparams_.yarn_beta_fast, cparams_.yarn_beta_slow, nullptr)) {
                         if (err) *err = "maintain: failed to build native RoPE tables";
                         return xkv_maintain_error;
@@ -1908,15 +1915,18 @@ xkv_maintenance_outcome llama_xkv_runtime::maintain(
         }
 
         // Precommit gate: runs pool release atomically with the store publish commit.
-        xkv_seal_precommit_fn ngate = [&kv, pre_plan](
+        // Reference capture: pre_plan aliases scratch_.release_plan (a runtime
+        // member outliving this synchronous publish); the closure stays within
+        // std::function SSO. Expected ids are stamped on the scratch plan
+        // itself, which is rebuilt every maintain before validation.
+        xkv_seal_precommit_fn ngate = [&kv, &pre_plan](
             const xkv_seal_precommit_ctx & pctx, std::string * gerr) -> bool {
-            xkv_hot_release_plan plan = pre_plan;
-            plan.expected_segment_id = pctx.segment_id;
-            plan.expected_segment_version = pctx.segment_version;
-            return kv.commit_hot_release(plan, gerr);
+            pre_plan.expected_segment_id = pctx.segment_id;
+            pre_plan.expected_segment_version = pctx.segment_version;
+            return kv.commit_hot_release(pre_plan, gerr);
         };
         std::string pub_err;
-        if (!store->publish_candidate(cand, pids, gens, &pub_err, nullptr, ngate, &native_cap_res)) {
+        if (!store->publish_candidate(cand, pids, gens, &pub_err, nullptr, std::move(ngate), &native_cap_res)) {
             stats_.record_skip(xkv_skip_reason::aborted);
             stats_.record_error(pub_err);
             if (err) *err = "maintain: native candidate publish failed: " + pub_err;
@@ -2092,32 +2102,6 @@ xkv_maintenance_outcome llama_xkv_runtime::maintain(
     }
     params.expected_group_count = (uint32_t) inputs.size();
     params.expected_group_map_fingerprint = compute_layer_group_map_fingerprint(inputs);
-
-    // Store capacity reservation: do NOT reserve for evaluate-only SHADOW.
-    // For DENSE/SR, compute the exact checked candidate bytes estimate from
-    // inputs and reserve capacity using estimate_segment_bundle_persistent_bytes;
-    // pass &store_cap_res into params so store publish consumes it without double-counting.
-    size_t store_deficit = 0;
-    std::string cap_res_err;
-    xkv_capacity_reservation store_cap_res;
-    if (!is_shadow && store->store_capacity_bytes() > 0) {
-        size_t exact_dest_bytes = 0;
-        std::string est_err;
-        if (!estimate_segment_bundle_persistent_bytes(inputs, params, &exact_dest_bytes, &est_err)) {
-            stats_.record_skip(xkv_skip_reason::unsupported_config);
-            if (err) *err = "maintain: estimate_segment_bundle_persistent_bytes failed: " + est_err;
-            return xkv_maintain_error;
-        }
-        store_cap_res = store->reserve_capacity(
-            exact_dest_bytes, &cap_res_err, &store_deficit);
-        if (!store_cap_res.valid()) {
-            stats_.record_skip(xkv_skip_reason::preflight_oom);
-            if (err) *err = "maintain: store capacity reservation failed (deficit " +
-                            std::to_string(store_deficit) + " bytes): " + cap_res_err;
-            return xkv_maintain_error;
-        }
-        params.capacity_reservation = &store_cap_res;
-    }
 
     // Exact per-group phase specs for landmark construction.
     // R3 + R0/R1: reference profile always builds configured landmarks
@@ -2351,6 +2335,34 @@ xkv_maintenance_outcome llama_xkv_runtime::maintain(
             return true;
         };
     }
+    // Store capacity reservation: do NOT reserve for evaluate-only SHADOW.
+    // For DENSE/SR, compute the exact checked candidate bytes estimate from
+    // inputs and reserve capacity using estimate_segment_bundle_persistent_bytes;
+    // pass &store_cap_res into params so store publish consumes it without double-counting.
+    // Ordering: runs AFTER landmark_factory installation so the estimate
+    // includes landmark bytes; estimating earlier under-reserves exactly the
+    // sealed landmark footprint and trips the publish capacity check.
+    size_t store_deficit = 0;
+    std::string cap_res_err;
+    xkv_capacity_reservation store_cap_res;
+    if (!is_shadow && store->store_capacity_bytes() > 0) {
+        size_t exact_dest_bytes = 0;
+        std::string est_err;
+        if (!estimate_segment_bundle_persistent_bytes(inputs, params, &exact_dest_bytes, &est_err)) {
+            stats_.record_skip(xkv_skip_reason::unsupported_config);
+            if (err) *err = "maintain: estimate_segment_bundle_persistent_bytes failed: " + est_err;
+            return xkv_maintain_error;
+            }
+        store_cap_res = store->reserve_capacity(
+            exact_dest_bytes, &cap_res_err, &store_deficit);
+        if (!store_cap_res.valid()) {
+            stats_.record_skip(xkv_skip_reason::preflight_oom);
+            if (err) *err = "maintain: store capacity reservation failed (deficit " +
+                            std::to_string(store_deficit) + " bytes): " + cap_res_err;
+            return xkv_maintain_error;
+    }
+        params.capacity_reservation = &store_cap_res;
+    }
     if (is_shadow) {
         // Evaluate-only: factorization/encode/gates run, the candidate is
         // discarded, payloads stay hot_committed, epochs/locations untouched.
@@ -2389,17 +2401,18 @@ xkv_maintenance_outcome llama_xkv_runtime::maintain(
     // No post-publish adopt: native backend batches build off-side and attach
     // to the candidate before publish; the gate below covers the pool half.
     // Device profiles cannot reach here (factorizer gate fails closed above).
-    xkv_seal_precommit_fn gate = [this, &kv, pre_plan](
+    // Reference capture (see native gate above): pre_plan aliases the
+    // scratch member; dropping `this` keeps the closure within SSO.
+    xkv_seal_precommit_fn gate = [&kv, &pre_plan](
         const xkv_seal_precommit_ctx & pctx, std::string * gerr) -> bool {
-        xkv_hot_release_plan plan = pre_plan;
-        plan.expected_segment_id = pctx.segment_id;
-        plan.expected_segment_version = pctx.segment_version;
+        pre_plan.expected_segment_id = pctx.segment_id;
+        pre_plan.expected_segment_version = pctx.segment_version;
         // Gate half: pool release only, zero store calls, single pool lock,
         // at most once per seal after a successful validate with unbroken
         // quiescence, never retried after true. SHADOW never reaches here.
-        return kv.commit_hot_release(plan, gerr);
+        return kv.commit_hot_release(pre_plan, gerr);
     };
-    const xkv_sealing_result res = store->seal_segment_bundle(inputs, pids, gens, params, gate);
+    const xkv_sealing_result res = store->seal_segment_bundle(inputs, pids, gens, params, std::move(gate));
     if (!res.success) {
         stats_.record_skip(res.skip_reason);
         stats_.record_error(res.message);
@@ -3074,6 +3087,9 @@ static bool build_sr_fragment_plan(
             const uint64_t frag_idx = (uint64_t) out_frags.size() + (uint64_t) fi;
             if (frag_idx > (uint64_t) UINT32_MAX) return fail("fragment index overflow");
             f.requires_native_rebuild = true;
+            f.source_fingerprint = seg.source_fingerprint;
+            f.key.source_fingerprint = seg.source_fingerprint;
+            f.key.landmark_codec_fp = gp.landmark.desc.fingerprint();
             xkv_graph_snapshot::xkv_native_landmark_rebuild_desc rd;
             rd.fragment_index = (uint32_t) frag_idx;
             rd.segment_id = seg.segment_id;
@@ -3166,12 +3182,12 @@ bool llama_kv_cache_context::build_xkv_graph_snapshot(
         if (err) *err = "build_xkv_graph_snapshot: kv_head out of range";
         return false;
     }
+    if (!rt->groups_valid() && !rt->rebuild_groups(hparams, *kv, err)) {
+        return false;
+    }
     const uint32_t owning = kv->get_owning_layer(il);
     if (!rt->xkv_layer_enabled(owning)) {
         if (err) *err = "build_xkv_graph_snapshot: layer is not on the XKV path (SWA/recurrent/MTP)";
-        return false;
-    }
-    if (!rt->groups_valid() && !rt->rebuild_groups(hparams, *kv, err)) {
         return false;
     }
     const layer_group * grp = nullptr;
@@ -3374,6 +3390,10 @@ bool llama_kv_cache_context::build_xkv_graph_snapshot(
                             if (err) *err = "build_xkv_graph_snapshot: hot binding missing or stale";
                             return false;
                         }
+                        if (info.state != llama_xkv::xkv_slot_state::bound) {
+                            if (err) *err = "build_xkv_graph_snapshot: hot slot is not committed/bound";
+                            return false;
+                        }
                         prow = info.slot;
                     } else {
                         auto bit = bindings.find(pid);
@@ -3511,6 +3531,10 @@ bool llama_kv_cache_context::build_xkv_graph_snapshot(
                         xkv_hot_slot_info info;
                         if (!pool->find_payload(pid, info) || info.storage_generation != gen) {
                             if (err) *err = "build_xkv_graph_snapshot: hot binding missing or stale";
+                            return false;
+                        }
+                        if (info.state != llama_xkv::xkv_slot_state::bound) {
+                            if (err) *err = "build_xkv_graph_snapshot: hot slot is not committed/bound";
                             return false;
                         }
                         prow = info.slot;
@@ -4070,6 +4094,20 @@ bool build_landmark_phase_layers(
     std::string * err) {
     out_layers.clear();
     out_fingerprint = 0;
+    if (hparams.rope_type == LLAMA_ROPE_TYPE_NONE) {
+        for (size_t li = 0; li < group.owning_layers.size(); ++li) {
+            const uint32_t ol = group.owning_layers[li];
+            xkv_landmark_phase_layer l;
+            l.feature_offset = group.layer_feature_offsets_k[li];
+            l.feature_dim = group.layer_feature_dims_k[li];
+            l.n_heads = hparams.n_head_kv(ol);
+            l.head_dim = hparams.n_embd_head_k(ol);
+            l.rotary_dim = 0;
+            out_layers.push_back(std::move(l));
+        }
+        out_fingerprint = fingerprint_landmark_phase(out_layers);
+        return true;
+    }
     if (hparams.rope_type != LLAMA_ROPE_TYPE_NEOX && hparams.rope_type != LLAMA_ROPE_TYPE_IMROPE) {
         if (err) *err = "phase layers: unsupported rope type (NeoX/text-IMRoPE only)";
         return false;
@@ -4096,9 +4134,13 @@ bool build_landmark_phase_layers(
             if (err) *err = "phase layers: feature dim does not match head geometry";
             return false;
         }
-        if (l.rotary_dim == 0 || (l.rotary_dim & 1u) != 0 || l.rotary_dim > l.head_dim) {
-            if (err) *err = "phase layers: invalid rotary_dim";
+        if ((l.rotary_dim & 1u) != 0 || l.rotary_dim > l.head_dim) {
+            if (err) *err = "phase layers: odd or oversized rotary_dim";
             return false;
+        }
+        if (l.rotary_dim == 0) {
+            out_layers.push_back(std::move(l));
+            continue;
         }
         const uint32_t fc = l.rotary_dim / 2;
         l.omega.assign(fc, 0.0f);
@@ -4119,12 +4161,14 @@ bool build_landmark_phase_layers(
                 factor_ptr = freq_factors.data();
             }
         }
+        const float freq_base = (cparams.rope_freq_base > 0.0f) ? model.get_rope_freq_base(cparams, (int) ol) : model.hparams.rope_freq_base_train;
+        const float freq_scale = (cparams.rope_freq_scale > 0.0f) ? model.get_rope_freq_scale(cparams, (int) ol) : 1.0f;
+        const float attn_factor = (cparams.yarn_attn_factor > 0.0f) ? cparams.yarn_attn_factor : 1.0f;
         if (!triattention_build_rope_tables(
                 l.omega.data(), l.freq_scale_sq.data(), l.rotary_dim,
-                model.get_rope_freq_base(cparams, (int) ol),
-                model.get_rope_freq_scale(cparams, (int) ol),
+                freq_base, freq_scale,
                 (int32_t) cparams.n_ctx_orig_yarn,
-                cparams.yarn_ext_factor, cparams.yarn_attn_factor,
+                cparams.yarn_ext_factor, attn_factor,
                 cparams.yarn_beta_fast, cparams.yarn_beta_slow, factor_ptr)) {
             if (err) *err = "phase layers: rope table build failed";
             return false;

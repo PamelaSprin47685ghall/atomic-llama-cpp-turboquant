@@ -426,15 +426,15 @@ static void test_planner_parity() {
     stamp.binding_epoch = 9;
     stamp.view.topology_epoch = 2;
     std::vector<row_meta> rows = {
-        {0, 1000, 1, 0, 10, 10, 0, true, true},
-        {1, 1001, 1, 0, 11, 11, 0, true, true},
-        {2, 1002, 2, 0, 12, 12, 0, true, true},
-        {3, 1003, 1, 0, 13, 13, 1, true, true},
-        {4, 1004, 1, 0, 14, 14, 1, true, true},
-        {5, 1005, 1, 0, 15, 20, 1, true, true},
-        {6, 1006, 1, 0, 16, 21, 1, true, true},
-        {9, 1009, 1, 0, 21, 26, 1, true, false},
-        {10, 1010, 1, 0, 22, 27, 1, true, true},
+        {0, 1000, 1, 0, 10, 10, 0, 1, true, true},
+        {1, 1001, 1, 0, 11, 11, 0, 1, true, true},
+        {2, 1002, 2, 0, 12, 12, 0, 1, true, true},
+        {3, 1003, 1, 0, 13, 13, 1, 1, true, true},
+        {4, 1004, 1, 0, 14, 14, 1, 1, true, true},
+        {5, 1005, 1, 0, 15, 20, 1, 1, true, true},
+        {6, 1006, 1, 0, 16, 21, 1, 1, true, true},
+        {9, 1009, 1, 0, 21, 26, 1, 1, true, false},
+        {10, 1010, 1, 0, 22, 27, 1, 1, true, true},
     };
     // row 9 is reader-invisible but live in segment; rows vector holds 16 live rows
     auto ref = build_legal_fragments(*seg, stamp, 7, 1, 0, 0, rows, 4, 0xAB, -1);
@@ -1285,25 +1285,25 @@ static void test_fragment_partitioning() {
 
     std::vector<row_meta> rows = {
         // Run 0: normal visibility, phase_delta = 0
-        {0, 1000, 1, 0, 10, 10, static_cast<uint8_t>(llama_rerot_visibility::normal), true, true},
-        {1, 1001, 1, 0, 11, 11, static_cast<uint8_t>(llama_rerot_visibility::normal), true, true},
-        {2, 1002, 1, 0, 12, 12, static_cast<uint8_t>(llama_rerot_visibility::normal), true, true},
+        {0, 1000, 1, 0, 10, 10, 0, static_cast<uint8_t>(llama_rerot_visibility::normal), true, true},
+        {1, 1001, 1, 0, 11, 11, 0, static_cast<uint8_t>(llama_rerot_visibility::normal), true, true},
+        {2, 1002, 1, 0, 12, 12, 0, static_cast<uint8_t>(llama_rerot_visibility::normal), true, true},
 
         // Boundary: visibility change to public_live
-        {3, 1003, 1, 0, 13, 13, static_cast<uint8_t>(llama_rerot_visibility::public_live), true, true},
-        {4, 1004, 1, 0, 14, 14, static_cast<uint8_t>(llama_rerot_visibility::public_live), true, true},
+        {3, 1003, 1, 0, 13, 13, 0, static_cast<uint8_t>(llama_rerot_visibility::public_live), true, true},
+        {4, 1004, 1, 0, 14, 14, 0, static_cast<uint8_t>(llama_rerot_visibility::public_live), true, true},
 
         // Boundary: phase change (virtual_pos offset change: storage_pos 15, virt 20 -> phase -5)
-        {5, 1005, 1, 0, 15, 20, static_cast<uint8_t>(llama_rerot_visibility::public_live), true, true},
-        {6, 1006, 1, 0, 16, 21, static_cast<uint8_t>(llama_rerot_visibility::public_live), true, true},
+        {5, 1005, 1, 0, 15, 20, 0, static_cast<uint8_t>(llama_rerot_visibility::public_live), true, true},
+        {6, 1006, 1, 0, 16, 21, 0, static_cast<uint8_t>(llama_rerot_visibility::public_live), true, true},
 
         // Boundary: sparse gap (storage_pos jumps from 16 to 19)
-        {7, 1007, 1, 0, 19, 24, static_cast<uint8_t>(llama_rerot_visibility::public_live), true, true},
-        {8, 1008, 1, 0, 20, 25, static_cast<uint8_t>(llama_rerot_visibility::public_live), true, true},
+        {7, 1007, 1, 0, 19, 24, 0, static_cast<uint8_t>(llama_rerot_visibility::public_live), true, true},
+        {8, 1008, 1, 0, 20, 25, 0, static_cast<uint8_t>(llama_rerot_visibility::public_live), true, true},
 
         // Boundary: reader_visible false
-        {9, 1009, 1, 0, 21, 26, static_cast<uint8_t>(llama_rerot_visibility::public_live), true, false},
-        {10, 1010, 1, 0, 22, 27, static_cast<uint8_t>(llama_rerot_visibility::public_live), true, true},
+        {9, 1009, 1, 0, 21, 26, 0, static_cast<uint8_t>(llama_rerot_visibility::public_live), true, false},
+        {10, 1010, 1, 0, 22, 27, 0, static_cast<uint8_t>(llama_rerot_visibility::public_live), true, true},
     };
 
     uint32_t chunk_size = 4;
@@ -2384,6 +2384,7 @@ static void test_base_table_bind() {
 // Defined after main to keep the runner call list readable.
 static void test_quant_row_encoder();
 static void test_bounded_builder_q8();
+static void test_landmark_advanced_lifecycle();
 
 int main() {
     std::cout << "Running test-xkv-landmark..." << std::endl;
@@ -2486,6 +2487,7 @@ int main() {
     test_quant_row_encoder();
     test_bounded_builder_q8();
     test_base_table_bind();
+    test_landmark_advanced_lifecycle();
 
     std::cout << "All test-xkv-landmark tests passed successfully!" << std::endl;
     return 0;
@@ -2713,5 +2715,145 @@ static void test_bounded_builder_q8() {
         }
     }
     std::cout << "[test_bounded_builder_q8] passed!" << std::endl;
+}
+
+static void test_landmark_advanced_lifecycle() {
+    std::cout << "[test_landmark_advanced_lifecycle] starting..." << std::endl;
+    // 1. Invalidation: phase transform fingerprint mismatch, source fingerprint mismatch,
+    // binding epoch, view stamp, and codec epoch.
+    landmark_table tbl(1024 * 1024);
+    auto seg = create_test_segment(8, 16, 64, 1);
+    // Segment-level source identity: the table key carries this (not the
+    // encoded content fingerprint), so the fixture must set it explicitly.
+    seg->source_fingerprint = 0x5EED;
+    xkv_snapshot_stamp stamp;
+    stamp.live_epoch = 1;
+    stamp.content_epoch = 1;
+    stamp.codec_epoch = 1;
+    stamp.binding_epoch = 1;
+    stamp.view.topology_epoch = 1;
+    stamp.view.publish_epoch = 1;
+    stamp.view.layout_epoch = 1;
+
+    std::vector<row_meta> rows = {
+        {0, 1000, 1, 0, 0, 0, 0, static_cast<uint8_t>(llama_rerot_visibility::normal), true, true},
+    };
+    auto frags = build_legal_fragments(*seg, stamp, 1, 1, 0, 0, rows, 4, 0x111, -1);
+    assert(!frags.empty());
+    encode_fragment_landmark(frags[0], *seg, 0, 32, nullptr, 0x111, GGML_TYPE_Q8_0);
+    uint64_t orig_src_fp = frags[0].source_fingerprint;
+    auto fp0 = std::make_shared<const legal_fragment>(frags[0]);
+    assert(tbl.insert(fp0));
+    assert(tbl.fragment_count() == 1);
+
+    // Phase/source invalidation keys on the fragment key identity: matching
+    // phase + matching key source keeps the entry.
+    tbl.invalidate_phase_source(seg->segment_id, 0x111, frags[0].key.source_fingerprint);
+    assert(tbl.fragment_count() == 1);
+    // Mismatch source evicts even when the phase matches.
+    tbl.invalidate_phase_source(seg->segment_id, 0x111, frags[0].key.source_fingerprint ^ 0xFFu);
+    assert(tbl.fragment_count() == 0);
+    // Re-insert: mismatch phase evicts even when the source matches.
+    assert(tbl.insert(fp0));
+    assert(tbl.fragment_count() == 1);
+    tbl.invalidate_phase_source(seg->segment_id, 0x999, frags[0].key.source_fingerprint);
+    assert(tbl.fragment_count() == 0);
+
+    // Re-insert and test binding epoch invalidation
+    assert(tbl.insert(fp0));
+    assert(tbl.fragment_count() == 1);
+    tbl.invalidate_binding_epoch(seg->segment_id, 999);
+    assert(tbl.fragment_count() == 0);
+
+    // Re-insert and test view stamp invalidation
+    assert(tbl.insert(fp0));
+    assert(tbl.fragment_count() == 1);
+    xkv_snapshot_stamp diff_view = stamp;
+    diff_view.view.topology_epoch = 999;
+    tbl.invalidate_view(seg->segment_id, diff_view);
+    assert(tbl.fragment_count() == 0);
+
+    // Re-insert and test codec epoch invalidation
+    assert(tbl.insert(fp0));
+    assert(tbl.fragment_count() == 1);
+    tbl.invalidate_codec_epoch(seg->segment_id, 999);
+    assert(tbl.fragment_count() == 0);
+
+    // 2. DEVICE_OWNED empty-host-bytes intact landmark binding
+    codec_desc bdesc = make_codec_desc(factor_role::landmark, GGML_TYPE_TURBO4_0,
+        orientation::token_major, {1, 32}, 128, 0x777);
+    auto empty_base = std::make_shared<encoded_matrix>();
+    empty_base->desc = bdesc;
+    assert(empty_base->bytes.empty());
+
+    std::vector<uint64_t> pids = {1000};
+    std::vector<uint64_t> gens = {1};
+    std::vector<int64_t> poss = {0};
+    std::vector<uint32_t> coffs = {0, 1};
+    float eb[1] = {0.02f};
+    uint64_t sfp[1] = {orig_src_fp};
+
+    landmark_base_table btab;
+    btab.landmark = empty_base;
+    btab.row_payload_ids = pids.data();
+    btab.row_generations = gens.data();
+    btab.row_positions = poss.data();
+    btab.chunk_error_bounds = eb;
+    btab.chunk_source_fingerprints = sfp;
+    btab.chunk_row_offsets = coffs.data();
+    btab.n_rows_total = 1;
+    btab.n_chunks = 1;
+    btab.stamp = stamp;
+    btab.phase_tx_fingerprint = 0x111;
+    btab.bounds_fingerprint = compute_base_table_fingerprint(btab);
+
+    legal_fragment intact_frag;
+    intact_frag.row_count = 1;
+    intact_frag.row_indices = {0};
+    intact_frag.payload_ids = {1000};
+    intact_frag.generations = {1};
+    intact_frag.storage_positions = {0};
+    intact_frag.key.live_epoch = 1; intact_frag.key.content_epoch = 1; intact_frag.key.codec_epoch = 1;
+    intact_frag.key.binding_epoch = 1; intact_frag.key.view_topology_epoch = 1;
+    intact_frag.key.view_publish_epoch = 1; intact_frag.key.view_layout_epoch = 1;
+    intact_frag.key.phase_tx_fingerprint = 0x111;
+
+    size_t nb = 0;
+    assert(bind_base_landmarks(&intact_frag, 1, btab, &nb, nullptr));
+    assert(nb == 1);
+    assert(intact_frag.uses_base_landmark());
+    assert(intact_frag.error_bound == eb[0]);
+    assert(intact_frag.source_fingerprint == orig_src_fp);
+    assert(intact_frag.key.landmark_codec_fp == bdesc.fingerprint());
+    assert(intact_frag.landmark_matrix.bytes.empty());
+
+    // 3. Turbo4 top-k scoring behavior
+    std::vector<float> mean(32, 0.4f);
+    legal_fragment t4_frag;
+    t4_frag.row_count = 1;
+    t4_frag.row_indices = {0};
+    t4_frag.storage_positions = {0};
+    t4_frag.payload_ids = {1000};
+    t4_frag.generations = {1};
+    t4_frag.key.storage_generation = 1;
+    t4_frag.key.storage_pos0 = 0;
+    encode_fragment_landmark(t4_frag, *seg, 0, 32, nullptr, 0x111, GGML_TYPE_TURBO4_0);
+    assert(t4_frag.landmark_matrix.desc.type == GGML_TYPE_TURBO4_0);
+    assert(t4_frag.error_bound > 0.0f);
+    assert(t4_frag.source_fingerprint != 0);
+
+    sr_query q;
+    q.head_dim = 32;
+    q.q_vec.assign(32, 0.5f);
+    sr_selection_config cfg;
+    cfg.sr_budget = 1;
+    cfg.landmark_type = GGML_TYPE_TURBO4_0;
+    auto res = select_sr_query(q, {t4_frag}, cfg, seg.get(), 0, 32, nullptr, 0x111);
+    assert(res.selected_rows.size() == 1);
+    assert(res.selected_rows[0].row == 0);
+    assert(res.scores.size() == 1);
+    assert(std::isfinite(res.scores[0]));
+
+    std::cout << "[test_landmark_advanced_lifecycle] passed!" << std::endl;
 }
 

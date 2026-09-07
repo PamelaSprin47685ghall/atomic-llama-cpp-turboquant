@@ -185,8 +185,10 @@ static std::shared_ptr<xkv_segment> create_test_segment_f32(
         pids[i] = seed_base * 1000 + i + 1;
         store.register_hot_payload(pids[i], i, gens[i], xkv_state::hot_committed);
     }
-    bool marked = store.mark_seal_candidates(pids);
-    assert(marked);
+    uint64_t nonce = 0;
+    std::string mark_err;
+    bool marked = store.mark_seal_candidates(pids, gens, &nonce, &mark_err);
+    assert(marked && nonce > 0 && mark_err.empty());
 
     std::string err;
     bool ok = store.publish_candidate(seg, pids, gens, &err);
@@ -249,8 +251,10 @@ static std::shared_ptr<xkv_segment> create_test_segment_turbo4(
         pids[i] = seed_base * 1000 + i + 1;
         store.register_hot_payload(pids[i], i, gens[i], xkv_state::hot_committed);
     }
-    bool marked = store.mark_seal_candidates(pids);
-    assert(marked);
+    uint64_t nonce = 0;
+    std::string mark_err;
+    bool marked = store.mark_seal_candidates(pids, gens, &nonce, &mark_err);
+    assert(marked && nonce > 0 && mark_err.empty());
 
     std::string err;
     bool ok = store.publish_candidate(seg, pids, gens, &err);
@@ -590,8 +594,10 @@ static void test_ddvr_spans_and_groups() {
         pids[i] = 4000 + i + 1;
         store.register_hot_payload(pids[i], i, gens[i], xkv_state::hot_committed);
     }
-    bool marked = store.mark_seal_candidates(pids);
-    assert(marked);
+    uint64_t nonce = 0;
+    std::string mark_err;
+    bool marked = store.mark_seal_candidates(pids, gens, &nonce, &mark_err);
+    assert(marked && nonce > 0 && mark_err.empty());
     std::string pub_err;
     bool published = store.publish_candidate(seg, pids, gens, &pub_err);
     assert(published);
@@ -2452,8 +2458,10 @@ static std::shared_ptr<xkv_segment> create_test_segment_quant(
         pids[i] = seed_base * 1000 + i + 1;
         store.register_hot_payload(pids[i], i, gens[i], xkv_state::hot_committed);
     }
-    bool marked = store.mark_seal_candidates(pids);
-    assert(marked);
+    uint64_t nonce = 0;
+    std::string mark_err;
+    bool marked = store.mark_seal_candidates(pids, gens, &nonce, &mark_err);
+    assert(marked && nonce > 0 && mark_err.empty());
 
     std::string err;
     bool ok = store.publish_candidate(seg, pids, gens, &err);
