@@ -3,6 +3,8 @@
 // Uses assert-based testing (no external framework).
 
 #include "../src/llama-triattention.h"
+#include "../src/turbo-rotation-data.h"
+#include "../wanxiangqi/calib/triattention-config.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -904,9 +906,121 @@ static void test_zscore_normalization() {
 // Main
 // ============================================================================
 
+static void test_turbo_scores_match_storage_oracle() {
+    fprintf(stderr, "--- test_turbo_scores_match_storage_oracle ---\n");
+    const char * path = "/tmp/test_triattention_turbo_domain.triattention";
+    const uint32_t n = 7;
+    uint32_t cells[n] = {0, 1, 2, 3, 4, 5, 6};
+    int32_t positions[n] = {0, 1, 13, 96, 200, 511, 2048};
+    for (uint32_t hd : {128u, 256u}) {
+        for (uint32_t style : {0u, 1u}) {
+            mock_calib_params p;
+            p.head_dim = hd;
+            p.freq_count = hd / 2;
+            p.rope_style = style;
+            p.num_layers = p.num_attn_heads = p.num_kv_heads = p.n_sampled = 1;
+            write_mock_calib(path, p);
+            triattention_scorer_config cfg;
+            cfg.normalize_scores = false;
+            triattention_scorer scorer(path, cfg, p.rope_theta, hd, 1);
+            TEST_ASSERT(scorer.valid());
+            for (ggml_type type : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+                mock_tensor_ctx mtc = make_mock_tensor_ctx(1024 * 1024);
+                ggml_tensor * quant = ggml_new_tensor_2d(mtc.ctx, type, hd, n);
+                ggml_tensor * reference = make_k_tensor(mtc, 1, hd, n);
+                alloc_mock_tensors(mtc);
+                const auto * traits = ggml_get_type_traits(type);
+                TEST_ASSERT(traits && traits->from_float_ref && traits->to_float);
+                std::vector<float> input(hd), stored(hd), restored(hd);
+                std::vector<uint8_t> bytes(ggml_row_size(type, hd));
+                for (uint32_t cell = 0; cell < n; ++cell) {
+                    for (uint32_t d = 0; d < hd; ++d) {
+                        input[d] = std::sin((d + 1) * (cell + 3) * 0.071f) * (cell + 1);
+                    }
+                    traits->from_float_ref(input.data(), bytes.data(), hd);
+                    traits->to_float(bytes.data(), stored.data(), hd);
+                    // Independent dense R^T oracle, not the production fast
+                    // butterfly. Compare the same quantized bytes, so the
+                    // test does not confuse quantization error with a bug.
+                    for (uint32_t off = 0; off < hd; off += 128) {
+                        for (uint32_t i = 0; i < 128; ++i) {
+                            double sum = 0;
+                            for (uint32_t j = 0; j < 128; ++j) {
+                                sum += (double) TURBO_ROTATION_RT[i * 128 + j] * stored[off + j];
+                            }
+                            restored[off + i] = (float) sum;
+                        }
+                    }
+                    ggml_backend_tensor_set(quant, bytes.data(), cell * bytes.size(), bytes.size());
+                    write_k_cell(reference, cell, 0, hd, restored.data());
+                }
+                float expected[n] = {}, individual[n] = {}, combined[n] = {};
+                scorer.score_head(expected, reference, cells, positions, 0, n, 4096);
+                scorer.score_head(individual, quant, cells, positions, 0, n, 4096);
+                ggml_tensor * tensors[] = {quant};
+                int32_t layers[] = {0};
+                scorer.score_combined(combined, tensors, 1, layers, cells, positions, n, 4096);
+                for (uint32_t i = 0; i < n; ++i) {
+                    const float tolerance = 2e-4f * std::max(1.0f, std::fabs(expected[i]));
+                    TEST_ASSERT_MSG(std::fabs(individual[i] - expected[i]) < tolerance,
+                            "individual Turbo score must inverse-WHT before inverse-RoPE");
+                    TEST_ASSERT_MSG(std::fabs(combined[i] - expected[i]) < tolerance,
+                            "combined Turbo score must match the independent storage-domain oracle");
+                }
+                free_mock_tensor_ctx(mtc);
+            }
+        }
+    }
+    remove(path);
+    fprintf(stderr, "  PASSED\n");
+}
+
+static void test_collector_model_geometry() {
+    llama_hparams hp{};
+    hp.n_embd = 3072;
+    hp.n_layer_all = 44;
+    hp.n_head_arr.fill(48);
+    hp.n_head_kv_arr.fill(8);
+    hp.n_embd_head_k_full = 128;
+    hp.n_rot_full = 128;
+    hp.rope_freq_base_train = 70000000.0f;
+    auto mc = wxq::get_triattention_model_config(hp, LLAMA_ROPE_TYPE_NORM);
+    TEST_ASSERT(mc.head_dim == 128); // not n_embd/n_head == 64
+    TEST_ASSERT(mc.n_layer == 44 && mc.full_attn_layers.size() == 44);
+    TEST_ASSERT(mc.full_attn_layers.back() == 43);
+    TEST_ASSERT(mc.freq_count == 64 && mc.rope_style == 1);
+    TEST_ASSERT(mc.rope_theta == 70000000.0);
+
+    // Hybrid calibration must not include recurrent or SWA layers and must
+    // retain IMRoPE's front/back vector pairing for partial rotary dimensions.
+    hp.n_layer_all = 4;
+    hp.is_recr_impl[0] = hp.is_recr_impl[2] = 1;
+    hp.is_swa_impl[1] = 1;
+    hp.n_embd_head_k_full = 256;
+    hp.n_rot_full = 64;
+    mc = wxq::get_triattention_model_config(hp, LLAMA_ROPE_TYPE_IMROPE);
+    TEST_ASSERT(mc.full_attn_layers == std::vector<int>{3});
+    TEST_ASSERT(mc.head_dim == 256 && mc.freq_count == 32 && mc.rope_style == 0);
+
+    hp.n_rot_full = 65;
+    bool rejected = false;
+    try { (void) wxq::get_triattention_model_config(hp, LLAMA_ROPE_TYPE_IMROPE); }
+    catch (const std::runtime_error &) { rejected = true; }
+    TEST_ASSERT(rejected);
+    hp.n_rot_full = 64;
+    hp.is_recr_impl[3] = 1;
+    rejected = false;
+    try { (void) wxq::get_triattention_model_config(hp, LLAMA_ROPE_TYPE_IMROPE); }
+    catch (const std::runtime_error &) { rejected = true; }
+    TEST_ASSERT(rejected);
+    fprintf(stderr, "test_collector_model_geometry PASSED\n");
+}
+
 int main() {
     fprintf(stderr, "=== TriAttention Scorer Tests ===\n\n");
 
+    test_collector_model_geometry();
+    test_turbo_scores_match_storage_oracle();
     test_calibration_loading();
     test_rope_inversion();
     test_scoring();

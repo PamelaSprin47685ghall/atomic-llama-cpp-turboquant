@@ -23,9 +23,12 @@
 #include "llama.h"
 #include "llama-ext.h"
 #include "llama-triattention.h"
+#include "llama-model.h"
+#include "triattention-config.h"
 
 #include "trie.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstdint>
@@ -42,126 +45,10 @@
 // Model config extraction
 // ============================================================================
 
-struct model_config {
-    int32_t  n_layer       = 0;    // trunk layers (not MTP)
-    int32_t  n_head        = 0;    // attention heads
-    int32_t  n_head_kv     = 0;    // KV heads
-    int32_t  head_dim      = 0;
-    double   rope_theta    = 0.0;
-    uint32_t rope_style    = 0;    // 0=half/NeoX pairing, 1=even-odd pairing
-    uint32_t rotary_dim    = 0;    // partial RoPE dimension
-    uint32_t freq_count    = 0;    // rotary_dim / 2
-    std::vector<int> full_attn_layers;  // layer indices with standard attention
-};
+using model_config = wxq::triattention_model_config;
 
 static model_config get_model_config(llama_model * model) {
-    model_config mc;
-    mc.n_layer    = llama_model_n_layer(model);
-    mc.n_head     = llama_model_n_head(model);
-    mc.n_head_kv  = llama_model_n_head_kv(model);
-
-    // head_dim: use architecture-specific key_length if available, else compute
-    {
-        char buf[256];
-        // Try common architecture prefixes
-        const char * prefixes[] = {"qwen35moe", "qwen3", "llama", nullptr};
-        bool found = false;
-        for (int i = 0; prefixes[i] && !found; ++i) {
-            std::string key = std::string(prefixes[i]) + ".attention.key_length";
-            if (llama_model_meta_val_str(model, key.c_str(), buf, sizeof(buf))) {
-                mc.head_dim = (int32_t)std::strtol(buf, nullptr, 10);
-                found = true;
-            }
-        }
-        if (!found) {
-            mc.head_dim = mc.n_head > 0 ? llama_model_n_embd(model) / mc.n_head : 0;
-        }
-    }
-
-    // rope_theta: try architecture-specific rope.freq_base
-    {
-        char buf[256];
-        const char * prefixes[] = {"qwen35moe", "qwen3", "llama", nullptr};
-        bool found = false;
-        for (int i = 0; prefixes[i] && !found; ++i) {
-            std::string key = std::string(prefixes[i]) + ".rope.freq_base";
-            if (llama_model_meta_val_str(model, key.c_str(), buf, sizeof(buf))) {
-                mc.rope_theta = std::strtod(buf, nullptr);
-                found = true;
-            }
-        }
-        if (!found) {
-            // Fallback to generic rope_theta
-            if (llama_model_meta_val_str(model, "rope_theta", buf, sizeof(buf))) {
-                mc.rope_theta = std::strtod(buf, nullptr);
-            }
-        }
-    }
-
-    // Pairing follows ggml's vector rotation layout, not M-RoPE section order.
-    // IMROPE interleaves position sections but still uses NeoX/front-back pairs.
-    switch (llama_model_rope_type(model)) {
-        case LLAMA_ROPE_TYPE_NORM:
-            mc.rope_style = 1;
-            break;
-        case LLAMA_ROPE_TYPE_NEOX:
-        case LLAMA_ROPE_TYPE_MROPE:
-        case LLAMA_ROPE_TYPE_IMROPE:
-            mc.rope_style = 0;
-            break;
-        case LLAMA_ROPE_TYPE_NONE:
-        case LLAMA_ROPE_TYPE_VISION:
-            throw std::runtime_error("TriAttention calibration does not support this RoPE layout");
-    }
-
-    // rotary_dim: use architecture-specific rope.dimension_count
-    {
-        char buf[256];
-        const char * prefixes[] = {"qwen35moe", "qwen3", "llama", nullptr};
-        bool found = false;
-        for (int i = 0; prefixes[i] && !found; ++i) {
-            std::string key = std::string(prefixes[i]) + ".rope.dimension_count";
-            if (llama_model_meta_val_str(model, key.c_str(), buf, sizeof(buf))) {
-                mc.rotary_dim = (uint32_t)std::strtoul(buf, nullptr, 10);
-                found = true;
-            }
-        }
-        if (!found) {
-            mc.rotary_dim = (uint32_t)mc.head_dim;  // full RoPE
-        }
-    }
-
-    mc.freq_count = mc.rotary_dim / 2;
-
-    // Determine full-attention layers using full_attention_interval
-    {
-        char buf[256];
-        const char * prefixes[] = {"qwen35moe", "qwen3", nullptr};
-        int interval = 0;
-        bool found = false;
-        for (int i = 0; prefixes[i] && !found; ++i) {
-            std::string key = std::string(prefixes[i]) + ".full_attention_interval";
-            if (llama_model_meta_val_str(model, key.c_str(), buf, sizeof(buf))) {
-                interval = (int)std::strtol(buf, nullptr, 10);
-                found = true;
-            }
-        }
-        if (found && interval > 0) {
-            // Full attention at layers where (i+1) % interval == 0
-            for (int i = 0; i < mc.n_layer; ++i) {
-                if ((i + 1) % interval == 0) {
-                    mc.full_attn_layers.push_back(i);
-                }
-            }
-        } else {
-            // Fallback: all layers are full attention
-            for (int i = 0; i < mc.n_layer; ++i) {
-                mc.full_attn_layers.push_back(i);
-            }
-        }
-    }
-
-    return mc;
+    return wxq::get_triattention_model_config(model->hparams, llama_model_rope_type(model));
 }
 
 // ============================================================================
@@ -520,7 +407,13 @@ int main(int argc, char ** argv) {
     }
 
     // Get model config
-    model_config mc = get_model_config(model);
+    model_config mc;
+    try {
+        mc = get_model_config(model);
+    } catch (const std::exception & e) {
+        LOG_ERR("%s: %s\n", __func__, e.what());
+        return 1;
+    }
 
     LOG_INF("%s: model config:\n", __func__);
     LOG_INF("%s:   n_layer=%d, n_head=%d, n_head_kv=%d, head_dim=%d\n",
@@ -546,6 +439,13 @@ int main(int argc, char ** argv) {
     } else {
         for (int il : mc.full_attn_layers) {
             sampled_layers.insert(il);
+        }
+    }
+
+    for (int il : sampled_layers) {
+        if (std::find(mc.full_attn_layers.begin(), mc.full_attn_layers.end(), il) == mc.full_attn_layers.end()) {
+            LOG_ERR("%s: sampled layer %d is not a full-attention layer\n", __func__, il);
+            return 1;
         }
     }
 

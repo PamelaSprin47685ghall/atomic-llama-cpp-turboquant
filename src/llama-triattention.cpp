@@ -24,7 +24,8 @@
 // Block types and dequant declarations are in ggml-common.h (ggml/src/)
 // which is not on the include path for src/. We declare the dequant
 // functions with void* parameters and cast at call sites.
-// Block sizes (bytes per 128 elements): turbo2=10, turbo3=14, turbo4=68, q8_0=34
+// Block sizes: turbo2=34, turbo3=50, turbo4=68 bytes per 128 elements;
+// q8_0=34 bytes per 32 elements.
 
 #ifdef _MSC_VER
 #define _USE_MATH_DEFINES
@@ -51,19 +52,13 @@
 #include <sys/time.h>
 #endif
 
-// Pre-computed WHT inverse rotation matrix R^T (128x128)
-// Used to convert turbo2/turbo3 dequant output from WHT-rotated space
-// back to the original post-RoPE embedding space.
-// turbo4 dequant already applies R^T internally, so this is only needed
-// for turbo2_0 and turbo3_0 types.
-#include "turbo-rotation-data.h"
-
 // TurboQuant dequant function declarations (from ggml-turbo-quant.c)
 // Using void* since block type definitions live in ggml-common.h (not on include path)
 extern "C" {
     void dequantize_row_turbo2_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
     void dequantize_row_turbo3_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
     void dequantize_row_turbo4_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+    GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size);
 }
 
 // Standard ggml dequant for Q8_0, F16, etc.
@@ -88,17 +83,24 @@ static double triattention_time_ms(void) {
 #endif
 }
 
-// Matrix-vector multiply: out[i] = sum_j mat[i*d + j] * vec[j]
-// Used for inverse WHT rotation on turbo2/turbo3 dequant output
-static void matvec_128(const float * mat, const float * vec, float * out) {
-    for (int i = 0; i < 128; i++) {
-        float sum = 0.0f;
-        const float * row = mat + i * 128;
-        for (int j = 0; j < 128; j++) {
-            sum += row[j] * vec[j];
-        }
-        out[i] = sum;
+static bool triattention_needs_inverse_wht(ggml_type type) {
+    if (type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0) {
+        return true;
     }
+    // TURBO4_USE_4BIT defaults to 1 in ggml-common.h. Only the legacy
+    // 3-bit+QJL representation inverse-rotates inside its dequantizer.
+#if !defined(TURBO4_USE_4BIT) || TURBO4_USE_4BIT
+    return type == GGML_TYPE_TURBO4_0;
+#else
+    return false;
+#endif
+}
+
+static void triattention_inverse_wht_128(const float * src, float * dst) {
+    // The butterfly is O(d log d), rather than O(d^2) for a dense R^T.
+    // Reclamation applies this to every retained candidate and sampled head.
+    memcpy(dst, src, 128 * sizeof(float));
+    turbo_cpu_fwht_inverse(dst, 128);
 }
 
 // Helper: z-score normalize an array in-place
@@ -744,13 +746,12 @@ static void triattention_dequant_kv_head(
                 continue;
         }
 
-        // Apply inverse WHT rotation for turbo2/turbo3
-        // turbo4 dequant already applies R^T internally
+        // Restore post-RoPE K before applying inverse RoPE.
         if (need_wht_inv) {
             float * final_dst = out + (size_t)ci * padded_hd;
             // Process in 128-element blocks (WHT block size)
             for (uint32_t b = 0; b < padded_hd; b += 128) {
-                matvec_128(TURBO_ROTATION_RT, dequant_tmp.data() + b, final_dst + b);
+                triattention_inverse_wht_128(dequant_tmp.data() + b, final_dst + b);
             }
         }
     }
@@ -818,7 +819,7 @@ static void triattention_dequant_kv_head_from_rows(
         if (need_wht_inv) {
             float * final_dst = out + (size_t) ci * padded_hd;
             for (uint32_t b = 0; b < padded_hd; b += 128) {
-                matvec_128(TURBO_ROTATION_RT, dequant_tmp.data() + b, final_dst + b);
+                triattention_inverse_wht_128(dequant_tmp.data() + b, final_dst + b);
             }
         }
     }
@@ -866,7 +867,7 @@ struct triattention_scorer::impl {
     // Get or create GPU state for a specific (device, k_type) combination.
     // Returns nullptr if initialization fails.
     triattention_gpu_state * get_gpu_state(int device_id, ggml_type k_type) {
-        const bool need_wht_inv = k_type == GGML_TYPE_TURBO2_0 || k_type == GGML_TYPE_TURBO3_0;
+        const bool need_wht_inv = triattention_needs_inverse_wht(k_type);
         if (need_wht_inv && (cal->head_dim != 128 || cal->rotary_dim != cal->head_dim)) {
             // The current CUDA scorer can cooperatively invert exactly one
             // 128-wide WHT block. Fall back to the backend-read CPU scorer for
@@ -1110,7 +1111,7 @@ void triattention_scorer::score_sampled_head(
     const uint32_t padded_hd = ((hd + 127) / 128) * 128;
 
     const ggml_type k_type = k_tensor->type;
-    const bool need_wht_inv = (k_type == GGML_TYPE_TURBO2_0 || k_type == GGML_TYPE_TURBO3_0);
+    const bool need_wht_inv = triattention_needs_inverse_wht(k_type);
 
 #ifdef GGML_USE_CUDA
     // GPU fast path: if K tensor is on a CUDA device, score directly on GPU
@@ -1318,7 +1319,7 @@ void triattention_scorer::score_combined(
         const bool k_is_turbo = k_type == GGML_TYPE_TURBO2_0 ||
                                 k_type == GGML_TYPE_TURBO3_0 ||
                                 k_type == GGML_TYPE_TURBO4_0;
-        const bool need_wht_inv = k_type == GGML_TYPE_TURBO2_0 || k_type == GGML_TYPE_TURBO3_0;
+        const bool need_wht_inv = triattention_needs_inverse_wht(k_type);
         const uint32_t storage_hd = k_is_turbo ? ((hd + 127) / 128) * 128 : hd;
         const size_t row_bytes = ggml_row_size(k_type, k_tensor->ne[0]);
         const uint32_t max_cell = *std::max_element(cell_indices, cell_indices + n_candidates);
