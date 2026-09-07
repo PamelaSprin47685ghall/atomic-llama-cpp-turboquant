@@ -51,9 +51,10 @@ layout (push_constant) uniform parameter
 uint expert_id;
 #ifdef MUL_MAT_ID_GROUPED
 uint expert_count;
+uint expert_row0;
 
 uint mat_vec_packed_row(const uint j) {
-    return uint(data_ids[expert_id*p.route_elements + j]);
+    return uint(data_ids[expert_id*p.route_elements + expert_row0 + j]);
 }
 
 uint mat_vec_expert_slot(const uint j) {
@@ -76,9 +77,11 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 
 #ifdef MUL_MAT_ID_GROUPED
     const uint active_idx = gl_WorkGroupID.y;
-    expert_id = data_expert_count[p.grouped_list_offset + active_idx];
-    expert_count = data_expert_count[1 + p.active_capacity + expert_id];
-    const uint packed = uint(data_ids[expert_id*p.route_elements]);
+    const uint tile = data_expert_count[p.grouped_list_offset + active_idx];
+    expert_id = tile & 0xffffu;
+    expert_row0 = tile >> 16;
+    expert_count = data_expert_count[1 + p.active_capacity + expert_id] - expert_row0;
+    const uint packed = mat_vec_packed_row(0u);
     expert_i0 = packed & 0xffffu;
     expert_i1 = packed >> 16;
 #else

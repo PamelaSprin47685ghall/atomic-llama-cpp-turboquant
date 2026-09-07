@@ -11098,6 +11098,9 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 static void ggml_compute_forward_gated_delta_net_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, 1) != 0) {
+        GGML_ABORT("RERoT GDN requires a supported GPU backend");
+    }
 
     ggml_tensor * V = dst->src[2];
     int64_t nr = V->ne[1] * V->ne[3];

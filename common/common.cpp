@@ -22,6 +22,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <random>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -444,6 +445,18 @@ std::string common_params_get_system_info(const common_params & params) {
 //
 // String utils
 //
+
+std::string random_string(size_t length) {
+    static constexpr char alphabet[] =
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    std::random_device random;
+    std::uniform_int_distribution<size_t> pick(0, sizeof(alphabet) - 2);
+    std::string result(length, ' ');
+    for (char & ch : result) {
+        ch = alphabet[pick(random)];
+    }
+    return result;
+}
 
 std::string string_format(const char * fmt, ...) {
     va_list ap;
@@ -1323,17 +1336,23 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.rerot_brain_rows = fit_res.b_people;
             params.rerot_hand_rows = fit_res.p_pens;
             params.n_ctx_kv = fit_res.k_tokens;
+            params.n_outputs_max = std::max(
+                1u,
+                fit_res.p_pens * (1u + params.speculative.need_n_rs_seq()));
 
             cparams.n_person_max = fit_res.b_people;
             cparams.n_pen_max = fit_res.p_pens;
             cparams.n_ctx_kv = fit_res.k_tokens;
             cparams.n_seq_recurrent = fit_res.b_people;
             cparams.n_seq_max = LLAMA_MAX_SEQ;
+            cparams.n_outputs_max = params.n_outputs_max;
             if (extra_cparams != nullptr) {
-                cparams_mtp.n_person_max = fit_res.b_people;
-                cparams_mtp.n_pen_max = fit_res.p_pens;
+                cparams_mtp.n_person_max = 0;
+                cparams_mtp.n_pen_max = 0;
                 cparams_mtp.n_ctx_kv = fit_res.k_tokens;
-                cparams_mtp.n_seq_recurrent = fit_res.b_people;
+                cparams_mtp.n_seq_max = fit_res.p_pens;
+                cparams_mtp.n_seq_recurrent = fit_res.p_pens;
+                cparams_mtp.n_outputs_max = fit_res.p_pens;
             }
         } else {
             // Ordinary (RERoT OFF) auto-fit remains 100% untouched
@@ -1833,9 +1852,6 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     // capacities separate so the seq-id arena does not multiply recurrent VRAM.
     cparams.n_seq_recurrent   = params.rerot_enabled ? params.n_parallel : 0;
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
-    if (params.rerot_enabled) {
-        cparams.n_outputs_max = std::max<uint32_t>(cparams.n_outputs_max, cparams.n_seq_max);
-    }
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;

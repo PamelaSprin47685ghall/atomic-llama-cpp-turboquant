@@ -263,10 +263,23 @@ public:
     virtual ~llm_graph_input_rs() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    void set_input_recurrent(
+        const llama_memory_recurrent_context * current,
+        const llama_ubatch * ubatch);
 
     bool can_reuse(const llm_graph_params & params) override;
+    bool can_reuse_recurrent(
+        const llama_memory_recurrent_context * current,
+        const llama_ubatch & ubatch);
 
-    ggml_tensor * s_copy;  // I32 [n_rs]
+    ggml_tensor * s_copy;      // I32 [n_rs]
+    ggml_tensor * brain_copy;  // I32 [n_seqs], grouped shared-S rows
+
+    struct rbb_group_input {
+        int32_t brain_row = -1;
+        ggml_tensor * public_rows = nullptr; // I32 [n_public_rows]
+    };
+    std::vector<rbb_group_input> rbb_groups;
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
@@ -1473,6 +1486,12 @@ struct llm_graph_context {
                 int32_t   state_size,
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+
+    ggml_tensor * build_rs_shared(
+            llm_graph_input_rs * inp,
+            ggml_tensor * s,
+                int32_t   state_size,
+                int32_t   n_seqs) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

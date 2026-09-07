@@ -1,7 +1,11 @@
 #include "server-rerot.h"
+#include "common.h"
+#include "json-schema-to-grammar.h"
+#include "peg-parser.h"
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <utility>
@@ -12,10 +16,25 @@ constexpr std::string_view k_open_ol  = "<ol>";
 constexpr std::string_view k_close_ol = "</ol>";
 constexpr std::string_view k_open_li  = "<li>";
 constexpr std::string_view k_close_li = "</li>";
-constexpr std::string_view k_private_control_tags[] = {"<blockquote>", "</blockquote>"};
 
 bool ascii_space(unsigned char ch) {
     return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v';
+}
+
+bool valid_child_close_marker(std::string_view marker) {
+    if (marker.size() != 11 || marker[0] != '<' || marker[1] != '/' ||
+        marker.back() != '>') {
+        return false;
+    }
+    for (size_t i = 2; i < 10; ++i) {
+        const unsigned char ch = static_cast<unsigned char>(marker[i]);
+        if (!((ch >= '0' && ch <= '9') ||
+              (ch >= 'A' && ch <= 'Z') ||
+              (ch >= 'a' && ch <= 'z'))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void skip_ascii_space(std::string_view text, size_t & pos, size_t end) {
@@ -327,11 +346,10 @@ server_rerot_marker_parser::server_rerot_marker_parser(std::string marker)
 void server_rerot_marker_parser::reset() {
     candidate_.clear();
     error_.clear();
-    state_ = marker_.empty()
-        ? server_rerot_marker_state::failed
-        : server_rerot_marker_state::public_text;
-    if (marker_.empty()) {
-        error_ = "RERoT private marker must not be empty";
+    state_ = server_rerot_marker_state::public_text;
+    if (!marker_.empty() && !valid_child_close_marker(marker_)) {
+        state_ = server_rerot_marker_state::failed;
+        error_ = "RERoT child close marker must contain exactly 8 base62 characters";
     }
 }
 
@@ -362,6 +380,9 @@ bool server_rerot_marker_parser::fail(server_rerot_marker_step & step, std::stri
 
 server_rerot_marker_step server_rerot_marker_parser::consume(std::string_view bytes) {
     server_rerot_marker_step step;
+    if (marker_.empty()) {
+        return step;
+    }
 
     if (state_ == server_rerot_marker_state::failed) {
         step.malformed = true;
@@ -416,7 +437,7 @@ server_rerot_marker_step server_rerot_marker_parser::consume(std::string_view by
     }
 
     const size_t suffix = trailing_marker_prefix(scan, marker_);
-    if (suffix != 0) {
+    if (suffix >= 1) {
         candidate_.assign(scan.substr(scan.size() - suffix));
         state_ = server_rerot_marker_state::marker_candidate;
         step.write_visibility = llama_rerot_visibility::pending_record;
@@ -427,44 +448,6 @@ server_rerot_marker_step server_rerot_marker_parser::consume(std::string_view by
     state_ = server_rerot_marker_state::public_text;
     step.write_visibility = llama_rerot_visibility::public_live;
     return step;
-}
-
-void server_rerot_control_tag_filter::consume(std::string & bytes) {
-    if (!pending_.empty()) {
-        pending_.append(bytes);
-        bytes.swap(pending_);
-        pending_.clear();
-    }
-
-    while (!bytes.empty()) {
-        size_t first = std::string::npos;
-        std::string_view matched;
-        for (const auto tag : k_private_control_tags) {
-            const size_t pos = bytes.find(tag);
-            if (pos < first) {
-                first = pos;
-                matched = tag;
-            }
-        }
-        if (first != std::string::npos) {
-            bytes.erase(first, matched.size());
-            continue;
-        }
-
-        size_t hold = 0;
-        for (const auto tag : k_private_control_tags) {
-            hold = std::max(hold, trailing_marker_prefix(bytes, tag));
-        }
-        if (hold != 0) {
-            pending_.assign(bytes, bytes.size() - hold, hold);
-            bytes.resize(bytes.size() - hold);
-        }
-        return;
-    }
-}
-
-void server_rerot_control_tag_filter::reset() {
-    pending_.clear();
 }
 
 server_rerot_stream_lines server_rerot_line_mux::append(
@@ -569,11 +552,6 @@ server_rerot_stream_lines server_rerot_line_mux::drain_lane(
              newline = lane.partial_line.find('\n')) {
             std::string line = lane.partial_line.substr(0, newline + 1);
             lane.partial_line.erase(0, newline + 1);
-            for (const std::string_view tag : {"<blockquote>", "</blockquote>"}) {
-                for (size_t pos = line.find(tag); pos != std::string::npos; pos = line.find(tag)) {
-                    line.erase(pos, tag.size());
-                }
-            }
             if (!line.empty() && line != "\n") {
                 result.lines.push_back(std::move(line));
             }
@@ -581,13 +559,6 @@ server_rerot_stream_lines server_rerot_line_mux::drain_lane(
     }
 
     if (finish && !lane.partial_line.empty()) {
-        for (const std::string_view tag : {"<blockquote>", "</blockquote>"}) {
-            for (size_t pos = lane.partial_line.find(tag);
-                 pos != std::string::npos;
-                 pos = lane.partial_line.find(tag)) {
-                lane.partial_line.erase(pos, tag.size());
-            }
-        }
         if (!lane.partial_line.empty() && !only_ascii_space(lane.partial_line)) {
             lane.partial_line.push_back('\n');
             result.lines.push_back(std::move(lane.partial_line));
@@ -601,14 +572,43 @@ server_rerot_stream_lines server_rerot_line_mux::drain_lane(
 
 std::string_view server_rerot_planner_prompt() {
     static constexpr std::string_view prompt =
-        "我把完成请求所需的推理目标按依赖分组：每项通过思考得到结论，不是执行计划或产物清单。只有遮住其他 li 后仍能完成的目标才分开，否则合并。每个 li 只写目标，不展开答案。以 ol 开头、/ol 结尾。\n";
+        "我先把回答中可以同时展开、工作量大致相当的并列对象或章节列成一个平面的 HTML 有序列表："
+        "以 <ol> 开头，每项只写一个简短 <li> 标题，不提前展开内容，以 </ol> 结尾。"
+        "一个 <li> 只对应一个可独立展开的对象或子主题；同一项里仍有互不依赖的部分时，我继续把它们分成并列项。"
+        "只有确实无法并行拆解时才写一个 <li>。输出完 </ol> 后我再展开分析。";
     return prompt;
+}
+
+std::string server_rerot_child_grammar(std::string_view close_marker) {
+    if (!valid_child_close_marker(close_marker)) {
+        return {};
+    }
+    const std::string close(close_marker);
+    auto arena = build_peg_parser([&](common_peg_parser_builder & builder) {
+        auto terminator = builder.choice({
+            builder.literal("\n"),
+            builder.literal("。"),
+            builder.literal("."),
+        });
+        return builder.sequence({
+            builder.chars("[^ \\t\\r\\n<]", 1, 1),
+            builder.until_one_of({"\n", "。", "."}),
+            terminator,
+            builder.literal(close),
+            builder.end(),
+        });
+    });
+    common_grammar_options options;
+    options.dotall = true;
+    return build_grammar([&](const common_grammar_builder & grammar_builder) {
+        arena.build_grammar(grammar_builder, false);
+    }, options);
 }
 
 std::string_view server_rerot_planner_grammar() {
     static constexpr std::string_view grammar =
         "root ::= item-text \"</li>\" ws (\"<li>\" item-text \"</li>\" ws)* \"</ol>\"\n"
-        "item-text ::= [^<]* [^< \\t\\r\\n] [^<]*\n"
+        "item-text ::= ws [^< \\t\\r\\n] [^<]*\n"
         "ws ::= [ \\t\\r\\n]*\n";
     return grammar;
 }
@@ -1232,8 +1232,10 @@ std::optional<server_rerot_token_plan> server_rerot_runtime::plan_generated_toke
 
     server_rerot_parser_step parser_step;
     server_rerot_marker_step marker_step;
+    const auto marker_state_before =
+        current_node->exit_parser.state();
     if (current_node->planner_armed) {
-        // A node may fork via <ol>...</ol> OR conclude directly with </think>.
+        // A child may recursively fork or close its own random delimiter.
         // Both detectors track the token stream in parallel.
         marker_step = current_node->exit_parser.consume(token_bytes);
         if (marker_step.malformed) {
@@ -1258,12 +1260,22 @@ std::optional<server_rerot_token_plan> server_rerot_runtime::plan_generated_toke
             parser_step.malformed = false;
         }
 
+        // The list parser owns all bytes of an unfinished structural record.
+        // Marker-like substrings inside it must not escape as public prefixes
+        // or be moved ahead of the record when its bytes are rendered.
+        if (current_node->parser.state() == server_rerot_parser_state::opening_candidate ||
+            current_node->parser.state() == server_rerot_parser_state::list_pending ||
+            parser_step.record_closed) {
+            marker_step.public_prefix_bytes = 0;
+        }
+
         const bool candidate_alive =
             current_node->exit_parser.state() == server_rerot_marker_state::marker_candidate ||
             current_node->parser.state() == server_rerot_parser_state::opening_candidate ||
             current_node->parser.state() == server_rerot_parser_state::list_pending;
 
         const bool release_pending =
+            current_node->control_id().empty() &&
             (marker_step.release_previous_pending || parser_step.release_previous_pending) &&
             !candidate_alive;
 
@@ -1282,7 +1294,10 @@ std::optional<server_rerot_token_plan> server_rerot_runtime::plan_generated_toke
         } else if (candidate_alive) {
             parser_step.write_visibility = llama_rerot_visibility::pending_record;
         } else {
-            parser_step.write_visibility = llama_rerot_visibility::public_live;
+            parser_step.write_visibility =
+                current_node->control_id().empty()
+                    ? llama_rerot_visibility::public_live
+                    : llama_rerot_visibility::pending_record;
         }
     } else {
         marker_step = current_node->exit_parser.consume(token_bytes);
@@ -1292,10 +1307,33 @@ std::optional<server_rerot_token_plan> server_rerot_runtime::plan_generated_toke
                 : marker_step.error);
             return std::nullopt;
         }
-        if (marker_step.release_previous_pending && !release_false_pending(*current, *current_node)) {
-            return std::nullopt;
+
+        if (!current_node->control_id().empty()) {
+            // A child work block is atomic: its body stays PENDING and is
+            // visible only to its owning query run. Once the exact close
+            // marker begins, the completed body is published in one step;
+            // marker tokens remain PENDING until finalized PRIVATE.
+            parser_step.write_visibility =
+                llama_rerot_visibility::pending_record;
+        } else {
+            if (marker_step.release_previous_pending &&
+                !release_false_pending(*current, *current_node)) {
+                return std::nullopt;
+            }
+            parser_step.write_visibility = marker_step.write_visibility;
         }
-        parser_step.write_visibility = marker_step.write_visibility;
+    }
+
+    const bool child_marker_started =
+        !current_node->control_id().empty() &&
+        marker_state_before == server_rerot_marker_state::public_text &&
+        (current_node->exit_parser.state() ==
+             server_rerot_marker_state::marker_candidate ||
+         marker_step.marker_closed);
+    if (child_marker_started &&
+        current_node->pending_record.has_value() &&
+        !release_false_pending(*current, *current_node)) {
+        return std::nullopt;
     }
 
     server_rerot_token_plan plan;
@@ -1494,6 +1532,7 @@ bool server_rerot_runtime::publish_pending_record(
         }
         server_rerot_node_runtime child;
         child.id = child_id;
+        child.exit_parser = server_rerot_marker_parser("</" + random_string(8) + ">");
         child.enqueue_frontier = episode.frontier;
         episode.nodes.push_back(std::move(child));
         episode.ready_queue.push_back(child_id);
@@ -1826,7 +1865,26 @@ bool server_rerot_runtime::freeze_fork_parent(
         parked.emplace_back(child_id, allocated[next_alloc++]);
     }
 
-    if (memory_) {
+    std::vector<uint8_t> parent_seed = parent->hand_seed;
+    if (memory_ && parent_seed.empty()) {
+        const size_t seed_size =
+            llama_memory_rerot_capture_hand_seed(
+                memory_, parent->exec_seq, nullptr, 0);
+        if (seed_size == 0) {
+            return fail_episode(
+                *current,
+                "failed to size the parent recurrent hand seed");
+        }
+        parent_seed.resize(seed_size);
+        if (llama_memory_rerot_capture_hand_seed(
+                memory_,
+                parent->exec_seq,
+                parent_seed.data(),
+                parent_seed.size()) != parent_seed.size()) {
+            return fail_episode(
+                *current,
+                "failed to capture the parent recurrent hand seed");
+        }
         if (need_archive && current->base_prefix_end > 0) {
             llama_memory_seq_cp_attention(
                 memory_, parent->exec_seq, archive_seq, 0, current->base_prefix_end);
@@ -1834,24 +1892,11 @@ bool server_rerot_runtime::freeze_fork_parent(
 
         archive_public_runs(*current, *parent, archive_seq);
 
-        for (const auto & child : parked) {
-            llama_memory_seq_cp_recurrent(memory_, parent->exec_seq, child.second, -1, -1);
-        }
-
         if (!llama_memory_seq_rm_attention(memory_, parent->exec_seq, -1, -1) ||
             !llama_memory_seq_rm_recurrent(memory_, parent->exec_seq, -1, -1)) {
             return fail_episode(*current, "failed to release parent execution sequence after fork");
         }
         clear_sequence_control(parent->exec_seq);
-    }
-
-    std::vector<uint8_t> parent_seed = parent->hand_seed;
-    if (memory_) {
-        const size_t sz = llama_memory_rerot_capture_hand_seed(memory_, parent->exec_seq, nullptr, 0);
-        if (sz > 0) {
-            parent_seed.resize(sz);
-            llama_memory_rerot_capture_hand_seed(memory_, parent->exec_seq, parent_seed.data(), sz);
-        }
     }
 
     if (need_archive) {
@@ -1865,6 +1910,22 @@ bool server_rerot_runtime::freeze_fork_parent(
         child_runtime->parked_seq = child.second;
         child_runtime->storage_pos_next = parent->storage_pos_next;
         child_runtime->hand_seed = parent_seed;
+        if (child_runtime->hand_seed.size() >=
+            sizeof(uint32_t) + sizeof(llama_pos)) {
+            uint32_t seed_magic = 0;
+            std::memcpy(
+                &seed_magic,
+                child_runtime->hand_seed.data(),
+                sizeof(seed_magic));
+            if (seed_magic == 0x32454553) {
+                const llama_pos seed_pos =
+                    std::max<llama_pos>(0, parent->storage_pos_next - 1);
+                std::memcpy(
+                    child_runtime->hand_seed.data() + sizeof(uint32_t),
+                    &seed_pos,
+                    sizeof(seed_pos));
+            }
+        }
     }
 
     const int released_slot = parent->physical_slot;
@@ -1940,39 +2001,28 @@ bool server_rerot_runtime::admit_next_child(
                 memory_, current->archive_seq, exec_seq, 0, current->base_prefix_end);
         }
 
-        // The copied recurrent state is positioned at the parent's final
-        // planner token. Add a reference to the latest PUBLIC parent run so
-        // attention and recurrent seq_pos_max stay aligned even though the
-        // intervening private planner prompt is intentionally invisible.
-        const auto * parent_doc = current->document.node(child_doc->parent);
-        const llama_rerot_run * anchor = nullptr;
-        if (parent_doc) {
-            for (const auto run_id : parent_doc->runs) {
-                const auto * run = current->document.run(run_id);
-                if (!run || run->visibility != llama_rerot_visibility::public_live || run->token_count == 0) {
-                    continue;
-                }
-                const int64_t end = int64_t(run->storage_pos0) + int64_t(run->token_count);
-                const int64_t anchor_end = anchor
-                    ? int64_t(anchor->storage_pos0) + int64_t(anchor->token_count)
-                    : -1;
-                if (end > anchor_end) {
-                    anchor = run;
-                }
-            }
-        }
-        if (!anchor || int64_t(anchor->storage_pos0) + int64_t(anchor->token_count) != child->storage_pos_next ||
-            llama_memory_rerot_add_run_ref(memory_, current->id, anchor->id, exec_seq) == 0) {
-            return fail_episode(*current, "RERoT child admission could not anchor the fork frontier");
+        // Transfer every parked visible run to the physical execution
+        // sequence, then release the logical parking reference. The previous
+        // single-anchor reconstruction dropped sibling-specific sparse runs
+        // and leaked parked refs across admissions.
+        llama_memory_seq_cp_attention(
+            memory_, child->parked_seq, exec_seq, -1, -1);
+        if (!llama_memory_seq_rm_attention(
+                memory_, child->parked_seq, -1, -1)) {
+            return fail_episode(
+                *current,
+                "failed to transfer parked attention state during admission");
         }
 
-        llama_memory_seq_cp_recurrent(memory_, child->parked_seq, exec_seq, -1, -1);
-        if (!llama_memory_seq_rm_recurrent(memory_, child->parked_seq, -1, -1)) {
-            return fail_episode(*current, "failed to release parked recurrent sequence after admission");
-        }
-
-        if (!child->hand_seed.empty()) {
-            llama_memory_rerot_apply_hand_seed(memory_, exec_seq, child->hand_seed.data(), child->hand_seed.size());
+        if (child->hand_seed.empty() ||
+            !llama_memory_rerot_apply_hand_seed(
+                memory_,
+                exec_seq,
+                child->hand_seed.data(),
+                child->hand_seed.size())) {
+            return fail_episode(
+                *current,
+                "failed to restore child recurrent hand seed");
         }
     }
 
@@ -2463,6 +2513,27 @@ bool server_rerot_runtime::complete_serial_tail(uint64_t episode_id, llama_rerot
     return true;
 }
 
+bool server_rerot_runtime::continue_unforked_root(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id) {
+    auto * current = episode(episode_id);
+    auto * root = node(episode_id, node_id);
+    const auto * document_node = current ? current->document.node(node_id) : nullptr;
+    if (!current || !root || !document_node || node_id != current->document.root() ||
+        !root->control_id().empty() || current->hard_aborted || current->finalizing ||
+        current->serial_tail || !current->ready_queue.empty() ||
+        !current->starting.empty() || !current->suspended.empty() ||
+        current->running.size() != 1 || current->running.count(node_id) != 1 ||
+        document_node->state != llama_rerot_node_state::terminal_running ||
+        root->exit_intent || root->exec_seq < 0) {
+        return current ? fail_episode(
+            *current, "invalid RERoT N=1 root serial transition") : false;
+    }
+    current->serial_tail = true;
+    current->serial_node = node_id;
+    return true;
+}
+
 bool server_rerot_runtime::validate_serial_tail_state(
         uint64_t episode_id,
         llama_rerot_node_id node_id,
@@ -2798,14 +2869,6 @@ const std::string & server_rerot_marker_parser::marker() const {
     return marker_;
 }
 
-std::string_view server_rerot_marker_parser::completion_suffix() const {
-    if (state_ == server_rerot_marker_state::complete ||
-        state_ == server_rerot_marker_state::failed) {
-        return {};
-    }
-    return std::string_view(marker_).substr(candidate_.size());
-}
-
 server_rerot_marker_snapshot server_rerot_marker_parser::snapshot() const {
     server_rerot_marker_snapshot s;
     s.marker = marker_;
@@ -2816,13 +2879,19 @@ server_rerot_marker_snapshot server_rerot_marker_parser::snapshot() const {
 }
 
 bool server_rerot_marker_parser::restore(const server_rerot_marker_snapshot & snap, std::string * error) {
-    if (snap.marker.empty()) {
-        return rerot_state_set_error(error, "RERoT marker snapshot has an empty marker");
+    if (!snap.marker.empty() && !valid_child_close_marker(snap.marker)) {
+        return rerot_state_set_error(
+            error, "RERoT state uses an obsolete or malformed child delimiter");
+    }
+    if (snap.marker.empty() &&
+        (snap.state != server_rerot_marker_state::public_text ||
+         !snap.candidate.empty() || !snap.error.empty())) {
+        return rerot_state_set_error(error, "RERoT unarmed marker has active parser state");
     }
     if (snap.state > server_rerot_marker_state::failed) {
         return rerot_state_set_error(error, "RERoT marker snapshot has an out-of-range state");
     }
-    if (snap.candidate.size() >= snap.marker.size()) {
+    if (!snap.marker.empty() && snap.candidate.size() >= snap.marker.size()) {
         return rerot_state_set_error(error, "RERoT marker snapshot has an oversized marker candidate");
     }
     if (!snap.candidate.empty() &&

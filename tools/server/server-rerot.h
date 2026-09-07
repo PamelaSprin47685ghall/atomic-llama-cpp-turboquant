@@ -127,12 +127,7 @@ struct server_rerot_marker_step {
     std::string error;
 };
 
-// Byte-stream detector for a private runtime marker such as </think>. A
-// tokenizer token containing all or part of the marker is held PENDING until
-// the marker is either completed or disproved.
-// Versioned persistence snapshot for the private end-marker parser (§A.8).
-// The marker text itself is part of the snapshot: a restore with a different
-// marker is corrupt, never silently accepted.
+// Persistence snapshot for one child's exact random close-marker parser.
 struct server_rerot_marker_snapshot {
     std::string marker;
     std::string candidate;
@@ -140,12 +135,12 @@ struct server_rerot_marker_snapshot {
     std::string error;
 };
 
-// Byte-stream detector for a private runtime marker such as </think>. A
-// tokenizer token containing all or part of the marker is held PENDING until
-// the marker is either completed or disproved.
+// Byte-stream detector for one child's exact random close marker. A tokenizer
+// token containing all or part of it is held PENDING until closed or disproved.
 class server_rerot_marker_parser {
 public:
-    explicit server_rerot_marker_parser(std::string marker = "</blockquote>");
+    // Empty means unarmed (the ordinary root has no child delimiter).
+    explicit server_rerot_marker_parser(std::string marker = {});
 
     void reset();
     server_rerot_marker_step consume(std::string_view bytes);
@@ -155,7 +150,6 @@ public:
     bool failed() const;
     const std::string & error() const;
     const std::string & marker() const;
-    std::string_view completion_suffix() const;
 
     server_rerot_marker_snapshot snapshot() const;
     // Restore a snapshot produced by snapshot(). Returns false when the
@@ -173,17 +167,6 @@ private:
     std::string error_;
 };
 
-// Removes private RERoT delimiters from serial output across arbitrary
-// tokenizer boundaries. Instances exist only for active episodes.
-class server_rerot_control_tag_filter {
-public:
-    void consume(std::string & bytes);
-    void reset();
-
-private:
-    std::string pending_;
-};
-
 // Fixed private control prompt injected after the user's ordinary prompt and
 // before planner-visible generation. Its prose is deliberately phrased as the
 // model's first-person introspection rather than an external command. It is
@@ -191,6 +174,9 @@ private:
 // chat-template machinery.
 std::string_view server_rerot_planner_prompt();
 std::string_view server_rerot_planner_grammar();
+// Eager grammar for one child: arbitrary text must eventually terminate with
+// that child's exact random delimiter before EOG can be sampled.
+std::string server_rerot_child_grammar(std::string_view close_marker);
 
 struct server_rerot_hard_limits {
     // Zero means unbounded. When any bound is crossed the whole episode takes
@@ -305,6 +291,19 @@ struct server_rerot_node_runtime {
 
     server_rerot_planner_parser parser;
     server_rerot_marker_parser exit_parser;
+    // The persisted exact close marker owns the ID; do not store a second copy.
+    std::string_view control_id() const {
+        const auto & close = exit_parser.marker();
+        return close.empty() ? std::string_view{} : std::string_view(close).substr(2, 8);
+    }
+    std::string control_open() const {
+        const auto id = control_id();
+        if (id.empty()) {
+            return {};
+        }
+        return "<" + std::string(id) +
+            " note=\"Start of private child work block.\">";
+    }
     bool planner_armed = true;
     // Global FIFO key (§16.2). Assigned at fork publication from the current
     // frontier. Admission order is (enqueue_frontier, tree_path); no scoring.
@@ -585,7 +584,7 @@ public:
 
     // Final acquire fence (§21.4). Rebuilds the survivor reader view after all
     // same-frontier public writes and exits have committed, and reinstalls it
-    // on the survivor exec seq so the fence </think> decode observes stable
+    // on the survivor exec seq so the closing child marker observes stable
     // shared memory. On success fills ordered_runs_out with the fence view.
     bool refresh_final_fence(
         uint64_t episode_id,
@@ -596,6 +595,9 @@ public:
     // ordinary tool-call / body decode to the fence survivor. The survivor
     // keeps writing the episode root response stream.
     bool complete_serial_tail(uint64_t episode_id, llama_rerot_node_id node_id);
+    // N=1 root: leave the parallel scheduler without inventing a child
+    // delimiter or touching the model-native reasoning boundary.
+    bool continue_unforked_root(uint64_t episode_id, llama_rerot_node_id node_id);
 
     // Coordinate freeze and validation (§22): verifies all serial tail invariants,
     // ensuring the survivor reader view is complete, queue is empty, and

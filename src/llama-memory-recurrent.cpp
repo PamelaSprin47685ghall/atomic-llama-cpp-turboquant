@@ -8,7 +8,6 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cmath>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -26,6 +25,8 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
+                 uint32_t   n_brain_max,
+                 uint32_t   n_hand_max,
     const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
     const int32_t n_layer = hparams.n_layer();
 
@@ -34,6 +35,17 @@ llama_memory_recurrent::llama_memory_recurrent(
     used = 0;
 
     this->n_rs_seq = n_rs_seq;
+
+    const bool grouped = n_brain_max > 0 || n_hand_max > 0;
+    if (grouped) {
+        if (n_brain_max == 0 || n_hand_max == 0 || mem_size != n_hand_max) {
+            throw std::invalid_argument("invalid grouped recurrent brain/hand capacity");
+        }
+        n_brain_rows = n_brain_max;
+        n_hand_rows = n_hand_max;
+        brain_capacity = n_brain_max;
+        hand_capacity = n_hand_max;
+    }
 
     // RERoT logical seq-id capacity (§6.5): the parked/recursive-fork lineage
     // may reference any id in [0, LLAMA_MAX_SEQ), while the physical state
@@ -44,6 +56,11 @@ llama_memory_recurrent::llama_memory_recurrent(
     cells.clear();
     cells.resize(mem_size);
     tails.assign(LLAMA_MAX_SEQ, -1);
+    seq_brain.assign(LLAMA_MAX_SEQ, -1);
+    seq_episode.assign(LLAMA_MAX_SEQ, 0);
+    seq_node.assign(LLAMA_MAX_SEQ, LLAMA_REROT_NODE_INVALID);
+    seq_public_write.assign(LLAMA_MAX_SEQ, 0);
+    brain_episode.assign(n_brain_rows, 0);
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -58,7 +75,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(3u*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -78,7 +95,10 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     r_l.resize(n_layer);
     s_l.resize(n_layer);
+    d_l.resize(n_layer);
+    s_shared_l.assign(n_layer, 0);
 
+    uint32_t recurrent_ordinal = 0;
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: skipped\n", __func__, i);
@@ -103,13 +123,31 @@ llama_memory_recurrent::llama_memory_recurrent(
             throw std::runtime_error("failed to create ggml context for rs cache");
         }
 
-        const uint32_t n_rows = mem_size * (1 + n_rs_seq);
-        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
+        const bool shared_s = grouped && recurrent_ordinal >= 3;
+        const uint32_t r_rows = mem_size * (1 + n_rs_seq);
+        // Shared layers keep current public/private brain rows. Rollback only
+        // applies to public generation, so its additional planes hold B rows,
+        // not both public and planner brains.
+        const uint32_t s_rows = shared_s
+            ? 2 * n_brain_rows + n_brain_rows * n_rs_seq
+            : mem_size * (1 + n_rs_seq);
+        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), r_rows);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), s_rows);
+        ggml_tensor * d = shared_s
+            ? ggml_new_tensor_2d(
+                ctx, GGML_TYPE_F16, hparams.n_embd_s(),
+                mem_size * (1 + n_rs_seq))
+            : nullptr;
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
+        if (d) {
+            ggml_format_name(d, "cache_d_l%d", i);
+        }
         r_l[i] = r;
         s_l[i] = s;
+        d_l[i] = d;
+        s_shared_l[i] = shared_s;
+        ++recurrent_ordinal;
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
@@ -126,11 +164,13 @@ llama_memory_recurrent::llama_memory_recurrent(
     {
         const size_t memory_size_r = size_r_bytes();
         const size_t memory_size_s = size_s_bytes();
+        const size_t memory_size_d = size_d_bytes();
 
-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs %2u rs_seq), R (%s): %7.2f MiB, S (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_r + memory_size_s) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
+        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u hand rows, %3d layers, %2u seqs %2u rs_seq, %u brain rows), R (%s): %7.2f MiB, S (%s): %7.2f MiB, hand state (f16): %7.2f MiB\n", __func__,
+                (float)(memory_size_r + memory_size_s + memory_size_d) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq, n_brain_rows,
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
-                ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f));
+                ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
+                (float)memory_size_d / (1024.0f * 1024.0f));
     }
 }
 
@@ -141,6 +181,12 @@ void llama_memory_recurrent::clear(bool data) {
         cells[i].src = -1;
     }
     std::fill(tails.begin(), tails.end(), -1);
+    std::fill(seq_brain.begin(), seq_brain.end(), -1);
+    std::fill(seq_episode.begin(), seq_episode.end(), 0);
+    std::fill(seq_node.begin(), seq_node.end(), LLAMA_REROT_NODE_INVALID);
+    std::fill(seq_public_write.begin(), seq_public_write.end(), 0);
+    episode_brain.clear();
+    std::fill(brain_episode.begin(), brain_episode.end(), 0);
 
     head = 0;
     used = 0;
@@ -169,9 +215,19 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     if (rm_all) {
         if (seq_id >= 0) {
             set_rs_idx(seq_id, 0);
+            if ((size_t) seq_id < seq_brain.size()) {
+                seq_brain[(size_t) seq_id] = -1;
+                seq_episode[(size_t) seq_id] = 0;
+                seq_node[(size_t) seq_id] = LLAMA_REROT_NODE_INVALID;
+                seq_public_write[(size_t) seq_id] = 0;
+            }
         } else {
             std::fill(rs_idx.begin(), rs_idx.end(), 0);
             std::fill(tails.begin(), tails.end(), -1);
+            std::fill(seq_brain.begin(), seq_brain.end(), -1);
+            std::fill(seq_episode.begin(), seq_episode.end(), 0);
+            std::fill(seq_node.begin(), seq_node.end(), LLAMA_REROT_NODE_INVALID);
+            std::fill(seq_public_write.begin(), seq_public_write.end(), 0);
         }
     }
 
@@ -261,6 +317,11 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
     // Releasing an exec id later drops just its own ref, leaving parked
     // siblings (and recursive-fork grandchildren) undisturbed.
     if ((uint32_t) seq_id_dst < LLAMA_MAX_SEQ && (uint32_t) seq_id_src < LLAMA_MAX_SEQ) {
+        seq_brain[(size_t) seq_id_dst] = brain_row_for_seq(seq_id_src);
+        seq_episode[(size_t) seq_id_dst] = seq_episode[(size_t) seq_id_src];
+        seq_node[(size_t) seq_id_dst] = seq_node[(size_t) seq_id_src];
+        seq_public_write[(size_t) seq_id_dst] = seq_public_write[(size_t) seq_id_src];
+
         int32_t & tail_src = tails[(size_t) seq_id_src];
         int32_t & tail_dst = tails[(size_t) seq_id_dst];
         if (tail_dst >= 0) {
@@ -542,10 +603,13 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
 bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
     const uint32_t n_seqs       = ubatch.n_seqs;
+    const uint32_t hand_begin   = 0;
+    const uint32_t hand_end     = size;
+    const uint32_t hand_size    = size;
 
-    // if we have enough unused cells before the current head ->
-    //   better to start searching from the beginning of the cache, hoping to fill it
-    if (head > used + 2*n_seqs) {
+    // Persistent brain rows live in separate S tensors. The ordinary cell
+    // allocator owns only hand rows.
+    if (head >= hand_end || head > used + 2*n_seqs) {
         head = 0;
     }
 
@@ -556,8 +620,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     // can only process batches with an equal number of new tokens in each sequence
     GGML_ASSERT(ubatch.equal_seqs());
 
-    int32_t min = size - 1;
-    int32_t max = 0;
+    int32_t min = hand_end - 1;
+    int32_t max = hand_begin;
 
     // everything should fit if all seq_ids are smaller than the max
     for (uint32_t s = 0; s < n_seqs; ++s) {
@@ -617,15 +681,15 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             ++n_needed;
         }
     }
-    if (n_needed > size - used) {
+    if (n_needed > hand_size - used) {
         return false;
     }
 
-    // find next empty cell
+    // find next empty hand cell
     uint32_t next_empty_cell = head;
 
-    for (uint32_t i = 0; i < size; ++i) {
-        if (next_empty_cell >= size) { next_empty_cell -= size; }
+    for (uint32_t i = 0; i < hand_size; ++i) {
+        if (next_empty_cell >= hand_end) { next_empty_cell = hand_begin; }
         auto & cell = cells[next_empty_cell];
         if (cell.is_empty()) { break; }
         next_empty_cell += 1;
@@ -655,9 +719,9 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             }
             seq_tail = next_empty_cell;
             if (s + 1 < n_seqs) {
-                for (uint32_t j = 0; j < size; ++j) {
+                for (uint32_t j = 0; j < hand_size; ++j) {
                     next_empty_cell += 1;
-                    if (next_empty_cell >= size) { next_empty_cell -= size; }
+                    if (next_empty_cell >= hand_end) { next_empty_cell = hand_begin; }
                     auto & cell = cells[next_empty_cell];
                     if (cell.is_empty()) { break; }
                 }
@@ -769,10 +833,16 @@ uint32_t llama_memory_recurrent::get_recurrent_used() const {
 }
 
 void llama_memory_recurrent::set_grouped_layout(uint32_t n_brains, uint32_t n_hands) {
-    n_brain_rows = n_brains;
-    n_hand_rows = n_hands;
-    brain_capacity = n_brains;
-    hand_capacity = n_hands;
+    GGML_ASSERT(n_brains > 0);
+    GGML_ASSERT(n_hands > 0);
+    GGML_ASSERT(n_brains == n_brain_rows);
+    GGML_ASSERT(n_hands == n_hand_rows);
+    GGML_ASSERT(n_hands == size);
+    GGML_ASSERT(used == 0);
+}
+
+bool llama_memory_recurrent::is_s_shared(int32_t il) const {
+    return il >= 0 && (size_t) il < s_shared_l.size() && s_shared_l[(size_t) il] != 0;
 }
 
 uint32_t llama_memory_recurrent::get_brain_capacity() const {
@@ -787,90 +857,130 @@ uint32_t llama_memory_recurrent::get_brain_used() const {
     if (!is_grouped_layout()) {
         return get_recurrent_used();
     }
-    return std::min(get_recurrent_used(), brain_capacity);
+    return (uint32_t) std::count_if(
+        brain_episode.begin(), brain_episode.end(),
+        [](uint64_t episode_id) { return episode_id != 0; });
 }
 
 uint32_t llama_memory_recurrent::get_hand_used() const {
-    if (!is_grouped_layout()) {
-        return get_recurrent_used();
-    }
-    return std::min(get_recurrent_used(), hand_capacity);
+    return get_recurrent_used();
 }
 
-bool llama_memory_recurrent::commit_rbb_frontier_mean(
-        uint32_t person_id,
-        const std::vector<int32_t> & candidate_hand_rows,
-        const std::vector<bool> & is_public_write) {
-    if (candidate_hand_rows.empty() || candidate_hand_rows.size() != is_public_write.size()) {
-        return false;
+int32_t llama_memory_recurrent::brain_row_for_seq(llama_seq_id seq_id) const {
+    if (!is_grouped_layout() || seq_id < 0 || (size_t) seq_id >= seq_brain.size()) {
+        return -1;
+    }
+    if (seq_brain[(size_t) seq_id] >= 0) {
+        return seq_brain[(size_t) seq_id];
     }
 
-    // Filter valid PUBLIC candidate hand rows (§14.1, §B.6.2): PRIVATE/PENDING never enter global S
-    std::vector<int32_t> valid_rows;
-    for (size_t i = 0; i < candidate_hand_rows.size(); ++i) {
-        if (is_public_write[i] && candidate_hand_rows[i] >= 0 && (uint32_t) candidate_hand_rows[i] < size) {
-            valid_rows.push_back(candidate_hand_rows[i]);
+    // Before an episode is armed, root request sequences occupy the first B
+    // server slots. Their stable slot id is therefore their provisional brain
+    // row during prompt prefill.
+    return seq_id < (llama_seq_id) n_brain_rows ? seq_id : -1;
+}
+
+int32_t llama_memory_recurrent::acquire_brain_row(
+        uint64_t episode_id,
+        llama_seq_id seq_id) {
+    if (!is_grouped_layout() || episode_id == 0 ||
+        seq_id < 0 || (size_t) seq_id >= seq_brain.size()) {
+        return -1;
+    }
+
+    const auto found = episode_brain.find(episode_id);
+    if (found != episode_brain.end()) {
+        seq_brain[(size_t) seq_id] = found->second;
+        seq_episode[(size_t) seq_id] = episode_id;
+        return found->second;
+    }
+
+    int32_t row = brain_row_for_seq(seq_id);
+    if (row < 0 || brain_episode[(size_t) row] != 0) {
+        const auto free = std::find(brain_episode.begin(), brain_episode.end(), 0);
+        if (free == brain_episode.end()) {
+            return -1;
         }
+        row = (int32_t) std::distance(brain_episode.begin(), free);
     }
 
-    if (valid_rows.empty()) {
-        return true;
-    }
+    brain_episode[(size_t) row] = episode_id;
+    episode_brain.emplace(episode_id, row);
+    seq_brain[(size_t) seq_id] = row;
+    seq_episode[(size_t) seq_id] = episode_id;
+    return row;
+}
 
-    const uint32_t b_cap = get_brain_capacity();
-    const uint32_t target_brain_row = b_cap > 0 ? (person_id % b_cap) : 0;
+void llama_memory_recurrent::clear_brain_row(int32_t brain_row) {
+    if (brain_row < 0 || (uint32_t) brain_row >= n_brain_rows) {
+        return;
+    }
 
     for (size_t il = 0; il < s_l.size(); ++il) {
         ggml_tensor * s = s_l[il];
-        if (!s) {
+        if (!s || !is_s_shared((int32_t) il)) {
             continue;
         }
-
         const size_t row_size = ggml_row_size(s->type, s->ne[0]);
-        const size_t n_elem = s->ne[0];
-
-        // N=1: exact identity with single candidate (bitwise/tolerance equivalent to native recurrence)
-        if (valid_rows.size() == 1) {
-            const int32_t src_row = valid_rows[0];
-            if ((uint32_t) src_row == target_brain_row) {
-                continue;
-            }
-            std::vector<uint8_t> buf(row_size);
-            ggml_backend_tensor_get(s, buf.data(), (size_t) src_row * row_size, row_size);
-            ggml_backend_tensor_set(s, buf.data(), (size_t) target_brain_row * row_size, row_size);
-            continue;
-        }
-
-        // N > 1: Deterministic mean reduction across all valid candidate rows
-        // Order-free / permutation symmetric (§14.1, §B.6.3)
-        if (s->type == GGML_TYPE_F32) {
-            std::vector<float> acc(n_elem, 0.0f);
-            std::vector<float> row_buf(n_elem);
-
-            std::vector<int32_t> sorted_rows = valid_rows;
-            std::sort(sorted_rows.begin(), sorted_rows.end());
-
-            for (int32_t src_row : sorted_rows) {
-                ggml_backend_tensor_get(s, row_buf.data(), (size_t) src_row * row_size, row_size);
-                for (size_t k = 0; k < n_elem; ++k) {
-                    acc[k] += row_buf[k];
-                }
-            }
-
-            const float inv_n = 1.0f / float(sorted_rows.size());
-            for (size_t k = 0; k < n_elem; ++k) {
-                acc[k] *= inv_n;
-            }
-
-            ggml_backend_tensor_set(s, acc.data(), (size_t) target_brain_row * row_size, row_size);
-        } else {
-            std::vector<uint8_t> buf(row_size);
-            ggml_backend_tensor_get(s, buf.data(), (size_t) valid_rows[0] * row_size, row_size);
-            ggml_backend_tensor_set(s, buf.data(), (size_t) target_brain_row * row_size, row_size);
+        std::vector<uint8_t> zero(row_size, 0);
+        ggml_backend_tensor_set(
+            s, zero.data(), (uint32_t) brain_row * row_size, row_size);
+        ggml_backend_tensor_set(
+            s, zero.data(),
+            (n_brain_rows + (uint32_t) brain_row) * row_size,
+            row_size);
+        for (uint32_t snapshot = 1; snapshot <= n_rs_seq; ++snapshot) {
+            const size_t row =
+                2 * (size_t) n_brain_rows +
+                (size_t) (snapshot - 1) * n_brain_rows +
+                (uint32_t) brain_row;
+            ggml_backend_tensor_set(
+                s, zero.data(), row * row_size, row_size);
         }
     }
+}
 
+bool llama_memory_recurrent::rerot_set_write_tag(
+        llama_seq_id seq_id,
+        const llama_kv_rerot_meta & tag) {
+    if (!is_grouped_layout()) {
+        return true;
+    }
+    const int32_t row = acquire_brain_row(tag.episode_id, seq_id);
+    if (row < 0) {
+        return false;
+    }
+    seq_node[(size_t) seq_id] = tag.node_id;
+    seq_public_write[(size_t) seq_id] =
+        tag.visibility == llama_rerot_visibility::public_live ? 1 : 0;
     return true;
+}
+
+void llama_memory_recurrent::rerot_clear_write_tag(llama_seq_id seq_id) {
+    if (seq_id < 0 || (size_t) seq_id >= seq_public_write.size()) {
+        return;
+    }
+    seq_public_write[(size_t) seq_id] = 0;
+}
+
+void llama_memory_recurrent::rerot_release_episode(uint64_t episode_id) {
+    const auto found = episode_brain.find(episode_id);
+    if (found == episode_brain.end()) {
+        return;
+    }
+
+    const int32_t brain_row = found->second;
+    for (size_t i = 0; i < seq_episode.size(); ++i) {
+        if (seq_episode[i] == episode_id) {
+            seq_episode[i] = 0;
+            seq_node[i] = LLAMA_REROT_NODE_INVALID;
+            seq_brain[i] = -1;
+            seq_public_write[i] = 0;
+        }
+    }
+    episode_brain.erase(found);
+    brain_episode[(size_t) brain_row] = 0;
+    clear_brain_row(brain_row);
 }
 
 std::shared_ptr<llama_memory_recurrent::hand_seed> llama_memory_recurrent::capture_hand_seed(
@@ -884,23 +994,44 @@ std::shared_ptr<llama_memory_recurrent::hand_seed> llama_memory_recurrent::captu
     auto seed = std::make_shared<hand_seed>();
     seed->fork_id = fork_id;
     seed->source_hand_row = row;
+    seed->source_pos = cells[(size_t) row].pos;
     seed->conv_tail_bytes.resize(r_l.size());
-    seed->private_s_bytes.resize(s_l.size());
+    seed->state_bytes.resize(s_l.size());
+
+    auto read_row = [&](ggml_tensor * tensor, std::vector<uint8_t> & bytes) {
+        const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+        bytes.resize(row_size);
+        ggml_backend_t backend = backend_sched
+            ? ggml_backend_sched_get_tensor_backend(backend_sched, tensor)
+            : nullptr;
+        if (backend) {
+            ggml_backend_tensor_get_async(
+                backend,
+                tensor,
+                bytes.data(),
+                (size_t) row * row_size,
+                row_size);
+        } else {
+            ggml_backend_tensor_get(
+                tensor,
+                bytes.data(),
+                (size_t) row * row_size,
+                row_size);
+        }
+    };
 
     for (size_t il = 0; il < r_l.size(); ++il) {
         if (r_l[il]) {
-            const size_t row_size = ggml_row_size(r_l[il]->type, r_l[il]->ne[0]);
-            seed->conv_tail_bytes[il].resize(row_size);
-            ggml_backend_tensor_get(r_l[il], seed->conv_tail_bytes[il].data(), (size_t) row * row_size, row_size);
+            read_row(r_l[il], seed->conv_tail_bytes[il]);
         }
     }
-    const size_t prefix_limit = std::min<size_t>(3, s_l.size());
-    for (size_t il = 0; il < prefix_limit; ++il) {
-        if (s_l[il]) {
-            const size_t row_size = ggml_row_size(s_l[il]->type, s_l[il]->ne[0]);
-            seed->private_s_bytes[il].resize(row_size);
-            ggml_backend_tensor_get(s_l[il], seed->private_s_bytes[il].data(), (size_t) row * row_size, row_size);
+    for (size_t il = 0; il < s_l.size(); ++il) {
+        if (s_l[il] && !is_s_shared((int32_t) il)) {
+            read_row(s_l[il], seed->state_bytes[il]);
         }
+    }
+    if (backend_sched) {
+        ggml_backend_sched_synchronize(backend_sched);
     }
 
     return seed;
@@ -909,25 +1040,109 @@ std::shared_ptr<llama_memory_recurrent::hand_seed> llama_memory_recurrent::captu
 bool llama_memory_recurrent::apply_hand_seed(
         llama_seq_id dest_seq,
         const std::shared_ptr<hand_seed> & seed) {
-    if (!seed || dest_seq < 0 || (size_t) dest_seq >= tails.size() || tails[(size_t) dest_seq] < 0) {
+    if (!seed || seed->source_pos < 0 || dest_seq < 0 ||
+        (size_t) dest_seq >= tails.size()) {
         return false;
     }
 
-    const int32_t row = tails[(size_t) dest_seq];
-    for (size_t il = 0; il < seed->conv_tail_bytes.size() && il < r_l.size(); ++il) {
-        if (r_l[il] && !seed->conv_tail_bytes[il].empty()) {
-            const size_t row_size = ggml_row_size(r_l[il]->type, r_l[il]->ne[0]);
-            ggml_backend_tensor_set(r_l[il], seed->conv_tail_bytes[il].data(), (size_t) row * row_size, row_size);
+    int32_t row = tails[(size_t) dest_seq];
+    if (row < 0) {
+        for (uint32_t i = 0; i < size; ++i) {
+            const uint32_t candidate = (head + i) % size;
+            if (!cells[candidate].is_empty()) {
+                continue;
+            }
+            auto & cell = cells[candidate];
+            cell.pos = seed->source_pos;
+            cell.src = (int32_t) candidate;
+            cell.src0 = (int32_t) candidate;
+            cell.seq_id.insert(dest_seq);
+            tails[(size_t) dest_seq] = (int32_t) candidate;
+            row = (int32_t) candidate;
+            ++used;
+            head = (candidate + 1) % size;
+            break;
         }
     }
-    for (size_t il = 0; il < seed->private_s_bytes.size() && il < s_l.size(); ++il) {
-        if (s_l[il] && !seed->private_s_bytes[il].empty()) {
-            const size_t row_size = ggml_row_size(s_l[il]->type, s_l[il]->ne[0]);
-            ggml_backend_tensor_set(s_l[il], seed->private_s_bytes[il].data(), (size_t) row * row_size, row_size);
+    if (row < 0) {
+        return false;
+    }
+    auto write_row = [&](ggml_tensor * tensor, const std::vector<uint8_t> & bytes) {
+        const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+        if (bytes.size() != row_size) {
+            return false;
         }
+        ggml_backend_t backend = backend_sched
+            ? ggml_backend_sched_get_tensor_backend(backend_sched, tensor)
+            : nullptr;
+        if (backend) {
+            ggml_backend_tensor_set_async(
+                backend,
+                tensor,
+                bytes.data(),
+                (size_t) row * row_size,
+                row_size);
+        } else {
+            ggml_backend_tensor_set(
+                tensor,
+                bytes.data(),
+                (size_t) row * row_size,
+                row_size);
+        }
+        return true;
+    };
+
+    for (size_t il = 0; il < seed->conv_tail_bytes.size() && il < r_l.size(); ++il) {
+        if (r_l[il] && !seed->conv_tail_bytes[il].empty() &&
+            !write_row(r_l[il], seed->conv_tail_bytes[il])) {
+            return false;
+        }
+    }
+    std::vector<uint8_t> zero_row;
+    for (size_t il = 0; il < s_l.size(); ++il) {
+        if (is_s_shared((int32_t) il)) {
+            ggml_tensor * hand_echo = d_l[il];
+            const size_t row_size =
+                ggml_row_size(hand_echo->type, hand_echo->ne[0]);
+            zero_row.assign(row_size, 0);
+            if (!write_row(hand_echo, zero_row)) {
+                return false;
+            }
+        } else if (il < seed->state_bytes.size() &&
+                   s_l[il] &&
+                   !seed->state_bytes[il].empty() &&
+                   !write_row(s_l[il], seed->state_bytes[il])) {
+            return false;
+        }
+    }
+    if (backend_sched) {
+        ggml_backend_sched_synchronize(backend_sched);
     }
 
     return true;
+}
+
+size_t llama_memory_recurrent::rerot_hand_seed_size(llama_seq_id source_seq) const {
+    if (source_seq < 0 || (size_t) source_seq >= tails.size() ||
+        tails[(size_t) source_seq] < 0) {
+        return 0;
+    }
+
+    size_t total_bytes =
+        sizeof(uint32_t) * 3 + sizeof(llama_pos);
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        total_bytes += sizeof(uint32_t);
+        if (r_l[il]) {
+            total_bytes += ggml_row_size(r_l[il]->type, r_l[il]->ne[0]);
+        }
+    }
+    for (size_t il = 0; il < s_l.size(); ++il) {
+        total_bytes += sizeof(uint32_t);
+        if (s_l[il] && !is_s_shared((int32_t) il)) {
+            total_bytes += ggml_row_size(s_l[il]->type, s_l[il]->ne[0]);
+        }
+    }
+    return total_bytes;
 }
 
 bool llama_memory_recurrent::rerot_capture_hand_seed(llama_seq_id source_seq, std::vector<uint8_t> & seed_out) {
@@ -937,15 +1152,16 @@ bool llama_memory_recurrent::rerot_capture_hand_seed(llama_seq_id source_seq, st
         return false;
     }
 
-    const uint32_t magic = 0x53454544; // 'SEED'
+    const uint32_t magic = 0x32454553; // 'SEE2'
     const uint32_t n_conv = uint32_t(seed->conv_tail_bytes.size());
-    const uint32_t n_priv = uint32_t(seed->private_s_bytes.size());
+    const uint32_t n_state = uint32_t(seed->state_bytes.size());
 
-    size_t total_bytes = sizeof(magic) + sizeof(n_conv) + sizeof(n_priv);
+    size_t total_bytes =
+        sizeof(magic) + sizeof(seed->source_pos) + sizeof(n_conv) + sizeof(n_state);
     for (const auto & b : seed->conv_tail_bytes) {
         total_bytes += sizeof(uint32_t) + b.size();
     }
-    for (const auto & b : seed->private_s_bytes) {
+    for (const auto & b : seed->state_bytes) {
         total_bytes += sizeof(uint32_t) + b.size();
     }
 
@@ -956,13 +1172,19 @@ bool llama_memory_recurrent::rerot_capture_hand_seed(llama_seq_id source_seq, st
     };
 
     append_u32(magic);
+    const uint8_t * pos_bytes =
+        reinterpret_cast<const uint8_t *>(&seed->source_pos);
+    seed_out.insert(
+        seed_out.end(),
+        pos_bytes,
+        pos_bytes + sizeof(seed->source_pos));
     append_u32(n_conv);
     for (const auto & b : seed->conv_tail_bytes) {
         append_u32(uint32_t(b.size()));
         seed_out.insert(seed_out.end(), b.begin(), b.end());
     }
-    append_u32(n_priv);
-    for (const auto & b : seed->private_s_bytes) {
+    append_u32(n_state);
+    for (const auto & b : seed->state_bytes) {
         append_u32(uint32_t(b.size()));
         seed_out.insert(seed_out.end(), b.begin(), b.end());
     }
@@ -971,7 +1193,8 @@ bool llama_memory_recurrent::rerot_capture_hand_seed(llama_seq_id source_seq, st
 }
 
 bool llama_memory_recurrent::rerot_apply_hand_seed(llama_seq_id dest_seq, const std::vector<uint8_t> & seed_in) {
-    if (seed_in.size() < sizeof(uint32_t) * 3) {
+    if (seed_in.size() <
+        sizeof(uint32_t) * 3 + sizeof(llama_pos)) {
         return false;
     }
 
@@ -984,14 +1207,23 @@ bool llama_memory_recurrent::rerot_apply_hand_seed(llama_seq_id dest_seq, const 
     };
 
     uint32_t magic = 0;
-    if (!read_u32(magic) || magic != 0x53454544) {
+    if (!read_u32(magic) || magic != 0x32454553) {
         return false;
     }
+
+    auto seed = std::make_shared<hand_seed>();
+    if (offset + sizeof(seed->source_pos) > seed_in.size()) {
+        return false;
+    }
+    std::memcpy(
+        &seed->source_pos,
+        seed_in.data() + offset,
+        sizeof(seed->source_pos));
+    offset += sizeof(seed->source_pos);
 
     uint32_t n_conv = 0;
     if (!read_u32(n_conv)) return false;
 
-    auto seed = std::make_shared<hand_seed>();
     seed->conv_tail_bytes.resize(n_conv);
     for (uint32_t i = 0; i < n_conv; ++i) {
         uint32_t len = 0;
@@ -1001,15 +1233,17 @@ bool llama_memory_recurrent::rerot_apply_hand_seed(llama_seq_id dest_seq, const 
         offset += len;
     }
 
-    uint32_t n_priv = 0;
-    if (!read_u32(n_priv)) return false;
+    uint32_t n_state = 0;
+    if (!read_u32(n_state)) return false;
 
-    seed->private_s_bytes.resize(n_priv);
-    for (uint32_t i = 0; i < n_priv; ++i) {
+    seed->state_bytes.resize(n_state);
+    for (uint32_t i = 0; i < n_state; ++i) {
         uint32_t len = 0;
         if (!read_u32(len)) return false;
         if (offset + len > seed_in.size()) return false;
-        seed->private_s_bytes[i].assign(seed_in.data() + offset, seed_in.data() + offset + len);
+        seed->state_bytes[i].assign(
+            seed_in.data() + offset,
+            seed_in.data() + offset + len);
         offset += len;
     }
 
@@ -1021,216 +1255,14 @@ bool llama_memory_recurrent::rerot_commit_rbb_frontier(
         const llama_seq_id * candidate_seqs,
         const uint8_t * is_public_write,
         size_t n_candidates) {
-    if (!candidate_seqs || !is_public_write || n_candidates == 0) {
-        return false;
-    }
+    GGML_UNUSED(person_id);
+    GGML_UNUSED(candidate_seqs);
+    GGML_UNUSED(is_public_write);
 
-    std::vector<int32_t> candidate_rows;
-    std::vector<bool> public_flags;
-    candidate_rows.reserve(n_candidates);
-    public_flags.reserve(n_candidates);
-
-    for (size_t i = 0; i < n_candidates; ++i) {
-        const llama_seq_id seq = candidate_seqs[i];
-        if (seq >= 0 && (size_t) seq < tails.size() && tails[(size_t) seq] >= 0) {
-            candidate_rows.push_back(tails[(size_t) seq]);
-            public_flags.push_back(is_public_write[i] != 0);
-        }
-    }
-
-    if (candidate_rows.empty()) {
-        return true;
-    }
-
-    // Parallel Delta order-free block DeltaNet update (§14.1.2, §B.6)
-    return commit_rbb_frontier_parallel_delta(person_id, candidate_rows, public_flags);
-}
-
-bool llama_memory_recurrent::commit_rbb_frontier_parallel_delta(
-        uint32_t person_id,
-        const std::vector<int32_t> & candidate_hand_rows,
-        const std::vector<bool> & is_public_write,
-        const std::vector<float> & candidate_log_decays) {
-    if (candidate_hand_rows.empty() || candidate_hand_rows.size() != is_public_write.size()) {
-        return false;
-    }
-
-    std::vector<int32_t> valid_rows;
-    std::vector<float> valid_decays;
-    for (size_t i = 0; i < candidate_hand_rows.size(); ++i) {
-        if (is_public_write[i] && candidate_hand_rows[i] >= 0 && (uint32_t) candidate_hand_rows[i] < size) {
-            valid_rows.push_back(candidate_hand_rows[i]);
-            if (i < candidate_log_decays.size()) {
-                valid_decays.push_back(candidate_log_decays[i]);
-            } else {
-                valid_decays.push_back(0.0f);
-            }
-        }
-    }
-
-    if (valid_rows.empty()) {
-        return true;
-    }
-
-    const uint32_t b_cap = get_brain_capacity();
-    const uint32_t target_brain_row = b_cap > 0 ? (person_id % b_cap) : 0;
-
-    for (size_t il = 0; il < s_l.size(); ++il) {
-        ggml_tensor * s = s_l[il];
-        if (!s) {
-            continue;
-        }
-
-        const size_t row_size = ggml_row_size(s->type, s->ne[0]);
-        const size_t n_elem = s->ne[0];
-
-        // N = 1: exact identity with single candidate (§14.1.2)
-        if (valid_rows.size() == 1) {
-            const int32_t src_row = valid_rows[0];
-            if ((uint32_t) src_row != target_brain_row) {
-                std::vector<uint8_t> buf(row_size);
-                ggml_backend_tensor_get(s, buf.data(), (size_t) src_row * row_size, row_size);
-                ggml_backend_tensor_set(s, buf.data(), (size_t) target_brain_row * row_size, row_size);
-            }
-            continue;
-        }
-
-        if (s->type != GGML_TYPE_F32) {
-            // Fallback to mean for non-FP32
-            commit_rbb_frontier_mean(person_id, candidate_hand_rows, is_public_write);
-            continue;
-        }
-
-        const size_t N = valid_rows.size();
-
-        // Sort rows for strict deterministic permutation symmetry (§14.1.2)
-        std::vector<size_t> p(N);
-        for (size_t i = 0; i < N; ++i) p[i] = i;
-        std::sort(p.begin(), p.end(), [&](size_t a, size_t b) {
-            return valid_rows[a] < valid_rows[b];
-        });
-
-        // 1. Read S_old from target brain row
-        std::vector<float> S_old(n_elem);
-        ggml_backend_tensor_get(s, S_old.data(), (size_t) target_brain_row * row_size, row_size);
-
-        // Average log-decay: g_bar = mean(g_i), alpha = exp(g_bar)
-        float g_sum = 0.0f;
-        for (size_t i = 0; i < N; ++i) {
-            g_sum += valid_decays[p[i]];
-        }
-        const float g_bar = g_sum / float(N);
-        const float alpha = std::exp(std::min(0.0f, g_bar));
-
-        // S_bar = alpha * S_old
-        std::vector<float> S_bar(n_elem);
-        for (size_t k = 0; k < n_elem; ++k) {
-            S_bar[k] = alpha * S_old[k];
-        }
-
-        // 2. Read candidate rows and compute deltas: Delta_i = S_i - S_bar
-        std::vector<std::vector<float>> deltas(N, std::vector<float>(n_elem));
-        std::vector<float> row_buf(n_elem);
-        for (size_t i = 0; i < N; ++i) {
-            ggml_backend_tensor_get(s, row_buf.data(), (size_t) valid_rows[p[i]] * row_size, row_size);
-            for (size_t k = 0; k < n_elem; ++k) {
-                deltas[i][k] = row_buf[k] - S_bar[k];
-            }
-        }
-
-        // 3. Compute Gram matrix G_ij = <Delta_i, Delta_j>
-        std::vector<float> G(N * N, 0.0f);
-        for (size_t i = 0; i < N; ++i) {
-            for (size_t j = i; j < N; ++j) {
-                double dot = 0.0;
-                for (size_t k = 0; k < n_elem; ++k) {
-                    dot += double(deltas[i][k]) * double(deltas[j][k]);
-                }
-                G[i * N + j] = float(dot);
-                G[j * N + i] = float(dot);
-            }
-        }
-
-        // 4. Regularized solve: M = G + D + eps * I where D is ridge
-        std::vector<float> M = G;
-        const float eps = 1e-4f;
-        for (size_t i = 0; i < N; ++i) {
-            M[i * N + i] += eps * (1.0f + G[i * N + i]);
-        }
-
-        std::vector<float> b(N);
-        for (size_t i = 0; i < N; ++i) {
-            b[i] = G[i * N + i];
-        }
-
-        std::vector<float> w(N, 1.0f / float(N));
-        bool solve_ok = true;
-        // Gaussian elimination with partial pivoting for small N (N <= 16)
-        std::vector<float> A = M;
-        for (size_t i = 0; i < N; ++i) {
-            size_t max_row = i;
-            float max_val = std::abs(A[i * N + i]);
-            for (size_t r = i + 1; r < N; ++r) {
-                if (std::abs(A[r * N + i]) > max_val) {
-                    max_val = std::abs(A[r * N + i]);
-                    max_row = r;
-                }
-            }
-            if (max_val < 1e-7f) {
-                solve_ok = false;
-                break;
-            }
-            if (max_row != i) {
-                for (size_t c = i; c < N; ++c) std::swap(A[i * N + c], A[max_row * N + c]);
-                std::swap(b[i], b[max_row]);
-            }
-            const float pivot = A[i * N + i];
-            for (size_t r = i + 1; r < N; ++r) {
-                const float factor = A[r * N + i] / pivot;
-                for (size_t c = i; c < N; ++c) {
-                    A[r * N + c] -= factor * A[i * N + c];
-                }
-                b[r] -= factor * b[i];
-            }
-        }
-
-        if (solve_ok) {
-            for (int i = int(N) - 1; i >= 0; --i) {
-                float sum = b[size_t(i)];
-                for (size_t c = size_t(i) + 1; c < N; ++c) {
-                    sum -= A[size_t(i) * N + c] * w[c];
-                }
-                w[size_t(i)] = sum / A[size_t(i) * N + size_t(i)];
-            }
-        }
-
-        // Clamp weights to prevent extreme amplification
-        float total_w = 0.0f;
-        for (size_t i = 0; i < N; ++i) {
-            if (!std::isfinite(w[i]) || w[i] < 0.0f) w[i] = 0.0f;
-            if (w[i] > 1.0f) w[i] = 1.0f;
-            total_w += w[i];
-        }
-        if (total_w < 1e-6f) {
-            for (size_t i = 0; i < N; ++i) w[i] = 1.0f / float(N);
-        } else if (total_w > float(N)) {
-            const float scale = float(N) / total_w;
-            for (size_t i = 0; i < N; ++i) w[i] *= scale;
-        }
-
-        // 5. Commit S' = S_bar + sum_i w_i * Delta_i
-        std::vector<float> S_prime = S_bar;
-        for (size_t i = 0; i < N; ++i) {
-            const float weight = w[i];
-            for (size_t k = 0; k < n_elem; ++k) {
-                S_prime[k] += weight * deltas[i][k];
-            }
-        }
-
-        ggml_backend_tensor_set(s, S_prime.data(), (size_t) target_brain_row * row_size, row_size);
-    }
-
-    return true;
+    // Shared-S candidates are reduced and committed by the compute graph,
+    // before llama_decode() completes. The server frontier hook remains as an
+    // atomicity check but performs no host readback or backend synchronization.
+    return n_candidates > 0;
 }
 
 uint32_t llama_memory_recurrent::get_recurrent_seq_used(llama_seq_id seq_id) const {
@@ -1268,6 +1300,18 @@ size_t llama_memory_recurrent::size_s_bytes() const {
     }
 
     return size_s_bytes;
+}
+
+size_t llama_memory_recurrent::size_d_bytes() const {
+    size_t size_d_bytes = 0;
+
+    for (const auto & d : d_l) {
+        if (d != nullptr) {
+            size_d_bytes += ggml_nbytes(d);
+        }
+    }
+
+    return size_d_bytes;
 }
 
 void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
@@ -1775,12 +1819,117 @@ uint32_t llama_memory_recurrent_context::get_size() const {
     return mem->size;
 }
 
+uint32_t llama_memory_recurrent_context::get_brain_size() const {
+    return mem->is_grouped_layout() ? 2 * mem->n_brain_rows : mem->size;
+}
+
+bool llama_memory_recurrent_context::is_grouped() const {
+    return mem->is_grouped_layout();
+}
+
 ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {
     return mem->r_l[il];
 }
 
 ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
     return mem->s_l[il];
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_d_l(int32_t il) const {
+    return mem->d_l[il];
+}
+
+bool llama_memory_recurrent_context::is_s_shared(int32_t il) const {
+    return mem->is_s_shared(il);
+}
+
+int32_t llama_memory_recurrent_context::brain_copy(int i) const {
+    if (!mem->is_grouped_layout() || is_full) {
+        return s_copy(i);
+    }
+
+    const auto & ubatch = get_ubatch();
+    if (i < 0 || (uint32_t) i >= ubatch.n_seqs) {
+        return -1;
+    }
+    const uint32_t token_index = (uint32_t) i * ubatch.n_seq_tokens;
+    const llama_seq_id seq_id = ubatch.seq_id[token_index][0];
+    int32_t row = mem->brain_row_for_seq(seq_id);
+    if (row < 0) {
+        return -1;
+    }
+
+    const bool private_planner =
+        mem->seq_episode[(size_t) seq_id] != 0 &&
+        mem->seq_public_write[(size_t) seq_id] == 0 &&
+        mem->seq_node[(size_t) seq_id] == 0;
+    if (private_planner) {
+        row += (int32_t) mem->n_brain_rows;
+    }
+
+    const uint32_t snapshot =
+        seq_id >= 0 && (size_t) seq_id < mem->rs_idx.size()
+            ? mem->rs_idx[(size_t) seq_id]
+            : 0;
+    if (snapshot == 0 || private_planner) {
+        return row;
+    }
+    return (int32_t) (
+        2 * mem->n_brain_rows +
+        (snapshot - 1) * mem->n_brain_rows +
+        (uint32_t) row);
+}
+
+bool llama_memory_recurrent_context::is_public_write(int i) const {
+    if (!mem->is_grouped_layout() || is_full) {
+        return false;
+    }
+    const auto & ubatch = get_ubatch();
+    if (i < 0 || (uint32_t) i >= ubatch.n_seqs) {
+        return false;
+    }
+    const uint32_t token_index = (uint32_t) i * ubatch.n_seq_tokens;
+    const llama_seq_id seq_id = ubatch.seq_id[token_index][0];
+    if (seq_id < 0 || (size_t) seq_id >= mem->seq_public_write.size()) {
+        return false;
+    }
+
+    // Before an episode write tag exists this is ordinary causal recurrence
+    // (including the root prompt prefill), so its single writer must commit.
+    return mem->seq_episode[(size_t) seq_id] == 0 ||
+        mem->seq_public_write[(size_t) seq_id] != 0;
+}
+
+std::map<int32_t, std::vector<int32_t>>
+llama_memory_recurrent_context::public_brain_groups() const {
+    std::map<int32_t, std::vector<int32_t>> result;
+    if (!mem->is_grouped_layout() || is_full) {
+        return result;
+    }
+    const auto & ubatch = get_ubatch();
+    for (uint32_t i = 0; i < ubatch.n_seqs; ++i) {
+        const uint32_t token_index = i * ubatch.n_seq_tokens;
+        const llama_seq_id seq_id = ubatch.seq_id[token_index][0];
+        const int32_t base_row = mem->brain_row_for_seq(seq_id);
+        if (base_row < 0) {
+            continue;
+        }
+
+        if (mem->seq_episode[(size_t) seq_id] == 0) {
+            // Keep a ready private planner snapshot without a D2H/H2D copy at
+            // episode start.
+            result[base_row].push_back((int32_t) i);
+            result[(int32_t) mem->n_brain_rows + base_row].push_back((int32_t) i);
+        } else if (mem->seq_public_write[(size_t) seq_id] != 0) {
+            // Every public writer belongs to the person's shared frontier,
+            // including child workers. Restricting this to node zero silently
+            // turned all parallel lanes into isolated recurrent decoders.
+            result[base_row].push_back((int32_t) i);
+        } else if (mem->seq_node[(size_t) seq_id] == 0) {
+            result[(int32_t) mem->n_brain_rows + base_row].push_back((int32_t) i);
+        }
+    }
+    return result;
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {

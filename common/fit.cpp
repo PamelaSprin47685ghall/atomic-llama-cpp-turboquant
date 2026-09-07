@@ -1333,6 +1333,7 @@ common_rerot_fit_result common_fit_rerot_capacities(
         test.n_pen_max = p;
         test.n_seq_recurrent = b;
         test.n_seq_max = LLAMA_MAX_SEQ;
+        test.n_outputs_max = std::max(1u, p * (1u + test.n_rs_seq));
 
         common_device_memory_data_vec data;
         try {
@@ -1351,9 +1352,16 @@ common_rerot_fit_result common_fit_rerot_capacities(
         if (extra_cparams != nullptr) {
             llama_context_params extra = *extra_cparams;
             extra.n_ctx_kv = k_val;
-            extra.n_person_max = b;
-            extra.n_pen_max = p;
-            extra.n_seq_recurrent = b;
+            // The speculative context owns only live execution sequences. It
+            // never stores the RERoT document's parked logical sequence IDs,
+            // brains, or pens. Giving it LLAMA_MAX_SEQ forces output_reserve()
+            // to allocate one vocabulary row for thousands of nonexistent
+            // draft readers and incorrectly collapses the fitted pen arena.
+            extra.n_seq_max = std::max(1u, p);
+            extra.n_outputs_max = std::max(1u, p);
+            extra.n_person_max = 0;
+            extra.n_pen_max = 0;
+            extra.n_seq_recurrent = std::max(1u, p);
             uint32_t extra_ngl = 0;
             uint32_t extra_n_ctx_train = 0;
             uint32_t extra_n_expert = 0;

@@ -2566,7 +2566,20 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-        cparams.n_seq_recurrent = llama_n_seq_recurrent(ctx_tgt);
+        // A draft context addresses physical execution slots only. RERoT's
+        // target context needs LLAMA_MAX_SEQ for parked document nodes, but
+        // mirroring that logical arena here would reserve thousands of unused
+        // vocabulary output rows and recurrent states.
+        const uint32_t n_draft_seq = std::max(
+            1u,
+            params.rerot_enabled
+                ? params.rerot_pen_max
+                : static_cast<uint32_t>(std::max(1, params.n_parallel)));
+        cparams.n_seq_max = n_draft_seq;
+        cparams.n_outputs_max = n_draft_seq;
+        cparams.n_seq_recurrent = n_draft_seq;
+        cparams.n_person_max = 0;
+        cparams.n_pen_max = 0;
         cparams.type_k   = params.cache_type_k;
         cparams.type_v   = params.cache_type_v;
     }

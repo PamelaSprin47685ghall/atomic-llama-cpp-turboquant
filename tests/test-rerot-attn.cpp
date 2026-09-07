@@ -896,9 +896,11 @@ static void test_vulkan_indexed_parity() {
     constexpr int lnkv = 257;
     constexpr int lng = 3;
     constexpr int lnq = 2;
-    std::vector<float> lq(size_t(td) * lng * thq);
-    std::vector<float> lk(size_t(td) * lnkv * thkv);
-    std::vector<float> lv(size_t(tdv) * lnkv * thkv);
+    constexpr int lhq = 16;
+    constexpr int lhkv = 2;
+    std::vector<float> lq(size_t(td) * lng * lhq);
+    std::vector<float> lk(size_t(td) * lnkv * lhkv);
+    std::vector<float> lv(size_t(tdv) * lnkv * lhkv);
     for (size_t i = 0; i < lq.size(); ++i) lq[i] = std::sin(float(i + 7) * 0.007f);
     for (size_t i = 0; i < lk.size(); ++i) lk[i] = std::cos(float(i + 11) * 0.009f);
     for (size_t i = 0; i < lv.size(); ++i) lv[i] = std::sin(float(i + 13) * 0.011f);
@@ -915,10 +917,10 @@ static void test_vulkan_indexed_parity() {
     }
     const std::vector<int32_t> loffsets = { 0, lnkv, 2 * lnkv };
     const auto lcpu = run_indexed_op(
-        td, tdv, lng, lnkv, thq, thkv, lnq, lq, lk, lv, lentries, loffsets,
+        td, tdv, lng, lnkv, lhq, lhkv, lnq, lq, lk, lv, lentries, loffsets,
         tscale, nullptr, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0);
     const auto lgpu = run_indexed_op(
-        td, tdv, lng, lnkv, thq, thkv, lnq, lq, lk, lv, lentries, loffsets,
+        td, tdv, lng, lnkv, lhq, lhkv, lnq, lq, lk, lv, lentries, loffsets,
         tscale, backend, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0);
     CHECK(lcpu.size() == lgpu.size());
     if (lcpu.size() == lgpu.size()) {
@@ -1114,6 +1116,279 @@ static void test_ragged_multi_reader_grouped_attention() {
     }
 }
 
+static void test_vulkan_parallel_delta_gdn(int N, bool correlated) {
+    std::puts("--- Vulkan RERoT Parallel Delta GDN ---");
+
+    ggml_backend_load_all();
+    ggml_backend_dev_t device =
+        ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!device) {
+        std::puts("SKIP: no GPU backend for Parallel Delta GDN");
+        return;
+    }
+    ggml_backend_t backend = ggml_backend_dev_init(device, nullptr);
+    CHECK(backend != nullptr);
+    if (!backend) {
+        return;
+    }
+
+    constexpr int D = 128;
+    constexpr int H = 1;
+    std::vector<float> q((size_t) D * H * N, 0.0f);
+    std::vector<float> k((size_t) D * H * N, 0.0f);
+    std::vector<float> v((size_t) D * H * N, 0.0f);
+    std::vector<float> g((size_t) H * N);
+    std::vector<float> beta((size_t) H * N);
+    std::vector<float> state((size_t) D * D * H);
+
+    for (int seq = 0; seq < N; ++seq) {
+        q[(size_t) seq * D + seq] = 1.0f;
+        k[(size_t) seq * D + seq] = 1.0f;
+        g[seq] = -0.1f * float(seq + 1);
+        beta[seq] = 0.3f + 0.1f * float(seq % 6);
+        if (correlated) {
+            double norm = 0.0;
+            for (int row = 0; row < D; ++row) {
+                const float value = 0.8f + std::sin(float((seq + 1) * (row + 3)) * 0.17f);
+                k[(size_t) seq * D + row] = value;
+                q[(size_t) seq * D + row] = std::cos(float(seq + row) * 0.11f) / std::sqrt(float(D));
+                norm += double(value) * value;
+            }
+            for (int row = 0; row < D; ++row) {
+                k[(size_t) seq * D + row] /= std::sqrt(norm);
+            }
+        }
+        for (int col = 0; col < D; ++col) {
+            v[(size_t) seq * D + col] =
+                0.01f * float(1 + col) + 0.2f * float(seq);
+        }
+    }
+    for (int col = 0; col < D; ++col) {
+        for (int row = 0; row < D; ++row) {
+            const float value =
+                0.0001f * float(1 + row + 2 * col);
+            state[(size_t) col * D + row] = value;
+        }
+    }
+
+    // Exact regularized Parallel DeltaNet block update. The GPU solves the
+    // same state-column system with matrix-free preconditioned CG; pivoted
+    // elimination supplies an independent numerical reference.
+    std::vector<float> expected_state((size_t) D * D, 0.0f);
+    std::vector<double> expected_output((size_t) D * N, 0.0);
+    std::vector<float> expected_hand((size_t) D * D * N, 0.0f);
+    double mean_log_decay = 0.0;
+    for (int seq = 0; seq < N; ++seq) {
+        mean_log_decay += g[seq];
+    }
+    const double base_alpha = std::exp(mean_log_decay / N);
+
+    for (int col = 0; col < D; ++col) {
+        std::vector<double> rhs((size_t) N, 0.0);
+        for (int seq = 0; seq < N; ++seq) {
+            double projected = 0.0;
+            for (int row = 0; row < D; ++row) {
+                projected += base_alpha *
+                    state[(size_t) col * D + row] *
+                    k[(size_t) seq * D + row];
+            }
+            rhs[(size_t) seq] =
+                v[(size_t) seq * D + col] - projected;
+        }
+
+        std::vector<double> weights((size_t) N, 0.0);
+        if (N == 1) {
+            // Strict native-recurrence degeneration; no epsilon perturbation.
+            weights[0] = beta[0] * rhs[0];
+        } else {
+            std::vector<double> matrix((size_t) N * N, 0.0);
+            for (int i = 0; i < N; ++i) {
+                for (int j = i; j < N; ++j) {
+                    double dot = 0.0;
+                    for (int row = 0; row < D; ++row) {
+                        dot += k[(size_t) i * D + row] *
+                            k[(size_t) j * D + row];
+                    }
+                    matrix[(size_t) i * N + j] = dot;
+                    matrix[(size_t) j * N + i] = dot;
+                }
+                matrix[(size_t) i * N + i] +=
+                    (1.0 - beta[i]) / beta[i] + 1.0e-4;
+            }
+
+            std::vector<double> solve_rhs = rhs;
+            bool solve_ok = true;
+            for (int i = 0; i < N; ++i) {
+                int pivot_row = i;
+                double pivot_abs =
+                    std::abs(matrix[(size_t) i * N + i]);
+                for (int row = i + 1; row < N; ++row) {
+                    const double candidate =
+                        std::abs(matrix[(size_t) row * N + i]);
+                    if (candidate > pivot_abs) {
+                        pivot_abs = candidate;
+                        pivot_row = row;
+                    }
+                }
+                if (pivot_abs < 1.0e-12) {
+                    solve_ok = false;
+                    break;
+                }
+                if (pivot_row != i) {
+                    for (int column = i; column < N; ++column) {
+                        std::swap(
+                            matrix[(size_t) i * N + column],
+                            matrix[(size_t) pivot_row * N + column]);
+                    }
+                    std::swap(
+                        solve_rhs[(size_t) i],
+                        solve_rhs[(size_t) pivot_row]);
+                }
+                const double pivot = matrix[(size_t) i * N + i];
+                for (int row = i + 1; row < N; ++row) {
+                    const double factor =
+                        matrix[(size_t) row * N + i] / pivot;
+                    for (int column = i; column < N; ++column) {
+                        matrix[(size_t) row * N + column] -=
+                            factor * matrix[(size_t) i * N + column];
+                    }
+                    solve_rhs[(size_t) row] -=
+                        factor * solve_rhs[(size_t) i];
+                }
+            }
+            if (solve_ok) {
+                for (int i = N - 1; i >= 0; --i) {
+                    double value = solve_rhs[(size_t) i];
+                    for (int column = i + 1; column < N; ++column) {
+                        value -= matrix[(size_t) i * N + column] *
+                            weights[(size_t) column];
+                    }
+                    weights[(size_t) i] =
+                        value / matrix[(size_t) i * N + i];
+                }
+            }
+        }
+
+        std::vector<double> native_delta((size_t) N, 0.0);
+        for (int seq = 0; seq < N; ++seq) {
+            const double alpha = std::exp(double(g[seq]));
+            double projected = 0.0;
+            for (int row = 0; row < D; ++row) {
+                projected += alpha *
+                    state[(size_t) col * D + row] *
+                    k[(size_t) seq * D + row];
+            }
+            native_delta[(size_t) seq] = beta[seq] *
+                (v[(size_t) seq * D + col] - projected);
+        }
+
+        for (int row = 0; row < D; ++row) {
+            double merged =
+                base_alpha * state[(size_t) col * D + row];
+            for (int seq = 0; seq < N; ++seq) {
+                merged += k[(size_t) seq * D + row] *
+                    weights[(size_t) seq];
+            }
+            expected_state[(size_t) col * D + row] = float(merged);
+            for (int seq = 0; seq < N; ++seq) {
+                const double candidate =
+                    std::exp(double(g[seq])) *
+                    state[(size_t) col * D + row] +
+                    k[(size_t) seq * D + row] *
+                    native_delta[(size_t) seq];
+                expected_output[(size_t) seq * D + col] +=
+                    candidate * q[(size_t) seq * D + row] /
+                    std::sqrt(double(D));
+                expected_hand[
+                    ((size_t) seq * D + col) * D + row] =
+                    float(candidate - merged);
+            }
+        }
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr(ggml_init(params));
+    ggml_context * ctx = ctx_ptr.get();
+    ggml_tensor * tq = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, H, 1, N);
+    ggml_tensor * tk = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, H, 1, N);
+    ggml_tensor * tv = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, H, 1, N);
+    ggml_tensor * tg = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, N);
+    ggml_tensor * tb = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, N);
+    ggml_tensor * ts = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, D, H, 1);
+    ggml_tensor * tn = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, D, H, N);
+    ggml_tensor * out =
+        ggml_gated_delta_net_rbb(ctx, tq, tk, tv, tg, tb, ts, tn);
+
+    CHECK(ggml_backend_supports_op(backend, out));
+    ggml_backend_buffer_ptr buffer(
+        ggml_backend_alloc_ctx_tensors(ctx, backend));
+    CHECK(buffer != nullptr);
+    if (!buffer) {
+        ggml_backend_free(backend);
+        return;
+    }
+
+    ggml_backend_tensor_set(tq, q.data(), 0, q.size() * sizeof(float));
+    ggml_backend_tensor_set(tk, k.data(), 0, k.size() * sizeof(float));
+    ggml_backend_tensor_set(tv, v.data(), 0, v.size() * sizeof(float));
+    ggml_backend_tensor_set(tg, g.data(), 0, g.size() * sizeof(float));
+    ggml_backend_tensor_set(tb, beta.data(), 0, beta.size() * sizeof(float));
+    ggml_backend_tensor_set(ts, state.data(), 0, state.size() * sizeof(float));
+    for (int seq = 0; seq < N; ++seq) {
+        ggml_backend_tensor_set(
+            tn,
+            state.data(),
+            (size_t) seq * state.size() * sizeof(float),
+            state.size() * sizeof(float));
+    }
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 32, false);
+    ggml_build_forward_expand(graph, out);
+    CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_synchronize(backend);
+
+    const size_t state_offset = (size_t) D * H * N;
+    const size_t hand_offset = state_offset + expected_state.size();
+    std::vector<float> actual(
+        hand_offset + expected_hand.size());
+    ggml_backend_tensor_get(
+        out, actual.data(), 0, actual.size() * sizeof(float));
+
+    float state_error = 0.0f;
+    float output_error = 0.0f;
+    float hand_error = 0.0f;
+    for (size_t i = 0; i < expected_state.size(); ++i) {
+        state_error = std::max(
+            state_error, std::abs(actual[state_offset + i] - expected_state[i]));
+    }
+    for (int seq = 0; seq < N; ++seq) {
+        for (int col = 0; col < D; ++col) {
+            const size_t index = (size_t) seq * D + col;
+            output_error = std::max(
+                output_error,
+                float(std::abs(actual[index] - expected_output[index])));
+        }
+    }
+    for (size_t i = 0; i < expected_hand.size(); ++i) {
+        hand_error = std::max(
+            hand_error,
+            std::abs(actual[hand_offset + i] - expected_hand[i]));
+    }
+    CHECK(state_error < 2e-4f);
+    CHECK(output_error < 2e-5f);
+    CHECK(hand_error < 2e-4f);
+    std::printf(
+        "Parallel Delta GDN N=%d correlated=%d state error = %.9g, output error = %.9g, hand error = %.9g\n",
+        N, correlated, state_error, output_error, hand_error);
+
+    buffer.reset();
+    ggml_backend_free(backend);
+}
+
 int main() {
     std::puts("=== RERoT indexed attention test ===");
     test_indexed_basic();
@@ -1122,6 +1397,11 @@ int main() {
     test_vulkan_indexed_parity();
     test_cpu_helper_matches_op();
     test_ragged_multi_reader_grouped_attention();
+    test_vulkan_parallel_delta_gdn(1, false);
+    test_vulkan_parallel_delta_gdn(3, false);
+    test_vulkan_parallel_delta_gdn(12, true);
+    test_vulkan_parallel_delta_gdn(32, true);
+    test_vulkan_parallel_delta_gdn(64, true);
     std::printf("=== Results: %d failure(s) ===\n", failures);
     return failures == 0 ? 0 : 1;
 }

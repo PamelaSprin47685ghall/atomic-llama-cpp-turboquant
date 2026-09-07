@@ -22,6 +22,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                 ggml_type   type_r,
                 ggml_type   type_s,
                  uint32_t   rs_size,
+                 uint32_t   n_brain_max,
+                 uint32_t   n_hand_max,
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
@@ -58,6 +60,8 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         rs_size,
         unified ? LLAMA_MAX_SEQ : n_seq_max,
         n_rs_seq,
+        n_brain_max,
+        n_hand_max,
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
@@ -210,11 +214,23 @@ void llama_memory_hybrid_iswa::seq_cp_recurrent(
 bool llama_memory_hybrid_iswa::rerot_set_write_tag(
         llama_seq_id seq_id,
         const llama_kv_rerot_meta & tag) {
-    return mem_attn->rerot_set_write_tag(seq_id, tag);
+    if (!mem_recr->rerot_set_write_tag(seq_id, tag)) {
+        return false;
+    }
+    if (!mem_attn->rerot_set_write_tag(seq_id, tag)) {
+        mem_recr->rerot_clear_write_tag(seq_id);
+        return false;
+    }
+    return true;
 }
 
 void llama_memory_hybrid_iswa::rerot_clear_write_tag(llama_seq_id seq_id) {
     mem_attn->rerot_clear_write_tag(seq_id);
+    mem_recr->rerot_clear_write_tag(seq_id);
+}
+
+void llama_memory_hybrid_iswa::rerot_release_episode(uint64_t episode_id) {
+    mem_recr->rerot_release_episode(episode_id);
 }
 
 bool llama_memory_hybrid_iswa::rerot_can_publish_run(

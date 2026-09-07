@@ -2082,6 +2082,11 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
+    const uint32_t recurrent_size =
+        cparams.rerot_enabled && cparams.n_pen_max > 0
+            ? cparams.n_pen_max
+            : cparams.n_seq_recurrent;
+
     switch (arch) {
         // Models that need specific instantiation should be handled in the
         // switch statement
@@ -2266,9 +2271,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             GGML_TYPE_F32,
                             GGML_TYPE_F32,
                             cparams.offload_kqv,
-                            cparams.n_seq_recurrent,
+                            recurrent_size,
                             cparams.n_seq_max,
                             cparams.n_rs_seq,
+                            cparams.n_person_max,
+                            cparams.n_pen_max,
                             nullptr);
                 } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen) {
                     // The main difference between hybrid architectures is the
@@ -2308,7 +2315,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
                             /* recurrent_type_s  */ GGML_TYPE_F32,
-                            /* recurrent_rs_size */ cparams.n_seq_recurrent,
+                            /* recurrent_rs_size */ recurrent_size,
+                            /* recurrent_brains */ cparams.n_person_max,
+                            /* recurrent_hands  */ cparams.n_pen_max,
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
                             /* offload           */ cparams.offload_kqv,
@@ -2327,7 +2336,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
                             /* recurrent_type_v  */ GGML_TYPE_F32,
-                            /* recurrent_kv_size */ cparams.n_seq_recurrent,
+                            /* recurrent_kv_size */ recurrent_size,
+                            /* recurrent_brains */ cparams.n_person_max,
+                            /* recurrent_hands  */ cparams.n_pen_max,
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
                             /* offload           */ cparams.offload_kqv,
@@ -2436,6 +2447,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
                 }
             }
+    }
+
+    if (res != nullptr && cparams.rerot_enabled &&
+        cparams.n_person_max > 0 && cparams.n_pen_max > 0) {
+        res->set_grouped_layout(cparams.n_person_max, cparams.n_pen_max);
     }
 
     return res;

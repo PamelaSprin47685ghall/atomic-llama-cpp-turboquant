@@ -96,6 +96,14 @@ struct llama_memory_i {
 
     virtual ~llama_memory_i() = default;
 
+    void set_backend_sched(ggml_backend_sched_t sched) {
+        backend_sched = sched;
+    }
+
+protected:
+    ggml_backend_sched_t backend_sched = nullptr;
+
+public:
     // split the input batch into a set of ubatches and verify that they can fit into the cache
     // return a context object containing the ubatches and memory state required to process them
     // check the llama_memory_context_i::get_status() for the result
@@ -122,7 +130,11 @@ struct llama_memory_i {
     virtual uint32_t get_recurrent_used()     const { return 0; }
     virtual uint32_t get_recurrent_seq_used(llama_seq_id seq_id) const { GGML_UNUSED(seq_id); return 0; }
 
-    // RERoT grouped layout queries (§§B.3.2, B.6, B.13 Phase 3)
+    // RERoT grouped layout (§§B.3.2, B.6, B.13 Phase 3).
+    virtual void set_grouped_layout(uint32_t n_brains, uint32_t n_hands) {
+        GGML_UNUSED(n_brains);
+        GGML_UNUSED(n_hands);
+    }
     virtual uint32_t get_brain_capacity() const { return get_recurrent_capacity(); }
     virtual uint32_t get_hand_capacity()  const { return get_recurrent_capacity(); }
     virtual uint32_t get_brain_used()     const { return get_recurrent_used(); }
@@ -186,6 +198,9 @@ struct llama_memory_i {
     }
     virtual void rerot_clear_write_tag(llama_seq_id seq_id) {
         GGML_UNUSED(seq_id);
+    }
+    virtual void rerot_release_episode(uint64_t episode_id) {
+        GGML_UNUSED(episode_id);
     }
     virtual bool rerot_can_publish_run(
             uint64_t episode_id,
@@ -269,6 +284,10 @@ struct llama_memory_i {
     }
 
     // Shared fork hand seed (§16.1, §16.4, §B.6.4)
+    virtual size_t rerot_hand_seed_size(llama_seq_id source_seq) const {
+        GGML_UNUSED(source_seq);
+        return 0;
+    }
     virtual bool rerot_capture_hand_seed(llama_seq_id source_seq, std::vector<uint8_t> & seed_out) {
         GGML_UNUSED(source_seq);
         GGML_UNUSED(seed_out);

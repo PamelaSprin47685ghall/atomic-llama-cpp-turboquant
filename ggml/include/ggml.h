@@ -2626,6 +2626,20 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    // RERoT Parallel Delta: concurrent PUBLIC writers advance one shared brain
+    // through the regularized (K K^T + D + eps I) block update. native_state
+    // preserves each Lane's causal readout and the result carries its residual
+    // against the committed brain. N=1 preserves native recurrence exactly.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_rbb(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * brain_state,
+            struct ggml_tensor  * native_state);
+
     // TurboQuant Walsh-Hadamard Transform (O(d log d) rotation for KV cache compression)
     // Applies WHT rotation to 128-element groups along ne[0]: sign1 → butterfly → sign2 → normalize
     // direction: 0 = forward (signs1 → WHT → signs2), 1 = inverse (signs2 → WHT → signs1)

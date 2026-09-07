@@ -32,6 +32,8 @@ public:
                 ggml_type   type_r,
                 ggml_type   type_s,
                  uint32_t   rs_size,
+                 uint32_t   n_brain_max,
+                 uint32_t   n_hand_max,
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
@@ -66,6 +68,11 @@ public:
     uint32_t get_recurrent_used()     const override;
     uint32_t get_recurrent_seq_used(llama_seq_id seq_id) const override;
 
+    void set_grouped_layout(uint32_t n_brains, uint32_t n_hands) override {
+        if (mem_recr) {
+            mem_recr->set_grouped_layout(n_brains, n_hands);
+        }
+    }
     uint32_t get_brain_capacity() const override { return mem_recr ? mem_recr->get_brain_capacity() : 0; }
     uint32_t get_hand_capacity()  const override { return mem_recr ? mem_recr->get_hand_capacity()  : 0; }
     uint32_t get_brain_used()     const override { return mem_recr ? mem_recr->get_brain_used()     : 0; }
@@ -86,6 +93,7 @@ public:
 
     bool rerot_set_write_tag(llama_seq_id seq_id, const llama_kv_rerot_meta & tag) override;
     void rerot_clear_write_tag(llama_seq_id seq_id) override;
+    void rerot_release_episode(uint64_t episode_id) override;
     bool rerot_can_publish_run(uint64_t episode_id, llama_rerot_run_id run_id, size_t * count) const override;
     bool rerot_can_reclassify_run(uint64_t episode_id, llama_rerot_run_id run_id,
         llama_rerot_visibility expected, llama_rerot_visibility replacement,
@@ -100,6 +108,7 @@ public:
     bool rerot_set_reader_view(llama_seq_id seq_id, const llama_rerot_reader_state & view) override;
     void rerot_clear_reader_view(llama_seq_id seq_id) override;
 
+    size_t rerot_hand_seed_size(llama_seq_id source_seq) const override;
     bool rerot_capture_hand_seed(llama_seq_id source_seq, std::vector<uint8_t> & seed_out) override;
     bool rerot_apply_hand_seed(llama_seq_id dest_seq, const std::vector<uint8_t> & seed_in) override;
     bool rerot_commit_rbb_frontier(

@@ -7222,7 +7222,6 @@ static void test_rerot_stream_preserves_tool_calls() {
 
     server_task_result_cmpl_partial first;
     first.is_rerot_content = true;
-    first.rerot_parse_prefix = "</think>\n\n";
     first.content =
         R"(<tool_call>[{"name":"special_function","arguments":{"arg1":)";
     first.update(state);
@@ -7230,7 +7229,6 @@ static void test_rerot_stream_preserves_tool_calls() {
 
     server_task_result_cmpl_partial second;
     second.is_rerot_content = true;
-    second.rerot_parse_prefix = "</think>\n\n";
     second.content = R"(1}}]</tool_call>)";
     second.update(state);
     collect_content(second.oaicompat_msg_diffs);
@@ -7238,12 +7236,13 @@ static void test_rerot_stream_preserves_tool_calls() {
     server_task_result_cmpl_final final;
     final.stream = true;
     final.rerot_explicit_channels = true;
-    final.rerot_parse_prefix = "</think>\n\n";
     final.update(state);
     collect_content(final.oaicompat_msg_diffs);
 
     assert_not_contains(leaked_content, "<tool_call>");
-    assert_equals(std::string("lane reasoning\n"), final.oaicompat_msg.reasoning_content);
+    assert_equals(
+        std::string("lane reasoning\n"),
+        final.oaicompat_msg.reasoning_content);
     assert_equals(std::string(), final.oaicompat_msg.content);
     assert_equals(size_t(1), final.oaicompat_msg.tool_calls.size());
     assert_equals(

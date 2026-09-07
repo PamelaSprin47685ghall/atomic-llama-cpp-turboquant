@@ -96,7 +96,6 @@ json format_error_response(const std::string & message, const enum error_type ty
 // random string / id
 //
 
-std::string random_string();
 std::string gen_chatcmplid();
 std::string gen_tool_call_id();
 

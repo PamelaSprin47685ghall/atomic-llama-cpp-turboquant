@@ -370,15 +370,17 @@ vec4 rerot_load_v(const in uint key, const in uint dvec, const in uint v_stride,
     return vec4(dequantize4(coord / BLOCK_SIZE_V, coord % BLOCK_SIZE_V, v_offset, BINDING_IDX_V));
 }
 
-// Shmem sized for the host-enforced single-row config: one staged Q row, one
-// staged K/V block reused for K then V, plus reduction scratch.
+// Br is the number of GQA heads sharing a staged K/V tile. Br=1 retains
+// the generic scalar path and its workgroup-wide reduction scratch.
 const uint32_t REROT_Q_WORDS = HSK / 4u + 1u;
 const uint32_t REROT_D = HSK > HSV ? HSK : HSV;
 const uint32_t REROT_KV_STRIDE = REROT_D / 4u + 1u;
 const uint32_t REROT_NUM_SUBGROUPS = SubGroupSize == 0u ? 0u : WorkGroupSize / SubGroupSize;
 const uint32_t REROT_COL_GROUPS = WorkGroupSize / D_split;
+const uint32_t REROT_GROUPED_COLS = SubGroupSize >= D_split ? SubGroupSize / D_split : 1u;
 const uint32_t REROT_HSV4_PER_THREAD = (HSV / 4u + D_split - 1u) / D_split;
-shared vec4 rerot_qf[REROT_Q_WORDS];
+shared vec4 rerot_qf[Br * REROT_Q_WORDS];
+shared uint rerot_run_end;
 shared vec4 rerot_kvsh[SHMEM_STAGING != 0 ? Bc * REROT_KV_STRIDE : 1];
 shared float rerot_tmpsh[WorkGroupSize];
 shared vec4 rerot_tmpv4[WorkGroupSize];
@@ -392,6 +394,195 @@ const uint32_t REROT_MAXC = (Bc + REROT_COL_GROUPS - 1u) / REROT_COL_GROUPS;
 // the ordinary path's convention.
 const float REROT_NEG = -1.7014117e38;
 
+// One subgroup owns one Q head; the whole workgroup stages each K/V tile
+// once for every head in the group. Per-head accumulators stay in registers.
+void rerot_grouped_main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint local_h = gl_SubgroupID;
+    const uint S = max(p.k_num, 1u);
+    const uint q = gl_WorkGroupID.x / S;
+    const uint split = gl_WorkGroupID.x % S;
+    const uint h_base = gl_WorkGroupID.y * Br;
+    const uint h = h_base + local_h;
+    if (q >= p.N || h_base >= p.neq2) {
+        return;
+    }
+    const uint d_tid = lane % D_split;
+    const uint col_group = lane / D_split;
+    const uint col_groups = REROT_GROUPED_COLS;
+    const uint k_offset = ((h_base / (p.neq2 / p.nek2)) * p.nb12) / FaBlockBytesK;
+    const uint v_offset = ((h_base / (p.neq2 / p.nev2)) * p.nb22) / FaBlockBytesV;
+    const uint HSK4 = HSK / 4u;
+    const uint HSV4 = HSV / 4u;
+    const int off_b = rerot_offsets[q];
+    const int off_e = rerot_offsets[q + 1u];
+    const uint len = off_e > off_b && off_b >= 0 ? uint(off_e - off_b) : 0u;
+    const uint base = off_b > 0 ? uint(off_b) : 0u;
+    const uint chunk = (len + S - 1u) / S;
+    uint begin = base + split * chunk;
+    const uint end = min(base + len, base + (split + 1u) * chunk);
+
+    float L = 0.0;
+    float M = REROT_NEG;
+    vec4 O[REROT_HSV4_PER_THREAD];
+    for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+        O[di] = vec4(0.0);
+    }
+    float scores[(Bc + REROT_GROUPED_COLS - 1u) / REROT_GROUPED_COLS];
+    bool valid[(Bc + REROT_GROUPED_COLS - 1u) / REROT_GROUPED_COLS];
+    uint previous_group = 0xffffffffu;
+
+    while (begin < end) {
+        const uint group = uint(rerot_entries[2u * begin + 1u]);
+        const bool group_ok = group < p.nem2;
+        // Find the first group boundary cooperatively within this tile.
+        // There is no serial scan of the reader's entire key range.
+        if (tid == 0u) {
+            rerot_run_end = min(begin + Bc, end);
+        }
+        barrier();
+        const uint limit = min(begin + Bc, end);
+        for (uint e = begin + tid; e < limit; e += WorkGroupSize) {
+            if (uint(rerot_entries[2u * e + 1u]) != group) {
+                atomicMin(rerot_run_end, e);
+            }
+        }
+        barrier();
+        const uint tile_end = rerot_run_end;
+        if (group != previous_group && group_ok) {
+            const uint q_base = group * (p.nb01 / 4u) + (h * p.nb02) / 4u;
+            for (uint d = lane; d < HSK4; d += SubGroupSize) {
+                rerot_qf[local_h * REROT_Q_WORDS + d] =
+                    rerot_qv4[q_base + d] * p.scale;
+            }
+        }
+        previous_group = group;
+        for (uint idx = tid; idx < Bc * HSK4; idx += WorkGroupSize) {
+            const uint c = idx / HSK4;
+            const uint d = idx % HSK4;
+            vec4 value = vec4(0.0);
+            if (begin + c < tile_end && group_ok) {
+                const uint key = uint(rerot_entries[2u * (begin + c)]);
+                if (KV_bounds_check == false || key < p.KV) {
+                    value = rerot_load_k(key, d, p.nb11, k_offset);
+                }
+            }
+            rerot_kvsh[c * REROT_KV_STRIDE + d] = value;
+        }
+        barrier();
+
+        uint count = 0u;
+        float block_max = REROT_NEG;
+        for (uint c = col_group; c < Bc; c += col_groups) {
+            const uint e = begin + c;
+            bool ok = e < tile_end && group_ok;
+            if (ok && KV_bounds_check) {
+                ok = uint(rerot_entries[2u * e]) < p.KV;
+            }
+            float score = REROT_NEG;
+            if (ok) {
+                vec4 dot = vec4(0.0);
+                for (uint d = d_tid; d < HSK4; d += D_split) {
+                    dot = fma(
+                        rerot_qf[local_h * REROT_Q_WORDS + d],
+                        rerot_kvsh[c * REROT_KV_STRIDE + d], dot);
+                }
+                score = rerot_hsum(dot);
+                for (uint st = 1u; st < D_split; st <<= 1u) {
+                    score += subgroupShuffleXor(score, st);
+                }
+                if (LOGIT_SOFTCAP) {
+                    score = p.logit_softcap * tanh(score);
+                }
+            }
+            scores[count] = score;
+            valid[count++] = ok;
+            block_max = max(block_max, score);
+        }
+        for (uint st = 1u; st < SubGroupSize; st <<= 1u) {
+            block_max = max(block_max, subgroupShuffleXor(block_max, st));
+        }
+        const float next_max = max(M, block_max);
+        const float rescale = exp(M - next_max);
+        M = next_max;
+        L *= rescale;
+        for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+            O[di] *= rescale;
+        }
+
+        barrier();
+        for (uint idx = tid; idx < Bc * HSV4; idx += WorkGroupSize) {
+            const uint c = idx / HSV4;
+            const uint d = idx % HSV4;
+            vec4 value = vec4(0.0);
+            if (begin + c < tile_end && group_ok) {
+                const uint key = uint(rerot_entries[2u * (begin + c)]);
+                if (KV_bounds_check == false || key < p.KV) {
+                    value = rerot_load_v(key, d, p.nb21, v_offset);
+                }
+            }
+            rerot_kvsh[c * REROT_KV_STRIDE + d] = value;
+        }
+        barrier();
+        count = 0u;
+        for (uint c = col_group; c < Bc; c += col_groups) {
+            const float weight = valid[count] ? exp(scores[count] - M) : 0.0;
+            ++count;
+            if (d_tid == 0u) {
+                L += weight;
+            }
+            for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+                const uint d = di * D_split + d_tid;
+                if (d < HSV4) {
+                    O[di] = fma(vec4(weight),
+                        rerot_kvsh[c * REROT_KV_STRIDE + d], O[di]);
+                }
+            }
+        }
+        barrier();
+        begin = tile_end;
+    }
+
+    for (uint st = 1u; st < SubGroupSize; st <<= 1u) {
+        L += subgroupShuffleXor(L, st);
+    }
+    for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+        for (uint st = D_split; st < SubGroupSize; st <<= 1u) {
+            O[di] += subgroupShuffleXor(O[di], st);
+        }
+    }
+    // Count the sink once, in split zero, and include its maximum in the
+    // ordinary split-K reduction state.
+    if (split == 0u && (p.mask_n_head_log2 & SINK_ENABLE_BIT) != 0u) {
+        const float sink = float(data_s[h]);
+        const float next_max = max(M, sink);
+        const float rescale = exp(M - next_max);
+        L = L * rescale + exp(sink - next_max);
+        for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+            O[di] *= rescale;
+        }
+        M = next_max;
+    }
+    const uint flat_row = h + p.ne2 * q;
+    const uint n_flat = p.ne2 * p.N;
+    const uint out_base = S == 1u ? flat_row * HSV4 : (n_flat * split + flat_row) * HSV4;
+    const float normalization = S == 1u ? (L > 0.0 ? 1.0 / L : 0.0) : 1.0;
+    if (col_group == 0u) {
+        for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+            const uint d = di * D_split + d_tid;
+            if (d < HSV4) {
+                data_ov4[out_base + d] = D_TYPEV4(O[di] * normalization);
+            }
+        }
+    }
+    if (S > 1u && lane == 0u) {
+        const uint lm_base = HSV * n_flat * S + 2u * n_flat * split + flat_row;
+        data_o[lm_base] = D_TYPE(L);
+        data_o[lm_base + n_flat] = D_TYPE(M);
+    }
+}
+
 void rerot_main() {
     if (RerotMode != 1u) {
         return;
@@ -401,6 +592,11 @@ void rerot_main() {
         init_iq_shmem(gl_WorkGroupSize);
     }
 #endif
+
+    if (Br > 1u) {
+        rerot_grouped_main();
+        return;
+    }
 
     const uint tid = gl_LocalInvocationIndex;
     const uint WGS = gl_WorkGroupSize.x;

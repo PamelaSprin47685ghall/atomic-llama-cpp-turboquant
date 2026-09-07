@@ -591,18 +591,18 @@ common_chat_msg task_result_state::update_chat_msg(
 
 common_chat_msg task_result_state::update_rerot_msg(
         const std::string & reasoning,
-        const std::string & parse_prefix,
         const std::string & content,
         std::vector<common_chat_msg_diff> & diffs) {
-    generated_text = parse_prefix;
-    generated_text += content;
+    // Final acquire mechanically closes the model-native reasoning block.
+    // Keep that boundary in the parser input, not in the returned content.
+    generated_text = "</think>\n" + content;
     auto msg_prv_copy = chat_msg;
 
     auto new_msg = common_chat_parse(generated_text, false, chat_parser_params);
     if (new_msg.role.empty()) {
         new_msg.role = "assistant";
     }
-    new_msg.reasoning_content = reasoning;
+    new_msg.reasoning_content.insert(0, reasoning);
     new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
     chat_msg = std::move(new_msg);
     diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
@@ -610,12 +610,13 @@ common_chat_msg task_result_state::update_rerot_msg(
 }
 
 common_chat_msg task_result_state::update_rerot_content(
-        const std::string & parse_prefix,
         const std::string & text_added,
         bool is_partial,
         std::vector<common_chat_msg_diff> & diffs) {
-    if (generated_text.empty()) {
-        generated_text = parse_prefix;
+    if (!rerot_serial_started) {
+        rerot_reasoning_prefix = chat_msg.reasoning_content;
+        generated_text = "</think>\n";
+        rerot_serial_started = true;
     }
     generated_text += text_added;
     auto msg_prv_copy = chat_msg;
@@ -626,7 +627,7 @@ common_chat_msg task_result_state::update_rerot_content(
         if (new_msg.role.empty()) {
             new_msg.role = "assistant";
         }
-        new_msg.reasoning_content = msg_prv_copy.reasoning_content;
+        new_msg.reasoning_content.insert(0, rerot_reasoning_prefix);
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
         chat_msg = std::move(new_msg);
         diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
@@ -1429,7 +1430,7 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
         oaicompat_msg_diffs.push_back(std::move(diff));
     } else if (is_rerot_content) {
         state.update_rerot_content(
-            rerot_parse_prefix, content, true, oaicompat_msg_diffs);
+            content, true, oaicompat_msg_diffs);
     } else {
         state.update_chat_msg(content, true, oaicompat_msg_diffs);
     }

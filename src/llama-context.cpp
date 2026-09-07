@@ -670,7 +670,10 @@ llama_context::llama_context(
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
-    cparams.n_outputs_max = std::max(cparams.n_outputs_max, cparams.n_seq_max);
+    const uint32_t n_outputs_min = params.rerot
+        ? std::max(1u, params.n_pen_max)
+        : cparams.n_seq_max;
+    cparams.n_outputs_max = std::max(cparams.n_outputs_max, n_outputs_min);
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
@@ -810,7 +813,7 @@ llama_context::llama_context(
 
         // graph outputs buffer
         {
-            if (output_reserve(params.n_seq_max) < params.n_seq_max) {
+            if (output_reserve(n_outputs_min) < n_outputs_min) {
                 throw std::runtime_error("failed to reserve initial output buffer");
             }
 
@@ -1114,6 +1117,9 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new_shared(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload, compute_pool.get()));
+    if (memory) {
+        memory->set_backend_sched(sched.get());
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -1150,6 +1156,9 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new_shared(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload, compute_pool.get()));
+                if (memory) {
+                    memory->set_backend_sched(sched.get());
+                }
                 gf = graph_reserve(n_tokens_pp, n_seqs_pp, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -2718,7 +2727,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
-    const int64_t n_outputs_max = std::max<int64_t>(n_outputs, n_seq_max());
+    const int64_t n_outputs_max = std::max<int64_t>(
+        n_outputs,
+        cparams.rerot_enabled ? std::max(1u, cparams.n_pen_max) : n_seq_max());
 
     const auto n_batch    = cparams.n_batch;
     const auto n_vocab    = vocab.n_tokens();
@@ -4645,6 +4656,10 @@ llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
     return ctx->get_sampled_token_ith(i);
 }
 
+llama_token llama_get_sampled_token_ith_no_sync(llama_context * ctx, int32_t i) {
+    return ctx->get_sampled_token_ith(i);
+}
+
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
@@ -4932,11 +4947,14 @@ size_t llama_memory_rerot_capture_hand_seed(
     if (!mem) {
         return 0;
     }
+    if (!dst) {
+        return mem->rerot_hand_seed_size(source_seq);
+    }
     std::vector<uint8_t> blob;
     if (!mem->rerot_capture_hand_seed(source_seq, blob) || blob.empty()) {
         return 0;
     }
-    if (!dst || size < blob.size()) {
+    if (size < blob.size()) {
         return blob.size();
     }
     std::memcpy(dst, blob.data(), blob.size());
@@ -5034,6 +5052,7 @@ void llama_rerot_episode_end(llama_context * ctx, uint64_t episode_id) {
             mem->rerot_clear_write_tag(s);
             mem->rerot_clear_reader_view(s);
         }
+        mem->rerot_release_episode(episode_id);
     }
 }
 

@@ -152,22 +152,9 @@ static void test_bytes_after_complete_are_malformed() {
     CHECK(!extra.error.empty());
 }
 
-static void test_planner_prompt_shape() {
-    const std::string prompt(server_rerot_planner_prompt());
-    CHECK(!prompt.empty());
-    CHECK(prompt.find("ol") != std::string::npos);
-    CHECK(prompt.find("li") != std::string::npos);
-    CHECK(prompt.find("/ol") != std::string::npos);
-    CHECK(prompt.find("请先") == std::string::npos);
-    CHECK(prompt.find("禁止") == std::string::npos);
-    CHECK(prompt.find("目标") != std::string::npos);
-    CHECK(prompt.find("子答案") == std::string::npos);
-    CHECK(prompt.find("简单问题") == std::string::npos);
-    CHECK(prompt.size() < 300);
-}
-
-static bool planner_grammar_accepts(const std::string & input) {
-    const std::string grammar_text(server_rerot_planner_grammar());
+static bool grammar_accepts(
+        const std::string & grammar_text,
+        const std::string & input) {
     llama_grammar * grammar = llama_grammar_init_impl(
         nullptr, grammar_text.c_str(), "root", false, nullptr, 0, nullptr, 0);
     CHECK(grammar != nullptr);
@@ -190,6 +177,11 @@ static bool planner_grammar_accepts(const std::string & input) {
     return complete;
 }
 
+static bool planner_grammar_accepts(const std::string & input) {
+    return grammar_accepts(
+        std::string(server_rerot_planner_grammar()), input);
+}
+
 static void test_planner_grammar_rejects_empty_items() {
     CHECK(planner_grammar_accepts("目标</li>\n</ol>"));
     CHECK(planner_grammar_accepts("\n  目标  \n</li>\n<li>另一个目标</li>\n</ol>"));
@@ -198,16 +190,33 @@ static void test_planner_grammar_rejects_empty_items() {
     CHECK(!planner_grammar_accepts("目标</li>\n<li>\n</li>\n</ol>"));
 }
 
-static void test_private_marker_split() {
-    server_rerot_marker_parser parser;
+static constexpr const char * TEST_CHILD_CLOSE = "</AbCdEfG0>";
 
-    auto step = parser.consume("conclusion </blockquo");
+static void test_child_grammar_requires_exact_random_close() {
+    const std::string grammar = server_rerot_child_grammar(TEST_CHILD_CLOSE);
+    CHECK(!grammar.empty());
+    CHECK(grammar_accepts(
+        grammar, "原生标签只是正文</think>\n</AbCdEfG0>"));
+    CHECK(grammar_accepts(grammar, "事实清单。</AbCdEfG0>"));
+    CHECK(grammar_accepts(grammar, "one sentence.</AbCdEfG0>"));
+    CHECK(grammar_accepts(grammar, "推导正文\n</AbCdEfG0>"));
+    CHECK(!grammar_accepts(grammar, "</AbCdEfG0>"));
+    CHECK(!grammar_accepts(grammar, " \n\n</AbCdEfG0>"));
+    CHECK(!grammar_accepts(grammar, "推导正文"));
+    CHECK(!grammar_accepts(grammar, "推导正文</AbCdEfG1>"));
+    CHECK(server_rerot_child_grammar("</think>").empty());
+}
+
+static void test_private_marker_split() {
+    server_rerot_marker_parser parser(TEST_CHILD_CLOSE);
+
+    auto step = parser.consume("conclusion </AbCd");
     CHECK(step.write_visibility == llama_rerot_visibility::pending_record);
     CHECK(step.public_prefix_bytes == std::string("conclusion ").size());
     CHECK(!step.marker_closed);
     CHECK(parser.state() == server_rerot_marker_state::marker_candidate);
 
-    step = parser.consume("te>\n");
+    step = parser.consume("EfG0>\n");
     CHECK(step.write_visibility == llama_rerot_visibility::pending_record);
     CHECK(step.public_prefix_bytes == 0);
     CHECK(step.marker_closed);
@@ -215,26 +224,8 @@ static void test_private_marker_split() {
     CHECK(parser.complete());
 }
 
-static void test_private_marker_completion_suffix() {
-    server_rerot_marker_parser parser;
-    CHECK(parser.completion_suffix() == "</blockquote>");
-
-    auto step = parser.consume("></");
-    CHECK(step.public_prefix_bytes == 1);
-    CHECK(parser.completion_suffix() == "blockquote>");
-
-    step = parser.consume("blockquote");
-    CHECK(step.public_prefix_bytes == 0);
-    CHECK(parser.completion_suffix() == ">");
-
-    step = parser.consume(">");
-    CHECK(step.marker_closed);
-    CHECK(parser.complete());
-    CHECK(parser.completion_suffix().empty());
-}
-
 static void test_private_marker_false_prefix() {
-    server_rerot_marker_parser parser;
+    server_rerot_marker_parser parser(TEST_CHILD_CLOSE);
 
     auto step = parser.consume("ordinary <");
     CHECK(step.write_visibility == llama_rerot_visibility::pending_record);
@@ -246,16 +237,16 @@ static void test_private_marker_false_prefix() {
 }
 
 static void test_private_marker_closes_with_trailing_body() {
-    server_rerot_marker_parser parser;
-    const auto step = parser.consume("</blockquote>answer in same tokenizer token");
+    server_rerot_marker_parser parser(TEST_CHILD_CLOSE);
+    const auto step = parser.consume("</AbCdEfG0>answer in same tokenizer token");
     CHECK(step.marker_closed);
     CHECK(!step.malformed);
     CHECK(parser.complete());
 }
 
 static void test_private_marker_after_complete_is_ignored() {
-    server_rerot_marker_parser parser;
-    const auto closed = parser.consume("done </blockquote>");
+    server_rerot_marker_parser parser(TEST_CHILD_CLOSE);
+    const auto closed = parser.consume("done </AbCdEfG0>");
     CHECK(closed.marker_closed);
     CHECK(parser.complete());
     const auto extra = parser.consume("more");
@@ -263,49 +254,41 @@ static void test_private_marker_after_complete_is_ignored() {
     CHECK(!extra.malformed);
 }
 
-static void test_control_tag_filter_across_tokens() {
-    server_rerot_control_tag_filter filter;
-
-    std::string bytes = "<";
-    filter.consume(bytes);
-    CHECK(bytes.empty());
-
-    bytes = "blockquote";
-    filter.consume(bytes);
-    CHECK(bytes.empty());
-
-    bytes = ">answer</block";
-    filter.consume(bytes);
-    CHECK(bytes == "answer");
-
-    bytes = "quote>tail";
-    filter.consume(bytes);
-    CHECK(bytes == "tail");
-
-    bytes = "one<blockquote>two</blockquote>three";
-    filter.consume(bytes);
-    CHECK(bytes == "onetwothree");
+static void test_unarmed_root_does_not_parse_native_thought_tags() {
+    server_rerot_marker_parser parser;
+    const auto step = parser.consume("</think>");
+    CHECK(step.write_visibility == llama_rerot_visibility::public_live);
+    CHECK(!step.marker_closed);
+    CHECK(!step.malformed);
+    CHECK(!parser.complete());
 }
 
-static void test_control_tag_filter_false_prefix() {
-    server_rerot_control_tag_filter filter;
+static void test_private_marker_snapshot_preserves_id_and_split() {
+    server_rerot_marker_parser parser(TEST_CHILD_CLOSE);
+    CHECK(!parser.consume("</AbCd").malformed);
 
-    std::string bytes = "prefix <";
-    filter.consume(bytes);
-    CHECK(bytes == "prefix ");
+    const auto snapshot = parser.snapshot();
+    server_rerot_marker_parser restored;
+    std::string error;
+    CHECK(restored.restore(snapshot, &error));
+    CHECK(restored.marker() == TEST_CHILD_CLOSE);
+    CHECK(restored.state() == server_rerot_marker_state::marker_candidate);
+    CHECK(restored.consume("EfG0>").marker_closed);
 
-    bytes = "b> remains";
-    filter.consume(bytes);
-    CHECK(bytes == "<b> remains");
+    auto obsolete = snapshot;
+    obsolete.marker = "</think>";
+    CHECK(!restored.restore(obsolete, &error));
+    CHECK(error.find("obsolete") != std::string::npos);
+}
 
-    bytes = "</block";
-    filter.consume(bytes);
-    CHECK(bytes.empty());
-    filter.reset();
-
-    bytes = "safe";
-    filter.consume(bytes);
-    CHECK(bytes == "safe");
+static void test_rejects_obsolete_or_malformed_delimiters() {
+    for (const std::string marker : {
+            "</think>", "</blockquote>", "</short>", "</AbCd-Ef0>",
+            "</AbCdEfG01>", "<AbCdEfG0>"}) {
+        server_rerot_marker_parser parser(marker);
+        CHECK(parser.failed());
+        CHECK(!parser.error().empty());
+    }
 }
 
 int main() {
@@ -319,15 +302,15 @@ int main() {
     test_non_candidate_angle_text_stays_public();
     test_malformed_records();
     test_bytes_after_complete_are_malformed();
-    test_planner_prompt_shape();
     test_planner_grammar_rejects_empty_items();
+    test_child_grammar_requires_exact_random_close();
     test_private_marker_split();
-    test_private_marker_completion_suffix();
     test_private_marker_false_prefix();
     test_private_marker_closes_with_trailing_body();
     test_private_marker_after_complete_is_ignored();
-    test_control_tag_filter_across_tokens();
-    test_control_tag_filter_false_prefix();
+    test_unarmed_root_does_not_parse_native_thought_tags();
+    test_private_marker_snapshot_preserves_id_and_split();
+    test_rejects_obsolete_or_malformed_delimiters();
     std::fprintf(stderr, "=== Results: %d failure(s) ===\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

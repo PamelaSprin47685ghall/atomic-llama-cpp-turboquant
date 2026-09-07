@@ -327,9 +327,44 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
+    set_input_recurrent(mctx, ubatch);
+}
+
+void llm_graph_input_rs::set_input_recurrent(
+        const llama_memory_recurrent_context * current,
+        const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
+    mctx = current;
 
     const int64_t n_rs = mctx->get_n_rs();
+
+    // Read rollback-aware brain indices before s_copy() consumes and resets
+    // each sequence's rollback selector.
+    if (brain_copy && brain_copy->buffer != nullptr) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(brain_copy->buffer));
+        int32_t * data = (int32_t *) brain_copy->data;
+        for (uint32_t i = 0; i < mctx->get_ubatch().n_seqs; ++i) {
+            data[i] = mctx->brain_copy((int32_t) i);
+            GGML_ASSERT(data[i] >= 0);
+        }
+    }
+
+    const auto public_groups = mctx->public_brain_groups();
+    GGML_ASSERT(public_groups.size() == rbb_groups.size());
+    size_t group_index = 0;
+    for (const auto & [brain_row, rows] : public_groups) {
+        const auto & group = rbb_groups[group_index++];
+        GGML_ASSERT(group.brain_row == brain_row);
+        GGML_ASSERT(group.public_rows != nullptr);
+        GGML_ASSERT((size_t) group.public_rows->ne[0] == rows.size());
+        // The fused all-writer Parallel Delta node encodes this membership in
+        // its graph shape and does not consume the index tensor.
+        if (group.public_rows->buffer != nullptr) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(group.public_rows->buffer));
+            ggml_backend_tensor_set(
+                group.public_rows, rows.data(), 0, rows.size() * sizeof(rows[0]));
+        }
+    }
 
     if (s_copy) {
         GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
@@ -343,16 +378,36 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
-    const auto * mctx = static_cast<const llama_memory_recurrent_context *>(params.mctx);
+    const auto * current = static_cast<const llama_memory_recurrent_context *>(params.mctx);
+    return can_reuse_recurrent(current, params.ubatch);
+}
 
-    this->mctx = mctx;
+bool llm_graph_input_rs::can_reuse_recurrent(
+        const llama_memory_recurrent_context * current,
+        const llama_ubatch & ubatch) {
+    mctx = current;
 
     bool res = true;
 
     res &= s_copy->ne[0] == mctx->get_n_rs();
+    res &= s_copy_main->ne[0]  == ubatch.n_seqs;
+    res &= s_copy_extra->ne[0] == mctx->get_n_rs() - ubatch.n_seqs;
+    res &= (brain_copy != nullptr) == mctx->is_grouped();
+    if (brain_copy) {
+        res &= brain_copy->ne[0] == ubatch.n_seqs;
+    }
 
-    res &= s_copy_main->ne[0]  == params.ubatch.n_seqs;
-    res &= s_copy_extra->ne[0] == mctx->get_n_rs() - params.ubatch.n_seqs;
+    const auto public_groups = mctx->public_brain_groups();
+    res &= public_groups.size() == rbb_groups.size();
+    if (res) {
+        size_t group_index = 0;
+        for (const auto & [brain_row, rows] : public_groups) {
+            const auto & group = rbb_groups[group_index++];
+            res &= group.brain_row == brain_row;
+            res &= group.public_rows != nullptr;
+            res &= (size_t) group.public_rows->ne[0] == rows.size();
+        }
+    }
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
@@ -1406,17 +1461,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         inp_attn->rerot_spans_fill(ubatch, mctx->get_attn());
     }
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    inp_rs->set_input_recurrent(mctx->get_recr(), ubatch);
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1437,13 +1482,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_attn->rerot_spans_can_reuse(
         params.ubatch, params.sched, params.cparams, mctx->get_attn());
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
-
-    res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
-    res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
-
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_recurrent(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1456,17 +1495,7 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    inp_rs->set_input_recurrent(mctx->get_recr(), ubatch);
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1480,13 +1509,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
-
-    res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
-    res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
-
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_recurrent(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1530,17 +1553,7 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
         attn_ctx->get_swa()->set_input_v_rot(inp_attn->self_v_rot_swa);
     }
 
-    const int64_t n_rs = mctx->get_recr()->get_n_rs();
-
-    if (inp_rs->s_copy) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
-
-        // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
-        for (uint32_t i = 0; i < n_rs; ++i) {
-            data[i] = mctx->get_recr()->s_copy(i);
-        }
-    }
+    inp_rs->set_input_recurrent(mctx->get_recr(), ubatch);
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
@@ -1568,13 +1581,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask_swa, attn_ctx->get_swa(), params.ubatch, params.cparams);
 
-    res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
-
-    res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
-    res &= inp_rs->s_copy_extra->ne[0] == mctx->get_recr()->get_n_rs() - params.ubatch.n_seqs;
-
-    res &= inp_rs->head == mctx->get_recr()->get_head();
-    res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_recurrent(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -4092,6 +4099,20 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
     inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);
 
+    if (mctx_cur->is_grouped()) {
+        inp->brain_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs);
+        ggml_set_input(inp->brain_copy);
+
+        for (const auto & [brain_row, rows] : mctx_cur->public_brain_groups()) {
+            llm_graph_input_rs::rbb_group_input group;
+            group.brain_row = brain_row;
+            group.public_rows =
+                ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) rows.size());
+            ggml_set_input(group.public_rows);
+            inp->rbb_groups.push_back(group);
+        }
+    }
+
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
 
@@ -4117,6 +4138,21 @@ ggml_tensor * llm_graph_context::build_rs(
     return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
+}
+
+ggml_tensor * llm_graph_context::build_rs_shared(
+        llm_graph_input_rs * inp,
+        ggml_tensor * s,
+            int32_t   state_size,
+            int32_t   n_seqs) const {
+    GGML_ASSERT(inp->brain_copy != nullptr);
+    GGML_ASSERT(inp->mctx->is_grouped());
+    GGML_ASSERT((int64_t) n_seqs == inp->brain_copy->ne[0]);
+
+    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+    ggml_tensor * output_states = ggml_get_rows(ctx0, states, inp->brain_copy);
+    ggml_build_forward_expand(gf, output_states);
+    return output_states;
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(

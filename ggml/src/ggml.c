@@ -6434,6 +6434,7 @@ struct ggml_tensor * ggml_gated_delta_net(
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
+    ggml_set_op_params_i32(result, 1, 0);
 
     result->op     = GGML_OP_GATED_DELTA_NET;
     result->src[0] = q;
@@ -6442,6 +6443,73 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+    result->src[6] = state;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net_rbb(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * native_state) {
+    GGML_ASSERT(v->ne[2] == 1);
+    GGML_ASSERT(v->ne[3] >= 1);
+    GGML_ASSERT(g->ne[0] == 1);
+
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+    GGML_ASSERT(ggml_is_contiguous(native_state));
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_F32);
+    GGML_ASSERT(native_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->ne[0] == v->ne[0]);
+    GGML_ASSERT(state->ne[1] == v->ne[0]);
+    GGML_ASSERT(state->ne[2] == v->ne[1]);
+    GGML_ASSERT(state->ne[3] == 1);
+    GGML_ASSERT(native_state->ne[0] == v->ne[0]);
+    GGML_ASSERT(native_state->ne[1] == v->ne[0]);
+    GGML_ASSERT(native_state->ne[2] == v->ne[1]);
+    GGML_ASSERT(native_state->ne[3] == v->ne[3]);
+
+    const int64_t S_v = v->ne[0];
+    const int64_t H = v->ne[1];
+    const int64_t n_seqs = v->ne[3];
+    // The result packs native Lane readouts, one merged brain state, per-Lane
+    // hand residuals against that brain, then device-local work vectors for
+    // the exact order-free Parallel Delta solve.
+    const int64_t candidate_rows = S_v * n_seqs;
+    const int64_t scratch_rows = 8 * n_seqs;
+    const int64_t ne[4] = {
+        S_v * H,
+        n_seqs + S_v + candidate_rows + scratch_rows,
+        1,
+        1,
+    };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    ggml_set_op_params_i32(result, 0, 1);
+    ggml_set_op_params_i32(result, 1, 1);
+
+    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = native_state;
 
     return result;
 }

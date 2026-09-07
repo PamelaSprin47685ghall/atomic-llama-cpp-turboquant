@@ -11,7 +11,6 @@
 #include "server-task.h"
 #include "server-rerot.h"
 
-#include <random>
 #include <sstream>
 #include <fstream>
 #include <limits>
@@ -63,21 +62,6 @@ json format_error_response(const std::string & message, const enum error_type ty
 //
 // random string / id
 //
-
-std::string random_string() {
-    static const std::string str("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz");
-
-    std::random_device rd;
-    std::mt19937 generator(rd());
-
-    std::string result(32, ' ');
-
-    for (int i = 0; i < 32; ++i) {
-        result[i] = str[generator() % str.size()];
-    }
-
-    return result;
-}
 
 std::string gen_chatcmplid() {
     return "chatcmpl-" + random_string();
@@ -1174,7 +1158,7 @@ json oaicompat_chat_params_parse(
     llama_params["message_delimiters"] = chat_params.message_delimiters.to_json();
 
     // Reasoning budget: pass parameters through to sampling layer.
-    // For RERoT, sublanes manage their own blockquote delimiters and never force think tags.
+    // RERoT manages private thought exits under its episode-wide budget.
     if (!json_value(body, "rerot", false)) {
         int reasoning_budget = json_value(body, "reasoning_budget_tokens",
                                json_value(body, "thinking_budget_tokens", -1));

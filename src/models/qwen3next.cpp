@@ -474,8 +474,34 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    ggml_tensor * state_base = nullptr;
+    ggml_tensor * hand_echo_all = nullptr;
+    ggml_tensor * state = nullptr;
+    const bool parallel_delta = uses_parallel_delta(inp, il);
+    if (mctx_cur->is_s_shared(il)) {
+        hand_echo_all = mctx_cur->get_d_l(il);
+        ggml_tensor * state_base_rows = nullptr;
+        if (parallel_delta) {
+            state_base = ggml_view_1d(
+                ctx0, ssm_states_all, hparams.n_embd_s(),
+                (size_t) inp->rbb_groups[0].brain_row * ssm_states_all->nb[1]);
+            state_base_rows =
+                build_rs_shared(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        } else {
+            state_base =
+                build_rs_shared(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+            state_base_rows = state_base;
+        }
+        ggml_tensor * hand_echo =
+            build_rs(inp, hand_echo_all, hparams.n_embd_s(), n_seqs);
+        state = ggml_add(
+            ctx0, state_base_rows, ggml_cast(ctx0, hand_echo, GGML_TYPE_F32));
+    } else {
+        state = build_rs(
+            inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    }
+    state = ggml_reshape_4d(
+        ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
@@ -549,7 +575,9 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    ggml_tensor * output = build_recurrent_attn(
+        inp, ssm_states_all, state_base, hand_echo_all,
+        q_conv, k_conv, v_conv, gate, beta, state, il);
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

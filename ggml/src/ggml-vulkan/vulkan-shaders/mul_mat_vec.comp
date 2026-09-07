@@ -44,6 +44,48 @@ vec4 load_b(const uint j, const uint iybs, const uint iqs, const bool lastiter, 
 
 void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i, bool lastiter)
 {
+#if K_PER_ITER == 8 && !defined(MUL_MAT_ID)
+    // Recurrent decode stores concurrent Lane vectors as columns sharing one
+    // matrix. For the dominant one-row tile, dequantize that matrix block once
+    // and reuse it for every Lane instead of repeating the weight load/work.
+    if (num_rows == 1u && NUM_COLS > 1u) {
+        const uint col = i*BLOCK_SIZE + K_PER_ITER*tid;
+        const uint iqs = (col%QUANT_K)/QUANT_R;
+        const uint iybs = col - col%QUANT_K;
+        const uint ib = (first_row*p.ncols + col)/QUANT_K;
+
+        vec4 v = dequantize4(ib, iqs, a_offset);
+        vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
+        const vec2 dm = get_dm(ib, a_offset);
+        if (dm.y != 0) {
+            v = v * dm.x + dm.y;
+            v2 = v2 * dm.x + dm.y;
+        }
+
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+#if QUANT_R == 2
+            const vec4 bv02 = vec4(data_b_v4[
+                (j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
+            const vec4 bv13 = vec4(data_b_v4[
+                (j*p.batch_stride_b + b_offset + iybs + iqs + y_offset) / 4]);
+            const vec4 bv0 = vec4(bv02.x, bv13.x, bv02.y, bv13.y);
+            const vec4 bv1 = vec4(bv02.z, bv13.z, bv02.w, bv13.w);
+#else
+            const vec4 bv0 = vec4(data_b_v4[
+                (j*p.batch_stride_b + b_offset + iybs + iqs) / 4]);
+            const vec4 bv1 = vec4(data_b_v4[
+                (j*p.batch_stride_b + b_offset + iybs + iqs) / 4 + 1]);
+#endif
+            FLOAT_TYPE rowtmp = dot(bv0, v) + dot(bv1, v2);
+            if (dm.y == 0) {
+                rowtmp *= dm.x;
+            }
+            temp[j][0] += rowtmp;
+        }
+        return;
+    }
+#endif
+
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
         const uint col = i*BLOCK_SIZE + K_PER_ITER*tid;
         const uint iqs = (col%QUANT_K)/QUANT_R; // quant index

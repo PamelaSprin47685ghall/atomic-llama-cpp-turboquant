@@ -210,6 +210,8 @@ struct task_result_state {
     common_chat_parser_params chat_parser_params;
     common_chat_msg chat_msg;
     std::string generated_text; // append new chunks of generated text here
+    std::string rerot_reasoning_prefix;
+    bool rerot_serial_started = false;
     std::vector<std::string> generated_tool_call_ids;
     std::unordered_set<size_t> sent_tool_call_names;
 
@@ -240,12 +242,10 @@ struct task_result_state {
 
     common_chat_msg update_rerot_msg(
         const std::string & reasoning,
-        const std::string & parse_prefix,
         const std::string & content,
         std::vector<common_chat_msg_diff> & diffs);
 
     common_chat_msg update_rerot_content(
-        const std::string & parse_prefix,
         const std::string & text_added,
         bool is_partial,
         std::vector<common_chat_msg_diff> & diffs);
@@ -496,7 +496,6 @@ struct completion_token_output {
 struct server_task_result_cmpl_final : server_task_result {
     std::string content;
     std::string rerot_reasoning;
-    std::string rerot_parse_prefix;
     bool rerot_explicit_channels = false;
     llama_tokens tokens;
 
@@ -546,9 +545,9 @@ struct server_task_result_cmpl_final : server_task_result {
         if (rerot_explicit_channels) {
             oaicompat_msg = stream
                 ? state.update_rerot_content(
-                    rerot_parse_prefix, content, false, oaicompat_msg_diffs)
+                    content, false, oaicompat_msg_diffs)
                 : state.update_rerot_msg(
-                    rerot_reasoning, rerot_parse_prefix, content, oaicompat_msg_diffs);
+                    rerot_reasoning, content, oaicompat_msg_diffs);
         } else {
             oaicompat_msg =
                 state.update_chat_msg(content, false, oaicompat_msg_diffs);
@@ -609,7 +608,6 @@ struct server_task_result_cmpl_partial : server_task_result {
     // through the request chat parser so tool calls retain their API shape.
     bool is_rerot_reasoning = false;
     bool is_rerot_content   = false;
-    std::string rerot_parse_prefix;
 
     // Streaming state copied from task_result_state for this chunk
     bool thinking_block_started = false;

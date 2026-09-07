@@ -56,6 +56,24 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * s,
                         int   il);
 
+    struct delta_net_rbb_result {
+        ggml_tensor * output;
+        ggml_tensor * merged_state;
+        ggml_tensor * hand_deltas;
+    };
+
+    delta_net_rbb_result build_delta_net_rbb(
+                ggml_tensor * q,
+                ggml_tensor * k,
+                ggml_tensor * v,
+                ggml_tensor * g,
+                ggml_tensor * b,
+                ggml_tensor * brain_state,
+                ggml_tensor * native_state,
+                        int   il);
+
+    bool uses_parallel_delta(const llm_graph_input_rs * inp, int il) const;
+
     // choose one of two implementations above based on the number of tokens
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net(
                 ggml_tensor * q,
@@ -76,12 +94,21 @@ struct llm_build_delta_net_base : public llm_graph_context {
             int64_t              conv_channels,
             int                  il);
 
-    // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
-    // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
-    ggml_tensor * build_recurrent_attn(
+    void build_rbb_parallel_commit(
             llm_graph_input_rs * inp,
             ggml_tensor *        ssm_states_all,
-            ggml_tensor *        q,
+            ggml_tensor *        candidate_states,
+            int64_t              n_snapshots,
+            int                  il);
+
+    // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
+    // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
+        ggml_tensor * build_recurrent_attn(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        ssm_states_all,
+        ggml_tensor *        state_base,
+        ggml_tensor *        hand_echo_all,
+        ggml_tensor *        q,
             ggml_tensor *        k,
             ggml_tensor *        v,
             ggml_tensor *        g,

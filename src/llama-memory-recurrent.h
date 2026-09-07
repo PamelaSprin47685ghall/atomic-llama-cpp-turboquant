@@ -24,6 +24,8 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
+                     uint32_t   n_brain_max,
+                     uint32_t   n_hand_max,
         const layer_filter_cb & filter);
 
     ~llama_memory_recurrent() = default;
@@ -76,43 +78,30 @@ public:
     uint32_t get_brain_used()     const override;
     uint32_t get_hand_used()      const override;
 
-    void set_grouped_layout(uint32_t n_brains, uint32_t n_hands);
+    void set_grouped_layout(uint32_t n_brains, uint32_t n_hands) override;
     bool is_grouped_layout() const { return n_brain_rows > 0 && n_hand_rows > 0; }
-
-    // RBB frontier mean commit (§14.1, §B.6):
-    // Deterministically reduces valid PUBLIC candidate hand rows to update S_global for this person.
-    // N=1: exact identity with single candidate.
-    // PRIVATE/PENDING: excluded from global S commit.
-    // Isolation: S_global[person_a] and S_global[person_b] are in separate rows.
-    bool commit_rbb_frontier_mean(
-        uint32_t person_id,
-        const std::vector<int32_t> & candidate_hand_rows,
-        const std::vector<bool> & is_public_write);
-
-    // Parallel Delta order-free block DeltaNet update (§14.1.2):
-    // Combines concurrent candidate writes to shared S without dilution.
-    // N=1: exact identity with single candidate.
-    // N>1: regularized Gram solve over orthogonal write components.
-    bool commit_rbb_frontier_parallel_delta(
-        uint32_t person_id,
-        const std::vector<int32_t> & candidate_hand_rows,
-        const std::vector<bool> & is_public_write,
-        const std::vector<float> & candidate_log_decays = {});
+    bool is_s_shared(int32_t il) const;
 
     // Shared fork hand seed (§B.6.4):
     // Materializes/captures immutable fork seed for queued children without duplicating full recurrent rows.
     struct hand_seed {
         uint64_t fork_id = 0;
         int32_t source_hand_row = -1;
+        llama_pos source_pos = -1;
         std::vector<std::vector<uint8_t>> conv_tail_bytes; // layer -> conv state bytes
-        std::vector<std::vector<uint8_t>> private_s_bytes; // layer -> R0-R2 private S bytes
+        std::vector<std::vector<uint8_t>> state_bytes;     // layer -> private S or shared hand state
     };
 
     std::shared_ptr<hand_seed> capture_hand_seed(uint64_t fork_id, llama_seq_id source_seq);
     bool apply_hand_seed(llama_seq_id dest_seq, const std::shared_ptr<hand_seed> & seed);
 
+    size_t rerot_hand_seed_size(llama_seq_id source_seq) const override;
     bool rerot_capture_hand_seed(llama_seq_id source_seq, std::vector<uint8_t> & seed_out) override;
     bool rerot_apply_hand_seed(llama_seq_id dest_seq, const std::vector<uint8_t> & seed_in) override;
+    bool rerot_set_write_tag(llama_seq_id seq_id, const llama_kv_rerot_meta & tag) override;
+    void rerot_clear_write_tag(llama_seq_id seq_id) override;
+    void rerot_release_episode(uint64_t episode_id) override;
+
     bool rerot_commit_rbb_frontier(
             uint32_t person_id,
             const llama_seq_id * candidate_seqs,
@@ -170,13 +159,26 @@ public:
     };
 
     std::vector<mem_cell> cells;
-    std::vector<int32_t> tails; // logical seq_id -> physical cell
+    std::vector<int32_t> tails; // logical seq_id -> physical hand row
+
+    // RERoT grouped state ownership. A sequence owns one hand row through
+    // tails[] and references one episode-global brain row here.
+    std::vector<int32_t> seq_brain;
+    std::vector<uint64_t> seq_episode;
+    std::vector<llama_rerot_node_id> seq_node;
+    std::vector<uint8_t> seq_public_write;
+    std::map<uint64_t, int32_t> episode_brain;
+    std::vector<uint64_t> brain_episode;
 
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
+    std::vector<ggml_tensor *> d_l; // compact per-hand delta from the shared brain
+    std::vector<uint8_t> s_shared_l;
 
 private:
+    friend class llama_memory_recurrent_context;
+
     //const llama_model & model;
     const llama_hparams & hparams;
 
@@ -189,12 +191,17 @@ private:
 
     size_t size_r_bytes() const;
     size_t size_s_bytes() const;
+    size_t size_d_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
+
+    int32_t brain_row_for_seq(llama_seq_id seq_id) const;
+    int32_t acquire_brain_row(uint64_t episode_id, llama_seq_id seq_id);
+    void clear_brain_row(int32_t brain_row);
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {
@@ -231,11 +238,18 @@ public:
     uint32_t get_head() const;
     int32_t  get_rs_z() const;
     uint32_t get_size() const;
+    uint32_t get_brain_size() const;
+    bool is_grouped() const;
 
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
+    ggml_tensor * get_d_l(int32_t il) const;
+    bool is_s_shared(int32_t il) const;
 
     int32_t s_copy(int i) const;
+    int32_t brain_copy(int i) const;
+    bool is_public_write(int i) const;
+    std::map<int32_t, std::vector<int32_t>> public_brain_groups() const;
 
 private:
     const llama_memory_status status;

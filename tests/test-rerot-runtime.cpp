@@ -49,6 +49,17 @@ static void start_child(
     if (!node) {
         return;
     }
+    const auto id = node->control_id();
+    CHECK(id.size() == 8);
+    CHECK(std::all_of(id.begin(), id.end(), [](unsigned char ch) {
+        return (ch >= '0' && ch <= '9') ||
+               (ch >= 'A' && ch <= 'Z') ||
+               (ch >= 'a' && ch <= 'z');
+    }));
+    CHECK(node->exit_parser.marker() == "</" + std::string(id) + ">");
+    CHECK(node->control_open() ==
+        "<" + std::string(id) +
+        " note=\"Start of private child work block.\">");
 
     const auto heading = runtime.plan_heading_token(
         episode_id, admitted, node->storage_pos_next);
@@ -94,12 +105,19 @@ static void request_exit(
     if (!node) {
         return;
     }
-    CHECK(commit_generated(runtime, episode_id, node_id, node->storage_pos_next,
-        "final observation </blockquo"));
+    const std::string close = node->exit_parser.marker();
+    CHECK(close.size() == 11);
+    if (close.size() != 11) {
+        return;
+    }
+    CHECK(commit_generated(
+        runtime, episode_id, node_id, node->storage_pos_next,
+        "final observation " + close.substr(0, 6)));
     node = runtime.node(episode_id, node_id);
     CHECK(node != nullptr);
     if (node) {
-        CHECK(commit_generated(runtime, episode_id, node_id, node->storage_pos_next, "te>"));
+        CHECK(commit_generated(
+            runtime, episode_id, node_id, node->storage_pos_next, close.substr(6)));
         CHECK(node->exit_intent);
     }
 }
@@ -176,59 +194,115 @@ static void test_line_mux_completion_order_and_visibility() {
     CHECK(!missing.ok);
 }
 
+static void test_list_marker_prefixes_remain_atomic() {
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
+    const uint64_t episode_id = runtime.adopt_root(95, 95, 0, 0, 0);
+    server_rerot_line_mux mux;
+    const std::vector<std::string> tokens = {
+        "<", "ol", ">\n<li>", "第一项。\n</", "li", ">\n</", "ol", ">\n",
+    };
+    std::string emitted;
+    llama_pos position = 0;
+    for (const auto & bytes : tokens) {
+        auto plan = runtime.plan_generated_token(episode_id, 0, position++, bytes);
+        CHECK(plan.has_value());
+        if (!plan) {
+            return;
+        }
+        // A caller must not expose marker-like prefixes from an unfinished
+        // list as public text or move its punctuation ahead of the opener.
+        CHECK(bytes.substr(0, plan->marker_step.public_prefix_bytes).empty());
+        CHECK(runtime.commit_token(episode_id, 0, *plan));
+        const auto ready = mux.append(
+            0, plan->run_id, bytes, runtime.episode(episode_id)->document,
+            plan->marker_step.public_prefix_bytes);
+        CHECK(ready.ok);
+        for (const auto & line : ready.lines) {
+            emitted += line;
+        }
+        if (!plan->parser_step.record_closed) {
+            CHECK(emitted.empty());
+        }
+    }
+    CHECK(emitted == "<ol>\n<li>第一项。\n</li>\n</ol>\n");
+}
+
 static void test_marker_token_preserves_public_prefix() {
     server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
     const uint64_t episode_id = runtime.adopt_root(96, 96, 0, 0, 0);
+    CHECK(commit_generated(
+        runtime, episode_id, 0, 0,
+        "<ol><li>Marker A</li><li>Marker B</li></ol>"));
+    runtime.finish_frontier(episode_id);
+    CHECK(runtime.freeze_fork_parent(episode_id, 0));
+    start_child(runtime, episode_id, 0, 1);
+
+    auto * child = runtime.node(episode_id, 1);
+    CHECK(child != nullptr);
+    if (!child) {
+        return;
+    }
+    const std::string id(child->control_id());
     server_rerot_line_mux mux;
 
     auto plan = runtime.plan_generated_token(
-        episode_id, 0, 0, "answer</p");
+        episode_id, 1, child->storage_pos_next, "answer</p");
     CHECK(plan.has_value());
-    CHECK(plan && runtime.commit_token(episode_id, 0, *plan));
+    CHECK(plan && plan->visibility ==
+        llama_rerot_visibility::pending_record);
+    CHECK(plan && runtime.commit_token(episode_id, 1, *plan));
     if (!plan) {
         return;
     }
+    const auto body_run = plan->run_id;
+    const auto * body_before =
+        runtime.episode(episode_id)->document.run(body_run);
+    CHECK(body_before && body_before->visibility ==
+        llama_rerot_visibility::pending_record);
     auto ready = mux.append(
-        0, plan->run_id, "answer</p", runtime.episode(episode_id)->document);
+        1, plan->run_id, "answer</p", runtime.episode(episode_id)->document);
     CHECK(ready.ok && ready.lines.empty());
 
-    auto * node = runtime.node(episode_id, 0);
-    CHECK(node != nullptr);
+    child = runtime.node(episode_id, 1);
     plan = runtime.plan_generated_token(
-        episode_id, 0, node ? node->storage_pos_next : 1, "></");
+        episode_id, 1, child ? child->storage_pos_next : 1, "></");
     CHECK(plan.has_value());
     CHECK(plan && plan->marker_step.public_prefix_bytes == 1);
-    CHECK(plan && runtime.commit_token(episode_id, 0, *plan));
+    const auto * body_after =
+        runtime.episode(episode_id)->document.run(body_run);
+    CHECK(body_after && body_after->visibility ==
+        llama_rerot_visibility::public_live);
+    CHECK(plan && runtime.commit_token(episode_id, 1, *plan));
     if (!plan) {
         return;
     }
     ready = mux.append(
-        0,
+        1,
         plan->run_id,
         "></",
         runtime.episode(episode_id)->document,
         plan->marker_step.public_prefix_bytes);
     CHECK(ready.ok && ready.lines.empty());
 
-    node = runtime.node(episode_id, 0);
-    CHECK(node != nullptr);
+    child = runtime.node(episode_id, 1);
+    CHECK(child != nullptr);
     plan = runtime.plan_generated_token(
-        episode_id, 0, node ? node->storage_pos_next : 2, "blockquote>");
+        episode_id, 1, child ? child->storage_pos_next : 2, id + ">");
     CHECK(plan.has_value());
     CHECK(plan && plan->marker_step.marker_closed);
-    CHECK(plan && runtime.commit_token(episode_id, 0, *plan));
+    CHECK(plan && runtime.commit_token(episode_id, 1, *plan));
     if (!plan) {
         return;
     }
     ready = mux.append(
-        0,
+        1,
         plan->run_id,
-        "blockquote>",
+        id + ">",
         runtime.episode(episode_id)->document,
         plan->marker_step.public_prefix_bytes);
     CHECK(ready.ok && ready.lines.empty());
 
-    ready = mux.finish(0, runtime.episode(episode_id)->document);
+    ready = mux.finish(1, runtime.episode(episode_id)->document);
     CHECK(ready.ok);
     CHECK(ready.lines == std::vector<std::string>({"answer</p>\n"}));
     CHECK(mux.empty());
@@ -291,40 +365,7 @@ static void test_split_pending_record_resolution() {
         runtime.episode(episode_id)->document);
     CHECK(ready.ok && ready.lines == std::vector<std::string>({"public line\n"}));
 
-    node = runtime.node(episode_id, 0);
-    auto marker_a = runtime.plan_generated_token(
-        episode_id, 0, node->storage_pos_next, "</blockquo");
-    CHECK(marker_a.has_value());
-    CHECK(marker_a && runtime.commit_token(episode_id, 0, *marker_a));
-    if (!marker_a) {
-        return;
-    }
-    ready = mux.append(0, marker_a->run_id, "</blockquo",
-        runtime.episode(episode_id)->document);
-    CHECK(ready.ok && ready.lines.empty());
-
-    node = runtime.node(episode_id, 0);
-    auto marker_b = runtime.plan_generated_token(
-        episode_id, 0, node->storage_pos_next + 1, "te>");
-    CHECK(marker_b.has_value());
-    CHECK(marker_b && marker_b->run_id != marker_a->run_id);
-    CHECK(marker_b && marker_b->marker_step.marker_closed);
-    CHECK(marker_b && runtime.commit_token(episode_id, 0, *marker_b));
-    if (!marker_b) {
-        return;
-    }
-    ready = mux.append(0, marker_b->run_id, "te>",
-        runtime.episode(episode_id)->document);
-    CHECK(ready.ok && ready.lines.empty());
     CHECK(mux.empty());
-
-    episode = runtime.episode(episode_id);
-    CHECK(episode && episode->pending_tokens == 0);
-    CHECK(episode && episode->generated_private_tokens == 2);
-    CHECK(episode && episode->document.run(marker_a->run_id)->visibility ==
-        llama_rerot_visibility::private_control);
-    CHECK(episode && episode->document.run(marker_b->run_id)->visibility ==
-        llama_rerot_visibility::private_control);
     CHECK(runtime.erase_episode(episode_id));
 
     server_rerot_runtime prefix_runtime(
@@ -438,31 +479,23 @@ static void test_n1_no_fork_disarm_forever() {
     CHECK(!frontier.natural_final());
     CHECK(!frontier.hard_aborted);
 
-    // Later planner-shaped text is ordinary body content, never a re-fork.
+    // N=1 never invents a child delimiter or a synthetic thought close.
+    CHECK(node && node->control_id().empty());
+    CHECK(runtime.continue_unforked_root(episode_id, 0));
+    episode = runtime.episode(episode_id);
+    CHECK(episode && episode->serial_tail && episode->serial_node == 0);
+
+    // Later planner-shaped text is ordinary serial content, never a re-fork.
     node = runtime.node(episode_id, 0);
-    CHECK(commit_generated(runtime, episode_id, 0, node->storage_pos_next, "Body mentions "));
-    node = runtime.node(episode_id, 0);
-    CHECK(commit_generated(runtime, episode_id, 0, node->storage_pos_next, "<ol><li>Again</li></ol>"));
+    const auto serial = runtime.plan_serial_token(
+        episode_id, 0, node->storage_pos_next);
+    CHECK(serial.has_value());
+    CHECK(serial && runtime.commit_token(episode_id, 0, *serial));
     node = runtime.node(episode_id, 0);
     CHECK(node != nullptr && !node->planner_armed);
     episode = runtime.episode(episode_id);
     CHECK(episode && episode->document.node_count() == 1);
     CHECK(episode && episode->ready_queue.empty());
-
-    // Single RUNNING Lane with empty queue/starting exits into natural final,
-    // then fence refresh and serial tail transition keep the root response.
-    request_exit(runtime, episode_id, 0);
-    frontier = runtime.finish_frontier(episode_id);
-    CHECK(frontier.natural_final());
-    CHECK(frontier.final_node == 0);
-    CHECK(frontier.retired.empty());
-
-    std::vector<uint32_t> fence_runs;
-    CHECK(runtime.refresh_final_fence(episode_id, 0, &fence_runs));
-    CHECK(!fence_runs.empty());
-    CHECK(runtime.complete_serial_tail(episode_id, 0));
-    episode = runtime.episode(episode_id);
-    CHECK(episode && episode->serial_tail && episode->serial_node == 0);
     CHECK(runtime.response_task_id(episode_id) == 101);
     CHECK(runtime.erase_episode(episode_id));
 }
@@ -911,9 +944,12 @@ static void test_episode_state_round_trip_and_fingerprint() {
     CHECK(episode_id == 77);
     CHECK(commit_private(runtime, episode_id, 0, 10));
     CHECK(commit_generated(runtime, episode_id, 0, 11,
-        "<ol><li>Persist this terminal task</li></ol>"));
+        "<ol><li>Persist child A</li><li>Persist child B</li></ol>"));
+    CHECK(runtime.finish_frontier(episode_id).forked.size() == 1);
+    CHECK(runtime.freeze_fork_parent(episode_id, 0));
+    start_child(runtime, episode_id, 0, 1);
 
-    auto * lane = runtime.node(episode_id, 0);
+    auto * lane = runtime.node(episode_id, 1);
     CHECK(lane != nullptr);
     if (lane) {
         lane->sampler_blob = {1, 2, 3, 4};
@@ -921,6 +957,10 @@ static void test_episode_state_round_trip_and_fingerprint() {
         lane->view_stamp = {4, 5, 6};
     }
 
+    const std::string saved_marker = lane ? lane->exit_parser.marker() : "";
+    const auto saved_marker_state = lane
+        ? lane->exit_parser.snapshot()
+        : server_rerot_marker_snapshot{};
     const auto fp = test_state_fingerprints();
     std::vector<uint8_t> blob;
     std::string error;
@@ -933,7 +973,7 @@ static void test_episode_state_round_trip_and_fingerprint() {
     CHECK(restored.load_episode(blob.data(), blob.size(), fp, &restored_id, &error));
     CHECK(restored_id == episode_id);
     const auto * restored_episode = restored.episode(restored_id);
-    const auto * restored_lane = restored.node(restored_id, 0);
+    const auto * restored_lane = restored.node(restored_id, 1);
     CHECK(restored_episode != nullptr);
     CHECK(restored_episode && restored_episode->root_task_id == 280);
     CHECK(restored_episode && restored_episode->response_task_id == 281);
@@ -944,6 +984,9 @@ static void test_episode_state_round_trip_and_fingerprint() {
     CHECK(restored_lane && restored_lane->view_stamp.topology_epoch == 4);
     CHECK(restored_lane && restored_lane->view_stamp.publish_epoch == 5);
     CHECK(restored_lane && restored_lane->view_stamp.layout_epoch == 6);
+    CHECK(restored_lane && restored_lane->exit_parser.marker() == saved_marker);
+    CHECK(restored_lane &&
+        restored_lane->exit_parser.snapshot().candidate == saved_marker_state.candidate);
     CHECK(restored_episode && restored_episode->document.validate(&error));
 
     server_rerot_runtime wrong_model(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
@@ -1374,9 +1417,8 @@ static void test_multi_person_multi_pen_bxp_stress() {
         const auto p_pens = runtime.pens_for_person(ep);
         if (child_counts[i] == 1) {
             make_terminal(runtime, ep, 0);
-            request_exit(runtime, ep, 0);
-            auto f = runtime.finish_frontier(ep);
-            CHECK(f.natural_final());
+            CHECK(runtime.continue_unforked_root(ep, 0));
+            CHECK(runtime.episode(ep)->serial_tail);
         } else {
             // Retire all children except the last one
             for (size_t c = 1; c < size_t(child_counts[i]); ++c) {
@@ -1519,12 +1561,10 @@ static void test_shared_prefix_multi_branch_union_and_preemption() {
     CHECK(runtime.pens_allocated() == 1); // Only Ep3 remains
     CHECK(runtime.pens_for_person(ep3).size() == 1);
 
-    // Ep3 finishes naturally
+    // Ep3 takes the delimiter-free N=1 serial path.
     make_terminal(runtime, ep3, 0);
-    request_exit(runtime, ep3, 0);
-    auto f3 = runtime.finish_frontier(ep3);
-    CHECK(f3.natural_final());
-    CHECK(f3.final_node == 0);
+    CHECK(runtime.continue_unforked_root(ep3, 0));
+    CHECK(runtime.episode(ep3)->serial_tail);
 
     CHECK(runtime.erase_episode(ep2));
     CHECK(runtime.erase_episode(ep3));
@@ -1964,20 +2004,9 @@ static void test_multi_episode_concurrent_final_fence_and_coordinate_freeze() {
     CHECK(commit_generated(runtime, ep1, 0, 0, n1_xml));
     runtime.finish_frontier(ep1);
 
-    // Episode 1 survivor plans a generated token and emits </think>
-    CHECK(commit_generated(runtime, ep1, 0, 10, "conclusion"));
-    runtime.finish_frontier(ep1);
-
-    auto * node1 = runtime.node(ep1, 0);
-    CHECK(node1 != nullptr);
-    node1->exit_intent = true;
-    ep1_ptr->finalizing = true;
-
-    // Refresh final fence on Episode 1
-    std::vector<uint32_t> fence_runs;
-    CHECK(runtime.refresh_final_fence(ep1, 0, &fence_runs));
-    CHECK(!fence_runs.empty());
-    CHECK(runtime.complete_serial_tail(ep1, 0));
+    // N=1 roots have no child delimiter and continue serially without
+    // observing or synthesizing the model-native thought boundary.
+    CHECK(runtime.continue_unforked_root(ep1, 0));
 
     // Validate serial tail state and execute coordinate freeze on Episode 1
     std::string err;
@@ -1994,15 +2023,12 @@ static void test_multi_episode_concurrent_final_fence_and_coordinate_freeze() {
     // Invariant: Episode 1 serial tail is not corrupted by Episode 2 execution
     CHECK(runtime.validate_serial_tail_state(ep1, 0, &err));
 
-    // Now Episode 2 finishes its reasoning and reaches final fence
-    auto * node2 = runtime.node(ep2, 0);
-    CHECK(node2 != nullptr);
-    node2->exit_intent = true;
-    ep2_ptr->finalizing = true;
-
-    std::vector<uint32_t> ep2_fence_runs;
-    CHECK(runtime.refresh_final_fence(ep2, 0, &ep2_fence_runs));
-    CHECK(runtime.complete_serial_tail(ep2, 0));
+    // Episode 2 independently takes the same delimiter-free N=1 path.
+    CHECK(commit_generated(
+        runtime, ep2, 0, runtime.node(ep2, 0)->storage_pos_next,
+        "<ol><li>Single task</li></ol>"));
+    runtime.finish_frontier(ep2);
+    CHECK(runtime.continue_unforked_root(ep2, 0));
     CHECK(runtime.validate_serial_tail_state(ep2, 0, &err));
     CHECK(runtime.freeze_serial_coordinates(ep2, 0, &err));
 
@@ -2021,6 +2047,7 @@ int main() {
     test_pen_capacity_and_multi_episode_allocation();
     test_chronicle_to_canonical_mapping_registry();
     test_line_mux_completion_order_and_visibility();
+    test_list_marker_prefixes_remain_atomic();
     test_marker_token_preserves_public_prefix();
     test_split_pending_record_resolution();
     test_private_span_reserves_one_contiguous_run();

@@ -9140,6 +9140,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 GGML_TYPE_Q6_K, GGML_TYPE_F32,
                 64, n, 256, {1, 1}, {1, 1}));
     }
+    // Recurrent/RERoT decode stores one column per outer batch instead of
+    // ne11. Both layouts must hit the shared-matrix multi-column path without
+    // changing the logical four-dimensional result.
+    test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q6_K, GGML_TYPE_F32,
+            64, 1, 256, {1, 1}, {7, 1}));
+    test_cases.emplace_back(new test_mul_mat(
+            GGML_TYPE_Q6_K, GGML_TYPE_F32,
+            64, 1, 256, {1, 1}, {18, 1}));
 
     // TQ4_1S: Gemma-4 E2B dimensions. The fused mul_mat_vec kernel has a
     // shared-memory WHT on the activation and dequantizes centroid*scale per

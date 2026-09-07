@@ -3,6 +3,9 @@
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
+#include <cmath>
+
 // utility to get one slice from the third dimension
 // input dim:  [x, y, c, b]
 // output dim: [x, y, 1, b]
@@ -422,6 +425,64 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     return {output, new_state};
 }
 
+llm_build_delta_net_base::delta_net_rbb_result
+llm_build_delta_net_base::build_delta_net_rbb(
+        ggml_tensor * q,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        ggml_tensor * g,
+        ggml_tensor * b,
+        ggml_tensor * brain_state,
+        ggml_tensor * native_state,
+        int           il) {
+    const int64_t S_v = v->ne[0];
+    const int64_t H_v = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs = v->ne[3];
+
+    GGML_ASSERT(n_tokens == 1);
+    GGML_ASSERT(n_seqs >= 1);
+    GGML_ASSERT(g->ne[0] == 1);
+    brain_state =
+        ggml_reshape_4d(ctx0, brain_state, S_v, S_v, H_v, 1);
+    native_state =
+        ggml_reshape_4d(ctx0, native_state, S_v, S_v, H_v, n_seqs);
+
+    ggml_tensor * result =
+        ggml_gated_delta_net_rbb(
+            ctx0, q, k, v, g, b, brain_state, native_state);
+    res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
+
+    ggml_tensor * output = ggml_view_4d(
+        ctx0, result,
+        S_v, H_v, n_tokens, n_seqs,
+        ggml_row_size(result->type, S_v),
+        ggml_row_size(result->type, S_v * H_v),
+        ggml_row_size(result->type, S_v * H_v * n_tokens),
+        0);
+
+    const size_t output_bytes =
+        ggml_row_size(result->type, S_v * H_v * n_tokens * n_seqs);
+    const size_t state_bytes =
+        ggml_row_size(result->type, S_v * S_v * H_v);
+
+    ggml_tensor * merged_state = ggml_view_4d(
+        ctx0, result,
+        S_v, S_v, H_v, 1,
+        ggml_row_size(result->type, S_v),
+        ggml_row_size(result->type, S_v * S_v),
+        state_bytes,
+        output_bytes);
+    ggml_tensor * hand_deltas = ggml_view_4d(
+        ctx0, result,
+        S_v, S_v, H_v, n_seqs,
+        ggml_row_size(result->type, S_v),
+        ggml_row_size(result->type, S_v * S_v),
+        state_bytes,
+        output_bytes + state_bytes);
+    return {output, merged_state, hand_deltas};
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net(
         ggml_tensor * q,
         ggml_tensor * k,
@@ -524,9 +585,85 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     return conv_input;
 }
 
+void llm_build_delta_net_base::build_rbb_parallel_commit(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        ssm_states_all,
+        ggml_tensor *        candidate_states,
+        int64_t              n_snapshots,
+        int                  il) {
+    const auto * mctx_cur = inp->mctx;
+    GGML_ASSERT(mctx_cur->is_s_shared(il));
+    GGML_ASSERT(inp->brain_copy != nullptr);
+    GGML_ASSERT(n_snapshots > 0);
+
+    const int64_t D = hparams.n_embd_s();
+    const int64_t n_seqs = ubatch.n_seqs;
+    const uint32_t brain_size = mctx_cur->get_brain_size();
+    const size_t row_size =
+        ggml_row_size(ssm_states_all->type, hparams.n_embd_s());
+
+    ggml_tensor * candidates =
+        ggml_reshape_3d(ctx0, candidate_states, D, n_seqs, n_snapshots);
+
+    for (const auto & group : inp->rbb_groups) {
+        GGML_ASSERT(group.brain_row >= 0);
+        GGML_ASSERT((uint32_t) group.brain_row < brain_size);
+        GGML_ASSERT(group.public_rows != nullptr);
+        GGML_ASSERT(group.public_rows->ne[0] > 0);
+
+        for (int64_t snapshot = 0; snapshot < n_snapshots; ++snapshot) {
+            ggml_tensor * candidate_snapshot = ggml_view_2d(
+                ctx0, candidates, D, n_seqs, candidates->nb[1],
+                (size_t) snapshot * candidates->nb[2]);
+            ggml_tensor * selected =
+                ggml_get_rows(ctx0, candidate_snapshot, group.public_rows);
+            ggml_tensor * reduced = selected;
+            if (group.public_rows->ne[0] > 1) {
+                ggml_tensor * transposed =
+                    ggml_cont(ctx0, ggml_transpose(ctx0, selected));
+                reduced = ggml_sum_rows(ctx0, transposed);
+            }
+            reduced = ggml_reshape_1d(ctx0, reduced, D);
+
+            const uint32_t public_brains = brain_size / 2;
+            if (snapshot > 0 &&
+                (uint32_t) group.brain_row >= public_brains) {
+                continue;
+            }
+            const size_t destination_row = snapshot == 0
+                ? (uint32_t) group.brain_row
+                : (size_t) brain_size +
+                    (size_t) (snapshot - 1) * public_brains +
+                    (uint32_t) group.brain_row;
+            ggml_tensor * destination = ggml_view_1d(
+                ctx0, ssm_states_all, D, destination_row * row_size);
+
+            if (group.public_rows->ne[0] > 1) {
+                // The candidate-state path uses the documented symmetric
+                // mean; scaling deltas by 1/sqrt(N) amplifies concurrent writes.
+                reduced = ggml_scale(
+                    ctx0, reduced, 1.0f / (float) group.public_rows->ne[0]);
+            }
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, reduced, destination));
+        }
+    }
+}
+
+bool llm_build_delta_net_base::uses_parallel_delta(
+        const llm_graph_input_rs * inp, int il) const {
+    return inp->mctx->is_s_shared(il) &&
+        cparams.n_rs_seq == 0 &&
+        ubatch.n_seq_tokens == 1 &&
+        ubatch.n_seqs >= 1 &&
+        inp->rbb_groups.size() == 1 &&
+        inp->rbb_groups[0].public_rows->ne[0] == ubatch.n_seqs;
+}
+
 ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         llm_graph_input_rs * inp,
         ggml_tensor *        ssm_states_all,
+        ggml_tensor *        state_base,
+        ggml_tensor *        hand_echo_all,
         ggml_tensor *        q,
         ggml_tensor *        k,
         ggml_tensor *        v,
@@ -538,12 +675,54 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const auto   kv_head    = mctx_cur->get_head();
     const uint32_t mem_size = mctx_cur->get_size();
 
-    const int64_t S_v          = s->ne[0];
-    const int64_t H_v          = s->ne[2];
-    const int64_t n_seqs       = s->ne[3];
+    const int64_t S_v          = v->ne[0];
+    const int64_t H_v          = v->ne[1];
+    const int64_t n_seqs       = v->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
     const bool keep = cparams.n_rs_seq > 0;
+
+    if (uses_parallel_delta(inp, il)) {
+        GGML_ASSERT(g->ne[0] == 1);
+        GGML_ASSERT(state_base != nullptr);
+        GGML_ASSERT(hand_echo_all != nullptr);
+
+        // PUBLIC rows advance the shared brain through one order-free block
+        // transition. The fused kernel also advances each Lane's native
+        // brain+hand state, returning its causal readout and residual against
+        // the committed brain without a second GDN pass.
+        const auto rbb =
+            build_delta_net_rbb(q, k, v, g, b, state_base, s, il);
+        cb(rbb.output, "attn_output", il);
+        cb(rbb.merged_state, "new_state", il);
+
+        const auto & group = inp->rbb_groups[0];
+        const size_t row_size =
+            ggml_row_size(ssm_states_all->type, hparams.n_embd_s());
+        ggml_tensor * destination = ggml_view_1d(
+            ctx0,
+            ssm_states_all,
+            hparams.n_embd_s(),
+            (size_t) group.brain_row * row_size);
+        ggml_build_forward_expand(
+            gf, ggml_cpy(ctx0, rbb.merged_state, destination));
+
+        ggml_tensor * hand_destination = ggml_view_2d(
+            ctx0,
+            hand_echo_all,
+            hparams.n_embd_s(),
+            n_seqs,
+            hand_echo_all->nb[1],
+            (size_t) kv_head * hand_echo_all->nb[1]);
+        ggml_tensor * hand_delta = ggml_reshape_2d(
+            ctx0,
+            rbb.hand_deltas,
+            hparams.n_embd_s(),
+            n_seqs);
+        ggml_build_forward_expand(
+            gf, ggml_cpy(ctx0, hand_delta, hand_destination));
+        return rbb.output;
+    }
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
@@ -552,10 +731,48 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         cb(output, "attn_output", il);
         cb(new_state, "new_state", il);
 
-        ggml_build_forward_expand(gf,
-                ggml_cpy(ctx0, new_state,
-                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+        if (mctx_cur->is_s_shared(il)) {
+            GGML_ASSERT(state_base != nullptr);
+            GGML_ASSERT(hand_echo_all != nullptr);
+            const int64_t D = hparams.n_embd_s();
+            ggml_tensor * baseline_state = ggml_reshape_4d(
+                ctx0, state_base, S_v, S_v, H_v, n_seqs);
+            ggml_tensor * hand_reference = baseline_state;
+
+            if (!inp->rbb_groups.empty()) {
+                // PUBLIC commits are evaluated from the brain-only baseline.
+                // The native path above remains brain+hand for this Lane's
+                // output. Their difference is the evolved private hand and is
+                // never included in the shared commit.
+                const auto baseline =
+                    build_delta_net(q, k, v, g, b, baseline_state, il);
+                cb(baseline.second, "brain_candidate_states", il);
+                hand_reference = baseline.second;
+                build_rbb_parallel_commit(
+                    inp, ssm_states_all, baseline.second,
+                    /*n_snapshots=*/1, il);
+            }
+
+            ggml_tensor * hand_destination = ggml_view_2d(
+                ctx0,
+                hand_echo_all,
+                D,
+                n_seqs,
+                hand_echo_all->nb[1],
+                (size_t) kv_head * hand_echo_all->nb[1]);
+            ggml_tensor * hand_delta = ggml_reshape_2d(
+                ctx0,
+                ggml_sub(ctx0, new_state, hand_reference),
+                D,
+                n_seqs);
+            ggml_build_forward_expand(
+                gf, ggml_cpy(ctx0, hand_delta, hand_destination));
+        } else {
+            ggml_build_forward_expand(gf,
+                    ggml_cpy(ctx0, new_state,
+                        ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                            kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+        }
 
         return output;
     }
@@ -594,13 +811,18 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_row_size(gdn_out->type, state_size_per_snap),
         ggml_row_size(gdn_out->type, attn_score_elems));
 
-    ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all,
-        D, n_seqs, n_written,
-        ssm_states_all->nb[1],
-        (size_t) mem_size * row_size,
-        (size_t) kv_head * row_size);
+    if (mctx_cur->is_s_shared(il)) {
+        build_rbb_parallel_commit(
+            inp, ssm_states_all, src, n_written, il);
+    } else {
+        ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all,
+            D, n_seqs, n_written,
+            ssm_states_all->nb[1],
+            (size_t) mem_size * row_size,
+            (size_t) kv_head * row_size);
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+    }
 
     return output;
 }

@@ -880,6 +880,9 @@ bool set_process_priority(enum ggml_sched_priority prio);
 LLAMA_COMMON_ATTRIBUTE_FORMAT(1, 2)
 std::string string_format(const char * fmt, ...);
 
+// Random base62 identifiers, independent of model sampling.
+std::string random_string(size_t length = 32);
+
 std::string string_strip(const std::string & str);
 std::string string_get_sortable_timestamp();
 std::string string_lcs(std::string_view a, std::string_view b);
