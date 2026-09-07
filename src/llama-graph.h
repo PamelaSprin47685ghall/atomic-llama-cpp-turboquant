@@ -535,6 +535,15 @@ struct llm_graph_fp_key {
     int32_t  n_pos  = 1;  // positions per token (model-fixed; q_pos stride)
     int32_t  backend_variant = 0; // 0 = unset, 1 = CPU reference, 2 = Vulkan fused
 
+    // The metadata is shared by layers, but their K/V formats need not be.
+    // Indexed by logical layer; (-1,-1) denotes an ineligible layer.
+    std::vector<std::pair<int32_t, int32_t>> layer_kv_types;
+
+    bool matches_layer_types(int32_t il, int32_t k, int32_t v) const {
+        return il >= 0 && (size_t) il < layer_kv_types.size() &&
+            layer_kv_types[il].first == k && layer_kv_types[il].second == v;
+    }
+
     bool operator==(const llm_graph_fp_key & o) const {
         return mode == o.mode && tail_scope == o.tail_scope && block_q == o.block_q &&
                block_k == o.block_k && sink_blocks == o.sink_blocks &&
@@ -547,7 +556,8 @@ struct llm_graph_fp_key {
                max_sel_pair == o.max_sel_pair && u_layout_cap == o.u_layout_cap && n_groups == o.n_groups &&
                dk == o.dk && dv == o.dv && n_kv_heads == o.n_kv_heads &&
                n_q_heads == o.n_q_heads && k_type == o.k_type && v_type == o.v_type &&
-               n_pos == o.n_pos && backend_variant == o.backend_variant;
+               n_pos == o.n_pos && backend_variant == o.backend_variant &&
+               layer_kv_types == o.layer_kv_types;
     }
     bool operator!=(const llm_graph_fp_key & o) const { return !(*this == o); }
 };

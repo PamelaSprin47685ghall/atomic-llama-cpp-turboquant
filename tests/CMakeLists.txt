@@ -116,7 +116,26 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+# The probe runner must fail on failed checks, independently of GPU/model
+# availability. Its tests use only the Python standard library.
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if (Python3_Interpreter_FOUND)
+    foreach(check nanbeige-audit nanbeige-report)
+        add_test(NAME test-${check}
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-${check}.py)
+        set_tests_properties(test-${check} PROPERTIES LABELS "python" TIMEOUT 30)
+    endforeach()
+endif()
+
 # build test-tokenizer-0 target once and add many tests
+add_executable(test-turbo-quant test-turbo-quant.c)
+target_include_directories(test-turbo-quant PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+target_link_libraries(test-turbo-quant PRIVATE ggml-base)
+if (NOT MSVC)
+    target_link_libraries(test-turbo-quant PRIVATE m)
+endif()
+llama_test(test-turbo-quant)
+
 llama_build(test-tokenizer-0.cpp)
 
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-bert-bge          ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-bert-bge.gguf)

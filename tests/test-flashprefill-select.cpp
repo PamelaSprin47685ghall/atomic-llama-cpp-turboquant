@@ -3,7 +3,7 @@
 // Covers the FlashPrefill V2 tile-energy selector (PREFILL.md section 3.2)
 // and the GGML SELECT wire contract (ggml/include/ggml-flashprefill.h):
 //
-//   - PackGQA mapping for G=1/2/4/8, BM both dividing and NOT dividing G,
+//   - PackGQA mapping for G=1/2/4/6/8, BM both dividing and NOT dividing G,
 //     including tiles that split a GQA group and partial tail tiles.
 //   - Tile-energy selection with a GLOBAL max over all (row, candidate)
 //     pairs (not per-head top-k, not mean-logit averaging).
@@ -48,7 +48,7 @@
 // Self-contained: no shared fixture file. Math tests always run; backend
 // tests run on CPU by default and additionally/alternatively on --backend.
 //
-// Not wired into tests/CMakeLists.txt yet (Main registers later).
+// Registered in tests/CMakeLists.txt; GPU checks are explicitly requested.
 
 #include "ggml-flashprefill.h"
 #include "ggml.h"
@@ -274,8 +274,8 @@ static bool check_int_sets(const char * what,
 static int64_t packgqa_rows(int64_t n_tokens, int64_t g) { return n_tokens * g; }
 
 static void test_packgqa_mapping() {
-    std::puts("--- PackGQA mapping G=1/2/4/8, BM dividing and non-dividing ---");
-    const int64_t groups[4] = {1, 2, 4, 8};
+    std::puts("--- PackGQA mapping G=1/2/4/6/8, BM dividing and non-dividing ---");
+    const int64_t groups[] = {1, 2, 4, 6, 8}; // Nanbeige has GQA ratio 6
     const int64_t bms[] = {1, 2, 3, 4, 5, 6, 7, 8, 16, 100, 127, 128};
     const int64_t token_counts[] = {1, 3, 5, 33};
     for (int64_t g : groups) {
@@ -294,23 +294,17 @@ static void test_packgqa_mapping() {
                     SELECT_CHECK_MSG(pos * g + sub == r, "G=%lld pack round trip r=%lld",
                             (long long) g, (long long) r);
                 }
-                // Boundary-split prediction: tile t>0 starts mid-group iff
-                // (t*BM) % G != 0; such a tile must span two positions.
+                // Starting mid-group means sharing a position with the
+                // preceding tile, not necessarily spanning two positions
+                // within this tile (BM=1 is an immediate counterexample).
                 for (int64_t t = 0; t < ntiles; ++t) {
                     const int64_t start = t * bm;
                     const int64_t end = std::min(start + bm, npack);
                     const bool predicted_split = (t > 0) && ((start % g) != 0);
-                    const bool observed_split = (start / g) != ((end - 1) / g);
-                    if (predicted_split) {
-                        SELECT_CHECK_MSG(observed_split,
-                                "G=%lld BM=%lld nt=%lld tile %lld starts mid-group but shows no split",
-                                (long long) g, (long long) bm, (long long) nt, (long long) t);
-                    }
-                    if (!predicted_split && (end - start) <= g) {
-                        SELECT_CHECK_MSG(!observed_split,
-                                "G=%lld BM=%lld nt=%lld tile %lld aligned but split",
-                                (long long) g, (long long) bm, (long long) nt, (long long) t);
-                    }
+                    const bool observed_split = start > 0 && start / g == (start - 1) / g;
+                    SELECT_CHECK(predicted_split == observed_split);
+                    const int64_t positions = (start % g + end - start + g - 1) / g;
+                    SELECT_CHECK(positions == (end - 1) / g - start / g + 1);
                 }
                 // Partial tail tile holds exactly the remainder rows.
                 const int64_t tail = npack - (ntiles - 1) * bm;
@@ -403,21 +397,22 @@ static bool check_oracle_vs_ref(const char * what,
 
 // Global-max discriminator: spiky fragment (strong in one row, weak in the
 // other) beats a uniformly mediocre fragment under tile-energy, while a
-// per-row-top-1-union or a mean-logit rule would keep the mediocre one.
+// per-row-top-1-union would also retain a weak candidate.
 static void test_energy_global_max_not_head_topk() {
     std::puts("--- energy: global max over rows, not head top-k / mean ---");
     constexpr int32_t dk = 4;
     constexpr int32_t n_rows = 2;
     constexpr int32_t n_cand = 3; // A spiky, B flat, C weak
-    // row0 Q = +8*e0, row1 Q = -8*e0; kbarA=+8*e0, kbarB=0, kbarC=-8*e0.
-    // scale=1/8: z(A)=(8,-8) M=8; S[A]=1+e^-16~=1, S[B]=2e^-8~=0.00067,
-    // S[C]=2e^-16~=0. alpha=0.5 keeps A only. Union-of-top-1 keeps {A,C}
-    // (C is row1's top-1); mean-logit ties A/B/C at 0. Energy keeps A.
+    // row0 Q = +8*e0, row1 Q = -4*e0; kbarA=+8*e0, kbarB=0, kbarC=-8*e0.
+    // scale=1/8: z(A)=(8,-4), z(C)=(-8,4), M=8.
+    // S[A]=1+e^-12, S[B]=2e^-8, S[C]=e^-16+e^-4. alpha=.5 keeps A
+    // only, unlike the row-top-1 union {A,C}. Symmetric +/-8 queries would
+    // give A and C equal energy and cannot discriminate these algorithms.
     std::vector<float> qpair((size_t) n_rows * n_cand * dk, 0.0f);
     std::vector<float> kbar((size_t) n_cand * dk, 0.0f);
     for (int32_t j = 0; j < n_cand; ++j) {
         qpair[((size_t) 0 * n_cand + j) * dk + 0] = 8.0f;
-        qpair[((size_t) 1 * n_cand + j) * dk + 0] = -8.0f;
+        qpair[((size_t) 1 * n_cand + j) * dk + 0] = -4.0f;
     }
     kbar[0 * dk + 0] = 8.0f;   // A: +e0
     kbar[2 * dk + 0] = -8.0f;  // C: -e0 (B stays zero)
@@ -1038,11 +1033,12 @@ static void test_metadata_rejections() {
                         GGML_FLASHPREFILL_ERR_DUP_KEY,
                 "dup row key rejected");
     }
-    // Duplicate token in one triple: point frag 1's use at frag 0's cells.
+    // Duplicate physical token in one triple while keeping each use inside
+    // its own fragment's legal cell-index range.
     {
         std::vector<int32_t> bad = fx.meta;
-        SELECT_CHECK(ggml_flashprefill_metadata_set_use(bad.data(), fx.meta_words, 1,
-                1, 0, 0, 0, 0, 2, 0, 0) == GGML_FLASHPREFILL_OK);
+        SELECT_CHECK(ggml_flashprefill_metadata_set_cell(bad.data(), fx.meta_words, 2, 0) ==
+                GGML_FLASHPREFILL_OK);
         SELECT_CHECK_MSG(ggml_flashprefill_metadata_validate(bad.data(), fx.meta_words) ==
                         GGML_FLASHPREFILL_ERR_DUP_TOKEN,
                 "dup token rejected");
@@ -1732,6 +1728,184 @@ static bool check_backend_plan(const char * dev_name,
 // Build the hotspot bm=4 graphs and run SELECT on one device. Returns true
 // when the device executed and matched; sets skipped when the device cannot
 // run SELECT (missing or unsupported op).
+static void test_backend_repeated_fragments(ggml_backend_t backend) {
+    // Two queries share all three fragments. The first two are proxies,
+    // the last is exact. Writing proxy uses over the score scratch used to
+    // overwrite the last fragment's score before the second query read it.
+    const int dk = 8, dv = 8, nq = 2, hq = 2, nf = 3, nu = nq * nf;
+    int64_t mw = 0;
+    SELECT_CHECK(ggml_flashprefill_metadata_words(nf, nq * hq, nu, nf, &mw) == 0);
+    std::vector<int32_t> meta((size_t) mw);
+    SELECT_CHECK(ggml_flashprefill_metadata_init(meta.data(), mw, nf, nq * hq, nu, nf,
+                dk, dv, 1, nq, hq) == 0);
+    SELECT_CHECK(ggml_flashprefill_metadata_set_counts(meta.data(), mw, nf, nq * hq, nu, nf) == 0);
+    for (int f = 0; f < nf; ++f) {
+        SELECT_CHECK(ggml_flashprefill_metadata_set_frag(meta.data(), mw, f, f, 1, f, 0, 0) == 0);
+        SELECT_CHECK(ggml_flashprefill_metadata_set_cell(meta.data(), mw, f, f) == 0);
+    }
+    for (int q = 0; q < nq; ++q) {
+        for (int h = 0; h < hq; ++h) {
+            SELECT_CHECK(ggml_flashprefill_metadata_set_row(meta.data(), mw, q * hq + h,
+                        q, 0, q, 0, 0, nq, 0, h) == 0);
+        }
+        for (int f = 0; f < nf; ++f) {
+            SELECT_CHECK(ggml_flashprefill_metadata_set_use(meta.data(), mw, q * nf + f,
+                        f, 0, 0, q, f, 1, 0, q) == 0);
+        }
+    }
+    SELECT_CHECK(ggml_flashprefill_metadata_validate(meta.data(), mw) == 0);
+    ggml_context_ptr ctx(ggml_init({1024 * 1024, nullptr, true}));
+    ggml_tensor * q = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, dk, nq, hq);
+    ggml_tensor * pool = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, dk + dv, 1, nf);
+    ggml_tensor * mt = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, mw);
+    ggml_tensor * out = ggml_flash_prefill_select(ctx.get(), q, pool, mt, 1, 1, nu,
+            1.0f, 0.5f, 0.0f, 0, true);
+    if (!out || !ggml_backend_supports_op(backend, out)) {
+        SELECT_CHECK_MSG(false, "repeated-fragment SELECT is unsupported");
+        return;
+    }
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    if (!buf) {
+        SELECT_CHECK_MSG(false, "repeated-fragment allocation failed");
+        return;
+    }
+    std::vector<float> qdata(dk * nq * hq, 0.0f), pdata((dk + dv) * nf, 0.0f);
+    for (int i = 0; i < nq * hq; ++i) qdata[i * dk] = 1.0f;
+    pdata[0] = -10.0f; pdata[dk + dv] = -1.0f; pdata[2 * (dk + dv)] = 1.0f;
+    ggml_backend_tensor_set(q, qdata.data(), 0, qdata.size() * sizeof(float));
+    ggml_backend_tensor_set(pool, pdata.data(), 0, pdata.size() * sizeof(float));
+    ggml_backend_tensor_set(mt, meta.data(), 0, meta.size() * sizeof(int32_t));
+    std::vector<int32_t> got((size_t) ggml_nelements(out), (int32_t) 0xa5a5a5a5u);
+    ggml_backend_tensor_set(out, got.data(), 0, got.size() * sizeof(int32_t));
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 32, false);
+    ggml_build_forward_expand(graph, out);
+    // Reuse the same graph and dirty output: neither header nor counters
+    // may depend on caller initialization, including a change to exact-all.
+    for (int run = 0; run < 3; ++run) {
+        if (run == 2) {
+            std::fill(qdata.begin(), qdata.end(), 0.0f); // all scores tie => all exact
+            ggml_backend_tensor_set(q, qdata.data(), 0, qdata.size() * sizeof(float));
+        }
+        if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+            SELECT_CHECK_MSG(false, "repeated-fragment graph compute failed");
+            return;
+        }
+        ggml_backend_tensor_get(out, got.data(), 0, got.size() * sizeof(int32_t));
+        if (ggml_flashprefill_plan_validate(got.data(), (int64_t) got.size()) != 0) {
+            SELECT_CHECK_MSG(false, "repeated-fragment plan invalid (run=%d, error=%d)", run, got[10]);
+            continue;
+        }
+        SELECT_CHECK(ggml_flashprefill_plan_validate_against_metadata(got.data(),
+                    (int64_t) got.size(), meta.data(), mw) == 0);
+        const std::vector<int32_t> exact = run == 2 ? std::vector<int32_t>{0, 1, 2, 3, 4, 5} :
+                                                                    std::vector<int32_t>{2, 5};
+        const std::vector<int32_t> proxy = run == 2 ? std::vector<int32_t>{} :
+                                                                    std::vector<int32_t>{0, 1, 3, 4};
+        SELECT_CHECK(got[got[8]] == (int32_t) exact.size());
+        SELECT_CHECK(got[got[8] + 1] == (int32_t) proxy.size());
+        SELECT_CHECK(std::equal(exact.begin(), exact.end(), got.begin() + got[6]));
+        SELECT_CHECK(std::equal(proxy.begin(), proxy.end(), got.begin() + got[7]));
+        ggml_flashprefill_plan_stats stats{};
+        SELECT_CHECK(ggml_flashprefill_plan_get_stats(got.data(), (int64_t) got.size(), &stats) == 0);
+        SELECT_CHECK(stats.visible_tokens == nu);
+        SELECT_CHECK(stats.exact_tokens == (int64_t) exact.size());
+        SELECT_CHECK(stats.sparse_rows == (run == 2 ? 0 : nq * hq));
+    }
+    // An invalid input must not leave yesterday's valid output header.
+    // A subsequent valid run must recover without caller-side plan reset.
+    const int32_t saved_magic = meta[0];
+    meta[0] = 0;
+    ggml_backend_tensor_set(mt, meta.data(), 0, meta.size() * sizeof(int32_t));
+    // CPU exposes invalid input through the plan header. Vulkan also
+    // rejects the graph at its mandatory plan-error readback boundary.
+    const bool is_vulkan = std::string(ggml_backend_name(backend)).find("Vulkan") != std::string::npos;
+    SELECT_CHECK(ggml_backend_graph_compute(backend, graph) ==
+            (is_vulkan ? GGML_STATUS_FAILED : GGML_STATUS_SUCCESS));
+    ggml_backend_tensor_get(out, got.data(), 0, got.size() * sizeof(int32_t));
+    SELECT_CHECK(got[10] != GGML_FLASHPREFILL_OK);
+    meta[0] = saved_magic;
+    ggml_backend_tensor_set(mt, meta.data(), 0, meta.size() * sizeof(int32_t));
+    SELECT_CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(out, got.data(), 0, got.size() * sizeof(int32_t));
+    SELECT_CHECK(ggml_flashprefill_plan_validate_against_metadata(got.data(),
+                (int64_t) got.size(), meta.data(), mw) == GGML_FLASHPREFILL_OK);
+}
+
+static void test_backend_grid_stride(ggml_backend_t backend) {
+    // One Q group but many packed tiles: a scheduling cap must stride over
+    // all tiles, not silently process just the first. Multiple KV heads and
+    // repeated execution also exercise per-pair ownership and counter reset.
+    for (int tiles : {1, 3, 17}) for (int hkv : {1, 2}) {
+        const int dk = 8, dv = 8, nf = 2, nr = tiles * hkv, nu = nr * nf, hq = nr;
+        int64_t mw = 0;
+        SELECT_CHECK(ggml_flashprefill_metadata_words(nf, nr, nu, nf, &mw) == 0);
+        std::vector<int32_t> meta((size_t) mw);
+        SELECT_CHECK(ggml_flashprefill_metadata_init(meta.data(), mw, nf, nr, nu, nf,
+                    dk, dv, hkv, 1, hq) == 0);
+        SELECT_CHECK(ggml_flashprefill_metadata_set_counts(meta.data(), mw, nf, nr, nu, nf) == 0);
+        for (int f = 0; f < nf; ++f) {
+            SELECT_CHECK(ggml_flashprefill_metadata_set_frag(meta.data(), mw, f, f, 1, f, 0, 0) == 0);
+            SELECT_CHECK(ggml_flashprefill_metadata_set_cell(meta.data(), mw, f, f) == 0);
+        }
+        for (int t = 0; t < tiles; ++t) for (int h = 0; h < hkv; ++h) {
+            const int pair = t * hkv + h;
+            SELECT_CHECK(ggml_flashprefill_metadata_set_row(meta.data(), mw, pair,
+                        0, h, 0, t, 0, 1, 0, h * tiles + t) == 0);
+            for (int f = 0; f < nf; ++f) {
+                SELECT_CHECK(ggml_flashprefill_metadata_set_use(meta.data(), mw, pair * nf + f,
+                            f, t, h, 0, f, 1, 0, 0) == 0);
+            }
+        }
+        SELECT_CHECK(ggml_flashprefill_metadata_validate(meta.data(), mw) == 0);
+        ggml_context_ptr ctx(ggml_init({1024 * 1024, nullptr, true}));
+        ggml_tensor * q = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, dk, 1, hq);
+        ggml_tensor * pool = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, dk + dv, hkv, nf);
+        ggml_tensor * mt = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, mw);
+        ggml_tensor * out = ggml_flash_prefill_select(ctx.get(), q, pool, mt, tiles, hkv, nf,
+                1.0f, 0.5f, 0.0f, 0, true);
+        if (!out || !ggml_backend_supports_op(backend, out)) {
+            SELECT_CHECK_MSG(false, "grid-stride SELECT unsupported");
+            return;
+        }
+        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+        if (!buf) { SELECT_CHECK(false); return; }
+        std::vector<float> qs(dk * hq, 0.0f), ps((dk + dv) * hkv * nf, 0.0f);
+        for (int f = 0; f < nf; ++f) for (int h = 0; h < hkv; ++h) {
+            ps[(f * hkv + h) * (dk + dv)] = f == 0 ? -4.0f : 4.0f;
+        }
+        ggml_backend_tensor_set(pool, ps.data(), 0, ggml_nbytes(pool));
+        ggml_backend_tensor_set(mt, meta.data(), 0, ggml_nbytes(mt));
+        std::vector<int32_t> got((size_t) ggml_nelements(out), (int32_t) 0xa5a5a5a5u);
+        ggml_backend_tensor_set(out, got.data(), 0, ggml_nbytes(out));
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 32, false);
+        ggml_build_forward_expand(graph, out);
+        for (int run = 0; run < 3; ++run) {
+            for (int h = 0; h < hq; ++h) qs[h * dk] = run == 0 ? 1.0f : run == 1 ? 0.0f : -1.0f;
+            ggml_backend_tensor_set(q, qs.data(), 0, ggml_nbytes(q));
+            SELECT_CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get(out, got.data(), 0, ggml_nbytes(out));
+            if (ggml_flashprefill_plan_validate_against_metadata(got.data(), got.size(), meta.data(), mw) != 0) {
+                SELECT_CHECK_MSG(false, "grid-stride plan invalid: tiles=%d heads=%d run=%d", tiles, hkv, run);
+                continue;
+            }
+            for (int pair = 0; pair < nr; ++pair) {
+                SELECT_CHECK(got[got[8] + pair * 2] == (run == 1 ? 2 : 1));
+                SELECT_CHECK(got[got[8] + pair * 2 + 1] == (run == 1 ? 0 : 1));
+                SELECT_CHECK(got[got[6] + pair * 2] == pair * 2 + (run == 0 ? 1 : 0));
+                if (run == 1) SELECT_CHECK(got[got[6] + pair * 2 + 1] == pair * 2 + 1);
+                else SELECT_CHECK(got[got[7] + pair * 2] == pair * 2 + (run == 0 ? 0 : 1));
+            }
+            ggml_flashprefill_plan_stats stats{};
+            SELECT_CHECK(ggml_flashprefill_plan_get_stats(got.data(), got.size(), &stats) == 0);
+            SELECT_CHECK(stats.visible_tokens == nu);
+            SELECT_CHECK(stats.exact_tokens == (run == 1 ? nu : nr));
+            SELECT_CHECK(stats.sparse_rows == (run == 1 ? 0 : nr));
+            SELECT_CHECK(stats.dense_rows == (run == 1 ? nr : 0));
+        }
+    }
+    std::puts("backend grid-stride tiles: PASS");
+}
+
 static bool run_backend_select(ggml_backend_dev_t dev, bool & skipped, std::string & skip_why) {
     skipped = false;
     const char * dev_name = ggml_backend_dev_name(dev);
@@ -1826,6 +2000,8 @@ static bool run_backend_select(ggml_backend_dev_t dev, bool & skipped, std::stri
     std::vector<int32_t> plan((size_t) ggml_nelements(out), 0);
     ggml_backend_tensor_get(out, plan.data(), 0, plan.size() * sizeof(int32_t));
     buffer.reset();
+    test_backend_repeated_fragments(backend);
+    test_backend_grid_stride(backend);
     ggml_backend_free(backend);
     struct ggml_flashprefill_plan_stats want_st = {};
     want_st.selected_total = 5;

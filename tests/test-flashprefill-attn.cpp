@@ -344,7 +344,7 @@ static bool host_select(
         bool partial = !cand_full[(size_t) j];
         bool kept = false;
         if (!partial && any_scored) kept = (s[(size_t) j] >= thr);
-        bool exact = partial || kept || cand_mandatory[(size_t) j] || exact_all;
+        bool exact = !any_scored || partial || kept || cand_mandatory[(size_t) j] || exact_all;
         if (exact) out_exact.push_back(j);
         else out_proxy.push_back(j);
     }
@@ -665,7 +665,9 @@ static void test_softcap_ordering(void) {
         std::vector<std::vector<float>> ke(1, std::vector<float>(2, 1.0f));
         std::vector<std::vector<float>> ve(1, std::vector<float>(1, 1.0f));
         fp_oracle::ProxyFrag p;
-        p.kbar = {1.0f, 1.0f};
+        // Different raw logits are essential: applying the same softcap to
+        // identical exact/proxy logits cancels from their relative weights.
+        p.kbar = {0.1f, 0.1f};
         p.vbar = {2.0f};
         p.count = 4;
         std::vector<float> q = {5.0f, 5.0f};
@@ -1000,7 +1002,7 @@ static void test_quant_storage(void) {
         {
             std::vector<float> q((size_t) D, 0.2f);
             // Q in storage domain: forward-WHT when K is turbo2/3.
-            bool k_needs_wht = (c.kt == GGML_TYPE_TURBO2_0 || c.kt == GGML_TYPE_TURBO3_0);
+            bool k_needs_wht = (c.kt == GGML_TYPE_TURBO2_0 || c.kt == GGML_TYPE_TURBO3_0 || c.kt == GGML_TYPE_TURBO4_0);
             std::vector<float> q_storage = q;
             if (k_needs_wht) fp_wht_rows(q_storage, D, fp_wht_group_for_dim(D), false);
             std::vector<std::vector<float>> ke_m, ve_m, ke_s, ve_s;
@@ -1024,7 +1026,7 @@ static void test_quant_storage(void) {
             }
             // V turbo2/3 storage output needs single inverse to reach model
             // output: verify inverse-once differs from zero/twice inverses.
-            bool v_needs_inv = (c.vt == GGML_TYPE_TURBO2_0 || c.vt == GGML_TYPE_TURBO3_0);
+            bool v_needs_inv = (c.vt == GGML_TYPE_TURBO2_0 || c.vt == GGML_TYPE_TURBO3_0 || c.vt == GGML_TYPE_TURBO4_0);
             if (v_needs_inv) {
                 std::vector<float> once = o_storage, twice = o_storage;
                 fp_wht_rows(once, D, fp_wht_group_for_dim(D), true);
@@ -1264,10 +1266,12 @@ struct BackendSel {
     std::string name;
     std::string desc;
     bool is_cpu = true;
+    bool required = false;
 };
 
 static BackendSel fp_pick_device(const std::string & want_backend, const std::string & required_backend, bool & failed) {
     BackendSel sel;
+    sel.required = !required_backend.empty();
     failed = false;
     ggml_backend_load_all();
     size_t n = ggml_backend_dev_count();
@@ -1331,7 +1335,7 @@ static bool fp_build_meta(std::vector<int32_t> & meta,
                           int nfrag, const std::vector<int> & frag_counts,
                           const std::vector<int> & frag_mandatory,
                           const std::vector<int> & frag_qgroup,
-                          int64_t & out_n_tiles) {
+                          int64_t & out_n_tiles, bool padded_uses = false) {
     meta.clear();
     out_n_tiles = 0;
     if (dk < 1 || dv < 1 || hkv < 1 || hq < 1 || ngroups < 1 || nfrag < 1) return false;
@@ -1344,6 +1348,7 @@ static bool fp_build_meta(std::vector<int32_t> & meta,
     int nrow = hq; // Nq=1, one row per head, sq=0
     int nuse = nfrag; // one use per fragment, sq=0, tile=0, kvh=0
     int64_t f_cap = nfrag, r_cap = nrow, u_cap = nuse, c_cap = ncell;
+    if (padded_uses) u_cap = std::max<int64_t>(u_cap, 128);
     int64_t words = 0;
     if (ggml_flashprefill_metadata_words(f_cap, r_cap, u_cap, c_cap, &words) != GGML_FLASHPREFILL_OK) return false;
     meta.assign((size_t) words, 0);
@@ -1380,17 +1385,20 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
                                    ggml_type ktype, ggml_type vtype,
                                    float scale, float softcap, float alpha, int exact_all,
                                    bool use_sink, float sink_val,
-                                   const std::string & label, double atol, double rtol) {
+                                   const std::string & label, double atol, double rtol,
+                                   bool padded_uses = false, bool mean_correction = true,
+                                   int tokens_per_frag = 4) {
     (void) sel;
-    // Fixture: Nk=8 in 2 fragments (4+4), frag0 mandatory (sink block),
+    // Fixture: two equal fragments, frag0 mandatory (sink block),
     // frag0 g0, frag1 g1 (two phases, one denominator).
-    const int Nk = 8;
-    std::vector<int> counts = {4, 4};
+    FP_CHECK(tokens_per_frag > 0);
+    const int Nk = 2 * tokens_per_frag;
+    std::vector<int> counts = {tokens_per_frag, tokens_per_frag};
     std::vector<int> mandatory = {1, 0};
     std::vector<int> qgroups = {0 % ngroups, 1 % ngroups};
     std::vector<int32_t> meta;
     int64_t n_tiles = 0;
-    if (!fp_build_meta(meta, dk, dv, hkv, hq, ngroups, 2, counts, mandatory, qgroups, n_tiles)) {
+    if (!fp_build_meta(meta, dk, dv, hkv, hq, ngroups, 2, counts, mandatory, qgroups, n_tiles, padded_uses)) {
         FP_CHECK_MSG(false, "%s: meta build failed", label.c_str());
         return false;
     }
@@ -1418,12 +1426,12 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
     // Make Q resemble frag0 direction: copy frag0 model mean + small noise.
     {
         std::vector<double> m0((size_t) dk, 0.0);
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < tokens_per_frag; ++i)
             for (int d = 0; d < dk; ++d) m0[(size_t) d] += km[(size_t) i * (size_t) dk + (size_t) d];
         for (int g = 0; g < ngroups; ++g) {
             for (int h = 0; h < hq; ++h) {
                 for (int d = 0; d < dk; ++d) {
-                    float base = (float)(m0[(size_t) d] / 4.0);
+                    float base = (float)(m0[(size_t) d] / (double) tokens_per_frag);
                     qhost[((size_t) h * (size_t) ngroups + (size_t) g) * (size_t) dk + (size_t) d] = base * 0.8f + qhost[((size_t) h * (size_t) ngroups + (size_t) g) * (size_t) dk + (size_t) d] * 0.2f;
                 }
             }
@@ -1431,7 +1439,7 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
     }
     // Storage domain for Q when K is turbo2/3 (forward WHT per head-group row).
     std::vector<float> q_storage = qhost;
-    bool k_needs_wht = (ktype == GGML_TYPE_TURBO2_0 || ktype == GGML_TYPE_TURBO3_0);
+    bool k_needs_wht = (ktype == GGML_TYPE_TURBO2_0 || ktype == GGML_TYPE_TURBO3_0 || ktype == GGML_TYPE_TURBO4_0);
     if (k_needs_wht) {
         // Q tensor layout [Dk,ngroups,Hq]: rows are (h*ngroups+g) vectors.
         fp_wht_rows(q_storage, dk, fp_wht_group_for_dim(dk), false);
@@ -1477,7 +1485,7 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
         return false;
     }
     ggml_tensor * tplan = ggml_flash_prefill_select(ctx.get(), tq, tpool, tmeta,
-            n_tiles, hkv, max_sel, scale, alpha, softcap, exact_all, true);
+            n_tiles, hkv, max_sel, scale, alpha, softcap, exact_all, mean_correction);
     if (!tplan) {
         FP_CHECK_MSG(false, "%s: select ctor failed", label.c_str());
         return false;
@@ -1489,7 +1497,7 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
         sinkhost.assign((size_t) hq, sink_val);
     }
     ggml_tensor * tout = ggml_flash_prefill_attn(ctx.get(), tq, tk, tv, tpool, tplan, tmeta, tsinks,
-            1, hq, dv, scale, softcap, true);
+            1, hq, dv, scale, softcap, mean_correction);
     if (!tout) {
         FP_CHECK_MSG(false, "%s: attn ctor failed", label.c_str());
         return false;
@@ -1498,6 +1506,11 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
     if (!ggml_backend_supports_op(backend, tpool) ||
         !ggml_backend_supports_op(backend, tplan) ||
         !ggml_backend_supports_op(backend, tout)) {
+        if (sel.required) {
+            FP_CHECK_MSG(false, "%s: required backend '%s' lacks FLASH_PREFILL support",
+                    label.c_str(), sel.name.c_str());
+            return false;
+        }
         std::printf("SKIP %s: backend '%s' lacks FLASH_PREFILL support\n", label.c_str(), sel.name.c_str());
         ++g_skips;
         return true;
@@ -1525,6 +1538,19 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
     }
     ggml_backend_synchronize(backend);
 
+    if (padded_uses && sel.name.find("Vulkan") != std::string::npos) {
+        using scratch_fn = ggml_status (*)(ggml_backend_t, uint64_t *, uint64_t *);
+        auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        auto scratch = reinterpret_cast<scratch_fn>(ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_vk_flashprefill_scratch"));
+        uint64_t current = 0, peak = 0;
+        FP_CHECK(scratch != nullptr);
+        if (scratch) {
+            FP_CHECK(scratch(backend, &current, &peak) == GGML_STATUS_SUCCESS);
+            FP_CHECK_MSG(current > 0 && peak >= current, "%s did not execute split-K", label.c_str());
+        }
+    }
+
     // Read back ACTUAL pool + plan + output after completion.
     int64_t pool_ne = ggml_nelements(tpool);
     std::vector<float> pool_got((size_t) pool_ne, 0.0f);
@@ -1539,7 +1565,7 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
     // Validate plan encoding + coverage against metadata (strict).
     FP_CHECK(ggml_flashprefill_plan_validate(plan_got.data(), plan_ne) == GGML_FLASHPREFILL_OK);
     FP_CHECK(ggml_flashprefill_plan_validate_against_metadata(plan_got.data(), plan_ne, meta.data(), (int64_t) meta.size()) == GGML_FLASHPREFILL_OK);
-    struct ggml_flashprefill_plan_stats stats;
+    struct ggml_flashprefill_plan_stats stats = {};
     FP_CHECK(ggml_flashprefill_plan_get_stats(plan_got.data(), plan_ne, &stats) == GGML_FLASHPREFILL_OK);
     // Exact-all must have zero proxy uses; sparse must have coverage.
     if (exact_all) {
@@ -1554,18 +1580,18 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
         // Pool layout: pool[(f*Hkv+h)*(Dk+Dv)+d], K rows [0,Dk), V [Dk,Dk+Dv).
         double max_abs = 0.0;
         for (int f = 0; f < 2; ++f) {
-            // Fragment f covers tokens [f*4,4).
+            // Fragment f covers one contiguous token range.
             for (int d = 0; d < dk; ++d) {
                 double acc = 0.0;
-                for (int i = 0; i < 4; ++i) acc += kd[(size_t)(f * 4 + i) * (size_t) dk + (size_t) d];
-                float want = (float)(acc / 4.0);
+                for (int i = 0; i < tokens_per_frag; ++i) acc += kd[(size_t)(f * tokens_per_frag + i) * (size_t) dk + (size_t) d];
+                float want = (float)(acc / (double) tokens_per_frag);
                 float got = pool_got[(size_t)(f * hkv + 0) * (size_t)(dk + dv) + (size_t) d];
                 max_abs = std::max(max_abs, std::abs((double) got - (double) want));
             }
             for (int d = 0; d < dv; ++d) {
                 double acc = 0.0;
-                for (int i = 0; i < 4; ++i) acc += vd[(size_t)(f * 4 + i) * (size_t) dv + (size_t) d];
-                float want = (float)(acc / 4.0);
+                for (int i = 0; i < tokens_per_frag; ++i) acc += vd[(size_t)(f * tokens_per_frag + i) * (size_t) dv + (size_t) d];
+                float want = (float)(acc / (double) tokens_per_frag);
                 float got = pool_got[(size_t)(f * hkv + 0) * (size_t)(dk + dv) + (size_t)(dk + d)];
                 max_abs = std::max(max_abs, std::abs((double) got - (double) want));
             }
@@ -1597,52 +1623,38 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
         // use's q_group (frag0->g0, frag1->g1). Exact tokens use kd/vd rows;
         // proxy uses pool means with count=4.
         std::vector<float> ref_all((size_t) dv * (size_t) hq, 0.0f);
-        bool v_needs_inv = (vtype == GGML_TYPE_TURBO2_0 || vtype == GGML_TYPE_TURBO3_0);
         for (int h = 0; h < hq; ++h) {
-            // Gather per-use Q: need q_group per use from metadata.
-            // Uses were built as frag f -> qgroup f%ngroups.
-            std::vector<std::vector<float>> ke;
-            std::vector<std::vector<float>> ve;
-            std::vector<fp_oracle::ProxyFrag> proxies;
-            // Exact uses: expand to token rows.
+            // Each fragment has its own RoPE phase/Q group. Accumulate all
+            // exact tokens and proxies into ONE independent denominator.
+            fp_oracle::Mlo state = fp_oracle::mlo_init(dv);
+            bool ok = false;
             for (int u : exact_uses) {
-                int f = u; // use idx == frag id in this fixture
-                for (int i = 0; i < 4; ++i) {
-                    int tok = f * 4 + i;
-                    std::vector<float> kr((size_t) dk), vr((size_t) dv);
-                    for (int d = 0; d < dk; ++d) kr[(size_t) d] = kd[(size_t) tok * (size_t) dk + (size_t) d];
-                    for (int d = 0; d < dv; ++d) vr[(size_t) d] = vd[(size_t) tok * (size_t) dv + (size_t) d];
-                    ke.push_back(kr);
-                    ve.push_back(vr);
+                const int f = u;
+                const float * qh = q_storage.data() + ((size_t) h * ngroups + f % ngroups) * dk;
+                for (int i = 0; i < tokens_per_frag; ++i) {
+                    const int tok = f * tokens_per_frag + i;
+                    double dot = 0;
+                    for (int d = 0; d < dk; ++d) dot += (double) qh[d] * kd[(size_t) tok * dk + d];
+                    FP_CHECK(fp_oracle::mlo_add(state, scale * dot, vd.data() + (size_t) tok * dv,
+                            1, 1.0, softcap, ok) && ok);
                 }
             }
             for (int u : proxy_uses) {
-                int f = u;
-                fp_oracle::ProxyFrag pr;
-                pr.kbar.assign((size_t) dk, 0.0f);
-                pr.vbar.assign((size_t) dv, 0.0f);
-                for (int d = 0; d < dk; ++d) pr.kbar[(size_t) d] = pool_got[(size_t)(f * hkv + 0) * (size_t)(dk + dv) + (size_t) d];
-                for (int d = 0; d < dv; ++d) pr.vbar[(size_t) d] = pool_got[(size_t)(f * hkv + 0) * (size_t)(dk + dv) + (size_t)(dk + d)];
-                pr.count = 4;
-                proxies.push_back(pr);
+                if (!mean_correction) break;
+                const int f = u;
+                const float * qh = q_storage.data() + ((size_t) h * ngroups + f % ngroups) * dk;
+                const float * mean = pool_got.data() + (size_t) f * hkv * (dk + dv);
+                double dot = 0;
+                for (int d = 0; d < dk; ++d) dot += (double) qh[d] * mean[d];
+                FP_CHECK(fp_oracle::mlo_add(state, scale * dot, mean + dk, tokens_per_frag, 1.0, softcap, ok) && ok);
             }
-            // Q selection per head: if any proxy/exact mix spans groups, the
-            // single-denominator oracle needs per-fragment Q. Our fixture has
-            // frag0 g0 and frag1 g1; for simplicity use the Q variant of the
-            // first exact fragment when all-exact, else merge with per-fragment
-            // Q via manual Mlo (mirrors phase test). Here both fragments share
-            // similar Q (constructed alike), so head Q g0 is representative;
-            // strict phase coverage is in the host test. Use g0 Q for oracle.
-            const float * qh = q_storage.data() + ((size_t) h * (size_t) ngroups + 0) * (size_t) dk;
+            if (use_sink) {
+                FP_CHECK(fp_oracle::mlo_add_sink(state, sink_val, ok) && ok);
+            }
             std::vector<float> out;
-            bool has_sink = use_sink;
-            double slog = use_sink ? (double) sink_val : 0.0;
-            FP_CHECK(fp_oracle::attend_row(qh, dk, ke, ve, proxies, dv, scale, softcap, has_sink, slog, out));
-            if (v_needs_inv) {
-                // Backend output is model domain (single inverse applied);
-                // bring storage oracle to model domain for comparison.
-                fp_wht_rows(out, dv, fp_wht_group_for_dim(dv), true);
-            }
+            FP_CHECK(fp_oracle::mlo_finalize(state, out, ok) && ok);
+            // The raw ATTN op returns the stored V domain. The llama graph
+            // applies inverse WHT afterwards; do not rotate only the oracle.
             for (int d = 0; d < dv; ++d) ref_all[(size_t) h * (size_t) dv + (size_t) d] = out[(size_t) d];
         }
         // Backend output layout [Dv,Hq,1]: (d,h,0).
@@ -1658,6 +1670,106 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
     return true;
 }
 
+static void test_backend_coverage_lanes(ggml_backend_t backend, const BackendSel & sel) {
+    // Exercise the actual ATTN coverage scan at workgroup boundaries. Use a
+    // leaf plan, not SELECT, so missing/duplicate entries reach the consumer.
+    for (int nf : {1, 63, 64, 65, 129}) {
+        constexpr int dim = 64, hq = 2;
+        std::vector<int32_t> meta;
+        int64_t nt = 0, pw = 0;
+        FP_CHECK(fp_build_meta(meta, dim, dim, 1, hq, 1, nf,
+                    std::vector<int>(nf, 1), std::vector<int>(nf, 0), std::vector<int>(nf, 0), nt, nf == 1));
+        FP_CHECK(ggml_flashprefill_plan_words(1, 1, nf, &pw) == GGML_FLASHPREFILL_OK);
+        ggml_context_ptr ctx(ggml_init({16 * 1024 * 1024, nullptr, true}));
+        ggml_tensor * q = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, dim, 1, hq);
+        ggml_tensor * k = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, dim, nf, 1);
+        ggml_tensor * v = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, dim, nf, 1);
+        ggml_tensor * pool = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 2 * dim, 1, nf);
+        ggml_tensor * mt = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, meta.size());
+        ggml_tensor * plan = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, pw);
+        ggml_tensor * out = ggml_flash_prefill_attn(ctx.get(), q, k, v, pool, plan, mt, nullptr,
+                1, hq, dim, 1.0f, 0.0f, true);
+        if (!out || !ggml_backend_supports_op(backend, out)) {
+            FP_CHECK_MSG(false, "coverage ATTN unsupported on %s", sel.name.c_str());
+            return;
+        }
+        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+        if (!buffer) { FP_CHECK(false); return; }
+        std::vector<float> qdata(dim * hq, 0), pooldata(2 * dim * nf, 0);
+        std::vector<ggml_fp16_t> kdata(dim * nf, ggml_fp32_to_fp16(0)), vdata(dim * nf);
+        // K=Q=0 makes every token equally likely. V is exactly representable
+        // in F16, so the independent reference is a simple arithmetic mean.
+        for (int f = 0; f < nf; ++f) for (int d = 0; d < dim; ++d) {
+            const float value = (f + d) * 0.125f;
+            vdata[f * dim + d] = ggml_fp32_to_fp16(value);
+            pooldata[f * 2 * dim + dim + d] = value;
+        }
+        ggml_backend_tensor_set(q, qdata.data(), 0, ggml_nbytes(q));
+        ggml_backend_tensor_set(k, kdata.data(), 0, ggml_nbytes(k));
+        ggml_backend_tensor_set(v, vdata.data(), 0, ggml_nbytes(v));
+        ggml_backend_tensor_set(pool, pooldata.data(), 0, ggml_nbytes(pool));
+        ggml_backend_tensor_set(mt, meta.data(), 0, ggml_nbytes(mt));
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 32, false);
+        ggml_build_forward_expand(graph, out);
+        for (int mode = 0; mode < 6; ++mode) {
+            const bool corrupt = mode >= 3;
+            // CPU deliberately aborts on corrupt plans; Vulkan reports the
+            // error in the plan. Negative cases test that GPU protocol only.
+            if (corrupt && sel.is_cpu) continue;
+            if (mode == 4 && nf == 1) continue;
+            std::vector<int32_t> wire((size_t) pw);
+            FP_CHECK(ggml_flashprefill_plan_init(wire.data(), pw, 1, 1, nf, 0) == GGML_FLASHPREFILL_OK);
+            int ne = 0, np = 0;
+            for (int u = 0; u < nf; ++u) {
+                if (mode == 3 && u == nf - 1) continue; // omit the last lane's use
+                if (mode == 2 && u % 2) wire[wire[7] + np++] = u;
+                else wire[wire[6] + ne++] = mode == 1 ? nf - 1 - u : u;
+            }
+            if (mode == 4) wire[wire[6] + nf - 1] = 0; // duplicate, missing tail
+            wire[wire[8]] = ne;
+            wire[wire[8] + 1] = np;
+            auto meta_input = meta;
+            if (mode == 5) meta_input[0] = 0; // invalid header on a small, otherwise valid plan
+            ggml_backend_tensor_set(mt, meta_input.data(), 0, ggml_nbytes(mt));
+            ggml_backend_tensor_set(plan, wire.data(), 0, ggml_nbytes(plan));
+            const ggml_status status = ggml_backend_graph_compute(backend, graph);
+            FP_CHECK_MSG(corrupt ? status != GGML_STATUS_SUCCESS : status == GGML_STATUS_SUCCESS,
+                    "coverage execution status nf=%d mode=%d status=%d", nf, mode, int(status));
+            if (nf == 1 && mode == 0 && sel.name.find("Vulkan") != std::string::npos) {
+                // Padding forces multiple splits with only ONE real token,
+                // so empty M=-inf/L=0/O=0 partials must merge correctly.
+                using scratch_fn = ggml_status (*)(ggml_backend_t, uint64_t *, uint64_t *);
+                auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+                auto scratch = reinterpret_cast<scratch_fn>(ggml_backend_reg_get_proc_address(
+                            reg, "ggml_backend_vk_flashprefill_scratch"));
+                uint64_t current = 0, peak = 0;
+                FP_CHECK(scratch != nullptr);
+                if (scratch) {
+                    FP_CHECK(scratch(backend, &current, &peak) == GGML_STATUS_SUCCESS);
+                    FP_CHECK(current > 0 && peak >= current);
+                }
+            }
+            ggml_backend_tensor_get(plan, wire.data(), 0, ggml_nbytes(plan));
+            if (corrupt) {
+                FP_CHECK_MSG(wire[10] != GGML_FLASHPREFILL_OK,
+                        "missing/duplicate use accepted: nf=%d mode=%d", nf, mode);
+            } else {
+                FP_CHECK_MSG(wire[10] == GGML_FLASHPREFILL_OK,
+                        "valid coverage rejected: nf=%d mode=%d error=%d", nf, mode, wire[10]);
+                std::vector<float> got(dim * hq);
+                ggml_backend_tensor_get(out, got.data(), 0, ggml_nbytes(out));
+                for (int h = 0; h < hq; ++h) for (int d = 0; d < dim; ++d) {
+                    const float expected = ((nf - 1) * 0.5f + d) * 0.125f;
+                    FP_CHECK_MSG(std::isfinite(got[h * dim + d]) &&
+                            std::abs(got[h * dim + d] - expected) < 5e-4f,
+                            "coverage output mismatch nf=%d mode=%d h=%d d=%d", nf, mode, h, d);
+                }
+            }
+        }
+    }
+    std::printf("test_backend_coverage_lanes done (%s)\n", sel.name.c_str());
+}
+
 static void test_backend_exactall(ggml_backend_t backend, const BackendSel & sel) {
     // Exact-all over same cached bytes vs dense oracle (same dequantized data).
     fp_backend_sparse_once(backend, sel, 64, 64, 1, 2, 2,
@@ -1666,6 +1778,12 @@ static void test_backend_exactall(ggml_backend_t backend, const BackendSel & sel
     fp_backend_sparse_once(backend, sel, 64, 32, 1, 2, 2,
             GGML_TYPE_F16, GGML_TYPE_F16, 0.25f, 0.0f, 0.1f, 1, true, 0.4f,
             "backend-exactall-sink-dkdv", 2e-3, 2e-2);
+    // The Vulkan split heuristic uses metadata capacity. Padding forces
+    // split-K plus MERGE, including empty splits, without a large fixture.
+    // This also catches under-reservation of ATTN descriptor sets.
+    fp_backend_sparse_once(backend, sel, 128, 128, 1, 2, 2,
+            GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0, 0.25f, 0.0f, 0.1f, 1, true, 0.4f,
+            "backend-exactall-split-turbo4-turbo2", 5e-3, 5e-2, true);
 }
 
 static void test_backend_sparse(ggml_backend_t backend, const BackendSel & sel) {
@@ -1677,10 +1795,54 @@ static void test_backend_sparse(ggml_backend_t backend, const BackendSel & sel) 
             "backend-sparse-softcap-sink", 3e-3, 3e-2);
 }
 
+static void test_backend_value_accumulation(ggml_backend_t backend, const BackendSel & sel) {
+    // Cover the register-path boundary and the unbounded-head fallback,
+    // independently of the selector. The oracle uses double M/L/O algebra.
+    for (int dv : {8, 248, 256, 264}) for (bool split : {false, true}) {
+        for (bool correction : {false, true}) {
+            const std::string name = "backend-values-dv" + std::to_string(dv) +
+                (split ? "-split" : "-single") + (correction ? "-means" : "-no-means");
+            fp_backend_sparse_once(backend, sel, 64, dv, 1, 2, 2,
+                    GGML_TYPE_F16, GGML_TYPE_F16, 8.0f, 1.5f, 1.0f, 0, true, 2.0f,
+                    name, 2e-3, 2e-2, split, correction);
+        }
+    }
+    fp_backend_sparse_once(backend, sel, 128, 256, 1, 2, 2,
+            GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0, 8.0f, 1.5f, 1.0f, 0, true, 2.0f,
+            "backend-values-turbo4-turbo2-dv256", 5e-3, 5e-2, true);
+
+    // Long online-softmax accumulation: one full exact fragment plus one
+    // proxy fragment. Repeated M/L/O rescaling must stay close to the same
+    // double-precision oracle, including split-K partial merge.
+    for (bool split : {false, true}) {
+        fp_backend_sparse_once(backend, sel, 64, 128, 1, 2, 2,
+                GGML_TYPE_F16, GGML_TYPE_F16, 8.0f, 1.5f, 1.0f, 0, true, 2.0f,
+                std::string("backend-values-long128-") + (split ? "split" : "single"),
+                3e-4, 3e-3, split, true, 128);
+    }
+    // The default boundary-layer V policy uses Q8, even with --ctv turbo2.
+    for (int exact : {0, 1}) for (bool split : {false, true}) {
+        fp_backend_sparse_once(backend, sel, 128, 128, 1, 2, 2,
+                GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0, 8.0f, 1.5f, 1.0f, exact, true, 2.0f,
+                std::string("backend-values-boundary-q8-") + (exact ? "exact" : "sparse") +
+                    (split ? "-split" : "-single"), 5e-3, 5e-2, split);
+    }
+}
+
 static void test_backend_quant(ggml_backend_t backend, const BackendSel & sel) {
     fp_backend_sparse_once(backend, sel, 128, 128, 1, 2, 2,
             GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0, 0.25f, 0.0f, 0.15f, 0, false, 0.0f,
             "backend-sparse-turbo3", 5e-3, 5e-2);
+    // Mixed K/V storage is the deployment case, not just equal-bit caches.
+    for (ggml_type ktype : { GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0 }) {
+        for (int exact_all : { 0, 1 }) {
+            const std::string label = std::string(exact_all ? "backend-exactall-" : "backend-sparse-") +
+                ggml_type_name(ktype) + "-turbo2";
+            fp_backend_sparse_once(backend, sel, 128, 128, 1, 2, 2,
+                    ktype, GGML_TYPE_TURBO2_0, 0.25f, 0.0f, 0.15f, exact_all, false, 0.0f,
+                    label, 5e-3, 5e-2);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1743,6 +1905,8 @@ int main(int argc, char ** argv) {
     test_backend_sparse(backend, sel);
     // Quant backend coverage is best-effort: SKIP when unsupported.
     test_backend_quant(backend, sel);
+    test_backend_value_accumulation(backend, sel);
+    test_backend_coverage_lanes(backend, sel);
     ggml_backend_free(backend);
 
     if (g_failures == 0) {

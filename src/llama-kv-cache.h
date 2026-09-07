@@ -188,6 +188,11 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
+    // Actual storage types by logical model layer (including boundary-V
+    // overrides and reused layers), without allocating tensor views.
+    ggml_type layer_type_k(int32_t il) const;
+    ggml_type layer_type_v(int32_t il) const;
+
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
@@ -593,6 +598,9 @@ public:
 
     ggml_type type_k() const;
     ggml_type type_v() const;
+
+    ggml_type layer_type_k(int32_t il) const;
+    ggml_type layer_type_v(int32_t il) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;

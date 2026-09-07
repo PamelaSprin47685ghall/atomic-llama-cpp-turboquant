@@ -13,10 +13,6 @@
 #include <cfloat>
 #include <cmath>
 
-extern "C" {
-GGML_API int turbo3_cpu_wht_group_size;
-}
-
 // ggml_compute_forward_dup
 
 static void ggml_compute_forward_dup_same_cont(
@@ -5139,11 +5135,13 @@ static void ggml_compute_forward_set_rows_impl(
 
     ggml_from_float_t const from_float = ggml_get_type_traits_cpu(dst->type)->from_float;
 
-    // For turbo types: communicate WHT group size to the quantize function via global
+    // KV heads are padded to complete 128-element Turbo blocks. Do not pass
+    // per-operation geometry through a process-global variable: independent
+    // contexts and SET_ROWS workers may execute concurrently.
     if (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO2_0) {
         int gs = 0;
         memcpy(&gs, dst->op_params, sizeof(int));
-        turbo3_cpu_wht_group_size = (gs == 64 || gs == 128) ? gs : 0;
+        GGML_ASSERT(gs == 0 || gs == 128);
     }
 
     for (int64_t i03 = 0; i03 < ne03; ++i03) {
@@ -12603,7 +12601,9 @@ void ggml_compute_forward_flash_prefill_pool(
     if (dst->ne[0] != Dk + Dv) {
         GGML_ABORT("flash_prefill_pool: pool row mismatch");
     }
-    if (ggml_n_dims(K) < 3 || ggml_n_dims(V) < 3) {
+    // ggml_n_dims drops trailing singleton dimensions. [D,N,1] is still a
+    // legal one-KV-head cache, not an invalid two-dimensional tensor.
+    if (K->ne[3] != 1 || V->ne[3] != 1) {
         GGML_ABORT("flash_prefill_pool: K/V rank");
     }
     const int64_t Hkv = dst->ne[1];
@@ -13416,7 +13416,9 @@ void ggml_compute_forward_flash_prefill_attn(
     int32_t param_rc = ggml_flashprefill_op_params_unpack(dst->op_params, &pp);
     const int64_t Dv_out = dst ? dst->ne[0] : 0;
     const int64_t Hq_out = dst ? dst->ne[1] : 0;
-    const int64_t Nq_out = (dst && ggml_n_dims(dst) >= 3) ? dst->ne[2] : 0;
+    // A single output query has ne[2]=1 even though ggml_n_dims(dst)==2.
+    // Treating it as zero left the entire output buffer uninitialized.
+    const int64_t Nq_out = dst ? dst->ne[2] : 0;
     // Per-thread scratch: decoded K row + decoded V row + MLO accum + MLO tmp.
     const int64_t Dk = (param_rc == GGML_FLASHPREFILL_OK) ? (int64_t)pp.dk : 0;
     const int64_t Dv = (param_rc == GGML_FLASHPREFILL_OK) ? (int64_t)pp.dv : Dv_out;

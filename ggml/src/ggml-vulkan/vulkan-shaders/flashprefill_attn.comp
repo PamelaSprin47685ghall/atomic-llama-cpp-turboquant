@@ -56,6 +56,7 @@ layout(binding = 10) buffer SCR_O { float data_scr_o[]; };
 layout(push_constant) uniform FpAttnPushBlock { FP_ATTN_PUSH_FIELDS } p;
 
 shared float attn_sh[256];
+shared uint attn_coverage_bad;
 
 float attn_q_at(uint q_group, uint q_head, uint d) {
     return data_q[(q_group * p.q_nb1 + q_head * p.q_nb2) / 4u + d];
@@ -203,7 +204,10 @@ void main() {
         // No safe output mapping (row unreadable or plan flagged); raise the
         // writable plan error so the failure propagates before any client
         // output is consumed (backend barrier), instead of valid zeros.
-        if (p.plan_words >= FP_PLAN_HDR_WORDS + 10u && tid == 0u) {
+        // ERROR is word 10 INSIDE the 24-word header. Requiring 34 words
+        // silently accepted malformed metadata with a one-use (28-word)
+        // plan, leaving the caller to consume an unwritten output tensor.
+        if (p.plan_words >= FP_PLAN_HDR_WORDS && tid == 0u) {
             atomicMax(data_plan[FP_PH_ERROR], bad_code);
         }
         return;
@@ -235,8 +239,12 @@ void main() {
         if (tid == 0u) atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_PLAN_COVERAGE));
         return;
     }
-    // Per-row coverage: every matching use appears exactly once (bounded).
-    for (uint u = 0u; u < n_use; ++u) {
+    // Check the same complete metadata set, but partition it across lanes.
+    // Previously all 64 invocations redundantly scanned every use and both
+    // plan lists. The shared result keeps subsequent barrier control uniform.
+    if (tid == 0u) attn_coverage_bad = 0u;
+    barrier();
+    for (uint u = tid; u < n_use; u += wgsize) {
         uint ub = use_off + u * 8u;
         if (data_meta[ub + FP_UW_TILE] != int(u_tile)) continue;
         if (data_meta[ub + FP_UW_KV_HEAD] != int(u_kv)) continue;
@@ -249,12 +257,16 @@ void main() {
             if (data_plan[proxy_off + pair * max_sel + uint(k)] == int(u)) found++;
         }
         if (found != 1) {
-            for (uint d = tid; d < p.dv; d += wgsize) {
-                data_out[d + p.dv * (u_hq + Hq * u_sq)] = 0.0f;
-            }
-            if (tid == 0u) atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_PLAN_COVERAGE));
-            return;
+            atomicOr(attn_coverage_bad, 1u);
         }
+    }
+    barrier();
+    if (attn_coverage_bad != 0u) {
+        for (uint d = tid; d < p.dv; d += wgsize) {
+            data_out[d + p.dv * (u_hq + Hq * u_sq)] = 0.0f;
+        }
+        if (tid == 0u) atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_PLAN_COVERAGE));
+        return;
     }
 
     float sink_logit = 0.0f;
@@ -288,6 +300,12 @@ void main() {
     float M = NEGH;
     float L = 0.0f;
     bool have = false;
+    // Up to four output components per lane stay in registers. Accumulate
+    // the numerator with the same online M/L rescaling, eliminating a
+    // second QK pass and per-token global output read/modify/write. Larger
+    // value heads retain the general two-pass path below without truncation.
+    const bool online_values = p.dv <= 4u * wgsize;
+    float values[4] = float[4](0.0f, 0.0f, 0.0f, 0.0f);
     // Flattened exact-token cursor for stride assignment.
     uint tok_cursor = 0u;
     for (int k = 0; k < n_exact; ++k) {
@@ -306,7 +324,18 @@ void main() {
             z = fp_softcap_apply(p.scale * z, p.softcap);
             // Cooperative dot already barriered; replicated M/L update.
             float m_new = have ? max(M, z) : z;
-            L = have ? (L * exp(M - m_new) + exp(z - m_new)) : exp(z - m_new);
+            float keep = have ? exp(M - m_new) : 0.0f;
+            float weight = exp(z - m_new);
+            L = L * keep + weight;
+            if (online_values) {
+                [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+                    uint d = tid + i * wgsize;
+                    if (d < p.dv) {
+                        vec4 v = attn_load_v4(uint(cell), u_kv, d & ~3u);
+                        values[i] = values[i] * keep + weight * v[d & 3u];
+                    }
+                }
+            }
             M = m_new;
             have = true;
         }
@@ -341,16 +370,46 @@ void main() {
             float z = attn_dot_qkbar(uint(qg), u_hq, uint(frag), u_kv, p.dk, Hkv, dtot);
             z = fp_softcap_apply(p.scale * z, p.softcap) + log(float(sc));
             float m_new = have ? max(M, z) : z;
-            L = have ? (L * exp(M - m_new) + exp(z - m_new)) : exp(z - m_new);
+            float keep = have ? exp(M - m_new) : 0.0f;
+            float weight = exp(z - m_new);
+            L = L * keep + weight;
+            if (online_values) {
+                uint vbase = (uint(frag) * Hkv + u_kv) * dtot + p.dk;
+                [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+                    uint d = tid + i * wgsize;
+                    if (d < p.dv) values[i] = values[i] * keep + weight * data_pool[vbase + d];
+                }
+            }
             M = m_new;
             have = true;
         }
     }
     if (have_sink) {
         float m_new = have ? max(M, sink_logit) : sink_logit;
-        L = have ? (L * exp(M - m_new) + exp(sink_logit - m_new)) : exp(sink_logit - m_new);
+        float keep = have ? exp(M - m_new) : 0.0f;
+        L = L * keep + exp(sink_logit - m_new);
+        if (online_values) {
+            [[unroll]] for (uint i = 0u; i < 4u; ++i) values[i] *= keep;
+        }
         M = m_new;
         have = true;
+    }
+
+    if (online_values) {
+        if (phase == 1u && tid == 0u) {
+            data_scr_m[r * n_splits + split_id] = have ? M : uintBitsToFloat(0xFF800000u);
+            data_scr_l[r * n_splits + split_id] = have ? L : 0.0f;
+        }
+        [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+            uint d = tid + i * wgsize;
+            if (d >= p.dv) continue;
+            if (phase == 1u) {
+                data_scr_o[(r * n_splits + split_id) * p.dv + d] = values[i];
+            } else {
+                data_out[d + p.dv * (u_hq + Hq * u_sq)] = have && L > 0.0f ? values[i] / L : 0.0f;
+            }
+        }
+        return;
     }
 
     if (phase == 1u) {

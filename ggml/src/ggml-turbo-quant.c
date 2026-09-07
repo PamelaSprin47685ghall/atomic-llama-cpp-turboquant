@@ -24,7 +24,8 @@
  * -Wmissing-prototypes under upstream CI's -Werror policy). */
 GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size);
 
-/* Global: WHT group size for CPU quantize path (set by CPU SET_ROWS handler) */
+/* Retained for ABI compatibility only. Turbo blocks and padded KV heads are
+ * now always 128 elements; quantizers must not depend on mutable global state. */
 GGML_API int turbo3_cpu_wht_group_size = 0;
 
 /* ---------- constants ---------- */
@@ -274,17 +275,8 @@ GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size) {
 /* ---------- TURBO3_0: 3-bit PolarQuant with WHT rotation ---------- */
 
 void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_TURBO3 == 0);
-
-    // Read WHT group size from global (set by CPU SET_ROWS handler before each call).
-    // Fallback: 128 if row is 128-aligned, else 64.
-    extern int turbo3_cpu_wht_group_size;
-    int group_size = turbo3_cpu_wht_group_size;
-    if (group_size != 64 && group_size != 128) {
-        group_size = (k % 128 == 0) ? 128 : 64;
-    }
-    if (k % group_size != 0) group_size = (group_size == 128) ? 64 : 128;
-    assert(k % group_size == 0);
+    GGML_ASSERT(k % QK_TURBO3 == 0);
+    const int group_size = QK_TURBO3_GROUP;
 
     const int n_groups = k / group_size;
     const int blocks_per_group = group_size / QK_TURBO3;
@@ -371,15 +363,8 @@ size_t quantize_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
 /* ---------- TURBO2_0: 2-bit PolarQuant (no QJL) ---------- */
 
 void quantize_row_turbo2_0_ref(const float * GGML_RESTRICT x, block_turbo2_0 * GGML_RESTRICT y, int64_t k) {
-    assert(k % QK_TURBO2 == 0);
-
-    extern int turbo3_cpu_wht_group_size;
-    int group_size = turbo3_cpu_wht_group_size;
-    if (group_size != 64 && group_size != 128) {
-        group_size = (k % 128 == 0) ? 128 : 64;
-    }
-    if (k % group_size != 0) group_size = (group_size == 128) ? 64 : 128;
-    assert(k % group_size == 0);
+    GGML_ASSERT(k % QK_TURBO2 == 0);
+    const int group_size = QK_TURBO2_GROUP;
 
     const int n_groups = k / group_size;
     const int blocks_per_group = group_size / QK_TURBO2;
@@ -459,10 +444,12 @@ size_t quantize_turbo2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
 /* ---------- TURBO4_0: 3-bit PolarQuant + 1-bit QJL ---------- */
 
 void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * GGML_RESTRICT y, int64_t k) {
+#if !TURBO4_USE_4BIT
     turbo_init_rotation();
     turbo_init_qjl();
+#endif
 
-    assert(k % QK_TURBO4 == 0);
+    GGML_ASSERT(k % QK_TURBO4 == 0);
     const int nb = k / QK_TURBO4;
     const int d  = QK_TURBO4;
 
@@ -570,15 +557,16 @@ void quantize_row_turbo4_0_ref(const float * GGML_RESTRICT x, block_turbo4_0 * G
 }
 
 void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+#if !TURBO4_USE_4BIT
     turbo_init_rotation();
+#endif
 
-    assert(k % QK_TURBO4 == 0);
+    GGML_ASSERT(k % QK_TURBO4 == 0);
     const int nb = k / QK_TURBO4;
     const int d  = QK_TURBO4;
 
 #if TURBO4_USE_4BIT
-    /* 4-bit PolarQuant: nibble unpack → centroid → inverse rotate → scale */
-    /* TODO: add proper 4-bit centroid table to C code (currently only in Metal) */
+    /* 4-bit PolarQuant: nibble unpack -> centroid -> scale (WHT domain). */
     static const float CENTROIDS_4BIT[16] = {
         -0.173926f, -0.117195f, -0.089527f, -0.068756f,
         -0.051262f, -0.035597f, -0.020989f, -0.006938f,

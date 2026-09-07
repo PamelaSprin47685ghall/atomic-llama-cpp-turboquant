@@ -92,12 +92,28 @@ uint upper_bound_row(uint n_row, uint row_off, int t, int h) {
     return lo;
 }
 
-void main() {
-    uint t = gl_WorkGroupID.x;
+void select_tile(uint t) {
     uint h = gl_WorkGroupID.y;
     uint tid = gl_LocalInvocationIndex;
-    uint wgsize = gl_WorkGroupSize.x;
     bool is_init = (p.phase == 0u);
+
+    // SELECT owns its output, including the header. Never read an allocator's
+    // previous contents. Phase 0 runs once; phase 1 initializes disjoint pair
+    // slices after the dispatch barrier, before accumulating shared counters.
+    if (tid != 0u || (is_init && (t != 0u || h != 0u))) return;
+    if (p.plan_words < FP_PLAN_HDR_WORDS) return;
+    if (is_init) {
+        for (uint i = 0u; i < FP_PLAN_HDR_WORDS; ++i) data_plan[i] = 0;
+        data_plan[FP_PH_MAGIC] = int(FP_MAGIC_PLAN);
+        data_plan[FP_PH_VERSION] = int(FP_VERSION);
+        data_plan[FP_PH_HDR_WORDS] = int(FP_PLAN_HDR_WORDS);
+        data_plan[FP_PH_TOTAL] = int(p.plan_words);
+        data_plan[FP_PH_REQ_EXACT_ALL] = int(p.exact_all);
+        // Any early return leaves an explicit failure, not a stale valid plan.
+        data_plan[FP_PH_ERROR] = int(FP_ERR_BAD_LAYOUT);
+    } else if (atomicAdd(data_plan[FP_PH_ERROR], 0) != int(FP_OK)) {
+        return;
+    }
 
     // ---- common: read device metadata header (bounds-checked) ----
     // For init, plan header is uninitialized: do not read it.
@@ -125,7 +141,8 @@ void main() {
     // Validate caps (push) vs device actuals. Dims exact, counts bounded.
     if (dk_dev != p.dk) return;
     if (n_groups_dev > p.q_groups_cap || n_qheads_dev > p.q_heads_cap) return;
-    if (Hdev > p.hkv_cap) return;
+    if (Hdev == 0u || Hdev != p.hkv_cap || n_qheads_dev == 0u ||
+        n_qheads_dev % Hdev != 0u || n_groups_dev == 0u) return;
     if (f_cap != p.f_cap || r_cap > p.r_cap || u_cap > p.u_cap || c_cap > p.c_cap) {
         // Device caps exceed host allocation caps: cannot safely proceed.
         // Init cannot flag (plan uninit); select flags via atomicMax below.
@@ -142,77 +159,41 @@ void main() {
     if (use_off != row_off + 8u * r_cap) return;
     if (ctab != use_off + 8u * u_cap) return;
     if (p.meta_words < ctab + c_cap) return;
-    uint Tdev = 0u;
-    // n_tiles actual = max tile+1 over rows and uses (device). Bounded by r_cap.
-    for (uint r = 0u; r < n_row; ++r) {
-        int tt = data_meta[row_off + r * 8u + FP_RW_TILE];
-        if (tt >= 0 && uint(tt) + 1u > Tdev) Tdev = uint(tt) + 1u;
-    }
-    for (uint u = 0u; u < n_use; ++u) {
-        int tt = data_meta[use_off + u * 8u + FP_UW_TILE];
-        if (tt >= 0 && uint(tt) + 1u > Tdev) Tdev = uint(tt) + 1u;
-    }
-    // max_sel actual = max per-(tile,head) use count (device). Needs pair
-    // histogram; bounded single pass over uses with small T/H? T*H may be
-    // large (r_cap x H). Instead bound: max_sel <= n_use (trivially) and
-    // host plan was sized with plan_max_sel_for_meta at build time. Init
-    // recomputes exact max via per-pair binary-search counts below? That
-    // needs T/H loops. Cheaper: init grid covers caps; each init workgroup
-    // handles one (t,h) cap pair and counts via binary search (O(log U)),
-    // then atomicMax to a header slot? No cross-workgroup init race for
-    // max (atomicMax safe, never cleared). But header T/max_sel must be
-    // written once. Two-step init within phase 0: step A (all cap pairs
-    // count + atomicMax max_sel slot + atomicMax T slot), barrier? No global
-    // barrier! atomics only. Step B (workgroup 0 spins waiting for all? No).
-    // Cannot safely finalize header in phase 0 without a barrier between
-    // counting and publishing. Resolution: host plan_init already published
-    // T/H/max_sel/offsets at build time (host knew actuals then); device
-    // init must NOT recompute them, only zero error/counters/tables. So init
-    // reads T/H/max_sel from the device plan header (host-written), exactly
-    // like select. No recomputation, no race beyond header-only-by-(0,0).
     if (is_init) {
-        if (p.plan_words < FP_PLAN_HDR_WORDS) return;
-        // Cap grid guard: actuals read after validation below.
-        uint T = uint(data_plan[FP_PH_N_TILES]);
-        uint H = uint(data_plan[FP_PH_N_HEADS]);
-        uint max_sel = uint(data_plan[FP_PH_MAX_SEL]);
-        if (data_plan[FP_PH_MAGIC] != int(FP_MAGIC_PLAN)) return;
-        if (data_plan[FP_PH_VERSION] != int(FP_VERSION)) return;
-        if (T == 0u || H == 0u || H != Hdev) {
-            // Header mismatch: only (0,0) flags to avoid atomic storms.
-            if (t == 0u && h == 0u && tid == 0u) {
-                data_plan[FP_PH_ERROR] = int(FP_ERR_BAD_LAYOUT);
-            }
-            return;
+        // Scan once, not once per dispatched pair. Binary searches below
+        // require both tables to be globally sorted by (tile, KV head).
+        uint T = 0u;
+        for (uint r = 0u; r < n_row; ++r) {
+            int rt = data_meta[row_off + r * 8u + FP_RW_TILE];
+            int rh = data_meta[row_off + r * 8u + FP_RW_KV_HEAD];
+            if (rt < 0 || rh < 0 || uint(rh) >= Hdev) return;
+            if (r > 0u && row_pair_cmp(r - 1u, row_off, rt, rh) > 0) return;
+            T = max(T, uint(rt) + 1u);
         }
-        if (t >= T || h >= H) return; // cap-grid over-dispatch guard
-        uint exact_off = uint(data_plan[FP_PH_EXACT_OFF]);
-        uint proxy_off = uint(data_plan[FP_PH_PROXY_OFF]);
-        uint counts_off = uint(data_plan[FP_PH_COUNTS_OFF]);
-        uint pair = t * H + h;
-        for (uint s = tid; s < max_sel; s += wgsize) {
-            data_plan[exact_off + pair * max_sel + s] = -1;
-            data_plan[proxy_off + pair * max_sel + s] = -1;
+        for (uint u = 0u; u < n_use; ++u) {
+            int ut = data_meta[use_off + u * 8u + FP_UW_TILE];
+            int uh = data_meta[use_off + u * 8u + FP_UW_KV_HEAD];
+            if (ut < 0 || uh < 0 || uint(uh) >= Hdev) return;
+            if (u > 0u && use_pair_cmp(u - 1u, use_off, ut, uh) > 0) return;
+            T = max(T, uint(ut) + 1u);
         }
-        for (uint k = tid; k < 2u; k += wgsize) {
-            data_plan[counts_off + pair * 2u + k] = 0;
-        }
-        if (t == 0u && h == 0u) {
-            // Header zeroing: single workgroup, strided threads, no race
-            // (no other workgroup touches header words in init).
-            if (tid == 0u) {
-                data_plan[FP_PH_ERROR] = int(FP_OK);
-                data_plan[FP_PH_SPARSE_ROWS] = 0;
-                data_plan[FP_PH_DENSE_ROWS] = 0;
-                data_plan[FP_PH_SELECTED] = 0;
-                data_plan[FP_PH_CORRECTED] = 0;
-                data_plan[FP_PH_VIS_LO] = 0;
-                data_plan[FP_PH_VIS_HI] = 0;
-                data_plan[FP_PH_EXACT_TOK_LO] = 0;
-                data_plan[FP_PH_EXACT_TOK_HI] = 0;
-                // req_exact_all echo + offsets/total untouched (host-set).
-            }
-        }
+        // Match CPU: infer the allocated per-pair capacity from the output
+        // size, not from a header that no producer has ever written.
+        uint payload = p.plan_words - FP_PLAN_HDR_WORDS;
+        if (T == 0u || T > p.r_cap + 1u || T > payload / 2u / Hdev) return;
+        uint pairs = T * Hdev;
+        uint denom = 2u * pairs;
+        if (payload % denom != 0u) return;
+        uint max_sel = payload / denom - 1u;
+        uint proxy_off = FP_PLAN_HDR_WORDS + pairs * max_sel;
+        uint counts_off = proxy_off + pairs * max_sel;
+        data_plan[FP_PH_N_TILES] = int(T);
+        data_plan[FP_PH_N_HEADS] = int(Hdev);
+        data_plan[FP_PH_MAX_SEL] = int(max_sel);
+        data_plan[FP_PH_EXACT_OFF] = int(FP_PLAN_HDR_WORDS);
+        data_plan[FP_PH_PROXY_OFF] = int(proxy_off);
+        data_plan[FP_PH_COUNTS_OFF] = int(counts_off);
+        data_plan[FP_PH_ERROR] = int(FP_OK);
         return;
     }
 
@@ -232,7 +213,7 @@ void main() {
         atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_LAYOUT));
         return;
     }
-    if (T == 0u || H == 0u || H != Hdev || T != Tdev) {
+    if (T == 0u || H == 0u || H != Hdev) {
         atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_LAYOUT));
         return;
     }
@@ -254,6 +235,12 @@ void main() {
         return;
     }
     uint pair = t * H + h;
+    for (uint s = 0u; s < max_sel; ++s) {
+        data_plan[exact_off + pair * max_sel + s] = -1;
+        data_plan[proxy_off + pair * max_sel + s] = -1;
+    }
+    data_plan[counts_off + pair * 2u] = 0;
+    data_plan[counts_off + pair * 2u + 1u] = 0;
 
     // Canonical ranges via binary search (owner sorted by (tile,kv_head)).
     uint u_lo = lower_bound_use(n_use, use_off, int(t), int(h));
@@ -541,6 +528,10 @@ void main() {
         for (uint k = 0u; k < P; ++k) {
             data_plan[exact_off + pair * max_sel + k] = int(u_lo + k);
         }
+        // The proxy slice contained score scratch, not a valid empty list.
+        for (uint k = 0u; k < max_sel; ++k) {
+            data_plan[proxy_off + pair * max_sel + k] = -1;
+        }
         data_plan[counts_off + pair * 2u + 0u] = int(P);
         data_plan[counts_off + pair * 2u + 1u] = 0;
         atomicAdd(data_plan[FP_PH_SELECTED], int(P));
@@ -562,17 +553,10 @@ void main() {
     }
     float thresh = p.alpha * maxS;
 
-    // Final classification in increasing use order (deterministic, single
-    // pass). Frag ordinals recomputed on the fly in first-use order (same
-    // order used for score slots); proxy score slots (Sf>=thresh <=> keep)
-    // are read but never overwritten until the proxy write for that same
-    // slot position below, and ordinal lookup does not touch exact-slice
-    // frag scratch, so there is no scratch-clobber hazard.
-    uint e = 0u, px = 0u, etok = 0u;
-    // Per-row sparse flags: Rp bounded, track via proxy-presence per row.
-    // Use exact slice [0..P) as row-sparse bytes? Row count Rp unbounded by
-    // max_sel. Instead compute sparse rows in the same loop: for each row,
-    // scan P uses for a proxy-listed match (O(Rp*P) bounded local).
+    // Classify all uses before emitting either list: several query uses can
+    // share one fragment score. Compacting proxy indices over the score
+    // array here would corrupt scores still needed by later queries.
+    // Exact-slice fragment scratch is dead; use its P slots as boolean flags.
     for (uint k = 0u; k < P; ++k) {
         uint u = u_lo + k;
         uint ub = use_off + u * 8u;
@@ -615,7 +599,13 @@ void main() {
         float Sf = uintBitsToFloat(uint(data_plan[proxy_off + pair * max_sel + ord]));
         bool keep = (Sf >= thresh);
         bool exact = mandatory || !full || !col_full || keep;
-        if (exact) {
+        data_plan[exact_off + pair * max_sel + k] = exact ? 1 : 0;
+    }
+    uint e = 0u, px = 0u, etok = 0u;
+    for (uint k = 0u; k < P; ++k) {
+        uint u = u_lo + k;
+        // e <= k: in-place exact compaction cannot overwrite an unread flag.
+        if (data_plan[exact_off + pair * max_sel + k] != 0) {
             if (e >= max_sel) {
                 data_plan[counts_off + pair * 2u + 0u] = 0;
                 data_plan[counts_off + pair * 2u + 1u] = 0;
@@ -624,7 +614,7 @@ void main() {
             }
             data_plan[exact_off + pair * max_sel + e] = int(u);
             e++;
-            etok += uint(sc);
+            etok += uint(data_meta[use_off + u * 8u + FP_UW_SUB_CNT]);
         } else {
             if (px >= max_sel) {
                 data_plan[counts_off + pair * 2u + 0u] = 0;
@@ -636,6 +626,10 @@ void main() {
             px++;
         }
     }
+    // The wire format requires -1 after each count, including former
+    // fragment IDs, classification flags and floating-point score scratch.
+    for (uint k = e; k < max_sel; ++k) data_plan[exact_off + pair * max_sel + k] = -1;
+    for (uint k = px; k < max_sel; ++k) data_plan[proxy_off + pair * max_sel + k] = -1;
     data_plan[counts_off + pair * 2u + 0u] = int(e);
     data_plan[counts_off + pair * 2u + 1u] = int(px);
     atomicAdd(data_plan[FP_PH_SELECTED], int(e));
@@ -658,4 +652,26 @@ void main() {
     if (old_lo + pair_vis < old_lo) atomicAdd(data_plan[FP_PH_VIS_HI], 1);
     uint old_e = uint(atomicAdd(data_plan[FP_PH_EXACT_TOK_LO], int(etok)));
     if (old_e + etok < old_e) atomicAdd(data_plan[FP_PH_EXACT_TOK_HI], 1);
+}
+
+void main() {
+    if (p.phase == 0u) {
+        select_tile(gl_WorkGroupID.x);
+        return;
+    }
+    if (gl_LocalInvocationIndex != 0u || p.plan_words < FP_PLAN_HDR_WORDS) return;
+    if (data_plan[FP_PH_MAGIC] != int(FP_MAGIC_PLAN) ||
+        data_plan[FP_PH_VERSION] != int(FP_VERSION) ||
+        atomicAdd(data_plan[FP_PH_ERROR], 0) != int(FP_OK)) return;
+    uint tiles = uint(data_plan[FP_PH_N_TILES]);
+    if (tiles == 0u || tiles > p.r_cap + 1u) {
+        atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_LAYOUT));
+        return;
+    }
+    // The host dispatches a bounded grid based only on Q's allocated shape.
+    // Grid-stride traversal covers ALL actual tiles, even when a query has
+    // more packed tiles than Q groups. Each (tile,head) still has one owner.
+    for (uint t = gl_WorkGroupID.x; t < tiles; t += gl_NumWorkGroups.x) {
+        select_tile(t);
+    }
 }

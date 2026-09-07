@@ -1556,23 +1556,29 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
         // How many candidates to keep
         const uint32_t candidates_to_keep = (target_retention > n_protected) ? std::min(target_retention - n_protected, n_candidates) : 0;
 
-        // Score candidates
-        std::vector<float> scores(n_candidates);
-        const int64_t t_score_start = ggml_time_us();
-        tri_scorer->score_combined(
-            scores.data(),
-            k_tensors.data(),
-            n_kv_layers,
-            layer_map.data(),
-            cand_indices.data(),
-            cand_positions.data(),
-            n_candidates,
-            (int64_t) max_pos);
-        std::vector<float> pooled_scores(n_candidates);
-        triattention_max_pool_scores(
-            pooled_scores.data(), scores.data(), cand_positions.data(), n_candidates, 2);
-        scores.swap(pooled_scores);
-        result.score_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_score_start);
+        // Hard guards can already consume the entire target (notably the
+        // 128-token recent floor). Then every candidate is evicted regardless
+        // of its score: avoid GPU readback, dequantization and scoring, without
+        // changing either the retained set or the reference-removal order.
+        std::vector<float> scores;
+        if (candidates_to_keep > 0) {
+            scores.resize(n_candidates);
+            const int64_t t_score_start = ggml_time_us();
+            tri_scorer->score_combined(
+                scores.data(),
+                k_tensors.data(),
+                n_kv_layers,
+                layer_map.data(),
+                cand_indices.data(),
+                cand_positions.data(),
+                n_candidates,
+                (int64_t) max_pos);
+            std::vector<float> pooled_scores(n_candidates);
+            triattention_max_pool_scores(
+                pooled_scores.data(), scores.data(), cand_positions.data(), n_candidates, 2);
+            scores.swap(pooled_scores);
+            result.score_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_score_start);
+        }
 
         // Select top candidates to keep (highest score first)
         std::vector<uint32_t> order(n_candidates);
@@ -2054,6 +2060,14 @@ ggml_type llama_kv_cache::type_k() const {
 
 ggml_type llama_kv_cache::type_v() const {
     return layers[0].v->type;
+}
+
+ggml_type llama_kv_cache::layer_type_k(int32_t il) const {
+    return layers.at(map_layer_ids.at(il)).k->type;
+}
+
+ggml_type llama_kv_cache::layer_type_v(int32_t il) const {
+    return layers.at(map_layer_ids.at(il)).v->type;
 }
 
 std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
@@ -5444,6 +5458,14 @@ ggml_type llama_kv_cache_context::type_k() const {
 
 ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
+}
+
+ggml_type llama_kv_cache_context::layer_type_k(int32_t il) const {
+    return kv->layer_type_k(il);
+}
+
+ggml_type llama_kv_cache_context::layer_type_v(int32_t il) const {
+    return kv->layer_type_v(il);
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {

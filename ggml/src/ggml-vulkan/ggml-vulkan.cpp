@@ -2050,7 +2050,13 @@ static bool ggml_vk_flash_prefill_unpack_params(const ggml_tensor * dst, int32_t
     if (!std::isfinite(alpha) || !std::isfinite(scale) || !std::isfinite(softcap)) {
         return false;
     }
-    if (alpha <= 0.0f || alpha > 1.0f || scale == 0.0f || softcap < 0.0f) {
+    // Only SELECT consumes alpha. POOL constructors store alpha=scale=0,
+    // and ATTN stores alpha=0; rejecting those unused fields disables the
+    // entire Vulkan path. A finite zero attention scale is legal as well.
+    if (fp_op < FP_OP_POOL || fp_op > FP_OP_ATTN || softcap < 0.0f) {
+        return false;
+    }
+    if (fp_op == FP_OP_SELECT && (alpha <= 0.0f || alpha > 1.0f)) {
         return false;
     }
     if (exact_all != 0 && exact_all != 1) {
@@ -11950,11 +11956,17 @@ static void ggml_vk_flash_prefill_select(ggml_backend_vk_context * ctx, vk_conte
         GGML_ABORT("ggml_vulkan: flashprefill select row bound out of range");
     }
     const uint32_t rows_b = (uint32_t) rb;
-    // +1 covers device tile-max+1 (see supports_op); guarded on-device.
-    const uint32_t grid_x = rows_b + 1u;
+    // A byte-derived row bound includes use-table slack and can launch tens
+    // of thousands of empty workgroups for only a handful of actual tiles.
+    // Bound the grid by Q groups and let the shader stride over device T.
+    // This is a scheduling bound, never a truncation of metadata or work.
+    const uint32_t grid_x = (uint32_t) std::min({ (uint64_t) rows_b + 1u,
+        (uint64_t) q->ne[1], (uint64_t) ctx->device->properties.limits.maxComputeWorkGroupCount[0] });
     const uint32_t hkv = (uint32_t) pool->ne[1];
     vk_pipeline pipeline = ggml_vk_ensure_flash_prefill(ctx, ctx->device->pipeline_flash_prefill_select);
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    // The init and selection phases are separate dispatches, each consuming
+    // its own descriptor set from the graph-wide pool.
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 2);
     vk_subbuffer q_buf    = ggml_vk_tensor_subbuffer(ctx, q);
     vk_subbuffer pool_buf = ggml_vk_tensor_subbuffer(ctx, pool);
     vk_subbuffer meta_buf = ggml_vk_tensor_subbuffer(ctx, meta);
@@ -11979,11 +11991,11 @@ static void ggml_vk_flash_prefill_select(ggml_backend_vk_context * ctx, vk_conte
     pc_init.alpha       = alpha;
     pc_init.scale       = scale;
     pc_init.softcap     = softcap;
-    // Init grid covers cap pairs (each workgroup zeroes its own slice;
-    // header words only by (0,0)); over-dispatch guarded on-device.
+    // Initialize the output header once from device metadata. Pair slices
+    // are initialized by their owner in phase 1, after this barrier.
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         { q_buf, q_buf, q_buf, pool_buf, plan_buf, meta_buf, q_buf, plan_buf },
-        pc_init, { grid_x, hkv, 1 });
+        pc_init, { 1, 1, 1 });
     // Cross-dispatch barrier: init writes must be visible before any
     // selection workgroup runs; selection only sets error/counters.
     ggml_vk_sync_buffers(ctx, subctx);
@@ -12129,6 +12141,9 @@ static void ggml_vk_flash_prefill_attn(ggml_backend_vk_context * ctx, vk_context
         vk_subbuffer scr_m = { ctx->prealloc_split_k, 0, (size_t) rows_cap * ml_pitch };
         vk_subbuffer scr_l = { ctx->prealloc_split_k, (size_t) rows_cap * ml_pitch, (size_t) rows_cap * ml_pitch };
         vk_subbuffer scr_o = { ctx->prealloc_split_k, (size_t) 2u * (size_t) rows_cap * ml_pitch, (size_t) rows_cap * (size_t) n_splits * (size_t) dv_u * sizeof(float) };
+        // The first set was reserved above. Each additional partial dispatch
+        // also consumes a set; the merge has its own reservation below.
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, n_splits - 1u);
         for (uint32_t s = 0; s < n_splits; ++s) {
             FpAttnPush pc = base;
             pc.split_phase = 1;
@@ -19514,7 +19529,9 @@ static bool ggml_vk_flash_prefill_select_ok(const vk_device & device, const ggml
     if (fp_op != 1) {
         return false;
     }
-    if (!ggml_vk_flash_prefill_dims_ok(dk, dv)) {
+    // SELECT uses scalar F32 loads; it does not inherit K/V vector-width
+    // restrictions from POOL/ATTN (e.g. the Dk=8, Dv=4 selector fixture).
+    if (dk < 1 || dv < 1 || dk > 65536 || dv > 65536) {
         return false;
     }
     if (!ggml_vk_flash_prefill_common_ok(device, q, GGML_TYPE_F32, false)) {
@@ -19542,15 +19559,15 @@ static bool ggml_vk_flash_prefill_select_ok(const vk_device & device, const ggml
     if (meta->ne[0] < FP_META_HDR_WORDS || op->ne[0] < FP_PLAN_HDR_WORDS) {
         return false;
     }
-    // Dispatch cap-grid {rows_bound+1, hkv} (init + select) must fit. The +1
-    // covers device tile-max+1 (tiles index rows and uses, so T <=
-    // max(n_row,n_use)+1 <= rows_bound+1); over-dispatch is guarded
-    // on-device by t>=T. Degenerate owner input still flags explicit plan
-    // errors via the pairs that do run (never silent).
+    // Scheduling and validation bounds are independent: device actuals are
+    // still validated against the complete row bound, while grid-stride
+    // traversal visits every actual tile with at most Q-group-count CTAs.
     {
         const uint64_t rb = ggml_vk_flash_prefill_row_bound((uint64_t) meta->ne[0], (uint64_t) pool->ne[2]);
+        const uint64_t grid_x = std::min({ rb + 1u, (uint64_t) q->ne[1],
+            (uint64_t) device->properties.limits.maxComputeWorkGroupCount[0] });
         if (rb == 0 || rb + 1u > 0xffffffffULL ||
-            !ggml_vk_flash_prefill_grid_ok(device, rb + 1u, (uint64_t) pool->ne[1])) {
+            !ggml_vk_flash_prefill_grid_ok(device, grid_x, (uint64_t) pool->ne[1])) {
             return false;
         }
     }
