@@ -26,14 +26,18 @@ class AuditTests(unittest.TestCase):
         self.args = SimpleNamespace(corpus=None, prompt_tokens=8, predict=2, repeats=1,
                                     no_chat=False, needle_tokens=0, request_timeout=1, out=self.root)
 
-    def response(self, answer="391", finish="stop", budget=2, speed=25.0):
+    def response(self, answer="391", finish="stop", budget=2, speed=25.0,
+                 cache_n=0, prompt_n=8, predicted_n=2, truncated=False,
+                 prompt_ms=320.0):
         chats = iter([answer, "12", "-3, 0, 2, 7, 11"])
 
         def request(base, key, path, data=None, timeout=1):
             if path == "/tokenize":
                 return {"tokens": list(range(16))}
             if path == "/completion":
-                return {"tokens_predicted": budget, "timings": {
+                return {"tokens_predicted": budget, "truncated": truncated, "timings": {
+                    "cache_n": cache_n, "prompt_n": prompt_n, "predicted_n": predicted_n,
+                    "prompt_ms": prompt_ms, "predicted_ms": 80.0,
                     "prompt_per_second": speed, "predicted_per_second": 25.0}}
             if path == "/v1/chat/completions":
                 return {"choices": [{"message": {"content": next(chats)}, "finish_reason": finish}]}
@@ -86,6 +90,13 @@ class AuditTests(unittest.TestCase):
         for kwargs in ({"budget": 1}, {"speed": float("nan")}, {"speed": float("inf")}, {"speed": 0}, {"speed": True}):
             with self.subTest(kwargs=kwargs), self.assertRaises(RuntimeError):
                 self.run_probe(**kwargs)
+
+    def test_cached_shortened_or_inconsistent_work_is_not_throughput(self):
+        for change in ({"cache_n": 1}, {"prompt_n": 7}, {"predicted_n": 1},
+                       {"truncated": True}, {"prompt_ms": 0}, {"prompt_ms": float("inf")},
+                       {"speed": 25000.0}, {"cache_n": False}, {"prompt_n": 8.0}):
+            with self.subTest(change=change), self.assertRaises(RuntimeError):
+                self.run_probe(**change)
 
     def test_failed_case_saved_and_nonzero_exit(self):
         model = self.root / "fixture.gguf"

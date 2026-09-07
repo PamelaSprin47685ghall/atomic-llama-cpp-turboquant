@@ -197,6 +197,28 @@ def summarize_timings(timings):
     return {"first_request": rates[0], "repeated_requests": repeated}
 
 
+def check_completion(response, prompt_tokens, predict):
+    """A throughput sample must actually execute the complete requested work."""
+    if not isinstance(response, dict) or not isinstance(response.get("timings"), dict):
+        raise RuntimeError("completion has no timing object")
+    timings = response["timings"]
+    if type(response.get("tokens_predicted")) is not int or response["tokens_predicted"] != predict:
+        raise RuntimeError("completion did not generate the requested token budget")
+    if response.get("truncated") is not False:
+        raise RuntimeError("completion was truncated or its truncation state is missing")
+    for field, expected in (("cache_n", 0), ("prompt_n", prompt_tokens), ("predicted_n", predict)):
+        if type(timings.get(field)) is not int or timings[field] != expected:
+            raise RuntimeError("completion work mismatch: " + field + " must equal " + str(expected))
+    for phase, count in (("prompt", prompt_tokens), ("predicted", predict)):
+        ms = timings.get(phase + "_ms")
+        rate = timings.get(phase + "_per_second")
+        for name, value in ((phase + "_ms", ms), (phase + "_per_second", rate)):
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise RuntimeError("missing or invalid timing: " + name)
+        if not math.isclose(rate, 1000.0 * count / ms, rel_tol=1e-4, abs_tol=1e-6):
+            raise RuntimeError("inconsistent completion duration/rate: " + phase)
+
+
 def probe(args, base, key, result):
     result["requests"] = []
     text = args.corpus.read_text(encoding="utf-8") if args.corpus else (
@@ -204,23 +226,25 @@ def probe(args, base, key, result):
     tokens = request(base, key, "/tokenize", {"content": text, "add_special": True})["tokens"]
     if len(tokens) < args.prompt_tokens:
         raise ValueError("corpus is shorter than the requested prompt")
+    body = {"prompt": tokens[:args.prompt_tokens], "n_predict": args.predict,
+            "temperature": 0, "seed": 1234, "cache_prompt": False,
+            "ignore_eos": True, "n_probs": 0}
+    if not all(type(token) is int and token >= 0 for token in body["prompt"]):
+        raise ValueError("tokenizer returned invalid token IDs")
+    request_hash = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"),
+                                           allow_nan=False).encode("utf-8")).hexdigest()
+    result["workload"] = {"version": 1, "request_sha256": request_hash,
+                          "prompt_tokens": args.prompt_tokens, "predict": args.predict,
+                          "repeats": args.repeats,
+                          "parameters": {key: value for key, value in body.items() if key != "prompt"}}
     for repeat in range(args.repeats):
         started = time.monotonic()
-        response = request(base, key, "/completion", {
-            "prompt": tokens[:args.prompt_tokens], "n_predict": args.predict,
-            "temperature": 0, "seed": 1234, "cache_prompt": False,
-            "ignore_eos": True, "n_probs": 0,
-        }, timeout=args.request_timeout)
+        response = request(base, key, "/completion", body, timeout=args.request_timeout)
         response["wall_seconds"] = time.monotonic() - started
         response["case"] = "prefill-decode-" + str(repeat)
+        response["request_sha256"] = request_hash
         result["requests"].append(response)
-        timings = response.get("timings", {})
-        if response.get("tokens_predicted") != args.predict:
-            raise RuntimeError("completion did not generate the requested token budget")
-        for field in ("prompt_per_second", "predicted_per_second"):
-            value = timings.get(field)
-            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
-                raise RuntimeError("missing or invalid timing: " + field)
+        check_completion(response, args.prompt_tokens, args.predict)
         print(json.dumps({"config": result["config"]["name"], "repeat": repeat,
                           "timings": response.get("timings")}), flush=True)
     result["timing_summary"] = summarize_timings([response["timings"] for response in result["requests"]])
