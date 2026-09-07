@@ -239,34 +239,38 @@ void main() {
         if (tid == 0u) atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_PLAN_COVERAGE));
         return;
     }
-    // Check the same complete metadata set, but partition it across lanes.
-    // Previously all 64 invocations redundantly scanned every use and both
-    // plan lists. The shared result keeps subsequent barrier control uniform.
-    if (tid == 0u) attn_coverage_bad = 0u;
-    barrier();
-    for (uint u = tid; u < n_use; u += wgsize) {
-        uint ub = use_off + u * 8u;
-        if (data_meta[ub + FP_UW_TILE] != int(u_tile)) continue;
-        if (data_meta[ub + FP_UW_KV_HEAD] != int(u_kv)) continue;
-        if (data_meta[ub + FP_UW_SRC_Q] != int(u_sq)) continue;
-        int found = 0;
-        for (int k = 0; k < n_exact; ++k) {
-            if (data_plan[exact_off + pair * max_sel + uint(k)] == int(u)) found++;
+    if (p.reserved4 == 0u) {
+        // External/leaf plans are untrusted. Check the same complete metadata
+        // set, partitioned across lanes, so a missing or duplicated use can
+        // never masquerade as valid zeros. Direct SELECT output skips this
+        // quadratic consumer revalidation only when it consumed this exact
+        // metadata tensor and therefore validated/covered the same uses.
+        if (tid == 0u) attn_coverage_bad = 0u;
+        barrier();
+        for (uint u = tid; u < n_use; u += wgsize) {
+            uint ub = use_off + u * 8u;
+            if (data_meta[ub + FP_UW_TILE] != int(u_tile)) continue;
+            if (data_meta[ub + FP_UW_KV_HEAD] != int(u_kv)) continue;
+            if (data_meta[ub + FP_UW_SRC_Q] != int(u_sq)) continue;
+            int found = 0;
+            for (int k = 0; k < n_exact; ++k) {
+                if (data_plan[exact_off + pair * max_sel + uint(k)] == int(u)) found++;
+            }
+            for (int k = 0; k < n_proxy; ++k) {
+                if (data_plan[proxy_off + pair * max_sel + uint(k)] == int(u)) found++;
+            }
+            if (found != 1) {
+                atomicOr(attn_coverage_bad, 1u);
+            }
         }
-        for (int k = 0; k < n_proxy; ++k) {
-            if (data_plan[proxy_off + pair * max_sel + uint(k)] == int(u)) found++;
+        barrier();
+        if (attn_coverage_bad != 0u) {
+            for (uint d = tid; d < p.dv; d += wgsize) {
+                data_out[d + p.dv * (u_hq + Hq * u_sq)] = 0.0f;
+            }
+            if (tid == 0u) atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_PLAN_COVERAGE));
+            return;
         }
-        if (found != 1) {
-            atomicOr(attn_coverage_bad, 1u);
-        }
-    }
-    barrier();
-    if (attn_coverage_bad != 0u) {
-        for (uint d = tid; d < p.dv; d += wgsize) {
-            data_out[d + p.dv * (u_hq + Hq * u_sq)] = 0.0f;
-        }
-        if (tid == 0u) atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_PLAN_COVERAGE));
-        return;
     }
 
     float sink_logit = 0.0f;
