@@ -1386,7 +1386,7 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
                                    float scale, float softcap, float alpha, int exact_all,
                                    bool use_sink, float sink_val,
                                    const std::string & label, double atol, double rtol,
-                                   bool padded_uses = false) {
+                                   bool padded_uses = false, bool mean_correction = true) {
     (void) sel;
     // Fixture: Nk=8 in 2 fragments (4+4), frag0 mandatory (sink block),
     // frag0 g0, frag1 g1 (two phases, one denominator).
@@ -1483,7 +1483,7 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
         return false;
     }
     ggml_tensor * tplan = ggml_flash_prefill_select(ctx.get(), tq, tpool, tmeta,
-            n_tiles, hkv, max_sel, scale, alpha, softcap, exact_all, true);
+            n_tiles, hkv, max_sel, scale, alpha, softcap, exact_all, mean_correction);
     if (!tplan) {
         FP_CHECK_MSG(false, "%s: select ctor failed", label.c_str());
         return false;
@@ -1495,7 +1495,7 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
         sinkhost.assign((size_t) hq, sink_val);
     }
     ggml_tensor * tout = ggml_flash_prefill_attn(ctx.get(), tq, tk, tv, tpool, tplan, tmeta, tsinks,
-            1, hq, dv, scale, softcap, true);
+            1, hq, dv, scale, softcap, mean_correction);
     if (!tout) {
         FP_CHECK_MSG(false, "%s: attn ctor failed", label.c_str());
         return false;
@@ -1638,6 +1638,7 @@ static bool fp_backend_sparse_once(ggml_backend_t backend, const BackendSel & se
                 }
             }
             for (int u : proxy_uses) {
+                if (!mean_correction) break;
                 const int f = u;
                 const float * qh = q_storage.data() + ((size_t) h * ngroups + f % ngroups) * dk;
                 const float * mean = pool_got.data() + (size_t) f * hkv * (dk + dv);
@@ -1675,7 +1676,7 @@ static void test_backend_coverage_lanes(ggml_backend_t backend, const BackendSel
         std::vector<int32_t> meta;
         int64_t nt = 0, pw = 0;
         FP_CHECK(fp_build_meta(meta, dim, dim, 1, hq, 1, nf,
-                    std::vector<int>(nf, 1), std::vector<int>(nf, 0), std::vector<int>(nf, 0), nt));
+                    std::vector<int>(nf, 1), std::vector<int>(nf, 0), std::vector<int>(nf, 0), nt, nf == 1));
         FP_CHECK(ggml_flashprefill_plan_words(1, 1, nf, &pw) == GGML_FLASHPREFILL_OK);
         ggml_context_ptr ctx(ggml_init({16 * 1024 * 1024, nullptr, true}));
         ggml_tensor * q = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, dim, 1, hq);
@@ -1732,6 +1733,20 @@ static void test_backend_coverage_lanes(ggml_backend_t backend, const BackendSel
             const ggml_status status = ggml_backend_graph_compute(backend, graph);
             FP_CHECK_MSG(corrupt ? status != GGML_STATUS_SUCCESS : status == GGML_STATUS_SUCCESS,
                     "coverage execution status nf=%d mode=%d status=%d", nf, mode, int(status));
+            if (nf == 1 && mode == 0 && sel.name.find("Vulkan") != std::string::npos) {
+                // Padding forces multiple splits with only ONE real token,
+                // so empty M=-inf/L=0/O=0 partials must merge correctly.
+                using scratch_fn = ggml_status (*)(ggml_backend_t, uint64_t *, uint64_t *);
+                auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+                auto scratch = reinterpret_cast<scratch_fn>(ggml_backend_reg_get_proc_address(
+                            reg, "ggml_backend_vk_flashprefill_scratch"));
+                uint64_t current = 0, peak = 0;
+                FP_CHECK(scratch != nullptr);
+                if (scratch) {
+                    FP_CHECK(scratch(backend, &current, &peak) == GGML_STATUS_SUCCESS);
+                    FP_CHECK(current > 0 && peak >= current);
+                }
+            }
             ggml_backend_tensor_get(plan, wire.data(), 0, ggml_nbytes(plan));
             if (corrupt) {
                 FP_CHECK_MSG(wire[10] != GGML_FLASHPREFILL_OK,
@@ -1776,6 +1791,30 @@ static void test_backend_sparse(ggml_backend_t backend, const BackendSel & sel) 
     fp_backend_sparse_once(backend, sel, 128, 128, 1, 2, 2,
             GGML_TYPE_F16, GGML_TYPE_F16, 0.25f, 1.5f, 0.1f, 0, true, 0.3f,
             "backend-sparse-softcap-sink", 3e-3, 3e-2);
+}
+
+static void test_backend_value_accumulation(ggml_backend_t backend, const BackendSel & sel) {
+    // Cover the register-path boundary and the unbounded-head fallback,
+    // independently of the selector. The oracle uses double M/L/O algebra.
+    for (int dv : {8, 248, 256, 264}) for (bool split : {false, true}) {
+        for (bool correction : {false, true}) {
+            const std::string name = "backend-values-dv" + std::to_string(dv) +
+                (split ? "-split" : "-single") + (correction ? "-means" : "-no-means");
+            fp_backend_sparse_once(backend, sel, 64, dv, 1, 2, 2,
+                    GGML_TYPE_F16, GGML_TYPE_F16, 8.0f, 1.5f, 1.0f, 0, true, 2.0f,
+                    name, 2e-3, 2e-2, split, correction);
+        }
+    }
+    fp_backend_sparse_once(backend, sel, 128, 256, 1, 2, 2,
+            GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0, 8.0f, 1.5f, 1.0f, 0, true, 2.0f,
+            "backend-values-turbo4-turbo2-dv256", 5e-3, 5e-2, true);
+    // The default boundary-layer V policy uses Q8, even with --ctv turbo2.
+    for (int exact : {0, 1}) for (bool split : {false, true}) {
+        fp_backend_sparse_once(backend, sel, 128, 128, 1, 2, 2,
+                GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0, 8.0f, 1.5f, 1.0f, exact, true, 2.0f,
+                std::string("backend-values-boundary-q8-") + (exact ? "exact" : "sparse") +
+                    (split ? "-split" : "-single"), 5e-3, 5e-2, split);
+    }
 }
 
 static void test_backend_quant(ggml_backend_t backend, const BackendSel & sel) {
@@ -1854,6 +1893,7 @@ int main(int argc, char ** argv) {
     test_backend_sparse(backend, sel);
     // Quant backend coverage is best-effort: SKIP when unsupported.
     test_backend_quant(backend, sel);
+    test_backend_value_accumulation(backend, sel);
     test_backend_coverage_lanes(backend, sel);
     ggml_backend_free(backend);
 

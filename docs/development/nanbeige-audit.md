@@ -138,3 +138,61 @@ Production acceptance still needs model-level FullKV/Tri/FlashPrefill A/B,
 nontrivial retrieval and generation tasks, shared-prefix pressure, state
 save/restore, streaming, and sustained load. Preserve raw outputs and failures;
 neither `/health` nor a successful build replaces those gates.
+
+## September 2026 optimization audit (RTX 3070 Ti)
+
+The Vulkan ATTN path now partitions its complete coverage validation across
+lanes, and uses an online M/L/O numerator for value heads up to four components
+per lane (256 at the current 64-lane workgroup). Larger heads retain the
+general two-pass path. This adds no persistent scratch and does not change
+the eviction policy, selected-plan semantics, or the V storage domain.
+Tests cover the 248/256/264 boundary, correction on/off, Q8 boundary layers,
+Turbo K/V, split-K/MERGE and truly empty partials. Invalid small plans must
+signal failure; an error-header offset bug was reproduced and fixed.
+
+SELECT dispatch is bounded independently of descriptor validation and uses
+grid-stride traversal. CPU/GPU tests cover more actual tiles than dispatched
+workgroups. This removes excess launches but did **not** materially accelerate
+the selector in the measured workload; serial selection remains a bottleneck.
+
+Paired non-profiled model measurements used the same IQ4_NL Nanbeige model,
+768 prompt tokens, 8 greedy generated tokens, 512 physical KV cells, context
+4096, batch/ubatch 128, Turbo4/Turbo2 (default Q8 boundary V preserved), fixed
+TriAttention 3/32 and forced sparse coverage. `GGML_VK_DISABLE_COOPMAT2=1`
+was held equal. Sparse coverage used alpha=1, no sink/window blocks and no
+dense tail: these are adversarial coverage settings, **not recommendations**.
+Each process ran three requests. Below are medians of requests 2 and 3;
+the first request and all raw outputs were retained separately.
+
+| Binary order | Prompt tokens/s | Generated tokens/s | Sampled device VRAM MiB |
+| --- | ---: | ---: | ---: |
+| Preserved two-pass reference | 191.35 | 58.00 | 2281 |
+| Online value accumulation | 251.50 | 58.05 | 2281 |
+| Preserved reference rechecked | 190.57 | 58.29 | 2281 |
+
+The paired prefill improvement is about 31%; it is not a decode speedup or a
+claim to outperform ordinary dense attention. Plan counters were unchanged,
+but greedy text changed (`its itss` versus `its its outputs` in the repetitive
+synthetic probe). Floating-point accumulation is not bit-identical. Passing
+operator tolerances does not establish unchanged model quality.
+
+Additional checked QA plus 768-token retrieval passed 4/4 with FullKV. The
+512-cell Tri configurations failed retrieval with **both** the preserved
+reference and the optimized binary; failures included a PEG chat-format HTTP
+500 and a repeated-output budget exhaustion. These failures remain visible,
+block quality approval for those configurations, and were not worked around
+by increasing the retention ratio or accepting malformed responses.
+
+The default cooperative-matrix2-enabled configuration also completed three
+requests each at batch/ubatch 128 and 256. The 256 case had a roughly 22-second
+first prompt versus 0.35 seconds on repeats (about 2195 prompt tokens/s).
+The old failure was not reproduced; first-use overhead still needs separate
+operational attention. This is not evidence that every default-backend path
+or production load is validated.
+
+Local evidence is under `build-audit-vulkan/continuation/`: `cm2-warm`,
+`two-pass-normal`, `online-normal`, `two-pass-recheck`, `quality-reference`,
+`quality-smoke`, and `online-ctest.log`. Model results retain binary
+fingerprints, flags and per-request responses; successful pressure/sparse
+probes additionally record the requested plan/reclaim evidence.
+Nothing in this audit installs a binary or restarts the existing service.
