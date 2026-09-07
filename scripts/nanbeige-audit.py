@@ -49,9 +49,25 @@ def artifact_fingerprint(binary):
     return result
 
 
+def model_fingerprint(path):
+    """Fingerprint the requested GGUF, rejecting mutation during the read."""
+    path = path.resolve()
+    before = path.stat()
+    signature = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    if signature(before) != signature(path.stat()):
+        raise RuntimeError("model file changed while fingerprinting")
+    return {"path": str(path), "sha256": digest.hexdigest(), "size_bytes": before.st_size,
+            "stat": list(signature(before))}
+
+
 @contextlib.contextmanager
 def server(args, config, result):
     result["artifacts_before"] = artifact_fingerprint(args.server)
+    result["model_before"] = model_fingerprint(args.model)
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
@@ -136,6 +152,12 @@ def server(args, config, result):
         except OSError as exc:
             result["artifacts_changed"] = True
             result["artifact_fingerprint_error"] = str(exc)
+        try:
+            result["model_after"] = model_fingerprint(args.model)
+            result["model_changed"] = result["model_before"] != result["model_after"]
+        except (OSError, RuntimeError) as exc:
+            result["model_changed"] = True
+            result["model_fingerprint_error"] = str(exc)
 
 
 def prepare(args, base, key, result):
@@ -355,9 +377,11 @@ def validate_configs(configs):
         if not isinstance(extra, list) or not all(isinstance(arg, str) for arg in extra):
             raise ValueError("extra must be a list of argument strings")
         # Keep probes local and authenticated even with caller-supplied flags.
-        reserved = {"--host", "--port", "--api-key", "--api-key-file"}
+        reserved = {"--host", "--port", "--api-key", "--api-key-file",
+                    "-m", "--model", "-mu", "--model-url", "-hf", "--hf-repo",
+                    "--huggingface-repo", "--hf-file", "--huggingface-file"}
         if any(arg.split("=", 1)[0].replace("_", "-") in reserved for arg in extra):
-            raise ValueError("extra may not override the probe listener or authentication")
+            raise ValueError("extra may not override the probe listener, authentication or model source")
         env = config.get("env", {})
         if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
             raise ValueError("env must map strings to strings")
@@ -409,6 +433,8 @@ def main(argv=None):
                 (prepare if args.mode == "prepare" else probe)(args, base, key, result)
             if result.get("artifacts_changed"):
                 raise RuntimeError("build artifacts changed during the probe; result is not valid")
+            if result.get("model_changed"):
+                raise RuntimeError("model file changed during the probe; result is not valid")
             if result.get("server_exit_before_cleanup") is not None:
                 raise RuntimeError("server exited before runner cleanup: " + str(result["server_exit_before_cleanup"]))
             check_runtime_evidence(config, result)

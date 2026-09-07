@@ -174,6 +174,7 @@ class AuditTests(unittest.TestCase):
         self.args.server = self.root / "server"
         self.args.server.touch()
         self.args.model = self.root / "model"
+        self.args.model.touch()
         self.args.startup_timeout = 1
         for crashed in (False, True):
             with self.subTest(crashed=crashed):
@@ -204,6 +205,41 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(len(before), 2)
         library.write_bytes(b"new")
         self.assertNotEqual(before, audit.artifact_fingerprint(binary))
+
+    def test_model_identity_is_content_based_and_stable(self):
+        model = self.root / "model.gguf"
+        model.write_bytes(b"weights")
+        first = audit.model_fingerprint(model)
+        self.assertEqual(first, audit.model_fingerprint(model))
+        self.assertEqual(first["size_bytes"], 7)
+        copied = self.root / "copy.gguf"
+        copied.write_bytes(model.read_bytes())
+        self.assertEqual(first["sha256"], audit.model_fingerprint(copied)["sha256"])
+        model.write_bytes(b"changed")  # same size must still be detected
+        self.assertNotEqual(first["sha256"], audit.model_fingerprint(model)["sha256"])
+
+    def test_model_override_flags_are_rejected(self):
+        for flag in ("-m", "--model", "--model-url", "-hf", "--hf-repo", "--huggingface-file"):
+            with self.subTest(flag=flag), self.assertRaises(ValueError):
+                audit.validate_configs([dict(self.config, extra=[flag, "other-model"])])
+
+    def test_model_changes_and_late_server_exit_fail_the_run(self):
+        binary = self.root / "server"
+        binary.touch()
+        for evidence in ({"model_changed": True}, {"server_exit_before_cleanup": 0},
+                         {"server_exit_before_cleanup": -11}):
+            @contextlib.contextmanager
+            def changed_server(args, config, result):
+                result.update(evidence)
+                yield "local", "key"
+
+            with self.subTest(evidence=evidence), mock.patch.object(audit, "server", changed_server), \
+                    mock.patch.object(audit, "probe"), contextlib.redirect_stdout(io.StringIO()):
+                code = audit.main(["probe", "--server", str(binary), "--model", str(binary),
+                                   "--out", str(self.root)])
+            self.assertEqual(code, 1)
+            saved = json.loads((self.root / "baseline.json").read_text())
+            self.assertEqual(saved["status"], "failed")
 
     def test_changed_artifacts_cannot_pass(self):
         binary = self.root / "server"
