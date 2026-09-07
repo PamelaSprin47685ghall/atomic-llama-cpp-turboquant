@@ -489,11 +489,38 @@ llama_kv_cache::llama_kv_cache(
     {
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
+        const double kib_per_cell = kv_size > 0
+            ? (double)(memory_size_k + memory_size_v) / (double)kv_size / 1024.0
+            : 0.0;
 
-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
+        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs, %7.3f KiB/cell), "
+                       "K: %7.2f MiB, V: %7.2f MiB (requested %s/%s)\n", __func__,
                 (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
-                ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
-                ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+                kib_per_cell,
+                (float)memory_size_k / (1024.0f * 1024.0f), (float)memory_size_v / (1024.0f * 1024.0f),
+                ggml_type_name(type_k), ggml_type_name(type_v));
+
+        // Requested cache types can differ from the tensors actually
+        // allocated per layer (layer-adaptive modes, automatic asymmetric K,
+        // model-specific reuse). Print the real layer/type/byte mix so memory
+        // fitting does not mistake e.g. Boundary-V q8 layers for uniform V2.
+        for (int side = 0; side < 2; ++side) {
+            std::map<ggml_type, std::pair<uint32_t, size_t>> mix;
+            for (const auto & layer : layers) {
+                const ggml_tensor * tensor = side == 0 ? layer.k : layer.v;
+                if (!tensor) {
+                    continue;
+                }
+                auto & entry = mix[tensor->type];
+                entry.first += 1;
+                entry.second += ggml_nbytes(tensor);
+            }
+            for (const auto & [type, entry] : mix) {
+                LLAMA_LOG_INFO("%s: actual %c layers: %3u x %-8s = %7.2f MiB\n", __func__,
+                        side == 0 ? 'K' : 'V', entry.first, ggml_type_name(type),
+                        (float)entry.second / (1024.0f * 1024.0f));
+            }
+        }
     }
 
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
