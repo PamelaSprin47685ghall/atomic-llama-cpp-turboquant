@@ -187,6 +187,31 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(saved["status"], "failed")
         self.assertIn("artifacts changed", saved["error"])
 
+    def test_pressure_gate_needs_real_drain(self):
+        log = self.root / "server.log"
+        config = dict(self.config, require_tri_drain=True, max_tri_score_ms=0)
+        result = {"server_log": str(log)}
+        for text in ("health ok", "TriAttention maintenance: before=384 after=128 freed=256 score_ms=0 pack_ms=1"):
+            log.write_text(text, encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "expected a real"):
+                audit.check_runtime_evidence(config, result)
+        text = "TriAttention drain: before=512 after=128 freed=384 score_ms=0.000 pack_ms=2.3"
+        log.write_text(text, encoding="utf-8")
+        audit.check_runtime_evidence(config, result)
+        self.assertEqual(result["tri_events"][0]["freed"], 384)
+        for changed in (text.replace("0.000", "2.3"), text.replace("384", "383"),
+                        text.replace("0.000", "nan")):
+            log.write_text(changed, encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                audit.check_runtime_evidence(config, result)
+
+    def test_pressure_gate_config_validation(self):
+        for change in ({"require_tri_drain": "true"}, {"max_tri_score_ms": -1},
+                       {"max_tri_score_ms": True}, {"max_tri_score_ms": float("nan")}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                audit.validate_configs([dict(self.config, **change)])
+        audit.validate_configs([dict(self.config, require_tri_drain=True, max_tri_score_ms=0)])
+
 
 if __name__ == "__main__":
     unittest.main()

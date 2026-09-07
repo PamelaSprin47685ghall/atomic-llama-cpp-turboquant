@@ -32,8 +32,9 @@ commands above explicitly fail rather than silently substitute CPU or skip
 an unavailable backend.
 
 On the RTX 3070 Ti test host, the Turbo cooperative-matrix patch was checked
-with 24 dense attention cases (GQA=6, K=Turbo2/3/4, V=Turbo2/3/4/F16,
-query batches 1/128), 33 Turbo SET_ROWS cases, and 81 CPU round trips.
+with 32 dense attention cases (GQA=6, K=Turbo2/3/4, V=Turbo2/3/4/F16/Q8_0,
+query batches 1/128 plus the K4/V2 and K4/Q8 256-token prefill shapes),
+33 Turbo SET_ROWS cases, and 81 CPU round trips.
 These are operator correctness checks, not model-quality scores.
 
 ## Bounded model probes
@@ -72,6 +73,14 @@ budget, missing/nonfinite timing, or unhealthy final response makes the run
 exit nonzero. Per-case evidence is saved even when checks fail. `--no-chat`
 disables short QA checks; it must not be described as a quality evaluation.
 The three built-in numeric questions are smoke checks, not a benchmark suite.
+
+A matrix entry can set `"require_tri_drain": true` to require an observed
+drain that actually frees physical cells. `"max_tri_score_ms": 0` additionally
+checks the floor-only fast path, where hard guards already fill the target
+and no candidate ranking is needed. These gates parse the real server log,
+check before/after/freed accounting, and save the observed events. Do not use
+the zero-score bound for general ranked eviction, which legitimately scores
+candidates. HTTP success alone does not satisfy a requested pressure gate.
 
 For calibration preparation, use `prepare` instead of `probe` with an explicit
 **training** corpus. The runner tokenizes with the supplied model and writes a

@@ -238,6 +238,36 @@ def probe(args, base, key, result):
         raise RuntimeError("quality checks failed; see saved per-case results")
 
 
+def check_runtime_evidence(config, result):
+    """Pressure gates must observe real reclaim, not merely HTTP success."""
+    required = config.get("require_tri_drain", False)
+    ceiling = config.get("max_tri_score_ms")
+    if not required and ceiling is None:
+        return
+    text = Path(result["server_log"]).read_text(encoding="utf-8", errors="replace")
+    events = []
+    for line in text.splitlines():
+        match = re.search(r"TriAttention (drain|maintenance):", line)
+        if not match:
+            continue
+        fields = dict(re.findall(r"(\w+)=([^\s]+)", line[match.end():]))
+        event = {"kind": match.group(1)}
+        for field in ("before", "after", "freed"):
+            event[field] = int(fields[field])
+        for field in ("score_ms", "pack_ms"):
+            event[field] = float(fields[field])
+            if not math.isfinite(event[field]) or event[field] < 0:
+                raise RuntimeError("invalid TriAttention timing in server log")
+        if event["before"] < event["after"] or event["before"] - event["after"] != event["freed"]:
+            raise RuntimeError("inconsistent TriAttention physical-cell accounting")
+        events.append(event)
+    result["tri_events"] = events
+    if required and not any(event["kind"] == "drain" and event["freed"] > 0 for event in events):
+        raise RuntimeError("expected a real TriAttention drain, but none freed cells")
+    if ceiling is not None and (not events or any(event["score_ms"] > ceiling for event in events)):
+        raise RuntimeError("TriAttention scoring exceeded the configured bound or no reclaim ran")
+
+
 def validate_configs(configs):
     """Reject ambiguous matrices before starting servers or writing results."""
     if not isinstance(configs, list) or not configs:
@@ -273,6 +303,11 @@ def validate_configs(configs):
         env = config.get("env", {})
         if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
             raise ValueError("env must map strings to strings")
+        if type(config.get("require_tri_drain", False)) is not bool:
+            raise ValueError("require_tri_drain must be boolean")
+        ceiling = config.get("max_tri_score_ms")
+        if ceiling is not None and (type(ceiling) not in (int, float) or not math.isfinite(ceiling) or ceiling < 0):
+            raise ValueError("max_tri_score_ms must be finite and nonnegative")
 
 
 def main(argv=None):
@@ -314,6 +349,7 @@ def main(argv=None):
                 (prepare if args.mode == "prepare" else probe)(args, base, key, result)
             if result.get("artifacts_changed"):
                 raise RuntimeError("build artifacts changed during the probe; result is not valid")
+            check_runtime_evidence(config, result)
             result["status"] = "completed"
         except Exception as exc:
             failed = True
