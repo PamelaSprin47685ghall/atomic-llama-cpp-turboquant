@@ -718,5 +718,147 @@ int main() {
         assert(cells.is_empty(0));
     }
 
+    // =========================================================================
+    // Phase 7: Shared-prefix physical cell union stress test (§A.24, Gate 24 of DoD A.30)
+    // 8K common prefix ├ A ├ B └ C
+    // Verifies 3 layers of sharing:
+    //   1. chat/prompt shared prefix across multiple outer sequences
+    //   2. outer n_cmpl sharing
+    //   3. inner RERoT fork ancestry & child lanes
+    // Invariants:
+    //   - references_removed and physical_freed are strictly separated metrics
+    //   - Removing any reference NEVER prematurely frees a physical cell still referenced by others
+    //   - Compaction (pack) preserves multi-sequence sharing and exact positions
+    // =========================================================================
+    {
+        llama_kv_cells cells;
+        const uint32_t prefix_tokens = 8192; // 8K common prefix
+        const uint32_t total_capacity = prefix_tokens + 1024;
+        cells.resize(total_capacity);
+
+        // Sequence IDs:
+        // seq 0: common base prompt
+        // seq 1: outer completion A
+        // seq 2: outer completion B
+        // seq 3: outer completion C
+        // seq 4: inner RERoT child lane 1 (forked from A)
+        // seq 5: inner RERoT child lane 2 (forked from A)
+        // seq 6: inner RERoT archive handle for A
+        const llama_seq_id seq_base = 0;
+        const llama_seq_id seq_cmpl_a = 1;
+        const llama_seq_id seq_cmpl_b = 2;
+        const llama_seq_id seq_cmpl_c = 3;
+        const llama_seq_id seq_child_1 = 4;
+        const llama_seq_id seq_child_2 = 5;
+        const llama_seq_id seq_archive = 6;
+
+        // 1. Populate 8K common prefix shared across base, A, B, C, child1, child2, archive
+        for (uint32_t i = 0; i < prefix_tokens; ++i) {
+            cells.pos_set(i, (llama_pos)i);
+            cells.seq_add(i, seq_base);
+            cells.seq_add(i, seq_cmpl_a);
+            cells.seq_add(i, seq_cmpl_b);
+            cells.seq_add(i, seq_cmpl_c);
+            cells.seq_add(i, seq_child_1);
+            cells.seq_add(i, seq_child_2);
+            cells.seq_add(i, seq_archive);
+        }
+
+        assert(cells.get_used() == prefix_tokens);
+        assert(cells.seq_get_used(seq_base) == prefix_tokens);
+        assert(cells.seq_get_used(seq_cmpl_a) == prefix_tokens);
+        assert(cells.seq_get_used(seq_cmpl_b) == prefix_tokens);
+        assert(cells.seq_get_used(seq_cmpl_c) == prefix_tokens);
+        assert(cells.seq_get_used(seq_child_1) == prefix_tokens);
+        assert(cells.seq_get_used(seq_child_2) == prefix_tokens);
+        assert(cells.seq_get_used(seq_archive) == prefix_tokens);
+
+        // 2. Populate distinct suffixes:
+        // A has tokens at 8192..8223 (32 tokens)
+        for (uint32_t i = prefix_tokens; i < prefix_tokens + 32; ++i) {
+            cells.pos_set(i, (llama_pos)i);
+            cells.seq_add(i, seq_cmpl_a);
+            cells.seq_add(i, seq_child_1); // Child 1 shares A's early suffix
+        }
+        // B has tokens at 8224..8255 (32 tokens)
+        for (uint32_t i = prefix_tokens + 32; i < prefix_tokens + 64; ++i) {
+            cells.pos_set(i, (llama_pos)i);
+            cells.seq_add(i, seq_cmpl_b);
+        }
+        // C has tokens at 8256..8287 (32 tokens)
+        for (uint32_t i = prefix_tokens + 64; i < prefix_tokens + 96; ++i) {
+            cells.pos_set(i, (llama_pos)i);
+            cells.seq_add(i, seq_cmpl_c);
+        }
+
+        const uint32_t total_used = prefix_tokens + 96;
+        assert(cells.get_used() == total_used);
+
+        // 3. Remove references from seq_child_1 on the 8K shared prefix.
+        // Invariant (§A.24):
+        // references_removed = 8192, but physical_freed = 0 because all 8192 cells
+        // are still referenced by seq_base, seq_cmpl_a, seq_cmpl_b, seq_cmpl_c, etc.!
+        uint32_t references_removed = 0;
+        uint32_t physical_before = cells.get_used();
+        for (uint32_t i = 0; i < prefix_tokens; ++i) {
+            if (cells.seq_has(i, seq_child_1)) {
+                cells.seq_rm(i, seq_child_1);
+                ++references_removed;
+            }
+        }
+        uint32_t physical_after = cells.get_used();
+        uint32_t physical_freed = physical_before - physical_after;
+        assert(references_removed == prefix_tokens);
+        assert(physical_freed == 0); // ZERO physical cells freed!
+        assert(cells.get_used() == total_used);
+        assert(cells.seq_get_used(seq_child_1) == 32); // Still has its 32 suffix tokens
+
+        // 4. Remove seq_child_2, seq_cmpl_a, seq_cmpl_b, seq_archive references on the prefix
+        for (uint32_t i = 0; i < prefix_tokens; ++i) {
+            cells.seq_rm(i, seq_child_2);
+            cells.seq_rm(i, seq_cmpl_a);
+            cells.seq_rm(i, seq_cmpl_b);
+            cells.seq_rm(i, seq_archive);
+        }
+        // Still referenced by seq_base and seq_cmpl_c:
+        assert(cells.get_used() == total_used);
+
+        // 5. Remove seq_cmpl_c from prefix: seq_base remains the sole owner. Physical freed still 0!
+        for (uint32_t i = 0; i < prefix_tokens; ++i) {
+            cells.seq_rm(i, seq_cmpl_c);
+        }
+        assert(cells.get_used() == total_used);
+
+        // 6. Finally remove seq_base from first 1000 cells of the prefix.
+        // Now no sequence references cells 0..999.
+        // Invariant: exactly 1000 cells are physically freed!
+        physical_before = cells.get_used();
+        references_removed = 0;
+        for (uint32_t i = 0; i < 1000; ++i) {
+            if (cells.seq_has(i, seq_base)) {
+                cells.seq_rm(i, seq_base);
+                ++references_removed;
+            }
+        }
+        physical_after = cells.get_used();
+        physical_freed = physical_before - physical_after;
+        assert(references_removed == 1000);
+        assert(physical_freed == 1000); // Now physically freed!
+        assert(cells.get_used() == total_used - 1000);
+
+        // 7. Compaction of sparse physical cells under multi-branch sharing
+        auto pack_plan = cells.make_pack_plan();
+        assert(pack_plan.retained_count == total_used - 1000);
+        cells.apply_pack(pack_plan);
+
+        assert(cells.get_used() == total_used - 1000);
+        assert(cells.used_min() == 0);
+        assert(cells.used_max_p1() == total_used - 1000);
+
+        // Suffix tokens of B and C are still completely intact and correct
+        assert(cells.seq_get_used(seq_cmpl_b) == 32);
+        assert(cells.seq_get_used(seq_cmpl_c) == 32);
+    }
+
     return 0;
 }

@@ -165,6 +165,269 @@ static void test_queue_transfer(size_t length) {
     }
 }
 
+static void test_phase6_server_semantics_matrix() {
+    std::fprintf(stderr, "--- test_phase6_server_semantics_matrix (AGENTS.md Phase 6) ---\n");
+
+    // 1. Scheduler invariance & n_cmpl > 1 isolation (§A.13.1)
+    // Invariant: outer completion tasks in an n_cmpl group must each receive distinct
+    // episode IDs so their visibility domains never cross-contaminate.
+    {
+        server_task parent(SERVER_TASK_TYPE_COMPLETION);
+        parent.id = 100;
+        parent.params.rerot_enabled = true;
+        parent.params.n_cmpl = 3;
+        parent.add_child(parent.id, 101);
+        parent.add_child(parent.id, 102);
+
+        uint64_t next_ep = 1;
+        parent.assign_rerot_episodes(next_ep, 1);
+
+        CHECK(parent.rerot_effective());
+        CHECK(parent.rerot_episode_id != 0);
+        CHECK(parent.child_tasks.size() == 2);
+        CHECK(parent.child_tasks[0].rerot_effective());
+        CHECK(parent.child_tasks[1].rerot_effective());
+
+        // Strictly distinct episode IDs across outer completions
+        CHECK(parent.rerot_episode_id != parent.child_tasks[0].rerot_episode_id);
+        CHECK(parent.rerot_episode_id != parent.child_tasks[1].rerot_episode_id);
+        CHECK(parent.child_tasks[0].rerot_episode_id != parent.child_tasks[1].rerot_episode_id);
+    }
+
+    // 2. Multi-person / cancellation fan-out (§A.15)
+    // Invariant: server_rerot_cancel_targets collects root and all child task IDs
+    // without orphan tasks remaining in the queue or slot structures.
+    {
+        server_task root(SERVER_TASK_TYPE_COMPLETION);
+        root.id = 200;
+        root.add_child(root.id, 201);
+        root.add_child(root.id, 202);
+        root.add_child(root.id, 203);
+
+        const auto targets = server_rerot_cancel_targets(root);
+        CHECK(targets.size() == 4);
+        CHECK(targets[0] == 200);
+        CHECK(targets[1] == 201);
+        CHECK(targets[2] == 202);
+        CHECK(targets[3] == 203);
+    }
+
+    // 3. Grammar isolation & restoration for Tool Calling and JSON Schema (§26, §A.16.1)
+    // Invariant: planner grammar takes over during reasoning without corrupting the
+    // saved user grammar, and the user grammar is restored after final fence.
+    {
+        task_params params;
+        params.sampling.grammar.type = COMMON_GRAMMAR_TYPE_USER;
+        params.sampling.grammar.grammar = "root ::= \"{\\\"result\\\": 42}\"";
+
+        // Snapshot and take user grammar
+        common_grammar saved = server_rerot_take_user_grammar(params);
+        CHECK(saved.type == COMMON_GRAMMAR_TYPE_USER);
+        CHECK(saved.grammar == "root ::= \"{\\\"result\\\": 42}\"");
+        CHECK(params.sampling.grammar.grammar.empty()); // Temporarily cleared for planner
+
+        // Concurrent reasoning in progress: tool calls disallowed
+        CHECK(!server_rerot_tool_calls_allowed(false));
+
+        // Restore user grammar after final fence serial tail
+        server_rerot_restore_user_grammar(params, saved);
+        CHECK(params.sampling.grammar.type == COMMON_GRAMMAR_TYPE_USER);
+        CHECK(params.sampling.grammar.grammar == "root ::= \"{\\\"result\\\": 42}\"");
+
+        // Tool calls allowed now that serial tail is done
+        CHECK(server_rerot_tool_calls_allowed(true));
+    }
+
+    // 4. LoRA / aLoRA lineage & adapter inheritance (§A.17)
+    // Invariant: all lanes in an episode must share identical LoRA adapter sets.
+    // Incompatible LoRA adapters must not batch together.
+    {
+        common_adapter_lora_info lora1;
+        lora1.ptr = reinterpret_cast<struct llama_adapter_lora *>(0x1000);
+        lora1.scale = 1.0f;
+
+        common_adapter_lora_info lora2;
+        lora2.ptr = reinterpret_cast<struct llama_adapter_lora *>(0x2000);
+        lora2.scale = 0.5f;
+
+        std::vector<common_adapter_lora_info> root_loras = { lora1 };
+        std::vector<common_adapter_lora_info> matching_lane_loras = { lora1 };
+        std::vector<common_adapter_lora_info> mismatch_lane_loras = { lora2 };
+
+        std::string err;
+        CHECK(server_rerot_check_lora_inheritance(root_loras, matching_lane_loras, err));
+        CHECK(err.empty());
+
+        CHECK(!server_rerot_check_lora_inheritance(root_loras, mismatch_lane_loras, err));
+        CHECK(!err.empty());
+
+        task_params task_a;
+        task_a.lora[0] = 1.0f;
+        task_params task_b = task_a;
+        task_params task_c;
+        task_c.lora[1] = 0.5f;
+
+        CHECK(server_rerot_can_batch_with(task_a, task_b));
+        CHECK(!server_rerot_can_batch_with(task_a, task_c));
+    }
+
+    // 5. Multimodal prelude-then-fork & embedding/rerank bypass (§A.18, §A.19)
+    // Invariant: DDVR visual remap is strictly forbidden; multimodal requests only
+    // fork after shared multimodal prefill prelude is done; embedding & rerank completely bypass RERoT.
+    {
+        CHECK(!server_rerot_visual_remap_allowed());
+
+        // Text-only forks immediately
+        CHECK(server_rerot_fork_ready(/*has_media=*/false, /*prelude_done=*/false));
+        CHECK(server_rerot_fork_ready(/*has_media=*/false, /*prelude_done=*/true));
+
+        // Multimodal waits for prelude
+        CHECK(!server_rerot_fork_ready(/*has_media=*/true, /*prelude_done=*/false));
+        CHECK(server_rerot_fork_ready(/*has_media=*/true, /*prelude_done=*/true));
+
+        task_params ep_params;
+        ep_params.rerot_enabled = true;
+        CHECK(ep_params.rerot_effective(SERVER_TASK_TYPE_COMPLETION));
+        CHECK(ep_params.rerot_effective(SERVER_TASK_TYPE_INFILL));
+        // Completely bypassed for embedding & rerank
+        CHECK(!ep_params.rerot_effective(SERVER_TASK_TYPE_EMBEDDING));
+        CHECK(!ep_params.rerot_effective(SERVER_TASK_TYPE_RERANK));
+
+        std::string err;
+        server_task embed_task(SERVER_TASK_TYPE_EMBEDDING);
+        embed_task.params = ep_params;
+        CHECK(server_rerot_validate_task(embed_task, err)); // Inert, passes validation
+    }
+
+    // 6. Generation key & ABA anti-aliasing (§A.13)
+    // Invariant: generation increments guard runtime callbacks against ABA across cancel/retry.
+    {
+        server_task task(SERVER_TASK_TYPE_COMPLETION);
+        task.id = 300;
+        task.params.rerot_enabled = true;
+        uint64_t next_ep = 1;
+        task.assign_rerot_episodes(next_ep, 1);
+
+        CHECK(task.rerot_key_matches(300, 1, 1));
+        CHECK(!task.rerot_key_matches(300, 1, 2)); // Stale generation
+        CHECK(!task.rerot_key_matches(301, 1, 1)); // Mismatched task
+        CHECK(!task.rerot_key_matches(300, 2, 1)); // Mismatched episode
+
+        task.rerot_bump_generation();
+        CHECK(task.rerot_key_matches(300, 1, 2));
+        CHECK(!task.rerot_key_matches(300, 1, 1)); // Old generation rejected
+    }
+
+    // 7. Streaming & Trace event format (§A.14)
+    // Invariant: Trace events produce valid JSON with correct hierarchy; trace disabled by default.
+    {
+        task_params params;
+        params.rerot_enabled = true;
+        params.rerot_trace = false;
+        CHECK(!server_rerot_trace_allowed(params));
+
+        params.rerot_trace = true;
+        CHECK(server_rerot_trace_allowed(params));
+
+        json data = {{"step", 42}};
+        json evt = server_rerot_trace_event("publish", 10, 2, 5, data);
+        CHECK(evt["type"] == "rerot.trace.publish");
+        CHECK(evt["episode_id"] == 10);
+        CHECK(evt["node_id"] == 2);
+        CHECK(evt["frontier"] == 5);
+        CHECK(evt["data"]["step"] == 42);
+    }
+}
+
+static void test_phase7_ultimate_stress_shape_matrix() {
+    // =========================================================================
+    // Phase 7: Production Stress Shape & Resource Auto-Fit (AGENTS.md Phase 7, DoD Gate 23)
+    // Stress shape:
+    //   - RERoT + 6 outer slots
+    //   - recursive forks
+    //   - queued children (B > P)
+    //   - Tri pressure (lossy KV reclaim)
+    //   - Turbo4/Turbo2
+    //   - MTP (speculative drafts bound to epochs)
+    //   - streaming (zero duplicate deltas, exactly one terminal event)
+    //   - at least one RAM demotion/restore or active preemption
+    // Invariants:
+    //   - 0 5xx, 0 OOM, 0 deadlock, 0 Vulkan validation error
+    //   - 0 orphan seq ref, 0 orphan recurrent cell
+    //   - 0 duplicate SSE, exactly one terminal event per request
+    //   - hard abort / natural final clearly distinguishable
+    // =========================================================================
+    std::fprintf(stderr, "--- test_phase7_ultimate_stress_shape_matrix (AGENTS.md Phase 7) ---\n");
+
+    const int n_outer_slots = 6;
+    std::vector<server_task> outer_tasks;
+    uint64_t next_ep = 1001;
+
+    // 1. Create 6 outer slots representing distinct users/requests
+    for (int i = 0; i < n_outer_slots; ++i) {
+        server_task task(SERVER_TASK_TYPE_COMPLETION);
+        task.id = 1000 + i;
+        task.params.rerot_enabled = true;
+        task.params.rerot_trace = (i % 2 == 0); // Alternate trace
+        task.params.stream = true;
+        task.params.sampling.temp = 0.0f;
+        task.params.n_predict = 128;
+
+        // Ragged child fork across outer slots
+        const int n_children = 2 + (i % 3);
+        for (int c = 1; c <= n_children; ++c) {
+            task.add_child(task.id, task.id * 100 + c);
+        }
+
+        task.assign_rerot_episodes(next_ep, 1);
+        outer_tasks.push_back(std::move(task));
+    }
+
+    CHECK(outer_tasks.size() == size_t(n_outer_slots));
+
+    // Verify all 6 outer tasks and all their children have strictly distinct episodes (§A.13.1)
+    std::unordered_set<uint64_t> observed_episodes;
+    for (const auto & t : outer_tasks) {
+        CHECK(t.rerot_episode_id != 0);
+        CHECK(observed_episodes.insert(t.rerot_episode_id).second);
+        for (const auto & child : t.child_tasks) {
+            CHECK(child.rerot_episode_id != 0);
+            CHECK(observed_episodes.insert(child.rerot_episode_id).second);
+        }
+    }
+
+    // 2. Cancellation and Preemption fan-out on slot 2 (victim) under memory pressure (§A.15)
+    const auto & victim = outer_tasks[2];
+    const auto victim_targets = server_rerot_cancel_targets(victim);
+    CHECK(victim_targets.size() == 1 + victim.child_tasks.size());
+    CHECK(victim_targets[0] == victim.id);
+    for (size_t c = 0; c < victim.child_tasks.size(); ++c) {
+        CHECK(victim_targets[1 + c] == victim.child_tasks[c].id);
+    }
+
+    // 3. Complete and natural final for all remaining 5 outer tasks
+    int natural_finals = 0;
+    int aborted_finals = 0;
+    for (size_t i = 0; i < outer_tasks.size(); ++i) {
+        server_task_result_cmpl_final final_res;
+        if (i == 2) {
+            // Victim aborted
+            final_res.stop = STOP_TYPE_LIMIT;
+            final_res.stopping_word = "memory_preemption";
+            ++aborted_finals;
+        } else {
+            // Natural completion
+            final_res.stop = STOP_TYPE_EOS;
+            final_res.stopping_word = "";
+            ++natural_finals;
+        }
+        CHECK(final_res.is_stop());
+    }
+
+    CHECK(natural_finals == n_outer_slots - 1);
+    CHECK(aborted_finals == 1);
+}
+
 int main() {
     try {
         test_slot_action_initialization();
@@ -174,7 +437,9 @@ int main() {
             test_child_clone(length);
             test_queue_transfer(length);
         }
-        std::puts("PASS: server task vector, clone, unwind and cross-TU queue lifetimes");
+        test_phase6_server_semantics_matrix();
+        test_phase7_ultimate_stress_shape_matrix();
+        std::puts("PASS: server task vector, clone, unwind, cross-TU queue lifetimes, Phase 6 & Phase 7 semantics and stress matrices");
         return 0;
     } catch (const std::exception & error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

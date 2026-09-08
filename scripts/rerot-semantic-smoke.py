@@ -89,6 +89,7 @@ def main() -> int:
     bindir = Path(args.build_dir).resolve() / 'bin'
     key = secrets.token_urlsafe(24)
     with socket.socket() as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind(('127.0.0.1', args.port))
     command = [str(bindir / 'llama-server'), '-m', args.model, '-a', 'ornith-1.5',
                '-c', str(args.context), '--total-kv', str(args.total_kv), '-ngl', '40', '-kvo',

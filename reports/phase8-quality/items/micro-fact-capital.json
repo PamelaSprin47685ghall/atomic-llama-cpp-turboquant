@@ -1,0 +1,22 @@
+{
+  "id": "micro-fact-capital",
+  "tier": "deterministic_micro",
+  "prompt": "法国的首都是哪里？请直接回答城市名称。",
+  "seed": 424242,
+  "config": {
+    "rerot": true,
+    "frontier": "strong"
+  },
+  "answer": "巴黎",
+  "reasoning": "The user is asking in Chinese: \"What is the capital of France? Please answer directly with the city name.\"\n\nThe capital of France is Paris. The user wants a direct answer with just the city name.\n\nI should respond in Chinese since they asked in Chinese, and give the direct answer.\n",
+  "usage": {
+    "completion_tokens": 66,
+    "prompt_tokens": 21,
+    "total_tokens": 87,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "passed": true,
+  "wall_seconds": 1.1384027530439198
+}

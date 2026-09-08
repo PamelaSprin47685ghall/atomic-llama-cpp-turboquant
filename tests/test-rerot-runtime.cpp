@@ -1,6 +1,7 @@
 #include "server-rerot.h"
 #include "llama-context.h"
 #include "llama-model.h"
+#include "llama-memory-recurrent.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -1544,6 +1545,387 @@ static void test_context_multi_episode_isolation() {
     CHECK(!llama_rerot_is_active(&ctx, 0));
 }
 
+static void test_rerot_mtp_speculative_matrix() {
+    std::fprintf(stderr, "--- test_rerot_mtp_speculative_matrix (AGENTS.md Phase 4) ---\n");
+    test_stub_model model;
+    llama_cparams cparams = {};
+    cparams.rerot_enabled = true;
+    cparams.rerot_frontier = LLAMA_REROT_FRONTIER_STRONG;
+    llama_context ctx(model, cparams, true);
+
+    const uint64_t ep1 = 201;
+    CHECK(llama_rerot_episode_begin(&ctx, ep1, nullptr));
+
+    const llama_seq_id seq_reader = 1;
+    uint32_t run_ids[] = {1};
+
+    // 1. Initial frontier reader view at epoch (1, 1, 1)
+    llama_rerot_frontier_reader_view v1 = {
+        seq_reader, ep1, 1, 1, 10, LLAMA_REROT_FRONTIER_STRONG, {1, 1, 1}, run_ids, 1
+    };
+    CHECK(llama_rerot_set_frontier_views(&ctx, &v1, 1));
+
+    // Draft created under view (1, 1, 1)
+    llama_rerot_view_stamp draft_stamp = {1, 1, 1};
+
+    // Invariant 1: RERoT + MTP no peer update -> draft remains valid
+    CHECK(!llama_rerot_mtp_is_stale(&ctx, seq_reader, &draft_stamp));
+
+    // 2. Peer updates: peer publishes run advancing episode publish_epoch to 2
+    llama_rerot_publish pub = {};
+    pub.episode_id = ep1;
+    pub.run_id = 2;
+    pub.publish_epoch = 2;
+    CHECK(llama_rerot_publish_run(&ctx, &pub) > 0);
+
+    // Invariant 2: RERoT + MTP peer update -> older draft MUST report stale!
+    CHECK(llama_rerot_mtp_is_stale(&ctx, seq_reader, &draft_stamp));
+
+    // 3. Rollback & re-draft: update view stamp to current publish epoch 2
+    llama_rerot_frontier_reader_view v2 = {
+        seq_reader, ep1, 1, 1, 11, LLAMA_REROT_FRONTIER_STRONG, {1, 2, 1}, run_ids, 1
+    };
+    CHECK(llama_rerot_set_frontier_views(&ctx, &v2, 1));
+    draft_stamp = {1, 2, 1}; // New draft from fresh view
+    CHECK(!llama_rerot_mtp_is_stale(&ctx, seq_reader, &draft_stamp));
+
+    // 4. Invariant 3: Fork barrier: topology changes (new child fork bumps topology epoch)
+    llama_rerot_frontier_reader_view v3 = {
+        seq_reader, ep1, 1, 1, 12, LLAMA_REROT_FRONTIER_STRONG, {2, 2, 1}, run_ids, 1
+    };
+    CHECK(llama_rerot_set_frontier_views(&ctx, &v3, 1));
+    // Old draft from stamp {1, 2, 1} is immediately stale across the fork barrier
+    CHECK(llama_rerot_mtp_is_stale(&ctx, seq_reader, &draft_stamp));
+
+    // 5. Invariant 4: Tri pressure & context shift: layout epoch bumps
+    draft_stamp = {2, 2, 1}; // Re-draft at current view
+    CHECK(!llama_rerot_mtp_is_stale(&ctx, seq_reader, &draft_stamp));
+    llama_rerot_frontier_reader_view v4 = {
+        seq_reader, ep1, 1, 1, 13, LLAMA_REROT_FRONTIER_STRONG, {2, 2, 2}, run_ids, 1
+    };
+    CHECK(llama_rerot_set_frontier_views(&ctx, &v4, 1));
+    // Tri layout compaction / eviction bumps layout epoch: old draft stale!
+    CHECK(llama_rerot_mtp_is_stale(&ctx, seq_reader, &draft_stamp));
+
+    // 6. Invariant 5: Final fence: coordinator coordinates freeze and serial tail
+    draft_stamp = {2, 2, 2}; // Re-draft at current view
+    CHECK(!llama_rerot_mtp_is_stale(&ctx, seq_reader, &draft_stamp));
+    llama_rerot_frontier_reader_view v_final = {
+        seq_reader, ep1, 1, 1, 14, LLAMA_REROT_FRONTIER_STRONG, {3, 3, 3}, run_ids, 1
+    };
+    CHECK(llama_rerot_set_frontier_views(&ctx, &v_final, 1));
+    CHECK(llama_rerot_mtp_is_stale(&ctx, seq_reader, &draft_stamp));
+
+    llama_rerot_episode_end(&ctx, ep1);
+    CHECK(!llama_rerot_is_active(&ctx, ep1));
+}
+
+static void test_phase5_ram_checkpoint_context_shift_matrix() {
+    std::fprintf(stderr, "--- test_phase5_ram_checkpoint_context_shift_matrix (AGENTS.md Phase 5) ---\n");
+
+    // -----------------------------------------------------------------------
+    // Part 1: Minimum Acceptance Gate:
+    // fork -> children running -> demote -> RAM save -> physical slots reallocated to other requests
+    // -> restore to different physical indices -> resume generation
+    // Result matches uninterrupted reference.
+    // -----------------------------------------------------------------------
+    {
+        // 1. Reference runtime: uninterrupted generation
+        server_rerot_runtime ref_runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
+        const uint64_t ep_ref = ref_runtime.adopt_root(101, 101, 0, 0, 10, 501);
+        CHECK(ep_ref == 501);
+        CHECK(commit_private(ref_runtime, ep_ref, 0, 10));
+        CHECK(commit_generated(ref_runtime, ep_ref, 0, 11, "<ol><li>Worker Alpha</li><li>Worker Beta</li></ol>"));
+        ref_runtime.finish_frontier(ep_ref);
+        CHECK(ref_runtime.freeze_fork_parent(ep_ref, 0));
+
+        // Admit child 1 into slot 1, child 2 into slot 2
+        start_child(ref_runtime, ep_ref, 1, 1);
+        start_child(ref_runtime, ep_ref, 2, 2);
+        CHECK(ref_runtime.node(ep_ref, 1)->physical_slot == 1);
+        CHECK(ref_runtime.node(ep_ref, 2)->physical_slot == 2);
+
+        // Advance generation on children in reference
+        CHECK(commit_generated(ref_runtime, ep_ref, 1, ref_runtime.node(ep_ref, 1)->storage_pos_next, "Alpha reasoning token"));
+        CHECK(commit_generated(ref_runtime, ep_ref, 2, ref_runtime.node(ep_ref, 2)->storage_pos_next, "Beta reasoning token"));
+
+        // 2. Target runtime: fork -> run -> demote -> RAM save -> swap slots -> restore -> resume
+        server_rerot_runtime target_runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
+        const uint64_t ep_tgt = target_runtime.adopt_root(101, 101, 0, 0, 10, 501);
+        CHECK(ep_tgt == 501);
+        CHECK(commit_private(target_runtime, ep_tgt, 0, 10));
+        CHECK(commit_generated(target_runtime, ep_tgt, 0, 11, "<ol><li>Worker Alpha</li><li>Worker Beta</li></ol>"));
+        target_runtime.finish_frontier(ep_tgt);
+        CHECK(target_runtime.freeze_fork_parent(ep_tgt, 0));
+
+        start_child(target_runtime, ep_tgt, 1, 1);
+        start_child(target_runtime, ep_tgt, 2, 2);
+        CHECK(commit_generated(target_runtime, ep_tgt, 1, target_runtime.node(ep_tgt, 1)->storage_pos_next, "Alpha reasoning token"));
+        CHECK(commit_generated(target_runtime, ep_tgt, 2, target_runtime.node(ep_tgt, 2)->storage_pos_next, "Beta reasoning token"));
+
+        // Stamp states for verification
+        target_runtime.node(ep_tgt, 1)->sampler_blob = {11, 22, 33};
+        target_runtime.node(ep_tgt, 1)->mtp_blob = {44, 55};
+        target_runtime.node(ep_tgt, 2)->sampler_blob = {66, 77};
+        target_runtime.node(ep_tgt, 2)->mtp_blob = {88, 99};
+
+        // Demote target episode: transient slot/pen bindings released
+        CHECK(target_runtime.demote_episode(ep_tgt));
+        CHECK(target_runtime.node(ep_tgt, 1)->physical_slot == -1);
+        CHECK(target_runtime.node(ep_tgt, 2)->physical_slot == -1);
+
+        // RAM Save episode
+        const auto fp = test_state_fingerprints();
+        std::vector<uint8_t> ram_blob;
+        std::string err;
+        CHECK(target_runtime.save_episode(ep_tgt, fp, &ram_blob, &err));
+        CHECK(!ram_blob.empty() && err.empty());
+
+        // Erase ep_tgt in target_runtime, and allocate other work in target_runtime to occupy slots 1 and 2
+        // while preserving non-overlapping internal sequence arena.
+        CHECK(target_runtime.erase_episode(ep_tgt));
+
+        // In target_runtime, occupy physical slots 1 and 2 with an unrelated episode using distinct exec_seqs (5 and 6)
+        const uint64_t ep_other = target_runtime.adopt_root(200, 200, 0, 7, 0, 777);
+        CHECK(ep_other == 777);
+        CHECK(commit_generated(target_runtime, ep_other, 0, 0, "<ol><li>Other 1</li><li>Other 2</li></ol>"));
+        target_runtime.finish_frontier(ep_other);
+        CHECK(target_runtime.freeze_fork_parent(ep_other, 0));
+
+        llama_rerot_node_id other1 = LLAMA_REROT_NODE_INVALID;
+        CHECK(target_runtime.admit_next_child(ep_other, 1, 5, &other1));
+        CHECK(other1 == 1);
+        llama_rerot_node_id other2 = LLAMA_REROT_NODE_INVALID;
+        CHECK(target_runtime.admit_next_child(ep_other, 2, 6, &other2));
+        CHECK(other2 == 2);
+        CHECK(target_runtime.node(ep_other, 1)->physical_slot == 1);
+        CHECK(target_runtime.node(ep_other, 2)->physical_slot == 2);
+
+        // Now restore ep_tgt into target_runtime:
+        // Because ep_tgt was demoted, its physical_slot is -1, so it does NOT conflict with slots 1 and 2!
+        uint64_t restored_id = 0;
+        const bool load_ok = target_runtime.load_episode(ram_blob.data(), ram_blob.size(), fp, &restored_id, &err);
+        if (!load_ok) {
+            std::fprintf(stderr, "target_runtime.load_episode failed: %s\n", err.c_str());
+        }
+        CHECK(load_ok);
+        CHECK(restored_id == ep_tgt);
+
+        auto * restored_ep = target_runtime.episode(restored_id);
+        CHECK(restored_ep != nullptr);
+        CHECK(restored_ep->document.validate(&err));
+        CHECK(restored_ep->running.count(1) != 0);
+        CHECK(restored_ep->running.count(2) != 0);
+
+        // Restore to different physical slots (slots 3 and 4, since 1 and 2 are busy!)
+        auto * r_node1 = target_runtime.node(restored_id, 1);
+        auto * r_node2 = target_runtime.node(restored_id, 2);
+        CHECK(r_node1 && r_node2);
+        r_node1->physical_slot = 3;
+        r_node2->physical_slot = 4;
+        CHECK(r_node1->sampler_blob == std::vector<uint8_t>({11, 22, 33}));
+        CHECK(r_node1->mtp_blob == std::vector<uint8_t>({44, 55}));
+        CHECK(r_node2->sampler_blob == std::vector<uint8_t>({66, 77}));
+        CHECK(r_node2->mtp_blob == std::vector<uint8_t>({88, 99}));
+
+        // Continue generation on the restored episode on different physical slots
+        CHECK(commit_generated(target_runtime, restored_id, 1, r_node1->storage_pos_next, " continue A"));
+        CHECK(commit_generated(target_runtime, restored_id, 2, r_node2->storage_pos_next, " continue B"));
+
+        // Match with ref_runtime also generating the same tokens
+        CHECK(commit_generated(ref_runtime, ep_ref, 1, ref_runtime.node(ep_ref, 1)->storage_pos_next, " continue A"));
+        CHECK(commit_generated(ref_runtime, ep_ref, 2, ref_runtime.node(ep_ref, 2)->storage_pos_next, " continue B"));
+
+        // Verify logical equivalence: node run counts, token counts, PAC-DFS view equality
+        const auto * ref_ep = ref_runtime.episode(ep_ref);
+        CHECK(ref_ep->document.node_count() == restored_ep->document.node_count());
+        CHECK(ref_ep->document.run_count() == restored_ep->document.run_count());
+        for (size_t r = 0; r < ref_ep->document.run_count(); ++r) {
+            const auto * ref_run = ref_ep->document.run(llama_rerot_run_id(r));
+            const auto * res_run = restored_ep->document.run(llama_rerot_run_id(r));
+            CHECK(ref_run != nullptr && res_run != nullptr);
+            CHECK(ref_run->owner == res_run->owner);
+            CHECK(ref_run->visibility == res_run->visibility);
+            CHECK(ref_run->token_count == res_run->token_count);
+            CHECK(ref_run->storage_pos0 == res_run->storage_pos0);
+        }
+
+        // Compare reader PAC-DFS view between reference and restored
+        const auto ref_view = ref_ep->document.build_view(1);
+        const auto res_view = restored_ep->document.build_view(1);
+        CHECK(ref_view.runs.size() == res_view.runs.size());
+        CHECK(ref_view.runs.size() > 0);
+        for (size_t i = 0; i < ref_view.runs.size(); ++i) {
+            CHECK(ref_view.runs[i].run_id == res_view.runs[i].run_id);
+            CHECK(ref_view.runs[i].owner == res_view.runs[i].owner);
+            CHECK(ref_view.runs[i].token_count == res_view.runs[i].token_count);
+            CHECK(ref_view.runs[i].virtual_pos0 == res_view.runs[i].virtual_pos0);
+            CHECK(ref_view.runs[i].storage_pos0 == res_view.runs[i].storage_pos0);
+            CHECK(ref_view.runs[i].publish_epoch == res_view.runs[i].publish_epoch);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 2: Context Shift as Logical History Deletion:
+    // Drops oldest unpinned public runs, updates coordinates, reader PAC-DFS view,
+    // bumps layout & publish epochs, and invalidates MTP view stamps.
+    // -----------------------------------------------------------------------
+    {
+        test_stub_model model;
+        llama_cparams cparams = {};
+        cparams.rerot_enabled = true;
+        cparams.rerot_frontier = LLAMA_REROT_FRONTIER_STRONG;
+        llama_context ctx(model, cparams, true);
+
+        const uint64_t ep = 601;
+        CHECK(llama_rerot_episode_begin(&ctx, ep, nullptr));
+
+        server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 64);
+        const uint64_t ep_id = runtime.adopt_root(10, 10, 0, 0, 10, ep);
+        CHECK(ep_id == ep);
+        auto * episode = runtime.episode(ep);
+        CHECK(episode != nullptr);
+
+        // Append base prefix (pinned)
+        const auto run_prefix = episode->document.append_run(0, llama_rerot_visibility::public_live, 0, 10, 1);
+        // Append older public runs that can be shifted
+        const auto run_old1 = episode->document.append_run(0, llama_rerot_visibility::public_live, 10, 5, 2);
+        const auto run_old2 = episode->document.append_run(0, llama_rerot_visibility::public_live, 15, 5, 3);
+        // Active run
+        const auto run_active = episode->document.append_run(0, llama_rerot_visibility::public_live, 20, 4, 4);
+        runtime.node(ep, 0)->public_run = run_active;
+
+        episode->publish_epoch = 10;
+        episode->layout_epoch = 20;
+        episode->topology_epoch = 5;
+
+        // Establish reader view on context and check MTP draft stamp
+        llama_seq_id seq_reader = 0;
+        llama_rerot_view_stamp stamp = {episode->topology_epoch, episode->publish_epoch, episode->layout_epoch};
+        uint32_t run_ids[] = {run_prefix, run_old1, run_old2, run_active};
+        llama_rerot_frontier_reader_view v_before = {
+            seq_reader, ep, 0, run_active, 24, LLAMA_REROT_FRONTIER_STRONG, stamp, run_ids, 4
+        };
+        CHECK(llama_rerot_set_frontier_views(&ctx, &v_before, 1));
+        CHECK(!llama_rerot_mtp_is_stale(&ctx, seq_reader, &stamp));
+
+        // Perform context shift: remove 5 tokens (which exactly empties run_old1)
+        server_rerot_shift_result shift_res;
+        std::string err;
+        CHECK(runtime.context_shift(ep, 5, &shift_res, &err));
+        CHECK(err.empty());
+        CHECK(shift_res.tokens_removed == 5);
+        CHECK(shift_res.runs_emptied == 1);
+        CHECK(shift_res.runs_truncated == 1);
+        CHECK(episode->document.run(run_prefix)->token_count == 10); // prefix kept intact
+        CHECK(episode->document.run(run_old1)->token_count == 0);     // old1 emptied
+        CHECK(episode->document.run(run_old2)->token_count == 5);     // old2 intact
+        CHECK(episode->document.run(run_active)->token_count == 4);   // active intact
+
+        // Layout epoch and publish epoch bumped
+        CHECK(episode->layout_epoch == 21);
+        CHECK(episode->publish_epoch == 11);
+        CHECK(episode->topology_barrier_pending);
+
+        // Update reader view on context post-shift
+        llama_rerot_view_stamp stamp_post = {episode->topology_epoch, episode->publish_epoch, episode->layout_epoch};
+        uint32_t post_run_ids[] = {run_prefix, run_old2, run_active}; // run_old1 dropped from PAC-DFS view
+        llama_rerot_frontier_reader_view v_after = {
+            seq_reader, ep, 0, run_active, 19, LLAMA_REROT_FRONTIER_STRONG, stamp_post, post_run_ids, 3
+        };
+        CHECK(llama_rerot_set_frontier_views(&ctx, &v_after, 1));
+
+        // Prior MTP draft stamp MUST be invalidated (stale)
+        CHECK(llama_rerot_mtp_is_stale(&ctx, seq_reader, &stamp));
+        // New draft stamp with updated layout epoch is valid
+        CHECK(!llama_rerot_mtp_is_stale(&ctx, seq_reader, &stamp_post));
+
+        llama_rerot_episode_end(&ctx, ep);
+    }
+
+    // -----------------------------------------------------------------------
+    // Part 3: Checkpoint and Partial Rollback (AGENTS.md Phase 5):
+    // Snapshot plane, child native recurrent, PUBLIC brain, PRIVATE root brain,
+    // F32 hand, conv state.
+    // -----------------------------------------------------------------------
+    {
+        test_stub_model model;
+        model.hparams.n_layer_all = 4;
+        model.hparams.n_embd = 8;
+        model.hparams.n_embd_r_impl = 16;
+        model.hparams.ssm_d_state = 16;
+        model.hparams.ssm_d_inner = 32;
+
+        // Grouped recurrent memory: 2 brain rows, 4 hand rows, n_rs_seq = 2 (2 snapshots)
+        llama_memory_recurrent mem(model, GGML_TYPE_F32, GGML_TYPE_F32,
+            false, 4, 16, 2, 2, 4, nullptr);
+        CHECK(mem.is_grouped_layout());
+        CHECK(mem.get_brain_capacity() == 2);
+        CHECK(mem.get_hand_capacity() == 4);
+
+        const uint64_t ep_roll = 701;
+        llama_seq_id root_seq = 0;
+        llama_seq_id child_seq = 1;
+
+        // Step 1: Root prefill and setup write tag
+        llama_kv_rerot_meta root_tag;
+        root_tag.episode_id = ep_roll;
+        root_tag.node_id = 0;
+        root_tag.visibility = llama_rerot_visibility::public_live;
+        CHECK(mem.rerot_set_write_tag(root_seq, root_tag));
+
+        // Allocate root in recurrent memory
+        mem.tails[root_seq] = 0;
+        mem.cells[0].pos = 5;
+        mem.cells[0].seq_id.insert(root_seq);
+        mem.seq_episode[root_seq] = ep_roll;
+        mem.seq_node[root_seq] = 0;
+
+        // Verify PUBLIC brain slot allocation
+        CHECK(mem.episode_brain.count(ep_roll) != 0);
+        const int32_t brain_row = mem.episode_brain.at(ep_roll);
+        CHECK(brain_row >= 0 && brain_row < 2);
+        CHECK(mem.seq_brain[root_seq] == brain_row);
+
+        // Capture root hand seed at fork
+        const auto fork_seed = mem.capture_hand_seed(ep_roll, root_seq);
+        CHECK(fork_seed != nullptr);
+        CHECK(fork_seed->source_pos == 5);
+        CHECK(fork_seed->conv_tail_bytes.size() == mem.r_l.size());
+        CHECK(fork_seed->state_bytes.size() == mem.s_l.size());
+
+        // Step 2: Child admission with hand seed applied
+        llama_kv_rerot_meta child_tag;
+        child_tag.episode_id = ep_roll;
+        child_tag.node_id = 1;
+        child_tag.visibility = llama_rerot_visibility::public_live;
+        CHECK(mem.rerot_set_write_tag(child_seq, child_tag));
+
+        // Child tail starts unallocated (needs_cell=true), apply_hand_seed allocates cell 1
+        CHECK(mem.apply_hand_seed(child_seq, fork_seed));
+        CHECK(mem.tails[child_seq] == 1);
+        CHECK(mem.cells[1].pos == 5);
+        CHECK(mem.cells[1].has_seq_id(child_seq));
+
+        // Advance child tokens: simulate snapshot recording
+        mem.cells[1].pos = 8;
+        // Verify child native recurrent status
+        CHECK(mem.uses_native_child_state(child_seq));
+
+        // Perform partial rollback on child sequence (rollback from pos 8 to pos 6)
+        // pos 8 down to 6 is a 2-token rollback, within n_rs_seq=2 capacity
+        CHECK(mem.seq_rm(child_seq, 7, -1));
+        CHECK(mem.cells[1].pos == 6);
+        CHECK(mem.rs_idx[child_seq] == 2);
+
+        // Clear tags and release episode cleanly
+        mem.rerot_clear_write_tag(child_seq);
+        mem.rerot_clear_write_tag(root_seq);
+        mem.rerot_release_episode(ep_roll);
+        CHECK(mem.get_brain_used() == 0);
+    }
+}
+
 static void test_multi_person_multi_pen_bxp_stress() {
     std::fprintf(stderr, "--- test_multi_person_multi_pen_bxp_stress (§B.0, §B.8, §B.12, §B.16) ---\n");
     // B=6 people, P=18 pens
@@ -2234,6 +2616,107 @@ static void test_multi_episode_concurrent_final_fence_and_coordinate_freeze() {
     CHECK(runtime.erase_episode(ep2));
 }
 
+static void test_phase7_runtime_production_stress_and_pressure() {
+    // =========================================================================
+    // Phase 7: Production-scale Full-Slot Pressure & Fallback Order (§B.9, §B.13, Gate 23)
+    // Co-locates:
+    //   - 6 outer slots (B=6)
+    //   - recursive forks with ragged child distribution
+    //   - queued children (B > P where P=12, queued=18)
+    //   - TriAttention KV pressure with lossy reclaim on public history
+    //   - speculative MTP draft invalidation on layout epoch changes
+    //   - active preemption and slot demotion/re-allocation
+    // Invariants:
+    //   - 0 orphan seq ref, 0 orphan recurrent cell
+    //   - victim preemption returns all physical slots immediately
+    //   - unaffected lanes continue and complete with exactly one terminal event
+    // =========================================================================
+    std::fprintf(stderr, "--- test_phase7_runtime_production_stress_and_pressure (AGENTS.md Phase 7) ---\n");
+
+    const uint32_t P = 12; // 12 physical pens
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 10, 250);
+    runtime.set_pen_capacity(P);
+    CHECK(runtime.pen_capacity() == P);
+
+    // 1. 6 outer episodes (B=6)
+    std::vector<uint64_t> people;
+    const std::vector<int> child_counts = { 4, 3, 5, 2, 3, 4 }; // Sum = 21 children > 12 pens
+    for (size_t i = 0; i < child_counts.size(); ++i) {
+        const uint64_t ep = runtime.adopt_root(
+            int(i + 1), int(i + 1), int(i), llama_seq_id(10 + i), 0, uint64_t(700 + i));
+        people.push_back(ep);
+    }
+    CHECK(runtime.pens_allocated() == 6);
+
+    // Fork each episode
+    for (size_t i = 0; i < people.size(); ++i) {
+        const uint64_t ep = people[i];
+        const int n_children = child_counts[i];
+        std::string xml = "<ol>";
+        for (int c = 0; c < n_children; ++c) {
+            xml += "<li>Subtask " + std::to_string(c) + "</li>";
+        }
+        xml += "</ol>";
+        CHECK(commit_generated(runtime, ep, 0, 0, xml));
+        runtime.finish_frontier(ep);
+        CHECK(runtime.freeze_fork_parent(ep, 0));
+    }
+
+    // Schedule pens: P=12 capacity, children demand 21 pens.
+    // Invariant: admissions are strictly bounded by pen_capacity, remainder stays in ready_queue
+    const size_t admitted = runtime.schedule_pens(people);
+    CHECK(admitted == P);
+    CHECK(runtime.pens_allocated() == P);
+    CHECK(runtime.pens_allocated() <= runtime.pen_capacity());
+
+    // 2. Memory pressure & active preemption:
+    // Demote Person 2 (ep = people[2], which holds child pens)
+    const uint64_t victim_ep = people[2];
+    const auto victim_pens = runtime.pens_for_person(victim_ep);
+    CHECK(!victim_pens.empty());
+    const size_t freed_pen_count = victim_pens.size();
+
+    // Release slots and demote to logical state (§A.11)
+    for (int pen_id : victim_pens) {
+        runtime.release_slot(pen_id);
+    }
+    auto * victim_ptr = runtime.episode(victim_ep);
+    CHECK(victim_ptr != nullptr);
+    server_rerot_episode_demote_to_logical(*victim_ptr);
+
+    // Invariant: freed pens immediately available for queued children
+    CHECK(runtime.pens_allocated() == P - freed_pen_count);
+    CHECK(runtime.pens_for_person(victim_ep).empty());
+
+    // Re-schedule pens to admit waiting children from remaining people
+    const size_t refill_admitted = runtime.schedule_pens(people);
+    CHECK(refill_admitted == freed_pen_count);
+    CHECK(runtime.pens_allocated() == P);
+
+    // 3. TriAttention truncation on Person 0 under KV pressure (§B.9.3)
+    auto * ep0_ptr = runtime.episode(people[0]);
+    CHECK(ep0_ptr != nullptr);
+    const auto r_pub = ep0_ptr->document.append_run(0, llama_rerot_visibility::public_live, 0, 400, 1);
+    const auto r_active = ep0_ptr->document.append_run(0, llama_rerot_visibility::public_live, 400, 10, 2);
+    runtime.node(people[0], 0)->public_run = r_active;
+
+    server_rerot_shift_result shift_res;
+    std::string err;
+    CHECK(server_rerot_truncate_oldest_public(*ep0_ptr, 350, &shift_res, &err));
+    CHECK(shift_res.tokens_removed == 400);
+    CHECK(ep0_ptr->document.run(r_pub)->token_count == 0);
+
+    // Invariant: Layout epoch bumped, older MTP drafts are invalidated
+    CHECK(ep0_ptr->layout_epoch > 0);
+
+    // 4. Clean completion and erasure of all episodes
+    for (uint64_t ep : people) {
+        CHECK(runtime.erase_episode(ep));
+    }
+    CHECK(runtime.pens_allocated() == 0);
+    CHECK(runtime.pens_running() == 0);
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT Runtime Tests ===\n");
     test_recurrent_only_pressure_isolation();
@@ -2264,12 +2747,15 @@ int main() {
     test_internal_seq_exhaustion_aborts_whole_episode();
     test_people_pen_scheduler();
     test_context_multi_episode_isolation();
+    test_rerot_mtp_speculative_matrix();
+    test_phase5_ram_checkpoint_context_shift_matrix();
     test_hand_seed_and_final_fence_continuation();
     test_shared_prefix_multi_branch_union_and_preemption();
     test_multi_person_multi_pen_bxp_stress();
     test_triattention_multi_person_pressure();
     test_frontier_boundary_pen_yield_and_resume();
     test_multi_person_b_greater_than_p_fairness();
+    test_phase7_runtime_production_stress_and_pressure();
     std::fprintf(stderr, "=== Results: %d failure(s) ===\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

@@ -1,0 +1,23 @@
+{
+  "id": "code-python-dp-coinchange",
+  "tier": "code_tasks",
+  "prompt": "请写一个 Python 函数 `def coinChange(coins: list[int], amount: int) -> int:`，计算凑成总金额所需的最少硬币个数；如果无法凑出则返回 -1。请在 ```python ``` 代码块中给出完整实现。",
+  "seed": 424242,
+  "config": {
+    "rerot": true,
+    "frontier": "strong"
+  },
+  "answer": "# 硬币找零问题（动态规划）\n\n这是一个经典的完全背包型动态规划问题。\n\n## 思路\n\n定义 `dp[i]` 表示凑成金额 `i` 所需的**最少硬币个数**：\n\n- 初始化 `dp[0] = 0`（凑成金额 0 不需要硬币）\n- 其余初始化为无穷大 `inf`（表示暂时无法凑出）\n- 对每个金额 `i`，遍历所有硬币，状态转移：`dp[i] = min(dp[i], dp[i - coin] + 1)`\n\n## 完整实现\n\n```python\ndef coinChange(coins: list[int], amount: int) -> int:\n    # dp[i] 表示凑成金额 i 所需的最少硬币个数\n    dp = [float('inf')] * (amount + 1)\n    dp[0] = 0  # 凑成金额 0 需要 0 个硬币\n\n    for i in range(1, amount + 1):\n        for coin in coins:\n            if i - coin >= 0:\n                dp[i] = min(dp[i], dp[i - coin] + 1)\n\n    # 若 dp[amount] 仍是无穷大，说明无法凑出，返回 -1\n    return dp[amount] if dp[amount] != float('inf') else -1\n```\n\n## 复杂度分析\n\n| 项目 | 复杂度 |\n|------|--------|\n| 时间复杂度 | `O(amount × len(coins))` |\n| 空间复杂度 | `O(amount)` |\n\n## 验证示例\n\n```python\nprint(coinChange([1, 2, 5], 11))   # 输出: 3  (5 + 5 + 1)\nprint(coinChange([2], 3))          # 输出: -1 (无法凑出)\nprint(coinChange([1], 0))          # 输出: 0  (金额为 0)\n```\n\n## 补充：BFS 解法（更直观）\n\n也可以用广度优先搜索，从金额 `amount` 出发，每层减一枚硬币，第一次到达 0 即得到最少硬币数：\n\n```python\nfrom collections import deque\n\ndef coinChange(coins: list[int], amount: int) -> int:\n    if amount == 0:\n        return 0\n    visited = {amount}\n    queue = deque([(amount, 1)])  # (当前金额, 已用硬币数)\n    while queue:\n        cur, count = queue.popleft()\n        for coin in coins:\n            nxt = cur - coin\n            if nxt == 0:\n                return count + 1\n            if nxt > 0 and nxt not in visited:\n                visited.add(nxt)\n                queue.append((nxt, count + 1))\n    return -1\n```\n\n两种方法均可正确求解，DP 解法更简洁高效，推荐作为首选。",
+  "reasoning": "The user is asking me to write a Python function `coinChange` that solves the classic coin change problem (LeetCode 322). Let me provide a complete implementation.\n\nThe problem: Given a list of coin denominations and a target amount, find the minimum number of coins needed to make up that amount. Return -1 if it's impossible.\n\nThis is a classic dynamic programming problem. Let me write the solution.\n\nThe standard DP approach:\n- Create an array `dp` where `dp[i]` represents the minimum number of coins needed to make amount `i`.\n- Initialize `dp[0] = 0` (0 coins needed for amount 0).\n- For each amount from 1 to amount, iterate through all coins and update `dp[i] = min(dp[i], dp[i - coin] + 1)`.\n- Return `dp[amount]` if it's reachable, else -1.\n\nLet me write this cleanly.\n\n```python\ndef coinChange(coins: list[int], amount: int) -> int:\n    # dp[i] 表示凑成金额 i 所需的最少硬币个数\n    dp = [float('inf')] * (amount + 1)\n    dp[0] = 0  # 凑成金额 0 需要 0 个硬币\n    \n    for i in range(1, amount + 1):\n        for coin in coins:\n            if i - coin >= 0:\n                dp[i] = min(dp[i], dp[i - coin] + 1)\n    \n    return dp[amount] if dp[amount] != float('inf') else -1\n```\n\nThis is a clean and correct solution. Let me also consider edge cases:\n- amount = 0: returns 0 (dp[0] = 0)\n- coins is empty: if amount > 0, returns -1; if amount = 0, returns 0\n\nLet me verify with an example:\n- coins = [1, 2, 5], amount = 11\n- dp[0] = 0\n- dp[1] = 1 (coin 1)\n- dp[2] = 1 (coin 2)\n- dp[3] = 2 (1+2)\n- dp[4] = 2 (2+2)\n- dp[5] = 1 (coin 5)\n- dp[6] = 2 (5+1)\n- dp[7] = 2 (5+2)\n- dp[8] = 3 (5+2+1)\n- dp[9] = 3 (5+2+2)\n- dp[10] = 2 (5+5)\n- dp[11] = 3 (5+5+1)\n- Returns 3. Correct!\n\nLet me also provide a BFS alternative or mention the time complexity. Actually, let me keep it focused but add a brief explanation.\n\nLet me write the final answer with explanation.\n",
+  "usage": {
+    "completion_tokens": 1314,
+    "prompt_tokens": 65,
+    "total_tokens": 1379,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "passed": true,
+  "error": "",
+  "wall_seconds": 20.207006911979988
+}

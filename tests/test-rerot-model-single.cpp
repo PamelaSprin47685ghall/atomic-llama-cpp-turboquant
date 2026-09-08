@@ -181,7 +181,8 @@ static void add_token(llama_batch & batch, llama_token token, llama_pos pos, boo
     batch.logits[i] = logits;
 }
 
-static llama_context * make_context(llama_model * model, bool rerot, bool f16, layer_trace * trace, uint32_t rollback) {
+static llama_context * make_context(llama_model * model, bool rerot, bool f16, layer_trace * trace, uint32_t rollback,
+                                    bool triattention = false, const char * tri_stats = nullptr, double tri_ratio = 3.0 / 32.0) {
     auto cp = llama_context_default_params();
     cp.n_ctx = 4096;
     cp.n_ctx_kv = 4096;
@@ -196,6 +197,9 @@ static llama_context * make_context(llama_model * model, bool rerot, bool f16, l
     cp.type_k = f16 ? GGML_TYPE_F16 : GGML_TYPE_TURBO4_0;
     cp.type_v = f16 ? GGML_TYPE_F16 : GGML_TYPE_TURBO2_0;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    cp.triattention = triattention;
+    cp.triattention_stats = tri_stats;
+    cp.triattention_ratio = tri_ratio;
     cp.rerot = rerot;
     cp.rerot_frontier = LLAMA_REROT_FRONTIER_STRONG;
     cp.n_person_max = rerot ? 1 : 0;
@@ -209,7 +213,7 @@ int main(int argc, char ** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "usage: %s MODEL [steps=16] [turbo|f16] [--tape-in FILE] [--tape-out FILE] "
             "[--prompt TEXT] [--trace-step N|--no-trace] [--trace-attn-only] [--dump-dir DIR] [--rollback N] "
-            "[--replace-stage NAME] [--report-only]\n"
+            "[--replace-stage NAME] [--report-only] [--triattention] [--triattention-stats PATH] [--triattention-ratio RATIO]\n"
             "Decision equivalence is enforced by default; --report-only explicitly permits mismatches.\n", argv[0]);
         return 2;
     }
@@ -232,12 +236,16 @@ int main(int argc, char ** argv) {
         bool attention_only = false;
         bool strict = true;
         int rollback = 0;
+        bool triattention = false;
+        std::string tri_stats;
+        double tri_ratio = 3.0 / 32.0;
         for (int i = 4; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--strict") { strict = true; continue; }
             if (arg == "--report-only") { strict = false; continue; }
             if (arg == "--no-trace") { trace_step = -2; continue; }
             if (arg == "--trace-attn-only") { attention_only = true; continue; }
+            if (arg == "--triattention") { triattention = true; continue; }
             require(i + 1 < argc, "missing option value");
             const std::string value = argv[++i];
             if (arg == "--tape-in") tape_in = value;
@@ -247,6 +255,8 @@ int main(int argc, char ** argv) {
             else if (arg == "--rollback") rollback = std::stoi(value);
             else if (arg == "--replace-stage") replace_stage = value;
             else if (arg == "--dump-dir") dump_dir = value;
+            else if (arg == "--triattention-stats") { tri_stats = value; triattention = true; }
+            else if (arg == "--triattention-ratio") { tri_ratio = std::stod(value); triattention = true; }
             else throw std::runtime_error("unknown option: " + arg);
         }
         require(trace_step >= -2 && trace_step < steps, "invalid trace step");
@@ -269,8 +279,9 @@ int main(int argc, char ** argv) {
         native_trace.selected_step = rerot_trace.selected_step = trace_step;
         native_trace.attention_only = rerot_trace.attention_only = attention_only;
         native_trace.dump_dir = rerot_trace.dump_dir = dump_dir;
-        native = make_context(model, false, f16, &native_trace, uint32_t(rollback));
-        rerot = make_context(model, true, f16, &rerot_trace, uint32_t(rollback));
+        const char * tri_stats_ptr = tri_stats.empty() ? nullptr : tri_stats.c_str();
+        native = make_context(model, false, f16, &native_trace, uint32_t(rollback), triattention, tri_stats_ptr, tri_ratio);
+        rerot = make_context(model, true, f16, &rerot_trace, uint32_t(rollback), triattention, tri_stats_ptr, tri_ratio);
         require(native && rerot, "context load failed");
         auto * vocab = llama_model_get_vocab(model);
         const int n_prompt = -llama_tokenize(vocab, prompt.data(), int(prompt.size()), nullptr, 0, true, true);

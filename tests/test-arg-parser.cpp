@@ -246,6 +246,26 @@ static void test(void) {
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), off_params, LLAMA_EXAMPLE_SERVER));
         assert(!off_params.rerot_enabled);
         assert(off_params.n_parallel == 6);
+
+        // Phase 7: Auto-fit reserve accounting and worst-case scratch (§A.12, Gate 22 of DoD A.30)
+        // Invariant:
+        // - RERoT OFF: common_rerot_scratch_reserve_bytes returns 0 (zero overhead, no reserve).
+        // - RERoT ON: common_rerot_scratch_reserve_bytes returns worst-case runtime scratch (>= 8 MiB)
+        //   covering span-table/DDVR inputs, frontier query rows, parked recurrent metadata,
+        //   host episode metadata.
+        assert(common_rerot_scratch_reserve_bytes(off_params) == 0);
+        assert(common_rerot_scratch_reserve_bytes(full_auto_params) >= 8ull * 1024ull * 1024ull);
+        assert(common_rerot_scratch_reserve_bytes(manual_params) >= 8ull * 1024ull * 1024ull);
+
+        // Auto-fit gate validation
+        const auto gate_auto = common_rerot_validate_stage0(full_auto_params);
+        assert(gate_auto.ok);
+
+        common_params manual_conflict = full_auto_params;
+        manual_conflict.n_parallel_explicit = true;
+        manual_conflict.n_parallel = 6;
+        const auto gate_conflict = common_rerot_validate_stage0(manual_conflict);
+        assert(!gate_conflict.ok);
     }
 
     {

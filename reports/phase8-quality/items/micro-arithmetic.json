@@ -1,0 +1,22 @@
+{
+  "id": "micro-arithmetic",
+  "tier": "deterministic_micro",
+  "prompt": "计算 127 * 38 + 592。请一步一步计算，并将最终数值写在 \\boxed{} 内。",
+  "seed": 424242,
+  "config": {
+    "rerot": true,
+    "frontier": "strong"
+  },
+  "answer": "# 计算 127 × 38 + 592\n\n## 第一步：计算 127 × 38\n\n将 38 拆分为 30 + 8：\n\n$$127 \\times 38 = 127 \\times 30 + 127 \\times 8$$\n\n分别计算：\n\n$$127 \\times 30 = 3810$$\n\n$$127 \\times 8 = 1016$$\n\n相加：\n\n$$3810 + 1016 = 4826$$\n\n## 第二步：加上 592\n\n$$4826 + 592 = 5418$$\n\n## 最终结果\n\n$$\\boxed{5418}$$",
+  "reasoning": "Let me calculate 127 × 38 + 592 step by step.\n\nFirst, calculate 127 × 38.\n\n127 × 38 = 127 × (40 - 2) = 127 × 40 - 127 × 2 = 5080 - 254 = 4826\n\nLet me verify: 127 × 38\n127 × 30 = 3810\n127 × 8 = 1016\n3810 + 1016 = 4826\n\nSo 127 × 38 = 4826.\n\nNow add 592:\n4826 + 592 = 5418\n\nLet me verify: 4826 + 592\n4826 + 592 = 4826 + 600 - 8 = 5426 - 8 = 5418\n\nSo the answer is 5418.\n",
+  "usage": {
+    "completion_tokens": 433,
+    "prompt_tokens": 39,
+    "total_tokens": 472,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "passed": true,
+  "wall_seconds": 6.811554685002193
+}
