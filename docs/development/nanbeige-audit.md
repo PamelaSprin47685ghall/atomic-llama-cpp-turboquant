@@ -84,6 +84,18 @@ budget, missing/nonfinite timing, or unhealthy final response makes the run
 exit nonzero. Per-case evidence is saved even when checks fail. `--no-chat`
 disables short QA checks; it must not be described as a quality evaluation.
 The three built-in numeric questions are smoke checks, not a benchmark suite.
+For prompt-contained retrieval, `--needle-tokens N` keeps the historical
+early-needle fixture by default. Repeat `--needle-position` to cover multiple
+locations without changing the corpus or answer key, for example:
+
+```sh
+--needle-tokens 8192 \
+--needle-position early --needle-position middle --needle-position late
+```
+
+The middle fixture splits the same tokenized filler in half before
+detokenization, so early/middle/late use the same held-out source tokens.
+Duplicate positions and positions without a positive needle length are rejected.
 
 Use `--repeats 3` or more for performance comparisons. The result's
 `timing_summary.first_request` preserves the process-first request separately;

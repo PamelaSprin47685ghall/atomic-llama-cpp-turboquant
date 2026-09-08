@@ -456,10 +456,25 @@ def probe(args, base, key, result):
     if args.needle_tokens:
         if len(tokens) < args.needle_tokens:
             raise ValueError("corpus is shorter than the requested retrieval fixture")
-        filler = request(base, key, "/detokenize", {"tokens": tokens[:args.needle_tokens]})["content"]
+        filler_tokens = tokens[:args.needle_tokens]
+        filler = request(base, key, "/detokenize", {"tokens": filler_tokens})["content"]
+        requested_positions = getattr(args, "needle_positions", None)
+        positions = requested_positions or ["early"]
         fact = "档案中的唯一验收编号为593174。"
-        questions.append(("retrieval", "请记住下列档案事实。" + fact + "\n下面是无关资料：\n" +
-                          filler + "\n请只输出档案的六位验收编号，不要解释。", [593174]))
+        answer = "\n请只输出档案的六位验收编号，不要解释。"
+        if "early" in positions:
+            case = "retrieval" if requested_positions is None else "retrieval_early"
+            questions.append((case, "请记住下列档案事实。" + fact +
+                              "\n下面是无关资料：\n" + filler + answer, [593174]))
+        if "middle" in positions:
+            split = len(filler_tokens) // 2
+            left = request(base, key, "/detokenize", {"tokens": filler_tokens[:split]})["content"]
+            right = request(base, key, "/detokenize", {"tokens": filler_tokens[split:]})["content"]
+            questions.append(("retrieval_middle", "下面是无关资料：\n" + left +
+                              "\n请记住下列档案事实。" + fact + "\n" + right + answer, [593174]))
+        if "late" in positions:
+            questions.append(("retrieval_late", "下面是无关资料：\n" + filler +
+                              "\n请记住下列档案事实。" + fact + answer, [593174]))
     result["quality_checks"] = []
     for name, question, expected in questions:
         response = request(base, key, "/v1/chat/completions", {
@@ -611,6 +626,9 @@ def main(argv=None):
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--no-chat", action="store_true", help="throughput/stress only; no short QA checks")
     parser.add_argument("--needle-tokens", type=int, default=0, help="additional long-context retrieval fixture")
+    parser.add_argument("--needle-position", dest="needle_positions", action="append",
+                        choices=("early", "middle", "late"),
+                        help="needle location; repeat for multiple positions (default: early)")
     parser.add_argument("--startup-timeout", type=int, default=180)
     parser.add_argument("--request-timeout", type=int, default=240)
     args = parser.parse_args(argv)
@@ -622,6 +640,10 @@ def main(argv=None):
         parser.error("token counts, repeat counts and timeouts must be positive")
     if args.needle_tokens < 0:
         parser.error("needle token count cannot be negative")
+    if args.needle_positions and args.needle_tokens == 0:
+        parser.error("--needle-position requires --needle-tokens > 0")
+    if args.needle_positions and len(set(args.needle_positions)) != len(args.needle_positions):
+        parser.error("needle positions must not be repeated")
     try:
         configs = json.loads(args.configs.read_text(encoding="utf-8")) if args.configs else [
             {"name": "baseline", "ctx": 8192, "batch": 256, "ubatch": 256, "k": "turbo4", "v": "turbo2"}]

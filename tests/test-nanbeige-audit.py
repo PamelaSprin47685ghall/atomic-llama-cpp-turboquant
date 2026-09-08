@@ -25,7 +25,8 @@ class AuditTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.config = dict(name="case", ctx=8192, batch=256, ubatch=256, k="turbo4", v="turbo2")
         self.args = SimpleNamespace(corpus=None, prompt_tokens=8, predict=2, repeats=1,
-                                    no_chat=False, needle_tokens=0, request_timeout=1, out=self.root)
+                                    no_chat=False, needle_tokens=0, needle_positions=None,
+                                    request_timeout=1, out=self.root)
 
     def response(self, answer="391", finish="stop", budget=2, speed=25.0,
                  cache_n=0, prompt_n=8, predicted_n=2, truncated=False,
@@ -58,6 +59,88 @@ class AuditTests(unittest.TestCase):
         self.assertTrue(all(case["passed"] for case in result["quality_checks"]))
         self.assertEqual(len(result["requests"]), 4)
         self.assertEqual(result["timing_summary"]["repeated_requests"]["count"], 0)
+
+    def test_retrieval_positions_are_independent_fixtures(self):
+        self.args.needle_tokens = 8
+        self.args.needle_positions = ["early", "middle", "late"]
+        prompts = []
+        chats = iter(["391", "12", "-3, 0, 2, 7, 11", "593174", "593174", "593174"])
+
+        def request(base, key, path, data=None, timeout=1):
+            if path == "/tokenize":
+                return {"tokens": list(range(16))}
+            if path == "/detokenize":
+                values = data["tokens"]
+                return {"content": "[" + ",".join(str(value) for value in values) + "]"}
+            if path == "/completion":
+                return {"tokens_predicted": 2, "truncated": False, "timings": {
+                    "cache_n": 0, "prompt_n": 8, "predicted_n": 2,
+                    "prompt_ms": 320.0, "predicted_ms": 80.0,
+                    "prompt_per_second": 25.0, "predicted_per_second": 25.0}}
+            if path == "/v1/chat/completions":
+                prompts.append(data["messages"][0]["content"])
+                return {"choices": [{"message": {"content": next(chats)}, "finish_reason": "stop"}]}
+            if path == "/health":
+                return {"status": "ok"}
+            raise AssertionError(path)
+
+        result = {"config": self.config}
+        with mock.patch.object(audit, "request", side_effect=request), contextlib.redirect_stdout(io.StringIO()):
+            audit.probe(self.args, "local", "key", result)
+
+        self.assertEqual([case["case"] for case in result["quality_checks"]], [
+            "arithmetic", "extract", "sort",
+            "retrieval_early", "retrieval_middle", "retrieval_late",
+        ])
+        self.assertTrue(all(case["passed"] for case in result["quality_checks"]))
+        early, middle, late = prompts[-3:]
+        fact = "档案中的唯一验收编号为593174。"
+        self.assertLess(early.index(fact), early.index("[0,1,2,3,4,5,6,7]"))
+        self.assertLess(middle.index("[0,1,2,3]"), middle.index(fact))
+        self.assertLess(middle.index(fact), middle.index("[4,5,6,7]"))
+        self.assertLess(late.index("[0,1,2,3,4,5,6,7]"), late.index(fact))
+
+    def test_default_retrieval_case_name_stays_compatible(self):
+        self.args.needle_tokens = 8
+        chats = iter(["391", "12", "-3, 0, 2, 7, 11", "593174"])
+
+        def request(base, key, path, data=None, timeout=1):
+            if path == "/tokenize":
+                return {"tokens": list(range(16))}
+            if path == "/detokenize":
+                return {"content": "filler"}
+            if path == "/completion":
+                return {"tokens_predicted": 2, "truncated": False, "timings": {
+                    "cache_n": 0, "prompt_n": 8, "predicted_n": 2,
+                    "prompt_ms": 320.0, "predicted_ms": 80.0,
+                    "prompt_per_second": 25.0, "predicted_per_second": 25.0}}
+            if path == "/v1/chat/completions":
+                return {"choices": [{"message": {"content": next(chats)}, "finish_reason": "stop"}]}
+            if path == "/health":
+                return {"status": "ok"}
+            raise AssertionError(path)
+
+        result = {"config": self.config}
+        with mock.patch.object(audit, "request", side_effect=request), contextlib.redirect_stdout(io.StringIO()):
+            audit.probe(self.args, "local", "key", result)
+        self.assertEqual(result["quality_checks"][-1]["case"], "retrieval")
+
+    def test_retrieval_position_cli_validation(self):
+        binary = self.root / "server"
+        binary.touch()
+        base = ["probe", "--server", str(binary), "--model", str(binary),
+                "--out", str(self.root)]
+        bad = [
+            base + ["--needle-position", "middle"],
+            base + ["--needle-tokens", "8", "--needle-position", "early",
+                    "--needle-position", "early"],
+        ]
+        for argv in bad:
+            with self.subTest(argv=argv), mock.patch.object(audit, "server") as server, \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exc:
+                audit.main(argv)
+            self.assertEqual(exc.exception.code, 2)
+            server.assert_not_called()
 
     def test_first_request_is_not_mixed_into_repeated_rates(self):
         samples = [{"prompt_per_second": pp, "predicted_per_second": tg}
