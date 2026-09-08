@@ -1579,6 +1579,64 @@ static void test_workspace_span_oracle() {
 }
 
 // ----------------------------------------------------------------------------
+// 20b. Sparse hot slots in workspace span (F14 regression test)
+// ----------------------------------------------------------------------------
+static void test_workspace_span_sparse_slots() {
+    std::cout << "Running test_workspace_span_sparse_slots..." << std::endl;
+    const uint32_t D = 8, Ntotal = 100, Ngather = 2;
+    llama_cparams cparams = ref_cparams();
+    llama_xkv_cache_store store(cparams);
+    struct ggml_context * ctx = make_ctx();
+    auto kcells = std::vector<std::vector<std::vector<float>>>(Ntotal, std::vector<std::vector<float>>(1));
+    auto vcells = std::vector<std::vector<std::vector<float>>>(Ntotal, std::vector<std::vector<float>>(1));
+    for (uint32_t c = 0; c < Ntotal; ++c) {
+        kcells[c][0] = det_floats(D, 8000 + c);
+        vcells[c][0] = det_floats(D, 8500 + c);
+    }
+    struct ggml_tensor * k_st = make_storage_f32(ctx, D, 1, Ntotal, kcells);
+    struct ggml_tensor * v_st = make_storage_f32(ctx, D, 1, Ntotal, vcells);
+    auto snap = base_snap(D, D, 1, 1, 0);
+    // Cells with huge gap: cell 2 and cell 95 (span = 94, but gather count = 2)
+    const int64_t sparse_cells[2] = { 2, 95 };
+    for (uint32_t i = 0; i < Ngather; ++i) {
+        add_gather_row(*snap, sparse_cells[i], 0, (int64_t) i);
+    }
+    snap->k_storage_dep = 1;
+    snap->v_storage_dep = 2;
+    xkv_arena_lease lease;
+    // Attach workspace sized ONLY for Ngather = 2 rows
+    attach_workspace(*snap, store, Ngather,
+        (size_t) k_st->nb[2], (size_t) v_st->nb[2],
+        (size_t) D, (size_t) D, D, D, D, 0, 8 * 1024 * 1024, lease);
+    std::vector<float> qdata = det_floats(D, 8900);
+    struct ggml_tensor * q = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
+    std::memcpy(q->data, qdata.data(), D * sizeof(float));
+    std::shared_ptr<xkv_graph_op_handle> h;
+    struct ggml_tensor * out = xkv_build_graph_attention_ref(ctx, q, std::move(snap), h, { k_st, v_st });
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    ggml_graph_compute_with_ctx(ctx, gf, 1);
+    assert(h->succeeded());
+    std::vector<xkv_hot_row> rows;
+    for (uint32_t i = 0; i < Ngather; ++i) {
+        xkv_hot_row r;
+        r.storage_pos = (int64_t) i;
+        r.k_ptr = kcells[sparse_cells[i]][0].data();
+        r.v_ptr = vcells[sparse_cells[i]][0].data();
+        rows.push_back(r);
+    }
+    xkv_query_input qi;
+    qi.head_dim_k = D; qi.head_dim_v = D; qi.q_vec = qdata;
+    std::vector<float> expect = xkv_dense_attention_reference(qi, rows, {}, {}, {}, {});
+    std::vector<float> actual(D);
+    std::memcpy(actual.data(), out->data, D * sizeof(float));
+    assert(vec_eq(actual, expect, 1e-4f));
+    h.reset();
+    ggml_free(ctx);
+    std::cout << "test_workspace_span_sparse_slots PASSED" << std::endl;
+}
+
+// ----------------------------------------------------------------------------
 // 21. One-byte-short backing fails closed (P0-WS)
 // ----------------------------------------------------------------------------
 static void test_workspace_one_byte_short() {
@@ -3829,6 +3887,7 @@ int main() {
     test_sr_per_query_isolation();
     test_sr_global_budget();
     test_workspace_span_oracle();
+    test_workspace_span_sparse_slots();
     test_workspace_one_byte_short();
     test_workspace_lease_accounting();
     test_zero_heap_callback();

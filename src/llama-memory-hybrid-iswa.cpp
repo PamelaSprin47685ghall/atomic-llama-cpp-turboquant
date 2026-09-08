@@ -234,12 +234,13 @@ bool llama_memory_hybrid_iswa::try_clear(bool data, std::string * err) {
 }
 
 bool llama_memory_hybrid_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    // Try removing from the recurrent cache first since it may fail. If it does
-    // fail, the cache will not have been mutated.
-    if (!mem_recr->seq_rm(seq_id, p0, p1)) {
+    // Attention removal can fail if bounded removal release/preflight fails.
+    // Remove attention first; if attention removal fails, recurrent cache is
+    // left untouched.
+    if (!mem_attn->seq_rm(seq_id, p0, p1)) {
         return false;
     }
-    return mem_attn->seq_rm(seq_id, p0, p1);
+    return mem_recr->seq_rm(seq_id, p0, p1);
 }
 
 void llama_memory_hybrid_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -450,6 +451,9 @@ llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(
 bool llama_memory_hybrid_iswa_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
+    postcompute_finalized = false;
+    postcompute_ok = false;
+
     ctx_attn->next();
     ctx_recr->next();
 
@@ -462,6 +466,9 @@ bool llama_memory_hybrid_iswa_context::next() {
 
 bool llama_memory_hybrid_iswa_context::apply() {
     assert(!llama_memory_status_is_fail(status));
+
+    postcompute_finalized = false;
+    postcompute_ok = false;
 
     bool res = true;
 

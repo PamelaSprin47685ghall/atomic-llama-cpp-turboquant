@@ -938,6 +938,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_diag[2];
     vk_pipeline pipeline_clamp[2];
     vk_pipeline pipeline_pad_f32;
+    vk_pipeline pipeline_memmove_bytes;
     vk_pipeline pipeline_roll_f32;
     vk_pipeline pipeline_repeat_i32, pipeline_repeat_back_f32;
     vk_pipeline pipeline_repeat_i16;
@@ -1096,6 +1097,8 @@ struct vk_device_struct {
     // intentionally separate from sync_staging: TriAttention compaction must
     // stay on-device and never round-trip through host-visible memory.
     vk_buffer memmove_scratch;
+    std::vector<vk::DescriptorPool> memmove_descriptor_pools;
+    std::vector<vk::DescriptorSet> memmove_descriptor_sets;
 
     ggml_backend_buffer_type buffer_type;
 
@@ -1113,6 +1116,9 @@ struct vk_device_struct {
 
         ggml_vk_destroy_buffer(sync_staging);
         ggml_vk_destroy_buffer(memmove_scratch);
+        for (auto pool : memmove_descriptor_pools) {
+            device.destroyDescriptorPool(pool);
+        }
 
         if (compute_queue) compute_queue->cmd_pool.destroy(device);
         if (transfer_queue) transfer_queue->cmd_pool.destroy(device);
@@ -2342,6 +2348,7 @@ struct ggml_backend_vk_context {
     bool prealloc_moe_route_need_sync;
     const ggml_tensor * prealloc_moe_route_last_ids {};
     uint32_t prealloc_moe_route_grouped_max {};
+    bool prealloc_moe_route_split_singletons {};
 
     vk_context_ref compute_ctx;
 
@@ -4482,10 +4489,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const void * spv_data = nullptr;
         size_t spv_size = 0;
         const char *name = nullptr;
-        if (bf16_kv) {
+        // The half-operand "f32acc" module only widens QK accumulation:
+        // Q staging, dequantization, softmax weights and PV still round to
+        // F16. This is not the precision of the indexed F32 path and can
+        // change expert/token decisions even with identical visible keys.
+        // Use the existing full-F32 scalar module for non-MMQ F32 attention;
+        // leave the explicit low-precision and integer-dot paths intact.
+        if (bf16_kv || (f32acc && !use_mmq)) {
             spv_data = flash_attn_f32_f16_fp32_data;
             spv_size = flash_attn_f32_f16_fp32_len;
-            name = aligned ? "flash_attn_f32_bf16_aligned" : "flash_attn_f32_bf16";
+            name = aligned ? "flash_attn_f32_full_aligned" : "flash_attn_f32_full";
         } else if (use_mmq) {
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
             if (device->fp16) {
@@ -4525,39 +4538,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // first-use pipeline creation.
     for (auto &fa : device->pipeline_flash_attn_f32_f16) {
         if (fa.first.path != FA_SCALAR || !fa.first.rerot) continue;
-        const bool f32acc = fa.first.f32acc;
-        const void * spv_data = nullptr;
-        size_t spv_size = 0;
-        // Module selection mirrors the ordinary scalar loop above; the
-        // RerotMode specialization makes the selected main() path variant-
-        // agnostic.
-        if (fa.first.k_type == GGML_TYPE_BF16) {
-            spv_data = flash_attn_f32_f16_fp32_data;
-            spv_size = flash_attn_f32_f16_fp32_len;
-        } else if (ggml_vk_fa_scalar_uses_mmq(device, fa.first.k_type, fa.first.v_type)) {
-#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
-            if (device->fp16) {
-                if (f32acc) { spv_data = flash_attn_f32_f16_int8_data;        spv_size = flash_attn_f32_f16_int8_len; }
-                else        { spv_data = flash_attn_f32_f16_f16acc_int8_data; spv_size = flash_attn_f32_f16_f16acc_int8_len; }
-            } else {
-                spv_data = flash_attn_f32_f16_fp32_int8_data;
-                spv_size = flash_attn_f32_f16_fp32_int8_len;
-            }
-#endif
-        } else {
-            if (device->fp16) {
-                if (device->dot2_f16) {
-                    if (f32acc) { spv_data = flash_attn_f32_f16_dot2_data;        spv_size = flash_attn_f32_f16_dot2_len; }
-                    else        { spv_data = flash_attn_f32_f16_dot2_f16acc_data; spv_size = flash_attn_f32_f16_dot2_f16acc_len; }
-                } else {
-                    if (f32acc) { spv_data = flash_attn_f32_f16_data;        spv_size = flash_attn_f32_f16_len; }
-                    else        { spv_data = flash_attn_f32_f16_f16acc_data; spv_size = flash_attn_f32_f16_f16acc_len; }
-                }
-            } else {
-                spv_data = flash_attn_f32_f16_fp32_data;
-                spv_size = flash_attn_f32_f16_fp32_len;
-            }
-        }
+        // Indexed attention is F32, including dequantization. Selecting a
+        // half-operand module silently rounded Turbo K/V before the otherwise
+        // F32 kernel. It never uses MMQ's Q8 query quantization either.
+        GGML_ASSERT(fa.first.f32acc);
+        const void * spv_data = flash_attn_f32_f16_fp32_data;
+        const size_t spv_size = flash_attn_f32_f16_fp32_len;
         const uint32_t subgroup_size = fa.first.subgroup_size;
         ggml_vk_create_pipeline(device, fa.second, "flash_attn_rerot", spv_size, spv_data, "main", 9,
                                 sizeof(vk_flash_attn_push_constants), {1, 1, 1},
@@ -5682,6 +5668,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_diag[1], "diag_f16", diag_f16_len, diag_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_pad_f32, "pad_f32", pad_f32_len, pad_f32_data, "main", 2, sizeof(vk_op_pad_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_memmove_bytes, "memmove_bytes", memmove_bytes_len, memmove_bytes_data, "main", 2, 3 * sizeof(uint32_t), {64, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_roll_f32, "roll_f32", roll_f32_len, roll_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
@@ -7706,6 +7693,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->prealloc_moe_route_need_sync = false;
     ctx->prealloc_moe_route_last_ids = nullptr;
     ctx->prealloc_moe_route_grouped_max = 0;
+    ctx->prealloc_moe_route_split_singletons = false;
     // Fixed size of 1KB, for deterministic behavior
     ctx->prealloc_size_add_rms_partials = 1024;
 
@@ -10444,11 +10432,12 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
     vk_pipeline count_experts = ctx->device->pipeline_count_experts;
 
-    const bool split_singletons = nei1 <= mul_mat_vec_id_hybrid_max_cols;
     const ggml_type routed_type_a = qx_needs_dequant ? f16_type : src0->type;
     const ggml_type routed_type_b = quantize_y
         ? GGML_TYPE_Q8_1
         : (qy_needs_dequant ? f16_type : src1->type);
+    const bool split_singletons = nei1 <= mul_mat_vec_id_hybrid_max_cols &&
+        (routed_type_b == GGML_TYPE_F32 || routed_type_b == GGML_TYPE_Q8_1);
 
     vk_pipeline singleton_dmmv = nullptr;
     vk_pipeline grouped_dmmv = nullptr;
@@ -10529,7 +10518,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             ggml_pipeline_request_descriptor_sets(ctx, grouped_dmmv, 1);
         }
         if (ctx->prealloc_moe_route_last_ids != ids ||
-            ctx->prealloc_moe_route_grouped_max != grouped_max) {
+            ctx->prealloc_moe_route_grouped_max != grouped_max ||
+            ctx->prealloc_moe_route_split_singletons != split_singletons) {
             ggml_pipeline_request_descriptor_sets(ctx, count_experts, 2);
         }
     }
@@ -10608,7 +10598,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // Gate/up/down projections share the same selected-expert tensor. Build the
     // packed row map once per graph execution and reuse it for every consumer.
     if (ctx->prealloc_moe_route_last_ids != ids ||
-        ctx->prealloc_moe_route_grouped_max != grouped_max) {
+        ctx->prealloc_moe_route_grouped_max != grouped_max ||
+        ctx->prealloc_moe_route_split_singletons != split_singletons) {
         if (ctx->prealloc_moe_route_need_sync) {
             ggml_vk_sync_buffers(ctx, subctx);
         }
@@ -10627,6 +10618,14 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                                  grouped_dispatch_offset,
                                                  generic_dispatch_offset,
             (uint32_t) n_as };
+        if (!split_singletons) {
+            ggml_vk_dispatch_pipeline(ctx, subctx, count_experts,
+                { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf, route_rows_buf },
+                pc_reset, { 1, 1, 1 });
+            ctx->prealloc_moe_route_need_sync = true;
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+
         auto pc_build = pc_reset;
         pc_build[5] = split_singletons ? 3 : 1;
         ggml_vk_dispatch_pipeline(ctx, subctx, count_experts,
@@ -10635,6 +10634,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
         ctx->prealloc_moe_route_last_ids = ids;
         ctx->prealloc_moe_route_grouped_max = grouped_max;
+        ctx->prealloc_moe_route_split_singletons = split_singletons;
         ctx->prealloc_moe_route_need_sync = true;
     }
 
@@ -11053,16 +11053,16 @@ static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx
 }
 
 static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type) {
-    GGML_UNUSED(f32acc);
     // Needs to be kept up to date on shader changes
     const uint32_t wg_size = params.workgroup_size;
     const uint32_t Br = params.block_rows;
     const uint32_t Bc = params.block_cols;
 
-    // BF16 uses the fp32 shader (FLOAT_TYPE=float)
-    const uint32_t float_type_size = (device->fp16 && k_type != GGML_TYPE_BF16) ? sizeof(ggml_fp16_t) : sizeof(float);
-
     const bool mmq = ggml_vk_fa_scalar_uses_mmq(device, k_type, v_type);
+    // Must match module selection: BF16 and non-MMQ F32 use FLOAT_TYPE=float,
+    // even on a device advertising fast F16 / dot2.
+    const bool half_operands = device->fp16 && k_type != GGML_TYPE_BF16 && !(f32acc && !mmq);
+    const uint32_t float_type_size = half_operands ? sizeof(ggml_fp16_t) : sizeof(float);
 
     // tmpsh is overestimated slightly
     const uint32_t tmpsh = wg_size * sizeof(float);
@@ -16172,6 +16172,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         ctx->prealloc_moe_route_need_sync = false;
         ctx->prealloc_moe_route_last_ids = nullptr;
         ctx->prealloc_moe_route_grouped_max = 0;
+        ctx->prealloc_moe_route_split_singletons = false;
     }
     if (ctx->prealloc_add_rms_partials == nullptr || (ctx->prealloc_size_add_rms_partials > 0 && ctx->prealloc_add_rms_partials->size < ctx->prealloc_size_add_rms_partials)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(add_partials_size: " << ctx->prealloc_add_rms_partials << ")");
@@ -16818,6 +16819,7 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->prealloc_y_last_decode_vector_staging = false;
     ctx->prealloc_moe_route_last_ids = nullptr;
     ctx->prealloc_moe_route_grouped_max = 0;
+    ctx->prealloc_moe_route_split_singletons = false;
 
     ctx->unsynced_nodes_written.clear();
     ctx->unsynced_nodes_read.clear();
@@ -17051,10 +17053,10 @@ static bool ggml_backend_vk_buffer_memmove_tensor(
     vk_buffer data_buf = buf_ctx->dev_buffer;
     vk_device device = data_buf->device;
 
-    // Validate the full batch before touching data. vkCmdCopyBuffer requires
-    // 4-byte aligned offsets/sizes, so layouts that cannot be represented by
-    // transfer copies (notably some transposed F16/BF16 V moves) explicitly
-    // report unsupported instead of silently falling back to host staging.
+    // Aligned copies retain the transfer fast path. Other byte layouts (in
+    // particular transposed F16 V) use device compute, never host staging.
+    size_t byte_dispatches = 0;
+    const size_t chunk_limit = std::min<size_t>(GGML_VK_MEMMOVE_SCRATCH_SIZE, 1u << 20);
     for (size_t r = 0; r < n_regions; ++r) {
         const auto & region = regions[r];
         if (region.tensor == nullptr || region.tensor->buffer != buffer || region.n_copies == 0) {
@@ -17068,9 +17070,14 @@ static bool ggml_backend_vk_buffer_memmove_tensor(
             const uint64_t end_src = src + region.size;
             const uint64_t end_dst = dst + region.size;
 
-            if (end_src > buffer->size || end_dst > buffer->size ||
-                (src & 3u) != 0 || (dst & 3u) != 0 || (region.size & 3u) != 0) {
+            if (end_src < src || end_dst < dst || end_src > buffer->size || end_dst > buffer->size) {
                 return false;
+            }
+            if (region.size && src != dst && ((src | dst | region.size) & 3u)) {
+                byte_dispatches += 2 * (1 + (region.size - 1) / chunk_limit);
+                if (byte_dispatches > UINT32_MAX) {
+                    return false;
+                }
             }
         }
     }
@@ -17078,12 +17085,43 @@ static bool ggml_backend_vk_buffer_memmove_tensor(
     std::lock_guard<std::recursive_mutex> guard(device->mutex);
     ggml_vk_ensure_memmove_scratch(device);
 
+    ggml_backend_vk_context byte_ctx{};
+    byte_ctx.device = device;
+    byte_ctx.descriptor_pools.swap(device->memmove_descriptor_pools);
+    byte_ctx.descriptor_sets.swap(device->memmove_descriptor_sets);
+    // Descriptor sets are immutable while submitted commands may use them.
+    // Reserve a distinct set per dispatch during preflight. Reuse pools only
+    // after the fence; the device mutex also serializes concurrent callers.
+    struct pool_guard {
+        ggml_backend_vk_context & ctx;
+        ~pool_guard() {
+            ctx.descriptor_pools.swap(ctx.device->memmove_descriptor_pools);
+            ctx.descriptor_sets.swap(ctx.device->memmove_descriptor_sets);
+        }
+    } cleanup{byte_ctx};
+    if (byte_dispatches) {
+        ggml_pipeline_request_descriptor_sets(&byte_ctx, device->pipeline_memmove_bytes, (uint32_t) byte_dispatches);
+    }
     if (dry_run) {
         return true;
     }
 
-    vk_context subctx = ggml_vk_create_temporary_context(device->transfer_queue->cmd_pool);
+    vk_context subctx = ggml_vk_create_temporary_context(
+        byte_dispatches ? device->compute_queue->cmd_pool : device->transfer_queue->cmd_pool);
     ggml_vk_ctx_begin(device, subctx);
+
+    auto copy_bytes = [&](vk_buffer & src_buf, uint64_t src, vk_buffer & dst_buf, uint64_t dst, size_t count) {
+        const uint64_t alignment = device->properties.limits.minStorageBufferOffsetAlignment;
+        const uint64_t src_base = src - src % alignment;
+        const uint64_t dst_base = dst - dst % alignment;
+        const uint32_t so = (uint32_t) (src - src_base), doff = (uint32_t) (dst - dst_base);
+        const std::array<uint32_t, 3> pc = {so, doff, (uint32_t) count};
+        ggml_vk_dispatch_pipeline(&byte_ctx, subctx, device->pipeline_memmove_bytes,
+            {{src_buf->buffer, src_base, (so + count + 3) & ~size_t(3)},
+             {dst_buf->buffer, dst_base, (doff + count + 3) & ~size_t(3)}},
+            pc, {(uint32_t) ((doff % 4 + count + 3) / 4), 1, 1});
+        ggml_vk_sync_buffers(nullptr, subctx);
+    };
 
     auto move_one = [&](uint64_t src, uint64_t dst, size_t size) {
         if (size == 0 || src == dst) {
@@ -17096,15 +17134,20 @@ static bool ggml_backend_vk_buffer_memmove_tensor(
         // intentionally general.
         size_t remaining = size;
         while (remaining > 0) {
-            const size_t chunk = std::min(remaining, GGML_VK_MEMMOVE_SCRATCH_SIZE);
+            const size_t chunk = std::min(remaining, chunk_limit);
             const size_t off = dst > src ? remaining - chunk : size - remaining;
 
+            if (((src | dst | size) & 3u) != 0) {
+                copy_bytes(data_buf, src + off, device->memmove_scratch, 0, chunk);
+                copy_bytes(device->memmove_scratch, 0, data_buf, dst + off, chunk);
+            } else {
             ggml_vk_buffer_copy_async(
                 subctx, device->memmove_scratch, 0, data_buf, src + off, chunk);
             ggml_vk_sync_buffers(nullptr, subctx);
             ggml_vk_buffer_copy_async(
                 subctx, data_buf, dst + off, device->memmove_scratch, 0, chunk);
             ggml_vk_sync_buffers(nullptr, subctx);
+            }
 
             remaining -= chunk;
         }

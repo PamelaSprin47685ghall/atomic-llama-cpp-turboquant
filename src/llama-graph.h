@@ -286,8 +286,8 @@ public:
         const llama_memory_recurrent_context * current,
         const llama_ubatch & ubatch);
 
-    ggml_tensor * s_copy;      // I32 [n_rs]
-    ggml_tensor * brain_copy;  // I32 [n_seqs], grouped shared-S rows
+    ggml_tensor * s_copy = nullptr;      // I32 [n_rs]
+    ggml_tensor * brain_copy = nullptr;  // I32 [n_seqs], grouped shared-S rows
 
     struct rbb_group_input {
         int32_t brain_row = -1;
@@ -298,8 +298,8 @@ public:
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
-    ggml_tensor * s_copy_main;   // I32 [n_seqs]
-    ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
+    ggml_tensor * s_copy_main = nullptr;   // I32 [n_seqs]
+    ggml_tensor * s_copy_extra = nullptr;  // I32 [n_rs - n_seqs]
 
     const llama_memory_recurrent_context * mctx;
 

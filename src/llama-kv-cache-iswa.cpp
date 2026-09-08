@@ -120,12 +120,10 @@ bool llama_kv_cache_iswa::try_clear(bool data, std::string * err) {
 }
 
 bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    bool res = true;
-
-    res = res & kv_base->seq_rm(seq_id, p0, p1);
-    res = res & kv_swa ->seq_rm(seq_id, p0, p1);
-
-    return res;
+    if (!kv_base->seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
+    return kv_swa->seq_rm(seq_id, p0, p1);
 }
 
 void llama_kv_cache_iswa::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
@@ -538,6 +536,9 @@ llama_kv_cache_iswa_context:: ~llama_kv_cache_iswa_context() = default;
 bool llama_kv_cache_iswa_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
+    postcompute_finalized = false;
+    postcompute_ok = false;
+
     ctx_base->next();
     ctx_swa ->next();
 
@@ -550,6 +551,9 @@ bool llama_kv_cache_iswa_context::next() {
 
 bool llama_kv_cache_iswa_context::apply() {
     assert(!llama_memory_status_is_fail(status));
+
+    postcompute_finalized = false;
+    postcompute_ok = false;
 
     bool res = true;
 

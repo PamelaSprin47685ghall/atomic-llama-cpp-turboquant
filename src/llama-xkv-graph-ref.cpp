@@ -1030,19 +1030,22 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
                 float * deq_base = reinterpret_cast<float *>(wbase + lay.deq_off);
                 float * out_base = reinterpret_cast<float *>(wbase + lay.gather_off);
                 float * rot_tmp = reinterpret_cast<float *>(wbase + lay.rot_off);
-                int64_t min_c = 0, max_c = -1;
-                for (int64_t c : gather_cells) {
-                    if (max_c < 0 || c < min_c) min_c = c;
-                    if (c > max_c) max_c = c;
-                }
                 if (!gather_cells.empty()) {
                     if (snap.hot_storage_host_resident && k_storage->data && v_storage->data) {
                         for (size_t j = 0; j < gather_cells.size(); ++j) {
+                            if (gather_cells[j] < 0 || gather_cells[j] >= k_storage->ne[2] ||
+                                gather_cells[j] >= v_storage->ne[2]) {
+                                snap.last_status = xkv_read_status::invalid_argument;
+                                snap.last_error = "hot gather cell out of storage range";
+                                return;
+                            }
                             size_t rk = 0, rv = 0, ok = 0, ov = 0;
-                            if (!safe_mul((size_t) (gather_cells[j] - min_c), stride_k, rk) ||
+                            if (!safe_mul(j, stride_k, rk) ||
                                 !safe_mul((size_t) gather_cells[j], stride_k, ok) ||
-                                !safe_mul((size_t) (gather_cells[j] - min_c), stride_v, rv) ||
-                                !safe_mul((size_t) gather_cells[j], stride_v, ov)) {
+                                !safe_mul(j, stride_v, rv) ||
+                                !safe_mul((size_t) gather_cells[j], stride_v, ov) ||
+                                rk + row_k > lay.bulk_k_bytes ||
+                                rv + row_v > lay.bulk_v_bytes) {
                                 snap.last_status = xkv_read_status::invalid_argument;
                                 snap.last_error = "hot gather span offset overflow";
                                 return;
@@ -1051,16 +1054,27 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
                             std::memcpy(bv + rv, static_cast<const uint8_t *>(v_storage->data) + ov, row_v);
                         }
                     } else {
-                        size_t span_n = 0, span_bk = 0, span_bv = 0, base_k = 0, base_v = 0;
-                        if (!safe_add((size_t) (max_c - min_c), 1, span_n) ||
-                            !safe_mul(span_n, stride_k, span_bk) || !safe_mul(span_n, stride_v, span_bv) ||
-                            !safe_mul((size_t) min_c, stride_k, base_k) || !safe_mul((size_t) min_c, stride_v, base_v)) {
-                            snap.last_status = xkv_read_status::invalid_argument;
-                            snap.last_error = "hot gather span range overflow";
-                            return;
+                        for (size_t j = 0; j < gather_cells.size(); ++j) {
+                            if (gather_cells[j] < 0 || gather_cells[j] >= k_storage->ne[2] ||
+                                gather_cells[j] >= v_storage->ne[2]) {
+                                snap.last_status = xkv_read_status::invalid_argument;
+                                snap.last_error = "hot gather cell out of storage range";
+                                return;
+                            }
+                            size_t rk = 0, rv = 0, ok = 0, ov = 0;
+                            if (!safe_mul(j, stride_k, rk) ||
+                                !safe_mul((size_t) gather_cells[j], stride_k, ok) ||
+                                !safe_mul(j, stride_v, rv) ||
+                                !safe_mul((size_t) gather_cells[j], stride_v, ov) ||
+                                rk + row_k > lay.bulk_k_bytes ||
+                                rv + row_v > lay.bulk_v_bytes) {
+                                snap.last_status = xkv_read_status::invalid_argument;
+                                snap.last_error = "hot gather span offset overflow";
+                                return;
+                            }
+                            ggml_backend_tensor_get(k_storage, bk + rk, ok, row_k);
+                            ggml_backend_tensor_get(v_storage, bv + rv, ov, row_v);
                         }
-                        ggml_backend_tensor_get(k_storage, bk, base_k, span_bk);
-                        ggml_backend_tensor_get(v_storage, bv, base_v, span_bv);
                     }
                 }
                 for (size_t i = 0; i < snap.hot_data.size(); ++i) {
@@ -1088,8 +1102,10 @@ void xkv_graph_op_handle::compute(struct ggml_tensor * dst, int ith, int nth) no
                         return;
                     }
                     size_t rk = 0, rv = 0;
-                    if (!safe_mul((size_t) (gather_cells[bp] - min_c), stride_k, rk) ||
-                        !safe_mul((size_t) (gather_cells[bp] - min_c), stride_v, rv)) {
+                    if (!safe_mul(bp, stride_k, rk) ||
+                        !safe_mul(bp, stride_v, rv) ||
+                        rk + row_k > lay.bulk_k_bytes ||
+                        rv + row_v > lay.bulk_v_bytes) {
                         snap.last_status = xkv_read_status::invalid_argument;
                         snap.last_error = "hot gather span offset overflow";
                         return;
@@ -1595,24 +1611,28 @@ bool dequant_storage_row(ggml_type type, const uint8_t * raw, int64_t n_elements
 }
 
 // y = M * x with row-major M (dim x dim), in place via scratch.
-bool apply_inverse_rotation(std::vector<float> & vec, const std::vector<float> & mat, uint32_t dim, std::string * err) {
+bool apply_inverse_rotation(std::vector<float> & vec, const std::vector<float> & mat, uint32_t rot_dim, std::string * err) {
     if (mat.empty()) return true;
-    if (dim == 0 || vec.size() != dim) {
+    if (rot_dim == 0 || vec.size() == 0 || vec.size() < rot_dim || vec.size() % rot_dim != 0) {
         if (err) *err = "apply_inverse_rotation: dimension mismatch";
         return false;
     }
     size_t need = 0;
-    if (!safe_mul(static_cast<size_t>(dim), static_cast<size_t>(dim), need) || mat.size() != need) {
+    if (!safe_mul(static_cast<size_t>(rot_dim), static_cast<size_t>(rot_dim), need) || mat.size() != need) {
         if (err) *err = "apply_inverse_rotation: matrix size mismatch";
         return false;
     }
-    std::vector<float> tmp(dim);
-    for (uint32_t i = 0; i < dim; ++i) {
-        double acc = 0.0;
-        for (uint32_t j = 0; j < dim; ++j) acc += static_cast<double>(mat[i * dim + j]) * vec[j];
-        tmp[i] = static_cast<float>(acc);
+    std::vector<float> tmp(rot_dim);
+    for (size_t b = 0; b < vec.size(); b += rot_dim) {
+        for (uint32_t i = 0; i < rot_dim; ++i) {
+            double acc = 0.0;
+            for (uint32_t j = 0; j < rot_dim; ++j) acc += static_cast<double>(mat[i * rot_dim + j]) * vec[b + j];
+            tmp[i] = static_cast<float>(acc);
+        }
+        for (uint32_t i = 0; i < rot_dim; ++i) {
+            vec[b + i] = tmp[i];
+        }
     }
-    std::copy(tmp.begin(), tmp.end(), vec.begin());
     return true;
 }
 
@@ -2236,21 +2256,25 @@ bool xform_hot_head_span(float * io, uint32_t pad, const std::vector<float> & in
         return false;
     }
     if (!inv_rot.empty()) {
-        if (rot_dim != pad) {
+        if (rot_dim == 0 || pad < rot_dim || pad % rot_dim != 0) {
             if (err) *err = "xform_hot_head_span: rotation dimension mismatch";
             return false;
         }
         size_t need = 0;
-        if (!safe_mul(static_cast<size_t>(pad), static_cast<size_t>(pad), need) || inv_rot.size() != need) {
+        if (!safe_mul(static_cast<size_t>(rot_dim), static_cast<size_t>(rot_dim), need) || inv_rot.size() != need) {
             if (err) *err = "xform_hot_head_span: rotation matrix size mismatch";
             return false;
         }
-        for (uint32_t i = 0; i < pad; ++i) {
-            double acc = 0.0;
-            for (uint32_t j = 0; j < pad; ++j) acc += static_cast<double>(inv_rot[i * pad + j]) * io[j];
-            tmp[i] = static_cast<float>(acc);
+        for (size_t b = 0; b < pad; b += rot_dim) {
+            for (uint32_t i = 0; i < rot_dim; ++i) {
+                double acc = 0.0;
+                for (uint32_t j = 0; j < rot_dim; ++j) acc += static_cast<double>(inv_rot[i * rot_dim + j]) * io[b + j];
+                tmp[i] = static_cast<float>(acc);
+            }
+            for (uint32_t i = 0; i < rot_dim; ++i) {
+                io[b + i] = tmp[i];
+            }
         }
-        std::memcpy(io, tmp, (size_t) pad * sizeof(float));
     }
     if (!chan_mul.empty()) {
         if (chan_mul.size() != pad) {

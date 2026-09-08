@@ -24,6 +24,8 @@
  * -Wmissing-prototypes under upstream CI's -Werror policy). */
 GGML_API void ggml_turbo_wht_row(float * x, int group_size);
 GGML_API void ggml_turbo_wht_inverse_row(float * x, int group_size);
+GGML_API void turbo_cpu_fwht(float * x, int group_size);
+GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size);
 
 /* Global: WHT group size for CPU quantize path (set by CPU SET_ROWS handler) */
 GGML_API int turbo3_cpu_wht_group_size = 0;
@@ -272,14 +274,23 @@ GGML_API void ggml_turbo_wht_inverse_row(float * x, int group_size) {
     for (int i = 0; i < group_size; i++) x[i] *= inv_sqrt * s1[i];
 }
 
+GGML_API void turbo_cpu_fwht(float * x, int group_size) {
+    ggml_turbo_wht_row(x, group_size);
+}
+
+GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size) {
+    ggml_turbo_wht_inverse_row(x, group_size);
+}
+
 /* ---------- TURBO3_0: 3-bit PolarQuant with WHT rotation ---------- */
 
 static void quantize_row_turbo3_0_group(const float * GGML_RESTRICT x, block_turbo3_0 * GGML_RESTRICT y, int64_t k, int group_size) {
     assert(k % QK_TURBO3 == 0);
-    if (group_size != 64 && group_size != 128) {
-        group_size = (k % 128 == 0) ? 128 : 64;
+    // Turbo3 block layout strictly requires 128-element blocks (QK_TURBO3 = 128).
+    // group_size must be >= QK_TURBO3 and a multiple of QK_TURBO3 to avoid zero blocks_per_group.
+    if (group_size < QK_TURBO3 || group_size % QK_TURBO3 != 0) {
+        group_size = 128;
     }
-    if (k % group_size != 0) group_size = (group_size == 128) ? 64 : 128;
     assert(k % group_size == 0);
 
     const int n_groups = k / group_size;
@@ -581,10 +592,11 @@ GGML_API uint64_t ggml_turbo_layout_fingerprint(enum ggml_type type) {
 
 static void quantize_row_turbo2_0_group(const float * GGML_RESTRICT x, block_turbo2_0 * GGML_RESTRICT y, int64_t k, int group_size) {
     assert(k % QK_TURBO2 == 0);
-    if (group_size != 64 && group_size != 128) {
-        group_size = (k % 128 == 0) ? 128 : 64;
+    // Turbo2 block layout strictly requires 128-element blocks (QK_TURBO2 = 128).
+    // group_size must be >= QK_TURBO2 and a multiple of QK_TURBO2 to avoid zero blocks_per_group.
+    if (group_size < QK_TURBO2 || group_size % QK_TURBO2 != 0) {
+        group_size = 128;
     }
-    if (k % group_size != 0) group_size = (group_size == 128) ? 64 : 128;
     assert(k % group_size == 0);
 
     const int n_groups = k / group_size;

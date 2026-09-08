@@ -433,7 +433,7 @@ llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t 
         /*.seq_id_unq   =*/ udata->seq_id_unq.data(),
         /*.seq_idx      =*/ udata->seq_idx.data(),
         /*.output       =*/ udata->output.data(),
-        /*.data         =*/ std::move(udata),
+        /*.data         =*/ udata,
     };
 
     return res;

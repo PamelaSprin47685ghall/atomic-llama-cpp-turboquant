@@ -3488,8 +3488,9 @@ bool llama_kv_cache_context::build_xkv_graph_snapshot(
                 if (!seq_hit) {
                     continue;
                 }
+                const bool causal = rt->get_cparams().causal_attn;
                 const llama_pos cp = cells.pos_get(c);
-                if (cp > ubatch.pos[q]) {
+                if (causal && cp > ubatch.pos[q]) {
                     continue; // causal: future rows invisible to this query
                 }
                 const auto & meta = cells.rerot_get(c);
@@ -3638,7 +3639,8 @@ bool llama_kv_cache_context::build_xkv_graph_snapshot(
         snap->query_ddvr_group_counts.clear();
     }
     snap->query_causal_limits.assign((size_t) nq, -1);
-    if (!use_rerot) {
+    const bool causal = rt->get_cparams().causal_attn;
+    if (!use_rerot && causal) {
         for (int32_t q = 0; q < nq; ++q) {
             snap->query_causal_limits[(size_t) q] = (int64_t) ubatch.pos[q];
         }
@@ -3647,19 +3649,53 @@ bool llama_kv_cache_context::build_xkv_graph_snapshot(
     // are the authoritative PAC-DFS visibility and may legally exceed a
     // lane's physical query position.
     // Physical hot storage descriptor (graph validates views against it).
-    snap->hot_layout.k_type = kv->type_k();
-    snap->hot_layout.v_type = kv->type_v();
+    snap->hot_layout.k_type = kv->layer_type_k(owning);
+    snap->hot_layout.v_type = kv->layer_type_v(owning);
     snap->hot_layout.head_dim_k = hd_k;
     snap->hot_layout.head_dim_v = hd_v;
-    const bool k_turbo = (kv->type_k() == GGML_TYPE_TURBO2_0 || kv->type_k() == GGML_TYPE_TURBO3_0 ||
-                            kv->type_k() == GGML_TYPE_TURBO4_0);
-    const bool v_turbo = (kv->type_v() == GGML_TYPE_TURBO2_0 || kv->type_v() == GGML_TYPE_TURBO3_0 ||
-                            kv->type_v() == GGML_TYPE_TURBO4_0);
+    const bool k_turbo = (snap->hot_layout.k_type == GGML_TYPE_TURBO2_0 || snap->hot_layout.k_type == GGML_TYPE_TURBO3_0 ||
+                            snap->hot_layout.k_type == GGML_TYPE_TURBO4_0);
+    const bool v_turbo = (snap->hot_layout.v_type == GGML_TYPE_TURBO2_0 || snap->hot_layout.v_type == GGML_TYPE_TURBO3_0 ||
+                            snap->hot_layout.v_type == GGML_TYPE_TURBO4_0);
     snap->hot_layout.padded_k = (k_turbo && hd_k % 128 != 0) ? ((hd_k + 127) / 128 * 128) : 0;
     snap->hot_layout.padded_v = (v_turbo && hd_v % 128 != 0) ? ((hd_v + 127) / 128 * 128) : 0;
     snap->hot_layout.v_transposed = kv->get_v_trans();
     snap->hot_storage_host_resident =
         (xkv_expected_residency(rt->get_cparams()) == GGML_XKV_RES_REFERENCE_HOST);
+    // Attention custom rotation setup:
+    // When K or V attention rotation is enabled on the cache, populate
+    // inverse rotation matrices and dimensions into snapshot so CPU hot gather
+    // can invert them. If rotation is configured but matrix is missing, fail closed.
+    if (kv->get_attn_rot_k()) {
+        int32_t nr_k = kv->get_attn_rot_k_nrot();
+        if (nr_k <= 0) {
+            if (err) *err = "build_xkv_graph_snapshot: invalid attn_rot_k_nrot";
+            return false;
+        }
+        const auto & hads = kv->get_attn_rot_hadamard();
+        auto hit = hads.find((int64_t) nr_k);
+        if (hit == hads.end() || hit->second.empty()) {
+            if (err) *err = "build_xkv_graph_snapshot: missing attention rotation Hadamard matrix for K";
+            return false;
+        }
+        snap->hot_k_inv_rot = hit->second;
+        snap->hot_k_rot_dim = (uint32_t) nr_k;
+    }
+    if (kv->get_attn_rot_v()) {
+        int32_t nr_v = kv->get_attn_rot_v_nrot();
+        if (nr_v <= 0) {
+            if (err) *err = "build_xkv_graph_snapshot: invalid attn_rot_v_nrot";
+            return false;
+        }
+        const auto & hads = kv->get_attn_rot_hadamard();
+        auto hit = hads.find((int64_t) nr_v);
+        if (hit == hads.end() || hit->second.empty()) {
+            if (err) *err = "build_xkv_graph_snapshot: missing attention rotation Hadamard matrix for V";
+            return false;
+        }
+        snap->hot_v_inv_rot = hit->second;
+        snap->hot_v_rot_dim = (uint32_t) nr_v;
+    }
     // Hot rows: storage-gather descriptors, no owned copies. Every emitted
     // cell is below the hot storage bound (checked at enumeration).
     snap->hot_data.reserve(hot_all.size());
@@ -3797,16 +3833,38 @@ bool llama_kv_cache_context::build_xkv_graph_snapshot(
     snap->sr_config.landmark_type = rt->get_cparams().xkv_landmark_type;
     snap->sr_config.refine_mode = rt->get_cparams().xkv_landmark_refine;
     snap->sr_config.refine_max_rows = rt->get_cparams().xkv_landmark_refine_max_rows;
+    std::vector<xkv_landmark_phase_layer> pl;
+    uint64_t pfp = 0;
+    if (!build_landmark_phase_layers(*kv, rt->get_cparams(), hparams, *grp, pl, pfp, err)) {
+        return false;
+    }
+    const xkv_landmark_phase_layer * play = nullptr;
+    for (size_t pli = 0; pli < pl.size(); ++pli) {
+        // pl parallels grp->owning_layers order.
+        if (pli < grp->owning_layers.size() && grp->owning_layers[pli] == owning) {
+            play = &pl[pli];
+            break;
+        }
+    }
+    if (!play) {
+        if (err) *err = "build_xkv_graph_snapshot: phase tables missing for owning layer";
+        return false;
+    }
+    const uint32_t phd = play->head_dim;
+    const uint32_t prd = play->rotary_dim;
+    const std::vector<float> pom = play->omega;
+    const std::vector<float> pfs = play->freq_scale_sq;
+    phase_transform_fn frag_phase = [phd, prd, pom, pfs](
+        const float * src, int64_t pos, uint32_t /*head_idx*/, float * dst) {
+        apply_forward_rope_head(src, dst, phd, prd, pom.data(), pfs.data(), pos);
+    };
+    snap->phase_tx = frag_phase;
+
     const llama_xkv_mode snap_mode = rt->get_cparams().xkv_mode;
     if (snap_mode == LLAMA_XKV_MODE_SR) {
         // SR-after-Q: selection runs in compute; builder pins legal
         // landmark fragments per segment for this head.
         snap->sr_mode = 1;
-        std::vector<xkv_landmark_phase_layer> pl;
-        uint64_t pfp = 0;
-        if (!build_landmark_phase_layers(*kv, rt->get_cparams(), hparams, *grp, pl, pfp, err)) {
-            return false;
-        }
         snap->sr_phase_fingerprint = pfp;
         const uint32_t chunk = rt->effective_config().chunk_tokens;
         if (chunk == 0) {
@@ -3863,28 +3921,6 @@ bool llama_kv_cache_context::build_xkv_graph_snapshot(
             if (err) *err = "build_xkv_graph_snapshot: fragment cap overflow";
             return false;
         }
-        // Phase tables for the owning layer (head slice below), shared by all
-        // plans: the exact layout backing canonical K reads and landmarks.
-        const xkv_landmark_phase_layer * play = nullptr;
-        for (size_t pli = 0; pli < pl.size(); ++pli) {
-            // pl parallels grp->owning_layers order.
-            if (pli < grp->owning_layers.size() && grp->owning_layers[pli] == owning) {
-                play = &pl[pli];
-                break;
-            }
-        }
-        if (!play) {
-            if (err) *err = "build_xkv_graph_snapshot: phase tables missing for owning layer";
-            return false;
-        }
-        const uint32_t phd = play->head_dim;
-        const uint32_t prd = play->rotary_dim;
-        const std::vector<float> & pom = play->omega;
-        const std::vector<float> & pfs = play->freq_scale_sq;
-        phase_transform_fn frag_phase = [&, phd, prd](
-            const float * src, int64_t pos, uint32_t /*head_idx*/, float * dst) {
-            apply_forward_rope_head(src, dst, phd, prd, pom.data(), pfs.data(), pos);
-        };
         // Borrowed-backend rope bridge: [omega, direct_mag] for this layer/head
         // from the exact phase tables above (never derived in graph). Empty iff
         // rotary_dim == 0, when the graph substitutes an empty tensor.

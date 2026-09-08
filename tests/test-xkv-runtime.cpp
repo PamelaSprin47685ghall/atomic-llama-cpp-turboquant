@@ -124,6 +124,7 @@ static llama_cparams rt_cparams(
     c.rope_freq_base = 10000.0f;
     c.rope_freq_scale = 1.0f;
     c.yarn_attn_factor = 1.0f;
+    c.causal_attn = true;
     return c;
 }
 
