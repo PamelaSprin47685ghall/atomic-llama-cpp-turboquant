@@ -606,10 +606,11 @@ std::string server_rerot_child_worker_prompt(
     if (!valid_child_close_marker(close_marker)) return {};
     const std::string clean_title = normalize_lane_title(title);
     if (clean_title.empty()) return {};
-    return "\n现在我展开『" + clean_title + "』的详尽分析。"
-        "我只专注于完成这一项内容；其他公开章节仅作参考，我不越界接管，也不重新回答整个用户问题。"
-        "当前所有列表和标题均属正文内容。完整列出本项内容后，我直接输出 " + std::string(close_marker) +
-        " 结束思考，不输出任何多余问句、客套话或后续章节总结。\n";
+    return "\n我现在开始专注于自己的唯一子任务『" + clean_title + "』的详尽推导。"
+        "其他公开章节仅作为参考背景，我不越界接管，也不重新回答整个用户问题。"
+        "正文中普通列表、标题和代码块只是内容呈现，不具有调度含义。"
+        "详尽完成本项内容后，我直接输出 " + std::string(close_marker) +
+        " 结束当前段落，不再继续其他章节。\n";
 }
 
 std::string server_rerot_child_grammar(std::string_view close_marker) {

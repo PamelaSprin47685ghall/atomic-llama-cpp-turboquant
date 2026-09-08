@@ -195,12 +195,16 @@ private:
     size_t size_d_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    void state_write_data(
+            llama_io_write_i & io,
+            const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+            const std::vector<int32_t> & brain_rows) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
-    bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
+    bool state_read_data(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id);
 
     int32_t brain_row_for_seq(llama_seq_id seq_id) const;
+    int32_t brain_read_row_for_seq(llama_seq_id seq_id) const;
     int32_t acquire_brain_row(uint64_t episode_id, llama_seq_id seq_id);
     void clear_brain_row(int32_t brain_row);
     void clear_hand_row(int32_t hand_row);

@@ -1928,6 +1928,7 @@ private:
         }
         slot.task = std::make_unique<const server_task>(std::move(child_task));
         slot.smpl = std::move(child_sampler);
+        slot.init_sampler();
         rerot_bind_sampler(slot);
 
         const std::string worker_prompt = server_rerot_child_worker_prompt(
@@ -2066,6 +2067,7 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(root_lane_task));
         slot.smpl = std::move(root_lane_sampler);
+        slot.init_sampler();
         llama_set_sampler(ctx_tgt, slot.id, nullptr);
 
         ++rerot_metrics.episode_total;
@@ -2876,6 +2878,7 @@ private:
 
         slot.task = std::make_unique<const server_task>(std::move(final_task));
         slot.smpl = std::move(final_sampler);
+        slot.init_sampler();
         llama_set_sampler(ctx_tgt, slot.id, nullptr);
         slot.generated_text = std::move(response_reasoning);
         transport_it->second->final_content_offset = slot.generated_text.size();

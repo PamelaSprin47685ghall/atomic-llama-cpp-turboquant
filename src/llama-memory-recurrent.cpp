@@ -905,6 +905,37 @@ int32_t llama_memory_recurrent::brain_row_for_seq(llama_seq_id seq_id) const {
     return seq_id < (llama_seq_id) n_brain_rows ? seq_id : -1;
 }
 
+int32_t llama_memory_recurrent::brain_read_row_for_seq(llama_seq_id seq_id) const {
+    int32_t row = brain_row_for_seq(seq_id);
+    if (row < 0) {
+        return -1;
+    }
+
+    const bool private_planner =
+        seq_episode[(size_t) seq_id] != 0 &&
+        seq_public_write[(size_t) seq_id] == 0 &&
+        seq_node[(size_t) seq_id] == 0;
+    if (private_planner) {
+        row += (int32_t) n_brain_rows;
+    }
+
+    const uint32_t snapshot =
+        seq_id >= 0 && (size_t) seq_id < rs_idx.size()
+            ? rs_idx[(size_t) seq_id]
+            : 0;
+    // A default child never committed the shared-brain snapshot slots. Its
+    // rollback selector belongs to its private hand, not to the root's (often
+    // unwritten) historical brain slots. Pair the saved hand with the same
+    // unchanged public brain used when it was produced.
+    if (snapshot == 0 || private_planner || uses_native_child_state(seq_id)) {
+        return row;
+    }
+    return (int32_t) (
+        2 * n_brain_rows +
+        (snapshot - 1) * n_brain_rows +
+        (uint32_t) row);
+}
+
 int32_t llama_memory_recurrent::acquire_brain_row(
         uint64_t episode_id,
         llama_seq_id seq_id) {
@@ -1544,6 +1575,7 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges; // ranges, from inclusive, to exclusive
     std::vector<std::pair<uint32_t, uint32_t>> cell_ranges_data; // logical source row ranges
+    std::vector<int32_t> brain_rows_data; // resolved shared-brain row per serialized cell
     uint32_t cell_count = 0;
 
     // Count the number of cells with the specified seq_id
@@ -1582,6 +1614,31 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
                 cell_ranges_data.back().second++;
             }
 
+            if (is_grouped_layout()) {
+                int32_t brain_row = -1;
+                const auto add_seq_brain = [&](llama_seq_id state_seq) {
+                    const int32_t row = brain_read_row_for_seq(state_seq);
+                    if (row < 0) {
+                        throw std::runtime_error("cannot serialize grouped recurrent state without a brain row");
+                    }
+                    if (brain_row >= 0 && brain_row != row) {
+                        throw std::runtime_error("cannot serialize one recurrent cell with different brain rows");
+                    }
+                    brain_row = row;
+                };
+                if (seq_id != -1) {
+                    add_seq_brain(seq_id);
+                } else {
+                    for (const llama_seq_id cell_seq_id : cell.seq_id) {
+                        add_seq_brain(cell_seq_id);
+                    }
+                }
+                if (brain_row < 0) {
+                    throw std::runtime_error("cannot serialize grouped recurrent state without a sequence");
+                }
+                brain_rows_data.push_back(brain_row);
+            }
+
             if (cell_range_begin == size) {
                 cell_range_begin = i;
             }
@@ -1612,11 +1669,12 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
         cell_count_check += range.second - range.first;
     }
     GGML_ASSERT(cell_count == cell_count_check);
+    GGML_ASSERT(!is_grouped_layout() || brain_rows_data.size() == cell_count);
 
     io.write(&cell_count, sizeof(cell_count));
 
     state_write_meta(io, cell_ranges, seq_id);
-    state_write_data(io, cell_ranges_data);
+    state_write_data(io, cell_ranges_data, brain_rows_data);
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -1630,7 +1688,7 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     res = res && state_read_meta(io, cell_count, seq_id);
 
     try {
-        res = res && state_read_data(io, cell_count);
+        res = res && state_read_data(io, cell_count, seq_id);
     } catch (...) {
         res = false;
     }
@@ -1672,7 +1730,10 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
     }
 }
 
-void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
+void llama_memory_recurrent::state_write_data(
+        llama_io_write_i & io,
+        const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+        const std::vector<int32_t> & brain_rows) const {
     const uint32_t s_trans = 0;
     const uint32_t n_layer = hparams.n_layer();
 
@@ -1715,12 +1776,30 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             const uint64_t s_size_row = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
             io.write(&s_size_row, sizeof(s_size_row));
 
-            // Write each logical cell row range. With pending recurrent rollback,
-            // the logical current state may live in a rollback snapshot plane.
-            for (const auto & range : cell_ranges) {
-                const size_t range_size = range.second - range.first;
-                const size_t buf_size = range_size * s_size_row;
-                io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
+            if (is_s_shared((int32_t) il)) {
+                // Grouped shared S is indexed by brain, not by the physical
+                // hand row used by R/private S. Save the resolved current
+                // brain twice so restore can install the ordinary public and
+                // ready-private mirrors without a host round trip.
+                for (int mirror = 0; mirror < 2; ++mirror) {
+                    for (const int32_t brain_row : brain_rows) {
+                        if (brain_row < 0 || brain_row >= s_l[il]->ne[1]) {
+                            throw std::runtime_error("grouped recurrent brain row is out of bounds");
+                        }
+                        io.write_tensor(
+                            s_l[il],
+                            (size_t) brain_row * s_size_row,
+                            s_size_row);
+                    }
+                }
+            } else {
+                // Write each logical cell row range. With pending recurrent
+                // rollback, the current state may live in a snapshot plane.
+                for (const auto & range : cell_ranges) {
+                    const size_t range_size = range.second - range.first;
+                    const size_t buf_size = range_size * s_size_row;
+                    io.write_tensor(s_l[il], range.first * s_size_row, buf_size);
+                }
             }
         }
     } else {
@@ -1852,7 +1931,10 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
     return true;
 }
 
-bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell_count) {
+bool llama_memory_recurrent::state_read_data(
+        llama_io_read_i & io,
+        uint32_t cell_count,
+        llama_seq_id dest_seq_id) {
     uint32_t s_trans;
     uint32_t n_layer;
     io.read(&s_trans, sizeof(s_trans));
@@ -1869,6 +1951,37 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
     if (false != (bool) s_trans) {
         LLAMA_LOG_ERROR("%s: incompatible s transposition\n", __func__);
         return false;
+    }
+
+    std::vector<int32_t> brain_rows;
+    if (is_grouped_layout()) {
+        brain_rows.reserve(cell_count);
+        for (uint32_t i = 0; i < cell_count; ++i) {
+            auto & cell = cells[head + i];
+            int32_t brain_row = -1;
+            for (const llama_seq_id cell_seq_id : cell.seq_id) {
+                const int32_t row = brain_row_for_seq(cell_seq_id);
+                if (row < 0) {
+                    LLAMA_LOG_ERROR("%s: no brain row for restored seq %d\n", __func__, cell_seq_id);
+                    return false;
+                }
+                if (brain_row >= 0 && brain_row != row) {
+                    LLAMA_LOG_ERROR("%s: restored recurrent cell has different brain rows\n", __func__);
+                    return false;
+                }
+                brain_row = row;
+            }
+            if (brain_row < 0 || brain_row >= (int32_t) n_brain_rows) {
+                LLAMA_LOG_ERROR("%s: invalid restored brain row %d\n", __func__, brain_row);
+                return false;
+            }
+            for (const llama_seq_id cell_seq_id : cell.seq_id) {
+                seq_brain[(size_t) cell_seq_id] = brain_row;
+            }
+            brain_rows.push_back(brain_row);
+            clear_hand_row((int32_t) (head + i));
+        }
+        GGML_ASSERT(dest_seq_id == -1 || brain_rows.size() <= 1);
     }
 
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
@@ -1925,8 +2038,24 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
             }
 
             if (cell_count) {
-                // Read and set the values for the whole cell range
-                io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
+                if (is_s_shared((int32_t) il)) {
+                    GGML_ASSERT(brain_rows.size() == cell_count);
+                    for (const int32_t brain_row : brain_rows) {
+                        io.read_tensor(
+                            s_l[il],
+                            (size_t) brain_row * s_size_row,
+                            s_size_row);
+                    }
+                    for (const int32_t brain_row : brain_rows) {
+                        io.read_tensor(
+                            s_l[il],
+                            ((size_t) n_brain_rows + (size_t) brain_row) * s_size_row,
+                            s_size_row);
+                    }
+                } else {
+                    // Read and set the values for the whole cell range.
+                    io.read_tensor(s_l[il], head * s_size_row, cell_count * s_size_row);
+                }
             }
         }
     } else {
@@ -2078,35 +2207,7 @@ int32_t llama_memory_recurrent_context::brain_copy(int i) const {
         return -1;
     }
     const uint32_t token_index = (uint32_t) i * ubatch.n_seq_tokens;
-    const llama_seq_id seq_id = ubatch.seq_id[token_index][0];
-    int32_t row = mem->brain_row_for_seq(seq_id);
-    if (row < 0) {
-        return -1;
-    }
-
-    const bool private_planner =
-        mem->seq_episode[(size_t) seq_id] != 0 &&
-        mem->seq_public_write[(size_t) seq_id] == 0 &&
-        mem->seq_node[(size_t) seq_id] == 0;
-    if (private_planner) {
-        row += (int32_t) mem->n_brain_rows;
-    }
-
-    const uint32_t snapshot =
-        seq_id >= 0 && (size_t) seq_id < mem->rs_idx.size()
-            ? mem->rs_idx[(size_t) seq_id]
-            : 0;
-    // A default child never committed the shared-brain snapshot slots. Its
-    // rollback selector belongs to its private hand, not to the root's (often
-    // unwritten) historical brain slots. Pair the saved hand with the same
-    // unchanged public brain used when it was produced.
-    if (snapshot == 0 || private_planner || mem->uses_native_child_state(seq_id)) {
-        return row;
-    }
-    return (int32_t) (
-        2 * mem->n_brain_rows +
-        (snapshot - 1) * mem->n_brain_rows +
-        (uint32_t) row);
+    return mem->brain_read_row_for_seq(ubatch.seq_id[token_index][0]);
 }
 
 bool llama_memory_recurrent_context::is_child_row(int i) const {

@@ -1028,11 +1028,10 @@ bool llama_rerot_cell_visible_public_full(
     if (meta.episode_id != reader.episode_id) {
         return false;
     }
+    // Strict barrier-after: only peer tokens from previously committed frontiers
+    // are visible. A peer token from the current forward step is never visible
+    // until after the frontier barrier has settled.
     if (meta.frontier < reader.frontier) {
-        return true;
-    }
-    if (meta.frontier == reader.frontier && meta.node_id != reader.reader &&
-        reader.frontier_mode == LLAMA_REROT_FRONTIER_STRONG) {
         return true;
     }
     return false;

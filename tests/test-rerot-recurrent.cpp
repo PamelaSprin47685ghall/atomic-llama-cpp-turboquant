@@ -3,6 +3,7 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "llama-graph.h"
+#include "llama-io.h"
 #include "models/models.h"
 #include "llama-batch.h"
 #include "llama-memory-recurrent.h"
@@ -13,8 +14,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <new>
+#include <stdexcept>
 #include <vector>
 
 // RERoT hybrid-recurrent parking COW (planning guide Stage 3 / §6):
@@ -29,6 +32,59 @@
 // Hermetic: a stub model provides hparams only; no model file is needed.
 
 static int g_failures = 0;
+
+class test_state_writer final : public llama_io_write_i {
+public:
+    void write(const void * src, size_t size) override {
+        const size_t offset = data.size();
+        data.resize(offset + size);
+        std::memcpy(data.data() + offset, src, size);
+    }
+
+    void write_tensor(ggml_tensor * tensor, size_t offset, size_t size) override {
+        if (offset + size > ggml_nbytes(tensor)) {
+            throw std::runtime_error("test tensor read out of bounds");
+        }
+        const size_t dst = data.size();
+        data.resize(dst + size);
+        ggml_backend_tensor_get(tensor, data.data() + dst, offset, size);
+    }
+
+    size_t n_bytes() override {
+        return data.size();
+    }
+
+    std::vector<uint8_t> data;
+};
+
+class test_state_reader final : public llama_io_read_i {
+public:
+    explicit test_state_reader(const std::vector<uint8_t> & data) : data(data) {}
+
+    void read(void * dst, size_t size) override {
+        if (offset + size > data.size()) {
+            throw std::runtime_error("test state read out of bounds");
+        }
+        std::memcpy(dst, data.data() + offset, size);
+        offset += size;
+    }
+
+    void read_tensor(ggml_tensor * tensor, size_t tensor_offset, size_t size) override {
+        if (offset + size > data.size() || tensor_offset + size > ggml_nbytes(tensor)) {
+            throw std::runtime_error("test tensor write out of bounds");
+        }
+        ggml_backend_tensor_set(tensor, data.data() + offset, tensor_offset, size);
+        offset += size;
+    }
+
+    size_t n_bytes() override {
+        return offset;
+    }
+
+private:
+    const std::vector<uint8_t> & data;
+    size_t offset = 0;
+};
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -1771,6 +1827,55 @@ int main(int argc, char ** argv) {
             CHECK(std::abs(group_dec.hand_f32[(size_t) i]) < 1.0e-6f);
         }
         CHECK(ord_max_abs_diff(group_dec.brain_pub, group_dec.brain_priv) < 1.0e-6f);
+
+        // Sequence prompt-cache round trip with a pending speculative
+        // rollback. Shared S has B*(2+n_rs) rows, while private R/S has
+        // P*(1+n_rs) rows; indexing shared S by the hand row used to read
+        // exactly one row past cache_s_l3 for production B=1/P=5.
+        {
+            llama_memory_recurrent checkpointed(model, GGML_TYPE_F32, GGML_TYPE_F32,
+                false, /*mem_size=*/ 5, /*n_seq_max=*/ 16, /*n_rs_seq=*/ 3,
+                /*n_brain_max=*/ 1, /*n_hand_max=*/ 5, nullptr);
+            CHECK(checkpointed.is_s_shared(IL));
+            CHECK(checkpointed.s_l[IL]->ne[1] == 5);
+
+            llama_batch_allocr state_alloc(1);
+            std::vector<llama_seq_id> state_ids;
+            const llama_ubatch state_ub = make_ubatch(state_alloc, 0, {7}, state_ids);
+            CHECK(checkpointed.find_slot(state_ub));
+            CHECK(checkpointed.tails[0] >= 0);
+
+            const size_t row_size = ggml_row_size(
+                checkpointed.s_l[IL]->type, checkpointed.s_l[IL]->ne[0]);
+            std::vector<float> snapshot((size_t) D);
+            for (int64_t i = 0; i < D; ++i) {
+                snapshot[(size_t) i] = 0.25f + 0.001f * (float) i;
+            }
+            ggml_backend_tensor_set(
+                checkpointed.s_l[IL], snapshot.data(),
+                /* first rollback brain row */ 2 * row_size, row_size);
+            checkpointed.set_rs_idx(0, 1);
+
+            test_state_writer writer;
+            checkpointed.state_write(writer, 0, 0);
+            CHECK(!writer.data.empty());
+            CHECK(writer.n_bytes() == writer.data.size());
+
+            checkpointed.clear(true);
+            test_state_reader reader(writer.data);
+            checkpointed.state_read(reader, 0, 0);
+            CHECK(reader.n_bytes() == writer.data.size());
+
+            std::vector<float> restored_public((size_t) D);
+            std::vector<float> restored_private((size_t) D);
+            ggml_backend_tensor_get(
+                checkpointed.s_l[IL], restored_public.data(), 0, row_size);
+            ggml_backend_tensor_get(
+                checkpointed.s_l[IL], restored_private.data(), row_size, row_size);
+            CHECK(restored_public == snapshot);
+            CHECK(restored_private == snapshot);
+            CHECK(checkpointed.rs_idx[0] == 0);
+        }
 
         // Reused root after reset: same seq id re-admitted at pos 0 must
         // still match native (build_rs_shared lacks the rs_zero clear that

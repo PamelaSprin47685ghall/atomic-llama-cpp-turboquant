@@ -155,17 +155,16 @@ class QualityBenchRunner:
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
 
-    def query(self, prompt: str, seed: int = 424242, max_tokens: int = 2048, temperature: float = 0.0, rerot: bool = False, timeout: float = 120.0) -> Dict[str, Any]:
+    def query(self, prompt: str, seed: int = 424242, max_tokens: int = 2048, temperature: float = 0.0, rerot: bool = True, timeout: float = 240.0) -> Dict[str, Any]:
         payload = {
             'model': 'ornith-1.5',
             'messages': [{'role': 'user', 'content': prompt}],
             'temperature': temperature,
             'seed': seed,
             'max_tokens': max_tokens,
-            'reasoning_effort': 'low',
             'stream': False,
             'rerot': rerot,
-            'rerot_trace': rerot
+            'rerot_trace': False
         }
         start = time.monotonic()
         status, raw = self._http('/v1/chat/completions', json.dumps(payload).encode(), timeout=timeout)
