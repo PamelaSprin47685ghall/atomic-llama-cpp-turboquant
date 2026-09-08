@@ -1,8 +1,10 @@
 // test-vulkan-moe-threshold.cpp
 // Hermetic regression test verifying Vulkan MoE count_experts reset behavior
 // across the 18/19 threshold (mul_mat_vec_id_hybrid_max_cols = 18).
-// When N <= 18 (split_singletons=true, mode 3), single workgroup clears counters.
-// When N > 18 (split_singletons=false, mode 1), generic routing requires mode 0 reset.
+// For supported F32/Q8_1 B, N <= 18 uses singleton routing (mode 3).
+// Larger N, or staged F16/BF16 B (e.g. coopmat2), uses the generic route and
+// requires mode 0 reset. In particular, small N must not request an F16-B
+// singleton kernel: that kernel family only accepts F32/Q8_1 B.
 // Tests sequence 18 -> 19 -> 20 -> 18 -> 19 and repeated executions with different
 // expert id distributions to ensure route counters / dispatch offsets always start from 0.
 
@@ -143,6 +145,58 @@ static bool run_moe_step(
     return true;
 }
 
+// Three consumers share one expert-ID tensor, but the middle consumer stages
+// non-contiguous B. Without coopmat2 this switches singleton -> generic ->
+// singleton. The route cache must include that mode, not just IDs/grouped_max.
+static bool run_mixed_layout_graph(ggml_backend_t backend, int n,
+        const std::vector<float> & a_data, const std::vector<float> & b_data,
+        const std::vector<int32_t> & ids_data, std::vector<std::vector<float>> & outputs) {
+    constexpr int k = 64, m = 32, n_mats = 8, n_used = 2, stride = k + 4;
+    ggml_init_params params = {64 * 1024 * 1024, nullptr, true};
+    ggml_context * ctx = ggml_init(params);
+    if (!ctx) return false;
+
+    auto * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, m, n_mats);
+    auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+    auto * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n);
+    auto * padded = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, stride * n_used * n);
+    auto * strided = ggml_view_3d(ctx, padded, k, n_used, n,
+            stride * sizeof(float), stride * n_used * sizeof(float), 0);
+    ggml_tensor * results[] = {
+        ggml_mul_mat_id(ctx, a, b, ids),
+        ggml_mul_mat_id(ctx, a, strided, ids),
+        ggml_mul_mat_id(ctx, a, b, ids),
+    };
+    auto * graph = ggml_new_graph(ctx);
+    for (auto * result : results) ggml_build_forward_expand(graph, result);
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buffer) {
+        ggml_free(ctx);
+        return false;
+    }
+
+    // Poison padding so a mistaken contiguous read is observable.
+    std::vector<float> padded_data(stride * n_used * n, 10000.0f);
+    for (int row = 0; row < n_used * n; ++row) {
+        std::copy_n(b_data.data() + row * k, k, padded_data.data() + row * stride);
+    }
+    ggml_backend_tensor_set(a, a_data.data(), 0, a_data.size() * sizeof(float));
+    ggml_backend_tensor_set(b, b_data.data(), 0, b_data.size() * sizeof(float));
+    ggml_backend_tensor_set(padded, padded_data.data(), 0, padded_data.size() * sizeof(float));
+    ggml_backend_tensor_set(ids, ids_data.data(), 0, ids_data.size() * sizeof(int32_t));
+    const auto status = ggml_backend_graph_compute(backend, graph);
+    if (status == GGML_STATUS_SUCCESS) {
+        outputs.resize(3);
+        for (size_t i = 0; i < outputs.size(); ++i) {
+            outputs[i].resize(ggml_nelements(results[i]));
+            ggml_backend_tensor_get(results[i], outputs[i].data(), 0, outputs[i].size() * sizeof(float));
+        }
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+    return status == GGML_STATUS_SUCCESS;
+}
+
 } // namespace
 
 int main() {
@@ -182,8 +236,8 @@ int main() {
     std::vector<float> a_data(k * m * n_mats);
     for (auto & v : a_data) v = dist_val(rng);
 
-    // Sequence of column counts specifically crossing and re-crossing the 18 threshold:
-    // 18 (split_singletons=true) -> 19 (split_singletons=false) -> 20 -> 18 -> 19 -> 18 -> 21
+    // Cross the 18 threshold repeatedly, including the small-N generic fallback
+    // on coopmat2 devices that stage B as F16.
     const std::vector<int> n_cols_seq = { 18, 19, 20, 18, 19, 18, 21 };
 
     for (size_t round = 0; round < 3; ++round) {
@@ -216,7 +270,7 @@ int main() {
             }
             double nmse = sum_ref2 > 0.0 ? (sum_diff2 / sum_ref2) : sum_diff2;
 
-            std::cout << "  N=" << n << (n <= 18 ? " (<=18 mode 3) " : " (>18 mode 1)  ")
+            std::cout << "  N=" << n << (n <= 18 ? " (singleton-eligible size) " : " (generic size) ")
                       << " max_abs_diff=" << max_diff << " nmse=" << nmse << "\n";
             CHECK(nmse < 5e-4);
 
@@ -233,6 +287,32 @@ int main() {
         }
     }
 
-    std::cout << "PASS: Vulkan MoE 18/19 threshold regression test\n";
+    for (int n : {18, 19, 18}) {
+        std::vector<float> b_data(k * n_used * n);
+        for (auto & value : b_data) value = dist_val(rng);
+        std::vector<int32_t> ids_data(n_used * n);
+        for (int row = 0; row < n; ++row) {
+            ids_data[2 * row] = row % n_mats;
+            ids_data[2 * row + 1] = (row + 1) % n_mats;
+        }
+        std::vector<std::vector<float>> actual, reference;
+        CHECK(run_mixed_layout_graph(fix.backend_gpu, n, a_data, b_data, ids_data, actual));
+        CHECK(run_mixed_layout_graph(fix.backend_cpu, n, a_data, b_data, ids_data, reference));
+        CHECK(actual.size() == 3 && reference.size() == 3);
+        for (size_t consumer = 0; consumer < 3; ++consumer) {
+            CHECK(actual[consumer].size() == reference[consumer].size());
+            double error2 = 0.0, reference2 = 0.0;
+            for (size_t i = 0; i < actual[consumer].size(); ++i) {
+                CHECK(std::isfinite(actual[consumer][i]) && std::isfinite(reference[consumer][i]));
+                const double delta = actual[consumer][i] - reference[consumer][i];
+                error2 += delta * delta;
+                reference2 += double(reference[consumer][i]) * reference[consumer][i];
+            }
+            CHECK(reference2 > 0.0 && error2 / reference2 < 5e-4);
+        }
+        std::cout << "  shared IDs, contiguous/strided/contiguous B, N=" << n << " PASS\n";
+    }
+
+    std::cout << "PASS: Vulkan MoE 18/19 threshold and mixed-layout route-cache regression test\n";
     return 0;
 }

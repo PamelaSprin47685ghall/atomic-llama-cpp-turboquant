@@ -2425,6 +2425,7 @@ struct ggml_backend_vk_context {
     bool prealloc_moe_route_need_sync;
     const ggml_tensor * prealloc_moe_route_last_ids {};
     uint32_t prealloc_moe_route_grouped_max {};
+    bool prealloc_moe_route_split_singletons {};
 
     vk_context_ref compute_ctx;
 
@@ -7784,6 +7785,7 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->prealloc_moe_route_need_sync = false;
     ctx->prealloc_moe_route_last_ids = nullptr;
     ctx->prealloc_moe_route_grouped_max = 0;
+    ctx->prealloc_moe_route_split_singletons = false;
     // Fixed size of 1KB, for deterministic behavior
     ctx->prealloc_size_add_rms_partials = 1024;
 
@@ -10516,11 +10518,15 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
     vk_pipeline count_experts = ctx->device->pipeline_count_experts;
 
-    const bool split_singletons = nei1 <= mul_mat_vec_id_hybrid_max_cols;
     const ggml_type routed_type_a = qx_needs_dequant ? f16_type : src0->type;
     const ggml_type routed_type_b = quantize_y
         ? GGML_TYPE_Q8_1
         : (qy_needs_dequant ? f16_type : src1->type);
+    // The singleton vector kernels cannot read staged F16/BF16 B. Keep those
+    // rows in the generic matrix route instead of requesting an incompatible
+    // vector kernel. The generic route still runs its explicit counter reset.
+    const bool split_singletons = nei1 <= mul_mat_vec_id_hybrid_max_cols &&
+        (routed_type_b == GGML_TYPE_F32 || routed_type_b == GGML_TYPE_Q8_1);
 
     vk_pipeline singleton_dmmv = nullptr;
     vk_pipeline grouped_dmmv = nullptr;
@@ -10601,7 +10607,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
             ggml_pipeline_request_descriptor_sets(ctx, grouped_dmmv, 1);
         }
         if (ctx->prealloc_moe_route_last_ids != ids ||
-            ctx->prealloc_moe_route_grouped_max != grouped_max) {
+            ctx->prealloc_moe_route_grouped_max != grouped_max ||
+            ctx->prealloc_moe_route_split_singletons != split_singletons) {
             ggml_pipeline_request_descriptor_sets(ctx, count_experts, 2);
         }
     }
@@ -10680,7 +10687,8 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     // Gate/up/down projections share the same selected-expert tensor. Build the
     // packed row map once per graph execution and reuse it for every consumer.
     if (ctx->prealloc_moe_route_last_ids != ids ||
-        ctx->prealloc_moe_route_grouped_max != grouped_max) {
+        ctx->prealloc_moe_route_grouped_max != grouped_max ||
+        ctx->prealloc_moe_route_split_singletons != split_singletons) {
         if (ctx->prealloc_moe_route_need_sync) {
             ggml_vk_sync_buffers(ctx, subctx);
         }
@@ -10715,6 +10723,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
         ctx->prealloc_moe_route_last_ids = ids;
         ctx->prealloc_moe_route_grouped_max = grouped_max;
+        ctx->prealloc_moe_route_split_singletons = split_singletons;
         ctx->prealloc_moe_route_need_sync = true;
     }
 
@@ -16350,6 +16359,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         ctx->prealloc_moe_route_need_sync = false;
         ctx->prealloc_moe_route_last_ids = nullptr;
         ctx->prealloc_moe_route_grouped_max = 0;
+        ctx->prealloc_moe_route_split_singletons = false;
     }
     if (ctx->prealloc_add_rms_partials == nullptr || (ctx->prealloc_size_add_rms_partials > 0 && ctx->prealloc_add_rms_partials->size < ctx->prealloc_size_add_rms_partials)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(add_partials_size: " << ctx->prealloc_add_rms_partials << ")");
@@ -17001,6 +17011,7 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->prealloc_y_last_decode_vector_staging = false;
     ctx->prealloc_moe_route_last_ids = nullptr;
     ctx->prealloc_moe_route_grouped_max = 0;
+    ctx->prealloc_moe_route_split_singletons = false;
 
     ctx->unsynced_nodes_written.clear();
     ctx->unsynced_nodes_read.clear();
