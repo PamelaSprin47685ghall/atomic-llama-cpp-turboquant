@@ -506,6 +506,8 @@ static void test_budgeted_prerope_staging_and_invariants() {
     // Case 4: Mark one cell as private_control -> staging fails closed
     llama_kv_rerot_meta priv_meta;
     priv_meta.episode_id = 99;
+    priv_meta.node_id = 1;
+    priv_meta.run_id = 1;
     priv_meta.visibility = llama_rerot_visibility::private_control;
     cells.rerot_set(2, priv_meta);
     ok = staging.stage_range(kv, 0, 0, 4, k_buf.data(), v_buf.data(), &err);
@@ -514,6 +516,8 @@ static void test_budgeted_prerope_staging_and_invariants() {
     // Case 5: Mark cell as pending_record -> staging fails closed
     llama_kv_rerot_meta pend_meta;
     pend_meta.episode_id = 99;
+    pend_meta.node_id = 1;
+    pend_meta.run_id = 1;
     pend_meta.visibility = llama_rerot_visibility::pending_record;
     cells.rerot_set(2, pend_meta);
     ok = staging.stage_range(kv, 0, 0, 4, k_buf.data(), v_buf.data(), &err);

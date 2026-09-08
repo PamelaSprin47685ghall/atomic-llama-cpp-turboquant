@@ -253,6 +253,12 @@ codec_desc make_codec_desc(
     desc.logical_shape = logical_shape;
     desc.seed = seed;
 
+    // Fail closed BEFORE any ggml type-table contact: out-of-range types
+    // (e.g. GGML_TYPE_COUNT from corrupt configs) abort in ggml asserts.
+    if ((int) type < 0 || (int) type >= (int) GGML_TYPE_COUNT) {
+        throw std::invalid_argument("make_codec_desc: ggml_type out of range");
+    }
+
     int64_t blk = ggml_blck_size(type);
     if (blk <= 0) {
         throw std::invalid_argument("unknown or invalid ggml_type block size");

@@ -403,13 +403,15 @@ static void test_boundary_and_geometry_matrix() {
         std::string err;
         bool ok = factorize_matrix(m1, 1, LLAMA_XKV_FACTOR_BALANCE_UPSTREAM, 42, fp, &err);
         MATRIX_CHECK(ok, "Factorize n=1 matrix should succeed: " + err);
-        MATRIX_CHECK(fp.rank == 1, "Rank for n=1 should be 1");
-        MATRIX_CHECK(fp.a.rows == 1 && fp.a.cols == 1, "A matrix shape should be 1x1");
-        MATRIX_CHECK(fp.b_transposed.rows == 64 && fp.b_transposed.cols == 1, "B^T matrix shape should be 64x1");
+        if (ok) {
+            MATRIX_CHECK(fp.rank == 1, "Rank for n=1 should be 1");
+            MATRIX_CHECK(fp.a.rows == 1 && fp.a.cols == 1, "A matrix shape should be 1x1");
+            MATRIX_CHECK(fp.b_transposed.rows == 64 && fp.b_transposed.cols == 1, "B^T matrix shape should be 64x1");
 
-        matrix recon = matrix_reconstruct(fp.a, fp.b_transposed);
-        factor_error_report rep = compute_error_report(m1, recon);
-        MATRIX_CHECK(rep.relative_error < 1e-4, "n=1 reconstruction should be exact (< 1e-4)");
+            matrix recon = matrix_reconstruct(fp.a, fp.b_transposed);
+            factor_error_report rep = compute_error_report(m1, recon);
+            MATRIX_CHECK(rep.relative_error < 1e-4, "n=1 reconstruction should be exact (< 1e-4)");
+        }
     }
 
     // 4b. Requested rank >= n (e.g. n=10, m=20, requested_rank=16 clamped to min(n,m)=10)

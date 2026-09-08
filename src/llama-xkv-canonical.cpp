@@ -433,7 +433,11 @@ bool xkv_canonical_layer_kv_snapshot::init(
         const uint32_t freq_count = rotary_dim / 2;
 
         // Use precomputed canonical_rope_context if provided, or safely derive from model/cparams
-        if (rope_ctx && rope_ctx->valid) {
+        if (rope_ctx) {
+            if (!rope_ctx->valid) {
+                if (err) *err = "provided canonical_rope_context is invalid";
+                return false;
+            }
             if (rope_ctx->rotary_dim != rotary_dim || rope_ctx->omega.size() != freq_count) {
                 if (err) *err = "provided canonical_rope_context dimension mismatch";
                 return false;

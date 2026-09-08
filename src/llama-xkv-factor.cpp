@@ -514,7 +514,8 @@ bool estimate_factorize_matrix_workspace_bytes(
             !safe_mul_u64(t1, df, t2) ||
             !safe_mul_u64((uint64_t)64, (uint64_t)sizeof(float), c64) ||
             !safe_mul_u64(m, c64, j_tile) ||
-            !safe_add_u64(t2, j_tile, peak)) {
+            !safe_add_u64(t2, j_tile, peak) ||
+            !safe_add_u64(peak, (uint64_t)1024, peak)) { // alignment headroom
             if (err) *err = "workspace estimator: integer overflow on direct Jacobi peak calculation";
             return false;
         }
@@ -1090,7 +1091,7 @@ bool factorize_matrix(
     std::vector<uint8_t> fallback_ws;
     workspace_bump_carver carver(workspace.data, workspace.size_bytes);
     if (!workspace.valid()) {
-        fallback_ws.resize(required_workspace);
+        fallback_ws.resize(required_workspace + 1024);
         carver = workspace_bump_carver(fallback_ws.data(), fallback_ws.size());
     }
 
