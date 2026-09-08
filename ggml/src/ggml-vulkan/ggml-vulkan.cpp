@@ -12070,6 +12070,14 @@ static void ggml_vk_flash_prefill_attn(ggml_backend_vk_context * ctx, vk_context
     base.mean_correction = (uint32_t) mean_corr;
     base.scale           = scale;
     base.softcap         = softcap;
+    // A direct SELECT source that consumes this exact metadata tensor is a
+    // validated producer dependency of ATTN. Graph expansion/scheduling
+    // recomputes it first and SELECT owns every plan entry, so ATTN need not
+    // repeat its O(rows*uses*selected) coverage scan. Leaf/view/external
+    // plans, or SELECT plans built from another metadata tensor, stay slow
+    // and fail-closed through the full consumer-side coverage validation.
+    base.reserved4 =
+        plan->op == GGML_OP_FLASH_PREFILL_SELECT && plan->src[2] == meta ? 1u : 0u;
     vk_pipeline pipeline = ggml_vk_ensure_flash_prefill_typed(ctx, ctx->device->pipeline_flash_prefill_attn, k->type, v->type);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     vk_subbuffer q_buf    = ggml_vk_tensor_subbuffer(ctx, q);

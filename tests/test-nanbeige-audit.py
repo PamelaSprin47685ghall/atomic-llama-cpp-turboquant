@@ -4,6 +4,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import struct
 import tempfile
@@ -230,6 +231,89 @@ class AuditTests(unittest.TestCase):
         library.write_bytes(b"new")
         self.assertNotEqual(before, audit.artifact_fingerprint(binary))
 
+    def test_build_preflight_rejects_stale_server_object(self):
+        source = self.root / "source"
+        build = self.root / "build"
+        binary = build / "bin" / "llama-server"
+        object_dir = build / "tools" / "server" / "CMakeFiles" / "server-context.dir"
+        header = source / "tools" / "server" / "server-task.h"
+        object_file = object_dir / "server-queue.cpp.o"
+        dep_file = object_dir / "server-queue.cpp.o.d"
+        binary.parent.mkdir(parents=True)
+        object_dir.mkdir(parents=True)
+        header.parent.mkdir(parents=True)
+        binary.write_bytes(b"server")
+        header.write_text("new layout", encoding="utf-8")
+        object_file.write_bytes(b"old object")
+        dep_file.write_text(f"server-queue.cpp.o: {header}\n", encoding="utf-8")
+        (build / "CMakeCache.txt").write_text(
+            f"CMAKE_HOME_DIRECTORY:INTERNAL={source}\n", encoding="utf-8")
+        os.utime(object_file, ns=(1_000_000_000, 1_000_000_000))
+        os.utime(header, ns=(2_000_000_000, 2_000_000_000))
+
+        report = audit.inspect_build_artifacts(binary)
+        self.assertTrue(report["checked"])
+        self.assertEqual(len(report["stale_objects"]), 1)
+        self.assertIn("stale server object", report["errors"][0])
+
+        os.utime(object_file, ns=(3_000_000_000, 3_000_000_000))
+        self.assertEqual(audit.inspect_build_artifacts(binary)["errors"], [])
+
+    def test_build_preflight_rejects_duplicate_static_archive_members(self):
+        source = self.root / "source"
+        build = self.root / "build"
+        binary = build / "bin" / "llama-server"
+        archive = build / "tools" / "server" / "libserver-context.a"
+        (build / "tools" / "server" / "CMakeFiles").mkdir(parents=True)
+        binary.parent.mkdir(parents=True)
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_bytes(b"server")
+        source.mkdir()
+        (build / "CMakeCache.txt").write_text(
+            f"CMAKE_HOME_DIRECTORY:INTERNAL={source}\n", encoding="utf-8")
+
+        def member(name, payload):
+            encoded = name.encode("ascii") + b"/"
+            header = (encoded.ljust(16) + b"0".ljust(12) + b"0".ljust(6) + b"0".ljust(6)
+                      + b"100644".ljust(8) + str(len(payload)).encode("ascii").ljust(10) + b"`\n")
+            return header + payload + (b"\n" if len(payload) & 1 else b"")
+
+        archive.write_bytes(b"!<arch>\n" + member("same.o", b"a") + member("same.o", b"b"))
+        report = audit.inspect_build_artifacts(binary)
+        self.assertEqual(report["duplicate_archive_members"][str(archive)], ["same.o"])
+        self.assertIn("duplicate static archive members", report["errors"][0])
+
+    def test_orphan_versioned_libraries_do_not_change_runtime_fingerprint(self):
+        binary = self.root / "server"
+        binary.write_bytes(b"server")
+        current = self.root / "libfixture.so.2.0.7"
+        current.write_bytes(b"current")
+        (self.root / "libfixture.so").symlink_to(current.name)
+        (self.root / "libfixture.so.2").symlink_to(current.name)
+        orphan = self.root / "libfixture.so.1.0.0"
+        orphan.write_bytes(b"old orphan")
+        before = audit.artifact_fingerprint(binary)
+        self.assertEqual(set(before), {str(binary.resolve()), str(current.resolve())})
+        orphan.write_bytes(b"changed orphan")
+        self.assertEqual(before, audit.artifact_fingerprint(binary))
+
+    def test_switching_runtime_library_symlink_changes_fingerprint(self):
+        binary = self.root / "server"
+        binary.write_bytes(b"server")
+        first = self.root / "libfixture.so.1.0.0"
+        second = self.root / "libfixture.so.2.0.0"
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        alias = self.root / "libfixture.so"
+        alias.symlink_to(first.name)
+        before = audit.artifact_fingerprint(binary)
+        alias.unlink()
+        alias.symlink_to(second.name)
+        after = audit.artifact_fingerprint(binary)
+        self.assertNotEqual(before, after)
+        self.assertIn(str(second.resolve()), after)
+        self.assertNotIn(str(first.resolve()), after)
+
     def test_model_identity_is_content_based_and_stable(self):
         model = self.root / "model.gguf"
         model.write_bytes(b"weights")
@@ -301,12 +385,24 @@ class AuditTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 audit.check_runtime_evidence(config, result)
 
+    def test_pressure_gate_can_require_real_scoring(self):
+        log = self.root / "server.log"
+        config = dict(self.config, require_tri_scoring=True)
+        result = {"server_log": str(log)}
+        floor_only = "TriAttention drain: before=512 after=128 freed=384 score_ms=0.000 pack_ms=2.3"
+        log.write_text(floor_only, encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "scored TriAttention drain"):
+            audit.check_runtime_evidence(config, result)
+        log.write_text(floor_only.replace("score_ms=0.000", "score_ms=2.300"), encoding="utf-8")
+        audit.check_runtime_evidence(config, result)
+        self.assertGreater(result["tri_events"][0]["score_ms"], 0)
+
     def test_pressure_gate_config_validation(self):
-        for change in ({"require_tri_drain": "true"}, {"max_tri_score_ms": -1},
+        for change in ({"require_tri_drain": "true"}, {"require_tri_scoring": "true"}, {"max_tri_score_ms": -1},
                        {"max_tri_score_ms": True}, {"max_tri_score_ms": float("nan")}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 audit.validate_configs([dict(self.config, **change)])
-        audit.validate_configs([dict(self.config, require_tri_drain=True, max_tri_score_ms=0)])
+        audit.validate_configs([dict(self.config, require_tri_drain=True, require_tri_scoring=True)])
 
 
 if __name__ == "__main__":

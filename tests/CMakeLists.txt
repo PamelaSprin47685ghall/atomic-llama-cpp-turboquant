@@ -136,6 +136,10 @@ if (NOT MSVC)
 endif()
 llama_test(test-turbo-quant)
 
+add_executable(test-turbo-config test-turbo-config.cpp)
+target_link_libraries(test-turbo-config PRIVATE ggml-base)
+llama_test(test-turbo-config)
+
 llama_build(test-tokenizer-0.cpp)
 
 llama_test(test-tokenizer-0 NAME test-tokenizer-0-bert-bge          ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-bert-bge.gguf)
@@ -202,10 +206,22 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-triattention-score.cpp)
     target_include_directories(test-triattention-score PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
-    foreach(component routing select attn state)
+    foreach(component routing select state)
         llama_build_and_test(test-flashprefill-${component}.cpp)
         target_include_directories(test-flashprefill-${component} PRIVATE ${PROJECT_SOURCE_DIR}/src)
     endforeach()
+
+    # The ATTN contract test exercises only ggml graph/wire/backend APIs. Keep
+    # it independent of llama-common so Vulkan kernel regressions can be built
+    # and run without first rebuilding the entire libllama dependency graph.
+    add_executable(test-flashprefill-attn test-flashprefill-attn.cpp)
+    target_link_libraries(test-flashprefill-attn PRIVATE ggml)
+    target_include_directories(test-flashprefill-attn PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    if (LLAMA_TESTS_INSTALL)
+        install(TARGETS test-flashprefill-attn RUNTIME)
+    endif()
+    add_test(NAME test-flashprefill-attn COMMAND $<TARGET_FILE:test-flashprefill-attn>)
+    set_property(TEST test-flashprefill-attn PROPERTY LABELS main)
     # test-flashprefill-state exercises the real RERoT runtime (chains B/E/G:
     # episode codec, context shift, pen suspend/resume) — same extra source
     # and include dir as test-rerot-runtime.

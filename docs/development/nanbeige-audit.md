@@ -48,7 +48,12 @@ produce unused RoPE inputs; phase-bearing graphs retain their position data.
 The standard-library-only runner starts a private loopback listener with an
 ephemeral authentication key and stops it in a `finally` block. It stores
 per-request responses, checked answers, timing, sampled GPU memory, and server
-logs. Finish the build before probing. The runner fingerprints the executable
+logs. Finish the build before probing. For binaries inside a CMake build tree,
+the runner first rejects stale server objects whose local compiler dependencies
+are newer and duplicate members in the server/common static archives. This
+prevents hand-run object relinks or direct `link.txt`/`ar qc` invocations from
+silently mixing incompatible C++ layouts. The runner then fingerprints the
+executable
 and local shared libraries before/after each run and rejects changed artifacts;
 these hashes do not cover driver or system libraries outside the binary directory.
 It records the process exit status **before** its cleanup signal, so a server
@@ -97,6 +102,12 @@ and no candidate ranking is needed. These gates parse the real server log,
 check before/after/freed accounting, and save the observed events. Do not use
 the zero-score bound for general ranked eviction, which legitimately scores
 candidates. HTTP success alone does not satisfy a requested pressure gate.
+
+Use `"require_tri_scoring": true` when the test is specifically meant to
+exercise calibration/ranking. It requires a real drain with `score_ms > 0`, so
+the KV=512 recent-window floor-only case cannot be mistaken for scorer coverage.
+For Nanbeige, use physical KV at least 4096 and a prompt longer than physical KV
+so the 3/32 target exceeds the fixed recent-128 guard.
 
 Set `"require_flashprefill_plan": true` to require completed FlashPrefill
 plan work. The runner enables `/metrics`, saves the response, and validates

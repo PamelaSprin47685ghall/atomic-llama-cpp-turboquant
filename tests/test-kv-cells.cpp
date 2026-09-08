@@ -5,7 +5,6 @@
 #endif
 
 #include "../src/llama-kv-cells.h"
-
 #include <cassert>
 
 static llama_kv_rerot_meta make_rerot_meta(

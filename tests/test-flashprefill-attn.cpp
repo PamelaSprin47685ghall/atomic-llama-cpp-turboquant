@@ -1770,6 +1770,65 @@ static void test_backend_coverage_lanes(ggml_backend_t backend, const BackendSel
     std::printf("test_backend_coverage_lanes done (%s)\n", sel.name.c_str());
 }
 
+static void test_backend_select_provenance(ggml_backend_t backend, const BackendSel & sel) {
+    if (sel.name.find("Vulkan") == std::string::npos) return;
+
+    // The plan is a real SELECT node, but it consumes meta_a while ATTN is
+    // deliberately wired to a same-sized meta_b with one additional legal
+    // use. Trusting only plan->op would skip consumer coverage and accept the
+    // missing use. Producer validation is allowed only when the exact metadata
+    // tensor is shared by SELECT and ATTN.
+    constexpr int dim = 64, hq = 2, nf = 3;
+    std::vector<int32_t> meta_b;
+    int64_t nt = 0;
+    FP_CHECK(fp_build_meta(meta_b, dim, dim, 1, hq, 1, nf,
+                std::vector<int>(nf, 1), std::vector<int>(nf, 0), std::vector<int>(nf, 0), nt));
+    FP_CHECK(nt == 1);
+    auto meta_a = meta_b;
+    // Header word 7 is n_use; u_cap and table layout remain 3, so both
+    // tensors have identical allocation geometry while SELECT sees only two.
+    meta_a[7] = 2;
+    FP_CHECK(ggml_flashprefill_metadata_validate(meta_a.data(), meta_a.size()) == GGML_FLASHPREFILL_OK);
+    int64_t max_sel = 0;
+    FP_CHECK(ggml_flashprefill_plan_max_sel_for_meta(meta_a.data(), meta_a.size(), &max_sel) == GGML_FLASHPREFILL_OK);
+    FP_CHECK(max_sel == 2);
+
+    ggml_context_ptr ctx(ggml_init({16 * 1024 * 1024, nullptr, true}));
+    ggml_tensor * q = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, dim, 1, hq);
+    ggml_tensor * k = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, dim, nf, 1);
+    ggml_tensor * v = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, dim, nf, 1);
+    ggml_tensor * ma = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, meta_a.size());
+    ggml_tensor * mb = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, meta_b.size());
+    ggml_tensor * pool = ggml_flash_prefill_pool(ctx.get(), k, v, ma, nullptr, nullptr, dim, dim, 1, nf);
+    ggml_tensor * plan = ggml_flash_prefill_select(ctx.get(), q, pool, ma, 1, 1, max_sel,
+            1.0f, 1.0f, 0.0f, 0, true);
+    ggml_tensor * out = ggml_flash_prefill_attn(ctx.get(), q, k, v, pool, plan, mb, nullptr,
+            1, hq, dim, 1.0f, 0.0f, true);
+    FP_CHECK(q && k && v && ma && mb && pool && plan && out);
+    if (!out || !ggml_backend_supports_op(backend, pool) || !ggml_backend_supports_op(backend, plan) ||
+            !ggml_backend_supports_op(backend, out)) {
+        FP_CHECK_MSG(false, "producer provenance fixture unsupported on %s", sel.name.c_str());
+        return;
+    }
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    if (!buffer) { FP_CHECK(false); return; }
+    std::vector<float> qdata(dim * hq, 0.0f);
+    std::vector<ggml_fp16_t> kvdata(dim * nf, ggml_fp32_to_fp16(0.0f));
+    ggml_backend_tensor_set(q, qdata.data(), 0, ggml_nbytes(q));
+    ggml_backend_tensor_set(k, kvdata.data(), 0, ggml_nbytes(k));
+    ggml_backend_tensor_set(v, kvdata.data(), 0, ggml_nbytes(v));
+    ggml_backend_tensor_set(ma, meta_a.data(), 0, ggml_nbytes(ma));
+    ggml_backend_tensor_set(mb, meta_b.data(), 0, ggml_nbytes(mb));
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 64, false);
+    ggml_build_forward_expand(graph, out);
+    const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    FP_CHECK_MSG(status != GGML_STATUS_SUCCESS, "SELECT plan from different metadata was incorrectly trusted");
+    std::vector<int32_t> wire((size_t) ggml_nelements(plan));
+    ggml_backend_tensor_get(plan, wire.data(), 0, ggml_nbytes(plan));
+    FP_CHECK_MSG(wire[10] == GGML_FLASHPREFILL_ERR_BAD_PLAN_COVERAGE,
+            "different-metadata coverage error=%d", wire[10]);
+}
+
 static void test_backend_exactall(ggml_backend_t backend, const BackendSel & sel) {
     // Exact-all over same cached bytes vs dense oracle (same dequantized data).
     fp_backend_sparse_once(backend, sel, 64, 64, 1, 2, 2,
@@ -1907,6 +1966,7 @@ int main(int argc, char ** argv) {
     test_backend_quant(backend, sel);
     test_backend_value_accumulation(backend, sel);
     test_backend_coverage_lanes(backend, sel);
+    test_backend_select_provenance(backend, sel);
     ggml_backend_free(backend);
 
     if (g_failures == 0) {
