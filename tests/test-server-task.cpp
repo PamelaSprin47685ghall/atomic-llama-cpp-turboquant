@@ -1,6 +1,9 @@
 #include "server-queue.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -22,6 +25,24 @@ static_assert(std::is_move_assignable<server_task>::value, "tasks must be move-a
 
 static std::string payload(int id, size_t length) {
     return std::string(length, char('a' + id % 26));
+}
+
+static void test_slot_action_initialization() {
+    const int unset_slot = -1;
+    for (bool typed : {false, true}) {
+        // Poison raw storage before the object's lifetime, never a live task.
+        // Inspect bytes rather than evaluating a possibly indeterminate int
+        // so the regression does not itself read an uninitialized scalar.
+        alignas(server_task) unsigned char storage[sizeof(server_task)];
+        std::fill_n(storage, sizeof(storage), 0xa5);
+        auto * task = typed
+            ? new (storage) server_task(SERVER_TASK_TYPE_COMPLETION)
+            : new (storage) server_task;
+        const bool initialized = std::memcmp(
+                &task->slot_action.id_slot, &unset_slot, sizeof(unset_slot)) == 0;
+        task->~server_task();
+        CHECK(initialized);
+    }
 }
 
 static server_task make_task(int id, size_t length) {
@@ -110,6 +131,7 @@ static void test_child_clone(size_t length) {
         CHECK(child.tokens.get_tokens() == parent.tokens.get_tokens());
         CHECK(child.rerot_original_user_text == parent.rerot_original_user_text);
         CHECK(child.cache_key.empty());
+        CHECK(child.slot_action.id_slot == -1);
     }
     parent.child_tasks.front().tokens.set_token(0, 99);
     CHECK(parent.tokens[0] == 20);
@@ -145,6 +167,7 @@ static void test_queue_transfer(size_t length) {
 
 int main() {
     try {
+        test_slot_action_initialization();
         // Empty, small-string and heap-backed payloads exercise distinct moves.
         for (size_t length : {size_t(0), size_t(7), size_t(257)}) {
             test_vector_lifetime(length);
