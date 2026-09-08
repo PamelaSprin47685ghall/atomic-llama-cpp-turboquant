@@ -939,6 +939,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_diag[2];
     vk_pipeline pipeline_clamp[2];
     vk_pipeline pipeline_pad_f32;
+    vk_pipeline pipeline_memmove_bytes;
     vk_pipeline pipeline_roll_f32;
     vk_pipeline pipeline_repeat_i32, pipeline_repeat_back_f32;
     vk_pipeline pipeline_repeat_i16;
@@ -1099,6 +1100,8 @@ struct vk_device_struct {
     // intentionally separate from sync_staging: TriAttention compaction must
     // stay on-device and never round-trip through host-visible memory.
     vk_buffer memmove_scratch;
+    std::vector<vk::DescriptorPool> memmove_descriptor_pools;
+    std::vector<vk::DescriptorSet> memmove_descriptor_sets;
 
     ggml_backend_buffer_type buffer_type;
 
@@ -1116,6 +1119,9 @@ struct vk_device_struct {
 
         ggml_vk_destroy_buffer(sync_staging);
         ggml_vk_destroy_buffer(memmove_scratch);
+        for (auto pool : memmove_descriptor_pools) {
+            device.destroyDescriptorPool(pool);
+        }
 
         if (compute_queue) compute_queue->cmd_pool.destroy(device);
         if (transfer_queue) transfer_queue->cmd_pool.destroy(device);
@@ -5780,6 +5786,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_diag[1], "diag_f16", diag_f16_len, diag_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_pad_f32, "pad_f32", pad_f32_len, pad_f32_data, "main", 2, sizeof(vk_op_pad_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_memmove_bytes, "memmove_bytes", memmove_bytes_len, memmove_bytes_data, "main", 2, 3 * sizeof(uint32_t), {64, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_roll_f32, "roll_f32", roll_f32_len, roll_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
 
@@ -17251,10 +17258,10 @@ static bool ggml_backend_vk_buffer_memmove_tensor(
     vk_buffer data_buf = buf_ctx->dev_buffer;
     vk_device device = data_buf->device;
 
-    // Validate the full batch before touching data. vkCmdCopyBuffer requires
-    // 4-byte aligned offsets/sizes, so layouts that cannot be represented by
-    // transfer copies (notably some transposed F16/BF16 V moves) explicitly
-    // report unsupported instead of silently falling back to host staging.
+    // Aligned copies retain the transfer fast path. Other byte layouts (in
+    // particular transposed F16 V) use device compute, never host staging.
+    size_t byte_dispatches = 0;
+    const size_t chunk_limit = std::min<size_t>(GGML_VK_MEMMOVE_SCRATCH_SIZE, 1u << 20);
     for (size_t r = 0; r < n_regions; ++r) {
         const auto & region = regions[r];
         if (region.tensor == nullptr || region.tensor->buffer != buffer || region.n_copies == 0) {
@@ -17268,9 +17275,14 @@ static bool ggml_backend_vk_buffer_memmove_tensor(
             const uint64_t end_src = src + region.size;
             const uint64_t end_dst = dst + region.size;
 
-            if (end_src > buffer->size || end_dst > buffer->size ||
-                (src & 3u) != 0 || (dst & 3u) != 0 || (region.size & 3u) != 0) {
+            if (end_src < src || end_dst < dst || end_src > buffer->size || end_dst > buffer->size) {
                 return false;
+            }
+            if (region.size && src != dst && ((src | dst | region.size) & 3u)) {
+                byte_dispatches += 2 * (1 + (region.size - 1) / chunk_limit);
+                if (byte_dispatches > UINT32_MAX) {
+                    return false;
+                }
             }
         }
     }
@@ -17278,12 +17290,42 @@ static bool ggml_backend_vk_buffer_memmove_tensor(
     std::lock_guard<std::recursive_mutex> guard(device->mutex);
     ggml_vk_ensure_memmove_scratch(device);
 
+    ggml_backend_vk_context byte_ctx{};
+    byte_ctx.device = device;
+    byte_ctx.descriptor_pools.swap(device->memmove_descriptor_pools);
+    byte_ctx.descriptor_sets.swap(device->memmove_descriptor_sets);
+    // Descriptor sets are immutable while submitted commands may use them.
+    // Reserve a distinct set per dispatch during preflight. Reuse pools only
+    // after the fence; the device mutex also serializes concurrent callers.
+    struct pool_guard {
+        ggml_backend_vk_context & ctx;
+        ~pool_guard() {
+            ctx.descriptor_pools.swap(ctx.device->memmove_descriptor_pools);
+            ctx.descriptor_sets.swap(ctx.device->memmove_descriptor_sets);
+        }
+    } cleanup{byte_ctx};
+    if (byte_dispatches) {
+        ggml_pipeline_request_descriptor_sets(&byte_ctx, device->pipeline_memmove_bytes, (uint32_t) byte_dispatches);
+    }
     if (dry_run) {
         return true;
     }
-
-    vk_context subctx = ggml_vk_create_temporary_context(device->transfer_queue->cmd_pool);
+    vk_context subctx = ggml_vk_create_temporary_context(
+        byte_dispatches ? device->compute_queue->cmd_pool : device->transfer_queue->cmd_pool);
     ggml_vk_ctx_begin(device, subctx);
+
+    auto copy_bytes = [&](vk_buffer & src_buf, uint64_t src, vk_buffer & dst_buf, uint64_t dst, size_t count) {
+        const uint64_t alignment = device->properties.limits.minStorageBufferOffsetAlignment;
+        const uint64_t src_base = src - src % alignment;
+        const uint64_t dst_base = dst - dst % alignment;
+        const uint32_t so = (uint32_t) (src - src_base), doff = (uint32_t) (dst - dst_base);
+        const std::array<uint32_t, 3> pc = {so, doff, (uint32_t) count};
+        ggml_vk_dispatch_pipeline(&byte_ctx, subctx, device->pipeline_memmove_bytes,
+            {{src_buf->buffer, src_base, (so + count + 3) & ~size_t(3)},
+             {dst_buf->buffer, dst_base, (doff + count + 3) & ~size_t(3)}},
+            pc, {(uint32_t) ((doff % 4 + count + 3) / 4), 1, 1});
+        ggml_vk_sync_buffers(nullptr, subctx);
+    };
 
     auto move_one = [&](uint64_t src, uint64_t dst, size_t size) {
         if (size == 0 || src == dst) {
@@ -17296,15 +17338,20 @@ static bool ggml_backend_vk_buffer_memmove_tensor(
         // intentionally general.
         size_t remaining = size;
         while (remaining > 0) {
-            const size_t chunk = std::min(remaining, GGML_VK_MEMMOVE_SCRATCH_SIZE);
+            const size_t chunk = std::min(remaining, chunk_limit);
             const size_t off = dst > src ? remaining - chunk : size - remaining;
 
-            ggml_vk_buffer_copy_async(
-                subctx, device->memmove_scratch, 0, data_buf, src + off, chunk);
-            ggml_vk_sync_buffers(nullptr, subctx);
-            ggml_vk_buffer_copy_async(
-                subctx, data_buf, dst + off, device->memmove_scratch, 0, chunk);
-            ggml_vk_sync_buffers(nullptr, subctx);
+            if (((src | dst | size) & 3u) != 0) {
+                copy_bytes(data_buf, src + off, device->memmove_scratch, 0, chunk);
+                copy_bytes(device->memmove_scratch, 0, data_buf, dst + off, chunk);
+            } else {
+                ggml_vk_buffer_copy_async(
+                    subctx, device->memmove_scratch, 0, data_buf, src + off, chunk);
+                ggml_vk_sync_buffers(nullptr, subctx);
+                ggml_vk_buffer_copy_async(
+                    subctx, data_buf, dst + off, device->memmove_scratch, 0, chunk);
+                ggml_vk_sync_buffers(nullptr, subctx);
+            }
 
             remaining -= chunk;
         }

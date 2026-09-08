@@ -195,6 +195,7 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+    ggml_tensor * get_v_storage(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
@@ -377,6 +378,9 @@ public:
     // Moves K/V tensor rows and updates cell metadata atomically
     // Must be called after llama_synchronize() and before next init_batch()
     void compact();
+    // Used by update after synchronization. Turbo K is decoded, phase-shifted
+    // and requantized; WHT alone never makes a position shift a no-op.
+    void shift_turbo_keys(const llama_cparams & cparams);
 
     // find a slot of kv cells that can hold the ubatch
     // if cont == true, then the slot must be continuous
@@ -415,6 +419,7 @@ public:
     void set_input_v_rot(ggml_tensor * dst) const;
 
 private:
+    bool compact_planned(llama_kv_cells_vec & planned_cells);
     const llama_model & model;
     const llama_hparams & hparams;
 
@@ -443,6 +448,7 @@ private:
 
     // env: LLAMA_ATTN_ROT_DISABLE
     bool attn_rot_k = false;
+    uint32_t attn_rot_k_nrot = 0;
     bool attn_rot_v = false;
 
     // if all layers participating in the cache have constant head size, the value is stored here

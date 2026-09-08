@@ -7,6 +7,7 @@
 #include "server-rerot.h"
 #include "server-rerot-audit.h"
 #include "server-task.h"
+#include "server-triattention.h"
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
@@ -457,10 +458,10 @@ struct server_slot {
         if (res && loaded_state) {
             common_speculative_set_state(spec, id, state_spec);
         }
-        if (res) {
-            triattention_compressed = loaded_state &&
-                llama_memory_seq_get_kv_used(llama_get_memory(ctx_tgt), id) < prompt.tokens.size();
-        }
+        triattention_compressed = server_triattention_compressed_after_load(
+            triattention_compressed, res, loaded_state,
+            loaded_state ? llama_memory_seq_get_kv_used(llama_get_memory(ctx_tgt), id) : 0,
+            prompt.tokens.size());
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -4694,8 +4695,42 @@ private:
 
                 // Context-level reclaim synchronizes pending compute before any
                 // physical K/V movement and invalidates graph reservations after.
-                auto result_tgt = llama_context_reclaim_kv(ctx_tgt, &req);
-                if (result_tgt.supported && result_tgt.changed) {
+                auto results = server_triattention_reclaim_pair(
+                    has_dft_usage && mem_dft != mem_tgt,
+                    [&]() {
+                        // A separate context may still read shared target K/V
+                        // (assistant views). Fence it before target movement.
+                        if (ctx_dft) {
+                            llama_synchronize(ctx_dft);
+                        }
+                        return llama_context_reclaim_kv(ctx_tgt, &req);
+                    },
+                    [&]() {
+                        llama_memory_kv_reclaim_request req_dft = req;
+                        req_dft.required_free = kv_deficit_dft;
+                        req_dft.seq_hints.clear();
+                        // Drafts own physical execution slots, not the target
+                        // episode's archive/parked sequence namespace.
+                        for (const auto & slot : slots) {
+                            if (slot.prompt.n_tokens() == 0 ||
+                                (!kv_pressure && !slot.triattention_compressed) ||
+                                llama_memory_seq_get_kv_used(mem_dft, slot.id) == 0) {
+                                continue;
+                            }
+                            llama_memory_kv_reclaim_seq_hint hint{};
+                            hint.seq_id = slot.id;
+                            hint.logical_tokens = (uint32_t) slot.prompt.n_tokens();
+                            hint.tail_guard = 128;
+                            hint.eligible = true;
+                            req_dft.seq_hints.push_back(hint);
+                        }
+                        return req_dft.seq_hints.empty() ? llama_memory_kv_reclaim_result{} :
+                            llama_context_reclaim_kv(ctx_dft, &req_dft);
+                    });
+                const auto & result_tgt = results.first;
+                const auto & result_dft = results.second;
+                if ((result_tgt.supported && result_tgt.changed) ||
+                    (result_dft.supported && result_dft.changed)) {
                     if (kv_pressure) {
                         tri_drain_count++;
                     } else {
@@ -4754,17 +4789,9 @@ private:
                         }
                     }
 
-                    // Also reclaim on draft if separate
-                    if (has_dft_usage && mem_dft != mem_tgt) {
-                        llama_memory_kv_reclaim_request req_dft = req;
-                        req_dft.required_free = kv_deficit_dft;
-                        auto result_dft = llama_context_reclaim_kv(ctx_dft, &req_dft);
-                        if (result_dft.supported && result_dft.changed) {
-                            tri_cells_freed_total += result_dft.physical_freed;
-                            tri_score_us_total    += result_dft.score_us;
-                            tri_pack_us_total     += result_dft.pack_us;
-                        }
-                    }
+                    tri_cells_freed_total += result_dft.physical_freed;
+                    tri_score_us_total    += result_dft.score_us;
+                    tri_pack_us_total     += result_dft.pack_us;
                     // Re-check capacity by continuing the while loop
                     continue;
                 }

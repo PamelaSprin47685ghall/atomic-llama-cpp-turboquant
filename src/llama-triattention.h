@@ -106,6 +106,9 @@ struct triattention_scorer_config {
     bool disable_mlr = false;       // ablation
     bool disable_trig = false;      // ablation
     bool enable_logging = false;
+    uint32_t k_hadamard = 0;       // optional post-RoPE attention rotation tile
+    // Draft-only policy: nextn layers may have no target-model calibration.
+    bool uncalibrated_draft_recency = false;
 };
 
 // ============================================================================
@@ -128,6 +131,7 @@ public:
     ~triattention_scorer();
 
     bool valid() const;
+    bool matches_layers(const int32_t * layer_map, uint32_t n_layers) const;
 
     // Score candidates for a single (layer, head) pair
     // out_scores: [n_candidates] importance scores

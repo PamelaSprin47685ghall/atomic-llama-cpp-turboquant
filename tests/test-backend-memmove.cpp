@@ -21,22 +21,7 @@ static void fill_pattern(std::vector<uint8_t> & data) {
     }
 }
 
-int main() {
-    ggml_backend_load_all();
-
-    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
-    if (!dev) {
-        std::cout << "SKIP: no GPU backend\n";
-        return 0;
-    }
-
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
-    if (!reg_name || std::string(reg_name).find("Vulkan") == std::string::npos) {
-        std::cout << "SKIP: GPU backend is not Vulkan\n";
-        return 0;
-    }
-
+static int test_buffer(ggml_backend_buffer_type_t buft) {
     ggml_init_params params = {};
     params.mem_size = 2 * ggml_tensor_overhead() + 1024;
     params.no_alloc = true;
@@ -45,7 +30,6 @@ int main() {
 
     ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64); // 256 bytes
     CHECK(ggml_nbytes(tensor) == 256);
-    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
     CHECK(buffer);
 
@@ -92,8 +76,7 @@ int main() {
     ggml_backend_tensor_get(tensor, actual.data(), 0, actual.size());
     CHECK(actual == expected);
 
-    // Vulkan transfer copies require four-byte alignment. Unsupported regions
-    // must fail preflight and leave data untouched.
+    // Two-byte and byte-unaligned ranges use native compute on Vulkan.
     ggml_backend_tensor_set(tensor, original.data(), 0, original.size());
     ggml_backend_tensor_memmove_region unaligned = {};
     unaligned.tensor = tensor;
@@ -101,12 +84,55 @@ int main() {
     unaligned.dst_offset = 0;
     unaligned.size = 2;
     unaligned.n_copies = 1;
-    CHECK(!ggml_backend_tensor_memmove_regions_supported(&unaligned, 1));
+    CHECK(ggml_backend_tensor_memmove_regions_supported(&unaligned, 1));
+    CHECK(ggml_backend_tensor_memmove_regions(&unaligned, 1));
+    expected = original;
+    memmove(expected.data(), expected.data() + 4, 2);
+    ggml_backend_tensor_get(tensor, actual.data(), 0, actual.size());
+    CHECK(actual == expected);
+
+    for (size_t src : {size_t(1), size_t(13), size_t(64)}) {
+        for (size_t dst : {size_t(2), size_t(17), size_t(80)}) {
+            ggml_backend_tensor_set(tensor, original.data(), 0, original.size());
+            unaligned.src_offset = src;
+            unaligned.dst_offset = dst;
+            unaligned.size = 31;
+            unaligned.n_copies = 3;
+            unaligned.src_stride = unaligned.dst_stride = 48;
+            expected = original;
+            for (size_t c = 0; c < 3; ++c) {
+                memmove(expected.data() + dst + c * 48, expected.data() + src + c * 48, 31);
+            }
+            CHECK(ggml_backend_tensor_memmove_regions(&unaligned, 1));
+            ggml_backend_tensor_get(tensor, actual.data(), 0, actual.size());
+            CHECK(actual == expected);
+        }
+    }
+    // A later invalid region must reject the WHOLE batch without mutation.
+    ggml_backend_tensor_set(tensor, original.data(), 0, original.size());
+    auto bad = contiguous;
+    bad.src_offset = SIZE_MAX - 1;
+    ggml_backend_tensor_memmove_region batch[] = {contiguous, bad};
+    CHECK(!ggml_backend_tensor_memmove_regions_supported(batch, 2));
+    CHECK(!ggml_backend_tensor_memmove_regions(batch, 2));
     ggml_backend_tensor_get(tensor, actual.data(), 0, actual.size());
     CHECK(actual == original);
 
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
-    std::cout << "PASS: Vulkan backend memmove regions\n";
+    std::cout << "PASS: " << ggml_backend_buft_name(buft) << " memmove regions\n";
+    return 0;
+}
+
+int main() {
+    ggml_backend_load_all();
+    CHECK(test_buffer(ggml_backend_cpu_buffer_type()) == 0);
+    auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg && std::string(ggml_backend_reg_name(reg)).find("Vulkan") != std::string::npos) {
+        CHECK(test_buffer(ggml_backend_dev_buffer_type(dev)) == 0);
+    } else {
+        std::cout << "SKIP: Vulkan portion (CPU tests ran)\n";
+    }
     return 0;
 }

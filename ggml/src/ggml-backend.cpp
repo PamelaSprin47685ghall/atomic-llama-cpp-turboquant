@@ -516,6 +516,30 @@ static bool ggml_backend_tensor_memmove_regions_impl(
         if (region.tensor == NULL || region.tensor->buffer != buffer || region.n_copies == 0) {
             return false;
         }
+        const size_t limit = ggml_nbytes(region.tensor);
+        auto fits = [&](size_t offset, size_t stride) {
+            return offset <= limit && region.size <= limit - offset &&
+                (stride == 0 || region.n_copies - 1 <= (limit - offset - region.size) / stride);
+        };
+        if (!fits(region.src_offset, region.src_stride) || !fits(region.dst_offset, region.dst_stride)) {
+            return false;
+        }
+    }
+
+    // Host buffers need no device callback. Validate the entire batch above
+    // before writing even its first byte (including overflow/strided bounds).
+    if (ggml_backend_buffer_is_host(buffer)) {
+        if (!dry_run) {
+            for (size_t i = 0; i < n_regions; ++i) {
+                const auto & region = regions[i];
+                auto * data = static_cast<uint8_t *>(region.tensor->data);
+                for (size_t c = 0; c < region.n_copies; ++c) {
+                    memmove(data + region.dst_offset + c * region.dst_stride,
+                            data + region.src_offset + c * region.src_stride, region.size);
+                }
+            }
+        }
+        return true;
     }
 
     if (buffer->iface.memmove_tensor == NULL) {

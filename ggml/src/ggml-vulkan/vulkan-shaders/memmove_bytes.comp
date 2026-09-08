@@ -1,0 +1,32 @@
+#version 450
+
+// Non-overlapping byte copy, used in two passes through device scratch for
+// memmove. One invocation owns an entire destination word, so partial-word
+// writes cannot race and bytes outside the requested range are preserved.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) readonly buffer Source { uint a[]; };
+layout(binding = 1) buffer Destination { uint b[]; };
+layout(push_constant) uniform Parameters {
+    uint src_offset;
+    uint dst_offset;
+    uint n_bytes;
+} p;
+
+void main() {
+    uint word = (p.dst_offset / 4) + gl_GlobalInvocationID.x;
+    uint start = word * 4;
+    if (start >= p.dst_offset + p.n_bytes) {
+        return;
+    }
+    uint value = 0;
+    uint mask = 0;
+    for (uint byte_id = 0; byte_id < 4; ++byte_id) {
+        uint d = start + byte_id;
+        if (d >= p.dst_offset && d - p.dst_offset < p.n_bytes) {
+            uint s = p.src_offset + (d - p.dst_offset);
+            value |= ((a[s / 4] >> (8 * (s % 4))) & 255u) << (8 * byte_id);
+            mask |= 255u << (8 * byte_id);
+        }
+    }
+    b[word] = mask == 0xffffffffu ? value : (b[word] & ~mask) | value;
+}

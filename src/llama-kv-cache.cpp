@@ -1,5 +1,6 @@
 #include "llama-kv-cache.h"
 #include "llama-triattention.h"
+#include "llama-kv-transform.h"
 #include "llama-turbo-config.h"
 
 #include "llama-impl.h"
@@ -532,6 +533,7 @@ llama_kv_cache::llama_kv_cache(
 
         attn_rot_k = other->attn_rot_k;
         attn_rot_v = other->attn_rot_v;
+        attn_rot_k_nrot = other->attn_rot_k_nrot;
     } else {
         // TurboQuant: master's #21038 attention rotation is OFF by default on this
         // fork. Enable per-side via LLAMA_ATTN_ROT_K_OVERRIDE=1 and/or
@@ -595,6 +597,21 @@ llama_kv_cache::llama_kv_cache(
             hparams.n_embd_head_k_full == hparams.indexer_head_size) {
             attn_rot_k = true;
         }
+    }
+
+    if (attn_rot_k && !other) {
+        const char * value = getenv("LLAMA_ATTN_ROT_K_NROT");
+        int nrot = value ? atoi(value) : 64;
+        if (nrot == 0) {
+            nrot = 64;
+            while (n_embd_head_k_all % (2 * nrot) == 0) {
+                nrot *= 2;
+            }
+        }
+        if (nrot < 64 || (nrot & (nrot - 1)) != 0 || n_embd_head_k_all % nrot != 0) {
+            throw std::runtime_error("invalid LLAMA_ATTN_ROT_K_NROT for K head dimension");
+        }
+        attn_rot_k_nrot = (uint32_t) nrot;
     }
 
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
@@ -1156,26 +1173,38 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
         // apply K-shift if needed
         if (hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
-            ggml_backend_sched_reset(sched);
+            const bool has_plain_k = std::any_of(layers.begin(), layers.end(), [](const auto & layer) {
+                return !llama_kv_is_turbo(layer.k->type);
+            });
+            if (has_plain_k) {
+                ggml_backend_sched_reset(sched);
 
-            auto * res = lctx->get_gf_res_reserve();
+                auto * res = lctx->get_gf_res_reserve();
 
-            res->reset();
+                res->reset();
 
-            auto * gf = build_graph_shift(res, lctx);
-            if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-                LLAMA_LOG_ERROR("%s: failed to allocate compute graph for K-shift\n", __func__);
-                return updated;
+                auto * gf = build_graph_shift(res, lctx);
+                if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+                    LLAMA_LOG_ERROR("%s: failed to allocate compute graph for K-shift\n", __func__);
+                    return updated;
+                }
+
+                res->set_inputs(nullptr);
+
+                if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
+                    LLAMA_LOG_ERROR("%s: failed to compute K-shift\n", __func__);
+                    return updated;
+                }
+
+                updated = true;
             }
-
-            res->set_inputs(nullptr);
-
-            if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
-                LLAMA_LOG_ERROR("%s: failed to compute K-shift\n", __func__);
-                return updated;
+            if (std::any_of(layers.begin(), layers.end(), [](const auto & layer) {
+                    return llama_kv_is_turbo(layer.k->type);
+                })) {
+                llama_synchronize(lctx);
+                shift_turbo_keys(lctx->get_cparams());
+                updated = true;
             }
-
-            updated = true;
         }
 
         for (uint32_t s = 0; s < n_stream; ++s) {
@@ -1194,11 +1223,21 @@ void llama_kv_cache::compact() {
         return;
     }
 
+    auto planned_cells = v_cells;
+    if (!compact_planned(planned_cells)) {
+        throw std::runtime_error("KV native compaction is unsupported by this backend/layout");
+    }
+}
+
+bool llama_kv_cache::compact_planned(llama_kv_cells_vec & planned_cells) {
     fp_bump();
 
+    auto heads = v_heads;
+    std::map<ggml_backend_buffer_t, std::vector<ggml_backend_tensor_memmove_region>> buffer_moves;
+
     for (uint32_t s = 0; s < n_stream; ++s) {
-        auto & cells = v_cells[s];
-        auto & head  = v_heads[s];
+        auto & cells = planned_cells[s];
+        auto & head  = heads[s];
 
         const auto plan = cells.make_pack_plan();
 
@@ -1227,8 +1266,6 @@ void llama_kv_cache::compact() {
         // ranges are safe without CPU staging. We preflight every buffer before
         // executing any data movement; only after every buffer succeeds do we
         // commit cell metadata.
-        std::map<ggml_backend_buffer_t, std::vector<ggml_backend_tensor_memmove_region>> buffer_moves;
-
         auto add_row_move = [&](ggml_tensor * tensor, const auto & move) {
             const size_t row_bytes  = ggml_row_size(tensor->type, tensor->ne[0]);
             const size_t row_stride = tensor->nb[1];
@@ -1313,25 +1350,27 @@ void llama_kv_cache::compact() {
             }
         }
 
-        for (const auto & [buffer, moves] : buffer_moves) {
-            if (!ggml_backend_tensor_memmove_regions_supported(moves.data(), moves.size())) {
-                throw std::runtime_error(
-                    std::string("TriAttention native compaction is unsupported by KV backend/layout: ") +
-                    (buffer ? ggml_backend_buffer_name(buffer) : "<null>"));
-            }
-        }
-
-        for (const auto & [buffer, moves] : buffer_moves) {
-            GGML_UNUSED(buffer);
-            if (!ggml_backend_tensor_memmove_regions(moves.data(), moves.size())) {
-                throw std::runtime_error("TriAttention native compaction failed after successful preflight");
-            }
-        }
-
-        // Apply metadata changes after all K/V data is moved
+        // This is still a private plan. Finish every allocation and preflight
+        // across ALL streams/backing buffers before moving any live K/V.
         cells.apply_pack(plan);
         head = plan.retained_count;
     }
+
+    for (const auto & [buffer, moves] : buffer_moves) {
+        GGML_UNUSED(buffer);
+        if (!ggml_backend_tensor_memmove_regions_supported(moves.data(), moves.size())) {
+            return false;
+        }
+    }
+    for (const auto & [buffer, moves] : buffer_moves) {
+        GGML_UNUSED(buffer);
+        if (!ggml_backend_tensor_memmove_regions(moves.data(), moves.size())) {
+            throw std::runtime_error("KV native compaction failed after successful preflight");
+        }
+    }
+    v_cells = std::move(planned_cells);
+    v_heads = std::move(heads);
+    return true;
 }
 
 void llama_kv_cache::init_triattention(
@@ -1354,6 +1393,8 @@ void llama_kv_cache::init_triattention(
     cfg.normalize_scores = true;
     cfg.disable_mlr = false;
     cfg.disable_trig = false;
+    cfg.k_hadamard = attn_rot_k_nrot;
+    cfg.uncalibrated_draft_recency = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
 
     const uint32_t head_dim = n_embd_head_k_all > 0 ? (uint32_t) n_embd_head_k_all : hparams.n_embd_head_k(0);
     const uint32_t n_kv_heads = hparams.n_head_kv(0);
@@ -1444,6 +1485,16 @@ void llama_kv_cache::init_triattention(
         tri_scorer.reset();
         throw std::runtime_error(std::string("failed to initialize TriAttention scorer from: ") + stats_path);
     }
+    std::vector<int32_t> layer_map;
+    for (const auto & layer : layers) {
+        layer_map.push_back((int32_t) layer.il);
+    }
+    if (!tri_scorer->matches_layers(layer_map.data(), (uint32_t) layer_map.size())) {
+        if (!cfg.uncalibrated_draft_recency) {
+            throw std::runtime_error("TriAttention calibration covers none of this context's KV layers");
+        }
+        LLAMA_LOG_WARN("%s: nextn draft has no matching calibration; using explicit recent-KV retention on draft only (target still uses TriAttention)\n", __func__);
+    }
 }
 
 llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_reclaim_request & request) {
@@ -1468,10 +1519,10 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
         return result;
     }
 
-    // Unified KV: all sequences share stream 0
-    auto & cells = v_cells[0];
-
-    result.physical_before = cells.get_used();
+    // Evictions are planned against a copy. A rejected pack, invalid scorer,
+    // or allocation failure must not partially delete live sequence refs.
+    auto planned_cells = v_cells;
+    result.physical_before = get_kv_used();
     if (result.physical_before == 0) {
         result.physical_after = 0;
         result.physical_freed = 0;
@@ -1485,18 +1536,24 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
     std::vector<ggml_tensor *> k_tensors(n_kv_layers);
     std::vector<int32_t> layer_map(n_kv_layers);
     for (uint32_t l = 0; l < n_kv_layers; l++) {
-        k_tensors[l] = layers[l].k;
         layer_map[l] = (int32_t) layers[l].il;
     }
 
     std::vector<llama_memory_kv_reclaim_seq_hint> hints = request.seq_hints;
     if (hints.empty()) {
-        llama_memory_kv_reclaim_seq_hint h;
-        h.seq_id = 0;
-        h.logical_tokens = (uint32_t) (cells.seq_pos_max(0) >= 0 ? cells.seq_pos_max(0) + 1 : 0);
-        h.tail_guard = tri_recent_window;
-        h.eligible = true;
-        hints.push_back(h);
+        // The low-level decode retry has no server slot hints. Discover all
+        // resident sequences, not just seq 0 (also works with split streams).
+        for (llama_seq_id seq = 0; (size_t) seq < seq_to_stream.size(); ++seq) {
+            const llama_pos pmax = planned_cells[seq_to_stream[seq]].seq_pos_max(seq);
+            if (pmax >= 0) {
+                llama_memory_kv_reclaim_seq_hint h{};
+                h.seq_id = seq;
+                h.logical_tokens = (uint32_t) pmax + 1;
+                h.tail_guard = tri_recent_window;
+                h.eligible = true;
+                hints.push_back(h);
+            }
+        }
     }
 
     for (const auto & hint : hints) {
@@ -1505,6 +1562,14 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
         }
 
         const llama_seq_id seq_id = hint.seq_id;
+        if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+            throw std::runtime_error("TriAttention: invalid sequence hint");
+        }
+        const uint32_t stream = seq_to_stream[seq_id];
+        auto & cells = planned_cells[stream];
+        for (uint32_t l = 0; l < n_kv_layers; ++l) {
+            k_tensors[l] = layers[l].k_stream[stream];
+        }
         const llama_pos max_pos = cells.seq_pos_max(seq_id);
         if (max_pos < 0) {
             continue;
@@ -1666,20 +1731,34 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
     // Report the final physical shared set, not the number of intermediate
     // seq_rm() calls that happened to leave a cell referenced. This makes the
     // metric directly describe the union that must remain resident.
-    for (uint32_t i = 0; i < cells.size(); ++i) {
-        if (!cells.is_empty(i) && cells.seq_count(i) > 1) {
-            result.shared_keep++;
+    for (const auto & cells : planned_cells) {
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.is_empty(i) && cells.seq_count(i) > 1) {
+                result.shared_keep++;
+            }
         }
+    }
+
+    if (result.references_removed == 0) {
+        result.physical_after = result.physical_before;
+        result.capacity_satisfied = request.required_free == 0;
+        result.floor_reached = true;
+        return result;
     }
 
     // Pack remaining used cells to [0, retained_count)
     const int64_t t_pack_start = ggml_time_us();
-    compact();
+    if (!compact_planned(planned_cells)) {
+        const uint32_t before = result.physical_before;
+        result = {};
+        result.physical_before = result.physical_after = before;
+        return result;
+    }
     result.pack_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_pack_start);
 
-    result.physical_after = cells.get_used();
+    result.physical_after = get_kv_used();
     result.physical_freed = result.physical_before - result.physical_after;
-    result.changed = (result.physical_freed > 0);
+    result.changed = (result.references_removed > 0);
     result.capacity_satisfied = (result.physical_freed >= request.required_free);
     result.floor_reached = true;
 
@@ -2069,8 +2148,6 @@ uint32_t llama_kv_cache::get_n_stream() const {
 }
 
 bool llama_kv_cache::get_has_shift() const {
-    // TurboQuant uses kernel-level WHT rotation -- position shift is a no-op
-    if (!layers.empty() && (layers[0].k->type == GGML_TYPE_TURBO2_0 || layers[0].k->type == GGML_TYPE_TURBO3_0 || layers[0].k->type == GGML_TYPE_TURBO4_0)) { return false; }
     bool result = false;
 
     for (uint32_t s = 0; s < n_stream; ++s) {
@@ -2117,6 +2194,10 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     return v_cells[seq_to_stream[seq_id]];
+}
+
+ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
+    return layers.at(map_layer_ids.at(il)).v;
 }
 
 bool llama_kv_cache::rerot_set_write_tag(
@@ -4114,25 +4195,9 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
     if (attn_rot_k) {
-        // EXPERIMENT (master TODO): force smallest rotation matrix (nrot=64)
-        // for K, mirroring V's choice. Master defaults to the largest power-of-2
-        // that divides head_dim, but the upstream comment hypothesizes smaller
-        // tiles preserve more local structure → less PPL hit on sensitive models
-        // (gemma-4 26B-A4B reportedly regresses with the largest tile).
-        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
-        const char * LLAMA_ATTN_ROT_K_NROT = getenv("LLAMA_ATTN_ROT_K_NROT");
-        int nrot = LLAMA_ATTN_ROT_K_NROT ? atoi(LLAMA_ATTN_ROT_K_NROT) : 64;
-
-        // Original master behavior (largest power-of-2): set LLAMA_ATTN_ROT_K_NROT=0
-        if (nrot == 0) {
-            nrot = 64;
-            do {
-                nrot *= 2;
-            } while (n_embd_head_k_all % nrot == 0);
-            nrot /= 2;
-        }
-
-        res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
+        // Resolved once at cache construction: writer, scorer and K-shift
+        // must all use the same transform even if the environment changes.
+        res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, attn_rot_k_nrot, attn_rot_k_nrot);
         ggml_set_input(res);
         ggml_set_name(res, "attn_inp_k_rot");
     }
@@ -4568,6 +4633,70 @@ size_t llama_kv_cache::size_v_bytes() const {
     }
 
     return size_v_bytes;
+}
+
+void llama_kv_cache::shift_turbo_keys(const llama_cparams & cparams) {
+    // K-shift is infrequent. Use the checked codec for every backend until a
+    // native fused Turbo shift exists. Read/write one layer/stream snapshot,
+    // not one synchronous GPU transfer per cell; leave unshifted bytes alone.
+    for (const auto & layer : layers) {
+        if (!llama_kv_is_turbo(layer.k->type)) {
+            continue;
+        }
+        const uint32_t il = layer.il;
+        const uint32_t hd = hparams.n_embd_head_k(il);
+        const uint32_t storage_hd = ((hd + 127) / 128) * 128;
+        const uint32_t rotary_dim = hparams.n_rot(il);
+        const uint32_t n_heads = hparams.n_head_kv(il);
+        std::vector<float> factors;
+        if (auto * tensor = model.get_rope_factors(cparams, il)) {
+            if (tensor->type != GGML_TYPE_F32 || tensor->ne[0] < rotary_dim / 2) {
+                throw std::runtime_error("Turbo K-shift: invalid RoPE factors");
+            }
+            factors.resize(rotary_dim / 2);
+            ggml_backend_tensor_get(tensor, factors.data(), 0, factors.size() * sizeof(float));
+        }
+        std::vector<float> omega(rotary_dim / 2), scale_sq(rotary_dim / 2);
+        if (!triattention_build_rope_tables(
+                omega.data(), scale_sq.data(), rotary_dim,
+                model.get_rope_freq_base(cparams, il), model.get_rope_freq_scale(cparams, il),
+                (int32_t) cparams.n_ctx_orig_yarn, cparams.yarn_ext_factor,
+                cparams.yarn_attn_factor, cparams.yarn_beta_fast, cparams.yarn_beta_slow,
+                factors.empty() ? nullptr : factors.data())) {
+            throw std::runtime_error("Turbo K-shift: invalid RoPE parameters");
+        }
+        const bool neox = hparams.rope_type != LLAMA_ROPE_TYPE_NORM;
+        const auto * traits = ggml_get_type_traits(layer.k->type);
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            const auto & cells = v_cells[s];
+            if (!cells.get_has_shift()) {
+                continue;
+            }
+            auto * k = layer.k_stream[s];
+            const size_t bytes = ggml_nbytes(k);
+            std::vector<uint8_t> snapshot(bytes);
+            std::vector<float> row(storage_hd * n_heads);
+            ggml_backend_tensor_get(k, snapshot.data(), 0, bytes);
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                const llama_pos delta = cells.get_shift(i);
+                if (cells.is_empty(i) || delta == 0) {
+                    continue;
+                }
+                uint8_t * encoded = snapshot.data() + (size_t) i * k->nb[1];
+                llama_kv_decode_key(k->type, encoded, row.data(), (uint32_t) row.size());
+                for (uint32_t h = 0; h < n_heads; ++h) {
+                    float * key = row.data() + h * storage_hd;
+                    llama_kv_hadamard(key, hd, attn_rot_k_nrot);
+                    const uint32_t rope_offset = hparams.n_lora_kv > 0 ? hd - rotary_dim : 0;
+                    llama_kv_shift_key(key + rope_offset, rotary_dim, neox, omega.data(), delta);
+                    llama_kv_hadamard(key, hd, attn_rot_k_nrot);
+                }
+                // from_float_ref performs the forward Turbo WHT itself.
+                traits->from_float_ref(row.data(), encoded, (int64_t) row.size());
+            }
+            ggml_backend_tensor_set(k, snapshot.data(), 0, bytes);
+        }
+    }
 }
 
 ggml_tensor * llama_kv_cache::build_rope_shift(

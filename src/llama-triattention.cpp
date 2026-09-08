@@ -11,6 +11,7 @@
 // Trigonometric Key Cache Eviction for Long-Context LLM Inference" (2604.04921)
 
 #include "llama-triattention.h"
+#include "llama-kv-transform.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -58,7 +59,6 @@ extern "C" {
     void dequantize_row_turbo2_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
     void dequantize_row_turbo3_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
     void dequantize_row_turbo4_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
-    GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size);
 }
 
 // Standard ggml dequant for Q8_0, F16, etc.
@@ -686,13 +686,14 @@ static void triattention_dequant_kv_head(
     }
 
     const size_t span_rows  = (size_t)cell_max - cell_min + 1;
-    const size_t span_bytes = span_rows * row_bytes;
+    const size_t row_stride = k_tensor->nb[1];
+    const size_t span_bytes = (span_rows - 1) * row_stride + row_bytes;
     std::vector<uint8_t> quant_span(span_bytes);
 
     ggml_backend_tensor_get(
         k_tensor,
         quant_span.data(),
-        (size_t)cell_min * row_bytes,
+        (size_t)cell_min * row_stride,
         span_bytes);
 
     // Temporary buffer for dequantized values (before WHT inverse)
@@ -703,7 +704,7 @@ static void triattention_dequant_kv_head(
 
         // Byte offset inside the single bulk read above. This addresses stream
         // 0 (the common case for unified KV caches).
-        const size_t span_offset = ((size_t)cell_idx - cell_min) * row_bytes + head_offset_bytes;
+        const size_t span_offset = ((size_t)cell_idx - cell_min) * row_stride + head_offset_bytes;
         const uint8_t * quant_src = quant_span.data() + span_offset;
 
         // Dequantize based on type
@@ -741,9 +742,8 @@ static void triattention_dequant_kv_head(
                 break;
             }
             default:
-                fprintf(stderr, "[TriAttention] ERROR: unsupported K cache type %d\n", k_type);
-                memset(out + (size_t)ci * padded_hd, 0, padded_hd * sizeof(float));
-                continue;
+                llama_kv_decode_key(k_type, quant_src, dst, padded_hd);
+                break;
         }
 
         // Restore post-RoPE K before applying inverse RoPE.
@@ -811,9 +811,8 @@ static void triattention_dequant_kv_head_from_rows(
                 memcpy(dst, src, padded_hd * sizeof(float));
                 break;
             default:
-                fprintf(stderr, "[TriAttention] ERROR: unsupported K cache type %d\n", k_type);
-                memset(out + (size_t) ci * padded_hd, 0, padded_hd * sizeof(float));
-                continue;
+                llama_kv_decode_key(k_type, src, dst, padded_hd);
+                break;
         }
 
         if (need_wht_inv) {
@@ -867,6 +866,12 @@ struct triattention_scorer::impl {
     // Get or create GPU state for a specific (device, k_type) combination.
     // Returns nullptr if initialization fails.
     triattention_gpu_state * get_gpu_state(int device_id, ggml_type k_type) {
+        // Unsupported CUDA scorer combinations use the checked host decoder.
+        if (cfg.k_hadamard != 0 ||
+            (k_type != GGML_TYPE_F32 && k_type != GGML_TYPE_F16 &&
+             k_type != GGML_TYPE_Q8_0 && !llama_kv_is_turbo(k_type))) {
+            return nullptr;
+        }
         const bool need_wht_inv = triattention_needs_inverse_wht(k_type);
         if (need_wht_inv && (cal->head_dim != 128 || cal->rotary_dim != cal->head_dim)) {
             // The current CUDA scorer can cooperatively invert exactly one
@@ -1001,6 +1006,11 @@ triattention_scorer::triattention_scorer(
 
     pimpl->cal = cal;
 
+    if (cfg.k_hadamard != 0 &&
+        ((cfg.k_hadamard & (cfg.k_hadamard - 1)) != 0 || head_dim % cfg.k_hadamard != 0)) {
+        throw std::runtime_error("TriAttention: invalid K attention rotation tile");
+    }
+
     const uint32_t fc = cal->freq_count;
 
     // Build precomputed arrays
@@ -1035,6 +1045,20 @@ triattention_scorer::~triattention_scorer() = default;
 
 bool triattention_scorer::valid() const {
     return pimpl && pimpl->is_valid;
+}
+
+bool triattention_scorer::matches_layers(const int32_t * layer_map, uint32_t n_layers) const {
+    if (!valid()) {
+        return false;
+    }
+    for (uint32_t i = 0; i < n_layers; ++i) {
+        for (uint32_t sh = 0; sh < pimpl->cal->n_sampled; ++sh) {
+            if (layer_map[i] == (int32_t) pimpl->cal->sampled_layer[sh]) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 void triattention_scorer::score_head(
@@ -1108,7 +1132,7 @@ void triattention_scorer::score_sampled_head(
     const auto * cal = pimpl->cal;
     const uint32_t fc = cal->freq_count;
     const uint32_t hd = cal->head_dim;
-    const uint32_t padded_hd = ((hd + 127) / 128) * 128;
+    const uint32_t padded_hd = llama_kv_is_turbo(k_tensor->type) ? ((hd + 127) / 128) * 128 : hd;
 
     const ggml_type k_type = k_tensor->type;
     const bool need_wht_inv = triattention_needs_inverse_wht(k_type);
@@ -1196,6 +1220,10 @@ void triattention_scorer::score_sampled_head(
         cal->num_kv_heads,
         need_wht_inv);
 
+    for (uint32_t i = 0; i < n_candidates; ++i) {
+        llama_kv_hadamard(dequant_buf.data() + (size_t) i * padded_hd, hd, pimpl->cfg.k_hadamard);
+    }
+
     // 2. Invert RoPE -> pre-RoPE K (output in half layout)
     std::vector<float> unrot_buf((size_t)n_candidates * padded_hd);
     triattention_invert_rope(
@@ -1248,6 +1276,16 @@ void triattention_scorer::score_combined(
     const auto * cal = pimpl->cal;
     const uint32_t fc = cal->freq_count;
     const uint32_t hd = cal->head_dim;
+
+    if (!matches_layers(layer_map, n_kv_layers)) {
+        if (!pimpl->cfg.uncalibrated_draft_recency) {
+            throw std::runtime_error("TriAttention: calibration covers none of the resident KV layers");
+        }
+        for (uint32_t i = 0; i < n_candidates; ++i) {
+            combined[i] = (float) ((int64_t) positions[i] - frontier_position);
+        }
+        return;
+    }
 
     std::fill(combined, combined + n_candidates, -1e30f);
 
@@ -1321,13 +1359,12 @@ void triattention_scorer::score_combined(
                                 k_type == GGML_TYPE_TURBO4_0;
         const bool need_wht_inv = triattention_needs_inverse_wht(k_type);
         const uint32_t storage_hd = k_is_turbo ? ((hd + 127) / 128) * 128 : hd;
-        const size_t row_bytes = ggml_row_size(k_type, k_tensor->ne[0]);
+        const size_t row_bytes = k_tensor->nb[1];
         const uint32_t max_cell = *std::max_element(cell_indices, cell_indices + n_candidates);
-        const size_t snapshot_bytes = ((size_t) max_cell + 1) * row_bytes;
+        const size_t snapshot_bytes = (size_t) max_cell * row_bytes + ggml_row_size(k_type, k_tensor->ne[0]);
 
         if (snapshot_bytes > ggml_nbytes(k_tensor)) {
-            fprintf(stderr, "[TriAttention] ERROR: K snapshot exceeds tensor bounds for layer %d\n", model_layer);
-            continue;
+            throw std::runtime_error("TriAttention: K snapshot exceeds tensor bounds");
         }
 
         std::vector<uint8_t> snapshot;
@@ -1352,6 +1389,9 @@ void triattention_scorer::score_combined(
             triattention_dequant_kv_head_from_rows(
                 dequant_buf.data(), rows, row_bytes, k_type, cell_indices,
                 kv_head, n_candidates, storage_hd, need_wht_inv);
+            for (uint32_t i = 0; i < n_candidates; ++i) {
+                llama_kv_hadamard(dequant_buf.data() + (size_t) i * storage_hd, hd, pimpl->cfg.k_hadamard);
+            }
             triattention_invert_rope(
                 unrot_buf.data(), dequant_buf.data(), positions, pimpl->omega,
                 pimpl->freq_scale_sq,
@@ -1408,7 +1448,7 @@ void triattention_scorer::score_combined(
         }
     }
     if (!any_valid) {
-        memset(combined, 0, n_candidates * sizeof(float));
+        throw std::runtime_error("TriAttention: no valid K scores; refusing lossy reclaim");
     }
 }
 

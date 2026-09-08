@@ -159,7 +159,7 @@ struct llama_memory_kv_reclaim_request {
 // Result of KV reclaim
 struct llama_memory_kv_reclaim_result {
     bool     supported = false;       // false if memory type doesn't support reclaim
-    bool     changed = false;         // true if any cells were freed
+    bool     changed = false;         // true if any seq refs/layout changed, even if another seq retains the cells
     bool     capacity_satisfied = false; // true if required_free was met
     bool     floor_reached = false;   // true if all eligible seqs are at policy floor
     uint32_t physical_before = 0;     // physical cells used before reclaim

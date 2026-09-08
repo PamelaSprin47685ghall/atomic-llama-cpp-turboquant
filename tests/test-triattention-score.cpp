@@ -56,6 +56,7 @@ struct mock_calib_params {
     uint32_t rope_style     = 0;  // half
     uint32_t n_sampled      = 2;
     uint32_t freq_count     = 64;
+    uint32_t rotary_dim     = 0;
     const char * model_name = "test_model";
 };
 
@@ -78,7 +79,7 @@ static void write_mock_calib(const char * path, const mock_calib_params & p) {
     fwrite(&p.n_sampled, sizeof(uint32_t), 1, f);
     fwrite(&p.freq_count, sizeof(uint32_t), 1, f);
     // v2: rotary_dim = head_dim (full RoPE for test model)
-    uint32_t rotary_dim = p.head_dim;
+    uint32_t rotary_dim = p.rotary_dim ? p.rotary_dim : p.head_dim;
     fwrite(&rotary_dim, sizeof(uint32_t), 1, f);
 
     // Model name (null-terminated, name_len includes the null)
@@ -1022,10 +1023,109 @@ static void test_tri_policy() {
     fprintf(stderr, "  PASSED\n");
 }
 
+// Independent dense Hadamard oracle, not the production butterfly.
+static void dense_hadamard(std::vector<float> & values, uint32_t hd, uint32_t tile) {
+    if (!tile) { return; }
+    const auto input = values;
+    for (uint32_t off = 0; off < hd; off += tile) {
+        for (uint32_t i = 0; i < tile; ++i) {
+            double sum = 0;
+            for (uint32_t j = 0; j < tile; ++j) {
+                uint32_t bits = i & j, parity = 0;
+                while (bits) { parity ^= bits & 1; bits >>= 1; }
+                sum += (parity ? -1.0 : 1.0) * input[off + j];
+            }
+            values[off + i] = (float) (sum / std::sqrt((double) tile));
+        }
+    }
+}
+
+static void test_storage_and_extra_rotation() {
+    const char * path = "test-triattention-storage-coop.triattention";
+    constexpr uint32_t n = 7;
+    uint32_t cells[n] = {0, 1, 2, 3, 4, 5, 6};
+    int32_t positions[n] = {0, 1, 13, 96, 200, 511, 2048};
+    for (uint32_t hd : {64u, 128u, 192u, 256u}) {
+        for (uint32_t tile : {0u, 64u, 128u}) {
+            if (tile && hd % tile) { continue; }
+            mock_calib_params p;
+            p.head_dim = hd;
+            p.rotary_dim = 64; // also cover partial RoPE and Turbo head padding
+            p.freq_count = 32;
+            p.num_layers = p.num_attn_heads = p.num_kv_heads = p.n_sampled = 1;
+            write_mock_calib(path, p);
+            triattention_scorer_config cfg;
+            cfg.normalize_scores = false;
+            triattention_scorer reference_scorer(path, cfg, p.rope_theta, hd, 1);
+            cfg.k_hadamard = tile;
+            triattention_scorer scorer(path, cfg, p.rope_theta, hd, 1);
+            for (auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+                              GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+                const bool turbo = type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+                const uint32_t storage_hd = turbo ? (hd + 127) / 128 * 128 : hd;
+                auto mtc = make_mock_tensor_ctx(1024 * 1024);
+                auto * quant = ggml_new_tensor_2d(mtc.ctx, type, storage_hd, n);
+                auto * reference = make_k_tensor(mtc, 1, hd, n);
+                alloc_mock_tensors(mtc);
+                const auto * traits = ggml_get_type_traits(type);
+                std::vector<uint8_t> encoded(ggml_row_size(type, storage_hd));
+                for (uint32_t cell = 0; cell < n; ++cell) {
+                    std::vector<float> input(storage_hd, 0), restored(storage_hd);
+                    for (uint32_t d = 0; d < hd; ++d) {
+                        input[d] = std::sin((d + 1) * (cell + 3) * .071f) * (cell + 1);
+                    }
+                    dense_hadamard(input, hd, tile);
+                    traits->from_float_ref(input.data(), encoded.data(), storage_hd);
+                    traits->to_float(encoded.data(), restored.data(), storage_hd);
+                    if (turbo) {
+                        const auto rotated = restored;
+                        for (uint32_t off = 0; off < storage_hd; off += 128) {
+                            for (uint32_t i = 0; i < 128; ++i) {
+                                double sum = 0;
+                                for (uint32_t j = 0; j < 128; ++j) {
+                                    sum += (double) TURBO_ROTATION_RT[i * 128 + j] * rotated[off + j];
+                                }
+                                restored[off + i] = (float) sum;
+                            }
+                        }
+                    }
+                    dense_hadamard(restored, hd, tile);
+                    ggml_backend_tensor_set(quant, encoded.data(), cell * encoded.size(), encoded.size());
+                    write_k_cell(reference, cell, 0, hd, restored.data());
+                }
+                float expected[n], single[n], combined[n];
+                reference_scorer.score_head(expected, reference, cells, positions, 0, n, 4096);
+                scorer.score_head(single, quant, cells, positions, 0, n, 4096);
+                ggml_tensor * tensors[] = {quant};
+                int32_t layers[] = {0};
+                scorer.score_combined(combined, tensors, 1, layers, cells, positions, n, 4096);
+                for (uint32_t i = 0; i < n; ++i) {
+                    const float tolerance = 3e-4f * std::max(1.f, std::fabs(expected[i]));
+                    TEST_ASSERT(std::fabs(single[i] - expected[i]) < tolerance);
+                    TEST_ASSERT(std::fabs(combined[i] - expected[i]) < tolerance);
+                }
+                layers[0] = 99; // nextn layer absent from the target calibration
+                bool rejected = false;
+                try { scorer.score_combined(combined, tensors, 1, layers, cells, positions, n, 4096); }
+                catch (const std::runtime_error &) { rejected = true; }
+                TEST_ASSERT(rejected);
+                cfg.uncalibrated_draft_recency = true;
+                triattention_scorer draft(path, cfg, p.rope_theta, hd, 1);
+                draft.score_combined(combined, tensors, 1, layers, cells, positions, n, 4096);
+                for (uint32_t i = 1; i < n; ++i) { TEST_ASSERT(combined[i] > combined[i - 1]); }
+                free_mock_tensor_ctx(mtc);
+            }
+        }
+    }
+    remove(path);
+    fprintf(stderr, "test_storage_and_extra_rotation PASSED\n");
+}
+
 int main() {
     fprintf(stderr, "=== TriAttention Scorer Tests ===\n\n");
 
     test_collector_model_geometry();
+    test_storage_and_extra_rotation();
     test_turbo_scores_match_storage_oracle();
     test_calibration_loading();
     test_rope_inversion();
