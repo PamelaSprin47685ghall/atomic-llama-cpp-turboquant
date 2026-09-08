@@ -2761,6 +2761,7 @@ static void test_final_fence_user_grammar_restoration() {
 
     std::vector<uint32_t> ordered_runs;
     CHECK(runtime.refresh_final_fence(ep, 2, &ordered_runs));
+    replay_final_fence(runtime, ep, 2);
     CHECK(runtime.complete_serial_tail(ep, 2));
     const auto * ep_ptr = runtime.episode(ep);
     CHECK(ep_ptr != nullptr && ep_ptr->serial_tail && ep_ptr->serial_node == 2);

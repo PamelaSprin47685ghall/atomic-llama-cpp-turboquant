@@ -292,6 +292,7 @@ public:
     struct rbb_group_input {
         int32_t brain_row = -1;
         ggml_tensor * public_rows = nullptr; // I32 [n_public_rows]
+        ggml_tensor * default_shared_rows = nullptr; // I32 [n_non_child_public_rows], nullable
     };
     std::vector<rbb_group_input> rbb_groups;
 
