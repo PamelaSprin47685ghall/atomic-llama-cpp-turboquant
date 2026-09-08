@@ -376,6 +376,9 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(saved["status"], "failed")
         self.assertIn("runtime commit", saved["error"])
         self.assertIn("908169007", saved["error"])
+        self.assertEqual(saved["config"], {
+            "name": "baseline", "ctx": 8192, "batch": 256, "ubatch": 256,
+            "k": "turbo4", "v": "turbo2"})
         model.assert_not_called()
         process.assert_not_called()
 

@@ -311,6 +311,7 @@ def model_fingerprint(path):
 
 @contextlib.contextmanager
 def server(args, config, result):
+    result["config"] = config
     env = dict(os.environ, LD_LIBRARY_PATH=str(args.server.resolve().parent),
                TURBO_AUTO_ASYMMETRIC="0")
     env.update(config.get("env", {}))
@@ -334,7 +335,6 @@ def server(args, config, result):
     if config.get("require_flashprefill_plan", False):
         command.append("--metrics")
     result["command"] = ["<ephemeral-key>" if v == key else v for v in command]
-    result["config"] = config
     stop = threading.Event()
     samples = []
     errors = []
