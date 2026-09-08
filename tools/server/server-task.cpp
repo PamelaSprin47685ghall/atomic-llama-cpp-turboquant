@@ -607,6 +607,12 @@ common_chat_msg task_result_state::update_rerot_msg(
     if (new_msg.role.empty()) {
         new_msg.role = "assistant";
     }
+    // If the parser does not understand or extract </think>, strip the artificial prefix
+    if (new_msg.content.rfind("</think>\n", 0) == 0) {
+        new_msg.content.erase(0, 9);
+    } else if (new_msg.content.rfind("</think>", 0) == 0) {
+        new_msg.content.erase(0, 8);
+    }
     new_msg.reasoning_content.insert(0, reasoning);
     new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
     chat_msg = std::move(new_msg);
@@ -846,12 +852,12 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
 json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     std::string finish_reason = "length";
     common_chat_msg msg;
-    if (rerot_explicit_channels) {
+    if (!oaicompat_msg.empty()) {
+        msg = oaicompat_msg;
+    } else if (rerot_explicit_channels) {
         msg.role = "assistant";
         msg.content = content;
         msg.reasoning_content = rerot_reasoning;
-    } else if (!oaicompat_msg.empty()) {
-        msg = oaicompat_msg;
     } else {
         msg.role = "assistant";
         msg.content = content;
@@ -963,12 +969,12 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
 
 json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     common_chat_msg msg;
-    if (rerot_explicit_channels) {
+    if (!oaicompat_msg.empty()) {
+        msg = oaicompat_msg;
+    } else if (rerot_explicit_channels) {
         msg.role = "assistant";
         msg.content = content;
         msg.reasoning_content = rerot_reasoning;
-    } else if (!oaicompat_msg.empty()) {
-        msg = oaicompat_msg;
     } else {
         msg.role = "assistant";
         msg.content = content;
@@ -1177,12 +1183,12 @@ json server_task_result_cmpl_final::to_json_anthropic() {
     json content_blocks = json::array();
 
     common_chat_msg msg;
-    if (rerot_explicit_channels) {
+    if (!oaicompat_msg.empty()) {
+        msg = oaicompat_msg;
+    } else if (rerot_explicit_channels) {
         msg.role = "assistant";
         msg.content = content;
         msg.reasoning_content = rerot_reasoning;
-    } else if (!oaicompat_msg.empty()) {
-        msg = oaicompat_msg;
     } else {
         msg.role = "assistant";
         msg.content = content;

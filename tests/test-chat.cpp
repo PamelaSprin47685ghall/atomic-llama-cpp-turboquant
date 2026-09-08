@@ -7347,6 +7347,29 @@ static void test_rerot_stream_preserves_tool_calls() {
     }
 }
 
+static void test_rerot_nonstream_content_reasoning_clean() {
+    common_chat_parser_params parser_params;
+    parser_params.format = COMMON_CHAT_FORMAT_CONTENT_ONLY;
+    parser_params.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    task_result_state state(parser_params);
+
+    server_task_result_cmpl_final final;
+    final.stream = false;
+    final.rerot_explicit_channels = true;
+    final.rerot_reasoning = "<ol>\n<li>task 1</li>\n</ol>";
+    final.content = "9.9 更大。\n理由：比较十分位。";
+    final.res_type = TASK_RESPONSE_TYPE_OAI_CHAT;
+    final.update(state);
+
+    json res = final.to_json_oaicompat_chat();
+    const auto & choice = res["choices"][0];
+    const auto & msg = choice["message"];
+
+    assert_equals(std::string("9.9 更大。\n理由：比较十分位。"), msg["content"].get<std::string>());
+    assert_equals(std::string("<ol>\n<li>task 1</li>\n</ol>"), msg["reasoning_content"].get<std::string>());
+    assert_not_contains(msg["content"].get<std::string>(), "</think>");
+}
+
 static void test_msg_diffs_compute() {
     LOG_DBG("%s\n", __func__);
     {
@@ -7498,6 +7521,7 @@ int main(int argc, char ** argv) {
 #endif
     {
         test_rerot_stream_preserves_tool_calls();
+        test_rerot_nonstream_content_reasoning_clean();
         test_msg_diffs_compute();
         test_msgs_oaicompat_json_conversion();
         test_msg_token_delimiters_split();
