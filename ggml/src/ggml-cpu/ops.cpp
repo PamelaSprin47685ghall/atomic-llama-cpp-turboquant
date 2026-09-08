@@ -10,6 +10,7 @@
 #include "vec.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <cmath>
 
@@ -529,6 +530,42 @@ void ggml_compute_forward_dup(
         ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
+
+    static std::atomic<int64_t> sc_cpy_seq{0};
+
+    // StateCarryFix: safe host scan of the state-commit copy/dup SRC at compute
+    // time. Identifies whether new_state (fused GDN output view, F32) is
+    // already NaN before being copied to ssm_states_all. Targets only the
+    // recurrent state dimension (nelements == 16384 * n_seqs).
+    if (params->ith == 0 && src0 && src0->data && src0->type == GGML_TYPE_F32 &&
+        ggml_nelements(src0) >= 16384) {
+        int64_t sc_bad = 0, sc_first = -1;
+        const int64_t ne0 = src0->ne[0], ne1 = src0->ne[1], ne2 = src0->ne[2], ne3 = src0->ne[3];
+        const size_t nb0 = src0->nb[0], nb1 = src0->nb[1], nb2 = src0->nb[2], nb3 = src0->nb[3];
+        for (int64_t i3 = 0; i3 < ne3; ++i3) {
+            for (int64_t i2 = 0; i2 < ne2; ++i2) {
+                for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                    const float * row = (const float *) ((const char *) src0->data + i1*nb1 + i2*nb2 + i3*nb3);
+                    for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                        if (!std::isfinite(row[i0])) {
+                            if (sc_bad == 0) sc_first = i0 + i1*ne0 + i2*ne0*ne1 + i3*ne0*ne1*ne2;
+                            ++sc_bad;
+                        }
+                    }
+                }
+            }
+        }
+        static int sc_cpy_log = 0;
+        if (sc_bad > 0 || sc_cpy_log++ < 10) {
+            fprintf(stderr, "[statecarry] cpy-compute seq=%lld: src ne=[%lld,%lld,%lld,%lld] dst ne=[%lld,%lld,%lld,%lld] %lld/%lld non-finite (first %lld) src_type=%s dst_type=%s op=%s src=%p dst=%p\n",
+                (long long) sc_cpy_seq.fetch_add(1),
+                (long long) ne0, (long long) ne1, (long long) ne2, (long long) ne3,
+                (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+                (long long) sc_bad, (long long) ggml_nelements(src0), (long long) sc_first,
+                ggml_type_name(src0->type), ggml_type_name(dst->type), ggml_op_name(dst->op),
+                (const void *) src0->data, (void *) dst->data);
+        }
+    }
 
     if (src0->type == dst->type) {
         ggml_compute_forward_dup_bytes(params, dst);
@@ -11048,6 +11085,16 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     float * attn_out_base  = (float *)dst->data;
     float * state_out_base = (float *)dst->data + attn_score_elems;
 
+    // Unconditional entry trace: logs result pointer + state region offset
+    // in floats for order/aliasing matching against cpy-compute.
+    {
+        static int sc_gdn_exec_log = 0;
+        if (sc_gdn_exec_log++ < 200) {
+            fprintf(stderr, "[gdn-exec] n_tokens=%lld result=%p state_off=%ld\n",
+                (long long) n_tokens, (const void *) dst->data, (long) (state_out_base - (float *) dst->data));
+        }
+    }
+
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
 
@@ -11113,8 +11160,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             const float * g_d    =  (const float *)((const char *)src_g->data    + iv3 * nbg3 + t * nbg2 + iv1 * nbg1);
 
             // Per-row finiteness probe on all input tokens (rate-limited).
-            static int gdn_nan_log = 0;
-            if ((!std::isfinite(beta_val) || !std::isfinite(g_d[0]) || !std::isfinite(q_d[0]) || !std::isfinite(k_d[0]) || !std::isfinite(v_d[0])) && gdn_nan_log++ < 10) {
+            if (!std::isfinite(beta_val) || !std::isfinite(g_d[0]) || !std::isfinite(q_d[0]) || !std::isfinite(k_d[0]) || !std::isfinite(v_d[0])) {
                 fprintf(stderr, "[fused_gdn] NON-FINITE INPUT at token %lld head %lld seq %lld: beta=%f g[0]=%f q[0]=%f k[0]=%f v[0]=%f\n",
                     (long long)t, (long long)iv1, (long long)iv3, beta_val, g_d[0], q_d[0], k_d[0], v_d[0]);
             }
@@ -11196,18 +11242,15 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
                         if (!std::isfinite(g_d[di])) ++g_bad;
                     }
                     const int is_carry = s_prev_finite ? 0 : 1;
-                    static int sg_log_38 = 0, sg_log_04 = 0, sg_log_xx = 0;
-                    int * budget = n_tokens == 38 ? &sg_log_38 : (n_tokens == 4 ? &sg_log_04 : &sg_log_xx);
-                    if (*budget < 128) {
-                        (*budget)++;
-                        fprintf(stderr, "[fused_gdn] STATE-NAN %s at token %lld (n_tokens=%lld, head=%lld, seq=%lld): %lld/%lld state elems non-finite; inputs beta=%f(%s) q_bad=%lld k_bad=%lld v_bad=%lld g_bad=%lld/%lld s_in_finite=%d\n",
-                            is_carry ? "carry-in" : "genesis",
-                            (long long)t, (long long)n_tokens, (long long)iv1, (long long)iv3,
-                            (long long)sg_bad, (long long)(S_v * S_v),
-                            beta_val, std::isfinite(beta_val) ? "ok" : "BAD",
-                            (long long)q_bad, (long long)k_bad, (long long)v_bad, (long long)g_bad, (long long)ng,
-                            (int)s_prev_finite);
-                    }
+                    // UNLIMITED: fires exactly once per (head, seq) per call
+                    // via s_genesis_reported, so at most H*n_seqs lines.
+                    fprintf(stderr, "[fused_gdn] STATE-NAN %s at token %lld (n_tokens=%lld, head=%lld, seq=%lld): %lld/%lld state elems non-finite; inputs beta=%f(%s) q_bad=%lld k_bad=%lld v_bad=%lld g_bad=%lld/%lld s_in_finite=%d\n",
+                        is_carry ? "carry-in" : "genesis",
+                        (long long)t, (long long)n_tokens, (long long)iv1, (long long)iv3,
+                        (long long)sg_bad, (long long)(S_v * S_v),
+                        beta_val, std::isfinite(beta_val) ? "ok" : "BAD",
+                        (long long)q_bad, (long long)k_bad, (long long)v_bad, (long long)g_bad, (long long)ng,
+                        (int)s_prev_finite);
                     s_genesis_reported = true;
                 } else {
                     s_prev_finite = true;

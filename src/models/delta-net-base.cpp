@@ -304,6 +304,13 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     s = ggml_reshape_4d(ctx0, s, S_v, S_v, H_v, n_seqs);
     cb(s, "output_state", il);
 
+    LLAMA_LOG_ERROR("[chunk-tail] il=%d n_tokens=%lld CS=%d kda=%d pad=%d n_chunks=%d o=[%lld,%lld,%lld,%lld] o_nb=[%zu,%zu,%zu,%zu] s=[%lld,%lld,%lld,%lld] vdim1=%lld\n",
+        il, (long long) n_tokens, CS, (int) kda, pad, n_chunks,
+        (long long) o->ne[0], (long long) o->ne[1], (long long) o->ne[2], (long long) o->ne[3],
+        o->nb[0], o->nb[1], o->nb[2], o->nb[3],
+        (long long) s->ne[0], (long long) s->ne[1], (long long) s->ne[2], (long long) s->ne[3],
+        (long long) v->ne[1]);
+
     return {o, s};
 }
 
@@ -515,6 +522,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         int           il) {
     const int64_t n_seq_tokens = q->ne[2];
 
+    LLAMA_LOG_ERROR("[gdn-dispatch] il=%d n_seq_tokens=%lld fused_ar=%d fused_ch=%d -> %s\n",
+        il, (long long) n_seq_tokens, (int) cparams.fused_gdn_ar, (int) cparams.fused_gdn_ch,
+        n_seq_tokens == 1 ? (cparams.fused_gdn_ar ? "FUSED-AR" : "AUTOREG") : (cparams.fused_gdn_ch ? "FUSED-CH" : "CHUNKING"));
+
     if (n_seq_tokens == 1) {
         if (cparams.fused_gdn_ar) {
             return build_delta_net_fused(q, k, v, g, b, s, il);
@@ -720,11 +731,14 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     // at set_input time instead (see [statecarry] set_input line).
     const int64_t K_log = keep ? (int64_t) cparams.n_rs_seq + 1 : -1;
     const int64_t n_written_log = keep ? std::min<int64_t>(n_seq_tokens, K_log) : -1;
-    LLAMA_LOG_ERROR("[statecarry] build_recurrent_attn il=%d n_seq_tokens=%lld n_seqs=%lld keep=%d K=%lld n_written=%lld kv_head=%u n_rs=%u rs_z=%d s_copy_ne=%lld\n",
+    LLAMA_LOG_ERROR("[statecarry] build_recurrent_attn il=%d n_seq_tokens=%lld n_seqs=%lld keep=%d K=%lld n_written=%lld kv_head=%u n_rs=%u rs_z=%d s_copy_ne=%lld s_shared=%d ssm=%p hand=%p\n",
         il, (long long) n_seq_tokens, (long long) n_seqs, (int) keep,
         (long long) K_log, (long long) n_written_log, (unsigned) kv_head,
         (unsigned) mctx_cur->get_n_rs(), (int) mctx_cur->get_rs_z(),
-        (long long) (inp && inp->s_copy ? inp->s_copy->ne[0] : -1));
+        (long long) (inp && inp->s_copy ? inp->s_copy->ne[0] : -1),
+        (int) mctx_cur->is_s_shared(il),
+        (const void *) (ssm_states_all ? ssm_states_all->data : nullptr),
+        (const void *) (hand_echo_all ? hand_echo_all->data : nullptr));
 
     // Exact trained recurrence is the default for every child row, regardless
     // of what the scheduler co-batches beside it. DDVR is already the

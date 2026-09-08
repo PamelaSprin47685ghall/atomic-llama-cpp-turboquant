@@ -1338,6 +1338,8 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_gdn_ch_probe, cparams.fused_gdn_ch);
         cparams.auto_fgdn = false;
     }
+    LLAMA_LOG_ERROR("[gdn-resolve] final fused_gdn_ar=%d fused_gdn_ch=%d\n",
+        (int) cparams.fused_gdn_ar, (int) cparams.fused_gdn_ch);
 
     if (cparams.auto_flid) {
         LLAMA_LOG_INFO("%s: resolving fused Lightning Indexer support:\n", func);
