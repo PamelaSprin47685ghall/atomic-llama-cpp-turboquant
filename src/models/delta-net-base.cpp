@@ -725,20 +725,6 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_seq_tokens = q->ne[2];
 
     const bool keep = cparams.n_rs_seq > 0;
-    // StateCarryFix instrumented run: per-ubatch-per-layer carry geometry.
-    // NOTE: s_copy values are deliberately NOT read here — s_copy() resets
-    // rollback selectors (llama-memory-recurrent.cpp), so values are logged
-    // at set_input time instead (see [statecarry] set_input line).
-    const int64_t K_log = keep ? (int64_t) cparams.n_rs_seq + 1 : -1;
-    const int64_t n_written_log = keep ? std::min<int64_t>(n_seq_tokens, K_log) : -1;
-    LLAMA_LOG_ERROR("[statecarry] build_recurrent_attn il=%d n_seq_tokens=%lld n_seqs=%lld keep=%d K=%lld n_written=%lld kv_head=%u n_rs=%u rs_z=%d s_copy_ne=%lld s_shared=%d ssm=%p hand=%p\n",
-        il, (long long) n_seq_tokens, (long long) n_seqs, (int) keep,
-        (long long) K_log, (long long) n_written_log, (unsigned) kv_head,
-        (unsigned) mctx_cur->get_n_rs(), (int) mctx_cur->get_rs_z(),
-        (long long) (inp && inp->s_copy ? inp->s_copy->ne[0] : -1),
-        (int) mctx_cur->is_s_shared(il),
-        (const void *) (ssm_states_all ? ssm_states_all->data : nullptr),
-        (const void *) (hand_echo_all ? hand_echo_all->data : nullptr));
 
     // Exact trained recurrence is the default for every child row, regardless
     // of what the scheduler co-batches beside it. DDVR is already the
@@ -921,17 +907,6 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
                 const uint8_t * sc_expect = sc_base ? sc_base + (size_t) kv_head * (size_t) hparams.n_embd_s() * sc_elt : nullptr;
                 ggml_tensor * sc_cpy = ggml_cpy(ctx0, new_state, sc_dst_nk);
                 ggml_build_forward_expand(gf, sc_cpy);
-                bool sc_in = false;
-                for (int sc_i = 0, sc_nn = ggml_graph_n_nodes(gf); sc_i < sc_nn; ++sc_i) {
-                    if (ggml_graph_node(gf, sc_i) == sc_cpy) { sc_in = true; break; }
-                }
-                LLAMA_LOG_ERROR("[statecarry] nokeep-commit il=%d new_ne=[%lld,%lld,%lld,%lld] embd_s=%lld n_seqs=%lld kv_head=%u nelem_match=%d dst_match=%d in_graph=%d\n",
-                    il,
-                    (long long) new_state->ne[0], (long long) new_state->ne[1],
-                    (long long) new_state->ne[2], (long long) new_state->ne[3],
-                    (long long) hparams.n_embd_s(), (long long) n_seqs, (unsigned) kv_head,
-                    (int) (ggml_nelements(new_state) == ggml_nelements(sc_dst_nk)),
-                    (int) (sc_base && sc_dst_nk->data && sc_dst_nk->data == sc_expect), (int) sc_in);
             }
         }
 
@@ -1025,15 +1000,6 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             const uint8_t * sc_expect = sc_base ? sc_base + (size_t) kv_head * (size_t) D * sc_elt : nullptr;
             ggml_tensor * sc_cpy = ggml_cpy(ctx0, src, dst);
             ggml_build_forward_expand(gf, sc_cpy);
-            bool sc_in = false;
-            for (int sc_i = 0, sc_nn = ggml_graph_n_nodes(gf); sc_i < sc_nn; ++sc_i) {
-                if (ggml_graph_node(gf, sc_i) == sc_cpy) { sc_in = true; break; }
-            }
-            LLAMA_LOG_ERROR("[statecarry] keep-commit il=%d D=%lld embd_s=%lld n_written=%lld kv_head=%u dst_match=%d in_graph=%d src_off=%lld expect_src_off=%lld\n",
-                il, (long long) D, (long long) hparams.n_embd_s(), (long long) n_written, (unsigned) kv_head,
-                (int) (sc_base && dst->data && dst->data == sc_expect), (int) sc_in,
-                (long long) (src->data && gdn_out->data ? (const uint8_t *) src->data - (const uint8_t *) gdn_out->data : -1),
-                (long long) ((size_t) attn_score_elems * ggml_element_size(gdn_out)));
         }
     }
 

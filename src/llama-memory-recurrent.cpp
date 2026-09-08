@@ -843,18 +843,6 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     used = std::count_if(cells.begin(), cells.end(),
         [](const mem_cell & cell){ return !cell.is_empty(); });
 
-    // Slot-binding trace (split-ubatch carry debug): find_slot runs in
-    // prepare() for every ubatch (state restored after) and in apply() for
-    // the live ubatch. n_seq_tokens tags which ubatch this call bound.
-    {
-        static int find_slot_calls = 0;
-        if (find_slot_calls++ < 256) {
-            fprintf(stderr, "[rec-state] FIND_SLOT #%d: n_seq_tokens=%u n_seqs=%u min=%d max=%d head=%u n=%u used=%u rs_z=%d\n",
-                find_slot_calls, n_seq_tokens, n_seqs, (int) min, (int) max,
-                head, n, used, rs_z);
-        }
-    }
-
     // sanity check
     return n >= n_seqs;
 }
@@ -2029,102 +2017,10 @@ bool llama_memory_recurrent_context::apply() {
 
     mem->find_slot(ubatches[i_next]);
 
-    // PRECOMPUTE state audit (split-ubatch carry debug): scan the live cache
-    // rows of every layer right after slot assignment, i.e. factory state at
-    // ub0 and committed state at ub1+. Finite-confirmation for gathered rows
-    // is logged explicitly (absence of a line is not evidence).
-    {
-        static int precompute_ub = 0;
-        static int precompute_nan_log = 0;
-        const llama_ubatch & ub = ubatches[i_next];
-        // Always report gathered rows for continuation ubatches (i_next>0)
-        // regardless of how many prior requests burned the static budget;
-        // first two applies are verbose so ub0 factory state is on record.
-        const bool verbose = (i_next > 0 || precompute_ub < 2);
-        for (size_t il = 0; il < mem->s_l.size(); ++il) {
-            ggml_tensor * s = mem->s_l[il];
-            if (!s || !s->data || s->type != GGML_TYPE_F32) {
-                continue;
-            }
-            if (s->buffer && !ggml_backend_buffer_is_host(s->buffer)) {
-                continue;
-            }
-            for (uint32_t r = 0; r < mem->n; ++r) {
-                const uint32_t row = mem->head + r;
-                if ((int64_t) row >= s->ne[1]) {
-                    break;
-                }
-                const float * data = (const float *) ((const char *) s->data + (size_t) row * s->nb[1]);
-                int64_t bad = 0;
-                for (int64_t e = 0; e < s->ne[0]; ++e) {
-                    if (!std::isfinite(data[e])) ++bad;
-                }
-                const bool is_gathered = r < ub.n_seqs;
-                if (bad > 0) {
-                    if (precompute_nan_log++ < 4096) {
-                        fprintf(stderr, "[rec-state] PRECOMPUTE ub=%d il=%d row=%u%s: %lld/%lld non-finite (rs_z=%d head=%u n=%u)\n",
-                            (int) i_next, (int) il, row, is_gathered ? "[gathered]" : "",
-                            (long long) bad, (long long) s->ne[0],
-                            mem->rs_z, mem->head, mem->n);
-                    }
-                } else if (verbose && is_gathered) {
-                    fprintf(stderr, "[rec-state] PRECOMPUTE ub=%d il=%d row=%u[gathered]: FINITE (rs_z=%d head=%u n=%u)\n",
-                        (int) i_next, (int) il, row, mem->rs_z, mem->head, mem->n);
-                }
-            }
-        }
-        ++precompute_ub;
-    }
-
     return true;
 }
 
 bool llama_memory_recurrent_context::postcompute_success() {
-    // POSTCOMPUTE audit (split-ubatch carry debug): runs after graph compute
-    // + fence for the just-finished ubatch (i_next not yet advanced), so this
-    // is the only unambiguous read of committed state — no timestamp guess.
-    {
-        static int postcompute_log = 0;
-        static int postcompute_nan_log = 0;
-        if (!ubatches.empty() && status == LLAMA_MEMORY_STATUS_SUCCESS) {
-            const llama_ubatch & ub = ubatches[i_next];
-            for (size_t il = 0; il < mem->s_l.size(); ++il) {
-                ggml_tensor * s = mem->s_l[il];
-                if (!s || !s->data || s->type != GGML_TYPE_F32) {
-                    continue;
-                }
-                if (s->buffer && !ggml_backend_buffer_is_host(s->buffer)) {
-                    continue;
-                }
-                for (uint32_t r = 0; r < mem->n; ++r) {
-                    const uint32_t row = mem->head + r;
-                    if ((int64_t) row >= s->ne[1]) {
-                        break;
-                    }
-                    const float * data = (const float *) ((const char *) s->data + (size_t) row * s->nb[1]);
-                    int64_t bad = 0;
-                    for (int64_t e = 0; e < s->ne[0]; ++e) {
-                        if (!std::isfinite(data[e])) ++bad;
-                    }
-                    const bool is_gathered = r < ub.n_seqs;
-                    if (!is_gathered) {
-                        continue;
-                    }
-                    if (bad > 0) {
-                        if (postcompute_nan_log++ < 4096) {
-                            fprintf(stderr, "[rec-state] POSTCOMPUTE ub=%d il=%d row=%u[gathered]: %lld/%lld non-finite (rs_z=%d head=%u n=%u)\n",
-                                (int) i_next, (int) il, row,
-                                (long long) bad, (long long) s->ne[0],
-                                mem->rs_z, mem->head, mem->n);
-                        }
-                    } else if (postcompute_log++ < 4096) {
-                        fprintf(stderr, "[rec-state] POSTCOMPUTE ub=%d il=%d row=%u[gathered]: FINITE (rs_z=%d head=%u n=%u)\n",
-                            (int) i_next, (int) il, row, mem->rs_z, mem->head, mem->n);
-                    }
-                }
-            }
-        }
-    }
     return true;
 }
 

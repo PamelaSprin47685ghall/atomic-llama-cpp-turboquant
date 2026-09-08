@@ -344,18 +344,6 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     }
 }
 
-// StateCarryFix instrumented-run stash storage (decls in llama-graph.h).
-// Plain data copy: no graph-tensor lifetime coupling across TUs.
-namespace {
-int     sc_dbg_ntokens = -1;
-int32_t sc_dbg_vals[64];
-int     sc_dbg_n = 0;
-} // namespace
-
-int sc_dbg_scopy_ntokens() { return sc_dbg_ntokens; }
-int sc_dbg_scopy_n() { return sc_dbg_n; }
-int32_t sc_dbg_scopy(int i) { return (i >= 0 && i < sc_dbg_n) ? sc_dbg_vals[i] : -1; }
-
 void llm_graph_input_rs::set_input_recurrent(
         const llama_memory_recurrent_context * current,
         const llama_ubatch * ubatch) {
@@ -421,13 +409,6 @@ void llm_graph_input_rs::set_input_recurrent(
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->s_copy(i);
         }
-        // StateCarryFix instrumented run: s_copy(0) must be read here, not at
-        // build time (s_copy() resets rollback selectors).
-        LLAMA_LOG_ERROR("[statecarry] set_input n_tokens=%d n_rs=%lld s_copy(0)=%d\n",
-            ubatch ? ubatch->n_tokens : -1, (long long) n_rs, n_rs > 0 ? data[0] : -1);
-        sc_dbg_ntokens = ubatch ? ubatch->n_tokens : -1;
-        sc_dbg_n = 0;
-        for (uint32_t sc_i = 0; sc_i < n_rs && sc_dbg_n < 64; ++sc_i) sc_dbg_vals[sc_dbg_n++] = data[sc_i];
     }
 }
 
@@ -2141,32 +2122,11 @@ static ggml_tensor * llm_build_attn_xkv(
                     return true;
                 });
         }
-        LLAMA_LOG_ERROR("[xkv_attach] attached CPU-ref probe on il%dh%d (out_cpu %p, branch=%s)\n",
-            il, h, (void*)out_cpu, native_branch ? "native" : "cpu_ref");
 
         xkv_inp->adopt(handle, [handle, il, h, out_cpu]() {
             // Forced stale retry (failed refresh) reports before status.
             if (const auto * s = handle->snapshot()) {
                 if (s->force_retry_stale) return 1;
-            }
-            // (i) H1 probe: per-query finite check on the CPU-ref attention
-            // output. Runs at poll time, after graph compute fenced, so
-            // out_cpu holds this ubatch's values. Silence = all rows finite.
-            if (out_cpu && out_cpu->data && out_cpu->type == GGML_TYPE_F32 &&
-                out_cpu->ne[0] > 0 && out_cpu->ne[1] > 0) {
-                const int64_t w = out_cpu->ne[0];
-                const int64_t nq = out_cpu->ne[1];
-                for (int64_t q = 0; q < nq; ++q) {
-                    const float * row = (const float *) ((const char *) out_cpu->data + q * out_cpu->nb[1]);
-                    int64_t bad = 0, first = -1;
-                    for (int64_t d = 0; d < w; ++d) {
-                        if (!std::isfinite(row[d])) { if (bad == 0) first = d; ++bad; }
-                    }
-                    if (bad > 0) {
-                        LLAMA_LOG_ERROR("[xkv_out_probe] op il%dh%d query %lld: %lld/%lld elems non-finite (first %lld)\n",
-                            il, h, (long long) q, (long long) bad, (long long) w, (long long) first);
-                    }
-                }
             }
             int act = static_cast<int>(xkv_graph_postcompute_action(handle->status()));
             if (act != 0 && handle->snapshot()) {

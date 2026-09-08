@@ -398,13 +398,6 @@ private:
     uint32_t last_n_tokens_ = 0;
 };
 
-// StateCarryFix instrumented-run stash: s_copy values copied at set_input
-// time (llama-graph.cpp), consumed post-fence in llama-context.cpp. Plain
-// data (not tensor pointers), so no graph-lifetime coupling across TUs.
-int     sc_dbg_scopy_ntokens();
-int     sc_dbg_scopy_n();
-int32_t sc_dbg_scopy(int i);
-
 class llm_graph_input_cross_embd : public llm_graph_input_i {
 public:
     llm_graph_input_cross_embd(
