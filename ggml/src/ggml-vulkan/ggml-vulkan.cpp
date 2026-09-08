@@ -4263,6 +4263,12 @@ struct CompileTask {
     uint32_t required_subgroup_size;
 };
 
+// GCC 16.2.1 crashes in PRE's pointer-analysis pass on this large pipeline
+// initialization walk at -O3. Keep the workaround local to this function;
+// shader code, execution paths and other compilers retain their optimizations.
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 16
+__attribute__((optimize("no-tree-pre")))
+#endif
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
