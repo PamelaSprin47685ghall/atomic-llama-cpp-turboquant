@@ -103,6 +103,12 @@ check before/after/freed accounting, and save the observed events. Do not use
 the zero-score bound for general ranked eviction, which legitimately scores
 candidates. HTTP success alone does not satisfy a requested pressure gate.
 
+Use `"require_tri_scoring": true` when the test is specifically meant to
+exercise calibration/ranking. It requires a real drain with `score_ms > 0`, so
+the KV=512 recent-window floor-only case cannot be mistaken for scorer coverage.
+For Nanbeige, use physical KV at least 4096 and a prompt longer than physical KV
+so the 3/32 target exceeds the fixed recent-128 guard.
+
 Set `"require_flashprefill_plan": true` to require completed FlashPrefill
 plan work. The runner enables `/metrics`, saves the response, and validates
 finite integral row/block/token counters. Exact-all plans count as real

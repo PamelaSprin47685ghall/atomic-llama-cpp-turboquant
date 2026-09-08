@@ -385,12 +385,24 @@ class AuditTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 audit.check_runtime_evidence(config, result)
 
+    def test_pressure_gate_can_require_real_scoring(self):
+        log = self.root / "server.log"
+        config = dict(self.config, require_tri_scoring=True)
+        result = {"server_log": str(log)}
+        floor_only = "TriAttention drain: before=512 after=128 freed=384 score_ms=0.000 pack_ms=2.3"
+        log.write_text(floor_only, encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "scored TriAttention drain"):
+            audit.check_runtime_evidence(config, result)
+        log.write_text(floor_only.replace("score_ms=0.000", "score_ms=2.300"), encoding="utf-8")
+        audit.check_runtime_evidence(config, result)
+        self.assertGreater(result["tri_events"][0]["score_ms"], 0)
+
     def test_pressure_gate_config_validation(self):
-        for change in ({"require_tri_drain": "true"}, {"max_tri_score_ms": -1},
+        for change in ({"require_tri_drain": "true"}, {"require_tri_scoring": "true"}, {"max_tri_score_ms": -1},
                        {"max_tri_score_ms": True}, {"max_tri_score_ms": float("nan")}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 audit.validate_configs([dict(self.config, **change)])
-        audit.validate_configs([dict(self.config, require_tri_drain=True, max_tri_score_ms=0)])
+        audit.validate_configs([dict(self.config, require_tri_drain=True, require_tri_scoring=True)])
 
 
 if __name__ == "__main__":

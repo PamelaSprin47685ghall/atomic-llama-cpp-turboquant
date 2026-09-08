@@ -518,8 +518,9 @@ def check_runtime_evidence(config, result):
     """Pressure gates must observe real reclaim, not merely HTTP success."""
     check_flashprefill_evidence(config, result)
     required = config.get("require_tri_drain", False)
+    require_scoring = config.get("require_tri_scoring", False)
     ceiling = config.get("max_tri_score_ms")
-    if not required and ceiling is None:
+    if not required and not require_scoring and ceiling is None:
         return
     text = Path(result["server_log"]).read_text(encoding="utf-8", errors="replace")
     events = []
@@ -541,6 +542,10 @@ def check_runtime_evidence(config, result):
     result["tri_events"] = events
     if required and not any(event["kind"] == "drain" and event["freed"] > 0 for event in events):
         raise RuntimeError("expected a real TriAttention drain, but none freed cells")
+    if require_scoring and not any(
+            event["kind"] == "drain" and event["freed"] > 0 and event["score_ms"] > 0
+            for event in events):
+        raise RuntimeError("expected a scored TriAttention drain, but scoring did not run")
     if ceiling is not None and (not events or any(event["score_ms"] > ceiling for event in events)):
         raise RuntimeError("TriAttention scoring exceeded the configured bound or no reclaim ran")
 
@@ -584,6 +589,8 @@ def validate_configs(configs):
             raise ValueError("env must map strings to strings")
         if type(config.get("require_tri_drain", False)) is not bool:
             raise ValueError("require_tri_drain must be boolean")
+        if type(config.get("require_tri_scoring", False)) is not bool:
+            raise ValueError("require_tri_scoring must be boolean")
         if type(config.get("require_flashprefill_plan", False)) is not bool:
             raise ValueError("require_flashprefill_plan must be boolean")
         ceiling = config.get("max_tri_score_ms")
