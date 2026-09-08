@@ -471,57 +471,56 @@ void select_tile(uint t) {
             if (!full) { col_full = false; break; }
         }
         if (!col_full) continue; // excluded column: exact, no energy
-        for (uint j = 0u; j < Rp; ++j) {
-            uint rb = row_off + (r_lo + j) * 8u;
-            int rsq = data_meta[rb + FP_RW_SRC_Q];
-            uint rqh = uint(data_meta[rb + FP_RW_Q_HEAD]);
-            // Phase for (frag,source): unique local use (key uniqueness).
-            // Column is full, so any present pair is fully legal; missing
-            // pairs (frag illegal for this query) are skipped.
-            int qg = -1;
-            for (uint k = 0u; k < P; ++k) {
-                uint u = u_lo + k;
-                uint uub = use_off + u * 8u;
-                if (data_meta[uub + FP_UW_FRAG] != frag) continue;
-                if (data_meta[uub + FP_UW_SRC_Q] != rsq) continue;
-                qg = data_meta[uub + FP_UW_Q_GROUP];
-                break;
-            }
-            if (qg < 0) continue; // frag not legal for this row's query
-            float dot = 0.0f;
-            for (uint dd = 0u; dd < p.dk; ++dd) {
-                uint q_idx = (uint(qg) * p.q_nb1 + rqh * p.q_nb2) / 4u + dd;
-                uint pb_idx = (uint(frag) * H + h) * dtot + dd;
-                dot += data_q[q_idx] * data_pool[pb_idx];
-            }
-            float z = fp_softcap_apply(p.scale * dot, p.softcap);
-            if (!fp_isfinite(z)) {
-                data_plan[counts_off + pair * 2u + 0u] = 0;
-                data_plan[counts_off + pair * 2u + 1u] = 0;
-                atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_INPUT));
-                return;
-            }
-            if (!have) {
-                M = z; have = true;
-                float cur = uintBitsToFloat(uint(data_plan[proxy_off + pair * max_sel + d]));
-                cur += 1.0f; // exp(z-M)=1 for the max element itself
-                data_plan[proxy_off + pair * max_sel + d] = int(floatBitsToUint(cur));
-            } else if (z > M) {
-                // Rescale all accumulated S by exp(oldM-newM), then add.
-                float rescale = exp(M - z);
-                for (uint dd2 = 0u; dd2 < F; ++dd2) {
-                    float s = uintBitsToFloat(uint(data_plan[proxy_off + pair * max_sel + dd2]));
-                    s *= rescale;
-                    data_plan[proxy_off + pair * max_sel + dd2] = int(floatBitsToUint(s));
+        // Uses are unique on (source_query,tile,kv_head,frag). Iterate the
+        // uses that carry this fragment directly instead of re-scanning all P
+        // uses for every row just to recover q_group. This keeps the same
+        // legal (frag,row) pairs and the same dot count, while replacing the
+        // hot F*Rp*P phase lookup with F*P + P*Rp bounded scans.
+        for (uint k = 0u; k < P; ++k) {
+            uint u = u_lo + k;
+            uint uub = use_off + u * 8u;
+            if (data_meta[uub + FP_UW_FRAG] != frag) continue;
+            int usq = data_meta[uub + FP_UW_SRC_Q];
+            int qg = data_meta[uub + FP_UW_Q_GROUP];
+            for (uint j = 0u; j < Rp; ++j) {
+                uint rb = row_off + (r_lo + j) * 8u;
+                if (data_meta[rb + FP_RW_SRC_Q] != usq) continue;
+                uint rqh = uint(data_meta[rb + FP_RW_Q_HEAD]);
+                float dot = 0.0f;
+                for (uint dd = 0u; dd < p.dk; ++dd) {
+                    uint q_idx = (uint(qg) * p.q_nb1 + rqh * p.q_nb2) / 4u + dd;
+                    uint pb_idx = (uint(frag) * H + h) * dtot + dd;
+                    dot += data_q[q_idx] * data_pool[pb_idx];
                 }
-                M = z;
-                float cur = uintBitsToFloat(uint(data_plan[proxy_off + pair * max_sel + d]));
-                cur += 1.0f;
-                data_plan[proxy_off + pair * max_sel + d] = int(floatBitsToUint(cur));
-            } else {
-                float cur = uintBitsToFloat(uint(data_plan[proxy_off + pair * max_sel + d]));
-                cur += exp(z - M);
-                data_plan[proxy_off + pair * max_sel + d] = int(floatBitsToUint(cur));
+                float z = fp_softcap_apply(p.scale * dot, p.softcap);
+                if (!fp_isfinite(z)) {
+                    data_plan[counts_off + pair * 2u + 0u] = 0;
+                    data_plan[counts_off + pair * 2u + 1u] = 0;
+                    atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_INPUT));
+                    return;
+                }
+                if (!have) {
+                    M = z; have = true;
+                    float cur = uintBitsToFloat(uint(data_plan[proxy_off + pair * max_sel + d]));
+                    cur += 1.0f; // exp(z-M)=1 for the max element itself
+                    data_plan[proxy_off + pair * max_sel + d] = int(floatBitsToUint(cur));
+                } else if (z > M) {
+                    // Rescale all accumulated S by exp(oldM-newM), then add.
+                    float rescale = exp(M - z);
+                    for (uint dd2 = 0u; dd2 < F; ++dd2) {
+                        float s = uintBitsToFloat(uint(data_plan[proxy_off + pair * max_sel + dd2]));
+                        s *= rescale;
+                        data_plan[proxy_off + pair * max_sel + dd2] = int(floatBitsToUint(s));
+                    }
+                    M = z;
+                    float cur = uintBitsToFloat(uint(data_plan[proxy_off + pair * max_sel + d]));
+                    cur += 1.0f;
+                    data_plan[proxy_off + pair * max_sel + d] = int(floatBitsToUint(cur));
+                } else {
+                    float cur = uintBitsToFloat(uint(data_plan[proxy_off + pair * max_sel + d]));
+                    cur += exp(z - M);
+                    data_plan[proxy_off + pair * max_sel + d] = int(floatBitsToUint(cur));
+                }
             }
         }
     }
