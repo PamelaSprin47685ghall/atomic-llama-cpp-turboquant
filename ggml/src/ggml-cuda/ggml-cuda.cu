@@ -25,6 +25,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/flashprefill.cuh"
 #include "ggml-cuda/fattn-banded.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
@@ -2550,6 +2551,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
             break;
+        case GGML_OP_FLASH_PREFILL_POOL:
+            ggml_cuda_flash_prefill_pool(ctx, dst);
+            break;
+        case GGML_OP_FLASH_PREFILL_SELECT:
+            ggml_cuda_flash_prefill_select(ctx, dst);
+            break;
+        case GGML_OP_FLASH_PREFILL_ATTN:
+            ggml_cuda_flash_prefill_attn(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -2724,6 +2734,15 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
 #endif
             }
+        }
+
+        if (node->op == GGML_OP_FLASH_PREFILL_POOL ||
+            node->op == GGML_OP_FLASH_PREFILL_SELECT ||
+            node->op == GGML_OP_FLASH_PREFILL_ATTN) {
+            use_cuda_graph = false;
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: disabling CUDA graphs due to flashprefill op\n", __func__);
+#endif
         }
 
         if (!use_cuda_graph) {
@@ -4359,6 +4378,22 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
+    // Check for plan error in FlashPrefill plan nodes to reject corrupt plan execution
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_FLASH_PREFILL_ATTN && node->src[4] != nullptr) {
+            const ggml_tensor * plan = node->src[4];
+            if (ggml_nelements(plan) >= 11) {
+                int32_t plan_err = 0;
+                CUDA_CHECK(cudaMemcpyAsync(&plan_err, (const int32_t*)plan->data + 10, sizeof(int32_t), cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+                CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+                if (plan_err != 0) {
+                    return GGML_STATUS_FAILED;
+                }
+            }
+        }
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -5384,7 +5419,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_FLASH_PREFILL_POOL:
         case GGML_OP_FLASH_PREFILL_SELECT:
         case GGML_OP_FLASH_PREFILL_ATTN:
-            return false;
+            return true;
 
         default:
             return false;

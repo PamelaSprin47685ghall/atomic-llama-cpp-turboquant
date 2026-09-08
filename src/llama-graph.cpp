@@ -4833,10 +4833,11 @@ bool llm_fp_is_snapshot_rows(const std::vector<llama_flashprefill_row> & rows, c
 
 // Backend scan mirroring the RERoT variant discipline. CUDA/Metal/RPC have
 // no sparse kernels (unsupported); CPU reference + Vulkan fused supported.
-// Returns 0 = unsupported, 1 = CPU reference, 2 = Vulkan fused.
+// Returns 0 = unsupported, 1 = CPU reference, 2 = Vulkan fused, 3 = CUDA native.
 int llm_fp_backend_variant(ggml_backend_sched_t sched, bool * supported_out) {
     bool supported = true;
     bool vulkan = false;
+    bool cuda = false;
     if (sched != nullptr) {
         const int n = ggml_backend_sched_get_n_backends(sched);
         for (int i = 0; i < n; ++i) {
@@ -4850,7 +4851,9 @@ int llm_fp_backend_variant(ggml_backend_sched_t sched, bool * supported_out) {
             }
             const std::string s(name);
             if (s.find("CUDA")  != std::string::npos ||
-                s.find("Metal") != std::string::npos ||
+                s.find("cuda")  != std::string::npos) {
+                cuda = true;
+            } else if (s.find("Metal") != std::string::npos ||
                 s.find("RPC")   != std::string::npos) {
                 supported = false;
             }
@@ -4865,6 +4868,9 @@ int llm_fp_backend_variant(ggml_backend_sched_t sched, bool * supported_out) {
     }
     if (!supported) {
         return 0;
+    }
+    if (cuda) {
+        return 3;
     }
     return vulkan ? 2 : 1;
 }
