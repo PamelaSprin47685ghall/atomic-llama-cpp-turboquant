@@ -4582,10 +4582,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         const void * spv_data = nullptr;
         size_t spv_size = 0;
         const char *name = nullptr;
-        if (bf16_kv) {
+        // The half-operand "f32acc" module only widens QK accumulation:
+        // Q staging, dequantization, softmax weights and PV still round to
+        // F16. This is not the precision of the indexed F32 path and can
+        // change expert/token decisions even with identical visible keys.
+        // Use the existing full-F32 scalar module for non-MMQ F32 attention;
+        // leave the explicit low-precision and integer-dot paths intact.
+        if (bf16_kv || (f32acc && !use_mmq)) {
             spv_data = flash_attn_f32_f16_fp32_data;
             spv_size = flash_attn_f32_f16_fp32_len;
-            name = aligned ? "flash_attn_f32_bf16_aligned" : "flash_attn_f32_bf16";
+            name = aligned ? "flash_attn_f32_full_aligned" : "flash_attn_f32_full";
         } else if (use_mmq) {
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
             if (device->fp16) {
@@ -4625,39 +4631,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // first-use pipeline creation.
     for (auto &fa : device->pipeline_flash_attn_f32_f16) {
         if (fa.first.path != FA_SCALAR || !fa.first.rerot) continue;
-        const bool f32acc = fa.first.f32acc;
-        const void * spv_data = nullptr;
-        size_t spv_size = 0;
-        // Module selection mirrors the ordinary scalar loop above; the
-        // RerotMode specialization makes the selected main() path variant-
-        // agnostic.
-        if (fa.first.k_type == GGML_TYPE_BF16) {
-            spv_data = flash_attn_f32_f16_fp32_data;
-            spv_size = flash_attn_f32_f16_fp32_len;
-        } else if (ggml_vk_fa_scalar_uses_mmq(device, fa.first.k_type, fa.first.v_type)) {
-#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
-            if (device->fp16) {
-                if (f32acc) { spv_data = flash_attn_f32_f16_int8_data;        spv_size = flash_attn_f32_f16_int8_len; }
-                else        { spv_data = flash_attn_f32_f16_f16acc_int8_data; spv_size = flash_attn_f32_f16_f16acc_int8_len; }
-            } else {
-                spv_data = flash_attn_f32_f16_fp32_int8_data;
-                spv_size = flash_attn_f32_f16_fp32_int8_len;
-            }
-#endif
-        } else {
-            if (device->fp16) {
-                if (device->dot2_f16) {
-                    if (f32acc) { spv_data = flash_attn_f32_f16_dot2_data;        spv_size = flash_attn_f32_f16_dot2_len; }
-                    else        { spv_data = flash_attn_f32_f16_dot2_f16acc_data; spv_size = flash_attn_f32_f16_dot2_f16acc_len; }
-                } else {
-                    if (f32acc) { spv_data = flash_attn_f32_f16_data;        spv_size = flash_attn_f32_f16_len; }
-                    else        { spv_data = flash_attn_f32_f16_f16acc_data; spv_size = flash_attn_f32_f16_f16acc_len; }
-                }
-            } else {
-                spv_data = flash_attn_f32_f16_fp32_data;
-                spv_size = flash_attn_f32_f16_fp32_len;
-            }
-        }
+        // Indexed attention is F32, including dequantization. Selecting a
+        // half-operand module silently rounded Turbo K/V before the otherwise
+        // F32 kernel. It never uses MMQ's Q8 query quantization either.
+        GGML_ASSERT(fa.first.f32acc);
+        const void * spv_data = flash_attn_f32_f16_fp32_data;
+        const size_t spv_size = flash_attn_f32_f16_fp32_len;
         const uint32_t subgroup_size = fa.first.subgroup_size;
         ggml_vk_create_pipeline(device, fa.second, "flash_attn_rerot", spv_size, spv_data, "main", 9,
                                 sizeof(vk_flash_attn_push_constants), {1, 1, 1},
@@ -10714,6 +10693,14 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                                  grouped_dispatch_offset,
                                                  generic_dispatch_offset,
             (uint32_t) n_as };
+        if (!split_singletons) {
+            ggml_vk_dispatch_pipeline(ctx, subctx, count_experts,
+                { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf, route_rows_buf },
+                pc_reset, { 1, 1, 1 });
+            ctx->prealloc_moe_route_need_sync = true;
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+
         auto pc_build = pc_reset;
         pc_build[5] = split_singletons ? 3 : 1;
         ggml_vk_dispatch_pipeline(ctx, subctx, count_experts,
@@ -11140,16 +11127,16 @@ static void ggml_vk_mul_mat_id(ggml_backend_vk_context * ctx, vk_context& subctx
 }
 
 static bool ggml_vk_flash_attn_scalar_shmem_support(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool f32acc, ggml_type k_type, ggml_type v_type) {
-    GGML_UNUSED(f32acc);
     // Needs to be kept up to date on shader changes
     const uint32_t wg_size = params.workgroup_size;
     const uint32_t Br = params.block_rows;
     const uint32_t Bc = params.block_cols;
 
-    // BF16 uses the fp32 shader (FLOAT_TYPE=float)
-    const uint32_t float_type_size = (device->fp16 && k_type != GGML_TYPE_BF16) ? sizeof(ggml_fp16_t) : sizeof(float);
-
     const bool mmq = ggml_vk_fa_scalar_uses_mmq(device, k_type, v_type);
+    // Must match module selection: BF16 and non-MMQ F32 use FLOAT_TYPE=float,
+    // even on a device advertising fast F16 / dot2.
+    const bool half_operands = device->fp16 && k_type != GGML_TYPE_BF16 && !(f32acc && !mmq);
+    const uint32_t float_type_size = half_operands ? sizeof(ggml_fp16_t) : sizeof(float);
 
     // tmpsh is overestimated slightly
     const uint32_t tmpsh = wg_size * sizeof(float);

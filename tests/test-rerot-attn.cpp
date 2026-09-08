@@ -260,11 +260,28 @@ static std::vector<float> materialized_gqa(const std::vector<float> & raw_q,
 } // namespace attn_ref
 
 static float max_abs_diff(const std::vector<float> & a, const std::vector<float> & b) {
+    // Missing/nonfinite output is a failed numerical gate, not zero error.
+    // std::max(m, NaN) keeps m and used to silently accept broken kernels.
+    if (a.empty() || a.size() != b.size()) return INFINITY;
     float m = 0.0f;
-    for (size_t i = 0; i < std::min(a.size(), b.size()); ++i) {
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (!std::isfinite(a[i]) || !std::isfinite(b[i])) return INFINITY;
         m = std::max(m, std::abs(a[i] - b[i]));
     }
     return m;
+}
+
+static void test_error_metric_rejects_invalid_outputs() {
+    CHECK(max_abs_diff({1.0f, -2.0f}, {1.0f, -2.0f}) == 0.0f);
+    CHECK(max_abs_diff({1.0f, -2.0f}, {1.25f, -2.0f}) == 0.25f);
+    CHECK(std::isinf(max_abs_diff({}, {})));
+    CHECK(std::isinf(max_abs_diff({1.0f}, {})));
+    CHECK(std::isinf(max_abs_diff({1.0f}, {1.0f, 2.0f})));
+    for (const float bad : {NAN, INFINITY, -INFINITY}) {
+        CHECK(std::isinf(max_abs_diff({bad}, {0.0f})));
+        CHECK(std::isinf(max_abs_diff({0.0f}, {bad})));
+        CHECK(std::isinf(max_abs_diff({bad}, {bad})));
+    }
 }
 
 // Runs the indexed RERoT op (GGML_OP_FLASH_ATTN_EXT_REROT, ordinary path
@@ -763,6 +780,101 @@ static std::vector<float> run_standard_op(
     std::vector<float> actual(ggml_nelements(out));
     ggml_backend_tensor_get(out, actual.data(), 0, actual.size() * sizeof(float));
     return actual;
+}
+
+// Decode the same quantized bytes used by the GPU tests, but do not invoke
+// either attention implementation when constructing the numerical oracle.
+static std::vector<float> stored_values(const std::vector<float> & input, ggml_type type, int width) {
+    if (type == GGML_TYPE_F32) return input;
+    const size_t rows = input.size() / width;
+    CHECK(rows * width == input.size());
+    const size_t row_bytes = ggml_row_size(type, width);
+    std::vector<uint8_t> encoded(rows * row_bytes);
+    const size_t written = ggml_quantize_chunk(type, input.data(), encoded.data(), 0, rows, width, nullptr);
+    const auto * traits = ggml_get_type_traits(type);
+    CHECK(written == encoded.size() && traits && traits->to_float);
+    if (written != encoded.size() || !traits || !traits->to_float) return {};
+    std::vector<float> decoded(input.size());
+    for (size_t row = 0; row < rows; ++row) {
+        traits->to_float(encoded.data() + row * row_bytes, decoded.data() + row * width, width);
+    }
+    return decoded;
+}
+
+// Equal visible keys and equal Q must not acquire different rounding merely
+// by selecting the indexed execution shape. In particular GGML_PREC_F32 must
+// not round Q, softmax weights, or the PV accumulation to half precision.
+static void test_attention_f32_precision(bool require_gpu = false) {
+    ggml_backend_load_all();
+    const auto device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!device) {
+        std::puts("SKIP: no GPU backend for attention precision regression");
+        CHECK(!require_gpu);
+    }
+    ggml_backend_t gpu = device ? ggml_backend_dev_init(device, nullptr) : nullptr;
+    CHECK(!device || gpu != nullptr);
+    constexpr int d = 256, hq = 16, hkv = 2;
+    const float scale = 1.0f / std::sqrt(float(d));
+    std::mt19937 rng(0x51a9u);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    for (const int nkv : {33, 257}) {
+        std::vector<float> q(d * hq), k(size_t(d) * nkv * hkv), v(k.size());
+        for (auto & x : q) x = dist(rng) * 2.0f;
+        for (auto & x : k) x = dist(rng);
+        for (auto & x : v) x = dist(rng);
+        std::vector<int32_t> entries;
+        for (int i = 0; i < nkv; ++i) { entries.push_back(i); entries.push_back(0); }
+        const std::vector<int32_t> offsets = {0, nkv};
+        for (const bool turbo : {false, true}) {
+            const auto kt = turbo ? GGML_TYPE_TURBO4_0 : GGML_TYPE_F16;
+            const auto vt = turbo ? GGML_TYPE_TURBO2_0 : GGML_TYPE_F16;
+            const auto stored_k = stored_values(k, kt, d);
+            const auto stored_v = stored_values(v, vt, d);
+            CHECK(stored_k.size() == k.size() && stored_v.size() == v.size());
+            if (stored_k.size() != k.size() || stored_v.size() != v.size()) continue;
+            // Both F16 and Turbo now use an independent f64 QK/softmax/PV
+            // reference over their stored K/V, with the original F32 Q.
+            std::vector<float> ref(q.size());
+            for (int h = 0; h < hq; ++h) {
+                const int kvh = h / (hq / hkv);
+                std::vector<double> scores(nkv);
+                for (int i = 0; i < nkv; ++i) {
+                    double dot = 0.0;
+                    for (int c = 0; c < d; ++c) dot += double(q[h*d+c]) *
+                        stored_k[(size_t(kvh)*nkv+i)*d+c];
+                    scores[i] = dot * scale;
+                }
+                const double maximum = *std::max_element(scores.begin(), scores.end());
+                double sum = 0.0;
+                for (auto & x : scores) { x = std::exp(x - maximum); sum += x; }
+                for (int c = 0; c < d; ++c) {
+                    double value = 0.0;
+                    for (int i = 0; i < nkv; ++i) value += scores[i] / sum *
+                        stored_v[(size_t(kvh)*nkv+i)*d+c];
+                    ref[h*d+c] = float(value);
+                }
+            }
+            const auto cpu = run_indexed_op(d, d, 1, nkv, hq, hkv, 1, q, k, v, entries, offsets, scale, nullptr, kt, vt);
+            const float cpu_error = max_abs_diff(ref, cpu);
+            std::printf("F32_CPU_PRECISION cache=%s keys=%d error=%g reference=f64\n",
+                turbo ? "turbo" : "f16", nkv, cpu_error);
+            CHECK(cpu_error < 2e-5f);
+            // The CPU oracle gate also runs on hosts without a GPU.
+            if (!gpu) continue;
+            const auto ordinary = run_standard_op(d, d, nkv, hq, hkv, q, k, v, scale, gpu, kt, vt, {});
+            const auto indexed = run_indexed_op(d, d, 1, nkv, hq, hkv, 1, q, k, v, entries, offsets, scale, gpu, kt, vt);
+            CHECK(ref.size() == ordinary.size() && ref.size() == indexed.size());
+            const float native_error = max_abs_diff(ref, ordinary);
+            const float indexed_error = max_abs_diff(ref, indexed);
+            const float shape_error = max_abs_diff(ordinary, indexed);
+            std::printf("F32_PRECISION cache=%s keys=%d native=%g indexed=%g shape=%g cpu=%g reference=f64\n",
+                turbo ? "turbo" : "f16", nkv, native_error, indexed_error, shape_error, cpu_error);
+            CHECK(native_error < 2e-5f);
+            CHECK(indexed_error < 2e-5f);
+            CHECK(shape_error < 2e-5f);
+        }
+    }
+    if (gpu) ggml_backend_free(gpu);
 }
 
 static void test_vulkan_indexed_parity() {
@@ -1612,12 +1724,19 @@ static int replay_rbb_snapshot(const std::string & directory) {
 }
 
 int main(int argc, char ** argv) {
+    test_error_metric_rejects_invalid_outputs();
     if (argc == 3 && std::strcmp(argv[1], "--rbb-replay") == 0) return replay_rbb_snapshot(argv[2]);
+    if (argc == 2 && std::strcmp(argv[1], "--precision-only") == 0) {
+        // An explicitly requested GPU gate cannot succeed without running.
+        test_attention_f32_precision(true);
+        return failures == 0 ? 0 : 1;
+    }
     std::puts("=== RERoT indexed attention test ===");
     test_indexed_basic();
     test_ddvr_imrope_via_indexed_op();
     test_frontier_strong_vs_lag1();
     test_vulkan_indexed_parity();
+    test_attention_f32_precision();
     test_cpu_helper_matches_op();
     test_ragged_multi_reader_grouped_attention();
     test_full_size_multi_reader_attention();

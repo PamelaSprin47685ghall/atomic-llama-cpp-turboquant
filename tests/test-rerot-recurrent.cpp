@@ -165,13 +165,28 @@ static float ord_det(uint64_t x) {
 }
 
 static float ord_max_abs_diff(const std::vector<float> & a, const std::vector<float> & b) {
+    // Return a failing error for missing state or NaNs; std::max alone can
+    // otherwise hide a corrupt persistent trajectory as zero deviation.
+    if (a.empty() || a.size() != b.size()) return INFINITY;
     float m = 0.0f;
-    const size_t n = std::min(a.size(), b.size());
-    CHECK(a.size() == b.size());
-    for (size_t i = 0; i < n; ++i) {
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (!std::isfinite(a[i]) || !std::isfinite(b[i])) return INFINITY;
         m = std::max(m, std::abs(a[i] - b[i]));
     }
     return m;
+}
+
+static void test_error_metric_rejects_invalid_outputs() {
+    CHECK(ord_max_abs_diff({1.0f, -2.0f}, {1.0f, -2.0f}) == 0.0f);
+    CHECK(ord_max_abs_diff({1.0f, -2.0f}, {1.25f, -2.0f}) == 0.25f);
+    CHECK(std::isinf(ord_max_abs_diff({}, {})));
+    CHECK(std::isinf(ord_max_abs_diff({1.0f}, {})));
+    CHECK(std::isinf(ord_max_abs_diff({1.0f}, {1.0f, 2.0f})));
+    for (const float bad : {NAN, INFINITY, -INFINITY}) {
+        CHECK(std::isinf(ord_max_abs_diff({bad}, {0.0f})));
+        CHECK(std::isinf(ord_max_abs_diff({0.0f}, {bad})));
+        CHECK(std::isinf(ord_max_abs_diff({bad}, {bad})));
+    }
 }
 
 struct ord_step_out {
@@ -219,6 +234,7 @@ static ord_step_out ord_run_mem_step(
     params.hparams = model.hparams;
     params.cparams.fused_gdn_ar = true;
     params.cparams.fused_gdn_ch = true;
+    params.cparams.n_rs_seq = mem.n_rs_seq;
     params.ubatch = ubatch;
     params.mctx = &mctx;
     params.res = &res;
@@ -295,11 +311,14 @@ static ord_step_out ord_run_mem_step(
         CHECK(hand_row >= 0);
         ggml_tensor * d = mem.d_l[(size_t) il];
         const size_t hrow_size = ggml_row_size(d->type, d->ne[0]);
-        std::vector<ggml_fp16_t> hraw((size_t) D);
-        ggml_backend_tensor_get(d, hraw.data(), (size_t) hand_row * hrow_size, hrow_size);
         out.hand_f32.resize((size_t) D);
-        for (int64_t i = 0; i < D; ++i) {
-            out.hand_f32[i] = ggml_fp16_to_fp32(hraw[i]);
+        if (d->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(d, out.hand_f32.data(), (size_t) hand_row * hrow_size, hrow_size);
+        } else {
+            CHECK(d->type == GGML_TYPE_F16);
+            std::vector<ggml_fp16_t> hraw((size_t) D);
+            ggml_backend_tensor_get(d, hraw.data(), (size_t) hand_row * hrow_size, hrow_size);
+            for (int64_t i = 0; i < D; ++i) out.hand_f32[i] = ggml_fp16_to_fp32(hraw[i]);
         }
         out.eff.resize((size_t) D);
         for (int64_t i = 0; i < D; ++i) {
@@ -742,6 +761,127 @@ static void test_child_local_recurrence_in_mixed_batch(ggml_backend_t backend) {
 
 // Non-grouped graph inputs have no brain_copy tensor. Force nonzero recycled
 // storage so this regression does not depend on whether malloc returns zeros.
+// A one-step output check cannot detect lossy persistent hand storage: that
+// output is emitted BEFORE the F32 -> F16 store. Replay identical Q/K/V/g/b
+// for many steps against native memory, using the actual production gather,
+// transition, and cache-write path (no separately rounded reference).
+static void test_child_persistent_native_trajectory(uint32_t snapshots = 0) {
+    stub_model model;
+    model.hparams.n_layer_all = 4;
+    model.hparams.n_embd = 8;
+    model.hparams.n_embd_r_impl = 16;
+    model.hparams.ssm_d_state = 16;
+    model.hparams.ssm_d_inner = 32;
+    constexpr int S = 16, H = 2, IL = 3;
+    llama_memory_recurrent plain(model, GGML_TYPE_F32, GGML_TYPE_F32,
+        false, 4, 16, snapshots, 0, 0, nullptr);
+    llama_memory_recurrent grouped(model, GGML_TYPE_F32, GGML_TYPE_F32,
+        false, 4, 16, snapshots, 2, 4, nullptr);
+    std::vector<float> q(S*H), k(S*H), v(S*H), g(H), b(H);
+    float output_error = 0.0f, state_error = 0.0f;
+    std::vector<float> frozen_brain;
+    for (int t = 0; t <= 128; ++t) {
+        for (int h = 0; h < H; ++h) {
+            double norm = 0.0;
+            for (int d = 0; d < S; ++d) {
+                const int i = h*S+d;
+                q[i] = std::sin(0.17f * float(i + 7*t + 1));
+                k[i] = std::cos(0.11f * float(i + 3*t + 1));
+                norm += double(k[i])*k[i];
+                v[i] = 2.0f * std::sin(0.13f * float(i + t + 1));
+            }
+            for (int d = 0; d < S; ++d) k[h*S+d] /= float(std::sqrt(norm));
+            g[h] = -0.015f - 0.01f*h;
+            b[h] = 0.23f + 0.12f*h;
+        }
+        if (t == 1) {
+            llama_kv_rerot_meta tag;
+            tag.episode_id = 912;
+            tag.node_id = 1;
+            tag.visibility = llama_rerot_visibility::public_live;
+            CHECK(grouped.rerot_set_write_tag(0, tag));
+        }
+        llama_batch_allocr alloc(1);
+        std::vector<llama_seq_id> ids;
+        const auto ub = make_ubatch(alloc, 0, {t}, ids);
+        const auto native = ord_run_mem_step(model, plain, ub, IL, S, H, q, k, v, g, b);
+        const auto child = ord_run_mem_step(model, grouped, ub, IL, S, H, q, k, v, g, b);
+        if (t == 0) frozen_brain = child.brain_pub;
+        else CHECK(child.brain_pub == frozen_brain);
+        output_error = std::max(output_error, ord_max_abs_diff(native.output, child.output));
+        state_error = std::max(state_error, ord_max_abs_diff(native.eff, child.eff));
+    }
+    std::printf("child persistent native 128 steps: output=%g state=%g hand_type=%s rollback=%u\n",
+        output_error, state_error, ggml_type_name(grouped.d_l[IL]->type), snapshots);
+    CHECK(output_error < 2e-6f);
+    CHECK(state_error < 2e-6f);
+}
+
+// Exercise all retained hand snapshots, then discard a speculative suffix
+// and continue from an older snapshot through the real memory admission path.
+static void test_child_snapshot_rollback() {
+    stub_model model;
+    model.hparams.n_layer_all = 4;
+    model.hparams.n_embd = 8;
+    model.hparams.n_embd_r_impl = 16;
+    model.hparams.ssm_d_state = 16;
+    model.hparams.ssm_d_inner = 32;
+    constexpr int S = 16, H = 2, IL = 3, D = S*S*H;
+    llama_memory_recurrent plain(model, GGML_TYPE_F32, GGML_TYPE_F32,
+        false, 4, 16, 2, 0, 0, nullptr);
+    llama_memory_recurrent grouped(model, GGML_TYPE_F32, GGML_TYPE_F32,
+        false, 4, 16, 2, 2, 4, nullptr);
+    auto run = [&](const std::vector<llama_pos> & positions) {
+        const size_t n = positions.size();
+        std::vector<float> q(S*H*n), k(q.size(), 0.0f), v(q.size()), g(H*n, -0.05f), b(H*n, 0.37f);
+        for (size_t t = 0; t < n; ++t) {
+            for (int h = 0; h < H; ++h) {
+                k[(t*H+h)*S + positions[t]%S] = 1.0f;
+                for (int d = 0; d < S; ++d) {
+                    const size_t i = (t*H+h)*S+d;
+                    q[i] = std::sin(float(d + 3*positions[t] + h)*0.1f);
+                    v[i] = std::cos(float(d + positions[t] + h)*0.2f);
+                }
+            }
+        }
+        llama_batch_allocr alloc(1);
+        std::vector<llama_seq_id> ids;
+        const auto ub = make_ubatch(alloc, 0, positions, ids);
+        const auto native = ord_run_mem_step(model, plain, ub, IL, S, H, q, k, v, g, b);
+        const auto child = ord_run_mem_step(model, grouped, ub, IL, S, H, q, k, v, g, b);
+        CHECK(ord_max_abs_diff(native.output, child.output) < 2e-6f);
+        CHECK(ord_max_abs_diff(native.eff, child.eff) < 2e-6f);
+    };
+    run({0});
+    llama_kv_rerot_meta tag;
+    tag.episode_id = 913;
+    tag.node_id = 1;
+    tag.visibility = llama_rerot_visibility::public_live;
+    CHECK(grouped.rerot_set_write_tag(0, tag));
+    run({1, 2, 3});
+    const auto brain = grouped.s_l[IL];
+    std::vector<float> base(D), native(D), hand(D);
+    ggml_backend_tensor_get(brain, base.data(), size_t(grouped.episode_brain.at(913))*D*sizeof(float), D*sizeof(float));
+    for (size_t snapshot = 0; snapshot < 3; ++snapshot) {
+        ggml_backend_tensor_get(plain.s_l[IL], native.data(),
+            (snapshot*plain.size + plain.tails[0])*D*sizeof(float), D*sizeof(float));
+        ggml_backend_tensor_get(grouped.d_l[IL], hand.data(),
+            (snapshot*grouped.size + grouped.tails[0])*D*sizeof(float), D*sizeof(float));
+        for (int i = 0; i < D; ++i) hand[i] += base[i];
+        CHECK(ord_max_abs_diff(native, hand) < 2e-6f);
+    }
+    CHECK(plain.seq_rm(0, 2, -1));
+    CHECK(grouped.seq_rm(0, 2, -1));
+    CHECK(plain.rs_idx[0] == grouped.rs_idx[0]);
+    CHECK(plain.rs_idx[0] != 0);
+    const auto saved_child = grouped.capture_hand_seed(913, 0);
+    CHECK(saved_child && saved_child->source_pos == 1);
+    CHECK(grouped.apply_hand_seed(0, saved_child));
+    run({2});
+    run({3, 4, 5});
+    std::puts("child snapshot rollback: three snapshots + suffix discard + resume checked");
+}
+
 static void test_native_input_recycled_storage() {
     stub_model model;
     model.hparams.n_layer_all = 1;
@@ -795,12 +935,12 @@ static void test_fence_replay_recurrent_oracle() {
     tag.node_id = 1;
     tag.visibility = llama_rerot_visibility::private_control;
     CHECK(mem.rerot_set_write_tag(0, tag));
-    std::vector<ggml_fp16_t> hand(D);
+    std::vector<float> hand(D);
     for (int i = 0; i < D; ++i) {
-        hand[i] = ggml_fp32_to_fp16(0.03125f * float(i % 7 - 3));
+        hand[i] = 0.03125f * float(i % 7 - 3);
     }
     ggml_backend_tensor_set(mem.d_l[IL], hand.data(),
-        size_t(mem.tails[0]) * D * sizeof(ggml_fp16_t), D * sizeof(ggml_fp16_t));
+        size_t(mem.tails[0]) * D * sizeof(float), D * sizeof(float));
     const auto checkpoint = mem.capture_hand_seed(1, 0);
     CHECK(checkpoint && checkpoint->source_pos == 0);
     step(1);
@@ -818,7 +958,7 @@ static void test_fence_replay_recurrent_oracle() {
     CHECK(mem.cells[mem.tails[0]].pos == 0);
     std::vector<double> expected(D);
     for (int i = 0; i < D; ++i) {
-        expected[i] = double(brain[i]) + ggml_fp16_to_fp32(hand[i]);
+        expected[i] = double(brain[i]) + hand[i];
     }
     double max_output_error = 0.0, max_state_error = 0.0;
     for (int t = 1; t <= 2; ++t) {
@@ -834,10 +974,8 @@ static void test_fence_replay_recurrent_oracle() {
                         max_output_error = std::max(max_output_error,
                             std::abs(double(actual.output[h * S + col]) - next / std::sqrt(double(S))));
                     }
-                    // The persistent hand plane is FP16; each real step rounds
-                    // its overlay before reconstructing the next B+H input.
-                    expected[base + row] = double(brain[base + row]) + ggml_fp16_to_fp32(
-                        ggml_fp32_to_fp16(float(next - brain[base + row])));
+                    // Persistent state is F32, like the native recurrence.
+                    expected[base + row] = double(brain[base + row]) + float(next - brain[base + row]);
                     max_state_error = std::max(max_state_error,
                         std::abs(double(actual.eff[base + row]) - expected[base + row]));
                 }
@@ -872,17 +1010,17 @@ static void test_root_visibility_state_continuity() {
     const size_t n = size_t(brain->ne[0]);
     const size_t public_off = size_t(mem.episode_brain.at(808)) * n * sizeof(float);
     const size_t private_off = public_off + mem.get_brain_capacity() * n * sizeof(float);
-    const size_t hand_off = size_t(mem.tails[0]) * n * sizeof(ggml_fp16_t);
+    const size_t hand_off = size_t(mem.tails[0]) * n * sizeof(float);
     const std::vector<float> public_values(n, 1.0f), private_values(n, 4.0f);
-    const std::vector<ggml_fp16_t> initial_hand(n, ggml_fp32_to_fp16(2.0f));
+    const std::vector<float> initial_hand(n, 2.0f);
     ggml_backend_tensor_set(brain, public_values.data(), public_off, n * sizeof(float));
     ggml_backend_tensor_set(brain, private_values.data(), private_off, n * sizeof(float));
-    ggml_backend_tensor_set(hand, initial_hand.data(), hand_off, n * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(hand, initial_hand.data(), hand_off, n * sizeof(float));
     auto check_hand = [&](float expected) {
-        std::vector<ggml_fp16_t> values(n);
-        ggml_backend_tensor_get(hand, values.data(), hand_off, n * sizeof(ggml_fp16_t));
-        CHECK(std::all_of(values.begin(), values.end(), [=](ggml_fp16_t x) {
-            return ggml_fp16_to_fp32(x) == expected;
+        std::vector<float> values(n);
+        ggml_backend_tensor_get(hand, values.data(), hand_off, n * sizeof(float));
+        CHECK(std::all_of(values.begin(), values.end(), [=](float x) {
+            return x == expected;
         }));
     };
     tag.visibility = llama_rerot_visibility::public_live;
@@ -912,7 +1050,10 @@ static void test_hand_checkpoint_snapshot_capture() {
     CHECK(admit(mem, 0, 0, 3));
     llama_kv_rerot_meta tag;
     tag.episode_id = 818;
-    tag.node_id = 1;
+    // This case deliberately changes the shared brain between snapshots;
+    // use its PUBLIC root writer. Native children do not write these slots
+    // and are covered by the real snapshot/rollback trajectory above.
+    tag.node_id = 0;
     tag.visibility = llama_rerot_visibility::public_live;
     CHECK(mem.rerot_set_write_tag(0, tag));
     const size_t row = size_t(mem.tails[0]);
@@ -930,11 +1071,11 @@ static void test_hand_checkpoint_snapshot_capture() {
     const size_t n = size_t(mem.s_l[3]->ne[0]);
     const size_t br = size_t(mem.episode_brain.at(818));
     const std::vector<float> current(n, 10.0f), saved(n, 4.0f);
-    const std::vector<ggml_fp16_t> delta(n, ggml_fp32_to_fp16(2.0f));
+    const std::vector<float> delta(n, 2.0f);
     ggml_backend_tensor_set(mem.s_l[3], current.data(), br * n * sizeof(float), n * sizeof(float));
     ggml_backend_tensor_set(mem.s_l[3], saved.data(),
         (2 * mem.get_brain_capacity() + br) * n * sizeof(float), n * sizeof(float));
-    ggml_backend_tensor_set(mem.d_l[3], delta.data(), saved_row * n * sizeof(ggml_fp16_t), n * sizeof(ggml_fp16_t));
+    ggml_backend_tensor_set(mem.d_l[3], delta.data(), saved_row * n * sizeof(float), n * sizeof(float));
     CHECK(mem.seq_rm(0, 2, -1));
     const auto checkpoint = mem.capture_hand_seed(1, 0);
     CHECK(checkpoint && checkpoint->source_pos == 1);
@@ -943,10 +1084,10 @@ static void test_hand_checkpoint_snapshot_capture() {
     CHECK(std::all_of(checkpoint->state_bytes[0].begin(), checkpoint->state_bytes[0].end(),
         [](uint8_t x) { return x == 0x41; }));
     CHECK(mem.apply_hand_seed(0, checkpoint));
-    std::vector<ggml_fp16_t> actual(n);
-    ggml_backend_tensor_get(mem.d_l[3], actual.data(), row * n * sizeof(ggml_fp16_t), n * sizeof(ggml_fp16_t));
-    CHECK(std::all_of(actual.begin(), actual.end(), [](ggml_fp16_t x) {
-        return ggml_fp16_to_fp32(x) == -4.0f; // saved 4+2 = current 10+(-4)
+    std::vector<float> actual(n);
+    ggml_backend_tensor_get(mem.d_l[3], actual.data(), row * n * sizeof(float), n * sizeof(float));
+    CHECK(std::all_of(actual.begin(), actual.end(), [](float x) {
+        return x == -4.0f; // saved 4+2 = current 10+(-4)
     }));
     CHECK(mem.rs_idx[0] == 0);
 }
@@ -994,7 +1135,17 @@ static void test_hand_checkpoint_restore() {
     CHECK(snap_seq(mem, 0) == before);
 }
 
-int main() {
+int main(int argc, char ** argv) {
+    test_error_metric_rejects_invalid_outputs();
+    if (argc == 2 && std::strcmp(argv[1], "--trajectory-only") == 0) {
+        test_child_persistent_native_trajectory();
+        test_child_persistent_native_trajectory(2);
+        test_child_snapshot_rollback();
+        return g_failures == 0 ? 0 : 1;
+    }
+    test_child_persistent_native_trajectory();
+    test_child_persistent_native_trajectory(2);
+    test_child_snapshot_rollback();
     std::fprintf(stderr, "=== RERoT Recurrent Parking COW Tests ===\n");
     test_hand_checkpoint_restore();
     test_fence_replay_recurrent_oracle();
@@ -1182,7 +1333,7 @@ int main() {
             CHECK(gmem.is_s_shared(il) == (il >= 3));
             CHECK((gmem.d_l[il] != nullptr) == (il >= 3));
             if (gmem.d_l[il]) {
-                CHECK(gmem.d_l[il]->type == GGML_TYPE_F16);
+                CHECK(gmem.d_l[il]->type == GGML_TYPE_F32);
                 CHECK(gmem.d_l[il]->ne[1] == 12);
             }
         }
@@ -1288,8 +1439,7 @@ int main() {
                 ggml_row_size(gmem.d_l[il]->type, gmem.d_l[il]->ne[0]);
             const std::vector<float> public_state(n, 1.0f);
             const std::vector<float> private_state(n, 4.0f);
-            const std::vector<ggml_fp16_t> planner_delta(
-                n, ggml_fp32_to_fp16(2.0f));
+            const std::vector<float> planner_delta(n, 2.0f);
             ggml_backend_tensor_set(
                 gmem.s_l[il],
                 public_state.data(),
@@ -1320,7 +1470,7 @@ int main() {
             const size_t n = (size_t) gmem.d_l[il]->ne[0];
             const size_t row_size =
                 ggml_row_size(gmem.d_l[il]->type, gmem.d_l[il]->ne[0]);
-            std::vector<ggml_fp16_t> restored(n);
+            std::vector<float> restored(n);
             ggml_backend_tensor_get(
                 gmem.d_l[il],
                 restored.data(),
@@ -1328,9 +1478,8 @@ int main() {
                 row_size);
             CHECK(std::all_of(
                 restored.begin(), restored.end(),
-                [](ggml_fp16_t value) {
-                    return std::abs(
-                        ggml_fp16_to_fp32(value) - 5.0f) < 1.0e-6f;
+                [](float value) {
+                    return std::abs(value - 5.0f) < 1.0e-6f;
                 }));
         }
 
@@ -1467,17 +1616,17 @@ int main() {
             CHECK(std::all_of(brain.begin(), brain.end(), [](float value) {
                 return std::abs(value - 2.0f * std::sqrt(0.5f * 0.25f)) < 1.0e-6f;
             }));
-            std::vector<ggml_fp16_t> hand(D * 3);
+            std::vector<float> hand(D * 3);
             ggml_backend_tensor_get(
-                graph_mem.d_l[3], hand.data(), 0, hand.size() * sizeof(ggml_fp16_t));
-            CHECK(std::all_of(hand.begin(), hand.begin() + D, [](ggml_fp16_t value) {
-                return ggml_fp16_to_fp32(value) == 0.0f;
+                graph_mem.d_l[3], hand.data(), 0, hand.size() * sizeof(float));
+            CHECK(std::all_of(hand.begin(), hand.begin() + D, [](float value) {
+                return value == 0.0f;
             }));
-            CHECK(std::all_of(hand.begin() + D, hand.begin() + 2 * D, [](ggml_fp16_t value) {
-                return std::abs(ggml_fp16_to_fp32(value) - 0.5f) < 1.0e-6f;
+            CHECK(std::all_of(hand.begin() + D, hand.begin() + 2 * D, [](float value) {
+                return std::abs(value - 0.5f) < 1.0e-6f;
             }));
-            CHECK(std::all_of(hand.begin() + 2 * D, hand.end(), [](ggml_fp16_t value) {
-                return std::abs(ggml_fp16_to_fp32(value) - 2.0f) < 1.0e-6f;
+            CHECK(std::all_of(hand.begin() + 2 * D, hand.end(), [](float value) {
+                return std::abs(value - 2.0f) < 1.0e-6f;
             }));
             ggml_backend_buffer_free(graph_buffer);
             ggml_backend_free(cpu);
@@ -1531,7 +1680,7 @@ int main() {
         CHECK(!plain.is_s_shared(IL));
         CHECK(grouped.is_s_shared(IL));
         CHECK(grouped.d_l[IL] != nullptr);
-        CHECK(grouped.d_l[IL]->type == GGML_TYPE_F16);
+        CHECK(grouped.d_l[IL]->type == GGML_TYPE_F32);
 
         auto make_vec = [](int64_t n, uint64_t seed, bool is_gate, bool is_beta) {
             std::vector<float> v((size_t) n);

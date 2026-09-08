@@ -80,6 +80,7 @@ public:
 
     void set_grouped_layout(uint32_t n_brains, uint32_t n_hands) override;
     bool is_grouped_layout() const { return n_brain_rows > 0 && n_hand_rows > 0; }
+    bool uses_native_child_state(llama_seq_id seq_id) const;
     bool is_s_shared(int32_t il) const;
 
     // Shared fork hand seed (§B.6.4):

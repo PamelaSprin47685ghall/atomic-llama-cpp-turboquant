@@ -9317,15 +9317,22 @@ void ggml_compute_forward_flash_attn_ext_rerot(
         scale /= logit_softcap;
     }
 
+    const bool full_f32 = dst->op_params[3] == GGML_PREC_F32;
+    GGML_ASSERT(full_f32 || dst->op_params[3] == GGML_PREC_DEFAULT);
     const ggml_type k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
     const ggml_from_float_t q_to_vec_dot = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
     const ggml_vec_dot_t kq_vec_dot = ggml_get_type_traits_cpu(k->type)->vec_dot;
+    const ggml_to_float_t k_to_float = ggml_get_type_traits(k->type)->to_float;
     const ggml_to_float_t v_to_float = ggml_get_type_traits(v->type)->to_float;
 
-    GGML_ASSERT(q_to_vec_dot && kq_vec_dot && "RERoT attention: unsupported K type");
+    GGML_ASSERT((full_f32 ? (k->type == GGML_TYPE_F32 || k_to_float) : (q_to_vec_dot && kq_vec_dot)) &&
+        "RERoT attention: unsupported K type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float) && "RERoT attention: unsupported V type");
 
-    const size_t q_row_size = ggml_row_size(k_vec_dot_type, DK);
+    // Explicit F32 keeps the original Q. Reuse this scratch row to decode K
+    // instead of downcasting Q to F16/BF16 or quantizing it for an integer dot.
+    // Keep the planner's FLASH_ATTN_EXT_REROT allocation in sync.
+    const size_t q_row_size = ggml_row_size(full_f32 ? GGML_TYPE_F32 : k_vec_dot_type, DK);
     const size_t q_row_padded = GGML_PAD(q_row_size, CACHE_LINE_SIZE);
     const size_t accum_bytes = size_t(DV) * sizeof(float);
     const size_t temp_bytes = size_t(DV) * sizeof(float);
@@ -9357,6 +9364,7 @@ void ggml_compute_forward_flash_attn_ext_rerot(
         memset(accum, 0, accum_bytes);
 
         int32_t loaded_group = -1;
+        const float * q_data = nullptr;
         for (int32_t ie = begin; ie < end; ++ie) {
             const int32_t key_index   = entry_data[2 * ie + 0];
             const int32_t group_index = entry_data[2 * ie + 1];
@@ -9364,16 +9372,25 @@ void ggml_compute_forward_flash_attn_ext_rerot(
             GGML_ASSERT(group_index >= 0 && group_index < q->ne[1]);
 
             if (loaded_group != group_index) {
-                const float * q_data = (const float *) ((const char *) q->data +
+                q_data = (const float *) ((const char *) q->data +
                     size_t(group_index) * q->nb[1] + size_t(head) * q->nb[2]);
-                q_to_vec_dot(q_data, q_buf, DK);
+                if (!full_f32) q_to_vec_dot(q_data, q_buf, DK);
                 loaded_group = group_index;
             }
 
             const char * k_data = (const char *) k->data +
                 size_t(key_index) * k->nb[1] + size_t(k_head) * k->nb[2];
             float score = 0.0f;
-            kq_vec_dot(DK, &score, 0, k_data, 0, q_buf, 0, 1);
+            if (full_f32) {
+                const float * k_f32 = (const float *) k_data;
+                if (k->type != GGML_TYPE_F32) {
+                    k_to_float(k_data, (float *) q_buf, DK);
+                    k_f32 = (const float *) q_buf;
+                }
+                ggml_vec_dot_f32(DK, &score, 0, k_f32, 0, q_data, 0, 1);
+            } else {
+                kq_vec_dot(DK, &score, 0, k_data, 0, q_buf, 0, 1);
+            }
             score *= scale;
             if (logit_softcap != 0.0f) {
                 score = logit_softcap * tanhf(score);

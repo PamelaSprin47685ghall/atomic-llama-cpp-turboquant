@@ -3040,7 +3040,9 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         const int64_t DK = node->src[1]->ne[0];
                         const int64_t DV = node->src[2]->ne[0];
-                        const enum ggml_type vec_dot_type = type_traits_cpu[node->src[1]->type].vec_dot_type;
+                        // F32 indexed attention decodes K here without rounding Q.
+                        const enum ggml_type vec_dot_type = node->op_params[3] == GGML_PREC_F32
+                            ? GGML_TYPE_F32 : type_traits_cpu[node->src[1]->type].vec_dot_type;
                         const size_t q_row = GGML_PAD(ggml_row_size(vec_dot_type, DK), CACHE_LINE_SIZE);
                         cur += (q_row + 2 * sizeof(float) * DV + CACHE_LINE_SIZE) * n_tasks;
                     } break;

@@ -929,6 +929,41 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_row_size(gdn_out->type, attn_score_elems));
 
     if (mctx_cur->is_s_shared(il)) {
+        GGML_ASSERT(state_base != nullptr && hand_echo_all != nullptr);
+        // Rollback changes how many states are retained, not the recurrence.
+        // The GDN snapshots are complete lane-local states. Keep each hand
+        // snapshot relative to that snapshot's committed brain (or the
+        // unchanged input brain for non-committing child/private rows).
+        // Previously only the shared brain was written here: child rows do
+        // not commit that brain, so enabling rollback silently lost every
+        // recurrent transition after its immediate output.
+        ggml_tensor * base_rows = ggml_reshape_2d(ctx0, state_base, D, n_seqs);
+        for (int64_t snapshot = 0; snapshot < n_written; ++snapshot) {
+            ggml_tensor * candidate = ggml_view_2d(ctx0, src, D, n_seqs,
+                src->nb[1], (size_t) snapshot * src->nb[2]);
+            ggml_tensor * reference = base_rows;
+            for (const auto & group : inp->rbb_groups) {
+                ggml_tensor * rows = rerot_rbb_rows(group, shared_rbb);
+                if (!rows || rows->ne[0] == 0) {
+                    continue;
+                }
+                ggml_tensor * selected = ggml_get_rows(ctx0, candidate, rows);
+                ggml_tensor * committed = selected;
+                if (rows->ne[0] > 1) {
+                    committed = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, selected)));
+                    committed = ggml_scale(ctx0, committed, 1.0f / (float) rows->ne[0]);
+                }
+                committed = ggml_reshape_2d(ctx0, committed, D, 1);
+                reference = ggml_set_rows(ctx0, reference,
+                    ggml_repeat(ctx0, committed, selected), rows);
+            }
+            ggml_tensor * hand = ggml_sub(ctx0, candidate, reference);
+            ggml_tensor * destination = ggml_view_2d(ctx0, hand_echo_all, D, n_seqs,
+                hand_echo_all->nb[1],
+                ((size_t) snapshot * mem_size + kv_head) * hand_echo_all->nb[1]);
+            // Materialize all hands before updating any shared brain buffer.
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, hand, destination));
+        }
         build_rbb_parallel_commit(
             inp, ssm_states_all, src, n_written, il);
     } else {

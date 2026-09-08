@@ -20,11 +20,39 @@ import urllib.error
 import urllib.request
 
 
+def resolve_context(context: int | None, total_kv: str) -> int:
+    """Keep an explicit manual capacity legal without silently changing it."""
+    if context is not None and context < 1:
+        raise ValueError('context must be >= 1')
+    if total_kv == 'auto':
+        return 131072 if context is None else context
+    try:
+        capacity = int(total_kv)
+    except ValueError as exc:
+        raise ValueError('total-kv must be auto or a positive integer') from exc
+    if capacity < 1:
+        raise ValueError('total-kv must be >= 1')
+    if context is None:
+        return min(131072, capacity)
+    if context > capacity:
+        raise ValueError('without TriAttention, manual total-kv must be >= context; '
+                         'choose an explicit smaller --context or use --total-kv auto')
+    return context
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', required=True)
     parser.add_argument('--build-dir', default='build-vulkan-localhost')
-    parser.add_argument('--context', type=int, default=131072)
+    parser.add_argument('--context', type=int, help='default: 131072 for auto KV; min(131072,total-kv) for manual KV')
     parser.add_argument('--total-kv', default='auto', help='auto for production-style joint B/P/K fitting, or an explicit token capacity')
     parser.add_argument('--parallel', type=int, help='explicit server slot count; only valid with non-auto total-kv for RERoT')
     parser.add_argument('--cache', choices=('turbo', 'f16'), default='turbo', help='f16 is an explicit numerical control, not the production gate')
@@ -43,6 +71,11 @@ def main() -> int:
     parser.add_argument('--ancestors-only', action='store_true', help='research control: no peer lexical KV; never a release run')
     parser.add_argument('--concurrency', type=int, default=1, help='independent RERoT-OFF requests for batched-backend control')
     args = parser.parse_args()
+    requested_context = args.context
+    try:
+        args.context = resolve_context(args.context, args.total_kv)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.concurrency < 1 or (args.concurrency != 1 and not args.serial_baseline):
         parser.error('concurrency >1 is restricted to the explicit RERoT-OFF baseline')
     if args.parallel is not None and args.parallel < 1:
@@ -101,8 +134,12 @@ def main() -> int:
         env['LLAMA_REROT_AUDIT_DIR'] = str(run / 'tensor-audit')
     save_json('request.json', request)
     save_json('args.json', ['<redacted>' if value == key else value for value in command])
-    libraries = ['llama-server', 'libllama-server-impl.so', 'libllama.so', 'libggml-vulkan.so', 'libggml-cpu.so']
-    save_json('hashes.json', {name: hashlib.sha256((bindir / name).read_bytes()).hexdigest() for name in libraries})
+    libraries = ['llama-server', 'libllama-server-impl.so', 'libllama.so', 'libllama-common.so',
+                 'libmtmd.so', 'libggml.so', 'libggml-base.so', 'libggml-vulkan.so', 'libggml-cpu.so']
+    save_json('hashes.json', {name: sha256_file(bindir / name) for name in libraries})
+    save_json('library-paths.json', {name: str((bindir / name).resolve()) for name in libraries})
+    save_json('environment.json', {name: value for name, value in env.items()
+                                 if name.startswith(('LLAMA_', 'GGML_', 'VK_')) or name == 'LD_LIBRARY_PATH'})
     repo = Path(__file__).resolve().parents[1]
     def capture(argv: list[str]) -> str:
         return subprocess.run(argv, cwd=repo, env=env, text=True, stdout=subprocess.PIPE,
@@ -112,6 +149,7 @@ def main() -> int:
         'status_porcelain': capture(['git', 'status', '--porcelain=v1']),
         'server_version': capture([str(bindir / 'llama-server'), '--version']),
     })
+    (run / 'source.patch').write_text(capture(['git', 'diff', '--binary']) + '\n', encoding='utf-8')
     save_json('diagnostics.json', {'audit': args.audit, 'serial_baseline': args.serial_baseline,
                                 'rbb_ablation': args.rbb_ablation,
                                 'frontier': args.frontier,
@@ -120,6 +158,9 @@ def main() -> int:
                                 'concurrency': args.concurrency,
                                 'cache': args.cache,
                                 'response_timeout': args.timeout, 'context': args.context,
+                                'context_requested': requested_context,
+                                'context_resolution': 'explicit' if requested_context is not None else
+                                    ('auto-default' if args.total_kv == 'auto' else 'manual-capacity-default'),
                                 'total_kv': args.total_kv, 'parallel': args.parallel,
                                 'seed': args.seed, 'temperature': args.temperature,
                                 'max_tokens': args.max_tokens})
@@ -151,6 +192,20 @@ def main() -> int:
                 time.sleep(0.5)
             else:
                 raise TimeoutError('server readiness timeout')
+            # Record what the live process actually mapped, not just sonames
+            # next to the wrapper binary. This also catches library-path drift.
+            maps = Path(f'/proc/{proc.pid}/maps')
+            if maps.is_file():
+                mapped = maps.read_text()
+                (run / 'process-maps.txt').write_text(mapped, encoding='utf-8')
+                selected = set()
+                for line in mapped.splitlines():
+                    fields = line.split(None, 5)
+                    if len(fields) == 6 and fields[5].startswith('/'):
+                        path = Path(fields[5])
+                        if path.name.startswith(('libllama', 'libggml', 'libmtmd')) and path.is_file():
+                            selected.add(path)
+                save_json('mapped-library-hashes.json', {str(path): sha256_file(path) for path in sorted(selected)})
             (run / 'metrics-before.txt').write_bytes(http('/metrics')[1])
             def inference(index: int) -> dict:
                 start = time.monotonic()

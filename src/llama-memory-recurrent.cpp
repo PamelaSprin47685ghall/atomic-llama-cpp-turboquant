@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -135,7 +136,11 @@ llama_memory_recurrent::llama_memory_recurrent(
         ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), s_rows);
         ggml_tensor * d = shared_s
             ? ggml_new_tensor_2d(
-                ctx, GGML_TYPE_F16, hparams.n_embd_s(),
+                // This is persistent recurrent state, not a lossy KV cache.
+                // F16 overlays round every child transition even when DDVR
+                // inputs are identical to native; one-step output tests miss
+                // the loss because output precedes this store.
+                ctx, GGML_TYPE_F32, hparams.n_embd_s(),
                 mem_size * (1 + n_rs_seq))
             : nullptr;
         ggml_format_name(r, "cache_r_l%d", i);
@@ -166,7 +171,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         const size_t memory_size_s = size_s_bytes();
         const size_t memory_size_d = size_d_bytes();
 
-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u hand rows, %3d layers, %2u seqs %2u rs_seq, %u brain rows), R (%s): %7.2f MiB, S (%s): %7.2f MiB, hand state (f16): %7.2f MiB\n", __func__,
+        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u hand rows, %3d layers, %2u seqs %2u rs_seq, %u brain rows), R (%s): %7.2f MiB, S (%s): %7.2f MiB, hand state (f32): %7.2f MiB\n", __func__,
                 (float)(memory_size_r + memory_size_s + memory_size_d) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq, n_brain_rows,
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f),
@@ -1008,6 +1013,16 @@ void llama_memory_recurrent::clear_hand_row(int32_t hand_row) {
     }
 }
 
+bool llama_memory_recurrent::uses_native_child_state(llama_seq_id seq_id) const {
+    if (!is_grouped_layout() || seq_id < 0 || (size_t) seq_id >= seq_node.size() ||
+        seq_episode[(size_t) seq_id] == 0 || seq_node[(size_t) seq_id] == 0 ||
+        seq_node[(size_t) seq_id] == LLAMA_REROT_NODE_INVALID) {
+        return false;
+    }
+    const char * mode = std::getenv("LLAMA_REROT_RBB_ABLATION");
+    return !mode || (std::strcmp(mode, "shared-rbb") != 0 && std::strcmp(mode, "raw-redundant") != 0);
+}
+
 bool llama_memory_recurrent::rerot_set_write_tag(
         llama_seq_id seq_id,
         const llama_kv_rerot_meta & tag) {
@@ -1040,15 +1055,15 @@ bool llama_memory_recurrent::rerot_set_write_tag(
                 }
                 const size_t n = (size_t) s_l[il]->ne[0];
                 std::vector<float> public_brain(n), private_brain(n);
-                std::vector<ggml_fp16_t> hand(n);
+                std::vector<float> hand(n);
                 ggml_backend_tensor_get(s_l[il], public_brain.data(), (size_t) row * n * sizeof(float), n * sizeof(float));
                 ggml_backend_tensor_get(s_l[il], private_brain.data(),
                     ((size_t) n_brain_rows + row) * n * sizeof(float), n * sizeof(float));
-                std::memcpy(hand.data(), seed->state_bytes[il].data(), n * sizeof(ggml_fp16_t));
+                std::memcpy(hand.data(), seed->state_bytes[il].data(), n * sizeof(float));
                 for (size_t i = 0; i < n; ++i) {
-                    hand[i] = ggml_fp32_to_fp16(ggml_fp16_to_fp32(hand[i]) + public_brain[i] - private_brain[i]);
+                    hand[i] = hand[i] + public_brain[i] - private_brain[i];
                 }
-                std::memcpy(seed->state_bytes[il].data(), hand.data(), n * sizeof(ggml_fp16_t));
+                std::memcpy(seed->state_bytes[il].data(), hand.data(), n * sizeof(float));
             }
         }
         if (!apply_hand_seed(seq_id, seed)) {
@@ -1171,14 +1186,14 @@ std::shared_ptr<llama_memory_recurrent::hand_seed> llama_memory_recurrent::captu
         }
 
         ggml_tensor * hand_state = d_l[il];
-        if (!private_planner && snapshot == 0) {
+        if (!private_planner && (snapshot == 0 || uses_native_child_state(source_seq))) {
             read_row(hand_state, seed->state_bytes[il]);
             continue;
         }
 
         ggml_tensor * brain_state = s_l[il];
         if (brain_state->type != GGML_TYPE_F32 ||
-            hand_state->type != GGML_TYPE_F16 ||
+            hand_state->type != GGML_TYPE_F32 ||
             brain_state->ne[0] != hand_state->ne[0]) {
             return nullptr;
         }
@@ -1189,8 +1204,8 @@ std::shared_ptr<llama_memory_recurrent::hand_seed> llama_memory_recurrent::captu
             ggml_row_size(hand_state->type, hand_state->ne[0]);
         std::vector<float> public_brain(n);
         std::vector<float> private_brain(n);
-        std::vector<ggml_fp16_t> planner_hand(n);
-        std::vector<ggml_fp16_t> child_hand(n);
+        std::vector<float> planner_hand(n);
+        std::vector<float> child_hand(n);
         ggml_backend_tensor_get(
             brain_state,
             public_brain.data(),
@@ -1209,10 +1224,7 @@ std::shared_ptr<llama_memory_recurrent::hand_seed> llama_memory_recurrent::captu
             local_row * hand_row_size,
             hand_row_size);
         for (size_t i = 0; i < n; ++i) {
-            child_hand[i] = ggml_fp32_to_fp16(
-                private_brain[i] +
-                ggml_fp16_to_fp32(planner_hand[i]) -
-                public_brain[i]);
+            child_hand[i] = private_brain[i] + planner_hand[i] - public_brain[i];
         }
         seed->state_bytes[il].resize(hand_row_size);
         std::memcpy(
@@ -1236,7 +1248,7 @@ bool llama_memory_recurrent::apply_hand_seed(
     }
 
     // Validate the complete checkpoint before allocating a cell or writing
-    // any layer. SEE2 contains every existing conv/local-state/hand row.
+    // any layer. SEE3 contains every existing conv/local-state/F32 hand row.
     if (seed->conv_tail_bytes.size() != r_l.size() ||
         seed->state_bytes.size() != s_l.size()) {
         return false;
@@ -1365,7 +1377,7 @@ bool llama_memory_recurrent::rerot_capture_hand_seed(llama_seq_id source_seq, st
         return false;
     }
 
-    const uint32_t magic = 0x32454553; // 'SEE2'
+    const uint32_t magic = 0x33454553; // 'SEE3': F32 persistent hand, no implicit SEE2 conversion
     const uint32_t n_conv = uint32_t(seed->conv_tail_bytes.size());
     const uint32_t n_state = uint32_t(seed->state_bytes.size());
 
@@ -1420,7 +1432,7 @@ bool llama_memory_recurrent::rerot_apply_hand_seed(llama_seq_id dest_seq, const 
     };
 
     uint32_t magic = 0;
-    if (!read_u32(magic) || magic != 0x32454553) {
+    if (!read_u32(magic) || magic != 0x33454553) {
         return false;
     }
 
@@ -2084,7 +2096,11 @@ int32_t llama_memory_recurrent_context::brain_copy(int i) const {
         seq_id >= 0 && (size_t) seq_id < mem->rs_idx.size()
             ? mem->rs_idx[(size_t) seq_id]
             : 0;
-    if (snapshot == 0 || private_planner) {
+    // A default child never committed the shared-brain snapshot slots. Its
+    // rollback selector belongs to its private hand, not to the root's (often
+    // unwritten) historical brain slots. Pair the saved hand with the same
+    // unchanged public brain used when it was produced.
+    if (snapshot == 0 || private_planner || mem->uses_native_child_state(seq_id)) {
         return row;
     }
     return (int32_t) (

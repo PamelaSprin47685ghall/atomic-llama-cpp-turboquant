@@ -4,7 +4,7 @@
 
 本班按“数学定义 → 实现 → 语义测试 → 最后才性能”推进。以下是局部修复记录，不是 RERoT 完成交付报告。接班时工作树已经有未提交改动；本班在其上修改，没有清理、提交、推送或部署。
 
-**最新状态见 §7。§1–§6 保留前两轮证据：完整 fence 已接入，一行 child 限制已撤销；真实回答质量仍未通过。**
+**最新状态见 §10（2026-09-08）。前文保留历史证据，不覆盖当前 child native recurrence、STRONG barrier-after 和随机 ID completion 定义。真实回答质量仍未通过。**
 
 ## 1. 数学上先纠正两项规定
 
@@ -399,3 +399,150 @@ max    = 95% * M
 开源实现并非完全一致。OpenRouter 对 budget-only 模型公开的比例是 `low=.20 / medium=.50 / high=.80 / xhigh=.95 / max=.95`；Cline 的完整 effort ladder 是 `none=0 / minimal=.10 / low=.20 / medium=.50 / high=.80 / xhigh=.95 / max=1.00`。因为本项目 API 同时暴露 `xhigh` 和 `max`，fallback 采用 Cline 的 distinct-max 语义：`max=100%`，再由 `budget < max_tokens` 的硬约束落成至多 `max_tokens-1`。这仍然只是 budget-only 兼容层，不冒充 Anthropic adaptive effort 的模型原生分配。
 
 测试：`test-chat` 覆盖五档 template kwarg、五档 8192 output budget 映射（1638/4096/6553/7782/8191）、无有限 output cap 时不制造 synthetic budget、显式 budget override、非法 effort 拒绝，以及 Responses `reasoning.effort -> reasoning_effort`。最后相关 CTest 8/8、`test-chat` all passed、child parser 0 failures，`git diff --check` 通过；生产服务保持 inactive。
+
+## 10. 2026-09-08：recurrent rollback 修复与真实决策分叉定位
+
+### 10.1 本轮基线和已有 F32 修复
+
+基线仍为 `master...origin/master`，HEAD `205913a2af1846521687fc8d47bf91df459ae8bd`。本节记录未提交工作树，不能只用这个 HEAD 或 build number 复现；必须同时使用各 run 的 `source.patch`、`source.json`、库哈希和完整参数。
+
+恢复工具时，工作树已有 full-F32 scalar/indexed attention、F32 persistent hand 及相关测试修改。本轮保留并验证，不把这些已有改动冒充新的修复：
+
+- ordinary scalar 的非 MMQ F32 路径不再在 Q staging、softmax/PV 中偷偷回到 F16；indexed 路径的 Turbo dequant 也使用 F32 模块，shared-memory 预算与实际模块一致。
+- persistent hand 从 F16 改为 F32；SEE3 hand seed 明确拒绝旧 SEE2 格式。原生 recurrent state 不是可任意有损压缩的 KV cache。
+- 已有 128 步确定性 recurrent 反例：F16 hand 的 output/state 误差约 `5.76e-4 / 1.72e-3`；F32 降到 `3.58e-7 / 7.15e-7`。证据在 `/tmp/rerot-p0-fix-20260908-_gintnjm`。
+
+### 10.2 新修复：rollback 开关改变了 child 方程
+
+`build_recurrent_attn` 的 `n_rs_seq > 0` 分支原来只提交 shared brain，没有保存 hand snapshots。默认 child 不提交 shared brain，因此即使没有真正执行 rollback，仅启用两个 rollback slots 就会丢失持续 recurrent transition。单步 output 测试看不到这件事。
+
+新增生产 graph/memory 路径反例，128 步结果：
+
+| rollback slots | 修复前 output/state 最大误差 | 修复后 output/state 最大误差 |
+|---:|---:|---:|
+| 0 | `3.58e-7 / 7.15e-7` | `3.58e-7 / 7.15e-7` |
+| 2 | `2.17231 / 1.14956` | `2.68e-7 / 7.15e-7` |
+
+现在每份完整 GDN state snapshot 都保存对应的 hand：默认 child 以不变 input brain 为参照，真正 shared writer 以本 snapshot 的实际 committed brain 为参照。先写齐 hand，再提交 brain。
+
+继续执行“三份 snapshot → 丢弃 suffix → 续跑”又发现第二个错误：child hand 的 rollback index 被错误地用于选择 root 的历史 brain 槽。默认 child 从未写过这些槽。已在 `brain_copy` 和 `capture_hand_seed` 中区分 native child 与实际 shared writer，保留 PUBLIC root 的 snapshot rebasing。回归同时覆盖三份快照、`seq_rm`、checkpoint capture/apply 和 resume。
+
+核心数学、CG、重复证据 normalization、默认 child 策略和结束协议均未回退。
+
+### 10.3 固定旧 tape：rollback 0/2 已经数值一致，但不能宣告总体等价
+
+使用修复前保存的 `/tmp/rerot-p0-fix-20260908-_gintnjm/teacher.tape`，prompt 为原始文本 `世界上每个大洲有哪些国家`，无 eval callback，128 步：
+
+| KV | argmax mismatch | logits 相对 L2 最大值 |
+|---|---:|---:|
+| Turbo4/Turbo2 | 0/128 | 0.0742375 |
+| F16/F16 | 0/128 | 0.0348572 |
+
+每种 KV 下，rollback 0 与 2 的逐步 logits 报告完全相同。prefill logits 完全相同。这证明本反例中的 rollback 开关不再改变持续推理；几个百分点的误差仍然存在，不能说所有 shape sensitivity 已解决。
+
+诊断现在默认严格检查，分叉返回失败；`--report-only` 才明确允许只报告。prefill 非有限值/不相等也失败。显式 `--precision-only` 没有 GPU 时不再 skip-success。I32 expert IDs 单独报告排序变化与集合变化，不再把编号差当作浮点 activation 误差。
+
+### 10.4 512 步反例及 counterfactual：第 29 层 expert membership 改变最终 token
+
+另生成 512 步 native Turbo teacher tape，并让 F16 使用同一份 tape。这不是上面的旧 tape，不能把旧实验的 step=33 与下面的 step=509 当成同一输入的前后延迟指标。
+
+- Turbo：1/512 argmax mismatch，首次 step=509（零起算），原生 token `97852`，RERoT token `134536`；严格进程 exit 1。
+- F16：0/512 mismatch，但 logits relative L2 最高仍到 0.132615。
+- 两种模式 prefill 都完全相等。所有 run 保存源码 diff、实际加载库路径/哈希及参数；运行期间源码和库哈希不变。
+
+在 step=509 完整逐层 trace 中再次复现同一分叉，logits 相对 L2 `0.0953225`，与无插桩的 `0.0953226` 接近：
+
+1. 第一处非零浮点差异是 A3 attention output，relative L2 `2.43e-7`；A19 上升到 `0.00133105`，A27 到 `0.0379533`。
+2. 十层 full attention 的 visible key 集合、顺序均相同（516 keys，单 Q group）；A3 实际 K/V 字节也相同。A19 已有历史 Turbo K 的离散 code 差异，后续层差异增多，不能只看当前 Q/K/V 投影。
+3. 第 26/28 层仅 selected expert 顺序变化。第 29 层第一次改变选中的 expert 集合：native 的 `203` 被 RERoT 的 `5` 替代。
+4. **仅在诊断中**将第 29 层的 8 个 selected expert IDs 换回 native 值，其他历史不变，最终 token 恢复为 `97852`。这是本反例一个可直接改变 sampled decision 的位置。
+
+counterfactual 不是 production 修复，也不证明 router 算错了。上游细微误差、量化阈值和历史状态仍须继续定位；不得把 native expert ID 硬塞进生产来掩盖差异。这一因果实验也尚未证明就是 9.11 数字漂移的根因。
+
+### 10.5 短题 smoke：完成改善，数字漂移仍在
+
+先发现 harness 配置错误：旧默认 `context=131072` 与显式 `total-kv=8192` 不相容，server 在模型初始化阶段拒绝，未产生回答。未放宽 server 的检查；脚本改为：manual KV 且未显式给 context 时选择 `min(131072,total-kv)`，显式冲突报错，auto 仍保留原默认。请求内容、采样和结束协议不变，解析后的容量写入 diagnostics。
+
+沿用短题、seed=424242、temperature=0、max_tokens=512、KV8192/parallel2，解析后的 context8192：
+
+```text
+evidence = /tmp/rerot-semantic-5k83b_1v
+HTTP = 200
+wall = 17.991691 s
+finish_reason = stop
+root children = 3
+```
+
+三个 child 都通过 `injection=0` 的采样自然生成自己的 random-ID close。最终回答正确比较 `9.9 > 9.11`。但是第一 child 的公开正文仍出现 `3.9 和 3.11`、字面 `</think>`，另有重复标题；对应 trace 也都是 `injection=0`。这是模型生成偏航，不是 PRIVATE transport 直接泄漏。不能据此宣布语义质量通过，不能用去字串或更换结束条件遮住它。
+
+本次 context 明确为8192，不冒充之前其他 capacity/context 配置的严格质量 A/B。
+
+### 10.6 验证与后续入口
+
+主证据目录：`/tmp/rerot-resume-fix-20260908-tdq0ptmb`。重点看：
+
+```text
+rollback-before.log                 # 修复前失败
+final-build.log / final-ctest.log    # 最终 build / 9 of 9 PASS
+frozen128-*-rollback*/              # 同一旧 tape，rollback 0/2
+extended512-turbo/                  # 无插桩、step509 真实失败
+trace509-turbo/ / step509-tensors/   # 逐层原始张量
+counterfactual509-moe29/            # 仅诊断注入，不能作 production pass
+counterfactual-summary.json
+step509-kv-differences.json
+```
+
+最终提供的 build targets 构建成功，CTest `rerot|kv-cells|triattention-score` 为 **9/9 PASS**（原8项加新 harness 测试）。原有 child mixed-batch CPU/Vulkan regression 保留。生产服务保持 inactive，没有部署、重启、提交或推送，两个原有未跟踪项未动。
+
+下一条数值路线已明确：使用保存的512 tape，回溯 A19 首个不同 Turbo K code 对应的历史 token（本快照最早物理 key397），固定量化前 tensor 和持久 state，区分舍入起点与离散阈值放大；不要改 prompt 或强制 router 决策。
+
+## 11. 2026-09-08 后续核对：CPU F32 indexed attention 与误差门禁
+
+本次实际恢复了命令执行和写入，在已有未提交修改上继续；§10 的 Vulkan full-F32、F32 hand、rollback 修复不是本次新增代码。没有改默认 child 定义、RBB 数学、STRONG frontier 或 completion 协议。
+
+### 11.1 先修数值测试的假通过
+
+`test-rerot-attn.cpp::max_abs_diff` 使用较短向量长度比较，且 `std::max(m, NaN)` 会保留旧的 `m`。因此空输出、长度不一致、NaN 可能被报告为零误差。recurrent 的同类函数已有长度 CHECK，但同样会忽略 NaN。
+
+已先加入失败反例，两个 focused 进程均返回 1；再修改两个比较器：空输出、长度不一致、任一侧非有限数统一返回正无穷误差。反例覆盖 NaN、正负无穷在左侧、右侧和两侧同时出现，不再依赖正常张量恰好不产生 NaN。
+
+### 11.2 独立 double 参考暴露了 CPU 的 Q 降精度
+
+精度测试现在对 F16 和 Turbo 都从实际相同的量化 K/V 字节解码，独立使用 double 累加 QK、softmax、PV；不调用任一 attention 算子生成参考答案。CPU indexed 和 Vulkan ordinary/indexed 都分别与它比较。
+
+这直接发现 CPU `ggml_compute_forward_flash_attn_ext_rerot` 无视显式 F32 选择，按 K 的 vec-dot 类型转换 Q。F16 K 会使原始 F32 Q 先舍入成 F16。修改仅限 RERoT indexed 的 `GGML_PREC_F32`：保留 Q，按需把 K 解码到 F32 后点积；普通 attention 和 indexed DEFAULT 分支不变。CPU scratch planner 同步按 F32 K 临时行预算，避免扩大缓冲使用却不扩大分配。
+
+| 独立 double 参考，F16 KV | CPU 修复前最大绝对误差 | CPU 修复后 |
+|---|---:|---:|
+| 33 keys | 5.55948e-5 | 1.19209e-7 |
+| 257 keys | 2.067e-5 | 8.9407e-8 |
+
+Turbo CPU 的同两项最终为 `1.19209e-7 / 8.9407e-8`。Vulkan 两条路径在这些 F16/Turbo 合成用例中均不超过 `1.19209e-7`。CPU 参考门即使没有 GPU 也会执行；显式 GPU gate 仍不得 skip-success。这些结果不是完整模型或所有 tensor shape 的误差上界。
+
+### 11.3 当前真实模型问题仍未解决
+
+本次旧 `/tmp` 证据目录受工作区读取权限限制，没有重放旧 step33 tape。另生成并保存 512 步 native Turbo tape，随后所有模式都读取这同一份外部 tape，均不安装 eval callback。
+
+| KV / rollback slots | argmax mismatch | 首次分叉（零起算） | logits 相对 L2 最大值 | 真实测试 exit |
+|---|---:|---:|---:|---:|
+| Turbo / 0 | 1/512 | 509 | 0.118488 | 1 |
+| Turbo / 2 | 1/512 | 509 | 0.118488 | 1 |
+| F16 / 0 | 0/512 | 无 | 0.132615 | 0 |
+
+三种 prefill 完全相同。CPU 修复前后的 Turbo 本反例都在 step509 分叉，不能把 CPU 修复说成 Vulkan 根因修复，也不能把历史 step33 与本次 step509 当成同一输入的前后改善。本次未重新执行 9.11 chat smoke，语义质量状态仍按 §10.5 保留为未通过。
+
+### 11.4 验证与证据
+
+证据使用仓库内被构建目录忽略的相对路径，便于后续工作区读取：
+
+```text
+build-vulkan-localhost/rerot-evidence/20260908-AuxjZd/
+  guard-red-attn.log / guard-red-recurrent.log  # 误差门禁修复前失败
+  guard-green-attn.log                         # 独立参考抓到 CPU Q 精度错误，exit 1
+  final-precision.log / final-trajectory.log
+  final-build.log / final-ctest.log             # build 成功，9/9 PASS
+  model512-inherited/teacher.tape              # 本次新生成的固定输入
+  final512-{turbo,f16}-rollback*/               # 源码 diff、参数、log、exit、库哈希
+```
+
+每次最终真实模型运行的前后 artifact 哈希相同。128 步 recurrent focused 测试：rollback0 output/state `3.57628e-7 / 7.15256e-7`，rollback2 `2.68221e-7 / 7.15256e-7`；三快照、suffix discard、capture/apply/resume 回归通过。未部署、未提交、未推送；下一步仍应查 Vulkan 长轨迹舍入/量化阈值放大，不调 prompt 或伪造结束。
