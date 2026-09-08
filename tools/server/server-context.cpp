@@ -1868,10 +1868,10 @@ private:
 
     static std::string rerot_serial_resume_prompt(bool child_fence) {
         // Guide §21.4: "PRIVATE 注入简短的串行继续指令（结合已公开推导完成思考，并按模型原生格式进入回答）"
+        // Keep it concise and command-oriented to avoid inducing question echo in the serial output.
         return child_fence
-            ? "\n我已完成对上述所有任务项的并发思考梳理。现在结合上述公开推导完成思考，并直接给出条理清晰的最终答案：\n"
-            : "\n这个内容块不需要并行。我完成剩余思考，"
-              "现在按照当前模型的原生对话格式给出最终回答。\n";
+            ? "\n并发推导完成。现在直接输出最终回答，不要重述问题，不要再输出标题：\n"
+            : "\n这个内容块不需要并行。直接给出最终回答，不要重述问题。\n";
     }
 
     bool rerot_set_injection(

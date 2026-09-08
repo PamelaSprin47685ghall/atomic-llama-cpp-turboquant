@@ -229,6 +229,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-flashprefill-state PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 
     llama_build_and_test(test-backend-memmove.cpp)
+    llama_build_and_test(test-vulkan-moe-threshold.cpp)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
