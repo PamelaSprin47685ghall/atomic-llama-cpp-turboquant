@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shlex
 import socket
 import statistics
 import struct
@@ -67,6 +68,163 @@ def artifact_fingerprint(binary):
     return result
 
 
+def _cmake_source_root(cache):
+    for line in cache.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("CMAKE_HOME_DIRECTORY:INTERNAL="):
+            return Path(line.split("=", 1)[1]).resolve()
+    return None
+
+
+def _make_dependencies(dep_file):
+    """Return compiler-emitted make dependencies from one ``*.o.d`` file."""
+    text = dep_file.read_text(encoding="utf-8", errors="surrogateescape").replace("\\\n", " ")
+    _, separator, dependencies = text.partition(":")
+    if not separator:
+        raise ValueError("malformed dependency file: " + str(dep_file))
+    # The normal build paths contain no escaped whitespace. Avoid shlex's
+    # character-at-a-time parser on thousands of system-header dependencies;
+    # retain it only for the uncommon escaped-path case.
+    return shlex.split(dependencies) if "\\ " in dependencies else dependencies.split()
+
+
+def _archive_members(path):
+    """Read member names from a regular GNU/BSD ar archive without invoking ar."""
+    data = path.read_bytes()
+    if not data.startswith(b"!<arch>\n"):
+        raise ValueError("unsupported static archive format: " + str(path))
+    offset = 8
+    string_table = b""
+    members = []
+    while offset < len(data):
+        if offset + 60 > len(data):
+            raise ValueError("truncated static archive header: " + str(path))
+        header = data[offset:offset + 60]
+        offset += 60
+        if header[58:60] != b"`\n":
+            raise ValueError("invalid static archive header: " + str(path))
+        try:
+            size = int(header[48:58].decode("ascii").strip())
+        except ValueError as exc:
+            raise ValueError("invalid static archive member size: " + str(path)) from exc
+        if size < 0 or offset + size > len(data):
+            raise ValueError("truncated static archive member: " + str(path))
+        payload = data[offset:offset + size]
+        offset += size + (size & 1)
+        raw_name = header[:16].decode("ascii", errors="replace").strip()
+        if raw_name == "//":
+            string_table = payload
+            continue
+        if raw_name in ("/", "/SYM64/") or raw_name.startswith("__.SYMDEF"):
+            continue
+        if raw_name.startswith("#1/"):
+            try:
+                name_size = int(raw_name[3:])
+            except ValueError as exc:
+                raise ValueError("invalid BSD archive member name: " + str(path)) from exc
+            if name_size > len(payload):
+                raise ValueError("truncated BSD archive member name: " + str(path))
+            name = payload[:name_size].decode("utf-8", errors="surrogateescape").rstrip("\x00")
+        elif raw_name.startswith("/") and raw_name[1:].isdigit():
+            if not string_table:
+                raise ValueError("archive long-name table is missing: " + str(path))
+            name_offset = int(raw_name[1:])
+            if name_offset >= len(string_table):
+                raise ValueError("archive long-name offset is invalid: " + str(path))
+            end = string_table.find(b"/\n", name_offset)
+            if end < 0:
+                end = string_table.find(b"\n", name_offset)
+            if end < 0:
+                end = len(string_table)
+            name = string_table[name_offset:end].decode("utf-8", errors="surrogateescape")
+        else:
+            name = raw_name[:-1] if raw_name.endswith("/") else raw_name
+        members.append(name)
+    return members
+
+
+def inspect_build_artifacts(binary):
+    """Fail-closed evidence for build-tree binaries before model startup.
+
+    Normal CMake target builds rebuild objects whose local dependencies are
+    newer and remove static archives before ``ar qc``. Manual object relinks or
+    direct execution of a generated ``link.txt`` can bypass both guarantees,
+    leaving translation units compiled against different C++ layouts. Detect
+    those states before spending GPU time or trusting benchmark output.
+    """
+    binary = binary.resolve()
+    build_root = binary.parent.parent
+    cache = build_root / "CMakeCache.txt"
+    server_cmake = build_root / "tools" / "server" / "CMakeFiles"
+    report = {"checked": False, "build_root": str(build_root), "stale_objects": [],
+              "duplicate_archive_members": {}}
+    if binary.parent.name != "bin" or not cache.is_file() or not server_cmake.is_dir():
+        report["reason"] = "server is not inside a CMake build tree"
+        return report
+
+    source_root = _cmake_source_root(cache)
+    if source_root is None:
+        report["errors"] = ["CMakeCache.txt has no CMAKE_HOME_DIRECTORY"]
+        return report
+    report["checked"] = True
+    report["source_root"] = str(source_root)
+    source_root_s = os.path.abspath(source_root)
+    build_root_s = os.path.abspath(build_root)
+    source_prefix = source_root_s + os.sep
+    build_prefix = build_root_s + os.sep
+
+    object_dirs = [
+        server_cmake / "server-context.dir",
+        server_cmake / "llama-server-impl.dir",
+        server_cmake / "llama-server.dir",
+    ]
+    for object_dir in object_dirs:
+        if not object_dir.is_dir():
+            continue
+        compile_dir = object_dir.parents[1]
+        for dep_file in object_dir.rglob("*.o.d"):
+            object_file = Path(str(dep_file)[:-2])
+            if not object_file.is_file():
+                report["stale_objects"].append({"object": str(object_file), "dependency": "<missing object>"})
+                continue
+            object_mtime = object_file.stat().st_mtime_ns
+            for item in _make_dependencies(dep_file):
+                dependency = os.path.abspath(item if os.path.isabs(item) else os.path.join(compile_dir, item))
+                local = (dependency == source_root_s or dependency.startswith(source_prefix)
+                         or dependency == build_root_s or dependency.startswith(build_prefix))
+                if not local or not os.path.isfile(dependency):
+                    continue
+                if os.stat(dependency).st_mtime_ns > object_mtime:
+                    report["stale_objects"].append({
+                        "object": str(object_file),
+                        "dependency": dependency,
+                    })
+                    break
+
+    for archive in (build_root / "tools" / "server" / "libserver-context.a",
+                    build_root / "common" / "libllama-common-base.a"):
+        if not archive.is_file():
+            continue
+        members = _archive_members(archive)
+        seen = set()
+        duplicates = []
+        for member in members:
+            if member in seen and member not in duplicates:
+                duplicates.append(member)
+            seen.add(member)
+        if duplicates:
+            report["duplicate_archive_members"][str(archive)] = duplicates
+
+    errors = []
+    if report["stale_objects"]:
+        first = report["stale_objects"][0]
+        errors.append("stale server object: " + first["object"] + " (newer dependency: " + first["dependency"] + ")")
+    if report["duplicate_archive_members"]:
+        archive, members = next(iter(report["duplicate_archive_members"].items()))
+        errors.append("duplicate static archive members in " + archive + ": " + ", ".join(members[:4]))
+    report["errors"] = errors
+    return report
+
+
 def model_fingerprint(path):
     """Fingerprint the requested GGUF, rejecting mutation during the read."""
     path = path.resolve()
@@ -84,6 +242,9 @@ def model_fingerprint(path):
 
 @contextlib.contextmanager
 def server(args, config, result):
+    result["build_preflight"] = inspect_build_artifacts(args.server)
+    if result["build_preflight"].get("errors"):
+        raise RuntimeError("build preflight failed: " + "; ".join(result["build_preflight"]["errors"]))
     result["artifacts_before"] = artifact_fingerprint(args.server)
     result["model_before"] = model_fingerprint(args.model)
     with socket.socket() as sock:

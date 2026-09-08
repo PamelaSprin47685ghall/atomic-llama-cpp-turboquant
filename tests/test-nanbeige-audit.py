@@ -4,6 +4,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import struct
 import tempfile
@@ -229,6 +230,58 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(len(before), 2)
         library.write_bytes(b"new")
         self.assertNotEqual(before, audit.artifact_fingerprint(binary))
+
+    def test_build_preflight_rejects_stale_server_object(self):
+        source = self.root / "source"
+        build = self.root / "build"
+        binary = build / "bin" / "llama-server"
+        object_dir = build / "tools" / "server" / "CMakeFiles" / "server-context.dir"
+        header = source / "tools" / "server" / "server-task.h"
+        object_file = object_dir / "server-queue.cpp.o"
+        dep_file = object_dir / "server-queue.cpp.o.d"
+        binary.parent.mkdir(parents=True)
+        object_dir.mkdir(parents=True)
+        header.parent.mkdir(parents=True)
+        binary.write_bytes(b"server")
+        header.write_text("new layout", encoding="utf-8")
+        object_file.write_bytes(b"old object")
+        dep_file.write_text(f"server-queue.cpp.o: {header}\n", encoding="utf-8")
+        (build / "CMakeCache.txt").write_text(
+            f"CMAKE_HOME_DIRECTORY:INTERNAL={source}\n", encoding="utf-8")
+        os.utime(object_file, ns=(1_000_000_000, 1_000_000_000))
+        os.utime(header, ns=(2_000_000_000, 2_000_000_000))
+
+        report = audit.inspect_build_artifacts(binary)
+        self.assertTrue(report["checked"])
+        self.assertEqual(len(report["stale_objects"]), 1)
+        self.assertIn("stale server object", report["errors"][0])
+
+        os.utime(object_file, ns=(3_000_000_000, 3_000_000_000))
+        self.assertEqual(audit.inspect_build_artifacts(binary)["errors"], [])
+
+    def test_build_preflight_rejects_duplicate_static_archive_members(self):
+        source = self.root / "source"
+        build = self.root / "build"
+        binary = build / "bin" / "llama-server"
+        archive = build / "tools" / "server" / "libserver-context.a"
+        (build / "tools" / "server" / "CMakeFiles").mkdir(parents=True)
+        binary.parent.mkdir(parents=True)
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_bytes(b"server")
+        source.mkdir()
+        (build / "CMakeCache.txt").write_text(
+            f"CMAKE_HOME_DIRECTORY:INTERNAL={source}\n", encoding="utf-8")
+
+        def member(name, payload):
+            encoded = name.encode("ascii") + b"/"
+            header = (encoded.ljust(16) + b"0".ljust(12) + b"0".ljust(6) + b"0".ljust(6)
+                      + b"100644".ljust(8) + str(len(payload)).encode("ascii").ljust(10) + b"`\n")
+            return header + payload + (b"\n" if len(payload) & 1 else b"")
+
+        archive.write_bytes(b"!<arch>\n" + member("same.o", b"a") + member("same.o", b"b"))
+        report = audit.inspect_build_artifacts(binary)
+        self.assertEqual(report["duplicate_archive_members"][str(archive)], ["same.o"])
+        self.assertIn("duplicate static archive members", report["errors"][0])
 
     def test_orphan_versioned_libraries_do_not_change_runtime_fingerprint(self):
         binary = self.root / "server"
