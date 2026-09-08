@@ -473,6 +473,7 @@ struct server_slot {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
+        common_speculative_set_paused(spec, id, false);
         common_speculative_set_state(spec, id, {});
 
         prompt.clear();
@@ -2093,7 +2094,7 @@ private:
         slot.spec_draft.clear();
         slot.spec_i_batch.clear();
         if (spec) {
-            common_speculative_set_state(spec.get(), slot.id, {});
+            common_speculative_set_paused(spec.get(), slot.id, true);
         }
 
         if (!rerot_set_injection(
@@ -2373,7 +2374,7 @@ private:
         slot.spec_draft.clear();
         slot.spec_i_batch.clear();
         if (spec) {
-            common_speculative_set_state(spec.get(), slot.id, {});
+            common_speculative_set_paused(spec.get(), slot.id, true);
         }
 
         slot.rerot_internal = true;

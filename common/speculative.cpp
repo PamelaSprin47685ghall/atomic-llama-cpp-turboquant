@@ -186,8 +186,9 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+    virtual void set_paused(llama_seq_id /*seq_id*/, bool /*paused*/) {}
 
-    // true if this implementation requires the target context to extract post-norm embeddings
+    // true if this implementation requires target post-norm embeddings
     virtual bool need_embd() const = 0;
 
     // true if this implementation requires the target context to extract pre-norm embeddings
@@ -1332,6 +1333,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<llama_pos>>       staged_pos;
     std::vector<std::vector<float>>           staged_embd;
     std::vector<int32_t>                      staged_commit_rows;
+    std::vector<bool>                         paused;
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
@@ -1420,6 +1422,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         staged_pos.assign(n_seq, {});
         staged_embd.assign(n_seq, {});
         staged_commit_rows.assign(n_seq, 0);
+        paused.assign(n_seq, false);
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1465,6 +1468,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             staged_embd[seq_id].clear();
         }
         std::fill(staged_commit_rows.begin(), staged_commit_rows.end(), 0);
+        std::fill(paused.begin(), paused.end(), false);
         std::fill(i_last.begin(), i_last.end(), -1);
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
@@ -1551,6 +1555,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const llama_seq_id seq_id = batch_in.seq_id[k][0];
             GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
+            if (paused[(size_t) seq_id]) {
+                continue;
+            }
 
             if (i_batch_beg[seq_id] < 0) {
                 i_batch_beg[seq_id] = k;
@@ -1922,6 +1929,31 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
         std::memcpy(pending_h[seq_id].data(), data.data(), state_size);
+    }
+
+    void set_paused(llama_seq_id seq_id, bool value) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq ||
+            paused[(size_t) seq_id] == value) {
+            return;
+        }
+
+        paused[(size_t) seq_id] = value;
+        if (!value) {
+            return;
+        }
+
+        set_state(seq_id, {});
+        common_sampler_reset(smpls[(size_t) seq_id].get());
+        if (backend_chains[(size_t) seq_id] != nullptr) {
+            llama_sampler_reset(backend_chains[(size_t) seq_id]);
+        }
+
+        // A shared draft context owns the target memory and must never remove
+        // it. Ornith/Qwen-style MTP has an independent draft context.
+        if (!is_mem_shared) {
+            llama_memory_seq_rm(
+                llama_get_memory(params.ctx_dft), seq_id, -1, -1);
+        }
     }
 
     bool need_embd() const override {
@@ -3004,6 +3036,16 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 
     for (auto & impl : spec->impls) {
         impl->set_state(seq_id, data);
+    }
+}
+
+void common_speculative_set_paused(common_speculative * spec, llama_seq_id seq_id, bool paused) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->set_paused(seq_id, paused);
     }
 }
 
