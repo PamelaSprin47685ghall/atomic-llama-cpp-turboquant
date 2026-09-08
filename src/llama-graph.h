@@ -289,7 +289,17 @@ public:
 
     struct rbb_group_input {
         int32_t brain_row = -1;
+        // All PUBLIC writers in this brain group. Explicit shared-RBB research
+        // modes consume this set.
         ggml_tensor * public_rows = nullptr; // I32 [n_public_rows]
+
+        // Writers that are allowed to advance the shared recurrent brain in
+        // the default mathematical contract. Child lanes are intentionally
+        // absent: their trained recurrence is lane-local and DDVR is the
+        // cross-lane memory channel. Keeping this as graph input data (rather
+        // than an all-or-nothing ubatch predicate) makes the recurrence
+        // independent of scheduler batch composition.
+        ggml_tensor * default_shared_rows = nullptr; // I32 [n_non_child_public_rows], nullable
     };
     std::vector<rbb_group_input> rbb_groups;
 

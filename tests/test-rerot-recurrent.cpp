@@ -422,8 +422,8 @@ static void test_mixed_frontier_graph(ggml_backend_t backend, bool reversed) {
     llm_graph_input_rs inp(&mctx);
     inp.brain_copy = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
     for (int group = 0; group < 2; ++group) {
-        inp.rbb_groups.push_back({group,
-            ggml_new_tensor_1d(ctx, GGML_TYPE_I32, groups[group].size())});
+        auto * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, groups[group].size());
+        inp.rbb_groups.push_back({group, rows, rows});
     }
     auto * brain = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, 4);
     auto * hand = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, D, N);
@@ -562,6 +562,181 @@ static void test_mixed_frontier_graph(ggml_backend_t backend, bool reversed) {
     CHECK(hand_err < 0.04); // FP16 private deltas contain values around 60.
     std::printf("mixed frontier %s reversed=%d: brain=%g output=%g hand=%g\n",
         ggml_backend_name(backend), reversed, brain_err, output_err, hand_err);
+    ggml_backend_buffer_free(buffer);
+}
+
+// Default child recurrence is a per-row mathematical property, not a batch
+// shape. Co-batching two child workers with an unrelated root must not opt the
+// children into shared RBB or mutate their person's shared brain. This is the
+// regression that the old all-children `local_state` predicate missed: a
+// child-only ubatch was local, while the same children plus one root silently
+// switched to shared recurrence.
+static void test_child_local_recurrence_in_mixed_batch(ggml_backend_t backend) {
+    constexpr int S = 16, H = 2, N = 3, D = S * S * H;
+    stub_model model;
+    model.hparams.n_layer_all = 4;
+    model.hparams.n_embd = 8;
+    model.hparams.n_embd_r_impl = 16;
+    model.hparams.ssm_d_state = S;
+    model.hparams.ssm_d_inner = S * H;
+    llama_memory_recurrent mem(model, GGML_TYPE_F32, GGML_TYPE_F32,
+        false, N, 16, 0, 2, N, nullptr);
+
+    llama_batch_allocr alloc(1);
+    llama_ubatch ub = alloc.ubatch_reserve(1, N);
+    llama_seq_id ids[N] = {0, 1, 2};
+    for (int row = 0; row < N; ++row) {
+        ub.token[row] = 1;
+        ub.pos[row] = 0;
+        ub.n_seq_id[row] = 1;
+        ub.seq_id[row] = &ids[row];
+        ub.output[row] = 1;
+    }
+    llama_memory_recurrent_context mctx(&mem, {ub});
+
+    llm_graph_result res(2048);
+    llm_graph_params params{};
+    params.hparams = model.hparams;
+    params.ubatch = ub;
+    params.res = &res;
+    params.cparams.fused_gdn_ar = true;
+    params.n_outputs = N;
+    llm_build_delta_net_base builder(params);
+    ggml_context * ctx = res.get_ctx();
+    llm_graph_input_rs inp(&mctx);
+    inp.brain_copy = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
+
+    // Rows 0/1 are PUBLIC child writers for person 0. They remain visible in
+    // `public_rows` for explicit shared-RBB experiments, but the default
+    // shared set is empty. Row 2 is an unrelated root writer for person 1 and
+    // still advances that root's grouped brain normally.
+    auto * child_public = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
+    auto * root_public = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    inp.rbb_groups.push_back({0, child_public, nullptr});
+    inp.rbb_groups.push_back({1, root_public, root_public});
+
+    auto * brain = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, 4);
+    auto * hand = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, D, N);
+    auto * base = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, N);
+    auto * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, S, H, N);
+    auto * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, 1, N);
+    auto * k = ggml_dup_tensor(ctx, q);
+    auto * v = ggml_dup_tensor(ctx, q);
+    auto * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, N);
+    auto * beta = ggml_dup_tensor(ctx, g);
+
+    const char * old_mode = std::getenv("LLAMA_REROT_RBB_ABLATION");
+    const std::string old_mode_copy = old_mode ? old_mode : "";
+    unsetenv("LLAMA_REROT_RBB_ABLATION");
+    auto * output = builder.build_recurrent_attn(
+        &inp, brain, base, hand, q, k, v, g, beta, state, 3);
+    if (old_mode) setenv("LLAMA_REROT_RBB_ABLATION", old_mode_copy.c_str(), 1);
+    else unsetenv("LLAMA_REROT_RBB_ABLATION");
+    ggml_build_forward_expand(res.get_gf(), output);
+
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    CHECK(buffer != nullptr);
+    if (!buffer) return;
+
+    const int32_t child_rows[2] = {0, 1};
+    const int32_t root_row[1] = {2};
+    ggml_backend_tensor_set(child_public, child_rows, 0, sizeof(child_rows));
+    ggml_backend_tensor_set(root_public, root_row, 0, sizeof(root_row));
+
+    std::vector<float> brain_data(D * 4, 7.0f);
+    std::vector<float> base_data(D * N), state_data(D * N);
+    std::vector<float> q_data(S * H * N, 0.0f), k_data(q_data), v_data(q_data);
+    std::vector<float> g_data(H * N), beta_data(H * N);
+    for (int row = 0; row < N; ++row) {
+        const float B = row < 2 ? 1.25f : 2.5f;
+        const float H0 = 0.125f * float(row + 1);
+        for (int h = 0; h < H; ++h) {
+            const int qk = (row * H + h) * S;
+            const int key_d = (row + h) % S;
+            q_data[qk + key_d] = 1.0f;
+            k_data[qk + key_d] = 1.0f;
+            g_data[row * H + h] = std::log(0.75f + 0.02f * row);
+            beta_data[row * H + h] = 0.35f + 0.05f * row;
+            for (int col = 0; col < S; ++col) {
+                v_data[qk + col] = 3.0f + row + 0.01f * col;
+                for (int d = 0; d < S; ++d) {
+                    const int index = row * D + (h * S + col) * S + d;
+                    base_data[index] = B;
+                    state_data[index] = B + H0;
+                }
+            }
+        }
+    }
+    for (int h = 0; h < H; ++h) {
+        std::fill_n(brain_data.data() + h * S * S, S * S, 1.25f);
+        std::fill_n(brain_data.data() + D + h * S * S, S * S, 2.5f);
+    }
+
+    auto set_f32 = [](ggml_tensor * tensor, const std::vector<float> & data) {
+        ggml_backend_tensor_set(tensor, data.data(), 0, data.size() * sizeof(float));
+    };
+    set_f32(brain, brain_data);
+    set_f32(base, base_data);
+    set_f32(state, state_data);
+    set_f32(q, q_data);
+    set_f32(k, k_data);
+    set_f32(v, v_data);
+    set_f32(g, g_data);
+    set_f32(beta, beta_data);
+
+    CHECK(ggml_backend_graph_compute(backend, res.get_gf()) == GGML_STATUS_SUCCESS);
+    ggml_backend_synchronize(backend);
+
+    std::vector<float> actual_brain(D * 4), actual_output(S * H * N);
+    std::vector<ggml_fp16_t> actual_hand(D * N);
+    ggml_backend_tensor_get(brain, actual_brain.data(), 0, actual_brain.size() * sizeof(float));
+    ggml_backend_tensor_get(output, actual_output.data(), 0, actual_output.size() * sizeof(float));
+    ggml_backend_tensor_get(hand, actual_hand.data(), 0, actual_hand.size() * sizeof(ggml_fp16_t));
+
+    double output_err = 0.0, hand_err = 0.0;
+    for (int row = 0; row < 2; ++row) {
+        const double B = 1.25;
+        const double H0 = 0.125 * double(row + 1);
+        for (int h = 0; h < H; ++h) {
+            const int key_d = (row + h) % S;
+            const double alpha = std::exp(double(g_data[row * H + h]));
+            const double rate = beta_data[row * H + h];
+            for (int col = 0; col < S; ++col) {
+                const double value = v_data[(row * H + h) * S + col];
+                for (int d = 0; d < S; ++d) {
+                    const int state_index = row * D + (h * S + col) * S + d;
+                    const double before = B + H0;
+                    const double native = alpha * before +
+                        (d == key_d ? rate * (value - alpha * before) : 0.0);
+                    const double expected_hand = native - B;
+                    hand_err = std::max(hand_err,
+                        std::abs(double(ggml_fp16_to_fp32(actual_hand[state_index])) - expected_hand));
+                    if (d == key_d) {
+                        const double expected_output = native / std::sqrt(double(S));
+                        const double got = actual_output[(row * H + h) * S + col];
+                        output_err = std::max(output_err, std::abs(got - expected_output));
+                    }
+                }
+            }
+        }
+    }
+
+    double child_brain_err = 0.0;
+    for (int i = 0; i < D; ++i) {
+        child_brain_err = std::max(child_brain_err,
+            std::abs(double(actual_brain[i]) - 1.25));
+    }
+    double root_brain_change = 0.0;
+    for (int i = 0; i < D; ++i) {
+        root_brain_change = std::max(root_brain_change,
+            std::abs(double(actual_brain[D + i]) - 2.5));
+    }
+    CHECK(child_brain_err < 1e-6);
+    CHECK(root_brain_change > 1e-4);
+    CHECK(output_err < 2e-5);
+    CHECK(hand_err < 2e-3); // F16 hand storage only.
+    std::printf("mixed child-local %s: child_brain=%g root_change=%g output=%g hand=%g\n",
+        ggml_backend_name(backend), child_brain_err, root_brain_change, output_err, hand_err);
     ggml_backend_buffer_free(buffer);
 }
 
@@ -831,12 +1006,14 @@ int main() {
     ggml_backend_t cpu_oracle = ggml_backend_cpu_init();
     test_mixed_frontier_graph(cpu_oracle, false);
     test_mixed_frontier_graph(cpu_oracle, true);
+    test_child_local_recurrence_in_mixed_batch(cpu_oracle);
     ggml_backend_free(cpu_oracle);
     ggml_backend_load_all();
     if (auto * device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) {
         if (auto * gpu = ggml_backend_dev_init(device, nullptr)) {
             test_mixed_frontier_graph(gpu, false);
             test_mixed_frontier_graph(gpu, true);
+            test_child_local_recurrence_in_mixed_batch(gpu);
             ggml_backend_free(gpu);
         }
     }
@@ -1238,7 +1415,7 @@ int main() {
             llm_graph_input_rs graph_input(&graph_mctx);
             graph_input.brain_copy = ggml_new_tensor_1d(graph_ctx, GGML_TYPE_I32, 3);
             auto * public_rows = ggml_new_tensor_1d(graph_ctx, GGML_TYPE_I32, 2);
-            graph_input.rbb_groups.push_back({0, public_rows});
+            graph_input.rbb_groups.push_back({0, public_rows, public_rows});
 
             constexpr int64_t S = 4;
             constexpr int64_t H = 2;

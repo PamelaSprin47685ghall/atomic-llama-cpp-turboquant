@@ -581,6 +581,10 @@ public:
     // prefix may be injected before or after this transition, but ordinary
     // generated tokens are only legal once the node is RUNNING.
     bool complete_admission(uint64_t episode_id, llama_rerot_node_id node_id);
+    // Enter direct worker mode without consuming a synthetic N=1 planner
+    // record. This is the default v1 child path; explicit recursive-planner
+    // research mode may call arm_planner() instead.
+    bool begin_worker(uint64_t episode_id, llama_rerot_node_id node_id);
     bool arm_planner(uint64_t episode_id, llama_rerot_node_id node_id);
 
     // Apply all EXIT_INTENTs after every token in a frontier has committed.

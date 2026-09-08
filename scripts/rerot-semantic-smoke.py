@@ -25,7 +25,13 @@ def main() -> int:
     parser.add_argument('--model', required=True)
     parser.add_argument('--build-dir', default='build-vulkan-localhost')
     parser.add_argument('--context', type=int, default=131072)
+    parser.add_argument('--total-kv', default='auto', help='auto for production-style joint B/P/K fitting, or an explicit token capacity')
+    parser.add_argument('--parallel', type=int, help='explicit server slot count; only valid with non-auto total-kv for RERoT')
     parser.add_argument('--cache', choices=('turbo', 'f16'), default='turbo', help='f16 is an explicit numerical control, not the production gate')
+    parser.add_argument('--prompt', default='世界上每个大洲有哪些国家')
+    parser.add_argument('--seed', type=int, default=424242)
+    parser.add_argument('--temperature', type=float, default=0.0)
+    parser.add_argument('--max-tokens', type=int, default=8192)
     parser.add_argument('--port', type=int, default=18081)
     parser.add_argument('--output', type=Path)
     parser.add_argument('--timeout', type=float, default=240)
@@ -39,6 +45,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.concurrency < 1 or (args.concurrency != 1 and not args.serial_baseline):
         parser.error('concurrency >1 is restricted to the explicit RERoT-OFF baseline')
+    if args.parallel is not None and args.parallel < 1:
+        parser.error('parallel must be >= 1')
+    if not args.serial_baseline and args.parallel is not None and args.total_kv == 'auto':
+        parser.error('RERoT full-auto owns B/P/K; use explicit --total-kv with --parallel')
     run = args.output or Path(tempfile.mkdtemp(prefix='rerot-semantic-'))
     if args.output:
         run.mkdir(parents=True, exist_ok=False)
@@ -48,16 +58,18 @@ def main() -> int:
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', args.port))
     command = [str(bindir / 'llama-server'), '-m', args.model, '-a', 'ornith-1.5',
-               '-c', str(args.context), '--total-kv', 'auto', '-ngl', '40', '-kvo',
+               '-c', str(args.context), '--total-kv', str(args.total_kv), '-ngl', '40', '-kvo',
                '-b', '4096', '-ub', '2048', '-ctk', 'turbo4', '-ctv', 'turbo2',
                '--rerot', '--rerot-frontier', args.frontier, '--run-dump', str(run / 'trie'),
                '--metrics', '--fit', 'off', '--load-mode', 'mmap', '--host', '127.0.0.1',
                '--port', str(args.port), '--api-key', key, '--jinja', '--reasoning-preserve']
+    if args.parallel is not None:
+        command.extend(['-np', str(args.parallel)])
     if args.cache == 'f16':
         command[command.index('-ctk') + 1] = 'f16'
         command[command.index('-ctv') + 1] = 'f16'
-    request = {'model': 'ornith-1.5', 'messages': [{'role': 'user', 'content': '世界上每个大洲有哪些国家'}],
-               'temperature': 0, 'seed': 424242, 'max_tokens': 8192,
+    request = {'model': 'ornith-1.5', 'messages': [{'role': 'user', 'content': args.prompt}],
+               'temperature': args.temperature, 'seed': args.seed, 'max_tokens': args.max_tokens,
                'stream': False, 'rerot': True, 'rerot_trace': True}
     if args.serial_baseline:
         command.remove('--rerot')
@@ -65,16 +77,12 @@ def main() -> int:
         del command[frontier_index:frontier_index + 2]
         request['rerot'] = False
         request['rerot_trace'] = False
-        if args.concurrency > 1:
+        if args.concurrency > 1 and args.parallel is None:
             command.extend(['-np', str(args.concurrency)])
 
     def save_json(name: str, obj: object) -> None:
         (run / name).write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding='utf-8')
 
-    save_json('request.json', request)
-    save_json('args.json', ['<redacted>' if value == key else value for value in command])
-    libraries = ['llama-server', 'libllama-server-impl.so', 'libllama.so', 'libggml-vulkan.so', 'libggml-cpu.so']
-    save_json('hashes.json', {name: hashlib.sha256((bindir / name).read_bytes()).hexdigest() for name in libraries})
     env = os.environ.copy()
     env['LD_LIBRARY_PATH'] = str(bindir) + ':' + env.get('LD_LIBRARY_PATH', '')
     env.pop('LLAMA_REROT_AUDIT', None)
@@ -91,6 +99,19 @@ def main() -> int:
     if args.audit:
         env['LLAMA_REROT_AUDIT'] = '1'
         env['LLAMA_REROT_AUDIT_DIR'] = str(run / 'tensor-audit')
+    save_json('request.json', request)
+    save_json('args.json', ['<redacted>' if value == key else value for value in command])
+    libraries = ['llama-server', 'libllama-server-impl.so', 'libllama.so', 'libggml-vulkan.so', 'libggml-cpu.so']
+    save_json('hashes.json', {name: hashlib.sha256((bindir / name).read_bytes()).hexdigest() for name in libraries})
+    repo = Path(__file__).resolve().parents[1]
+    def capture(argv: list[str]) -> str:
+        return subprocess.run(argv, cwd=repo, env=env, text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, check=False).stdout.strip()
+    save_json('source.json', {
+        'head': capture(['git', 'rev-parse', 'HEAD']),
+        'status_porcelain': capture(['git', 'status', '--porcelain=v1']),
+        'server_version': capture([str(bindir / 'llama-server'), '--version']),
+    })
     save_json('diagnostics.json', {'audit': args.audit, 'serial_baseline': args.serial_baseline,
                                 'rbb_ablation': args.rbb_ablation,
                                 'frontier': args.frontier,
@@ -98,7 +119,10 @@ def main() -> int:
                                 'ancestors_only': args.ancestors_only,
                                 'concurrency': args.concurrency,
                                 'cache': args.cache,
-                                'response_timeout': args.timeout, 'context': args.context})
+                                'response_timeout': args.timeout, 'context': args.context,
+                                'total_kv': args.total_kv, 'parallel': args.parallel,
+                                'seed': args.seed, 'temperature': args.temperature,
+                                'max_tokens': args.max_tokens})
 
     def http(path: str, data: bytes | None = None, timeout: float = 3) -> tuple[int, bytes]:
         req = urllib.request.Request(f'http://127.0.0.1:{args.port}' + path, data=data,

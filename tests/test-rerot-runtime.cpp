@@ -783,8 +783,9 @@ static void test_child_content_list_is_not_scheduler_control() {
     CHECK(worker.find("Only child") != std::string::npos);
     CHECK(worker.find("整个用户问题") != std::string::npos);
 
-    // Explicit planner phase returns N=1 and is then permanently disarmed.
-    make_terminal(runtime, episode_id, 1);
+    // Default child admission goes directly to worker mode. No synthetic N=1
+    // planner record is required merely to make ordinary HTML safe.
+    CHECK(runtime.begin_worker(episode_id, 1));
     lane = runtime.node(episode_id, 1);
     CHECK(lane && !lane->planner_armed);
     const size_t nodes_before = runtime.episode(episode_id)->document.node_count();

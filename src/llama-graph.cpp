@@ -372,6 +372,26 @@ void llm_graph_input_rs::set_input_recurrent(
             ggml_backend_tensor_set(
                 group.public_rows, rows.data(), 0, rows.size() * sizeof(rows[0]));
         }
+
+        std::vector<int32_t> default_shared_rows;
+        default_shared_rows.reserve(rows.size());
+        for (const int32_t row : rows) {
+            if (!mctx->is_child_row(row)) {
+                default_shared_rows.push_back(row);
+            }
+        }
+        GGML_ASSERT((group.default_shared_rows != nullptr) == !default_shared_rows.empty());
+        if (group.default_shared_rows != nullptr) {
+            GGML_ASSERT((size_t) group.default_shared_rows->ne[0] == default_shared_rows.size());
+            if (group.default_shared_rows->buffer != nullptr) {
+                GGML_ASSERT(ggml_backend_buffer_is_host(group.default_shared_rows->buffer));
+                ggml_backend_tensor_set(
+                    group.default_shared_rows,
+                    default_shared_rows.data(),
+                    0,
+                    default_shared_rows.size() * sizeof(default_shared_rows[0]));
+            }
+        }
     }
 
     if (s_copy) {
@@ -414,6 +434,15 @@ bool llm_graph_input_rs::can_reuse_recurrent(
             res &= group.brain_row == brain_row;
             res &= group.public_rows != nullptr;
             res &= (size_t) group.public_rows->ne[0] == rows.size();
+
+            size_t n_default_shared = 0;
+            for (const int32_t row : rows) {
+                n_default_shared += !mctx->is_child_row(row);
+            }
+            res &= (group.default_shared_rows != nullptr) == (n_default_shared != 0);
+            if (group.default_shared_rows != nullptr) {
+                res &= (size_t) group.default_shared_rows->ne[0] == n_default_shared;
+            }
         }
     }
 
@@ -4285,6 +4314,16 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
             group.public_rows =
                 ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) rows.size());
             ggml_set_input(group.public_rows);
+
+            size_t n_default_shared = 0;
+            for (const int32_t row : rows) {
+                n_default_shared += !mctx_cur->is_child_row(row);
+            }
+            if (n_default_shared != 0) {
+                group.default_shared_rows =
+                    ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) n_default_shared);
+                ggml_set_input(group.default_shared_rows);
+            }
             inp->rbb_groups.push_back(group);
         }
     }

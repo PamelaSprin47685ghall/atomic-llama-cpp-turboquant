@@ -1890,6 +1890,58 @@ private:
         return true;
     }
 
+    bool rerot_enter_child_worker(
+            server_slot & slot,
+            uint64_t episode_id,
+            llama_rerot_node_id node_id,
+            bool direct_admission) {
+        const auto * lane = rerot ? rerot->node(episode_id, node_id) : nullptr;
+        const auto * episode = rerot ? rerot->episode(episode_id) : nullptr;
+        const auto * logical = episode ? episode->document.node(node_id) : nullptr;
+        if (!lane || !logical || !slot.task || lane->control_id().empty()) {
+            return false;
+        }
+        if (direct_admission && !rerot->begin_worker(episode_id, node_id)) {
+            return false;
+        }
+
+        server_task child_task = rerot_clone_task(*slot.task);
+        rerot_remove_planner_grammar(child_task.params);
+        if (!rerot_install_child_grammar(
+                child_task.params, lane->exit_parser.marker())) {
+            rerot->hard_abort(
+                episode_id, "rerot_protocol_error: invalid child close grammar");
+            return false;
+        }
+        common_sampler_ptr child_sampler;
+        try {
+            child_sampler.reset(common_sampler_init(
+                model_tgt,
+                child_task.params.sampling,
+                (int32_t) llama_n_ctx(ctx_tgt)));
+        } catch (const std::exception & e) {
+            rerot->hard_abort(
+                episode_id,
+                std::string("rerot_sampler_error: failed to enter child worker: ") + e.what());
+            return false;
+        }
+        slot.task = std::make_unique<const server_task>(std::move(child_task));
+        slot.smpl = std::move(child_sampler);
+        rerot_bind_sampler(slot);
+
+        const std::string worker_prompt = server_rerot_child_worker_prompt(
+            logical->title, lane->exit_parser.marker());
+        if (worker_prompt.empty() || !rerot_set_injection(
+                slot,
+                server_rerot_injection_kind::worker,
+                worker_prompt)) {
+            rerot->hard_abort(
+                episode_id, "rerot_protocol_error: failed to enter child worker phase");
+            return false;
+        }
+        return true;
+    }
+
     bool rerot_start_root(server_slot & slot) {
         if (!rerot || !ctx_tgt || !slot.task ||
             !slot.task->params.rerot_effective(slot.task->type)) {
@@ -2625,44 +2677,8 @@ private:
                 // Explicit child planner decided N=1. Planning is over. The
                 // worker phase uses the owner-specific close grammar again;
                 // the random ID remains the sole child completion delimiter.
-                server_task child_task = rerot_clone_task(*slot.task);
-                rerot_remove_planner_grammar(child_task.params);
-                if (!rerot_install_child_grammar(
-                        child_task.params, lane->exit_parser.marker())) {
-                    rerot->hard_abort(
-                        episode_id, "rerot_protocol_error: invalid child close grammar");
-                    return false;
-                }
-                common_sampler_ptr child_sampler;
-                try {
-                    child_sampler.reset(common_sampler_init(
-                        model_tgt,
-                        child_task.params.sampling,
-                        (int32_t) llama_n_ctx(ctx_tgt)));
-                } catch (const std::exception & e) {
-                    rerot->hard_abort(
-                        episode_id,
-                        std::string("rerot_sampler_error: failed to leave child planner: ") + e.what());
-                    return false;
-                }
-                slot.task = std::make_unique<const server_task>(std::move(child_task));
-                slot.smpl = std::move(child_sampler);
-                rerot_bind_sampler(slot);
-                const auto * episode = rerot->episode(episode_id);
-                const auto * logical = episode ? episode->document.node(node_id) : nullptr;
-                const std::string worker_prompt = logical
-                    ? server_rerot_child_worker_prompt(
-                        logical->title, lane->exit_parser.marker())
-                    : std::string{};
-                if (worker_prompt.empty() || !rerot_set_injection(
-                        slot,
-                        server_rerot_injection_kind::worker,
-                        worker_prompt)) {
-                    rerot->hard_abort(
-                        episode_id, "rerot_protocol_error: failed to enter child worker phase");
-                    return false;
-                }
-                return true;
+                return rerot_enter_child_worker(
+                    slot, episode_id, node_id, /*direct_admission=*/false);
             }
 
             // The unforked root is the only Lane still sampled under the
@@ -2714,39 +2730,22 @@ private:
             const auto * lane = rerot->node(episode_id, node_id);
             if (!document_node || !lane ||
                 !rerot->publish_heading(episode_id, node_id, plan.run_id) ||
-                !rerot->complete_admission(episode_id, node_id) ||
-                !rerot->arm_planner(episode_id, node_id)) {
+                !rerot->complete_admission(episode_id, node_id)) {
                 rerot->hard_abort(episode_id, "rerot_protocol_error: child heading publication failed");
                 return false;
             }
-            // Recursive decomposition is an explicit PRIVATE phase. Ordinary
-            // worker HTML never acquires scheduler meaning by accident.
-            server_task planner_task = rerot_clone_task(*slot.task);
-            rerot_install_planner_grammar(planner_task.params);
-            common_sampler_ptr planner_sampler;
-            try {
-                planner_sampler.reset(common_sampler_init(
-                    model_tgt,
-                    planner_task.params.sampling,
-                    (int32_t) llama_n_ctx(ctx_tgt)));
-            } catch (const std::exception & e) {
+
+            // Root planning decides the first parallel frontier. Child lanes
+            // then execute their exact assigned task directly. Recursive
+            // planner support stays available in the runtime, but it is not a
+            // mandatory phase: repeatedly feeding the model another planning
+            // grammar creates a planner -> list -> planner feedback loop and
+            // magnifies harmless sampling/numerical differences into topology.
+            // Worker HTML is ordinary content because planner_armed is false.
+            if (!rerot_enter_child_worker(
+                    slot, episode_id, node_id, /*direct_admission=*/true)) {
                 rerot->hard_abort(
-                    episode_id,
-                    std::string("rerot_sampler_error: failed to arm child planner grammar: ") +
-                        e.what());
-                return false;
-            }
-            slot.task = std::make_unique<const server_task>(std::move(planner_task));
-            slot.smpl = std::move(planner_sampler);
-            rerot_bind_sampler(slot);
-            const std::string planner_prompt =
-                server_rerot_child_planner_prompt(document_node->title);
-            if (planner_prompt.empty() || !rerot_set_injection(
-                    slot,
-                    server_rerot_injection_kind::planner,
-                    planner_prompt)) {
-                rerot->hard_abort(
-                    episode_id, "rerot_protocol_error: failed to enter child planner phase");
+                    episode_id, "rerot_protocol_error: failed to enter child worker phase");
                 return false;
             }
             rerot_stream_visibility_changed(episode_id, node_id);
@@ -3591,8 +3590,9 @@ private:
         }
 
         if (const char * ablation = std::getenv("LLAMA_REROT_RBB_ABLATION")) {
-            if (std::strcmp(ablation, "native-read") != 0 && std::strcmp(ablation, "local-state") != 0 &&
-                std::strcmp(ablation, "coherence-write") != 0) {
+            if (std::strcmp(ablation, "local-state") != 0 &&
+                std::strcmp(ablation, "shared-rbb") != 0 &&
+                std::strcmp(ablation, "raw-redundant") != 0) {
                 SRV_ERR("invalid RERoT research ablation: %s\n", ablation);
                 return false;
             }

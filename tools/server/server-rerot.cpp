@@ -610,7 +610,7 @@ std::string server_rerot_child_worker_prompt(
     if (!valid_child_close_marker(close_marker)) return {};
     const std::string clean_title = normalize_lane_title(title);
     if (clean_title.empty()) return {};
-    return "\n规划阶段已经结束。现在进入正文阶段。当前唯一任务仍然是：『" + clean_title + "』。"
+    return "\n现在进入正文阶段。当前唯一任务是：『" + clean_title + "』。"
         "只完成这一项；其他公开章节只可引用为背景，不得接管，不得重新回答整个用户问题。"
         "普通列表、标题和代码块现在都只是正文内容，不具有调度含义。"
         "完成这一项后输出 " + std::string(close_marker) +
@@ -2129,6 +2129,24 @@ bool server_rerot_runtime::complete_admission(
     current->topology_barrier_pending = true;
     ++current->topology_epoch;
     ++current->layout_epoch;
+    return true;
+}
+
+bool server_rerot_runtime::begin_worker(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id) {
+    auto * current = episode(episode_id);
+    auto * lane = node(episode_id, node_id);
+    const auto * logical = current ? current->document.node(node_id) : nullptr;
+    if (!current || !lane || !logical || current->hard_aborted ||
+        logical->state != llama_rerot_node_state::planning ||
+        lane->planner_armed || lane->pending_record.has_value()) {
+        return false;
+    }
+    lane->parser.reset();
+    if (!current->document.set_node_state(node_id, llama_rerot_node_state::terminal_running)) {
+        return fail_episode(*current, "failed to enter RERoT direct worker state");
+    }
     return true;
 }
 
