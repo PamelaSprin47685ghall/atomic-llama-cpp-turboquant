@@ -337,10 +337,67 @@ class AuditTests(unittest.TestCase):
         report = audit.inspect_build_artifacts(binary)
         self.assertTrue(report["checked"])
         self.assertEqual(len(report["stale_objects"]), 1)
-        self.assertIn("stale server object", report["errors"][0])
+        self.assertIn("stale build object", report["errors"][0])
 
         os.utime(object_file, ns=(3_000_000_000, 3_000_000_000))
         self.assertEqual(audit.inspect_build_artifacts(binary)["errors"], [])
+
+    def test_build_preflight_checks_runtime_library_objects(self):
+        targets = (
+            "src/CMakeFiles/llama.dir",
+            "common/CMakeFiles/llama-common.dir",
+            "common/CMakeFiles/llama-common-base.dir",
+            "tools/mtmd/CMakeFiles/mtmd.dir",
+            "ggml/src/CMakeFiles/ggml-base.dir",
+            "ggml/src/CMakeFiles/ggml-cpu.dir",
+            "ggml/src/ggml-vulkan/CMakeFiles/ggml-vulkan.dir",
+        )
+        for index, target in enumerate(targets):
+            with self.subTest(target=target):
+                root = self.root / str(index)
+                source = root / "source"
+                build = root / "build"
+                binary = build / "bin" / "llama-server"
+                object_file = build / target / "runtime.cpp.o"
+                header = source / "runtime.h"
+                source.mkdir(parents=True)
+                binary.parent.mkdir(parents=True)
+                object_file.parent.mkdir(parents=True)
+                (build / "tools/server/CMakeFiles").mkdir(parents=True)
+                binary.write_bytes(b"server")
+                header.write_text("new runtime layout", encoding="utf-8")
+                object_file.write_bytes(b"old runtime object")
+                Path(str(object_file) + ".d").write_text(
+                    f"runtime.cpp.o: {header}\n", encoding="utf-8")
+                (build / "CMakeCache.txt").write_text(
+                    f"CMAKE_HOME_DIRECTORY:INTERNAL={source}\n", encoding="utf-8")
+                os.utime(object_file, ns=(1_000_000_000, 1_000_000_000))
+                os.utime(header, ns=(2_000_000_000, 2_000_000_000))
+
+                report = audit.inspect_build_artifacts(binary)
+                self.assertEqual(len(report["stale_objects"]), 1)
+                self.assertTrue(report["errors"])
+                os.utime(object_file, ns=(3_000_000_000, 3_000_000_000))
+                self.assertEqual(audit.inspect_build_artifacts(binary)["errors"], [])
+
+    def test_build_preflight_rejects_missing_local_dependency(self):
+        source = self.root / "source"
+        build = self.root / "build"
+        binary = build / "bin" / "llama-server"
+        object_dir = build / "tools/server/CMakeFiles/server-context.dir"
+        object_dir.mkdir(parents=True)
+        binary.parent.mkdir(parents=True)
+        source.mkdir()
+        binary.write_bytes(b"server")
+        (object_dir / "server-queue.cpp.o").write_bytes(b"old object")
+        missing = source / "removed-layout.h"
+        (object_dir / "server-queue.cpp.o.d").write_text(
+            f"server-queue.cpp.o: {missing}\n", encoding="utf-8")
+        (build / "CMakeCache.txt").write_text(
+            f"CMAKE_HOME_DIRECTORY:INTERNAL={source}\n", encoding="utf-8")
+        report = audit.inspect_build_artifacts(binary)
+        self.assertEqual(len(report["stale_objects"]), 1)
+        self.assertIn("missing", report["errors"][0])
 
     def test_build_preflight_rejects_duplicate_static_archive_members(self):
         source = self.root / "source"

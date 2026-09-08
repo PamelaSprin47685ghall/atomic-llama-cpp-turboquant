@@ -155,7 +155,7 @@ def inspect_build_artifacts(binary):
     build_root = binary.parent.parent
     cache = build_root / "CMakeCache.txt"
     server_cmake = build_root / "tools" / "server" / "CMakeFiles"
-    report = {"checked": False, "build_root": str(build_root), "stale_objects": [],
+    report = {"checked": False, "build_root": str(build_root), "checked_objects": 0, "stale_objects": [],
               "duplicate_archive_members": {}}
     if binary.parent.name != "bin" or not cache.is_file() or not server_cmake.is_dir():
         report["reason"] = "server is not inside a CMake build tree"
@@ -176,12 +176,26 @@ def inspect_build_artifacts(binary):
         server_cmake / "server-context.dir",
         server_cmake / "llama-server-impl.dir",
         server_cmake / "llama-server.dir",
+        build_root / "common/CMakeFiles/llama-common.dir",
+        build_root / "common/CMakeFiles/llama-common-base.dir",
+        build_root / "src/CMakeFiles/llama.dir",
+        build_root / "tools/mtmd/CMakeFiles/mtmd.dir",
     ]
-    for object_dir in object_dirs:
+    # Server-only checks miss ABI/layout changes in its runtime libraries.
+    # Include the core ggml targets and backend targets present in this tree,
+    # but not unrelated test/example objects or historical library payloads.
+    ggml_src = build_root / "ggml/src"
+    object_dirs.extend((ggml_src / "CMakeFiles").glob("ggml*.dir"))
+    object_dirs.extend(ggml_src.glob("*/CMakeFiles/ggml*.dir"))
+    # Many translation units share the same headers. Stat each local path once
+    # per preflight rather than once per object (especially for Vulkan).
+    dependency_mtimes = {}
+    for object_dir in sorted(set(object_dirs)):
         if not object_dir.is_dir():
             continue
         compile_dir = object_dir.parents[1]
         for dep_file in object_dir.rglob("*.o.d"):
+            report["checked_objects"] += 1
             object_file = Path(str(dep_file)[:-2])
             if not object_file.is_file():
                 report["stale_objects"].append({"object": str(object_file), "dependency": "<missing object>"})
@@ -191,12 +205,19 @@ def inspect_build_artifacts(binary):
                 dependency = os.path.abspath(item if os.path.isabs(item) else os.path.join(compile_dir, item))
                 local = (dependency == source_root_s or dependency.startswith(source_prefix)
                          or dependency == build_root_s or dependency.startswith(build_prefix))
-                if not local or not os.path.isfile(dependency):
+                if not local:
                     continue
-                if os.stat(dependency).st_mtime_ns > object_mtime:
+                if dependency not in dependency_mtimes:
+                    try:
+                        dependency_mtimes[dependency] = os.stat(dependency).st_mtime_ns
+                    except FileNotFoundError:
+                        dependency_mtimes[dependency] = None
+                dependency_mtime = dependency_mtimes[dependency]
+                if dependency_mtime is None or dependency_mtime > object_mtime:
                     report["stale_objects"].append({
                         "object": str(object_file),
                         "dependency": dependency,
+                        "reason": "missing dependency" if dependency_mtime is None else "newer dependency",
                     })
                     break
 
@@ -217,7 +238,8 @@ def inspect_build_artifacts(binary):
     errors = []
     if report["stale_objects"]:
         first = report["stale_objects"][0]
-        errors.append("stale server object: " + first["object"] + " (newer dependency: " + first["dependency"] + ")")
+        errors.append("stale build object: " + first["object"] + " (" +
+                      first.get("reason", "missing object") + ": " + first["dependency"] + ")")
     if report["duplicate_archive_members"]:
         archive, members = next(iter(report["duplicate_archive_members"].items()))
         errors.append("duplicate static archive members in " + archive + ": " + ", ".join(members[:4]))

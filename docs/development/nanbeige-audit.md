@@ -49,10 +49,14 @@ The standard-library-only runner starts a private loopback listener with an
 ephemeral authentication key and stops it in a `finally` block. It stores
 per-request responses, checked answers, timing, sampled GPU memory, and server
 logs. Finish the build before probing. For binaries inside a CMake build tree,
-the runner first rejects stale server objects whose local compiler dependencies
-are newer and duplicate members in the server/common static archives. This
+the runner first checks compiler dependency files for server, common, mtmd,
+llama and ggml (including built backend) objects. It rejects newer or missing
+local dependencies and duplicate members in the server/common static archives. This
 prevents hand-run object relinks or direct `link.txt`/`ar qc` invocations from
-silently mixing incompatible C++ layouts. The runner then fingerprints the
+silently mixing incompatible C++ layouts. The result records `checked_objects`;
+this timestamp check covers the available `*.o.d` files, not a reproducible-build
+attestation. A normal target build and a separate `llama-server --version` check
+against the intended commit are still required. The runner then fingerprints the
 executable
 and local shared libraries before/after each run and rejects changed artifacts;
 these hashes do not cover driver or system libraries outside the binary directory.
