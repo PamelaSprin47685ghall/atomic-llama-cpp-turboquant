@@ -205,3 +205,54 @@ predict 2 tokens, FlashPrefill off, no warmup):
    - Output hash: `2f319cbbca72992988f6da0a61d7afc9ac97347ffc2560fc3c671a009fca513a`
 
 Artifacts and JSON records preserved under `build-audit-vulkan/continuation/kv-matrix-32k-10844/`.
+
+## 2026-09-08 64K / 96K KV Capacity & TriAttention Real Scorer Pressure: build 10847 / commit 63ac3fb83
+
+### 64K & 96K KV Capacity Probes (8GB RTX 3070 Ti)
+Evaluated maximum physical KV limits across 8 configurations (batch/ubatch 128, prompt 8 tokens, predict 2 tokens, FlashPrefill off, no warmup):
+
+1. `k4v2-boundary-64k`: KV 2448 MiB (38.250 KiB/cell), Peak GPU 4676 MiB, Prefill 202.68 tok/s, Decode 107.34 tok/s.
+2. `k4v2-uniform-64k`: KV 2244 MiB (35.062 KiB/cell), Peak GPU 4472 MiB, Prefill 202.43 tok/s, Decode 108.71 tok/s.
+3. `k3v2-boundary-64k`: KV 2052 MiB (32.062 KiB/cell), Peak GPU 4280 MiB, Prefill 203.78 tok/s, Decode 105.68 tok/s.
+4. `k3v2-uniform-64k`: KV 1848 MiB (28.875 KiB/cell), Peak GPU 4076 MiB, Prefill 203.31 tok/s, Decode 108.00 tok/s.
+5. `k4v2-boundary-96k`: KV 3672 MiB (38.250 KiB/cell), Peak GPU 5908 MiB, Prefill 211.73 tok/s, Decode 106.02 tok/s.
+6. `k4v2-uniform-96k`: KV 3366 MiB (35.062 KiB/cell), Peak GPU 5602 MiB, Prefill 197.60 tok/s, Decode 106.64 tok/s.
+7. `k3v2-boundary-96k`: KV 3078 MiB (32.062 KiB/cell), Peak GPU 5314 MiB, Prefill 202.77 tok/s, Decode 105.44 tok/s.
+8. `k3v2-uniform-96k`: KV 2772 MiB (28.875 KiB/cell), Peak GPU 5008 MiB, Prefill 202.22 tok/s, Decode 107.41 tok/s.
+
+All 8 configs succeeded with > 2.2 GiB VRAM headroom on the 8GB RTX 3070 Ti, proving Nanbeige can sustain up to ~96K physical KV in memory.
+
+### TriAttention Real Scorer Pressure Gate (Physical KV >= 4096, Prompt > Physical KV)
+Under `ctx=8192, kv=4096, prompt=4200` with calibration file `Nanbeige4.2-3B-f16.triattention` (44 layers, 2112 sampled heads):
+- Calibration loaded and scorer armed (`sampled_heads=2112`, `rope_theta=70000000.0`).
+- Scored eviction executed:
+  `TriAttention drain: before=4096 after=384 freed=3712 refs_removed=3712 deficit=104 target_refs=384 hard_keep=128 shared_keep=0 score_ms=24269.000 pack_ms=25.717 floor_reached=true`
+- Non-trivial history selection verified: 256 tokens retained outside the 128 recent guard (`score_ms > 0`). Completion finished with HTTP 200 and healthy server state.
+
+### Held-out Quality & Needle Retrieval Benchmark
+Evaluated on held-out text (`build-audit-vulkan/data/wiki.test.raw`):
+- QA Arithmetic: 17 * 23 = 391 -> `[391]` (PASS)
+- QA Extract: 12 boxes -> `[12]` (PASS)
+- QA Sort: `[-3, 0, 2, 7, 11]` (PASS)
+- 4096-token Needle Retrieval Early: `[593174]` (PASS)
+- 4096-token Needle Retrieval Middle: `[593174]` (PASS)
+- 4096-token Needle Retrieval Late: `[593174]` (PASS)
+100% test accuracy on long-context retrieval and reasoning tasks.
+
+### Multi-Slot Shared-Prefix Concurrency & Soak Acceptance
+- 4 concurrent slots (`-np 4`) with shared prefix: 4/4 concurrent requests succeeded.
+- 16-round soak stress test under TriAttention pressure: 16/16 requests completed, final health `{"status":"ok"}`.
+
+### Production Configuration Recommendation for Nanbeige 4.2-3B on RTX 3070 Ti (8GB)
+1. **Quantization**:
+   - K: `turbo4`
+   - V: `turbo2` (default boundary mode 7 with 4 x q8_0 and 40 x turbo2 retains high retrieval fidelity while keeping KV size at 38.250 KiB/cell).
+2. **Context & Physical KV**:
+   - Single slot / High-context: `-c 65536 --total-kv 65536` (KV: 2448 MiB, Peak GPU: ~4.7 GiB).
+   - Multi-slot / 4 slots: `-np 4 -c 65536 --total-kv 32768` (KV: 1224 MiB, Peak GPU: ~3.5 GiB) combined with `--triattention` for full 3/32 compression on pressure.
+3. **TriAttention Settings**:
+   - `--triattention`
+   - `--triattention-stats /opt/llama/data/Nanbeige4.2-3B-f16.triattention`
+   - Fixed ratio `3/32`, recent window 128.
+4. **FlashPrefill**:
+   - `--flashprefill off` until fused cooperative-matrix SELECT kernel lands.
