@@ -342,6 +342,134 @@ class AuditTests(unittest.TestCase):
         os.utime(object_file, ns=(3_000_000_000, 3_000_000_000))
         self.assertEqual(audit.inspect_build_artifacts(binary)["errors"], [])
 
+    def test_runtime_commit_mismatch_is_saved_before_model_startup(self):
+        source = self.root / "source"
+        build = self.root / "build"
+        binary = build / "bin/llama-server"
+        (source / ".git").mkdir(parents=True)
+        (build / "tools/server/CMakeFiles").mkdir(parents=True)
+        binary.parent.mkdir()
+        binary.write_bytes(b"server")
+        (build / "CMakeCache.txt").write_text(
+            f"CMAKE_HOME_DIRECTORY:INTERNAL={source}\n", encoding="utf-8")
+        head = "8352a28b80dfcc53a96e50fca21870930d322b30"
+
+        def run(command, **kwargs):
+            if command == [str(binary), "--version"]:
+                output = "version: test (build 10837, commit 908169007)\n"
+            elif command[:3] == ["git", "-C", str(source)]:
+                output = "" if "status" in command else head + "\n"
+            else:
+                raise AssertionError(command)
+            return audit.subprocess.CompletedProcess(command, 0, output, "")
+
+        with mock.patch.object(audit.subprocess, "run", side_effect=run), \
+                mock.patch.object(audit, "artifact_fingerprint", return_value={}), \
+                mock.patch.object(audit, "model_fingerprint",
+                                  side_effect=AssertionError("model fingerprint was reached")) as model, \
+                mock.patch.object(audit.subprocess, "Popen") as process, \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = audit.main(["probe", "--server", str(binary), "--model", str(binary),
+                               "--out", str(self.root / "results")])
+        saved = json.loads((self.root / "results/baseline.json").read_text())
+        self.assertEqual(code, 1)
+        self.assertEqual(saved["status"], "failed")
+        self.assertIn("runtime commit", saved["error"])
+        self.assertIn("908169007", saved["error"])
+        model.assert_not_called()
+        process.assert_not_called()
+
+    def test_runtime_identity_matches_and_records_dirty_worktree(self):
+        source = self.root / "source"
+        source.mkdir()
+        # A managed Git worktree has a .git file, not a directory.
+        (source / ".git").write_text("gitdir: fixture\n")
+        binary = self.root / "llama-server"
+        head = "a" * 40
+        env = {"LD_LIBRARY_PATH": str(self.root), "TURBO_LAYER_ADAPTIVE": "0"}
+        for dirty in ("", " M tracked.cpp\n?? new-test.cpp\n"):
+            for commit in (head[:9], head):
+                def run(command, **kwargs):
+                    if command == [str(binary), "--version"]:
+                        self.assertEqual(kwargs["env"], env)
+                        # llama-server can print --version to stderr.
+                        return audit.subprocess.CompletedProcess(
+                            command, 0, "", f"version: fixture (build 1, commit {commit})\n")
+                    output = dirty if "status" in command else head + "\n"
+                    return audit.subprocess.CompletedProcess(command, 0, output, "")
+
+                with self.subTest(dirty=dirty, commit=commit), \
+                        mock.patch.object(audit.subprocess, "run", side_effect=run):
+                    report = audit.inspect_build_identity(binary, source, env)
+                self.assertTrue(report["checked"])
+                self.assertEqual(report["errors"], [])
+                self.assertEqual(report["source_head"], head)
+                self.assertEqual(report["runtime_commit"], commit)
+                self.assertEqual(report["source_dirty"], bool(dirty))
+                self.assertEqual(report["source_status"], dirty.rstrip("\n"))
+
+    def test_runtime_identity_fails_closed_on_bad_version_or_command(self):
+        source = self.root / "source"
+        (source / ".git").mkdir(parents=True)
+        binary = self.root / "llama-server"
+        head = "a" * 40
+        cases = [
+            ("version: unknown", 0),
+            ("commit aaaaaaaaa\ncommit bbbbbbbbb", 0),
+            ("commit aaaaaaaaa", -6),
+        ]
+        for output, returncode in cases:
+            def run(command, **kwargs):
+                if command == [str(binary), "--version"]:
+                    return audit.subprocess.CompletedProcess(command, returncode, output, "")
+                value = "" if "status" in command else head + "\n"
+                return audit.subprocess.CompletedProcess(command, 0, value, "")
+
+            with self.subTest(output=output, returncode=returncode), \
+                    mock.patch.object(audit.subprocess, "run", side_effect=run):
+                report = audit.inspect_build_identity(binary, source)
+            self.assertTrue(report["checked"])
+            self.assertTrue(report["errors"])
+            self.assertEqual(report["version_returncode"], returncode)
+
+        for failure in (OSError("missing git"), audit.subprocess.TimeoutExpired("git", 15),
+                        audit.subprocess.CalledProcessError(128, "git")):
+            with self.subTest(failure=failure), \
+                    mock.patch.object(audit.subprocess, "run", side_effect=failure):
+                report = audit.inspect_build_identity(binary, source)
+            self.assertTrue(report["checked"])
+            self.assertTrue(report["errors"])
+
+    def test_runtime_identity_detects_head_change_during_check(self):
+        source = self.root / "source"
+        (source / ".git").mkdir(parents=True)
+        binary = self.root / "llama-server"
+        head = "a" * 40
+        heads = iter([head, "b" * 40])
+
+        def run(command, **kwargs):
+            if command == [str(binary), "--version"]:
+                output = "version: fixture (build 1, commit aaaaaaaaa)\n"
+            elif "status" in command:
+                output = ""
+            elif command[-1] == "HEAD":
+                output = next(heads)
+            else:
+                output = head
+            return audit.subprocess.CompletedProcess(command, 0, output, "")
+
+        with mock.patch.object(audit.subprocess, "run", side_effect=run):
+            report = audit.inspect_build_identity(binary, source)
+        self.assertIn("HEAD changed", report["errors"][0])
+
+    def test_runtime_identity_does_not_invent_git_for_source_archives(self):
+        with mock.patch.object(audit.subprocess, "run") as run:
+            report = audit.inspect_build_identity(self.root / "server", self.root)
+        self.assertFalse(report["checked"])
+        self.assertEqual(report["errors"], [])
+        self.assertIn("not a Git checkout", report["reason"])
+        run.assert_not_called()
+
     def test_build_preflight_checks_runtime_library_objects(self):
         targets = (
             "src/CMakeFiles/llama.dir",

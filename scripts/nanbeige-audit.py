@@ -142,7 +142,51 @@ def _archive_members(path):
     return members
 
 
-def inspect_build_artifacts(binary):
+def inspect_build_identity(binary, source_root, env=None):
+    """Check the executable's reported commit against its CMake source tree.
+
+    Object timestamps alone cannot detect a stale build-info archive after a
+    checkout or merge. A matching version is necessary, not proof of a clean
+    or ABI-consistent build; keep the dirty status beside the runtime identity.
+    """
+    report = {"checked": False, "errors": []}
+    if not (source_root / ".git").exists():
+        report["reason"] = "CMake source is not a Git checkout"
+        return report
+    report["checked"] = True
+
+    def git(*arguments):
+        return subprocess.run(["git", "-C", str(source_root), *arguments],
+                              capture_output=True, text=True, check=True, timeout=15).stdout.rstrip("\r\n")
+
+    try:
+        head = git("rev-parse", "--verify", "HEAD")
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+            raise ValueError("invalid source HEAD: " + head)
+        report["source_head"] = head
+        report["source_status"] = git("status", "--porcelain=v1", "--untracked-files=normal")
+        report["source_dirty"] = bool(report["source_status"])
+        runtime_env = env if env is not None else dict(os.environ, LD_LIBRARY_PATH=str(binary.parent))
+        version = subprocess.run([str(binary), "--version"], capture_output=True,
+                                 text=True, env=runtime_env, timeout=15)
+        report["version"] = version.stdout + version.stderr
+        report["version_returncode"] = version.returncode
+        if version.returncode != 0:
+            raise ValueError("server --version exited with " + str(version.returncode))
+        commits = set(re.findall(r"\bcommit ([0-9a-f]{7,64})\b", report["version"]))
+        if len(commits) != 1:
+            raise ValueError("server --version did not report one unambiguous runtime commit")
+        commit = report["runtime_commit"] = commits.pop()
+        if not head.startswith(commit) or git("rev-parse", "--verify", commit + "^{commit}") != head:
+            raise ValueError("runtime commit " + commit + " does not match source HEAD " + head)
+        if git("rev-parse", "--verify", "HEAD") != head:
+            raise ValueError("source HEAD changed during runtime identity check")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        report["errors"].append("runtime identity check failed: " + str(exc))
+    return report
+
+
+def inspect_build_artifacts(binary, env=None):
     """Fail-closed evidence for build-tree binaries before model startup.
 
     Normal CMake target builds rebuild objects whose local dependencies are
@@ -243,6 +287,9 @@ def inspect_build_artifacts(binary):
     if report["duplicate_archive_members"]:
         archive, members = next(iter(report["duplicate_archive_members"].items()))
         errors.append("duplicate static archive members in " + archive + ": " + ", ".join(members[:4]))
+    if not errors:
+        report["runtime_identity"] = inspect_build_identity(binary, source_root, env)
+        errors.extend(report["runtime_identity"]["errors"])
     report["errors"] = errors
     return report
 
@@ -264,7 +311,10 @@ def model_fingerprint(path):
 
 @contextlib.contextmanager
 def server(args, config, result):
-    result["build_preflight"] = inspect_build_artifacts(args.server)
+    env = dict(os.environ, LD_LIBRARY_PATH=str(args.server.resolve().parent),
+               TURBO_AUTO_ASYMMETRIC="0")
+    env.update(config.get("env", {}))
+    result["build_preflight"] = inspect_build_artifacts(args.server, env)
     if result["build_preflight"].get("errors"):
         raise RuntimeError("build preflight failed: " + "; ".join(result["build_preflight"]["errors"]))
     result["artifacts_before"] = artifact_fingerprint(args.server)
@@ -285,9 +335,6 @@ def server(args, config, result):
         command.append("--metrics")
     result["command"] = ["<ephemeral-key>" if v == key else v for v in command]
     result["config"] = config
-    env = dict(os.environ, LD_LIBRARY_PATH=str(args.server.resolve().parent),
-               TURBO_AUTO_ASYMMETRIC="0")
-    env.update(config.get("env", {}))
     stop = threading.Event()
     samples = []
     errors = []

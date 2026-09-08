@@ -55,9 +55,18 @@ local dependencies and duplicate members in the server/common static archives. T
 prevents hand-run object relinks or direct `link.txt`/`ar qc` invocations from
 silently mixing incompatible C++ layouts. The result records `checked_objects`;
 this timestamp check covers the available `*.o.d` files, not a reproducible-build
-attestation. A normal target build and a separate `llama-server --version` check
-against the intended commit are still required. The runner then fingerprints the
-executable
+attestation. When the CMake source is a Git checkout, the runner also executes
+`llama-server --version` with the probe's runtime environment and requires its
+reported commit to resolve to that checkout's current HEAD. A stale, missing or
+ambiguous commit, a failed version command, or a HEAD change during this check
+fails before model fingerprinting or server startup. The failed JSON is retained.
+`build_preflight.runtime_identity` records the version, HEAD and porcelain Git
+status; a matching commit with dirty source is **not** a clean-HEAD build claim.
+Source archives without Git metadata explicitly record that identity comparison
+was skipped. Installed binaries outside a CMake build tree still require an
+operator identity check. A normal, completed target build remains necessary;
+neither matching version text nor timestamps prove ABI consistency.
+The runner then fingerprints the executable
 and local shared libraries before/after each run and rejects changed artifacts;
 these hashes do not cover driver or system libraries outside the binary directory.
 It records the process exit status **before** its cleanup signal, so a server
