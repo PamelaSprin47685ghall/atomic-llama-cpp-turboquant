@@ -1145,9 +1145,6 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_PREFILL_POOL",
     "FLASH_PREFILL_SELECT",
     "FLASH_PREFILL_ATTN",
-};
-
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
     "XKV_RECONSTRUCT",
     "XKV_ATTENTION",
     "XKV_FACTORIZE",
@@ -1158,7 +1155,7 @@ static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
     "XKV_LANDMARK_MERGE",
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1278,9 +1275,6 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "flash_prefill_pool(x)",
     "flash_prefill_select(x)",
     "flash_prefill_attn(x)",
-};
-
-static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
     "xkv_reconstruct(a_k,b_k,a_v,b_v,refs,pos,meta)",
     "xkv_attention(q,k_hot,v_hot,k_cold,v_cold,entries,offsets,sinks)",
     "xkv_factorize(x)",
@@ -1291,7 +1285,7 @@ static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
     "xkv_landmark_merge(idx,sc,base,outsc,status)",
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 

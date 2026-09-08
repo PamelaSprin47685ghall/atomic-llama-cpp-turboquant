@@ -1,7 +1,5 @@
 #include "llama-kv-cache.h"
 #include "llama-triattention.h"
-#include "llama-kv-transform.h"
-#include "llama-turbo-config.h"
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -46,6 +44,7 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
     if (tensor->type != GGML_TYPE_F32) {
         data_f32.resize(n*n);
         data = data_f32.data();
+    }
 
     data[0*n + 0] = 1.0 / sqrtf(n);
 
@@ -228,21 +227,6 @@ llama_kv_cache::llama_kv_cache(
     const uint32_t n_layer    = hparams.n_layer_all;
     const uint32_t n_layer_kv = hparams.n_layer_kv();
 
-    // Resolve once per cache instance, not once per process. In particular,
-    // a turbo2-V cache may auto-select mode 7 while a later turbo3-V cache in
-    // the same process must remain turbo3 unless the user explicitly asks for
-    // an adaptive mode.
-    const uint32_t n_layer_adaptive = hparams.n_layer();
-    const char * adaptive_env = getenv("TURBO_LAYER_ADAPTIVE");
-    const int adaptive_mode = llama_turbo_layer_adaptive_mode(type_v, n_layer_adaptive, adaptive_env);
-    if (adaptive_env != nullptr) {
-        if (adaptive_mode > 0) {
-            LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", adaptive_mode);
-        }
-    } else if (adaptive_mode == 7) {
-        LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
-    }
-
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
@@ -389,7 +373,7 @@ llama_kv_cache::llama_kv_cache(
 
         // Layer-adaptive: use higher precision for quality-sensitive layers
         // Config: TURBO_LAYER_ADAPTIVE env var controls the strategy
-        //   0 = uniform (explicit opt-out; unset + turbo2 V auto-selects mode 7)
+        //   0 = uniform (default)
         //   1 = q8_0 K+V for first+last 4 layers
         //   2 = q8_0 K+V for last 8 layers
         //   5 = Boundary V: first2+last2 V=turbo4, rest V=turbo2 (K unchanged)
@@ -398,34 +382,51 @@ llama_kv_cache::llama_kv_cache(
         ggml_type layer_type_k = type_k;
         ggml_type layer_type_v = type_v;
         {
+            static const int adaptive_mode = [&]() {
+                const char * env = getenv("TURBO_LAYER_ADAPTIVE");
+                if (env) {
+                    int mode = atoi(env);
+                    if (mode > 0) {
+                        LLAMA_LOG_INFO("llama_kv_cache: layer-adaptive mode %d enabled (env)\n", mode);
+                    }
+                    return mode;
+                }
+                // Auto-enable Boundary V (mode 7) when V is turbo2
+                if (type_v == GGML_TYPE_TURBO2_0 && hparams.n_layer() >= 8) {
+                    LLAMA_LOG_INFO("llama_kv_cache: Boundary V auto-enabled for turbo2-V (opt-out: TURBO_LAYER_ADAPTIVE=0)\n");
+                    return 7;
+                }
+                return 0;
+            }();
             const bool is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
             const bool v_is_turbo = (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0);
-            if (adaptive_mode == 1 && is_turbo && n_layer_adaptive >= 8) {
-                if (il < 4 || il >= n_layer_adaptive - 4) {
+            const uint32_t n_layer = hparams.n_layer();
+            if (adaptive_mode == 1 && is_turbo && n_layer >= 8) {
+                if (il < 4 || il >= n_layer - 4) {
                     layer_type_k = GGML_TYPE_Q8_0;
                     layer_type_v = GGML_TYPE_Q8_0;
                 }
-            } else if (adaptive_mode == 2 && is_turbo && n_layer_adaptive >= 8) {
-                if (il >= n_layer_adaptive - 8) {
+            } else if (adaptive_mode == 2 && is_turbo && n_layer >= 8) {
+                if (il >= n_layer - 8) {
                     layer_type_k = GGML_TYPE_Q8_0;
                     layer_type_v = GGML_TYPE_Q8_0;
                 }
-            } else if (adaptive_mode == 5 && v_is_turbo && n_layer_adaptive >= 8) {
+            } else if (adaptive_mode == 5 && v_is_turbo && n_layer >= 8) {
                 // Boundary V (turbo4 boundaries): first2+last2 V=turbo4, rest V=turbo2 (excluding MTP layers)
-                const bool is_boundary = (il < 2 || (il < n_layer_adaptive && il >= n_layer_adaptive - 2));
+                const bool is_boundary = (il < 2 || (il < n_layer && il >= n_layer - 2));
                 layer_type_v = is_boundary ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
                 if (il == 0) {
                     LLAMA_LOG_INFO("llama_kv_cache: Boundary V mode 5: first2+last2 V=turbo4, rest V=turbo2\n");
                 }
-            } else if (adaptive_mode == 6 && v_is_turbo && n_layer_adaptive >= 8) {
+            } else if (adaptive_mode == 6 && v_is_turbo && n_layer >= 8) {
                 // V-only: last 8 V=turbo4, rest V=turbo2
-                layer_type_v = (il >= n_layer_adaptive - 8) ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
+                layer_type_v = (il >= n_layer - 8) ? GGML_TYPE_TURBO4_0 : GGML_TYPE_TURBO2_0;
                 if (il == 0) {
                     LLAMA_LOG_INFO("llama_kv_cache: V-only LA mode 6: last8 V=turbo4, rest V=turbo2\n");
                 }
-            } else if (adaptive_mode == 7 && v_is_turbo && n_layer_adaptive >= 8) {
+            } else if (adaptive_mode == 7 && v_is_turbo && n_layer >= 8) {
                 // Boundary V (recommended): first2+last2 V=q8_0, rest V=turbo2 (excluding MTP layers)
-                const bool is_boundary = (il < 2 || (il < n_layer_adaptive && il >= n_layer_adaptive - 2));
+                const bool is_boundary = (il < 2 || (il < n_layer && il >= n_layer - 2));
                 layer_type_v = is_boundary ? GGML_TYPE_Q8_0 : GGML_TYPE_TURBO2_0;
                 if (il == 0) {
                     LLAMA_LOG_INFO("llama_kv_cache: Boundary V mode 7: first2+last2 V=q8_0, rest V=turbo2\n");
@@ -561,38 +562,11 @@ llama_kv_cache::llama_kv_cache(
     {
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
-        const double kib_per_cell = kv_size > 0
-            ? (double)(memory_size_k + memory_size_v) / (double)kv_size / 1024.0
-            : 0.0;
 
-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs, %7.3f KiB/cell), "
-                       "K: %7.2f MiB, V: %7.2f MiB (requested %s/%s)\n", __func__,
+        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
                 (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
-                kib_per_cell,
-                (float)memory_size_k / (1024.0f * 1024.0f), (float)memory_size_v / (1024.0f * 1024.0f),
-                ggml_type_name(type_k), ggml_type_name(type_v));
-
-        // Requested cache types can differ from the tensors actually
-        // allocated per layer (layer-adaptive modes, automatic asymmetric K,
-        // model-specific reuse). Print the real layer/type/byte mix so memory
-        // fitting does not mistake e.g. Boundary-V q8 layers for uniform V2.
-        for (int side = 0; side < 2; ++side) {
-            std::map<ggml_type, std::pair<uint32_t, size_t>> mix;
-            for (const auto & layer : layers) {
-                const ggml_tensor * tensor = side == 0 ? layer.k : layer.v;
-                if (!tensor) {
-                    continue;
-                }
-                auto & entry = mix[tensor->type];
-                entry.first += 1;
-                entry.second += ggml_nbytes(tensor);
-            }
-            for (const auto & [type, entry] : mix) {
-                LLAMA_LOG_INFO("%s: actual %c layers: %3u x %-8s = %7.2f MiB\n", __func__,
-                        side == 0 ? 'K' : 'V', entry.first, ggml_type_name(type),
-                        (float)entry.second / (1024.0f * 1024.0f));
-            }
-        }
+                ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
+                ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
     }
 
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
@@ -604,7 +578,6 @@ llama_kv_cache::llama_kv_cache(
 
         attn_rot_k = other->attn_rot_k;
         attn_rot_v = other->attn_rot_v;
-        attn_rot_k_nrot = other->attn_rot_k_nrot;
     } else {
         // TurboQuant: master's #21038 attention rotation is OFF by default on this
         // fork. Enable per-side via LLAMA_ATTN_ROT_K_OVERRIDE=1 and/or
@@ -670,21 +643,6 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    if (attn_rot_k && !other) {
-        const char * value = getenv("LLAMA_ATTN_ROT_K_NROT");
-        int nrot = value ? atoi(value) : 64;
-        if (nrot == 0) {
-            nrot = 64;
-            while (n_embd_head_k_all % (2 * nrot) == 0) {
-                nrot *= 2;
-            }
-        }
-        if (nrot < 64 || (nrot & (nrot - 1)) != 0 || n_embd_head_k_all % nrot != 0) {
-            throw std::runtime_error("invalid LLAMA_ATTN_ROT_K_NROT for K head dimension");
-        }
-        attn_rot_k_nrot = (uint32_t) nrot;
-    }
-
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
     LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
 
@@ -723,7 +681,7 @@ void llama_kv_cache::clear(bool data) {
     if (!try_clear(data, &err)) {
         LLAMA_LOG_ERROR("%s: %s\n", __func__, err.c_str());
     }
-}
+    }
 
 bool llama_kv_cache::try_clear(bool data, std::string * err) {
     // Unilateral cross-atomic clear (no store-gate dependency): preflight
@@ -815,8 +773,6 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (other) {
         return true;
     }
-
-    fp_bump();
 
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
@@ -934,8 +890,6 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
         return;
     }
 
-    fp_bump();
-
     GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
     GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
 
@@ -1040,8 +994,6 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
         return;
     }
 
-    fp_bump();
-
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
@@ -1088,8 +1040,6 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     if (other) {
         return;
     }
-
-    fp_bump();
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
@@ -1177,8 +1127,6 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     if (other) {
         return;
     }
-
-    fp_bump();
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_div() is only supported for n_pos_per_embd() == 1");
@@ -2036,8 +1984,6 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
         return true;
     }
 
-    fp_bump();
-
     bool updated = false;
 
     // Bounded context-shift transaction (positions-aware landmark COW +
@@ -2095,15 +2041,11 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
         // apply K-shift if needed
         if (hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
-            const bool has_plain_k = std::any_of(layers.begin(), layers.end(), [](const auto & layer) {
-                return !llama_kv_is_turbo(layer.k->type);
-            });
-            if (has_plain_k) {
-                ggml_backend_sched_reset(sched);
+            ggml_backend_sched_reset(sched);
 
-                auto * res = lctx->get_gf_res_reserve();
+            auto * res = lctx->get_gf_res_reserve();
 
-                res->reset();
+            res->reset();
 
             auto * gf = build_graph_shift(res, lctx);
             if (gf == nullptr) {
@@ -2123,14 +2065,6 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
             }
 
             updated = true;
-            }
-            if (std::any_of(layers.begin(), layers.end(), [](const auto & layer) {
-                    return llama_kv_is_turbo(layer.k->type);
-                })) {
-                llama_synchronize(lctx);
-                shift_turbo_keys(lctx->get_cparams());
-                updated = true;
-            }
         }
 
         for (uint32_t s = 0; s < n_stream; ++s) {
@@ -2173,26 +2107,13 @@ void llama_kv_cache::compact() {
         return;
     }
 
-    auto planned_cells = v_cells;
-    if (!compact_planned(planned_cells)) {
-        throw std::runtime_error("KV native compaction is unsupported by this backend/layout");
-    }
-}
-
-bool llama_kv_cache::compact_planned(llama_kv_cells_vec & planned_cells) {
-    fp_bump();
-
-    auto heads = v_heads;
-    std::map<ggml_backend_buffer_t, std::vector<ggml_backend_tensor_memmove_region>> buffer_moves;
-
     for (uint32_t s = 0; s < n_stream; ++s) {
-        auto & cells = planned_cells[s];
-        auto & head  = heads[s];
+        auto & cells = v_cells[s];
+        auto & head  = v_heads[s];
 
         const auto plan = cells.make_pack_plan();
 
         if (plan.moves.empty()) {
-            head = 0;
             continue;
         }
 
@@ -2205,7 +2126,6 @@ bool llama_kv_cache::compact_planned(llama_kv_cells_vec & planned_cells) {
             }
         }
         if (!needs_compaction) {
-            head = plan.retained_count;
             continue;
         }
 
@@ -2216,6 +2136,8 @@ bool llama_kv_cache::compact_planned(llama_kv_cells_vec & planned_cells) {
         // ranges are safe without CPU staging. We preflight every buffer before
         // executing any data movement; only after every buffer succeeds do we
         // commit cell metadata.
+        std::map<ggml_backend_buffer_t, std::vector<ggml_backend_tensor_memmove_region>> buffer_moves;
+
         auto add_row_move = [&](ggml_tensor * tensor, const auto & move) {
             const size_t row_bytes  = ggml_row_size(tensor->type, tensor->ne[0]);
             const size_t row_stride = tensor->nb[1];
@@ -2300,30 +2222,28 @@ bool llama_kv_cache::compact_planned(llama_kv_cells_vec & planned_cells) {
             }
         }
 
-        // This is still a private plan. Finish every allocation and preflight
-        // across ALL streams/backing buffers before moving any live K/V.
+        for (const auto & [buffer, moves] : buffer_moves) {
+            if (!ggml_backend_tensor_memmove_regions_supported(moves.data(), moves.size())) {
+                throw std::runtime_error(
+                    std::string("TriAttention native compaction is unsupported by KV backend/layout: ") +
+                    (buffer ? ggml_backend_buffer_name(buffer) : "<null>"));
+            }
+        }
+
+        for (const auto & [buffer, moves] : buffer_moves) {
+            GGML_UNUSED(buffer);
+            if (!ggml_backend_tensor_memmove_regions(moves.data(), moves.size())) {
+                throw std::runtime_error("TriAttention native compaction failed after successful preflight");
+            }
+        }
+
+        // Apply metadata changes after all K/V data is moved
         cells.apply_pack(plan);
         head = plan.retained_count;
         // NOTE: no store notification here. Logical cell indices and store hot
         // physical rows are different domains; factored row packing happens via
         // the store mutation transaction, not cell compact.
     }
-
-    for (const auto & [buffer, moves] : buffer_moves) {
-        GGML_UNUSED(buffer);
-        if (!ggml_backend_tensor_memmove_regions_supported(moves.data(), moves.size())) {
-            return false;
-        }
-    }
-    for (const auto & [buffer, moves] : buffer_moves) {
-        GGML_UNUSED(buffer);
-        if (!ggml_backend_tensor_memmove_regions(moves.data(), moves.size())) {
-            throw std::runtime_error("KV native compaction failed after successful preflight");
-        }
-    }
-    v_cells = std::move(planned_cells);
-    v_heads = std::move(heads);
-    return true;
 }
 
 void llama_kv_cache::init_triattention(
@@ -2346,8 +2266,6 @@ void llama_kv_cache::init_triattention(
     cfg.normalize_scores = true;
     cfg.disable_mlr = false;
     cfg.disable_trig = false;
-    cfg.k_hadamard = attn_rot_k_nrot;
-    cfg.uncalibrated_draft_recency = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
 
     const uint32_t head_dim = n_embd_head_k_all > 0 ? (uint32_t) n_embd_head_k_all : hparams.n_embd_head_k(0);
     const uint32_t n_kv_heads = hparams.n_head_kv(0);
@@ -2438,16 +2356,6 @@ void llama_kv_cache::init_triattention(
         tri_scorer.reset();
         throw std::runtime_error(std::string("failed to initialize TriAttention scorer from: ") + stats_path);
     }
-    std::vector<int32_t> layer_map;
-    for (const auto & layer : layers) {
-        layer_map.push_back((int32_t) layer.il);
-    }
-    if (!tri_scorer->matches_layers(layer_map.data(), (uint32_t) layer_map.size())) {
-        if (!cfg.uncalibrated_draft_recency) {
-            throw std::runtime_error("TriAttention calibration covers none of this context's KV layers");
-        }
-        LLAMA_LOG_WARN("%s: nextn draft has no matching calibration; using explicit recent-KV retention on draft only (target still uses TriAttention)\n", __func__);
-    }
 }
 
 llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_reclaim_request & request) {
@@ -2458,8 +2366,6 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
     if (other) {
         return other->reclaim_kv(request);
     }
-
-    fp_bump();
 
     if (!tri_scorer || !tri_scorer->valid()) {
         result.supported = false;
@@ -2808,24 +2714,18 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
     std::vector<ggml_tensor *> k_tensors(n_kv_layers);
     std::vector<int32_t> layer_map(n_kv_layers);
     for (uint32_t l = 0; l < n_kv_layers; l++) {
+        k_tensors[l] = layers[l].k;
         layer_map[l] = (int32_t) layers[l].il;
     }
 
     std::vector<llama_memory_kv_reclaim_seq_hint> hints = request.seq_hints;
     if (hints.empty()) {
-        // The low-level decode retry has no server slot hints. Discover all
-        // resident sequences, not just seq 0 (also works with split streams).
-        for (llama_seq_id seq = 0; (size_t) seq < seq_to_stream.size(); ++seq) {
-            const llama_pos pmax = planned_cells[seq_to_stream[seq]].seq_pos_max(seq);
-            if (pmax >= 0) {
-                llama_memory_kv_reclaim_seq_hint h{};
-                h.seq_id = seq;
-                h.logical_tokens = (uint32_t) pmax + 1;
-                h.tail_guard = tri_recent_window;
-                h.eligible = true;
-                hints.push_back(h);
-            }
-        }
+        llama_memory_kv_reclaim_seq_hint h;
+        h.seq_id = 0;
+        h.logical_tokens = (uint32_t) (cells.seq_pos_max(0) >= 0 ? cells.seq_pos_max(0) + 1 : 0);
+        h.tail_guard = tri_recent_window;
+        h.eligible = true;
+        hints.push_back(h);
     }
 
     for (const auto & hint : hints) {
@@ -2834,14 +2734,6 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
         }
 
         const llama_seq_id seq_id = hint.seq_id;
-        if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
-            throw std::runtime_error("TriAttention: invalid sequence hint");
-        }
-        const uint32_t stream = seq_to_stream[seq_id];
-        auto & cells = planned_cells[stream];
-        for (uint32_t l = 0; l < n_kv_layers; ++l) {
-            k_tensors[l] = layers[l].k_stream[stream];
-        }
         const llama_pos max_pos = cells.seq_pos_max(seq_id);
         if (max_pos < 0) {
             continue;
@@ -2850,8 +2742,9 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
         const uint32_t tail_guard = hint.tail_guard > 0 ? hint.tail_guard : tri_recent_window;
         const uint32_t logical_tokens = hint.logical_tokens > 0 ? hint.logical_tokens : (uint32_t) (max_pos + 1);
 
-        // Target retention based on the configured ratio (§B.9, §B.11).
-        uint32_t target_retention = tri_rerot_target_retention(logical_tokens, tri_ratio, tail_guard);
+        // Target retention based on the configured ratio.
+        uint32_t target_retention = (uint32_t) std::ceil((double) logical_tokens * tri_ratio);
+        target_retention = std::max(target_retention, tail_guard);
 
         result.target_references += target_retention;
 
@@ -2877,9 +2770,9 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
                 rerot_meta.active() &&
                 rerot_meta.visibility == llama_rerot_visibility::pending_record;
             const bool semantic_foreign_tag =
+                hint.semantic_episode_id != 0 &&
                 rerot_meta.active() &&
-                (hint.semantic_episode_id == 0 ||
-                 rerot_meta.episode_id != hint.semantic_episode_id ||
+                (rerot_meta.episode_id != hint.semantic_episode_id ||
                  rerot_meta.visibility != llama_rerot_visibility::public_live);
             bool semantic_reader_tail = false;
             if (hint.semantic_episode_id != 0) {
@@ -2919,29 +2812,23 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
         // How many candidates to keep
         const uint32_t candidates_to_keep = (target_retention > n_protected) ? std::min(target_retention - n_protected, n_candidates) : 0;
 
-        // Hard guards can already consume the entire target (notably the
-        // 128-token recent floor). Then every candidate is evicted regardless
-        // of its score: avoid GPU readback, dequantization and scoring, without
-        // changing either the retained set or the reference-removal order.
-        std::vector<float> scores;
-        if (candidates_to_keep > 0) {
-            scores.resize(n_candidates);
-            const int64_t t_score_start = ggml_time_us();
-            tri_scorer->score_combined(
-                scores.data(),
-                k_tensors.data(),
-                n_kv_layers,
-                layer_map.data(),
-                cand_indices.data(),
-                cand_positions.data(),
-                n_candidates,
-                (int64_t) max_pos);
-            std::vector<float> pooled_scores(n_candidates);
-            triattention_max_pool_scores(
-                pooled_scores.data(), scores.data(), cand_positions.data(), n_candidates, 2);
-            scores.swap(pooled_scores);
-            result.score_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_score_start);
-        }
+        // Score candidates
+        std::vector<float> scores(n_candidates);
+        const int64_t t_score_start = ggml_time_us();
+        tri_scorer->score_combined(
+            scores.data(),
+            k_tensors.data(),
+            n_kv_layers,
+            layer_map.data(),
+            cand_indices.data(),
+            cand_positions.data(),
+            n_candidates,
+            (int64_t) max_pos);
+        std::vector<float> pooled_scores(n_candidates);
+        triattention_max_pool_scores(
+            pooled_scores.data(), scores.data(), cand_positions.data(), n_candidates, 2);
+        scores.swap(pooled_scores);
+        result.score_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_score_start);
 
         // Select top candidates to keep (highest score first)
         std::vector<uint32_t> order(n_candidates);
@@ -2963,10 +2850,6 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
                 const uint32_t cand_idx = order[k];
                 const uint32_t cell_i   = cand_indices[cand_idx];
 
-                if (cells.is_empty(cell_i)) {
-                    continue;
-                }
-
                 const auto rerot_meta = cells.rerot_get(cell_i);
                 const bool semantic_cell =
                     hint.semantic_episode_id != 0 &&
@@ -2978,23 +2861,15 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
                     // cell regardless of archive/exec bookkeeping refs. Remove
                     // only this episode's refs; another outer completion may
                     // legally retain the same physical base-prefix cell.
-                    bool removed_any = false;
                     for (const llama_seq_id ref : hint.semantic_seq_ids) {
                         if (!cells.is_empty(cell_i) && cells.seq_has(cell_i, ref)) {
                             cells.seq_rm(cell_i, ref);
                             result.references_removed++;
-                            removed_any = true;
                         }
                     }
-                    if (!removed_any && !cells.is_empty(cell_i) && cells.seq_has(cell_i, seq_id)) {
-                        cells.seq_rm(cell_i, seq_id);
-                        result.references_removed++;
-                    }
                 } else {
-                    if (!cells.is_empty(cell_i) && cells.seq_has(cell_i, seq_id)) {
-                        cells.seq_rm(cell_i, seq_id);
-                        result.references_removed++;
-                    }
+                    cells.seq_rm(cell_i, seq_id);
+                    result.references_removed++;
                 }
             }
         }
@@ -3003,34 +2878,20 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
     // Report the final physical shared set, not the number of intermediate
     // seq_rm() calls that happened to leave a cell referenced. This makes the
     // metric directly describe the union that must remain resident.
-    for (const auto & cells : planned_cells) {
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.is_empty(i) && cells.seq_count(i) > 1) {
-                result.shared_keep++;
-            }
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i) && cells.seq_count(i) > 1) {
+            result.shared_keep++;
         }
-    }
-
-    if (result.references_removed == 0) {
-        result.physical_after = result.physical_before;
-        result.capacity_satisfied = request.required_free == 0;
-        result.floor_reached = true;
-        return result;
     }
 
     // Pack remaining used cells to [0, retained_count)
     const int64_t t_pack_start = ggml_time_us();
-    if (!compact_planned(planned_cells)) {
-        const uint32_t before = result.physical_before;
-        result = {};
-        result.physical_before = result.physical_after = before;
-        return result;
-    }
+    compact();
     result.pack_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_pack_start);
 
-    result.physical_after = get_kv_used();
+    result.physical_after = cells.get_used();
     result.physical_freed = result.physical_before - result.physical_after;
-    result.changed = (result.references_removed > 0);
+    result.changed = (result.physical_freed > 0);
     result.capacity_satisfied = (result.physical_freed >= request.required_free);
     result.floor_reached = true;
 
@@ -3801,8 +3662,6 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         return;
     }
 
-    fp_bump();
-
     // keep track of the max sequence position that we would overwrite with this ubatch
     // for non-SWA cache, this would be always empty
     llama_seq_id seq_pos_max_rm[LLAMA_MAX_SEQ];
@@ -4197,704 +4056,12 @@ ggml_type llama_kv_cache::layer_type_v(int32_t il) const {
     return layers.at(map_layer_ids.at(il)).v->type;
 }
 
-std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
-    std::vector<uint32_t> res;
-    res.reserve(layers.size());
-
-    for (const auto & layer : layers) {
-        res.push_back(layer.il);
-    }
-
-    return res;
+ggml_type llama_kv_cache_context::layer_type_k(int32_t il) const {
+    return kv->layer_type_k(il);
 }
 
-ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
-    const int32_t ikv = map_layer_ids.at(il);
-
-    return layers[ikv].k;
-}
-
-ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
-    const int32_t ikv = map_layer_ids.at(il);
-
-    return layers[ikv].v;
-}
-
-int32_t llama_kv_cache::get_attn_rot_k_nrot() const {
-    if (!attn_rot_k) {
-        return 0;
-    }
-    const char * LLAMA_ATTN_ROT_K_NROT = getenv("LLAMA_ATTN_ROT_K_NROT");
-    int nrot = LLAMA_ATTN_ROT_K_NROT ? atoi(LLAMA_ATTN_ROT_K_NROT) : 64;
-    if (nrot == 0) {
-        nrot = 64;
-        do {
-            nrot *= 2;
-        } while (n_embd_head_k_all > 0 && n_embd_head_k_all % nrot == 0);
-        nrot /= 2;
-    }
-    return nrot;
-}
-
-int32_t llama_kv_cache::get_attn_rot_v_nrot() const {
-    if (!attn_rot_v) {
-        return 0;
-    }
-    return 64;
-}
-
-std::vector<ggml_context *> llama_kv_cache::get_buffer_contexts() const {
-    std::vector<ggml_context *> res;
-    for (const auto & [ctx, _] : ctxs_bufs) {
-        res.push_back(ctx.get());
-    }
-    return res;
-}
-
-bool llama_kv_cache::validate_seq_id(llama_seq_id seq_id) const {
-    return seq_id >= 0 && (size_t) seq_id < seq_to_stream.size();
-}
-
-uint32_t llama_kv_cache::get_stream_for_seq(llama_seq_id seq_id) const {
-    if (!validate_seq_id(seq_id)) {
-        return 0;
-    }
-    return seq_to_stream[seq_id];
-}
-
-bool llama_kv_cache::can_capture_prerope_range(
-        llama_seq_id seq_id,
-        uint32_t cell_start,
-        uint32_t cell_count,
-        std::string * reason) const {
-    if (cell_count == 0) {
-        if (reason) *reason = "cell_count is zero";
-        return false;
-    }
-    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
-        if (reason) *reason = "invalid seq_id";
-        return false;
-    }
-    if (cell_start > UINT32_MAX - cell_count) {
-        if (reason) *reason = "cell range arithmetic overflow";
-        return false;
-    }
-
-    const auto & stream_cells = v_cells[seq_to_stream[seq_id]];
-    if (cell_start + cell_count > stream_cells.size()) {
-        if (reason) *reason = "cell range exceeds cache capacity";
-        return false;
-    }
-
-    // Strict sealing conditions (§5.2):
-    // Must be committed, occupied, seq_has(seq_id), and NOT PRIVATE / PENDING.
-    for (uint32_t i = 0; i < cell_count; ++i) {
-        uint32_t cell_idx = cell_start + i;
-        if (stream_cells.is_empty(cell_idx)) {
-            if (reason) *reason = "cell range contains empty cell at index " + std::to_string(cell_idx);
-            return false;
-        }
-        if (!stream_cells.seq_has(cell_idx, seq_id)) {
-            if (reason) *reason = "cell does not belong to sequence at index " + std::to_string(cell_idx);
-            return false;
-        }
-        // Consult XKV store hot_committed state to reject ordinary tentative tokens
-        if (xkv_store) {
-            const uint64_t pid = stream_cells.payload_id_get(cell_idx);
-            llama_xkv::xkv_location loc;
-            if (!xkv_store->find_location(pid, loc) || loc.state != llama_xkv::xkv_state::hot_committed) {
-                if (reason) *reason = "cell payload " + std::to_string(pid) + " is not in hot_committed state";
-                return false;
-            }
-        }
-        const auto & meta = stream_cells.rerot_get(cell_idx);
-        if (meta.active()) {
-            if (meta.visibility == llama_rerot_visibility::pending_record) {
-                if (reason) *reason = "cell in range has uncommitted PENDING record status at index " + std::to_string(cell_idx);
-                return false;
-            }
-            if (meta.visibility == llama_rerot_visibility::private_control) {
-                if (reason) *reason = "cell in range is private_control at index " + std::to_string(cell_idx);
-                return false;
-            }
-        }
-    }
-
-    return true;
-}
-
-const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
-    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-
-    return v_cells[seq_to_stream[seq_id]];
-}
-
-ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
-    return layers.at(map_layer_ids.at(il)).v;
-}
-
-bool llama_kv_cache::rerot_set_write_tag(
-        llama_seq_id seq_id,
-        const llama_kv_rerot_meta & tag) {
-    if (seq_id < 0 || (size_t) seq_id >= rerot_write_tags.size()) {
-        return false;
-    }
-
-    fp_bump();
-
-    if (tag.active()) {
-        if (tag.node_id == LLAMA_REROT_NODE_INVALID || tag.run_id == LLAMA_REROT_RUN_INVALID ||
-            tag.visibility == llama_rerot_visibility::normal ||
-            (tag.visibility == llama_rerot_visibility::pending_record && tag.publish_epoch != 0)) {
-            return false;
-        }
-        rerot_write_tags[seq_id] = tag;
-    } else {
-        rerot_write_tags[seq_id].reset();
-    }
-
-    return true;
-}
-
-void llama_kv_cache::rerot_clear_write_tag(llama_seq_id seq_id) {
-    fp_bump();
-    if (seq_id >= 0 && (size_t) seq_id < rerot_write_tags.size()) {
-        rerot_write_tags[seq_id].reset();
-    }
-}
-
-size_t llama_kv_cache::rerot_publish_run(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        uint64_t publish_epoch) {
-    size_t count = 0;
-    if (publish_epoch == 0 || !rerot_can_publish_run(episode_id, run_id, &count)) {
-        return 0;
-    }
-
-    fp_bump();
-
-    std::vector<std::pair<uint32_t, uint32_t>> matches;
-    GGML_ASSERT(rerot_find_run_cells(episode_id, run_id, &matches) == count);
-
-    for (const auto & match : matches) {
-        const bool published = v_cells[match.first].rerot_publish(
-            match.second, episode_id, run_id, publish_epoch);
-        GGML_ASSERT(published);
-    }
-
-    return matches.size();
-}
-
-size_t llama_kv_cache::rerot_reclassify_run(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        llama_rerot_visibility expected,
-        llama_rerot_visibility replacement,
-        uint64_t publish_epoch) {
-    size_t count = 0;
-    if (!rerot_can_reclassify_run(
-            episode_id, run_id, expected, replacement, publish_epoch, &count)) {
-        return 0;
-    }
-
-    fp_bump();
-
-    std::vector<std::pair<uint32_t, uint32_t>> matches;
-    GGML_ASSERT(rerot_find_run_cells(episode_id, run_id, &matches) == count);
-
-    for (const auto & match : matches) {
-        const bool changed = v_cells[match.first].rerot_reclassify(
-            match.second, episode_id, run_id, expected, replacement, publish_epoch);
-        GGML_ASSERT(changed);
-    }
-    return matches.size();
-}
-
-bool llama_kv_cache::rerot_can_add_run_ref(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        llama_seq_id seq_id,
-        size_t * count) const {
-    if (count) {
-        *count = 0;
-    }
-    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID ||
-        seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
-        return false;
-    }
-
-    const uint32_t dst_stream = seq_to_stream[seq_id];
-    size_t matches = 0;
-    for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
-        const auto & cells = v_cells[stream];
-        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-            if (cells.is_empty(cell)) {
-                continue;
-            }
-            const auto & meta = cells.rerot_get(cell);
-            if (meta.episode_id != episode_id || meta.run_id != run_id) {
-                continue;
-            }
-            // A logical run cannot be copied between independent KV streams,
-            // and only an atomically published run is eligible for a keeper.
-            if (stream != dst_stream || meta.visibility != llama_rerot_visibility::public_live ||
-                meta.publish_epoch == 0) {
-                return false;
-            }
-            ++matches;
-        }
-    }
-
-    if (count) {
-        *count = matches;
-    }
-    return matches > 0;
-}
-
-size_t llama_kv_cache::rerot_add_run_ref(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        llama_seq_id seq_id) {
-    size_t count = 0;
-    if (!rerot_can_add_run_ref(episode_id, run_id, seq_id, &count)) {
-        return 0;
-    }
-
-    fp_bump();
-
-    auto & cells = v_cells[seq_to_stream[seq_id]];
-    size_t seen = 0;
-    for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-        if (cells.is_empty(cell)) {
-            continue;
-        }
-        const auto & meta = cells.rerot_get(cell);
-        if (meta.episode_id != episode_id || meta.run_id != run_id) {
-            continue;
-        }
-        if (!cells.seq_has(cell, seq_id)) {
-            cells.seq_add(cell, seq_id);
-        }
-        ++seen;
-    }
-
-    GGML_ASSERT(seen == count);
-    return seen;
-}
-
-size_t llama_kv_cache::rerot_find_run_cells(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        std::vector<std::pair<uint32_t, uint32_t>> * out) const {
-    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID) {
-        return 0;
-    }
-
-    size_t count = 0;
-    for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
-        std::vector<uint32_t> idxs;
-        count += v_cells[stream].rerot_collect_run(episode_id, run_id, idxs);
-        if (out != nullptr) {
-            for (const uint32_t cell : idxs) {
-                out->emplace_back(stream, cell);
-            }
-        }
-    }
-    return count;
-}
-
-bool llama_kv_cache::rerot_can_freeze_to_archive(
-        uint64_t episode_id,
-        llama_seq_id exec_seq,
-        llama_seq_id archive_seq,
-        size_t * count) const {
-    if (count != nullptr) {
-        *count = 0;
-    }
-    if (episode_id == 0 || exec_seq < 0 || archive_seq < 0 || exec_seq == archive_seq ||
-        (size_t) exec_seq >= seq_to_stream.size() || (size_t) archive_seq >= seq_to_stream.size()) {
-        return false;
-    }
-    if (other != nullptr || seq_to_stream[exec_seq] != seq_to_stream[archive_seq]) {
-        return false;
-    }
-
-    size_t kept = 0;
-    const auto & cells = v_cells[seq_to_stream[exec_seq]];
-    for (uint32_t i = 0; i < cells.size(); ++i) {
-        if (cells.is_empty(i) || !cells.seq_has(i, exec_seq)) {
-            continue;
-        }
-        const auto & meta = cells.rerot_get(i);
-        if (meta.active() && meta.episode_id == episode_id &&
-            meta.visibility == llama_rerot_visibility::public_live && meta.publish_epoch != 0) {
-            ++kept;
-        }
-    }
-
-    if (count != nullptr) {
-        *count = kept;
-    }
-    return true;
-}
-
-size_t llama_kv_cache::rerot_freeze_to_archive(
-        uint64_t episode_id,
-        llama_seq_id exec_seq,
-        llama_seq_id archive_seq) {
-    size_t count = 0;
-    if (!rerot_can_freeze_to_archive(episode_id, exec_seq, archive_seq, &count)) {
-        return 0;
-    }
-
-    fp_bump();
-
-    auto & cells = v_cells[seq_to_stream[exec_seq]];
-    const size_t kept = cells.rerot_freeze_to_archive(episode_id, exec_seq, archive_seq);
-
-    GGML_ASSERT(kept == count);
-    return kept;
-}
-
-bool llama_kv_cache::rerot_blocks_state_save(llama_seq_id seq_id) const {
-    if (seq_id == -1) {
-        for (const auto & tag : rerot_write_tags) {
-            if (tag.active()) {
-                return true;
-            }
-        }
-        for (const auto & view : rerot_reader_views) {
-            if (view.active()) {
-                return true;
-            }
-        }
-        for (const auto & cells : v_cells) {
-            if (cells.rerot_has_active()) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
-        return false;
-    }
-    if ((size_t) seq_id < rerot_write_tags.size() && rerot_write_tags[seq_id].active()) {
-        return true;
-    }
-    if ((size_t) seq_id < rerot_reader_views.size() && rerot_reader_views[seq_id].active()) {
-        return true;
-    }
-    return v_cells[seq_to_stream[seq_id]].rerot_has_active_seq(seq_id);
-}
-
-bool llama_kv_cache::rerot_can_reclassify_run(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        llama_rerot_visibility expected,
-        llama_rerot_visibility replacement,
-        uint64_t publish_epoch,
-        size_t * count) const {
-    if (count) {
-        *count = 0;
-    }
-    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID ||
-        expected == llama_rerot_visibility::normal || replacement == llama_rerot_visibility::normal ||
-        (replacement == llama_rerot_visibility::public_live && publish_epoch == 0) ||
-        (replacement != llama_rerot_visibility::public_live && publish_epoch != 0)) {
-        return false;
-    }
-
-    size_t matches = 0;
-    for (const auto & cells : v_cells) {
-        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-            if (cells.is_empty(cell)) {
-                continue;
-            }
-            const auto & meta = cells.rerot_get(cell);
-            if (meta.episode_id != episode_id || meta.run_id != run_id) {
-                continue;
-            }
-            if (meta.visibility != expected) {
-                return false;
-            }
-            ++matches;
-        }
-    }
-
-    if (count) {
-        *count = matches;
-    }
-    return matches > 0;
-}
-
-bool llama_kv_cache::rerot_can_publish_run(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        size_t * count) const {
-    if (count) {
-        *count = 0;
-    }
-    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID) {
-        return false;
-    }
-
-    size_t matches = 0;
-    for (const auto & cells : v_cells) {
-        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-            if (cells.is_empty(cell)) {
-                continue;
-            }
-            const auto & meta = cells.rerot_get(cell);
-            if (meta.episode_id != episode_id || meta.run_id != run_id) {
-                continue;
-            }
-            if (meta.visibility != llama_rerot_visibility::pending_record) {
-                return false;
-            }
-            ++matches;
-        }
-    }
-
-    if (count) {
-        *count = matches;
-    }
-    return matches > 0;
-}
-
-bool llama_kv_cache::rerot_set_reader_view(
-        llama_seq_id seq_id,
-        const llama_rerot_reader_state & view) {
-    fp_bump();
-    if (seq_id < 0 || (size_t) seq_id >= rerot_reader_views.size() || !view.active() ||
-        view.reader == LLAMA_REROT_NODE_INVALID || view.query_run == LLAMA_REROT_RUN_INVALID ||
-        view.ordered_runs.empty()) {
-        return false;
-    }
-
-    std::unordered_set<llama_rerot_run_id> seen;
-    seen.reserve(view.ordered_runs.size());
-    bool query_run_seen = false;
-    for (const auto run_id : view.ordered_runs) {
-        if (run_id == LLAMA_REROT_RUN_INVALID || !seen.insert(run_id).second) {
-            return false;
-        }
-        query_run_seen |= run_id == view.query_run;
-    }
-    if (!query_run_seen) {
-        return false;
-    }
-
-    rerot_reader_views[seq_id] = view;
-    return true;
-}
-
-void llama_kv_cache::rerot_clear_reader_view(llama_seq_id seq_id) {
-    fp_bump();
-    if (seq_id >= 0 && (size_t) seq_id < rerot_reader_views.size()) {
-        rerot_reader_views[seq_id].reset();
-    }
-}
-
-bool llama_kv_cache::rerot_batch_active(const llama_ubatch & ubatch) const {
-    bool any = false;
-    bool all = true;
-    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-        if (!ubatch.seq_id || !ubatch.seq_id[i] || ubatch.n_seq_id[i] < 1) {
-            all = false;
-            continue;
-        }
-        const llama_seq_id seq_id = ubatch.seq_id[i][0];
-        const bool active = seq_id >= 0 && (size_t) seq_id < rerot_reader_views.size() &&
-                            rerot_reader_views[seq_id].active();
-        any |= active;
-        all &= active;
-    }
-    if (any && !all) {
-        throw std::runtime_error("RERoT and ordinary query rows cannot share one ubatch");
-    }
-    return any;
-}
-
-llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
-        const llama_ubatch & ubatch,
-        uint32_t n_kv) const {
-    llama_rerot_attn_layout result;
-    if (!rerot_batch_active(ubatch)) {
-        return result;
-    }
-    if (n_stream != 1 || v_cells.size() != 1) {
-        throw std::runtime_error("RERoT indexed attention requires unified KV");
-    }
-
-    const auto & cells = v_cells[0];
-    if (n_kv > cells.size()) {
-        throw std::runtime_error("RERoT attention layout exceeds KV cache size");
-    }
-
-    result.n_queries = ubatch.n_tokens;
-    result.query_offsets.reserve(size_t(result.n_queries) + 1);
-    result.query_offsets.push_back(0);
-
-    for (uint32_t query = 0; query < ubatch.n_tokens; ++query) {
-        const llama_seq_id seq_id = ubatch.seq_id[query][0];
-        const auto & reader = rerot_reader_views.at(seq_id);
-
-        std::vector<llama_rerot_key_record> keys;
-        keys.reserve(n_kv);
-        for (uint32_t key = 0; key < n_kv; ++key) {
-            if (cells.is_empty(key)) {
-                continue;
-            }
-            keys.push_back({
-                key,
-                cells.pos_get(key),
-                cells.seq_has(key, seq_id),
-                cells.rerot_get(key),
-            });
-        }
-
-        auto query_layout = llama_rerot_build_query_layout(reader, ubatch.pos[query], keys);
-        const uint32_t group_base = static_cast<uint32_t>(result.groups.size());
-        for (auto group : query_layout.groups) {
-            group.query_index = query;
-            result.groups.push_back(group);
-        }
-        for (auto entry : query_layout.entries) {
-            entry.group_index += group_base;
-            result.entries.push_back(entry);
-        }
-        result.query_offsets.push_back(static_cast<uint32_t>(result.entries.size()));
-    }
-
-    std::string error;
-    if (!result.validate(n_kv, &error)) {
-        throw std::runtime_error("invalid RERoT attention layout: " + error);
-    }
-    return result;
-}
-
-llama_kv_cache::rerot_resolved_view llama_kv_cache::rerot_resolve_view(
-        const llama_rerot_reader_view & view) const {
-    rerot_resolved_view result;
-    result.episode_id = view.episode_id;
-    result.reader = view.reader;
-
-    for (const auto & logical_run : view.runs) {
-        std::vector<rerot_resolved_cell> run_cells;
-
-        for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
-            const auto & cells = v_cells[stream];
-            for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-                if (cells.is_empty(cell)) {
-                    continue;
-                }
-
-                const auto & meta = cells.rerot_get(cell);
-                if (meta.episode_id != view.episode_id || meta.run_id != logical_run.run_id ||
-                    meta.node_id != logical_run.owner) {
-                    continue;
-                }
-
-                run_cells.push_back({
-                    stream,
-                    cell,
-                    cells.pos_get(cell),
-                    0,
-                    meta,
-                });
-            }
-        }
-
-        std::stable_sort(run_cells.begin(), run_cells.end(), [](const auto & lhs, const auto & rhs) {
-            if (lhs.storage_pos != rhs.storage_pos) {
-                return lhs.storage_pos < rhs.storage_pos;
-            }
-            if (lhs.meta.frontier != rhs.meta.frontier) {
-                return lhs.meta.frontier < rhs.meta.frontier;
-            }
-            if (lhs.stream != rhs.stream) {
-                return lhs.stream < rhs.stream;
-            }
-            return lhs.cell < rhs.cell;
-        });
-
-        for (auto & resolved : run_cells) {
-            resolved.virtual_pos = result.query_virtual_pos++;
-            result.cells.push_back(std::move(resolved));
-        }
-    }
-
-    return result;
-}
-
-// FlashPrefill legal-fragment planning (CacheFragments)
-//
-
-static bool fp_stamp_usable(const llama_flashprefill_cell_stamp & s) {
-    return s.stamp != 0 && s.stamp != std::numeric_limits<uint64_t>::max() &&
-           s.generation != std::numeric_limits<uint64_t>::max();
-}
-
-void llama_kv_cache::flashprefill_enable_tracking() const {
-    // One-time lazy opt-in on the flash path only (OFF never reaches here).
-    // Idempotent; the enable itself bumps each stream once, and every build
-    // captures stamps afterwards, so no pre-enable state can validate.
-    fp_active = true;
-    for (auto & cells : v_cells) {
-        const_cast<llama_kv_cells &>(cells).set_generation_enabled(true);
-    }
-}
-
-// Text-pattern partial IMRoPE (Qwen35/Ornith text): n_pos>=3 rows whose extra
-// coords replicate the sequence position ([p,p,p] + zero fourth) are exactly
-// 1D-equivalent for legality. Only genuinely non-text rows gate out.
-static bool fp_row_is_text_pattern(const llama_ubatch & ubatch, uint32_t q) {
-    if (ubatch.n_pos < 3) {
-        return true;
-    }
-    if (ubatch.n_pos > 4) {
-        return false;
-    }
-    const uint32_t n = ubatch.n_tokens;
-    const llama_pos p = ubatch.pos[q];
-    if (ubatch.pos[q + n] != p || ubatch.pos[q + 2 * n] != p) {
-        return false;
-    }
-    if (ubatch.n_pos >= 4 && ubatch.pos[q + 3 * n] != 0) {
-        return false;
-    }
-    return true;
-}
-
-// A member cell that can never flip a p0==p1 tiebreak against a text-pattern
-// row: the mask skips iff ext.y>P || (==P && ext.x>P), which is exactly the
-// complement below. 1D-written cells carry ext {0,0} and always qualify.
-static bool fp_cell_text_compatible(const llama_kv_cells & cells, uint32_t idx, llama_pos pos) {
-    const llama_kv_cell_ext & ext = cells.ext_get(idx);
-    return ext.y < pos || (ext.y == pos && ext.x <= pos);
-}
-
-bool llama_kv_cache::flashprefill_tracking_enabled() const {
-    for (const auto & cells : v_cells) {
-        if (!cells.get_generation_enabled()) {
-            return false;
-        }
-    }
-    return true;
-}
-
-void llama_kv_cache::flashprefill_cell_stamps(std::vector<llama_flashprefill_cell_stamp> & out) const {
-    out.clear();
-    out.reserve(v_cells.size());
-    for (const auto & cells : v_cells) {
-        out.push_back({ cells.get_generation_stamp(), cells.get_generation() });
-    }
-}
-
-uint32_t llama_kv_cache::flashprefill_n_streams() const {
-    return (uint32_t) v_cells.size();
+ggml_type llama_kv_cache_context::layer_type_v(int32_t il) const {
+    return kv->layer_type_v(il);
 }
 
 bool llama_flashprefill_layout::validate(uint32_t scan_width, std::string * error) const {
@@ -5038,1008 +4205,644 @@ bool llama_flashprefill_layout::validate(uint32_t scan_width, std::string * erro
     return true;
 }
 
-// Coverage of one fragment's logical span for one query row: 0 = no legal
-// member, 1 = partial (a strict non-empty subset), 2 = full. Edge tests only,
-// O(1): masking is monotone over the causal prefix for every supported SWA
-// shape, and member order is position-ascending, so span endpoints decide.
-static int fp_ord_coverage(
-        bool causal, uint32_t n_swa, llama_swa_type swa_type,
-        llama_pos mn, llama_pos mx, llama_pos qpos) {
-    if (causal && mn > qpos) {
-        return 0;
+
+bool llama_kv_cache_context::flashprefill_build_current_layout(
+        int32_t /*role*/,
+        const llama_flashprefill_layout_params & /*params*/,
+        std::string * error) const {
+    // XKV branch never enables FlashPrefill; fail closed explicitly so the
+    // ordinary stock path (not a FlashPrefill sparse path) handles attention.
+    if (error) {
+        *error = "flashprefill layout: not supported in this build (fail closed)";
     }
-    const bool causal_full = !causal || mx <= qpos;
-    bool swa_none = false;
-    bool swa_full = true;
-    if (swa_type != LLAMA_SWA_TYPE_NONE && n_swa != 0) {
-        // monotone: masked(min) => all masked; !masked(max) => none masked.
-        swa_none = llama_hparams::is_masked_swa(n_swa, swa_type, mn, qpos);
-        swa_full = !llama_hparams::is_masked_swa(n_swa, swa_type, mx, qpos);
-    }
-    if (swa_none) {
-        return 0;
-    }
-    if (causal_full && swa_full) {
-        return 2;
-    }
-    return 1;
+    return false;
 }
 
-struct fp_ord_member {
-    uint32_t idx = 0;
-    llama_pos pos = 0;
-};
-
-struct fp_ord_frag_work {
-    std::bitset<LLAMA_MAX_SEQ> sig;
-    std::vector<fp_ord_member> members; // sorted by (pos, idx) before emission
-    llama_pos mn = 0;
-    llama_pos mx = -1;
-};
-
-// Ordinary-path fragment planning over resident owned cells. Partition key is
-// (stream, logical BN block, exact membership signature); members are emitted
-// in (pos, idx) order so every query's legal set is one contiguous interval.
-llama_flashprefill_build_status llama_flashprefill_build_ordinary_plan(
-        const llama_kv_cells_vec & v_cells,
-        const std::vector<uint32_t> & seq_to_stream,
-        uint32_t n_swa,
-        llama_swa_type swa_type,
-        bool causal,
-        bool require_text_cells,
-        const llama_ubatch & ubatch,
-        const llama_flashprefill_layout_params & params,
-        llama_flashprefill_layout & L,
-        std::string * error) {
-    const auto hard_error = [&](const std::string & msg) -> llama_flashprefill_build_status {
-        if (error) { *error = msg; }
-        return llama_flashprefill_build_status::HARD_ERROR;
-    };
-
-    const uint32_t n_streams = (uint32_t) v_cells.size();
-    if (n_streams == 0) {
-        return hard_error("flashprefill layout: no KV streams");
-    }
-
-    // Queried primary sequences per stream: the ONLY seqs that can appear in
-    // any query row (ubatch seq_id[q][0], matching the KQ-mask and qr.seq_id
-    // convention). Membership signatures draw exclusively from these, so
-    // foreign idle/private KV never splits fragments, never trips
-    // text-compat, and never shifts counts or admission. Unique + validated;
-    // unrelated seq refs on a cell are ignored for partitioning.
-    std::vector<std::vector<llama_seq_id>> queried(n_streams);
-    for (uint32_t q = 0; q < ubatch.n_tokens; ++q) {
-        if (ubatch.n_seq_id[q] < 1 || ubatch.seq_id[q] == nullptr) {
-            return hard_error("flashprefill layout: query row without sequence");
-        }
-        const llama_seq_id seq = ubatch.seq_id[q][0];
-        if (seq < 0 || (size_t) seq >= seq_to_stream.size() || (size_t) seq >= LLAMA_MAX_SEQ) {
-            return hard_error("flashprefill layout: query sequence out of range");
-        }
-        const uint32_t stream = seq_to_stream[seq];
-        if (stream >= n_streams) {
-            return hard_error("flashprefill layout: query stream out of range");
-        }
-        auto & vec = queried[stream];
-        if (std::find(vec.begin(), vec.end(), seq) == vec.end()) {
-            vec.push_back(seq);
-        }
-    }
-
-    // Partition. Outer vector per stream; inner map BN block -> frags by sig.
-    std::vector<std::map<uint32_t, std::vector<fp_ord_frag_work>>> table(n_streams);
-    for (uint32_t s = 0; s < n_streams; ++s) {
-        const auto & cells = v_cells[s];
-        for (uint32_t idx = 0; idx < cells.size(); ++idx) {
-            if (cells.is_empty(idx)) {
-                continue;
-            }
-            const llama_pos pos = cells.pos_get(idx);
-            if (pos < 0) {
-                return hard_error("flashprefill layout: resident cell with negative position");
-            }
-            std::bitset<LLAMA_MAX_SEQ> sig;
-            for (const llama_seq_id seq : queried[s]) {
-                if (cells.seq_has(idx, seq)) {
-                    sig.set((size_t) seq);
-                }
-            }
-            if (sig.none()) {
-                continue; // referenced by no queried sequence: invisible to
-                          // every row; skipped BEFORE any text/layout check so
-                          // foreign content can neither gate nor split
-            }
-            if (require_text_cells && !fp_cell_text_compatible(cells, idx, pos)) {
-                // Image-pattern resident content: the stock KQ mask applies a
-                // 2-D tiebreak this 1D-equivalent legality cannot reproduce.
-                if (error) { *error = "flashprefill layout: image-pattern cell keeps the stock path"; }
-                return llama_flashprefill_build_status::INELIGIBLE;
-            }
-            const uint32_t block = uint32_t(pos) / params.block_k;
-            auto & bucket = table[s][block];
-            fp_ord_frag_work * work = nullptr;
-            for (auto & cand : bucket) {
-                if (cand.sig == sig) {
-                    work = &cand;
-                    break;
-                }
-            }
-            if (!work) {
-                bucket.push_back(fp_ord_frag_work{});
-                work = &bucket.back();
-                work->sig = sig;
-                work->mn = pos;
-                work->mx = pos;
-            }
-            work->members.push_back({ idx, pos });
-            if (pos < work->mn) { work->mn = pos; }
-            if (pos > work->mx) { work->mx = pos; }
-        }
-    }
-
-    // Emit fragments stream-major. Members sorted by (pos, idx); contiguous
-    // range form only when idx-consecutive in that order (positions then
-    // ascend by construction).
-    std::vector<uint32_t> stream_begin(n_streams + 1, 0);
-    for (uint32_t s = 0; s < n_streams; ++s) {
-        stream_begin[s] = (uint32_t) L.fragments.size();
-        for (auto & block_it : table[s]) {
-            for (auto & work : block_it.second) {
-                auto & members = work.members;
-                std::sort(members.begin(), members.end(), [](const fp_ord_member & a, const fp_ord_member & b) {
-                    if (a.pos != b.pos) { return a.pos < b.pos; }
-                    return a.idx < b.idx;
-                });
-                if (work.mx == std::numeric_limits<llama_pos>::max()) {
-                    return hard_error("flashprefill layout: logical position at INT32_MAX");
-                }
-                llama_flashprefill_fragment frag;
-                frag.domain = llama_flashprefill_fragment_domain::ORDINARY;
-                frag.stream = s;
-                frag.boundary_partial = false;
-                frag.token_count = (uint32_t) members.size();
-                frag.logical_block = block_it.first;
-                frag.logical_begin = work.mn;
-                frag.logical_end = work.mx + 1;
-                frag.members = work.sig;
-                frag.gated = true;
-                bool contiguous = true;
-                for (size_t k = 1; k < members.size(); ++k) {
-                    if (members[k].idx != members[k - 1].idx + 1) {
-                        contiguous = false;
-                        break;
-                    }
-                }
-                if (contiguous) {
-                    frag.contiguous = true;
-                    frag.cell_begin = members.front().idx;
-                    frag.cell_ref_offset = UINT32_MAX;
-                } else {
-                    frag.contiguous = false;
-                    frag.cell_begin = 0;
-                    frag.cell_ref_offset = (uint32_t) L.cell_refs.size();
-                    for (const auto & m : members) {
-                        L.cell_refs.push_back(m.idx);
-                    }
-                }
-                L.fragments.push_back(frag);
-            }
-        }
-    }
-    stream_begin[n_streams] = (uint32_t) L.fragments.size();
-
-    // Queries.
-    for (uint32_t q = 0; q < ubatch.n_tokens; ++q) {
-        if (ubatch.n_seq_id[q] < 1 || ubatch.seq_id[q] == nullptr) {
-            return hard_error("flashprefill layout: query row without sequence");
-        }
-        const llama_seq_id seq = ubatch.seq_id[q][0];
-        if (seq < 0 || (size_t) seq >= seq_to_stream.size()) {
-            return hard_error("flashprefill layout: query sequence out of range");
-        }
-        const uint32_t stream = seq_to_stream[seq];
-        if (stream >= n_streams) {
-            return hard_error("flashprefill layout: query stream out of range");
-        }
-        const llama_pos qpos = ubatch.pos[q];
-        if (qpos < 0) {
-            return hard_error("flashprefill layout: query with negative position");
-        }
-        llama_flashprefill_query qr;
-        qr.query_index = q;
-        qr.seq_id = seq;
-        qr.stream = stream;
-        qr.query_pos = qpos;
-        qr.query_virtual_pos = -1;
-        L.queries.push_back(qr);
-    }
-
-    // Per-query emission: one group + uses over the query's stream range.
-    L.group_offsets.push_back(0);
-    L.use_offsets.push_back(0);
-    if (params.want_exact_rows) {
-        L.exact_offsets.push_back(0);
-    }
-    uint64_t exact_total = 0;
-    for (uint32_t q = 0; q < (uint32_t) L.queries.size(); ++q) {
-        const auto & qr = L.queries[q];
-        llama_rerot_attn_group group;
-        group.query_index = q;
-        group.effective_pos = qr.query_pos;
-        L.groups.push_back(group);
-        const uint32_t gid = (uint32_t) L.groups.size() - 1;
-        L.group_offsets.push_back((uint32_t) L.groups.size());
-
-        for (uint32_t f = stream_begin[qr.stream]; f < stream_begin[qr.stream + 1]; ++f) {
-            auto & frag = L.fragments[f];
-            if (!frag.members.test((size_t) qr.seq_id)) {
-                continue;
-            }
-            const int cov = fp_ord_coverage(
-                causal, n_swa, swa_type, frag.logical_begin, frag.logical_end - 1, qr.query_pos);
-            if (cov == 0) {
-                continue;
-            }
-            uint32_t sub_off = 0;
-            uint32_t sub_count = frag.token_count;
-            uint32_t flags = 0;
-            if (cov == 1) {
-                // Interval scan over member order (position-ascending): the
-                // legal set must be one contiguous interval; anything else is
-                // an ordering bug and fails closed.
-                const auto & cells = v_cells[qr.stream];
-                uint32_t first = frag.token_count;
-                uint32_t last = frag.token_count;
-                bool seen_illegal = false;
-                for (uint32_t k = 0; k < frag.token_count; ++k) {
-                    const uint32_t idx = frag.contiguous ? frag.cell_begin + k
-                                                         : L.cell_refs[frag.cell_ref_offset + k];
-                    const llama_pos p = cells.pos_get(idx);
-                    const bool legal = (!causal || p <= qr.query_pos) &&
-                        (swa_type == LLAMA_SWA_TYPE_NONE || n_swa == 0 ||
-                         !llama_hparams::is_masked_swa(n_swa, swa_type, p, qr.query_pos));
-                    if (legal) {
-                        if (seen_illegal) {
-                            return hard_error("flashprefill layout: non-interval legal subset");
-                        }
-                        if (first == frag.token_count) {
-                            first = k;
-                        }
-                        last = k;
-                    } else {
-                        seen_illegal = first != frag.token_count;
-                    }
-                }
-                if (first == frag.token_count) {
-                    return hard_error("flashprefill layout: partial fragment with empty subset");
-                }
-                sub_off = first;
-                sub_count = last - first + 1;
-                flags = llama_flashprefill_use::FLAG_MANDATORY;
-                frag.boundary_partial = true;
-            }
-            llama_flashprefill_use use;
-            use.query = q;
-            use.fragment = f;
-            use.group = gid;
-            use.sub_off = sub_off;
-            use.sub_count = sub_count;
-            use.flags = flags;
-            L.uses.push_back(use);
-
-            if (params.want_exact_rows) {
-                if (exact_total + sub_count > params.exact_cap) {
-                    return hard_error("flashprefill layout: exact row capacity exceeded");
-                }
-                const auto & cells = v_cells[qr.stream];
-                for (uint32_t k = 0; k < sub_count; ++k) {
-                    const uint32_t idx = frag.contiguous ? frag.cell_begin + sub_off + k
-                                                         : L.cell_refs[frag.cell_ref_offset + sub_off + k];
-                    (void) cells;
-                    L.exact_rows.push_back(idx);
-                    L.exact_groups.push_back(gid);
-                    L.exact_flags.push_back(flags);
-                }
-                exact_total += sub_count;
-            }
-        }
-        L.use_offsets.push_back((uint32_t) L.uses.size());
-        if (params.want_exact_rows) {
-            L.exact_offsets.push_back((uint32_t) L.exact_rows.size());
-        }
-    }
-    return llama_flashprefill_build_status::OK;
+const llama_flashprefill_layout & llama_kv_cache_context::flashprefill_get_layout() const {
+    return fp_layout;
 }
 
-struct fp_rerot_view_key {
-    uint64_t episode = 0;
-    llama_rerot_node_id reader = LLAMA_REROT_NODE_INVALID;
-    llama_rerot_run_id query_run = LLAMA_REROT_RUN_INVALID;
-    uint64_t frontier = 0;
-    uint64_t topology_epoch = 0;
-    uint64_t publish_epoch = 0;
-    uint64_t layout_epoch = 0;
-    llama_rerot_frontier_mode frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
-    std::vector<llama_rerot_run_id> ordered_runs;
+bool llama_kv_cache_context::flashprefill_layout_is_fresh() const {
+    return false;
+}
 
-    bool operator==(const fp_rerot_view_key & o) const {
-        return episode == o.episode && reader == o.reader && query_run == o.query_run &&
-               frontier == o.frontier && topology_epoch == o.topology_epoch &&
-               publish_epoch == o.publish_epoch && layout_epoch == o.layout_epoch &&
-               frontier_mode == o.frontier_mode && ordered_runs == o.ordered_runs;
+const llama_flashprefill_build_key & llama_kv_cache_context::flashprefill_layout_key() const {
+    return fp_key;
+}
+
+std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
+    std::vector<uint32_t> res;
+    res.reserve(layers.size());
+
+    for (const auto & layer : layers) {
+        res.push_back(layer.il);
     }
-};
 
-struct fp_tagged_member {
-    uint32_t idx = 0;
-    llama_pos storage = 0;
-    uint64_t frontier = 0;
-    llama_rerot_visibility vis = llama_rerot_visibility::normal;
-    bool gated = true;
-    std::bitset<LLAMA_MAX_SEQ> sig;
-};
+    return res;
+}
 
-struct fp_base_member {
-    uint32_t idx = 0;
-    llama_pos storage = 0;
-    std::bitset<LLAMA_MAX_SEQ> sig;
-};
+ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
 
-// RERoT-path fragment planning. One reusable run/span table per distinct
-// reader view (O(K) each); per-query work then touches fragments only
-// (O(Q*F)). Visibility mirrors llama_rerot_build_query_layout exactly: FULL
-// members (position-independent public) are legal for every sharing query,
-// gated members (base, private/pending, own-node frontier-equal public) keep
-// per-query ownership+causal checks. The old per-query full-KV expansion is
-// never built on this path.
-llama_flashprefill_build_status llama_flashprefill_build_rerot_plan(
-        const llama_kv_cells & cells,
-        const std::vector<llama_rerot_reader_state> & views,
+    return layers[ikv].k;
+}
+
+ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    return layers[ikv].v;
+}
+
+int32_t llama_kv_cache::get_attn_rot_k_nrot() const {
+    if (!attn_rot_k) {
+        return 0;
+    }
+    const char * LLAMA_ATTN_ROT_K_NROT = getenv("LLAMA_ATTN_ROT_K_NROT");
+    int nrot = LLAMA_ATTN_ROT_K_NROT ? atoi(LLAMA_ATTN_ROT_K_NROT) : 64;
+    if (nrot == 0) {
+        nrot = 64;
+        do {
+            nrot *= 2;
+        } while (n_embd_head_k_all > 0 && n_embd_head_k_all % nrot == 0);
+        nrot /= 2;
+    }
+    return nrot;
+}
+
+int32_t llama_kv_cache::get_attn_rot_v_nrot() const {
+    if (!attn_rot_v) {
+        return 0;
+    }
+    return 64;
+}
+
+std::vector<ggml_context *> llama_kv_cache::get_buffer_contexts() const {
+    std::vector<ggml_context *> res;
+    for (const auto & [ctx, _] : ctxs_bufs) {
+        res.push_back(ctx.get());
+    }
+    return res;
+}
+
+bool llama_kv_cache::validate_seq_id(llama_seq_id seq_id) const {
+    return seq_id >= 0 && (size_t) seq_id < seq_to_stream.size();
+}
+
+uint32_t llama_kv_cache::get_stream_for_seq(llama_seq_id seq_id) const {
+    if (!validate_seq_id(seq_id)) {
+        return 0;
+    }
+    return seq_to_stream[seq_id];
+}
+
+bool llama_kv_cache::can_capture_prerope_range(
+        llama_seq_id seq_id,
+        uint32_t cell_start,
+        uint32_t cell_count,
+        std::string * reason) const {
+    if (cell_count == 0) {
+        if (reason) *reason = "cell_count is zero";
+        return false;
+    }
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        if (reason) *reason = "invalid seq_id";
+        return false;
+    }
+    if (cell_start > UINT32_MAX - cell_count) {
+        if (reason) *reason = "cell range arithmetic overflow";
+        return false;
+    }
+
+    const auto & stream_cells = v_cells[seq_to_stream[seq_id]];
+    if (cell_start + cell_count > stream_cells.size()) {
+        if (reason) *reason = "cell range exceeds cache capacity";
+        return false;
+    }
+
+    // Strict sealing conditions (§5.2):
+    // Must be committed, occupied, seq_has(seq_id), and NOT PRIVATE / PENDING.
+    for (uint32_t i = 0; i < cell_count; ++i) {
+        uint32_t cell_idx = cell_start + i;
+        if (stream_cells.is_empty(cell_idx)) {
+            if (reason) *reason = "cell range contains empty cell at index " + std::to_string(cell_idx);
+            return false;
+        }
+        if (!stream_cells.seq_has(cell_idx, seq_id)) {
+            if (reason) *reason = "cell does not belong to sequence at index " + std::to_string(cell_idx);
+            return false;
+        }
+        // Consult XKV store hot_committed state to reject ordinary tentative tokens
+        if (xkv_store) {
+            const uint64_t pid = stream_cells.payload_id_get(cell_idx);
+            llama_xkv::xkv_location loc;
+            if (!xkv_store->find_location(pid, loc) || loc.state != llama_xkv::xkv_state::hot_committed) {
+                if (reason) *reason = "cell payload " + std::to_string(pid) + " is not in hot_committed state";
+                return false;
+            }
+        }
+        const auto & meta = stream_cells.rerot_get(cell_idx);
+        if (meta.active()) {
+            if (meta.visibility == llama_rerot_visibility::pending_record) {
+                if (reason) *reason = "cell in range has uncommitted PENDING record status at index " + std::to_string(cell_idx);
+                return false;
+            }
+            if (meta.visibility == llama_rerot_visibility::private_control) {
+                if (reason) *reason = "cell in range is private_control at index " + std::to_string(cell_idx);
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    return v_cells[seq_to_stream[seq_id]];
+}
+
+bool llama_kv_cache::rerot_set_write_tag(
+        llama_seq_id seq_id,
+        const llama_kv_rerot_meta & tag) {
+    if (seq_id < 0 || (size_t) seq_id >= rerot_write_tags.size()) {
+        return false;
+    }
+
+    if (tag.active()) {
+        if (tag.node_id == LLAMA_REROT_NODE_INVALID || tag.run_id == LLAMA_REROT_RUN_INVALID ||
+            tag.visibility == llama_rerot_visibility::normal ||
+            (tag.visibility == llama_rerot_visibility::pending_record && tag.publish_epoch != 0)) {
+            return false;
+        }
+        rerot_write_tags[seq_id] = tag;
+    } else {
+        rerot_write_tags[seq_id].reset();
+    }
+
+    return true;
+}
+
+void llama_kv_cache::rerot_clear_write_tag(llama_seq_id seq_id) {
+    if (seq_id >= 0 && (size_t) seq_id < rerot_write_tags.size()) {
+        rerot_write_tags[seq_id].reset();
+    }
+}
+
+size_t llama_kv_cache::rerot_publish_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        uint64_t publish_epoch) {
+    size_t count = 0;
+    if (publish_epoch == 0 || !rerot_can_publish_run(episode_id, run_id, &count)) {
+        return 0;
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> matches;
+    GGML_ASSERT(rerot_find_run_cells(episode_id, run_id, &matches) == count);
+
+    for (const auto & match : matches) {
+        const bool published = v_cells[match.first].rerot_publish(
+            match.second, episode_id, run_id, publish_epoch);
+        GGML_ASSERT(published);
+    }
+
+    return matches.size();
+}
+
+size_t llama_kv_cache::rerot_reclassify_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_rerot_visibility expected,
+        llama_rerot_visibility replacement,
+        uint64_t publish_epoch) {
+    size_t count = 0;
+    if (!rerot_can_reclassify_run(
+            episode_id, run_id, expected, replacement, publish_epoch, &count)) {
+        return 0;
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> matches;
+    GGML_ASSERT(rerot_find_run_cells(episode_id, run_id, &matches) == count);
+
+    for (const auto & match : matches) {
+        const bool changed = v_cells[match.first].rerot_reclassify(
+            match.second, episode_id, run_id, expected, replacement, publish_epoch);
+        GGML_ASSERT(changed);
+    }
+    return matches.size();
+}
+
+bool llama_kv_cache::rerot_can_add_run_ref(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_seq_id seq_id,
+        size_t * count) const {
+    if (count) {
+        *count = 0;
+    }
+    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID ||
+        seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+
+    const uint32_t dst_stream = seq_to_stream[seq_id];
+    size_t matches = 0;
+    for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
+        const auto & cells = v_cells[stream];
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (cells.is_empty(cell)) {
+                continue;
+            }
+            const auto & meta = cells.rerot_get(cell);
+            if (meta.episode_id != episode_id || meta.run_id != run_id) {
+                continue;
+            }
+            // A logical run cannot be copied between independent KV streams,
+            // and only an atomically published run is eligible for a keeper.
+            if (stream != dst_stream || meta.visibility != llama_rerot_visibility::public_live ||
+                meta.publish_epoch == 0) {
+                return false;
+            }
+            ++matches;
+        }
+    }
+
+    if (count) {
+        *count = matches;
+    }
+    return matches > 0;
+}
+
+size_t llama_kv_cache::rerot_add_run_ref(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_seq_id seq_id) {
+    size_t count = 0;
+    if (!rerot_can_add_run_ref(episode_id, run_id, seq_id, &count)) {
+        return 0;
+    }
+
+    auto & cells = v_cells[seq_to_stream[seq_id]];
+    size_t seen = 0;
+    for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+        if (cells.is_empty(cell)) {
+            continue;
+        }
+        const auto & meta = cells.rerot_get(cell);
+        if (meta.episode_id != episode_id || meta.run_id != run_id) {
+            continue;
+        }
+        if (!cells.seq_has(cell, seq_id)) {
+            cells.seq_add(cell, seq_id);
+        }
+        ++seen;
+    }
+
+    GGML_ASSERT(seen == count);
+    return seen;
+}
+
+size_t llama_kv_cache::rerot_find_run_cells(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        std::vector<std::pair<uint32_t, uint32_t>> * out) const {
+    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID) {
+        return 0;
+    }
+
+    size_t count = 0;
+    for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
+        std::vector<uint32_t> idxs;
+        count += v_cells[stream].rerot_collect_run(episode_id, run_id, idxs);
+        if (out != nullptr) {
+            for (const uint32_t cell : idxs) {
+                out->emplace_back(stream, cell);
+            }
+        }
+    }
+    return count;
+}
+
+bool llama_kv_cache::rerot_can_freeze_to_archive(
+        uint64_t episode_id,
+        llama_seq_id exec_seq,
+        llama_seq_id archive_seq,
+        size_t * count) const {
+    if (count != nullptr) {
+        *count = 0;
+    }
+    if (episode_id == 0 || exec_seq < 0 || archive_seq < 0 || exec_seq == archive_seq ||
+        (size_t) exec_seq >= seq_to_stream.size() || (size_t) archive_seq >= seq_to_stream.size()) {
+        return false;
+    }
+    if (other != nullptr || seq_to_stream[exec_seq] != seq_to_stream[archive_seq]) {
+        return false;
+    }
+
+    size_t kept = 0;
+    const auto & cells = v_cells[seq_to_stream[exec_seq]];
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i) || !cells.seq_has(i, exec_seq)) {
+            continue;
+        }
+        const auto & meta = cells.rerot_get(i);
+        if (meta.active() && meta.episode_id == episode_id &&
+            meta.visibility == llama_rerot_visibility::public_live && meta.publish_epoch != 0) {
+            ++kept;
+        }
+    }
+
+    if (count != nullptr) {
+        *count = kept;
+    }
+    return true;
+}
+
+size_t llama_kv_cache::rerot_freeze_to_archive(
+        uint64_t episode_id,
+        llama_seq_id exec_seq,
+        llama_seq_id archive_seq) {
+    size_t count = 0;
+    if (!rerot_can_freeze_to_archive(episode_id, exec_seq, archive_seq, &count)) {
+        return 0;
+    }
+
+    auto & cells = v_cells[seq_to_stream[exec_seq]];
+    const size_t kept = cells.rerot_freeze_to_archive(episode_id, exec_seq, archive_seq);
+
+    GGML_ASSERT(kept == count);
+    return kept;
+}
+
+bool llama_kv_cache::rerot_blocks_state_save(llama_seq_id seq_id) const {
+    if (seq_id == -1) {
+        for (const auto & tag : rerot_write_tags) {
+            if (tag.active()) {
+                return true;
+            }
+        }
+        for (const auto & view : rerot_reader_views) {
+            if (view.active()) {
+                return true;
+            }
+        }
+        for (const auto & cells : v_cells) {
+            if (cells.rerot_has_active()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+    if ((size_t) seq_id < rerot_write_tags.size() && rerot_write_tags[seq_id].active()) {
+        return true;
+    }
+    if ((size_t) seq_id < rerot_reader_views.size() && rerot_reader_views[seq_id].active()) {
+        return true;
+    }
+    return v_cells[seq_to_stream[seq_id]].rerot_has_active_seq(seq_id);
+}
+
+bool llama_kv_cache::rerot_can_reclassify_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_rerot_visibility expected,
+        llama_rerot_visibility replacement,
+        uint64_t publish_epoch,
+        size_t * count) const {
+    if (count) {
+        *count = 0;
+    }
+    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID ||
+        expected == llama_rerot_visibility::normal || replacement == llama_rerot_visibility::normal ||
+        (replacement == llama_rerot_visibility::public_live && publish_epoch == 0) ||
+        (replacement != llama_rerot_visibility::public_live && publish_epoch != 0)) {
+        return false;
+    }
+
+    size_t matches = 0;
+    for (const auto & cells : v_cells) {
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (cells.is_empty(cell)) {
+                continue;
+            }
+            const auto & meta = cells.rerot_get(cell);
+            if (meta.episode_id != episode_id || meta.run_id != run_id) {
+                continue;
+            }
+            if (meta.visibility != expected) {
+                return false;
+            }
+            ++matches;
+        }
+    }
+
+    if (count) {
+        *count = matches;
+    }
+    return matches > 0;
+}
+
+bool llama_kv_cache::rerot_can_publish_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        size_t * count) const {
+    if (count) {
+        *count = 0;
+    }
+    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID) {
+        return false;
+    }
+
+    size_t matches = 0;
+    for (const auto & cells : v_cells) {
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (cells.is_empty(cell)) {
+                continue;
+            }
+            const auto & meta = cells.rerot_get(cell);
+            if (meta.episode_id != episode_id || meta.run_id != run_id) {
+                continue;
+            }
+            if (meta.visibility != llama_rerot_visibility::pending_record) {
+                return false;
+            }
+            ++matches;
+        }
+    }
+
+    if (count) {
+        *count = matches;
+    }
+    return matches > 0;
+}
+
+bool llama_kv_cache::rerot_set_reader_view(
+        llama_seq_id seq_id,
+        const llama_rerot_reader_state & view) {
+    if (seq_id < 0 || (size_t) seq_id >= rerot_reader_views.size() || !view.active() ||
+        view.reader == LLAMA_REROT_NODE_INVALID || view.query_run == LLAMA_REROT_RUN_INVALID ||
+        view.ordered_runs.empty()) {
+        return false;
+    }
+
+    std::unordered_set<llama_rerot_run_id> seen;
+    seen.reserve(view.ordered_runs.size());
+    bool query_run_seen = false;
+    for (const auto run_id : view.ordered_runs) {
+        if (run_id == LLAMA_REROT_RUN_INVALID || !seen.insert(run_id).second) {
+            return false;
+        }
+        query_run_seen |= run_id == view.query_run;
+    }
+    if (!query_run_seen) {
+        return false;
+    }
+
+    rerot_reader_views[seq_id] = view;
+    return true;
+}
+
+void llama_kv_cache::rerot_clear_reader_view(llama_seq_id seq_id) {
+    if (seq_id >= 0 && (size_t) seq_id < rerot_reader_views.size()) {
+        rerot_reader_views[seq_id].reset();
+    }
+}
+
+bool llama_kv_cache::rerot_batch_active(const llama_ubatch & ubatch) const {
+    bool any = false;
+    bool all = true;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (!ubatch.seq_id || !ubatch.seq_id[i] || ubatch.n_seq_id[i] < 1) {
+            all = false;
+            continue;
+        }
+        const llama_seq_id seq_id = ubatch.seq_id[i][0];
+        const bool active = seq_id >= 0 && (size_t) seq_id < rerot_reader_views.size() &&
+                            rerot_reader_views[seq_id].active();
+        any |= active;
+        all &= active;
+    }
+    if (any && !all) {
+        throw std::runtime_error("RERoT and ordinary query rows cannot share one ubatch");
+    }
+    return any;
+}
+
+llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
         const llama_ubatch & ubatch,
-        const llama_flashprefill_layout_params & params,
-        llama_flashprefill_layout & L,
-        std::string * error) {
-    const auto hard_error = [&](const std::string & msg) -> llama_flashprefill_build_status {
-        if (error) { *error = msg; }
-        return llama_flashprefill_build_status::HARD_ERROR;
-    };
-
-    // Live sequences for ownership signatures (unified stream).
-    std::vector<llama_seq_id> live;
-    for (llama_seq_id seq = 0; seq < LLAMA_MAX_SEQ; ++seq) {
-        if (cells.seq_get_used(seq) > 0) {
-            live.push_back(seq);
-        }
+        uint32_t n_kv) const {
+    llama_rerot_attn_layout result;
+    if (!rerot_batch_active(ubatch)) {
+        return result;
     }
-    const auto member_sig = [&](uint32_t idx) {
-        std::bitset<LLAMA_MAX_SEQ> sig;
-        for (const llama_seq_id seq : live) {
-            if (cells.seq_has(idx, seq)) {
-                sig.set((size_t) seq);
-            }
-        }
-        return sig;
-    };
-
-    struct view_group {
-        fp_rerot_view_key key;
-        const llama_rerot_reader_state * view = nullptr;
-        std::vector<uint32_t> rows; // ubatch rows, in order
-    };
-    std::vector<view_group> vgroups;
-    for (uint32_t q = 0; q < ubatch.n_tokens; ++q) {
-        if (ubatch.n_seq_id[q] < 1 || ubatch.seq_id[q] == nullptr) {
-            return hard_error("flashprefill layout: query row without sequence");
-        }
-        const llama_seq_id seq = ubatch.seq_id[q][0];
-        if (seq < 0 || (size_t) seq >= views.size() || !views[seq].active()) {
-            return hard_error("flashprefill layout: query without active reader view");
-        }
-        const auto & view = views[seq];
-        fp_rerot_view_key key;
-        key.episode = view.episode_id;
-        key.reader = view.reader;
-        key.query_run = view.query_run;
-        key.frontier = view.frontier;
-        key.topology_epoch = view.topology_epoch;
-        key.publish_epoch = view.publish_epoch;
-        key.layout_epoch = view.layout_epoch;
-        key.frontier_mode = view.frontier_mode;
-        key.ordered_runs = view.ordered_runs;
-        view_group * group = nullptr;
-        for (auto & cand : vgroups) {
-            if (cand.key == key) {
-                group = &cand;
-                break;
-            }
-        }
-        if (!group) {
-            vgroups.push_back(view_group{});
-            group = &vgroups.back();
-            group->key = std::move(key);
-            group->view = &view;
-        }
-        group->rows.push_back(q);
+    if (n_stream != 1 || v_cells.size() != 1) {
+        throw std::runtime_error("RERoT indexed attention requires unified KV");
     }
 
-    struct frag_range {
-        uint32_t begin = 0;
-        uint32_t end = 0;
-    };
-    std::vector<frag_range> vgroup_frags;
-    vgroup_frags.reserve(vgroups.size());
-    std::vector<std::map<llama_seq_id, std::unordered_map<llama_pos, std::pair<uint32_t, uint32_t>>>> own_by_vgroup;
-    own_by_vgroup.reserve(vgroups.size());
+    const auto & cells = v_cells[0];
+    if (n_kv > cells.size()) {
+        throw std::runtime_error("RERoT attention layout exceeds KV cache size");
+    }
 
-    // Reusable table per distinct view.
-    for (const auto & vg : vgroups) {
-        const auto & view = *vg.view;
-        const uint32_t fbegin = (uint32_t) L.fragments.size();
-        // Physical key -> (fragment, fragment-local index), for own-cell
-        // lookup without rescanning tables per query.
-        std::vector<uint32_t> key_frag(cells.size(), UINT32_MAX);
-        std::vector<uint32_t> key_local(cells.size(), UINT32_MAX);
+    result.n_queries = ubatch.n_tokens;
+    result.query_offsets.reserve(size_t(result.n_queries) + 1);
+    result.query_offsets.push_back(0);
 
-        std::unordered_map<llama_rerot_run_id, uint32_t> rank;
-        rank.reserve(view.ordered_runs.size());
-        for (uint32_t r = 0; r < view.ordered_runs.size(); ++r) {
-            const auto run = view.ordered_runs[r];
-            if (run == LLAMA_REROT_RUN_INVALID || !rank.emplace(run, r).second) {
-                return hard_error("flashprefill layout: reader view with invalid/duplicate run");
-            }
-        }
+    for (uint32_t query = 0; query < ubatch.n_tokens; ++query) {
+        const llama_seq_id seq_id = ubatch.seq_id[query][0];
+        const auto & reader = rerot_reader_views.at(seq_id);
 
-        std::vector<fp_base_member> base;
-        std::vector<std::vector<fp_tagged_member>> runs(view.ordered_runs.size());
-        for (uint32_t idx = 0; idx < cells.size(); ++idx) {
-            if (cells.is_empty(idx)) {
+        std::vector<llama_rerot_key_record> keys;
+        keys.reserve(n_kv);
+        for (uint32_t key = 0; key < n_kv; ++key) {
+            if (cells.is_empty(key)) {
                 continue;
             }
-            const llama_pos storage = cells.pos_get(idx);
-            if (storage < 0) {
-                return hard_error("flashprefill layout: resident cell with negative position");
-            }
-            const auto & meta = cells.rerot_get(idx);
-            if (!meta.active()) {
-                auto sig = member_sig(idx);
-                if (sig.none()) {
-                    continue;
-                }
-                base.push_back({ idx, storage, sig });
-                continue;
-            }
-            if (meta.episode_id != view.episode_id) {
-                continue;
-            }
-            const auto rank_it = rank.find(meta.run_id);
-            if (rank_it == rank.end()) {
-                continue;
-            }
-            const bool full = llama_rerot_cell_visible_public_full(meta, view);
-            bool maybe = false;
-            if (!full) {
-                if (meta.visibility == llama_rerot_visibility::public_live) {
-                    maybe = meta.frontier == view.frontier && meta.node_id == view.reader;
-                } else if (meta.visibility == llama_rerot_visibility::private_control ||
-                           meta.visibility == llama_rerot_visibility::pending_record) {
-                    maybe = meta.node_id == view.reader;
-                }
-            }
-            if (!full && !maybe) {
-                continue;
-            }
-            runs[rank_it->second].push_back({ idx, storage, meta.frontier, meta.visibility, !full, member_sig(idx) });
-        }
-
-        auto by_storage = [](const auto & a, const auto & b) {
-            if (a.storage != b.storage) { return a.storage < b.storage; }
-            return a.idx < b.idx;
-        };
-        std::sort(base.begin(), base.end(), by_storage);
-        for (auto & run : runs) {
-            std::sort(run.begin(), run.end(), [](const fp_tagged_member & a, const fp_tagged_member & b) {
-                if (a.storage != b.storage) { return a.storage < b.storage; }
-                if (a.frontier != b.frontier) { return a.frontier < b.frontier; }
-                return a.idx < b.idx;
+            keys.push_back({
+                key,
+                cells.pos_get(key),
+                cells.seq_has(key, seq_id),
+                cells.rerot_get(key),
             });
         }
 
-        // Dense virtualization: base first, then runs in view order.
-        if (base.size() > uint64_t(std::numeric_limits<llama_pos>::max()) + 1u) {
-            return hard_error("flashprefill layout: base exceeds llama_pos range");
+        auto query_layout = llama_rerot_build_query_layout(reader, ubatch.pos[query], keys);
+        const uint32_t group_base = static_cast<uint32_t>(result.groups.size());
+        for (auto group : query_layout.groups) {
+            group.query_index = query;
+            result.groups.push_back(group);
         }
-        std::vector<llama_pos> run_v0(runs.size(), 0);
-        int64_t cursor = (int64_t) base.size();
-        for (size_t r = 0; r < runs.size(); ++r) {
-            if (cursor > std::numeric_limits<llama_pos>::max()) {
-                return hard_error("flashprefill layout: virtual positions exceed llama_pos range");
-            }
-            run_v0[r] = (llama_pos) cursor;
-            cursor += (int64_t) runs[r].size();
+        for (auto entry : query_layout.entries) {
+            entry.group_index += group_base;
+            result.entries.push_back(entry);
         }
-        if (cursor > int64_t(std::numeric_limits<llama_pos>::max()) + 1) {
-            return hard_error("flashprefill layout: virtual positions exceed llama_pos range");
-        }
-
-        const auto emit_members = [&](llama_flashprefill_fragment & frag, const std::vector<uint32_t> & idxs) {
-            frag.token_count = (uint32_t) idxs.size();
-            bool contiguous = true;
-            for (size_t k = 1; k < idxs.size(); ++k) {
-                if (idxs[k] != idxs[k - 1] + 1) {
-                    contiguous = false;
-                    break;
-                }
-            }
-            if (contiguous) {
-                frag.contiguous = true;
-                frag.cell_begin = idxs.front();
-                frag.cell_ref_offset = UINT32_MAX;
-            } else {
-                frag.contiguous = false;
-                frag.cell_begin = 0;
-                frag.cell_ref_offset = (uint32_t) L.cell_refs.size();
-                for (uint32_t idx : idxs) {
-                    L.cell_refs.push_back(idx);
-                }
-            }
-        };
-
-        // Base fragments: cut on membership-signature, virtual-BN, and phase-bias changes.
-        {
-            size_t start = 0;
-            const auto cut_before = [&](size_t i) {
-                if (base[i].sig != base[i - 1].sig) { return true; }
-                if (uint64_t(i) / params.block_k != uint64_t(i - 1) / params.block_k) { return true; }
-                return (int64_t(base[i].storage) - int64_t(i)) != (int64_t(base[i - 1].storage) - int64_t(i - 1));
-            };
-            const auto emit_base = [&](size_t b, size_t e) {
-                std::vector<uint32_t> idxs;
-                idxs.reserve(e - b);
-                for (size_t k = b; k < e; ++k) { idxs.push_back(base[k].idx); }
-                llama_flashprefill_fragment frag;
-                frag.domain = llama_flashprefill_fragment_domain::REROT_BASE;
-                frag.stream = 0;
-                frag.boundary_partial = false;
-                frag.logical_block = uint32_t(uint64_t(b) / params.block_k);
-                frag.logical_begin = (llama_pos) b;
-                frag.logical_end = (llama_pos) e;
-                frag.members = base[b].sig;
-                frag.episode_id = view.episode_id;
-                frag.virtual_pos0 = (llama_pos) b;
-                // Table-phase constant P = storage - piece-local index. The
-                // cut keeps (storage - base_index) fixed over base indices,
-                // so P == base[b].storage exactly.
-                frag.phase_bias = int64_t(base[b].storage);
-                frag.gated = true;
-                emit_members(frag, idxs);
-                {
-                    const uint32_t new_frag = (uint32_t) L.fragments.size();
-                    for (size_t k = 0; k < idxs.size(); ++k) {
-                        key_frag[idxs[k]] = new_frag;
-                        key_local[idxs[k]] = (uint32_t) k;
-                    }
-                }
-                L.fragments.push_back(frag);
-            };
-            for (size_t i = 1; i <= base.size(); ++i) {
-                if (i == base.size() || cut_before(i)) {
-                    if (i > start) { emit_base(start, i); }
-                    start = i;
-                }
-            }
-        }
-
-        // Run fragments: reusable split once per run, then membership post-split for gated pieces.
-        for (size_t r = 0; r < runs.size(); ++r) {
-            const auto & run = runs[r];
-            if (run.empty()) {
-                continue;
-            }
-            std::vector<llama_rerot_table_member> tm;
-            tm.reserve(run.size());
-            for (const auto & t : run) {
-                tm.push_back({ t.idx, t.storage, t.frontier, t.vis, t.gated });
-            }
-            std::vector<llama_rerot_table_fragment> splits;
-            try {
-                splits = llama_rerot_split_table_fragments(tm.data(), tm.size(), run_v0[r], params.block_k);
-            } catch (const std::exception & e) {
-                return hard_error(std::string("flashprefill layout: run split failed: ") + e.what());
-            }
-            for (const auto & sp : splits) {
-                size_t pstart = sp.begin;
-                while (pstart < sp.end) {
-                    size_t pend = pstart + 1;
-                    if (sp.gated) {
-                        while (pend < sp.end && run[pend].sig == run[pstart].sig) { ++pend; }
-                    } else {
-                        pend = sp.end;
-                    }
-                    std::vector<uint32_t> idxs;
-                    idxs.reserve(pend - pstart);
-                    for (size_t k = pstart; k < pend; ++k) { idxs.push_back(run[k].idx); }
-                    const llama_pos vp0 = run_v0[r] + (llama_pos) pstart;
-                    llama_flashprefill_fragment frag;
-                    frag.domain = llama_flashprefill_fragment_domain::REROT_RUN;
-                    frag.stream = 0;
-                    frag.boundary_partial = false;
-                    frag.logical_block = uint32_t(uint64_t(vp0) / params.block_k);
-                    frag.logical_begin = vp0;
-                    frag.logical_end = vp0 + (llama_pos) idxs.size();
-                    if (sp.gated) { frag.members = run[pstart].sig; }
-                    frag.episode_id = view.episode_id;
-                    frag.run_id = view.ordered_runs[r];
-                    frag.visibility = sp.visibility;
-                    frag.run_rank = (uint32_t) r;
-                    frag.virtual_pos0 = vp0;
-                    // Table-phase constant P = split bias + run table origin
-                    // + piece start: storage minus piece-local index.
-                    frag.phase_bias = sp.phase_bias + int64_t(run_v0[r]) + int64_t(pstart);
-                    frag.gated = sp.gated;
-                    emit_members(frag, idxs);
-                    {
-                        const uint32_t new_frag = (uint32_t) L.fragments.size();
-                        for (size_t k = 0; k < idxs.size(); ++k) {
-                            key_frag[idxs[k]] = new_frag;
-                            key_local[idxs[k]] = (uint32_t) k;
-                        }
-                    }
-                    L.fragments.push_back(frag);
-                    pstart = pend;
-                }
-            }
-        }
-
-        vgroup_frags.push_back({ fbegin, (uint32_t) L.fragments.size() });
-
-        // Per-(query-seq) data inside this view: ownership is fixed, so the
-        // own-cell last-match locations are built once per seq, not per query.
-        // Map: query storage -> (fragment, fragment-local index), overwrite
-        // wins, replicating the old builder's last-match scan over global
-        // order. Per-query virtuals are derived from these in the emission
-        // pass below, AFTER that query's own filtering — never from fixed
-        // table virtuals.
-        std::map<llama_seq_id, std::vector<uint32_t>> rows_by_seq;
-        for (uint32_t q : vg.rows) {
-            rows_by_seq[ubatch.seq_id[q][0]].push_back(q);
-        }
-        std::map<llama_seq_id, std::unordered_map<llama_pos, std::pair<uint32_t, uint32_t>>> own_by_seq;
-        for (const auto & seq_rows : rows_by_seq) {
-            const llama_seq_id qseq = seq_rows.first;
-            if (qseq < 0 || (size_t) qseq >= views.size()) {
-                return hard_error("flashprefill layout: query sequence out of range");
-            }
-            const auto rank_qr = rank.find(view.query_run);
-            if (rank_qr == rank.end()) {
-                return hard_error("flashprefill layout: query run absent from reader view");
-            }
-            std::unordered_map<llama_pos, std::pair<uint32_t, uint32_t>> own_match;
-            const auto & qrun = runs[rank_qr->second];
-            for (size_t j = 0; j < qrun.size(); ++j) {
-                const uint32_t idx = qrun[j].idx;
-                const auto & meta = cells.rerot_get(idx);
-                if (meta.node_id == view.reader && cells.seq_has(idx, qseq)) {
-                    own_match[qrun[j].storage] = { key_frag[idx], key_local[idx] };
-                }
-            }
-            own_by_seq[qseq] = std::move(own_match);
-            for (uint32_t q : seq_rows.second) {
-                const llama_pos qpos = ubatch.pos[q];
-                if (qpos < 0) {
-                    return hard_error("flashprefill layout: query with negative position");
-                }
-                llama_flashprefill_query qr;
-                qr.query_index = q;
-                qr.seq_id = qseq;
-                qr.stream = 0;
-                qr.query_pos = qpos;
-                qr.query_virtual_pos = -1; // filled per query in the emission pass
-                L.queries.push_back(qr);
-            }
-        }
-        own_by_vgroup.push_back(std::move(own_by_seq));
+        result.query_offsets.push_back(static_cast<uint32_t>(result.entries.size()));
     }
 
-    // Queries were appended view-major; restore ubatch order for dense
-    // per-query ranges (groups/uses stay query-indexed either way).
-    std::sort(L.queries.begin(), L.queries.end(), [](const llama_flashprefill_query & a, const llama_flashprefill_query & b) {
-        return a.query_index < b.query_index;
-    });
-
-    // Per-query emission over the query's own view range.
-    L.group_offsets.push_back(0);
-    L.use_offsets.push_back(0);
-    if (params.want_exact_rows) {
-        L.exact_offsets.push_back(0);
+    std::string error;
+    if (!result.validate(n_kv, &error)) {
+        throw std::runtime_error("invalid RERoT attention layout: " + error);
     }
-    uint64_t exact_total = 0;
-    // ubatch row -> vgroup index.
-    std::vector<uint32_t> row_vgroup(ubatch.n_tokens, UINT32_MAX);
-    for (uint32_t v = 0; v < vgroups.size(); ++v) {
-        for (uint32_t q : vgroups[v].rows) { row_vgroup[q] = v; }
-    }
-    for (uint32_t qi = 0; qi < (uint32_t) L.queries.size(); ++qi) {
-        auto & qr = L.queries[qi];
-        const uint32_t v = row_vgroup[qr.query_index];
-        std::map<llama_pos, uint32_t> eff2group;
-        const auto group_for = [&](int64_t eff, std::string & msg) -> int64_t {
-            if (eff < 0 || eff > std::numeric_limits<llama_pos>::max()) {
-                msg = "flashprefill layout: effective query position out of range";
-                return -1;
-            }
-            const llama_pos e = (llama_pos) eff;
-            const auto it = eff2group.find(e);
-            if (it != eff2group.end()) { return (int64_t) it->second; }
-            llama_rerot_attn_group group;
-            group.query_index = qi;
-            group.effective_pos = e;
-            L.groups.push_back(group);
-            const uint32_t gid = (uint32_t) L.groups.size() - 1;
-            eff2group[e] = gid;
-            return (int64_t) gid;
-        };
-        // Pass A: legality + legal counts in global fragment order. This is
-        // the per-query filtering the old builder performs BEFORE dense
-        // virtualization: base ownership, gated causal edges, and future-key
-        // exclusion all shape the virtual address space of THIS query.
-        const uint32_t use_begin = (uint32_t) L.uses.size();
-        int64_t total = 0;
-        for (uint32_t f = vgroup_frags[v].begin; f < vgroup_frags[v].end; ++f) {
-            auto & frag = L.fragments[f];
-            uint32_t sub_off = 0;
-            uint32_t sub_count = frag.token_count;
-            uint32_t flags = 0;
-            if (!frag.gated) {
-                // FULL: visible to every sharing query, whole fragment legal.
-            } else {
-                if (!frag.members.test((size_t) qr.seq_id)) {
-                    continue;
-                }
-                // Storage span: smin is the table-phase constant (first
-                // member storage exactly); smax is ground truth off the last
-                // member. Gaps inside the span only shrink the legal prefix.
-                const int64_t smin = frag.phase_bias;
-                const uint32_t last_idx = frag.contiguous
-                    ? frag.cell_begin + frag.token_count - 1
-                    : L.cell_refs[frag.cell_ref_offset + frag.token_count - 1];
-                const int64_t smax = cells.pos_get(last_idx);
-                if (smin > qr.query_pos) {
-                    continue;
-                }
-                if (smax > qr.query_pos) {
-                    // Prefix scan in storage order: legal prefix then illegal
-                    // tail; anything else fails closed.
-                    uint32_t k = 0;
-                    for (; k < frag.token_count; ++k) {
-                        const uint32_t idx = frag.contiguous ? frag.cell_begin + k
-                                                             : L.cell_refs[frag.cell_ref_offset + k];
-                        if (cells.pos_get(idx) > qr.query_pos) { break; }
-                    }
-                    for (uint32_t t = k; t < frag.token_count; ++t) {
-                        const uint32_t idx = frag.contiguous ? frag.cell_begin + t
-                                                             : L.cell_refs[frag.cell_ref_offset + t];
-                        if (cells.pos_get(idx) <= qr.query_pos) {
-                            return hard_error("flashprefill layout: non-interval gated subset");
-                        }
-                    }
-                    if (k == 0) {
-                        return hard_error("flashprefill layout: gated fragment with empty subset");
-                    }
-                    sub_count = k;
-                    flags = llama_flashprefill_use::FLAG_MANDATORY;
-                    frag.boundary_partial = true;
-                }
-            }
-            llama_flashprefill_use use;
-            use.query = qi;
-            use.fragment = f;
-            use.group = UINT32_MAX; // assigned in pass B once qvirt is known
-            use.sub_off = sub_off;
-            use.sub_count = sub_count;
-            use.flags = flags;
-            L.uses.push_back(use);
-            total += sub_count;
-        }
-        // Own virtual position: prefix count of legal members before the
-        // own fragment plus the fragment-local index — or the legal total
-        // when the query has no resident own cell (read-only refresh). The
-        // uses are fragment-ordered, so one linear prefix scan suffices.
-        int64_t qvirt = total;
-        {
-            const auto & own_by_seq = own_by_vgroup[v];
-            const auto seq_it = own_by_seq.find(qr.seq_id);
-            if (seq_it != own_by_seq.end()) {
-                const auto oit = seq_it->second.find(qr.query_pos);
-                if (oit != seq_it->second.end()) {
-                    const uint32_t frag_o = oit->second.first;
-                    const uint32_t local_o = oit->second.second;
-                    int64_t c = 0;
-                    bool found = false;
-                    for (uint32_t u = use_begin; u < (uint32_t) L.uses.size(); ++u) {
-                        const auto & uu = L.uses[u];
-                        if (uu.fragment < frag_o) {
-                            c += uu.sub_count;
-                            continue;
-                        }
-                        if (uu.fragment == frag_o) {
-                            found = true;
-                        }
-                        break;
-                    }
-                    if (!found) {
-                        return hard_error("flashprefill layout: own cell without covering use");
-                    }
-                    qvirt = c + local_o;
-                }
-            }
-        }
-        if (qvirt > std::numeric_limits<llama_pos>::max()) {
-            return hard_error("flashprefill layout: query virtual position out of range");
-        }
-        qr.query_virtual_pos = (llama_pos) qvirt;
-        // Pass B: phase groups + oracle expansion. Effective position of a
-        // use is qvirt + P - C, where P is the fragment's table-phase
-        // constant (storage minus piece-local index, uniform by split) and C
-        // is the legal prefix count before the fragment for THIS query.
-        {
-            int64_t c = 0;
-            for (uint32_t u = use_begin; u < (uint32_t) L.uses.size(); ++u) {
-                auto & uu = L.uses[u];
-                const auto & frag = L.fragments[uu.fragment];
-                std::string gmsg;
-                const int64_t gid = group_for(qvirt + frag.phase_bias - c, gmsg);
-                if (gid < 0) {
-                    return hard_error(gmsg);
-                }
-                uu.group = (uint32_t) gid;
-                if (params.want_exact_rows) {
-                    if (exact_total + uu.sub_count > params.exact_cap) {
-                        return hard_error("flashprefill layout: exact row capacity exceeded");
-                    }
-                    for (uint32_t k = 0; k < uu.sub_count; ++k) {
-                        const uint32_t idx = frag.contiguous ? frag.cell_begin + uu.sub_off + k
-                                                             : L.cell_refs[frag.cell_ref_offset + uu.sub_off + k];
-                        L.exact_rows.push_back(idx);
-                        L.exact_groups.push_back((uint32_t) gid);
-                        L.exact_flags.push_back(uu.flags);
-                    }
-                    exact_total += uu.sub_count;
-                }
-                c += uu.sub_count;
-            }
-        }
-        L.group_offsets.push_back((uint32_t) L.groups.size());
-        L.use_offsets.push_back((uint32_t) L.uses.size());
-        if (params.want_exact_rows) {
-            L.exact_offsets.push_back((uint32_t) L.exact_rows.size());
-        }
-    }
-    return llama_flashprefill_build_status::OK;
+    return result;
 }
 
-bool llama_kv_cache::flashprefill_build_layout(
-        const llama_ubatch & ubatch,
-        int32_t role,
-        const llama_flashprefill_layout_params & params,
-        llama_flashprefill_layout & out,
-        std::string * error) const {
-    out.clear();
-    const auto hard_error = [&](const std::string & msg) -> bool {
-        out.clear();
-        out.eligible = false;
-        out.error = msg;
-        if (error) { *error = msg; }
-        return false;
-    };
-    const auto ineligible = [&](int32_t reason, const std::string & msg) -> bool {
-        out.clear();
-        out.eligible = false;
-        out.dense_reason = reason;
-        if (error) { *error = msg; }
-        return false;
-    };
+llama_kv_cache::rerot_resolved_view llama_kv_cache::rerot_resolve_view(
+        const llama_rerot_reader_view & view) const {
+    rerot_resolved_view result;
+    result.episode_id = view.episode_id;
+    result.reader = view.reader;
 
-    if (params.block_k == 0) {
-        return hard_error("flashprefill layout: block_k must be non-zero");
-    }
-    if (ubatch.n_tokens == 0 || ubatch.pos == nullptr || ubatch.seq_id == nullptr || ubatch.n_seq_id == nullptr) {
-        return hard_error("flashprefill layout: ubatch carries no positions/sequences");
-    }
-    // Qwen35/Ornith text partial IMRoPE (n_pos==4, [p,p,p,0]) is 1D-equivalent
-    // and stays eligible; only genuinely non-text rows/cells gate out below.
-    // The RERoT indexed path consumes the scalar slot-0 coordinate exactly
-    // like the old builder, so it needs no pattern gate for oracle equality.
-    const bool ubatch_2d = ubatch.is_pos_2d();
-    if (hparams.use_alibi) {
-        return ineligible(LLAMA_FLASHPREFILL_ROUTE_DENSE_UNSUPPORTED,
-            "flashprefill layout: ALiBi bias keeps the stock path");
-    }
-    const bool want_rerot = (role == LLAMA_FLASHPREFILL_ROLE_REROT_TEACHER_FORCED);
-    if (role != LLAMA_FLASHPREFILL_ROLE_PREFILL && !want_rerot) {
-        return ineligible(LLAMA_FLASHPREFILL_ROUTE_DENSE_ROLE,
-            "flashprefill layout: role is not prefill-eligible");
-    }
-    // Existing mixed-ubatch contract: throws when RERoT and ordinary rows mix.
-    const bool rerot_on = rerot_batch_active(ubatch);
-    if (want_rerot && !rerot_on) {
-        return ineligible(LLAMA_FLASHPREFILL_ROUTE_DENSE_ROLE,
-            "flashprefill layout: ordinary ubatch with RERoT-teacher role");
-    }
-    if (!want_rerot && rerot_on) {
-        return ineligible(LLAMA_FLASHPREFILL_ROUTE_DENSE_ROLE,
-            "flashprefill layout: RERoT-active ubatch needs the RERoT-teacher role");
-    }
+    for (const auto & logical_run : view.runs) {
+        std::vector<rerot_resolved_cell> run_cells;
 
-    // Lazy CellGeneration opt-in: the flash path only. OFF never reaches here.
-    flashprefill_enable_tracking();
-
-    std::string msg;
-    llama_flashprefill_build_status st = llama_flashprefill_build_status::HARD_ERROR;
-    if (want_rerot) {
-        if (n_stream != 1 || v_cells.size() != 1) {
-            return ineligible(LLAMA_FLASHPREFILL_ROUTE_DENSE_UNSUPPORTED,
-                "flashprefill layout: RERoT fragments require unified KV");
-        }
-        if (n_swa != 0 || swa_type != LLAMA_SWA_TYPE_NONE) {
-            return ineligible(LLAMA_FLASHPREFILL_ROUTE_DENSE_UNSUPPORTED,
-                "flashprefill layout: RERoT+SWA has no indexed legality; stock path");
-        }
-        out.is_rerot = 1;
-        out.causal = 1;
-        out.swa_window = 0;
-        out.swa_type = 0;
-        st = llama_flashprefill_build_rerot_plan(v_cells[0], rerot_reader_views, ubatch, params, out, &msg);
-    } else {
-        if (!params.causal && n_swa != 0 && swa_type != LLAMA_SWA_TYPE_NONE) {
-            return ineligible(LLAMA_FLASHPREFILL_ROUTE_DENSE_UNSUPPORTED,
-                "flashprefill layout: non-causal SWA keeps the stock path");
-        }
-        if (ubatch_2d) {
-            for (uint32_t q = 0; q < ubatch.n_tokens; ++q) {
-                if (!fp_row_is_text_pattern(ubatch, q)) {
-                    return ineligible(LLAMA_FLASHPREFILL_ROUTE_DENSE_UNSUPPORTED,
-                        "flashprefill layout: non-text 2-D row keeps the stock path");
+        for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
+            const auto & cells = v_cells[stream];
+            for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+                if (cells.is_empty(cell)) {
+                    continue;
                 }
+
+                const auto & meta = cells.rerot_get(cell);
+                if (meta.episode_id != view.episode_id || meta.run_id != logical_run.run_id ||
+                    meta.node_id != logical_run.owner) {
+                    continue;
+                }
+
+                run_cells.push_back({
+                    stream,
+                    cell,
+                    cells.pos_get(cell),
+                    0,
+                    meta,
+                });
             }
         }
-        out.is_rerot = 0;
-        out.causal = params.causal ? 1u : 0u;
-        out.swa_window = n_swa;
-        out.swa_type = (uint32_t) swa_type;
-        st = llama_flashprefill_build_ordinary_plan(v_cells, seq_to_stream, n_swa, swa_type, params.causal, ubatch_2d,
-            ubatch, params, out, &msg);
-    }
-    if (st == llama_flashprefill_build_status::INELIGIBLE) {
-        return ineligible(LLAMA_FLASHPREFILL_ROUTE_DENSE_UNSUPPORTED, msg);
-    }
-    if (st != llama_flashprefill_build_status::OK) {
-        out.clear();
-        out.eligible = false;
-        out.error = msg;
-        if (error) { *error = msg; }
-        return false;
+
+        std::stable_sort(run_cells.begin(), run_cells.end(), [](const auto & lhs, const auto & rhs) {
+            if (lhs.storage_pos != rhs.storage_pos) {
+                return lhs.storage_pos < rhs.storage_pos;
+            }
+            if (lhs.meta.frontier != rhs.meta.frontier) {
+                return lhs.meta.frontier < rhs.meta.frontier;
+            }
+            if (lhs.stream != rhs.stream) {
+                return lhs.stream < rhs.stream;
+            }
+            return lhs.cell < rhs.cell;
+        });
+
+        for (auto & resolved : run_cells) {
+            resolved.virtual_pos = result.query_virtual_pos++;
+            result.cells.push_back(std::move(resolved));
+        }
     }
 
-    uint32_t width = 0;
-    for (const auto & cells : v_cells) {
-        width = std::max(width, cells.size());
-    }
-    out.block_k = params.block_k;
-    out.cells_epoch = fp_epoch;
-    flashprefill_cell_stamps(out.cell_stamps);
-    out.n_kv_at_build = width;
-    out.requires_cache_writes = true;
-    out.eligible = true;
-
-    std::string vmsg;
-    if (!out.validate(width, &vmsg)) {
-        out.clear();
-        out.eligible = false;
-        out.error = "flashprefill layout: invalid derived layout: " + vmsg;
-        if (error) { *error = out.error; }
-        return false;
-    }
-    return true;
+    return result;
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
@@ -6386,9 +5189,25 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
     if (attn_rot_k) {
-        // Resolved once at cache construction: writer, scorer and K-shift
-        // must all use the same transform even if the environment changes.
-        res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, attn_rot_k_nrot, attn_rot_k_nrot);
+        // EXPERIMENT (master TODO): force smallest rotation matrix (nrot=64)
+        // for K, mirroring V's choice. Master defaults to the largest power-of-2
+        // that divides head_dim, but the upstream comment hypothesizes smaller
+        // tiles preserve more local structure → less PPL hit on sensitive models
+        // (gemma-4 26B-A4B reportedly regresses with the largest tile).
+        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
+        const char * LLAMA_ATTN_ROT_K_NROT = getenv("LLAMA_ATTN_ROT_K_NROT");
+        int nrot = LLAMA_ATTN_ROT_K_NROT ? atoi(LLAMA_ATTN_ROT_K_NROT) : 64;
+
+        // Original master behavior (largest power-of-2): set LLAMA_ATTN_ROT_K_NROT=0
+        if (nrot == 0) {
+            nrot = 64;
+            do {
+                nrot *= 2;
+            } while (n_embd_head_k_all % nrot == 0);
+            nrot /= 2;
+        }
+
+        res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
         ggml_set_input(res);
         ggml_set_name(res, "attn_inp_k_rot");
     }
@@ -6904,70 +5723,6 @@ size_t llama_kv_cache::size_v_bytes() const {
     return size_v_bytes;
 }
 
-void llama_kv_cache::shift_turbo_keys(const llama_cparams & cparams) {
-    // K-shift is infrequent. Use the checked codec for every backend until a
-    // native fused Turbo shift exists. Read/write one layer/stream snapshot,
-    // not one synchronous GPU transfer per cell; leave unshifted bytes alone.
-    for (const auto & layer : layers) {
-        if (!llama_kv_is_turbo(layer.k->type)) {
-            continue;
-        }
-        const uint32_t il = layer.il;
-        const uint32_t hd = hparams.n_embd_head_k(il);
-        const uint32_t storage_hd = ((hd + 127) / 128) * 128;
-        const uint32_t rotary_dim = hparams.n_rot(il);
-        const uint32_t n_heads = hparams.n_head_kv(il);
-        std::vector<float> factors;
-        if (auto * tensor = model.get_rope_factors(cparams, il)) {
-            if (tensor->type != GGML_TYPE_F32 || tensor->ne[0] < rotary_dim / 2) {
-                throw std::runtime_error("Turbo K-shift: invalid RoPE factors");
-            }
-            factors.resize(rotary_dim / 2);
-            ggml_backend_tensor_get(tensor, factors.data(), 0, factors.size() * sizeof(float));
-        }
-        std::vector<float> omega(rotary_dim / 2), scale_sq(rotary_dim / 2);
-        if (!triattention_build_rope_tables(
-                omega.data(), scale_sq.data(), rotary_dim,
-                model.get_rope_freq_base(cparams, il), model.get_rope_freq_scale(cparams, il),
-                (int32_t) cparams.n_ctx_orig_yarn, cparams.yarn_ext_factor,
-                cparams.yarn_attn_factor, cparams.yarn_beta_fast, cparams.yarn_beta_slow,
-                factors.empty() ? nullptr : factors.data())) {
-            throw std::runtime_error("Turbo K-shift: invalid RoPE parameters");
-        }
-        const bool neox = hparams.rope_type != LLAMA_ROPE_TYPE_NORM;
-        const auto * traits = ggml_get_type_traits(layer.k->type);
-        for (uint32_t s = 0; s < n_stream; ++s) {
-            const auto & cells = v_cells[s];
-            if (!cells.get_has_shift()) {
-                continue;
-            }
-            auto * k = layer.k_stream[s];
-            const size_t bytes = ggml_nbytes(k);
-            std::vector<uint8_t> snapshot(bytes);
-            std::vector<float> row(storage_hd * n_heads);
-            ggml_backend_tensor_get(k, snapshot.data(), 0, bytes);
-            for (uint32_t i = 0; i < cells.size(); ++i) {
-                const llama_pos delta = cells.get_shift(i);
-                if (cells.is_empty(i) || delta == 0) {
-                    continue;
-                }
-                uint8_t * encoded = snapshot.data() + (size_t) i * k->nb[1];
-                llama_kv_decode_key(k->type, encoded, row.data(), (uint32_t) row.size());
-                for (uint32_t h = 0; h < n_heads; ++h) {
-                    float * key = row.data() + h * storage_hd;
-                    llama_kv_hadamard(key, hd, attn_rot_k_nrot);
-                    const uint32_t rope_offset = hparams.n_lora_kv > 0 ? hd - rotary_dim : 0;
-                    llama_kv_shift_key(key + rope_offset, rotary_dim, neox, omega.data(), delta);
-                    llama_kv_hadamard(key, hd, attn_rot_k_nrot);
-                }
-                // from_float_ref performs the forward Turbo WHT itself.
-                traits->from_float_ref(row.data(), encoded, (int64_t) row.size());
-            }
-            ggml_backend_tensor_set(k, snapshot.data(), 0, bytes);
-        }
-    }
-}
-
 ggml_tensor * llama_kv_cache::build_rope_shift(
         const llama_cparams & cparams,
                ggml_context * ctx,
@@ -7287,8 +6042,6 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     if (other) {
         return;
     }
-
-    fp_bump();
 
     GGML_UNUSED(flags);
 
@@ -9081,10 +7834,6 @@ bool llama_kv_cache_context::next() {
     rerot_layout_ready = false;
     rerot_layout = {};
 
-    fp_key_valid = false;
-    fp_layout.clear();
-    fp_cell_stamps.clear();
-
     return true;
 }
 
@@ -9171,10 +7920,6 @@ bool llama_kv_cache_context::apply() {
     n_kv = kv->get_n_kv(sinfos[i_cur]);
     rerot_layout_ready = false;
     rerot_layout = {};
-
-    fp_key_valid = false;
-    fp_layout.clear();
-    fp_cell_stamps.clear();
 
     // InnerQ: check if CUDA calibration finalized and tensor needs update
     if (kv->get_turbo_innerq_scale_inv() != nullptr && turbo_innerq_needs_tensor_update()) {
@@ -9291,100 +8036,6 @@ uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
 }
 
-bool llama_kv_cache_context::flashprefill_build_layout(
-        uint32_t ubatch_index,
-        int32_t role,
-        const llama_flashprefill_layout_params & params,
-        std::string * error) const {
-    if (status != LLAMA_MEMORY_STATUS_SUCCESS || kv == nullptr) {
-        if (error) { *error = "flashprefill layout: no memory context"; }
-        return false;
-    }
-    if (ubatches.empty() || sinfos.empty() || ubatch_index >= ubatches.size()) {
-        if (error) { *error = "flashprefill layout: ubatch index out of range"; }
-        return false;
-    }
-    const llama_ubatch & ub = ubatches[ubatch_index];
-
-    llama_flashprefill_build_key key;
-    key.ubatch_index = ubatch_index;
-    key.role = role;
-    key.block_k = params.block_k;
-    key.causal = params.causal ? 1u : 0u;
-    key.want_exact_rows = params.want_exact_rows ? 1u : 0u;
-    key.n_tokens = ub.n_tokens;
-    key.exact_cap_bucket = llama_flashprefill_layout_params::bucket_for(params.exact_cap);
-
-    // Reuse the owned planning when topology matches and owner stamps are fresh.
-    if (fp_key_valid && fp_key.ubatch_index == key.ubatch_index && fp_key.role == key.role &&
-        fp_key.block_k == key.block_k && fp_key.causal == key.causal &&
-        fp_key.want_exact_rows == key.want_exact_rows && fp_key.n_tokens == key.n_tokens &&
-        fp_key.exact_cap_bucket == key.exact_cap_bucket && flashprefill_layout_is_fresh()) {
-        return fp_layout.eligible;
-    }
-
-    std::string msg;
-    const bool eligible = kv->flashprefill_build_layout(ub, role, params, fp_layout, &msg);
-
-    // Finalize the topology key post-build (group capacity and path are known now).
-    key.group_cap_bucket = llama_flashprefill_layout_params::bucket_for(fp_layout.n_groups());
-    key.is_rerot = fp_layout.is_rerot;
-    fp_key = key;
-    fp_key_valid = true;
-    fp_cells_epoch = kv->flashprefill_epoch();
-    kv->flashprefill_cell_stamps(fp_cell_stamps);
-
-    if (error) { *error = msg; }
-    return eligible;
-}
-
-bool llama_kv_cache_context::flashprefill_build_current_layout(
-        int32_t role,
-        const llama_flashprefill_layout_params & params,
-        std::string * error) const {
-    if (status != LLAMA_MEMORY_STATUS_SUCCESS || kv == nullptr) {
-        if (error) { *error = "flashprefill layout: no memory context"; }
-        return false;
-    }
-    if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size()) {
-        if (error) { *error = "flashprefill layout: no current ubatch"; }
-        return false;
-    }
-    return flashprefill_build_layout((uint32_t) i_cur, role, params, error);
-}
-
-const llama_flashprefill_layout & llama_kv_cache_context::flashprefill_get_layout() const {
-    return fp_layout;
-}
-
-bool llama_kv_cache_context::flashprefill_layout_is_fresh() const {
-    if (!fp_key_valid || kv == nullptr) {
-        return false;
-    }
-    if (fp_cells_epoch != kv->flashprefill_epoch()) {
-        return false;
-    }
-    std::vector<llama_flashprefill_cell_stamp> cur;
-    kv->flashprefill_cell_stamps(cur);
-    if (cur.size() != fp_cell_stamps.size()) {
-        return false;
-    }
-    for (size_t i = 0; i < cur.size(); ++i) {
-        if (cur[i].stamp != fp_cell_stamps[i].stamp ||
-            cur[i].generation != fp_cell_stamps[i].generation) {
-            return false;
-        }
-        if (!fp_stamp_usable(cur[i])) {
-            return false;
-        }
-    }
-    return true;
-}
-
-const llama_flashprefill_build_key & llama_kv_cache_context::flashprefill_layout_key() const {
-    return fp_key;
-}
-
 uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
     // Full-cache and update contexts do not carry a concrete ubatch/slot pair.
     if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size() || i_cur >= sinfos.size()) {
@@ -9406,14 +8057,6 @@ ggml_type llama_kv_cache_context::type_k() const {
 
 ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
-}
-
-ggml_type llama_kv_cache_context::layer_type_k(int32_t il) const {
-    return kv->layer_type_k(il);
-}
-
-ggml_type llama_kv_cache_context::layer_type_v(int32_t il) const {
-    return kv->layer_type_v(il);
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {

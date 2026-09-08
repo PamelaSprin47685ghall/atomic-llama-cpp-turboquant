@@ -17,7 +17,6 @@ class llm_graph_input_attn_flashprefill; // companion input (defined below)
 #include <cstdint>
 #include <vector>
 #include <memory>
-#include <string>
 #include <set>
 #include <functional>
 #include <map>
@@ -25,8 +24,6 @@ class llm_graph_input_attn_flashprefill; // companion input (defined below)
 struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
-
-namespace llama_xkv { class xkv_graph_snapshot; }
 
 struct llama_cparams;
 struct llama_layer;
@@ -42,6 +39,8 @@ class llama_kv_cache_iswa_context;
 class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
+
+namespace llama_xkv { class xkv_graph_snapshot; }
 
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
@@ -239,7 +238,7 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * out_ids = nullptr; // I32 [n_outputs]
+    ggml_tensor * out_ids; // I32 [n_outputs]
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -254,7 +253,7 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    ggml_tensor * mean = nullptr; // F32 [n_batch, n_batch]
+    ggml_tensor * mean; // F32 [n_batch, n_batch]
 
     const llama_cparams cparams;
 };
@@ -266,7 +265,7 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    ggml_tensor * cls = nullptr; // I32 [n_batch]
+    ggml_tensor * cls; // I32 [n_batch]
 
     const llama_cparams cparams;
     const llm_arch arch;
@@ -287,35 +286,115 @@ public:
         const llama_memory_recurrent_context * current,
         const llama_ubatch & ubatch);
 
-    ggml_tensor * s_copy = nullptr;      // I32 [n_rs]
-    ggml_tensor * brain_copy = nullptr;  // I32 [n_seqs], absent outside grouped layout
+    ggml_tensor * s_copy;      // I32 [n_rs]
+    ggml_tensor * brain_copy;  // I32 [n_seqs], grouped shared-S rows
 
     struct rbb_group_input {
         int32_t brain_row = -1;
-        // All PUBLIC writers in this brain group. Explicit shared-RBB research
-        // modes consume this set.
         ggml_tensor * public_rows = nullptr; // I32 [n_public_rows]
-
-        // Writers that are allowed to advance the shared recurrent brain in
-        // the default mathematical contract. Child lanes are intentionally
-        // absent: their trained recurrence is lane-local and DDVR is the
-        // cross-lane memory channel. Keeping this as graph input data (rather
-        // than an all-or-nothing ubatch predicate) makes the recurrence
-        // independent of scheduler batch composition.
-        ggml_tensor * default_shared_rows = nullptr; // I32 [n_non_child_public_rows], nullable
     };
     std::vector<rbb_group_input> rbb_groups;
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
-    ggml_tensor * s_copy_main = nullptr;   // I32 [n_seqs]
-    ggml_tensor * s_copy_extra = nullptr;  // I32 [n_rs - n_seqs]
+    ggml_tensor * s_copy_main;   // I32 [n_seqs]
+    ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
 
-    const llama_memory_recurrent_context * mctx = nullptr;
+    const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
-    uint32_t head = 0;
-    int32_t rs_z = 0;
+    uint32_t head;
+    int32_t rs_z;
+};
+
+// Managed XKV graph input: owns bounded-hot XKV op handles through compute
+// (stable custom-op userdata addresses via shared ownership), disables graph
+// reuse while bounded XKV is active, and exposes post-compute validation so
+// stale/codec/workspace callback status becomes retry/hard failure instead of
+// a silently accepted zeroed tensor. Owned by llm_graph_result.
+class llm_graph_input_xkv : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_xkv(bool bounded_active) : bounded_active(bounded_active) {}
+    ~llm_graph_input_xkv() override;
+    void set_input(const llama_ubatch * ubatch) override;
+    // Bounded XKV reuses the graph only when the capacity key matches and
+    // every adopted snapshot proves freshness (store stamps unchanged).
+    // OFF/SHADOW never install this input. Until the snapshot refresh API
+    // lands (XkvRuntimeSealer), any store mutation refuses reuse by stamp.
+    bool can_reuse(const llm_graph_params & params) override;
+    // Capacity key for graph reuse. Exact today (bucket size 1): padded
+    // snapshot refresh + bucketed builds widen these to buckets without
+    // changing the comparison sites. n_kv covers storage-view shapes.
+    struct xkv_reuse_key {
+        uint32_t n_tokens = 0;
+        int xkv_mode = 0;
+        int storage_profile = 0;
+        bool cpu_branch = true;
+        bool operator==(const xkv_reuse_key & o) const {
+            // No n_kv: bounded hot views are fixed-capacity pool views, so
+            // storage shapes are stable across ubatches by pool invariant
+            // (HotSafety); logical cache growth does not reshape them.
+            return n_tokens == o.n_tokens && xkv_mode == o.xkv_mode &&
+                storage_profile == o.storage_profile && cpu_branch == o.cpu_branch;
+        }
+        bool operator!=(const xkv_reuse_key & o) const { return !(*this == o); }
+    };
+    // Adopt one per-KV-head op handle with a status poller returning
+    // 0 = ok, 1 = retry (stale stamp), 2 = hard error. validity_fn reports
+    // snapshot freshness (e.g. store stamp unchanged); absent means
+    // unverifiable and refuses reuse when bounded.
+    void adopt(std::shared_ptr<void> handle, std::function<int()> status_fn, std::string label,
+        std::function<bool()> validity_fn = {},
+        std::function<void()> release_fn = {},
+        std::function<bool(std::string &)> acquire_fn = {},
+        // Fill hook for graph-created metadata tensors (native path): replays
+        // exact precomputed bytes into set_input-marked tensors; throws on
+        // capacity overflow (rebuild required, refusing to truncate).
+        std::function<void()> fill_fn = {},
+        llama_xkv::xkv_graph_snapshot * snapshot = nullptr);
+    // Snapshot sidecar for refresh/freshness (non-owning; lifetime held by
+    // handle). Passed explicitly to avoid type-erased round-trip casts.
+    void note_snapshot(llama_xkv::xkv_graph_snapshot * snap);
+    // Coordinator reader lease lifecycle (XkvRuntimeSealer guard): release
+    // runs after final validation on EVERY poll path (ok/retry/hard) and in
+    // the destructor, so a cached graph/result can never block maintenance
+    // forever. Segment pins are untouched (COW-immutable). Acquire runs at
+    // set_input start (fresh guard before snapshot refresh); acquire failure
+    // surfaces as hard error at the next poll. Non-const: polling mutates
+    // lease state.
+    void release_reader_leases();
+    void set_key(xkv_reuse_key key, const llama_memory_context_i * mctx) {
+        key_ = key;
+        key_valid_ = true;
+        build_mctx_ = mctx;
+    }
+    // True iff every adopted op computed successfully. err carries the first
+    // failure. Must be consulted after graph compute; a zeroed output tensor
+    // alone is never success.
+    bool postcompute_ok(std::string * err);
+    int post_action();
+    bool bounded() const { return bounded_active; }
+    size_t n_ops() const { return entries.size(); }
+private:
+    struct entry {
+        std::shared_ptr<void> handle;
+        std::function<int()> status_fn;
+        std::string label;
+        std::function<bool()> validity_fn;
+        std::function<void()> release_fn;
+        std::function<bool(std::string &)> acquire_fn;
+        std::string acquire_err;
+        bool lease_outstanding = false;
+        llama_xkv::xkv_graph_snapshot * snapshot = nullptr;
+        std::function<void()> fill_fn;
+    };
+    bool bounded_active = false;
+    xkv_reuse_key key_;
+    bool key_valid_ = false;
+    const llama_memory_context_i * build_mctx_ = nullptr;
+    std::vector<entry> entries;
+    // Last ubatch seen in set_input (defensive record; refresh hook point).
+    uint32_t last_n_tokens_ = 0;
 };
 
 // StateCarryFix instrumented-run stash: s_copy values copied at set_input
@@ -333,7 +412,7 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
-    ggml_tensor * cross_embd = nullptr; // F32 [n_embd, n_outputs_enc]
+    ggml_tensor * cross_embd; // F32 [n_embd, n_outputs_enc]
 
     const llama_cross * cross;
 };
@@ -371,7 +450,7 @@ public:
 //   first three coordinates only, the fourth stays 0.
 // - RoPE runs BEFORE Turbo WHT; K storage is never moved, not one byte.
 // - Kernels consume span descriptors (entries [2, E] + offsets [n_queries+1])
-//   with one global online softmax per query range. Staged frontier visibility
+//   with one global online softmax per query range. Strong-frontier visibility
 //   is resolved layout-side by entry pre-filtering (strong vs lag1), never by
 //   the kernel and never by ordinary seq-membership masks.
 // - Span metadata / offsets / visibility are INPUT TENSOR DATA, not graph
@@ -851,95 +930,6 @@ public:
 
 // V-less input for the KV cache
 // ref: https://github.com/ggml-org/llama.cpp/pull/19067
-// Managed XKV graph input: owns bounded-hot XKV op handles through compute
-// (stable custom-op userdata addresses via shared ownership), disables graph
-// reuse while bounded XKV is active, and exposes post-compute validation so
-// stale/codec/workspace callback status becomes retry/hard failure instead of
-// a silently accepted zeroed tensor. Owned by llm_graph_result.
-class llm_graph_input_xkv : public llm_graph_input_i {
-public:
-    explicit llm_graph_input_xkv(bool bounded_active) : bounded_active(bounded_active) {}
-    ~llm_graph_input_xkv() override;
-    void set_input(const llama_ubatch * ubatch) override;
-    // Bounded XKV reuses the graph only when the capacity key matches and
-    // every adopted snapshot proves freshness (store stamps unchanged).
-    // OFF/SHADOW never install this input. Until the snapshot refresh API
-    // lands (XkvRuntimeSealer), any store mutation refuses reuse by stamp.
-    bool can_reuse(const llm_graph_params & params) override;
-    // Capacity key for graph reuse. Exact today (bucket size 1): padded
-    // snapshot refresh + bucketed builds widen these to buckets without
-    // changing the comparison sites. n_kv covers storage-view shapes.
-    struct xkv_reuse_key {
-        uint32_t n_tokens = 0;
-        int xkv_mode = 0;
-        int storage_profile = 0;
-        bool cpu_branch = true;
-        bool operator==(const xkv_reuse_key & o) const {
-            // No n_kv: bounded hot views are fixed-capacity pool views, so
-            // storage shapes are stable across ubatches by pool invariant
-            // (HotSafety); logical cache growth does not reshape them.
-            return n_tokens == o.n_tokens && xkv_mode == o.xkv_mode &&
-                storage_profile == o.storage_profile && cpu_branch == o.cpu_branch;
-        }
-        bool operator!=(const xkv_reuse_key & o) const { return !(*this == o); }
-    };
-    // Adopt one per-KV-head op handle with a status poller returning
-    // 0 = ok, 1 = retry (stale stamp), 2 = hard error. validity_fn reports
-    // snapshot freshness (e.g. store stamp unchanged); absent means
-    // unverifiable and refuses reuse when bounded.
-    void adopt(std::shared_ptr<void> handle, std::function<int()> status_fn, std::string label,
-        std::function<bool()> validity_fn = {},
-        std::function<void()> release_fn = {},
-        std::function<bool(std::string &)> acquire_fn = {},
-        // Fill hook for graph-created metadata tensors (native path): replays
-        // exact precomputed bytes into set_input-marked tensors; throws on
-        // capacity overflow (rebuild required, refusing to truncate).
-        std::function<void()> fill_fn = {},
-        llama_xkv::xkv_graph_snapshot * snapshot = nullptr);
-    // Snapshot sidecar for refresh/freshness (non-owning; lifetime held by
-    // handle). Passed explicitly to avoid type-erased round-trip casts.
-    void note_snapshot(llama_xkv::xkv_graph_snapshot * snap);
-    // Coordinator reader lease lifecycle (XkvRuntimeSealer guard): release
-    // runs after final validation on EVERY poll path (ok/retry/hard) and in
-    // the destructor, so a cached graph/result can never block maintenance
-    // forever. Segment pins are untouched (COW-immutable). Acquire runs at
-    // set_input start (fresh guard before snapshot refresh); acquire failure
-    // surfaces as hard error at the next poll. Non-const: polling mutates
-    // lease state.
-    void release_reader_leases();
-    void set_key(xkv_reuse_key key, const llama_memory_context_i * mctx) {
-        key_ = key;
-        key_valid_ = true;
-        build_mctx_ = mctx;
-    }
-    // True iff every adopted op computed successfully. err carries the first
-    // failure. Must be consulted after graph compute; a zeroed output tensor
-    // alone is never success.
-    bool postcompute_ok(std::string * err);
-    int post_action();
-    bool bounded() const { return bounded_active; }
-    size_t n_ops() const { return entries.size(); }
-private:
-    struct entry {
-        std::shared_ptr<void> handle;
-        std::function<int()> status_fn;
-        std::string label;
-        std::function<bool()> validity_fn;
-        std::function<void()> release_fn;
-        std::function<bool(std::string &)> acquire_fn;
-        std::string acquire_err;
-        bool lease_outstanding = false;
-        llama_xkv::xkv_graph_snapshot * snapshot = nullptr;
-        std::function<void()> fill_fn;
-    };
-    bool bounded_active = false;
-    xkv_reuse_key key_;
-    bool key_valid_ = false;
-    const llama_memory_context_i * build_mctx_ = nullptr;
-    std::vector<entry> entries;
-    // Last ubatch seen in set_input (defensive record; refresh hook point).
-    uint32_t last_n_tokens_ = 0;
-};
 class llm_graph_input_attn_k : public llm_graph_input_i {
 public:
     llm_graph_input_attn_k(
@@ -1579,21 +1569,7 @@ public:
     const std::vector<ggml_tensor *> & get_flashprefill_plans() const { return flashprefill_plans; }
     const std::vector<int> & get_flashprefill_plan_ils() const { return flashprefill_plan_ils; }
     const llm_graph_flashprefill_summary & get_flashprefill_summary() const { return flashprefill_summary; }
-    // Bounded-XKV post-compute aggregate (P0-1). Scans managed
-    // llm_graph_input_xkv inputs and returns the worst action: 0 = ok,
-    // 1 = retry (stale stamp), 2 = hard error. err carries the first
-    // failure detail. MUST be called after graph compute AND backend
-    // synchronization; polling earlier races the reference callback.
-    // Retry contract: rebuild the snapshot (builder) and the graph; KV
-    // cells are already applied, do NOT re-apply them. Hard error aborts
-    // the ubatch. A zeroed attention tensor alone is never success.
-    // Byte-complete ordering: the caller MUST force exactly one scheduler
-    // sync after graph compute and BEFORE this poll (count it as part of the
-    // commit protocol); hot_committed means K/V bytes complete. Polling an
-    // unsynchronized graph races the callback and MUST NOT mark payloads
-    // committed — never expose committed bytes while a write is in flight.
-    // Alternatively a backend completion fence must be consumed before any
-    // seal/state/read observing these bytes (seal side, XkvRuntimeSealer).
+
     int xkv_poll_postcompute(std::string * err);
     bool xkv_has_bounded() const;
     void set_params(const llm_graph_params & params);
