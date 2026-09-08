@@ -10436,6 +10436,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const ggml_type routed_type_b = quantize_y
         ? GGML_TYPE_Q8_1
         : (qy_needs_dequant ? f16_type : src1->type);
+    // The singleton vector kernels cannot read staged F16/BF16 B. Keep those
+    // rows in the generic matrix route instead of requesting an incompatible
+    // vector kernel. The generic route still runs its explicit counter reset.
     const bool split_singletons = nei1 <= mul_mat_vec_id_hybrid_max_cols &&
         (routed_type_b == GGML_TYPE_F32 || routed_type_b == GGML_TYPE_Q8_1);
 
