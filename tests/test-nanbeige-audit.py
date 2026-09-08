@@ -230,6 +230,37 @@ class AuditTests(unittest.TestCase):
         library.write_bytes(b"new")
         self.assertNotEqual(before, audit.artifact_fingerprint(binary))
 
+    def test_orphan_versioned_libraries_do_not_change_runtime_fingerprint(self):
+        binary = self.root / "server"
+        binary.write_bytes(b"server")
+        current = self.root / "libfixture.so.2.0.7"
+        current.write_bytes(b"current")
+        (self.root / "libfixture.so").symlink_to(current.name)
+        (self.root / "libfixture.so.2").symlink_to(current.name)
+        orphan = self.root / "libfixture.so.1.0.0"
+        orphan.write_bytes(b"old orphan")
+        before = audit.artifact_fingerprint(binary)
+        self.assertEqual(set(before), {str(binary.resolve()), str(current.resolve())})
+        orphan.write_bytes(b"changed orphan")
+        self.assertEqual(before, audit.artifact_fingerprint(binary))
+
+    def test_switching_runtime_library_symlink_changes_fingerprint(self):
+        binary = self.root / "server"
+        binary.write_bytes(b"server")
+        first = self.root / "libfixture.so.1.0.0"
+        second = self.root / "libfixture.so.2.0.0"
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        alias = self.root / "libfixture.so"
+        alias.symlink_to(first.name)
+        before = audit.artifact_fingerprint(binary)
+        alias.unlink()
+        alias.symlink_to(second.name)
+        after = audit.artifact_fingerprint(binary)
+        self.assertNotEqual(before, after)
+        self.assertIn(str(second.resolve()), after)
+        self.assertNotIn(str(first.resolve()), after)
+
     def test_model_identity_is_content_based_and_stable(self):
         model = self.root / "model.gguf"
         model.write_bytes(b"weights")

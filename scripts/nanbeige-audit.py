@@ -35,10 +35,27 @@ def request(base, key, path, data=None, timeout=240, *, as_text=False):
 
 
 def artifact_fingerprint(binary):
-    """Fingerprint local build products, deduplicating shared-library symlinks."""
+    """Fingerprint the executable and currently selected local runtime libs.
+
+    Build directories retain many historical ``libfoo.so.0.0.<build>`` files.
+    Hashing every orphan version is both expensive and misleading: only the
+    targets selected by the current ``.so``/version symlinks can participate
+    in this probe.  Resolve those aliases and deduplicate their targets.
+    """
     binary = binary.resolve()
     paths = {binary}
-    for pattern in ("lib*.so*", "*.dylib", "*.dll"):
+    so_candidates = list(binary.parent.glob("lib*.so*"))
+    so_aliases = [path for path in so_candidates if path.is_symlink()]
+    for path in so_aliases:
+        target = path.resolve(strict=True)
+        if not target.is_file():
+            raise OSError("shared-library alias does not resolve to a file: " + str(path))
+        paths.add(target)
+    # Some builds install an unversioned .so as a regular file instead of a
+    # symlink.  Include it, but not unrelated historical versioned payloads.
+    paths.update(path.resolve() for path in so_candidates
+                 if not path.is_symlink() and path.name.endswith(".so") and path.is_file())
+    for pattern in ("*.dylib", "*.dll"):
         paths.update(path.resolve() for path in binary.parent.glob(pattern) if path.is_file())
     result = {}
     for path in sorted(paths):
