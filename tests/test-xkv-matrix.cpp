@@ -606,7 +606,7 @@ static void test_byte_preserving_store_pack() {
     for (size_t i = 0; i < n_rows; ++i) {
         store.register_hot_payload(pids[i], (uint32_t)i, gens[i], xkv_state::hot_committed);
     }
-    bool marked = store.mark_seal_candidates(pids);
+    bool marked = store.mark_seal_candidates(pids, gens, nullptr);
     MATRIX_CHECK(marked, "mark_seal_candidates should succeed");
 
     // Construct valid candidate segment
