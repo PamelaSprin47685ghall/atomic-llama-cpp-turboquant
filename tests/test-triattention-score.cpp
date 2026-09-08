@@ -1016,6 +1016,12 @@ static void test_collector_model_geometry() {
     fprintf(stderr, "test_collector_model_geometry PASSED\n");
 }
 
+static void test_tri_policy() {
+    fprintf(stderr, "--- test_tri_rerot_policy_selfcheck ---\n");
+    TEST_ASSERT(tri_rerot_policy_selfcheck());
+    fprintf(stderr, "  PASSED\n");
+}
+
 int main() {
     fprintf(stderr, "=== TriAttention Scorer Tests ===\n\n");
 
@@ -1027,6 +1033,7 @@ int main() {
     test_combined_uses_exact_sampled_head();
     test_score_max_pooling();
     test_zscore_normalization();
+    test_tri_policy();
 
     fprintf(stderr, "\n=== Results: %d failure(s) ===\n", g_test_failures);
     return g_test_failures == 0 ? 0 : 1;

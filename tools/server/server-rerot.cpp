@@ -586,22 +586,18 @@ std::string server_rerot_child_contract(
     if (!valid_child_close_marker(close_marker)) return {};
     const std::string clean_title = normalize_lane_title(title);
     if (clean_title.empty()) return {};
-    return "\n当前 Lane 的唯一任务是：『" + clean_title + "』。"
-        "其他公开章节只能作为参考，不能把它们接管成自己的任务。"
-        "如果稍后进入单独的 PRIVATE planner 阶段，只在那个阶段做递归拆分；"
-        "进入正文阶段后，普通 <ol>/<li> 只是内容格式，不再具有调度含义。"
-        "正文可以多行、多段。完成这个唯一任务后输出 " + std::string(close_marker) +
-        " 结束当前工作块，不继续其他章节。\n";
+    return "\n我现在专注于自己的唯一子任务『" + clean_title + "』。"
+        "其他公开章节只作为我的参考背景，我不接管它们，也不重新回答整个用户问题。"
+        "正文中普通列表和标题只是内容呈现；详尽完成本项内容后，我直接输出 " + std::string(close_marker) +
+        " 结束当前工作块，不再发散。\n";
 }
 
 std::string server_rerot_child_planner_prompt(std::string_view title) {
     const std::string clean_title = normalize_lane_title(title);
     if (clean_title.empty()) return {};
-    return "只针对当前唯一任务『" + clean_title + "』判断是否还存在两个或更多可以并行、"
-        "彼此独立展开的子任务。输出一个平面的 HTML 有序列表：以 <ol> 开头，"
-        "每项只写一个简短 <li> 标题，不展开内容，以 </ol> 结尾。"
-        "如果不需要继续拆分，也必须只输出一个 <li>，其标题概括当前任务。"
-        "不要列出兄弟章节，不要重述整个用户问题。";
+    return "我只针对当前唯一任务『" + clean_title + "』自省是否还存在两个或更多可以独立并行展开的子任务。"
+        "输出一个平面的 HTML 有序列表：以 <ol> 开头，每项只写一个简短 <li> 标题，不提前展开内容，以 </ol> 结尾。"
+        "如果无需拆分，我也只输出一个概括当前任务的 <li>。不列出兄弟章节，不重述整个用户问题。";
 }
 
 std::string server_rerot_child_worker_prompt(
@@ -610,11 +606,10 @@ std::string server_rerot_child_worker_prompt(
     if (!valid_child_close_marker(close_marker)) return {};
     const std::string clean_title = normalize_lane_title(title);
     if (clean_title.empty()) return {};
-    return "\n现在进入正文阶段。当前唯一任务是：『" + clean_title + "』。"
-        "只完成这一项；其他公开章节只可引用为背景，不得接管，不得重新回答整个用户问题。"
-        "普通列表、标题和代码块现在都只是正文内容，不具有调度含义。"
-        "完成这一项后输出 " + std::string(close_marker) +
-        " 结束当前工作块，不要继续其他章节、总题总结或下一个标题。\n";
+    return "\n现在我展开『" + clean_title + "』的详尽分析。"
+        "我只专注于完成这一项内容；其他公开章节仅作参考，我不越界接管，也不重新回答整个用户问题。"
+        "当前所有列表和标题均属正文内容。完整列出本项内容后，我直接输出 " + std::string(close_marker) +
+        " 结束思考，不输出任何多余问句、客套话或后续章节总结。\n";
 }
 
 std::string server_rerot_child_grammar(std::string_view close_marker) {

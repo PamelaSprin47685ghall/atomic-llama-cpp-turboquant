@@ -1868,10 +1868,10 @@ private:
 
     static std::string rerot_serial_resume_prompt(bool child_fence) {
         // Guide §21.4: "PRIVATE 注入简短的串行继续指令（结合已公开推导完成思考，并按模型原生格式进入回答）"
-        // Keep it concise and command-oriented to avoid inducing question echo in the serial output.
+        // Phrased in the model's first-person introspective voice to match internal reasoning.
         return child_fence
-            ? "\n并发推导完成。现在直接输出最终回答，不要重述问题，不要再输出标题：\n"
-            : "\n这个内容块不需要并行。直接给出最终回答，不要重述问题。\n";
+            ? "\n各并行章节的推导已经全部完成。现在我综合所有已知分析，直接给出最终完整的回答：\n"
+            : "\n这一部分无需拆分并行。现在我直接给出完整解答：\n";
     }
 
     bool rerot_set_injection(
@@ -2385,13 +2385,12 @@ private:
         slot.rerot_inflight_forced = false;
         slot.triattention_compressed = transport_it->second->triattention_compressed;
 
-        std::string open_marker = lane->control_open();
-        open_marker += server_rerot_child_contract(logical->title, lane->exit_parser.marker());
-        if (open_marker.empty() ||
-            !rerot_set_injection(
+        // The child task enters with the heading directly as its public start.
+        // The first-person introspective contract is injected in worker prompt.
+        if (!rerot_set_injection(
                 slot,
-                server_rerot_injection_kind::child_open,
-                open_marker)) {
+                server_rerot_injection_kind::heading,
+                rerot->heading_text(episode_id, node_id))) {
             return false;
         }
 

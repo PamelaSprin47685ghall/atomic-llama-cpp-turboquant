@@ -195,6 +195,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build(test-rerot-model-batch.cpp)
     llama_build(test-rerot-model-single.cpp)
     llama_build(test-rerot-model-permute.cpp)
+    llama_build(test-native-determinism.cpp)
     llama_build_and_test(test-rerot-parser.cpp ${PROJECT_SOURCE_DIR}/tools/server/server-rerot.cpp)
     target_include_directories(test-rerot-parser PRIVATE
         ${PROJECT_SOURCE_DIR}/src

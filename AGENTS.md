@@ -1,670 +1,800 @@
-# TriAttention：当前基线与剩余交付工作
+现在这条线终于可以按“**收口工程**”来规划，而不是继续根因考古。
 
-本文替代旧的设计对话导出。TriAttention 已完成基础移植、校准和受控压力验证；后续工作必须以当前实现为基线，不得重新实现已完成阶段或恢复旧的 duplicate cell tracking。
+当前基线 `7509335d1` 我会定义为：
 
-## 固定产品契约
+> **RERoT Core Correctness Candidate**：核心数学、Vulkan MoE、Turbo/F16 数值轨迹、child recurrence、final fence、response surface 都已经有很强的正确性证据；但离“atomic-llama-cpp-turboquant production-compatible RERoT”还差完整兼容矩阵、资源压力、长稳和最终性能门。
 
-TriAttention 开关语义不得改变：
-
-```text
-TriAttention OFF
-    完全保持 atomic 原有 unified KV / recurrent / RAM swap / preemption 行为
-
-TriAttention ON
-    1. fill-first：有空闲 physical KV 时保持 dense，不提前压缩
-    2. 首次 KV 压力：所有 resident eligible sequences 主动 drain 到 3/32
-    3. 已压缩 sequence sticky maintenance：增长超过 target + 128 时重新压到 target
-    4. Tri floor 耗尽后，atomic 原有 idle demotion / active preemption 才接手
-    5. recurrent-only pressure 不得触发 TriAttention KV reclaim
-```
-
-固定参数：
+整张蓝图可以压成一条主线：
 
 ```text
-target residency = 3/32 = 9.375%
-virtual factor   = 32/3 ≈ 10.67x
-recent window    = 128
-future offsets   = mean
-head aggregation = normalized max/union
-local clustering = max pool, kernel 5
-protect prefill  = false
+锁死当前正确性基线
+        ↓
+真实长任务闭合
+        ↓
+长轨迹数值确定性
+        ↓
+Tri/Turbo/MTP/RAM/context-shift 全组合
+        ↓
+多请求/共享前缀/抢占/流式/tool 等 server 语义
+        ↓
+生产级资源压力 + auto-fit
+        ↓
+质量总验收
+        ↓
+性能优化到目标
+        ↓
+长稳 soak
+        ↓
+artifact sealing + shadow/canary + production
 ```
 
-`--triattention-ratio` 只用于显式实验和 A/B；生产基线仍固定为 `3/32`。任何非默认 ratio 都必须由启动参数明确指定并记录，runtime 不得根据质量、压力或模型输出自行修改。
+下面一段一段走到底。
 
-每个 sequence 的目标：
+## Phase 0：把 `7509335d1` 封成不可随便破坏的 Golden Baseline
+
+这一阶段**不追求新功能**，只做一件事：以后任何优化都必须能证明没有破坏今天已经修好的东西。
+
+需要把现在这些证据全部转成稳定的 release gate：
+
+| 门                             | 当前状态                  | 最终应固定成                                    |
+| ----------------------------- | --------------------- | ----------------------------------------- |
+| Vulkan MoE 18/19              | 已有 hermetic test      | 永久 CTest                                  |
+| native-vs-native determinism  | 已证明                   | 18/19/20、多次重复、不同前序 shape                  |
+| RERoT vs native fixed tape    | Turbo/F16 128 step 已过 | 128/512/更长固定 tape                         |
+| mixed ubatch child recurrence | CPU/Vulkan 已过         | 永久 invariant                              |
+| response reasoning/content    | 已清洁                   | OpenAI/Responses/Anthropic 单测             |
+| random-ID close               | 已工作                   | exact-owner-only regression               |
+| final acquire fence           | 已工作                   | exactly-once regression                   |
+| PRIVATE transport             | 已隔离                   | public response 不得出现 forced PRIVATE bytes |
+
+从这一刻以后，任何性能 patch 如果让其中一项红，**直接判 patch 错，而不是调 tolerance 或改 prompt。**
+
+特别是 MoE：
 
 ```text
-target(L) = max(128, ceil(3L/32))
+18 → 19 → 20 → 18 → 19
 ```
 
-不得在 runtime 因质量担忧静默提高 residency；质量失败应阻止发布或修正实现/校准。
+现在已经是“红线测试”。
 
-## 已完成，禁止重复建设
+---
 
-### Scorer 与校准格式
+# Phase 1：先拿下真正的长任务闭合
 
-- `src/llama-triattention.{h,cpp}` 已实现纯 scorer。
-- calibration format 当前为 version 2；version 1 loader 保持兼容。
-- 已支持 Ornith/Qwen hybrid 的 partial IMRoPE；注意 IMRoPE 的 position sections
-  是 interleaved，但 ggml 的向量旋转配对仍是 NeoX/front-back half：
-  - `head_dim = 256`
-  - `rotary_dim = 64`
-  - `freq_count = 32`
-  - `rope_theta = 10,000,000`
-- `llama_kv_cells` 是唯一 physical cell metadata owner；不得恢复旧版 `cell_positions[]`、global absolute position 或独立 cell lifecycle callbacks。
-- `llama_memory_i::reclaim_kv()` 是通用 lossy reclaim 接口。
-- iSWA/hybrid wrapper 已把 reclaim 转发到 attention/base KV，recurrent memory 不参与 TriAttention。
-- sparse-position capability 已暴露，调用方不得假设 `[pos_min,pos_max]` 全连续。
-- `score_combined()` 必须使用每个 calibration entry 的 exact sampled head stats；不得再按 KV head 退化成“取第一个 sampled head”。
-- Vulkan/CPU fallback 的 runtime scoring 已按 sampled layer 批量 readback K，并让同一 KV head 的多个 Q heads 复用一次 dequant + inverse-RoPE；不得恢复 per-cell/per-head 同步 D2H。
+当前唯一明显还没完成的真实语义门，是“大洲国家”这种长、多 child 请求。
 
-### Trie calibration collector
-
-`wanxiangqi/calib/trie-triattention-calib.cpp` 已完成：
-
-- 从 `wanxiangqi/calibration/` 加载 trie；
-- DFS 每个 trie node/edge 只 decode 一次；
-- selected pre-RoPE Q 作为 graph outputs；
-- Vulkan 对全部 sampled layers 排队 async D2H；
-- 每个 decoded batch 只做一次 `llama_synchronize()`；
-- 无 per-layer graph cut 或 per-layer synchronize。
-
-2026-09 pairing/scaled-RoPE correctness 修复后，旧校准
-`7fbfcdcfc7903e11efba96d7c13bea0ae9d60ff81c75475d54ee613bae2b3cc7`
-已删除，**不再可信且不得部署**。原因：该 v2 文件的 `rope_style=1`，由旧
-collector 把 IMRoPE 的 section interleaving 错当成 even/odd vector pairing
-生成。当前 runtime 会 fail-closed 拒绝该文件；旧文件中的 `q_abs_mean` 已按
-错误 pair 聚合，不能从现有 aggregate 无损重排修复。
-
-修正后重新采集并部署的可信校准：
+之前 8192 context 的失败现在不能当算法 FAIL：
 
 ```text
-source artifact: /tmp/ornith-1.5-35b.triattention
-deployed path:   /opt/llama/data/ornith-1.5-35b.triattention
-SHA-256:         e95dae507d1f4a64e29be160c5281f8a4308a3332dc9c9176e1a3a0af32e50e2
-file size:       83,288 bytes
-format:          version 2, rope_style=0, rotary_dim=64, freq_count=32
-model:           Ornith-1.5-35B-Uncensored-YMQ-S-MTP
+8 children
+持续并发 111 s
+→ episode token budget / context hard limit
 ```
 
-源文件与部署文件已逐字节 checksum 一致。文件长度与 160 个 sampled-head
-entry 的二进制布局精确一致；10 个 full-attention layer 各包含 16 个唯一 Q
-head entry。
-
-采集结果：
+下一次应该直接用接近 production 的容量，例如：
 
 ```text
-unique trie positions = 270,952
-context resets        = 0
-sampled layer/heads   = 160 = 10 full-attention layers × 16 Q heads
-samples per entry     = 270,952
-total Q samples       = 43,352,320
-peak host snapshots   = 2.18 GiB
-full-attn layers      = 3,7,11,15,19,23,27,31,35,39
+context >= 32768
+最好直接 131072 / 262144
+--total-kv auto
+Turbo4/Turbo2
+STRONG
+默认 child direct-worker
 ```
 
-同名 `/tmp/ornith-1.5-35b.triattention` 曾存在早期 tensor-pointer 生命周期
-问题产物；该文件已删除并由上述 checksum 的新采集结果替换。不得仅凭路径
-判断可信度，必须核对 SHA-256。
-
-### Runtime pressure 与 state 行为
-
-`tools/server/server-context.cpp` 已完成并实测：
-
-- 首次 pressure drain；
-- per-slot sticky compressed state；
-- unrelated/new prompt 清除 sparse gaps 后恢复 fill-first；
-- pressure hints 包含 resident idle slots，而非只看 active slot；
-- logical length 使用 `slot.prompt.n_tokens()`，不得再叠加 `n_decoded`；
-- recurrent-only pressure 跳过 Tri reclaim；
-- floor exhausted 时先走 atomic fallback；
-- protected prefill slot 无法抢占时，以真实 available KV 限制下一批大小，避免 decode 内部半批成功后耗尽 KV；
-- prompt-cache 和手工 slot restore 可重建 sticky compressed 标记；
-- exact saved frontier 可直接继续；需要回退到旧 frontier 时，hybrid recurrent state 会安全地重新 prefill。
-
-当前日志格式可区分：
+这次验收不看“几秒结束”，而看完整生命周期：
 
 ```text
-TriAttention drain
-TriAttention maintenance
-TriAttention floor exhausted
-KV floor exhausted during prefill; limiting next batch
-active slot preemption
+root planner
+→ 8 child admitted
+→ 每个 child 自然 exact random-ID close
+→ 8/8 retired
+→ exactly one final survivor
+→ final fence prepare
+→ close-token replay exactly once
+→ serial final answer
+→ HTTP 200
+→ finish_reason=stop
 ```
 
-### 可观测性与 backend-native compaction
+最终正文要求：
 
-- `/metrics` 已暴露 `tri_drain_total`、`tri_maintenance_total`、`tri_cells_before/after/freed`、`tri_references_removed`、`tri_target_references`、`tri_hard_keep`、`tri_shared_keep`、`tri_score_seconds`、`tri_pack_seconds`、`tri_floor_exhausted_total`。
-- `tri_atomic_fallback_total{reason="kv|recurrent"}` 已按资源原因区分，Tri OFF 不计入 Tri fallback 指标。
-- `ggml_backend_tensor_memmove_regions()` 已提供 ordered memmove-style backend primitive；Vulkan 用 device-local reusable scratch 批量执行 move ranges，一组 region 只提交/等待一次。
-- `llama_kv_cache::compact()` 已改为 backend-native K/V pack；全部 backing buffer preflight 成功后才执行 data moves，全部 data move 成功后才提交 metadata。
-- 不支持 native memmove/layout 的 backend 会明确失败，不再静默走 CPU-mediated 完整 K/V 搬移。
-- Vulkan memmove scratch 已纳入 auto-fit reserve。
+* 七大洲/地区组织合理；
+* 没有串洲；
+* 没有章节死循环；
+* 没有 child 接管兄弟任务；
+* 没有 prompt echo；
+* 没有 `</think>` 等内部协议；
+* 没有随机 ID 暴露；
+* usage 与实际 token accounting 一致。
 
-### 已通过的受控验证
+如果这一步过了，可以第一次说：
 
-以下真实 Ornith runtime/smoke 记录使用的是上述旧 calibration，因此只能视为
-历史工程验证，不能作为 pairing/scaled-RoPE correctness 修复后的 release gate；
-必须在新 calibration 生成后重跑。
+> **RERoT 核心真实语义闭环通过。**
 
-1. Scorer：`build/bin/test-triattention-score`，0 failures。
-2. Cell metadata：`build/bin/test-kv-cells`，exit 0。
-3. 单槽真实模型、Vulkan、Turbo4/Turbo2：
-   - `physical KV = 2048`
-   - 3,519-token prompt
-   - 首次 `2048 -> 192`，释放 1,856 cells
-   - sticky maintenance 最终到 `ceil(3519*3/32) = 330`
-   - 输出 `STICKY_OK`
-4. 极端 fallback：
-   - `physical KV = 512`、3 slots、3 个并发 2,420-token prompts
-   - 日志确认 `Tri drain -> floor exhausted -> batch limit/preemption`
-   - 修复后全部 HTTP 200，无 `Context size exceeded`
-5. Pressure 下 streaming：
-   - assembled content 为 `STREAM_OK`
-   - 一个 `finish=stop`
-   - 一个 `[DONE]`
-   - 无重复或中断
-6. Sparse state：
-   - save/erase/restore 1,956 tokens
-   - frontier continuation `cache_n=1956`、`prompt_n=8`
-   - 继续请求耗时约 0.216 s，而非重新 prefill
-7. 生产 smoke：
-   - `/health` 返回 `{"status":"ok"}`
-   - 回复 `PROD_TRI_OK`
-   - MTP smoke 接受 15/16 draft tokens
-8. Backend-native pack primitive：
-   - `build-vulkan-localhost/bin/test-backend-memmove`
-   - AMD Radeon RX 6800 / RADV Vulkan
-   - overlap + strided regions 均通过，输出 `PASS: Vulkan backend memmove regions`
-9. 当前 delivery-candidate、真实 Ornith、Vulkan、Turbo4/Turbo2、`physical KV=2048`：
-   - 5,059-token prompt，HTTP 200
-   - initial drain：`2048 -> 192`，`score_ms=55.016`，`pack_ms=4.598`
-   - 共 1 次 drain + 7 次 sticky maintenance
-   - 全请求累计 `tri_score_seconds=0.190775`、`tri_pack_seconds=0.061720`
-   - prompt throughput 约 `901.30 tok/s`
-   - `tri_atomic_fallback_total{reason="kv"}=0`、`reason="recurrent"=0`
-10. 当前 delivery-candidate Tri OFF 轻量隔离 smoke：
-   - 同一 Ornith 模型、Vulkan、Turbo4/Turbo2，HTTP 200
-   - 启动日志不创建 Tri scorer
-   - 全部 `tri_*` counter/gauge 为 0
-11. 当前 delivery-candidate MTP + pressure smoke：
-   - 3,401-token prompt，`physical KV=2048`
-   - 1 次 drain + 3 次 maintenance
-   - 累计 `tri_score_seconds=0.105506`、`tri_pack_seconds=0.023833`
-   - 正常 `finish=stop`，答案 `4`
-   - MTP draft 接受 `16/20`，acceptance = `0.80`
-   - 无 KV/recurrent atomic fallback
-
-第一轮 512-cell fallback 测试曾复现 HTTP 500；根因是 floor 后仍构造大于 available KV 的 prefill batch。该问题已修复并用同一场景复测；失败版本不得部署。
-
-## 当前生产基线
-
-最后验证配置：
+如果不过，也不要碰 random-ID 规则。直接分类是哪一种失败：
 
 ```text
-model:       /opt/llama/data/Ornith-1.5-35B-Uncensored-YMQ-S-MTP.gguf
-service:     /etc/systemd/system/llama-server.service
-context:     262,144 per slot
-KV:          --total-kv auto
-backend:     Vulkan full offload
-K/V types:   turbo4 / turbo2
-TriAttention enabled with deployed calibration
-MTP enabled, draft max 2
+A. context/resource 不够
+B. 某 child 不 close
+C. child semantic drift
+D. final fence
+E. serial tail
+F. API assembly
 ```
 
-最近一次 auto-fit 得到：
+现在这些层已经能分开查，不需要再猜。
+
+---
+
+# Phase 2：把“数值正确”从 128 step 扩成真正的长轨迹保证
+
+虽然当前已经非常强，但 production 前我仍会补这一道。
+
+固定一份 native teacher tape，至少覆盖：
 
 ```text
-physical unified KV = 69,376 cells
-recurrent capacity  = 6 slots
-server slots         = 6
+short prompt
+19/20-token MoE threshold prompt
+9.11
+中文长 prompt
+代码 prompt
 ```
 
-Auto-fit 会随启动时可用显存变化；`69,376` 不是固定断言。启动期间 `KV size ... does not fit` 是 probe 候选失败，只有最终 `automatic unified KV capacity`、`model loaded` 和 health 才决定启动成功。
-
-当前已部署并验证的 server binary：
+然后对：
 
 ```text
-SHA-256 = 9fcd58b10b9b26c80482f1087b1e53a46933818ed81098aca06b664edc7e7694
+Turbo4/Turbo2
+F16 control
+rollback 0
+rollback >0
+不同 ubatch composition
+不同 physical row ordering
 ```
 
-注意：以上 server hash 仅作为该次验证记录。重新构建后必须以新 build/deploy checksum 一致为准，不得把此值当成永久常量。
+跑长轨迹。
 
-### 2026-09-02 delivery candidate 部署状态
+核心指标分三级。
 
-> 历史状态：下述 calibration 使用旧 `rope_style=1` pairing，已被 2026-09
-> correctness 修复判定为不兼容。不要用当前源码 + 该 calibration 启动
-> TriAttention；先重新采集并重跑 release gates。
-
-当前 build 与生产部署：
+第一层必须是：
 
 ```text
-build binary: build-vulkan-localhost/bin/llama-server
-SHA-256:      9fcd58b10b9b26c80482f1087b1e53a46933818ed81098aca06b664edc7e7694
-calibration:  /opt/llama/data/ornith-1.5-35b.triattention
-calib SHA-256: 7fbfcdcfc7903e11efba96d7c13bea0ae9d60ff81c75475d54ee613bae2b3cc7
+native vs native
+mismatch = 0
 ```
 
-生产路径 `/opt/llama/bin/llama-server` 已部署同一 binary：
+这属于确定性，不接受 tolerance。
+
+第二层：
 
 ```text
-SHA-256:          9fcd58b10b9b26c80482f1087b1e53a46933818ed81098aca06b664edc7e7694
-system fingerprint: b10724-f0b7765e7
+RERoT single-lane vs native
+argmax decision mismatch = 0
 ```
 
-`llama-server.service` 当前为 active；`/health` 返回 `{"status":"ok"}`，真实推理返回 `DEPLOY_10724_OK`。build、deployed binary 及所需 runtime libraries 已逐项校验 checksum 一致。
+这是最重要的语义数值门。
 
-用户明确要求优先轻量验证、尽快交工，因此本次收尾没有重新运行 AIME/MATH 全量 A/B、production auto-fit/full-slot 大压力、shared-prefix 三分支、完整 RAM/checkpoint/context-shift 矩阵或多小时 soak。已运行且通过的轻量交付门为：
-
-- focused `llama-server` build；
-- `test-triattention-score`：0 failures；
-- `test-kv-cells`：exit 0；
-- `test-backend-memmove`：Vulkan PASS；
-- `git diff --check`；
-- 真实 Ornith 2048-cell pressure smoke；
-- 真实 Ornith Tri OFF 隔离 smoke；
-- 真实 Ornith MTP + pressure smoke。
-
-因此当前状态是：**代码与轻量真实模型验证达到 delivery-candidate，可提交/推送；下面列出的重型门仍是正式 production release 验收项。**
-
-### 2026-09-04 RERoT 整改部署状态
-
-RERoT 整改提交与生产部署：
+第三层才看：
 
 ```text
-branch commit:   2ab7223c6
-build binary:    build-vulkan/bin/llama-server
-deployed binary: /opt/llama/bin/llama-server
-binary SHA-256:  ac626f7726386977d28e6e9316c7444e16298d45b3854210ddb1ff9a6903c740
-calibration:     /opt/llama/data/ornith-1.5-35b.triattention
-calib SHA-256:   e95dae507d1f4a64e29be160c5281f8a4308a3332dc9c9176e1a3a0af32e50e2
+logits rel L2
+layer activation error
 ```
 
-binary、`libllama-server-impl`、llama/common/mtmd 及全部 ggml CPU/Vulkan
-共享库已逐项核对 build/deploy SHA-256 一致；生产进程的 `/proc/<pid>/maps`
-确认实际从 `/opt/llama/bin` 加载这些新库，不再误用 `/opt/llama/lib` 的旧副本。
+可以有浮点差，但不能随长度无界增长，也不能越过 sampled-decision boundary。
 
-生产 unit 已：
+如果未来 Turbo 在例如 step 700 才产生 first top divergence，就停在那个 token，对 layer 做二分，而不是继续跑自然语言。
 
-- 删除违规实验参数 `--triattention-ratio 0.5`，恢复固定 `3/32`；
-- 启用 `--rerot --rerot-frontier strong`；
-- 将 `/opt/llama/bin` 放在 `LD_LIBRARY_PATH` 首位。
-
-本次启动 auto-fit 日志包含 `automatic unified KV capacity = 34816 tokens`；
-hybrid recurrent 最终为 3 个 physical slots，server 将 `-np 6` 安全收敛为
-3 个 slots，每槽 context 262,144。日志确认 `RERoT runtime armed
-(frontier=strong)`、`model loaded`；`/health` 返回 `{"status":"ok"}`。
-
-生产真实请求 `"如何减肥?"` 返回 HTTP 200、`finish_reason=stop`，包含根级
-`<ol>`、5 个公开章节、10,161 字符 reasoning 与 1,635 字符最终答案；
-共 3,747 completion tokens，wall time 约 96.97 s。MTP speculative 当前未在
-该 unit 启用；这仍是指南 Phase 1 的 correctness-first 部署，不得据此宣称
-附录 A 的 MTP/RAM/context-shift/full-slot/soak 等 production release blocker
-已经完成。
-
-### 2026-09-04 RERoT 完美终版 (Three-Capacity & Production Perfection) 交付状态
-
-指南所有阶段（Phase 0–Phase 9）、正文终版数学形态与附录 A/B 深度兼容性改造已全部实现并通过全量验证：
-
-1. **Recurrent 终版数学形态：Parallel Delta (Order-Free Block DeltaNet) 与 Hand Seed 持久化 (§14.1.2, §16.1, §16.4, §B.6)**
-   - 在 `src/llama-memory-recurrent.cpp` 实现 `commit_rbb_frontier_parallel_delta`：
-     - $N=1$ 时严格退化原生 recurrence。
-     - $N>1$ 时通过求解正则化 Gram 矩阵方程 $(G + D + \epsilon I) w = b$，保留正交并发写入分量，杜绝朴素 mean 的 $1/N$ 稀释，满足置换对称性。
-     - 二进制 hand seed 序列化/反序列化（`rerot_capture_hand_seed` / `rerot_apply_hand_seed`），在 `llama_memory_i`、hybrid wrapper 及 C API 中打通。
-     - `server_rerot_node_runtime` 引入 `hand_seed` 字段；parent fork 时冻结并下发至 child descriptors；child pen admission 时自动恢复 conv tail 与私有 R0–R2 状态；支持 episode save/load 完整持久化。
-
-2. **Final Acquire Fence、坐标冻结与 Tool Calling 恢复 (§21.4, §22, §26, §A.16)**
-   - 在 `tools/server/server-context.cpp` 的 `rerot_transport_state` 中缓存客户端原始 `saved_user_grammar`。
-   - 在 `rerot_on_final_fence` 阶段完成坐标冻结与稳定共享内存视图重构，随后调用 `server_rerot_restore_user_grammar` 恢复用户的 Tool Calling 与 JSON Schema 语法约束，重新初始化采样器无缝进入串行正文与工具调用。
-   - `task_params::rerot_effective` 明确对非生成任务（`SERVER_TASK_TYPE_EMBEDDING` 与 `SERVER_TASK_TYPE_RERANK`）绕行 RERoT，零资源占用。
-
-3. **深度兼容性矩阵：RAM Swap、Context Shift、Shared Prefix 与 Preemption (§A.8, §A.9, §A.11, §A.24, §B.8)**
-   - `server_rerot_episode_demote_to_logical` 统一解除 physical slot 与 pen binding，保留完整树形拓扑、运行 run 与 FIFO 队列用于重新接纳。
-   - 验证 shared prefix（8K 公共前缀）下 3 个独立分支并发推进：分支抢占/降级、取消（`SERVER_TASK_TYPE_CANCEL`）均精确回收所属 pen/brain，无孤儿状态，不干扰同 context 其它并行分支。
-   - Context shift 仅对未固定（非 active query run）的公开历史段执行安全裁剪。
-
-4. **VRAM-Only 三容量 Auto-Fit 与 B.14 监控指标 (§B.10, §B.14)**
-   - 在 `common/fit.cpp` 实现 `common_fit_rerot_capacities`，无显存写死或上下文写死常量，自动联合选择 `B` people、`P` pens 与 aligned 最大 `K` KV cache tokens。
-   - 暴露 §B.14 聚合指标（`rerot_people_capacity`、`rerot_pens_capacity`、`rerot_brain_bytes`、`rerot_hand_bytes`、`rerot_frontier_rows` 等）。
-
-5. **构建物 SHA-256 Checksum**
-   ```text
-   build binary: build-vulkan-localhost/bin/llama-server
-   SHA-256:      9fcd58b10b9b26c80482f1087b1e53a46933818ed81098aca06b664edc7e7694
-   libllama-server-impl.so:  2ca88ec059bcba725a1c96a6b832d72ddad2ffd7897485c3f69c6be5e1bdb93d
-   libllama.so.0.0.10788:    700d75c9551742ad042ae6fe429b81b63db90a02f573a236a90c96ac5dabce07
-   libllama-common.so.0.0.10788: 34bee5593bcf5a61888212e384f80d684de991e1cecc91a914c9aa0e9eb52e86
-   libmtmd.so.0.0.10788:     e632f7d92deb26403902a4df0c6dfaa6973d7e14723cd8ec2060d09d39d6ad55
-   libggml-vulkan.so.0.18.1: b2198c4f3cdc36ca18ffc38973126cbdeb3bae69c5b188e31d2407734b516c38
-   libggml-cpu.so.0.18.1:    6985432492209e53a7c59c8b74bb6bc75e15a41254a35ede1747d55af0d92970
-   libggml-base.so.0.18.1:   907c202d1407efdb17bd771c99e0da1d2a8bb24cc13252f507f737bc71b9a073
-   libggml.so.0.18.1:        e7992290322df18d85efe32c1d4bf5f70bfb1384bb40b33c1b10cfdd691f0070
-   ```
-
-6. **全量回归与压力测试通过结果**
-   - `ctest --test-dir build-vulkan-localhost -R rerot`: 100% tests passed (6/6)
-   - `test-arg-parser`: all tests OK
-   - `test-rerot-attn`: Vulkan GPU vs CPU ragged multi-reader grouped attention 误差 $1.1920929\times 10^{-7}$
-   - `test-rerot-runtime`: $B=6, P=18$ 重度非齐次并发 stress 测试通过，TriAttention 多人压力隔离测试通过
-   - `git diff --check`: 0 issues
-   - **生产服务真实推理压测验证**:
-     - 请求 1: `task=29054, episode=4, prompt="9.11 和 9.9 哪个大？简要回答并说明理由。"`
-       - 执行: 根级 `<ol>` 2 个任务项原子公开，动态 fork 为 2 个并行 Lane (`node=1`, `node=2`)；经 final acquire fence 坐标冻结后切入串行正文与尾部。
-       - 吞吐与延迟: HTTP 200，耗时 3.04 s，aggregate 吞吐达 **141.391 tok/s**，0 5xx、0 OOM、0 重复 stream。
-     - 请求 2: `task=29327, episode=5, prompt="比较光速和声速的本质区别，简明列出两者的核心差异。"`
-       - 执行: 根级 `<ol>` 5 个任务项原子公开，动态 fork 为 5 个并行 Lane (`node=1` 至 `node=5`)，全局 FIFO 排队接纳；全 frontier 执行 order-free RBB frontier commit 实时同步全局脑记忆；final fence 稳定重构 1,575 public bytes 坐标冻结后串行输出结构化正文。
-       - 吞吐与延迟: HTTP 200，耗时 7.96 s，生成 617 tokens (含思维链共 1,015 tokens)，aggregate 吞吐达 **127.573 tok/s**，0 5xx、0 OOM、0 重复 stream。
-     - 请求 3 (吞吐门验证 / 5 独立任务并发): `scripts/rerot-throughput-gate.py`
-       - 任务: 17×23、水的化学式、法国首都、二进制1011转十进制、地球唯一天然卫星。
-       - 结果: Serial = 108.074 tok/s，RERoT Aggregate = 147.534 tok/s (**+36.5% 吞吐提速**)。
-       - 门禁指标: `one_completed_episode=true`, `no_hard_abort=true`, `one_final_fence=true`, `visibility_accounting_exact=true`, `aggregate_faster_than_serial=true`, `parallel_faster_than_serial=true`，全项 **PASS**。
-
-7. **语义上下文平移 (Episode Semantic Context Shift, §25.2, §A.9)**
-   - 在 `tools/server/server-rerot.h/.cpp` 暴露并实现 `server_rerot_runtime::context_shift`。
-   - 在 `tools/server/server-context.cpp` 的 decode 上下文满溢处理路径中，彻底替换初级阶段的硬中断 (`hard_abort`)，接入全局语义平移：基于 `server_rerot_truncate_oldest_public` 裁剪最老非固定公共 run，结合 `llama_rerot_context_apply_shift` 前移 layout/publish epoch，使旧 MTP view stamp 自动失效并触发重采样，recurrent state 零重写，平滑完成长推理会话滑动。
-
-8. **Frontier-Boundary 笔让渡与多 Person 公平调度 (Pen Yield & Resume, §B.8.4, §B.15)**
-   - 在 `tools/server/server-rerot.h/.cpp` 实现 `suspend_pen` 与 `resume_pen`，节点进入 `ready_suspended` 状态，安全保留私有手部 conv tail/R0-R2 及 sampler/MTP 绑定，释放执行 pen 行回池。
-   - 在 `tools/server/server-context.cpp` 的 frontier 结算与接纳路径 (`rerot_handle_finished_frontier`, `rerot_admit_ready`) 接入公平让渡：当 $B > P$ 且有新 person 到达或饥饿等待时，已持有超额笔的 person 在 frontier 边界让渡笔，使新到达 person 即刻启动；待释放后优先恢复挂起节点，无代数环与模式崩溃。
-   - 在 `tests/test-rerot-runtime.cpp` 增加 `test_frontier_boundary_pen_yield_and_resume` 与 `test_multi_person_b_greater_than_p_fairness`，0 failures 验证通过。
-
-9. **二维分配形状矩阵验证 (2D Allocation Shape Matrix, §B.12.2)**
-   - 实现 `scripts/rerot-capacity-matrix.py`，完整覆盖三类核心分配形状：
-     1. `all_pens_one_person` (单人多笔并发 fork): 268 tok, 4.41 s (60.83 tok/s)
-     2. `balanced_across_people` (双人均衡多笔并发): 524 tok, 7.72 s (67.87 tok/s)
-     3. `one_pen_per_person` (独立单笔请求密集并发): 333 tok, 4.84 s (68.84 tok/s)
-   - 结果：全量形状 **ALL SHAPES PASSED**，累计完成 5 个端到端推理 episode，0 5xx、0 hard abort、0 deadlock、0 orphan state，端到端吞吐达 **60.8–68.8 tok/s**，吞吐与时延表现平稳。
-
-10. **终版 Pen Arena 容量初始化与多 Person 零单例彻底解耦 (§B.4, §B.5, §B.8, §B.14, DoD B.16)**
-   - 在 `server_rerot_runtime` 构造函数自动初始化 `pens_`，并在 `server_context_impl::init` 显式调用 `rerot->set_pen_capacity(pen_cap)`，修复 pen arena 默认容量为 0 的缺陷。
-   - 彻底解除 `server_context_impl::rerot_episode_id` 单例假设，`rerot_active()`、`rerot_active_episode()`、`rerot_erase_episode()`、`rerot_propagate_hard_abort()` 与 `clean_up()` 均以 `rerot_transport` 和多 episode 粒度全生命周期协同推进，支持多 Person 独立并发推进。
-   - 在 `SERVER_TASK_TYPE_METRICS` 完整暴露 `rerot_people_capacity`、`rerot_people_resident`、`rerot_people_runnable`、`rerot_people_waiting`、`rerot_brain_bytes`、`rerot_hand_bytes` 与 `rerot_grouped_scratch_bytes`。
-   - 在 `tests/test-rerot-runtime.cpp` 新增 `test_pen_capacity_and_multi_episode_allocation` 覆盖构造函数容量注入、显式扩容、双 Person 根节点分配、笔让渡、槽位释放与跨槽位恢复，全量 7/7 CTest 自动化测试 100% 通过。
-
-11. **负反馈二分探测与自适应 KV Auto 闭环 (§B.10)**
-   - 彻底移除硬编码候选数组，改用基准探测测得物理 $K_1$ 并确立 $B_{\max} = \min(\text{LLAMA\_MAX\_SEQ}/6, \lfloor K_1 / E_K \rfloor)$。
-   - 实施负反馈二分搜索：显存过载拉低上界，实测 $K$ 产生实际支撑力反馈 $B_{\text{supported}} = \lfloor K / E_K \rfloor$ 实时纠偏收敛；固定每人 6 笔预算，运行时先到先得弹性借调，单人全窗保底。
-
-## 剩余发布阻断项
-
-以下工作未完成。按顺序处理；不得以短 health request 替代。
-
-### P0：Tri OFF 零回归
-
-使用同一模型、prompt、seed 和采样参数比较旧基线与新 binary 的 Tri OFF：
-
-- greedy 输出一致；
-- unified KV、recurrent fitting、RAM prompt cache、preemption 行为不变；
-- 不创建 scorer；
-- 不分配 Tri scratch；
-- 不启用 sparse semantics；
-- 无显著吞吐或显存回退。
-
-必须增加可重复的自动化回归，而不是只做人工 smoke。
-
-### P0：Ornith 质量 A/B
-
-固定 `3/32`，比较 FullKV 与 TriAttention：
-
-- AIME24/25；
-- MATH-500；
-- 长上下文 retrieval/needle；
-- 多轮聊天；
-- 代码仓库问答；
-- 真实生产 prompt 样本。
-
-要求：
-
-- 同一模型、模板、seed、采样和输出预算；
-- 保存每题输出和评分，不只报平均值；
-- 质量断崖阻止发布；
-- 不允许通过提高 residency 隐藏实现问题。
-
-当前 calibration correlation 只能证明采集一致性，不能替代任务质量评测。
-
-### P0：真实 production auto-fit KV、全 slot 压力
-
-在 shadow instance 或维护窗口运行与生产完全相同的模型、MTP、Turbo K/V 和 Vulkan 配置，使总 resident KV 明确超过最终 auto-fit capacity。
-
-建议至少：
+做到这一点后，过去那种：
 
 ```text
-6 concurrent slots
-每槽约 12K+ logical tokens
-总 resident history > 最终 auto-fit capacity（最近一次为 69,376）
+“输出坏了，是模型语义还是 kernel 数值？”
 ```
 
-验收：
+基本就可以从项目里消失。
 
-- 第一次压力先 Tri drain；
-- 每个 compressed seq 保持 `max(128,ceil(3L/32))` 加合法 shared/hard guards；
-- floor 前无 idle demotion/active preemption；
-- floor 后 atomic fallback 能完成所有请求；
-- MTP checkpoint/rollback 正常；
-- streaming 无重复 token；
-- 无 5xx、OOM、死锁或服务重启。
+---
 
-### P0：shared-prefix / multi-sequence union
+# Phase 3：重新认证 TriAttention + Turbo + unified KV
 
-当前真实压力测试的 `shared_keep=0`，未覆盖 shared physical cells。
+注意这里说的是**重新认证**，很多实现历史上已经有，不是全部重写。
 
-构造至少三个 sequence：
+最近底层经历过：
+
+* MoE routing reset；
+* attention shader precision；
+* F32 recurrent hand；
+* recurrent row semantics；
+* response handling。
+
+因此以前的兼容测试不能全部自动继承。
+
+需要重新走四个主组合：
 
 ```text
-共同 8K prefix
-├─ branch A
-├─ branch B
-└─ branch C
+RERoT + FullKV
+RERoT + Turbo
+RERoT + Tri
+RERoT + Tri + Turbo
 ```
 
-验收：
-
-- `shared_keep > 0`；
-- 一个 sequence 的淘汰不得删除另一个 sequence 的 keep reference；
-- physical keep-set 等于所有 per-seq keep-set 的并集；
-- `references_removed` 与 `physical_freed` 分开核算；
-- 三个 sequence 输出无交叉污染；
-- compaction 后 shared refs、positions、K/V bytes 不变。
-
-### P0：runtime scoring/compaction 性能（核心路径已完成，待 production-scale 大 drain 门）
-
-旧实现的受控结果：
+Tri 重点不只是“能回答”：
 
 ```text
-3,519-token、单次 drain 的旧行为：约 21.8 s
-正确 sticky maintenance：             约 40.3 s
+initial drain
+sticky maintenance
+3/32 target
+backend-native compaction
+shared physical cell union
+sparse position reader
 ```
 
-当前 delivery-candidate 已完成：
+都必须正确。
 
-- Vulkan/backend-native stable pack；
-- 批量执行 move ranges；
-- 不把完整 K/V 搬到 CPU；
-- 不做 per-layer/per-move synchronize；
-- K/V 全部成功后再提交 metadata；
-- 使用实际 tensor `type/ne/nb`，支持 Turbo padding 和 V layout；
-- pack 后 `used_max_p1 == used`；
-- scoring/pack scratch 纳入 auto-fit reserve；
-- runtime `score_ms` / `pack_ms` 已进入日志和 metrics；
-- sampled-head exact aggregation bug 已修复并增加回归测试；
-- Vulkan fallback scoring 已从 per-cell/per-head D2H 改为 per-layer bulk snapshot + KV-head reuse。
-
-当前 2,048-cell 真实 Ornith 压力下，8 次 reclaim 的累计 scoring/pack 约为 `0.191 s / 0.062 s`；MTP 场景 4 次 reclaim 为 `0.106 s / 0.024 s`。剩余性能发布门只有：
-
-- 首次真实 production-scale drain 不 OOM；
-- 在最终 production auto-fit 配置下记录首次大 drain 的 score/pack wall time，并确认没有显著吞吐断崖。
-
-Vulkan 是当前发布目标。其他 backend 未支持时必须明确失败，不得静默走极慢或错误路径。
-
-### P1：recurrent-only pressure 实测
-
-代码已增加 KV/recurrent pressure gate，但缺少强制 recurrent shortage 的运行测试。
-
-验收：
-
-- KV capacity 足够、recurrent capacity 不足；
-- 日志中没有 Tri drain/maintenance；
-- 直接进入原 recurrent victim handling；
-- 请求最终完成。
-
-### P1：sparse state 与 RAM swap 完整矩阵
-
-Exact-frontier 手工 save/restore 已通过，仍需覆盖：
-
-- server idle slot 自动 RAM demotion；
-- RAM restore 到不同 physical indices；
-- MTP speculative checkpoint；
-- partial rollback；
-- context shift；
-- prompt LCP/cache-key reuse；
-- 多次 save/restore 后继续 sticky maintenance。
-
-增加持久 metadata 或等价校验：
-
-```text
-layout = sparse
-policy = triattention
-target = 3/32
-recent_window = 128
-calibration fingerprint
-```
-
-不匹配的 sparse state 必须拒绝，不得当成 FullKV state 加载。
-
-### P1：长稳测试
-
-至少运行：
-
-```text
-100 次 drain/maintenance
-20 次 save/erase/restore
-10 次 floor-exhaustion/preemption
-全部 fitted slots 持续多小时
-```
-
-验收：
-
-- 无 Vulkan validation error；
-- 无 CPU/GPU memory leak；
-- warmup 后 VRAM 不持续增长；
-- 无 stale tensor/readback；
-- 无服务重启；
-- 每条 stream 恰好一个终止事件；
-- 每个请求的 predict budget 在 retry 后不丢失。
-
-## 必须保持的不变量
-
-### KV metadata
-
-```text
-llama_kv_cells 是唯一 metadata owner
-empty cell 没有 seq refs
-non-empty cell 至少有一个 seq ref
-seq_get_used(seq) 等于实际引用数
-get_kv_used() 统计 physical cells，不统计 references
-```
-
-### Tri target
-
-```text
-resident_refs(seq) <= max(128,ceil(3*logical_tokens/32))
-```
-
-允许超过 reference target 的原因只能明确归因于 hard/in-flight guards。Shared physical cells影响 physical freed 数，不能伪装成 reference target。
-
-### Compaction
-
-```text
-retained cell 的 position/ext/seq refs/K bytes/V bytes 前后不变
-occupied physical indices = [0,used)
-used_max_p1 == used
-metadata 只在所有 data moves 成功后提交
-```
-
-### Fallback 顺序
+另外必须单独验证 fallback 顺序：
 
 ```text
 KV pressure:
-    full Tri drain
-    -> refresh usage
-    -> sticky floor confirmed exhausted
-    -> idle demotion / active preemption
+Tri reclaim
+→ refresh
+→ floor exhausted
+→ atomic demotion/preemption
 
 recurrent-only pressure:
-    不调用 Tri
-    -> 原 recurrent fallback
+禁止调用 Tri
+→ recurrent fallback
 ```
 
-### Fill-first 与 sticky
+不能因为最近 RERoT 改动重新把资源类型混掉。
+
+---
+
+# Phase 4：MTP / speculative decoding
+
+这是完整 production 兼容的第一块大状态组合。
+
+原则非常清楚：
 
 ```text
-新 sequence：首次 physical pressure 前保持 dense
-已压缩 sequence：resident > target + 128 时 maintenance
-unrelated prompt 清除 sparse state 后重新 fill-first
-restored exact frontier 继续保持 sticky
+MTP draft
+必须绑定：
+topology epoch
+publish epoch
+layout epoch
+reader view
 ```
 
-## 快速回归配方
-
-### 首次 drain + sticky
+只要 peer publish、fork、context shift 等让 view 改变：
 
 ```text
--c 8192 --total-kv 2048 -np 1 -b 512 -ub 256
+旧 draft invalid
+→ reject / rollback
+→ 重新 draft
 ```
 
-使用约 3,519-token prompt。预期：
+不得让 speculative token 穿越未提交 frontier。
+
+要逐项验：
 
 ```text
-2048 -> 192 initial drain
-后续 maintenance 最终 target = 330
-HTTP 200
+RERoT + MTP no peer update
+RERoT + MTP peer update
+RERoT + MTP fork barrier
+RERoT + MTP rollback
+RERoT + MTP Tri pressure
+RERoT + MTP final fence
 ```
 
-### Floor exhausted + fallback
+最终还应该有真实 Ornith acceptance-rate 数据。
+
+但 acceptance rate 再低也只是性能问题；**首先保证 target 结果与 MTP OFF 一致。**
+
+---
+
+# Phase 5：RAM / checkpoint / rollback / prompt cache / context shift
+
+这是我认为整个 production 兼容里最容易藏状态 bug 的一层。
+
+现在 state 不只是 token tape，而是：
 
 ```text
--c 4096 --total-kv 512 -np 3 -b 384 -ub 128
+tree topology
+document runs
+PUBLIC/PRIVATE/PENDING
+random child IDs
+reader views
+frontier epochs
+brain
+F32 hand
+conv / R0-R2
+sampler RNG
+MTP checkpoint
+final-fence state
 ```
 
-并发三个约 2,420-token prompts。预期：
+RAM save/restore 必须保存的是**episode 语义**，不能只恢复 server slot。
+
+最低门：
 
 ```text
-Tri drain
--> floor exhausted
--> prefill batch limit 和/或 preemption
--> 所有请求 HTTP 200
+fork
+→ children running
+→ demote
+→ RAM save
+→ physical slots 被其他请求占用
+→ restore 到不同 physical indices
+→ 继续生成
 ```
 
-### Streaming
+结果必须与 uninterrupted reference 相同。
 
-在 pressure 配置下组装全部 SSE delta。要求：
+checkpoint / partial rollback 则要特别覆盖：
 
 ```text
-finish_reason = stop
-[DONE] count = 1
-无重复 content
+snapshot plane
+child native recurrent
+PUBLIC brain
+PRIVATE root brain
+F32 hand
+conv
 ```
 
-### Sparse restore
+context shift 必须理解成：
 
 ```text
-drain -> slot save -> erase -> restore -> append from exact saved frontier
+logical history deletion
 ```
 
-要求：恢复后的 `cache_n` 等于 saved frontier，`prompt_n` 只包含新增 suffix。
+而不是 Tri eviction。
 
-## 最终 Definition of Done
+shift 后要同步更新：
 
-只有以下全部成立才可宣布完整交付：
+```text
+document run coordinates
+reader PAC-DFS view
+KV positions
+epochs
+MTP invalidation
+```
 
-1. Tri OFF 自动化零回归通过。
-2. Ornith FullKV vs 3/32 质量 A/B 无断崖。
-3. 真实 production auto-fit/full-slot/MTP/Vulkan 压力通过。
-4. shared-prefix union 测试通过。
-5. recurrent-only pressure 不调用 Tri。
-6. runtime scoring/pack 达到明确性能门且首次大 drain 不 OOM。
-7. RAM swap、checkpoint、rollback、context shift 矩阵通过。
-8. metrics 可观测，fallback 原因可区分。
-9. 长稳测试无泄漏、死锁、5xx 或 stream 重复。
-10. 最终 build、部署 binary、校准文件 checksum 一致；生产 health 和真实推理通过。
+这部分通过后，RERoT 才真正能跑长会话，而不是只能一次性回答。
+
+---
+
+# Phase 6：Server 外层语义矩阵
+
+核心算法正确之后，再证明它能和整个 server 共存。
+
+正式矩阵至少包括：
+
+| 能力                | 必须证明                        |
+| ----------------- | --------------------------- |
+| multi-person      | 多独立请求不串状态                   |
+| B > P             | queued child + pen fairness |
+| `n_cmpl > 1`      | 外层 completion 不互相污染         |
+| shared-prefix     | prefix refs 与内层 RERoT 正确组合  |
+| idle demotion     | 可恢复                         |
+| active preemption | victim 后继续                  |
+| cancellation      | 无 orphan                    |
+| retry             | 不重复 token                   |
+| streaming         | 无重复 delta，恰好一个终止事件          |
+| tool calling      | final fence 后恢复用户 grammar   |
+| JSON schema       | 同上                          |
+| LoRA/aLoRA        | lineage/adapter 不串          |
+| multimodal        | shared prelude 后安全 fork     |
+| embedding/rerank  | 全局开 RERoT 时完全绕过             |
+| graph reuse       | input lifetime 不 stale      |
+| pipeline parallel | span/frontier buffer 生命周期正确 |
+
+这里最重要的一条不变量还是：
+
+> **scheduler 的行为不能改变数学。**
+
+换 slot、排队、preempt、不同 batch packing，只能影响**什么时候运行**，不能影响**算什么**。
+
+---
+
+# Phase 7：生产级压力 / auto-fit
+
+到这里才开始真正“折磨服务器”。
+
+规划指南里最有价值的终极压力形状其实已经写好了：
+
+```text
+RERoT
++ 6 outer slots
++ recursive forks
++ queued children
++ Tri pressure
++ Turbo4/Turbo2
++ MTP
++ streaming
++ 至少一次 RAM demotion/restore 或 active preemption
+```
+
+一次测试里同时让这些机制发生。
+
+验收必须全部满足：
+
+```text
+0 5xx
+0 OOM
+0 deadlock
+0 Vulkan validation error
+0 orphan seq ref
+0 orphan recurrent cell
+0 duplicate SSE
+每请求 exactly one terminal event
+hard abort / natural final 可明确区分
+```
+
+然后单独压 shared-prefix：
+
+```text
+8K common prefix
+├ A
+├ B
+└ C
+```
+
+保证 physical cell union 正确。
+
+最后核 auto-fit。
+
+当前 auto-fit 不只是：
+
+```text
+KV
+```
+
+而是必须同时为：
+
+```text
+B people
+P pens
+K physical KV
+RERoT hand/brain
+DDVR scratch
+Tri scoring/pack scratch
+MTP scratch
+Vulkan temporary buffers
+```
+
+预留空间。
+
+如果 auto-fit 算出来能装，真实运行就不能再 OOM。
+
+---
+
+# Phase 8：质量总验收
+
+这时不要只测 3 个 demo。
+
+我会冻结一组多层级质量集。
+
+确定性微题：
+
+```text
+9.11 vs 9.9
+整数运算
+简单逻辑
+短事实
+```
+
+必须 100% 正确。
+
+代码：
+
+```text
+Python
+C++
+算法题
+小型 repo QA
+```
+
+至少做：
+
+```text
+compile / syntax
+unit tests
+结果正确
+```
+
+数学正式 benchmark：
+
+```text
+MATH-500
+AIME24/25
+```
+
+长上下文：
+
+```text
+needle/retrieval
+长文总结
+大洲国家
+多章节问答
+```
+
+真实生产 prompt 样本也要进入。
+
+每题都保存：
+
+```text
+prompt
+seed
+config
+answer
+reasoning
+usage
+artifact hashes
+```
+
+不要只报一个平均分。
+
+这里比较的重点不是“RERoT 必须逐 token 等于 serial”，那不现实；而是：
+
+> **RERoT 不能因为并行架构造成任务质量断崖。**
+
+阈值要在跑 benchmark **之前**写死，不能看到分数后再改门槛。
+
+---
+
+# Phase 9：性能阶段正式开始
+
+只有前面全部绿，我才允许大规模性能改动。
+
+正式 production 配置固定：
+
+```text
+Ornith 1.5 35B
+Vulkan
+Turbo4/Turbo2
+Tri 3/32
+MTP ON
+RERoT STRONG
+production auto-fit
+```
+
+然后测：
+
+```text
+serial tok/s
+RERoT aggregate tok/s
+parallel model tok/s
+prefill tok/s
+p50 latency
+p95 latency
+VRAM peak
+frontier barrier cost
+attention cost
+recurrent cost
+MoE cost
+MTP acceptance
+```
+
+之前的目标 **>= 500 tok/s** 应该明确成：
+
+> **标准化多-Lane workload 下 aggregate model throughput >= 500 tok/s，且不能通过少生成、改 prompt、降低质量或取消机制获得。**
+
+性能优化顺序我会遵循“收益/风险比”。
+
+先动：
+
+```text
+不必要 synchronize
+graph rebuild
+metadata upload
+small dispatch
+重复 gather/scatter
+```
+
+再动：
+
+```text
+multi-reader DDVR 的 shared physical KV scan
+一次 K/V load 服务多 Q reader
+Turbo dequant reuse
+frontier batch packing
+```
+
+再看：
+
+```text
+MTP acceptance / draft scheduling
+MoE route reuse
+kernel fusion
+```
+
+任何 MoE route cache 优化现在都必须过刚新增的 18/19 hermetic test。
+
+性能阶段最重要的纪律：
+
+```text
+每一个 perf patch
+→ fixed-tape numerical gate
+→ RERoT CTest
+→ semantic microset
+→ 再看 benchmark
+```
+
+不能攒 20 个优化最后才发现语义坏了。
+
+---
+
+# Phase 10：长稳 Soak
+
+达到性能目标之后还不能 deploy。
+
+至少需要一轮真正的 soak：
+
+```text
+连续 full-slot 请求
+多次 fork / close
+Tri drain / maintenance
+MTP accept / rollback
+RAM save / restore
+preemption
+context shift
+shared prefix
+cancel / retry
+stream
+```
+
+重点监控：
+
+```text
+CPU RSS
+VRAM used
+allocated buffers
+recurrent used rows
+KV refs
+people/pens
+orphan count
+Vulkan errors
+```
+
+warmup 后内存必须进入平台，不得持续上涨。
+
+最终要证明：
+
+```text
+无 leak
+无 stale tensor
+无死锁
+无偶发 nondeterminism
+无服务重启
+```
+
+---
+
+# Phase 11：Release Candidate Artifact Sealing
+
+到这一步开始禁止“我本地跑的是 A，部署时变成 B”。
+
+每个 RC 保存：
+
+```text
+Git HEAD
+git status
+compiler
+CMake config
+llama-server --version
+
+SHA-256:
+llama-server
+libllama-server-impl
+libllama
+libggml
+libggml-vulkan
+libggml-cpu
+libllama-common
+libmtmd
+
+model SHA/fingerprint
+Tri calibration SHA
+systemd unit
+完整启动参数
+```
+
+然后在**同一 artifact**上跑 release gates。
+
+如果 rebuild：
+
+> 旧验收立即失效。
+
+这正是 build 10794 那次给项目留下的最大教训。
+
+---
+
+# Phase 12：Shadow → Canary → Production
+
+最后发布不要直接覆盖 production。
+
+先 shadow：
+
+```text
+同 production model/config
+不接真实用户流量
+全 release smoke
+```
+
+再 canary：
+
+```text
+少量真实请求
+重点观察：
+5xx
+OOM
+finish
+latency
+VRAM
+RERoT metrics
+Tri metrics
+MTP acceptance
+```
+
+确认没有异常后再全量。
+
+production 启动后重新核：
+
+```text
+/proc/PID/maps
+```
+
+确保实际加载的是刚刚验收的 `.so`，而不是某个 `/opt/llama/lib` 旧副本。
+
+最后跑：
+
+```text
+health
+9.11
+代码题
+长题
+stream
+tool call
+并发压力
+```
+
+并保留上一 RC 的完整 rollback artifact。
+
+---
+
+# 最终什么才叫“完整交付”
+
+规划指南现在给的是 **30 个 production DoD 硬门**。我把它浓缩成六句话：
+
+```text
+数学正确。
+同一个 logical computation 不因 backend/batch/scheduler 改方程。
+
+语义正确。
+长短任务都能自然 fork/close/fence/finalize。
+
+生态兼容。
+Tri/Turbo/MTP/RAM/context-shift/preemption/shared-prefix/tool/stream 全工作。
+
+资源正确。
+auto-fit、压力、fallback、恢复都不 OOM、不丢状态。
+
+性能达标。
+标准 production workload aggregate >= 500 tok/s，质量不退。
+
+工程可发布。
+长稳通过，artifact checksum 锁死，shadow/canary/production 同一套二进制。
+```
+
+达到这里，才可以把标签从：
+
+```text
+RERoT research/core correctness candidate
+```
+
+正式改成：
+
+```text
+atomic-llama-cpp-turboquant
+production-compatible RERoT
+```
+
+而从今天 `7509335d1` 的位置看，**最危险的“数学到底对不对 / Vulkan 为什么会生成垃圾”阶段基本已经过去了。下一段最关键的是 Phase 1 的生产上下文长题闭合；它一旦通过，就应该立即转入兼容矩阵，而不是继续打磨 prompt。**
