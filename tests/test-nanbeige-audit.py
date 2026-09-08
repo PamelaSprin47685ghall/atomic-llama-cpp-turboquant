@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import struct
 import tempfile
 from types import SimpleNamespace
@@ -529,6 +530,132 @@ class AuditTests(unittest.TestCase):
         report = audit.inspect_build_artifacts(binary)
         self.assertEqual(len(report["stale_objects"]), 1)
         self.assertIn("missing", report["errors"][0])
+
+    def link_fixture(self):
+        source = self.root / "source"
+        build = self.root / "build with spaces"
+        source.mkdir()
+        binary = build / "bin/llama-server"
+        binary.parent.mkdir(parents=True)
+        targets = [build / "tools/server/CMakeFiles" / (name + ".dir")
+                   for name in ("server-context", "llama-server-impl", "llama-server")]
+        for target in targets:
+            target.mkdir(parents=True)
+        (build / "CMakeCache.txt").write_text(f"CMAKE_HOME_DIRECTORY:INTERNAL={source}\n")
+        header = source / "server-task.h"
+        header.write_text("current task layout")
+        obj = targets[0] / "task payload.cpp.o"
+        obj.write_bytes(b"current object")
+        Path(str(obj) + ".d").write_text(f"task.o: {header}\n")
+        archive = build / "tools/server/libserver-context.a"
+        member = (b"task.o/".ljust(16) + b"0".ljust(12) + b"0".ljust(6)
+                  + b"0".ljust(6) + b"100644".ljust(8) + b"4".ljust(10) + b"`\nold!")
+        archive.write_bytes(b"!<arch>\n" + member)
+        library = binary.parent / "libllama-server-impl.so"
+        library.write_bytes(b"linked library")
+        binary.write_bytes(b"linked executable")
+        quote = shlex.quote
+        recipes = [
+            f"/usr/bin/ar qc {quote(str(archive))} {quote(str(obj))}\n"
+            f"/usr/bin/ranlib {quote(str(archive))}\n",
+            f"/usr/bin/c++ -shared -o {quote(str(library))} {quote(str(archive))}\n",
+            f"/usr/bin/c++ -o {quote(str(binary))} {quote(str(library))}\n",
+        ]
+        for target, recipe in zip(targets, recipes):
+            link = target / "link.txt"
+            link.write_text(recipe)
+            os.utime(link, ns=(10**9, 10**9))
+        for timestamp, path in enumerate((header, obj, archive, library, binary), 1):
+            os.utime(path, ns=(timestamp * 10**9, timestamp * 10**9))
+        return binary, obj, archive, library, targets
+
+    def test_build_preflight_checks_each_link_in_the_runtime_chain(self):
+        binary, obj, archive, library, _ = self.link_fixture()
+        for changed, consumer, timestamp in ((obj, archive, 4), (archive, library, 5),
+                                              (library, binary, 6)):
+            with self.subTest(changed=changed):
+                original = changed.stat().st_mtime_ns
+                os.utime(changed, ns=(timestamp * 10**9, timestamp * 10**9))
+                report = audit.inspect_build_artifacts(binary)
+                self.assertEqual(report["stale_objects"], [])
+                self.assertTrue(report["errors"], "fresh objects cannot excuse a stale link")
+                self.assertEqual(report["stale_links"][0]["artifact"], str(consumer))
+                os.utime(changed, ns=(original, original))
+        report = audit.inspect_build_artifacts(binary)
+        self.assertEqual(report["errors"], [])
+        self.assertEqual(report["checked_links"], 3)
+
+    def test_build_preflight_rejects_missing_link_inputs_and_outputs(self):
+        binary, _, archive, library, _ = self.link_fixture()
+        for missing in (archive, library):
+            with self.subTest(missing=missing):
+                data, timestamp = missing.read_bytes(), missing.stat().st_mtime_ns
+                missing.unlink()
+                report = audit.inspect_build_artifacts(binary)
+                self.assertTrue(report["errors"])
+                reasons = {entry["reason"] for entry in report["stale_links"]}
+                self.assertIn("missing output", reasons)
+                self.assertIn("missing dependency", reasons)
+                missing.write_bytes(data)
+                os.utime(missing, ns=(timestamp, timestamp))
+
+    def test_build_preflight_reads_link_response_files_without_execution(self):
+        binary, obj, archive, _, targets = self.link_fixture()
+        response = targets[0] / "objects.rsp"
+        response.write_text(shlex.quote(os.path.relpath(obj, targets[0].parents[1])))
+        os.utime(response, ns=(10**9, 10**9))
+        link = targets[0] / "link.txt"
+        link.write_text('/usr/bin/ar qc libserver-context.a @CMakeFiles/server-context.dir/objects.rsp\n')
+        os.utime(link, ns=(10**9, 10**9))
+        self.assertEqual(audit.inspect_build_artifacts(binary)["errors"], [])
+        os.utime(response, ns=(4 * 10**9, 4 * 10**9))
+        report = audit.inspect_build_artifacts(binary)
+        self.assertTrue(report["errors"])
+        self.assertEqual(report["stale_links"][0]["artifact"], str(archive))
+        self.assertEqual(report["stale_links"][0]["dependency"], str(response))
+        for contents in (None, '@CMakeFiles/server-context.dir/objects.rsp'):
+            with self.subTest(contents=contents):
+                if contents is None:
+                    response.unlink()
+                else:
+                    response.write_text(contents)
+                self.assertTrue(audit.inspect_build_artifacts(binary)["errors"])
+
+    def test_build_preflight_rejects_unreadable_link_recipes(self):
+        binary, _, _, _, targets = self.link_fixture()
+        for recipe in ("", "/usr/bin/c++ -o\n", "/usr/bin/c++ -o first -o second\n",
+                       "unterminated 'quote", "unknown-command\n"):
+            with self.subTest(recipe=recipe):
+                (targets[0] / "link.txt").write_text(recipe)
+                report = audit.inspect_build_artifacts(binary)
+                self.assertTrue(report["errors"])
+                self.assertTrue(report["link_errors"])
+
+    def test_build_preflight_reports_missing_link_metadata_coverage(self):
+        binary, _, _, _, targets = self.link_fixture()
+        for target in targets:
+            (target / "link.txt").unlink()
+        report = audit.inspect_build_artifacts(binary)
+        self.assertEqual(report["checked_links"], 0)
+        self.assertEqual(report["errors"], [])
+
+    def test_stale_link_failure_is_saved_before_model_startup(self):
+        binary, obj, _, _, _ = self.link_fixture()
+        os.utime(obj, ns=(4 * 10**9, 4 * 10**9))
+        config = self.root / "configs.json"
+        config.write_text(json.dumps([self.config]))
+        with mock.patch.object(audit, "model_fingerprint") as model, \
+                mock.patch.object(audit.subprocess, "Popen") as process, \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = audit.main(["probe", "--server", str(binary), "--model", str(binary),
+                               "--configs", str(config), "--out", str(self.root / "results")])
+        self.assertEqual(code, 1)
+        saved = json.loads((self.root / "results/case.json").read_text())
+        self.assertEqual(saved["status"], "failed")
+        self.assertEqual(saved["config"], self.config)
+        self.assertIn("stale linked artifact", saved["error"])
+        model.assert_not_called()
+        process.assert_not_called()
 
     def test_build_preflight_rejects_duplicate_static_archive_members(self):
         source = self.root / "source"

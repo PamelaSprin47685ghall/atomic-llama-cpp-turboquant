@@ -87,6 +87,62 @@ def _make_dependencies(dep_file):
     return shlex.split(dependencies) if "\\ " in dependencies else dependencies.split()
 
 
+def _cmake_link_inputs(link_file):
+    """Read CMake Makefile link metadata without executing its commands.
+
+    Paths are relative to the target's binary directory, not CMakeFiles.
+    System libraries selected with -l are outside this local freshness check.
+    """
+    working_dir = link_file.parents[2]
+    dependencies = {link_file}
+
+    def local_path(value):
+        return Path(os.path.abspath(working_dir / value))
+
+    def expand(arguments, stack=()):
+        result = []
+        for argument in arguments:
+            if not argument.startswith("@"):
+                result.append(argument)
+                continue
+            response = local_path(argument[1:])
+            if response in stack or len(stack) >= 8:
+                raise ValueError("cyclic or excessively nested link response file: " + str(response))
+            dependencies.add(response)
+            result.extend(expand(shlex.split(response.read_text(encoding="utf-8")), stack + (response,)))
+        return result
+
+    outputs = []
+    for line in link_file.read_text(encoding="utf-8").splitlines():
+        arguments = expand(shlex.split(line))
+        if not arguments:
+            continue
+        tool = Path(arguments[0]).name
+        if re.fullmatch(r"(?:.*-)?ranlib(?:-\d+)?", tool):
+            continue
+        if "-o" in arguments:
+            if arguments.count("-o") != 1:
+                raise ValueError("ambiguous link output in " + str(link_file))
+            output_index = arguments.index("-o") + 1
+            if output_index >= len(arguments) or arguments[output_index].startswith("-"):
+                raise ValueError("missing link output in " + str(link_file))
+        elif re.fullmatch(r"(?:.*-)?ar(?:-\d+)?", tool):
+            output_index = next((i for i in range(1, len(arguments))
+                                 if arguments[i].endswith(".a") and not arguments[i].startswith("-")), None)
+            if output_index is None:
+                raise ValueError("missing archive output in " + str(link_file))
+        else:
+            raise ValueError("unsupported link recipe in " + str(link_file))
+        outputs.append(local_path(arguments[output_index]))
+        for index, argument in enumerate(arguments[1:], 1):
+            if index != output_index and not argument.startswith("-") and re.search(
+                    r"\.(?:o|obj|a|lib|dylib|so(?:\.[\w.-]+)?)$", argument):
+                dependencies.add(local_path(argument))
+    if len(outputs) != 1:
+        raise ValueError("expected one link output in " + str(link_file))
+    return outputs[0], sorted(dependencies)
+
+
 def _archive_members(path):
     """Read member names from a regular GNU/BSD ar archive without invoking ar."""
     data = path.read_bytes()
@@ -190,8 +246,9 @@ def inspect_build_artifacts(binary, env=None):
     """Fail-closed evidence for build-tree binaries before model startup.
 
     Normal CMake target builds rebuild objects whose local dependencies are
-    newer and remove static archives before ``ar qc``. Manual object relinks or
-    direct execution of a generated ``link.txt`` can bypass both guarantees,
+    newer, relink their consumers, and remove static archives before ``ar qc``.
+    Manual object relinks or direct execution of a generated ``link.txt`` can
+    bypass these guarantees,
     leaving translation units compiled against different C++ layouts. Detect
     those states before spending GPU time or trusting benchmark output.
     """
@@ -200,7 +257,7 @@ def inspect_build_artifacts(binary, env=None):
     cache = build_root / "CMakeCache.txt"
     server_cmake = build_root / "tools" / "server" / "CMakeFiles"
     report = {"checked": False, "build_root": str(build_root), "checked_objects": 0, "stale_objects": [],
-              "duplicate_archive_members": {}}
+              "duplicate_archive_members": {}, "checked_links": 0, "stale_links": [], "link_errors": []}
     if binary.parent.name != "bin" or not cache.is_file() or not server_cmake.is_dir():
         report["reason"] = "server is not inside a CMake build tree"
         return report
@@ -265,6 +322,34 @@ def inspect_build_artifacts(binary, env=None):
                     })
                     break
 
+        # Fresh objects do not prove that their archives or downstream shared
+        # libraries/executables have actually been relinked.
+        link_file = object_dir / "link.txt"
+        if not link_file.exists():
+            continue  # coverage is reported; non-Makefile generators differ
+        try:
+            output, dependencies = _cmake_link_inputs(link_file)
+            report["checked_links"] += 1
+            if not output.is_file():
+                report["stale_links"].append({"artifact": str(output), "dependency": str(link_file),
+                                               "reason": "missing output"})
+                continue
+            output_mtime = output.stat().st_mtime_ns
+            for dependency in dependencies:
+                path = str(dependency)
+                if not (path == source_root_s or path.startswith(source_prefix)
+                        or path == build_root_s or path.startswith(build_prefix)):
+                    continue
+                if path not in dependency_mtimes:
+                    dependency_mtimes[path] = dependency.stat().st_mtime_ns if dependency.is_file() else None
+                mtime = dependency_mtimes[path]
+                if mtime is None or mtime > output_mtime:
+                    report["stale_links"].append({"artifact": str(output), "dependency": path,
+                                                   "reason": "missing dependency" if mtime is None else "newer dependency"})
+                    break
+        except (OSError, ValueError) as exc:
+            report["link_errors"].append(str(exc))
+
     for archive in (build_root / "tools" / "server" / "libserver-context.a",
                     build_root / "common" / "libllama-common-base.a"):
         if not archive.is_file():
@@ -287,6 +372,11 @@ def inspect_build_artifacts(binary, env=None):
     if report["duplicate_archive_members"]:
         archive, members = next(iter(report["duplicate_archive_members"].items()))
         errors.append("duplicate static archive members in " + archive + ": " + ", ".join(members[:4]))
+    if report["stale_links"]:
+        first = report["stale_links"][0]
+        errors.append("stale linked artifact: " + first["artifact"] + " (" +
+                      first["reason"] + ": " + first["dependency"] + ")")
+    errors.extend("link recipe check failed: " + error for error in report["link_errors"])
     if not errors:
         report["runtime_identity"] = inspect_build_identity(binary, source_root, env)
         errors.extend(report["runtime_identity"]["errors"])

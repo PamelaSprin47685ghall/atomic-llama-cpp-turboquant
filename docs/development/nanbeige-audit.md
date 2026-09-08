@@ -51,11 +51,20 @@ per-request responses, checked answers, timing, sampled GPU memory, and server
 logs. Finish the build before probing. For binaries inside a CMake build tree,
 the runner first checks compiler dependency files for server, common, mtmd,
 llama and ggml (including built backend) objects. It rejects newer or missing
-local dependencies and duplicate members in the server/common static archives. This
-prevents hand-run object relinks or direct `link.txt`/`ar qc` invocations from
-silently mixing incompatible C++ layouts. The result records `checked_objects`;
-this timestamp check covers the available `*.o.d` files, not a reproducible-build
-attestation. When the CMake source is a Git checkout, the runner also executes
+local dependencies and duplicate members in the server/common static archives.
+For available CMake Makefile `link.txt` recipes, it also checks each archive,
+shared library and executable against its explicit local object/library inputs,
+the recipe and any response files. Fresh objects with an old archive, or a fresh
+archive with an old downstream binary, fail before model startup. Missing inputs
+or outputs, malformed recipes and missing/cyclic response files also fail; no
+recipe is executed by this check.
+The result records `checked_objects`, `checked_links`, `stale_links` and
+`link_errors`. Coverage is limited to available `*.o.d` and `link.txt` metadata;
+zero checked links means no link-freshness evidence, not a successful link audit.
+Other generators and system libraries selected through `-l` are not covered.
+These checks catch common incomplete manual rebuilds, but are not a
+reproducible-build or ABI-consistency attestation. When the CMake source is a
+Git checkout, the runner also executes
 `llama-server --version` with the probe's runtime environment and requires its
 reported commit to resolve to that checkout's current HEAD. A stale, missing or
 ambiguous commit, a failed version command, or a HEAD change during this check
