@@ -8,8 +8,12 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <queue>
 #include <unordered_set>
 #include <utility>
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
 
 namespace {
 
@@ -611,6 +615,221 @@ std::string server_rerot_child_worker_prompt(
         "正文中普通列表、标题和代码块只是内容呈现，不具有调度含义。"
         "详尽完成本项内容后，我直接输出 " + std::string(close_marker) +
         " 结束当前段落，不再继续其他章节。\n";
+}
+
+std::string server_rerot_format_fixed_entry(
+        const std::string & node_label,
+        const std::string & intent,
+        bool is_synthesis) {
+    // AGENTS.md §04: F_i = CLOSE_PREVIOUS + HANDOFF_TO_i + OPEN_CURRENT
+    // F_i starts with </think> to close whichever preceding segment is ordered before it,
+    // provides deterministic context for Lane i, and opens <think> for Lane i.
+    std::string frame;
+    frame += "</think>";
+    if (is_synthesis) {
+        frame += "\n[System: 所有前置子任务论证已全部就绪。现在由 Lane 0 开启全局综合推导。]\n<think>\n";
+    } else {
+        frame += "\n[Subagent Task: ";
+        frame += node_label;
+        if (!intent.empty()) {
+            frame += " | Intent: ";
+            frame += intent;
+        }
+        frame += "]\n<think>\n";
+    }
+    return frame;
+}
+
+std::string server_rerot_routing_schema_json() {
+    // Exact schema from AGENTS.md §02.4
+    return R"({
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["strategy", "payload"],
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {"const": "simple"},
+        "payload": {"const": {}}
+      }
+    },
+    {
+      "type": "object",
+      "required": ["strategy", "payload"],
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {"const": "dag"},
+        "payload": {"$ref": "#/$defs/DagPayload"}
+      }
+    }
+  ],
+  "$defs": {
+    "DagPayload": {
+      "type": "object",
+      "required": ["questions", "depends_on"],
+      "additionalProperties": false,
+      "properties": {
+        "questions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "intent"],
+            "additionalProperties": false,
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "intent": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        "depends_on": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "depends_on_id"],
+            "additionalProperties": false,
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "depends_on_id": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    }
+  }
+})";
+}
+
+server_rerot_routing_decision server_rerot_parse_routing_decision(const std::string & json_str) {
+    server_rerot_routing_decision result;
+    json root_json;
+    try {
+        root_json = json::parse(json_str);
+    } catch (const std::exception & e) {
+        result.error = "Invalid JSON syntax: " + std::string(e.what());
+        return result;
+    }
+
+    if (!root_json.is_object() || !root_json.contains("strategy") || !root_json.contains("payload")) {
+        result.error = "Missing strategy or payload";
+        return result;
+    }
+
+    std::string strategy = root_json["strategy"].is_string() ? root_json["strategy"].get<std::string>() : "";
+    if (strategy == "simple") {
+        if (!root_json["payload"].is_object() || !root_json["payload"].empty()) {
+            result.error = "simple payload must be empty object {}";
+            return result;
+        }
+        result.strategy = server_rerot_routing_decision::strategy_type::simple;
+        return result;
+    }
+
+    if (strategy == "dag") {
+        const auto & payload = root_json["payload"];
+        if (!payload.is_object() || !payload.contains("questions") || !payload.contains("depends_on")) {
+            result.error = "dag payload missing questions or depends_on";
+            return result;
+        }
+
+        const auto & q_arr = payload["questions"];
+        if (!q_arr.is_array() || q_arr.empty()) {
+            result.error = "questions must be a non-empty array";
+            return result;
+        }
+
+        std::unordered_set<std::string> known_ids;
+        uint32_t rank = 0;
+        for (const auto & item : q_arr) {
+            if (!item.is_object() || !item.contains("id") || !item.contains("intent")) {
+                result.error = "question item missing id or intent";
+                return result;
+            }
+            std::string qid = item["id"].get<std::string>();
+            std::string intent = item["intent"].get<std::string>();
+            if (qid.empty() || intent.empty()) {
+                result.error = "id and intent must not be empty";
+                return result;
+            }
+            if (qid == "0") {
+                result.error = "id '0' is reserved for main synthesis";
+                return result;
+            }
+            if (known_ids.count(qid)) {
+                result.error = "duplicate question id: " + qid;
+                return result;
+            }
+            known_ids.insert(qid);
+            result.questions.push_back({qid, intent, rank++});
+        }
+
+        const auto & dep_arr = payload["depends_on"];
+        if (!dep_arr.is_array()) {
+            result.error = "depends_on must be an array";
+            return result;
+        }
+
+        std::set<std::pair<std::string, std::string>> seen_edges;
+        for (const auto & dep : dep_arr) {
+            if (!dep.is_object() || !dep.contains("id") || !dep.contains("depends_on_id")) {
+                result.error = "depends_on item missing id or depends_on_id";
+                return result;
+            }
+            std::string to_id = dep["id"].get<std::string>();
+            std::string from_id = dep["depends_on_id"].get<std::string>();
+
+            if (!known_ids.count(to_id) || !known_ids.count(from_id)) {
+                result.error = "unknown endpoint in dependency: " + from_id + " -> " + to_id;
+                return result;
+            }
+            if (to_id == from_id) {
+                result.error = "self-loop dependency: " + to_id;
+                return result;
+            }
+            if (seen_edges.count({from_id, to_id})) {
+                result.error = "duplicate dependency edge: " + from_id + " -> " + to_id;
+                return result;
+            }
+            seen_edges.insert({from_id, to_id});
+            result.dependencies.push_back({from_id, to_id});
+        }
+
+        // Kahn algorithm topological check
+        std::unordered_map<std::string, int> in_degree;
+        std::unordered_map<std::string, std::vector<std::string>> adj;
+        for (const auto & qid : known_ids) {
+            in_degree[qid] = 0;
+        }
+        for (const auto & edge : result.dependencies) {
+            in_degree[edge.to_id]++;
+            adj[edge.from_id].push_back(edge.to_id);
+        }
+
+        std::queue<std::string> q;
+        for (const auto & [qid, deg] : in_degree) {
+            if (deg == 0) q.push(qid);
+        }
+        size_t visited = 0;
+        while (!q.empty()) {
+            std::string u = q.front();
+            q.pop();
+            visited++;
+            for (const auto & v : adj[u]) {
+                if (--in_degree[v] == 0) q.push(v);
+            }
+        }
+
+        if (visited != known_ids.size()) {
+            result.error = "cycle detected in dependency graph";
+            return result;
+        }
+
+        result.strategy = server_rerot_routing_decision::strategy_type::dag;
+        return result;
+    }
+
+    result.error = "unknown strategy: " + strategy;
+    return result;
 }
 
 std::string server_rerot_child_grammar(std::string_view close_marker) {
@@ -1390,7 +1609,9 @@ bool server_rerot_runtime::build_reader_view_desc(
         llama_rerot_run_id query_run,
         std::vector<uint32_t> & ordered_runs,
         llama_rerot_reader_view_desc & desc) const {
-    const auto view = episode.document.build_view(node.id);
+    const auto view = episode.is_dag
+        ? build_dag_view_for_reader(episode.id, node.id)
+        : episode.document.build_view(node.id);
     ordered_runs.clear();
     ordered_runs.reserve(view.runs.size() + 1);
     // Explicit research control, never selected as an automatic fallback.
@@ -1857,6 +2078,160 @@ bool server_rerot_runtime::retire_node(
         *released_slot = physical_slot;
     }
     return true;
+}
+
+bool server_rerot_runtime::initialize_dag(
+        uint64_t episode_id,
+        const server_rerot_routing_decision & decision,
+        std::string * error_out) {
+    auto * ep = episode(episode_id);
+    if (!ep) {
+        if (error_out) *error_out = "episode not found";
+        return false;
+    }
+    if (!decision.is_dag()) {
+        if (error_out) *error_out = "invalid DAG decision: " + decision.error;
+        return false;
+    }
+
+    ep->is_dag = true;
+    ep->document.set_dag_mode(true);
+
+    std::unordered_map<std::string, llama_rerot_node_id> str_to_nid;
+
+    // Create a node for each question under root
+    for (const auto & q : decision.questions) {
+        auto nid = ep->document.create_child(ep->document.root(), q.intent, llama_rerot_node_state::queued);
+        ep->document.set_plan_rank(nid, q.plan_rank);
+
+        server_rerot_node_runtime nr;
+        nr.id = nid;
+        nr.string_id = q.id;
+        nr.intent = q.intent;
+        nr.planner_armed = false;
+
+        // Ensure nodes array is large enough
+        if (nid >= ep->nodes.size()) {
+            ep->nodes.resize(nid + 1);
+        }
+        ep->nodes[nid] = std::move(nr);
+        str_to_nid[q.id] = nid;
+    }
+
+    // Add edges
+    for (const auto & dep : decision.dependencies) {
+        auto from_nid = str_to_nid.at(dep.from_id);
+        auto to_nid = str_to_nid.at(dep.to_id);
+        if (!ep->document.add_edge(from_nid, to_nid, error_out)) {
+            return false;
+        }
+    }
+
+    // Populate ready_queue with initial eligible nodes (in_degree == 0)
+    ep->ready_queue.clear();
+    for (const auto & q : decision.questions) {
+        auto nid = str_to_nid.at(q.id);
+        const auto * n = ep->document.node(nid);
+        if (n && n->predecessors.empty()) {
+            ep->ready_queue.push_back(nid);
+        }
+    }
+
+    return true;
+}
+
+std::vector<llama_rerot_node_id> server_rerot_runtime::get_eligible_dag_nodes(uint64_t episode_id) const {
+    const auto * ep = episode(episode_id);
+    if (!ep || !ep->is_dag) {
+        return {};
+    }
+
+    std::vector<llama_rerot_node_id> eligible;
+    for (size_t i = 1; i < ep->nodes.size(); ++i) {
+        const auto & nr = ep->nodes[i];
+        const auto * doc_node = ep->document.node(static_cast<llama_rerot_node_id>(i));
+        if (!doc_node) continue;
+
+        // Must not be already started or sealed
+        if (nr.is_sealed || doc_node->state == llama_rerot_node_state::running ||
+            doc_node->state == llama_rerot_node_state::starting) {
+            continue;
+        }
+
+        // All predecessors must be sealed
+        bool all_preds_sealed = true;
+        for (const auto pred : doc_node->predecessors) {
+            if (pred < ep->nodes.size() && !ep->nodes[pred].is_sealed) {
+                all_preds_sealed = false;
+                break;
+            }
+        }
+        if (all_preds_sealed) {
+            eligible.push_back(static_cast<llama_rerot_node_id>(i));
+        }
+    }
+    return eligible;
+}
+
+bool server_rerot_runtime::seal_dag_node(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id,
+        llama_rerot_event_origin origin) {
+    auto * ep = episode(episode_id);
+    if (!ep || node_id >= ep->nodes.size()) {
+        return false;
+    }
+
+    auto & nr = ep->nodes[node_id];
+    if (nr.is_sealed) {
+        return true; // Idempotent (§07.5)
+    }
+
+    nr.is_sealed = true;
+    nr.completion_origin = origin;
+    ep->document.set_node_state(node_id, llama_rerot_node_state::retired);
+
+    // Release pen if bound
+    if (nr.pen_id >= 0) {
+        free_pen(nr.pen_id);
+        nr.pen_id = -1;
+    }
+
+    // Refresh ready_queue with newly eligible nodes
+    const auto eligible = get_eligible_dag_nodes(episode_id);
+    for (const auto nid : eligible) {
+        if (std::find(ep->ready_queue.begin(), ep->ready_queue.end(), nid) == ep->ready_queue.end()) {
+            ep->ready_queue.push_back(nid);
+        }
+    }
+
+    return true;
+}
+
+llama_rerot_reader_view server_rerot_runtime::build_dag_view_for_reader(
+        uint64_t episode_id,
+        llama_rerot_node_id reader) const {
+    const auto * ep = episode(episode_id);
+    if (!ep) {
+        throw std::out_of_range("episode not found");
+    }
+
+    // Collect all started nodes (root + nodes that are starting, running, or sealed/retired)
+    std::vector<llama_rerot_node_id> started;
+    started.push_back(0); // root always started
+
+    for (size_t i = 1; i < ep->nodes.size(); ++i) {
+        const auto & nr = ep->nodes[i];
+        const auto * dn = ep->document.node(static_cast<llama_rerot_node_id>(i));
+        if (!dn) continue;
+
+        if (nr.is_sealed || dn->state == llama_rerot_node_state::running ||
+            dn->state == llama_rerot_node_state::starting || dn->state == llama_rerot_node_state::retired) {
+            started.push_back(static_cast<llama_rerot_node_id>(i));
+        }
+    }
+
+    return ep->document.build_dag_view(reader, started);
 }
 
 bool server_rerot_runtime::freeze_fork_parent(
@@ -2685,7 +3060,9 @@ bool server_rerot_runtime::refresh_final_fence(
     // does NOT decode/re-evaluate the closing sequence; neither does the core
     // refresh barrier (synchronize only). Full §21.4 close replay still needs
     // a causal checkpoint and must not double-apply recurrent transitions.
-    const auto view = current->document.build_view(node_id);
+    const auto view = current->is_dag
+        ? build_dag_view_for_reader(current->id, node_id)
+        : current->document.build_view(node_id);
     if (ordered_runs_out) {
         ordered_runs_out->clear();
         ordered_runs_out->reserve(view.runs.size());

@@ -6,6 +6,7 @@
 #include <map>
 #include <numeric>
 #include <stdexcept>
+#include <queue>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -163,6 +164,7 @@ llama_rerot_document::llama_rerot_document(uint64_t episode_id) {
 
 void llama_rerot_document::reset(uint64_t episode_id) {
     episode_id_ = episode_id;
+    is_dag_mode_ = false;
     nodes_.clear();
     runs_.clear();
 
@@ -173,6 +175,226 @@ void llama_rerot_document::reset(uint64_t episode_id) {
     root_node.child_index = 0;
     root_node.state = llama_rerot_node_state::planning;
     nodes_.push_back(std::move(root_node));
+}
+
+bool llama_rerot_document::is_dag_mode() const {
+    return is_dag_mode_;
+}
+
+void llama_rerot_document::set_dag_mode(bool enabled) {
+    is_dag_mode_ = enabled;
+}
+
+bool llama_rerot_document::set_plan_rank(llama_rerot_node_id node_id, uint32_t rank) {
+    if (node_id >= nodes_.size()) {
+        return false;
+    }
+    nodes_[node_id].plan_rank = rank;
+    return true;
+}
+
+bool llama_rerot_document::add_edge(llama_rerot_node_id before, llama_rerot_node_id after, std::string * error) {
+    if (before >= nodes_.size() || after >= nodes_.size()) {
+        return set_error(error, "edge endpoint out of range");
+    }
+    if (before == after) {
+        return set_error(error, "self loop not permitted in DAG");
+    }
+    auto & preds = nodes_[after].predecessors;
+    if (std::find(preds.begin(), preds.end(), before) != preds.end()) {
+        return set_error(error, "duplicate edge");
+    }
+    preds.push_back(before);
+    nodes_[before].successors.push_back(after);
+    return true;
+}
+
+std::vector<llama_rerot_node_id> llama_rerot_document::topo_sort_cycle_preferred(
+        const std::vector<llama_rerot_node_id> & candidates,
+        llama_rerot_node_id reader,
+        std::string * error) const {
+    if (candidates.empty()) {
+        return {};
+    }
+
+    std::unordered_set<llama_rerot_node_id> candidate_set(candidates.begin(), candidates.end());
+    if (candidate_set.size() != candidates.size()) {
+        set_error(error, "duplicate candidate node");
+        return {};
+    }
+    if (candidate_set.find(reader) == candidate_set.end()) {
+        set_error(error, "reader not in candidates");
+        return {};
+    }
+
+    // Sort candidates by plan_rank to establish initial plan_order
+    std::vector<llama_rerot_node_id> plan_order = candidates;
+    std::sort(plan_order.begin(), plan_order.end(), [&](llama_rerot_node_id a, llama_rerot_node_id b) {
+        return nodes_[a].plan_rank < nodes_[b].plan_rank;
+    });
+
+    // Find position of reader in plan_order
+    size_t reader_idx = 0;
+    for (size_t i = 0; i < plan_order.size(); ++i) {
+        if (plan_order[i] == reader) {
+            reader_idx = i;
+            break;
+        }
+    }
+
+    // Build cycle priority list:
+    // Elements after reader in plan_order, then before reader, and reader self last.
+    std::vector<llama_rerot_node_id> cycle_priority;
+    cycle_priority.reserve(plan_order.size());
+    for (size_t i = reader_idx + 1; i < plan_order.size(); ++i) {
+        cycle_priority.push_back(plan_order[i]);
+    }
+    for (size_t i = 0; i < reader_idx; ++i) {
+        cycle_priority.push_back(plan_order[i]);
+    }
+    cycle_priority.push_back(reader);
+
+    // Map each node to its priority rank (lower number = higher priority)
+    std::unordered_map<llama_rerot_node_id, size_t> rank;
+    for (size_t i = 0; i < cycle_priority.size(); ++i) {
+        rank[cycle_priority[i]] = i;
+    }
+
+    // Build sub-graph in-degrees and adjacency within candidate_set
+    std::unordered_map<llama_rerot_node_id, size_t> in_degree;
+    std::unordered_map<llama_rerot_node_id, std::vector<llama_rerot_node_id>> following;
+    for (const auto node : candidates) {
+        in_degree[node] = 0;
+        following[node] = {};
+    }
+
+    for (const auto node : candidates) {
+        for (const auto succ : nodes_[node].successors) {
+            if (candidate_set.count(succ)) {
+                following[node].push_back(succ);
+                in_degree[succ]++;
+            }
+        }
+    }
+
+    // Min-heap ordered by priority rank (rank[node])
+    auto cmp = [&](llama_rerot_node_id a, llama_rerot_node_id b) {
+        return rank[a] > rank[b]; // greater for min-heap
+    };
+    std::priority_queue<llama_rerot_node_id, std::vector<llama_rerot_node_id>, decltype(cmp)> heap(cmp);
+
+    for (const auto node : candidates) {
+        if (in_degree[node] == 0) {
+            heap.push(node);
+        }
+    }
+
+    std::vector<llama_rerot_node_id> result;
+    result.reserve(candidates.size());
+
+    while (!heap.empty()) {
+        const auto node = heap.top();
+        heap.pop();
+        result.push_back(node);
+
+        for (const auto succ : following[node]) {
+            if (--in_degree[succ] == 0) {
+                heap.push(succ);
+            }
+        }
+    }
+
+    if (result.size() != candidates.size()) {
+        set_error(error, "cycle detected in candidate DAG");
+        return {};
+    }
+
+    return result;
+}
+
+llama_rerot_reader_view llama_rerot_document::build_dag_view(
+        llama_rerot_node_id reader,
+        const std::vector<llama_rerot_node_id> & started_nodes) const {
+    if (reader >= nodes_.size()) {
+        throw std::out_of_range("RERoT reader node does not exist");
+    }
+
+    llama_rerot_reader_view result;
+    result.episode_id = episode_id_;
+    result.reader = reader;
+
+    llama_pos virtual_pos = 0;
+
+    // 1. Root node (0.plan / public prefix) always comes first
+    for (const auto run_id : nodes_[0].runs) {
+        const auto & current_run = runs_[run_id];
+        if (!run_visible_to(current_run, reader) || current_run.token_count == 0) {
+            continue;
+        }
+        result.runs.push_back({
+            current_run.id,
+            current_run.owner,
+            current_run.storage_pos0,
+            virtual_pos,
+            current_run.token_count,
+            current_run.publish_epoch,
+        });
+        virtual_pos += static_cast<llama_pos>(current_run.token_count);
+    }
+
+    // 2. Compute cycle-preferred topological sort for started worker nodes (excluding 0)
+    std::vector<llama_rerot_node_id> workers;
+    workers.reserve(started_nodes.size());
+    for (const auto nid : started_nodes) {
+        if (nid != 0) {
+            workers.push_back(nid);
+        }
+    }
+
+    if (!workers.empty()) {
+        std::string err;
+        std::vector<llama_rerot_node_id> ordered_workers;
+        if (reader == 0) {
+            // Synthesis reader: order by plan_rank preserving DAG dependencies
+            // We use the node with lowest priority as anchor or sort
+            // Setting candidate with highest plan_rank or lowest plan_rank?
+            // If reader == 0, reader is not in workers, so we find topological sort of workers.
+            // When there are no dependencies, we want (1, 2, 3) in order.
+            // Using workers.back() as anchor will put workers.front() at the beginning.
+            // To produce exact plan_order (1, 2, 3...) when independent:
+            // cycle_priority when dummy reader is workers.back():
+            // reader_idx = N-1; cycle_priority has elements before reader: (0..N-2), then N-1!
+            // That is exactly (1, 2, 3...)!
+            ordered_workers = topo_sort_cycle_preferred(workers, workers.back(), &err);
+        } else {
+            ordered_workers = topo_sort_cycle_preferred(workers, reader, &err);
+        }
+        if (ordered_workers.empty()) {
+            throw std::runtime_error("DAG topological sort failed: " + err);
+        }
+
+        for (const auto nid : ordered_workers) {
+            const auto & node = nodes_[nid];
+            for (const auto run_id : node.runs) {
+                const auto & current_run = runs_[run_id];
+                if (!run_visible_to(current_run, reader) || current_run.token_count == 0) {
+                    continue;
+                }
+                result.runs.push_back({
+                    current_run.id,
+                    current_run.owner,
+                    current_run.storage_pos0,
+                    virtual_pos,
+                    current_run.token_count,
+                    current_run.publish_epoch,
+                });
+                virtual_pos += static_cast<llama_pos>(current_run.token_count);
+            }
+        }
+    }
+
+    result.query_virtual_pos = virtual_pos;
+    return result;
 }
 
 uint64_t llama_rerot_document::episode_id() const {
@@ -209,7 +431,8 @@ llama_rerot_run_id llama_rerot_document::append_run(
         llama_rerot_visibility visibility,
         llama_pos storage_pos0,
         uint32_t token_count,
-        uint64_t publish_epoch) {
+        uint64_t publish_epoch,
+        llama_rerot_segment_kind kind) {
     if (owner >= nodes_.size()) {
         throw std::out_of_range("RERoT run owner does not exist");
     }
@@ -228,6 +451,7 @@ llama_rerot_run_id llama_rerot_document::append_run(
     run.id = static_cast<llama_rerot_run_id>(runs_.size());
     run.owner = owner;
     run.visibility = visibility;
+    run.kind = kind;
     run.storage_pos0 = storage_pos0;
     run.token_count = token_count;
     run.publish_epoch = publish_epoch;
@@ -235,6 +459,14 @@ llama_rerot_run_id llama_rerot_document::append_run(
     nodes_[owner].runs.push_back(run.id);
     runs_.push_back(std::move(run));
     return static_cast<llama_rerot_run_id>(runs_.size() - 1);
+}
+
+bool llama_rerot_document::set_run_segment_kind(llama_rerot_run_id run_id, llama_rerot_segment_kind kind) {
+    if (run_id >= runs_.size()) {
+        return false;
+    }
+    runs_[run_id].kind = kind;
+    return true;
 }
 
 bool llama_rerot_document::set_run_token_count(llama_rerot_run_id run_id, uint32_t token_count) {
@@ -339,6 +571,12 @@ std::vector<uint32_t> llama_rerot_document::tree_path(llama_rerot_node_id node_i
 bool llama_rerot_document::run_visible_to(
         const llama_rerot_run & run,
         llama_rerot_node_id reader) const {
+    // AGENTS.md §04.7: source terminal tokens (source_end) are preserved in
+    // owner's tape for accounting and state, but are NOT exported to foreign
+    // views to prevent double-close in concatenated views.
+    if (run.kind == llama_rerot_segment_kind::source_end && run.owner != reader) {
+        return false;
+    }
     if (is_public_visibility(run.visibility)) {
         return true;
     }

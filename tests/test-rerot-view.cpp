@@ -826,8 +826,94 @@ static void test_run_epoch_contract() {
     CHECK(view.runs[2].publish_epoch == 0);
     CHECK(view.runs[3].publish_epoch == 0);
 }
+static void test_dag_cycle_preferred_topo() {
+    // AGENTS.md §03.5.4 & §09
+    // questions plan_order: 1, 2, 3 (flat)
+    // reader 1: 2, 3, 1
+    // reader 2: 3, 1, 2
+    // reader 3: 1, 2, 3
+    llama_rerot_document doc(99);
+    doc.set_dag_mode(true);
+
+    const auto root = doc.root();
+    const auto n1 = doc.create_child(root, "Task 1");
+    const auto n2 = doc.create_child(root, "Task 2");
+    const auto n3 = doc.create_child(root, "Task 3");
+    doc.set_plan_rank(n1, 0);
+    doc.set_plan_rank(n2, 1);
+    doc.set_plan_rank(n3, 2);
+
+    std::string err;
+    const std::vector<llama_rerot_node_id> flat = { n1, n2, n3 };
+    CHECK(doc.topo_sort_cycle_preferred(flat, n1, &err) == std::vector<llama_rerot_node_id>({ n2, n3, n1 }));
+    CHECK(doc.topo_sort_cycle_preferred(flat, n2, &err) == std::vector<llama_rerot_node_id>({ n3, n1, n2 }));
+    CHECK(doc.topo_sort_cycle_preferred(flat, n3, &err) == std::vector<llama_rerot_node_id>({ n1, n2, n3 }));
+
+    // AGENTS.md §03.5.5: With dependency 1 -> 3, 2 independent
+    // reader 2: 1, 3, 2 (1 must precede 3 despite cycle preference!)
+    // reader 3: 1, 2, 3
+    CHECK(doc.add_edge(n1, n3, &err));
+    CHECK(doc.topo_sort_cycle_preferred(flat, n2, &err) == std::vector<llama_rerot_node_id>({ n1, n3, n2 }));
+    CHECK(doc.topo_sort_cycle_preferred(flat, n3, &err) == std::vector<llama_rerot_node_id>({ n1, n2, n3 }));
+
+    // Diamond: 1->2, 1->3, 2->4, 3->4
+    const auto n4 = doc.create_child(root, "Task 4");
+    doc.set_plan_rank(n4, 3);
+    CHECK(doc.add_edge(n1, n2, &err));
+    CHECK(doc.add_edge(n2, n4, &err));
+    CHECK(doc.add_edge(n3, n4, &err));
+    const std::vector<llama_rerot_node_id> diamond = { n1, n2, n3, n4 };
+    CHECK(doc.topo_sort_cycle_preferred(diamond, n4, &err) == std::vector<llama_rerot_node_id>({ n1, n2, n3, n4 }));
+
+    // Cycle detection: add 4 -> 1 should fail
+    CHECK(doc.add_edge(n4, n1, &err));
+    CHECK(doc.topo_sort_cycle_preferred(diamond, n4, &err).empty());
+}
+
+static void test_dag_reader_view_assembly() {
+    llama_rerot_document doc(100);
+    doc.set_dag_mode(true);
+
+    const auto root = doc.root();
+    const auto n1 = doc.create_child(root, "1");
+    const auto n2 = doc.create_child(root, "2");
+    const auto n3 = doc.create_child(root, "3");
+    doc.set_plan_rank(n1, 0);
+    doc.set_plan_rank(n2, 1);
+    doc.set_plan_rank(n3, 2);
+
+    doc.append_run(root, llama_rerot_visibility::public_live, 0, 10, 1); // P: 10 tokens
+    doc.append_run(n1, llama_rerot_visibility::public_live, 10, 5, 2);   // B1: 5 tokens
+    doc.append_run(n2, llama_rerot_visibility::public_live, 15, 6, 2);   // B2: 6 tokens
+    doc.append_run(n3, llama_rerot_visibility::public_live, 21, 7, 2);   // B3: 7 tokens
+
+    const std::vector<llama_rerot_node_id> started = { root, n1, n2, n3 };
+
+    // reader 1: P, B2, B3, B1
+    const auto view1 = doc.build_dag_view(n1, started);
+    CHECK(owners(view1) == std::vector<llama_rerot_node_id>({ root, n2, n3, n1 }));
+    CHECK(view1.query_virtual_pos == 28);
+
+    // reader 2: P, B3, B1, B2
+    const auto view2 = doc.build_dag_view(n2, started);
+    CHECK(owners(view2) == std::vector<llama_rerot_node_id>({ root, n3, n1, n2 }));
+    CHECK(view2.query_virtual_pos == 28);
+
+    // reader 3: P, B1, B2, B3
+    const auto view3 = doc.build_dag_view(n3, started);
+    CHECK(owners(view3) == std::vector<llama_rerot_node_id>({ root, n1, n2, n3 }));
+    CHECK(view3.query_virtual_pos == 28);
+
+    // Synthesis reader 0: P, B1, B2, B3
+    const auto view0 = doc.build_dag_view(root, started);
+    CHECK(owners(view0) == std::vector<llama_rerot_node_id>({ root, n1, n2, n3 }));
+    CHECK(view0.query_virtual_pos == 28);
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT View Tests ===\n");
+    test_dag_cycle_preferred_topo();
+    test_dag_reader_view_assembly();
     test_manual_pac_dfs();
     test_visibility();
     test_reclassify_run_validation();

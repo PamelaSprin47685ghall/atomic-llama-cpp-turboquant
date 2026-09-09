@@ -138,6 +138,7 @@ enum class server_rerot_injection_kind : uint8_t {
     refresh,
     worker,
     serial_resume,
+    dag_frame,
 };
 
 static constexpr size_t SERVER_REROT_PRIVATE_BATCH = 32;
@@ -147,7 +148,8 @@ static bool server_rerot_private_microbatch(server_rerot_injection_kind injectio
            injection == server_rerot_injection_kind::refresh ||
            injection == server_rerot_injection_kind::child_open ||
            injection == server_rerot_injection_kind::worker ||
-           injection == server_rerot_injection_kind::serial_resume;
+           injection == server_rerot_injection_kind::serial_resume ||
+           injection == server_rerot_injection_kind::dag_frame;
 }
 
 struct server_slot; // forward declaration
@@ -1782,11 +1784,17 @@ private:
 
         std::optional<server_rerot_token_plan> plan;
         if (forced && server_rerot_private_microbatch(slot.rerot_injection)) {
-            auto plans = rerot->plan_private_span(
-                slot.rerot_episode_id,
-                slot.rerot_node_id,
-                lane->storage_pos_next,
-                rerot_private_batch_size(slot));
+            auto plans = (slot.rerot_injection == server_rerot_injection_kind::dag_frame)
+                ? rerot->plan_private_span(
+                    slot.rerot_episode_id,
+                    slot.rerot_node_id,
+                    lane->storage_pos_next,
+                    rerot_private_batch_size(slot))
+                : rerot->plan_private_span(
+                    slot.rerot_episode_id,
+                    slot.rerot_node_id,
+                    lane->storage_pos_next,
+                    rerot_private_batch_size(slot));
             if (plans.has_value() && !plans->empty()) {
                 plan = std::move(plans->front());
                 for (size_t i = 1; i < plans->size(); ++i) {

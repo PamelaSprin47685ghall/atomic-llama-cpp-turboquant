@@ -1,0 +1,45 @@
+[schema]
+type = "object"
+required = ["strategy", "payload"]
+properties.strategy = { type = "string" }
+
+[[schema.oneOf]]
+description = "当前不适合拆解，则使用简单的线性思路"
+properties.strategy = { const = "simple" }
+properties.payload = { type = "object" }
+
+[[schema.oneOf]]
+description = "拆解为拓扑思维导图，则使用 DAG"
+properties.strategy = { const = "dag" }
+properties.payload = { "$ref" = "#/schema/$defs/DagPayload" }
+
+[schema."$defs".DagPayload]
+type = "object"
+required = ["questions", "depends_on"]
+
+[schema."$defs".DagPayload.properties]
+questions = { 
+  type = "array", 
+  items = {
+    type = "object", 
+    required = ["id", "intent"],
+    properties = { 
+      id = { type = "string" }, 
+      intent = { type = "string" } 
+    }
+  } 
+}
+depends_on = { 
+  type = "array", 
+  items = { 
+    type = "object", 
+    required = ["id", "depends_on_id"], 
+    properties = { 
+      id = { type = "string" },
+      depends_on_id = { type = "string" }
+    }
+  }
+}
+
+[data]
+strategy = 

@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <nlohmann/json.hpp>
 
 static int g_failures = 0;
 
@@ -306,8 +307,87 @@ static void test_rejects_obsolete_or_malformed_delimiters() {
     }
 }
 
+static void test_routing_decision_parser() {
+    // AGENTS.md §02: simple
+    const std::string simple_json = R"({"strategy":"simple","payload":{}})";
+    const auto dec_simple = server_rerot_parse_routing_decision(simple_json);
+    CHECK(dec_simple.is_simple());
+    CHECK(!dec_simple.is_dag());
+
+    // Simple with non-empty payload -> rejected (§02.4)
+    const std::string simple_bad = R"({"strategy":"simple","payload":{"foo":"bar"}})";
+    CHECK(!server_rerot_parse_routing_decision(simple_bad).is_simple());
+
+    // DAG valid (§02.4)
+    const std::string dag_json = R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Step C"}
+        ],
+        "depends_on": [
+          {"id": "C", "depends_on_id": "A"}
+        ]
+      }
+    })";
+    const auto dec_dag = server_rerot_parse_routing_decision(dag_json);
+    CHECK(dec_dag.is_dag());
+    CHECK(dec_dag.questions.size() == 3);
+    CHECK(dec_dag.dependencies.size() == 1);
+    CHECK(dec_dag.dependencies[0].from_id == "A");
+    CHECK(dec_dag.dependencies[0].to_id == "C");
+
+    // DAG with cycle -> rejected (§02.6)
+    const std::string cycle_json = R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Task A"},
+          {"id": "B", "intent": "Task B"}
+        ],
+        "depends_on": [
+          {"id": "B", "depends_on_id": "A"},
+          {"id": "A", "depends_on_id": "B"}
+        ]
+      }
+    })";
+    CHECK(!server_rerot_parse_routing_decision(cycle_json).is_dag());
+
+    // DAG with duplicate question id -> rejected
+    const std::string dup_id_json = R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Task A"},
+          {"id": "A", "intent": "Task A duplicate"}
+        ],
+        "depends_on": []
+      }
+    })";
+    CHECK(!server_rerot_parse_routing_decision(dup_id_json).is_dag());
+
+    // DAG with unknown endpoint -> rejected
+    const std::string unknown_ep_json = R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [{"id": "A", "intent": "Task A"}],
+        "depends_on": [{"id": "A", "depends_on_id": "UNKNOWN"}]
+      }
+    })";
+    CHECK(!server_rerot_parse_routing_decision(unknown_ep_json).is_dag());
+
+    // Schema JSON non-empty and parsable
+    const std::string schema_str = server_rerot_routing_schema_json();
+    CHECK(!schema_str.empty());
+    nlohmann::json parsed_schema = nlohmann::json::parse(schema_str);
+    CHECK(parsed_schema.contains("oneOf"));
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT Planner Parser Tests ===\n");
+    test_routing_decision_parser();
     test_plain_public_text();
     test_split_open_and_close();
     test_byte_by_byte_record();

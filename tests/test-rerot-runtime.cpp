@@ -2856,8 +2856,121 @@ static void test_ram_restore_context_shift_and_preemption() {
     CHECK(rt1.erase_episode(ep1));
     CHECK(rt2.pens_allocated() == 0);
 }
+static void test_dag_runtime_lifecycle() {
+    // AGENTS.md §§02, 03, 07:
+    // Create DAG episode:
+    // Questions: A (rank 0), B (rank 1), C (rank 2)
+    // Edge: A -> C (C depends on A). B is independent.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(4);
+
+    const int root_slot = 0;
+    const uint64_t ep_id = runtime.adopt_root(10, 10, root_slot, 1, 0);
+    CHECK(ep_id != 0);
+
+    const std::string dag_json = R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Synthesize C"}
+        ],
+        "depends_on": [
+          {"id": "C", "depends_on_id": "A"}
+        ]
+      }
+    })";
+    const auto decision = server_rerot_parse_routing_decision(dag_json);
+    CHECK(decision.is_dag());
+
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->is_dag);
+
+    // Initial eligible nodes must be A (1) and B (2). C (3) must NOT be eligible!
+    auto eligible = runtime.get_eligible_dag_nodes(ep_id);
+    CHECK(eligible.size() == 2);
+    CHECK(std::find(eligible.begin(), eligible.end(), 1) != eligible.end());
+    CHECK(std::find(eligible.begin(), eligible.end(), 2) != eligible.end());
+    CHECK(std::find(eligible.begin(), eligible.end(), 3) == eligible.end());
+
+    // Allocate pen and start A (1)
+    auto pen_a = runtime.allocate_pen(10, ep_id, 1);
+    CHECK(pen_a.has_value());
+    ep->document.set_node_state(1, llama_rerot_node_state::running);
+    ep->nodes[1].pen_id = *pen_a;
+
+    // Allocate pen and start B (2)
+    auto pen_b = runtime.allocate_pen(10, ep_id, 2);
+    CHECK(pen_b.has_value());
+    ep->document.set_node_state(2, llama_rerot_node_state::running);
+    ep->nodes[2].pen_id = *pen_b;
+
+    // Both A and B are running. Add some public tokens:
+    ep->document.append_run(0, llama_rerot_visibility::public_live, 0, 10, 1); // P: 10
+    ep->document.append_run(1, llama_rerot_visibility::public_live, 10, 4, 2); // A: 4
+    ep->document.append_run(2, llama_rerot_visibility::public_live, 14, 6, 2); // B: 6
+
+    // Verify reader views:
+    // A reader view: P, B, A (own work last!)
+    const auto view_a = runtime.build_dag_view_for_reader(ep_id, 1);
+    CHECK(view_a.runs.size() == 3);
+    CHECK(view_a.runs[0].owner == 0);
+    CHECK(view_a.runs[1].owner == 2);
+    CHECK(view_a.runs[2].owner == 1);
+
+    // B reader view: P, A, B (own work last!)
+    const auto view_b = runtime.build_dag_view_for_reader(ep_id, 2);
+    CHECK(view_b.runs.size() == 3);
+    CHECK(view_b.runs[0].owner == 0);
+    CHECK(view_b.runs[1].owner == 1);
+    CHECK(view_b.runs[2].owner == 2);
+
+    // Now A naturally finishes and is sealed:
+    CHECK(runtime.seal_dag_node(ep_id, 1, llama_rerot_event_origin::worker_source));
+    CHECK(ep->nodes[1].is_sealed);
+    CHECK(ep->document.node(1)->state == llama_rerot_node_state::retired);
+
+    // Now C (3) must become eligible!
+    eligible = runtime.get_eligible_dag_nodes(ep_id);
+    CHECK(eligible.size() == 1);
+    CHECK(eligible[0] == 3);
+
+    // Start C (3)
+    auto pen_c = runtime.allocate_pen(10, ep_id, 3);
+    CHECK(pen_c.has_value());
+    ep->document.set_node_state(3, llama_rerot_node_state::running);
+    ep->nodes[3].pen_id = *pen_c;
+    ep->document.append_run(3, llama_rerot_visibility::public_live, 20, 8, 3); // C: 8
+
+    // C reader view: A (predecessor), B (peer), C (self last)
+    const auto view_c = runtime.build_dag_view_for_reader(ep_id, 3);
+    CHECK(view_c.runs.size() == 4);
+    CHECK(view_c.runs[0].owner == 0);
+    CHECK(view_c.runs[1].owner == 1);
+    CHECK(view_c.runs[2].owner == 2);
+    CHECK(view_c.runs[3].owner == 3);
+
+    // Seal B and C
+    CHECK(runtime.seal_dag_node(ep_id, 2, llama_rerot_event_origin::worker_source));
+    CHECK(runtime.seal_dag_node(ep_id, 3, llama_rerot_event_origin::worker_source));
+
+    // Synthesis reader 0 view: P, A, B, C
+    const auto view_synth = runtime.build_dag_view_for_reader(ep_id, 0);
+    CHECK(view_synth.runs.size() == 4);
+    CHECK(view_synth.runs[0].owner == 0);
+    CHECK(view_synth.runs[1].owner == 1);
+    CHECK(view_synth.runs[2].owner == 2);
+    CHECK(view_synth.runs[3].owner == 3);
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT Runtime Tests ===\n");
+    test_dag_runtime_lifecycle();
     test_recurrent_only_pressure_isolation();
     test_multi_episode_concurrent_final_fence_and_coordinate_freeze();
     test_pen_capacity_and_multi_episode_allocation();

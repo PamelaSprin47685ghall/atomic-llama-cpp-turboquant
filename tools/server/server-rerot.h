@@ -299,6 +299,63 @@ struct server_rerot_fence_checkpoint {
     bool complete() const { return prepared && !rows.empty() && cursor == rows.size(); }
 };
 
+// Pre-branch checkpoint and routing (AGENTS.md §§02, 07)
+// Captures prefill watermark and sampler/recurrent state to allow zero-cost rollback on "simple".
+struct server_rerot_prebranch_checkpoint {
+    uint64_t episode_id = 0;
+    int task_id = -1;
+    llama_seq_id seq_id = -1;
+
+    llama_pos n_prompt_tokens = 0; // Prefill end watermark
+    std::vector<uint8_t> gdn_recurrent_states;
+    std::vector<uint8_t> conv1d_states;
+    std::vector<uint8_t> sampler_snapshot_bytes;
+
+    bool valid() const { return episode_id != 0 && n_prompt_tokens > 0; }
+    void clear() {
+        episode_id = 0;
+        task_id = -1;
+        seq_id = -1;
+        n_prompt_tokens = 0;
+        gdn_recurrent_states.clear();
+        conv1d_states.clear();
+        sampler_snapshot_bytes.clear();
+    }
+};
+
+// DAG payload item for routing decisions (§02.4)
+struct server_rerot_dag_plan_item {
+    std::string id;
+    std::string intent;
+    uint32_t plan_rank = 0;
+};
+
+struct server_rerot_dag_edge {
+    std::string from_id;
+    std::string to_id;
+};
+
+struct server_rerot_routing_decision {
+    enum class strategy_type : uint8_t {
+        invalid = 0,
+        simple,
+        dag,
+    } strategy = strategy_type::invalid;
+
+    std::vector<server_rerot_dag_plan_item> questions;
+    std::vector<server_rerot_dag_edge> dependencies;
+    std::string error;
+
+    bool is_simple() const { return strategy == strategy_type::simple; }
+    bool is_dag() const { return strategy == strategy_type::dag && error.empty(); }
+};
+
+// Parses and strictly validates JSON according to AGENTS.md §02.4 & §02.6
+server_rerot_routing_decision server_rerot_parse_routing_decision(const std::string & json_str);
+
+// Returns JSON schema string for GBNF conversion (§02.4)
+std::string server_rerot_routing_schema_json();
+
 struct server_rerot_node_runtime {
     llama_rerot_node_id id = LLAMA_REROT_NODE_INVALID;
     // Pen binding (§§B.4.2, B.13 Phase 1). physical_slot aliases pen_id for backward compatibility
@@ -333,6 +390,12 @@ struct server_rerot_node_runtime {
     uint64_t enqueue_frontier = 0;
     bool exit_intent = false;
     bool last_write_public = true;
+
+    // DAG subagent fixed-entry and role state (AGENTS.md §§04, 07)
+    std::string string_id; // Model's planning id (e.g. "task_A", "1")
+    std::string intent;    // Task intent
+    bool is_sealed = false; // Natural completion verified and submitted
+    llama_rerot_event_origin completion_origin = llama_rerot_event_origin::unknown;
 
     // A.8 opaque per-lane extension state. Filled by the server integration
     // (sampler bytes, MTP checkpoint); empty means none. Persisted verbatim
@@ -391,10 +454,22 @@ struct server_rerot_shift_result {
     uint64_t new_publish_epoch = 0;
 };
 
+// Fixed entry frame construction (AGENTS.md §04):
+// B_i = F_i + R_i
+// F_i = CLOSE_PREVIOUS + HANDOFF_TO_i + OPEN_CURRENT
+// For simplified tag-based or tool template, renders deterministic text.
+std::string server_rerot_format_fixed_entry(
+    const std::string & node_label,
+    const std::string & intent,
+    bool is_synthesis = false);
+
 struct server_rerot_episode {
     uint64_t id = 0;
     int root_task_id = -1;
     int response_task_id = -1;
+
+    // True when episode runs in DAG mode (AGENTS.md §§01, 02)
+    bool is_dag = false;
 
     uint64_t frontier = 1;
     uint64_t publish_epoch = 1;
@@ -530,6 +605,27 @@ public:
         uint64_t episode_id,
         llama_rerot_node_id node_id,
         llama_rerot_run_id run_id);
+
+    // DAG episode initialization and dependency methods (AGENTS.md §§02, 03, 07)
+    bool initialize_dag(
+        uint64_t episode_id,
+        const server_rerot_routing_decision & decision,
+        std::string * error_out = nullptr);
+
+    // Checks which nodes have all predecessors sealed and are eligible for admission
+    std::vector<llama_rerot_node_id> get_eligible_dag_nodes(uint64_t episode_id) const;
+
+    // Seal a naturally completed worker/synthesis node (AGENTS.md §07.5):
+    // Releases exec bindings, marks node sealed, and unlocks eligible successors.
+    bool seal_dag_node(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id,
+        llama_rerot_event_origin origin = llama_rerot_event_origin::worker_source);
+
+    // Build the complete reader view for any DAG node or synthesis 0
+    llama_rerot_reader_view build_dag_view_for_reader(
+        uint64_t episode_id,
+        llama_rerot_node_id reader) const;
 
     // Fork-time parking/freezing and queued-child admission. These operations
     // use component-selective sequence APIs: public attention gets an archive
