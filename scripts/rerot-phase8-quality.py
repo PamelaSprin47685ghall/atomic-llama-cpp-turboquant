@@ -96,10 +96,6 @@ class QualityBenchRunner:
             '-ub', '2048',
             '-ctk', 'turbo4',
             '-ctv', 'turbo2',
-            '--triattention-stats', '/opt/llama/data/ornith-1.5-35b.triattention',
-            '--triattention-ratio', '0.09375',
-            '--spec-type', 'mtp',
-            '--spec-draft-n-max', '3',
             '--top-k', '40',
             '--repeat-penalty', '1.08',
             '--repeat-last-n', '4096',
@@ -171,7 +167,7 @@ class QualityBenchRunner:
         temperature: float = 0.0,
         rerot: bool = True,
         reasoning_effort: Optional[str] = "low",
-        timeout: float = 240.0
+        timeout: float = 600.0
     ) -> Dict[str, Any]:
         payload = {
             'model': 'ornith-1.5',
