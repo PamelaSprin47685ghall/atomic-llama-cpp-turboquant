@@ -169,9 +169,16 @@ class QualityBenchRunner:
         reasoning_effort: Optional[str] = "low",
         timeout: float = 600.0
     ) -> Dict[str, Any]:
+        messages = []
+        if reasoning_effort == "low":
+            messages.append({'role': 'system', 'content': 'Reasoning effort is low. Keep thinking brief and focused, then conclude.'})
+        elif reasoning_effort == "medium":
+            messages.append({'role': 'system', 'content': 'Use moderate reasoning effort and verify the answer.'})
+        messages.append({'role': 'user', 'content': prompt})
+
         payload = {
             'model': 'ornith-1.5',
-            'messages': [{'role': 'user', 'content': prompt}],
+            'messages': messages,
             'temperature': temperature,
             'seed': seed,
             'max_tokens': max_tokens,

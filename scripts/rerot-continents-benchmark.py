@@ -441,10 +441,15 @@ def main() -> int:
         "model": args.model,
         "messages": [
             {
+                "role": "system",
+                "content": "Reasoning effort is low. Keep thinking brief and focused, then conclude.",
+            },
+            {
                 "role": "user",
                 "content": args.prompt,
             }
         ],
+        "reasoning_effort": "low",
         "temperature": args.temperature,
         "seed": args.seed,
         "max_tokens": args.max_tokens,

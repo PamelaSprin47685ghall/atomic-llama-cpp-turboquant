@@ -7960,7 +7960,9 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
         return pipelines;
     }
 
-    GGML_ASSERT(src1_type == GGML_TYPE_F32 || (ctx->device->coopmat2 && src1_type == GGML_TYPE_F16));
+    if (src1_type != GGML_TYPE_F32 && (!ctx->device->coopmat2 || src1_type != GGML_TYPE_F16)) {
+        return nullptr;
+    }
 
     switch (src0_type) {
         case GGML_TYPE_Q1_0:
