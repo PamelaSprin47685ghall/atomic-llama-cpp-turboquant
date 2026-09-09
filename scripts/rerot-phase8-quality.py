@@ -163,7 +163,16 @@ class QualityBenchRunner:
         except urllib.error.HTTPError as exc:
             return exc.code, exc.read()
 
-    def query(self, prompt: str, seed: int = 424242, max_tokens: int = 2048, temperature: float = 0.0, rerot: bool = True, timeout: float = 240.0) -> Dict[str, Any]:
+    def query(
+        self,
+        prompt: str,
+        seed: int = 424242,
+        max_tokens: int = 2048,
+        temperature: float = 0.0,
+        rerot: bool = True,
+        reasoning_effort: Optional[str] = "low",
+        timeout: float = 240.0
+    ) -> Dict[str, Any]:
         payload = {
             'model': 'ornith-1.5',
             'messages': [{'role': 'user', 'content': prompt}],
@@ -174,6 +183,8 @@ class QualityBenchRunner:
             'rerot': rerot,
             'rerot_trace': False
         }
+        if reasoning_effort is not None:
+            payload['reasoning_effort'] = reasoning_effort
         start = time.monotonic()
         status, raw = self._http('/v1/chat/completions', json.dumps(payload).encode(), timeout=timeout)
         wall = time.monotonic() - start
@@ -248,7 +259,7 @@ def main():
         tier1_passed = 0
         for test in micro_tests:
             print(f"Running {test['id']}...", flush=True)
-            res = runner.query(test['prompt'], max_tokens=test['max_tokens'])
+            res = runner.query(test['prompt'], max_tokens=test['max_tokens'], reasoning_effort="low")
             content = res.get('content', '')
             reasoning = res.get('reasoning', '')
             passed = test['verifier'](content, reasoning)
@@ -311,7 +322,7 @@ def main():
 
         for test in code_tests:
             print(f"Running {test['id']}...", flush=True)
-            res = runner.query(test['prompt'], max_tokens=test['max_tokens'])
+            res = runner.query(test['prompt'], max_tokens=test['max_tokens'], reasoning_effort="medium")
             content = res.get('content', '')
             reasoning = res.get('reasoning', '')
             passed, err = test['verifier'](content)
@@ -363,7 +374,7 @@ def main():
 
         for test in math_tests:
             print(f"Running {test['id']}...", flush=True)
-            res = runner.query(test['prompt'], max_tokens=test['max_tokens'])
+            res = runner.query(test['prompt'], max_tokens=test['max_tokens'], reasoning_effort="medium")
             content = res.get('content', '')
             reasoning = res.get('reasoning', '')
             extracted = extract_boxed(content) or extract_boxed(reasoning)
@@ -400,7 +411,7 @@ def main():
             "问题：上面长文档中记录的绝密安全密钥是什么？请直接输出密钥。"
         )
         print("Running needle-in-haystack (4K context)...", flush=True)
-        res_needle = runner.query(needle_prompt, max_tokens=2048)
+        res_needle = runner.query(needle_prompt, max_tokens=2048, reasoning_effort="low")
         needle_content = res_needle.get('content', '')
         needle_pass = secret_key in needle_content or secret_key in res_needle.get('reasoning', '')
         print(f"  Needle Result: {'PASS' if needle_pass else 'FAIL'} (wall={res_needle.get('wall_seconds', 0):.2f}s)", flush=True)
@@ -430,7 +441,7 @@ def main():
             "请分章节详细阐述各主题的核心原理与对比。"
         )
         print("Running multi-chapter structured production prompt...", flush=True)
-        res_mc = runner.query(multichapter_prompt, max_tokens=1536)
+        res_mc = runner.query(multichapter_prompt, max_tokens=1536, reasoning_effort="low")
         mc_content = res_mc.get('content', '')
         # Check that the 3 core themes are covered
         required_topics = ["进程", "内存", "文件"]
