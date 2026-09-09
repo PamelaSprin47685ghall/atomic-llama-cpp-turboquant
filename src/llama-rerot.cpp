@@ -193,6 +193,14 @@ bool llama_rerot_document::set_plan_rank(llama_rerot_node_id node_id, uint32_t r
     return true;
 }
 
+bool llama_rerot_document::set_stage_role(llama_rerot_node_id node_id, llama_rerot_stage_role role) {
+    if (node_id >= nodes_.size()) {
+        return false;
+    }
+    nodes_[node_id].stage_role = role;
+    return true;
+}
+
 bool llama_rerot_document::add_edge(llama_rerot_node_id before, llama_rerot_node_id after, std::string * error) {
     if (before >= nodes_.size() || after >= nodes_.size()) {
         return set_error(error, "edge endpoint out of range");
@@ -317,6 +325,22 @@ llama_rerot_reader_view llama_rerot_document::build_dag_view(
         const std::vector<llama_rerot_node_id> & started_nodes) const {
     if (reader >= nodes_.size()) {
         throw std::out_of_range("RERoT reader node does not exist");
+    }
+
+    std::unordered_set<llama_rerot_node_id> started_set(started_nodes.begin(), started_nodes.end());
+    started_set.insert(0);
+    for (const auto nid : started_set) {
+        if (nid >= nodes_.size()) {
+            throw std::out_of_range("RERoT started node does not exist");
+        }
+        if (nid == 0) {
+            continue;
+        }
+        for (const auto pred : nodes_[nid].predecessors) {
+            if (started_set.find(pred) == started_set.end()) {
+                throw std::runtime_error("DAG started set misses a predecessor");
+            }
+        }
     }
 
     llama_rerot_reader_view result;
@@ -574,6 +598,9 @@ bool llama_rerot_document::run_visible_to(
     // AGENTS.md §04.7: source terminal tokens (source_end) are preserved in
     // owner's tape for accounting and state, but are NOT exported to foreign
     // views to prevent double-close in concatenated views.
+    if (run.kind == llama_rerot_segment_kind::probe_control) {
+        return false;
+    }
     if (run.kind == llama_rerot_segment_kind::source_end && run.owner != reader) {
         return false;
     }

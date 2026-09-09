@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <mutex>
 #include <queue>
@@ -41,6 +42,170 @@ bool valid_child_close_marker(std::string_view marker) {
     }
     return true;
 }
+
+bool valid_native_end_marker(std::string_view marker) {
+    // Accepts any non-empty, non-null terminal marker (e.g. </think>,
+    // [/THINK], <|end|>, <|im_end|>, etc.) without assuming XML brackets.
+    return !marker.empty() && marker.find('\0') == std::string_view::npos;
+}
+
+void skip_json_ws(std::string_view text, size_t & pos) {
+    while (pos < text.size() && ascii_space(static_cast<unsigned char>(text[pos]))) {
+        ++pos;
+    }
+}
+
+bool skip_json_string(std::string_view text, size_t & pos) {
+    if (pos >= text.size() || text[pos] != '"') {
+        return false;
+    }
+    ++pos;
+    while (pos < text.size()) {
+        if (text[pos] == '\\') {
+            pos += (pos + 1 < text.size()) ? 2 : 1;
+            continue;
+        }
+        if (text[pos] == '"') {
+            ++pos;
+            return true;
+        }
+        ++pos;
+    }
+    return false;
+}
+
+bool json_value_has_duplicate_keys(std::string_view text, size_t & pos);
+
+bool json_object_has_duplicate_keys(std::string_view text, size_t & pos) {
+    if (pos >= text.size() || text[pos] != '{') {
+        return true;
+    }
+    ++pos;
+    skip_json_ws(text, pos);
+    std::unordered_set<std::string> keys;
+    if (pos < text.size() && text[pos] == '}') {
+        ++pos;
+        return false;
+    }
+    while (pos < text.size()) {
+        skip_json_ws(text, pos);
+        const size_t key_begin = pos;
+        if (!skip_json_string(text, pos)) {
+            return true;
+        }
+        if (!keys.insert(std::string(text.substr(key_begin, pos - key_begin))).second) {
+            return true;
+        }
+        skip_json_ws(text, pos);
+        if (pos >= text.size() || text[pos] != ':') {
+            return true;
+        }
+        ++pos;
+        skip_json_ws(text, pos);
+        if (json_value_has_duplicate_keys(text, pos)) {
+            return true;
+        }
+        skip_json_ws(text, pos);
+        if (pos < text.size() && text[pos] == ',') {
+            ++pos;
+            continue;
+        }
+        if (pos < text.size() && text[pos] == '}') {
+            ++pos;
+            return false;
+        }
+        return true;
+    }
+    return true;
+}
+
+bool json_array_has_duplicate_keys(std::string_view text, size_t & pos) {
+    if (pos >= text.size() || text[pos] != '[') {
+        return true;
+    }
+    ++pos;
+    skip_json_ws(text, pos);
+    if (pos < text.size() && text[pos] == ']') {
+        ++pos;
+        return false;
+    }
+    while (pos < text.size()) {
+        skip_json_ws(text, pos);
+        if (json_value_has_duplicate_keys(text, pos)) {
+            return true;
+        }
+        skip_json_ws(text, pos);
+        if (pos < text.size() && text[pos] == ',') {
+            ++pos;
+            continue;
+        }
+        if (pos < text.size() && text[pos] == ']') {
+            ++pos;
+            return false;
+        }
+        return true;
+    }
+    return true;
+}
+
+bool json_value_has_duplicate_keys(std::string_view text, size_t & pos) {
+    skip_json_ws(text, pos);
+    if (pos >= text.size()) {
+        return true;
+    }
+    const char ch = text[pos];
+    if (ch == '{') {
+        return json_object_has_duplicate_keys(text, pos);
+    }
+    if (ch == '[') {
+        return json_array_has_duplicate_keys(text, pos);
+    }
+    if (ch == '"') {
+        return !skip_json_string(text, pos);
+    }
+    if (ch == 't' || ch == 'f' || ch == 'n' || ch == '-' || (ch >= '0' && ch <= '9')) {
+        while (pos < text.size() && !ascii_space(static_cast<unsigned char>(text[pos])) &&
+               text[pos] != ',' && text[pos] != '}' && text[pos] != ']') {
+            ++pos;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool json_text_has_duplicate_keys(std::string_view text) {
+    size_t pos = 0;
+    skip_json_ws(text, pos);
+    if (json_value_has_duplicate_keys(text, pos)) {
+        return true;
+    }
+    skip_json_ws(text, pos);
+    return pos != text.size();
+}
+
+bool json_object_has_only_keys(
+        const json & object,
+        std::initializer_list<const char *> allowed,
+        std::string * error,
+        const char * context) {
+    for (auto it = object.begin(); it != object.end(); ++it) {
+        bool ok = false;
+        for (const char * key : allowed) {
+            if (it.key() == key) {
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) {
+            if (error) {
+                *error = std::string("unexpected field '") + it.key() + "' in " + context;
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
 
 void skip_ascii_space(std::string_view text, size_t & pos, size_t end) {
     while (pos < end && ascii_space(static_cast<unsigned char>(text[pos]))) {
@@ -343,8 +508,8 @@ bool server_rerot_planner_parser::fail(server_rerot_parser_step & step, std::str
     return false;
 }
 
-server_rerot_marker_parser::server_rerot_marker_parser(std::string marker)
-    : marker_(std::move(marker)) {
+server_rerot_marker_parser::server_rerot_marker_parser(std::string marker, bool native_end)
+    : marker_(std::move(marker)), native_end_(native_end) {
     reset();
 }
 
@@ -352,7 +517,17 @@ void server_rerot_marker_parser::reset() {
     candidate_.clear();
     error_.clear();
     state_ = server_rerot_marker_state::public_text;
-    if (!marker_.empty() && !valid_child_close_marker(marker_)) {
+    if (marker_.empty()) {
+        return;
+    }
+    if (native_end_) {
+        if (!valid_native_end_marker(marker_)) {
+            state_ = server_rerot_marker_state::failed;
+            error_ = "RERoT native source-end marker is not a reasoning-end tag";
+        }
+        return;
+    }
+    if (!valid_child_close_marker(marker_)) {
         state_ = server_rerot_marker_state::failed;
         error_ = "RERoT child close marker must contain exactly 8 base62 characters";
     }
@@ -620,24 +795,88 @@ std::string server_rerot_child_worker_prompt(
 std::string server_rerot_format_fixed_entry(
         const std::string & node_label,
         const std::string & intent,
-        bool is_synthesis) {
-    // AGENTS.md §04: F_i = CLOSE_PREVIOUS + HANDOFF_TO_i + OPEN_CURRENT
-    // F_i starts with </think> to close whichever preceding segment is ordered before it,
-    // provides deterministic context for Lane i, and opens <think> for Lane i.
+        bool is_synthesis,
+        std::string_view think_end,
+        std::string_view think_start) {
+    // AGENTS.md §04: F_i = CLOSE_PREVIOUS + HANDOFF_TO_i + OPEN_CURRENT.
+    // Tags must come from the target template; this helper only concatenates
+    // the structural close/open around a target-only identity payload.
     std::string frame;
-    frame += "</think>";
+    frame.append(think_end.data(), think_end.size());
+    frame += "\n";
     if (is_synthesis) {
-        frame += "\n[System: 所有前置子任务论证已全部就绪。现在由 Lane 0 开启全局综合推导。]\n<think>\n";
+        frame += "synthesis:";
+        frame += node_label.empty() ? "0" : node_label;
     } else {
-        frame += "\n[Subagent Task: ";
+        frame += "lane:";
         frame += node_label;
-        if (!intent.empty()) {
-            frame += " | Intent: ";
-            frame += intent;
-        }
-        frame += "]\n<think>\n";
     }
+    if (!intent.empty()) {
+        // AGENTS.md §04.10: serialize intent cleanly, flattening line breaks
+        // and disarming any raw think markers to prevent boundary forgery.
+        std::string clean_intent;
+        clean_intent.reserve(intent.size());
+        for (char c : intent) {
+            if (c == '\r' || c == '\n') {
+                clean_intent += ' ';
+            } else {
+                clean_intent += c;
+            }
+        }
+        if (!think_end.empty()) {
+            size_t pos = 0;
+            while ((pos = clean_intent.find(think_end, pos)) != std::string::npos) {
+                clean_intent.replace(pos, think_end.size(), "[end]");
+                pos += 5;
+            }
+        }
+        if (!think_start.empty()) {
+            size_t pos = 0;
+            while ((pos = clean_intent.find(think_start, pos)) != std::string::npos) {
+                clean_intent.replace(pos, think_start.size(), "[start]");
+                pos += 7;
+            }
+        }
+        frame += "\nintent:";
+        frame += clean_intent;
+    }
+    frame += "\n";
+    frame.append(think_start.data(), think_start.size());
+    frame += "\n";
     return frame;
+}
+
+std::string_view server_rerot_routing_probe_prompt() {
+    static constexpr std::string_view prompt =
+        "Choose whether this request continues as a single answer or a DAG of independent sub-questions. "
+        "Output only JSON: {\"strategy\":\"simple\",\"payload\":{}} or "
+        "{\"strategy\":\"dag\",\"payload\":{\"questions\":[{\"id\":\"...\",\"intent\":\"...\"}],\"depends_on\":[]}}.";
+    return prompt;
+}
+
+std::string server_rerot_routing_grammar() {
+    const auto schema = nlohmann::ordered_json::parse(server_rerot_routing_schema_json());
+    return json_schema_to_grammar(schema);
+}
+
+std::string server_rerot_source_end_grammar(std::string_view close_marker) {
+    if (!valid_native_end_marker(close_marker)) {
+        return {};
+    }
+    const std::string close(close_marker);
+    auto arena = build_peg_parser([&](common_peg_parser_builder & builder) {
+        return builder.sequence({
+            builder.chars("[^ \\t\\r\\n]", 1, 1),
+            builder.until_one_of({close}),
+            builder.literal(close),
+            builder.end(),
+        });
+    });
+    common_grammar_options options;
+    options.dotall = true;
+    return build_grammar([&](const common_grammar_builder & grammar_builder) {
+        arena.build_grammar(grammar_builder, false);
+    }, options);
 }
 
 std::string server_rerot_routing_schema_json() {
@@ -702,6 +941,10 @@ std::string server_rerot_routing_schema_json() {
 
 server_rerot_routing_decision server_rerot_parse_routing_decision(const std::string & json_str) {
     server_rerot_routing_decision result;
+    if (json_text_has_duplicate_keys(json_str)) {
+        result.error = "duplicate JSON object members are not allowed";
+        return result;
+    }
     json root_json;
     try {
         root_json = json::parse(json_str);
@@ -712,6 +955,9 @@ server_rerot_routing_decision server_rerot_parse_routing_decision(const std::str
 
     if (!root_json.is_object() || !root_json.contains("strategy") || !root_json.contains("payload")) {
         result.error = "Missing strategy or payload";
+        return result;
+    }
+    if (!json_object_has_only_keys(root_json, {"strategy", "payload"}, &result.error, "routing root")) {
         return result;
     }
 
@@ -731,12 +977,19 @@ server_rerot_routing_decision server_rerot_parse_routing_decision(const std::str
             result.error = "dag payload missing questions or depends_on";
             return result;
         }
+        if (!json_object_has_only_keys(payload, {"questions", "depends_on"}, &result.error, "dag payload")) {
+            return result;
+        }
 
         const auto & q_arr = payload["questions"];
         if (!q_arr.is_array() || q_arr.empty()) {
             result.error = "questions must be a non-empty array";
             return result;
         }
+
+        auto is_all_ws = [](const std::string & s) {
+            return std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isspace(c); });
+        };
 
         std::unordered_set<std::string> known_ids;
         uint32_t rank = 0;
@@ -745,10 +998,17 @@ server_rerot_routing_decision server_rerot_parse_routing_decision(const std::str
                 result.error = "question item missing id or intent";
                 return result;
             }
+            if (!json_object_has_only_keys(item, {"id", "intent"}, &result.error, "question")) {
+                return result;
+            }
+            if (!item["id"].is_string() || !item["intent"].is_string()) {
+                result.error = "id and intent must be strings";
+                return result;
+            }
             std::string qid = item["id"].get<std::string>();
             std::string intent = item["intent"].get<std::string>();
-            if (qid.empty() || intent.empty()) {
-                result.error = "id and intent must not be empty";
+            if (qid.empty() || is_all_ws(qid) || intent.empty() || is_all_ws(intent)) {
+                result.error = "id and intent must not be empty or whitespace-only";
                 return result;
             }
             if (qid == "0") {
@@ -773,6 +1033,13 @@ server_rerot_routing_decision server_rerot_parse_routing_decision(const std::str
         for (const auto & dep : dep_arr) {
             if (!dep.is_object() || !dep.contains("id") || !dep.contains("depends_on_id")) {
                 result.error = "depends_on item missing id or depends_on_id";
+                return result;
+            }
+            if (!json_object_has_only_keys(dep, {"id", "depends_on_id"}, &result.error, "depends_on")) {
+                return result;
+            }
+            if (!dep["id"].is_string() || !dep["depends_on_id"].is_string()) {
+                result.error = "dependency endpoints must be strings";
                 return result;
             }
             std::string to_id = dep["id"].get<std::string>();
@@ -1273,7 +1540,8 @@ llama_rerot_run_id server_rerot_runtime::ensure_run(
         server_rerot_episode & episode,
         server_rerot_node_runtime & node,
         llama_rerot_visibility visibility,
-        llama_pos storage_pos) {
+        llama_pos storage_pos,
+        llama_rerot_segment_kind kind) {
     std::optional<llama_rerot_run_id> * active = nullptr;
     switch (visibility) {
         case llama_rerot_visibility::public_live:     active = &node.public_run; break;
@@ -1298,7 +1566,7 @@ llama_rerot_run_id server_rerot_runtime::ensure_run(
         ? episode.publish_epoch
         : 0;
     const auto run_id = episode.document.append_run(
-        node.id, visibility, storage_pos, 0, publish_epoch);
+        node.id, visibility, storage_pos, 0, publish_epoch, kind);
     *active = run_id;
     return run_id;
 }
@@ -1433,8 +1701,11 @@ std::optional<std::vector<server_rerot_token_plan>> server_rerot_runtime::plan_p
         return std::nullopt;
     }
 
+    const auto kind = current->probing
+        ? llama_rerot_segment_kind::probe_control
+        : llama_rerot_segment_kind::body;
     const llama_rerot_run_id run_id = ensure_run(
-        *current, *current_node, llama_rerot_visibility::private_control, storage_pos);
+        *current, *current_node, llama_rerot_visibility::private_control, storage_pos, kind);
     if (run_id == LLAMA_REROT_RUN_INVALID) {
         return std::nullopt;
     }
@@ -1445,9 +1716,48 @@ std::optional<std::vector<server_rerot_token_plan>> server_rerot_runtime::plan_p
         server_rerot_token_plan plan;
         plan.storage_pos = storage_pos + static_cast<llama_pos>(i);
         plan.visibility = llama_rerot_visibility::private_control;
+        plan.segment_kind = kind;
         plan.run_id = run_id;
         plans.push_back(std::move(plan));
     }
+    if (current->probing) {
+        current->probe_tokens += token_count;
+    }
+    return plans;
+}
+
+std::optional<std::vector<server_rerot_token_plan>> server_rerot_runtime::plan_frame_span(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id,
+        llama_pos storage_pos,
+        size_t token_count) {
+    auto * current = episode(episode_id);
+    auto * current_node = node(episode_id, node_id);
+    if (!current || !current_node || current->hard_aborted || storage_pos < 0 ||
+        token_count == 0 ||
+        token_count > size_t(std::numeric_limits<llama_pos>::max() - storage_pos) + 1) {
+        return std::nullopt;
+    }
+
+    const llama_rerot_run_id run_id = ensure_run(
+        *current, *current_node, llama_rerot_visibility::pending_record, storage_pos,
+        llama_rerot_segment_kind::frame);
+    if (run_id == LLAMA_REROT_RUN_INVALID) {
+        return std::nullopt;
+    }
+
+    std::vector<server_rerot_token_plan> plans;
+    plans.reserve(token_count);
+    for (size_t i = 0; i < token_count; ++i) {
+        server_rerot_token_plan plan;
+        plan.storage_pos = storage_pos + static_cast<llama_pos>(i);
+        plan.visibility = llama_rerot_visibility::pending_record;
+        plan.segment_kind = llama_rerot_segment_kind::frame;
+        plan.event_origin = llama_rerot_event_origin::runtime_frame;
+        plan.run_id = run_id;
+        plans.push_back(std::move(plan));
+    }
+    current->frame_tokens += token_count;
     return plans;
 }
 
@@ -1478,6 +1788,55 @@ std::optional<server_rerot_token_plan> server_rerot_runtime::plan_generated_toke
     auto * current_node = node(episode_id, node_id);
     if (!current || !current_node || current->hard_aborted || storage_pos < 0) {
         return std::nullopt;
+    }
+
+    if (current->probing) {
+        server_rerot_token_plan plan;
+        plan.storage_pos = storage_pos;
+        plan.visibility = llama_rerot_visibility::private_control;
+        plan.segment_kind = llama_rerot_segment_kind::probe_control;
+        plan.run_id = ensure_run(
+            *current, *current_node, plan.visibility, storage_pos, plan.segment_kind);
+        ++current->probe_tokens;
+        return plan.valid() ? std::optional<server_rerot_token_plan>(std::move(plan)) : std::nullopt;
+    }
+
+    if (current->is_dag) {
+        server_rerot_token_plan plan;
+        plan.storage_pos = storage_pos;
+        const auto * logical = current->document.node(node_id);
+        const bool starting = logical && logical->state == llama_rerot_node_state::starting;
+        if (starting || current_node->exit_parser.marker().empty()) {
+            plan.visibility = llama_rerot_visibility::public_live;
+            plan.segment_kind = llama_rerot_segment_kind::body;
+            plan.run_id = ensure_run(*current, *current_node, plan.visibility, storage_pos);
+            return plan.valid() ? std::optional<server_rerot_token_plan>(std::move(plan)) : std::nullopt;
+        }
+        auto marker_step = current_node->exit_parser.consume(token_bytes);
+        if (marker_step.malformed) {
+            fail_episode(*current, marker_step.error.empty()
+                ? "malformed RERoT native source-end marker"
+                : marker_step.error);
+            return std::nullopt;
+        }
+        plan.marker_step = marker_step;
+        if (marker_step.marker_closed) {
+            plan.visibility = llama_rerot_visibility::private_control;
+            plan.segment_kind = llama_rerot_segment_kind::source_end;
+            plan.event_origin = current_node->stage_role == llama_rerot_stage_role::synthesis
+                ? llama_rerot_event_origin::synthesis_source
+                : llama_rerot_event_origin::worker_source;
+            ++current->source_end_tokens;
+        } else if (current_node->exit_parser.state() == server_rerot_marker_state::marker_candidate) {
+            plan.visibility = llama_rerot_visibility::pending_record;
+            plan.segment_kind = llama_rerot_segment_kind::body;
+        } else {
+            plan.visibility = llama_rerot_visibility::public_live;
+            plan.segment_kind = llama_rerot_segment_kind::body;
+        }
+        plan.run_id = ensure_run(
+            *current, *current_node, plan.visibility, storage_pos, plan.segment_kind);
+        return plan.valid() ? std::optional<server_rerot_token_plan>(std::move(plan)) : std::nullopt;
     }
 
     server_rerot_parser_step parser_step;
@@ -1902,6 +2261,19 @@ bool server_rerot_runtime::commit_token(
         return true;
     }
     if (plan.marker_step.marker_closed) {
+        if (current->is_dag) {
+            if (plan.event_origin == llama_rerot_event_origin::runtime_frame ||
+                plan.event_origin == llama_rerot_event_origin::foreign_export ||
+                plan.event_origin == llama_rerot_event_origin::unknown) {
+                return true;
+            }
+            current_node->exit_intent = true;
+            if (current_node->stage_role == llama_rerot_stage_role::synthesis) {
+                // Keep the synthesis pen bound for ordinary serial content.
+                return true;
+            }
+            return seal_dag_node(current->id, current_node->id, plan.event_origin);
+        }
         return finalize_exit_marker(*current, *current_node, plan.run_id);
     }
     return true;
@@ -2095,22 +2467,31 @@ bool server_rerot_runtime::initialize_dag(
     }
 
     ep->is_dag = true;
+    ep->strategy_decided = true;
     ep->document.set_dag_mode(true);
+    ep->document.set_stage_role(0, llama_rerot_stage_role::planner);
+    if (!ep->nodes.empty()) {
+        ep->nodes[0].stage_role = llama_rerot_stage_role::planner;
+        ep->nodes[0].planner_armed = false;
+    }
 
     std::unordered_map<std::string, llama_rerot_node_id> str_to_nid;
 
-    // Create a node for each question under root
     for (const auto & q : decision.questions) {
         auto nid = ep->document.create_child(ep->document.root(), q.intent, llama_rerot_node_state::queued);
         ep->document.set_plan_rank(nid, q.plan_rank);
+        ep->document.set_stage_role(nid, llama_rerot_stage_role::worker);
 
         server_rerot_node_runtime nr;
         nr.id = nid;
         nr.string_id = q.id;
         nr.intent = q.intent;
         nr.planner_armed = false;
+        nr.stage_role = llama_rerot_stage_role::worker;
+        if (!ep->source_end_marker.empty()) {
+            nr.exit_parser = server_rerot_marker_parser(ep->source_end_marker, true);
+        }
 
-        // Ensure nodes array is large enough
         if (nid >= ep->nodes.size()) {
             ep->nodes.resize(nid + 1);
         }
@@ -2118,7 +2499,6 @@ bool server_rerot_runtime::initialize_dag(
         str_to_nid[q.id] = nid;
     }
 
-    // Add edges
     for (const auto & dep : decision.dependencies) {
         auto from_nid = str_to_nid.at(dep.from_id);
         auto to_nid = str_to_nid.at(dep.to_id);
@@ -2127,16 +2507,121 @@ bool server_rerot_runtime::initialize_dag(
         }
     }
 
-    // Populate ready_queue with initial eligible nodes (in_degree == 0)
-    ep->ready_queue.clear();
     for (const auto & q : decision.questions) {
-        auto nid = str_to_nid.at(q.id);
-        const auto * n = ep->document.node(nid);
-        if (n && n->predecessors.empty()) {
-            ep->ready_queue.push_back(nid);
+        if (!ep->document.add_edge(0, str_to_nid.at(q.id), error_out)) {
+            return false;
         }
     }
 
+    auto synth = ep->document.create_child(ep->document.root(), "0.synthesize", llama_rerot_node_state::queued);
+    ep->document.set_plan_rank(synth, static_cast<uint32_t>(decision.questions.size()));
+    ep->document.set_stage_role(synth, llama_rerot_stage_role::synthesis);
+    if (synth >= ep->nodes.size()) {
+        ep->nodes.resize(synth + 1);
+    }
+    server_rerot_node_runtime synth_nr;
+    synth_nr.id = synth;
+    synth_nr.string_id = "0";
+    synth_nr.intent = "0.synthesize";
+    synth_nr.planner_armed = false;
+    synth_nr.stage_role = llama_rerot_stage_role::synthesis;
+    if (!ep->source_end_marker.empty()) {
+        synth_nr.exit_parser = server_rerot_marker_parser(ep->source_end_marker, true);
+    }
+    ep->nodes[synth] = std::move(synth_nr);
+    ep->synthesis_node = synth;
+    for (const auto & q : decision.questions) {
+        if (!ep->document.add_edge(str_to_nid.at(q.id), synth, error_out)) {
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < ep->nodes.size(); ++i) {
+        const auto * doc_n = ep->document.node(static_cast<llama_rerot_node_id>(i));
+        if (doc_n) {
+            ep->nodes[i].remaining_preds = static_cast<uint32_t>(doc_n->predecessors.size());
+        }
+    }
+
+    // Plan submission completes 0.plan. Decrement worker remaining_preds exactly once.
+    ep->nodes[0].remaining_preds = 0;
+    ep->nodes[0].is_sealed = true;
+    ep->document.set_node_state(0, llama_rerot_node_state::retired);
+    const auto * root_doc = ep->document.node(0);
+    if (root_doc) {
+        for (const auto succ : root_doc->successors) {
+            if (succ < ep->nodes.size() && ep->nodes[succ].remaining_preds > 0) {
+                --ep->nodes[succ].remaining_preds;
+            }
+        }
+    }
+
+    ep->ready_queue.clear();
+    ep->frozen_read_publish_epoch = ep->publish_epoch;
+    for (size_t i = 1; i < ep->nodes.size(); ++i) {
+        if (ep->nodes[i].is_sealed) {
+            continue;
+        }
+        if (ep->nodes[i].remaining_preds == 0) {
+            ep->ready_queue.push_back(static_cast<llama_rerot_node_id>(i));
+            ep->nodes[i].enqueue_frontier = ep->frontier;
+        }
+    }
+
+    return true;
+}
+
+void server_rerot_runtime::set_dag_protocol_markers(
+        uint64_t episode_id,
+        std::string_view source_end_marker,
+        std::string_view think_start_marker) {
+    auto * ep = episode(episode_id);
+    if (!ep) {
+        return;
+    }
+    ep->source_end_marker = std::string(source_end_marker);
+    ep->think_start_marker = std::string(think_start_marker);
+}
+
+bool server_rerot_runtime::capture_c0(uint64_t episode_id, llama_seq_id seq_id, llama_pos n_prompt_tokens) {
+    auto * ep = episode(episode_id);
+    if (!ep || seq_id < 0 || n_prompt_tokens < 0) {
+        return false;
+    }
+    ep->c0.seq_id = seq_id;
+    ep->c0.n_prompt_tokens = n_prompt_tokens;
+    ep->c0.captured = true;
+    auto * root = node(episode_id, 0);
+    if (root && !root->hand_seed.empty()) {
+        ep->c0.gdn_recurrent_states = root->hand_seed;
+    }
+    return ep->c0.valid();
+}
+
+bool server_rerot_runtime::capture_c_base(uint64_t episode_id) {
+    auto * ep = episode(episode_id);
+    if (!ep || !ep->c0.valid()) {
+        return false;
+    }
+    ep->c_base = ep->c0;
+    return ep->c_base.valid();
+}
+
+bool server_rerot_runtime::activate_dag_frontier(uint64_t episode_id) {
+    auto * ep = episode(episode_id);
+    if (!ep || !ep->is_dag) {
+        return false;
+    }
+    ep->frozen_read_publish_epoch = ep->publish_epoch;
+    const auto eligible = get_eligible_dag_nodes(episode_id);
+    for (const auto nid : eligible) {
+        if (std::find(ep->ready_queue.begin(), ep->ready_queue.end(), nid) == ep->ready_queue.end()) {
+            ep->ready_queue.push_back(nid);
+        }
+        if (nid < ep->nodes.size()) {
+            ep->nodes[nid].enqueue_frontier = ep->frontier;
+        }
+    }
     return true;
 }
 
@@ -2157,16 +2642,7 @@ std::vector<llama_rerot_node_id> server_rerot_runtime::get_eligible_dag_nodes(ui
             doc_node->state == llama_rerot_node_state::starting) {
             continue;
         }
-
-        // All predecessors must be sealed
-        bool all_preds_sealed = true;
-        for (const auto pred : doc_node->predecessors) {
-            if (pred < ep->nodes.size() && !ep->nodes[pred].is_sealed) {
-                all_preds_sealed = false;
-                break;
-            }
-        }
-        if (all_preds_sealed) {
+        if (nr.remaining_preds == 0) {
             eligible.push_back(static_cast<llama_rerot_node_id>(i));
         }
     }
@@ -2182,14 +2658,31 @@ bool server_rerot_runtime::seal_dag_node(
         return false;
     }
 
+    if (origin == llama_rerot_event_origin::runtime_frame ||
+        origin == llama_rerot_event_origin::foreign_export ||
+        origin == llama_rerot_event_origin::unknown) {
+        return false;
+    }
+
     auto & nr = ep->nodes[node_id];
     if (nr.is_sealed) {
-        return true; // Idempotent (§07.5)
+        return true; // Idempotent (§07.5): do not decrement twice
     }
 
     nr.is_sealed = true;
     nr.completion_origin = origin;
     ep->document.set_node_state(node_id, llama_rerot_node_state::retired);
+    ep->running.erase(node_id);
+    ep->starting.erase(node_id);
+
+    const auto * doc_n = ep->document.node(node_id);
+    if (doc_n) {
+        for (const auto succ : doc_n->successors) {
+            if (succ < ep->nodes.size() && ep->nodes[succ].remaining_preds > 0) {
+                --ep->nodes[succ].remaining_preds;
+            }
+        }
+    }
 
     // Release pen if bound
     if (nr.pen_id >= 0) {
@@ -2383,19 +2876,23 @@ bool server_rerot_runtime::admit_next_child(
     const auto child_id = *best_it;
     auto * child = node(episode_id, child_id);
     const auto * child_doc = current->document.node(child_id);
-    if (!child || !child_doc || child_doc->state != llama_rerot_node_state::queued || child->parked_seq < 0) {
+    if (!child || !child_doc || child_doc->state != llama_rerot_node_state::queued) {
+        return fail_episode(*current, "RERoT ready queue contains an invalid parked child");
+    }
+    if (!current->is_dag && child->parked_seq < 0) {
         return fail_episode(*current, "RERoT ready queue contains an invalid parked child");
     }
 
     if (memory_) {
-        if (current->archive_seq < 0) {
+        if (!current->is_dag && current->archive_seq < 0) {
             return fail_episode(*current, "RERoT child admission has no archive sequence");
         }
-        if (current->base_prefix_end > 0) {
+        if (current->base_prefix_end > 0 && current->archive_seq >= 0) {
             llama_memory_seq_cp_attention(
                 memory_, current->archive_seq, exec_seq, 0, current->base_prefix_end);
         }
 
+        if (!current->is_dag) {
         // Transfer every parked visible run to the physical execution
         // sequence, then release the logical parking reference. The previous
         // single-anchor reconstruction dropped sibling-specific sparse runs
@@ -2407,6 +2904,7 @@ bool server_rerot_runtime::admit_next_child(
             return fail_episode(
                 *current,
                 "failed to transfer parked attention state during admission");
+        }
         }
 
         const auto * parent_doc = current->document.node(child_doc->parent);
@@ -2430,7 +2928,16 @@ bool server_rerot_runtime::admit_next_child(
                 }
             }
         }
-        if (!anchor ||
+        if (current->is_dag) {
+            const auto & seed = !current->c_base.gdn_recurrent_states.empty()
+                ? current->c_base.gdn_recurrent_states
+                : current->c0.gdn_recurrent_states;
+            if (!seed.empty() &&
+                !llama_memory_rerot_apply_hand_seed(
+                    memory_, exec_seq, seed.data(), seed.size())) {
+                return fail_episode(*current, "failed to restore DAG C_base hand seed");
+            }
+        } else if (!anchor ||
             int64_t(anchor->storage_pos0) + int64_t(anchor->token_count) !=
                 child->storage_pos_next ||
             llama_memory_rerot_add_run_ref(
@@ -2438,9 +2945,7 @@ bool server_rerot_runtime::admit_next_child(
             return fail_episode(
                 *current,
                 "RERoT child admission could not anchor the fork frontier");
-        }
-
-        if (child->hand_seed.empty() ||
+        } else if (child->hand_seed.empty() ||
             !llama_memory_rerot_apply_hand_seed(
                 memory_,
                 exec_seq,
@@ -2452,7 +2957,9 @@ bool server_rerot_runtime::admit_next_child(
         }
     }
 
-    free_internal_seq(child->parked_seq);
+    if (child->parked_seq >= 0) {
+        free_internal_seq(child->parked_seq);
+    }
     child->parked_seq = -1;
     child->pen_id = physical_slot;
     child->physical_slot = physical_slot;
@@ -2605,7 +3112,42 @@ server_rerot_frontier_result server_rerot_runtime::finish_frontier(uint64_t epis
     });
 
     llama_rerot_node_id final_candidate = LLAMA_REROT_NODE_INVALID;
-    if (!exits.empty() &&
+    if (current->is_dag) {
+        for (size_t i = 1; i < current->nodes.size(); ++i) {
+            if (i == current->synthesis_node) {
+                continue;
+            }
+            auto * sealed = node(episode_id, static_cast<llama_rerot_node_id>(i));
+            if (!sealed || !sealed->is_sealed || sealed->physical_slot < 0 || sealed->exec_seq < 0) {
+                continue;
+            }
+            int released_slot = -1;
+            if (!retire_node(*current, *sealed, &released_slot)) {
+                break;
+            }
+            result.retired.push_back(static_cast<llama_rerot_node_id>(i));
+            if (released_slot >= 0) {
+                result.released_slots.push_back(released_slot);
+            }
+        }
+        auto * synth = current->synthesis_node != LLAMA_REROT_NODE_INVALID
+            ? node(episode_id, current->synthesis_node)
+            : nullptr;
+        if (synth && !synth->is_sealed) {
+            result.synthesis_node = current->synthesis_node;
+            if (synth->remaining_preds == 0 &&
+                std::find(current->ready_queue.begin(), current->ready_queue.end(),
+                          current->synthesis_node) == current->ready_queue.end() &&
+                current->running.count(current->synthesis_node) == 0 &&
+                current->starting.count(current->synthesis_node) == 0) {
+                current->ready_queue.push_back(current->synthesis_node);
+                synth->enqueue_frontier = current->frontier;
+            }
+            if (synth->exit_intent && current->running.count(current->synthesis_node) != 0) {
+                final_candidate = current->synthesis_node;
+            }
+        }
+    } else if (!exits.empty() &&
         exits.size() == current->running.size() &&
         current->ready_queue.empty() &&
         current->starting.empty() &&
@@ -2616,22 +3158,24 @@ server_rerot_frontier_result server_rerot_runtime::finish_frontier(uint64_t epis
         final_candidate = exits.back();
     }
 
-    for (const auto node_id : exits) {
-        if (node_id == final_candidate) {
-            continue;
-        }
-        auto * current_node = node(episode_id, node_id);
-        if (!current_node) {
-            fail_episode(*current, "RERoT exit set references a missing node");
-            break;
-        }
-        int released_slot = -1;
-        if (!retire_node(*current, *current_node, &released_slot)) {
-            break;
-        }
-        result.retired.push_back(node_id);
-        if (released_slot >= 0) {
-            result.released_slots.push_back(released_slot);
+    if (!current->is_dag) {
+        for (const auto node_id : exits) {
+            if (node_id == final_candidate) {
+                continue;
+            }
+            auto * current_node = node(episode_id, node_id);
+            if (!current_node) {
+                fail_episode(*current, "RERoT exit set references a missing node");
+                break;
+            }
+            int released_slot = -1;
+            if (!retire_node(*current, *current_node, &released_slot)) {
+                break;
+            }
+            result.retired.push_back(node_id);
+            if (released_slot >= 0) {
+                result.released_slots.push_back(released_slot);
+            }
         }
     }
 
@@ -2639,8 +3183,9 @@ server_rerot_frontier_result server_rerot_runtime::finish_frontier(uint64_t epis
         result.final_node = final_candidate;
         current->finalizing = true;
         const auto * survivor = node(episode_id, final_candidate);
-        if (!survivor || !survivor->exit_intent ||
-            current->running.find(final_candidate) == current->running.end()) {
+        if (!survivor ||
+            current->running.find(final_candidate) == current->running.end() ||
+            (!current->is_dag && !survivor->exit_intent)) {
             fail_episode(*current, "RERoT final survivor lost its live execution state");
             result.final_node = LLAMA_REROT_NODE_INVALID;
         }
@@ -3053,7 +3598,7 @@ bool server_rerot_runtime::refresh_final_fence(
     // memory: nothing queued, starting, or suspended, exactly this Lane still RUNNING.
     if (!current->ready_queue.empty() || !current->starting.empty() || !current->suspended.empty() ||
         current->running.size() != 1 || current->running.count(node_id) != 1 ||
-        !survivor->exit_intent || survivor->exec_seq < 0) {
+        (!current->is_dag && !survivor->exit_intent) || survivor->exec_seq < 0) {
         return fail_episode(*current, "RERoT final fence lost its single-survivor precondition");
     }
     // Install the stable view through the final public frontier. This method
@@ -3092,7 +3637,8 @@ bool server_rerot_runtime::complete_serial_tail(uint64_t episode_id, llama_rerot
     if (!current || !survivor) {
         return false;
     }
-    if (current->hard_aborted || !current->finalizing || !current->fence_refreshed || !survivor->fence.complete() ||
+    if (current->hard_aborted || !current->finalizing || !current->fence_refreshed ||
+        (!current->is_dag && !survivor->fence.complete()) ||
         current->serial_tail || current->running.size() != 1 ||
         current->running.count(node_id) != 1) {
         return current ? fail_episode(*current, "invalid RERoT serial tail transition") : false;
@@ -3222,6 +3768,7 @@ constexpr uint8_t k_rerot_flag_finalize  = 1u << 1;
 constexpr uint8_t k_rerot_flag_aborted   = 1u << 2;
 constexpr uint8_t k_rerot_flag_fence     = 1u << 3;
 constexpr uint8_t k_rerot_flag_serial    = 1u << 4;
+constexpr uint8_t k_rerot_flag_dag       = 1u << 5;
 
 struct rerot_blob_writer {
     std::vector<uint8_t> buf;
@@ -3382,6 +3929,7 @@ void rerot_write_marker_snapshot(rerot_blob_writer & w, const server_rerot_marke
     w.str(s.candidate);
     w.u8(static_cast<uint8_t>(s.state));
     w.str(s.error);
+    w.u8(s.native_end ? 1 : 0);
 }
 
 bool rerot_read_marker_snapshot(rerot_blob_reader & r, server_rerot_marker_snapshot & s) {
@@ -3389,7 +3937,8 @@ bool rerot_read_marker_snapshot(rerot_blob_reader & r, server_rerot_marker_snaps
     std::string candidate = r.str();
     const uint8_t state = r.u8();
     std::string error = r.str();
-    if (!r.ok || state > static_cast<uint8_t>(server_rerot_marker_state::failed)) {
+    const uint8_t native_end = r.u8();
+    if (!r.ok || state > static_cast<uint8_t>(server_rerot_marker_state::failed) || native_end > 1) {
         r.ok = false;
         return false;
     }
@@ -3397,6 +3946,7 @@ bool rerot_read_marker_snapshot(rerot_blob_reader & r, server_rerot_marker_snaps
     s.candidate = std::move(candidate);
     s.state = static_cast<server_rerot_marker_state>(state);
     s.error = std::move(error);
+    s.native_end = native_end != 0;
     return true;
 }
 
@@ -3464,13 +4014,21 @@ server_rerot_marker_snapshot server_rerot_marker_parser::snapshot() const {
     s.candidate = candidate_;
     s.state = state_;
     s.error = error_;
+    s.native_end = native_end_;
     return s;
 }
 
 bool server_rerot_marker_parser::restore(const server_rerot_marker_snapshot & snap, std::string * error) {
-    if (!snap.marker.empty() && !valid_child_close_marker(snap.marker)) {
-        return rerot_state_set_error(
-            error, "RERoT state uses an obsolete or malformed child delimiter");
+    if (!snap.marker.empty()) {
+        if (snap.native_end) {
+            if (!valid_native_end_marker(snap.marker)) {
+                return rerot_state_set_error(
+                    error, "RERoT state uses an invalid native source-end marker");
+            }
+        } else if (!valid_child_close_marker(snap.marker)) {
+            return rerot_state_set_error(
+                error, "RERoT state uses an obsolete or malformed child delimiter");
+        }
     }
     if (snap.marker.empty() &&
         (snap.state != server_rerot_marker_state::public_text ||
@@ -3502,6 +4060,7 @@ bool server_rerot_marker_parser::restore(const server_rerot_marker_snapshot & sn
     candidate_ = snap.candidate;
     state_ = snap.state;
     error_ = snap.error;
+    native_end_ = snap.native_end;
     return true;
 }
 
@@ -3587,8 +4146,12 @@ std::vector<uint8_t> server_rerot_episode_save(
     if (episode.hard_aborted)             { flags |= k_rerot_flag_aborted; }
     if (episode.fence_refreshed)          { flags |= k_rerot_flag_fence; }
     if (episode.serial_tail)              { flags |= k_rerot_flag_serial; }
+    if (episode.is_dag)                   { flags |= k_rerot_flag_dag; }
     w.u8(flags);
     w.u32(episode.serial_node);
+    w.u32(episode.synthesis_node);
+    w.str(episode.source_end_marker);
+    w.str(episode.think_start_marker);
     w.str(episode.abort_reason);
     w.u64(episode.generated_public_tokens);
     w.u64(episode.generated_private_tokens);
@@ -3632,6 +4195,10 @@ std::vector<uint8_t> server_rerot_episode_save(
         for (const auto run : node->runs) {
             w.u32(run);
         }
+        w.u32(node->plan_rank);
+        w.u8(static_cast<uint8_t>(node->stage_role));
+        write_id_vec(node->predecessors);
+        write_id_vec(node->successors);
     }
 
     w.u32(static_cast<uint32_t>(episode.document.run_count()));
@@ -3643,6 +4210,7 @@ std::vector<uint8_t> server_rerot_episode_save(
         w.i32(run->storage_pos0);
         w.u32(run->token_count);
         w.u64(run->publish_epoch);
+        w.u8(static_cast<uint8_t>(run->kind));
     }
 
     w.u32(static_cast<uint32_t>(episode.nodes.size()));
@@ -3677,6 +4245,12 @@ std::vector<uint8_t> server_rerot_episode_save(
         w.u64(node.view_stamp.topology_epoch);
         w.u64(node.view_stamp.publish_epoch);
         w.u64(node.view_stamp.layout_epoch);
+        w.u32(node.remaining_preds);
+        w.u8(static_cast<uint8_t>(node.stage_role));
+        w.u8(node.is_sealed ? 1 : 0);
+        w.str(node.string_id);
+        w.str(node.intent);
+        w.u8(static_cast<uint8_t>(node.completion_origin));
     }
     return std::move(w.buf);
 }
@@ -3692,12 +4266,17 @@ struct rerot_node_blob {
     std::string title;
     std::vector<llama_rerot_node_id> children;
     std::vector<llama_rerot_run_id> runs;
+    uint32_t plan_rank = 0;
+    llama_rerot_stage_role stage_role = llama_rerot_stage_role::planner;
+    std::vector<llama_rerot_node_id> predecessors;
+    std::vector<llama_rerot_node_id> successors;
 };
 
 struct rerot_run_blob {
     llama_rerot_run_id id = LLAMA_REROT_RUN_INVALID;
     llama_rerot_node_id owner = LLAMA_REROT_NODE_INVALID;
     llama_rerot_visibility visibility = llama_rerot_visibility::public_live;
+    llama_rerot_segment_kind kind = llama_rerot_segment_kind::body;
     llama_pos storage_pos0 = 0;
     uint32_t token_count = 0;
     uint64_t publish_epoch = 0;
@@ -3720,6 +4299,12 @@ struct rerot_runtime_blob {
     std::vector<uint8_t> hand_seed;
     server_rerot_fence_checkpoint fence;
     llama_rerot_view_stamp view_stamp = {0, 0, 0};
+    uint32_t remaining_preds = 0;
+    llama_rerot_stage_role stage_role = llama_rerot_stage_role::planner;
+    bool is_sealed = false;
+    std::string string_id;
+    std::string intent;
+    llama_rerot_event_origin completion_origin = llama_rerot_event_origin::unknown;
 };
 
 } // namespace
@@ -3796,6 +4381,9 @@ bool server_rerot_episode_load(
     const llama_seq_id archive_seq = r.i32();
     const uint8_t flags = r.u8();
     const llama_rerot_node_id serial_node = r.u32();
+    const llama_rerot_node_id synthesis_node = r.u32();
+    std::string source_end_marker = r.str();
+    std::string think_start_marker = r.str();
     std::string abort_reason = r.str();
     const uint64_t gen_public = r.u64();
     const uint64_t gen_private = r.u64();
@@ -3813,7 +4401,7 @@ bool server_rerot_episode_load(
     if (episode_id == 0 || frontier == 0 || publish_epoch == 0 || topology_epoch == 0 || layout_epoch == 0) {
         return rerot_state_set_error(error_out, "RERoT episode load refused: zero episode id or epoch");
     }
-    if (base_prefix_end < 0 || (flags & 0xE0u) != 0) {
+    if (base_prefix_end < 0 || (flags & 0xC0u) != 0) {
         return rerot_state_set_error(error_out, "RERoT episode load refused: corrupt prefix end or flag bits");
     }
 
@@ -3878,6 +4466,18 @@ bool server_rerot_episode_load(
         for (uint32_t k = 0; k < n_runs; ++k) {
             nb.runs[k] = r.u32();
         }
+        nb.plan_rank = r.u32();
+        const uint8_t role = r.u8();
+        if (!r.ok || role > static_cast<uint8_t>(llama_rerot_stage_role::synthesis)) {
+            r.ok = false;
+            break;
+        }
+        nb.stage_role = static_cast<llama_rerot_stage_role>(role);
+        read_id_vec(nb.predecessors);
+        read_id_vec(nb.successors);
+        if (!r.ok) {
+            break;
+        }
         node_blobs.push_back(std::move(nb));
     }
     if (!r.ok) {
@@ -3898,10 +4498,13 @@ bool server_rerot_episode_load(
         rb.storage_pos0 = r.i32();
         rb.token_count = r.u32();
         rb.publish_epoch = r.u64();
-        if (!r.ok || !rerot_visibility_from_u8(vis, rb.visibility)) {
+        const uint8_t kind = r.u8();
+        if (!r.ok || !rerot_visibility_from_u8(vis, rb.visibility) ||
+            kind > static_cast<uint8_t>(llama_rerot_segment_kind::probe_control)) {
             r.ok = false;
             break;
         }
+        rb.kind = static_cast<llama_rerot_segment_kind>(kind);
         if (rb.storage_pos0 < 0) {
             r.ok = false;
             break;
@@ -3977,6 +4580,20 @@ bool server_rerot_episode_load(
         rb.view_stamp.topology_epoch = r.u64();
         rb.view_stamp.publish_epoch = r.u64();
         rb.view_stamp.layout_epoch = r.u64();
+        rb.remaining_preds = r.u32();
+        const uint8_t stage_role = r.u8();
+        const uint8_t sealed = r.u8();
+        rb.string_id = r.str();
+        rb.intent = r.str();
+        const uint8_t origin = r.u8();
+        if (!r.ok || stage_role > static_cast<uint8_t>(llama_rerot_stage_role::synthesis) ||
+            sealed > 1 || origin > static_cast<uint8_t>(llama_rerot_event_origin::forced_abort)) {
+            r.ok = false;
+            break;
+        }
+        rb.stage_role = static_cast<llama_rerot_stage_role>(stage_role);
+        rb.is_sealed = sealed != 0;
+        rb.completion_origin = static_cast<llama_rerot_event_origin>(origin);
         if (!r.ok || rb.storage_pos_next < 0 || rb.physical_slot < -1 ||
             rb.exec_seq < -1 || rb.parked_seq < -1) {
             r.ok = false;
@@ -4074,7 +4691,7 @@ bool server_rerot_episode_load(
         for (uint32_t i = 0; i < n_runs; ++i) {
             const auto & rb = run_blobs[i];
             const auto made = rebuilt.document.append_run(
-                rb.owner, rb.visibility, rb.storage_pos0, rb.token_count, rb.publish_epoch);
+                rb.owner, rb.visibility, rb.storage_pos0, rb.token_count, rb.publish_epoch, rb.kind);
             if (made != i) {
                 return rerot_state_set_error(error_out, "RERoT episode load refused: run id skew during rebuild");
             }
@@ -4092,6 +4709,21 @@ bool server_rerot_episode_load(
         std::string verr;
         if (!rebuilt.document.validate(&verr)) {
             return rerot_state_set_error(error_out, "RERoT episode load refused: document validation failed: " + verr);
+        }
+    }
+    const bool is_dag = (flags & k_rerot_flag_dag) != 0;
+    if (is_dag) {
+        rebuilt.document.set_dag_mode(true);
+        for (uint32_t i = 0; i < n_nodes; ++i) {
+            const auto & nb = node_blobs[i];
+            rebuilt.document.set_plan_rank(i, nb.plan_rank);
+            rebuilt.document.set_stage_role(i, nb.stage_role);
+            for (const auto pred : nb.predecessors) {
+                std::string eerr;
+                if (!rebuilt.document.add_edge(pred, i, &eerr)) {
+                    return rerot_state_set_error(error_out, "RERoT episode load refused: DAG edge restore: " + eerr);
+                }
+            }
         }
     }
 
@@ -4127,6 +4759,12 @@ bool server_rerot_episode_load(
         node.hand_seed = sb.hand_seed;
         node.fence = sb.fence;
         node.view_stamp = sb.view_stamp;
+        node.remaining_preds = sb.remaining_preds;
+        node.stage_role = sb.stage_role;
+        node.is_sealed = sb.is_sealed;
+        node.string_id = sb.string_id;
+        node.intent = sb.intent;
+        node.completion_origin = sb.completion_origin;
         const auto check_ref = [&](const std::optional<llama_rerot_run_id> & ref, llama_rerot_visibility want) {
             if (!ref.has_value()) {
                 return true;
@@ -4169,6 +4807,14 @@ bool server_rerot_episode_load(
     rebuilt.fence_refreshed = (flags & k_rerot_flag_fence) != 0;
     rebuilt.serial_tail = (flags & k_rerot_flag_serial) != 0;
     rebuilt.serial_node = serial_node;
+    rebuilt.is_dag = is_dag;
+    rebuilt.strategy_decided = is_dag;
+    rebuilt.synthesis_node = synthesis_node;
+    rebuilt.source_end_marker = std::move(source_end_marker);
+    rebuilt.think_start_marker = think_start_marker.empty() ? std::string("<think>") : std::move(think_start_marker);
+    if (rebuilt.synthesis_node != LLAMA_REROT_NODE_INVALID && rebuilt.synthesis_node >= n_nodes) {
+        return rerot_state_set_error(error_out, "RERoT episode load refused: synthesis node out of range");
+    }
     if (rebuilt.serial_node != LLAMA_REROT_NODE_INVALID && rebuilt.serial_node >= n_nodes) {
         return rerot_state_set_error(error_out, "RERoT episode load refused: serial node out of range");
     }

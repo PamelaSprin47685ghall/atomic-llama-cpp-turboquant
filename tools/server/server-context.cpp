@@ -139,6 +139,7 @@ enum class server_rerot_injection_kind : uint8_t {
     worker,
     serial_resume,
     dag_frame,
+    probe,
 };
 
 static constexpr size_t SERVER_REROT_PRIVATE_BATCH = 32;
@@ -149,7 +150,8 @@ static bool server_rerot_private_microbatch(server_rerot_injection_kind injectio
            injection == server_rerot_injection_kind::child_open ||
            injection == server_rerot_injection_kind::worker ||
            injection == server_rerot_injection_kind::serial_resume ||
-           injection == server_rerot_injection_kind::dag_frame;
+           injection == server_rerot_injection_kind::dag_frame ||
+           injection == server_rerot_injection_kind::probe;
 }
 
 struct server_slot; // forward declaration
@@ -1241,6 +1243,7 @@ private:
         uint64_t parallel_elapsed_us = 0;
         bool parallel_finished = false;
         common_grammar saved_user_grammar;
+        common_sampler_ptr c0_sampler;
 
         explicit rerot_transport_state(server_task && task)
             : response_task(std::move(task)) {
@@ -1541,6 +1544,55 @@ private:
               "现在按照当前模型的原生对话格式给出最终回答。\n";
     }
 
+    std::pair<std::string, std::string> rerot_native_think_tags() const {
+        if (!chat_params.tmpls) {
+            return {};
+        }
+        common_chat_templates_inputs inputs;
+        inputs.use_jinja = chat_params.use_jinja;
+        inputs.enable_thinking = true;
+        try {
+            const auto applied = common_chat_templates_apply(chat_params.tmpls.get(), inputs);
+            if (!applied.supports_thinking ||
+                applied.thinking_start_tag.empty() ||
+                applied.thinking_end_tags.empty()) {
+                return {};
+            }
+            return {applied.thinking_start_tag, applied.thinking_end_tags.front()};
+        } catch (...) {
+            return {};
+        }
+    }
+
+    static void rerot_install_routing_grammar(task_params & params) {
+        (void) server_rerot_take_user_grammar(params);
+        params.sampling.grammar = {
+            COMMON_GRAMMAR_TYPE_USER,
+            server_rerot_routing_grammar(),
+        };
+        params.sampling.grammar_lazy = false;
+        params.sampling.grammar_triggers.clear();
+        params.sampling.preserved_tokens.clear();
+    }
+
+    static bool rerot_install_source_end_grammar(
+            task_params & params,
+            std::string_view close_marker) {
+        std::string grammar = server_rerot_source_end_grammar(close_marker);
+        if (grammar.empty()) {
+            return false;
+        }
+        params.sampling.grammar = {
+            COMMON_GRAMMAR_TYPE_USER,
+            std::move(grammar),
+        };
+        params.sampling.grammar_lazy = false;
+        params.sampling.grammar_triggers.clear();
+        params.sampling.preserved_tokens.clear();
+        return true;
+    }
+
+
     bool rerot_set_injection(
             server_slot & slot,
             server_rerot_injection_kind kind,
@@ -1615,11 +1667,19 @@ private:
             return false;
         }
 
+        common_sampler_ptr c0_sampler;
+        if (slot.smpl) {
+            c0_sampler.reset(common_sampler_clone(slot.smpl.get()));
+        }
+
         server_task root_lane_task = rerot_clone_task(*slot.task);
         root_lane_task.params.sampling.reasoning_budget_start.clear();
         root_lane_task.params.sampling.reasoning_budget_end.clear();
         root_lane_task.params.sampling.reasoning_budget_tokens = -1;
-        rerot_install_planner_grammar(root_lane_task.params);
+        rerot_install_routing_grammar(root_lane_task.params);
+        if (root_lane_task.params.sampling.grammar.empty()) {
+            return false;
+        }
         if (root_lane_task.params.sampling.seed != LLAMA_DEFAULT_SEED &&
             root_lane_task.index > 0) {
             uint64_t mixed = root_lane_task.params.sampling.seed ^
@@ -1671,18 +1731,24 @@ private:
                 ? llama_memory_rerot_capture_hand_seed(
                     memory, slot.id, nullptr, 0)
                 : 0;
-        if (!root_node || root_seed_size == 0) {
+        if (!root_node) {
             rerot->erase_episode(episode_id);
             return false;
         }
-        root_node->hand_seed.resize(root_seed_size);
-        if (llama_memory_rerot_capture_hand_seed(
-                memory,
-                slot.id,
-                root_node->hand_seed.data(),
-                root_node->hand_seed.size()) != root_node->hand_seed.size()) {
-            rerot->erase_episode(episode_id);
-            return false;
+        // Pure Transformer recurrent data may be empty; C0 validity is not
+        // "GDN blob non-empty" (AGENTS.md §02.2).
+        if (root_seed_size > 0) {
+            root_node->hand_seed.resize(root_seed_size);
+            if (llama_memory_rerot_capture_hand_seed(
+                    memory,
+                    slot.id,
+                    root_node->hand_seed.data(),
+                    root_node->hand_seed.size()) != root_node->hand_seed.size()) {
+                rerot->erase_episode(episode_id);
+                return false;
+            }
+        } else {
+            root_node->hand_seed.clear();
         }
 
         // Bound total work at episode scope, never per child/depth and never
@@ -1714,6 +1780,7 @@ private:
         transport->triattention_compressed = slot.triattention_compressed;
         transport->started_us = ggml_time_us();
         transport->saved_user_grammar = slot.task->params.sampling.grammar;
+        transport->c0_sampler = std::move(c0_sampler);
         rerot_transport.emplace(episode_id, std::move(transport));
 
         slot.task = std::make_unique<const server_task>(std::move(root_lane_task));
@@ -1747,10 +1814,17 @@ private:
             common_speculative_set_paused(spec.get(), slot.id, true);
         }
 
+        auto * episode = rerot->episode(episode_id);
+        if (!episode || !rerot->capture_c0(episode_id, slot.id, slot.prompt.tokens.pos_next())) {
+            rerot_erase_episode(episode_id);
+            return false;
+        }
+        episode->probing = true;
+        episode->strategy_decided = false;
         if (!rerot_set_injection(
                 slot,
-                server_rerot_injection_kind::planner,
-                rerot_planner_control_prompt())) {
+                server_rerot_injection_kind::probe,
+                std::string(server_rerot_routing_probe_prompt()))) {
             rerot_propagate_hard_abort();
             return false;
         }
@@ -1760,6 +1834,155 @@ private:
             llama_rerot_frontier_mode_name(slot.task->params.rerot_frontier));
         return true;
     }
+
+    bool rerot_discard_probe_kv(server_slot & slot, uint64_t episode_id) {
+        auto * episode = rerot ? rerot->episode(episode_id) : nullptr;
+        auto transport_it = rerot_transport.find(episode_id);
+        if (!episode || !episode->c0.valid() || transport_it == rerot_transport.end()) {
+            return false;
+        }
+        llama_memory_t memory = llama_get_memory(ctx_tgt);
+        if (memory) {
+            // Probe tokens share the C0 sequence. Drop only the attention
+            // suffix, then restore the captured C0 recurrent seed. seq_rm of
+            // the whole sequence is not a C0 rollback (AGENTS.md §02.2).
+            if (!llama_memory_seq_rm_attention(
+                    memory, slot.id, episode->c0.n_prompt_tokens, -1)) {
+                rerot->hard_abort(episode_id, "rerot_state_error: failed to discard isolated probe tokens");
+                return false;
+            }
+            const auto & seed = episode->c0.gdn_recurrent_states;
+            if (!seed.empty() &&
+                !llama_memory_rerot_apply_hand_seed(
+                    memory, slot.id, seed.data(), seed.size())) {
+                rerot->hard_abort(
+                    episode_id,
+                    "rerot_state_error: failed to restore C0 recurrent seed after probe");
+                return false;
+            }
+        }
+        auto lineage_it = transport_it->second->lineage_tokens.find(0);
+        if (lineage_it != transport_it->second->lineage_tokens.end()) {
+            slot.prompt.tokens = lineage_it->second.clone();
+        }
+        auto * root = rerot->node(episode_id, 0);
+        if (root) {
+            root->storage_pos_next = episode->c0.n_prompt_tokens;
+        }
+        episode->probing = false;
+        return true;
+    }
+
+    bool rerot_enter_simple(server_slot & slot, uint64_t episode_id) {
+        auto * episode = rerot ? rerot->episode(episode_id) : nullptr;
+        auto transport_it = rerot_transport.find(episode_id);
+        auto * root = rerot ? rerot->node(episode_id, 0) : nullptr;
+        if (!episode || !root || transport_it == rerot_transport.end() || !slot.task) {
+            return false;
+        }
+        if (!rerot_discard_probe_kv(slot, episode_id)) {
+            return false;
+        }
+        episode->strategy_decided = true;
+        episode->is_dag = false;
+        root->planner_armed = false;
+
+        server_task cont = rerot_clone_task(transport_it->second->response_task);
+        cont.params.sampling.reasoning_budget_start.clear();
+        cont.params.sampling.reasoning_budget_end.clear();
+        cont.params.sampling.reasoning_budget_tokens = -1;
+        if (!transport_it->second->c0_sampler) {
+            rerot->hard_abort(episode_id, "rerot_state_error: missing C0 sampler for simple continuation");
+            return false;
+        }
+        slot.task = std::make_unique<const server_task>(std::move(cont));
+        slot.smpl = std::move(transport_it->second->c0_sampler);
+        slot.init_sampler();
+        rerot_bind_sampler(slot);
+        episode->serial_tail = true;
+        episode->serial_node = 0;
+        slot.rerot_serial_tail = true;
+        slot.rerot_injection = server_rerot_injection_kind::none;
+        slot.rerot_injection_tokens.clear();
+        slot.rerot_injection_cursor = 0;
+        SRV_INF("RERoT simple continuation: episode=%" PRIu64 " slot=%d\n", episode_id, slot.id);
+        return true;
+    }
+
+    bool rerot_enter_dag(
+            server_slot & slot,
+            uint64_t episode_id,
+            const server_rerot_routing_decision & decision) {
+        auto * episode = rerot ? rerot->episode(episode_id) : nullptr;
+        auto transport_it = rerot_transport.find(episode_id);
+        if (!episode || transport_it == rerot_transport.end()) {
+            return false;
+        }
+        const auto tags = rerot_native_think_tags();
+        if (tags.first.empty() || tags.second.empty()) {
+            rerot->hard_abort(episode_id, "rerot_protocol_error: chat template has no native reasoning tags for DAG");
+            return false;
+        }
+        if (!rerot_discard_probe_kv(slot, episode_id)) {
+            return false;
+        }
+        rerot->set_dag_protocol_markers(episode_id, tags.second, tags.first);
+        if (!rerot->capture_c_base(episode_id)) {
+            rerot->hard_abort(episode_id, "rerot_state_error: failed to capture C_base");
+            return false;
+        }
+        std::string err;
+        if (!rerot->initialize_dag(episode_id, decision, &err)) {
+            rerot->hard_abort(episode_id, "rerot_protocol_error: " + (err.empty() ? std::string("invalid DAG plan") : err));
+            return false;
+        }
+        if (llama_get_memory(ctx_tgt) && !rerot->sync_public_archive(episode_id)) {
+            rerot->hard_abort(episode_id, "rerot_state_error: failed to archive C_base prefix");
+            return false;
+        }
+        auto & lineage = transport_it->second->lineage_tokens;
+        auto root_lineage = lineage.find(0);
+        if (root_lineage == lineage.end()) {
+            rerot->hard_abort(episode_id, "rerot_state_error: missing C0 lineage tape");
+            return false;
+        }
+        episode = rerot->episode(episode_id);
+        for (size_t i = 1; i < episode->nodes.size(); ++i) {
+            lineage.insert_or_assign(static_cast<llama_rerot_node_id>(i), root_lineage->second.clone());
+        }
+        const int released_slot = slot.id;
+        if (!rerot->detach_node(episode_id, 0)) {
+            rerot->hard_abort(episode_id, "rerot_state_error: failed to detach 0.plan after DAG submit");
+            return false;
+        }
+        rerot_make_slot_idle(slot);
+        if (!rerot->activate_dag_frontier(episode_id) || !rerot_admit_ready(episode_id)) {
+            return false;
+        }
+        SRV_INF("RERoT DAG start: episode=%" PRIu64 " nodes=%zu released_slot=%d\n",
+            episode_id, episode->nodes.size(), released_slot);
+        return true;
+    }
+
+    bool rerot_try_finish_probe(server_slot & slot) {
+        auto * episode = rerot ? rerot->episode(slot.rerot_episode_id) : nullptr;
+        if (!episode || !episode->probing || episode->strategy_decided) {
+            return true;
+        }
+        const auto decision = server_rerot_parse_routing_decision(episode->probe_bytes);
+        if (!decision.error.empty()) {
+            return true;
+        }
+        if (decision.is_simple()) {
+            return rerot_enter_simple(slot, slot.rerot_episode_id);
+        }
+        if (decision.is_dag()) {
+            return rerot_enter_dag(slot, slot.rerot_episode_id, decision);
+        }
+        rerot->hard_abort(slot.rerot_episode_id, "rerot_protocol_error: routing probe produced an invalid strategy");
+        return false;
+    }
+
 
     bool rerot_plan_next_token(server_slot & slot) {
         if (!slot.rerot_internal || !rerot || slot.rerot_episode_id == 0 ||
@@ -1785,7 +2008,7 @@ private:
         std::optional<server_rerot_token_plan> plan;
         if (forced && server_rerot_private_microbatch(slot.rerot_injection)) {
             auto plans = (slot.rerot_injection == server_rerot_injection_kind::dag_frame)
-                ? rerot->plan_private_span(
+                ? rerot->plan_frame_span(
                     slot.rerot_episode_id,
                     slot.rerot_node_id,
                     lane->storage_pos_next,
@@ -2002,12 +2225,23 @@ private:
         slot.rerot_inflight_forced = false;
         slot.triattention_compressed = transport_it->second->triattention_compressed;
 
-        const std::string open_marker = lane->control_open();
-        if (open_marker.empty() ||
-            !rerot_set_injection(
-                slot,
-                server_rerot_injection_kind::child_open,
-                open_marker + "\n")) {
+        if (episode->is_dag) {
+            const bool is_synth = lane->stage_role == llama_rerot_stage_role::synthesis;
+            const std::string frame = server_rerot_format_fixed_entry(
+                lane->string_id.empty() ? "0" : lane->string_id,
+                lane->intent,
+                is_synth,
+                episode->source_end_marker,
+                episode->think_start_marker);
+            if (frame.empty() ||
+                !rerot_set_injection(slot, server_rerot_injection_kind::dag_frame, frame)) {
+                rerot->hard_abort(episode_id, "rerot_protocol_error: failed to arm DAG fixed entry");
+                return false;
+            }
+        } else {
+            rerot->hard_abort(
+                episode_id,
+                "rerot_protocol_error: HTML planner production path is retired");
             return false;
         }
 
@@ -2095,11 +2329,18 @@ private:
             return {};
         }
 
-        const auto view = episode->document.build_view(reader);
+        const auto view = episode->is_dag
+            ? rerot->build_dag_view_for_reader(episode_id, reader)
+            : episode->document.build_view(reader);
         std::string result;
         for (const auto & view_run : view.runs) {
             const auto * run = episode->document.run(view_run.run_id);
             if (!run) {
+                continue;
+            }
+            if (run->kind == llama_rerot_segment_kind::frame ||
+                run->kind == llama_rerot_segment_kind::source_end ||
+                run->kind == llama_rerot_segment_kind::probe_control) {
                 continue;
             }
             const auto prefix_it =
@@ -2207,6 +2448,9 @@ private:
             }
             if (!slot.rerot_serial_tail &&
                 current_plan.visibility != llama_rerot_visibility::private_control &&
+                current_plan.segment_kind != llama_rerot_segment_kind::frame &&
+                current_plan.segment_kind != llama_rerot_segment_kind::source_end &&
+                current_plan.segment_kind != llama_rerot_segment_kind::probe_control &&
                 !rerot_stream_commit(
                     episode_id,
                     node_id,
@@ -2235,6 +2479,19 @@ private:
         }
 
         const bool forced = slot.rerot_inflight_forced;
+        auto * episode_now = rerot->episode(episode_id);
+        if (episode_now && episode_now->probing && !forced) {
+            episode_now->probe_bytes += slot.rerot_inflight_bytes;
+            for (const auto & extra : slot.rerot_inflight_extra_bytes) {
+                episode_now->probe_bytes += extra;
+            }
+            slot.rerot_inflight_plan.reset();
+            slot.rerot_inflight_bytes.clear();
+            slot.rerot_inflight_extra_plans.clear();
+            slot.rerot_inflight_extra_bytes.clear();
+            slot.rerot_inflight_forced = false;
+            return rerot_try_finish_probe(slot);
+        }
         const auto injection = slot.rerot_injection;
         const bool forced_complete = forced &&
             slot.rerot_injection_cursor == slot.rerot_injection_tokens.size();
@@ -2388,15 +2645,40 @@ private:
             slot.smpl = std::move(child_sampler);
             rerot_bind_sampler(slot);
         } else if (injection == server_rerot_injection_kind::planner) {
-            if (!rerot_set_injection(
-                    slot,
-                    server_rerot_injection_kind::planner_open,
-                    "<ol>\n<li>")) {
-                rerot->hard_abort(
-                    episode_id,
-                    "rerot_protocol_error: failed to arm planner list");
+            rerot->hard_abort(
+                episode_id,
+                "rerot_protocol_error: HTML planner production path is retired");
+            return false;
+        } else if (injection == server_rerot_injection_kind::probe) {
+            return true;
+        } else if (injection == server_rerot_injection_kind::dag_frame) {
+            const auto * lane = rerot->node(episode_id, node_id);
+            if (!lane ||
+                !rerot->publish_heading(episode_id, node_id, plan.run_id) ||
+                !rerot->complete_admission(episode_id, node_id)) {
+                rerot->hard_abort(episode_id, "rerot_protocol_error: DAG frame publication failed");
                 return false;
             }
+            server_task lane_task = rerot_clone_task(*slot.task);
+            rerot_remove_planner_grammar(lane_task.params);
+            if (!rerot_install_source_end_grammar(
+                    lane_task.params, lane->exit_parser.marker())) {
+                rerot->hard_abort(episode_id, "rerot_protocol_error: invalid native source-end grammar");
+                return false;
+            }
+            common_sampler_ptr lane_sampler;
+            try {
+                lane_sampler.reset(common_sampler_init(
+                    model_tgt, lane_task.params.sampling, (int32_t) llama_n_ctx(ctx_tgt)));
+            } catch (const std::exception & e) {
+                rerot->hard_abort(
+                    episode_id,
+                    std::string("rerot_sampler_error: failed to arm native source-end grammar: ") + e.what());
+                return false;
+            }
+            slot.task = std::make_unique<const server_task>(std::move(lane_task));
+            slot.smpl = std::move(lane_sampler);
+            rerot_bind_sampler(slot);
         }
         return true;
     }
@@ -2451,16 +2733,20 @@ private:
         // fork hand before serial continuation so their instructions cannot
         // echo into the final answer; PUBLIC branch facts remain in the stable
         // DDVR view and shared brain established by the acquire fence.
+        const auto * episode = rerot->episode(episode_id);
+        const bool dag_synth = episode && episode->is_dag;
         llama_memory_t memory = llama_get_memory(ctx_tgt);
-        if (!memory || lane->hand_seed.empty() ||
-            !llama_memory_rerot_apply_hand_seed(
-                memory,
-                lane->exec_seq,
-                lane->hand_seed.data(),
-                lane->hand_seed.size())) {
-            rerot->hard_abort(
-                episode_id, "rerot_state_error: failed to restore final serial hand");
-            return false;
+        if (!dag_synth) {
+            if (!memory || lane->hand_seed.empty() ||
+                !llama_memory_rerot_apply_hand_seed(
+                    memory,
+                    lane->exec_seq,
+                    lane->hand_seed.data(),
+                    lane->hand_seed.size())) {
+                rerot->hard_abort(
+                    episode_id, "rerot_state_error: failed to restore final serial hand");
+                return false;
+            }
         }
         rerot_note_parallel_end(episode_id, ggml_time_us());
 
@@ -2519,13 +2805,15 @@ private:
         slot.rerot_injection = server_rerot_injection_kind::none;
         slot.rerot_injection_tokens.clear();
         slot.rerot_injection_cursor = 0;
-        if (!rerot_set_injection(
-                slot,
-                server_rerot_injection_kind::serial_resume,
-                rerot_serial_resume_prompt(child_fence))) {
-            rerot->hard_abort(
-                episode_id, "rerot_protocol_error: failed to resume serial reasoning");
-            return false;
+        if (!dag_synth) {
+            if (!rerot_set_injection(
+                    slot,
+                    server_rerot_injection_kind::serial_resume,
+                    rerot_serial_resume_prompt(child_fence))) {
+                rerot->hard_abort(
+                    episode_id, "rerot_protocol_error: failed to resume serial reasoning");
+                return false;
+            }
         }
 
         if (child_fence) {

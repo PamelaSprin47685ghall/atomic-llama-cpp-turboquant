@@ -1214,7 +1214,7 @@ extern "C" {
     //
 
     #define LLAMA_REROT_STATE_MAGIC   0x52524f54u // 'RROT'
-    #define LLAMA_REROT_STATE_VERSION 3u
+    #define LLAMA_REROT_STATE_VERSION 4u
 
     enum llama_rerot_state_cap {
         LLAMA_REROT_STATE_CAP_NONE          = 0,

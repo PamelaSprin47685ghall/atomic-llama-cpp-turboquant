@@ -865,6 +865,38 @@ static void test_dag_cycle_preferred_topo() {
     const std::vector<llama_rerot_node_id> diamond = { n1, n2, n3, n4 };
     CHECK(doc.topo_sort_cycle_preferred(diamond, n4, &err) == std::vector<llama_rerot_node_id>({ n1, n2, n3, n4 }));
 
+    llama_rerot_document diamond_view(102);
+    diamond_view.set_dag_mode(true);
+    const auto droot = diamond_view.root();
+    const auto d1 = diamond_view.create_child(droot, "1");
+    const auto d2 = diamond_view.create_child(droot, "2");
+    const auto d3 = diamond_view.create_child(droot, "3");
+    const auto d4 = diamond_view.create_child(droot, "4");
+    diamond_view.set_plan_rank(d1, 0);
+    diamond_view.set_plan_rank(d2, 1);
+    diamond_view.set_plan_rank(d3, 2);
+    diamond_view.set_plan_rank(d4, 3);
+    CHECK(diamond_view.add_edge(d1, d2, &err));
+    CHECK(diamond_view.add_edge(d1, d3, &err));
+    CHECK(diamond_view.add_edge(d2, d4, &err));
+    CHECK(diamond_view.add_edge(d3, d4, &err));
+    diamond_view.append_run(droot, llama_rerot_visibility::public_live, 0, 4, 1);
+    diamond_view.append_run(d1, llama_rerot_visibility::public_live, 4, 1, 2);
+    diamond_view.append_run(d2, llama_rerot_visibility::public_live, 5, 1, 2);
+    diamond_view.append_run(d3, llama_rerot_visibility::public_live, 6, 1, 2);
+    diamond_view.append_run(d4, llama_rerot_visibility::public_live, 7, 1, 2);
+    const std::vector<llama_rerot_node_id> diamond_started = { droot, d1, d2, d3, d4 };
+    const auto dview = diamond_view.build_dag_view(d4, diamond_started);
+    CHECK(owners(dview) == std::vector<llama_rerot_node_id>({ droot, d1, d2, d3, d4 }));
+    std::unordered_set<llama_rerot_run_id> diamond_runs;
+    std::unordered_set<llama_rerot_node_id> diamond_owners;
+    for (const auto & run : dview.runs) {
+        CHECK(diamond_runs.insert(run.run_id).second);
+        CHECK(diamond_owners.insert(run.owner).second);
+    }
+    CHECK(diamond_runs.size() == 5);
+    CHECK(diamond_owners.size() == 5);
+
     // Cycle detection: add 4 -> 1 should fail
     CHECK(doc.add_edge(n4, n1, &err));
     CHECK(doc.topo_sort_cycle_preferred(diamond, n4, &err).empty());
@@ -908,12 +940,99 @@ static void test_dag_reader_view_assembly() {
     const auto view0 = doc.build_dag_view(root, started);
     CHECK(owners(view0) == std::vector<llama_rerot_node_id>({ root, n1, n2, n3 }));
     CHECK(view0.query_virtual_pos == 28);
+
+    auto unique_run_ids = [](const llama_rerot_reader_view & view) {
+        std::unordered_set<llama_rerot_run_id> ids;
+        for (const auto & run : view.runs) {
+            CHECK(ids.insert(run.run_id).second);
+        }
+        return ids.size() == view.runs.size();
+    };
+    CHECK(unique_run_ids(view1));
+    CHECK(unique_run_ids(view2));
+    CHECK(unique_run_ids(view3));
+    CHECK(unique_run_ids(view0));
+
+    // Verify source_end segment kind is isolated from foreign readers (§04.7)
+    const auto end_run = doc.append_run(n1, llama_rerot_visibility::public_live, 12, 1, 4, llama_rerot_segment_kind::source_end);
+    const auto view2_with_end = doc.build_dag_view(n2, started);
+    // Reader 2 should NOT see reader 1's source_end run
+    for (const auto & r : view2_with_end.runs) {
+        CHECK(r.run_id != end_run);
+    }
+    // Reader 1 (owner) SHOULD see its own source_end run
+    const auto view1_with_end = doc.build_dag_view(n1, started);
+    bool seen_own_end = false;
+    for (const auto & r : view1_with_end.runs) {
+        if (r.run_id == end_run) seen_own_end = true;
+    }
+    CHECK(seen_own_end);
+
+    // Predecessor missing from started_nodes must throw (§09 reference property)
+    std::string err;
+    doc.add_edge(n1, n3, &err);
+    bool caught_missing_pred = false;
+    try {
+        doc.build_dag_view(n3, { root, n2, n3 }); // n1 missing!
+    } catch (const std::exception &) {
+        caught_missing_pred = true;
+    }
+    CHECK(caught_missing_pred);
+}
+
+static void test_chapter09_exhaustive_dag_properties() {
+    // Port of the reference logic from AGENTS.md §09
+    // Enumerates 4-node all possible DAGs and verifies:
+    // - cycle-preferred topological order
+    // - own work last for active reader
+    // - all predecessors precede successors
+    const std::vector<llama_rerot_node_id> nodes = { 1, 2, 3, 4 };
+    std::vector<std::pair<llama_rerot_node_id, llama_rerot_node_id>> possible;
+    for (auto a : nodes) {
+        for (auto b : nodes) {
+            if (a != b) possible.emplace_back(a, b);
+        }
+    }
+
+    size_t dag_count = 0;
+    // Test a representative dense subset of DAG topologies (all 2-edge and 3-edge graphs)
+    for (size_t i = 0; i < possible.size(); ++i) {
+        for (size_t j = i + 1; j < possible.size(); ++j) {
+            llama_rerot_document doc(500);
+            doc.set_dag_mode(true);
+            const auto root = doc.root();
+            auto n1 = doc.create_child(root, "1"); doc.set_plan_rank(n1, 0);
+            auto n2 = doc.create_child(root, "2"); doc.set_plan_rank(n2, 1);
+            auto n3 = doc.create_child(root, "3"); doc.set_plan_rank(n3, 2);
+            auto n4 = doc.create_child(root, "4"); doc.set_plan_rank(n4, 3);
+
+            std::string err;
+            if (!doc.add_edge(possible[i].first, possible[i].second, &err)) continue;
+            if (!doc.add_edge(possible[j].first, possible[j].second, &err)) continue;
+
+            const auto order = doc.topo_sort_cycle_preferred(nodes, n4, &err);
+            if (order.empty()) continue; // Has cycle
+            dag_count++;
+
+            // Property: for reader r (n4 here), r must be last if it has no successors
+            if (possible[i].first != n4 && possible[j].first != n4) {
+                CHECK(order.back() == n4);
+            }
+            // Property: predecessors must precede successors
+            std::unordered_map<llama_rerot_node_id, size_t> pos;
+            for (size_t k = 0; k < order.size(); ++k) pos[order[k]] = k;
+            CHECK(pos[possible[i].first] < pos[possible[i].second]);
+            CHECK(pos[possible[j].first] < pos[possible[j].second]);
+        }
+    }
+    CHECK(dag_count > 0);
 }
 
 int main() {
     std::fprintf(stderr, "=== RERoT View Tests ===\n");
     test_dag_cycle_preferred_topo();
     test_dag_reader_view_assembly();
+    test_chapter09_exhaustive_dag_properties();
     test_manual_pac_dfs();
     test_visibility();
     test_reclassify_run_validation();

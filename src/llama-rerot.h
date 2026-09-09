@@ -52,6 +52,13 @@ enum class llama_rerot_event_origin : uint8_t {
     forced_abort,        // Cancel / resource exhaustion / error
 };
 
+// 0.plan and 0.synthesize share actor label 0 but must not share this identity.
+enum class llama_rerot_stage_role : uint8_t {
+    planner = 0,
+    worker,
+    synthesis,
+};
+
 // Metadata attached to the physical KV cell by llama_kv_cells. Keeping this
 // POD-like and index-local lets existing save/copy/pack code move it together
 // with position, extents, shifts, and sequence references.
@@ -137,6 +144,7 @@ struct llama_rerot_node {
     // Successors are outgoing edges (v -> w).
     // plan_rank is the index in the original planning list/questions array.
     uint32_t plan_rank = 0;
+    llama_rerot_stage_role stage_role = llama_rerot_stage_role::planner;
     std::vector<llama_rerot_node_id> predecessors;
     std::vector<llama_rerot_node_id> successors;
 };
@@ -300,6 +308,7 @@ public:
 
     bool add_edge(llama_rerot_node_id before, llama_rerot_node_id after, std::string * error = nullptr);
     bool set_plan_rank(llama_rerot_node_id node_id, uint32_t rank);
+    bool set_stage_role(llama_rerot_node_id node_id, llama_rerot_stage_role role);
 
     // Cycle-preferred topological sort (Kahn's algorithm with tie-break priority
     // defined in AGENTS.md §03.5):

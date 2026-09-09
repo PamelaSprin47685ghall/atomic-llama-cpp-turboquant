@@ -125,6 +125,9 @@ if (Python3_Interpreter_FOUND)
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-${check}.py)
         set_tests_properties(test-${check} PROPERTIES LABELS "python" TIMEOUT 30)
     endforeach()
+    add_test(NAME test-rerot-dag-reference
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/rerot-dag-reference.py)
+    set_tests_properties(test-rerot-dag-reference PROPERTIES LABELS "python" TIMEOUT 60)
 endif()
 
 # build test-tokenizer-0 target once and add many tests

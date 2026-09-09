@@ -133,6 +133,7 @@ struct server_rerot_marker_snapshot {
     std::string candidate;
     server_rerot_marker_state state = server_rerot_marker_state::public_text;
     std::string error;
+    bool native_end = false;
 };
 
 // Byte-stream detector for one child's exact random close marker. A tokenizer
@@ -140,7 +141,7 @@ struct server_rerot_marker_snapshot {
 class server_rerot_marker_parser {
 public:
     // Empty means unarmed (the ordinary root has no child delimiter).
-    explicit server_rerot_marker_parser(std::string marker = {});
+    explicit server_rerot_marker_parser(std::string marker = {}, bool native_end = false);
 
     void reset();
     server_rerot_marker_step consume(std::string_view bytes);
@@ -165,6 +166,7 @@ private:
     std::string candidate_;
     server_rerot_marker_state state_ = server_rerot_marker_state::public_text;
     std::string error_;
+    bool native_end_ = false;
 };
 
 // Fixed private control prompt injected after the user's ordinary prompt and
@@ -174,6 +176,9 @@ private:
 // chat-template machinery.
 std::string_view server_rerot_planner_prompt();
 std::string_view server_rerot_planner_grammar();
+std::string_view server_rerot_routing_probe_prompt();
+std::string server_rerot_routing_grammar();
+std::string server_rerot_source_end_grammar(std::string_view close_marker);
 // Eager grammar for one child: arbitrary text must eventually terminate with
 // that child's exact random delimiter before EOG can be sampled.
 std::string server_rerot_child_grammar(std::string_view close_marker);
@@ -206,6 +211,8 @@ struct server_rerot_token_plan {
     // PENDING until fully injected, then atomically published by
     // publish_heading (§16). Used only for budget accounting.
     bool is_heading = false;
+    llama_rerot_segment_kind segment_kind = llama_rerot_segment_kind::body;
+    llama_rerot_event_origin event_origin = llama_rerot_event_origin::unknown;
     server_rerot_parser_step parser_step;
     server_rerot_marker_step marker_step;
 
@@ -302,7 +309,6 @@ struct server_rerot_fence_checkpoint {
 // Pre-branch checkpoint and routing (AGENTS.md §§02, 07)
 // Captures prefill watermark and sampler/recurrent state to allow zero-cost rollback on "simple".
 struct server_rerot_prebranch_checkpoint {
-    uint64_t episode_id = 0;
     int task_id = -1;
     llama_seq_id seq_id = -1;
 
@@ -310,13 +316,15 @@ struct server_rerot_prebranch_checkpoint {
     std::vector<uint8_t> gdn_recurrent_states;
     std::vector<uint8_t> conv1d_states;
     std::vector<uint8_t> sampler_snapshot_bytes;
+    bool captured = false;
 
-    bool valid() const { return episode_id != 0 && n_prompt_tokens > 0; }
+    // Recurrent data may be empty. episode_id is not a validity signal (§02.2).
+    bool valid() const { return captured && seq_id >= 0 && n_prompt_tokens >= 0; }
     void clear() {
-        episode_id = 0;
         task_id = -1;
         seq_id = -1;
         n_prompt_tokens = 0;
+        captured = false;
         gdn_recurrent_states.clear();
         conv1d_states.clear();
         sampler_snapshot_bytes.clear();
@@ -396,6 +404,9 @@ struct server_rerot_node_runtime {
     std::string intent;    // Task intent
     bool is_sealed = false; // Natural completion verified and submitted
     llama_rerot_event_origin completion_origin = llama_rerot_event_origin::unknown;
+    llama_rerot_stage_role stage_role = llama_rerot_stage_role::planner;
+    uint32_t remaining_preds = 0;
+    llama_pos frame_injection_end = -1;
 
     // A.8 opaque per-lane extension state. Filled by the server integration
     // (sampler bytes, MTP checkpoint); empty means none. Persisted verbatim
@@ -419,6 +430,7 @@ struct server_rerot_frontier_result {
     std::vector<llama_rerot_node_id> retired;
     std::vector<int> released_slots;
     llama_rerot_node_id final_node = LLAMA_REROT_NODE_INVALID;
+    llama_rerot_node_id synthesis_node = LLAMA_REROT_NODE_INVALID;
     bool topology_barrier = false;
     bool hard_aborted = false;
     std::string abort_reason;
@@ -461,7 +473,9 @@ struct server_rerot_shift_result {
 std::string server_rerot_format_fixed_entry(
     const std::string & node_label,
     const std::string & intent,
-    bool is_synthesis = false);
+    bool is_synthesis = false,
+    std::string_view think_end = "</think>",
+    std::string_view think_start = "<think>");
 
 struct server_rerot_episode {
     uint64_t id = 0;
@@ -470,6 +484,18 @@ struct server_rerot_episode {
 
     // True when episode runs in DAG mode (AGENTS.md §§01, 02)
     bool is_dag = false;
+    bool strategy_decided = false;
+    bool probing = false;
+    llama_rerot_node_id synthesis_node = LLAMA_REROT_NODE_INVALID;
+    std::string source_end_marker;
+    std::string think_start_marker = "<think>";
+    std::string probe_bytes;
+    server_rerot_prebranch_checkpoint c0;
+    server_rerot_prebranch_checkpoint c_base;
+    uint64_t frozen_read_publish_epoch = 0;
+    uint64_t probe_tokens = 0;
+    uint64_t frame_tokens = 0;
+    uint64_t source_end_tokens = 0;
 
     uint64_t frontier = 1;
     uint64_t publish_epoch = 1;
@@ -611,6 +637,19 @@ public:
         uint64_t episode_id,
         const server_rerot_routing_decision & decision,
         std::string * error_out = nullptr);
+
+    void set_dag_protocol_markers(
+        uint64_t episode_id,
+        std::string_view source_end_marker,
+        std::string_view think_start_marker);
+    bool capture_c0(uint64_t episode_id, llama_seq_id seq_id, llama_pos n_prompt_tokens);
+    bool capture_c_base(uint64_t episode_id);
+    bool activate_dag_frontier(uint64_t episode_id);
+    std::optional<std::vector<server_rerot_token_plan>> plan_frame_span(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id,
+        llama_pos storage_pos,
+        size_t token_count);
 
     // Checks which nodes have all predecessors sealed and are eligible for admission
     std::vector<llama_rerot_node_id> get_eligible_dag_nodes(uint64_t episode_id) const;
@@ -796,7 +835,8 @@ private:
         server_rerot_episode & episode,
         server_rerot_node_runtime & node,
         llama_rerot_visibility visibility,
-        llama_pos storage_pos);
+        llama_pos storage_pos,
+        llama_rerot_segment_kind kind = llama_rerot_segment_kind::body);
 
     bool release_false_pending(
         server_rerot_episode & episode,

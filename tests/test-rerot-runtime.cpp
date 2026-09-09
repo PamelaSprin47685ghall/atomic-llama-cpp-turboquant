@@ -2890,6 +2890,18 @@ static void test_dag_runtime_lifecycle() {
     auto * ep = runtime.episode(ep_id);
     CHECK(ep != nullptr);
     CHECK(ep->is_dag);
+    CHECK(ep->synthesis_node != 0);
+    CHECK(ep->synthesis_node != LLAMA_REROT_NODE_INVALID);
+    CHECK(ep->nodes[1].remaining_preds == 0);
+    CHECK(ep->nodes[2].remaining_preds == 0);
+    CHECK(ep->nodes[3].remaining_preds == 1);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 3);
+    CHECK(ep->c0.valid() == false);
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(ep->c0.valid());
+    CHECK(ep->c0.gdn_recurrent_states.empty());
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(ep->c_base.valid());
 
     // Initial eligible nodes must be A (1) and B (2). C (3) must NOT be eligible!
     auto eligible = runtime.get_eligible_dag_nodes(ep_id);
@@ -2897,17 +2909,20 @@ static void test_dag_runtime_lifecycle() {
     CHECK(std::find(eligible.begin(), eligible.end(), 1) != eligible.end());
     CHECK(std::find(eligible.begin(), eligible.end(), 2) != eligible.end());
     CHECK(std::find(eligible.begin(), eligible.end(), 3) == eligible.end());
+    CHECK(std::find(eligible.begin(), eligible.end(), ep->synthesis_node) == eligible.end());
 
     // Allocate pen and start A (1)
     auto pen_a = runtime.allocate_pen(10, ep_id, 1);
     CHECK(pen_a.has_value());
     ep->document.set_node_state(1, llama_rerot_node_state::running);
+    ep->running.insert(1);
     ep->nodes[1].pen_id = *pen_a;
 
     // Allocate pen and start B (2)
     auto pen_b = runtime.allocate_pen(10, ep_id, 2);
     CHECK(pen_b.has_value());
     ep->document.set_node_state(2, llama_rerot_node_state::running);
+    ep->running.insert(2);
     ep->nodes[2].pen_id = *pen_b;
 
     // Both A and B are running. Add some public tokens:
@@ -2935,7 +2950,9 @@ static void test_dag_runtime_lifecycle() {
     CHECK(ep->nodes[1].is_sealed);
     CHECK(ep->document.node(1)->state == llama_rerot_node_state::retired);
 
-    // Now C (3) must become eligible!
+    // Now C (3) must become eligible! Synthesis still waits on B and C.
+    CHECK(ep->nodes[3].remaining_preds == 0);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 2);
     eligible = runtime.get_eligible_dag_nodes(ep_id);
     CHECK(eligible.size() == 1);
     CHECK(eligible[0] == 3);
@@ -2944,6 +2961,7 @@ static void test_dag_runtime_lifecycle() {
     auto pen_c = runtime.allocate_pen(10, ep_id, 3);
     CHECK(pen_c.has_value());
     ep->document.set_node_state(3, llama_rerot_node_state::running);
+    ep->running.insert(3);
     ep->nodes[3].pen_id = *pen_c;
     ep->document.append_run(3, llama_rerot_visibility::public_live, 20, 8, 3); // C: 8
 
@@ -2958,6 +2976,15 @@ static void test_dag_runtime_lifecycle() {
     // Seal B and C
     CHECK(runtime.seal_dag_node(ep_id, 2, llama_rerot_event_origin::worker_source));
     CHECK(runtime.seal_dag_node(ep_id, 3, llama_rerot_event_origin::worker_source));
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 0);
+
+    // Repeat seal is a no-op: remaining_preds must not decrement twice (§07.5)
+    CHECK(runtime.seal_dag_node(ep_id, 1, llama_rerot_event_origin::worker_source));
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 0);
+
+    // Provenance validation: runtime_frame origin must be rejected (§04.6)
+    CHECK(!runtime.seal_dag_node(ep_id, 1, llama_rerot_event_origin::runtime_frame));
+    CHECK(!runtime.seal_dag_node(ep_id, 1, llama_rerot_event_origin::foreign_export));
 
     // Synthesis reader 0 view: P, A, B, C
     const auto view_synth = runtime.build_dag_view_for_reader(ep_id, 0);
@@ -2966,10 +2993,86 @@ static void test_dag_runtime_lifecycle() {
     CHECK(view_synth.runs[1].owner == 1);
     CHECK(view_synth.runs[2].owner == 2);
     CHECK(view_synth.runs[3].owner == 3);
+
+    // Workers are sealed; synthesis is eligible but not yet running, so there
+    // is no serial survivor. final_node is only the live synthesis node after
+    // it emits native source-end while still bound to a slot.
+    const auto frontier_res = runtime.finish_frontier(ep_id);
+    CHECK(frontier_res.final_node == LLAMA_REROT_NODE_INVALID);
+    CHECK(frontier_res.synthesis_node == ep->synthesis_node);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 0);
+
+    // Verify DAG episode serialization and deserialization preserves DAG topology
+    server_rerot_state_fingerprints fp;
+    fp.caps = LLAMA_REROT_STATE_CAP_REROT | LLAMA_REROT_STATE_CAP_REROT_TREE;
+    std::string serr;
+    std::vector<uint8_t> saved_blob;
+    CHECK(runtime.save_episode(ep_id, fp, &saved_blob, &serr));
+    CHECK(serr.empty());
+    CHECK(!saved_blob.empty());
+
+    // Erase live episode before restoring (§A.8)
+    CHECK(runtime.erase_episode(ep_id));
+
+    uint64_t loaded_ep_id = 0;
+    std::string lerr;
+    CHECK(runtime.load_episode(saved_blob.data(), saved_blob.size(), fp, &loaded_ep_id, &lerr));
+    CHECK(loaded_ep_id == ep_id);
+    CHECK(runtime.episode(ep_id)->is_dag);
+    CHECK(runtime.episode(ep_id)->document.is_dag_mode());
+    CHECK(runtime.episode(ep_id)->nodes[1].is_sealed);
+    CHECK(runtime.episode(ep_id)->nodes[1].string_id == "A");
+    const auto * loaded_c = runtime.episode(ep_id)->document.node(3);
+    CHECK(loaded_c != nullptr);
+    CHECK(std::find(loaded_c->predecessors.begin(), loaded_c->predecessors.end(),
+                    llama_rerot_node_id(1)) != loaded_c->predecessors.end());
+    CHECK(runtime.episode(ep_id)->synthesis_node != 0);
+    CHECK(runtime.episode(ep_id)->nodes[runtime.episode(ep_id)->synthesis_node].remaining_preds == 0);
+}
+
+static void test_c0_and_dag_admit_without_parked_seq() {
+    // DAG workers start from C_base with parked_seq < 0. Admission must not
+    // demand an HTML-fork parked sequence, and C0 remains valid with empty
+    // recurrent state.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(4);
+
+    const uint64_t ep_id = runtime.adopt_root(11, 11, 0, 1, 0);
+    CHECK(ep_id != 0);
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->c0.valid());
+    CHECK(ep->c0.gdn_recurrent_states.empty());
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(ep->c_base.valid());
+
+    const std::string dag_json = R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"}
+        ],
+        "depends_on": []
+      }
+    })";
+    const auto decision = server_rerot_parse_routing_decision(dag_json);
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+
+    llama_rerot_node_id admitted = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 1, 2, &admitted));
+    CHECK(admitted == 1);
+    CHECK(runtime.node(ep_id, admitted)->parked_seq < 0);
+    CHECK(runtime.node(ep_id, admitted)->physical_slot == 1);
+    CHECK(runtime.complete_admission(ep_id, admitted));
 }
 
 int main() {
     std::fprintf(stderr, "=== RERoT Runtime Tests ===\n");
+    test_c0_and_dag_admit_without_parked_seq();
     test_dag_runtime_lifecycle();
     test_recurrent_only_pressure_isolation();
     test_multi_episode_concurrent_final_fence_and_coordinate_freeze();

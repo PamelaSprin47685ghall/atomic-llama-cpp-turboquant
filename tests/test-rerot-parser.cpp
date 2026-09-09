@@ -378,16 +378,122 @@ static void test_routing_decision_parser() {
     })";
     CHECK(!server_rerot_parse_routing_decision(unknown_ep_json).is_dag());
 
+    // DAG with whitespace-only intent -> rejected (AGENTS.md §02.6.2)
+    const std::string ws_intent_json = R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [{"id": "A", "intent": "   \t\n  "}],
+        "depends_on": []
+      }
+    })";
+    CHECK(!server_rerot_parse_routing_decision(ws_intent_json).is_dag());
+
+    // DAG with non-string id -> rejected without crash
+    const std::string non_str_id_json = R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [{"id": 123, "intent": "Task 123"}],
+        "depends_on": []
+      }
+    })";
+    CHECK(!server_rerot_parse_routing_decision(non_str_id_json).is_dag());
+
     // Schema JSON non-empty and parsable
     const std::string schema_str = server_rerot_routing_schema_json();
     CHECK(!schema_str.empty());
     nlohmann::json parsed_schema = nlohmann::json::parse(schema_str);
     CHECK(parsed_schema.contains("oneOf"));
+
+    // Extra fields and duplicate keys are rejected (§02.4 / §02.6)
+    CHECK(!server_rerot_parse_routing_decision(
+        R"({"strategy":"simple","payload":{},"extra":true})").is_simple());
+    CHECK(!server_rerot_parse_routing_decision(
+        R"({"strategy":"simple","strategy":"dag","payload":{}})").is_simple());
+    CHECK(!server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [{"id": "A", "intent": "Fact A", "rank": 1}],
+        "depends_on": []
+      }
+    })").is_dag());
+    CHECK(!server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [{"id": "A", "intent": "Fact A"}],
+        "depends_on": [],
+        "extra": []
+      }
+    })").is_dag());
+}
+
+static void test_native_source_end_marker() {
+    // Tests standard XML think marker
+    server_rerot_marker_parser parser("</think>", true);
+    CHECK(!parser.failed());
+    auto step = parser.consume("done ");
+    CHECK(!step.marker_closed);
+    CHECK(step.write_visibility == llama_rerot_visibility::public_live);
+    step = parser.consume("</think>");
+    CHECK(step.marker_closed);
+    CHECK(parser.complete());
+
+    const auto snapshot = parser.snapshot();
+    CHECK(snapshot.native_end);
+    CHECK(snapshot.marker == "</think>");
+    server_rerot_marker_parser restored;
+    std::string error;
+    CHECK(restored.restore(snapshot, &error));
+    CHECK(restored.marker() == "</think>");
+    CHECK(restored.complete());
+
+    // Non-XML template markers (e.g. [/THINK], <|im_end|>) must also be valid
+    server_rerot_marker_parser alt_parser("[/THINK]", true);
+    CHECK(!alt_parser.failed());
+    auto alt_step = alt_parser.consume("answer [/THINK]");
+    CHECK(alt_step.marker_closed);
+    CHECK(alt_parser.complete());
+}
+
+static void test_format_fixed_entry() {
+    const std::string frame = server_rerot_format_fixed_entry(
+        "A", "compute A", false, "</think>", "<think>");
+    CHECK(frame.find("</think>") == 0);
+    CHECK(frame.find("lane:A") != std::string::npos);
+    CHECK(frame.find("intent:compute A") != std::string::npos);
+    CHECK(frame.find("<think>") != std::string::npos);
+    CHECK(frame.rfind("<think>") > frame.find("</think>"));
+    const std::string synth = server_rerot_format_fixed_entry(
+        "0", "0.synthesize", true, "</think>", "<think>");
+    CHECK(synth.find("synthesis:0") != std::string::npos);
+    CHECK(synth.find("lane:") == std::string::npos);
+
+    // Intent line breaks and raw think markers must be sanitized to disarm forgery
+    const std::string sanitized = server_rerot_format_fixed_entry(
+        "B", "line 1\nline 2 </think> evil <think>", false, "</think>", "<think>");
+    CHECK(sanitized.find("line 1 line 2") != std::string::npos);
+    CHECK(sanitized.find("</think> evil") == std::string::npos);
+    CHECK(sanitized.find("[end] evil [start]") != std::string::npos);
+}
+
+static void test_routing_schema_grammar() {
+    const std::string grammar = server_rerot_routing_grammar();
+    CHECK(!grammar.empty());
+    CHECK(grammar_accepts(grammar, R"({"strategy":"simple","payload":{}})"));
+    CHECK(!grammar_accepts(grammar, R"({"strategy":"simple","payload":{"x":1}})"));
+    CHECK(grammar_accepts(
+        grammar,
+        R"({"strategy":"dag","payload":{"questions":[{"id":"A","intent":"Fact A"}],"depends_on":[]}})"));
+    CHECK(!grammar_accepts(
+        grammar,
+        R"({"strategy":"dag","payload":{"questions":[{"id":"A","intent":"Fact A","extra":1}],"depends_on":[]}})"));
 }
 
 int main() {
     std::fprintf(stderr, "=== RERoT Planner Parser Tests ===\n");
     test_routing_decision_parser();
+    test_native_source_end_marker();
+    test_format_fixed_entry();
+    test_routing_schema_grammar();
     test_plain_public_text();
     test_split_open_and_close();
     test_byte_by_byte_record();
