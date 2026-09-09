@@ -326,6 +326,22 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
     throw std::runtime_error("Unsupported cache type: " + s);
 }
 
+static ggml_type xkv_codec_type_from_str(const std::string & s) {
+    // Accepted factor and landmark codec types (§16):
+    // Accepted factor types: F32, F16, Q8_0, Turbo2, Turbo3, Turbo4 (reject q4/q5/bf16/iq etc.)
+    if (s == "turbo2_0") { return GGML_TYPE_TURBO2_0; }
+    if (s == "turbo2")   { return GGML_TYPE_TURBO2_0; }
+    if (s == "turbo3_0") { return GGML_TYPE_TURBO3_0; }
+    if (s == "turbo3")   { return GGML_TYPE_TURBO3_0; }
+    if (s == "turbo4_0") { return GGML_TYPE_TURBO4_0; }
+    if (s == "turbo4")   { return GGML_TYPE_TURBO4_0; }
+    if (s == "q8_0")     { return GGML_TYPE_Q8_0;     }
+    if (s == "f16")      { return GGML_TYPE_F16;      }
+    if (s == "f32")      { return GGML_TYPE_F32;      }
+
+    throw std::invalid_argument("Unsupported XKV codec type: " + s);
+}
+
 static std::string get_all_kv_cache_types() {
     std::ostringstream msg;
     for (const auto & type : kv_cache_types) {
@@ -342,6 +358,70 @@ static bool parse_bool_value(const std::string & value) {
     } else {
         throw std::invalid_argument("invalid boolean value");
     }
+}
+
+static uint32_t parse_strict_u32(const std::string & value, const char * opt_name) {
+    if (value.empty()) {
+        throw std::invalid_argument(string_format("error: %s requires a non-empty numeric argument", opt_name));
+    }
+    for (char c : value) {
+        if (c < '0' || c > '9') {
+            throw std::invalid_argument(string_format("error: %s requires an unsigned integer without sign or trailing characters, got '%s'", opt_name, value.c_str()));
+        }
+    }
+    size_t pos = 0;
+    unsigned long long parsed = 0;
+    try {
+        parsed = std::stoull(value, &pos);
+    } catch (...) {
+        throw std::invalid_argument(string_format("error: %s argument '%s' is out of range", opt_name, value.c_str()));
+    }
+    if (pos != value.size() || parsed > UINT32_MAX) {
+        throw std::invalid_argument(string_format("error: %s argument '%s' overflows uint32", opt_name, value.c_str()));
+    }
+    return (uint32_t) parsed;
+}
+
+static uint64_t parse_strict_u64(const std::string & value, const char * opt_name) {
+    if (value.empty()) {
+        throw std::invalid_argument(string_format("error: %s requires a non-empty numeric argument", opt_name));
+    }
+    for (char c : value) {
+        if (c < '0' || c > '9') {
+            throw std::invalid_argument(string_format("error: %s requires an unsigned integer without sign or trailing characters, got '%s'", opt_name, value.c_str()));
+        }
+    }
+    size_t pos = 0;
+    unsigned long long parsed = 0;
+    try {
+        parsed = std::stoull(value, &pos);
+    } catch (...) {
+        throw std::invalid_argument(string_format("error: %s argument '%s' is out of range", opt_name, value.c_str()));
+    }
+    if (pos != value.size()) {
+        throw std::invalid_argument(string_format("error: %s argument '%s' contains trailing characters", opt_name, value.c_str()));
+    }
+    return (uint64_t) parsed;
+}
+
+static double parse_strict_fraction(const std::string & value, const char * opt_name) {
+    if (value.empty()) {
+        throw std::invalid_argument(string_format("error: %s requires a non-empty numeric argument", opt_name));
+    }
+    size_t pos = 0;
+    double parsed = 0.0;
+    try {
+        parsed = std::stod(value, &pos);
+    } catch (...) {
+        throw std::invalid_argument(string_format("error: %s argument '%s' is invalid", opt_name, value.c_str()));
+    }
+    if (pos != value.size() || !std::isfinite(parsed) || std::isnan(parsed)) {
+        throw std::invalid_argument(string_format("error: %s argument '%s' must be a finite number", opt_name, value.c_str()));
+    }
+    if (parsed < 0.0 || parsed > 1.0) {
+        throw std::invalid_argument(string_format("error: %s argument '%s' must be within [0.0, 1.0]", opt_name, value.c_str()));
+    }
+    return parsed;
 }
 
 [[noreturn]] static void arg_removed(const std::string & msg) {
@@ -955,6 +1035,31 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         // by ignoring the flag rather than enabling the runtime.
         LOG_WRN("warning: --rerot-trace without --rerot has no effect; RERoT stays OFF\n");
         params.rerot_trace = false;
+    }
+
+    // XKV static validation gate (§16). OFF: no-op, no allocation.
+    // OFF runs the validator too: it accepts defaults and rejects any
+    // non-default flag exactly (no silent ignores, no allocation).
+    if (!llama_xkv_is_enabled(params.xkv_mode)) {
+        const common_xkv_gate xkv_gate = common_xkv_validate_stage0(params);
+        if (!xkv_gate.warning.empty()) {
+            LOG_WRN("%s\n", xkv_gate.warning.c_str());
+        }
+        if (!xkv_gate.ok) {
+            LOG_ERR("error: %s\n", xkv_gate.error.c_str());
+            return false;
+        }
+    }
+    if (llama_xkv_is_enabled(params.xkv_mode)) {
+        params.kv_unified = true;
+        const common_xkv_gate xkv_gate = common_xkv_validate_stage0(params);
+        if (!xkv_gate.warning.empty()) {
+            LOG_WRN("%s\n", xkv_gate.warning.c_str());
+        }
+        if (!xkv_gate.ok) {
+            LOG_ERR("error: %s\n", xkv_gate.error.c_str());
+            return false;
+        }
     }
 
     return true;
@@ -1869,6 +1974,261 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.flashprefill.exact_all = true;
         }
     ).set_env("LLAMA_ARG_FLASHPREFILL_EXACT_ALL").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    // XKV (§16) command-line arguments
+    add_opt(common_arg(
+        {"--xkv"}, "off|shadow|dense|sr",
+        string_format("XKV compression mode ('off', 'shadow', 'dense', 'sr', default: '%s')",
+            llama_xkv_mode_name(params.xkv_mode)),
+        [](common_params & params, const std::string & value) {
+            if (value == "off") {
+                params.xkv_mode = LLAMA_XKV_MODE_OFF;
+            } else if (value == "shadow") {
+                params.xkv_mode = LLAMA_XKV_MODE_SHADOW;
+            } else if (value == "dense") {
+                params.xkv_mode = LLAMA_XKV_MODE_DENSE;
+            } else if (value == "sr") {
+                params.xkv_mode = LLAMA_XKV_MODE_SR;
+            } else {
+                throw std::invalid_argument("XKV mode must be 'off', 'shadow', 'dense', or 'sr'");
+            }
+        }
+    ).set_env("LLAMA_ARG_XKV").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-off"},
+        "disable XKV compression and reset mode to 'off'",
+        [](common_params & params) {
+            params.xkv_mode = LLAMA_XKV_MODE_OFF;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-storage-profile"}, "reference|tq-factors|tq-factors-landmarks",
+        string_format("XKV storage profile ('reference', 'tq-factors', 'tq-factors-landmarks', default: '%s')",
+            llama_xkv_storage_profile_name(params.xkv_storage_profile)),
+        [](common_params & params, const std::string & value) {
+            if (value == "reference") {
+                params.xkv_storage_profile = LLAMA_XKV_STORAGE_PROFILE_REFERENCE;
+            } else if (value == "tq-factors") {
+                params.xkv_storage_profile = LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS;
+            } else if (value == "tq-factors-landmarks") {
+                params.xkv_storage_profile = LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS;
+            } else {
+                throw std::invalid_argument("XKV storage profile must be 'reference', 'tq-factors', or 'tq-factors-landmarks'");
+            }
+        }
+    ).set_env("LLAMA_ARG_XKV_STORAGE_PROFILE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-group-size"}, "N",
+        string_format("XKV owning-layer group size (default: %u)", params.xkv_group_size),
+        [](common_params & params, const std::string & value) {
+            params.xkv_group_size = parse_strict_u32(value, "--xkv-group-size");
+        }
+    ).set_env("LLAMA_ARG_XKV_GROUP_SIZE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-rank-k"}, "N",
+        string_format("XKV rank for K factors (default: %u)", params.xkv_rank_k),
+        [](common_params & params, const std::string & value) {
+            params.xkv_rank_k = parse_strict_u32(value, "--xkv-rank-k");
+        }
+    ).set_env("LLAMA_ARG_XKV_RANK_K").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-rank-v"}, "N",
+        string_format("XKV rank for V factors (default: %u)", params.xkv_rank_v),
+        [](common_params & params, const std::string & value) {
+            params.xkv_rank_v = parse_strict_u32(value, "--xkv-rank-v");
+        }
+    ).set_env("LLAMA_ARG_XKV_RANK_V").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-segment-tokens"}, "N",
+        string_format("XKV segment size in tokens (default: %u)", params.xkv_segment_tokens),
+        [](common_params & params, const std::string & value) {
+            params.xkv_segment_tokens = parse_strict_u32(value, "--xkv-segment-tokens");
+        }
+    ).set_env("LLAMA_ARG_XKV_SEGMENT_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-chunk-tokens"}, "N",
+        string_format("XKV SR chunk size in tokens (default: %u)", params.xkv_chunk_tokens),
+        [](common_params & params, const std::string & value) {
+            params.xkv_chunk_tokens = parse_strict_u32(value, "--xkv-chunk-tokens");
+        }
+    ).set_env("LLAMA_ARG_XKV_CHUNK_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-sr-budget"}, "N",
+        string_format("XKV SR budget (must be >0 in sr mode; ignored otherwise, default: %u)", params.xkv_sr_budget),
+        [](common_params & params, const std::string & value) {
+            params.xkv_sr_budget = parse_strict_u32(value, "--xkv-sr-budget");
+        }
+    ).set_env("LLAMA_ARG_XKV_SR_BUDGET").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-source"}, "decoded-hot|prerope-capture",
+        string_format("XKV factor source ('decoded-hot' or 'prerope-capture', default: '%s')",
+            llama_xkv_source_name(params.xkv_source)),
+        [](common_params & params, const std::string & value) {
+            if (value == "decoded-hot") {
+                params.xkv_source = LLAMA_XKV_SOURCE_DECODED_HOT;
+            } else if (value == "prerope-capture") {
+                params.xkv_source = LLAMA_XKV_SOURCE_PREROPE_CAPTURE;
+            } else {
+                throw std::invalid_argument("XKV source must be 'decoded-hot' or 'prerope-capture'");
+            }
+        }
+    ).set_env("LLAMA_ARG_XKV_SOURCE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-factor-a-k"}, "TYPE",
+        string_format("XKV factor A_K data type (default: %s)", ggml_type_name(params.xkv_factor_a_k)),
+        [](common_params & params, const std::string & value) {
+            params.xkv_factor_a_k = xkv_codec_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_XKV_FACTOR_A_K").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-factor-b-k"}, "TYPE",
+        string_format("XKV factor B_K data type (default: %s)", ggml_type_name(params.xkv_factor_b_k)),
+        [](common_params & params, const std::string & value) {
+            params.xkv_factor_b_k = xkv_codec_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_XKV_FACTOR_B_K").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-factor-a-v"}, "TYPE",
+        string_format("XKV factor A_V data type (default: %s)", ggml_type_name(params.xkv_factor_a_v)),
+        [](common_params & params, const std::string & value) {
+            params.xkv_factor_a_v = xkv_codec_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_XKV_FACTOR_A_V").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-factor-b-v"}, "TYPE",
+        string_format("XKV factor B_V data type (default: %s)", ggml_type_name(params.xkv_factor_b_v)),
+        [](common_params & params, const std::string & value) {
+            params.xkv_factor_b_v = xkv_codec_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_XKV_FACTOR_B_V").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-factor-balance"}, "upstream|sqrt|diagonal",
+        string_format("XKV factor singular value balance mode ('upstream', 'sqrt', 'diagonal', default: '%s')",
+            llama_xkv_factor_balance_name(params.xkv_factor_balance)),
+        [](common_params & params, const std::string & value) {
+            if (value == "upstream") {
+                params.xkv_factor_balance = LLAMA_XKV_FACTOR_BALANCE_UPSTREAM;
+            } else if (value == "sqrt") {
+                params.xkv_factor_balance = LLAMA_XKV_FACTOR_BALANCE_SQRT;
+            } else if (value == "diagonal") {
+                params.xkv_factor_balance = LLAMA_XKV_FACTOR_BALANCE_DIAGONAL;
+            } else {
+                throw std::invalid_argument("XKV factor balance must be 'upstream', 'sqrt', or 'diagonal'");
+            }
+        }
+    ).set_env("LLAMA_ARG_XKV_FACTOR_BALANCE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-landmark-type"}, "TYPE",
+        string_format("XKV landmark data type (default: %s)", ggml_type_name(params.xkv_landmark_type)),
+        [](common_params & params, const std::string & value) {
+            params.xkv_landmark_type = xkv_codec_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_XKV_LANDMARK_TYPE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-landmark-refine"}, "none|boundary",
+        string_format("XKV landmark refine mode ('none' or 'boundary', default: '%s')",
+            llama_xkv_landmark_refine_name(params.xkv_landmark_refine)),
+        [](common_params & params, const std::string & value) {
+            if (value == "none") {
+                params.xkv_landmark_refine = LLAMA_XKV_LANDMARK_REFINE_NONE;
+            } else if (value == "boundary") {
+                params.xkv_landmark_refine = LLAMA_XKV_LANDMARK_REFINE_BOUNDARY;
+            } else {
+                throw std::invalid_argument("XKV landmark refine must be 'none' or 'boundary'");
+            }
+        }
+    ).set_env("LLAMA_ARG_XKV_LANDMARK_REFINE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-landmark-refine-max-rows"}, "N",
+        string_format("XKV maximum rows to refine per query (default: %u)", params.xkv_landmark_refine_max_rows),
+        [](common_params & params, const std::string & value) {
+            params.xkv_landmark_refine_max_rows = parse_strict_u32(value, "--xkv-landmark-refine-max-rows");
+        }
+    ).set_env("LLAMA_ARG_XKV_LANDMARK_REFINE_MAX_ROWS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-workspace-mib"}, "N",
+        string_format("XKV total workspace budget in MiB (default: %u)", params.xkv_workspace_mib),
+        [](common_params & params, const std::string & value) {
+            params.xkv_workspace_mib = parse_strict_u32(value, "--xkv-workspace-mib");
+        }
+    ).set_env("LLAMA_ARG_XKV_WORKSPACE_MIB").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-decode-cache-mib"}, "N",
+        string_format("XKV global decoded tile cache budget in MiB (default: %u)", params.xkv_decode_cache_mib),
+        [](common_params & params, const std::string & value) {
+            params.xkv_decode_cache_mib = parse_strict_u32(value, "--xkv-decode-cache-mib");
+        }
+    ).set_env("LLAMA_ARG_XKV_DECODE_CACHE_MIB").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-store-mib"}, "N",
+        string_format("XKV persistent factor store budget in MiB (0 = auto-derive, default: %u)", params.xkv_store_mib),
+        [](common_params & params, const std::string & value) {
+            params.xkv_store_mib = parse_strict_u32(value, "--xkv-store-mib");
+        }
+    ).set_env("LLAMA_ARG_XKV_STORE_MIB").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-seed"}, "SEED",
+        string_format("XKV deterministic pseudo-random seed (default: %" PRIu64 ")", params.xkv_seed),
+        [](common_params & params, const std::string & value) {
+            params.xkv_seed = parse_strict_u64(value, "--xkv-seed");
+        }
+    ).set_env("LLAMA_ARG_XKV_SEED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-min-saving"}, "FRACTION",
+        string_format("XKV minimum relative byte saving fraction [0.0, 1.0] (default: %.2f)", params.xkv_min_saving),
+        [](common_params & params, const std::string & value) {
+            params.xkv_min_saving = parse_strict_fraction(value, "--xkv-min-saving");
+        }
+    ).set_env("LLAMA_ARG_XKV_MIN_SAVING").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-min-factor-coverage"}, "FRACTION",
+        string_format("XKV minimum factor baseline byte coverage fraction [0.0, 1.0] (default: %.2f)", params.xkv_min_factor_coverage),
+        [](common_params & params, const std::string & value) {
+            params.xkv_min_factor_coverage = parse_strict_fraction(value, "--xkv-min-factor-coverage");
+        }
+    ).set_env("LLAMA_ARG_XKV_MIN_FACTOR_COVERAGE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
+    add_opt(common_arg(
+        {"--xkv-factorizer"}, "cpu-reference|vulkan|vulkan-hybrid|cuda",
+        string_format("XKV factorization backend ('cpu-reference', 'vulkan', 'vulkan-hybrid', 'cuda', default: '%s')",
+            llama_xkv_factorizer_name(params.xkv_factorizer)),
+        [](common_params & params, const std::string & value) {
+            if (value == "cpu-reference") {
+                params.xkv_factorizer = LLAMA_XKV_FACTORIZER_CPU_REFERENCE;
+            } else if (value == "vulkan") {
+                params.xkv_factorizer = LLAMA_XKV_FACTORIZER_VULKAN;
+            } else if (value == "vulkan-hybrid") {
+                params.xkv_factorizer = LLAMA_XKV_FACTORIZER_VULKAN_HYBRID;
+            } else if (value == "cuda") {
+                params.xkv_factorizer = LLAMA_XKV_FACTORIZER_CUDA;
+            } else {
+                throw std::invalid_argument("XKV factorizer must be 'cpu-reference', 'vulkan', 'vulkan-hybrid', or 'cuda'");
+            }
+        }
+    ).set_env("LLAMA_ARG_XKV_FACTORIZER").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(

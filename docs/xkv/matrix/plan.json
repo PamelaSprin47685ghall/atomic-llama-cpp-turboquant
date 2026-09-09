@@ -1,0 +1,43 @@
+{
+  "backend": "server",
+  "items": [],
+  "model_path": "/opt/llama/data/Ornith-1.5-35B-Uncensored-YMQ-S-MTP.gguf",
+  "model_path_source": "profile-root:model.path",
+  "plan_sha256": "4ae209a1372c6628ebc1df2db37b03fa1f238465616af4c470e174f3ef5b6ff5",
+  "profiles": [
+    {
+      "name": "B0",
+      "profile_sha256": "c9b866b2dbfd8a8da57a3483f34163b95facd0b497fc6ebdcf50d4a462d7e3b0",
+      "storage_profile": "none",
+      "xkv_enabled": false
+    },
+    {
+      "name": "E1",
+      "profile_sha256": "f6895ab20cb8ce7ce78a92e19b5dd5ca518f9f1a8d9a015a8361d090ce1e3b3f",
+      "storage_profile": "tq-factors-landmarks",
+      "xkv_enabled": true
+    }
+  ],
+  "sampling": {
+    "n_predict": 512,
+    "seed": 42,
+    "temperature": 0.0,
+    "template": "",
+    "top_k": 1,
+    "top_p": 1.0
+  },
+  "sampling_fingerprint": "923471cdd59741b8b50c5f7142f301b6386cde22cbc12a6d56d35931a26cd852",
+  "server": {
+    "launch": false,
+    "mode": "single",
+    "runtime_cfg": {
+      "ctx_size": 262144,
+      "device": null,
+      "gpu_layers": "all",
+      "n_parallel": null,
+      "total_kv": "auto"
+    },
+    "urls": {}
+  },
+  "version": 1
+}

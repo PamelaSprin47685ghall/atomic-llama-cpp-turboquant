@@ -1,0 +1,501 @@
+#version 450
+
+// xkv_landmark_build.comp — High-Performance Parallel Native Landmark Construction
+// from FINAL encoded A_K/B_K streams (v1).
+//
+// Parallelization:
+//   Grid: (chunk, block) workgroups where block covers 32 (Q8_0) or 128 (Turbo4_0) features.
+//   Workgroup size: 128 threads (local_size_x = 128, local_size_y = 1, local_size_z = 1).
+//   Each thread reconstructs its feature across all chunk rows (r0..r1), applies per-row
+//   forward RoPE at that row's own storage_position, and accumulates into mean.
+//   Workgroup cooperatively computes block scaling, quantization, and chunk error bound.
+//
+// Scratch:
+//   Bounded to ONE chunk intermediate of max_feature_dim * pad_rank + pad_rank floats,
+//   independent of chunk or history count.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Cody-Waite range reduction of pos * omega to [-pi, pi] using double-precision
+// splitting of 2*pi (PI2_HI + PI2_LO = 2*pi exact to 48 bits). Eliminates
+// GPU hardware range-reduction divergence on large angles (|pos| <= 4096)
+// so v_sin_f32 / v_cos_f32 operate in their near-exact [-pi, pi] domain.
+void rope_trig_cody_waite(float pos_f, float omega, out float out_c, out float out_s) {
+    const float INV_TWO_PI = 0.15915494309189535; // 1 / (2*pi)
+    const float TWO_PI_HI  = 6.2831854820251465;  // high 24 bits
+    const float TWO_PI_LO  = -1.748455588302094e-7; // low bits
+    float ang = pos_f * omega;
+    float k_cycles = round(ang * INV_TWO_PI);
+    float red_ang = fma(k_cycles, -TWO_PI_HI, ang);
+    red_ang = fma(k_cycles, -TWO_PI_LO, red_ang);
+    out_c = cos(red_ang);
+    out_s = sin(red_ang);
+}
+
+layout (local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform BuildPush {
+    uint step;
+    uint n_rows;
+    uint n_chunks;
+    uint chunk_tokens;
+    uint total_dim;
+    uint padded_dim;
+    uint rank;
+    uint pad_rank;
+    uint n_layers;
+    uint landmark_type;
+    uint a_type;
+    uint b_type;
+    uint a_stride;
+    uint b_stride;
+    uint dst_stride;
+    uint max_dim;
+    uint pos_is_64;
+    uint rope_nelems;
+    uint status_idx;
+    uint seed_lo;
+    uint phase_lo;
+    uint phase_hi;
+} p;
+
+layout (binding = 0, std430) readonly buffer AK { uint8_t ak[]; };
+layout (binding = 1, std430) readonly buffer BK { uint8_t bk[]; };
+layout (binding = 2, std430) readonly buffer ROWS { int rows[]; };
+layout (binding = 3, std430) readonly buffer POS { uint pos_raw[]; };
+layout (binding = 4, std430) readonly buffer LMETA { int lmeta[]; };
+layout (binding = 5, std430) readonly buffer ROPE { float rope[]; };
+layout (binding = 6, std430) buffer SCR { float scr[]; };
+// Non-negative float bit patterns are monotonically ordered as uint, allowing
+// step 1 workgroups to atomically accumulate a conservative per-chunk max.
+layout (binding = 7, std430) buffer EB { uint ebits[]; };
+layout (binding = 8, std430) buffer SFP { uint srcfp[]; };
+layout (binding = 9, std430) buffer DST { uint8_t dst[]; };
+layout (binding = 10, std430) buffer ST { uint st[]; };
+
+const float S1[128] = float[128](
+    -1,1,1,-1,-1,1,-1,1,-1,-1,1,1,1,1,1,1,1,-1,1,-1,1,-1,-1,1,1,1,-1,1,1,-1,-1,-1,
+    -1,1,1,-1,1,1,-1,1,-1,1,1,-1,-1,1,-1,1,1,1,1,-1,-1,-1,-1,-1,1,-1,1,1,1,1,-1,1,
+    -1,-1,1,-1,-1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,1,-1,-1,1,1,1,-1,-1,1,1,-1,1,1,-1,1,-1,
+    -1,1,1,-1,1,-1,1,-1,1,1,1,1,-1,1,-1,1,1,-1,1,1,-1,-1,-1,-1,-1,1,1,-1,1,1,-1,1);
+const float S2[128] = float[128](
+    1,1,1,1,-1,1,1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,-1,-1,1,-1,1,-1,1,-1,-1,1,-1,1,1,1,
+    1,1,-1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,1,-1,1,-1,1,1,1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,
+    1,-1,1,-1,-1,-1,-1,1,-1,1,-1,1,-1,-1,1,1,-1,1,-1,1,1,-1,1,-1,-1,-1,-1,1,-1,-1,1,-1,
+    1,-1,1,1,1,-1,-1,1,-1,1,-1,1,1,-1,-1,1,-1,1,-1,1,1,-1,1,-1,1,-1,-1,-1,-1,-1,1,-1);
+const float C4[16] = float[16](
+    -0.173926, -0.117195, -0.089527, -0.068756,
+    -0.051262, -0.035597, -0.020989, -0.006938,
+     0.006938,  0.020989,  0.035597,  0.051262,
+     0.068756,  0.089527,  0.117195,  0.173926);
+const float TM4[15] = float[15](
+    -0.145561, -0.103361, -0.079142, -0.060009,
+    -0.043430, -0.028293, -0.013964,  0.0,
+     0.013964,  0.028293,  0.043430,  0.060009,
+     0.079142,  0.103361,  0.145561);
+const float INV_SQRT128 = 0.08838834764831845;
+
+float rd_half_ak(uint off) {
+    uint h = uint(ak[off]) | (uint(ak[off + 1u]) << 8u);
+    return unpackHalf2x16(h).x;
+}
+float rd_f32_ak(uint off) {
+    uint w = uint(ak[off]) | (uint(ak[off + 1u]) << 8u) | (uint(ak[off + 2u]) << 16u) | (uint(ak[off + 3u]) << 24u);
+    return uintBitsToFloat(w);
+}
+float rd_half_bk(uint off) {
+    uint h = uint(bk[off]) | (uint(bk[off + 1u]) << 8u);
+    return unpackHalf2x16(h).x;
+}
+float rd_f32_bk(uint off) {
+    uint w = uint(bk[off]) | (uint(bk[off + 1u]) << 8u) | (uint(bk[off + 2u]) << 16u) | (uint(bk[off + 3u]) << 24u);
+    return uintBitsToFloat(w);
+}
+
+float reconstruct_value(int arow, uint feature) {
+    if (arow < 0 || feature >= p.total_dim) return 0.0;
+    uint abase = uint(arow) * p.a_stride;
+    uint bbase = feature * p.b_stride;
+    float value = 0.0;
+    for (uint k = 0u; k < p.rank; ++k) {
+        float av;
+        if (p.a_type == 0u) av = rd_f32_ak(abase + k * 4u);
+        else if (p.a_type == 1u) av = rd_half_ak(abase + k * 2u);
+        else if (p.a_type == 8u) {
+            uint b = k / 32u, j = k % 32u;
+            float d = rd_half_ak(abase + b * 34u);
+            int q = int(ak[abase + b * 34u + 2u + j]);
+            if (q >= 128) q -= 256;
+            av = d * float(q);
+        } else {
+            uint g = k / 128u, j = k % 128u;
+            uint off = abase + g * 68u;
+            float norm = rd_half_ak(off);
+            uint packed = uint(ak[off + 4u + j / 2u]);
+            uint qi = (j & 1u) == 0u ? (packed & 15u) : (packed >> 4u);
+            // A and B use the same orthogonal Turbo rotation, so their dot
+            // product is invariant in this rotated centroid domain.
+            av = norm * C4[qi];
+        }
+
+        float bv;
+        if (p.b_type == 0u) bv = rd_f32_bk(bbase + k * 4u);
+        else if (p.b_type == 1u) bv = rd_half_bk(bbase + k * 2u);
+        else if (p.b_type == 8u) {
+            uint b = k / 32u, j = k % 32u;
+            float d = rd_half_bk(bbase + b * 34u);
+            int q = int(bk[bbase + b * 34u + 2u + j]);
+            if (q >= 128) q -= 256;
+            bv = d * float(q);
+        } else {
+            uint g = k / 128u, j = k % 128u;
+            uint off = bbase + g * 68u;
+            float norm = rd_half_bk(off);
+            uint packed = uint(bk[off + 4u + j / 2u]);
+            uint qi = (j & 1u) == 0u ? (packed & 15u) : (packed >> 4u);
+            bv = norm * C4[qi];
+        }
+        value += av * bv;
+    }
+    return value;
+}
+
+int64_t load_position(uint row_index) {
+    if (p.pos_is_64 == 0u) return int64_t(int(pos_raw[row_index]));
+    uint lo = pos_raw[2u * row_index];
+    int64_t hi = int64_t(int(pos_raw[2u * row_index + 1u]));
+    return (hi << 32) | int64_t(uint64_t(lo));
+}
+
+uint64_t fnv_byte(uint64_t h, uint v) {
+    return (h ^ uint64_t(v & 255u)) * 0x100000001b3UL;
+}
+
+uint64_t fnv_u32(uint64_t h, uint v) {
+    h = fnv_byte(h, v);
+    h = fnv_byte(h, v >> 8u);
+    h = fnv_byte(h, v >> 16u);
+    return fnv_byte(h, v >> 24u);
+}
+
+// Cooperative shared memory within the workgroup
+shared float sh_v[128];
+shared float sh_red[128];
+shared uint  sh_u[128];
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x;
+
+    if (p.step == 0u) {
+        if (gid == 0u) {
+            bool ok = (p.n_rows > 0u && p.n_chunks > 0u && p.chunk_tokens > 0u &&
+                       p.total_dim > 0u && p.total_dim <= 4096u && p.padded_dim >= p.total_dim &&
+                       p.rank > 0u && p.pad_rank >= p.rank && p.n_layers > 0u &&
+                       (p.landmark_type == 8u || p.landmark_type == 44u) &&
+                       (p.a_type == 0u || p.a_type == 1u || p.a_type == 8u || p.a_type == 44u) &&
+                       (p.b_type == 0u || p.b_type == 1u || p.b_type == 8u || p.b_type == 44u));
+            if (ok) {
+                uint run = 0u;
+                for (uint li = 0u; li < p.n_layers; ++li) {
+                    int foff = lmeta[li * 6u + 0u], fdim = lmeta[li * 6u + 1u];
+                    int ehd = lmeta[li * 6u + 2u], rdim = lmeta[li * 6u + 3u];
+                    int rmode = lmeta[li * 6u + 4u], roff = lmeta[li * 6u + 5u];
+                    if (foff != int(run) || fdim <= 0) { ok = false; break; }
+                    if (ehd <= 0 || (fdim % ehd) != 0 || rdim < 0 || rdim > ehd || (rdim & 1) != 0) { ok = false; break; }
+                    if (rmode < 0 || rmode > 1 || roff < 0) { ok = false; break; }
+                    if (rdim > 0 && uint(roff + rdim) > p.rope_nelems) { ok = false; break; }
+                    run += uint(fdim);
+                }
+                if (ok && run != p.total_dim) ok = false;
+            }
+            st[p.status_idx] = ok ? 0u : 4u;
+            st[p.status_idx + 1u] = 0u;
+            if (ok) {
+                for (uint c = 0u; c < p.n_chunks; ++c) {
+                    ebits[c] = 0u;
+                    srcfp[2u * c] = 0u;
+                    srcfp[2u * c + 1u] = 0u;
+                }
+            }
+        }
+        return;
+    }
+    if (st[p.status_idx] != 0u) return;
+
+    // Step 2 runs after a device barrier following every block encoder. One
+    // lane per chunk finalizes the conservative bound and a deterministic
+    // fingerprint of the encoded row plus its exact source row/position set.
+    if (p.step == 2u) {
+        uint cid = gl_WorkGroupID.x;
+        if (cid >= p.n_chunks || lid != 0u) return;
+
+        float max_abs = uintBitsToFloat(ebits[cid]);
+        float bound = sqrt(float(p.total_dim)) * max_abs;
+        bound = bound * (1.0 + 8.0 * 1.1920928955078125e-7) + 1.0e-6;
+        if (!(bound >= 1.0e-6) || isnan(bound) || isinf(bound)) bound = 1.0e-4;
+        ebits[cid] = floatBitsToUint(bound);
+
+        uint64_t h = 0xcbf29ce484222325UL;
+        h = fnv_u32(h, p.seed_lo);
+        h = fnv_u32(h, p.phase_lo); h = fnv_u32(h, p.phase_hi);
+        h = fnv_u32(h, cid);
+        uint r0 = cid * p.chunk_tokens;
+        uint r1 = min(r0 + p.chunk_tokens, p.n_rows);
+        for (uint ri = r0; ri < r1; ++ri) {
+            h = fnv_u32(h, uint(rows[ri]));
+            if (p.pos_is_64 != 0u) {
+                h = fnv_u32(h, pos_raw[2u * ri]);
+                h = fnv_u32(h, pos_raw[2u * ri + 1u]);
+            } else {
+                h = fnv_u32(h, pos_raw[ri]);
+                h = fnv_u32(h, uint(int(pos_raw[ri]) < 0 ? 0xFFFFFFFFu : 0u));
+            }
+        }
+        uint dbase = cid * p.dst_stride;
+        for (uint i = 0u; i < p.dst_stride; ++i) h = fnv_byte(h, uint(dst[dbase + i]));
+        if (h == 0UL) h = 1UL;
+        srcfp[2u * cid] = uint(h & 0xFFFFFFFFUL);
+        srcfp[2u * cid + 1u] = uint(h >> 32u);
+        if (cid == 0u) st[p.status_idx + 1u] = p.n_chunks;
+        return;
+    }
+
+    // Step 1: Parallel reconstruction and cooperative block quantization
+    uint blk_sz = (p.landmark_type == 8u) ? 32u : 128u;
+    uint nb = p.padded_dim / blk_sz;
+    uint total_workgroups = p.n_chunks * nb;
+    uint wgid = gl_WorkGroupID.x;
+    if (wgid >= total_workgroups) return;
+
+    uint cid = wgid / nb;
+    uint bid = wgid % nb;
+
+    uint P = p.pad_rank, D = p.total_dim, PD = p.padded_dim;
+    uint feat = bid * blk_sz + lid;
+    bool valid_feat = (lid < blk_sz) && (feat < D);
+
+    // Locate which layer owns `feat`
+    int layer_idx = -1;
+    uint foff = 0u, fdim = 0u, ehd = 0u, rdim = 0u, rmode = 0u, roff = 0u;
+    if (valid_feat) {
+        for (uint li = 0u; li < p.n_layers; ++li) {
+            uint lo = uint(lmeta[li * 6u + 0u]), ld = uint(lmeta[li * 6u + 1u]);
+            if (feat >= lo && feat < lo + ld) {
+                layer_idx = int(li);
+                foff = lo; fdim = ld;
+                ehd = uint(lmeta[li * 6u + 2u]);
+                rdim = uint(lmeta[li * 6u + 3u]);
+                rmode = uint(lmeta[li * 6u + 4u]);
+                roff = uint(lmeta[li * 6u + 5u]);
+                break;
+            }
+        }
+    }
+
+    uint r0 = cid * p.chunk_tokens;
+    uint r1 = r0 + p.chunk_tokens;
+    if (r1 > p.n_rows) r1 = p.n_rows;
+
+    // Thread reconstructs its feature across the chunk rows [r0, r1)
+    float acc_feat = 0.0;
+    bool bad = false;
+
+    for (uint ri = r0; ri < r1; ++ri) {
+        int ar = rows[ri];
+        if (ar < 0) { bad = true; break; }
+
+        float dot_val = valid_feat ? reconstruct_value(ar, feat) : 0.0;
+
+        if (valid_feat) {
+            float phased_val = dot_val;
+            if (rdim > 0u) {
+                int64_t pos = load_position(ri);
+                float fpos = float(pos);
+                uint fc = rdim / 2u;
+                uint head_local = (feat - foff) % ehd;
+                if (head_local < rdim) {
+                    uint head_base = feat - head_local;
+                    if (rmode == 0u) { // HALF mode
+                        if (head_local < fc) {
+                            float re = dot_val;
+                            float im = reconstruct_value(ar, head_base + head_local + fc);
+                            float om = rope[roff + head_local];
+                            float mg = rope[roff + fc + head_local];
+                            if (mg <= 0.0) mg = 1.0;
+                            float c, sn;
+                            rope_trig_cody_waite(fpos, om, c, sn);
+                            phased_val = (re * c - im * sn) * mg;
+                        } else {
+                            float im = dot_val;
+                            uint f = head_local - fc;
+                            float re = reconstruct_value(ar, head_base + f);
+                            float om = rope[roff + f];
+                            float mg = rope[roff + fc + f];
+                            if (mg <= 0.0) mg = 1.0;
+                            float c, sn;
+                            rope_trig_cody_waite(fpos, om, c, sn);
+                            phased_val = (re * sn + im * c) * mg;
+                        }
+                    } else { // INTERLEAVED mode
+                        uint pair_idx = head_local / 2u;
+                        float om = rope[roff + pair_idx];
+                        float mg = rope[roff + fc + pair_idx];
+                        if (mg <= 0.0) mg = 1.0;
+                        float c, sn;
+                        rope_trig_cody_waite(fpos, om, c, sn);
+                        if ((head_local & 1u) == 0u) {
+                            float re = dot_val;
+                            float im = reconstruct_value(ar, feat + 1u);
+                            phased_val = (re * c - im * sn) * mg;
+                        } else {
+                            float im = dot_val;
+                            float re = reconstruct_value(ar, feat - 1u);
+                            phased_val = (re * sn + im * c) * mg;
+                        }
+                    }
+                }
+            }
+            if (isnan(phased_val) || isinf(phased_val)) bad = true;
+            acc_feat += phased_val;
+        }
+    }
+
+    if (bad) { atomicMax(st[p.status_idx], 2u); return; }
+
+    // Mean pool across chunk rows
+    float inv_rows = 1.0 / float(r1 - r0);
+    float mean_val = valid_feat ? (acc_feat * inv_rows) : 0.0;
+    sh_v[lid] = mean_val;
+    barrier();
+
+    // Workgroup cooperatively encodes this codec block
+    uint dbase = cid * p.dst_stride;
+
+    if (p.landmark_type == 8u) {
+        // Q8_0 block (32 elements)
+        if (lid < 32u) {
+            sh_red[lid] = abs(mean_val);
+        } else {
+            sh_red[lid] = 0.0;
+        }
+        barrier();
+        for (uint s = 16u; s > 0u; s >>= 1u) {
+            if (lid < s) sh_red[lid] = max(sh_red[lid], sh_red[lid + s]);
+            barrier();
+        }
+        float amax = sh_red[0];
+        float dd = amax / 127.0;
+        uint dd_bits = packHalf2x16(vec2(dd, 0.0));
+        float stored_dd = unpackHalf2x16(dd_bits).x;
+        float id = (dd != 0.0) ? (1.0 / dd) : 0.0;
+
+        if (lid == 0u) {
+            dst[dbase + bid * 34u] = uint8_t(dd_bits & 255u);
+            dst[dbase + bid * 34u + 1u] = uint8_t((dd_bits >> 8u) & 255u);
+        }
+
+        float err_upper = 0.0;
+        if (lid < 32u) {
+            int q = int(round(mean_val * id));
+            q = clamp(q, -128, 127);
+            dst[dbase + bid * 34u + 2u + lid] = uint8_t(uint(q) & 255u);
+            float decv = float(q) * stored_dd;
+            if (feat < D) {
+                float diff = decv - mean_val;
+                err_upper = abs(diff) +
+                    4.0 * 1.1920928955078125e-7 * (abs(decv) + abs(mean_val) + 1.0);
+            }
+        }
+        sh_red[lid] = err_upper;
+        barrier();
+        for (uint s = 64u; s > 0u; s >>= 1u) {
+            if (lid < s) sh_red[lid] = max(sh_red[lid], sh_red[lid + s]);
+            barrier();
+        }
+        if (lid == 0u) {
+            atomicMax(ebits[cid], floatBitsToUint(sh_red[0]));
+        }
+    } else {
+        // Turbo4_0 block (128 elements)
+        sh_red[lid] = mean_val * mean_val;
+        barrier();
+        for (uint s = 64u; s > 0u; s >>= 1u) {
+            if (lid < s) sh_red[lid] += sh_red[lid + s];
+            barrier();
+        }
+        float nrm = sqrt(sh_red[0]);
+        float inv_nrm = (nrm > 1e-10) ? (1.0 / nrm) : 0.0;
+        float rot = mean_val * inv_nrm * S1[lid];
+        sh_v[lid] = rot;
+        barrier();
+
+        // Cooperative 128-element butterfly WHT
+        for (uint h = 1u; h < 128u; h <<= 1u) {
+            float a = sh_v[lid];
+            float b = sh_v[lid ^ h];
+            barrier();
+            sh_v[lid] = ((lid & h) == 0u) ? (a + b) : (b - a);
+            barrier();
+        }
+        float wht_val = sh_v[lid] * INV_SQRT128 * S2[lid];
+
+        uint ix = 0u;
+        for (uint i = 0u; i < 15u; ++i) {
+            if (wht_val >= TM4[i]) ix = i + 1u;
+        }
+        sh_u[lid] = ix;
+        sh_red[lid] = C4[ix] * C4[ix];
+        barrier();
+        for (uint s = 64u; s > 0u; s >>= 1u) {
+            if (lid < s) sh_red[lid] += sh_red[lid + s];
+            barrier();
+        }
+        float rn = sqrt(sh_red[0]);
+        float cnorm = (rn > 1e-10) ? (nrm / rn) : nrm;
+        uint cnorm_bits = packHalf2x16(vec2(cnorm, 0.0));
+        float stored_cnorm = unpackHalf2x16(cnorm_bits).x;
+
+        uint boff = dbase + bid * 68u;
+        if (lid == 0u) {
+            dst[boff] = uint8_t(cnorm_bits & 255u);
+            dst[boff + 1u] = uint8_t((cnorm_bits >> 8u) & 255u);
+            dst[boff + 2u] = uint8_t(0u);
+            dst[boff + 3u] = uint8_t(0u);
+        }
+        if (lid < 64u) {
+            uint lo = sh_u[2u * lid] & 15u, hi = sh_u[2u * lid + 1u] & 15u;
+            dst[boff + 4u + lid] = uint8_t(lo | (hi << 4u));
+        }
+
+        // Error calculation: inverse WHT of reconstructed centroids
+        float c_val = stored_cnorm * C4[ix] * S2[lid];
+        sh_v[lid] = c_val;
+        barrier();
+        for (uint h = 1u; h < 128u; h <<= 1u) {
+            float a = sh_v[lid];
+            float b = sh_v[lid ^ h];
+            barrier();
+            sh_v[lid] = ((lid & h) == 0u) ? (a + b) : (b - a);
+            barrier();
+        }
+        float dec_val = sh_v[lid] * INV_SQRT128 * S1[lid];
+        float diff = (feat < D) ? (dec_val - mean_val) : 0.0;
+        sh_red[lid] = (feat < D) ? abs(diff) +
+            4.0 * 1.1920928955078125e-7 * (abs(dec_val) + abs(mean_val) + 1.0) : 0.0;
+        barrier();
+        for (uint s = 64u; s > 0u; s >>= 1u) {
+            if (lid < s) sh_red[lid] = max(sh_red[lid], sh_red[lid + s]);
+            barrier();
+        }
+        if (lid == 0u) {
+            atomicMax(ebits[cid], floatBitsToUint(sh_red[0]));
+        }
+    }
+}

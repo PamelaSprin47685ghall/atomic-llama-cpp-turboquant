@@ -1,0 +1,919 @@
+#version 450
+
+// xkv_factorize.comp — Native Vulkan device-local randomized factorization core.
+//
+// One canonical group matrix X[n,m] (F32) -> packed A[n,pad_a] + B[m,pad_b]
+// streams (F32/F16/Q8_0/Turbo2/3/4, exact ggml kernels/layouts) via:
+//   s0  Y = X*Omega, Omega counter-Rademacher fused (32-bit fmix, bit-exact
+//       with ggml_xkv_factorize_cpu_oracle; no persistent Omega)
+//   s1  two-pass CGS2 orthonormalization, rank-deficiency guard (zero, no NaN)
+//   s2/s3 power iterations Z = X^T Q / Y = X Z with s1 between
+//   s4  reduced core C = Q^T X (l x m)
+//   s5  Gram G = C*C^T (l x l, symmetric)
+//   s6  parallel round-robin cyclic Jacobi eigendecomposition of G (15 sweeps,
+//       1e-5 relative off-diag gate) -> S[l], V[l,l]; odd-even sort desc with
+//       index-asc tie-break (repeated singular values deterministic)
+//   s7  U_full = Q*V_ord, BT_raw = CT*V_ord*inv(S) (inv=0 when S<=1e-12*Smax)
+//   s8  sign canonicalization (max-|.| of A col) + balance (upstream/sqrt/diag)
+//   s9/s10 contiguous encode of A/BT rows (scalar loops in CPU order:
+//       L2 norm -> normalize -> forward WHT(s1/butterfly/s2) -> nearest
+//       centroid (midpoint ladders) -> corrected norm; F16/Q8_0/F32 direct)
+//
+// All steps device-local with pipeline barriers; host reads only the scalar
+// status word. Invalid params -> status!=0 and NO output writes (handles stay
+// unpublished). NOTE: the Gram route squares conditioning (standard GPU
+// tradeoff vs the oracle's one-sided Jacobi); rank-deficient columns are
+// guarded and subspace agreement is covered by test tolerances.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform FactorPush {
+    uint step;
+    uint n; uint m; uint r; uint l;
+    uint seed_lo; uint seed_hi;
+    uint balance;
+    uint type_a; uint type_b;
+    uint pad_a; uint pad_b;
+    uint off_Y; uint off_Z; uint off_C;
+    uint off_G; uint off_V; uint off_S;
+    uint off_ORD; uint off_AF; uint off_BTF;
+    uint status_idx;
+    uint qr_rows;
+    uint aux;
+} p;
+
+layout (binding = 0, std430) readonly buffer XIN { float x[]; };
+layout (binding = 1, std430) buffer SCR { float s[]; };
+layout (binding = 2, std430) buffer OA { uint8_t oa[]; };
+layout (binding = 3, std430) buffer OB { uint8_t ob[]; };
+layout (binding = 4, std430) buffer ST { uint st[]; };
+
+shared float sh_red[256];
+shared float sh_bc;
+shared uint  sh_np;
+shared uint  sh_P[256];
+shared uint  sh_Q[256];
+shared float sh_C[256];
+shared float sh_Sv[256];
+shared float sh_keys[512];
+shared uint  sh_idx[512];
+shared uint  sh_done;
+
+// ---- counter Rademacher (bit-exact with CPU oracle) ----
+uint fmix32(uint h) {
+    h ^= h >> 16u;
+    h *= 0x7FEB352Du;
+    h ^= h >> 15u;
+    h *= 0x846CA68Bu;
+    h ^= h >> 16u;
+    return h;
+}
+float radem(uint k, uint j) {
+    uint h = p.seed_lo ^ (k * 2654435761u) ^ (j * 2246822519u)
+           ^ (p.l * 3266489917u) ^ (p.seed_hi * 668265263u);
+    h = fmix32(h == 0u ? 0x9E3779B9u : h);
+    return (h & 1u) != 0u ? 1.0 : -1.0;
+}
+
+// ---- Turbo constants (exact ggml-turbo-quant.c) ----
+const float S1[128] = float[128](
+    -1,1,1,-1,-1,1,-1,1,-1,-1,1,1,1,1,1,1,1,-1,1,-1,1,-1,-1,1,1,1,-1,1,1,-1,-1,-1,
+    -1,1,1,-1,1,1,-1,1,-1,1,1,-1,-1,1,-1,1,1,1,1,-1,-1,-1,-1,-1,1,-1,1,1,1,1,-1,1,
+    -1,-1,1,-1,-1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,1,-1,-1,1,1,1,-1,-1,1,1,-1,1,1,-1,1,-1,
+    -1,1,1,-1,1,-1,1,-1,1,1,1,1,-1,1,-1,1,1,-1,1,1,-1,-1,-1,-1,-1,1,1,-1,1,1,-1,1);
+const float S2[128] = float[128](
+    1,1,1,1,-1,1,1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,-1,-1,1,-1,1,-1,1,-1,-1,1,-1,1,1,1,
+    1,1,-1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,1,-1,1,-1,1,1,1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,
+    1,-1,1,-1,-1,-1,-1,1,-1,1,-1,1,-1,-1,1,1,-1,1,-1,1,1,-1,1,-1,-1,-1,-1,1,-1,-1,1,-1,
+    1,-1,1,1,1,-1,-1,1,-1,1,-1,1,1,-1,-1,1,-1,1,-1,1,1,-1,1,-1,1,-1,-1,-1,-1,-1,1,-1);
+const float C2[4] = float[4](-0.133462, -0.039994, 0.039994, 0.133462);
+const float C3[8] = float[8](
+    -0.190685, -0.117832, -0.065717, -0.021460,
+     0.021460,  0.065717,  0.117832,  0.190685);
+const float C4[16] = float[16](
+    -0.173926, -0.117195, -0.089527, -0.068756,
+    -0.051262, -0.035597, -0.020989, -0.006938,
+     0.006938,  0.020989,  0.035597,  0.051262,
+     0.068756,  0.089527,  0.117195,  0.173926);
+const float INV_SQRT128 = 0.08838834764831845;
+
+uint pack_half(float v) { return packHalf2x16(vec2(v, 0.0)); }
+void store_half_oa(uint off, float v) {
+    uint h = pack_half(v);
+    oa[off] = uint8_t(h & 255u);
+    oa[off + 1u] = uint8_t((h >> 8u) & 255u);
+}
+void store_half_ob(uint off, float v) {
+    uint h = pack_half(v);
+    ob[off] = uint8_t(h & 255u);
+    ob[off + 1u] = uint8_t((h >> 8u) & 255u);
+}
+float rhalf_away(float v) {
+    // round-half-away-from-zero (matches CPU roundf in Q8_0 quant)
+    return v >= 0.0 ? floor(v + 0.5) : -floor(-v + 0.5);
+}
+
+uint rowbytes_of(uint t, uint pr) {
+    if (t == 0u) return pr * 4u;
+    if (t == 1u) return pr * 2u;
+    if (t == 8u) return (pr / 32u) * 34u;
+    if (t == 42u) return (pr / 128u) * 34u;
+    if (t == 43u) return (pr / 128u) * 50u;
+    return (pr / 128u) * 68u;
+}
+
+// Packed-stream decode (ROTATED Turbo domain = production dot contract).
+// Bit-exact with ggml dequant kernels (same tables/order as xkv_reconstruct).
+float decA(uint i, uint k) {
+    uint t = p.type_a, pr = p.pad_a;
+    uint base = i * rowbytes_of(t, pr);
+    if (t == 0u) {
+        uint o = base + k * 4u;
+        uint w = uint(oa[o]) | (uint(oa[o+1u])<<8u) | (uint(oa[o+2u])<<16u) | (uint(oa[o+3u])<<24u);
+        return uintBitsToFloat(w);
+    }
+    if (t == 1u) {
+        uint o = base + k * 2u;
+        uint h = uint(oa[o]) | (uint(oa[o+1u])<<8u);
+        return unpackHalf2x16(h).x;
+    }
+    if (t == 8u) {
+        uint b = k / 32u, j = k % 32u;
+        uint bo = base + b * 34u;
+        uint h = uint(oa[bo]) | (uint(oa[bo+1u])<<8u);
+        float d = unpackHalf2x16(h).x;
+        int q = int(oa[bo + 2u + j]);
+        if (q >= 128) q -= 256;
+        return d * float(q);
+    }
+    uint g = k / 128u, j = k % 128u;
+    uint bb = (t == 42u) ? 34u : ((t == 43u) ? 50u : 68u);
+    uint bo = base + g * bb;
+    uint hn = uint(oa[bo]) | (uint(oa[bo+1u])<<8u);
+    float norm = unpackHalf2x16(hn).x;
+    float cv = 0.0;
+    if (t == 42u) {
+        uint qb = uint(oa[bo + 2u + j / 4u]);
+        cv = C2[(qb >> (2u * (j % 4u))) & 3u];
+    } else if (t == 43u) {
+        uint qb = uint(oa[bo + 2u + j / 4u]);
+        uint sb = uint(oa[bo + 34u + j / 8u]);
+        uint idx = ((qb >> (2u * (j % 4u))) & 3u) | (((sb >> (j % 8u)) & 1u) << 2u);
+        cv = C3[idx];
+    } else {
+        uint qb = uint(oa[bo + 4u + j / 2u]);
+        uint idx = ((j % 2u) == 0u) ? (qb & 15u) : (qb >> 4u);
+        cv = C4[idx];
+    }
+    return norm * cv;
+}
+
+float decB(uint j, uint k) {
+    uint t = p.type_b, pr = p.pad_b;
+    uint base = j * rowbytes_of(t, pr);
+    if (t == 0u) {
+        uint o = base + k * 4u;
+        uint w = uint(ob[o]) | (uint(ob[o+1u])<<8u) | (uint(ob[o+2u])<<16u) | (uint(ob[o+3u])<<24u);
+        return uintBitsToFloat(w);
+    }
+    if (t == 1u) {
+        uint o = base + k * 2u;
+        uint h = uint(ob[o]) | (uint(ob[o+1u])<<8u);
+        return unpackHalf2x16(h).x;
+    }
+    if (t == 8u) {
+        uint b = k / 32u, jj = k % 32u;
+        uint bo = base + b * 34u;
+        uint h = uint(ob[bo]) | (uint(ob[bo+1u])<<8u);
+        float d = unpackHalf2x16(h).x;
+        int q = int(ob[bo + 2u + jj]);
+        if (q >= 128) q -= 256;
+        return d * float(q);
+    }
+    uint g = k / 128u, jj = k % 128u;
+    uint bb = (t == 42u) ? 34u : ((t == 43u) ? 50u : 68u);
+    uint bo = base + g * bb;
+    uint hn = uint(ob[bo]) | (uint(ob[bo+1u])<<8u);
+    float norm = unpackHalf2x16(hn).x;
+    float cv = 0.0;
+    if (t == 42u) {
+        uint qb = uint(ob[bo + 2u + jj / 4u]);
+        cv = C2[(qb >> (2u * (jj % 4u))) & 3u];
+    } else if (t == 43u) {
+        uint qb = uint(ob[bo + 2u + jj / 4u]);
+        uint sb = uint(ob[bo + 34u + jj / 8u]);
+        uint idx = ((qb >> (2u * (jj % 4u))) & 3u) | (((sb >> (jj % 8u)) & 1u) << 2u);
+        cv = C3[idx];
+    } else {
+        uint qb = uint(ob[bo + 4u + jj / 2u]);
+        uint idx = ((jj % 2u) == 0u) ? (qb & 15u) : (qb >> 4u);
+        cv = C4[idx];
+    }
+    return norm * cv;
+}
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+
+    if (p.step == 0u) {
+        // validate once here
+        if (gid == 0u) {
+            bool ok = (p.n > 0u && p.m > 0u && p.r > 0u && p.l > 0u && p.l <= 512u &&
+                       p.r <= p.n && p.r <= p.m &&
+                       (p.balance <= 2u) &&
+                       (p.pad_a == p.r || p.pad_a > p.r) && (p.pad_b == p.r || p.pad_b > p.r) &&
+                       (p.pad_a == p.pad_b));
+            st[p.status_idx] = ok ? 0u : 1u;
+        }
+        return;
+    }
+    if (st[p.status_idx] != 0u) return;
+
+    uint n = p.n, m = p.m, r = p.r, l = p.l;
+
+    if (p.step == 1u) {
+        // PROJ_Y fused: Y[i*l+j] at off_Y
+        uint total = n * l;
+        if (gid < total) {
+            uint i = gid / l, j = gid % l;
+            float acc = 0.0;
+            for (uint k = 0u; k < m; ++k) acc += x[i * m + k] * radem(k, j);
+            s[p.off_Y + gid] = acc;
+        }
+        return;
+    }
+
+    if (p.step == 2u) {
+        // CGS2x2 in place on T[qr_rows x l] at p.aux (off_Y or off_Z); single workgroup required
+        if (gl_NumWorkGroups.x != 1u) { if (lid == 0u) st[p.status_idx] = 1u; return; }
+        uint K = p.qr_rows;
+        uint TB = p.aux;
+        for (uint j = 0u; j < l; ++j) {
+            for (uint pass = 0u; pass < 2u; ++pass) {
+                for (uint j0 = 0u; j0 < j; ++j0) {
+                    float part = 0.0;
+                    for (uint i = lid; i < K; i += 256u)
+                        part += s[TB + i * l + j0] * s[TB + i * l + j];
+                    sh_red[lid] = part;
+                    barrier();
+                    if (lid == 0u) {
+                        float d = 0.0;
+                        for (uint t = 0u; t < 256u; ++t) d += sh_red[t];
+                        sh_bc = d;
+                    }
+                    barrier();
+                    float d = sh_bc;
+                    for (uint i = lid; i < K; i += 256u)
+                        s[TB + i * l + j] -= d * s[TB + i * l + j0];
+                    barrier();
+                }
+            }
+            float part = 0.0;
+            for (uint i = lid; i < K; i += 256u) {
+                float v = s[TB + i * l + j];
+                part += v * v;
+            }
+            sh_red[lid] = part;
+            barrier();
+            if (lid == 0u) {
+                float nn = 0.0;
+                for (uint t = 0u; t < 256u; ++t) nn += sh_red[t];
+                sh_bc = sqrt(nn);
+            }
+            barrier();
+            float nn = sh_bc;
+            if (nn > 1e-12) {
+                for (uint i = lid; i < K; i += 256u) s[TB + i * l + j] /= nn;
+            } else {
+                for (uint i = lid; i < K; i += 256u) s[TB + i * l + j] = 0.0;
+            }
+            barrier();
+        }
+        return;
+    }
+
+    if (p.step == 3u) {
+        // Z[m,l] = X^T * Q ; Q at off_Y, Z at off_Z
+        uint total = m * l;
+        if (gid < total) {
+            uint i = gid / l, j = gid % l;
+            float acc = 0.0;
+            for (uint k = 0u; k < n; ++k) acc += x[k * m + i] * s[p.off_Y + k * l + j];
+            s[p.off_Z + gid] = acc;
+        }
+        return;
+    }
+
+    if (p.step == 4u) {
+        // Y[n,l] = X * Z ; Z at off_Z, Y at off_Y
+        uint total = n * l;
+        if (gid < total) {
+            uint i = gid / l, j = gid % l;
+            float acc = 0.0;
+            for (uint k = 0u; k < m; ++k) acc += x[i * m + k] * s[p.off_Z + k * l + j];
+            s[p.off_Y + gid] = acc;
+        }
+        return;
+    }
+
+    if (p.step == 5u) {
+        // C[l,m] at off_C: C[j*m+i] = sum_k Q[k*l+j]*X[k*m+i]
+        uint total = l * m;
+        if (gid < total) {
+            uint j = gid / m, i = gid % m;
+            float acc = 0.0;
+            for (uint k = 0u; k < n; ++k) acc += s[p.off_Y + k * l + j] * x[k * m + i];
+            s[p.off_C + gid] = acc;
+        }
+        return;
+    }
+
+    if (p.step == 6u) {
+        // G[l,l] = C*C^T
+        uint total = l * l;
+        if (gid < total) {
+            uint i = gid / l, j = gid % l;
+            float acc = 0.0;
+            for (uint k = 0u; k < m; ++k) acc += s[p.off_C + i * m + k] * s[p.off_C + j * m + k];
+            s[p.off_G + gid] = acc;
+        }
+        return;
+    }
+
+    if (p.step == 7u) {
+        // Parallel round-robin cyclic Jacobi on G (symmetric, in place) + V=I
+        // accumulation; then S + odd-even sort. Single workgroup required.
+        if (gl_NumWorkGroups.x != 1u) { if (lid == 0u) st[p.status_idx] = 1u; return; }
+        uint L2 = l + (l & 1u);
+        uint npair = L2 / 2u;
+        for (uint i = lid; i < l * l; i += 256u) {
+            uint rr = i / l, cc = i % l;
+            s[p.off_V + i] = (rr == cc) ? 1.0 : 0.0;
+        }
+        barrier();
+        sh_done = 0u;
+        barrier();
+        for (uint sweep = 0u; sweep < 20u; ++sweep) {
+            for (uint t = 0u; t + 1u < L2; ++t) {
+                // build disjoint pairs for this round
+                if (lid == 0u) {
+                    uint cnt = 0u;
+                    uint a0 = t, b0 = L2 - 1u;
+                    if (a0 < l && b0 < l) { sh_P[cnt] = a0; sh_Q[cnt] = b0; cnt++; }
+                    for (uint k = 1u; k < npair; ++k) {
+                        uint a = (t + k) % (L2 - 1u);
+                        uint b = (t + L2 - 1u - k) % (L2 - 1u);
+                        if (a < l && b < l) { sh_P[cnt] = a; sh_Q[cnt] = b; cnt++; }
+                    }
+                    sh_np = cnt;
+                }
+                barrier();
+                uint cnt = sh_np;
+                if (cnt == 0u) { barrier(); continue; }
+                // rotation params per pair
+                if (lid < cnt) {
+                    uint a = sh_P[lid], b = sh_Q[lid];
+                    float app = s[p.off_G + a * l + a];
+                    float aqq = s[p.off_G + b * l + b];
+                    float apq = s[p.off_G + a * l + b];
+                    float tau = (aqq - app) / (2.0 * apq + 1e-30);
+                    float tt = (tau >= 0.0 ? 1.0 : -1.0) / (abs(tau) + sqrt(1.0 + tau * tau));
+                    float c = inversesqrt(1.0 + tt * tt);
+                    sh_C[lid] = c; sh_Sv[lid] = tt * c;
+                }
+                barrier();
+                // Phase A: column rotations G1 = G*J (cols a,b) + V1 = V*J.
+                // One thread owns each (pair, row): reads both old values,
+                // writes both new values. Disjoint pairs => no cross-thread
+                // dependence (the old slot-split design raced slot1 reads
+                // against slot0 writes of the same element).
+                for (uint e = lid; e < cnt * l; e += 256u) {
+                    uint pi = e / l;
+                    uint cc = e % l;
+                    uint a = sh_P[pi], b = sh_Q[pi];
+                    float c = sh_C[pi], sv = sh_Sv[pi];
+                    float gai = s[p.off_G + cc * l + a];
+                    float gbi = s[p.off_G + cc * l + b];
+                    s[p.off_G + cc * l + a] = c * gai - sv * gbi;
+                    s[p.off_G + cc * l + b] = sv * gai + c * gbi;
+                    float vai = s[p.off_V + cc * l + a];
+                    float vbi = s[p.off_V + cc * l + b];
+                    s[p.off_V + cc * l + a] = c * vai - sv * vbi;
+                    s[p.off_V + cc * l + b] = sv * vai + c * vbi;
+                }
+                barrier();
+                // Phase B: row rotations G' = J^T*G1 (rows a,b), same ownership.
+                for (uint e = lid; e < cnt * l; e += 256u) {
+                    uint pi = e / l;
+                    uint cc = e % l;
+                    uint a = sh_P[pi], b = sh_Q[pi];
+                    float c = sh_C[pi], sv = sh_Sv[pi];
+                    float gaj = s[p.off_G + a * l + cc];
+                    float gbj = s[p.off_G + b * l + cc];
+                    s[p.off_G + a * l + cc] = c * gaj - sv * gbj;
+                    s[p.off_G + b * l + cc] = sv * gaj + c * gbj;
+                }
+                barrier();
+            }
+            // convergence: max absolute off-diagonal vs max diagonal.
+            // (A relative per-pair gate never trips on rank-deficient tails
+            // whose diagonals underflow; the absolute gate measures the
+            // coupling that actually pollutes the top-r subspace.)
+            float poff = 0.0, pdiag = 0.0;
+            uint total = l * l;
+            for (uint e = lid; e < total; e += 256u) {
+                uint i = e / l, j = e % l;
+                if (i < j) {
+                    poff = max(poff, abs(s[p.off_G + i * l + j]));
+                } else if (i == j) {
+                    pdiag = max(pdiag, abs(s[p.off_G + i * l + i]));
+                }
+            }
+            sh_red[lid] = poff;
+            sh_C[lid] = pdiag;
+            barrier();
+            if (lid == 0u) {
+                float mx = 0.0, md = 0.0;
+                for (uint t = 0u; t < 256u; ++t) { mx = max(mx, sh_red[t]); md = max(md, sh_C[t]); }
+                sh_bc = mx;
+                sh_done = (mx <= 1e-5 * md || md == 0.0) ? 1u : 0u;
+            }
+            barrier();
+            if (sh_done != 0u) break;
+        }
+        if (sh_done == 0u) { if (lid == 0u) st[p.status_idx] = 2u; return; }
+        // S = sqrt(max(diag,0)); init sort arrays
+        for (uint i = lid; i < l; i += 256u) {
+            float d = s[p.off_G + i * l + i];
+            sh_keys[i] = sqrt(max(d, 0.0));
+            sh_idx[i] = i;
+        }
+        barrier();
+        // odd-even transposition sort: S desc, index asc
+        for (uint ph = 0u; ph < l; ++ph) {
+            uint start = ph & 1u;
+            for (uint i = start + lid * 2u; i + 1u < l; i += 512u) {
+                float a = sh_keys[i], b = sh_keys[i + 1u];
+                uint ia = sh_idx[i], ib = sh_idx[i + 1u];
+                if (b > a || (b == a && ib < ia)) {
+                    sh_keys[i] = b; sh_keys[i + 1u] = a;
+                    sh_idx[i] = ib; sh_idx[i + 1u] = ia;
+                }
+            }
+            barrier();
+        }
+        for (uint i = lid; i < l; i += 256u) {
+            s[p.off_S + i] = sh_keys[i];
+            s[p.off_ORD + i] = uintBitsToFloat(sh_idx[i]);
+        }
+        return;
+    }
+
+    if (p.step == 8u) {
+        // FACTORS: Af[n,r] U-part; BTf[m,r] UT*inv(S) part (balance in s9)
+        uint total = (n + m) * r;
+        if (gid < total) {
+            float smax = s[p.off_S];
+            float guard = smax * 1e-12;
+            if (gid < n * r) {
+                uint i = gid / r, k = gid % r;
+                uint src = floatBitsToUint(s[p.off_ORD + k]);
+                float acc = 0.0;
+                for (uint j = 0u; j < l; ++j) acc += s[p.off_Y + i * l + j] * s[p.off_V + j * l + src];
+                s[p.off_AF + gid] = acc;
+            } else {
+                uint g2 = gid - n * r;
+                uint j = g2 / r, k = g2 % r;
+                uint src = floatBitsToUint(s[p.off_ORD + k]);
+                float sv = s[p.off_S + k];
+                // Gram route (unlike the oracle's in-place one-sided Jacobi,
+                // C is never rotated here): BT = C^T V_ord S^-1 needs the full
+                // sum over the l core rows, not a single C element.
+                float acc2 = 0.0;
+                for (uint t = 0u; t < l; ++t)
+                    acc2 += s[p.off_C + t * m + j] * s[p.off_V + t * l + src];
+                s[p.off_BTF + g2] = (sv > guard && sv > 0.0) ? acc2 / sv : 0.0;
+            }
+        }
+        return;
+    }
+
+    if (p.step == 9u) {
+        // SIGN + BALANCE, one thread per column; single workgroup
+        if (gl_NumWorkGroups.x != 1u) { if (lid == 0u) st[p.status_idx] = 1u; return; }
+        if (lid < r) {
+            uint k = lid;
+            float best = 0.0; bool neg = false;
+            for (uint i = 0u; i < n; ++i) {
+                float v = s[p.off_AF + i * r + k];
+                if (abs(v) > abs(best)) { best = v; neg = (v < 0.0); }
+            }
+            float sg = neg ? -1.0 : 1.0;
+            float sv = s[p.off_S + k];
+            if (p.balance == 0u) {
+                for (uint i = 0u; i < n; ++i) s[p.off_AF + i * r + k] *= sg * sv;
+                if (sg < 0.0) for (uint j = 0u; j < m; ++j) s[p.off_BTF + j * r + k] = -s[p.off_BTF + j * r + k];
+            } else {
+                float sq = sqrt(max(sv, 0.0));
+                for (uint i = 0u; i < n; ++i) s[p.off_AF + i * r + k] *= sg * sq;
+                for (uint j = 0u; j < m; ++j) s[p.off_BTF + j * r + k] *= sg * sq;
+                if (p.balance == 2u) {
+                    // Single-precision accumulation (scale factor only; also
+                    // avoids any float64 device requirement).
+                    float na = 0.0, nb = 0.0;
+                    for (uint i = 0u; i < n; ++i) { float v = s[p.off_AF + i * r + k]; na += v * v; }
+                    for (uint j = 0u; j < m; ++j) { float v = s[p.off_BTF + j * r + k]; nb += v * v; }
+                    na = sqrt(na); nb = sqrt(nb);
+                    if (na > 1e-12 && nb > 1e-12) {
+                        float d = sqrt(nb / na);
+                        for (uint i = 0u; i < n; ++i) s[p.off_AF + i * r + k] *= d;
+                        for (uint j = 0u; j < m; ++j) s[p.off_BTF + j * r + k] /= d;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // s10/s11: ENCODE rows (one thread per row; scalar loops in CPU order)
+    if (p.step == 10u || p.step == 11u) {
+        bool isA = (p.step == 10u);
+        uint rows = isA ? n : m;
+        uint pr = isA ? p.pad_a : p.pad_b;
+        uint tcode = isA ? p.type_a : p.type_b;
+        uint foff = isA ? p.off_AF : p.off_BTF;
+        if (gid >= rows) return;
+        // gather padded row into registers via local array (max 512 -> use 512 cap)
+        // Turbo rows are multiples of 128; Q8 of 32.
+        if (tcode == 0u) {
+            // F32 direct
+            for (uint j = 0u; j < pr; ++j) {
+                float v = (j < r) ? s[foff + gid * r + j] : 0.0;
+                uint w = floatBitsToUint(v);
+                uint base = gid * pr * 4u + j * 4u;
+                if (isA) {
+                    oa[base] = uint8_t(w & 255u); oa[base+1u] = uint8_t((w>>8u)&255u);
+                    oa[base+2u] = uint8_t((w>>16u)&255u); oa[base+3u] = uint8_t(w>>24u);
+                } else {
+                    ob[base] = uint8_t(w & 255u); ob[base+1u] = uint8_t((w>>8u)&255u);
+                    ob[base+2u] = uint8_t((w>>16u)&255u); ob[base+3u] = uint8_t(w>>24u);
+                }
+            }
+            return;
+        }
+        if (tcode == 1u) {
+            // F16 direct
+            for (uint j = 0u; j < pr; ++j) {
+                float v = (j < r) ? s[foff + gid * r + j] : 0.0;
+                uint h = pack_half(v);
+                uint base = gid * pr * 2u + j * 2u;
+                uint8_t lo = uint8_t(h & 255u), hi = uint8_t((h >> 8u) & 255u);
+                if (isA) { oa[base] = lo; oa[base+1u] = hi; }
+                else { ob[base] = lo; ob[base+1u] = hi; }
+            }
+            return;
+        }
+        if (tcode == 8u) {
+            // Q8_0: amax/127, round-half-away
+            uint nb = pr / 32u;
+            for (uint b = 0u; b < nb; ++b) {
+                float amax = 0.0;
+                for (uint j = 0u; j < 32u; ++j) {
+                    uint c = b * 32u + j;
+                    float v = (c < r) ? s[foff + gid * r + c] : 0.0;
+                    amax = max(amax, abs(v));
+                }
+                float d = amax / 127.0;
+                float id = (d != 0.0) ? 1.0 / d : 0.0;
+                uint base = gid * (nb * 34u);
+                if (isA) { store_half_oa(base + b * 34u, d); }
+                else { store_half_ob(base + b * 34u, d); }
+                for (uint j = 0u; j < 32u; ++j) {
+                    uint c = b * 32u + j;
+                    float v = (c < r) ? s[foff + gid * r + c] : 0.0;
+                    int q = int(rhalf_away(v * id));
+                    q = clamp(q, -127, 127);
+                    uint8_t qb = uint8_t(uint(q) & 255u);
+                    if (isA) oa[base + b * 34u + 2u + j] = qb;
+                    else ob[base + b * 34u + 2u + j] = qb;
+                }
+            }
+            return;
+        }
+        // Turbo2/3/4: per-128-group L2 norm -> normalize -> fwd WHT -> nearest
+        // centroid -> corrected norm; layouts: T2 34B, T3 50B, T4 68B.
+        bool isT2 = (tcode == 42u);
+        bool isT3 = (tcode == 43u);
+        uint ng = pr / 128u;
+        uint grp_bytes = isT2 ? 34u : (isT3 ? 50u : 68u);
+        for (uint g = 0u; g < ng; ++g) {
+            float buf[128];
+            float nrm2 = 0.0;
+            for (uint j = 0u; j < 128u; ++j) {
+                uint c = g * 128u + j;
+                float v = (c < r) ? s[foff + gid * r + c] : 0.0;
+                buf[j] = v;
+                nrm2 += v * v;
+            }
+            float gn = sqrt(nrm2);
+            float inv = (gn > 1e-10) ? 1.0 / gn : 0.0;
+            for (uint j = 0u; j < 128u; ++j) buf[j] *= inv;
+            // forward WHT (CPU order: s1, butterfly, inv_sqrt*s2)
+            for (uint j = 0u; j < 128u; ++j) buf[j] *= S1[j];
+            for (uint h = 1u; h < 128u; h *= 2u)
+                for (uint i = 0u; i < 128u; i += h * 2u)
+                    for (uint j = i; j < i + h; ++j) {
+                        float a = buf[j], bb = buf[j + h];
+                        buf[j] = a + bb; buf[j + h] = a - bb;
+                    }
+            for (uint j = 0u; j < 128u; ++j) buf[j] *= INV_SQRT128 * S2[j];
+            // nearest centroid + recon energy
+            float rsq = 0.0;
+            uint cidx[128];
+            for (uint j = 0u; j < 128u; ++j) {
+                float v = buf[j];
+                uint ix = 0u;
+                if (isT2) {
+                    ix = v < -0.086728 ? 0u : (v < 0.0 ? 1u : (v < 0.086728 ? 2u : 3u));
+                    rsq += C2[ix] * C2[ix];
+                } else if (isT3) {
+                    ix = v < -0.154259 ? 0u : (v < -0.091775 ? 1u : (v < -0.043589 ? 2u :
+                          (v < 0.0 ? 3u : (v < 0.043589 ? 4u : (v < 0.091775 ? 5u :
+                          (v < 0.154259 ? 6u : 7u))))));
+                    rsq += C3[ix] * C3[ix];
+                } else {
+                    ix = v < -0.145560 ? 0u : (v < -0.103361 ? 1u : (v < -0.079142 ? 2u :
+                          (v < -0.060009 ? 3u : (v < -0.043430 ? 4u : (v < -0.028293 ? 5u :
+                          (v < -0.013963 ? 6u : (v < 0.0 ? 7u : (v < 0.013963 ? 8u :
+                          (v < 0.028293 ? 9u : (v < 0.043430 ? 10u : (v < 0.060009 ? 11u :
+                          (v < 0.079142 ? 12u : (v < 0.103361 ? 13u : (v < 0.145560 ? 14u : 15u))))))))))))));
+                    rsq += C4[ix] * C4[ix];
+                }
+                cidx[j] = ix;
+            }
+            float rn = sqrt(rsq);
+            float corr = (rn > 1e-10) ? gn / rn : gn;
+            uint base = gid * (ng * grp_bytes) + g * grp_bytes;
+            if (isA) {
+                store_half_oa(base, corr);
+                if (isT2) {
+                    for (uint j = 0u; j < 32u; ++j) {
+                        uint qacc = 0u;
+                        for (uint k = 0u; k < 4u; ++k) qacc |= ((cidx[j * 4u + k] & 3u) << (k * 2u));
+                        oa[base + 2u + j] = uint8_t(qacc & 255u);
+                    }
+                } else if (isT3) {
+                    for (uint j = 0u; j < 32u; ++j) {
+                        uint qacc = 0u;
+                        for (uint k = 0u; k < 4u; ++k) qacc |= ((cidx[j * 4u + k] & 3u) << (k * 2u));
+                        oa[base + 2u + j] = uint8_t(qacc & 255u);
+                    }
+                    for (uint j = 0u; j < 16u; ++j) {
+                        uint sacc = 0u;
+                        for (uint k = 0u; k < 8u; ++k)
+                            if (((cidx[j * 8u + k]) & 4u) != 0u) sacc |= (1u << k);
+                        oa[base + 34u + j] = uint8_t(sacc & 255u);
+                    }
+                } else {
+                    store_half_oa(base + 2u, 0.0);
+                    for (uint j = 0u; j < 64u; ++j) {
+                        oa[base + 4u + j] = uint8_t((cidx[j * 2u] & 15u) | ((cidx[j * 2u + 1u] & 15u) << 4u) & 255u);
+                    }
+                }
+            } else {
+                store_half_ob(base, corr);
+                if (isT2) {
+                    for (uint j = 0u; j < 32u; ++j) {
+                        uint qacc = 0u;
+                        for (uint k = 0u; k < 4u; ++k) qacc |= ((cidx[j * 4u + k] & 3u) << (k * 2u));
+                        ob[base + 2u + j] = uint8_t(qacc & 255u);
+                    }
+                } else if (isT3) {
+                    for (uint j = 0u; j < 32u; ++j) {
+                        uint qacc = 0u;
+                        for (uint k = 0u; k < 4u; ++k) qacc |= ((cidx[j * 4u + k] & 3u) << (k * 2u));
+                        ob[base + 2u + j] = uint8_t(qacc & 255u);
+                    }
+                    for (uint j = 0u; j < 16u; ++j) {
+                        uint sacc = 0u;
+                        for (uint k = 0u; k < 8u; ++k)
+                            if (((cidx[j * 8u + k]) & 4u) != 0u) sacc |= (1u << k);
+                        ob[base + 34u + j] = uint8_t(sacc & 255u);
+                    }
+                } else {
+                    store_half_ob(base + 2u, 0.0);
+                    for (uint j = 0u; j < 64u; ++j) {
+                        ob[base + 4u + j] = uint8_t((cidx[j * 2u] & 15u) | ((cidx[j * 2u + 1u] & 15u) << 4u) & 255u);
+                    }
+                }
+            }
+        }
+    }
+    // Steps 12/13: EXACT ALL-ROW TILED FINAL-CODEC RESIDUAL (no sampling).
+    // Every row i in [0, n) is visited; G workgroups (1..64, passed via aux)
+    // stride row indices i = g*256 + lid with step G*256 (row-interleaved
+    // partitioning; every row assigned to exactly one workgroup). Fixed 64-band
+    // scratch (RES region); step 13 folds bands in fixed order -> status[1..9].
+    // Zero sampling: any single-row adversarial corruptions are guaranteed
+    // to be caught, while 256-wide workgroups parallelize all-row reduction.
+    if (p.step == 12u) {
+        uint G = p.aux;
+        uint pr = p.pad_a; // pad_a == pad_b enforced in step 0
+        uint off_RES = p.off_BTF + m * p.r;
+        if (gl_NumWorkGroups.x != G || G < 1u || G > 64u) {
+            if (lid == 0u) st[p.status_idx] = 1u;
+            return;
+        }
+        if (st[p.status_idx] != 0u) return;
+        uint g = gl_WorkGroupID.x;
+        float ad[256];
+        float bd[256];
+        float sum_o = 0.0, co = 0.0;
+        float sum_ab = 0.0, cab = 0.0;
+        float sum_a = 0.0, ca = 0.0;
+        float sum_b = 0.0, cb = 0.0;
+        float mx_ab = 0.0, mx_a = 0.0, mx_b = 0.0;
+        uint bad = 0u;
+        uint stride = G * 256u;
+        for (uint i = g * 256u + lid; i < n; i += stride) {
+            for (uint j = 0u; j < m; ++j) {
+                float o = x[i * m + j];
+                if (isnan(o) || isinf(o)) { bad = 1u; continue; }
+                float dab = 0.0, da = 0.0, db = 0.0;
+                for (uint c0 = 0u; c0 < pr; c0 += 256u) {
+                    uint K = min(256u, pr - c0);
+                    for (uint t = 0u; t < K; ++t) {
+                        uint k = c0 + t;
+                        ad[t] = decA(i, k);
+                        bd[t] = decB(j, k);
+                    }
+                    for (uint t = 0u; t < K; ++t) {
+                        uint k = c0 + t;
+                        float afp = (k < r) ? s[p.off_AF + i * r + k] : 0.0;
+                        float bfp = (k < r) ? s[p.off_BTF + j * r + k] : 0.0;
+                        float av = ad[t], bv = bd[t];
+                        if (isnan(av) || isinf(av) || isnan(bv) || isinf(bv) ||
+                            isnan(afp) || isinf(afp) || isnan(bfp) || isinf(bfp)) { bad = 1u; }
+                        dab += av * bv;
+                        da += av * bfp;
+                        db += afp * bv;
+                    }
+                }
+                float y0 = o * o - co; float t0 = sum_o + y0; co = (t0 - sum_o) - y0; sum_o = t0;
+                float eab = o - dab;
+                float y1 = eab * eab - cab; float t1 = sum_ab + y1; cab = (t1 - sum_ab) - y1; sum_ab = t1;
+                float ea = o - da;
+                float y2 = ea * ea - ca; float t2 = sum_a + y2; ca = (t2 - sum_a) - y2; sum_a = t2;
+                float eb = o - db;
+                float y3 = eb * eb - cb; float t3 = sum_b + y3; cb = (t3 - sum_b) - y3; sum_b = t3;
+                mx_ab = max(mx_ab, abs(eab));
+                mx_a = max(mx_a, abs(ea));
+                mx_b = max(mx_b, abs(eb));
+            }
+        }
+        // intra-workgroup tree fold into lane 0 (fixed order => deterministic)
+        // Kahan across lanes is overkill; plain fold of compensated partials.
+        sh_red[lid] = sum_o;
+        barrier();
+        // fold helper inlined per quantity (7 sums + 3 maxes + badflag)
+        // reduce via sh_keys staging to keep sh_red protocol simple
+        sh_keys[lid] = sum_o; sh_keys[256u + lid] = sum_ab;
+        barrier();
+        // NOTE: sh_keys is 512 wide; use two rounds for 8 sums + maxes below.
+        // Round 1: fold sum_o/sum_ab/sum_a/sum_b with pairwise Kahan in lane 0.
+        // (Implemented explicitly for auditability; G<=64 WGs => cheap.)
+        barrier();
+        // Per-thread partials are complete; cooperatively reduce:
+        // each lane contributes its 4 sums; lane 0 folds all 256 lanes.
+        // (Fold code shared below via staging slots.)
+        // stage: [0..256)=o [256..512)=ab ; second round a/b/maxes/bad
+        // (sh_keys has exactly 512 entries: fits round 1.)
+        if (lid == 0u) {
+            float ao = 0.0, c0 = 0.0, ab = 0.0, c1 = 0.0;
+            for (uint t = 0u; t < 256u; ++t) {
+                float y = sh_keys[t] - c0; float tt = ao + y; c0 = (tt - ao) - y; ao = tt;
+                y = sh_keys[256u + t] - c1; tt = ab + y; c1 = (tt - ab) - y; ab = tt;
+            }
+            sh_bc = ao;
+            // stash ab-sum in sh_C[0] temporarily (sh_C free in this step)
+            sh_C[0] = ab;
+        }
+        barrier();
+        float band_o = sh_bc;
+        float band_ab = sh_C[0];
+        // round 2: sum_a/sum_b
+        sh_keys[lid] = sum_a; sh_keys[256u + lid] = sum_b;
+        barrier();
+        if (lid == 0u) {
+            float a = 0.0, c0 = 0.0, b = 0.0, c1 = 0.0;
+            for (uint t = 0u; t < 256u; ++t) {
+                float y = sh_keys[t] - c0; float tt = a + y; c0 = (tt - a) - y; a = tt;
+                y = sh_keys[256u + t] - c1; tt = b + y; c1 = (tt - b) - y; b = tt;
+            }
+            sh_bc = a;
+            sh_C[0] = b;
+        }
+        barrier();
+        float band_a = sh_bc;
+        float band_b = sh_C[0];
+        // round 3: maxes (max is associative/commutative: order-free)
+        sh_keys[lid] = mx_ab;
+        barrier();
+        if (lid == 0u) {
+            float m = 0.0;
+            for (uint t = 0u; t < 256u; ++t) m = max(m, sh_keys[t]);
+            sh_bc = m;
+        }
+        barrier();
+        float band_mab = sh_bc;
+        sh_keys[lid] = mx_a;
+        barrier();
+        if (lid == 0u) {
+            float m = 0.0;
+            for (uint t = 0u; t < 256u; ++t) m = max(m, sh_keys[t]);
+            sh_bc = m;
+        }
+        barrier();
+        float band_ma = sh_bc;
+        sh_keys[lid] = mx_b;
+        barrier();
+        if (lid == 0u) {
+            float m = 0.0;
+            for (uint t = 0u; t < 256u; ++t) m = max(m, sh_keys[t]);
+            sh_bc = m;
+        }
+        barrier();
+        float band_mb = sh_bc;
+        // badflag OR (shared benign: single value per band outcome)
+        if (bad != 0u || isnan(sum_o + sum_ab + sum_a + sum_b) || isinf(sum_o + sum_ab + sum_a + sum_b)) {
+            // Note: isfinite unavailable; use isnan/isinf explicitly:
+            bad = 1u;
+        }
+        barrier();
+        // write band partials to RES region (10 floats per band)
+        if (lid == 0u) {
+            uint base = off_RES + g * 10u;
+            s[base + 0u] = band_o;
+            s[base + 1u] = band_ab;
+            s[base + 2u] = band_a;
+            s[base + 3u] = band_b;
+            s[base + 4u] = band_mab;
+            s[base + 5u] = band_ma;
+            s[base + 6u] = band_mb;
+            s[base + 7u] = 0.0;
+            s[base + 8u] = 0.0;
+            s[base + 9u] = (bad != 0u) ? 1.0 : 0.0;
+        }
+        return;
+    }
+    if (p.step == 13u) {
+        // Fold G band partials (fixed 0..G-1 order) -> status[1..9].
+        uint G = p.aux;
+        uint off_RES = p.off_BTF + m * p.r;
+        if (gl_NumWorkGroups.x != 1u || G < 1u || G > 64u) {
+            if (lid == 0u) st[p.status_idx] = 1u;
+            return;
+        }
+        if (st[p.status_idx] != 0u) return;
+        if (lid == 0u) {
+            float so = 0.0, co = 0.0;
+            float sab = 0.0, cab = 0.0, sa = 0.0, caa = 0.0, sb = 0.0, cbb = 0.0;
+            float mab = 0.0, ma = 0.0, mb = 0.0;
+            uint anybad = 0u;
+            for (uint g = 0u; g < G; ++g) {
+                uint base = off_RES + g * 10u;
+                float y;
+                y = s[base + 0u] - co;  float t = so + y;  co = (t - so) - y;  so = t;
+                y = s[base + 1u] - cab; t = sab + y; cab = (t - sab) - y; sab = t;
+                y = s[base + 2u] - caa; t = sa + y;  caa = (t - sa) - y;  sa = t;
+                y = s[base + 3u] - cbb; t = sb + y;  cbb = (t - sb) - y;  sb = t;
+                mab = max(mab, s[base + 4u]);
+                ma = max(ma, s[base + 5u]);
+                mb = max(mb, s[base + 6u]);
+                if (s[base + 9u] > 0.0) anybad = 1u;
+                if (isnan(so+sab+sa+sb) || isinf(so+sab+sa+sb)) anybad = 1u;
+            }
+            if (anybad != 0u) {
+                st[p.status_idx] = 4u;
+            } else {
+                st[p.status_idx + 1u] = floatBitsToUint(sqrt(so));
+                st[p.status_idx + 2u] = floatBitsToUint(sqrt(sab));
+                st[p.status_idx + 3u] = floatBitsToUint(mab);
+                st[p.status_idx + 4u] = floatBitsToUint(sqrt(so));
+                st[p.status_idx + 5u] = floatBitsToUint(sqrt(sa));
+                st[p.status_idx + 6u] = floatBitsToUint(ma);
+                st[p.status_idx + 7u] = floatBitsToUint(sqrt(so));
+                st[p.status_idx + 8u] = floatBitsToUint(sqrt(sb));
+                st[p.status_idx + 9u] = floatBitsToUint(mb);
+            }
+        }
+        return;
+    }
+}

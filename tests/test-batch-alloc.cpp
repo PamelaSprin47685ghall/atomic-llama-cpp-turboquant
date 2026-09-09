@@ -933,7 +933,7 @@ static void test_source_row(testing & t) {
 
         // disabling tracking yields null maps on subsequent splits
         ba.set_source_row_tracking(false);
-        ba.split_reset();
+        ba.init(bb_bb.make(), vocab, nullptr, bb_bb.n_embd, 4, false);
         llama_ubatch ub_off = ba.split_simple(10);
         t.assert_true(ub_off.source_row == nullptr);
         t.assert_true(ub_off.data->source_row.empty());

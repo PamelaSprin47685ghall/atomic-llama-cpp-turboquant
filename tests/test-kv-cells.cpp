@@ -6,6 +6,8 @@
 
 #include "../src/llama-kv-cells.h"
 #include <cassert>
+#include <cstdint>
+#include <vector>
 
 static llama_kv_rerot_meta make_rerot_meta(
         uint64_t episode_id,
@@ -352,373 +354,145 @@ int main() {
         assert(!cells.rerot_get(1).active());
     }
 
-    // === Generation (FlashPrefill invalidation stamp) tests ===
-    // Contract: OFF by default with stamp 0 / generation 0, no bumps and no
-    // atomic work; opt-in via set_generation_enabled() which lazily assigns a
-    // unique stamp and bumps once; identity is (stamp, generation); consumers
-    // treat generation == MAX or stamp == MAX as always-invalid (saturating
-    // overflow needs 2^64 steps and is documented but not exercised here).
+    // Test 8: Stable payload ID and storage generation lifecycle
     {
-        // Disabled by default: lazy stamp 0, mutations do not bump or assign.
         llama_kv_cells cells;
-        cells.resize(4);
-        assert(!cells.get_generation_enabled());
-        assert(cells.get_generation() == 0);
-        assert(cells.get_generation_stamp() == 0);
+        cells.resize(10);
 
-        cells.pos_set(0, 7);
-        cells.seq_add(0, 0);
-        cells.ext_set(0, {1, 2});
-        assert(cells.get_generation() == 0);
-        assert(cells.get_generation_stamp() == 0);
+        // Empty cells must have 0 payload_id and 0 generation
+        for (uint32_t i = 0; i < 10; ++i) {
+            assert(cells.is_empty(i));
+            assert(cells.payload_id_get(i) == 0);
+            assert(cells.storage_generation_get(i) == 0);
+        }
 
-        // Disabled copies stay untracked with no atomic work.
-        llama_kv_cells disabled_copy(cells);
-        assert(!disabled_copy.get_generation_enabled());
-        assert(disabled_copy.get_generation() == 0);
-        assert(disabled_copy.get_generation_stamp() == 0);
-        const auto disabled_snap = cells.cp(0, 2);
-        assert(!disabled_snap.get_generation_enabled());
-        assert(disabled_snap.get_generation_stamp() == 0);
+        // Nonzero unique ID allocated on occupancy, generation initialized to 1
+        cells.pos_set(1, 100);
+        cells.seq_add(1, 0);
+        const uint64_t pid1 = cells.payload_id_get(1);
+        const uint64_t gen1 = cells.storage_generation_get(1);
+        assert(pid1 != 0);
+        assert(gen1 == 1);
 
-        // Enabling lazily assigns a unique stamp and bumps to a non-zero baseline.
-        cells.set_generation_enabled(true);
-        assert(cells.get_generation_enabled());
-        assert(cells.get_generation() != 0);
-        assert(cells.get_generation_stamp() != 0);
-        // Enabling twice is idempotent (no second bump, same stamp).
-        const uint64_t base = cells.get_generation();
-        const uint64_t base_stamp = cells.get_generation_stamp();
-        cells.set_generation_enabled(true);
-        assert(cells.get_generation() == base);
-        assert(cells.get_generation_stamp() == base_stamp);
-    }
+        cells.pos_set(3, 101);
+        cells.seq_add(3, 0);
+        const uint64_t pid3 = cells.payload_id_get(3);
+        const uint64_t gen3 = cells.storage_generation_get(3);
+        assert(pid3 != 0);
+        assert(gen3 == 1);
+        assert(pid1 != pid3);
 
-    {
-        // Enabled membership/ext mutations bump; read-only queries do not.
-        llama_kv_cells cells;
-        cells.resize(4);
-        cells.set_generation_enabled(true);
-        const uint64_t base = cells.get_generation();
+        // Same-cell seq_cp sharing: adding another sequence to an occupied cell must not change payload_id or generation
+        cells.seq_add(1, 1);
+        assert(cells.payload_id_get(1) == pid1);
+        assert(cells.storage_generation_get(1) == gen1);
 
-        cells.pos_set(0, 10);
-        assert(cells.get_generation() != base);
-        uint64_t g = cells.get_generation();
+        // Storage generation increment preserved
+        cells.storage_generation_inc(1);
+        assert(cells.storage_generation_get(1) == gen1 + 1);
+        const uint64_t gen1_inc = cells.storage_generation_get(1);
 
-        cells.seq_add(0, 0);
-        assert(cells.get_generation() != g);
-        g = cells.get_generation();
+        // Exact preservation through cp / set
+        const auto cp1 = cells.cp(1, 1);
+        assert(cp1.payload_id_get(0) == pid1);
+        assert(cp1.storage_generation_get(0) == gen1_inc);
 
-        cells.ext_set(0, {3, 4});
-        assert(cells.get_generation() != g);
-        g = cells.get_generation();
+        // Exact preservation through compaction (make_pack_plan / apply_pack)
+        cells.pos_set(7, 102);
+        cells.seq_add(7, 2);
+        const uint64_t pid7 = cells.payload_id_get(7);
+        const uint64_t gen7 = cells.storage_generation_get(7);
+        assert(pid7 != 0 && pid7 != pid1 && pid7 != pid3);
 
-        // Read-only queries never bump.
-        (void) cells.is_empty(0);
-        (void) cells.get_used();
-        (void) cells.used_min();
-        (void) cells.used_max_p1();
-        (void) cells.get_has_shift();
-        (void) cells.seq_has(0, 0);
-        (void) cells.seq_count(0);
-        (void) cells.seq_get(0);
-        (void) cells.seq_pos_min(0);
-        (void) cells.seq_pos_max(0);
-        (void) cells.seq_get_used(0);
-        (void) cells.pos_get(0);
-        (void) cells.ext_get(0);
-        (void) cells.rerot_get(0);
-        (void) cells.get_shift(0);
-        (void) cells.pos_in(0, 0, 20);
-        (void) cells.rerot_has_active();
-        (void) cells.rerot_has_active_seq(0);
-        (void) cells.make_pack_plan();
-        std::vector<uint32_t> out;
-        (void) cells.rerot_collect_run(1, 1, out);
-        assert(cells.get_generation() == g);
-    }
-
-    {
-        // Shift/position mutations bump; no-op reset_shift does not.
-        llama_kv_cells cells;
-        cells.resize(4);
-        cells.set_generation_enabled(true);
-        cells.pos_set(0, 10);
-        cells.seq_add(0, 0);
-        uint64_t g = cells.get_generation();
-
-        // No pending shift: no-op reset does not bump.
-        cells.reset_shift();
-        assert(cells.get_generation() == g);
-
-        cells.pos_add(0, 5);
-        assert(cells.get_generation() != g);
-        g = cells.get_generation();
-
-        cells.pos_div(0, 2);
-        assert(cells.get_generation() != g);
-        g = cells.get_generation();
-
-        // Consuming the pending shift bumps once.
-        assert(cells.get_has_shift());
-        cells.reset_shift();
-        assert(cells.get_generation() != g);
-        g = cells.get_generation();
-        // Second reset with no shift is a no-op again.
-        cells.reset_shift();
-        assert(cells.get_generation() == g);
-    }
-
-    {
-        // Sequence membership: real changes bump, single-keeper/empty no-ops do not.
-        llama_kv_cells cells;
-        cells.resize(4);
-        cells.set_generation_enabled(true);
-        cells.pos_set(0, 1);
-        cells.seq_add(0, 0);
-        uint64_t g = cells.get_generation();
-
-        // Keeping the sole ref is a no-op.
-        assert(!cells.seq_keep(0, 0));
-        assert(cells.get_generation() == g);
-
-        // Adding a second ref bumps.
-        cells.seq_add(0, 1);
-        assert(cells.get_generation() != g);
-        g = cells.get_generation();
-
-        // Keeping one of two refs removes the other: bumps.
-        assert(!cells.seq_keep(0, 0));
-        assert(cells.get_generation() != g);
-        g = cells.get_generation();
-
-        // Removing the last ref via seq_rm bumps and frees.
-        assert(cells.seq_rm(0, 0));
-        assert(cells.is_empty(0));
-        assert(cells.get_generation() != g);
-        g = cells.get_generation();
-
-        // Filtering an already-empty cell is a no-op.
-        assert(!cells.seq_keep(1, 0));
-        assert(cells.get_generation() == g);
-    }
-
-    {
-        // Failed rerot guards do not bump; success bumps.
-        llama_kv_cells cells;
-        cells.resize(4);
-        cells.set_generation_enabled(true);
-        cells.pos_set(0, 5);
-        cells.seq_add(0, 0);
-        const auto pending = make_rerot_meta(11, 2, 3, llama_rerot_visibility::pending_record, 0, 5);
-        cells.rerot_set(0, pending);
-        uint64_t g = cells.get_generation();
-
-        // Wrong run: fail, no bump.
-        assert(!cells.rerot_publish(0, 11, 4, 7));
-        assert(!cells.rerot_reclassify(
-            0, 11, 3,
-            llama_rerot_visibility::pending_record,
-            llama_rerot_visibility::private_control,
-            7));
-        assert(cells.get_generation() == g);
-        assert(cells.rerot_get(0) == pending);
-
-        // Success bumps.
-        assert(cells.rerot_publish(0, 11, 3, 7));
-        assert(cells.get_generation() != g);
-        g = cells.get_generation();
-
-        // Resetting an active tag bumps; resetting inactive does not.
-        cells.rerot_reset(0);
-        assert(cells.get_generation() != g);
-        g = cells.get_generation();
-        cells.rerot_reset(0);
-        assert(cells.get_generation() == g);
-
-        // Re-tag then reclassify success bumps.
-        cells.rerot_set(0, pending);
-        g = cells.get_generation();
-        assert(cells.rerot_reclassify(
-            0, 11, 3,
-            llama_rerot_visibility::pending_record,
-            llama_rerot_visibility::private_control,
-            0));
-        assert(cells.get_generation() != g);
-    }
-
-    {
-        // Clearing preserves enabled+stamp and bumps (never resets to 0).
-        llama_kv_cells cells;
-        cells.resize(4);
-        cells.set_generation_enabled(true);
-        cells.pos_set(0, 1);
-        cells.seq_add(0, 0);
-        const uint64_t stamp = cells.get_generation_stamp();
-        const uint64_t g = cells.get_generation();
-
-        cells.reset();
-        assert(cells.get_generation_enabled());
-        assert(cells.get_generation_stamp() == stamp);
-        assert(cells.get_generation() != g);
-        assert(cells.get_generation() != 0);
-        assert(cells.get_used() == 0);
-
-        // resize (which clears) also preserves and bumps.
-        const uint64_t g2 = cells.get_generation();
-        cells.resize(4);
-        assert(cells.get_generation_enabled());
-        assert(cells.get_generation_stamp() == stamp);
-        assert(cells.get_generation() != g2);
-
-        // Disabling preserves the version; mutations stop bumping; re-enable bumps.
-        cells.set_generation_enabled(false);
-        assert(!cells.get_generation_enabled());
-        const uint64_t g3 = cells.get_generation();
-        const uint64_t stamp3 = cells.get_generation_stamp();
-        cells.pos_set(1, 9);
-        assert(cells.get_generation() == g3);
-        cells.set_generation_enabled(true);
-        assert(cells.get_generation_stamp() == stamp3);
-        assert(cells.get_generation() != g3);
-    }
-
-    {
-        // Copy/cp/assign never collide on (stamp, generation).
-        llama_kv_cells src;
-        src.resize(4);
-        src.set_generation_enabled(true);
-        src.pos_set(0, 3);
-        src.seq_add(0, 0);
-        const uint64_t src_stamp = src.get_generation_stamp();
-        const uint64_t src_gen = src.get_generation();
-
-        // cp() does not bump the source; snapshot inherits baseline with fresh stamp.
-        const auto snap = src.cp(0, 2);
-        assert(src.get_generation() == src_gen);
-        assert(snap.get_generation_enabled());
-        assert(snap.get_generation() == src_gen);
-        assert(snap.get_generation_stamp() != src_stamp);
-
-        // Copy construction: same baseline, different stamp.
-        llama_kv_cells copy(src);
-        assert(copy.get_generation() == src_gen);
-        assert(copy.get_generation_stamp() != src_stamp);
-
-        // Copy assignment: fresh stamp, inherited baseline.
-        llama_kv_cells dst;
-        dst.resize(4);
-        dst.set_generation_enabled(true);
-        const uint64_t dst_stamp_before = dst.get_generation_stamp();
-        dst = src;
-        assert(dst.get_generation() == src_gen);
-        assert(dst.get_generation_stamp() != src_stamp);
-        assert(dst.get_generation_stamp() != dst_stamp_before);
-
-        // Mutating the copy diverges without colliding with the source.
-        const uint64_t copy_gen = copy.get_generation();
-        copy.pos_set(1, 8);
-        assert(copy.get_generation() != copy_gen);
-        assert(copy.get_generation_stamp() != src_stamp);
-        assert(src.get_generation() == src_gen);
-
-        // Moves transfer identity with ordinary data-move semantics and clear
-        // the source to disabled 0/0/false with no atomic work.
-        llama_kv_cells moved_src;
-        moved_src.resize(4);
-        moved_src.set_generation_enabled(true);
-        moved_src.pos_set(0, 5);
-        const uint64_t moved_stamp = moved_src.get_generation_stamp();
-        const uint64_t moved_gen = moved_src.get_generation();
-        assert(moved_stamp != 0);
-        llama_kv_cells moved(std::move(moved_src));
-        assert(moved.get_generation_stamp() == moved_stamp);
-        assert(moved.get_generation() == moved_gen);
-        assert(moved.get_generation_enabled());
-        assert(moved_src.get_generation_stamp() == 0);
-        assert(moved_src.get_generation() == 0);
-        assert(!moved_src.get_generation_enabled());
-    }
-
-    {
-        // set() restore bumps; empty restore does not.
-        llama_kv_cells cells;
-        cells.resize(4);
-        cells.set_generation_enabled(true);
-        cells.pos_set(0, 3);
-        cells.seq_add(0, 0);
-        const auto saved = cells.cp(0, 2);
-        uint64_t g = cells.get_generation();
-
-        cells.rm(0);
-        assert(cells.get_generation() != g);
-        g = cells.get_generation();
-
-        cells.set(0, saved);
-        assert(cells.get_generation() != g);
-        g = cells.get_generation();
-
-        llama_kv_cells empty;
-        empty.resize(0);
-        cells.set(0, empty);
-        assert(cells.get_generation() == g);
-
-        std::vector<uint32_t> no_idxs;
-        cells.set(no_idxs, empty);
-        assert(cells.get_generation() == g);
-    }
-
-    {
-        // Pack: empty plan is a no-op; non-empty plan bumps.
-        llama_kv_cells cells;
-        cells.resize(8);
-        cells.set_generation_enabled(true);
-        uint64_t g = cells.get_generation();
-
-        auto empty_plan = cells.make_pack_plan();
-        assert(empty_plan.moves.empty());
-        cells.apply_pack(empty_plan);
-        assert(cells.get_generation() == g);
-
-        cells.pos_set(0, 0);
-        cells.seq_add(0, 0);
-        cells.pos_set(5, 5);
-        cells.seq_add(5, 0);
-        g = cells.get_generation();
-
-        // Planning itself never bumps.
         auto plan = cells.make_pack_plan();
-        assert(cells.get_generation() == g);
-        assert(!plan.moves.empty());
-
+        assert(plan.retained_count == 3);
         cells.apply_pack(plan);
-        assert(cells.get_generation() != g);
-        assert(cells.get_used() == 2);
-        assert(cells.used_max_p1() == 2);
-    }
 
-    {
-        // Freeze: empty exec set is a no-op; otherwise bumps.
-        llama_kv_cells cells;
-        cells.resize(4);
-        cells.set_generation_enabled(true);
-        uint64_t g = cells.get_generation();
-        // No cell references exec seq 0: no-op.
-        assert(cells.rerot_freeze_to_archive(99, 0, 1) == 0);
-        assert(cells.get_generation() == g);
+        // Cells [1, 3, 7] packed to [0, 1, 2]
+        assert(cells.get_used() == 3);
+        assert(cells.payload_id_get(0) == pid1);
+        assert(cells.storage_generation_get(0) == gen1_inc);
+        assert(cells.payload_id_get(1) == pid3);
+        assert(cells.storage_generation_get(1) == gen3);
+        assert(cells.payload_id_get(2) == pid7);
+        assert(cells.storage_generation_get(2) == gen7);
+        for (uint32_t i = 3; i < 10; ++i) {
+            assert(cells.is_empty(i));
+            assert(cells.payload_id_get(i) == 0);
+            assert(cells.storage_generation_get(i) == 0);
+        }
 
-        cells.pos_set(0, 1);
-        cells.seq_add(0, 0);
-        const auto pending = make_rerot_meta(99, 2, 3, llama_rerot_visibility::pending_record, 0, 5);
-        cells.rerot_set(0, pending);
-        g = cells.get_generation();
-        // Pending cells are released (kept == 0) but exec-ref removal still bumps.
-        assert(cells.rerot_freeze_to_archive(99, 0, 1) == 0);
-        assert(cells.get_generation() != g);
+        // Empty-only reset: removing sequence without making cell empty keeps payload_id and generation
+        assert(!cells.seq_rm(0, 0)); // seq 1 remains on cell 0
+        assert(cells.payload_id_get(0) == pid1);
+        assert(cells.storage_generation_get(0) == gen1_inc);
+
+        // Removing last sequence empties cell: resets payload_id and generation to 0
+        assert(cells.seq_rm(0, 1));
         assert(cells.is_empty(0));
+        assert(cells.payload_id_get(0) == 0);
+        assert(cells.storage_generation_get(0) == 0);
+
+        // seq_keep that retains sequence preserves payload_id and generation
+        assert(!cells.seq_keep(1, 0));
+        assert(cells.payload_id_get(1) == pid3);
+        assert(cells.storage_generation_get(1) == gen3);
+
+        // seq_keep that empties cell resets payload_id and generation to 0
+        assert(cells.seq_keep(2, 5)); // seq 5 not present in cell 2 (which had seq 2)
+        assert(cells.is_empty(2));
+        assert(cells.payload_id_get(2) == 0);
+        assert(cells.storage_generation_get(2) == 0);
+
+        // Explicit rm resets to 0
+        cells.rm(1);
+        assert(cells.is_empty(1));
+        assert(cells.payload_id_get(1) == 0);
+        assert(cells.storage_generation_get(1) == 0);
+
+        // New content allocated in previously cleared cell gets a fresh new ID
+        cells.pos_set(0, 200);
+        cells.seq_add(0, 0);
+        const uint64_t pid_new = cells.payload_id_get(0);
+        assert(pid_new != 0);
+        assert(pid_new != pid1);
+        assert(cells.storage_generation_get(0) == 1);
+
+        // Full reset resets all payload_ids and generations
+        cells.reset();
+        for (uint32_t i = 0; i < 10; ++i) {
+            assert(cells.is_empty(i));
+            assert(cells.payload_id_get(i) == 0);
+            assert(cells.storage_generation_get(i) == 0);
+        }
     }
 
-    // =========================================================================
+    // Test 9: Same-stream vs distinct cross-stream copy identity semantics
+    {
+        llama_kv_cells src_cells;
+        src_cells.resize(4);
+        src_cells.pos_set(0, 10);
+        src_cells.seq_add(0, 0);
+        const uint64_t pid0 = src_cells.payload_id_get(0);
+        const uint64_t gen0 = src_cells.storage_generation_get(0);
+        assert(pid0 != 0);
+
+        // Same-stream reference addition: payload_id and storage_generation unchanged
+        src_cells.seq_add(0, 1);
+        assert(src_cells.payload_id_get(0) == pid0);
+        assert(src_cells.storage_generation_get(0) == gen0);
+
+        // Cross-stream distinct physical copy: fresh allocation via pos_set gives distinct payload_id
+        llama_kv_cells dst_cells;
+        dst_cells.resize(4);
+        dst_cells.pos_set(0, src_cells.pos_get(0));
+        dst_cells.seq_add(0, 2);
+        const uint64_t pid_dst = dst_cells.payload_id_get(0);
+        assert(pid_dst != 0);
+        assert(pid_dst != pid0); // Fresh identity for distinct physical copy
+    }
+
+// =========================================================================
     // Phase 7: Shared-prefix physical cell union stress test (§A.24, Gate 24 of DoD A.30)
     // 8K common prefix ├ A ├ B └ C
     // Verifies 3 layers of sharing:
@@ -858,6 +632,186 @@ int main() {
         // Suffix tokens of B and C are still completely intact and correct
         assert(cells.seq_get_used(seq_cmpl_b) == 32);
         assert(cells.seq_get_used(seq_cmpl_c) == 32);
+    }
+
+    // Test 10: reserve_payload_ids_through preflight monotonicity and fail-closed saturation
+    {
+        llama_kv_cells c;
+        c.resize(4);
+        c.pos_set(0, 1);
+        const uint64_t pid_initial = c.payload_id_get(0);
+        assert(pid_initial > 0);
+
+        // Advancing past a higher target: next allocation must strictly exceed target
+        const uint64_t target_pid = pid_initial + 1000;
+        assert(llama_kv_cells::reserve_payload_ids_through(target_pid));
+        c.pos_set(1, 2);
+        const uint64_t pid_after_reserve = c.payload_id_get(1);
+        assert(pid_after_reserve > target_pid);
+
+        // Monotonicity: reserving a smaller value than current counter succeeds without decrementing
+        assert(llama_kv_cells::reserve_payload_ids_through(pid_initial));
+        c.pos_set(2, 3);
+        const uint64_t pid_after_lower = c.payload_id_get(2);
+        assert(pid_after_lower > pid_after_reserve);
+
+        // Fail-closed at UINT64_MAX: cannot wrap, returns false
+        assert(!llama_kv_cells::reserve_payload_ids_through(UINT64_MAX));
+    }
+
+    // Test 11: RERoT freeze to archive and shared reference union without double importance
+    {
+        llama_kv_cells c;
+        c.resize(8);
+
+        const uint64_t ep = 42;
+        const llama_seq_id exec_seq = 0;
+        const llama_seq_id archive_seq = 1;
+        const llama_seq_id foreign_seq = 2;
+
+        // Cell 0: PUBLIC_LIVE in exec_seq -> should be archived (gains archive_seq, loses exec_seq)
+        c.pos_set(0, 10);
+        c.seq_add(0, exec_seq);
+        c.rerot_set(0, make_rerot_meta(ep, 1, 101, llama_rerot_visibility::pending_record, 0, 10));
+        assert(c.rerot_publish(0, ep, 101, 5));
+
+        // Cell 1: PRIVATE_CONTROL in exec_seq -> should NOT be archived; exec_seq removed -> becomes empty
+        c.pos_set(1, 11);
+        c.seq_add(1, exec_seq);
+        c.rerot_set(1, make_rerot_meta(ep, 2, 102, llama_rerot_visibility::private_control, 0, 11));
+
+        // Cell 2: PENDING_RECORD in exec_seq -> should NOT be archived; exec_seq removed -> becomes empty
+        c.pos_set(2, 12);
+        c.seq_add(2, exec_seq);
+        c.rerot_set(2, make_rerot_meta(ep, 3, 103, llama_rerot_visibility::pending_record, 0, 12));
+
+        // Cell 3: PUBLIC_LIVE already shared with archive_seq -> gains no duplicate reference, loses exec_seq, keeps archive_seq
+        c.pos_set(3, 13);
+        c.seq_add(3, exec_seq);
+        c.seq_add(3, archive_seq);
+        c.rerot_set(3, make_rerot_meta(ep, 4, 104, llama_rerot_visibility::pending_record, 0, 13));
+        assert(c.rerot_publish(3, ep, 104, 5));
+
+        // Cell 4: foreign sequence cell -> completely untouched
+        c.pos_set(4, 14);
+        c.seq_add(4, foreign_seq);
+
+        assert(c.seq_get_used(exec_seq) == 4);
+        assert(c.seq_get_used(archive_seq) == 1);
+        assert(c.seq_get_used(foreign_seq) == 1);
+
+        // Physical run lookup before freeze
+        std::vector<uint32_t> run_cells;
+        assert(c.rerot_collect_run(ep, 101, run_cells) == 1);
+        assert(run_cells[0] == 0);
+        run_cells.clear();
+        assert(c.rerot_collect_run(0, 101, run_cells) == 0); // ep=0 returns 0
+
+        // Freeze exec_seq to archive_seq
+        size_t kept = c.rerot_freeze_to_archive(ep, exec_seq, archive_seq);
+        assert(kept == 2); // Cell 0 and Cell 3
+
+        // Exec seq has 0 cells left
+        assert(c.seq_get_used(exec_seq) == 0);
+
+        // Cell 0 survived under archive_seq
+        assert(!c.is_empty(0));
+        assert(c.seq_has(0, archive_seq));
+        assert(!c.seq_has(0, exec_seq));
+        assert(c.seq_count(0) == 1);
+        assert(c.rerot_get(0).visibility == llama_rerot_visibility::public_live);
+
+        // Cells 1 and 2 emptied (private and pending dropped)
+        assert(c.is_empty(1));
+        assert(c.payload_id_get(1) == 0);
+        assert(c.is_empty(2));
+        assert(c.payload_id_get(2) == 0);
+
+        // Cell 3 survived under archive_seq without double importance
+        assert(!c.is_empty(3));
+        assert(c.seq_has(3, archive_seq));
+        assert(!c.seq_has(3, exec_seq));
+        assert(c.seq_count(3) == 1); // No double count for archive_seq
+
+        // Cell 4 unaffected
+        assert(!c.is_empty(4));
+        assert(c.seq_has(4, foreign_seq));
+
+        assert(c.seq_get_used(archive_seq) == 2);
+        assert(c.seq_get_used(foreign_seq) == 1);
+    }
+
+    // Test 12: Exact multi-ref sequence snapshot/restore for overwrite-victim lifecycle
+    {
+        llama_kv_cells c;
+        c.resize(6);
+
+        c.pos_set(1, 50);
+        c.seq_add(1, 0);
+        c.seq_add(1, 2);
+        c.seq_add(1, 5);
+
+        assert(c.seq_get_used(0) == 1);
+        assert(c.seq_get_used(2) == 1);
+        assert(c.seq_get_used(5) == 1);
+
+        const auto snap = c.seq_snapshot(1);
+        assert(snap.count() == 3);
+        assert(snap.test(0) && snap.test(2) && snap.test(5));
+
+        // Remove cell 1
+        c.rm(1);
+        assert(c.is_empty(1));
+        assert(c.seq_get_used(0) == 0);
+        assert(c.seq_get_used(2) == 0);
+        assert(c.seq_get_used(5) == 0);
+
+        // Restore onto cell 3 with pos_set then seq_restore
+        c.pos_set(3, 50);
+        c.seq_restore(3, snap);
+
+        assert(!c.is_empty(3));
+        assert(c.seq_count(3) == 3);
+        assert(c.seq_has(3, 0) && c.seq_has(3, 2) && c.seq_has(3, 5));
+        assert(c.seq_get_used(0) == 1);
+        assert(c.seq_get_used(2) == 1);
+        assert(c.seq_get_used(5) == 1);
+        assert(c.seq_pos_min(0) == 50 && c.seq_pos_max(0) == 50);
+        assert(c.seq_pos_min(2) == 50 && c.seq_pos_max(2) == 50);
+        assert(c.seq_pos_min(5) == 50 && c.seq_pos_max(5) == 50);
+    }
+
+    // Test 13: One-row boundary and non-divisible compaction preservation
+    {
+        llama_kv_cells c;
+        c.resize(17); // prime size / non-divisible
+
+        // Single isolated row at the very end
+        c.pos_set(16, 999);
+        c.seq_add(16, 3);
+        const uint64_t single_pid = c.payload_id_get(16);
+        const uint64_t single_gen = c.storage_generation_get(16);
+
+        auto plan = c.make_pack_plan();
+        assert(plan.retained_count == 1);
+        assert(plan.moves.size() == 1);
+        assert(plan.moves[0].src_begin == 16);
+        assert(plan.moves[0].dst_begin == 0);
+        assert(plan.moves[0].length == 1);
+
+        c.apply_pack(plan);
+        assert(c.get_used() == 1);
+        assert(c.used_min() == 0);
+        assert(c.used_max_p1() == 1);
+        assert(!c.is_empty(0));
+        assert(c.pos_get(0) == 999);
+        assert(c.seq_has(0, 3));
+        assert(c.payload_id_get(0) == single_pid);
+        assert(c.storage_generation_get(0) == single_gen);
+        for (uint32_t i = 1; i < 17; ++i) {
+            assert(c.is_empty(i));
+            assert(c.payload_id_get(i) == 0);
+        }
     }
 
     return 0;

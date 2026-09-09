@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <limits>
@@ -2144,6 +2146,10 @@ bool llama_memory_recurrent_context::apply() {
 
     mem->find_slot(ubatches[i_next]);
 
+    return true;
+}
+
+bool llama_memory_recurrent_context::postcompute_success() {
     return true;
 }
 

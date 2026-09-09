@@ -320,6 +320,20 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
 
+        // Retain canonical source-artifact paths (main file first, then splits
+        // in loader order, deduplicated) for exact file-content restore
+        // identity. Empty for memory/file-object loads without paths.
+        if (!fname.empty()) {
+            model_ptr->source_paths.push_back(fname);
+            for (const auto & sp : splits) {
+                if (!sp.empty() && sp != fname &&
+                    std::find(model_ptr->source_paths.begin(), model_ptr->source_paths.end(), sp) ==
+                        model_ptr->source_paths.end()) {
+                    model_ptr->source_paths.push_back(sp);
+                }
+            }
+        }
+
         bool ok = llama_prepare_model_devices(params, model_ptr.get());
         if (!ok) {
             return {-1, nullptr};

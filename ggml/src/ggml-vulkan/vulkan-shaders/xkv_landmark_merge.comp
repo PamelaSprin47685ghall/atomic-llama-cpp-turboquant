@@ -1,0 +1,135 @@
+#version 450
+
+// xkv_landmark_merge.comp — Deterministic multi-segment top-k merge for XKV (v2).
+//
+// Merges n_sets per-query candidate lists into one global top_k list per query:
+// score desc, global-frag-id asc.
+//
+// Audit fixes (Main directive):
+//  1. Global ID mapping: candidate local ID from set s is mapped via set_base[s] + local_id.
+//     If set_base is not provided (or 0), duplicate local IDs across sets are flagged as collisions
+//     and fail closed unless mapped to globally unique IDs.
+//  2. Deterministic success status: status[0..3] explicitly initialized to [0, ntook, 0, 0] on success,
+//     never left uninitialized.
+//  3. Sentinels (-1, -1e30) and NaN poison handled deterministically.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// 16 x 4B = 64B push constants
+layout (push_constant) uniform parameter {
+    uint n_queries;
+    uint n_sets;
+    uint set_cap;
+    uint top_k;
+    uint has_set_base; // 1 if set_base buffer is present, 0 if IDs already global
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+} p;
+
+layout (binding = 0, std430) readonly buffer SETIDX  { int set_idx[]; };
+layout (binding = 1, std430) readonly buffer SETSC   { float set_sc[]; };
+layout (binding = 2, std430) readonly buffer SETBASE { uint set_base[]; }; // base offset per set
+layout (binding = 3, std430) buffer OUTIDX           { int out_idx[]; };
+layout (binding = 4, std430) buffer OUTSC            { float out_sc[]; };
+layout (binding = 5, std430) buffer STATUS           { int status[]; };
+
+void main() {
+    uint qq = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    if (qq >= p.n_queries || lid != 0u) return;
+
+    uint ns = p.n_sets;
+    uint sc = p.set_cap;
+    uint tk = p.top_k;
+
+    if (ns == 0u || ns > 64u || sc == 0u || sc > 128u || tk == 0u || tk > 128u) {
+        status[0] = 1; // ERR_BUDGET
+        status[1] = 0; status[2] = 0; status[3] = 0;
+        return;
+    }
+    if (uint64_t(tk) > uint64_t(ns) * uint64_t(sc)) {
+        status[0] = 1;
+        status[1] = 0; status[2] = 0; status[3] = 0;
+        return;
+    }
+
+    uint took_id[128];
+    float took_sc[128];
+    uint ntook = 0u;
+    bool failed = false;
+
+    for (uint s = 0u; s < ns && !failed; ++s) {
+        uint base_offset = (p.has_set_base != 0u) ? set_base[s] : 0u;
+
+        for (uint i = 0u; i < sc; ++i) {
+            uint at = (s * p.n_queries + qq) * sc + i;
+            int local_id = set_idx[at];
+            float v = set_sc[at];
+
+            if (local_id < 0) continue; // sentinel short list
+            if (isnan(v)) { failed = true; break; }
+            if (v == uintBitsToFloat(0xFF800000u)) continue; // -inf illegal
+
+            uint global_id = base_offset + uint(local_id);
+
+            // Check if global_id already taken
+            bool dup = false;
+            for (uint t = 0u; t < ntook; ++t) {
+                if (took_id[t] == global_id) { dup = true; break; }
+            }
+            if (dup) continue;
+
+            uint pos = ntook;
+            for (uint t = 0u; t < ntook; ++t) {
+                if (v > took_sc[t] || (v == took_sc[t] && global_id < took_id[t])) {
+                    pos = t; break;
+                }
+            }
+
+            if (pos < tk) {
+                uint up = ntook < tk ? ntook : tk - 1u;
+                for (uint t = up; t > pos; --t) {
+                    took_id[t] = took_id[t - 1u];
+                    took_sc[t] = took_sc[t - 1u];
+                }
+                took_id[pos] = global_id;
+                took_sc[pos] = v;
+                if (ntook < tk) ntook++;
+            }
+        }
+    }
+
+    if (failed) {
+        for (uint i = 0u; i < tk; ++i) {
+            out_idx[qq * tk + i] = -1;
+            out_sc[qq * tk + i] = -1e30;
+        }
+        status[0] = 2; // ERR_INPUT
+        status[1] = 0; status[2] = 0; status[3] = 0;
+        return;
+    }
+
+    for (uint i = 0u; i < tk; ++i) {
+        if (i < ntook) {
+            out_idx[qq * tk + i] = int(took_id[i]);
+            out_sc[qq * tk + i] = took_sc[i];
+        } else {
+            out_idx[qq * tk + i] = -1;
+            out_sc[qq * tk + i] = -1e30;
+        }
+    }
+
+    // Deterministic success status
+    status[0] = 0; // GGML_XKV_LANDMARK_STATUS_OK
+    status[1] = int(ntook);
+    status[2] = 0;
+    status[3] = 0;
+}

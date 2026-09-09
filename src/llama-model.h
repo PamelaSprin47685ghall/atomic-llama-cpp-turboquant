@@ -7,8 +7,10 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 
+#include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -574,6 +576,12 @@ struct llama_model {
 
     std::string name = "n/a";
 
+    // Canonical source-artifact paths (main GGUF first, then splits in loader
+    // order, deduplicated). Populated at load from the loader's fname/splits;
+    // empty when loaded from memory/file objects without paths. Consumed by
+    // source_artifact_sha256() for exact state-restore identity.
+    std::vector<std::string> source_paths;
+
     llama_hparams hparams = {};
     llama_vocab   vocab;
 
@@ -679,6 +687,18 @@ struct llama_model {
 
     size_t size() const; // file size
     size_t n_tensors() const;
+
+    // Exact source-artifact digest: lazily SHA-256 hashes every full file in
+    // source_paths on first call (domain-separated split order/name/size/
+    // content via xkv_source_files_sha256) and caches the result. False (out
+    // untouched) when paths are missing/unreadable. Thread-safe. This is FILE
+    // CONTENT identity for state restore; never confuse with the metadata-only
+    // load-artifact fingerprint used for fast mismatch screening.
+    bool source_artifact_sha256(uint8_t out[32]) const;
+
+    mutable std::mutex source_digest_mu;
+    mutable bool source_digest_cached = false;
+    mutable uint8_t source_digest_cache[32] = {};
     size_t n_devices() const;
     const float * tensor_split() const;
 

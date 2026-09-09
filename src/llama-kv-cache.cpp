@@ -7,6 +7,11 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-xkv-tri.h"
+#include "llama-xkv-backend.h"
+#include "llama-xkv-runtime.h"
+#include "llama-xkv-transaction.h"
+#include "llama-xkv-state.h"
 
 #include <algorithm>
 #include <cassert>
@@ -15,6 +20,7 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <set>
 #include <stdexcept>
 
 static bool ggml_is_power_of_2(int n) {
@@ -109,12 +115,74 @@ llama_kv_cache::llama_kv_cache(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) :
+    const  layer_share_cb & share,
+    const llama_cparams   * cparams) :
     model(model), hparams(hparams), v_trans(v_trans),
-    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
+    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max),
+    kv_unified(unified),
+    n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
-    v_cells(*v_cells_impl) {
+    v_cells(*v_cells_impl),
+    xkv_store(other ? other->xkv_store : nullptr),
+    xkv_hot_pool(other ? other->xkv_hot_pool : nullptr) {
+
+    if (cparams && other == nullptr) {
+        if (cparams->xkv_mode == LLAMA_XKV_MODE_DENSE || cparams->xkv_mode == LLAMA_XKV_MODE_SR) {
+            // MTP draft contexts must never allocate hot resources: the draft
+            // cache holds only the speculative tail and shares no hot lifecycle.
+            // Non-unified caches are rejected: bounded-hot tensor rows and the
+            // shared pool assume a single unified stream.
+            if (cparams->ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                throw std::invalid_argument("llama_kv_cache: bounded-hot XKV is not supported in MTP draft contexts");
+            }
+            if (!unified) {
+                throw std::invalid_argument("llama_kv_cache: bounded-hot XKV requires a unified KV cache");
+            }
+            xkv_dense_sr = true;
+            const uint64_t seg = (uint64_t) cparams->xkv_segment_tokens;
+            const uint64_t ub  = (uint64_t) std::max<uint32_t>(cparams->n_batch, cparams->n_ubatch);
+            // Fixed config forbids hidden fallbacks: chunk_tokens == 0 throws
+            // instead of silently substituting 8.
+            if (cparams->xkv_chunk_tokens == 0) {
+                throw std::invalid_argument("llama_kv_cache: XKV chunk_tokens must be positive");
+            }
+            const uint64_t chunk = (uint64_t) cparams->xkv_chunk_tokens;
+            if (seg == 0) {
+                throw std::invalid_argument("llama_kv_cache: XKV segment_tokens must be positive");
+            }
+            // Explicit checked add (u32 + u32 always fits, stated for audit).
+            const uint64_t raw_hot = seg + ub;
+            if (raw_hot == 0 || raw_hot > (uint64_t) UINT32_MAX) {
+                throw std::invalid_argument("llama_kv_cache: XKV hot capacity derivation overflow");
+            }
+            if (raw_hot > UINT32_MAX - chunk) {
+                throw std::invalid_argument("llama_kv_cache: XKV hot capacity rounding overflow");
+            }
+            const uint64_t rounded = ((raw_hot + chunk - 1) / chunk) * chunk;
+            if (rounded == 0 || rounded > UINT32_MAX) {
+                throw std::invalid_argument("llama_kv_cache: rounded hot capacity overflow");
+            }
+            // Bounded mode needs room to seal safely: the logical cache must
+            // fit a full segment plus the batch headroom. Silently clamping
+            // hot below segment+batch would leave no sealable window, so the
+            // configuration is rejected instead of clamped.
+            if (rounded > (uint64_t) kv_size) {
+                throw std::invalid_argument("llama_kv_cache: logical KV capacity below XKV segment+batch hot requirement");
+            }
+            hot_kv_size = (uint32_t) rounded;
+            if (hot_kv_size == 0) {
+                throw std::invalid_argument("llama_kv_cache: derived hot capacity is invalid");
+            }
+            xkv_hot_pool = std::make_shared<llama_xkv::xkv_hot_slot_pool>(hot_kv_size);
+        }
+    } else if (other) {
+        xkv_dense_sr = other->xkv_dense_sr;
+        hot_kv_size  = other->hot_kv_size;
+    }
+    if (hot_kv_size == 0) {
+        hot_kv_size = kv_size;
+    }
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -266,6 +334,10 @@ llama_kv_cache::llama_kv_cache(
                 layers.push_back(layer_share);
                 layers.back().il = il;
 
+                if (xkv_store) {
+                    xkv_store->register_layer_alias(il, (uint32_t) il_share);
+                }
+
                 continue;
             }
         }
@@ -388,8 +460,8 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa_eff, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa_eff, kv_size, n_stream) : nullptr;
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, layer_type_k, n_embd_k_gqa_eff, hot_kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, layer_type_v, n_embd_v_gqa_eff, hot_kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
@@ -398,8 +470,8 @@ llama_kv_cache::llama_kv_cache(
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa_eff, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
-            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa_eff, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
+            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa_eff, hot_kv_size, k->nb[1], s*k->nb[2]) : nullptr);
+            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa_eff, hot_kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
         map_layer_ids[il] = layers.size();
@@ -490,38 +562,11 @@ llama_kv_cache::llama_kv_cache(
     {
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
-        const double kib_per_cell = kv_size > 0
-            ? (double)(memory_size_k + memory_size_v) / (double)kv_size / 1024.0
-            : 0.0;
 
-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs, %7.3f KiB/cell), "
-                       "K: %7.2f MiB, V: %7.2f MiB (requested %s/%s)\n", __func__,
+        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
                 (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
-                kib_per_cell,
-                (float)memory_size_k / (1024.0f * 1024.0f), (float)memory_size_v / (1024.0f * 1024.0f),
-                ggml_type_name(type_k), ggml_type_name(type_v));
-
-        // Requested cache types can differ from the tensors actually
-        // allocated per layer (layer-adaptive modes, automatic asymmetric K,
-        // model-specific reuse). Print the real layer/type/byte mix so memory
-        // fitting does not mistake e.g. Boundary-V q8 layers for uniform V2.
-        for (int side = 0; side < 2; ++side) {
-            std::map<ggml_type, std::pair<uint32_t, size_t>> mix;
-            for (const auto & layer : layers) {
-                const ggml_tensor * tensor = side == 0 ? layer.k : layer.v;
-                if (!tensor) {
-                    continue;
-                }
-                auto & entry = mix[tensor->type];
-                entry.first += 1;
-                entry.second += ggml_nbytes(tensor);
-            }
-            for (const auto & [type, entry] : mix) {
-                LLAMA_LOG_INFO("%s: actual %c layers: %3u x %-8s = %7.2f MiB\n", __func__,
-                        side == 0 ? 'K' : 'V', entry.first, ggml_type_name(type),
-                        (float)entry.second / (1024.0f * 1024.0f));
-            }
-        }
+                ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
+                ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
     }
 
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
@@ -533,7 +578,6 @@ llama_kv_cache::llama_kv_cache(
 
         attn_rot_k = other->attn_rot_k;
         attn_rot_v = other->attn_rot_v;
-        attn_rot_k_nrot = other->attn_rot_k_nrot;
     } else {
         // TurboQuant: master's #21038 attention rotation is OFF by default on this
         // fork. Enable per-side via LLAMA_ATTN_ROT_K_OVERRIDE=1 and/or
@@ -599,21 +643,6 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    if (attn_rot_k && !other) {
-        const char * value = getenv("LLAMA_ATTN_ROT_K_NROT");
-        int nrot = value ? atoi(value) : 64;
-        if (nrot == 0) {
-            nrot = 64;
-            while (n_embd_head_k_all % (2 * nrot) == 0) {
-                nrot *= 2;
-            }
-        }
-        if (nrot < 64 || (nrot & (nrot - 1)) != 0 || n_embd_head_k_all % nrot != 0) {
-            throw std::runtime_error("invalid LLAMA_ATTN_ROT_K_NROT for K head dimension");
-        }
-        attn_rot_k_nrot = (uint32_t) nrot;
-    }
-
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
     LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
 
@@ -643,38 +672,100 @@ llama_kv_cache::llama_kv_cache(
 }
 
 void llama_kv_cache::clear(bool data) {
-    fp_bump();
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        v_cells[s].reset();
-        v_heads[s] = 0;
+    // Legacy void entry: failure-reporting callers must use try_clear (or the
+    // C try-clear API, which returns bool). Logs an explicit refusal and
+    // returns with the cache unchanged instead of throwing or aborting, so
+    // fault injection (or an active reader breaking quiescence) can never
+    // kill the service through this path.
+    std::string err;
+    if (!try_clear(data, &err)) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, err.c_str());
+    }
     }
 
-    for (auto & tag : rerot_write_tags) {
-        tag.reset();
-    }
-    for (auto & view : rerot_reader_views) {
-        view.reset();
-    }
-
-    if (data) {
-        for (auto & [_, buf] : ctxs_bufs) {
-            ggml_backend_buffer_clear(buf.get(), 0);
+bool llama_kv_cache::try_clear(bool data, std::string * err) {
+    // Unilateral cross-atomic clear (no store-gate dependency): preflight
+    // everything BEFORE mutating anything, snapshot the pool as insurance,
+    // commit pool reset, then store clear, and only then reset cells.
+    // False leaves store, pool, cells and epochs bit-identical: the pool is
+    // restored from its snapshot when the store commit fails, the store
+    // reports failure before mutating (rechecked preflight contract), and
+    // cells are touched last. Object identity of the shared pool is
+    // preserved by the in-place reset/restore; views observe the same
+    // instance throughout. Never throws.
+    try {
+        if (xkv_hot_pool && xkv_hot_pool->has_active_reservations()) {
+            if (err) *err = "llama_kv_cache::clear: active live reservations exist; cache not quiescent";
+            return false;
         }
-
-        // Re-initialize turbo rotation matrices after buffer clear (clear zeroes everything)
-        if (turbo_rotation != nullptr && turbo_rotation->buffer != nullptr) {
-            #include "turbo-rotation-data.h"
-            ggml_backend_tensor_set(turbo_rotation, TURBO_ROTATION_R, 0, 128 * 128 * sizeof(float));
-            ggml_backend_tensor_set(turbo_rotation_inv, TURBO_ROTATION_RT, 0, 128 * 128 * sizeof(float));
-
-            // Re-initialize InnerQ scale_inv to all 1.0
-            if (turbo_innerq_scale_inv != nullptr && turbo_innerq_scale_inv->buffer != nullptr) {
-                float ones[INNERQ_MAX_CHANNELS];
-                for (int i = 0; i < INNERQ_MAX_CHANNELS; i++) ones[i] = 1.0f;
-                ggml_backend_tensor_set(turbo_innerq_scale_inv, ones, 0, INNERQ_MAX_CHANNELS * sizeof(float));
+        if (xkv_store) {
+            if (!xkv_store->can_clear(err)) {
+                return false;
             }
         }
+        // Pool snapshot first (copies; throws only on OOM, caught below
+        // with nothing mutated yet).
+        llama_xkv::xkv_hot_slot_pool::pool_snapshot pool_snap;
+        bool have_pool_snap = false;
+        if (xkv_hot_pool) {
+            pool_snap = xkv_hot_pool->snapshot_state();
+            have_pool_snap = true;
+        }
+        // Commit order: pool reset, then store clear. A pool-reset failure
+        // (post-quiescence race) returns false with the store untouched; a
+        // store-clear failure restores the pool snapshot first, so cells
+        // (still untouched) never describe a diverged store.
+        if (xkv_hot_pool) {
+            if (!xkv_hot_pool->reset(err)) {
+                return false;
+            }
+        }
+        if (xkv_store) {
+            if (!xkv_store->clear(err)) {
+                if (have_pool_snap) {
+                    xkv_hot_pool->restore_state(pool_snap);
+        }
+                return false;
+            }
+        }
+        if (xkv_runtime) {
+            xkv_runtime->clear_decode_cache();
+        }
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            v_cells[s].reset();
+            v_heads[s] = 0;
+        }
+        for (auto & tag : rerot_write_tags) {
+            tag.reset();
+        }
+        for (auto & view : rerot_reader_views) {
+            view.reset();
+        }
+        if (data) {
+            for (auto & [_, buf] : ctxs_bufs) {
+                ggml_backend_buffer_clear(buf.get(), 0);
+            }
+            // Re-initialize turbo rotation matrices after buffer clear (clear zeroes everything)
+            if (turbo_rotation != nullptr && turbo_rotation->buffer != nullptr) {
+                #include "turbo-rotation-data.h"
+                ggml_backend_tensor_set(turbo_rotation, TURBO_ROTATION_R, 0, 128 * 128 * sizeof(float));
+                ggml_backend_tensor_set(turbo_rotation_inv, TURBO_ROTATION_RT, 0, 128 * 128 * sizeof(float));
+                // Re-initialize InnerQ scale_inv to all 1.0
+                if (turbo_innerq_scale_inv != nullptr && turbo_innerq_scale_inv->buffer != nullptr) {
+                    float ones[INNERQ_MAX_CHANNELS];
+                    for (int i = 0; i < INNERQ_MAX_CHANNELS; i++) ones[i] = 1.0f;
+                    ggml_backend_tensor_set(turbo_innerq_scale_inv, ones, 0, INNERQ_MAX_CHANNELS * sizeof(float));
+                }
+            }
+        }
+    } catch (const std::exception & e) {
+        if (err) *err = e.what();
+        return false;
+    } catch (...) {
+        if (err) *err = "llama_kv_cache::clear: unknown failure";
+        return false;
     }
+    return true;
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -682,8 +773,6 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (other) {
         return true;
     }
-
-    fp_bump();
 
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
@@ -698,6 +787,32 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     if (seq_id >= 0) {
         auto & cells = v_cells[seq_to_stream[seq_id]];
         auto & head  = v_heads[seq_to_stream[seq_id]];
+
+        // Collect exclusively-owned cells in range. Shared cells (seq_count > 1)
+        // only drop this sequence's reference below and release nothing: the
+        // payload frees at the last reference, never earlier.
+        std::vector<uint32_t> doomed;
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.pos_in(i, p0, p1)) continue;
+            if (cells.seq_has(i, seq_id) && cells.seq_count(i) == 1) {
+                doomed.push_back(i);
+            }
+        }
+
+        // Preflight pool + store with zero mutation; a stale binding or seal
+        // lock fails closed before any subsystem mutates.
+        xkv_removal_release rel;
+        {
+            std::string err;
+            if (!collect_removal_release(seq_to_stream[seq_id], doomed, rel, &err)) {
+                LLAMA_LOG_ERROR("%s: removal preflight failed: %s\n", __func__, err.c_str());
+                return false;
+            }
+            if (!execute_removal_release(rel, &err)) {
+                LLAMA_LOG_ERROR("%s: removal release failed: %s\n", __func__, err.c_str());
+                return false;
+            }
+        }
 
         uint32_t new_head = cells.size();
 
@@ -722,6 +837,28 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         for (uint32_t s = 0; s < n_stream; ++s) {
             auto & cells = v_cells[s];
             auto & head  = v_heads[s];
+
+            std::vector<uint32_t> doomed;
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (!cells.pos_in(i, p0, p1)) continue;
+                if (!cells.is_empty(i)) {
+                    doomed.push_back(i);
+                }
+            }
+            // Aligned hot-only triple + full store lists with dedup; shared
+            // payload IDs release once. Fail-closed before cells mutate.
+            xkv_removal_release rel;
+            {
+                std::string err;
+                if (!collect_removal_release(s, doomed, rel, &err)) {
+                    LLAMA_LOG_ERROR("%s: removal preflight failed: %s\n", __func__, err.c_str());
+                    return false;
+                }
+                if (!execute_removal_release(rel, &err)) {
+                    LLAMA_LOG_ERROR("%s: removal release failed: %s\n", __func__, err.c_str());
+                    return false;
+                }
+            }
 
             uint32_t new_head = cells.size();
 
@@ -752,8 +889,6 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     if (other) {
         return;
     }
-
-    fp_bump();
 
     GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
     GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
@@ -794,6 +929,14 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
     // cross-stream sequence copies require to copy the actual buffer data
 
+    // Bounded-hot caches are unified by construction, so a cross-stream copy
+    // with hot bindings cannot legitimately occur. Reject before any mutation
+    // instead of fabricating physical hot rows (logical index != hot row) or
+    // splitting factored shared identity across streams.
+    if (is_xkv_bounded_hot()) {
+        throw std::runtime_error("llama_kv_cache::seq_cp: cross-stream copy is not supported with bounded-hot XKV");
+    }
+
     bool is_full = true;
 
     if (p0 > 0 && p0 + 1 < (int) get_size()) {
@@ -832,6 +975,9 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 
             v_cells[s1].ext_set(i, ext);
             v_cells[s1].rerot_set(i, v_cells[s0].rerot_get(i));
+            // Distinct physical copied content receives a fresh payload_id/
+            // generation (allocated by pos_set above). Unbounded caches have no
+            // hot pool, so the logical index needs no physical translation here.
         }
     }
 
@@ -848,12 +994,30 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
         return;
     }
 
-    fp_bump();
-
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
+
+    // Cells exclusively owned by other sequences are dropped; their payloads
+    // release through the aligned helper with shared-ID dedup.
+    std::vector<uint32_t> doomed;
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (!cells.is_empty(i) && !cells.seq_has(i, seq_id) && cells.seq_count(i) == 1) {
+            doomed.push_back(i);
+        }
+    }
+    // Preflight pool + store with zero mutation; fail closed before cells mutate.
+    {
+        xkv_removal_release rel;
+        std::string err;
+        if (!collect_removal_release(seq_to_stream[seq_id], doomed, rel, &err)) {
+            throw std::runtime_error("llama_kv_cache::seq_keep: removal preflight failed: " + err);
+        }
+        if (!execute_removal_release(rel, &err)) {
+            throw std::runtime_error("llama_kv_cache::seq_keep: removal release failed: " + err);
+        }
+    }
 
     uint32_t new_head = cells.size();
 
@@ -876,8 +1040,6 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     if (other) {
         return;
     }
-
-    fp_bump();
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
@@ -904,6 +1066,36 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         return;
     }
 
+    // Bounded hot mapping: cells evicted by a negative shift (pos_add drops
+    // them when pos goes negative) must release their pool rows + store
+    // payloads, or the pool/store keep stale bindings for dead cells.
+    // Pre-scan (read-only) so the removal release is preflighted before any
+    // cell mutates; execution after the loop goes through the store-held
+    // removal gate. A gate false only logs: this void entry cannot propagate,
+    // and matches legacy leak behavior instead of corrupting state.
+    xkv_removal_release evict_rel;
+    bool have_evict = false;
+    if (xkv_hot_pool || xkv_store) {
+        std::vector<uint32_t> doomed;
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (!cells.pos_in(i, p0, p1)) {
+                continue;
+            }
+            if (cells.seq_has(i, seq_id) && !cells.is_empty(i) &&
+                cells.pos_get(i) + shift < 0) {
+                doomed.push_back(i);
+            }
+        }
+        if (!doomed.empty()) {
+            std::string pre_err;
+            if (collect_removal_release(seq_to_stream[seq_id], doomed, evict_rel, &pre_err)) {
+                have_evict = true;
+            } else {
+                LLAMA_LOG_ERROR("%s: eviction preflight refused: %s\n", __func__, pre_err.c_str());
+            }
+        }
+    }
+
     for (uint32_t i = 0; i < cells.size(); ++i) {
         if (!cells.pos_in(i, p0, p1)) {
             continue;
@@ -918,6 +1110,13 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
         }
     }
 
+    if (have_evict) {
+        std::string rel_err;
+        if (!execute_removal_release(evict_rel, &rel_err)) {
+            LLAMA_LOG_ERROR("%s: eviction release failed: %s\n", __func__, rel_err.c_str());
+        }
+    }
+
     // If we freed up a slot, set head to it so searching can start there.
     // Otherwise we just start the next search from the beginning.
     head = new_head != cells.size() ? new_head : 0;
@@ -929,14 +1128,18 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
         return;
     }
 
-    fp_bump();
-
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_div() is only supported for n_pos_per_embd() == 1");
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
 
     if (d == 1) {
+        return;
+    }
+
+    // Division by zero traps and negative divisors produce nonsense
+    // positions; neither is supported. Refuse with zero mutation.
+    if (d <= 0) {
         return;
     }
 
@@ -1007,11 +1210,77 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
     return ret;
 }
 
+bool llama_kv_cache::reserve_hot_slots(slot_info_vec_t & sinfos,
+                                        const std::vector<llama_ubatch> & ubatches,
+                                        std::vector<llama_xkv::xkv_hot_reservation> & out_reservations,
+                                        std::string * err) {
+    out_reservations.clear();
+    if (!is_xkv_bounded_hot() || !xkv_hot_pool) {
+        return true;
+    }
+    if (sinfos.size() != ubatches.size()) {
+        if (err) *err = "reserve_hot_slots: sinfos/ubatches size mismatch";
+        return false;
+    }
+    std::vector<llama_xkv::xkv_hot_reservation> staged;
+    staged.reserve(ubatches.size());
+    // On any failure, staged reservations roll back via RAII and hot_idxs
+    // filled so far are cleared, so callers can fail closed without residue.
+    auto clear_filled_hot_idxs = [&]() {
+        for (auto & sinfo : sinfos) {
+            sinfo.hot_idxs.clear();
+        }
+    };
+    for (size_t u = 0; u < ubatches.size(); ++u) {
+        const uint32_t needed = ubatches[u].n_tokens;
+        auto & sinfo = sinfos[u];
+        if (needed == 0) {
+            staged.emplace_back();
+            continue;
+        }
+        std::string res_err;
+        auto r = xkv_hot_pool->reserve(needed, &res_err);
+        if (!r.valid()) {
+            if (err) *err = "reserve_hot_slots: failed to reserve " + std::to_string(needed) +
+                            " hot slots for ubatch " + std::to_string(u) + ": " + res_err;
+            clear_filled_hot_idxs();
+            return false;
+        }
+        // Fill hot_idxs: one physical row per logical token, stream-major to
+        // match the sinfo.idxs layout consumed by apply and page writers.
+        if (sinfo.n_stream() == 0 || sinfo.size() == 0 ||
+            (uint64_t) sinfo.n_stream() * sinfo.size() != needed) {
+            if (err) *err = "reserve_hot_slots: sinfo token count does not match ubatch n_tokens";
+            clear_filled_hot_idxs();
+            return false;
+        }
+        sinfo.hot_idxs.resize(sinfo.n_stream());
+        size_t slot_offset = 0;
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            sinfo.hot_idxs[s].resize(sinfo.size());
+            for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+                sinfo.hot_idxs[s][ii] = r[slot_offset++];
+            }
+        }
+        staged.push_back(std::move(r));
+    }
+    out_reservations = std::move(staged);
+    return true;
+}
+
 llama_memory_context_ptr llama_kv_cache::init_batch(
             llama_batch_allocr & balloc,
             uint32_t n_ubatch,
             bool embd_all) {
     GGML_UNUSED(embd_all);
+
+    // Fail closed before the first batch: bounded hot tensors must never
+    // execute legacy attention without a ready XKV path.
+    if (is_xkv_bounded_hot() && xkv_runtime && !xkv_runtime->attention_path_ready()) {
+        LLAMA_LOG_ERROR("%s: bounded hot active without a ready XKV path (%s)\n",
+            __func__, xkv_runtime->readiness_reason());
+        return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
 
     do {
         balloc.split_reset();
@@ -1037,8 +1306,15 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             break;
         }
 
+        std::vector<llama_xkv::xkv_hot_reservation> hot_res;
+        std::string res_err;
+        if (!reserve_hot_slots(sinfos, ubatches, hot_res, &res_err)) {
+            LLAMA_LOG_WARN("%s: %s\n", __func__, res_err.c_str());
+            break;
+        }
+
         return std::make_unique<llama_kv_cache_context>(
-                this, std::move(sinfos), std::move(ubatches));
+                this, std::move(sinfos), std::move(ubatches), std::move(hot_res));
     } while (false);
 
     return std::make_unique<llama_kv_cache_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -1097,7 +1373,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         }
 
         // now emplace the ubatch
-        apply_ubatch(sinfo_new, ubatch);
+        apply_ubatch(sinfo_new, ubatch, /*dry_run=*/true);
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -1122,15 +1398,607 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
     return res;
 }
 
+// Shifted-cell record for the bounded context-shift transaction.
+struct xkv_shift_item {
+    uint32_t stream = 0;
+    uint32_t idx = 0;
+    uint64_t pid = 0;
+    uint64_t gen = 0;
+    llama_pos delta = 0;
+    llama_pos new_pos = 0;
+};
+
+bool llama_kv_cache::update_shift_bounded(llama_context * lctx, std::string * err) {
+    // Phase 1: collect shifted cells (read-only). Positions were advanced by
+    // seq_add/seq_div already (stock protocol); shift[] holds pending deltas.
+    std::vector<xkv_shift_item> items;
+    std::unordered_map<uint64_t, uint32_t> pid_cell;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const auto & cells = v_cells[s];
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.is_empty(i) || cells.get_shift(i) == 0) {
+                continue;
+            }
+            const uint64_t pid = cells.payload_id_get(i);
+            if (pid == 0) {
+                if (err) *err = "bounded shift: shifted cell holds untracked residue";
+                return false;
+            }
+            // Cross-cell pid sharing would corrupt row/delta mapping and the
+            // position map below; same doctrine as overwrite victims.
+            // Any duplicate pid across distinct (stream, cell) visits refuses;
+            // the loop visits each cell once, so a hit is always sharing.
+            if (!pid_cell.emplace(pid, i).second) {
+                if (err) *err = "bounded shift: payload " + std::to_string(pid) +
+                                " shared across cells";
+                return false;
+            }
+            xkv_shift_item it;
+            it.stream = s;
+            it.idx = i;
+            it.pid = pid;
+            it.gen = cells.storage_generation_get(i);
+            it.delta = cells.get_shift(i);
+            it.new_pos = cells.pos_get(i);
+            items.push_back(it);
+        }
+    }
+    if (items.empty()) {
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            v_cells[s].reset_shift();
+        }
+        return true;
+    }
+
+    // Phase 2: resolve + partition (read-only). Hot rows rotate; factored
+    // segments with landmark streams refresh via COW packs; plain factored
+    // canonical (pre-RoPE) needs no store mutation.
+    std::unordered_map<uint32_t, llama_pos> row_delta; // hot row -> delta (dedup)
+    std::unordered_map<uint64_t, std::vector<const xkv_shift_item *>> seg_items;
+    for (const auto & it : items) {
+        llama_xkv::xkv_location loc;
+        if (!xkv_store || !xkv_store->find_location(it.pid, loc)) {
+            if (err) *err = "bounded shift: shifted payload " + std::to_string(it.pid) +
+                            " not tracked in store";
+            return false;
+        }
+        if (loc.storage_generation != it.gen) {
+            if (err) *err = "bounded shift: generation mismatch for payload " + std::to_string(it.pid);
+            return false;
+        }
+        if (loc.state == llama_xkv::xkv_state::seal_candidate && loc.seal_tx_nonce != 0) {
+            if (err) *err = "bounded shift: payload " + std::to_string(it.pid) +
+                            " locked in an active seal transaction";
+            return false;
+        }
+        if (loc.kind == llama_xkv::xkv_location_kind::hot) {
+            uint32_t slot = 0;
+            llama_xkv::xkv_hot_slot_info hinfo;
+            if (!xkv_hot_pool || !xkv_hot_pool->find_payload(it.pid, hinfo)) {
+                if (err) *err = "bounded shift: hot payload " + std::to_string(it.pid) +
+                                " has no pool row";
+                return false;
+            }
+            if (hinfo.storage_generation != it.gen) {
+                if (err) *err = "bounded shift: pool generation mismatch for payload " +
+                                std::to_string(it.pid);
+                return false;
+            }
+            slot = hinfo.slot;
+            auto ins = row_delta.emplace(slot, it.delta);
+            if (!ins.second && ins.first->second != it.delta) {
+                if (err) *err = "bounded shift: conflicting deltas on shared hot row " +
+                                std::to_string(slot);
+                return false;
+            }
+        } else if (loc.kind == llama_xkv::xkv_location_kind::factored) {
+            if (loc.segment_id == 0) {
+                if (err) *err = "bounded shift: factored payload " + std::to_string(it.pid) +
+                                " has no segment";
+                return false;
+            }
+            seg_items[loc.segment_id].push_back(&it);
+        } else {
+            if (err) *err = "bounded shift: payload " + std::to_string(it.pid) +
+                            " is flat-stored with no shift byte path";
+            return false;
+        }
+    }
+
+    // Phase 3: segment profiles. Only segments carrying landmark streams
+    // need a refresh; everything else factored is position-independent.
+    std::vector<uint64_t> rebuild_seg_ids;
+    for (const auto & kv : seg_items) {
+        auto seg = xkv_store->get_segment(kv.first);
+        if (!seg) {
+            if (err) *err = "bounded shift: segment " + std::to_string(kv.first) + " not published";
+            return false;
+        }
+        // Detect landmarks by non-empty chunks table, valid descriptor, or
+        // profile contract (never host byte count alone: DEVICE_OWNED has
+        // empty host bytes).
+        bool has_landmarks = (seg->profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS);
+        for (const auto & g : seg->groups) {
+            if (!g.landmark_chunks.empty() || g.bytes_landmark > 0 ||
+                g.landmark.desc.logical_shape.rows > 0) {
+                has_landmarks = true;
+                break;
+            }
+        }
+        if (has_landmarks) {
+            rebuild_seg_ids.push_back(kv.first);
+        }
+    }
+
+    // Rotation needed only with RoPE and hot rows; landmark publish needed
+    // only with landmark segments. lctx/sched stay untouched on pure-refusal
+    // paths above, so a null context fails closed here instead of crashing.
+    const bool need_rotate = !row_delta.empty() && hparams.rope_type != LLAMA_ROPE_TYPE_NONE;
+    if (lctx == nullptr && (!rebuild_seg_ids.empty() || need_rotate)) {
+        if (err) *err = "bounded shift: null context with rotation/publish work pending";
+        return false;
+    }
+
+    // Native bridge contract: the landmark refresh below decodes factor
+    // streams on host. Production device-owned profiles must never decode
+    // full streams nor fall back to host reference; their native rebuild
+    // kernels are wired via the runtime's native landmark rebuild.
+    if (!rebuild_seg_ids.empty()) {
+        const bool is_cpu = (xkv_store->get_cparams().xkv_factorizer == LLAMA_XKV_FACTORIZER_CPU_REFERENCE);
+        if (!is_cpu) {
+            // Verify that runtime is present, armed, and ready for native device landmark rebuild
+            if (!xkv_runtime || !xkv_runtime->attention_path_ready() || !xkv_runtime->get_coordinator()) {
+                if (err) *err = "bounded shift: device-owned factorizer requires an active native landmark builder and coordinator";
+                return false;
+            }
+        }
+    }
+
+    // Phase 4: coordinator exclusion (skipped standalone when no coordinator).
+    std::unique_ptr<llama_xkv::xkv_maintenance_guard> mguard;
+    if (xkv_tx_coord) {
+        std::string merr;
+        mguard.reset(new llama_xkv::xkv_maintenance_guard(
+            xkv_tx_coord.get(), llama_xkv::xkv_maintenance_op::landmark_publish,
+            xkv_shift_maint_id_++, &merr));
+        if (!mguard->held()) {
+            if (err) *err = "bounded shift: maintenance exclusion contention: " + merr;
+            return false;
+        }
+    }
+
+    // Phase 5: Build exact new phase-aware landmarks in ONE prepared batch COW
+    // mutation (all affected segments cloned and re-landmarked atomically),
+    // staged off-side. No store mutation commits yet!
+    // Full pid -> new-position map: shifted items plus a cell scan for
+    // unshifted rows of the same segments (read-only).
+    std::unordered_map<uint64_t, int64_t> pid_to_pos;
+    if (!rebuild_seg_ids.empty()) {
+        const llama_cparams & cparams = lctx->get_cparams();
+        const llama_cparams & store_params = xkv_store->get_cparams();
+        const ggml_type lm_type = store_params.xkv_landmark_type;
+        const uint32_t chunk = store_params.xkv_chunk_tokens;
+        for (const auto & it : items) {
+            pid_to_pos[it.pid] = (int64_t) it.new_pos;
+        }
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            const auto & cells = v_cells[s];
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (cells.is_empty(i)) {
+                    continue;
+                }
+                const uint64_t pid = cells.payload_id_get(i);
+                if (pid != 0 && pid_to_pos.find(pid) == pid_to_pos.end()) {
+                    pid_to_pos[pid] = (int64_t) cells.pos_get(i);
+                }
+            }
+        }
+    }
+
+    // Rebuild closure for the atomic batch mutation:
+    auto rebuild_fn = [this, &pid_to_pos, lctx](
+        const llama_xkv::xkv_segment & old_seg,
+        const std::vector<uint32_t> & surviving_rows,
+        llama_xkv::xkv_segment & candidate,
+        std::string * cerr) -> bool {
+        const llama_cparams & cparams = lctx->get_cparams();
+        const llama_cparams & store_params = xkv_store->get_cparams();
+        const ggml_type lm_type = store_params.xkv_landmark_type;
+        const uint32_t chunk = store_params.xkv_chunk_tokens;
+
+        // Two distinct paths:
+        // 1. DEVICE_OWNED: refuse closed without host decode. Native device
+        //    rebuild issuance (placement buft, allocation IDs, candidate bundle
+        //    attach) is owned by the store mutation path; this callback cannot
+        //    supply it, so it must never fall back to host reference decode.
+        // 2. REFERENCE_HOST: use CPU rebuild_candidate_landmarks_with_positions with decoded host factors.
+        if (candidate.residency == GGML_XKV_RES_DEVICE_OWNED) {
+            if (!candidate.backend_bundle || !candidate.backend_bundle->is_committed()) {
+                if (cerr) *cerr = "shift rebuild: device-owned candidate lacks committed backend bundle";
+                return false;
+            }
+            ggml_backend_t exec = candidate.backend_bundle->get_executor();
+            if (!exec) {
+                if (cerr) *cerr = "shift rebuild: device-owned candidate backend bundle missing executor";
+                return false;
+            }
+            // Device-owned candidate requires active runtime and coordinator for native landmark builder
+            if (!xkv_runtime || !xkv_runtime->attention_path_ready() || !xkv_runtime->get_coordinator()) {
+                if (cerr) *cerr = "shift rebuild: native device landmark builder unavailable";
+                return false;
+            }
+            // Build exact positions vector corresponding to surviving_rows
+            std::vector<int64_t> dev_positions;
+            dev_positions.reserve(surviving_rows.size());
+            for (uint32_t r : surviving_rows) {
+                if (r >= old_seg.row_payload_ids.size()) {
+                    if (cerr) *cerr = "shift rebuild: surviving row out of range";
+                    return false;
+                }
+                const uint64_t pid = old_seg.row_payload_ids[r];
+                auto it = pid_to_pos.find(pid);
+                if (it == pid_to_pos.end()) {
+                    if (cerr) *cerr = "shift rebuild: no position for payload " + std::to_string(pid);
+                    return false;
+                }
+                dev_positions.push_back(it->second);
+            }
+            std::vector<llama_xkv::xkv_group_phase_spec> specs;
+            for (const auto & g : candidate.groups) {
+                llama_xkv::layer_group lg;
+                lg.group_index = g.group_index;
+                lg.owning_layers = g.owning_layers;
+                lg.layer_feature_offsets_k = g.layer_feature_offsets_k;
+                lg.layer_feature_dims_k = g.layer_feature_dims_k;
+                lg.layer_feature_offsets_v = g.layer_feature_offsets_v;
+                lg.layer_feature_dims_v = g.layer_feature_dims_v;
+                lg.total_dim_k = g.total_dim_k;
+                lg.total_dim_v = g.total_dim_v;
+                llama_xkv::xkv_group_phase_spec spec;
+                spec.group_index = g.group_index;
+                if (!llama_xkv::build_landmark_phase_layers(
+                        *this, cparams, hparams, lg, spec.layers, spec.fingerprint, cerr)) {
+                    return false;
+                }
+                specs.push_back(std::move(spec));
+            }
+            // DEVICE_OWNED factors must never be decoded on host: the CPU
+            // rebuild decodes source A_K/B_K bytes, which are empty for
+            // device-resident segments. Native device rebuild issuance needs
+            // the placement buft, allocation IDs, and candidate bundle attach
+            // owned by the store mutation path, so this caller fails closed
+            // instead of falling back to host reference.
+            (void) dev_positions;
+            (void) specs;
+            (void) lm_type;
+            (void) chunk;
+            if (cerr) *cerr = "shift rebuild: device-owned landmarks require a native device rebuild; host decode forbidden";
+            return false;
+        }
+        // Build exact positions vector corresponding to surviving_rows
+        std::vector<int64_t> positions;
+        positions.reserve(surviving_rows.size());
+        for (uint32_t r : surviving_rows) {
+            if (r >= old_seg.row_payload_ids.size()) {
+                if (cerr) *cerr = "shift rebuild: surviving row out of range";
+                return false;
+            }
+            const uint64_t pid = old_seg.row_payload_ids[r];
+            auto it = pid_to_pos.find(pid);
+            if (it == pid_to_pos.end()) {
+                if (cerr) *cerr = "shift rebuild: no position for payload " + std::to_string(pid);
+                return false;
+            }
+            positions.push_back(it->second);
+        }
+        std::vector<llama_xkv::xkv_group_phase_spec> specs;
+        for (const auto & g : candidate.groups) {
+            llama_xkv::layer_group lg;
+            lg.group_index = g.group_index;
+            lg.owning_layers = g.owning_layers;
+            lg.layer_feature_offsets_k = g.layer_feature_offsets_k;
+            lg.layer_feature_dims_k = g.layer_feature_dims_k;
+            lg.layer_feature_offsets_v = g.layer_feature_offsets_v;
+            lg.layer_feature_dims_v = g.layer_feature_dims_v;
+            lg.total_dim_k = g.total_dim_k;
+            lg.total_dim_v = g.total_dim_v;
+            llama_xkv::xkv_group_phase_spec spec;
+            spec.group_index = g.group_index;
+            if (!llama_xkv::build_landmark_phase_layers(
+                    *this, cparams, hparams, lg, spec.layers, spec.fingerprint, cerr)) {
+                return false;
+            }
+            specs.push_back(std::move(spec));
+        }
+        // REFERENCE_HOST only: the CPU rebuild decodes host factor streams.
+        // Device-owned candidates are refused in the branch above; reaching
+        // here with device residency is a logic error, so refuse closed.
+        if (candidate.residency == GGML_XKV_RES_DEVICE_OWNED) {
+            if (cerr) *cerr = "shift rebuild: device-owned candidate reached host rebuild path";
+            return false;
+        }
+        return llama_xkv::rebuild_candidate_landmarks_with_positions(
+            old_seg, surviving_rows, positions, specs, candidate,
+            lm_type, chunk, cerr);
+    };
+
+    // Phase 6: Hot rotation staged into isolated off-side buffers/scratch.
+    // Stage rotated hot rows off-side; live K is NOT mutated before store commit!
+    // Device-local off-side staging: Allocate dedicated device staging tensors
+    // and context holding exactly the affected hot rows on the active backend device.
+    // Queue ggml_backend_tensor_copy_async for live-row -> staging-row, synchronize once.
+    // On failure, reverse copies are queued and synchronized.
+    // No full-history D2H, no host vectors per row, no per-row syncs, and bounded by workspace.
+    struct device_row_staging {
+        ggml_tensor * k_tensor = nullptr;
+        ggml_context * staging_ctx = nullptr;
+        ggml_backend_buffer_ptr staging_buf;
+        ggml_backend_t backend = nullptr;
+        ggml_tensor * staging_tensor = nullptr; // 2D [row_elements, n_affected]
+        struct row_view_pair {
+            ggml_tensor * live_view = nullptr;
+            ggml_tensor * staging_view = nullptr;
+        };
+        std::vector<row_view_pair> view_pairs;
+
+        device_row_staging() = default;
+        ~device_row_staging() {
+            reset();
+        }
+        device_row_staging(const device_row_staging &) = delete;
+        device_row_staging & operator=(const device_row_staging &) = delete;
+        device_row_staging(device_row_staging && o) noexcept
+            : k_tensor(o.k_tensor),
+              staging_ctx(o.staging_ctx),
+              staging_buf(std::move(o.staging_buf)),
+              backend(o.backend),
+              staging_tensor(o.staging_tensor),
+              view_pairs(std::move(o.view_pairs)) {
+            o.k_tensor = nullptr;
+            o.staging_ctx = nullptr;
+            o.backend = nullptr;
+            o.staging_tensor = nullptr;
+        }
+        device_row_staging & operator=(device_row_staging && o) noexcept {
+            if (this != &o) {
+                reset();
+                k_tensor = o.k_tensor;
+                staging_ctx = o.staging_ctx;
+                staging_buf = std::move(o.staging_buf);
+                backend = o.backend;
+                staging_tensor = o.staging_tensor;
+                view_pairs = std::move(o.view_pairs);
+                o.k_tensor = nullptr;
+                o.staging_ctx = nullptr;
+                o.backend = nullptr;
+                o.staging_tensor = nullptr;
+            }
+            return *this;
+        }
+        void reset() noexcept {
+            // Rollback safety: queued async copies (live->staging preflight
+            // or staging->live reverse restore) must complete before the
+            // staging buffer is released, on every exit path including
+            // early returns and exceptions that skip the explicit rollback.
+            if (backend != nullptr) {
+                ggml_backend_synchronize(backend);
+            }
+            staging_buf.reset(); // Buffer released before context
+            if (staging_ctx != nullptr) {
+                ggml_free(staging_ctx);
+                staging_ctx = nullptr;
+            }
+            k_tensor = nullptr;
+            backend = nullptr;
+            staging_tensor = nullptr;
+            view_pairs.clear();
+        }
+    };
+    std::vector<device_row_staging> staged_layers;
+    if (need_rotate) {
+        auto * sched = lctx->get_sched();
+        if (!sched) {
+            if (err) *err = "bounded shift: scheduler is null for rotation";
+            return false;
+        }
+        staged_layers.reserve(layers.size());
+        const size_t n_affected = row_delta.size();
+        size_t total_staging_bytes = 0;
+
+        // Preflight 1: Check workspace budget for all staged layers
+        for (const auto & layer : layers) {
+            if (layer.k && layer.k->buffer) {
+                const size_t row_b = ggml_row_size(layer.k->type, layer.k->ne[0]);
+                if (n_affected > 0 && row_b > std::numeric_limits<size_t>::max() / n_affected) {
+                    if (err) *err = "bounded shift: staging bytes overflow";
+                    return false;
+                }
+                const size_t layer_staging_b = n_affected * row_b;
+                if (total_staging_bytes > std::numeric_limits<size_t>::max() - layer_staging_b) {
+                    if (err) *err = "bounded shift: total staging bytes overflow";
+                    return false;
+                }
+                total_staging_bytes += layer_staging_b;
+            }
+        }
+        llama_xkv::xkv_device_staging_reservation staging_res;
+        if (xkv_store != nullptr && total_staging_bytes > 0) {
+            std::string st_err;
+            size_t deficit = 0;
+            staging_res = xkv_store->reserve_device_staging(total_staging_bytes, &st_err, &deficit);
+            if (xkv_store->get_arena().get_capacity_bytes() > 0 && !staging_res.valid()) {
+                if (err) *err = "bounded shift: " + st_err;
+                return false;
+            }
+        }
+
+        // Preflight 2: Allocate contexts, buffers, and views; copy live -> staging
+        std::vector<ggml_backend_t> active_backends;
+        for (const auto & layer : layers) {
+            if (layer.k && layer.k->buffer) {
+                device_row_staging st;
+                st.k_tensor = layer.k;
+
+                // Obtain backend for this specific layer tensor from the scheduler
+                st.backend = ggml_backend_sched_get_tensor_backend(sched, layer.k);
+                if (!st.backend) {
+                    if (err) *err = "bounded shift: could not resolve backend for layer tensor";
+                    return false;
+                }
+                ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(layer.k->buffer);
+                if (buft && !ggml_backend_dev_supports_buft(ggml_backend_get_device(st.backend), buft)) {
+                    if (err) *err = "bounded shift: backend device does not support layer buffer type";
+                    return false;
+                }
+                if (std::find(active_backends.begin(), active_backends.end(), st.backend) == active_backends.end()) {
+                    active_backends.push_back(st.backend);
+                }
+
+                // Create allocated staging tensor and context on same buffer type
+                ggml_init_params st_params = {
+                    /* mem_size   = */ (n_affected * 2 + 8) * ggml_tensor_overhead(),
+                    /* mem_buffer = */ nullptr,
+                    /* no_alloc   = */ true,
+                };
+                st.staging_ctx = ggml_init(st_params);
+                if (!st.staging_ctx) {
+                    if (err) *err = "bounded shift: failed to init staging context";
+                    return false;
+                }
+                st.staging_tensor = ggml_new_tensor_2d(st.staging_ctx, layer.k->type, layer.k->ne[0], n_affected);
+                if (!st.staging_tensor) {
+                    if (err) *err = "bounded shift: failed to create staging tensor";
+                    return false;
+                }
+                st.staging_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(st.staging_ctx, buft));
+                if (!st.staging_buf) {
+                    if (err) *err = "bounded shift: failed to allocate staging buffer from buft";
+                    return false;
+                }
+
+                // Create views for each affected row and queue copy
+                st.view_pairs.reserve(n_affected);
+                size_t idx = 0;
+                for (const auto & rd : row_delta) {
+                    device_row_staging::row_view_pair vp;
+                    vp.live_view = ggml_view_1d(st.staging_ctx, layer.k, layer.k->ne[0],
+                        (size_t) rd.first * layer.k->nb[1]);
+                    vp.staging_view = ggml_view_1d(st.staging_ctx, st.staging_tensor, layer.k->ne[0],
+                        idx * st.staging_tensor->nb[1]);
+                    if (!vp.live_view || !vp.staging_view) {
+                        if (err) *err = "bounded shift: failed to create row views for staging";
+                        return false;
+                    }
+                    if (ggml_backend_view_init(vp.live_view) != GGML_STATUS_SUCCESS) {
+                        if (err) *err = "bounded shift: live view init failed";
+                        return false;
+                    }
+                    if (ggml_backend_view_init(vp.staging_view) != GGML_STATUS_SUCCESS) {
+                        if (err) *err = "bounded shift: staging view init failed";
+                        return false;
+                    }
+                    ggml_backend_tensor_copy_async(st.backend, st.backend, vp.live_view, vp.staging_view);
+                    st.view_pairs.push_back(vp);
+                    ++idx;
+                }
+                staged_layers.push_back(std::move(st));
+            }
+        }
+        // Single sync per active backend across all queued row copies
+        for (ggml_backend_t b : active_backends) {
+            ggml_backend_synchronize(b);
+        }
+
+        ggml_backend_sched_reset(sched);
+        auto * res = lctx->get_gf_res_reserve();
+        res->reset();
+        auto * gf = build_graph_shift(res, lctx);
+        if (gf == nullptr) {
+            LLAMA_LOG_ERROR("%s: failed to build graph for bounded K-shift\n", __func__);
+            return false;
+        }
+        if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+            LLAMA_LOG_ERROR("%s: failed to allocate compute graph for bounded K-shift\n", __func__);
+            return false;
+        }
+        res->set_inputs(nullptr);
+        if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: failed to compute bounded K-shift\n", __func__);
+            // Device-local reverse copy restore of affected hot rows without D2H
+            for (auto & st : staged_layers) {
+                for (const auto & vp : st.view_pairs) {
+                    ggml_backend_tensor_copy_async(st.backend, st.backend, vp.staging_view, vp.live_view);
+                }
+            }
+            for (ggml_backend_t b : active_backends) {
+                ggml_backend_synchronize(b);
+            }
+            return false;
+        }
+        ggml_backend_sched_synchronize(sched);
+    }
+
+    // Phase 7: Atomic COW store commit of all prepared landmark segments
+    // in one transaction with no-fail ordering. If store mutation fails,
+    // restore only the affected hot rows on device via queued reverse copy!
+    if (!rebuild_seg_ids.empty()) {
+        llama_xkv::xkv_batch_mutation bm;
+        bm.segments_to_pack = rebuild_seg_ids;
+        bm.landmark_rebuild = rebuild_fn;
+        llama_xkv::xkv_mutation_result mres;
+        if (!xkv_store->execute_mutation_transaction(bm, &mres, err)) {
+            LLAMA_LOG_ERROR("%s: failed to execute landmark batch COW mutation: %s\n",
+                __func__, err ? err->c_str() : "");
+            // Device-local reverse copy restore: live K returns to exact unshifted state without D2H
+            for (auto & st : staged_layers) {
+                for (const auto & vp : st.view_pairs) {
+                    ggml_backend_tensor_copy_async(st.backend, st.backend, vp.staging_view, vp.live_view);
+                }
+            }
+            std::vector<ggml_backend_t> synced_backends;
+            for (const auto & st : staged_layers) {
+                if (st.backend && std::find(synced_backends.begin(), synced_backends.end(), st.backend) == synced_backends.end()) {
+                    ggml_backend_synchronize(st.backend);
+                    synced_backends.push_back(st.backend);
+                }
+            }
+            return false;
+        }
+    }
+    // Phase 8: Commit metadata only after every data move and every store
+    // candidate succeeds. Hot rotation above is staged device-local with reverse-
+    // copy rollback; the landmark COW above is one atomic batch mutation that
+    // refreshes (never truncates) landmark bytes/chunks and rejects stale or
+    // zero source fingerprints. Retired versions stay readable until the last pin
+    // releases; shift deltas clear only here so any failure above stays retryable
+    // with bit-identical K/V bytes. Pool rows are unchanged (same rows, rotated bytes).
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        v_cells[s].reset_shift();
+    }
+    return true;
+}
+
 bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
     }
 
-    fp_bump();
-
     bool updated = false;
+
+    // Bounded context-shift transaction (positions-aware landmark COW +
+    // hot-only rotation, atomically under coordinator exclusion). The stock
+    // path below must never run on bounded tensors: it sizes the shift
+    // graph over logical cell counts.
+    if (do_shift && is_xkv_bounded_hot()) {
+        assert(sc_info.empty() && "bounded caches never carry cross-stream copies");
+        std::string err;
+        if (!update_shift_bounded(lctx, &err)) {
+            LLAMA_LOG_ERROR("%s: bounded shift transaction refused/failed: %s\n", __func__, err.c_str());
+            return false;
+        }
+        return true;
+    }
 
     auto * sched = lctx->get_sched();
 
@@ -1173,38 +2041,30 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
         // apply K-shift if needed
         if (hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
-            const bool has_plain_k = std::any_of(layers.begin(), layers.end(), [](const auto & layer) {
-                return !llama_kv_is_turbo(layer.k->type);
-            });
-            if (has_plain_k) {
-                ggml_backend_sched_reset(sched);
+            ggml_backend_sched_reset(sched);
 
-                auto * res = lctx->get_gf_res_reserve();
+            auto * res = lctx->get_gf_res_reserve();
 
-                res->reset();
+            res->reset();
 
-                auto * gf = build_graph_shift(res, lctx);
-                if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-                    LLAMA_LOG_ERROR("%s: failed to allocate compute graph for K-shift\n", __func__);
-                    return updated;
-                }
-
-                res->set_inputs(nullptr);
-
-                if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
-                    LLAMA_LOG_ERROR("%s: failed to compute K-shift\n", __func__);
-                    return updated;
-                }
-
-                updated = true;
+            auto * gf = build_graph_shift(res, lctx);
+            if (gf == nullptr) {
+                LLAMA_LOG_ERROR("%s: failed to build graph for K-shift\n", __func__);
+                return updated;
             }
-            if (std::any_of(layers.begin(), layers.end(), [](const auto & layer) {
-                    return llama_kv_is_turbo(layer.k->type);
-                })) {
-                llama_synchronize(lctx);
-                shift_turbo_keys(lctx->get_cparams());
-                updated = true;
+            if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+                LLAMA_LOG_ERROR("%s: failed to allocate compute graph for K-shift\n", __func__);
+                return updated;
             }
+
+            res->set_inputs(nullptr);
+
+            if (lctx->graph_compute(gf, false) != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR("%s: failed to compute K-shift\n", __func__);
+                return updated;
+            }
+
+            updated = true;
         }
 
         for (uint32_t s = 0; s < n_stream; ++s) {
@@ -1222,7 +2082,6 @@ void llama_kv_cache::compact() {
     if (other) {
         return;
     }
-
     auto planned_cells = v_cells;
     if (!compact_planned(planned_cells)) {
         throw std::runtime_error("KV native compaction is unsupported by this backend/layout");
@@ -1232,17 +2091,37 @@ void llama_kv_cache::compact() {
 bool llama_kv_cache::compact_planned(llama_kv_cells_vec & planned_cells) {
     fp_bump();
 
-    auto heads = v_heads;
-    std::map<ggml_backend_buffer_t, std::vector<ggml_backend_tensor_memmove_region>> buffer_moves;
+    // In XKV dense/SR mode with bounded hot cache, logical cells are packed semantically,
+    // while physical hot tensors are not moved or rebound.
+    if (is_xkv_bounded_hot()) {
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            auto & cells = v_cells[s];
+            auto & head  = v_heads[s];
+            const auto plan = cells.make_pack_plan();
+            if (plan.moves.empty()) {
+                continue;
+            }
+            cells.apply_pack(plan);
+            head = plan.retained_count;
+            // NOTE: deliberately no store notification here. kv_pack_plan
+            // carries LOGICAL cell indices, which the store would misread as
+            // hot-pool physical rows (xkv_location.row), corrupting bindings
+            // and epochs. Payload IDs travel with the cells (apply_pack
+            // preserves pid/gen/pos/ext/shift/seq/rerot); the store locator
+            // (pool row or segment row) is untouched, so no epoch moves.
+            // Factored row packing happens via the store mutation
+            // transaction, never cell compact.
+        }
+        return true;
+    }
 
     for (uint32_t s = 0; s < n_stream; ++s) {
         auto & cells = planned_cells[s];
-        auto & head  = heads[s];
+        auto & head  = v_heads[s];
 
         const auto plan = cells.make_pack_plan();
 
         if (plan.moves.empty()) {
-            head = 0;
             continue;
         }
 
@@ -1255,7 +2134,6 @@ bool llama_kv_cache::compact_planned(llama_kv_cells_vec & planned_cells) {
             }
         }
         if (!needs_compaction) {
-            head = plan.retained_count;
             continue;
         }
 
@@ -1266,6 +2144,8 @@ bool llama_kv_cache::compact_planned(llama_kv_cells_vec & planned_cells) {
         // ranges are safe without CPU staging. We preflight every buffer before
         // executing any data movement; only after every buffer succeeds do we
         // commit cell metadata.
+        std::map<ggml_backend_buffer_t, std::vector<ggml_backend_tensor_memmove_region>> buffer_moves;
+
         auto add_row_move = [&](ggml_tensor * tensor, const auto & move) {
             const size_t row_bytes  = ggml_row_size(tensor->type, tensor->ne[0]);
             const size_t row_stride = tensor->nb[1];
@@ -1350,26 +2230,24 @@ bool llama_kv_cache::compact_planned(llama_kv_cells_vec & planned_cells) {
             }
         }
 
-        // This is still a private plan. Finish every allocation and preflight
-        // across ALL streams/backing buffers before moving any live K/V.
+        for (const auto & [buffer, moves] : buffer_moves) {
+            if (!ggml_backend_tensor_memmove_regions_supported(moves.data(), moves.size())) {
+                return false;
+            }
+        }
+
+        for (const auto & [buffer, moves] : buffer_moves) {
+            GGML_UNUSED(buffer);
+            if (!ggml_backend_tensor_memmove_regions(moves.data(), moves.size())) {
+                throw std::runtime_error("TriAttention native compaction failed after successful preflight");
+            }
+        }
+
+        // Apply metadata changes after all K/V data is moved
         cells.apply_pack(plan);
         head = plan.retained_count;
     }
-
-    for (const auto & [buffer, moves] : buffer_moves) {
-        GGML_UNUSED(buffer);
-        if (!ggml_backend_tensor_memmove_regions_supported(moves.data(), moves.size())) {
-            return false;
-        }
-    }
-    for (const auto & [buffer, moves] : buffer_moves) {
-        GGML_UNUSED(buffer);
-        if (!ggml_backend_tensor_memmove_regions(moves.data(), moves.size())) {
-            throw std::runtime_error("KV native compaction failed after successful preflight");
-        }
-    }
     v_cells = std::move(planned_cells);
-    v_heads = std::move(heads);
     return true;
 }
 
@@ -1393,8 +2271,6 @@ void llama_kv_cache::init_triattention(
     cfg.normalize_scores = true;
     cfg.disable_mlr = false;
     cfg.disable_trig = false;
-    cfg.k_hadamard = attn_rot_k_nrot;
-    cfg.uncalibrated_draft_recency = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
 
     const uint32_t head_dim = n_embd_head_k_all > 0 ? (uint32_t) n_embd_head_k_all : hparams.n_embd_head_k(0);
     const uint32_t n_kv_heads = hparams.n_head_kv(0);
@@ -1485,16 +2361,6 @@ void llama_kv_cache::init_triattention(
         tri_scorer.reset();
         throw std::runtime_error(std::string("failed to initialize TriAttention scorer from: ") + stats_path);
     }
-    std::vector<int32_t> layer_map;
-    for (const auto & layer : layers) {
-        layer_map.push_back((int32_t) layer.il);
-    }
-    if (!tri_scorer->matches_layers(layer_map.data(), (uint32_t) layer_map.size())) {
-        if (!cfg.uncalibrated_draft_recency) {
-            throw std::runtime_error("TriAttention calibration covers none of this context's KV layers");
-        }
-        LLAMA_LOG_WARN("%s: nextn draft has no matching calibration; using explicit recent-KV retention on draft only (target still uses TriAttention)\n", __func__);
-    }
 }
 
 llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_reclaim_request & request) {
@@ -1505,8 +2371,6 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
     if (other) {
         return other->reclaim_kv(request);
     }
-
-    fp_bump();
 
     if (!tri_scorer || !tri_scorer->valid()) {
         result.supported = false;
@@ -1519,10 +2383,11 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
         return result;
     }
 
-    // Evictions are planned against a copy. A rejected pack, invalid scorer,
-    // or allocation failure must not partially delete live sequence refs.
-    auto planned_cells = v_cells;
-    result.physical_before = get_kv_used();
+    // Unified KV: all sequences share stream 0
+    auto & cells = v_cells[0];
+
+    // physical_before must be hot bound before planning, not initial cells.get_used()
+    result.physical_before = (xkv_store && xkv_hot_pool) ? xkv_hot_pool->get_bound() : get_kv_used();
     if (result.physical_before == 0) {
         result.physical_after = 0;
         result.physical_freed = 0;
@@ -1531,11 +2396,331 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
         return result;
     }
 
+    // XKV active branch: delegate lossy reclaim to XKV TriAttention adapter across HOT+FACTORED payloads
+    if (xkv_store) {
+        const auto * cal = tri_scorer->get_calibration();
+        const float * omega = tri_scorer->get_omega();
+        const float * fsq = tri_scorer->get_freq_scale_sq();
+        if (cal && omega && fsq) {
+            llama_xkv::xkv_tri_config cfg;
+            cfg.ratio = tri_ratio;
+            cfg.recent_window = tri_recent_window;
+            llama_xkv::xkv_tri_adapter adapter(*cal, omega, fsq, cfg);
+
+            // Build layer slices from attention layers
+            const uint32_t eff_head_dim_k = n_embd_head_k_all > 0 ? (uint32_t)n_embd_head_k_all : hparams.n_embd_head_k(0);
+            const uint32_t eff_head_dim_v = n_embd_head_v_all > 0 ? (uint32_t)n_embd_head_v_all : hparams.n_embd_head_v(0);
+            std::vector<llama_xkv::xkv_layer_slice> slices;
+            slices.reserve(layers.size());
+            for (size_t l = 0; l < layers.size(); ++l) {
+                llama_xkv::xkv_layer_slice sl;
+                sl.model_layer = (uint32_t)layers[l].il;
+                sl.owning_layer = xkv_store->resolve_owning_layer(sl.model_layer);
+                sl.head_dim = eff_head_dim_k;
+                sl.rotary_dim = hparams.n_rot(layers[l].il);
+                sl.n_kv_heads = (uint32_t)hparams.n_head_kv(layers[l].il);
+                sl.feature_dim_k = sl.n_kv_heads * sl.head_dim;
+                sl.feature_dim_v = sl.n_kv_heads * eff_head_dim_v;
+                sl.rope_style = 0; // MUST be 0 (half/NeoX pairing; IMRoPE pairing is also NeoX half)
+                slices.push_back(sl);
+            }
+
+            llama_xkv::xkv_tri_pressure_hooks hooks;
+            hooks.hot_span_provider = [this, eff_head_dim_k, omega, fsq](uint32_t ml, uint32_t kv_h, const uint32_t * cell_idxs, size_t n, float * dst, size_t dst_cap) -> bool {
+                for (size_t l = 0; l < this->layers.size(); ++l) {
+                    if ((uint32_t)this->layers[l].il == ml) {
+                        ggml_tensor * k_ten = this->layers[l].k;
+                        if (!k_ten) return false;
+
+                        // Resolve physical rows and storage positions from store hot locations
+                        std::vector<uint32_t> phys_rows(n);
+                        std::vector<int32_t> pos_buf(n);
+                        for (size_t ci = 0; ci < n; ++ci) {
+                            uint32_t cell_i = cell_idxs[ci];
+                            uint64_t pid = this->v_cells[0].payload_id_get(cell_i);
+                            if (pid == 0) return false; // missing payload: fail closed
+                            llama_xkv::xkv_location loc;
+                            if (!this->xkv_store->find_location(pid, loc) || loc.kind != llama_xkv::xkv_location_kind::hot) {
+                                return false; // missing location or not hot: fail closed, never fall back to cell_i!
+                            }
+                            phys_rows[ci] = loc.row;
+                            pos_buf[ci] = (int32_t)this->v_cells[0].pos_get(cell_i);
+                        }
+
+                        // Safe bulk readback using xkv_backend_hot_readback_batch: queued async gets + one sync
+                        ggml_backend_buffer_type_t buft_k = k_ten->buffer ? ggml_backend_buffer_get_type(k_ten->buffer) : nullptr;
+                        ggml_backend_t backend_k = nullptr;
+                        if (buft_k) {
+                            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft_k);
+                            if (dev) backend_k = ggml_backend_dev_init(dev, nullptr);
+                        }
+
+                        const size_t row_bytes = ggml_row_size(k_ten->type, k_ten->ne[0]);
+                        const size_t head_offset = ggml_row_size(k_ten->type, (uint64_t)kv_h * eff_head_dim_k);
+
+                        llama_xkv::xkv_backend_hot_readback_request hreq;
+                        hreq.hot_tensor = k_ten;
+                        hreq.hot_capacity = (uint32_t)k_ten->ne[1];
+                        hreq.row_stride_bytes = row_bytes;
+                        hreq.physical_slots = phys_rows.data();
+                        hreq.n_slots = (uint32_t)n;
+
+                        llama_xkv::xkv_backend_hot_readback_result hres;
+                        std::string rerr;
+                        if (!llama_xkv::xkv_backend_hot_readback_batch(backend_k, hreq, hres, &rerr)) {
+                            return false;
+                        }
+
+                        for (size_t ci = 0; ci < n; ++ci) {
+                            const uint8_t * src_row = hres.bytes.data() + ci * row_bytes;
+                            const uint8_t * src_head = src_row + head_offset;
+                            float * dst_head = dst + ci * eff_head_dim_k;
+                            if (k_ten->type == GGML_TYPE_F32) {
+                                std::memcpy(dst_head, src_head, eff_head_dim_k * sizeof(float));
+                            } else {
+                                const auto * traits = ggml_get_type_traits(k_ten->type);
+                                if (traits && traits->to_float) {
+                                    traits->to_float(src_head, dst_head, eff_head_dim_k);
+                                } else {
+                                    return false; // unsupported type: fail closed
+                                }
+                            }
+                        }
+
+                        // Inverse attention rotation (WHT) for Turbo types
+                        const bool k_is_turbo = k_ten->type == GGML_TYPE_TURBO2_0 ||
+                                                k_ten->type == GGML_TYPE_TURBO3_0 ||
+                                                k_ten->type == GGML_TYPE_TURBO4_0;
+                        if (k_is_turbo) {
+                            for (size_t ci = 0; ci < n; ++ci) {
+                                float * row_ptr = dst + ci * eff_head_dim_k;
+                                for (uint32_t g = 0; g < eff_head_dim_k; g += 128) {
+                                    const uint32_t cur_g = std::min<uint32_t>(128, eff_head_dim_k - g);
+                                    if (cur_g == 128) {
+                                        ggml_turbo_wht_inverse_row(row_ptr + g, 128);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Inverse partial RoPE with exact frequencies and scaling tables
+                        const uint32_t rotary_dim = this->hparams.n_rot(this->layers[l].il);
+                        const uint32_t freq_count = rotary_dim / 2;
+                        // Carve post_rope scratch from arena to avoid heap allocation
+                        auto lease_pr = this->xkv_store->acquire_workspace_lease(n * eff_head_dim_k * sizeof(float));
+                        float * pr_buf = lease_pr ? lease_pr.as<float>() : nullptr;
+                        std::vector<float> fallback_pr;
+                        if (!pr_buf) {
+                            fallback_pr.resize(n * eff_head_dim_k);
+                            pr_buf = fallback_pr.data();
+                        }
+                        std::memcpy(pr_buf, dst, n * eff_head_dim_k * sizeof(float));
+
+                        triattention_invert_rope(
+                            dst,
+                            pr_buf,
+                            pos_buf.data(),
+                            omega,
+                            fsq,
+                            (uint32_t)n,
+                            eff_head_dim_k,
+                            rotary_dim,
+                            freq_count,
+                            0 // half/NeoX pairing
+                        );
+
+                        return true;
+                    }
+                }
+                return false;
+            };
+            // Device-owned selected K fetch using BackendResidency native reconstruct
+            hooks.selected_k_fetch = [this, eff_head_dim_k, &adapter](
+                uint64_t seg_id,
+                uint64_t seg_ver,
+                const uint32_t * srows,
+                uint32_t rn,
+                const llama_xkv::xkv_layer_slice & sl,
+                uint32_t kv_h,
+                float * dst,
+                size_t dst_cap,
+                std::string * err
+            ) -> bool {
+                if (rn == 0) return true;
+                if (!dst) {
+                    if (err) *err = "fetch: null destination pointer";
+                    return false;
+                }
+                uint64_t req_elems = 0;
+                if (__builtin_mul_overflow((uint64_t)rn, (uint64_t)eff_head_dim_k, &req_elems) ||
+                    req_elems > (uint64_t)std::numeric_limits<size_t>::max() ||
+                    dst_cap < (size_t)req_elems) {
+                    if (err) *err = "fetch: destination capacity too small";
+                    return false;
+                }
+                auto seg = seg_ver > 0 ? this->xkv_store->get_segment_version(seg_id, seg_ver)
+                                       : this->xkv_store->get_segment(seg_id);
+                if (!seg) {
+                    if (err) *err = "fetch: segment not found";
+                    return false;
+                }
+                const auto * g = seg->find_group_for_layer(sl.owning_layer);
+                if (!g) {
+                    if (err) *err = "fetch: group not found for layer";
+                    return false;
+                }
+
+                // Dispatch by segment residency
+                if (seg->residency == GGML_XKV_RES_DEVICE_OWNED) {
+                    // DEVICE_OWNED must call BackendResidency native bounded reconstruct/fetch
+                    if (!seg->backend_bundle) {
+                        if (err) *err = "fetch: DEVICE_OWNED segment missing backend bundle";
+                        return false;
+                    }
+                    // Validate exact group and match backend handles by group/layer identity
+                    const auto * fg = seg->find_group_for_layer(sl.owning_layer);
+                    if (!fg) {
+                        if (err) *err = "fetch: exact group not found for layer";
+                        return false;
+                    }
+                    llama_xkv::xkv_backend_tri_fetch_handles b_handles;
+                    const uint64_t fp_ak = fg->a_k.desc.fingerprint();
+                    const uint64_t fp_bk = fg->b_k ? fg->b_k->desc.fingerprint() : 0;
+                    const uint64_t fp_av = fg->a_v.desc.fingerprint();
+                    const uint64_t fp_bv = fg->b_v ? fg->b_v->desc.fingerprint() : 0;
+                    for (const auto & h : seg->backend_bundle->handles) {
+                        if (!h) continue;
+                        const uint64_t h_fp = h->get_descriptor_fingerprint();
+                        if (h_fp == fp_ak) b_handles.a_k = h;
+                        else if (h_fp == fp_bk) b_handles.b_k = h;
+                        else if (h_fp == fp_av) b_handles.a_v = h;
+                        else if (h_fp == fp_bv) b_handles.b_v = h;
+                    }
+                    if (!b_handles.a_k || !b_handles.b_k) {
+                        if (err) *err = "fetch: DEVICE_OWNED segment missing required a_k or b_k backend handle for group " + std::to_string(fg->group_index);
+                        return false;
+                    }
+
+                    // Borrow owning backend from buffer without creating/leaking new backend instance
+                    ggml_backend_t dev_be = nullptr;
+                    ggml_backend_buffer_type_t buft = b_handles.a_k->get_owning_buft();
+                    if (buft) {
+                        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                        if (dev) dev_be = ggml_backend_dev_init(dev, nullptr);
+                    }
+                    return llama_xkv::xkv_backend_tri_fetch_selected_k(
+                        dev_be, b_handles, srows, rn, eff_head_dim_k, kv_h,
+                        sl.n_kv_heads, sl.feature_offset_k, sl.feature_dim_k,
+                        dst, dst_cap, err);
+                }
+
+                // REFERENCE_HOST: dispatch host reconstruct stream_factored_k_head
+                try {
+                    adapter.stream_factored_k_head(*seg, sl, kv_h, srows, rn, dst, dst_cap,
+                                                   32);
+                    return true;
+                } catch (const std::exception & e) {
+                    if (err) *err = std::string("fetch failed: ") + e.what();
+                    return false;
+                }
+            };
+            hooks.arena = &xkv_store->get_arena();
+
+            const int64_t t0 = ggml_time_us();
+            // Generic required_free represents physical hot/KV slots deficit in XKV reclaim_kv
+            auto prop = adapter.plan_pressure(cells, request, slices, *xkv_store, false, hooks,
+                                              llama_xkv::xkv_tri_pressure_resource::hot_slots);
+            const auto decision = adapter.decide(prop);
+
+            if (decision == llama_xkv::xkv_tri_pressure_decision::reclaimed) {
+                // Collect hot removals (pid, generation, slot) to release xkv_hot_slot_pool atomically
+                std::vector<uint64_t> hot_pids;
+                std::vector<uint64_t> hot_gens;
+                std::vector<uint32_t> hot_slots;
+                for (size_t i = 0; i < prop.released_hot_payloads.size(); ++i) {
+                    uint64_t pid = prop.released_hot_payloads[i];
+                    uint32_t slot = prop.released_hot_rows[i];
+                    llama_xkv::xkv_location loc;
+                    if (xkv_store->find_location(pid, loc)) {
+                        hot_pids.push_back(pid);
+                        hot_gens.push_back(loc.storage_generation);
+                        hot_slots.push_back(slot);
+                    }
+                }
+
+                // Set batch.removal_precommit using make_pool_removal_gate
+                prop.store_proposal.batch.removal_precommit = make_pool_removal_gate(hot_pids, hot_gens, hot_slots);
+
+                // Preflight hot pool release atomically BEFORE mutating store
+                if (xkv_hot_pool && !hot_pids.empty()) {
+                    std::string can_err;
+                    if (!xkv_hot_pool->can_release_batch(hot_pids.data(), hot_gens.data(), hot_slots.data(), hot_pids.size(), &can_err)) {
+                        result.supported = true;
+                        result.changed = false;
+                        result.capacity_satisfied = false;
+                        result.floor_reached = false;
+                        return result;
+                    }
+                }
+
+                const uint32_t hot_bound_before = xkv_hot_pool ? xkv_hot_pool->get_bound() : 0;
+                std::string apply_err;
+                if (prop.store_proposal.apply(*xkv_store, nullptr, &apply_err)) {
+                    // Apply reference removals to cells
+                    for (const auto & rem : prop.plan.ref_removals) {
+                        if (cells.seq_has(rem.cell_index, rem.seq_id)) {
+                            cells.seq_rm(rem.cell_index, rem.seq_id);
+                        }
+                    }
+                    compact();
+                    const uint32_t hot_bound_after = xkv_hot_pool ? xkv_hot_pool->get_bound() : 0;
+                    const uint32_t hot_freed = (hot_bound_before > hot_bound_after) ? (hot_bound_before - hot_bound_after) : prop.hot_slots_freed;
+                    auto r = adapter.result_from_proposal(prop, request, result.physical_before);
+                    r.physical_after = hot_bound_after; // Map actual resource usage, not semantic cells
+                    r.physical_freed = hot_freed; // Factored-only removals count 0 hot slots toward physical_freed
+                    r.capacity_satisfied = (hot_freed >= request.required_free);
+                    r.score_us = (uint64_t)std::max<int64_t>(0, ggml_time_us() - t0);
+                    return r;
+                }
+                // Store apply failure: return explicit failure, NEVER fall through to legacy
+                result.supported = true;
+                result.changed = false;
+                result.capacity_satisfied = false;
+                result.floor_reached = false;
+                return result;
+            } else if (decision == llama_xkv::xkv_tri_pressure_decision::floor_exhausted_victim) {
+                auto r = adapter.result_from_proposal(prop, request, result.physical_before);
+                r.floor_reached = true;
+                return r;
+            } else if (decision == llama_xkv::xkv_tri_pressure_decision::bypass_recurrent_only) {
+                result.supported = true;
+                result.changed = false;
+                result.capacity_satisfied = false;
+                result.floor_reached = false;
+                return result;
+            } else {
+                // Any other decision (error, retry_stale): fail closed explicitly, never fall through to legacy scorer!
+                result.supported = true;
+                result.changed = false;
+                result.capacity_satisfied = false;
+                result.floor_reached = (decision == llama_xkv::xkv_tri_pressure_decision::floor_exhausted_victim);
+                return result;
+            }
+        }
+        // XKV active but scorer initialization failed: fail closed
+        result.supported = false;
+        return result;
+    }
+
+    // Legacy branch for XKV OFF / fallback
+    auto planned_cells = v_cells;
+
     // Build K tensor array and layer_map for score_combined()
     const uint32_t n_kv_layers = (uint32_t) layers.size();
     std::vector<ggml_tensor *> k_tensors(n_kv_layers);
     std::vector<int32_t> layer_map(n_kv_layers);
     for (uint32_t l = 0; l < n_kv_layers; l++) {
+        k_tensors[l] = layers[l].k;
         layer_map[l] = (int32_t) layers[l].il;
     }
 
@@ -1605,9 +2790,9 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
                 rerot_meta.active() &&
                 rerot_meta.visibility == llama_rerot_visibility::pending_record;
             const bool semantic_foreign_tag =
+                hint.semantic_episode_id != 0 &&
                 rerot_meta.active() &&
-                (hint.semantic_episode_id == 0 ||
-                 rerot_meta.episode_id != hint.semantic_episode_id ||
+                (rerot_meta.episode_id != hint.semantic_episode_id ||
                  rerot_meta.visibility != llama_rerot_visibility::public_live);
             bool semantic_reader_tail = false;
             if (hint.semantic_episode_id != 0) {
@@ -1647,29 +2832,23 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
         // How many candidates to keep
         const uint32_t candidates_to_keep = (target_retention > n_protected) ? std::min(target_retention - n_protected, n_candidates) : 0;
 
-        // Hard guards can already consume the entire target (notably the
-        // 128-token recent floor). Then every candidate is evicted regardless
-        // of its score: avoid GPU readback, dequantization and scoring, without
-        // changing either the retained set or the reference-removal order.
-        std::vector<float> scores;
-        if (candidates_to_keep > 0) {
-            scores.resize(n_candidates);
-            const int64_t t_score_start = ggml_time_us();
-            tri_scorer->score_combined(
-                scores.data(),
-                k_tensors.data(),
-                n_kv_layers,
-                layer_map.data(),
-                cand_indices.data(),
-                cand_positions.data(),
-                n_candidates,
-                (int64_t) max_pos);
-            std::vector<float> pooled_scores(n_candidates);
-            triattention_max_pool_scores(
-                pooled_scores.data(), scores.data(), cand_positions.data(), n_candidates, 2);
-            scores.swap(pooled_scores);
-            result.score_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_score_start);
-        }
+        // Score candidates
+        std::vector<float> scores(n_candidates);
+        const int64_t t_score_start = ggml_time_us();
+        tri_scorer->score_combined(
+            scores.data(),
+            k_tensors.data(),
+            n_kv_layers,
+            layer_map.data(),
+            cand_indices.data(),
+            cand_positions.data(),
+            n_candidates,
+            (int64_t) max_pos);
+        std::vector<float> pooled_scores(n_candidates);
+        triattention_max_pool_scores(
+            pooled_scores.data(), scores.data(), cand_positions.data(), n_candidates, 2);
+        scores.swap(pooled_scores);
+        result.score_us += (uint64_t) std::max<int64_t>(0, ggml_time_us() - t_score_start);
 
         // Select top candidates to keep (highest score first)
         std::vector<uint32_t> order(n_candidates);
@@ -1691,10 +2870,6 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
                 const uint32_t cand_idx = order[k];
                 const uint32_t cell_i   = cand_indices[cand_idx];
 
-                if (cells.is_empty(cell_i)) {
-                    continue;
-                }
-
                 const auto rerot_meta = cells.rerot_get(cell_i);
                 const bool semantic_cell =
                     hint.semantic_episode_id != 0 &&
@@ -1706,17 +2881,11 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
                     // cell regardless of archive/exec bookkeeping refs. Remove
                     // only this episode's refs; another outer completion may
                     // legally retain the same physical base-prefix cell.
-                    bool removed_any = false;
                     for (const llama_seq_id ref : hint.semantic_seq_ids) {
                         if (!cells.is_empty(cell_i) && cells.seq_has(cell_i, ref)) {
                             cells.seq_rm(cell_i, ref);
                             result.references_removed++;
-                            removed_any = true;
                         }
-                    }
-                    if (!removed_any && !cells.is_empty(cell_i) && cells.seq_has(cell_i, seq_id)) {
-                        cells.seq_rm(cell_i, seq_id);
-                        result.references_removed++;
                     }
                 } else {
                     if (!cells.is_empty(cell_i) && cells.seq_has(cell_i, seq_id)) {
@@ -1731,19 +2900,12 @@ llama_memory_kv_reclaim_result llama_kv_cache::reclaim_kv(const llama_memory_kv_
     // Report the final physical shared set, not the number of intermediate
     // seq_rm() calls that happened to leave a cell referenced. This makes the
     // metric directly describe the union that must remain resident.
-    for (const auto & cells : planned_cells) {
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.is_empty(i) && cells.seq_count(i) > 1) {
-                result.shared_keep++;
-            }
+    for (const auto & cells_s : planned_cells) {
+      for (uint32_t i = 0; i < cells_s.size(); ++i) {
+        if (!cells_s.is_empty(i) && cells_s.seq_count(i) > 1) {
+            result.shared_keep++;
         }
-    }
-
-    if (result.references_removed == 0) {
-        result.physical_after = result.physical_before;
-        result.capacity_satisfied = request.required_free == 0;
-        result.floor_reached = true;
-        return result;
+      }
     }
 
     // Pack remaining used cells to [0, retained_count)
@@ -1885,6 +3047,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         /*.s1   =*/ 0,
         /*.strm =*/ { },
         /*.idxs =*/ { },
+        /*.hot_idxs =*/ { },
     };
 
     res.resize(n_seqs);
@@ -2001,13 +3164,532 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
-void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+bool llama_kv_cache::collect_overwrite_victims(const slot_info & sinfo, xkv_overwrite_victims & out,
+                                                std::string * err) {
+    out.items.clear();
+    if (other) {
+        return true;
+    }
+    if (!xkv_hot_pool && !xkv_store) {
+        return true;
+    }
+    std::vector<uint64_t> seen_pids;
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const auto & cells = v_cells[sinfo.strm[s]];
+        for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+            const uint32_t idx = sinfo.idxs[s][ii];
+            if (cells.is_empty(idx)) {
+                continue;
+            }
+            const uint64_t pid = cells.payload_id_get(idx);
+            if (pid == 0) {
+                continue;
+            }
+            for (uint64_t seen : seen_pids) {
+                if (seen == pid) {
+                    if (err) *err = "collect_overwrite_victims: duplicate payload_id " + std::to_string(pid) +
+                                    " across victim cells (cross-cell sharing is not overwritable)";
+                    out.items.clear();
+                    return false;
+                }
+            }
+            seen_pids.push_back(pid);
+            xkv_victim_snapshot snap;
+            snap.stream = sinfo.strm[s];
+            snap.cell   = idx;
+            snap.pos    = cells.pos_get(idx);
+            snap.ext    = cells.ext_get(idx);
+            snap.shift  = cells.get_shift(idx);
+            snap.seqs   = cells.seq_snapshot(idx);
+            snap.rerot  = cells.rerot_get(idx);
+            snap.pid    = pid;
+            snap.gen    = cells.storage_generation_get(idx);
+            if (snap.seqs.count() != 1) {
+                if (err) *err = "collect_overwrite_victims: victim cell is shared across sequences; "
+                                "overwriting it would destroy co-refs (fail closed, zero mutation)";
+                out.items.clear();
+                return false;
+            }
+            // Presence-gated alignment: untracked residue (e.g. dry-run cells
+            // never registered in store/pool) is overwritten freely.
+            if (xkv_hot_pool) {
+                llama_xkv::xkv_hot_slot_info hinfo;
+                if (xkv_hot_pool->find_payload(pid, hinfo)) {
+                    if (hinfo.storage_generation != snap.gen) {
+                        if (err) *err = "collect_overwrite_victims: hot generation mismatch for payload " +
+                                        std::to_string(pid);
+                        out.items.clear();
+                        return false;
+                    }
+                    snap.in_pool = true;
+                    snap.hot_row = hinfo.slot;
+                }
+            }
+            if (xkv_store) {
+                llama_xkv::xkv_location loc;
+                if (xkv_store->find_location(pid, loc)) {
+                    if (loc.storage_generation != snap.gen) {
+                        if (err) *err = "collect_overwrite_victims: store generation mismatch for payload " +
+                                        std::to_string(pid);
+                        out.items.clear();
+                        return false;
+                    }
+                    if (loc.state == llama_xkv::xkv_state::seal_candidate && loc.seal_tx_nonce != 0) {
+                        if (err) *err = "collect_overwrite_victims: payload " + std::to_string(pid) +
+                                        " is locked in an active seal transaction";
+                        out.items.clear();
+                        return false;
+                    }
+                    snap.in_store = true;
+                    snap.store_state = loc.state;
+                }
+            }
+            out.items.push_back(snap);
+        }
+    }
+    // Bounded-SR landmark rebuild BEFORE any mutation: the runtime owns
+    // positions-aware summary repair; false fails closed with zero mutation.
+    if (!out.items.empty()) {
+        xkv_removal_cells hook_cells;
+        for (const auto & snap : out.items) {
+            hook_cells.emplace_back(snap.stream, snap.cell);
+        }
+        if (!run_removal_rebuild_hook(hook_cells, err)) {
+            out.items.clear();
+            return false;
+        }
+    }
+    // Cross-subsystem preflight with zero mutation: no subsystem may mutate
+    // if another would fail. Both validators are read-only.
+    std::vector<uint64_t> hot_pids;
+    std::vector<uint64_t> hot_gens;
+    std::vector<uint32_t> hot_slots;
+    for (const auto & snap : out.items) {
+        if (snap.in_pool) {
+            hot_pids.push_back(snap.pid);
+            hot_gens.push_back(snap.gen);
+            hot_slots.push_back(snap.hot_row);
+        }
+    }
+    if (!hot_pids.empty()) {
+        if (!xkv_hot_pool->can_release_batch(hot_pids.data(), hot_gens.data(), hot_slots.data(),
+                                              hot_pids.size(), err)) {
+            out.items.clear();
+            return false;
+        }
+    }
+    return true;
+}
+
+bool llama_kv_cache::release_collected_victims(const xkv_overwrite_victims & victims, std::string * err) {
+    std::vector<uint64_t> hot_pids;
+    std::vector<uint64_t> hot_gens;
+    std::vector<uint32_t> hot_slots;
+    std::vector<uint64_t> store_pids;
+    std::vector<uint64_t> store_gens;
+    for (const auto & snap : victims.items) {
+        if (snap.in_pool) {
+            hot_pids.push_back(snap.pid);
+            hot_gens.push_back(snap.gen);
+            hot_slots.push_back(snap.hot_row);
+        }
+        if (snap.in_store) {
+            store_pids.push_back(snap.pid);
+            store_gens.push_back(snap.gen);
+        }
+    }
+    // Gate protocol (same guarantees as execute_removal_release): the store
+    // fires our pool gate under its lock and commits allocation-free after
+    // gate-true. Any false leaves store, pool, cells and epochs
+    // bit-identical; the caller releases nothing further on false.
+    auto gate = make_pool_removal_gate(hot_pids, hot_gens, hot_slots);
+    if (xkv_store) {
+        if (!xkv_store->remove_payloads(store_pids, store_gens, nullptr, err,
+                                         nullptr, nullptr, gate)) {
+            return false;
+        }
+        return true;
+    }
+    if (!hot_pids.empty()) {
+        if (!xkv_hot_pool || !xkv_hot_pool->release_batch(hot_pids.data(), hot_gens.data(),
+                                                           hot_slots.data(), hot_pids.size(), err)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void llama_kv_cache::verify_bound_hot_rows(const std::vector<xkv_applied_entry> & entries) {
+    // Per-row finiteness probe over committed hot storage. Covers F32/F16
+    // directly and any other codec via type traits (e.g. Q8_0 boundary
+    // layers); turbo rows need canonical decode and are noted once.
+    auto row_finite = [](ggml_tensor * t, uint32_t slot, const char * tag, int il, uint32_t cell, uint64_t pid) {
+        if (!t || !t->data) return;
+        const uint32_t n = (uint32_t) t->ne[0];
+        const uint8_t * base = (const uint8_t *) t->data + (size_t) slot * (size_t) t->nb[1];
+        std::vector<float> owned;
+        const float * row = nullptr;
+        if (t->type == GGML_TYPE_F32) {
+            row = (const float *) base;
+        } else if (t->type == GGML_TYPE_F16) {
+            owned.resize(n);
+            for (uint32_t d = 0; d < n; ++d) owned[d] = ggml_fp16_to_fp32(((const ggml_fp16_t *) base)[d]);
+            row = owned.data();
+        } else if (t->type == GGML_TYPE_TURBO2_0 || t->type == GGML_TYPE_TURBO3_0 || t->type == GGML_TYPE_TURBO4_0) {
+            static bool noted = false;
+            if (!noted) {
+                noted = true;
+                LLAMA_LOG_WARN("[llama_kv_cache] verify_bound_hot_rows: turbo %s rows unchecked (need canonical decode)\n", tag);
+            }
+            return;
+        } else {
+            const ggml_type_traits * traits = ggml_get_type_traits(t->type);
+            const int64_t blck = ggml_blck_size(t->type);
+            if (!traits || !traits->to_float || blck <= 0 || n % (uint32_t) blck != 0) return;
+            owned.resize(n);
+            traits->to_float(base, owned.data(), n);
+            row = owned.data();
+        }
+        uint32_t bad = 0, first = 0;
+        for (uint32_t d = 0; d < n; ++d) {
+            if (!std::isfinite(row[d])) { if (bad == 0) first = d; ++bad; }
+        }
+        if (bad > 0) {
+            LLAMA_LOG_ERROR("[llama_kv_cache] postcompute: non-finite %s at layer %d, hot_slot %u (cell %u): %u/%u elems, first elem %u: %f (pid %llu type %s)\n",
+                tag, il, slot, cell, bad, n, first, row[first], (unsigned long long) pid, ggml_type_name(t->type));
+        }
+    };
+    for (const auto & e : entries) {
+        if (!e.has_hot) continue;
+        for (const auto & layer : layers) {
+            // K + V discriminator: Vcur has no norm/rope/rot, so V NaN + K
+            // NaN => shared hidden/embedding fault at this layer's input;
+            // V finite + K NaN => K-path only (wk, attn_k_norm, RoPE, k_rot).
+            row_finite(layer.k, e.hot_slot, "K", layer.il, e.cell, e.pid);
+            row_finite(layer.v, e.hot_slot, "V", layer.il, e.cell, e.pid);
+        }
+    }
+}
+void llama_kv_cache::set_removal_rebuild_hook(xkv_removal_rebuild_fn fn) {
+    removal_rebuild = std::move(fn);
+}
+
+bool llama_kv_cache::run_removal_rebuild_hook(const xkv_removal_cells & cells, std::string * err) {
+    if (!removal_rebuild || cells.empty()) {
+        return true;
+    }
+    return removal_rebuild(cells, err);
+}
+
+void llama_kv_cache::restore_victim_cells(const xkv_overwrite_victims & victims) {
+    // Victim pool/store entries are still bound on every path that calls this
+    // (release is deferred to postcompute_success), so only cells need repair.
+    if (other) {
+        return;
+    }
+    for (const auto & snap : victims.items) {
+        auto & cells = v_cells[snap.stream];
+        if (!cells.is_empty(snap.cell)) {
+            cells.rm(snap.cell);
+        }
+        cells.pos_set(snap.cell, snap.pos);
+        cells.payload_id_set(snap.cell, snap.pid, snap.gen);
+        cells.seq_restore(snap.cell, snap.seqs);
+        cells.ext_set(snap.cell, snap.ext);
+        if (snap.shift != 0) {
+            cells.pos_add(snap.cell, snap.shift);
+        }
+        cells.rerot_set(snap.cell, snap.rerot);
+    }
+}
+
+// Remove new store entries and drop new cells for applied entries
+// [base, size). Victim pool/store entries are untouched. Routes through the
+// store-held removal gate (empty pool triple: nothing bound yet on this
+// path); false leaves everything bit-identical for the caller to propagate.
+bool llama_kv_cache::rollback_applied_entries(const std::vector<xkv_applied_entry> & entries, size_t base,
+                                               std::string * err) {
+    if (other) {
+        return true;
+    }
+    if (base >= entries.size()) {
+        return true;
+    }
+    std::vector<uint64_t> pids;
+    std::vector<uint64_t> gens;
+    for (size_t k = base; k < entries.size(); ++k) {
+        pids.push_back(entries[k].pid);
+        gens.push_back(entries[k].gen);
+    }
+    if (!pids.empty()) {
+        auto gate = make_pool_removal_gate({}, {}, {});
+        if (xkv_store) {
+            if (!xkv_store->remove_payloads(pids, gens, nullptr, err,
+                                             nullptr, nullptr, gate)) {
+                return false;
+            }
+        }
+    }
+    for (size_t k = base; k < entries.size(); ++k) {
+        auto & cells = v_cells[entries[k].stream];
+        if (!cells.is_empty(entries[k].cell)) {
+            cells.rm(entries[k].cell);
+        }
+    }
+    return true;
+}
+
+bool llama_kv_cache::rollback_applied_batch(const std::vector<xkv_applied_entry> & entries,
+                                             const std::vector<xkv_overwrite_victims> & victims,
+                                             std::string * err) {
+    if (other) {
+        return true;
+    }
+    // Bounded-SR landmark rebuild BEFORE any mutation.
+    if (!entries.empty()) {
+        xkv_removal_cells hook_cells;
+        for (const auto & e : entries) {
+            hook_cells.emplace_back(e.stream, e.cell);
+        }
+        std::string hook_err;
+        if (!run_removal_rebuild_hook(hook_cells, &hook_err)) {
+            if (err) *err = "rebuild hook: " + hook_err;
+            return false;
+        }
+    }
+    if (entries.empty()) {
+        return true;
+    }
+    // Gate protocol: store removal of new payloads with our pool gate for
+    // the bound rows. Gate/store false returns false with store, pool, cells
+    // and epochs bit-identical (nothing below runs). Only after true do the
+    // infallible cell repairs run: drop new cells, restore victims (victim
+    // pool/store entries were never released).
+    {
+        std::vector<uint64_t> pids;
+        std::vector<uint64_t> gens;
+        std::vector<uint64_t> hot_pids;
+        std::vector<uint64_t> hot_gens;
+        std::vector<uint32_t> hot_slots;
+        for (const auto & e : entries) {
+            pids.push_back(e.pid);
+            gens.push_back(e.gen);
+            if (e.has_hot) {
+                hot_pids.push_back(e.pid);
+                hot_gens.push_back(e.gen);
+                hot_slots.push_back(e.hot_slot);
+            }
+        }
+        auto gate = make_pool_removal_gate(hot_pids, hot_gens, hot_slots);
+        if (xkv_store) {
+            if (!xkv_store->remove_payloads(pids, gens, nullptr, err,
+                                             nullptr, nullptr, gate)) {
+                return false;
+            }
+        } else if (!hot_pids.empty()) {
+            if (!xkv_hot_pool || !xkv_hot_pool->release_batch(hot_pids.data(), hot_gens.data(),
+                                                              hot_slots.data(), hot_pids.size(), err)) {
+                return false;
+            }
+        }
+    }
+    for (const auto & e : entries) {
+        auto & cells = v_cells[e.stream];
+        if (!cells.is_empty(e.cell)) {
+            cells.rm(e.cell);
+        }
+    }
+    for (const auto & v : victims) {
+        if (!v.empty()) {
+            restore_victim_cells(v);
+        }
+    }
+    return true;
+}
+
+bool llama_kv_cache::collect_removal_release(uint32_t stream, const std::vector<uint32_t> & idxs,
+                                              xkv_removal_release & out, std::string * err) {
+    out = xkv_removal_release{};
+    if (other) {
+        return true;
+    }
+    if (!xkv_hot_pool && !xkv_store) {
+        return true;
+    }
+    if (stream >= v_cells.size()) {
+        if (err) *err = "collect_removal_release: stream out of range";
+        return false;
+    }
+    const auto & cells = v_cells[stream];
+    for (uint32_t idx : idxs) {
+        if (idx >= cells.size() || cells.is_empty(idx)) {
+            continue;
+        }
+        const uint64_t pid = cells.payload_id_get(idx);
+        if (pid == 0) {
+            continue;
+        }
+        const uint64_t gen = cells.storage_generation_get(idx);
+        // Deduplicate shared payload IDs: first occurrence owns the release.
+        bool seen = false;
+        for (uint64_t s : out.store_pids) {
+            if (s == pid) { seen = true; break; }
+        }
+        if (!seen) {
+            for (uint64_t h : out.hot_pids) {
+                if (h == pid) { seen = true; break; }
+            }
+        }
+        if (seen) {
+            continue;
+        }
+        bool in_pool  = false;
+        bool in_store = false;
+        uint32_t hot_row = 0;
+        llama_xkv::xkv_location loc;
+        if (xkv_hot_pool) {
+            llama_xkv::xkv_hot_slot_info hinfo;
+            if (xkv_hot_pool->find_payload(pid, hinfo)) {
+                if (hinfo.storage_generation != gen) {
+                    if (err) *err = "collect_removal_release: hot generation mismatch for payload " +
+                                    std::to_string(pid);
+                    out = xkv_removal_release{};
+                    return false;
+                }
+                in_pool = true;
+                hot_row = hinfo.slot;
+            }
+        }
+        if (xkv_store) {
+            if (xkv_store->find_location(pid, loc)) {
+                if (loc.storage_generation != gen) {
+                    if (err) *err = "collect_removal_release: store generation mismatch for payload " +
+                                    std::to_string(pid);
+                    out = xkv_removal_release{};
+                    return false;
+                }
+                if (loc.state == llama_xkv::xkv_state::seal_candidate && loc.seal_tx_nonce != 0) {
+                    if (err) *err = "collect_removal_release: payload " + std::to_string(pid) +
+                                    " is locked in an active seal transaction";
+                    out = xkv_removal_release{};
+                    return false;
+                }
+                in_store = true;
+            }
+        }
+        if (!in_pool && !in_store) {
+            continue; // untracked residue: cells-only cleanup
+        }
+        if (in_pool) {
+            out.hot_pids.push_back(pid);
+            out.hot_gens.push_back(gen);
+            out.hot_slots.push_back(hot_row);
+        }
+        if (in_store) {
+            out.store_pids.push_back(pid);
+            out.store_gens.push_back(gen);
+        }
+    }
+    // Bounded-SR landmark rebuild BEFORE any mutation; false fails closed.
+    if (!idxs.empty()) {
+        xkv_removal_cells hook_cells;
+        for (uint32_t idx : idxs) {
+            hook_cells.emplace_back(stream, idx);
+        }
+        if (!run_removal_rebuild_hook(hook_cells, err)) {
+            out = xkv_removal_release{};
+            return false;
+        }
+    }
+    // Cross-subsystem preflight with zero mutation.
+    if (!out.hot_pids.empty() &&
+        !xkv_hot_pool->can_release_batch(out.hot_pids.data(), out.hot_gens.data(),
+                                          out.hot_slots.data(), out.hot_pids.size(), err)) {
+        out = xkv_removal_release{};
+        return false;
+    }
+    return true;
+}
+
+bool llama_kv_cache::execute_removal_release(const xkv_removal_release & rel, std::string * err) {
+    if (rel.empty()) {
+        return true;
+    }
+    // True removal gate protocol: the store prepares clones, revalidates,
+    // preflights epochs and reserves, then fires our pool gate with the store
+    // lock held; after gate-true the store commit is allocation-free and
+    // cannot fail. Gate-false (or store-false) leaves store, pool, cells and
+    // epochs bit-identical: the pool release inside the gate is single-lock
+    // atomic, and the caller mutates cells only after true. No compensation,
+    // no best-effort leak normalization.
+    auto gate = make_pool_removal_gate(rel.hot_pids, rel.hot_gens, rel.hot_slots);
+    if (xkv_store) {
+        // Landmark rebuild provider is runtime-owned (wired separately);
+        // null fails LANDMARKS removals closed inside the store, which is
+        // the correct interim: hot/reference removals proceed.
+        if (!xkv_store->remove_payloads(rel.store_pids, rel.store_gens, nullptr, err,
+                                         nullptr, nullptr, gate)) {
+            return false;
+        }
+        return true;
+    }
+    // No store (unbounded without tracking): pool-only release.
+    if (!rel.hot_pids.empty()) {
+        if (!xkv_hot_pool || !xkv_hot_pool->release_batch(rel.hot_pids.data(), rel.hot_gens.data(),
+                                                           rel.hot_slots.data(), rel.hot_pids.size(), err)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+llama_xkv::xkv_removal_precommit_fn llama_kv_cache::make_pool_removal_gate(
+    const std::vector<uint64_t> & pids,
+    const std::vector<uint64_t> & gens,
+    const std::vector<uint32_t> & slots) const {
+    // Pin pool identity for the gate lifetime; the triple is copied.
+    auto pool = xkv_hot_pool;
+    return [pids, gens, slots, pool](const llama_xkv::xkv_removal_precommit_ctx & ctx,
+                                     std::string * err) -> bool {
+        try {
+            if (!pool || pids.empty()) {
+                return true; // nothing pool-owned: SHADOW/unbounded/factored-only
+            }
+            if (pids.size() != gens.size() || pids.size() != slots.size()) {
+                if (err) *err = "pool gate: triple size mismatch";
+                return false;
+            }
+            // Every triple pid must belong to the store's removal set.
+            for (uint64_t pid : pids) {
+                bool found = false;
+                for (uint64_t c : ctx.payload_ids) {
+                    if (c == pid) { found = true; break; }
+                }
+                if (!found) {
+                    if (err) *err = "pool gate: payload " + std::to_string(pid) +
+                                    " not in store removal set";
+                    return false;
+                }
+            }
+            // Single-lock atomic validate + release; zero store calls, so
+            // this is safe under the store-held gate lock.
+            return pool->release_batch(pids.data(), gens.data(), slots.data(), pids.size(), err);
+        } catch (const std::exception & e) {
+            if (err) *err = e.what();
+            return false;
+        } catch (...) {
+            if (err) *err = "pool gate: unknown failure";
+            return false;
+        }
+    };
+}
+
+void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch, bool dry_run,
+                                    xkv_overwrite_victims * victims_out) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
     }
-
-    fp_bump();
 
     // keep track of the max sequence position that we would overwrite with this ubatch
     // for non-SWA cache, this would be always empty
@@ -2017,6 +3699,18 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     }
 
     assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
+
+    // Phase 0 (bounded, non-dry): collect + preflight victims with zero
+    // mutation on rejection. Dry runs (prepare) never touch pool/store.
+    xkv_overwrite_victims local_victims;
+    xkv_overwrite_victims & victims = victims_out ? *victims_out : local_victims;
+    victims.items.clear();
+    if (!dry_run && (xkv_hot_pool || xkv_store)) {
+        std::string err;
+        if (!collect_overwrite_victims(sinfo, victims, &err)) {
+            throw std::runtime_error("llama_kv_cache::apply_ubatch: overwrite preflight failed: " + err);
+        }
+    }
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
@@ -2073,6 +3767,42 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         }
     }
 
+    if (!dry_run && xkv_store) {
+        std::vector<llama_xkv::xkv_hot_payload_binding> bindings;
+        bindings.reserve(ubatch.n_tokens);
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            const auto & cells = v_cells[sinfo.strm[s]];
+            for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+                const auto idx = sinfo.idxs[s][ii];
+                const uint32_t hot_row = (!sinfo.hot_idxs.empty() && s < sinfo.hot_idxs.size() && ii < sinfo.hot_idxs[s].size())
+                                             ? sinfo.hot_idxs[s][ii] : idx;
+                llama_xkv::xkv_hot_payload_binding b;
+                b.payload_id = cells.payload_id_get(idx);
+                b.hot_slot_row = hot_row;
+                b.storage_generation = cells.storage_generation_get(idx);
+                b.state = llama_xkv::xkv_state::hot_writing;
+                bindings.push_back(b);
+            }
+        }
+        std::string err;
+        if (!xkv_store->register_hot_payloads(bindings, &err)) {
+            // Roll back newly allocated cells and restore overwritten victim
+            // cells. Victim pool/store entries were never released (release is
+            // deferred to postcompute_success), so cells repair is sufficient
+            // for an exact return to the pre-apply state.
+            for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+                auto & cells = v_cells[sinfo.strm[s]];
+                for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+                    cells.rm(sinfo.idxs[s][ii]);
+                }
+            }
+            restore_victim_cells(victims);
+            victims.items.clear();
+            throw std::runtime_error("llama_kv_cache::apply_ubatch: register_hot_payloads failed: " + err);
+        }
+    }
+
+
     // note: we want to preserve the invariant that all positions between [pos_min, pos_max] for each sequence
     //       will be present in the cache. so we have to purge any position which is less than those we would overwrite
     //       ref: https://github.com/ggml-org/llama.cpp/pull/13746#issuecomment-2916057092
@@ -2118,7 +3848,184 @@ uint32_t llama_kv_cache::get_size() const {
     return cells.size();
 }
 
+uint32_t llama_kv_cache::get_hot_size() const {
+    return hot_kv_size;
+}
+
+uint32_t llama_kv_cache::get_kv_hot_capacity() const {
+    return hot_kv_size * n_stream;
+}
+
+bool llama_kv_cache::can_use_legacy_attention() const {
+    return !is_xkv_bounded_hot();
+}
+
+bool llama_kv_cache::is_xkv_bounded_hot() const {
+    return xkv_dense_sr && (xkv_hot_pool != nullptr);
+}
+
+std::shared_ptr<llama_xkv::xkv_hot_slot_pool> llama_kv_cache::get_hot_slot_pool() const {
+    return xkv_hot_pool;
+}
+
+bool llama_kv_cache::apply_hot_release_plan(
+    const llama_xkv::xkv_hot_release_plan & plan,
+    std::string * err) {
+    if (!xkv_store) {
+        if (err) *err = "xkv_store is null";
+        return false;
+    }
+    if (!xkv_store->validate_hot_release_plan(plan, err)) {
+        return false;
+    }
+    if (!xkv_hot_pool) {
+        return true; // No hot pool to release from
+    }
+    return xkv_hot_pool->release_batch(
+        plan.released_payload_ids.data(),
+        plan.released_generations.data(),
+        plan.released_physical_rows.data(),
+        plan.released_payload_ids.size(),
+        err
+    );
+}
+
+bool llama_kv_cache::precommit_hot_release(
+    const llama_xkv::xkv_hot_release_plan & plan,
+    std::string * err) {
+    return precommit_hot_release_impl(plan, /*probe_store=*/ true, err);
+}
+
+bool llama_kv_cache::precommit_hot_release_nostore(
+    const llama_xkv::xkv_hot_release_plan & plan,
+    std::string * err) {
+    return precommit_hot_release_impl(plan, /*probe_store=*/ false, err);
+}
+
+bool llama_kv_cache::validate_hot_release(
+    const llama_xkv::xkv_hot_release_plan & plan,
+    std::string * err) {
+    // SHADOW and unbounded caches never release: validation is vacuous.
+    if (!is_xkv_bounded_hot() || !xkv_hot_pool) {
+        return true;
+    }
+    const size_t n = plan.released_payload_ids.size();
+    if (n == 0 || plan.released_physical_rows.size() != n ||
+        plan.released_generations.size() != n) {
+        if (err) *err = "validate_hot_release: plan triple size mismatch or empty";
+        return false;
+    }
+    // Read-only: pool binding+generation, store presence+generation, and
+    // unlocked pre-seal rows. Zero mutation; locks are taken and released
+    // internally, so the caller must not hold the store lock here.
+    for (size_t i = 0; i < n; ++i) {
+        const uint64_t pid  = plan.released_payload_ids[i];
+        const uint64_t gen  = plan.released_generations[i];
+        const uint32_t row  = plan.released_physical_rows[i];
+        if (pid == 0) {
+            if (err) *err = "validate_hot_release: payload_id is 0 at index " + std::to_string(i);
+            return false;
+        }
+        llama_xkv::xkv_hot_slot_info hinfo;
+        if (!xkv_hot_pool->find_payload(pid, hinfo) || hinfo.slot != row ||
+            hinfo.storage_generation != gen) {
+            if (err) *err = "validate_hot_release: pool binding mismatch for payload " +
+                            std::to_string(pid);
+            return false;
+        }
+        if (xkv_store) {
+            llama_xkv::xkv_location loc;
+            if (!xkv_store->find_location(pid, loc) || loc.storage_generation != gen) {
+                if (err) *err = "validate_hot_release: store binding mismatch for payload " +
+                                std::to_string(pid);
+                return false;
+            }
+            if (loc.state == llama_xkv::xkv_state::seal_candidate && loc.seal_tx_nonce != 0) {
+                if (err) *err = "validate_hot_release: payload " + std::to_string(pid) +
+                                " is locked in an active seal transaction";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool llama_kv_cache::commit_hot_release(
+    const llama_xkv::xkv_hot_release_plan & plan,
+    std::string * err) {
+    // SHADOW and unbounded caches never release.
+    if (!is_xkv_bounded_hot() || !xkv_hot_pool) {
+        return true;
+    }
+    const size_t n = plan.released_payload_ids.size();
+    if (n == 0 || plan.released_physical_rows.size() != n ||
+        plan.released_generations.size() != n) {
+        if (err) *err = "commit_hot_release: plan triple size mismatch or empty";
+        return false;
+    }
+    // Pool release only with zero store calls: safe as the seal-gate callback
+    // under the store lock. Single-lock atomic all-or-nothing; gate-false
+    // leaves every subsystem unmutated.
+    return xkv_hot_pool->release_batch(
+        plan.released_payload_ids.data(),
+        plan.released_generations.data(),
+        plan.released_physical_rows.data(),
+        n,
+        err
+    );
+}
+
+bool llama_kv_cache::precommit_hot_release_impl(
+    const llama_xkv::xkv_hot_release_plan & plan,
+    bool probe_store,
+    std::string * err) {
+    // Standalone convenience: full preflight, then gate-style commit.
+    // probe_store=false (seal-gate callback under the store lock) skips all
+    // store calls and preflights pool bindings only.
+    if (!is_xkv_bounded_hot() || !xkv_hot_pool) {
+        return true;
+    }
+    if (probe_store) {
+        if (!validate_hot_release(plan, err)) {
+            return false;
+        }
+    } else {
+        const size_t n = plan.released_payload_ids.size();
+        if (n == 0 || plan.released_physical_rows.size() != n ||
+            plan.released_generations.size() != n) {
+            if (err) *err = "precommit_hot_release: plan triple size mismatch or empty";
+            return false;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            const uint64_t pid = plan.released_payload_ids[i];
+            const uint64_t gen = plan.released_generations[i];
+            const uint32_t row = plan.released_physical_rows[i];
+            llama_xkv::xkv_hot_slot_info hinfo;
+            if (pid == 0 || !xkv_hot_pool->find_payload(pid, hinfo) || hinfo.slot != row ||
+                hinfo.storage_generation != gen) {
+                if (err) *err = "precommit_hot_release: pool binding mismatch for payload " +
+                                std::to_string(pid);
+                return false;
+            }
+        }
+    }
+    return commit_hot_release(plan, err);
+}
+
+uint32_t llama_kv_cache::get_owning_layer(uint32_t model_layer) const {
+    auto it = map_layer_ids.find(model_layer);
+    if (it != map_layer_ids.end() && (size_t) it->second < layers.size()) {
+        return layers[it->second].il;
+    }
+    return model_layer;
+}
+
 uint32_t llama_kv_cache::get_kv_capacity() const {
+    // In bounded XKV mode, capacity is the physical hot pool capacity.
+    // Server admission/preemption depends on physical hot capacity, not logical metadata.
+    if (is_xkv_bounded_hot() && xkv_hot_pool) {
+        return xkv_hot_pool->get_capacity();
+    }
     uint64_t result = 0;
     for (const auto & cells : v_cells) {
         result += cells.size();
@@ -2127,6 +4034,11 @@ uint32_t llama_kv_cache::get_kv_capacity() const {
 }
 
 uint32_t llama_kv_cache::get_kv_used() const {
+    // In bounded XKV mode, get_kv_used returns actual physical hot pool live count.
+    // AGENTS invariant: physical cells, not logical references/metadata.
+    if (is_xkv_bounded_hot() && xkv_hot_pool) {
+        return xkv_hot_pool->get_live();
+    }
     uint64_t result = 0;
     for (const auto & cells : v_cells) {
         result += cells.get_used();
@@ -2173,528 +4085,14 @@ ggml_type llama_kv_cache::layer_type_v(int32_t il) const {
     return layers.at(map_layer_ids.at(il)).v->type;
 }
 
-std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
-    std::vector<uint32_t> res;
-    res.reserve(layers.size());
-
-    for (const auto & layer : layers) {
-        res.push_back(layer.il);
-    }
-
-    return res;
+ggml_type llama_kv_cache_context::layer_type_k(int32_t il) const {
+    return kv->layer_type_k(il);
 }
 
-ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
-    const int32_t ikv = map_layer_ids.at(il);
-
-    return layers[ikv].k;
+ggml_type llama_kv_cache_context::layer_type_v(int32_t il) const {
+    return kv->layer_type_v(il);
 }
 
-const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
-    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-
-    return v_cells[seq_to_stream[seq_id]];
-}
-
-ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
-    return layers.at(map_layer_ids.at(il)).v;
-}
-
-bool llama_kv_cache::rerot_set_write_tag(
-        llama_seq_id seq_id,
-        const llama_kv_rerot_meta & tag) {
-    if (seq_id < 0 || (size_t) seq_id >= rerot_write_tags.size()) {
-        return false;
-    }
-
-    fp_bump();
-
-    if (tag.active()) {
-        if (tag.node_id == LLAMA_REROT_NODE_INVALID || tag.run_id == LLAMA_REROT_RUN_INVALID ||
-            tag.visibility == llama_rerot_visibility::normal ||
-            (tag.visibility == llama_rerot_visibility::pending_record && tag.publish_epoch != 0)) {
-            return false;
-        }
-        rerot_write_tags[seq_id] = tag;
-    } else {
-        rerot_write_tags[seq_id].reset();
-    }
-
-    return true;
-}
-
-void llama_kv_cache::rerot_clear_write_tag(llama_seq_id seq_id) {
-    fp_bump();
-    if (seq_id >= 0 && (size_t) seq_id < rerot_write_tags.size()) {
-        rerot_write_tags[seq_id].reset();
-    }
-}
-
-size_t llama_kv_cache::rerot_publish_run(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        uint64_t publish_epoch) {
-    size_t count = 0;
-    if (publish_epoch == 0 || !rerot_can_publish_run(episode_id, run_id, &count)) {
-        return 0;
-    }
-
-    fp_bump();
-
-    std::vector<std::pair<uint32_t, uint32_t>> matches;
-    GGML_ASSERT(rerot_find_run_cells(episode_id, run_id, &matches) == count);
-
-    for (const auto & match : matches) {
-        const bool published = v_cells[match.first].rerot_publish(
-            match.second, episode_id, run_id, publish_epoch);
-        GGML_ASSERT(published);
-    }
-
-    return matches.size();
-}
-
-size_t llama_kv_cache::rerot_reclassify_run(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        llama_rerot_visibility expected,
-        llama_rerot_visibility replacement,
-        uint64_t publish_epoch) {
-    size_t count = 0;
-    if (!rerot_can_reclassify_run(
-            episode_id, run_id, expected, replacement, publish_epoch, &count)) {
-        return 0;
-    }
-
-    fp_bump();
-
-    std::vector<std::pair<uint32_t, uint32_t>> matches;
-    GGML_ASSERT(rerot_find_run_cells(episode_id, run_id, &matches) == count);
-
-    for (const auto & match : matches) {
-        const bool changed = v_cells[match.first].rerot_reclassify(
-            match.second, episode_id, run_id, expected, replacement, publish_epoch);
-        GGML_ASSERT(changed);
-    }
-    return matches.size();
-}
-
-bool llama_kv_cache::rerot_can_add_run_ref(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        llama_seq_id seq_id,
-        size_t * count) const {
-    if (count) {
-        *count = 0;
-    }
-    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID ||
-        seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
-        return false;
-    }
-
-    const uint32_t dst_stream = seq_to_stream[seq_id];
-    size_t matches = 0;
-    for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
-        const auto & cells = v_cells[stream];
-        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-            if (cells.is_empty(cell)) {
-                continue;
-            }
-            const auto & meta = cells.rerot_get(cell);
-            if (meta.episode_id != episode_id || meta.run_id != run_id) {
-                continue;
-            }
-            // A logical run cannot be copied between independent KV streams,
-            // and only an atomically published run is eligible for a keeper.
-            if (stream != dst_stream || meta.visibility != llama_rerot_visibility::public_live ||
-                meta.publish_epoch == 0) {
-                return false;
-            }
-            ++matches;
-        }
-    }
-
-    if (count) {
-        *count = matches;
-    }
-    return matches > 0;
-}
-
-size_t llama_kv_cache::rerot_add_run_ref(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        llama_seq_id seq_id) {
-    size_t count = 0;
-    if (!rerot_can_add_run_ref(episode_id, run_id, seq_id, &count)) {
-        return 0;
-    }
-
-    fp_bump();
-
-    auto & cells = v_cells[seq_to_stream[seq_id]];
-    size_t seen = 0;
-    for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-        if (cells.is_empty(cell)) {
-            continue;
-        }
-        const auto & meta = cells.rerot_get(cell);
-        if (meta.episode_id != episode_id || meta.run_id != run_id) {
-            continue;
-        }
-        if (!cells.seq_has(cell, seq_id)) {
-            cells.seq_add(cell, seq_id);
-        }
-        ++seen;
-    }
-
-    GGML_ASSERT(seen == count);
-    return seen;
-}
-
-size_t llama_kv_cache::rerot_find_run_cells(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        std::vector<std::pair<uint32_t, uint32_t>> * out) const {
-    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID) {
-        return 0;
-    }
-
-    size_t count = 0;
-    for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
-        std::vector<uint32_t> idxs;
-        count += v_cells[stream].rerot_collect_run(episode_id, run_id, idxs);
-        if (out != nullptr) {
-            for (const uint32_t cell : idxs) {
-                out->emplace_back(stream, cell);
-            }
-        }
-    }
-    return count;
-}
-
-bool llama_kv_cache::rerot_can_freeze_to_archive(
-        uint64_t episode_id,
-        llama_seq_id exec_seq,
-        llama_seq_id archive_seq,
-        size_t * count) const {
-    if (count != nullptr) {
-        *count = 0;
-    }
-    if (episode_id == 0 || exec_seq < 0 || archive_seq < 0 || exec_seq == archive_seq ||
-        (size_t) exec_seq >= seq_to_stream.size() || (size_t) archive_seq >= seq_to_stream.size()) {
-        return false;
-    }
-    if (other != nullptr || seq_to_stream[exec_seq] != seq_to_stream[archive_seq]) {
-        return false;
-    }
-
-    size_t kept = 0;
-    const auto & cells = v_cells[seq_to_stream[exec_seq]];
-    for (uint32_t i = 0; i < cells.size(); ++i) {
-        if (cells.is_empty(i) || !cells.seq_has(i, exec_seq)) {
-            continue;
-        }
-        const auto & meta = cells.rerot_get(i);
-        if (meta.active() && meta.episode_id == episode_id &&
-            meta.visibility == llama_rerot_visibility::public_live && meta.publish_epoch != 0) {
-            ++kept;
-        }
-    }
-
-    if (count != nullptr) {
-        *count = kept;
-    }
-    return true;
-}
-
-size_t llama_kv_cache::rerot_freeze_to_archive(
-        uint64_t episode_id,
-        llama_seq_id exec_seq,
-        llama_seq_id archive_seq) {
-    size_t count = 0;
-    if (!rerot_can_freeze_to_archive(episode_id, exec_seq, archive_seq, &count)) {
-        return 0;
-    }
-
-    fp_bump();
-
-    auto & cells = v_cells[seq_to_stream[exec_seq]];
-    const size_t kept = cells.rerot_freeze_to_archive(episode_id, exec_seq, archive_seq);
-
-    GGML_ASSERT(kept == count);
-    return kept;
-}
-
-bool llama_kv_cache::rerot_blocks_state_save(llama_seq_id seq_id) const {
-    if (seq_id == -1) {
-        for (const auto & tag : rerot_write_tags) {
-            if (tag.active()) {
-                return true;
-            }
-        }
-        for (const auto & view : rerot_reader_views) {
-            if (view.active()) {
-                return true;
-            }
-        }
-        for (const auto & cells : v_cells) {
-            if (cells.rerot_has_active()) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
-        return false;
-    }
-    if ((size_t) seq_id < rerot_write_tags.size() && rerot_write_tags[seq_id].active()) {
-        return true;
-    }
-    if ((size_t) seq_id < rerot_reader_views.size() && rerot_reader_views[seq_id].active()) {
-        return true;
-    }
-    return v_cells[seq_to_stream[seq_id]].rerot_has_active_seq(seq_id);
-}
-
-bool llama_kv_cache::rerot_can_reclassify_run(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        llama_rerot_visibility expected,
-        llama_rerot_visibility replacement,
-        uint64_t publish_epoch,
-        size_t * count) const {
-    if (count) {
-        *count = 0;
-    }
-    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID ||
-        expected == llama_rerot_visibility::normal || replacement == llama_rerot_visibility::normal ||
-        (replacement == llama_rerot_visibility::public_live && publish_epoch == 0) ||
-        (replacement != llama_rerot_visibility::public_live && publish_epoch != 0)) {
-        return false;
-    }
-
-    size_t matches = 0;
-    for (const auto & cells : v_cells) {
-        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-            if (cells.is_empty(cell)) {
-                continue;
-            }
-            const auto & meta = cells.rerot_get(cell);
-            if (meta.episode_id != episode_id || meta.run_id != run_id) {
-                continue;
-            }
-            if (meta.visibility != expected) {
-                return false;
-            }
-            ++matches;
-        }
-    }
-
-    if (count) {
-        *count = matches;
-    }
-    return matches > 0;
-}
-
-bool llama_kv_cache::rerot_can_publish_run(
-        uint64_t episode_id,
-        llama_rerot_run_id run_id,
-        size_t * count) const {
-    if (count) {
-        *count = 0;
-    }
-    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID) {
-        return false;
-    }
-
-    size_t matches = 0;
-    for (const auto & cells : v_cells) {
-        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-            if (cells.is_empty(cell)) {
-                continue;
-            }
-            const auto & meta = cells.rerot_get(cell);
-            if (meta.episode_id != episode_id || meta.run_id != run_id) {
-                continue;
-            }
-            if (meta.visibility != llama_rerot_visibility::pending_record) {
-                return false;
-            }
-            ++matches;
-        }
-    }
-
-    if (count) {
-        *count = matches;
-    }
-    return matches > 0;
-}
-
-bool llama_kv_cache::rerot_set_reader_view(
-        llama_seq_id seq_id,
-        const llama_rerot_reader_state & view) {
-    fp_bump();
-    if (seq_id < 0 || (size_t) seq_id >= rerot_reader_views.size() || !view.active() ||
-        view.reader == LLAMA_REROT_NODE_INVALID || view.query_run == LLAMA_REROT_RUN_INVALID ||
-        view.ordered_runs.empty()) {
-        return false;
-    }
-
-    std::unordered_set<llama_rerot_run_id> seen;
-    seen.reserve(view.ordered_runs.size());
-    bool query_run_seen = false;
-    for (const auto run_id : view.ordered_runs) {
-        if (run_id == LLAMA_REROT_RUN_INVALID || !seen.insert(run_id).second) {
-            return false;
-        }
-        query_run_seen |= run_id == view.query_run;
-    }
-    if (!query_run_seen) {
-        return false;
-    }
-
-    rerot_reader_views[seq_id] = view;
-    return true;
-}
-
-void llama_kv_cache::rerot_clear_reader_view(llama_seq_id seq_id) {
-    fp_bump();
-    if (seq_id >= 0 && (size_t) seq_id < rerot_reader_views.size()) {
-        rerot_reader_views[seq_id].reset();
-    }
-}
-
-bool llama_kv_cache::rerot_batch_active(const llama_ubatch & ubatch) const {
-    bool any = false;
-    bool all = true;
-    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-        if (!ubatch.seq_id || !ubatch.seq_id[i] || ubatch.n_seq_id[i] < 1) {
-            all = false;
-            continue;
-        }
-        const llama_seq_id seq_id = ubatch.seq_id[i][0];
-        const bool active = seq_id >= 0 && (size_t) seq_id < rerot_reader_views.size() &&
-                            rerot_reader_views[seq_id].active();
-        any |= active;
-        all &= active;
-    }
-    if (any && !all) {
-        throw std::runtime_error("RERoT and ordinary query rows cannot share one ubatch");
-    }
-    return any;
-}
-
-llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
-        const llama_ubatch & ubatch,
-        uint32_t n_kv) const {
-    llama_rerot_attn_layout result;
-    if (!rerot_batch_active(ubatch)) {
-        return result;
-    }
-    if (n_stream != 1 || v_cells.size() != 1) {
-        throw std::runtime_error("RERoT indexed attention requires unified KV");
-    }
-
-    const auto & cells = v_cells[0];
-    if (n_kv > cells.size()) {
-        throw std::runtime_error("RERoT attention layout exceeds KV cache size");
-    }
-
-    result.n_queries = ubatch.n_tokens;
-    result.query_offsets.reserve(size_t(result.n_queries) + 1);
-    result.query_offsets.push_back(0);
-
-    for (uint32_t query = 0; query < ubatch.n_tokens; ++query) {
-        const llama_seq_id seq_id = ubatch.seq_id[query][0];
-        const auto & reader = rerot_reader_views.at(seq_id);
-
-        std::vector<llama_rerot_key_record> keys;
-        keys.reserve(n_kv);
-        for (uint32_t key = 0; key < n_kv; ++key) {
-            if (cells.is_empty(key)) {
-                continue;
-            }
-            keys.push_back({
-                key,
-                cells.pos_get(key),
-                cells.seq_has(key, seq_id),
-                cells.rerot_get(key),
-            });
-        }
-
-        auto query_layout = llama_rerot_build_query_layout(reader, ubatch.pos[query], keys);
-        const uint32_t group_base = static_cast<uint32_t>(result.groups.size());
-        for (auto group : query_layout.groups) {
-            group.query_index = query;
-            result.groups.push_back(group);
-        }
-        for (auto entry : query_layout.entries) {
-            entry.group_index += group_base;
-            result.entries.push_back(entry);
-        }
-        result.query_offsets.push_back(static_cast<uint32_t>(result.entries.size()));
-    }
-
-    std::string error;
-    if (!result.validate(n_kv, &error)) {
-        throw std::runtime_error("invalid RERoT attention layout: " + error);
-    }
-    return result;
-}
-
-llama_kv_cache::rerot_resolved_view llama_kv_cache::rerot_resolve_view(
-        const llama_rerot_reader_view & view) const {
-    rerot_resolved_view result;
-    result.episode_id = view.episode_id;
-    result.reader = view.reader;
-
-    for (const auto & logical_run : view.runs) {
-        std::vector<rerot_resolved_cell> run_cells;
-
-        for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
-            const auto & cells = v_cells[stream];
-            for (uint32_t cell = 0; cell < cells.size(); ++cell) {
-                if (cells.is_empty(cell)) {
-                    continue;
-                }
-
-                const auto & meta = cells.rerot_get(cell);
-                if (meta.episode_id != view.episode_id || meta.run_id != logical_run.run_id ||
-                    meta.node_id != logical_run.owner) {
-                    continue;
-                }
-
-                run_cells.push_back({
-                    stream,
-                    cell,
-                    cells.pos_get(cell),
-                    0,
-                    meta,
-                });
-            }
-        }
-
-        std::stable_sort(run_cells.begin(), run_cells.end(), [](const auto & lhs, const auto & rhs) {
-            if (lhs.storage_pos != rhs.storage_pos) {
-                return lhs.storage_pos < rhs.storage_pos;
-            }
-            if (lhs.meta.frontier != rhs.meta.frontier) {
-                return lhs.meta.frontier < rhs.meta.frontier;
-            }
-            if (lhs.stream != rhs.stream) {
-                return lhs.stream < rhs.stream;
-            }
-            return lhs.cell < rhs.cell;
-        });
-
-        for (auto & resolved : run_cells) {
-            resolved.virtual_pos = result.query_virtual_pos++;
-            result.cells.push_back(std::move(resolved));
-        }
-    }
-
-    return result;
-}
 
 // FlashPrefill legal-fragment planning (CacheFragments)
 //
@@ -2763,6 +4161,7 @@ void llama_kv_cache::flashprefill_cell_stamps(std::vector<llama_flashprefill_cel
 uint32_t llama_kv_cache::flashprefill_n_streams() const {
     return (uint32_t) v_cells.size();
 }
+
 
 bool llama_flashprefill_layout::validate(uint32_t scan_width, std::string * error) const {
     const auto fail = [&](const char * msg) -> bool {
@@ -3909,6 +5308,780 @@ bool llama_kv_cache::flashprefill_build_layout(
     return true;
 }
 
+bool llama_kv_cache_context::flashprefill_build_layout(
+        uint32_t ubatch_index,
+        int32_t role,
+        const llama_flashprefill_layout_params & params,
+        std::string * error) const {
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS || kv == nullptr) {
+        if (error) { *error = "flashprefill layout: no memory context"; }
+        return false;
+    }
+    if (ubatches.empty() || sinfos.empty() || ubatch_index >= ubatches.size()) {
+        if (error) { *error = "flashprefill layout: ubatch index out of range"; }
+        return false;
+    }
+    const llama_ubatch & ub = ubatches[ubatch_index];
+
+    llama_flashprefill_build_key key;
+    key.ubatch_index = ubatch_index;
+    key.role = role;
+    key.block_k = params.block_k;
+    key.causal = params.causal ? 1u : 0u;
+    key.want_exact_rows = params.want_exact_rows ? 1u : 0u;
+    key.n_tokens = ub.n_tokens;
+    key.exact_cap_bucket = llama_flashprefill_layout_params::bucket_for(params.exact_cap);
+
+    // Reuse the owned planning when topology matches and owner stamps are fresh.
+    if (fp_key_valid && fp_key.ubatch_index == key.ubatch_index && fp_key.role == key.role &&
+        fp_key.block_k == key.block_k && fp_key.causal == key.causal &&
+        fp_key.want_exact_rows == key.want_exact_rows && fp_key.n_tokens == key.n_tokens &&
+        fp_key.exact_cap_bucket == key.exact_cap_bucket && flashprefill_layout_is_fresh()) {
+        return fp_layout.eligible;
+    }
+
+    std::string msg;
+    const bool eligible = kv->flashprefill_build_layout(ub, role, params, fp_layout, &msg);
+
+    // Finalize the topology key post-build (group capacity and path are known now).
+    key.group_cap_bucket = llama_flashprefill_layout_params::bucket_for(fp_layout.n_groups());
+    key.is_rerot = fp_layout.is_rerot;
+    fp_key = key;
+    fp_key_valid = true;
+    fp_cells_epoch = kv->flashprefill_epoch();
+    kv->flashprefill_cell_stamps(fp_cell_stamps);
+
+    if (error) { *error = msg; }
+    return eligible;
+}
+
+bool llama_kv_cache_context::flashprefill_build_current_layout(
+        int32_t role,
+        const llama_flashprefill_layout_params & params,
+        std::string * error) const {
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS || kv == nullptr) {
+        if (error) { *error = "flashprefill layout: no memory context"; }
+        return false;
+    }
+    if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size()) {
+        if (error) { *error = "flashprefill layout: no current ubatch"; }
+        return false;
+    }
+    return flashprefill_build_layout((uint32_t) i_cur, role, params, error);
+}
+
+const llama_flashprefill_layout & llama_kv_cache_context::flashprefill_get_layout() const {
+    return fp_layout;
+}
+
+bool llama_kv_cache_context::flashprefill_layout_is_fresh() const {
+    if (!fp_key_valid || kv == nullptr) {
+        return false;
+    }
+    if (fp_cells_epoch != kv->flashprefill_epoch()) {
+        return false;
+    }
+    std::vector<llama_flashprefill_cell_stamp> cur;
+    kv->flashprefill_cell_stamps(cur);
+    if (cur.size() != fp_cell_stamps.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < cur.size(); ++i) {
+        if (cur[i].stamp != fp_cell_stamps[i].stamp ||
+            cur[i].generation != fp_cell_stamps[i].generation) {
+            return false;
+        }
+        if (!fp_stamp_usable(cur[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+
+const llama_flashprefill_build_key & llama_kv_cache_context::flashprefill_layout_key() const {
+    return fp_key;
+}
+
+std::vector<uint32_t> llama_kv_cache::get_layer_ids() const {
+    std::vector<uint32_t> res;
+    res.reserve(layers.size());
+
+    for (const auto & layer : layers) {
+        res.push_back(layer.il);
+    }
+
+    return res;
+}
+
+ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    return layers[ikv].k;
+}
+
+ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    return layers[ikv].v;
+}
+
+int32_t llama_kv_cache::get_attn_rot_k_nrot() const {
+    if (!attn_rot_k) {
+        return 0;
+    }
+    const char * LLAMA_ATTN_ROT_K_NROT = getenv("LLAMA_ATTN_ROT_K_NROT");
+    int nrot = LLAMA_ATTN_ROT_K_NROT ? atoi(LLAMA_ATTN_ROT_K_NROT) : 64;
+    if (nrot == 0) {
+        nrot = 64;
+        do {
+            nrot *= 2;
+        } while (n_embd_head_k_all > 0 && n_embd_head_k_all % nrot == 0);
+        nrot /= 2;
+    }
+    return nrot;
+}
+
+int32_t llama_kv_cache::get_attn_rot_v_nrot() const {
+    if (!attn_rot_v) {
+        return 0;
+    }
+    return 64;
+}
+
+std::vector<ggml_context *> llama_kv_cache::get_buffer_contexts() const {
+    std::vector<ggml_context *> res;
+    for (const auto & [ctx, _] : ctxs_bufs) {
+        res.push_back(ctx.get());
+    }
+    return res;
+}
+
+bool llama_kv_cache::validate_seq_id(llama_seq_id seq_id) const {
+    return seq_id >= 0 && (size_t) seq_id < seq_to_stream.size();
+}
+
+uint32_t llama_kv_cache::get_stream_for_seq(llama_seq_id seq_id) const {
+    if (!validate_seq_id(seq_id)) {
+        return 0;
+    }
+    return seq_to_stream[seq_id];
+}
+
+bool llama_kv_cache::can_capture_prerope_range(
+        llama_seq_id seq_id,
+        uint32_t cell_start,
+        uint32_t cell_count,
+        std::string * reason) const {
+    if (cell_count == 0) {
+        if (reason) *reason = "cell_count is zero";
+        return false;
+    }
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        if (reason) *reason = "invalid seq_id";
+        return false;
+    }
+    if (cell_start > UINT32_MAX - cell_count) {
+        if (reason) *reason = "cell range arithmetic overflow";
+        return false;
+    }
+
+    const auto & stream_cells = v_cells[seq_to_stream[seq_id]];
+    if (cell_start + cell_count > stream_cells.size()) {
+        if (reason) *reason = "cell range exceeds cache capacity";
+        return false;
+    }
+
+    // Strict sealing conditions (§5.2):
+    // Must be committed, occupied, seq_has(seq_id), and NOT PRIVATE / PENDING.
+    for (uint32_t i = 0; i < cell_count; ++i) {
+        uint32_t cell_idx = cell_start + i;
+        if (stream_cells.is_empty(cell_idx)) {
+            if (reason) *reason = "cell range contains empty cell at index " + std::to_string(cell_idx);
+            return false;
+        }
+        if (!stream_cells.seq_has(cell_idx, seq_id)) {
+            if (reason) *reason = "cell does not belong to sequence at index " + std::to_string(cell_idx);
+            return false;
+        }
+        // Consult XKV store hot_committed state to reject ordinary tentative tokens
+        if (xkv_store) {
+            const uint64_t pid = stream_cells.payload_id_get(cell_idx);
+            llama_xkv::xkv_location loc;
+            if (!xkv_store->find_location(pid, loc) || loc.state != llama_xkv::xkv_state::hot_committed) {
+                if (reason) *reason = "cell payload " + std::to_string(pid) + " is not in hot_committed state";
+                return false;
+            }
+        }
+        const auto & meta = stream_cells.rerot_get(cell_idx);
+        if (meta.active()) {
+            if (meta.visibility == llama_rerot_visibility::pending_record) {
+                if (reason) *reason = "cell in range has uncommitted PENDING record status at index " + std::to_string(cell_idx);
+                return false;
+            }
+            if (meta.visibility == llama_rerot_visibility::private_control) {
+                if (reason) *reason = "cell in range is private_control at index " + std::to_string(cell_idx);
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    return v_cells[seq_to_stream[seq_id]];
+}
+
+bool llama_kv_cache::rerot_set_write_tag(
+        llama_seq_id seq_id,
+        const llama_kv_rerot_meta & tag) {
+    if (seq_id < 0 || (size_t) seq_id >= rerot_write_tags.size()) {
+        return false;
+    }
+
+    if (tag.active()) {
+        if (tag.node_id == LLAMA_REROT_NODE_INVALID || tag.run_id == LLAMA_REROT_RUN_INVALID ||
+            tag.visibility == llama_rerot_visibility::normal ||
+            (tag.visibility == llama_rerot_visibility::pending_record && tag.publish_epoch != 0)) {
+            return false;
+        }
+        rerot_write_tags[seq_id] = tag;
+    } else {
+        rerot_write_tags[seq_id].reset();
+    }
+
+    return true;
+}
+
+void llama_kv_cache::rerot_clear_write_tag(llama_seq_id seq_id) {
+    if (seq_id >= 0 && (size_t) seq_id < rerot_write_tags.size()) {
+        rerot_write_tags[seq_id].reset();
+    }
+}
+
+size_t llama_kv_cache::rerot_publish_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        uint64_t publish_epoch) {
+    size_t count = 0;
+    if (publish_epoch == 0 || !rerot_can_publish_run(episode_id, run_id, &count)) {
+        return 0;
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> matches;
+    GGML_ASSERT(rerot_find_run_cells(episode_id, run_id, &matches) == count);
+
+    for (const auto & match : matches) {
+        const bool published = v_cells[match.first].rerot_publish(
+            match.second, episode_id, run_id, publish_epoch);
+        GGML_ASSERT(published);
+    }
+
+    return matches.size();
+}
+
+size_t llama_kv_cache::rerot_reclassify_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_rerot_visibility expected,
+        llama_rerot_visibility replacement,
+        uint64_t publish_epoch) {
+    size_t count = 0;
+    if (!rerot_can_reclassify_run(
+            episode_id, run_id, expected, replacement, publish_epoch, &count)) {
+        return 0;
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> matches;
+    GGML_ASSERT(rerot_find_run_cells(episode_id, run_id, &matches) == count);
+
+    for (const auto & match : matches) {
+        const bool changed = v_cells[match.first].rerot_reclassify(
+            match.second, episode_id, run_id, expected, replacement, publish_epoch);
+        GGML_ASSERT(changed);
+    }
+    return matches.size();
+}
+
+bool llama_kv_cache::rerot_can_add_run_ref(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_seq_id seq_id,
+        size_t * count) const {
+    if (count) {
+        *count = 0;
+    }
+    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID ||
+        seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+
+    const uint32_t dst_stream = seq_to_stream[seq_id];
+    size_t matches = 0;
+    for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
+        const auto & cells = v_cells[stream];
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (cells.is_empty(cell)) {
+                continue;
+            }
+            const auto & meta = cells.rerot_get(cell);
+            if (meta.episode_id != episode_id || meta.run_id != run_id) {
+                continue;
+            }
+            // A logical run cannot be copied between independent KV streams,
+            // and only an atomically published run is eligible for a keeper.
+            if (stream != dst_stream || meta.visibility != llama_rerot_visibility::public_live ||
+                meta.publish_epoch == 0) {
+                return false;
+            }
+            ++matches;
+        }
+    }
+
+    if (count) {
+        *count = matches;
+    }
+    return matches > 0;
+}
+
+size_t llama_kv_cache::rerot_add_run_ref(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_seq_id seq_id) {
+    size_t count = 0;
+    if (!rerot_can_add_run_ref(episode_id, run_id, seq_id, &count)) {
+        return 0;
+    }
+
+    auto & cells = v_cells[seq_to_stream[seq_id]];
+    size_t seen = 0;
+    for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+        if (cells.is_empty(cell)) {
+            continue;
+        }
+        const auto & meta = cells.rerot_get(cell);
+        if (meta.episode_id != episode_id || meta.run_id != run_id) {
+            continue;
+        }
+        if (!cells.seq_has(cell, seq_id)) {
+            cells.seq_add(cell, seq_id);
+        }
+        ++seen;
+    }
+
+    GGML_ASSERT(seen == count);
+    return seen;
+}
+
+size_t llama_kv_cache::rerot_find_run_cells(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        std::vector<std::pair<uint32_t, uint32_t>> * out) const {
+    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID) {
+        return 0;
+    }
+
+    size_t count = 0;
+    for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
+        std::vector<uint32_t> idxs;
+        count += v_cells[stream].rerot_collect_run(episode_id, run_id, idxs);
+        if (out != nullptr) {
+            for (const uint32_t cell : idxs) {
+                out->emplace_back(stream, cell);
+            }
+        }
+    }
+    return count;
+}
+
+bool llama_kv_cache::rerot_can_freeze_to_archive(
+        uint64_t episode_id,
+        llama_seq_id exec_seq,
+        llama_seq_id archive_seq,
+        size_t * count) const {
+    if (count != nullptr) {
+        *count = 0;
+    }
+    if (episode_id == 0 || exec_seq < 0 || archive_seq < 0 || exec_seq == archive_seq ||
+        (size_t) exec_seq >= seq_to_stream.size() || (size_t) archive_seq >= seq_to_stream.size()) {
+        return false;
+    }
+    if (other != nullptr || seq_to_stream[exec_seq] != seq_to_stream[archive_seq]) {
+        return false;
+    }
+
+    size_t kept = 0;
+    const auto & cells = v_cells[seq_to_stream[exec_seq]];
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i) || !cells.seq_has(i, exec_seq)) {
+            continue;
+        }
+        const auto & meta = cells.rerot_get(i);
+        if (meta.active() && meta.episode_id == episode_id &&
+            meta.visibility == llama_rerot_visibility::public_live && meta.publish_epoch != 0) {
+            ++kept;
+        }
+    }
+
+    if (count != nullptr) {
+        *count = kept;
+    }
+    return true;
+}
+
+size_t llama_kv_cache::rerot_freeze_to_archive(
+        uint64_t episode_id,
+        llama_seq_id exec_seq,
+        llama_seq_id archive_seq) {
+    size_t count = 0;
+    if (!rerot_can_freeze_to_archive(episode_id, exec_seq, archive_seq, &count)) {
+        return 0;
+    }
+
+    auto & cells = v_cells[seq_to_stream[exec_seq]];
+    const size_t kept = cells.rerot_freeze_to_archive(episode_id, exec_seq, archive_seq);
+
+    GGML_ASSERT(kept == count);
+    return kept;
+}
+
+void llama_kv_cache::shift_turbo_keys(const llama_cparams & cparams) {
+    // K-shift is infrequent. Use the checked codec for every backend until a
+    // native fused Turbo shift exists. Read/write one layer/stream snapshot,
+    // not one synchronous GPU transfer per cell; leave unshifted bytes alone.
+    for (const auto & layer : layers) {
+        if (!llama_kv_is_turbo(layer.k->type)) {
+            continue;
+        }
+        const uint32_t il = layer.il;
+        const uint32_t hd = hparams.n_embd_head_k(il);
+        const uint32_t storage_hd = ((hd + 127) / 128) * 128;
+        const uint32_t rotary_dim = hparams.n_rot(il);
+        const uint32_t n_heads = hparams.n_head_kv(il);
+        std::vector<float> factors;
+        if (auto * tensor = model.get_rope_factors(cparams, il)) {
+            if (tensor->type != GGML_TYPE_F32 || tensor->ne[0] < rotary_dim / 2) {
+                throw std::runtime_error("Turbo K-shift: invalid RoPE factors");
+            }
+            factors.resize(rotary_dim / 2);
+            ggml_backend_tensor_get(tensor, factors.data(), 0, factors.size() * sizeof(float));
+        }
+        std::vector<float> omega(rotary_dim / 2), scale_sq(rotary_dim / 2);
+        if (!triattention_build_rope_tables(
+                omega.data(), scale_sq.data(), rotary_dim,
+                model.get_rope_freq_base(cparams, il), model.get_rope_freq_scale(cparams, il),
+                (int32_t) cparams.n_ctx_orig_yarn, cparams.yarn_ext_factor,
+                cparams.yarn_attn_factor, cparams.yarn_beta_fast, cparams.yarn_beta_slow,
+                factors.empty() ? nullptr : factors.data())) {
+            throw std::runtime_error("Turbo K-shift: invalid RoPE parameters");
+        }
+        const bool neox = hparams.rope_type != LLAMA_ROPE_TYPE_NORM;
+        const auto * traits = ggml_get_type_traits(layer.k->type);
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            const auto & cells = v_cells[s];
+            if (!cells.get_has_shift()) {
+                continue;
+            }
+            auto * k = layer.k_stream[s];
+            const size_t bytes = ggml_nbytes(k);
+            std::vector<uint8_t> snapshot(bytes);
+            std::vector<float> row(storage_hd * n_heads);
+            ggml_backend_tensor_get(k, snapshot.data(), 0, bytes);
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (cells.is_empty(i) || cells.get_shift(i) == 0) {
+                    continue;
+                }
+                const llama_pos delta = cells.get_shift(i);
+                uint8_t * encoded = snapshot.data() + (size_t) i * k->nb[1];
+                llama_kv_decode_key(k->type, encoded, row.data(), (uint32_t) row.size());
+                for (uint32_t h = 0; h < n_heads; ++h) {
+                    float * key = row.data() + h * storage_hd;
+                    llama_kv_hadamard(key, hd, attn_rot_k_nrot);
+                    const uint32_t rope_offset = hparams.n_lora_kv > 0 ? hd - rotary_dim : 0;
+                    llama_kv_shift_key(key + rope_offset, rotary_dim, neox, omega.data(), delta);
+                    llama_kv_hadamard(key, hd, attn_rot_k_nrot);
+                }
+                // from_float_ref performs the forward Turbo WHT itself.
+                traits->from_float_ref(row.data(), encoded, (int64_t) row.size());
+            }
+            ggml_backend_tensor_set(k, snapshot.data(), 0, bytes);
+        }
+    }
+}
+
+bool llama_kv_cache::rerot_blocks_state_save(llama_seq_id seq_id) const {
+    if (seq_id == -1) {
+        for (const auto & tag : rerot_write_tags) {
+            if (tag.active()) {
+                return true;
+            }
+        }
+        for (const auto & view : rerot_reader_views) {
+            if (view.active()) {
+                return true;
+            }
+        }
+        for (const auto & cells : v_cells) {
+            if (cells.rerot_has_active()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size()) {
+        return false;
+    }
+    if ((size_t) seq_id < rerot_write_tags.size() && rerot_write_tags[seq_id].active()) {
+        return true;
+    }
+    if ((size_t) seq_id < rerot_reader_views.size() && rerot_reader_views[seq_id].active()) {
+        return true;
+    }
+    return v_cells[seq_to_stream[seq_id]].rerot_has_active_seq(seq_id);
+}
+
+bool llama_kv_cache::rerot_can_reclassify_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_rerot_visibility expected,
+        llama_rerot_visibility replacement,
+        uint64_t publish_epoch,
+        size_t * count) const {
+    if (count) {
+        *count = 0;
+    }
+    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID ||
+        expected == llama_rerot_visibility::normal || replacement == llama_rerot_visibility::normal ||
+        (replacement == llama_rerot_visibility::public_live && publish_epoch == 0) ||
+        (replacement != llama_rerot_visibility::public_live && publish_epoch != 0)) {
+        return false;
+    }
+
+    size_t matches = 0;
+    for (const auto & cells : v_cells) {
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (cells.is_empty(cell)) {
+                continue;
+            }
+            const auto & meta = cells.rerot_get(cell);
+            if (meta.episode_id != episode_id || meta.run_id != run_id) {
+                continue;
+            }
+            if (meta.visibility != expected) {
+                return false;
+            }
+            ++matches;
+        }
+    }
+
+    if (count) {
+        *count = matches;
+    }
+    return matches > 0;
+}
+
+bool llama_kv_cache::rerot_can_publish_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        size_t * count) const {
+    if (count) {
+        *count = 0;
+    }
+    if (episode_id == 0 || run_id == LLAMA_REROT_RUN_INVALID) {
+        return false;
+    }
+
+    size_t matches = 0;
+    for (const auto & cells : v_cells) {
+        for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+            if (cells.is_empty(cell)) {
+                continue;
+            }
+            const auto & meta = cells.rerot_get(cell);
+            if (meta.episode_id != episode_id || meta.run_id != run_id) {
+                continue;
+            }
+            if (meta.visibility != llama_rerot_visibility::pending_record) {
+                return false;
+            }
+            ++matches;
+        }
+    }
+
+    if (count) {
+        *count = matches;
+    }
+    return matches > 0;
+}
+
+bool llama_kv_cache::rerot_set_reader_view(
+        llama_seq_id seq_id,
+        const llama_rerot_reader_state & view) {
+    if (seq_id < 0 || (size_t) seq_id >= rerot_reader_views.size() || !view.active() ||
+        view.reader == LLAMA_REROT_NODE_INVALID || view.query_run == LLAMA_REROT_RUN_INVALID ||
+        view.ordered_runs.empty()) {
+        return false;
+    }
+
+    std::unordered_set<llama_rerot_run_id> seen;
+    seen.reserve(view.ordered_runs.size());
+    bool query_run_seen = false;
+    for (const auto run_id : view.ordered_runs) {
+        if (run_id == LLAMA_REROT_RUN_INVALID || !seen.insert(run_id).second) {
+            return false;
+        }
+        query_run_seen |= run_id == view.query_run;
+    }
+    if (!query_run_seen) {
+        return false;
+    }
+
+    rerot_reader_views[seq_id] = view;
+    return true;
+}
+
+void llama_kv_cache::rerot_clear_reader_view(llama_seq_id seq_id) {
+    if (seq_id >= 0 && (size_t) seq_id < rerot_reader_views.size()) {
+        rerot_reader_views[seq_id].reset();
+    }
+}
+
+bool llama_kv_cache::rerot_batch_active(const llama_ubatch & ubatch) const {
+    bool any = false;
+    bool all = true;
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (!ubatch.seq_id || !ubatch.seq_id[i] || ubatch.n_seq_id[i] < 1) {
+            all = false;
+            continue;
+        }
+        const llama_seq_id seq_id = ubatch.seq_id[i][0];
+        const bool active = seq_id >= 0 && (size_t) seq_id < rerot_reader_views.size() &&
+                            rerot_reader_views[seq_id].active();
+        any |= active;
+        all &= active;
+    }
+    if (any && !all) {
+        throw std::runtime_error("RERoT and ordinary query rows cannot share one ubatch");
+    }
+    return any;
+}
+
+llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
+        const llama_ubatch & ubatch,
+        uint32_t n_kv) const {
+    llama_rerot_attn_layout result;
+    if (!rerot_batch_active(ubatch)) {
+        return result;
+    }
+    if (n_stream != 1 || v_cells.size() != 1) {
+        throw std::runtime_error("RERoT indexed attention requires unified KV");
+    }
+
+    const auto & cells = v_cells[0];
+    if (n_kv > cells.size()) {
+        throw std::runtime_error("RERoT attention layout exceeds KV cache size");
+    }
+
+    result.n_queries = ubatch.n_tokens;
+    result.query_offsets.reserve(size_t(result.n_queries) + 1);
+    result.query_offsets.push_back(0);
+
+    for (uint32_t query = 0; query < ubatch.n_tokens; ++query) {
+        const llama_seq_id seq_id = ubatch.seq_id[query][0];
+        const auto & reader = rerot_reader_views.at(seq_id);
+
+        std::vector<llama_rerot_key_record> keys;
+        keys.reserve(n_kv);
+        for (uint32_t key = 0; key < n_kv; ++key) {
+            if (cells.is_empty(key)) {
+                continue;
+            }
+            keys.push_back({
+                key,
+                cells.pos_get(key),
+                cells.seq_has(key, seq_id),
+                cells.rerot_get(key),
+            });
+        }
+
+        auto query_layout = llama_rerot_build_query_layout(reader, ubatch.pos[query], keys);
+        const uint32_t group_base = static_cast<uint32_t>(result.groups.size());
+        for (auto group : query_layout.groups) {
+            group.query_index = query;
+            result.groups.push_back(group);
+        }
+        for (auto entry : query_layout.entries) {
+            entry.group_index += group_base;
+            result.entries.push_back(entry);
+        }
+        result.query_offsets.push_back(static_cast<uint32_t>(result.entries.size()));
+    }
+
+    std::string error;
+    if (!result.validate(n_kv, &error)) {
+        throw std::runtime_error("invalid RERoT attention layout: " + error);
+    }
+    return result;
+}
+
+llama_kv_cache::rerot_resolved_view llama_kv_cache::rerot_resolve_view(
+        const llama_rerot_reader_view & view) const {
+    rerot_resolved_view result;
+    result.episode_id = view.episode_id;
+    result.reader = view.reader;
+
+    for (const auto & logical_run : view.runs) {
+        std::vector<rerot_resolved_cell> run_cells;
+
+        for (uint32_t stream = 0; stream < v_cells.size(); ++stream) {
+            const auto & cells = v_cells[stream];
+            for (uint32_t cell = 0; cell < cells.size(); ++cell) {
+                if (cells.is_empty(cell)) {
+                    continue;
+                }
+
+                const auto & meta = cells.rerot_get(cell);
+                if (meta.episode_id != view.episode_id || meta.run_id != logical_run.run_id ||
+                    meta.node_id != logical_run.owner) {
+                    continue;
+                }
+
+                run_cells.push_back({
+                    stream,
+                    cell,
+                    cells.pos_get(cell),
+                    0,
+                    meta,
+                });
+            }
+        }
+
+        std::stable_sort(run_cells.begin(), run_cells.end(), [](const auto & lhs, const auto & rhs) {
+            if (lhs.storage_pos != rhs.storage_pos) {
+                return lhs.storage_pos < rhs.storage_pos;
+            }
+            if (lhs.meta.frontier != rhs.meta.frontier) {
+                return lhs.meta.frontier < rhs.meta.frontier;
+            }
+            if (lhs.stream != rhs.stream) {
+                return lhs.stream < rhs.stream;
+            }
+            return lhs.cell < rhs.cell;
+        });
+
+        for (auto & resolved : run_cells) {
+            resolved.virtual_pos = result.query_virtual_pos++;
+            result.cells.push_back(std::move(resolved));
+        }
+    }
+
+    return result;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
@@ -3975,7 +6148,7 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     auto * k = layers[ikv].k;
 
-    const uint64_t kv_size      = get_size();
+    const uint64_t kv_size      = get_hot_size();
     const uint64_t n_embd_k_gqa = k->ne[0];
 
     // For turbo-padded caches, n_embd_k_gqa may be larger than hparams value
@@ -3991,14 +6164,28 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint32_t head_k_eff = (k_is_turbo && head_k % 128 != 0)
         ? ((head_k + 127) / 128) * 128 : head_k;
 
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    uint32_t n_kv_eff = n_kv;
+    uint32_t s0 = sinfo.s0;
+    uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    if (is_xkv_bounded_hot()) {
+        n_kv_eff = std::min(n_kv, (uint32_t) kv_size);
+        if (s0 >= n_stream) {
+            s0 = 0;
+        }
+        if (s0 + ns > n_stream) {
+            ns = (n_stream > s0) ? (n_stream - s0) : 1;
+        }
+        if (ns == 0) {
+            ns = 1;
+        }
+    }
 
     return ggml_view_4d(ctx, k,
-            head_k_eff, hparams.n_head_kv(il), n_kv, ns,
+            head_k_eff, hparams.n_head_kv(il), n_kv_eff, ns,
             ggml_row_size(k->type, head_k_eff),
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*s0);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -4006,7 +6193,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     auto * v = layers[ikv].v;
 
-    const uint64_t kv_size      = get_size();
+    const uint64_t kv_size      = get_hot_size();
     const uint64_t n_embd_v_gqa = v->ne[0];
 
     // [TAG_V_CACHE_VARIABLE] — for turbo-padded V, cache may be larger
@@ -4018,25 +6205,57 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint32_t head_v_eff = (v_is_turbo && head_v % 128 != 0)
         ? ((head_v + 127) / 128) * 128 : head_v;
 
-    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    uint32_t n_kv_eff = n_kv;
+    uint32_t s0 = sinfo.s0;
+    uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+    if (is_xkv_bounded_hot()) {
+        n_kv_eff = std::min(n_kv, (uint32_t) kv_size);
+        if (s0 >= n_stream) {
+            s0 = 0;
+        }
+        if (s0 + ns > n_stream) {
+            ns = (n_stream > s0) ? (n_stream - s0) : 1;
+        }
+        if (ns == 0) {
+            ns = 1;
+        }
+    }
 
     if (!v_trans) {
         // note: v->nb[1] <= v->nb[2]
         return ggml_view_4d(ctx, v,
-                head_v_eff, hparams.n_head_kv(il), n_kv, ns,
+                head_v_eff, hparams.n_head_kv(il), n_kv_eff, ns,
                 ggml_row_size(v->type, head_v_eff),                      // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                    // v->nb[2]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size),            // v->nb[3]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*sinfo.s0);
+                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*s0);
     }
 
     // note: v->nb[1] > v->nb[2]
     return ggml_view_4d(ctx, v,
-            n_kv, hparams.n_head_kv(il), head_v_eff, ns,
+            n_kv_eff, hparams.n_head_kv(il), head_v_eff, ns,
             ggml_row_size(v->type, kv_size*head_v_eff),              // v->nb[1]
             ggml_row_size(v->type, kv_size),                         // v->nb[2]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa),            // v->nb[3]
-            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
+            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*s0);
+}
+
+ggml_tensor * llama_kv_cache::get_hot_k(ggml_context * ctx, int32_t il, const slot_info & sinfo) const {
+    if (!is_xkv_bounded_hot()) {
+        LLAMA_LOG_ERROR("%s: hot K view requested on unbounded cache\n", __func__);
+        return nullptr;
+    }
+    // Full physical span: hot tensor rows are indexed sparsely by hot_idxs,
+    // so the view covers hot_kv_size rows, never a logical n_kv count.
+    return get_k(ctx, il, hot_kv_size, sinfo);
+}
+
+ggml_tensor * llama_kv_cache::get_hot_v(ggml_context * ctx, int32_t il, const slot_info & sinfo) const {
+    if (!is_xkv_bounded_hot()) {
+        LLAMA_LOG_ERROR("%s: hot V view requested on unbounded cache\n", __func__);
+        return nullptr;
+    }
+    return get_v(ctx, il, hot_kv_size, sinfo);
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
@@ -4072,13 +6291,25 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     const int64_t n_stream = k->ne[2];
 
     if (n_stream > 1) {
-        const int64_t kv_size = get_size();
+        const int64_t kv_size = get_hot_size();
 
         assert(n_embd_gqa == k->ne[0]);
         assert(kv_size    == k->ne[1]);
 
         // merge the buffer across all streams because the idxs are global
         k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
+    }
+
+    // Logging hook to inspect k_cur inputs at build time
+    LLAMA_LOG_DEBUG("[cpy_k] layer %d: k_cur [%lld, %lld], n_tokens=%lld, n_embd_gqa=%lld, k type=%d\n",
+        il, (long long)k_cur->ne[0], (long long)k_cur->ne[1], (long long)n_tokens, (long long)n_embd_gqa, (int)k->type);
+
+    // Logging hook to inspect k_idxs values when available on host
+    if (k_idxs && k_idxs->data && ggml_backend_buffer_is_host(k_idxs->buffer)) {
+        const int64_t * idxs_ptr = (const int64_t *) k_idxs->data;
+        for (int64_t i = 0; i < std::min<int64_t>(10, n_tokens); ++i) {
+            LLAMA_LOG_ERROR("[cpy_k] layer %d: token %lld -> k_idx %lld\n", il, (long long)i, (long long)idxs_ptr[i]);
+        }
     }
 
     // store the current K values into the cache
@@ -4126,7 +6357,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
         v_cur = ggml_view_2d(ctx, v_cur, n_embd_gqa, n_tokens, v_cur->nb[2], 0);
 
         if (n_stream > 1) {
-            const int64_t kv_size = get_size();
+            const int64_t kv_size = get_hot_size();
 
             assert(n_embd_gqa == v->ne[0]);
             assert(kv_size    == v->ne[1]);
@@ -4195,9 +6426,25 @@ ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
     ggml_tensor * res = nullptr;
 
     if (attn_rot_k) {
-        // Resolved once at cache construction: writer, scorer and K-shift
-        // must all use the same transform even if the environment changes.
-        res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, attn_rot_k_nrot, attn_rot_k_nrot);
+        // EXPERIMENT (master TODO): force smallest rotation matrix (nrot=64)
+        // for K, mirroring V's choice. Master defaults to the largest power-of-2
+        // that divides head_dim, but the upstream comment hypothesizes smaller
+        // tiles preserve more local structure → less PPL hit on sensitive models
+        // (gemma-4 26B-A4B reportedly regresses with the largest tile).
+        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
+        const char * LLAMA_ATTN_ROT_K_NROT = getenv("LLAMA_ATTN_ROT_K_NROT");
+        int nrot = LLAMA_ATTN_ROT_K_NROT ? atoi(LLAMA_ATTN_ROT_K_NROT) : 64;
+
+        // Original master behavior (largest power-of-2): set LLAMA_ATTN_ROT_K_NROT=0
+        if (nrot == 0) {
+            nrot = 64;
+            do {
+                nrot *= 2;
+            } while (n_embd_head_k_all % nrot == 0);
+            nrot /= 2;
+        }
+
+        res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
         ggml_set_input(res);
         ggml_set_name(res, "attn_inp_k_rot");
     }
@@ -4232,12 +6479,26 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
 
+    const bool use_hot = is_xkv_bounded_hot() && !sinfo.hot_idxs.empty();
+    const int64_t stride = get_hot_size();
+
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-        const int64_t offs = sinfo.strm[s]*get_size();
+        const int64_t offs = sinfo.strm[s]*stride;
+        const auto & cur_idxs = use_hot ? sinfo.hot_idxs[s] : sinfo.idxs[s];
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
-            data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+            data[s*sinfo.size() + i] = offs + cur_idxs[i];
         }
+    }
+    // Host-side trace for the hot-slot38 NaN hunt: ubatch row -> dst slot,
+    // with RoPE position and output flag. RoPE of finite inputs with finite
+    // positions is finite, so finite positions here pin the NaN to pre-rope
+    // Kcur (matmul/norm); a non-finite position pins it to the RoPE cache.
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const long long pos = ubatch->pos ? (long long)ubatch->pos[i] : -1ll;
+        const int out = ubatch->output ? (int)ubatch->output[i] : -1;
+        LLAMA_LOG_ERROR("[k_idxs] ubatch_row %u -> dst slot %lld (pos %lld out %d hot %d)\n",
+            i, (long long)data[i], pos, out, (int)use_hot);
     }
 }
 
@@ -4248,26 +6509,31 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
 
+    const bool use_hot = is_xkv_bounded_hot() && !sinfo.hot_idxs.empty();
+    const int64_t stride = get_hot_size();
+
     if (!v_trans) {
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            const int64_t offs = sinfo.strm[s]*get_size();
+            const int64_t offs = sinfo.strm[s]*stride;
+            const auto & cur_idxs = use_hot ? sinfo.hot_idxs[s] : sinfo.idxs[s];
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
-                data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+                data[s*sinfo.size() + i] = offs + cur_idxs[i];
             }
         }
     } else {
         // note: the V cache is transposed when not using flash attention
-        const int64_t kv_size = get_size();
+        const int64_t kv_size = stride;
 
         const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa_max();
 
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
             const int64_t offs = sinfo.strm[s]*kv_size*n_embd_v_gqa;
+            const auto & cur_idxs = use_hot ? sinfo.hot_idxs[s] : sinfo.idxs[s];
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                    data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*kv_size + sinfo.idxs[s][i];
+                    data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*kv_size + cur_idxs[i];
                 }
             }
         }
@@ -4279,11 +6545,70 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
 
     int32_t * data = (int32_t *) dst->data;
 
+
+    if (is_xkv_bounded_hot()) {
+        const uint32_t hot_size = get_hot_size();
+        std::fill(data, data + hot_size * n_stream, 0);
+        if (xkv_hot_pool) {
+            for (uint32_t s = 0; s < n_stream; ++s) {
+                const auto & cells = v_cells[s];
+                for (uint32_t i = 0; i < cells.size(); ++i) {
+                    if (!cells.is_empty(i) && cells.get_shift(i) != 0) {
+                        uint64_t pid = cells.payload_id_get(i);
+                        uint32_t slot = 0;
+                        if (xkv_hot_pool->find_slot(pid, slot) && slot < hot_size) {
+                            data[s * hot_size + slot] = cells.get_shift(i);
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         const auto & cells = v_cells[s];
 
         for (uint32_t i = 0; i < cells.size(); ++i) {
             data[s*cells.size() + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
+        }
+    }
+}
+
+void llama_kv_cache::set_input_k_shift_rows(ggml_tensor * dst) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+
+    int32_t * data = (int32_t *) dst->data;
+    int64_t n = 0;
+    const int64_t cap = dst->ne[0];
+
+    // Global hot-row indices (stream*hot + slot) for cells carrying a
+    // nonzero shift. Bounded caches resolve pool slots; unbounded caches
+    // address logical rows directly. Mirrors the build-time count scan, so
+    // counts agree (no interleaving mutation between build and set_input).
+    if (is_xkv_bounded_hot() && xkv_hot_pool) {
+        const uint32_t hot_size = get_hot_size();
+        for (uint32_t s = 0; s < n_stream && n < cap; ++s) {
+            const auto & cells = v_cells[s];
+            for (uint32_t i = 0; i < cells.size() && n < cap; ++i) {
+                if (cells.is_empty(i) || cells.get_shift(i) == 0) {
+                    continue;
+                }
+                uint32_t slot = 0;
+                if (xkv_hot_pool->find_slot(cells.payload_id_get(i), slot) && slot < hot_size) {
+                    data[n++] = (int32_t)(s * hot_size + slot);
+                }
+            }
+        }
+    } else {
+        for (uint32_t s = 0; s < n_stream && n < cap; ++s) {
+            const auto & cells = v_cells[s];
+            for (uint32_t i = 0; i < cells.size() && n < cap; ++i) {
+                if (!cells.is_empty(i) && cells.get_shift(i) != 0) {
+                    data[n++] = (int32_t)(s * cells.size() + i);
+                }
+            }
         }
     }
 }
@@ -4635,70 +6960,6 @@ size_t llama_kv_cache::size_v_bytes() const {
     return size_v_bytes;
 }
 
-void llama_kv_cache::shift_turbo_keys(const llama_cparams & cparams) {
-    // K-shift is infrequent. Use the checked codec for every backend until a
-    // native fused Turbo shift exists. Read/write one layer/stream snapshot,
-    // not one synchronous GPU transfer per cell; leave unshifted bytes alone.
-    for (const auto & layer : layers) {
-        if (!llama_kv_is_turbo(layer.k->type)) {
-            continue;
-        }
-        const uint32_t il = layer.il;
-        const uint32_t hd = hparams.n_embd_head_k(il);
-        const uint32_t storage_hd = ((hd + 127) / 128) * 128;
-        const uint32_t rotary_dim = hparams.n_rot(il);
-        const uint32_t n_heads = hparams.n_head_kv(il);
-        std::vector<float> factors;
-        if (auto * tensor = model.get_rope_factors(cparams, il)) {
-            if (tensor->type != GGML_TYPE_F32 || tensor->ne[0] < rotary_dim / 2) {
-                throw std::runtime_error("Turbo K-shift: invalid RoPE factors");
-            }
-            factors.resize(rotary_dim / 2);
-            ggml_backend_tensor_get(tensor, factors.data(), 0, factors.size() * sizeof(float));
-        }
-        std::vector<float> omega(rotary_dim / 2), scale_sq(rotary_dim / 2);
-        if (!triattention_build_rope_tables(
-                omega.data(), scale_sq.data(), rotary_dim,
-                model.get_rope_freq_base(cparams, il), model.get_rope_freq_scale(cparams, il),
-                (int32_t) cparams.n_ctx_orig_yarn, cparams.yarn_ext_factor,
-                cparams.yarn_attn_factor, cparams.yarn_beta_fast, cparams.yarn_beta_slow,
-                factors.empty() ? nullptr : factors.data())) {
-            throw std::runtime_error("Turbo K-shift: invalid RoPE parameters");
-        }
-        const bool neox = hparams.rope_type != LLAMA_ROPE_TYPE_NORM;
-        const auto * traits = ggml_get_type_traits(layer.k->type);
-        for (uint32_t s = 0; s < n_stream; ++s) {
-            const auto & cells = v_cells[s];
-            if (!cells.get_has_shift()) {
-                continue;
-            }
-            auto * k = layer.k_stream[s];
-            const size_t bytes = ggml_nbytes(k);
-            std::vector<uint8_t> snapshot(bytes);
-            std::vector<float> row(storage_hd * n_heads);
-            ggml_backend_tensor_get(k, snapshot.data(), 0, bytes);
-            for (uint32_t i = 0; i < cells.size(); ++i) {
-                const llama_pos delta = cells.get_shift(i);
-                if (cells.is_empty(i) || delta == 0) {
-                    continue;
-                }
-                uint8_t * encoded = snapshot.data() + (size_t) i * k->nb[1];
-                llama_kv_decode_key(k->type, encoded, row.data(), (uint32_t) row.size());
-                for (uint32_t h = 0; h < n_heads; ++h) {
-                    float * key = row.data() + h * storage_hd;
-                    llama_kv_hadamard(key, hd, attn_rot_k_nrot);
-                    const uint32_t rope_offset = hparams.n_lora_kv > 0 ? hd - rotary_dim : 0;
-                    llama_kv_shift_key(key + rope_offset, rotary_dim, neox, omega.data(), delta);
-                    llama_kv_hadamard(key, hd, attn_rot_k_nrot);
-                }
-                // from_float_ref performs the forward Turbo WHT itself.
-                traits->from_float_ref(row.data(), encoded, (int64_t) row.size());
-            }
-            ggml_backend_tensor_set(k, snapshot.data(), 0, bytes);
-        }
-    }
-}
-
 ggml_tensor * llama_kv_cache::build_rope_shift(
         const llama_cparams & cparams,
                ggml_context * ctx,
@@ -4760,6 +7021,13 @@ public:
 
     ggml_tensor * k_shift; // I32 [kv_size*n_stream]
 
+    // I64 [n_shifted]: global hot-row indices (stream*hot + slot) with
+    // nonzero shift, built host-side alongside k_shift. Turbo write-back
+    // (set_rows) addresses only these rows so unshifted rows stay
+    // byte-identical (a dense re-encode would spray requant noise).
+    // Null when no Turbo K layer needs it.
+    ggml_tensor * k_shift_rows = nullptr;
+
     // note: assumes k_rot^2 == I
     ggml_tensor * k_rot = nullptr;
 
@@ -4771,6 +7039,10 @@ void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
 
     if (k_shift) {
         kv_self->set_input_k_shift(k_shift);
+    }
+
+    if (k_shift_rows) {
+        kv_self->set_input_k_shift_rows(k_shift_rows);
     }
 
     if (k_rot) {
@@ -4787,18 +7059,56 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
     auto inp = std::make_unique<llm_graph_input_k_shift>(this);
 
-    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) get_size()*n_stream);
+    const int64_t k_shift_size = (int64_t) get_hot_size() * n_stream;
+    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, k_shift_size);
     ggml_set_input(inp->k_shift);
 
     inp->k_rot = build_input_k_rot(ctx);
 
     const auto & cparams = lctx->get_cparams();
 
+    // Number of hot rows carrying a nonzero shift (exact set_rows count).
+    // Counted here at build time from cells+pool; set_input fills the same
+    // scan with no interleaving mutation, so the counts agree.
+    int64_t n_shifted_rows = 0;
+    bool any_turbo_k = false;
+    for (const auto & layer : layers) {
+        if (layer.k->type == GGML_TYPE_TURBO2_0 || layer.k->type == GGML_TYPE_TURBO3_0 ||
+            layer.k->type == GGML_TYPE_TURBO4_0) {
+            any_turbo_k = true;
+            break;
+        }
+    }
+    if (any_turbo_k) {
+        const uint32_t hot_size = get_hot_size();
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            const auto & cells = v_cells[s];
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (!cells.is_empty(i) && cells.get_shift(i) != 0) {
+                    // Bounded caches count only pool-bound rows (mirrors the
+                    // setter exactly); unbounded caches count every shifted
+                    // cell. Same scan, same order: counts agree at set_input.
+                    if (is_xkv_bounded_hot() && xkv_hot_pool) {
+                        uint64_t pid = cells.payload_id_get(i);
+                        uint32_t slot = 0;
+                        if (pid != 0 && xkv_hot_pool->find_slot(pid, slot)) {
+                            ++n_shifted_rows;
+                        }
+                    } else if (!is_xkv_bounded_hot()) {
+                        ++n_shifted_rows;
+                    }
+                }
+            }
+        }
+        if (n_shifted_rows > 0) {
+            inp->k_shift_rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_shifted_rows);
+            ggml_set_input(inp->k_shift_rows);
+        }
+    }
+
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
         const bool is_turbo_k = (layer.k->type == GGML_TYPE_TURBO2_0 || layer.k->type == GGML_TYPE_TURBO3_0 || layer.k->type == GGML_TYPE_TURBO4_0);
-        if (is_turbo_k) { continue; }
-
         const int64_t n_head_kv    = hparams.n_head_kv(il);
         const int64_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
 
@@ -4811,9 +7121,59 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
         ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
 
+        if (is_turbo_k) {
+            // TurboQuant hot rows store WHT-domain quantized blocks, so the
+            // n_rot-column rope view (which would split 128-element blocks)
+            // and the generic cpy write-back (no Turbo quantize path on
+            // device) cannot run. Decode full block-aligned head rows,
+            // rotate the IDENTICAL rope section as stock, re-encode in place.
+            // Only shifted rows are written back (set_rows by k_shift_rows)
+            // so unshifted rows stay byte-identical (no requant noise).
+            if (inp->k_shift_rows == nullptr) {
+                continue; // no shifted rows addressable: nothing to do
+            }
+            const int64_t head_w = layer.k->ne[0] / n_head_kv;
+            if (n_head_kv <= 0 || layer.k->ne[0] % n_head_kv != 0 || head_w % 128 != 0) {
+                LLAMA_LOG_ERROR("%s: turbo K layer %u head width not 128-aligned\n", __func__, il);
+                return nullptr;
+            }
+            ggml_tensor * kfull = ggml_view_3d(ctx, layer.k,
+                head_w, n_head_kv, k_shift_size,
+                ggml_row_size(layer.k->type, head_w), layer.k->nb[1], 0);
+            ggml_tensor * dec = ggml_cast(ctx, kfull, GGML_TYPE_F32);
+            ggml_tensor * canon = ggml_turbo_wht(ctx, dec, 1 /*inverse*/, 128, nullptr);
+            // Rope full canon rows (first n_rot cols only, identical to the old
+            // sec-view section) so the result chains into the forward WHT.
+            // NOTE: rope must chain into forward WHT. ggml_rope_ext is out-of-place
+            // (dup) and ggml_rope_ext_inplace returns a view alias: discarding the
+            // return value orphans the ROPE node from the graph, so forward WHT
+            // would re-encode unrotated canon (CPU no-op). Rope full canon rows
+            // with n_rot (touches first n_rot cols only, identical to sec view)
+            // so the result chains directly into the forward WHT.
+            ggml_tensor * roped = build_rope_shift(cparams, ctx, canon, inp->k_shift, inp->k_rot,
+                rope_factors, freq_base_l, freq_scale_l, il);
+            // Gather the shifted subset for write-back (F32 get_rows is
+            // universal); set_rows quantizes on device with the same
+            // wht_group contract as the K-write path (which performs forward WHT
+            // rotation inside quantization, e.g. copy_to_quant.comp / quantize_row_turbo*_group).
+            // Feeding an already-WHT-rotated tensor into set_rows would double-rotate.
+            ggml_tensor * flat = ggml_view_2d(ctx, roped, head_w * n_head_kv, k_shift_size,
+                roped->nb[2], 0);
+            ggml_tensor * sub = ggml_get_rows(ctx, flat, inp->k_shift_rows);
+            ggml_tensor * dst = layer.k;
+            if (n_stream > 1) {
+                dst = ggml_reshape_2d(ctx, dst, head_w * n_head_kv, k_shift_size);
+            }
+            ggml_tensor * back = ggml_set_rows(ctx, dst, sub, inp->k_shift_rows);
+            int32_t wht_group = 128;
+            memcpy(back->op_params, &wht_group, sizeof(int32_t));
+            ggml_build_forward_expand(gf, back);
+            continue;
+        }
+
         ggml_tensor * k =
             ggml_view_3d(ctx, layer.k,
-                n_rot, n_head_kv, get_size()*n_stream,
+                n_rot, n_head_kv, k_shift_size,
                 ggml_row_size(layer.k->type, n_embd_head_k),
                 ggml_row_size(layer.k->type, n_embd_k_gqa),
                 ggml_row_size(layer.k->type, n_embd_nope));
@@ -4908,6 +7268,10 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         state_write_meta(io, cr, seq_id);
         state_write_data(io, cr);
     }
+
+    // XKV trailer: full + per-seq subset (PARTIAL_ONLY checkpoints excluded
+    // inside the helper). OFF writes zero extra bytes.
+    xkv_state_write_trailer(io, seq_id, flags);
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -4915,8 +7279,6 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     if (other) {
         return;
     }
-
-    fp_bump();
 
     GGML_UNUSED(flags);
 
@@ -4927,6 +7289,11 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
     if (n_stream_cur != n_stream) {
         throw std::runtime_error("n_stream mismatch");
     }
+
+    // Retained granted-slot order for the XKV trailer (per-seq rebind).
+    slot_info last_sinfo;
+    uint32_t last_strm = 0;
+    bool have_slots = false;
 
     for (uint32_t s = 0; s < n_stream; ++s) {
         uint32_t cell_count;
@@ -4957,7 +7324,13 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
             }
             throw std::runtime_error("failed to restore kv cache");
         }
+        last_sinfo = sinfo;
+        last_strm = strm;
+        have_slots = true;
     }
+    // XKV trailer: full + per-seq subset (PARTIAL_ONLY checkpoints excluded
+    // inside). Absent sections = legacy bytes.
+    xkv_state_read_trailer(io, seq_id, flags, have_slots ? &last_sinfo : nullptr, last_strm);
 }
 
 void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id) const {
@@ -5090,6 +7463,1252 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     }
 }
 
+llama_xkv::xkv_state_fingerprints llama_kv_cache::xkv_state_expected_fps(
+        const llama_xkv::xkv_state_config & cfg) const {
+    auto fp = llama_xkv::make_config_fingerprints(cfg);
+    std::vector<uint8_t> buf;
+    auto pu32 = [&](uint32_t v) {
+        for (int i = 0; i < 4; ++i) {
+            buf.push_back((uint8_t) ((v >> (i * 8)) & 0xFF));
+        }
+    };
+    auto pu64 = [&](uint64_t v) {
+        for (int i = 0; i < 8; ++i) {
+            buf.push_back((uint8_t) ((v >> (i * 8)) & 0xFF));
+        }
+    };
+    auto pf = [&](float v) {
+        uint32_t b = 0;
+        std::memcpy(&b, &v, sizeof(b));
+        pu32(b);
+    };
+    // Model load-artifact identity (name, arch, quant type, tensor count, file
+    // size, structural dims): fast metadata screening only, NOT content proof.
+    // Same-name same-size same-shape files with different weights can match
+    // here; exact file-content proof is provenance.model_sha256 (required
+    // nonzero for factored restore, enforced in validate_image).
+    buf.clear();
+    pu32((uint32_t) model.arch);
+    for (char ch : model.name) {
+        buf.push_back((uint8_t) ch);
+    }
+    buf.push_back(0);
+    pu32((uint32_t) model.ftype());
+    pu64((uint64_t) model.n_tensors());
+    pu64((uint64_t) model.size());
+    pu32(hparams.n_layer());
+    pu32(hparams.n_embd);
+    pu32(hparams.n_ctx_train);
+    pu32(hparams.n_head_kv(0));
+    pu32(hparams.n_embd_head_k(0));
+    pu32(hparams.n_embd_head_v(0));
+    fp.model = llama_xkv::xkv_state_checksum(buf.data(), buf.size());
+    // RoPE configuration identity.
+    buf.clear();
+    pf(hparams.rope_freq_base_train);
+    pf(hparams.rope_freq_scale_train);
+    pu32((uint32_t) hparams.rope_type);
+    pu32((uint32_t) hparams.rope_scaling_type_train);
+    pf(hparams.rope_attn_factor);
+    pu32(hparams.n_rot(0));
+    fp.rope = llama_xkv::xkv_state_checksum(buf.data(), buf.size());
+    // Tri calibration identity (presence + ratio + window + exact validated
+    // content fingerprint). Two same-shape files with different stats hash
+    // differently here and in the provenance digest below.
+    buf.clear();
+    pu32(tri_scorer != nullptr ? 1u : 0u);
+    uint64_t ratio_bits = 0;
+    double ratio = tri_ratio;
+    std::memcpy(&ratio_bits, &ratio, sizeof(ratio_bits));
+    pu64(ratio_bits);
+    pu32(tri_recent_window);
+    uint64_t cal_content = 0;
+    if (tri_scorer != nullptr) {
+        cal_content = tri_scorer->calibration_content_fingerprint();
+    }
+    pu64(cal_content);
+    fp.tri_calibration = llama_xkv::xkv_state_checksum(buf.data(), buf.size());
+    return fp;
+}
+
+// Cache-side provenance digests. model_sha256 is the EXACT source-artifact
+// file-content digest (lazy, cached in llama_model; zeros when source paths
+// are unavailable, e.g. memory/file-object loads). It is NEVER a metadata
+// digest: same-name same-size same-shape GGUFs with different weights hash
+// differently because every content byte is hashed. Tri digest is the
+// calibration content SHA-256 when a valid scorer exists (zeros = Tri OFF).
+// Source digest stays zero cache-side; enforced via fp.source + config equality.
+static llama_xkv::xkv_state_provenance xkv_state_bridge_provenance(
+        const llama_model & model, const triattention_scorer * scorer) {
+    llama_xkv::xkv_state_provenance prov;
+    uint8_t digest[32];
+    if (model.source_artifact_sha256(digest)) {
+        std::memcpy(prov.model_sha256, digest, 32);
+    }
+    if (scorer != nullptr) {
+        if (scorer->calibration_content_sha256(digest)) {
+            std::memcpy(prov.tri_calibration_sha256, digest, 32);
+        }
+    }
+    return prov;
+}
+
+void llama_kv_cache::xkv_state_write_trailer(llama_io_write_i & io, llama_seq_id seq_id,
+                                              llama_state_seq_flags flags) const {
+    const bool per_seq = (seq_id != -1);
+    // XKV OFF (no store) writes zero extra bytes. PARTIAL_ONLY checkpoints
+    // (speculative/RERoT snapshots) stay lightweight stamps/refs: no store.
+    if (other || !xkv_store) {
+        return;
+    }
+    if (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) {
+        return;
+    }
+    const auto acc = xkv_store->get_accounting();
+    if (acc.factored_bytes == 0) {
+        return; // hot-only/empty: legacy bytes already restore everything
+    }
+    auto fail = [](const std::string & m) {
+        throw std::runtime_error("llama_kv_cache::xkv_state_write_trailer: " + m);
+    };
+    // 1. Enumerate live cells in legacy save order (mirrors state_write cell
+    // selection exactly: non-empty, seq match, SWA-mask). Ordinal = position
+    // among saved cells of the stream; restore rebinds by ordinal.
+    struct enum_cell {
+        uint32_t stream;
+        uint32_t ordinal;
+        uint64_t pid;
+        uint64_t gen;
+    };
+    std::vector<enum_cell> ecells;
+    std::vector<std::pair<uint64_t, uint64_t>> ids; // dedup (pid, gen)
+    for (uint32_t s = 0; s < (uint32_t) v_cells.size(); ++s) {
+        const auto & cells = v_cells[s];
+        uint32_t ordinal = 0;
+        for (uint32_t i = 0; i < (uint32_t) cells.size(); ++i) {
+            if (cells.is_empty(i)) {
+                continue;
+            }
+            if (seq_id != -1) {
+                if (!cells.seq_has(i, seq_id)) {
+                    continue;
+                }
+                const bool masked = llama_hparams::is_masked_swa(n_swa, swa_type, cells.pos_get(i),
+                                                                 cells.seq_pos_max(seq_id));
+                if (masked) {
+                    continue;
+                }
+            }
+            const uint64_t pid = cells.payload_id_get(i);
+            if (pid == 0) {
+                continue;
+            }
+            const uint64_t gen = cells.storage_generation_get(i);
+            ecells.push_back({s, ordinal, pid, gen});
+            ++ordinal;
+            bool seen = false;
+            for (const auto & q : ids) {
+                if (q.first == pid) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                ids.emplace_back(pid, gen);
+            }
+        }
+    }
+    // 2. Hot bindings are authoritative for hot rows.
+    const auto hot_snap = xkv_store->list_hot_payload_bindings();
+    std::map<uint64_t, llama_xkv::xkv_hot_payload_binding> hot_by_id;
+    for (const auto & h : hot_snap.bindings) {
+        hot_by_id[h.payload_id] = h;
+    }
+    // 3. Factored/flat live records from store locations.
+    std::vector<uint64_t> factored_pids;
+    std::vector<llama_xkv::xkv_state_payload> frec;
+    std::set<uint64_t> factored_set; // pids with factored locations (for cellmap)
+    for (const auto & pr : ids) {
+        const uint64_t pid = pr.first;
+        const uint64_t gen = pr.second;
+        const auto hit = hot_by_id.find(pid);
+        if (hit != hot_by_id.end()) {
+            if (hit->second.storage_generation != gen) {
+                fail("hot generation skew for payload " + std::to_string(pid));
+            }
+            llama_xkv::xkv_location loc;
+            if (xkv_store->find_location(pid, loc) &&
+                loc.kind != llama_xkv::xkv_location_kind::hot) {
+                fail("hot/store kind skew for payload " + std::to_string(pid));
+            }
+            continue;
+        }
+        llama_xkv::xkv_location loc;
+        if (!xkv_store->find_location(pid, loc)) {
+            continue; // pool-only residue; legacy tensor bytes cover it
+        }
+        if (loc.storage_generation != gen) {
+            fail("store generation skew for payload " + std::to_string(pid));
+        }
+        if (loc.state == llama_xkv::xkv_state::seal_candidate && loc.seal_tx_nonce != 0) {
+            fail("seal transaction active; quiesce maintenance before state save");
+        }
+        if (loc.kind == llama_xkv::xkv_location_kind::hot) {
+            fail("hot-kind location without hot binding for payload " + std::to_string(pid));
+        }
+        if (loc.kind == llama_xkv::xkv_location_kind::factored) {
+            factored_pids.push_back(pid);
+            factored_set.insert(pid);
+        } else if (loc.kind != llama_xkv::xkv_location_kind::flat_quantized) {
+            fail("unknown storage kind for payload " + std::to_string(pid));
+        }
+        llama_xkv::xkv_state_payload rec;
+        rec.payload_id = pid;
+        rec.generation = gen;
+        rec.live       = 1;
+        rec.locator    = loc;
+        frec.push_back(rec);
+    }
+    if (factored_pids.empty()) {
+        return; // no enumerable factored state; legacy bytes suffice
+    }
+    // Factored cell bindings in legacy save order (ordinal per stream).
+    // Hot/flat cells stay legacy dense and are never rebound: excluded here.
+    std::vector<llama_xkv::xkv_cell_binding> bindings;
+    for (const auto & e : ecells) {
+        if (factored_set.count(e.pid) == 0) {
+            continue;
+        }
+        llama_xkv::xkv_cell_binding b;
+        b.stream_idx = e.stream;
+        b.ordinal    = e.ordinal;
+        b.payload_id = e.pid;
+        b.generation = e.gen;
+        bindings.push_back(b);
+    }
+    // Hot bindings in scope (informational only; restore never installs pool
+    // rows from state). Cell-less pool residue is excluded.
+    std::vector<llama_xkv::xkv_hot_payload_binding> hot_in_scope;
+    for (const auto & h : hot_snap.bindings) {
+        bool tracked = false;
+        for (const auto & q : ids) {
+            if (q.first == h.payload_id) {
+                tracked = true;
+                break;
+            }
+        }
+        if (tracked) {
+            hot_in_scope.push_back(h);
+        }
+    }
+    // 4. Pinned segment snapshots behind the factored payloads.
+    const auto views = xkv_store->query_payload_segments(factored_pids);
+    std::vector<std::shared_ptr<const llama_xkv::xkv_segment>> raw_segs;
+    for (const auto & v : views.views) {
+        auto h = v.pin.handle();
+        if (!h) {
+            fail("segment pin lost during state save");
+        }
+        bool seen = false;
+        for (const auto & s : raw_segs) {
+            if (s.get() == h.get()) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            raw_segs.push_back(h);
+        }
+    }
+    if (raw_segs.empty()) {
+        fail("factored payloads without pinned segments");
+    }
+
+    // Batched encoded-stream readback for DEVICE_OWNED segments.
+    // DEVICE_OWNED segments have empty host byte vectors; their code streams live on
+    // device handles (BackendResidency). We collect all unique allocations, queue
+    // readbacks using xkv_backend_readback_batch with one sync, and populate
+    // xkv_state_readback so capture_image serializes exact code streams.
+    llama_xkv::xkv_state_readback dev_readback;
+    {
+        // Check if any segment is DEVICE_OWNED
+        bool has_device = false;
+        for (const auto & s : raw_segs) {
+            if (s->residency == GGML_XKV_RES_DEVICE_OWNED) {
+                has_device = true;
+                break;
+            }
+        }
+        if (has_device) {
+            // Group readbacks by actual executor owner from backend_bundle:
+            // Every device segment must have a valid executor, and all must agree or be grouped.
+            // No fallback temporary backend creation!
+            struct stream_key_map {
+                uint64_t seg_id;
+                uint64_t seg_ver;
+                uint32_t group_idx;
+                uint32_t role;
+                uint64_t alloc_id;
+            };
+            std::map<ggml_backend_t, std::map<uint64_t, std::shared_ptr<const llama_xkv::xkv_backend_allocation>>> exec_to_allocs;
+            std::vector<std::pair<ggml_backend_t, stream_key_map>> exec_key_maps;
+
+            for (const auto & s : raw_segs) {
+                if (s->residency != GGML_XKV_RES_DEVICE_OWNED || !s->backend_bundle) continue;
+                ggml_backend_t s_exec = s->backend_bundle->get_executor();
+                if (!s_exec) {
+                    fail("DEVICE_OWNED segment missing real executor in backend_bundle");
+                }
+                const auto & bundle = *s->backend_bundle;
+                for (const auto & g : s->groups) {
+                    auto match_handle = [&](uint64_t fp, llama_xkv::factor_role role) {
+                        for (const auto & h : bundle.handles) {
+                            if (h && h->get_descriptor_fingerprint() == fp && h->get_desc().role == role) {
+                                uint64_t aid = h->get_allocation_id();
+                                exec_to_allocs[s_exec][aid] = h;
+                                exec_key_maps.push_back({s_exec, {s->segment_id, s->segment_version, g.group_index, (uint32_t)role, aid}});
+                                break;
+                            }
+                        }
+                    };
+                    match_handle(g.a_k.desc.fingerprint(), llama_xkv::factor_role::a_k);
+                    if (g.b_k) match_handle(g.b_k->desc.fingerprint(), llama_xkv::factor_role::b_k);
+                    match_handle(g.a_v.desc.fingerprint(), llama_xkv::factor_role::a_v);
+                    if (g.b_v) match_handle(g.b_v->desc.fingerprint(), llama_xkv::factor_role::b_v);
+                    if (!g.landmark.bytes.empty() || g.landmark.desc.logical_shape.rows > 0) {
+                        match_handle(g.landmark.desc.fingerprint(), llama_xkv::factor_role::landmark);
+                    }
+                }
+            }
+
+            std::map<std::pair<ggml_backend_t, uint64_t>, std::vector<uint8_t>> downloaded_bytes;
+            for (const auto & kv_exec : exec_to_allocs) {
+                ggml_backend_t cur_exec = kv_exec.first;
+                const auto & cur_allocs = kv_exec.second;
+                if (cur_allocs.empty()) continue;
+
+                std::vector<uint64_t> alloc_ids_order;
+                std::vector<std::shared_ptr<const llama_xkv::xkv_backend_allocation>> alloc_vec;
+                for (const auto & kv_a : cur_allocs) {
+                    alloc_ids_order.push_back(kv_a.first);
+                    alloc_vec.push_back(kv_a.second);
+                }
+
+                llama_xkv::xkv_backend_batch_config rb_cfg;
+                rb_cfg.residency = GGML_XKV_RES_DEVICE_OWNED;
+                llama_xkv::xkv_backend_readback_result rb_res;
+                std::string rb_err;
+                if (!llama_xkv::xkv_backend_readback_batch(cur_exec, alloc_vec, rb_cfg, rb_res, &rb_err)) {
+                    fail("DEVICE_OWNED batched stream readback failed: " + rb_err);
+                }
+                if (rb_res.stream_bytes.size() != alloc_vec.size()) {
+                    fail("DEVICE_OWNED readback stream count mismatch");
+                }
+
+                for (size_t i = 0; i < alloc_ids_order.size(); ++i) {
+                    downloaded_bytes[{cur_exec, alloc_ids_order[i]}] = std::move(rb_res.stream_bytes[i]);
+                }
+            }
+
+            for (const auto & ekm : exec_key_maps) {
+                const auto & km = ekm.second;
+                llama_xkv::xkv_state_readback_entry rbe;
+                rbe.segment_id = km.seg_id;
+                rbe.segment_version = km.seg_ver;
+                rbe.group_index = km.group_idx;
+                rbe.role = km.role;
+                rbe.bytes = downloaded_bytes[{ekm.first, km.alloc_id}];
+                dev_readback.entries.push_back(std::move(rbe));
+            }
+        }
+    }
+
+    // Per-sequence export granularity (RAM demotion isolation):
+    // When seq_id != -1, serialize ONLY the rows referenced by the target
+    // sequence (shared prefix + private seq rows). Unrelated private rows from
+    // other sequences MUST NOT be copied into the envelope. We construct
+    // state-local compact segments that pack A_K/A_V rows, slice/recompute
+    // exact landmark chunks, and remap the factored_pids / frec locators.
+    std::vector<std::shared_ptr<const llama_xkv::xkv_segment>> segs;
+    if (per_seq) {
+        std::set<uint64_t> seq_pids(factored_pids.begin(), factored_pids.end());
+        for (const auto & orig_seg : raw_segs) {
+            // Find which rows in this segment belong to the target sequence
+            std::vector<uint32_t> kept_rows;
+            for (uint32_t r = 0; r < orig_seg->n_rows; ++r) {
+                if (orig_seg->live_rows[r] && seq_pids.count(orig_seg->row_payload_ids[r]) != 0) {
+                    kept_rows.push_back(r);
+                }
+            }
+            if (kept_rows.empty()) {
+                continue;
+            }
+            if (kept_rows.size() == orig_seg->n_rows) {
+                // All rows referenced; keep original segment as-is
+                segs.push_back(orig_seg);
+                continue;
+            }
+
+            // Build state-local compact segment
+            const uint32_t compact_n_rows = (uint32_t) kept_rows.size();
+            auto cseg = std::make_shared<llama_xkv::xkv_segment>();
+            cseg->segment_id = orig_seg->segment_id;
+            cseg->segment_version = orig_seg->segment_version;
+            cseg->profile = orig_seg->profile;
+            cseg->source = orig_seg->source;
+            cseg->profile_fingerprint = orig_seg->profile_fingerprint;
+            cseg->source_fingerprint = orig_seg->source_fingerprint;
+            cseg->layer_group_map_fingerprint = orig_seg->layer_group_map_fingerprint;
+            cseg->n_rows = compact_n_rows;
+            cseg->n_live_rows = compact_n_rows;
+            cseg->live_rows.assign(compact_n_rows, true);
+
+            // Remap row payload IDs and record new row index for locator updates
+            std::map<uint64_t, uint32_t> pid_to_compact_row;
+            for (uint32_t dst_r = 0; dst_r < compact_n_rows; ++dst_r) {
+                uint32_t src_r = kept_rows[dst_r];
+                uint64_t pid = orig_seg->row_payload_ids[src_r];
+                cseg->row_payload_ids.push_back(pid);
+                pid_to_compact_row[pid] = dst_r;
+            }
+
+            // Update frec locators to point to compact row indices
+            for (auto & rec : frec) {
+                if (rec.locator.segment_id == orig_seg->segment_id &&
+                    rec.locator.segment_version == orig_seg->segment_version) {
+                    auto it = pid_to_compact_row.find(rec.payload_id);
+                    if (it != pid_to_compact_row.end()) {
+                        rec.locator.row = it->second;
+                    }
+                }
+            }
+
+            // Pack groups: pack A_K / A_V rows, preserve shared B handles,
+            // slice landmark chunks
+            for (const auto & og : orig_seg->groups) {
+                llama_xkv::xkv_factor_group_payload cg;
+                cg.group_index = og.group_index;
+                cg.owning_layers = og.owning_layers;
+                cg.rank_k = og.rank_k;
+                cg.rank_v = og.rank_v;
+                cg.layer_feature_offsets_k = og.layer_feature_offsets_k;
+                cg.layer_feature_dims_k = og.layer_feature_dims_k;
+                cg.layer_feature_offsets_v = og.layer_feature_offsets_v;
+                cg.layer_feature_dims_v = og.layer_feature_dims_v;
+                cg.total_dim_k = og.total_dim_k;
+                cg.total_dim_v = og.total_dim_v;
+                cg.config_fingerprint = og.config_fingerprint;
+                cg.baseline_original_row_bytes = og.baseline_original_row_bytes;
+                uint64_t base_bytes = 0;
+                if (og.baseline_original_row_bytes > 0 && (uint64_t) compact_n_rows > UINT64_MAX / (uint64_t) og.baseline_original_row_bytes) {
+                    fail("per-seq export: baseline_original_bytes multiplication overflow");
+                }
+                base_bytes = (uint64_t) og.baseline_original_row_bytes * (uint64_t) compact_n_rows;
+                cg.baseline_original_bytes = base_bytes;
+
+                // Shared B handles are preserved verbatim
+                cg.b_k = og.b_k;
+                cg.b_v = og.b_v;
+
+                // Find source stream bytes: for DEVICE_OWNED segments, og.a_k/a_v/landmark.bytes
+                // are empty, so we must copy row-wise from the readback bytes in dev_readback!
+                auto get_source_bytes = [&](llama_xkv::factor_role role, const llama_xkv::encoded_matrix & em) -> const std::vector<uint8_t> * {
+                    if (!em.bytes.empty()) {
+                        return &em.bytes;
+                    }
+                    for (const auto & rbe : dev_readback.entries) {
+                        if (rbe.segment_id == orig_seg->segment_id &&
+                            rbe.segment_version == orig_seg->segment_version &&
+                            rbe.group_index == og.group_index &&
+                            rbe.role == (uint32_t)role) {
+                            return &rbe.bytes;
+                        }
+                    }
+                    return &em.bytes;
+                };
+
+                const auto * src_ak_bytes = get_source_bytes(llama_xkv::factor_role::a_k, og.a_k);
+                const auto * src_av_bytes = get_source_bytes(llama_xkv::factor_role::a_v, og.a_v);
+
+                // Pack A_K rows
+                const size_t stride_ak = og.a_k.desc.row_stride_bytes;
+                cg.a_k.desc = og.a_k.desc;
+                cg.a_k.desc.logical_shape.rows = compact_n_rows;
+                cg.a_k.desc.padded_shape.rows = compact_n_rows;
+                if (stride_ak != 0 && (uint64_t) compact_n_rows > (uint64_t) std::numeric_limits<size_t>::max() / (uint64_t) stride_ak) {
+                    fail("A_K compact bytes multiplication overflow during per-seq compaction");
+                }
+                cg.a_k.bytes.resize(compact_n_rows * stride_ak);
+                for (uint32_t dst_r = 0; dst_r < compact_n_rows; ++dst_r) {
+                    uint32_t src_r = kept_rows[dst_r];
+                    if ((src_r + 1) * stride_ak > src_ak_bytes->size()) {
+                        fail("A_K row source bytes out of bounds during per-seq compaction");
+                    }
+                    std::memcpy(cg.a_k.bytes.data() + dst_r * stride_ak,
+                                src_ak_bytes->data() + src_r * stride_ak,
+                                stride_ak);
+                }
+
+                // Pack A_V rows
+                const size_t stride_av = og.a_v.desc.row_stride_bytes;
+                cg.a_v.desc = og.a_v.desc;
+                cg.a_v.desc.logical_shape.rows = compact_n_rows;
+                cg.a_v.desc.padded_shape.rows = compact_n_rows;
+                if (stride_av != 0 && (uint64_t) compact_n_rows > (uint64_t) std::numeric_limits<size_t>::max() / (uint64_t) stride_av) {
+                    fail("A_V compact bytes multiplication overflow during per-seq compaction");
+                }
+                cg.a_v.bytes.resize(compact_n_rows * stride_av);
+                for (uint32_t dst_r = 0; dst_r < compact_n_rows; ++dst_r) {
+                    uint32_t src_r = kept_rows[dst_r];
+                    if ((src_r + 1) * stride_av > src_av_bytes->size()) {
+                        fail("A_V row source bytes out of bounds during per-seq compaction");
+                    }
+                    std::memcpy(cg.a_v.bytes.data() + dst_r * stride_av,
+                                src_av_bytes->data() + src_r * stride_av,
+                                stride_av);
+                }
+
+                // Slice/rebuild landmark chunks if present
+                const auto * src_lm_bytes = get_source_bytes(llama_xkv::factor_role::landmark, og.landmark);
+                const bool has_lm = !src_lm_bytes->empty() || og.landmark.desc.logical_shape.rows != 0;
+                if (has_lm) {
+                    // Check which chunks fall entirely within the kept row range
+                    const size_t stride_lm = og.landmark.desc.row_stride_bytes;
+                    std::vector<uint32_t> kept_chunk_indices;
+                    std::vector<llama_xkv::xkv_landmark_chunk> new_chunks;
+
+                    uint32_t compact_cursor = 0;
+                    for (size_t ci = 0; ci < og.landmark_chunks.size(); ++ci) {
+                        const auto & och = og.landmark_chunks[ci];
+                        // Intact requires exact source identity in order: the
+                        // chunk interval must lie inside the source segment
+                        // (overflow-safe), carry a nonzero source fingerprint
+                        // (chunk provenance), a sane error bound, and every
+                        // source row must appear consecutively in kept_rows at
+                        // the current compact cursor. Export compaction never
+                        // shifts storage positions or phase, so exact identity
+                        // plus provenance preserves validity; anything else
+                        // takes the bounded rebuild path below, never a copy.
+                        if (och.row_count == 0 ||
+                            och.row_count > orig_seg->n_rows ||
+                            och.row_begin > orig_seg->n_rows - och.row_count ||
+                            och.source_fingerprint == 0 ||
+                            !std::isfinite(och.error_bound) || och.error_bound < 0.0f) {
+                            break; // corrupt/non-provenanced chunk: force rebuild path
+                        }
+                        bool chunk_intact = true;
+                        for (uint32_t k = 0; k < och.row_count; ++k) {
+                            const uint64_t dst = (uint64_t) compact_cursor + k;
+                            if (dst >= kept_rows.size() ||
+                                kept_rows[(size_t) dst] != och.row_begin + k) {
+                                chunk_intact = false;
+                                break;
+                            }
+                        }
+                        if (chunk_intact) {
+                            kept_chunk_indices.push_back((uint32_t) ci);
+                            llama_xkv::xkv_landmark_chunk nch;
+                            nch.row_begin = compact_cursor;
+                            nch.row_count = och.row_count;
+                            nch.error_bound = och.error_bound;
+                            nch.source_fingerprint = och.source_fingerprint;
+                            new_chunks.push_back(nch);
+                            compact_cursor += och.row_count;
+                        }
+                    }
+
+                    if (compact_cursor == compact_n_rows && !new_chunks.empty()) {
+                        // All compact rows covered by intact original chunks: copy summary rows
+                        const uint32_t n_lm_rows = (uint32_t) new_chunks.size();
+                        cg.landmark.desc = og.landmark.desc;
+                        cg.landmark.desc.logical_shape.rows = n_lm_rows;
+                        cg.landmark.desc.padded_shape.rows = n_lm_rows;
+                        if (stride_lm != 0 && (uint64_t) n_lm_rows > (uint64_t) std::numeric_limits<size_t>::max() / (uint64_t) stride_lm) {
+                            fail("Landmark compact bytes multiplication overflow during per-seq compaction");
+                        }
+                        cg.landmark.bytes.resize(n_lm_rows * stride_lm);
+                        for (uint32_t dci = 0; dci < n_lm_rows; ++dci) {
+                            uint32_t sci = kept_chunk_indices[dci];
+                            if ((sci + 1) * stride_lm > src_lm_bytes->size()) {
+                                fail("Landmark row source bytes out of bounds during per-seq compaction");
+                            }
+                            std::memcpy(cg.landmark.bytes.data() + dci * stride_lm,
+                                        src_lm_bytes->data() + sci * stride_lm,
+                                        stride_lm);
+                        }
+                        cg.landmark_chunks = std::move(new_chunks);
+                        cg.landmark_table_fingerprint =
+                            compute_landmark_table_fingerprint(cg.landmark_chunks);
+                    } else {
+                        // Partial chunks across sequence boundaries: intact copy
+                        // is unsafe (summaries are position-sensitive), so a
+                        // semantic rebuild is required. The CPU hook decodes
+                        // host factor streams and is reference-host only: for
+                        // device-resident segments it is skipped entirely (no
+                        // host decode, no silent fallback) and the export
+                        // fails closed below.
+                        bool rebuilt = false;
+                        const bool host_factors = (orig_seg->residency != GGML_XKV_RES_DEVICE_OWNED);
+                        if (xkv_runtime && host_factors) {
+                            auto rcb = xkv_runtime->bound_removal_callback();
+                            if (rcb) {
+                                auto dummy_seg = std::make_shared<llama_xkv::xkv_segment>();
+                                if (rcb(*orig_seg, kept_rows, *dummy_seg, nullptr)) {
+                                    const auto * fg = dummy_seg->find_group(cg.group_index);
+                                    if (fg) {
+                                        cg.landmark = fg->landmark;
+                                        cg.landmark_chunks = fg->landmark_chunks;
+                                        cg.landmark_table_fingerprint = fg->landmark_table_fingerprint;
+                                        rebuilt = true;
+                                    }
+                                }
+                            }
+                        }
+                        if (!rebuilt) {
+                            fail(orig_seg->residency == GGML_XKV_RES_DEVICE_OWNED
+                                ? "per-seq export: device-owned landmark chunks cut across sequence boundaries; native rebuild unavailable in export, refusing partial leak"
+                                : "per-seq export: landmark chunks cut across sequence boundaries without rebuild hook; refusing partial leak");
+                        }
+                    }
+                }
+
+                cg.refresh_descriptor_fingerprint();
+                cg.update_byte_counters();
+                cseg->groups.push_back(std::move(cg));
+            }
+
+            cseg->update_byte_counters();
+            segs.push_back(cseg);
+        }
+    } else {
+        segs = raw_segs;
+    }
+
+    // 5. Config / fingerprints / stamp / exact count caps.
+    const auto & cp = xkv_store->get_cparams();
+    auto cfg = llama_xkv::make_bridge_config(cp);
+    if (cfg.store_mib == 0) {
+        fail("admission xkv_store_mib unresolved");
+    }
+    const auto fps   = xkv_state_expected_fps(cfg);
+    const auto stamp = xkv_store->current_stamp();
+    size_t total_groups = 0;
+    uint32_t max_groups = 1, max_own = 1, max_rows = 1;
+    for (const auto & s : segs) {
+        total_groups += s->groups.size();
+        if ((uint32_t) s->groups.size() > max_groups) {
+            max_groups = (uint32_t) s->groups.size();
+        }
+        if (s->n_rows > max_rows) {
+            max_rows = s->n_rows;
+        }
+        for (const auto & g : s->groups) {
+            if ((uint32_t) g.owning_layers.size() > max_own) {
+                max_own = (uint32_t) g.owning_layers.size();
+            }
+        }
+    }
+    if (segs.size() > (size_t) std::numeric_limits<uint32_t>::max() ||
+        total_groups > (size_t) std::numeric_limits<uint32_t>::max() - 8 ||
+        hot_in_scope.size() + frec.size() > (size_t) std::numeric_limits<uint32_t>::max() - 8) {
+        fail("state census exceeds 32-bit count caps");
+    }
+    const uint64_t store_budget = (uint64_t) cfg.store_mib << 20;
+    const auto limits = llama_xkv::xkv_state_limits::from_store_budgets(
+        store_budget, acc.hot_bytes, (uint32_t) segs.size(), max_groups,
+        (uint32_t) (hot_in_scope.size() + frec.size()), (uint32_t) (5 * total_groups + 8), max_own,
+        max_rows);
+    const llama_xkv::xkv_state_provenance prov =
+        xkv_state_bridge_provenance(model, tri_scorer.get());
+    llama_xkv::xkv_state_image img;
+    std::string err;
+    if (!llama_xkv::capture_image(segs, hot_in_scope, frec, acc, cp.xkv_workspace_mib,
+                                  cp.xkv_decode_cache_mib, cfg, fps, prov, stamp, limits, img,
+                                  dev_readback.entries.empty() ? nullptr : &dev_readback,
+                                  &err)) {
+        fail("capture: " + err);
+    }
+    std::vector<uint8_t> env;
+    if (!llama_xkv::encode_image(img, env, limits, &err)) {
+        fail("encode: " + err);
+    }
+    if (!llama_xkv::write_state_section(io, env, &err)) {
+        fail("section write: " + err);
+    }
+    // Second section: factored cell bindings in legacy save order.
+    if (!llama_xkv::write_cellmap_section(io, bindings, &err)) {
+        fail("cellmap write: " + err);
+    }
+}
+
+static bool xkv_restore_segments_identical(const std::shared_ptr<const llama_xkv::xkv_segment> & live,
+                                           const std::shared_ptr<const llama_xkv::xkv_segment> & img,
+                                           const std::map<uint64_t, const std::vector<uint8_t> *> & handle_to_rb_bytes) {
+    if (!live || !img) {
+        return false;
+    }
+    if (live->segment_id != img->segment_id || live->segment_version != img->segment_version) {
+        return false;
+    }
+    if (live->n_rows != img->n_rows || live->n_live_rows != img->n_live_rows) {
+        return false;
+    }
+    if (live->row_payload_ids != img->row_payload_ids) {
+        return false;
+    }
+    if (live->live_rows.size() != img->live_rows.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < live->live_rows.size(); ++i) {
+        if ((bool) live->live_rows[i] != (bool) img->live_rows[i]) {
+            return false;
+        }
+    }
+    if (live->groups.size() != img->groups.size()) {
+        return false;
+    }
+    const bool is_device = (live->residency == GGML_XKV_RES_DEVICE_OWNED && live->backend_bundle != nullptr);
+    for (size_t gi = 0; gi < live->groups.size(); ++gi) {
+        const auto & a = live->groups[gi];
+        const auto & b = img->groups[gi];
+        if (a.group_index != b.group_index || a.owning_layers != b.owning_layers) {
+            return false;
+        }
+        if (a.rank_k != b.rank_k || a.rank_v != b.rank_v) {
+            return false;
+        }
+        if (a.layer_feature_offsets_k != b.layer_feature_offsets_k ||
+            a.layer_feature_dims_k != b.layer_feature_dims_k ||
+            a.layer_feature_offsets_v != b.layer_feature_offsets_v ||
+            a.layer_feature_dims_v != b.layer_feature_dims_v) {
+            return false;
+        }
+        if (a.total_dim_k != b.total_dim_k || a.total_dim_v != b.total_dim_v) {
+            return false;
+        }
+        if (!(a.a_k.desc == b.a_k.desc)) {
+            return false;
+        }
+        if (!a.b_k || !b.b_k || !(a.b_k->desc == b.b_k->desc)) {
+            return false;
+        }
+        if (!(a.a_v.desc == b.a_v.desc)) {
+            return false;
+        }
+        if (!a.b_v || !b.b_v || !(a.b_v->desc == b.b_v->desc)) {
+            return false;
+        }
+        const bool a_has = !a.landmark.bytes.empty() || a.landmark.desc.logical_shape.rows != 0;
+        const bool b_has = !b.landmark.bytes.empty() || b.landmark.desc.logical_shape.rows != 0;
+        if (a_has != b_has) {
+            return false;
+        }
+        if (a_has && !(a.landmark.desc == b.landmark.desc)) {
+            return false;
+        }
+        if (!is_device) {
+            // Host flows: compare code stream bytes directly
+            if (a.a_k.bytes != b.a_k.bytes || a.b_k->bytes != b.b_k->bytes ||
+                a.a_v.bytes != b.a_v.bytes || a.b_v->bytes != b.b_v->bytes ||
+                (a_has && a.landmark.bytes != b.landmark.bytes)) {
+                return false;
+            }
+        } else {
+            // DEVICE_OWNED: live segment has empty host bytes, so compare exact content identity.
+            // Every backend allocation must match descriptor AND stored upload-time checksum.
+            // If checksum is not bound, compare against the batched readback stream map!
+            auto find_and_verify_handle = [&](uint64_t fp, llama_xkv::factor_role role,
+                                              const std::vector<uint8_t> & expected_bytes) -> bool {
+                for (const auto & h : live->backend_bundle->handles) {
+                    if (h && h->get_descriptor_fingerprint() == fp && h->get_desc().role == role) {
+                        if (h->is_checksum_bound()) {
+                            uint64_t expected_cs = llama_xkv::xkv_backend_checksum(expected_bytes.data(), expected_bytes.size());
+                            return h->get_checksum() == expected_cs;
+                        } else {
+                            // Compare against prepared batched readback result (zero per-handle D2H loops)
+                            auto it_rb = handle_to_rb_bytes.find(h->get_allocation_id());
+                            if (it_rb != handle_to_rb_bytes.end() && it_rb->second != nullptr) {
+                                return *(it_rb->second) == expected_bytes;
+                            }
+                            return false; // missing required readback verification
+                        }
+                    }
+                }
+                return false;
+            };
+            if (!find_and_verify_handle(b.a_k.desc.fingerprint(), llama_xkv::factor_role::a_k, b.a_k.bytes)) return false;
+            if (!find_and_verify_handle(b.b_k->desc.fingerprint(), llama_xkv::factor_role::b_k, b.b_k->bytes)) return false;
+            if (!find_and_verify_handle(b.a_v.desc.fingerprint(), llama_xkv::factor_role::a_v, b.a_v.bytes)) return false;
+            if (!find_and_verify_handle(b.b_v->desc.fingerprint(), llama_xkv::factor_role::b_v, b.b_v->bytes)) return false;
+            if (a_has) {
+                if (!find_and_verify_handle(b.landmark.desc.fingerprint(), llama_xkv::factor_role::landmark, b.landmark.bytes)) return false;
+            }
+        }
+        if (a.landmark_chunks != b.landmark_chunks) {
+            return false;
+        }
+        if (a.landmark_table_fingerprint != b.landmark_table_fingerprint) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void llama_kv_cache::xkv_state_read_trailer(llama_io_read_i & io, llama_seq_id seq_id,
+                                            llama_state_seq_flags flags,
+                                            const slot_info * granted, uint32_t granted_strm) {
+    if (other) {
+        return;
+    }
+    if (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) {
+        return; // lightweight checkpoints carry no trailer
+    }
+    const bool per_seq = seq_id != -1;
+    auto refuse = [&](const std::string & m) {
+        if (per_seq) {
+            seq_rm(seq_id, -1, -1);
+        } else {
+            clear(true);
+        }
+        throw std::runtime_error("llama_kv_cache::xkv_state_read_trailer: " + m);
+    };
+    if (!xkv_store) {
+        // XKV OFF: the legacy stream must end here.
+        std::vector<uint8_t> env;
+        std::string err;
+        const auto r = llama_xkv::read_state_section(io, 1 << 20, env, &err);
+        if (r == llama_xkv::xkv_section_read_result::absent) {
+            return;
+        }
+        refuse("cross-mode restore refused (XKV section present, XKV store absent)");
+    }
+    const auto & cp = xkv_store->get_cparams();
+    const uint64_t store_budget = (uint64_t) cp.xkv_store_mib << 20;
+    const auto acc = xkv_store->get_accounting();
+    // Exact byte caps from live budgets; wide anti-malformed count caps.
+    const auto limits = llama_xkv::xkv_state_limits::from_store_budgets(
+        store_budget, acc.hot_bytes, 1 << 16, 256, 1 << 24, 1 << 20, 4096, 1 << 24);
+    std::vector<uint8_t> env;
+    std::string err;
+    const auto r = llama_xkv::read_state_section(io, limits.max_envelope_bytes, env, &err);
+    if (r == llama_xkv::xkv_section_read_result::absent) {
+        return; // legacy file: dense-only restore stands
+    }
+    if (r == llama_xkv::xkv_section_read_result::corrupt) {
+        refuse("corrupt trailer: " + err);
+    }
+    const auto cfg = llama_xkv::make_bridge_config(cp);
+    const auto fps = xkv_state_expected_fps(cfg);
+    const llama_xkv::xkv_state_provenance prov =
+        xkv_state_bridge_provenance(model, tri_scorer.get());
+    llama_xkv::xkv_state_image img;
+    if (!llama_xkv::decode_image(env.data(), env.size(), img, fps, prov, limits, &err)) {
+        refuse("decode/validate: " + err);
+    }
+    // Exact effective-config compatibility: a Turbo2-saved bundle under a
+    // Turbo4-requested live config (same profile) refuses here by codec type,
+    // as do mode/budget/SR/refine/factorizer/balance/rank drifts.
+    if (!llama_xkv::check_config_compatible(img.config, cfg, &err)) {
+        refuse("config compatible: " + err);
+    }
+    // Restored-cell census bounds the cellmap (full: non-empty per stream;
+    // per-seq: granted slots). The cellmap is required with the envelope.
+    std::vector<uint32_t> restored_counts;
+    uint64_t cell_total = 0;
+    if (per_seq) {
+        if (granted == nullptr || granted->idxs.empty()) {
+            refuse("per-seq trailer without granted slots");
+        }
+        cell_total = (uint64_t) granted->idxs[0].size();
+    } else {
+        for (uint32_t s = 0; s < (uint32_t) v_cells.size(); ++s) {
+            const auto & cells = v_cells[s];
+            uint32_t n = 0;
+            for (uint32_t i = 0; i < (uint32_t) cells.size(); ++i) {
+                if (!cells.is_empty(i)) {
+                    ++n;
+                }
+            }
+            restored_counts.push_back(n);
+            cell_total += n;
+        }
+    }
+    if (cell_total > llama_xkv::XKV_STATE_CELLMAP_MAX_ENTRIES) {
+        refuse("restored cell census exceeds cellmap hard maximum");
+    }
+    std::vector<llama_xkv::xkv_cell_binding> bindings;
+    const auto rc = llama_xkv::read_cellmap_section(io, cell_total, bindings, &err);
+    if (rc != llama_xkv::xkv_section_read_result::ok) {
+        refuse(rc == llama_xkv::xkv_section_read_result::absent
+                   ? "envelope present but cellmap absent (cannot rejoin cells)"
+                   : "corrupt cellmap: " + err);
+    }
+    // Off-side binding validation against restored cells + decoded image.
+    std::map<uint64_t, llama_xkv::xkv_location> plan_locs;
+    for (const auto & pl : img.payloads) {
+        plan_locs[pl.payload_id] = pl.locator;
+    }
+    for (const auto & b : bindings) {
+        if (b.stream_idx >= (uint32_t) v_cells.size()) {
+            refuse("cellmap stream out of range");
+        }
+        uint64_t bound = per_seq ? cell_total : restored_counts[b.stream_idx];
+        if (per_seq && b.stream_idx != granted_strm) {
+            refuse("cellmap stream disagrees with per-seq granted stream");
+        }
+        if (b.ordinal >= bound) {
+            refuse("cellmap ordinal out of restored range");
+        }
+        const auto it = plan_locs.find(b.payload_id);
+        if (it == plan_locs.end() || it->second.kind != llama_xkv::xkv_location_kind::factored ||
+            it->second.storage_generation != b.generation) {
+            refuse("cellmap entry without matching factored payload record");
+        }
+    }
+    llama_xkv::xkv_state_import_plan plan;
+    if (!llama_xkv::build_import_plan(img, limits, plan, &err)) {
+        refuse("import plan: " + err);
+    }
+    // PID preflight before any mutation: future allocate_payload_id() calls
+    // must exceed every restored id (cross-process counter resets otherwise
+    // collide). Burns counter gaps only; harmless on later refusal paths.
+    {
+        uint64_t max_pid = 0;
+        for (const auto & pl : plan.bundle.locations) {
+            if (pl.first > max_pid) {
+                max_pid = pl.first;
+            }
+        }
+        if (!llama_kv_cells::reserve_payload_ids_through(max_pid)) {
+            refuse("pid reservation failed (counter saturated)");
+        }
+    }
+    // Backend device-batch hook (BackendResidency): translate plan allocations
+    // to backend streams and verify pre-upload. Host/CPU flows skip (no provider
+    // bound). Nothing here decodes full streams or falls back to host reference.
+    // STAGED on provider details; tracked in the yield.
+    // Dedup-narrow vs live store: reuse byte-identical segments, import the rest.
+    std::vector<std::shared_ptr<const llama_xkv::xkv_segment>> need;
+    // For any candidate live device segment, collect handles with unbound checksums
+    // and batch-readback once per executor (zero per-handle D2H loops).
+    std::map<uint64_t, const std::vector<uint8_t> *> handle_to_rb_bytes;
+    std::map<uint64_t, std::vector<uint8_t>> rb_storage; // holds downloaded bytes
+    {
+        std::map<ggml_backend_t, std::vector<std::shared_ptr<const llama_xkv::xkv_backend_allocation>>> exec_to_allocs;
+        std::map<uint64_t, std::shared_ptr<const llama_xkv::xkv_backend_allocation>> unique_unbound;
+        for (const auto & s : plan.bundle.segments) {
+            auto live = xkv_store->get_segment_version(s->segment_id, s->segment_version);
+            if (live && live->residency == GGML_XKV_RES_DEVICE_OWNED && live->backend_bundle) {
+                ggml_backend_t exec = live->backend_bundle->get_executor();
+                if (exec) {
+                    for (const auto & h : live->backend_bundle->handles) {
+                        if (h && !h->is_checksum_bound() && unique_unbound.emplace(h->get_allocation_id(), h).second) {
+                            exec_to_allocs[exec].push_back(h);
+                        }
+                    }
+                }
+            }
+        }
+        for (const auto & kv_ex : exec_to_allocs) {
+            llama_xkv::xkv_backend_batch_config rb_cfg;
+            rb_cfg.residency = GGML_XKV_RES_DEVICE_OWNED;
+            llama_xkv::xkv_backend_readback_result rb_res;
+            std::string rb_err;
+            if (llama_xkv::xkv_backend_readback_batch(kv_ex.first, kv_ex.second, rb_cfg, rb_res, &rb_err)) {
+                for (size_t i = 0; i < kv_ex.second.size() && i < rb_res.stream_bytes.size(); ++i) {
+                    uint64_t aid = kv_ex.second[i]->get_allocation_id();
+                    rb_storage[aid] = std::move(rb_res.stream_bytes[i]);
+                    handle_to_rb_bytes[aid] = &rb_storage[aid];
+                }
+            }
+        }
+    }
+
+    for (const auto & s : plan.bundle.segments) {
+        auto live = xkv_store->get_segment_version(s->segment_id, s->segment_version);
+        if (live) {
+            if (!xkv_restore_segments_identical(live, s, handle_to_rb_bytes)) {
+                refuse("conflicting live segment for restored bundle");
+            }
+            continue; // shared handle reused, never duplicated
+        }
+        need.push_back(s);
+    }
+    if (!need.empty()) {
+        // New segments require the atomic store import. The narrowed set always
+        // equals the full plan set here: any already-present shared segment
+        // would have been reused above, and a partially overlapping store
+        // cannot merge, so import (which itself demands zero factored state)
+        // is the only consistent path. Fenced per TransactionCore contract.
+        if (!xkv_tx_coord) {
+            refuse("no transaction coordinator for fenced import");
+        }
+        std::string ferr;
+        llama_xkv::xkv_quiesce_options qo;
+        qo.wait = true;
+        if (xkv_tx_coord->wait_for_readers_drained(qo, &ferr) != llama_xkv::xkv_tx_status::ok) {
+            refuse("reader drain refused import: " + ferr);
+        }
+        // NOTE to TransactionCore: no restore op exists yet; seal is the closest
+        // existing exclusion fence. Please add xkv_maintenance_op::restore.
+        llama_xkv::xkv_maintenance_guard mguard(
+            xkv_tx_coord.get(), llama_xkv::xkv_maintenance_op::seal,
+            plan.bundle.next_seal_tx_nonce, &ferr);
+        if (!mguard.held()) {
+            refuse("maintenance guard refused import: " + ferr);
+        }
+        // Adapt to the store contract: factored locations only (hot/flat never
+        // install pool/dense rows from state), zero nonces, nonzero generations.
+        llama_xkv::llama_xkv_cache_store::xkv_snapshot_import_bundle sb;
+        sb.segments = need;
+        uint64_t sealed = 0;
+        for (const auto & pl : plan.bundle.locations) {
+            if (pl.second.kind != llama_xkv::xkv_location_kind::factored) {
+                continue;
+            }
+            if (pl.second.seal_tx_nonce != 0 || pl.second.storage_generation == 0) {
+                refuse("importable location violates zero-nonce/nonzero-generation contract");
+            }
+            sb.locations.push_back(pl);
+            ++sealed;
+        }
+        sb.stamp              = plan.bundle.stamp;
+        sb.sealed_count       = sealed;
+        sb.next_segment_id    = plan.bundle.next_segment_id;
+        sb.next_seal_tx_nonce = plan.bundle.next_seal_tx_nonce;
+        sb.next_alloc_id      = plan.bundle.next_alloc_id;
+        // Pre-commit dedup fit against the validated bundle cap (the store
+        // enforces its live cap internally as well).
+        {
+            std::map<const llama_xkv::encoded_matrix *, size_t> seen;
+            uint64_t dedup = 0;
+            for (const auto & s : sb.segments) {
+                for (const auto & g : s->groups) {
+                    if (seen.emplace(g.b_k.get(), g.b_k->bytes.size()).second) {
+                        dedup += g.b_k->bytes.size();
+                    }
+                    if (seen.emplace(g.b_v.get(), g.b_v->bytes.size()).second) {
+                        dedup += g.b_v->bytes.size();
+                    }
+                    dedup += g.a_k.bytes.size() + g.a_v.bytes.size() + g.landmark.bytes.size();
+                }
+            }
+            if (dedup > plan.bundle.store_cap_bytes) {
+                refuse("import footprint exceeds validated bundle cap");
+            }
+        }
+
+        // DEVICE_OWNED restoration path: upload state code streams via
+        // xkv_backend_import_code_streams under StoreReservation, attach
+        // immutable backend_bundle + real executor owner, and release host bytes.
+        // CPU reference flows skip this and keep host bytes.
+        llama_xkv::xkv_capacity_reservation store_cap_handle;
+        const bool needs_device = llama_xkv_profile_is_device_owned(
+            (llama_xkv_storage_profile) plan.bundle.config.profile,
+            (llama_xkv_factorizer) plan.bundle.config.factorizer);
+        if (needs_device) {
+            ggml_tensor * k0 = get_k_storage(0);
+            ggml_backend_buffer_type_t buft0 = (k0 && k0->buffer) ? ggml_backend_buffer_get_type(k0->buffer) : nullptr;
+            ggml_backend_dev_t dev0 = buft0 ? ggml_backend_buft_get_device(buft0) : nullptr;
+            if (dev0) {
+                std::shared_ptr<struct ggml_backend> exec_owner = llama_xkv::xkv_backend_make_owner(ggml_backend_dev_init(dev0, nullptr));
+                ggml_backend_t exec_b = exec_owner.get();
+                if (!exec_b) {
+                    refuse("cannot initialize backend device for code-stream import");
+                }
+
+                // Build backend import streams from image allocations preserving dedup_key
+                std::vector<llama_xkv::xkv_backend_import_stream> b_streams;
+                b_streams.reserve(img.allocations.size());
+                for (const auto & a : img.allocations) {
+                    llama_xkv::xkv_backend_import_stream bs;
+                    bs.desc = a.desc;
+                    bs.data = a.bytes.data();
+                    bs.size = a.bytes.size();
+                    bs.expected_checksum = a.checksum;
+                    bs.desc_bytes = a.desc_bytes.data();
+                    bs.desc_size = a.desc_bytes.size();
+                    bs.dedup_key = (uint64_t) a.alloc_id;
+                    b_streams.push_back(bs);
+                }
+
+                llama_xkv::xkv_backend_batch_config b_cfg;
+                b_cfg.residency = GGML_XKV_RES_DEVICE_OWNED;
+                b_cfg.enforce_residency = true;
+                b_cfg.backend_owner = exec_owner;
+
+                // Calculate exact newly-staged dedup actual bytes (backend alignment + segment metadata)
+                size_t exact_staged_bytes = 0;
+                for (const auto & bs : b_streams) {
+                    size_t raw_sz = bs.desc.logical_shape.rows > 0 ? llama_xkv::encoded_matrix_bytes(bs.desc) : bs.size;
+                    size_t align = buft0 ? ggml_backend_buft_get_alignment(buft0) : 128;
+                    size_t stream_aligned = (raw_sz + align - 1) & ~(align - 1);
+                    exact_staged_bytes += stream_aligned;
+                }
+                for (const auto & seg : sb.segments) {
+                    exact_staged_bytes += sizeof(*seg);
+                }
+
+                size_t deficit = 0;
+                std::string cap_err;
+                store_cap_handle = xkv_store->reserve_capacity(
+                    exact_staged_bytes > 0 ? exact_staged_bytes : (size_t) plan.bundle.store_cap_bytes, &cap_err, &deficit);
+                if (!store_cap_handle.valid()) {
+                    refuse("DEVICE_OWNED store capacity reservation failed: " + cap_err);
+                }
+                llama_xkv::xkv_backend_store_reservation s_res = store_cap_handle.backend_reservation();
+
+                // Advance/seed the store-owned persistent ID generator from the image's
+                // validated high-water next_alloc_id so new imported allocations are >= high-water
+                // and cannot collide with previously issued IDs.
+                auto & id_gen = xkv_store->allocation_id_generator();
+                if (plan.bundle.next_alloc_id > id_gen.current_id()) {
+                    id_gen.reset(plan.bundle.next_alloc_id);
+                }
+
+                llama_xkv::xkv_backend_import_result b_res;
+                std::string b_err;
+                if (!llama_xkv::xkv_backend_import_code_streams(
+                        exec_b, buft0, b_streams, b_cfg,
+                        id_gen,
+                        b_res, &b_err, &s_res)) {
+                    refuse("DEVICE_OWNED xkv_backend_import_code_streams failed: " + b_err);
+                }
+
+                // Verify whole bundle
+                if (!llama_xkv::xkv_backend_bundle_verify(b_res.handles, GGML_XKV_RES_DEVICE_OWNED, false, &b_err)) {
+                    refuse("DEVICE_OWNED imported handles bundle verification failed: " + b_err);
+                }
+
+                // Verify batch_res generation:
+                auto batch_res = b_res.make_batch_result(exec_b, exec_owner);
+                if (!batch_res || !batch_res->is_success() || !batch_res->is_committed()) {
+                    refuse("DEVICE_OWNED make_batch_result failed or uncommitted");
+                }
+
+                // Attach immutable backend_bundle subsets matched by allocation/fingerprint to each segment,
+                // and clear ALL host factor bytes (A and B) post-upload so zero host mirrors remain.
+                // Mapping uses wire stream index b_res.handles[wire_stream_index] verified by descriptor+checksum,
+                // never ambiguous descriptor-only match and never comparing new runtime ID to serialized ID!
+                for (auto & seg : sb.segments) {
+                    auto mut_seg = std::const_pointer_cast<llama_xkv::xkv_segment>(seg);
+                    mut_seg->residency = GGML_XKV_RES_DEVICE_OWNED;
+
+                    // Construct segment-specific bundle subset
+                    llama_xkv::xkv_backend_import_result seg_res;
+                    for (const auto & iseg : img.segments) {
+                        if (iseg.segment_id == mut_seg->segment_id && iseg.segment_version == mut_seg->segment_version) {
+                            for (const auto & ig : iseg.groups) {
+                                auto add_wire_handle = [&](uint32_t wire_stream_idx) {
+                                    if (wire_stream_idx >= b_res.handles.size() || wire_stream_idx >= img.allocations.size()) {
+                                        refuse("DEVICE_OWNED wire stream index out of range");
+                                    }
+                                    const auto & h = b_res.handles[wire_stream_idx];
+                                    const auto & a = img.allocations[wire_stream_idx];
+                                    if (!h || !(h->get_desc() == a.desc)) {
+                                        refuse("DEVICE_OWNED imported handle descriptor mismatch with wire allocation");
+                                    }
+                                    seg_res.handles.push_back(h);
+                                };
+                                add_wire_handle(ig.stream_ak);
+                                add_wire_handle(ig.stream_bk);
+                                add_wire_handle(ig.stream_av);
+                                add_wire_handle(ig.stream_bv);
+                                if (ig.has_landmark) {
+                                    add_wire_handle(ig.stream_landmark);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    auto seg_batch_res = seg_res.make_batch_result(exec_b, exec_owner);
+                    if (!seg_batch_res || !seg_batch_res->is_success()) {
+                        refuse("DEVICE_OWNED segment make_batch_result failed");
+                    }
+                    mut_seg->backend_bundle = seg_batch_res;
+                    // Release host bytes truthfully post-upload (both A and B)
+                }
+
+                // Deterministic host memory release: swap with empty std::vector<uint8_t>()
+                // guarantees zero allocated capacity and releases accounting truthfully.
+                // A and landmark streams are per-segment; shared B handles are cleared
+                // exactly once after all segment mappings have succeeded!
+                std::set<const llama_xkv::encoded_matrix *> cleared_shared_b;
+                for (auto & seg : sb.segments) {
+                    auto mut_seg = std::const_pointer_cast<llama_xkv::xkv_segment>(seg);
+                    for (auto & g : mut_seg->groups) {
+                        std::vector<uint8_t>().swap(g.a_k.bytes);
+                        std::vector<uint8_t>().swap(g.a_v.bytes);
+                        std::vector<uint8_t>().swap(g.landmark.bytes);
+                        if (g.b_k && cleared_shared_b.insert(g.b_k.get()).second) {
+                            auto mut_bk = std::const_pointer_cast<llama_xkv::encoded_matrix>(g.b_k);
+                            std::vector<uint8_t>().swap(mut_bk->bytes);
+                        }
+                        if (g.b_v && cleared_shared_b.insert(g.b_v.get()).second) {
+                            auto mut_bv = std::const_pointer_cast<llama_xkv::encoded_matrix>(g.b_v);
+                            std::vector<uint8_t>().swap(mut_bv->bytes);
+                        }
+                    }
+                }
+            } else {
+                refuse("DEVICE_OWNED profile requires a valid device/buft (fail-closed, no silent fallback)");
+            }
+        }
+
+        llama_xkv::xkv_capacity_reservation * cap_res_ptr = store_cap_handle.valid() ? &store_cap_handle : nullptr;
+        if (!xkv_store->import_snapshot_segments(sb, &err, cap_res_ptr)) {
+            refuse("store import refused: " + err);
+        }
+        xkv_tx_coord->sync_from_store(xkv_store->current_stamp());
+    } else {
+        // Shared steady state: every plan segment already present byte-identical
+        // and no import was attempted. Verify all factored locations against the
+        // live store before rebind (exact match; racing maintenance refuses).
+        for (const auto & pl : plan.bundle.locations) {
+            if (pl.second.kind != llama_xkv::xkv_location_kind::factored) {
+                continue;
+            }
+            llama_xkv::xkv_location live;
+            if (!xkv_store->find_location(pl.first, live) || !(live == pl.second)) {
+                refuse("live store diverged from restored bindings");
+            }
+        }
+    }
+    // Rebind factored cells with zero store mutation on this path: legacy
+    // ordinal for whole-cache, granted order for per-seq. Hot/flat stay dense.
+    try {
+        for (const auto & b : bindings) {
+            const uint32_t target = per_seq ? granted->idxs[0][b.ordinal] : b.ordinal;
+            auto & cells = v_cells[b.stream_idx];
+            if (cells.payload_id_get(target) != 0) {
+                refuse("restored cell already bound (unexpected pre-bound state)");
+            }
+            cells.payload_id_set(target, b.payload_id, b.generation);
+        }
+    } catch (const std::bad_alloc &) {
+        refuse("cell rebind allocation failure");
+    }
+    // Verify every rebound cell against live store locations.
+    for (const auto & b : bindings) {
+        const uint32_t target = per_seq ? granted->idxs[0][b.ordinal] : b.ordinal;
+        if (v_cells[b.stream_idx].payload_id_get(target) != b.payload_id) {
+            refuse("rebind did not stick (logic error)");
+        }
+        llama_xkv::xkv_location loc;
+        if (!xkv_store->find_location(b.payload_id, loc) ||
+            loc.kind != llama_xkv::xkv_location_kind::factored ||
+            loc.storage_generation != b.generation) {
+            refuse("rebound cell without live factored location");
+        }
+    }
+
+    // Invalidate decoded tile cache upon successful state restore so restored
+    // streams cannot hit stale pre-restore decoded tiles (fail-closed, §13).
+    if (xkv_runtime) {
+        xkv_runtime->clear_decode_cache();
+    }
+}
+
 bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, slot_info & sinfo, llama_seq_id dest_seq_id) {
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
@@ -5197,6 +8816,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 }
 
                 cells.seq_add(i, seq_id);
+            }
+
+            if (xkv_store) {
+                xkv_store->register_hot_payload(cells.payload_id_get(i), i, cells.storage_generation_get(i));
             }
         }
 
@@ -5422,7 +9045,10 @@ llama_kv_cache_context::llama_kv_cache_context(
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
         llama_kv_cache::slot_info_vec_t sinfos,
-        std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
+        std::vector<llama_ubatch> ubatches,
+        std::vector<llama_xkv::xkv_hot_reservation> hot_reservations) :
+    status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)),
+    hot_reservations(std::move(hot_reservations)), ubatches(std::move(ubatches)) {
     // Pre-compute n_kv so read-only paths (e.g. MTP draft, which calls process_ubatch with
     // apply_mctx=false) get a valid mask/K/V shape based on current cache occupancy.
     // For paths that DO call apply(), n_kv is re-derived there after apply_ubatch().
@@ -5445,10 +9071,6 @@ bool llama_kv_cache_context::next() {
     rerot_layout_ready = false;
     rerot_layout = {};
 
-    fp_key_valid = false;
-    fp_layout.clear();
-    fp_cell_stamps.clear();
-
     return true;
 }
 
@@ -5462,14 +9084,79 @@ bool llama_kv_cache_context::apply() {
         return true;
     }
 
-    kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
+    postcompute_finalized = false;
+    const auto & sinfo = sinfos[i_cur];
+    const bool bounded = kv->is_xkv_bounded_hot();
+    const bool has_res = i_cur < hot_reservations.size() && hot_reservations[i_cur].valid();
+
+    // apply_ubatch binds new cells + store entries and defers victim release
+    // until postcompute_success. It repairs cells on store-register failure
+    // and throws only after restoring the exact pre-apply state.
+    llama_kv_cache::xkv_overwrite_victims victims;
+    try {
+        kv->apply_ubatch(sinfo, ubatches[i_cur], false, bounded ? &victims : nullptr);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: apply_ubatch failed: %s\n", __func__, e.what());
+        return false;
+    }
+
+    // Record applied entries for postcompute commit/rollback.
+    const size_t entry_base = applied_entries.size();
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const auto & cells = kv->get_cells(sinfo.strm[s]);
+        for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+            const uint32_t cell_idx = sinfo.idxs[s][ii];
+            llama_kv_cache::xkv_applied_entry e;
+            e.stream = sinfo.strm[s];
+            e.cell   = cell_idx;
+            e.pid    = cells.payload_id_get(cell_idx);
+            e.gen    = cells.storage_generation_get(cell_idx);
+            e.has_hot = bounded && !sinfo.hot_idxs.empty() && s < sinfo.hot_idxs.size() &&
+                        ii < sinfo.hot_idxs[s].size();
+            e.hot_slot = e.has_hot ? sinfo.hot_idxs[s][ii] : 0;
+            if (e.has_hot) {
+                LLAMA_LOG_ERROR("[llama_kv_cache] apply_ubatch: bound cell %u to hot_slot %u (pid %llu, gen %llu)\n",
+                    cell_idx, e.hot_slot, (unsigned long long)e.pid, (unsigned long long)e.gen);
+            }
+            applied_entries.push_back(e);
+        }
+    }
+
+    // For bounded hot cache, commit the reservation binding payload IDs and generations.
+    // Victim release stays deferred: it runs only at postcompute_success.
+    if (has_res) {
+        std::vector<uint64_t> pids;
+        std::vector<uint64_t> gens;
+        pids.reserve(applied_entries.size() - entry_base);
+        gens.reserve(applied_entries.size() - entry_base);
+        for (size_t k = entry_base; k < applied_entries.size(); ++k) {
+            pids.push_back(applied_entries[k].pid);
+            gens.push_back(applied_entries[k].gen);
+        }
+        std::string err;
+        if (!hot_reservations[i_cur].commit(pids, gens, &err)) {
+            LLAMA_LOG_ERROR("%s: failed to commit hot reservation: %s\n", __func__, err.c_str());
+            // Gated rollback: the store-held gate removes new entries with an
+            // empty pool triple (nothing bound yet). On false the store/cells
+            // stay exactly as applied (bit-identical to the pre-commit
+            // attempt): victims and the uncommitted reservation are left
+            // alone and the failure propagates.
+            std::string rb_err;
+            if (!kv->rollback_applied_entries(applied_entries, entry_base, &rb_err)) {
+                LLAMA_LOG_ERROR("%s: apply rollback refused: %s\n", __func__, rb_err.c_str());
+                return false;
+            }
+            applied_entries.resize(entry_base);
+            kv->restore_victim_cells(victims);
+            hot_reservations[i_cur].rollback();
+            return false;
+        }
+    }
+    pending_victims.push_back(std::move(victims));
+
     n_kv = kv->get_n_kv(sinfos[i_cur]);
     rerot_layout_ready = false;
     rerot_layout = {};
-
-    fp_key_valid = false;
-    fp_layout.clear();
-    fp_cell_stamps.clear();
 
     // InnerQ: check if CUDA calibration finalized and tensor needs update
     if (kv->get_turbo_innerq_scale_inv() != nullptr && turbo_innerq_needs_tensor_update()) {
@@ -5484,6 +9171,94 @@ bool llama_kv_cache_context::apply() {
     return true;
 }
 
+bool llama_kv_cache_context::postcompute_success() {
+    // Exactly-once: repeat calls return the recorded outcome.
+    if (postcompute_finalized) {
+        return postcompute_ok;
+    }
+    if (!kv) {
+        postcompute_finalized = true;
+        postcompute_ok = true;
+        return true;
+    }
+    // Atomic commit: applied hot_writing rows become hot_committed FIRST.
+    // Deferred victims release only after a successful commit, so a commit
+    // failure returns false with victims still bound and bookkeeping retained
+    // for the failure path (no partial release, no silent continuation).
+    // A failed commit does NOT finalize: postcompute_failure (or a retried
+    // success) may still run. Only spent states finalize.
+    auto store = kv->get_xkv_store();
+    if (store && !applied_entries.empty()) {
+        std::vector<uint64_t> pids;
+        pids.reserve(applied_entries.size());
+        for (const auto & e : applied_entries) {
+            pids.push_back(e.pid);
+        }
+        if (!store->commit_hot_payloads(pids)) {
+            LLAMA_LOG_ERROR("%s: commit_hot_payloads failed; victims retained, entries retained\n", __func__);
+            postcompute_ok = false;
+            return false;
+        }
+        kv->verify_bound_hot_rows(applied_entries);
+    }
+    for (const auto & victims : pending_victims) {
+        if (!victims.empty()) {
+            std::string err;
+            if (!kv->release_collected_victims(victims, &err)) {
+                // Committed above; victim bookkeeping is spent. Report the
+                // failure instead of continuing silently.
+                LLAMA_LOG_ERROR("%s: failed to release overwrite victims: %s\n", __func__, err.c_str());
+                applied_entries.clear();
+                pending_victims.clear();
+                postcompute_finalized = true;
+                postcompute_ok = false;
+                return false;
+            }
+        }
+    }
+    applied_entries.clear();
+    pending_victims.clear();
+    postcompute_finalized = true;
+    postcompute_ok = true;
+    return true;
+    }
+
+bool llama_kv_cache_context::postcompute_failure() {
+    // Exactly-once: repeat calls return the recorded outcome.
+    if (postcompute_finalized) {
+        return postcompute_ok;
+    }
+    if (!kv) {
+    postcompute_finalized = true;
+        postcompute_ok = true;
+        return true;
+    }
+    // One coordinated rollback transaction: store removal of new payloads,
+    // then pool release of new rows, then new-cell drops, then victim-cell
+    // restores. Victim pool/store entries were never released, so no
+    // re-binding is needed. Uncommitted reservations (including
+    // never-applied later ubatches) roll back below; committed ones had
+    // their rows freed by the transaction.
+    // A failed transaction does NOT finalize: records are retained and the
+    // rollback (or a commit retry) may run again. Only spent states
+    // finalize; repeats after true return the recorded outcome.
+    std::string err;
+    const bool tx_ok = kv->rollback_applied_batch(applied_entries, pending_victims, &err);
+    if (!tx_ok) {
+        LLAMA_LOG_ERROR("%s: rollback transaction incomplete: %s\n", __func__, err.c_str());
+        postcompute_ok = false;
+        return false;
+    }
+    postcompute_finalized = true;
+        postcompute_ok = true;
+    applied_entries.clear();
+    pending_victims.clear();
+    for (auto & res : hot_reservations) {
+        res.rollback();
+    }
+        return true;
+    }
+
 llama_memory_status llama_kv_cache_context::get_status() const {
     return status;
 }
@@ -5496,100 +9271,6 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
     return n_kv;
-}
-
-bool llama_kv_cache_context::flashprefill_build_layout(
-        uint32_t ubatch_index,
-        int32_t role,
-        const llama_flashprefill_layout_params & params,
-        std::string * error) const {
-    if (status != LLAMA_MEMORY_STATUS_SUCCESS || kv == nullptr) {
-        if (error) { *error = "flashprefill layout: no memory context"; }
-        return false;
-    }
-    if (ubatches.empty() || sinfos.empty() || ubatch_index >= ubatches.size()) {
-        if (error) { *error = "flashprefill layout: ubatch index out of range"; }
-        return false;
-    }
-    const llama_ubatch & ub = ubatches[ubatch_index];
-
-    llama_flashprefill_build_key key;
-    key.ubatch_index = ubatch_index;
-    key.role = role;
-    key.block_k = params.block_k;
-    key.causal = params.causal ? 1u : 0u;
-    key.want_exact_rows = params.want_exact_rows ? 1u : 0u;
-    key.n_tokens = ub.n_tokens;
-    key.exact_cap_bucket = llama_flashprefill_layout_params::bucket_for(params.exact_cap);
-
-    // Reuse the owned planning when topology matches and owner stamps are fresh.
-    if (fp_key_valid && fp_key.ubatch_index == key.ubatch_index && fp_key.role == key.role &&
-        fp_key.block_k == key.block_k && fp_key.causal == key.causal &&
-        fp_key.want_exact_rows == key.want_exact_rows && fp_key.n_tokens == key.n_tokens &&
-        fp_key.exact_cap_bucket == key.exact_cap_bucket && flashprefill_layout_is_fresh()) {
-        return fp_layout.eligible;
-    }
-
-    std::string msg;
-    const bool eligible = kv->flashprefill_build_layout(ub, role, params, fp_layout, &msg);
-
-    // Finalize the topology key post-build (group capacity and path are known now).
-    key.group_cap_bucket = llama_flashprefill_layout_params::bucket_for(fp_layout.n_groups());
-    key.is_rerot = fp_layout.is_rerot;
-    fp_key = key;
-    fp_key_valid = true;
-    fp_cells_epoch = kv->flashprefill_epoch();
-    kv->flashprefill_cell_stamps(fp_cell_stamps);
-
-    if (error) { *error = msg; }
-    return eligible;
-}
-
-bool llama_kv_cache_context::flashprefill_build_current_layout(
-        int32_t role,
-        const llama_flashprefill_layout_params & params,
-        std::string * error) const {
-    if (status != LLAMA_MEMORY_STATUS_SUCCESS || kv == nullptr) {
-        if (error) { *error = "flashprefill layout: no memory context"; }
-        return false;
-    }
-    if (ubatches.empty() || sinfos.empty() || i_cur >= ubatches.size()) {
-        if (error) { *error = "flashprefill layout: no current ubatch"; }
-        return false;
-    }
-    return flashprefill_build_layout((uint32_t) i_cur, role, params, error);
-}
-
-const llama_flashprefill_layout & llama_kv_cache_context::flashprefill_get_layout() const {
-    return fp_layout;
-}
-
-bool llama_kv_cache_context::flashprefill_layout_is_fresh() const {
-    if (!fp_key_valid || kv == nullptr) {
-        return false;
-    }
-    if (fp_cells_epoch != kv->flashprefill_epoch()) {
-        return false;
-    }
-    std::vector<llama_flashprefill_cell_stamp> cur;
-    kv->flashprefill_cell_stamps(cur);
-    if (cur.size() != fp_cell_stamps.size()) {
-        return false;
-    }
-    for (size_t i = 0; i < cur.size(); ++i) {
-        if (cur[i].stamp != fp_cell_stamps[i].stamp ||
-            cur[i].generation != fp_cell_stamps[i].generation) {
-            return false;
-        }
-        if (!fp_stamp_usable(cur[i])) {
-            return false;
-        }
-    }
-    return true;
-}
-
-const llama_flashprefill_build_key & llama_kv_cache_context::flashprefill_layout_key() const {
-    return fp_key;
 }
 
 uint32_t llama_kv_cache_context::get_n_kv_pos_contiguous() const {
@@ -5615,20 +9296,20 @@ ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
 }
 
-ggml_type llama_kv_cache_context::layer_type_k(int32_t il) const {
-    return kv->layer_type_k(il);
-}
-
-ggml_type llama_kv_cache_context::layer_type_v(int32_t il) const {
-    return kv->layer_type_v(il);
-}
-
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
     return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_xkv_hot_k(ggml_context * ctx, int32_t il) const {
+    return kv->get_hot_k(ctx, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_xkv_hot_v(ggml_context * ctx, int32_t il) const {
+    return kv->get_hot_v(ctx, il, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::get_turbo_rotation() const {
@@ -5802,4 +9483,204 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
+}
+
+std::shared_ptr<llama_xkv::llama_xkv_cache_store> llama_kv_cache::get_xkv_store() const {
+    return xkv_store;
+}
+
+void llama_kv_cache::init_xkv_store(const llama_cparams & cparams) {
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return;
+    }
+    // Native capability gate: the Vulkan XKV graph rejects self-rotated hot
+    // cache (self_k_rot/self_v_rot). Check here at init — after the Turbo
+    // rotation policy is known, before store/workspace allocation — so a
+    // Vulkan XKV + rotation-override combo fails startup explicitly instead
+    // of dying on first decode. CPU reference continues regardless.
+    if (cparams.xkv_mode != LLAMA_XKV_MODE_OFF &&
+        (cparams.xkv_factorizer == LLAMA_XKV_FACTORIZER_VULKAN ||
+         cparams.xkv_factorizer == LLAMA_XKV_FACTORIZER_VULKAN_HYBRID) &&
+        (attn_rot_k || attn_rot_v)) {
+        throw std::runtime_error(
+            "init_xkv_store: Vulkan XKV cannot run with hot-cache rotation active "
+            "(attn_rot_k/v); unset LLAMA_ATTN_ROT_K_OVERRIDE/V_OVERRIDE or use CPU reference");
+    }
+    if (cparams.xkv_mode != LLAMA_XKV_MODE_OFF) {
+        if (!xkv_store) {
+            if (other && other->xkv_store) {
+                xkv_store = other->xkv_store;
+            } else {
+                xkv_store = std::make_shared<llama_xkv::llama_xkv_cache_store>(cparams);
+            }
+        }
+        // Register layer aliases deterministically from map_layer_ids
+        if (xkv_store) {
+            for (const auto & kv_pair : map_layer_ids) {
+                const uint32_t model_layer = (uint32_t) kv_pair.first;
+                const size_t   idx         = (size_t) kv_pair.second;
+                if (idx < layers.size()) {
+                    const uint32_t owning_layer = layers[idx].il;
+                    xkv_store->register_layer_alias(model_layer, owning_layer);
+                }
+            }
+        }
+        // Cache-owned runtime coordinator + single transaction coordinator.
+        // One runtime + one coordinator per shared-store family: inherit
+        // both from `other` when it shares this store, else create fresh.
+        // A fresh per-cache pair could race maintenance on one store.
+        // Non-owner/MTP caches never receive a runtime (MTP returns above),
+        // so their layer gate and maintenance stay false.
+        if (other && other->xkv_store == xkv_store && other->xkv_runtime && other->xkv_tx_coord) {
+            xkv_runtime = other->xkv_runtime;
+            xkv_tx_coord = other->xkv_tx_coord;
+        } else {
+            if (!xkv_tx_coord) {
+                xkv_tx_coord = std::make_shared<llama_xkv::xkv_transaction_coordinator>();
+            }
+            if (!xkv_runtime) {
+                xkv_runtime = llama_xkv::llama_xkv_runtime::create(cparams);
+            }
+        }
+        if (xkv_runtime) {
+            xkv_runtime->set_coordinator(xkv_tx_coord.get());
+            set_removal_rebuild_hook(xkv_runtime->bind_removal_hook(*this));
+        }
+        // Bind the coordinator to the authoritative store stamp at creation;
+        // maintain() re-syncs before taking the exclusion (never a stale
+        // zero-stamp gate). Full provider/delegate sync lives with the
+        // transaction owner.
+        if (xkv_tx_coord && xkv_store) {
+            xkv_tx_coord->sync_from_store(xkv_store->current_stamp());
+        }
+    }
+}
+
+llama_kv_cache::~llama_kv_cache() = default;
+
+llama_xkv::llama_xkv_runtime * llama_kv_cache::get_xkv_runtime() {
+    return xkv_runtime.get();
+}
+
+const llama_xkv::llama_xkv_runtime * llama_kv_cache::get_xkv_runtime() const {
+    return xkv_runtime.get();
+}
+
+std::shared_ptr<struct ggml_backend> llama_kv_cache::get_xkv_executor(ggml_backend_buffer_type_t buft) const {
+    if (other) {
+        return other->get_xkv_executor(buft);
+    }
+    if (!xkv_store || !buft) {
+        return nullptr;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (!dev) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(xkv_executor_mutex);
+    const auto found = xkv_executors.find(dev);
+    if (found != xkv_executors.end()) {
+        return found->second;
+    }
+
+    ggml_backend_t raw = ggml_backend_dev_init(dev, nullptr);
+    if (!raw) {
+        return nullptr;
+    }
+    std::shared_ptr<struct ggml_backend> owner(raw, ggml_backend_free);
+    try {
+        xkv_executors.emplace(dev, owner);
+    } catch (...) {
+        return nullptr;
+    }
+    return owner;
+}
+
+bool llama_kv_cache::get_admission_snapshot(struct llama_memory_admission_snapshot * out) const {
+    if (out == nullptr) {
+        return false;
+    }
+    if (xkv_runtime) {
+        std::string err;
+        if (!xkv_runtime->fill_admission_snapshot(*this, *out, &err)) {
+            return false;
+        }
+        return out->logical_capacity != 0;
+    }
+    // No runtime (OFF/MTP/rejected): exact legacy mapping via base default.
+    return llama_memory_i::get_admission_snapshot(out);
+}
+
+llama_memory_maintenance_status llama_kv_cache::maintain_safe_boundary() {
+    if (!xkv_runtime) {
+        return LLAMA_MEMORY_MAINTENANCE_NO_ACTION; // XKV OFF/MTP: always a no-op
+    }
+    std::string err;
+    // Explicit server maintenance request is treated as pressure (forced).
+    // Exactly one segment seals per call; the server repeats until the hot
+    // deficit clears. No segment-count cap.
+    const llama_xkv::xkv_maintenance_outcome oc = xkv_runtime->maintain(*this, 0, true, &err);
+    switch (oc) {
+        case llama_xkv::xkv_maintain_sealed:
+            return LLAMA_MEMORY_MAINTENANCE_PROGRESS;
+        case llama_xkv::xkv_maintain_no_action:
+        case llama_xkv::xkv_maintain_evaluated:
+            return LLAMA_MEMORY_MAINTENANCE_NO_ACTION;
+        case llama_xkv::xkv_maintain_retry_stale:
+            return LLAMA_MEMORY_MAINTENANCE_RETRY_STALE;
+        case llama_xkv::xkv_maintain_error:
+        default:
+            LLAMA_LOG_ERROR("%s: xkv maintenance failed: %s\n", __func__, err.c_str());
+            return LLAMA_MEMORY_MAINTENANCE_ERROR;
+    }
+}
+
+bool llama_kv_cache::get_xkv_runtime_snapshot(struct llama_memory_xkv_runtime_snapshot * out) const {
+    if (out == nullptr) {
+        return false;
+    }
+    *out = {};
+    if (!xkv_runtime) {
+        return false;
+    }
+    std::string err;
+    return xkv_runtime->fill_runtime_snapshot(*this, *out, &err);
+}
+
+bool llama_kv_cache_context::xkv_layer_enabled(uint32_t il) const {
+    if (!kv) {
+        return false;
+    }
+    auto * rt = kv->get_xkv_runtime();
+    if (!rt) {
+        return false;
+    }
+    return rt->xkv_layer_enabled(kv->get_owning_layer(il));
+}
+
+llama_kv_cache * llama_kv_cache_context::get_kv() const {
+    return kv;
+}
+
+size_t llama_kv_cache_context::get_ubatch_index() const {
+    return i_cur;
+}
+
+size_t llama_kv_cache_context::get_ubatch_count() const {
+    return ubatches.size();
+}
+
+size_t llama_kv_cache_context::get_sinfo_count() const {
+    return sinfos.size();
+}
+
+const llama_ubatch & llama_kv_cache_context::get_ubatch_at(size_t i) const {
+    GGML_ASSERT(i < ubatches.size());
+    return ubatches[i];
+}
+
+const llama_kv_cache::slot_info & llama_kv_cache_context::get_sinfo_at(size_t i) const {
+    GGML_ASSERT(i < sinfos.size());
+    return sinfos[i];
 }

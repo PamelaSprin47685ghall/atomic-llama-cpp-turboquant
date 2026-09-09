@@ -93,8 +93,11 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include "ggml-xkv.h"
+#include "ggml-xkv-factor.h"
+#include "ggml-vulkan-landmark.h"
+
 #include "ggml-vulkan-shaders.hpp"
-#include "vulkan-shaders/flashprefill-interface.h"
 
 // remove this once it's more widely available in the SDK
 #if !defined(VK_KHR_shader_bfloat16)
@@ -793,10 +796,6 @@ struct vk_device_struct {
     uint32_t subgroup_size;
     uint32_t subgroup_size_log2;
     uint32_t shader_core_count;
-    // timestampValidBits of the selected compute queue family (PhysicalDevice
-    // Limits has no such member; timestamps are a queue property). Cached at
-    // init; 0 means FP GPU timings omitted with diagnostic, never faked.
-    uint32_t compute_timestamp_valid_bits {};
     bool uma;
     bool prefer_host_memory;
     bool float_controls_rte_fp16;
@@ -1047,12 +1046,21 @@ struct vk_device_struct {
     vk_pipeline pipeline_pool1d_f32;
     vk_pipeline pipeline_pool2d_f32;
     vk_pipeline pipeline_turbo_wht;
+    vk_pipeline pipeline_xkv_reconstruct;
+    vk_pipeline pipeline_xkv_attention;
+    vk_pipeline pipeline_xkv_factorize;
+    vk_pipeline pipeline_xkv_canonicalize;
+    vk_pipeline pipeline_xkv_landmark_score;
+    vk_pipeline pipeline_xkv_landmark_select;
+    vk_pipeline pipeline_xkv_landmark_build;
+    vk_pipeline pipeline_xkv_landmark_rows;
+    vk_pipeline pipeline_xkv_landmark_merge;
     vk_pipeline pipeline_rwkv_wkv6_f32;
     vk_pipeline pipeline_rwkv_wkv7_f32;
     vk_pipeline pipeline_gated_linear_attn_f32;
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
-    vk_pipeline pipeline_gated_delta_net_rbb[4][2];
+    vk_pipeline pipeline_gated_delta_net_rbb[4];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1074,17 +1082,6 @@ struct vk_device_struct {
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
-    // FlashPrefill V2 (POOL/SELECT/ATTN): lazy on-demand only, never created
-    // while OFF. POOL/ATTN decode K/V on the fly (F16/F32/Turbo2/3/4 asym via
-    // flash_attn_dequant.glsl) with runtime K/V specialization via FaTypeK/V
-    // + block-bytes spec constants like FA, so one pipeline per (Ktype,Vtype)
-    // pair; SELECT touches only F32 Q/pool, single pipeline. No eager
-    // creation; claimed on first use under compile_mutex, compiled by
-    // ggml_vk_load_shaders on descriptor-set request.
-    std::map<std::pair<ggml_type, ggml_type>, vk_pipeline> pipeline_flash_prefill_pool;
-    vk_pipeline pipeline_flash_prefill_select;
-    std::map<std::pair<ggml_type, ggml_type>, vk_pipeline> pipeline_flash_prefill_attn;
-    vk_pipeline pipeline_flash_prefill_merge;
     vk_pipeline pipeline_count_experts;
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
@@ -2007,92 +2004,6 @@ struct vk_op_flash_attn_mask_opt_push_constants {
     uint32_t nbd3;
 };
 
-// FlashPrefill V2 pushes: FpPoolPush (64 B) / FpSelectPush (96 B) /
-// FpAttnPush (<=128 B) from vulkan-shaders/flashprefill-interface.h
-// (Shader-owned joint contract, included above). Bindings Q=0,K=1,V=2
-// (reuse flash_attn_dequant.glsl),pool=3,plan=4,meta=5,sinks=6,dst=7.
-// POOL uses 1,2,5,7; SELECT uses 0,3,5,7 (two phases: 0=init,1=select with
-// a global barrier between, never a workgroup-only barrier); ATTN uses
-// 0..7 split-1. Metadata/plan contents stay opaque on host (frozen
-// ggml-flashprefill.h offsets parsed on device); dispatch validates only
-// capacities via ne/nb plus 16xI32 op_params by value (words 0..8, floats
-// bit-cast, 9..15 zero). Frozen shapes: Q F32 [Dk,n_groups,Hq,1], K/V
-// [D,nkv,Hkv,1], pool F32 [Dk+Dv,Hkv,Fcap], plan I32 1-D, ATTN out F32
-// [Dv,Hq,n_output_queries,1]. Actual counts/tiles live in device headers;
-// push carries caps/bounds/strides/scalars only (no per-layer host count
-// sync); shaders read counts on-device and report errors via the plan
-// header (error, never truncation/silent dense).
-
-// Unpack 16xI32 op_params carried by value on the dst tensor (no host ptr).
-// Returns false on bad size/version/fields; floats are bit-cast per the
-// WireReference/OpRegistration frozen words 0..8.
-static bool ggml_vk_flash_prefill_unpack_params(const ggml_tensor * dst, int32_t & fp_op, float & alpha, float & scale, float & softcap, int32_t & exact_all, int32_t & dk, int32_t & dv, int32_t & version, int32_t & mean_corr) {
-    if (dst == nullptr) {
-        return false;
-    }
-    // 16 int32 words = 64 B, the public scalar limit.
-    static_assert(GGML_MAX_OP_PARAMS >= 64, "GGML_MAX_OP_PARAMS must hold 16xI32 flashprefill params");
-    const int32_t * w = (const int32_t *) dst->op_params;
-    fp_op     = w[0];
-    memcpy(&alpha,   &w[1], sizeof(float));
-    memcpy(&scale,   &w[2], sizeof(float));
-    memcpy(&softcap, &w[3], sizeof(float));
-    exact_all = w[4];
-    dk        = w[5];
-    dv        = w[6];
-    version   = w[7];
-    mean_corr = w[8];
-    for (int i = 9; i < 16; ++i) {
-        if (w[i] != 0) {
-            return false;
-        }
-    }
-    if (version != 1) {
-        return false;
-    }
-    if (dk < 1 || dv < 1) {
-        return false;
-    }
-    if (!std::isfinite(alpha) || !std::isfinite(scale) || !std::isfinite(softcap)) {
-        return false;
-    }
-    // Only SELECT consumes alpha. POOL constructors store alpha=scale=0,
-    // and ATTN stores alpha=0; rejecting those unused fields disables the
-    // entire Vulkan path. A finite zero attention scale is legal as well.
-    if (fp_op < FP_OP_POOL || fp_op > FP_OP_ATTN || softcap < 0.0f) {
-        return false;
-    }
-    if (fp_op == FP_OP_SELECT && (alpha <= 0.0f || alpha > 1.0f)) {
-        return false;
-    }
-    if (exact_all != 0 && exact_all != 1) {
-        return false;
-    }
-    if (mean_corr != 0 && mean_corr != 1) {
-        return false;
-    }
-    return true;
-}
-
-static bool ggml_vk_flash_prefill_stride_ok(size_t nb) {
-    return nb <= (size_t) std::numeric_limits<uint32_t>::max();
-}
-
-static uint64_t vk_tensor_offset(const ggml_tensor * tensor);
-static uint32_t get_misalign_bytes(const ggml_backend_vk_context * ctx, const ggml_tensor * t);
-static bool ggml_vk_flash_prefill_aligned(const vk_device & device, const ggml_tensor * t) {
-    const uint32_t align = device->properties.limits.minStorageBufferOffsetAlignment;
-    if (align <= 1) {
-        return true;
-    }
-    const size_t off = vk_tensor_offset(t) + t->view_offs;
-    return (off & (align - 1)) == 0;
-}
-
-static bool ggml_vk_flash_prefill_aligned_ctx(const ggml_backend_vk_context * ctx, const ggml_tensor * t) {
-    return get_misalign_bytes(ctx, t) == 0;
-}
-
 // Allow pre-recording command buffers
 struct vk_staging_memcpy {
     vk_staging_memcpy(void * _dst, const void * _src, size_t _n) : dst(_dst), src(_src), n(_n) {}
@@ -2133,8 +2044,6 @@ struct ggml_vk_garbage_collector {
 };
 
 static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subctx);
-static uint64_t ggml_vk_flash_prefill_row_bound(uint64_t meta_words, uint64_t f_cap);
-static std::vector<uint32_t> ggml_vk_flash_prefill_spec(ggml_type k_type, ggml_type v_type);
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested = nullptr);
 static void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx);
 static bool ggml_vk_intel_windows_driver_equals_or_newer_than(uint32_t driver_version, uint32_t threshold_major, uint32_t threshold_minor);
@@ -2182,8 +2091,6 @@ std::mutex vk_memory_logger::log_mutex;
 static bool vk_perf_logger_enabled = false;
 static bool vk_perf_logger_concurrent = false;
 static bool vk_enable_sync_logger = false;
-// (Per-context FP counters live in ggml_backend_vk_context::fp_ns; no
-// process-global timing state, so concurrent contexts never mix.)
 // number of calls between perf logger prints
 static uint32_t vk_perf_logger_frequency = 1;
 static std::string vk_pipeline_stats_filter;
@@ -2223,6 +2130,16 @@ static uint64_t ggml_vk_get_node_flops(const ggml_tensor * node) {
         const ggml_tensor * v = node->src[2];
         const ggml_tensor * entries = node->src[3];
         return 2ull * entries->ne[1] * q->ne[2] * (k->ne[0] + v->ne[0]);
+    }
+    if (node->op == GGML_OP_XKV_ATTENTION) {
+        ggml_xkv_attention_params p;
+        memcpy(&p, node->op_params, sizeof(p));
+        return 2ull * p.n_entries * p.gqa_ratio * (p.dim_k + p.dim_v);
+    }
+    if (node->op == GGML_OP_XKV_LANDMARK) {
+        ggml_xkv_landmark_params p;
+        memcpy(&p, node->op_params, sizeof(p));
+        return 2ull * p.n_queries * p.n_frags * p.head_dim * p.n_q_heads;
     }
     return 0;
 }
@@ -2468,25 +2385,6 @@ struct ggml_backend_vk_context {
     std::vector<int> query_node_idx;
     int32_t num_queries {};
     int32_t query_idx {};
-    // FlashPrefill ON-only timestamp capture: dedicated pool + per-op-class
-    // brackets, independent of GGML_VK_PERF_LOGGER (required metrics must flow
-    // without it). Queued with dispatches, read once at graph completion.
-    struct vk_fp_stamp { uint32_t begin, end, cls; }; // cls: 0 pool, 1 select, 2 attn(+merge)
-    vk::QueryPool fp_query_pool;
-    uint32_t fp_num_queries {};
-    uint32_t fp_query_idx {};
-    std::vector<vk_fp_stamp> fp_stamps;
-    bool fp_timing_active {};
-    // Cumulative GPU nanoseconds per op class for THIS backend context
-    // (monotonic since backend init; snapshot once per completed call and
-    // difference — concurrent contexts/models never mix).
-    uint64_t fp_ns[3] {};
-    // FP native split scratch actually chosen by FP ATTN on THIS backend:
-    // 0 when the last ATTN took split1 (no scratch), else the exact
-    // scr_bytes sized from shared prealloc_split_k (never the whole shared
-    // buffer when other ops sized it larger). Peak is monotonic max.
-    uint64_t fp_scratch_cur {};
-    uint64_t fp_scratch_peak {};
 };
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
@@ -2933,7 +2831,9 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
     if (device->float_controls_rte_fp16 || device->float_controls_denorm_preserve_fp16) {
         const uint32_t* spv_words = reinterpret_cast<const uint32_t *>(spv_data);
         size_t word_count = spv_size / sizeof(uint32_t);
-        spirv.assign(spv_words, spv_words + word_count);
+        if (spv_words && word_count > 0) {
+            spirv.assign(spv_words, spv_words + word_count);
+        }
 
         // Find insertion points respecting SPIR-V layout order:
         //   Header(5) -> OpCapability -> OpExtension -> ... -> OpEntryPoint -> OpExecutionMode -> ...
@@ -4270,12 +4170,6 @@ struct CompileTask {
     uint32_t required_subgroup_size;
 };
 
-// GCC 16.2.1 crashes in PRE's pointer-analysis pass on this large pipeline
-// initialization walk at -O3. Keep the workaround local to this function;
-// shader code, execution paths and other compilers retain their optimizations.
-#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ == 16
-__attribute__((optimize("no-tree-pre")))
-#endif
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -5607,23 +5501,6 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, it.second, "fa_mask_opt", fa_mask_opt_len, fa_mask_opt_data, "main", 2, sizeof(vk_op_flash_attn_mask_opt_push_constants), {1, 1, 1}, {128, 128 / device->subgroup_size, BrBc.first, BrBc.second}, 1, true, true, device->subgroup_size);
     }
 
-    // FlashPrefill V2 (VulkanShaders-owned SPIR-V + interface.h pushes;
-    // VulkanDispatch owns ensure/request/dispatch/barriers/scratch-fit).
-    // Select is a single F32 variant; pool/attn specialize K/V at runtime
-    // via ggml_vk_flash_prefill_spec (ids 0/12..15) like FA. Attn declares
-    // scratch bindings 8/9/10 for split-partials: 11 descriptors, final
-    // split1 binds dummy scratch. Merge (split/merge Phase4 path) is typeless.
-    ggml_vk_create_pipeline(device, device->pipeline_flash_prefill_select, "flashprefill_select", flashprefill_select_len, flashprefill_select_data, "main", 8, sizeof(FpSelectPush), {1,1,1}, {}, 1, true);
-    for (auto &it : device->pipeline_flash_prefill_pool) {
-        auto kv = it.first;
-        ggml_vk_create_pipeline(device, it.second, "flashprefill_pool", flashprefill_pool_len, flashprefill_pool_data, "main", 8, sizeof(FpPoolPush), {1,1,1}, ggml_vk_flash_prefill_spec(kv.first, kv.second), 1, true);
-    }
-    for (auto &it : device->pipeline_flash_prefill_attn) {
-        auto kv = it.first;
-        ggml_vk_create_pipeline(device, it.second, "flashprefill_attn", flashprefill_attn_len, flashprefill_attn_data, "main", 11, sizeof(FpAttnPush), {1,1,1}, ggml_vk_flash_prefill_spec(kv.first, kv.second), 1, true);
-    }
-    ggml_vk_create_pipeline(device, device->pipeline_flash_prefill_merge, "flashprefill_merge", flashprefill_merge_len, flashprefill_merge_data, "main", 11, sizeof(FpMergePush), {1,1,1}, {}, 1, true);
-
     if (device->subgroup_clustered && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_quantize_q8_1_x4, "quantize_q8_1_x4", quantize_q8_1_x4_subgroup_len, quantize_q8_1_x4_subgroup_data, "main", 2, sizeof(vk_quantize_q8_1_push_constants), {32 * device->subgroup_size / 8, 1, 1}, { device->subgroup_size }, 1, true, true);
     } else {
@@ -5724,6 +5601,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q5_1], "cpy_q5_1_f32", cpy_q5_1_f32_len, cpy_q5_1_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q5_1), 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q8_0], "cpy_q8_0_f32", cpy_q8_0_f32_len, cpy_q8_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q8_0), 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_IQ4_NL], "cpy_iq4_nl_f32", cpy_iq4_nl_f32_len, cpy_iq4_nl_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_IQ4_NL), 1, 1}, {}, 1);
+
+    // TurboQuant dequantize-to-F32 (bounded hot-row rephasing read path).
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_TURBO2_0], "cpy_turbo2_0_f32", cpy_turbo2_0_f32_len, cpy_turbo2_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_TURBO2_0), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_TURBO3_0], "cpy_turbo3_0_f32", cpy_turbo3_0_f32_len, cpy_turbo3_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_TURBO3_0), 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_TURBO4_0], "cpy_turbo4_0_f32", cpy_turbo4_0_f32_len, cpy_turbo4_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_TURBO4_0), 1, 1}, {}, 1);
 
     auto get_suffix = [](bool src0_f16, bool src1_f16, bool dst_f16) {
         std::string s;
@@ -5988,6 +5870,33 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // TurboQuant WHT (forward / inverse rotation, 128-element block)
     ggml_vk_create_pipeline(device, device->pipeline_turbo_wht, "turbo_wht", turbo_wht_len, turbo_wht_data, "main", 2, 3 * sizeof(uint32_t), {128, 1, 1}, {}, 1);
 
+    // XKV selected-row factor reconstruction: 10 bindings, 84B push constants, one dispatch per op
+    ggml_vk_create_pipeline(device, device->pipeline_xkv_reconstruct, "xkv_reconstruct", xkv_reconstruct_len, xkv_reconstruct_data, "main", 10, 84, {64, 1, 1}, {}, 1);
+
+    // XKV dual-source indexed attention: 11 bindings, 112B push constants, one dispatch per KV head.
+    ggml_vk_create_pipeline(device, device->pipeline_xkv_attention, "xkv_attention", xkv_attention_len, xkv_attention_data, "main", 11, 112, {1, 1, 1}, {}, 1);
+
+    // XKV device-local factorization: 5 bindings, 96B push constants
+    ggml_vk_create_pipeline(device, device->pipeline_xkv_factorize, "xkv_factorize", xkv_factorize_len, xkv_factorize_data, "main", 5, 96, {256, 1, 1}, {}, 1);
+
+    // XKV canonicalize-hot: 7 bindings, 52B push constants
+    ggml_vk_create_pipeline(device, device->pipeline_xkv_canonicalize, "xkv_canonicalize", xkv_canonicalize_len, xkv_canonicalize_data, "main", 7, 56, {64, 1, 1}, {}, 1);
+
+    // XKV landmark score: 8 bindings, 64B push constants, 2D dispatch over [n_frags, n_queries]
+    ggml_vk_create_pipeline(device, device->pipeline_xkv_landmark_score, "xkv_landmark_score", xkv_landmark_score_len, xkv_landmark_score_data, "main", 8, 76, {64, 1, 1}, {}, 1);
+
+    // XKV landmark select: 7 bindings, 64B push constants, one workgroup per query (+1-group fold)
+    ggml_vk_create_pipeline(device, device->pipeline_xkv_landmark_select, "xkv_landmark_select", xkv_landmark_select_len, xkv_landmark_select_data, "main", 7, 76, {64, 1, 1}, {}, 1);
+
+    // XKV landmark construction: 11 bindings, 88B push constants (owned by XkvNativeLandmarkBuild)
+    ggml_vk_create_pipeline(device, device->pipeline_xkv_landmark_build, "xkv_landmark_build", xkv_landmark_build_len, xkv_landmark_build_data, "main", 11, 88, {64, 1, 1}, {}, 1);
+
+    // XKV landmark rows: 11 bindings, 64B push constants (words 0..14 params, word 15 status_flag)
+    ggml_vk_create_pipeline(device, device->pipeline_xkv_landmark_rows, "xkv_landmark_rows", xkv_landmark_rows_len, xkv_landmark_rows_data, "main", 11, 64, {64, 1, 1}, {}, 1);
+
+    // XKV landmark merge: 6 bindings, 32B push constants
+    ggml_vk_create_pipeline(device, device->pipeline_xkv_landmark_merge, "xkv_landmark_merge", xkv_landmark_merge_len, xkv_landmark_merge_data, "main", 6, 32, {64, 1, 1}, {}, 1);
+
     ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv6_f32, "rwkv_wkv6_f32", rwkv_wkv6_f32_len, rwkv_wkv6_f32_data, "main", 7, sizeof(vk_op_rwkv_wkv6_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_rwkv_wkv7_f32, "rwkv_wkv7_f32", rwkv_wkv7_f32_len, rwkv_wkv7_f32_data, "main", 8, sizeof(vk_op_rwkv_wkv7_push_constants), {1, 1, 1}, {device->subgroup_size}, 1);
@@ -6068,23 +5977,21 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 8, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column, gdn_workgroup_size, 0u}, 1, true, use_subgroup_ops, device->subgroup_size);
             }
-            for (uint32_t density_mode = 0; density_mode < 2; ++density_mode) {
             ggml_vk_create_pipeline(
                 device,
-                device->pipeline_gated_delta_net_rbb[si][density_mode],
-                (std::string(gdn_names[si][0]) + (density_mode ? "_rbb_coherence" : "_rbb")).c_str(),
+                device->pipeline_gated_delta_net_rbb[si],
+                (std::string(gdn_names[si][0]) + "_rbb").c_str(),
                 gdn_len,
                 gdn_data,
                 "main",
                 8,
                 sizeof(vk_op_gated_delta_net_push_constants),
                 wg_denoms,
-                {S_V, 0u, device->subgroup_size, lanes_per_column, gdn_workgroup_size, 1u + density_mode},
+                {S_V, 0u, device->subgroup_size, lanes_per_column, gdn_workgroup_size, 1u},
                 1,
                 true,
                 use_subgroup_ops,
                 device->subgroup_size);
-            }
         }
     }
 
@@ -7120,12 +7027,6 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         // Queues
         device->compute_queue = ggml_vk_create_queue(device, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
-        {
-            // Timestamps are a queue-family property (not a device limit).
-            const std::vector<vk::QueueFamilyProperties> ts_props = device->physical_device.getQueueFamilyProperties();
-            const uint32_t ts_qfi = device->compute_queue->queue_family_index;
-            device->compute_timestamp_valid_bits = (ts_qfi < ts_props.size()) ? ts_props[ts_qfi].timestampValidBits : 0;
-        }
 
         // Shaders
         // Disable matmul tile sizes early if performance low or not supported
@@ -8059,9 +7960,7 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
         return pipelines;
     }
 
-    if (src1_type != GGML_TYPE_F32 && (!ctx->device->coopmat2 || src1_type != GGML_TYPE_F16)) {
-        return nullptr;
-    }
+    GGML_ASSERT(src1_type == GGML_TYPE_F32 || (ctx->device->coopmat2 && src1_type == GGML_TYPE_F16));
 
     switch (src0_type) {
         case GGML_TYPE_Q1_0:
@@ -9306,6 +9205,12 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
             return ctx->device->pipeline_cpy_quant_f32[src->type];
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
+            // Bounded hot-row rephasing read path only; all other Turbo
+            // consumers keep their dedicated kernels.
+            return ctx->device->pipeline_cpy_quant_f32[src->type];
         default:
             break;
         }
@@ -10531,9 +10436,6 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     const ggml_type routed_type_b = quantize_y
         ? GGML_TYPE_Q8_1
         : (qy_needs_dequant ? f16_type : src1->type);
-    // The singleton vector kernels cannot read staged F16/BF16 B. Keep those
-    // rows in the generic matrix route instead of requesting an incompatible
-    // vector kernel. The generic route still runs its explicit counter reset.
     const bool split_singletons = nei1 <= mul_mat_vec_id_hybrid_max_cols &&
         (routed_type_b == GGML_TYPE_F32 || routed_type_b == GGML_TYPE_Q8_1);
 
@@ -11798,399 +11700,6 @@ static void ggml_vk_flash_attn_rerot(ggml_backend_vk_context * ctx, vk_context &
     }
 }
 
-// Timestamp bracket helper for FP timing: writes one timestamp query into the
-// recording command buffer and returns its index. Caller pairs begin/end per
-// op; deltas resolve post-fence at graph completion (never per-layer waits).
-static uint32_t ggml_vk_fp_stamp(ggml_backend_vk_context * ctx, vk_context & compute_ctx) {
-    const uint32_t idx = ctx->fp_query_idx++;
-    compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->fp_query_pool, idx);
-    return idx;
-}
-
-// FlashPrefill V2 native dispatch. All data stay on GPU: inputs are device
-// subbuffers, outputs are graph tensors sized by host capacities (Fcap,
-// n_tiles, max_sel). No full decoded KV mirror, no host KV readback, no
-// per-layer count sync, no prealloc scratch. Each op ends with a global
-// write/read barrier so POOL->SELECT->ATTN order on distinct graph buffers
-// (plus the generic overlap tracker) is exact. Invalid metadata/plan
-// contents are shader-reported errors (plan header error word, error not
-// truncation); host dispatch validates only capacities/strides/alignment and
-// aborts clearly via GGML_ABORT so the backend failure path is explicit.
-// GPU error/counter details ride the plan header and are observed only at
-// the existing graph-completion boundary, never per layer.
-// FaType/block-bytes spec like FA (ids 12..15 carry raw ggml_type +
-// block bytes; id 0 carries workgroup size). Indices 1..11 zero.
-// Called by ggml_vk_load_shaders flashprefill entries (VulkanShaders); kept
-// here so the FaType/block-bytes mapping stays next to dispatch.
-[[maybe_unused]] static std::vector<uint32_t> ggml_vk_flash_prefill_spec(ggml_type k_type, ggml_type v_type) {
-    const auto block_bytes = [](ggml_type t) -> uint32_t {
-        if (t == GGML_TYPE_F32) {
-            return 16u;
-        }
-        return (uint32_t) ggml_type_size(t);
-    };
-    std::vector<uint32_t> spec(16, 0u);
-    spec[FP_SPEC_WGSIZE]   = 64u;
-    spec[FP_SPEC_FATYPE_K] = static_cast<uint32_t>(k_type);
-    spec[FP_SPEC_FATYPE_V] = static_cast<uint32_t>(v_type);
-    spec[FP_SPEC_FBLOCKB_K] = block_bytes(k_type);
-    spec[FP_SPEC_FBLOCKB_V] = block_bytes(v_type);
-    return spec;
-}
-
-// Bounded-split count and scratch sizing. Fit-visible contract:
-// FittingIntegration mirrors these two functions line-for-line with
-// rows_bound=n_output*Hq (ATTN dst ne[2]*ne[1]; rows unique on
-// (source_query,q_head) so this is an exact structural cap, no use/cell
-// slack), uses_bound=meta_words/8, cores=device cores (16 if unknown),
-// dv=padded Dv; dispatch calls them on actual tensor shapes. S<=4 hard; S>1
-// only when rows_bound < 2*cores and uses_bound > 64 (single-workgroup
-// efficient range), so live scratch is cores-bounded and S=1 allocates zero.
-// rows_bound <= ubatch*Hq_max definitionally, so the fitter's ubatch*Hq_max
-// cover is sound with no U-scaled artificial reserve. sink_split is always 0
-// (unique sink carrier).
-static uint32_t ggml_vk_flash_prefill_n_splits(uint64_t rows_bound, uint64_t uses_bound, uint32_t cores) {
-    if (cores == 0) {
-        cores = 16;
-    }
-    if (rows_bound == 0 || rows_bound >= (uint64_t) cores * 2u || uses_bound <= 64u) {
-        return 1;
-    }
-    uint64_t s = ((uint64_t) cores * 2u + rows_bound - 1u) / rows_bound;
-    if (s > 4) {
-        s = 4;
-    }
-    return (uint32_t) s;
-}
-
-static size_t ggml_vk_flash_prefill_split_bytes(uint64_t rows_bound, uint32_t n_splits, uint32_t dv) {
-    return (size_t) rows_bound * (size_t) n_splits * (2u + (size_t) dv) * sizeof(float);
-}
-
-static vk_pipeline ggml_vk_ensure_flash_prefill(ggml_backend_vk_context * ctx, vk_pipeline & slot) {
-    std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
-    if (slot == nullptr) {
-        slot = std::make_shared<vk_pipeline_struct>();
-    }
-    return slot;
-}
-
-static vk_pipeline ggml_vk_ensure_flash_prefill_typed(ggml_backend_vk_context * ctx, std::map<std::pair<ggml_type, ggml_type>, vk_pipeline> & map, ggml_type k_type, ggml_type v_type) {
-    std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
-    auto key = std::make_pair(k_type, v_type);
-    auto it = map.find(key);
-    if (it != map.end()) {
-        return it->second;
-    }
-    vk_pipeline pipeline = std::make_shared<vk_pipeline_struct>();
-    map[key] = pipeline;
-    return pipeline;
-}
-
-static void ggml_vk_flash_prefill_pool(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * meta, ggml_tensor * dst) {
-    int32_t fp_op = 0;
-    float alpha = 0.0f;
-    float scale = 1.0f;
-    float softcap = 0.0f;
-    int32_t exact_all = 0;
-    int32_t dk = 0;
-    int32_t dv = 0;
-    int32_t version = 1;
-    int32_t mean_corr = 0;
-    GGML_ASSERT(ggml_vk_flash_prefill_unpack_params(dst, fp_op, alpha, scale, softcap, exact_all, dk, dv, version, mean_corr));
-    GGML_ASSERT(fp_op == FP_OP_POOL);
-    (void) alpha;
-    (void) scale;
-    (void) softcap;
-    (void) exact_all;
-    (void) mean_corr;
-    GGML_ASSERT(ggml_vk_flash_prefill_aligned_ctx(ctx, k));
-    GGML_ASSERT(ggml_vk_flash_prefill_aligned_ctx(ctx, v));
-    GGML_ASSERT(ggml_vk_flash_prefill_aligned_ctx(ctx, meta));
-    GGML_ASSERT(ggml_vk_flash_prefill_aligned_ctx(ctx, dst));
-    const uint32_t h_cap = (uint32_t) k->ne[2];
-    const uint32_t f_cap = (uint32_t) dst->ne[2];
-    FpPoolPush pc{};
-    pc.dk         = (uint32_t) dk;
-    pc.dv         = (uint32_t) dv;
-    pc.h_cap      = h_cap;
-    pc.f_cap      = f_cap;
-    pc.meta_words = (uint32_t) meta->ne[0];
-    pc.n_kv       = (uint32_t) k->ne[1];
-    pc.k_nb1      = (uint32_t) k->nb[1];
-    pc.k_nb2      = (uint32_t) k->nb[2];
-    pc.v_nb1      = (uint32_t) v->nb[1];
-    pc.v_nb2      = (uint32_t) v->nb[2];
-    pc.version    = (uint32_t) version;
-    vk_pipeline pipeline = ggml_vk_ensure_flash_prefill_typed(ctx, ctx->device->pipeline_flash_prefill_pool, k->type, v->type);
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-    vk_subbuffer k_buf    = ggml_vk_tensor_subbuffer(ctx, k);
-    vk_subbuffer v_buf    = ggml_vk_tensor_subbuffer(ctx, v);
-    vk_subbuffer meta_buf = ggml_vk_tensor_subbuffer(ctx, meta);
-    vk_subbuffer pool_buf = ggml_vk_tensor_subbuffer(ctx, dst);
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        { pool_buf, k_buf, v_buf, pool_buf, pool_buf, meta_buf, pool_buf, pool_buf },
-        pc, { f_cap, h_cap, 1 });
-    ggml_vk_sync_buffers(ctx, subctx);
-}
-
-static void ggml_vk_flash_prefill_select(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * q, const ggml_tensor * pool, const ggml_tensor * meta, ggml_tensor * dst) {
-    int32_t fp_op = 0;
-    float alpha = 0.0f;
-    float scale = 1.0f;
-    float softcap = 0.0f;
-    int32_t exact_all = 0;
-    int32_t dk = 0;
-    int32_t dv = 0;
-    int32_t version = 1;
-    int32_t mean_corr = 0;
-    GGML_ASSERT(ggml_vk_flash_prefill_unpack_params(dst, fp_op, alpha, scale, softcap, exact_all, dk, dv, version, mean_corr));
-    GGML_ASSERT(fp_op == FP_OP_SELECT);
-    (void) mean_corr;
-    GGML_ASSERT(ggml_vk_flash_prefill_aligned_ctx(ctx, q));
-    GGML_ASSERT(ggml_vk_flash_prefill_aligned_ctx(ctx, pool));
-    GGML_ASSERT(ggml_vk_flash_prefill_aligned_ctx(ctx, meta));
-    GGML_ASSERT(ggml_vk_flash_prefill_aligned_ctx(ctx, dst));
-    // Caps-only push (no host count sync): actuals (n_frag/n_row/n_use/n_cell,
-    // T/H/max_sel) live in device headers; shaders read them on-device and
-    // validate actual<=cap. Cap-grid {rows_bound, hkv}: rows_bound from
-    // host-visible shapes (total words minus frag region), guarded on-device
-    // by t>=T / r>=n_row. Init (phase 0) zeroes error/counters/tables slices;
-    // barrier; select (phase 1) only atomicMax error / atomicAdd counters.
-    const uint64_t mw = (uint64_t) meta->ne[0];
-    const uint64_t fc = (uint64_t) pool->ne[2];
-    uint64_t rb = ggml_vk_flash_prefill_row_bound(mw, fc);
-    if (rb > 0xffffffffULL) {
-        rb = 0xffffffffULL;
-    }
-    if (rb == 0 || rb >= 0xffffffffULL) {
-        GGML_ABORT("ggml_vulkan: flashprefill select row bound out of range");
-    }
-    const uint32_t rows_b = (uint32_t) rb;
-    // A byte-derived row bound includes use-table slack and can launch tens
-    // of thousands of empty workgroups for only a handful of actual tiles.
-    // Bound the grid by Q groups and let the shader stride over device T.
-    // This is a scheduling bound, never a truncation of metadata or work.
-    const uint32_t grid_x = (uint32_t) std::min({ (uint64_t) rows_b + 1u,
-        (uint64_t) q->ne[1], (uint64_t) ctx->device->properties.limits.maxComputeWorkGroupCount[0] });
-    const uint32_t hkv = (uint32_t) pool->ne[1];
-    vk_pipeline pipeline = ggml_vk_ensure_flash_prefill(ctx, ctx->device->pipeline_flash_prefill_select);
-    // The init and selection phases are separate dispatches, each consuming
-    // its own descriptor set from the graph-wide pool.
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 2);
-    vk_subbuffer q_buf    = ggml_vk_tensor_subbuffer(ctx, q);
-    vk_subbuffer pool_buf = ggml_vk_tensor_subbuffer(ctx, pool);
-    vk_subbuffer meta_buf = ggml_vk_tensor_subbuffer(ctx, meta);
-    vk_subbuffer plan_buf = ggml_vk_tensor_subbuffer(ctx, dst);
-    FpSelectPush pc_init{};
-    pc_init.phase       = 0;
-    pc_init.dk          = (uint32_t) dk;
-    pc_init.dv_cap      = (uint32_t) dv;
-    pc_init.f_cap       = (uint32_t) fc;
-    pc_init.r_cap       = rows_b;
-    pc_init.u_cap       = mw > 0xffffffffULL ? 0xffffffffu : (uint32_t) mw / 8u;
-    pc_init.c_cap       = mw > 0xffffffffULL ? 0xffffffffu : (uint32_t) mw;
-    pc_init.meta_words  = (uint32_t) mw;
-    pc_init.plan_words  = (uint32_t) dst->ne[0];
-    pc_init.q_nb1       = (uint32_t) q->nb[1];
-    pc_init.q_nb2       = (uint32_t) q->nb[2];
-    pc_init.q_groups_cap = (uint32_t) q->ne[1];
-    pc_init.q_heads_cap  = (uint32_t) q->ne[2];
-    pc_init.hkv_cap     = hkv;
-    pc_init.exact_all   = (uint32_t) exact_all;
-    pc_init.version     = (uint32_t) version;
-    pc_init.alpha       = alpha;
-    pc_init.scale       = scale;
-    pc_init.softcap     = softcap;
-    // Initialize the output header once from device metadata. Pair slices
-    // are initialized by their owner in phase 1, after this barrier.
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        { q_buf, q_buf, q_buf, pool_buf, plan_buf, meta_buf, q_buf, plan_buf },
-        pc_init, { 1, 1, 1 });
-    // Cross-dispatch barrier: init writes must be visible before any
-    // selection workgroup runs; selection only sets error/counters.
-    ggml_vk_sync_buffers(ctx, subctx);
-    FpSelectPush pc = pc_init;
-    pc.phase = 1;
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        { q_buf, q_buf, q_buf, pool_buf, plan_buf, meta_buf, q_buf, plan_buf },
-        pc, { grid_x, hkv, 1 });
-    ggml_vk_sync_buffers(ctx, subctx);
-}
-
-static void ggml_vk_flash_prefill_attn(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * pool, const ggml_tensor * plan, const ggml_tensor * meta, const ggml_tensor * sinks, ggml_tensor * dst) {
-    int32_t fp_op = 0;
-    float alpha = 0.0f;
-    float scale = 1.0f;
-    float softcap = 0.0f;
-    int32_t exact_all = 0;
-    int32_t dk = 0;
-    int32_t dv = 0;
-    int32_t version = 1;
-    int32_t mean_corr = 0;
-    GGML_ASSERT(ggml_vk_flash_prefill_unpack_params(dst, fp_op, alpha, scale, softcap, exact_all, dk, dv, version, mean_corr));
-    GGML_ASSERT(fp_op == FP_OP_ATTN);
-    (void) alpha;
-    (void) exact_all;
-    GGML_ASSERT(ggml_vk_flash_prefill_aligned_ctx(ctx, q));
-    GGML_ASSERT(ggml_vk_flash_prefill_aligned_ctx(ctx, k));
-    GGML_ASSERT(ggml_vk_flash_prefill_aligned_ctx(ctx, v));
-    GGML_ASSERT(ggml_vk_flash_prefill_aligned_ctx(ctx, pool));
-    GGML_ASSERT(ggml_vk_flash_prefill_aligned_ctx(ctx, plan));
-    GGML_ASSERT(ggml_vk_flash_prefill_aligned_ctx(ctx, meta));
-    GGML_ASSERT(ggml_vk_flash_prefill_aligned_ctx(ctx, dst));
-    if (sinks) {
-        GGML_ASSERT(ggml_vk_flash_prefill_aligned_ctx(ctx, sinks));
-    }
-    // Exact structural row cap: rows unique on (source_query,q_head), so
-    // n_rows <= n_output*Hq = dst ne[2]*ne[1] (no use/cell slack). One
-    // workgroup per metadata row (cap-grid rows_cap, guarded r>=n_row); the
-    // shader errors when device n_row exceeds push r_cap (never truncates).
-    // Scratch likewise scales with rows_cap, so the fitter's ubatch*Hq_max
-    // cover is sound with no U-scaled artificial reserve.
-    const uint64_t mw = (uint64_t) meta->ne[0];
-    const uint64_t fc = (uint64_t) pool->ne[2];
-    const uint64_t rows64 = (uint64_t) dst->ne[2] * (uint64_t) dst->ne[1];
-    if (rows64 == 0 || rows64 > 0xffffffffULL) {
-        GGML_ABORT("ggml_vulkan: flashprefill attn row cap out of range");
-    }
-    const uint32_t rows_cap = (uint32_t) rows64;
-    const uint32_t dv_u = (uint32_t) dv;
-    FpAttnPush base{};
-    base.dk              = (uint32_t) dk;
-    base.dv              = dv_u;
-    base.meta_words      = (uint32_t) mw;
-    base.plan_words      = (uint32_t) plan->ne[0];
-    base.n_kv            = (uint32_t) k->ne[1];
-    base.f_cap           = (uint32_t) fc;
-    base.r_cap           = rows_cap;
-    base.u_cap           = mw > 0xffffffffULL ? 0xffffffffu : (uint32_t) mw / 8u;
-    base.c_cap           = mw > 0xffffffffULL ? 0xffffffffu : (uint32_t) mw;
-    base.n_output_cap    = (uint32_t) dst->ne[2];
-    base.q_nb1           = (uint32_t) q->nb[1];
-    base.q_nb2           = (uint32_t) q->nb[2];
-    base.k_nb1           = (uint32_t) k->nb[1];
-    base.k_nb2           = (uint32_t) k->nb[2];
-    base.v_nb1           = (uint32_t) v->nb[1];
-    base.v_nb2           = (uint32_t) v->nb[2];
-    base.q_groups_cap    = (uint32_t) q->ne[1];
-    base.q_heads_cap     = (uint32_t) q->ne[2];
-    base.hkv_cap         = (uint32_t) k->ne[2];
-    base.sinks_present   = sinks ? 1u : 0u;
-    base.version         = (uint32_t) version;
-    base.mean_correction = (uint32_t) mean_corr;
-    base.scale           = scale;
-    base.softcap         = softcap;
-    // A direct SELECT source that consumes this exact metadata tensor is a
-    // validated producer dependency of ATTN. Graph expansion/scheduling
-    // recomputes it first and SELECT owns every plan entry, so ATTN need not
-    // repeat its O(rows*uses*selected) coverage scan. Leaf/view/external
-    // plans, or SELECT plans built from another metadata tensor, stay slow
-    // and fail-closed through the full consumer-side coverage validation.
-    base.reserved4 =
-        plan->op == GGML_OP_FLASH_PREFILL_SELECT && plan->src[2] == meta ? 1u : 0u;
-    vk_pipeline pipeline = ggml_vk_ensure_flash_prefill_typed(ctx, ctx->device->pipeline_flash_prefill_attn, k->type, v->type);
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-    vk_subbuffer q_buf    = ggml_vk_tensor_subbuffer(ctx, q);
-    vk_subbuffer k_buf    = ggml_vk_tensor_subbuffer(ctx, k);
-    vk_subbuffer v_buf    = ggml_vk_tensor_subbuffer(ctx, v);
-    vk_subbuffer pool_buf = ggml_vk_tensor_subbuffer(ctx, pool);
-    vk_subbuffer plan_buf = ggml_vk_tensor_subbuffer(ctx, plan);
-    vk_subbuffer meta_buf = ggml_vk_tensor_subbuffer(ctx, meta);
-    vk_subbuffer sinks_buf = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : q_buf;
-    vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
-    // Bounded-split scope (explicit; host-blind to per-row uses, so driven
-    // by caps only): S=1 (split1 final, no scratch) unless rows_cap is below
-    // 2x shader cores while the use bound exceeds single-workgroup efficient
-    // range (>64). Then S<=4 stride-partitions the flattened exact/proxy
-    // sequences (deterministic, disjoint, merge-associative); sink mass rides
-    // split 0 only. Scratch (rows_cap*S*(2+Dv) floats) reuses the shared
-    // prealloc_split_k pool (fit-observed, no hidden reserve).
-    const uint32_t cores = ctx->device->shader_core_count ? ctx->device->shader_core_count : 16;
-    uint32_t n_splits = ggml_vk_flash_prefill_n_splits(rows_cap, mw / 8u, cores);
-    if (n_splits <= 1) {
-        // Split-1 final: stable online softmax per row straight to dst.
-        // 11 descriptors (scratch 8/9/10 bound to dummy q_buf, unwritten in
-        // phase 0). ATTN raises plan errors via atomicMax AND writes zeros
-        // (never valid-looking output); rejection happens at the existing
-        // graph-completion boundary before outputs are consumed.
-        FpAttnPush pc = base;
-        pc.split_phase = 0;
-        pc.split_id    = 0;
-        pc.n_splits    = 1;
-        pc.sink_split  = 0;
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-            { q_buf, k_buf, v_buf, pool_buf, plan_buf, meta_buf, sinks_buf, dst_buf, q_buf, q_buf, q_buf },
-            pc, { rows_cap, 1, 1 });
-        ggml_vk_sync_buffers(ctx, subctx);
-        ctx->fp_scratch_cur = 0;
-        return;
-    }
-    // Bounded split: size shared scratch, partials, barrier, merge, barrier.
-    const uint64_t scr_bytes = ggml_vk_flash_prefill_split_bytes(rows_cap, n_splits, dv_u);
-    if (scr_bytes > ctx->device->properties.limits.maxStorageBufferRange) {
-        // Scratch would exceed range: fall back to split1 (always correct).
-        FpAttnPush pc = base;
-        pc.split_phase = 0;
-        pc.split_id    = 0;
-        pc.n_splits    = 1;
-        pc.sink_split  = 0;
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-            { q_buf, k_buf, v_buf, pool_buf, plan_buf, meta_buf, sinks_buf, dst_buf, q_buf, q_buf, q_buf },
-            pc, { rows_cap, 1, 1 });
-        ggml_vk_sync_buffers(ctx, subctx);
-        ctx->fp_scratch_cur = 0;
-        return;
-    }
-    // Record FP-owned live scratch (exact bytes sized here, not the whole
-    // shared pool) and monotonic peak for the Metrics scratch getter.
-    ctx->fp_scratch_cur = scr_bytes;
-    if (scr_bytes > ctx->fp_scratch_peak) {
-        ctx->fp_scratch_peak = scr_bytes;
-    }
-    if (ctx->prealloc_size_split_k < scr_bytes) {
-        ctx->prealloc_size_split_k = (size_t) scr_bytes;
-        ggml_vk_preallocate_buffers(ctx, subctx);
-    }
-    if (ctx->prealloc_split_k_need_sync) {
-        ggml_vk_sync_buffers(ctx, subctx);
-    }
-    {
-        const size_t ml_pitch  = (size_t) n_splits * sizeof(float);
-        vk_subbuffer scr_m = { ctx->prealloc_split_k, 0, (size_t) rows_cap * ml_pitch };
-        vk_subbuffer scr_l = { ctx->prealloc_split_k, (size_t) rows_cap * ml_pitch, (size_t) rows_cap * ml_pitch };
-        vk_subbuffer scr_o = { ctx->prealloc_split_k, (size_t) 2u * (size_t) rows_cap * ml_pitch, (size_t) rows_cap * (size_t) n_splits * (size_t) dv_u * sizeof(float) };
-        // The first set was reserved above. Each additional partial dispatch
-        // also consumes a set; the merge has its own reservation below.
-        ggml_pipeline_request_descriptor_sets(ctx, pipeline, n_splits - 1u);
-        for (uint32_t s = 0; s < n_splits; ++s) {
-            FpAttnPush pc = base;
-            pc.split_phase = 1;
-            pc.split_id    = s;
-            pc.n_splits    = n_splits;
-            pc.sink_split  = 0;
-            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                { q_buf, k_buf, v_buf, pool_buf, plan_buf, meta_buf, sinks_buf, dst_buf, scr_m, scr_l, scr_o },
-                pc, { rows_cap, 1, 1 });
-        }
-        ggml_vk_sync_buffers(ctx, subctx);
-        vk_pipeline merge = ggml_vk_ensure_flash_prefill(ctx, ctx->device->pipeline_flash_prefill_merge);
-        ggml_pipeline_request_descriptor_sets(ctx, merge, 1);
-        FpMergePush mp{};
-        mp.dv           = dv_u;
-        mp.r_cap        = rows_cap;
-        mp.meta_words   = (uint32_t) mw;
-        mp.plan_words   = (uint32_t) plan->ne[0];
-        mp.n_splits_cap = n_splits;
-        mp.version      = (uint32_t) version;
-        ggml_vk_dispatch_pipeline(ctx, subctx, merge,
-            { q_buf, q_buf, q_buf, q_buf, plan_buf, meta_buf, q_buf, dst_buf, scr_m, scr_l, scr_o },
-            mp, { rows_cap, 1, 1 });
-        ggml_vk_sync_buffers(ctx, subctx);
-    }
-    ctx->prealloc_split_k_need_sync = true;
-}
-
 static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, uint32_t K, uint32_t NPQ) {
     auto n_tiles = [&](vk_conv_shapes s) {
         return CEIL_DIV(K, vk_conv_block_sizes[s].K)
@@ -12750,9 +12259,7 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 default: return nullptr;
             }
             if (ggml_get_op_params_i32(dst, 1) != 0) {
-                const int32_t density_mode = ggml_get_op_params_i32(dst, 2);
-                GGML_ASSERT(density_mode == 0 || density_mode == 1);
-                return ctx->device->pipeline_gated_delta_net_rbb[si][density_mode];
+                return ctx->device->pipeline_gated_delta_net_rbb[si];
             }
             return ctx->device->pipeline_gated_delta_net[si][kda];
         }
@@ -14278,6 +13785,303 @@ static void ggml_vk_turbo_wht(ggml_backend_vk_context * ctx, vk_context& subctx,
 
 static void ggml_vk_silu_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_SILU_BACK, { (uint32_t)ggml_nelements(src0), 0, 0.0f, 0.0f, 0.0f, 0.0f });
+}
+
+// XKV selected-row factor reconstruction: single dispatch per op, code streams
+// stay device-resident. Host validates shapes/fingerprints via
+// ggml_xkv_reconstruct_supports(); bounds poison NaN in-shader (no host mirror).
+struct vk_op_xkv_push {
+    uint32_t n_sel, n_groups, rank_k, rank_v, dim_k, dim_v, rotary_dim, rope_mode;
+    uint32_t a_k_type, b_k_type, a_v_type, b_v_type;
+    uint32_t a_k_stride, b_k_stride, a_v_stride, b_v_stride;
+    uint32_t prk, prv;
+    uint32_t n_rows_a, b_k_rows, b_v_rows;
+};
+static_assert(sizeof(vk_op_xkv_push) == 84, "xkv push must be 84B");
+static void ggml_vk_xkv_reconstruct(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * a_k, const ggml_tensor * b_k,
+        const ggml_tensor * a_v, const ggml_tensor * b_v,
+        const ggml_tensor * refs, const ggml_tensor * positions,
+        const ggml_tensor * group_meta, const ggml_tensor * layer_meta,
+        const ggml_tensor * rope_tables, ggml_tensor * dst) {
+    ggml_xkv_reconstruct_params p;
+    memcpy(&p, dst->op_params, sizeof(p));
+    char err[256] = {0};
+    GGML_ASSERT(ggml_xkv_reconstruct_supports(a_k, b_k, a_v, b_v, refs, positions, group_meta,
+                                              layer_meta, rope_tables, dst, &p, err, sizeof(err)));
+    vk_op_xkv_push pc;
+    pc.n_sel = p.n_sel; pc.n_groups = p.n_groups;
+    pc.rank_k = p.rank_k; pc.rank_v = p.rank_v;
+    pc.dim_k = p.dim_k; pc.dim_v = p.dim_v;
+    pc.rotary_dim = p.rotary_dim; pc.rope_mode = p.rope_mode;
+    pc.a_k_type = (uint32_t)a_k->type; pc.b_k_type = (uint32_t)b_k->type;
+    pc.a_v_type = (uint32_t)a_v->type; pc.b_v_type = (uint32_t)b_v->type;
+    pc.a_k_stride = (uint32_t)ggml_row_size(a_k->type, a_k->ne[0]);
+    pc.b_k_stride = (uint32_t)ggml_row_size(b_k->type, b_k->ne[0]);
+    pc.a_v_stride = (uint32_t)ggml_row_size(a_v->type, a_v->ne[0]);
+    pc.b_v_stride = (uint32_t)ggml_row_size(b_v->type, b_v->ne[0]);
+    pc.prk = (uint32_t)a_k->ne[0]; pc.prv = (uint32_t)a_v->ne[0];
+    pc.n_rows_a = (uint32_t)a_k->ne[1]; pc.b_k_rows = (uint32_t)b_k->ne[1]; pc.b_v_rows = (uint32_t)b_v->ne[1];
+    vk_pipeline pipeline = ctx->device->pipeline_xkv_reconstruct;
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    vk_subbuffer ba_k = ggml_vk_tensor_subbuffer(ctx, a_k, false);
+    vk_subbuffer bb_k = ggml_vk_tensor_subbuffer(ctx, b_k, false);
+    vk_subbuffer ba_v = ggml_vk_tensor_subbuffer(ctx, a_v, false);
+    vk_subbuffer bb_v = ggml_vk_tensor_subbuffer(ctx, b_v, false);
+    vk_subbuffer bref = ggml_vk_tensor_subbuffer(ctx, refs, false);
+    vk_subbuffer bpos = ggml_vk_tensor_subbuffer(ctx, positions, false);
+    vk_subbuffer bmeta = ggml_vk_tensor_subbuffer(ctx, group_meta, false);
+    vk_subbuffer blmeta = ggml_vk_tensor_subbuffer(ctx, layer_meta, false);
+    vk_subbuffer brope = ggml_vk_tensor_subbuffer(ctx, rope_tables, false);
+    vk_subbuffer bdst = ggml_vk_tensor_subbuffer(ctx, dst, false);
+    ggml_vk_sync_buffers(ctx, subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ba_k, bb_k, ba_v, bb_v, bref, bpos, bmeta, blmeta, brope, bdst }, pc, { p.n_sel, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+}
+
+// XKV factorize/canonicalize device kernels (owned by XkvVulkanFactorizer;
+// shared-switch integration owned here). Uses ggml-xkv-factor.h declarations.
+#include "ggml-vulkan-xkv-factor.inl"
+
+// XKV landmark build device kernel (owned by XkvNativeLandmarkBuild).
+#include "ggml-xkv-landmark-build.h"
+#include "ggml-vulkan-xkv-landmark-build.inl"
+
+// ---- XKV dual-source indexed attention dispatch (GGML_OP_XKV_ATTENTION) ----
+// One dispatch per KV head over (query, GQA) rows; single global online
+// softmax per row across hot + cold entries. All code streams stay
+// device-resident; no host decode/readback, no per-decode re-upload.
+struct vk_op_xkv_attn_push {
+    uint32_t dim_k, dim_v, gqa, n_groups;
+    uint32_t n_queries, hot_rows, n_cold, n_entries;
+    uint32_t kv_head, stream, flags, entry_stride;
+    float    scale, softcap;
+    uint32_t k_hot_type, v_hot_type, k_cold_type, v_cold_type;
+    uint32_t q_nb1, q_nb2;
+    uint32_t kh_nb1, kh_nb2, kh_nb3;
+    uint32_t vh_nb1, vh_nb2, vh_nb3;
+    uint32_t kc_nb1, vc_nb1;
+};
+static_assert(sizeof(vk_op_xkv_attn_push) == 112, "xkv attn push must be 112B");
+
+static void ggml_vk_xkv_attention(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * q, const ggml_tensor * k_hot, const ggml_tensor * v_hot,
+        const ggml_tensor * k_cold, const ggml_tensor * v_cold,
+        const ggml_tensor * entries, const ggml_tensor * offsets,
+        const ggml_tensor * sinks, const ggml_tensor * status, const ggml_tensor * carry, ggml_tensor * dst) {
+    ggml_xkv_attention_params p;
+    memcpy(&p, dst->op_params, sizeof(p));
+    char err[256] = {0};
+    GGML_ASSERT(ggml_xkv_attention_supports(q, k_hot, v_hot, k_cold, v_cold, entries,
+                                             offsets, sinks, status, carry, dst, &p, err, sizeof(err)));
+    vk_op_xkv_attn_push pc;
+    pc.dim_k = p.dim_k; pc.dim_v = p.dim_v; pc.gqa = p.gqa_ratio; pc.n_groups = p.n_groups;
+    pc.n_queries = p.n_queries; pc.hot_rows = p.hot_rows; pc.n_cold = p.n_cold;
+    pc.n_entries = p.n_entries;
+    pc.kv_head = p.kv_head; pc.stream = p.stream;
+    pc.flags = (p.flags & GGML_XKV_ATTN_FLAG_REJECT_DUPES ? 1u : 0u) |
+               (entries->ne[0] == 2 ? 2u : 0u) |
+               (sinks ? 4u : 0u) |
+               (p.flags & GGML_XKV_ATTN_FLAG_FIRST_TILE ? 8u : 0u) |
+               (carry ? 16u : 0u) |
+               (p.flags & GGML_XKV_ATTN_FLAG_FINAL_TILE ? 32u : 0u);
+    pc.entry_stride = (uint32_t)entries->ne[0];
+    pc.scale = p.scale; pc.softcap = p.logit_softcap;
+    pc.k_hot_type = (uint32_t)k_hot->type; pc.v_hot_type = (uint32_t)v_hot->type;
+    pc.k_cold_type = (uint32_t)k_cold->type; pc.v_cold_type = (uint32_t)v_cold->type;
+    pc.q_nb1 = (uint32_t)q->nb[1]; pc.q_nb2 = (uint32_t)q->nb[2];
+    pc.kh_nb1 = (uint32_t)k_hot->nb[1]; pc.kh_nb2 = (uint32_t)k_hot->nb[2]; pc.kh_nb3 = (uint32_t)k_hot->nb[3];
+    pc.vh_nb1 = (uint32_t)v_hot->nb[1]; pc.vh_nb2 = (uint32_t)v_hot->nb[2]; pc.vh_nb3 = (uint32_t)v_hot->nb[3];
+    pc.kc_nb1 = (uint32_t)k_cold->nb[1]; pc.vc_nb1 = (uint32_t)v_cold->nb[1];
+    vk_pipeline pipeline = ctx->device->pipeline_xkv_attention;
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    vk_subbuffer bq   = ggml_vk_tensor_subbuffer(ctx, q, false);
+    vk_subbuffer bst  = ggml_vk_tensor_subbuffer(ctx, status, false);
+    // Zero-row tensors are legal for the CPU oracle, but Vulkan storage
+    // descriptors require a nonzero range. Bind the sticky status word as a
+    // dummy; shader bounds guarantee these bindings are never read.
+    vk_subbuffer bkh  = p.hot_rows  ? ggml_vk_tensor_subbuffer(ctx, k_hot, false)  : bst;
+    vk_subbuffer bvh  = p.hot_rows  ? ggml_vk_tensor_subbuffer(ctx, v_hot, false)  : bst;
+    vk_subbuffer bkc  = p.n_cold    ? ggml_vk_tensor_subbuffer(ctx, k_cold, false) : bst;
+    vk_subbuffer bvc  = p.n_cold    ? ggml_vk_tensor_subbuffer(ctx, v_cold, false) : bst;
+    vk_subbuffer bent = p.n_entries ? ggml_vk_tensor_subbuffer(ctx, entries, false) : bst;
+    vk_subbuffer boff = ggml_vk_tensor_subbuffer(ctx, offsets, false);
+    // Optional sinks: bind the offsets buffer as a dummy when absent (the
+    // shader never reads binding 7 unless the has-sinks flag is set).
+    vk_subbuffer bsnk = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks, false) : boff;
+    vk_subbuffer bdst = ggml_vk_tensor_subbuffer(ctx, dst, false);
+    vk_subbuffer bcar = carry ? ggml_vk_tensor_subbuffer(ctx, carry, false) : bdst;
+    // The first tile initializes the sticky status word. Later tiles preserve
+    // an earlier failure; their explicit carry dependency orders the write.
+    if (p.flags & GGML_XKV_ATTN_FLAG_FIRST_TILE) {
+        ggml_vk_buffer_memset_async(subctx, bst.buffer, bst.offset, 0, sizeof(int32_t));
+    }
+    ggml_vk_sync_buffers(ctx, subctx);
+    const uint32_t rows = p.n_queries * p.gqa_ratio;
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { bq, bkh, bvh, bkc, bvc, bent, boff, bsnk, bst, bdst, bcar }, pc, { rows, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+}
+
+// ---- XKV landmark dispatch (GGML_OP_XKV_LANDMARK) ----
+// Score kernel (2D over [n_frags, n_queries]) -> device barrier -> select
+// pass 1 (one workgroup per query) -> barrier -> select pass 2 (1-workgroup
+// CSR/status fold). Code streams stay device-resident; caller-owned scratch
+// carries scores + disjoint select regions (see workspace_bytes layout).
+// No host decode, no readback, no per-decode re-upload.
+struct vk_op_xkv_landmark_push {
+    uint32_t n_queries, n_frags, head_dim, padded_dim;
+    uint32_t rotary_dim, rope_mode, landmark_type, top_k;
+    uint32_t max_top_k, refine_cap, frag_size;
+    float    scale;
+    uint32_t n_q_heads, n_rows_total, landmark_row_stride_bytes, status_flag;
+    uint32_t fstride, qstride, flags;
+};
+static_assert(sizeof(vk_op_xkv_landmark_push) == 76, "xkv landmark push must be 76B");
+
+static void ggml_vk_xkv_landmark(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * q, const ggml_tensor * landmarks,
+        const ggml_tensor * frag_positions, const ggml_tensor * frag_meta,
+        const ggml_tensor * query_meta, const ggml_tensor * rope_tables,
+        const ggml_tensor * scratch, const ggml_tensor * csr_ptrs,
+        const ggml_tensor * topk_scores, const ggml_tensor * status, ggml_tensor * dst) {
+    ggml_xkv_landmark_params p;
+    memcpy(&p, dst->op_params, sizeof(p));
+    char err[256] = {0};
+    GGML_ASSERT(ggml_xkv_landmark_supports(q, landmarks, frag_positions, frag_meta, query_meta,
+                                            rope_tables, scratch, csr_ptrs, topk_scores, status,
+                                            dst, &p, err, sizeof(err)));
+    vk_op_xkv_landmark_push pc;
+    pc.n_queries = p.n_queries; pc.n_frags = p.n_frags;
+    pc.head_dim = p.head_dim; pc.padded_dim = p.padded_dim;
+    pc.rotary_dim = p.rotary_dim; pc.rope_mode = p.rope_mode;
+    pc.landmark_type = p.landmark_type; pc.top_k = p.top_k;
+    pc.max_top_k = p.max_top_k; pc.refine_cap = p.refine_cap; pc.frag_size = p.frag_size;
+    pc.scale = p.scale; pc.n_q_heads = p.n_q_heads; pc.n_rows_total = p.n_rows_total;
+    // Strided full-group views: per-head score indexes rows by this byte stride.
+    // The binding base already carries the view byte offset. Validated in
+    // supports (>= encoded row bytes, codec-block aligned) and in-shader.
+    pc.landmark_row_stride_bytes = (uint32_t)landmarks->nb[1];
+    pc.status_flag = 0;
+    pc.fstride = (uint32_t)frag_meta->ne[0];
+    pc.qstride = (uint32_t)query_meta->ne[0];
+    pc.flags = p._reserved;
+    vk_subbuffer bq     = ggml_vk_tensor_subbuffer(ctx, q, false);
+    vk_subbuffer bland  = ggml_vk_tensor_subbuffer(ctx, landmarks, false);
+    vk_subbuffer bfpos  = ggml_vk_tensor_subbuffer(ctx, frag_positions, false);
+    vk_subbuffer bfmeta = ggml_vk_tensor_subbuffer(ctx, frag_meta, false);
+    vk_subbuffer bqmeta = ggml_vk_tensor_subbuffer(ctx, query_meta, false);
+    vk_subbuffer brope  = ggml_vk_tensor_subbuffer(ctx, rope_tables, false);
+    vk_subbuffer bscr   = ggml_vk_tensor_subbuffer(ctx, scratch, false);
+    vk_subbuffer bptr   = ggml_vk_tensor_subbuffer(ctx, csr_ptrs, false);
+    vk_subbuffer bsc    = ggml_vk_tensor_subbuffer(ctx, topk_scores, false);
+    vk_subbuffer bst    = ggml_vk_tensor_subbuffer(ctx, status, false);
+    vk_subbuffer bdst   = ggml_vk_tensor_subbuffer(ctx, dst, false);
+    // Zero the I32[4] status device-side (no host write into device memory).
+    ggml_vk_buffer_memset_async(subctx, bst.buffer, bst.offset, 0, 4 * sizeof(int32_t));
+    ggml_vk_sync_buffers(ctx, subctx);
+    vk_pipeline pscore = ctx->device->pipeline_xkv_landmark_score;
+    vk_pipeline psel   = ctx->device->pipeline_xkv_landmark_select;
+    GGML_ASSERT(pscore != nullptr && psel != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pscore, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, psel, 2);
+    pc.status_flag = 0;
+    ggml_vk_dispatch_pipeline(ctx, subctx, pscore,
+        { bq, bland, bfpos, bfmeta, bqmeta, brope, bscr, bst }, pc,
+        { p.n_queries * 64u, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, psel,
+        { bscr, bfmeta, bptr, bdst, bsc, bst, bscr }, pc, { p.n_queries * 64u, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+    pc.status_flag = 1;
+    ggml_vk_dispatch_pipeline(ctx, subctx, psel,
+        { bscr, bfmeta, bptr, bdst, bsc, bst, bscr }, pc, { 1, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+}
+
+struct vk_op_xkv_landmark_rows_push {
+    uint32_t version;
+    uint32_t n_queries;
+    uint32_t top_k;
+    uint32_t n_frags;
+    uint32_t refine_cap;
+    uint32_t fstride;
+    uint32_t flags;
+    uint32_t max_frag_rows;
+    uint32_t n_rows_total;
+    uint32_t n_parent_queries;
+    uint32_t has_query_map;
+    uint32_t arena_filter;
+    uint32_t global_row_base;
+    uint32_t arena_row_count;
+    uint32_t output_row_begin;
+    uint32_t status_flag; // word 15: 0 = emit, 1 = fold & compact (replaces _reserved)
+};
+static_assert(sizeof(vk_op_xkv_landmark_rows_push) == 64, "xkv rows push must be 64B");
+
+static void ggml_vk_xkv_landmark_rows(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * sel_idx, const ggml_tensor * frag_meta,
+        const ggml_tensor * frag_row_off, const ggml_tensor * frag_row_ids,
+        const ggml_tensor * frag_kv, const ggml_tensor * row_pos,
+        const ggml_tensor * row_ptrs, const ggml_tensor * row_out_pos, const ggml_tensor * row_entries,
+        const ggml_tensor * row_status, ggml_tensor * dst) {
+    ggml_xkv_landmark_rows_params p;
+    memcpy(&p, dst->op_params, sizeof(p));
+    char err[256] = {0};
+    GGML_ASSERT(ggml_xkv_landmark_rows_supports(sel_idx, frag_meta, frag_row_off, frag_row_ids,
+                                                frag_kv, row_pos, row_ptrs, dst, row_out_pos, row_entries,
+                                                row_status, &p, err, sizeof(err)));
+    vk_pipeline prows = ctx->device->pipeline_xkv_landmark_rows;
+    GGML_ASSERT(prows != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, prows, 2);
+    vk_subbuffer bsel    = ggml_vk_tensor_subbuffer(ctx, sel_idx, false);
+    vk_subbuffer bmeta   = ggml_vk_tensor_subbuffer(ctx, frag_meta, false);
+    vk_subbuffer boff    = ggml_vk_tensor_subbuffer(ctx, frag_row_off, false);
+    vk_subbuffer bids    = ggml_vk_tensor_subbuffer(ctx, frag_row_ids, false);
+    vk_subbuffer bkv     = ggml_vk_tensor_subbuffer(ctx, frag_kv, false);
+    vk_subbuffer bpos    = ggml_vk_tensor_subbuffer(ctx, row_pos, false);
+    vk_subbuffer bptrs   = ggml_vk_tensor_subbuffer(ctx, row_ptrs, false);
+    vk_subbuffer bdst    = ggml_vk_tensor_subbuffer(ctx, dst, false);
+    vk_subbuffer boutpos = ggml_vk_tensor_subbuffer(ctx, row_out_pos, false);
+    vk_subbuffer bentries= ggml_vk_tensor_subbuffer(ctx, row_entries, false);
+    vk_subbuffer bst     = ggml_vk_tensor_subbuffer(ctx, row_status, false);
+    ggml_vk_buffer_memset_async(subctx, bst.buffer, bst.offset, 0, 4 * sizeof(int32_t));
+    ggml_vk_sync_buffers(ctx, subctx);
+    vk_op_xkv_landmark_rows_push pc;
+    static_assert(sizeof(pc) == sizeof(p), "rows push must match rows params size");
+    memcpy(&pc, &p, sizeof(p));
+    pc.status_flag = 1;
+    ggml_vk_dispatch_pipeline(ctx, subctx, prows,
+        { bsel, bmeta, boff, bids, bkv, bpos, bptrs, bdst, boutpos, bentries, bst }, pc, { 1, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+}
+
+static void ggml_vk_xkv_landmark_merge(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * set_idx, const ggml_tensor * set_sc,
+        const ggml_tensor * set_base, const ggml_tensor * out_sc,
+        const ggml_tensor * status, ggml_tensor * dst) {
+    ggml_xkv_landmark_merge_params p;
+    memcpy(&p, dst->op_params, sizeof(p));
+    char err[256] = {0};
+    GGML_ASSERT(ggml_xkv_landmark_merge_supports(set_idx, set_sc, set_base, out_sc,
+                                                 status, dst, &p, err, sizeof(err)));
+    vk_pipeline pmerge = ctx->device->pipeline_xkv_landmark_merge;
+    GGML_ASSERT(pmerge != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pmerge, 1);
+    vk_subbuffer bidx    = ggml_vk_tensor_subbuffer(ctx, set_idx, false);
+    vk_subbuffer bsc     = ggml_vk_tensor_subbuffer(ctx, set_sc, false);
+    vk_subbuffer bbase   = set_base ? ggml_vk_tensor_subbuffer(ctx, set_base, false) : bidx;
+    vk_subbuffer bdst    = ggml_vk_tensor_subbuffer(ctx, dst, false);
+    vk_subbuffer boutsc  = ggml_vk_tensor_subbuffer(ctx, out_sc, false);
+    vk_subbuffer bst     = ggml_vk_tensor_subbuffer(ctx, status, false);
+    ggml_vk_buffer_memset_async(subctx, bst.buffer, bst.offset, 0, 4 * sizeof(int32_t));
+    ggml_vk_sync_buffers(ctx, subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pmerge,
+        { bidx, bsc, bbase, bdst, boutsc, bst }, p, { p.n_queries * 64u, 1, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
 }
 
 static void ggml_vk_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -16651,6 +16455,43 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_turbo_wht(ctx, compute_ctx, src0, node);
 
         break;
+    case GGML_OP_XKV_RECONSTRUCT:
+        ggml_vk_xkv_reconstruct(ctx, compute_ctx, src0, src1, src2, src3,
+            node->src[4], node->src[5], node->src[6], node->src[7], node->src[8], node);
+
+        break;
+    case GGML_OP_XKV_ATTENTION:
+        ggml_vk_xkv_attention(ctx, compute_ctx, src0, src1, src2, src3,
+            node->src[4], node->src[5], node->src[6], node->src[7], node->src[8], node->src[9], node);
+
+        break;
+    case GGML_OP_XKV_FACTORIZE:
+        ggml_vk_xkv_factorize(ctx, compute_ctx, src0, src1, src2, src3, node);
+
+        break;
+    case GGML_OP_XKV_CANONICALIZE:
+        ggml_vk_xkv_canonicalize(ctx, compute_ctx, src0, src1, src2, src3,
+            node->src[4], node->src[5], node);
+
+        break;
+    case GGML_OP_XKV_LANDMARK:
+        ggml_vk_xkv_landmark(ctx, compute_ctx, src0, src1, src2, src3,
+            node->src[4], node->src[5], node->src[6], node->src[7], node->src[8], node->src[9], node);
+
+        break;
+    case GGML_OP_XKV_LANDMARK_BUILD:
+        ggml_vk_xkv_landmark_build(ctx, compute_ctx, src0, src1, src2, src3,
+            node->src[4], node->src[5], node->src[6], node->src[7], node->src[8], node->src[9], node);
+
+        break;
+    case GGML_OP_XKV_LANDMARK_ROWS:
+        ggml_vk_xkv_landmark_rows(ctx, compute_ctx, src0, src1, src2, src3,
+            node->src[4], node->src[5], node->src[6], node->src[7], node->src[8], node->src[9], node);
+        break;
+    case GGML_OP_XKV_LANDMARK_MERGE:
+        ggml_vk_xkv_landmark_merge(ctx, compute_ctx, src0, src1, src2, src3,
+            node->src[4], node);
+        break;
     case GGML_OP_SILU_BACK:
         ggml_vk_silu_back(ctx, compute_ctx, src0, src1, node);
 
@@ -16853,48 +16694,6 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
-    case GGML_OP_FLASH_PREFILL_POOL: {
-        uint32_t fp_beg = std::numeric_limits<uint32_t>::max(), fp_end = std::numeric_limits<uint32_t>::max();
-        if (ctx->fp_timing_active) {
-            fp_beg = ggml_vk_fp_stamp(ctx, compute_ctx);
-        }
-        ggml_vk_flash_prefill_pool(ctx, compute_ctx, src0, src1, src2, node);
-        if (ctx->fp_timing_active) {
-            fp_end = ggml_vk_fp_stamp(ctx, compute_ctx);
-            ctx->fp_stamps.push_back({ fp_beg, fp_end, 0 });
-        }
-
-        break;
-    }
-
-    case GGML_OP_FLASH_PREFILL_SELECT: {
-        uint32_t fp_beg = std::numeric_limits<uint32_t>::max(), fp_end = std::numeric_limits<uint32_t>::max();
-        if (ctx->fp_timing_active) {
-            fp_beg = ggml_vk_fp_stamp(ctx, compute_ctx);
-        }
-        ggml_vk_flash_prefill_select(ctx, compute_ctx, src0, src1, src2, node);
-        if (ctx->fp_timing_active) {
-            fp_end = ggml_vk_fp_stamp(ctx, compute_ctx);
-            ctx->fp_stamps.push_back({ fp_beg, fp_end, 1 });
-        }
-
-        break;
-    }
-
-    case GGML_OP_FLASH_PREFILL_ATTN: {
-        uint32_t fp_beg = std::numeric_limits<uint32_t>::max(), fp_end = std::numeric_limits<uint32_t>::max();
-        if (ctx->fp_timing_active) {
-            fp_beg = ggml_vk_fp_stamp(ctx, compute_ctx);
-        }
-        ggml_vk_flash_prefill_attn(ctx, compute_ctx, src0, src1, src2, node->src[3], node->src[4], node->src[5], node->src[6], node);
-        if (ctx->fp_timing_active) {
-            fp_end = ggml_vk_fp_stamp(ctx, compute_ctx);
-            ctx->fp_stamps.push_back({ fp_beg, fp_end, 2 });
-        }
-
-        break;
-    }
-
     case GGML_OP_RWKV_WKV6:
         ggml_vk_rwkv_wkv6(ctx, compute_ctx, node);
 
@@ -17079,12 +16878,6 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->prealloc_size_x = 0;
     ctx->prealloc_size_y = 0;
     ctx->prealloc_size_split_k = 0;
-
-    if (ctx->fp_query_pool) {
-        ctx->device->device.destroyQueryPool(ctx->fp_query_pool);
-        ctx->fp_query_pool = nullptr;
-    }
-    ctx->fp_num_queries = 0;
 
     for (auto& event : ctx->gc.events) {
         ctx->device->device.destroyEvent(event);
@@ -17312,6 +17105,7 @@ static bool ggml_backend_vk_buffer_memmove_tensor(
     if (dry_run) {
         return true;
     }
+
     vk_context subctx = ggml_vk_create_temporary_context(
         byte_dispatches ? device->compute_queue->cmd_pool : device->transfer_queue->cmd_pool);
     ggml_vk_ctx_begin(device, subctx);
@@ -17347,12 +17141,12 @@ static bool ggml_backend_vk_buffer_memmove_tensor(
                 copy_bytes(data_buf, src + off, device->memmove_scratch, 0, chunk);
                 copy_bytes(device->memmove_scratch, 0, data_buf, dst + off, chunk);
             } else {
-                ggml_vk_buffer_copy_async(
-                    subctx, device->memmove_scratch, 0, data_buf, src + off, chunk);
-                ggml_vk_sync_buffers(nullptr, subctx);
-                ggml_vk_buffer_copy_async(
-                    subctx, data_buf, dst + off, device->memmove_scratch, 0, chunk);
-                ggml_vk_sync_buffers(nullptr, subctx);
+            ggml_vk_buffer_copy_async(
+                subctx, device->memmove_scratch, 0, data_buf, src + off, chunk);
+            ggml_vk_sync_buffers(nullptr, subctx);
+            ggml_vk_buffer_copy_async(
+                subctx, data_buf, dst + off, device->memmove_scratch, 0, chunk);
+            ggml_vk_sync_buffers(nullptr, subctx);
             }
 
             remaining -= chunk;
@@ -18334,64 +18128,6 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
-// FlashPrefill V2 completion-boundary status: reject the graph when any
-// SELECT/ATTN plan header carries a nonzero error word. Runs only when the
-// graph holds flashprefill ops (zero cost otherwise: no extra sync, no
-// reads). Single synchronize covers all devices, then tiny 4 B reads of the
-// plan error words (existing completion boundary, never per-layer sync).
-// Deduplicates shared plans. Errors propagate before any client output is
-// consumed; counters ride the same header for the metrics hook.
-static ggml_status ggml_vk_flash_prefill_plan_status(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph) {
-    std::vector<const ggml_tensor *> plans;
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        const ggml_tensor * t = cgraph->nodes[i];
-        const ggml_tensor * plan = nullptr;
-        if (t->op == GGML_OP_FLASH_PREFILL_SELECT) {
-            plan = t;
-        } else if (t->op == GGML_OP_FLASH_PREFILL_ATTN) {
-            plan = t->src[4];
-        }
-        if (plan == nullptr || plan->type != GGML_TYPE_I32) {
-            continue;
-        }
-        bool seen = false;
-        for (const ggml_tensor * p : plans) {
-            if (p == plan) {
-                seen = true;
-                break;
-            }
-        }
-        if (!seen) {
-            plans.push_back(plan);
-        }
-    }
-    if (plans.empty()) {
-        return GGML_STATUS_SUCCESS;
-    }
-    ggml_vk_synchronize(ctx);
-    for (const ggml_tensor * plan : plans) {
-        if (plan->buffer == nullptr || (size_t) ggml_nbytes(plan) < ((size_t) FP_PH_ERROR + 1u) * sizeof(int32_t)) {
-            continue;
-        }
-        auto * buf_ctx = (ggml_backend_vk_buffer_context *) plan->buffer->context;
-        if (buf_ctx == nullptr || buf_ctx->dev_buffer == nullptr) {
-            continue;
-        }
-        vk_buffer dev_buf = buf_ctx->dev_buffer;
-        const size_t off = vk_tensor_offset(plan) + plan->view_offs + (size_t) FP_PH_ERROR * sizeof(int32_t);
-        if (off + sizeof(int32_t) > dev_buf->size) {
-            continue;
-        }
-        int32_t err = FP_OK;
-        ggml_vk_buffer_read(dev_buf, off, &err, sizeof(err));
-        if (err != FP_OK) {
-            std::cerr << "ggml_vulkan: flashprefill plan '" << plan->name << "' error " << err << "; rejecting graph output" << std::endl;
-            return GGML_STATUS_FAILED;
-        }
-    }
-    return GGML_STATUS_SUCCESS;
-}
-
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -18423,47 +18159,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     int submit_node_idx = 0; // index to first node in a batch
 
     ggml_vk_submit_transfer_ctx(ctx);
-
-    // FlashPrefill ON-only timing prescan: cheap op-enum scan, no sync. When
-    // the graph holds FP ops and the device offers real timestamps, activate
-    // the dedicated FP query pool (independent of GGML_VK_PERF_LOGGER).
-    // timestampValidBits==0 omits fields with a one-time diagnostic.
-    ctx->fp_timing_active = false;
-    ctx->fp_stamps.clear();
-    {
-        bool has_fp = false;
-        for (int i = 0; i < cgraph->n_nodes; ++i) {
-            const ggml_op op = cgraph->nodes[i]->op;
-            if (op == GGML_OP_FLASH_PREFILL_POOL || op == GGML_OP_FLASH_PREFILL_SELECT || op == GGML_OP_FLASH_PREFILL_ATTN) {
-                has_fp = true;
-                break;
-            }
-        }
-        if (has_fp) {
-            if (ctx->device->compute_timestamp_valid_bits == 0) {
-                static bool fp_ts_warned = false;
-                if (!fp_ts_warned) {
-                    fp_ts_warned = true;
-                    std::cerr << "ggml_vulkan: device timestampValidBits==0, flashprefill GPU timings omitted" << std::endl;
-                }
-            } else {
-                ctx->fp_timing_active = true;
-                const uint32_t need = 2u * (uint32_t) cgraph->n_nodes + 4u;
-                if (ctx->fp_num_queries < need) {
-                    if (ctx->fp_query_pool) {
-                        ctx->device->device.destroyQueryPool(ctx->fp_query_pool);
-                    }
-                    vk::QueryPoolCreateInfo fp_qci;
-                    fp_qci.queryType = vk::QueryType::eTimestamp;
-                    fp_qci.queryCount = need;
-                    ctx->fp_query_pool = ctx->device->device.createQueryPool(fp_qci);
-                    ctx->fp_num_queries = need;
-                }
-                ctx->device->device.resetQueryPool(ctx->fp_query_pool, 0, need);
-                ctx->fp_query_idx = 0;
-            }
-        }
-    }
 
     vk_context compute_ctx;
     if (vk_perf_logger_enabled) {
@@ -18850,40 +18545,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     if (!ctx->device->support_async) {
         ggml_vk_synchronize(ctx);
-    }
-
-    // FlashPrefill timing resolution: single post-fence read of the dedicated
-    // pool (the completion boundary; never per-layer waits), accumulated into
-    // the process-wide monotonic counters. Runs only when FP ops were built.
-    if (ctx->fp_timing_active) {
-        if (ctx->submit_pending) {
-            ggml_vk_synchronize(ctx);
-        }
-        const uint32_t nq = ctx->fp_query_idx;
-        if (nq > 0 && !ctx->fp_stamps.empty()) {
-            std::vector<uint64_t> fp_ts(nq);
-            VK_CHECK(ctx->device->device.getQueryPoolResults(ctx->fp_query_pool, 0, nq, nq * sizeof(uint64_t), fp_ts.data(), sizeof(uint64_t), vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait), "fp timestamp results");
-            const uint32_t vbits = ctx->device->compute_timestamp_valid_bits;
-            const uint64_t mask = (vbits >= 64) ? ~0ULL : ((1ULL << vbits) - 1ULL);
-            const double period = (double) ctx->device->properties.limits.timestampPeriod;
-            for (const auto & st : ctx->fp_stamps) {
-                if (st.begin >= nq || st.end >= nq || st.cls > 2) {
-                    continue;
-                }
-                // Valid-bits mask keeps the delta exact across timestamp
-                // counter wrap; never dropped.
-                const uint64_t d = (fp_ts[st.end] - fp_ts[st.begin]) & mask;
-                ctx->fp_ns[st.cls] += (uint64_t) (d * period);
-            }
-        }
-        ctx->fp_timing_active = false;
-    }
-
-    {
-        const ggml_status plan_st = ggml_vk_flash_prefill_plan_status(ctx, cgraph);
-        if (plan_st != GGML_STATUS_SUCCESS) {
-            return plan_st;
-        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -19414,340 +19075,23 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const 
     return ggml_backend_vk_init(ctx->device);
 }
 
-// FlashPrefill V2 capability predicates. Host validates only actual
-// type/ne/nb plus op_params capacities; metadata/plan contents stay opaque
-// (row/use offsets owned by ggml-flashprefill.h, parsed on device). K/V
-// accept the FA envelope incl. asym Turbo2/3/4 + F16/F32 via
-// ggml_vk_fa_kv_type_ok; BF16 must match. Q/pool/plan/output dtypes and the
-// frozen shapes (Q F32 [Dk,n_groups,Hq,1], K/V [D,nkv,Hkv,1], pool F32
-// [Dk+Dv,Hkv,Fcap], ATTN out F32 [Dv,Hq,n_out,1]) are enforced. Strides must
-// be 32-bit representable, buffers aligned, sizes in push range. Returning
-// false keeps ordinary CPU fallback as graph-policy decision; unsupported is
-// reported, never silently run as dense or as the old RERoT path.
-// Upper bound on metadata rows/tiles from host-visible shapes only (no count
-// sync): total = 32+8f+8r+8u+c words, so 8r <= meta_words-32-8*f_cap.
-static uint64_t ggml_vk_flash_prefill_row_bound(uint64_t meta_words, uint64_t f_cap) {
-    if (meta_words < 32u + 8u * f_cap) {
-        return 0;
-    }
-    return (meta_words - 32u - 8u * f_cap) / 8u;
-}
-
-static bool ggml_vk_flash_prefill_grid_ok(const vk_device & device, uint64_t nx, uint64_t ny) {
-    const uint64_t lx = device->properties.limits.maxComputeWorkGroupCount[0];
-    const uint64_t ly = device->properties.limits.maxComputeWorkGroupCount[1];
-    return nx <= lx && ny <= ly && nx > 0 && ny > 0;
-}
-
-static bool ggml_vk_flash_prefill_dims_ok(int32_t dk, int32_t dv) {
-    if (dk < 1 || dv < 1) {
-        return false;
-    }
-    if (dk > 65536 || dv > 65536) {
-        return false;
-    }
-    // v1 shader tiling covers 8-wide vec loads with legal padding.
-    if ((dk % 8) != 0 || (dv % 8) != 0) {
-        return false;
-    }
-    return true;
-}
-
-static bool ggml_vk_flash_prefill_common_ok(const vk_device & device, const ggml_tensor * t, ggml_type want, bool need_vec) {
-    if (t == nullptr || t->type != want) {
-        return false;
-    }
-    if (t->nb[0] != ggml_type_size(want)) {
-        return false;
-    }
-    if (!ggml_vk_flash_prefill_stride_ok(t->nb[1]) || !ggml_vk_flash_prefill_stride_ok(t->nb[2]) || !ggml_vk_flash_prefill_stride_ok(t->nb[3])) {
-        return false;
-    }
-    if (!ggml_vk_flash_prefill_aligned(device, t)) {
-        return false;
-    }
-    if (need_vec && !ggml_is_vector(t)) {
-        // Metadata/plan are I32 1-D; keep 1-D invariant without reading words.
-        return false;
-    }
-    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-        if (t->ne[i] < 0) {
-            return false;
-        }
-        if ((uint64_t) t->ne[i] > (uint64_t) std::numeric_limits<uint32_t>::max()) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool ggml_vk_flash_prefill_pool_ok(const vk_device & device, const ggml_tensor * op) {
-    const ggml_tensor * k    = op->src[0];
-    const ggml_tensor * v    = op->src[1];
-    const ggml_tensor * meta = op->src[2];
-    if (k == nullptr || v == nullptr || meta == nullptr) {
-        return false;
-    }
-    // src[3]=k_dep, src[4]=v_dep are real dependency edges (no K/V alias
-    // assumption); compute uses only k/v/meta, deps only order the graph.
-    for (int i = 5; i < GGML_MAX_SRC; ++i) {
-        if (op->src[i] != nullptr) {
-            return false;
-        }
-    }
-    int32_t fp_op = 0;
-    float alpha = 0.0f;
-    float scale = 1.0f;
-    float softcap = 0.0f;
-    int32_t exact_all = 0;
-    int32_t dk = 0;
-    int32_t dv = 0;
-    int32_t version = 1;
-    int32_t mean_corr = 0;
-    if (!ggml_vk_flash_prefill_unpack_params(op, fp_op, alpha, scale, softcap, exact_all, dk, dv, version, mean_corr)) {
-        return false;
-    }
-    if (fp_op != 0) {
-        return false;
-    }
-    if (!ggml_vk_flash_prefill_dims_ok(dk, dv)) {
-        return false;
-    }
-    if (!ggml_vk_fa_kv_type_ok(k->type) || !ggml_vk_fa_kv_type_ok(v->type)) {
-        return false;
-    }
-    if ((k->type == GGML_TYPE_BF16) != (v->type == GGML_TYPE_BF16)) {
-        return false;
-    }
-    if (k->ne[0] != dk || v->ne[0] != dv) {
-        return false;
-    }
-    if (k->ne[2] != v->ne[2] || k->ne[2] < 1) {
-        return false;
-    }
-    if (k->ne[1] != v->ne[1] || k->ne[1] < 1) {
-        return false;
-    }
-    if (k->ne[3] != 1 || v->ne[3] != 1) {
-        return false;
-    }
-    if (k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type)) {
-        return false;
-    }
-    if (!ggml_vk_flash_prefill_common_ok(device, meta, GGML_TYPE_I32, true)) {
-        return false;
-    }
-    if (!ggml_vk_flash_prefill_common_ok(device, op, GGML_TYPE_F32, false)) {
-        return false;
-    }
-    if (op->ne[0] != (int64_t) dk + (int64_t) dv || op->ne[1] != k->ne[2]) {
-        return false;
-    }
-    if (op->ne[2] < 1 || op->ne[3] != 1) {
-        return false;
-    }
-    if (meta->ne[0] < FP_META_HDR_WORDS) {
-        return false;
-    }
-    // Dispatch grid {f_cap, hkv} must fit device limits.
-    if (!ggml_vk_flash_prefill_grid_ok(device, (uint64_t) op->ne[2], (uint64_t) k->ne[2])) {
-        return false;
-    }
-    if (!ggml_vk_flash_prefill_stride_ok(k->nb[1]) || !ggml_vk_flash_prefill_stride_ok(k->nb[2]) ||
-        !ggml_vk_flash_prefill_stride_ok(v->nb[1]) || !ggml_vk_flash_prefill_stride_ok(v->nb[2])) {
-        return false;
-    }
-    if (!ggml_vk_flash_prefill_aligned(device, k) || !ggml_vk_flash_prefill_aligned(device, v) || !ggml_vk_flash_prefill_aligned(device, op)) {
-        return false;
-    }
-    return true;
-}
-
-static bool ggml_vk_flash_prefill_select_ok(const vk_device & device, const ggml_tensor * op) {
-    const ggml_tensor * q    = op->src[0];
-    const ggml_tensor * pool = op->src[1];
-    const ggml_tensor * meta = op->src[2];
-    if (q == nullptr || pool == nullptr || meta == nullptr) {
-        return false;
-    }
-    for (int i = 3; i < GGML_MAX_SRC; ++i) {
-        if (op->src[i] != nullptr) {
-            return false;
-        }
-    }
-    int32_t fp_op = 0;
-    float alpha = 0.0f;
-    float scale = 1.0f;
-    float softcap = 0.0f;
-    int32_t exact_all = 0;
-    int32_t dk = 0;
-    int32_t dv = 0;
-    int32_t version = 1;
-    int32_t mean_corr = 0;
-    if (!ggml_vk_flash_prefill_unpack_params(op, fp_op, alpha, scale, softcap, exact_all, dk, dv, version, mean_corr)) {
-        return false;
-    }
-    if (fp_op != 1) {
-        return false;
-    }
-    // SELECT uses scalar F32 loads; it does not inherit K/V vector-width
-    // restrictions from POOL/ATTN (e.g. the Dk=8, Dv=4 selector fixture).
-    if (dk < 1 || dv < 1 || dk > 65536 || dv > 65536) {
-        return false;
-    }
-    if (!ggml_vk_flash_prefill_common_ok(device, q, GGML_TYPE_F32, false)) {
-        return false;
-    }
-    if (!ggml_vk_flash_prefill_common_ok(device, pool, GGML_TYPE_F32, false)) {
-        return false;
-    }
-    if (!ggml_vk_flash_prefill_common_ok(device, meta, GGML_TYPE_I32, true)) {
-        return false;
-    }
-    if (!ggml_vk_flash_prefill_common_ok(device, op, GGML_TYPE_I32, true)) {
-        return false;
-    }
-    // Frozen Q shape F32 [Dk,n_groups,Hq,1]: ne[0] is Dk, ne[3] is 1.
-    if (q->ne[0] != dk || q->ne[3] != 1) {
-        return false;
-    }
-    if (q->ne[1] < 1 || q->ne[2] < 1) {
-        return false;
-    }
-    if (pool->ne[0] != (int64_t) dk + (int64_t) dv || pool->ne[1] < 1 || pool->ne[2] < 1 || pool->ne[3] != 1) {
-        return false;
-    }
-    if (meta->ne[0] < FP_META_HDR_WORDS || op->ne[0] < FP_PLAN_HDR_WORDS) {
-        return false;
-    }
-    // Scheduling and validation bounds are independent: device actuals are
-    // still validated against the complete row bound, while grid-stride
-    // traversal visits every actual tile with at most Q-group-count CTAs.
-    {
-        const uint64_t rb = ggml_vk_flash_prefill_row_bound((uint64_t) meta->ne[0], (uint64_t) pool->ne[2]);
-        const uint64_t grid_x = std::min({ rb + 1u, (uint64_t) q->ne[1],
-            (uint64_t) device->properties.limits.maxComputeWorkGroupCount[0] });
-        if (rb == 0 || rb + 1u > 0xffffffffULL ||
-            !ggml_vk_flash_prefill_grid_ok(device, grid_x, (uint64_t) pool->ne[1])) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool ggml_vk_flash_prefill_attn_ok(const vk_device & device, const ggml_tensor * op) {
-    const ggml_tensor * q     = op->src[0];
-    const ggml_tensor * k     = op->src[1];
-    const ggml_tensor * v     = op->src[2];
-    const ggml_tensor * pool  = op->src[3];
-    const ggml_tensor * plan  = op->src[4];
-    const ggml_tensor * meta  = op->src[5];
-    const ggml_tensor * sinks = op->src[6];
-    if (q == nullptr || k == nullptr || v == nullptr || pool == nullptr || plan == nullptr || meta == nullptr) {
-        return false;
-    }
-    for (int i = 7; i < GGML_MAX_SRC; ++i) {
-        if (op->src[i] != nullptr) {
-            return false;
-        }
-    }
-    int32_t fp_op = 0;
-    float alpha = 0.0f;
-    float scale = 1.0f;
-    float softcap = 0.0f;
-    int32_t exact_all = 0;
-    int32_t dk = 0;
-    int32_t dv = 0;
-    int32_t version = 1;
-    int32_t mean_corr = 0;
-    if (!ggml_vk_flash_prefill_unpack_params(op, fp_op, alpha, scale, softcap, exact_all, dk, dv, version, mean_corr)) {
-        return false;
-    }
-    if (fp_op != 2) {
-        return false;
-    }
-    if (!ggml_vk_flash_prefill_dims_ok(dk, dv)) {
-        return false;
-    }
-    if (!ggml_vk_fa_kv_type_ok(k->type) || !ggml_vk_fa_kv_type_ok(v->type)) {
-        return false;
-    }
-    if ((k->type == GGML_TYPE_BF16) != (v->type == GGML_TYPE_BF16)) {
-        return false;
-    }
-    if (!ggml_vk_flash_prefill_common_ok(device, q, GGML_TYPE_F32, false)) {
-        return false;
-    }
-    if (!ggml_vk_flash_prefill_common_ok(device, pool, GGML_TYPE_F32, false)) {
-        return false;
-    }
-    if (!ggml_vk_flash_prefill_common_ok(device, plan, GGML_TYPE_I32, true)) {
-        return false;
-    }
-    if (!ggml_vk_flash_prefill_common_ok(device, meta, GGML_TYPE_I32, true)) {
-        return false;
-    }
-    if (!ggml_vk_flash_prefill_common_ok(device, op, GGML_TYPE_F32, false)) {
-        return false;
-    }
-    if (q->ne[0] != dk || q->ne[3] != 1) {
-        return false;
-    }
-    if (k->ne[0] != dk || v->ne[0] != dv) {
-        return false;
-    }
-    if (k->ne[2] != v->ne[2] || k->ne[2] < 1) {
-        return false;
-    }
-    if (k->ne[1] != v->ne[1] || k->ne[1] < 1) {
-        return false;
-    }
-    if (k->ne[3] != 1 || v->ne[3] != 1) {
-        return false;
-    }
-    if (k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type)) {
-        return false;
-    }
-    if (pool->ne[0] != (int64_t) dk + (int64_t) dv) {
-        return false;
-    }
-    // Output F32 [Dv,Hq,n_output_queries,1].
-    if (op->ne[0] != dv || op->ne[1] < 1 || op->ne[2] < 1 || op->ne[3] != 1) {
-        return false;
-    }
-    if (q->ne[2] != op->ne[1]) {
-        // Q Hq must match output Hq; GQA groups ride ne[1].
-        return false;
-    }
-    if (meta->ne[0] < FP_META_HDR_WORDS || plan->ne[0] < FP_PLAN_HDR_WORDS) {
-        return false;
-    }
-    // Exact structural row cap: rows unique on (source_query,q_head) with
-    // source_query in [0,n_output) and q_head in [0,Hq), so n_rows <=
-    // n_output*Hq = dst ne[2]*ne[1] (no use/cell slack). Dispatch cap-grid
-    // {rows_cap} (attn + merge) must fit device limits; the shader errors
-    // (never truncates) when device n_row exceeds push r_cap.
-    {
-        const uint64_t rows_cap = (uint64_t) op->ne[2] * (uint64_t) op->ne[1];
-        if (rows_cap == 0 || rows_cap > 0xffffffffULL ||
-            !ggml_vk_flash_prefill_grid_ok(device, rows_cap, 1)) {
-            return false;
-        }
-    }
-    if (sinks != nullptr) {
-        if (sinks->type != GGML_TYPE_F32 || !ggml_is_vector(sinks)) {
-            return false;
-        }
-        if (sinks->ne[0] != op->ne[1]) {
-            return false;
-        }
-        if (!ggml_vk_flash_prefill_aligned(device, sinks)) {
-            return false;
-        }
-    }
-    if (!ggml_vk_flash_prefill_aligned(device, q) || !ggml_vk_flash_prefill_aligned(device, k) ||
-        !ggml_vk_flash_prefill_aligned(device, v) || !ggml_vk_flash_prefill_aligned(device, op)) {
-        return false;
+// XKV device-affinity gate (parent directive): factor/attention/landmark nodes
+// carry backend-resident code-stream handles with an owning backend. When
+// placement is already known (allocated buffers), every tensor of the node
+// must live on THIS Vulkan device. A group silently spanning devices is
+// rejected here so the Runtime splits (or fails) multi-device graphs
+// upstream — never implicit D2D copies, readback, or unaccounted B
+// duplication inside the kernel. Unknown placement (null buffers) passes
+// through; the scheduler then assigns single-device or explicit copies.
+static bool ggml_vk_xkv_single_device(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    for (int i = -1; i < GGML_MAX_SRC; ++i) {
+        const ggml_tensor * t = (i < 0) ? op : op->src[i];
+        if (!t) continue;
+        const ggml_tensor * root = t;
+        while (root->view_src) root = root->view_src;
+        if (!root->buffer) continue;
+        if (ggml_backend_buffer_is_host(root->buffer)) return false;
+        if (ggml_backend_buft_get_device(root->buffer->buft) != dev) return false;
     }
     return true;
 }
@@ -19996,12 +19340,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return true;
             }
-        case GGML_OP_FLASH_PREFILL_POOL:
-            return ggml_vk_flash_prefill_pool_ok(device, op);
-        case GGML_OP_FLASH_PREFILL_SELECT:
-            return ggml_vk_flash_prefill_select_ok(device, op);
-        case GGML_OP_FLASH_PREFILL_ATTN:
-            return ggml_vk_flash_prefill_attn_ok(device, op);
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
@@ -20097,6 +19435,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                         break;
                     }
                 }
+                // Turbo->F32 dequantize is pipeline-backed (cpy_quant_f32); the
+                // reverse F32->Turbo direction has no CPY pipeline and stays rejected.
                 if (src1_type == GGML_TYPE_F32) {
                     switch (src0_type) {
                     case GGML_TYPE_F16:
@@ -20109,6 +19449,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_IQ4_NL:
+                    case GGML_TYPE_TURBO2_0:
+                    case GGML_TYPE_TURBO3_0:
+                    case GGML_TYPE_TURBO4_0:
                         return true;
                     default:
                         break;
@@ -20306,6 +19649,164 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_TURBO_WHT:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 128 == 0;
+        case GGML_OP_XKV_RECONSTRUCT:
+            {
+                // 9 srcs: A_K,B_K,A_V,B_V,refs,positions,group_meta,layer_meta,rope_tables. Mixed
+                // Turbo/canonical explicitly unsupported on Vulkan v1 (CPU
+                // oracle covers mixed via canonical decode).
+                if (!op->src[0] || !op->src[1] || !op->src[2] || !op->src[3] ||
+                    !op->src[4] || !op->src[5] || !op->src[6] || !op->src[7] || !op->src[8]) {
+                    return false;
+                }
+                ggml_xkv_reconstruct_params p;
+                memcpy(&p, op->op_params, sizeof(p));
+                char err[256] = {0};
+                if (!ggml_xkv_reconstruct_supports(op->src[0], op->src[1], op->src[2],
+                    op->src[3], op->src[4], op->src[5], op->src[6], op->src[7], op->src[8], op, &p,
+                    err, sizeof(err))) {
+                    return false;
+                }
+                // Vulkan v1 kernel subset: matched Turbo pairs and canonical
+                // pairs only; mixed Turbo/canonical explicitly unsupported
+                // (CPU oracle covers mixed via canonical decode).
+                auto is_turbo = [](enum ggml_type t) {
+                    return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+                };
+                bool kak = is_turbo(op->src[0]->type), kbk = is_turbo(op->src[1]->type);
+                bool kav = is_turbo(op->src[2]->type), kbv = is_turbo(op->src[3]->type);
+                if ((kak != kbk) || (kav != kbv)) {
+                    return false;
+                }
+                return true;
+            }
+        case GGML_OP_XKV_ATTENTION:
+            {
+                // q,k_hot,v_hot,k_cold,v_cold,entries,offsets,sinks?,status,carry?.
+                if (!op->src[0] || !op->src[1] || !op->src[2] || !op->src[3] ||
+                    !op->src[4] || !op->src[5] || !op->src[6] || !op->src[8]) {
+                    return false;
+                }
+                if (!ggml_vk_xkv_single_device(dev, op)) return false;
+                ggml_xkv_attention_params p;
+                memcpy(&p, op->op_params, sizeof(p));
+                char err[256] = {0};
+                if (!ggml_xkv_attention_supports(op->src[0], op->src[1], op->src[2],
+                    op->src[3], op->src[4], op->src[5], op->src[6], op->src[7], op->src[8], op->src[9], op, &p,
+                    err, sizeof(err))) {
+                    return false;
+                }
+                // Index/output tensors must be densely packed for flat shader indexing.
+                if (!ggml_is_contiguous(op->src[5]) || !ggml_is_contiguous(op->src[6]) ||
+                    !ggml_is_contiguous(op->src[8]) || !ggml_is_contiguous(op)) {
+                    return false;
+                }
+                if (op->src[7] && !ggml_is_contiguous(op->src[7])) return false;
+                if (op->src[9] && !ggml_is_contiguous(op->src[9])) return false;
+                if ((p.flags & (GGML_XKV_ATTN_FLAG_FIRST_TILE | GGML_XKV_ATTN_FLAG_FINAL_TILE)) ==
+                        (GGML_XKV_ATTN_FLAG_FIRST_TILE | GGML_XKV_ATTN_FLAG_FINAL_TILE) &&
+                    p.n_cold > GGML_XKV_ATTN_DENSE_COLD_MAX) {
+                    return false;
+                }
+                return true;
+            }
+        case GGML_OP_XKV_FACTORIZE:
+            {
+                if (!op->src[0] || !op->src[1] || !op->src[2] || !op->src[3]) return false;
+                if (!ggml_vk_xkv_single_device(dev, op)) return false;
+                ggml_xkv_factorize_params p;
+                memcpy(&p, op->op_params, sizeof(p));
+                char err[256] = {0};
+                return ggml_xkv_factorize_supports(op->src[0], op->src[1], op->src[2],
+                    op->src[3], op, &p, err, sizeof(err));
+            }
+        case GGML_OP_XKV_CANONICALIZE:
+            {
+                if (!op->src[0] || !op->src[1] || !op->src[2] || !op->src[3] ||
+                    !op->src[4] || !op->src[5]) return false;
+                if (!ggml_vk_xkv_single_device(dev, op)) return false;
+                ggml_xkv_canonicalize_params p;
+                memcpy(&p, op->op_params, sizeof(p));
+                char err[256] = {0};
+                return ggml_xkv_canonicalize_supports(op->src[0], op->src[1], op->src[2],
+                    op->src[3], op->src[4], op->src[5], op, &p, err, sizeof(err));
+            }
+        case GGML_OP_XKV_LANDMARK:
+            {
+                // 10 srcs: q,landmarks,frag_pos,frag_meta,query_meta,rope,scratch,
+                // csr_ptrs,topk_scores,status.
+                for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                    if (!op->src[i]) return false;
+                }
+                if (!ggml_vk_xkv_single_device(dev, op)) return false;
+                ggml_xkv_landmark_params p;
+                memcpy(&p, op->op_params, sizeof(p));
+                char err[256] = {0};
+                if (!ggml_xkv_landmark_supports(op->src[0], op->src[1], op->src[2],
+                    op->src[3], op->src[4], op->src[5], op->src[6], op->src[7],
+                    op->src[8], op->src[9], op, &p, err, sizeof(err))) {
+                    return false;
+                }
+                // Device kernel subset: Q8_0/Turbo4 only (host gates first),
+                // Turbo4 requires whole 128-groups, shader register file <= 1024,
+                // and the refine hit-bit packs into the refined word (< 2^31).
+                if (p.landmark_type != (uint32_t)GGML_TYPE_Q8_0 &&
+                    p.landmark_type != (uint32_t)GGML_TYPE_TURBO4_0) {
+                    return false;
+                }
+                if (p.padded_dim == 0 || p.padded_dim > 1024) return false;
+                if (p.landmark_type == (uint32_t)GGML_TYPE_TURBO4_0 && p.padded_dim % 128u != 0) {
+                    return false;
+                }
+                if (p.refine_cap >= 0x80000000u) return false;
+                return true;
+            }
+        case GGML_OP_XKV_LANDMARK_BUILD:
+            {
+                for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                    if (!op->src[i]) return false;
+                }
+                if (!ggml_vk_xkv_single_device(dev, op)) return false;
+                ggml_xkv_landmark_build_params p;
+                memcpy(&p, op->op_params, sizeof(p));
+                char err[256] = {0};
+                if (!ggml_xkv_landmark_build_supports(op->src[0], op->src[1], op->src[2],
+                    op->src[3], op->src[4], op->src[5], op->src[6], op->src[7],
+                    op->src[8], op->src[9], op, &p, err, sizeof(err))) {
+                    return false;
+                }
+                // Vulkan v1 factor codecs: F32/F16/Q8_0/Turbo4_0 only
+                bool fok = (p.a_type == (uint32_t)GGML_TYPE_F32 || p.a_type == (uint32_t)GGML_TYPE_F16 ||
+                            p.a_type == (uint32_t)GGML_TYPE_Q8_0 || p.a_type == (uint32_t)GGML_TYPE_TURBO4_0) &&
+                           (p.b_type == (uint32_t)GGML_TYPE_F32 || p.b_type == (uint32_t)GGML_TYPE_F16 ||
+                            p.b_type == (uint32_t)GGML_TYPE_Q8_0 || p.b_type == (uint32_t)GGML_TYPE_TURBO4_0);
+                if (!fok) return false;
+                return true;
+            }
+        case GGML_OP_XKV_LANDMARK_ROWS:
+            {
+                if (!ggml_vk_xkv_single_device(dev, op)) return false;
+                ggml_xkv_landmark_rows_params p;
+                memcpy(&p, op->op_params, sizeof(p));
+                char err[256] = {0};
+                if (!ggml_xkv_landmark_rows_supports(op->src[0], op->src[1], op->src[2],
+                    op->src[3], op->src[4], op->src[5], op->src[6], op, op->src[7],
+                    op->src[8], op->src[9], &p, err, sizeof(err))) {
+                    return false;
+                }
+                return true;
+            }
+        case GGML_OP_XKV_LANDMARK_MERGE:
+            {
+                if (!ggml_vk_xkv_single_device(dev, op)) return false;
+                ggml_xkv_landmark_merge_params p;
+                memcpy(&p, op->op_params, sizeof(p));
+                char err[256] = {0};
+                if (!ggml_xkv_landmark_merge_supports(op->src[0], op->src[1], op->src[2],
+                    op->src[3], op->src[4], op, &p, err, sizeof(err))) {
+                    return false;
+                }
+                return true;
+            }
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             return true; // all inputs are contiguous, see ggml.c
@@ -20620,72 +20121,11 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
-// FlashPrefill timing/capability producer API for MetricsIntegration,
-// resolved link-free via ggml_backend_reg_get_proc_address (same pattern as
-// the CPU threadpool hook; null-safe when absent). Counters are owned by the
-// ggml_backend_vk_context (cumulative GPU nanoseconds since backend init;
-// snapshot once per completed call and difference — concurrent contexts and
-// models never mix, collect only scheduler backends). All out-args nullable.
-// supported() is build-level dispatch capability; per-slice shapes/dtypes
-// still gate through ggml_backend_dev_supports_op.
-static ggml_status ggml_backend_vk_flashprefill_times(ggml_backend_t backend, uint64_t * pool_ns, uint64_t * select_ns, uint64_t * attn_ns) {
-    if (!ggml_backend_is_vk(backend)) {
-        return GGML_STATUS_FAILED;
-    }
-    const ggml_backend_vk_context * ctx = (const ggml_backend_vk_context *) backend->context;
-    if (pool_ns) {
-        *pool_ns = ctx->fp_ns[0];
-    }
-    if (select_ns) {
-        *select_ns = ctx->fp_ns[1];
-    }
-    if (attn_ns) {
-        *attn_ns = ctx->fp_ns[2];
-    }
-    return GGML_STATUS_SUCCESS;
-}
-
-static bool ggml_backend_vk_flashprefill_supported(void) {
-    return true;
-}
-
-// FP native scratch live/peak for MetricsIntegration: backend-local bytes
-// actually chosen by FP ATTN (0 after split1, exact scr_bytes after split),
-// never the whole shared prealloc pool. Null-arg tolerant.
-static ggml_status ggml_backend_vk_flashprefill_scratch(ggml_backend_t backend, uint64_t * cur_bytes, uint64_t * peak_bytes) {
-    if (!ggml_backend_is_vk(backend)) {
-        return GGML_STATUS_FAILED;
-    }
-    const ggml_backend_vk_context * ctx = (const ggml_backend_vk_context *) backend->context;
-    if (cur_bytes) {
-        *cur_bytes = ctx->fp_scratch_cur;
-    }
-    if (peak_bytes) {
-        *peak_bytes = ctx->fp_scratch_peak;
-    }
-    return GGML_STATUS_SUCCESS;
-}
-
-static void * ggml_backend_vk_get_proc_address(ggml_backend_reg_t reg, const char * name) {
-    if (strcmp(name, "ggml_backend_vk_flashprefill_times") == 0) {
-        return (void *) ggml_backend_vk_flashprefill_times;
-    }
-    if (strcmp(name, "ggml_backend_vk_flashprefill_supported") == 0) {
-        return (void *) ggml_backend_vk_flashprefill_supported;
-    }
-    if (strcmp(name, "ggml_backend_vk_flashprefill_scratch") == 0) {
-        return (void *) ggml_backend_vk_flashprefill_scratch;
-    }
-    return NULL;
-
-    GGML_UNUSED(reg);
-}
-
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ ggml_backend_vk_get_proc_address,
+    /* .get_proc_address = */ NULL,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {
@@ -21042,24 +20482,49 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             if (src_clone[5]) {
                 ggml_flash_attn_ext_add_sinks(tensor_clone, src_clone[5]);
             }
-        } else if (tensor->op == GGML_OP_FLASH_PREFILL_POOL || tensor->op == GGML_OP_FLASH_PREFILL_SELECT || tensor->op == GGML_OP_FLASH_PREFILL_ATTN) {
-            // FlashPrefill V2 debug clone: exact preservation, no add_sinks
-            // helper (unlike RERoT above where sinks is attached post-hoc).
-            // Sources map exactly to the OpRegistration constructors:
-            // POOL(k,v,meta,k_dep,v_dep), SELECT(q,pool,meta),
-            // ATTN(q,k,v,pool,plan,meta,sinks-or-NULL with sinks already
-            // src[6], never via add_sinks). Capacities (Fcap/n_tiles/max_sel)
-            // ride the tensor shapes + 16xI32 op_params by value, so dup+copy
-            // is exactly equivalent to re-invoking
-            // ggml_flash_prefill_pool/select/attn with the same host scalars
-            // without parsing plan/metadata headers on host or touching the
-            // RERoT add_sinks path.
-            tensor_clone = ggml_dup_tensor(ggml_ctx, tensor);
-            tensor_clone->op = tensor->op;
-            for (int i = 0; i < GGML_MAX_SRC; ++i) {
-                tensor_clone->src[i] = src_clone[i];
-            }
-            memcpy(tensor_clone->op_params, tensor->op_params, sizeof(tensor_clone->op_params));
+        } else if (tensor->op == GGML_OP_XKV_RECONSTRUCT) {
+            ggml_xkv_reconstruct_params p;
+            memcpy(&p, tensor->op_params, sizeof(p));
+            tensor_clone = ggml_xkv_reconstruct(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                src_clone[3], src_clone[4], src_clone[5], src_clone[6], src_clone[7], src_clone[8], &p);
+        } else if (tensor->op == GGML_OP_XKV_ATTENTION) {
+            ggml_xkv_attention_params p;
+            memcpy(&p, tensor->op_params, sizeof(p));
+            tensor_clone = ggml_xkv_attention(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                src_clone[3], src_clone[4], src_clone[5], src_clone[6], src_clone[7], src_clone[8], src_clone[9], &p);
+        } else if (tensor->op == GGML_OP_XKV_FACTORIZE) {
+            ggml_xkv_factorize_params p;
+            memcpy(&p, tensor->op_params, sizeof(p));
+            tensor_clone = ggml_xkv_factorize(ggml_ctx, src_clone[0], src_clone[1],
+                src_clone[2], src_clone[3], &p);
+        } else if (tensor->op == GGML_OP_XKV_CANONICALIZE) {
+            ggml_xkv_canonicalize_params p;
+            memcpy(&p, tensor->op_params, sizeof(p));
+            tensor_clone = ggml_xkv_canonicalize(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                src_clone[3], src_clone[4], src_clone[5], &p);
+        } else if (tensor->op == GGML_OP_XKV_LANDMARK) {
+            ggml_xkv_landmark_params p;
+            memcpy(&p, tensor->op_params, sizeof(p));
+            tensor_clone = ggml_xkv_landmark(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                src_clone[3], src_clone[4], src_clone[5], src_clone[6], src_clone[7],
+                src_clone[8], src_clone[9], &p);
+        } else if (tensor->op == GGML_OP_XKV_LANDMARK_BUILD) {
+            ggml_xkv_landmark_build_params p;
+            memcpy(&p, tensor->op_params, sizeof(p));
+            tensor_clone = ggml_xkv_landmark_build(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                src_clone[3], src_clone[4], src_clone[5], src_clone[6], src_clone[7],
+                src_clone[8], src_clone[9], &p);
+        } else if (tensor->op == GGML_OP_XKV_LANDMARK_ROWS) {
+            ggml_xkv_landmark_rows_params p;
+            memcpy(&p, tensor->op_params, sizeof(p));
+            tensor_clone = ggml_xkv_landmark_rows(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                src_clone[3], src_clone[4], src_clone[5], src_clone[6], src_clone[7],
+                src_clone[8], src_clone[9], &p);
+        } else if (tensor->op == GGML_OP_XKV_LANDMARK_MERGE) {
+            ggml_xkv_landmark_merge_params p;
+            memcpy(&p, tensor->op_params, sizeof(p));
+            tensor_clone = ggml_xkv_landmark_merge(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                src_clone[3], src_clone[4], &p);
         } else if (tensor->op == GGML_OP_MUL_MAT) {
             tensor_clone = ggml_mul_mat(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_MUL_MAT_ID) {

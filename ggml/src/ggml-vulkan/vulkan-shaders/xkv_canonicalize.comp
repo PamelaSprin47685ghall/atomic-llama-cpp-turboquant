@@ -1,0 +1,223 @@
+#version 450
+
+// xkv_canonicalize.comp — Native Vulkan device-local canonicalize-hot core.
+//
+// Consumes hot K/V rows (F32/F16/Q8_0/Turbo2/3/4, per-head blocks with own
+// norms) + selected physical rows + storage positions, applies per-head
+// decode (Turbo: exact centroid tables in rotated domain, then exact inverse
+// WHT with swapped signs; mirrors ggml_dequantize_turbo_row CANONICAL domain),
+// inverse attention Hadamard rotation (exact H multiply, skipped when
+// hadamard_dim==0), and exact table-driven inverse text RoPE (HALF or
+// INTERLEAVED) for K into contiguous X[n, total_feat] F32 staging. V skips RoPE.
+//
+// s0 validates params -> status; s1 does the work (early-out if status!=0).
+// Out-of-range rows or non-finite outputs set status and skip writes.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform CanonPush {
+    uint step;
+    uint n;
+    uint nvec;
+    uint hd;
+    uint phd;
+    uint rotary_dim;
+    uint rope_mode;
+    uint input_type;
+    uint is_k;
+    uint hadamard_dim;
+    uint hot_row_bytes;
+    uint hot_nphys;
+    uint pos_is_64;
+    uint status_idx;
+} p;
+
+layout (binding = 0, std430) readonly buffer HOT { uint8_t hot[]; };
+layout (binding = 1, std430) readonly buffer ROWS { int rows[]; };
+layout (binding = 2, std430) readonly buffer POS { int pos_raw[]; };
+layout (binding = 3, std430) readonly buffer ROPE { float rope[]; };
+layout (binding = 4, std430) readonly buffer HAD { float had[]; };
+layout (binding = 5, std430) buffer OUTX { float outx[]; };
+layout (binding = 6, std430) buffer ST { uint st[]; };
+
+const float S1[128] = float[128](
+    -1,1,1,-1,-1,1,-1,1,-1,-1,1,1,1,1,1,1,1,-1,1,-1,1,-1,-1,1,1,1,-1,1,1,-1,-1,-1,
+    -1,1,1,-1,1,1,-1,1,-1,1,1,-1,-1,1,-1,1,1,1,1,-1,-1,-1,-1,-1,1,-1,1,1,1,1,-1,1,
+    -1,-1,1,-1,-1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,1,-1,-1,1,1,1,-1,-1,1,1,-1,1,1,-1,1,-1,
+    -1,1,1,-1,1,-1,1,-1,1,1,1,1,-1,1,-1,1,1,-1,1,1,-1,-1,-1,-1,-1,1,1,-1,1,1,-1,1);
+const float S2[128] = float[128](
+    1,1,1,1,-1,1,1,-1,1,-1,-1,-1,1,-1,-1,-1,1,1,-1,-1,1,-1,1,-1,1,-1,-1,1,-1,1,1,1,
+    1,1,-1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,1,-1,1,-1,1,1,1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,
+    1,-1,1,-1,-1,-1,-1,1,-1,1,-1,1,-1,-1,1,1,-1,1,-1,1,1,-1,1,-1,-1,-1,-1,1,-1,-1,1,-1,
+    1,-1,1,1,1,-1,-1,1,-1,1,-1,1,1,-1,-1,1,-1,1,-1,1,1,-1,1,-1,1,-1,-1,-1,-1,-1,1,-1);
+const float C2[4] = float[4](-0.133462, -0.039994, 0.039994, 0.133462);
+const float C3[8] = float[8](
+    -0.190685, -0.117832, -0.065717, -0.021460,
+     0.021460,  0.065717,  0.117832,  0.190685);
+const float C4[16] = float[16](
+    -0.173926, -0.117195, -0.089527, -0.068756,
+    -0.051262, -0.035597, -0.020989, -0.006938,
+     0.006938,  0.020989,  0.035597,  0.051262,
+     0.068756,  0.089527,  0.117195,  0.173926);
+const float INV_SQRT128 = 0.08838834764831845;
+
+float rd_half(uint off) {
+    uint h = uint(hot[off]) | (uint(hot[off + 1u]) << 8u);
+    return unpackHalf2x16(h).x;
+}
+float rd_f32(uint off) {
+    uint w = uint(hot[off]) | (uint(hot[off + 1u]) << 8u) | (uint(hot[off + 2u]) << 16u) | (uint(hot[off + 3u]) << 24u);
+    return uintBitsToFloat(w);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+
+    if (p.step == 0u) {
+        if (gid == 0u) {
+            bool ok = (p.n > 0u && p.nvec > 0u && p.hd > 0u && p.phd > 0u &&
+                       p.phd >= p.hd && p.hot_row_bytes > 0u &&
+                       (p.rotary_dim <= p.hd) && ((p.rotary_dim & 1u) == 0u) &&
+                       (p.rope_mode <= 1u) &&
+                       (p.input_type == 0u || p.input_type == 1u || p.input_type == 8u ||
+                        p.input_type == 42u || p.input_type == 43u || p.input_type == 44u) &&
+                       (p.hadamard_dim == 0u || (p.hd % p.hadamard_dim) == 0u));
+            if (ok && (p.input_type == 42u || p.input_type == 43u || p.input_type == 44u)) {
+                ok = (p.phd % 128u) == 0u;
+            }
+            if (ok && p.input_type == 8u) ok = (p.phd % 32u) == 0u;
+            st[p.status_idx] = ok ? 0u : 1u;
+        }
+        return;
+    }
+    if (st[p.status_idx] != 0u) return;
+
+    uint n = p.n, nvec = p.nvec, hd = p.hd, phd = p.phd;
+    uint total = n * nvec;
+    if (gid >= total) return;
+
+    uint i = gid / nvec;
+    uint v = gid % nvec;
+    int pr = rows[i];
+    if (pr < 0 || uint(pr) >= p.hot_nphys) { st[p.status_idx] = 2u; return; }
+
+    uint t = p.input_type;
+    // per-head byte stride within a hot row
+    uint head_bytes = 0u;
+    if (t == 0u) head_bytes = phd * 4u;
+    else if (t == 1u) head_bytes = phd * 2u;
+    else if (t == 8u) head_bytes = (phd / 32u) * 34u;
+    else if (t == 42u) head_bytes = (phd / 128u) * 34u;
+    else if (t == 43u) head_bytes = (phd / 128u) * 50u;
+    else head_bytes = (phd / 128u) * 68u;
+    uint base = uint(pr) * p.hot_row_bytes + v * head_bytes;
+
+    // decode head into canonical floats (Turbo: rotated domain first)
+    // max phd 512 (host supports bound); one head staged in registers.
+    if (phd > 512u) { st[p.status_idx] = 2u; return; }
+    float buf[512];
+    if (t == 0u) {
+        for (uint j = 0u; j < phd; ++j) buf[j] = rd_f32(base + j * 4u);
+    } else if (t == 1u) {
+        for (uint j = 0u; j < phd; ++j) buf[j] = rd_half(base + j * 2u);
+    } else if (t == 8u) {
+        for (uint b = 0u; b < phd / 32u; ++b) {
+            float d = rd_half(base + b * 34u);
+            for (uint j = 0u; j < 32u; ++j) {
+                int q = int(hot[base + b * 34u + 2u + j]);
+                if (q >= 128) q -= 256;
+                buf[b * 32u + j] = d * float(q);
+            }
+        }
+    } else {
+        bool isT2 = (t == 42u);
+        bool isT3 = (t == 43u);
+        for (uint g = 0u; g < phd / 128u; ++g) {
+            uint boff = base + g * (isT2 ? 34u : (isT3 ? 50u : 68u));
+            float norm = rd_half(boff);
+            for (uint j = 0u; j < 128u; ++j) {
+                float cv = 0.0;
+                if (isT2) {
+                    uint qb = uint(hot[boff + 2u + j / 4u]);
+                    cv = C2[(qb >> (2u * (j % 4u))) & 3u];
+                } else if (isT3) {
+                    uint qb = uint(hot[boff + 2u + j / 4u]);
+                    uint sb = uint(hot[boff + 34u + j / 8u]);
+                    uint idx = ((qb >> (2u * (j % 4u))) & 3u) | (((sb >> (j % 8u)) & 1u) << 2u);
+                    cv = C3[idx];
+                } else {
+                    uint qb = uint(hot[boff + 4u + j / 2u]);
+                    uint idx = (j % 2u == 0u) ? (qb & 15u) : (qb >> 4u);
+                    cv = C4[idx];
+                }
+                buf[g * 128u + j] = norm * cv;
+            }
+            // exact inverse WHT (swapped signs) -> canonical domain
+            {
+                for (uint j = 0u; j < 128u; ++j) buf[g * 128u + j] *= S2[j];
+                for (uint h = 1u; h < 128u; h *= 2u)
+                    for (uint k = 0u; k < 128u; k += h * 2u)
+                        for (uint j = k; j < k + h; ++j) {
+                            float a = buf[g * 128u + j], b = buf[g * 128u + j + h];
+                            buf[g * 128u + j] = a + b; buf[g * 128u + j + h] = a - b;
+                        }
+                for (uint j = 0u; j < 128u; ++j) buf[g * 128u + j] *= INV_SQRT128 * S1[j];
+            }
+        }
+    }
+
+    uint out_base = i * (nvec * hd) + v * hd;
+    // inverse attention rotation per hadamard block
+    uint Hd = p.hadamard_dim;
+    if (Hd > 0u) {
+        for (uint b = 0u; b < hd; b += Hd) {
+            for (uint ii = 0u; ii < Hd; ++ii) {
+                float acc = 0.0;
+                for (uint jj = 0u; jj < Hd; ++jj) acc += had[ii * Hd + jj] * buf[b + jj];
+                outx[out_base + b + ii] = acc;
+            }
+        }
+    } else {
+        for (uint j = 0u; j < hd; ++j) outx[out_base + j] = buf[j];
+    }
+
+    // exact inverse text RoPE for K
+    if (p.is_k != 0u && p.rotary_dim > 0u) {
+        float pos = (p.pos_is_64 != 0u)
+            ? (float(pos_raw[2u * i]) + float(pos_raw[2u * i + 1u]) * 4294967296.0)
+            : float(pos_raw[i]);
+        uint Fc = p.rotary_dim / 2u;
+        if (p.rope_mode == 0u) {
+            for (uint f = 0u; f < Fc; ++f) {
+                float ang = rope[f] * pos;
+                float c = cos(ang), sn = sin(ang);
+                float sc = rope[Fc + f] > 0.0 ? rope[Fc + f] : 1.0;
+                float re = outx[out_base + f] / sc;
+                float im = outx[out_base + f + Fc] / sc;
+                outx[out_base + f] = re * c + im * sn;
+                outx[out_base + f + Fc] = im * c - re * sn;
+            }
+        } else {
+            for (uint f = 0u; f < Fc; ++f) {
+                float ang = rope[f] * pos;
+                float c = cos(ang), sn = sin(ang);
+                float sc = rope[Fc + f] > 0.0 ? rope[Fc + f] : 1.0;
+                float re = outx[out_base + 2u * f] / sc;
+                float im = outx[out_base + 2u * f + 1u] / sc;
+                outx[out_base + 2u * f] = re * c + im * sn;
+                outx[out_base + 2u * f + 1u] = im * c - re * sn;
+            }
+        }
+    }
+
+    for (uint j = 0u; j < hd; ++j) {
+        float w = outx[out_base + j];
+        if (isnan(w) || isinf(w)) { st[p.status_idx] = 3u; return; }
+    }
+}

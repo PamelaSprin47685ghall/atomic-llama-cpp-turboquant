@@ -980,6 +980,16 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_FLASH_ATTN_EXT_REROT: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
+            case GGML_OP_XKV_RECONSTRUCT: {
+            case GGML_OP_XKV_ATTENTION:
+            case GGML_OP_XKV_FACTORIZE:
+            case GGML_OP_XKV_CANONICALIZE:
+            case GGML_OP_XKV_LANDMARK:
+            case GGML_OP_XKV_LANDMARK_BUILD:
+            case GGML_OP_XKV_LANDMARK_ROWS:
+            case GGML_OP_XKV_LANDMARK_MERGE:
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
             case GGML_OP_FLASH_ATTN_BACK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;

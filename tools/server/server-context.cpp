@@ -5,9 +5,7 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-rerot.h"
-#include "server-rerot-audit.h"
 #include "server-task.h"
-#include "server-triattention.h"
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
@@ -140,7 +138,6 @@ enum class server_rerot_injection_kind : uint8_t {
     refresh,
     worker,
     serial_resume,
-    final_fence,
 };
 
 static constexpr size_t SERVER_REROT_PRIVATE_BATCH = 32;
@@ -179,16 +176,6 @@ struct server_batch {
 
     float  alora_scale       = -1.0f;
     size_t alora_disabled_id = 0;
-
-    // FlashPrefill V2 routing sidecar (ServerRouting ownership).
-    // Parallel to tokens[]: fp_rows[i] describes tokens[i] with a frozen
-    // llama_flashprefill_row (role + seq/reader identity + logical pos +
-    // frozen prefill interval). Same clear() lifetime as tokens, same off
-    // slicing as get_view(). OFF (default): stays empty forever — no
-    // allocation, no split/sync change. Context-internal source-row mapping
-    // (BatchIdentity) is not needed here; the server slices by off only and
-    // the context validates n_rows == batch.n_tokens on its copy.
-    std::vector<llama_flashprefill_row> fp_rows;
 
     server_batch() {
         batch.pos = nullptr; // sentinel: uninitialized batch
@@ -233,9 +220,6 @@ struct server_batch {
     void clear() {
         tokens.clear();
         embd.clear();
-        fp_rows.clear();
-        // OFF: fp_rows never reserved; enabled path reserves at most
-        // n_tokens_alloc once per iteration (no per-row growth).
         common_batch_clear(batch);
         slot_batched      = nullptr;
         alora_scale       = -1.0f;
@@ -257,18 +241,9 @@ struct server_batch {
         tokens[idx].output = output;
     }
 
-    // Push one frozen row parallel to the last add()ed token. Caller (impl)
-    // gates on fp_enabled, so OFF never allocates here. Must be called
-    // exactly once per successful add() while enabled to keep row identity.
-    void fp_push_row(const llama_flashprefill_row & row) {
-        fp_rows.push_back(row);
-    }
-
     void render() {
         GGML_ASSERT(!batch_rendered);
         GGML_ASSERT(batch.pos != nullptr);
-        // Row identity: enabled => exactly one row per token; OFF => no rows.
-        GGML_ASSERT(fp_rows.empty() || fp_rows.size() == tokens.size());
         common_batch_clear(batch);
         for (int32_t i = 0; i < size(); i++) {
             const auto & t = tokens[i];
@@ -301,30 +276,6 @@ struct server_batch {
         };
 
         return view;
-    }
-
-    // Borrowed versioned execution view sliced by the same off/n as get_view().
-    // Lifetime: valid until the next clear()/render(), exactly like the batch
-    // view (the callee must copy before async submit; the context does).
-    // OFF: returns an empty view (n_rows==0, rows==NULL) — the decode path
-    // then takes the ordinary llama_decode() dense route with zero new work.
-    llama_flashprefill_exec fp_exec_view(int32_t off, int32_t n_tokens) const {
-        llama_flashprefill_exec exec = {};
-        exec.version = LLAMA_FLASHPREFILL_EXEC_VERSION;
-        exec.struct_size = (uint32_t) sizeof(llama_flashprefill_exec);
-        if (fp_rows.empty()) {
-            exec.n_rows = 0;
-            exec.reserved0 = 0;
-            exec.rows = nullptr;
-            return exec;
-        }
-        GGML_ASSERT(batch_rendered);
-        GGML_ASSERT(off >= 0 && off + n_tokens <= (int32_t) fp_rows.size());
-        GGML_ASSERT(n_tokens > 0);
-        exec.n_rows = (uint32_t) n_tokens;
-        exec.reserved0 = 0;
-        exec.rows = fp_rows.data() + off;
-        return exec;
     }
 };
 
@@ -458,10 +409,10 @@ struct server_slot {
         if (res && loaded_state) {
             common_speculative_set_state(spec, id, state_spec);
         }
-        triattention_compressed = server_triattention_compressed_after_load(
-            triattention_compressed, res, loaded_state,
-            loaded_state ? llama_memory_seq_get_kv_used(llama_get_memory(ctx_tgt), id) : 0,
-            prompt.tokens.size());
+        if (res) {
+            triattention_compressed = loaded_state &&
+                llama_memory_seq_get_kv_used(llama_get_memory(ctx_tgt), id) < prompt.tokens.size();
+        }
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -518,20 +469,6 @@ struct server_slot {
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
-
-    // FlashPrefill V2 per-slot routing state (ServerRouting ownership).
-    // fp_boundary: frozen ordinary logical-prefill suffix, set once after the
-    //   prefix-cache final n_past decision (STARTED path) and persisted across
-    //   ubatches until reset/release. New requests must not inherit it.
-    // fp_eligible_rows / fp_dense_by_reason: per-request (slot-lifetime)
-    //   successful-only distribution, indexed by fp_dense_reason_index().
-    //   Incremented exclusively from the post_decode success path; retry,
-    //   fatal-error, and cancel paths never touch them. OFF: boundary stays
-    //   unknown and all counters stay zero (no allocation beyond these inline
-    //   fields, no behavior change).
-    server_flashprefill_routing::fp_slot_boundary fp_boundary;
-    uint64_t fp_eligible_rows = 0;
-    uint64_t fp_dense_by_reason[7] = {};
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -603,14 +540,6 @@ struct server_slot {
         rerot_inflight_extra_bytes.clear();
         rerot_inflight_forced = false;
         rerot_serial_tail = false;
-
-        // FlashPrefill: new requests must not inherit the previous request's
-        // frozen interval or its successful-only distribution.
-        fp_boundary = server_flashprefill_routing::fp_slot_boundary();
-        fp_eligible_rows = 0;
-        for (int i = 0; i < 7; ++i) {
-            fp_dense_by_reason[i] = 0;
-        }
     }
 
     void init_sampler() const {
@@ -662,6 +591,7 @@ struct server_slot {
         GGML_ASSERT(task);
 
         return task->type == other_slot.task->type
+            && rerot_internal == other_slot.rerot_internal
             && inp_embd.size() == other_slot.inp_embd.size()
             && are_lora_equal(lora, other_slot.lora);
     }
@@ -723,26 +653,9 @@ struct server_slot {
     }
 
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
-    // fp_enabled gates the FlashPrefill sidecar: OFF leaves batch.fp_rows empty
-    // (no allocation, no split/sync change). When enabled, exactly one frozen
-    // row is pushed per successful add() to keep row identity. All decode rows
-    // below are conservative dense (never sparse): ordinary decode, MTP/target
-    // verification, and speculative replay all keep the pre-existing attention
-    // path, and the existing active-lane MTP pause is untouched (this function
-    // never drafts for rerot_internal slots; those go through
-    // rerot_append_planned_token).
-    void handle_last_sampled_token(server_batch & batch, bool fp_enabled) {
-        namespace fp = server_flashprefill_routing;
+    void handle_last_sampled_token(server_batch & batch) {
         bool add_ok = true;
         bool handled_append_chunk = false;
-        // Dense row template for decode-phase rows: unknown boundary forbids
-        // any logical-prompt tail guessing; decode position is irrelevant to
-        // routing so logical_pos stays UNKNOWN.
-        const fp::fp_slot_boundary fp_unknown;
-        auto fp_decode_row = [&](int32_t role) {
-            return fp::make_row(role, id, LLAMA_FLASHPREFILL_READER_NONE,
-                LLAMA_FLASHPREFILL_POS_UNKNOWN, fp_unknown);
-        };
         if (!token_append_chunk.empty()) {
             GGML_ASSERT(spec_draft.empty());
             GGML_ASSERT(token_append_anchor != LLAMA_TOKEN_NULL);
@@ -753,15 +666,8 @@ struct server_slot {
             const int32_t batch0 = batch.size();
 
             add_ok &= batch.add(id, token_append_anchor, pos0++, false);
-            if (fp_enabled && add_ok) {
-                batch.fp_push_row(fp_decode_row(LLAMA_FLASHPREFILL_ROLE_DECODE));
-            }
             for (size_t i = 0; i < token_append_chunk.size(); ++i) {
-                const bool ok = batch.add(id, token_append_chunk[i], pos0++, i + 1 == token_append_chunk.size());
-                add_ok &= ok;
-                if (fp_enabled && ok) {
-                    batch.fp_push_row(fp_decode_row(LLAMA_FLASHPREFILL_ROLE_DECODE));
-                }
+                add_ok &= batch.add(id, token_append_chunk[i], pos0++, i + 1 == token_append_chunk.size());
             }
 
             i_batch = batch0 + (int32_t) token_append_chunk.size();
@@ -780,9 +686,6 @@ struct server_slot {
             } else {
                 add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true);
             }
-            if (fp_enabled && add_ok) {
-                batch.fp_push_row(fp_decode_row(LLAMA_FLASHPREFILL_ROLE_DECODE));
-            }
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
                     sampled, n_ctx, prompt.n_tokens(), truncated);
@@ -799,24 +702,9 @@ struct server_slot {
 
             auto pos0 = prompt.tokens.pos_next();
 
-            // Target-verification batch (sampled + drafts): must never route
-            // sparse. Replay-after-restore uses SPECULATIVE_REPLAY, all other
-            // verification batches use MTP_VERIFY (covers MTP draft/target
-            // verification; external-draft verification is equally dense and
-            // shares the same DENSE_ROLE server reason).
-            const int32_t verify_role = spec_is_replay
-                ? LLAMA_FLASHPREFILL_ROLE_SPECULATIVE_REPLAY
-                : LLAMA_FLASHPREFILL_ROLE_MTP_VERIFY;
             add_ok &= batch.add(id, sampled, pos0++, true);
-            if (fp_enabled && add_ok) {
-                batch.fp_push_row(fp_decode_row(verify_role));
-            }
             for (auto token : spec_draft) {
-                const bool ok = batch.add(this->id, token, pos0++, true);
-                add_ok &= ok;
-                if (fp_enabled && ok) {
-                    batch.fp_push_row(fp_decode_row(verify_role));
-                }
+                add_ok &= batch.add(this->id, token, pos0++, true);
             }
         }
 
@@ -839,9 +727,8 @@ struct server_slot {
 
             state = SLOT_STATE_IDLE;
 
-            // Clear context for child slots or RERoT internal slots to prevent
-            // state residue across requests.
-            if (task->is_child() || rerot_internal) {
+            // do not keep context of the child slots - the parent's context is enough
+            if (task->is_child()) {
                 prompt_clear();
             }
 
@@ -1146,49 +1033,11 @@ struct server_slot {
     }
 };
 
+
+
 //
 // server_metrics
 //
-
-// Saturating once-per-successful-slice merge of one context drain delta
-// (MetricsIntegration owner; declared in server-context.h). Gauges:
-// scratch_live overwrites (buffers reused), scratch_peak maxes, layout time
-// sums measured slices only (unmeasured slices contribute nothing).
-void server_flashprefill_routing::fp_gpu_merge_slice(
-        fp_gpu_deltas & acc, const struct llama_flashprefill_metrics_slice & d) {
-    const auto sat_add = [](uint64_t a, uint64_t b) {
-        return a > UINT64_MAX - b ? UINT64_MAX : a + b;
-    };
-    acc.sparse_rows     = sat_add(acc.sparse_rows, d.sparse_rows);
-    acc.dense_packed    = sat_add(acc.dense_packed, d.dense_packed);
-    acc.selected_blocks = sat_add(acc.selected_blocks, d.selected_blocks);
-    acc.corrected_blocks = sat_add(acc.corrected_blocks, d.corrected_blocks);
-    acc.visible_tokens  = sat_add(acc.visible_tokens, d.visible_tokens);
-    acc.exact_tokens    = sat_add(acc.exact_tokens, d.exact_tokens);
-    for (int i = 0; i < 10; ++i) {
-        acc.dense_rows[i] = sat_add(acc.dense_rows[i], d.dense_rows[i]);
-    }
-    for (int i = 0; i < 2; ++i) {
-        acc.pool_rebuild[i] = sat_add(acc.pool_rebuild[i], d.pool_rebuild[i]);
-    }
-    for (int i = 0; i < 3; ++i) {
-        acc.plan_invalidations[i] = sat_add(acc.plan_invalidations[i], d.plan_invalidations[i]);
-    }
-    acc.scratch_live_bytes = d.scratch_live_bytes;
-    if (d.scratch_peak_bytes > acc.scratch_peak_bytes) {
-        acc.scratch_peak_bytes = d.scratch_peak_bytes;
-    }
-    if (d.has_layout_us) {
-        acc.layout_us_total = sat_add(acc.layout_us_total, d.layout_us);
-        acc.layout_slices_measured += 1;
-    }
-    if (d.has_gpu_us) {
-        acc.gpu_pool_us_total   = sat_add(acc.gpu_pool_us_total, d.gpu_pool_us);
-        acc.gpu_select_us_total = sat_add(acc.gpu_select_us_total, d.gpu_select_us);
-        acc.gpu_attn_us_total   = sat_add(acc.gpu_attn_us_total, d.gpu_attn_us);
-        acc.gpu_slices_measured += 1;
-    }
-}
 
 struct server_metrics {
     int64_t t_start = 0;
@@ -1208,39 +1057,6 @@ struct server_metrics {
 
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
-
-    // FlashPrefill V2 metrics accumulator contract (ServerRouting ownership).
-    // Successful-only, cumulative for the process lifetime, all zero while OFF
-    // (no series emitted, no GPU work counted):
-    //   fp_eligible_rows: rows constructed with a sparse-eligible role
-    //     (PREFILL or REROT_TEACHER_FORCED) and a known frozen boundary,
-    //     counted once per successful decode slice covering the row.
-    //   fp_dense_by_reason[7]: server-attributable dense rows by bounded
-    //     DENSE_* route label, indexed by fp_dense_reason_index()
-    //     (DENSE_OFF..DENSE_CAPACITY). Today the server fills DENSE_ROLE
-    //     (decode / MTP verify / replay / frontier / embedding / rerank /
-    //     multimodal) and DENSE_UNKNOWN_BOUNDARY (eligible role but no known
-    //     interval); SHORT/T tail/UNSUPPORTED/CAPACITY refinements arrive via
-    //     the pending GPU aggregate hook (never faked here).
-    //   fp_policy_fingerprint / fp_has_policy: policy identity for state and
-    //     cache isolation (llama_flashprefill_fingerprint over config +
-    //     model/adapter ids). OFF (default): fp_has_policy==false, omitted.
-    // GPU-determined totals (MetricsIntegration owner): sparse/dense-packed
-    // plan counts, granular dense buckets, selected/corrected blocks,
-    // visible/exact tokens, pool/plan bounded reasons, scratch live/peak,
-    // host layout time. Producer: the context drain
-    // (llama_flashprefill_metrics_drain) merged in fp_merge_gpu_slice() on
-    // the post_decode success path with the same once-per-slice discipline
-    // as fp_count_slice_success (saturating addition; see fp_gpu_deltas in
-    // server-context.h). All zero while OFF (serializer emits zeros then at
-    // no counting cost, per the matrix off_baseline contract); GPU work is
-    // counted only after successful graph completion, never from theoretical
-    // eligibility.
-    uint64_t fp_eligible_rows = 0;
-    uint64_t fp_dense_by_reason[7] = {};
-    uint64_t fp_policy_fingerprint = 0;
-    bool     fp_has_policy = false;
-    server_flashprefill_routing::fp_gpu_deltas fp_gpu;
 
     void init() {
         t_start = ggml_time_us();
@@ -1330,7 +1146,6 @@ private:
     // use server_context methods instead
 
     common_params params_base;
-    server_rerot_audit rerot_audit;
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
@@ -1385,172 +1200,6 @@ private:
 
     server_inference_mode inference_mode = SERVER_INFERENCE_MODE_DECODE;
     int32_t id_slot_prefill = -1;
-
-    // FlashPrefill V2 server policy (ServerRouting ownership).
-    // Default is always OFF (llama_flashprefill_default_config): fp_enabled
-    // false, sidecar never allocated, scheduling byte-identical to baseline.
-    // Remaining dependencies (not guessed here): ConfigIntegration declares
-    // llama_context_params.flashprefill + llama_decode_with_flashprefill in
-    // llama.h and the CLI plumbing; ContextIntegration implements the decode
-    // copy semantics + llama_flashprefill_policy_fingerprint getter and the
-    // per-ubatch GPU-delta producer. Until those land, the impl builds and
-    // validates the borrowed exec view per slice but keeps calling the
-    // ordinary llama_decode() dense route (see decode()).
-    llama_flashprefill_config fp_config = llama_flashprefill_default_config();
-    bool fp_enabled = false;
-
-    // Store identity for isolation (StatePolicy core key, not just diagnostics).
-    // fp_current_fingerprint/fp_has_policy are stamped at load_model from the
-    // live context (llama_flashprefill_policy_fingerprint) and never change
-    // afterwards: the policy is immutable for the context lifetime. They feed
-    // metrics/diagnostics only.
-    // fp_current_state_key/fp_has_state_key are the store identity, refreshed
-    // from llama_flashprefill_state_cache_key() every iteration (not just at
-    // load): policy fingerprint + context serial + adapter generation. Any
-    // effective LoRA/cvec mutation retires the key, so the RAM cache can never
-    // silently reuse KV produced under older adapters. Durable authority on
-    // every restore is the 64-byte core envelope inside the state bytes (the
-    // key itself is an in-memory fast-path stamp, never serialized); the RAM
-    // stamp below is keyed on this same value. 0 == no isolation identity
-    // (OFF: legacy path).
-    // fp_cache_key/fp_cache_key_stamped record which identity the RAM prompt
-    // cache contents were produced under; fp_guard_prompt_cache() drops the
-    // whole cache when the stamp disagrees, so sparse-prefill KV can never be
-    // consumed as dense-prefill KV (or across any adapter/policy change).
-    uint64_t fp_current_fingerprint = 0;
-    bool     fp_has_policy = false;
-    uint64_t fp_current_state_key = 0;
-    bool     fp_has_state_key = false;
-    uint64_t fp_cache_key = 0;
-    bool     fp_cache_key_stamped = false;
-
-    // Drop RAM prompt-cache contents produced under a different store identity.
-    // Cheap (one compare) and OFF-safe: OFF has no state key, so this keeps
-    // exact old behavior and never spurious-clears. Must run before any decode
-    // or cache use in the iteration; called at the top of update_slots(). The
-    // cache is process-lifetime with a single policy today, so this only fires
-    // on a genuine identity disagreement (policy change, adapter mutation, or
-    // context replacement) — which is exactly when reuse would silently mix
-    // approximate and exact KV lineages.
-    void fp_guard_prompt_cache() {
-        if (!prompt_cache) {
-            return;
-        }
-        // Refresh the live store identity every iteration (not just at load):
-        // LoRA apply/cvec on the live context (per-batch slot LoRA, POST
-        // /lora-adapters) retires the StatePolicy core key via the context
-        // adapter generation, and the guard must observe that retirement here
-        // or stale RAM entries would survive an adapter switch. Cheap single
-        // key recompute per iteration; OFF stays 0 (legacy behavior, never
-        // spurious-clears). Slot sidecar writes later in this same iteration
-        // therefore also stamp the current identity.
-        if (ctx_tgt != nullptr) {
-            fp_current_state_key = llama_flashprefill_state_cache_key(ctx_tgt);
-            fp_has_state_key = (fp_current_state_key != 0);
-        }
-        if (!fp_has_state_key) {
-            // No identity to enforce by (pre-load, OFF, or key unavailable):
-            // keep exact old behavior, never spurious-clear.
-            return;
-        }
-        namespace fp = server_flashprefill_routing;
-        if (!fp_cache_key_stamped) {
-            fp_cache_key = fp_current_state_key;
-            fp_cache_key_stamped = true;
-            return;
-        }
-        if (fp::fp_isolate_store(fp_cache_key, true, fp_current_state_key, true)
-                != fp::FP_STORE_USABLE) {
-            SRV_WRN("flashprefill store identity changed (cache %016llx vs current %016llx): dropping %zu RAM-cached prompts\n",
-                (unsigned long long) fp_cache_key,
-                (unsigned long long) fp_current_state_key,
-                prompt_cache->states.size());
-            prompt_cache->states.clear();
-            fp_cache_key = fp_current_state_key;
-        }
-    }
-
-    // Manual slot files carry NO companion sidecar: the single authority for
-    // store isolation is the 64-byte StatePolicy core envelope inside the
-    // state bytes themselves (policy fingerprint + process nonce + context
-    // serial + adapter generation, validated before any KV is consumed on
-    // load). No v1/v2 ".flashprefill" scheme is written or read — a redundant
-    // file sidecar would be a second source of truth that can disagree with
-    // the envelope. Restores under a mismatched identity fail at load
-    // (nread == 0 below) with a re-prefill error; OFF restores keep exact old
-    // behavior (no envelope in either direction).
-
-    // True for the two sparse-eligible roles with a known frozen boundary.
-    // Everything else is a server-attributable dense row (DENSE_ROLE, or
-    // DENSE_UNKNOWN_BOUNDARY when an eligible role lacks its interval).
-    bool fp_row_is_eligible(const llama_flashprefill_row & row) const {
-        if (!server_flashprefill_routing::role_is_sparse_eligible(row.role)) {
-            return false;
-        }
-        return row.prefill_known;
-    }
-
-    int32_t fp_server_dense_reason(const llama_flashprefill_row & row) const {
-        if (server_flashprefill_routing::role_is_sparse_eligible(row.role) && !row.prefill_known) {
-            return LLAMA_FLASHPREFILL_ROUTE_DENSE_UNKNOWN_BOUNDARY;
-        }
-        return LLAMA_FLASHPREFILL_ROUTE_DENSE_ROLE;
-    }
-
-    // Successful-only accounting for one slice [off, off+n). Called at the top
-    // of post_decode (which runs only after its decode returned 0), so each
-    // row is counted exactly once; retries, throws, and cancels never arrive
-    // here. Attributes rows to slots via batch.tokens (row identity intact).
-    void fp_count_slice_success(int32_t off, int32_t n) {
-        if (!fp_enabled || batch.fp_rows.empty()) {
-            return;
-        }
-        GGML_ASSERT(off >= 0 && off + n <= (int32_t) batch.fp_rows.size());
-        GGML_ASSERT(off >= 0 && off + n <= (int32_t) batch.tokens.size());
-        for (int32_t i = 0; i < n; ++i) {
-            const int32_t idx = off + i;
-            const auto & row = batch.fp_rows[idx];
-            const int32_t id_slot = batch.tokens[idx].id_slot;
-            server_slot * slot = get_slot_by_id(id_slot);
-            if (fp_row_is_eligible(row)) {
-                metrics.fp_eligible_rows += 1;
-                if (slot != nullptr) {
-                    slot->fp_eligible_rows += 1;
-                }
-            } else {
-                const int32_t reason = fp_server_dense_reason(row);
-                const int32_t ridx = server_flashprefill_routing::fp_dense_reason_index(reason);
-                GGML_ASSERT(ridx >= 0);
-                metrics.fp_dense_by_reason[ridx] += 1;
-                if (slot != nullptr) {
-                    slot->fp_dense_by_reason[ridx] += 1;
-                }
-            }
-        }
-    }
-
-    // GPU-determined merge for one successful slice (MetricsIntegration
-    // owner; called in post_decode right after fp_count_slice_success, so the
-    // same once-per-slice discipline covers both). Drains the target-context
-    // ledger (transactional: failed/retried calls never commit context-side,
-    // and the drain is consume-once, so narrowed-batch retries cannot double
-    // count). The speculative draft context (ctx_dft) is deliberately not
-    // drained: its re-eval traffic stays uncounted rather than risk double
-    // attribution against the target ledger. OFF or empty drain merges
-    // nothing. The drain's eligible_rows field is deliberately ignored here
-    // (server-side fp_eligible_rows above stays canonical; merging both
-    // would double count the same rows).
-    void fp_merge_gpu_slice() {
-        if (!fp_enabled || ctx_tgt == nullptr) {
-            return;
-        }
-        llama_flashprefill_metrics_slice d = {};
-        const int32_t rc = llama_flashprefill_metrics_drain(ctx_tgt, &d);
-        if (rc != 0) {
-            return; // 1: empty/OFF (zeroed); -1 impossible with non-null args
-        }
-        server_flashprefill_routing::fp_gpu_merge_slice(metrics.fp_gpu, d);
-    }
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
@@ -1624,10 +1273,19 @@ private:
         return nullptr;
     }
 
-    size_t rerot_private_batch_size(const server_slot &) const {
-        // Recurrent PRIVATE spans require a state commit between logical
-        // timesteps. Batch equal frontiers across Lanes, never time within one.
-        return 1;
+    size_t rerot_private_batch_size(const server_slot & slot) const {
+        if (!ctx_tgt ||
+            !server_rerot_private_microbatch(slot.rerot_injection) ||
+            slot.rerot_injection_cursor >= slot.rerot_injection_tokens.size()) {
+            return 1;
+        }
+        const size_t fair_batch_capacity = std::max<size_t>(
+            1, llama_n_batch(ctx_tgt) / std::max<size_t>(1, slots.size()));
+        return std::min({
+            slot.rerot_injection_tokens.size() - slot.rerot_injection_cursor,
+            SERVER_REROT_PRIVATE_BATCH,
+            fair_batch_capacity,
+        });
     }
 
     void rerot_emit_reasoning_lines(
@@ -1868,12 +1526,17 @@ private:
         return std::string(server_rerot_planner_prompt());
     }
 
+    std::string rerot_worker_control_prompt(
+            std::string_view,
+            std::string_view) const {
+        return "\n仅用一句完整事实回答上方标题，不写标签或元说明，以句号结束：";
+    }
+
     static std::string rerot_serial_resume_prompt(bool child_fence) {
-        // Guide §21.4: "PRIVATE 注入简短的串行继续指令（结合已公开推导完成思考，并按模型原生格式进入回答）"
-        // Phrased in the model's first-person introspective voice to match internal reasoning.
         return child_fence
-            ? "\n各并行章节的推导已经全部完成。现在我综合所有已知分析，直接给出最终完整的回答：\n"
-            : "\n这一部分无需拆分并行。现在我直接给出完整解答：\n";
+            ? "</think>\n"
+            : "\n这个内容块不需要并行。我完成剩余思考，"
+              "现在按照当前模型的原生对话格式给出最终回答。\n";
     }
 
     bool rerot_set_injection(
@@ -1944,23 +1607,11 @@ private:
         }
         return true;
     }
-
     bool rerot_start_root(server_slot & slot) {
         if (!rerot || !ctx_tgt || !slot.task ||
             !slot.task->params.rerot_effective(slot.task->type)) {
             return false;
         }
-
-        // Assert slot internal state is purely clean before starting a new RERoT root
-        GGML_ASSERT(!slot.rerot_internal);
-        GGML_ASSERT(slot.rerot_episode_id == 0);
-        GGML_ASSERT(slot.rerot_node_id == UINT32_MAX);
-        GGML_ASSERT(slot.rerot_injection == server_rerot_injection_kind::none);
-        GGML_ASSERT(slot.rerot_injection_tokens.empty());
-        GGML_ASSERT(!slot.rerot_inflight_plan.has_value());
-        GGML_ASSERT(slot.rerot_inflight_bytes.empty());
-        GGML_ASSERT(slot.rerot_inflight_extra_plans.empty());
-        GGML_ASSERT(slot.rerot_inflight_extra_bytes.empty());
 
         server_task root_lane_task = rerot_clone_task(*slot.task);
         root_lane_task.params.sampling.reasoning_budget_start.clear();
@@ -2037,19 +1688,16 @@ private:
         // is the request's normal completion budget bounded by context; queue
         // pressure follows the internal sequence-id arena used by lineages.
         const uint64_t context_limit = std::max<uint64_t>(1, llama_n_ctx(ctx_tgt));
-        // Episode-level hard limits (§20): max_total_tokens bounds the entire episode
-        // against physical context capacity. The client's n_predict applies to the final
-        // serial response stream via process_token, not to the combined sum of all parallel
-        // Lanes plus private markers. Setting episode budget to n_predict prematurely aborts
-        // multi-Lane workloads as soon as the aggregate token count hits the single-stream target.
-        const uint64_t episode_token_budget = context_limit;
+        const uint64_t context_budget = slot.task->params.n_predict > 0
+            ? std::min<uint64_t>(context_limit, slot.task->params.n_predict)
+            : context_limit;
         const uint64_t internal_seq_budget =
             LLAMA_MAX_SEQ > slots.size() ? LLAMA_MAX_SEQ - slots.size() : 1;
         rerot->set_hard_limits(episode_id, {
-            episode_token_budget,
+            context_budget,
             std::max<uint64_t>(64, internal_seq_budget * 16),
             internal_seq_budget,
-            episode_token_budget,
+            context_budget,
         });
 
         auto transport = std::make_unique<rerot_transport_state>(
@@ -2133,9 +1781,7 @@ private:
         const std::string bytes = common_token_to_piece(ctx_tgt, token, true);
 
         std::optional<server_rerot_token_plan> plan;
-        if (forced && slot.rerot_injection == server_rerot_injection_kind::final_fence) {
-            plan = rerot->plan_final_fence_token(slot.rerot_episode_id, slot.rerot_node_id);
-        } else if (forced && server_rerot_private_microbatch(slot.rerot_injection)) {
+        if (forced && server_rerot_private_microbatch(slot.rerot_injection)) {
             auto plans = rerot->plan_private_span(
                 slot.rerot_episode_id,
                 slot.rerot_node_id,
@@ -2176,10 +1822,6 @@ private:
             return false;
         }
 
-        if (!forced && !slot.rerot_serial_tail &&
-            !rerot->track_fence_token(slot.rerot_episode_id, slot.rerot_node_id, *plan, token)) {
-            return false;
-        }
         slot.rerot_inflight_plan = std::move(plan);
         slot.rerot_inflight_bytes = bytes;
         slot.rerot_inflight_forced = forced;
@@ -2226,20 +1868,14 @@ private:
             const auto & plan = i == 0
                 ? *slot.rerot_inflight_plan
                 : slot.rerot_inflight_extra_plans[i - 1];
-            // Capture the forced flag and injection offset before the cursor
-            // advances: each row keeps its exact known interval identity, and
-            // frontier generation rows (not forced) stay distinguishable.
-            const bool row_forced = slot.rerot_inflight_forced;
-            const int32_t inject_offset = row_forced
-                ? (int32_t) slot.rerot_injection_cursor
-                : LLAMA_FLASHPREFILL_POS_UNKNOWN;
-            const llama_token token = row_forced
+            const llama_token token = slot.rerot_inflight_forced
                 ? slot.rerot_injection_tokens.at(slot.rerot_injection_cursor)
                 : slot.sampled;
-            const bool forced_last = row_forced &&
+            const bool forced_last = slot.rerot_inflight_forced &&
                 slot.rerot_injection_cursor + 1 == slot.rerot_injection_tokens.size();
-            const bool needs_logits = !row_forced ||
+            const bool needs_logits = !slot.rerot_inflight_forced ||
                 (forced_last &&
+                 slot.rerot_injection != server_rerot_injection_kind::heading &&
                  slot.rerot_injection != server_rerot_injection_kind::child_open &&
                  slot.rerot_injection != server_rerot_injection_kind::planner);
             const int32_t i_batch = batch.size();
@@ -2249,40 +1885,10 @@ private:
                     "rerot_resource_exhausted: private microbatch capacity");
                 return false;
             }
-            if (fp_enabled) {
-                // Exact known teacher-forced interval: the whole injection was
-                // tokenized up front, so [0, size) is known before the first
-                // frontier commits. Frontier generation rows (row_forced false,
-                // including serial-tail and planner_open generations) use an
-                // unknown boundary and the REROT_FRONTIER dense role — they
-                // are never mistaken for prefill, even when several share a frontier.
-                llama_flashprefill_row row = {};
-                row.version = LLAMA_FLASHPREFILL_ROW_VERSION;
-                row.struct_size = (uint32_t) sizeof(llama_flashprefill_row);
-                row.seq_id = slot.id;
-                row.reader_id = slot.rerot_node_id;
-                if (row_forced) {
-                    row.role = LLAMA_FLASHPREFILL_ROLE_REROT_TEACHER_FORCED;
-                    row.logical_pos = inject_offset;
-                    row.prefill_begin = 0;
-                    row.prefill_end = (int32_t) slot.rerot_injection_tokens.size();
-                    row.prefill_known = true;
-                } else {
-                    row.role = LLAMA_FLASHPREFILL_ROLE_REROT_FRONTIER;
-                    row.logical_pos = LLAMA_FLASHPREFILL_POS_UNKNOWN;
-                    row.prefill_begin = LLAMA_FLASHPREFILL_SEQ_UNKNOWN;
-                    row.prefill_end = LLAMA_FLASHPREFILL_SEQ_UNKNOWN;
-                    row.prefill_known = false;
-                }
-                GGML_ASSERT(llama_flashprefill_validate_row(&row) == LLAMA_FLASHPREFILL_OK);
-                batch.fp_push_row(row);
-            }
 
             slot.i_batch = i_batch;
-            if (slot.rerot_injection != server_rerot_injection_kind::final_fence) {
-                slot.prompt.tokens.push_back(token);
-            }
-            if (row_forced) {
+            slot.prompt.tokens.push_back(token);
+            if (slot.rerot_inflight_forced) {
                 ++slot.rerot_injection_cursor;
             }
         }
@@ -2316,9 +1922,8 @@ private:
         auto transport_it = rerot_transport.find(episode_id);
         auto * episode = rerot ? rerot->episode(episode_id) : nullptr;
         auto * lane = rerot ? rerot->node(episode_id, node_id) : nullptr;
-        const auto * logical = episode ? episode->document.node(node_id) : nullptr;
         if (transport_it == rerot_transport.end() || !episode || !lane ||
-            !logical || lane->physical_slot != slot.id || lane->exec_seq != slot.id) {
+            lane->physical_slot != slot.id || lane->exec_seq != slot.id) {
             return false;
         }
 
@@ -2389,12 +1994,12 @@ private:
         slot.rerot_inflight_forced = false;
         slot.triattention_compressed = transport_it->second->triattention_compressed;
 
-        // The child task enters with the heading directly as its public start.
-        // The first-person introspective contract is injected in worker prompt.
-        if (!rerot_set_injection(
+        const std::string open_marker = lane->control_open();
+        if (open_marker.empty() ||
+            !rerot_set_injection(
                 slot,
-                server_rerot_injection_kind::heading,
-                rerot->heading_text(episode_id, node_id))) {
+                server_rerot_injection_kind::child_open,
+                open_marker + "\n")) {
             return false;
         }
 
@@ -2512,20 +2117,7 @@ private:
         if (rerot) {
             rerot->erase_episode(episode_id);
         }
-        auto transport_it = rerot_transport.find(episode_id);
-        if (transport_it != rerot_transport.end()) {
-            transport_it->second->lineage_tokens.clear();
-            transport_it->second->run_bytes.clear();
-            transport_it->second->run_public_prefixes.clear();
-            rerot_transport.erase(transport_it);
-        }
-        // Ensure any slot still tagged with this episode is thoroughly reset and unreferenced
-        for (auto & slot : slots) {
-            if (slot.rerot_episode_id == episode_id) {
-                slot.prompt_clear();
-                slot.reset();
-            }
-        }
+        rerot_transport.erase(episode_id);
         if (rerot_metrics.episode_active > 0) {
             --rerot_metrics.episode_active;
         }
@@ -2569,20 +2161,6 @@ private:
             slot.rerot_inflight_extra_bytes.size()) {
             rerot->hard_abort(episode_id, "rerot_state_error: private microbatch plan drift");
             return false;
-        }
-
-        if (slot.rerot_injection == server_rerot_injection_kind::final_fence) {
-            if (!slot.rerot_inflight_extra_plans.empty() ||
-                !rerot->commit_final_fence_token(episode_id, node_id, plan)) {
-                rerot->hard_abort(episode_id, "rerot_state_error: invalid fence replay commit");
-                return false;
-            }
-            slot.rerot_inflight_plan.reset();
-            slot.rerot_inflight_bytes.clear();
-            slot.rerot_inflight_forced = false;
-            slot.i_batch = -1;
-            const auto * lane = rerot->node(episode_id, node_id);
-            return lane && (!lane->fence.complete() || rerot_begin_serial_tail(episode_id, node_id));
         }
 
         const auto commit_one = [&](const server_rerot_token_plan & current_plan,
@@ -2676,12 +2254,12 @@ private:
                 return false;
             }
 
+            // A child is already sampled under its exact-close grammar.
+            // Its output may legitimately contain a one-item <ol>; only the
+            // planner parser becomes terminal. Rebuilding here would discard
+            // the child grammar and let its private delimiter become PUBLIC.
             if (!lane->control_id().empty()) {
-                // Explicit child planner decided N=1. Planning is over. The
-                // worker phase uses the owner-specific close grammar again;
-                // the random ID remains the sole child completion delimiter.
-                return rerot_enter_child_worker(
-                    slot, episode_id, node_id, /*direct_admission=*/false);
+                return true;
             }
 
             // The unforked root is the only Lane still sampled under the
@@ -2737,21 +2315,70 @@ private:
                 rerot->hard_abort(episode_id, "rerot_protocol_error: child heading publication failed");
                 return false;
             }
-
-            // Root planning decides the first parallel frontier. Child lanes
-            // then execute their exact assigned task directly. Recursive
-            // planner support stays available in the runtime, but it is not a
-            // mandatory phase: repeatedly feeding the model another planning
-            // grammar creates a planner -> list -> planner feedback loop and
-            // magnifies harmless sampling/numerical differences into topology.
-            // Worker HTML is ordinary content because planner_armed is false.
-            if (!rerot_enter_child_worker(
-                    slot, episode_id, node_id, /*direct_admission=*/true)) {
+            // Admission starts a worker, not a mandatory extra planning wave.
+            // Leave planner_armed intact so a naturally generated <ol> can
+            // still fork at any depth; N=1 remains terminal for that node.
+            server_task lane_task = rerot_clone_task(*slot.task);
+            rerot_remove_planner_grammar(lane_task.params);
+            common_sampler_ptr lane_sampler;
+            try {
+                lane_sampler.reset(common_sampler_init(
+                    model_tgt,
+                    lane_task.params.sampling,
+                    (int32_t) llama_n_ctx(ctx_tgt)));
+            } catch (const std::exception & e) {
                 rerot->hard_abort(
-                    episode_id, "rerot_protocol_error: failed to enter child worker phase");
+                    episode_id,
+                    std::string(
+                        "rerot_sampler_error: failed to configure child sampler: ") +
+                        e.what());
                 return false;
             }
-            rerot_stream_visibility_changed(episode_id, node_id);
+            slot.task = std::make_unique<const server_task>(std::move(lane_task));
+            slot.smpl = std::move(lane_sampler);
+            rerot_bind_sampler(slot);
+
+            if (!rerot_stream_visibility_changed(episode_id, node_id) ||
+                !rerot_set_injection(
+                    slot,
+                    server_rerot_injection_kind::worker,
+                    rerot_worker_control_prompt(
+                        document_node->title, lane->exit_parser.marker()))) {
+                rerot->hard_abort(
+                    episode_id,
+                    "rerot_protocol_error: child control admission failed");
+                return false;
+            }
+        } else if (injection == server_rerot_injection_kind::worker) {
+            const auto * lane = rerot->node(episode_id, node_id);
+            if (!lane || !slot.task) {
+                rerot->hard_abort(
+                    episode_id, "rerot_state_error: child disappeared after control prompt");
+                return false;
+            }
+            server_task child_task = rerot_clone_task(*slot.task);
+            if (!rerot_install_child_grammar(
+                    child_task.params, lane->exit_parser.marker())) {
+                rerot->hard_abort(
+                    episode_id, "rerot_protocol_error: invalid child close grammar");
+                return false;
+            }
+            common_sampler_ptr child_sampler;
+            try {
+                child_sampler.reset(common_sampler_init(
+                    model_tgt,
+                    child_task.params.sampling,
+                    (int32_t) llama_n_ctx(ctx_tgt)));
+            } catch (const std::exception & e) {
+                rerot->hard_abort(
+                    episode_id,
+                    std::string("rerot_sampler_error: failed to arm child close grammar: ") +
+                        e.what());
+                return false;
+            }
+            slot.task = std::make_unique<const server_task>(std::move(child_task));
+            slot.smpl = std::move(child_sampler);
+            rerot_bind_sampler(slot);
         } else if (injection == server_rerot_injection_kind::planner) {
             if (!rerot_set_injection(
                     slot,
@@ -2781,44 +2408,12 @@ private:
             return false;
         }
 
-        if (child_fence && !lane->fence.complete()) {
-            if (!lane->fence.prepared) {
-                std::vector<uint32_t> fence_runs;
-                if (!rerot->refresh_final_fence(episode_id, final_node, &fence_runs) ||
-                    !llama_rerot_refresh_barrier(ctx_tgt, episode_id) ||
-                    !rerot->prepare_final_fence(episode_id, final_node)) {
-                    rerot->hard_abort(episode_id, "rerot_state_error: cannot prepare final acquire fence");
-                    return false;
-                }
-            }
-            // The end-of-batch fence poll can enter here again before the
-            // next row runs. Never rewind the hand or replay cursor twice.
-            if (slot.rerot_injection == server_rerot_injection_kind::final_fence) {
-                return true;
-            }
-            // Replay through the next ordinary server batches. Nested decode
-            // here would destroy other slots' as-yet-unsampled output rows.
-            slot.rerot_injection_tokens.clear();
-            for (const auto & row : lane->fence.rows) {
-                slot.rerot_injection_tokens.push_back(row.token);
-            }
-            slot.rerot_injection_cursor = lane->fence.cursor;
-            slot.rerot_injection = server_rerot_injection_kind::final_fence;
-            slot.i_batch = -1;
-            rerot_note_parallel_end(episode_id, ggml_time_us());
-            SRV_INF("RERoT final fence replay: episode=%" PRIu64 " node=%u rows=%zu\n",
-                episode_id, final_node, lane->fence.rows.size());
-            return true;
-        }
-
         server_task final_task =
             rerot_clone_task(transport_it->second->response_task);
         final_task.params.sampling.reasoning_budget_start.clear();
         final_task.params.sampling.reasoning_budget_end.clear();
         final_task.params.sampling.reasoning_budget_tokens = -1;
         final_task.params.sampling.seed = slot.task->params.sampling.seed;
-        // Restore user original grammar if any (e.g. JSON Schema / tool call grammar)
-        final_task.params.sampling.grammar = transport_it->second->saved_user_grammar;
         common_sampler_ptr final_sampler;
         try {
             final_sampler.reset(common_sampler_init(
@@ -2831,7 +2426,10 @@ private:
         }
 
         if (child_fence) {
-            if (!rerot->complete_serial_tail(episode_id, final_node)) {
+            std::vector<uint32_t> fence_runs;
+            if (!rerot->refresh_final_fence(episode_id, final_node, &fence_runs) ||
+                !llama_rerot_refresh_barrier(ctx_tgt, episode_id) ||
+                !rerot->complete_serial_tail(episode_id, final_node)) {
                 rerot->hard_abort(episode_id, "rerot_state_error: final acquire fence failed");
                 return false;
             }
@@ -2841,11 +2439,21 @@ private:
             return false;
         }
 
-        // Continue the survivor's CURRENT conv / R0-R2 / private overlay.
-        // A fork seed is for admission, not for removing instructions: loading
-        // it here pairs today's brain/KV with an old local causal trajectory,
-        // discards the survivor's work, and can resurrect planner state.
-        // Visibility controls sharing; it is not a reversible state filter.
+        // Child/planner control prompts are PRIVATE causal state. Restore the
+        // fork hand before serial continuation so their instructions cannot
+        // echo into the final answer; PUBLIC branch facts remain in the stable
+        // DDVR view and shared brain established by the acquire fence.
+        llama_memory_t memory = llama_get_memory(ctx_tgt);
+        if (!memory || lane->hand_seed.empty() ||
+            !llama_memory_rerot_apply_hand_seed(
+                memory,
+                lane->exec_seq,
+                lane->hand_seed.data(),
+                lane->hand_seed.size())) {
+            rerot->hard_abort(
+                episode_id, "rerot_state_error: failed to restore final serial hand");
+            return false;
+        }
         rerot_note_parallel_end(episode_id, ggml_time_us());
 
         std::string logical_reasoning =
@@ -2876,6 +2484,7 @@ private:
         std::string response_reasoning = chronological_stream
             ? transport_it->second->streamed_reasoning
             : std::move(logical_reasoning);
+        response_reasoning += "\n\n";
 
         slot.task = std::make_unique<const server_task>(std::move(final_task));
         slot.smpl = std::move(final_sampler);
@@ -2927,12 +2536,6 @@ private:
     }
 
     bool rerot_handle_finished_frontier(uint64_t episode_id) {
-        const auto * before = rerot->episode(episode_id);
-        if (before && before->finalizing && !before->serial_tail) {
-            // The last normal frontier already selected the survivor. Fence
-            // rows are re-evaluations, not more exits/frontiers/public writes.
-            return !before->hard_aborted;
-        }
         auto result = rerot->finish_frontier(episode_id);
         ++rerot_metrics.frontiers;
         if (result.topology_barrier) {
@@ -3071,34 +2674,6 @@ private:
             return false;
         }
 
-        // Explicit diagnostic only: distinguish raw model collapse/nonfinite
-        // logits from grammar-induced choices. Never change sampling here.
-        static const bool audit_logits = std::getenv("LLAMA_REROT_AUDIT") != nullptr;
-        llama_token raw_top = LLAMA_TOKEN_NULL;
-        float raw_max = -INFINITY;
-        float raw_min = INFINITY;
-        uint32_t nonfinite = 0;
-        uint64_t raw_hash = 1469598103934665603ULL;
-        const bool audit_row = audit_logits && (slot.n_decoded < 128 || slot.n_decoded % 256 == 0);
-        if (audit_row) {
-            const float * logits = llama_get_logits_ith(slot.ctx_tgt, tok_idx);
-            const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-            for (int32_t i = 0; i < n_vocab; ++i) {
-                const float value = logits[i];
-                uint32_t bits;
-                std::memcpy(&bits, &value, sizeof(bits));
-                raw_hash = (raw_hash ^ bits) * 1099511628211ULL;
-                if (!std::isfinite(value)) {
-                    ++nonfinite;
-                    continue;
-                }
-                raw_min = std::min(raw_min, value);
-                if (value > raw_max) {
-                    raw_max = value;
-                    raw_top = i;
-                }
-            }
-        }
         llama_token id;
         {
             scoped_timer timer(t_sampl, n_sampl);
@@ -3106,11 +2681,6 @@ private:
                 slot.smpl.get(), slot.ctx_tgt, tok_idx,
                 /* grammar_first = */ false,
                 /* synchronize = */ false);
-        }
-        if (audit_row) {
-            SRV_INF("rerot.audit.logits episode=%" PRIu64 " node=%u slot=%d step=%d row=%d raw_top=%d sampled=%d min=%g max=%g nonfinite=%u hash=%016" PRIx64 "\n",
-                slot.rerot_episode_id, slot.rerot_node_id, slot.id, slot.n_decoded, tok_idx,
-                raw_top, id, raw_min, raw_max, nonfinite, raw_hash);
         }
         if (slot.task && slot.task->params.rerot_trace) {
             const std::string line = string_format(
@@ -3183,8 +2753,9 @@ private:
         slot.print_timings();
         send_final_response(slot);
         metrics.on_prediction(slot);
-        slot.release();
         rerot_erase_episode(episode_id);
+        slot.prompt.clear();
+        slot.release();
         rerot_start_next_waiting_root();
         return true;
     }
@@ -3211,8 +2782,10 @@ private:
         return true;
     }
 
-    // Submission barrier only. Final-child numerical refresh is the explicit
-    // checkpoint/replay path above; synchronize alone does not refresh logits.
+    // Topology-barrier refresh trigger (§17): after a frontier commits with a
+    // topology change, re-observe stable shared memory via a read-only
+    // context refresh (no public token write; recurrent checkpoint/restore
+    // handled inside llama_rerot_refresh_barrier when needed).
     void rerot_on_topology_barrier(bool barrier, uint64_t episode_id = 0) {
         if (!rerot || !barrier || ctx_tgt == nullptr) {
             return;
@@ -3593,32 +3166,6 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        if (const char * ablation = std::getenv("LLAMA_REROT_RBB_ABLATION")) {
-            if (std::strcmp(ablation, "local-state") != 0 &&
-                std::strcmp(ablation, "shared-rbb") != 0 &&
-                std::strcmp(ablation, "raw-redundant") != 0) {
-                SRV_ERR("invalid RERoT research ablation: %s\n", ablation);
-                return false;
-            }
-            SRV_WRN("RERoT RESEARCH ABLATION=%s; not the production block contract\n", ablation);
-        }
-        if (std::getenv("LLAMA_REROT_CHILD_CONTRACT") != nullptr) {
-            SRV_WRN("%s", "RERoT RESEARCH: explicit private child scope/termination contract enabled\n");
-        }
-        if (std::getenv("LLAMA_REROT_ANCESTORS_ONLY") != nullptr) {
-            SRV_WRN("%s", "RERoT research control: peer lexical KV excluded; not a release configuration\n");
-        }
-        if (std::getenv("LLAMA_REROT_AUDIT") != nullptr) {
-            if (params_base.cb_eval != nullptr && params_base.cb_eval != server_rerot_audit::observe) {
-                SRV_ERR("%s", "RERoT audit cannot replace an existing evaluation callback\n");
-                return false;
-            }
-            rerot_audit.seen.clear();
-            rerot_audit.blocks = 0;
-            params_base.cb_eval = server_rerot_audit::observe;
-            params_base.cb_eval_user_data = &rerot_audit;
-            SRV_WRN("%s", "RERoT read-only activation/logit audit enabled; not a performance measurement\n");
-        }
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
@@ -3631,34 +3178,6 @@ private:
 
         if (ctx_tgt == nullptr) {
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
-            return false;
-        }
-
-        // FlashPrefill: adopt the context policy as the single source of truth
-        // (ConfigIntegration plumbed params_base.flashprefill through
-        // common_context_params_to_llama; the context strict-validated it at
-        // creation). fp_enabled gates the sidecar; OFF (default) keeps every
-        // path byte-identical to baseline. The live-context fingerprint is the
-        // policy identity for RAM-cache and slot-file isolation below (never a
-        // bare diagnostic: mismatched stores are rejected, not just counted).
-        fp_config = params_base.flashprefill;
-        fp_enabled = llama_flashprefill_is_enabled(&fp_config);
-        fp_current_fingerprint = llama_flashprefill_policy_fingerprint(ctx_tgt);
-        fp_has_policy = (fp_current_fingerprint != 0);
-        // Authoritative store identity (StatePolicy core key): stamped from
-        // the live context alongside the fingerprint and retired on every
-        // effective adapter mutation. OFF keeps key 0 (legacy path, no
-        // isolation identity needed).
-        fp_current_state_key = llama_flashprefill_state_cache_key(ctx_tgt);
-        fp_has_state_key = (fp_current_state_key != 0);
-        metrics.fp_policy_fingerprint = fp_current_fingerprint;
-        metrics.fp_has_policy = fp_has_policy;
-        if (fp_enabled && !fp_has_policy) {
-            SRV_ERR("%s", "flashprefill enabled but policy fingerprint unavailable\n");
-            return false;
-        }
-        if (fp_enabled && !fp_has_state_key) {
-            SRV_ERR("%s", "flashprefill enabled but state cache key unavailable (no context serial or adapter identity)\n");
             return false;
         }
 
@@ -4542,6 +4061,17 @@ private:
     bool ensure_next_kv_capacity() {
         kv_batch_limit = UINT32_MAX;
 
+        // XKV maintenance runs inside the loop below, after admission and
+        // required cells are known (fill-first): sealing a full segment while
+        // hot slots remain would violate Tri fill-first. OFF: zero change.
+        llama_memory_maintenance_status xkv_maintain_status = LLAMA_MEMORY_MAINTENANCE_NO_ACTION;
+        int xkv_maintain_attempts = 0;
+        bool xkv_tri_allowed = true;
+        // Checked progress: hot_free before the last maintain, to detect
+        // unchanged (no-progress) maintenance and fall through to Tri.
+        uint32_t xkv_last_hot_free = 0;
+        bool xkv_have_last_hot = false;
+
         if (!params_base.kv_unified || params_base.n_ctx_kv == 0) {
             return true;
         }
@@ -4551,6 +4081,48 @@ private:
         // reason once per planner invocation rather than once per loop pass.
         bool counted_kv_fallback = false;
         bool counted_recurrent_fallback = false;
+
+        // Combined XKV admission across the resident attention memories.
+        // The batch must fit every memory it runs on (target + split draft
+        // context): the combined token/hot bound is the tighter side, the
+        // new-sequence gate is the OR. Querying only the target over-admits
+        // whenever the draft memory is the tighter one. Recurrent-only
+        // memories bypass (attention domain only).
+        struct xkv_admission_pair {
+            llama_memory_admission_snapshot tgt = {};
+            llama_memory_admission_snapshot dft = {};
+            llama_memory_admission_snapshot combined = {};
+            bool have_tgt = false;
+            bool have_dft = false;
+            bool have_combined = false;
+        };
+        auto query_xkv_admission = [&](llama_memory_t mem_t, llama_memory_t mem_d,
+                bool has_t, bool has_d) {
+            xkv_admission_pair out;
+            if (!llama_xkv_is_enabled(params_base.xkv_mode) || (!has_t && !has_d)) {
+                return out;
+            }
+            out.have_tgt = has_t && mem_t &&
+                llama_memory_get_admission_snapshot(mem_t, &out.tgt);
+            out.have_dft = has_d && mem_d && mem_d != mem_t &&
+                llama_memory_get_admission_snapshot(mem_d, &out.dft);
+            if (out.have_tgt && out.have_dft) {
+                out.combined = out.tgt.safe_next_ubatch <= out.dft.safe_next_ubatch
+                    ? out.tgt : out.dft;
+                out.combined.hot_free =
+                    std::min(out.tgt.hot_free, out.dft.hot_free);
+                out.combined.recurrent_blocks_new_seq =
+                    out.tgt.recurrent_blocks_new_seq || out.dft.recurrent_blocks_new_seq;
+                out.have_combined = true;
+            } else if (out.have_tgt) {
+                out.combined = out.tgt;
+                out.have_combined = true;
+            } else if (out.have_dft) {
+                out.combined = out.dft;
+                out.have_combined = true;
+            }
+            return out;
+        };
 
         while (true) {
             llama_memory_kv_usage usage_tgt = {};
@@ -4577,15 +4149,130 @@ private:
             const uint64_t available_recurrent_tgt = has_recurrent_tgt ? usage_recurrent_tgt.capacity - std::min(usage_recurrent_tgt.capacity, usage_recurrent_tgt.used) : UINT64_MAX;
             const uint64_t available_recurrent_dft = has_recurrent_dft ? usage_recurrent_dft.capacity - std::min(usage_recurrent_dft.capacity, usage_recurrent_dft.used) : UINT64_MAX;
 
-            const bool kv_pressure = required_kv > available_tgt || required_kv > available_dft;
-            const bool recurrent_pressure = required_recurrent_tgt > available_recurrent_tgt ||
-                                            required_recurrent_dft > available_recurrent_dft;
-            const uint32_t kv_deficit_tgt = has_tgt_usage && required_kv > available_tgt
+            bool kv_pressure = required_kv > available_tgt || required_kv > available_dft;
+            bool recurrent_pressure = required_recurrent_tgt > available_recurrent_tgt ||
+                                        required_recurrent_dft > available_recurrent_dft;
+
+            // Combined target + draft admission: the batch must fit each
+            // resident attention memory. Recurrent sequence slots never enter
+            // the token minimum; each memory gates only its own new-sequence
+            // demand, while continuation batches on full recurrent slots stay
+            // valid.
+            xkv_admission_pair xkv_adm =
+                query_xkv_admission(mem_tgt, mem_dft, has_tgt_usage, has_dft_usage);
+            llama_memory_admission_snapshot xkv_snap = xkv_adm.combined;
+            bool have_xkv_snap = xkv_adm.have_combined;
+            if ((xkv_adm.have_tgt && required_recurrent_tgt > 0 &&
+                    xkv_adm.tgt.recurrent_blocks_new_seq) ||
+                (xkv_adm.have_dft && required_recurrent_dft > 0 &&
+                    xkv_adm.dft.recurrent_blocks_new_seq)) {
+                recurrent_pressure = true;
+            }
+            // Fill-first XKV maintenance: sealing runs only when hot slots
+            // cannot cover the upcoming batch (SHADOW evaluate-only always
+            // runs). After maintenance the snapshot is re-queried fresh;
+            // PROGRESS re-plans and maintains again only if still
+            // insufficient; RETRY_STALE bounded-retries with a fresh snapshot
+            // instead of skipping into a zero-bound error.
+            if (llama_xkv_is_enabled(params_base.xkv_mode)) {
+                const bool is_shadow = params_base.xkv_mode == LLAMA_XKV_MODE_SHADOW;
+                // Deficit-derived bound (no fixed constant): seals ~one
+                // segment per run, so allow ceil(deficit/seg) + domains.
+                const uint64_t xkv_max = server_task_result_metrics::xkv_maintain_max_attempts(
+                    true, have_xkv_snap,
+                    have_xkv_snap ? xkv_snap.hot_free : 0, have_xkv_snap ? xkv_snap.hot_capacity : 0,
+                    required_kv, params_base.xkv_segment_tokens);
+                // Unchanged maintenance (PROGRESS with identical hot_free and
+                // still insufficient) is not progress: stop and fall through.
+                const bool xkv_unchanged =
+                    xkv_have_last_hot && have_xkv_snap && xkv_snap.hot_free == xkv_last_hot_free &&
+                    xkv_snap.hot_free < required_kv;
+                if (!xkv_unchanged &&
+                    (server_task_result_metrics::xkv_should_maintain(true, is_shadow, have_xkv_snap,
+                         have_xkv_snap ? xkv_snap.hot_free : 0, required_kv,
+                         (uint64_t) xkv_maintain_attempts, xkv_max) ||
+                     (xkv_maintain_status == LLAMA_MEMORY_MAINTENANCE_RETRY_STALE &&
+                      (uint64_t) xkv_maintain_attempts < xkv_max))) {
+                    xkv_maintain_attempts++;
+                    if (have_xkv_snap) {
+                        xkv_last_hot_free = xkv_snap.hot_free;
+                        xkv_have_last_hot = true;
+                    }
+                    auto run_maintain = [](llama_memory_t m) {
+                        return m ? llama_memory_maintain_safe_boundary(m)
+                                 : LLAMA_MEMORY_MAINTENANCE_NO_ACTION;
+                    };
+                    auto st = run_maintain(has_tgt_usage ? mem_tgt : nullptr);
+                    if (mem_dft && mem_dft != mem_tgt) {
+                        const auto st_dft = run_maintain(has_dft_usage ? mem_dft : nullptr);
+                        if (st_dft == LLAMA_MEMORY_MAINTENANCE_ERROR ||
+                            st == LLAMA_MEMORY_MAINTENANCE_ERROR) {
+                            st = LLAMA_MEMORY_MAINTENANCE_ERROR;
+                        } else if (st_dft == LLAMA_MEMORY_MAINTENANCE_PROGRESS ||
+                                   st == LLAMA_MEMORY_MAINTENANCE_PROGRESS) {
+                            st = LLAMA_MEMORY_MAINTENANCE_PROGRESS;
+                        } else if (st_dft == LLAMA_MEMORY_MAINTENANCE_RETRY_STALE ||
+                                   st == LLAMA_MEMORY_MAINTENANCE_RETRY_STALE) {
+                            st = LLAMA_MEMORY_MAINTENANCE_RETRY_STALE;
+                        } else if (!(st_dft == LLAMA_MEMORY_MAINTENANCE_FLOOR_EXHAUSTED &&
+                                     st == LLAMA_MEMORY_MAINTENANCE_FLOOR_EXHAUSTED)) {
+                            st = LLAMA_MEMORY_MAINTENANCE_NO_ACTION;
+                        }
+                    }
+                    xkv_maintain_status = st;
+                    if (st == LLAMA_MEMORY_MAINTENANCE_ERROR) {
+                        SRV_ERR("%s", "XKV safe-boundary maintenance failed; refusing decode rather than masking the failure\n");
+                        const int32_t err_id = id_slot_protected >= 0 ? id_slot_protected : id_slot_prefill;
+                        if (err_id >= 0) {
+                            if (server_slot * err_slot = get_slot_by_id(err_id)) {
+                                if (err_slot->is_processing()) {
+                                    send_error(*err_slot, "XKV maintenance failed (codec/workspace); cannot proceed safely");
+                                    err_slot->release();
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                    // Fresh snapshot after maintenance for the replan below.
+                    if (has_tgt_usage || has_dft_usage) {
+                        xkv_adm = query_xkv_admission(mem_tgt, mem_dft, has_tgt_usage, has_dft_usage);
+                        xkv_snap = xkv_adm.combined;
+                        have_xkv_snap = xkv_adm.have_combined;
+                    }
+                    if (st == LLAMA_MEMORY_MAINTENANCE_RETRY_STALE ||
+                        st == LLAMA_MEMORY_MAINTENANCE_PROGRESS) {
+                        continue; // replan against the fresh snapshot (bounded above)
+                    }
+                }
+            }
+            xkv_tri_allowed = !llama_xkv_is_enabled(params_base.xkv_mode) ||
+                xkv_maintain_status == LLAMA_MEMORY_MAINTENANCE_NO_ACTION ||
+                xkv_maintain_status == LLAMA_MEMORY_MAINTENANCE_FLOOR_EXHAUSTED;
+            uint32_t kv_deficit_tgt = has_tgt_usage && required_kv > available_tgt
                 ? (uint32_t) std::min<uint64_t>(UINT32_MAX, (uint64_t) required_kv - available_tgt)
                 : 0;
-            const uint32_t kv_deficit_dft = has_dft_usage && required_kv > available_dft
+            // XKV hot pressure (bounded hot): logical capacity stays huge while
+            // physical hot slots exhaust, so the hot deficit from the fresh
+            // snapshot joins overall KV pressure, deficit, Tri trigger, floor
+            // logging/counters, fallback, and batch limiting. Each memory sizes
+            // its own Tri reclaim request; legacy logical capacity is never
+            // conflated: only XKV hot deficits.
+            if (xkv_adm.have_tgt && required_kv > xkv_adm.tgt.hot_free) {
+                kv_pressure = true;
+                const uint64_t hot_d = (uint64_t) required_kv - xkv_adm.tgt.hot_free;
+                const uint32_t hot_deficit =
+                    (uint32_t) std::min<uint64_t>(hot_d, UINT32_MAX);
+                kv_deficit_tgt = std::max(kv_deficit_tgt, hot_deficit);
+            }
+            uint32_t kv_deficit_dft = has_dft_usage && required_kv > available_dft
                 ? (uint32_t) std::min<uint64_t>(UINT32_MAX, (uint64_t) required_kv - available_dft)
                 : 0;
+            if (xkv_adm.have_dft && required_kv > xkv_adm.dft.hot_free) {
+                kv_pressure = true;
+                const uint64_t hot_d = (uint64_t) required_kv - xkv_adm.dft.hot_free;
+                kv_deficit_dft = std::max(kv_deficit_dft,
+                    (uint32_t) std::min<uint64_t>(hot_d, UINT32_MAX));
+            }
 
             bool tri_maintenance_due = false;
             if (params_base.triattention_enabled && !kv_pressure) {
@@ -4637,7 +4324,10 @@ private:
 
             // TriAttention only reclaims KV. Recurrent-only pressure must go directly
             // to the existing recurrent fallback path.
-            if (params_base.triattention_enabled && (kv_pressure || tri_maintenance_due)) {
+            // XKV: Tri/atomic runs only on confirmed floor/no-action; a new
+            // sequence blocked on recurrent slots goes to the recurrent
+            // victim path below without Tri (Tri reclaims KV, not recurrent).
+            if (params_base.triattention_enabled && xkv_tri_allowed && (kv_pressure || tri_maintenance_due)) {
                 // Initial pressure drains every resident sequence. Maintenance only
                 // touches sequences that have already entered compressed mode.
                 std::vector<llama_memory_kv_reclaim_seq_hint> seq_hints;
@@ -4699,42 +4389,8 @@ private:
 
                 // Context-level reclaim synchronizes pending compute before any
                 // physical K/V movement and invalidates graph reservations after.
-                auto results = server_triattention_reclaim_pair(
-                    has_dft_usage && mem_dft != mem_tgt,
-                    [&]() {
-                        // A separate context may still read shared target K/V
-                        // (assistant views). Fence it before target movement.
-                        if (ctx_dft) {
-                            llama_synchronize(ctx_dft);
-                        }
-                        return llama_context_reclaim_kv(ctx_tgt, &req);
-                    },
-                    [&]() {
-                        llama_memory_kv_reclaim_request req_dft = req;
-                        req_dft.required_free = kv_deficit_dft;
-                        req_dft.seq_hints.clear();
-                        // Drafts own physical execution slots, not the target
-                        // episode's archive/parked sequence namespace.
-                        for (const auto & slot : slots) {
-                            if (slot.prompt.n_tokens() == 0 ||
-                                (!kv_pressure && !slot.triattention_compressed) ||
-                                llama_memory_seq_get_kv_used(mem_dft, slot.id) == 0) {
-                                continue;
-                            }
-                            llama_memory_kv_reclaim_seq_hint hint{};
-                            hint.seq_id = slot.id;
-                            hint.logical_tokens = (uint32_t) slot.prompt.n_tokens();
-                            hint.tail_guard = 128;
-                            hint.eligible = true;
-                            req_dft.seq_hints.push_back(hint);
-                        }
-                        return req_dft.seq_hints.empty() ? llama_memory_kv_reclaim_result{} :
-                            llama_context_reclaim_kv(ctx_dft, &req_dft);
-                    });
-                const auto & result_tgt = results.first;
-                const auto & result_dft = results.second;
-                if ((result_tgt.supported && result_tgt.changed) ||
-                    (result_dft.supported && result_dft.changed)) {
+                auto result_tgt = llama_context_reclaim_kv(ctx_tgt, &req);
+                if (result_tgt.supported && result_tgt.changed) {
                     if (kv_pressure) {
                         tri_drain_count++;
                     } else {
@@ -4793,9 +4449,17 @@ private:
                         }
                     }
 
-                    tri_cells_freed_total += result_dft.physical_freed;
-                    tri_score_us_total    += result_dft.score_us;
-                    tri_pack_us_total     += result_dft.pack_us;
+                    // Also reclaim on draft if separate
+                    if (has_dft_usage && mem_dft != mem_tgt) {
+                        llama_memory_kv_reclaim_request req_dft = req;
+                        req_dft.required_free = kv_deficit_dft;
+                        auto result_dft = llama_context_reclaim_kv(ctx_dft, &req_dft);
+                        if (result_dft.supported && result_dft.changed) {
+                            tri_cells_freed_total += result_dft.physical_freed;
+                            tri_score_us_total    += result_dft.score_us;
+                            tri_pack_us_total     += result_dft.pack_us;
+                        }
+                    }
                     // Re-check capacity by continuing the while loop
                     continue;
                 }
@@ -4845,6 +4509,54 @@ private:
                     if (kv_batch_limit > 0) {
                         SRV_INF("KV floor exhausted during prefill; limiting next batch to %u cells\n", kv_batch_limit);
                     }
+                }
+                // XKV admission (snapshot taken above): tighten the next batch
+                // to the live token bound. A zero bound with a real reason
+                // means do NOT decode — with no preemption victim left, error
+                // the protected prefill slot instead of clamping to one cell.
+                // Only an unknown snapshot (NONE) defers to the legacy size.
+                // Recurrent gating needs no batch tightening: continuation
+                // batches proceed, and a blocked new sequence with no victim
+                // takes the same no-decode error path here.
+                if (have_xkv_snap && xkv_snap.limit_reason != LLAMA_MEMORY_LIMIT_NONE) {
+                    if (xkv_snap.safe_next_ubatch == 0) {
+                        SRV_ERR("XKV admission exhausted (%s); refusing decode\n",
+                            llama_memory_limit_reason_name(xkv_snap.limit_reason));
+                        if (id_slot_protected >= 0) {
+                            if (server_slot * stuck = get_slot_by_id(id_slot_protected)) {
+                                if (stuck->is_processing()) {
+                                    send_error(*stuck, "Context size has been exceeded.");
+                                    stuck->release();
+                                }
+                            }
+                        }
+                        return false;
+                    }
+                    const uint32_t cap = (uint32_t) std::min<uint64_t>(
+                        xkv_snap.safe_next_ubatch, (uint64_t) llama_n_batch(ctx_tgt));
+                    if (cap < kv_batch_limit) {
+                        kv_batch_limit = cap;
+                        SRV_INF("XKV admission (%s): limiting next batch to %u cells\n",
+                            llama_memory_limit_reason_name(xkv_snap.limit_reason), kv_batch_limit);
+                }
+                }
+                // Per-memory gate (matches the pressure planning above): a new
+                // sequence blocked on either memory with no victim left refuses
+                // decode instead of clamping to one cell.
+                if ((xkv_adm.have_tgt && required_recurrent_tgt > 0 &&
+                        xkv_adm.tgt.recurrent_blocks_new_seq) ||
+                    (xkv_adm.have_dft && required_recurrent_dft > 0 &&
+                        xkv_adm.dft.recurrent_blocks_new_seq)) {
+                    SRV_ERR("%s", "XKV recurrent admission: no free recurrent slot for the new sequence\n");
+                    if (id_slot_protected >= 0) {
+                        if (server_slot * stuck = get_slot_by_id(id_slot_protected)) {
+                            if (stuck->is_processing()) {
+                                send_error(*stuck, "Context size has been exceeded.");
+                                stuck->release();
+                            }
+                        }
+                    }
+                    return false;
                 }
                 return true;
             }
@@ -5831,38 +5543,237 @@ private:
                     res->tri_hard_keep          = tri_hard_keep;
                     res->tri_shared_keep        = tri_shared_keep;
 
-                    // FlashPrefill (MetricsIntegration owner for the GPU
-                    // totals; ServerRouting owner for eligible/dense/policy).
-                    // Successful-only cumulative totals; all zero while OFF.
-                    res->fp_sparse_rows            = metrics.fp_gpu.sparse_rows;
-                    res->fp_dense_packed           = metrics.fp_gpu.dense_packed;
-                    for (int i = 0; i < 10; ++i) {
-                        res->fp_dense_rows[i] = metrics.fp_gpu.dense_rows[i];
+                    // XKV admission snapshot (enabled only). Store/runtime
+                    // counters stay zero until the XKV runtime fills them;
+                    // OFF leaves res->xkv empty so the schema is unchanged.
+                    if (llama_xkv_is_enabled(params_base.xkv_mode)) {
+                        llama_memory_admission_snapshot snap = {};
+                        llama_memory_t mem_metrics = ctx_tgt ? llama_get_memory(ctx_tgt) : nullptr;
+                        if (mem_metrics && llama_memory_get_admission_snapshot(mem_metrics, &snap)) {
+                            auto & xm = res->xkv;
+                            xm.has_admission = true;
+                            xm.safe_next_ubatch = snap.safe_next_ubatch;
+                            xm.limit_reason = llama_memory_limit_reason_name(snap.limit_reason);
+                            xm.logical_capacity = snap.logical_capacity;
+                            xm.logical_used = snap.logical_used;
+                            xm.hot_capacity = snap.hot_capacity;
+                            xm.hot_used = snap.hot_used;
+                            xm.hot_free = snap.hot_free;
+                            xm.hot_reserved = snap.hot_reserved;
+                            xm.factor_live_bytes = snap.factor_live_bytes;
+                            xm.factor_reserved_bytes = snap.factor_reserved_bytes;
+                            xm.factor_budget_bytes = snap.factor_budget_bytes;
+                            xm.factor_free_bytes = snap.factor_free_bytes;
+                            xm.factor_safe_tokens = snap.factor_safe_tokens;
+                            xm.workspace_live_bytes = snap.workspace_live_bytes;
+                            xm.workspace_peak_bytes = snap.workspace_peak_bytes;
+                            xm.workspace_budget_bytes = snap.workspace_budget_bytes;
+                            xm.workspace_free_bytes = snap.workspace_free_bytes;
+                            xm.workspace_safe_tokens = snap.workspace_safe_tokens;
+                            xm.recurrent_capacity = snap.recurrent_capacity;
+                            xm.recurrent_used = snap.recurrent_used;
+                            xm.requested_profile = llama_xkv_storage_profile_name(params_base.xkv_storage_profile);
+                            xm.requested_mode = llama_xkv_mode_name(params_base.xkv_mode);
+                            xm.requested_a_k = ggml_type_name(params_base.xkv_factor_a_k);
+                            xm.requested_b_k = ggml_type_name(params_base.xkv_factor_b_k);
+                            xm.requested_a_v = ggml_type_name(params_base.xkv_factor_a_v);
+                            xm.requested_b_v = ggml_type_name(params_base.xkv_factor_b_v);
+                            xm.requested_landmark = ggml_type_name(params_base.xkv_landmark_type);
+                            xm.requested_factorizer = llama_xkv_factorizer_name(params_base.xkv_factorizer);
+                            xm.requested_balance = llama_xkv_factor_balance_name(params_base.xkv_factor_balance);
+                            {
+                                std::ostringstream s;
+                                s << "0x" << std::hex << std::nouppercase << std::setw(16) << std::setfill('0') << params_base.xkv_seed;
+                                xm.requested_seed = s.str();
+                            }
+                            {
+                                // Canonical landmark codec table seed (777). No CLI
+                                // override exists; the seal path uses this default
+                                // verbatim, so requested == effective constant.
+                                std::ostringstream s_lm;
+                                s_lm << "0x" << std::hex << std::nouppercase << std::setw(16) << std::setfill('0') << (uint64_t) 777;
+                                xm.requested_landmark_seed = s_lm.str();
+                            }
+                            if (std::fabs(params_base.triattention_ratio - (3.0 / 32.0)) < 1e-6) {
+                                xm.tri_ratio_str = "3/32";
+                            } else {
+                                std::ostringstream s_ratio;
+                                s_ratio << params_base.triattention_ratio;
+                                xm.tri_ratio_str = s_ratio.str();
+                            }
+                            xm.tri_recent_window = 128;
+                            if (model_tgt != nullptr) {
+                                uint8_t msha[32] = {};
+                                if (llama_model_source_artifact_sha256(model_tgt, msha)) {
+                                    std::ostringstream ss;
+                                    for (int i = 0; i < 32; ++i) {
+                                        ss << std::hex << std::nouppercase << std::setw(2) << std::setfill('0') << (int) msha[i];
+                                    }
+                                    xm.model_sha256 = ss.str();
+                                }
+                            }
+                            // Requested profile is the request; effective config comes
+                            // ONLY from the observed runtime snapshot when armed.
+                            // Missing/failed runtime => not_evaluated (fields stay
+                            // zero), never a copy of the request.
+                            llama_memory_xkv_runtime_snapshot rsnap = {};
+                            // Zero-init contract: the filler sets struct_size and
+                            // version; anything else is not_evaluated.
+                            // observed marks XKV-enabled with a runtime present even
+                            // when no snapshot is armed yet: ratios/timers then render
+                            // as null/NaN (not_evaluated) instead of 0.0. Fully
+                            // unobserved (OFF) snapshots keep exact all-zero output.
+                            auto & xr0 = res->xkv;
+                            xr0.observed = (mem_metrics != nullptr);
+                            if (mem_metrics && llama_memory_get_xkv_runtime_snapshot(mem_metrics, &rsnap) &&
+                                rsnap.armed && rsnap.version == 1 &&
+                                rsnap.struct_size == sizeof(rsnap)) {
+                                auto & xr = res->xkv;
+                                xr.effective_profile = llama_xkv_storage_profile_name(rsnap.effective_profile);
+                                xr.effective_mode = llama_xkv_mode_name(rsnap.mode);
+                                if (rsnap.codec_a_k >= 0 && rsnap.codec_a_k < GGML_TYPE_COUNT) {
+                                    xr.effective_a_k = ggml_type_name((enum ggml_type) rsnap.codec_a_k);
+                                }
+                                if (rsnap.codec_b_k >= 0 && rsnap.codec_b_k < GGML_TYPE_COUNT) {
+                                    xr.effective_b_k = ggml_type_name((enum ggml_type) rsnap.codec_b_k);
+                                }
+                                if (rsnap.codec_a_v >= 0 && rsnap.codec_a_v < GGML_TYPE_COUNT) {
+                                    xr.effective_a_v = ggml_type_name((enum ggml_type) rsnap.codec_a_v);
+                                }
+                                if (rsnap.codec_b_v >= 0 && rsnap.codec_b_v < GGML_TYPE_COUNT) {
+                                    xr.effective_b_v = ggml_type_name((enum ggml_type) rsnap.codec_b_v);
+                                }
+                                if (rsnap.codec_landmark >= 0 && rsnap.codec_landmark < GGML_TYPE_COUNT) {
+                                    xr.effective_landmark = ggml_type_name((enum ggml_type) rsnap.codec_landmark);
+                                }
+                                if (rsnap.codec_factorizer >= 0 && rsnap.codec_factorizer <= (int) LLAMA_XKV_FACTORIZER_CUDA) {
+                                    xr.effective_factorizer = llama_xkv_factorizer_name((enum llama_xkv_factorizer) rsnap.codec_factorizer);
+                                }
+                                if (rsnap.codec_balance >= 0 && rsnap.codec_balance <= (int) LLAMA_XKV_FACTOR_BALANCE_DIAGONAL) {
+                                    xr.effective_balance = llama_xkv_factor_balance_name((enum llama_xkv_factor_balance) rsnap.codec_balance);
+                                }
+                                xr.tri_calibration_fingerprint = rsnap.tri_calibration_fingerprint;
+                                bool has_tri_sha = false;
+                                for (int i = 0; i < 32; ++i) {
+                                    if (rsnap.tri_calibration_sha256[i] != 0) { has_tri_sha = true; break; }
+                                }
+                                if (has_tri_sha) {
+                                    std::ostringstream ss_tsha;
+                                    for (int i = 0; i < 32; ++i) {
+                                        ss_tsha << std::hex << std::nouppercase << std::setw(2) << std::setfill('0') << (int) rsnap.tri_calibration_sha256[i];
+                                    }
+                                    xr.tri_calibration_sha256 = ss_tsha.str();
+                                }
+                                if (std::fabs(rsnap.tri_ratio - (3.0 / 32.0)) < 1e-6) {
+                                    xr.tri_ratio_str = "3/32";
+                                } else if (rsnap.tri_ratio > 0.0) {
+                                    std::ostringstream s_ratio;
+                                    s_ratio << rsnap.tri_ratio;
+                                    xr.tri_ratio_str = s_ratio.str();
+                                }
+                                xr.tri_recent_window = rsnap.tri_recent_window;
+                                xr.tri_scorer_valid = rsnap.tri_scorer_valid;
+                                xr.graph_timings_evaluated = rsnap.graph_timings_evaluated;
+                                xr.pack_timer_evaluated = rsnap.pack_timer_evaluated;
+                                xr.sr_counters_evaluated = rsnap.sr_counters_evaluated;
+                                xr.spec_counters_evaluated = rsnap.spec_counters_evaluated;
+                                {
+                                    std::ostringstream s_eff_seed;
+                                    s_eff_seed << "0x" << std::hex << std::nouppercase << std::setw(16) << std::setfill('0') << rsnap.factor_seed;
+                                    xr.effective_seed = s_eff_seed.str();
+                                }
+                                {
+                                    std::ostringstream s_eff_lm;
+                                    s_eff_lm << "0x" << std::hex << std::nouppercase << std::setw(16) << std::setfill('0') << (uint64_t) 777;
+                                    xr.effective_landmark_seed = s_eff_lm.str();
+                                }
+                                xr.compression_goal_evaluated = rsnap.compression_goal_evaluated;
+                                xr.source = llama_xkv_source_name(rsnap.source);
+                                xr.rank_k = rsnap.rank_k;
+                                xr.rank_v = rsnap.rank_v;
+                                xr.factor_streams = rsnap.factor_streams;
+                                xr.codec_fingerprint = rsnap.codec_fingerprint;
+                                xr.backend_fingerprint = rsnap.backend_fingerprint;
+                                xr.source_fingerprint = rsnap.source_fingerprint;
+                                xr.profile_fingerprint = rsnap.profile_fingerprint;
+                                xr.config_fingerprint = rsnap.profile_fingerprint;
+                                xr.actual_bytes = rsnap.factor_payload_bytes + rsnap.landmark_payload_bytes;
+                                xr.nominal_bytes = rsnap.baseline_covered_bytes;
+                                xr.hot_bytes = rsnap.hot_bytes;
+                                xr.flat_bytes = rsnap.flat_bytes;
+                                xr.factor_ak_bytes = rsnap.factor_ak_bytes;
+                                xr.factor_bk_bytes = rsnap.factor_bk_bytes;
+                                xr.factor_av_bytes = rsnap.factor_av_bytes;
+                                xr.factor_bv_bytes = rsnap.factor_bv_bytes;
+                                xr.factor_payload_bytes = rsnap.factor_payload_bytes;
+                                xr.factor_metadata_bytes = rsnap.factor_metadata_bytes;
+                                xr.factor_padding_bytes = rsnap.factor_padding_bytes;
+                                xr.landmark_payload_bytes = rsnap.landmark_payload_bytes;
+                                xr.landmark_metadata_bytes = rsnap.landmark_metadata_bytes;
+                                xr.landmark_exception_bytes = rsnap.landmark_exception_bytes;
+                                xr.index_bytes = rsnap.index_bytes;
+                                xr.codec_shared_bytes = rsnap.codec_shared_bytes;
+                                xr.decode_tile_cache_bytes = rsnap.decode_tile_cache_bytes;
+                                xr.capture_bytes = rsnap.capture_bytes;
+                                xr.candidate_bytes = rsnap.candidate_bytes;
+                                // No separate staging ring in decoded-hot mode: transient
+                                // staging lives inside the workspace arena / candidate
+                                // scratch, so observed staging is 0 (never inferred).
+                                xr.staging_bytes = 0;
+                                xr.snapshot_pinned_bytes = rsnap.snapshot_pinned_bytes;
+                                xr.allocator_live_bytes = rsnap.allocator_live_bytes;
+                                xr.allocator_reserved_bytes = rsnap.allocator_reserved_bytes;
+                                xr.device_peak_bytes = rsnap.device_peak_bytes;
+                                xr.host_peak_bytes = rsnap.host_peak_bytes;
+                                xr.unique_payloads = rsnap.unique_payloads;
+                                xr.aliased_payloads = rsnap.aliased_payloads;
+                                xr.baseline_same_rows_bytes = rsnap.baseline_covered_bytes;
+                                xr.covered_compressed_bytes = rsnap.covered_compressed_bytes;
+                                xr.factored_baseline_byte_coverage = rsnap.factored_baseline_byte_coverage;
+                                xr.factor_quant_ratio = rsnap.factor_quant_ratio;
+                                xr.net_extra_compression_ratio = rsnap.net_extra_compression_ratio;
+                                xr.net_extra_compression_ratio_reserved = rsnap.net_extra_compression_ratio_reserved;
+                                {
+                                    const uint64_t peak_alloc = rsnap.device_peak_bytes + rsnap.host_peak_bytes;
+                                    xr.net_extra_compression_ratio_peak =
+                                        (rsnap.baseline_covered_bytes > 0 && peak_alloc > 0)
+                                            ? (double) rsnap.baseline_covered_bytes / (double) peak_alloc
+                                            : 0.0;
+                                }
+                                xr.ratios_evaluated = rsnap.ratios_evaluated;
+                                xr.seal_timers_evaluated = rsnap.seal_timers_evaluated;
+                                xr.quant_timers_evaluated = rsnap.quant_timers_evaluated;
+                                xr.seal_seconds = rsnap.seal_seconds;
+                                xr.factor_quant_seconds = rsnap.factor_quant_seconds;
+                                xr.landmark_quant_seconds = rsnap.landmark_quant_seconds;
+                                xr.select_seconds = rsnap.select_seconds;
+                                xr.refine_seconds = rsnap.refine_seconds;
+                                xr.reconstruct_seconds = rsnap.reconstruct_seconds;
+                                xr.read_seconds = rsnap.read_seconds;
+                                xr.pack_seconds = rsnap.pack_seconds;
+                                xr.segments_sealed = rsnap.segments_sealed;
+                                for (int ri = 0; ri < LLAMA_MEMORY_XKV_SKIP_REASON_COUNT; ++ri) {
+                                    const uint64_t c = rsnap.skip_counts[ri];
+                                    if (c > 0) {
+                                        xr.segments_skipped_by_reason[llama_memory_xkv_skip_reason_name(
+                                            (enum llama_memory_xkv_skip_reason) ri)] += c;
+                                    }
+                                }
+                                xr.sr_selected_rows = rsnap.sr_selected_rows;
+                                xr.sr_fragments = rsnap.sr_fragments;
+                                xr.effective_chunk_size = rsnap.effective_chunk_size;
+                                xr.landmark_refine_rows = rsnap.landmark_refine_rows;
+                                xr.landmark_refine_cap_hits = rsnap.landmark_refine_cap_hits;
+                                xr.spec_stale_total = rsnap.spec_stale_total;
+                                xr.transaction_abort_total = rsnap.transaction_abort_total;
+                                xr.synchronize_total = rsnap.synchronize_total;
+                                xr.compression_goal_met = rsnap.compression_goal_met;
+                            }
+                            if (snap.limit_reason != LLAMA_MEMORY_LIMIT_NONE) {
+                                xm.throttle_reason = xm.limit_reason;
+                            }
+                        }
                     }
-                    res->fp_selected_blocks        = metrics.fp_gpu.selected_blocks;
-                    res->fp_corrected_blocks       = metrics.fp_gpu.corrected_blocks;
-                    res->fp_visible_tokens         = metrics.fp_gpu.visible_tokens;
-                    res->fp_exact_tokens           = metrics.fp_gpu.exact_tokens;
-                    for (int i = 0; i < 2; ++i) {
-                        res->fp_pool_rebuild[i] = metrics.fp_gpu.pool_rebuild[i];
-                    }
-                    for (int i = 0; i < 3; ++i) {
-                        res->fp_plan_invalidations[i] = metrics.fp_gpu.plan_invalidations[i];
-                    }
-                    res->fp_scratch_live_bytes     = metrics.fp_gpu.scratch_live_bytes;
-                    res->fp_scratch_peak_bytes     = metrics.fp_gpu.scratch_peak_bytes;
-                    res->fp_layout_us_total        = metrics.fp_gpu.layout_us_total;
-                    res->fp_layout_slices_measured = metrics.fp_gpu.layout_slices_measured;
-                    res->fp_gpu_pool_us_total      = metrics.fp_gpu.gpu_pool_us_total;
-                    res->fp_gpu_select_us_total    = metrics.fp_gpu.gpu_select_us_total;
-                    res->fp_gpu_attn_us_total      = metrics.fp_gpu.gpu_attn_us_total;
-                    res->fp_gpu_slices_measured    = metrics.fp_gpu.gpu_slices_measured;
-                    res->fp_eligible_rows          = metrics.fp_eligible_rows;
-                    for (int i = 0; i < 7; ++i) {
-                        res->fp_dense_by_reason[i] = metrics.fp_dense_by_reason[i];
-                    }
-                    res->fp_policy_fingerprint     = metrics.fp_policy_fingerprint;
-                    res->fp_has_policy             = metrics.fp_has_policy;
 
                     if (rerot) {
                         const uint32_t people_cap = params_base.rerot_person_max > 0
@@ -5961,12 +5872,6 @@ private:
                     const size_t token_count = tokens.size();
                     const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
 
-                    // FlashPrefill store isolation: when enabled, the saved KV
-                    // bytes carry the 64-byte core envelope (store identity)
-                    // ahead of the memory payload, validated before any KV is
-                    // consumed on restore. No sidecar is written: the envelope
-                    // is the single authority. OFF: legacy bytes unchanged.
-
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -6004,13 +5909,6 @@ private:
                         break;
                     }
 
-                    // FlashPrefill store isolation: no pre-check here — the
-                    // single authority is the core envelope validated inside
-                    // the load below (before any KV is consumed). A mismatched
-                    // identity (policy, process, context, or adapter) fails
-                    // the load (nread == 0) with a re-prefill error; OFF loads
-                    // keep exact old behavior. Rejected restores leave the
-                    // slot salvageable so the client can re-prefill.
                     const int64_t t_start = ggml_time_us();
 
                     std::string filename = task.slot_action.filename;
@@ -6022,11 +5920,7 @@ private:
                     size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
                     if (nread == 0) {
                         slot->prompt.clear(); // KV may already been invalidated?
-                        if (fp_enabled) {
-                            send_error(task, "Unable to restore slot: save file was produced under a different FlashPrefill store identity (policy, process, context, or adapter mismatch) or the cache is full: re-prefill instead of restoring", ERROR_TYPE_INVALID_REQUEST);
-                        } else {
-                            send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
-                        }
+                        send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
                     tokens.resize(token_count);
@@ -6213,21 +6107,6 @@ private:
     }
 
     server_inference_mode select_inference_mode() {
-        // IdleAudit F1: Prevent prefill from completely starving decode when slots
-        // (especially RERoT lanes) are generating. If we previously ran prefill and there
-        // are generating slots waiting to decode, yield a decode turn.
-        bool has_generating = false;
-        for (const auto & slot : slots) {
-            if (slot.state == SLOT_STATE_GENERATING) {
-                has_generating = true;
-                break;
-            }
-        }
-
-        if (inference_mode == SERVER_INFERENCE_MODE_PREFILL && has_generating) {
-            return SERVER_INFERENCE_MODE_DECODE;
-        }
-
         if (id_slot_prefill >= 0 && id_slot_prefill < (int32_t) slots.size()) {
             if (is_prefill_slot(slots[id_slot_prefill])) {
                 return SERVER_INFERENCE_MODE_PREFILL;
@@ -6301,10 +6180,6 @@ private:
 
         update_inference_mode();
 
-        // FlashPrefill store isolation: enforce the RAM prompt-cache policy
-        // stamp before building or consuming any batch in this iteration.
-        fp_guard_prompt_cache();
-
         // RERoT frontier entry (§§19.3,20): one frontier is one atomic budget
         // unit; when hard limits are crossed the whole episode HARD_ABORTs
         // here instead of running a partial Lane subset. OFF: no-op true.
@@ -6334,28 +6209,7 @@ private:
 
             // TODO @ngxson : alora handling is too messy, need to refactor it to be more clear and maintainable
             // apply lora, only need to do it once per batch
-            // A refusal (FlashPrefill enabled atop an active RERoT episode) is
-            // a request failure, never silent: the core applied nothing, so the
-            // batched slots must not decode under the stale adapters. Fail
-            // exactly the batched (same-lora) slots and return; the next
-            // iteration rebuilds the batch from the survivors. OFF and
-            // identical-set calls always succeed, so this path is unreachable
-            // for them and old behavior is byte-identical.
-            if (!common_set_adapter_lora(ctx_tgt, slot_batched->lora)) {
-                std::set<int32_t> refused;
-                for (int32_t i = 0; i < batch.size(); ++i) {
-                    refused.insert(batch.tokens[i].id_slot);
-                }
-                for (const int32_t id_slot : refused) {
-                    server_slot * slot = get_slot_by_id(id_slot);
-                    if (slot != nullptr && slot->is_processing()) {
-                        send_error(*slot, "LoRA adapter change refused: FlashPrefill is enabled atop an active RERoT episode — end the episode (or disable the policy) and retry");
-                        slot->prompt_clear();
-                        slot->release();
-                    }
-                }
-                return;
-            }
+            common_set_adapter_lora(ctx_tgt, slot_batched->lora);
 
             // if the lora is temporarily disabled for an alora, re-enable it
             // for next time
@@ -6377,15 +6231,7 @@ private:
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch_view = batch.get_view(off, n_tokens);
-                // FlashPrefill: borrowed exec view sliced by the same off/n
-                // as the batch view, so every retry keeps stage, token
-                // offset, output row, sequence, and reader view aligned to
-                // the same source row. OFF: empty view (no allocation).
-                // decode() validates the view and dispatches to
-                // llama_decode_with_flashprefill() (ContextIntegration owns
-                // the pre-async copy + per-ubatch propagation).
-                const llama_flashprefill_exec fp_exec = batch.fp_exec_view(off, n_tokens);
-                bool ok = decode(n_batch, off, batch_view, fp_exec);
+                bool ok = decode(n_batch, off, batch_view);
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
@@ -6555,11 +6401,6 @@ private:
 
         // start populating the batch for this iteration
         batch.clear();
-        // FlashPrefill: bound the sidecar once per iteration while enabled so
-        // per-row pushes never regrow; OFF skips this entirely (no alloc).
-        if (fp_enabled && batch.n_tokens_alloc > 0) {
-            batch.fp_rows.reserve((size_t) batch.n_tokens_alloc);
-        }
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -6617,6 +6458,8 @@ private:
                         slot.spec_draft.clear();
                         slot.spec_i_batch.clear();
                         slot.rerot_has_draft_stamp = false;
+                        // XKV abort side: the seq_rm above is the full rollback;
+                        // sealing is forbidden here by design.
                     }
                     // v1: no cross-frontier speculative window for RERoT lanes.
                     return;
@@ -6740,7 +6583,7 @@ private:
                     rerot_plan_ok = false;
                 }
             } else {
-                slot.handle_last_sampled_token(batch, fp_enabled);
+                slot.handle_last_sampled_token(batch);
             }
         });
         if (!rerot_plan_ok) {
@@ -7075,20 +6918,6 @@ private:
                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
                         }
 
-                        // FlashPrefill: freeze the ordinary logical-prefill
-                        // suffix AFTER every prefix-cache adjustment above
-                        // (common prefix, alora clamp, chunk-reuse shifts,
-                        // checkpoint restore, TAG_PROMPT_LOGITS). The frozen
-                        // [n_past, task.n_tokens) interval persists on the
-                        // slot across ubatches; later chunk boundaries must
-                        // not re-derive it from n_tokens>1 guessing, and the
-                        // three lengths (cached count, batch count, dialogue
-                        // length) must not be conflated. OFF: untouched.
-                        if (fp_enabled) {
-                            slot.fp_boundary = server_flashprefill_routing::freeze_prefill_boundary(
-                                (int32_t) n_past, slot.task->n_tokens());
-                        }
-
                         slot.n_prompt_tokens_cache = n_past;
                         if (slot.n_decoded_start == 0) {
                             slot.n_prompt_tokens_cache_response = n_past;
@@ -7230,37 +7059,10 @@ private:
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
-                        {
-                            const bool ok = batch.add(slot.id,
-                                cur_tok,
-                                slot.prompt.tokens.pos_next(),
-                                slot.need_embd());
-                            add_ok &= ok;
-                            // FlashPrefill: only true prompt rows are eligible,
-                            // with the frozen suffix interval above. Embedding,
-                            // rerank, and multimodal rows take explicit dense
-                            // roles with a reason; never guessed from the
-                            // batch size. OFF: no push, no allocation.
-                            if (fp_enabled && ok) {
-                                namespace fp = server_flashprefill_routing;
-                                fp::fp_row_inputs in;
-                                in.is_embedding = slot.task->type == SERVER_TASK_TYPE_EMBEDDING;
-                                in.is_rerank = slot.task->type == SERVER_TASK_TYPE_RERANK;
-                                in.has_mtmd = has_mtmd || slot.prompt.tokens.has_mtmd;
-                                in.rerot_internal = false;
-                                in.rerot_forced = false;
-                                in.is_mtp_verify = false;
-                                in.is_spec_replay = false;
-                                in.is_prompt_row = true;
-                                const int32_t role = fp::classify_row_role(in);
-                                const int32_t logical_pos = (int32_t) slot.prompt.n_tokens();
-                                const llama_flashprefill_row row = fp::make_row(
-                                    role, slot.id, LLAMA_FLASHPREFILL_READER_NONE,
-                                    logical_pos, slot.fp_boundary);
-                                GGML_ASSERT(llama_flashprefill_validate_row(&row) == LLAMA_FLASHPREFILL_OK);
-                                batch.fp_push_row(row);
-                            }
-                        }
+                        add_ok &= batch.add(slot.id,
+                            cur_tok,
+                            slot.prompt.tokens.pos_next(),
+                            slot.need_embd());
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
@@ -7363,15 +7165,7 @@ private:
 
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
-    // fp_exec is the borrowed versioned execution view for this slice
-    // (same off/n as batch_view; empty while OFF). It is validated here so
-    // every narrowed-batch retry keeps role/boundary alignment, then
-    // dispatched below: non-empty views go through llama_decode_with_flash-
-    // prefill (ContextIntegration owns validation/copy/propagation), empty
-    // views keep the ordinary llama_decode() path. All roles — MTP draft/
-    // target verification and speculative replay included — ride without a
-    // new global disable and with the active-lane pause unchanged.
-    bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view, const llama_flashprefill_exec & fp_exec) {
+    bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
         if (batch.size() == 0) {
@@ -7386,26 +7180,6 @@ private:
             n_empty_consecutive = 0;
         }
 
-        // FlashPrefill view validation (cheap, OFF-empty passes): version and
-        // struct size must match the frozen contract, and a non-empty view
-        // must cover exactly this slice's rows. A mismatch is a routing bug,
-        // not a performance fallback, so it fails loudly like the existing
-        // speculative-index check in post_decode.
-        if (fp_exec.version != LLAMA_FLASHPREFILL_EXEC_VERSION ||
-            fp_exec.struct_size != (uint32_t) sizeof(llama_flashprefill_exec)) {
-            throw std::runtime_error("flashprefill exec view has wrong version/size");
-        }
-        if (!batch.fp_rows.empty()) {
-            if (fp_exec.n_rows != (uint32_t) batch_view.n_tokens || fp_exec.rows == nullptr) {
-                throw std::runtime_error("flashprefill exec view does not match batch slice");
-            }
-            if (llama_flashprefill_validate_exec(&fp_exec) != LLAMA_FLASHPREFILL_OK) {
-                throw std::runtime_error("flashprefill exec view failed validation");
-            }
-        } else if (fp_exec.n_rows != 0 || fp_exec.rows != nullptr) {
-            throw std::runtime_error("flashprefill exec view must be empty while OFF");
-        }
-
         // TODO @ngxson : dft model may have different n_embd than the tgt model, so we check & reject if that's the case
         // this case is not currently used by any models, but may need to be supported in the future
         if (spec && batch.has_embd) {
@@ -7415,29 +7189,12 @@ private:
             }
         }
 
-        // Versioned execution dispatch (ContextIntegration owns the copy
-        // semantics + per-ubatch propagation; ConfigIntegration declares the
-        // C API in llama.h). Non-empty views carry every submission slice's
-        // roles/boundaries with row identity intact; the context validates
-        // version/size/n_rows and copies rows before async work. Empty views
-        // (OFF) keep the ordinary dense route. MTP draft/target verification
-        // and speculative replay rows are dense by role, so they ride the same
-        // call without a global disable and with the active-lane pause intact.
-        const int ret = batch.fp_rows.empty()
-            ? llama_decode(ctx_tgt, batch_view)
-            : llama_decode_with_flashprefill(ctx_tgt, batch_view, &fp_exec);
+        const int ret = llama_decode(ctx_tgt, batch_view);
 
         metrics.on_decoded(slots);
 
         if (ret != 0) {
-            bool has_rerot_slot = false;
-            for (const auto & slot : slots) {
-                if (slot.rerot_internal && slot.is_processing()) {
-                    has_rerot_slot = true;
-                    break;
-                }
-            }
-            if (rerot_active() && has_rerot_slot) {
+            if (rerot_active() && batch.slot_batched && batch.slot_batched->rerot_internal) {
                 const std::string reason = ret == 1
                     ? "rerot_resource_exhausted: memory cannot commit the complete frontier"
                     : "rerot_backend_error: complete frontier decode failed";
@@ -7549,19 +7306,6 @@ private:
             return idx >= off && idx < off + n_batch_tokens;
         };
 
-        // FlashPrefill successful-only accounting: this runs solely after its
-        // decode slice returned 0, so each row in [off, off+n) is counted
-        // exactly once. Narrowed-batch retries (decode false), fatal errors
-        // (throw + abort_all_slots), and slot cancel/release paths never reach
-        // here, so canceled/failed/retried rows are never double counted.
-        // No GPU work is claimed here (see fp_gpu_deltas); only eligible vs
-        // server-dense attribution.
-        fp_count_slice_success(off, n_batch_tokens);
-        // GPU-determined drain for the same successful slice (consume-once:
-        // narrowed-batch retries can never double count). OFF or empty drain
-        // merges nothing.
-        fp_merge_gpu_slice();
-
         // TODO @ngxson : it's tricky to make sub-batch compatible with common_sampler_sample_and_accept_n,
         // so for now we will throw an error in this case: https://github.com/ggml-org/llama.cpp/issues/24840
         iterate(slots, [&](server_slot & slot) {
@@ -7571,21 +7315,6 @@ private:
                 }
             }
         });
-
-        // Ensure atomic frontier integrity (IdleAudit F4):
-        // All RERoT rows of an active frontier must execute within the current sub-batch view.
-        if (rerot_active()) {
-            iterate(slots, [&](server_slot & slot) {
-                if (slot.state == SLOT_STATE_GENERATING && slot.rerot_internal &&
-                    slot.rerot_inflight_plan.has_value()) {
-                    if (slot.i_batch >= 0 && !is_inside_view(slot.i_batch)) {
-                        throw std::runtime_error(string_format(
-                            "rerot frontier sliced across sub-batches (slot %d i_batch %d outside [%d, %d))",
-                            slot.id, slot.i_batch, off, off + n_batch_tokens));
-                    }
-                }
-            });
-        }
 
         // RERoT owns its token lifecycle: first commit every physical KV
         // write in the frontier, then mutate topology/retire/admit, and only
@@ -7878,6 +7607,8 @@ private:
                 slot.spec_draft.clear();
                 slot.spec_i_batch.clear();
                 slot.rerot_has_draft_stamp = false;
+                // XKV abort side: the seq_rm above is the full rollback (no
+                // accepted prefix exists); sealing is forbidden here by design.
                 return;
             }
 
@@ -7930,6 +7661,10 @@ private:
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         slot.smpl = std::move(smpl_save);
 
+                        // XKV abort side: checkpoint restore + seq_rm reset the
+                        // tentative rows; no accepted prefix exists yet, so no
+                        // sealing may run on this path.
+
                         return;
                     }
                 }
@@ -7974,6 +7709,33 @@ private:
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+
+            // XKV settle at the acceptance decision boundary. The seq_rm above
+            // rolled back the rejected suffix (fail-closed: common_memory aborts
+            // on removal failure), so only accepted-prefix rows remain
+            // hot_committed. Publication (sealing) is legal only from this point
+            // on — never at the generic decode tail before acceptance. Seal here
+            // only when hot pressure is actually due (hot_free == 0 mirrors the
+            // old fill-first trigger), so no unconditional sync happens when
+            // maintenance is not needed; the pre-batch admission path remains
+            // the primary seal driver. Errors are logged, never masking the
+            // already-accepted decode.
+            if (llama_xkv_is_enabled(params_base.xkv_mode)) {
+                if (llama_memory_t mem_settle = llama_get_memory(slot.ctx_tgt)) {
+                    llama_memory_admission_snapshot snap = {};
+                    if (llama_memory_get_admission_snapshot(mem_settle, &snap) && snap.hot_free == 0) {
+                        const auto mst = llama_memory_maintain_safe_boundary(mem_settle);
+                        if (mst == LLAMA_MEMORY_MAINTENANCE_RETRY_STALE) {
+                            const auto mst2 = llama_memory_maintain_safe_boundary(mem_settle);
+                            if (mst2 == LLAMA_MEMORY_MAINTENANCE_ERROR) {
+                                SLT_ERR(slot, "%s", "XKV settle maintain retry failed (decode already accepted; continuing without sealing)\n");
+                            }
+                        } else if (mst == LLAMA_MEMORY_MAINTENANCE_ERROR) {
+                            SLT_ERR(slot, "%s", "XKV settle maintain failed (decode already accepted; continuing without sealing)\n");
+                        }
+                    }
+                }
+            }
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
@@ -8657,6 +8419,11 @@ void server_routes::init_routes() {
             emit_rerot("gauge", "rerot_grouped_scratch_bytes", "Estimated grouped multi-reader / RBB scratch in bytes.", r.grouped_scratch_bytes);
         }
 
+        // XKV suite (§16): additive; OFF (empty) emits nothing.
+        if (!res_task->xkv.empty()) {
+            res_task->xkv.to_prometheus(prometheus);
+        }
+
         // Labeled fallback counter is emitted separately because the compact
         // metric-definition helper above intentionally models unlabeled series.
         prometheus << "# HELP llamacpp:tri_atomic_fallback_total Atomic fallback entries after dynamic-memory pressure, by reason.\n"
@@ -8665,105 +8432,6 @@ void server_routes::init_routes() {
                    << res_task->tri_atomic_fallback_kv_total << "\n"
                    << "llamacpp:tri_atomic_fallback_total{reason=\"recurrent\"} "
                    << res_task->tri_atomic_fallback_recurrent_total << "\n";
-
-        // FlashPrefill V2 series (MetricsIntegration owner; ServerRouting
-        // owns the eligible/dense-reason source rows). Always emitted —
-        // including zeros while OFF, which cost no GPU work or counting
-        // overhead (the matrix off_baseline expects the counters present);
-        // only the fingerprint info is policy-gated (no value while OFF).
-        // All labels are bounded (9 granular dense reasons, 7 frozen server
-        // reasons, 2 pool reasons, 3 plan reasons, one fingerprint value);
-        // no sequence ids, prompt text, or unbounded reader ids. Units:
-        // sparse/dense_packed are packed execution rows (plan-confirmed);
-        // dense breakdowns are packed rows by reason; selected/corrected are
-        // plan use counts; visible/exact are 64-bit use-record token sums.
-        // Keep one unit per ratio: sparse/(sparse+dense_packed), or
-        // exact/visible. Timings: layout is host-measured; pool/select/
-        // attention are GPU dispatch times sampled post-completion from the
-        // VulkanDispatch timestamp hook (0 until it reports — never faked).
-        {
-            const auto emit_fp = [&prometheus](
-                    const char * type,
-                    const char * name,
-                    const char * help,
-                    const auto & value) {
-                prometheus << "# HELP llamacpp:" << name << " " << help << "\n"
-                           << "# TYPE llamacpp:" << name << " " << type << "\n"
-                           << "llamacpp:" << name << " " << value << "\n";
-            };
-            namespace fp = server_flashprefill_routing;
-            emit_fp("counter", "flashprefill_eligible_rows_total",
-                    "Source rows presented with a sparse-eligible role and known boundary.",
-                    res_task->fp_eligible_rows);
-            emit_fp("counter", "flashprefill_sparse_rows_total",
-                    "Packed execution rows confirmed sparse by the plan headers after successful completion.",
-                    res_task->fp_sparse_rows);
-            emit_fp("counter", "flashprefill_dense_packed_rows_total",
-                    "Packed execution rows the plans ran dense.",
-                    res_task->fp_dense_packed);
-            emit_fp("counter", "flashprefill_selected_blocks_total",
-                    "Plan exact uses summed over layers.",
-                    res_task->fp_selected_blocks);
-            emit_fp("counter", "flashprefill_corrected_blocks_total",
-                    "Plan proxy (mean-corrected) uses summed over layers.",
-                    res_task->fp_corrected_blocks);
-            emit_fp("counter", "flashprefill_visible_tokens_total",
-                    "Plan use-record token sum over layers (64-bit, subhead fan-out not multiplied).",
-                    res_task->fp_visible_tokens);
-            emit_fp("counter", "flashprefill_exact_tokens_total",
-                    "Plan exact-use token sum over layers (64-bit).",
-                    res_task->fp_exact_tokens);
-            emit_fp("gauge", "flashprefill_scratch_bytes",
-                    "Live FlashPrefill scratch bytes from the last successful slice.",
-                    res_task->fp_scratch_live_bytes);
-            emit_fp("gauge", "flashprefill_scratch_peak_bytes",
-                    "Peak FlashPrefill scratch bytes over successful slices.",
-                    res_task->fp_scratch_peak_bytes);
-            emit_fp("counter", "flashprefill_layout_seconds",
-                    "Host layout time over measured slices.",
-                    res_task->fp_layout_us_total / 1.e6);
-            emit_fp("counter", "flashprefill_pool_seconds",
-                    "GPU pool-dispatch time over sampled calls (0 until the timestamp hook reports).",
-                    res_task->fp_gpu_pool_us_total / 1.e6);
-            emit_fp("counter", "flashprefill_select_seconds",
-                    "GPU select-dispatch time over sampled calls (0 until the timestamp hook reports).",
-                    res_task->fp_gpu_select_us_total / 1.e6);
-            emit_fp("counter", "flashprefill_attention_seconds",
-                    "GPU attention-dispatch time over sampled calls, merge included (0 until the timestamp hook reports).",
-                    res_task->fp_gpu_attn_us_total / 1.e6);
-            prometheus << "# HELP llamacpp:flashprefill_dense_rows_total Packed rows executed dense by granular reason.\n"
-                       << "# TYPE llamacpp:flashprefill_dense_rows_total counter\n";
-            for (int i = 0; i < 10; ++i) {
-                prometheus << "llamacpp:flashprefill_dense_rows_total{reason=\""
-                           << fp::fp_gpu_dense_name(i) << "\"} " << res_task->fp_dense_rows[i] << "\n";
-            }
-            prometheus << "# HELP llamacpp:flashprefill_server_dense_rows_total Source rows routed dense by frozen server reason.\n"
-                       << "# TYPE llamacpp:flashprefill_server_dense_rows_total counter\n";
-            for (int i = 0; i < 7; ++i) {
-                const int32_t route = fp::fp_dense_index_to_route(i);
-                prometheus << "llamacpp:flashprefill_server_dense_rows_total{reason=\""
-                           << llama_flashprefill_route_name(route) << "\"} "
-                           << res_task->fp_dense_by_reason[i] << "\n";
-            }
-            prometheus << "# HELP llamacpp:flashprefill_pool_rebuild_total Pool-mean rebuilds by reason.\n"
-                       << "# TYPE llamacpp:flashprefill_pool_rebuild_total counter\n";
-            for (int i = 0; i < 2; ++i) {
-                prometheus << "llamacpp:flashprefill_pool_rebuild_total{reason=\""
-                           << fp::fp_gpu_pool_name(i) << "\"} " << res_task->fp_pool_rebuild[i] << "\n";
-            }
-            prometheus << "# HELP llamacpp:flashprefill_plan_invalidations_total Plan invalidations by reason.\n"
-                       << "# TYPE llamacpp:flashprefill_plan_invalidations_total counter\n";
-            for (int i = 0; i < 3; ++i) {
-                prometheus << "llamacpp:flashprefill_plan_invalidations_total{reason=\""
-                           << fp::fp_gpu_plan_name(i) << "\"} " << res_task->fp_plan_invalidations[i] << "\n";
-            }
-            if (res_task->fp_has_policy) {
-                const std::string fphex = string_format("%016" PRIx64, (uint64_t) res_task->fp_policy_fingerprint);
-                prometheus << "# HELP llamacpp:flashprefill_policy_fingerprint_info Active FlashPrefill policy fingerprint (single series).\n"
-                           << "# TYPE llamacpp:flashprefill_policy_fingerprint_info gauge\n"
-                           << "llamacpp:flashprefill_policy_fingerprint_info{fingerprint=\"" << fphex << "\"} 1\n";
-            }
-        }
 
         res->headers["Process-Start-Time-Unix"] = std::to_string(res_task->t_start);
         res->content_type = "text/plain; version=0.0.4";
@@ -8891,6 +8559,38 @@ void server_routes::init_routes() {
             { "is_sleeping",                 queue_tasks.is_sleeping() },
             { "cors_proxy_enabled",          params.ui_mcp_proxy },
         };
+
+        // Evaluator identity keys: content-checksum model identity (never path),
+        // exact XKV mode, factorization seed, Tri calibration identity, RERoT
+        // frontier mode, and speculative draft bounds.
+        const llama_model * pmodel = this->ctx_server.model_tgt;
+        if (pmodel != nullptr) {
+            uint8_t msha[32] = {};
+            if (llama_model_source_artifact_sha256(pmodel, msha)) {
+                std::ostringstream ss;
+                for (int i = 0; i < 32; ++i) {
+                    ss << std::hex << std::nouppercase << std::setw(2) << std::setfill('0') << (int) msha[i];
+                }
+                props["model_sha256"] = ss.str();
+            }
+        }
+        props["xkv_mode"] = llama_xkv_mode_name(params.xkv_mode);
+        {
+            std::ostringstream ss;
+            ss << "0x" << std::hex << std::nouppercase << std::setw(16) << std::setfill('0') << params.xkv_seed;
+            props["xkv_seed"] = ss.str();
+            props["xkv_factor_seed"] = ss.str();
+        }
+        props["xkv_storage_profile"] = llama_xkv_storage_profile_name(params.xkv_storage_profile);
+        {
+            std::ostringstream ss_lm;
+            ss_lm << "0x" << std::hex << std::nouppercase << std::setw(16) << std::setfill('0') << (uint64_t) 777;
+            props["xkv_landmark_seed"] = ss_lm.str();
+        }
+        props["rerot_frontier"] = std::string(llama_rerot_frontier_mode_name(params.rerot_frontier));
+        props["spec_draft_n_max"] = params.speculative.draft.n_max;
+        props["triattention_ratio"] = "3/32";
+        props["tri_recent_window"] = 128;
         if (params.use_jinja) {
             if (!tmpl_tools.empty()) {
                 props["chat_template_tool_use"] = tmpl_tools;

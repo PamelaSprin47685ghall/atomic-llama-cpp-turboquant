@@ -1,0 +1,302 @@
+#version 450
+
+// xkv_landmark_score.comp — 64-lane parallel phase-aware quantized landmark scoring with
+// online streaming carry top-k for XKV (v3 audit revision).
+//
+// Audit fixes (Main directive):
+//  1. Subnormal-capable f16 unpack: uses GLSL unpackHalf2x16 built-in, which correctly
+//     handles all IEEE 754-2008 half-precision floats including subnormals and zero.
+//  2. Real per-query legality & DDVR group matching:
+//     query_meta stride-6 (authoritative): [causal,query_pos,n_q_heads,kv_head,vis_group,reserved].
+//     frag_meta stride-8:  [0]=rb, [1]=rc, [2]=seg, [3]=elig, [4]=row_off, [5]=group, [6]=fpos, [7]=gen.
+//     Fragment legality requires:
+//       - v3 bitset: binding 2 word bit set for (query,frag) when fstride==8
+//       - eligibility bit0 == 1 (meta word [3])
+//       - DDVR group match: frag_meta[5] == query_meta[4] (or query vis_group == -1 wildcard)
+//       - causal cutoff: fragment storage_pos <= query causal_limit (pos0 <= causal)
+//     frag_meta[7] (storage generation) is diagnostic only, never compared to any epoch.
+//     Landmark rows are indexed by landmark_row_stride_bytes (src[1]->nb[1]) so
+//     per-head views into one sealed full-group tensor score without a copy.
+//  3. 64-lane cooperative scoring with tree reduction in shared memory across query heads.
+//  4. Deterministic status initialization on all paths.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint n_queries;
+    uint n_frags;
+    uint head_dim;
+    uint padded_dim;
+    uint rotary_dim;
+    uint rope_mode;
+    uint landmark_type;   // 8 = Q8_0, 44 = TURBO4_0
+    uint top_k;
+    uint max_top_k;
+    uint refine_cap;
+    uint frag_size;
+    float scale;
+    uint n_q_heads;
+    uint n_rows_total;
+    uint landmark_row_stride_bytes; // src[1]->nb[1]: full-group byte stride for per-head views
+    uint status_flag;
+    uint fstride;         // 4 legacy, 6 extended, 8 v3
+    uint qstride;         // 4 legacy, 6 extended
+    uint flags;           // FLAG_SPARSE_ROWS (1), FLAG_PERQ_LEGAL (2), FLAG_CANONICAL_XPHASE (4)
+} p;
+
+layout (binding = 0, std430) readonly buffer Q       { float q_data[]; };
+layout (binding = 1, std430) readonly buffer LAND    { uint8_t land[]; };
+layout (binding = 2, std430) readonly buffer FPOS    { int frag_pos[]; };
+layout (binding = 3, std430) readonly buffer FMETA   { int frag_meta[]; };
+layout (binding = 4, std430) readonly buffer QMETA   { int query_meta[]; };
+layout (binding = 5, std430) readonly buffer ROPE    { float rope[]; };
+layout (binding = 6, std430) buffer SCRATCH          { uint scratch[]; };
+layout (binding = 7, std430) buffer STATUS           { int status[]; };
+
+const float XC4[16] = float[16](
+    -0.173926, -0.117195, -0.089527, -0.068756,
+    -0.051262, -0.035597, -0.020989, -0.006938,
+     0.006938,  0.020989,  0.035597,  0.051262,
+     0.068756,  0.089527,  0.117195,  0.173926);
+
+const float XS1[128] = float[128](
+    -1., 1., 1., -1., -1., 1., -1., 1., -1., -1., 1., 1., 1., 1., 1., 1.,
+     1., -1., 1., -1., 1., -1., -1., 1., 1., 1., -1., 1., 1., -1., -1., -1.,
+    -1., 1., 1., -1., 1., 1., -1., 1., -1., 1., 1., -1., -1., 1., -1., 1.,
+     1., 1., 1., -1., -1., -1., -1., -1., 1., -1., 1., 1., 1., 1., -1., 1.,
+    -1., -1., 1., -1., -1., -1., 1., -1., -1., -1., 1., -1., -1., -1., 1., 1.,
+     1., -1., -1., 1., 1., 1., -1., -1., 1., 1., -1., 1., 1., -1., 1., -1.,
+    -1., 1., 1., -1., 1., -1., 1., -1., 1., 1., 1., 1., -1., 1., -1., 1.,
+     1., -1., 1., 1., -1., -1., -1., -1., -1., 1., 1., -1., 1., 1., -1., 1.);
+const float XS2[128] = float[128](
+     1., 1., 1., 1., -1., 1., 1., -1., 1., -1., -1., -1., 1., -1., -1., -1.,
+     1., 1., -1., -1., 1., -1., 1., -1., 1., -1., -1., 1., -1., 1., 1., 1.,
+     1., 1., -1., -1., -1., 1., -1., -1., -1., -1., -1., -1., 1., 1., 1., -1.,
+     1., -1., 1., 1., 1., -1., -1., 1., -1., -1., -1., -1., -1., -1., 1., 1.,
+     1., -1., 1., -1., -1., -1., -1., 1., -1., 1., -1., 1., -1., -1., 1., 1.,
+    -1., 1., -1., 1., 1., -1., 1., -1., -1., -1., -1., 1., -1., -1., 1., -1.,
+     1., -1., 1., 1., 1., -1., -1., 1., -1., 1., -1., 1., 1., -1., -1., 1.,
+    -1., 1., -1., 1., 1., -1., 1., -1., 1., -1., -1., -1., -1., -1., 1., -1.);
+
+// Correct subnormal-capable f16 unpack via GLSL built-in
+float unpack_f16(uint h) {
+    return unpackHalf2x16(h & 0xFFFFu).x;
+}
+
+shared float s_land[256];
+shared float s_red[64];
+shared float s_head_best;
+shared uint  s_is_legal;
+
+void main() {
+    uint qq = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    if (qq >= p.n_queries) return;
+
+    uint nq = p.n_queries;
+    uint tk = p.top_k;
+    uint ci  = 0u;
+    uint cs  = nq * tk;
+    uint tak = cs + nq * tk;
+    uint ref = tak + nq;
+    uint leg = ref + nq;
+    uint my_ci = ci + qq * tk;
+    uint my_cs = cs + qq * tk;
+
+    // Fail-closed cap/param checks
+    if (tk == 0u || tk > p.max_top_k || tk > p.n_frags || tk > 128u) {
+        if (lid == 0u) { scratch[tak + qq] = 0u; scratch[leg + qq] = 0u; status[0] = 1; }
+        return;
+    }
+    if (p.landmark_type != 8u && p.landmark_type != 44u) {
+        if (lid == 0u) { scratch[tak + qq] = 0u; scratch[leg + qq] = 0u; status[0] = 4; }
+        return;
+    }
+    if (p.head_dim == 0u || p.head_dim > 256u || p.padded_dim < p.head_dim || p.padded_dim > 256u) {
+        if (lid == 0u) { scratch[tak + qq] = 0u; scratch[leg + qq] = 0u; status[0] = 4; }
+        return;
+    }
+    if (p.landmark_type == 44u && (p.padded_dim % 128u) != 0u) {
+        if (lid == 0u) { scratch[tak + qq] = 0u; scratch[leg + qq] = 0u; status[0] = 4; }
+        return;
+    }
+    if (p.n_q_heads == 0u || p.n_q_heads > 32u) {
+        if (lid == 0u) { scratch[tak + qq] = 0u; scratch[leg + qq] = 0u; status[0] = 2; }
+        return;
+    }
+    if (p.fstride != 4u && p.fstride != 6u && p.fstride != 8u) {
+        if (lid == 0u) { scratch[tak + qq] = 0u; scratch[leg + qq] = 0u; status[0] = 2; }
+        return;
+    }
+    if (p.qstride != 4u && p.qstride != 6u) {
+        if (lid == 0u) { scratch[tak + qq] = 0u; scratch[leg + qq] = 0u; status[0] = 2; }
+        return;
+    }
+    if ((p.flags & 4u) != 0u) {
+        // Canonical experimental mode is host-oracle-only; device rejects
+        if (lid == 0u) { scratch[tak + qq] = 0u; scratch[leg + qq] = 0u; status[0] = 4; }
+        return;
+    }
+
+    // Strided landmark rows: per-head views into one sealed full-group tensor
+    // index rows by landmark_row_stride_bytes (binding base carries the view
+    // byte offset). Fail closed on short or block-misaligned strides.
+    {
+        uint enc_bytes = (p.landmark_type == 8u) ? (p.padded_dim / 32u) * 34u : (p.padded_dim / 128u) * 68u;
+        uint blk_bytes = (p.landmark_type == 8u) ? 34u : 68u;
+        if (p.landmark_row_stride_bytes < enc_bytes ||
+            (p.landmark_row_stride_bytes % blk_bytes) != 0u) {
+            if (lid == 0u) { scratch[tak + qq] = 0u; scratch[leg + qq] = 0u; status[0] = 4; }
+            return;
+        }
+    }
+
+    int causal = query_meta[qq * p.qstride + 0u];
+    int vis_group = (p.qstride == 6u) ? query_meta[qq * 6u + 4u] : -1;
+    uint hd = p.head_dim;
+    uint pd = p.padded_dim;
+
+    uint ncarry = 0u;
+    uint nlegal = 0u;
+    bool failed = false;
+
+    for (uint f = 0u; f < p.n_frags && !failed; ++f) {
+        if (lid == 0u) {
+            int fl = frag_meta[f * p.fstride + 3u];
+            int spos = (p.fstride == 8u) ? frag_meta[f * 8u + 6u] : frag_pos[f];
+            int fgrp = (p.fstride >= 6u) ? frag_meta[f * p.fstride + 5u] : -1;
+
+            bool ok = ((fl & 1) != 0) && (causal < 0 || spos <= causal);
+
+            // v3: per-query eligibility bitset rides in binding 2 as
+            // I32[ceil(n_frags/32), n_queries]; checked before scoring.
+            // frag_meta[7] (storage generation) is diagnostic only, never gated.
+            if (ok && p.fstride == 8u) {
+                uint words_per_q = (p.n_frags + 31u) / 32u;
+                uint w = uint(frag_pos[qq * words_per_q + f / 32u]);
+                if ((w & (1u << (f % 32u))) == 0u) ok = false;
+            }
+
+            // Real DDVR group matching
+            if (ok && vis_group >= 0 && fgrp >= 0) {
+                if (fgrp != vis_group) ok = false;
+            }
+
+            s_is_legal = ok ? 1u : 0u;
+        }
+        barrier();
+        if (s_is_legal == 0u) continue;
+        if (lid == 0u) nlegal++;
+
+        // Cooperative 64-lane decode from the strided full-group row
+        uint bb = f * p.landmark_row_stride_bytes;
+        if (p.landmark_type == 8u) {
+            // Q8_0: 34B per 32 elements
+            for (uint d = lid; d < pd; d += 64u) {
+                uint b = d / 32u;
+                uint j = d % 32u;
+                uint boff = bb + b * 34u;
+                uint h = uint(land[boff]) | (uint(land[boff + 1u]) << 8u);
+                float dd = unpack_f16(h); // subnormal-capable
+                int qv = int(land[boff + 2u + j]);
+                if (qv >= 128) qv -= 256;
+                s_land[d] = dd * float(qv);
+            }
+        } else {
+            // Turbo4_0
+            uint ngroups = pd / 128u;
+            for (uint g = 0u; g < ngroups; ++g) {
+                uint boff = bb + g * 68u;
+                uint h = uint(land[boff]) | (uint(land[boff + 1u]) << 8u);
+                float norm = unpack_f16(h); // subnormal-capable
+                for (uint k = 0u; k < 2u; ++k) {
+                    uint j = lid * 2u + k;
+                    uint qb = uint(land[boff + 4u + j / 2u]);
+                    uint idx = ((j & 1u) != 0u) ? ((qb >> 4u) & 15u) : (qb & 15u);
+                    s_land[g * 128u + j] = norm * XC4[idx] * XS2[j];
+                }
+            }
+            barrier();
+            for (uint g = 0u; g < ngroups; ++g) {
+                uint goff = g * 128u;
+                for (uint hh = 1u; hh < 128u; hh *= 2u) {
+                    uint pair = (lid / hh) * (2u * hh) + (lid % hh);
+                    float a = s_land[goff + pair];
+                    float c = s_land[goff + pair + hh];
+                    s_land[goff + pair]      = a + c;
+                    s_land[goff + pair + hh] = a - c;
+                    barrier();
+                }
+                for (uint k = 0u; k < 2u; ++k) {
+                    uint j = lid * 2u + k;
+                    s_land[goff + j] *= (0.08838834764831845 * XS1[j]);
+                }
+            }
+        }
+        barrier();
+
+        if (lid == 0u) s_head_best = -3.402823466e+38;
+        barrier();
+
+        // Cooperative dot product and tree reduction
+        for (uint qh = 0u; qh < p.n_q_heads; ++qh) {
+            uint qbase = (qq * p.n_q_heads + qh) * hd;
+            float my_dot = 0.0;
+            for (uint d = lid; d < hd; d += 64u) {
+                my_dot += q_data[qbase + d] * s_land[d];
+            }
+            s_red[lid] = my_dot;
+            barrier();
+            for (uint s = 32u; s > 0u; s >>= 1u) {
+                if (lid < s) s_red[lid] += s_red[lid + s];
+                barrier();
+            }
+            if (lid == 0u) {
+                float sc = s_red[0] * p.scale;
+                if (isnan(sc) || isinf(sc)) failed = true;
+                if (sc > s_head_best) s_head_best = sc;
+            }
+            barrier();
+            if (failed) break;
+        }
+
+        // Lane 0: deterministic carry insertion
+        if (lid == 0u && !failed) {
+            float best = s_head_best;
+            uint pos = ncarry;
+            for (uint i = 0u; i < ncarry; ++i) {
+                uint ef = scratch[my_ci + i];
+                float es = uintBitsToFloat(scratch[my_cs + i]);
+                if (best > es || (best == es && f < ef)) { pos = i; break; }
+            }
+            if (pos < tk) {
+                uint up = ncarry < tk ? ncarry : tk - 1u;
+                for (uint i = up; i > pos; --i) {
+                    scratch[my_ci + i] = scratch[my_ci + i - 1u];
+                    scratch[my_cs + i] = scratch[my_cs + i - 1u];
+                }
+                scratch[my_ci + pos] = f;
+                scratch[my_cs + pos] = floatBitsToUint(best);
+                if (ncarry < tk) ncarry++;
+            }
+        }
+        barrier();
+    }
+
+    if (lid == 0u) {
+        if (failed) {
+            scratch[tak + qq] = 0u;
+            scratch[leg + qq] = 0u;
+            status[0] = 2;
+        } else {
+            scratch[tak + qq] = ncarry;
+            scratch[leg + qq] = nlegal;
+        }
+    }
+}

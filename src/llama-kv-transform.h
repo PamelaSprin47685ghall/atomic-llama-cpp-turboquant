@@ -11,6 +11,9 @@
 extern "C" {
 #endif
 GGML_API void turbo_cpu_fwht_inverse(float * x, int group_size);
+GGML_API void turbo_cpu_fwht(float * x, int group_size);
+GGML_API void ggml_turbo_wht_row(float * x, int group_size);
+GGML_API void ggml_turbo_wht_inverse_row(float * x, int group_size);
 #ifdef __cplusplus
 }
 #endif

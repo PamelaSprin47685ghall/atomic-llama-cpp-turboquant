@@ -92,6 +92,32 @@ struct llama_cparams {
     std::shared_ptr<const std::vector<struct llama_flashprefill_row>> flashprefill_rows;
     bool pipeline_parallel;
 
+    // XKV (§16) parameters
+    enum llama_xkv_mode            xkv_mode                 = LLAMA_XKV_MODE_OFF;
+    enum llama_xkv_storage_profile xkv_storage_profile      = LLAMA_XKV_STORAGE_PROFILE_REFERENCE;
+    uint32_t                       xkv_group_size           = 4;
+    uint32_t                       xkv_rank_k               = 384;
+    uint32_t                       xkv_rank_v               = 576;
+    uint32_t                       xkv_segment_tokens       = 4096;
+    uint32_t                       xkv_chunk_tokens         = 8;
+    uint32_t                       xkv_sr_budget            = 0;
+    enum llama_xkv_source          xkv_source               = LLAMA_XKV_SOURCE_DECODED_HOT;
+    enum ggml_type                 xkv_factor_a_k           = GGML_TYPE_TURBO4_0;
+    enum ggml_type                 xkv_factor_b_k           = GGML_TYPE_TURBO4_0;
+    enum ggml_type                 xkv_factor_a_v           = GGML_TYPE_TURBO4_0;
+    enum ggml_type                 xkv_factor_b_v           = GGML_TYPE_TURBO4_0;
+    enum llama_xkv_factor_balance  xkv_factor_balance       = LLAMA_XKV_FACTOR_BALANCE_UPSTREAM;
+    enum ggml_type                 xkv_landmark_type        = GGML_TYPE_Q8_0;
+    enum llama_xkv_landmark_refine xkv_landmark_refine      = LLAMA_XKV_LANDMARK_REFINE_NONE;
+    uint32_t                       xkv_landmark_refine_max_rows = 64;
+    uint32_t                       xkv_workspace_mib        = 256;
+    uint32_t                       xkv_decode_cache_mib     = 64;
+    uint32_t                       xkv_store_mib            = 0;
+    uint64_t                       xkv_seed                 = 6362273814452121649ULL;
+    double                         xkv_min_saving           = 0.10;
+    double                         xkv_min_factor_coverage  = 0.50;
+    enum llama_xkv_factorizer      xkv_factorizer           = LLAMA_XKV_FACTORIZER_CPU_REFERENCE;
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
     std::vector<bool> attention_q_pre_rope; // [n_layer()] extract normalized Q before RoPE
 

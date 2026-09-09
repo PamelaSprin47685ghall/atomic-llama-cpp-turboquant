@@ -11,7 +11,6 @@
 #include "server-common.h"
 
 #include <algorithm>
-#include <iterator>
 
 using json = nlohmann::ordered_json;
 
@@ -390,21 +389,7 @@ int server_task::rerot_response_owner() const {
 }
 
 bool server_task::rerot_effective() const {
-    return params.rerot_effective(type) && rerot_episode_id != 0;
-}
-
-common_grammar server_rerot_take_user_grammar(task_params & params) {
-    // A.16.1: snapshot the user/tool grammar before planner <ol> injection so
-    // the planner constraint can never pollute it. Cheap move, no parse.
-    common_grammar saved = std::move(params.sampling.grammar);
-    params.sampling.grammar = common_grammar{};
-    return saved;
-}
-
-void server_rerot_restore_user_grammar(task_params & params, const common_grammar & saved) {
-    // Restore the stock user/tool path after the final fence (§26). The planner
-    // grammar is discarded; the serial tail decodes with the original sampler.
-    params.sampling.grammar = saved;
+    return params.rerot_effective(type);
 }
 
 bool server_rerot_tool_calls_allowed(bool serial_tail_done) {
@@ -2014,28 +1999,6 @@ json server_task_result_metrics::to_json() {
         { "tri_hard_keep",                   tri_hard_keep },
         { "tri_shared_keep",                 tri_shared_keep },
 
-        { "fp_sparse_rows",                  fp_sparse_rows },
-        { "fp_dense_packed",                 fp_dense_packed },
-        { "fp_dense_rows",                   std::vector<uint64_t>(std::begin(fp_dense_rows), std::end(fp_dense_rows)) },
-        { "fp_selected_blocks",              fp_selected_blocks },
-        { "fp_corrected_blocks",             fp_corrected_blocks },
-        { "fp_visible_tokens",               fp_visible_tokens },
-        { "fp_exact_tokens",                 fp_exact_tokens },
-        { "fp_pool_rebuild",                 std::vector<uint64_t>(std::begin(fp_pool_rebuild), std::end(fp_pool_rebuild)) },
-        { "fp_plan_invalidations",           std::vector<uint64_t>(std::begin(fp_plan_invalidations), std::end(fp_plan_invalidations)) },
-        { "fp_scratch_live_bytes",           fp_scratch_live_bytes },
-        { "fp_scratch_peak_bytes",           fp_scratch_peak_bytes },
-        { "fp_layout_us_total",              fp_layout_us_total },
-        { "fp_layout_slices_measured",       fp_layout_slices_measured },
-        { "fp_gpu_pool_us_total",            fp_gpu_pool_us_total },
-        { "fp_gpu_select_us_total",          fp_gpu_select_us_total },
-        { "fp_gpu_attn_us_total",            fp_gpu_attn_us_total },
-        { "fp_gpu_slices_measured",          fp_gpu_slices_measured },
-        { "fp_eligible_rows",                fp_eligible_rows },
-        { "fp_dense_by_reason",              std::vector<uint64_t>(std::begin(fp_dense_by_reason), std::end(fp_dense_by_reason)) },
-        { "fp_policy_fingerprint",           fp_policy_fingerprint },
-        { "fp_has_policy",                   fp_has_policy },
-
         { "slots",                           slots_data },
     };
     // RERoT suite (§A.26) is additive to Tri metrics. OFF (empty) emits
@@ -2047,9 +2010,15 @@ json server_task_result_metrics::to_json() {
             out[kv.key()] = kv.value();
         }
     }
-    // FlashPrefill keys above are always present (zero while OFF, matching
-    // the Tri convention of unconditional cumulative keys); the Prometheus
-    // serializer likewise always emits the series (zeros while OFF).
+    // XKV suite (§16) is additive the same way. OFF (empty) emits nothing:
+    // the pre-XKV schema is byte-identical and admission behavior is
+    // unchanged.
+    if (!xkv.empty()) {
+        const json xj = xkv.to_json();
+        for (const auto & kv : xj.items()) {
+            out[kv.key()] = kv.value();
+        }
+    }
     return out;
 }
 

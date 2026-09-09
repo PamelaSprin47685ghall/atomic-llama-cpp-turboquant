@@ -28,7 +28,8 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+        const llama_cparams   * cparams = nullptr);
 
     llama_kv_cache_iswa(
             const llama_model & model,
@@ -46,7 +47,8 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+        const llama_cparams   * cparams = nullptr);
 
     ~llama_kv_cache_iswa() = default;
 
@@ -66,6 +68,12 @@ public:
     bool get_can_shift() const override;
 
     uint32_t get_kv_capacity() const override;
+    // Failure-reporting clear forwarded to base + SWA (base first; a base
+    // false returns before SWA mutates).
+    bool try_clear(bool data, std::string * err = nullptr) override;
+    uint32_t get_kv_hot_capacity() const override;
+    bool can_use_legacy_attention() const override;
+    bool is_xkv_bounded_hot() const override;
     uint32_t get_kv_used()     const override;
     uint32_t get_kv_seq_used(llama_seq_id seq_id) const override;
 
@@ -154,7 +162,8 @@ public:
             llama_kv_cache_iswa * kv,
             slot_info_vec_t sinfos_base,
             slot_info_vec_t sinfos_swa,
-            std::vector<llama_ubatch> ubatches);
+            std::vector<llama_ubatch> ubatches,
+            std::vector<llama_xkv::xkv_hot_reservation> hot_res_base = {});
 
     virtual ~llama_kv_cache_iswa_context();
 
@@ -164,6 +173,14 @@ public:
 
     bool next()  override;
     bool apply() override;
+
+    // Graph-facing bounded-hot views: forwarded to target (base) attention
+    // through the interface; SWA never serves physical hot views.
+    ggml_tensor * get_xkv_hot_k(ggml_context * ctx, int32_t il) const override;
+    ggml_tensor * get_xkv_hot_v(ggml_context * ctx, int32_t il) const override;
+
+    bool postcompute_success() override;
+    bool postcompute_failure() override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -185,6 +202,11 @@ private:
 
     const llama_memory_context_ptr ctx_base;
     const llama_memory_context_ptr ctx_swa;
+
+    // Exactly-once postcompute forward flag (inner contexts guard themselves;
+    // this makes the forward fire once).
+    bool postcompute_finalized = false;
+    bool postcompute_ok = false;
 
     const llama_memory_status status;
 };

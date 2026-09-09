@@ -76,6 +76,7 @@ add_library(wanxiangqi-repetition-guard STATIC
     common/repetition-guard.cpp
     common/repetition-guard.h
     "${WANXIANGQI_REPETITION_ENVELOPE}")
+set_target_properties(wanxiangqi-repetition-guard PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(wanxiangqi-repetition-guard PRIVATE cxx_std_17)
 target_link_libraries(wanxiangqi-repetition-guard PRIVATE wanxiangqi-o200k)
 target_include_directories(wanxiangqi-repetition-guard PUBLIC

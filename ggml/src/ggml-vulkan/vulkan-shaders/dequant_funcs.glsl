@@ -762,6 +762,53 @@ vec2 get_dm(uint ib, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_TURBO2_0)
+// TurboQuant2 dequant: 2-bit centroids, 4 elements per qs byte, no signs.
+// Matches dequantize_row_turbo2_0 (CPU): idx(j) = (qs[j/4] >> ((j%4)*2)) & 3.
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const float centroids[4] = float[4](-0.133462, -0.039994, 0.039994, 0.133462);
+    const uint j0 = iqs;
+    const uint j1 = iqs + 1;
+    const uint idx0 = (uint(data_a[a_offset + ib].qs[j0 / 4]) >> ((j0 % 4) * 2)) & 0x3;
+    const uint idx1 = (uint(data_a[a_offset + ib].qs[j1 / 4]) >> ((j1 % 4) * 2)) & 0x3;
+    return vec2(centroids[idx0], centroids[idx1]);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    vec2 v0 = dequantize(ib, iqs, a_offset);
+    vec2 v1 = dequantize(ib, iqs + 2, a_offset);
+    return vec4(v0.x, v0.y, v1.x, v1.y);
+}
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(float(data_a[a_offset + ib].norm), 0);
+}
+#endif
+
+#if defined(DATA_A_TURBO4_0)
+// TurboQuant4 dequant: 4-bit nibble indices, 2 per qs byte.
+// Matches dequantize_row_turbo4_0 (CPU): idx(j) = (qs[j/2] >> ((j&1)*4)) & 0xF.
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const float centroids[16] = float[16](
+        -0.173926, -0.117195, -0.089527, -0.068756,
+        -0.051262, -0.035597, -0.020989, -0.006938,
+         0.006938,  0.020989,  0.035597,  0.051262,
+         0.068756,  0.089527,  0.117195,  0.173926
+    );
+    const uint j0 = iqs;
+    const uint j1 = iqs + 1;
+    const uint idx0 = (uint(data_a[a_offset + ib].qs[j0 / 2]) >> ((j0 & 1) * 4)) & 0xF;
+    const uint idx1 = (uint(data_a[a_offset + ib].qs[j1 / 2]) >> ((j1 & 1) * 4)) & 0xF;
+    return vec2(centroids[idx0], centroids[idx1]);
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    vec2 v0 = dequantize(ib, iqs, a_offset);
+    vec2 v1 = dequantize(ib, iqs + 2, a_offset);
+    return vec4(v0.x, v0.y, v1.x, v1.y);
+}
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(float(data_a[a_offset + ib].norm), 0);
+}
+#endif
+
 #if defined(DATA_A_TQ4_1S)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     // TQ4_1S: 16-level Lloyd-Max centroids for N(0,1)

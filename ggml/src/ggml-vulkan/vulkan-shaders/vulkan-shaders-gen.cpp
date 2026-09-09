@@ -850,6 +850,12 @@ void process_shaders() {
         string_to_spv("cpy_" + t + "_f32", "copy_from_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     }
 
+    // TurboQuant dequantize-to-F32 (bounded hot-row rephasing read path;
+    // quantize direction stays exclusively with set_rows_f32_turbo_*).
+    for (std::string t : {"turbo2_0", "turbo3_0", "turbo4_0"}) {
+        string_to_spv("cpy_" + t + "_f32", "copy_from_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+    }
+
     for (auto src : {std::pair{"f32", "float"}, std::pair{"f16", "float16_t"}}) {
         for (std::string dst : {"f32", "f16", "bf16", "q1_0", "q2_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl"}) {
             string_to_spv("set_rows_" + std::string(src.first) + "_" + dst + "_i32", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(dst), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"S_TYPE", src.second}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
@@ -866,6 +872,25 @@ void process_shaders() {
 
     // TurboQuant Walsh-Hadamard Transform op (Q forward + kqv inverse rotation)
     string_to_spv("turbo_wht", "turbo_wht.comp", {});
+
+    // XKV selected-row factor reconstruction (single dispatch per op)
+    string_to_spv("xkv_reconstruct", "xkv_reconstruct.comp", {});
+
+    // XKV dual-source indexed attention (one dispatch per KV head)
+    string_to_spv("xkv_attention", "xkv_attention.comp", {});
+
+    // XKV device-local factorization + canonicalize-hot (owned by XkvVulkanFactorizer)
+    string_to_spv("xkv_factorize", "xkv_factorize.comp", {});
+    string_to_spv("xkv_canonicalize", "xkv_canonicalize.comp", {});
+
+    // XKV landmark score + select (owned by XkvVulkanLandmark)
+    string_to_spv("xkv_landmark_score", "xkv_landmark_score.comp", {});
+    string_to_spv("xkv_landmark_select", "xkv_landmark_select.comp", {});
+
+    // XKV landmark construction (owned by XkvNativeLandmarkBuild)
+    string_to_spv("xkv_landmark_build", "xkv_landmark_build.comp", {});
+    string_to_spv("xkv_landmark_rows", "xkv_landmark_rows.comp", {});
+    string_to_spv("xkv_landmark_merge", "xkv_landmark_merge.comp", {});
 
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";

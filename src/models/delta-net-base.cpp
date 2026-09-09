@@ -304,6 +304,13 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     s = ggml_reshape_4d(ctx0, s, S_v, S_v, H_v, n_seqs);
     cb(s, "output_state", il);
 
+    LLAMA_LOG_ERROR("[chunk-tail] il=%d n_tokens=%lld CS=%d kda=%d pad=%d n_chunks=%d o=[%lld,%lld,%lld,%lld] o_nb=[%zu,%zu,%zu,%zu] s=[%lld,%lld,%lld,%lld] vdim1=%lld\n",
+        il, (long long) n_tokens, CS, (int) kda, pad, n_chunks,
+        (long long) o->ne[0], (long long) o->ne[1], (long long) o->ne[2], (long long) o->ne[3],
+        o->nb[0], o->nb[1], o->nb[2], o->nb[3],
+        (long long) s->ne[0], (long long) s->ne[1], (long long) s->ne[2], (long long) s->ne[3],
+        (long long) v->ne[1]);
+
     return {o, s};
 }
 
@@ -514,6 +521,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * s,
         int           il) {
     const int64_t n_seq_tokens = q->ne[2];
+
+    LLAMA_LOG_ERROR("[gdn-dispatch] il=%d n_seq_tokens=%lld fused_ar=%d fused_ch=%d -> %s\n",
+        il, (long long) n_seq_tokens, (int) cparams.fused_gdn_ar, (int) cparams.fused_gdn_ch,
+        n_seq_tokens == 1 ? (cparams.fused_gdn_ar ? "FUSED-AR" : "AUTOREG") : (cparams.fused_gdn_ch ? "FUSED-CH" : "CHUNKING"));
 
     if (n_seq_tokens == 1) {
         if (cparams.fused_gdn_ar) {
@@ -885,10 +896,18 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             ggml_build_forward_expand(
                 gf, ggml_cpy(ctx0, hand_delta, hand_destination));
         } else {
-            ggml_build_forward_expand(gf,
-                    ggml_cpy(ctx0, new_state,
-                        ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                            kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+            ggml_tensor * sc_dst_nk = ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all));
+            // StateCarryFix: verify no-keep commit (K=1 full-state write):
+            // new_state element count vs dst, dst pointer vs s_l base +
+            // kv_head offset, and cpy node presence in graph (not fused/dropped).
+            {
+                const size_t sc_elt = ggml_element_size(ssm_states_all);
+                const uint8_t * sc_base = ssm_states_all->data ? (const uint8_t *) ssm_states_all->data : nullptr;
+                const uint8_t * sc_expect = sc_base ? sc_base + (size_t) kv_head * (size_t) hparams.n_embd_s() * sc_elt : nullptr;
+                ggml_tensor * sc_cpy = ggml_cpy(ctx0, new_state, sc_dst_nk);
+                ggml_build_forward_expand(gf, sc_cpy);
+            }
         }
 
         return output;
@@ -973,7 +992,15 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
             (size_t) mem_size * row_size,
             (size_t) kv_head * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        // StateCarryFix: verify cpy dst == s_l base + kv_head*D*elt and that
+        // the cpy node is present in the graph (not fused/dropped).
+        {
+            const size_t sc_elt = ggml_element_size(ssm_states_all);
+            const uint8_t * sc_base = ssm_states_all->data ? (const uint8_t *) ssm_states_all->data : nullptr;
+            const uint8_t * sc_expect = sc_base ? sc_base + (size_t) kv_head * (size_t) D * sc_elt : nullptr;
+            ggml_tensor * sc_cpy = ggml_cpy(ctx0, src, dst);
+            ggml_build_forward_expand(gf, sc_cpy);
+        }
     }
 
     return output;

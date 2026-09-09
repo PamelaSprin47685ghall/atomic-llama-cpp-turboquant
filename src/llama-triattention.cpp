@@ -12,6 +12,7 @@
 
 #include "llama-triattention.h"
 #include "llama-kv-transform.h"
+#include "llama-xkv-state.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -59,6 +60,7 @@ extern "C" {
     void dequantize_row_turbo2_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
     void dequantize_row_turbo3_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
     void dequantize_row_turbo4_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+    GGML_API void ggml_turbo_wht_inverse_row(float * x, int group_size);
 }
 
 // Standard ggml dequant for Q8_0, F16, etc.
@@ -100,7 +102,7 @@ static void triattention_inverse_wht_128(const float * src, float * dst) {
     // The butterfly is O(d log d), rather than O(d^2) for a dense R^T.
     // Reclamation applies this to every retained candidate and sampled head.
     memcpy(dst, src, 128 * sizeof(float));
-    turbo_cpu_fwht_inverse(dst, 128);
+    ggml_turbo_wht_inverse_row(dst, 128);
 }
 
 // Helper: z-score normalize an array in-place
@@ -1061,6 +1063,70 @@ bool triattention_scorer::matches_layers(const int32_t * layer_map, uint32_t n_l
     return false;
 }
 
+// Canonical little-endian serialization of validated calibration content for
+// fingerprinting (dims, rope params, sampled ids, all stats floats, name).
+static void triattention_calibration_serialize(const triattention_calibration * cal,
+                                               std::vector<uint8_t> & out) {
+    auto pu32 = [&](uint32_t v) {
+        for (int i = 0; i < 4; ++i) {
+            out.push_back((uint8_t) ((v >> (i * 8)) & 0xFF));
+        }
+    };
+    auto pf = [&](float v) {
+        uint32_t b = 0;
+        std::memcpy(&b, &v, sizeof(b));
+        pu32(b);
+    };
+    auto pd = [&](double v) {
+        uint64_t b = 0;
+        std::memcpy(&b, &v, sizeof(b));
+        for (int i = 0; i < 8; ++i) {
+            out.push_back((uint8_t) ((b >> (i * 8)) & 0xFF));
+        }
+    };
+    pu32(cal->head_dim);
+    pu32(cal->num_layers);
+    pu32(cal->num_attn_heads);
+    pu32(cal->num_kv_heads);
+    pu32(cal->num_kv_groups);
+    pd(cal->rope_theta);
+    pu32(cal->rope_style);
+    pu32(cal->freq_count);
+    pu32(cal->rotary_dim);
+    pu32(cal->n_sampled);
+    for (uint32_t i = 0; i < cal->n_sampled; ++i) {
+        pu32(cal->sampled_layer[i]);
+        pu32(cal->sampled_head[i]);
+        for (uint32_t f = 0; f < cal->freq_count; ++f) {
+            pf(cal->head_stats[i].q_mean_real[f]);
+            pf(cal->head_stats[i].q_mean_imag[f]);
+            pf(cal->head_stats[i].q_abs_mean[f]);
+        }
+    }
+    for (int i = 0; i < 256 && cal->model_name[i] != '\0'; ++i) {
+        out.push_back((uint8_t) cal->model_name[i]);
+    }
+}
+
+uint64_t triattention_scorer::calibration_content_fingerprint() const {
+    if (!valid() || !pimpl->cal) {
+        return 0;
+    }
+    std::vector<uint8_t> buf;
+    triattention_calibration_serialize(pimpl->cal, buf);
+    return llama_xkv::xkv_state_checksum(buf.data(), buf.size());
+}
+
+bool triattention_scorer::calibration_content_sha256(uint8_t out[32]) const {
+    if (out == nullptr || !valid() || !pimpl->cal) {
+        return false;
+    }
+    std::vector<uint8_t> buf;
+    triattention_calibration_serialize(pimpl->cal, buf);
+    llama_xkv::xkv_sha256(buf.data(), buf.size(), out);
+    return true;
+}
+
 void triattention_scorer::score_head(
     float * out_scores,
     const ggml_tensor * k_tensor,
@@ -1140,9 +1206,8 @@ void triattention_scorer::score_sampled_head(
 #ifdef GGML_USE_CUDA
     // GPU fast path: if K tensor is on a CUDA device, score directly on GPU
     // without copying K data to host. Only the score array is transferred back.
-    if (k_tensor->buffer && ggml_backend_buffer_get_type(k_tensor->buffer)) {
-        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(k_tensor->buffer);
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (k_tensor->buffer && k_tensor->buffer->buft) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(k_tensor->buffer->buft);
         ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
         const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
         const bool is_cuda_buffer = reg_name && strstr(reg_name, "CUDA") != nullptr;
@@ -1330,9 +1395,8 @@ void triattention_scorer::score_combined(
 
 #ifdef GGML_USE_CUDA
         bool is_cuda_buffer = false;
-        if (k_tensor->buffer && ggml_backend_buffer_get_type(k_tensor->buffer)) {
-            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(k_tensor->buffer);
-            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (k_tensor->buffer && k_tensor->buffer->buft) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(k_tensor->buffer->buft);
             ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
             const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
             is_cuda_buffer = reg_name && strstr(reg_name, "CUDA") != nullptr;
@@ -1516,6 +1580,18 @@ uint32_t triattention_scorer::get_freq_count() const {
 
 const char * triattention_scorer::get_model_name() const {
     return pimpl && pimpl->cal ? pimpl->cal->model_name : "";
+}
+
+const triattention_calibration * triattention_scorer::get_calibration() const {
+    return pimpl ? pimpl->cal : nullptr;
+}
+
+const float * triattention_scorer::get_omega() const {
+    return pimpl ? pimpl->omega : nullptr;
+}
+
+const float * triattention_scorer::get_freq_scale_sq() const {
+    return pimpl ? pimpl->freq_scale_sq : nullptr;
 }
 
 // ============================================================================
