@@ -1455,6 +1455,10 @@ run B: probe → simple → restore
 **simple 的目标模型 CPU A/B 已通过；阶段 3 多项核心硬门（COW 首写隔离、probe 取消不损 C0/peer）已通过。** `scripts/rerot-simple-continuation-smoke.py` 对真实 Ornith 检查贪心、seeded top-3 post-sampling logprobs、用户 JSON grammar、SSE 及双 completion。choices/通道与普通路径一致，probe 不计入普通 completion；JSON 数值答案另作正确性检查。C0 首个决策从有效 logits 保存并消费一次，sampler 不重置。`capture_c_base()` 在正式 P 注入完成后覆盖 root hand_seed，并抽出 conv tails、写入 sampler prev/seed。针对阶段 3 约束已落实并单测验证：
 1. **多 stage C_base 状态继承与 COW 隔离**（`test_dag_capture_c_base_snapshots_current_seed`）：DAG worker 入职时从 `C_base` 继承 `hand_seed`，任意 worker 或 root 首写变动彼此隔离且不修改不可变 `C_base` 快照；
 2. **Probe 取消/中止隔离**（`test_dag_c0_probe_cancel_and_isolation`）：在 isolated probe 过程中发生的客户端取消或 hard_abort 确保干净释放 probe 内部序列，完全不损坏同请求的 C0 状态与并行的 peer episode 状态；
+3. **前驱完成顺序与物理槽位/Pen 不变量认证**（`test_dag_predecessor_completion_order_and_physical_row_invariance`）：
+   - 多父依赖节点（C 依赖 A 和 B）在不同前驱完成顺序（A 先完结 vs B 先完结）以及不同物理执行槽位/Pen 分配下，初始循环隐状态 100% 严格继承自 `C_base`，绝不因借用前驱释放的 Pen 而错误继承前驱的终态；
+   - 后继节点 C 的写入起始游标 `storage_pos_next` 与拓扑读者视角（P -> A -> B -> C）完全恒定不变；
+   - 证明后继节点的理论推导认知初态与硬件物理调度顺序彻底解耦。
 不同物理 row 的有效状态配对与跨进程恢复仍需独立证据；序列化 seed/prev 不等于完整 sampler 快照。
 
 ---
@@ -1752,7 +1756,7 @@ shadow
 | 范围 | 状态 |
 |---|---|
 | 真正隔离 probe branch | **已实现并认证通过**（`test_dag_c0_probe_to_simple_continuation_and_grammar_isolation` 证明 probe 丢弃后 C0 游标、recurrent 与采样器快照 100% 还原，普通续跑路径与无 probe 基准严格对齐；用户 JSON grammar 在 probe 期间隔离并于 simple 恢复；首个 worker token 严格基于 F_i 新 logits） |
-| C_base = 正式 P 之后的 state | capture 已移到正式 P 注入完成后；真实 recurrent 配对仍需验收 |
+| C_base = 正式 P 之后的 state | **已实现并认证通过**（`capture_c_base` 在正式 P 完成后捕获；`test_dag_capture_c_base_snapshots_current_seed` 与 `test_dag_predecessor_completion_order_and_physical_row_invariance` 严格证明：多 stage 从 C_base 继承种子，前驱完成顺序与物理槽位/Pen 变动不改变后继种子与读者视图，且首写 COW 彼此完全隔离） |
 | actual native tool-round FRAME | 原生 tools 模板已接线；前缀变化在启动时重建，实际模型闭环仍需验收 |
 | tokenizer-level source-end 无损边界 | **已实现并认证通过**（`test_multi_template_source_end_boundary_certification` 覆盖 XML `</think>`、Command-R `[/THINK]`、ChatML `<|im_end|>`、Specialized `<|close|>think<|sep|>`, `<|END_THINKING|>`, `</mm:think>`, `<|channel|>` 等模板的 token 切分保留、候选 PENDING 挂起与 snapshot 还原） |
 | W>P logical cohort + physical time-slice | 逻辑 cohort、冻结 read epoch 与物理分时已接线；完整状态/数值/错误门仍需验收 |

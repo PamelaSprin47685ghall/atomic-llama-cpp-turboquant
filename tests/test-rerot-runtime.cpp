@@ -3177,6 +3177,173 @@ static void test_dag_capture_c_base_snapshots_current_seed() {
     CHECK(ep->c_base.gdn_recurrent_states == seed);
 }
 
+static void test_dag_predecessor_completion_order_and_physical_row_invariance() {
+    // AGENTS.md 阶段 3 (RERoT.md §12.4):
+    // "前驱完成顺序、pen/row 变化不改变后继的 seed 和规定 view。"
+    // "多父后继从 C_base 起步，A、B 的 PUBLIC 工作通过已经安装的 DDVR view 进入 C 的 Full Attention，
+    //  不能凭 pen 恰好由 A 或 B 释放，就让 C 自动继承 A 或 B 的终态。"
+    //
+    // Setup DAG: A (rank 0), B (rank 1), C (rank 2, depends on both A and B).
+    // Compare Scenario 1 (A finishes first, pen 0 assigned to C) vs
+    //         Scenario 2 (B finishes first, pen 1 assigned to C).
+    // In both scenarios, C's initial hand_seed must 100% equal C_base (never A's or B's final mutated seed),
+    // and C's topological reader view must be strictly invariant: P, A, B, C (own work last).
+
+    const std::vector<uint8_t> base_seed = {0x11, 0x22, 0x33, 0x44, 0x55};
+    const std::string dag_json = R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Join C"}
+        ],
+        "depends_on": [
+          {"id": "C", "depends_on_id": "A"},
+          {"id": "C", "depends_on_id": "B"}
+        ]
+      }
+    })";
+
+    struct ScenarioResult {
+        std::vector<uint8_t> c_initial_seed;
+        llama_pos c_storage_pos_next;
+        std::vector<llama_rerot_node_id> c_view_owners;
+    };
+
+    auto run_scenario = [&](bool a_finishes_first, int c_target_slot, int c_target_pen) -> ScenarioResult {
+        server_rerot_runtime runtime(nullptr);
+        runtime.set_pen_capacity(4);
+
+        const uint64_t ep_id = runtime.adopt_root(50, 50, 0, 1, 0);
+        CHECK(ep_id != 0);
+
+        const auto decision = server_rerot_parse_routing_decision(dag_json);
+        CHECK(decision.is_dag());
+        std::string err;
+        CHECK(runtime.initialize_dag(ep_id, decision, &err));
+
+        auto * root = runtime.node(ep_id, 0);
+        CHECK(root != nullptr);
+        root->hand_seed = base_seed;
+        root->storage_pos_next = 12; // Rebuilt formal-P end
+
+        CHECK(runtime.capture_c0(ep_id, 1, 0));
+        CHECK(runtime.capture_c_base(ep_id));
+        CHECK(runtime.activate_dag_frontier(ep_id));
+
+        auto * ep = runtime.episode(ep_id);
+        CHECK(ep != nullptr && ep->c_base.valid());
+        CHECK(ep->c_base.gdn_recurrent_states == base_seed);
+
+        dag_unbind_planner_if_bound(runtime, ep_id);
+
+        // Admit A (slot 0, pen 0) and B (slot 1, pen 1)
+        llama_rerot_node_id nid_a = LLAMA_REROT_NODE_INVALID;
+        llama_rerot_node_id nid_b = LLAMA_REROT_NODE_INVALID;
+        CHECK(runtime.admit_next_child(ep_id, 0, 1, &nid_a)); // slot 0, exec_seq 1
+        CHECK(runtime.admit_next_child(ep_id, 1, 2, &nid_b)); // slot 1, exec_seq 2
+        CHECK(nid_a == 1 && nid_b == 2);
+        CHECK(runtime.complete_admission(ep_id, nid_a));
+        CHECK(runtime.complete_admission(ep_id, nid_b));
+
+        auto * node_a = runtime.node(ep_id, nid_a);
+        auto * node_b = runtime.node(ep_id, nid_b);
+        CHECK(node_a && node_b);
+
+        // Verify A and B both start with base_seed
+        CHECK(node_a->hand_seed == base_seed);
+        CHECK(node_b->hand_seed == base_seed);
+
+        // A and B generate divergent local recurrent thoughts
+        node_a->hand_seed = {0xAA, 0xAA, 0xAA}; // A's mutated final state
+        node_b->hand_seed = {0xBB, 0xBB, 0xBB}; // B's mutated final state
+
+        // Append public runs for P, A, and B
+        ep->document.append_run(0, llama_rerot_visibility::public_live, 0, 12, 1);
+        ep->document.append_run(nid_a, llama_rerot_visibility::public_live, 12, 8, 2);
+        ep->document.append_run(nid_b, llama_rerot_visibility::public_live, 20, 10, 2);
+
+        // C is initially blocked on both A and B
+        CHECK(ep->nodes[3].remaining_preds == 2);
+        CHECK(!dag_queue_contains(ep->ready_queue, 3));
+
+        if (a_finishes_first) {
+            // First A seals, then B seals
+            CHECK(runtime.seal_dag_node(ep_id, nid_a, llama_rerot_event_origin::worker_source));
+            CHECK(runtime.detach_node(ep_id, nid_a));
+            CHECK(ep->nodes[3].remaining_preds == 1);
+            CHECK(!dag_queue_contains(ep->ready_queue, 3));
+
+            CHECK(runtime.seal_dag_node(ep_id, nid_b, llama_rerot_event_origin::worker_source));
+            CHECK(runtime.detach_node(ep_id, nid_b));
+            CHECK(ep->nodes[3].remaining_preds == 0);
+            CHECK(dag_queue_contains(ep->ready_queue, 3));
+        } else {
+            // First B seals, then A seals
+            CHECK(runtime.seal_dag_node(ep_id, nid_b, llama_rerot_event_origin::worker_source));
+            CHECK(runtime.detach_node(ep_id, nid_b));
+            CHECK(ep->nodes[3].remaining_preds == 1);
+            CHECK(!dag_queue_contains(ep->ready_queue, 3));
+
+            CHECK(runtime.seal_dag_node(ep_id, nid_a, llama_rerot_event_origin::worker_source));
+            CHECK(runtime.detach_node(ep_id, nid_a));
+            CHECK(ep->nodes[3].remaining_preds == 0);
+            CHECK(dag_queue_contains(ep->ready_queue, 3));
+        }
+
+        // Now C is eligible. Admit C to specified physical slot and pen
+        llama_rerot_node_id nid_c = LLAMA_REROT_NODE_INVALID;
+        CHECK(runtime.admit_next_child(ep_id, c_target_slot, c_target_pen, &nid_c));
+        CHECK(nid_c == 3);
+        CHECK(runtime.complete_admission(ep_id, nid_c));
+
+        auto * node_c = runtime.node(ep_id, nid_c);
+        CHECK(node_c != nullptr);
+
+        // Append a public run for C as it starts reasoning
+        ep->document.append_run(nid_c, llama_rerot_visibility::public_live, 30, 6, 3);
+
+        ScenarioResult res;
+        res.c_initial_seed = node_c->hand_seed;
+        res.c_storage_pos_next = node_c->storage_pos_next;
+
+        const auto view_c = runtime.build_dag_view_for_reader(ep_id, nid_c);
+        for (const auto & run : view_c.runs) {
+            res.c_view_owners.push_back(run.owner);
+        }
+
+        return res;
+    };
+
+    // Scenario 1: A finishes first, C assigned physical slot 0 (where A lived)
+    const auto s1 = run_scenario(/*a_finishes_first=*/true, /*c_target_slot=*/0, /*c_target_pen=*/3);
+
+    // Scenario 2: B finishes first, C assigned physical slot 1 (where B lived)
+    const auto s2 = run_scenario(/*a_finishes_first=*/false, /*c_target_slot=*/1, /*c_target_pen=*/4);
+
+    // Scenario 3: A finishes first, C assigned totally different physical slot 3
+    const auto s3 = run_scenario(/*a_finishes_first=*/true, /*c_target_slot=*/3, /*c_target_pen=*/5);
+
+    // 1. Initial seed invariance: C must ALWAYS inherit C_base (base_seed),
+    // NEVER the final state of A ({0xAA, ...}) or B ({0xBB, ...}),
+    // regardless of whether A or B finished first or what physical slot was borrowed.
+    CHECK(s1.c_initial_seed == base_seed);
+    CHECK(s2.c_initial_seed == base_seed);
+    CHECK(s3.c_initial_seed == base_seed);
+
+    // 2. Storage position invariance: C's storage position must start after formal P (12)
+    CHECK(s1.c_storage_pos_next == 12);
+    CHECK(s2.c_storage_pos_next == 12);
+    CHECK(s3.c_storage_pos_next == 12);
+
+    // 3. Reader view invariance: C's topological view must be P (0), A (1), B (2), C (3, own last)
+    const std::vector<llama_rerot_node_id> expected_view = {0, 1, 2, 3};
+    CHECK(s1.c_view_owners == expected_view);
+    CHECK(s2.c_view_owners == expected_view);
+    CHECK(s3.c_view_owners == expected_view);
+}
+
 static void test_dag_isolated_probe_uses_other_seq() {
     server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 16);
     runtime.set_pen_capacity(2);
@@ -6668,6 +6835,7 @@ int main() {
     test_c0_and_dag_admit_without_parked_seq();
     test_dag_runtime_lifecycle();
     test_dag_capture_c_base_snapshots_current_seed();
+    test_dag_predecessor_completion_order_and_physical_row_invariance();
     test_dag_isolated_probe_uses_other_seq();
     test_dag_c0_probe_cancel_and_isolation();
     test_dag_c0_probe_to_simple_continuation_and_grammar_isolation();
