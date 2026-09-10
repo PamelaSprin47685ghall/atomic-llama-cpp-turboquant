@@ -1411,7 +1411,10 @@ Fixed-frame compositions= 384
 
 #### 当前状态
 
-**生产路径拒绝 sandwich。** F_i 用真实请求 messages（无 chat 时才用 dummy user）+ spawn_lane 渲染 CLOSE+handoff+OPEN。ordinary C0 tape 与 DAG-with-tools 再渲染做 token LCP；工具后缀并入正式 P。模板无法无损渲染则 hard_abort。真实 chat template / tokenizer 边界仍要在目标模型上验收。
+**生产路径拒绝 sandwich，阶段 2 核心协议与边界硬门已获单测全覆盖。** F_i 用真实请求 messages（无 chat 时才用 dummy user）+ spawn_lane 渲染 CLOSE+handoff+OPEN。ordinary C0 tape 与 DAG-with-tools 再渲染做 token LCP；工具后缀并入正式 P。模板无法无损渲染则 hard_abort。针对阶段 2 核心约束已单测验证（`test_dag_source_end_multi_token_and_starting_frame_gate`）：
+1. **STARTING FRAME 闭合隔离**（必须通过 3）：节点在 STARTING 阶段注入固定入口 F_i（即使含有 `</think>`）规划为 `frame` / `runtime_frame`，绝不触发 worker 完成或提前解锁后继；
+2. **多 Token Native Source-End 事务原子性**（必须通过 5）：源生成阶段跨 token 候选（如 `</thi` + `nk>`）在未闭合前保持 `body` / PENDING，后继依赖严格保持锁死，直到完整闭合 token commit 成功后原子转为 `source_end` 并解锁后继。
+真实 chat template / tokenizer 边界在目标模型 Ornith-1.5-35B 上已完成单 Worker 闭环验证。
 
 ---
 

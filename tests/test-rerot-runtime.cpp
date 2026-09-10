@@ -5229,6 +5229,87 @@ static void test_dag_initialize_refuses_double_init() {
     CHECK(runtime.episode(ep_id)->nodes.size() == n_nodes);
 }
 
+static void test_dag_source_end_multi_token_and_starting_frame_gate() {
+    // Stage 2 (§12.3) Verification:
+    // 1. STARTING FRAME tokens carrying close delimiters must NOT seal worker.
+    // 2. Multi-token source-end marker: candidate token stays PENDING and does NOT
+    //    seal or unlock successors until the final token closes the marker.
+    // 3. Foreign FRAME or ordinary think tags in BODY do not trigger seal.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(4);
+    const uint64_t ep_id = runtime.adopt_root(74, 74, 0, 1, 0);
+    CHECK(ep_id != 0);
+    runtime.set_dag_protocol_markers(ep_id, "</think>", "<think>");
+
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"}
+        ],
+        "depends_on": [
+          {"id": "B", "depends_on_id": "A"}
+        ]
+      }
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+
+    auto * root = runtime.node(ep_id, 0);
+    if (root && root->physical_slot >= 0) {
+        CHECK(runtime.detach_node(ep_id, 0));
+    }
+
+    llama_rerot_node_id a = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 2, &a));
+    CHECK(a == 1);
+    // Node A is in STARTING state.
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->document.node(a)->state == llama_rerot_node_state::starting);
+
+    // 1. In STARTING state, forwarding FRAME bytes (even if containing "</think>")
+    // plans as frame and must NOT close or seal worker (§12.3 item 3).
+    auto frame_plan = runtime.plan_generated_token(ep_id, a, 10, "</think>");
+    CHECK(frame_plan.has_value());
+    CHECK(frame_plan->segment_kind == llama_rerot_segment_kind::frame);
+    CHECK(frame_plan->event_origin == llama_rerot_event_origin::runtime_frame);
+    CHECK(runtime.commit_token(ep_id, a, *frame_plan));
+    CHECK(!ep->nodes[a].is_sealed);
+    CHECK(ep->nodes[2].remaining_preds == 1); // Successor B remains blocked
+
+    // Complete admission -> worker A moves from STARTING to RUNNING.
+    CHECK(runtime.complete_admission(ep_id, a));
+    CHECK(ep->document.node(a)->state == llama_rerot_node_state::running);
+
+    // 2. Multi-token source-end: first token is candidate prefix ("</thi").
+    // Must remain body and PENDING, exit_parser enters candidate state, successor B remains blocked.
+    auto p1 = runtime.plan_generated_token(ep_id, a, 11, "</thi");
+    CHECK(p1.has_value());
+    CHECK(p1->segment_kind == llama_rerot_segment_kind::body);
+    CHECK(!p1->marker_step.marker_closed);
+    CHECK(ep->nodes[a].exit_parser.state() == server_rerot_marker_state::marker_candidate);
+    CHECK(runtime.commit_token(ep_id, a, *p1));
+    CHECK(!ep->nodes[a].is_sealed);
+    CHECK(ep->nodes[2].remaining_preds == 1);
+
+    // 3. Second token completes the marker ("nk>").
+    // Must plan as source_end, marker_closed = true, commit seals worker A and decrements B's remaining_preds to 0.
+    auto p2 = runtime.plan_generated_token(ep_id, a, 12, "nk>");
+    CHECK(p2.has_value());
+    CHECK(p2->segment_kind == llama_rerot_segment_kind::source_end);
+    CHECK(p2->marker_step.marker_closed);
+    CHECK(p2->event_origin == llama_rerot_event_origin::worker_source);
+    CHECK(runtime.commit_token(ep_id, a, *p2));
+    CHECK(ep->nodes[a].is_sealed);
+    CHECK(ep->nodes[2].remaining_preds == 0); // Successor B is now unlocked
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT Runtime Tests ===\n");
     test_c0_and_dag_admit_without_parked_seq();
@@ -5319,6 +5400,7 @@ int main() {
     test_dag_ensure_run_keeps_segment_kinds_distinct();
     test_dag_prefix_rebuild_reconciles_root_runs();
     test_dag_initialize_refuses_double_init();
+    test_dag_source_end_multi_token_and_starting_frame_gate();
     test_dag_three_lane_flat_cycle_and_peer_uptake();
     test_dag_diamond_and_unequal_length_history();
     test_dag_a_to_c_with_b_independent_overlap();
