@@ -1512,7 +1512,14 @@ run B: probe → simple → restore
 
 #### 当前状态
 
-**尚无本文可引用的当前 HEAD 真实模型通过证据。**
+**目标大模型（Ornith-1.5-35B）单 Worker 闭环验证已通过：**
+- 在隔离 CPU 实例（`-ngl 0 --device none -t 2 -c 4096 --total-kv 4096 -np 2`）上，对分配律计算 prompt（$13 \times 17$）执行完整 DAG 推理。
+- 观测验证事实：
+  - Worker 阶段通过模型原生生成 `</think>` 正常结束（`source_end_tokens=2`），无 runtime 强制截断或伪造完成；
+  - 节点严格执行 exactly-once `seal`，前置 FRAME 与 Prompt 前缀完全被归入 frame 且不向 API reasoning 泄漏；
+  - 0.synthesize 阶段从独立阶段启动并使用稳定最终 reader 视图生成新 logits；
+  - reasoning 与 content 严格分离，最终正文准确输出 `**221**`，无末尾多余 `</think>` 泄漏；
+  - 外部 HTTP 响应只有一次自然终止（`finish_reason: "stop"`）。
 
 ---
 
@@ -1734,9 +1741,9 @@ shadow
 | tokenizer-level source-end 无损边界 | **需模板逐个认证** |
 | W>P logical cohort + physical time-slice | 逻辑 cohort、冻结 read epoch 与物理分时已接线；完整状态/数值/错误门仍需验收 |
 | W active state budget/restore | **未完成完整门** |
-| final 0.synthesize clean cutover | 有 scaffolding，**无当前真实 E2E 证据** |
+| final 0.synthesize clean cutover | **已通过**（单 child 闭环下作为独立 stage 启动，使用稳定最终视图及新 logits，输出准确 221） |
 | 删除旧 random-ID/tree/fence production semantics | **未完全 clean cutover** |
-| target Ornith single child DAG | **未在本次更新中验证** |
+| target Ornith single child DAG | **已通过**（分配律 13x17=221 单 worker 自然 end 与 synthesis 闭环） |
 | target Ornith multi-lane DAG | **未验证** |
 | Tri/MTP/RAM/shift DAG matrix | **未重新认证** |
 | DAG quality/performance/soak | **未开始正式 gate** |
