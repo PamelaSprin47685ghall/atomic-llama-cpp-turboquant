@@ -1413,7 +1413,12 @@ Fixed-frame compositions= 384
 
 **生产路径拒绝 sandwich，阶段 2 核心协议与边界硬门已获单测全覆盖。** F_i 用真实请求 messages（无 chat 时才用 dummy user）+ spawn_lane 渲染 CLOSE+handoff+OPEN。ordinary C0 tape 与 DAG-with-tools 再渲染做 token LCP；工具后缀并入正式 P。模板无法无损渲染则 hard_abort。针对阶段 2 核心约束已单测验证（`test_dag_source_end_multi_token_and_starting_frame_gate`）：
 1. **STARTING FRAME 闭合隔离**（必须通过 3）：节点在 STARTING 阶段注入固定入口 F_i（即使含有 `</think>`）规划为 `frame` / `runtime_frame`，绝不触发 worker 完成或提前解锁后继；
-2. **多 Token Native Source-End 事务原子性**（必须通过 5）：源生成阶段跨 token 候选（如 `</thi` + `nk>`）在未闭合前保持 `body` / PENDING，后继依赖严格保持锁死，直到完整闭合 token commit 成功后原子转为 `source_end` 并解锁后继。
+2. **多 Token Native Source-End 事务原子性**（必须通过 5）：源生成阶段跨 token 候选（如 `</thi` + `nk>`）在未闭合前保持 `body` / PENDING，后继依赖严格保持锁死，直到完整闭合 token commit 成功后原子转为 `source_end` 并解锁后继；
+3. **实际原生工具回合固定入口（FRAME）跨模板全生命周期认证**（必须通过 1 与 2，`test_dag_actual_native_tool_round_frame_certification`）：在生产大模型真实 Jinja 模板（Qwen3.5、DeepSeek-V4、DeepSeek-V4-Flash、DeepSeek-V3.2 等）上，严格证明：
+   - 固定入口 $F_i$ 严格采用原生 `spawn_lane` 工具回合（关前段 reasoning + 发起内部 subagent tool_call + tool 结果返回目标 Lane 与 intent + 开启当前 reasoning），意图与参数严格由模板序列化，绝不依赖字符串拼接或硬编码特殊控制符；
+   - $F_i$ 具备完全的阶段独立性，只绑定目标节点意图与阶段，不依赖相邻兄弟、物理槽位或 GPU 行；
+   - 任意合法片段循环排列（如 Reader 1 视角 $P + B_2 + B_3 + B_1$，其中 $B_i = F_i + R_i$）在文本维度严格保证所有前置片段的 reasoning 全部配对闭合，唯独当前读者自己的 reasoning 保持打开；
+   - 终极综合视图（$P + B_1 + B_2 + B_3 + F_{\text{synth}}$）严格保证所有先前工作分支全部自然闭合，仅终极综合帧开启思考，达成严格的“总-分-总”认知闭环。
 真实 chat template / tokenizer 边界在目标模型 Ornith-1.5-35B 上已完成单 Worker 闭环验证。
 
 ---
@@ -1762,7 +1767,7 @@ shadow
 |---|---|
 | 真正隔离 probe branch | **已实现并认证通过**（`test_dag_c0_probe_to_simple_continuation_and_grammar_isolation` 证明 probe 丢弃后 C0 游标、recurrent 与采样器快照 100% 还原，普通续跑路径与无 probe 基准严格对齐；用户 JSON grammar 在 probe 期间隔离并于 simple 恢复；首个 worker token 严格基于 F_i 新 logits） |
 | C_base = 正式 P 之后的 state | **已实现并认证通过**（`capture_c_base` 在正式 P 完成后捕获；`test_dag_capture_c_base_snapshots_current_seed` 与 `test_dag_predecessor_completion_order_and_physical_row_invariance` 严格证明：多 stage 从 C_base 继承种子，前驱完成顺序与物理槽位/Pen 变动不改变后继种子与读者视图，且首写 COW 彼此完全隔离） |
-| actual native tool-round FRAME | 原生 tools 模板已接线；前缀变化在启动时重建，实际模型闭环仍需验收 |
+| actual native tool-round FRAME | **已实现并认证通过**（`test_dag_actual_native_tool_round_frame_certification` 在 Qwen3.5、DeepSeek-V4、DeepSeek-V4-Flash、DeepSeek-V3.2 等生产模板上，严格证明 $F_i$ 渲染基于原生 `spawn_lane` 工具回合与意图序列化，具备阶段独立性与槽位无关性；任意合法循环排列 $P + B_2 + B_3 + B_1$ 严格保证封口前段并独留当前读者 reasoning 打开；终极综合视图中所有前置工作片段自然完结闭合，唯独综合帧 reasoning 打开） |
 | tokenizer-level source-end 无损边界 | **已实现并认证通过**（`test_multi_template_source_end_boundary_certification` 覆盖 XML `</think>`、Command-R `[/THINK]`、ChatML `<|im_end|>`、Specialized `<|close|>think<|sep|>`, `<|END_THINKING|>`, `</mm:think>`, `<|channel|>` 等模板的 token 切分保留、候选 PENDING 挂起与 snapshot 还原） |
 | W>P logical cohort + physical time-slice | **已实现并认证通过**（`test_dag_w_gt_p_logical_cohort_and_time_slice_certification` 严格证明：在 $P=1, W=3$ 场景下，全部 eligible 节点同一调度边界进入逻辑 cohort，不待先前任务退出；分片切片执行期间冻结读取视界，后来切片绝不提前观测同一步未发布的 peer 写入；全员 commit 完成前绝不提前发布半个 frontier；全员 commit 后原子发布全量正文并统一更新读者视界；各节点自然完结释放依赖解锁综合） |
 | W active state budget/restore | **已实现并单测验证**（`test_dag_w_active_state_retention_and_swap` 证明挂起节点局部 state/sampler/hand 完整保留且换槽恢复后零丢失） |
