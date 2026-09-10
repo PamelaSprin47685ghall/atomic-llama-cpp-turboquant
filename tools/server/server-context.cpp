@@ -2980,6 +2980,9 @@ private:
         if (!slot.rerot_internal || slot.state != SLOT_STATE_GENERATING) {
             return true;
         }
+        // If a DAG frame finished injecting in this slice, slot.rerot_injection was
+        // reset to none in rerot_commit_inflight, but slot.i_batch has the valid
+        // logits row index for the first worker token!
         if (slot.rerot_injection != server_rerot_injection_kind::none ||
             slot.i_batch < off || slot.i_batch >= off + n_batch_tokens) {
             return true;
@@ -3728,28 +3731,28 @@ private:
                 rerot->hard_abort(episode_id, "rerot_protocol_error: DAG frame publication failed");
                 return false;
             }
+            // Native source-end parser is already armed (native_end=true).
+            // Do not install a must-close grammar on DAG workers (AGENTS.md §04).
+            server_task lane_task = rerot_clone_task(*slot.task);
+            rerot_remove_planner_grammar(lane_task.params);
+            common_sampler_ptr lane_sampler;
+            try {
+                lane_sampler.reset(common_sampler_init(
+                    model_tgt, lane_task.params.sampling, (int32_t) llama_n_ctx(ctx_tgt)));
+            } catch (const std::exception & e) {
+                rerot->hard_abort(
+                    episode_id,
+                    std::string("rerot_sampler_error: failed to arm DAG worker sampler: ") + e.what());
+                return false;
+            }
+            slot.task = std::make_unique<const server_task>(std::move(lane_task));
+            slot.smpl = std::move(lane_sampler);
+            rerot_bind_sampler(slot);
+
             const auto * lane_now = rerot->node(episode_id, node_id);
             if (!lane_now || lane_now->physical_slot != slot.id) {
                 rerot_park_slot_lineage(slot);
                 rerot_make_slot_idle(slot);
-            } else {
-                // Native source-end parser is already armed (native_end=true).
-                // Do not install a must-close grammar on DAG workers (AGENTS.md §04).
-                server_task lane_task = rerot_clone_task(*slot.task);
-                rerot_remove_planner_grammar(lane_task.params);
-                common_sampler_ptr lane_sampler;
-                try {
-                    lane_sampler.reset(common_sampler_init(
-                        model_tgt, lane_task.params.sampling, (int32_t) llama_n_ctx(ctx_tgt)));
-                } catch (const std::exception & e) {
-                    rerot->hard_abort(
-                        episode_id,
-                        std::string("rerot_sampler_error: failed to arm DAG worker sampler: ") + e.what());
-                    return false;
-                }
-                slot.task = std::make_unique<const server_task>(std::move(lane_task));
-                slot.smpl = std::move(lane_sampler);
-                rerot_bind_sampler(slot);
             }
             // No peer admission here: this runs mid commit-loop while other
             // rows of the slice are uncommitted. Admission happens centrally

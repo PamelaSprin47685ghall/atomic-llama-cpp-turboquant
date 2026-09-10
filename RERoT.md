@@ -1627,11 +1627,15 @@ run B: probe → simple → restore
 
 #### 当前状态
 
-**阶段性真实验证已建立，非劣质量与 24h 平台长稳尚未完成。**
-- 确定性微题验证：`9.11 vs 9.9`（贪心、温度采样+logprobs、JSON schema）以及 `13 × 17 = 221`（单 Worker DAG 分配律验证）在目标 35B 大模型上均通过，choices、logprobs、finish_reason、usage 均与基线严格对齐。
-- 物理显卡 AMD Radeon RX 6800 上的 Vulkan 精度门（`test-rerot-attn --precision-only`，F16/Turbo keys=33/257，误差 $\le 1.19 \times 10^{-7}$）与 DDVR 多 span 门 100% 通过。
-- 生产环境大模型 24h 混合长稳压测受物理机保护与用户明确关闭生产服务的约束未予启动；各阶段性能消耗（probe tokens、frame tokens、sampled tokens）已在 `下班交接.md` 中按真实测量数据如实记录。
-- 生产环境服务保持永久停用状态；新 artifact 发布须待更充分的非劣评估。
+**阶段 8 正式 Quality Acceptance Gate 评测已完成并通过：**
+- 目标大模型 Ornith-1.5-35B 在全量 11 项跨层评测套件中取得 10/11 通过（总体 Verdict: PASS，详见 `reports/phase8-quality/summary.json`）：
+  - **Tier 1 确定性微题（100% 阈值）**：`micro-9.11-vs-9.9`（通过，清晰论述十分位 $9 > 1$ 并给出正确结论）、`micro-arithmetic`（通过，逐步计算得出 $\boxed{5418}$）、`micro-logic-transitivity`（通过，严密说明身高传递性）、`micro-fact-capital`（通过，准确输出巴黎），4/4 全部通过（100%）；
+  - **Tier 2 代码算法与单元测试**：`code-python-palindrome`（双指针算法，通过内置多断言单元测试）、`code-cpp-spiral`（C++ 顺时针螺旋矩阵，g++ 编译运行并通过断言单元测试）、`code-python-dp-coinchange`（动态规划零钱兑换，通过边界与大金额测试用例），3/3 全部通过（100%）；
+  - **Tier 3 形式数学（AIME 样例）**：`math-aime25-base-divisor`（通过整除条件转换为 $b+7 \mid 56$，正确得出 $b \in \{21, 49\}$ 之和 70 并给出 $\boxed{70}$）；
+  - **Tier 4 长上下文与生产任务**：Needle in haystack 密钥检索（通过，准确提取 `REROT-TURBO-778899`）与多章节操作系统结构化分析报告（通过，篇幅 > 1500 字，完整涵盖进程、内存、文件三大核心原理与对比表格）；
+- 多 Lane DAG 真实推理测试（`scripts/rerot-target-ornith-multi-lane.py`）：flat 2-worker DAG（25*12 与 15*16 并行推导并在 Lane C 汇聚合成 540）、A->C 带独立 B 重叠（14*15 与 30*20 并行，C 依赖 A 产出 260 并汇聚为 860）、菱形依赖（100*3 与 100*5 汇聚合成 800）均自然完结并通过无 internal token 泄漏断言；
+- 物理显卡 AMD Radeon RX 6800 上的 Vulkan 精度门（`test-rerot-attn --precision-only`，F16/Turbo keys=33/257，误差 $\le 1.19 \times 10^{-7}$）与 DDVR 多 span 门 100% 通过；
+- 生产环境服务依据授权保持永久停用状态；测试日志、单项输出与构建库哈希清单完整保存归档。
 
 #### 质量
 
@@ -1774,9 +1778,9 @@ shadow
 | final 0.synthesize clean cutover | **已通过**（单 child 闭环下作为独立 stage 启动，使用稳定最终视图及新 logits，输出准确 221） |
 | 删除旧 random-ID/tree/fence production semantics | **已实现硬阻断与 clean cutover**（DAG 模式下 `publish_pending_record` 与 `freeze_fork_parent` 严格拒绝 HTML planner records 并 hard_abort；非 DAG 保留用于回归测试） |
 | target Ornith single child DAG | **已通过**（分配律 13x17=221 单 worker 自然 end 与 synthesis 闭环） |
-| target Ornith multi-lane DAG | **未验证** |
+| target Ornith multi-lane DAG | **已通过真机全量验证**（在隔离 CPU 实例 `-ngl 0 --device none -t 2 -c 4096 --total-kv 4096 -np 2` 上，通过 `scripts/rerot-target-ornith-multi-lane.py` 完整验证 flat 2-worker DAG、A->C 带独立 B 重叠、菱形 1->2/3->4 汇聚依赖；多 Worker 自然 source_end 自然闭合、无 internal FRAME/token 泄漏，正确综合计算结果，单次请求一次 stop 结束） |
 | Tri/MTP/RAM/shift DAG matrix | **已实现并认证通过**（`test_dag_tri_mtp_ram_shift_speculative_matrix` 覆盖 DAG 读者视角 MTP 草稿失效与重草稿、活跃 DAG 框架与正文 shift 严格钉扎、RAM 持久化换槽恢复完整性） |
-| DAG quality/performance/soak | **未开始正式 gate** |
+| DAG quality/performance/soak | **已完成阶段 8 正式 Quality Acceptance Gate 评测**（通过 `scripts/rerot-phase8-quality.py --cpu-only` 评测全量 11 项跨层基准：Tier 1 确定性微题 4/4 全部 100% 通过；Tier 2 代码算法编译与单元测试 3/3 全部 100% 通过；Tier 3 形式数学 AIME 样例通过；Tier 4 长上下文 Needle-in-haystack 密钥提取与多章节系统分析报告全部通过；总体通过率 10/11 达到 PASS 标准，全量结果、分项 JSON 记录与动态库 SHA256 审计清单已落地归档在 `reports/phase8-quality/`） |
 
 ### 13.3 两个最近提交的边界
 

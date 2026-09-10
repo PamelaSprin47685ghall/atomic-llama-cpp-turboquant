@@ -8,15 +8,23 @@
     "frontier": "strong"
   },
   "answer": "巴黎",
-  "reasoning": "The user is asking in Chinese: \"What is the capital of France? Please answer directly with the city name.\"\n\nThe capital of France is Paris. The user wants a direct answer with just the city name.\n\nI should respond in Chinese since they asked in Chinese, and give the direct answer.\n",
+  "reasoning": "The user is asking in Chinese: \"What is the capital of France? Please answer directly with the city name.\"\n\nThe capital of France is Paris.\n",
   "usage": {
-    "completion_tokens": 66,
-    "prompt_tokens": 21,
-    "total_tokens": 87,
+    "completion_tokens": 36,
+    "prompt_tokens": 41,
+    "total_tokens": 77,
     "prompt_tokens_details": {
       "cached_tokens": 0
+    },
+    "rerot": {
+      "prompt_tokens": 41,
+      "cached_tokens": 0,
+      "probe_tokens": 65,
+      "frame_tokens": 0,
+      "sampled_tokens": 36,
+      "source_end_tokens": 0
     }
   },
   "passed": true,
-  "wall_seconds": 1.1384027530439198
+  "wall_seconds": 5.344401619993732
 }

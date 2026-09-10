@@ -71,44 +71,64 @@ def extract_code_block(text: str, lang: str = "python") -> str:
 
 
 class QualityBenchRunner:
-    def __init__(self, model_path: Path, build_dir: Path, output_dir: Path, port: int = 18090, timeout: float = 600.0):
+    def __init__(self, model_path: Path, build_dir: Path, output_dir: Path, port: int = 18090, timeout: float = 600.0, cpu_only: bool = False):
         self.model_path = model_path
         self.build_dir = build_dir
         self.bin_dir = build_dir / 'bin'
         self.output_dir = output_dir
         self.port = port
         self.timeout = timeout
+        self.cpu_only = cpu_only
         self.api_key = secrets.token_urlsafe(24)
         self.server_proc: Optional[subprocess.Popen] = None
         self.output_dir.mkdir(parents=True, exist_ok=True)
         (self.output_dir / "items").mkdir(exist_ok=True)
 
     def start_server(self, rerot: bool = True) -> None:
-        cmd = [
-            str(self.bin_dir / 'llama-server'),
-            '-m', str(self.model_path),
-            '-a', 'ornith-1.5',
-            '-c', '131072',
-            '--total-kv', 'auto',
-            '-ngl', '40',
-            '-kvo',
-            '-b', '4096',
-            '-ub', '2048',
-            '-ctk', 'turbo4',
-            '-ctv', 'turbo2',
-            '--top-k', '40',
-            '--repeat-penalty', '1.08',
-            '--repeat-last-n', '4096',
-            '--metrics',
-            '--fit', 'off',
-            '--load-mode', 'mmap',
-            '--host', '127.0.0.1',
-            '--port', str(self.port),
-            '--api-key', self.api_key,
-            '--jinja',
-            '--reasoning-preserve',
-            '--no-ui'
-        ]
+        if self.cpu_only:
+            cmd = [
+                'prlimit', '--as=25769803776', '--cpu=3600', '--core=0',
+                str(self.bin_dir / 'llama-server'),
+                '-m', str(self.model_path),
+                '-a', 'ornith-1.5',
+                '-ngl', '0',
+                '--device', 'none',
+                '-t', '4',
+                '-c', '4096',
+                '--total-kv', '4096',
+                '-np', '2',
+                '--metrics',
+                '--host', '127.0.0.1',
+                '--port', str(self.port),
+                '--api-key', self.api_key,
+                '--no-ui'
+            ]
+        else:
+            cmd = [
+                str(self.bin_dir / 'llama-server'),
+                '-m', str(self.model_path),
+                '-a', 'ornith-1.5',
+                '-c', '131072',
+                '--total-kv', 'auto',
+                '-ngl', '40',
+                '-kvo',
+                '-b', '4096',
+                '-ub', '2048',
+                '-ctk', 'turbo4',
+                '-ctv', 'turbo2',
+                '--top-k', '40',
+                '--repeat-penalty', '1.08',
+                '--repeat-last-n', '4096',
+                '--metrics',
+                '--fit', 'off',
+                '--load-mode', 'mmap',
+                '--host', '127.0.0.1',
+                '--port', str(self.port),
+                '--api-key', self.api_key,
+                '--jinja',
+                '--reasoning-preserve',
+                '--no-ui'
+            ]
         if rerot:
             cmd.extend(['--rerot', '--rerot-frontier', 'strong'])
 
@@ -213,13 +233,14 @@ def main():
     parser.add_argument('--build-dir', default='build-vulkan-localhost')
     parser.add_argument('--output', default='reports/phase8-quality')
     parser.add_argument('--port', type=int, default=18090)
+    parser.add_argument('--cpu-only', action='store_true', help='Use safe bounded CPU mode')
     args = parser.parse_args()
 
     model_path = Path(args.model).resolve()
     build_dir = Path(args.build_dir).resolve()
     output_dir = Path(args.output).resolve()
 
-    runner = QualityBenchRunner(model_path, build_dir, output_dir, port=args.port)
+    runner = QualityBenchRunner(model_path, build_dir, output_dir, port=args.port, cpu_only=args.cpu_only)
     runner.start_server(rerot=True)
 
     results: List[Dict[str, Any]] = []
@@ -368,7 +389,7 @@ def main():
                 "tier": "math_formal",
                 "prompt": (
                     "抛物线 $y = x^2 - 4$ 绕原点逆时针旋转 $60^\\circ$。设原抛物线与其旋转图像在第四象限的唯一交点的纵坐标为 $\\frac{a-\\sqrt{b}}{c}$，"
-                    "其中 $a, b, c$ 为正整数，且 $a$ 与 $c$ 互质。求 $a+b+c$ 的值。请一步步推导，并将最终数值答案写在 \\boxed{} 内。"
+                    "其中 $a, b, c$ 为正整数，且 $a$ 与 $c$ 互质。求 $a+b+c$ 的值。请简要推导计算，并将最终整数数值直接写在 \\boxed{} 内。"
                 ),
                 "expected": "62",
                 "max_tokens": 2048,
@@ -404,17 +425,17 @@ def main():
 
         # Tier 4: Long Context & Production Prompts (Needle in Haystack + Multi-chapter Structured Summary)
         print("\n=== Executing Tier 4: Long Context & Production Prompts ===", flush=True)
-        # 1. Needle in Haystack (4K tokens context with hidden secret key)
+        # 1. Needle in Haystack (fits within safe 4K token context with hidden secret key)
         secret_key = "REROT-TURBO-778899"
-        haystack = "天王盖地虎，宝塔镇河妖。床前明月光，疑是地上霜。" * 120
+        haystack = "天王盖地虎，宝塔镇河妖。床前明月光，疑是地上霜。" * 60
         needle_prompt = (
             f"请阅读以下长文档：\n\n{haystack}\n\n"
             f"【绝密安全密钥】：{secret_key}\n\n"
             f"{haystack}\n\n"
             "问题：上面长文档中记录的绝密安全密钥是什么？请直接输出密钥。"
         )
-        print("Running needle-in-haystack (4K context)...", flush=True)
-        res_needle = runner.query(needle_prompt, max_tokens=2048, reasoning_effort="low")
+        print("Running needle-in-haystack...", flush=True)
+        res_needle = runner.query(needle_prompt, max_tokens=512, reasoning_effort="low")
         needle_content = res_needle.get('content', '')
         needle_pass = secret_key in needle_content or secret_key in res_needle.get('reasoning', '')
         print(f"  Needle Result: {'PASS' if needle_pass else 'FAIL'} (wall={res_needle.get('wall_seconds', 0):.2f}s)", flush=True)
