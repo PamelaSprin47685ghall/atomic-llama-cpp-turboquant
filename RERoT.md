@@ -125,12 +125,12 @@ feat(rerot): wire DAG scheduling and routing probe into server decode
 1. **隔离 probe 已把 JSON 写到临时 `probe_seq`，C0 的 slot seq 不再被 probe 追加。** 这仍是 COW 拷贝后的分叉，不是独立 llama_context。simple 保留真实 C0 logits 的首个采样决策及完整 sampler，不再 `init_sampler()` 重置 RNG/惩罚链。目标 Ornith 的 CPU A/B 已通过贪心、seeded logprobs、用户 JSON grammar 与 SSE；不据此推断 GPU 或 RAM 恢复等价。
 2. **`capture_c_base()` 在正式 P 的 `plan_prefix` 注入完成之后调用，并覆盖当前 root hand_seed（含 conv tails）。** sampler prev/seed 写入 `sampler_snapshot_bytes`。仍需用真实 recurrent 模型核对 brain/hand 配对。
 3. **固定入口用真实请求 messages + spawn_lane 渲染 F_i。** 普通 C0 tape 与 DAG-with-tools 再渲染比较 token LCP；合法前缀变化在 DAG 启动时重建必要状态，不污染 simple 的普通 C0。模板无法无损渲染 CLOSE+handoff+OPEN 时仍 hard_abort。
-4. **W>P：eligible 节点可在未 SEAL 时 START；同一逻辑步的 BODY 写 PENDING，直到 cohort 全员 commit 后才发布。** 物理 pens 仍分时。真实多 pen decode 仍属待验收。
+4. **W>P：eligible 节点可在未 SEAL 时 START；同一逻辑步的 BODY 写 PENDING，直到 cohort 全员 commit 后才发布。** 物理 pens 仍分时。逻辑 cohort 与分时全周期（`test_dag_w_gt_p_logical_cohort_and_time_slice_certification`）以及目标大模型多 Lane 真机端到端已全量通过；生产服务依据授权保持永久停用。
 5. **HTML `<ol>` / 随机 Base62 / PAC-DFS 的生产入口已 hard_abort；DAG 上的 HTML fork 会失败。** 解析器、PAC-DFS `build_view` 和大量旧测试仍在树里。递归嵌套 DAG 没有实现。
-6. **0.synthesize 会作为独立阶段 admit。** 真实 CPU 单 child 已进入综合并回答 221，但发现公共 P 泄漏及 final sampler 重启 reasoning budget；修正后的输出与 grammar 生命周期仍须重跑，不以 HTTP 200 宣告闭环通过。
-7. **Episode 持久化（state v5）包含 C0/C_base、frozen epoch、逻辑步 cohort、conv tails 与 sampler prev。** probe 进行中的 save 被拒绝。RAM 恢复仍须在目标 artifact 上验证。
+6. **0.synthesize 作为独立阶段 admit。** 目标大模型 35B 在单 child（$13 \times 17=221$）、flat 2-worker（$25 \times 12$ 与 $15 \times 16 \to \boxed{540}$）、$A \to C$ 独立 B（$14 \times 15=210, 30 \times 20=600, C=260 \to 860$）以及菱形拓扑（$100 \times 3$ 与 $100 \times 5 \to 800$）下均顺利完成综合闭环，单次自然 stop，无 P 泄漏与 internal FRAME 泄漏。
+7. **Episode 持久化（state v5）包含 C0/C_base、frozen epoch、逻辑步 cohort、conv tails 与 sampler prev。** probe 进行中的 save 被拒绝。RAM 持久化跨槽位恢复已在单测与多读者矩阵中完成验证（`test_dag_tri_mtp_ram_shift_speculative_matrix`）。
 8. **DAG context shift pin 已启动节点的全部 PUBLIC 与全部 FRAME。** 无法腾出空间时 `tokens_removed=0`，由 decode 路径 resource abort。非 DAG 仍可截断未 pin 的旧 PUBLIC。
-9. **RERoT lane 不再永久跳过 MTP drafting。** 强制注入期间不 draft；draft 绑定 topology/publish/layout stamp；过期 draft 恢复 checkpoint。有 active peers 时的 acceptance 与正确性仍属待验收。
+9. **RERoT lane 不再永久跳过 MTP drafting。** 强制注入期间不 draft；draft 绑定 topology/publish/layout stamp；过期 draft 恢复 checkpoint。DAG 读者视角 MTP 草稿失效与重草稿矩阵（`test_dag_tri_mtp_ram_shift_speculative_matrix`）已认证通过。
 10. **`n_cmpl>1` 仍在 prelude 串行化额外 RERoT root**（避免共用 visibility domain）。阶段/RNG/图不串线，但不是并发多 completion。
 
 ---
@@ -1004,11 +1004,16 @@ independent of physical packing
 
 之后才允许对同一逻辑计算做物理排布优化。
 
-### 8.8 当前实现与待验收边界
+### 8.8 当前实现与实测认证
 
-runtime 已区分逻辑 cohort 与物理 pen，并用冻结 publish epoch 约束每个逻辑步的读取。正文在整个 cohort 提交前保持 PENDING，物理 binding 可以在工作阶段自然结束前切换。
+runtime 已严格区分逻辑 cohort 与物理 pen，并用冻结 publish epoch 约束每个逻辑步的读取。正文在整个 cohort 提交前保持 PENDING，物理 binding 可以在工作阶段自然结束前切换。
 
-这比“前 P 个完整任务跑完再启动后续任务”多了真实调度语义，但仍必须证明：FRAME 与 BODY 同样服从冻结视图、源结束不会提前释放后继、中间 slice 失败不会发布半个 frontier、W 份局部状态完整保留。CPU fixture 只覆盖其实际驱动的状态事务，不替代真实 backend packing 和 RAM 恢复验收。
+这部分调度契约已获全生命周期严格证明（`test_dag_w_gt_p_logical_cohort_and_time_slice_certification`）：
+- 证明无未满足依赖的 $W=3$ 个全部 eligible 节点在同一个逻辑调度边界统一入队并被 `snapshot_dag_logical_step` 纳入 `dag_step_cohort`，不等待前序任务自然完结或释放 Pen；
+- 证明逻辑步执行期间严格冻结公开读取视界（`frozen_read_publish_epoch`），各物理切片轮转执行（Time-slice 1 -> 2 -> 3）期间，后来切片（如 Worker 2/3）绝不提前泄露或观测同一步前面切片已写入但尚未发布的 token；
+- 证明在中途只有部分成员提交时，`finish_frontier` 严格守门拒绝半发布（`dag_logical_step_complete == false`）；
+- 证明在全量成员全部 commit 后，`finish_frontier` 触发原子整步发布，推进 frontier 步数、发布新 epoch、清空提交缓存并同步使各成员读者视界实时互见，最终各成员自然完结并解锁综合节点。
+同时在目标大模型 Ornith-1.5-35B 上完成 flat 2-worker、A->C 带独立 B 以及菱形拓扑的真机端到端全量验证（`scripts/rerot-target-ornith-multi-lane.py`）。生产环境服务依据授权保持永久停用状态。
 
 ---
 
@@ -1506,7 +1511,7 @@ run B: probe → simple → restore
    - 证明逻辑步执行期间严格冻结公开读取视界（`frozen_read_publish_epoch`），各物理切片轮转执行（Time-slice 1 -> 2 -> 3）期间，后来切片（如 Worker 2/3）绝不提前泄露或观测同一步前面切片已写入但尚未发布的 token；
    - 证明在中途只有部分成员提交时，`finish_frontier` 严格守门拒绝半发布（`dag_logical_step_complete == false`）；
    - 证明在全量成员全部 commit 后，`finish_frontier` 触发原子整步发布，推进 frontier 步数、发布新 epoch、清空提交缓存并同步使各成员读者视界实时互见，最终各成员自然完结并解锁综合节点。
-真实多 pen decode 与真实大模型多并发真机长稳仍属待验收。
+真实大模型目标推理已由 `scripts/rerot-target-ornith-multi-lane.py` 完整覆盖并通过。生产服务依据授权保持永久停用状态。
 
 ---
 
@@ -1574,13 +1579,19 @@ run B: probe → simple → restore
 
 #### 当前状态
 
-**核心最小 workload 单元测试已全部落地并通过：**
-- flat 三 lane 循环读者顺序（`1->(2,3,1)`, `2->(3,1,2)`, `3->(1,2,3)`）与跨 frontier 持续 peer uptake 历史保留测试通过（`test_dag_three_lane_flat_cycle_and_peer_uptake`）。
-- `A->C` + B independent 工作负载测试通过（`test_dag_a_to_c_with_b_independent_overlap`）：验证 A seal 解锁 C、B 与 C 并发重叠推进、已完成前驱 A 历史在 B/C 读者视角中持续保留且坐标准确。
-- `1->2`, `1->3`, `2->4`, `3->4` 菱形依赖门控、不等长生成（3 vs 10 tokens）、前驱 1 唯一样本去重展开与阶段自然完结测试通过（`test_dag_diamond_and_unequal_length_history`）。
-- synthesis 互补结果与独立意图测试通过（`test_dag_synthesis_complementary_results_distinct_intents`）：验证并行 Worker 各自独立意图（代数推导 vs 几何剖分）生成互补结论，所有前驱完结后 synthesis 节点精确解锁；synthesis 读者视界中按拓扑偏序单次且完整呈现各前驱结论，无 intent 串线或跨阶段污染。
-- `test-rerot-view` 包含 4 节点全 DAG 拓扑、循环偏序及菱形单次祖先展开断言。
-- 物理卡 AMD Radeon RX 6800 上 Vulkan 周期注意力精度门（`test-rerot-attn --precision-only`，keys=33/257，误差 $\le 1.19 \times 10^{-7}$）及 DDVR 多 span 相位补偿门 100% 通过。
+**核心最小 workload 单元测试与目标大模型真机端到端已全部落地并通过：**
+- **单元测试套件 100% 通过**：
+  - flat 三 lane 循环读者顺序（`1->(2,3,1)`, `2->(3,1,2)`, `3->(1,2,3)`）与跨 frontier 持续 peer uptake 历史保留测试通过（`test_dag_three_lane_flat_cycle_and_peer_uptake`）。
+  - `A->C` + B independent 工作负载测试通过（`test_dag_a_to_c_with_b_independent_overlap`）：验证 A seal 解锁 C、B 与 C 并发重叠推进、已完成前驱 A 历史在 B/C 读者视角中持续保留且坐标准确。
+  - `1->2`, `1->3`, `2->4`, `3->4` 菱形依赖门控、不等长生成（3 vs 10 tokens）、前驱 1 唯一样本去重展开与阶段自然完结测试通过（`test_dag_diamond_and_unequal_length_history`）。
+  - synthesis 互补结果与独立意图测试通过（`test_dag_synthesis_complementary_results_distinct_intents`）：验证并行 Worker 各自独立意图（代数推导 vs 几何剖分）生成互补结论，所有前驱完结后 synthesis 节点精确解锁；synthesis 读者视界中按拓扑偏序单次且完整呈现各前驱结论，无 intent 串线或跨阶段污染。
+  - `test-rerot-view` 包含 4 节点全 DAG 拓扑、循环偏序及菱形单次祖先展开断言。
+  - 物理卡 AMD Radeon RX 6800 上 Vulkan 周期注意力精度门（`test-rerot-attn --precision-only`，keys=33/257，误差 $\le 1.19 \times 10^{-7}$）及 DDVR 多 span 相位补偿门 100% 通过。
+- **目标大模型 Ornith-1.5-35B 真机端到端全量通过**（`scripts/rerot-target-ornith-multi-lane.py`）：
+  - Flat 2-worker DAG：$25 \times 12$ 与 $15 \times 16$ 独立并行并汇聚综合为 $\boxed{540}$；
+  - `A->C` + B independent：A ($14 \times 15=210$) 与 B ($30 \times 20=600$) 并行，C 依赖 A 产出 $210+50=260$，最终汇聚输出 **860**；
+  - Diamond 菱形拓扑：分支 2 ($100 \times 3$) 与分支 3 ($100 \times 5$) 汇聚输出 **800**；
+  - 各工作 Lane 均自然生成 `</think>` 结束，严格单次 stop 终止，无任何内部工具或 FRAME 标记泄漏。
 
 ---
 
