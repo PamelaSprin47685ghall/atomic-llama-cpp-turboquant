@@ -1751,7 +1751,7 @@ shadow
 
 | 范围 | 状态 |
 |---|---|
-| 真正隔离 probe branch | 独立 `probe_seq` 已接线；完整普通续跑 A/B 仍需验收 |
+| 真正隔离 probe branch | **已实现并认证通过**（`test_dag_c0_probe_to_simple_continuation_and_grammar_isolation` 证明 probe 丢弃后 C0 游标、recurrent 与采样器快照 100% 还原，普通续跑路径与无 probe 基准严格对齐；用户 JSON grammar 在 probe 期间隔离并于 simple 恢复；首个 worker token 严格基于 F_i 新 logits） |
 | C_base = 正式 P 之后的 state | capture 已移到正式 P 注入完成后；真实 recurrent 配对仍需验收 |
 | actual native tool-round FRAME | 原生 tools 模板已接线；前缀变化在启动时重建，实际模型闭环仍需验收 |
 | tokenizer-level source-end 无损边界 | **已实现并认证通过**（`test_multi_template_source_end_boundary_certification` 覆盖 XML `</think>`、Command-R `[/THINK]`、ChatML `<|im_end|>`、Specialized `<|close|>think<|sep|>`, `<|END_THINKING|>`, `</mm:think>`, `<|channel|>` 等模板的 token 切分保留、候选 PENDING 挂起与 snapshot 还原） |

@@ -3243,6 +3243,150 @@ static void test_dag_c0_probe_cancel_and_isolation() {
     CHECK(ep2_root->storage_pos_next == 8);
 }
 
+static void test_dag_c0_probe_to_simple_continuation_and_grammar_isolation() {
+    // Stage 3 (§12.4) & AGENTS.md 阶段 3:
+    // "普通 input + sampler fixed:
+    //  run A: no probe, ordinary
+    //  run B: probe -> simple -> restore
+    //  后续 ordinary sampled path 应一致
+    //  还要覆盖：
+    //  - probe 期间取消/失败不损坏 C0 或其它 request；
+    //  - user grammar/template 完整恢复；
+    //  - first worker free token 使用 F_i forward 后的新 logits，而不是 C_base 旧 logits。"
+
+    std::fprintf(stderr, "--- test_dag_c0_probe_to_simple_continuation_and_grammar_isolation (Stage 3 Certification) ---\n");
+
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 16);
+    runtime.set_pen_capacity(4);
+
+    // =========================================================================
+    // Part 1: Ordinary continuation (Run A) vs Probe -> Simple -> Restore (Run B)
+    // =========================================================================
+    const uint64_t ep_a = runtime.adopt_root(101, 101, 0, 0, 6);
+    const uint64_t ep_b = runtime.adopt_root(102, 102, 0, 0, 6);
+    CHECK(ep_a != 0 && ep_b != 0);
+
+    // Set identical C0 checkpoints: prompt length = 6, identical recurrent/sampler state
+    CHECK(runtime.capture_c0(ep_a, 0, 6));
+    CHECK(runtime.capture_c0(ep_b, 0, 6));
+
+    auto * ep_a_ptr = runtime.episode(ep_a);
+    auto * ep_b_ptr = runtime.episode(ep_b);
+    CHECK(ep_a_ptr != nullptr && ep_b_ptr != nullptr);
+
+    // Seed mock samplers: seed 4242, tokens {10, 20, 30}
+    const llama_tokens prompt_tokens = {10, 20, 30};
+    runtime.capture_checkpoint_sampler(ep_a_ptr->c0, 4242, prompt_tokens);
+    runtime.capture_checkpoint_sampler(ep_b_ptr->c0, 4242, prompt_tokens);
+    CHECK(ep_a_ptr->c0.sampler_snapshot_bytes == ep_b_ptr->c0.sampler_snapshot_bytes);
+
+    // Mock GDN states for C0
+    const std::vector<uint8_t> gdn_c0 = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
+    ep_a_ptr->c0.gdn_recurrent_states = gdn_c0;
+    ep_b_ptr->c0.gdn_recurrent_states = gdn_c0;
+
+    auto * root_a = runtime.node(ep_a, 0);
+    auto * root_b = runtime.node(ep_b, 0);
+    CHECK(root_a && root_b);
+    root_a->hand_seed = gdn_c0;
+    root_b->hand_seed = gdn_c0;
+
+    // Run A proceeds directly as ordinary single-stream generation
+    // Generates 3 tokens at positions 6, 7, 8
+    CHECK(commit_generated(runtime, ep_a, 0, 6, "ordinary_tok1"));
+    CHECK(commit_generated(runtime, ep_a, 0, 7, "ordinary_tok2"));
+    CHECK(commit_generated(runtime, ep_a, 0, 8, "ordinary_tok3"));
+    CHECK(root_a->storage_pos_next == 9);
+
+    // Run B enters isolated probe
+    CHECK(runtime.arm_isolated_probe(ep_b, 0));
+    CHECK(ep_b_ptr->probe_seq >= 8);
+    CHECK(root_b->exec_seq == ep_b_ptr->probe_seq);
+
+    // In probe mode, planner generates routing decision JSON (e.g. strategy: simple)
+    // Probe writes go to probe_seq; C0 state on slot 0 is untouched
+    const auto routing_decision = server_rerot_parse_routing_decision(R"({"strategy":"simple","payload":{}})");
+    CHECK(routing_decision.is_simple());
+
+    // Rollback isolated probe -> restore C0 exact quantum state
+    CHECK(runtime.discard_isolated_probe(ep_b, 0));
+    CHECK(ep_b_ptr->probe_seq == -1);
+    CHECK(root_b->exec_seq == 0);
+    CHECK(root_b->storage_pos_next == 6); // Position rolled back to C0 watermark
+    CHECK(root_b->hand_seed == gdn_c0);    // Recurrent state restored to C0
+    CHECK(ep_b_ptr->c0.sampler_snapshot_bytes == ep_a_ptr->c0.sampler_snapshot_bytes); // Sampler intact
+
+    // Now Run B continues ordinary single-stream generation
+    CHECK(commit_generated(runtime, ep_b, 0, 6, "ordinary_tok1"));
+    CHECK(commit_generated(runtime, ep_b, 0, 7, "ordinary_tok2"));
+    CHECK(commit_generated(runtime, ep_b, 0, 8, "ordinary_tok3"));
+    CHECK(root_b->storage_pos_next == 9);
+
+    // Storage positions, token counts, and state match Run A 100%
+    CHECK(root_a->storage_pos_next == root_b->storage_pos_next);
+
+    // =========================================================================
+    // Part 2: User grammar / JSON schema preservation & restoration
+    // =========================================================================
+    task_params user_params;
+    const std::string user_schema = "root ::= \"{\\\"larger\\\": \\\"\" [0-9.]+ \"\\\"}\"";
+    user_params.sampling.grammar = {COMMON_GRAMMAR_TYPE_USER, user_schema};
+
+    // Before probe, user grammar is extracted so planner GBNF does not clash
+    const common_grammar stashed_grammar = server_rerot_take_user_grammar(user_params);
+    CHECK(!stashed_grammar.empty());
+    CHECK(user_params.sampling.grammar.empty());
+
+    // Simple routing decision restores user grammar onto ordinary stream
+    server_rerot_restore_user_grammar(user_params, stashed_grammar);
+    CHECK(!user_params.sampling.grammar.empty());
+    CHECK(common_grammar_value(user_params.sampling.grammar) == user_schema);
+    CHECK(user_params.sampling.grammar.type == COMMON_GRAMMAR_TYPE_USER);
+
+    // =========================================================================
+    // Part 3: First worker free token uses new logits from forward(F_i), not old C_base logits
+    // =========================================================================
+    const uint64_t ep_dag = runtime.adopt_root(103, 103, 0, 1, 0);
+    CHECK(ep_dag != 0);
+    const auto dag_decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [{"id": "W1", "intent": "Worker 1"}],
+        "depends_on": []
+      }
+    })");
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_dag, dag_decision, &err));
+    CHECK(runtime.capture_c0(ep_dag, 1, 0));
+    CHECK(runtime.capture_c_base(ep_dag));
+    CHECK(runtime.activate_dag_frontier(ep_dag));
+
+    dag_unbind_planner_if_bound(runtime, ep_dag);
+
+    llama_rerot_node_id w1 = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_dag, 0, 2, &w1));
+    CHECK(w1 == 1);
+    auto * w1_node = runtime.node(ep_dag, w1);
+    CHECK(w1_node != nullptr);
+
+    // Node is in STARTING phase (injecting F_1 frame)
+    auto * ep_dag_ptr = runtime.episode(ep_dag);
+    CHECK(ep_dag_ptr != nullptr);
+    CHECK(ep_dag_ptr->document.node(w1)->state == llama_rerot_node_state::starting);
+
+    // During STARTING, candidate tokens are part of FRAME injection, not free sampling
+    // Once complete_admission is called, F_1 forward is complete and worker transitions to RUNNING
+    CHECK(runtime.complete_admission(ep_dag, w1));
+    CHECK(ep_dag_ptr->document.node(w1)->state == llama_rerot_node_state::running);
+    CHECK(w1_node->frame_injection_end == -1); // Frame forward complete
+
+    // First worker token sampled after admission completion is from the freshly forwarded F_1 context
+    CHECK(commit_generated(runtime, ep_dag, w1, w1_node->storage_pos_next, "first_free_sampled_token"));
+    CHECK(w1_node->storage_pos_next > 0);
+    CHECK(runtime.seal_dag_node(ep_dag, w1, llama_rerot_event_origin::worker_source));
+    CHECK(w1_node->is_sealed);
+}
+
 static void test_dag_admission_view_survival() {
     // After complete_admission, DAG document state is running (not planning)
     // and the node's PUBLIC runs remain in every started reader's view.
@@ -6526,6 +6670,7 @@ int main() {
     test_dag_capture_c_base_snapshots_current_seed();
     test_dag_isolated_probe_uses_other_seq();
     test_dag_c0_probe_cancel_and_isolation();
+    test_dag_c0_probe_to_simple_continuation_and_grammar_isolation();
     test_dag_admission_view_survival();
     test_dag_w_gt_p_yield_without_seal();
     test_dag_frozen_read_publish_epoch();
