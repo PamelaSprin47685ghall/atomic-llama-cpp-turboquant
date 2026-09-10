@@ -14,6 +14,7 @@
 #include <sstream>
 #include <fstream>
 #include <limits>
+#include <chrono>
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -1153,9 +1154,15 @@ json oaicompat_chat_params_parse(
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;
+    llama_params["rerot_chat_messages"] = messages;
+    if (tools.is_array()) {
+        llama_params["rerot_chat_tools"] = tools;
+    }
+    llama_params["rerot_chat_now_ms"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+        inputs.now.time_since_epoch()).count();
     if (!chat_params.grammar.empty()) {
         llama_params["grammar"]      = chat_params.grammar;
-        llama_params["grammar_type"] = std::string("tool_calls");
+        llama_params["grammar_type"] = !inputs.json_schema.empty() ? std::string("output_format") : std::string("tool_calls");
     }
     llama_params["grammar_lazy"] = chat_params.grammar_lazy;
     auto grammar_triggers        = json::array();
@@ -1187,8 +1194,9 @@ json oaicompat_chat_params_parse(
     // This is NOT Anthropic's native semantics: current Claude effort is a
     // soft behavioral signal, not a strict token allocation. Do not invent an
     // absolute budget when the request has no finite output cap.
-    // RERoT continues to own its private random-ID lifecycle.
-    if (!json_value(body, "rerot", false)) {
+    // RERoT must capture the same ordinary C0 sampler configuration. Its
+    // internal planning/worker phases disable budgets on their own copies.
+    {
         const bool explicit_budget =
             (body.contains("reasoning_budget_tokens") && !body.at("reasoning_budget_tokens").is_null()) ||
             (body.contains("thinking_budget_tokens") && !body.at("thinking_budget_tokens").is_null());

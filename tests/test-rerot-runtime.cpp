@@ -1,5 +1,6 @@
 #include "server-rerot.h"
 #include "server-task.h"
+#include "llama.h"
 #include "llama-context.h"
 #include "llama-grammar.h"
 #include "llama-model.h"
@@ -3061,6 +3062,7 @@ static void test_c0_and_dag_admit_without_parked_seq() {
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    CHECK(runtime.activate_dag_frontier(ep_id));
 
     llama_rerot_node_id admitted = LLAMA_REROT_NODE_INVALID;
     CHECK(runtime.admit_next_child(ep_id, 1, 2, &admitted));
@@ -3070,10 +3072,1484 @@ static void test_c0_and_dag_admit_without_parked_seq() {
     CHECK(runtime.complete_admission(ep_id, admitted));
 }
 
+static bool dag_view_has_run(const llama_rerot_reader_view & view, llama_rerot_run_id run_id) {
+    for (const auto & run : view.runs) {
+        if (run.run_id == run_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool dag_view_has_owner(const llama_rerot_reader_view & view, llama_rerot_node_id owner) {
+    for (const auto & run : view.runs) {
+        if (run.owner == owner) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool dag_queue_contains(
+        const std::deque<llama_rerot_node_id> & queue,
+        llama_rerot_node_id node_id) {
+    return std::find(queue.begin(), queue.end(), node_id) != queue.end();
+}
+
+static void dag_unbind_planner_if_bound(server_rerot_runtime & runtime, uint64_t ep_id) {
+    auto * root = runtime.node(ep_id, 0);
+    if (root && root->physical_slot >= 0) {
+        CHECK(runtime.detach_node(ep_id, 0));
+    }
+}
+
+static bool dag_state_is_live_worker(llama_rerot_node_state state) {
+    return state == llama_rerot_node_state::running ||
+           state == llama_rerot_node_state::terminal_running;
+}
+
+static void test_dag_capture_c_base_snapshots_current_seed() {
+    // C_base is a snapshot of the current seed. Empty GDN is valid; validity
+    // is not "episode_id != 0 && gdn nonempty".
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(4);
+    const uint64_t ep_id = runtime.adopt_root(12, 12, 0, 1, 0);
+    CHECK(ep_id != 0);
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    auto * ep = runtime.episode(ep_id);
+    auto * root = runtime.node(ep_id, 0);
+    CHECK(ep != nullptr);
+    CHECK(root != nullptr);
+    CHECK(ep->c0.valid());
+    CHECK(ep->c0.gdn_recurrent_states.empty());
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(ep->c_base.valid());
+    CHECK(ep->c_base.gdn_recurrent_states.empty());
+
+    const std::vector<uint8_t> seed = {11, 22, 33, 44};
+    root->hand_seed = seed;
+    ep->c0.gdn_recurrent_states = {9, 9};
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(ep->c_base.valid());
+    CHECK(ep->c_base.gdn_recurrent_states == seed);
+    root->hand_seed = {1};
+    CHECK(ep->c_base.gdn_recurrent_states == seed);
+}
+
+static void test_dag_isolated_probe_uses_other_seq() {
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 16);
+    runtime.set_pen_capacity(2);
+    const uint64_t ep_id = runtime.adopt_root(20, 20, 0, 0, 4);
+    CHECK(ep_id != 0);
+    CHECK(runtime.capture_c0(ep_id, 0, 4));
+    CHECK(runtime.arm_isolated_probe(ep_id, 0));
+    auto * ep = runtime.episode(ep_id);
+    auto * root = runtime.node(ep_id, 0);
+    CHECK(ep != nullptr && root != nullptr);
+    CHECK(ep->probe_seq >= 8);
+    CHECK(ep->probe_seq != 0);
+    CHECK(root->exec_seq == ep->probe_seq);
+    CHECK(runtime.discard_isolated_probe(ep_id, 0));
+    CHECK(ep->probe_seq == -1);
+    CHECK(root->exec_seq == 0);
+    CHECK(root->storage_pos_next == 4);
+    CHECK(!runtime.discard_isolated_probe(ep_id, 0));
+}
+
+static void test_dag_admission_view_survival() {
+    // After complete_admission, DAG document state is running (not planning)
+    // and the node's PUBLIC runs remain in every started reader's view.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(4);
+
+    const uint64_t ep_id = runtime.adopt_root(13, 13, 0, 1, 0);
+    CHECK(ep_id != 0);
+
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Synthesize C"}
+        ],
+        "depends_on": [
+          {"id": "C", "depends_on_id": "A"}
+        ]
+      }
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->nodes[1].remaining_preds == 0);
+    CHECK(ep->nodes[2].remaining_preds == 0);
+    CHECK(ep->nodes[3].remaining_preds == 1);
+
+    // Formal base capture after init, before any ready work.
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    ep->ready_queue.clear();
+    CHECK(runtime.activate_dag_frontier(ep_id));
+    CHECK(dag_queue_contains(ep->ready_queue, 1));
+    CHECK(dag_queue_contains(ep->ready_queue, 2));
+    CHECK(!dag_queue_contains(ep->ready_queue, 3));
+    CHECK(!dag_queue_contains(ep->ready_queue, ep->synthesis_node));
+
+    auto pen_a = runtime.allocate_pen(13, ep_id, 1);
+    CHECK(pen_a.has_value());
+    llama_rerot_node_id admitted_a = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, *pen_a, 2, &admitted_a));
+    CHECK(admitted_a == 1);
+
+    auto pen_b = runtime.allocate_pen(13, ep_id, 2);
+    CHECK(pen_b.has_value());
+    llama_rerot_node_id admitted_b = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, *pen_b, 3, &admitted_b));
+    CHECK(admitted_b == 2);
+
+    CHECK(runtime.complete_admission(ep_id, admitted_a));
+    const auto * logical_a = ep->document.node(admitted_a);
+    CHECK(logical_a != nullptr);
+    CHECK(dag_state_is_live_worker(logical_a->state));
+    CHECK(logical_a->state != llama_rerot_node_state::planning);
+
+    ep->document.append_run(0, llama_rerot_visibility::public_live, 0, 4, 1);
+    const auto run_a = ep->document.append_run(
+        admitted_a, llama_rerot_visibility::public_live, 4, 5, 2);
+
+    const auto view_a = runtime.build_dag_view_for_reader(ep_id, admitted_a);
+    CHECK(dag_view_has_run(view_a, run_a));
+    CHECK(dag_view_has_owner(view_a, admitted_a));
+
+    CHECK(runtime.complete_admission(ep_id, admitted_b));
+    const auto run_b = ep->document.append_run(
+        admitted_b, llama_rerot_visibility::public_live, 9, 6, 2);
+    const auto view_b = runtime.build_dag_view_for_reader(ep_id, admitted_b);
+    CHECK(dag_view_has_run(view_b, run_a));
+    CHECK(dag_view_has_run(view_b, run_b));
+    CHECK(dag_view_has_owner(view_b, admitted_a));
+    CHECK(!runtime.node(ep_id, admitted_a)->is_sealed);
+    CHECK(ep->nodes[3].remaining_preds == 1);
+}
+
+static void test_dag_w_gt_p_yield_without_seal() {
+    // P=1, W=3 independent workers: yield the running pen so the next
+    // eligible can admit without anyone sealing.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(1);
+
+    const uint64_t ep_id = runtime.adopt_root(14, 14, 0, 1, 0);
+    CHECK(ep_id != 0);
+
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Fact C"}
+        ],
+        "depends_on": []
+      }
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    // Formal base capture after init, before any ready work: lineage,
+    // watermarks, and sampler clones do not exist until this point.
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->ready_queue.size() >= 3);
+
+    dag_unbind_planner_if_bound(runtime, ep_id);
+
+    llama_rerot_node_id first = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 1, &first));
+    CHECK(first == 1);
+    CHECK(runtime.complete_admission(ep_id, first));
+    CHECK(!runtime.node(ep_id, first)->is_sealed);
+    CHECK(dag_queue_contains(ep->ready_queue, 2) || dag_queue_contains(ep->ready_queue, 3) ||
+          ep->starting.count(2) || ep->starting.count(3) ||
+          ep->running.count(2) || ep->running.count(3));
+
+    auto find_other_started = [&]() -> llama_rerot_node_id {
+        for (llama_rerot_node_id nid : {llama_rerot_node_id(2), llama_rerot_node_id(3)}) {
+            const auto * dn = ep->document.node(nid);
+            if (!dn) {
+                continue;
+            }
+            if (ep->starting.count(nid) || ep->running.count(nid) ||
+                dn->state == llama_rerot_node_state::starting ||
+                dag_state_is_live_worker(dn->state) ||
+                dn->state == llama_rerot_node_state::ready_suspended) {
+                return nid;
+            }
+        }
+        return LLAMA_REROT_NODE_INVALID;
+    };
+
+    // complete_admission may already have yielded; still require a yield when
+    // the first worker holds the only pen. First must not need is_sealed.
+    if (runtime.node(ep_id, first)->physical_slot >= 0) {
+        CHECK(runtime.yield_dag_pen_for_ready(ep_id));
+    }
+    CHECK(!runtime.node(ep_id, first)->is_sealed);
+    const auto first_state = ep->document.node(first)->state;
+    CHECK(first_state == llama_rerot_node_state::ready_suspended ||
+          dag_state_is_live_worker(first_state));
+    CHECK(first_state != llama_rerot_node_state::planning);
+
+    llama_rerot_node_id second = find_other_started();
+    if (second == LLAMA_REROT_NODE_INVALID) {
+        CHECK(runtime.admit_next_child(ep_id, 0, 2, &second));
+    }
+    CHECK(second != LLAMA_REROT_NODE_INVALID);
+    CHECK(second != first);
+    CHECK(!runtime.node(ep_id, first)->is_sealed);
+
+    ep->document.append_run(0, llama_rerot_visibility::public_live, 0, 3, 1);
+    const auto run_a = ep->document.append_run(
+        first, llama_rerot_visibility::public_live, 3, 4, 2);
+    const auto run_b = ep->document.append_run(
+        second, llama_rerot_visibility::public_live, 7, 5, 2);
+
+    const auto view_first = runtime.build_dag_view_for_reader(ep_id, first);
+    const auto view_second = runtime.build_dag_view_for_reader(ep_id, second);
+    CHECK(dag_view_has_run(view_first, run_a));
+    CHECK(dag_view_has_run(view_second, run_a));
+    CHECK(dag_view_has_run(view_second, run_b));
+}
+
+static void test_dag_frozen_read_publish_epoch() {
+    // Foreign PUBLIC runs with publish_epoch > frozen_read_publish_epoch are
+    // omitted. Older public runs and the reader's own run remain visible.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(4);
+
+    const uint64_t ep_id = runtime.adopt_root(15, 15, 0, 1, 0);
+    CHECK(ep_id != 0);
+
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"}
+        ],
+        "depends_on": []
+      }
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    // Formal base capture after init, before any ready work: lineage,
+    // watermarks, and sampler clones do not exist until this point.
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+
+    CHECK(ep->document.set_node_state(1, llama_rerot_node_state::running));
+    CHECK(ep->document.set_node_state(2, llama_rerot_node_state::running));
+    ep->running.insert(1);
+    ep->running.insert(2);
+
+    const auto run_p = ep->document.append_run(0, llama_rerot_visibility::public_live, 0, 4, 1);
+    const auto run_b = ep->document.append_run(2, llama_rerot_visibility::public_live, 4, 3, 2);
+    const auto run_a = ep->document.append_run(1, llama_rerot_visibility::public_live, 7, 5, 5);
+
+    ep->frozen_read_publish_epoch = 2;
+
+    const auto view_b = runtime.build_dag_view_for_reader(ep_id, 2);
+    CHECK(dag_view_has_run(view_b, run_p));
+    CHECK(dag_view_has_run(view_b, run_b));
+    CHECK(!dag_view_has_run(view_b, run_a));
+
+    const auto view_a = runtime.build_dag_view_for_reader(ep_id, 1);
+    CHECK(dag_view_has_run(view_a, run_a));
+    CHECK(dag_view_has_run(view_a, run_p));
+    CHECK(dag_view_has_run(view_a, run_b));
+}
+
+static void test_dag_logical_step_hides_foreign_pending() {
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(4);
+
+    const uint64_t ep_id = runtime.adopt_root(16, 16, 0, 1, 0);
+    CHECK(ep_id != 0);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"}
+        ],
+        "depends_on": []
+      }
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    // Formal base capture after init, before any ready work: lineage,
+    // watermarks, and sampler clones do not exist until this point.
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+    CHECK(runtime.has_open_dag_logical_step(ep_id));
+    CHECK(!runtime.dag_logical_step_complete(ep_id));
+
+    auto pen_a = runtime.allocate_pen(16, ep_id, 1);
+    auto pen_b = runtime.allocate_pen(16, ep_id, 2);
+    CHECK(pen_a.has_value());
+    CHECK(pen_b.has_value());
+
+    llama_rerot_node_id a = LLAMA_REROT_NODE_INVALID;
+    llama_rerot_node_id b = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, *pen_a, 1, &a));
+    CHECK(runtime.admit_next_child(ep_id, *pen_b, 2, &b));
+    CHECK(a != b);
+    CHECK(a != LLAMA_REROT_NODE_INVALID);
+    CHECK(b != LLAMA_REROT_NODE_INVALID);
+    CHECK(runtime.complete_admission(ep_id, a));
+    CHECK(runtime.complete_admission(ep_id, b));
+
+    const auto * na_start = runtime.node(ep_id, a);
+    CHECK(na_start != nullptr);
+    CHECK(commit_generated(runtime, ep_id, a, na_start->storage_pos_next, "aaa"));
+    const auto * na = runtime.node(ep_id, a);
+    CHECK(na && na->pending_record.has_value());
+    const auto pending_a = *na->pending_record;
+    runtime.finish_frontier(ep_id);
+    CHECK(!runtime.dag_logical_step_complete(ep_id));
+    const auto view_b_mid = runtime.build_dag_view_for_reader(ep_id, b);
+    CHECK(!dag_view_has_run(view_b_mid, pending_a));
+
+    const auto * nb = runtime.node(ep_id, b);
+    CHECK(nb != nullptr);
+    CHECK(commit_generated(runtime, ep_id, b, nb->storage_pos_next, "bbb"));
+    runtime.finish_frontier(ep_id);
+    const auto view_b_end = runtime.build_dag_view_for_reader(ep_id, b);
+    CHECK(dag_view_has_run(view_b_end, pending_a));
+}
+
+static void test_dag_refuses_nested_html_fork() {
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(2);
+    const uint64_t ep_id = runtime.adopt_root(18, 16, 0, 1, 0);
+    CHECK(ep_id != 0);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {"questions": [{"id": "A", "intent": "A"}], "depends_on": []}
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    CHECK(!runtime.freeze_fork_parent(ep_id, 0));
+    const auto * ep = runtime.episode(ep_id);
+    CHECK(ep && ep->hard_aborted);
+    CHECK(ep->abort_reason.find("nested") != std::string::npos);
+}
+
+static void test_dag_save_refuses_probe_and_persists_c0() {
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(2);
+    const uint64_t ep_id = runtime.adopt_root(17, 16, 0, 1, 0);
+    CHECK(ep_id != 0);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {"questions": [{"id": "A", "intent": "A"}], "depends_on": []}
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    CHECK(runtime.capture_c0(ep_id, 1, 4));
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep);
+    ep->c0.gdn_recurrent_states = {1, 2, 3, 4};
+    CHECK(runtime.capture_c_base(ep_id));
+    ep->frozen_read_publish_epoch = 9;
+    ep->probe_tokens = 11;
+    ep->frame_tokens = 7;
+
+    server_rerot_state_fingerprints fp;
+    fp.caps = LLAMA_REROT_STATE_CAP_REROT | LLAMA_REROT_STATE_CAP_REROT_TREE |
+              LLAMA_REROT_STATE_CAP_REROT_PRIVATE;
+    ep->probing = true;
+    const auto refused = server_rerot_episode_save(*ep, fp, &err);
+    CHECK(refused.empty());
+    CHECK(err.find("probe") != std::string::npos);
+    ep->probing = false;
+    ep->probe_seq = 8;
+    err.clear();
+    CHECK(server_rerot_episode_save(*ep, fp, &err).empty());
+    ep->probe_seq = -1;
+    err.clear();
+    const auto blob = server_rerot_episode_save(*ep, fp, &err);
+    CHECK(!blob.empty());
+    CHECK(err.empty());
+    server_rerot_episode loaded;
+    CHECK(server_rerot_episode_load(blob.data(), blob.size(), fp, &loaded, &err));
+    CHECK(loaded.c0.gdn_recurrent_states == ep->c0.gdn_recurrent_states);
+    CHECK(loaded.c_base.valid());
+    CHECK(loaded.frozen_read_publish_epoch == 9);
+    CHECK(loaded.probe_tokens == 11);
+    CHECK(loaded.frame_tokens == 7);
+    CHECK(loaded.c0.gdn_recurrent_states.size() == 4);
+}
+
+static void test_dag_shift_pins_started_public_history() {
+    server_rerot_episode episode(292);
+    episode.is_dag = true;
+    server_rerot_node_runtime root;
+    root.id = 0;
+    episode.nodes.push_back(std::move(root));
+    const auto child = episode.document.create_child(0, "A");
+    CHECK(child != LLAMA_REROT_NODE_INVALID);
+    CHECK(episode.document.set_node_state(child, llama_rerot_node_state::running));
+    server_rerot_node_runtime worker;
+    worker.id = child;
+    episode.nodes.push_back(std::move(worker));
+    episode.base_prefix_end = 4;
+    episode.publish_epoch = 3;
+    episode.layout_epoch = 7;
+
+    CHECK(episode.document.append_run(
+        0, llama_rerot_visibility::public_live, 0, 4, 1) != LLAMA_REROT_RUN_INVALID);
+    const auto history = episode.document.append_run(
+        child, llama_rerot_visibility::public_live, 4, 6, 2);
+    const auto current = episode.document.append_run(
+        child, llama_rerot_visibility::public_live, 10, 3, 3);
+    CHECK(history != LLAMA_REROT_RUN_INVALID);
+    CHECK(current != LLAMA_REROT_RUN_INVALID);
+    episode.nodes[1].public_run = current;
+
+    server_rerot_shift_result result;
+    std::string error;
+    CHECK(server_rerot_truncate_oldest_public(episode, 6, &result, &error));
+    CHECK(error.empty());
+    CHECK(result.tokens_removed == 0);
+    CHECK(episode.document.run(history)->token_count == 6);
+    CHECK(episode.document.run(current)->token_count == 3);
+}
+
+static void test_context_shift_pins_frame_runs() {
+    server_rerot_episode episode(291);
+    server_rerot_node_runtime root;
+    root.id = 0;
+    episode.nodes.push_back(std::move(root));
+    const auto child = episode.document.create_child(0, "A");
+    CHECK(child != LLAMA_REROT_NODE_INVALID);
+    server_rerot_node_runtime worker;
+    worker.id = child;
+    episode.nodes.push_back(std::move(worker));
+    episode.base_prefix_end = 4;
+    episode.publish_epoch = 3;
+    episode.layout_epoch = 7;
+
+    CHECK(episode.document.append_run(
+        0, llama_rerot_visibility::public_live, 0, 4, 1) != LLAMA_REROT_RUN_INVALID);
+    const auto frame = episode.document.append_run(
+        child, llama_rerot_visibility::public_live, 4, 5, 2, llama_rerot_segment_kind::frame);
+    CHECK(frame != LLAMA_REROT_RUN_INVALID);
+
+    server_rerot_shift_result result;
+    std::string error;
+    CHECK(server_rerot_truncate_oldest_public(episode, 5, &result, &error));
+    CHECK(error.empty());
+    CHECK(result.tokens_removed == 0);
+    CHECK(episode.document.run(frame)->token_count == 5);
+}
+
+static void test_dag_seal_exactly_once_and_refuses_unstarted() {
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(4);
+    const uint64_t ep_id = runtime.adopt_root(30, 30, 0, 1, 0);
+    CHECK(ep_id != 0);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Needs A"}
+        ],
+        "depends_on": [{"id": "C", "depends_on_id": "A"}]
+      }
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    // Formal base capture after init, before any ready work: lineage,
+    // watermarks, and sampler clones do not exist until this point.
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->nodes[3].remaining_preds == 1);
+
+    // Bad origin never seals and never aborts.
+    CHECK(!runtime.seal_dag_node(ep_id, 1, llama_rerot_event_origin::runtime_frame));
+    CHECK(!ep->hard_aborted);
+    CHECK(!ep->nodes[1].is_sealed);
+
+    // Admit + complete A, then seal twice: the successor debits once.
+    auto * root = runtime.node(ep_id, 0);
+    if (root && root->physical_slot >= 0) {
+        CHECK(runtime.detach_node(ep_id, 0));
+    }
+    llama_rerot_node_id a = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 2, &a));
+    CHECK(a == 1);
+    CHECK(runtime.complete_admission(ep_id, a));
+    CHECK(runtime.seal_dag_node(ep_id, a, llama_rerot_event_origin::worker_source));
+    CHECK(ep->nodes[a].is_sealed);
+    CHECK(ep->nodes[3].remaining_preds == 0);
+    CHECK(runtime.seal_dag_node(ep_id, a, llama_rerot_event_origin::worker_source));
+    CHECK(ep->nodes[3].remaining_preds == 0);
+
+    // Sealing queued C (never started) is a scheduler invariant violation:
+    // the episode aborts and nothing is debited or resurrected.
+    CHECK(!runtime.seal_dag_node(ep_id, 3, llama_rerot_event_origin::worker_source));
+    CHECK(ep->hard_aborted);
+    CHECK(ep->abort_reason.find("never started") != std::string::npos);
+    CHECK(!ep->nodes[3].is_sealed);
+    CHECK(ep->nodes[3].remaining_preds == 0);
+
+    // A late seal on the dead episode fails without touching the first reason.
+    CHECK(!runtime.seal_dag_node(ep_id, 2, llama_rerot_event_origin::worker_source));
+    CHECK(ep->hard_aborted);
+    CHECK(ep->abort_reason.find("never started") != std::string::npos);
+    CHECK(!ep->nodes[2].is_sealed);
+}
+
+static void test_dag_seal_releases_pen_parked_until_cohort_retire() {
+    // P=1, two independent workers: A seals while B is still queued. The seal
+    // must free A's executor at once (attention parked, PENDING kept) so B
+    // can admit before cohort publication. finish_frontier then publishes
+    // both bodies and retires A exactly once with history preserved.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(1);
+    const uint64_t ep_id = runtime.adopt_root(31, 31, 0, 1, 0);
+    CHECK(ep_id != 0);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"}
+        ],
+        "depends_on": []
+      }
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    // Formal base capture after init, before any ready work: lineage,
+    // watermarks, and sampler clones do not exist until this point.
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+    auto * root = runtime.node(ep_id, 0);
+    if (root && root->physical_slot >= 0) {
+        CHECK(runtime.detach_node(ep_id, 0));
+    }
+    llama_rerot_node_id a = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 2, &a));
+    CHECK(a == 1);
+    CHECK(runtime.complete_admission(ep_id, a));
+    auto * na = runtime.node(ep_id, a);
+    CHECK(na != nullptr);
+    CHECK(commit_generated(runtime, ep_id, a, na->storage_pos_next, "aaa"));
+    CHECK(runtime.seal_dag_node(ep_id, a, llama_rerot_event_origin::worker_source));
+
+    // Executor freed now; logical state parked, nothing dropped.
+    CHECK(runtime.has_free_pen());
+    const auto * sealed = runtime.node(ep_id, a);
+    CHECK(sealed && sealed->is_sealed);
+    CHECK(sealed->physical_slot < 0 && sealed->exec_seq < 0 && sealed->pen_id < 0);
+    CHECK(sealed->parked_seq >= 0);
+    CHECK(sealed->pending_record.has_value());
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->document.node(a)->state == llama_rerot_node_state::retired);
+
+    // The queued peer admits onto the freed pen before any publication.
+    llama_rerot_node_id b = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 3, &b));
+    CHECK(b == 2);
+    CHECK(runtime.complete_admission(ep_id, b));
+    auto * nb = runtime.node(ep_id, b);
+    CHECK(nb != nullptr);
+    CHECK(commit_generated(runtime, ep_id, b, nb->storage_pos_next, "bbb"));
+
+    // Cohort publication publishes both bodies; A retires exactly once.
+    const auto res = runtime.finish_frontier(ep_id);
+    CHECK(!res.hard_aborted);
+    CHECK(res.retired.size() == 1 && res.retired[0] == a);
+    const auto * retired = runtime.node(ep_id, a);
+    CHECK(retired && retired->parked_seq < 0);
+    CHECK(retired->pending_record == std::nullopt);
+    const auto * history = retired->public_run.has_value()
+        ? ep->document.run(*retired->public_run)
+        : nullptr;
+    CHECK(history && history->owner == a);
+    CHECK(history->visibility == llama_rerot_visibility::public_live);
+    CHECK(history->token_count == 1);
+
+    // A second frontier emits no duplicate retired notification.
+    const auto res2 = runtime.finish_frontier(ep_id);
+    CHECK(!res2.hard_aborted);
+    CHECK(res2.retired.empty());
+}
+
+static void test_dag_complete_admission_evicts_no_peer() {
+    // P=2, A running, B starting, C queued, cohort open, no pen free:
+    // completing B's admission must only flip B starting->running. It must
+    // not suspend any bound peer mid-commit-loop; central scheduling runs
+    // after the slice commits.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(2);
+    const uint64_t ep_id = runtime.adopt_root(33, 33, 0, 1, 0);
+    CHECK(ep_id != 0);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Fact C"}
+        ],
+        "depends_on": []
+      }
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+    dag_unbind_planner_if_bound(runtime, ep_id);
+
+    llama_rerot_node_id a = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 2, &a));
+    CHECK(a == 1);
+    CHECK(runtime.complete_admission(ep_id, a));
+    llama_rerot_node_id b = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 1, 3, &b));
+    CHECK(b == 2);
+
+    CHECK(runtime.complete_admission(ep_id, b));
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->suspended.empty());
+    CHECK(ep->running.count(a) != 0 && ep->running.count(b) != 0);
+    const auto * na = runtime.node(ep_id, a);
+    const auto * nb = runtime.node(ep_id, b);
+    CHECK(na && na->physical_slot == 0 && na->exec_seq == 2);
+    CHECK(nb && nb->physical_slot == 1 && nb->exec_seq == 3);
+    CHECK(!ep->hard_aborted);
+}
+
+static void test_dag_seal_evicts_no_bound_peer() {
+    // P=1: A suspended, B just admitted+completed (host commit/sample still
+    // pending), C queued. Sealing A must stage only A's own completion —
+    // passivate self, debit successors — and leave bound B untouched. It must
+    // never select B as a yield victim mid-commit-loop.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(1);
+    const uint64_t ep_id = runtime.adopt_root(34, 34, 0, 1, 0);
+    CHECK(ep_id != 0);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Fact C"}
+        ],
+        "depends_on": []
+      }
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+    dag_unbind_planner_if_bound(runtime, ep_id);
+
+    llama_rerot_node_id a = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 2, &a));
+    CHECK(a == 1);
+    CHECK(runtime.complete_admission(ep_id, a));
+    // Park A so B can start; B's host work has not run yet.
+    CHECK(runtime.yield_dag_pen_for_ready(ep_id));
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr && ep->suspended.count(a) != 0);
+    llama_rerot_node_id b = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 3, &b));
+    CHECK(b == 2);
+    CHECK(runtime.complete_admission(ep_id, b));
+
+    CHECK(runtime.seal_dag_node(ep_id, a, llama_rerot_event_origin::worker_source));
+    CHECK(!ep->hard_aborted);
+    const auto * sealed = runtime.node(ep_id, a);
+    CHECK(sealed && sealed->is_sealed && sealed->parked_seq >= 0);
+    CHECK(sealed->physical_slot < 0 && sealed->exec_seq < 0);
+    // Bound B is untouched: still running on its pen, never suspended.
+    const auto * peer = runtime.node(ep_id, b);
+    CHECK(peer && peer->physical_slot == 0 && peer->exec_seq == 3);
+    CHECK(ep->running.count(b) != 0 && ep->suspended.empty());
+    CHECK(ep->document.node(b)->state == llama_rerot_node_state::running);
+}
+
+static void test_dag_yield_force_under_resource_pressure() {
+    // Pens free, but recurrent rows exhausted: the default yield no-ops (a
+    // free pen is not a free recurrent row); the pressure yield suspends one
+    // bound worker so the queued peer can proceed.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(2);
+    const uint64_t ep_id = runtime.adopt_root(32, 32, 0, 1, 0);
+    CHECK(ep_id != 0);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"}
+        ],
+        "depends_on": []
+      }
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+    dag_unbind_planner_if_bound(runtime, ep_id);
+
+    llama_rerot_node_id a = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 2, &a));
+    CHECK(a == 1);
+    CHECK(runtime.complete_admission(ep_id, a));
+
+    // One pen still free: default yield refuses, worker untouched.
+    CHECK(runtime.has_free_pen());
+    CHECK(!runtime.yield_dag_pen_for_ready(ep_id));
+    const auto * running = runtime.node(ep_id, a);
+    CHECK(running && running->physical_slot == 0 && running->exec_seq == 2);
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr && ep->suspended.empty());
+
+    // Forced yield under pressure suspends the bound worker anyway.
+    CHECK(runtime.yield_dag_pen_for_ready(ep_id, true));
+    CHECK(ep->suspended.count(a) != 0);
+    CHECK(ep->document.node(a)->state == llama_rerot_node_state::ready_suspended);
+    CHECK(runtime.node(ep_id, a)->physical_slot < 0);
+    CHECK(runtime.has_free_pen());
+
+    // The queued peer admits onto the freed pen.
+    llama_rerot_node_id b = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 2, &b));
+    CHECK(b == 2);
+}
+
+static void test_dag_admit_anchors_worker_storage_to_c_base() {
+    // C_base watermark path: workers start after the rebuilt formal prefix.
+    {
+        server_rerot_runtime runtime(nullptr);
+        runtime.set_pen_capacity(4);
+        const uint64_t ep_id = runtime.adopt_root(32, 32, 0, 1, 0);
+        CHECK(ep_id != 0);
+        CHECK(runtime.capture_c0(ep_id, 1, 0));
+        const auto decision = server_rerot_parse_routing_decision(R"({
+          "strategy": "dag",
+          "payload": {"questions": [{"id": "A", "intent": "A"}], "depends_on": []}
+        })");
+        CHECK(decision.is_dag());
+        std::string err;
+        CHECK(runtime.initialize_dag(ep_id, decision, &err));
+        auto * root = runtime.node(ep_id, 0);
+        CHECK(root != nullptr);
+        root->storage_pos_next = 7; // rebuilt formal-P end
+        CHECK(runtime.capture_c_base(ep_id));
+        CHECK(runtime.activate_dag_frontier(ep_id));
+        if (root->physical_slot >= 0) {
+            CHECK(runtime.detach_node(ep_id, 0));
+        }
+        llama_rerot_node_id admitted = LLAMA_REROT_NODE_INVALID;
+        CHECK(runtime.admit_next_child(ep_id, 0, 2, &admitted));
+        CHECK(admitted == 1);
+        const auto * w = runtime.node(ep_id, admitted);
+        CHECK(w && w->storage_pos_next == 7);
+    }
+}
+
+static void test_dag_init_alone_never_admits_until_base_captured() {
+    // Initialization publishes validated descriptors (nodes, edges, root plan
+    // seal) but no worker is physically ready before the formal base: the
+    // real-target failure admitted from this state and died on missing
+    // lineage. Formal P capture then activates the same descriptors.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(4);
+    const uint64_t ep_id = runtime.adopt_root(33, 33, 0, 1, 5);
+    CHECK(ep_id != 0);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {"questions": [{"id": "A", "intent": "A"}], "depends_on": []}
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->nodes[1].remaining_preds == 0);
+    CHECK(ep->nodes[0].is_sealed);
+    CHECK(runtime.get_eligible_dag_nodes(ep_id).empty());
+    CHECK(ep->ready_queue.empty());
+    CHECK(!runtime.activate_dag_frontier(ep_id));
+    CHECK(!runtime.has_open_dag_logical_step(ep_id));
+    CHECK(!runtime.dag_step_next_pending(ep_id).has_value());
+    // Admission pre-base is a scheduling no-op, never an abort.
+    auto * root = runtime.node(ep_id, 0);
+    if (root && root->physical_slot >= 0) {
+        CHECK(runtime.detach_node(ep_id, 0));
+    }
+    llama_rerot_node_id admitted = LLAMA_REROT_NODE_INVALID;
+    CHECK(!runtime.admit_next_child(ep_id, 0, 2, &admitted));
+    CHECK(admitted == LLAMA_REROT_NODE_INVALID);
+    CHECK(!ep->hard_aborted);
+    // Formal P capture then activates: workers admit from the base watermark.
+    CHECK(runtime.capture_c0(ep_id, 1, 5));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+    CHECK(!runtime.get_eligible_dag_nodes(ep_id).empty());
+    CHECK(dag_queue_contains(ep->ready_queue, 1));
+    CHECK(runtime.admit_next_child(ep_id, 0, 2, &admitted));
+    CHECK(admitted == 1);
+    const auto * w = runtime.node(ep_id, admitted);
+    CHECK(w && w->storage_pos_next == 5);
+}
+
+static void test_dag_discard_probe_retracts_probe_runs() {
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 16);
+    runtime.set_pen_capacity(2);
+    const uint64_t ep_id = runtime.adopt_root(34, 34, 0, 0, 4);
+    CHECK(ep_id != 0);
+    CHECK(runtime.capture_c0(ep_id, 0, 4));
+    CHECK(runtime.arm_isolated_probe(ep_id, 0));
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    ep->probing = true;
+    auto * root = runtime.node(ep_id, 0);
+    CHECK(root != nullptr);
+    CHECK(commit_generated(runtime, ep_id, 0, root->storage_pos_next, "probe bytes "));
+    bool saw_probe = false;
+    for (size_t i = 0; i < ep->document.run_count(); ++i) {
+        const auto * run = ep->document.run(static_cast<llama_rerot_run_id>(i));
+        if (run && run->kind == llama_rerot_segment_kind::probe_control) {
+            CHECK(run->token_count == 1);
+            saw_probe = true;
+        }
+    }
+    CHECK(saw_probe);
+    CHECK(runtime.discard_isolated_probe(ep_id, 0));
+    for (size_t i = 0; i < ep->document.run_count(); ++i) {
+        const auto * run = ep->document.run(static_cast<llama_rerot_run_id>(i));
+        CHECK(!(run && run->kind == llama_rerot_segment_kind::probe_control && run->token_count > 0));
+    }
+    CHECK(root->storage_pos_next == 4);
+}
+
+static void test_dag_frozen_view_gates_foreign_frame() {
+    // Frozen epoch gates every foreign PUBLIC run newer than the snapshot —
+    // BODY and FRAME alike. Only the reader's own runs are exempt.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(4);
+    const uint64_t ep_id = runtime.adopt_root(35, 35, 0, 1, 0);
+    CHECK(ep_id != 0);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"}
+        ],
+        "depends_on": []
+      }
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    // Formal base capture after init, before any ready work: lineage,
+    // watermarks, and sampler clones do not exist until this point.
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->document.set_node_state(1, llama_rerot_node_state::running));
+    CHECK(ep->document.set_node_state(2, llama_rerot_node_state::running));
+    ep->running.insert(1);
+    ep->running.insert(2);
+
+    const auto run_p = ep->document.append_run(0, llama_rerot_visibility::public_live, 0, 4, 1);
+    const auto run_b = ep->document.append_run(2, llama_rerot_visibility::public_live, 4, 3, 2);
+    const auto run_f = ep->document.append_run(
+        1, llama_rerot_visibility::public_live, 7, 2, 5, llama_rerot_segment_kind::frame);
+    const auto run_a = ep->document.append_run(1, llama_rerot_visibility::public_live, 9, 5, 5);
+    ep->frozen_read_publish_epoch = 2;
+
+    const auto view_b = runtime.build_dag_view_for_reader(ep_id, 2);
+    CHECK(dag_view_has_run(view_b, run_p));
+    CHECK(dag_view_has_run(view_b, run_b));
+    CHECK(!dag_view_has_run(view_b, run_f));
+    CHECK(!dag_view_has_run(view_b, run_a));
+
+    const auto view_a = runtime.build_dag_view_for_reader(ep_id, 1);
+    CHECK(dag_view_has_run(view_a, run_p));
+    CHECK(dag_view_has_run(view_a, run_b));
+    CHECK(dag_view_has_run(view_a, run_f));
+    CHECK(dag_view_has_run(view_a, run_a));
+}
+
+static void test_dag_load_refuses_bad_cohort_and_sampler_snapshot() {
+    server_rerot_state_fingerprints fp;
+    fp.caps = LLAMA_REROT_STATE_CAP_REROT | LLAMA_REROT_STATE_CAP_REROT_TREE |
+              LLAMA_REROT_STATE_CAP_REROT_PRIVATE;
+
+    // Truncated sampler bytes are corruption, never a best-effort reseed.
+    {
+        server_rerot_runtime runtime(nullptr);
+        runtime.set_pen_capacity(2);
+        const uint64_t ep_id = runtime.adopt_root(50, 50, 0, 1, 0);
+        CHECK(ep_id != 0);
+        CHECK(runtime.capture_c0(ep_id, 1, 0));
+        auto * ep = runtime.episode(ep_id);
+        CHECK(ep != nullptr);
+        ep->c0.sampler_snapshot_bytes = {1, 2, 3};
+        std::string err;
+        const auto blob = server_rerot_episode_save(*ep, fp, &err);
+        CHECK(!blob.empty());
+        server_rerot_episode loaded;
+        CHECK(!server_rerot_episode_load(blob.data(), blob.size(), fp, &loaded, &err));
+        CHECK(err.find("sampler") != std::string::npos);
+    }
+    // A well-formed snapshot round-trips verbatim (opaque, never installed).
+    {
+        server_rerot_runtime runtime(nullptr);
+        runtime.set_pen_capacity(2);
+        const uint64_t ep_id = runtime.adopt_root(51, 51, 0, 1, 0);
+        CHECK(ep_id != 0);
+        CHECK(runtime.capture_c0(ep_id, 1, 0));
+        auto * ep = runtime.episode(ep_id);
+        CHECK(ep != nullptr);
+        const llama_tokens prev = {7, 8, 9};
+        runtime.capture_checkpoint_sampler(ep->c0, 42, prev);
+        CHECK(server_rerot_validate_sampler_snapshot(ep->c0.sampler_snapshot_bytes, nullptr));
+        std::string err;
+        const auto blob = server_rerot_episode_save(*ep, fp, &err);
+        CHECK(!blob.empty());
+        server_rerot_episode loaded;
+        CHECK(server_rerot_episode_load(blob.data(), blob.size(), fp, &loaded, &err));
+        CHECK(loaded.c0.sampler_snapshot_bytes == ep->c0.sampler_snapshot_bytes);
+        const std::vector<uint8_t> bad_magic(12, 0);
+        CHECK(!server_rerot_validate_sampler_snapshot(bad_magic, &err));
+    }
+    // Cohort / commit records must name live nodes.
+    {
+        server_rerot_runtime runtime(nullptr);
+        runtime.set_pen_capacity(2);
+        const uint64_t ep_id = runtime.adopt_root(52, 52, 0, 1, 0);
+        CHECK(ep_id != 0);
+        const auto decision = server_rerot_parse_routing_decision(R"({
+          "strategy": "dag",
+          "payload": {"questions": [{"id": "A", "intent": "A"}], "depends_on": []}
+        })");
+        CHECK(decision.is_dag());
+        std::string err;
+        CHECK(runtime.initialize_dag(ep_id, decision, &err));
+        auto * ep = runtime.episode(ep_id);
+        CHECK(ep != nullptr);
+        ep->dag_step_cohort.insert(9999);
+        const auto blob = server_rerot_episode_save(*ep, fp, &err);
+        CHECK(!blob.empty());
+        server_rerot_episode loaded;
+        CHECK(!server_rerot_episode_load(blob.data(), blob.size(), fp, &loaded, &err));
+        CHECK(err.find("cohort") != std::string::npos);
+        ep->dag_step_cohort.clear();
+        ep->dag_step_committed.insert(9998);
+        err.clear();
+        const auto blob2 = server_rerot_episode_save(*ep, fp, &err);
+        CHECK(!blob2.empty());
+        CHECK(!server_rerot_episode_load(blob2.data(), blob2.size(), fp, &loaded, &err));
+        CHECK(err.find("commit") != std::string::npos);
+    }
+}
+
+static void test_dag_load_rebinds_pens_for_bound_slots() {
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(2);
+    const uint64_t ep_id = runtime.adopt_root(40, 40, 0, 1, 0);
+    CHECK(ep_id != 0);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {"questions": [{"id": "A", "intent": "A"}], "depends_on": []}
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    // Formal base capture after init, before any ready work: lineage,
+    // watermarks, and sampler clones do not exist until this point.
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+    auto * root = runtime.node(ep_id, 0);
+    if (root && root->physical_slot >= 0) {
+        CHECK(runtime.detach_node(ep_id, 0));
+    }
+    llama_rerot_node_id w = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 1, 2, &w));
+    CHECK(w == 1);
+    CHECK(runtime.complete_admission(ep_id, w));
+
+    server_rerot_state_fingerprints fp;
+    fp.caps = LLAMA_REROT_STATE_CAP_REROT | LLAMA_REROT_STATE_CAP_REROT_TREE |
+              LLAMA_REROT_STATE_CAP_REROT_PRIVATE;
+    std::vector<uint8_t> blob;
+    CHECK(runtime.save_episode(ep_id, fp, &blob, &err));
+    CHECK(!blob.empty());
+    CHECK(runtime.erase_episode(ep_id));
+    CHECK(runtime.has_free_pen());
+
+    uint64_t restored_id = 0;
+    CHECK(runtime.load_episode(blob.data(), blob.size(), fp, &restored_id, &err));
+    CHECK(restored_id == ep_id);
+    // The pen arena is rebound symmetrically: slot 1 is running work again,
+    // not a phantom map entry over a free pen.
+    const auto * pen = runtime.pen(1);
+    CHECK(pen && pen->state == server_pen_state::running);
+    CHECK(pen && pen->node_id == w && pen->episode_id == ep_id);
+    const auto * node = runtime.node(ep_id, w);
+    CHECK(node && node->physical_slot == 1 && node->pen_id == 1 && node->exec_seq == 2);
+    // Only slot 0 is allocatable now.
+    const auto free_pen = runtime.allocate_pen(ep_id, ep_id, w);
+    CHECK(free_pen.has_value() && *free_pen == 0);
+    runtime.free_pen(*free_pen);
+}
+
+static void test_dag_step_publish_is_atomic_on_member_failure() {
+    // A commits cleanly, then B's gapped speculative plan fails resolution at
+    // publish time. The failure must still abort, but A stays PENDING and no
+    // counter/epoch moves: no half frontier escapes.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(2);
+    const uint64_t ep_id = runtime.adopt_root(61, 61, 0, 1, 0);
+    CHECK(ep_id != 0);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"}
+        ],
+        "depends_on": []
+      }
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    // Formal base capture after init, before any ready work: lineage,
+    // watermarks, and sampler clones do not exist until this point.
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+    auto * root = runtime.node(ep_id, 0);
+    if (root && root->physical_slot >= 0) {
+        CHECK(runtime.detach_node(ep_id, 0));
+    }
+    llama_rerot_node_id a = LLAMA_REROT_NODE_INVALID;
+    llama_rerot_node_id b = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 2, &a));
+    CHECK(runtime.admit_next_child(ep_id, 1, 3, &b));
+    CHECK(a == 1 && b == 2);
+    CHECK(runtime.complete_admission(ep_id, a));
+    CHECK(runtime.complete_admission(ep_id, b));
+
+    auto * na = runtime.node(ep_id, a);
+    CHECK(na != nullptr);
+    CHECK(commit_generated(runtime, ep_id, a, na->storage_pos_next, "aaa"));
+    // B leaves a gapped plan: the empty pending run can only fail at publish
+    // time (both commits themselves succeed).
+    const auto gap1 = runtime.plan_generated_token(ep_id, b, 10, "gap");
+    CHECK(gap1.has_value());
+    const auto gap2 = runtime.plan_generated_token(ep_id, b, 20, "bbb");
+    CHECK(gap2.has_value());
+    CHECK(runtime.track_fence_token(ep_id, b, *gap2, 2020) &&
+          runtime.commit_token(ep_id, b, *gap2));
+
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    const uint64_t epoch_before = ep->publish_epoch;
+    const uint64_t pending_before = ep->pending_tokens;
+    CHECK(pending_before == 2);
+    const auto res = runtime.finish_frontier(ep_id);
+    CHECK(res.hard_aborted);
+    CHECK(res.abort_reason.find("pending-record") != std::string::npos);
+
+    ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->publish_epoch == epoch_before);
+    CHECK(ep->pending_tokens == pending_before);
+    CHECK(ep->generated_public_tokens == 0);
+    const auto * na_after = runtime.node(ep_id, a);
+    CHECK(na_after && na_after->pending_record.has_value());
+    const auto * arun = ep->document.run(*na_after->pending_record);
+    CHECK(arun && arun->visibility == llama_rerot_visibility::pending_record);
+    CHECK(arun && arun->token_count == 1);
+    const auto * nb_after = runtime.node(ep_id, b);
+    CHECK(nb_after && nb_after->pending_record.has_value());
+}
+
+static void test_dag_step_publish_overflow_keeps_history_public() {
+    // The worker owns a historical PUBLIC run stamped at the max epoch and a
+    // fresh pending run; the next publish overflows. The failure aborts, but
+    // the historical run must stay PUBLIC: a retained max epoch on the
+    // failing entry must never match it for rollback.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(2);
+    const uint64_t ep_id = runtime.adopt_root(62, 62, 0, 1, 0);
+    CHECK(ep_id != 0);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {"questions": [{"id": "A", "intent": "Fact A"}], "depends_on": []}
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    // Formal base capture after init, before any ready work: lineage,
+    // watermarks, and sampler clones do not exist until this point.
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+    auto * root = runtime.node(ep_id, 0);
+    if (root && root->physical_slot >= 0) {
+        CHECK(runtime.detach_node(ep_id, 0));
+    }
+    llama_rerot_node_id a = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 2, &a));
+    CHECK(a == 1);
+    CHECK(runtime.complete_admission(ep_id, a));
+
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    const auto hist = ep->document.append_run(
+        a, llama_rerot_visibility::public_live, 0, 3, ~uint64_t(0));
+    auto * na = runtime.node(ep_id, a);
+    CHECK(na != nullptr);
+    na->storage_pos_next = 3;
+    CHECK(commit_generated(runtime, ep_id, a, na->storage_pos_next, "aaa"));
+    ep->publish_epoch = ~uint64_t(0);
+
+    const auto res = runtime.finish_frontier(ep_id);
+    CHECK(res.hard_aborted);
+    CHECK(res.abort_reason.find("overflow") != std::string::npos);
+
+    ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    const auto * hist_run = ep->document.run(hist);
+    CHECK(hist_run && hist_run->visibility == llama_rerot_visibility::public_live);
+    CHECK(hist_run && hist_run->publish_epoch == ~uint64_t(0));
+    CHECK(hist_run && hist_run->token_count == 3);
+    const auto * na_after = runtime.node(ep_id, a);
+    CHECK(na_after && na_after->pending_record.has_value());
+    const auto * fresh = ep->document.run(*na_after->pending_record);
+    CHECK(fresh && fresh->visibility == llama_rerot_visibility::pending_record);
+    CHECK(ep->pending_tokens == 1);
+    CHECK(ep->generated_public_tokens == 0);
+}
+
+static void test_dag_init_frames_prefix_keeps_view_not_body_export() {
+    // The ordinary prefix is model-PUBLIC control, never API BODY:
+    // initialize_dag flips root BODY runs to FRAME (probe_control left
+    // alone) while build_dag_view keeps the full P for attention and worker
+    // BODY reasoning stays in the body-export set.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(4);
+    const uint64_t ep_id = runtime.adopt_root(70, 70, 0, 1, 0);
+    CHECK(ep_id != 0);
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    // Ordinary prefill as production leaves it: root PUBLIC BODY prefix plus
+    // a stale (unretracted here to prove kind-based exclusion) probe run.
+    const auto run_p = ep->document.append_run(0, llama_rerot_visibility::public_live, 0, 10, 1);
+    const auto run_probe = ep->document.append_run(
+        0, llama_rerot_visibility::private_control, 10, 2, 0, llama_rerot_segment_kind::probe_control);
+
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {"questions": [{"id": "A", "intent": "Fact A"}], "depends_on": []}
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+
+    // Kind flipped; everything the model attends to is preserved.
+    const auto * framed = ep->document.run(run_p);
+    CHECK(framed && framed->kind == llama_rerot_segment_kind::frame);
+    CHECK(framed->visibility == llama_rerot_visibility::public_live);
+    CHECK(framed->storage_pos0 == 0 && framed->token_count == 10 && framed->publish_epoch == 1);
+    const auto * probe = ep->document.run(run_probe);
+    CHECK(probe && probe->kind == llama_rerot_segment_kind::probe_control);
+
+    // Formal plan-prefix suffix planned as FRAME stays model-visible and out
+    // of the body-export set (the ServerProtocol plan_prefix callsite).
+    const auto suffix = runtime.plan_public_span(
+        ep_id, 0, 10, 3, llama_rerot_segment_kind::frame);
+    CHECK(suffix.has_value() && suffix->size() == 3);
+    for (const auto & plan : *suffix) {
+        CHECK(plan.visibility == llama_rerot_visibility::public_live);
+        CHECK(plan.segment_kind == llama_rerot_segment_kind::frame);
+    }
+    // Forced P forwards ledger as framing cost, never as useful BODY.
+    CHECK(ep->frame_tokens == 3);
+    CHECK(runtime.commit_token(ep_id, 0, suffix->front()));
+    CHECK(ep->generated_public_tokens == 1);
+    const auto * suffix_run = ep->document.run(suffix->front().run_id);
+    CHECK(suffix_run && suffix_run->kind == llama_rerot_segment_kind::frame);
+    CHECK(suffix_run->visibility == llama_rerot_visibility::public_live);
+
+    // Worker BODY reasoning stays exportable and shares the same P view.
+    CHECK(ep->document.set_node_state(1, llama_rerot_node_state::running));
+    ep->running.insert(1);
+    const auto run_b = ep->document.append_run(1, llama_rerot_visibility::public_live, 13, 4, 2);
+    const auto view = runtime.build_dag_view_for_reader(ep_id, 1);
+    CHECK(dag_view_has_run(view, run_p));
+    CHECK(dag_view_has_run(view, suffix->front().run_id));
+    CHECK(dag_view_has_run(view, run_b));
+    const auto * first = ep->document.run(view.runs.front().run_id);
+    CHECK(first && first->owner == 0 && first->storage_pos0 == 0 && first->token_count == 10);
+
+    // Body-export set under the API rule (skip frame/source_end/probe,
+    // require public_live): P runs excluded, worker BODY included.
+    const auto exportable = [&](llama_rerot_run_id rid) {
+        const auto * run = ep->document.run(rid);
+        if (!run) {
+            return false;
+        }
+        if (run->kind == llama_rerot_segment_kind::frame ||
+            run->kind == llama_rerot_segment_kind::source_end ||
+            run->kind == llama_rerot_segment_kind::probe_control) {
+            return false;
+        }
+        return run->visibility == llama_rerot_visibility::public_live;
+    };
+    CHECK(!exportable(run_p));
+    CHECK(!exportable(suffix->front().run_id));
+    CHECK(!exportable(run_probe));
+    CHECK(exportable(run_b));
+}
+
+static void test_dag_ensure_run_keeps_segment_kinds_distinct() {
+    // ensure_run reuses by owner + visibility + contiguity + kind: adjacent
+    // same-visibility FRAME then BODY spans stay two model spans (formal-P
+    // text must not dissolve into exportable BODY), same-kind spans still
+    // merge, and a private BODY run stays distinct from the source_end that
+    // closes it.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(2);
+    const uint64_t ep_id = runtime.adopt_root(71, 71, 0, 1, 0);
+    CHECK(ep_id != 0);
+    runtime.set_dag_protocol_markers(ep_id, "<end>", "<think>");
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    const auto run_p = ep->document.append_run(0, llama_rerot_visibility::public_live, 0, 10, 1);
+
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {"questions": [{"id": "A", "intent": "Fact A"}], "depends_on": []}
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    CHECK(ep->document.run(run_p)->kind == llama_rerot_segment_kind::frame);
+
+    // Formal suffix as FRAME, then more FRAME: same kind still merges.
+    const auto f2_plans = runtime.plan_public_span(
+        ep_id, 0, 10, 2, llama_rerot_segment_kind::frame);
+    CHECK(f2_plans.has_value() && f2_plans->size() == 2);
+    const auto run_f2 = f2_plans->front().run_id;
+    for (const auto & plan : *f2_plans) {
+        CHECK(plan.run_id == run_f2);
+        CHECK(runtime.commit_token(ep_id, 0, plan));
+    }
+    const auto f2_more = runtime.plan_public_span(
+        ep_id, 0, 12, 1, llama_rerot_segment_kind::frame);
+    CHECK(f2_more.has_value() && f2_more->front().run_id == run_f2);
+    CHECK(runtime.commit_token(ep_id, 0, f2_more->front()));
+    CHECK(ep->document.run(run_f2)->token_count == 3);
+
+    // Same visibility and contiguity, new kind: BODY splits off.
+    const auto b2_plans = runtime.plan_public_span(ep_id, 0, 13, 1);
+    CHECK(b2_plans.has_value() && b2_plans->front().run_id != run_f2);
+    CHECK(b2_plans->front().segment_kind == llama_rerot_segment_kind::body);
+    const auto run_b2 = b2_plans->front().run_id;
+    CHECK(runtime.commit_token(ep_id, 0, b2_plans->front()));
+    const auto * b2 = ep->document.run(run_b2);
+    CHECK(b2 && b2->kind == llama_rerot_segment_kind::body);
+    CHECK(b2->storage_pos0 == 13 && b2->token_count == 1);
+    CHECK(b2->visibility == llama_rerot_visibility::public_live);
+
+    // Private BODY closed by the native end marker: the end boundary stays
+    // its own run instead of dissolving into the body run.
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+    auto * root = runtime.node(ep_id, 0);
+    if (root && root->physical_slot >= 0) {
+        CHECK(runtime.detach_node(ep_id, 0));
+    }
+    llama_rerot_node_id w = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 2, &w));
+    CHECK(w == 1);
+    CHECK(runtime.complete_admission(ep_id, w));
+    const auto priv_plans = runtime.plan_private_span(ep_id, w, 0, 2);
+    CHECK(priv_plans.has_value() && priv_plans->size() == 2);
+    const auto run_pb = priv_plans->front().run_id;
+    for (const auto & plan : *priv_plans) {
+        CHECK(plan.run_id == run_pb);
+        CHECK(runtime.commit_token(ep_id, w, plan));
+    }
+    CHECK(commit_generated(runtime, ep_id, w,
+        runtime.node(ep_id, w)->storage_pos_next, "<end>"));
+    const auto * pb = ep->document.run(run_pb);
+    CHECK(pb && pb->kind == llama_rerot_segment_kind::body && pb->token_count == 2);
+    auto * nw = runtime.node(ep_id, w);
+    CHECK(nw && nw->is_sealed);
+    CHECK(nw->private_run.has_value() && *nw->private_run != run_pb);
+    const auto * se = ep->document.run(*nw->private_run);
+    CHECK(se && se->kind == llama_rerot_segment_kind::source_end && se->token_count == 1);
+    CHECK(se->storage_pos0 == 2 && se->visibility == llama_rerot_visibility::private_control);
+
+    // Body-export set under the API rule: P and suffix FRAME excluded, both
+    // BODY spans included, end boundary excluded.
+    const auto exportable = [&](llama_rerot_run_id rid) {
+        const auto * run = ep->document.run(rid);
+        if (!run) {
+            return false;
+        }
+        if (run->kind == llama_rerot_segment_kind::frame ||
+            run->kind == llama_rerot_segment_kind::source_end ||
+            run->kind == llama_rerot_segment_kind::probe_control) {
+            return false;
+        }
+        return run->visibility == llama_rerot_visibility::public_live;
+    };
+    CHECK(!exportable(run_p));
+    CHECK(!exportable(run_f2));
+    CHECK(exportable(run_b2));
+}
+
+static void test_dag_prefix_rebuild_reconciles_root_runs() {
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 32);
+    runtime.set_pen_capacity(2);
+    const uint64_t ep_id = runtime.adopt_root(60, 60, 0, 1, 10);
+    CHECK(ep_id != 0);
+    CHECK(runtime.capture_c0(ep_id, 1, 10));
+    auto * ep = runtime.episode(ep_id);
+    auto * root = runtime.node(ep_id, 0);
+    CHECK(ep != nullptr && root != nullptr);
+    // Ordinary prefix plus stale probe residue on the root document.
+    const auto r_full = ep->document.append_run(0, llama_rerot_visibility::public_live, 0, 10, 1);
+    const auto r_probe = ep->document.append_run(
+        0, llama_rerot_visibility::private_control, 10, 4, 0, llama_rerot_segment_kind::probe_control);
+    root->public_run = r_full;
+    root->private_run = r_probe;
+    ep->archive_seq = 9;
+    root->parked_seq = 10;
+
+    std::string err;
+    CHECK(runtime.prepare_dag_prefix_rebuild(ep_id, 6, &err));
+    CHECK(err.empty());
+    CHECK(ep->document.run(r_full)->token_count == 6);
+    CHECK(ep->document.run(r_probe)->token_count == 0);
+    CHECK(root->storage_pos_next == 6);
+    CHECK(root->public_run.has_value()); // straddling run stays referenced
+    CHECK(!root->private_run.has_value()); // emptied run ref cleared
+    CHECK(ep->archive_seq == -1);
+    CHECK(root->parked_seq == -1);
+
+    // Base past C0 is refused; post-init rebuild is refused.
+    CHECK(!runtime.prepare_dag_prefix_rebuild(ep_id, 11, &err));
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {"questions": [{"id": "A", "intent": "A"}], "depends_on": []}
+    })");
+    CHECK(decision.is_dag());
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    CHECK(!runtime.prepare_dag_prefix_rebuild(ep_id, 6, &err));
+}
+
+static void test_dag_initialize_refuses_double_init() {
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(2);
+    const uint64_t ep_id = runtime.adopt_root(53, 53, 0, 1, 0);
+    CHECK(ep_id != 0);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {"questions": [{"id": "A", "intent": "A"}], "depends_on": []}
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    const auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    const size_t n_nodes = ep->nodes.size();
+    err.clear();
+    CHECK(!runtime.initialize_dag(ep_id, decision, &err));
+    CHECK(err.find("already") != std::string::npos);
+    CHECK(runtime.episode(ep_id)->nodes.size() == n_nodes);
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT Runtime Tests ===\n");
     test_c0_and_dag_admit_without_parked_seq();
     test_dag_runtime_lifecycle();
+    test_dag_capture_c_base_snapshots_current_seed();
+    test_dag_isolated_probe_uses_other_seq();
+    test_dag_admission_view_survival();
+    test_dag_w_gt_p_yield_without_seal();
+    test_dag_frozen_read_publish_epoch();
+    test_dag_logical_step_hides_foreign_pending();
+    test_dag_refuses_nested_html_fork();
+    test_dag_save_refuses_probe_and_persists_c0();
+    test_dag_seal_exactly_once_and_refuses_unstarted();
+    test_dag_seal_releases_pen_parked_until_cohort_retire();
+    test_dag_complete_admission_evicts_no_peer();
+    test_dag_seal_evicts_no_bound_peer();
+    test_dag_yield_force_under_resource_pressure();
+    test_dag_admit_anchors_worker_storage_to_c_base();
+    test_dag_discard_probe_retracts_probe_runs();
+    test_dag_frozen_view_gates_foreign_frame();
+    test_dag_load_refuses_bad_cohort_and_sampler_snapshot();
+    test_dag_load_rebinds_pens_for_bound_slots();
+    test_dag_step_publish_is_atomic_on_member_failure();
+    test_dag_step_publish_overflow_keeps_history_public();
+    test_dag_init_alone_never_admits_until_base_captured();
+    test_dag_init_frames_prefix_keeps_view_not_body_export();
+    test_dag_ensure_run_keeps_segment_kinds_distinct();
+    test_dag_prefix_rebuild_reconciles_root_runs();
+    test_dag_initialize_refuses_double_init();
+    test_dag_shift_pins_started_public_history();
+    test_context_shift_pins_frame_runs();
     test_recurrent_only_pressure_isolation();
     test_multi_episode_concurrent_final_fence_and_coordinate_freeze();
     test_pen_capacity_and_multi_episode_allocation();

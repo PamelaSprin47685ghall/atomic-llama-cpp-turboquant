@@ -271,6 +271,8 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
                     std::string grammar_type = json_value(data, "grammar_type", std::string());
                     if (grammar_type == "tool_calls") {
                         params.sampling.grammar = {COMMON_GRAMMAR_TYPE_TOOL_CALLS, std::move(grammar_str)};
+                    } else if (grammar_type == "output_format") {
+                        params.sampling.grammar = {COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, std::move(grammar_str)};
                     } else {
                         // explicit grammar from the user (API field "grammar")
                         params.sampling.grammar = {COMMON_GRAMMAR_TYPE_USER, std::move(grammar_str)};
@@ -294,6 +296,21 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ctx.params.chat_parser_params.format = static_cast<common_chat_format>(data.at("chat_format").get<int>());
             SRV_TRC("chat format: %s\n", common_chat_format_name(ctx.params.chat_parser_params.format));
         }));
+
+    add((new field_json("rerot_chat_messages"))
+        ->set_desc("Internal: original chat messages for RERoT ordinary/DAG prefix LCP")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.rerot_chat_messages = json_value(data, "rerot_chat_messages", json::array());
+        }));
+
+    add((new field_json("rerot_chat_tools"))
+        ->set_desc("Internal: original user tools for RERoT ordinary/DAG prefix LCP")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.rerot_chat_tools = json_value(data, "rerot_chat_tools", json::array());
+        }));
+
+    add((new field_num("rerot_chat_now_ms", params.rerot_chat_now_ms))
+        ->set_desc("Internal: frozen chat-template clock for RERoT prefix LCP"));
 
     add((new field_str("reasoning_format"))
         ->set_desc("Reasoning format for chain-of-thought models")

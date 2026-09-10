@@ -426,6 +426,48 @@ static void test_routing_decision_parser() {
     })").is_dag());
 }
 
+static void test_routing_decision_rejections() {
+    // Control-plane fail-closed matrix (RERoT.md 15.1): single-node valid
+    // plus every rejection the peer parser must enforce. Invalid inputs must
+    // be explicitly invalid — nonempty error, neither dag nor simple — since
+    // a silent fallback to simple is forbidden by contract.
+    const auto one_node = server_rerot_parse_routing_decision(
+        R"({"strategy":"dag","payload":{"questions":[{"id":"A","intent":"Fact A"}],"depends_on":[]}})");
+    CHECK(one_node.is_dag());
+    CHECK(!one_node.is_simple());
+    CHECK(one_node.error.empty());
+    CHECK(one_node.questions.size() == 1);
+
+    const char * invalid_cases[] = {
+        // dag strategy with an empty (simple-shaped) payload
+        R"({"strategy":"dag","payload":{}})",
+        // dag payload missing depends_on
+        R"({"strategy":"dag","payload":{"questions":[{"id":"A","intent":"Fact A"}]}})",
+        // self-loop
+        R"({"strategy":"dag","payload":{)"
+        R"("questions":[{"id":"A","intent":"Fact A"}],)"
+        R"("depends_on":[{"id":"A","depends_on_id":"A"}]}})",
+        // duplicate edge
+        R"({"strategy":"dag","payload":{)"
+        R"("questions":[{"id":"A","intent":"Fact A"},{"id":"B","intent":"Fact B"}],)"
+        R"("depends_on":[{"id":"B","depends_on_id":"A"},{"id":"B","depends_on_id":"A"}]}})",
+        // reserved id "0"
+        R"({"strategy":"dag","payload":{)"
+        R"("questions":[{"id":"0","intent":"Reserved"}],"
+        R"("depends_on":[]}})",
+        // whitespace-only id
+        R"({"strategy":"dag","payload":{)"
+        R"("questions":[{"id":"   ","intent":"Fact A"}],"
+        R"("depends_on":[]}})",
+    };
+    for (const char * json : invalid_cases) {
+        const auto decision = server_rerot_parse_routing_decision(json);
+        CHECK(!decision.is_dag());
+        CHECK(!decision.is_simple());
+        CHECK(!decision.error.empty());
+    }
+}
+
 static void test_native_source_end_marker() {
     // Tests standard XML think marker
     server_rerot_marker_parser parser("</think>", true);
@@ -475,6 +517,61 @@ static void test_format_fixed_entry() {
     CHECK(sanitized.find("[end] evil [start]") != std::string::npos);
 }
 
+static void test_format_plan_prefix() {
+    // PUBLIC 0.plan body: id+intent in plan_rank order. It must not close
+    // reasoning and must not emit worker lane: frames.
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Fact C <think>"}
+        ],
+        "depends_on": [
+          {"id": "C", "depends_on_id": "A"}
+        ]
+      }
+    })");
+    CHECK(decision.is_dag());
+    const std::string think_end = "</think>";
+    const std::string think_start = "<think>";
+    const std::string prefix = server_rerot_format_plan_prefix(decision, think_start);
+    CHECK(prefix.find("plan:") != std::string::npos);
+    CHECK(prefix.find("Fact A") != std::string::npos);
+    CHECK(prefix.find("Fact B") != std::string::npos);
+    CHECK(prefix.find("Fact C [start]") != std::string::npos);
+    CHECK(prefix.find("A:") != std::string::npos);
+    CHECK(prefix.find(think_end) == std::string::npos);
+    CHECK(prefix.find("</think>") == std::string::npos);
+    CHECK(prefix.find("lane:") == std::string::npos);
+    CHECK(prefix.find("<think>") == std::string::npos);
+}
+
+static void test_dag_protocol_does_not_require_source_end_grammar() {
+    // The source_end grammar helper may still exist, but DAG workers close on
+    // native source-end detection. Installing that grammar is not required.
+    server_rerot_marker_parser native("</think>", true);
+    auto step = native.consume("task body ");
+    CHECK(!step.marker_closed);
+    step = native.consume("</think>");
+    CHECK(step.marker_closed);
+    CHECK(native.complete());
+
+    const std::string optional_grammar = server_rerot_source_end_grammar("</think>");
+    (void) optional_grammar;
+
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [{"id": "A", "intent": "Fact A"}],
+        "depends_on": []
+      }
+    })");
+    CHECK(decision.is_dag());
+    CHECK(decision.error.empty());
+}
+
 static void test_routing_schema_grammar() {
     const std::string grammar = server_rerot_routing_grammar();
     CHECK(!grammar.empty());
@@ -491,8 +588,11 @@ static void test_routing_schema_grammar() {
 int main() {
     std::fprintf(stderr, "=== RERoT Planner Parser Tests ===\n");
     test_routing_decision_parser();
+    test_routing_decision_rejections();
     test_native_source_end_marker();
     test_format_fixed_entry();
+    test_format_plan_prefix();
+    test_dag_protocol_does_not_require_source_end_grammar();
     test_routing_schema_grammar();
     test_plain_public_text();
     test_split_open_and_close();

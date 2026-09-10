@@ -1795,8 +1795,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_TRIATTENTION_RATIO").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--rerot"},
-        "enable Recursive Elastic Ring-of-Thought shared-memory reasoning (requires --kv-unified; "
-        "parallel frontiers pause speculative draft and active unsupported state operations fail closed)",
+        "enable adaptive DAG RERoT shared-memory reasoning (requires --kv-unified; "
+        "peers read committed frontiers and unsupported state operations fail closed)",
         [](common_params & params) {
             params.rerot_enabled = true;
             params.kv_unified = true;

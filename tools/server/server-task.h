@@ -100,6 +100,12 @@ struct task_params {
     // message spans for checkpointing
     common_chat_msg_spans message_spans;
 
+    // Original chat request used to re-render ordinary vs DAG tool prefixes
+    // (AGENTS.md §02.3). Empty for non-chat completions.
+    json rerot_chat_messages = json::array();
+    json rerot_chat_tools = json::array();
+    int64_t rerot_chat_now_ms = 0;
+
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
 
@@ -1105,6 +1111,10 @@ struct server_task_result_cmpl_final : server_task_result {
     bool has_new_line;
     std::string stopping_word;
     stop_type stop = STOP_TYPE_NONE;
+
+    uint64_t rerot_probe_tokens = 0;
+    uint64_t rerot_frame_tokens = 0;
+    uint64_t rerot_source_end_tokens = 0;
 
     bool post_sampling_probs;
     std::vector<completion_token_output> probs_output;

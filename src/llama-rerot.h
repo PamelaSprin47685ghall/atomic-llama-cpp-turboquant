@@ -325,9 +325,15 @@ public:
     // Render DAG view for reader:
     // Orders eligible started nodes via cycle-preferred topological sort,
     // ensuring predecessors precede successors, and reader's own work is last.
+    // The synthesis reader (node 0) renders plan-rank order subject to
+    // dependencies, independent of the started_nodes input order.
+    // When frozen_read_publish_epoch != 0, every foreign PUBLIC run published
+    // after that epoch is omitted — BODY and FRAME alike. Only the reader's
+    // own runs (including its current FRAME) are exempt from the freeze.
     llama_rerot_reader_view build_dag_view(
         llama_rerot_node_id reader,
-        const std::vector<llama_rerot_node_id> & started_nodes) const;
+        const std::vector<llama_rerot_node_id> & started_nodes,
+        uint64_t frozen_read_publish_epoch = 0) const;
 
     // Path-Anchored Cyclic DFS render of the whole tree for one reader: at
     // every node on the reader path the reader-branch child renders last and

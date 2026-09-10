@@ -980,6 +980,149 @@ static void test_dag_reader_view_assembly() {
     CHECK(caught_missing_pred);
 }
 
+static bool view_has_run_id(const llama_rerot_reader_view & view, llama_rerot_run_id run_id) {
+    for (const auto & run : view.runs) {
+        if (run.run_id == run_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void test_dag_running_and_ready_suspended_keep_public_runs() {
+    // complete_admission-equivalent states (running, ready_suspended) keep
+    // PUBLIC runs in reader views. Queued/blocked nodes are not started.
+    llama_rerot_document doc(110);
+    doc.set_dag_mode(true);
+
+    const auto root = doc.root();
+    const auto n1 = doc.create_child(root, "1");
+    const auto n2 = doc.create_child(root, "2");
+    const auto n3 = doc.create_child(root, "3");
+    doc.set_plan_rank(n1, 0);
+    doc.set_plan_rank(n2, 1);
+    doc.set_plan_rank(n3, 2);
+
+    const auto run_p = doc.append_run(root, llama_rerot_visibility::public_live, 0, 10, 1);
+    const auto run_1 = doc.append_run(n1, llama_rerot_visibility::public_live, 10, 5, 2);
+    const auto run_2 = doc.append_run(n2, llama_rerot_visibility::public_live, 15, 6, 2);
+    const auto run_3 = doc.append_run(n3, llama_rerot_visibility::public_live, 21, 7, 2);
+
+    CHECK(doc.set_node_state(n1, llama_rerot_node_state::running));
+    CHECK(doc.set_node_state(n2, llama_rerot_node_state::ready_suspended));
+    CHECK(doc.set_node_state(n3, llama_rerot_node_state::queued));
+
+    const std::vector<llama_rerot_node_id> started_two = { root, n1, n2 };
+    const auto view1 = doc.build_dag_view(n1, started_two);
+    CHECK(owners(view1) == std::vector<llama_rerot_node_id>({ root, n2, n1 }));
+    CHECK(view_has_run_id(view1, run_p));
+    CHECK(view_has_run_id(view1, run_1));
+    CHECK(view_has_run_id(view1, run_2));
+    CHECK(!view_has_run_id(view1, run_3));
+
+    const auto view2 = doc.build_dag_view(n2, started_two);
+    CHECK(owners(view2) == std::vector<llama_rerot_node_id>({ root, n1, n2 }));
+    CHECK(view_has_run_id(view2, run_1));
+    CHECK(view_has_run_id(view2, run_2));
+    CHECK(!view_has_run_id(view2, run_3));
+
+    // All three ready_suspended: original independent cycle orders unchanged.
+    CHECK(doc.set_node_state(n1, llama_rerot_node_state::ready_suspended));
+    CHECK(doc.set_node_state(n2, llama_rerot_node_state::ready_suspended));
+    CHECK(doc.set_node_state(n3, llama_rerot_node_state::ready_suspended));
+    const std::vector<llama_rerot_node_id> started_all = { root, n1, n2, n3 };
+    CHECK(owners(doc.build_dag_view(n1, started_all)) ==
+          std::vector<llama_rerot_node_id>({ root, n2, n3, n1 }));
+    CHECK(owners(doc.build_dag_view(n2, started_all)) ==
+          std::vector<llama_rerot_node_id>({ root, n3, n1, n2 }));
+    CHECK(owners(doc.build_dag_view(n3, started_all)) ==
+          std::vector<llama_rerot_node_id>({ root, n1, n2, n3 }));
+    CHECK(view_has_run_id(doc.build_dag_view(n3, started_all), run_1));
+    CHECK(view_has_run_id(doc.build_dag_view(n3, started_all), run_2));
+    CHECK(view_has_run_id(doc.build_dag_view(n3, started_all), run_3));
+}
+
+static void test_dag_synthesis_view_ignores_started_order() {
+    // Synthesis reader (0) renders plan-rank order subject to dependencies,
+    // regardless of the caller's started_nodes order.
+    llama_rerot_document doc(120);
+    doc.set_dag_mode(true);
+
+    const auto root = doc.root();
+    const auto n1 = doc.create_child(root, "1");
+    const auto n2 = doc.create_child(root, "2");
+    const auto n3 = doc.create_child(root, "3");
+    doc.set_plan_rank(n1, 0);
+    doc.set_plan_rank(n2, 1);
+    doc.set_plan_rank(n3, 2);
+
+    std::string err;
+    CHECK(doc.add_edge(n1, n3, &err));
+
+    doc.append_run(root, llama_rerot_visibility::public_live, 0, 10, 1);
+    doc.append_run(n1, llama_rerot_visibility::public_live, 10, 5, 2);
+    doc.append_run(n2, llama_rerot_visibility::public_live, 15, 6, 2);
+    doc.append_run(n3, llama_rerot_visibility::public_live, 21, 7, 2);
+
+    const std::vector<llama_rerot_node_id> expected = { root, n1, n2, n3 };
+    CHECK(owners(doc.build_dag_view(root, { root, n1, n2, n3 })) == expected);
+    CHECK(owners(doc.build_dag_view(root, { root, n3, n1, n2 })) == expected);
+    CHECK(owners(doc.build_dag_view(root, { n2, root, n3, n1 })) == expected);
+}
+
+static void test_dag_frozen_epoch_delays_foreign_frame() {
+    // Frozen logical-step read version (AGENTS.md §06.3): every foreign
+    // PUBLIC run newer than the snapshot stays hidden — BODY and FRAME
+    // alike — until the freeze advances. Only the reader's own runs
+    // (including its current FRAME) and older PUBLIC history stay visible,
+    // with dense positions.
+    llama_rerot_document doc(121);
+    doc.set_dag_mode(true);
+
+    const auto root = doc.root();
+    const auto n1 = doc.create_child(root, "1");
+    const auto n2 = doc.create_child(root, "2");
+    doc.set_plan_rank(n1, 0);
+    doc.set_plan_rank(n2, 1);
+
+    const auto run_p = doc.append_run(root, llama_rerot_visibility::public_live, 0, 4, 1);
+    const auto run_old = doc.append_run(n2, llama_rerot_visibility::public_live, 4, 2, 2);
+    const auto run_frame = doc.append_run(
+        n2, llama_rerot_visibility::public_live, 6, 2, 5, llama_rerot_segment_kind::frame);
+    const auto run_new = doc.append_run(n2, llama_rerot_visibility::public_live, 8, 3, 5);
+    const auto run_own_frame = doc.append_run(
+        n1, llama_rerot_visibility::public_live, 11, 2, 6, llama_rerot_segment_kind::frame);
+    const auto run_own = doc.append_run(n1, llama_rerot_visibility::public_live, 13, 3, 6);
+
+    const std::vector<llama_rerot_node_id> started = { root, n1, n2 };
+    const auto view = doc.build_dag_view(n1, started, 2);
+
+    CHECK(view_has_run_id(view, run_p));
+    CHECK(view_has_run_id(view, run_old));
+    CHECK(!view_has_run_id(view, run_frame));
+    CHECK(!view_has_run_id(view, run_new));
+    CHECK(view_has_run_id(view, run_own_frame));
+    CHECK(view_has_run_id(view, run_own));
+    CHECK(owners(view) == std::vector<llama_rerot_node_id>({ root, n2, n1, n1 }));
+
+    llama_pos expected_pos = 0;
+    for (const auto & run : view.runs) {
+        CHECK(run.virtual_pos0 == expected_pos);
+        expected_pos += run.token_count;
+    }
+    CHECK(view.query_virtual_pos == expected_pos);
+    CHECK(view.query_virtual_pos == 11);
+
+    // Advancing the freeze to the cohort publish epoch reveals the foreign
+    // FRAME and BODY together, preserving worker order and density.
+    const auto released = doc.build_dag_view(n1, started, 5);
+    CHECK(view_has_run_id(released, run_frame));
+    CHECK(view_has_run_id(released, run_new));
+    CHECK(owners(released) ==
+          std::vector<llama_rerot_node_id>({ root, n2, n2, n2, n1, n1 }));
+    CHECK(released.query_virtual_pos == 16);
+}
+
 static void test_chapter09_exhaustive_dag_properties() {
     // Port of the reference logic from AGENTS.md §09
     // Enumerates 4-node all possible DAGs and verifies:
@@ -1032,6 +1175,9 @@ int main() {
     std::fprintf(stderr, "=== RERoT View Tests ===\n");
     test_dag_cycle_preferred_topo();
     test_dag_reader_view_assembly();
+    test_dag_running_and_ready_suspended_keep_public_runs();
+    test_dag_synthesis_view_ignores_started_order();
+    test_dag_frozen_epoch_delays_foreign_frame();
     test_chapter09_exhaustive_dag_properties();
     test_manual_pac_dfs();
     test_visibility();

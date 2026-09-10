@@ -1206,8 +1206,9 @@ void triattention_scorer::score_sampled_head(
 #ifdef GGML_USE_CUDA
     // GPU fast path: if K tensor is on a CUDA device, score directly on GPU
     // without copying K data to host. Only the score array is transferred back.
-    if (k_tensor->buffer && k_tensor->buffer->buft) {
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(k_tensor->buffer->buft);
+    ggml_backend_buffer_type_t k_buft = k_tensor->buffer ? ggml_backend_buffer_get_type(k_tensor->buffer) : nullptr;
+    if (k_buft) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(k_buft);
         ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
         const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
         const bool is_cuda_buffer = reg_name && strstr(reg_name, "CUDA") != nullptr;
@@ -1395,8 +1396,9 @@ void triattention_scorer::score_combined(
 
 #ifdef GGML_USE_CUDA
         bool is_cuda_buffer = false;
-        if (k_tensor->buffer && k_tensor->buffer->buft) {
-            ggml_backend_dev_t dev = ggml_backend_buft_get_device(k_tensor->buffer->buft);
+        ggml_backend_buffer_type_t k_buft_layer = k_tensor->buffer ? ggml_backend_buffer_get_type(k_tensor->buffer) : nullptr;
+        if (k_buft_layer) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(k_buft_layer);
             ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
             const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
             is_cuda_buffer = reg_name && strstr(reg_name, "CUDA") != nullptr;

@@ -865,7 +865,7 @@ inline common_rerot_gate common_rerot_validate_stage0(const common_params & para
     }
     // ContextGlue + TriIntegration + EpisodePersist compat:
     // TriAttention acts as legal lossy reclaimer for RERoT shared KV (§§23, A.4).
-    // Speculative decoding / MTP drafts are epoch-bound and force n_draft_max=0 on active lanes (§§24, A.6).
+    // Speculative decoding / MTP drafts are bound to the reader's topology/publish/layout epochs.
     // Context shift and cache reuse are intercepted per-episode via shared-memory log truncation (§§25, A.9).
     return gate;
 }

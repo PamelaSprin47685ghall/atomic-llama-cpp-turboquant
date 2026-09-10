@@ -315,6 +315,12 @@ struct server_rerot_prebranch_checkpoint {
     llama_pos n_prompt_tokens = 0; // Prefill end watermark
     std::vector<uint8_t> gdn_recurrent_states;
     std::vector<uint8_t> conv1d_states;
+    // Opaque seed + accepted-token history (capture_checkpoint_sampler).
+    // Never installed as a sampler by this runtime: it cannot restore RNG
+    // offset, grammar, reasoning budget, or adaptive state standalone. Full
+    // sampler continuity lives only on the in-process demotion path
+    // (transport-owned sampler clones). Load validates the encoding but
+    // performs no reseed; callers must not reseed-and-claim-continuation.
     std::vector<uint8_t> sampler_snapshot_bytes;
     bool captured = false;
 
@@ -410,7 +416,8 @@ struct server_rerot_node_runtime {
 
     // A.8 opaque per-lane extension state. Filled by the server integration
     // (sampler bytes, MTP checkpoint); empty means none. Persisted verbatim
-    // and never interpreted here.
+    // and never interpreted here. Standalone restore cannot reanimate these;
+    // see sampler_snapshot_bytes for the continuity boundary.
     std::vector<uint8_t> sampler_blob;
     std::vector<uint8_t> mtp_blob;
     // Shared fork hand seed (§§16.1, 16.4, B.6.4). Holds parent conv tail and private S.
@@ -466,16 +473,23 @@ struct server_rerot_shift_result {
     uint64_t new_publish_epoch = 0;
 };
 
-// Fixed entry frame construction (AGENTS.md §04):
-// B_i = F_i + R_i
-// F_i = CLOSE_PREVIOUS + HANDOFF_TO_i + OPEN_CURRENT
-// For simplified tag-based or tool template, renders deterministic text.
+// Research/test sandwich for F_i. Production DAG must use the live chat
+// template; if that template cannot losslessly render native CLOSE+handoff+OPEN,
+// DAG capability is refused. Do not inject this string as a silent fallback.
 std::string server_rerot_format_fixed_entry(
     const std::string & node_label,
     const std::string & intent,
     bool is_synthesis = false,
     std::string_view think_end = "</think>",
     std::string_view think_start = "<think>");
+
+// PUBLIC 0.plan body. Lists each question id+intent in plan_rank order.
+// Does not emit think_end, and does not emit a second think_start (the prefix
+// sits inside an already-open reasoning region). think_start is used only to
+// sanitize intent text that would forge a template boundary.
+std::string server_rerot_format_plan_prefix(
+    const server_rerot_routing_decision & decision,
+    std::string_view think_start = {});
 
 struct server_rerot_episode {
     uint64_t id = 0;
@@ -496,6 +510,11 @@ struct server_rerot_episode {
     uint64_t probe_tokens = 0;
     uint64_t frame_tokens = 0;
     uint64_t source_end_tokens = 0;
+    // W-wide logical step (AGENTS.md §06): freeze the PUBLIC read-set, then
+    // physically time-slice pens. Members write BODY as PENDING until every
+    // cohort member has committed this step.
+    std::set<llama_rerot_node_id> dag_step_cohort;
+    std::set<llama_rerot_node_id> dag_step_committed;
 
     uint64_t frontier = 1;
     uint64_t publish_epoch = 1;
@@ -512,6 +531,8 @@ struct server_rerot_episode {
     std::set<llama_rerot_node_id> suspended;
 
     llama_seq_id archive_seq = -1;
+    // Isolated strategy probe (AGENTS.md §02). Writes never use the C0 seq.
+    llama_seq_id probe_seq = -1;
 
     bool topology_barrier_pending = false;
     bool finalizing = false;
@@ -643,19 +664,83 @@ public:
         std::string_view source_end_marker,
         std::string_view think_start_marker);
     bool capture_c0(uint64_t episode_id, llama_seq_id seq_id, llama_pos n_prompt_tokens);
+    void capture_checkpoint_sampler(
+        server_rerot_prebranch_checkpoint & cp,
+        uint32_t seed,
+        const std::vector<llama_token> & prev);
+    // Copy C0 attention/recurrent onto a temp seq and bind the root writer there.
+    // Returns false if the internal seq arena is exhausted.
+    bool arm_isolated_probe(uint64_t episode_id, llama_seq_id c0_seq);
+    // Drop the probe seq without touching C0. Also retracts probe_control
+    // runs so wiped spans leave no logical residue. Returns false when no
+    // probe seq was armed so the caller can fall back to suffix removal.
+    bool discard_isolated_probe(uint64_t episode_id, llama_seq_id c0_seq);
     bool capture_c_base(uint64_t episode_id);
+    // Reconcile the logical document with a rebuilt formal prefix [0, base):
+    // shrink/remove root runs beyond base, clear refs left over emptied runs
+    // (a set root pending record is refused), release archive + root parked
+    // lineage, and pin root storage_pos_next. C0, probe accounting, and work
+    // counters are untouched. Pre-routing only: refuses once is_dag is set.
+    // The caller truncates physical memory + its prompt tape first, then
+    // calls this, then re-forwards the divergent suffix as formal P.
+    bool prepare_dag_prefix_rebuild(
+        uint64_t episode_id,
+        llama_pos base,
+        std::string * error_out = nullptr);
+    // Enqueue newly eligible workers, snapshot the logical cohort, and
+    // time-slice pens. Returns false until c_base is captured (no cohort, no
+    // enqueue, no time-slicing). Root formal-P forced execution is unaffected.
     bool activate_dag_frontier(uint64_t episode_id);
+    bool has_free_pen() const;
+    // Snapshot the current logical cohort if one is not already open.
+    // No-op until c_base is captured.
+    void snapshot_dag_logical_step(uint64_t episode_id);
+    bool has_open_dag_logical_step(uint64_t episode_id) const;
+    // True when the node is done for the open logical step (sealed or
+    // committed): batch construction must not feed it again while other
+    // cohort members are pending. False when no step is open.
+    bool dag_step_node_done(uint64_t episode_id, llama_rerot_node_id node_id) const;
+    bool dag_logical_step_complete(uint64_t episode_id) const;
+    // Unbound incomplete member of the open logical step, if any.
+    std::optional<llama_rerot_node_id> dag_step_next_pending(uint64_t episode_id) const;
+    // W>P: suspend one physically bound DAG worker so a queued eligible node
+    // can START, or a suspended/incomplete step member can resume. Does not
+    // wait for SEAL. No-ops when a free pen already exists, and until c_base
+    // is captured — unless resource_pressure is set, which permits a yield
+    // under physical resource pressure (e.g. recurrent rows exhausted) even
+    // with a free pen: a free pen is not a free recurrent row.
+    bool yield_dag_pen_for_ready(uint64_t episode_id, bool resource_pressure = false);
     std::optional<std::vector<server_rerot_token_plan>> plan_frame_span(
         uint64_t episode_id,
         llama_rerot_node_id node_id,
         llama_pos storage_pos,
         size_t token_count);
+    // PUBLIC span planner. kind selects the segment class without changing
+    // visibility: formal DAG plan-prefix injection passes frame so the P
+    // suffix stays model-visible but never enters API BODY export. Planned
+    // tokens ledger in frame_tokens (forced framing cost); the init-time
+    // ordinary-prefix reclassification performs no forwards and counts
+    // nothing.
+    std::optional<std::vector<server_rerot_token_plan>> plan_public_span(
+        uint64_t episode_id,
+        llama_rerot_node_id node_id,
+        llama_pos storage_pos,
+        size_t token_count,
+        llama_rerot_segment_kind kind = llama_rerot_segment_kind::body);
 
-    // Checks which nodes have all predecessors sealed and are eligible for admission
+    // Checks which nodes have all predecessors sealed and are eligible for admission.
+    // Empty until c_base is captured: descriptors may exist, but no worker is
+    // physically ready before the formal base.
     std::vector<llama_rerot_node_id> get_eligible_dag_nodes(uint64_t episode_id) const;
 
-    // Seal a naturally completed worker/synthesis node (AGENTS.md §07.5):
-    // Releases exec bindings, marks node sealed, and unlocks eligible successors.
+    // Seal a naturally completed worker/synthesis node: marks sealed, debits
+    // each successor remaining_preds exactly once, and refreshes the ready
+    // queue. Already-sealed is a no-op success (no double debit). Refuses
+    // seals on hard-aborted episodes and on nodes that never started.
+    // Sealed workers passivate immediately (attention parked, executor freed)
+    // so pending peers are never starved; retirement (archive + release +
+    // exactly-once notification) waits for cohort publication in
+    // finish_frontier. Synthesis stays bound for serial content.
     bool seal_dag_node(
         uint64_t episode_id,
         llama_rerot_node_id node_id,
@@ -676,11 +761,14 @@ public:
     bool sync_public_archive(
         uint64_t episode_id,
         std::vector<llama_seq_id> * semantic_seq_ids_out = nullptr);
+    // DAG admission additionally refuses until c_base is captured (scheduling
+    // no-op, never an abort). Root formal-P forced execution never admits.
     bool admit_next_child(
         uint64_t episode_id,
         int physical_slot,
         llama_seq_id exec_seq,
-        llama_rerot_node_id * admitted_node);
+        llama_rerot_node_id * admitted_node,
+        llama_rerot_node_id prefer_node = LLAMA_REROT_NODE_INVALID);
 
     // Fixed P pen arena management (§§B.0, B.4.2, B.8, B.13 Phase 1)
     void set_pen_capacity(uint32_t total_pens);
@@ -712,9 +800,11 @@ public:
     // If only 1 person, Pass 2 gives all P pens to that person.
     size_t schedule_pens(const std::vector<uint64_t> & ready_people);
 
-    // Marks a fully injected child heading as RUNNING. The private planner
-    // prefix may be injected before or after this transition, but ordinary
-    // generated tokens are only legal once the node is RUNNING.
+    // Marks a fully injected child heading as live. DAG episodes enter
+    // document state `running` (not `planning`) so F_i publication stays in
+    // the started set. Non-DAG may keep PLANNING for remaining HTML helpers.
+    // Performs no scheduling: W>P time-slicing is driven centrally after the
+    // slice commits, never from inside the per-row commit path.
     bool complete_admission(uint64_t episode_id, llama_rerot_node_id node_id);
     // Enter direct worker mode without consuming a synthetic N=1 planner
     // record. This is the default v1 child path; explicit recursive-planner
@@ -888,6 +978,23 @@ private:
     uint64_t next_publish_epoch(server_rerot_episode & episode);
     std::optional<llama_seq_id> alloc_internal_seq();
     void free_internal_seq(llama_seq_id seq_id);
+    void release_probe_seq(server_rerot_episode & episode);
+    void note_dag_step_commit(server_rerot_episode & episode, llama_rerot_node_id node_id);
+    bool dag_step_member_done(const server_rerot_episode & episode, llama_rerot_node_id node_id) const;
+    bool publish_dag_step_bodies(server_rerot_episode & episode);
+    struct dag_step_publish_stage {
+        llama_rerot_node_id node_id = LLAMA_REROT_NODE_INVALID;
+        uint64_t epoch = 0;
+        std::optional<llama_rerot_run_id> pending;
+        std::optional<llama_rerot_run_id> published_over;
+    };
+    // Unwind staged cohort publishes after a mid-cohort failure so no half
+    // frontier escapes. Restores run visibility/epochs, node refs, and (by
+    // the caller) counters/epochs. The episode stays aborted: failure still
+    // aborts, it just no longer publishes partially.
+    void rollback_dag_step_publish(
+        server_rerot_episode & episode,
+        const std::vector<dag_step_publish_stage> & staged);
     bool fail_episode(server_rerot_episode & episode, std::string reason);
     // Returns true when a hard limit was crossed (episode aborted with
     // finish_reason rerot_resource_exhausted). False otherwise.
@@ -919,6 +1026,9 @@ private:
 //     serial_tail) | u32 serial_node | string abort_reason
 //   u64 x5 counters (public/private/forced-heading/pending/queue_peak)
 //   u64 x4 hard limits (total_tokens/nodes/queue/frontiers)
+//   v5: frozen_read_publish_epoch, probe_seq, probing, strategy_decided,
+//     probe/frame/source_end token counters, C0/C_base checkpoints,
+//     dag_step_cohort, dag_step_committed. Probe-in-flight state is refused.
 //   u32-counted vectors: forked_this_frontier, ready_queue (FIFO order
 //     preserved verbatim), running, starting
 //   document nodes (u32 count; per node: u32 id/parent/depth/child_index,
@@ -956,6 +1066,14 @@ std::vector<uint8_t> server_rerot_episode_save(
     const server_rerot_state_fingerprints & fp,
     std::string * error_out = nullptr);
 
+// Validate an opaque checkpoint-sampler encoding (capture_checkpoint_sampler
+// format). Empty means absent. Returns false naming the defect for truncated,
+// magic-mismatched, or length-inconsistent bytes. Validation only: there is
+// no decoder because seed + history cannot restore a sampler standalone.
+bool server_rerot_validate_sampler_snapshot(
+    const std::vector<uint8_t> & bytes,
+    std::string * error_out = nullptr);
+
 // Deserialize and validate a blob produced by server_rerot_episode_save into
 // *episode_out (untouched on failure). Virtual positions are NOT stored;
 // callers observe them via document.build_view(reader) after a successful
@@ -977,16 +1095,12 @@ void server_rerot_episode_demote_to_logical(server_rerot_episode & episode);
 // episode-wide until tokens_removed >= max_tokens_to_remove or no eligible
 // run remains. Eligibility: visibility public_live, token_count > 0, storage
 // entirely at or after base_prefix_end (the common system/user prefix is
-// always kept), and NOT referenced by any live Lane's active
-// public/private/pending run pointer (active causal tails are never cut).
-// Whole-run granularity is deliberate: runs are the semantic log segments,
-// and the frozen document offers no partial front-slice primitive. Sets
-// topology_barrier_pending, bumps layout (+publish) epochs, and fills
-// *result_out (no-op success with zeros when nothing is eligible). Returns
-// false only for a missing/invalid episode or epoch overflow. Physical KV
-// cells of dropped runs become unreachable (excluded from future
-// ordered_runs) and are reclaimed lazily via Tri/lifecycle — Tri eviction
-// itself stays physical-only and separate, and is never invoked here.
+// always kept). FRAME runs are always pinned. On DAG episodes, every PUBLIC
+// run of a started node is pinned (AGENTS.md §03.4 / §06.7). On non-DAG
+// episodes, only the live Lane's active public/private/pending pointers are
+// pinned. If nothing unpinned remains, returns success with tokens_removed=0
+// so the caller can fail the resource request instead of deleting needed
+// worker results.
 bool server_rerot_truncate_oldest_public(
     server_rerot_episode & episode,
     uint64_t max_tokens_to_remove,

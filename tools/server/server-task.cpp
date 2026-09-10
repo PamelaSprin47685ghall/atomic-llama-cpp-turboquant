@@ -583,22 +583,44 @@ common_chat_msg task_result_state::update_rerot_msg(
         const std::string & reasoning,
         const std::string & content,
         std::vector<common_chat_msg_diff> & diffs) {
-    // Final acquire mechanically closes the model-native reasoning block.
-    // Keep that boundary in the parser input, not in the returned content.
-    generated_text = "</think>\n" + content;
     auto msg_prv_copy = chat_msg;
+    common_chat_msg new_msg;
 
-    auto new_msg = common_chat_parse(generated_text, false, chat_parser_params);
+    // For peg-native format, the parser expects full generation including thought tags.
+    // When reasoning and content are already cleanly separated by RERoT, try parsing
+    // with reasoning block reconstruction, and fall back to direct content population.
+    bool parsed_ok = false;
+    if (chat_parser_params.format == COMMON_CHAT_FORMAT_PEG_NATIVE) {
+        try {
+            std::string full_text = "<think>\n" + reasoning + "</think>\n" + content;
+            new_msg = common_chat_parse(full_text, false, chat_parser_params);
+            parsed_ok = true;
+        } catch (...) {
+            // Fall through to content-only parsing below
+        }
+    }
+
+    if (!parsed_ok) {
+        try {
+            generated_text = "</think>\n" + content;
+            new_msg = common_chat_parse(generated_text, false, chat_parser_params);
+            if (new_msg.content.rfind("</think>\n", 0) == 0) {
+                new_msg.content.erase(0, 9);
+            } else if (new_msg.content.rfind("</think>", 0) == 0) {
+                new_msg.content.erase(0, 8);
+            }
+            new_msg.reasoning_content.insert(0, reasoning);
+            parsed_ok = true;
+        } catch (...) {
+            new_msg.role = "assistant";
+            new_msg.content = content;
+            new_msg.reasoning_content = reasoning;
+        }
+    }
+
     if (new_msg.role.empty()) {
         new_msg.role = "assistant";
     }
-    // If the parser does not understand or extract </think>, strip the artificial prefix
-    if (new_msg.content.rfind("</think>\n", 0) == 0) {
-        new_msg.content.erase(0, 9);
-    } else if (new_msg.content.rfind("</think>", 0) == 0) {
-        new_msg.content.erase(0, 8);
-    }
-    new_msg.reasoning_content.insert(0, reasoning);
     new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
     chat_msg = std::move(new_msg);
     diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
@@ -779,6 +801,16 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"tokens_cached",       n_tokens_cached},
         {"timings",             timings.to_json()},
     };
+    if (rerot_probe_tokens != 0 || rerot_frame_tokens != 0 || rerot_source_end_tokens != 0) {
+        res["rerot"] = json {
+            {"prompt_tokens",     n_prompt_tokens},
+            {"cached_tokens",     n_prompt_tokens_cache},
+            {"probe_tokens",      rerot_probe_tokens},
+            {"frame_tokens",      rerot_frame_tokens},
+            {"sampled_tokens",   n_decoded},
+            {"source_end_tokens", rerot_source_end_tokens},
+        };
+    }
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
     }
@@ -786,12 +818,23 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
 }
 
 json server_task_result_cmpl_final::usage_json_oaicompat() {
-    return json {
+    json usage = json {
         {"completion_tokens", n_decoded},
         {"prompt_tokens",     n_prompt_tokens},
         {"total_tokens",      n_decoded + n_prompt_tokens},
         {"prompt_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
     };
+    if (rerot_probe_tokens != 0 || rerot_frame_tokens != 0 || rerot_source_end_tokens != 0) {
+        usage["rerot"] = json {
+            {"prompt_tokens",     n_prompt_tokens},
+            {"cached_tokens",     n_prompt_tokens_cache},
+            {"probe_tokens",      rerot_probe_tokens},
+            {"frame_tokens",      rerot_frame_tokens},
+            {"sampled_tokens",    n_decoded},
+            {"source_end_tokens", rerot_source_end_tokens},
+        };
+    }
+    return usage;
 }
 
 json server_task_result_cmpl_final::to_json_oaicompat() {

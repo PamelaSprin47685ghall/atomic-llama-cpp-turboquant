@@ -1,1589 +1,2299 @@
-# RERoT：设计、实现与当前状态
+# RERoT：自适应 DAG 执行语义、实现状态与交付路线
 
-更新：2026-09-09。项目：`atomic-llama-cpp-turboquant`。本次整理核对的 `master` HEAD：`47432e525`。
+更新：2026-09-09。项目：`atomic-llama-cpp-turboquant`。本文核对的 `master` HEAD：`4e7769152`。
 
-本文合并原实施指南、数学与语义审计、交接记录，以及 `AGENTS.md` 中的路线图。以后只在这里维护 RERoT 的设计和状态。**本次是文档整理与源码核对，没有重新构建、运行模型、部署或认证当前二进制。** 下文严格区分当前实现、历史测试结果和待验收目标。
+本文是 RERoT 的单一自包含事实源，吸收当前 `AGENTS.md` 的最新方案，并结合当前源码与最近两笔 DAG 实现提交校正“已经实现什么、还缺什么”。以后不要再用旧 `RERoT指南.md`、旧数学审计、每日交接或脚本名字推断项目阶段。
 
-## 1. 先看结论
+**当前状态包含 `4e7769152` 之后的工作树实现，不等同于该历史 HEAD，也不等同于生产部署。** 本轮继续修复 DAG 实现与验证，保留既有 `src/llama-triattention.cpp` buffer-type API 修改；没有修改 `AGENTS.md`。生产服务与当前候选 artifact 分开记录，不继承旧部署的验收结论。
 
-**当前阶段是 Phase 1：核心真实长任务闭环验证。尚未通过，不能称为 production-compatible RERoT，也不能按 Phase 8 / Phase 9 已完成继续推进。**
+---
 
-核心并非从零开始：DDVR、树与队列、随机 ID 退出、child 原生递推、完整 final fence，以及多项 CPU/Vulkan 数值回归已有实现和局部证据。但局部测试通过，不等于长任务能完整、正确、自然结束；此前的兼容与性能成绩也不能自动继承到当前代码。
+## 0. 阅读口径
 
-### 1.1 当前口径
+文中结论分五级：
 
-| 项目 | 当前结论 |
+| 标记 | 含义 |
 |---|---|
-| 主要对象 | Ornith / Qwen3.5 hybrid；CPU 作数值参考，Vulkan 是首要认证后端，Turbo4/Turbo2 是目标 KV 配置 |
-| 跨 Lane 共享 | **DDVR 共享已提交的 PUBLIC K/V；child 的 GDN recurrence 和 conv 保持私有、原生递推** |
-| Shared RBB | 仅显式科研模式，不是默认算法，也不是坏输出时自动切换的备用路径 |
-| STRONG | **barrier-after**：peer 本 frontier 的 token 不得同拍可见；下一 frontier 才能读取 |
-| child 完成 | 模型自然生成自身精确的随机 `</ID>`；换行、EOG、超时、长度或重复次数都不能替代它 |
-| final fence | 已有闭合前 checkpoint、原 token 回放、逐行确认与幂等处理；仍须随完整长任务验收 |
-| 当前实验基线 | TriAttention OFF、MTP OFF、RAM checkpoint/demotion OFF；隔离 context shift 等状态迁移 |
-| 下一项工作 | 原题“世界上每个大洲有哪些国家”的多 child 长任务闭环，见第 7 节 |
-| 发布资格 | 未取得：完整兼容矩阵、资源压力、质量、性能、长稳与同一 artifact 验收均未收齐 |
+| **决定** | 当前产品/工程选择，后续实现应以它为准 |
+| **数学事实** | 在明确前提下可推导的关系，不自动等于模型质量结论 |
+| **当前实现** | 当前 HEAD 源码中已能找到实际接线或数据结构 |
+| **历史证据** | 旧 artifact / 旧提交曾经测到的结果；必须重新认证才能覆盖当前版本 |
+| **待验收** | 方案明确要求，但还没有当前目标 artifact 的完整证据 |
 
-`7509335d1` 是历史上的 **Core Correctness Candidate**，不是当前 HEAD，也不是生产认证标签。此后合并过 FlashPrefill、XKV-SR 等改动；当前 HEAD 又包含 Vulkan MoE 类型约束和不支持 pipeline 时的回退修复。旧提交的通过记录不能替代这些改动后的重新验证。
+必须同时记住三句话：
 
-### 1.2 这次统一掉的冲突
+1. **不要求 RERoT 等价于“把最终 transcript 串行 prefill 一遍”，不等于允许同一个已经定义好的 RERoT 计算因 backend、batch packing、slot 或 row 顺序改变数学。**
+2. **DAG 只规定什么时候必须等前驱完成；它不等于信息隔离。所有已经启动并发布的同 episode PUBLIC 内容仍持续共享。**
+3. **某个固定入口里出现原生 reasoning-end，不代表源任务完成。只有当前源阶段自己生成并成功提交的结束事件，才允许释放硬依赖。**
 
-| 旧文中的说法 | 以后采用的说法 |
-|---|---|
-| “global recurrent 共享是正式默认，lane-local 只是 Scheme 0” | child 默认已回到 lane-local native recurrence；shared RBB 降为研究模式 |
-| “联合 forward 内 peer 当前 K/V 可互读” | 物理上先写 KV 不代表逻辑提交；STRONG 必须隔开 read / write / barrier |
-| “child 首个换行后强制 close” | 已撤销；正文可多行、多段、含代码块，精确 owner delimiter 才结束 |
-| “正文出现 `<ol>` 就递归 fork” | 只有显式 planner phase 中的完整规划列表有拓扑含义；worker 的普通列表只是正文 |
-| “恢复 fork seed 可以清除私有指令” | 错误；会丢掉后续局部状态。serial tail 保留当前状态，fence 只恢复对应闭合前 checkpoint |
-| “fence 只是换 view / synchronize，尚未回放” | 属于早期记录；后续已实现正常 batch 路径中的完整回放，见第 6 节 |
-| “hand 是 FP16，旧 SEE2 可继续用” | persistent hand 已改 F32；SEE3 明确拒绝旧 SEE2，不隐式有损转换 |
-| “已到 Phase 8 / Phase 9” | 2026-09-09 已纠偏回 Phase 1；脚本名、提交标题或旧阶段编号不是验收结果 |
-| “HTTP 200、CTest 全绿、关键词评分 PASS 就通过” | 传输、局部数学、完整任务质量是三种证据，不能互相代替 |
+---
 
-## 2. RERoT 到底做什么
+## 1. 当前结论
 
-RERoT 是 Recursive Elastic Ring-of-Thought：在一次请求的思考过程中，把可并行推进的任务拆成多个逻辑 Lane。它不是多开几个独立 completion，再找一个模型汇总；Lane 在运行时共享公开推导，最后由自然退出的最后一条 Lane 接着完成串行回答。
+### 1.1 产品语义已经换轨
 
-DDVR 是 Dynamic Dense Virtual RoPE：同一份物理 K/V，对不同 reader 呈现不同的连续虚拟文档与位置，不为每个 reader 复制整份缓存。
+旧版主线是：
 
 ```text
-一个外部请求 / 一个 episode / 一个 response owner
-  → PRIVATE planner 提示
-  → PUBLIC 分析；规划列表暂存为 PENDING
-  → 完整 <ol><li>...</li>...</ol> 原子公开
-      ├─ N=1：当前 Lane 继续，不 fork，也不再递归规划
-      └─ N>1：parent freeze；创建全部 child descriptor
-                 → 有 pen 的 admission，其余 FIFO 排队
-                 → 各 child 推导；通过 DDVR 读取已提交 PUBLIC KV
-                 → 显式 planner phase 可以再次 fork
-                 → 各 child 自然输出自己的 </ID> 并退场
-  → 无 queued / starting / suspended work，确定唯一 final survivor
-  → 在稳定共享视图上完成 exactly-once final acquire fence
-  → 从 survivor 继续串行思考
-  → 原有 chat 路径自然进入正文或 tool call，结束同一条响应
+HTML <ol>/<li> planner
+→ 平面/递归 tree
+→ PAC-DFS 环形 reader view
+→ 每 child 随机 8 位 Base62 <ID>...</ID>
+→ 最后 child 成为 survivor
+→ 回放 survivor close token 做 final fence
+→ survivor 接管串行回答
 ```
 
-没有 merge agent，不回到冻结的 main，不按答案质量挑 survivor。并行历史产生的是 writer-contextual KV 和 recurrent state；它不等价于把最终文档重新串行 prefill 一遍。
+**这已经不是新的生产目标。** 新主线改为：
 
-### 2.1 四种身份不能混在一起
+```text
+普通 prompt prefill
+        ↓
+      C0
+        ↓
+隔离的 strategy probe
+        ├─ simple ─→ 丢弃 probe，恢复 C0，继续普通单流
+        │
+        └─ dag
+             ↓
+        校验 DAG 计划
+             ↓
+        建立正式公共规划边界 P / C_base
+             ↓
+        依赖满足的节点逻辑启动
+             ↓
+        每节点只 forward 一次固定入口 F_i
+             ↓
+        节点持续生成 R_i
+        （native lane-local recurrent）
+             ↓
+        PUBLIC 通过 reader-specific DDVR 实时共享
+        STRONG = 只看已经提交的 peer frontier
+             ↓
+        当前源阶段自然生成 native reasoning-end
+             ↓
+        SEALED，解锁真正后继
+             ↓
+        全部工作 SEALED
+             ↓
+        从 C_base 启动新的 0.synthesize 阶段
+             ↓
+        固定最终 view + F_0s + 新 logits
+             ↓
+        原生 reasoning → 最终正文 / 用户工具
+```
+
+几个旧概念被明确替换：
+
+| 旧概念 | 新定义 |
+|---|---|
+| `<ol>/<li>` 决定拓扑 | schema probe 产生显式 DAG `questions + depends_on` |
+| tree parent/child 就是依赖 | 创建关系、硬依赖、状态来源、物理 binding 分开 |
+| PAC-DFS 决定所有 reader 顺序 | DAG 上的循环优先 Kahn 排序，依赖约束优先 |
+| 随机 Base62 `</ID>` 唯一完成 | 当前 WORKER 源流自己的原生 reasoning-end 完成 |
+| 最后 child survivor | 所有工作完成后启动独立的 `0.synthesize` |
+| final fence 回放最后 child close | 新 synthesis 直接从稳定 view + C_base + F_0s 获取新 logits |
+| planner/child 控制串长期驻留 | probe 隔离；每节点固定入口只 forward 一次 |
+| shared RBB 是默认 | **不是**；默认仍是 native lane-local recurrent + DDVR KV 共享 |
+
+### 1.2 当前工程阶段
+
+最近两笔提交已经把新方案的一部分落到代码：
+
+```text
+c3648d789
+feat(rerot): implement adaptive DAG scheduling,
+             cycle-preferred topological views,
+             and fixed-entry framing
+
+4e7769152
+feat(rerot): wire DAG scheduling and routing probe into server decode
+```
+
+因此项目已经不是“旧 Ring Phase 1 长题闭合”状态，也不能继续用旧 `Phase 0..12` 作为当前推进编号。
+
+当前更准确的定级是：
+
+> **DAG production path wired, not production-certified**：隔离 probe、正式 P/C_base、循环优先 Kahn、原生 tool-round 固定入口、按 token LCP 的启动前缀重建、simple 完整 sampler clone 与用户预算恢复、源结束、W>P 逻辑 cohort、PUBLIC BODY/FRAME 冻结视图均已接线。shift、MTP 与 episode 持久化也有实现，但实现存在不等于完整兼容矩阵通过。当前仍不能称 DAG RERoT 完成或 production-compatible；各阶段证据与限制见第 12/13 节。
+
+新的实施阶段只保留第 12 节的 **阶段 0–8**。
+
+### 1.3 当前源码与目标方案最重要的差距
+
+这几项后续最容易被“代码已经有名字”误判为完成：
+
+1. **隔离 probe 已把 JSON 写到临时 `probe_seq`，C0 的 slot seq 不再被 probe 追加。** 这仍是 COW 拷贝后的分叉，不是独立 llama_context。simple 保留真实 C0 logits 的首个采样决策及完整 sampler，不再 `init_sampler()` 重置 RNG/惩罚链。目标 Ornith 的 CPU A/B 已通过贪心、seeded logprobs、用户 JSON grammar 与 SSE；不据此推断 GPU 或 RAM 恢复等价。
+2. **`capture_c_base()` 在正式 P 的 `plan_prefix` 注入完成之后调用，并覆盖当前 root hand_seed（含 conv tails）。** sampler prev/seed 写入 `sampler_snapshot_bytes`。仍需用真实 recurrent 模型核对 brain/hand 配对。
+3. **固定入口用真实请求 messages + spawn_lane 渲染 F_i。** 普通 C0 tape 与 DAG-with-tools 再渲染比较 token LCP；合法前缀变化在 DAG 启动时重建必要状态，不污染 simple 的普通 C0。模板无法无损渲染 CLOSE+handoff+OPEN 时仍 hard_abort。
+4. **W>P：eligible 节点可在未 SEAL 时 START；同一逻辑步的 BODY 写 PENDING，直到 cohort 全员 commit 后才发布。** 物理 pens 仍分时。真实多 pen decode 仍属待验收。
+5. **HTML `<ol>` / 随机 Base62 / PAC-DFS 的生产入口已 hard_abort；DAG 上的 HTML fork 会失败。** 解析器、PAC-DFS `build_view` 和大量旧测试仍在树里。递归嵌套 DAG 没有实现。
+6. **0.synthesize 会作为独立阶段 admit。** 真实 CPU 单 child 已进入综合并回答 221，但发现公共 P 泄漏及 final sampler 重启 reasoning budget；修正后的输出与 grammar 生命周期仍须重跑，不以 HTTP 200 宣告闭环通过。
+7. **Episode 持久化（state v5）包含 C0/C_base、frozen epoch、逻辑步 cohort、conv tails 与 sampler prev。** probe 进行中的 save 被拒绝。RAM 恢复仍须在目标 artifact 上验证。
+8. **DAG context shift pin 已启动节点的全部 PUBLIC 与全部 FRAME。** 无法腾出空间时 `tokens_removed=0`，由 decode 路径 resource abort。非 DAG 仍可截断未 pin 的旧 PUBLIC。
+9. **RERoT lane 不再永久跳过 MTP drafting。** 强制注入期间不 draft；draft 绑定 topology/publish/layout stamp；过期 draft 恢复 checkpoint。有 active peers 时的 acceptance 与正确性仍属待验收。
+10. **`n_cmpl>1` 仍在 prelude 串行化额外 RERoT root**（避免共用 visibility domain）。阶段/RNG/图不串线，但不是并发多 completion。
+
+---
+
+## 2. 不可变底层契约
+
+### 2.1 RERoT 是同一推理栈上的 execution semantics
+
+不要为每个 Lane 新建一套 server request、`llama_context`、KV cache 或 backend。
+
+```text
+same request/response infrastructure
+same llama_context
+same llama_kv_cells physical owner
+same recurrent memory owner
+same graph/backend
+same Tri/MTP/RAM/preemption foundations
+             +
+RERoT logical DAG / phase / view / epoch metadata
+```
+
+`llama_kv_cells` 继续是唯一 physical KV metadata owner。server 只保存稳定 logical run/node IDs，不把 GPU physical cell index 当作语义地址。
+
+### 2.2 四类身份必须分开
 
 | 身份 | 含义 |
 |---|---|
-| request / person / episode | 一份独立任务状态与外部响应；普通串行请求也占一个 person |
-| logical node / Lane | 树上的任务；可以排队、运行、递归 fork、暂停或退休 |
-| pen / physical execution slot | 执行 Lane 的有限物理资源，可换绑不同 node |
-| `llama_seq_id` | 底层执行、保活或状态引用 handle，不是逻辑任务身份 |
+| request / completion / person | 一份独立外部响应与全局任务状态 |
+| internal stage / node | 一次明确的计算阶段；`0.plan` 与 `0.synthesize` 必须是两个内部阶段 |
+| actor / Lane label | 给模型叙事看的身份；两个 0 阶段都可以叫 Lane 0 |
+| pen / physical slot / exec seq | 暂时的物理执行资源和底层 handle |
 
-`slot.id`、`node_id`、`exec_seq` 不能因早期实现恰好相等就互相替代。外层 `n_cmpl` 的不同 completion 各有独立 episode；内层 RERoT child 不能另建外部 completion 或单独终止 SSE。
+模型输出的 `question.id` 也是另一域。它是计划接口字符串，不是 `seq_id`、slot id 或内部 node id。
 
-### 2.2 复用现有推理栈
+### 2.3 Recurrent 共享边界已经冻结
 
-`llama_kv_cells` 是唯一 physical KV metadata owner。RERoT 扩展其 visibility、episode/node/run、frontier 等元数据，不另建 server 私有的 physical-cell registry。Tri compaction、清理、restore 都必须保持这些元数据与 cell 一致。
-
-server 管协议、树、队列、admission、sampler、response 和 frontier；core 管 view、KV 解析、位置、memory 和 graph。不要让 `server-context.cpp` 自行遍历物理 KV，也不要为每条 Lane 建一个 `llama_context`。
-
-### 2.3 当前逻辑状态模型
-
-接班时至少要能区分下面几层状态。字段名以当前源码为准，文档只保留语义，不要求未来 struct 排列永远不变。
+当前正式默认：
 
 ```text
-server_rerot_episode
-  id / root_task_id / response_task_id
-  frontier
-  publish_epoch / topology_epoch / layout_epoch
-  document
-  nodes[]
-  ready_queue / running / starting / suspended
-  archive_seq
-  hard limits + token counters
-  topology_barrier_pending
-  finalizing / hard_aborted
-  fence_refreshed / serial_tail / serial_node
-
-server_rerot_node_runtime
-  logical node id
-  pen_id / physical_slot compatibility alias
-  exec_seq / parked_seq compatibility state
-  storage_pos_next
-  current public/private/pending run
-  planner parser / exact-close parser
-  enqueue_frontier
-  sampler_blob / mtp_blob
-  shared fork hand_seed
-  final-fence checkpoint
-  last installed view_stamp
-
-server_pen
-  pen id
-  person / episode / node binding
-  exec_seq
-  free / allocated / running / suspended
+Full-Attention K/V    = same-episode PUBLIC 精确共享
+GDN recurrent matrix = lane/stage-local native recurrence
+Conv tail             = lane/stage-local
+Sampler/RNG/penalty   = lane/stage-local
 ```
 
-逻辑 document 在 core 层保存：
+不恢复 shared-RBB 默认，不把前驱 recurrent state 平均，不做“把 foreign token 无 MoE 回放进后继 recurrent”的隐式补丁。
+
+固定本 token 参数后，原生 GDN 可写为：
 
 ```text
-llama_rerot_node
-  parent / children / depth / title / state / runs
-
-llama_rerot_run
-  owner
-  visibility
-  storage_pos0 / token_count
-  publish_epoch
-
-llama_kv_rerot_meta   # 跟 physical cell 一起移动
-  episode_id
-  node_id
-  run_id
-  publish_epoch
-  frontier
-  visibility
-
-llama_rerot_reader_state
-  episode / reader / query_run
-  frontier
-  topology/publish/layout epoch
-  frontier mode
-  ordered run ids
+k,q ∈ R^(d_k), v ∈ R^(d_v), S ∈ R^(d_k × d_v)
+Sbar = alpha S, alpha = exp(g)
+Snew = Sbar + beta k (v - Sbar^T k)^T
+o = Snew^T q
 ```
 
-node 状态机当前至少包含：
+内部实现可能用转置布局，但同一公式里的矩阵方向必须一致。
+
+如果底层用 `S_effective = B + H` 表示 lane-local 有效状态，换基底时必须保持：
 
 ```text
-planning
-terminal_running
-forked
-queued
-starting
-running
-ready_suspended
-retired
-```
-
-这些状态的关键边界是：**logical node 可以长期存在而没有 physical pen；reader view 只带稳定 run id，不带长期 physical KV index；pen 和 exec_seq 都是可回收 execution handle。**
-
-### 2.4 三个 epoch 各自表示什么
-
-不要把所有“发生变化”都塞进一个 generation counter。
-
-```text
-publish_epoch
-  PUBLIC 文档/共享内存发生可见提交
-
-topology_epoch
-  tree、fork、heading、admission 等改变 reader 的结构关系
-
-layout_epoch
-  context shift、restore/重建、resident layout 等改变有效地址/布局
-```
-
-MTP、graph/input refresh、state restore 都要明确自己依赖哪几个 epoch。一个 peer 只追加普通 PUBLIC token，通常推进 publish/frontier；fork/heading 可能同时推进 topology；逻辑 history deletion 必须推进 layout。不能为了省事让所有事件全局 invalidation，也不能漏掉真正改变 reader view 的事件。
-
-## 3. 协议：公开文档和私有控制分开
-
-### 3.1 三种 visibility
-
-| 类型 | owner 可读 | peer 可读 | 客户端可见 |
-|---|---|---|---|
-| PUBLIC | 是 | 同 episode、reader view 包含且满足提交边界时可读 | 已提交内容可见 |
-| PRIVATE | 按自身执行 lineage 可读 | 不可直接 lexical 读取 | 不输出 runtime 强制控制字节 |
-| PENDING | 是 | 完整记录提交前不可读 | 提交前不可见 |
-
-普通非 RERoT cell 仍走原有 sequence membership。PUBLIC 也不是“同 episode 一律可见”，仍由 reader view、位置和 frontier 判定；不同 episode 的 PUBLIC 绝不能串读。
-
-**PRIVATE 只是词面隔离，不是安全隔离，更不是状态中可逆删除的指令。** 私有提示影响 owner 的 hidden/recurrent，随后生成的 PUBLIC 内容可以带着这种因果影响。模型自己采样出内部标签，与 runtime 强制 PRIVATE 字节直接泄漏，也必须分开查。
-
-RERoT 不解析、注入、删除、替换或强制闭合原生 `<think></think>`，不把它们当调度信号。原有 chat template / reasoning parser 继续负责思考与正文的分离。
-
-### 3.2 Planner 与 worker
-
-planner 提示采用第一人称、简明内省，要求列出工作量大致相当、可独立推进的平面 `<li>` 标题，不提前展开答案，也不告诉模型硬件有几支 pen。2026-09-09 当前实现文本是：
-
-```text
-我先把回答中可以同时展开、工作量大致相当的并列对象或章节列成一个平面的 HTML 有序列表：以 <ol> 开头，每项只写一个简短 <li> 标题，不提前展开内容，以 </ol> 结尾。一个 <li> 只对应一个可独立展开的对象或子主题；同一项里仍有互不依赖的部分时，我继续把它们分成并列项。只有确实无法并行拆解时才写一个 <li>。输出完 </ol> 后我再展开分析。
-```
-
-这是协议的一部分，不是普通 system prompt 调参项。若源码以后修改，应同步更新本文并重新做 Phase 1 语义验收；不能让文档和 binary 各自维护不同“冻结 prompt”。
-
-字节 parser 必须处理 tokenizer 任意拆分。疑似 `<ol>` 的片段先 hold；真正规划列表从开始到完整 `</ol>` 均为 PENDING，随后原子公开；候选失败则按原字节顺序释放。不得让 sibling 看到半个列表。
-
-N=1 时不新建 child。root 解除 planner grammar 后用 PRIVATE continuation 接着思考；child 从显式 planner 返回 worker 时保留/恢复自身 exact-close 约束。该 node 后续普通列表不再触发规划。
-
-N>1 时 parent 停止运行，为所有 direct `<li>` 建 descriptor。admission 后把标题机械转成 heading：第一级 `<h1>`，随后逐级增加，显示最多到 `<h6>`；真实深度保留在 metadata 中。heading 完整后才原子公开。
-
-当前 child 默认直接做 worker，并有绑定自身标题和 close marker 的 PRIVATE task contract；不是旧文所写的“完全没有 worker control”。递归规划必须显式进入 planner phase；普通 worker 正文中的 `<ol>/<li>`、标题和代码块没有调度含义。实现入口是 `server_rerot_child_contract()`、`server_rerot_child_planner_prompt()`、`server_rerot_child_worker_prompt()` 与 runtime 的 planner 状态转换。
-
-当前 contract 的语义固定为：
-
-```text
-我只做自己的唯一子任务 <title>；
-sibling PUBLIC 内容只作参考，不接管兄弟章节，也不重答整个用户问题；
-普通列表/标题/代码块只是正文，不触发 scheduler；
-完成自己的任务后直接输出自身精确 </ID>，随后停止该 child。
-```
-
-child 若需要继续递归拆分，runtime 显式进入 PRIVATE planner phase，再使用只针对当前 title 的 planner prompt；不能靠 worker 正文偶然出现 `<ol>` 自动 fork。
-
-### 3.3 随机 ID 是唯一自然退出协议
-
-每个 logical child 创建时分配随机 8 位 base62 ID，字母表为 `0-9A-Za-z`，大小写敏感。PRIVATE opener 为 `<ID>`，close 为 `</ID>`。ID 随 node 保存，不随 slot 改变。
-
-协议随机源独立于模型 sampler。排队、换 pen、RAM 恢复、checkpoint 和 retry 恢复同一 logical child 时不能重生成 ID。按现有契约假设随机 ID 不碰撞，不添加查重集合、上下文扫描或内容 escape；首字符可以是数字，这不是 XML tag-name 协议。
-
-只匹配**当前 owner 的完整精确字节序列**。错误 ID、大小写不符、普通 HTML、固定 `<blockquote>` 都不能触发退出。不假设 delimiter 是一个 token；不完整候选保持 PENDING，失败则原样释放，成功只消费 delimiter，不能吞掉相邻正文。
-
-child 正文须先有非空白内容，随后可任意多行、多段、含代码块。`server_rerot_child_grammar()` 没有“一行完成”规则。EOG 在 close 之前是协议错误，不允许据此由 runtime 偷补 `</ID>`。不设置 per-child/per-depth token budget，不用重复截断或题目专用 stop 冒充完成。
-
-### 3.4 Response 与采样
-
-episode root request 始终拥有外部响应。PUBLIC reasoning 使用现有 reasoning/thinking 字段，不能混入最终 `content`；PRIVATE 和未提交 PENDING 不进客户端 delta。
-
-流式时每个 Lane 缓冲不完整行，按完整行实际提交/完成顺序输出，同 frontier 以稳定 commit 顺序裁决。退场或 fork 可补发最后非空残行。非流式 reasoning 按最终 PAC-DFS 文档渲染；两者顺序不必相同。serial tail 不重发已流出的 reasoning；一条响应恰好一个起始事件和一个终止事件。
-
-每个 live Lane 有独立 sampler、grammar 和 RNG；pen 换绑须正确初始化/恢复 sampler。sibling 内容通过 attention 影响 logits，不机械加入本 Lane 的 repetition penalty history。协议 ID 的随机数不能消耗模型采样随机流。
-
-`reasoning_effort` 已进入本地请求链路，支持 `none/low/medium/high/xhigh/max`，Responses 的 `reasoning.effort` 转到同一路径。它不是 RERoT child 的结束协议。历史审计中的预算比例曾多次修订；普通非 RERoT 的 budget-only fallback 最后记录为 `20%/50%/80%/95%/100%`，受显式预算和最终输出余量约束，不把它解释成第三方模型的原生行为。具体请求语义查 [server README](tools/server/README.md) 和 `test-chat`，不要把这组比例复制成 RERoT 调度规则。
-
-## 4. Attention：PAC-DFS、DDVR 与 frontier
-
-### 4.1 PAC-DFS 给每个 reader 排一份文档
-
-对某节点的 children `c0 ... ck`，若 reader 位于 `ci` 子树，渲染顺序为：
-
-```text
-本节点 PUBLIC prefix
-→ c(i+1) ... ck
-→ c0 ... c(i-1)
-→ ci 递归放最后
-```
-
-不在 reader 路径上的子树按原始 child 顺序稳定 DFS。这样 parent heading 在 child 前，每个 PUBLIC token 恰好出现一次，reader 自身路径在每层最后，off-path 子树不随内部 writer 活跃情况洗牌。
-
-core 从稳定 run id 解析当前 resident cells，再分配连续、唯一的 virtual positions。Tri eviction 后可以有 storage/physical 空洞，但虚拟文档仍是 dense；不能假定一个逻辑 run 对应连续物理区间。server 不保存长期有效的 GPU cell index。
-
-### 4.2 DDVR 的数学
-
-令一段 K 在 storage position `s+m` 写入，而 reader 将它排到 virtual position `v+m`；query 的虚拟位置是 `q`。在固定、已验证的 RoPE 参数下：
-
-```text
-缓存：K_m = R(s+m) K̄_m
-目标：<R(q) Q̄, R(v+m) K̄_m>
-等价：<R(q+s-v) Q̄, R(s+m) K̄_m>
-```
-
-因此 K 不动；针对不同 source span 调整 Q 的相位。正确性基准是显式 rephase K 后的 dense attention，与 Q-side DDVR 对照，而不是两份实现互相抄预期。
-
-**所有可见 span 共用一个 softmax。** 不能分别算 `softmax(QK_A)V_A`、`softmax(QK_B)V_B` 再相加。fused kernel 用跨 span 的 online-softmax `(m,l,O)` 累积；PUBLIC 与 PRIVATE 分段扫描也必须按相同归一化合并。
-
-本项目 Qwen3.5 文本 IMRoPE 输入是 `(p,p,p,0)`。文本位移 `Δ` 必须成为 `(p+Δ,p+Δ,p+Δ,0)`，不能只改第一轴或改第四轴。多模态 spatial positions 不能照此处理。
-
-Turbo 路径还必须保持变换顺序：Q projection/norm → DDVR/IMRoPE → Turbo WHT → K dot；K 保持 writer storage phase 的缓存表示。以实际 tensor type/shape/stride/padding 为准，不能把 storage head dimension 当成逻辑 head dimension。F16 是数值对照，不是生产中静默替换 Turbo 的理由。
-
-实现与基准入口：[llama-rerot.cpp](src/llama-rerot.cpp)、[test-rerot-ddvr.cpp](tests/test-rerot-ddvr.cpp)、[test-rerot-attn.cpp](tests/test-rerot-attn.cpp)、[llama-graph.cpp](src/llama-graph.cpp) 和 CPU/Vulkan attention 实现。
-
-### 4.3 STRONG 不是“同拍互读”
-
-```text
-read：自己的 causal history / current K/V + barrier 前已提交的 peer PUBLIC
-write：各 Lane 写本 frontier 的 K/V，执行自身 recurrent transition
-barrier：该 frontier 完成并提交
-next read：下一 frontier 才可读取这些 peer writes
-```
-
-当前 `llama_rerot_cell_visible_public_full()` 以同 episode、PUBLIC 且 `meta.frontier < reader.frontier` 为完整 peer 可见条件；自己的 current K/V 走 owner-gated causal 路径。Vulkan/FlashPrefill 不能因先 copy KV 再算 attention 而绕开它。LAG1 再额外延迟一个已提交 frontier，只作显式对照。
-
-sampled/PUBLIC/PENDING 推进按 Lane frontier 组织；连续 PRIVATE control 可用有界 causal microbatch（既有设计上限 32 token），但不得部分提交逻辑事务。物理组批可以改变执行时间，不能把同一个逻辑读写集合换成另一条方程。
-
-### 4.4 Topology 与 graph input
-
-列表公开、heading 公开、fork/admission、大规模 view 变化都可能使旧 next-token logits 失效。refresh 必须读取最新 view，又不重复推进 KV/recurrent、计数或 stream。**单纯 synchronize 不证明完成了 logits refresh。** 一般 topology refresh 的覆盖范围要继续测试，不能用 final-fence 回放测试代替所有 barrier。
-
-view/visibility/phase offsets 尽量做 graph input，shape/capacity/kernel variant 才进入 reuse key。异步执行和 pipeline parallel 下，旧 graph 还在读的 host/GPU input 不能提前被下一 frontier 覆写。
-
-多 reader 共享 K/V tile load 与 Turbo dequant 是可追求的优化，各自仍保留独立 Q、phase、attention output 和 `(m,l,O)`。reader tile 宽度不是每人 Lane 上限；“一次加载服务多 reader”也不能仅凭架构图宣布当前所有路径都已优化完成。
-
-## 5. Recurrent：默认原生递推，研究共享另列
-
-### 5.1 当前默认及状态表示
-
-目标 hybrid 的主干是周期性 `3×GDN + 1×Full Attention`；该 Ornith 配置的 Full Attention 位于 `3,7,...,39`。当前 child 的所有 GDN 层保持本 Lane 的原生 recurrence，conv 始终私有。A3/A7 等层读到的 peer PUBLIC 信息会自然进入后续本地递推，不再直接合并 child 的 recurrent matrix。
-
-固定本 token 的 `k,v,g,beta` 后，原生 GDN 状态更新是仿射算子：
-
-```text
-T_i(S) = A_i S + C_i
-A_i = exp(g_i) (I - beta_i k_i k_iᵀ)
-C_i = beta_i k_i v_iᵀ
-```
-
-transition composition 结合但一般不交换，state 本身不是可随 PAC-DFS 重排的文档。没有 token 就没有 transition，不能为 position gap 另加未训练的 decay。
-
-当前 grouped memory 仍可能用 `B + H_i` 表示有效状态：`B` 是存储基底，`H_i` 是 Lane 的 hand overlay。**保留 brain/hand arena 不等于 child 仍在共享更新 brain。** 默认 child 不提交 shared brain，其 hand 必须保存完整本地 transition：
-
-```text
-有效输入：S_i = B + H_i
-默认 child：H_i' = T_i(B + H_i) - B
-有效输出状态：B + H_i' = T_i(B + H_i)
-```
-
-root 的 PRIVATE shadow 与 PUBLIC 基底切换只是换坐标，不是重新递推：
-
-```text
-H_new = H_old + B_old - B_new
 B_old + H_old = B_new + H_new
+H_new = B_old + H_old - B_new
 ```
 
-不能通过 batch 里“恰有两组”等 shape 猜 ordinary root 并忽略 hand。persistent hand 已为 **F32**；不能把它当作可随意有损量化的 KV cache。
+这是坐标换基，不是新的 GDN transition，也不是 state merge。
 
-实现入口：[delta-net-base.cpp](src/models/delta-net-base.cpp) 的 `rerot_shared_rbb_enabled()`、[llama-memory-recurrent.cpp](src/llama-memory-recurrent.cpp)、模型 graph builder 与 [test-rerot-recurrent.cpp](tests/test-rerot-recurrent.cpp)。
+### 2.4 DDVR 继续是共享注意力核心
 
-### 5.2 为什么 shared RBB 不再默认启用
+三个位置域不能混：
 
-DDVR 已把 peer 文本写进各 Lane 的 hidden；后续 `q/k/v/g/beta` 是这些 hidden 的非线性投影。再把这些 transition 合进同一个 global brain，会增加第二条反馈通道。仅从当前投影量，不能唯一拆出“本 Lane 新信息”和“刚读过的 peer 信息”。
-
-这不是说共享 recurrent 永远不可研究，而是现有方案缺少可验证的去重/innovation 定义。置换对称、单次 decay、数值稳定都不能代替未重训模型的任务质量证据。因此只有显式 `LLAMA_REROT_RBB_ABLATION=shared-rbb` 才启用共享研究路径；`raw-redundant` 保留重复证据反例。默认不是根据输出好坏动态 fallback。
-
-未来要把 shared RBB 升为默认，须先给出可验证的 innovation operator 或明确的 transition virtualization 契约，再过数学、语义和质量门。foreign-token state-only replay 的全网成本接近随 Lane 数平方增长，不作为当前默认方案。
-
-### 5.3 保留的研究数学与已纠正边界
-
-以下是审计所用的 block-Delta 基础方程，**不是默认 child 的更新式，也不是后续 evidence-normalization 研究实现的完整替代定义**。令 `N` 只计同一 brain、本 frontier 的 PUBLIC writers，`K`/`V` 按 writer 堆叠：
-
-```text
-N=0：B' = B
-N=1：Bbar = exp(g_1) B
-     B' = Bbar + beta_1 k_1 (v_1 - Bbarᵀ k_1)ᵀ
-N>1：Bbar = exp(mean(g_i)) B
-     C = diag(sqrt(beta_i))
-     M = C K Kᵀ C + diag(1-beta_i) + eps C²
-     M z = C (V - K Bbar)
-     B' = Bbar + Kᵀ C z，eps = 1e-4
-```
-
-`N=1` 必须显式走原生分支。直接把带 `eps` 的 block 公式套到单笔，其系数是 `beta/(beta*||k||² + 1-beta + eps*beta)`，并不普遍等于 beta。
-
-`beta` 定义域包括 `[0,1]` 端点。零 write gate 必须严格不写，不能 clamp 到 `1e-6`，但该 PUBLIC token 的 decay 仍计入公开时钟。对称缩放避免除零；合法参数下的正定系统用独立参考验证，非有限求解不得静默换成零。
-
-研究 shared writer 的基本 hand 项是 `T_i(B+H_i)-T_i(B)=A_iH_i`；不提交 brain 的 PRIVATE/PENDING row 则是 `T_i(B+H_i)-B`。二者不能混用。当前 token 的 readout 走自身 native transition，不能先合并本步 peer writes 再立刻读 `B'`；shared commit 只供下一 frontier 使用。
-
-未归一化的重复 writer 有确定的宽度放大。相同单位 key/value/beta 的有效写门为：
-
-```text
-beta_effective(N) = N*beta / (1 + (N-1)*beta + eps*beta)
-```
-
-`beta=0.3,N=8` 时约为 `0.774`，不是 `0.3`。后续研究路径加入 evidence-density normalization 和零均值 self-echo；这些只修正特定动力学问题，不证明两条共享通道叠加已有效。
-
-CPU 使用独立 double 参考；Vulkan CG 的“N 步精确收敛”不能照搬到 FP32。真实捕获张量曾暴露该错误，后改有界 4N 迭代、每 N 步重算真实残差并重启。通过有限 captured blocks 不是对任意病态输入的误差上界证明。
-
-## 6. 生命周期、内存与恢复
-
-### 6.1 Fork、排队与 archive
-
-parent fork 或 Lane retire 时，PUBLIC KV 需要通过 attention-only archive/keeper 引用保活，再释放 exec 引用；PRIVATE/PENDING 不作为公开 archive。archive 只解决生命周期，不定义 reader visibility。
-
-queued child 只有逻辑 descriptor、标题、ID、parser/sampler seed，以及必要的共享 fork-state seed 引用。**排队不能按 child 数提前分配一整份 GPU KV/recurrent 执行状态。** 同一 fork 的多个 sibling 可以共享不可变 seed，admission 时才 materialize 到 pen；旧 parked recurrent COW 机制仍是实现/对照的一部分，不应按“共享脑默认”旧设计误删当前原生递推所需 lineage。
-
-默认 native child 继承相应 fork 局部状态，同时 admission 读取最新已提交 PUBLIC KV。不得照旧文写成“只接当前共享脑、不需要 child recurrence”。child 数没有 planner-visible 上限；超过物理 pen 数只排队，不截断 `<li>`。队列采用 enqueue frontier / tree-path 的稳定 FIFO，不按标题、置信度或答案好坏选任务。
-
-### 6.2 Frontier 是原子提交单位
-
-执行前核对整组所需 KV、recurrent、metadata、预算与 backend 资源。不能只让 A 成功提交而 B 因资源不足未执行，却继续当作同一完整 frontier。PRIVATE causal microbatch 的物理推进和逻辑 run 扩展也必须一致。
-
-只维护 episode/global 硬资源门，不给 child/depth 分预算，也不为了“保住答案”预留 final token。pen 暂时不足是排队，不是资源失败；不可恢复的硬资源耗尽则 HARD_ABORT 整个受影响 episode：停止 writers、清理 queue/refs/drafts，不选 survivor，不做 final fence，不补答案或伪造自然 `stop`。
-
-对外用现有错误/终止通道明确区分 hard abort、cancel、timeout、length 和自然完成；不依赖一个文档自造的 `finish_reason` 值。每条响应仍须正常收尾且只终止一次。
-
-### 6.3 Final survivor 与 acquire fence
-
-queue、starting、suspended 和尚未 admission 的工作都必须清空。最后一条 Lane 自然输出自身 `</ID>`，才有资格进入 final。多个 Lane 同 frontier 退出时按稳定 tree-path 顺序裁决，不引入 judge。
-
-完整 fence 不只是安装 stable view，步骤是：
-
-```text
-提交其他 Lane 最终 PUBLIC writes，确定 survivor
-→ 安装稳定 PAC-DFS reader view
-→ 恢复首个闭合候选 token 之前的完整局部 checkpoint
-  （不回退当前 PUBLIC brain，不覆盖其他 Lane）
-→ 移除 survivor 原 PRIVATE suffix KV
-→ 用原 token ID / storage position / run ID 逐行 PRIVATE 回放
-→ 每行经正常 batch/decode，确认全部成功
-→ 才允许 complete_serial_tail、恢复用户 grammar 和串行继续
-```
-
-不能重新 tokenize delimiter，也不能直接再走一次已提交的 recurrent transition。不得在 `post_decode()` 递归调用 `llama_decode()` 覆盖其他 slot 尚待采样的 logits。prepared 状态与 cursor 必须幂等；重复 poll/prepare 不能重置回放。
-
-回放不再次扩展 logical run、不重写 prompt tape、不重复计 model/sample/visibility tokens 或发 stream。物理计算开销仍要反映在耗时中。非 survivor 及时释放 checkpoint；final 回放完成后也释放其局部快照。
-
-serial tail 保留 survivor 的最新 conv、local recurrent、hand 和共享 view，不恢复 fork 旧 seed 来“洗掉指令”。未 fork 的 N=1 root 同样保留当前状态。可以继续使用 DDVR attention，不要求立即搬动并重相位全部 K。
-
-实现入口：[server-rerot.h](tools/server/server-rerot.h) 的 fence checkpoint、[server-rerot.cpp](tools/server/server-rerot.cpp) 的 serial transition，以及 [server-context.cpp](tools/server/server-context.cpp) 的正常 decode 回放接线。
-
-### 6.4 Checkpoint / RAM / context shift 的边界
-
-checkpoint 要覆盖同一个完整局部时点：conv、R0-R2/local S、F32 hand、position、source row、rollback selector。restore 应先校验所有尺寸和格式，再取得独占 cell 后整体写入；坏输入不能半写状态或分配一半。共享 sibling 不能被覆盖。
-
-选择旧 snapshot 后接到当前 PUBLIC 基底时，需要 rebasing：`H_seed = B_selected + H_selected - B_public_now`。默认 native child 的 hand snapshot index 不能误用来选择它从未写过的 root 历史 brain 槽。启用 rollback slots、即使没真正 rollback，也不能改变后续递推方程。
-
-SEE3 是 F32 hand seed 格式；episode blob 另有 `LLAMA_REROT_STATE_VERSION`。旧审计记录的 episode `2→3` 是一次历史升级，不应把“3”当成永久当前版本。版本、model/RoPE/Tri fingerprint 和实际 loader 接受范围须一并核对。
-
-完整 RAM save/restore 的对象是 episode，而不是一条 token tape 或一个 server slot。必须保存树、runs、visibility、ID/parser、queues、epochs、memory lineage、sampler RNG、MTP checkpoint、预算与 final-fence 状态；恢复到不同物理 indices 后重建 view。局部 blob roundtrip 通过不代表真实 demotion/resume 已验收。
-
-context shift 是**逻辑历史删除**，Tri eviction 是**物理驻留压缩**。shift 必须同步裁剪 runs/KV/view、更新 epochs、失效相关 drafts；不能用普通 `seq_add()` 随意修 active DDVR 的虚拟地址，也不逆向重写 recurrent 来假装删除过去的语义影响。
-
-## 7. 当前唯一主线：把 Phase 1 长任务做完
-
-### 7.1 先锁配置，再运行
-
-当前目标不是再调 prompt 或追 tok/s，而是让原题完整经历 fork → 自然 close → final fence → serial answer。最小基线为 STRONG、默认 child native recurrence、Turbo4/Turbo2，关闭 TriAttention、MTP、RAM checkpoint/demotion，并隔离 context shift 等干扰。
-
-context 和 episode output/work budget 是两回事，必须分别记录。历史 8192 context / budget 的资源失败不能直接判算法错误；同样也不能据此盲开 131K/262K 窗口。先确认设备、实际 B/P/K 和显存余量，再选择能承载长任务的容量；32K 可作为候选起点，不能当作已证明足够的固定值。容量或预算改变后是新配置，不和旧结果冒充严格 A/B。
-
-**真机测试须谨慎：不能把桌面 GPU 或生产机器拖死。** 不自动重启服务、停止不属于本次测试的进程，或与已有模型服务叠加显存。先检查服务状态、端口、环境变量与完整启动日志。仅仅“不写 `--mtp` / `--triattention`”不能代替核实实际生效配置。
-
-### 7.2 两个现有入口，各有用途
-
-优先用保存完整证据的 [rerot-semantic-smoke.py](scripts/rerot-semantic-smoke.py)。它会**启动本地开发 server 并在结束后清理自己的子进程**，不是只读命令；应在完成上面的资源检查后显式执行：
-
-```bash
-# 在仓库根目录；MODEL 指向本地目标 GGUF。
-# 输出目录须尚不存在；再次运行时换一个目录名。
-: "${MODEL:?请先设置本地目标模型路径}"
-python3 scripts/rerot-semantic-smoke.py \
-  --model "$MODEL" \
-  --context 32768 \
-  --total-kv auto \
-  --frontier strong \
-  --port 18081 \
-  --output reports/phase1-semantic-01
-```
-
-该脚本的原题请求默认 temperature=0、seed=424242、max_tokens=8192；这些默认值并不保证长任务预算充足。它保存 request、原始 response、metrics、日志、trie、源码 patch 与 binary/library hashes，只检查传输/完成条件，不替国家清单评“质量通过”。`--audit` 会增加同步和读回，不计入性能成绩。RERoT full-auto 下不要再加 `--parallel`；显式 manual KV/parallel 仅作单独标记的开发对照。
-
-已有服务上的 [rerot-continents-benchmark.py](scripts/rerot-continents-benchmark.py) 可采集报告；它**不负责配置或启动服务**：
-
-```bash
-python3 scripts/rerot-continents-benchmark.py \
-  --base-url http://127.0.0.1:8080 \
-  --output reports/phase1-continents.json
-```
-
-`--output` 是 JSON **文件**，不是旧交接所写的目录。当前脚本还会加 low-effort system 提示和 `reasoning_effort=low`，并非上面 smoke 的相同请求。报告必须保留实际 payload，不能混报。
-
-**该 continents 评分器尚不能作为 Phase 1 质量裁判。** 它硬性要求八个 `<li>`，把不同地区别名合进第八项，并在全文而非各章节内部找国家关键词；因此不能可靠识别串洲，也可能误判合理拆分。修评分器与修模型应分开，不以改答案、强塞“第八洲”或放宽阈值制造 PASS。本次只整理文档，没有修改这两个脚本。
-
-### 7.3 完整验收条件
-
-生命周期要有日志/trie 证据，而不只看最后一行响应：
-
-```text
-root planner
-→ 全部 child 建立并按资源 admission
-→ 每个 child 自然生成自身 exact random-ID close
-→ 全部子任务退休，无剩余 queue / starting / suspended / orphan
-→ exactly one final survivor
-→ final fence prepare 与原 close-token replay exactly once
-→ serial final answer
-→ HTTP 200，finish_reason=stop
-```
-
-既有八 child 压力用例要证明 8/8 完成；这只是该用例的覆盖目标，不是协议 child 上限或通用地理分类定义。对自然规划结果，要检查任务拆分是否合理、每项是否真正完成，而不是只数 `<li>`。
-
-质量还要逐项检查：章节归属正确、无串洲/接管兄弟任务、无死循环或反复标题、无 prompt echo、无 PRIVATE/random ID 暴露、无内部协议混入公开正文；最终答案完整且确实回答原题。usage、sampled tokens、forced tokens、visibility counters 和实际提交 tape 必须核对，不将 fence 回放重复算成新 token。
-
-失败按层分类保存，不改停止协议遮住问题：资源/context/budget；child 不 close；child 语义偏航；final fence；serial tail；API/stream assembly。timeout 是未完成观察，不等于自然 length/stop，也不能单凭短窗口超时证明模型永不结束。
-
-通过这一完整门后才能宣告“Phase 1 核心真实语义闭环通过”，再转入长轨迹与兼容矩阵。
-
-## 8. 已有证据：哪些修了，哪些仍不能下结论
-
-下表是原文记录的历史证据摘要，**不是本次重跑结果，也不是当前 HEAD 的完整回归报告**。历史 FP16 hand 数值属于当时实现，不能当作当前 F32 hand 的新测量。
-
-### 8.1 局部数学、memory 与 backend
-
-| 发现 | 修复/证据 | 边界 |
-|---|---|---|
-| mixed batch 随无关 rows 改用 candidate mean；PRIVATE transition 被抵消 | 按 brain group gather/solve/scatter，区分两类 hand；CPU/Vulkan 独立 oracle 覆盖 mixed visibility、两个 brain、倒序 rows | 无 snapshot 单步通过不能推广到全部 multi-token/MTP |
-| beta 下限偷偷打开零 write gate | 对称缩放、单笔 native 分支；GPU beta=0/1e-8 的 brain 最大误差由约 `1.02e-3` 降到 `1.86e-9` | 不宣称任意非法输入已有服务层优雅处理 |
-| 未初始化 `brain_copy` 影响非 grouped 路径 | 指针/标量初始化；脏存储 placement-new 回归 | 曾出现 CTest 8/8 而直接运行崩溃，故必须保留 direct test |
-| checkpoint 半写、COW sibling 覆盖、位置/source/snapshot 错配 | 先加失败反例，再整体校验与写入；包含局部 capture/apply/rebase | 不等于整个 server RAM 恢复通过 |
-| final fence 重复 prepare | 原 token tape 与闭合前 checkpoint 经正常 batch 回放，prepared/cursor 幂等；runtime 测 exactly-once | 早期真实请求仍曾 HTTP 500，后修；传输修复不等于答案正确 |
-| root PRIVATE/PUBLIC 换基底丢有效状态 | 验证 `4+2 = 1+5`，同 tag 重装不重复换算 | 不是清除私有指令 |
-| FP32 CG 只跑 N 步不收敛 | captured 四 writer block 的 brain 误差 `0.00918055 → 4.76837e-7`，output `6.5567e-5 → 7.45058e-9` | 4N 与残差重启仅对已测输入给证据 |
-| F16 hand 长轨迹漂移 | 128 步 output/state 误差约 `5.76e-4/1.72e-3 → 3.58e-7/7.15e-7`，改 persistent F32 | 不代表整模型 greedy 恒等 |
-| 启用 rollback slots 就丢 child transition | rollback=2 的 128 步 output/state 误差 `2.17231/1.14956 → 2.68e-7/7.15e-7`；另测三快照、suffix discard、resume | MTP 完整矩阵仍须另验 |
-| 比较器把空输出/NaN 当零误差；CPU F32 indexed Q 偷降 F16 | 比较器 fail-closed；独立 double QK/softmax/PV；33/257 keys 的 CPU F16-KV 误差降至 `1.19e-7/8.94e-8` | CPU 修复不能冒称 Vulkan 长轨迹根因修复 |
-| Vulkan MoE threshold / shape 状态污染 | `7509335d1` 记录 hermetic 18/19 门；后续加入 supported B types 与 unsupported pipeline 回退 | 当前需保留 `18→19→20→18→19` 再认证，不能只看提交标题 |
-
-### 8.2 整模型与真实语义的历史结果
-
-| 输入/配置 | 已观测结果 | 应如何解读 |
-|---|---|---|
-| 修复 rollback 后的旧 128 teacher tape | Turbo/F16 均 0/128 argmax mismatch；同 KV 下 rollback 0/2 报告一致；最大 logits rel L2 约 `0.07424/0.03486` | 本反例的 rollback 开关不再改递推，仍有形状/精度差 |
-| 另一份 512 native Turbo tape | Turbo 1/512 mismatch，首次零起算 step=509；F16 0/512，最大 rel L2 仍到 `0.132615` | 不同 tape 的 step33/509 不能比较成“分叉被推迟”；需同一冻结输入复验 |
-| step509 诊断 counterfactual | A3 微差逐层放大；layer29 expert membership 变化；仅诊断替回 native IDs 可恢复 native top token | 定位了能改变决策的位置，不证明 router 本身算错，更不能作生产修复 |
-| 默认模型多路固定不同 token | F16/Turbo 短程各路 raw top 与本路参考相同，但 Turbo rel L2 明显更大 | 短程 argmax 相同不等于数值/长期 greedy 等价 |
-| 两 Lane 物理行反转 | Turbo 12 步最大 rel L2 约 `6.3e-7`，top token 不变 | 覆盖该排列反例，不覆盖全部 scheduler/restore |
-| F16、context8192 的 reader attention audit | observation128/192/256 的 pair cosine mean 约 `0.04088/0.03542/0.03469`，top-key overlap 为 0 | 该观测中 reader attention 确实不同；不是所有运行的证明，不能冒用作 Turbo 解码结果 |
-| 早期长题 fence 重入修正后 | HTTP 200 但 `finish_reason=length`，仍串洲、HTML 残缺，completion 8426 与请求预算 8192 不一致 | 明确不通过；不能拿“fence 已工作”覆盖语义与计数失败 |
-| 2026-09-08 的 9.11 短题 | HTTP 200/stop，三个 child 自然 close，最终比较正确；公开 child 文本仍有数字漂移和字面内部标签 | 任务完成改善，不是完整语义通过；采样偏航与 PRIVATE transport 泄漏分开 |
-| `7509335d1` 候选总结 | 记录了后续 Turbo/F16 fixed-tape、native determinism、response surface 等局部门 | 比上面的失败记录更新，但未给当前合并后版本的全部长轨迹重跑证据 |
-| 2026-09-09 交接纠偏 | 锁回 Phase 1 最小配置；同拍物理可见性、提示措辞、sampler 初始化、grouped state 映射已有修复记录 | “长任务尚待完成”仍是当前结论 |
-
-旧 step509 失败是必须保留的回归入口，不能因后续短 tape 通过就删掉；也不能不重跑就断言它在当前 HEAD 必然仍复现。当前应在新 artifact 上冻结 tape、核实对应源码与库，再更新这张表。
-
-可在仓库内查找的历史证据定位：`build-vulkan-localhost/rerot-evidence/20260908-AuxjZd/`，包括 `final-build.log`、`final-ctest.log`、`model512-inherited/teacher.tape`、`final512-{turbo,f16}-rollback*/`。旧 `/tmp/rerot-*` 是当次运行证据，不保证今天仍存在；完整目录名、原始日志清单和逐轮数据可按第 12 节从旧审计取回。
-
-### 8.3 旧速度数据只作历史
-
-2026-09-04 的旧三 slot 配置记录：single-Lane 约 `108.429 tok/s`；两次 request-wide aggregate `237.061/245.028 tok/s`，parallel aggregate `252.476/266.110 tok/s`。当时使用 Tri、Turbo 和旧实现，其部署记录对应 `a0ad22005`。
-
-这些数据说明当时的总吞吐统计已修正，不证明当前版本、默认 recurrence、长任务质量或最终生产配置通过；更没有达到或认证 `>=500 tok/s`。旧记录里的 service active/inactive、代理修复和动态库路径都是当时快照，不是今天的服务状态。
-
-## 9. 完整交付还要补什么
-
-### 9.1 三容量契约保留，但不能沿用旧共享脑成本
-
-```text
-B = device-resident people / 独立请求状态容量
-P = device-resident pens / Lane 执行状态容量
-K = unified physical KV cells
-
-resident_people <= B
-sum(person.allocated_pens) == allocated_pens <= P
-physical_KV_used <= K
-```
-
-一个 person 空闲时可使用全部 P；没有每人三笔或每人固定上限。queued child 不占 physical pen，不按人数/笔数静态切 KV。`n_batch/n_ubatch/reader_tile` 是执行形状，不是第四种逻辑容量。
-
-生产目标继续由 `--total-kv auto` 联合选择 B/P/K，不增加生产 pen 配额参数。显式 `-np` 与 RERoT full-auto 冲突应 fail-fast；RERoT OFF 的 `-np` 语义不变。动态 handle/output/graph 容量须由布局派生，不能让固定 `LLAMA_MAX_SEQ` 偷变成独立产品上限。
-
-**旧文的 `B×27层共享S + P×(R0-R2+conv)` 显存估算已不足以描述默认 native child。** 当前需从实际 grouped brain、完整 F32 hand、local S、conv、snapshot 布局 probe 字节；名字叫 hand 不代表仍只是一个小缓存。
-
-```text
-M_total = M_model
-        + M_actual_brain_layout(B)
-        + M_actual_hand_local_conv_layout(P)
-        + M_KV(K)
-        + M_graph_DDVR_Tri_MTP_scratch(B,P,K)
-        + allocator/headroom/state-staging
-```
-
-所有成本由真实 tensor/allocator/probe 获取，并逐 device 检查；不能把多 GPU 显存简单求和，或硬编码某张卡/context 的 token 容量。auto-fit 通过而真实同配置 OOM，仍是容量门失败。
-
-旧三容量规划给出的无在线 benchmark 先验是 pen 候选 `6,5,7,4,3,2,1`，不是算力自适应结论；people 目标为 `min(P,ceil(P/2),B_kv)`，`B_kv≈round(2K/(rho*C))`，`rho` 为 Tri ratio（OFF 为 1），`C` 为实际 context。这些是规划/代码版本级选择策略，须按当前 F32/native-child 成本重新认证，不能把历史“预测 B=3/P=6”写成机器今天的结果。
-
-压力必须分开：人数满则 root 留 admission queue；笔满则 child 排队；KV 满才走 Tri drain/maintenance → refresh → floor exhausted → episode-level demotion/preemption。recurrent-only/brain/hand 压力不调用 Tri。最终公平性还须覆盖 B>P 与后来请求到达；pen yield 只能在 frontier 边界完整保存/恢复局部 state、sampler/MTP 并 refresh，不是杀掉 child。
-
-### 9.2 兼容矩阵：有实现不等于已重新认证
-
-以下均为最终交付要求。当前 Phase 1 为定位故障而关闭某项，不代表最终允许永久缺失。
-
-| 范围 | 必须证明 |
+| 域 | 含义 |
 |---|---|
-| RERoT OFF | mask、RoPE、KV、recurrent、sampler、batch、Tri/MTP、server 生命周期及既有 backend 零回归，不额外保留无用 GPU scratch |
-| FullKV / Turbo / Vulkan DDVR | 四种基础组合 RERoT+FullKV、+Turbo、+Tri、+Tri+Turbo；CPU 独立参考、GQA/IMRoPE/padding/softmax 与精度门 |
-| TriAttention | fill-first、首次 drain、3/32、sticky maintenance、floor/fallback、sparse reader、backend-native compaction；archive refs 不重复抬高 target |
-| Shared physical union | 外层共享 prompt × n_cmpl × 内层 ancestry/archive/exec；删除一个 ref 不提前 free cell，references_removed 与 physical_freed 分开 |
-| MTP / speculative | draft 绑定 person/pen/node、frontier、topology/publish/layout epoch 和 reader view；peer publish/fork/shift 使受影响 draft 失效并正确 rollback |
-| Snapshot / RAM / prompt cache | 完整 episode 保存；restore 到不同 physical rows 后与 uninterrupted reference 对照；cache key 不只取最终可读 transcript |
-| Context shift / cache reuse | 逻辑 run/view/KV/epoch 同步更新，active DDVR 不误走普通线性 shift；与 Tri eviction 分离 |
-| Demotion / preemption / yield | episode victim 不留 orphan；局部 pen yield 精确恢复；recurrent-only pressure 不错误触发 Tri |
-| 多请求 / n_cmpl / B>P | 不同 episode 不串 KV、brain、epochs、RNG、final 或响应；排队公平，不按答案内容调度 |
-| Streaming / cancel / retry | 无重复 delta，恰好一个 terminal；取消清理 queue/draft/refs，保留其他请求仍用的 shared prefix；旧 generation 回调不污染 retry |
-| Tool / JSON / grammar | planner/child grammar 与用户 grammar 分离；final fence 后恢复原 parser、sampler 与工具能力；工具结果回来开启新 episode |
-| LoRA / aLoRA | 同 episode adapter set/scale 与 invocation lineage 一致；原 `can_batch_with()` 约束不能绕过 |
-| Multimodal | 共同 multimodal prelude 后 fork；只重映射 reasoning text，不重排视觉/音频 spatial positions，不切坏 image chunks |
-| Embedding / rerank | 即使全局开 RERoT，也完全绕过 RERoT runtime，保持原路径 |
-| Graph / pipeline / backend sampling | input lifetime、reuse key、各 reader 的 logits/sampler row 正确；不为了并行共享而强行 CPU 全量读回 |
-| CPU / Vulkan / 其他 backend | CPU 保留 reference，Vulkan 为首要 release gate；其他 backend 明确认证范围，不静默退到语义错误的 stock attention |
-| State / metrics | 版本/fingerprint 不匹配明确处理；保留已有 Tri metrics 语义，RERoT 计数与 allocator 一致 |
+| physical key/cell index | 当前 resident K/V 的物理地址，可因 compaction 变化 |
+| `storage_pos` | writer 写 K 时使用的逻辑/RoPE position |
+| `virtual_pos(reader)` | 当前 reader 排列可见文档后的虚拟位置 |
 
-MTP 要先证明 target 语义正确，再看 acceptance rate；近期“active RERoT 暂停 draft mirroring”的隔离修复不是 MTP 全组合通过。至少覆盖 no-peer-update、peer invalidation、fork、rollback、Tri pressure、final fence 六类。
-
-最小真实 RAM 组合：fork → children running → demote/save → 物理 slots 被其他请求占用 → restore 到不同 indices → 继续；核对 brain/F32 hand/conv、RNG、view、fence 与不中断参考。只看 shape、保存成功或 blob roundtrip 不够。
-
-### 9.3 压力、质量、性能和长稳是独立门
-
-最终压力形状至少组合：6 个外层请求槽位、递归 fork、queued child、Tri pressure、Turbo4/Turbo2、MTP、streaming，以及一次 RAM demotion/restore 或 active preemption。另测 8K common prefix 的多请求 physical union。
-
-要求无 5xx/OOM/deadlock/Vulkan validation error、无 orphan seq/recurrent cell、无重复 SSE，每请求一个终止事件；hard abort 与自然 final 明确区分。auto-fit 的 B/P/K 与真实 allocator 对得上。
-
-质量集包括确定性微题（9.11、整数运算、逻辑）、有 compile/unit tests 的代码题、数学集、长上下文检索/总结/多章节任务，以及真实 prompt 样本。MATH-500、AIME24/25 是原规划中的候选集，不是已完成成绩。阈值在运行前冻结，每题保留输入、seed、配置、answer/reasoning、usage 和 artifact hashes。多 Lane 输出不必逐 token 等于 serial，但不能因并行架构出现质量断崖。
-
-正式性能目标是**标准化多 Lane workload 的 aggregate model throughput >=500 tok/s，且质量不退**。不能靠缩短答案、改题、减预算、删机制或统计 forced token 的方式偷换目标。除 tok/s，还看 quality-qualified goodput、completed responses/s、p50/p95、显存、队列等待、frontier/attention/recurrent/MoE 成本及 MTP acceptance。
-
-最后做长稳：连续请求、fork/close、Tri、MTP、RAM、preemption、shift、shared prefix、cancel/retry、stream 都实际发生。warmup 后 CPU RSS、VRAM、buffer、KV refs、recurrent rows 应进入平台；无 leak、stale tensor、偶发 nondeterminism、死锁或服务重启。
-
-### 9.4 Production Definition of Done：30 个硬门
-
-下面 30 项来自原完整兼容契约，保留为正式 release blocker。前面的阶段可以为了定位问题暂时关闭某个机制，但**最终交付不能靠永久关闭已有能力来通过**。
-
-1. RERoT OFF 全机制零回归。
-2. RERoT ON + unified KV 正常。
-3. RERoT ON + hybrid recurrent 正常；当前默认 child 为 native lane-local recurrence，研究 RBB 不能混报。
-4. RERoT ON + TurboQuant K/V 正常。
-5. RERoT ON + Vulkan DDVR/FlashAttention 正常，不能长期依赖语义不同的 fallback。
-6. RERoT ON + TriAttention 3/32 正常。
-7. backend-native compaction 后 RERoT cell metadata、refs、reader view 正常。
-8. RERoT ON + MTP 正常；view/epoch invalidation、rollback 正确。
-9. prompt cache / RAM save/restore 保存完整 episode 语义。
-10. checkpoint / partial rollback 保存并恢复正确局部状态。
-11. context shift 更新逻辑历史、view、KV、epochs，并与 Tri eviction 分离。
-12. idle demotion / active preemption 不留 orphan episode/Lane/state。
-13. recurrent-only / brain / hand pressure 不错误调用 Tri。
-14. outer `n_cmpl` / shared-prefix 与 inner RERoT 正确嵌套。
-15. streaming 无重复 reasoning/content delta，且每请求恰好一个 terminal event。
-16. cancellation / retry 清理旧 generation，不让旧 callback 污染新请求。
-17. LoRA / aLoRA adapter 与 invocation lineage 不串。
-18. multimodal prompt 可以在共同 prelude 后 fork，multimodal position 不被 DDVR 错改。
-19. tool calling / JSON schema / user grammar 在 final fence 后恢复 stock 能力。
-20. embedding / rerank 等非生成请求在全局开启 RERoT 时仍完全绕过。
-21. graph reuse / pipeline parallel 不出现 stale input / buffer lifetime bug。
-22. auto-fit 计入 RERoT、DDVR、Tri、MTP、recurrent、backend scratch 和 headroom。
-23. production-scale full-slot 压力通过。
-24. shared physical cell union 压力通过，一个 ref 删除不能提前 free 其他 owner 仍需的 cell。
-25. RAM/checkpoint/context-shift/MTP/Tri 组合矩阵通过。
-26. 长稳无 CPU/GPU leak、deadlock、stale tensor、state corruption 或偶发 nondeterminism。
-27. Vulkan 当前生产配置性能没有不可接受断崖，并达到第 10.10 节固定的性能门。
-28. 所有新增 state format 有 version/fingerprint，错误版本明确拒绝或按明确兼容规则处理。
-29. 现有 Tri metrics 语义不变，新增 RERoT metrics 与真实 allocator/token accounting 对得上。
-30. 最终验收、shadow、canary、production 使用同一源码/二进制/运行库/模型/校准 artifact；hash 和 `/proc/PID/maps` 一致。
-
-只完成树、DDVR、scheduler、fence 和若干数学回归，可以称 **RERoT research/core correctness candidate**；只有以上 30 项全过，才可称 **production-compatible RERoT**。
-
-## 10. 只保留这一套推进顺序
-
-以下编号沿用原 `AGENTS.md` 的**收口路线**，以后项目进度只用这一套。旧指南中的 Stage 0–10 是早期“从零实现组件”的施工顺序；附录 A/B 的 Phase 是兼容/容量子计划；脚本 `phase8` 只是文件名。它们都不能再拿来表示整个项目已经走到哪个阶段。
-
-总主线是：
+若 K 在 storage position `s` 写入：
 
 ```text
-Phase 0  锁死局部正确性基线
-    ↓
-Phase 1  真实长任务完整闭环                     ← 当前在这里
-    ↓
-Phase 2  长轨迹数值确定性
-    ↓
-Phase 3  Tri / Turbo / unified KV 重新认证
-    ↓
-Phase 4  MTP / speculative 组合
-    ↓
-Phase 5  RAM / checkpoint / rollback / cache / shift
-    ↓
-Phase 6  Server 外层语义矩阵
-    ↓
-Phase 7  生产级资源压力 + B/P/K auto-fit
-    ↓
-Phase 8  质量总验收
-    ↓
-Phase 9  性能优化与正式性能门
-    ↓
-Phase 10 长稳 soak
-    ↓
-Phase 11 RC artifact sealing
-    ↓
-Phase 12 shadow → canary → production
+Kstored = R(s) Kraw
 ```
 
-后一个阶段可以提前写代码或做诊断，但**不能把后面某个局部结果当成前一阶段已经通过**。例如 MTP 代码可以已经存在，Phase 4 仍然可以是“未认证”；质量脚本可以叫 phase8，项目仍然处于 Phase 1。
+而某 reader 希望这枚 K 出现在 virtual position `v`，query 虚拟位置为 `q`，则可在 Q 侧使用：
 
-### 10.1 Phase 0：把局部正确性封成 Golden Baseline
+```text
+Qeffective = R(q + s - v) Qraw
+```
 
-**目的**：以后所有功能改动、merge 和性能优化都有一组不能随便破坏的红线。Phase 0 不是开发新能力，而是把已修过的确定错误变成稳定 regression。
+于是：
 
-必须固定的门至少有：
+```text
+Qeffective^T Kstored
+```
 
-| 门 | 目标 |
+表达与 reader 虚拟相对位置一致的 RoPE 关系，而不搬 K。
+
+**所有可见 spans 必须进入同一个 query/head 的全局 softmax。** 不允许每 span 单独 softmax 后再相加。
+
+Qwen3.5 文本 IMRoPE 仍按：
+
+```text
+(p, p, p, 0)
+```
+
+处理文本轴。不要因为 DAG 再引入动态 RoPE base、特殊“相对论”频率或视觉位置重排。
+
+### 2.5 STRONG = barrier-after，不是同一次 forward 互穿
+
+逻辑定义：
+
+```text
+frontier f read:
+    自己的 causal history/current key
+    + peer 在 f 之前已提交的 PUBLIC
+
+frontier f compute:
+    各 active stage 执行本轮工作
+
+frontier f commit:
+    PUBLIC 增量原子发布
+
+frontier f+1 read:
+    才可以读到 peer 在 f 的新 PUBLIC
+```
+
+GPU 物理上可能先把本 batch K/V 写进 cache，再执行 attention；这不能越过逻辑 publish/frontier gate。
+
+LAG1 若保留，只是研究对照。正式 STRONG 仍是“上一提交边界立即可见”，不是“同拍 future leakage”。
+
+---
+
+## 3. 三个正交的数据属性
+
+旧版只用 PUBLIC/PRIVATE/PENDING 已经不足以表达新 framing。至少要区分：
+
+### 3.1 Visibility：模型谁能读
+
+```text
+normal
+PUBLIC
+PRIVATE
+PENDING
+```
+
+### 3.2 Segment kind：这段是什么
+
+当前 core 已增加/使用的语义类别包括：
+
+```text
+FRAME
+BODY
+SOURCE_END
+PROBE_CONTROL
+```
+
+### 3.3 Presentation：客户端看到什么
+
+例如：
+
+| 段 | 模型 peer 可见 | API reasoning/content | 能否触发完成 |
+|---|---|---|---|
+| FRAME | 需要，完整发布后可读 | 不应逐字泄漏 | 否 |
+| BODY | PUBLIC 时可读 | 按 reasoning 策略可见 | 否 |
+| SOURCE_END | 源 state/tape 中保留 | foreign canonical body 不重复导出 | 当前源阶段提交后可以 |
+| PROBE_CONTROL | 只属于隔离 probe | 不可见 | 否 |
+
+**模型可见与用户可见不是一个布尔值。** 不能把 FRAME 永久设成 owner-only PRIVATE 来阻止 API 泄漏，否则固定入口拼接失效；也不能因为 peer 要读取 FRAME 就把内部 subagent tool call 发给客户端执行。
+
+---
+
+## 4. 自适应路由：C0、probe、simple、dag
+
+### 4.1 C0 的定义
+
+**决定：** C0 是普通公共 prompt prefill 完成后、任何 RERoT 专用规划字节进入正式执行状态之前的干净状态。
+
+C0 必须覆盖/保持同一个计算时点的：
+
+| 域 | 要求 |
 |---|---|
-| Vulkan MoE threshold | 覆盖 `18 → 19 → 20 → 18 → 19`，不同前序 shape 不能污染后续 routing/pipeline state |
-| native-vs-native | 同一输入、同一配置、多次运行 sampled decision mismatch = 0 |
-| fixed teacher tape | 128/512/更长；Turbo/F16；rollback 0/>0；同一 tape 可重复定位 first divergence |
-| mixed child recurrence | 加 PRIVATE/PENDING、另一 episode、换 row order、换 ubatch packing 不能偷换递推方程 |
-| DDVR / attention | independent double/materialized reference；global softmax；IMRoPE；NaN/空输出 fail-closed |
-| random-ID close | 只认 exact owner delimiter；跨 tokenizer token；错误 ID 不结束；restore 后 ID 不变 |
-| final fence | checkpoint、原 token replay、幂等 prepare、exactly-once 计数/stream |
-| response surface | OpenAI/Responses/Anthropic reasoning/content/finish 不混，forced PRIVATE bytes 不外泄 |
-| state format | SEE3/F32 hand 和 episode state version 失败方式明确，坏输入不半写 |
+| attention | prefix token/position、KV refs、必要 resident state |
+| recurrent | 有效 local state、brain/hand 配对、conv、snapshot selector |
+| sampler | 完整 RNG、penalty/history/adaptive sampler 状态，不只是 seed |
+| parser/grammar | 原用户 grammar、reasoning/stop parser 阶段 |
+| decode | 当前有效 logits 对应的 state/frontier |
+| speculative | draft/checkpoint 不能携带 probe 污染 |
+| transport | probe 尚未发给客户端，输出 cursor 不前移 |
+| identity | 模型、template、adapter、RoPE、request/completion lineage |
 
-**当前状态**：历史上这些项目有相当强的局部证据，`7509335d1` 曾因此被称为 Core Correctness Candidate；但当前 HEAD 已经过多轮 merge 和 backend 改动，所以 release 时仍要在当前 artifact 上重跑。旧“9/9 PASS”只说明当时那个测试集合。
+Pure Transformer 可以没有 recurrent blob；不能以“GDN blob 非空”判断 C0 有效。
 
-**通过标准**：这些门都成为可重复自动化；任何后续 patch 让其变红，先判 patch/regression 错，不先调 tolerance、换 prompt、减预算或改 seed。
+KV allocator 的“head/cursor”也不是通用 checkpoint。Unified KV 有共享 refs、空洞、compaction、回收和多请求；不能全局倒退一个游标删除本请求 probe。
 
-### 10.2 Phase 1：真实长任务闭环
-
-**目的**：证明 RERoT 不只是局部算子和短 smoke 正确，而是能让一个真实、多 child、长生命周期请求完整自然结束。当前唯一主线就是第 7 节“大洲国家”任务。
-
-基线先隔离干扰项：
+### 4.2 推荐流程
 
 ```text
-RERoT ON
-STRONG barrier-after
-default child native recurrence
-Turbo4/Turbo2
-Tri OFF
-MTP OFF
-RAM demotion/checkpoint OFF
-context shift OFF / 隔离
-temperature 0
-fixed seed
+普通 prompt
+   ↓
+  C0
+   └──→ 隔离 probe branch
+            ↓
+        schema-constrained JSON
+            ├─ simple
+            │    → 丢弃 probe branch
+            │    → 原 C0 sampler/state 继续
+            │
+            └─ dag
+                 → 校验整张计划
+                 → 丢弃 probe branch
+                 → 从 C0 构建正式规划边界 P
+                 → capture C_base
+                 → 启动 DAG
 ```
 
-容量必须能容纳任务；context、KV capacity、episode token/work budget 分别记录，不能把一个耗尽冒充另一个。历史 8192 容量失败只能说明当时资源/预算不足，不自动证明算法错；同样也不能把盲目加到 131K/262K 当成修复。
+“隔离”不是因为 PRIVATE 可以消除因果影响，而是反过来：**PRIVATE 不能从已经运行过的 recurrent/sampler 里扣掉。** 要得到干净 simple continuation，必须保留真正的 C0 边界。
 
-完整生命周期必须观测到：
+### 4.3 路由 schema
 
-```text
-root planner
-→ 完整规划记录原子公开
-→ 所有 child descriptor 建立
-→ 能跑的 admission，其余 FIFO
-→ 每个 child 自然生成自己的 exact random-ID close
-→ 所有 child retired，无 queue/starting/suspended/orphan
-→ exactly one final survivor
-→ stable reader view
-→ final fence prepare
-→ original close-token replay exactly once
-→ serial tail
-→ final answer
-→ HTTP 200
-→ finish_reason=stop
+正式 schema 不是旧的手写 GBNF，而是 JSON Schema 交给现有 schema→grammar 转换器：
+
+```json
+{
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["strategy", "payload"],
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {"const": "simple"},
+        "payload": {"const": {}}
+      }
+    },
+    {
+      "type": "object",
+      "required": ["strategy", "payload"],
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {"const": "dag"},
+        "payload": {"$ref": "#/$defs/DagPayload"}
+      }
+    }
+  ],
+  "$defs": {
+    "DagPayload": {
+      "type": "object",
+      "required": ["questions", "depends_on"],
+      "additionalProperties": false,
+      "properties": {
+        "questions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "intent"],
+            "additionalProperties": false,
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "intent": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        "depends_on": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "depends_on_id"],
+            "additionalProperties": false,
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "depends_on_id": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    }
+  }
+}
 ```
 
-质量同时要求：任务拆分合理；各章节归属正确；无 child 接管 sibling；无循环标题、prompt echo、随机 ID / forced PRIVATE /内部控制协议泄漏；最终答案完整。`usage`、sampled/forced token、PUBLIC/PRIVATE/PENDING counters 和 replay 不重复计数。
+正确 simple：
 
-失败分六类，不通过改 delimiter 或 stop 规则遮住：
-
-```text
-A. context / KV / episode budget / backend resource
-B. child 不自然 close
-C. child semantic drift / sibling takeover
-D. final fence / stable view / replay
-E. serial tail / reasoning-to-answer transition
-F. API / streaming / response assembly
+```json
+{"strategy":"simple","payload":{}}
 ```
 
-**当前状态**：未通过。只有这一门通过后，才能第一次说“核心真实语义闭环通过”。
+正确 DAG 例子：
 
-### 10.3 Phase 2：长轨迹数值确定性
-
-**目的**：把“128 步或某个短例子没问题”升级成真正能支撑生产排障的长轨迹保证。它解决的问题是：以后自然语言答案坏了，能先排除“backend/batch/rollback 偷偷改数学”。
-
-冻结一份或一组 **native teacher tape**，至少覆盖：
-
-```text
-短 prompt
-MoE 18/19/20 threshold prompt
-9.11 数值题
-中文长 prompt
-代码 prompt
-长到能覆盖历史 step509 一类晚分叉的输入
+```json
+{
+  "strategy": "dag",
+  "payload": {
+    "questions": [
+      {"id":"A","intent":"计算第一项所需事实"},
+      {"id":"B","intent":"独立检查第二项"},
+      {"id":"C","intent":"使用 A 的结果继续推导"}
+    ],
+    "depends_on": [
+      {"id":"C","depends_on_id":"A"}
+    ]
+  }
+}
 ```
 
-每份 tape 对下列组合运行：
+A、B 可同时开始；A SEALED 后 C 可启动，不等 B 完成；B 与 C 可以继续实时共享 PUBLIC。
+
+### 4.4 控制面语义校验
+
+grammar 只负责结构子集。正式计划提交前还必须：
+
+1. JSON 可解析；拒绝重复 object member 等歧义输入。
+2. `questions` 非空；ID、intent 非空且非纯空白。
+3. ID 唯一；`0` 保留给内部主体阶段。
+4. questions 数组顺序固定为 `plan_rank`。
+5. `depends_on` 转成 `u → v`。
+6. 拒绝未知端点、自环、重复边。
+7. Kahn 必须消费全部工作节点，否则整张计划拒绝。
+8. runtime 自动建立 `0.plan` 的公共起点语义和“全部工作 → 0.synthesize”的最终条件。
+9. 完整 descriptors/resources 可建立后再原子发布计划；失败不能留下半张图。
+
+无效计划不能通过删边、裁问题、偷偷改 simple 或加 judge 来修复。
+
+### 4.5 simple 的恢复义务
+
+simple 恢复后必须证明：
 
 ```text
-Turbo4/Turbo2
-F16/F16 numerical control
-rollback slots = 0
-rollback slots > 0
-不同 ubatch composition
-不同 physical row ordering
-不同前序 shape / graph reuse history
-必要时不同 reader count / person grouping
+相同普通 prompt
+相同原 sampler 完整状态
+相同普通模板/grammar
+相同模型/backend配置
 ```
 
-指标分三层，不能混成一个 tolerance：
+其后续普通 sampled path 不受 probe RNG、penalty history、KV/recurrent 或 parser 污染。
 
-1. **native vs native determinism**：sampled/argmax mismatch 必须为 0。这是确定性，不接受“误差很小”。
-2. **RERoT single-lane vs native**：在语义应等价的单 Lane 路径，sampled-decision/argmax mismatch 必须为 0。
-3. **连续数值误差**：再报告 logits relative L2、逐层 activation error、KV/code 差异、router membership 等。误差允许非零，但不能无限漂移，也不能跨过 sampled-decision boundary。
+不要求“时间倒流”：probe 的 wall time 和真实计算已经发生，不能把它从性能账里擦掉，也不能宣称“零 TTFT”。
 
-如果在 step `t` 第一次 top token 分叉：
+### 4.6 当前实现状态
+
+当前 HEAD 已有：
+
+- `server_rerot_routing_schema_json()`；
+- `server_rerot_routing_grammar()`；
+- `server_rerot_parse_routing_decision()`，含 duplicate IDs/edges、自环、unknown endpoint、Kahn cycle check；
+- `capture_c0()` / `rerot_start_root()` / `rerot_try_finish_probe()`；
+- `rerot_enter_simple()`；
+- `rerot_enter_dag()`。
+
+工作树使用独立 `probe_seq`，而不是继续向 C0 的 slot sequence 追加 planner。probe 丢弃后恢复 C0 lineage；simple 绑定保留的完整 sampler clone，并保留用户原 reasoning budget。
+
+DAG 模板新增 tools 可能改变普通前缀。`rerot_render_dag_prefix()` 比较真实 token LCP；`rerot_rebuild_dag_prefix_memory()` 在 DAG 启动时重建必要前缀，深度 recurrent rollback 不可用时从空状态重新计算正式 P。该工作只发生在启动边界，不是逐 frontier 重算 FRAME。不能仅因合法工具模板改变前缀就拒绝整个 DAG。
+
+这些是实现状态，**不替代 fixed ordinary continuation A/B、recurrent 状态与实际模板的验收**。
+
+---
+
+## 5. DAG：硬依赖、实时信息流、reader 排版是三件事
+
+### 5.1 硬启动依赖
+
+`u → v` 只表达：
 
 ```text
-固定 teacher tape 到 t
-→ 复现无插桩分叉
-→ 打开逐层 trace
-→ 找第一处可测差异
-→ 对 attention / recurrent / MoE / quantization 分层二分
-→ 必要时做只读 counterfactual
+u 没有自然 SEALED
+⇒ v 不能 STARTING
 ```
 
-counterfactual 只能定位因果点，不能把 native expert ID、native logits 等硬塞回生产路径当“修复”。
-
-**已有历史**：128 tape、512 tape、step509、F16/Turbo、rollback 0/2 都已有重要证据和反例，见第 8 节。**当前任务是重新认证，不是从头发明测试。**
-
-**通过标准**：长 tape 上 deterministic/single-lane decision 门稳定，误差曲线和 first-divergence 调试路径可重复；当前 artifact 的结果和源码/库 hashes 锁定。
-
-### 10.4 Phase 3：TriAttention + Turbo + unified KV 重新认证
-
-**目的**：证明 RERoT 核心在真实生产 KV 栈上仍正确。这里叫“重新认证”而不是“实现”，因为大部分代码历史上已经存在，但近期 DDVR、MoE、F32 hand、FlashPrefill、XKV-SR、response 等都发生过变化。
-
-先跑四个基础组合：
+形式化：
 
 ```text
-RERoT + FullKV
-RERoT + Turbo
-RERoT + Tri
-RERoT + Tri + Turbo
+eligible(v) = not_started(v)
+              && forall u in pred(v): sealed(u)
 ```
 
-每个组合至少核：
+它不表示 v 只能看到 u，也不表示没有边的节点互相不可读。
 
-- reader visible cell 集与顺序正确；
-- DDVR virtual position dense、unique；
-- Turbo4/Turbo2 不静默退 F16；
-- IMRoPE/GQA/padding/global softmax 正确；
-- public/private/pending visibility 不因 compaction/packing 漂移；
-- archive/exec/shared-prefix refs 的 physical union 正确。
+### 5.2 实时信息流
 
-Tri 不是“能 reclaim 就过”，必须完整保持原契约：
+已经启动并发布的 PUBLIC 内容继续留在 same-episode 共享文档中，包括：
+
+- 当前 reader 的硬祖先；
+- 同时运行的无硬依赖 peer；
+- 已经完成但不是当前 reader 硬祖先的节点；
+- peer 所依赖、已经完成的前驱。
+
+反例：A、B 原本并行，A 先完成。A 不是 B 的 hard pred。若 reader 只枚举 RUNNING peers，A 会突然从 B 的上下文消失，这是错误的。
+
+因此：
+
+> **DAG 只控制启动屏障；PUBLIC history 的生命周期不能由 RUNNING/RETIRED 状态直接决定。**
+
+### 5.3 `0.plan` 与 `0.synthesize`
+
+不要建：
 
 ```text
-fill-first
-→ first pressure drain
-→ 3/32 target
-→ sticky maintenance
-→ floor exhausted
-→ atomic demotion/preemption
+0 → A → 0
 ```
 
-Tri reclaim 后，DDVR view 从当前 resident cells 重新构造；逻辑文档和物理 residency 分开。archive ref 只是 keeper，不得让 scorer 误以为相同 semantic token 有多份价值。
+那在图论上是环。
 
-压力 fallback 必须严格区分：
+应建成两个内部阶段：
 
 ```text
-KV pressure:
-  Tri drain/maintenance
-  → refresh physical usage
-  → floor exhausted
-  → episode-level demotion / preemption
+0.plan
+   ├─ A → C ─┐
+   └─ B → D ─┤
+             └─ E
 
-recurrent / brain / hand pressure:
-  禁止调用 Tri
-  → recurrent/pen/person 对应处理
+全部工作阶段 SEALED
+        ↓
+0.synthesize
 ```
 
-shared-prefix 另做至少一组：共同 8K prefix → 多 completion / episode → inner RERoT fork，逐 ref 删除并核 `references_removed` 与 `physical_freed`。
+对模型叙事它们都可以叫 Lane 0；对 stage state、sampler、run ownership、source end、MTP checkpoint、恢复和完成判断，必须是不同 internal stage。
 
-**通过标准**：四个基础组合、Tri sparse/compaction、physical union、fallback 顺序都自动化；FullKV 和 Tri 的差异只来自允许的 lossy residency，不来自 metadata/visibility bug。
+### 5.4 循环优先 Kahn reader view
 
-### 10.5 Phase 4：MTP / speculative decoding
+取 questions 数组位置为 `plan_rank`。
 
-**目的**：让 speculative decoding 在共享内存会变化的 RERoT 中有明确一致性语义，而不是简单永久关闭。
-
-每个 draft/checkpoint 至少绑定：
+对 worker reader `r`，tie-break 优先序为：
 
 ```text
-person / episode
-pen / node
-frontier
-topology_epoch
-publish_epoch
-layout_epoch
+plan_rank 在 r 之后的节点
+→ plan_rank 在 r 之前的节点
+→ r 自己最后
+```
+
+但这个循环优先只能在所有 DAG 依赖合法的零入度候选之间使用；**依赖优先于循环偏好。**
+
+无依赖 1/2/3：
+
+```text
+reader 1: P, B2, B3, B1
+reader 2: P, B3, B1, B2
+reader 3: P, B1, B2, B3
+
+final 0:
+P, B1, B2, B3, B0.synthesize
+```
+
+有依赖 `1 → 3`，2 独立；1 已完成，2/3 活跃：
+
+```text
+reader 2: P, B1, B3, B2
+reader 3: P, B1, B2, B3
+```
+
+reader 2 不能排成 `B3, B1, B2`，因为会违反 `1 → 3`。
+
+菱形：
+
+```text
+1 → 2
+1 → 3
+2 → 4
+3 → 4
+```
+
+公共文档中 1 只出现一次，不能沿两条父路径重复展开成 `1,2,1,3,4`。
+
+### 5.5 为什么 active reader 可以最后
+
+如果 reader r 仍在 RUNNING，它的 hard successor 不应已经启动；否则调度器已经违反依赖屏障。因此在“已启动节点子图”中，r 是汇点之一。
+
+Kahn zero-indegree 选择时把 r 设为最低 tie-break，不会阻塞别的节点，最后可以合法放到末尾。
+
+### 5.6 运行状态不直接重排文档
+
+在可见 runs 不变时：
+
+```text
+RUNNING → SEALED → RETIRED
+pen migration
+ready_queue 内部排序
+physical microbatch order
+```
+
+都不应该凭自身改变公共片段存在与 `plan_rank`。
+
+真正会改变结构的事件包括：
+
+- 新节点固定入口完整发布；
+- 新 BODY run 首次进入公共文档；
+- context shift 删除逻辑单元；
+- 明确的 topology/plan 变化。
+
+普通 BODY append 只延长对应 run，使其后 spans 的 virtual coordinate 后移。
+
+### 5.7 当前实现
+
+当前 core 已有：
+
+- `llama_rerot_document::set_dag_mode()`；
+- node `plan_rank / predecessors / successors / stage_role`；
+- `add_edge()`；
+- `topo_sort_cycle_preferred()`；
+- `build_dag_view()`；
+- source-end / probe-control 的 reader filtering；
+- runtime `initialize_dag()`、`get_eligible_dag_nodes()`、`seal_dag_node()`、`build_dag_view_for_reader()`。
+
+这是新方案最扎实的一块之一，但仍需 Stage 1 的纯属性测试和 Stage 6 的真实 DDVR/backend 门继续认证。
+
+---
+
+## 6. 固定入口 framing：`B_i = F_i + R_i`
+
+### 6.1 目标结构
+
+每个工作片段统一为：
+
+```text
+B_i = F_i + R_i
+
+F_i = CLOSE_PREVIOUS
+    + HANDOFF_TO_i
+    + OPEN_CURRENT
+
+R_i = 节点 i 持续追加的源 reasoning BODY
+```
+
+公共前缀 P 的导出形式约定为“左边界上存在一个打开的 0.plan reasoning 区域”。第一个 F_i 的 `CLOSE_PREVIOUS` 负责关闭它。
+
+固定入口的核心性质：
+
+```text
+一段 F_i 接收“前面有一个打开 reasoning”
+→ 关闭它
+→ 完成一次目标 i 的 handoff
+→ 再打开 i 的 reasoning
+```
+
+连续拼接任意合法 node order 后，始终只有最后一段保持 reasoning open，而最后一段正是当前 reader。
+
+### 6.2 两 lane / 三 lane
+
+```text
+reader 1:
+P + F2 + R2 + F1 + R1
+
+reader 2:
+P + F1 + R1 + F2 + R2
+```
+
+三 lane：
+
+```text
+reader 1: P + B2 + B3 + B1
+reader 2: P + B3 + B1 + B2
+reader 3: P + B1 + B2 + B3
+```
+
+若 R2 多长一个 token，只需让后面的 F1/R1 virtual positions 后移；**F1 本身不能重新 forward。**
+
+### 6.3 正式 handoff 应优先使用真实模型模板
+
+概念上的简化：
+
+```text
+</think>
+...handoff to lane i...
+<think>
+```
+
+只是解释结构。
+
+生产目标是：
+
+```text
+结束前一个 assistant reasoning
+→ 在该 assistant 回合中形成内部 subagent/tool handoff
+→ 对应 internal tool result 说明 Lane/Intent
+→ 新 assistant generation prefix
+→ 打开当前 reasoning
+```
+
+role/special tokens、tool call id、thinking start/end 都必须来自**实际部署模型的真实 chat template**。不能把伪 `[Tool Call]` 文本或硬编码特殊符号当成跨模型协议。
+
+internal handoff 不是用户工具调用；不能出现在外部 `tool_calls` 里要求客户端执行。
+
+### 6.4 F_i 只依赖目标，不依赖偶然前驱
+
+F_i 可以包含：
+
+- 稳定 stage/node identity；
+- `intent`；
+- internal call/result correlation；
+- 固定 scope 说明；
+- 模板需要的回合边界。
+
+不要包含：
+
+- “我前面一定是 node 2”；
+- physical slot/row；
+- 当前 frontier；
+- token 剩余数；
+- 当前 peer 列表；
+- 动态预测下一次谁完成。
+
+同一个 F_i 要能在不同 reader 拓扑序里接到不同前一片段后面。
+
+### 6.5 FRAME 发布事务
+
+节点 admission：
+
+```text
+1. hard preds 已全部 SEALED
+2. 从 C_base 建立 stage-local state
+3. 绑定 pen/exec（或进入逻辑 STARTING 等待本 frontier 的物理执行）
+4. 用真实模板 tokenize F_i 一次
+5. F_i 在构建期间整体 PENDING
+6. 正常 forward F_i
+7. 全部成功后原子发布 FRAME
+8. stage → RUNNING
+9. 安装 source-native reasoning-end 处理
+10. 以后只追加 BODY R_i
+```
+
+入口是实际模型输入，不能只在 CPU 文本层换 view。
+
+### 6.6 source end provenance
+
+至少区分：
+
+| 来源 | 能否完成当前 WORKER |
+|---|---|
+| runtime 固定 FRAME 中的 reasoning-end | 否 |
+| foreign export 中其它节点的边界 | 否 |
+| 当前 WORKER 源流自己生成的 native reasoning-end | decode+commit 后可以 |
+| 当前 0.synthesize 源流的 native reasoning-end | 转入普通 final content/tool |
+| EOG/资源耗尽/取消/强制 abort | 否，属于失败/终止 |
+
+完成判断要绑定：
+
+```text
+(episode, internal_stage_id, event_origin)
+```
+
+不能扫描拼接后的 reader 文本搜 `</think>`，也不能只看 Lane label==0。
+
+### 6.7 防止双重关闭
+
+真实 source state/tape 可以保留：
+
+```text
+F1 + R1 + SOURCE_END
+```
+
+但 foreign canonical export 使用：
+
+```text
+F1 + R1
+```
+
+下一片段 F2 自己的 CLOSE_PREVIOUS 负责词法闭合。
+
+否则会出现：
+
+```text
+R1 </think> </think><think> R2
+```
+
+SOURCE_END 的真实 KV/recurrent transition 不能为了“导出不显示”而从源计算状态删除。
+
+### 6.8 token 边界
+
+native reasoning-end 可能是一个 token，也可能跨多个 token。必须以模板/tokenizer 可识别的源协议事件处理：
+
+- 跨 token 候选先 PENDING；
+- 完整确认后再 seal；
+- 正文里字面引用 `</think>` 不等于协议事件；
+- 如果一个 tokenizer token 同时含正文尾部和关闭字节，不能假装一枚 KV row 可以免费切成两枚独立 token。
+
+某模板若无法无损识别/导出该边界，应明确报 DAG protocol unsupported；不能靠全局字符串替换继续运行。
+
+### 6.9 当前实现与目标差距
+
+生产 admission 使用真实 chat messages、内部 `spawn_lane` tool call/result 和模板 reasoning 边界构造 FRAME，不再使用简化的 think/lane/intent sandwich 作为回退。模板无法无损表达接缝时仍明确失败。
+
+- FRAME 完整发布后对模型可见，presentation 不把内部工具回合外发。
+- `event_origin` 与 `seal_dag_node()` 区分 runtime 输入、foreign 导出与当前源结束。
+- foreign reader 排除 SOURCE_END，但保留源计算历史。
+- 冻结 read epoch 同时约束 foreign BODY 和 FRAME；owner 当前输入仍可见。
+- worker/internal reasoning 不安装用户最终 JSON grammar；最终输出恢复原用户 grammar。自然结束解析与 grammar helper 是否存在是两回事。
+
+目标 GGUF 的只读元数据确认 `<think>` / `</think>` 为独立 token（248068 / 248069，token type 4）；这支持边界能力检查，但仍不是完整模型生命周期或回答质量验收。
+
+---
+
+## 7. C_base 与 stage-local state
+
+### 7.1 两个 checkpoint
+
+```text
+C0:
+普通 prompt prefill 之后的干净普通状态
+
+C_base:
+dag 已验证
+probe 已丢弃
+正式公共规划/左边界 P 已真实 forward
+之后的统一、不可变 stage seed
+```
+
+默认：
+
+```text
+worker v:
+clone/reference C_base
+→ install final reader view
+→ forward F_v
+→ generate R_v
+
+0.synthesize:
+clone/reference C_base
+→ install final stable view
+→ forward F_0s
+→ generate synthesis reasoning
+```
+
+### 7.2 为什么不继承任意前驱终态
+
+若 C 依赖 A、B，不能因为 A 恰好释放了一个 physical pen，就让 C 继承 A 的 recurrent final state。
+
+否则：
+
+```text
+physical scheduling choice
+→ 偷偷变成 cognitive state choice
+```
+
+这是不允许的。
+
+A/B 的结果通过稳定 PUBLIC KV + DDVR 进入 C 的 Full Attention，然后自然影响 C 后续 native recurrent。
+
+### 7.3 不平均前驱 state
+
+不要自动做：
+
+```text
+S_C = (S_A + S_B) / 2
+```
+
+它不是“C 已经读过 A/B”的原生 state，也无法自然去除共同历史、不同 conv tail 与独立轨迹。
+
+如果未来研究 state merge，它必须是另一条明确算法、单独数学与质量门，不作为坏输出时 fallback。
+
+### 7.4 不做所谓“无 MoE 原生回放”
+
+GDN 每层 q/k/v/g/beta 都由整个网络上下文投影得到。只拿前驱 token、跳过模型层直接更新 recurrence，不是原生模型。
+
+保存并重放 writer transitions 又是另一种 transition-sharing 算法。本方案不需要它。
+
+### 7.5 当前实现与待验收边界
+
+`capture_c_base()` 已在正式 `plan_prefix` 注入完成后捕获当前 recurrent seed，并更新 root 的 hand/conv lineage；不再仅以 `c_base=c0` 表示正式规划后的状态。
+
+C0/simple 使用保留的 sampler clone。checkpoint 中的 seed/prev 元数据不能单独证明完整 RNG、adaptive sampler 或 grammar 恢复；进程内 transport 的 sampler clone 与序列化 episode 是不同资产。Stage 3/7 必须分别验证这些状态在真实 decode、parking 和 RAM 恢复中的生命周期。
+
+---
+
+## 8. W>P：逻辑并发与物理 pens 分开
+
+### 8.1 四个容量量
+
+| 符号 | 含义 |
+|---|---|
+| B | resident 独立 request/person 数 |
+| P | 可同时绑定执行的 physical pens |
+| W | 某 episode 当前已经逻辑启动、尚未完成的工作阶段数 |
+| K | unified physical KV capacity |
+
+```text
+physical bound stages <= P
+logical active stages = W，可以 > P
+```
+
+blocked 节点还不算 W；它们只持 descriptor/依赖和共同 C_base 引用，不提前拥有完整 per-stage state/FRAME。
+
+### 8.2 “eligible 同时启动”的精确含义
+
+同一已提交边界上，新满足依赖的所有节点一起进入逻辑 STARTING cohort。
+
+它们不必同一纳秒占用 GPU，但不能因为只有 P 个 slot，就让前 P 个 task 一直跑到自然结束，然后才创建剩余 task。那会改变 peer 可见轨迹和用户要求的逻辑计算。
+
+### 8.3 一个逻辑 frontier
+
+```text
+1. 从上一 commit 的 SEALED 状态计算新 eligible
+2. 固定本 frontier active cohort
+3. 固定所有 reader 的 read publish/version
+4. 固定每 stage 本轮应该推进的工作量
+5. 用最多 P 个 pens 分 microbatch 计算
+6. later microbatch 仍然只读本 frontier 冻结的 old world
+7. 所有成员成功后统一 publish PUBLIC/FRAME
+8. 提交合法 SOURCE_END
+9. seal 一次，精确减少 successor remaining_preds
+10. frontier++，再计算新 eligible
+```
+
+physical microbatch order 只决定什么时候算，不得决定读到哪个版本。
+
+### 8.4 为什么“排队到别的任务结束”不等价
+
+假设 A/B/C 同 frontier old state 分别为 1/2/3，简化更新：
+
+```text
+new(i) = old(i) + 0.1 * sum(old(peer))
+```
+
+正确逻辑中三者都读冻结 old，怎么分批都得到同一结果。
+
+若先算 A 并立即 publish，再算 B/C，后者读到了 A_new，数学已经变了。
+
+真实 Transformer/GDN 更复杂，但这个反例已经足够证明：
+
+> **“有一个 queue”不等于支持 W>P。**
+
+### 8.5 W 份局部 state 要真实存在
+
+native lane-local recurrence 下，每个已经推进过的 active stage 都有自己的 recurrent/conv/sampler 状态。
+
+P 只是 executor 数，不会让 W-P 份 state 消失。
+
+可用承载手段：
+
+- device-resident logical state，多路绑定少量 pens；
+- parked/COW lineage；
+- 完整 RAM demotion/restore；
+- 其它经定义的 state virtualization。
+
+不能让 suspended stage 恢复时重新拿 C_base，假装之前没有思考过。
+
+### 8.6 seal 是恰好一次事务
+
+建议语义：
+
+```text
+RUNNING
+→ source end candidate
+→ EXIT_PENDING
+→ 本 frontier decode/commit success
+→ SEALED
+```
+
+seal 事务：
+
+1. 校验 current internal stage 和 event origin；
+2. 确认模型计算成功提交；
+3. 保留公共 FRAME/BODY keeper refs；
+4. state → SEALED；
+5. 每个 successor `remaining_preds--` 恰好一次；
+6. 再释放可释放 physical binding。
+
+重复 callback / restore notification 命中已经 SEALED 时，不得再扣一次。
+
+失败、EOG 异常、取消、资源 abort 不得走 SEALED 路径。
+
+### 8.7 不先上 CPM
+
+不把 DAG 深度直接当作任务时长，不用 CPM/置信度/标题内容决定谁先长期运行。
+
+第一目标是：
+
+```text
+same logical cohort
+same frozen read world
+same math
+independent of physical packing
+```
+
+之后才允许对同一逻辑计算做物理排布优化。
+
+### 8.8 当前实现与待验收边界
+
+runtime 已区分逻辑 cohort 与物理 pen，并用冻结 publish epoch 约束每个逻辑步的读取。正文在整个 cohort 提交前保持 PENDING，物理 binding 可以在工作阶段自然结束前切换。
+
+这比“前 P 个完整任务跑完再启动后续任务”多了真实调度语义，但仍必须证明：FRAME 与 BODY 同样服从冻结视图、源结束不会提前释放后继、中间 slice 失败不会发布半个 frontier、W 份局部状态完整保留。CPU fixture 只覆盖其实际驱动的状态事务，不替代真实 backend packing 和 RAM 恢复验收。
+
+---
+
+## 9. Final acquire 的新定义：启动 `0.synthesize`
+
+### 9.1 什么时候可以开始
+
+必须同时满足：
+
+```text
+所有工作 stage SEALED
+无 STARTING
+无 RUNNING/EXIT_PENDING
+无未完成 frontier commit
+无 ready/eligible 但未处理工作
+episode 未 abort/cancel
+```
+
+### 9.2 新流程
+
+```text
+1. 固定最终完整 reader view
+2. 原子把 0.synthesize 从 waiting → STARTING
+3. 从 C_base 建新的 stage-local state
+4. invalidate old speculative state
+5. 正常 forward F_0s
+6. 得到新的 synthesis logits
+7. 生成 synthesis reasoning
+8. 当前 synthesis 源流自然 reasoning-end
+9. 转回普通 content / user tool / user grammar
+```
+
+不要：
+
+- 把最后 child 改名成 0；
+- 恢复最后 child state 给 0；
+- 复制/回放最后 child close token给 0；
+- 恢复旧 fork seed“洗掉指令”；
+- 再加 merge/judge agent。
+
+### 9.3 外部 response ownership 不变
+
+整个 episode 始终只有一个外部 response owner。
+
+internal worker/source end 不结束 SSE；只有最终 synthesis/普通输出路径结束整个 request。
+
+如果 stream 已经开始，后续失败不能改写已经发出的 HTTP status；要按现有 transport 规范发送一次终止/error 并关闭，不能伪造自然 `stop`。
+
+### 9.4 当前实现
+
+当前 document/runtime 已有 `synthesis_node`、`stage_role::synthesis`，DAG fixed entry 也能以 `is_synthesis` 渲染不同标签。
+
+但当前 server 仍保留大量旧 `final_fence / serial_tail / survivor` infrastructure。DAG 路径对这些旧字段已有条件分支，却还没有足够真实 E2E 证据说明 clean-cutover 已完成。
+
+因此：**有 synthesis node 不是 final-acquire gate 通过。** Stage 5/6 必须用真实 token/role/view 轨迹证明它确实是一个新阶段，而不是旧 final tail 的新名字。
+
+---
+
+## 10. Tri、MTP、RAM、shift 和 server 生态
+
+### 10.1 TriAttention
+
+Tri 继续处理 physical residency，不决定 DAG 语义。
+
+必须保持：
+
+```text
+physical cell union
+semantic run/node ownership
+reader visibility
+archive/keeper refs
+```
+
+四者分离。
+
+reclaim 后 reader view 从 resident logical runs/cells 重建，不持久化 old physical indices。
+
+FRAME 的逻辑结构与当前 resident token 子集是两个层面；如果 Tri 淘汰重要 framing 导致模型协议认知退化，应在 Tri protection/scoring 策略中解决，不无限 pin 全部历史。
+
+### 10.2 context shift
+
+Tri 是物理 residency compression；context shift 是逻辑历史删除。
+
+shift 只能删除完整、被允许裁掉的语义单元，更新：
+
+- run table；
+- reader view；
+- storage/virtual layout；
+- publish/layout epochs；
+- MTP stamps；
+- state serialization metadata。
+
+不能切半一个 FRAME、当前 active causal tail 或仍必需的前驱结果。
+
+若资源与完整语义冲突，应明确 resource failure，不能偷偷删掉关键工作结果让答案“继续成功”。
+
+### 10.3 MTP / speculative
+
+draft 至少绑定：
+
+```text
+episode
+internal stage
 reader view stamp
+frontier / publish epoch
+layout/topology version
+recurrent/sampler checkpoint
 ```
 
-只要 peer publish、fork、heading publish、context shift、Tri/compaction 导致该 reader 的有效 memory view 改变：
+会改变 reader 输入的 foreign PUBLIC commit、FRAME publish、stage switch、shift 等发生后：
 
 ```text
 old draft stale
-→ reject remaining draft
-→ restore target checkpoint
-→ 清掉 uncommitted draft KV/recurrent state
-→ 从最新 stable view 重新 draft
+→ reject
+→ restore checkpoint
+→ remove unaccepted KV/recurrent/sampler progress
+→ redraft
 ```
 
-不得让 draft 穿过尚未提交的 frontier，也不能因联合 batch 的物理执行顺序看到同拍 peer write。
+有 active peers 时不能用旧 view 一次 acceptance 穿越多个公共 frontier。
 
-至少六类实测：
+MTP acceptance 低是性能问题；target 结果与 MTP OFF 不一致是正确性问题，后者优先。
+
+### 10.4 RAM / checkpoint / persistence
+
+保存的是完整 episode 语义，不是最终文本：
+
+- DAG nodes/edges/plan_rank；
+- actor/internal-stage/stage_role；
+- remaining_preds、SEALED transaction；
+- C0/C_base refs；
+- FRAME injection cursor；
+- source-end candidate/provenance；
+- run kind/visibility/tape；
+- logical active/ready/starting/frontier transaction；
+- each active stage recurrent/conv/sampler state；
+- MTP/view stamps；
+- outer response/output cursor；
+- hard resource/accounting state。
+
+restore 到不同 physical rows/slots 之后按 logical IDs 重建 binding/view；不能依赖旧 GPU cell index。
+
+协议/wire state 要 versioned。旧 random-ID/tree episode 若无法无歧义迁移，应明确拒绝，不 best-effort 猜。
+
+### 10.5 多请求 / `n_cmpl` / shared prefix
+
+每 completion/episode 独立：
+
+- DAG；
+- stage states；
+- RNG；
+- epochs；
+- final synthesis；
+- HTTP/SSE lifecycle。
+
+外层 shared prompt physical cell 可以共享 refs；episode_id 成为 fork 后的 RERoT visibility domain。
+
+不同 episode PUBLIC 不能互读。
+
+### 10.6 Streaming
+
+内部 chronology 与最终 canonical DAG document 可以不同。
+
+要求：
+
+- 已发送 reasoning delta 不倒序重发；
+- FRAME/internal tools 不冒充用户输出；
+- worker source-end 不终止外部响应；
+- cancel/retry 不产生 duplicate token；
+- 一条 response 恰好一个 terminal event。
+
+### 10.7 用户工具 / JSON grammar
+
+internal subagent handoff 与用户真实 tool call 是两个协议域。
+
+0.synthesize 完成 reasoning 后恢复：
 
 ```text
-RERoT + MTP, no peer update
-RERoT + MTP, peer update invalidates draft
-RERoT + MTP, fork/topology barrier
-RERoT + MTP, rollback
-RERoT + MTP, Tri pressure/compaction
-RERoT + MTP, final fence
+original user grammar
+original user tool grammar/parser
+original response protocol
 ```
 
-**正确性门优先于 acceptance rate**：相同 target 配置下，MTP ON 的最终 target 结果必须与 MTP OFF 一致。acceptance 低只是性能问题；结果变了是 correctness fail。
+如果用户工具返回后还要再 RERoT，应建立新的 episode/stage，不复活已经 SEALED 的旧 workers。
 
-近期“active RERoT 暂停 draft mirroring”只是隔离修复，不能冒充这一阶段完成。
+### 10.8 LoRA / aLoRA
 
-### 10.6 Phase 5：RAM / checkpoint / rollback / prompt cache / context shift
+同 episode 各 stage 使用相同 request adapter set/scale。不能因借到不同 physical pen 改 adapter lineage。
 
-**目的**：证明 RERoT 不只会“一口气生成完”，而是完整状态可以保存、恢复、回滚和迁移。
+`can_batch_with()` 等既有 adapter compatibility 规则继续有效。
 
-episode state 远不止 token tape，至少包含：
+### 10.9 Multimodal
+
+正确边界：
 
 ```text
-tree topology / node states / child order
-document runs
-PUBLIC / PRIVATE / PENDING metadata
-random child IDs + parser partial state
-ready/running/starting/suspended queues
-reader views / topology,publish,layout epochs
-KV refs / archive ownership
-native child recurrent state
-root/private basis state
-F32 hand / conv / local S
-sampler RNG / grammar state
-MTP checkpoint + view stamp
-budget/resource counters
-final-fence checkpoint/prepared/cursor
+system/user text + image/audio/video prelude
+→ 普通模型 prefill
+→ C0
+→ routing/DAG reasoning
 ```
 
-最低真实 RAM 门：
+DDVR 只对 reasoning text runs 做其定义内的位置映射，不把 image spatial M-RoPE 当文本 PAC/DAG 顺序重新排。
+
+### 10.10 Embedding / rerank
+
+非 autoregressive generation 请求不进入 probe/DAG。即使 server 全局启用 RERoT 配置，也要完全走旧路径。
+
+### 10.11 graph reuse / pipeline
+
+view/span/phase/frontier metadata 尽量作为 graph input；只有 shape/capacity/kernel variant 等进入 reuse key。
+
+host/GPU input buffer 生命周期必须覆盖实际 device consumption，不能下一 frontier 提前覆写。
+
+---
+
+## 11. 资源模型
+
+### 11.1 不再使用旧“P 份状态就代表全部 active work”估算
+
+新语义下真正峰值至少包括：
 
 ```text
-fork
-→ 多 children running
-→ demote / save
-→ 原 physical rows/slots 被其他请求复用
-→ restore 到不同 physical indices
-→ rebuild view
-→ 继续生成
-→ 与 uninterrupted reference 对照
+model resident weights
++ shared prompt/public KV physical union
++ DAG FRAME/BODY resident KV
++ C0 / C_base lineage state
++ W active stages 的实际 lane-local recurrent/conv/sampler state
++ P executor graph/workspace
++ Tri score/pack scratch
++ MTP draft/verify/checkpoint
++ Vulkan temp/alignment/fragmentation
++ state save/restore staging
++ safety headroom
 ```
 
-只验证“blob 能 roundtrip”不够。checkpoint / partial rollback 必须覆盖 snapshot plane、source row、position、F32 hand、conv/local S、root/private/public basis，以及 suffix discard 后继续推进。
+不能：
 
-prompt cache 的 key 不能只看最终可读 transcript；同样文字可能对应不同 writer-contextual KV、tree、epochs 和 recurrent lineage。
+- 用 Turbo4/Turbo2 KV 类型推算权重 resident bytes；
+- 用 MoE active params 推算全部模型驻留；
+- 按 reader 数重复计 shared prefix physical KV；
+- 只按 P 份 recurrent state 计预算，却允许 W>P active；
+- 忽略 FRAME/probe token 与 KV；
+- 用真实 OOM/driver reset 来探容量。
 
-context shift 定义为：
+### 11.2 B/P/K 仍有意义，但必须加 W
+
+旧三容量：
 
 ```text
-logical semantic history deletion
+B = people
+P = pens
+K = physical KV
 ```
 
-不是 Tri eviction。shift 后必须同步更新 run coordinates、KV refs/positions、PAC-DFS view、layout/publish epoch，并使相关 MTP draft stale。active DDVR run 不能用普通线性 `seq_add()` 假装改 virtual position。
+仍然有用，但新 DAG 还必须显式考虑：
 
-**通过标准**：保存/恢复/rollback/shift 后的 sampled decisions、state、view 与 reference 一致；版本/fingerprint 不匹配明确失败；不发生半写、orphan 或旧 physical index 依赖。
+```text
+W = logical active stages
+```
 
-### 10.7 Phase 6：Server 外层语义矩阵
+尤其 native recurrent 私有后，W 可能直接决定大量 persistent state，而不是只有 executor P 决定。
 
-**目的**：证明 scheduler、HTTP/SSE、outer completion 和已有 server 功能不会改变 RERoT 的数学与生命周期。
+auto-fit 如果声称某组合可运行，真实压力下不能因漏计 W state、FRAME、MTP/Tri scratch 再 OOM。
 
-正式矩阵至少包括：
+### 11.3 资源不足的语义
 
-| 能力 | 必须证明 |
+分清：
+
+```text
+暂时无 pen
+    = scheduling/residency 问题
+    ≠ task failure
+
+计划要求的逻辑 state 总量无法承载
+    = resource capability failure
+    → 明确 fail/abort
+```
+
+不允许把后者偷偷改成“只运行前 P 个问题，剩下的等它们完成”，因为那改变了 W>P 的逻辑并发语义。
+
+---
+
+## 12. 新的唯一实施阶段：0–8
+
+旧文 Phase 0–12 以后只作历史，不再用作进度标签。当前 DAG 路线固定如下。
+
+### 12.1 阶段 0：冻结可信基线与实施前提
+
+#### 目标
+
+先知道自己正在修改哪份源码/二进制/模板，以及旧数值红线是否仍可靠。
+
+#### 工作
+
+1. 封存 Git HEAD/status/source patch。
+2. 记录 compiler/CMake、server version、实际加载共享库、模型/template/adapter、完整启动参数。
+3. 分开旧 Ring artifact、当前 DAG source 和 dirty worktree，不能混称一个基线。
+4. 核对实际模板：thinking start/end、assistant/tool round、history reasoning retention、generation prefix。
+5. 核对 C0/C_base 可用的 memory/sampler save/restore 能力。
+6. 分类 CPU-only、可能初始化 Vulkan、需要真实模型的测试。
+7. 保留旧数学红线，不通过改 tolerance/prompt/seed 消掉。
+
+#### 通过条件
+
+有一份可追溯 baseline matrix，并能回答：
+
+```text
+当前生产/目标 artifact 是什么？
+哪些测试只查纯逻辑？
+哪些测试会真正用 GPU？
+哪个模板能无损表达 FRAME/SOURCE_END？
+C0/C_base 当前到底保存哪些 state？
+```
+
+#### 当前状态
+
+**部分具备。** 当前工作树与 DAG commits 明确。本轮在 `build-test`（`GGML_VULKAN=OFF`）重跑了 `test-rerot-parser` / `test-rerot-view` / `test-rerot-runtime`。没有封存生产 binary/模型/模板，Stage 0 不能标 PASS。
+
+---
+
+### 12.2 阶段 1：纯逻辑计划与 reader reference
+
+#### 工作
+
+- schema 结构 + control-plane validation；
+- stable string ID → internal ID / `plan_rank`；
+- DAG edges / Kahn cycle check；
+- `0.plan` / `0.synthesize` internal stage；
+- started public document set；
+- cycle-preferred topological ordering；
+- unique run expansion，不读取 physical cell index。
+
+#### 必须通过的反例
+
+| case | 期望 |
 |---|---|
-| multi-person | 多独立 episode 的 KV、recurrent、epochs、RNG、response、final 互不串 |
-| `B > P` | root/person admission 与 child pen queue 分开；aging/fairness，无长期饥饿 |
-| `n_cmpl > 1` | 外层 completion 各自一 episode，共享 prefix 但 fork 后 visibility domain 分离 |
-| shared-prefix | 共同 prefix refs × outer completion × inner ancestry/archive/exec 的 union 正确 |
-| idle demotion | 整个 episode 可保存/恢复 |
-| active preemption | victim 后精确继续或明确终止，不留下 sibling/orphan |
-| pen yield | 只能 frontier boundary，完整保存 local state、sampler/MTP，再从最新 PUBLIC view refresh |
-| cancellation | 停止所有 writers、queue、draft，清理本 episode refs，不删其他请求仍用的 prefix |
-| retry | 新 generation/id，旧异步 callback 不能提交到新请求 |
-| streaming | PUBLIC reasoning 无重复；PRIVATE/PENDING 不漏；恰好一个 terminal event |
-| tool calling | final fence 后恢复 stock tool grammar/parser；工具结果回来开新 episode |
-| JSON/GBNF | planner/child grammar 不污染用户 grammar，serial tail 恢复原 sampler |
-| LoRA/aLoRA | adapter set/scale 与 invocation lineage 一致，不能绕过 `can_batch_with()` |
-| multimodal | shared multimodal prelude 后 fork；视觉/音频 position 不进 text DDVR 重排 |
-| embedding/rerank | 即使全局开 RERoT 也不创建 episode/runtime，完全走 stock path |
-| graph reuse | capacity/shape 进 reuse key，具体 ids/view 数据走 input；无 stale host/GPU buffer |
-| pipeline parallel | span/frontier input 生命周期与同步正确 |
-| backend sampling | 每 Lane 独立 sampler row，不为方便强制全部 logits 回 CPU |
+| simple + DAG payload | reject |
+| dag + `{}` payload | reject |
+| duplicate ID | reject |
+| self-loop | reject |
+| duplicate edge | reject |
+| unknown endpoint | reject |
+| cycle | reject whole plan |
+| questions order != topo order | dependency first, `plan_rank` 只 tie-break |
+| flat 1/2/3 | reader 1=`2,3,1`; 2=`3,1,2`; 3=`1,2,3` |
+| A→C，B independent | A seal 后 C eligible；B 不需等；B 仍看 A |
+| diamond | shared ancestor/run exactly once |
+| blocked node | no premature FRAME/BODY |
+| only physical slot changes | logical reader order unchanged |
 
-总不变量：
+#### 独立参考
 
-> scheduler 只能改变“什么时候运行”，不能改变“算什么”。
-
-换 pen、排队、抢占、batch packing、不同外层请求组合，都不能让同一个 logical computation 静默切换 attention mask、recurrent update、RNG lineage 或 grammar。
-
-**通过标准**：上述矩阵有自动化和至少一组真实 Ornith/Vulkan E2E；每请求 response ownership 清楚，无 5xx/orphan/重复终止。
-
-### 10.8 Phase 7：生产级压力与 B/P/K auto-fit
-
-**目的**：在所有主要机制同时活跃时证明资源模型和 fallback 真能成立，不只是小规模 smoke。
-
-核心容量只有三种：
+仓库已有：
 
 ```text
-B = resident people / independent request-state capacity
-P = resident pens / Lane execution-state capacity
-K = unified physical KV cells
+scripts/rerot-dag-reference.py
 ```
 
-运行不变量：
+它枚举 4-node DAG/合法 live state/reader view，并验证固定 frame automaton。脚本预期统计：
 
 ```text
-resident_people <= B
-allocated_pens <= P
-sum(person.allocated_pens) == allocated_pens
-physical_KV_used <= K
+DAGs                    = 543
+Legal live states       = 3007
+Reader views            = 3904
+Fixed-frame compositions= 384
 ```
 
-没有 per-person pen cap。一个 person 在没有竞争时可拿全部 P；child > P 只排队，不丢 descriptor。人数满和笔满都不触发 Tri，只有 KV pressure 触发 Tri。
+它不测试模型、template tokenizer、KV、Vulkan 或恢复。
 
-终极组合压力至少包含：
+#### 当前状态
+
+**逻辑门已接线并经 CPU 重跑。** `src/llama-rerot.*` 与 parser/view/runtime tests 覆盖 Stage 1 反例。这不是模型语义或 Vulkan 证据。
+
+---
+
+### 12.3 阶段 2：固定入口与源结束协议
+
+#### 工作
+
+1. 以真实模型 template 构造 F_i，不停留在简化 `lane:` 文本。
+2. FRAME 只依赖目标 stage/intent。
+3. FRAME 完整 PENDING → 一次 forward → 原子 publish。
+4. source raw tape 与 foreign export 分开。
+5. native reasoning-end 的 tokenizer/protocol boundary 明确。
+6. event origin/phase gate 接入完成事务。
+7. presentation layer 隐藏 internal FRAME/tool IDs。
+
+#### 必须通过
+
+1. 任意合法片段排列后只有 reader reasoning open。
+2. peer BODY 增长不重新 forward 旧 F_i。
+3. STARTING FRAME 中的 close 不能完成 worker。
+4. foreign FRAME close 不能完成 current worker。
+5. native source end 跨 token 时完整 commit 前不解锁后继。
+6. source terminal 保留真实 state/tape，但 foreign canonical 不双重 close。
+7. BODY 中普通 `<think>` 引用、代码、tool 示例不触发 scheduler。
+8. FRAME/internal tool 不泄漏外部 `tool_calls`/content。
+9. 模板不能无损识别 end boundary 时 fail capability，不猜。
+
+#### 当前状态
+
+**生产路径拒绝 sandwich。** F_i 用真实请求 messages（无 chat 时才用 dummy user）+ spawn_lane 渲染 CLOSE+handoff+OPEN。ordinary C0 tape 与 DAG-with-tools 再渲染做 token LCP；工具后缀并入正式 P。模板无法无损渲染则 hard_abort。真实 chat template / tokenizer 边界仍要在目标模型上验收。
+
+---
+
+### 12.4 阶段 3：C0 与 C_base 状态边界
+
+#### 工作
+
+- C0 保存普通 sampler/state；
+- probe isolation；
+- simple strict continuation；
+- dag probe discard；
+- 正式 P forward；
+- C_base 在准确时点 capture；
+- worker/synthesis 从 C_base clone/reference；
+- recurrent/conv/position/snapshot/brain-hand 完整配对。
+
+#### 必须通过
 
 ```text
-RERoT
-+ 6 outer requests/slots
-+ recursive forks
-+ queued children
-+ Tri pressure
-+ Turbo4/Turbo2
-+ MTP
-+ streaming
-+ 至少一次 RAM demotion/restore 或 active preemption
+普通 input + sampler fixed
+
+run A: no probe, ordinary
+run B: probe → simple → restore
+
+后续 ordinary sampled path 应一致
 ```
 
-验收必须同时满足：
+还要覆盖：
+
+- probe 期间取消/失败不损坏 C0 或其它 request；
+- 多 stage 从 C_base 首写后互不修改；
+- predecessor completion order/physical row 不改变 child seed；
+- user grammar/template 完整恢复；
+- first worker free token 使用 F_i forward 后的新 logits，而不是 C_base 旧 logits。
+
+#### 当前状态
+
+**simple 的目标模型 CPU A/B 已通过；阶段 3 尚未整体通过。** `scripts/rerot-simple-continuation-smoke.py` 对真实 Ornith 检查贪心、seeded top-3 post-sampling logprobs、用户 JSON grammar、SSE 及双 completion。choices/通道与普通路径一致，probe 不计入普通 completion；JSON 数值答案另作正确性检查。C0 首个决策从有效 logits 保存并消费一次，sampler 不重置。`capture_c_base()` 在正式 P 注入完成后覆盖 root hand_seed，并抽出 conv tails、写入 sampler prev/seed。多阶段 COW 隔离、不同物理 row 的有效状态配对、取消与跨进程恢复仍需独立证据；序列化 seed/prev 不等于完整 sampler 快照。
+
+---
+
+### 12.5 阶段 4：调度器、W>P 与错误事务
+
+#### 工作
+
+- logical active 与 physical bound 分离；
+- 同 frontier eligible cohort；
+- frozen read version；
+- finite pens microbatch；
+- W stage state persistence / swap；
+- atomic frontier publish；
+- exactly-once seal；
+- synthesis start transaction；
+- failure cleanup。
+
+#### 必须通过
+
+1. A 完成可立即解锁 C，不等无关 B。
+2. W>P 时全部 eligible 在同逻辑边界 active，不等前 P 个任务自然退出。
+3. 同一逻辑 frontier 不同 microbatch 分割/row order 得到同一规定结果。
+4. later slice 不偷读 earlier slice 本 frontier 新 PUBLIC。
+5. 任一 slice 失败不发布半个 frontier。
+6. duplicate end callback 不重复 `remaining_preds--`。
+7. abort/cancel 后无 orphan state/ref/response。
+8. 合法图“无 runnable 但有 unfinished”立即报 scheduler invariant error。
+
+#### 当前状态
+
+**逻辑步已接线，真机分时未验收。** eligible 可在未 SEAL 时 START；同一逻辑步 BODY 保持 PENDING，直到 cohort 全员 commit 后发布。CPU fixture 证明 foreign reader 看不到未发布 BODY。真实多 pen decode、slice 失败原子性、W 份状态换出仍属待验收。
+
+---
+
+### 12.6 阶段 5：单 child 真实原生回合闭环
+
+最小真实模型：
 
 ```text
-0 5xx
+0.plan
+→ routing=dag with one worker
+→ F1
+→ R1 natural native end
+→ 0.synthesize F0s
+→ R0 natural end
+→ user final content
+```
+
+#### 必须观察
+
+- 实际模型 template 的 token/role 轨迹；
+- child end 来自 source generation，不是 runtime FRAME；
+- worker seal exactly once；
+- final view 稳定；
+- synthesis 从新 stage/new logits 开始；
+- reasoning/content 正确分离；
+- user grammar/tool 恢复；
+- outer response 只有一次终止；
+- 内容确实正确，不能只看 HTTP 200。
+
+#### 当前状态
+
+**尚无本文可引用的当前 HEAD 真实模型通过证据。**
+
+---
+
+### 12.7 阶段 6：多 lane 实时共享与 DAG 数值门
+
+#### 最小 workload
+
+1. flat 三 lane：验证三个循环 reader 顺序和持续 peer uptake。
+2. `A→C` + B independent：验证 A history 保留，B/C overlap。
+3. diamond：验证 join 和 ancestor unique。
+4. unequal lengths：完成节点 history 不消失。
+5. synthesis 使用多个互补结果，不串 intent。
+
+#### 数值门
+
+- 固定 writer tape/frontier/view/KV bytes，比 CPU/reference 与 Vulkan；
+- native lane-local recurrent；
+- mixed ubatch；
+- different physical row order；
+- rollback 0/>0；
+- MoE `18→19→20→18→19`；
+- NaN/Inf/empty/length mismatch fail-closed；
+- same logical computation 不因 batch packing 改 sampled decision。
+
+不在这一阶段引入 dynamic RoPE、shared RBB、foreign replay。
+
+#### 当前状态
+
+旧数值证据很多，DAG 新 reader/protocol 尚未完整重新认证。
+
+---
+
+### 12.8 阶段 7：完整兼容矩阵
+
+| 组合 | 硬门 |
+|---|---|
+| FullKV / Turbo / Tri / Tri+Turbo | same DAG rule；sparse/union/compaction 正确 |
+| MTP no-peer-change | 保持普通 draft/verify semantics |
+| MTP peer/frame/shift/stage switch | stale draft reject + exact restore |
+| demote → other physical rows → restore | DAG、FRAME cursor、source end、local state 连续 |
+| context shift | 只删合法完整单元，更新 view/epochs |
+| W>P + multi people | physical packing 不改变 math，资源可恢复 |
+| `n_cmpl>1` / shared prefix | completion isolation + physical ref union |
+| streaming / retry / cancel | no duplicate + exactly one terminal |
+| user tools / JSON | internal handoff 不外发，final 恢复 user rules |
+| LoRA/aLoRA | adapter lineage 不随 pen 漂移 |
+| multimodal | common prelude/position lineage 正确 |
+| embedding/rerank | 完全绕过 DAG |
+| RERoT OFF | 普通路径零回归 |
+| graph reuse/pipeline | no stale input/descriptor |
+| legacy recursive fork requirement | 若仍是产品需求，必须用 phase→sub-DAG→synthesize 正式建模 |
+
+早期可以为了定位关闭 Tri/MTP/RAM；最终不能拿“关闭以后通过”当兼容证据。
+
+#### 当前状态
+
+**未完成。** DAG shift pin 与 MTP stamp 已接线；FullKV/Turbo/Tri/MTP/RAM 兼容矩阵仍缺目标 artifact 证据。`n_cmpl>1` 仍串行化额外 RERoT root。递归嵌套 DAG 仍 fail-closed。
+
+---
+
+### 12.9 阶段 8：质量、性能、长稳、artifact、发布
+
+#### 质量
+
+至少：
+
+- 9.11/整数/短逻辑等确定性微题；
+- 代码 compile/tests；
+- 数学/依赖推理；
+- 长上下文 retrieval/summarization；
+- 多章节长任务；
+- 真实生产样本。
+
+每题保留：
+
+```text
+prompt
+seed
+routing plan
+DAG
+config
+reasoning/content
+usage/accounting
+source event trace
+artifact hashes
+```
+
+#### 机制消融
+
+固定计划后先做：
+
+| group | scheduling | narrative/end protocol |
+|---|---|---|
+| A | old flat | old |
+| B | DAG | old |
+| C | old flat | fixed-entry/native-end |
+| D | DAG | fixed-entry/native-end |
+
+然后再加入 model-generated routing，才能区分“DAG 改善”“新 framing 改善”“planner routing 改善”。
+
+#### 性能
+
+报告：
+
+- useful sampled tok/s；
+- aggregate model throughput；
+- probe tokens/time；
+- FRAME tokens/time；
+- state swap W>P cost；
+- prefill/TTFT；
+- p50/p95；
+- VRAM/RSS；
+- frontier/barrier；
+- graph rebuild/metadata；
+- attention/recurrent/MoE；
+- MTP acceptance + invalidation cause。
+
+旧 `>=500 tok/s` 是待验证性能目标，不能写成新 DAG 已保证。不能把 forced framing/probe token 冒充 useful reasoning throughput。
+
+#### soak
+
+质量/性能过门后再组合：
+
+```text
+DAG startup/seal/synthesis
+Tri drain/maintenance
+MTP accept/rollback
+RAM save/restore
+preemption
+context shift
+shared prefix
+cancel/retry
+stream
+```
+
+warmup 后内存/refs/state 要进入平台，无 leak、stale tensor、deadlock、偶发 cross-episode state corruption。
+
+#### artifact & release
+
+同一 RC 保存：
+
+```text
+Git HEAD + status + source patch
+compiler + CMake
+llama-server --version
+llama-server / libllama-server-impl
+libllama / libllama-common / libmtmd
+libggml / libggml-base / libggml-cpu / libggml-vulkan
+model fingerprint
+template fingerprint/version
+Tri calibration fingerprint
+service unit + full args
+```
+
+实际运行通过 `/proc/PID/maps` 核对加载库。rebuild 后旧验收失效。
+
+发布：
+
+```text
+shadow
+→ canary
+→ production
+```
+
+并保留上一完整 RC rollback artifact。
+
+---
+
+## 13. 当前实现盘点
+
+### 13.1 已经落下的 DAG 基础
+
+当前 HEAD 源码可以确认以下实现存在：
+
+| 范围 | 当前实现 |
+|---|---|
+| routing schema | JSON Schema + schema-to-grammar |
+| routing parse | simple/dag strict parse，duplicate member/ID/edge、自环、unknown endpoint、cycle check |
+| prebranch state | `server_rerot_prebranch_checkpoint`，C0/C_base fields |
+| node DAG metadata | `string_id / intent / plan_rank / predecessors / successors / remaining_preds / stage_role / is_sealed` |
+| document mode | DAG mode、edge、cycle-preferred Kahn、DAG reader view |
+| segment semantics | `frame / body / source_end / probe_control` |
+| origin semantics | runtime frame / foreign export / worker source 等 completion origin |
+| fixed entry | 真实请求 messages + 原生 `spawn_lane` tool round；启动时一次 FRAME |
+| native end | template thinking end tag → 当前源流 parser/origin gate，不用 grammar 强制完成 |
+| DAG init | workers + synthesis node + dependency count |
+| server wiring | 隔离 probe → simple/dag；正式前缀重建；DAG admission；FRAME injection；源结束与最终输出分流 |
+| serialization | DAG flags/node fields/source marker 已进入 episode state path |
+| offline reference | `scripts/rerot-dag-reference.py` |
+
+### 13.2 当前明确未完成/未证明
+
+| 范围 | 状态 |
+|---|---|
+| 真正隔离 probe branch | 独立 `probe_seq` 已接线；完整普通续跑 A/B 仍需验收 |
+| C_base = 正式 P 之后的 state | capture 已移到正式 P 注入完成后；真实 recurrent 配对仍需验收 |
+| actual native tool-round FRAME | 原生 tools 模板已接线；前缀变化在启动时重建，实际模型闭环仍需验收 |
+| tokenizer-level source-end 无损边界 | **需模板逐个认证** |
+| W>P logical cohort + physical time-slice | 逻辑 cohort、冻结 read epoch 与物理分时已接线；完整状态/数值/错误门仍需验收 |
+| W active state budget/restore | **未完成完整门** |
+| final 0.synthesize clean cutover | 有 scaffolding，**无当前真实 E2E 证据** |
+| 删除旧 random-ID/tree/fence production semantics | **未完全 clean cutover** |
+| target Ornith single child DAG | **未在本次更新中验证** |
+| target Ornith multi-lane DAG | **未验证** |
+| Tri/MTP/RAM/shift DAG matrix | **未重新认证** |
+| DAG quality/performance/soak | **未开始正式 gate** |
+
+### 13.3 两个最近提交的边界
+
+`c3648d789` 主要覆盖：
+
+- 文档合并；
+- DAG logical metadata；
+- cycle-preferred views；
+- fixed-entry framing scaffolding；
+- parser/runtime/view tests。
+
+`4e7769152` 主要覆盖：
+
+- server decode routing probe；
+- C0 simple/dag wiring；
+- DAG scheduler/server admission；
+- source-end grammar；
+- 更多 parser/runtime/view tests；
+- offline DAG reference script。
+
+提交标题和代码存在只证明 implementation landed，不证明 target artifact 的 Stage 0–8 gates 已通过。
+
+---
+
+## 14. 旧 Ring 审计中仍然必须保留的数值红线
+
+协议换轨不会让底层数学 bug 自动失效。下面这些历史证据仍应成为 DAG implementation 的 regression corpus，但要在当前 artifact 上重新跑。
+
+### 14.1 Recurrent / checkpoint
+
+| 历史问题 | 历史修复/证据 | DAG 后仍要保留什么 |
+|---|---|---|
+| mixed batch 因无关 rows 偷换 shared algorithm | group-aware gather/solve/scatter | batch packing 不改同一 stage 的 native recurrence |
+| PRIVATE row 被减掉本 token transition | private/non-writer hand 分支 | FRAME/PROBE/BODY 分类不能误删 local transition |
+| beta=0 被 clamp 成正 write | 删除 beta floor | zero gate 必须仍是 zero |
+| `brain_copy` 未初始化 | 初始化 + dirty placement test | RERoT OFF/ordinary path 不能被 DAG input 破坏 |
+| checkpoint 半写/COW sibling 覆盖 | 全尺寸预校验、COW、position/source/snapshot 一致 | C0/C_base/active state restore 要复用完整原则 |
+| root PRIVATE/PUBLIC 换基底改变有效 state | `H_new = H_old + B_old-B_new` | stage seed 换物理 row 仍要保持 effective state |
+| F16 persistent hand 长程漂移 | hand 改 F32 | DAG active W states 不能降成有损 hand cache |
+| rollback slots 打开就改变 child equation | snapshot 保存 hand + brain selector 修复 | MTP/rollback ON/OFF 不得改变未 rollback 的持续计算 |
+
+历史 128-step recurrent 数值：
+
+```text
+F16 hand:
+output/state max error ≈ 5.76e-4 / 1.72e-3
+
+F32 hand:
+output/state max error ≈ 3.58e-7 / 7.15e-7
+```
+
+rollback=2 的历史反例：
+
+```text
+before:
+output/state ≈ 2.17231 / 1.14956
+
+after:
+output/state ≈ 2.68e-7 / 7.15e-7
+```
+
+### 14.2 Attention / DDVR / Vulkan
+
+历史重要修复：
+
+- FP32 indexed CPU path 不得把 Q 偷降 F16；
+- reference 要独立做 double QK/softmax/PV；
+- empty output、length mismatch、NaN/Inf 必须 fail-closed；
+- Vulkan RBB/CG 的“N 步精确收敛”不能照搬 FP32，历史改成 4N + periodic true residual restart；
+- MoE singleton routing threshold / pipeline cache 必须 hermetic；
+- `18→19→20→18→19` 是红线序列。
+
+历史 CPU F16-KV independent reference：
+
+```text
+33 keys:  CPU max abs ≈ 1.19e-7 after fix
+257 keys: CPU max abs ≈ 8.94e-8 after fix
+```
+
+这些不是新 DAG 的性能/质量证据，只是 backend correctness inheritance。
+
+### 14.3 Fixed teacher tape
+
+历史 128 native teacher tape：
+
+```text
+Turbo: 0/128 argmax mismatch
+F16:   0/128 argmax mismatch
+rollback 0/2 reports matched within same KV mode
+```
+
+历史另一份 512 Turbo teacher tape：
+
+```text
+Turbo: 1/512 argmax mismatch, first at step 509
+F16:   0/512 argmax mismatch
+```
+
+step509 trace 曾显示：
+
+- A3 极小 attention 差异；
+- 后续层逐步放大；
+- layer 29 首次改变 selected expert membership；
+- 诊断性替回 native expert IDs 可恢复 native top token。
+
+这说明“短程 argmax 一样”不等于长期数值轨迹完成认证，也不能用 production 强制 router IDs 掩盖误差。
+
+### 14.4 历史语义/性能数据的定位
+
+旧 Ring 时代：
+
+- 9.11 短题曾出现 HTTP 200/stop、children natural random-ID close、最终比较正确，但 child reasoning 仍有漂移；
+- 长“大洲国家”曾 HTTP 200 但 length/串洲/残缺，明确不通过；
+- 2026-09-04 旧 3-slot aggregate throughput 约 237–266 tok/s，single-lane 约 108 tok/s。
+
+这些数据只证明旧实现的某些历史性质。新 DAG protocol、native source-end、C0 probe 和 `0.synthesize` 改变了输入与生命周期，旧质量/速度不能继承。
+
+---
+
+## 15. 测试矩阵
+
+### 15.1 纯 parser / schema
+
+必须覆盖：
+
+```text
+valid simple
+valid one-node dag
+valid multi-node dag
+duplicate JSON member
+missing fields
+extra fields
+simple + dag payload mismatch
+dag + empty simple payload mismatch
+whitespace-only id/intent
+id "0"
+duplicate id
+unknown endpoint
+self-loop
+duplicate edge
+cycle
+```
+
+### 15.2 DAG property tests
+
+随机/穷举至少断言：
+
+```text
+every started node's hard predecessors are started/sealed
+reader exists in started set
+every visible node appears once
+all visible hard edges are topologically ordered
+active reader is last
+retired public node does not disappear
+physical binding does not change order
+```
+
+仓库纯参考脚本统计可作为 one independent oracle，但不能让项目 C++ 直接调用它产生 expected result。
+
+### 15.3 FRAME automaton
+
+抽象状态：
+
+```text
+reasoning
+  --end--> content
+  --call--> waiting_tool
+  --matching result--> assistant_start
+  --start--> reasoning
+```
+
+对多个 `F_i+R_i` 任意合法排列，最后必须仍是 reasoning；额外 source close 再拼下一 FRAME 应被检测为 double close。
+
+真实模板测试还要增加：
+
+- actual special tokens；
+- tool call/result correlation；
+- reasoning history retention；
+- tokenizer split；
+-正文尾部+end 同 token；
+- user grammar/tool coexistence。
+
+### 15.4 C0/simple
+
+同 ordinary request 做：
+
+```text
+baseline ordinary
+vs
+probe → simple restore
+```
+
+比：
+
+- sampled token sequence；
+- logits/top decision；
+- sampler history/RNG；
+- recurrent effective state；
+- KV ownership/position；
+- user grammar state；
+- transport cursor。
+
+### 15.5 W>P frontier fixture
+
+用 deterministic fake model/state 驱动：
+
+```text
+W=5, P=2
+```
+
+遍历多种 physical slice：
+
+```text
+[A,B] [C,D] [E]
+[C,E] [A,D] [B]
+...
+```
+
+所有 slice 都读取同一 frozen public version，最后 logical state/commit events 一致。
+
+不能只断言“所有 task 最后都跑过”。
+
+### 15.6 真实模型 Stage 5/6
+
+目标模型先从小、安全配置逐级：
+
+```text
+single worker DAG
+flat 2 workers
+flat 3 workers
+A→C + B
+diamond
+unequal-length workers
+```
+
+每次保存 routing JSON、DAG、FRAME raw token tape、SOURCE_END origin、reader views、response、metrics、logs 和 artifact hashes。
+
+### 15.7 数值 fixed-tape
+
+至少：
+
+```text
+native-vs-native determinism
+single-stage RERoT vs native
+Turbo/F16
+rollback 0/>0
+different ubatch
+different physical row ordering
+MoE threshold shapes
+```
+
+三级门：
+
+1. native-vs-native mismatch=0；
+2. same defined RERoT computation sampled decision mismatch=0；
+3. 才报告 logits rel L2 / layer activation error。
+
+### 15.8 兼容压力
+
+最终组合至少包含：
+
+```text
+multiple people
+DAG W>P
+Tri pressure
+Turbo4/Turbo2
+MTP
+streaming
+shared prefix
+one RAM demotion/restore or preemption
+```
+
+要求：
+
+```text
+0 unexpected 5xx
 0 OOM
 0 deadlock
 0 Vulkan validation error
-0 orphan seq ref
-0 orphan recurrent/hand/brain cell
+0 orphan seq/ref/state
 0 duplicate SSE
-每请求 exactly one terminal event
-hard abort / natural final 可区分
-Tri fallback 顺序正确
-MTP rollback 正确
+exactly one outer terminal/request
+abort != natural success
 ```
 
-另做 shared-prefix union 压力，例如 8K common prefix、多 completion、多 inner child；逐步取消/retire/demote，保证 physical cell 不提前释放。
+---
 
-auto-fit 不是只算 KV：
+## 16. 统计口径
+
+### 16.1 token 分账
+
+新 DAG 至少分：
 
 ```text
-model tensors
-B/person brain/state
-P/pen native local recurrent + F32 hand + conv + sampler/output rows
-K physical KV
-DDVR span/query metadata
-Tri score/pack scratch
-MTP target/draft scratch
-Vulkan/graph temporary buffers
-state-save staging
-allocator granularity + headroom
+prompt/prefill
+probe input/generated
+formal P tokens
+FRAME forced tokens
+BODY sampled tokens
+SOURCE_END sampled/protocol tokens
+synthesis FRAME
+synthesis sampled reasoning
+final content/tool tokens
+MTP draft/verify
+real restore/recompute work
 ```
 
-`--total-kv auto` 的目标是联合求 B/P/K；真实 bytes 由 allocation probe 和 tensor layout 获取，不写死某张显卡、某模型 context 或“每 pen 几 MiB”。如果 auto-fit 判定可装，真实同配置仍 OOM，就是 Phase 7 fail。
+逻辑 rollback 不能抹掉 probe 已经真实消耗的时间/算力。
 
-旧 pen sweet-band `6,5,7,4,3,2,1` 只是无在线 benchmark 的历史先验；改变 GPU/backend 后须通过容量/性能矩阵重新认证，不能把它说成硬件自适应最优解。
+同一个 token 做数值 replay/verify 也不能当成第二个用户生成 token。
 
-### 10.9 Phase 8：质量总验收
+### 16.2 useful throughput 与 aggregate compute
 
-**目的**：证明并行 execution semantics 没有带来任务质量断崖。不能只靠 9.11、一个长题或几个关键词 smoke。
-
-冻结多层质量集：
-
-```text
-确定性微题：
-  9.11 vs 9.9
-  整数运算
-  简单逻辑
-  短事实
-
-代码：
-  Python
-  C++
-  算法题
-  小型 repo QA
-  至少 compile/syntax + unit tests + 结果正确
-
-数学：
-  MATH-500
-  AIME24/25
-  或同级冻结集
-
-长上下文：
-  needle/retrieval
-  长文总结
-  大洲国家
-  多章节问答
-
-生产：
-  真实 prompt 样本
-```
-
-每题都保存：prompt、seed、sampling/config、RERoT/Tri/MTP/Turbo 参数、answer、reasoning、usage、metrics、artifact hashes。不要只报一个平均分。
-
-RERoT 多 Lane 不要求逐 token 等于 serial，因为并行共享本来就是新 execution semantics；但必须与冻结 baseline 比较，不能出现系统性章节错位、事实/数学退化、代码通过率暴跌或长任务无法闭合。
-
-**阈值在跑 benchmark 之前写死。** 看见分数后再放宽阈值、换评分器、换 prompt 或减少任务难度，不算验收。
-
-`rerot-phase8-quality.py` 只是工具入口；文件名不代表这一阶段已经完成。
-
-### 10.10 Phase 9：性能阶段
-
-**前置条件**：Phase 1–8 的 correctness/compatibility/quality 门全部绿。此前可以做小的明显低风险性能修复，但不能把正式性能目标放在错误语义上优化。
-
-标准 production 配置固定后再测，例如：
-
-```text
-Ornith 1.5 35B
-Vulkan
-Turbo4/Turbo2
-Tri 3/32
-MTP ON
-RERoT STRONG
-production B/P/K auto-fit
-```
-
-至少记录：
-
-```text
-serial tok/s
-RERoT request-wide aggregate tok/s
-parallel model tok/s
-completed responses/s
-quality-qualified goodput
-prefill tok/s
-p50 / p95 latency
-VRAM peak
-queue wait / pen utilization
-frontier barrier cost
-DDVR attention cost / HBM bytes
-recurrent cost
-MoE cost
-MTP acceptance
-graph rebuild / metadata upload / small dispatch cost
-```
-
-正式性能门：
-
-> **标准化多-Lane workload 下 aggregate model throughput >= 500 tok/s，并且质量门不退。**
-
-不能通过少生成、改 prompt、降低 reasoning、取消 Tri/MTP、缩 context、减少任务数、把 forced control work 从统计里消失等办法达到。
-
-优化顺序按风险/收益：
-
-```text
-第一层：
-  不必要 synchronize
-  graph rebuild
-  metadata upload
-  small dispatch
-  重复 gather/scatter
-
-第二层：
-  multi-reader DDVR shared physical KV scan
-  K/V tile load once, serve multiple Q readers
-  Turbo dequant reuse
-  frontier batch packing / weight batching
-
-第三层：
-  MTP acceptance / draft scheduling
-  MoE route reuse
-  kernel fusion
-```
-
-每个 perf patch 都必须：
-
-```text
-fixed-tape numerical gate
-→ RERoT focused CTest/direct tests
-→ semantic microset
-→ 再看 benchmark
-```
-
-MoE route/pipeline cache 优化尤其必须过 18/19/20 threshold 红线。不能积 20 个优化后才发现某处开始改语义。
-
-### 10.11 Phase 10：长稳 Soak
-
-**目的**：证明达到质量和性能目标后，服务器在长时间真实状态切换中仍稳定。
-
-soak 中要持续发生，而不是只“开着不动”：
-
-```text
-full-slot / full-person 连续请求
-fork / close / recursive fork
-queued child admission
-Tri drain / maintenance / floor events
-MTP accept / invalidate / rollback
-RAM save / restore
-preemption / pen yield
-context shift
-shared prefix
-cancel / retry
-streaming
-tool call round-trip
-```
-
-持续监控：
-
-```text
-CPU RSS
-VRAM used
-backend allocated buffers
-KV physical cells / refs
-brain / hand / local recurrent used rows
-people / pens resident/allocated/suspended
-queue depth
-MTP draft state
-orphan counters
-Vulkan errors
-```
-
-warmup 后内存和资源计数必须进入平台，不能随请求数单调上涨。episode 完成/取消后相应 refs、pens、state 必须归零或回到稳定基线。
-
-**通过标准**：无 leak、stale tensor、死锁、偶发 nondeterminism、state corruption、服务重启或长期 starvation。
-
-### 10.12 Phase 11：Release Candidate Artifact Sealing
-
-**目的**：消除“验收的是 A，部署的是 B”的工程假通过。
-
-每个 RC 至少封存：
-
-```text
-Git HEAD
-git status / source.patch
-compiler
-CMake cache / build config
-llama-server --version
-
-SHA-256:
-  llama-server
-  libllama-server-impl
-  libllama
-  libllama-common
-  libggml
-  libggml-base
-  libggml-vulkan
-  libggml-cpu
-  libmtmd
-
-model SHA / fingerprint
-Tri calibration SHA / fingerprint
-systemd unit / service config
-完整启动参数
-关键环境变量
-```
-
-运行时用 `/proc/PID/maps` 记录真正 mmap 的 `.so` 路径和 hash，避免链接到了 `/opt/...` 的旧副本。release gates 必须跑在**同一 artifact**上。
-
-只要 rebuild、换 library、改校准、改模型或 dirty patch：
-
-> 旧验收对新 artifact 失效，相关门必须重跑。
-
-build success 不是 deploy permission；Git HEAD 相同也不代表 dirty worktree、runtime library 和 model artifact 相同。
-
-### 10.13 Phase 12：Shadow → Canary → Production
-
-**目的**：最终发布仍分层，不直接覆盖生产。
-
-Shadow：
-
-```text
-同 production model/config/artifact
-不接真实用户流量
-跑完整 release smoke 和组合检查
-```
-
-Canary：
-
-```text
-少量真实请求
-重点观察：
-  5xx
-  OOM
-  finish / terminal event
-  p50/p95 latency
-  VRAM / RSS
-  RERoT people/pens/queue/fence metrics
-  Tri drain/floor/fallback metrics
-  MTP acceptance/invalidation
-```
-
-Production 放量后重新核 `/proc/PID/maps` 和 artifact hashes，再跑：
-
-```text
-health
-9.11 / deterministic microset
-代码题
-长题
-stream
-tool call
-并发/资源压力
-```
-
-保留上一 RC 的完整 rollback artifact、service config 和 hashes。rollback 不应依赖重新编译或临时寻找旧库。
-
-### 10.14 阶段状态总表
-
-| 阶段 | 当前状态 |
-|---|---|
-| 0 Golden Baseline | 有历史强证据；当前 HEAD/artifact 仍需完整复核 |
-| **1 真实长任务闭环** | **当前主线，未通过** |
-| 2 长轨迹数值 | 有 128/512/step509 历史证据与反例；待当前 artifact 重认证 |
-| 3 Tri/Turbo/unified KV | 实现历史丰富；待四组合和压力重新认证 |
-| 4 MTP | 有隔离/状态接线；完整 epoch-aware 组合未认证 |
-| 5 RAM/checkpoint/shift/cache | 局部 checkpoint/rollback 修复已有；真实 episode 恢复矩阵未收齐 |
-| 6 Server 外层矩阵 | 若干机制已有代码；完整 multi-person/B>P/n_cmpl/stream/tool 等矩阵未收齐 |
-| 7 资源/auto-fit | B/P/K 设计与工具存在；production full-pressure 未验收 |
-| 8 质量 | 工具存在；阶段未通过 |
-| 9 性能 | 有旧 237–266 tok/s 历史数据；未达到/认证最终 >=500 门 |
-| 10 Soak | 未完成正式长稳 |
-| 11 Artifact sealing | 有历史证据采集方法；未形成当前 RC |
-| 12 Release | 未获发布许可 |
-
-阶段推进纪律只有两条：第一，**前一阶段没过，不准用后一阶段的局部成绩替它盖章**；第二，出现 regression 先缩到固定 tape / 固定 state / 固定 artifact，而不是回去调 prompt 或 stop 条件。
-
-## 11. 测试、工具和统计口径
-
-### 11.1 源码导航
-
-| 范围 | 入口 |
-|---|---|
-| 树/view/DDVR/visibility | [src/llama-rerot.h](src/llama-rerot.h)、[src/llama-rerot.cpp](src/llama-rerot.cpp) |
-| KV metadata / compaction / reclaim | [src/llama-kv-cells.h](src/llama-kv-cells.h)、[src/llama-kv-cache.cpp](src/llama-kv-cache.cpp) |
-| recurrent / snapshot / hand seed | [src/llama-memory-recurrent.cpp](src/llama-memory-recurrent.cpp)、[src/models/delta-net-base.cpp](src/models/delta-net-base.cpp) |
-| context / graph / state | [src/llama-context.cpp](src/llama-context.cpp)、[src/llama-graph.cpp](src/llama-graph.cpp) |
-| parser / queue / protocol / fence | [tools/server/server-rerot.h](tools/server/server-rerot.h)、[tools/server/server-rerot.cpp](tools/server/server-rerot.cpp) |
-| server 接线、sampler、pressure、response | [tools/server/server-context.cpp](tools/server/server-context.cpp) |
-| 容量与参数 | [common/fit.cpp](common/fit.cpp)、[common/common.cpp](common/common.cpp)、[common/arg.cpp](common/arg.cpp) |
-
-### 11.2 分层验证，不把诊断程序当质量门
-
-无模型测试覆盖 parser、PAC-DFS、DDVR、recurrent、runtime、KV cells 与 Tri score。以下是原审计使用的 focused 构建/运行方式，**不是本次已经执行的结果**；其中 direct attention/recurrent 可能使用 Vulkan，仍须遵守真机安全约束：
-
-```bash
-cmake --build build-vulkan-localhost --target \
-  llama-server test-rerot-parser test-rerot-view test-rerot-ddvr \
-  test-rerot-recurrent test-rerot-attn test-rerot-runtime \
-  test-kv-cells test-triattention-score -j6
-ctest --test-dir build-vulkan-localhost \
-  -R 'rerot|kv-cells|triattention-score' --output-on-failure
-build-vulkan-localhost/bin/test-rerot-recurrent
-build-vulkan-localhost/bin/test-rerot-attn
-git diff --check
-```
-
-CTest 的 8/8、9/9 是历史测试集快照，不是永久应有项数。显式设备门在没有 GPU 时不能 skip-success；必须保留直接运行的 device、数值和 exit code。比较器应拒绝空输出、长度不同和 NaN/Inf。
-
-整模型诊断入口是 [test-rerot-model-single.cpp](tests/test-rerot-model-single.cpp)、[test-rerot-model-batch.cpp](tests/test-rerot-model-batch.cpp)、[test-rerot-model-permute.cpp](tests/test-rerot-model-permute.cpp)。需要本地模型，运行前读各自 CLI；不能把 `model-batch` 调用成功/有限值的 exit 0 当作所有误差已过门。strict fixed-tape 检查与显式 `--report-only` 必须分开。
-
-数值分三层：同一配置的 native-vs-native determinism 要求 mismatch=0；RERoT single-lane vs native 检查 sampled-decision/argmax mismatch=0；再报告 logits rel L2 与 activation error，不能只因误差“小”就忽略跨过采样决策边界。
-
-| 脚本 | 用途和限制 |
-|---|---|
-| [rerot-semantic-smoke.py](scripts/rerot-semantic-smoke.py) | 真实模型生命周期与完整证据；不自动评答案正确性 |
-| [rerot-continents-benchmark.py](scripts/rerot-continents-benchmark.py) | 已有服务采集/离线粗查；八项与全文关键词评分局限见第 7 节 |
-| [rerot-audit-replay.py](scripts/rerot-audit-replay.py) | 同一捕获 RBB 输入独立重放，避免比较已分叉自回归轨迹 |
-| [rerot-attention-audit.py](scripts/rerot-attention-audit.py) | reader attention 分布审计；按实际支持的 tensor/KV 格式解释，不冒解 Turbo 为 F16 |
-| [rerot-throughput-gate.py](scripts/rerot-throughput-gate.py) | 同 prompt/seed/采样配置下统计吞吐与计数门，不代替质量验收 |
-| [rerot-capacity-matrix.py](scripts/rerot-capacity-matrix.py) | people/pens/容量分配形状测试入口；当前配置与覆盖范围须逐次记录 |
-| [rerot-phase8-quality.py](scripts/rerot-phase8-quality.py) | 质量集工具；名称中的 Phase 8 不代表当前项目阶段 |
-
-### 11.3 Token 与吞吐不能混账
+旧口径仍可参考：
 
 ```text
 request-wide aggregate =
-  Δrerot_completed_model_tokens / Δrerot_completed_episode_seconds
+  completed model work / completed episode seconds
 
 parallel aggregate =
-  Δrerot_parallel_model_tokens / Δrerot_parallel_seconds
+  parallel model work / parallel seconds
 
-single-Lane baseline =
-  timings.predicted_n / timings.predicted_ms * 1000
+single-lane baseline =
+  predicted_n / predicted_ms * 1000
 ```
 
-同一已完成 episode 的 model tokens 要与 PUBLIC + PRIVATE + PENDING committed counters 核对；failed/cancelled episode 不混入 completed 的分子分母。visibility 计数与 sampled/forced 是不同维度，不把所有 PENDING 简单视为“非采样 token”。API usage 与 forced runtime work 要分别报告；不能把 sampled-only `predicted_n` 称为 RERoT 总吞吐。
+但 DAG 还要单独报告：
 
-计数全局共享时，要隔离测试流量或精确归属请求，避免别人的 metrics 增量混进报告。审计读回、fixed-tape、强制 counterfactual、研究 ablation 与正式速度测试分开。
+- useful BODY+synthesis sampled tokens；
+- probe/frame/source-control forced work；
+- W>P state swap；
+- routing overhead；
+- goodput / completed responses/s。
 
-观测至少覆盖 episode 完成/abort、nodes/queue、people/pens、frontiers、topology refresh、visibility tokens、final fences、MTP invalidations、context shifts、brain/hand/scratch bytes、KV refs 和原有 Tri metrics。person/node id 放关联日志，不做高基数 metric labels；默认日志不输出完整 PRIVATE 推理。
+不能通过把 FRAME/probe forced token 算进 useful reasoning，制造更高 tok/s。
 
-### 11.4 必须长期保留的属性测试矩阵
+### 16.3 metrics
 
-这组不是一次性调试清单，而是设计不变量的 executable form。具体 case 可以增加，下面的语义不能删掉。
-
-**PAC-DFS / document**
+至少能观测：
 
 ```text
-单层 2/3/4 children
-3 层以上 nested tree
-reader 位于不同 leaf
-off-path writer 追加内容时旧 subtree 顺序不洗牌
-每个可见 PUBLIC token exactly once
-virtual positions 连续且无重复
-retired / queued / suspended node 不破坏文档顺序
+episodes active/completed/aborted
+routing simple/dag/invalid
+probe tokens/time
+DAG nodes/edges/max width/max depth
+blocked/eligible/starting/running/sealed
+W logical active
+P bound pens
+frontiers
+FRAME/BODY/SOURCE_END tokens
+publish/topology/layout epochs
+MTP invalidation reasons
+Tri reclaim/compaction existing metrics
+RAM save/restore
+context shifts
+orphan count
+final synthesis starts/completes
 ```
 
-**DDVR / attention**
+不要给 person/node ID 做高基数 Prometheus label；关联信息放日志。
+
+---
+
+## 17. 真机安全与发布纪律
+
+### 17.1 真机顺序
+
+1. 先纯 CPU parser/DAG/frame reference。
+2. 再 CPU/state fixture。
+3. 再最小真实模型单 worker。
+4. 再少量 multi-lane。
+5. 再单一增加 Tri/Turbo/MTP/RAM 变量。
+6. 最后才 full context / W>P / pressure。
+
+不要同时打开最大 context、最大 W/P、Tri、MTP 和长输出做第一次验证。
+
+禁止通过 OOM/driver reset 探 auto-fit 极限；测试前检查后台 GPU 服务与目标进程，不随意停生产或叠加未知显存负载。
+
+### 17.2 一个结果何时算证据
+
+必须能回答：
 
 ```text
-equal / unequal span lengths
-storage position overlap
-private gaps
-sparse physical indices
-compaction before / after
-Qwen3.5 text IMRoPE (p,p,p,0)
-GQA
-head-dim padding / stride
-F16 / Turbo4+Turbo2
-CPU independent reference vs Vulkan
-one global softmax across all visible spans
-STRONG barrier-after / LAG1 timing
+which source/patch?
+which binary and mapped libraries?
+which model/template/adapter?
+which full args?
+which prompt/seed/routing plan?
+which response/events/metrics?
+which exit code?
 ```
 
-**recurrent / state**
+只有 HTTP 200、CTest 绿、编译成功、脚本名带 phase、commit message 写 “complete” 都不足以单独证明功能完成。
+
+### 17.3 设计红线
+
+以后发现自己准备做以下任何一条，先停：
+
+- [ ] 把 random Base62 close 重新作为 DAG worker 正式退出协议。
+- [ ] 让最后一个 child 接管最终用户回答。
+- [ ] 扫 reader 拼接文本里的 `</think>` 来判当前 worker 完成。
+- [ ] 把 runtime FRAME 中的 close 当 source completion。
+- [ ] 把 SOURCE_END 从真实源 state 中撤销，只因为 foreign view 不显示。
+- [ ] 每 peer BODY append 都重新 forward fixed entry/footer。
+- [ ] 再造动态 footer/footer checkpoint 子系统。
+- [ ] 只让当前 RUNNING peers 可见，导致刚 RETIRED 的 PUBLIC history 消失。
+- [ ] 只渲染 hard ancestors，丢掉无硬依赖但已发布的共享知识。
+- [ ] 让 tree parent 同时表示 DAG dependency、state parent 和 ownership。
+- [ ] 让 physical slot/seq 决定 child seed 或 reader 顺序。
+- [ ] W>P 时让前 P 个完整跑完再启动剩余节点，却仍声称同一逻辑并发。
+- [ ] later physical microbatch 读取本 frontier earlier microbatch 新 PUBLIC。
+- [ ] 为 child 设强制 token 长度后伪造自然 SEALED。
+- [ ] 用 attention entropy 自动剪枝，仍把后继当依赖已满足。
+- [ ] 出错后删除依赖边继续生成一个“成功答案”。
+- [ ] 平均 predecessor recurrent state 作为默认 child init。
+- [ ] 做“跳过模型层的原生 recurrent token replay”。
+- [ ] 恢复 shared RBB 作为隐藏 fallback。
+- [ ] 为 DAG 动态改 RoPE base 来修语义问题。
+- [ ] 每 reader 复制完整 KV。
+- [ ] 每 span 独立 softmax。
+- [ ] server 持久保存 physical KV indices 作为 semantic truth。
+- [ ] context shift 切半 FRAME/current causal tail。
+- [ ] 把 Tri eviction 当逻辑 history deletion。
+- [ ] internal subagent tool call 冒充用户 tool call 发给客户端。
+- [ ] simple 恢复时只重建相同 seed sampler，不恢复完整 sampler history。
+- [ ] probe 已经发给客户端后还声称 simple 是纯净普通回答。
+- [ ] 保留旧 random-ID/tree production runtime 与新 DAG runtime 两套长期并行事实源。
+- [ ] 用 forced FRAME/probe token 提高 useful throughput 指标。
+- [ ] RERoT OFF 时改变普通 attention/recurrent/sampler/server semantics。
+
+---
+
+## 18. 何时才可以称“DAG RERoT 完成交付”
+
+至少同时满足：
+
+### 路由
 
 ```text
-default native child N=1 等价原生
-rollback slots 0 / >0 不改变未 rollback 的方程
-三 snapshot → discard suffix → resume
-PRIVATE / PENDING 不误提交 shared research brain
-root PRIVATE/PUBLIC basis switch 保持 B+H
-不同 episode / mixed visibility / row permutation 不串
-F32 hand capture/apply / SEE3 invalid input fail-closed
-shared-rbb 仅显式 ablation，不能在默认 path 偷启用
+C0 干净
+simple continuation 无 planner 污染
+dag schema/semantic validation fail-closed
 ```
 
-**visibility / publication**
-
-用固定 secret 构造：
+### DAG
 
 ```text
-PUBLIC:  R7K2
-PRIVATE: P9M4
-PENDING: X3Q8
+hard dependency exact
+cycle-preferred reader view exact
+retired PUBLIC history preserved
+node/run unique
 ```
 
-foreign reader 应在正确 frontier 后读到 PUBLIC；不能 lexical 读取 PRIVATE；PENDING 在完整提交前完全不可见，提交后作为完整 record 可见。错误 episode id 永远不可见。
-
-**queue / scheduler**
+### Protocol
 
 ```text
-2 pens，parent 产生 8 children
-8 descriptor 全创建
-只有资源允许的 child admission
-其余保持 FIFO
-后 admission child 看得到等待期间新提交的 PUBLIC memory
-child > P 不丢任务
-B > P 有 aging / fairness
-换 pen / row order / batch packing 不改变 logical result
+actual model-template fixed FRAME
+FRAME forward once
+native source-end provenance exact
+no double close
+no internal frame/tool leakage
 ```
 
-**close / final fence**
+### State
 
 ```text
-delimiter 跨 tokenizer token
-错误 ID / sibling ID / 大小写不符不能 close
-正文可多行、多段、代码块、普通 HTML
-restore 后 ID 和 parser partial state 不变
-queue 非空不能 final
-simultaneous exits deterministic
-倒数第二 Lane 最后写 SECRET42
-final survivor 的 replay 必须在 stable view 中看到 SECRET42
-fence prepare/replay/metrics/stream exactly once
+C_base accurate
+native lane-local recurrence
+physical row/pen independent
+W active state fully retained/restored
 ```
 
-**server / transport**
+### Scheduling
 
 ```text
-OpenAI Chat Completions
-Responses API
-Anthropic-compatible surface（若当前 server 支持）
-stream / non-stream
-cancel / retry
-n_cmpl
-shared-prefix
-tool / JSON grammar
-hard abort
+W>P logical cohort correct
+physical microbatch does not change read world/math
+frontier atomic
+seal exactly once
 ```
 
-对所有 surface，PRIVATE/random ID 不出现在公开响应；reasoning/content 不串；自然 stop、length、cancel、hard abort 不互相伪装；每个 response 恰好一个终止事件。
-
-**资源 / compatibility**
+### Final
 
 ```text
-FullKV / Turbo / Tri / Tri+Turbo
-MTP no-update / invalidation / rollback / final fence
-RAM restore to different physical rows
-context shift
-preemption / pen yield
-shared physical union
-auto-fit selected B/P/K vs allocator peak
+all workers SEALED
+new 0.synthesize stage
+stable final view
+new F_0s forward + new logits
+ordinary user grammar/tool/content resumes
 ```
 
-如果某个功能只能靠删除这些 case 才“通过”，应视为设计 regression，而不是测试太严格。
+### Ecosystem
 
-## 12. 发布、证据与文档维护
+```text
+Tri/Turbo/MTP/RAM/shift/preemption/shared-prefix/n_cmpl/stream/tool/LoRA/multimodal
+all have explicit target-artifact evidence
+```
 
-一个通过结果必须能回答：**哪份源码、哪个模型、什么配置、实际加载哪组库、跑了什么输入、输出和退出状态是什么？**
+### Production
 
-每轮保存 Git HEAD/status/source.patch、compiler/CMake、server version、完整启动参数、请求/seed/预算、response/reasoning/usage、metrics、日志/trie；记录 launcher、server impl、libllama、libggml/base/Vulkan/CPU、common、mtmd，以及模型和 Tri calibration 的 SHA/fingerprint。运行前后 hashes 一致，并通过 `/proc/PID/maps` 核实实际加载的 `.so`，不能只 hash 构建目录里的同名文件。
+```text
+quality non-regression/benefit threshold frozen before run
+performance target measured honestly
+soak stable
+artifact hashes sealed
+shadow/canary/production same RC
+```
 
-rebuild 或换库后，旧 artifact 验收失效，相关门必须在新 artifact 上重跑。build 通过不是部署许可；旧 build number 或同一个 Git HEAD 也不代表 dirty worktree 与加载库完全一致。
+做到这里，才可以称：
 
-最终先 shadow，再少量 canary，确认 5xx/OOM/finish/latency/VRAM/RERoT/Tri/MTP 指标后放量；同一 artifact 完成 health、短题、代码、长题、stream、tool、并发验证，保留上一完整 RC 回滚包。本文没有宣称今天的服务 active 或 inactive。
+```text
+atomic-llama-cpp-turboquant
+production-compatible adaptive DAG RERoT
+```
 
-### 12.1 原始记录去哪里找
+在此之前，标签应更保守：
 
-本次合并前的四份原文都保存在 Git 提交 `47432e525`。需要完整旧公式推演、逐轮实验表、临时证据目录、原始部署 hashes 或已淘汰设计时，直接查看历史，而不再维护第二份“当前状态”：
+```text
+DAG RERoT implementation candidate
+```
+
+---
+
+## 19. 源码与测试入口
+
+| 范围 | 入口 |
+|---|---|
+| DAG document/view/DDVR | `src/llama-rerot.h`, `src/llama-rerot.cpp` |
+| KV metadata/residency | `src/llama-kv-cells.h`, `src/llama-kv-cache.cpp` |
+| recurrent/checkpoint/hand | `src/llama-memory-recurrent.*`, model GDN builders |
+| runtime/protocol/routing | `tools/server/server-rerot.h`, `tools/server/server-rerot.cpp` |
+| server decode/wiring | `tools/server/server-context.cpp` |
+| chat template | `common/chat.*`, server template integration |
+| schema→grammar | `common/json-schema-to-grammar.*` |
+| DAG offline oracle | `scripts/rerot-dag-reference.py` |
+| parser tests | `tests/test-rerot-parser.cpp` |
+| view tests | `tests/test-rerot-view.cpp` |
+| runtime tests | `tests/test-rerot-runtime.cpp` |
+| DDVR | `tests/test-rerot-ddvr.cpp` |
+| attention | `tests/test-rerot-attn.cpp` |
+| recurrent | `tests/test-rerot-recurrent.cpp` |
+| model fixed-tape | `tests/test-rerot-model-single.cpp`, `test-rerot-model-batch.cpp`, `test-rerot-model-permute.cpp` |
+
+纯文档/源码核对后常用的低风险检查：
 
 ```bash
-git show '47432e525:AGENTS.md'
-git show '47432e525:RERoT指南.md'
-git show '47432e525:RERoT数学与语义审计.md'
-git show '47432e525:下班交接.md'
+python3 scripts/rerot-dag-reference.py
+git diff --check
 ```
 
-关键定位：`7509335d1` 是历史 core candidate；`32e36c3a3` 记录物理 barrier 与第一人称提示修复；`3355b7c23` 是 active RERoT 的 draft-mirroring 隔离；`0c7fef45c` 移除 Phase 1 评测中的 Tri/MTP 干扰；`535ac8cfa` 明确把进度退回 Phase 1；`0374d3eb0` / `47432e525` 是当前 HEAD 附近的 Vulkan MoE 约束/回退。提交存在只能证明改动记录存在，测试通过仍要看对应 artifact 的结果。
+是否执行 C++ test 前仍要确认构建配置和 backend；不要仅凭测试名假定不会初始化 Vulkan。
 
-### 12.2 以后怎么更新
+---
 
-新增证据时先改第 1 节的状态，再补第 8 节的输入、配置、artifact、结果和边界；阶段真正通过后才改第 10 节。默认算法或协议改变时直接改对应正文，不在文末再追加一条与正文相反的“最新规范”。
+## 20. 历史资料与维护规则
 
-未验证的实现写“已实现、待验收”；历史通过写清版本；失败保留最小复现；研究开关不混进默认配置。`AGENTS.md` 只留安全要求和本文入口，不再存路线图；不再新增每日交接作为竞争事实源。
+旧 Ring 设计、旧审计和旧交接在 Git 历史里仍可用于追 bug，但不再与本文竞争“当前产品语义”。
 
-## 13. 设计红线：这些做法不要再引入
+重要历史锚点：
 
-这部分保留原指南中最有价值的“反模式”清单。发现实现准备走到其中任何一条，应先证明为什么旧的不变量已经不适用，而不是静默改变架构。
+```text
+7509335d1  old RERoT Core Correctness Candidate
+535ac8cfa  old plan reset to Ring Phase 1
+47432e525  before DAG cutover commits
+c3648d789  DAG logical/view/fixed-entry implementation
+4e7769152  DAG routing/server wiring
+```
 
-- 不给每个 Lane 预留固定 KV 长度，也不按 person/pen 静态切统一 KV 池。
-- 不让两个可见 token 占同一个 reader virtual position。
-- 不为 DDVR 每 frontier 搬整份 K cache，也不为每个 reader 复制完整 KV。
-- 不做 per-span 独立 softmax 再相加；一个 reader/head 必须是一个全局 softmax。
-- 不用普通 `seq_has(reader)` 代替 RERoT PUBLIC visibility。
-- 不在 server 维护第二份长期 physical-cell-index registry；physical metadata 只能跟 `llama_kv_cells` 或稳定 logical id 走。
-- 不把 `server_slot.id == node_id == exec_seq == pen_id` 当语义，只能作为过渡实现偶然相等。
-- 不把 queued child 当完整运行 Lane 提前复制 GPU KV / full recurrent state。
-- 不设置隐藏 per-person pen cap；单 person 空闲时可以使用全部全局 P。
-- 不把 `n_batch`、`n_ubatch`、reader tile 或 shader specialization 当逻辑 Lane 上限。
-- 不因 child 太多静默截断 `<li>`；资源不足要排队或明确 HARD_ABORT。
-- 不给 child/depth 增加“为了防循环”的私有 token budget 来冒充自然 completion。
-- 不用 EOG、换行、重复次数、timeout 或题目专用 stop 替代 exact owner `</ID>`。
-- 不把普通 worker 正文里的 `<ol>` 当隐式 fork；拓扑变化只能来自显式 planner phase。
-- 不解析、补写或劫持模型原生 `<think></think>` 作为 RERoT scheduler 协议。
-- 不把 PRIVATE 宣传成安全隔离，也不假设恢复 fork seed 能逆掉私有指令影响。
-- 不恢复旧 snapshot 覆盖当前 conv/local recurrent/hand，只为“清理”控制 prompt。
-- 不让同一 frontier 的 peer PUBLIC 在联合 forward 内同拍互读；STRONG 是 barrier-after。
-- 不因 batch shape、是否有 PRIVATE row、row order 或 rollback slots 改变 recurrent 算法。
-- 不把 beta=0 clamp 成小正数；关闭的 write gate 必须真关闭。
-- 不以 NaN/空输出/长度不符的比较器结果当零误差通过。
-- 不把 shared RBB 研究模式作为默认动态 fallback；算法切换必须显式、可复现、可审计。
-- 不为 foreign token 默认做 O(N²) 全网 replay 作为“正确性修复”。
-- 不把 Tri eviction 和 context shift 混成一个动作：前者是物理 residency 压缩，后者是逻辑 history deletion。
-- 不在 recurrent-only / brain / hand pressure 下调用 Tri。
-- 不让 MTP draft 穿越已变化的 reader view / publish/topology/layout epoch。
-- 不只保存一个 server slot 就宣称 RAM restore 支持 RERoT；保存单位必须覆盖完整 episode 语义。
-- 不只 preempt 一个 Lane 后让 sibling 继续假装 episode 完整，除非显式实现并验收 subtree/pen yield 语义。
-- 不把 sibling PUBLIC token 机械塞进本 Lane repetition penalty history；共享影响应主要通过模型 memory/logits。
-- 不为了 RERoT 强行 batch 原本 adapter/backend 不兼容的请求。
-- 不把多模态 spatial position 当 text DDVR position 重排。
-- 不让 embedding/rerank 因全局 RERoT flag 进入 generation runtime。
-- 不在 graph reuse 时让 span/view/frontier input 指向已被下一轮覆写的 buffer。
-- 不以 capability fallback 的“能跑”代替生产 backend 的正确 DDVR/Turbo 实现。
-- 不在 CPU 数学/reference 还没过时先靠 Vulkan shader 调参猜正确性。
-- 不再加入 merge/judge agent 选择“最好答案”；final survivor 由生命周期决定，不由质量打分决定。
-- 不让模型看到硬件 slot/Lane 数、tree path 等调度角色提示，除非明确做研究 ablation。
-- 不把 HTTP 200、CTest summary、keyword score、throughput 单独当成“RERoT 通过”。
-- 不在 performance regression 时先改 prompt、seed、预算、质量阈值或统计口径。
-- 不在 rebuild 后沿用旧 artifact 的验收结果。
+需要旧文件原文可从对应 commit `git show <commit>:<path>` 获取，不把旧文本重新复制回仓库作为第二事实源。
 
-最后压成一句话：
+以后更新本文遵守：
 
-> **同一个 logical computation 不能因为 backend、batch packing、slot/pen 分配、压力处理或恢复路径不同而静默换方程；同一个外部请求也不能因为 RERoT 的内部并行而失去原 server 的生命周期与兼容语义。**
+1. **先改第 1/13 节当前状态，再改阶段状态。**
+2. 设计变化直接改正文，不在文末追加与正文冲突的“最新补丁”。
+3. “已实现”与“已通过”分开。
+4. 历史数字保留 artifact/version 边界。
+5. 研究假说不升级为默认 fallback，除非有明确决定和门。
+6. 不再新增新的 RERoT 指南/审计/交接作为并行事实源。

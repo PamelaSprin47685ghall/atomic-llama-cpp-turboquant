@@ -322,7 +322,8 @@ std::vector<llama_rerot_node_id> llama_rerot_document::topo_sort_cycle_preferred
 
 llama_rerot_reader_view llama_rerot_document::build_dag_view(
         llama_rerot_node_id reader,
-        const std::vector<llama_rerot_node_id> & started_nodes) const {
+        const std::vector<llama_rerot_node_id> & started_nodes,
+        uint64_t frozen_read_publish_epoch) const {
     if (reader >= nodes_.size()) {
         throw std::out_of_range("RERoT reader node does not exist");
     }
@@ -349,11 +350,20 @@ llama_rerot_reader_view llama_rerot_document::build_dag_view(
 
     llama_pos virtual_pos = 0;
 
-    // 1. Root node (0.plan / public prefix) always comes first
-    for (const auto run_id : nodes_[0].runs) {
-        const auto & current_run = runs_[run_id];
+    const auto append_visible_run = [&](const llama_rerot_run & current_run) {
         if (!run_visible_to(current_run, reader) || current_run.token_count == 0) {
-            continue;
+            return;
+        }
+        // Frozen logical-step read version (AGENTS.md §06.3): omit every
+        // foreign PUBLIC run published after the snapshot — BODY and FRAME
+        // alike — so later slices cannot observe this step's cohort writes.
+        // Only the reader's own runs (including its current FRAME) are
+        // exempt. Root P predates any freeze snapshot, so it is unaffected.
+        if (frozen_read_publish_epoch != 0 &&
+            current_run.owner != reader &&
+            current_run.visibility == llama_rerot_visibility::public_live &&
+            current_run.publish_epoch > frozen_read_publish_epoch) {
+            return;
         }
         result.runs.push_back({
             current_run.id,
@@ -364,6 +374,11 @@ llama_rerot_reader_view llama_rerot_document::build_dag_view(
             current_run.publish_epoch,
         });
         virtual_pos += static_cast<llama_pos>(current_run.token_count);
+    };
+
+    // 1. Root node (0.plan / public prefix) always comes first
+    for (const auto run_id : nodes_[0].runs) {
+        append_visible_run(runs_[run_id]);
     }
 
     // 2. Compute cycle-preferred topological sort for started worker nodes (excluding 0)
@@ -379,17 +394,17 @@ llama_rerot_reader_view llama_rerot_document::build_dag_view(
         std::string err;
         std::vector<llama_rerot_node_id> ordered_workers;
         if (reader == 0) {
-            // Synthesis reader: order by plan_rank preserving DAG dependencies
-            // We use the node with lowest priority as anchor or sort
-            // Setting candidate with highest plan_rank or lowest plan_rank?
-            // If reader == 0, reader is not in workers, so we find topological sort of workers.
-            // When there are no dependencies, we want (1, 2, 3) in order.
-            // Using workers.back() as anchor will put workers.front() at the beginning.
-            // To produce exact plan_order (1, 2, 3...) when independent:
-            // cycle_priority when dummy reader is workers.back():
-            // reader_idx = N-1; cycle_priority has elements before reader: (0..N-2), then N-1!
-            // That is exactly (1, 2, 3...)!
-            ordered_workers = topo_sort_cycle_preferred(workers, workers.back(), &err);
+            // Synthesis reader: plan-rank order subject to DAG dependencies.
+            // The reader (0) is not among the workers, so anchor the cycle
+            // priority on the max-rank worker: its cycle list is exactly the
+            // plan order, independent of the caller's started_nodes order.
+            auto anchor = workers.front();
+            for (const auto nid : workers) {
+                if (nodes_[nid].plan_rank > nodes_[anchor].plan_rank) {
+                    anchor = nid;
+                }
+            }
+            ordered_workers = topo_sort_cycle_preferred(workers, anchor, &err);
         } else {
             ordered_workers = topo_sort_cycle_preferred(workers, reader, &err);
         }
@@ -400,19 +415,7 @@ llama_rerot_reader_view llama_rerot_document::build_dag_view(
         for (const auto nid : ordered_workers) {
             const auto & node = nodes_[nid];
             for (const auto run_id : node.runs) {
-                const auto & current_run = runs_[run_id];
-                if (!run_visible_to(current_run, reader) || current_run.token_count == 0) {
-                    continue;
-                }
-                result.runs.push_back({
-                    current_run.id,
-                    current_run.owner,
-                    current_run.storage_pos0,
-                    virtual_pos,
-                    current_run.token_count,
-                    current_run.publish_epoch,
-                });
-                virtual_pos += static_cast<llama_pos>(current_run.token_count);
+                append_visible_run(runs_[run_id]);
             }
         }
     }
