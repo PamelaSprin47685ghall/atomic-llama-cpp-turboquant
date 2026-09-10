@@ -4925,6 +4925,202 @@ static void test_dag_diamond_and_unequal_length_history() {
     CHECK(ep->document.run(run_4)->token_count == 4);
 }
 
+static void test_dag_a_to_c_with_b_independent_overlap() {
+    // AGENTS.md stage 6 minimal workload 2 (RERoT.md §12.7): A->C with B
+    // independent. Verifies gated unlock of C on A's seal, B/C execution
+    // overlap, and completed-node history retention in peer views.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(4);
+
+    const uint64_t ep_id = runtime.adopt_root(42, 42, 0, 1, 0);
+    CHECK(ep_id != 0);
+
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Fact C"}
+        ],
+        "depends_on": [
+          {"id": "C", "depends_on_id": "A"}
+        ]
+      }
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->is_dag);
+    CHECK(ep->synthesis_node != 0);
+    CHECK(ep->synthesis_node != LLAMA_REROT_NODE_INVALID);
+    CHECK(ep->nodes[1].remaining_preds == 0);
+    CHECK(ep->nodes[2].remaining_preds == 0);
+    CHECK(ep->nodes[3].remaining_preds == 1);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 3);
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(ep->c_base.valid());
+
+    // Initial eligibility: A (1) and B (2) only; C (3) is blocked on A.
+    auto eligible = runtime.get_eligible_dag_nodes(ep_id);
+    CHECK(eligible.size() == 2);
+    CHECK(std::find(eligible.begin(), eligible.end(), 1) != eligible.end());
+    CHECK(std::find(eligible.begin(), eligible.end(), 2) != eligible.end());
+    CHECK(std::find(eligible.begin(), eligible.end(), 3) == eligible.end());
+    CHECK(std::find(eligible.begin(), eligible.end(), ep->synthesis_node) == eligible.end());
+
+    auto pen_a = runtime.allocate_pen(42, ep_id, 1);
+    CHECK(pen_a.has_value());
+    CHECK(ep->document.set_node_state(1, llama_rerot_node_state::running));
+    ep->running.insert(1);
+    ep->nodes[1].pen_id = *pen_a;
+
+    auto pen_b = runtime.allocate_pen(42, ep_id, 2);
+    CHECK(pen_b.has_value());
+    CHECK(ep->document.set_node_state(2, llama_rerot_node_state::running));
+    ep->running.insert(2);
+    ep->nodes[2].pen_id = *pen_b;
+
+    // First wave: shared prefix plus one public run per admitted lane.
+    // All runs share publish epoch 1 so the frozen read watermark captured by
+    // finish_frontier never gates them: this test pins gating/overlap, not frozen gating.
+    const auto run_p = ep->document.append_run(0, llama_rerot_visibility::public_live, 0, 10, 1);
+    const auto run_a = ep->document.append_run(1, llama_rerot_visibility::public_live, 10, 5, 1);
+    const auto run_b1 = ep->document.append_run(2, llama_rerot_visibility::public_live, 15, 8, 1);
+    CHECK(run_p != LLAMA_REROT_RUN_INVALID);
+    CHECK(run_a != LLAMA_REROT_RUN_INVALID);
+    CHECK(run_b1 != LLAMA_REROT_RUN_INVALID);
+
+    // A finishes and seals while B is still running: C unlocks, B unaffected.
+    CHECK(runtime.seal_dag_node(ep_id, 1, llama_rerot_event_origin::worker_source));
+    CHECK(ep->nodes[1].is_sealed);
+    CHECK(ep->document.node(1)->state == llama_rerot_node_state::retired);
+    CHECK(ep->nodes[3].remaining_preds == 0);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 2);
+    CHECK(!ep->nodes[2].is_sealed);
+    CHECK(ep->running.count(2) == 1);
+    CHECK(ep->document.node(2)->state == llama_rerot_node_state::running);
+    eligible = runtime.get_eligible_dag_nodes(ep_id);
+    CHECK(eligible.size() == 1);
+    CHECK(eligible[0] == 3);
+
+    // Start C while B keeps running: genuine B/C execution overlap.
+    auto pen_c = runtime.allocate_pen(42, ep_id, 3);
+    CHECK(pen_c.has_value());
+    CHECK(ep->document.set_node_state(3, llama_rerot_node_state::running));
+    ep->running.insert(3);
+    ep->nodes[3].pen_id = *pen_c;
+    const auto run_c = ep->document.append_run(3, llama_rerot_visibility::public_live, 23, 6, 1);
+    const auto run_b2 = ep->document.append_run(2, llama_rerot_visibility::public_live, 29, 4, 1);
+    CHECK(run_c != LLAMA_REROT_RUN_INVALID);
+    CHECK(run_b2 != LLAMA_REROT_RUN_INVALID);
+
+    // B and C overlap in execution.
+    CHECK(ep->running.count(2) == 1);
+    CHECK(ep->running.count(3) == 1);
+    CHECK(ep->document.node(2)->state == llama_rerot_node_state::running);
+    CHECK(ep->document.node(3)->state == llama_rerot_node_state::running);
+
+    // Reader 2 (B): sealed A history is retained and visible, C is visible,
+    // own runs are last. Cycle-preferred topo order anchored at 2 with the
+    // 1->3 edge is [1,3,2].
+    const auto view_b = runtime.build_dag_view_for_reader(ep_id, 2);
+    CHECK(view_b.runs.size() == 5);
+    CHECK(view_b.runs[0].owner == 0);
+    CHECK(view_b.runs[1].owner == 1);
+    CHECK(view_b.runs[2].owner == 3);
+    CHECK(view_b.runs[3].owner == 2);
+    CHECK(view_b.runs[4].owner == 2);
+    CHECK(dag_view_has_run(view_b, run_p));
+    CHECK(dag_view_has_run(view_b, run_a));
+    CHECK(dag_view_has_run(view_b, run_b1));
+    CHECK(dag_view_has_run(view_b, run_b2));
+    CHECK(dag_view_has_run(view_b, run_c));
+    CHECK(ep->document.run(run_a)->token_count == 5);
+    CHECK(ep->document.run(run_b1)->token_count == 8);
+    CHECK(ep->document.run(run_c)->token_count == 6);
+    CHECK(ep->document.run(run_b2)->token_count == 4);
+    CHECK(view_b.query_virtual_pos == 33);
+
+    // Reader 3 (C): predecessor A first, concurrent peer B visible, own run last.
+    const auto view_c = runtime.build_dag_view_for_reader(ep_id, 3);
+    CHECK(view_c.runs.size() == 5);
+    CHECK(view_c.runs[0].owner == 0);
+    CHECK(view_c.runs[1].owner == 1);
+    CHECK(view_c.runs[2].owner == 2);
+    CHECK(view_c.runs[3].owner == 2);
+    CHECK(view_c.runs[4].owner == 3);
+    CHECK(dag_view_has_run(view_c, run_p));
+    CHECK(dag_view_has_run(view_c, run_a));
+    CHECK(dag_view_has_run(view_c, run_b1));
+    CHECK(dag_view_has_run(view_c, run_b2));
+    CHECK(dag_view_has_run(view_c, run_c));
+    CHECK(view_c.query_virtual_pos == 33);
+
+    // Seal B: synthesis still blocked on C.
+    CHECK(runtime.seal_dag_node(ep_id, 2, llama_rerot_event_origin::worker_source));
+    CHECK(ep->nodes[2].is_sealed);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 1);
+    eligible = runtime.get_eligible_dag_nodes(ep_id);
+    CHECK(eligible.empty());
+
+    // Seal C: synthesis becomes eligible.
+    CHECK(runtime.seal_dag_node(ep_id, 3, llama_rerot_event_origin::worker_source));
+    CHECK(ep->nodes[3].is_sealed);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 0);
+    eligible = runtime.get_eligible_dag_nodes(ep_id);
+    CHECK(eligible.size() == 1);
+    CHECK(eligible[0] == ep->synthesis_node);
+
+    // Synthesis sees every worker in plan order with the 1->3 edge preserved:
+    // A and C appear exactly once; B appears twice (two overlap waves).
+    const auto view_s = runtime.build_dag_view_for_reader(ep_id, 0);
+    CHECK(view_s.runs.size() == 5);
+    CHECK(view_s.runs[0].owner == 0);
+    CHECK(view_s.runs[1].owner == 1);
+    CHECK(view_s.runs[2].owner == 2);
+    CHECK(view_s.runs[3].owner == 2);
+    CHECK(view_s.runs[4].owner == 3);
+    size_t synth_1 = 0;
+    size_t synth_2 = 0;
+    size_t synth_3 = 0;
+    for (const auto & entry : view_s.runs) {
+        synth_1 += (entry.owner == 1) ? 1 : 0;
+        synth_2 += (entry.owner == 2) ? 1 : 0;
+        synth_3 += (entry.owner == 3) ? 1 : 0;
+    }
+    CHECK(synth_1 == 1);
+    CHECK(synth_2 == 2);
+    CHECK(synth_3 == 1);
+    CHECK(dag_view_has_run(view_s, run_p));
+    CHECK(dag_view_has_run(view_s, run_a));
+    CHECK(dag_view_has_run(view_s, run_b1));
+    CHECK(dag_view_has_run(view_s, run_b2));
+    CHECK(dag_view_has_run(view_s, run_c));
+    CHECK(view_s.query_virtual_pos == 33);
+    CHECK(ep->document.run(run_a)->token_count == 5);
+    CHECK(ep->document.run(run_b1)->token_count == 8);
+    CHECK(ep->document.run(run_b2)->token_count == 4);
+    CHECK(ep->document.run(run_c)->token_count == 6);
+
+    const auto synth = ep->synthesis_node;
+    const auto fr = runtime.finish_frontier(ep_id);
+    CHECK(!fr.hard_aborted);
+    CHECK(fr.synthesis_node == synth);
+    ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    const auto view_s2 = runtime.build_dag_view_for_reader(ep_id, 0);
+    CHECK(view_s2.runs.size() == 5);
+    CHECK(ep->document.run(run_a)->token_count == 5);
+    CHECK(ep->document.run(run_b1)->token_count == 8);
+    CHECK(ep->document.run(run_b2)->token_count == 4);
+    CHECK(ep->document.run(run_c)->token_count == 6);
+}
+
 static void test_dag_initialize_refuses_double_init() {
     server_rerot_runtime runtime(nullptr);
     runtime.set_pen_capacity(2);
@@ -4977,6 +5173,7 @@ int main() {
     test_dag_initialize_refuses_double_init();
     test_dag_three_lane_flat_cycle_and_peer_uptake();
     test_dag_diamond_and_unequal_length_history();
+    test_dag_a_to_c_with_b_independent_overlap();
     test_dag_shift_pins_started_public_history();
     test_context_shift_pins_frame_runs();
     test_recurrent_only_pressure_isolation();

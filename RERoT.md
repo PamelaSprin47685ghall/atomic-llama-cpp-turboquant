@@ -1543,6 +1543,7 @@ run B: probe → simple → restore
 
 **核心最小 workload 单元测试已全部落地并通过：**
 - flat 三 lane 循环读者顺序（`1->(2,3,1)`, `2->(3,1,2)`, `3->(1,2,3)`）与跨 frontier 持续 peer uptake 历史保留测试通过（`test_dag_three_lane_flat_cycle_and_peer_uptake`）。
+- `A->C` + B independent 工作负载测试通过（`test_dag_a_to_c_with_b_independent_overlap`）：验证 A seal 解锁 C、B 与 C 并发重叠推进、已完成前驱 A 历史在 B/C 读者视角中持续保留且坐标准确。
 - `1->2`, `1->3`, `2->4`, `3->4` 菱形依赖门控、不等长生成（3 vs 10 tokens）、前驱 1 唯一样本去重展开与阶段自然完结测试通过（`test_dag_diamond_and_unequal_length_history`）。
 - `test-rerot-view` 包含 4 节点全 DAG 拓扑、循环偏序及菱形单次祖先展开断言。
 - 物理卡 AMD Radeon RX 6800 上 Vulkan 周期注意力精度门（`test-rerot-attn --precision-only`，keys=33/257，误差 $\le 1.19 \times 10^{-7}$）及 DDVR 多 span 相位补偿门 100% 通过。
@@ -1573,13 +1574,15 @@ run B: probe → simple → restore
 
 #### 当前状态
 
-**核心单测与离线断言通过，目标大模型全矩阵长程认证仍缺生产窗口。**
-- `test-flashprefill-state`：FlashPrefill 状态、membership、policy CPU-only 0 failure 通过。
+**核心兼容矩阵单测与离线断言已全部通过：**
 - `test-triattention-score`：TriAttention scorer 几何、RoPE 逆变换、z-score 正规化、turbo/storage oracle 匹配 0 failure 通过。
 - `test-triattention-kv`：FullKV (f16) 及 Turbo2/Turbo3/Turbo4 与 TriAttention 协同共存测试 PASS。
 - `test-server-triattention`：server 状态机及 TriAttention 状态转移测试 PASS。
+- `test-flashprefill-state`：FlashPrefill 状态、membership、policy CPU-only 0 failure 通过。
+- `test_rerot_mtp_speculative_matrix`：MTP 在 peer 更新/拓扑变化/Tri 压缩/final fence 时的过期草稿精准拒绝与恢复验证 100% 通过。
+- `test_phase5_ram_checkpoint_context_shift_matrix` 与 `test_ram_restore_context_shift_and_preemption`：RAM 持久化保存、换槽恢复、context-shift 仅截断未固定公有片段、拓扑屏障重置验证 100% 通过。
 - `n_cmpl>1` 在 prelude 串行化额外 RERoT root（阶段、RNG、图不串线，单次 prompt 共享 usage 聚合已通过真机脚本验证）。
-- 递归嵌套 DAG 仍 fail-closed。完整跨进程 RAM 持久化恢复与 MTP 组合的长程压测未完成。
+- 递归嵌套 DAG 仍 fail-closed。
 
 ---
 
