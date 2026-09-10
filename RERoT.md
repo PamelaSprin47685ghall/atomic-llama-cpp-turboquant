@@ -1449,7 +1449,10 @@ run B: probe → simple → restore
 
 #### 当前状态
 
-**simple 的目标模型 CPU A/B 已通过；阶段 3 尚未整体通过。** `scripts/rerot-simple-continuation-smoke.py` 对真实 Ornith 检查贪心、seeded top-3 post-sampling logprobs、用户 JSON grammar、SSE 及双 completion。choices/通道与普通路径一致，probe 不计入普通 completion；JSON 数值答案另作正确性检查。C0 首个决策从有效 logits 保存并消费一次，sampler 不重置。`capture_c_base()` 在正式 P 注入完成后覆盖 root hand_seed，并抽出 conv tails、写入 sampler prev/seed。多阶段 COW 隔离、不同物理 row 的有效状态配对、取消与跨进程恢复仍需独立证据；序列化 seed/prev 不等于完整 sampler 快照。
+**simple 的目标模型 CPU A/B 已通过；阶段 3 多项核心硬门（COW 首写隔离、probe 取消不损 C0/peer）已通过。** `scripts/rerot-simple-continuation-smoke.py` 对真实 Ornith 检查贪心、seeded top-3 post-sampling logprobs、用户 JSON grammar、SSE 及双 completion。choices/通道与普通路径一致，probe 不计入普通 completion；JSON 数值答案另作正确性检查。C0 首个决策从有效 logits 保存并消费一次，sampler 不重置。`capture_c_base()` 在正式 P 注入完成后覆盖 root hand_seed，并抽出 conv tails、写入 sampler prev/seed。针对阶段 3 约束已落实并单测验证：
+1. **多 stage C_base 状态继承与 COW 隔离**（`test_dag_capture_c_base_snapshots_current_seed`）：DAG worker 入职时从 `C_base` 继承 `hand_seed`，任意 worker 或 root 首写变动彼此隔离且不修改不可变 `C_base` 快照；
+2. **Probe 取消/中止隔离**（`test_dag_c0_probe_cancel_and_isolation`）：在 isolated probe 过程中发生的客户端取消或 hard_abort 确保干净释放 probe 内部序列，完全不损坏同请求的 C0 状态与并行的 peer episode 状态；
+不同物理 row 的有效状态配对与跨进程恢复仍需独立证据；序列化 seed/prev 不等于完整 sampler 快照。
 
 ---
 

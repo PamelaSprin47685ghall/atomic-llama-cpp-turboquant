@@ -3134,6 +3134,47 @@ static void test_dag_capture_c_base_snapshots_current_seed() {
     CHECK(ep->c_base.gdn_recurrent_states == seed);
     root->hand_seed = {1};
     CHECK(ep->c_base.gdn_recurrent_states == seed);
+
+    // Multi-stage COW and immutability (§12.4):
+    // Modifying worker or root seeds post-admission must not mutate C_base snapshot.
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [{"id": "1", "intent": "Worker 1"}, {"id": "2", "intent": "Worker 2"}],
+        "depends_on": []
+      }
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+
+    // Admit worker 1 and worker 2
+    llama_rerot_node_id a = LLAMA_REROT_NODE_INVALID;
+    llama_rerot_node_id b = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 1, 8, &a));
+    CHECK(runtime.admit_next_child(ep_id, 2, 9, &b));
+    CHECK(a == 1 && b == 2);
+    CHECK(runtime.complete_admission(ep_id, a));
+    CHECK(runtime.complete_admission(ep_id, b));
+    auto * w1 = runtime.node(ep_id, 1);
+    auto * w2 = runtime.node(ep_id, 2);
+    CHECK(w1 != nullptr && w2 != nullptr);
+
+    // Initial hand seed inherited from C_base
+    CHECK(w1->hand_seed == seed);
+    CHECK(w2->hand_seed == seed);
+
+    // Mutating w1 hand seed (first write / local mutation) isolates w1 from w2 and C_base
+    w1->hand_seed = {0xAA, 0xBB};
+    CHECK(w1->hand_seed != w2->hand_seed);
+    CHECK(w2->hand_seed == seed);
+    CHECK(ep->c_base.gdn_recurrent_states == seed);
+
+    // Mutating w2 hand seed isolates w2 from w1 and C_base
+    w2->hand_seed = {0xCC, 0xDD};
+    CHECK(w1->hand_seed != w2->hand_seed);
+    CHECK(ep->c_base.gdn_recurrent_states == seed);
 }
 
 static void test_dag_isolated_probe_uses_other_seq() {
@@ -3154,6 +3195,52 @@ static void test_dag_isolated_probe_uses_other_seq() {
     CHECK(root->exec_seq == 0);
     CHECK(root->storage_pos_next == 4);
     CHECK(!runtime.discard_isolated_probe(ep_id, 0));
+}
+
+static void test_dag_c0_probe_cancel_and_isolation() {
+    // Stage 3 (§12.4): Cancellation/abort during isolated probe must cleanly
+    // release probe resources without corrupting C0 or peer episode state.
+    server_rerot_runtime runtime(nullptr, LLAMA_REROT_FRONTIER_STRONG, 8, 16);
+    runtime.set_pen_capacity(4);
+
+    // Create Ep 1 (target episode under probe) and Ep 2 (peer episode)
+    const uint64_t ep1 = runtime.adopt_root(21, 21, 0, 0, 4);
+    const uint64_t ep2 = runtime.adopt_root(22, 22, 0, 0, 8);
+    CHECK(ep1 != 0 && ep2 != 0);
+
+    // Ep 1 captures C0 and arms isolated probe
+    CHECK(runtime.capture_c0(ep1, 0, 4));
+    CHECK(runtime.arm_isolated_probe(ep1, 0));
+    auto * ep1_ptr = runtime.episode(ep1);
+    CHECK(ep1_ptr != nullptr);
+    const llama_seq_id probe1 = ep1_ptr->probe_seq;
+    CHECK(probe1 >= 8);
+
+    // Ep 2 captures C0 and remains unprobed
+    CHECK(runtime.capture_c0(ep2, 0, 8));
+    auto * ep2_ptr = runtime.episode(ep2);
+    CHECK(ep2_ptr != nullptr);
+    CHECK(ep2_ptr->c0.valid());
+    CHECK(ep2_ptr->c0.n_prompt_tokens == 8);
+
+    // Abort Ep 1 during probe (e.g. client cancellation)
+    runtime.hard_abort(ep1, "client_cancelled_during_probe");
+    CHECK(ep1_ptr->hard_aborted);
+    CHECK(ep1_ptr->probe_seq == -1);
+
+    // Probe sequence must be returned: arming probe on ep2 must succeed and assign a valid internal sequence
+    CHECK(runtime.arm_isolated_probe(ep2, 0));
+    CHECK(ep2_ptr->probe_seq >= 8);
+    CHECK(runtime.discard_isolated_probe(ep2, 0));
+    CHECK(ep2_ptr->probe_seq == -1);
+
+    // Peer Ep 2 C0 state and runtime must be 100% intact
+    CHECK(ep2_ptr->c0.valid());
+    CHECK(ep2_ptr->c0.n_prompt_tokens == 8);
+    CHECK(!ep2_ptr->hard_aborted);
+    auto * ep2_root = runtime.node(ep2, 0);
+    CHECK(ep2_root != nullptr);
+    CHECK(ep2_root->storage_pos_next == 8);
 }
 
 static void test_dag_admission_view_survival() {
@@ -5148,6 +5235,7 @@ int main() {
     test_dag_runtime_lifecycle();
     test_dag_capture_c_base_snapshots_current_seed();
     test_dag_isolated_probe_uses_other_seq();
+    test_dag_c0_probe_cancel_and_isolation();
     test_dag_admission_view_survival();
     test_dag_w_gt_p_yield_without_seal();
     test_dag_frozen_read_publish_epoch();

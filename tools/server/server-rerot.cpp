@@ -3975,9 +3975,13 @@ bool server_rerot_runtime::admit_next_child(
     // once a tools-induced prefix rebuild moved it). Admission is refused
     // until c_base is valid, so no fallback exists here; a resumed (parked)
     // stage keeps its own watermark so committed spans stay contiguous.
-    if (current->is_dag && child->parked_seq < 0 && current->c_base.valid() &&
-        current->c_base.n_prompt_tokens >= 0) {
-        child->storage_pos_next = current->c_base.n_prompt_tokens;
+    if (current->is_dag && child->parked_seq < 0 && current->c_base.valid()) {
+        if (current->c_base.n_prompt_tokens >= 0) {
+            child->storage_pos_next = current->c_base.n_prompt_tokens;
+        }
+        if (child->hand_seed.empty() && !current->c_base.gdn_recurrent_states.empty()) {
+            child->hand_seed = current->c_base.gdn_recurrent_states;
+        }
     }
     if (child->parked_seq >= 0) {
         free_internal_seq(child->parked_seq);
