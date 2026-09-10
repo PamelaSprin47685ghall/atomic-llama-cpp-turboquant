@@ -5153,6 +5153,36 @@ int main() {
     test_dag_frozen_read_publish_epoch();
     test_dag_logical_step_hides_foreign_pending();
     test_dag_refuses_nested_html_fork();
+    {
+        server_rerot_runtime runtime(nullptr);
+        const uint64_t ep_id = runtime.adopt_root(15, 15, 0, 1, 0);
+        CHECK(ep_id != 0);
+        const auto decision = server_rerot_parse_routing_decision(R"({
+          "strategy": "dag",
+          "payload": {
+            "questions": [{"id": "A", "intent": "Fact A"}],
+            "depends_on": []
+          }
+        })");
+        std::string err;
+        CHECK(runtime.initialize_dag(ep_id, decision, &err));
+        auto * ep = runtime.episode(ep_id);
+        CHECK(ep != nullptr && ep->is_dag);
+        auto * node0 = runtime.node(ep_id, 0);
+        CHECK(node0 != nullptr);
+        const auto run_id = ep->document.append_run(0, llama_rerot_visibility::pending_record, 0, 5, 0);
+        node0->pending_record = run_id;
+        server_rerot_token_plan plan;
+        plan.storage_pos = 5;
+        plan.visibility = llama_rerot_visibility::pending_record;
+        plan.segment_kind = llama_rerot_segment_kind::body;
+        plan.run_id = run_id;
+        plan.parser_step.record_closed = true;
+        plan.parser_step.items = {"task1", "task2"};
+        CHECK(!runtime.commit_token(ep_id, 0, plan));
+        CHECK(ep->hard_aborted);
+        CHECK(ep->abort_reason.find("HTML fork is retired") != std::string::npos);
+    }
     test_dag_save_refuses_probe_and_persists_c0();
     test_dag_seal_exactly_once_and_refuses_unstarted();
     test_dag_seal_releases_pen_parked_until_cohort_retire();

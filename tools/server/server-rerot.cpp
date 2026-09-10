@@ -2338,6 +2338,10 @@ bool server_rerot_runtime::publish_pending_record(
         server_rerot_node_runtime & node,
         llama_rerot_run_id run_id,
         const std::vector<std::string> & items) {
+    if (episode.is_dag) {
+        return fail_episode(episode,
+            "rerot_protocol_error: HTML fork is retired; DAG mode rejects HTML planner records");
+    }
     if (!node.pending_record.has_value() || *node.pending_record != run_id || items.empty()) {
         return fail_episode(episode, "planner closed a missing or empty pending record");
     }

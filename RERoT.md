@@ -1742,7 +1742,7 @@ shadow
 | W>P logical cohort + physical time-slice | 逻辑 cohort、冻结 read epoch 与物理分时已接线；完整状态/数值/错误门仍需验收 |
 | W active state budget/restore | **未完成完整门** |
 | final 0.synthesize clean cutover | **已通过**（单 child 闭环下作为独立 stage 启动，使用稳定最终视图及新 logits，输出准确 221） |
-| 删除旧 random-ID/tree/fence production semantics | **未完全 clean cutover** |
+| 删除旧 random-ID/tree/fence production semantics | **已实现硬阻断与 clean cutover**（DAG 模式下 `publish_pending_record` 与 `freeze_fork_parent` 严格拒绝 HTML planner records 并 hard_abort；非 DAG 保留用于回归测试） |
 | target Ornith single child DAG | **已通过**（分配律 13x17=221 单 worker 自然 end 与 synthesis 闭环） |
 | target Ornith multi-lane DAG | **未验证** |
 | Tri/MTP/RAM/shift DAG matrix | **未重新认证** |
