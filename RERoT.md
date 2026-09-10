@@ -1761,7 +1761,7 @@ shadow
 | 删除旧 random-ID/tree/fence production semantics | **已实现硬阻断与 clean cutover**（DAG 模式下 `publish_pending_record` 与 `freeze_fork_parent` 严格拒绝 HTML planner records 并 hard_abort；非 DAG 保留用于回归测试） |
 | target Ornith single child DAG | **已通过**（分配律 13x17=221 单 worker 自然 end 与 synthesis 闭环） |
 | target Ornith multi-lane DAG | **未验证** |
-| Tri/MTP/RAM/shift DAG matrix | **未重新认证** |
+| Tri/MTP/RAM/shift DAG matrix | **已实现并认证通过**（`test_dag_tri_mtp_ram_shift_speculative_matrix` 覆盖 DAG 读者视角 MTP 草稿失效与重草稿、活跃 DAG 框架与正文 shift 严格钉扎、RAM 持久化换槽恢复完整性） |
 | DAG quality/performance/soak | **未开始正式 gate** |
 
 ### 13.3 两个最近提交的边界

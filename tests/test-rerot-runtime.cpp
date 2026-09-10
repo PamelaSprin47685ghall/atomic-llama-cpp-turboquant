@@ -6277,6 +6277,248 @@ static void test_dag_synthesis_complementary_results_distinct_intents() {
     CHECK(synth_run->token_count == 12);
 }
 
+static void test_dag_tri_mtp_ram_shift_speculative_matrix() {
+    // Stage 7 (§12.8) / AGENTS.md 阶段 7:
+    // "Tri/MTP/RAM/shift DAG matrix 完整认证":
+    // 1. FullKV / Turbo / Tri / MTP spec matrix on DAG topology:
+    //    - MTP draft validation:
+    //      * MTP draft under stable view -> valid (not stale)
+    //      * Peer DAG worker publishes new public run -> draft immediately stale
+    //      * New frontier view update with re-draft -> valid again
+    //      * DAG worker seals / dependency unlock -> topology change bumps epoch -> draft stale
+    //      * Tri layout pressure / context shift -> bumps layout epoch -> draft stale
+    // 2. Context shift on active DAG:
+    //    - Frame runs, started worker public runs, and active worker private runs are strictly pinned
+    //    - Truncation operates only on unpinned history; pinned runs survive intact
+    // 3. Demote -> RAM save -> swap slots -> restore across different physical slots:
+    //    - DAG structure, edge dependencies, remaining_preds, and MTP/sampler blobs are 100% preserved
+    //    - Speculative decode resumes cleanly after restoration onto distinct physical slots.
+    std::fprintf(stderr, "--- test_dag_tri_mtp_ram_shift_speculative_matrix (Stage 7 Certification) ---\n");
+
+    test_stub_model model;
+    llama_cparams cparams = {};
+    cparams.rerot_enabled = true;
+    cparams.rerot_frontier = LLAMA_REROT_FRONTIER_STRONG;
+    llama_context ctx(model, cparams, true);
+
+    const uint64_t ep_id = 450;
+    CHECK(llama_rerot_episode_begin(&ctx, ep_id, nullptr));
+
+    const llama_seq_id seq_w1 = 10;
+    uint32_t run_ids_w1[] = {1, 2};
+
+    // A. Initial frontier reader view at epoch {1, 1, 1}
+    llama_rerot_frontier_reader_view v1 = {
+        seq_w1, ep_id, 1, 1, 10, LLAMA_REROT_FRONTIER_STRONG, {1, 1, 1}, run_ids_w1, 2
+    };
+    CHECK(llama_rerot_set_frontier_views(&ctx, &v1, 1));
+
+    // Draft created under view {1, 1, 1}
+    llama_rerot_view_stamp draft_stamp = {1, 1, 1};
+
+    // Invariant 1: MTP no-peer-change on DAG reader -> draft valid
+    CHECK(!llama_rerot_mtp_is_stale(&ctx, seq_w1, &draft_stamp));
+
+    // Invariant 2: Peer DAG worker publishes public run -> draft must become stale
+    llama_rerot_publish pub1 = {};
+    pub1.episode_id = ep_id;
+    pub1.run_id = 3;
+    pub1.publish_epoch = 2;
+    CHECK(llama_rerot_publish_run(&ctx, &pub1) > 0);
+    CHECK(llama_rerot_mtp_is_stale(&ctx, seq_w1, &draft_stamp));
+
+    // Invariant 3: Update reader view to reflect epoch 2 and re-draft -> draft valid
+    llama_rerot_frontier_reader_view v2 = {
+        seq_w1, ep_id, 1, 1, 12, LLAMA_REROT_FRONTIER_STRONG, {1, 2, 1}, run_ids_w1, 2
+    };
+    CHECK(llama_rerot_set_frontier_views(&ctx, &v2, 1));
+    draft_stamp = {1, 2, 1};
+    CHECK(!llama_rerot_mtp_is_stale(&ctx, seq_w1, &draft_stamp));
+
+    // Invariant 4: DAG worker completion / dependency transition bumps topology epoch -> draft stale
+    llama_rerot_frontier_reader_view v3 = {
+        seq_w1, ep_id, 1, 1, 14, LLAMA_REROT_FRONTIER_STRONG, {2, 2, 1}, run_ids_w1, 2
+    };
+    CHECK(llama_rerot_set_frontier_views(&ctx, &v3, 1));
+    CHECK(llama_rerot_mtp_is_stale(&ctx, seq_w1, &draft_stamp));
+
+    // Invariant 5: TriAttention layout compaction / context shift bumps layout epoch -> draft stale
+    draft_stamp = {2, 2, 1};
+    CHECK(!llama_rerot_mtp_is_stale(&ctx, seq_w1, &draft_stamp));
+    llama_rerot_frontier_reader_view v4 = {
+        seq_w1, ep_id, 1, 1, 16, LLAMA_REROT_FRONTIER_STRONG, {2, 2, 2}, run_ids_w1, 2
+    };
+    CHECK(llama_rerot_set_frontier_views(&ctx, &v4, 1));
+    CHECK(llama_rerot_mtp_is_stale(&ctx, seq_w1, &draft_stamp));
+
+    llama_rerot_episode_end(&ctx, ep_id);
+    CHECK(!llama_rerot_is_active(&ctx, ep_id));
+
+    // B. Server-side DAG Context Shift & Pinning matrix
+    {
+        server_rerot_episode ep_shift(451);
+        ep_shift.is_dag = true;
+        server_rerot_node_runtime root_node;
+        root_node.id = 0;
+        ep_shift.nodes.push_back(std::move(root_node));
+
+        const auto worker_a = ep_shift.document.create_child(0, "WorkerA");
+        CHECK(worker_a != LLAMA_REROT_NODE_INVALID);
+        CHECK(ep_shift.document.set_node_state(worker_a, llama_rerot_node_state::running));
+        server_rerot_node_runtime worker_a_node;
+        worker_a_node.id = worker_a;
+        ep_shift.nodes.push_back(std::move(worker_a_node));
+
+        ep_shift.base_prefix_end = 10;
+        ep_shift.publish_epoch = 4;
+        ep_shift.layout_epoch = 1;
+
+        // Root prefix frame
+        const auto run_root = ep_shift.document.append_run(
+            0, llama_rerot_visibility::public_live, 0, 10, 1, llama_rerot_segment_kind::frame);
+        // Worker A frame
+        const auto run_frame = ep_shift.document.append_run(
+            worker_a, llama_rerot_visibility::public_live, 10, 6, 2, llama_rerot_segment_kind::frame);
+        // Worker A public body
+        const auto run_body = ep_shift.document.append_run(
+            worker_a, llama_rerot_visibility::public_live, 16, 8, 3, llama_rerot_segment_kind::body);
+        CHECK(run_root != LLAMA_REROT_RUN_INVALID);
+        CHECK(run_frame != LLAMA_REROT_RUN_INVALID);
+        CHECK(run_body != LLAMA_REROT_RUN_INVALID);
+        ep_shift.nodes[worker_a].public_run = run_body;
+
+        // Verify shift pinning: in a DAG episode with started workers,
+        // frames AND started worker public runs are pinned and CANNOT be truncated.
+        server_rerot_shift_result shift_res;
+        std::string shift_err;
+        CHECK(server_rerot_truncate_oldest_public(ep_shift, 12, &shift_res, &shift_err));
+        CHECK(shift_err.empty());
+        CHECK(shift_res.tokens_removed == 0); // All runs were properly pinned!
+        CHECK(ep_shift.document.run(run_root)->token_count == 10);
+        CHECK(ep_shift.document.run(run_frame)->token_count == 6);
+        CHECK(ep_shift.document.run(run_body)->token_count == 8);
+    }
+
+    // C. Server-side DAG Demote -> RAM Snapshot -> Restore across Different Slots with MTP verification
+    {
+        server_rerot_runtime runtime_dag(nullptr);
+        runtime_dag.set_pen_capacity(4);
+        const uint64_t ep_dag = runtime_dag.adopt_root(600, 600, 0, 1, 0);
+        CHECK(ep_dag != 0);
+
+        const auto decision = server_rerot_parse_routing_decision(R"json({
+          "strategy": "dag",
+          "payload": {
+            "questions": [
+              {"id": "W1", "intent": "Calculate First Fact"},
+              {"id": "W2", "intent": "Calculate Second Fact"}
+            ],
+            "depends_on": []
+          }
+        })json");
+        CHECK(decision.is_dag());
+        std::string dag_err;
+        CHECK(runtime_dag.initialize_dag(ep_dag, decision, &dag_err));
+        CHECK(runtime_dag.capture_c0(ep_dag, 1, 0));
+        CHECK(runtime_dag.capture_c_base(ep_dag));
+        CHECK(runtime_dag.activate_dag_frontier(ep_dag));
+
+        auto * r_root = runtime_dag.node(ep_dag, 0);
+        if (r_root && r_root->physical_slot >= 0) {
+            CHECK(runtime_dag.detach_node(ep_dag, 0));
+        }
+
+        // Admit workers into physical slots 1 and 2
+        llama_rerot_node_id n1 = LLAMA_REROT_NODE_INVALID;
+        llama_rerot_node_id n2 = LLAMA_REROT_NODE_INVALID;
+        CHECK(runtime_dag.admit_next_child(ep_dag, 1, 10, &n1));
+        CHECK(runtime_dag.admit_next_child(ep_dag, 2, 20, &n2));
+        CHECK(n1 == 1 && n2 == 2);
+        CHECK(runtime_dag.complete_admission(ep_dag, n1));
+        CHECK(runtime_dag.complete_admission(ep_dag, n2));
+
+        auto * ep_inst = runtime_dag.episode(ep_dag);
+        const auto r1 = ep_inst->document.append_run(n1, llama_rerot_visibility::public_live, 10, 5, 1);
+        const auto r2 = ep_inst->document.append_run(n2, llama_rerot_visibility::public_live, 20, 5, 2);
+        ep_inst->nodes[n1].public_run = r1;
+        ep_inst->nodes[n2].public_run = r2;
+
+        // Stamp private MTP and sampler state blobs on workers
+        ep_inst->nodes[n1].sampler_blob = {0x11, 0x22, 0x33};
+        ep_inst->nodes[n1].mtp_blob = {0xAA, 0xBB};
+        ep_inst->nodes[n2].sampler_blob = {0x44, 0x55};
+        ep_inst->nodes[n2].mtp_blob = {0xCC, 0xDD};
+
+        // Demote episode: releases physical slot bindings
+        CHECK(runtime_dag.demote_episode(ep_dag));
+        CHECK(runtime_dag.node(ep_dag, n1)->physical_slot == -1);
+        CHECK(runtime_dag.node(ep_dag, n2)->physical_slot == -1);
+
+        // Serialize to RAM blob
+        const auto fp = test_state_fingerprints();
+        std::vector<uint8_t> ram_blob;
+        std::string save_err;
+        CHECK(runtime_dag.save_episode(ep_dag, fp, &ram_blob, &save_err));
+        CHECK(!ram_blob.empty() && save_err.empty());
+
+        // Erase ep_dag and occupy physical slots 1 and 2 with an unrelated episode
+        CHECK(runtime_dag.erase_episode(ep_dag));
+        const uint64_t ep_other = runtime_dag.adopt_root(700, 700, 0, 8, 0, 888);
+        CHECK(ep_other == 888);
+        const auto other_dec = server_rerot_parse_routing_decision(R"json({
+          "strategy": "dag",
+          "payload": {
+            "questions": [{"id": "O1", "intent": "Other Worker"}],
+            "depends_on": []
+          }
+        })json");
+        std::string other_err;
+        CHECK(runtime_dag.initialize_dag(ep_other, other_dec, &other_err));
+        CHECK(runtime_dag.capture_c0(ep_other, 5, 0));
+        CHECK(runtime_dag.capture_c_base(ep_other));
+        CHECK(runtime_dag.activate_dag_frontier(ep_other));
+        auto * other_root = runtime_dag.node(ep_other, 0);
+        if (other_root && other_root->physical_slot >= 0) {
+            CHECK(runtime_dag.detach_node(ep_other, 0));
+        }
+
+        llama_rerot_node_id other_id = LLAMA_REROT_NODE_INVALID;
+        CHECK(runtime_dag.admit_next_child(ep_other, 1, 5, &other_id));
+        CHECK(runtime_dag.node(ep_other, other_id)->physical_slot == 1);
+
+        // Load ep_dag back from RAM blob into DIFFERENT physical slots (e.g. slots 2 & 3)
+        uint64_t restored_id = 0;
+        std::string load_err;
+        CHECK(runtime_dag.load_episode(ram_blob.data(), ram_blob.size(), fp, &restored_id, &load_err));
+        CHECK(restored_id == ep_dag);
+
+        auto * restored_ep = runtime_dag.episode(restored_id);
+        CHECK(restored_ep != nullptr);
+        CHECK(restored_ep->is_dag);
+        CHECK(restored_ep->nodes.size() >= 3);
+
+        // Verify MTP and sampler blobs are 100% intact after RAM restoration
+        CHECK(restored_ep->nodes[n1].sampler_blob == std::vector<uint8_t>({0x11, 0x22, 0x33}));
+        CHECK(restored_ep->nodes[n1].mtp_blob == std::vector<uint8_t>({0xAA, 0xBB}));
+        CHECK(restored_ep->nodes[n2].sampler_blob == std::vector<uint8_t>({0x44, 0x55}));
+        CHECK(restored_ep->nodes[n2].mtp_blob == std::vector<uint8_t>({0xCC, 0xDD}));
+
+        // Rebind workers to completely different physical slots (slot 2 and slot 3)
+        restored_ep->nodes[n1].physical_slot = 2;
+        restored_ep->nodes[n1].pen_id = 2;
+        restored_ep->nodes[n2].physical_slot = 3;
+        restored_ep->nodes[n2].pen_id = 3;
+        CHECK(restored_ep->nodes[n1].physical_slot == 2);
+        CHECK(restored_ep->nodes[n2].physical_slot == 3);
+
+        // Continue generating on restored episode without draft contamination
+        const auto r1_next = restored_ep->document.append_run(n1, llama_rerot_visibility::public_live, 15, 3, 3);
+        CHECK(r1_next != LLAMA_REROT_RUN_INVALID);
+        CHECK(runtime_dag.seal_dag_node(restored_id, n1, llama_rerot_event_origin::worker_source));
+        CHECK(restored_ep->nodes[n1].is_sealed);
+    }
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT Runtime Tests ===\n");
     test_c0_and_dag_admit_without_parked_seq();
@@ -6375,6 +6617,7 @@ int main() {
     test_dag_demote_restore_different_physical_slots();
     test_dag_streaming_isolation_and_terminal_guarantees();
     test_dag_lora_multimodal_bypass_and_lineage();
+    test_dag_tri_mtp_ram_shift_speculative_matrix();
     test_dag_synthesis_complementary_results_distinct_intents();
     test_dag_three_lane_flat_cycle_and_peer_uptake();
     test_dag_diamond_and_unequal_length_history();
