@@ -5310,6 +5310,145 @@ static void test_dag_source_end_multi_token_and_starting_frame_gate() {
     CHECK(ep->nodes[2].remaining_preds == 0); // Successor B is now unlocked
 }
 
+static void test_dag_microbatch_slice_order_and_no_earlier_public_leak() {
+    // Stage 4 (§12.5) Verification:
+    // Must-pass item 3: Same logical frontier under different microbatch slicing/row orders
+    // produces the identical prescribed state and reader views.
+    // Must-pass item 4: A later slice in the same frontier cannot observe this frontier's
+    // earlier slice's newly committed tokens until the cohort-wide atomic publication.
+
+    // Scenario 1: Slice 1 executes lane A, Slice 2 executes lane B.
+    // Verify that when lane A commits in slice 1, lane B in slice 2 does NOT see lane A's write,
+    // and both only become mutually visible after the cohort step finishes.
+    server_rerot_runtime runtime1(nullptr);
+    runtime1.set_pen_capacity(4);
+    const uint64_t ep1 = runtime1.adopt_root(101, 101, 0, 1, 0);
+    CHECK(ep1 != 0);
+
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"}
+        ],
+        "depends_on": []
+      }
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime1.initialize_dag(ep1, decision, &err));
+    CHECK(runtime1.capture_c0(ep1, 1, 0));
+    CHECK(runtime1.capture_c_base(ep1));
+    CHECK(runtime1.activate_dag_frontier(ep1));
+    auto * root1 = runtime1.node(ep1, 0);
+    if (root1 && root1->physical_slot >= 0) {
+        CHECK(runtime1.detach_node(ep1, 0));
+    }
+
+    llama_rerot_node_id a1 = LLAMA_REROT_NODE_INVALID;
+    llama_rerot_node_id b1 = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime1.admit_next_child(ep1, 0, 2, &a1));
+    CHECK(runtime1.admit_next_child(ep1, 1, 3, &b1));
+    CHECK(a1 == 1 && b1 == 2);
+    CHECK(runtime1.complete_admission(ep1, a1));
+    CHECK(runtime1.complete_admission(ep1, b1));
+
+    // Snapshot open logical step for ep1
+    CHECK(runtime1.has_open_dag_logical_step(ep1));
+
+    // Slice 1: Lane A executes and commits.
+    auto * na1 = runtime1.node(ep1, a1);
+    CHECK(na1 != nullptr);
+    CHECK(commit_generated(runtime1, ep1, a1, na1->storage_pos_next, "tok_a"));
+    CHECK(na1->pending_record.has_value());
+    const auto run_a1 = *na1->pending_record;
+
+    // Mid-frontier inspection: Slice 2 is about to run Lane B.
+    // Reader B must NOT see Lane A's uncommitted/pending run_a1.
+    const auto view_b1_pre = runtime1.build_dag_view_for_reader(ep1, b1);
+    CHECK(!dag_view_has_run(view_b1_pre, run_a1));
+
+    // Slice 2: Lane B executes and commits.
+    auto * nb1 = runtime1.node(ep1, b1);
+    CHECK(nb1 != nullptr);
+    CHECK(commit_generated(runtime1, ep1, b1, nb1->storage_pos_next, "tok_b"));
+    CHECK(nb1->pending_record.has_value());
+    const auto run_b1 = *nb1->pending_record;
+
+    // Before finish_frontier: neither peer sees the other's pending write.
+    const auto view_a1_mid = runtime1.build_dag_view_for_reader(ep1, a1);
+    const auto view_b1_mid = runtime1.build_dag_view_for_reader(ep1, b1);
+    CHECK(!dag_view_has_run(view_a1_mid, run_b1));
+    CHECK(!dag_view_has_run(view_b1_mid, run_a1));
+
+    // Finish frontier publishes cohort atomically.
+    const auto res1 = runtime1.finish_frontier(ep1);
+    CHECK(!res1.hard_aborted);
+    const auto view_a1_post = runtime1.build_dag_view_for_reader(ep1, a1);
+    const auto view_b1_post = runtime1.build_dag_view_for_reader(ep1, b1);
+    CHECK(dag_view_has_run(view_a1_post, run_a1));
+    CHECK(dag_view_has_run(view_a1_post, run_b1));
+    CHECK(dag_view_has_run(view_b1_post, run_a1));
+    CHECK(dag_view_has_run(view_b1_post, run_b1));
+
+    // Scenario 2: Reversed row/microbatch order (Slice 1 runs Lane B, Slice 2 runs Lane A).
+    // The final result must be strictly identical in view structure and token mapping.
+    server_rerot_runtime runtime2(nullptr);
+    runtime2.set_pen_capacity(4);
+    const uint64_t ep2 = runtime2.adopt_root(102, 102, 0, 1, 0);
+    CHECK(ep2 != 0);
+    CHECK(runtime2.initialize_dag(ep2, decision, &err));
+    CHECK(runtime2.capture_c0(ep2, 1, 0));
+    CHECK(runtime2.capture_c_base(ep2));
+    CHECK(runtime2.activate_dag_frontier(ep2));
+    auto * root2 = runtime2.node(ep2, 0);
+    if (root2 && root2->physical_slot >= 0) {
+        CHECK(runtime2.detach_node(ep2, 0));
+    }
+
+    llama_rerot_node_id a2 = LLAMA_REROT_NODE_INVALID;
+    llama_rerot_node_id b2 = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime2.admit_next_child(ep2, 0, 2, &a2));
+    CHECK(runtime2.admit_next_child(ep2, 1, 3, &b2));
+    CHECK(runtime2.complete_admission(ep2, a2));
+    CHECK(runtime2.complete_admission(ep2, b2));
+
+    // Reversed execution: Slice 1 executes Lane B first
+    auto * nb2 = runtime2.node(ep2, b2);
+    CHECK(nb2 != nullptr);
+    CHECK(commit_generated(runtime2, ep2, b2, nb2->storage_pos_next, "tok_b"));
+    CHECK(nb2->pending_record.has_value());
+    const auto run_b2 = *nb2->pending_record;
+
+    // Mid-frontier inspection: Slice 2 (Lane A) must NOT see Lane B's write yet
+    const auto view_a2_pre = runtime2.build_dag_view_for_reader(ep2, a2);
+    CHECK(!dag_view_has_run(view_a2_pre, run_b2));
+
+    // Slice 2 executes Lane A
+    auto * na2 = runtime2.node(ep2, a2);
+    CHECK(na2 != nullptr);
+    CHECK(commit_generated(runtime2, ep2, a2, na2->storage_pos_next, "tok_a"));
+    const auto run_a2 = *na2->pending_record;
+
+    // Finish frontier publishes cohort atomically in runtime2
+    const auto res2 = runtime2.finish_frontier(ep2);
+    CHECK(!res2.hard_aborted);
+
+    const auto view_a2_post = runtime2.build_dag_view_for_reader(ep2, a2);
+    const auto view_b2_post = runtime2.build_dag_view_for_reader(ep2, b2);
+    CHECK(dag_view_has_run(view_a2_post, run_a2));
+    CHECK(dag_view_has_run(view_a2_post, run_b2));
+    CHECK(dag_view_has_run(view_b2_post, run_a2));
+    CHECK(dag_view_has_run(view_b2_post, run_b2));
+
+    // Exact structural equivalence: query virtual positions, total runs, and run counts match
+    CHECK(view_a1_post.runs.size() == view_a2_post.runs.size());
+    CHECK(view_a1_post.query_virtual_pos == view_a2_post.query_virtual_pos);
+    CHECK(view_b1_post.runs.size() == view_b2_post.runs.size());
+    CHECK(view_b1_post.query_virtual_pos == view_b2_post.query_virtual_pos);
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT Runtime Tests ===\n");
     test_c0_and_dag_admit_without_parked_seq();
@@ -5401,6 +5540,7 @@ int main() {
     test_dag_prefix_rebuild_reconciles_root_runs();
     test_dag_initialize_refuses_double_init();
     test_dag_source_end_multi_token_and_starting_frame_gate();
+    test_dag_microbatch_slice_order_and_no_earlier_public_leak();
     test_dag_three_lane_flat_cycle_and_peer_uptake();
     test_dag_diamond_and_unequal_length_history();
     test_dag_a_to_c_with_b_independent_overlap();
