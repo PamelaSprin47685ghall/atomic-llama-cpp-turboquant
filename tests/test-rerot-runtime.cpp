@@ -5183,6 +5183,36 @@ int main() {
         CHECK(ep->hard_aborted);
         CHECK(ep->abort_reason.find("HTML fork is retired") != std::string::npos);
     }
+    {
+        // Scheduler invariant check (§12.5 item 8):
+        // If a valid DAG has unfinished nodes but no runnable work,
+        // activate_dag_frontier must immediately report a scheduler invariant error and abort.
+        server_rerot_runtime runtime(nullptr);
+        const uint64_t ep_id = runtime.adopt_root(16, 16, 0, 1, 0);
+        CHECK(ep_id != 0);
+        const auto decision = server_rerot_parse_routing_decision(R"({
+          "strategy": "dag",
+          "payload": {
+            "questions": [{"id": "1", "intent": "Worker 1"}],
+            "depends_on": []
+          }
+        })");
+        CHECK(decision.is_dag());
+        std::string err;
+        CHECK(runtime.initialize_dag(ep_id, decision, &err));
+        CHECK(runtime.capture_c0(ep_id, 1, 0));
+        CHECK(runtime.capture_c_base(ep_id));
+        auto * ep = runtime.episode(ep_id);
+        CHECK(ep != nullptr);
+
+        // Artificially corrupt state: make both worker 1 and synthesis node unrunnable
+        ep->ready_queue.clear();
+        ep->nodes[1].remaining_preds = 999;
+        ep->nodes[ep->synthesis_node].remaining_preds = 999;
+        CHECK(!runtime.activate_dag_frontier(ep_id));
+        CHECK(ep->hard_aborted);
+        CHECK(ep->abort_reason.find("rerot_scheduler_invariant_error") != std::string::npos);
+    }
     test_dag_save_refuses_probe_and_persists_c0();
     test_dag_seal_exactly_once_and_refuses_unstarted();
     test_dag_seal_releases_pen_parked_until_cohort_retire();

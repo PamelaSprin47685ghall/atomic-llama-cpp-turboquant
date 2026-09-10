@@ -3097,6 +3097,34 @@ bool server_rerot_runtime::activate_dag_frontier(uint64_t episode_id) {
     }
     yield_dag_pen_for_ready(episode_id);
     snapshot_dag_logical_step(episode_id);
+
+    // AGENTS.md §阶段4 / RERoT.md §12.5 item 8:
+    // A valid DAG with unfinished nodes must have runnable work (running, starting, suspended, or ready).
+    // Node 0 (planner) is already sealed by initialize_dag; only worker/synthesis nodes constitute runnable DAG tasks.
+    // If no work is runnable while unsealed workers/synthesis remain, report a scheduler invariant error.
+    if (!ep->hard_aborted && !ep->serial_tail && ep->c_base.valid()) {
+        bool has_unsealed = false;
+        for (size_t i = 1; i < ep->nodes.size(); ++i) {
+            if (!ep->nodes[i].is_sealed) {
+                has_unsealed = true;
+                break;
+            }
+        }
+        bool has_active_worker = false;
+        for (const auto nid : ep->running) {
+            if (nid != 0) { has_active_worker = true; break; }
+        }
+        for (const auto nid : ep->starting) {
+            if (nid != 0) { has_active_worker = true; break; }
+        }
+        const bool has_runnable = has_active_worker ||
+                                  !ep->suspended.empty() ||
+                                  !ep->ready_queue.empty();
+        if (has_unsealed && !has_runnable) {
+            fail_episode(*ep, "rerot_scheduler_invariant_error: no runnable work but unfinished DAG nodes remain");
+            return false;
+        }
+    }
     return true;
 }
 
