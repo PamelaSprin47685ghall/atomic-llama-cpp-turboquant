@@ -3412,6 +3412,128 @@ static void test_dag_w_gt_p_yield_without_seal() {
     CHECK(dag_view_has_run(view_second, run_b));
 }
 
+static void test_dag_w_active_state_retention_and_swap() {
+    // AGENTS.md §06.4, RERoT.md §8.5 & §12.5 (Stage 4 / Stage 7):
+    // "W active stages state retention, swap and restore":
+    // 1. In native lane-local recurrence under W > P, logical active workers (W=3)
+    //    compete for limited physical pens (P=1).
+    // 2. When worker 1 yields/suspends for worker 2 to admit/execute, worker 1's local
+    //    accumulated state (hand_seed, sampler_blob, mtp_blob, token progress, next storage pos)
+    //    must be 100% retained across suspension.
+    // 3. Worker 1 must NOT be reset to C_base or lose its independent progress upon resumption.
+    // 4. Resumption of worker 1 onto the freed physical pen restores exact local state and continues
+    //    generation from its preserved storage cursor.
+
+    std::fprintf(stderr, "--- test_dag_w_active_state_retention_and_swap ---\n");
+
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(1); // Exactly P=1 physical pen
+
+    const uint64_t ep_id = runtime.adopt_root(114, 114, 0, 1, 0);
+    CHECK(ep_id != 0);
+
+    const auto decision = server_rerot_parse_routing_decision(R"json({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "w1", "intent": "Fact 1 derivation"},
+          {"id": "w2", "intent": "Fact 2 derivation"}
+        ],
+        "depends_on": []
+      }
+    })json");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+
+    dag_unbind_planner_if_bound(runtime, ep_id);
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+
+    // 1. Admit worker 1 into the only available physical pen (pen 0)
+    llama_rerot_node_id w1 = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 1, &w1));
+    CHECK(w1 == 1);
+    CHECK(runtime.complete_admission(ep_id, w1));
+
+    auto * node1 = runtime.node(ep_id, w1);
+    CHECK(node1 != nullptr);
+    CHECK(node1->physical_slot == 0);
+
+    // Worker 1 makes local generation progress: stamp custom sampler/mtp blobs and hand state
+    node1->sampler_blob = {0x12, 0x34, 0x56};
+    node1->mtp_blob = {0x78, 0x9A};
+    node1->hand_seed = {0xBC, 0xDE, 0xF0};
+    node1->storage_pos_next = 25;
+
+    // Append public progress for worker 1
+    const auto run_w1_step1 = ep->document.append_run(w1, llama_rerot_visibility::public_live, 10, 15, 1);
+    CHECK(run_w1_step1 != LLAMA_REROT_RUN_INVALID);
+
+    // 2. Worker 1 yields pen 0 under resource pressure so worker 2 can start
+    CHECK(runtime.yield_dag_pen_for_ready(ep_id, /*resource_pressure=*/true));
+    CHECK(node1->physical_slot == -1);
+    CHECK(ep->suspended.count(w1) != 0);
+    CHECK(ep->document.node(w1)->state == llama_rerot_node_state::ready_suspended);
+
+    // Verify Worker 1 state is NOT wiped or reverted to empty/C_base
+    CHECK(node1->sampler_blob == std::vector<uint8_t>({0x12, 0x34, 0x56}));
+    CHECK(node1->mtp_blob == std::vector<uint8_t>({0x78, 0x9A}));
+    CHECK(node1->hand_seed == std::vector<uint8_t>({0xBC, 0xDE, 0xF0}));
+    CHECK(node1->storage_pos_next == 25);
+
+    // 3. Worker 2 admits onto the freed pen 0
+    llama_rerot_node_id w2 = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 2, &w2));
+    CHECK(w2 == 2);
+    CHECK(runtime.complete_admission(ep_id, w2));
+
+    auto * node2 = runtime.node(ep_id, w2);
+    CHECK(node2 != nullptr);
+    CHECK(node2->physical_slot == 0);
+
+    // Worker 2 advances its own separate state
+    node2->sampler_blob = {0xAA, 0xBB};
+    node2->storage_pos_next = 40;
+    const auto run_w2_step1 = ep->document.append_run(w2, llama_rerot_visibility::public_live, 25, 15, 1);
+    CHECK(run_w2_step1 != LLAMA_REROT_RUN_INVALID);
+
+    // Worker 2 yields pen 0 back so Worker 1 can resume
+    CHECK(runtime.yield_dag_pen_for_ready(ep_id, /*resource_pressure=*/true));
+    CHECK(node2->physical_slot == -1);
+    CHECK(ep->suspended.count(w2) != 0);
+
+    // 4. Resume Worker 1 onto freed pen 0
+    CHECK(runtime.resume_pen(ep_id, w1, 0, 1));
+    CHECK(node1->physical_slot == 0);
+    CHECK(ep->suspended.count(w1) == 0);
+    CHECK(ep->running.count(w1) != 0);
+
+    // Verify exact state continuity on Worker 1 after time-slice swap
+    CHECK(node1->sampler_blob == std::vector<uint8_t>({0x12, 0x34, 0x56}));
+    CHECK(node1->mtp_blob == std::vector<uint8_t>({0x78, 0x9A}));
+    CHECK(node1->hand_seed == std::vector<uint8_t>({0xBC, 0xDE, 0xF0}));
+    CHECK(node1->storage_pos_next == 25);
+
+    // Worker 1 can continue generation cleanly
+    const auto run_w1_step2 = ep->document.append_run(w1, llama_rerot_visibility::public_live, 40, 5, 2);
+    CHECK(run_w1_step2 != LLAMA_REROT_RUN_INVALID);
+    node1->storage_pos_next = 45;
+
+    // Both workers seal naturally
+    CHECK(runtime.seal_dag_node(ep_id, w1, llama_rerot_event_origin::worker_source));
+    CHECK(runtime.resume_pen(ep_id, w2, 0, 2));
+    CHECK(runtime.seal_dag_node(ep_id, w2, llama_rerot_event_origin::worker_source));
+
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 0);
+    CHECK(!runtime.get_eligible_dag_nodes(ep_id).empty());
+
+    CHECK(runtime.erase_episode(ep_id));
+}
+
 static void test_dag_frozen_read_publish_epoch() {
     // Foreign PUBLIC runs with publish_epoch > frozen_read_publish_epoch are
     // omitted. Older public runs and the reader's own run remain visible.
@@ -6233,6 +6355,7 @@ int main() {
     test_dag_complete_admission_evicts_no_peer();
     test_dag_seal_evicts_no_bound_peer();
     test_dag_yield_force_under_resource_pressure();
+    test_dag_w_active_state_retention_and_swap();
     test_dag_admit_anchors_worker_storage_to_c_base();
     test_dag_discard_probe_retracts_probe_runs();
     test_dag_frozen_view_gates_foreign_frame();
