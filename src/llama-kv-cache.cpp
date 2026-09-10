@@ -8273,14 +8273,7 @@ void llama_kv_cache::xkv_state_read_trailer(llama_io_read_i & io, llama_seq_id s
         throw std::runtime_error("llama_kv_cache::xkv_state_read_trailer: " + m);
     };
     if (!xkv_store) {
-        // XKV OFF: the legacy stream must end here.
-        std::vector<uint8_t> env;
-        std::string err;
-        const auto r = llama_xkv::read_state_section(io, 1 << 20, env, &err);
-        if (r == llama_xkv::xkv_section_read_result::absent) {
-            return;
-        }
-        refuse("cross-mode restore refused (XKV section present, XKV store absent)");
+        return;
     }
     const auto & cp = xkv_store->get_cparams();
     const uint64_t store_budget = (uint64_t) cp.xkv_store_mib << 20;
