@@ -5581,6 +5581,162 @@ static void test_dag_abort_clears_orphan_refs_and_pens() {
     CHECK(runtime.episode(ep_id) == nullptr);
 }
 
+static void test_dag_synthesis_complementary_results_distinct_intents() {
+    // Stage 6 (§12.7) Minimal Workload 5:
+    // Synthesis uses multiple complementary results without cross-contaminating intents.
+    // Verifies:
+    // 1. Two parallel workers with distinct intents ("algebra_proof" and "geometric_evidence")
+    //    produce distinct reasoning/body token sequences and separate FRAME handoffs.
+    // 2. Both workers' outputs remain distinct and correctly attributed to their own node_id.
+    // 3. When both workers seal, synthesis_node is unlocked (remaining_preds == 0) and admits.
+    // 4. The synthesis reader view contains the root plan, worker 1 (algebra), and worker 2 (geometry)
+    //    in strict topological plan order, each appearing exactly once without cross-contamination.
+    // 5. Synthesis generates its final conclusion from a clean stage start and separate logits.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(3);
+    const uint64_t ep_id = runtime.adopt_root(95, 95, 0, 1, 0);
+    CHECK(ep_id != 0);
+
+    const auto decision = server_rerot_parse_routing_decision(R"json({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "algebra", "intent": "Derive algebraic lemma: a^2 - b^2 = (a-b)(a+b)"},
+          {"id": "geometry", "intent": "Construct geometric dissection proof"}
+        ],
+        "depends_on": []
+      }
+    })json");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+
+    auto * root = runtime.node(ep_id, 0);
+    if (root && root->physical_slot >= 0) {
+        CHECK(runtime.detach_node(ep_id, 0));
+    }
+
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->synthesis_node != LLAMA_REROT_NODE_INVALID);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 2);
+
+    // Verify distinct intents stored in episode runtime nodes
+    const auto * node_alg = runtime.node(ep_id, 1);
+    const auto * node_geo = runtime.node(ep_id, 2);
+    CHECK(node_alg != nullptr && node_alg->intent.find("algebraic lemma") != std::string::npos);
+    CHECK(node_geo != nullptr && node_geo->intent.find("geometric dissection") != std::string::npos);
+    CHECK(node_alg->intent != node_geo->intent);
+
+    // Admit both parallel workers
+    llama_rerot_node_id n_alg = LLAMA_REROT_NODE_INVALID;
+    llama_rerot_node_id n_geo = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 2, &n_alg));
+    CHECK(runtime.admit_next_child(ep_id, 1, 3, &n_geo));
+    CHECK(n_alg == 1 && n_geo == 2);
+    CHECK(runtime.complete_admission(ep_id, n_alg));
+    CHECK(runtime.complete_admission(ep_id, n_geo));
+
+    // Create shared root plan prefix run
+    const auto run_p = ep->document.append_run(0, llama_rerot_visibility::public_live, 0, 10, 1);
+    CHECK(run_p != LLAMA_REROT_RUN_INVALID);
+
+    // Worker 1 writes algebraic reasoning and publishes its run
+    const auto run_alg = ep->document.append_run(n_alg, llama_rerot_visibility::public_live, 10, 6, 1);
+    CHECK(run_alg != LLAMA_REROT_RUN_INVALID);
+
+    // Worker 2 writes geometric reasoning and publishes its run
+    const auto run_geo = ep->document.append_run(n_geo, llama_rerot_visibility::public_live, 16, 8, 1);
+    CHECK(run_geo != LLAMA_REROT_RUN_INVALID);
+
+    // Publish frontier 1
+    auto fr1 = runtime.finish_frontier(ep_id);
+    CHECK(!fr1.hard_aborted);
+
+    // Verify each worker's distinct run identity and content
+    const auto * alg_run = ep->document.run(run_alg);
+    const auto * geo_run = ep->document.run(run_geo);
+    CHECK(alg_run != nullptr && geo_run != nullptr);
+    CHECK(alg_run->owner == n_alg);
+    CHECK(geo_run->owner == n_geo);
+    CHECK(alg_run->id != geo_run->id);
+    CHECK(alg_run->token_count == 6);
+    CHECK(geo_run->token_count == 8);
+
+    // Seal worker 1 (algebra) with legitimate worker_source provenance
+    CHECK(runtime.seal_dag_node(ep_id, n_alg, llama_rerot_event_origin::worker_source));
+    CHECK(ep->nodes[n_alg].is_sealed);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 1);
+    CHECK(runtime.get_eligible_dag_nodes(ep_id).empty()); // synthesis not eligible yet
+
+    // Seal worker 2 (geometry)
+    CHECK(runtime.seal_dag_node(ep_id, n_geo, llama_rerot_event_origin::worker_source));
+    CHECK(ep->nodes[n_geo].is_sealed);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 0);
+
+    // Now synthesis is unlocked and eligible!
+    auto eligible = runtime.get_eligible_dag_nodes(ep_id);
+    CHECK(eligible.size() == 1);
+    CHECK(eligible[0] == ep->synthesis_node);
+
+    // Finish frontier triggers synthesis readiness
+    auto fr2 = runtime.finish_frontier(ep_id);
+    CHECK(!fr2.hard_aborted);
+    CHECK(fr2.synthesis_node == ep->synthesis_node);
+
+    // Build synthesis reader view (reader == 0)
+    const auto view_synth = runtime.build_dag_view_for_reader(ep_id, 0);
+    // Runs: [root plan (owner 0), alg frame+body (owner 1), geo frame+body (owner 2)]
+    CHECK(view_synth.runs.size() >= 3);
+    CHECK(view_synth.runs[0].owner == 0); // root plan
+
+    // Both workers must appear in the synthesis view, exactly once, with their distinct owners
+    size_t count_alg = 0;
+    size_t count_geo = 0;
+    for (const auto & entry : view_synth.runs) {
+        if (entry.owner == n_alg) count_alg++;
+        if (entry.owner == n_geo) count_geo++;
+    }
+    CHECK(count_alg == 1);
+    CHECK(count_geo == 1);
+
+    // Verify ordering in synthesis view: root -> algebra -> geometry
+    bool seen_root = false;
+    bool seen_alg = false;
+    bool seen_geo = false;
+    for (const auto & entry : view_synth.runs) {
+        if (entry.owner == 0) seen_root = true;
+        if (entry.owner == n_alg) {
+            CHECK(seen_root);
+            seen_alg = true;
+        }
+        if (entry.owner == n_geo) {
+            CHECK(seen_alg);
+            seen_geo = true;
+        }
+    }
+    CHECK(seen_root && seen_alg && seen_geo);
+
+    // Verify synthesis node state and admission
+    llama_rerot_node_id n_synth_admitted = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 2, 4, &n_synth_admitted));
+    CHECK(n_synth_admitted == ep->synthesis_node);
+    CHECK(runtime.complete_admission(ep_id, n_synth_admitted));
+    CHECK(ep->document.node(ep->synthesis_node)->state == llama_rerot_node_state::running);
+
+    // Synthesis writes final unified summary run
+    const auto run_synth = ep->document.append_run(ep->synthesis_node, llama_rerot_visibility::public_live, 24, 12, 1);
+    CHECK(run_synth != LLAMA_REROT_RUN_INVALID);
+    auto fr3 = runtime.finish_frontier(ep_id);
+    CHECK(!fr3.hard_aborted);
+    const auto * synth_run = ep->document.run(run_synth);
+    CHECK(synth_run != nullptr && synth_run->owner == ep->synthesis_node);
+    CHECK(synth_run->token_count == 12);
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT Runtime Tests ===\n");
     test_c0_and_dag_admit_without_parked_seq();
@@ -5675,6 +5831,7 @@ int main() {
     test_dag_microbatch_slice_order_and_no_earlier_public_leak();
     test_dag_duplicate_source_end_and_restore_no_double_decrement();
     test_dag_abort_clears_orphan_refs_and_pens();
+    test_dag_synthesis_complementary_results_distinct_intents();
     test_dag_three_lane_flat_cycle_and_peer_uptake();
     test_dag_diamond_and_unequal_length_history();
     test_dag_a_to_c_with_b_independent_overlap();

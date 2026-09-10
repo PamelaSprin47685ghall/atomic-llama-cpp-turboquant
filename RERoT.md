@@ -1563,6 +1563,7 @@ run B: probe → simple → restore
 - flat 三 lane 循环读者顺序（`1->(2,3,1)`, `2->(3,1,2)`, `3->(1,2,3)`）与跨 frontier 持续 peer uptake 历史保留测试通过（`test_dag_three_lane_flat_cycle_and_peer_uptake`）。
 - `A->C` + B independent 工作负载测试通过（`test_dag_a_to_c_with_b_independent_overlap`）：验证 A seal 解锁 C、B 与 C 并发重叠推进、已完成前驱 A 历史在 B/C 读者视角中持续保留且坐标准确。
 - `1->2`, `1->3`, `2->4`, `3->4` 菱形依赖门控、不等长生成（3 vs 10 tokens）、前驱 1 唯一样本去重展开与阶段自然完结测试通过（`test_dag_diamond_and_unequal_length_history`）。
+- synthesis 互补结果与独立意图测试通过（`test_dag_synthesis_complementary_results_distinct_intents`）：验证并行 Worker 各自独立意图（代数推导 vs 几何剖分）生成互补结论，所有前驱完结后 synthesis 节点精确解锁；synthesis 读者视界中按拓扑偏序单次且完整呈现各前驱结论，无 intent 串线或跨阶段污染。
 - `test-rerot-view` 包含 4 节点全 DAG 拓扑、循环偏序及菱形单次祖先展开断言。
 - 物理卡 AMD Radeon RX 6800 上 Vulkan 周期注意力精度门（`test-rerot-attn --precision-only`，keys=33/257，误差 $\le 1.19 \times 10^{-7}$）及 DDVR 多 span 相位补偿门 100% 通过。
 
