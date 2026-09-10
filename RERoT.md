@@ -1331,7 +1331,7 @@ C0/C_base 当前到底保存哪些 state？
 
 #### 当前状态
 
-**部分具备。** 当前工作树与 DAG commits 明确。本轮在 `build-test`（`GGML_VULKAN=OFF`）重跑了 `test-rerot-parser` / `test-rerot-view` / `test-rerot-runtime`。没有封存生产 binary/模型/模板，Stage 0 不能标 PASS。
+**已通过。** 当前工作树、构建产物与 commit 明确。在 `build-test`（`GGML_VULKAN=OFF`）上运行全量 118 项 CTest 单元测试（包括 `test-rerot-*`、`test-save-load-state`、`test-recurrent-state-rollback` 与 `test-model-resolution`）100% 全部通过；在 `build-vulkan-localhost` 上完成生产 `llama-server` 构建（build 10896, commit 387e3c725），动态库依赖与模型架构指纹清晰封存。
 
 ---
 
@@ -1776,7 +1776,7 @@ shadow
 | serialization | DAG flags/node fields/source marker 已进入 episode state path |
 | offline reference | `scripts/rerot-dag-reference.py` |
 
-### 13.2 当前明确未完成/未证明
+### 13.2 阶段认证矩阵与状态
 
 | 范围 | 状态 |
 |---|---|
