@@ -4498,6 +4498,433 @@ static void test_dag_prefix_rebuild_reconciles_root_runs() {
     CHECK(!runtime.prepare_dag_prefix_rebuild(ep_id, 6, &err));
 }
 
+static void test_dag_three_lane_flat_cycle_and_peer_uptake() {
+    // AGENTS.md stage 6 minimal workload 1 (RERoT.md §12.7): flat three lanes.
+    // Verifies cyclic reader order 1->(2,3,1), 2->(3,1,2), 3->(1,2,3) and
+    // continuous peer uptake across frontiers without history loss.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(4);
+
+    const uint64_t ep_id = runtime.adopt_root(40, 40, 0, 1, 0);
+    CHECK(ep_id != 0);
+
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Fact C"}
+        ],
+        "depends_on": []
+      }
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->is_dag);
+    CHECK(ep->synthesis_node != 0);
+    CHECK(ep->synthesis_node != LLAMA_REROT_NODE_INVALID);
+    CHECK(ep->nodes[1].remaining_preds == 0);
+    CHECK(ep->nodes[2].remaining_preds == 0);
+    CHECK(ep->nodes[3].remaining_preds == 0);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 3);
+    CHECK(!ep->c_base.valid());
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(ep->c0.valid());
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(ep->c_base.valid());
+
+    // Initial eligibility: all three lanes, synthesis blocked.
+    auto eligible = runtime.get_eligible_dag_nodes(ep_id);
+    CHECK(eligible.size() == 3);
+    CHECK(std::find(eligible.begin(), eligible.end(), 1) != eligible.end());
+    CHECK(std::find(eligible.begin(), eligible.end(), 2) != eligible.end());
+    CHECK(std::find(eligible.begin(), eligible.end(), 3) != eligible.end());
+    CHECK(std::find(eligible.begin(), eligible.end(), ep->synthesis_node) == eligible.end());
+
+    auto pen_a = runtime.allocate_pen(40, ep_id, 1);
+    CHECK(pen_a.has_value());
+    CHECK(ep->document.set_node_state(1, llama_rerot_node_state::running));
+    ep->running.insert(1);
+    ep->nodes[1].pen_id = *pen_a;
+
+    auto pen_b = runtime.allocate_pen(40, ep_id, 2);
+    CHECK(pen_b.has_value());
+    CHECK(ep->document.set_node_state(2, llama_rerot_node_state::running));
+    ep->running.insert(2);
+    ep->nodes[2].pen_id = *pen_b;
+
+    auto pen_c = runtime.allocate_pen(40, ep_id, 3);
+    CHECK(pen_c.has_value());
+    CHECK(ep->document.set_node_state(3, llama_rerot_node_state::running));
+    ep->running.insert(3);
+    ep->nodes[3].pen_id = *pen_c;
+
+    // First frontier wave: shared prefix plus one public run per lane.
+    // All runs share publish epoch 1 so the frozen read watermark captured by
+    // finish_frontier (episode publish epoch, untouched by direct appends)
+    // never gates them: this test pins ordering/uptake, not frozen gating.
+    const auto run_p = ep->document.append_run(0, llama_rerot_visibility::public_live, 0, 10, 1);
+    const auto run_a1 = ep->document.append_run(1, llama_rerot_visibility::public_live, 10, 4, 1);
+    const auto run_b1 = ep->document.append_run(2, llama_rerot_visibility::public_live, 14, 6, 1);
+    const auto run_c1 = ep->document.append_run(3, llama_rerot_visibility::public_live, 20, 5, 1);
+    CHECK(run_p != LLAMA_REROT_RUN_INVALID);
+    CHECK(run_a1 != LLAMA_REROT_RUN_INVALID);
+    CHECK(run_b1 != LLAMA_REROT_RUN_INVALID);
+    CHECK(run_c1 != LLAMA_REROT_RUN_INVALID);
+
+    // Cyclic reader order: own work last, peers in plan cycle.
+    const auto view_a = runtime.build_dag_view_for_reader(ep_id, 1);
+    CHECK(view_a.runs.size() == 4);
+    CHECK(view_a.runs[0].owner == 0);
+    CHECK(view_a.runs[1].owner == 2);
+    CHECK(view_a.runs[2].owner == 3);
+    CHECK(view_a.runs[3].owner == 1);
+
+    const auto view_b = runtime.build_dag_view_for_reader(ep_id, 2);
+    CHECK(view_b.runs.size() == 4);
+    CHECK(view_b.runs[0].owner == 0);
+    CHECK(view_b.runs[1].owner == 3);
+    CHECK(view_b.runs[2].owner == 1);
+    CHECK(view_b.runs[3].owner == 2);
+
+    const auto view_c = runtime.build_dag_view_for_reader(ep_id, 3);
+    CHECK(view_c.runs.size() == 4);
+    CHECK(view_c.runs[0].owner == 0);
+    CHECK(view_c.runs[1].owner == 1);
+    CHECK(view_c.runs[2].owner == 2);
+    CHECK(view_c.runs[3].owner == 3);
+
+    const auto view_s = runtime.build_dag_view_for_reader(ep_id, 0);
+    CHECK(view_s.runs.size() == 4);
+    CHECK(view_s.runs[0].owner == 0);
+    CHECK(view_s.runs[1].owner == 1);
+    CHECK(view_s.runs[2].owner == 2);
+    CHECK(view_s.runs[3].owner == 3);
+
+    // Advance the frontier with no seals pending (empty cohort publishes trivially).
+    const auto fr1 = runtime.finish_frontier(ep_id);
+    CHECK(!fr1.hard_aborted);
+    ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+
+    // Second wave: incremental public tokens on every lane.
+    const auto run_a2 = ep->document.append_run(1, llama_rerot_visibility::public_live, 25, 2, 1);
+    const auto run_b2 = ep->document.append_run(2, llama_rerot_visibility::public_live, 27, 2, 1);
+    const auto run_c2 = ep->document.append_run(3, llama_rerot_visibility::public_live, 29, 2, 1);
+    CHECK(run_a2 != LLAMA_REROT_RUN_INVALID);
+    CHECK(run_b2 != LLAMA_REROT_RUN_INVALID);
+    CHECK(run_c2 != LLAMA_REROT_RUN_INVALID);
+
+    // First-wave history is untouched by the second wave.
+    CHECK(ep->document.run(run_a1)->token_count == 4);
+    CHECK(ep->document.run(run_b1)->token_count == 6);
+    CHECK(ep->document.run(run_c1)->token_count == 5);
+
+    // Peer uptake: every reader sees both waves of every peer plus its own,
+    // ordered by owning node (each node's runs in document order).
+    const auto view_a2 = runtime.build_dag_view_for_reader(ep_id, 1);
+    CHECK(view_a2.runs.size() == 7);
+    CHECK(view_a2.runs[0].owner == 0);
+    CHECK(view_a2.runs[1].owner == 2);
+    CHECK(view_a2.runs[2].owner == 2);
+    CHECK(view_a2.runs[3].owner == 3);
+    CHECK(view_a2.runs[4].owner == 3);
+    CHECK(view_a2.runs[5].owner == 1);
+    CHECK(view_a2.runs[6].owner == 1);
+    CHECK(dag_view_has_run(view_a2, run_p));
+    CHECK(dag_view_has_run(view_a2, run_a1));
+    CHECK(dag_view_has_run(view_a2, run_a2));
+    CHECK(dag_view_has_run(view_a2, run_b1));
+    CHECK(dag_view_has_run(view_a2, run_b2));
+    CHECK(dag_view_has_run(view_a2, run_c1));
+    CHECK(dag_view_has_run(view_a2, run_c2));
+    CHECK(view_a2.query_virtual_pos == 31);
+
+    const auto view_b2 = runtime.build_dag_view_for_reader(ep_id, 2);
+    CHECK(view_b2.runs.size() == 7);
+    CHECK(view_b2.runs[0].owner == 0);
+    CHECK(view_b2.runs[1].owner == 3);
+    CHECK(view_b2.runs[2].owner == 3);
+    CHECK(view_b2.runs[3].owner == 1);
+    CHECK(view_b2.runs[4].owner == 1);
+    CHECK(view_b2.runs[5].owner == 2);
+    CHECK(view_b2.runs[6].owner == 2);
+    CHECK(dag_view_has_run(view_b2, run_a2));
+    CHECK(dag_view_has_run(view_b2, run_b2));
+    CHECK(dag_view_has_run(view_b2, run_c2));
+    CHECK(view_b2.query_virtual_pos == 31);
+
+    const auto view_c2 = runtime.build_dag_view_for_reader(ep_id, 3);
+    CHECK(view_c2.runs.size() == 7);
+    CHECK(view_c2.runs[0].owner == 0);
+    CHECK(view_c2.runs[1].owner == 1);
+    CHECK(view_c2.runs[2].owner == 1);
+    CHECK(view_c2.runs[3].owner == 2);
+    CHECK(view_c2.runs[4].owner == 2);
+    CHECK(view_c2.runs[5].owner == 3);
+    CHECK(view_c2.runs[6].owner == 3);
+    CHECK(dag_view_has_run(view_c2, run_a2));
+    CHECK(dag_view_has_run(view_c2, run_b2));
+    CHECK(dag_view_has_run(view_c2, run_c2));
+    CHECK(view_c2.query_virtual_pos == 31);
+
+    // Seal all lanes; the cohort then publishes and retires without dropping history.
+    CHECK(runtime.seal_dag_node(ep_id, 1, llama_rerot_event_origin::worker_source));
+    CHECK(runtime.seal_dag_node(ep_id, 2, llama_rerot_event_origin::worker_source));
+    CHECK(runtime.seal_dag_node(ep_id, 3, llama_rerot_event_origin::worker_source));
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 0);
+    const auto fr2 = runtime.finish_frontier(ep_id);
+    CHECK(!fr2.hard_aborted);
+    ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+
+    const auto view_a3 = runtime.build_dag_view_for_reader(ep_id, 1);
+    CHECK(view_a3.runs.size() == 7);
+    CHECK(view_a3.runs[0].owner == 0);
+    CHECK(view_a3.runs[1].owner == 2);
+    CHECK(view_a3.runs[2].owner == 2);
+    CHECK(view_a3.runs[3].owner == 3);
+    CHECK(view_a3.runs[4].owner == 3);
+    CHECK(view_a3.runs[5].owner == 1);
+    CHECK(view_a3.runs[6].owner == 1);
+    CHECK(view_a3.query_virtual_pos == 31);
+
+    const auto view_s2 = runtime.build_dag_view_for_reader(ep_id, 0);
+    CHECK(view_s2.runs.size() == 7);
+    CHECK(view_s2.runs[0].owner == 0);
+    CHECK(view_s2.runs[1].owner == 1);
+    CHECK(view_s2.runs[2].owner == 1);
+    CHECK(view_s2.runs[3].owner == 2);
+    CHECK(view_s2.runs[4].owner == 2);
+    CHECK(view_s2.runs[5].owner == 3);
+    CHECK(view_s2.runs[6].owner == 3);
+    CHECK(view_s2.query_virtual_pos == 31);
+    CHECK(ep->document.run(run_a1)->token_count == 4);
+    CHECK(ep->document.run(run_b1)->token_count == 6);
+    CHECK(ep->document.run(run_c1)->token_count == 5);
+    CHECK(ep->document.run(run_a2)->token_count == 2);
+    CHECK(ep->document.run(run_b2)->token_count == 2);
+    CHECK(ep->document.run(run_c2)->token_count == 2);
+}
+
+static void test_dag_diamond_and_unequal_length_history() {
+    // AGENTS.md stage 6 minimal workloads 3+4 (RERoT.md §12.7): diamond join
+    // 1->2, 1->3, 2->4, 3->4 with unequal lane lengths. Verifies join gating,
+    // unique ancestor expansion, and completed-node history retention.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(4);
+
+    const uint64_t ep_id = runtime.adopt_root(41, 41, 0, 1, 0);
+    CHECK(ep_id != 0);
+
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "1", "intent": "Base fact"},
+          {"id": "2", "intent": "Left branch"},
+          {"id": "3", "intent": "Right branch"},
+          {"id": "4", "intent": "Join synthesis"}
+        ],
+        "depends_on": [
+          {"id": "2", "depends_on_id": "1"},
+          {"id": "3", "depends_on_id": "1"},
+          {"id": "4", "depends_on_id": "2"},
+          {"id": "4", "depends_on_id": "3"}
+        ]
+      }
+    })");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->is_dag);
+    CHECK(ep->synthesis_node != 0);
+    CHECK(ep->synthesis_node != LLAMA_REROT_NODE_INVALID);
+    CHECK(ep->nodes[1].remaining_preds == 0);
+    CHECK(ep->nodes[2].remaining_preds == 1);
+    CHECK(ep->nodes[3].remaining_preds == 1);
+    CHECK(ep->nodes[4].remaining_preds == 2);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 4);
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(ep->c_base.valid());
+
+    // Only the diamond source is initially eligible.
+    auto eligible = runtime.get_eligible_dag_nodes(ep_id);
+    CHECK(eligible.size() == 1);
+    CHECK(eligible[0] == 1);
+
+    auto pen_1 = runtime.allocate_pen(41, ep_id, 1);
+    CHECK(pen_1.has_value());
+    CHECK(ep->document.set_node_state(1, llama_rerot_node_state::running));
+    ep->running.insert(1);
+    ep->nodes[1].pen_id = *pen_1;
+
+    // All runs share publish epoch 1 so the frozen read watermark captured by
+    // finish_frontier never gates them: this test pins join/history, not frozen gating.
+    const auto run_p = ep->document.append_run(0, llama_rerot_visibility::public_live, 0, 10, 1);
+    const auto run_1 = ep->document.append_run(1, llama_rerot_visibility::public_live, 10, 5, 1);
+    CHECK(run_p != LLAMA_REROT_RUN_INVALID);
+    CHECK(run_1 != LLAMA_REROT_RUN_INVALID);
+
+    CHECK(runtime.seal_dag_node(ep_id, 1, llama_rerot_event_origin::worker_source));
+    CHECK(ep->nodes[1].is_sealed);
+    CHECK(ep->document.node(1)->state == llama_rerot_node_state::retired);
+
+    // Both branches unlock; the join stays blocked on both.
+    CHECK(ep->nodes[2].remaining_preds == 0);
+    CHECK(ep->nodes[3].remaining_preds == 0);
+    CHECK(ep->nodes[4].remaining_preds == 2);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 3);
+    eligible = runtime.get_eligible_dag_nodes(ep_id);
+    CHECK(eligible.size() == 2);
+    CHECK(std::find(eligible.begin(), eligible.end(), 2) != eligible.end());
+    CHECK(std::find(eligible.begin(), eligible.end(), 3) != eligible.end());
+    CHECK(std::find(eligible.begin(), eligible.end(), 4) == eligible.end());
+    CHECK(std::find(eligible.begin(), eligible.end(), ep->synthesis_node) == eligible.end());
+
+    auto pen_2 = runtime.allocate_pen(41, ep_id, 2);
+    CHECK(pen_2.has_value());
+    CHECK(ep->document.set_node_state(2, llama_rerot_node_state::running));
+    ep->running.insert(2);
+    ep->nodes[2].pen_id = *pen_2;
+
+    auto pen_3 = runtime.allocate_pen(41, ep_id, 3);
+    CHECK(pen_3.has_value());
+    CHECK(ep->document.set_node_state(3, llama_rerot_node_state::running));
+    ep->running.insert(3);
+    ep->nodes[3].pen_id = *pen_3;
+
+    // Unequal lengths: short branch finishes in 3 tokens, long branch runs 10.
+    const auto run_2 = ep->document.append_run(2, llama_rerot_visibility::public_live, 15, 3, 1);
+    const auto run_3 = ep->document.append_run(3, llama_rerot_visibility::public_live, 18, 10, 1);
+    CHECK(run_2 != LLAMA_REROT_RUN_INVALID);
+    CHECK(run_3 != LLAMA_REROT_RUN_INVALID);
+    CHECK(ep->document.run(run_2)->token_count == 3);
+    CHECK(ep->document.run(run_3)->token_count == 10);
+
+    const auto fr1 = runtime.finish_frontier(ep_id);
+    CHECK(!fr1.hard_aborted);
+    ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+
+    // Seal the short branch first: the join must remain blocked on the long branch.
+    CHECK(runtime.seal_dag_node(ep_id, 2, llama_rerot_event_origin::worker_source));
+    CHECK(ep->nodes[2].is_sealed);
+    CHECK(ep->nodes[4].remaining_preds == 1);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 2);
+    eligible = runtime.get_eligible_dag_nodes(ep_id);
+    CHECK(std::find(eligible.begin(), eligible.end(), 4) == eligible.end());
+
+    // Completed short-branch history survives while the long branch continues.
+    CHECK(ep->document.run(run_2)->token_count == 3);
+    const auto view_3_mid = runtime.build_dag_view_for_reader(ep_id, 3);
+    CHECK(dag_view_has_run(view_3_mid, run_p));
+    CHECK(dag_view_has_run(view_3_mid, run_1));
+    CHECK(dag_view_has_run(view_3_mid, run_2));
+    CHECK(dag_view_has_run(view_3_mid, run_3));
+
+    // Sealing the long branch unlocks the join.
+    CHECK(runtime.seal_dag_node(ep_id, 3, llama_rerot_event_origin::worker_source));
+    CHECK(ep->nodes[3].is_sealed);
+    CHECK(ep->nodes[4].remaining_preds == 0);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 1);
+    eligible = runtime.get_eligible_dag_nodes(ep_id);
+    CHECK(eligible.size() == 1);
+    CHECK(eligible[0] == 4);
+
+    auto pen_4 = runtime.allocate_pen(41, ep_id, 4);
+    CHECK(pen_4.has_value());
+    CHECK(ep->document.set_node_state(4, llama_rerot_node_state::running));
+    ep->running.insert(4);
+    ep->nodes[4].pen_id = *pen_4;
+    const auto run_4 = ep->document.append_run(4, llama_rerot_visibility::public_live, 28, 4, 1);
+    CHECK(run_4 != LLAMA_REROT_RUN_INVALID);
+
+    // Join reader view: shared ancestor 1 appears exactly once despite two paths.
+    const auto view_4 = runtime.build_dag_view_for_reader(ep_id, 4);
+    CHECK(view_4.runs.size() == 5);
+    CHECK(view_4.runs[0].owner == 0);
+    CHECK(view_4.runs[1].owner == 1);
+    CHECK(view_4.runs[2].owner == 2);
+    CHECK(view_4.runs[3].owner == 3);
+    CHECK(view_4.runs[4].owner == 4);
+    size_t count_1 = 0;
+    size_t count_2 = 0;
+    size_t count_3 = 0;
+    size_t count_4 = 0;
+    for (const auto & entry : view_4.runs) {
+        count_1 += (entry.owner == 1) ? 1 : 0;
+        count_2 += (entry.owner == 2) ? 1 : 0;
+        count_3 += (entry.owner == 3) ? 1 : 0;
+        count_4 += (entry.owner == 4) ? 1 : 0;
+    }
+    CHECK(count_1 == 1);
+    CHECK(count_2 == 1);
+    CHECK(count_3 == 1);
+    CHECK(count_4 == 1);
+    CHECK(dag_view_has_run(view_4, run_p));
+    CHECK(dag_view_has_run(view_4, run_1));
+    CHECK(dag_view_has_run(view_4, run_2));
+    CHECK(dag_view_has_run(view_4, run_3));
+    CHECK(dag_view_has_run(view_4, run_4));
+    CHECK(ep->document.run(run_1)->token_count == 5);
+    CHECK(ep->document.run(run_2)->token_count == 3);
+    CHECK(ep->document.run(run_3)->token_count == 10);
+    CHECK(ep->document.run(run_4)->token_count == 4);
+
+    CHECK(runtime.seal_dag_node(ep_id, 4, llama_rerot_event_origin::worker_source));
+    CHECK(ep->nodes[4].is_sealed);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 0);
+
+    // Synthesis sees every worker exactly once with full completed history.
+    const auto view_s = runtime.build_dag_view_for_reader(ep_id, 0);
+    CHECK(view_s.runs.size() == 5);
+    CHECK(view_s.runs[0].owner == 0);
+    CHECK(view_s.runs[1].owner == 1);
+    CHECK(view_s.runs[2].owner == 2);
+    CHECK(view_s.runs[3].owner == 3);
+    CHECK(view_s.runs[4].owner == 4);
+    size_t synth_1 = 0;
+    size_t synth_2 = 0;
+    size_t synth_3 = 0;
+    size_t synth_4 = 0;
+    for (const auto & entry : view_s.runs) {
+        synth_1 += (entry.owner == 1) ? 1 : 0;
+        synth_2 += (entry.owner == 2) ? 1 : 0;
+        synth_3 += (entry.owner == 3) ? 1 : 0;
+        synth_4 += (entry.owner == 4) ? 1 : 0;
+    }
+    CHECK(synth_1 == 1);
+    CHECK(synth_2 == 1);
+    CHECK(synth_3 == 1);
+    CHECK(synth_4 == 1);
+    CHECK(dag_view_has_run(view_s, run_1));
+    CHECK(dag_view_has_run(view_s, run_2));
+    CHECK(dag_view_has_run(view_s, run_3));
+    CHECK(dag_view_has_run(view_s, run_4));
+
+    const auto fr2 = runtime.finish_frontier(ep_id);
+    CHECK(!fr2.hard_aborted);
+    CHECK(fr2.synthesis_node == ep->synthesis_node);
+    ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    const auto view_s2 = runtime.build_dag_view_for_reader(ep_id, 0);
+    CHECK(view_s2.runs.size() == 5);
+    CHECK(ep->document.run(run_1)->token_count == 5);
+    CHECK(ep->document.run(run_2)->token_count == 3);
+    CHECK(ep->document.run(run_3)->token_count == 10);
+    CHECK(ep->document.run(run_4)->token_count == 4);
+}
+
 static void test_dag_initialize_refuses_double_init() {
     server_rerot_runtime runtime(nullptr);
     runtime.set_pen_capacity(2);
@@ -4548,6 +4975,8 @@ int main() {
     test_dag_ensure_run_keeps_segment_kinds_distinct();
     test_dag_prefix_rebuild_reconciles_root_runs();
     test_dag_initialize_refuses_double_init();
+    test_dag_three_lane_flat_cycle_and_peer_uptake();
+    test_dag_diamond_and_unequal_length_history();
     test_dag_shift_pins_started_public_history();
     test_context_shift_pins_frame_runs();
     test_recurrent_only_pressure_isolation();

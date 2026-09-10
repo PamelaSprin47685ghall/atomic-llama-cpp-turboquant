@@ -1541,7 +1541,11 @@ run B: probe → simple → restore
 
 #### 当前状态
 
-旧数值证据很多，DAG 新 reader/protocol 尚未完整重新认证。
+**核心最小 workload 单元测试已全部落地并通过：**
+- flat 三 lane 循环读者顺序（`1->(2,3,1)`, `2->(3,1,2)`, `3->(1,2,3)`）与跨 frontier 持续 peer uptake 历史保留测试通过（`test_dag_three_lane_flat_cycle_and_peer_uptake`）。
+- `1->2`, `1->3`, `2->4`, `3->4` 菱形依赖门控、不等长生成（3 vs 10 tokens）、前驱 1 唯一样本去重展开与阶段自然完结测试通过（`test_dag_diamond_and_unequal_length_history`）。
+- `test-rerot-view` 包含 4 节点全 DAG 拓扑、循环偏序及菱形单次祖先展开断言。
+- 物理卡 AMD Radeon RX 6800 上 Vulkan 周期注意力精度门（`test-rerot-attn --precision-only`，keys=33/257，误差 $\le 1.19 \times 10^{-7}$）及 DDVR 多 span 相位补偿门 100% 通过。
 
 ---
 
