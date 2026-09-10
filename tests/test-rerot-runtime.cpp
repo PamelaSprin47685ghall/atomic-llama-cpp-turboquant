@@ -5581,6 +5581,205 @@ static void test_dag_abort_clears_orphan_refs_and_pens() {
     CHECK(runtime.episode(ep_id) == nullptr);
 }
 
+static void test_dag_demote_restore_different_physical_slots() {
+    // Stage 7 (§12.8) / AGENTS.md 阶段 7:
+    // "fork/启动后 demote -> 换物理位置 restore: 图、入口 cursor、source end、局部状态、输出继续一致"
+    //
+    // Setup:
+    // 1. Runtime A (reference) runs an uninterrupted DAG:
+    //    root (0) -> Worker A (1), Worker B (2) -> Synthesis (3)
+    //    Workers admit into physical slots 1 and 2, generate tokens, and seal.
+    // 2. Runtime B (test target) creates the identical DAG:
+    //    Workers admit into physical slots 1 and 2, generate initial tokens,
+    //    attach sampler/MTP/state snapshots, and then demote_episode() is called
+    //    to release physical slot bindings.
+    // 3. Runtime B serializes to RAM blob (save_episode).
+    // 4. In Runtime B, slots 1 and 2 are occupied by unrelated work.
+    // 5. Episode is restored (load_episode) and rebound to DIFFERENT physical slots (slots 3 and 4).
+    // 6. Restored workers continue generating the same subsequent tokens.
+    // 7. Verifies logical DAG equivalence, token counts, run structure, and reader view identicality.
+
+    // 1. Reference runtime
+    server_rerot_runtime ref_runtime(nullptr);
+    ref_runtime.set_pen_capacity(6);
+    const uint64_t ep_ref = ref_runtime.adopt_root(100, 100, 0, 1, 0);
+    CHECK(ep_ref != 0);
+    const auto decision = server_rerot_parse_routing_decision(R"json({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Worker Alpha"},
+          {"id": "B", "intent": "Worker Beta"}
+        ],
+        "depends_on": []
+      }
+    })json");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(ref_runtime.initialize_dag(ep_ref, decision, &err));
+    CHECK(ref_runtime.capture_c0(ep_ref, 1, 0));
+    CHECK(ref_runtime.capture_c_base(ep_ref));
+    CHECK(ref_runtime.activate_dag_frontier(ep_ref));
+
+    auto * ref_root = ref_runtime.node(ep_ref, 0);
+    if (ref_root && ref_root->physical_slot >= 0) {
+        CHECK(ref_runtime.detach_node(ep_ref, 0));
+    }
+    llama_rerot_node_id ref_w1 = LLAMA_REROT_NODE_INVALID;
+    llama_rerot_node_id ref_w2 = LLAMA_REROT_NODE_INVALID;
+    CHECK(ref_runtime.admit_next_child(ep_ref, 1, 10, &ref_w1));
+    CHECK(ref_runtime.admit_next_child(ep_ref, 2, 20, &ref_w2));
+    CHECK(ref_w1 == 1 && ref_w2 == 2);
+    CHECK(ref_runtime.complete_admission(ep_ref, ref_w1));
+    CHECK(ref_runtime.complete_admission(ep_ref, ref_w2));
+
+    // Append initial public tokens to reference workers
+    auto * ref_ep = ref_runtime.episode(ep_ref);
+    const auto ref_r1 = ref_ep->document.append_run(ref_w1, llama_rerot_visibility::public_live, 10, 4, 1);
+    const auto ref_r2 = ref_ep->document.append_run(ref_w2, llama_rerot_visibility::public_live, 20, 5, 2);
+    ref_ep->nodes[ref_w1].public_run = ref_r1;
+    ref_ep->nodes[ref_w2].public_run = ref_r2;
+
+    // 2. Target runtime: identical initial setup
+    server_rerot_runtime tgt_runtime(nullptr);
+    tgt_runtime.set_pen_capacity(6);
+    const uint64_t ep_tgt = tgt_runtime.adopt_root(100, 100, 0, 1, 0);
+    CHECK(ep_tgt == ep_ref);
+    CHECK(tgt_runtime.initialize_dag(ep_tgt, decision, &err));
+    CHECK(tgt_runtime.capture_c0(ep_tgt, 1, 0));
+    CHECK(tgt_runtime.capture_c_base(ep_tgt));
+    CHECK(tgt_runtime.activate_dag_frontier(ep_tgt));
+
+    auto * tgt_root = tgt_runtime.node(ep_tgt, 0);
+    if (tgt_root && tgt_root->physical_slot >= 0) {
+        CHECK(tgt_runtime.detach_node(ep_tgt, 0));
+    }
+    llama_rerot_node_id tgt_w1 = LLAMA_REROT_NODE_INVALID;
+    llama_rerot_node_id tgt_w2 = LLAMA_REROT_NODE_INVALID;
+    CHECK(tgt_runtime.admit_next_child(ep_tgt, 1, 10, &tgt_w1));
+    CHECK(tgt_runtime.admit_next_child(ep_tgt, 2, 20, &tgt_w2));
+    CHECK(tgt_w1 == 1 && tgt_w2 == 2);
+    CHECK(tgt_runtime.complete_admission(ep_tgt, tgt_w1));
+    CHECK(tgt_runtime.complete_admission(ep_tgt, tgt_w2));
+
+    auto * tgt_ep = tgt_runtime.episode(ep_tgt);
+    const auto tgt_r1 = tgt_ep->document.append_run(tgt_w1, llama_rerot_visibility::public_live, 10, 4, 1);
+    const auto tgt_r2 = tgt_ep->document.append_run(tgt_w2, llama_rerot_visibility::public_live, 20, 5, 2);
+    tgt_ep->nodes[tgt_w1].public_run = tgt_r1;
+    tgt_ep->nodes[tgt_w2].public_run = tgt_r2;
+
+    // Attach local state blobs for verification
+    tgt_ep->nodes[tgt_w1].sampler_blob = {0xAA, 0xBB, 0xCC};
+    tgt_ep->nodes[tgt_w1].mtp_blob = {0x11, 0x22};
+    tgt_ep->nodes[tgt_w2].sampler_blob = {0xDD, 0xEE};
+    tgt_ep->nodes[tgt_w2].mtp_blob = {0x33, 0x44};
+
+    // 3. Demote target episode: transient physical slot/pen bindings are released
+    CHECK(tgt_runtime.demote_episode(ep_tgt));
+    CHECK(tgt_runtime.node(ep_tgt, tgt_w1)->physical_slot == -1);
+    CHECK(tgt_runtime.node(ep_tgt, tgt_w2)->physical_slot == -1);
+
+    // 4. Save episode to RAM blob
+    server_rerot_state_fingerprints fp;
+    fp.caps = LLAMA_REROT_STATE_CAP_REROT | LLAMA_REROT_STATE_CAP_REROT_TREE |
+              LLAMA_REROT_STATE_CAP_REROT_PRIVATE;
+    std::vector<uint8_t> ram_blob;
+    CHECK(tgt_runtime.save_episode(ep_tgt, fp, &ram_blob, &err));
+    CHECK(!ram_blob.empty() && err.empty());
+
+    // 5. Erase ep_tgt, and occupy physical slots 1 and 2 with unrelated work
+    CHECK(tgt_runtime.erase_episode(ep_tgt));
+
+    // Allocate an unrelated episode that occupies slots 1 and 2
+    const uint64_t ep_other = tgt_runtime.adopt_root(200, 200, 0, 5, 0);
+    CHECK(ep_other != 0);
+    CHECK(tgt_runtime.initialize_dag(ep_other, decision, &err));
+    CHECK(tgt_runtime.capture_c0(ep_other, 5, 0));
+    CHECK(tgt_runtime.capture_c_base(ep_other));
+    CHECK(tgt_runtime.activate_dag_frontier(ep_other));
+    auto * other_root = tgt_runtime.node(ep_other, 0);
+    if (other_root && other_root->physical_slot >= 0) {
+        CHECK(tgt_runtime.detach_node(ep_other, 0));
+    }
+    llama_rerot_node_id other_w1 = LLAMA_REROT_NODE_INVALID;
+    llama_rerot_node_id other_w2 = LLAMA_REROT_NODE_INVALID;
+    CHECK(tgt_runtime.admit_next_child(ep_other, 1, 51, &other_w1));
+    CHECK(tgt_runtime.admit_next_child(ep_other, 2, 52, &other_w2));
+    CHECK(tgt_runtime.node(ep_other, other_w1)->physical_slot == 1);
+    CHECK(tgt_runtime.node(ep_other, other_w2)->physical_slot == 2);
+
+    // 6. Restore ep_tgt: since it was demoted, physical_slot is -1, so it does NOT conflict with slots 1 and 2!
+    uint64_t restored_id = 0;
+    CHECK(tgt_runtime.load_episode(ram_blob.data(), ram_blob.size(), fp, &restored_id, &err));
+    CHECK(restored_id == ep_tgt);
+
+    auto * restored_ep = tgt_runtime.episode(restored_id);
+    CHECK(restored_ep != nullptr);
+    CHECK(restored_ep->is_dag);
+    CHECK(restored_ep->running.count(tgt_w1) != 0);
+    CHECK(restored_ep->running.count(tgt_w2) != 0);
+
+    // Rebind restored workers to DIFFERENT physical slots (3 and 4)
+    auto * r_node1 = tgt_runtime.node(restored_id, tgt_w1);
+    auto * r_node2 = tgt_runtime.node(restored_id, tgt_w2);
+    CHECK(r_node1 && r_node2);
+    r_node1->physical_slot = 3;
+    r_node1->pen_id = 3;
+    r_node2->physical_slot = 4;
+    r_node2->pen_id = 4;
+
+    // Verify local state blobs were preserved exactly
+    CHECK(r_node1->sampler_blob == std::vector<uint8_t>({0xAA, 0xBB, 0xCC}));
+    CHECK(r_node1->mtp_blob == std::vector<uint8_t>({0x11, 0x22}));
+    CHECK(r_node2->sampler_blob == std::vector<uint8_t>({0xDD, 0xEE}));
+    CHECK(r_node2->mtp_blob == std::vector<uint8_t>({0x33, 0x44}));
+
+    // 7. Both reference and restored continue generation
+    const auto ref_r1_cont = ref_ep->document.append_run(ref_w1, llama_rerot_visibility::public_live, 14, 6, 3);
+    const auto ref_r2_cont = ref_ep->document.append_run(ref_w2, llama_rerot_visibility::public_live, 25, 7, 4);
+    ref_ep->nodes[ref_w1].public_run = ref_r1_cont;
+    ref_ep->nodes[ref_w2].public_run = ref_r2_cont;
+
+    const auto res_r1_cont = restored_ep->document.append_run(tgt_w1, llama_rerot_visibility::public_live, 14, 6, 3);
+    const auto res_r2_cont = restored_ep->document.append_run(tgt_w2, llama_rerot_visibility::public_live, 25, 7, 4);
+    restored_ep->nodes[tgt_w1].public_run = res_r1_cont;
+    restored_ep->nodes[tgt_w2].public_run = res_r2_cont;
+
+    // Seal both workers
+    CHECK(ref_runtime.seal_dag_node(ep_ref, ref_w1, llama_rerot_event_origin::worker_source));
+    CHECK(ref_runtime.seal_dag_node(ep_ref, ref_w2, llama_rerot_event_origin::worker_source));
+    CHECK(tgt_runtime.seal_dag_node(restored_id, tgt_w1, llama_rerot_event_origin::worker_source));
+    CHECK(tgt_runtime.seal_dag_node(restored_id, tgt_w2, llama_rerot_event_origin::worker_source));
+
+    // Both synthesis nodes must now be eligible (remaining_preds == 0)
+    CHECK(ref_ep->nodes[ref_ep->synthesis_node].remaining_preds == 0);
+    CHECK(restored_ep->nodes[restored_ep->synthesis_node].remaining_preds == 0);
+
+    // Verify logical DAG equivalence between reference and restored
+    CHECK(ref_ep->document.node_count() == restored_ep->document.node_count());
+    CHECK(ref_ep->document.run_count() == restored_ep->document.run_count());
+    for (size_t i = 0; i < ref_ep->document.run_count(); ++i) {
+        const auto * r_run = ref_ep->document.run(llama_rerot_run_id(i));
+        const auto * t_run = restored_ep->document.run(llama_rerot_run_id(i));
+        CHECK(r_run && t_run);
+        CHECK(r_run->owner == t_run->owner);
+        CHECK(r_run->visibility == t_run->visibility);
+        CHECK(r_run->token_count == t_run->token_count);
+        CHECK(r_run->storage_pos0 == t_run->storage_pos0);
+        CHECK(r_run->kind == t_run->kind);
+    }
+
+    // Compare reader views for synthesis node (reader 0)
+    const auto ref_view = ref_runtime.build_dag_view_for_reader(ep_ref, 0);
+    const auto res_view = tgt_runtime.build_dag_view_for_reader(restored_id, 0);
+    CHECK(ref_view.runs.size() == res_view.runs.size());
+    CHECK(!ref_view.runs.empty());
+    for (size_t i = 0; i < ref_view.runs.size(); ++i) {
+        CHECK(ref_view.runs[i].owner == res_view.runs[i].owner);
+        CHECK(ref_view.runs[i].run_id == res_view.runs[i].run_id);
+    }
+}
+
 static void test_dag_synthesis_complementary_results_distinct_intents() {
     // Stage 6 (§12.7) Minimal Workload 5:
     // Synthesis uses multiple complementary results without cross-contaminating intents.
@@ -5831,6 +6030,7 @@ int main() {
     test_dag_microbatch_slice_order_and_no_earlier_public_leak();
     test_dag_duplicate_source_end_and_restore_no_double_decrement();
     test_dag_abort_clears_orphan_refs_and_pens();
+    test_dag_demote_restore_different_physical_slots();
     test_dag_synthesis_complementary_results_distinct_intents();
     test_dag_three_lane_flat_cycle_and_peer_uptake();
     test_dag_diamond_and_unequal_length_history();

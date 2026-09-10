@@ -1600,6 +1600,7 @@ run B: probe → simple → restore
 - `test-flashprefill-state`：FlashPrefill 状态、membership、policy CPU-only 0 failure 通过。
 - `test_rerot_mtp_speculative_matrix`：MTP 在 peer 更新/拓扑变化/Tri 压缩/final fence 时的过期草稿精准拒绝与恢复验证 100% 通过。
 - `test_phase5_ram_checkpoint_context_shift_matrix` 与 `test_ram_restore_context_shift_and_preemption`：RAM 持久化保存、换槽恢复、context-shift 仅截断未固定公有片段、拓扑屏障重置验证 100% 通过。
+- `test_dag_demote_restore_different_physical_slots`：DAG 启动后通过 `demote_episode()` 释放物理槽位、序列化保存至 RAM blob、原槽位被无关业务占用后换槽恢复至全新物理 slot（slots 3 & 4）继续生成并通过 source_end 自然完结，与未中断的 reference 运行在逻辑图、run 结构、token 计数及 synthesis 读者视图（reader 0）上保持 100% 严格等价。
 - `n_cmpl>1` 在 prelude 串行化额外 RERoT root（阶段、RNG、图不串线，单次 prompt 共享 usage 聚合已通过真机脚本验证）。
 - 递归嵌套 DAG 仍 fail-closed。
 
