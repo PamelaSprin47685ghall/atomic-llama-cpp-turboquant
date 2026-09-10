@@ -1495,7 +1495,12 @@ run B: probe → simple → restore
 2. **切片微批次执行顺序与隔离**（必须通过 3 与 4，`test_dag_microbatch_slice_order_and_no_earlier_public_leak`）：同一逻辑 frontier 内不同 microbatch 分割/row 顺序产生严格一致的状态与视图结构；且 later slice 在本 frontier commit 之前绝不泄漏或提前读取 earlier slice 的新写入；
 3. **重复 source-end 与恢复通知幂等性**（必须通过 6，`test_dag_duplicate_source_end_and_restore_no_double_decrement`）：重复触发同一已完成节点的 source_end 事件或经持久化状态加载后，其后继依赖的 `remaining_preds` 严格执行 exactly-once 扣减，绝不发生重复扣减或负数溢出；
 4. **取消/资源异常清理不留孤儿状态**（必须通过 7，`test_dag_abort_clears_orphan_refs_and_pens`）：hard_abort / client cancellation 触发后，所有活跃执行绑定的 pen 立即全量回收为 free 态，节点 physical_slot 重置为 -1，无孤儿 sequence 引用或残存运行状态；
-5. **W 活跃阶段局部状态保留与换槽换出**（`test_dag_w_active_state_retention_and_swap`）：在 $W > P$（$P=1, W=2$ 并发 Worker）受限物理 Pen 竞争下，当 Worker 1 在逻辑 Frontier 边界让出/挂起 Pen 0 给 Worker 2 运行时，Worker 1 所累积的私有局部状态（`sampler_blob`、`mtp_blob`、`hand_seed` 与 `storage_pos_next`）100% 完整保留在逻辑节点运行时中，绝不重置为 C_base 或丢失思考进展；在换回 Pen 0 恢复（`resume_pen`）后精确延续状态与存储游标，两 Worker 均完成生成并自然 SEAL。
+5. **W 活跃阶段局部状态保留与换槽换出**（`test_dag_w_active_state_retention_and_swap`）：在 $W > P$（$P=1, W=2$ 并发 Worker）受限物理 Pen 竞争下，当 Worker 1 在逻辑 Frontier 边界让出/挂起 Pen 0 给 Worker 2 运行时，Worker 1 所累积的私有局部状态（`sampler_blob`、`mtp_blob`、`hand_seed` 与 `storage_pos_next`）100% 完整保留在逻辑节点运行时中，绝不重置为 C_base 或丢失思考进展；在换回 Pen 0 恢复（`resume_pen`）后精确延续状态与存储游标，两 Worker 均完成生成并自然 SEAL；
+6. **W>P 逻辑 Cohort 与物理分时全生命周期认证**（必须通过 2，`test_dag_w_gt_p_logical_cohort_and_time_slice_certification`）：在极端受限物理执行槽位（$P=1, W=3$ 并发独立 Worker）下：
+   - 证明无未满足依赖的 $W=3$ 个全部 eligible 节点在同一个逻辑调度边界统一入队并被 `snapshot_dag_logical_step` 纳入 `dag_step_cohort`，不等待前序任务自然完结或释放 Pen；
+   - 证明逻辑步执行期间严格冻结公开读取视界（`frozen_read_publish_epoch`），各物理切片轮转执行（Time-slice 1 -> 2 -> 3）期间，后来切片（如 Worker 2/3）绝不提前泄露或观测同一步前面切片已写入但尚未发布的 token；
+   - 证明在中途只有部分成员提交时，`finish_frontier` 严格守门拒绝半发布（`dag_logical_step_complete == false`）；
+   - 证明在全量成员全部 commit 后，`finish_frontier` 触发原子整步发布，推进 frontier 步数、发布新 epoch、清空提交缓存并同步使各成员读者视界实时互见，最终各成员自然完结并解锁综合节点。
 真实多 pen decode 与真实大模型多并发真机长稳仍属待验收。
 
 ---
@@ -1759,7 +1764,7 @@ shadow
 | C_base = 正式 P 之后的 state | **已实现并认证通过**（`capture_c_base` 在正式 P 完成后捕获；`test_dag_capture_c_base_snapshots_current_seed` 与 `test_dag_predecessor_completion_order_and_physical_row_invariance` 严格证明：多 stage 从 C_base 继承种子，前驱完成顺序与物理槽位/Pen 变动不改变后继种子与读者视图，且首写 COW 彼此完全隔离） |
 | actual native tool-round FRAME | 原生 tools 模板已接线；前缀变化在启动时重建，实际模型闭环仍需验收 |
 | tokenizer-level source-end 无损边界 | **已实现并认证通过**（`test_multi_template_source_end_boundary_certification` 覆盖 XML `</think>`、Command-R `[/THINK]`、ChatML `<|im_end|>`、Specialized `<|close|>think<|sep|>`, `<|END_THINKING|>`, `</mm:think>`, `<|channel|>` 等模板的 token 切分保留、候选 PENDING 挂起与 snapshot 还原） |
-| W>P logical cohort + physical time-slice | 逻辑 cohort、冻结 read epoch 与物理分时已接线；完整状态/数值/错误门仍需验收 |
+| W>P logical cohort + physical time-slice | **已实现并认证通过**（`test_dag_w_gt_p_logical_cohort_and_time_slice_certification` 严格证明：在 $P=1, W=3$ 场景下，全部 eligible 节点同一调度边界进入逻辑 cohort，不待先前任务退出；分片切片执行期间冻结读取视界，后来切片绝不提前观测同一步未发布的 peer 写入；全员 commit 完成前绝不提前发布半个 frontier；全员 commit 后原子发布全量正文并统一更新读者视界；各节点自然完结释放依赖解锁综合） |
 | W active state budget/restore | **已实现并单测验证**（`test_dag_w_active_state_retention_and_swap` 证明挂起节点局部 state/sampler/hand 完整保留且换槽恢复后零丢失） |
 | final 0.synthesize clean cutover | **已通过**（单 child 闭环下作为独立 stage 启动，使用稳定最终视图及新 logits，输出准确 221） |
 | 删除旧 random-ID/tree/fence production semantics | **已实现硬阻断与 clean cutover**（DAG 模式下 `publish_pending_record` 与 `freeze_fork_parent` 严格拒绝 HTML planner records 并 hard_abort；非 DAG 保留用于回归测试） |

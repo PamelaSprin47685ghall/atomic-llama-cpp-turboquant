@@ -3723,6 +3723,187 @@ static void test_dag_w_gt_p_yield_without_seal() {
     CHECK(dag_view_has_run(view_second, run_b));
 }
 
+static void test_dag_w_gt_p_logical_cohort_and_time_slice_certification() {
+    // Stage 4 (AGENTS.md §06 / RERoT.md §12.5 / §13.2):
+    // "W>P logical cohort + physical time-slice" full certification.
+    // Invariant 1: All W eligible workers enter the logical cohort in the same
+    //              scheduling boundary, without waiting for the first P workers to finish/SEAL.
+    // Invariant 2: The logical cohort freezes the public read watermark (frozen_read_publish_epoch);
+    //              any new public commits made in earlier physical time slices remain invisible
+    //              to later physical slices within the same logical step.
+    // Invariant 3: Time-slicing across limited physical pens (P=1, W=3) executes slice-by-slice
+    //              (using yield_dag_pen_for_ready / dag_step_next_pending / resume_pen)
+    //              until every cohort member commits.
+    // Invariant 4: Atomic publication: finish_frontier does not publish step bodies until
+    //              dag_logical_step_complete is true (every member committed).
+    // Invariant 5: Upon complete commit of the entire cohort, finish_frontier atomically
+    //              publishes all pending member bodies, advances frontier, clears cohort,
+    //              and updates reader views simultaneously.
+
+    std::fprintf(stderr, "--- test_dag_w_gt_p_logical_cohort_and_time_slice_certification (Stage 4) ---\n");
+
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(1); // P = 1 physical pen, W = 3 independent workers
+
+    const uint64_t ep_id = runtime.adopt_root(115, 115, 0, 1, 0);
+    CHECK(ep_id != 0);
+
+    const auto decision = server_rerot_parse_routing_decision(R"json({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "w1", "intent": "Fact 1"},
+          {"id": "w2", "intent": "Fact 2"},
+          {"id": "w3", "intent": "Fact 3"}
+        ],
+        "depends_on": []
+      }
+    })json");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+
+    dag_unbind_planner_if_bound(runtime, ep_id);
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+
+    // Initial state: W=3 eligible workers (nodes 1, 2, 3) in ready_queue
+    CHECK(ep->ready_queue.size() == 3);
+
+    // Invariant 1: Snapshot logical step captures all eligible unsealed workers into dag_step_cohort
+    CHECK(runtime.has_open_dag_logical_step(ep_id));
+    CHECK(ep->dag_step_cohort.size() == 3);
+    CHECK(ep->dag_step_cohort.count(1) != 0);
+    CHECK(ep->dag_step_cohort.count(2) != 0);
+    CHECK(ep->dag_step_cohort.count(3) != 0);
+    CHECK(!runtime.dag_logical_step_complete(ep_id));
+
+    // Time-slice 1: Admit w1 onto pen 0
+    llama_rerot_node_id w1 = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 1, &w1));
+    CHECK(w1 == 1);
+    CHECK(runtime.complete_admission(ep_id, w1));
+
+    // w1 writes token in time-slice 1
+    auto * nw1 = runtime.node(ep_id, w1);
+    CHECK(nw1 != nullptr);
+    CHECK(commit_generated(runtime, ep_id, w1, nw1->storage_pos_next, "w1_slice1"));
+    CHECK(nw1->pending_record.has_value());
+    const auto run_w1 = *nw1->pending_record;
+    CHECK(ep->dag_step_committed.count(w1) != 0);
+    CHECK(!runtime.dag_logical_step_complete(ep_id));
+
+    // Finish_frontier mid-cohort does NOT publish: w2 and w3 have not committed yet
+    const auto mid_res1 = runtime.finish_frontier(ep_id);
+    CHECK(!mid_res1.hard_aborted);
+    CHECK(runtime.has_open_dag_logical_step(ep_id));
+    CHECK(!runtime.dag_logical_step_complete(ep_id));
+    // w1's write must remain pending and unpublished
+    CHECK(ep->document.run(run_w1)->visibility == llama_rerot_visibility::pending_record);
+
+    // Yield pen 0 so w2 can run
+    CHECK(runtime.yield_dag_pen_for_ready(ep_id));
+    CHECK(ep->suspended.count(w1) != 0);
+    CHECK(runtime.pens_allocated() == 0);
+
+    // Time-slice 2: Admit w2 onto pen 0
+    const auto next_pen2 = runtime.dag_step_next_pending(ep_id);
+    CHECK(next_pen2.has_value());
+    llama_rerot_node_id w2 = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 2, &w2, *next_pen2));
+    CHECK(w2 == 2);
+    CHECK(runtime.complete_admission(ep_id, w2));
+
+    // Invariant 2: Reader view of w2 in time-slice 2 CANNOT observe w1's slice1 write
+    const auto view_w2_before_commit = runtime.build_dag_view_for_reader(ep_id, w2);
+    CHECK(!dag_view_has_run(view_w2_before_commit, run_w1));
+
+    // w2 writes token in time-slice 2
+    auto * nw2 = runtime.node(ep_id, w2);
+    CHECK(nw2 != nullptr);
+    CHECK(commit_generated(runtime, ep_id, w2, nw2->storage_pos_next, "w2_slice1"));
+    CHECK(nw2->pending_record.has_value());
+    const auto run_w2 = *nw2->pending_record;
+    CHECK(ep->dag_step_committed.count(w2) != 0);
+    CHECK(!runtime.dag_logical_step_complete(ep_id));
+
+    // Yield pen 0 so w3 can run
+    CHECK(runtime.yield_dag_pen_for_ready(ep_id));
+    CHECK(ep->suspended.count(w2) != 0);
+
+    // Time-slice 3: Admit w3 onto pen 0
+    const auto next_pen3 = runtime.dag_step_next_pending(ep_id);
+    CHECK(next_pen3.has_value());
+    llama_rerot_node_id w3 = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 3, &w3, *next_pen3));
+    CHECK(w3 == 3);
+    CHECK(runtime.complete_admission(ep_id, w3));
+
+    // Reader view of w3 still cannot see w1 or w2's uncommitted/unpublished writes
+    const auto view_w3_before_commit = runtime.build_dag_view_for_reader(ep_id, w3);
+    CHECK(!dag_view_has_run(view_w3_before_commit, run_w1));
+    CHECK(!dag_view_has_run(view_w3_before_commit, run_w2));
+
+    // w3 writes token in time-slice 3
+    auto * nw3 = runtime.node(ep_id, w3);
+    CHECK(nw3 != nullptr);
+    CHECK(commit_generated(runtime, ep_id, w3, nw3->storage_pos_next, "w3_slice1"));
+    CHECK(nw3->pending_record.has_value());
+    const auto run_w3 = *nw3->pending_record;
+    CHECK(ep->dag_step_committed.count(w3) != 0);
+
+    // Invariant 3 & 4: Now all 3 members have committed, logical step is complete!
+    CHECK(runtime.dag_logical_step_complete(ep_id));
+
+    // Invariant 5: finish_frontier atomically publishes all 3 members at once
+    const uint64_t frontier_before = ep->frontier;
+    const uint64_t publish_epoch_before = ep->publish_epoch;
+    const auto finish_res = runtime.finish_frontier(ep_id);
+    CHECK(!finish_res.hard_aborted);
+    CHECK(ep->frontier == frontier_before + 1);
+    CHECK(ep->publish_epoch > publish_epoch_before);
+    // After finish_frontier, advance_frontier and activate_dag_frontier run:
+    // dag_step_committed is cleared, and snapshot_dag_logical_step initializes
+    // the next logical frontier cohort with all remaining unsealed live workers.
+    CHECK(ep->dag_step_committed.empty());
+    CHECK(ep->dag_step_cohort.size() == 3);
+
+    // All 3 runs are now public_live
+    CHECK(ep->document.run(run_w1)->visibility == llama_rerot_visibility::public_live);
+    CHECK(ep->document.run(run_w2)->visibility == llama_rerot_visibility::public_live);
+    CHECK(ep->document.run(run_w3)->visibility == llama_rerot_visibility::public_live);
+
+    // Reader views for all 3 workers now mutually observe all 3 published runs
+    const auto view_w1_post = runtime.build_dag_view_for_reader(ep_id, w1);
+    const auto view_w2_post = runtime.build_dag_view_for_reader(ep_id, w2);
+    const auto view_w3_post = runtime.build_dag_view_for_reader(ep_id, w3);
+    CHECK(dag_view_has_run(view_w1_post, run_w1));
+    CHECK(dag_view_has_run(view_w1_post, run_w2));
+    CHECK(dag_view_has_run(view_w1_post, run_w3));
+    CHECK(dag_view_has_run(view_w2_post, run_w1));
+    CHECK(dag_view_has_run(view_w2_post, run_w2));
+    CHECK(dag_view_has_run(view_w2_post, run_w3));
+    CHECK(dag_view_has_run(view_w3_post, run_w1));
+    CHECK(dag_view_has_run(view_w3_post, run_w2));
+    CHECK(dag_view_has_run(view_w3_post, run_w3));
+
+    // All workers naturally seal
+    CHECK(runtime.seal_dag_node(ep_id, w3, llama_rerot_event_origin::worker_source));
+    CHECK(runtime.resume_pen(ep_id, w1, 0, 1));
+    CHECK(runtime.seal_dag_node(ep_id, w1, llama_rerot_event_origin::worker_source));
+    CHECK(runtime.resume_pen(ep_id, w2, 0, 2));
+    CHECK(runtime.seal_dag_node(ep_id, w2, llama_rerot_event_origin::worker_source));
+
+    // Synthesis is unlocked
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 0);
+    CHECK(!runtime.get_eligible_dag_nodes(ep_id).empty());
+
+    CHECK(runtime.erase_episode(ep_id));
+}
+
 static void test_dag_w_active_state_retention_and_swap() {
     // AGENTS.md §06.4, RERoT.md §8.5 & §12.5 (Stage 4 / Stage 7):
     // "W active stages state retention, swap and restore":
@@ -6841,6 +7022,7 @@ int main() {
     test_dag_c0_probe_to_simple_continuation_and_grammar_isolation();
     test_dag_admission_view_survival();
     test_dag_w_gt_p_yield_without_seal();
+    test_dag_w_gt_p_logical_cohort_and_time_slice_certification();
     test_dag_frozen_read_publish_epoch();
     test_dag_logical_step_hides_foreign_pending();
     test_dag_refuses_nested_html_fork();
