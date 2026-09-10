@@ -496,6 +496,85 @@ static void test_native_source_end_marker() {
     CHECK(alt_parser.complete());
 }
 
+static void test_multi_template_source_end_boundary_certification() {
+    // Stage 2 (§12.3 item 9 & AGENTS.md §04.7.1) Verification:
+    // Certify lossless token-level / byte-level reasoning-end boundary handling
+    // across major model chat templates:
+    // 1. Standard XML-style (Qwen, DeepSeek-R1, Ornith): "</think>"
+    // 2. Command-R / Peg-native bracketed: "[/THINK]"
+    // 3. ChatML / Specialized special-token closers: "<|im_end|>", "<|close|>think<|sep|>", "<|END_THINKING|>", "</mm:think>"
+    //
+    // For each template, assert:
+    // a) Precise public prefix boundary preservation when token contains trailing body before marker
+    // b) Multi-token split candidate holding in PENDING until final closing token
+    // c) False candidate release without dropping ordinary text
+    // d) Correct snapshot serialization and restoration
+    const std::vector<std::string> target_markers = {
+        "</think>",
+        "[/THINK]",
+        "<|im_end|>",
+        "<|close|>think<|sep|>",
+        "<|END_THINKING|>",
+        "</mm:think>",
+        "<|channel|>"
+    };
+
+    for (const auto & marker : target_markers) {
+        server_rerot_marker_parser parser(marker, true);
+        CHECK(!parser.failed());
+        CHECK(parser.marker() == marker);
+
+        // Case 1: Pure body bytes remain public_live
+        auto step = parser.consume("Reasoning step 1: 42 * 2 = 84. ");
+        CHECK(!step.marker_closed);
+        CHECK(!step.malformed);
+        CHECK(step.write_visibility == llama_rerot_visibility::public_live);
+        CHECK(step.public_prefix_bytes == 0);
+
+        // Case 2: Token containing body and start of marker (partial split)
+        // e.g. "answer </thi" for "</think>"
+        const std::string split_head = marker.substr(0, marker.size() / 2);
+        const std::string split_tail = marker.substr(marker.size() / 2);
+        const std::string prefix_text = "Conclusion established. ";
+
+        step = parser.consume(prefix_text + split_head);
+        CHECK(!step.marker_closed);
+        CHECK(!step.malformed);
+        CHECK(step.write_visibility == llama_rerot_visibility::pending_record);
+        CHECK(step.public_prefix_bytes == prefix_text.size());
+        CHECK(parser.state() == server_rerot_marker_state::marker_candidate);
+
+        // Case 3: Next token completes the marker
+        step = parser.consume(split_tail);
+        CHECK(step.marker_closed);
+        CHECK(!step.malformed);
+        CHECK(step.write_visibility == llama_rerot_visibility::pending_record);
+        CHECK(parser.complete());
+
+        // Case 4: Snapshot / Restore fidelity
+        const auto snap = parser.snapshot();
+        CHECK(snap.native_end);
+        CHECK(snap.marker == marker);
+        server_rerot_marker_parser restored;
+        std::string restore_err;
+        CHECK(restored.restore(snap, &restore_err));
+        CHECK(restored.marker() == marker);
+        CHECK(restored.complete());
+
+        // Case 5: False candidate test (prefix matches marker start then diverges)
+        server_rerot_marker_parser false_test(marker, true);
+        step = false_test.consume("text " + split_head);
+        CHECK(step.write_visibility == llama_rerot_visibility::pending_record);
+        CHECK(false_test.state() == server_rerot_marker_state::marker_candidate);
+        // Diverges:
+        step = false_test.consume("xyz false alarm");
+        CHECK(step.release_previous_pending);
+        CHECK(step.write_visibility == llama_rerot_visibility::public_live);
+        CHECK(!step.marker_closed);
+        CHECK(false_test.state() == server_rerot_marker_state::public_text);
+    }
+}
+
 static void test_format_fixed_entry() {
     const std::string frame = server_rerot_format_fixed_entry(
         "A", "compute A", false, "</think>", "<think>");
@@ -590,6 +669,7 @@ int main() {
     test_routing_decision_parser();
     test_routing_decision_rejections();
     test_native_source_end_marker();
+    test_multi_template_source_end_boundary_certification();
     test_format_fixed_entry();
     test_format_plan_prefix();
     test_dag_protocol_does_not_require_source_end_grammar();

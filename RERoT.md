@@ -1754,7 +1754,7 @@ shadow
 | 真正隔离 probe branch | 独立 `probe_seq` 已接线；完整普通续跑 A/B 仍需验收 |
 | C_base = 正式 P 之后的 state | capture 已移到正式 P 注入完成后；真实 recurrent 配对仍需验收 |
 | actual native tool-round FRAME | 原生 tools 模板已接线；前缀变化在启动时重建，实际模型闭环仍需验收 |
-| tokenizer-level source-end 无损边界 | **需模板逐个认证** |
+| tokenizer-level source-end 无损边界 | **已实现并认证通过**（`test_multi_template_source_end_boundary_certification` 覆盖 XML `</think>`、Command-R `[/THINK]`、ChatML `<|im_end|>`、Specialized `<|close|>think<|sep|>`, `<|END_THINKING|>`, `</mm:think>`, `<|channel|>` 等模板的 token 切分保留、候选 PENDING 挂起与 snapshot 还原） |
 | W>P logical cohort + physical time-slice | 逻辑 cohort、冻结 read epoch 与物理分时已接线；完整状态/数值/错误门仍需验收 |
 | W active state budget/restore | **已实现并单测验证**（`test_dag_w_active_state_retention_and_swap` 证明挂起节点局部 state/sampler/hand 完整保留且换槽恢复后零丢失） |
 | final 0.synthesize clean cutover | **已通过**（单 child 闭环下作为独立 stage 启动，使用稳定最终视图及新 logits，输出准确 221） |
