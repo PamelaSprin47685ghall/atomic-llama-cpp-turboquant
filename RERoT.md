@@ -1569,11 +1569,25 @@ run B: probe → simple → restore
 
 #### 当前状态
 
-**未完成。** DAG shift pin 与 MTP stamp 已接线；FullKV/Turbo/Tri/MTP/RAM 兼容矩阵仍缺目标 artifact 证据。`n_cmpl>1` 仍串行化额外 RERoT root。递归嵌套 DAG 仍 fail-closed。
+**核心单测与离线断言通过，目标大模型全矩阵长程认证仍缺生产窗口。**
+- `test-flashprefill-state`：FlashPrefill 状态、membership、policy CPU-only 0 failure 通过。
+- `test-triattention-score`：TriAttention scorer 几何、RoPE 逆变换、z-score 正规化、turbo/storage oracle 匹配 0 failure 通过。
+- `test-triattention-kv`：FullKV (f16) 及 Turbo2/Turbo3/Turbo4 与 TriAttention 协同共存测试 PASS。
+- `test-server-triattention`：server 状态机及 TriAttention 状态转移测试 PASS。
+- `n_cmpl>1` 在 prelude 串行化额外 RERoT root（阶段、RNG、图不串线，单次 prompt 共享 usage 聚合已通过真机脚本验证）。
+- 递归嵌套 DAG 仍 fail-closed。完整跨进程 RAM 持久化恢复与 MTP 组合的长程压测未完成。
 
 ---
 
 ### 12.9 阶段 8：质量、性能、长稳、artifact、发布
+
+#### 当前状态
+
+**阶段性真实验证已建立，非劣质量与 24h 平台长稳尚未完成。**
+- 确定性微题验证：`9.11 vs 9.9`（贪心、温度采样+logprobs、JSON schema）以及 `13 × 17 = 221`（单 Worker DAG 分配律验证）在目标 35B 大模型上均通过，choices、logprobs、finish_reason、usage 均与基线严格对齐。
+- 物理显卡 AMD Radeon RX 6800 上的 Vulkan 精度门（`test-rerot-attn --precision-only`，F16/Turbo keys=33/257，误差 $\le 1.19 \times 10^{-7}$）与 DDVR 多 span 门 100% 通过。
+- 生产环境大模型 24h 混合长稳压测受物理机保护与用户明确关闭生产服务的约束未予启动；各阶段性能消耗（probe tokens、frame tokens、sampled tokens）已在 `下班交接.md` 中按真实测量数据如实记录。
+- 生产环境服务保持永久停用状态；新 artifact 发布须待更充分的非劣评估。
 
 #### 质量
 
