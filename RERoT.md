@@ -1486,9 +1486,11 @@ run B: probe → simple → restore
 
 #### 当前状态
 
-**逻辑步已接线，调度不变量、分时与微批次切片隔离已获单测覆盖，真机分时未验收。** eligible 可在未 SEAL 时 START；同一逻辑步 BODY 保持 PENDING，直到 cohort 全员 commit 后发布。CPU fixture 证明 foreign reader 看不到未发布 BODY。针对阶段 4 核心约束已单测验证：
+**逻辑步已接线，调度不变量、分时、微批次切片隔离、重复结束幂等与取消清理已获单测覆盖，真机分时未验收。** eligible 可在未 SEAL 时 START；同一逻辑步 BODY 保持 PENDING，直到 cohort 全员 commit 后发布。CPU fixture 证明 foreign reader 看不到未发布 BODY。针对阶段 4 核心约束已单测验证：
 1. **调度不变量硬门**（必须通过 8）：合法 DAG 无 runnable 却有 unfinished 节点时立即触发 `rerot_scheduler_invariant_error` 终止 episode（`activate_dag_frontier`）；
-2. **切片微批次执行顺序与隔离**（必须通过 3 与 4，`test_dag_microbatch_slice_order_and_no_earlier_public_leak`）：同一逻辑 frontier 内不同 microbatch 分割/row 顺序产生严格一致的状态与视图结构；且 later slice 在本 frontier commit 之前绝不泄漏或提前读取 earlier slice 的新写入。
+2. **切片微批次执行顺序与隔离**（必须通过 3 与 4，`test_dag_microbatch_slice_order_and_no_earlier_public_leak`）：同一逻辑 frontier 内不同 microbatch 分割/row 顺序产生严格一致的状态与视图结构；且 later slice 在本 frontier commit 之前绝不泄漏或提前读取 earlier slice 的新写入；
+3. **重复 source-end 与恢复通知幂等性**（必须通过 6，`test_dag_duplicate_source_end_and_restore_no_double_decrement`）：重复触发同一已完成节点的 source_end 事件或经持久化状态加载后，其后继依赖的 `remaining_preds` 严格执行 exactly-once 扣减，绝不发生重复扣减或负数溢出；
+4. **取消/资源异常清理不留孤儿状态**（必须通过 7，`test_dag_abort_clears_orphan_refs_and_pens`）：hard_abort / client cancellation 触发后，所有活跃执行绑定的 pen 立即全量回收为 free 态，节点 physical_slot 重置为 -1，无孤儿 sequence 引用或残存运行状态。
 真实多 pen decode、slice 失败原子性、W 份状态换出仍属待验收。
 
 ---

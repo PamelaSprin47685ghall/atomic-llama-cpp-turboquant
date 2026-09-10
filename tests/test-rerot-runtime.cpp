@@ -5449,6 +5449,138 @@ static void test_dag_microbatch_slice_order_and_no_earlier_public_leak() {
     CHECK(view_b1_post.query_virtual_pos == view_b2_post.query_virtual_pos);
 }
 
+static void test_dag_duplicate_source_end_and_restore_no_double_decrement() {
+    // Stage 4 (§12.5) Verification:
+    // Must-pass item 6: Duplicate source-end callback and repeat restore notifications
+    // must not double-decrement remaining_preds on successors (§07.5).
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(3);
+    const uint64_t ep_id = runtime.adopt_root(70, 70, 0, 1, 0);
+    CHECK(ep_id != 0);
+    const auto decision = server_rerot_parse_routing_decision(
+        "{\"strategy\": \"dag\", \"payload\": {\"questions\": ["
+        "{\"id\": \"A\", \"intent\": \"Worker A\"},"
+        "{\"id\": \"B\", \"intent\": \"Worker B\"}"
+        "], \"depends_on\": [{\"id\": \"B\", \"depends_on_id\": \"A\"}]}}");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+
+    auto * root = runtime.node(ep_id, 0);
+    if (root && root->physical_slot >= 0) {
+        CHECK(runtime.detach_node(ep_id, 0));
+    }
+    llama_rerot_node_id a = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 2, &a));
+    CHECK(a == 1);
+    CHECK(runtime.complete_admission(ep_id, a));
+
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->nodes[2].remaining_preds == 1);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 2);
+
+    // First legitimate source_end seals node A and decrements B and synthesis
+    CHECK(runtime.seal_dag_node(ep_id, a, llama_rerot_event_origin::worker_source));
+    CHECK(ep->nodes[a].is_sealed);
+    CHECK(ep->nodes[2].remaining_preds == 0);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 1);
+
+    // Duplicate source_end calls must be no-ops: remaining_preds must not become negative or decrement again
+    CHECK(runtime.seal_dag_node(ep_id, a, llama_rerot_event_origin::worker_source));
+    CHECK(ep->nodes[2].remaining_preds == 0);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 1);
+
+    CHECK(runtime.seal_dag_node(ep_id, a, llama_rerot_event_origin::worker_source));
+    CHECK(ep->nodes[2].remaining_preds == 0);
+    CHECK(ep->nodes[ep->synthesis_node].remaining_preds == 1);
+
+    // Save state while A is sealed and B is ready (remaining_preds == 0)
+    server_rerot_state_fingerprints fp;
+    fp.caps = LLAMA_REROT_STATE_CAP_REROT | LLAMA_REROT_STATE_CAP_REROT_TREE |
+              LLAMA_REROT_STATE_CAP_REROT_PRIVATE;
+    std::vector<uint8_t> blob;
+    CHECK(runtime.save_episode(ep_id, fp, &blob, &err));
+    CHECK(!blob.empty());
+
+    // Restore into fresh runtime and verify remaining_preds is exactly 0, not decremented
+    server_rerot_runtime runtime_restored(nullptr);
+    uint64_t restored_id = 0;
+    CHECK(runtime_restored.load_episode(blob.data(), blob.size(), fp, &restored_id, &err));
+    auto * ep_restored = runtime_restored.episode(restored_id);
+    CHECK(ep_restored != nullptr);
+    CHECK(ep_restored->nodes[1].is_sealed);
+    CHECK(ep_restored->nodes[2].remaining_preds == 0);
+    CHECK(ep_restored->nodes[ep_restored->synthesis_node].remaining_preds == 1);
+
+    // Attempting repeat seal on the restored instance must also be a no-op
+    CHECK(runtime_restored.seal_dag_node(restored_id, 1, llama_rerot_event_origin::worker_source));
+    CHECK(ep_restored->nodes[2].remaining_preds == 0);
+    CHECK(ep_restored->nodes[ep_restored->synthesis_node].remaining_preds == 1);
+}
+
+static void test_dag_abort_clears_orphan_refs_and_pens() {
+    // Stage 4 (§12.5) Verification:
+    // Must-pass item 7: On abort / cancellation, there must be 0 orphan seq refs,
+    // 0 active running pens, and no uncleaned internal state.
+    server_rerot_runtime runtime(nullptr);
+    runtime.set_pen_capacity(3);
+    const uint64_t ep_id = runtime.adopt_root(80, 80, 0, 1, 0);
+    CHECK(ep_id != 0);
+    const auto decision = server_rerot_parse_routing_decision(
+        "{\"strategy\": \"dag\", \"payload\": {\"questions\": ["
+        "{\"id\": \"A\", \"intent\": \"Worker A\"},"
+        "{\"id\": \"B\", \"intent\": \"Worker B\"}"
+        "], \"depends_on\": []}}");
+    CHECK(decision.is_dag());
+    std::string err;
+    CHECK(runtime.initialize_dag(ep_id, decision, &err));
+    CHECK(runtime.capture_c0(ep_id, 1, 0));
+    CHECK(runtime.capture_c_base(ep_id));
+    CHECK(runtime.activate_dag_frontier(ep_id));
+
+    auto * root = runtime.node(ep_id, 0);
+    if (root && root->physical_slot >= 0) {
+        CHECK(runtime.detach_node(ep_id, 0));
+    }
+    llama_rerot_node_id a = LLAMA_REROT_NODE_INVALID;
+    llama_rerot_node_id b = LLAMA_REROT_NODE_INVALID;
+    CHECK(runtime.admit_next_child(ep_id, 0, 2, &a));
+    CHECK(runtime.admit_next_child(ep_id, 1, 3, &b));
+    CHECK(a == 1 && b == 2);
+    CHECK(runtime.complete_admission(ep_id, a));
+    CHECK(runtime.complete_admission(ep_id, b));
+
+    // Two active pens bound to this episode
+    CHECK(runtime.pens_for_person(ep_id).size() == 2);
+    CHECK(runtime.pens_allocated() == 2);
+
+    // Hard abort (e.g. client cancellation or resource error)
+    CHECK(!runtime.hard_abort(ep_id, "client_cancellation_during_workers"));
+    auto * ep = runtime.episode(ep_id);
+    CHECK(ep != nullptr);
+    CHECK(ep->hard_aborted);
+    CHECK(ep->abort_reason.find("client_cancellation") != std::string::npos);
+
+    // All pens must be freed immediately, no active bindings left
+    CHECK(runtime.pens_for_person(ep_id).empty());
+    CHECK(runtime.pens_allocated() == 0);
+    CHECK(runtime.pen(0)->state == server_pen_state::free);
+    CHECK(runtime.pen(1)->state == server_pen_state::free);
+    CHECK(runtime.pen(2)->state == server_pen_state::free);
+    CHECK(ep->running.empty());
+    CHECK(ep->ready_queue.empty());
+    CHECK(ep->nodes[a].physical_slot == -1);
+    CHECK(ep->nodes[b].physical_slot == -1);
+
+    // Erase episode cleanly
+    CHECK(runtime.erase_episode(ep_id));
+    CHECK(runtime.episode(ep_id) == nullptr);
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT Runtime Tests ===\n");
     test_c0_and_dag_admit_without_parked_seq();
@@ -5541,6 +5673,8 @@ int main() {
     test_dag_initialize_refuses_double_init();
     test_dag_source_end_multi_token_and_starting_frame_gate();
     test_dag_microbatch_slice_order_and_no_earlier_public_leak();
+    test_dag_duplicate_source_end_and_restore_no_double_decrement();
+    test_dag_abort_clears_orphan_refs_and_pens();
     test_dag_three_lane_flat_cycle_and_peer_uptake();
     test_dag_diamond_and_unequal_length_history();
     test_dag_a_to_c_with_b_independent_overlap();
