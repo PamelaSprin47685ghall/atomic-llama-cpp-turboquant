@@ -182,7 +182,13 @@ int llama_server(common_params & params, int argc, char ** argv) {
         if (params.n_parallel < 0) {
             const bool dynamic_kv = params.n_ctx_kv_auto || params.n_ctx_kv > 0;
             params.n_parallel = dynamic_kv ? (int) llama_max_parallel_sequences() : 4;
-            params.n_parallel_pp = dynamic_kv ? 1 : params.n_parallel;
+            // Prompt processing is serial by design: it is the phase whose graph is large, and the
+            // two phases never overlap, so it reserves and admits exactly one sequence at a time
+            // (a0c798b51 set this unconditionally). Letting it follow n_parallel with a fixed KV
+            // capacity let the server admit several prompts at once - measured: five concurrent
+            // 10k-token prefills took the Vulkan device down (vk::Queue::submit: ErrorDeviceLost)
+            // with the queue reporting decode() failures afterwards.
+            params.n_parallel_pp = 1;
             params.kv_unified = true;
 
             SRV_TRC("n_parallel is set to auto, using n_parallel = %d and kv_unified = true\n", params.n_parallel);
