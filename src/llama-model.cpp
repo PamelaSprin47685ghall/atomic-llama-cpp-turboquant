@@ -343,6 +343,10 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
 
 llama_model * llama_model_create(llama_model_loader & ml, const llama_model_params & params) {
     llm_arch arch = ml.get_arch();
+    // dry run: the loader allocates and writes exactly like a real load and skips only reading
+    // the weights from disk, so a probe sees the real memory picture (Vulkan allocates lazily)
+    // without paying for 79 GiB of file reads on every attempt.
+    ml.dry_run = params.dry_run;
     if (arch == LLM_ARCH_UNKNOWN) {
         if (ml.get_arch_name() == "gemma4_assistant") {
             // pre-b10018 fork assistant GGUFs use a different arch name, kv

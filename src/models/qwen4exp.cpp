@@ -1197,6 +1197,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
 
     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
     ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    // No explicit pin here: ggml_backend_sched derives a node's backend from its input tensors,
+    // and src0 of this gather is the table, which is on the host (see llama-model-loader). So the
+    // look-up runs where the data is and only the result crosses to the layer's device. Pinning
+    // it explicitly splits the graph for no gain and trips the fused GDN dispatch on shape.
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 

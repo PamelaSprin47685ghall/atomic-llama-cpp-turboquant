@@ -1166,19 +1166,28 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         // select the buffer type for this tensor
         const buft_list_t * buft_list;
-        switch (info.layer) {
-            case LLM_TENSOR_LAYER_INPUT:
-                buft_list = buft_list_input;
-                break;
-            case LLM_TENSOR_LAYER_OUTPUT:
-                buft_list = buft_list_output;
-                break;
-            case LLM_TENSOR_LAYER_REPEATING:
-                GGML_ASSERT(buft_list_layer != nullptr);
-                buft_list = buft_list_layer;
-                break;
-            default:
-                GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
+        if (tn_tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD) {
+            // The PLE n-gram table is tens of GiB - larger than the VRAM of any device - and the
+            // work on it is a host-side lookup: the hash that produces the row indices is already
+            // computed on the host (see llm_graph_input_ple). On a device the table would have to
+            // be spilled into system memory anyway, and every gather would read it back over PCIe
+            // for each token. It belongs on the CPU by default; an explicit override still wins.
+            buft_list = buft_list_cpu;
+        } else {
+            switch (info.layer) {
+                case LLM_TENSOR_LAYER_INPUT:
+                    buft_list = buft_list_input;
+                    break;
+                case LLM_TENSOR_LAYER_OUTPUT:
+                    buft_list = buft_list_output;
+                    break;
+                case LLM_TENSOR_LAYER_REPEATING:
+                    GGML_ASSERT(buft_list_layer != nullptr);
+                    buft_list = buft_list_layer;
+                    break;
+                default:
+                    GGML_ABORT("invalid layer %d for tensor %s", info.layer, tn.str().c_str());
+            }
         }
 
         ggml_backend_buffer_type_t buft = nullptr;

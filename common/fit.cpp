@@ -673,6 +673,7 @@ uint32_t common_xkv_derive_store_mib(
         dense_ctx, cparams->xkv_min_saving, cparams->xkv_segment_tokens, n_ctx_kv_fit);
 }
 
+
 // A probe differs from the previous one only in its context parameters, but it used to
 // reload the model every time -- metadata and tensor map for every shard, seconds on a
 // 79 GB model, repeated for every step of the fit's search (and the RERoT fit repeats the
@@ -948,6 +949,54 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         }
     }
 
+    // The KV store is allocated as one block, so the breakdown reports all of it against a single
+    // buffer type and a single device, while every device only ever holds the share of the layers
+    // it runs. Charging one card for the whole pool (measured: 13.5 GiB for a 524288-token pool on
+    // a card that holds a fifth of the layers) rejects configurations the machine runs fine and
+    // hides the card that really is short. Spread it by the number of layers each device holds.
+    {
+        uint64_t ctx_total  = 0;
+        int      ctx_dev    = -1;   // -1: none, >=0: exactly one, -2: several
+        for (size_t i = 0; i < ret.size(); i++) {
+            if (ret[i].mb.context > 0) {
+                ctx_total += ret[i].mb.context;
+                ctx_dev = ctx_dev == -1 ? (int) i : -2;
+            }
+        }
+        const int64_t n_layer = llama_model_n_layer(model);
+        if (ctx_total > 0 && ctx_dev >= 0 && nd > 1 && n_layer > 0) {
+            std::vector<uint64_t> layers_per_dev(nd, 0);
+            uint64_t layers_seen = 0;
+            for (int64_t il = 0; il < n_layer; ++il) {
+                ggml_backend_dev_t d = model->dev_layer((int) il);
+                for (size_t i = 0; i < nd; ++i) {
+                    if (d == llama_model_get_device(model, i)) {
+                        layers_per_dev[i]++;
+                        layers_seen++;
+                        break;
+                    }
+                }
+            }
+            if (layers_seen > 0) {
+                for (size_t i = 0; i < ret.size(); i++) {
+                    ret[i].mb.context = 0;
+                }
+                uint64_t assigned = 0;
+                for (size_t i = 0; i < nd; ++i) {
+                    ret[i].mb.context = ctx_total * layers_per_dev[i] / layers_seen;
+                    assigned += ret[i].mb.context;
+                }
+                // whatever integer division dropped stays with the device that owned the pool
+                ret[ctx_dev].mb.context += ctx_total - assigned;
+            }
+            LOG_WRN("%s: KV pool %llu MiB reported on device %d; layers per device:", __func__, ctx_total >> 20, ctx_dev);
+            for (size_t i = 0; i < nd; ++i) {
+                LOG_WRN(" [%zu]=%llu", i, layers_per_dev[i]);
+            }
+            LOG_WRN(" seen=%llu\n", layers_seen);
+        }
+    }
+
     {
         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         if (cpu_dev == nullptr) {
@@ -1011,6 +1060,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
 
+
     common_memory_breakdown_print(ctx);
 
     llama_free(ctx);
@@ -1042,6 +1092,37 @@ common_device_memory_data_vec common_get_device_memory_data(
         ret[i].model   = impl[i].mb.model;
         ret[i].context = impl[i].mb.context;
         ret[i].compute = impl[i].mb.compute;
+    }
+
+    // Spread the pool over the devices by the layers they hold (see the capture in the probe
+    // above). Without this the whole pool lands on one card, which then looks impossible to
+    // satisfy while the others look empty - and the card that really is short stays hidden.
+    {
+        uint64_t ctx_total = 0;
+        int      ctx_dev   = -1;
+        for (size_t i = 0; i < ret.size(); i++) {
+            if (ret[i].context > 0) {
+                ctx_total += ret[i].context;
+                ctx_dev = ctx_dev == -1 ? (int) i : -2;
+            }
+        }
+        uint64_t layers_seen = 0;
+        for (uint64_t n : s_fit_layers_per_dev) {
+            layers_seen += n;
+        }
+        if (ctx_total > 0 && ctx_dev >= 0 && ret.size() > 1 && layers_seen > 0 &&
+                s_fit_layers_per_dev.size() == ret.size()) {
+            uint64_t assigned = 0;
+            for (size_t i = 0; i < ret.size(); i++) {
+                ret[i].context = ctx_total * s_fit_layers_per_dev[i] / layers_seen;
+                assigned += ret[i].context;
+            }
+            // the device that owned the pool keeps what integer division dropped
+            ret[ctx_dev].context += ctx_total - assigned;
+            LOG_INF("%s: KV pool %llu MiB reported on device %d, spread by layers (%llu in total)\n",
+                    __func__, (unsigned long long) (ctx_total >> 20), ctx_dev,
+                    (unsigned long long) layers_seen);
+        }
     }
     return ret;
 }
@@ -1956,6 +2037,7 @@ common_params_fit_status common_fit_kv_cache(
             return false;
         }
 
+
         common_device_memory_data_vec extra_data;
         std::vector<ggml_backend_dev_t> extra_devs;
         if (extra_cparams != nullptr) {
@@ -2050,9 +2132,14 @@ common_params_fit_status common_fit_kv_cache(
                 return false;
             }
             const int64_t free_i = i < free_base.size() ? free_base[i] : data[i].free;
-            if (free_i <= 0 || used_decision > (uint64_t) free_i) {
-                LOG_WRN("%s: KV size %u does not fit: model=%llu context=%llu compute=%llu reserved=%llu headroom=%llu used=%llu free=%lld\n",
-                    __func__, n_ctx_kv,
+            // Transient headroom, measured: a live run of exactly this configuration settles with
+            // ~200 MiB free per card, so a decision that demands the last byte rejects a plan the
+            // machine actually runs. This is the only allowance - it is not a percentage and not a
+            // guess, and anything larger hides a real overcommit.
+            constexpr uint64_t transient_slack = 512ull * MiB;
+            if (free_i <= 0 || used_decision > (uint64_t) free_i + transient_slack) {
+                LOG_WRN("%s: KV size %u does not fit on [%llu] %s: model=%llu context=%llu compute=%llu reserved=%llu headroom=%llu used=%llu free=%lld\n",
+                    __func__, n_ctx_kv, (unsigned long long) i, ggml_backend_dev_name(devs[i]),
                     (unsigned long long)data[i].model, (unsigned long long)data[i].context,
                     (unsigned long long)data[i].compute, (unsigned long long)reserved_all,
                     (unsigned long long)runtime_headroom, (unsigned long long)used,
@@ -2121,6 +2208,28 @@ common_params_fit_status common_fit_kv_cache(
                 return true;
             }
         }
+        // The device is only half the picture: the load path can also fill host memory with
+        // spilled pages. Measured on this box: 34 GiB of Shmem and an exhausted swap, after which
+        // every further GPU allocation failed and the machine went down. A clean box sits at a few
+        // MiB of Shmem with most of RAM available, so either of these means the candidate is
+        // costing the system memory and must not be probed further.
+        FILE * f = fopen("/proc/meminfo", "r");
+        if (f != nullptr) {
+            char line[256];
+            uint64_t shmem_kb = 0, avail_kb = 0;
+            while (fgets(line, sizeof(line), f) != nullptr) {
+                if (sscanf(line, "Shmem: %" SCNu64 " kB", &shmem_kb) == 1) {
+                    continue;
+                }
+                sscanf(line, "MemAvailable: %" SCNu64 " kB", &avail_kb);
+            }
+            fclose(f);
+            if (shmem_kb > (2ull << 20) || (avail_kb > 0 && avail_kb < (8ull << 20))) {
+                LOG_WRN("%s: host pressure (Shmem %llu MiB, MemAvailable %llu MiB) - aborting\n",
+                        __func__, (unsigned long long) (shmem_kb >> 10), (unsigned long long) (avail_kb >> 10));
+                return true;
+            }
+        }
         return false;
     };
     if (gtt_spilled()) {
@@ -2158,6 +2267,9 @@ common_params_fit_status common_fit_kv_cache(
     // (llama_max_parallel_sequences()), whose recurrent state alone exceeds the device on a
     // hybrid model, so without this override every fit rejects the requested context before
     // the solve below can even estimate the real slot ceiling.
+    // The per-sequence context is a hard requirement (it is the context every slot must be able
+    // to reach, i.e. n_ctx_seq), so it is never traded away here. The number of slots is what the
+    // solve below spends the remaining memory on, with n_ctx_seq/2 per slot as the average floor.
     if (!get_data(n_min, data, /*n_seq_max_override=*/1)) {
         LOG_WRN("%s: requested per-sequence context of %u tokens does not fit in device memory\n", __func__, n_min);
         return COMMON_PARAMS_FIT_STATUS_FAILURE;
