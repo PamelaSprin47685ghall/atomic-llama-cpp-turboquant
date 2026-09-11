@@ -149,6 +149,14 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    // state_read, plus the cells the restored tokens were placed in
+    void state_read_sinfo(
+            llama_io_read_i & io,
+               llama_seq_id   seq_id,
+      llama_state_seq_flags   flags,
+          slot_info_vec_t *   sinfos_out,
+    const slot_info_vec_t *   sinfos_in);
+
     //
     // llama_kv_cache specific API
     //
@@ -165,6 +173,10 @@ public:
     ggml_tensor * get_k_storage(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+
+    bool has_cell_ext() const;
+
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
     //
     // graph_build API
@@ -439,6 +451,8 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
     llama_memory_status status;

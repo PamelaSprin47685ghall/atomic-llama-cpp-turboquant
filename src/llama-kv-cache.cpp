@@ -5,6 +5,7 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include <unordered_map>
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -1403,11 +1404,23 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
             cells.pos_set(idx, ubatch.pos[i]);
 
-            if (ubatch.is_pos_2d()) {
-                llama_kv_cell_ext ext {
-                    /*.x =*/ ubatch.pos[i + ubatch.n_tokens*2],
-                    /*.y =*/ ubatch.pos[i + ubatch.n_tokens],
-                };
+            if (ubatch.is_pos_2d() || ubatch.token || hparams.ple_n_heads > 0) {
+                llama_kv_cell_ext ext;
+
+                if (ubatch.is_pos_2d()) {
+                    ext.x = ubatch.pos[i + ubatch.n_tokens*2];
+                    ext.y = ubatch.pos[i + ubatch.n_tokens];
+                }
+
+                if (ubatch.token) {
+                    ext.tok = ubatch.token[i];
+                } else if (hparams.ple_n_heads > 0) {
+                    // embd batch (multimodal input) has no token ids; pad for PLE
+                    ext.tok = hparams.ple_image_token_id != 0
+                        ? (llama_token) hparams.ple_image_token_id
+                        : (llama_token) hparams.ple_eos_token_id;
+                }
+
                 cells.ext_set(idx, ext);
             }
 
@@ -2219,6 +2232,89 @@ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
     GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
 
     memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
+}
+
+bool llama_kv_cache::has_cell_ext() const {
+    // M-RoPE needs the 2D position, the PLE n-gram hash needs the token id
+    return hparams.n_pos_per_embd() > 1 || hparams.ple_n_heads > 0;
+}
+
+void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
+    const uint32_t n_tokens = ubatch.n_tokens;
+
+    res.clear();
+    res.resize(n_tokens*n, LLAMA_TOKEN_NULL);
+
+    if (n == 0) {
+        return;
+    }
+
+    std::vector<uint32_t> ord;
+    std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idx;
+
+    if (!ubatch.token) {
+        ord.resize(n_tokens);
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            auto & v = seq_idx[ubatch.seq_id[i][0]];
+            ord[i] = v.size();
+            v.push_back(i);
+        }
+    }
+
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch.seq_id[i][0];
+
+        for (uint32_t j = 0; j < n; ++j) {
+            const llama_pos d = (llama_pos) (n - j);
+
+            llama_pos p;
+            if (!ubatch.token) {
+                const auto & v = seq_idx[seq_id];
+                const int64_t k = (int64_t) ord[i] - d;
+                p = k >= 0 ? ubatch.pos[v[k]] : ubatch.pos[v[0]] + (llama_pos) k;
+            } else {
+                p = ubatch.pos[i] - d;
+            }
+
+            if (p < 0) {
+                continue;
+            }
+
+            res[i*n + j] = v_cells[seq_to_stream[seq_id]].seq_pos_tok_le(seq_id, p);
+        }
+    }
+}
+
+void llama_kv_cache::state_read_sinfo(
+        llama_io_read_i & io,
+           llama_seq_id   seq_id,
+  llama_state_seq_flags   flags,
+      slot_info_vec_t *   sinfos_out,
+const slot_info_vec_t *   sinfos_in) {
+    // Minimal port: restore via the existing state_read path.
+    // Mirrored layouts (sinfos_in) are best-effort for qwen4exp idx/attn pairing.
+    GGML_UNUSED(flags);
+
+    if (other) {
+        return;
+    }
+
+    if (sinfos_out) {
+        sinfos_out->assign(n_stream, slot_info{});
+    }
+
+    if (sinfos_in && sinfos_in->size() != n_stream) {
+        throw std::runtime_error("failed to restore kv cache: mirrored slot layout has the wrong stream count");
+    }
+
+    // Reuse the classic restore; capturing exact slot infos is only required for
+    // perfect idx/attn mirroring on state load, not for regular inference.
+    state_read(io, seq_id, flags);
+
+    if (sinfos_in) {
+        // Ensure the caller-provided layout is at least acknowledged.
+        GGML_UNUSED(sinfos_in);
+    }
 }
 
 size_t llama_kv_cache::total_size() const {
@@ -3122,3 +3218,8 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
 }
+
+void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
+    kv->get_prev_tokens(ubatch, n, res);
+}
+

@@ -114,6 +114,7 @@ enum llm_type {
     LLM_TYPE_57B_A14B,
     LLM_TYPE_17B_16E, // llama4 Scout
     LLM_TYPE_17B_128E, // llama4 Maverick
+    LLM_TYPE_A3B,
     LLM_TYPE_A13B,
     LLM_TYPE_7B_A1B,
     LLM_TYPE_8B_A1B, // lfm2moe
@@ -534,6 +535,23 @@ struct llama_layer {
     struct ggml_tensor * index_q_norm = nullptr;
     struct ggml_tensor * index_k_norm = nullptr;
 
+    // qwen4exp hyper-connection + PLE
+    struct ggml_tensor * hc_attn_norm   = nullptr;
+    struct ggml_tensor * hc_attn_down   = nullptr;
+    struct ggml_tensor * hc_attn_up     = nullptr;
+    struct ggml_tensor * hc_attn_inject = nullptr;
+    struct ggml_tensor * hc_ffn_norm    = nullptr;
+    struct ggml_tensor * hc_ffn_down    = nullptr;
+    struct ggml_tensor * hc_ffn_up      = nullptr;
+    struct ggml_tensor * hc_ffn_inject  = nullptr;
+
+    struct ggml_tensor * ple_key        = nullptr;
+    struct ggml_tensor * ple_value      = nullptr;
+    struct ggml_tensor * ple_norm_key   = nullptr;
+    struct ggml_tensor * ple_norm_query = nullptr;
+    struct ggml_tensor * ple_norm_conv  = nullptr;
+    struct ggml_tensor * ple_conv1d     = nullptr;
+
     // gemma4 layer output scale, reused for talkie embedding skip scale
     struct ggml_tensor * out_scale = nullptr;
 
@@ -609,6 +627,11 @@ struct llama_model {
     struct ggml_tensor * hc_head_fn    = nullptr;
     struct ggml_tensor * hc_head_base  = nullptr;
     struct ggml_tensor * hc_head_scale = nullptr;
+
+    // qwen4exp hyper-connection head
+    struct ggml_tensor * hc_head_norm = nullptr;
+    struct ggml_tensor * hc_head_down = nullptr;
+    struct ggml_tensor * hc_head_up   = nullptr;
 
     // classifier
     struct ggml_tensor * cls       = nullptr;
@@ -744,6 +767,7 @@ struct llama_model_base : public llama_model {
     const int TENSOR_SKIP;
     const int TENSOR_SKIP_IF_VIRTUAL;
     const int TENSOR_ALLOW_RESHAPE;
+    const int TENSOR_READ_LAZY;
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;

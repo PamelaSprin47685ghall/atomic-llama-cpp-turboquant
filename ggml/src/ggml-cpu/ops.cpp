@@ -5081,7 +5081,8 @@ void ggml_compute_forward_get_rows(
             } break;
         default:
             {
-                GGML_ABORT("fatal error");
+                GGML_ABORT("%s: unsupported type %s for src0='%s' dst='%s'", __func__,
+                           ggml_type_name(src0->type), src0->name, dst->name);
             }
     }
 

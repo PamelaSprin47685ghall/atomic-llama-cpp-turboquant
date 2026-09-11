@@ -17995,12 +17995,22 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             {
                 if ((op->src[0]->type != GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_F16) ||
                     (op->src[1]->type != GGML_TYPE_I32 && op->src[1]->type != GGML_TYPE_I64)) {
+                    fprintf(stderr, "[vk-set_rows] REJECT %s src0=%s src1=%s dst=%s\n",
+                            device->name.c_str(),
+                            ggml_type_name(op->src[0]->type),
+                            ggml_type_name(op->src[1]->type),
+                            ggml_type_name(op->type));
                     return false;
                 }
                 // fork: turbo shaders use a 128-element block (head_dim must be
                 // divisible by 128) and only the f32-source variant is compiled
                 if (op->type == GGML_TYPE_TURBO2_0 || op->type == GGML_TYPE_TURBO3_0 || op->type == GGML_TYPE_TURBO4_0) {
                     if (op->src[0]->ne[0] % 128 != 0 || op->src[0]->type != GGML_TYPE_F32) {
+                        fprintf(stderr, "[vk-set_rows] REJECT turbo %s ne0=%lld src0=%s dst=%s\n",
+                                device->name.c_str(),
+                                (long long)op->src[0]->ne[0],
+                                ggml_type_name(op->src[0]->type),
+                                ggml_type_name(op->type));
                         return false;
                     }
                 }
@@ -18021,6 +18031,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_TURBO4_0:
                         return true;
                     default:
+                        fprintf(stderr, "[vk-set_rows] REJECT unsupported dst %s type=%s\n",
+                                device->name.c_str(), ggml_type_name(op->type));
                         return false;
                 }
             }
@@ -18144,14 +18156,23 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                    op->type == op->src[0]->type;
         case GGML_OP_ARGSORT:
             {
-                if (!ggml_is_contiguous(op) || !ggml_is_contiguous(op->src[0])) {
+                const bool cont_op = ggml_is_contiguous(op);
+                const bool cont_src = ggml_is_contiguous(op->src[0]);
+                if (!cont_op || !cont_src) {
+                    fprintf(stderr, "[vk-argsort] REJECT %s cont_op=%d cont_src=%d ne0=%lld mm=%d\n",
+                            device->name.c_str(), (int)cont_op, (int)cont_src,
+                            (long long)op->ne[0], (int)device->vulkan_memory_model);
                     return false;
                 }
                 // pipeline_argsort_large_f32 requires vulkan memory model.
                 if (device->vulkan_memory_model) {
                     return true;
                 } else {
-                    return op->ne[0] <= (1 << device->max_workgroup_size_log2);
+                    const bool ok = op->ne[0] <= (1 << device->max_workgroup_size_log2);
+                    fprintf(stderr, "[vk-argsort] %s ne0=%lld maxwg=%u mm=0 ok=%d\n",
+                            device->name.c_str(), (long long)op->ne[0],
+                            device->max_workgroup_size_log2, (int)ok);
+                    return ok;
                 }
             }
         case GGML_OP_TOP_K:

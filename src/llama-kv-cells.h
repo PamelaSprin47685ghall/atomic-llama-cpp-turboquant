@@ -15,6 +15,9 @@ struct llama_kv_cell_ext {
     llama_pos x = 0;
     llama_pos y = 0;
 
+    // token id at this cell; used by PLE n-gram hashing
+    llama_token tok = LLAMA_TOKEN_NULL;
+
     // return true if the current 2D spatial position is greater than other
     bool is_2d_gt(llama_pos ox, llama_pos oy) const {
         return (y > oy) || (y == oy && x > ox);
@@ -31,6 +34,8 @@ struct llama_kv_cell_ext {
 // TODO: add unit tests
 class llama_kv_cells {
 public:
+    using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
+
     void reset() {
         for (uint32_t i = 0; i < pos.size(); ++i) {
             pos[i]   = -1;
@@ -297,6 +302,13 @@ public:
         return seq[i].count();
     }
 
+    // the full set of sequences this cell is visible to
+    const seq_set_t & seq_get_all(uint32_t i) const {
+        assert(i < pos.size());
+
+        return seq[i];
+    }
+
     // check if the cell contains seq_id
     bool seq_has(uint32_t i, llama_seq_id seq_id) const {
         assert(i < pos.size());
@@ -313,6 +325,31 @@ public:
 
         seq[i].set(seq_id);
         seq_pos_inc(seq_id, pos[i]);
+    }
+
+    // the token of the cell of sequence seq_id at the largest position <= p
+    // when several cells share that position, the one with the highest index wins
+    // return LLAMA_TOKEN_NULL if the sequence has no cell at or before p
+    llama_token seq_pos_tok_le(llama_seq_id seq_id, llama_pos p) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        llama_token best_tok = LLAMA_TOKEN_NULL;
+        llama_pos best_pos = -1;
+        uint32_t best_idx = 0;
+
+        for (uint32_t i = 0; i < pos.size(); ++i) {
+            if (pos[i] < 0 || !seq[i].test(seq_id) || pos[i] > p) {
+                continue;
+            }
+            if (pos[i] > best_pos || (pos[i] == best_pos && i >= best_idx)) {
+                best_pos = pos[i];
+                best_idx = i;
+                best_tok = ext[i].tok;
+            }
+        }
+
+        return best_tok;
     }
 
     // return the sequence id of this cell
@@ -483,7 +520,6 @@ private:
     //
     std::vector<llama_pos> shift;
 
-    using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
 
     // the bitset seq[i] tells us which sequences are currently occupying the i-th cell
     std::vector<seq_set_t> seq;
