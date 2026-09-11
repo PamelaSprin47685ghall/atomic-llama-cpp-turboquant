@@ -42,9 +42,9 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     llama_memory_hybrid(
         model,
         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
-        type_r, type_s, rs_size,
+        type_r, type_s, rs_size, n_seq_max, n_seq_max,
         n_seq_max, n_rs_seq, offload, unified,
-        filter_attn, filter_recr),
+        filter_attn, filter_recr, nullptr),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
