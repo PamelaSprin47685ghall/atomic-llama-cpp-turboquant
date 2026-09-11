@@ -6374,15 +6374,19 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
     if (is_xkv_bounded_hot()) {
         n_kv_eff = std::min(n_kv, (uint32_t) kv_size);
-        if (s0 >= n_stream) {
-            s0 = 0;
-        }
-        if (s0 + ns > n_stream) {
-            ns = (n_stream > s0) ? (n_stream - s0) : 1;
-        }
-        if (ns == 0) {
-            ns = 1;
-        }
+    }
+    // The view spans cache streams [s0, s0 + ns) and must never reach past the streams this
+    // cache actually has. This clamp used to live inside the bounded-hot branch only, so a batch
+    // decoding several sequences - each in its own stream - could ask for a span wider than the
+    // cache and trip the view bound assert in ggml.c (data_size + view_offs > nbytes(view_src)).
+    if (s0 >= n_stream) {
+        s0 = 0;
+    }
+    if (s0 + ns > n_stream) {
+        ns = (n_stream > s0) ? (n_stream - s0) : 1;
+    }
+    if (ns == 0) {
+        ns = 1;
     }
 
     return ggml_view_4d(ctx, k,
@@ -6415,15 +6419,17 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
     if (is_xkv_bounded_hot()) {
         n_kv_eff = std::min(n_kv, (uint32_t) kv_size);
-        if (s0 >= n_stream) {
-            s0 = 0;
-        }
-        if (s0 + ns > n_stream) {
-            ns = (n_stream > s0) ? (n_stream - s0) : 1;
-        }
-        if (ns == 0) {
-            ns = 1;
-        }
+    }
+    // Same clamp as get_k: the V view spans cache streams [s0, s0 + ns) and must stay inside
+    // the streams this cache has, in every mode.
+    if (s0 >= n_stream) {
+        s0 = 0;
+    }
+    if (s0 + ns > n_stream) {
+        ns = (n_stream > s0) ? (n_stream - s0) : 1;
+    }
+    if (ns == 0) {
+        ns = 1;
     }
 
     if (!v_trans) {

@@ -1092,8 +1092,31 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(ubatch->n_seq_id[i] == 1 && "PLE n-gram embeddings do not support tokens shared by multiple sequences");
     }
 
-    // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch, so its own tokens count too
-    mctx->get_prev_tokens(*ubatch, n_prev, prev);
+    // Fast path: during prefill or single-sequence decode with contiguous positions,
+    // predecessors are either earlier tokens in this same ubatch or recent tokens from earlier batches.
+    // Calling mctx->get_prev_tokens invokes an O(kv_size) full scan per token per predecessor!
+    // With kv_size = 655360 and 512 tokens, that was over 6.7x10^8 loop iterations per ubatch on CPU!
+    prev.assign(n_tokens * n_prev, LLAMA_TOKEN_NULL);
+    bool need_fallback = false;
+    if (ubatch->token && ubatch->pos) {
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            for (int64_t s = 1; s <= n_prev; ++s) {
+                int64_t prev_slot = i * n_prev + (n_prev - s);
+                if (i >= s && ubatch->pos[i] == ubatch->pos[i - s] + s) {
+                    prev[prev_slot] = ubatch->token[i - s];
+                } else {
+                    need_fallback = true;
+                }
+            }
+        }
+    } else {
+        need_fallback = true;
+    }
+
+    if (need_fallback) {
+        // Fallback for boundaries / multimodal embeddings / non-contiguous tokens
+        mctx->get_prev_tokens(*ubatch, n_prev, prev);
+    }
 
     for (int64_t i = 0; i < n_tokens; ++i) {
         // an EOS in the window resets everything at or before it

@@ -583,6 +583,15 @@ private:
     // early returns and exceptions. OFF cost: one bool store per reserve.
     bool fp_reserve_sizing_active = false;
 
+    // Phase of the graph computed last: prompt processing and token generation never run at the
+    // same time. On a change, the graph for the new phase is reserved, which releases the buffers
+    // of the finished one (see graph_reserve).
+    int      last_graph_phase = -1;   // -1 nothing yet, 0 token generation, 1 prompt processing
+    uint32_t res_n_tokens_pp  = 0;
+    uint32_t res_n_seqs_pp    = 0;
+    uint32_t res_n_outputs_pp = 0;
+    uint32_t res_n_seqs_tg    = 0;
+
     // FlashPrefill metrics ledger (MetricsIntegration owner; append-only).
     // fp_metrics_pending: per-call staging; each successful ubatch merges
     //   here, and decode_impl commits it into fp_metrics_accum exactly once

@@ -56,6 +56,11 @@ GGML_API ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, i
 GGML_API ggml_gallocr_t ggml_gallocr_new_n_shared(ggml_backend_buffer_type_t * bufts, int n_bufs, ggml_gallocr_buffer_pool_t pool);
 GGML_API void           ggml_gallocr_free(ggml_gallocr_t galloc);
 GGML_API void           ggml_gallocr_reset(ggml_gallocr_t galloc);
+// drop this allocator's plan and shrink the shared pool to what is still required; call only
+// after every reusable graph has been invalidated (llama_context does that in graph_reserve)
+GGML_API void           ggml_gallocr_release_buffers(ggml_gallocr_t galloc);
+// shrink every shared buffer to the largest size its gallocs currently require
+GGML_API void           ggml_gallocr_buffer_pool_trim(ggml_gallocr_buffer_pool_t pool);
 
 // pre-allocate buffers from a measure graph - does not allocate or modify the graph
 // call with a worst-case graph to avoid buffer reallocations

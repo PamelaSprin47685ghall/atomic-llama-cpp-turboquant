@@ -1580,17 +1580,24 @@ void llama_context::sched_reserve() {
         n_nodes_tg  = ggml_graph_n_nodes(gf);
     }
 
-    // reserve again with pp graph to avoid ggml-alloc reallocations during inference
+    // End on the token-generation graph. Each reserve releases the buffers of the graph before it
+    // (they can never be needed together), so the one reserved last is the one held while idle -
+    // and a server that is idle is waiting for a request, whose first work is the decode that
+    // follows its prefill. Sizing the idle state by the prompt-processing graph is what kept a
+    // session's prefill buffers resident for its whole lifetime and pushed them into system
+    // memory once the KV pool used the card up.
     {
-        // TODO: not sure if the following graph would be worst case for multi-stream KV caches:
-        //
-        // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
-        //
-        auto * gf = graph_reserve(n_tokens_pp, n_seqs_pp, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_seqs_tg, n_seqs_tg, n_seqs_tg, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
-            throw std::runtime_error("failed to allocate compute pp buffers");
+            throw std::runtime_error("failed to allocate compute tg buffers");
         }
     }
+
+    // The reserve shapes: a change of phase reserves again with these (see process_ubatch).
+    res_n_tokens_pp  = n_tokens_pp;
+    res_n_seqs_pp    = n_seqs_pp;
+    res_n_outputs_pp = n_outputs_pp;
+    res_n_seqs_tg    = n_seqs_tg;
 
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
@@ -2350,6 +2357,28 @@ struct llama_compute_guard {
 };
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // Prompt processing and token generation never run at the same time, so the compute buffers
+    // only ever have to hold one of them: on a change of phase the graph for the new phase is
+    // reserved, which releases what the finished phase was holding (graph_reserve does the
+    // invalidation and the release in that order). Without it the larger phase's buffers stay
+    // allocated for the whole session.
+    {
+        const int phase = ubatch.n_tokens > ubatch.n_seqs ? 1 : 0;   // 1 = prompt processing
+        if (phase != last_graph_phase && ggml_backend_sched_phase_release_enabled()) {
+            if (last_graph_phase >= 0) {
+                auto * gf_phase = phase == 1
+                    ? graph_reserve(res_n_tokens_pp, res_n_seqs_pp, res_n_outputs_pp, mctx, false)
+                    : graph_reserve(res_n_seqs_tg, res_n_seqs_tg, res_n_seqs_tg, mctx, false);
+                if (gf_phase == nullptr) {
+                    LLAMA_LOG_ERROR("%s: failed to reserve %s buffers\n", __func__, phase == 1 ? "pp" : "tg");
+                    ret = GGML_STATUS_ALLOC_FAILED;
+                    return nullptr;
+                }
+            }
+            last_graph_phase = phase;
+        }
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -4520,6 +4549,18 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
     gf_res_prev->reset();
+
+    // Every reusable graph is invalidated at this point, which is what makes it safe to hand the
+    // compute buffers back: the pool keeps the chunks only as large as the graph about to be
+    // reserved needs them. Prompt processing and token generation never run at the same time, so
+    // reserving for one of them releases what the other was holding - that is the phased
+    // behaviour, expressed through the reserve that already exists instead of a second mechanism.
+    ggml_backend_sched_release_buffers(sched.get());
+    // Opt-in until every holder that outlives a ubatch (flashprefill plans, k_idxs, cached graph
+    // results) has been made to drop its tensors on the same boundary as well.
+    if (ggml_backend_sched_phase_release_enabled()) {
+        ggml_backend_sched_release_buffers(sched.get());
+    }
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this

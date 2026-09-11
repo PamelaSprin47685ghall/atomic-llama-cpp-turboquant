@@ -761,6 +761,77 @@ void ggml_gallocr_reset(ggml_gallocr_t galloc) {
     galloc->n_bound_tensors = 0;
 }
 
+// Trim every shared buffer to the largest size its gallocs currently require. The pool is shared
+// between contexts (an MTP draft uses the same compute pool), so a chunk may only shrink when
+// nobody still needs the larger one; each galloc reports its need through its talloc, which the
+// caller resets when the work changes phase. Never grows - the reserve path handles that.
+void ggml_gallocr_buffer_pool_trim(ggml_gallocr_buffer_pool_t pool) {
+    if (pool == NULL) {
+        return;
+    }
+    for (int e = 0; e < pool->n_entries; ++e) {
+        struct vbuffer * buf = pool->entries[e].buffer;
+        if (buf == NULL) {
+            continue;
+        }
+        for (int c = 0; c < GGML_VBUFFER_MAX_CHUNKS; ++c) {
+            const size_t cur = ggml_vbuffer_chunk_size(buf, c);
+            if (cur == 0) {
+                continue;
+            }
+            size_t need = 0;
+            for (int g = 0; g < pool->n_gallocs; ++g) {
+                struct ggml_gallocr * ga = pool->gallocs[g];
+                for (int i = 0; i < ga->n_buffers; ++i) {
+                    if (ga->bufts[i] != pool->entries[e].buft || ga->buf_tallocs[i] == NULL) {
+                        continue;
+                    }
+                    const size_t n = ggml_dyn_tallocr_max_size(ga->buf_tallocs[i], c);
+                    need = n > need ? n : need;
+                }
+            }
+            if (need == 0 || need >= cur) {
+                continue;
+            }
+            ggml_gallocr_buffer_pool_invalidate_chunk(pool, buf->chunks[c]);
+            ggml_backend_buffer_free(buf->chunks[c]);
+            buf->chunks[c] = ggml_backend_buft_alloc_buffer(pool->entries[e].buft, need);
+            if (buf->chunks[c] == NULL) {
+                continue;   // the next reserve allocates it again
+            }
+            ggml_backend_buffer_set_usage(buf->chunks[c], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            pool->generation++;
+        }
+    }
+}
+
+// Drop this allocator's own plan and let the pool shrink to what is still needed. Call it only
+// where every reusable graph has already been invalidated - llama_context does that inside
+// graph_reserve (sched reset + previous graph result reset), because a released buffer still
+// referenced by a reused graph is a dangling layout.
+void ggml_gallocr_release_buffers(ggml_gallocr_t galloc) {
+    if (galloc == NULL) {
+        return;
+    }
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        if (galloc->buf_tallocs == NULL || galloc->buf_tallocs[i] == NULL) {
+            continue;
+        }
+        bool duplicate = false;   // a buffer type used twice shares one allocator
+        for (int j = 0; j < i; j++) {
+            if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            continue;
+        }
+        ggml_dyn_tallocr_reset(galloc->buf_tallocs[i]);
+    }
+    ggml_gallocr_buffer_pool_trim(galloc->buffer_pool);
+}
+
 typedef struct ggml_gallocr * ggml_gallocr_t;
 
 static struct hash_node * ggml_gallocr_hash_get(ggml_gallocr_t galloc, struct ggml_tensor * t) {

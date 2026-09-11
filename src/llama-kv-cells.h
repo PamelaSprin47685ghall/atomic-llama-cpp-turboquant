@@ -766,6 +766,22 @@ public:
         llama_pos best_pos = -1;
         uint32_t best_idx = 0;
 
+        // If used cells are recorded, only iterate over used cells rather than full capacity!
+        if (!used.empty()) {
+            for (auto it = used.begin(); it != used.end(); ++it) {
+                uint32_t i = *it;
+                if (pos[i] < 0 || !seq[i].test(seq_id) || pos[i] > p) {
+                    continue;
+                }
+                if (pos[i] > best_pos || (pos[i] == best_pos && i >= best_idx)) {
+                    best_pos = pos[i];
+                    best_idx = i;
+                    best_tok = ext[i].tok;
+                }
+            }
+            return best_tok;
+        }
+
         for (uint32_t i = 0; i < pos.size(); ++i) {
             if (pos[i] < 0 || !seq[i].test(seq_id) || pos[i] > p) {
                 continue;

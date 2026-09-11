@@ -2081,6 +2081,27 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     sched->is_alloc = false;
 }
 
+// Drop the compute buffers and re-derive them from the next graph. Call only where every reusable
+// graph has been invalidated already (llama_context's graph_reserve does the sched reset and the
+// previous graph result reset right before): a released buffer that a reused graph still points
+// into is a dangling layout, which shows up as a view over a source that is suddenly too small.
+void ggml_backend_sched_release_buffers(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    std::lock_guard<std::recursive_mutex> lock(sched->compute_pool->mutex);
+    ggml_gallocr_release_buffers(sched->galloc);
+    sched->is_alloc = false;
+    sched->is_reset = false;   // the next graph must re-carve its tensors
+}
+
+// Whether a reserve may hand the compute buffers back before re-deriving them. Off by default:
+// with reuse across ubatches (flashprefill plans, k_idxs, cached graph results) some tensor can
+// still point into a released chunk, which shows up as a view over a source that is too small.
+// The mechanism is in place so the remaining holders can be found and fixed one by one.
+bool ggml_backend_sched_phase_release_enabled() {
+    const char * env = getenv("LLAMA_PHASE_RELEASE");
+    return env != nullptr && env[0] == '1' && env[1] == '\0';
+}
+
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
