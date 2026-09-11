@@ -1094,36 +1094,6 @@ common_device_memory_data_vec common_get_device_memory_data(
         ret[i].compute = impl[i].mb.compute;
     }
 
-    // Spread the pool over the devices by the layers they hold (see the capture in the probe
-    // above). Without this the whole pool lands on one card, which then looks impossible to
-    // satisfy while the others look empty - and the card that really is short stays hidden.
-    {
-        uint64_t ctx_total = 0;
-        int      ctx_dev   = -1;
-        for (size_t i = 0; i < ret.size(); i++) {
-            if (ret[i].context > 0) {
-                ctx_total += ret[i].context;
-                ctx_dev = ctx_dev == -1 ? (int) i : -2;
-            }
-        }
-        uint64_t layers_seen = 0;
-        for (uint64_t n : s_fit_layers_per_dev) {
-            layers_seen += n;
-        }
-        if (ctx_total > 0 && ctx_dev >= 0 && ret.size() > 1 && layers_seen > 0 &&
-                s_fit_layers_per_dev.size() == ret.size()) {
-            uint64_t assigned = 0;
-            for (size_t i = 0; i < ret.size(); i++) {
-                ret[i].context = ctx_total * s_fit_layers_per_dev[i] / layers_seen;
-                assigned += ret[i].context;
-            }
-            // the device that owned the pool keeps what integer division dropped
-            ret[ctx_dev].context += ctx_total - assigned;
-            LOG_INF("%s: KV pool %llu MiB reported on device %d, spread by layers (%llu in total)\n",
-                    __func__, (unsigned long long) (ctx_total >> 20), ctx_dev,
-                    (unsigned long long) layers_seen);
-        }
-    }
     return ret;
 }
 
@@ -2038,6 +2008,21 @@ common_params_fit_status common_fit_kv_cache(
         }
 
 
+        {
+            uint64_t ctx_sum = 0;
+            for (size_t i = 0; i < data.size(); ++i) {
+                ctx_sum += data[i].context;
+            }
+            LOG_INF("%s: probe n_ctx_kv=%u -> context %llu MiB over %zu entries\n",
+                    __func__, n_ctx_kv, (unsigned long long) (ctx_sum >> 20), data.size());
+            for (size_t i = 0; i < data.size(); ++i) {
+                LOG_INF("%s:   entry %zu: context %llu MiB, model %llu MiB, compute %llu MiB\n",
+                        __func__, i, (unsigned long long) (data[i].context >> 20),
+                        (unsigned long long) (data[i].model >> 20),
+                        (unsigned long long) (data[i].compute >> 20));
+            }
+        }
+
         common_device_memory_data_vec extra_data;
         std::vector<ggml_backend_dev_t> extra_devs;
         if (extra_cparams != nullptr) {
@@ -2118,16 +2103,16 @@ common_params_fit_status common_fit_kv_cache(
                     reserved_all, runtime_headroom, used)) {
                 return false;
             }
-            // The graph/compute term is a *reserve upper bound*: the same configuration runs
-            // with ~1.3 GiB of compute where the plan books 2.65 GiB per device, so counting
-            // it in the decision rejects models whose weights nearly fill the card (measured:
-            // used 13.70 GiB against 12.94 GiB free while the live run leaves 2.2 GiB free).
-            // It stays in the logged total; only the decision uses the constant part.
             uint64_t used_decision = 0;
-            // runtime_headroom stays out of the decision as well: the free number already
-            // contains the driver's measured footprint, so padding it again made the probe
-            // reject the configuration by 52 MiB. It remains visible in the logged total.
-            if (!xkv_checked_sum_fit_bytes(data[i].model, data[i].context, 0,
+            // The graph/compute term is measured here, not reserved: the probe allocates and
+            // decodes, so data[i].compute is what the configuration really takes. Leaving it out
+            // let a candidate through that pushed 30 GiB into system memory before the guard
+            // killed the process. runtime_headroom stays out: the free number already contains
+            // the driver's footprint, and it stays visible in the logged total.
+            // The model term is zero on purpose: the free reading is taken with the probe's model
+            // resident (measured: 7.5 GiB free at probe time on a card whose weights are 10 GiB),
+            // so adding it again is double counting and rejects configurations the box runs.
+            if (!xkv_checked_sum_fit_bytes(0, data[i].context, data[i].compute,
                     reserved_all, 0, used_decision)) {
                 return false;
             }
@@ -2176,9 +2161,8 @@ common_params_fit_status common_fit_kv_cache(
     }
 
     free_base.assign(devs.size(), 0);
-    for (size_t i = 0; i < devs.size() && i < data.size(); ++i) {
-        free_base[i] = data[i].free;
-    }
+    // Fallback only: the pre-probe reading above is the reference. This fills in devices whose
+    // kernel reading failed, and never overwrites a value that was measured on an idle card.
     // The budget base must be read with nothing allocated. The dry probe above allocates and
     // frees the whole model, but the driver keeps those pages in its own pool instead of
     // returning them to the kernel, so a base read from inside the probe is optimistic by
@@ -2199,10 +2183,24 @@ common_params_fit_status common_fit_kv_cache(
     // a system-wide OOM and a forced reboot. Nothing here needs to know how far past the edge
     // it went: as soon as any device shows GTT usage, the candidate is rejected.
     const uint64_t gtt_limit = 64ull << 20;
+    std::vector<uint64_t> gtt_base;   // per device, captured on the first reading
     const auto gtt_spilled = [&]() {
         for (size_t i = 0; i < devs.size(); ++i) {
             uint64_t gtt = 0;
-            if (common_fit_device_gtt(devs[i], gtt) && gtt > gtt_limit) {
+            if (!common_fit_device_gtt(devs[i], gtt)) {
+                continue;
+            }
+            // Baseline, not an absolute limit: the CPU-offloaded tensors legitimately live in GTT
+            // (measured: ~5 GiB per card for per_layer_token_embd), so the first reading is the
+            // reference and only growth past it means the driver started evicting device memory.
+            if (i >= gtt_base.size()) {
+                gtt_base.resize(i + 1, 0);
+            }
+            if (gtt_base[i] == 0) {
+                gtt_base[i] = gtt;
+                continue;
+            }
+            if (gtt > gtt_base[i] + gtt_limit) {
                 LOG_WRN("%s: device %s has %llu MiB in system memory - aborting before it grows\n",
                         __func__, ggml_backend_dev_name(devs[i]), (unsigned long long) (gtt >> 20));
                 return true;
@@ -2270,6 +2268,19 @@ common_params_fit_status common_fit_kv_cache(
     // The per-sequence context is a hard requirement (it is the context every slot must be able
     // to reach, i.e. n_ctx_seq), so it is never traded away here. The number of slots is what the
     // solve below spends the remaining memory on, with n_ctx_seq/2 per slot as the average floor.
+
+    // Budget base, read now, before anything is loaded: the cards are idle here. A reading taken
+    // after a probe picks up the driver's pooled leftovers, and every later candidate is then
+    // rejected against a shrunken number (measured: 12.3 GiB free against a real 17.1 GiB).
+    free_base.assign(devs.size(), 0);
+    for (size_t i = 0; i < devs.size(); ++i) {
+        uint64_t vram_free  = 0;
+        uint64_t vram_total = 0;
+        if (common_fit_device_vram(devs[i], vram_free, vram_total)) {
+            free_base[i] = (int64_t) vram_free;
+        }
+    }
+
     if (!get_data(n_min, data, /*n_seq_max_override=*/1)) {
         LOG_WRN("%s: requested per-sequence context of %u tokens does not fit in device memory\n", __func__, n_min);
         return COMMON_PARAMS_FIT_STATUS_FAILURE;
@@ -2278,7 +2289,11 @@ common_params_fit_status common_fit_kv_cache(
     const uint32_t n_probe = (uint32_t) std::min<uint64_t>(n_max, std::max<uint64_t>((uint64_t) n_min * 2, (uint64_t) n_min + 4096));
     common_device_memory_data_vec data_probe;
     if (n_probe > n_min) {
-        if (get_data(n_probe, data_probe)) {
+        // The slot count has to match the pool: a pool of two per-sequence contexts declared as a
+        // single sequence is not a configuration anyone runs, and the hybrid KV sizes its
+        // per-sequence bookkeeping from it (measured: each card reported 12 to 19 GiB of context
+        // for that inconsistent probe, against 0.6 GiB for the consistent one).
+        if (get_data(n_probe, data_probe, /*n_seq_max_override=*/(n_probe + n_min - 1) / n_min)) {
             bool device_context_grows = false;
             for (size_t i = 0; i < devs.size(); ++i) {
                 device_context_grows |= data_probe[i].context > data[i].context;
@@ -2301,8 +2316,10 @@ common_params_fit_status common_fit_kv_cache(
     auto slack_of = [&devs, &free_base](const common_device_memory_data_vec & d) {
         int64_t s = INT64_MAX;
         for (size_t i = 0; i < devs.size() && i < d.size(); ++i) {
+            // free is read while the probe's model is resident, so the model is already counted in
+            // it; what a candidate still has to fit is its own KV plus its graph/compute buffers.
             const int64_t free_i = i < free_base.size() ? free_base[i] : d[i].free;
-            const int64_t si = free_i - (int64_t) (d[i].model + d[i].context);   // compute is a reserve, not a cost
+            const int64_t si = free_i - (int64_t) (d[i].context + d[i].compute);
             s = std::min(s, si);
         }
         return s;
