@@ -911,7 +911,9 @@ static ggml_backend_t open_vulkan_backend() {
     ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
     if (dev) vk = ggml_backend_dev_init(dev, nullptr);
 #ifdef GGML_USE_VULKAN
-    vk = ggml_backend_vk_init(0);
+    if (!vk && ggml_backend_vk_get_device_count() > 0) {
+        vk = ggml_backend_vk_init(0);
+    }
 #endif
     return vk;
 }

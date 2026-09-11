@@ -875,10 +875,10 @@ struct triattention_scorer::impl {
             return nullptr;
         }
         const bool need_wht_inv = triattention_needs_inverse_wht(k_type);
-        if (need_wht_inv && (cal->head_dim != 128 || cal->rotary_dim != cal->head_dim)) {
-            // The current CUDA scorer can cooperatively invert exactly one
-            // 128-wide WHT block. Fall back to the backend-read CPU scorer for
-            // partial-RoPE or wider TurboQuant heads instead of scoring bad K.
+        if (need_wht_inv && ((cal->head_dim + 127u) / 128u) * 128u != 128u) {
+            // The CUDA scorer inverts a single 128-wide WHT block and scores
+            // the rotary prefix (partial rotary included). Wider TurboQuant
+            // heads still use the backend-read CPU scorer instead of bad K.
             return nullptr;
         }
 

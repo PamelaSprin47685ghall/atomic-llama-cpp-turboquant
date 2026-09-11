@@ -354,6 +354,373 @@ int main() {
         assert(!cells.rerot_get(1).active());
     }
 
+    // === Generation (FlashPrefill invalidation stamp) tests ===
+    // Contract: OFF by default with stamp 0 / generation 0, no bumps and no
+    // atomic work; opt-in via set_generation_enabled() which lazily assigns a
+    // unique stamp and bumps once; identity is (stamp, generation); consumers
+    // treat generation == MAX or stamp == MAX as always-invalid (saturating
+    // overflow needs 2^64 steps and is documented but not exercised here).
+    {
+        // Disabled by default: lazy stamp 0, mutations do not bump or assign.
+        llama_kv_cells cells;
+        cells.resize(4);
+        assert(!cells.get_generation_enabled());
+        assert(cells.get_generation() == 0);
+        assert(cells.get_generation_stamp() == 0);
+
+        cells.pos_set(0, 7);
+        cells.seq_add(0, 0);
+        cells.ext_set(0, {1, 2});
+        assert(cells.get_generation() == 0);
+        assert(cells.get_generation_stamp() == 0);
+
+        // Disabled copies stay untracked with no atomic work.
+        llama_kv_cells disabled_copy(cells);
+        assert(!disabled_copy.get_generation_enabled());
+        assert(disabled_copy.get_generation() == 0);
+        assert(disabled_copy.get_generation_stamp() == 0);
+        const auto disabled_snap = cells.cp(0, 2);
+        assert(!disabled_snap.get_generation_enabled());
+        assert(disabled_snap.get_generation_stamp() == 0);
+
+        // Enabling lazily assigns a unique stamp and bumps to a non-zero baseline.
+        cells.set_generation_enabled(true);
+        assert(cells.get_generation_enabled());
+        assert(cells.get_generation() != 0);
+        assert(cells.get_generation_stamp() != 0);
+        // Enabling twice is idempotent (no second bump, same stamp).
+        const uint64_t base = cells.get_generation();
+        const uint64_t base_stamp = cells.get_generation_stamp();
+        cells.set_generation_enabled(true);
+        assert(cells.get_generation() == base);
+        assert(cells.get_generation_stamp() == base_stamp);
+    }
+
+    {
+        // Enabled membership/ext mutations bump; read-only queries do not.
+        llama_kv_cells cells;
+        cells.resize(4);
+        cells.set_generation_enabled(true);
+        const uint64_t base = cells.get_generation();
+
+        cells.pos_set(0, 10);
+        assert(cells.get_generation() != base);
+        uint64_t g = cells.get_generation();
+
+        cells.seq_add(0, 0);
+        assert(cells.get_generation() != g);
+        g = cells.get_generation();
+
+        cells.ext_set(0, {3, 4});
+        assert(cells.get_generation() != g);
+        g = cells.get_generation();
+
+        // Read-only queries never bump.
+        (void) cells.is_empty(0);
+        (void) cells.get_used();
+        (void) cells.used_min();
+        (void) cells.used_max_p1();
+        (void) cells.get_has_shift();
+        (void) cells.seq_has(0, 0);
+        (void) cells.seq_count(0);
+        (void) cells.seq_get(0);
+        (void) cells.seq_pos_min(0);
+        (void) cells.seq_pos_max(0);
+        (void) cells.seq_get_used(0);
+        (void) cells.pos_get(0);
+        (void) cells.ext_get(0);
+        (void) cells.rerot_get(0);
+        (void) cells.get_shift(0);
+        (void) cells.pos_in(0, 0, 20);
+        (void) cells.rerot_has_active();
+        (void) cells.rerot_has_active_seq(0);
+        (void) cells.make_pack_plan();
+        std::vector<uint32_t> out;
+        (void) cells.rerot_collect_run(1, 1, out);
+        assert(cells.get_generation() == g);
+    }
+
+    {
+        // Shift/position mutations bump; no-op reset_shift does not.
+        llama_kv_cells cells;
+        cells.resize(4);
+        cells.set_generation_enabled(true);
+        cells.pos_set(0, 10);
+        cells.seq_add(0, 0);
+        uint64_t g = cells.get_generation();
+
+        // No pending shift: no-op reset does not bump.
+        cells.reset_shift();
+        assert(cells.get_generation() == g);
+
+        cells.pos_add(0, 5);
+        assert(cells.get_generation() != g);
+        g = cells.get_generation();
+
+        cells.pos_div(0, 2);
+        assert(cells.get_generation() != g);
+        g = cells.get_generation();
+
+        // Consuming the pending shift bumps once.
+        assert(cells.get_has_shift());
+        cells.reset_shift();
+        assert(cells.get_generation() != g);
+        g = cells.get_generation();
+        // Second reset with no shift is a no-op again.
+        cells.reset_shift();
+        assert(cells.get_generation() == g);
+    }
+
+    {
+        // Sequence membership: real changes bump, single-keeper/empty no-ops do not.
+        llama_kv_cells cells;
+        cells.resize(4);
+        cells.set_generation_enabled(true);
+        cells.pos_set(0, 1);
+        cells.seq_add(0, 0);
+        uint64_t g = cells.get_generation();
+
+        // Keeping the sole ref is a no-op.
+        assert(!cells.seq_keep(0, 0));
+        assert(cells.get_generation() == g);
+
+        // Adding a second ref bumps.
+        cells.seq_add(0, 1);
+        assert(cells.get_generation() != g);
+        g = cells.get_generation();
+
+        // Keeping one of two refs removes the other: bumps.
+        assert(!cells.seq_keep(0, 0));
+        assert(cells.get_generation() != g);
+        g = cells.get_generation();
+
+        // Removing the last ref via seq_rm bumps and frees.
+        assert(cells.seq_rm(0, 0));
+        assert(cells.is_empty(0));
+        assert(cells.get_generation() != g);
+        g = cells.get_generation();
+
+        // Filtering an already-empty cell is a no-op.
+        assert(!cells.seq_keep(1, 0));
+        assert(cells.get_generation() == g);
+    }
+
+    {
+        // Failed rerot guards do not bump; success bumps.
+        llama_kv_cells cells;
+        cells.resize(4);
+        cells.set_generation_enabled(true);
+        cells.pos_set(0, 5);
+        cells.seq_add(0, 0);
+        const auto pending = make_rerot_meta(11, 2, 3, llama_rerot_visibility::pending_record, 0, 5);
+        cells.rerot_set(0, pending);
+        uint64_t g = cells.get_generation();
+
+        // Wrong run: fail, no bump.
+        assert(!cells.rerot_publish(0, 11, 4, 7));
+        assert(!cells.rerot_reclassify(
+            0, 11, 3,
+            llama_rerot_visibility::pending_record,
+            llama_rerot_visibility::private_control,
+            7));
+        assert(cells.get_generation() == g);
+        assert(cells.rerot_get(0) == pending);
+
+        // Success bumps.
+        assert(cells.rerot_publish(0, 11, 3, 7));
+        assert(cells.get_generation() != g);
+        g = cells.get_generation();
+
+        // Resetting an active tag bumps; resetting inactive does not.
+        cells.rerot_reset(0);
+        assert(cells.get_generation() != g);
+        g = cells.get_generation();
+        cells.rerot_reset(0);
+        assert(cells.get_generation() == g);
+
+        // Re-tag then reclassify success bumps.
+        cells.rerot_set(0, pending);
+        g = cells.get_generation();
+        assert(cells.rerot_reclassify(
+            0, 11, 3,
+            llama_rerot_visibility::pending_record,
+            llama_rerot_visibility::private_control,
+            0));
+        assert(cells.get_generation() != g);
+    }
+
+    {
+        // Clearing preserves enabled+stamp and bumps (never resets to 0).
+        llama_kv_cells cells;
+        cells.resize(4);
+        cells.set_generation_enabled(true);
+        cells.pos_set(0, 1);
+        cells.seq_add(0, 0);
+        const uint64_t stamp = cells.get_generation_stamp();
+        const uint64_t g = cells.get_generation();
+
+        cells.reset();
+        assert(cells.get_generation_enabled());
+        assert(cells.get_generation_stamp() == stamp);
+        assert(cells.get_generation() != g);
+        assert(cells.get_generation() != 0);
+        assert(cells.get_used() == 0);
+
+        // resize (which clears) also preserves and bumps.
+        const uint64_t g2 = cells.get_generation();
+        cells.resize(4);
+        assert(cells.get_generation_enabled());
+        assert(cells.get_generation_stamp() == stamp);
+        assert(cells.get_generation() != g2);
+
+        // Disabling preserves the version; mutations stop bumping; re-enable bumps.
+        cells.set_generation_enabled(false);
+        assert(!cells.get_generation_enabled());
+        const uint64_t g3 = cells.get_generation();
+        const uint64_t stamp3 = cells.get_generation_stamp();
+        cells.pos_set(1, 9);
+        assert(cells.get_generation() == g3);
+        cells.set_generation_enabled(true);
+        assert(cells.get_generation_stamp() == stamp3);
+        assert(cells.get_generation() != g3);
+    }
+
+    {
+        // Copy/cp/assign never collide on (stamp, generation).
+        llama_kv_cells src;
+        src.resize(4);
+        src.set_generation_enabled(true);
+        src.pos_set(0, 3);
+        src.seq_add(0, 0);
+        const uint64_t src_stamp = src.get_generation_stamp();
+        const uint64_t src_gen = src.get_generation();
+
+        // cp() does not bump the source; snapshot inherits baseline with fresh stamp.
+        const auto snap = src.cp(0, 2);
+        assert(src.get_generation() == src_gen);
+        assert(snap.get_generation_enabled());
+        assert(snap.get_generation() == src_gen);
+        assert(snap.get_generation_stamp() != src_stamp);
+
+        // Copy construction: same baseline, different stamp.
+        llama_kv_cells copy(src);
+        assert(copy.get_generation() == src_gen);
+        assert(copy.get_generation_stamp() != src_stamp);
+
+        // Copy assignment: fresh stamp, inherited baseline.
+        llama_kv_cells dst;
+        dst.resize(4);
+        dst.set_generation_enabled(true);
+        const uint64_t dst_stamp_before = dst.get_generation_stamp();
+        dst = src;
+        assert(dst.get_generation() == src_gen);
+        assert(dst.get_generation_stamp() != src_stamp);
+        assert(dst.get_generation_stamp() != dst_stamp_before);
+
+        // Mutating the copy diverges without colliding with the source.
+        const uint64_t copy_gen = copy.get_generation();
+        copy.pos_set(1, 8);
+        assert(copy.get_generation() != copy_gen);
+        assert(copy.get_generation_stamp() != src_stamp);
+        assert(src.get_generation() == src_gen);
+
+        // Moves transfer identity with ordinary data-move semantics and clear
+        // the source to disabled 0/0/false with no atomic work.
+        llama_kv_cells moved_src;
+        moved_src.resize(4);
+        moved_src.set_generation_enabled(true);
+        moved_src.pos_set(0, 5);
+        const uint64_t moved_stamp = moved_src.get_generation_stamp();
+        const uint64_t moved_gen = moved_src.get_generation();
+        assert(moved_stamp != 0);
+        llama_kv_cells moved(std::move(moved_src));
+        assert(moved.get_generation_stamp() == moved_stamp);
+        assert(moved.get_generation() == moved_gen);
+        assert(moved.get_generation_enabled());
+        assert(moved_src.get_generation_stamp() == 0);
+        assert(moved_src.get_generation() == 0);
+        assert(!moved_src.get_generation_enabled());
+    }
+
+    {
+        // set() restore bumps; empty restore does not.
+        llama_kv_cells cells;
+        cells.resize(4);
+        cells.set_generation_enabled(true);
+        cells.pos_set(0, 3);
+        cells.seq_add(0, 0);
+        const auto saved = cells.cp(0, 2);
+        uint64_t g = cells.get_generation();
+
+        cells.rm(0);
+        assert(cells.get_generation() != g);
+        g = cells.get_generation();
+
+        cells.set(0, saved);
+        assert(cells.get_generation() != g);
+        g = cells.get_generation();
+
+        llama_kv_cells empty;
+        empty.resize(0);
+        cells.set(0, empty);
+        assert(cells.get_generation() == g);
+
+        std::vector<uint32_t> no_idxs;
+        cells.set(no_idxs, empty);
+        assert(cells.get_generation() == g);
+    }
+
+    {
+        // Pack: empty plan is a no-op; non-empty plan bumps.
+        llama_kv_cells cells;
+        cells.resize(8);
+        cells.set_generation_enabled(true);
+        uint64_t g = cells.get_generation();
+
+        auto empty_plan = cells.make_pack_plan();
+        assert(empty_plan.moves.empty());
+        cells.apply_pack(empty_plan);
+        assert(cells.get_generation() == g);
+
+        cells.pos_set(0, 0);
+        cells.seq_add(0, 0);
+        cells.pos_set(5, 5);
+        cells.seq_add(5, 0);
+        g = cells.get_generation();
+
+        // Planning itself never bumps.
+        auto plan = cells.make_pack_plan();
+        assert(cells.get_generation() == g);
+        assert(!plan.moves.empty());
+
+        cells.apply_pack(plan);
+        assert(cells.get_generation() != g);
+        assert(cells.get_used() == 2);
+        assert(cells.used_max_p1() == 2);
+    }
+
+    {
+        // Freeze: empty exec set is a no-op; otherwise bumps.
+        llama_kv_cells cells;
+        cells.resize(4);
+        cells.set_generation_enabled(true);
+        uint64_t g = cells.get_generation();
+        // No cell references exec seq 0: no-op.
+        assert(cells.rerot_freeze_to_archive(99, 0, 1) == 0);
+        assert(cells.get_generation() == g);
+
+        cells.pos_set(0, 1);
+        cells.seq_add(0, 0);
+        const auto pending = make_rerot_meta(99, 2, 3, llama_rerot_visibility::pending_record, 0, 5);
+        cells.rerot_set(0, pending);
+        g = cells.get_generation();
+        // Pending cells are released (kept == 0) but exec-ref removal still bumps.
+        assert(cells.rerot_freeze_to_archive(99, 0, 1) == 0);
+        assert(cells.get_generation() != g);
+        assert(cells.is_empty(0));
+    }
+
+
     // Test 8: Stable payload ID and storage generation lifecycle
     {
         llama_kv_cells cells;

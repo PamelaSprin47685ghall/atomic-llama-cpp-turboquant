@@ -3,6 +3,8 @@
 #include "log.h"
 
 #include "../src/llama-ext.h"
+#include "../src/llama-flashprefill.h"
+#include "../src/llama-flashprefill-layout.h"
 #include "../src/llama-model.h"
 #include "../src/llama-xkv-factor.h"
 #include "../src/llama-xkv-codec.h"
@@ -33,6 +35,259 @@ enum common_layer_fraction_t {
 class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
+
+// --- FlashPrefill V2 fit budgeting (FittingIntegration owner) ------------------------
+//
+// Resource contract (PREFILL.md §11; coordinated with PolicyCore, VulkanDispatch,
+// GraphIntegration, CacheFragments, ConfigIntegration, ContextIntegration):
+// - Single sizing helper: llama_flashprefill::scratch_bytes_checked (PolicyCore).
+//   Fit and runtime call the same function; the formula is never duplicated here.
+//   Per-layer peak, reused across layers: single-layer F/Hkv/Dk/Dv, do NOT multiply
+//   by n_layer. Worst-case pool precision is F32 (mean_bytes = 4) until the graph
+//   proves F16 (PolicyCore).
+// - Pool/plan/outputs are graph tensors (VulkanDispatch, confirmed: SELECT scoring
+//   is on-chip plus graph tensors, zero extra workspace). Split M/L/O scratch lives
+//   in the backend-private prealloc_split_k vk_buffer pool (code proof beside
+//   common_fp_native_split_bytes): lazily grown at dispatch, invisible to scheduler
+//   sizes and probes. The graph reserve sizes worst-case sparse caps from probe
+//   inputs via the same shared helper when llm_graph_params.flashprefill_reserve_sizing
+//   is set (GraphIntegration; reserve graphs never alias live via the reuse key). The
+//   context factory scopes the flag via RAII in graph_reserve (StatePolicy, landed):
+//   true for synthetic builds incl. fit probes, false for live decode/training. The
+//   probe's compute thus holds every graph-owned byte and no manual reserve applies
+//   to those (no double charge); coverage proof is reserve tensors present in probe
+//   compute, never the helper log line alone. Meanwhile the
+//   split-pool peak is added here exactly once per Vulkan device
+//   with the dispatch formula (single source until the agreed size hook lands). The
+//   fitter publishes no live rows (source-map channel stays null; unknown live
+//   boundary stays unknown) — reserve-snapshot synthetic rows are GraphIntegration's
+//   sanctioned channel, not fit data.
+// - Fragment bound via CacheFragments' checked fragment_budget_for() (never
+//   ceil(K/BN), never clamped) with the frozen admission allowances
+//   (GraphIntegration): streams=1, split=4, run=65, q_cap token rows, for both
+//   paths; Fcap capped at K inside the helper (structural token invariant). These
+//   allowances are a DEVELOPMENT unbenchmarked guard — not a measured cutoff —
+//   pinned to the layout/schema version (bump version to change; fingerprint covers
+//   the version, hence the fixed policy). Single definition in
+//   llama-flashprefill-layout.h (admission_budget_for, landed): graph+fitter call
+//   the same function, no private copies here. Beyond-bound rows fall back to dense
+//   (AUTO) or resource-error (REQUIRED) at runtime — never truncated. Helper-guard
+//   breach reports unavailable (fail closed, never saturation, never silent fallback).
+// - OFF (or invalid) config -> no extra probes, no capacity change, no logs.
+// - Recurrent/MTP decode rows are never sparse-eligible: common_fit_recurrent_cache
+//   budgets zero FlashPrefill bytes by design (see its note below).
+
+static bool common_fp_is_enabled(const llama_context_params * cparams) {
+    return cparams != nullptr && llama_flashprefill_is_enabled(&cparams->flashprefill);
+}
+
+struct common_fp_dims {
+    uint32_t hkv = 0;
+    uint32_t dk  = 0;
+    uint32_t dv  = 0;
+    uint32_t gqa = 0;
+    uint32_t hq  = 0; // upper bound on Q heads (gqa*hqkv; exact for uniform models)
+};
+
+// Backend doubt resolved by code inspection, not assertion
+// (ggml/src/ggml-vulkan/ggml-vulkan.cpp): prealloc_split_k is a backend-private
+// vk_buffer on ggml_backend_vk_context, grown lazily at dispatch via
+// ggml_vk_preallocate_buffers (indexed-FA site sizes
+//   split_k_size = S>1 ? n_flat*(HSV+2)*S*4 : 0, n_flat = n_queries*n_head_q).
+// Raw VkDeviceMemory is invisible to ggml_backend_sched_get_buffer_size, hence to
+// probes — same class as the Tri memmove_scratch +8MiB precedent. The pool is shared
+// across layers/ops (grown to max), so the fitter adds the worst-case peak exactly
+// once per Vulkan device here. Final contract (VulkanDispatch): rows_bound is the
+// structural n_output*Hq cap (ATTN dst ne[2]*ne[1], zero U slack); n_ubatch*Hq_max
+// covers it definitionally and is adopted as final — rb_alloc dropped. S<=4 hard;
+// S=1 default allocates zero (kept as worst case here).
+static bool common_fp_is_vulkan_dev(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    const char * name = reg ? ggml_backend_reg_name(reg) : nullptr;
+    return name != nullptr && std::string(name).find("Vulkan") != std::string::npos;
+}
+
+static bool common_fp_native_split_bytes(
+        const llama_flashprefill_config * cfg,
+        const common_fp_dims * dims,
+        uint32_t n_ubatch,
+        uint32_t n_ctx_kv,
+        ggml_backend_dev_t dev,
+        uint64_t & out_bytes) {
+    out_bytes = 0;
+    if (cfg == nullptr || dims == nullptr) {
+        return true; // unknown dims (e.g. recurrent-only): no attention, exact zero
+    }
+    if (!common_fp_is_vulkan_dev(dev)) {
+        return true; // prealloc pools are Vulkan-backend-private
+    }
+    if (dims->hq == 0 || dims->hq > 4096 || n_ubatch > (1u << 24)) {
+        return false;
+    }
+    // U/F from the shared admission budget (streams=1 unified, q_cap token rows).
+    llama_flashprefill_fragment_budget budget;
+    if (!llama_flashprefill_admission_budget_for(
+            n_ctx_kv, cfg->block_k, LLAMA_FLASHPREFILL_ADMISSION_STREAMS_UNIFIED, n_ubatch, &budget, nullptr)) {
+        return false;
+    }
+    // S_max=4 hard in dispatch (S=1 default allocates zero); worst case takes 4.
+    // n_flat bound confirmed sound (VulkanDispatch): n_queries are TOKEN rows
+    // (PackGQA/BM packing is SELECT-internal), unique on (source_query,q_head) with
+    // tiles partitioning the query set, so rows <= n_output*Hq <= n_ubatch*Hq_max
+    // (final contract: rows_bound is the structural n_output*Hq cap, rb_alloc dropped).
+    const uint32_t s = budget.n_fragments == 0 ? 1u : std::min(4u, budget.n_fragments);
+    if (s <= 1) {
+        return true;
+    }
+    // dims.dv is Turbo-padded, matching the HSV width; terms fit u64 by the guards.
+    out_bytes = (uint64_t) n_ubatch * (uint64_t) dims->hq
+        * ((uint64_t) dims->dv + 2ull) * (uint64_t) s * 4ull;
+    return true;
+}
+
+// Log-only budget number: never added to probe sums (graph counts the caps).
+static bool common_fp_budget_bytes(
+        const llama_flashprefill_config * cfg,
+        const common_fp_dims * dims,
+        uint32_t n_ubatch,
+        uint32_t n_ctx_kv,
+        uint64_t & out_bytes,
+        uint32_t & out_fragments) {
+    out_bytes = 0;
+    if (cfg == nullptr || dims == nullptr || !llama_flashprefill_is_enabled(cfg)) {
+        return false;
+    }
+    if (cfg->block_k == 0 || cfg->block_q == 0) {
+        return false;
+    }
+    uint32_t n_packed = 0;
+    uint32_t n_tiles  = 0;
+    if (llama_flashprefill::packed_layout_checked(n_ubatch, dims->gqa, cfg->block_q, &n_packed, &n_tiles)
+            != LLAMA_FLASHPREFILL_OK) {
+        return false;
+    }
+    if (n_ctx_kv == 0 || n_ubatch == 0) {
+        return false;
+    }
+    // F via the CacheFragments checked budget (never ceil(K/BN), never clamped) with
+    // the frozen admission allowances (GraphIntegration): streams=1, split=4, run=65,
+    // q_cap token rows (n_ubatch). I32 breach or a helper-guard breach reports
+    // unavailable (fail closed).
+    out_fragments = 0;
+    llama_flashprefill_fragment_budget budget;
+    if (!llama_flashprefill_admission_budget_for(
+            n_ctx_kv, cfg->block_k, LLAMA_FLASHPREFILL_ADMISSION_STREAMS_UNIFIED, n_ubatch, &budget, nullptr)) {
+        return false;
+    }
+    // Shared helper already caps Fcap at K (structural token invariant: pool sized on
+    // actual admitted F); enforce the scratch helper's fragment guard here (fail closed).
+    if (budget.n_fragments == 0 || budget.n_fragments > (1u << 24)) {
+        return false;
+    }
+    out_fragments = budget.n_fragments;
+    llama_flashprefill::scratch_inputs in{};
+    in.n_fragments   = budget.n_fragments;
+    in.n_kv_heads    = dims->hkv;
+    in.d_k           = dims->dk;
+    in.d_v           = dims->dv;
+    in.n_packed_rows = n_packed;
+    in.n_splits      = 1; // default path (S=1, no scratch); bounded-S<=4 split triples reuse the observed prealloc_split_k pool (VulkanDispatch)
+    in.mean_bytes    = 4; // F32 pool worst case (PolicyCore)
+    return llama_flashprefill::scratch_bytes_checked(cfg, &in, &out_bytes) == LLAMA_FLASHPREFILL_OK;
+}
+
+static bool common_fp_dims_from_model(const llama_model * model, const llama_context_params * cparams, common_fp_dims & out) {
+    if (model == nullptr || cparams == nullptr) {
+        return false;
+    }
+    // Max-over-KV-layers getters (ConfigIntegration, include/llama.h).
+    const int32_t hkv = llama_model_n_head_kv_max(model);
+    const int32_t dk  = llama_model_n_embd_head_k(model);
+    const int32_t dv  = llama_model_n_embd_head_v(model);
+    const int32_t gqa = llama_model_n_gqa_max(model);
+    if (hkv <= 0 || dk <= 0 || dv <= 0 || gqa <= 0) {
+        return false; // recurrent-only or unknown layout: no sparse pool to predict
+    }
+    out.hkv = (uint32_t) hkv;
+    out.dk  = (uint32_t) dk;
+    out.dv  = (uint32_t) dv;
+    out.gqa = (uint32_t) gqa;
+    // Upper bound on Q heads per layer (exact for uniform models; the two maxima may
+    // come from different hybrid layers, which only over-states worst-case rows).
+    const uint64_t hq64 = (uint64_t) (uint32_t) hkv * (uint64_t) (uint32_t) gqa;
+    if (hq64 == 0 || hq64 > (uint64_t) UINT32_MAX) {
+        return false;
+    }
+    out.hq = (uint32_t) hq64;
+    // TurboQuant KV caches zero-pad heads to multiples of 128 (src/llama-kv-cache.cpp).
+    // Pad conservatively (MLA has no separate V cache, so this over-counts <= 127
+    // elements there; negligible and on the safe side for a worst-case bound).
+    auto is_turbo = [](ggml_type t) {
+        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+    };
+    if (is_turbo(cparams->type_k) && out.dk % 128 != 0) {
+        out.dk = ((out.dk + 127) / 128) * 128;
+    }
+    if (is_turbo(cparams->type_v) && out.dv % 128 != 0) {
+        out.dv = ((out.dv + 127) / 128) * 128;
+    }
+    return true;
+}
+
+// Resolve worst-case layer dims for the budget log via one metadata-only model load.
+// Called only when FlashPrefill is enabled (OFF adds zero work here).
+static bool common_fp_load_dims(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        common_fp_dims & out) {
+    if (!common_fp_is_enabled(cparams)) {
+        return false;
+    }
+    llama_model_params meta_mparams = *mparams;
+    meta_mparams.no_alloc  = true;
+    meta_mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+    llama_model * meta = llama_model_load_from_file(path_model, meta_mparams);
+    if (meta == nullptr) {
+        return false;
+    }
+    const bool ok = common_fp_dims_from_model(meta, cparams, out);
+    llama_model_free(meta);
+    return ok;
+}
+
+// Enabled-only fit summary: fitted capacity plus the single helper-sized worst-case
+// eligible scratch number with the real shapes used. OFF emits nothing.
+static void common_fp_log_fit_result(
+        const char * what,
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        uint32_t n_ctx_kv) {
+    if (!common_fp_is_enabled(cparams)) {
+        return;
+    }
+    constexpr uint64_t KiB = 1024ull;
+    common_fp_dims dims;
+    if (!common_fp_load_dims(path_model, mparams, cparams, dims)) {
+        LOG_INF("%s: FlashPrefill enabled, fitted %s K=%u tokens; budget bytes unavailable (dims unknown)\n",
+            __func__, what, n_ctx_kv);
+        return;
+    }
+    // Same single source the graph reserve sizes with (common_fp_budget_bytes).
+    uint64_t bytes = 0;
+    uint32_t frags = 0;
+    if (!common_fp_budget_bytes(&cparams->flashprefill, &dims, cparams->n_ubatch, n_ctx_kv, bytes, frags)) {
+        LOG_INF("%s: FlashPrefill enabled, fitted %s K=%u tokens; budget bytes unavailable (shape exceeds checked guards)\n",
+            __func__, what, n_ctx_kv);
+        return;
+    }
+    LOG_INF("%s: FlashPrefill enabled, fitted %s K=%u tokens (Hkv=%u Dk=%u Dv=%u GQA=%u ubatch=%u BN=%u F=%u); worst-case eligible scratch peak=%llu KiB\n",
+        __func__, what, n_ctx_kv, dims.hkv, dims.dk, dims.dv, dims.gqa, cparams->n_ubatch, cparams->flashprefill.block_k, frags,
+        (unsigned long long) (bytes / KiB));
+}
+
+
 
 static bool xkv_checked_mul_u64(uint64_t a, uint64_t b, uint64_t & out) {
     if (a == 0 || b == 0) {
@@ -1961,6 +2216,10 @@ common_params_fit_status common_fit_kv_cache(
     uint32_t hp_n_ctx_train = 0;
     uint32_t hp_n_expert = 0;
 
+    // FlashPrefill native-split dims, resolved once (metadata-only load, enabled-only).
+    // OFF: no load, fp_nat_have=false, probes add zero.
+    common_fp_dims fp_nat_dims;
+    const bool fp_nat_have = common_fp_load_dims(path_model, mparams, cparams, fp_nat_dims);
     // XKV reserve is computed exactly once per fit invocation (not per
     // probe). workspace_mib is the TOTAL transient budget (once); the exact
     // seal scratch must fit the remainder after the decode sub-budget.
@@ -2109,6 +2368,18 @@ common_params_fit_status common_fit_kv_cache(
                 }
             }
 
+            // FlashPrefill: graph caps arrive via data[i].compute (no manual reserve,
+            // no double charge); the backend-private split pool does not, so its
+            // worst-case peak is added here exactly once per device (shared formula).
+            if (fp_nat_have) {
+                uint64_t nat_bytes = 0;
+                if (!common_fp_native_split_bytes(&cparams->flashprefill, &fp_nat_dims, cparams->n_ubatch, n_ctx_kv, devs[i], nat_bytes)) {
+                    LOG_TRC("%s: KV size %u rejected: native split shape unsizable\n", __func__, n_ctx_kv);
+                    return false;
+                }
+                reserved += (size_t) std::min<uint64_t>(nat_bytes, (uint64_t) SIZE_MAX);
+            }
+
             // Vulkan TriAttention compaction uses one reusable 8 MiB
             // device-local memmove scratch buffer per Vulkan device. Keep
             // this in sync with GGML_VK_MEMMOVE_SCRATCH_SIZE so --total-kv
@@ -2117,8 +2388,21 @@ common_params_fit_status common_fit_kv_cache(
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(devs[i]);
                 const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
                 if (reg_name && std::string(reg_name).find("Vulkan") != std::string::npos) {
+                    // Keep in sync with GGML_VK_MEMMOVE_SCRATCH_SIZE
+                    reserved += 8ull * 1024ull * 1024ull;
+                } else if (reg_name && std::string(reg_name).find("CUDA") != std::string::npos) {
+                    // Keep in sync with GGML_CUDA_MEMMOVE_SCRATCH_SIZE
                     reserved += 8ull * 1024ull * 1024ull;
                 }
+            }
+
+            // RERoT span-table/DDVR phase inputs, frontier query rows,
+            // parked-recurrent metadata descriptors and episode host metadata
+            // (KV/recurrent payloads are sized by the surrounding fit paths,
+            // never double-counted here). Keep in sync with
+            // common_rerot_scratch_reserve_bytes() in common/common.h.
+            if (cparams->rerot) {
+                reserved += 8ull * 1024ull * 1024ull;
             }
 
             for (size_t j = 0; j < extra_devs.size(); ++j) {
@@ -2664,11 +2948,13 @@ common_params_fit_status common_fit_kv_cache(
                         "(%d slot probes, binding device %s)\n",
                         __func__, cparams->n_ctx_kv, cparams->n_seq_max, target, probes,
                         bind < devs.size() ? ggml_backend_dev_name(devs[bind]) : "?");
+                common_fp_log_fit_result("unified KV", path_model, mparams, cparams, cparams->n_ctx_kv);
                 return COMMON_PARAMS_FIT_STATUS_SUCCESS;
             }
         }
     }
 
+    common_fp_log_fit_result("unified KV", path_model, mparams, cparams, cparams->n_ctx_kv);
     return COMMON_PARAMS_FIT_STATUS_SUCCESS;
 }
 
@@ -2681,6 +2967,11 @@ common_params_fit_status common_fit_recurrent_cache(
                      ggml_log_level   log_level) {
     const uint32_t n_max = std::max(1u, cparams->n_seq_max);
     const uint32_t n_target = std::max(1u, std::min(cparams->n_seq_recurrent == 0 ? 1u : cparams->n_seq_recurrent, n_max));
+
+    // FlashPrefill: recurrent-state slots serve recurrent/MTP decode rows, which are
+    // never sparse-eligible, so this fit budgets zero FlashPrefill bytes by design
+    // (no reserve, no prediction). Prefill scratch is accounted in
+    // common_fit_kv_cache / common_fit_rerot_capacities only.
 
     std::vector<ggml_backend_dev_t> devs;
     uint32_t hp_ngl = 0;
@@ -2772,8 +3063,18 @@ common_params_fit_status common_fit_recurrent_cache(
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(devs[i]);
                 const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
                 if (reg_name && std::string(reg_name).find("Vulkan") != std::string::npos) {
+                    // Keep in sync with GGML_VK_MEMMOVE_SCRATCH_SIZE
+                    reserved += 8ull * 1024ull * 1024ull;
+                } else if (reg_name && std::string(reg_name).find("CUDA") != std::string::npos) {
+                    // Keep in sync with GGML_CUDA_MEMMOVE_SCRATCH_SIZE
                     reserved += 8ull * 1024ull * 1024ull;
                 }
+            }
+            // RERoT metadata scratch (span tables / frontier rows / episode
+            // host metadata; payloads sized elsewhere, never double-counted).
+            // Keep in sync with common_rerot_scratch_reserve_bytes().
+            if (cparams->rerot) {
+                reserved += 8ull * 1024ull * 1024ull;
             }
             for (size_t j = 0; j < extra_devs.size(); ++j) {
                 if (extra_devs[j] == devs[i]) {
@@ -2927,6 +3228,10 @@ common_rerot_fit_result common_fit_rerot_capacities(
     uint32_t hp_n_ctx_train = 0;
     uint32_t hp_n_expert = 0;
 
+    // FlashPrefill native-split dims, resolved once (metadata-only load, enabled-only).
+    common_fp_dims fp_nat_dims;
+    const bool fp_nat_have = common_fp_load_dims(path_model, mparams, cparams, fp_nat_dims);
+
     auto test_fit = [&](uint32_t b, uint32_t p, uint32_t k_val, int64_t & min_margin_out) -> bool {
         llama_context_params test = *cparams;
         test.n_ctx_kv = k_val;
@@ -2994,13 +3299,39 @@ common_rerot_fit_result common_fit_rerot_capacities(
                     reserved += bytes;
                 }
             }
+            // FlashPrefill: graph caps arrive via data[i].compute (no manual reserve,
+            // no double charge); the backend-private split pool does not, so its
+            // worst-case peak is added here exactly once per device (shared formula,
+            // frozen admission allowances).
+            if (fp_nat_have) {
+                uint64_t nat_bytes = 0;
+                if (!common_fp_native_split_bytes(&cparams->flashprefill, &fp_nat_dims, cparams->n_ubatch, k_val, devs[i], nat_bytes)) {
+                    LOG_TRC("%s: probe rejected for B=%u P=%u K=%u: native split shape unsizable\n", __func__, b, p, k_val);
+                    return false;
+                }
+                reserved += nat_bytes;
+            }
             if (cparams->triattention) {
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(devs[i]);
                 const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
                 if (reg_name && std::string(reg_name).find("Vulkan") != std::string::npos) {
+                    // Keep in sync with GGML_VK_MEMMOVE_SCRATCH_SIZE
+                    reserved += 8ull * 1024ull * 1024ull;
+                } else if (reg_name && std::string(reg_name).find("CUDA") != std::string::npos) {
+                    // Keep in sync with GGML_CUDA_MEMMOVE_SCRATCH_SIZE
                     reserved += 8ull * 1024ull * 1024ull;
                 }
             }
+
+            // RERoT span-table/DDVR phase inputs, frontier query rows,
+            // parked-recurrent metadata descriptors and episode host metadata
+            // (KV/recurrent payloads are sized by the surrounding fit paths,
+            // never double-counted here). Keep in sync with
+            // common_rerot_scratch_reserve_bytes() in common/common.h.
+            // This joint B/P/K path always runs with RERoT enabled, so the
+            // reserve is unconditional here (unlike the KV/recurrent fits
+            // which gate on cparams->rerot).
+            reserved += 8ull * 1024ull * 1024ull;
             for (size_t j = 0; j < extra_devs.size(); ++j) {
                 if (extra_devs[j] == devs[i]) {
                     reserved += extra_data[j].context;
@@ -3133,6 +3464,7 @@ common_rerot_fit_result common_fit_rerot_capacities(
 
         LOG_INF("RERoT auto-fit selected (feedback probe): B=%u people, P=%u pens, K=%u tokens (K_min=%u, min_margin=%lld B)\n",
             best.b_people, best.p_pens, best.k_tokens, best.k_min, (long long) best.min_device_margin);
+        common_fp_log_fit_result("RERoT", path_model, mparams, cparams, best.k_tokens);
         return best;
     }
 
@@ -3153,6 +3485,7 @@ common_rerot_fit_result common_fit_rerot_capacities(
         best.min_device_margin = margin_found;
         LOG_INF("RERoT auto-fit fallback selected: B=1 person, P=%u pens, K=%u tokens (K_min=%u, min_margin=%lld B)\n",
             best.p_pens, best.k_tokens, best.k_min, (long long) best.min_device_margin);
+        common_fp_log_fit_result("RERoT", path_model, mparams, cparams, best.k_tokens);
         return best;
     }
 

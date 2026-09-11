@@ -27,6 +27,7 @@
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/flashprefill.cuh"
 #include "ggml-cuda/fattn-banded.cuh"
+#include "ggml-cuda/fattn-rerot.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -71,6 +72,10 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/xkv-reconstruct.cuh"
+#include "ggml-cuda/xkv-attention.cuh"
+#include "ggml-cuda/xkv-factorize.cuh"
+#include "ggml-cuda/xkv-landmark.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -960,6 +965,106 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     CUDA_CHECK(cudaMemset(ctx->dev_ptr, value, buffer->size));
 }
 
+static constexpr size_t GGML_CUDA_MEMMOVE_SCRATCH_SIZE = 8u * 1024u * 1024u;
+
+static bool ggml_backend_cuda_buffer_memmove_tensor(
+        ggml_backend_buffer_t buffer,
+        const struct ggml_backend_tensor_memmove_region * regions,
+        size_t n_regions,
+        bool dry_run) {
+    if (n_regions == 0) {
+        return true;
+    }
+
+    ggml_backend_cuda_buffer_context * buf_ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    const int dev_id = buf_ctx->device;
+    const uintptr_t base_buf = (uintptr_t) buf_ctx->dev_ptr;
+
+    // Preflight and bounds checking across the whole batch
+    for (size_t r = 0; r < n_regions; ++r) {
+        const auto & region = regions[r];
+        if (region.tensor == nullptr || region.tensor->buffer != buffer || region.n_copies == 0) {
+            return false;
+        }
+
+        const uintptr_t t_data = (uintptr_t) region.tensor->data;
+        if (t_data < base_buf || t_data > base_buf + buffer->size) {
+            return false;
+        }
+        const size_t base_offset = t_data - base_buf;
+
+        for (size_t c = 0; c < region.n_copies; ++c) {
+            const size_t src = base_offset + region.src_offset + c * region.src_stride;
+            const size_t dst = base_offset + region.dst_offset + c * region.dst_stride;
+            const size_t end_src = src + region.size;
+            const size_t end_dst = dst + region.size;
+
+            if (end_src < src || end_dst < dst || end_src > buffer->size || end_dst > buffer->size) {
+                return false;
+            }
+        }
+    }
+
+    if (dry_run) {
+        return true;
+    }
+
+    // Fixed scratch limit to avoid unbounded allocation (like Vulkan's 8MB scratch)
+    const size_t chunk_limit = std::min<size_t>(GGML_CUDA_MEMMOVE_SCRATCH_SIZE, 1u << 20); // 1 MiB chunk
+    void * scratch = nullptr;
+
+    ggml_cuda_set_device(dev_id);
+
+    auto move_one = [&](char * src, char * dst, size_t size) {
+        if (size == 0 || src == dst) {
+            return;
+        }
+
+        const bool overlap = (src < dst && dst < src + size) || (dst < src && src < dst + size);
+        if (!overlap || dst < src) {
+            // Non-overlapping or downward move (src > dst) can copy directly from head to tail
+            CUDA_CHECK(cudaMemcpyAsync(dst, src, size, cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+        } else {
+            // Upward move with overlap: chunk via scratch buffer backwards
+            if (!scratch) {
+                CUDA_CHECK(cudaMalloc(&scratch, chunk_limit));
+            }
+            size_t remaining = size;
+            while (remaining > 0) {
+                const size_t chunk = std::min(remaining, chunk_limit);
+                const size_t off = remaining - chunk; // Process backwards from end for upward move
+                CUDA_CHECK(cudaMemcpyAsync(
+                    scratch, src + off, chunk,
+                    cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    dst + off, scratch, chunk,
+                    cudaMemcpyDeviceToDevice, cudaStreamPerThread));
+                CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+
+                remaining -= chunk;
+            }
+        }
+    };
+
+    for (size_t r = 0; r < n_regions; ++r) {
+        const auto & region = regions[r];
+        char * const base = (char *) region.tensor->data;
+
+        for (size_t c = 0; c < region.n_copies; ++c) {
+            char * const src = base + region.src_offset + c * region.src_stride;
+            char * const dst = base + region.dst_offset + c * region.dst_stride;
+            move_one(src, dst, region.size);
+        }
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    if (scratch) {
+        CUDA_CHECK(cudaFree(scratch));
+    }
+    return true;
+}
+
 static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
     /* .free_buffer     = */ ggml_backend_cuda_buffer_free_buffer,
     /* .get_base        = */ ggml_backend_cuda_buffer_get_base,
@@ -972,6 +1077,7 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
     /* .cpy_tensor      = */ ggml_backend_cuda_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_cuda_buffer_clear,
     /* .reset           = */ NULL,
+    /* .memmove_tensor  = */ ggml_backend_cuda_buffer_memmove_tensor,
 };
 
 // cuda buffer type
@@ -1018,7 +1124,7 @@ static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_ty
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
 
-    size_t size = (tensor->op == GGML_OP_FLASH_ATTN_EXT || tensor->op == GGML_OP_FLASH_ATTN_EXT_BANDED)
+    size_t size = (tensor->op == GGML_OP_FLASH_ATTN_EXT || tensor->op == GGML_OP_FLASH_ATTN_EXT_BANDED || tensor->op == GGML_OP_FLASH_ATTN_EXT_REROT)
         ? ggml_cuda_flash_attn_ext_get_alloc_size(buft_ctx->device, tensor)
         : ggml_nbytes(tensor);
     int64_t ne0 = tensor->ne[0];
@@ -2506,6 +2612,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_FLASH_ATTN_EXT_BANDED:
             ggml_cuda_flash_attn_ext_banded(ctx, dst);
             break;
+        case GGML_OP_FLASH_ATTN_EXT_REROT:
+            ggml_cuda_flash_attn_ext_rerot(ctx, dst);
+            break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
             break;
@@ -2550,6 +2659,30 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
+            break;
+        case GGML_OP_XKV_RECONSTRUCT:
+            ggml_cuda_xkv_reconstruct(ctx, dst);
+            break;
+        case GGML_OP_XKV_ATTENTION:
+            ggml_cuda_xkv_attention(ctx, dst);
+            break;
+        case GGML_OP_XKV_FACTORIZE:
+            ggml_cuda_xkv_factorize(ctx, dst);
+            break;
+        case GGML_OP_XKV_CANONICALIZE:
+            ggml_cuda_xkv_canonicalize(ctx, dst);
+            break;
+        case GGML_OP_XKV_LANDMARK_BUILD:
+            ggml_cuda_xkv_landmark_build(ctx, dst);
+            break;
+        case GGML_OP_XKV_LANDMARK:
+            ggml_cuda_xkv_landmark(ctx, dst);
+            break;
+        case GGML_OP_XKV_LANDMARK_ROWS:
+            ggml_cuda_xkv_landmark_rows(ctx, dst);
+            break;
+        case GGML_OP_XKV_LANDMARK_MERGE:
+            ggml_cuda_xkv_landmark_merge(ctx, dst);
             break;
         case GGML_OP_FLASH_PREFILL_POOL:
             ggml_cuda_flash_prefill_pool(ctx, dst);
@@ -2869,7 +3002,8 @@ static int ggml_cuda_try_gdn_cache_fusion(
     const ggml_tensor * gdn = cgraph->nodes[node_idx];
     // the kernel skips the snapshot tail, so the gdn output must not be a graph output
     if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 ||
-        (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        (gdn->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        ggml_get_op_params_i32(gdn, 1) != 0) {
         return 0;
     }
 
@@ -5387,7 +5521,28 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #ifdef GGML_USE_MUSA
             return false;
 #else
-            return true;
+            // Native path (op_params[1] == 0) runs the recurrent kernel; the
+            // RBB block path needs the device Cholesky solver, which covers
+            // F32 inputs with scalar gates, one token, S_v <= 128 writers
+            // N <= 64. Anything else falls back to the CPU oracle.
+            if (ggml_get_op_params_i32(op, 1) == 0) {
+                return true;
+            }
+            if (op->src[6] == nullptr || op->src[6]->type != GGML_TYPE_F32) {
+                return false;
+            }
+            for (int i = 0; i < 6; i++) {
+                if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32) {
+                    return false;
+                }
+            }
+            return op->type == GGML_TYPE_F32 &&
+                op->src[3]->ne[0] == 1 &&
+                op->src[2]->ne[2] == 1 &&
+                ggml_get_op_params_i32(op, 0) == 1 &&
+                op->src[2]->ne[0] <= 128 &&
+                op->src[2]->ne[3] <= 64 &&
+                op->src[2]->ne[3] >= 1;
 #endif // GGML_USE_MUSA
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
@@ -5403,6 +5558,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_FLASH_ATTN_EXT_BANDED:
             return ggml_cuda_flash_attn_ext_banded_supported(dev_ctx->device, op);
+        case GGML_OP_FLASH_ATTN_EXT_REROT:
+            return ggml_cuda_flash_attn_ext_rerot_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
@@ -5415,11 +5572,31 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_XKV_RECONSTRUCT:
+            return ggml_cuda_xkv_reconstruct_supports(op);
+
+        case GGML_OP_XKV_ATTENTION:
+            return ggml_cuda_xkv_attention_supports(op);
+
+        case GGML_OP_XKV_FACTORIZE:
+            return ggml_cuda_xkv_factorize_supports(op);
+        case GGML_OP_XKV_CANONICALIZE:
+            return ggml_cuda_xkv_canonicalize_supports(op);
+        case GGML_OP_XKV_LANDMARK_BUILD:
+            return ggml_cuda_xkv_landmark_build_supports(op);
+        case GGML_OP_XKV_LANDMARK:
+            return ggml_cuda_xkv_landmark_supports(op);
+        case GGML_OP_XKV_LANDMARK_ROWS:
+            return ggml_cuda_xkv_landmark_rows_supports(op);
+        case GGML_OP_XKV_LANDMARK_MERGE:
+            return ggml_cuda_xkv_landmark_merge_supports(op);
 
         case GGML_OP_FLASH_PREFILL_POOL:
+            return ggml_cuda_flash_prefill_pool_supported(dev_ctx->device, op);
         case GGML_OP_FLASH_PREFILL_SELECT:
+            return ggml_cuda_flash_prefill_select_supported(dev_ctx->device, op);
         case GGML_OP_FLASH_PREFILL_ATTN:
-            return true;
+            return ggml_cuda_flash_prefill_attn_supported(dev_ctx->device, op);
 
         default:
             return false;

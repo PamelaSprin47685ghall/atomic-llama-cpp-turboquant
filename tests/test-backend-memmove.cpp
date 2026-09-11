@@ -129,10 +129,10 @@ int main() {
     CHECK(test_buffer(ggml_backend_cpu_buffer_type()) == 0);
     auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
     auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-    if (reg && std::string(ggml_backend_reg_name(reg)).find("Vulkan") != std::string::npos) {
+    if (reg && (std::string(ggml_backend_reg_name(reg)).find("Vulkan") != std::string::npos || std::string(ggml_backend_reg_name(reg)).find("CUDA") != std::string::npos)) {
         CHECK(test_buffer(ggml_backend_dev_buffer_type(dev)) == 0);
     } else {
-        std::cout << "SKIP: Vulkan portion (CPU tests ran)\n";
+        std::cout << "SKIP: GPU portion (CPU tests ran)\n";
     }
     return 0;
 }

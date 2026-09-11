@@ -1,10 +1,13 @@
 # RERoT：自适应 DAG 执行语义、实现状态与交付路线
 
 更新：2026-09-09。项目：`atomic-llama-cpp-turboquant`。本文核对的 `master` HEAD：`4e7769152`。
+更新：2026-09-11（第十四轮静态审计校正）。项目：`atomic-llama-cpp-turboquant`。本文核对的 `master` HEAD：`ceba57b96`。
+更新：2026-09-11（第十五轮静态审计，全平台修复）。设备级验证：CPU、CUDA（RTX 2080 Ti sm_75）、Vulkan（NVIDIA ICD；AMD RADV 本机暂不可枚举）。本轮修复（均带设备证据，详见当日交接）：① Vulkan RERoT 共享内存预算按整模块静态 shared 计（74496B > 49152B 限制导致队列报错/fence 永不 signal 的挂死），`test-rerot-attn` 从 240s 挂死变为 ~1s 内 0 failure；② RERoT Parallel Delta GDN（RBB）在 CUDA/Vulkan 两侧补齐 density 归一化与并发求解：CUDA 新增设备端 RBB 分支，Vulkan 接入 `RBB=2` pipeline，`test-rerot-attn` GPU sections 从 57 failure 变为 0（CUDA 与 Vulkan 两树均验证）；③ CUDA ordinary FA 对 Turbo KV 的 TILE/MMA f16 临时缓冲漏分配（堆越界导致 turbo3 错解与 igu4_nl 非法指令崩溃）；④ CUDA TriAttention 打分器支持 partial-rotary Turbo（不再对 Ornith 类 partial IMRoPE 回退到主机）。这些改动只修复实现缺陷，不改第 2/4/6 节的执行语义与不变量。
+更新：2026-09-11（第十六轮静态审计与 upstream sync ×2）。项目：`atomic-llama-cpp-turboquant`。基线：`git pull origin master` 两次——第一次快进到 `81f5b0198`（含随后被回退的 `--fit` 容量求解重写），第二次 origin/master 被**强制更新**到 `88fca9ced`（回退那 5 笔 `--fit` 重写，改用 dry-measurement + joint pool/slot solve + kernel VRAM 数字的正确修法）；`git pull upstream master` 两次均为 up-to-date。本轮：① `--total-kv`（别名 `--kv-size`，server scope）由上游正确提供：`auto` → `n_ctx_kv_auto`，`-c`/`-np` 语义保留，RERoT 阶段 0 门「auto + 显式 -np」仍拒绝；本地为第一次 pull 打的临时兼容 shim 已删除（clean cutover，不留第二套机制）；② 校正文档漂移（Vulkan 精度门硬件、raw-Q 钩子覆盖范围、HEAD 基线）；③ 三平台（CPU/CUDA/Vulkan）特性测试矩阵两次合并后均为 0 failure。残余：AMD RX 6800 RADV 本机不可枚举，AMD 侧验收仍待；host 参考路径在**多 segment + boundary refine/部分因果切割**时仍显式拒绝（`--xkv-landmark-refine` 默认 `none`，设备路径按行 `refine_cap` 支持）。
 
 本文是 RERoT 的单一自包含事实源，吸收当前 `AGENTS.md` 的最新方案，并结合当前源码与最近两笔 DAG 实现提交校正“已经实现什么、还缺什么”。以后不要再用旧 `RERoT指南.md`、旧数学审计、每日交接或脚本名字推断项目阶段。
 
-**当前状态包含 `4e7769152` 之后的工作树实现，不等同于该历史 HEAD，也不等同于生产部署。** 本轮继续修复 DAG 实现与验证，保留既有 `src/llama-triattention.cpp` buffer-type API 修改；没有修改 `AGENTS.md`。生产服务与当前候选 artifact 分开记录，不继承旧部署的验收结论。
+**当前状态包含 `4e7769152` 之后的多笔实现提交（如 `8a2b25848`、`47f651b3d`，含第 12 节记录的 Stage 8 多 Lane DAG 认证）及其后的工作树修改，不等同于这些历史 HEAD，也不等同于生产部署。** 保留既有 `src/llama-triattention.cpp` buffer-type API 修改；没有修改 `AGENTS.md`。生产服务与当前候选 artifact 分开记录，不继承旧部署的验收结论。
 
 ---
 
@@ -1586,7 +1589,7 @@ run B: probe → simple → restore
   - `1->2`, `1->3`, `2->4`, `3->4` 菱形依赖门控、不等长生成（3 vs 10 tokens）、前驱 1 唯一样本去重展开与阶段自然完结测试通过（`test_dag_diamond_and_unequal_length_history`）。
   - synthesis 互补结果与独立意图测试通过（`test_dag_synthesis_complementary_results_distinct_intents`）：验证并行 Worker 各自独立意图（代数推导 vs 几何剖分）生成互补结论，所有前驱完结后 synthesis 节点精确解锁；synthesis 读者视界中按拓扑偏序单次且完整呈现各前驱结论，无 intent 串线或跨阶段污染。
   - `test-rerot-view` 包含 4 节点全 DAG 拓扑、循环偏序及菱形单次祖先展开断言。
-  - 物理卡 AMD Radeon RX 6800 上 Vulkan 周期注意力精度门（`test-rerot-attn --precision-only`，keys=33/257，误差 $\le 1.19 \times 10^{-7}$）及 DDVR 多 span 相位补偿门 100% 通过。
+  - Vulkan 周期注意力精度门（`test-rerot-attn --precision-only`，RTX 2080 Ti NVIDIA ICD 与 CPU reference，keys=33/257，误差 $\le 1.19 \times 10^{-7}$）及 DDVR 多 span 相位补偿门 100% 通过（本机 AMD RX 6800 RADV 驱动因系统层原因暂不可枚举，GPU 验证由 NVIDIA ICD 承载）。
 - **目标大模型 Ornith-1.5-35B 真机端到端全量通过**（`scripts/rerot-target-ornith-multi-lane.py`）：
   - Flat 2-worker DAG：$25 \times 12$ 与 $15 \times 16$ 独立并行并汇聚综合为 $\boxed{540}$；
   - `A->C` + B independent：A ($14 \times 15=210$) 与 B ($30 \times 20=600$) 并行，C 依赖 A 产出 $210+50=260$，最终汇聚输出 **860**；
@@ -1645,7 +1648,7 @@ run B: probe → simple → restore
   - **Tier 3 形式数学（AIME 样例）**：`math-aime25-base-divisor`（通过整除条件转换为 $b+7 \mid 56$，正确得出 $b \in \{21, 49\}$ 之和 70 并给出 $\boxed{70}$）；
   - **Tier 4 长上下文与生产任务**：Needle in haystack 密钥检索（通过，准确提取 `REROT-TURBO-778899`）与多章节操作系统结构化分析报告（通过，篇幅 > 1500 字，完整涵盖进程、内存、文件三大核心原理与对比表格）；
 - 多 Lane DAG 真实推理测试（`scripts/rerot-target-ornith-multi-lane.py`）：flat 2-worker DAG（25*12 与 15*16 并行推导并在 Lane C 汇聚合成 540）、A->C 带独立 B 重叠（14*15 与 30*20 并行，C 依赖 A 产出 260 并汇聚为 860）、菱形依赖（100*3 与 100*5 汇聚合成 800）均自然完结并通过无 internal token 泄漏断言；
-- 物理显卡 AMD Radeon RX 6800 上的 Vulkan 精度门（`test-rerot-attn --precision-only`，F16/Turbo keys=33/257，误差 $\le 1.19 \times 10^{-7}$）与 DDVR 多 span 门 100% 通过；
+- 显卡上的 Vulkan 精度门（`test-rerot-attn --precision-only`，RTX 2080 Ti NVIDIA ICD，F16/Turbo keys=33/257，误差 $\le 1.19 \times 10^{-7}$）与 DDVR 多 span 门 100% 通过；
 - 生产环境服务依据授权保持永久停用状态；测试日志、单项输出与构建库哈希清单完整保存归档。
 
 #### 质量

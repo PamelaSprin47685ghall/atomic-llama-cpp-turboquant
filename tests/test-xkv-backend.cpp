@@ -15,6 +15,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-xkv.h"
+#include "ggml-xkv-factor.h"
 #include "ggml-cpu.h"
 #include "../ggml/src/ggml-backend-impl.h"
 
@@ -1936,9 +1937,10 @@ static void test_vulkan_subcase() {
     test_device_owned_no_mirror(vk, vbuft);
 
     // ACTUAL VULKAN TEST PROVING DEVICE HOT CANONICALIZE:
-    // Allocates hot tensor directly on Vulkan device buffer type,
-    // poisons host tensor->data pointer, and verifies device execution
-    // succeeds without segfaulting / touching poisoned host address.
+    // Allocates hot tensor directly on Vulkan device buffer type, uploads
+    // deterministic quantized TURBO4 rows, runs device canonicalize, and asserts
+    // the output matches a CPU oracle computed from the same uploaded bytes
+    // while confirming exactly 1 device sync was performed.
     {
         std::cout << "[vulkan_hot_canonicalize_device_test] starting..." << std::endl;
         const uint32_t head_dim = 64;
@@ -1968,11 +1970,18 @@ static void test_vulkan_subcase() {
         // Populate data via backend tensor set (upload to GPU)
         const size_t total_nbytes = ggml_nbytes(hot);
         std::vector<uint8_t> init_bytes(total_nbytes, 0);
+        // Encode valid TURBO4 rows using deterministic float patterns
+        const size_t row_size_bytes = ggml_row_size(GGML_TYPE_TURBO4_0, padded_row);
+        for (uint32_t slot = 0; slot < capacity; ++slot) {
+            std::vector<float> row_floats(padded_row, 0.0f);
+            for (uint32_t j = 0; j < padded_row; ++j) {
+                row_floats[j] = std::sin((float)(slot * padded_row + j + 1) * 0.1f) * 0.5f;
+            }
+            uint8_t * slot_dst = init_bytes.data() + slot * row_size_bytes;
+            check(ggml_quantize_turbo_row(GGML_TYPE_TURBO4_0, row_floats.data(), slot_dst, padded_row, 128),
+                  "quantize hot slot");
+        }
         ggml_backend_tensor_set(hot, init_bytes.data(), 0, total_nbytes);
-
-        // POISON HOST POINTER to prove device execution NEVER dereferences it!
-        void * saved_data = hot->data;
-        hot->data = (void*)0xDEADBEEFBAADF00DULL;
 
         const std::vector<uint32_t> slots = {1, 3, 5};
         const std::vector<int32_t> positions = {10, 25, 42};
@@ -2000,8 +2009,54 @@ static void test_vulkan_subcase() {
               "vulkan hot canonicalize device execution: " + err);
         check(stats.sync_count == 1, "vulkan hot canonicalize exactly 1 sync");
 
-        // Restore pointer for safe cleanup
-        hot->data = saved_data;
+        // Compute CPU oracle from the SAME uploaded bytes to verify numerical equivalence.
+        ggml_xkv_canonicalize_params cp = {};
+        cp.version = GGML_XKV_FACTOR_VERSION;
+        cp.n_rows = n_rows;
+        cp.n_layers = 1;
+        cp.n_heads = n_heads;
+        cp.head_dim = head_dim;
+        cp.padded_head_dim = padded_hd;
+        cp.total_feat = head_dim * n_heads;
+        cp.rotary_dim = rotary_dim;
+        cp.rope_mode = 0;
+        cp.input_type = (uint32_t)GGML_TYPE_TURBO4_0;
+        cp.is_k = 1;
+        cp.hadamard_dim = 0;
+
+        std::vector<int32_t> i_rows(slots.begin(), slots.end());
+        std::vector<float> oracle_full(n_rows * cp.total_feat, 0.0f);
+        char ora_err[256] = {};
+        std::memset(ora_err, 0, sizeof(ora_err));
+        bool ora_ok = ggml_xkv_canonicalize_cpu_oracle(
+                  init_bytes.data(), GGML_TYPE_TURBO4_0,
+                  i_rows.data(), positions.data(), /*pos_is_64=*/0, n_rows,
+                  rope_tables.data(), (uint32_t)rope_tables.size(),
+                  nullptr, 0,
+                  &cp, oracle_full.data(),
+                  ora_err, sizeof(ora_err));
+        if (!ora_ok) {
+            std::cout << "ora_err: '" << ora_err << "' cp.version=" << cp.version
+                      << " n_rows=" << cp.n_rows << " total_feat=" << cp.total_feat
+                      << " head_dim=" << cp.head_dim << " phd=" << cp.padded_head_dim
+                      << " rot=" << cp.rotary_dim << " rope_nelems=" << rope_tables.size() << std::endl;
+        }
+        check(ora_ok, std::string("oracle execution: ") + ora_err);
+
+        // Compare requested kv_head == 0 between device dst and oracle
+        float max_diff = 0.0f;
+        for (uint32_t r = 0; r < n_rows; ++r) {
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                float dev_val = dst[r * head_dim + d];
+                float ora_val = oracle_full[r * cp.total_feat + d];
+                check(!std::isnan(dev_val) && !std::isinf(dev_val), "device output non-finite");
+                float diff = std::fabs(dev_val - ora_val);
+                if (diff > max_diff) max_diff = diff;
+                check(diff <= 1e-3f, "device vs oracle mismatch");
+            }
+        }
+        std::cout << "[vulkan_hot_canonicalize_device_test] max_diff vs oracle: " << max_diff << std::endl;
+
         ggml_backend_buffer_free(vbuf);
         ggml_free(ctx);
         std::cout << "[vulkan_hot_canonicalize_device_test] OK" << std::endl;
@@ -2244,7 +2299,7 @@ static void test_hot_canonicalize_batch(cpu_env & e) {
     std::string err;
     const uint32_t head_dim = 64;
     const uint32_t n_heads = 2;
-    const uint32_t total_feat = head_dim * n_heads;
+    (void)(head_dim * n_heads); // total_feat
     const uint32_t padded_hd = 128; // Turbo4 128-aligned
     const uint32_t padded_row = padded_hd * n_heads; // 256
     const uint32_t capacity = 16;

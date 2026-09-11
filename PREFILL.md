@@ -6,6 +6,11 @@
 >
 > 实现状态（2026-09-07）：代码实现与编译交付完成——server、4 个新增测试和 7 个既有测试目标均编译/链接通过，binary 见 `build-prefill/bin/llama-server`（基线冻结在独立构建，与 candidate 分离）。覆盖 CLI、配置/角色 API、GGML POOL/SELECT/ATTN、CPU/Vulkan kernel、路由、fit 预算、state envelope、`/metrics` 序列与 matrix/quality 脚本（详见 §7.5、§10.2、§12）。适用包络：普通 sparse dispatch 为共享 `build_attn`（支持的普通 KV 形状经公共调用方即可路由，无按架构逐个挂钩）；raw-Q RERoT 钩子仍仅 Qwen3.5 dense/MoE 族（含当前 Ornith）。族外 RERoT 与不支持形状无自动 sparse。运行验收 NOT RUN：测试仅编译，benchmark 与生产发布门均未运行；hash 见 `build-prefill-evidence/manifest.json` 与 `binary-libraries.sha256`，此处不预填任何假值。§21.3 复选框全部未勾选——实现不等于验收，任何“通过”表述都必须有第 18 节证据支撑。
 
+**更新（2026-09-11，第十三轮静态审计）：** CUDA 原生 FlashPrefill（POOL/SELECT/ATTN）已在树内落地，本轮补齐 IQ4_NL KV 解码（与 Vulkan `FA_DEQUANT4_IQ4_NL`、CPU `to_float` 同为 canonical 半块布局）；本机无 NVIDIA 设备，CUDA 路径为编译级验证，运行验收仍 NOT RUN。下文 §0.2、§12.1 中“CUDA 无原生 kernel”的历史陈述以本行为准。
+
+**更新（2026-09-11，第十五轮静态审计）：** 更正上行“本机无 NVIDIA 设备”——本机确有 `NVIDIA GeForce RTX 2080 Ti`（CUDA sm_75，`build-cuda` 树）与可用的 NVIDIA Vulkan ICD。本轮跑通设备级通道（此前“OK”仅覆盖默认 CPU 通道，因未给 `--required-backend`/`--backend`）：`test-flashprefill-attn --required-backend {CUDA,Vulkan}`、`test-flashprefill-select --backend {CUDA,Vulkan} --required-backend` 全部 all-pass（skips=0）；CPU 通道与 `test-flashprefill-routing/state` 保持通过。修复内容（Vulkan SELECT 两次 dispatch 只申请一个描述符集、ATTN split-K 部分和+merge 接线、FP graph_compute 对 plan-error 置图失败、CUDA/CPU 能力探针与 allowlist）见本轮交接记录。质量与性能门仍未运行，不能据此宣称质量通过。
+**更新（2026-09-11，第十六轮静态审计与 upstream sync ×2）：** 基线两次 `git pull origin master`：第一次快进到 `81f5b0198`（含随后被回退的 `--fit` 重写），第二次 origin/master 强制更新到 `88fca9ced`（回退 `--fit` 重写，改用 dry-measurement + joint pool/slot 求解）。`--total-kv`（别名 `--kv-size`，server scope）现由上游提供，本轮删除为第一次 pull 临时加入的本地 shim；评测脚本的 `-c … --total-kv auto -np …` argv 重新可用（`llama-server` 实测接受）。文档校正：§7.5/§23.2 raw-Q 钩子覆盖范围补入 `src/models/qwen3next.cpp`；§12.1 尾部历史硬件陈述与本机对齐。验证：CPU/CUDA/Vulkan 三平台 `test-flashprefill-*` 与全套特性矩阵在两次合并后均 0 failure。质量/性能门仍未运行。
+
 ## 0. 基线、范围与阅读顺序
 
 ### 0.1 本次建树记录
@@ -38,7 +43,7 @@
 | 验收、排错和交付 | 第 18–21 节 |
 | 查上游出处与移植差异 | 第 22 节 |
 
-第一交付目标是当前 Vulkan/Ornith 类 hybrid 模型路径。CPU 用于小规模参考与单元测试；CUDA、Metal、RPC 上新增原生稀疏 kernel 不在这一轮范围内。既有普通 attention 在这些后端的能力必须保留，既有 RERoT 的 capability gate 也必须保留。
+第一交付目标是当前 Vulkan/Ornith 类 hybrid 模型路径。CPU 用于小规模参考与单元测试；Metal、RPC 上新增原生稀疏 kernel 不在这一轮范围内。CUDA 原生 FlashPrefill（POOL/SELECT/ATTN）已在本轮落地（见文件头 2026-09-11 更新）。既有普通 attention 在这些后端的能力必须保留，既有 RERoT 的 capability gate 也必须保留。
 
 ### 0.3 先纠正三个容易误判的地方
 
@@ -415,7 +420,7 @@ Q/K/V projection + 原有 RoPE/旋转
 
 ### 7.5 支持包络（已实现，诚实范围）
 
-普通 sparse dispatch 为共享 `build_attn`（`attn_kv*` 公共路径，支持的普通 KV 形状经公共调用方即可路由，无按架构逐个挂钩）；raw-Q RERoT 钩子仍仅 Qwen3.5 dense/MoE 族（`src/models/qwen35.cpp` 与 `qwen35moe.cpp`，含当前 Ornith），shape-gated，无按模型名写死的维度。**族外 RERoT 与不支持形状走原有旧路径**，不自动获得 sparse——不得把本节写成全架构覆盖。第一交付目标仍是当前 Ornith。
+普通 sparse dispatch 为共享 `build_attn`（`attn_kv*` 公共路径，支持的普通 KV 形状经公共调用方即可路由，无按架构逐个挂钩）；raw-Q RERoT 钩子覆盖 Qwen3.5 dense/MoE 族与 Qwen3-Next（`src/models/qwen35.cpp`、`qwen35moe.cpp` 与 `qwen3next.cpp`，含当前 Ornith），shape-gated，无按模型名写死的维度。**族外 RERoT 与不支持形状走原有旧路径**，不自动获得 sparse——不得把本节写成全架构覆盖。第一交付目标仍是当前 Ornith。
 
 钩子内的显式 dense 门（AUTO 静默 dense；REQUIRED 对能力缺口抛错，不伪装）：recurrent 层（backstop，正常走独立 linear helper）、SWA 层、`full_attn_layers` 前缀内层、MTP context、embedding/pooling 调用、special KQ bias（ALiBi 类加项）、非 GQA 层、跨层 head-mapping 漂移（以 `il_first` 定键）、非 F32 Q、Q/KV 形状不匹配（含 `Dk/Dv` 漂移）、transposed V cache（`nb[1] > nb[2]`）、multi-stream cache（`ne[3] != 1`）、无 sparse backend。RERoT 路要求 raw Q + rope sections，普通路要求 roped Q；layout stale（`eligible`/`freshness`/`n_queries`/`n_kv` 任一漂移）直接抛错，不降级猜测。CPU kernel bodies 已全部实现并编译（graph 侧旧依赖注记过时，以此为准）。metrics lazy `unique_ptr` 存储与实际 scratch producer 已落地。不承诺任何未来工作为已完成。
 
@@ -590,7 +595,7 @@ OFF 的 helper 返回 0。开启后可以合理减少最终 K/B/P，但不能隐
 | `--flashprefill-mean-correction on\|off` | 正式模式为 on；off 仅用于消融，不得作为完成 V2 的配置 |
 | `--flashprefill-exact-all` | 调试：经过新路径但精算全部合法 token；length gate 可 bypass，backend 缺失仍 dense |
 
-已实现的角色/执行 API（`include/llama.h` + `include/llama-flashprefill.h`，policy v1 冻结）：只有 `PREFILL` 与 `REROT_TEACHER_FORCED`（有确定边界）可 sparse；`DECODE / MTP_DRAFT / MTP_VERIFY / SPECULATIVE_REPLAY / REROT_FRONTIER / EMBEDDING / RERANK / MULTIMODAL / UNKNOWN` 全部保守 dense。policy 经 `common_context_params_to_llama()` 按值传入后**对 context lifetime 不可变**；空 exec（OFF）走普通 `llama_decode()`，显式 exec 走 `llama_decode_with_flashprefill()`（NULL exec 即 dense；`n_rows != n_tokens` 拒绝 `-1`）。外部无阶段说明的 `llama_decode()` 永不猜测、一律 dense。基线 RERoT 活跃 lane 暂停 MTP drafting 的限制原样保留（见 §0.3）。后端：CPU 参考 kernel 与 Vulkan 原生 shader（`flashprefill_pool/select/attn.comp`）支持；CUDA/Metal 明确返回不支持（`return false`），走设计内 dense，不伪装、不报错掩盖。plan 为 24-word 头（`GGML_FLASHPREFILL_PLAN_HEADER_WORDS`），`visible/exact_tokens` 为 64 位（头 word 16..19）；metrics 只计成功完成 graph/slice 后的实际 GPU 工作，不计理论 eligible（见 §12.2）。
+已实现的角色/执行 API（`include/llama.h` + `include/llama-flashprefill.h`，policy v1 冻结）：只有 `PREFILL` 与 `REROT_TEACHER_FORCED`（有确定边界）可 sparse；`DECODE / MTP_DRAFT / MTP_VERIFY / SPECULATIVE_REPLAY / REROT_FRONTIER / EMBEDDING / RERANK / MULTIMODAL / UNKNOWN` 全部保守 dense。policy 经 `common_context_params_to_llama()` 按值传入后**对 context lifetime 不可变**；空 exec（OFF）走普通 `llama_decode()`，显式 exec 走 `llama_decode_with_flashprefill()`（NULL exec 即 dense；`n_rows != n_tokens` 拒绝 `-1`）。外部无阶段说明的 `llama_decode()` 永不猜测、一律 dense。基线 RERoT 活跃 lane 暂停 MTP drafting 的限制原样保留（见 §0.3）。后端：CPU 参考 kernel、Vulkan 原生 shader（`flashprefill_pool/select/attn.comp`）与 CUDA 原生 kernel（`ggml/src/ggml-cuda/flashprefill.cu`，第十三轮补齐 IQ4_NL KV 解码）支持；Metal/RPC 明确返回不支持（`return false`），走设计内 dense，不伪装、不报错掩盖；CUDA 原生路径与 NVIDIA Vulkan ICD 在本机 RTX 2080 Ti 设备级通道均已跑通（第十五轮静态审计），运行验收仍 NOT RUN。plan 为 24-word 头（`GGML_FLASHPREFILL_PLAN_HEADER_WORDS`），`visible/exact_tokens` 为 64 位（头 word 16..19）；metrics 只计成功完成 graph/slice 后的实际 GPU 工作，不计理论 eligible（见 §12.2）。
 
 `required` 仍然允许 decode、dense-tail、短上下文等设计内的 dense 路由；不允许把“不支持 RERoT/Turbo/Tri”伪装成常规 fallback。能力不足在执行前报明原因。损坏的索引和跨 reader 数据是错误，不因 auto 模式就静默吞掉。
 
@@ -1336,7 +1341,7 @@ test(prefill): add all-on quality and resource gates
 | GGML 与 CPU | 注册独立 POOL/SELECT/ATTN op、构造与形状检查、CPU dispatch、实际缓存解量化与 reference 运算 | `ggml/include/ggml.h`、`ggml/src/ggml.c`、`ggml/src/ggml-cpu/ops.cpp` |
 | Vulkan 原生执行 | GPU pool、选块与有界索引、精算加均值补偿、split/merge、跨 dispatch barrier、lazy pipeline、执行错误状态与时间戳采集 | `ggml/src/ggml-vulkan/ggml-vulkan.cpp`、`vulkan-shaders/flashprefill_*.comp`、`flashprefill-interface.h` |
 | 普通 attention 图 | 在共享 `build_attn(llm_graph_input_attn_kv *)` 接入符合条件的普通 KV attention；使用已经完成 RoPE 的 Q，不重复旋转 | `src/llama-graph.*` |
-| RERoT 图与可见性 | 从现有 cell owner 和 reader view 派生 compact fragments/uses；按 reader、run、有效相位划分；过滤后计算 virtual positions；raw-Q 路径接入 Qwen3.5 dense/MoE | `src/llama-kv-cache.*`、`src/llama-rerot.*`、`src/llama-flashprefill-layout.h`、`src/models/qwen35*.cpp` |
+| RERoT 图与可见性 | 从现有 cell owner 和 reader view 派生 compact fragments/uses；按 reader、run、有效相位划分；过滤后计算 virtual positions；raw-Q 路径接入 Qwen3.5 dense/MoE 与 Qwen3-Next | `src/llama-kv-cache.*`、`src/llama-rerot.*`、`src/llama-flashprefill-layout.h`、`src/models/qwen35*.cpp`、`src/models/qwen3next.cpp` |
 | TurboQuant / InnerQ | 在实际缓存解量化域取均值；保留 RoPE→WHT→dot、原 `kq_scale`、V inverse WHT、非对称 Dk/Dv、padding 与输出投影顺序 | `src/llama-graph.cpp`、既有 `flash_attn_dequant.glsl`、新 CPU/Vulkan op |
 | 状态与失效 | opt-in owner generation、每次提交的派生视图重建、policy 隔离、有界状态 framing，以及 restore/rollback/clear/布局变化后的失效处理 | `src/llama-kv-cells.h`、`src/llama-flashprefill-state.*`、`src/llama-context.cpp` |
 | fitting 与观测 | 共用 admission/sizing 规则；graph reserve 保持实际 plan 生命周期；单独计入 backend-private split workspace；暴露 counters、原因、scratch 和阶段耗时 | `common/fit.cpp`、`src/llama-flashprefill-metrics.*`、server metrics 序列化代码 |
@@ -1405,7 +1410,7 @@ cmake --build build-prefill -j 4 --target \
 
 ### 23.5 支持边界与未执行项目
 
-- 原生新增执行后端为 **CPU reference 和 Vulkan**；本轮不提供 CUDA、Metal、RPC 等后端的原生 FlashPrefill kernel。
+原生新增执行后端为 **CPU reference、Vulkan fused 与 CUDA native**；本轮不提供 Metal、RPC 等后端的原生 FlashPrefill kernel（见文件头 2026-09-11 更新）。
 - 普通路径通过共享 KV attention 入口按实际 shape/backend 能力选择，不等于所有架构、特殊 mask、transposed V 或 multi-stream 变体都自动支持。
 - RERoT raw-Q 模型钩子位于 Qwen3.5 dense/MoE 族，包含当前 Ornith。未解除活跃 lane 的既有 MTP drafting 暂停。
 - 不支持的布局、backend 和超出 admission 的资源形态按已记录规则保持 dense 或在 REQUIRED 下明确报错；不得把这些范围写成已验证支持。

@@ -2086,7 +2086,7 @@ bool llama_xkv_cache_store::validate_candidate(
                     const auto & h = backend_bundle->handles[i];
                     if (used[i] || !h) continue;
                     if (h->get_descriptor_fingerprint() == nd.desc.fingerprint() &&
-                        h->get_actual_bytes() == expect) {
+                        h->get_padded_bytes() == expect) {
                         used[i] = 1;
                         hit = true;
                         break;

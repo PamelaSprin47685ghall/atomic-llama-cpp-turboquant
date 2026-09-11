@@ -1089,11 +1089,17 @@ static void test_caps_and_dispatch() {
     // With the Vulkan backend registered, native dispatch is selected.
     xkv_register_native_reconstruct_capability("Vulkan", true);
     assert(xkv_native_reconstruct_available_for("Vulkan"));
-    assert(!xkv_native_reconstruct_available_for("CUDA"));
+    assert(xkv_native_reconstruct_available_for("CUDA"));
     assert(!xkv_native_reconstruct_available_for(nullptr));
     base.native_backend_registered = xkv_native_reconstruct_available_for("Vulkan");
     assert(xkv_select_exec_branch(base, br, &err));
     assert(br == xkv_exec_branch::native_reconstruct);
+
+    // With CUDA registered, native dispatch is also selected.
+    base.native_backend_registered = xkv_native_reconstruct_available_for("CUDA");
+    assert(xkv_select_exec_branch(base, br, &err));
+    assert(br == xkv_exec_branch::native_reconstruct);
+
     xkv_register_native_reconstruct_capability("Vulkan", false); // restore default-absent
     assert(!xkv_native_reconstruct_available_for("Vulkan"));
     base.storage_needs_native = false;
@@ -3011,6 +3017,94 @@ static void test_native_rope_half() {
 // ----------------------------------------------------------------------------
 // N8. Native unsupported battery: explicit fail-closed, skip-mirror proof
 // ----------------------------------------------------------------------------
+static void test_native_rotation_parity() {
+    std::cout << "Running test_native_rotation_parity..." << std::endl;
+    const uint32_t D = 8, N = 3, R = 4;
+    // Orthonormal Hadamard, self-inverse: H == H^-1.
+    std::vector<float> H(D * D);
+    for (uint32_t i = 0; i < D; ++i)
+        for (uint32_t j = 0; j < D; ++j)
+            H[i * D + j] = ((__builtin_popcount(i & j) % 2 == 0) ? 1.0f : -1.0f) / std::sqrt((float) D);
+    auto rot = [&](const std::vector<float> & v) {
+        std::vector<float> o(D, 0.0f);
+        for (uint32_t i = 0; i < D; ++i)
+            for (uint32_t j = 0; j < D; ++j) o[i] += H[i * D + j] * v[j];
+        return o;
+    };
+    llama_cparams cparams = ref_cparams();
+    llama_xkv_cache_store store(cparams);
+    native_seg_bundle seg = make_native_segment(store, N, D, D, R, 7100);
+    struct ggml_context * ctx = make_ctx(256 * 1024 * 1024);
+    ggml_tensor * ak_t = make_arena_tensor(ctx, seg.a_rows, R);
+    ggml_tensor * bk_t = make_arena_tensor(ctx, seg.bk_rows, R);
+    ggml_tensor * av_t = make_arena_tensor(ctx, seg.av_rows, R);
+    ggml_tensor * bv_t = make_arena_tensor(ctx, seg.bv_rows, R);
+    // Canonical hot rows and their storage-rotated twins.
+    std::vector<std::vector<float>> kcan(N), vcan(N);
+    auto ksto = std::vector<std::vector<std::vector<float>>>(N, std::vector<std::vector<float>>(1));
+    auto vsto = std::vector<std::vector<std::vector<float>>>(N, std::vector<std::vector<float>>(1));
+    for (uint32_t c = 0; c < N; ++c) {
+        kcan[c] = det_floats(D, 7110 + c);
+        vcan[c] = det_floats(D, 7120 + c);
+        ksto[c][0] = rot(kcan[c]);
+        vsto[c][0] = rot(vcan[c]);
+    }
+    struct ggml_tensor * k_st = make_storage_f32(ctx, D, 1, N, ksto);
+    struct ggml_tensor * v_st = make_storage_f32(ctx, D, 1, N, vsto);
+    auto snap = base_native_snap(D, D, 1, 1, 0);
+    snap->hot_k_inv_rot = H; // H^-1 == H
+    snap->hot_k_rot_dim = D;
+    snap->hot_v_inv_rot = H;
+    snap->hot_v_rot_dim = D;
+    for (int64_t c = 0; c < (int64_t) N; ++c) add_gather_row(*snap, c, 0, c);
+    attach_native_arenas(*snap, seg, ak_t, bk_t, av_t, bv_t);
+    xkv_segment_read_view view;
+    fill_native_view(view, store, seg.seg, N);
+    snap->segment_views.push_back(std::move(view));
+    fill_native_csr(*snap, seg.seg->segment_id, seg.seg->segment_version, N, 1);
+    std::vector<float> qdata = det_floats(D, 7130);
+    struct ggml_tensor * q = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
+    std::memcpy(q->data, qdata.data(), D * sizeof(float));
+    std::vector<xkv_native_status_item> statuses;
+    std::vector<xkv_native_fill_item> fills;
+    std::string err;
+    ggml_tensor * out = xkv_build_attention_native(ctx, q, *snap, k_st, v_st, nullptr,
+        true, statuses, fills, &err);
+    assert(out && err.empty());
+    apply_native_fills(fills);
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+    ggml_graph_compute_with_ctx(ctx, gf, 1);
+    assert(read_native_status(statuses) == std::vector<int32_t>{ 0 });
+    // Canonical oracle: unrotated Q/K/V hot plus canonical cold factors.
+    // Rotated-domain native math ((QR).(KR) == Q.K, O*R inverted to O) must match.
+    std::vector<xkv_hot_row> rows;
+    for (uint32_t c = 0; c < N; ++c) {
+        xkv_hot_row r;
+        r.storage_pos = c;
+        r.k_ptr = kcan[c].data(); r.v_ptr = vcan[c].data();
+        rows.push_back(r);
+    }
+    std::vector<std::vector<float>> ck(N, std::vector<float>(D, 0.0f));
+    std::vector<std::vector<float>> cv(N, std::vector<float>(D, 0.0f));
+    for (uint32_t r = 0; r < N; ++r)
+        for (uint32_t d = 0; d < D; ++d)
+            for (uint32_t k = 0; k < R; ++k) {
+                ck[r][d] += seg.a_rows[r][k] * seg.bk_rows[d][k];
+                cv[r][d] += seg.av_rows[r][k] * seg.bv_rows[d][k];
+            }
+    xkv_query_input qi;
+    qi.head_dim_k = D; qi.head_dim_v = D; qi.q_vec = qdata;
+    std::vector<uint32_t> groups(N, 0);
+    std::vector<bool> mask(N, true);
+    std::vector<float> expect = xkv_dense_attention_reference(qi, rows, ck, cv, groups, mask);
+    std::vector<float> actual(D);
+    std::memcpy(actual.data(), out->data, D * sizeof(float));
+    assert(vec_eq(actual, expect, 1e-4f));
+    ggml_free(ctx);
+    std::cout << "test_native_rotation_parity PASSED" << std::endl;
+}
+
 static void test_native_unsupported() {
     std::cout << "Running test_native_unsupported..." << std::endl;
     const uint32_t D = 8;
@@ -3061,7 +3155,9 @@ static void test_native_unsupported() {
         snap->hot_layout.v_transposed = true;
         assert(!run(std::move(snap), err) && err.find("transposed") != std::string::npos);
     }
-    { // 3. custom attention rotation (not invertible natively)
+    { // 3. malformed custom attention rotation matrix
+        // Malformed rotation matrix (size != rot_dim^2) still fails closed.
+        // Well-formed rotations run in the rotated domain (see rotation parity).
         auto snap = mini();
         snap->hot_k_inv_rot = { 1.0f };
         assert(!run(std::move(snap), err) && err.find("rotation") != std::string::npos);
@@ -3076,10 +3172,22 @@ static void test_native_unsupported() {
         assert(!run(std::move(snap), err) && (err.find("landmark") != std::string::npos || err.find("plan") != std::string::npos));
         q->data = saved_q;
     }
-    { // 5. prefilled snapshot sinks (tensor path only)
+    { // 5. broadcast snapshot sinks without a wired sink tensor
         auto snap = mini();
+        // Broadcast sinks without a wired sink tensor fail closed (no silent drop).
         snap->query_sink_logits = { { 0.5f } };
-        assert(!run(std::move(snap), err) && err.find("tensor path") != std::string::npos);
+        assert(!run(std::move(snap), err) && err.find("sink tensor") != std::string::npos);
+    }
+    { // 5b. per-query-varying sinks are unrepresentable on the native path
+        auto snap = base_native_snap(D, D, 1, 2, 0);
+        for (int64_t c = 0; c < 2; ++c) add_gather_row(*snap, c, 0, c);
+        attach_native_arenas(*snap, seg, ak_t, bk_t, av_t, bv_t);
+        xkv_segment_read_view view;
+        fill_native_view(view, store, seg.seg, 2);
+        snap->segment_views.push_back(std::move(view));
+        fill_native_csr(*snap, seg.seg->segment_id, seg.seg->segment_version, 2, 2);
+        snap->query_sink_logits = { { 0.5f }, { 0.7f } };
+        assert(!run(std::move(snap), err) && err.find("unrepresentable") != std::string::npos);
     }
     { // 6. unresolvable CSR ref
         auto snap = mini();
@@ -3905,6 +4013,7 @@ int main() {
     test_native_current_write();
     test_native_tiling();
     test_native_rope_half();
+    test_native_rotation_parity();
     test_native_unsupported();
     test_native_hot_per_query_groups();
     test_native_sr_after_q();

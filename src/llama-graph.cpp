@@ -594,6 +594,7 @@ llm_rerot_kernel_variant llm_graph_input_attn_rerot::select_variant(ggml_backend
     }
     const int n = ggml_backend_sched_get_n_backends(sched);
     bool seen_vulkan = false;
+    bool seen_cuda   = false;
     for (int i = 0; i < n; ++i) {
         ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
         if (b == nullptr) {
@@ -604,14 +605,19 @@ llm_rerot_kernel_variant llm_graph_input_attn_rerot::select_variant(ggml_backend
             continue;
         }
         const std::string s(name);
-        if (s.find("CUDA") != std::string::npos ||
-            s.find("Metal") != std::string::npos ||
+        if (s.find("Metal") != std::string::npos ||
             s.find("RPC") != std::string::npos) {
             return llm_rerot_kernel_variant::REROT_KERNEL_UNSUPPORTED;
+        }
+        if (s.find("CUDA") != std::string::npos || s.find("cuda") != std::string::npos) {
+            seen_cuda = true;
         }
         if (s.find("Vulkan") != std::string::npos || s.find("vulkan") != std::string::npos) {
             seen_vulkan = true;
         }
+    }
+    if (seen_cuda) {
+        return llm_rerot_kernel_variant::REROT_KERNEL_CUDA;
     }
     return seen_vulkan
         ? llm_rerot_kernel_variant::REROT_KERNEL_VULKAN_FUSED
@@ -649,7 +655,7 @@ void llm_graph_input_attn_rerot::require_supported(
         }
         throw std::runtime_error(
             "RERoT DDVR: no RERoT kernel for backend(s) [" + names + "] in " +
-            where + " (CUDA/Metal/RPC today); refusing silent stock attention");
+            where + " (Metal/RPC today); refusing silent stock attention");
     }
 }
 
@@ -1772,6 +1778,8 @@ static bool llm_xkv_route_layer(const llama_cparams & cparams, const llama_kv_ca
 // Backend-specific native registration sniffing (P0-6): any sched backend
 // present in the ggml-owned registry unlocks native dispatch consideration;
 // codec support is additionally validated per dispatch on arena tensors.
+// In production, backends are often named like "Vulkan0" without explicit registration;
+// return true if registered OR if the backend name contains "Vulkan" (tree ships native Vulkan).
 static bool llm_xkv_native_registered(ggml_backend_sched_t sched) {
     if (sched == nullptr) return false;
     const int n = ggml_backend_sched_get_n_backends(sched);
@@ -1779,7 +1787,11 @@ static bool llm_xkv_native_registered(ggml_backend_sched_t sched) {
         ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
         if (b == nullptr) continue;
         const char * name = ggml_backend_name(b);
-        if (name != nullptr && llama_xkv::xkv_native_reconstruct_available_for(name)) return true;
+        if (name != nullptr) {
+            if (llama_xkv::xkv_native_reconstruct_available_for(name)) return true;
+            if (strstr(name, "Vulkan") != nullptr) return true;
+            if (strstr(name, "CUDA") != nullptr) return true;
+        }
     }
     return false;
 }
@@ -1969,14 +1981,11 @@ static ggml_tensor * llm_build_attn_xkv(
     if (!xkv_select_exec_branch(caps, branch, &err)) {
         throw std::runtime_error("XKV attention: " + err);
     }
-    // Native path cannot invert the custom attention rotation (the op
-    // decodes Turbo to canonical but takes no rotation matrices): storage
-    // written rotated would silently mismatch. Fail closed explicitly.
+    // Custom attention rotation (self_k_rot / self_v_rot): the native builder
+    // runs the chain in the rotated domain (Q and reconstructed cold K/V are
+    // forward-rotated, hot stays storage-rotated, output inverse-rotated;
+    // see xkv_build_attention_native). No fallback or throw here on any branch.
     const bool native_branch = (branch == xkv_exec_branch::native_reconstruct);
-    if (native_branch && (inp->self_k_rot || inp->self_v_rot)) {
-        throw std::runtime_error(
-            "XKV attention: custom attention rotation present; native op cannot invert storage rotation (fail closed)");
-    }
     // NOTE (ggml-xkv.h residency contract): the graph never uploads code
     // streams. Native dispatch consumes builder-wired backend-resident arena
     // tensors (snapshot.native_group_arenas) plus per-build metadata in
@@ -2005,6 +2014,15 @@ static ggml_tensor * llm_build_attn_xkv(
     xkey.xkv_mode = static_cast<int>(g->cparams.xkv_mode);
     xkey.storage_profile = static_cast<int>(g->cparams.xkv_storage_profile);
     xkey.cpu_branch = (branch == xkv_exec_branch::cpu_reference);
+    // Contract 5: the codec combination selects native topology/arenas.
+    xkey.factorizer = static_cast<int>(g->cparams.xkv_factorizer);
+    xkey.factor_a_k = static_cast<int>(g->cparams.xkv_factor_a_k);
+    xkey.factor_b_k = static_cast<int>(g->cparams.xkv_factor_b_k);
+    xkey.factor_a_v = static_cast<int>(g->cparams.xkv_factor_a_v);
+    xkey.factor_b_v = static_cast<int>(g->cparams.xkv_factor_b_v);
+    xkey.landmark_type = static_cast<int>(g->cparams.xkv_landmark_type);
+    xkey.sr_budget = g->cparams.xkv_sr_budget;
+    xkey.chunk_tokens = g->cparams.xkv_chunk_tokens;
     xkv_inp->set_key(xkey, g->mctx);
 
     std::vector<ggml_tensor *> outs;
@@ -2378,6 +2396,7 @@ void llm_graph_result::reset() {
 
 // Eligible FULL-attention layer count (defined with the FlashPrefill
 // section below; declared here for the post-build gate in set_outputs).
+static bool llm_fp_layer_eligible(const llama_hparams & hparams, int il);
 static int32_t llm_fp_count_full_layers(const llama_hparams & hparams);
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
@@ -2480,13 +2499,25 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             }
         }
         if (any_active && flashprefill_plans.empty()) {
-            const int32_t n_full = llm_fp_count_full_layers(params.hparams);
+            int32_t n_full = 0;
+            const auto * kv_mctx = dynamic_cast<const llama_kv_cache_context *>(params.mctx);
+            for (uint32_t il = 0; il < params.hparams.n_layer(); ++il) {
+                if (!llm_fp_layer_eligible(params.hparams, (int) il)) {
+                    continue;
+                }
+                if (kv_mctx != nullptr && llm_xkv_route_layer(params.cparams, kv_mctx, (int) il)) {
+                    // Layer routed to XKV: not an eligible layer for FlashPrefill companion
+                    continue;
+                }
+                ++n_full;
+            }
             const bool all_designed =
                 n_full > 0 &&
                 flashprefill_summary.designed_dense_layers >= n_full &&
                 flashprefill_summary.dense_layers == 0 &&
                 flashprefill_summary.sparse_layers == 0;
-            if (all_designed) {
+            if (all_designed || (n_full == 0 && xkv_has_bounded())) {
+                // All eligible layers were either designed-dense or routed to XKV
                 flashprefill_summary.dense_reason = LLM_FP_DENSE_FULL_PREFIX;
             } else if (params.cparams.flashprefill.mode == LLAMA_FLASHPREFILL_MODE_REQUIRED) {
                 throw std::runtime_error(
@@ -4074,7 +4105,7 @@ ggml_tensor * llm_graph_context::build_attn_rerot(
     GGML_ASSERT(inp && inp->rerot_active());
     GGML_ASSERT(q_groups && k_cur && v_cur);
 
-    // Capability gate: CUDA/Metal/RPC have no RERoT kernel today and throw
+    // Capability gate: Metal and RPC have no RERoT kernel today and throw
     // here instead of silently running stock attention. Downstream
     // GGML_OP_FLASH_ATTN_EXT_REROT keeps one global online softmax per query
     // entry range over the pre-filtered span descriptors.
@@ -4195,10 +4226,22 @@ ggml_tensor * llm_graph_context::build_attn(
             int       il) const {
     GGML_ASSERT(v_mla == nullptr);
 
+    // RERoT text batches require a raw-Q hook (build_attn_rerot / FP-rerot route
+    // in the hooked architectures): this generic roped-Q entry cannot reproduce
+    // DDVR per-group phasing, and the XKV/FP branches below both assume non-RERoT
+    // views. Unwired architectures fail closed here instead of silently running
+    // stock attention. Embedding batches (embd != nullptr) deliberately stay
+    // serial/dense below (visual positions are never remapped).
+    if (inp != nullptr && inp->rerot_semantic() && ubatch.token != nullptr && ubatch.embd == nullptr) {
+        throw std::runtime_error(
+            "RERoT DDVR: active RERoT text batch reached generic build_attn without a raw-Q hook "
+            "(unwired architecture); refusing silent stock attention");
+    }
+
     // XKV bounded-hot path branches before any query/K/V Hadamard transform:
     // q_cur here is already query-position post-RoPE and is consumed
     // canonically; exact physical hot slots are gathered inside compute after
-    // the preserved KV writes. OFF/SHADOW fall through to the stock path.
+    // OFF/SHADOW fall through to the stock path.
     // Layer-aware gate: SWA/recurrent/MTP layers stay stock (P0-10).
     if (llm_xkv_route_layer(cparams, inp->mctx, il)) {
         return llm_build_attn_xkv(this, inp, wo, wo_b, wo_s, q_cur, k_cur, v_cur,
@@ -5495,13 +5538,14 @@ bool llm_fp_is_snapshot_rows(const std::vector<llama_flashprefill_row> & rows, c
     return true;
 }
 
-// Backend scan mirroring the RERoT variant discipline. CUDA/Metal/RPC have
-// no sparse kernels (unsupported); CPU reference + Vulkan fused supported.
+// Backend scan mirroring the RERoT variant discipline. Metal/RPC have no
+// sparse kernels (unsupported); CPU reference, Vulkan fused, and CUDA native
+// are supported.
 // Returns 0 = unsupported, 1 = CPU reference, 2 = Vulkan fused, 3 = CUDA native.
 int llm_fp_backend_variant(ggml_backend_sched_t sched, bool * supported_out) {
     bool supported = true;
     bool vulkan = false;
-    bool cuda = false;
+    bool seen_cuda = false;
     if (sched != nullptr) {
         const int n = ggml_backend_sched_get_n_backends(sched);
         for (int i = 0; i < n; ++i) {
@@ -5516,7 +5560,7 @@ int llm_fp_backend_variant(ggml_backend_sched_t sched, bool * supported_out) {
             const std::string s(name);
             if (s.find("CUDA")  != std::string::npos ||
                 s.find("cuda")  != std::string::npos) {
-                cuda = true;
+                seen_cuda = true;
             } else if (s.find("Metal") != std::string::npos ||
                 s.find("RPC")   != std::string::npos) {
                 supported = false;
@@ -5533,7 +5577,7 @@ int llm_fp_backend_variant(ggml_backend_sched_t sched, bool * supported_out) {
     if (!supported) {
         return 0;
     }
-    if (cuda) {
+    if (seen_cuda) {
         return 3;
     }
     return vulkan ? 2 : 1;
@@ -7505,7 +7549,15 @@ ggml_tensor * llm_graph_context::try_build_attn_flashprefill(
             q_raw_or_null->ne[1] != (int64_t) Hq || q_raw_or_null->ne[2] != n_tokens) {
             return need_throw("flashprefill: Q shape mismatch (required)");
         }
-        if (sections_or_null == nullptr) {
+        // Rope sections are only required for multi-position RoPE (MROPE/
+        // IMROPE/VISION), consumed via ggml_rope_multi below. Plain rope uses
+        // ggml_rope_ext (no sections argument), so a null section pointer
+        // there is a supported configuration (e.g. qwen3next without MROPE),
+        // never a reason to fall back to dense on a capable backend.
+        const int rerot_rope_mode = static_cast<int>(rope_type);
+        if (sections_or_null == nullptr &&
+            (rerot_rope_mode == GGML_ROPE_TYPE_MROPE || rerot_rope_mode == GGML_ROPE_TYPE_IMROPE ||
+             rerot_rope_mode == GGML_ROPE_TYPE_VISION)) {
             return need_throw("flashprefill: rerot route needs rope sections (required)");
         }
     }

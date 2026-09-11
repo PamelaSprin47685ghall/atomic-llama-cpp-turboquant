@@ -677,7 +677,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 }
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
-    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT || dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
+    GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT || dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED || dst->op == GGML_OP_FLASH_ATTN_EXT_REROT);
+
+    if (dst->op == GGML_OP_FLASH_ATTN_EXT_REROT) {
+        return ggml_nbytes(dst);
+    }
 
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -693,8 +697,15 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
         case BEST_FATTN_KERNEL_MMA_F16:
-            need_f16_K = K->type != GGML_TYPE_F16 && !is_turbo_kv(K->type);
-            need_f16_V = V->type != GGML_TYPE_F16 && !is_turbo_kv(V->type);
+            // TILE/MMA always run on F16 (launch_fattn is called with need_f16=true
+            // for both): TurboQuant KV has no native TILE/MMA decode, it is converted
+            // via to_fp16_cuda like any other quantized type. Skipping the temp buffer
+            // here under-allocates and the conversion overflows into neighboring
+            // memory (sentinel mismatch + eventual illegal-instruction crash).
+            // The VEC-preference for small batches (<=16 queries) still avoids the
+            // temp buffer in the common decode case.
+            need_f16_K = K->type != GGML_TYPE_F16;
+            need_f16_V = V->type != GGML_TYPE_F16;
             break;
         case BEST_FATTN_KERNEL_VEC:
             need_f16_K = K->type == GGML_TYPE_F32;

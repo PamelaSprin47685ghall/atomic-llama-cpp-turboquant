@@ -4,12 +4,17 @@
  * Computes importance scores for KV cache entries directly on GPU memory.
  * Each thread block processes one (position) with all freq dimensions in
  * parallel. The kernel handles dequantization, inverse WHT rotation (for
- * turbo2/turbo3), inverse RoPE, and the full TriAttention scoring formula.
+ * turbo2/turbo3/turbo4), inverse RoPE, and the full TriAttention scoring formula.
  *
  * Grid:  (n_cells, n_offsets_or_1, 1)
- * Block: (freq_count, 1, 1)  — one thread per frequency pair
- *
- * Reference: "TriAttention: Trigonometric KV Cache Eviction" (arXiv 2604.04921)
+ // Block: (freq_count, 1, 1) for plain types — one thread per frequency pair.
+ //   For Turbo types needing inverse WHT the block is 64 threads: the WHT phase
+ //   needs 64 cooperative workers for the full 128-wide head block even when
+ //   freq_count < 64 (partial rotary); the scoring phase then uses only the
+ //   rotary prefix [0, freq_count). Extra threads idle through the scoring
+ //   phase but still rendezvous at every __syncthreads().
+ //
+ // Reference: "TriAttention: Trigonometric KV Cache Eviction" (arXiv 2604.04921)
  */
 
 #include "triattention-score.cuh"
@@ -65,7 +70,7 @@ static __device__ void cooperative_fwht_128(float * smem, int tid) {
 }
 
 // ============================================================================
-// Device helper: inverse WHT rotation for turbo2/turbo3
+// Device helper: inverse WHT rotation for turbo2/turbo3/turbo4
 // R^T * x = signs1 * FWHT(signs2 * x)
 // ============================================================================
 
@@ -117,7 +122,8 @@ static __device__ void dequant_head_to_smem(
         smem[el0] = (float)x[blk0].qs[off0] * __half2float(x[blk0].d);
         smem[el1] = (float)x[blk1].qs[off1] * __half2float(x[blk1].d);
     } else if constexpr (K_TYPE == GGML_TYPE_TURBO4_0) {
-        // turbo4: block_size=128, dequant includes rotation → no need for WHT inv
+        // turbo4: block_size=128; dequant stays in rotated domain (no inv WHT in dequant),
+        // so TriAttention scoring must apply inverse WHT just like turbo2/turbo3.
         const block_turbo4_0 * x = (const block_turbo4_0 *)k_row_ptr;
         const int blk = (tid * 2) / QK_TURBO4;
         const int off = (tid * 2) % QK_TURBO4;
@@ -125,7 +131,7 @@ static __device__ void dequant_head_to_smem(
         smem[tid * 2]     = turbo4_dequant_element(&x[blk], off,     norm);
         smem[tid * 2 + 1] = turbo4_dequant_element(&x[blk], off + 1, norm);
     } else if constexpr (K_TYPE == GGML_TYPE_TURBO3_0) {
-        // turbo3: block_size=32, returns WHT-rotated values
+        // turbo3: block_size=128, returns WHT-rotated values
         const block_turbo3_0 * x = (const block_turbo3_0 *)k_row_ptr;
         const int el0 = tid * 2;
         const int el1 = tid * 2 + 1;
@@ -136,7 +142,7 @@ static __device__ void dequant_head_to_smem(
         smem[el0] = turbo3_dequant_element(&x[blk0], off0, __half2float(x[blk0].norm));
         smem[el1] = turbo3_dequant_element(&x[blk1], off1, __half2float(x[blk1].norm));
     } else if constexpr (K_TYPE == GGML_TYPE_TURBO2_0) {
-        // turbo2: block_size=32, returns WHT-rotated values
+        // turbo2: block_size=128, returns WHT-rotated values
         const block_turbo2_0 * x = (const block_turbo2_0 *)k_row_ptr;
         const int el0 = tid * 2;
         const int el1 = tid * 2 + 1;
@@ -157,7 +163,7 @@ static __device__ void dequant_head_to_smem(
 //
 // Pipeline per block:
 //   1. Dequant K head row → shared mem [head_dim]
-//   2. Inverse WHT rotation if turbo2/turbo3
+//   2. Inverse WHT rotation if turbo2/turbo3/turbo4
 //   3. Inverse RoPE → get pre-RoPE K in "half" layout
 //   4. Compute per-freq score contributions
 //   5. Block reduction → one score per position
@@ -189,9 +195,12 @@ static __global__ void triattention_score_kernel(
     const int                   agg_mode)        // 0=mean, 1=max
 {
     const int cell_idx_local = blockIdx.x;  // which cell we're scoring
-    const int f = threadIdx.x;              // frequency index [0, freq_count)
+    const int tid = threadIdx.x;
+    // Frequency index for the scoring phase; WHT-phase workers with
+    // tid >= freq_count dequantize/invert only, then idle (see below).
+    const int f = tid;
 
-    if (cell_idx_local >= (int)n_cells || f >= (int)freq_count) return;
+    if (cell_idx_local >= (int)n_cells) return;
 
     // Shared memory for dequantized K vector
     extern __shared__ float smem[];
@@ -205,38 +214,32 @@ static __global__ void triattention_score_kernel(
     const uint32_t cell_global = cell_indices[cell_idx_local];
     const char * k_row_ptr = (const char *)k_data + (size_t)cell_global * row_bytes + head_offset_bytes;
 
-    dequant_head_to_smem<K_TYPE>(k_smem, k_row_ptr, f, padded_hd);
+    // Turbo path launches 64 workers so every pair of the 128-wide head is
+    // covered; plain-type launches match freq_count as before.
+    dequant_head_to_smem<K_TYPE>(k_smem, k_row_ptr, tid, padded_hd);
     __syncthreads();
 
-    // ---- Step 2: Inverse WHT rotation (turbo2/turbo3 only) ----
+    // ---- Step 2: Inverse WHT rotation (turbo2/turbo3/turbo4) in 128-element blocks ----
     if constexpr (NEED_WHT_INV) {
-        // Process in 128-element blocks
-        for (uint32_t b = 0; b < padded_hd; b += 128) {
-            // Remap thread to work on this 128-elem block
-            if (f < 64) {
-                float * block = k_smem + b;
-                // Signs2 → FWHT → Signs1 (inverse rotation)
-                // Note: for f < 64, thread handles elements [f*2, f*2+1] within block
-                // But we need to handle the case where padded_hd > 128 (multiple blocks)
-                // For simplicity with 64 threads and 128 elements per block, each thread
-                // handles 2 elements
+        // Process every complete 128-element block across the padded head dimension.
+        for (uint32_t b = 0; b + 128 <= padded_hd; b += 128) {
+            if (tid < 64) {
+                inverse_wht_rotation_128(k_smem + b, tid);
             }
+            __syncthreads();
         }
-        // For head_dim = 128 (standard case), single block:
-        if (padded_hd == 128 && f < 64) {
-            inverse_wht_rotation_128(k_smem, f);
-        }
-        // For head_dim > 128, we'd need multiple passes.
-        // Most turbo models use head_dim=128, so this covers the primary case.
     }
 
-    // ---- Step 3: Inverse RoPE ----
+    // ---- Steps 3+4: Inverse RoPE + per-freq score (rotary prefix only) ----
     // K is stored post-RoPE. To get pre-RoPE K, apply RoPE^{-1}.
-    // In "half" layout: k_re = K[f], k_im = K[f + freq_count]
+    // In "half" layout: k_re = K[f], k_im = K[f + freq_count]. Non-rotary
+    // tail dims never enter the score, matching triattention_score_keys,
+    // which accumulates only f in [0, freq_count).
     // RoPE^{-1}: multiply by rotation(-θ) where θ = omega[f] * position
+    const bool active = f < (int) freq_count;
     float pre_re = 0.0f;
     float pre_im = 0.0f;
-    {
+    if (active) {
         const int32_t pos = positions[cell_idx_local];
         const float w = omega[f];
         const float theta = w * (float)pos;
@@ -261,9 +264,10 @@ static __global__ void triattention_score_kernel(
     const float k_im = pre_im;
     const float k_mag = sqrtf(k_re * k_re + k_im * k_im);
 
-    float total_score;
+    float total_score = 0.0f;
 
-    if constexpr (!DISABLE_TRIG) {
+    if (active) {
+      if constexpr (!DISABLE_TRIG) {
         // Full scoring with trigonometric + norm terms
         const float base_delta = (float)(round_start - positions[cell_idx_local]);
         const float amp = q_mean_abs[f] * k_mag;
@@ -300,13 +304,18 @@ static __global__ void triattention_score_kernel(
     } else {
         // Ablation: norm-only scoring
         total_score = extra_weight[f] * freq_scale_sq[f] * k_mag;
-    }
+      }
+
+    } // if (active); inactive WHT workers keep total_score == 0 (unused)
 
     // ---- Step 5: Block reduction  ----
-    score_smem[f] = total_score;
+    // Only rotary-prefix threads publish; everyone still rendezvous below.
+    if (active) {
+        score_smem[f] = total_score;
+    }
     __syncthreads();
 
-    // Tree reduction
+    // Tree reduction over the rotary prefix (inactive threads only sync).
     for (int stride = freq_count / 2; stride > 0; stride >>= 1) {
         if (f < stride) {
             score_smem[f] += score_smem[f + stride];
@@ -343,6 +352,12 @@ static void launch_score_kernel(
     const uint32_t fc = cfg.freq_count;
     const uint32_t hd = cfg.head_dim;
 
+    // Turbo storage pads each head to 128 elements; the device kernel inverts
+    // a single 128-wide WHT block and scores the rotary prefix, exactly like
+    // the CPU oracle (full-head dequant + inverse WHT, RoPE/score on the
+    // rotary dims only). Plain types have no padding.
+    const uint32_t padded = cfg.need_wht_inv ? ((hd + 127u) / 128u) * 128u : hd;
+
     // Calibration pointers for this head
     const float * qmr = state->d_q_mean_real  + (size_t)head_calib_idx * fc;
     const float * qmi = state->d_q_mean_imag  + (size_t)head_calib_idx * fc;
@@ -350,15 +365,18 @@ static void launch_score_kernel(
     const float * ew  = state->d_extra_weight  + (size_t)head_calib_idx * fc;
 
     const dim3 grid(n_cells, 1, 1);
-    const dim3 block(fc, 1, 1);
-    const size_t smem_bytes = (hd + fc) * sizeof(float);  // K vector + score reduction
+    // WHT path needs 64 cooperative workers for the 128-wide block even when
+    // freq_count < 64 (partial rotary); plain path keeps freq_count workers.
+    const dim3 block(cfg.need_wht_inv ? 64 : (int) fc, 1, 1);
+    const size_t smem_bytes = (padded + fc) * sizeof(float);  // K vector + score reduction
 
     // Compute head offset on host (ggml_row_size is a host function)
-    const size_t head_off = ggml_row_size(cfg.k_type, (uint64_t)kv_head_idx * hd);
+    // Turbo head stride uses the padded width (matches the KV cache layout).
+    const size_t head_off = ggml_row_size(cfg.k_type, (uint64_t)kv_head_idx * padded);
 
     #define LAUNCH_KERNEL(KTYPE, WHT, TRIG) \
         triattention_score_kernel<KTYPE, WHT, TRIG><<<grid, block, smem_bytes, stream>>>( \
-            scores_out, k_data, n_embd_k_gqa, row_bytes, head_off, hd, \
+            scores_out, k_data, n_embd_k_gqa, row_bytes, head_off, padded, \
             cell_indices, positions, n_cells, round_start, \
             state->d_omega, state->d_freq_scale_sq, state->d_offsets, cfg.n_offsets, \
             qmr, qmi, qma, ew, fc, cfg.rope_style, agg_mode)
@@ -367,7 +385,7 @@ static void launch_score_kernel(
         switch (cfg.k_type) {
             case GGML_TYPE_TURBO2_0: LAUNCH_KERNEL(GGML_TYPE_TURBO2_0, true,  true); break;
             case GGML_TYPE_TURBO3_0: LAUNCH_KERNEL(GGML_TYPE_TURBO3_0, true,  true); break;
-            case GGML_TYPE_TURBO4_0: LAUNCH_KERNEL(GGML_TYPE_TURBO4_0, false, true); break;
+            case GGML_TYPE_TURBO4_0: LAUNCH_KERNEL(GGML_TYPE_TURBO4_0, true,  true); break;
             case GGML_TYPE_Q8_0:     LAUNCH_KERNEL(GGML_TYPE_Q8_0,     false, true); break;
             case GGML_TYPE_F16:      LAUNCH_KERNEL(GGML_TYPE_F16,      false, true); break;
             case GGML_TYPE_F32:      LAUNCH_KERNEL(GGML_TYPE_F32,      false, true); break;
@@ -379,7 +397,7 @@ static void launch_score_kernel(
         switch (cfg.k_type) {
             case GGML_TYPE_TURBO2_0: LAUNCH_KERNEL(GGML_TYPE_TURBO2_0, true,  false); break;
             case GGML_TYPE_TURBO3_0: LAUNCH_KERNEL(GGML_TYPE_TURBO3_0, true,  false); break;
-            case GGML_TYPE_TURBO4_0: LAUNCH_KERNEL(GGML_TYPE_TURBO4_0, false, false); break;
+            case GGML_TYPE_TURBO4_0: LAUNCH_KERNEL(GGML_TYPE_TURBO4_0, true,  false); break;
             case GGML_TYPE_Q8_0:     LAUNCH_KERNEL(GGML_TYPE_Q8_0,     false, false); break;
             case GGML_TYPE_F16:      LAUNCH_KERNEL(GGML_TYPE_F16,      false, false); break;
             case GGML_TYPE_F32:      LAUNCH_KERNEL(GGML_TYPE_F32,      false, false); break;

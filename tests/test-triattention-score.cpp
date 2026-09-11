@@ -976,6 +976,144 @@ static void test_turbo_scores_match_storage_oracle() {
     fprintf(stderr, "  PASSED\n");
 }
 
+// ============================================================================
+// Partial-rotary TurboKV: device kernel vs CPU oracle
+// ============================================================================
+
+// Find a CUDA device through the portable backend API (no ggml-cuda link).
+static ggml_backend_dev_t find_cuda_device() {
+    ggml_backend_load_all();
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        const char * name = reg ? ggml_backend_reg_name(reg) : nullptr;
+        if (name && strstr(name, "CUDA") != nullptr) {
+            return dev;
+        }
+    }
+    return nullptr;
+}
+
+static void test_partial_rope_turbo_device() {
+    fprintf(stderr, "--- test_partial_rope_turbo_device ---\n");
+    // IMRoPE-style partial rotary: rotary_dim=64 < head_dim=128. Turbo K rows
+    // stay 128-wide (single WHT block, fully inverted on device); only the
+    // rotary prefix enters the score, exactly like the CPU oracle.
+    const char * path = "/tmp/test_triattention_partial_rope.triattention";
+    const uint32_t hd = 128, n = 7;
+    uint32_t cells[n] = {0, 1, 2, 3, 4, 5, 6};
+    int32_t positions[n] = {0, 1, 13, 96, 200, 511, 2048};
+    ggml_backend_dev_t cuda_dev = find_cuda_device();
+    fprintf(stderr, "  CUDA device: %s\n",
+            cuda_dev ? ggml_backend_dev_name(cuda_dev) : "(none -- device section skipped)");
+    // Partial rotary (IMRoPE-style, rotary_dim=64) plus the full-rotary control
+    // (rotary_dim=128, pre-existing device path) for every pairing style.
+    for (uint32_t rotary : {64u, 128u}) {
+    const uint32_t fc = rotary / 2;
+    for (uint32_t style : {0u, 1u}) {
+        mock_calib_params p;
+        p.head_dim = hd;
+        p.freq_count = fc;
+        // rotary_dim 0 encodes full RoPE (defaults to head_dim in the writer).
+        p.rotary_dim = (rotary == hd) ? 0u : rotary;
+        p.rope_style = style;
+        p.num_layers = p.num_attn_heads = p.num_kv_heads = p.n_sampled = 1;
+        write_mock_calib(path, p);
+        triattention_scorer_config cfg;
+        cfg.normalize_scores = false;
+        triattention_scorer scorer(path, cfg, p.rope_theta, hd, 1);
+        TEST_ASSERT(scorer.valid());
+        triattention_scorer_config cfg_norm = cfg;
+        cfg_norm.normalize_scores = true;
+        triattention_scorer scorer_norm(path, cfg_norm, p.rope_theta, hd, 1);
+        TEST_ASSERT(scorer_norm.valid());
+        for (ggml_type type : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
+            mock_tensor_ctx mtc = make_mock_tensor_ctx(1024 * 1024);
+            ggml_tensor * quant = ggml_new_tensor_2d(mtc.ctx, type, hd, n);
+            ggml_tensor * reference = make_k_tensor(mtc, 1, hd, n);
+            alloc_mock_tensors(mtc);
+            const auto * traits = ggml_get_type_traits(type);
+            TEST_ASSERT(traits && traits->from_float_ref && traits->to_float);
+            std::vector<float> input(hd), stored(hd), restored(hd);
+            std::vector<uint8_t> bytes(ggml_row_size(type, hd));
+            for (uint32_t cell = 0; cell < n; ++cell) {
+                for (uint32_t d = 0; d < hd; ++d) {
+                    input[d] = std::sin((d + 1) * (cell + 3) * 0.071f) * (cell + 1);
+                }
+                traits->from_float_ref(input.data(), bytes.data(), hd);
+                traits->to_float(bytes.data(), stored.data(), hd);
+                // Independent dense R^T oracle over the full 128-wide storage
+                // block (rotary and tail alike); the scorer inverts RoPE on the
+                // rotary prefix only, on both paths.
+                for (uint32_t off = 0; off < hd; off += 128) {
+                    for (uint32_t i = 0; i < 128; ++i) {
+                        double sum = 0;
+                        for (uint32_t j = 0; j < 128; ++j) {
+                            sum += (double) TURBO_ROTATION_RT[i * 128 + j] * stored[off + j];
+                        }
+                        restored[off + i] = (float) sum;
+                    }
+                }
+                ggml_backend_tensor_set(quant, bytes.data(), cell * bytes.size(), bytes.size());
+                write_k_cell(reference, cell, 0, hd, restored.data());
+            }
+            float expected[n] = {}, cpu_scores[n] = {};
+            scorer.score_head(expected, reference, cells, positions, 0, n, 4096);
+            scorer.score_head(cpu_scores, quant, cells, positions, 0, n, 4096);
+            for (uint32_t i = 0; i < n; ++i) {
+                const float tol = 2e-4f * std::max(1.0f, std::fabs(expected[i]));
+                TEST_ASSERT_MSG(std::fabs(cpu_scores[i] - expected[i]) < tol,
+                        "partial-rotary CPU Turbo score must match the storage-domain oracle");
+            }
+            if (cuda_dev) {
+                mock_tensor_ctx dtc = make_mock_tensor_ctx(1024 * 1024);
+                ggml_tensor * dquant = ggml_new_tensor_2d(dtc.ctx, type, hd, n);
+                dtc.buf = ggml_backend_alloc_ctx_tensors_from_buft(
+                    dtc.ctx, ggml_backend_dev_buffer_type(cuda_dev));
+                TEST_ASSERT_MSG(dtc.buf, "failed to allocate CUDA buffer for device K");
+                for (uint32_t cell = 0; cell < n; ++cell) {
+                    for (uint32_t d = 0; d < hd; ++d) {
+                        input[d] = std::sin((d + 1) * (cell + 3) * 0.071f) * (cell + 1);
+                    }
+                    traits->from_float_ref(input.data(), bytes.data(), hd);
+                    ggml_backend_tensor_set(dquant, bytes.data(), cell * bytes.size(), bytes.size());
+                }
+                // Raw kernel math vs CPU oracle (no normalization).
+                float device[n] = {};
+                scorer.score_head(device, dquant, cells, positions, 0, n, 4096);
+                for (uint32_t i = 0; i < n; ++i) {
+                    // Device accumulates per-freq totals then tree-reduces while
+                    // the CPU oracle accumulates serially, so allow FP-ordering
+                    // noise well below scoring significance.
+                    const float tol = 5e-3f * std::max(1.0f, std::fabs(cpu_scores[i]));
+                    TEST_ASSERT_MSG(std::fabs(device[i] - cpu_scores[i]) < tol,
+                            "CUDA partial-rotary Turbo score must match the CPU oracle");
+                }
+                // Full-set normalized path: device kernel + host z-score must
+                // agree with the host snapshot + host z-score path.
+                ggml_tensor * cpu_tensors[] = {quant};
+                ggml_tensor * dev_tensors[] = {dquant};
+                int32_t layers[] = {0};
+                float combined_cpu[n] = {}, combined_dev[n] = {};
+                scorer_norm.score_combined(combined_cpu, cpu_tensors, 1, layers,
+                                           cells, positions, n, 4096);
+                scorer_norm.score_combined(combined_dev, dev_tensors, 1, layers,
+                                           cells, positions, n, 4096);
+                for (uint32_t i = 0; i < n; ++i) {
+                    const float tol = 5e-3f * std::max(1.0f, std::fabs(combined_cpu[i]));
+                    TEST_ASSERT_MSG(std::fabs(combined_dev[i] - combined_cpu[i]) < tol,
+                            "CUDA normalized combined score must match the CPU path");
+                }
+                free_mock_tensor_ctx(dtc);
+            }
+            free_mock_tensor_ctx(mtc);
+        }
+    }
+    } // rotary variants {64 partial, 128 full}
+    remove(path);
+    fprintf(stderr, "  PASSED\n");
+}
+
 static void test_collector_model_geometry() {
     llama_hparams hp{};
     hp.n_embd = 3072;
@@ -1127,6 +1265,7 @@ int main() {
     test_collector_model_geometry();
     test_storage_and_extra_rotation();
     test_turbo_scores_match_storage_oracle();
+    test_partial_rope_turbo_device();
     test_calibration_loading();
     test_rope_inversion();
     test_scoring();

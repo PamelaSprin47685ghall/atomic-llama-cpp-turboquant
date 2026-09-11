@@ -869,9 +869,25 @@ static void test_attention_f32_precision(bool require_gpu = false) {
             const float shape_error = max_abs_diff(ordinary, indexed);
             std::printf("F32_PRECISION cache=%s keys=%d native=%g indexed=%g shape=%g cpu=%g reference=f64\n",
                 turbo ? "turbo" : "f16", nkv, native_error, indexed_error, shape_error, cpu_error);
-            CHECK(native_error < 2e-5f);
+            // Ordinary-path tolerance: dense FLASH_ATTN_EXT rounds Q/K/V inputs to
+            // half on CUDA (the MMA_F16 kernel stores Q as half2 and never reads the
+            // PREC_F32 flag in op_params[3]), so it cannot match the f64 reference at
+            // 2e-5. Measured on sm_75: f16/33=1.66e-4, turbo/33=2.78e-4,
+            // f16/257=5.8e-5, turbo/257=8.0e-5; a NumPy model that only rounds Q/K to
+            // f16 and applies softmax weights in half reproduces 1.0-1.3e-4, proving
+            // inherent kernel precision rather than a decode/softmax defect. The CPU
+            // dense path measures 7.9e-4 on the same inputs (probe 2026-09-11), so
+            // CUDA is not the outlier. Gate ordinary at 5e-4 (upstream FA scale);
+            // the RERoT indexed kernel keeps the strict 2e-5 gate.
+            // Both CUDA (MMA_F16) and Vulkan (flash_attn_base) dense FA kernels
+            // round inputs/softmax weights to half precision, producing inherent
+            // errors ~1-3e-4 vs f64 (CPU dense FA measures 7.9e-4 on the same inputs).
+            // The GPU ordinary path is gated at 5e-4 on any GPU backend;
+            // the RERoT indexed kernel keeps the strict 2e-5 gate.
+            const float ordinary_tol = 5e-4f;
+            CHECK(native_error < ordinary_tol);
             CHECK(indexed_error < 2e-5f);
-            CHECK(shape_error < 2e-5f);
+            CHECK(shape_error < ordinary_tol);
         }
     }
     if (gpu) ggml_backend_free(gpu);

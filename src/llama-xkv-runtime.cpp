@@ -485,22 +485,24 @@ bool llama_xkv_runtime::config_supported(const llama_cparams & cparams, std::str
     if (cparams.xkv_mode == LLAMA_XKV_MODE_OFF || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
         return true; // no runtime by design
     }
+    // SR mode requires tq-factors-landmarks profile when on the TQ path (SR selects via landmarks)
+    if (cparams.xkv_mode == LLAMA_XKV_MODE_SR &&
+        cparams.xkv_storage_profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS) {
+        if (err) *err = "XKV SR mode requires tq-factors-landmarks storage profile (tq-factors has no landmarks)";
+        return false;
+    }
     if (cparams.xkv_source == LLAMA_XKV_SOURCE_PREROPE_CAPTURE) {
         if (err) *err = "PREROPE_CAPTURE source requires a staging ring/graph capture (not wired)";
         return false;
     }
     // Factorizer/profile matrix (explicit, never reinterpreted):
     // - CPU_REFERENCE: CPU path for every profile.
-    // - VULKAN + TQ_FACTORS: native bridge. VULKAN + LANDMARKS stays on the
-    //   CPU path (no native landmark kernel exists; bridge refuses it).
+    // - VULKAN/CUDA + TQ_FACTORS(_LANDMARKS): native bridge, including native
+    //   landmark build/select/merge kernels (CUDA: xkv-landmark*.cu, Vulkan:
+    //   xkv_landmark*.comp) for all four-way TQ factor codecs.
     // - VULKAN + REFERENCE: contradictory (reference expects host, vulkan
     //   demands device) — no valid path, reject.
     // - HYBRID: split unimplemented — reject until real.
-    // - CUDA: unsupported on this build — reject.
-    if (cparams.xkv_factorizer == LLAMA_XKV_FACTORIZER_CUDA) {
-        if (err) *err = "CUDA factorizer is not supported on this build";
-        return false;
-    }
     if (cparams.xkv_factorizer == LLAMA_XKV_FACTORIZER_VULKAN_HYBRID) {
         if (err) *err = "VULKAN_HYBRID split is not implemented; use vulkan or cpu-reference";
         return false;
@@ -508,6 +510,11 @@ bool llama_xkv_runtime::config_supported(const llama_cparams & cparams, std::str
     if (cparams.xkv_factorizer == LLAMA_XKV_FACTORIZER_VULKAN &&
         cparams.xkv_storage_profile == LLAMA_XKV_STORAGE_PROFILE_REFERENCE) {
         if (err) *err = "VULKAN factorizer contradicts REFERENCE host profile; no valid path";
+        return false;
+    }
+    if (cparams.xkv_factorizer == LLAMA_XKV_FACTORIZER_CUDA &&
+        cparams.xkv_storage_profile == LLAMA_XKV_STORAGE_PROFILE_REFERENCE) {
+        if (err) *err = "CUDA factorizer contradicts REFERENCE host profile; no valid path";
         return false;
     }
     return true;
@@ -528,18 +535,84 @@ void llama_xkv_runtime::refresh_readiness(const llama_kv_cache & kv) const {
         fail("layer groups not built");
         return;
     }
-    // Inspect actual target-layer hot tensor backends: CPU host buffers
-    // support the CPU/reference graph path; anything else stays false
-    // (Vulkan TQ until native full-attention dispatch; CUDA/Metal always).
+    // Inspect actual target-layer hot tensor backends:
+    // - If factorizer is CPU_REFERENCE: requires host-resident hot tensors.
+    // - If factorizer is VULKAN / VULKAN_HYBRID: Vulkan native reconstruct is
+    //   available when this build's Vulkan backend owns the buffer (registry is
+    //   not required for production readiness); allow device buffers on Vulkan
+    //   backends; host buffers remain accepted; fail closed for others.
+    // - If factorizer is CUDA: CUDA native reconstruct is available when CUDA owns
+    //   the buffer; allow device buffers on CUDA backends; host buffers remain accepted.
+    // - Otherwise: fail closed.
+    const bool is_cpu_factorizer = (cparams_.xkv_factorizer == LLAMA_XKV_FACTORIZER_CPU_REFERENCE);
+    const bool is_vulkan_factorizer = (cparams_.xkv_factorizer == LLAMA_XKV_FACTORIZER_VULKAN ||
+                                       cparams_.xkv_factorizer == LLAMA_XKV_FACTORIZER_VULKAN_HYBRID);
+    const bool is_cuda_factorizer = (cparams_.xkv_factorizer == LLAMA_XKV_FACTORIZER_CUDA);
+
+    if (!is_cpu_factorizer && !is_vulkan_factorizer && !is_cuda_factorizer) {
+        fail("unsupported factorizer for attention path");
+        return;
+    }
+
     for (const auto & g : groups_.groups) {
         for (uint32_t ol : g.owning_layers) {
             ggml_tensor * k = kv.get_k_storage((int32_t) ol);
             ggml_tensor * v = kv.get_v_storage((int32_t) ol);
-            if (!k || !v || !k->buffer || !v->buffer ||
-                !ggml_backend_buffer_is_host(k->buffer) ||
-                !ggml_backend_buffer_is_host(v->buffer)) {
-                fail("hot tensor of layer " + std::to_string(ol) + " is not host-resident");
+            if (!k || !v || !k->buffer || !v->buffer) {
+                fail("hot tensor of layer " + std::to_string(ol) + " has null buffer");
                 return;
+            }
+            if (is_cpu_factorizer) {
+                if (!ggml_backend_buffer_is_host(k->buffer) ||
+                    !ggml_backend_buffer_is_host(v->buffer)) {
+                    fail("hot tensor of layer " + std::to_string(ol) + " is not host-resident");
+                    return;
+                }
+            } else if (is_vulkan_factorizer) {
+                // Device Vulkan buffers permitted (host also accepted: native seal borrows
+                // placement from these tensors; reject CUDA/Metal/unknown).
+                for (const ggml_tensor * t : {k, v}) {
+                    if (ggml_backend_buffer_is_host(t->buffer)) {
+                        continue;
+                    }
+                    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+                    ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+                    if (!dev) {
+                        fail("hot tensor of layer " + std::to_string(ol) + " has no backend device");
+                        return;
+                    }
+                    const char * dev_name = ggml_backend_dev_name(dev);
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                    const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+                    const bool is_vk = (dev_name && strstr(dev_name, "Vulkan") != nullptr) ||
+                                       (reg_name && strstr(reg_name, "Vulkan") != nullptr);
+                    if (!is_vk) {
+                        fail("hot tensor of layer " + std::to_string(ol) + " is on non-Vulkan backend device");
+                        return;
+                    }
+                }
+            } else if (is_cuda_factorizer) {
+                // Device CUDA buffers permitted (host also accepted)
+                for (const ggml_tensor * t : {k, v}) {
+                    if (ggml_backend_buffer_is_host(t->buffer)) {
+                        continue;
+                    }
+                    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(t->buffer);
+                    ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+                    if (!dev) {
+                        fail("hot tensor of layer " + std::to_string(ol) + " has no backend device");
+                        return;
+                    }
+                    const char * dev_name = ggml_backend_dev_name(dev);
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                    const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+                    const bool is_cuda = (dev_name && strstr(dev_name, "CUDA") != nullptr) ||
+                                         (reg_name && strstr(reg_name, "CUDA") != nullptr);
+                    if (!is_cuda) {
+                        fail("hot tensor of layer " + std::to_string(ol) + " is on non-CUDA backend device");
+                        return;
+                    }
+                }
             }
         }
     }
@@ -1186,16 +1259,6 @@ xkv_maintenance_outcome llama_xkv_runtime::maintain(
     if (!is_shadow && cparams_.xkv_mode != LLAMA_XKV_MODE_DENSE &&
         cparams_.xkv_mode != LLAMA_XKV_MODE_SR) {
         if (err) *err = "maintain: runtime created for unsupported mode";
-        return xkv_maintain_error;
-    }
-    // Factorization itself is CPU-reference here (host canonicalization +
-    // store-side CPU factorization) or native Vulkan via the bridge below.
-    // Supported factorizers: CPU_REFERENCE (host canonicalize + CPU SVD),
-    // and VULKAN / VULKAN_HYBRID via the native bridge above. CUDA remains
-    // unsupported and fails closed explicitly.
-    if (cparams_.xkv_factorizer == LLAMA_XKV_FACTORIZER_CUDA) {
-        stats_.record_skip(xkv_skip_reason::unsupported_config);
-        if (err) *err = "maintain: CUDA factorizer is not supported on this build";
         return xkv_maintain_error;
     }
     auto store = kv.get_xkv_store();
@@ -1938,7 +2001,6 @@ xkv_maintenance_outcome llama_xkv_runtime::maintain(
         stats_.sync_total += nbundle.sync_count + nbundle.adopt_sync_count;
         stats_.last_factored_bytes = nbundle.factored_bytes;
         stats_.last_factored_rows = n;
-        stats_.compression_goal_met = true;
         return xkv_maintain_sealed;
     }
     // Max-group streaming workspace accounting: size the arena lease to the
@@ -2475,7 +2537,6 @@ xkv_maintenance_outcome llama_xkv_runtime::maintain(
         stats_.last_factored_bytes = res.factored_bytes;
         stats_.last_factored_rows = n;
         stats_.last_compression_ratio = res.compression_ratio;
-        stats_.compression_goal_met = true; // gates passed or seal would have failed
     }
     // No post-publish apply: the release already ran inside the gate.
     // Logical cells stay resident; only physical hot backing was released.
@@ -4401,10 +4462,6 @@ bool llama_xkv_runtime::rebuild_landmarks_for_shift(
     std::vector<encoded_matrix> & out_landmarks,
     std::string * err) const {
     out_landmarks.clear();
-    if (cparams_.xkv_factorizer != LLAMA_XKV_FACTORIZER_CPU_REFERENCE) {
-        if (err) *err = "shift rebuild: non-CPU factorizer has no host rebuild path";
-        return false;
-    }
     auto store = kv.get_xkv_store();
     if (!store) {
         if (err) *err = "shift rebuild: no XKV store";
@@ -4472,6 +4529,86 @@ bool llama_xkv_runtime::rebuild_landmarks_for_shift(
         }
         if (!spec) {
             if (err) *err = "shift rebuild: group lacks a cached phase spec";
+            return false;
+        }
+        // DEVICE_OWNED: native device rebuild via xkv_native_landmark_rebuild.
+        // Never host-decode device factors.
+        if (seg->residency == GGML_XKV_RES_DEVICE_OWNED) {
+            if (!seg->backend_bundle || !seg->backend_bundle->is_committed()) {
+                if (err) *err = "shift rebuild: device-owned segment lacks committed backend bundle";
+                return false;
+            }
+            ggml_backend_t dev_exec = seg->backend_bundle->get_executor();
+            if (!dev_exec) {
+                if (err) *err = "shift rebuild: device-owned segment bundle missing executor";
+                return false;
+            }
+            const uint64_t fp_ak = g.a_k.desc.fingerprint();
+            const uint64_t fp_bk = g.b_k ? g.b_k->desc.fingerprint() : 0;
+            std::shared_ptr<const xkv_backend_allocation> h_ak, h_bk;
+            for (const auto & h : seg->backend_bundle->handles) {
+                if (!h) continue;
+                if (h->get_desc().role == factor_role::a_k &&
+                    (h->get_descriptor_fingerprint() == fp_ak || h->get_desc().fingerprint() == fp_ak)) {
+                    if (!h_ak) h_ak = h;
+                } else if (g.b_k && h->get_desc().role == factor_role::b_k &&
+                    (h->get_descriptor_fingerprint() == fp_bk || h->get_desc().fingerprint() == fp_bk)) {
+                    if (!h_bk) h_bk = h;
+                }
+            }
+            if (!h_ak || !h_bk) {
+                if (err) *err = "shift rebuild: device-owned group missing backend A_K/B_K handle";
+                return false;
+            }
+            const llama_hparams & hparams = kv.get_hparams();
+            xkv_native_landmark_rebuild_request req;
+            req.a_k = h_ak;
+            req.b_k = h_bk;
+            req.surviving_rows.reserve(surviving.size());
+            for (uint32_t r : surviving) req.surviving_rows.push_back((int32_t) r);
+            req.storage_positions = positions;
+            req.chunk_tokens = eff_.chunk_tokens;
+            req.landmark_type = cparams_.xkv_landmark_type;
+            req.seed = 777;
+            req.phase_tx_fingerprint = spec->fingerprint;
+            req.layers.reserve(spec->layers.size());
+            for (const auto & pl : spec->layers) {
+                xkv_native_seal_hot_layer lay;
+                lay.n_heads = pl.n_heads;
+                lay.head_dim_k = pl.head_dim;
+                lay.head_dim_v = pl.head_dim;
+                lay.rotary_dim_k = pl.rotary_dim;
+                if (hparams.rope_type == LLAMA_ROPE_TYPE_NORM) lay.rope_mode_k = GGML_XKV_ROPE_INTERLEAVED;
+                else lay.rope_mode_k = GGML_XKV_ROPE_HALF;
+                const uint32_t fc = pl.rotary_dim / 2;
+                lay.rope_omega_k = pl.omega;
+                lay.rope_mag_k.clear();
+                lay.rope_mag_k.reserve(fc);
+                for (uint32_t f = 0; f < fc; ++f) {
+                    const float sq = (f < pl.freq_scale_sq.size()) ? pl.freq_scale_sq[f] : 1.0f;
+                    lay.rope_mag_k.push_back(std::sqrt(sq));
+                }
+                req.layers.push_back(std::move(lay));
+            }
+            req.executor = seg->backend_bundle->executor;
+            ggml_backend_buffer_type_t buft = h_ak->get_owning_buft();
+            if (!buft) buft = ggml_backend_get_default_buffer_type(dev_exec);
+            req.buft = buft;
+            req.id_gen = &store->allocation_id_generator();
+            req.store_reservation = nullptr;
+            req.staging_reservation = nullptr;
+            xkv_native_landmark_rebuild_result res;
+            if (!xkv_native_landmark_rebuild(req, res, err)) {
+                return false;
+            }
+            encoded_matrix em;
+            em.desc = res.desc;
+            em.bytes.clear();
+            out_landmarks.push_back(std::move(em));
+            continue;
+        }
+        if (cparams_.xkv_factorizer != LLAMA_XKV_FACTORIZER_CPU_REFERENCE) {
+            if (err) *err = "shift rebuild: non-CPU factorizer on host-resident segment refused";
             return false;
         }
         encoded_matrix rebuilt;

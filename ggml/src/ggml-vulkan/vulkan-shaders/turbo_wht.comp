@@ -5,10 +5,13 @@
 
 layout (local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
-layout (push_constant) uniform parameter { uint ne; uint direction; uint group_size; } p;
+// use_scale != 0: multiply by InnerQ scale_inv (binding 2). When src[1] is NULL
+// the host binds a dummy buffer and sets use_scale = 0, so S is never read.
+layout (push_constant) uniform parameter { uint ne; uint direction; uint group_size; uint use_scale; } p;
 
 layout (binding = 0) readonly  buffer A { float data_a[]; };
 layout (binding = 1) writeonly buffer D { float data_d[]; };
+layout (binding = 2) readonly  buffer S { float data_s[]; };
 
 shared float x[128];
 
@@ -36,25 +39,42 @@ const float S2[128] = float[128](
     -1,  1, -1,  1,  1, -1,  1, -1,  1, -1, -1, -1, -1, -1,  1, -1
 );
 
-const float INV_SQRT_128 = 0.08838834764831845;  // 1 / sqrt(128)
-
 void main() {
     const uint tid  = gl_LocalInvocationID.x;
     const uint base = (gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x) * 128;
 
     if (base + tid >= p.ne) return;
 
-    const float fs = (p.direction == 0) ? S1[tid] : S2[tid];
-    const float ss = (p.direction == 0) ? S2[tid] : S1[tid];
+    // Group size resolved on host (ggml_turbo_wht: 32/64/128, auto already
+    // folded). One workgroup covers 128 elements = 128/gs complete groups.
+    // The graph guarantees ne[0] % gs == 0, so every participating group in
+    // a chunk is full: no cross-group pairing and no tail identity needed.
+    // 64-groups reuse the first 64 signs, matching the CPU oracle (ops.cpp)
+    // and CUDA TURBO_WHT_SIGNS*_64 (first 64 of the 128 arrays).
+    const uint gs = (p.group_size == 64) ? 64u : ((p.group_size == 32) ? 32u : 128u);
+    const uint l = tid % gs;  // within-group channel
+
+    const float fs = (p.direction == 0) ? S1[l] : S2[l];
+    const float ss = (p.direction == 0) ? S2[l] : S1[l];
 
     x[tid] = data_a[base + tid];
     barrier();
 
+    // InnerQ forward (direction 0): scale BEFORE signs+WHT, matching CPU
+    // (ops.cpp) and CUDA (turbo-wht.cu). Uniform branch: safe with barrier.
+    // Scale is per within-group channel, shared across groups.
+    if (p.use_scale != 0 && p.direction == 0) {
+        x[tid] *= data_s[l];
+        barrier();
+    }
+
     x[tid] *= fs;
     barrier();
 
-    [[unroll]] for (uint h = 1; h < 128; h *= 2) {
-        if ((tid % (2 * h)) < h) {
+    // Pairs stay inside the group: (l % (2h)) < h implies l+h < gs because
+    // groups are gs-aligned and 2h divides gs (powers of two).
+    for (uint h = 1; h < gs; h *= 2) {
+        if ((l % (2 * h)) < h) {
             float a    = x[tid];
             float b    = x[tid + h];
             x[tid]     = a + b;
@@ -63,5 +83,10 @@ void main() {
         barrier();
     }
 
-    data_d[base + tid] = x[tid] * INV_SQRT_128 * ss;
+    // InnerQ inverse (direction 1): scale AFTER WHT+signs+normalize.
+    float val = x[tid] * inversesqrt(float(gs)) * ss;
+    if (p.use_scale != 0 && p.direction == 1) {
+        val *= data_s[l];
+    }
+    data_d[base + tid] = val;
 }

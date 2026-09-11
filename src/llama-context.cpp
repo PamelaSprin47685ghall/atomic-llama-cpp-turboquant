@@ -670,11 +670,6 @@ static void llama_xkv_validate_cparams(const llama_cparams & cparams) {
         throw std::invalid_argument("XKV store budget requires DENSE/SR mode (SHADOW/OFF must use xkv_store_mib == 0)");
     }
 
-    // CUDA factorizer rejected
-    if (cparams.xkv_factorizer == LLAMA_XKV_FACTORIZER_CUDA) {
-        throw std::invalid_argument("XKV CUDA factorizer is not supported; rejected");
-    }
-
     auto is_turbo_type = [](ggml_type t) {
         return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
     };

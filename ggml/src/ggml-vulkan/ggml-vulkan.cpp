@@ -99,6 +99,11 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 
 #include "ggml-vulkan-shaders.hpp"
 
+// FlashPrefill V2 joint push/binding contract (Shader-owned). Provides
+// FpPoolPush/FpSelectPush/FpAttnPush plus FP_* macros; the same macros
+// generate the device push blocks, so host and device cannot drift.
+#include "vulkan-shaders/flashprefill-interface.h"
+
 // remove this once it's more widely available in the SDK
 #if !defined(VK_KHR_shader_bfloat16)
 
@@ -1061,6 +1066,9 @@ struct vk_device_struct {
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
     vk_pipeline pipeline_gated_delta_net_rbb[4];
+    // Density-normalized RBB contract (spec RBB=2); pipeline_gated_delta_net_rbb
+    // keeps the raw-redundant ablation (spec RBB=1) for explicit opt-out.
+    vk_pipeline pipeline_gated_delta_net_rbb_dense[4];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1082,6 +1090,14 @@ struct vk_device_struct {
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
+    // FlashPrefill V2: POOL/ATTN specialize K/V decode at runtime via
+    // FaTypeK/V + block-bytes spec constants (like FA), so one pipeline
+    // per (K type, V type) pair. SELECT only reads F32 Q/pool: single
+    // pipeline. MERGE recombines ATTN split-K partials (single pipeline).
+    std::map<std::pair<ggml_type, ggml_type>, vk_pipeline> pipeline_flash_prefill_pool;
+    std::map<std::pair<ggml_type, ggml_type>, vk_pipeline> pipeline_flash_prefill_attn;
+    vk_pipeline pipeline_flash_prefill_select;
+    vk_pipeline pipeline_flash_prefill_merge;
     vk_pipeline pipeline_count_experts;
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
@@ -2321,6 +2337,11 @@ struct ggml_backend_vk_context {
     ggml_vk_garbage_collector gc;
     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_moe_route, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_moe_route, prealloc_add_rms_partials, sync_staging;
+    // FlashPrefill split-K scratch accounting (bytes, host-side): current =
+    // bytes currently pinned for FP M/L/O triples, peak = max observed.
+    // Reported via ggml_backend_vk_flashprefill_scratch; the backing store
+    // is the shared prealloc_split_k pool (fit-counted, grow-only).
+    uint64_t fp_scratch_current {}, fp_scratch_peak {};
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
     bool almost_ready_fence_pending {};
@@ -3939,6 +3960,84 @@ static bool ggml_vk_fa_kv_type_ok(ggml_type t) {
     }
 }
 
+// FlashPrefill V2 host helpers. Shaders declare sparse spec ids
+// (0,12..15, shared with FA); the loader maps vector index -> constant
+// id, so the vector is 16 entries wide like get_fa_spec_constants.
+static uint32_t ggml_vk_fp_block_bytes(ggml_type t) {
+    if (t == GGML_TYPE_F32) return 16u;
+    return (uint32_t) ggml_type_size(t);
+}
+
+static std::vector<uint32_t> ggml_vk_fp_spec_constants(uint32_t wgsize, ggml_type k_type, ggml_type v_type) {
+    std::vector<uint32_t> out(16, 0u);
+    out[0] = wgsize;
+    out[12] = (uint32_t) k_type;
+    out[13] = (uint32_t) v_type;
+    out[14] = ggml_vk_fp_block_bytes(k_type);
+    out[15] = ggml_vk_fp_block_bytes(v_type);
+    return out;
+}
+
+// Unpacks the frozen 16-word op_params (see ggml_flash_prefill_* in ggml.c):
+// [op, alpha, scale, softcap, exact_all, dk, dv, version, mean_corr, 0..0].
+// Rejects op/version mismatch and nonzero reserved words (fail-closed).
+struct ggml_vk_fp_params {
+    float alpha = 0.0f;
+    float scale = 0.0f;
+    float softcap = 0.0f;
+    int32_t exact_all = 0;
+    int32_t dk = 0;
+    int32_t dv = 0;
+    int32_t mean_correction = 0;
+};
+
+static bool ggml_vk_fp_unpack_params(const ggml_tensor * node, int32_t expect_op, ggml_vk_fp_params & out) {
+    int32_t w[16];
+    memcpy(w, node->op_params, sizeof(w));
+    if (w[0] != expect_op || w[7] != (int32_t) FP_VERSION) {
+        return false;
+    }
+    for (int i = 9; i < 16; i++) {
+        if (w[i] != 0) {
+            return false;
+        }
+    }
+    memcpy(&out.alpha, &w[1], sizeof(float));
+    memcpy(&out.scale, &w[2], sizeof(float));
+    memcpy(&out.softcap, &w[3], sizeof(float));
+    out.exact_all = w[4];
+    out.dk = w[5];
+    out.dv = w[6];
+    out.mean_correction = w[8];
+    return true;
+}
+
+static bool ggml_vk_fp_float_ok(float x) {
+    return x == x && x != INFINITY && x != -INFINITY;
+}
+
+// Loose host-side cap for device r/u/c allocation caps the host cannot read
+// (no readback): every table lives inside meta_words, so each count cap fits
+// in (meta_words-32)/8 and the cell cap in (meta_words-32). Satisfies the
+// shader's actual<=cap checks without weakening them meaningfully.
+static uint32_t ggml_vk_fp_meta_count_bound(int64_t meta_words) {
+    if (meta_words <= FP_META_HDR_WORDS) {
+        return 0u;
+    }
+    uint64_t b = ((uint64_t) meta_words - FP_META_HDR_WORDS) / FP_FRAG_WORDS;
+    return b > UINT32_MAX ? UINT32_MAX : (uint32_t) b;
+}
+
+// SELECT phase-1 grid width. Any X>=1 is correct (grid-stride covers all
+// tiles); oversubscription is cheap (early return after the plan header).
+static uint32_t ggml_vk_fp_select_grid_x(int64_t meta_words) {
+    uint64_t b = (uint64_t) ggml_vk_fp_meta_count_bound(meta_words) + 1u;
+    if (b < 1u) {
+        b = 1u;
+    }
+    return b > 1024u ? 1024u : (uint32_t) b;
+}
+
 static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
 
     uint32_t lut_size = 0;
@@ -4550,6 +4649,31 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                 get_fa_spec_constants(fa.first), 1, true,
                                 subgroup_size != 0, subgroup_size);
     }
+
+    // FlashPrefill V2 (true device dispatch, split1-only; no CPU fallback).
+    // POOL/ATTN: 8 bindings used by POOL (0,3,4,6 dummy), 11 by ATTN
+    // (8/9/10 scratch dummy in split1). One workgroup per (frag,head) /
+    // row, so wg_denoms are {1,1,1} and grids are exact host caps.
+    for (auto &fp : device->pipeline_flash_prefill_pool) {
+        ggml_vk_create_pipeline(device, fp.second, "flashprefill_pool", flashprefill_pool_len, flashprefill_pool_data,
+                                "main", 8, sizeof(FpPoolPush), {1, 1, 1},
+                                ggml_vk_fp_spec_constants(64, fp.first.first, fp.first.second), 1);
+    }
+    for (auto &fp : device->pipeline_flash_prefill_attn) {
+        ggml_vk_create_pipeline(device, fp.second, "flashprefill_attn", flashprefill_attn_len, flashprefill_attn_data,
+                                "main", 11, sizeof(FpAttnPush), {1, 1, 1},
+                                ggml_vk_fp_spec_constants(64, fp.first.first, fp.first.second), 1);
+    }
+    // SELECT is type-uniform (F32 Q/pool, no FaType spec): single pipeline,
+    // scalar lane-0 work (wgsize 1, per the shader's own default).
+    ggml_vk_create_pipeline(device, device->pipeline_flash_prefill_select, "flashprefill_select",
+                            flashprefill_select_len, flashprefill_select_data,
+                            "main", 8, sizeof(FpSelectPush), {1, 1, 1}, {1}, 1);
+    // MERGE is type-uniform (plan/meta/scratch only, no KV decode): single
+    // pipeline. Bindings 0..10 with 0/1/2/3/6 dummy (11 descriptors).
+    ggml_vk_create_pipeline(device, device->pipeline_flash_prefill_merge, "flashprefill_merge",
+                            flashprefill_merge_len, flashprefill_merge_data,
+                            "main", 11, sizeof(FpMergePush), {1, 1, 1}, {64}, 1);
 
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->coopmat1_fa_support) {
@@ -5868,7 +5992,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_pool2d_f32, "pool2d_f32", pool2d_f32_len, pool2d_f32_data, "main", 2, sizeof(vk_op_pool2d_push_constants), {512, 1, 1}, {}, 1);
 
     // TurboQuant WHT (forward / inverse rotation, 128-element block)
-    ggml_vk_create_pipeline(device, device->pipeline_turbo_wht, "turbo_wht", turbo_wht_len, turbo_wht_data, "main", 2, 3 * sizeof(uint32_t), {128, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_turbo_wht, "turbo_wht", turbo_wht_len, turbo_wht_data, "main", 3, 4 * sizeof(uint32_t), {128, 1, 1}, {}, 1);
 
     // XKV selected-row factor reconstruction: 10 bindings, 84B push constants, one dispatch per op
     ggml_vk_create_pipeline(device, device->pipeline_xkv_reconstruct, "xkv_reconstruct", xkv_reconstruct_len, xkv_reconstruct_data, "main", 10, 84, {64, 1, 1}, {}, 1);
@@ -5988,6 +6112,24 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 sizeof(vk_op_gated_delta_net_push_constants),
                 wg_denoms,
                 {S_V, 0u, device->subgroup_size, lanes_per_column, gdn_workgroup_size, 1u},
+                1,
+                true,
+                use_subgroup_ops,
+                device->subgroup_size);
+            // Default production contract: coherence-normalized evidence
+            // (spec RBB=2). The RBB=1 pipeline above stays reachable only via
+            // the explicit raw-redundant ablation (op_params[2] == 0).
+            ggml_vk_create_pipeline(
+                device,
+                device->pipeline_gated_delta_net_rbb_dense[si],
+                (std::string(gdn_names[si][0]) + "_rbb_dense").c_str(),
+                gdn_len,
+                gdn_data,
+                "main",
+                8,
+                sizeof(vk_op_gated_delta_net_push_constants),
+                wg_denoms,
+                {S_V, 0u, device->subgroup_size, lanes_per_column, gdn_workgroup_size, 2u},
                 1,
                 true,
                 use_subgroup_ops,
@@ -11160,17 +11302,48 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
 // math, one staged Q row, one K/V block reused for K then V, no mask, no MMQ
 // workspace. Conservative on the IQ4_NL table (f16 there). Must be kept in
 // sync with the rerot block in flash_attn_base.glsl.
+//
+// CRITICAL: the rerot pipeline compiles the whole scalar flash_attn.comp
+// module, so the driver bills the ORDINARY-path shared arrays too
+// (tmpsh/tmpshv4/masksh/Qf/kvsh/occupancy_limiter in flash_attn.comp) on top
+// of the rerot arrays below. Budgeting only the rerot half selected
+// workgroups needing ~75 KB on a 48 KB device; the over-limit dispatch
+// faulted the queue and the host spun forever in ggml_vk_wait_for_fence
+// (NVIDIA RTX 2080 Ti: reported Shared Memory Size 74496 > 49152).
+// Keep every term in sync with both declaration sites.
 static bool ggml_vk_flash_attn_rerot_shmem_support(const vk_device & device, const vk_fa_tuning_params & params, uint32_t hsk, uint32_t hsv) {
     const uint32_t wg_size = params.workgroup_size;
     const uint32_t Bc = params.block_cols;
     const uint32_t D = std::max(hsk, hsv);
-    const uint32_t tmpsh = wg_size * sizeof(float);
-    const uint32_t tmpshv4 = wg_size * 4 * sizeof(float);
-    const uint32_t iq_shmem = 16 * sizeof(float);
-    const uint32_t Qf = params.block_rows * (hsk / 4 + 1) * 4 * sizeof(float);
-    const uint32_t kvsh = params.shmem_staging ? Bc * (D / 4 + 1) * 4 * sizeof(float) : 4 * sizeof(float);
-    const uint32_t occ = params.limit_occupancy_shmem * 4 * sizeof(float);
-    const uint64_t total_size = (uint64_t)tmpsh + tmpshv4 + iq_shmem + Qf + kvsh + occ + sizeof(uint32_t);
+    const uint32_t Br = params.block_rows;
+    const uint32_t sgs = params.subgroup_size;
+    // Round each array to 16 B (vec4 alignment); round the module total to
+    // 128 B (driver reporting granularity, verified against
+    // VK_KHR_pipeline_executable_properties on NVIDIA).
+    auto aligned = [](uint64_t bytes) { return (bytes + 15u) & ~uint64_t(15u); };
+    uint64_t total_size = 0;
+    // Ordinary path (flash_attn.comp, fp32 module: FLOAT_TYPE float):
+    // tmpsh/tmpshv4[tmpsh_size], masksh[Bc*(Br+1)], Qf[Br*(HSK/4+1)],
+    // kvsh[staging ? Bc*(D/4+1) : 1], occupancy_limiter[max(LIMIT,1)].
+    const uint32_t tmpsh_n = sgs > 0
+        ? (wg_size / std::max(sgs, 1u)) * (params.row_split == 1 ? params.d_split : 1u)
+        : wg_size;
+    total_size += aligned(uint64_t(tmpsh_n) * sizeof(float));
+    total_size += aligned(uint64_t(tmpsh_n) * 4 * sizeof(float));
+    total_size += aligned(uint64_t(Bc) * (Br + 1) * sizeof(float));
+    total_size += aligned(uint64_t(Br) * (hsk / 4 + 1) * 4 * sizeof(float));
+    total_size += aligned((params.shmem_staging ? uint64_t(Bc) * (D / 4 + 1) : 1u) * 4 * sizeof(float));
+    total_size += aligned(uint64_t(std::max(params.limit_occupancy_shmem, 1u)) * 4 * sizeof(float));
+    // Rerot path (flash_attn_base.glsl): rerot_qf[Br*(HSK/4+1)],
+    // rerot_run_end, rerot_kvsh[staging ? Bc*(D/4+1) : 1],
+    // rerot_tmpsh[WGS], rerot_tmpv4[WGS], rerot_occlim[max(LIMIT,1)].
+    total_size += aligned(uint64_t(Br) * (hsk / 4 + 1) * 4 * sizeof(float));
+    total_size += aligned(sizeof(uint32_t));
+    total_size += aligned((params.shmem_staging ? uint64_t(Bc) * (D / 4 + 1) : 1u) * 4 * sizeof(float));
+    total_size += aligned(uint64_t(wg_size) * sizeof(float));
+    total_size += aligned(uint64_t(wg_size) * 4 * sizeof(float));
+    total_size += aligned(uint64_t(std::max(params.limit_occupancy_shmem, 1u)) * 4 * sizeof(float));
+    total_size = (total_size + 127u) & ~uint64_t(127u);
     return total_size <= device->properties.limits.maxComputeSharedMemorySize;
 }
 
@@ -11217,19 +11390,27 @@ static bool ggml_vk_flash_attn_rerot_tune(const vk_device & device, uint32_t hsk
         }
     }
     params.block_rows = 1;
-    params.block_cols = 128;
     params.row_split = 1;
     if (params.disable_subgroups) {
         params.d_split = 1;
     }
-    if (!ggml_vk_flash_attn_rerot_shmem_support(device, params, hsk, hsv)) {
-        params.shmem_staging = false;
-        if (!ggml_vk_flash_attn_rerot_shmem_support(device, params, hsk, hsv)) {
-            return false;
+    // The module total (ordinary + rerot arrays) grows with Bc; halve the
+    // K/V tile until it fits, preferring staged loads, then fall back to
+    // direct loads. Failure means no valid dispatch: the caller reports the
+    // op unsupported (CPU fallback) instead of hanging on an over-limit
+    // workgroup.
+    const bool want_staging = params.shmem_staging;
+    for (int pass = 0; pass < 2; ++pass) {
+        params.shmem_staging = (pass == 0) ? want_staging : false;
+        for (uint32_t bc = 128; bc >= 16; bc /= 2) {
+            params.block_cols = bc;
+            if (ggml_vk_flash_attn_rerot_shmem_support(device, params, hsk, hsv)) {
+                out = params;
+                return true;
+            }
         }
     }
-    out = params;
-    return true;
+    return false;
 }
 
 static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
@@ -11703,6 +11884,275 @@ static void ggml_vk_flash_attn_rerot(ggml_backend_vk_context * ctx, vk_context &
                                     {q_buf, k_buf, v_buf, q_buf, sinks_buf, dst_buf, q_buf, entries_buf, offsets_buf},
                                     pc, { n_queries, head_groups, 1 });
     }
+}
+
+// FlashPrefill V2 device dispatch (split1-only; MERGE has no producer).
+// Semantics mirror ggml_compute_forward_flash_prefill_* (CPU reference):
+// per-(frag,head) K/V means, per-(tile,head) max-energy classification,
+// per-row sparse attention with proxy-mean correction. Error reporting
+// rides the plan header (SELECT/ATTN raise it on-device); POOL has no
+// error channel and poisons output on malformed input so SELECT flags it.
+
+static void ggml_vk_flash_prefill_pool(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * node) {
+    const ggml_tensor * k = node->src[0];
+    const ggml_tensor * v = node->src[1];
+    const ggml_tensor * meta = node->src[2];
+    ggml_vk_fp_params pp;
+    GGML_ASSERT(ggml_vk_fp_unpack_params(node, FP_OP_POOL, pp));
+    GGML_ASSERT(k->ne[0] == pp.dk && v->ne[0] == pp.dv);
+
+    const uint32_t f_cap = (uint32_t) node->ne[2];
+    const uint32_t h_cap = (uint32_t) node->ne[1];
+
+    vk_pipeline pipeline = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
+        auto & pipelines = ctx->device->pipeline_flash_prefill_pool;
+        auto it = pipelines.find({k->type, v->type});
+        if (it != pipelines.end()) {
+            pipeline = it->second;
+        } else {
+            pipelines[{k->type, v->type}] = pipeline = std::make_shared<vk_pipeline_struct>();
+        }
+    }
+    GGML_ASSERT(pipeline);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer kb = ggml_vk_tensor_subbuffer(ctx, k);
+    vk_subbuffer vb = ggml_vk_tensor_subbuffer(ctx, v);
+    vk_subbuffer mb = ggml_vk_tensor_subbuffer(ctx, meta);
+    vk_subbuffer db = ggml_vk_tensor_subbuffer(ctx, node);
+
+    FpPoolPush pc{};
+    pc.dk = (uint32_t) pp.dk;
+    pc.dv = (uint32_t) pp.dv;
+    pc.h_cap = h_cap;
+    pc.f_cap = f_cap;
+    pc.meta_words = (uint32_t) meta->ne[0];
+    pc.n_kv = (uint32_t) k->ne[1];
+    pc.k_nb1 = (uint32_t) k->nb[1];
+    pc.k_nb2 = (uint32_t) k->nb[2];
+    pc.v_nb1 = (uint32_t) v->nb[1];
+    pc.v_nb2 = (uint32_t) v->nb[2];
+    pc.version = FP_VERSION;
+
+    // Bindings 0/3/4/6 unused by POOL: valid dummies (never indexed).
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                {kb, kb, vb, kb, kb, mb, kb, db},
+                                pc, {f_cap, h_cap, 1});
+}
+
+static void ggml_vk_flash_prefill_select(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * node) {
+    const ggml_tensor * q = node->src[0];
+    const ggml_tensor * pool = node->src[1];
+    const ggml_tensor * meta = node->src[2];
+    ggml_vk_fp_params pp;
+    GGML_ASSERT(ggml_vk_fp_unpack_params(node, FP_OP_SELECT, pp));
+    GGML_ASSERT(q->ne[0] == pp.dk && pool->ne[0] - q->ne[0] == pp.dv);
+
+    vk_pipeline pipeline = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
+        if (!ctx->device->pipeline_flash_prefill_select) {
+            ctx->device->pipeline_flash_prefill_select = std::make_shared<vk_pipeline_struct>();
+        }
+        pipeline = ctx->device->pipeline_flash_prefill_select;
+    }
+    GGML_ASSERT(pipeline);
+    // Two dispatches below (phase 0 header + phase 1 classification) each
+    // consume one descriptor set; requesting only one starves the second
+    // dispatch (descriptor_set_idx overruns the allocated vector).
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 2);
+
+    vk_subbuffer qb = ggml_vk_tensor_subbuffer(ctx, q);
+    vk_subbuffer pb = ggml_vk_tensor_subbuffer(ctx, pool);
+    vk_subbuffer mb = ggml_vk_tensor_subbuffer(ctx, meta);
+    vk_subbuffer db = ggml_vk_tensor_subbuffer(ctx, node);
+
+    const uint32_t bound = ggml_vk_fp_meta_count_bound(meta->ne[0]);
+    FpSelectPush pc{};
+    pc.dk = (uint32_t) pp.dk;
+    pc.dv_cap = (uint32_t) pp.dv;
+    pc.f_cap = (uint32_t) pool->ne[2];
+    pc.r_cap = bound;
+    pc.u_cap = bound;
+    pc.c_cap = meta->ne[0] > FP_META_HDR_WORDS ? (uint32_t)(meta->ne[0] - FP_META_HDR_WORDS) : 0u;
+    pc.meta_words = (uint32_t) meta->ne[0];
+    pc.plan_words = (uint32_t) node->ne[0];
+    pc.q_nb1 = (uint32_t) q->nb[1];
+    pc.q_nb2 = (uint32_t) q->nb[2];
+    pc.q_groups_cap = (uint32_t) q->ne[1];
+    pc.q_heads_cap = (uint32_t) q->ne[2];
+    pc.hkv_cap = (uint32_t) pool->ne[1];
+    pc.exact_all = (uint32_t) pp.exact_all;
+    pc.version = FP_VERSION;
+    pc.alpha = pp.alpha;
+    pc.scale = pp.scale;
+    pc.softcap = pp.softcap;
+
+    // Phase 0: one workgroup builds/validates the plan header.
+    pc.phase = 0u;
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                {qb, qb, qb, pb, qb, mb, qb, db},
+                                pc, {1, 1, 1});
+    // Phase 1 dispatch barrier (device-only, no host sync); each pair
+    // clears its own lists, shared counters use atomics.
+    ggml_vk_sync_buffers(ctx, subctx);
+    pc.phase = 1u;
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                {qb, qb, qb, pb, qb, mb, qb, db},
+                                pc, {ggml_vk_fp_select_grid_x(meta->ne[0]), (uint32_t) pool->ne[1], 1});
+}
+
+static void ggml_vk_flash_prefill_attn(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * node) {
+    const ggml_tensor * q = node->src[0];
+    const ggml_tensor * k = node->src[1];
+    const ggml_tensor * v = node->src[2];
+    const ggml_tensor * pool = node->src[3];
+    const ggml_tensor * plan = node->src[4];
+    const ggml_tensor * meta = node->src[5];
+    const ggml_tensor * sinks = node->src[6];
+    ggml_vk_fp_params pp;
+    GGML_ASSERT(ggml_vk_fp_unpack_params(node, FP_OP_ATTN, pp));
+    GGML_ASSERT(q->ne[0] == pp.dk && node->ne[0] == pp.dv);
+
+    vk_pipeline pipeline = nullptr;
+    vk_pipeline merge = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(ctx->device->compile_mutex);
+        auto & pipelines = ctx->device->pipeline_flash_prefill_attn;
+        auto it = pipelines.find({k->type, v->type});
+        if (it != pipelines.end()) {
+            pipeline = it->second;
+        } else {
+            pipelines[{k->type, v->type}] = pipeline = std::make_shared<vk_pipeline_struct>();
+        }
+        if (!ctx->device->pipeline_flash_prefill_merge) {
+            ctx->device->pipeline_flash_prefill_merge = std::make_shared<vk_pipeline_struct>();
+        }
+        merge = ctx->device->pipeline_flash_prefill_merge;
+    }
+    GGML_ASSERT(pipeline);
+    GGML_ASSERT(merge);
+
+    // Split-K over exact-tokens/proxy-uses (S=2): two partial dispatches
+    // stride the work, MERGE recombines with the mlo equations. Total QK
+    // work is unchanged; empty partials merge via the -inf/0/0 identity, and
+    // the sink mass rides only split 0. Scratch M/L [R*S], O [R*S*Dv] comes
+    // from the shared split-K pool (fit-counted laround
+    // common_fp_native_split_bytes). Degenerate/oversize shapes keep the
+    // split1 final path (no scratch, no merge).
+    const uint64_t fp_n_rows = (uint64_t) node->ne[2] * (uint64_t) node->ne[1];
+    uint32_t fp_n_splits = 2u;
+    uint64_t fp_need = 0;
+    if (fp_n_rows == 0u || pp.dv <= 0 ||
+        fp_n_rows > (uint64_t) ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
+        fp_n_splits = 1u;
+    } else {
+        fp_need = fp_n_rows * (uint64_t) fp_n_splits * ((uint64_t) pp.dv + 2u) * sizeof(float);
+        if (fp_need > (uint64_t) ctx->device->properties.limits.maxStorageBufferRange) {
+            fp_n_splits = 1u;
+            fp_need = 0;
+        }
+    }
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, fp_n_splits);
+    if (fp_n_splits > 1) {
+        ggml_pipeline_request_descriptor_sets(ctx, merge, 1);
+    }
+
+    vk_subbuffer qb = ggml_vk_tensor_subbuffer(ctx, q);
+    vk_subbuffer kb = ggml_vk_tensor_subbuffer(ctx, k);
+    vk_subbuffer vb = ggml_vk_tensor_subbuffer(ctx, v);
+    vk_subbuffer pb = ggml_vk_tensor_subbuffer(ctx, pool);
+    vk_subbuffer plb = ggml_vk_tensor_subbuffer(ctx, plan);
+    vk_subbuffer mb = ggml_vk_tensor_subbuffer(ctx, meta);
+    vk_subbuffer sb = sinks ? ggml_vk_tensor_subbuffer(ctx, sinks) : qb;
+    vk_subbuffer db = ggml_vk_tensor_subbuffer(ctx, node);
+
+    const uint32_t hkv = (uint32_t) pool->ne[1];
+    const uint32_t bound = ggml_vk_fp_meta_count_bound(meta->ne[0]);
+    FpAttnPush pc{};
+    pc.dk = (uint32_t) pp.dk;
+    pc.dv = (uint32_t) pp.dv;
+    pc.meta_words = (uint32_t) meta->ne[0];
+    pc.plan_words = (uint32_t) plan->ne[0];
+    pc.n_kv = (uint32_t) k->ne[1];
+    pc.f_cap = (uint32_t) pool->ne[2];
+    pc.r_cap = bound;
+    pc.u_cap = bound;
+    pc.c_cap = meta->ne[0] > FP_META_HDR_WORDS ? (uint32_t)(meta->ne[0] - FP_META_HDR_WORDS) : 0u;
+    pc.n_output_cap = (uint32_t) node->ne[2];
+    pc.q_nb1 = (uint32_t) q->nb[1];
+    pc.q_nb2 = (uint32_t) q->nb[2];
+    pc.k_nb1 = (uint32_t) k->nb[1];
+    pc.k_nb2 = (uint32_t) k->nb[2];
+    pc.v_nb1 = (uint32_t) v->nb[1];
+    pc.v_nb2 = (uint32_t) v->nb[2];
+    pc.q_groups_cap = (uint32_t) q->ne[1];
+    pc.q_heads_cap = (uint32_t) q->ne[2];
+    pc.hkv_cap = hkv;
+    pc.sinks_present = sinks ? 1u : 0u;
+    pc.version = FP_VERSION;
+    pc.mean_correction = (uint32_t) pp.mean_correction;
+    pc.scale = pp.scale;
+    pc.softcap = pp.softcap;
+    // One workgroup per packed (source_query, q_head) row; rows are unique
+    // on that key, so n_output_cap * Hq covers every row (guard in-shader).
+    const uint32_t fp_grid = (uint32_t) fp_n_rows;
+    if (fp_n_splits > 1) {
+        if (fp_need > ctx->prealloc_size_split_k) {
+            ctx->prealloc_size_split_k = (size_t) fp_need;
+            ggml_vk_preallocate_buffers(ctx, subctx);
+        }
+        if (ctx->prealloc_split_k_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        const uint64_t fp_ml = fp_n_rows * (uint64_t) fp_n_splits * sizeof(float);
+        const vk_subbuffer scr_m = { ctx->prealloc_split_k, 0, fp_ml };
+        const vk_subbuffer scr_l = { ctx->prealloc_split_k, fp_ml, fp_ml };
+        const vk_subbuffer scr_o = { ctx->prealloc_split_k, 2u * fp_ml,
+            fp_n_rows * (uint64_t) fp_n_splits * (uint64_t) pp.dv * sizeof(float) };
+        ctx->fp_scratch_current = fp_need;
+        if (fp_need > ctx->fp_scratch_peak) {
+            ctx->fp_scratch_peak = fp_need;
+        }
+        for (uint32_t s = 0u; s < fp_n_splits; ++s) {
+            pc.split_phase = 1u;
+            pc.split_id = s;
+            pc.n_splits = fp_n_splits;
+            pc.sink_split = 0u;
+            pc.reserved4 = 0u;
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                        {qb, kb, vb, pb, plb, mb, sb, db, scr_m, scr_l, scr_o},
+                                        pc, {fp_grid, 1, 1});
+        }
+        ggml_vk_sync_buffers(ctx, subctx);
+        FpMergePush mpc{};
+        mpc.dv = (uint32_t) pp.dv;
+        mpc.r_cap = bound;
+        mpc.meta_words = (uint32_t) meta->ne[0];
+        mpc.plan_words = (uint32_t) plan->ne[0];
+        mpc.n_splits_cap = fp_n_splits;
+        mpc.version = FP_VERSION;
+        // Bindings 0/1/2/3/6 dummy (never indexed by MERGE).
+        ggml_vk_dispatch_pipeline(ctx, subctx, merge,
+                                    {qb, qb, qb, qb, plb, mb, qb, db, scr_m, scr_l, scr_o},
+                                    mpc, {fp_grid, 1, 1});
+        ctx->prealloc_split_k_need_sync = true;
+        return;
+    }
+    // Split1 final: writes O to dst; scratch bindings (8/9/10) dummy.
+    // reserved4 == 0 keeps the consumer-side plan-coverage revalidation
+    // (external plans untrusted); direct SELECT output pays the same
+    // bounded check rather than skipping it.
+    pc.split_phase = 0u;
+    pc.split_id = 0u;
+    pc.n_splits = 1u;
+    pc.sink_split = 0u;
+    pc.reserved4 = 0u;
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                {qb, kb, vb, pb, plb, mb, sb, db, qb, qb, qb},
+                                pc, {fp_grid, 1, 1});
 }
 
 static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, uint32_t K, uint32_t NPQ) {
@@ -12264,6 +12714,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 default: return nullptr;
             }
             if (ggml_get_op_params_i32(dst, 1) != 0) {
+                // op_params[2] != 0 is the density-normalized production
+                // contract; == 0 selects the raw-redundant ablation.
+                if (ggml_get_op_params_i32(dst, 2) != 0) {
+                    return ctx->device->pipeline_gated_delta_net_rbb_dense[si];
+                }
                 return ctx->device->pipeline_gated_delta_net_rbb[si];
             }
             return ctx->device->pipeline_gated_delta_net[si][kda];
@@ -13760,18 +14215,22 @@ static void ggml_vk_set_rows(ggml_backend_vk_context * ctx, vk_context& subctx, 
     });
 }
 
-static void ggml_vk_turbo_wht(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+static void ggml_vk_turbo_wht(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     int direction, group_size;
     memcpy(&direction, dst->op_params + 0, sizeof(int));
     memcpy(&group_size, dst->op_params + sizeof(int), sizeof(int));
-    struct { uint32_t ne; uint32_t direction; uint32_t group_size; } pc = {
+    struct { uint32_t ne; uint32_t direction; uint32_t group_size; uint32_t use_scale; } pc = {
         (uint32_t)ggml_nelements(src0), (uint32_t)direction, (uint32_t)group_size,
+        src1 != nullptr ? 1u : 0u,
     };
     vk_pipeline pipeline = ctx->device->pipeline_turbo_wht;
     GGML_ASSERT(pipeline != nullptr);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     vk_subbuffer src_buf = ggml_vk_tensor_subbuffer(ctx, src0, false);
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, false);
+    // InnerQ scale_inv (src[1]) is optional: bind src0 as a dummy when NULL.
+    // The shader never reads binding 2 unless use_scale is set.
+    vk_subbuffer scale_buf = src1 != nullptr ? ggml_vk_tensor_subbuffer(ctx, src1, false) : src_buf;
     // Spread workgroups across Y/Z to stay within maxComputeWorkGroupCount[0].
     const uint32_t n_groups = pc.ne / (uint32_t)group_size;
     std::array<uint32_t, 3> elements;
@@ -13784,7 +14243,7 @@ static void ggml_vk_turbo_wht(ggml_backend_vk_context * ctx, vk_context& subctx,
     }
     // Compute-to-compute RAW/WAW ordering must be explicit on Vulkan.
     ggml_vk_sync_buffers(ctx, subctx);
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, elements);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf, scale_buf }, pc, elements);
     ggml_vk_sync_buffers(ctx, subctx);
 }
 
@@ -16457,7 +16916,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_TURBO_WHT:
-        ggml_vk_turbo_wht(ctx, compute_ctx, src0, node);
+        ggml_vk_turbo_wht(ctx, compute_ctx, src0, src1, node);
 
         break;
     case GGML_OP_XKV_RECONSTRUCT:
@@ -16699,6 +17158,21 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_FLASH_PREFILL_POOL:
+        ggml_vk_flash_prefill_pool(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_FLASH_PREFILL_SELECT:
+        ggml_vk_flash_prefill_select(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_FLASH_PREFILL_ATTN:
+        ggml_vk_flash_prefill_attn(ctx, compute_ctx, node);
+
+        break;
+
     case GGML_OP_RWKV_WKV6:
         ggml_vk_rwkv_wkv6(ctx, compute_ctx, node);
 
@@ -16910,9 +17384,12 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
 }
 
 static int ggml_vk_get_device_count() {
-    ggml_vk_instance_init();
-
-    return vk_instance.device_indices.size();
+    try {
+        ggml_vk_instance_init();
+        return vk_instance.device_indices.size();
+    } catch (...) {
+        return 0;
+    }
 }
 
 static void ggml_vk_get_device_description(int device, char * description, size_t description_size) {
@@ -18563,6 +19040,37 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ggml_vk_synchronize(ctx);
     }
 
+    // FlashPrefill: mirror the CUDA post-check — a nonzero on-device plan
+    // error word fails the graph instead of yielding silent zeros. Gated on
+    // FP ATTN presence, so non-FP graphs pay nothing (no extra sync/read).
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        // SELECT writes its own plan (dst); ATTN consumes a SELECT plan
+        // (src[4]). POOL has no error channel.
+        const ggml_tensor * plan = nullptr;
+        if (node->op == GGML_OP_FLASH_PREFILL_SELECT) {
+            plan = node;
+        } else if (node->op == GGML_OP_FLASH_PREFILL_ATTN) {
+            plan = node->src[4];
+        } else {
+            continue;
+        }
+        if (plan == nullptr) {
+            continue;
+        }
+        if (plan->buffer == nullptr || ggml_nelements(plan) < 11) {
+            continue;
+        }
+        ggml_vk_synchronize(ctx);
+        const vk_subbuffer sub = ggml_vk_tensor_subbuffer(ctx, plan);
+        int32_t plan_err = 0;
+        vk_buffer plan_buf = sub.buffer;
+        ggml_vk_buffer_read(plan_buf, sub.offset + 10 * sizeof(int32_t), &plan_err, sizeof(plan_err));
+        if (plan_err != 0) {
+            return GGML_STATUS_FAILED;
+        }
+    }
+
     return GGML_STATUS_SUCCESS;
 
     UNUSED(backend);
@@ -19360,6 +19868,181 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return true;
             }
+        case GGML_OP_FLASH_PREFILL_POOL:
+            {
+                // True device dispatch (flashprefill_pool.comp); fail closed.
+                const ggml_tensor * k = op->src[0];
+                const ggml_tensor * v = op->src[1];
+                const ggml_tensor * meta = op->src[2];
+                if (k == nullptr || v == nullptr || meta == nullptr) {
+                    return false;
+                }
+                ggml_vk_fp_params pp;
+                if (!ggml_vk_fp_unpack_params(op, FP_OP_POOL, pp)) {
+                    return false;
+                }
+                if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
+                    return false;
+                }
+                if (meta->type != GGML_TYPE_I32 || !ggml_is_contiguous(meta) || meta->ne[0] < FP_META_HDR_WORDS) {
+                    return false;
+                }
+                if (pp.dk < 1 || pp.dv < 1) {
+                    return false;
+                }
+                if (k->ne[0] != pp.dk || v->ne[0] != pp.dv) {
+                    return false;
+                }
+                if (k->ne[1] != v->ne[1] || k->ne[1] < 1) {
+                    return false;
+                }
+                if (k->ne[2] != v->ne[2] || k->ne[2] < 1 || k->ne[3] != 1 || v->ne[3] != 1) {
+                    return false;
+                }
+                if (op->ne[0] != (int64_t) pp.dk + pp.dv || op->ne[1] != k->ne[2] ||
+                    op->ne[2] < 1 || op->ne[3] != 1) {
+                    return false;
+                }
+                if (!ggml_vk_fa_kv_type_ok(k->type) || !ggml_vk_fa_kv_type_ok(v->type)) {
+                    return false;
+                }
+                if ((k->type == GGML_TYPE_BF16) != (v->type == GGML_TYPE_BF16)) {
+                    return false;
+                }
+                if (k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type)) {
+                    return false;
+                }
+                if ((uint64_t) op->ne[2] > device->properties.limits.maxComputeWorkGroupCount[0] ||
+                    (uint64_t) op->ne[1] > device->properties.limits.maxComputeWorkGroupCount[1]) {
+                    return false;
+                }
+                return true;
+            }
+        case GGML_OP_FLASH_PREFILL_SELECT:
+            {
+                const ggml_tensor * q = op->src[0];
+                const ggml_tensor * pool = op->src[1];
+                const ggml_tensor * meta = op->src[2];
+                if (q == nullptr || pool == nullptr || meta == nullptr) {
+                    return false;
+                }
+                ggml_vk_fp_params pp;
+                if (!ggml_vk_fp_unpack_params(op, FP_OP_SELECT, pp)) {
+                    return false;
+                }
+                if (op->type != GGML_TYPE_I32 || !ggml_is_contiguous(op) || op->ne[0] < FP_PLAN_HDR_WORDS) {
+                    return false;
+                }
+                if (meta->type != GGML_TYPE_I32 || !ggml_is_contiguous(meta) || meta->ne[0] < FP_META_HDR_WORDS) {
+                    return false;
+                }
+                if (pp.dk < 1 || pp.dv < 1 || (pp.exact_all != 0 && pp.exact_all != 1)) {
+                    return false;
+                }
+                if (!ggml_vk_fp_float_ok(pp.alpha) || pp.alpha <= 0.0f || pp.alpha > 1.0f) {
+                    return false;
+                }
+                if (!ggml_vk_fp_float_ok(pp.scale) || !ggml_vk_fp_float_ok(pp.softcap) || pp.softcap < 0.0f) {
+                    return false;
+                }
+                if (q->type != GGML_TYPE_F32 || pool->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                if (q->ne[0] != pp.dk || q->ne[1] < 1 || q->ne[2] < 1 || q->ne[3] != 1) {
+                    return false;
+                }
+                if (pool->ne[0] != (int64_t) pp.dk + pp.dv || pool->ne[1] < 1 || pool->ne[3] != 1) {
+                    return false;
+                }
+                if (q->ne[2] % pool->ne[1] != 0) {
+                    return false;
+                }
+                if (q->nb[0] != sizeof(float) || q->nb[1] % sizeof(float) != 0 || q->nb[2] % sizeof(float) != 0) {
+                    return false;
+                }
+                if ((uint64_t) pool->ne[1] > device->properties.limits.maxComputeWorkGroupCount[1]) {
+                    return false;
+                }
+                return true;
+            }
+        case GGML_OP_FLASH_PREFILL_ATTN:
+            {
+                const ggml_tensor * q = op->src[0];
+                const ggml_tensor * k = op->src[1];
+                const ggml_tensor * v = op->src[2];
+                const ggml_tensor * pool = op->src[3];
+                const ggml_tensor * plan = op->src[4];
+                const ggml_tensor * meta = op->src[5];
+                const ggml_tensor * sinks = op->src[6];
+                if (q == nullptr || k == nullptr || v == nullptr ||
+                    pool == nullptr || plan == nullptr || meta == nullptr) {
+                    return false;
+                }
+                ggml_vk_fp_params pp;
+                if (!ggml_vk_fp_unpack_params(op, FP_OP_ATTN, pp)) {
+                    return false;
+                }
+                if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
+                    return false;
+                }
+                if (plan->type != GGML_TYPE_I32 || !ggml_is_contiguous(plan) || plan->ne[0] < FP_PLAN_HDR_WORDS) {
+                    return false;
+                }
+                if (meta->type != GGML_TYPE_I32 || !ggml_is_contiguous(meta) || meta->ne[0] < FP_META_HDR_WORDS) {
+                    return false;
+                }
+                if (pp.dk < 1 || pp.dv < 1 || (pp.mean_correction != 0 && pp.mean_correction != 1)) {
+                    return false;
+                }
+                if (!ggml_vk_fp_float_ok(pp.scale) || !ggml_vk_fp_float_ok(pp.softcap) || pp.softcap < 0.0f) {
+                    return false;
+                }
+                if (q->type != GGML_TYPE_F32 || pool->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                if (!ggml_vk_fa_kv_type_ok(k->type) || !ggml_vk_fa_kv_type_ok(v->type)) {
+                    return false;
+                }
+                if ((k->type == GGML_TYPE_BF16) != (v->type == GGML_TYPE_BF16)) {
+                    return false;
+                }
+                if (q->ne[0] != pp.dk || q->ne[1] < 1 || q->ne[2] < 1 || q->ne[3] != 1) {
+                    return false;
+                }
+                if (k->ne[0] != pp.dk || v->ne[0] != pp.dv) {
+                    return false;
+                }
+                if (k->ne[1] != v->ne[1] || k->ne[1] < 1) {
+                    return false;
+                }
+                if (k->ne[2] != v->ne[2] || k->ne[2] < 1 || k->ne[3] != 1 || v->ne[3] != 1) {
+                    return false;
+                }
+                if (q->ne[2] % k->ne[2] != 0) {
+                    return false;
+                }
+                if (pool->ne[0] != (int64_t) pp.dk + pp.dv || pool->ne[1] != k->ne[2]) {
+                    return false;
+                }
+                if (op->ne[0] != pp.dv || op->ne[1] != q->ne[2] || op->ne[2] < 1 || op->ne[3] != 1) {
+                    return false;
+                }
+                if (sinks != nullptr && (sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks) ||
+                    sinks->ne[0] != q->ne[2])) {
+                    return false;
+                }
+                if (q->nb[0] != sizeof(float) || q->nb[1] % sizeof(float) != 0 || q->nb[2] % sizeof(float) != 0) {
+                    return false;
+                }
+                if (k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type)) {
+                    return false;
+                }
+                const uint64_t n_rows = (uint64_t) op->ne[2] * (uint64_t) op->ne[1];
+                if (n_rows < 1 || n_rows > device->properties.limits.maxComputeWorkGroupCount[0]) {
+                    return false;
+                }
+                return true;
+            }
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
@@ -19689,7 +20372,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_POOL_2D:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_TURBO_WHT:
-            return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 128 == 0;
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % 128 == 0 &&
+                (op->src[1] == nullptr ||
+                 (op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[1])));
         case GGML_OP_XKV_RECONSTRUCT:
             {
                 // 9 srcs: A_K,B_K,A_V,B_V,refs,positions,group_meta,layer_meta,rope_tables. Mixed
@@ -19788,13 +20473,16 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
                 }
                 // Device kernel subset: Q8_0/Turbo4 only (host gates first),
-                // Turbo4 requires whole 128-groups, shader register file <= 1024,
+                // Turbo4 requires whole 128-groups, shader register file
+                // (s_land[256]) caps padded_dim at 256, matching
+                // GGML_XKV_LANDMARK_MAX_PADDED_DIM, the shader bounds check
+                // (xkv_landmark_score.comp:121) and CUDA (xkv-landmark.cu:460),
                 // and the refine hit-bit packs into the refined word (< 2^31).
                 if (p.landmark_type != (uint32_t)GGML_TYPE_Q8_0 &&
                     p.landmark_type != (uint32_t)GGML_TYPE_TURBO4_0) {
                     return false;
                 }
-                if (p.padded_dim == 0 || p.padded_dim > 1024) return false;
+                if (p.padded_dim == 0 || p.padded_dim > 256) return false;
                 if (p.landmark_type == (uint32_t)GGML_TYPE_TURBO4_0 && p.padded_dim % 128u != 0) {
                     return false;
                 }
@@ -19864,6 +20552,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32) {
                         return false;
                     }
+                }
+                // RBB reads the per-writer native overlay as src[6].
+                if (ggml_get_op_params_i32(op, 1) != 0 &&
+                    (op->src[6] == nullptr || op->src[6]->type != GGML_TYPE_F32)) {
+                    return false;
                 }
                 return op->type == GGML_TYPE_F32;
             }
@@ -20162,11 +20855,34 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+// FlashPrefill split-K scratch reporter (device-lane contract): current =
+// bytes currently pinned for FP M/L/O triples, peak = max observed. The
+// backing store is the shared prealloc_split_k pool.
+static enum ggml_status ggml_backend_vk_flashprefill_scratch(ggml_backend_t backend,
+        uint64_t * current, uint64_t * peak) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    if (current != nullptr) {
+        *current = ctx->fp_scratch_current;
+    }
+    if (peak != nullptr) {
+        *peak = ctx->fp_scratch_peak;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_vk_flashprefill_scratch") == 0) {
+        return (void *) ggml_backend_vk_flashprefill_scratch;
+    }
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {
@@ -20523,6 +21239,35 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             if (src_clone[5]) {
                 ggml_flash_attn_ext_add_sinks(tensor_clone, src_clone[5]);
             }
+        } else if (tensor->op == GGML_OP_FLASH_PREFILL_POOL) {
+            ggml_vk_fp_params pp;
+            GGML_ASSERT(ggml_vk_fp_unpack_params(tensor, FP_OP_POOL, pp));
+            tensor_clone = ggml_flash_prefill_pool(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                src_clone[3], src_clone[4], pp.dk, pp.dv, (int32_t) tensor->ne[1], tensor->ne[2]);
+        } else if (tensor->op == GGML_OP_FLASH_PREFILL_SELECT) {
+            ggml_vk_fp_params pp;
+            GGML_ASSERT(ggml_vk_fp_unpack_params(tensor, FP_OP_SELECT, pp));
+            const int32_t * meta = (const int32_t *) src_clone[2]->data;
+            const int64_t meta_words = ggml_nelements(src_clone[2]);
+            int64_t n_tiles = 0;
+            if (ggml_flashprefill_metadata_n_tiles(meta, meta_words, &n_tiles) != GGML_FLASHPREFILL_OK || n_tiles < 1) {
+                n_tiles = 1;
+            }
+            const int64_t n_kv_heads = src_clone[1]->ne[1];
+            const int64_t total = ggml_nelements(tensor);
+            const int64_t denom = 2 * n_tiles * n_kv_heads;
+            int64_t max_sel = 0;
+            if (denom > 0 && total >= FP_PLAN_HDR_WORDS + denom) {
+                max_sel = (total - FP_PLAN_HDR_WORDS - denom) / denom;
+            }
+            tensor_clone = ggml_flash_prefill_select(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                n_tiles, n_kv_heads, max_sel, pp.scale, pp.alpha, pp.softcap, pp.exact_all, pp.mean_correction != 0);
+        } else if (tensor->op == GGML_OP_FLASH_PREFILL_ATTN) {
+            ggml_vk_fp_params pp;
+            GGML_ASSERT(ggml_vk_fp_unpack_params(tensor, FP_OP_ATTN, pp));
+            tensor_clone = ggml_flash_prefill_attn(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                src_clone[3], src_clone[4], src_clone[5], src_clone[6],
+                tensor->ne[2], tensor->ne[1], pp.dv, pp.scale, pp.softcap, pp.mean_correction != 0);
         } else if (tensor->op == GGML_OP_XKV_RECONSTRUCT) {
             ggml_xkv_reconstruct_params p;
             memcpy(&p, tensor->op_params, sizeof(p));

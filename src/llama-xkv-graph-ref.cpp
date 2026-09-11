@@ -1655,6 +1655,15 @@ void xkv_register_native_reconstruct_capability(const char * backend_name, bool 
     native_cap_map()[std::string(backend_name)] = available;
 }
 
+namespace {
+struct xkv_cuda_capability_auto_register {
+    xkv_cuda_capability_auto_register() {
+        xkv_register_native_reconstruct_capability("CUDA", true);
+    }
+};
+static xkv_cuda_capability_auto_register s_xkv_cuda_auto_reg;
+} // namespace
+
 bool xkv_native_reconstruct_available_for(const char * backend_name) {
     if (!backend_name || !backend_name[0]) return false;
     std::lock_guard<std::mutex> lock(native_cap_mutex());
@@ -2925,6 +2934,33 @@ ggml_tensor * new_native_filled_1d(ggml_context * ctx, ggml_type type, int64_t n
     return t;
 }
 
+// Forward/inverse Hadamard rotation via plain matmul (no fast-path hint):
+// y = R x over nrot-sized blocks. The hinted FWHT path varies by backend and
+// is only a performance optimization; plain mul_mat is unambiguously correct
+// on every backend (CPU/CUDA/Vulkan) for these tiny rotation matrices.
+// Shapes mirror llama_mul_mat_hadamard (2D [nrot, N] geom, original dims kept).
+static ggml_tensor * xkv_rotate_block(ggml_context * ctx, ggml_tensor * cur,
+        ggml_tensor * rot, std::string * err) {
+    auto fail = [&](const std::string & m) -> ggml_tensor * {
+        if (err) *err = std::string("xkv_rotate_block: ") + m;
+        return nullptr;
+    };
+    if (!ctx || !cur || !rot) return fail("null ctx/tensor");
+    const int64_t n = rot->ne[0];
+    if (n <= 0 || rot->ne[1] != n) return fail("rotation matrix must be square");
+    const int64_t total = ggml_nelements(cur);
+    if (total <= 0 || total % n != 0) return fail("elements not a multiple of rotation dim");
+    ggml_tensor * flat = ggml_is_contiguous(cur)
+        ? ggml_reshape_2d(ctx, cur, n, total / n)
+        : ggml_cont_2d(ctx, cur, n, total / n);
+    if (!flat) return fail("flatten failed");
+    ggml_tensor * mm = ggml_mul_mat(ctx, rot, flat);
+    if (!mm) return fail("mul_mat failed");
+    ggml_tensor * back = ggml_reshape_4d(ctx, mm, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+    if (!back) return fail("reshape back failed");
+    return back;
+}
+
 enum class xkv_native_score_set_kind : uint8_t {
     sealed_landmarks,
     rebuilt_partial,
@@ -3591,10 +3627,61 @@ ggml_tensor * xkv_build_attention_native(
     if (q_h->ne[0] != (int64_t) DkL || q_h->ne[1] != (int64_t) gqa) return fail("q head layout mismatch");
     const int64_t G = q_h->ne[2];
     if (G <= 0) return fail("q groups nonlinear");
-    if (!snap.hot_k_inv_rot.empty() || !snap.hot_v_inv_rot.empty()) {
-        return fail("custom attention rotation not invertible on native path");
+    // Custom attention rotation on the native path runs the whole chain in the
+    // rotated domain: hot storage stays rotated, Q and reconstructed cold K/V
+    // are forward-rotated below, and the output is inverse-rotated back to
+    // canonical (the Hadamard is self-inverse, so the same matrix inverts).
+    // Dot products are preserved exactly: (QR).(KR) == Q.K.
+    ggml_tensor * rot_k_t = nullptr;
+    ggml_tensor * rot_v_t = nullptr;
+    uint32_t nrot_k = 0;
+    uint32_t nrot_v = 0;
+    if (!snap.hot_k_inv_rot.empty()) {
+        nrot_k = snap.hot_k_rot_dim;
+        if (nrot_k == 0 || snap.hot_k_inv_rot.size() != (size_t) nrot_k * nrot_k) {
+            return fail("custom K rotation matrix size mismatch");
+        }
+        if (DkL % nrot_k != 0) {
+            return fail("custom K rotation dim does not divide head width");
+        }
+        rot_k_t = new_native_filled(ctx, GGML_TYPE_F32, nrot_k, nrot_k,
+            snap.hot_k_inv_rot.data(), (size_t) nrot_k * nrot_k * sizeof(float), out_fills, err);
+        if (!rot_k_t) return nullptr;
     }
-    if (!snap.query_sink_logits.empty()) return fail("snapshot sinks require tensor path");
+    if (!snap.hot_v_inv_rot.empty()) {
+        nrot_v = snap.hot_v_rot_dim;
+        if (nrot_v == 0 || snap.hot_v_inv_rot.size() != (size_t) nrot_v * nrot_v) {
+            return fail("custom V rotation matrix size mismatch");
+        }
+        if (DvL % nrot_v != 0) {
+            return fail("custom V rotation dim does not divide head width");
+        }
+        rot_v_t = new_native_filled(ctx, GGML_TYPE_F32, nrot_v, nrot_v,
+            snap.hot_v_inv_rot.data(), (size_t) nrot_v * nrot_v * sizeof(float), out_fills, err);
+        if (!rot_v_t) return nullptr;
+    }
+    // Per-channel multipliers have no native kernel support: reject explicitly
+    // (previously silently ignored on this path).
+    if (!snap.hot_k_channel_mul.empty() || !snap.hot_v_channel_mul.empty()) {
+        return fail("channel multipliers require tensor path");
+    }
+    if (!snap.query_sink_logits.empty()) {
+        // Broadcast-only sinks are representable via sinks_head; only genuinely
+        // per-query-varying sinks are unrepresentable (bit-exact compare: equal
+        // rows are broadcast by value and remain correct).
+        if (snap.query_sink_logits.size() != NQ) return fail("sink cache query count mismatch");
+        for (uint32_t q = 0; q < NQ; ++q) {
+            if (snap.query_sink_logits[q].size() != snap.n_q_heads) return fail("sink cache head count mismatch");
+        }
+        for (uint32_t q = 1; q < NQ; ++q) {
+            for (uint32_t hh = 0; hh < snap.n_q_heads; ++hh) {
+                if (snap.query_sink_logits[q][hh] != snap.query_sink_logits[0][hh]) {
+                    return fail("per-query-varying sinks unrepresentable on native path");
+                }
+            }
+        }
+        if (!sinks_head) return fail("broadcast sinks present but no sink tensor wired");
+    }
     if (snap.native_params.version != GGML_XKV_VERSION) {
         return fail("native params not wired by builder");
     }
@@ -3651,6 +3738,14 @@ ggml_tensor * xkv_build_attention_native(
     if (k_store->ne[2] != v_store->ne[2]) return fail("hot K/V row spaces differ");
     const int64_t hot_rows_bound = k_store->ne[2];
     if (h >= (uint32_t) k_store->ne[1] || h >= (uint32_t) v_store->ne[1]) return fail("kv head out of storage range");
+    // Rotated-domain block alignment: padded hot widths must be whole rotation
+    // blocks so tail blocks stay pure padding (H*0 == 0 keeps them zero).
+    if (rot_k_t && dim_k % (int64_t) nrot_k != 0) {
+        return fail("custom K rotation dim does not divide padded hot width");
+    }
+    if (rot_v_t && dim_v != 0 && dim_v % (int64_t) nrot_v != 0) {
+        return fail("custom V rotation dim does not divide padded hot width");
+    }
     // ---- Q slots ----
     std::vector<std::vector<uint32_t>> qslots;
     if (!build_native_qslots(snap, G, qslots, err)) return nullptr;
@@ -4262,6 +4357,14 @@ ggml_tensor * xkv_build_attention_native(
         q_use = ggml_cont(ctx, ggml_pad(ctx, q_h, (int) pad, 0, 0, 0));
         if (!q_use) return fail("q pad failed");
     }
+    // Rotated domain: hot K stays storage-rotated, so Q must be forward-rotated
+    // to match ((QR).(KR) == Q.K). Zero padding rotates to zero (H*0 == 0).
+    // Cold K is rotated per tile below; the device SR selector keeps the
+    // original canonical q_h (landmarks are canonical factor products).
+    if (rot_k_t) {
+        q_use = xkv_rotate_block(ctx, q_use, rot_k_t, err);
+        if (!q_use) return fail("q rotation failed");
+    }
     // ---- reconstruct + tile chain ----
     struct tile_desc {
         size_t view_idx = 0;
@@ -4648,13 +4751,26 @@ ggml_tensor * xkv_build_attention_native(
         ap.flags = (first ? GGML_XKV_ATTN_FLAG_FIRST_TILE : 0) | (last ? GGML_XKV_ATTN_FLAG_FINAL_TILE : 0);
         ggml_tensor * st = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
         if (!st) return fail("status tensor failed");
-        ggml_tensor * node = ggml_xkv_attention(ctx, q_use, k_store, v_store, td.k_cold, td.v_cold,
+        // Rotated domain: cold reconstructs canonical factors, so forward-rotate
+        // cold K/V to match rotated Q/hot. Padded tails are whole rotation blocks
+        // of zeros and rotate to zero. Dummy zero tiles rotate to zero (no-op).
+        ggml_tensor * k_cold_use = td.k_cold;
+        ggml_tensor * v_cold_use = td.v_cold;
+        if (rot_k_t) {
+            k_cold_use = xkv_rotate_block(ctx, td.k_cold, rot_k_t, err);
+            if (!k_cold_use) return fail("cold K rotation failed");
+        }
+        if (rot_v_t) {
+            v_cold_use = xkv_rotate_block(ctx, td.v_cold, rot_v_t, err);
+            if (!v_cold_use) return fail("cold V rotation failed");
+        }
+        ggml_tensor * node = ggml_xkv_attention(ctx, q_use, k_store, v_store, k_cold_use, v_cold_use,
             entries_t, offsets_t, first ? sinks_t : nullptr, st, carry, &ap);
         if (!node) return fail("attention node failed");
         // Post-build validation on the real node (no duplicate dst
         // allocation); abandoned on failure, never returned.
         char asup_msg[256] = {};
-        if (!ggml_xkv_attention_supports(q_use, k_store, v_store, td.k_cold, td.v_cold,
+        if (!ggml_xkv_attention_supports(q_use, k_store, v_store, k_cold_use, v_cold_use,
                 entries_t, offsets_t, first ? sinks_t : nullptr, st, carry, node, &ap,
                 asup_msg, sizeof(asup_msg))) {
             if (err) *err = std::string("xkv_build_attention_native: attention unsupported: ") + asup_msg;
@@ -4673,6 +4789,14 @@ ggml_tensor * xkv_build_attention_native(
     if (!out_c) return fail("output cont failed");
     ggml_tensor * out = ggml_reshape_2d(ctx, out_c, (int64_t) DvL * gqa, NQ);
     if (!out) return fail("output reshape failed");
+    // Rotated domain: attention output is O*R (linear combo of rotated V);
+    // inverse-rotate to canonical O. The Hadamard is self-inverse, so the same
+    // matrix inverts. DvL is a whole number of rotation blocks, so blocks never
+    // cross head boundaries.
+    if (rot_v_t) {
+        out = xkv_rotate_block(ctx, out, rot_v_t, err);
+        if (!out) return fail("output inverse rotation failed");
+    }
     return out;
 }
 

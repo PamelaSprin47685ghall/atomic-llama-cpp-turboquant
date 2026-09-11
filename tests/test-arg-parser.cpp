@@ -271,6 +271,193 @@ static void test(void) {
     }
 
     {
+        // FlashPrefill V2 policy defaults (PREFILL.md §12): OFF with frozen v1 values.
+        common_params fp_defaults;
+        assert(fp_defaults.flashprefill.mode == LLAMA_FLASHPREFILL_MODE_OFF);
+        assert(fp_defaults.flashprefill.tail_scope == LLAMA_FLASHPREFILL_TAIL_LOGICAL_PROMPT);
+        assert(fp_defaults.flashprefill.alpha == LLAMA_FLASHPREFILL_DEFAULT_ALPHA);
+        assert(fp_defaults.flashprefill.block_q == LLAMA_FLASHPREFILL_DEFAULT_BLOCK_Q);
+        assert(fp_defaults.flashprefill.block_k == LLAMA_FLASHPREFILL_DEFAULT_BLOCK_K);
+        assert(fp_defaults.flashprefill.sink_blocks == LLAMA_FLASHPREFILL_DEFAULT_SINK_BLOCKS);
+        assert(fp_defaults.flashprefill.window_blocks == LLAMA_FLASHPREFILL_DEFAULT_WINDOW_BLOCKS);
+        assert(fp_defaults.flashprefill.dense_tail_tiles == LLAMA_FLASHPREFILL_DEFAULT_DENSE_TAIL_TILES);
+        assert(fp_defaults.flashprefill.min_kv == LLAMA_FLASHPREFILL_DEFAULT_MIN_KV);
+        assert(fp_defaults.flashprefill.full_attn_layers == LLAMA_FLASHPREFILL_DEFAULT_FULL_ATTN_LAYERS);
+        assert(fp_defaults.flashprefill.mean_correction == true);
+        assert(fp_defaults.flashprefill.exact_all == false);
+
+        // Default OFF transfers verbatim into versioned context params.
+        const auto fp_default_cparams = common_context_params_to_llama(fp_defaults);
+        assert(fp_default_cparams.flashprefill.mode == LLAMA_FLASHPREFILL_MODE_OFF);
+        assert(fp_default_cparams.flashprefill.version == LLAMA_FLASHPREFILL_CONFIG_VERSION);
+        assert(fp_default_cparams.flashprefill.struct_size == sizeof(struct llama_flashprefill_config));
+        assert(fp_default_cparams.flashprefill.alpha == LLAMA_FLASHPREFILL_DEFAULT_ALPHA);
+
+        // Mode enum parsing.
+        common_params fp_mode;
+        argv = {"binary_name", "--flashprefill", "auto"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_mode, LLAMA_EXAMPLE_SERVER));
+        assert(fp_mode.flashprefill.mode == LLAMA_FLASHPREFILL_MODE_AUTO);
+        // No switch implicitly enables Tri/RERoT or disables MTP routing.
+        assert(!fp_mode.triattention_enabled);
+        assert(!fp_mode.rerot_enabled);
+        assert(fp_mode.speculative.types.size() == 1 && fp_mode.speculative.types[0] == COMMON_SPECULATIVE_TYPE_NONE);
+
+        argv = {"binary_name", "--flashprefill", "required"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_mode, LLAMA_EXAMPLE_SERVER));
+        assert(fp_mode.flashprefill.mode == LLAMA_FLASHPREFILL_MODE_REQUIRED);
+
+        argv = {"binary_name", "--flashprefill", "off"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_mode, LLAMA_EXAMPLE_SERVER));
+        assert(fp_mode.flashprefill.mode == LLAMA_FLASHPREFILL_MODE_OFF);
+
+        const char * invalid_modes[] = {"", "AUTO", "on", "exact", "sparse", "autox"};
+        for (const char * mode : invalid_modes) {
+            common_params fp_invalid;
+            argv = {"binary_name", "--flashprefill", mode};
+            assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_invalid, LLAMA_EXAMPLE_SERVER));
+        }
+
+        // Alpha: finite and in (0, 1].
+        common_params fp_alpha;
+        argv = {"binary_name", "--flashprefill-alpha", "0.5"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_alpha, LLAMA_EXAMPLE_SERVER));
+        assert(fp_alpha.flashprefill.alpha == 0.5f);
+        argv = {"binary_name", "--flashprefill-alpha", "1"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_alpha, LLAMA_EXAMPLE_SERVER));
+        assert(fp_alpha.flashprefill.alpha == 1.0f);
+
+        const char * invalid_alphas[] = {"0", "-0.1", "1.1", "2", "nan", "inf", "-inf", "abc", "", "0.1x"};
+        for (const char * alpha : invalid_alphas) {
+            common_params fp_invalid;
+            argv = {"binary_name", "--flashprefill-alpha", alpha};
+            assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_invalid, LLAMA_EXAMPLE_SERVER));
+        }
+
+        // BM: positive integers <= 256 (safe signed parse with overflow checks).
+        common_params fp_bq;
+        for (const char * valid : {"1", "128", "256"}) {
+            argv = {"binary_name", "--flashprefill-block-q", valid};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_bq, LLAMA_EXAMPLE_SERVER));
+        }
+        assert(fp_bq.flashprefill.block_q == 256u);
+        const char * invalid_bq[] = {"0", "-1", "257", "1024", "128x", "abc", "", "9999999999999999999999"};
+        for (const char * bq : invalid_bq) {
+            common_params fp_invalid;
+            argv = {"binary_name", "--flashprefill-block-q", bq};
+            assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_invalid, LLAMA_EXAMPLE_SERVER));
+        }
+
+        // BN: multiples of 64 in [64, 1024].
+        common_params fp_bk;
+        for (const char * valid : {"64", "128", "1024"}) {
+            argv = {"binary_name", "--flashprefill-block-k", valid};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_bk, LLAMA_EXAMPLE_SERVER));
+        }
+        assert(fp_bk.flashprefill.block_k == 1024u);
+        const char * invalid_bk[] = {"0", "1", "32", "63", "65", "100", "1088", "-128", "128x", "abc", "", "9999999999999999999999"};
+        for (const char * bk : invalid_bk) {
+            common_params fp_invalid;
+            argv = {"binary_name", "--flashprefill-block-k", bk};
+            assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_invalid, LLAMA_EXAMPLE_SERVER));
+        }
+
+        // Non-negative counts: sink, window, dense tail, min-kv, full-attn-layers.
+        common_params fp_counts;
+        argv = {"binary_name", "--flashprefill-sink-blocks", "0", "--flashprefill-window-blocks", "6",
+                "--flashprefill-dense-tail-tiles", "0", "--flashprefill-min-kv", "0",
+                "--flashprefill-full-attn-layers", "3"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_counts, LLAMA_EXAMPLE_SERVER));
+        assert(fp_counts.flashprefill.sink_blocks == 0u);
+        assert(fp_counts.flashprefill.window_blocks == 6u);
+        assert(fp_counts.flashprefill.dense_tail_tiles == 0u);
+        assert(fp_counts.flashprefill.min_kv == 0u);
+        assert(fp_counts.flashprefill.full_attn_layers == 3u);
+        // Valid policy values without a mode still preserve OFF.
+        assert(fp_counts.flashprefill.mode == LLAMA_FLASHPREFILL_MODE_OFF);
+
+        const char * count_opts[] = {"--flashprefill-sink-blocks", "--flashprefill-window-blocks",
+            "--flashprefill-dense-tail-tiles", "--flashprefill-min-kv", "--flashprefill-full-attn-layers"};
+        const char * invalid_counts[] = {"-1", "-128", "4x", "abc", "", "99999999999", "9999999999999999999999"};
+        for (const char * opt : count_opts) {
+            for (const char * count : invalid_counts) {
+                common_params fp_invalid;
+                argv = {"binary_name", opt, count};
+                assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_invalid, LLAMA_EXAMPLE_SERVER));
+            }
+        }
+
+        // Tail scope enum.
+        common_params fp_tail;
+        argv = {"binary_name", "--flashprefill-tail-scope", "call"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_tail, LLAMA_EXAMPLE_SERVER));
+        assert(fp_tail.flashprefill.tail_scope == LLAMA_FLASHPREFILL_TAIL_CALL);
+        argv = {"binary_name", "--flashprefill-tail-scope", "logical-prompt"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_tail, LLAMA_EXAMPLE_SERVER));
+        assert(fp_tail.flashprefill.tail_scope == LLAMA_FLASHPREFILL_TAIL_LOGICAL_PROMPT);
+        const char * invalid_scopes[] = {"", "prompt", "CALL", "logical_prompt", "callx"};
+        for (const char * scope : invalid_scopes) {
+            common_params fp_invalid;
+            argv = {"binary_name", "--flashprefill-tail-scope", scope};
+            assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_invalid, LLAMA_EXAMPLE_SERVER));
+        }
+
+        // Mean correction on/off (off is ablation only).
+        common_params fp_mean;
+        argv = {"binary_name", "--flashprefill-mean-correction", "off"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_mean, LLAMA_EXAMPLE_SERVER));
+        assert(fp_mean.flashprefill.mean_correction == false);
+        argv = {"binary_name", "--flashprefill-mean-correction", "on"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_mean, LLAMA_EXAMPLE_SERVER));
+        assert(fp_mean.flashprefill.mean_correction == true);
+        const char * invalid_means[] = {"", "yes", "true", "1", "ON", "offx"};
+        for (const char * mean : invalid_means) {
+            common_params fp_invalid;
+            argv = {"binary_name", "--flashprefill-mean-correction", mean};
+            assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_invalid, LLAMA_EXAMPLE_SERVER));
+        }
+
+        // Exact-all debug gate.
+        common_params fp_exact;
+        argv = {"binary_name", "--flashprefill-exact-all"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_exact, LLAMA_EXAMPLE_SERVER));
+        assert(fp_exact.flashprefill.exact_all == true);
+        assert(fp_exact.flashprefill.mode == LLAMA_FLASHPREFILL_MODE_OFF);
+
+        // Invalid combo: enabled mode with an out-of-range block still fails clearly.
+        {
+            common_params fp_invalid;
+            argv = {"binary_name", "--flashprefill", "required", "--flashprefill-block-k", "100"};
+            assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_invalid, LLAMA_EXAMPLE_SERVER));
+        }
+        {
+            common_params fp_invalid;
+            argv = {"binary_name", "--flashprefill", "auto", "--flashprefill-alpha", "nan"};
+            assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_invalid, LLAMA_EXAMPLE_SERVER));
+        }
+
+        // Enabled config transfers by value into context params.
+        {
+            common_params fp_on;
+            argv = {"binary_name", "--flashprefill", "required", "--flashprefill-alpha", "0.5",
+                    "--flashprefill-block-q", "64", "--flashprefill-block-k", "256",
+                    "--flashprefill-tail-scope", "call", "--flashprefill-mean-correction", "off",
+                    "--flashprefill-exact-all"};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), fp_on, LLAMA_EXAMPLE_SERVER));
+            const auto fp_on_cparams = common_context_params_to_llama(fp_on);
+            assert(fp_on_cparams.flashprefill.mode == LLAMA_FLASHPREFILL_MODE_REQUIRED);
+            assert(fp_on_cparams.flashprefill.alpha == 0.5f);
+            assert(fp_on_cparams.flashprefill.block_q == 64u);
+            assert(fp_on_cparams.flashprefill.block_k == 256u);
+            assert(fp_on_cparams.flashprefill.tail_scope == LLAMA_FLASHPREFILL_TAIL_CALL);
+            assert(fp_on_cparams.flashprefill.mean_correction == false);
+            assert(fp_on_cparams.flashprefill.exact_all == true);
+            assert(!fp_on.triattention_enabled);
+            assert(!fp_on.rerot_enabled);
+        }
+    }
+
+    {
         printf("test-arg-parser: test XKV parameters\n\n");
 
         // 1. Confirm default OFF values and preservation of legacy fields
@@ -1123,13 +1310,22 @@ static void test(void) {
                 assert(gate.error == "XKV vulkan-hybrid factorizer is not yet implemented; rejected");
             }
 
-            // Unfinished CUDA backend fail-closed when enabled (exact error pinned)
+            // CUDA device factorizer is supported (symmetric with Vulkan); only REFERENCE keeps the device-residency rejection
             {
                 common_params prog = p_vk_tqf;
                 prog.xkv_factorizer = LLAMA_XKV_FACTORIZER_CUDA;
                 const common_xkv_gate gate = common_xkv_validate_stage0(prog);
+                assert(gate.ok);
+            }
+
+            // REFERENCE + CUDA factorizer rejection (symmetric with Vulkan)
+            {
+                common_params prog = p_vk_tqf;
+                prog.xkv_storage_profile = LLAMA_XKV_STORAGE_PROFILE_REFERENCE;
+                prog.xkv_factorizer = LLAMA_XKV_FACTORIZER_CUDA;
+                const common_xkv_gate gate = common_xkv_validate_stage0(prog);
                 assert(!gate.ok);
-                assert(gate.error == "XKV CUDA factorizer is not supported; rejected");
+                assert(gate.error == "XKV reference profile requires cpu-reference factorizer (device residency not supported for reference)");
             }
 
             // Unfinished prerope-capture source fail-closed when enabled

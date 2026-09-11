@@ -769,8 +769,11 @@ static void tri_score_carved(
                     htup[nht * 4 + 3] = c.location.row;
                     ++nht;
                 } else if (c.location.kind == xkv_location_kind::flat_quantized) {
-                    throw std::runtime_error(
-                        "score_candidate_subset: flat_quantized candidates unsupported by hot provider");
+                    // Canonical flat decode: flat_quantized candidates decode (dequant/turbo decode
+                    // to pre-RoPE K) via the canonical host provider and merge into ktile scoring.
+                    hpos[nh] = t;
+                    hcell[nh] = c.cell_index;
+                    ++nh;
                 } else {
                     hpos[nh] = t;
                     hcell[nh] = c.cell_index;
@@ -1338,7 +1341,7 @@ static void tri_build_carved(
             plan.evicted_cells.push_back(c.cell_index);
             plan.physical_freed++;
 
-            if (c.location.kind == xkv_location_kind::hot) {
+            if (c.location.kind == xkv_location_kind::hot || c.location.kind == xkv_location_kind::flat_quantized) {
                 plan.hot_slots_freed++;
             } else if (c.location.kind == xkv_location_kind::factored) {
                 plan.factored_rows_freed++;
@@ -1678,7 +1681,7 @@ xkv_tri_reclaim_proposal xkv_tri_adapter::create_reclaim_proposal(
 
     for (uint64_t pid : prop.plan.evicted_payloads) {
         const auto * c = tri_pid_find(pid);
-        if (c && c->location.kind == xkv_location_kind::hot) {
+        if (c && (c->location.kind == xkv_location_kind::hot || c->location.kind == xkv_location_kind::flat_quantized)) {
             prop.released_hot_payloads.push_back(pid);
             prop.released_hot_rows.push_back(c->location.row);
         }

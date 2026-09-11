@@ -1634,17 +1634,27 @@ static void test_stale_stamp_and_floor_exhausted() {
     TEST_ASSERT(prop_idle.plan.references_removed == 0);
     TEST_ASSERT(prop_idle.plan.survivor_payloads.size() == 4);
 
-    // Scenario A3: flat_quantized candidates fail closed without hot provider
+    // Scenario A3: flat_quantized candidates succeed with canonical flat decode
     std::vector<xkv_tri_candidate> flat_cands = candidates;
     flat_cands[0].location.kind = xkv_location_kind::flat_quantized;
-    // Now with pressure, scorable candidate triggers fail-closed. With the
+    // Now with pressure, scorable candidate is scored successfully. With the
     // test ratio 0.5 the target must stay below the 4 candidates: L=6 gives
     // max(1, ceil(3)) = 3 < 4, so all non-recent rows (incl. flat) are scored.
     seq0.logical_tokens = 6;
     seq0.frontier_pos = 9;
     seq0.tail_guard = 1;
     auto prop_flat = adapter.create_reclaim_proposal(flat_cands, {seq0}, {slice}, store, pressure, opts);
-    TEST_ASSERT_MSG(prop_flat.status == xkv_tri_proposal_status::score_error, "flat_quantized candidates must fail closed");
+    TEST_ASSERT_MSG(prop_flat.status == xkv_tri_proposal_status::success, "flat_quantized candidates must score successfully");
+    TEST_ASSERT(!prop_flat.plan.survivor_payloads.empty());
+    TEST_ASSERT(prop_flat.plan.references_removed > 0);
+
+    // Verify score_candidate_subset directly produces valid non-error scores for flat_quantized candidates
+    std::vector<uint32_t> sub_indices = {0, 1, 2, 3};
+    std::vector<float> flat_pooled(4, 0.0f);
+    adapter.score_candidate_subset(flat_cands, sub_indices, {slice}, store, seq0.frontier_pos, flat_pooled.data(), nullptr, opts.hot_provider);
+    for (uint32_t i = 0; i < 4; ++i) {
+        TEST_ASSERT_MSG(std::isfinite(flat_pooled[i]), "flat_quantized candidate scores must be finite");
+    }
 
     // Scenario B: Stale stamp retry detection
     // Make seq0 longer so it wants to evict

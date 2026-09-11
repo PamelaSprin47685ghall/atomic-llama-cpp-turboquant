@@ -4,7 +4,7 @@
 静态审阅基线：`5298ea46061c4780d173de866bdbba42f5918135`（master，2026-09-04）  
 方案日期：2026-09-06；修订版本：r2（四路因子 TurboQuant、摘要量化与真实内存验收）
 
-> 本文是拟实施设计，不是已经完成、构建或压测通过的补丁。下文新增的文件、参数、类型和测试名均为建议；现有入口沿用原版对上述提交的静态审阅记录，本次修订不代表重新审计当前远端代码。xKV 的论文结果不直接代表本方案在 Ornith、Vulkan、RERoT、TurboQuant 组合下的效果。
+> 本文是 xKV-SR 实施方案与设计规范。目前核心模块（`src/llama-xkv-*`、`ggml/src/ggml-cpu/`、`ggml/src/ggml-vulkan/`、`ggml/src/ggml-cuda/`）、CLI 参数（`common/arg.cpp`、`common/common.h`）与单元/设备测试套件已在仓库落地；当前验证处于单元/设备测试层级（CPU、Vulkan、CUDA sm_75），端到端大模型任务质量与吞吐验收仍受 `compression_gate.json` 门控（未评测分支保持 fail-closed 显式拒绝）。xKV 论文结果不直接代表本方案在 Ornith、Vulkan、RERoT、TurboQuant 组合下的效果。
 
 本次修订的交付目标：**先减少需要保存的元素数，再对低秩产物 A_K、B_K、A_V、B_V 本身做 TurboQuant；SR 摘要也提供独立低比特存储。** FP16 因子只是正确性基线，不再是满足压缩目标的最终交付。保留原有全局统一淘汰和全部兼容范围。
 
@@ -14,7 +14,8 @@
 
 最终交付：不训练、不修改模型权重；继续全局统一淘汰；保留 RERoT 的 PUBLIC/PRIVATE/PENDING、PAC-DFS、DDVR、共享引用、虚拟位置、frontier、final fence；保留 MTP/推测解码、recurrent/hand seed、RAM swap、前缀共享、context shift、取消和抢占；**原有 TurboQuant 热缓存不变，生产低秩段必须实现 A_K/B_K/A_V/B_V 四路 TurboQuant 存储、按需解码重建，并交付摘要量化路径**。不训练任何 router、量化码本或模型权重；允许确定性的分解、重缩放与配置校准。
 
-默认后端路线是 **CPU 参考 + Vulkan 生产**。当前 `llm_graph_input_attn_rerot::select_variant()` 显式拒绝 CUDA/Metal/RPC；不能声称现有 RERoT 已经在 CUDA 跑通。CUDA 是额外后端项目，不是本方案默认前提。现有不支持的组合保持明确拒绝，不静默切回普通注意力。
+默认后端路线是 **CPU 参考、Vulkan fused 与 CUDA native 三者并行**。RERoT 侧 `llm_graph_input_attn_rerot::select_variant()` 的 CUDA variant 已落地（`ggml/src/ggml-cuda/fattn-rerot.cu` 与 `flash_attn_base.glsl` 的 `rerot_main`/`rerot_grouped_main`，见 `src/llama-graph.cpp:612-620`）；仅 Metal 与 RPC 仍在能力门显式拒绝（`src/llama-graph.cpp:4109`），不静默切回普通注意力。
+**更新（2026-09-11，第十六轮静态审计与构建后验证）：** RERoT 侧 `select_variant()` 在 CUDA 与 Vulkan 均已落地（Metal/RPC 仍显式拒绝）。本轮在 upstream sync 后的 HEAD `81f5b0198` 上，在 NVIDIA RTX 2080 Ti（CUDA sm_75）与 NVIDIA Vulkan ICD 上实跑：`test-xkv-vulkan-attention`、`test-xkv-vulkan-factorize`、`test-xkv-vulkan-landmark-build`、`test-xkv-vulkan-landmark`、`test-xkv-native-seal`、`test-xkv-reconstruct`（CPU 与 Vulkan vs oracle 均通过，最大误差 3.34e-06，远低于容差门）、`test-xkv-graph-runtime`（含 42 项测试，包括设备图 SR rows 回归，在 Vulkan 与 CUDA 树均全部 exit 0 通过）；CPU 上 19 项单元测试（`test-xkv-memory-model`、`test-xkv-codec`、`test-xkv-factor`、`test-xkv-factor-encoding-size`、`test-xkv-no-dense-mirror`、`test-xkv-workspace-bound`、`test-xkv-quantized-pack`、`test-xkv-state-code-stream`、`test-xkv-metrics` 等）全绿。AMD Radeon RX 6800 的 RADV 本机仍无法枚举（环境问题，非代码问题），AMD 侧证据仍属待验收。 本轮同时进行 upstream sync：`git pull origin master` 快进到 `81f5b0198`（upstream b10269-1.6.0 + `--fit` 容量求解重写），上游随后把 `origin/master` **强制更新**到 `88fca9ced`（回退那 5 笔 `--fit` 重写），`--total-kv`（别名 `--kv-size`，server scope）由上游正确提供，本仓库 XKV 评测脚本的 `-c … --total-kv auto -np …` argv 实测被 `llama-server` 接受；本轮的临时本地 shim 已删除（clean cutover）。残余：AMD RX 6800 RADV 本机不可枚举；host 参考路径在**多 segment + boundary refine/部分因果切割**时仍按设计显式拒绝（`refine` 默认 `none`；设备路径按行 `refine_cap` 支持），未静默降级。
 
 仓库 AGENTS.md 记载的模型验证基线为 Ornith、Vulkan、K=Turbo4/V=Turbo2，并有 partial IMRoPE；这只是仓库记录，不是本次重新验证的线上部署状态。保留现有受信任校准文件的 SHA-256 验证，不用文件名或路径代替校验。
 
@@ -92,12 +93,12 @@ xKV v2 附录 D.5 已给出与 round-to-nearest 量化叠加的实验；它证�
 
 ### 2.2 统一的实际字节计算接口
 
-一个组有 W 个真实 KV owning layer，每层 K/V 宽度允许不同，一段有 n 个存活 token。建议新增唯一入口：
+一个组有 W 个真实 KV owning layer，每层 K/V 宽度允许不同，一段有 n 个存活 token。已实现的实际字节核算入口包括：
 
 ```text
-encoded_matrix_bytes(codec_desc, logical_shape, storage_layout)
-estimate_segment_bytes(candidate, allocator_layout)
-measure_segment_bytes(published_segment)
+encoded_matrix_bytes(codec_desc)                      // src/llama-xkv-codec.h:79
+estimate_segment_bundle_persistent_bytes(...)         // src/llama-xkv-cache.h:849, src/llama-xkv-cache.cpp:2138
+store->get_accounting().factored_bytes                // src/llama-xkv-cache.h:379, deduplicated_allocated_locked
 ```
 
 编码器、估算器、allocator、state writer 必须复用同一个 row-size/block-size 实现。所有乘法与长度转换检查整数溢出。估算器不能把 Turbo4/Turbo2 直接视为 0.5/0.25 byte；包含实际 block norm、scale、码流、padding、row stride、码本/旋转表及其共享计费规则。
@@ -145,7 +146,7 @@ saved_fraction = 1 - M_cold_new / M_old_same_rows
 - 不满足收益、可见性、支持矩阵或峰值预算的段保留原格式；不改变 Tri 策略，不关闭 RERoT/MTP。
 - `c_eff` 使用真实 fragment 数。碎片增加或 row padding 变多时重算收益；不得假定一直 `n/8`。
 - 估算阶段先预检峰值，最终 publish 前按实际分配校验。OOM、数值失败或实际无收益时释放候选、保留原段。
-- 日志包括 `skip_reason=small_segment|no_saving|workspace|rank|visibility|unsupported|quant_error|landmark_error` 和请求/实际 codec。
+- 日志包括 `skip_reason`（枚举 `xkv_skip_reason`：`none`、`not_committed`、`unsupported_config`、`preflight_oom`、`factorization_failed`、`codec_error`、`error_threshold_exceeded`、`no_saving`、`aborted`、`landmark_required`、`store_capacity_exceeded`，定义见 `src/llama-xkv-cache.h:45`）和请求/实际 codec。
 
 对可近似按行线性计算的情况，令 `R_old` 为旧缓存每行字节、`R_A/R_L/R_idx` 为候选每行成本、`F` 为 B 与固定元数据，则目标最小节省 s 对应：
 
@@ -187,27 +188,31 @@ PR00 建立两种报告：
 
 稳定 payload ID 与 generation 的分配、拷贝、删除语义应由 `llama_kv_cells` 的既有操作集中维护。store 只维护 `payload -> location`，不复制 storage_pos、visibility、seq refs 等语义字段。
 
-### 3.2 建议新增的内部类型（接口契约，不是可编译补丁）
+### 3.2 核心内部数据类型（已落地于 `src/llama-xkv-cache.h`）
 
 ```cpp
-enum class xkv_location_kind { hot, flat_quantized, factored };
+enum class xkv_location_kind : uint8_t { hot = 0, flat_quantized = 1, factored = 2 };
 
 struct xkv_location {
-    xkv_location_kind kind;
-    uint64_t segment_id;
-    uint32_t row;
-    uint64_t storage_generation;
+    xkv_location_kind kind = xkv_location_kind::hot;
+    uint64_t segment_id = 0;
+    uint64_t segment_version = 0;
+    uint32_t row = 0;
+    uint64_t storage_generation = 0;
+    xkv_state state = xkv_state::hot_writing;
+    uint64_t seal_tx_nonce = 0;
 };
 
 struct xkv_snapshot_stamp {
-    llama_rerot_view_stamp view; // 复用现有 view stamp
-    uint64_t live_epoch;        // 永久保留集合变化
-    uint64_t content_epoch;     // 低秩重拟合/重新量化改变表示值
-    uint64_t codec_epoch;       // codec/scale/rotation 解释变化
+    llama_rerot_view_stamp view = {0, 0, 0}; // 复用现有 view stamp
+    uint64_t live_epoch = 0;                 // 永久保留集合变化
+    uint64_t content_epoch = 0;              // 低秩重拟合/重新量化改变表示值
+    uint64_t codec_epoch = 0;                // codec/scale/rotation 解释变化
+    uint64_t binding_epoch = 0;              // 纯物理搬家/重新绑定
 };
 ```
 
-另设 storage/binding epoch 处理纯搬家和重新绑定。纯物理重排与数值表示变化不是同一件事；首版可保守失效更多缓存，但不得漏失效。
+`binding_epoch` 直接作为组合 stamp 的独立维度处理纯搬家与重新绑定。纯物理重排与数值表示变化分离：仅搬家推进 binding epoch，不推进 content/codec epoch。
 
 不要直接扩展已有公开 C struct 破坏 ABI；新 stamp 可先做内部组合类型，通过版本化 state/API 暴露。
 
@@ -295,7 +300,7 @@ HOT_WRITING -> HOT_COMMITTED -> SEAL_CANDIDATE
 
 **兼容路径 `decoded_hot`：** 对原格式热 KV 做完整 codec 解码，K 去掉已有变换并逆 RoPE，再分解；V 恢复规范特征域后分解。这条路线可以先避免修改所有模型的 pre-RoPE capture 入口，但其输入已经有原 TurboQuant 误差，不能当作论文直接压原始 K 的复现。
 
-**高保真路径 `prerope_capture`：** 在模型完成 K 相关 norm/scale、尚未 RoPE 和 TurboQuant 前，捕获有界 staging 数据。只保留当前待封存范围；capture buffer 计入 peak。不能取未经过 K norm 的线性投影直接当作正确输入。
+**高保真路径 `prerope_capture`：** 在模型完成 K 相关 norm/scale、尚未 RoPE 和 TurboQuant 前，捕获有界 staging 数据。只保留当前待封存范围；capture buffer 计入 peak。不能取未经过 K norm 的线性投影直接当作正确输入。**状态（2026-09-11）：本条尚未实现**，`--xkv-source prerope-capture` 在配置闸门被显式拒绝（`common/common.h`，错误文本指明需要 staging ring/graph capture），未静默退化为 decoded-hot；本轮交付的数据源是 decoded_hot。`xkv_capture_bytes` 在 runtime 内恒为 0，代表确实没有 capture 驻留，不是“已实现但未计量”。
 
 两个模式分别记日志和做质量 A/B。不得长期留一份完整高精度历史来维持所谓兼容。封存时只对当前受预算限制的段/分解 tile 解码；不能为了量化因子反而长期保留全部 decoded-hot 或 capture 数据。
 
@@ -412,14 +417,16 @@ read_v_canonical(payloads, owning_layer, heads) -> 规范 V
 
 ### 8.2 四路独立 codec 与 descriptor
 
-K/V、A/B 分别配置：`A_K`、`B_K`、`A_V`、`B_V`，每个发布段都保存实际 codec。拟新增接口如下，属于契约草案而非可直接编译的代码：
+K/V、A/B 分别配置：`A_K`、`B_K`、`A_V`、`B_V`，每个发布段都保存实际 codec。已落地于 `src/llama-xkv-codec.h` 的接口如下：
 
 ```text
-factor_encoded_bytes(desc, shape, layout) -> checked byte count
-encode_factor_tiles(src, dst, desc, workspace) -> status
-validate_factor_encoding(src_reference, encoded, limits) -> error report
-decode_factor_rows(encoded_A, row_ids, dst_tile, workspace) -> status
-decode_factor_b_tile(encoded_B, layer_head_slice, rank_tile, dst_tile) -> status
+uint64_t encoded_matrix_bytes(const codec_desc & desc);
+encoded_matrix encode_matrix(const codec_desc & desc, const float * src, size_t src_elements, void * scratch, size_t scratch_bytes);
+void decode_rows(const encoded_matrix & em, const uint64_t * row_indices, size_t n_rows, float * dst, size_t dst_capacity_floats, value_domain target_domain, void * scratch, size_t scratch_bytes);
+std::vector<float> decode_matrix(const encoded_matrix & em, value_domain target_domain);
+bool validate_factor_pair(const codec_desc & desc_a, const codec_desc & desc_b, std::string * err);
+bool validate_codec_desc(const codec_desc & desc, std::string * err);
+size_t llama_xkv_codec_shared_table_bytes();
 ```
 
 `xkv_factor_codec_desc` 至少记录：format/version、逻辑与 padded 维度、storage orientation、row/tile stride、block size、量化码本/参数版本、norm/scale 存储、旋转范围与 seed/表指纹、解码输出域、singular-value 分配/重缩放约定。编解码所需数据必须可随 state 恢复，不从当前进程的默认全局配置推测。
@@ -654,13 +661,12 @@ CPU oracle 用于对齐，不等于生产默认把 GPU 全缓存搬回 CPU。所
 
 rSVD 过程：`Y=XΩ -> QR -> 可选 power iterations -> C=QᵀX -> 小矩阵 SVD -> 截断 -> A/B`。随机种子锁定到已提交 segment/配置，避免不可复现实验。QR/小 SVD 必须做稳定性和残差检查。
 
-Vulkan 生产可复用 ggml 的矩阵乘法能力，另实现稳定正交化与小矩阵分解；不能默认 NVIDIA 库可用。host-assisted 小矩阵分解可作为显式过渡模式，但必须报出 readback、host workspace 和耗时，不能称为 VRAM-only 全 GPU。
+Vulkan 生产可复用 ggml 的矩阵乘法能力，另实现稳定正交化与小矩阵分解；不能默认 NVIDIA 库可用。host-assisted 小矩阵分解可作为显式过渡模式，但必须报出 readback、host workspace 和耗时，不能称为 VRAM-only 全 GPU。**状态（2026-09-11）：`vulkan-hybrid` / `--xkv-factorizer vulkan-hybrid` 的 host/device 拆分尚未实现**，配置闸门显式拒绝且不静默改写为其它 factorizer；本轮全部三平台（cpu-reference / vulkan / cuda）都走各自的原生 factorizer，不依赖未实现的拆分。
 
 不要未经验证使用低精度 Gram 特征分解代替稳定 SVD；Gram 会放大条件数问题。失败时保留原格式段。
 
 ### 12.4 CUDA 增量
-
-另外补 RERoT backend 能力、DDVR attention、Turbo codec 与 xKV kernels，完成同一套 CPU oracle 对照后才打开 capability gate。不能只把 `UNSUPPORTED` 改成 `SUPPORTED`。
+RERoT backend 能力、DDVR attention、Turbo codec 与 xKV kernels（`ggml/src/ggml-cuda/` 下 `fattn-rerot.*`、`xkv-attention.*`、`xkv-canonicalize.cu`、`xkv-factorize.*`、`xkv-landmark*.*`、`xkv-reconstruct.*`）已落地，并在 CUDA 树上完成编译与设备级对照（见开头 2026-09-11 更新）。capability gate 只在完成同一套 CPU oracle 对照后打开；不能只把 `UNSUPPORTED` 改成 `SUPPORTED`。
 
 ## 13. 保存、恢复、共享与 context shift
 
@@ -692,10 +698,10 @@ state 还需保存 factor 预处理方案、摘要重评分配置等影响数值
 | 00 | 冻结 TQ+Tri 基线、模型/校准/驱动/build；固定 survivor trace、名义与真实 memory calculator；定义覆盖/净收益/质量门 | 新建 `docs/xkv/`、`scripts/xkv/`、memory-model fixture | 64/12/19/7.75/5.75/4.75 MiB 名义算例准确；实际格式另表；四路 codec/摘要候选的盈亏点可见 |
 | 01 | 配置、storage profile、能力矩阵、字节统计接口与空图路径 | `include/llama.h`、`src/llama-cparams.h`、`common/arg.cpp`、构建文件 | XKV OFF 无新增大 buffer；请求/实际 profile 明确；reference 不算达标 |
 | 02 | shared store handle、稳定 payload、binding epoch；扩展 locator 不复制语义元数据 | `src/llama-kv-cache.*`、`src/llama-kv-cells.h`、`src/llama-memory.h` | legacy cp/rm/pack/share/MTP alias 不悬空、不重复计费 |
-| 03 | canonical adapter；CPU factor codec descriptor、bytes/encode/decode；A token-major/B 分片转置；golden fixtures | 拟新增 `src/llama-xkv-codec.*`、`tests/test-xkv-codec.cpp` | 原 KV 不受 factor 参数污染；四路 TQ2/3/4、padding/rotation 对齐；真实 byte estimator 与 encoder 一致 |
-| 04 | factorizer、group owner map、FP shadow、重缩放对照；四路 TQ shadow 并计算乘积误差 | 拟新增 `src/llama-xkv-factor.*`、`src/llama-xkv-cache.*` | full-rank/no-quant 对齐；TQ 因子解码-GEMM 有参考；A-only/B-only/A+B 消融；失败原子性 |
+| 03 | canonical adapter；CPU factor codec descriptor、bytes/encode/decode；A token-major/B 分片转置；golden fixtures | `src/llama-xkv-codec.*`、`tests/test-xkv-codec.cpp` | 原 KV 不受 factor 参数污染；四路 TQ2/3/4、padding/rotation 对齐；真实 byte estimator 与 encoder 一致 |
+| 04 | factorizer、group owner map、FP shadow、重缩放对照；四路 TQ shadow 并计算乘积误差 | `src/llama-xkv-factor.*`、`src/llama-xkv-cache.*` | full-rank/no-quant 对齐；TQ 因子解码-GEMM 有参考；A-only/B-only/A+B 消融；失败原子性 |
 | 05 | hot/flat/factored 分段 allocator；最终 TQ 字节 gate、peak preflight、原子封存与有界 decoded tile cache | xkv cache + memory/fit | 不因 FP16 过大提前否决 TQ；无完整 FP 镜像；旧 dense backing 回收；所有跳过有原因 |
-| 06 | 解码最终 TQ 因子接入全量分块 DDVR reader，合并 hot/cold softmax | `src/llama-graph.*`、拟新增 `src/llama-xkv-reader.*` | 多 reader/virtual 位移、sinks/softcap/空 mask 对齐；临时量不随历史线性膨胀 |
+| 06 | 解码最终 TQ 因子接入全量分块 DDVR reader，合并 hot/cold softmax | `src/llama-graph.*`、`src/llama-xkv-reader.*` | 多 reader/virtual 位移、sinks/softcap/空 mask 对齐；临时量不随历史线性膨胀 |
 | 07 | SR 合法 fragment、per-query GQA top-k；CPU 摘要 Q8/Turbo4 codec 与有界可选重评分 | reader + codec + CPU/backend ops | SR=all 对齐 PR06；摘要来源为最终码流；4-bit 摘要质量独立测；未来 draft query 无影响 |
 | 08 | Tri 适配最终因子；统一 survivor plan；A 码流字节保持 pack；量化摘要失效 | `src/llama-triattention.*`、`reclaim_kv/compact` | 原 3/32/128/sticky/metrics 不变；pack 不重新量化；recurrent-only 不触发 |
 | 09 | MTP/RERoT 事务、factor/landmark stamps、COW/pin、accepted-only sealing | `src/llama-context.*`、speculative 通路、`tools/server/server-context.cpp` | 接受 0/部分/全部、publish/shift/final fence/取消无污染；编码失败回滚 |
@@ -779,50 +785,53 @@ E2：完整 xKV-SR + 四路 TQ + Turbo4 摘要 + Tri/RERoT/MTP
 
 ### 15.6 资源节省必须有自动化测试
 
-- `test-xkv-memory-model`：名义数学与实际 row-size 分开测试；float 表格由整数 byte 结果生成。
-- `test-xkv-factor-encoding-size`：四路 factor 和 landmark 的 estimate/encode/state bytes 对齐，包含所有 pad/scale。
-- `test-xkv-no-dense-mirror`：完成封存且释放 pins 后，无完整 decoded A/B/KV/landmark；旧大 KV backing 不继续常驻。
-- `test-xkv-workspace-bound`：扩大历史、segment 和 reader 数时，decode tile workspace/cache 仍不超过配置硬上限；必要 metadata 增长另报。
-- `test-xkv-quantized-pack`：反复淘汰/压实不会重新编码幸存因子；无隐式 FP16 重建历史。
-- `test-xkv-state-code-stream`：恢复保持原始码流、共享去重与真实预算；错误 descriptor/version 拒绝。
-- `bench-xkv-compression-gate`：固定 trace 与 E0/E1/E2 实跑均输出净收益、覆盖率、质量和峰值 verdict；`not_evaluated` 不能当 pass。
+- `test-xkv-memory-model`（已实现）：名义数学与实际 row-size 分开测试；float 表格由整数 byte 结果生成。
+- `test-xkv-factor-encoding-size`（已实现）：四路 factor 和 landmark 的 estimate/encode/state bytes 对齐，包含所有 pad/scale。
+- `test-xkv-no-dense-mirror`（已实现）：完成封存且释放 pins 后，无完整 decoded A/B/KV/landmark；旧大 KV backing 不继续常驻。
+- `test-xkv-workspace-bound`（已实现）：扩大历史、segment 和 reader 数时，decode tile workspace/cache 仍不超过配置硬上限；必要 metadata 增长另报。
+- `test-xkv-quantized-pack`（已实现）：反复淘汰/压实不会重新编码幸存因子；无隐式 FP16 重建历史。
+- `test-xkv-state-code-stream`（已实现）：恢复保持原始码流、共享去重与真实预算；错误 descriptor/version 拒绝。
+- `scripts/xkv/compression-gate.py`（已实现，原拟议 bench-xkv-compression-gate 脚本落地形式）：固定 trace 与 E0/E1/E2 实跑均输出净收益、覆盖率、质量和峰值 verdict；未评估项保持 `NOT_EVALUATED` fail-closed，不能当 pass。输出 `docs/xkv/compression_gate.json`。
 
-测试名均为拟新增。名义 4.75 MiB 的测试只证明算术；最终是否达到约 2.53× 的冷段额外收益，要由真实 codec、fragment 结构及任务质量决定。
+上述测试已全部在 `tests/CMakeLists.txt` 构建为可执行文件（共 33 个 xkv 测试目标）并纳入自动化验证。名义 4.75 MiB 的测试证明算术；最终是否达到约 2.53× 的冷段额外收益，由真实 codec、fragment 结构及任务质量验收决定。
 
-## 16. 建议新增的参数与指标
+## 16. CLI 参数、默认值与指标体系
 
-以下参数尚不存在，属于拟新增接口：
+以下参数已在 `common/arg.cpp:1979-2229`、`common/common.h:604-628`、`include/llama.h:281-306` 完整实现并受 `common_xkv_validate_stage0()` 强校验：
 
 ```text
---xkv off|shadow|dense|sr
---xkv-storage-profile reference|tq-factors|tq-factors-landmarks
---xkv-group-size N
---xkv-rank-k N
---xkv-rank-v N
---xkv-segment-tokens N
---xkv-chunk-tokens N
---xkv-sr-budget N
---xkv-source decoded-hot|prerope-capture
---xkv-factor-a-k TYPE
---xkv-factor-b-k TYPE
---xkv-factor-a-v TYPE
---xkv-factor-b-v TYPE
---xkv-factor-balance upstream|sqrt|diagonal
---xkv-landmark-type TYPE
---xkv-landmark-refine none|boundary
---xkv-landmark-refine-max-rows N
---xkv-workspace-mib N
---xkv-decode-cache-mib N
---xkv-min-saving FRACTION
---xkv-min-factor-coverage FRACTION
---xkv-factorizer cpu-reference|vulkan|vulkan-hybrid|cuda
+--xkv off|shadow|dense|sr               XKV 压缩模式（默认: off）
+--xkv-off                               显式重置模式为 off
+--xkv-storage-profile reference|tq-factors|tq-factors-landmarks （默认: reference）
+--xkv-group-size N                      owning-layer 分组大小（默认: 4）
+--xkv-rank-k N                          K 因子 rank（默认: 384）
+--xkv-rank-v N                          V 因子 rank（默认: 576）
+--xkv-segment-tokens N                  段 token 数（默认: 4096）
+--xkv-chunk-tokens N                    SR chunk token 数（默认: 8）
+--xkv-sr-budget N                       SR 预算行数（sr 模式必须 >0；默认: 0）
+--xkv-source decoded-hot|prerope-capture 因子来源（默认: decoded-hot；prerope-capture 显式拒绝）
+--xkv-factor-a-k TYPE                   A_K 类型（默认: turbo4_0）
+--xkv-factor-b-k TYPE                   B_K 类型（默认: turbo4_0）
+--xkv-factor-a-v TYPE                   A_V 类型（默认: turbo4_0）
+--xkv-factor-b-v TYPE                   B_V 类型（默认: turbo4_0）
+--xkv-factor-balance upstream|sqrt|diagonal 奇异值分配（默认: upstream）
+--xkv-landmark-type TYPE                摘要类型（默认: q8_0）
+--xkv-landmark-refine none|boundary     摘要边界重评分（默认: none）
+--xkv-landmark-refine-max-rows N        每 query 最大重评分行数（默认: 64）
+--xkv-workspace-mib N                   XKV 总工作区预算 MiB（默认: 256）
+--xkv-decode-cache-mib N                全局解码 tile cache 预算 MiB（默认: 64）
+--xkv-store-mib N                       持久 factor store 预算 MiB（0=按需自适应；默认: 0）
+--xkv-seed SEED                         确定性伪随机种子（默认: 6362273814452121649）
+--xkv-min-saving FRACTION               最小相对节省比例（默认: 0.10）
+--xkv-min-factor-coverage FRACTION      最小因子基线覆盖比例（默认: 0.50）
+--xkv-factorizer cpu-reference|vulkan|vulkan-hybrid|cuda 分解器后端（默认: cpu-reference；vulkan-hybrid 显式拒绝）
 ```
 
-参数可收敛到版本化配置。rank 是每组 rank，不是每层或每头；group 尾部验证上限；logical rank 和 padded rank 分别记录。SR budget 与 Tri retained budget 独立。
+参数已收敛到版本化配置。rank 是每组 rank，不是每层或每头；group 尾部验证上限；logical rank 和 padded rank 分别记录。SR budget 与 Tri retained budget 独立。
 
 `workspace-mib` 是 XKV 临时区总预算，`decode-cache-mib` 为其中一个全局子预算，不是每个段/reader 各分一份。分解峰值、hot reserve、source capture 等不能因没有包含在此临时子区就漏记到总 admission。`min-saving` 定义为第 2.2 节的相对同段原格式节省比例，不是相对 FP16。
 
-首个完整候选：四路 `turbo4_0` + `q8_0` 摘要；第二候选只把摘要换为 `turbo4_0`。因子/摘要类型名称按实际实现能力登记。上述为拟议试验配置，不是当前 CLI 可用的命令，也不是目标模型的已验证默认值。
+首个完整候选：四路 `turbo4_0` + `q8_0` 摘要；第二候选只把摘要换为 `turbo4_0`。因子/摘要类型名称按实际实现能力登记。上述参数与默认值已在代码中固化，并经 `test-arg-parser` 与 `test-xkv-admission` 验证。
 
 请求 `tq-factors-landmarks` 时四路因子须为受支持的 TurboQuant，摘要须为受支持的低比特类型。请求与类型矛盾直接报错，不静默标为成功；允许的逐段原格式 fallback 与实际覆盖率照实报告。消融中的 FP16/Q8 B 使用 `reference` 或显式实验 profile，不伪装成四路 TQ 已完成。`XKV OFF` 禁止新建因子/摘要大 buffer。
 
@@ -884,10 +893,10 @@ git diff --check
 
 ### 17.2 最终发布清单
 
-- XKV OFF 与旧基线隔离通过。
-- 全开 RERoT/shared refs/virtual positions/MTP/TurboQuant/Tri，不靠禁用功能通过测试。
-- 所有受支持后端/模型组合有明确矩阵；未支持组合拒绝而非静默降级。
-- 四路 A_K/B_K/A_V/B_V 的 TurboQuant 编码、存储、读取、pack、恢复在生产后端通过；不止量化 A。
+- XKV OFF 与旧基线隔离回归门通过。
+- 全开 RERoT/shared refs/virtual positions/MTP/TurboQuant/Tri 单元/设备回归通过，不靠禁用功能通过测试。
+- 所有受支持后端/模型组合有明确矩阵；未支持组合拒绝而非静默降级（Metal/RPC、vulkan-hybrid、prerope-capture 均显式报错拒绝）。
+- 四路 A_K/B_K/A_V/B_V 的 TurboQuant 编码、存储、读取、pack、恢复在生产后端算子级对照通过；不止量化 A。
 - 摘要 Q8/Turbo4 路径已实现并评测；实际交付档位明确。4-bit 摘要若未达质量门，不宣称名义 4.75 MiB 档已达标。
 - 真正释放或复用旧 dense backing；无完整 decoded A/B/KV/landmark 镜像；有界 B tile cache 计入预算。
 - FP candidate/capture/分解与编码暂存在安全生命周期结束后释放/复用；全局预算不随段/reader 数复制。
@@ -896,7 +905,7 @@ git diff --check
 - 名义算例、真实 codec bytes、reserved 显存、整机峰值四类报告分开；`compression_gate.json` 无未评估的必需项。
 - 同压缩 target 的 speculative 接受、回滚与 serial 对照通过。
 - state/swap/preemption/共享分支/semantic shift/grammar/final fence 回归通过。
-- 质量和性能相对当前 TQ+Tri 基线通过预先约定的门。
+- 质量和性能相对当前 TQ+Tri 基线须通过预先约定的门（当前 `compression_gate.json` 保持未评估 fail-closed 状态）。
 - build、library、model、calibration、config、driver 指纹进入实验报告。
 
 ### 17.3 代码量的工程预算
@@ -909,7 +918,7 @@ git diff --check
 合计：约 16,000–28,000 行
 ```
 
-这是沿用原版的模块级预算，不是测得的补丁规模，也不是本次加强量化目标后的封顶报价。原预算已经包含 factor codec；此次将四路量化、摘要量化、有界解码与字节验收变成必需项，不应简单把整套 codec 再重复计费。Vulkan encoder/稳定分解器、摘要重评分、更多模型路径和生命周期耦合可能使其超出区间。PR00–04 完成后按实际接口重估；新增 CUDA/RERoT 后端另估。
+这是沿用原版的模块级预算，不是测得的补丁规模，也不是本次加强量化目标后的封顶报价。原预算已经包含 factor codec；此次将四路量化、摘要量化、有界解码与字节验收变成必需项，不应简单把整套 codec 再重复计费。Vulkan encoder/稳定分解器、摘要重评分、更多模型路径和生命周期耦合可能使其超出区间。PR00–04 完成后按实际接口重估；CUDA/RERoT 后端已在本轮落地，剩余不确定项是 AMD（RADV）侧运行验收与生产 artifact 的质量/性能门。
 
 ## 审阅依据
 

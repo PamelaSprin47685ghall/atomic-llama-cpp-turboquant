@@ -331,12 +331,27 @@ public:
         int xkv_mode = 0;
         int storage_profile = 0;
         bool cpu_branch = true;
+        // Codec combination (XKV-SR contract 4/5): factor/landmark codecs,
+        // factorizer, SR budget and chunking change native topology/arenas.
+        // Graphs built under one combination must never be reused for another.
+        int factorizer = 0;
+        int factor_a_k = 0;
+        int factor_b_k = 0;
+        int factor_a_v = 0;
+        int factor_b_v = 0;
+        int landmark_type = 0;
+        uint32_t sr_budget = 0;
+        uint32_t chunk_tokens = 0;
         bool operator==(const xkv_reuse_key & o) const {
             // No n_kv: bounded hot views are fixed-capacity pool views, so
             // storage shapes are stable across ubatches by pool invariant
             // (HotSafety); logical cache growth does not reshape them.
             return n_tokens == o.n_tokens && xkv_mode == o.xkv_mode &&
-                storage_profile == o.storage_profile && cpu_branch == o.cpu_branch;
+                storage_profile == o.storage_profile && cpu_branch == o.cpu_branch &&
+                factorizer == o.factorizer && factor_a_k == o.factor_a_k &&
+                factor_b_k == o.factor_b_k && factor_a_v == o.factor_a_v &&
+                factor_b_v == o.factor_b_v && landmark_type == o.landmark_type &&
+                sr_budget == o.sr_budget && chunk_tokens == o.chunk_tokens;
         }
         bool operator!=(const xkv_reuse_key & o) const { return !(*this == o); }
     };
@@ -459,7 +474,7 @@ public:
 // - First-CPU-prototype hatch: LLAMA_REROT_DISABLE_GRAPH_REUSE=1 forces a
 //   rebuild whenever RERoT is active. The capacity-bucketed reuse-key design
 //   stays authoritative regardless.
-// - Unsupported backends (no RERoT kernel today: CUDA / Metal / RPC) take an
+// - Unsupported backends (no RERoT kernel today: Metal / RPC) take an
 //   explicit capability-error path (throw), never silent stock attention.
 // RERoT OFF: none of this runs; ordinary graph construction is byte-identical.
 //
@@ -467,7 +482,8 @@ public:
 enum class llm_rerot_kernel_variant : uint8_t {
     REROT_KERNEL_CPU = 0,
     REROT_KERNEL_VULKAN_FUSED = 1,
-    REROT_KERNEL_UNSUPPORTED = 2,
+    REROT_KERNEL_CUDA = 2,
+    REROT_KERNEL_UNSUPPORTED = 3,
 };
 
 struct llm_rerot_span_reuse_key {
@@ -626,7 +642,7 @@ struct llm_graph_fp_key {
     int32_t  k_type = -1; // ggml_type tag of the K cache tensor at build
     int32_t  v_type = -1; // ggml_type tag of the V cache tensor at build
     int32_t  n_pos  = 1;  // positions per token (model-fixed; q_pos stride)
-    int32_t  backend_variant = 0; // 0 = unset, 1 = CPU reference, 2 = Vulkan fused
+    int32_t  backend_variant = 0; // 0 = unset, 1 = CPU reference, 2 = Vulkan fused, 3 = CUDA native
 
     // The metadata is shared by layers, but their K/V formats need not be.
     // Indexed by logical layer; (-1,-1) denotes an ineligible layer.
@@ -1931,7 +1947,7 @@ struct llm_graph_context {
     // map present) also route dense but size nothing. Never guesses known.
     bool flashprefill_is_reserve_snapshot() const;
 
-    // CPU + Vulkan run the sparse kernels; every other backend (CUDA, Metal,
+    // CPU + Vulkan + CUDA run the sparse kernels; every other backend (Metal,
     // RPC, ...) is unsupported (dense in AUTO, throw in REQUIRED). Mirrors
     // the RERoT backend scan; the native kernel matrix itself is owned by
     // VulkanDispatch/CpuKernels.

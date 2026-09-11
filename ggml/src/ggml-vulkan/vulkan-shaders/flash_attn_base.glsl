@@ -393,6 +393,7 @@ const uint32_t REROT_MAXC = (Bc + REROT_COL_GROUPS - 1u) / REROT_COL_GROUPS;
 // Use -FLT_MAX/2 rather than -inf to reduce the possibility of NaNs, matching
 // the ordinary path's convention.
 const float REROT_NEG = -1.7014117e38;
+const float REROT_NAN = 0.0 / 0.0;
 
 // One subgroup owns one Q head; the whole workgroup stages each K/V tile
 // once for every head in the group. Per-head accumulators stay in registers.
@@ -417,7 +418,8 @@ void rerot_grouped_main() {
     const uint HSV4 = HSV / 4u;
     const int off_b = rerot_offsets[q];
     const int off_e = rerot_offsets[q + 1u];
-    const uint len = off_e > off_b && off_b >= 0 ? uint(off_e - off_b) : 0u;
+    bool poison = (off_b < 0 || off_e < off_b || uint(off_e) > p.nem1);
+    const uint len = (!poison && off_e > off_b) ? uint(off_e - off_b) : 0u;
     const uint base = off_b > 0 ? uint(off_b) : 0u;
     const uint chunk = (len + S - 1u) / S;
     uint begin = base + split * chunk;
@@ -434,8 +436,12 @@ void rerot_grouped_main() {
     uint previous_group = 0xffffffffu;
 
     while (begin < end) {
-        const uint group = uint(rerot_entries[2u * begin + 1u]);
-        const bool group_ok = group < p.nem2;
+        const int group_signed = rerot_entries[2u * begin + 1u];
+        const bool group_ok = (group_signed >= 0 && uint(group_signed) < p.nem2);
+        if (!group_ok) {
+            poison = true;
+        }
+        const uint group = uint(group_signed);
         // Find the first group boundary cooperatively within this tile.
         // There is no serial scan of the reader's entire key range.
         if (tid == 0u) {
@@ -463,9 +469,15 @@ void rerot_grouped_main() {
             const uint d = idx % HSK4;
             vec4 value = vec4(0.0);
             if (begin + c < tile_end && group_ok) {
-                const uint key = uint(rerot_entries[2u * (begin + c)]);
-                if (KV_bounds_check == false || key < p.KV) {
-                    value = rerot_load_k(key, d, p.nb11, k_offset);
+                const int key_signed = rerot_entries[2u * (begin + c)];
+                if (KV_bounds_check) {
+                    if (key_signed < 0 || uint(key_signed) >= p.KV) {
+                        poison = true;
+                    } else {
+                        value = rerot_load_k(uint(key_signed), d, p.nb11, k_offset);
+                    }
+                } else {
+                    value = rerot_load_k(uint(key_signed), d, p.nb11, k_offset);
                 }
             }
             rerot_kvsh[c * REROT_KV_STRIDE + d] = value;
@@ -478,7 +490,11 @@ void rerot_grouped_main() {
             const uint e = begin + c;
             bool ok = e < tile_end && group_ok;
             if (ok && KV_bounds_check) {
-                ok = uint(rerot_entries[2u * e]) < p.KV;
+                const int k_chk = rerot_entries[2u * e];
+                if (k_chk < 0 || uint(k_chk) >= p.KV) {
+                    poison = true;
+                    ok = false;
+                }
             }
             float score = REROT_NEG;
             if (ok) {
@@ -494,6 +510,9 @@ void rerot_grouped_main() {
                 }
                 if (LOGIT_SOFTCAP) {
                     score = p.logit_softcap * tanh(score);
+                }
+                if (isnan(score)) {
+                    poison = true;
                 }
             }
             scores[count] = score;
@@ -517,9 +536,15 @@ void rerot_grouped_main() {
             const uint d = idx % HSV4;
             vec4 value = vec4(0.0);
             if (begin + c < tile_end && group_ok) {
-                const uint key = uint(rerot_entries[2u * (begin + c)]);
-                if (KV_bounds_check == false || key < p.KV) {
-                    value = rerot_load_v(key, d, p.nb21, v_offset);
+                const int key_signed = rerot_entries[2u * (begin + c)];
+                if (KV_bounds_check) {
+                    if (key_signed < 0 || uint(key_signed) >= p.KV) {
+                        poison = true;
+                    } else {
+                        value = rerot_load_v(uint(key_signed), d, p.nb21, v_offset);
+                    }
+                } else {
+                    value = rerot_load_v(uint(key_signed), d, p.nb21, v_offset);
                 }
             }
             rerot_kvsh[c * REROT_KV_STRIDE + d] = value;
@@ -544,6 +569,16 @@ void rerot_grouped_main() {
         begin = tile_end;
     }
 
+    // Poison must enter the cross-lane reduction: key-OOB / NaN scores are
+    // detected by only some lanes, and NaN through the shuffle adds makes the
+    // whole row NaN on every lane (matching the CPU reference's poisoned row).
+    if (poison) {
+        L = REROT_NAN;
+        M = REROT_NAN;
+        for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+            O[di] = vec4(REROT_NAN);
+        }
+    }
     for (uint st = 1u; st < SubGroupSize; st <<= 1u) {
         L += subgroupShuffleXor(L, st);
     }
@@ -567,7 +602,7 @@ void rerot_grouped_main() {
     const uint flat_row = h + p.ne2 * q;
     const uint n_flat = p.ne2 * p.N;
     const uint out_base = S == 1u ? flat_row * HSV4 : (n_flat * split + flat_row) * HSV4;
-    const float normalization = S == 1u ? (L > 0.0 ? 1.0 / L : 0.0) : 1.0;
+    const float normalization = S == 1u ? (L != 0.0 ? 1.0 / L : 0.0) : 1.0;
     if (col_group == 0u) {
         for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
             const uint d = di * D_split + d_tid;
@@ -634,7 +669,8 @@ void rerot_main() {
     // the split-K reduce.
     const int off_b = rerot_offsets[q];
     const int off_e = rerot_offsets[q + 1u];
-    const uint len  = (off_e > off_b && off_b >= 0) ? uint(off_e - off_b) : 0u;
+    bool poison = (off_b < 0 || off_e < off_b || uint(off_e) > p.nem1);
+    const uint len  = (!poison && off_e > off_b) ? uint(off_e - off_b) : 0u;
     const uint base = (off_b > 0) ? uint(off_b) : 0u;
     const uint chunk = (len + S - 1u) / S;
     const uint my_b = base + s * chunk;
@@ -664,14 +700,16 @@ void rerot_main() {
     // stages Q once. Run detection is uniform across the workgroup.
     uint run_b = my_b;
     while (run_b < my_e) {
-        const uint g = uint(rerot_entries[2u * run_b + 1u]);
+        const int g_signed = rerot_entries[2u * run_b + 1u];
+        const bool run_ok = (g_signed >= 0 && uint(g_signed) < p.nem2);
+        if (!run_ok) {
+            poison = true;
+        }
+        const uint g = uint(g_signed);
         uint run_e = run_b + 1u;
         while (run_e < my_e && uint(rerot_entries[2u * run_e + 1u]) == g) {
             ++run_e;
         }
-        // Out-of-range groups are excluded (treated as -inf); the layout
-        // builder never emits them, this only guards against garbage.
-        const bool run_ok = (g < p.nem2);
 
         if (run_ok) {
             const uint q_base = g * q_grp_stride + (h * p.nb02) / 4u;
@@ -692,9 +730,15 @@ void rerot_main() {
                     const uint e = b + c;
                     vec4 Kv = vec4(0.0);
                     if (e < b_end && run_ok) {
-                        const uint key = uint(rerot_entries[2u * e]);
-                        if (KV_bounds_check == false || key < p.KV) {
-                            Kv = rerot_load_k(key, d, k_stride, k_offset);
+                        const int key_signed = rerot_entries[2u * e];
+                        if (KV_bounds_check) {
+                            if (key_signed < 0 || uint(key_signed) >= p.KV) {
+                                poison = true;
+                            } else {
+                                Kv = rerot_load_k(uint(key_signed), d, k_stride, k_offset);
+                            }
+                        } else {
+                            Kv = rerot_load_k(uint(key_signed), d, k_stride, k_offset);
                         }
                     }
                     rerot_kvsh[c * REROT_KV_STRIDE + d] = Kv;
@@ -711,8 +755,11 @@ void rerot_main() {
                 float sc = REROT_NEG;
                 bool ok = false;
                 if (e < b_end && run_ok) {
-                    const uint key = uint(rerot_entries[2u * e]);
-                    if (KV_bounds_check == false || key < p.KV) {
+                    const int key_signed = rerot_entries[2u * e];
+                    if (KV_bounds_check && (key_signed < 0 || uint(key_signed) >= p.KV)) {
+                        poison = true;
+                    } else {
+                        const uint key = uint(key_signed);
                         vec4 acc = vec4(0.0);
                         if (SHMEM_STAGING != 0) {
                             for (uint d = d_tid; d < HSK4; d += D_split) {
@@ -731,6 +778,9 @@ void rerot_main() {
                         }
                         if (LOGIT_SOFTCAP) {
                             sc = p.logit_softcap * tanh(sc);
+                        }
+                        if (isnan(sc)) {
+                            poison = true;
                         }
                         ok = true;
                     }
@@ -789,9 +839,15 @@ void rerot_main() {
                     const uint e = b + c;
                     vec4 Vv = vec4(0.0);
                     if (e < b_end && run_ok) {
-                        const uint key = uint(rerot_entries[2u * e]);
-                        if (KV_bounds_check == false || key < p.KV) {
-                            Vv = rerot_load_v(key, d, v_stride, v_offset);
+                        const int key_signed = rerot_entries[2u * e];
+                        if (KV_bounds_check) {
+                            if (key_signed < 0 || uint(key_signed) >= p.KV) {
+                                poison = true;
+                            } else {
+                                Vv = rerot_load_v(uint(key_signed), d, v_stride, v_offset);
+                            }
+                        } else {
+                            Vv = rerot_load_v(uint(key_signed), d, v_stride, v_offset);
                         }
                     }
                     rerot_kvsh[c * REROT_KV_STRIDE + d] = Vv;
@@ -819,9 +875,15 @@ void rerot_main() {
                     } else {
                         Vv = vec4(0.0);
                         if (e < b_end && run_ok) {
-                            const uint key = uint(rerot_entries[2u * e]);
-                            if (KV_bounds_check == false || key < p.KV) {
-                                Vv = rerot_load_v(key, d, v_stride, v_offset);
+                            const int key_signed = rerot_entries[2u * e];
+                            if (KV_bounds_check) {
+                                if (key_signed < 0 || uint(key_signed) >= p.KV) {
+                                    poison = true;
+                                } else {
+                                    Vv = rerot_load_v(uint(key_signed), d, v_stride, v_offset);
+                                }
+                            } else {
+                                Vv = rerot_load_v(uint(key_signed), d, v_stride, v_offset);
                             }
                         }
                     }
@@ -834,6 +896,16 @@ void rerot_main() {
         run_b = run_e;
     }
 
+    // Poison must enter the cross-lane reduction: key-OOB / NaN scores are
+    // detected by only some lanes, and NaN through the shuffle/shared adds
+    // makes the whole row NaN on every lane (CPU reference poisons the row).
+    if (poison) {
+        Lf = REROT_NAN;
+        Mf = REROT_NAN;
+        for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+            Of[di] = vec4(REROT_NAN);
+        }
+    }
     // Every block max was workgroup-wide, so Mf is already identical across
     // threads. Reduce only the disjoint L/O column partials.
     if (SubGroupSize > 0u) {
@@ -908,7 +980,7 @@ void rerot_main() {
     }
 
     // Empty ranges (Lf == 0) yield zeros, matching the CPU reference.
-    const float rcp = (Lf == 0.0f) ? 0.0f : (1.0f / Lf);
+    const float rcp = (Lf != 0.0f) ? (1.0f / Lf) : 0.0f;
 
     if (S == 1u) {
         // Contiguous dst [Dv, n_head_q, n_queries] (asserted host-side).

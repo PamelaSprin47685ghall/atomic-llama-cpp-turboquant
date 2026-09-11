@@ -1148,13 +1148,6 @@ inline common_xkv_gate common_xkv_validate_stage0(const common_params & params) 
         return gate;
     }
 
-    // CUDA factorizer rejected
-    if (params.xkv_factorizer == LLAMA_XKV_FACTORIZER_CUDA) {
-        gate.ok = false;
-        gate.error = "XKV CUDA factorizer is not supported; rejected";
-        return gate;
-    }
-
     // Vulkan-hybrid factorizer is unfinished: fail closed before allocation.
     if (params.xkv_factorizer == LLAMA_XKV_FACTORIZER_VULKAN_HYBRID) {
         gate.ok = false;
@@ -1177,10 +1170,11 @@ inline common_xkv_gate common_xkv_validate_stage0(const common_params & params) 
         return gate;
     }
 
-    // Reference profile has no device-resident production path: a Vulkan
-    // factorizer with reference must not silently become DEVICE_OWNED.
+    // Reference profile has no device-resident production path: a device
+    // factorizer (Vulkan/CUDA) with reference must not silently become DEVICE_OWNED.
     if (params.xkv_storage_profile == LLAMA_XKV_STORAGE_PROFILE_REFERENCE &&
-        params.xkv_factorizer == LLAMA_XKV_FACTORIZER_VULKAN) {
+        (params.xkv_factorizer == LLAMA_XKV_FACTORIZER_VULKAN ||
+         params.xkv_factorizer == LLAMA_XKV_FACTORIZER_CUDA)) {
         gate.ok = false;
         gate.error = "XKV reference profile requires cpu-reference factorizer (device residency not supported for reference)";
         return gate;

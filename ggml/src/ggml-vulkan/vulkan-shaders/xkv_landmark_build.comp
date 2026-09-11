@@ -94,6 +94,10 @@ const float C4[16] = float[16](
     -0.051262, -0.035597, -0.020989, -0.006938,
      0.006938,  0.020989,  0.035597,  0.051262,
      0.068756,  0.089527,  0.117195,  0.173926);
+const float C2[4] = float[4](-0.133462, -0.039994, 0.039994, 0.133462);
+const float C3[8] = float[8](
+    -0.190685, -0.117832, -0.065717, -0.021460,
+     0.021460,  0.065717,  0.117832,  0.190685);
 const float TM4[15] = float[15](
     -0.145561, -0.103361, -0.079142, -0.060009,
     -0.043430, -0.028293, -0.013964,  0.0,
@@ -133,6 +137,21 @@ float reconstruct_value(int arow, uint feature) {
             int q = int(ak[abase + b * 34u + 2u + j]);
             if (q >= 128) q -= 256;
             av = d * float(q);
+        } else if (p.a_type == 42u) {
+            uint g = k / 128u, j = k % 128u;
+            uint off = abase + g * 34u;
+            float norm = rd_half_ak(off);
+            uint packed = uint(ak[off + 2u + j / 4u]);
+            uint qi = (packed >> (2u * (j % 4u))) & 3u;
+            av = norm * C2[qi];
+        } else if (p.a_type == 43u) {
+            uint g = k / 128u, j = k % 128u;
+            uint off = abase + g * 50u;
+            float norm = rd_half_ak(off);
+            uint qb = uint(ak[off + 2u + j / 4u]);
+            uint sb = uint(ak[off + 34u + j / 8u]);
+            uint qi = ((qb >> (2u * (j % 4u))) & 3u) | (((sb >> (j % 8u)) & 1u) << 2u);
+            av = norm * C3[qi];
         } else {
             uint g = k / 128u, j = k % 128u;
             uint off = abase + g * 68u;
@@ -153,6 +172,21 @@ float reconstruct_value(int arow, uint feature) {
             int q = int(bk[bbase + b * 34u + 2u + j]);
             if (q >= 128) q -= 256;
             bv = d * float(q);
+        } else if (p.b_type == 42u) {
+            uint g = k / 128u, j = k % 128u;
+            uint off = bbase + g * 34u;
+            float norm = rd_half_bk(off);
+            uint packed = uint(bk[off + 2u + j / 4u]);
+            uint qi = (packed >> (2u * (j % 4u))) & 3u;
+            bv = norm * C2[qi];
+        } else if (p.b_type == 43u) {
+            uint g = k / 128u, j = k % 128u;
+            uint off = bbase + g * 50u;
+            float norm = rd_half_bk(off);
+            uint qb = uint(bk[off + 2u + j / 4u]);
+            uint sb = uint(bk[off + 34u + j / 8u]);
+            uint qi = ((qb >> (2u * (j % 4u))) & 3u) | (((sb >> (j % 8u)) & 1u) << 2u);
+            bv = norm * C3[qi];
         } else {
             uint g = k / 128u, j = k % 128u;
             uint off = bbase + g * 68u;
@@ -199,8 +233,10 @@ void main() {
                        p.total_dim > 0u && p.total_dim <= 4096u && p.padded_dim >= p.total_dim &&
                        p.rank > 0u && p.pad_rank >= p.rank && p.n_layers > 0u &&
                        (p.landmark_type == 8u || p.landmark_type == 44u) &&
-                       (p.a_type == 0u || p.a_type == 1u || p.a_type == 8u || p.a_type == 44u) &&
-                       (p.b_type == 0u || p.b_type == 1u || p.b_type == 8u || p.b_type == 44u));
+                       (p.a_type == 0u || p.a_type == 1u || p.a_type == 8u || p.a_type == 42u ||
+                        p.a_type == 43u || p.a_type == 44u) &&
+                       (p.b_type == 0u || p.b_type == 1u || p.b_type == 8u || p.b_type == 42u ||
+                        p.b_type == 43u || p.b_type == 44u));
             if (ok) {
                 uint run = 0u;
                 for (uint li = 0u; li < p.n_layers; ++li) {

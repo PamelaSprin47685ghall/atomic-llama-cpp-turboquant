@@ -6815,23 +6815,34 @@ struct test_turbo_wht : public test_case {
     const int64_t head_dim;
     const int64_t n_heads;
     const int direction; // 0=forward, 1=inverse
+    const bool with_scale; // InnerQ per-channel equalization (src[1], 128-wide)
 
     std::string vars() override {
-        return VARS_TO_STR3(head_dim, n_heads, direction);
+        return VARS_TO_STR4(head_dim, n_heads, direction, with_scale);
     }
 
     double max_nmse_err() override {
         return 1e-5; // f32 SIMD reduction order varies across GPU backends
     }
 
-    test_turbo_wht(int64_t head_dim = 128, int64_t n_heads = 4, int direction = 0)
-        : head_dim(head_dim), n_heads(n_heads), direction(direction) {}
+    test_turbo_wht(int64_t head_dim = 128, int64_t n_heads = 4, int direction = 0, bool with_scale = false)
+        : head_dim(head_dim), n_heads(n_heads), direction(direction), with_scale(with_scale) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim, n_heads);
         ggml_set_param(a);
         ggml_set_name(a, "a");
-        ggml_tensor * out = ggml_turbo_wht(ctx, a, direction, 0, nullptr);
+        ggml_tensor * scale = nullptr;
+        if (with_scale) {
+            // Same shape the runtime uses for InnerQ scale_inv
+            // (INNERQ_MAX_CHANNELS == group_size == 128). The scale path is a
+            // real op input: a backend that silently drops it must fail this
+            // CPU parity gate.
+            scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+            ggml_set_param(scale);
+            ggml_set_name(scale, "scale");
+        }
+        ggml_tensor * out = ggml_turbo_wht(ctx, a, direction, 0, scale);
         ggml_set_name(out, "out");
         return out;
     }
@@ -9871,6 +9882,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t hd : {128, 256, 512}) {
             for (int64_t nh : {1, 4, 8}) {
                 test_cases.emplace_back(new test_turbo_wht(hd, nh, dir));
+                test_cases.emplace_back(new test_turbo_wht(hd, nh, dir, true));
             }
         }
     }

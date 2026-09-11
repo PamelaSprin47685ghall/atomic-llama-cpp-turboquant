@@ -5,8 +5,10 @@
 #include "traits.h"
 #include "ggml-impl.h"
 #include "amx/amx.h"
+#include "ggml-flashprefill.h"
 
 #include <cctype>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -420,6 +422,164 @@ static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_b
     GGML_UNUSED(max_tensor_size);
 }
 
+// FlashPrefill V2 CPU capability probe (data-free): mirrors the fail-closed
+// preconditions of ggml_compute_forward_flash_prefill_{pool,select,attn} in
+// ops.cpp without touching tensor data (supports_op runs before allocation).
+// Anything the kernels abort on is reported unsupported so the graph keeps
+// dense / throws in required mode instead of aborting at dispatch. Called
+// from the switch below so extra-buffer delegation above keeps priority.
+static bool ggml_backend_cpu_supports_flash_prefill(const struct ggml_tensor * op) {
+    // Anything the kernels abort on (bad op params/version, non-F32 Q/pool/
+    // output, non-I32 plan/metadata, bad row strides, inverse-WHT weight-only
+    // KV types, undecodable KV, quantized KV with D % block != 0, shape
+    // mismatches) is reported unsupported so the graph keeps dense / throws in
+    // required mode instead of aborting at dispatch. SELECT itself degrades
+    // to a plan error, but its inputs are gated here all the same.
+    auto fp_kv_decodable = [](ggml_type t, int64_t d) -> bool {
+        if (t == GGML_TYPE_TQ3_1S || t == GGML_TYPE_TQ4_1S) {
+            return false;
+        }
+        if (t != GGML_TYPE_F32 && ggml_get_type_traits(t)->to_float == nullptr) {
+            return false;
+        }
+        if (ggml_is_quantized(t) && (d % ggml_blck_size(t) != 0)) {
+            return false;
+        }
+        return true;
+    };
+    auto fp_float_ok = [](float x) -> bool {
+        return std::isfinite(x) != 0;
+    };
+    if (op->op == GGML_OP_FLASH_PREFILL_POOL ||
+        op->op == GGML_OP_FLASH_PREFILL_SELECT ||
+        op->op == GGML_OP_FLASH_PREFILL_ATTN) {
+        struct ggml_flashprefill_op_params pp;
+        if (ggml_flashprefill_op_params_unpack(op->op_params, &pp) != GGML_FLASHPREFILL_OK) {
+            return false;
+        }
+        if (pp.version != GGML_FLASHPREFILL_VERSION || pp.dk < 1 || pp.dv < 1 ||
+            pp.dk > GGML_FLASHPREFILL_HEAD_DIM_MAX || pp.dv > GGML_FLASHPREFILL_HEAD_DIM_MAX) {
+            return false;
+        }
+        if (op->op == GGML_OP_FLASH_PREFILL_POOL) {
+            if (pp.op != GGML_FLASHPREFILL_OP_POOL) {
+                return false;
+            }
+            const ggml_tensor * K = op->src[0];
+            const ggml_tensor * V = op->src[1];
+            const ggml_tensor * MT = op->src[2];
+            if (!K || !V || !MT) {
+                return false;
+            }
+            if (op->type != GGML_TYPE_F32 || MT->type != GGML_TYPE_I32) {
+                return false;
+            }
+            if (op->nb[0] != sizeof(float) || MT->nb[0] != sizeof(int32_t)) {
+                return false;
+            }
+            if (K->ne[0] != pp.dk || V->ne[0] != pp.dv) {
+                return false;
+            }
+            if (op->ne[0] != (int64_t) pp.dk + pp.dv) {
+                return false;
+            }
+            if (K->ne[3] != 1 || V->ne[3] != 1) {
+                return false;
+            }
+            if (op->ne[1] < 1 || op->ne[2] < 1 || K->ne[1] < 1) {
+                return false;
+            }
+            if (K->ne[2] != op->ne[1] || V->ne[2] != op->ne[1]) {
+                return false;
+            }
+            return fp_kv_decodable(K->type, pp.dk) && fp_kv_decodable(V->type, pp.dv);
+        }
+        if (op->op == GGML_OP_FLASH_PREFILL_SELECT) {
+            if (pp.op != GGML_FLASHPREFILL_OP_SELECT) {
+                return false;
+            }
+            if (!fp_float_ok(pp.alpha) || !(pp.alpha > 0.0f) || !(pp.alpha <= 1.0f) ||
+                !fp_float_ok(pp.scale) || !fp_float_ok(pp.softcap) || pp.softcap < 0.0f) {
+                return false;
+            }
+            if (pp.exact_all != 0 && pp.exact_all != 1) {
+                return false;
+            }
+            const ggml_tensor * Q = op->src[0];
+            const ggml_tensor * POOL = op->src[1];
+            const ggml_tensor * MT = op->src[2];
+            if (!Q || !POOL || !MT) {
+                return false;
+            }
+            if (Q->type != GGML_TYPE_F32 || POOL->type != GGML_TYPE_F32 ||
+                MT->type != GGML_TYPE_I32 || op->type != GGML_TYPE_I32) {
+                return false;
+            }
+            if (Q->nb[0] != sizeof(float) || POOL->nb[0] != sizeof(float) ||
+                MT->nb[0] != sizeof(int32_t) || op->nb[0] != sizeof(int32_t)) {
+                return false;
+            }
+            if (Q->ne[0] != pp.dk || POOL->ne[0] != (int64_t) pp.dk + pp.dv) {
+                return false;
+            }
+            if (Q->ne[1] < 1 || Q->ne[2] < 1 || POOL->ne[1] < 1) {
+                return false;
+            }
+            return true;
+        }
+        // GGML_OP_FLASH_PREFILL_ATTN.
+        if (pp.op != GGML_FLASHPREFILL_OP_ATTN) {
+            return false;
+        }
+        if (!fp_float_ok(pp.scale) || !fp_float_ok(pp.softcap) || pp.softcap < 0.0f) {
+            return false;
+        }
+        if (pp.mean_correction != 0 && pp.mean_correction != 1) {
+            return false;
+        }
+        const ggml_tensor * Q = op->src[0];
+        const ggml_tensor * K = op->src[1];
+        const ggml_tensor * V = op->src[2];
+        const ggml_tensor * POOL = op->src[3];
+        const ggml_tensor * PLAN = op->src[4];
+        const ggml_tensor * MT = op->src[5];
+        const ggml_tensor * SINKS = op->src[6];
+        if (!Q || !K || !V || !POOL || !PLAN || !MT) {
+            return false;
+        }
+        if (Q->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+            POOL->type != GGML_TYPE_F32 || PLAN->type != GGML_TYPE_I32 ||
+            MT->type != GGML_TYPE_I32) {
+            return false;
+        }
+        if (Q->nb[0] != sizeof(float) || op->nb[0] != sizeof(float) ||
+            POOL->nb[0] != sizeof(float) || PLAN->nb[0] != sizeof(int32_t) ||
+            MT->nb[0] != sizeof(int32_t)) {
+            return false;
+        }
+        if (Q->ne[0] != pp.dk || Q->ne[2] != op->ne[1] ||
+            op->ne[0] != pp.dv || op->ne[1] < 1) {
+            return false;
+        }
+        if (K->ne[0] != pp.dk || V->ne[0] != pp.dv) {
+            return false;
+        }
+        if (K->ne[3] != 1 || V->ne[3] != 1) {
+            return false;
+        }
+        if (Q->ne[1] < 1 || K->ne[1] < 1) {
+            return false;
+        }
+        if (SINKS != nullptr &&
+            (SINKS->type != GGML_TYPE_F32 || SINKS->nb[0] != sizeof(float) ||
+             SINKS->ne[0] != op->ne[1])) {
+            return false;
+        }
+        return fp_kv_decodable(K->type, pp.dk) && fp_kv_decodable(V->type, pp.dv);
+    }
+    return false;
+}
+
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
@@ -474,7 +634,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_FLASH_PREFILL_POOL:
         case GGML_OP_FLASH_PREFILL_SELECT:
         case GGML_OP_FLASH_PREFILL_ATTN:
-            return true;
+            return ggml_backend_cpu_supports_flash_prefill(op);
         default:
             return true;
     }

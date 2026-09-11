@@ -393,7 +393,8 @@ llama_rerot_reader_view llama_rerot_document::build_dag_view(
     if (!workers.empty()) {
         std::string err;
         std::vector<llama_rerot_node_id> ordered_workers;
-        if (reader == 0) {
+        const bool is_synthesis_reader = (reader == 0 || nodes_[reader].stage_role == llama_rerot_stage_role::synthesis);
+        if (is_synthesis_reader) {
             // Synthesis reader: plan-rank order subject to DAG dependencies.
             // The reader (0) is not among the workers, so anchor the cycle
             // priority on the max-rank worker: its cycle list is exactly the

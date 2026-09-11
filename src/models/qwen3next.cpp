@@ -289,11 +289,28 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn(
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    if (inp->rerot_active()) {
-        ggml_tensor * Qgroups = build_rerot_q_groups(inp, Qcur, nullptr, nullptr, il);
-        cur = build_attn_rerot(inp,
-                    nullptr, nullptr, nullptr,
-                    Qgroups, Kcur, Vcur, nullptr, kq_scale, il);
+    // Semantic RERoT activation (cache state, not span-tensor presence), mirroring
+    // qwen35/qwen35moe: legacy DDVR spans are built lazily and skipped entirely
+    // when FlashPrefill covers all rerot layers, so span presence alone misses
+    // FP-covered rerot batches (would silently fall through to stock attention
+    // below since generic build_attn skips FP for rerot-semantic views).
+    // Image/audio embedding batches never take the DDVR path.
+    const bool rerot_text = inp->rerot_semantic() &&
+        ubatch.token != nullptr && ubatch.embd == nullptr;
+    if (rerot_text) {
+        int sections_buf[4];
+        std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections_buf);
+        int * sections = hparams.use_mrope() ? sections_buf : nullptr;
+        if (ggml_tensor * fp_cur = try_build_attn_flashprefill(inp,
+                    Qcur, nullptr,
+                    Kcur, Vcur, sections, nullptr, nullptr, kq_scale, il)) {
+            cur = fp_cur;
+        } else {
+            ggml_tensor * Qgroups = build_rerot_q_groups(inp, Qcur, nullptr, sections, il);
+            cur = build_attn_rerot(inp,
+                        nullptr, nullptr, nullptr,
+                        Qgroups, Kcur, Vcur, nullptr, kq_scale, il);
+        }
     } else {
         Qcur = ggml_rope_ext(
                 ctx0, Qcur, inp_pos, nullptr,
