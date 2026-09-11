@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-xkv-state.h"  // xkv_source_files_sha256 for source_artifact_sha256
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1334,16 +1335,31 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         splits[i] /= split_sum;
     }
 
-    const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
-    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+    const int effective_n_layers = (hparams.n_layer_all > hparams.n_layer()) ? (int)hparams.n_layer() : n_layer_all;
+    const int i_gpu_start = (n_gpu_layers >= effective_n_layers) ? 0 : std::max(effective_n_layers + 1 - n_gpu_layers, 0);
+    const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, (int)n_layer_all + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
+        if (devices.empty() || n_gpu_layers == 0) {
+            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
+            return {cpu_dev, &pimpl->cpu_buft_list};
+        }
+        if (il == n_layer_all) {
+            // output layer is on GPU if all trunk layers or all layers are requested on GPU
+            if (n_gpu_layers >= effective_n_layers) {
+                auto * dev = devices.back().dev;
+                LLAMA_LOG_DEBUG("load_tensors: output layer assigned to device %s\n", ggml_backend_dev_name(dev));
+                return {dev, &pimpl->gpu_buft_list.at(dev)};
+            }
+            LLAMA_LOG_DEBUG("load_tensors: output layer assigned to device %s\n", ggml_backend_dev_name(cpu_dev));
+            return {cpu_dev, &pimpl->cpu_buft_list};
+        }
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
         const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
-        auto * dev = devices.at(layer_gpu).dev;
+        auto * dev = devices.at(std::min((size_t)layer_gpu, devices.size() - 1)).dev;
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
@@ -1713,6 +1729,29 @@ size_t llama_model::size() const {
     return pimpl->n_bytes;
 }
 
+bool llama_model::source_artifact_sha256(uint8_t out[32]) const {
+    if (out == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(source_digest_mu);
+    if (source_digest_cached) {
+        std::memcpy(out, source_digest_cache, 32);
+        return true;
+    }
+    if (source_paths.empty()) {
+        return false;
+    }
+    uint8_t digest[32];
+    std::string err;
+    if (!llama_xkv::xkv_source_files_sha256(source_paths, digest, &err)) {
+        return false;
+    }
+    std::memcpy(source_digest_cache, digest, 32);
+    source_digest_cached = true;
+    std::memcpy(out, digest, 32);
+    return true;
+}
+
 size_t llama_model::n_tensors() const {
     return tensors_by_name.size();
 }
@@ -2074,6 +2113,11 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
+    const uint32_t recurrent_size =
+        cparams.rerot_enabled && cparams.n_pen_max > 0
+            ? cparams.n_pen_max
+            : cparams.n_seq_recurrent;
+
     switch (arch) {
         // Models that need specific instantiation should be handled in the
         // switch statement
@@ -2107,7 +2151,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         !cparams.flash_attn,
                         cparams.offload_kqv,
                         cparams.kv_unified,
-                        cparams.n_ctx_seq,
+                        cparams.n_ctx_kv,
                         cparams.n_seq_max,
                         1,
                         hparams.n_swa,
@@ -2134,7 +2178,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             !cparams.flash_attn,
                             cparams.offload_kqv,
                             cparams.kv_unified,
-                            cparams.n_ctx_seq,
+                            cparams.n_ctx_kv,
                             cparams.n_seq_max,
                             1,
                             hparams.n_swa,
@@ -2159,7 +2203,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             !cparams.flash_attn,
                             cparams.offload_kqv,
                             cparams.kv_unified,
-                            cparams.n_ctx_seq,
+                            cparams.n_ctx_kv,
                             cparams.n_seq_max,
                             1,
                             hparams.n_swa,
@@ -2186,7 +2230,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.offload_kqv,
                             params.swa_full,
                             cparams.kv_unified,
-                            cparams.n_ctx_seq,
+                            cparams.n_ctx_kv,
                             cparams.n_seq_max,
                             cparams.n_ubatch,
                             1,
@@ -2195,6 +2239,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             nullptr);
                 } else {
+                    if (cparams.kv_unified && cparams.kv_size_explicit) {
+                        throw std::runtime_error("DeepSeek4 does not support dynamic shared unified KV capacity");
+                    }
+
                     res = new llama_kv_cache_dsv4(
                             *this,
                             params.type_k,
@@ -2203,7 +2251,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.offload_kqv,
                             params.swa_full,
                             cparams.kv_unified,
-                            cparams.n_ctx_seq,
+                            cparams.n_ctx_kv,
                             cparams.n_seq_max,
                             cparams.n_ubatch,
                             1,
@@ -2226,7 +2274,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.offload_kqv,
                             params.swa_full,
                             cparams.kv_unified,
-                            cparams.n_ctx_seq,
+                            cparams.n_ctx_kv,
                             cparams.n_seq_max,
                             cparams.n_ubatch,
                             1,
@@ -2254,9 +2302,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             GGML_TYPE_F32,
                             GGML_TYPE_F32,
                             cparams.offload_kqv,
-                            std::max((uint32_t) 1, cparams.n_seq_max),
+                            recurrent_size,
                             cparams.n_seq_max,
                             cparams.n_rs_seq,
+                            cparams.n_person_max,
+                            cparams.n_pen_max,
                             nullptr);
                 } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen) {
                     // The main difference between hybrid architectures is the
@@ -2302,18 +2352,21 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
                             /* attn_swa_full     */ params.swa_full,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_kv_size      */ cparams.n_ctx_kv,
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
                             /* recurrent_type_s  */ GGML_TYPE_F32,
-                            /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* recurrent_rs_size */ recurrent_size,
+                            /* recurrent_brains */ cparams.n_person_max,
+                            /* recurrent_hands  */ cparams.n_pen_max,
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* cparams           */ (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) ? &cparams : nullptr);
                     } else if (needs_mem_idx) {
                         // sparse attention over a per-token indexer cache, in its own memory type
                         res = new llama_memory_hybrid_idx(
@@ -2341,19 +2394,22 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_kv_size      */ cparams.n_ctx_kv,
                             /* attn_n_pad        */ 1,
                             /* attn_n_swa        */ hparams.n_swa,
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
                             /* recurrent_type_v  */ GGML_TYPE_F32,
-                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* recurrent_kv_size */ recurrent_size,
+                            /* recurrent_brains */ cparams.n_person_max,
+                            /* recurrent_hands  */ cparams.n_pen_max,
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* cparams           */ (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) ? &cparams : nullptr);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -2385,8 +2441,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             filter = [&](uint32_t il) { return il <  hparams.n_layer(); };
                         }
                     }
-
-                    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE && !mtp_on_hybrid_qwen) {
                         GGML_ASSERT(hparams.is_swa_any());
 
                         if (arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -2410,14 +2465,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     cparams.offload_kqv,
                                     params.swa_full,
                                     cparams.kv_unified,
-                                    cparams.n_ctx_seq,
+                                    cparams.n_ctx_kv,
                                     cparams.n_seq_max,
                                     cparams.n_ubatch,
                                     1,
                                     mem_other,
                                     filter,
                                     reuse,
-                                    share);
+                                    share,
+                                    (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) ? &cparams : nullptr);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -2427,18 +2483,17 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     cparams.offload_kqv,
                                     params.swa_full,
                                     cparams.kv_unified,
-                                    cparams.n_ctx_seq,
+                                    cparams.n_ctx_kv,
                                     cparams.n_seq_max,
                                     cparams.n_ubatch,
                                     1,
                                     nullptr,
                                     filter,
                                     reuse,
-                                    share);
+                                    share,
+                                    (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) ? &cparams : nullptr);
                         }
                     } else {
-                        GGML_ASSERT(!hparams.is_swa_any());
-
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
@@ -2447,18 +2502,24 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 !cparams.flash_attn,
                                 cparams.offload_kqv,
                                 cparams.kv_unified,
-                                cparams.n_ctx_seq,
+                                cparams.n_ctx_kv,
                                 cparams.n_seq_max,
                                 1,
-                                hparams.n_swa,
-                                hparams.swa_type,
+                                0,
+                                LLAMA_SWA_TYPE_NONE,
                                 nullptr,
                                 filter,
                                 nullptr,
-                                nullptr);
+                                nullptr,
+                                (params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) ? &cparams : nullptr);
                     }
                 }
             }
+    }
+
+    if (res != nullptr && cparams.rerot_enabled &&
+        cparams.n_person_max > 0 && cparams.n_pen_max > 0) {
+        res->set_grouped_layout(cparams.n_person_max, cparams.n_pen_max);
     }
 
     return res;
@@ -2563,6 +2624,38 @@ int32_t llama_model_n_swa(const llama_model * model) {
         return 0;
     }
     return model->hparams.n_swa;
+}
+
+// FlashPrefill fit sizing: maximum of one per-layer hparams value over the
+// KV-carrying layers (has_kv); 0 when no layer carries KV.
+static uint32_t llama_model_max_over_kv_layers(const llama_model * model, uint32_t (llama_hparams::*value)(uint32_t) const) {
+    uint32_t max_v = 0;
+    for (uint32_t il = 0; il < model->hparams.n_layer_all; ++il) {
+        if (!model->hparams.has_kv(il)) {
+            continue;
+        }
+        const uint32_t v = (model->hparams.*value)(il);
+        if (v > max_v) {
+            max_v = v;
+        }
+    }
+    return max_v;
+}
+
+int32_t llama_model_n_head_kv_max(const llama_model * model) {
+    return (int32_t) llama_model_max_over_kv_layers(model, &llama_hparams::n_head_kv);
+}
+
+int32_t llama_model_n_embd_head_k(const llama_model * model) {
+    return (int32_t) llama_model_max_over_kv_layers(model, &llama_hparams::n_embd_head_k);
+}
+
+int32_t llama_model_n_embd_head_v(const llama_model * model) {
+    return (int32_t) llama_model_max_over_kv_layers(model, &llama_hparams::n_embd_head_v);
+}
+
+int32_t llama_model_n_gqa_max(const llama_model * model) {
+    return (int32_t) llama_model_max_over_kv_layers(model, &llama_hparams::n_gqa);
 }
 
 
@@ -2841,6 +2934,13 @@ llama_ftype llama_model_ftype(const llama_model * model) {
 
 uint64_t llama_model_size(const llama_model * model) {
     return model->size();
+}
+
+bool llama_model_source_artifact_sha256(const llama_model * model, uint8_t out_sha256[32]) {
+    if (model == nullptr) {
+        return false;
+    }
+    return model->source_artifact_sha256(out_sha256);
 }
 
 const char * llama_model_chat_template(const llama_model * model, const char * name) {

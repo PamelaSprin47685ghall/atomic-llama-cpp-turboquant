@@ -59,6 +59,14 @@ extern "C" {
         void         (*clear)        (ggml_backend_buffer_t buffer, uint8_t value);
         // (optional) reset any internal state due to tensor initialization, such as tensor extras
         void         (*reset)        (ggml_backend_buffer_t buffer);
+        // (optional) ordered in-place tensor data movement. Implementations
+        // must validate every region before changing data and provide memmove
+        // semantics for overlap. All tensors must reside in this buffer.
+        bool         (*memmove_tensor)(ggml_backend_buffer_t buffer, const struct ggml_backend_tensor_memmove_region * regions, size_t n_regions, bool dry_run)
+#ifdef __cplusplus
+            = nullptr
+#endif
+            ;
     };
 
     struct ggml_backend_buffer {

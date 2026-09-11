@@ -46,6 +46,16 @@ const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_ty
     GGML_ABORT("fatal error");
 }
 
+const char * llama_rerot_frontier_mode_name(enum llama_rerot_frontier_mode mode) {
+    switch (mode) {
+        case LLAMA_REROT_FRONTIER_STRONG:
+            return "strong";
+        case LLAMA_REROT_FRONTIER_LAG1:
+            return "lag1";
+    }
+    GGML_ABORT("fatal error");
+}
+
 const char * llama_load_mode_name(enum llama_load_mode load_mode) {
     switch (load_mode) {
         case LLAMA_LOAD_MODE_NONE:
@@ -309,6 +319,20 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
+
+        // Retain canonical source-artifact paths (main file first, then splits
+        // in loader order, deduplicated) for exact file-content restore
+        // identity. Empty for memory/file-object loads without paths.
+        if (!fname.empty()) {
+            model_ptr->source_paths.push_back(fname);
+            for (const auto & sp : splits) {
+                if (!sp.empty() && sp != fname &&
+                    std::find(model_ptr->source_paths.begin(), model_ptr->source_paths.end(), sp) ==
+                        model_ptr->source_paths.end()) {
+                    model_ptr->source_paths.push_back(sp);
+                }
+            }
+        }
 
         bool ok = llama_prepare_model_devices(params, model_ptr.get());
         if (!ok) {

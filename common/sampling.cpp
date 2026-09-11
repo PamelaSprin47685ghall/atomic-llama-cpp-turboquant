@@ -184,6 +184,96 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
+static struct llama_sampler * common_grammar_sampler_init(
+        const struct llama_vocab * vocab,
+        const struct common_grammar & grammar,
+        bool grammar_lazy,
+        const std::vector<common_grammar_trigger> & triggers) {
+    const std::string & grammar_str = common_grammar_value(grammar);
+    if (grammar_str.compare(0, 11, "%llguidance") == 0) {
+#ifdef LLAMA_USE_LLGUIDANCE
+        return llama_sampler_init_llg(vocab, "lark", grammar_str.c_str());
+#else
+        GGML_ABORT("llguidance (cmake -DLLAMA_LLGUIDANCE=ON) is not enabled");
+#endif // LLAMA_USE_LLGUIDANCE
+    }
+
+    std::vector<std::string> trigger_patterns;
+    std::vector<llama_token> trigger_tokens;
+    for (const auto & trigger : triggers) {
+        switch (trigger.type) {
+            case COMMON_GRAMMAR_TRIGGER_TYPE_WORD:
+            {
+                const auto & word = trigger.value;
+                trigger_patterns.push_back(regex_escape(word));
+                break;
+            }
+            case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN:
+            {
+                trigger_patterns.push_back(trigger.value);
+                break;
+            }
+            case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL:
+            {
+                const auto & pattern = trigger.value;
+                std::string anchored = "^$";
+                if (!pattern.empty()) {
+                    anchored = (pattern.front() != '^' ? "^" : "")
+                        + pattern
+                        + (pattern.back() != '$' ? "$" : "");
+                }
+                trigger_patterns.push_back(anchored);
+                break;
+            }
+            case COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN:
+            {
+                const auto token = trigger.token;
+                trigger_tokens.push_back(token);
+                break;
+            }
+            default:
+                GGML_ASSERT(false && "unknown trigger type");
+        }
+    }
+
+    std::vector<const char *> trigger_patterns_c;
+    trigger_patterns_c.reserve(trigger_patterns.size());
+    for (const auto & regex : trigger_patterns) {
+        trigger_patterns_c.push_back(regex.c_str());
+    }
+
+    if (grammar_str.empty()) {
+        return nullptr;
+    }
+    if (grammar_lazy) {
+        return llama_sampler_init_grammar_lazy_patterns(vocab, grammar_str.c_str(), "root",
+                trigger_patterns_c.data(), trigger_patterns_c.size(),
+                trigger_tokens.data(), trigger_tokens.size());
+    }
+    return llama_sampler_init_grammar(vocab, grammar_str.c_str(), "root");
+}
+
+static std::vector<llama_token> common_generation_prompt_tokens(
+        const struct llama_vocab * vocab,
+        const std::string & generation_prompt) {
+    std::vector<llama_token> prefill_tokens;
+    if (generation_prompt.empty()) {
+        return prefill_tokens;
+    }
+    GGML_ASSERT(vocab != nullptr);
+    auto tokens = common_tokenize(vocab, generation_prompt, false, true);
+    for (size_t i = 0; i < tokens.size(); i++) {
+        std::string piece = common_token_to_piece(vocab, tokens[i], true);
+        if (i == 0 && std::isspace(piece[0]) && !std::isspace(generation_prompt[0])) {
+            // Some tokenizers will add a space before the first special token, need to exclude
+            continue;
+        }
+        LOG_DBG("%s: prefill token: %d = %s\n", __func__, tokens[i], piece.c_str());
+        prefill_tokens.push_back(tokens[i]);
+    }
+    return prefill_tokens;
+}
+
 struct common_sampler * common_sampler_init(
         const struct llama_model * model,
         struct common_params_sampling & params,
@@ -215,86 +305,15 @@ struct common_sampler * common_sampler_init(
     std::vector<llama_sampler *> samplers;
 
     const std::string & grammar_str = common_grammar_value(params.grammar);
-    if (grammar_str.compare(0, 11, "%llguidance") == 0) {
-#ifdef LLAMA_USE_LLGUIDANCE
-        grmr = llama_sampler_init_llg(vocab, "lark", grammar_str.c_str());
-#else
-        GGML_ABORT("llguidance (cmake -DLLAMA_LLGUIDANCE=ON) is not enabled");
-#endif // LLAMA_USE_LLGUIDANCE
-    } else {
-        std::vector<std::string> trigger_patterns;
-        std::vector<llama_token> trigger_tokens;
-        for (const auto & trigger : params.grammar_triggers) {
-            switch (trigger.type) {
-                case COMMON_GRAMMAR_TRIGGER_TYPE_WORD:
-                {
-                    const auto & word = trigger.value;
-                    trigger_patterns.push_back(regex_escape(word));
-                    break;
-                }
-                case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN:
-                {
-                    trigger_patterns.push_back(trigger.value);
-                    break;
-                }
-                case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL:
-                {
-                    const auto & pattern = trigger.value;
-                    std::string anchored = "^$";
-                    if (!pattern.empty()) {
-                        anchored = (pattern.front() != '^' ? "^" : "")
-                            + pattern
-                            + (pattern.back() != '$' ? "$" : "");
-                    }
-                    trigger_patterns.push_back(anchored);
-                    break;
-                }
-                case COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN:
-                {
-                    const auto token = trigger.token;
-                    trigger_tokens.push_back(token);
-                    break;
-                }
-                default:
-                    GGML_ASSERT(false && "unknown trigger type");
-            }
-        }
-
-        std::vector<const char *> trigger_patterns_c;
-        trigger_patterns_c.reserve(trigger_patterns.size());
-        for (const auto & regex : trigger_patterns) {
-            trigger_patterns_c.push_back(regex.c_str());
-        }
-
-        if (!grammar_str.empty()) {
-             if (params.grammar_lazy) {
-                 grmr = llama_sampler_init_grammar_lazy_patterns(vocab, grammar_str.c_str(), "root",
-                         trigger_patterns_c.data(), trigger_patterns_c.size(),
-                         trigger_tokens.data(), trigger_tokens.size());
-             } else {
-                 grmr = llama_sampler_init_grammar(vocab, grammar_str.c_str(), "root");
-             }
-        }
-    }
+    grmr = common_grammar_sampler_init(
+        vocab, params.grammar, params.grammar_lazy, params.grammar_triggers);
     if (!grmr && !grammar_str.empty()) {
         throw std::runtime_error("failed to parse grammar");
     }
 
     // Compute prefill tokens from the generation prompt
-    std::vector<llama_token> prefill_tokens;
-    if (!params.generation_prompt.empty()) {
-        GGML_ASSERT(vocab != nullptr);
-        auto tokens = common_tokenize(vocab, params.generation_prompt, false, true);
-        for (size_t i = 0; i < tokens.size(); i++) {
-            std::string piece = common_token_to_piece(vocab, tokens[i], true);
-            if (i == 0 && std::isspace(piece[0]) && !std::isspace(params.generation_prompt[0])) {
-                // Some tokenizers will add a space before the first special token, need to exclude
-                continue;
-            }
-            LOG_DBG("%s: prefill token: %d = %s\n", __func__, tokens[i], piece.c_str());
-            prefill_tokens.push_back(tokens[i]);
-        }
-    }
+    std::vector<llama_token> prefill_tokens =
+        common_generation_prompt_tokens(vocab, params.generation_prompt);
 
     // Feed generation prompt tokens to the grammar sampler so it advances past
     // tokens the template already placed in the prompt.
@@ -576,8 +595,15 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
-llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
-    llama_synchronize(ctx);
+llama_token common_sampler_sample(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        int idx,
+        bool grammar_first,
+        bool synchronize) {
+    if (synchronize) {
+        llama_synchronize(ctx);
+    }
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
@@ -589,29 +615,21 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    // Backend sampling already owns candidate selection. Avoid materializing
+    // even its compact candidate list on the CPU when the caller only needs
+    // the selected token.
+    id = synchronize
+        ? llama_get_sampled_token_ith(ctx, idx)
+        : llama_get_sampled_token_ith_no_sync(ctx, idx);
+    if (id != LLAMA_TOKEN_NULL) {
+        LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
-    // Check if a backend sampler has already sampled a token in which case we
-    // return that token id directly.
-    {
-        id = llama_get_sampled_token_ith(ctx, idx);
-
-        if (id != LLAMA_TOKEN_NULL) {
-            LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
-
-            GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
-            GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
-
-            for (size_t i = 0; i < cur_p.size; ++i) {
-                if (cur_p.data[i].id == id) {
-                    cur_p.selected = i;
-                    break;
-                }
-            }
-
-            return id;
-        }
+        GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
+        GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+        return id;
     }
+
+    gsmpl->set_logits(ctx, idx);
 
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);
@@ -699,8 +717,75 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
 }
 
+bool common_sampler_replace_grammar(
+        struct common_sampler * gsmpl,
+        const struct llama_vocab * vocab,
+        const struct common_params_sampling & params,
+        const llama_tokens * committed_end) {
+    if (!gsmpl || !vocab) {
+        return false;
+    }
+    struct llama_sampler * grmr = nullptr;
+    const std::string & grammar_str = common_grammar_value(params.grammar);
+    if (!grammar_str.empty()) {
+        grmr = common_grammar_sampler_init(
+            vocab, params.grammar, params.grammar_lazy, params.grammar_triggers);
+        if (!grmr) {
+            return false;
+        }
+        if (!params.grammar_lazy && common_grammar_needs_prefill(params.grammar)) {
+            try {
+                for (const auto & token : common_generation_prompt_tokens(vocab, params.generation_prompt)) {
+                    llama_sampler_accept(grmr, token);
+                }
+            } catch (std::exception & e) {
+                llama_sampler_free(grmr);
+                LOG_ERR("%s: error initializing grammar sampler for grammar:\n%s\n\nGeneration prompt:\n'%s'\n", __func__,
+                    common_grammar_value(params.grammar).c_str(), params.generation_prompt.c_str());
+                return false;
+            }
+        }
+    }
+    llama_sampler_free(gsmpl->grmr);
+    gsmpl->grmr = grmr;
+    gsmpl->params.grammar = params.grammar;
+    gsmpl->params.grammar_lazy = params.grammar_lazy;
+    gsmpl->params.grammar_triggers = params.grammar_triggers;
+    gsmpl->params.preserved_tokens = params.preserved_tokens;
+    // Lazy activation only: seed the new grammar from the committed native end
+    // sequence so lazy triggers observe it. Never replay into a non-lazy
+    // (active) grammar — feeding a stale </think> there corrupts constrained
+    // generation such as JSON. End evidence prefers the recorded budget match;
+    // without a budget sampler (e.g. no-budget synthesis) the server-supplied
+    // committed boundary is used. Absent both, the grammar activates on future
+    // tokens exactly like an ordinary lazy grammar start.
+    if (grmr && params.grammar_lazy) {
+        const llama_tokens * end_seq = nullptr;
+        if (gsmpl->rbudget &&
+            common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_DONE) {
+            end_seq = common_reasoning_budget_get_end_match(gsmpl->rbudget);
+        }
+        if (!end_seq || end_seq->empty()) {
+            end_seq = committed_end;
+        }
+        if (end_seq) {
+            for (const llama_token end_token : *end_seq) {
+                llama_sampler_accept(grmr, end_token);
+            }
+        }
+    }
+    return true;
+}
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
+}
+
+llama_tokens common_sampler_get_token_history(const struct common_sampler * gsmpl) {
+    if (!gsmpl) {
+        return {};
+    }
+    return gsmpl->prev.to_vector();
 }
 
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {

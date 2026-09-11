@@ -1,0 +1,183 @@
+#version 450
+
+// xkv_landmark_select.comp — Deterministic bounded top-k emit, per-query CSR fold, and
+// bounded boundary refinement for XKV landmarks (v3 audit revision).
+//
+// Audit fixes (Main directive):
+//  1. Deterministic status initialization on all paths (status[0..3] = [code, tot_ref, tot_hit, tot_leg]).
+//  2. Pass 1 (fold) writes CSR pointers into csr_ptrs[0..nq].
+//  3. Sentinels (-1, -1e30) for unused slots; one-shot fail-closed on error.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint n_queries;
+    uint n_frags;
+    uint head_dim;
+    uint padded_dim;
+    uint rotary_dim;
+    uint rope_mode;
+    uint landmark_type;
+    uint top_k;
+    uint max_top_k;
+    uint refine_cap;
+    uint frag_size;
+    float scale;
+    uint n_q_heads;
+    uint n_rows_total;
+    uint landmark_row_stride_bytes; // shared push layout with score (unused here)
+    uint status_flag;     // 0 = pass 0 (per-query emit), 1 = pass 1 (fold)
+    uint fstride;         // frag_meta stride (4, 6, or 8)
+    uint qstride;
+    uint flags;
+} p;
+
+layout (binding = 0, std430) readonly buffer CARRY   { uint carry[]; };
+layout (binding = 1, std430) readonly buffer FMETA   { int frag_meta[]; };
+layout (binding = 2, std430) buffer CSR_PTRS         { int csr_ptrs[]; };
+layout (binding = 3, std430) buffer CSR_IDX          { int csr_indices[]; };
+layout (binding = 4, std430) buffer TOPK_SC          { float topk_scores[]; };
+layout (binding = 5, std430) buffer STATUS           { int status[]; };
+layout (binding = 6, std430) buffer SCRATCH          { uint scratch[]; };
+
+void main() {
+    uint qq = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+
+    uint nq = p.n_queries;
+    uint tk = p.top_k;
+    uint cap = p.refine_cap;
+    uint ci  = 0u;
+    uint cs  = nq * tk;
+    uint tak = cs + nq * tk;
+    uint ref = tak + nq;
+    uint leg = ref + nq;
+    uint row = leg + nq;
+
+    // Pass 1: single-workgroup prefix & status fold
+    if (p.status_flag == 1u) {
+        if (qq != 0u || lid != 0u) return;
+
+        if (tk == 0u || tk > p.max_top_k || tk > p.n_frags) {
+            status[0] = 1;
+            status[1] = 0; status[2] = 0; status[3] = 0;
+            return;
+        }
+
+        int acc = 0;
+        for (uint q = 0u; q < nq; ++q) {
+            csr_ptrs[q] = acc;
+            acc += int(scratch[tak + q]);
+        }
+        csr_ptrs[nq] = acc;
+
+        uint tot_ref = 0u;
+        uint tot_hit = 0u;
+        uint tot_leg = 0u;
+        for (uint q = 0u; q < nq; ++q) {
+            uint rw = scratch[ref + q];
+            tot_ref += (rw & 0x7FFFFFFFu);
+            tot_hit += (rw >> 31u);
+            tot_leg += scratch[leg + q];
+        }
+
+        // Only set status[0]=0 if no prior error occurred
+        if (status[0] == 0) {
+            status[0] = 0; // OK
+        }
+        status[1] = int(tot_ref);
+        status[2] = int(tot_hit);
+        status[3] = int(tot_leg);
+        return;
+    }
+
+    // Pass 0: per-query emit
+    if (qq >= nq || lid != 0u) return;
+
+    if (tk == 0u || tk > p.max_top_k || tk > p.n_frags) {
+        scratch[tak + qq] = 0u;
+        scratch[ref + qq] = 0u;
+        status[0] = 1;
+        return;
+    }
+
+    // One-shot fail-closed on prior error
+    if (status[0] != 0) {
+        for (uint i = 0u; i < tk; ++i) {
+            csr_indices[qq * tk + i] = -1;
+            topk_scores[qq * tk + i] = -1e30;
+        }
+        scratch[tak + qq] = 0u;
+        scratch[ref + qq] = 0u;
+        return;
+    }
+
+    uint base_i = ci + qq * tk;
+    uint base_s = cs + qq * tk;
+    uint nsel = scratch[tak + qq];
+    if (nsel > tk) nsel = tk;
+
+    for (uint i = 0u; i < tk; ++i) {
+        if (i < nsel) {
+            csr_indices[qq * tk + i] = int(scratch[base_i + i]);
+            topk_scores[qq * tk + i] = uintBitsToFloat(scratch[base_s + i]);
+        } else {
+            csr_indices[qq * tk + i] = -1;
+            topk_scores[qq * tk + i] = -1e30;
+        }
+    }
+
+    // Bounded refinement
+    uint refined = 0u;
+    uint hit = 0u;
+    uint rowb = row + qq * cap;
+    if (cap > 0u && nsel > 0u) {
+        for (uint i = 1u; i < nsel; ++i) {
+            uint k = scratch[base_i + i];
+            uint j = i;
+            while (j > 0u && scratch[base_i + j - 1u] > k) {
+                scratch[base_i + j] = scratch[base_i + j - 1u];
+                --j;
+            }
+            scratch[base_i + j] = k;
+        }
+        uint total = 0u;
+        uint uniq = 0u;
+        for (uint s = 0u; s < nsel; ++s) {
+            uint fidx = scratch[base_i + s];
+            int rb = frag_meta[fidx * p.fstride + 0u];
+            int rc = frag_meta[fidx * p.fstride + 1u];
+            if (rc <= 0) rc = int(p.frag_size);
+            for (int r = 0; r < rc; ++r) {
+                int rr = rb + r;
+                if (rr < 0 || uint(rr) >= p.n_rows_total) continue;
+                total++;
+                if (uniq < cap) {
+                    uint urow = uint(rr);
+                    uint upos = uniq;
+                    for (uint i = 0u; i < uniq; ++i) {
+                        uint er = scratch[rowb + i];
+                        if (er == urow) { upos = uniq + 1u; break; }
+                        if (er > urow) { upos = i; break; }
+                    }
+                    if (upos <= uniq) {
+                        if (upos < uniq) {
+                            for (uint i = uniq; i > upos; --i) scratch[rowb + i] = scratch[rowb + i - 1u];
+                        }
+                        scratch[rowb + upos] = urow;
+                        uniq++;
+                    }
+                }
+            }
+        }
+        if (total > cap) hit = 1u;
+        refined = uniq < cap ? uniq : cap;
+    }
+    scratch[ref + qq] = refined | (hit << 31u);
+}

@@ -28,7 +28,8 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+        const llama_cparams   * cparams = nullptr);
 
     llama_kv_cache_iswa(
             const llama_model & model,
@@ -46,7 +47,8 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+        const llama_cparams   * cparams = nullptr);
 
     ~llama_kv_cache_iswa() = default;
 
@@ -65,6 +67,16 @@ public:
 
     bool get_can_shift() const override;
 
+    uint32_t get_kv_capacity() const override;
+    // Failure-reporting clear forwarded to base + SWA (base first; a base
+    // false returns before SWA mutates).
+    bool try_clear(bool data, std::string * err = nullptr) override;
+    uint32_t get_kv_hot_capacity() const override;
+    bool can_use_legacy_attention() const override;
+    bool is_xkv_bounded_hot() const override;
+    uint32_t get_kv_used()     const override;
+    uint32_t get_kv_seq_used(llama_seq_id seq_id) const override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -72,6 +84,22 @@ public:
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
+
+    bool rerot_set_write_tag(llama_seq_id seq_id, const llama_kv_rerot_meta & tag) override;
+    void rerot_clear_write_tag(llama_seq_id seq_id) override;
+    bool rerot_can_publish_run(uint64_t episode_id, llama_rerot_run_id run_id, size_t * count) const override;
+    bool rerot_can_reclassify_run(uint64_t episode_id, llama_rerot_run_id run_id,
+        llama_rerot_visibility expected, llama_rerot_visibility replacement,
+        uint64_t publish_epoch, size_t * count) const override;
+    size_t rerot_publish_run(uint64_t episode_id, llama_rerot_run_id run_id, uint64_t publish_epoch) override;
+    size_t rerot_reclassify_run(uint64_t episode_id, llama_rerot_run_id run_id,
+        llama_rerot_visibility expected, llama_rerot_visibility replacement, uint64_t publish_epoch) override;
+    bool rerot_can_add_run_ref(uint64_t episode_id, llama_rerot_run_id run_id,
+        llama_seq_id seq_id, size_t * count) const override;
+    size_t rerot_add_run_ref(uint64_t episode_id, llama_rerot_run_id run_id,
+        llama_seq_id seq_id) override;
+    bool rerot_set_reader_view(llama_seq_id seq_id, const llama_rerot_reader_state & view) override;
+    void rerot_clear_reader_view(llama_seq_id seq_id) override;
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
@@ -82,6 +110,10 @@ public:
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
+
+    llama_memory_kv_reclaim_result reclaim_kv(const llama_memory_kv_reclaim_request & request) override;
+
+    bool positions_are_sparse() const override;
 
     //
     // llama_kv_cache_iswa specific API
@@ -130,7 +162,8 @@ public:
             llama_kv_cache_iswa * kv,
             slot_info_vec_t sinfos_base,
             slot_info_vec_t sinfos_swa,
-            std::vector<llama_ubatch> ubatches);
+            std::vector<llama_ubatch> ubatches,
+            std::vector<llama_xkv::xkv_hot_reservation> hot_res_base = {});
 
     virtual ~llama_kv_cache_iswa_context();
 
@@ -140,6 +173,14 @@ public:
 
     bool next()  override;
     bool apply() override;
+
+    // Graph-facing bounded-hot views: forwarded to target (base) attention
+    // through the interface; SWA never serves physical hot views.
+    ggml_tensor * get_xkv_hot_k(ggml_context * ctx, int32_t il) const override;
+    ggml_tensor * get_xkv_hot_v(ggml_context * ctx, int32_t il) const override;
+
+    bool postcompute_success() override;
+    bool postcompute_failure() override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -161,6 +202,11 @@ private:
 
     const llama_memory_context_ptr ctx_base;
     const llama_memory_context_ptr ctx_swa;
+
+    // Exactly-once postcompute forward flag (inner contexts guard themselves;
+    // this makes the forward fire once).
+    bool postcompute_finalized = false;
+    bool postcompute_ok = false;
 
     const llama_memory_status status;
 };

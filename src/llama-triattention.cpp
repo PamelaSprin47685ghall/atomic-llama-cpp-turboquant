@@ -1,0 +1,1902 @@
+// TriAttention: Trigonometric KV Cache Importance Scorer for llama.cpp
+// Based on arXiv 2604.04921 (MIT/NVIDIA/ZJU)
+//
+// Phase 1: Pure "importance oracle" implementation.
+//   1. Binary calibration file loader (.triattention format)
+//   2. RoPE inversion (post-RoPE K -> pre-RoPE K)
+//   3. Trigonometric key importance scoring (Eqs. 6-10 from paper)
+//   4. Streaming combined scoring across all sampled heads (max/union)
+//
+// All math references cite equation numbers from: "TriAttention: Decoding-Time
+// Trigonometric Key Cache Eviction for Long-Context LLM Inference" (2604.04921)
+
+#include "llama-triattention.h"
+#include "llama-kv-transform.h"
+#include "llama-xkv-state.h"
+
+#include "ggml.h"
+#include "ggml-backend.h"
+
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#include <cuda_runtime.h>
+#include <map>
+#endif
+
+// Block types and dequant declarations are in ggml-common.h (ggml/src/)
+// which is not on the include path for src/. We declare the dequant
+// functions with void* parameters and cast at call sites.
+// Block sizes: turbo2=34, turbo3=50, turbo4=68 bytes per 128 elements;
+// q8_0=34 bytes per 32 elements.
+
+#ifdef _MSC_VER
+#define _USE_MATH_DEFINES
+#endif
+#include <math.h>
+
+#include <algorithm>
+#include <cassert>
+#include <cstdlib>
+#include <cstring>
+#include <numeric>
+#include <thread>
+#include <unordered_set>
+#include <vector>
+
+// For timing
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#   define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/time.h>
+#endif
+
+// TurboQuant dequant function declarations (from ggml-turbo-quant.c)
+// Using void* since block type definitions live in ggml-common.h (not on include path)
+extern "C" {
+    void dequantize_row_turbo2_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+    void dequantize_row_turbo3_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+    void dequantize_row_turbo4_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+    GGML_API void ggml_turbo_wht_inverse_row(float * x, int group_size);
+}
+
+// Standard ggml dequant for Q8_0, F16, etc.
+extern "C" {
+    void dequantize_row_q8_0(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+}
+
+// ============================================================================
+// Internal helpers
+// ============================================================================
+
+static double triattention_time_ms(void) {
+#ifdef _WIN32
+    LARGE_INTEGER freq, cnt;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&cnt);
+    return (double)cnt.QuadPart / (double)freq.QuadPart * 1000.0;
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
+#endif
+}
+
+static bool triattention_needs_inverse_wht(ggml_type type) {
+    if (type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0) {
+        return true;
+    }
+    // TURBO4_USE_4BIT defaults to 1 in ggml-common.h. Only the legacy
+    // 3-bit+QJL representation inverse-rotates inside its dequantizer.
+#if !defined(TURBO4_USE_4BIT) || TURBO4_USE_4BIT
+    return type == GGML_TYPE_TURBO4_0;
+#else
+    return false;
+#endif
+}
+
+static void triattention_inverse_wht_128(const float * src, float * dst) {
+    // The butterfly is O(d log d), rather than O(d^2) for a dense R^T.
+    // Reclamation applies this to every retained candidate and sampled head.
+    memcpy(dst, src, 128 * sizeof(float));
+    ggml_turbo_wht_inverse_row(dst, 128);
+}
+
+// Helper: z-score normalize an array in-place
+// After normalization: mean=0, std=1
+static void zscore_normalize(float * scores, uint32_t n) {
+    if (n <= 1) return;
+
+    double sum = 0.0;
+    for (uint32_t i = 0; i < n; i++) sum += scores[i];
+    double mean = sum / n;
+
+    double var_sum = 0.0;
+    for (uint32_t i = 0; i < n; i++) {
+        double d = scores[i] - mean;
+        var_sum += d * d;
+    }
+    double std = sqrt(var_sum / n);
+    if (std < 1e-10) std = 1e-10;
+
+    for (uint32_t i = 0; i < n; i++) {
+        scores[i] = (float)((scores[i] - mean) / std);
+    }
+}
+
+// ============================================================================
+// Binary calibration file I/O
+// ============================================================================
+
+// Load .triattention calibration file
+// Returns nullptr on any error, with diagnostic printed to stderr
+static triattention_calibration * triattention_load_calibration(const char * path) {
+    FILE * f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[TriAttention] ERROR: cannot open calibration file: %s\n", path);
+        return nullptr;
+    }
+
+    // Read and validate magic
+    uint32_t magic;
+    if (fread(&magic, sizeof(uint32_t), 1, f) != 1 || magic != TRIATTENTION_MAGIC) {
+        fprintf(stderr, "[TriAttention] ERROR: invalid magic in %s (got 0x%08x, expected 0x%08x)\n",
+                path, magic, TRIATTENTION_MAGIC);
+        fclose(f);
+        return nullptr;
+    }
+
+    // Read and validate version
+    uint32_t version;
+    if (fread(&version, sizeof(uint32_t), 1, f) != 1 || (version != 1 && version != 2)) {
+        fprintf(stderr, "[TriAttention] ERROR: unsupported version %u in %s (expected 1 or 2)\n",
+                version, path);
+        fclose(f);
+        return nullptr;
+    }
+
+    auto * cal = new triattention_calibration();
+    memset(cal, 0, sizeof(triattention_calibration));
+
+    // Read header fields
+    bool ok = true;
+    ok = ok && fread(&cal->head_dim,        sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fread(&cal->num_layers,      sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fread(&cal->num_attn_heads,  sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fread(&cal->num_kv_heads,    sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fread(&cal->rope_theta,      sizeof(double),   1, f) == 1;
+    ok = ok && fread(&cal->rope_style,      sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fread(&cal->n_sampled,       sizeof(uint32_t), 1, f) == 1;
+    ok = ok && fread(&cal->freq_count,      sizeof(uint32_t), 1, f) == 1;
+
+    // v2: read rotary_dim. v1: default to head_dim (full RoPE)
+    if (version >= 2) {
+        ok = ok && fread(&cal->rotary_dim,      sizeof(uint32_t), 1, f) == 1;
+    } else {
+        cal->rotary_dim = cal->head_dim;
+    }
+
+    if (!ok) {
+        fprintf(stderr, "[TriAttention] ERROR: truncated header in %s\n", path);
+        delete cal;
+        fclose(f);
+        return nullptr;
+    }
+
+    // Read model name
+    uint32_t name_len;
+    if (fread(&name_len, sizeof(uint32_t), 1, f) != 1 || name_len == 0 || name_len > 255) {
+        fprintf(stderr, "[TriAttention] ERROR: invalid model name length %u in %s\n", name_len, path);
+        delete cal;
+        fclose(f);
+        return nullptr;
+    }
+    if (fread(cal->model_name, 1, name_len, f) != name_len) {
+        fprintf(stderr, "[TriAttention] ERROR: truncated model name in %s\n", path);
+        delete cal;
+        fclose(f);
+        return nullptr;
+    }
+    cal->model_name[name_len] = '\0';
+
+    // Validate basic field consistency
+    if (cal->freq_count != cal->rotary_dim / 2) {
+        fprintf(stderr, "[TriAttention] ERROR: freq_count (%u) != rotary_dim/2 (%u) in %s\n",
+                cal->freq_count, cal->rotary_dim / 2, path);
+        delete cal;
+        fclose(f);
+        return nullptr;
+    }
+
+    if (cal->rotary_dim > cal->head_dim) {
+        fprintf(stderr, "[TriAttention] ERROR: rotary_dim (%u) > head_dim (%u) in %s\n",
+                cal->rotary_dim, cal->head_dim, path);
+        delete cal;
+        fclose(f);
+        return nullptr;
+    }
+
+    if (cal->num_attn_heads == 0 || cal->num_kv_heads == 0 ||
+        cal->num_attn_heads % cal->num_kv_heads != 0) {
+        fprintf(stderr, "[TriAttention] ERROR: invalid head counts (attn=%u, kv=%u) in %s\n",
+                cal->num_attn_heads, cal->num_kv_heads, path);
+        delete cal;
+        fclose(f);
+        return nullptr;
+    }
+
+    cal->num_kv_groups = cal->num_attn_heads / cal->num_kv_heads;
+
+    // Allocate per-head arrays
+    cal->sampled_layer = new uint32_t[cal->n_sampled];
+    cal->sampled_head  = new uint32_t[cal->n_sampled];
+    cal->head_stats    = new triattention_head_stats[cal->n_sampled];
+
+    const uint32_t fc = cal->freq_count;
+
+    for (uint32_t h = 0; h < cal->n_sampled; h++) {
+        // Read layer and head indices
+        ok = true;
+        ok = ok && fread(&cal->sampled_layer[h], sizeof(uint32_t), 1, f) == 1;
+        ok = ok && fread(&cal->sampled_head[h],  sizeof(uint32_t), 1, f) == 1;
+
+        if (!ok) {
+            fprintf(stderr, "[TriAttention] ERROR: truncated head entry %u in %s\n", h, path);
+            // Cleanup partially allocated heads
+            for (uint32_t j = 0; j < h; j++) {
+                delete[] cal->head_stats[j].q_mean_real;
+                delete[] cal->head_stats[j].q_mean_imag;
+                delete[] cal->head_stats[j].q_abs_mean;
+            }
+            delete[] cal->sampled_layer;
+            delete[] cal->sampled_head;
+            delete[] cal->head_stats;
+            delete cal;
+            fclose(f);
+            return nullptr;
+        }
+
+        // Validate indices
+        if (cal->sampled_layer[h] >= cal->num_layers ||
+            cal->sampled_head[h] >= cal->num_attn_heads) {
+            fprintf(stderr, "[TriAttention] ERROR: head entry %u has invalid indices (layer=%u, head=%u) in %s\n",
+                    h, cal->sampled_layer[h], cal->sampled_head[h], path);
+            for (uint32_t j = 0; j < h; j++) {
+                delete[] cal->head_stats[j].q_mean_real;
+                delete[] cal->head_stats[j].q_mean_imag;
+                delete[] cal->head_stats[j].q_abs_mean;
+            }
+            delete[] cal->sampled_layer;
+            delete[] cal->sampled_head;
+            delete[] cal->head_stats;
+            delete cal;
+            fclose(f);
+            return nullptr;
+        }
+
+        // Allocate and read per-frequency arrays
+        auto & hs = cal->head_stats[h];
+        hs.q_mean_real  = new float[fc];
+        hs.q_mean_imag  = new float[fc];
+        hs.q_abs_mean   = new float[fc];
+        hs.q_mean_abs   = nullptr;  // computed at init time
+        hs.extra_weight = nullptr;  // computed at init time
+
+        ok = true;
+        ok = ok && fread(hs.q_mean_real, sizeof(float), fc, f) == fc;
+        ok = ok && fread(hs.q_mean_imag, sizeof(float), fc, f) == fc;
+        ok = ok && fread(hs.q_abs_mean,  sizeof(float), fc, f) == fc;
+
+        // Read R_f (validation data — not stored at runtime, just skip)
+        float * r_f_tmp = new float[fc];
+        ok = ok && fread(r_f_tmp, sizeof(float), fc, f) == fc;
+        delete[] r_f_tmp;
+
+        if (!ok) {
+            fprintf(stderr, "[TriAttention] ERROR: truncated stats for head %u in %s\n", h, path);
+            // Free this head's arrays
+            delete[] hs.q_mean_real;
+            delete[] hs.q_mean_imag;
+            delete[] hs.q_abs_mean;
+            // Free previous heads
+            for (uint32_t j = 0; j < h; j++) {
+                delete[] cal->head_stats[j].q_mean_real;
+                delete[] cal->head_stats[j].q_mean_imag;
+                delete[] cal->head_stats[j].q_abs_mean;
+                delete[] cal->head_stats[j].q_mean_abs;
+                delete[] cal->head_stats[j].extra_weight;
+            }
+            delete[] cal->sampled_layer;
+            delete[] cal->sampled_head;
+            delete[] cal->head_stats;
+            delete cal;
+            fclose(f);
+            return nullptr;
+        }
+    }
+
+    fclose(f);
+
+    fprintf(stderr, "[TriAttention] Loaded calibration: model=%s, layers=%u, attn_heads=%u, kv_heads=%u, "
+            "head_dim=%u, sampled=%u, rope_theta=%.1f\n",
+            cal->model_name, cal->num_layers, cal->num_attn_heads,
+            cal->num_kv_heads, cal->head_dim, cal->n_sampled, cal->rope_theta);
+
+    return cal;
+}
+
+static void triattention_free_calibration(triattention_calibration * cal) {
+    if (!cal) return;
+
+    for (uint32_t h = 0; h < cal->n_sampled; h++) {
+        delete[] cal->head_stats[h].q_mean_real;
+        delete[] cal->head_stats[h].q_mean_imag;
+        delete[] cal->head_stats[h].q_abs_mean;
+        delete[] cal->head_stats[h].q_mean_abs;
+        delete[] cal->head_stats[h].extra_weight;
+    }
+    delete[] cal->sampled_layer;
+    delete[] cal->sampled_head;
+    delete[] cal->head_stats;
+    delete cal;
+}
+
+// ============================================================================
+// Precomputation at init time
+// ============================================================================
+
+// Build RoPE frequency array: omega[f] = rope_theta^(-2f/rotary_dim)
+// Paper Eq. 1: theta_f = base^{-2f/d}
+// For partial RoPE, d = rotary_dim (not head_dim)
+static void triattention_build_omega(float * omega, uint32_t freq_count, uint32_t rotary_dim, double rope_theta) {
+    for (uint32_t f = 0; f < freq_count; f++) {
+        double exponent = -2.0 * (double)f / (double)rotary_dim;
+        omega[f] = (float)pow(rope_theta, exponent);
+    }
+}
+
+static float triattention_rope_yarn_ramp(float low, float high, uint32_t pair_dim) {
+    const float y = ((float) pair_dim / 2.0f - low) / fmaxf(0.001f, high - low);
+    return 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+}
+
+bool triattention_build_rope_tables(
+    float * omega,
+    float * freq_scale_sq,
+    uint32_t rotary_dim,
+    float freq_base,
+    float freq_scale,
+    int32_t n_ctx_orig,
+    float ext_factor,
+    float attn_factor,
+    float beta_fast,
+    float beta_slow,
+    const float * freq_factors)
+{
+    if (!omega || !freq_scale_sq || rotary_dim == 0 || (rotary_dim & 1u) != 0 ||
+        !std::isfinite(freq_base) || freq_base <= 0.0f ||
+        !std::isfinite(freq_scale) || freq_scale <= 0.0f ||
+        !std::isfinite(ext_factor) || !std::isfinite(attn_factor) || attn_factor <= 0.0f) {
+        return false;
+    }
+
+    float corr_dims[2] = {0.0f, 0.0f};
+    if (ext_factor != 0.0f) {
+        if (n_ctx_orig <= 0) {
+            return false;
+        }
+        ggml_rope_yarn_corr_dims((int) rotary_dim, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+    }
+
+    float magnitude_scale = attn_factor;
+    if (ext_factor != 0.0f) {
+        magnitude_scale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    const float magnitude_scale_sq = magnitude_scale * magnitude_scale;
+
+    const uint32_t freq_count = rotary_dim / 2;
+    for (uint32_t f = 0; f < freq_count; ++f) {
+        const float factor = freq_factors ? freq_factors[f] : 1.0f;
+        if (!std::isfinite(factor) || factor == 0.0f) {
+            return false;
+        }
+
+        const float theta_extrap = powf(freq_base, -2.0f * (float) f / (float) rotary_dim) / factor;
+        float ramp_mix = 0.0f;
+        if (ext_factor != 0.0f) {
+            ramp_mix = triattention_rope_yarn_ramp(corr_dims[0], corr_dims[1], 2u * f) * ext_factor;
+        }
+        const float phase_scale = freq_scale * (1.0f - ramp_mix) + ramp_mix;
+
+        omega[f] = theta_extrap * phase_scale;
+        freq_scale_sq[f] = magnitude_scale_sq;
+    }
+
+    return true;
+}
+
+// Build geometric offset array: {1, 2, 4, 8, ..., offset_max}
+// Paper Eq. 9: D = {2^0, 2^1, ..., 2^{log2(max_length)}}
+static uint32_t triattention_build_offsets(float * offsets, uint32_t offset_max) {
+    uint32_t n = 0;
+    for (uint32_t d = 1; d <= offset_max; d *= 2) {
+        offsets[n++] = (float)d;
+    }
+    return n;
+}
+
+// Precompute derived quantities per head from calibration stats:
+//   q_mean_abs[f] = sqrt(q_mean_real[f]^2 + q_mean_imag[f]^2)  = ||E[q_f]||
+//   extra_weight[f] = q_abs_mean[f] - q_mean_abs[f]              = E[||q_f||] - ||E[q_f]||
+// Paper Eq. 8: the "norm excess" term weighted by (1 - R_f)
+static void triattention_precompute_head_derived(triattention_head_stats * hs, uint32_t freq_count, bool disable_mlr) {
+    hs->q_mean_abs   = new float[freq_count];
+    hs->extra_weight = new float[freq_count];
+
+    for (uint32_t f = 0; f < freq_count; f++) {
+        float re = hs->q_mean_real[f];
+        float im = hs->q_mean_imag[f];
+        hs->q_mean_abs[f] = sqrtf(re * re + im * im);
+
+        if (disable_mlr) {
+            // Ablation: use q_abs_mean directly as the norm contribution
+            hs->extra_weight[f] = hs->q_abs_mean[f];
+        } else {
+            // Standard: MLR-weighted norm excess = E[||q_f||] - ||E[q_f]||
+            // This is >= 0 because ||E[x]|| <= E[||x||] (Jensen's inequality)
+            hs->extra_weight[f] = hs->q_abs_mean[f] - hs->q_mean_abs[f];
+            if (hs->extra_weight[f] < 0.0f) {
+                hs->extra_weight[f] = 0.0f;  // Numerical safety
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Core scoring functions: CPU implementations
+// ============================================================================
+
+// Invert RoPE rotation on post-RoPE key vectors.
+// Paper Eq. 4: recover pre-RoPE K from post-RoPE K using known positions.
+//
+// For "half" style (Llama/Qwen): dimensions split as [real | imag]
+//   k_pre[f]    = k_post[f]*cos(omega[f]*pos) + k_post[f+fc]*sin(omega[f]*pos)
+//   k_pre[f+fc] = k_post[f+fc]*cos(omega[f]*pos) - k_post[f]*sin(omega[f]*pos)
+//
+// For adjacent/even-odd style (ggml NORMAL): pairs are (2f, 2f+1).
+// Do not confuse this with ggml IMROPE, whose vector pairing is still NeoX/half.
+//   k_pre[2f]   = k_post[2f]*cos(omega[f]*pos) + k_post[2f+1]*sin(omega[f]*pos)
+//   k_pre[2f+1] = k_post[2f+1]*cos(omega[f]*pos) - k_post[2f]*sin(omega[f]*pos)
+void triattention_invert_rope(
+    float       * out,
+    const float * post_rope_k,
+    const int32_t * positions,
+    const float * omega,
+    const float * freq_scale_sq,
+    uint32_t n_keys,
+    uint32_t head_dim,
+    uint32_t rotary_dim,
+    uint32_t freq_count,
+    uint32_t rope_style)
+{
+    for (uint32_t i = 0; i < n_keys; i++) {
+        const float * src = post_rope_k + (size_t)i * head_dim;
+        float       * dst = out         + (size_t)i * head_dim;
+        const float   pos = (float)positions[i];
+
+        if (rope_style == 0) {
+            // Half style: [real_0..real_{fc-1} | imag_0..imag_{fc-1}]
+            // RoPE applied to first rotary_dim dims, layout already half
+            for (uint32_t f = 0; f < freq_count; f++) {
+                float angle = omega[f] * pos;
+                float c = cosf(angle);
+                float s = sinf(angle);
+                const float scale = freq_scale_sq ? sqrtf(fmaxf(freq_scale_sq[f], 1e-30f)) : 1.0f;
+                float re = src[f] / scale;
+                float im = src[f + freq_count] / scale;
+                dst[f]              = re * c + im * s;
+                dst[f + freq_count] = im * c - re * s;
+            }
+        } else {
+            // Interleaved style: input [re_0, im_0, re_1, im_1, ...]
+            // Convert to half layout [re_0, re_1, ..., im_0, im_1, ...] during inversion
+            for (uint32_t f = 0; f < freq_count; f++) {
+                float angle = omega[f] * pos;
+                float c = cosf(angle);
+                float s = sinf(angle);
+                const float scale = freq_scale_sq ? sqrtf(fmaxf(freq_scale_sq[f], 1e-30f)) : 1.0f;
+                float re = src[2 * f] / scale;
+                float im = src[2 * f + 1] / scale;
+                dst[f]              = re * c + im * s;
+                dst[f + freq_count] = im * c - re * s;
+            }
+        }
+
+        // Copy non-rotary dimensions unchanged (partial RoPE)
+        for (uint32_t d = rotary_dim; d < head_dim; d++) {
+            dst[d] = src[d];
+        }
+    }
+}
+
+// Score cached keys for a single (layer, attention_head) pair.
+// Paper Eqs. 6-10: trigonometric importance scoring with MLR norm term.
+//
+// For each key at position p_k with base distance Delta = round_start - p_k:
+//   1. Convert pre-RoPE K to complex representation
+//   2. Compute amplitude: amp_f = ||E[q_f]|| * |k_f|
+//   3. Compute phase: phi_f = angle(E[q_f] * conj(k_f))
+//   4. Compute trig score: S_trig(Delta+delta) = sum_f amp_f * fscale_sq_f * cos(omega_f*(Delta+delta) + phi_f)
+//   5. Compute norm score: S_norm = sum_f extra_f * fscale_sq_f * |k_f|
+//   6. Aggregate over geometric offsets
+void triattention_score_keys(
+    float       * out_scores,
+    const float * pre_rope_k,
+    const triattention_head_stats * stats,
+    const float * omega,
+    const float * freq_scale_sq,
+    const float * offsets,
+    const int32_t * key_positions,
+    int64_t  round_start,
+    uint32_t n_keys,
+    uint32_t head_dim,
+    uint32_t freq_count,
+    uint32_t n_offsets,
+    enum triattention_agg agg,
+    bool disable_trig)
+{
+    const float inv_n_offsets = 1.0f / (float)n_offsets;
+
+    // cos(w * (base + offset)) is evaluated with the angle-addition identity.
+    // The old implementation recomputed sqrt/atan2/cos for every geometric
+    // offset. Algebraically,
+    //
+    //   |q||k| cos(theta + arg(q * conj(k)))
+    //     = Re((q * conj(k)) * exp(i theta))
+    //
+    // so atan2 is unnecessary, |k| is needed only once for the norm term, and
+    // the fixed offset trigonometry can be precomputed once per call.
+    std::vector<float> offset_cos((size_t)freq_count * n_offsets);
+    std::vector<float> offset_sin((size_t)freq_count * n_offsets);
+    if (!disable_trig) {
+        for (uint32_t f = 0; f < freq_count; ++f) {
+            for (uint32_t d = 0; d < n_offsets; ++d) {
+                const float a = omega[f] * offsets[d];
+                offset_cos[(size_t)f * n_offsets + d] = cosf(a);
+                offset_sin[(size_t)f * n_offsets + d] = sinf(a);
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < n_keys; i++) {
+        const float * k = pre_rope_k + (size_t)i * head_dim;
+        const float   base_delta = (float)(round_start - key_positions[i]);
+
+        // Precompute per-frequency quantities for this key
+        // Using "half" layout: k_re = k[f], k_im = k[f + freq_count]
+        // (even-odd would be k[2f], k[2f+1] — handled at invert_rope stage,
+        //  output from invert_rope is always in half layout for scoring)
+
+        if (!disable_trig) {
+            std::vector<float> trig_scores(n_offsets, 0.0f);
+            float norm_score = 0.0f;
+
+            for (uint32_t f = 0; f < freq_count; ++f) {
+                const float k_re = k[f];
+                const float k_im = k[f + freq_count];
+                const float fsq  = freq_scale_sq[f];
+
+                const float conj_re = stats->q_mean_real[f] * k_re + stats->q_mean_imag[f] * k_im;
+                const float conj_im = stats->q_mean_imag[f] * k_re - stats->q_mean_real[f] * k_im;
+
+                if (stats->extra_weight[f] != 0.0f) {
+                    const float k_mag = sqrtf(k_re * k_re + k_im * k_im);
+                    norm_score += stats->extra_weight[f] * fsq * k_mag;
+                }
+
+                const float base_angle = omega[f] * base_delta;
+                const float cb = cosf(base_angle);
+                const float sb = sinf(base_angle);
+
+                for (uint32_t d = 0; d < n_offsets; ++d) {
+                    const float co = offset_cos[(size_t)f * n_offsets + d];
+                    const float so = offset_sin[(size_t)f * n_offsets + d];
+                    const float c  = cb * co - sb * so;
+                    const float s  = sb * co + cb * so;
+                    trig_scores[d] += fsq * (conj_re * c - conj_im * s);
+                }
+            }
+
+            float trig_agg = trig_scores[0];
+            if (agg == TRIATTENTION_AGG_MAX) {
+                for (uint32_t d = 1; d < n_offsets; ++d) {
+                    trig_agg = fmaxf(trig_agg, trig_scores[d]);
+                }
+            } else {
+                for (uint32_t d = 1; d < n_offsets; ++d) {
+                    trig_agg += trig_scores[d];
+                }
+                trig_agg *= inv_n_offsets;
+            }
+
+            out_scores[i] = trig_agg + norm_score;
+        } else {
+            // Ablation: norm-only scoring (disable_trig=true)
+            // Only the position-independent norm term
+            float total_score = 0.0f;
+            for (uint32_t f = 0; f < freq_count; f++) {
+                float k_re = k[f];
+                float k_im = k[f + freq_count];
+                float k_mag = sqrtf(k_re * k_re + k_im * k_im);
+                total_score += stats->extra_weight[f] * freq_scale_sq[f] * k_mag;
+            }
+            out_scores[i] = total_score;
+        }
+    }
+}
+
+// ============================================================================
+// KV cache dequantization helper
+// ============================================================================
+
+// Dequantize K values for a specific KV head from the cache tensor.
+// Handles all supported quantization types and applies inverse WHT
+// rotation for turbo2/turbo3 types.
+//
+// Parameters:
+//   out         — [n_cells, padded_head_dim] dequantized float output
+//   k_tensor    — the raw K cache tensor for this layer
+//   cell_indices— [n_cells] which cell slots to extract
+//   kv_head_idx — which KV head (0..n_kv_heads-1)
+//   n_cells     — number of cells to dequantize
+//   padded_hd   — padded head dimension (128-aligned for turbo types)
+//   n_kv_heads  — total number of KV heads
+//   need_wht_inv— whether to apply inverse WHT rotation (turbo2/turbo3)
+//
+// Note: This function copies data from potentially GPU-resident tensors to
+// CPU memory. The candidates are scanned in physical-index order by reclaim,
+// so fetch the containing row span in one transfer instead of issuing one
+// synchronous backend read per candidate. This is especially important on
+// Vulkan where each synchronous tensor_get otherwise submits and waits a
+// transfer command buffer.
+static void triattention_dequant_kv_head(
+    float              * out,
+    const ggml_tensor  * k_tensor,
+    const uint32_t     * cell_indices,
+    uint32_t             kv_head_idx,
+    uint32_t             n_cells,
+    uint32_t             padded_hd,
+    uint32_t             n_kv_heads,
+    bool                 need_wht_inv)
+{
+    (void)n_kv_heads;  // kept for API symmetry, offset computed via kv_head_idx * padded_hd
+
+    const ggml_type k_type = k_tensor->type;
+    const uint64_t  n_embd_k_gqa = k_tensor->ne[0];  // total K embedding (all KV heads)
+    const size_t    row_bytes = ggml_row_size(k_type, n_embd_k_gqa);
+
+    // Byte offset to this KV head within a row
+    const size_t head_offset_bytes = ggml_row_size(k_type, (uint64_t)kv_head_idx * padded_hd);
+    uint32_t cell_min = cell_indices[0];
+    uint32_t cell_max = cell_indices[0];
+    for (uint32_t ci = 1; ci < n_cells; ++ci) {
+        cell_min = std::min(cell_min, cell_indices[ci]);
+        cell_max = std::max(cell_max, cell_indices[ci]);
+    }
+
+    const size_t span_rows  = (size_t)cell_max - cell_min + 1;
+    const size_t row_stride = k_tensor->nb[1];
+    const size_t span_bytes = (span_rows - 1) * row_stride + row_bytes;
+    std::vector<uint8_t> quant_span(span_bytes);
+
+    ggml_backend_tensor_get(
+        k_tensor,
+        quant_span.data(),
+        (size_t)cell_min * row_stride,
+        span_bytes);
+
+    // Temporary buffer for dequantized values (before WHT inverse)
+    std::vector<float> dequant_tmp(padded_hd);
+
+    for (uint32_t ci = 0; ci < n_cells; ci++) {
+        const uint32_t cell_idx = cell_indices[ci];
+
+        // Byte offset inside the single bulk read above. This addresses stream
+        // 0 (the common case for unified KV caches).
+        const size_t span_offset = ((size_t)cell_idx - cell_min) * row_stride + head_offset_bytes;
+        const uint8_t * quant_src = quant_span.data() + span_offset;
+
+        // Dequantize based on type
+        float * dst = need_wht_inv ? dequant_tmp.data() : (out + (size_t)ci * padded_hd);
+
+        switch (k_type) {
+            case GGML_TYPE_TURBO3_0:
+                dequantize_row_turbo3_0(quant_src, dst, padded_hd);
+                break;
+            case GGML_TYPE_TURBO4_0:
+                dequantize_row_turbo4_0(quant_src, dst, padded_hd);
+                break;
+            case GGML_TYPE_TURBO2_0:
+                dequantize_row_turbo2_0(quant_src, dst, padded_hd);
+                break;
+            case GGML_TYPE_Q8_0:
+                dequantize_row_q8_0(quant_src, dst, padded_hd);
+                break;
+            case GGML_TYPE_F16: {
+                const ggml_fp16_t * src16 = (const ggml_fp16_t *)quant_src;
+                for (uint32_t j = 0; j < padded_hd; j++) {
+                    dst[j] = ggml_fp16_to_fp32(src16[j]);
+                }
+                break;
+            }
+            case GGML_TYPE_BF16: {
+                const ggml_bf16_t * src16 = (const ggml_bf16_t *)quant_src;
+                for (uint32_t j = 0; j < padded_hd; j++) {
+                    dst[j] = ggml_bf16_to_fp32(src16[j]);
+                }
+                break;
+            }
+            case GGML_TYPE_F32: {
+                memcpy(dst, quant_src, padded_hd * sizeof(float));
+                break;
+            }
+            default:
+                llama_kv_decode_key(k_type, quant_src, dst, padded_hd);
+                break;
+        }
+
+        // Restore post-RoPE K before applying inverse RoPE.
+        if (need_wht_inv) {
+            float * final_dst = out + (size_t)ci * padded_hd;
+            // Process in 128-element blocks (WHT block size)
+            for (uint32_t b = 0; b < padded_hd; b += 128) {
+                triattention_inverse_wht_128(dequant_tmp.data() + b, final_dst + b);
+            }
+        }
+    }
+}
+
+// Same dequantization path as triattention_dequant_kv_head(), but consumes a
+// host snapshot containing complete K rows. Runtime score_combined() uses this
+// to amortize device readback to one transfer per sampled layer instead of one
+// synchronous transfer per (sampled head, candidate cell).
+static void triattention_dequant_kv_head_from_rows(
+    float              * out,
+    const uint8_t      * rows,
+    size_t               row_bytes,
+    ggml_type            k_type,
+    const uint32_t     * cell_indices,
+    uint32_t             kv_head_idx,
+    uint32_t             n_cells,
+    uint32_t             padded_hd,
+    bool                 need_wht_inv)
+{
+    const size_t head_offset_bytes = ggml_row_size(k_type, (uint64_t) kv_head_idx * padded_hd);
+
+    std::vector<float> dequant_tmp(padded_hd);
+
+    for (uint32_t ci = 0; ci < n_cells; ++ci) {
+        const uint8_t * src = rows + (size_t) cell_indices[ci] * row_bytes + head_offset_bytes;
+        float * dst = need_wht_inv ? dequant_tmp.data() : out + (size_t) ci * padded_hd;
+
+        switch (k_type) {
+            case GGML_TYPE_TURBO3_0:
+                dequantize_row_turbo3_0(src, dst, padded_hd);
+                break;
+            case GGML_TYPE_TURBO4_0:
+                dequantize_row_turbo4_0(src, dst, padded_hd);
+                break;
+            case GGML_TYPE_TURBO2_0:
+                dequantize_row_turbo2_0(src, dst, padded_hd);
+                break;
+            case GGML_TYPE_Q8_0:
+                dequantize_row_q8_0(src, dst, padded_hd);
+                break;
+            case GGML_TYPE_F16: {
+                const ggml_fp16_t * src16 = (const ggml_fp16_t *) src;
+                for (uint32_t j = 0; j < padded_hd; ++j) {
+                    dst[j] = ggml_fp16_to_fp32(src16[j]);
+                }
+                break;
+            }
+            case GGML_TYPE_BF16: {
+                const ggml_bf16_t * src16 = (const ggml_bf16_t *) src;
+                for (uint32_t j = 0; j < padded_hd; ++j) {
+                    dst[j] = ggml_bf16_to_fp32(src16[j]);
+                }
+                break;
+            }
+            case GGML_TYPE_F32:
+                memcpy(dst, src, padded_hd * sizeof(float));
+                break;
+            default:
+                llama_kv_decode_key(k_type, src, dst, padded_hd);
+                break;
+        }
+
+        if (need_wht_inv) {
+            float * final_dst = out + (size_t) ci * padded_hd;
+            for (uint32_t b = 0; b < padded_hd; b += 128) {
+                triattention_inverse_wht_128(dequant_tmp.data() + b, final_dst + b);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// triattention_scorer: pimpl implementation
+// ============================================================================
+
+struct triattention_scorer::impl {
+    triattention_calibration * cal = nullptr;
+    triattention_scorer_config cfg;
+
+    // Precomputed arrays (allocated once at init)
+    float *   omega = nullptr;          // [freq_count]  RoPE frequencies: theta^(-2f/d)
+    float *   freq_scale_sq = nullptr;  // [freq_count]  frequency scaling^2
+    float *   offsets = nullptr;        // [n_offsets]   geometric {1,2,4,...,offset_max}
+    uint32_t  n_offsets = 0;
+
+    bool      is_valid = false;
+
+#ifdef GGML_USE_CUDA
+    // GPU state cache: one triattention_gpu_state per (device_id, k_type) pair.
+    // Key: device_id * 1000 + (int)k_type
+    // This handles layer-adaptive K types and multi-GPU placement.
+    std::map<uint64_t, triattention_gpu_state *> gpu_states;
+
+    ~impl() {
+        // Free GPU states
+        for (auto & [key, state] : gpu_states) {
+            if (state) {
+                triattention_gpu_free(state);
+            }
+        }
+        gpu_states.clear();
+        if (cal) {
+            triattention_free_calibration(cal);
+            cal = nullptr;
+        }
+        delete[] omega;
+        delete[] freq_scale_sq;
+        delete[] offsets;
+    }
+
+    // Get or create GPU state for a specific (device, k_type) combination.
+    // Returns nullptr if initialization fails.
+    triattention_gpu_state * get_gpu_state(int device_id, ggml_type k_type) {
+        // Unsupported CUDA scorer combinations use the checked host decoder.
+        if (cfg.k_hadamard != 0 ||
+            (k_type != GGML_TYPE_F32 && k_type != GGML_TYPE_F16 &&
+             k_type != GGML_TYPE_Q8_0 && !llama_kv_is_turbo(k_type))) {
+            return nullptr;
+        }
+        const bool need_wht_inv = triattention_needs_inverse_wht(k_type);
+        if (need_wht_inv && (cal->head_dim != 128 || cal->rotary_dim != cal->head_dim)) {
+            // The current CUDA scorer can cooperatively invert exactly one
+            // 128-wide WHT block. Fall back to the backend-read CPU scorer for
+            // partial-RoPE or wider TurboQuant heads instead of scoring bad K.
+            return nullptr;
+        }
+
+        const uint64_t key = (uint64_t)device_id * 1000 + (uint64_t)k_type;
+        auto it = gpu_states.find(key);
+        if (it != gpu_states.end()) {
+            return it->second;
+        }
+
+        // Initialize GPU state for this (device, k_type)
+        triattention_gpu_config gcfg = {};
+        gcfg.head_dim      = cal->head_dim;
+        gcfg.freq_count    = cal->freq_count;
+        gcfg.n_kv_heads    = cal->num_kv_heads;
+        gcfg.n_sampled     = cal->n_sampled;
+        gcfg.n_offsets     = n_offsets;
+        gcfg.rope_style    = cal->rope_style;
+        gcfg.k_type        = k_type;
+        gcfg.need_wht_inv  = need_wht_inv;
+        gcfg.disable_trig  = cfg.disable_trig;
+
+        // Build per-head calibration arrays
+        std::vector<triattention_gpu_head_calib> head_calibs(cal->n_sampled);
+        for (uint32_t h = 0; h < cal->n_sampled; h++) {
+            head_calibs[h].q_mean_real  = cal->head_stats[h].q_mean_real;
+            head_calibs[h].q_mean_imag  = cal->head_stats[h].q_mean_imag;
+            head_calibs[h].q_mean_abs   = cal->head_stats[h].q_mean_abs;
+            head_calibs[h].extra_weight = cal->head_stats[h].extra_weight;
+        }
+
+        // Set CUDA device before init
+        cudaSetDevice(device_id);
+
+        triattention_gpu_state * state = triattention_gpu_init(
+            &gcfg, head_calibs.data(), omega, freq_scale_sq, offsets, nullptr);
+
+        if (state) {
+            gpu_states[key] = state;
+        }
+        return state;
+    }
+#else
+    ~impl() {
+        if (cal) {
+            triattention_free_calibration(cal);
+            cal = nullptr;
+        }
+        delete[] omega;
+        delete[] freq_scale_sq;
+        delete[] offsets;
+    }
+#endif
+
+    // Find the sampled head index for a given (model_layer, kv_head).
+    // Returns -1 if no sampled head matches.
+    int32_t find_sampled_head(uint32_t model_layer, uint32_t kv_head) const {
+        for (uint32_t sh = 0; sh < cal->n_sampled; sh++) {
+            if (cal->sampled_layer[sh] == model_layer) {
+                uint32_t attn_head = cal->sampled_head[sh];
+                uint32_t kv_h = attn_head / cal->num_kv_groups;
+                if (kv_h == kv_head) {
+                    return (int32_t)sh;
+                }
+            }
+        }
+        return -1;
+    }
+};
+
+// ============================================================================
+// triattention_scorer: public API
+// ============================================================================
+
+triattention_scorer::triattention_scorer(
+    const char * stats_path,
+    const triattention_scorer_config & cfg,
+    double rope_theta,
+    uint32_t head_dim,
+    uint32_t n_kv_heads,
+    uint32_t runtime_rotary_dim,
+    const float * runtime_omega,
+    const float * runtime_freq_scale_sq,
+    int32_t expected_rope_style)
+{
+    pimpl = std::make_unique<impl>();
+    pimpl->cfg = cfg;
+
+    // Load calibration file
+    triattention_calibration * cal = triattention_load_calibration(stats_path);
+    if (!cal) {
+        return;
+    }
+
+    // Validate model compatibility
+    if (cal->head_dim != head_dim) {
+        fprintf(stderr, "[TriAttention] ERROR: head_dim mismatch (calibration=%u, model=%u)\n",
+                cal->head_dim, head_dim);
+        triattention_free_calibration(cal);
+        return;
+    }
+    if (cal->num_kv_heads != n_kv_heads) {
+        fprintf(stderr, "[TriAttention] ERROR: n_kv_heads mismatch (calibration=%u, model=%u)\n",
+                cal->num_kv_heads, n_kv_heads);
+        triattention_free_calibration(cal);
+        return;
+    }
+    if (runtime_rotary_dim != 0 && cal->rotary_dim != runtime_rotary_dim) {
+        fprintf(stderr, "[TriAttention] ERROR: rotary_dim mismatch (calibration=%u, model=%u)\n",
+                cal->rotary_dim, runtime_rotary_dim);
+        triattention_free_calibration(cal);
+        return;
+    }
+    if (expected_rope_style >= 0 && cal->rope_style != (uint32_t) expected_rope_style) {
+        fprintf(stderr,
+                "[TriAttention] ERROR: RoPE pairing mismatch (calibration=%s, model=%s). "
+                "Regenerate calibration with the current collector.\n",
+                cal->rope_style == 0 ? "half/NeoX" : "even-odd",
+                expected_rope_style == 0 ? "half/NeoX" : "even-odd");
+        triattention_free_calibration(cal);
+        return;
+    }
+    // Warn if rope_theta differs significantly (>1% relative)
+    if (fabs(cal->rope_theta - rope_theta) / fmax(cal->rope_theta, 1.0) > 0.01) {
+        fprintf(stderr, "[TriAttention] WARNING: rope_theta mismatch (calibration=%.1f, model=%.1f)\n",
+                cal->rope_theta, rope_theta);
+    }
+
+    pimpl->cal = cal;
+
+    if (cfg.k_hadamard != 0 &&
+        ((cfg.k_hadamard & (cfg.k_hadamard - 1)) != 0 || head_dim % cfg.k_hadamard != 0)) {
+        throw std::runtime_error("TriAttention: invalid K attention rotation tile");
+    }
+
+    const uint32_t fc = cal->freq_count;
+
+    // Build precomputed arrays
+    pimpl->omega = new float[fc];
+    pimpl->freq_scale_sq = new float[fc];
+    if (runtime_omega && runtime_freq_scale_sq) {
+        memcpy(pimpl->omega, runtime_omega, fc * sizeof(float));
+        memcpy(pimpl->freq_scale_sq, runtime_freq_scale_sq, fc * sizeof(float));
+    } else {
+        // Legacy/test fallback: exact only for unscaled RoPE without frequency factors.
+        triattention_build_omega(pimpl->omega, fc, cal->rotary_dim, rope_theta);
+        std::fill(pimpl->freq_scale_sq, pimpl->freq_scale_sq + fc, 1.0f);
+    }
+
+    // Geometric offsets — max 17 elements for offset_max=65536
+    pimpl->offsets = new float[32];  // generous allocation
+    pimpl->n_offsets = triattention_build_offsets(pimpl->offsets, cfg.offset_max);
+
+    // Precompute derived head stats
+    for (uint32_t h = 0; h < cal->n_sampled; h++) {
+        triattention_precompute_head_derived(&cal->head_stats[h], fc, cfg.disable_mlr);
+    }
+
+    pimpl->is_valid = true;
+
+    fprintf(stderr, "[TriAttention] Scorer initialized: agg=%d, offsets=%u, "
+            "normalize=%d, sampled_heads=%u\n",
+            (int)cfg.agg, pimpl->n_offsets, (int)cfg.normalize_scores, cal->n_sampled);
+}
+
+triattention_scorer::~triattention_scorer() = default;
+
+bool triattention_scorer::valid() const {
+    return pimpl && pimpl->is_valid;
+}
+
+bool triattention_scorer::matches_layers(const int32_t * layer_map, uint32_t n_layers) const {
+    if (!valid()) {
+        return false;
+    }
+    for (uint32_t i = 0; i < n_layers; ++i) {
+        for (uint32_t sh = 0; sh < pimpl->cal->n_sampled; ++sh) {
+            if (layer_map[i] == (int32_t) pimpl->cal->sampled_layer[sh]) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Canonical little-endian serialization of validated calibration content for
+// fingerprinting (dims, rope params, sampled ids, all stats floats, name).
+static void triattention_calibration_serialize(const triattention_calibration * cal,
+                                               std::vector<uint8_t> & out) {
+    auto pu32 = [&](uint32_t v) {
+        for (int i = 0; i < 4; ++i) {
+            out.push_back((uint8_t) ((v >> (i * 8)) & 0xFF));
+        }
+    };
+    auto pf = [&](float v) {
+        uint32_t b = 0;
+        std::memcpy(&b, &v, sizeof(b));
+        pu32(b);
+    };
+    auto pd = [&](double v) {
+        uint64_t b = 0;
+        std::memcpy(&b, &v, sizeof(b));
+        for (int i = 0; i < 8; ++i) {
+            out.push_back((uint8_t) ((b >> (i * 8)) & 0xFF));
+        }
+    };
+    pu32(cal->head_dim);
+    pu32(cal->num_layers);
+    pu32(cal->num_attn_heads);
+    pu32(cal->num_kv_heads);
+    pu32(cal->num_kv_groups);
+    pd(cal->rope_theta);
+    pu32(cal->rope_style);
+    pu32(cal->freq_count);
+    pu32(cal->rotary_dim);
+    pu32(cal->n_sampled);
+    for (uint32_t i = 0; i < cal->n_sampled; ++i) {
+        pu32(cal->sampled_layer[i]);
+        pu32(cal->sampled_head[i]);
+        for (uint32_t f = 0; f < cal->freq_count; ++f) {
+            pf(cal->head_stats[i].q_mean_real[f]);
+            pf(cal->head_stats[i].q_mean_imag[f]);
+            pf(cal->head_stats[i].q_abs_mean[f]);
+        }
+    }
+    for (int i = 0; i < 256 && cal->model_name[i] != '\0'; ++i) {
+        out.push_back((uint8_t) cal->model_name[i]);
+    }
+}
+
+uint64_t triattention_scorer::calibration_content_fingerprint() const {
+    if (!valid() || !pimpl->cal) {
+        return 0;
+    }
+    std::vector<uint8_t> buf;
+    triattention_calibration_serialize(pimpl->cal, buf);
+    return llama_xkv::xkv_state_checksum(buf.data(), buf.size());
+}
+
+bool triattention_scorer::calibration_content_sha256(uint8_t out[32]) const {
+    if (out == nullptr || !valid() || !pimpl->cal) {
+        return false;
+    }
+    std::vector<uint8_t> buf;
+    triattention_calibration_serialize(pimpl->cal, buf);
+    llama_xkv::xkv_sha256(buf.data(), buf.size(), out);
+    return true;
+}
+
+void triattention_scorer::score_head(
+    float * out_scores,
+    const ggml_tensor * k_tensor,
+    const uint32_t * cell_indices,
+    const int32_t * positions,
+    uint32_t kv_head_idx,
+    uint32_t n_candidates,
+    int64_t frontier_position) const
+{
+    if (!valid() || !k_tensor || n_candidates == 0) {
+        if (out_scores && n_candidates > 0) {
+            memset(out_scores, 0, n_candidates * sizeof(float));
+        }
+        return;
+    }
+
+    const auto * cal = pimpl->cal;
+    // We need to find the sampled head for this (layer, kv_head) pair.
+    // The caller passes a single k_tensor for a specific layer.
+    // We search all sampled heads for one whose kv_head matches.
+    // Since we don't know the model layer index here (score_head is per-tensor),
+    // we search for any sampled head with this kv_head_idx.
+    // If multiple sampled heads share the same kv_head (different layers),
+    // we use the first match. For precise (layer, head) scoring, use score_combined.
+    int32_t sh = -1;
+    for (uint32_t s = 0; s < cal->n_sampled; s++) {
+        uint32_t attn_head = cal->sampled_head[s];
+        uint32_t kv_h = attn_head / cal->num_kv_groups;
+        if (kv_h == kv_head_idx) {
+            sh = (int32_t)s;
+            break;
+        }
+    }
+
+    if (sh < 0) {
+        // No calibration for this kv_head — zero scores
+        memset(out_scores, 0, n_candidates * sizeof(float));
+        return;
+    }
+
+    score_sampled_head(
+        out_scores,
+        k_tensor,
+        cell_indices,
+        positions,
+        (uint32_t) sh,
+        kv_head_idx,
+        n_candidates,
+        frontier_position);
+}
+
+void triattention_scorer::score_sampled_head(
+    float * out_scores,
+    const ggml_tensor * k_tensor,
+    const uint32_t * cell_indices,
+    const int32_t * positions,
+    uint32_t sampled_head_idx,
+    uint32_t kv_head_idx,
+    uint32_t n_candidates,
+    int64_t frontier_position) const
+{
+    if (!valid() || !k_tensor || sampled_head_idx >= pimpl->cal->n_sampled || n_candidates == 0) {
+        if (out_scores && n_candidates > 0) {
+            memset(out_scores, 0, n_candidates * sizeof(float));
+        }
+        return;
+    }
+
+    const auto * cal = pimpl->cal;
+    const uint32_t fc = cal->freq_count;
+    const uint32_t hd = cal->head_dim;
+    const uint32_t padded_hd = llama_kv_is_turbo(k_tensor->type) ? ((hd + 127) / 128) * 128 : hd;
+
+    const ggml_type k_type = k_tensor->type;
+    const bool need_wht_inv = triattention_needs_inverse_wht(k_type);
+
+#ifdef GGML_USE_CUDA
+    // GPU fast path: if K tensor is on a CUDA device, score directly on GPU
+    // without copying K data to host. Only the score array is transferred back.
+    ggml_backend_buffer_type_t k_buft = k_tensor->buffer ? ggml_backend_buffer_get_type(k_tensor->buffer) : nullptr;
+    if (k_buft) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(k_buft);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+        const bool is_cuda_buffer = reg_name && strstr(reg_name, "CUDA") != nullptr;
+        if (dev && is_cuda_buffer) {
+            // Get the CUDA device index
+            const char * dev_name = ggml_backend_dev_name(dev);
+            // Try to find device index by matching against CUDA devices
+            int cuda_dev_id = -1;
+            int n_cuda_devs = 0;
+            cudaGetDeviceCount(&n_cuda_devs);
+            for (int d = 0; d < n_cuda_devs; d++) {
+                cudaDeviceProp prop;
+                cudaGetDeviceProperties(&prop, d);
+                if (strstr(dev_name, prop.name) != nullptr) {
+                    cuda_dev_id = d;
+                    break;
+                }
+            }
+            // Fallback: use device 0 if we can't match
+            if (cuda_dev_id < 0 && n_cuda_devs > 0) {
+                cuda_dev_id = 0;
+            }
+
+            if (cuda_dev_id >= 0) {
+                auto * gpu_state = pimpl->get_gpu_state(cuda_dev_id, k_type);
+                if (gpu_state) {
+                    // Get device pointer to K data
+                    void * k_data_dev = k_tensor->data;
+                    const size_t row_bytes = ggml_row_size(k_type, k_tensor->ne[0]);
+
+                    // Upload cell indices and positions to device
+                    uint32_t * cell_indices_dev = nullptr;
+                    int32_t  * positions_dev = nullptr;
+                    triattention_gpu_upload_cells(
+                        &cell_indices_dev, &positions_dev,
+                        cell_indices, positions, n_candidates, nullptr);
+
+                    // Allocate score buffer on device
+                    float * scores_dev = triattention_gpu_alloc_scores(n_candidates, nullptr);
+
+                    // Launch kernel
+                    triattention_gpu_score_head(
+                        gpu_state, k_data_dev,
+                        (uint64_t)k_tensor->ne[0], row_bytes,
+                        kv_head_idx, sampled_head_idx,
+                        cell_indices_dev, positions_dev,
+                        n_candidates, frontier_position,
+                        (int)pimpl->cfg.agg, scores_dev, nullptr);
+
+                    // Copy scores back to host
+                    triattention_gpu_scores_to_host(
+                        out_scores, scores_dev, n_candidates, nullptr);
+
+                    // Cleanup device buffers
+                    triattention_gpu_free_dev(cell_indices_dev);
+                    triattention_gpu_free_dev(positions_dev);
+                    triattention_gpu_free_dev(scores_dev);
+
+                    return;
+                }
+            }
+        }
+    }
+#endif
+
+    // CPU path: dequantize, invert RoPE, score
+    // 1. Dequantize K for this KV head for all candidate cells
+    std::vector<float> dequant_buf((size_t)n_candidates * padded_hd);
+    triattention_dequant_kv_head(
+        dequant_buf.data(),
+        k_tensor,
+        cell_indices,
+        kv_head_idx,
+        n_candidates,
+        padded_hd,
+        cal->num_kv_heads,
+        need_wht_inv);
+
+    for (uint32_t i = 0; i < n_candidates; ++i) {
+        llama_kv_hadamard(dequant_buf.data() + (size_t) i * padded_hd, hd, pimpl->cfg.k_hadamard);
+    }
+
+    // 2. Invert RoPE -> pre-RoPE K (output in half layout)
+    std::vector<float> unrot_buf((size_t)n_candidates * padded_hd);
+    triattention_invert_rope(
+        unrot_buf.data(),
+        dequant_buf.data(),
+        positions,
+        pimpl->omega,
+        pimpl->freq_scale_sq,
+        n_candidates,
+        padded_hd,
+        cal->rotary_dim,
+        fc,
+        cal->rope_style);
+
+    // 3. Score keys
+    triattention_score_keys(
+        out_scores,
+        unrot_buf.data(),
+        &cal->head_stats[sampled_head_idx],
+        pimpl->omega,
+        pimpl->freq_scale_sq,
+        pimpl->offsets,
+        positions,
+        frontier_position,
+        n_candidates,
+        padded_hd,
+        fc,
+        pimpl->n_offsets,
+        pimpl->cfg.agg,
+        pimpl->cfg.disable_trig);
+}
+
+void triattention_scorer::score_combined(
+    float * combined,
+    ggml_tensor * const * k_tensors,
+    uint32_t n_kv_layers,
+    const int32_t * layer_map,
+    const uint32_t * cell_indices,
+    const int32_t * positions,
+    uint32_t n_candidates,
+    int64_t frontier_position) const
+{
+    if (!valid() || n_candidates == 0) {
+        if (combined && n_candidates > 0) {
+            memset(combined, 0, n_candidates * sizeof(float));
+        }
+        return;
+    }
+
+    const auto * cal = pimpl->cal;
+    const uint32_t fc = cal->freq_count;
+    const uint32_t hd = cal->head_dim;
+
+    if (!matches_layers(layer_map, n_kv_layers)) {
+        if (!pimpl->cfg.uncalibrated_draft_recency) {
+            throw std::runtime_error("TriAttention: calibration covers none of the resident KV layers");
+        }
+        for (uint32_t i = 0; i < n_candidates; ++i) {
+            combined[i] = (float) ((int64_t) positions[i] - frontier_position);
+        }
+        return;
+    }
+
+    std::fill(combined, combined + n_candidates, -1e30f);
+
+    // score_combined is the production path. On non-CUDA backends, especially
+    // Vulkan, calling score_sampled_head() independently would synchronously
+    // read one K head for every candidate and every sampled Q head. Ornith has
+    // 160 sampled heads, so that degenerates into hundreds of thousands of
+    // tiny D2H transfers even for a few thousand KV cells.
+    //
+    // Instead, process one sampled model layer at a time:
+    //   * one contiguous K snapshot per layer;
+    //   * one dequant + inverse-RoPE pass per KV head;
+    //   * all calibrated Q heads sharing that KV head score the same recovered
+    //     keys in parallel;
+    //   * normalize each Q head independently, then max/union into combined.
+    // CUDA retains its direct device scorer path below.
+    std::vector<float> temp_scores(n_candidates);
+
+    for (uint32_t l = 0; l < n_kv_layers; ++l) {
+        const int32_t model_layer = layer_map[l];
+        const ggml_tensor * k_tensor = k_tensors[l];
+        if (!k_tensor) {
+            continue;
+        }
+
+        std::vector<std::vector<uint32_t>> sampled_by_kv(cal->num_kv_heads);
+        uint32_t n_layer_sampled = 0;
+        for (uint32_t sh = 0; sh < cal->n_sampled; ++sh) {
+            if ((int32_t) cal->sampled_layer[sh] != model_layer) {
+                continue;
+            }
+            const uint32_t kv_head = cal->sampled_head[sh] / cal->num_kv_groups;
+            if (kv_head < sampled_by_kv.size()) {
+                sampled_by_kv[kv_head].push_back(sh);
+                ++n_layer_sampled;
+            }
+        }
+        if (n_layer_sampled == 0) {
+            continue;
+        }
+
+#ifdef GGML_USE_CUDA
+        bool is_cuda_buffer = false;
+        ggml_backend_buffer_type_t k_buft_layer = k_tensor->buffer ? ggml_backend_buffer_get_type(k_tensor->buffer) : nullptr;
+        if (k_buft_layer) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(k_buft_layer);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+            is_cuda_buffer = reg_name && strstr(reg_name, "CUDA") != nullptr;
+        }
+        if (is_cuda_buffer) {
+            for (uint32_t kv_head = 0; kv_head < sampled_by_kv.size(); ++kv_head) {
+                for (uint32_t sh : sampled_by_kv[kv_head]) {
+                    score_sampled_head(
+                        temp_scores.data(), k_tensor, cell_indices, positions,
+                        sh, kv_head, n_candidates, frontier_position);
+                    if (pimpl->cfg.normalize_scores) {
+                        zscore_normalize(temp_scores.data(), n_candidates);
+                    }
+                    for (uint32_t i = 0; i < n_candidates; ++i) {
+                        combined[i] = std::max(combined[i], temp_scores[i]);
+                    }
+                }
+            }
+            continue;
+        }
+#endif
+
+        const ggml_type k_type = k_tensor->type;
+        const bool k_is_turbo = k_type == GGML_TYPE_TURBO2_0 ||
+                                k_type == GGML_TYPE_TURBO3_0 ||
+                                k_type == GGML_TYPE_TURBO4_0;
+        const bool need_wht_inv = triattention_needs_inverse_wht(k_type);
+        const uint32_t storage_hd = k_is_turbo ? ((hd + 127) / 128) * 128 : hd;
+        const size_t row_bytes = k_tensor->nb[1];
+        const uint32_t max_cell = *std::max_element(cell_indices, cell_indices + n_candidates);
+        const size_t snapshot_bytes = (size_t) max_cell * row_bytes + ggml_row_size(k_type, k_tensor->ne[0]);
+
+        if (snapshot_bytes > ggml_nbytes(k_tensor)) {
+            throw std::runtime_error("TriAttention: K snapshot exceeds tensor bounds");
+        }
+
+        std::vector<uint8_t> snapshot;
+        const uint8_t * rows = nullptr;
+        if (k_tensor->buffer && ggml_backend_buffer_is_host(k_tensor->buffer)) {
+            rows = (const uint8_t *) k_tensor->data;
+        } else {
+            snapshot.resize(snapshot_bytes);
+            ggml_backend_tensor_get(k_tensor, snapshot.data(), 0, snapshot_bytes);
+            rows = snapshot.data();
+        }
+
+        for (uint32_t kv_head = 0; kv_head < sampled_by_kv.size(); ++kv_head) {
+            const auto & sampled = sampled_by_kv[kv_head];
+            if (sampled.empty()) {
+                continue;
+            }
+
+            std::vector<float> dequant_buf((size_t) n_candidates * storage_hd);
+            std::vector<float> unrot_buf  ((size_t) n_candidates * storage_hd);
+
+            triattention_dequant_kv_head_from_rows(
+                dequant_buf.data(), rows, row_bytes, k_type, cell_indices,
+                kv_head, n_candidates, storage_hd, need_wht_inv);
+            for (uint32_t i = 0; i < n_candidates; ++i) {
+                llama_kv_hadamard(dequant_buf.data() + (size_t) i * storage_hd, hd, pimpl->cfg.k_hadamard);
+            }
+            triattention_invert_rope(
+                unrot_buf.data(), dequant_buf.data(), positions, pimpl->omega,
+                pimpl->freq_scale_sq,
+                n_candidates, storage_hd, cal->rotary_dim, fc, cal->rope_style);
+
+            // Ornith maps eight sampled Q heads to each KV head. Score those
+            // independent calibration heads concurrently; each worker writes a
+            // private score row and reads only immutable recovered K data.
+            std::vector<float> head_scores((size_t) sampled.size() * n_candidates);
+            std::vector<std::thread> workers;
+            workers.reserve(sampled.size());
+            for (size_t h = 0; h < sampled.size(); ++h) {
+                workers.emplace_back([&, h]() {
+                    triattention_score_keys(
+                        head_scores.data() + h * n_candidates,
+                        unrot_buf.data(),
+                        &cal->head_stats[sampled[h]],
+                        pimpl->omega,
+                        pimpl->freq_scale_sq,
+                        pimpl->offsets,
+                        positions,
+                        frontier_position,
+                        n_candidates,
+                        storage_hd,
+                        fc,
+                        pimpl->n_offsets,
+                        pimpl->cfg.agg,
+                        pimpl->cfg.disable_trig);
+                });
+            }
+            for (auto & worker : workers) {
+                worker.join();
+            }
+
+            for (size_t h = 0; h < sampled.size(); ++h) {
+                float * scores = head_scores.data() + h * n_candidates;
+                if (pimpl->cfg.normalize_scores) {
+                    zscore_normalize(scores, n_candidates);
+                }
+                for (uint32_t i = 0; i < n_candidates; ++i) {
+                    combined[i] = std::max(combined[i], scores[i]);
+                }
+            }
+        }
+    }
+
+    // If no sampled head matched any layer, all combined entries remain -1e30f.
+    // Replace with 0 so the caller doesn't see sentinel values.
+    bool any_valid = false;
+    for (uint32_t i = 0; i < n_candidates; i++) {
+        if (combined[i] > -1e29f) {
+            any_valid = true;
+            break;
+        }
+    }
+    if (!any_valid) {
+        throw std::runtime_error("TriAttention: no valid K scores; refusing lossy reclaim");
+    }
+}
+
+void triattention_max_pool_scores(
+    float * pooled,
+    const float * scores,
+    const int32_t * positions,
+    uint32_t n_candidates,
+    uint32_t radius)
+{
+    if (n_candidates == 0) {
+        return;
+    }
+
+    std::vector<uint32_t> order(n_candidates);
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        return positions[a] < positions[b];
+    });
+
+    for (uint32_t rank = 0; rank < n_candidates; ++rank) {
+        const uint32_t candidate = order[rank];
+        const int64_t center = positions[candidate];
+        float best = scores[candidate];
+
+        for (uint32_t left = rank; left > 0; --left) {
+            const uint32_t neighbor = order[left - 1];
+            if (center - positions[neighbor] > radius) {
+                break;
+            }
+            best = std::max(best, scores[neighbor]);
+        }
+        for (uint32_t right = rank + 1; right < n_candidates; ++right) {
+            const uint32_t neighbor = order[right];
+            if ((int64_t) positions[neighbor] - center > radius) {
+                break;
+            }
+            best = std::max(best, scores[neighbor]);
+        }
+        pooled[candidate] = best;
+    }
+}
+
+// ============================================================================
+// Accessors
+// ============================================================================
+
+uint32_t triattention_scorer::get_head_dim() const {
+    return pimpl && pimpl->cal ? pimpl->cal->head_dim : 0;
+}
+
+uint32_t triattention_scorer::get_n_kv_heads() const {
+    return pimpl && pimpl->cal ? pimpl->cal->num_kv_heads : 0;
+}
+
+uint32_t triattention_scorer::get_n_sampled() const {
+    return pimpl && pimpl->cal ? pimpl->cal->n_sampled : 0;
+}
+
+uint32_t triattention_scorer::get_freq_count() const {
+    return pimpl && pimpl->cal ? pimpl->cal->freq_count : 0;
+}
+
+const char * triattention_scorer::get_model_name() const {
+    return pimpl && pimpl->cal ? pimpl->cal->model_name : "";
+}
+
+const triattention_calibration * triattention_scorer::get_calibration() const {
+    return pimpl ? pimpl->cal : nullptr;
+}
+
+const float * triattention_scorer::get_omega() const {
+    return pimpl ? pimpl->omega : nullptr;
+}
+
+const float * triattention_scorer::get_freq_scale_sq() const {
+    return pimpl ? pimpl->freq_scale_sq : nullptr;
+}
+
+// ============================================================================
+// Print info
+// ============================================================================
+
+void triattention_scorer::print_info(FILE * stream) const {
+    if (!valid() || !pimpl || !pimpl->cal) {
+        fprintf(stream, "[TriAttention] Scorer not initialized\n");
+        return;
+    }
+
+    const auto * cal = pimpl->cal;
+    const auto & cfg = pimpl->cfg;
+
+    fprintf(stream, "\n=== TriAttention Scorer ===\n");
+    fprintf(stream, "  Model:            %s\n", cal->model_name);
+    fprintf(stream, "  Head dim:         %u\n", cal->head_dim);
+    fprintf(stream, "  Rotary dim:       %u\n", cal->rotary_dim);
+    fprintf(stream, "  Layers:           %u\n", cal->num_layers);
+    fprintf(stream, "  Attention heads:  %u\n", cal->num_attn_heads);
+    fprintf(stream, "  KV heads:         %u\n", cal->num_kv_heads);
+    fprintf(stream, "  KV groups:        %u\n", cal->num_kv_groups);
+    fprintf(stream, "  RoPE theta:       %.1f\n", cal->rope_theta);
+    fprintf(stream, "  RoPE pairing:     %s\n", cal->rope_style == 0 ? "half/NeoX" : "even-odd");
+    fprintf(stream, "  Sampled heads:    %u of %u\n", cal->n_sampled, cal->num_attn_heads);
+    fprintf(stream, "  Freq count:       %u\n", cal->freq_count);
+    fprintf(stream, "  ---\n");
+    fprintf(stream, "  Score aggregation: %s\n",
+            cfg.agg == TRIATTENTION_AGG_MEAN ? "mean" : "max");
+    fprintf(stream, "  Geometric offsets: %u (max %u)\n", pimpl->n_offsets, cfg.offset_max);
+    fprintf(stream, "  Normalize scores:  %s\n", cfg.normalize_scores ? "on" : "off");
+    fprintf(stream, "  Disable MLR:       %s\n", cfg.disable_mlr ? "on" : "off");
+    fprintf(stream, "  Disable trig:      %s\n", cfg.disable_trig ? "on" : "off");
+    fprintf(stream, "===========================\n\n");
+}
+
+// ============================================================================
+// RERoT shared-memory reclaim policy (Stage 10 part 1 — §§23, A.4)
+//
+// Pure helpers only: no KV access, no scoring, no metrics. The caller keeps
+// physical ownership (llama_kv_cells), visibility semantics (layout builder),
+// and tri_* accounting; these functions only make the keeper-deduped target,
+// the pressure gate, the phase order, and the sparse-safe view order
+// assertable in one place.
+// ============================================================================
+
+double tri_rerot_default_ratio() {
+    return 3.0 / 32.0;
+}
+
+uint32_t tri_rerot_target_retention(uint32_t logical_tokens, double ratio, uint32_t tail_guard) {
+    // Guard the ratio exactly like init_triattention(): finite (0, 1].
+    if (!(ratio > 0.0) || !(ratio <= 1.0) || ratio != ratio) {
+        ratio = tri_rerot_default_ratio();
+    }
+    const double scaled = (double) logical_tokens * ratio;
+    uint32_t target = (uint32_t) ceil(scaled);
+    if (target < tail_guard) {
+        target = tail_guard;
+    }
+    return target;
+}
+
+tri_rerot_pressure tri_rerot_classify_pressure(bool kv_pressure, bool recurrent_pressure, bool maintenance_due) {
+    if (kv_pressure && recurrent_pressure) {
+        return TRI_REROT_PRESSURE_BOTH;
+    }
+    if (kv_pressure) {
+        return TRI_REROT_PRESSURE_KV;
+    }
+    if (recurrent_pressure) {
+        return TRI_REROT_PRESSURE_RECURRENT;
+    }
+    if (maintenance_due) {
+        return TRI_REROT_PRESSURE_MAINTENANCE;
+    }
+    return TRI_REROT_PRESSURE_NONE;
+}
+
+bool tri_rerot_should_reclaim(bool kv_pressure, bool recurrent_pressure, bool maintenance_due) {
+    // TriAttention reclaims KV cells only. Recurrent-only pressure must flow
+    // to the recurrent/atomic fallback without scoring or evicting anything.
+    (void) recurrent_pressure;
+    return kv_pressure || maintenance_due;
+}
+
+tri_rerot_phase tri_rerot_phase_after_reclaim(bool changed, bool floor_reached, bool capacity_satisfied) {
+    if (!changed) {
+        return TRI_REROT_PHASE_FLOOR_EXHAUSTED;
+    }
+    if (floor_reached && !capacity_satisfied) {
+        return TRI_REROT_PHASE_FLOOR_EXHAUSTED;
+    }
+    return TRI_REROT_PHASE_STICKY;
+}
+
+const char * tri_rerot_phase_name(tri_rerot_phase phase) {
+    switch (phase) {
+        case TRI_REROT_PHASE_FILL_FIRST:      return "fill-first";
+        case TRI_REROT_PHASE_DRAIN_TO_FLOOR:  return "drain-to-floor";
+        case TRI_REROT_PHASE_STICKY:          return "sticky";
+        case TRI_REROT_PHASE_FLOOR_EXHAUSTED: return "floor-exhausted";
+        case TRI_REROT_PHASE_ATOMIC_FALLBACK: return "atomic-fallback";
+        default:                              return "unknown";
+    }
+}
+
+uint32_t tri_rerot_dedup_candidates(
+    const uint32_t * cells,
+    const int32_t  * positions,
+    uint32_t n,
+    uint32_t * out_cells,
+    int32_t  * out_positions) {
+    if (n == 0) {
+        return 0;
+    }
+    if (cells == nullptr || positions == nullptr) {
+        return 0;
+    }
+    std::unordered_set<uint32_t> seen;
+    seen.reserve((size_t) n * 2);
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (!seen.insert(cells[i]).second) {
+            continue;  // same physical cell via another keeper ref: score once
+        }
+        if (out_cells != nullptr) {
+            out_cells[kept] = cells[i];
+        }
+        if (out_positions != nullptr) {
+            out_positions[kept] = positions[i];
+        }
+        ++kept;
+    }
+    return kept;
+}
+
+uint32_t tri_rerot_count_distinct_positions(const int32_t * positions, uint32_t n) {
+    if (n == 0 || positions == nullptr) {
+        return 0;
+    }
+    std::unordered_set<int32_t> seen;
+    seen.reserve((size_t) n * 2);
+    for (uint32_t i = 0; i < n; ++i) {
+        seen.insert(positions[i]);
+    }
+    return (uint32_t) seen.size();
+}
+
+void tri_rerot_order_by_storage(
+    const int32_t  * storage_pos,
+    const uint64_t * frontier_or_null,
+    const uint32_t * cells_or_null,
+    uint32_t n,
+    uint32_t * order) {
+    if (n == 0) {
+        return;
+    }
+    if (storage_pos == nullptr || order == nullptr) {
+        return;
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+        order[i] = i;
+    }
+    std::stable_sort(order, order + n, [&](uint32_t a, uint32_t b) {
+        if (storage_pos[a] != storage_pos[b]) {
+            return storage_pos[a] < storage_pos[b];
+        }
+        const uint64_t fa = frontier_or_null != nullptr ? frontier_or_null[a] : 0;
+        const uint64_t fb = frontier_or_null != nullptr ? frontier_or_null[b] : 0;
+        if (fa != fb) {
+            return fa < fb;
+        }
+        const uint32_t ca = cells_or_null != nullptr ? cells_or_null[a] : a;
+        const uint32_t cb = cells_or_null != nullptr ? cells_or_null[b] : b;
+        if (ca != cb) {
+            return ca < cb;
+        }
+        return a < b;
+    });
+}
+
+bool tri_rerot_policy_selfcheck() {
+    // 1. Archive/exec/parked fan-out must not inflate the scored set: one
+    //    PUBLIC cell held by three keeper refs folds to one candidate.
+    {
+        const uint32_t cells[]     = { 5, 5, 5, 9 };
+        const int32_t  positions[] = { 42, 42, 42, 43 };
+        uint32_t out_cells[4] = {};
+        int32_t  out_pos[4]   = {};
+        const uint32_t kept = tri_rerot_dedup_candidates(cells, positions, 4, out_cells, out_pos);
+        if (kept != 2 || out_cells[0] != 5 || out_cells[1] != 9 ||
+            out_pos[0] != 42 || out_pos[1] != 43) {
+            fprintf(stderr, "[TriAttention] selfcheck: keeper-ref dedup failed (kept=%u)\n", kept);
+            return false;
+        }
+        // Counting mode (null outputs) must agree.
+        if (tri_rerot_dedup_candidates(cells, positions, 4, nullptr, nullptr) != 2) {
+            fprintf(stderr, "[TriAttention] selfcheck: dedup counting mode failed\n");
+            return false;
+        }
+    }
+
+    // 2. Target sizes over distinct logical history, not ref multiplicity:
+    //    the triple-held cell above is one logical token, not three.
+    {
+        const int32_t positions[] = { 42, 42, 42, 43 };
+        if (tri_rerot_count_distinct_positions(positions, 4) != 2) {
+            fprintf(stderr, "[TriAttention] selfcheck: distinct-position count failed\n");
+            return false;
+        }
+        // 320 logical tokens at 3/32 keep 30, raised to the 128 tail guard;
+        // 2048 logical tokens keep 192. Keeper refs never enter this path.
+        if (tri_rerot_target_retention(320, tri_rerot_default_ratio(), 128) != 128) {
+            fprintf(stderr, "[TriAttention] selfcheck: floor target failed\n");
+            return false;
+        }
+        if (tri_rerot_target_retention(2048, tri_rerot_default_ratio(), 128) != 192) {
+            fprintf(stderr, "[TriAttention] selfcheck: ratio target failed\n");
+            return false;
+        }
+        // Degenerate ratio falls back to the configured floor instead of 0.
+        if (tri_rerot_target_retention(2048, 0.0, 128) != 192) {
+            fprintf(stderr, "[TriAttention] selfcheck: ratio fallback failed\n");
+            return false;
+        }
+    }
+
+    // 3. Recurrent-only pressure never triggers Tri reclaim; KV pressure and
+    //    sticky maintenance do; idle does nothing.
+    {
+        if (tri_rerot_should_reclaim(false, true, false)) {
+            fprintf(stderr, "[TriAttention] selfcheck: recurrent-only pressure must not reclaim\n");
+            return false;
+        }
+        if (!tri_rerot_should_reclaim(true, false, false) ||
+            !tri_rerot_should_reclaim(true, true, false) ||
+            !tri_rerot_should_reclaim(false, false, true)) {
+            fprintf(stderr, "[TriAttention] selfcheck: KV/maintenance pressure must reclaim\n");
+            return false;
+        }
+        if (tri_rerot_should_reclaim(false, false, false)) {
+            fprintf(stderr, "[TriAttention] selfcheck: idle must not reclaim\n");
+            return false;
+        }
+        if (tri_rerot_classify_pressure(false, true, false) != TRI_REROT_PRESSURE_RECURRENT ||
+            tri_rerot_classify_pressure(true, true, false)  != TRI_REROT_PRESSURE_BOTH ||
+            tri_rerot_classify_pressure(false, false, true) != TRI_REROT_PRESSURE_MAINTENANCE ||
+            tri_rerot_classify_pressure(false, false, false) != TRI_REROT_PRESSURE_NONE) {
+            fprintf(stderr, "[TriAttention] selfcheck: pressure classification failed\n");
+            return false;
+        }
+    }
+
+    // 4. Phase order: satisfying reclaim parks at sticky; empty or
+    //    floor-without-capacity advances to floor-exhausted (caller fallback).
+    {
+        if (tri_rerot_phase_after_reclaim(true, true, true) != TRI_REROT_PHASE_STICKY ||
+            tri_rerot_phase_after_reclaim(false, true, false) != TRI_REROT_PHASE_FLOOR_EXHAUSTED ||
+            tri_rerot_phase_after_reclaim(true, true, false) != TRI_REROT_PHASE_FLOOR_EXHAUSTED) {
+            fprintf(stderr, "[TriAttention] selfcheck: phase transition failed\n");
+            return false;
+        }
+    }
+
+    // 5. Reclaim-then-view: sparse storage (gaps, no continuity) orders by
+    //    storage_pos and packs dense virtual [0, L); evicting one resident
+    //    and re-enumerating keeps the remainder dense with no span holes.
+    {
+        const int32_t  storage[]  = { 100, 5, 50, 7 };
+        const uint64_t frontier[] = { 3, 1, 2, 1 };
+        const uint32_t cells[]    = { 11, 4, 8, 6 };
+        uint32_t order[4] = {};
+        tri_rerot_order_by_storage(storage, frontier, cells, 4, order);
+        // Expect storage order 5(c4,f1), 7(c6,f1), 50(c8,f2), 100(c11,f3).
+        const uint32_t expect[] = { 1, 3, 2, 0 };
+        for (uint32_t r = 0; r < 4; ++r) {
+            if (order[r] != expect[r]) {
+                fprintf(stderr, "[TriAttention] selfcheck: sparse order failed at rank %u\n", r);
+                return false;
+            }
+        }
+        // Dense virtual pack: rank index itself; storage gaps vanish.
+        for (uint32_t v = 0; v < 4; ++v) {
+            if (order[v] >= 4) {
+                fprintf(stderr, "[TriAttention] selfcheck: virtual pack out of range\n");
+                return false;
+            }
+        }
+        // Simulate post-reclaim residents (storage 50 evicted): the view
+        // re-enumerates only survivors and stays dense [0, 3).
+        const int32_t storage2[] = { 100, 5, 7 };
+        uint32_t order2[3] = {};
+        tri_rerot_order_by_storage(storage2, nullptr, nullptr, 3, order2);
+        const uint32_t expect2[] = { 1, 2, 0 };
+        for (uint32_t r = 0; r < 3; ++r) {
+            if (order2[r] != expect2[r]) {
+                fprintf(stderr, "[TriAttention] selfcheck: post-reclaim repack failed\n");
+                return false;
+            }
+        }
+    }
+
+    return true;
+}

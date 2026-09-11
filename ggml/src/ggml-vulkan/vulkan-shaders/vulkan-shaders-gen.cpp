@@ -775,6 +775,12 @@ void process_shaders() {
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
 
+        if (tname == "iq2_s" || tname == "iq3_xxs") {
+            string_to_spv("mul_mat_vec_id_grouped_" + tname + "_f32_f32", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {"MUL_MAT_ID_GROUPED", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
+            string_to_spv("mul_mat_vec_id_grouped_" + tname + "_f32_f32_subgroup", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {"MUL_MAT_ID_GROUPED", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv("mul_mat_vec_id_grouped_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {"MUL_MAT_ID_GROUPED", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+        }
+
         // mul mat vec with integer dot product
 #if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
         if (is_legacy_quant(tname) || tname == "mxfp4" || is_k_quant(tname) || tname == "iq1_s" || tname == "iq1_m") {
@@ -844,6 +850,12 @@ void process_shaders() {
         string_to_spv("cpy_" + t + "_f32", "copy_from_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     }
 
+    // TurboQuant dequantize-to-F32 (bounded hot-row rephasing read path;
+    // quantize direction stays exclusively with set_rows_f32_turbo_*).
+    for (std::string t : {"turbo2_0", "turbo3_0", "turbo4_0"}) {
+        string_to_spv("cpy_" + t + "_f32", "copy_from_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+    }
+
     for (auto src : {std::pair{"f32", "float"}, std::pair{"f16", "float16_t"}}) {
         for (std::string dst : {"f32", "f16", "bf16", "q1_0", "q2_0", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl"}) {
             string_to_spv("set_rows_" + std::string(src.first) + "_" + dst + "_i32", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(dst), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"S_TYPE", src.second}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
@@ -860,6 +872,25 @@ void process_shaders() {
 
     // TurboQuant Walsh-Hadamard Transform op (Q forward + kqv inverse rotation)
     string_to_spv("turbo_wht", "turbo_wht.comp", {});
+
+    // XKV selected-row factor reconstruction (single dispatch per op)
+    string_to_spv("xkv_reconstruct", "xkv_reconstruct.comp", {});
+
+    // XKV dual-source indexed attention (one dispatch per KV head)
+    string_to_spv("xkv_attention", "xkv_attention.comp", {});
+
+    // XKV device-local factorization + canonicalize-hot (owned by XkvVulkanFactorizer)
+    string_to_spv("xkv_factorize", "xkv_factorize.comp", {});
+    string_to_spv("xkv_canonicalize", "xkv_canonicalize.comp", {});
+
+    // XKV landmark score + select (owned by XkvVulkanLandmark)
+    string_to_spv("xkv_landmark_score", "xkv_landmark_score.comp", {});
+    string_to_spv("xkv_landmark_select", "xkv_landmark_select.comp", {});
+
+    // XKV landmark construction (owned by XkvNativeLandmarkBuild)
+    string_to_spv("xkv_landmark_build", "xkv_landmark_build.comp", {});
+    string_to_spv("xkv_landmark_rows", "xkv_landmark_rows.comp", {});
+    string_to_spv("xkv_landmark_merge", "xkv_landmark_merge.comp", {});
 
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";
@@ -893,6 +924,14 @@ void process_shaders() {
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
 
+    // FlashPrefill V2 (single F32 variant per op; K/V runtime specialization
+    // via FaTypeK/V + FaBlockBytes spec constants like FA, no coopmat dupes).
+    // DATA_A_IQ4_NL provides the shared LUT for IQ4_NL K/V decode.
+    string_to_spv("flashprefill_pool", "flashprefill_pool.comp", {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV4", "vec4"}, {"DATA_A_IQ4_NL", "1"}});
+    string_to_spv("flashprefill_select", "flashprefill_select.comp", {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV4", "vec4"}, {"DATA_A_IQ4_NL", "1"}});
+    string_to_spv("flashprefill_attn", "flashprefill_attn.comp", {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV4", "vec4"}, {"DATA_A_IQ4_NL", "1"}});
+    string_to_spv("flashprefill_merge", "flashprefill_merge.comp", {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV4", "vec4"}});
+
     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});
     string_to_spv("quantize_q8_1_subgroup", "quantize_q8_1.comp", {{"USE_SUBGROUPS", "1"}});
 
@@ -909,9 +948,11 @@ void process_shaders() {
 
     string_to_spv("repeat_i16", "repeat.comp", {{"A_TYPE", "int16_t"}, {"D_TYPE", "int16_t"}});
 
-    string_to_spv("scale_f32", "scale.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+    string_to_spv("scale_f32", "scale.comp", {{"A_TYPE", "float"},     {"D_TYPE", "float"},     {"FLOAT_TYPE", "float"}});
+    string_to_spv("scale_f16", "scale.comp", {{"A_TYPE", "float16_t"}, {"D_TYPE", "float16_t"}, {"FLOAT_TYPE", "float"}});
 
     string_to_spv("pad_f32", "pad.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
+    string_to_spv("memmove_bytes", "memmove_bytes.comp", {});
 
     string_to_spv("concat_i8", "concat.comp", {{"A_TYPE", "uint8_t"}, {"B_TYPE", "uint8_t"}, {"D_TYPE", "uint8_t"}});
     string_to_spv("concat_i16", "concat.comp", {{"A_TYPE", "uint16_t"}, {"B_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
@@ -1287,6 +1328,15 @@ void write_output_files() {
             src << "const uint64_t arr_dmmv_id_" << tname << "_" << btype << "_f32_len[3] =  {mul_mat_vec_id_" << tname << "_" << btype << "_f32_len,  mul_mat_vec_id_" << tname << "_" << btype << "_f32_subgroup_len, mul_mat_vec_id_"  << tname << "_" << btype << "_f32_subgroup_no_shmem_len};\n";
         }
     }
+    }
+
+    for (const std::string& tname : {"iq2_s", "iq3_xxs"}) {
+        hdr << "extern const void * arr_dmmv_id_grouped_" << tname << "_f32_f32_data[3];\n";
+        hdr << "extern const uint64_t arr_dmmv_id_grouped_" << tname << "_f32_f32_len[3];\n";
+        if (basename(input_filepath) == "mul_mat_vec.comp") {
+            src << "const void * arr_dmmv_id_grouped_" << tname << "_f32_f32_data[3] = {mul_mat_vec_id_grouped_" << tname << "_f32_f32_data, mul_mat_vec_id_grouped_" << tname << "_f32_f32_subgroup_data, mul_mat_vec_id_grouped_" << tname << "_f32_f32_subgroup_no_shmem_data};\n";
+            src << "const uint64_t arr_dmmv_id_grouped_" << tname << "_f32_f32_len[3] = {mul_mat_vec_id_grouped_" << tname << "_f32_f32_len, mul_mat_vec_id_grouped_" << tname << "_f32_f32_subgroup_len, mul_mat_vec_id_grouped_" << tname << "_f32_f32_subgroup_no_shmem_len};\n";
+        }
     }
 
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)

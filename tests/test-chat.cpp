@@ -8,7 +8,9 @@
 #include "../src/llama-grammar.h"
 #include "../src/unicode.h"
 #include "../tools/server/server-chat.h"
+#include "../tools/server/server-task.h"
 #include "chat-auto-parser.h"
+#include "chat-peg-parser.h"
 #include "chat.h"
 #include "common.h"
 #include "ggml.h"
@@ -1850,6 +1852,8 @@ static void test_convert_responses_to_chatcmpl() {
         // Verify other fields preserved
         assert_equals(std::string("gpt-5-mini"), result.at("model").get<std::string>());
         assert_equals(false, result.at("stream").get<bool>());
+        assert_equals(std::string("medium"), result.at("reasoning_effort").get<std::string>());
+        assert_equals(false, result.contains("reasoning"));
     }
 
     // Test string input
@@ -7142,6 +7146,95 @@ static void test_reasoning_budget_tokens_per_request() {
     }
 }
 
+static void test_reasoning_effort_per_request() {
+    LOG_DBG("%s\n", __func__);
+
+    // First prove the OAI field reaches templates that natively understand it.
+    {
+        auto tmpls = read_templates("models/templates/openai-gpt-oss-120b.jinja");
+        server_chat_params opt;
+        opt.tmpls = std::move(tmpls);
+        opt.use_jinja = true;
+        opt.enable_thinking = true;
+        opt.n_predict = 8192;
+
+        for (const std::string effort : {"low", "medium", "high", "xhigh", "max"}) {
+            json body = {
+                {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
+                {"reasoning_effort", effort},
+                {"max_tokens", 8192},
+            };
+            std::vector<raw_buffer> out_files;
+            auto llama_params = oaicompat_chat_params_parse(body, opt, out_files);
+            assert_contains(llama_params.at("prompt").get<std::string>(), "Reasoning: " + effort);
+        }
+    }
+
+    // Then prove the generic budget fallback is monotone when a template
+    // exposes explicit thinking start/end markers.
+    {
+        auto tmpls = read_templates("models/templates/Qwen-Qwen3-0.6B.jinja");
+        server_chat_params opt;
+        opt.tmpls = std::move(tmpls);
+        opt.use_jinja = true;
+        opt.enable_thinking = true;
+        opt.reasoning_budget = -1;
+        opt.n_predict = 8192;
+
+        const std::vector<std::pair<std::string, int>> expected = {
+            {"low", 1638}, {"medium", 4096}, {"high", 6553},
+            {"xhigh", 7782}, {"max", 8191},
+        };
+        for (const auto & [effort, budget] : expected) {
+            json body = {
+                {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
+                {"reasoning_effort", effort},
+                {"max_completion_tokens", 8192},
+            };
+            std::vector<raw_buffer> out_files;
+            auto llama_params = oaicompat_chat_params_parse(body, opt, out_files);
+            assert_equals(budget, llama_params.at("reasoning_budget_tokens").get<int>());
+        }
+
+        // No finite output cap => do not manufacture an absolute budget from
+        // the effort name. Native effort-aware templates still receive the
+        // effort kwarg; budget-only fallback remains unrestricted/default.
+        opt.n_predict = -1;
+        json unbounded_body = {
+            {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
+            {"reasoning_effort", "high"},
+        };
+        std::vector<raw_buffer> unbounded_files;
+        auto unbounded_params = oaicompat_chat_params_parse(unbounded_body, opt, unbounded_files);
+        assert_equals(-1, unbounded_params.at("reasoning_budget_tokens").get<int>());
+        opt.n_predict = 8192;
+
+        // Exact token budgets are the lower-level escape hatch and always win.
+        json explicit_body = {
+            {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
+            {"reasoning_effort", "max"},
+            {"max_tokens", 8192},
+            {"reasoning_budget_tokens", 777},
+        };
+        std::vector<raw_buffer> explicit_files;
+        auto explicit_params = oaicompat_chat_params_parse(explicit_body, opt, explicit_files);
+        assert_equals(777, explicit_params.at("reasoning_budget_tokens").get<int>());
+
+        bool rejected = false;
+        try {
+            json invalid_body = {
+                {"messages", json::array({json{{"role", "user"}, {"content", "hello"}}})},
+                {"reasoning_effort", "ultra"},
+            };
+            std::vector<raw_buffer> invalid_files;
+            (void) oaicompat_chat_params_parse(invalid_body, opt, invalid_files);
+        } catch (const std::invalid_argument &) {
+            rejected = true;
+        }
+        assert_equals(true, rejected);
+    }
+}
+
 static void test_reasoning_budget_message_per_request() {
     LOG_DBG("%s\n", __func__);
     // Same code path as test_reasoning_budget_tokens_per_request: the Qwen3 template's
@@ -7172,6 +7265,279 @@ static void test_reasoning_budget_message_per_request() {
     std::string got = llama_params["reasoning_budget_message"].get<std::string>();
     if (got != per_request_message) {
         throw std::runtime_error("Expected reasoning_budget_message='" + per_request_message + "', got '" + got + "'");
+    }
+}
+
+static void test_rerot_stream_preserves_tool_calls() {
+    LOG_DBG("%s\n", __func__);
+
+    const auto tools_json =
+        common_chat_tools_to_json_oaicompat({special_function_tool});
+    const auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+        auto reasoning = p.optional(
+            "<think>" + p.reasoning(p.until("</think>")) +
+            "</think>" + p.space());
+        auto tool_call = p.standard_json_tools(
+            "<tool_call>[", "]</tool_call>", tools_json, false, false);
+        return p.sequence({
+            reasoning,
+            p.content(p.until("<tool_call>")),
+            p.optional(p.space() + tool_call),
+            p.space(),
+            p.end(),
+        });
+    });
+
+    common_chat_parser_params parser_params;
+    parser_params.format = COMMON_CHAT_FORMAT_PEG_NATIVE;
+    parser_params.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    parser_params.generation_prompt = "<think>";
+    parser_params.parser.load(parser.save());
+    task_result_state state(parser_params);
+
+    server_task_result_cmpl_partial reasoning;
+    reasoning.res_type = TASK_RESPONSE_TYPE_OAI_RESP;
+    reasoning.is_rerot_reasoning = true;
+    reasoning.content = "lane reasoning\n";
+    reasoning.update(state);
+    assert_equals(false, reasoning.thinking_block_started);
+    assert_equals(true, state.thinking_block_started);
+    assert_equals(std::string("lane reasoning\n"), state.chat_msg.reasoning_content);
+
+    std::string leaked_content;
+    const auto collect_content = [&](const std::vector<common_chat_msg_diff> & diffs) {
+        for (const auto & diff : diffs) {
+            leaked_content += diff.content_delta;
+        }
+    };
+
+    server_task_result_cmpl_partial first;
+    first.is_rerot_content = true;
+    first.content =
+        R"(<tool_call>[{"name":"special_function","arguments":{"arg1":)";
+    first.update(state);
+    collect_content(first.oaicompat_msg_diffs);
+
+    server_task_result_cmpl_partial second;
+    second.is_rerot_content = true;
+    second.content = R"(1}}]</tool_call>)";
+    second.update(state);
+    collect_content(second.oaicompat_msg_diffs);
+
+    server_task_result_cmpl_final final;
+    final.stream = true;
+    final.rerot_explicit_channels = true;
+    final.update(state);
+    collect_content(final.oaicompat_msg_diffs);
+
+    assert_not_contains(leaked_content, "<tool_call>");
+    assert_equals(
+        std::string("lane reasoning\n"),
+        final.oaicompat_msg.reasoning_content);
+    assert_equals(std::string(), final.oaicompat_msg.content);
+    assert_equals(size_t(1), final.oaicompat_msg.tool_calls.size());
+    assert_equals(
+        std::string("special_function"),
+        final.oaicompat_msg.tool_calls.front().name);
+    assert_equals(
+        json({{"arg1", 1}}),
+        json::parse(final.oaicompat_msg.tool_calls.front().arguments));
+    if (final.oaicompat_msg.tool_calls.front().id.empty()) {
+        throw std::runtime_error("RERoT streamed tool call is missing its ID");
+    }
+}
+
+static void test_rerot_nonstream_content_reasoning_clean() {
+    common_chat_parser_params parser_params;
+    parser_params.format = COMMON_CHAT_FORMAT_CONTENT_ONLY;
+    parser_params.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    task_result_state state(parser_params);
+
+    server_task_result_cmpl_final final;
+    final.stream = false;
+    final.rerot_explicit_channels = true;
+    final.rerot_reasoning = "<ol>\n<li>task 1</li>\n</ol>";
+    final.content = "9.9 更大。\n理由：比较十分位。";
+    final.res_type = TASK_RESPONSE_TYPE_OAI_CHAT;
+    final.update(state);
+
+    json res = final.to_json_oaicompat_chat();
+    const auto & choice = res["choices"][0];
+    const auto & msg = choice["message"];
+
+    assert_equals(std::string("9.9 更大。\n理由：比较十分位。"), msg["content"].get<std::string>());
+    assert_equals(std::string("<ol>\n<li>task 1</li>\n</ol>"), msg["reasoning_content"].get<std::string>());
+    assert_not_contains(msg["content"].get<std::string>(), "</think>");
+}
+
+static void test_dag_actual_native_tool_round_frame_certification() {
+    LOG_DBG("%s\n", __func__);
+    // Stage 2 Certification (AGENTS.md §04 / RERoT.md §12.3 / §13.2):
+    // "actual native tool-round FRAME"
+    //
+    // 1. Verifies rendering of F_i using the formal chat template and spawn_lane tool round.
+    // 2. Verifies that F_i is strictly self-contained and depends only on target stage/intent,
+    //    not on physical slot, GPU row, or neighbor identity.
+    // 3. Verifies that concatenating arbitrary legal sequences of segments (e.g. reader 1:
+    //    P + F_2 + R_2 + F_3 + R_3 + F_1 + R_1) closes all preceding thinking blocks and
+    //    leaves strictly and only the current reader's reasoning open at the query horizon.
+    // 4. Verifies across diverse production Jinja templates (Qwen3.5, DeepSeek-V4, Nemotron-3).
+
+    const common_chat_tool spawn_tool{
+        /* .name = */ "spawn_lane",
+        /* .description = */ "Internal DAG lane handoff. Not a user-visible tool.",
+        /* .parameters = */ R"({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "intent": {"type": "string"},
+                "phase": {"type": "string"}
+            },
+            "required": ["id", "intent"]
+        })",
+    };
+
+    struct template_spec {
+        std::string name;
+        std::string path;
+        std::string think_start;
+        std::string think_end;
+    };
+
+    const std::vector<template_spec> specs = {
+        {"Qwen3.5", "models/templates/Qwen3.5-4B.jinja", "<think>", "</think>"},
+        {"DeepSeek-V4", "models/templates/deepseek-ai-DeepSeek-V4.jinja", "<think>", "</think>"},
+        {"DeepSeek-V4-Flash", "models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja", "<think>", "</think>"},
+        {"DeepSeek-V3.2", "models/templates/deepseek-ai-DeepSeek-V3.2.jinja", "<think>", "</think>"},
+    };
+
+    for (const auto & spec : specs) {
+        auto tmpls = read_templates(spec.path);
+        if (!tmpls) {
+            throw std::runtime_error("Failed to load template: " + spec.path);
+        }
+
+        common_chat_msg user_msg;
+        user_msg.role = "user";
+        user_msg.content = "Compute 13 * 17 via parallel decomposition";
+
+        // Render base prompt (P)
+        common_chat_templates_inputs base_inputs;
+        base_inputs.use_jinja = true;
+        base_inputs.enable_thinking = true;
+        base_inputs.add_generation_prompt = true;
+        base_inputs.tools = { spawn_tool };
+        base_inputs.messages = { user_msg };
+
+        const std::string base_prompt = common_chat_templates_apply(tmpls.get(), base_inputs).prompt;
+        assert_equals(true, !base_prompt.empty());
+
+        // Helper to render formal F_i suffix
+        const auto render_frame_suffix = [&](const std::string & id, const std::string & intent, bool is_synth = false) -> std::string {
+            common_chat_msg assistant;
+            assistant.role = "assistant";
+            json args = {{"id", id}, {"intent", intent}};
+            if (is_synth) {
+                args["phase"] = "synthesis";
+            }
+            common_chat_tool_call call;
+            call.name = spawn_tool.name;
+            call.arguments = args.dump();
+            call.id = "rerot-lane-" + id;
+            assistant.tool_calls.push_back(std::move(call));
+
+            common_chat_msg tool;
+            tool.role = "tool";
+            tool.tool_call_id = "rerot-lane-" + id;
+            tool.content = "you are Lane " + id + ", Intent: " + intent;
+
+            common_chat_templates_inputs full_inputs = base_inputs;
+            full_inputs.messages = { user_msg, assistant, tool };
+
+            const std::string full_prompt = common_chat_templates_apply(tmpls.get(), full_inputs).prompt;
+            assert_equals(true, full_prompt.size() > base_prompt.size());
+
+            // LCP extraction
+            size_t lcp = 0;
+            while (lcp < base_prompt.size() && lcp < full_prompt.size() && base_prompt[lcp] == full_prompt[lcp]) {
+                ++lcp;
+            }
+            assert_equals(base_prompt.size(), lcp);
+            return full_prompt.substr(lcp);
+        };
+
+        const std::string f1 = render_frame_suffix("1", "Calculate 13 * 10");
+        const std::string f2 = render_frame_suffix("2", "Calculate 13 * 7");
+        const std::string f3 = render_frame_suffix("3", "Verify intermediate sum");
+        const std::string f_synth = render_frame_suffix("0", "Synthesize 130 + 91 = 221", true);
+
+        // Invariant 1: F_i must contain think_end (to close preceding reasoning),
+        // spawn_lane tool round, and think_start (to open current reader reasoning).
+        assert_contains(f1, spec.think_end);
+        assert_contains(f1, spec.think_start);
+        assert_contains(f1, "spawn_lane");
+        assert_contains(f1, "Calculate 13 * 10");
+
+        assert_contains(f2, spec.think_end);
+        assert_contains(f2, spec.think_start);
+        assert_contains(f2, "spawn_lane");
+        assert_contains(f2, "Calculate 13 * 7");
+
+        // Invariant 2: F_i is target-invariant: f1 rendered independently can be seamlessly
+        // placed after f2, f3 or P in any topological permutation.
+        const std::string r1 = "Step 1: 13 * 10 = 130.\n";
+        const std::string r2 = "Step 2: 13 * 7 = 91.\n";
+        const std::string r3 = "Step 3: 130 and 91 are positive integers.\n";
+
+        // Count think tag balances across the reasoning stream.
+        // We begin tracking at the base prompt's final generation prompt (the opening
+        // of root reasoning in P, per AGENTS.md §04.5) to avoid matching instructions
+        // or schema docs that appear in the system prompt.
+        const size_t initial_generation_open = base_prompt.rfind(spec.think_start);
+        assert_equals(true, initial_generation_open != std::string::npos);
+
+        // Helper to check reasoning balance across an assembled view
+        const auto verify_view_reasoning_balance = [&](const std::string & view, size_t expected_segments) {
+            std::vector<size_t> opens;
+            std::vector<size_t> closes;
+            size_t p = initial_generation_open;
+            while ((p = view.find(spec.think_start, p)) != std::string::npos) {
+                opens.push_back(p);
+                p += spec.think_start.size();
+            }
+            p = initial_generation_open;
+            while ((p = view.find(spec.think_end, p)) != std::string::npos) {
+                closes.push_back(p);
+                p += spec.think_end.size();
+            }
+
+            // Invariant 3: Number of think_start must equal number of think_end + 1,
+            // exactly matching the number of segments concatenated.
+            assert_equals(expected_segments + 1, opens.size());
+            assert_equals(expected_segments, closes.size());
+
+            // Every think_close must close its corresponding think_open strictly before the next think_open.
+            for (size_t i = 0; i < closes.size(); ++i) {
+                assert_equals(true, opens[i] < closes[i]);
+                assert_equals(true, closes[i] < opens[i + 1]);
+            }
+            // At the very end of the view, reasoning must be strictly OPEN (last tag is think_start)
+            assert_equals(true, opens.back() > closes.back());
+        };
+
+        // Composition Test: Reader 1's cyclic topological view (P + B_2 + B_3 + B_1)
+        // 3 appended segments
+        const std::string view_reader_1 = base_prompt + (f2 + r2) + (f3 + r3) + (f1 + r1);
+        verify_view_reasoning_balance(view_reader_1, 3);
+
+        // Composition Test: Reader 2's cyclic topological view (P + B_3 + B_1 + B_2)
+        const std::string view_reader_2 = base_prompt + (f3 + r3) + (f1 + r1) + (f2 + r2);
+        verify_view_reasoning_balance(view_reader_2, 3);
+
+        // Composition Test: Synthesis Final View (P + B_1 + B_2 + B_3 + F_synth)
+        // 4 appended segments (3 workers + synthesis frame)
+        const std::string view_synth = base_prompt + (f1 + r1) + (f2 + r2) + (f3 + r3) + f_synth;
+        verify_view_reasoning_balance(view_synth, 4);
     }
 }
 
@@ -7325,6 +7691,9 @@ int main(int argc, char ** argv) {
     } else
 #endif
     {
+        test_rerot_stream_preserves_tool_calls();
+        test_rerot_nonstream_content_reasoning_clean();
+        test_dag_actual_native_tool_round_frame_certification();
         test_msg_diffs_compute();
         test_msgs_oaicompat_json_conversion();
         test_msg_token_delimiters_split();
@@ -7334,6 +7703,7 @@ int main(int argc, char ** argv) {
         test_deepseek_v4_thinking_retention();
         test_deepseek_v4_tool_result_ordering();
         test_template_generation_prompt();
+        test_reasoning_effort_per_request();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
         test_template_output_peg_parsers(detailed_debug);

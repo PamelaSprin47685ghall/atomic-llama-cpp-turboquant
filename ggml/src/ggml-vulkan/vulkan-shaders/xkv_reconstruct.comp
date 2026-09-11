@@ -1,0 +1,370 @@
+#version 450
+
+// xkv_reconstruct.comp — native XKV selected-row factor reconstruction (v1).
+//
+// One op per exact segment-group (n_groups==1 enforced host-side). Single
+// dispatch per op (one thread per selected row; no per-row/head/segment sync).
+// Code streams stay device-resident; refs/positions/group_meta/rope are bounded
+// small tensors. RoPE is table-driven: rope binding holds [omega(Fc), mag(Fc)]
+// (exact precomputed effective frequencies, partial IMRoPE HALF pairing).
+// Invalid refs/slices (checked against runtime push dimensions AND buffer
+// lengths via counts) poison dst with NaN (fail-closed). Matched Turbo pairs
+// dot in rotated domain; canonical pairs dot directly; mixed rejected host-side.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint n_sel;
+    uint n_groups;
+    uint rank_k;
+    uint rank_v;
+    uint dim_k;
+    uint dim_v;
+    uint rotary_dim;
+    uint rope_mode;
+    uint a_k_type;
+    uint b_k_type;
+    uint a_v_type;
+    uint b_v_type;
+    uint a_k_stride;
+    uint b_k_stride;
+    uint a_v_stride;
+    uint b_v_stride;
+    uint prk;
+    uint prv;
+    uint n_rows_a;
+    uint b_k_rows;
+    uint b_v_rows;
+} p;
+
+layout (binding = 0, std430) readonly buffer AK { uint8_t ak[]; };
+layout (binding = 1, std430) readonly buffer BK { uint8_t bk[]; };
+layout (binding = 2, std430) readonly buffer AV { uint8_t av[]; };
+layout (binding = 3, std430) readonly buffer BV { uint8_t bv[]; };
+layout (binding = 4, std430) readonly buffer REFS { int refs[]; };
+layout (binding = 5, std430) readonly buffer POS { int positions[]; };
+layout (binding = 6, std430) readonly buffer META { int group_meta[]; };
+layout (binding = 7, std430) readonly buffer LAYER { int layer_meta[]; };
+layout (binding = 8, std430) readonly buffer ROPE { float rope[]; };
+layout (binding = 9, std430) buffer DST { float dst[]; };
+
+const float C2[4] = float[4](-0.133462, -0.039994, 0.039994, 0.133462);
+
+// Cody-Waite range reduction of pos * omega to [-pi, pi] using double-precision
+// splitting of 2*pi (PI2_HI + PI2_LO = 2*pi exact to 48 bits). Eliminates
+// GPU hardware range-reduction divergence on large angles (|pos| <= 4096)
+// so v_sin_f32 / v_cos_f32 operate in their near-exact [-pi, pi] domain.
+void rope_trig_cody_waite(float pos_f, float omega, out float out_c, out float out_s) {
+    const float INV_TWO_PI = 0.15915494309189535; // 1 / (2*pi)
+    const float TWO_PI_HI  = 6.2831854820251465;  // high 24 bits
+    const float TWO_PI_LO  = -1.748455588302094e-7; // low bits
+    float ang = pos_f * omega;
+    float k_cycles = round(ang * INV_TWO_PI);
+    float red_ang = fma(k_cycles, -TWO_PI_HI, ang);
+    red_ang = fma(k_cycles, -TWO_PI_LO, red_ang);
+    out_c = cos(red_ang);
+    out_s = sin(red_ang);
+}
+const float C3[8] = float[8](
+    -0.190685, -0.117832, -0.065717, -0.021460,
+     0.021460,  0.065717,  0.117832,  0.190685);
+const float C4[16] = float[16](
+    -0.173926, -0.117195, -0.089527, -0.068756,
+    -0.051262, -0.035597, -0.020989, -0.006938,
+     0.006938,  0.020989,  0.035597,  0.051262,
+     0.068756,  0.089527,  0.117195,  0.173926);
+
+float ak_f16(uint off) {
+    uint h = uint(ak[off]) | (uint(ak[off + 1u]) << 8);
+    return unpackHalf2x16(h).x;
+}
+float bk_f16(uint off) {
+    uint h = uint(bk[off]) | (uint(bk[off + 1u]) << 8);
+    return unpackHalf2x16(h).x;
+}
+float av_f16(uint off) {
+    uint h = uint(av[off]) | (uint(av[off + 1u]) << 8);
+    return unpackHalf2x16(h).x;
+}
+float bv_f16(uint off) {
+    uint h = uint(bv[off]) | (uint(bv[off + 1u]) << 8);
+    return unpackHalf2x16(h).x;
+}
+float ak_f32(uint off) {
+    uint w = uint(ak[off]) | (uint(ak[off + 1u]) << 8) | (uint(ak[off + 2u]) << 16) | (uint(ak[off + 3u]) << 24);
+    return uintBitsToFloat(w);
+}
+float bk_f32(uint off) {
+    uint w = uint(bk[off]) | (uint(bk[off + 1u]) << 8) | (uint(bk[off + 2u]) << 16) | (uint(bk[off + 3u]) << 24);
+    return uintBitsToFloat(w);
+}
+float av_f32(uint off) {
+    uint w = uint(av[off]) | (uint(av[off + 1u]) << 8) | (uint(av[off + 2u]) << 16) | (uint(av[off + 3u]) << 24);
+    return uintBitsToFloat(w);
+}
+float bv_f32(uint off) {
+    uint w = uint(bv[off]) | (uint(bv[off + 1u]) << 8) | (uint(bv[off + 2u]) << 16) | (uint(bv[off + 3u]) << 24);
+    return uintBitsToFloat(w);
+}
+
+float deq_ak(uint base, uint r) {
+    uint t = p.a_k_type;
+    if (t == 0u) { return ak_f32(base + r * 4u); }
+    if (t == 1u) { return ak_f16(base + r * 2u); }
+    if (t == 8u) {
+        uint b = r / 32u; uint j = r % 32u;
+        uint boff = base + b * 34u;
+        float d = ak_f16(boff);
+        int q = int(ak[boff + 2u + j]);
+        if (q >= 128) { q -= 256; }
+        return d * float(q);
+    }
+    if (t == 42u) {
+        uint b = r / 128u; uint j = r % 128u;
+        uint boff = base + b * 34u;
+        float norm = ak_f16(boff);
+        uint qb = uint(ak[boff + 2u + j / 4u]);
+        uint idx = (qb >> (2u * (j % 4u))) & 3u;
+        return norm * C2[idx];
+    }
+    if (t == 43u) {
+        uint b = r / 128u; uint j = r % 128u;
+        uint boff = base + b * 50u;
+        float norm = ak_f16(boff);
+        uint qb = uint(ak[boff + 2u + j / 4u]);
+        uint sb = uint(ak[boff + 2u + 32u + j / 8u]);
+        uint low2 = (qb >> (2u * (j % 4u))) & 3u;
+        uint hi1 = (sb >> (j % 8u)) & 1u;
+        return norm * C3[low2 | (hi1 << 2u)];
+    }
+    {
+        uint b = r / 128u; uint j = r % 128u;
+        uint boff = base + b * 68u;
+        float norm = ak_f16(boff);
+        uint qb = uint(ak[boff + 4u + j / 2u]);
+        uint idx = (qb >> (4u * (j % 2u))) & 15u;
+        return norm * C4[idx];
+    }
+}
+float deq_bk(uint base, uint r) {
+    uint t = p.b_k_type;
+    if (t == 0u) { return bk_f32(base + r * 4u); }
+    if (t == 1u) { return bk_f16(base + r * 2u); }
+    if (t == 8u) {
+        uint b = r / 32u; uint j = r % 32u;
+        uint boff = base + b * 34u;
+        float d = bk_f16(boff);
+        int q = int(bk[boff + 2u + j]);
+        if (q >= 128) { q -= 256; }
+        return d * float(q);
+    }
+    if (t == 42u) {
+        uint b = r / 128u; uint j = r % 128u;
+        uint boff = base + b * 34u;
+        float norm = bk_f16(boff);
+        uint qb = uint(bk[boff + 2u + j / 4u]);
+        uint idx = (qb >> (2u * (j % 4u))) & 3u;
+        return norm * C2[idx];
+    }
+    if (t == 43u) {
+        uint b = r / 128u; uint j = r % 128u;
+        uint boff = base + b * 50u;
+        float norm = bk_f16(boff);
+        uint qb = uint(bk[boff + 2u + j / 4u]);
+        uint sb = uint(bk[boff + 2u + 32u + j / 8u]);
+        uint low2 = (qb >> (2u * (j % 4u))) & 3u;
+        uint hi1 = (sb >> (j % 8u)) & 1u;
+        return norm * C3[low2 | (hi1 << 2u)];
+    }
+    {
+        uint b = r / 128u; uint j = r % 128u;
+        uint boff = base + b * 68u;
+        float norm = bk_f16(boff);
+        uint qb = uint(bk[boff + 4u + j / 2u]);
+        uint idx = (qb >> (4u * (j % 2u))) & 15u;
+        return norm * C4[idx];
+    }
+}
+float deq_av(uint base, uint r) {
+    uint t = p.a_v_type;
+    if (t == 0u) { return av_f32(base + r * 4u); }
+    if (t == 1u) { return av_f16(base + r * 2u); }
+    if (t == 8u) {
+        uint b = r / 32u; uint j = r % 32u;
+        uint boff = base + b * 34u;
+        float d = av_f16(boff);
+        int q = int(av[boff + 2u + j]);
+        if (q >= 128) { q -= 256; }
+        return d * float(q);
+    }
+    if (t == 42u) {
+        uint b = r / 128u; uint j = r % 128u;
+        uint boff = base + b * 34u;
+        float norm = av_f16(boff);
+        uint qb = uint(av[boff + 2u + j / 4u]);
+        uint idx = (qb >> (2u * (j % 4u))) & 3u;
+        return norm * C2[idx];
+    }
+    if (t == 43u) {
+        uint b = r / 128u; uint j = r % 128u;
+        uint boff = base + b * 50u;
+        float norm = av_f16(boff);
+        uint qb = uint(av[boff + 2u + j / 4u]);
+        uint sb = uint(av[boff + 2u + 32u + j / 8u]);
+        uint low2 = (qb >> (2u * (j % 4u))) & 3u;
+        uint hi1 = (sb >> (j % 8u)) & 1u;
+        return norm * C3[low2 | (hi1 << 2u)];
+    }
+    {
+        uint b = r / 128u; uint j = r % 128u;
+        uint boff = base + b * 68u;
+        float norm = av_f16(boff);
+        uint qb = uint(av[boff + 4u + j / 2u]);
+        uint idx = (qb >> (4u * (j % 2u))) & 15u;
+        return norm * C4[idx];
+    }
+}
+float deq_bv(uint base, uint r) {
+    uint t = p.b_v_type;
+    if (t == 0u) { return bv_f32(base + r * 4u); }
+    if (t == 1u) { return bv_f16(base + r * 2u); }
+    if (t == 8u) {
+        uint b = r / 32u; uint j = r % 32u;
+        uint boff = base + b * 34u;
+        float d = bv_f16(boff);
+        int q = int(bv[boff + 2u + j]);
+        if (q >= 128) { q -= 256; }
+        return d * float(q);
+    }
+    if (t == 42u) {
+        uint b = r / 128u; uint j = r % 128u;
+        uint boff = base + b * 34u;
+        float norm = bv_f16(boff);
+        uint qb = uint(bv[boff + 2u + j / 4u]);
+        uint idx = (qb >> (2u * (j % 4u))) & 3u;
+        return norm * C2[idx];
+    }
+    if (t == 43u) {
+        uint b = r / 128u; uint j = r % 128u;
+        uint boff = base + b * 50u;
+        float norm = bv_f16(boff);
+        uint qb = uint(bv[boff + 2u + j / 4u]);
+        uint sb = uint(bv[boff + 2u + 32u + j / 8u]);
+        uint low2 = (qb >> (2u * (j % 4u))) & 3u;
+        uint hi1 = (sb >> (j % 8u)) & 1u;
+        return norm * C3[low2 | (hi1 << 2u)];
+    }
+    {
+        uint b = r / 128u; uint j = r % 128u;
+        uint boff = base + b * 68u;
+        float norm = bv_f16(boff);
+        uint qb = uint(bv[boff + 4u + j / 2u]);
+        uint idx = (qb >> (4u * (j % 2u))) & 15u;
+        return norm * C4[idx];
+    }
+}
+
+void main() {
+    uint sel = gl_GlobalInvocationID.x;
+    if (sel >= p.n_sel) { return; }
+
+    uint out_dim = p.dim_k + p.dim_v;
+    uint dst_base = sel * out_dim;
+
+    int a_row = refs[sel * 4u + 0u];
+    int grp = refs[sel * 4u + 1u];
+    int ls = refs[sel * 4u + 2u];
+    int hd = refs[sel * 4u + 3u];
+    int pos = positions[sel];
+
+    // Bounds-check against runtime push dimensions (never trust device
+    // refs/meta on host shape validation alone).
+    bool bad = false;
+    if (a_row < 0 || uint(a_row) >= p.n_rows_a) { bad = true; }
+    if (grp < 0 || uint(grp) >= p.n_groups) { bad = true; }
+    // Exact per-layer map (absolute offsets/dims/heads); aliases share
+    // offsets, tail/unequal K-V honored. Uniform formula never inferred.
+    int ok = 0, dk = 0, ov = 0, dv = 0, nh = 0;
+    if (!bad) {
+        if (ls < 0) { bad = true; }
+    }
+    if (!bad) {
+        // layer_slot indexes the layer map directly (group envelope in META).
+        ok = layer_meta[uint(ls) * 5u + 0u];
+        dk = layer_meta[uint(ls) * 5u + 1u];
+        ov = layer_meta[uint(ls) * 5u + 2u];
+        dv = layer_meta[uint(ls) * 5u + 3u];
+        nh = layer_meta[uint(ls) * 5u + 4u];
+        if (dk <= 0 || dv <= 0 || nh <= 0) { bad = true; }
+        if (hd < 0 || hd >= nh) { bad = true; }
+    }
+    // Checked 32-bit head-slice arithmetic (host-validated bounds re-checked).
+    int feat_k = 0, feat_v = 0;
+    if (!bad) {
+        feat_k = ok + hd * dk;
+        feat_v = ov + hd * dv;
+        if (feat_k < 0 || ok < 0 || uint(feat_k + dk) > p.b_k_rows) { bad = true; }
+        if (feat_v < 0 || ov < 0 || uint(feat_v + dv) > p.b_v_rows) { bad = true; }
+        if (uint(dk) > p.dim_k || uint(dv) > p.dim_v) { bad = true; }
+    }
+    if (bad) {
+        for (uint d = 0u; d < out_dim; ++d) { dst[dst_base + d] = uintBitsToFloat(0x7fc00000u); }
+        return;
+    }
+
+    uint a_k_base = uint(a_row) * p.a_k_stride;
+    for (int d = 0; d < dk; ++d) {
+        uint b_base = uint(feat_k + int(d)) * p.b_k_stride;
+        float acc = 0.0;
+        for (uint r = 0u; r < p.prk; ++r) {
+            acc += deq_ak(a_k_base, r) * deq_bk(b_base, r);
+        }
+        dst[dst_base + uint(d)] = acc;
+    }
+    for (int d = dk; d < int(p.dim_k); ++d) { dst[dst_base + uint(d)] = 0.0; }
+    // Table-driven exact partial RoPE (partial IMRoPE HALF pairing default).
+    if (p.rotary_dim > 0u) {
+        uint fc0 = p.rotary_dim / 2u;
+        uint fc = fc0;
+        // Clamp rotary span to the layer's own K width (narrow tail layers;
+        // odd widths floor, last lane unrotated — mirrors the CPU core).
+        if (fc > uint(dk) / 2u) { fc = uint(dk) / 2u; }
+        if (p.rope_mode == 0u) {
+            for (uint f = 0u; f < fc; ++f) {
+                float omega = rope[f];
+                float mg = rope[fc0 + f];
+                float c, s;
+                rope_trig_cody_waite(float(pos), omega, c, s);
+                float re = dst[dst_base + f], im = dst[dst_base + f + fc];
+                dst[dst_base + f] = (re * c - im * s) * mg;
+                dst[dst_base + f + fc] = (re * s + im * c) * mg;
+            }
+        } else {
+            for (uint f = 0u; f < fc; ++f) {
+                float omega = rope[f];
+                float mg = rope[fc0 + f];
+                float c, s;
+                rope_trig_cody_waite(float(pos), omega, c, s);
+                float re = dst[dst_base + 2u * f], im = dst[dst_base + 2u * f + 1u];
+                dst[dst_base + 2u * f] = (re * c - im * s) * mg;
+                dst[dst_base + 2u * f + 1u] = (re * s + im * c) * mg;
+            }
+        }
+    }
+    uint a_v_base = uint(a_row) * p.a_v_stride;
+    for (int d = 0; d < dv; ++d) {
+        uint b_base = uint(feat_v + int(d)) * p.b_v_stride;
+        float acc = 0.0;
+        for (uint r = 0u; r < p.prv; ++r) {
+            acc += deq_av(a_v_base, r) * deq_bv(b_base, r);
+        }
+        dst[dst_base + p.dim_k + uint(d)] = acc;
+    }
+    for (int d = dv; d < int(p.dim_v); ++d) { dst[dst_base + p.dim_k + uint(d)] = 0.0; }
+}

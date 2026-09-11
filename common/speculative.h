@@ -56,7 +56,11 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
 // process the batch and update the internal state of the speculative context
-bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
+// defer_mtp postpones MTP catch-up until common_speculative_commit(), after draft acceptance is known
+bool common_speculative_process(common_speculative * spec, const llama_batch & batch, bool defer_mtp = false);
+
+// commit any deferred speculative state updates
+bool common_speculative_commit(common_speculative * spec);
 
 // true if any implementation requires target post-norm embeddings to be extracted
 bool common_speculative_need_embd(common_speculative * spec);
@@ -73,6 +77,13 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+
+// Pause target-to-draft mirroring for a sequence whose logical history cannot
+// be represented by the draft context (for example, an active RERoT episode).
+void common_speculative_set_paused(common_speculative * spec, llama_seq_id seq_id, bool paused);
+
+// reset internal speculative decoding state across iterations/prompts
+void common_speculative_reset(common_speculative * spec);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);

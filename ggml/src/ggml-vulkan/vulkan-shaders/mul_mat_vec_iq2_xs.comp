@@ -89,7 +89,7 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
 }
 
 void main() {
-    const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+    const uint first_row = mat_vec_first_row();
 
     init_iq_shmem(gl_WorkGroupSize);
 

@@ -1,0 +1,30 @@
+{
+  "id": "micro-logic-transitivity",
+  "tier": "deterministic_micro",
+  "prompt": "张三比李四高，李四比王五高，张三比王五高吗？请简短回答是或否并说明理由。",
+  "seed": 424242,
+  "config": {
+    "rerot": true,
+    "frontier": "strong"
+  },
+  "answer": "**是。**\n\n**理由：** 身高比较具有传递性。既然张三比李四高，李四比王五高，那么张三一定比王五高。",
+  "reasoning": "The question is in Chinese. Let me translate:\n\n\"张三比李四高，李四比王五高，张三比王五高吗？请简短回答是或否并说明理由。\"\n\nTranslation: \"Zhang San is taller than Li Si, Li Si is taller than Wang Wu, is Zhang San taller than Wang Wu? Please answer briefly yes or no and explain the reason.\"\n\nThis is a transitivity logic question. If Zhang San > Li Si (in height), and Li Si > Wang Wu (in height), then by transitivity, Zhang San > Wang Wu.\n\nSo the answer is Yes (是).\n\nReason: Height comparison is transitive. If A > B and B > C, then A > C.\n",
+  "usage": {
+    "completion_tokens": 195,
+    "prompt_tokens": 60,
+    "total_tokens": 255,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "rerot": {
+      "prompt_tokens": 60,
+      "cached_tokens": 0,
+      "probe_tokens": 65,
+      "frame_tokens": 0,
+      "sampled_tokens": 195,
+      "source_end_tokens": 0
+    }
+  },
+  "passed": true,
+  "wall_seconds": 14.907745386008173
+}

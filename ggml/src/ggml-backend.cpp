@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <mutex>
 #include <vector>
 
 #ifdef __APPLE__
@@ -497,6 +499,68 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
     }
 }
 
+static bool ggml_backend_tensor_memmove_regions_impl(
+        const struct ggml_backend_tensor_memmove_region * regions,
+        size_t n_regions,
+        bool dry_run) {
+    if (n_regions == 0) {
+        return true;
+    }
+    if (regions == NULL || regions[0].tensor == NULL || regions[0].tensor->buffer == NULL) {
+        return false;
+    }
+
+    ggml_backend_buffer_t buffer = regions[0].tensor->buffer;
+    for (size_t i = 0; i < n_regions; ++i) {
+        const auto & region = regions[i];
+        if (region.tensor == NULL || region.tensor->buffer != buffer || region.n_copies == 0) {
+            return false;
+        }
+        const size_t limit = ggml_nbytes(region.tensor);
+        auto fits = [&](size_t offset, size_t stride) {
+            return offset <= limit && region.size <= limit - offset &&
+                (stride == 0 || region.n_copies - 1 <= (limit - offset - region.size) / stride);
+        };
+        if (!fits(region.src_offset, region.src_stride) || !fits(region.dst_offset, region.dst_stride)) {
+            return false;
+        }
+    }
+
+    // Host buffers need no device callback. Validate the entire batch above
+    // before writing even its first byte (including overflow/strided bounds).
+    if (ggml_backend_buffer_is_host(buffer)) {
+        if (!dry_run) {
+            for (size_t i = 0; i < n_regions; ++i) {
+                const auto & region = regions[i];
+                auto * data = static_cast<uint8_t *>(region.tensor->data);
+                for (size_t c = 0; c < region.n_copies; ++c) {
+                    memmove(data + region.dst_offset + c * region.dst_stride,
+                            data + region.src_offset + c * region.src_stride, region.size);
+                }
+            }
+        }
+        return true;
+    }
+
+    if (buffer->iface.memmove_tensor == NULL) {
+        return false;
+    }
+
+    return buffer->iface.memmove_tensor(buffer, regions, n_regions, dry_run);
+}
+
+bool ggml_backend_tensor_memmove_regions(
+        const struct ggml_backend_tensor_memmove_region * regions,
+        size_t n_regions) {
+    return ggml_backend_tensor_memmove_regions_impl(regions, n_regions, false);
+}
+
+bool ggml_backend_tensor_memmove_regions_supported(
+        const struct ggml_backend_tensor_memmove_region * regions,
+        size_t n_regions) {
+    return ggml_backend_tensor_memmove_regions_impl(regions, n_regions, true);
+}
+
 void ggml_backend_tensor_copy_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst) {
     GGML_ASSERT(ggml_are_same_layout(src, dst) && "cannot copy tensors with different layouts");
 
@@ -776,15 +840,25 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_backend_sched_compute_pool {
+    std::atomic<int> ref_count{1};
+    ggml_gallocr_buffer_pool_t buffer_pool = nullptr;
+    std::recursive_mutex mutex;
+    ggml_backend_sched_t owner = nullptr;
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+    bool shared_buffers;
 
     int n_backends;
 
     ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_buffer_type_t bufts[GGML_SCHED_MAX_BACKENDS];
     ggml_gallocr_t galloc;
+    ggml_backend_sched_compute_pool_t compute_pool;
+    uint64_t compute_pool_generation;
 
     // hash map of the nodes in the graph
     struct ggml_hash_set  hash_set;
@@ -950,6 +1024,8 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
 
     // skip FLASH_ATTN_EXT since the sinks tensor is too small to choose a based based on it
     allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT;
+    // same for flash prefill attn: sinks (src[6]) is a tiny per-head bias, not a placement weight
+    allow = allow && tensor->op != GGML_OP_FLASH_PREFILL_ATTN;
 
     if (allow) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
@@ -1781,6 +1857,68 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     return GGML_STATUS_SUCCESS;
 }
 
+ggml_backend_sched_compute_pool_t ggml_backend_sched_compute_pool_new(void) {
+    auto * pool = new ggml_backend_sched_compute_pool();
+    pool->buffer_pool = ggml_gallocr_buffer_pool_new();
+    return pool;
+}
+
+ggml_backend_sched_compute_pool_t ggml_backend_sched_compute_pool_ref(ggml_backend_sched_compute_pool_t pool) {
+    GGML_ASSERT(pool != nullptr);
+    pool->ref_count.fetch_add(1, std::memory_order_relaxed);
+    return pool;
+}
+
+void ggml_backend_sched_compute_pool_free(ggml_backend_sched_compute_pool_t pool) {
+    if (pool == nullptr) {
+        return;
+    }
+    if (pool->ref_count.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+        return;
+    }
+
+    GGML_ASSERT(pool->owner == nullptr);
+    ggml_gallocr_buffer_pool_free(pool->buffer_pool);
+    delete pool;
+}
+
+static void ggml_backend_sched_synchronize_raw(ggml_backend_sched_t sched) {
+    for (int i = 0; i < sched->n_backends; i++) {
+        ggml_backend_synchronize(sched->backends[i]);
+    }
+}
+
+static void ggml_backend_sched_compute_pool_acquire(ggml_backend_sched_t sched) {
+    auto * pool = sched->compute_pool;
+    GGML_ASSERT(pool != nullptr);
+
+    if (pool->owner != nullptr && pool->owner != sched) {
+        ggml_backend_sched_synchronize_raw(pool->owner);
+    }
+    pool->owner = sched;
+}
+
+void ggml_backend_sched_compute_begin(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    sched->compute_pool->mutex.lock();
+    ggml_backend_sched_compute_pool_acquire(sched);
+}
+
+void ggml_backend_sched_compute_end(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    sched->compute_pool->mutex.unlock();
+}
+
+static ggml_backend_sched_t ggml_backend_sched_new_impl(
+        ggml_backend_t * backends,
+        ggml_backend_buffer_type_t * bufts,
+        int n_backends,
+        size_t graph_size,
+        bool parallel,
+        bool op_offload,
+        ggml_backend_sched_compute_pool_t compute_pool,
+        bool shared_buffers);
+
 ggml_backend_sched_t ggml_backend_sched_new(
         ggml_backend_t * backends,
         ggml_backend_buffer_type_t * bufts,
@@ -1788,8 +1926,37 @@ ggml_backend_sched_t ggml_backend_sched_new(
         size_t graph_size,
         bool parallel,
         bool op_offload) {
+    ggml_backend_sched_compute_pool_t compute_pool = ggml_backend_sched_compute_pool_new();
+    ggml_backend_sched_t sched = ggml_backend_sched_new_impl(
+            backends, bufts, n_backends, graph_size, parallel, op_offload, compute_pool, false);
+    ggml_backend_sched_compute_pool_free(compute_pool);
+    return sched;
+}
+
+ggml_backend_sched_t ggml_backend_sched_new_shared(
+        ggml_backend_t * backends,
+        ggml_backend_buffer_type_t * bufts,
+        int n_backends,
+        size_t graph_size,
+        bool parallel,
+        bool op_offload,
+        ggml_backend_sched_compute_pool_t compute_pool) {
+    return ggml_backend_sched_new_impl(
+            backends, bufts, n_backends, graph_size, parallel, op_offload, compute_pool, true);
+}
+
+static ggml_backend_sched_t ggml_backend_sched_new_impl(
+        ggml_backend_t * backends,
+        ggml_backend_buffer_type_t * bufts,
+        int n_backends,
+        size_t graph_size,
+        bool parallel,
+        bool op_offload,
+        ggml_backend_sched_compute_pool_t compute_pool,
+        bool shared_buffers) {
     GGML_ASSERT(n_backends > 0);
     GGML_ASSERT(n_backends <= GGML_SCHED_MAX_BACKENDS);
+    GGML_ASSERT(compute_pool != nullptr);
     GGML_ASSERT(ggml_backend_dev_type(ggml_backend_get_device(backends[n_backends - 1])) == GGML_BACKEND_DEVICE_TYPE_CPU);
 
     struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
@@ -1845,7 +2012,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
         }
     }
 
-    sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
+    sched->compute_pool = ggml_backend_sched_compute_pool_ref(compute_pool);
+    sched->shared_buffers = shared_buffers;
+    {
+        std::lock_guard<std::recursive_mutex> lock(compute_pool->mutex);
+        sched->galloc = shared_buffers
+            ? ggml_gallocr_new_n_shared(sched->bufts, n_backends, compute_pool->buffer_pool)
+            : ggml_gallocr_new_n(sched->bufts, n_backends);
+    }
     sched->op_offload = op_offload;
 
     ggml_backend_sched_reset(sched);
@@ -1857,12 +2031,22 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+
+    auto * pool = sched->compute_pool;
+    {
+        std::lock_guard<std::recursive_mutex> lock(pool->mutex);
+        if (pool->owner == sched) {
+            ggml_backend_sched_synchronize_raw(sched);
+            pool->owner = nullptr;
+        }
+        ggml_gallocr_free(sched->galloc);
+    }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
         }
     }
-    ggml_gallocr_free(sched->galloc);
+    ggml_backend_sched_compute_pool_free(pool);
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);
     for (int i = 0; i < sched->splits_capacity; i++) {
@@ -1884,6 +2068,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+
+    std::lock_guard<std::recursive_mutex> lock(sched->compute_pool->mutex);
+    ggml_gallocr_reset(sched->galloc);
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
@@ -1912,6 +2099,8 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
 
+    std::lock_guard<std::recursive_mutex> lock(sched->compute_pool->mutex);
+    ggml_backend_sched_compute_pool_acquire(sched);
     ggml_backend_sched_synchronize(sched);
 
     ggml_backend_sched_split_graph(sched, measure_graph);
@@ -1930,6 +2119,12 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
 
+    std::lock_guard<std::recursive_mutex> lock(sched->compute_pool->mutex);
+    ggml_backend_sched_compute_pool_acquire(sched);
+    if (sched->shared_buffers) {
+        ggml_backend_sched_synchronize_raw(sched);
+    }
+
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
@@ -1939,6 +2134,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
         return false;
     }
 
+    sched->compute_pool_generation = ggml_gallocr_buffer_pool_get_generation(sched->compute_pool->buffer_pool);
     sched->is_alloc = true;
 
     return true;
@@ -1952,6 +2148,12 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
 
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+    std::lock_guard<std::recursive_mutex> lock(sched->compute_pool->mutex);
+    ggml_backend_sched_compute_pool_acquire(sched);
+
+    if (sched->compute_pool_generation != ggml_gallocr_buffer_pool_get_generation(sched->compute_pool->buffer_pool)) {
+        sched->is_alloc = false;
+    }
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }
@@ -1967,9 +2169,7 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
-    for (int i = 0; i < sched->n_backends; i++) {
-        ggml_backend_synchronize(sched->backends[i]);
-    }
+    ggml_backend_sched_synchronize_raw(sched);
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
         // this ensures that during generation the same copy is used every time,
@@ -1994,6 +2194,13 @@ int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
     return sched->n_copies;
 }
 
+bool ggml_backend_sched_is_allocated(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    std::lock_guard<std::recursive_mutex> lock(sched->compute_pool->mutex);
+    return sched->is_alloc &&
+        sched->compute_pool_generation == ggml_gallocr_buffer_pool_get_generation(sched->compute_pool->buffer_pool);
+}
+
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_backends;
@@ -2015,6 +2222,7 @@ ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched
 
 size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend) {
     GGML_ASSERT(sched);
+    std::lock_guard<std::recursive_mutex> lock(sched->compute_pool->mutex);
     int backend_index = ggml_backend_sched_backend_id(sched, backend);
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 

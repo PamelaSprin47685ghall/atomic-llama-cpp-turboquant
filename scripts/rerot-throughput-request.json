@@ -1,0 +1,15 @@
+{
+  "model": "ornith-1.5",
+  "messages": [
+    {
+      "role": "user",
+      "content": "请完成以下五个相互独立的小任务。每项只给出结论和一句理由，最后汇总成五行编号列表：1. 17×23；2. 水的化学式；3. 法国首都；4. 二进制1011转十进制；5. 地球唯一的天然卫星名称。"
+    }
+  ],
+  "temperature": 0,
+  "seed": 424242,
+  "max_tokens": 8192,
+  "stream": false,
+  "rerot": true,
+  "rerot_trace": false
+}

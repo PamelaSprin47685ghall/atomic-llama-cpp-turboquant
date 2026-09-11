@@ -22,6 +22,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <random>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -444,6 +445,18 @@ std::string common_params_get_system_info(const common_params & params) {
 //
 // String utils
 //
+
+std::string random_string(size_t length) {
+    static constexpr char alphabet[] =
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    std::random_device random;
+    std::uniform_int_distribution<size_t> pick(0, sizeof(alphabet) - 2);
+    std::string result(length, ' ');
+    for (char & ch : result) {
+        ch = alphabet[pick(random)];
+    }
+    return result;
+}
 
 std::string string_format(const char * fmt, ...) {
     va_list ap;
@@ -1222,6 +1235,32 @@ static void common_init_sampler_from_model(
     get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA),    sparams.mirostat_eta,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA);
 }
 
+static uint32_t common_dynamic_recurrent_target(const llama_context_params & cparams) {
+    const uint32_t n_seq_max = std::max(1u, cparams.n_seq_max);
+    const uint32_t n_ctx = cparams.n_ctx;
+    const uint32_t n_ctx_kv = cparams.n_ctx_kv;
+
+    if (n_ctx == 0 || n_ctx_kv == 0) {
+        return 1;
+    }
+
+    // Assume active sequence lengths are uniformly distributed in [0, n_ctx].
+    // Their expected KV residency is n_ctx / 2, so provision recurrent state for
+    // the nearest integer expected concurrency instead of filling spare VRAM.
+    //
+    // When TriAttention is enabled, expected KV residency per sequence is
+    // ratio*n_ctx/2 for lengths uniformly distributed in [0, n_ctx].
+    if (cparams.triattention) {
+        const double expected_concurrency = 2.0 * n_ctx_kv / (cparams.triattention_ratio * n_ctx);
+        const uint64_t rounded = (uint64_t) std::llround(expected_concurrency);
+        return std::max(1u, std::min<uint32_t>((uint32_t) std::min<uint64_t>(rounded, UINT32_MAX), n_seq_max));
+    }
+
+    const uint64_t scaled = 2ull * n_ctx_kv;
+    const uint64_t rounded = (scaled + n_ctx / 2u) / n_ctx;
+    return std::max(1u, std::min<uint32_t>((uint32_t) std::min<uint64_t>(rounded, UINT32_MAX), n_seq_max));
+}
+
 struct common_init_result::impl {
     impl() = default;
     ~impl() = default;
@@ -1242,15 +1281,308 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    const bool dynamic_kv = params.n_ctx_kv_auto || params.n_ctx_kv > 0;
+    if (dynamic_kv) {
+        // Start auto KV fitting with the minimum recurrent footprint. The final
+        // physical recurrent capacity is derived from the fitted unified KV size.
+        cparams.n_seq_recurrent = 1;
+    }
+
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
+        const uint32_t n_ctx_min = (params.n_ctx_kv_auto || params.n_ctx_kv > 0)
+            ? UINT32_MAX
+            : params.fit_params_min_ctx;
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
-            params.fit_params_min_ctx,
+            n_ctx_min,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+    }
+
+    llama_context_params cparams_mtp = {};
+    const llama_context_params * extra_cparams = nullptr;
+    if (dynamic_kv) {
+        const bool spec_mtp = std::find(
+            params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        if (spec_mtp) {
+            cparams_mtp = cparams;
+            cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+            cparams_mtp.ctx_other = nullptr;
+            cparams_mtp.n_seq_recurrent = cparams.n_seq_recurrent;
+            cparams_mtp.n_rs_seq = 0;
+            extra_cparams = &cparams_mtp;
+        }
+
+    }
+
+    if (params.n_ctx_kv_auto) {
+        // XKV auto-fit reserve accounting (§16): computed exactly once here
+        // for visibility and overflow validation; the per-device addition
+        // itself happens inside the fit probes (fit.cpp).
+            if (llama_xkv_is_enabled(cparams.xkv_mode)) {
+                common_xkv_fit_reserve xkv_reserve = {};
+                uint64_t xkv_log_scratch = 0;
+                uint64_t xkv_log_dedup = 0;
+                if (!common_xkv_scratch_bytes(params.model.path.c_str(), &mparams, &cparams, &xkv_log_scratch, &xkv_log_dedup)) {
+                    COM_WRN("%s", "XKV scratch estimation failed; degrading scratch reserve to 0\n");
+                    xkv_log_scratch = 0;
+                    xkv_log_dedup = 0;
+                }
+                if (!common_xkv_fit_reserve_bytes(&cparams, xkv_log_scratch, &xkv_reserve, xkv_log_dedup)) {
+                    COM_ERR("%s", "XKV reserve accounting overflow, aborting auto-fit\n");
+                    return;
+                }
+                COM_INF("XKV auto-fit reserve: workspace=%llu MiB decode_cache=%llu MiB factor_scratch=%llu MiB dedup_scratch=%llu MiB total=%llu MiB (workspace once per device; dedup host)\n",
+                    (unsigned long long) (xkv_reserve.workspace_bytes       / (1024ull * 1024ull)),
+                    (unsigned long long) (xkv_reserve.decode_cache_bytes   / (1024ull * 1024ull)),
+                    (unsigned long long) (xkv_reserve.factor_scratch_bytes / (1024ull * 1024ull)),
+                    (unsigned long long) (xkv_reserve.dedup_scratch_bytes   / (1024ull * 1024ull)),
+                    (unsigned long long) (xkv_reserve.total_bytes            / (1024ull * 1024ull)));
+        }
+        if (params.rerot_enabled) {
+            // §B.10 / Phase 8: VRAM-only Three-Capacity Auto-fit for RERoT
+            auto fit_res = common_fit_rerot_capacities(
+                params.model.path.c_str(), &mparams, &cparams,
+                params.n_ctx_kv_reserve, extra_cparams,
+                params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            if (fit_res.status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                COM_ERR("%s", "failed to size RERoT B/P/K capacities automatically\n");
+                return;
+            }
+            params.n_parallel = fit_res.b_people;
+            params.rerot_person_max = fit_res.b_people;
+            params.rerot_pen_max = fit_res.p_pens;
+            params.rerot_brain_rows = fit_res.b_people;
+            params.rerot_hand_rows = fit_res.p_pens;
+            params.n_ctx_kv = fit_res.k_tokens;
+            params.n_outputs_max = std::max(
+                1u,
+                fit_res.p_pens * (1u + params.speculative.need_n_rs_seq()));
+
+            cparams.n_person_max = fit_res.b_people;
+            cparams.n_pen_max = fit_res.p_pens;
+            cparams.n_ctx_kv = fit_res.k_tokens;
+            cparams.n_seq_recurrent = fit_res.b_people;
+            cparams.n_seq_max = LLAMA_MAX_SEQ;
+            cparams.n_outputs_max = params.n_outputs_max;
+            if (extra_cparams != nullptr) {
+                cparams_mtp.n_person_max = 0;
+                cparams_mtp.n_pen_max = 0;
+                cparams_mtp.n_ctx_kv = fit_res.k_tokens;
+                cparams_mtp.n_seq_max = fit_res.p_pens;
+                cparams_mtp.n_seq_recurrent = fit_res.p_pens;
+                cparams_mtp.n_outputs_max = fit_res.p_pens;
+            }
+            // XKV store feedback (three-capacity fit): same derive -> refit
+            // -> pin discipline as the KV branch, so the final store plus
+            // transient budgets fit every device. DENSE/SR only.
+            if (cparams.xkv_mode == LLAMA_XKV_MODE_DENSE || cparams.xkv_mode == LLAMA_XKV_MODE_SR) {
+                if (cparams.xkv_store_mib == 0) {
+                    const ggml_log_level xkv_log = params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR;
+                    uint32_t store0 = common_xkv_derive_store_mib(
+                        params.model.path.c_str(), &mparams, &cparams, cparams.n_ctx_kv, xkv_log);
+                    if (store0 == 0) {
+                        COM_ERR("%s", "XKV DENSE/SR requires a nonzero factor store budget: auto-derivation failed, set --xkv-store-mib explicitly\n");
+                        return;
+                    }
+                    cparams.xkv_store_mib = store0;
+                    params.xkv_store_mib = store0;
+                    fit_res = common_fit_rerot_capacities(
+                        params.model.path.c_str(), &mparams, &cparams,
+                        params.n_ctx_kv_reserve, extra_cparams, xkv_log);
+                    if (fit_res.status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                        COM_ERR("%s", "XKV DENSE/SR store budget does not fit: reduce --xkv-store-mib or free device memory\n");
+                        return;
+                    }
+                    params.n_parallel = fit_res.b_people;
+                    params.rerot_person_max = fit_res.b_people;
+                    params.rerot_pen_max = fit_res.p_pens;
+                    params.rerot_brain_rows = fit_res.b_people;
+                    params.rerot_hand_rows = fit_res.p_pens;
+                    params.n_ctx_kv = fit_res.k_tokens;
+                    cparams.n_person_max = fit_res.b_people;
+                    cparams.n_pen_max = fit_res.p_pens;
+                    cparams.n_ctx_kv = fit_res.k_tokens;
+                    cparams.n_seq_recurrent = fit_res.b_people;
+                    if (extra_cparams != nullptr) {
+                        cparams_mtp.n_person_max = fit_res.b_people;
+                        cparams_mtp.n_pen_max = fit_res.p_pens;
+                        cparams_mtp.n_ctx_kv = fit_res.k_tokens;
+                        cparams_mtp.n_seq_recurrent = fit_res.b_people;
+                    }
+                    uint32_t store1 = common_xkv_derive_store_mib(
+                        params.model.path.c_str(), &mparams, &cparams, cparams.n_ctx_kv, xkv_log);
+                    if (store1 == 0) {
+                        COM_ERR("%s", "XKV DENSE/SR requires a nonzero factor store budget: auto-derivation failed, set --xkv-store-mib explicitly\n");
+                        return;
+                    }
+                    if (store1 < cparams.xkv_store_mib) {
+                        cparams.xkv_store_mib = store1;
+                        params.xkv_store_mib = store1;
+                    }
+                }
+                COM_INF("XKV store budget resolved: %u MiB for %u KV tokens\n",
+                    cparams.xkv_store_mib, cparams.n_ctx_kv);
+            }
+        } else {
+            // Ordinary (RERoT OFF) auto-fit remains 100% untouched
+            auto fit_kv = [&]() {
+                return common_fit_kv_cache(
+                    params.model.path.c_str(), &mparams, &cparams,
+                    params.n_ctx_kv_reserve,
+                    extra_cparams,
+                    params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            };
+
+            auto status = fit_kv();
+            if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                COM_ERR("%s", "failed to size unified KV cache automatically\n");
+                return;
+            }
+
+            // Search downwards from the initial recurrent target to find the largest capacity that fits.
+            cparams.triattention       = params.triattention_enabled;
+            cparams.triattention_ratio = params.triattention_ratio;
+            cparams.triattention_stats = params.triattention_stats.c_str();
+            uint32_t target_recurrent = common_dynamic_recurrent_target(cparams);
+            while (target_recurrent > 1) {
+                cparams.n_seq_recurrent = target_recurrent;
+                if (extra_cparams != nullptr) {
+                    cparams_mtp.n_seq_recurrent = target_recurrent;
+                }
+
+                status = fit_kv();
+                if (status == COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                    const uint32_t supported_recurrent = common_dynamic_recurrent_target(cparams);
+                    if (supported_recurrent >= target_recurrent) {
+                        break;
+                    }
+                    target_recurrent = std::min(target_recurrent - 1, supported_recurrent);
+                } else {
+                    target_recurrent--;
+                }
+            }
+
+            if (cparams.n_seq_recurrent != target_recurrent || status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                cparams.n_seq_recurrent = target_recurrent;
+                if (extra_cparams != nullptr) {
+                    cparams_mtp.n_seq_recurrent = target_recurrent;
+                }
+                status = fit_kv();
+                if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                    COM_ERR("%s", "failed to size unified KV cache for recurrent target\n");
+                    return;
+                }
+            }
+
+            params.n_ctx_kv = cparams.n_ctx_kv;
+        // XKV store feedback: the provisional fit above reserved no
+        // persistent bytes. Derive the budget from the fitted capacity,
+        // refit once with it reserved (K only shrinks), then pin the final
+        // budget at or below the reserved amount so VRAM cannot overcommit.
+        // DENSE/SR only; SHADOW publishes nothing and stays zero.
+        if (cparams.xkv_mode == LLAMA_XKV_MODE_DENSE || cparams.xkv_mode == LLAMA_XKV_MODE_SR) {
+            // Explicit budgets are honored as configured (already reserved in
+            // the probes); only auto (zero) budgets resolve here.
+            if (cparams.xkv_store_mib == 0) {
+                const uint32_t store0 = common_xkv_derive_store_mib(
+                    params.model.path.c_str(), &mparams, &cparams, cparams.n_ctx_kv,
+                    params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+                if (store0 == 0) {
+                    COM_ERR("%s", "XKV DENSE/SR requires a nonzero factor store budget: auto-derivation failed, set --xkv-store-mib explicitly\n");
+                    return;
+                }
+                cparams.xkv_store_mib = store0;
+                params.xkv_store_mib = store0;
+                status = fit_kv();
+                if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                    COM_ERR("%s", "XKV DENSE/SR store budget does not fit: reduce --xkv-store-mib or free device memory\n");
+                    return;
+                }
+                params.n_ctx_kv = cparams.n_ctx_kv;
+                const uint32_t store1 = common_xkv_derive_store_mib(
+                    params.model.path.c_str(), &mparams, &cparams, cparams.n_ctx_kv,
+                    params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+                if (store1 == 0) {
+                    COM_ERR("%s", "XKV DENSE/SR requires a nonzero factor store budget: auto-derivation failed, set --xkv-store-mib explicitly\n");
+                    return;
+                }
+                // Final budget never exceeds the reserved (refit) amount:
+                // the refit reserved store0, and store1 <= store0 since K
+                // only shrank.
+                if (store1 < cparams.xkv_store_mib) {
+                    cparams.xkv_store_mib = store1;
+                    params.xkv_store_mib = store1;
+                }
+            }
+            COM_INF("XKV store budget resolved: %u MiB for %u KV tokens\n",
+                cparams.xkv_store_mib, cparams.n_ctx_kv);
+        }
+        } // end non-RERoT else (XKV feedback above uses branch-local fit_kv)
+    } else if (dynamic_kv) {
+        // When --fit is off and the user did not specify -c, resolve n_ctx
+        // from the model's training context so that common_dynamic_recurrent_target
+        // computes the correct recurrent target instead of falling back to 1.
+        if (cparams.n_ctx == 0) {
+            llama_model_params meta_mparams = mparams;
+            meta_mparams.no_alloc  = true;
+            meta_mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+            llama_model * meta_model = llama_model_load_from_file(params.model.path.c_str(), meta_mparams);
+            if (meta_model != nullptr) {
+                const int32_t n_ctx_train = llama_model_n_ctx_train(meta_model);
+                if (n_ctx_train > 0) {
+                    cparams.n_ctx = (uint32_t) n_ctx_train;
+                }
+                llama_model_free(meta_model);
+            }
+        }
+        cparams.triattention       = params.triattention_enabled;
+        cparams.triattention_ratio = params.triattention_ratio;
+        cparams.triattention_stats = params.triattention_stats.c_str();
+        cparams.n_seq_recurrent = common_dynamic_recurrent_target(cparams);
+        if (extra_cparams != nullptr) {
+            cparams_mtp.n_seq_recurrent = cparams.n_seq_recurrent;
+        }
+    }
+
+    // Persistent XKV store budget (§16): production DENSE/SR requires a
+    // nonzero resolved budget. An explicit --xkv-store-mib was already
+    // reserved per-device inside the fit probes above; a zero here is an
+    // auto-fit-derived placeholder resolved from the fitted KV capacity
+    // (dense-equivalent context scaled by min_saving). SHADOW reference
+    // keeps no persistent store and stays zero by gate construction.
+    // NOTE: the MTP/draft copy (extra_cparams) intentionally keeps 0: the
+    // draft cache is excluded from XKV persistence.
+    if (dynamic_kv &&
+        (cparams.xkv_mode == LLAMA_XKV_MODE_DENSE || cparams.xkv_mode == LLAMA_XKV_MODE_SR)) {
+        if (cparams.xkv_store_mib == 0) {
+            const uint32_t derived = common_xkv_derive_store_mib(
+                params.model.path.c_str(), &mparams, &cparams, cparams.n_ctx_kv,
+                params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            if (derived == 0) {
+                COM_ERR("%s", "XKV DENSE/SR requires a nonzero factor store budget: auto-derivation failed, set --xkv-store-mib explicitly\n");
+                return;
+            }
+            cparams.xkv_store_mib = derived;
+            params.xkv_store_mib = derived;
+            COM_INF("XKV store budget auto-derived: %u MiB for %u KV tokens (dense-equivalent scaled by min_saving)\n",
+                derived, cparams.n_ctx_kv);
+        }
+    }
+
+    if (dynamic_kv && !params.rerot_enabled) {
+        const auto status = common_fit_recurrent_cache(
+            params.model.path.c_str(), &mparams, &cparams, params.n_ctx_kv_reserve,
+            extra_cparams,
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+            COM_ERR("%s", "failed to size recurrent state pool automatically\n");
+            return;
+        }
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1439,7 +1771,12 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     }
 
     if (!params.lora_init_without_apply) {
-        common_set_adapter_lora(lctx, params.lora_adapters);
+        // A pre-apply refusal is init failure (unreachable on a fresh context
+        // with no active episode, but the contract is checked, not assumed).
+        if (!common_set_adapter_lora(lctx, params.lora_adapters)) {
+            COM_ERR("failed to apply LoRA adapters for model '%s'\n", params.model.path.c_str());
+            return res;
+        }
     }
 
     if (params.warmup) {
@@ -1599,7 +1936,7 @@ void common_memory::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, lla
     }
 }
 
-void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora) {
+bool common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora) {
     std::vector<llama_adapter_lora *> loras;
     std::vector<float> scales;
 
@@ -1608,7 +1945,10 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
         scales.push_back(la.scale);
     }
 
-    llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data());
+    // Forward the core contract (0 applied or identical no-op, -1 pre-apply
+    // refusal with zero mutation). No gate is duplicated here: the refusal
+    // decision lives entirely in llama_context::set_adapters_lora.
+    return llama_set_adapters_lora(ctx, loras.data(), loras.size(), scales.data()) == 0;
 }
 
 struct llama_model_params common_model_params_to_llama(common_params & params) {
@@ -1653,10 +1993,15 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     auto cparams = llama_context_default_params();
 
     cparams.n_ctx             = params.n_ctx;
-    cparams.n_seq_max         = params.n_parallel;
-    cparams.n_outputs_max     = params.n_outputs_max;
-    cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    cparams.n_ctx_kv          = params.n_ctx_kv;
+    cparams.n_seq_max         = params.rerot_enabled ? LLAMA_MAX_SEQ : params.n_parallel;
+    cparams.n_seq_max_pp      = params.n_parallel_pp;
+    // RERoT needs many logical ids for parked/archive sequences, but only one
+    // live recurrent state per physical server slot. The context keeps these
+    // capacities separate so the seq-id arena does not multiply recurrent VRAM.
+    cparams.n_seq_recurrent   = params.rerot_enabled ? params.n_parallel : 0;
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
+    cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;
@@ -1680,7 +2025,46 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
-    cparams.kv_unified        = params.kv_unified;
+    cparams.kv_unified        = params.rerot_enabled ? true : params.kv_unified;
+    if (llama_xkv_is_enabled(params.xkv_mode)) {
+        cparams.kv_unified    = true;
+    }
+    cparams.triattention        = params.triattention_enabled;
+    cparams.triattention_stats  = params.triattention_stats.c_str();
+    cparams.triattention_ratio  = params.triattention_ratio;
+    cparams.rerot               = params.rerot_enabled;
+    cparams.rerot_frontier      = params.rerot_frontier;
+    cparams.n_person_max        = params.rerot_person_max;
+    cparams.n_pen_max           = params.rerot_pen_max;
+    // FlashPrefill V2 policy: immutable value copy for the context lifetime.
+    // OFF (the default) preserves the pre-existing attention path exactly.
+    cparams.flashprefill        = params.flashprefill;
+
+    // XKV (§16) parameters
+    cparams.xkv_mode                     = params.xkv_mode;
+    cparams.xkv_storage_profile          = params.xkv_storage_profile;
+    cparams.xkv_group_size               = params.xkv_group_size;
+    cparams.xkv_rank_k                   = params.xkv_rank_k;
+    cparams.xkv_rank_v                   = params.xkv_rank_v;
+    cparams.xkv_segment_tokens           = params.xkv_segment_tokens;
+    cparams.xkv_chunk_tokens             = params.xkv_chunk_tokens;
+    cparams.xkv_sr_budget                = params.xkv_sr_budget;
+    cparams.xkv_source                   = params.xkv_source;
+    cparams.xkv_factor_a_k               = params.xkv_factor_a_k;
+    cparams.xkv_factor_b_k               = params.xkv_factor_b_k;
+    cparams.xkv_factor_a_v               = params.xkv_factor_a_v;
+    cparams.xkv_factor_b_v               = params.xkv_factor_b_v;
+    cparams.xkv_factor_balance           = params.xkv_factor_balance;
+    cparams.xkv_landmark_type            = params.xkv_landmark_type;
+    cparams.xkv_landmark_refine          = params.xkv_landmark_refine;
+    cparams.xkv_landmark_refine_max_rows = params.xkv_landmark_refine_max_rows;
+    cparams.xkv_workspace_mib            = params.xkv_workspace_mib;
+    cparams.xkv_decode_cache_mib         = params.xkv_decode_cache_mib;
+    cparams.xkv_store_mib                = params.xkv_store_mib;
+    cparams.xkv_seed                     = params.xkv_seed;
+    cparams.xkv_min_saving               = params.xkv_min_saving;
+    cparams.xkv_min_factor_coverage      = params.xkv_min_factor_coverage;
+    cparams.xkv_factorizer               = params.xkv_factorizer;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

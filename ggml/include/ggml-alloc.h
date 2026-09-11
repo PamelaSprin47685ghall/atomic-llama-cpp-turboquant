@@ -44,10 +44,18 @@ GGML_API enum ggml_status    ggml_tallocr_alloc(struct ggml_tallocr * talloc, st
 //   ggml_set_output(): output tensors are never freed and never overwritten
 
 typedef struct ggml_gallocr * ggml_gallocr_t;
+typedef struct ggml_gallocr_buffer_pool * ggml_gallocr_buffer_pool_t;
+
+GGML_API ggml_gallocr_buffer_pool_t ggml_gallocr_buffer_pool_new(void);
+GGML_API ggml_gallocr_buffer_pool_t ggml_gallocr_buffer_pool_ref(ggml_gallocr_buffer_pool_t pool);
+GGML_API void                       ggml_gallocr_buffer_pool_free(ggml_gallocr_buffer_pool_t pool);
+GGML_API uint64_t                   ggml_gallocr_buffer_pool_get_generation(ggml_gallocr_buffer_pool_t pool);
 
 GGML_API ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft);
 GGML_API ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs);
+GGML_API ggml_gallocr_t ggml_gallocr_new_n_shared(ggml_backend_buffer_type_t * bufts, int n_bufs, ggml_gallocr_buffer_pool_t pool);
 GGML_API void           ggml_gallocr_free(ggml_gallocr_t galloc);
+GGML_API void           ggml_gallocr_reset(ggml_gallocr_t galloc);
 
 // pre-allocate buffers from a measure graph - does not allocate or modify the graph
 // call with a worst-case graph to avoid buffer reallocations

@@ -10,6 +10,7 @@ file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
 
 add_library(llama
             ../include/llama.h
+            ../include/llama-flashprefill.h
             llama.cpp
             llama-adapter.cpp
             llama-arch.cpp
@@ -17,6 +18,12 @@ add_library(llama
             llama-chat.cpp
             llama-context.cpp
             llama-cparams.cpp
+            llama-flashprefill.h
+            llama-flashprefill.cpp
+            llama-flashprefill-metrics.h
+            llama-flashprefill-metrics.cpp
+            llama-flashprefill-state.h
+            llama-flashprefill-state.cpp
             llama-grammar.cpp
             llama-graph.cpp
             llama-hparams.cpp
@@ -37,8 +44,24 @@ add_library(llama
             llama-model-saver.cpp
             llama-model.cpp
             llama-quant.cpp
+            llama-rerot.cpp
             llama-sampler.cpp
+            llama-triattention.cpp
             llama-vocab.cpp
+            llama-xkv-backend.cpp
+            llama-xkv-cache.cpp
+            llama-xkv-canonical.cpp
+            llama-xkv-codec.cpp
+            llama-xkv-factor.cpp
+            llama-xkv-graph-ref.cpp
+            llama-xkv-hot.cpp
+            llama-xkv-landmark.cpp
+            llama-xkv-reader.cpp
+            llama-xkv-transaction.cpp
+            llama-xkv-state.cpp
+            llama-xkv-runtime.cpp
+            llama-xkv-tri.cpp
+            llama-xkv-seal.cpp
             unicode-data.cpp
             unicode.cpp
             unicode.h
@@ -56,6 +79,10 @@ target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+if (GGML_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(llama PRIVATE CUDA::cudart)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

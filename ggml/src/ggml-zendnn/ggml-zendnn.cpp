@@ -751,6 +751,11 @@ static bool ggml_backend_zendnn_device_supports_op(ggml_backend_dev_t dev, const
             }
         } break;
 
+        case GGML_OP_FLASH_PREFILL_POOL:
+        case GGML_OP_FLASH_PREFILL_SELECT:
+        case GGML_OP_FLASH_PREFILL_ATTN:
+            return false;
+
         default:
             return false;
     }

@@ -1108,6 +1108,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_EXT_BANDED",
+    "FLASH_ATTN_EXT_REROT",
     "FLASH_ATTN_BACK",
     "SSM_CONV",
     "SSM_SCAN",
@@ -1140,9 +1141,21 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "FLASH_PREFILL_POOL",
+    "FLASH_PREFILL_SELECT",
+    "FLASH_PREFILL_ATTN",
+    "XKV_RECONSTRUCT",
+    "XKV_ATTENTION",
+    "XKV_FACTORIZE",
+    "XKV_CANONICALIZE",
+    "XKV_LANDMARK",
+    "XKV_LANDMARK_BUILD",
+    "XKV_LANDMARK_ROWS",
+    "XKV_LANDMARK_MERGE",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1225,6 +1238,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "flash_attn_ext(x)",
     "flash_attn_ext_banded(x)",
+    "flash_attn_ext_rerot(x)",
     "flash_attn_back(x)",
     "ssm_conv(x)",
     "ssm_scan(x)",
@@ -1257,9 +1271,21 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "flash_prefill_pool(x)",
+    "flash_prefill_select(x)",
+    "flash_prefill_attn(x)",
+    "xkv_reconstruct(a_k,b_k,a_v,b_v,refs,pos,meta)",
+    "xkv_attention(q,k_hot,v_hot,k_cold,v_cold,entries,offsets,sinks)",
+    "xkv_factorize(x)",
+    "xkv_canonicalize(x)",
+    "xkv_landmark(q,land,pos,meta,rope,scratch,csr,scores,status)",
+    "xkv_landmark_build(a_k,b_k,rows,pos,meta,rope,scratch,eb,srcfp,status)",
+    "xkv_landmark_rows(sel,meta,off,ids,kv,pos,ptrs,outpos,status)",
+    "xkv_landmark_merge(idx,sc,base,outsc,status)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5537,10 +5563,52 @@ struct ggml_tensor * ggml_flash_attn_ext_banded(
     return result;
 }
 
+struct ggml_tensor * ggml_flash_attn_ext_rerot(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q_groups,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * entries,
+        struct ggml_tensor  * offsets,
+        struct ggml_tensor  * sinks,
+        float                 scale,
+        float                 logit_softcap) {
+    GGML_ASSERT(q_groups != NULL && k != NULL && v != NULL && entries != NULL && offsets != NULL);
+    GGML_ASSERT(q_groups->type == GGML_TYPE_F32);
+    GGML_ASSERT(q_groups->ne[0] == k->ne[0]);
+    GGML_ASSERT(q_groups->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1);
+    GGML_ASSERT(k->ne[1] == v->ne[1]);
+    GGML_ASSERT(q_groups->ne[2] % k->ne[2] == 0);
+    GGML_ASSERT(q_groups->ne[2] % v->ne[2] == 0);
+
+    GGML_ASSERT(entries->type == GGML_TYPE_I32);
+    GGML_ASSERT(entries->ne[0] == 2 && entries->ne[2] == 1 && entries->ne[3] == 1);
+    GGML_ASSERT(offsets->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_vector(offsets) && offsets->ne[0] >= 2);
+
+    const int64_t n_queries = offsets->ne[0] - 1;
+    int64_t ne[4] = { v->ne[0], q_groups->ne[2], n_queries, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    float params[] = { scale, 0.0f, logit_softcap };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_FLASH_ATTN_EXT_REROT;
+    result->src[0] = q_groups;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = entries;
+    result->src[4] = offsets;
+    result->src[5] = sinks;
+
+    return result;
+}
+
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_BANDED ||
+                a->op == GGML_OP_FLASH_ATTN_EXT_REROT);
 
     const int32_t prec_i32 = (int32_t) prec;
 
@@ -5549,7 +5617,8 @@ void ggml_flash_attn_ext_set_prec(
 
 enum ggml_prec ggml_flash_attn_ext_get_prec(
         const struct ggml_tensor * a) {
-    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT || a->op == GGML_OP_FLASH_ATTN_EXT_BANDED ||
+                a->op == GGML_OP_FLASH_ATTN_EXT_REROT);
 
     const int32_t prec_i32 = ggml_get_op_params_i32(a, 3);
 
@@ -6389,6 +6458,7 @@ struct ggml_tensor * ggml_gated_delta_net(
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
+    ggml_set_op_params_i32(result, 1, 0);
 
     result->op     = GGML_OP_GATED_DELTA_NET;
     result->src[0] = q;
@@ -6397,6 +6467,78 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+    result->src[6] = state;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net_rbb(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * native_state) {
+    GGML_ASSERT(v->ne[2] == 1);
+    GGML_ASSERT(v->ne[3] >= 1);
+    GGML_ASSERT(g->ne[0] == 1);
+
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+    GGML_ASSERT(ggml_is_contiguous(native_state));
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_F32);
+    GGML_ASSERT(native_state->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->ne[0] == v->ne[0]);
+    GGML_ASSERT(state->ne[1] == v->ne[0]);
+    GGML_ASSERT(state->ne[2] == v->ne[1]);
+    GGML_ASSERT(state->ne[3] == 1);
+    GGML_ASSERT(native_state->ne[0] == v->ne[0]);
+    GGML_ASSERT(native_state->ne[1] == v->ne[0]);
+    GGML_ASSERT(native_state->ne[2] == v->ne[1]);
+    GGML_ASSERT(native_state->ne[3] == v->ne[3]);
+
+    const int64_t S_v = v->ne[0];
+    const int64_t H = v->ne[1];
+    const int64_t n_seqs = v->ne[3];
+    // The result packs shared-brain-plus-hand readouts, one merged brain,
+    // evolved private hand overlays, then device-local work vectors for
+    // the exact order-free Parallel Delta solve.
+    const int64_t candidate_rows = S_v * n_seqs;
+    const int64_t scratch_rows = 8 * n_seqs;
+    const int64_t ne[4] = {
+        S_v * H,
+        n_seqs + S_v + candidate_rows + scratch_rows,
+        1,
+        1,
+    };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    ggml_set_op_params_i32(result, 0, 1);
+    ggml_set_op_params_i32(result, 1, 1);
+    // Explicit research-only key-coherence weighting, off by default.
+    // Coherence-normalized evidence is the mathematical contract. Raw
+    // redundant-evidence accumulation is available only as an explicit
+    // research override in the model graph builder.
+    ggml_set_op_params_i32(result, 2, 1);
+
+    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = native_state;
 
     return result;
 }
@@ -6593,6 +6735,220 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[3] = comb;
 
     return result;
+}
+
+// ggml_flash_prefill_pool / select / attn
+//
+// Frozen wire identities (see ggml/include/ggml-flashprefill.h, WireReference owner):
+//   op ids in op_params[0]: 0=POOL, 1=SELECT, 2=ATTN; version 1 in op_params[7].
+//   16x int32 layout matches struct ggml_flashprefill_op_params:
+//   [op, alpha_bits, scale_bits, softcap_bits, exact_all, dk, dv,
+//    version, mean_correction, 0, 0, 0, 0, 0, 0, 0] (words 9..15 reserved zero).
+// Row/plan header word offsets live in the wire header (row8/use8/header[22..23]
+// and plan header 24 frozen) and are NOT decoded here by design; constructors
+// validate only types, agreed dimensions, and explicit host capacities.
+// No host pointers cross the op boundary.
+
+static void ggml_flash_prefill_pack_op_params(struct ggml_tensor * result,
+        int32_t op, float alpha, float scale, float softcap,
+        int32_t exact_all, int32_t dk, int32_t dv, int32_t mean_correction) {
+    int32_t params[16] = {0};
+    params[0] = op;
+    memcpy(&params[1], &alpha,   sizeof(float));
+    memcpy(&params[2], &scale,   sizeof(float));
+    memcpy(&params[3], &softcap, sizeof(float));
+    params[4] = exact_all;
+    params[5] = dk;
+    params[6] = dv;
+    params[7] = 1; // GGML_FLASHPREFILL_VERSION
+    params[8] = mean_correction ? 1 : 0;
+    // params[9..15] remain 0
+    static_assert(GGML_MAX_OP_PARAMS >= 64, "flash prefill op params need 64 bytes");
+    ggml_set_op_params(result, params, sizeof(params));
+}
+
+struct ggml_tensor * ggml_flash_prefill_pool(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * metadata,
+        struct ggml_tensor  * k_dep,
+        struct ggml_tensor  * v_dep,
+        int32_t               dk,
+        int32_t               dv,
+        int32_t               n_kv_heads,
+        int64_t               f_cap) {
+    GGML_ASSERT(k != NULL && v != NULL && metadata != NULL);
+    GGML_ASSERT(dk > 0 && dv > 0 && n_kv_heads > 0 && f_cap > 0);
+    GGML_ASSERT(k->ne[0] == dk);
+    GGML_ASSERT(v->ne[0] == dv);
+    GGML_ASSERT(k->ne[1] == v->ne[1]);
+    GGML_ASSERT(k->ne[1] >= 1);
+    GGML_ASSERT(k->ne[2] == n_kv_heads);
+    GGML_ASSERT(v->ne[2] == n_kv_heads);
+    GGML_ASSERT(k->ne[3] == 1 && v->ne[3] == 1);
+    GGML_ASSERT(metadata->type == GGML_TYPE_I32);
+    GGML_ASSERT(metadata->ne[1] == 1 && metadata->ne[2] == 1 && metadata->ne[3] == 1);
+    GGML_ASSERT(metadata->ne[0] >= 32);
+    // k_dep/v_dep are ordering-only edges; contents never read.
+
+    const int64_t pool_d = (int64_t) dk + (int64_t) dv;
+    GGML_ASSERT(pool_d <= INT32_MAX);
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, pool_d, n_kv_heads, f_cap);
+
+    ggml_flash_prefill_pack_op_params(result, 0, 0.0f, 0.0f, 0.0f, 0, dk, dv, 0);
+
+    result->op     = GGML_OP_FLASH_PREFILL_POOL;
+    result->src[0] = k;
+    result->src[1] = v;
+    result->src[2] = metadata;
+    result->src[3] = k_dep;
+    result->src[4] = v_dep;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_flash_prefill_select(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * pool,
+        struct ggml_tensor  * metadata,
+        int64_t               n_tiles,
+        int64_t               n_kv_heads,
+        int64_t               max_sel,
+        float                 scale,
+        float                 alpha,
+        float                 softcap,
+        int32_t               exact_all,
+        bool                  mean_correction) {
+    GGML_ASSERT(q != NULL && pool != NULL && metadata != NULL);
+    GGML_ASSERT(n_tiles > 0 && n_kv_heads > 0 && max_sel >= 0);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(pool->type == GGML_TYPE_F32);
+    GGML_ASSERT(metadata->type == GGML_TYPE_I32);
+    GGML_ASSERT(metadata->ne[1] == 1 && metadata->ne[2] == 1 && metadata->ne[3] == 1);
+    GGML_ASSERT(metadata->ne[0] >= 32);
+    // Agreed Q layout (RERoT-style, NOT [Dk,Hq,Gmax,Nq]): F32 [Dk, n_groups, Hq, 1].
+    GGML_ASSERT(q->ne[0] >= 1 && q->ne[0] <= INT32_MAX);
+    GGML_ASSERT(q->ne[1] >= 1);
+    GGML_ASSERT(q->ne[2] >= 1 && q->ne[2] % n_kv_heads == 0);
+    GGML_ASSERT(q->ne[3] == 1);
+    GGML_ASSERT(pool->ne[3] == 1);
+    GGML_ASSERT(pool->ne[0] > q->ne[0]);
+    GGML_ASSERT(pool->ne[1] == n_kv_heads);
+    GGML_ASSERT(alpha > 0.0f && alpha <= 1.0f);
+    GGML_ASSERT(softcap >= 0.0f);
+    GGML_ASSERT(exact_all == 0 || exact_all == 1);
+    GGML_ASSERT(scale == scale && alpha == alpha && softcap == softcap); // no NaN
+
+    const int32_t dk = (int32_t) q->ne[0];
+    const int64_t dv64 = pool->ne[0] - q->ne[0];
+    GGML_ASSERT(dv64 >= 1 && dv64 <= INT32_MAX);
+    const int32_t dv = (int32_t) dv64;
+
+    // Plan words track the wire plan layout (header 24 + exact/proxy + counts).
+    // Prefer ggml_flashprefill_plan_words() at the call site; this repeats the
+    // frozen formula (24 + 2*T*H*max_sel_pair + 2*T*H) for graph allocation
+    // without reading GPU counts.
+    GGML_ASSERT(n_tiles <= INT32_MAX / (2 * (n_kv_heads > 0 ? n_kv_heads : 1) * (max_sel > 0 ? max_sel : 1) + 2));
+    const int64_t plan_words = 24 + 2 * n_tiles * n_kv_heads * max_sel + 2 * n_tiles * n_kv_heads;
+    GGML_ASSERT(plan_words >= 24);
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, plan_words);
+
+    ggml_flash_prefill_pack_op_params(result, 1, alpha, scale, softcap, exact_all, dk, dv,
+            mean_correction ? 1 : 0);
+
+    result->op     = GGML_OP_FLASH_PREFILL_SELECT;
+    result->src[0] = q;
+    result->src[1] = pool;
+    result->src[2] = metadata;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_flash_prefill_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * pool,
+        struct ggml_tensor  * plan,
+        struct ggml_tensor  * metadata,
+        struct ggml_tensor  * sinks,
+        int64_t               n_output_queries,
+        int64_t               n_heads,
+        int32_t               dv,
+        float                 scale,
+        float                 softcap,
+        bool                  mean_correction) {
+    GGML_ASSERT(q != NULL && k != NULL && v != NULL && pool != NULL && plan != NULL && metadata != NULL);
+    GGML_ASSERT(n_output_queries > 0 && n_heads > 0 && dv > 0);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(pool->type == GGML_TYPE_F32);
+    GGML_ASSERT(plan->type == GGML_TYPE_I32);
+    GGML_ASSERT(metadata->type == GGML_TYPE_I32);
+    // Agreed Q layout (RERoT-style, NOT [Dk,Hq,Gmax,Nq]): F32 [Dk, n_groups, Hq, 1].
+    // Output is F32 [Dv, Hq, n_output_queries, 1].
+    GGML_ASSERT(q->ne[0] >= 1 && q->ne[0] <= INT32_MAX);
+    GGML_ASSERT(q->ne[1] >= 1);
+    GGML_ASSERT(q->ne[2] == n_heads);
+    GGML_ASSERT(q->ne[3] == 1);
+    GGML_ASSERT(k->ne[0] == q->ne[0]);
+    GGML_ASSERT(v->ne[0] == dv);
+    GGML_ASSERT(k->ne[1] == v->ne[1]);
+    GGML_ASSERT(k->ne[2] == v->ne[2]);
+    GGML_ASSERT(k->ne[2] >= 1 && n_heads % k->ne[2] == 0);
+    GGML_ASSERT(k->ne[3] == 1 && v->ne[3] == 1);
+    GGML_ASSERT(pool->ne[0] == q->ne[0] + dv);
+    GGML_ASSERT(pool->ne[1] == k->ne[2]);
+    GGML_ASSERT(pool->ne[3] == 1);
+    GGML_ASSERT(plan->ne[1] == 1 && plan->ne[2] == 1 && plan->ne[3] == 1);
+    GGML_ASSERT(plan->ne[0] >= 24);
+    GGML_ASSERT(metadata->ne[1] == 1 && metadata->ne[2] == 1 && metadata->ne[3] == 1);
+    GGML_ASSERT(metadata->ne[0] >= 32);
+    GGML_ASSERT(softcap >= 0.0f);
+    GGML_ASSERT(scale == scale && softcap == softcap); // no NaN
+    if (sinks != NULL) {
+        GGML_ASSERT(sinks->type == GGML_TYPE_F32);
+        GGML_ASSERT(sinks->ne[0] == n_heads);
+    }
+
+    const int32_t dk = (int32_t) q->ne[0];
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, dv, n_heads, n_output_queries);
+
+    ggml_flash_prefill_pack_op_params(result, 2, 0.0f, scale, softcap, 0, dk, dv,
+            mean_correction ? 1 : 0);
+
+    result->op     = GGML_OP_FLASH_PREFILL_ATTN;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = pool;
+    result->src[4] = plan;
+    result->src[5] = metadata;
+    result->src[6] = sinks;
+
+    return result;
+}
+
+void ggml_flash_prefill_select_set_mean_correction(struct ggml_tensor * t, bool mean_correction) {
+    GGML_ASSERT(t != NULL && t->op == GGML_OP_FLASH_PREFILL_SELECT);
+    ggml_set_op_params_i32(t, 8, mean_correction ? 1 : 0);
+}
+
+bool ggml_flash_prefill_select_get_mean_correction(const struct ggml_tensor * t) {
+    GGML_ASSERT(t != NULL && t->op == GGML_OP_FLASH_PREFILL_SELECT);
+    return ggml_get_op_params_i32(t, 8) != 0;
+}
+
+void ggml_flash_prefill_attn_set_mean_correction(struct ggml_tensor * t, bool mean_correction) {
+    GGML_ASSERT(t != NULL && t->op == GGML_OP_FLASH_PREFILL_ATTN);
+    ggml_set_op_params_i32(t, 8, mean_correction ? 1 : 0);
+}
+
+bool ggml_flash_prefill_attn_get_mean_correction(const struct ggml_tensor * t) {
+    GGML_ASSERT(t != NULL && t->op == GGML_OP_FLASH_PREFILL_ATTN);
+    return ggml_get_op_params_i32(t, 8) != 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////

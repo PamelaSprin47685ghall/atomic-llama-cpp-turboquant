@@ -41,3 +41,21 @@ add_executable(${TARGET} vulkan-shaders-gen.cpp)
 install(TARGETS ${TARGET} RUNTIME)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 target_link_libraries(vulkan-shaders-gen PUBLIC Threads::Threads)
+
+# RERoT-DDVR note: the fused indexed-FA variant needs no new build entry here
+# and no new string_to_spv() case in vulkan-shaders-gen.cpp. It reuses the
+# existing flash_attn.comp scalar modules via a second entry point
+# (rerot_main, defined in flash_attn_base.glsl) selected at pipeline creation,
+# plus spec constant RerotMode (constant_id 16). Rebuilding after a
+# flash_attn_base.glsl change is already covered: the parent
+# ggml/src/ggml-vulkan/CMakeLists.txt compiles each .comp with glslc -MD/-MF
+# depfiles that track the .glsl includes.
+
+# FlashPrefill V2 note (dispatch-owned, shaders owned by VulkanShaders):
+# flashprefill_pool/select/attn.comp are picked up by the parent
+# ggml/src/ggml-vulkan/CMakeLists.txt *.comp glob automatically, like every
+# other .comp; no per-file entry here. They reuse
+# flash_attn_dequant.glsl (K=1/V=2 bindings) with a single variant per op and
+# runtime K/V specialization via spec constants like FA. The joint
+# push/binding contract lives in flashprefill-interface.h (Shader-owned,
+# tracked via glslc -MD/-MF depfiles like other .glsl includes).

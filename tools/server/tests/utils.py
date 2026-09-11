@@ -86,6 +86,7 @@ class ServerProcess:
     server_reranking: bool | None = False
     server_metrics: bool | None = False
     kv_unified: bool | None = False
+    kv_size: int | str | None = None
     server_slots: bool | None = False
     pooling: str | None = None
     api_key: str | None = None
@@ -194,6 +195,8 @@ class ServerProcess:
             server_args.append("--metrics")
         if self.kv_unified:
             server_args.append("--kv-unified")
+        if self.kv_size is not None:
+            server_args.extend(["--kv-size", self.kv_size])
         if self.server_slots:
             server_args.append("--slots")
         else:

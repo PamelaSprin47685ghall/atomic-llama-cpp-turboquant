@@ -2,6 +2,12 @@
 
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
+#include "../../ggml/src/ggml-impl.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <string>
 
 // utility to get one slice from the third dimension
 // input dim:  [x, y, c, b]
@@ -12,6 +18,21 @@ static ggml_tensor * get_slice_2d(ggml_context * ctx0, ggml_tensor * t, int64_t 
 }
 
 llm_build_delta_net_base::llm_build_delta_net_base(const llm_graph_params & params) : llm_graph_context(params) {}
+
+static bool rerot_shared_rbb_enabled() {
+    const char * mode_env = std::getenv("LLAMA_REROT_RBB_ABLATION");
+    if (!mode_env) {
+        return false;
+    }
+    const std::string mode(mode_env);
+    return mode == "shared-rbb" || mode == "raw-redundant";
+}
+
+static ggml_tensor * rerot_rbb_rows(
+        const llm_graph_input_rs::rbb_group_input & group,
+        bool shared_rbb) {
+    return shared_rbb ? group.public_rows : group.default_shared_rows;
+}
 
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_chunking(
         ggml_tensor * q,
@@ -283,6 +304,13 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     s = ggml_reshape_4d(ctx0, s, S_v, S_v, H_v, n_seqs);
     cb(s, "output_state", il);
 
+    LLAMA_LOG_ERROR("[chunk-tail] il=%d n_tokens=%lld CS=%d kda=%d pad=%d n_chunks=%d o=[%lld,%lld,%lld,%lld] o_nb=[%zu,%zu,%zu,%zu] s=[%lld,%lld,%lld,%lld] vdim1=%lld\n",
+        il, (long long) n_tokens, CS, (int) kda, pad, n_chunks,
+        (long long) o->ne[0], (long long) o->ne[1], (long long) o->ne[2], (long long) o->ne[3],
+        o->nb[0], o->nb[1], o->nb[2], o->nb[3],
+        (long long) s->ne[0], (long long) s->ne[1], (long long) s->ne[2], (long long) s->ne[3],
+        (long long) v->ne[1]);
+
     return {o, s};
 }
 
@@ -422,6 +450,68 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     return {output, new_state};
 }
 
+llm_build_delta_net_base::delta_net_rbb_result
+llm_build_delta_net_base::build_delta_net_rbb(
+        ggml_tensor * q,
+        ggml_tensor * k,
+        ggml_tensor * v,
+        ggml_tensor * g,
+        ggml_tensor * b,
+        ggml_tensor * brain_state,
+        ggml_tensor * native_state,
+        int           il) {
+    const int64_t S_v = v->ne[0];
+    const int64_t H_v = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs = v->ne[3];
+
+    GGML_ASSERT(n_tokens == 1);
+    GGML_ASSERT(n_seqs >= 1);
+    GGML_ASSERT(g->ne[0] == 1);
+    brain_state =
+        ggml_reshape_4d(ctx0, brain_state, S_v, S_v, H_v, 1);
+    native_state =
+        ggml_reshape_4d(ctx0, native_state, S_v, S_v, H_v, n_seqs);
+
+    ggml_tensor * result =
+        ggml_gated_delta_net_rbb(
+            ctx0, q, k, v, g, b, brain_state, native_state);
+    const char * rbb_mode = std::getenv("LLAMA_REROT_RBB_ABLATION");
+    const bool raw_redundant = rbb_mode && std::string(rbb_mode) == "raw-redundant";
+    ggml_set_op_params_i32(result, 2, raw_redundant ? 0 : 1);
+    cb(result, "rerot_block_result", il);
+    res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
+
+    ggml_tensor * output = ggml_view_4d(
+        ctx0, result,
+        S_v, H_v, n_tokens, n_seqs,
+        ggml_row_size(result->type, S_v),
+        ggml_row_size(result->type, S_v * H_v),
+        ggml_row_size(result->type, S_v * H_v * n_tokens),
+        0);
+
+    const size_t output_bytes =
+        ggml_row_size(result->type, S_v * H_v * n_tokens * n_seqs);
+    const size_t state_bytes =
+        ggml_row_size(result->type, S_v * S_v * H_v);
+
+    ggml_tensor * merged_state = ggml_view_4d(
+        ctx0, result,
+        S_v, S_v, H_v, 1,
+        ggml_row_size(result->type, S_v),
+        ggml_row_size(result->type, S_v * S_v),
+        state_bytes,
+        output_bytes);
+    ggml_tensor * hand_deltas = ggml_view_4d(
+        ctx0, result,
+        S_v, S_v, H_v, n_seqs,
+        ggml_row_size(result->type, S_v),
+        ggml_row_size(result->type, S_v * S_v),
+        state_bytes,
+        output_bytes + state_bytes);
+    return {output, merged_state, hand_deltas};
+}
+
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net(
         ggml_tensor * q,
         ggml_tensor * k,
@@ -431,6 +521,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * s,
         int           il) {
     const int64_t n_seq_tokens = q->ne[2];
+
+    LLAMA_LOG_ERROR("[gdn-dispatch] il=%d n_seq_tokens=%lld fused_ar=%d fused_ch=%d -> %s\n",
+        il, (long long) n_seq_tokens, (int) cparams.fused_gdn_ar, (int) cparams.fused_gdn_ch,
+        n_seq_tokens == 1 ? (cparams.fused_gdn_ar ? "FUSED-AR" : "AUTOREG") : (cparams.fused_gdn_ch ? "FUSED-CH" : "CHUNKING"));
 
     if (n_seq_tokens == 1) {
         if (cparams.fused_gdn_ar) {
@@ -524,9 +618,96 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     return conv_input;
 }
 
+void llm_build_delta_net_base::build_rbb_parallel_commit(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        ssm_states_all,
+        ggml_tensor *        candidate_states,
+        int64_t              n_snapshots,
+        int                  il) {
+    const auto * mctx_cur = inp->mctx;
+    GGML_ASSERT(mctx_cur->is_s_shared(il));
+    GGML_ASSERT(inp->brain_copy != nullptr);
+    GGML_ASSERT(n_snapshots > 0);
+
+    const int64_t D = hparams.n_embd_s();
+    const int64_t n_seqs = ubatch.n_seqs;
+    const uint32_t brain_size = mctx_cur->get_brain_size();
+    const size_t row_size =
+        ggml_row_size(ssm_states_all->type, hparams.n_embd_s());
+
+    ggml_tensor * candidates =
+        ggml_reshape_3d(ctx0, candidate_states, D, n_seqs, n_snapshots);
+
+    const bool shared_rbb = rerot_shared_rbb_enabled();
+
+    for (const auto & group : inp->rbb_groups) {
+        GGML_ASSERT(group.brain_row >= 0);
+        GGML_ASSERT((uint32_t) group.brain_row < brain_size);
+        GGML_ASSERT(group.public_rows != nullptr);
+        GGML_ASSERT(group.public_rows->ne[0] > 0);
+
+        ggml_tensor * rows = rerot_rbb_rows(group, shared_rbb);
+        if (!rows || rows->ne[0] == 0) {
+            continue;
+        }
+
+        for (int64_t snapshot = 0; snapshot < n_snapshots; ++snapshot) {
+            ggml_tensor * candidate_snapshot = ggml_view_2d(
+                ctx0, candidates, D, n_seqs, candidates->nb[1],
+                (size_t) snapshot * candidates->nb[2]);
+            ggml_tensor * selected =
+                ggml_get_rows(ctx0, candidate_snapshot, rows);
+            ggml_tensor * reduced = selected;
+            if (rows->ne[0] > 1) {
+                ggml_tensor * transposed =
+                    ggml_cont(ctx0, ggml_transpose(ctx0, selected));
+                reduced = ggml_sum_rows(ctx0, transposed);
+            }
+            reduced = ggml_reshape_1d(ctx0, reduced, D);
+
+            const uint32_t public_brains = brain_size / 2;
+            if (snapshot > 0 &&
+                (uint32_t) group.brain_row >= public_brains) {
+                continue;
+            }
+            const size_t destination_row = snapshot == 0
+                ? (uint32_t) group.brain_row
+                : (size_t) brain_size +
+                    (size_t) (snapshot - 1) * public_brains +
+                    (uint32_t) group.brain_row;
+            ggml_tensor * destination = ggml_view_1d(
+                ctx0, ssm_states_all, D, destination_row * row_size);
+
+            if (rows->ne[0] > 1) {
+                // The candidate-state path uses the documented symmetric
+                // mean; scaling deltas by 1/sqrt(N) amplifies concurrent writes.
+                reduced = ggml_scale(
+                    ctx0, reduced, 1.0f / (float) rows->ne[0]);
+            }
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, reduced, destination));
+        }
+    }
+}
+
+bool llm_build_delta_net_base::uses_parallel_delta(
+        const llm_graph_input_rs * inp, int il) const {
+    if (!inp->mctx->is_s_shared(il) ||
+        cparams.n_rs_seq != 0 ||
+        ubatch.n_seq_tokens != 1 ||
+        ubatch.n_seqs < 1 ||
+        inp->rbb_groups.size() != 1) {
+        return false;
+    }
+    ggml_tensor * rows = rerot_rbb_rows(inp->rbb_groups[0], rerot_shared_rbb_enabled());
+    return rows != nullptr &&
+        rows->ne[0] == ubatch.n_seqs;
+}
+
 ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         llm_graph_input_rs * inp,
         ggml_tensor *        ssm_states_all,
+        ggml_tensor *        state_base,
+        ggml_tensor *        hand_echo_all,
         ggml_tensor *        q,
         ggml_tensor *        k,
         ggml_tensor *        v,
@@ -538,24 +719,196 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const auto   kv_head    = mctx_cur->get_head();
     const uint32_t mem_size = mctx_cur->get_size();
 
-    const int64_t S_v          = s->ne[0];
-    const int64_t H_v          = s->ne[2];
-    const int64_t n_seqs       = s->ne[3];
+    const int64_t S_v          = v->ne[0];
+    const int64_t H_v          = v->ne[1];
+    const int64_t n_seqs       = v->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
     const bool keep = cparams.n_rs_seq > 0;
 
+    // Exact trained recurrence is the default for every child row, regardless
+    // of what the scheduler co-batches beside it. DDVR is already the
+    // cross-lane memory channel; blindly re-encoding DDVR-conditioned hidden
+    // states into one global recurrent brain double-counts peer evidence, and
+    // the innovation component is not identifiable from q/k/v alone.
+    // Shared RBB therefore remains an explicit research mode until such an
+    // innovation operator is mathematically defined. The row membership is
+    // carried by graph inputs; it must never be inferred from "all rows happen
+    // to be children in this ubatch".
+    const bool shared_rbb = rerot_shared_rbb_enabled();
+
+    if (uses_parallel_delta(inp, il)) {
+        GGML_ASSERT(g->ne[0] == 1);
+        GGML_ASSERT(state_base != nullptr);
+        GGML_ASSERT(hand_echo_all != nullptr);
+
+        // PUBLIC rows advance the shared brain through one order-free block
+        // transition. Private hand overlays evolve independently; each reader
+        // uses the new shared brain plus its own overlay. The overlay must not
+        // subtract the shared update and cancel peer influence.
+        const auto rbb =
+            build_delta_net_rbb(q, k, v, g, b, state_base, s, il);
+        cb(rbb.output, "attn_output", il);
+        cb(rbb.merged_state, "new_state", il);
+
+        const auto & group = inp->rbb_groups[0];
+        ggml_tensor * rows = rerot_rbb_rows(group, shared_rbb);
+        GGML_ASSERT(rows != nullptr && rows->ne[0] == n_seqs);
+        const size_t row_size =
+            ggml_row_size(ssm_states_all->type, hparams.n_embd_s());
+        ggml_tensor * destination = ggml_view_1d(
+            ctx0,
+            ssm_states_all,
+            hparams.n_embd_s(),
+            (size_t) group.brain_row * row_size);
+        ggml_build_forward_expand(
+            gf, ggml_cpy(ctx0, rbb.merged_state, destination));
+
+        ggml_tensor * hand_destination = ggml_view_2d(
+            ctx0,
+            hand_echo_all,
+            hparams.n_embd_s(),
+            n_seqs,
+            hand_echo_all->nb[1],
+            (size_t) kv_head * hand_echo_all->nb[1]);
+        ggml_tensor * hand_delta = ggml_reshape_2d(
+            ctx0,
+            rbb.hand_deltas,
+            hparams.n_embd_s(),
+            n_seqs);
+        ggml_build_forward_expand(
+            gf, ggml_cpy(ctx0, hand_delta, hand_destination));
+        return rbb.output;
+    }
+
+    if (!keep && mctx_cur->is_s_shared(il) && n_seq_tokens == 1 && !inp->rbb_groups.empty()) {
+        // Mixed visibility and multi-person batches are resolved per row. In
+        // the default contract child rows keep native lane-local recurrence;
+        // only non-child rows may advance a shared brain. Explicit shared-RBB
+        // research modes opt child rows back into the block operator. Thus the
+        // same logical child transition is invariant to scheduler composition.
+        const int64_t D = hparams.n_embd_s();
+        GGML_ASSERT(state_base != nullptr && hand_echo_all != nullptr);
+        ggml_tensor * base_rows = ggml_cont(ctx0, ggml_reshape_2d(ctx0, state_base, D, n_seqs));
+        const auto native = build_delta_net(q, k, v, g, b, s, il);
+        ggml_tensor * outputs = ggml_cont(ctx0, ggml_reshape_2d(ctx0, native.first, S_v * H_v, n_seqs));
+        // A non-committing PRIVATE/PENDING row retains its entire local
+        // transition relative to the unchanged input brain, not just A_i H_i.
+        ggml_tensor * hands = ggml_sub(ctx0,
+            ggml_reshape_2d(ctx0, native.second, D, n_seqs), base_rows);
+        ggml_build_forward_expand(gf, outputs);
+        ggml_build_forward_expand(gf, hands);
+
+        auto select = [&](ggml_tensor * tensor, ggml_tensor * rows) {
+            GGML_ASSERT(tensor->ne[3] == n_seqs);
+            ggml_tensor * flat = ggml_reshape_2d(ctx0, ggml_cont(ctx0, tensor),
+                tensor->ne[0] * tensor->ne[1] * tensor->ne[2], n_seqs);
+            return ggml_reshape_4d(ctx0, ggml_get_rows(ctx0, flat, rows),
+                tensor->ne[0], tensor->ne[1], tensor->ne[2], rows->ne[0]);
+        };
+        for (const auto & group : inp->rbb_groups) {
+            ggml_tensor * rows = rerot_rbb_rows(group, shared_rbb);
+            if (!rows || rows->ne[0] == 0) {
+                continue;
+            }
+            ggml_tensor * selected_base = ggml_get_rows(ctx0, base_rows, rows);
+            const auto rbb = build_delta_net_rbb(
+                select(q, rows), select(k, rows), select(v, rows),
+                select(g, rows), select(b, rows),
+                ggml_view_1d(ctx0, selected_base, D, 0), select(s, rows), il);
+            const size_t row_size = ggml_row_size(ssm_states_all->type, D);
+            ggml_tensor * destination = ggml_view_1d(ctx0, ssm_states_all, D,
+                (size_t) group.brain_row * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, rbb.merged_state, destination));
+            hands = ggml_set_rows(ctx0, hands,
+                ggml_reshape_2d(ctx0, rbb.hand_deltas, D, rows->ne[0]), rows);
+            ggml_build_forward_expand(gf, outputs);
+            ggml_build_forward_expand(gf, hands);
+        }
+        ggml_tensor * hand_destination = ggml_view_2d(ctx0, hand_echo_all, D, n_seqs,
+            hand_echo_all->nb[1], (size_t) kv_head * hand_echo_all->nb[1]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, hands, hand_destination));
+        return ggml_reshape_4d(ctx0, outputs, S_v, H_v, 1, n_seqs);
+    }
+
     if (!keep) {
+        const int64_t D = hparams.n_embd_s();
+
         auto attn_out = build_delta_net(q, k, v, g, b, s, il);
         ggml_tensor * output    = attn_out.first;
         ggml_tensor * new_state = attn_out.second;
         cb(output, "attn_output", il);
         cb(new_state, "new_state", il);
 
-        ggml_build_forward_expand(gf,
-                ggml_cpy(ctx0, new_state,
-                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+        if (mctx_cur->is_s_shared(il)) {
+            GGML_ASSERT(state_base != nullptr);
+            GGML_ASSERT(hand_echo_all != nullptr);
+            ggml_tensor * baseline_state = ggml_reshape_4d(
+                ctx0, state_base, S_v, S_v, H_v, n_seqs);
+            ggml_tensor * hand_reference =
+                ggml_reshape_2d(ctx0, baseline_state, D, n_seqs);
+
+            bool has_shared_writers = false;
+            for (const auto & group : inp->rbb_groups) {
+                ggml_tensor * rows = rerot_rbb_rows(group, shared_rbb);
+                has_shared_writers = has_shared_writers || (rows && rows->ne[0] > 0);
+            }
+            if (has_shared_writers) {
+                const auto baseline =
+                    build_delta_net(q, k, v, g, b, baseline_state, il);
+                cb(baseline.second, "brain_candidate_states", il);
+                ggml_tensor * baseline_rows =
+                    ggml_reshape_2d(ctx0, baseline.second, D, n_seqs);
+                // Only rows that actually participate in a shared commit use
+                // T(B) as the hand reference. Default child rows keep B itself
+                // as the reference, so H' = T(B+H)-B even in a mixed ubatch.
+                for (const auto & group : inp->rbb_groups) {
+                    ggml_tensor * rows = rerot_rbb_rows(group, shared_rbb);
+                    if (!rows || rows->ne[0] == 0) {
+                        continue;
+                    }
+                    hand_reference = ggml_set_rows(
+                        ctx0,
+                        hand_reference,
+                        ggml_get_rows(ctx0, baseline_rows, rows),
+                        rows);
+                }
+                build_rbb_parallel_commit(
+                    inp, ssm_states_all, baseline.second,
+                    /*n_snapshots=*/1, il);
+            }
+
+            ggml_tensor * hand_destination = ggml_view_2d(
+                ctx0,
+                hand_echo_all,
+                D,
+                n_seqs,
+                hand_echo_all->nb[1],
+                (size_t) kv_head * hand_echo_all->nb[1]);
+            ggml_tensor * hand_delta = ggml_reshape_2d(
+                ctx0,
+                ggml_sub(
+                    ctx0,
+                    ggml_reshape_2d(ctx0, new_state, D, n_seqs),
+                    hand_reference),
+                D,
+                n_seqs);
+            ggml_build_forward_expand(
+                gf, ggml_cpy(ctx0, hand_delta, hand_destination));
+        } else {
+            ggml_tensor * sc_dst_nk = ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all));
+            // StateCarryFix: verify no-keep commit (K=1 full-state write):
+            // new_state element count vs dst, dst pointer vs s_l base +
+            // kv_head offset, and cpy node presence in graph (not fused/dropped).
+            {
+                const size_t sc_elt = ggml_element_size(ssm_states_all);
+                const uint8_t * sc_base = ssm_states_all->data ? (const uint8_t *) ssm_states_all->data : nullptr;
+                const uint8_t * sc_expect = sc_base ? sc_base + (size_t) kv_head * (size_t) hparams.n_embd_s() * sc_elt : nullptr;
+                ggml_tensor * sc_cpy = ggml_cpy(ctx0, new_state, sc_dst_nk);
+                ggml_build_forward_expand(gf, sc_cpy);
+            }
+        }
 
         return output;
     }
@@ -594,13 +947,61 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_row_size(gdn_out->type, state_size_per_snap),
         ggml_row_size(gdn_out->type, attn_score_elems));
 
-    ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all,
-        D, n_seqs, n_written,
-        ssm_states_all->nb[1],
-        (size_t) mem_size * row_size,
-        (size_t) kv_head * row_size);
+    if (mctx_cur->is_s_shared(il)) {
+        GGML_ASSERT(state_base != nullptr && hand_echo_all != nullptr);
+        // Rollback changes how many states are retained, not the recurrence.
+        // The GDN snapshots are complete lane-local states. Keep each hand
+        // snapshot relative to that snapshot's committed brain (or the
+        // unchanged input brain for non-committing child/private rows).
+        // Previously only the shared brain was written here: child rows do
+        // not commit that brain, so enabling rollback silently lost every
+        // recurrent transition after its immediate output.
+        ggml_tensor * base_rows = ggml_reshape_2d(ctx0, state_base, D, n_seqs);
+        for (int64_t snapshot = 0; snapshot < n_written; ++snapshot) {
+            ggml_tensor * candidate = ggml_view_2d(ctx0, src, D, n_seqs,
+                src->nb[1], (size_t) snapshot * src->nb[2]);
+            ggml_tensor * reference = base_rows;
+            for (const auto & group : inp->rbb_groups) {
+                ggml_tensor * rows = rerot_rbb_rows(group, shared_rbb);
+                if (!rows || rows->ne[0] == 0) {
+                    continue;
+                }
+                ggml_tensor * selected = ggml_get_rows(ctx0, candidate, rows);
+                ggml_tensor * committed = selected;
+                if (rows->ne[0] > 1) {
+                    committed = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, selected)));
+                    committed = ggml_scale(ctx0, committed, 1.0f / (float) rows->ne[0]);
+                }
+                committed = ggml_reshape_2d(ctx0, committed, D, 1);
+                reference = ggml_set_rows(ctx0, reference,
+                    ggml_repeat(ctx0, committed, selected), rows);
+            }
+            ggml_tensor * hand = ggml_sub(ctx0, candidate, reference);
+            ggml_tensor * destination = ggml_view_2d(ctx0, hand_echo_all, D, n_seqs,
+                hand_echo_all->nb[1],
+                ((size_t) snapshot * mem_size + kv_head) * hand_echo_all->nb[1]);
+            // Materialize all hands before updating any shared brain buffer.
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, hand, destination));
+        }
+        build_rbb_parallel_commit(
+            inp, ssm_states_all, src, n_written, il);
+    } else {
+        ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all,
+            D, n_seqs, n_written,
+            ssm_states_all->nb[1],
+            (size_t) mem_size * row_size,
+            (size_t) kv_head * row_size);
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+        // StateCarryFix: verify cpy dst == s_l base + kv_head*D*elt and that
+        // the cpy node is present in the graph (not fused/dropped).
+        {
+            const size_t sc_elt = ggml_element_size(ssm_states_all);
+            const uint8_t * sc_base = ssm_states_all->data ? (const uint8_t *) ssm_states_all->data : nullptr;
+            const uint8_t * sc_expect = sc_base ? sc_base + (size_t) kv_head * (size_t) D * sc_elt : nullptr;
+            ggml_tensor * sc_cpy = ggml_cpy(ctx0, src, dst);
+            ggml_build_forward_expand(gf, sc_cpy);
+        }
+    }
 
     return output;
 }

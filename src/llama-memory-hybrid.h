@@ -32,6 +32,8 @@ public:
                 ggml_type   type_r,
                 ggml_type   type_s,
                  uint32_t   rs_size,
+                 uint32_t   n_brain_max,
+                 uint32_t   n_hand_max,
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
@@ -39,7 +41,8 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+    const llama_cparams   * cparams = nullptr);
 
     ~llama_memory_hybrid() = default;
 
@@ -58,6 +61,40 @@ public:
 
     bool get_can_shift() const override;
 
+    uint32_t get_kv_capacity() const override;
+    uint32_t get_kv_used()     const override;
+    uint32_t get_kv_seq_used(llama_seq_id seq_id) const override;
+
+    // Failure-reporting clear forwarded to attention then recurrent.
+    bool try_clear(bool data, std::string * err = nullptr) override;
+
+    // Bounded-hot state propagates from the attention cache: legacy defaults
+    // here would bypass hot reservations entirely.
+    uint32_t get_kv_hot_capacity() const override;
+    bool can_use_legacy_attention() const override;
+    bool is_xkv_bounded_hot() const override;
+
+    // Admission combines the attention token domains with the recurrent
+    // domain (sequence slots never enter the token minimum); legacy
+    // get_kv_capacity() meaning is unchanged.
+    bool get_admission_snapshot(struct llama_memory_admission_snapshot * out) const override;
+    llama_memory_maintenance_status maintain_safe_boundary() override;
+    bool get_xkv_runtime_snapshot(struct llama_memory_xkv_runtime_snapshot * out) const override;
+
+    uint32_t get_recurrent_capacity() const override;
+    uint32_t get_recurrent_used()     const override;
+    uint32_t get_recurrent_seq_used(llama_seq_id seq_id) const override;
+
+    void set_grouped_layout(uint32_t n_brains, uint32_t n_hands) override {
+        if (mem_recr) {
+            mem_recr->set_grouped_layout(n_brains, n_hands);
+        }
+    }
+    uint32_t get_brain_capacity() const override { return mem_recr ? mem_recr->get_brain_capacity() : 0; }
+    uint32_t get_hand_capacity()  const override { return mem_recr ? mem_recr->get_hand_capacity()  : 0; }
+    uint32_t get_brain_used()     const override { return mem_recr ? mem_recr->get_brain_used()     : 0; }
+    uint32_t get_hand_used()      const override { return mem_recr ? mem_recr->get_hand_used()      : 0; }
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -65,6 +102,37 @@ public:
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
+
+    bool seq_rm_attention(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
+    void seq_cp_attention(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+    bool seq_rm_recurrent(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
+    void seq_cp_recurrent(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+
+    bool rerot_set_write_tag(llama_seq_id seq_id, const llama_kv_rerot_meta & tag) override;
+    void rerot_clear_write_tag(llama_seq_id seq_id) override;
+    void rerot_release_episode(uint64_t episode_id) override;
+    bool rerot_can_publish_run(uint64_t episode_id, llama_rerot_run_id run_id, size_t * count) const override;
+    bool rerot_can_reclassify_run(uint64_t episode_id, llama_rerot_run_id run_id,
+        llama_rerot_visibility expected, llama_rerot_visibility replacement,
+        uint64_t publish_epoch, size_t * count) const override;
+    size_t rerot_publish_run(uint64_t episode_id, llama_rerot_run_id run_id, uint64_t publish_epoch) override;
+    size_t rerot_reclassify_run(uint64_t episode_id, llama_rerot_run_id run_id,
+        llama_rerot_visibility expected, llama_rerot_visibility replacement, uint64_t publish_epoch) override;
+    bool rerot_can_add_run_ref(uint64_t episode_id, llama_rerot_run_id run_id,
+        llama_seq_id seq_id, size_t * count) const override;
+    size_t rerot_add_run_ref(uint64_t episode_id, llama_rerot_run_id run_id,
+        llama_seq_id seq_id) override;
+    bool rerot_set_reader_view(llama_seq_id seq_id, const llama_rerot_reader_state & view) override;
+    void rerot_clear_reader_view(llama_seq_id seq_id) override;
+
+    size_t rerot_hand_seed_size(llama_seq_id source_seq) const override;
+    bool rerot_capture_hand_seed(llama_seq_id source_seq, std::vector<uint8_t> & seed_out) override;
+    bool rerot_apply_hand_seed(llama_seq_id dest_seq, const std::vector<uint8_t> & seed_in) override;
+    bool rerot_commit_rbb_frontier(
+            uint32_t person_id,
+            const llama_seq_id * candidate_seqs,
+            const uint8_t * is_public_write,
+            size_t n_candidates) override;
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
@@ -75,6 +143,10 @@ public:
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
+
+    llama_memory_kv_reclaim_result reclaim_kv(const llama_memory_kv_reclaim_request & request) override;
+
+    bool positions_are_sparse() const override;
 
     //
     // llama_memory_hybrid specific API
@@ -110,12 +182,22 @@ public:
     llama_memory_hybrid_context(
               llama_memory_hybrid * mem,
                   slot_info_vec_t   sinfos_attn,
-        std::vector<llama_ubatch>   ubatches);
+        std::vector<llama_ubatch>   ubatches,
+        std::vector<llama_xkv::xkv_hot_reservation> hot_res_attn = {});
 
     ~llama_memory_hybrid_context() = default;
 
     bool next()  override;
     bool apply() override;
+
+    // Forward hot-commit/rollback to attention and recurrent exactly once
+    // each (null-guarded for failure-status contexts).
+    bool postcompute_success() override;
+    bool postcompute_failure() override;
+
+    // Graph-facing bounded-hot views, forwarded to attention.
+    ggml_tensor * get_xkv_hot_k(ggml_context * ctx, int32_t il) const override;
+    ggml_tensor * get_xkv_hot_v(ggml_context * ctx, int32_t il) const override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -140,6 +222,10 @@ private:
 
     const llama_memory_context_ptr ctx_attn;
     const llama_memory_context_ptr ctx_recr;
+
+    // Exactly-once postcompute forward flag.
+    bool postcompute_finalized = false;
+    bool postcompute_ok = false;
 
     const llama_memory_status status;
 };

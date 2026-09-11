@@ -565,6 +565,32 @@ def test_return_progress(n_batch, batch_count, reuse_cache):
     assert total_batch_count == batch_count
 
 
+def test_chat_completions_multiple_choices_with_unified_kv_preemption():
+    global server
+    server.n_slots = 4
+    server.kv_unified = True
+    server.n_ctx = 256
+    server.kv_size = 256
+    server.cache_ram = 64
+    server.start()
+
+    def request():
+        return server.make_request("POST", "/chat/completions", data={
+            "max_tokens": 70,
+            "n": 2,
+            "ignore_eos": True,
+            "messages": [
+                {"role": "user", "content": "Tell me a short story about Ben."},
+            ],
+        })
+
+    results = parallel_function_calls([(request, ()), (request, ())])
+    for res in results:
+        assert res.status_code == 200
+        assert len(res.body["choices"]) == 2
+        assert [choice["finish_reason"] for choice in res.body["choices"]] == ["length", "length"]
+
+
 def test_chat_completions_multiple_choices():
     global server
     server.start()

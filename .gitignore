@@ -3,6 +3,7 @@
 *.a
 *.bat
 *.bin
+!wanxiangqi/qwen35-prune/evidence/**/*.bin
 *.d
 *.dll
 *.dot
@@ -156,3 +157,6 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Checked-in manual artifacts
+!/wanxiangqi/generated/repetition-envelope.h

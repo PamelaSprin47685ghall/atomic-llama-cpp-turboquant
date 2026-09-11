@@ -1,0 +1,110 @@
+{
+  "compression_gate_version": 1,
+  "target_profile": "E1",
+  "evidence_kind": "real",
+  "compression_goal_met": false,
+  "verdict_summary": {
+    "PASS": 0,
+    "FAIL": 0,
+    "NOT_EVALUATED": 16
+  },
+  "reasons": [
+    "[calibration_integrity] NOT_EVALUATED: Calibration file '/opt/llama/data/ornith-1.5-35b.triattention' missing and no evidence provided",
+    "[profile_consistency] NOT_EVALUATED: No evidence for xkv_effective_profile",
+    "[four_stream_codecs] NOT_EVALUATED: Missing codec evidence for one or more factor streams",
+    "[landmark_codec] NOT_EVALUATED: Missing evidence for xkv_codec_landmark (expected q8_0)",
+    "[factored_coverage] NOT_EVALUATED: No evidence for xkv_factored_baseline_byte_coverage (min=75.00%)",
+    "[no_resident_dense_mirror] NOT_EVALUATED: No evidence for has_resident_dense_mirror",
+    "[net_savings] NOT_EVALUATED: No evidence for xkv_net_saved_fraction (min=10.00%)",
+    "[peak_memory_budget] NOT_EVALUATED: No evidence for xkv_peak_vs_baseline_ratio (max=1.15x)",
+    "[allocator_byte_accounting] NOT_EVALUATED: Missing required live, reserved, or peak byte accounting evidence",
+    "[fingerprints] NOT_EVALUATED: Missing required source or profile fingerprints evidence",
+    "[quality_ppl] NOT_EVALUATED: No evidence for quality_ppl_degradation_pct (max=5.0%)",
+    "[context_scaling] NOT_EVALUATED: No evidence for quality_context_scaling_ratio (min=0.95)",
+    "[speculative_parity] NOT_EVALUATED: No evidence for speculative_acceptance_parity",
+    "[triattention_compatibility] NOT_EVALUATED: No evidence for triattention_compatible",
+    "[rerot_compatibility] NOT_EVALUATED: No evidence for rerot_compatible",
+    "[state_code_stream_exact] NOT_EVALUATED: No evidence for state_code_stream_exact"
+  ],
+  "verdicts": {
+    "calibration_integrity": {
+      "status": "NOT_EVALUATED",
+      "reason": "Calibration file '/opt/llama/data/ornith-1.5-35b.triattention' missing and no evidence provided"
+    },
+    "profile_consistency": {
+      "status": "NOT_EVALUATED",
+      "reason": "No evidence for xkv_effective_profile"
+    },
+    "four_stream_codecs": {
+      "status": "NOT_EVALUATED",
+      "reason": "Missing codec evidence for one or more factor streams"
+    },
+    "landmark_codec": {
+      "status": "NOT_EVALUATED",
+      "reason": "Missing evidence for xkv_codec_landmark (expected q8_0)"
+    },
+    "factored_coverage": {
+      "status": "NOT_EVALUATED",
+      "reason": "No evidence for xkv_factored_baseline_byte_coverage (min=75.00%)"
+    },
+    "no_resident_dense_mirror": {
+      "status": "NOT_EVALUATED",
+      "reason": "No evidence for has_resident_dense_mirror"
+    },
+    "net_savings": {
+      "status": "NOT_EVALUATED",
+      "reason": "No evidence for xkv_net_saved_fraction (min=10.00%)"
+    },
+    "peak_memory_budget": {
+      "status": "NOT_EVALUATED",
+      "reason": "No evidence for xkv_peak_vs_baseline_ratio (max=1.15x)"
+    },
+    "allocator_byte_accounting": {
+      "status": "NOT_EVALUATED",
+      "reason": "Missing required live, reserved, or peak byte accounting evidence"
+    },
+    "fingerprints": {
+      "status": "NOT_EVALUATED",
+      "reason": "Missing required source or profile fingerprints evidence"
+    },
+    "quality_ppl": {
+      "status": "NOT_EVALUATED",
+      "reason": "No evidence for quality_ppl_degradation_pct (max=5.0%)"
+    },
+    "context_scaling": {
+      "status": "NOT_EVALUATED",
+      "reason": "No evidence for quality_context_scaling_ratio (min=0.95)"
+    },
+    "speculative_parity": {
+      "status": "NOT_EVALUATED",
+      "reason": "No evidence for speculative_acceptance_parity"
+    },
+    "triattention_compatibility": {
+      "status": "NOT_EVALUATED",
+      "reason": "No evidence for triattention_compatible"
+    },
+    "rerot_compatibility": {
+      "status": "NOT_EVALUATED",
+      "reason": "No evidence for rerot_compatible"
+    },
+    "state_code_stream_exact": {
+      "status": "NOT_EVALUATED",
+      "reason": "No evidence for state_code_stream_exact"
+    }
+  },
+  "thresholds": {
+    "min_factored_byte_coverage": 0.75,
+    "min_saved_fraction": 0.1,
+    "allow_dense_mirror": false,
+    "max_workspace_peak_ratio_vs_baseline": 1.15,
+    "quality_ppl_max_degradation_pct": 5.0,
+    "quality_context_scaling_min_ratio": 0.95,
+    "require_speculative_acceptance_parity": true,
+    "require_triattention_compatibility": true,
+    "require_rerot_compatibility": true,
+    "require_state_code_stream_exact": true,
+    "require_allocator_byte_accounting": true,
+    "require_fingerprints": true
+  },
+  "evidence_provided": false
+}

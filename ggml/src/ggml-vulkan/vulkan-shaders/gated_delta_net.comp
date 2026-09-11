@@ -15,11 +15,15 @@ layout(constant_id = 0) const uint S_V = 128;
 layout(constant_id = 1) const uint KDA = 0;
 layout(constant_id = 2) const uint SUBGROUP_SIZE = 32;
 layout(constant_id = 3) const uint LANES_PER_COLUMN = 32;
+layout(constant_id = 4) const uint WORKGROUP_SIZE = 32;
+layout(constant_id = 5) const uint RBB = 0;
 
-const uint COLS_PER_WG = SUBGROUP_SIZE / LANES_PER_COLUMN;
+const uint COLS_PER_SUBGROUP = SUBGROUP_SIZE / LANES_PER_COLUMN;
+const uint SUBGROUPS_PER_WG = WORKGROUP_SIZE / SUBGROUP_SIZE;
+const uint COLS_PER_WG = COLS_PER_SUBGROUP * SUBGROUPS_PER_WG;
 const uint ROWS_PER_LANE = S_V / LANES_PER_COLUMN;
 
-layout(local_size_x_id = 2, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x_id = 4, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform Parameters {
     uint H;
@@ -34,29 +38,31 @@ layout(push_constant) uniform Parameters {
     uint K;
 };
 
-layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
-layout(binding = 1) readonly  buffer KBuf     { FLOAT_TYPE data_k[];     };
-layout(binding = 2) readonly  buffer VBuf     { FLOAT_TYPE data_v[];     };
-layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
-layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
-layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
-layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
+layout(binding = 0) readonly  buffer QBuf           { FLOAT_TYPE data_q[];            };
+layout(binding = 1) readonly  buffer KBuf           { FLOAT_TYPE data_k[];            };
+layout(binding = 2) readonly  buffer VBuf           { FLOAT_TYPE data_v[];            };
+layout(binding = 3) readonly  buffer GBuf           { FLOAT_TYPE data_g[];            };
+layout(binding = 4) readonly  buffer BetaBuf        { FLOAT_TYPE data_beta[];         };
+layout(binding = 5) readonly  buffer BrainStateBuf  { FLOAT_TYPE data_state[];        };
+layout(binding = 6) readonly  buffer NativeStateBuf { FLOAT_TYPE data_native_state[]; };
+layout(binding = 7)           buffer DstBuf         { FLOAT_TYPE data_dst[];          };
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
-shared FLOAT_TYPE temp[SUBGROUP_SIZE];
+shared FLOAT_TYPE temp[WORKGROUP_SIZE];
 
 // This does a reduction across groups of LANES_PER_COLUMN
 FLOAT_TYPE reduce_add_shmem(FLOAT_TYPE partial) {
     const uint lane = gl_SubgroupInvocationID;
-    temp[lane] = partial;
+    const uint base = gl_SubgroupID * SUBGROUP_SIZE;
+    temp[base + lane] = partial;
     barrier();
     [[unroll]] for (uint s = LANES_PER_COLUMN / 2u; s > 0; s >>= 1u) {
-        FLOAT_TYPE other = temp[lane ^ s];
+        FLOAT_TYPE other = temp[base + (lane ^ s)];
         barrier();
-        temp[lane] += other;
+        temp[base + lane] += other;
         barrier();
     }
-    const FLOAT_TYPE result = temp[lane];
+    const FLOAT_TYPE result = temp[base + lane];
     barrier();
     return result;
 }
@@ -92,25 +98,335 @@ FLOAT_TYPE reduce_partial(FLOAT_TYPE partial) {
     }
 }
 
+void rbb_main() {
+    const uint head_id = gl_WorkGroupID.x;
+    const uint lane = gl_SubgroupInvocationID % LANES_PER_COLUMN;
+    const uint local_col = gl_SubgroupID * COLS_PER_SUBGROUP +
+        gl_SubgroupInvocationID / LANES_PER_COLUMN;
+    const uint col = gl_WorkGroupID.z * COLS_PER_WG + local_col;
+    const uint state_base = head_id * S_V * S_V + col * S_V;
+    const uint qk_head = head_id % neq1;
+
+    // Eight runtime-sized vectors per (head, state column). The block solve
+    // uses one common decay, one residual per writer, and the exact
+    // Parallel DeltaNet operator, symmetrically scaled by sqrt(beta):
+    // A = C K K^T C + diag(1-beta) + eps C^2, rhs = C(V-K Sbar).
+    // This is equivalent for beta>0 and has an exact beta=0 limit.
+    const uint candidate_off = s_off + H * S_V * S_V;
+    const uint scratch_stride = 8u * n_seqs;
+    const uint scratch_base =
+        candidate_off + n_seqs * H * S_V * S_V +
+        (head_id * S_V + col) * scratch_stride;
+    const uint regularizer_off   = scratch_base;
+    const uint rhs_off           = regularizer_off + n_seqs;
+    const uint solution_off      = rhs_off + n_seqs;
+    const uint residual_off      = solution_off + n_seqs;
+    const uint direction_off     = residual_off + n_seqs;
+    const uint product_off       = direction_off + n_seqs;
+    const uint preconditioned_off = product_off + n_seqs;
+    const uint diagonal_off      = preconditioned_off + n_seqs;
+
+    float base_shard[ROWS_PER_LANE];
+    [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; ++r) {
+        base_shard[r] = float(data_state[
+            state_base + r * LANES_PER_COLUMN + lane]);
+    }
+
+    float mean_log_decay = 0.0;
+    for (uint writer = 0u; writer < n_seqs; ++writer) {
+        mean_log_decay +=
+            float(data_g[writer * sb3 + head_id * sb1]);
+    }
+    const float base_alpha = exp(mean_log_decay / float(n_seqs));
+
+    float residual_product = 0.0;
+    for (uint writer = 0u; writer < n_seqs; ++writer) {
+        const uint qk_off = (writer / rq3) * sq3 + qk_head * sq1;
+        const float beta = float(data_beta[writer * sb3 + head_id * sb1]);
+        float projected = 0.0;
+        float key_norm = 0.0;
+        [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; ++r) {
+            const uint d = r * LANES_PER_COLUMN + lane;
+            const float key = float(data_k[qk_off + d]);
+            projected += base_alpha * base_shard[r] * key;
+            key_norm += key * key;
+        }
+        projected = float(reduce_partial(FLOAT_TYPE(projected)));
+        key_norm = float(reduce_partial(FLOAT_TYPE(key_norm)));
+        const float rhs =
+            float(data_v[writer * sv3 + head_id * sv1 + col]) - projected;
+        float evidence_density = 1.0;
+        // RBB=2 is the default mathematical contract: correct redundant
+        // evidence without averaging orthogonal writes. Orthogonal keys keep
+        // density 1; identical active keys have density N. RBB=1 remains an
+        // explicit raw-redundant research control. PRIVATE overlays still use
+        // the native beta.
+        if (RBB == 2u && n_seqs > 1u) {
+            for (uint other = 0u; other < n_seqs; ++other) {
+                if (other == writer || float(data_beta[other * sb3 + head_id * sb1]) == 0.0) continue;
+                const uint other_off = (other / rq3) * sq3 + qk_head * sq1;
+                float cross = 0.0, other_norm = 0.0;
+                [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; ++r) {
+                    const uint d = r * LANES_PER_COLUMN + lane;
+                    const float ki = float(data_k[qk_off + d]), kj = float(data_k[other_off + d]);
+                    cross += ki * kj;
+                    other_norm += kj * kj;
+                }
+                cross = float(reduce_partial(FLOAT_TYPE(cross)));
+                other_norm = float(reduce_partial(FLOAT_TYPE(other_norm)));
+                if (key_norm * other_norm > 1.0e-20) evidence_density += cross * cross / (key_norm * other_norm);
+            }
+        }
+        const float regularizer =
+            n_seqs == 1u ? 0.0 : evidence_density * (1.0 - beta + 1.0e-4 * beta);
+        const float diagonal =
+            n_seqs == 1u ? key_norm : beta * key_norm + regularizer;
+        const float solution =
+            n_seqs == 1u ? beta * rhs : 0.0;
+        const float residual =
+            n_seqs == 1u ? 0.0 : sqrt(beta) * rhs;
+        const float preconditioned =
+            diagonal > 1.0e-20 ? residual / diagonal : 0.0;
+
+        if (lane == 0u) {
+            data_dst[regularizer_off + writer] = FLOAT_TYPE(regularizer);
+            data_dst[rhs_off + writer] = FLOAT_TYPE(rhs);
+            data_dst[solution_off + writer] = FLOAT_TYPE(solution);
+            data_dst[residual_off + writer] = FLOAT_TYPE(residual);
+            data_dst[direction_off + writer] = FLOAT_TYPE(preconditioned);
+            data_dst[product_off + writer] = FLOAT_TYPE(0.0);
+            data_dst[preconditioned_off + writer] =
+                FLOAT_TYPE(preconditioned);
+            data_dst[diagonal_off + writer] = FLOAT_TYPE(diagonal);
+            residual_product += residual * preconditioned;
+        }
+        memoryBarrierBuffer();
+        barrier();
+    }
+
+    // Matrix-free preconditioned CG. N steps are exact only in exact
+    // arithmetic: real correlated keys lost conjugacy even at N=4. Refine
+    // every frontier size and replace the recursively accumulated residual
+    // with b-Ax between Krylov cycles. The common loop bound keeps workgroup
+    // barriers uniform even when columns converge at different times.
+    const uint iteration_count =
+        n_seqs == 1u ? 0u : 4u * n_seqs;
+    for (uint iteration = 0u; iteration < iteration_count; ++iteration) {
+        if (iteration > 0u && iteration % n_seqs == 0u) {
+            float solution_keys[ROWS_PER_LANE];
+            [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; ++r) {
+                const uint d = r * LANES_PER_COLUMN + lane;
+                float value = 0.0;
+                for (uint writer = 0u; writer < n_seqs; ++writer) {
+                    const uint qk_off = (writer / rq3) * sq3 + qk_head * sq1;
+                    value += sqrt(float(data_beta[writer * sb3 + head_id * sb1])) *
+                        float(data_dst[solution_off + writer]) * float(data_k[qk_off + d]);
+                }
+                solution_keys[r] = value;
+            }
+            if (lane == 0u) residual_product = 0.0;
+            for (uint writer = 0u; writer < n_seqs; ++writer) {
+                const uint qk_off = (writer / rq3) * sq3 + qk_head * sq1;
+                float dot = 0.0;
+                [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; ++r) {
+                    const uint d = r * LANES_PER_COLUMN + lane;
+                    dot += float(data_k[qk_off + d]) * solution_keys[r];
+                }
+                dot = float(reduce_partial(FLOAT_TYPE(dot)));
+                if (lane == 0u) {
+                    const float beta = float(data_beta[writer * sb3 + head_id * sb1]);
+                    const float regularizer = float(data_dst[regularizer_off + writer]);
+                    const float residual = sqrt(beta) * (float(data_dst[rhs_off + writer]) - dot) -
+                        regularizer * float(data_dst[solution_off + writer]);
+                    const float z = residual / float(data_dst[diagonal_off + writer]);
+                    data_dst[residual_off + writer] = FLOAT_TYPE(residual);
+                    data_dst[preconditioned_off + writer] = FLOAT_TYPE(z);
+                    data_dst[direction_off + writer] = FLOAT_TYPE(z);
+                    residual_product += residual * z;
+                }
+            }
+            memoryBarrierBuffer();
+            barrier();
+        }
+        float projected_keys[ROWS_PER_LANE];
+        [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; ++r) {
+            const uint d = r * LANES_PER_COLUMN + lane;
+            float value = 0.0;
+            for (uint writer = 0u; writer < n_seqs; ++writer) {
+                const uint qk_off =
+                    (writer / rq3) * sq3 + qk_head * sq1;
+                value += sqrt(float(data_beta[writer * sb3 + head_id * sb1])) *
+                    float(data_dst[direction_off + writer]) *
+                    float(data_k[qk_off + d]);
+            }
+            projected_keys[r] = value;
+        }
+
+        for (uint writer = 0u; writer < n_seqs; ++writer) {
+            const uint qk_off =
+                (writer / rq3) * sq3 + qk_head * sq1;
+            float dot = 0.0;
+            [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; ++r) {
+                const uint d = r * LANES_PER_COLUMN + lane;
+                dot += float(data_k[qk_off + d]) * projected_keys[r];
+            }
+            dot = float(reduce_partial(FLOAT_TYPE(dot)));
+            if (lane == 0u) {
+                const float beta =
+                    float(data_beta[writer * sb3 + head_id * sb1]);
+                const float regularizer =
+                    float(data_dst[regularizer_off + writer]);
+                data_dst[product_off + writer] = FLOAT_TYPE(
+                    sqrt(beta) * dot + regularizer *
+                        float(data_dst[direction_off + writer]));
+            }
+        }
+        memoryBarrierBuffer();
+        barrier();
+
+        if (lane == 0u) {
+            float direction_product = 0.0;
+            for (uint writer = 0u; writer < n_seqs; ++writer) {
+                direction_product +=
+                    float(data_dst[direction_off + writer]) *
+                    float(data_dst[product_off + writer]);
+            }
+            const float step =
+                direction_product > 1.0e-20
+                    ? residual_product / direction_product
+                    : 0.0;
+            float next_residual_product = 0.0;
+            for (uint writer = 0u; writer < n_seqs; ++writer) {
+                const float residual =
+                    float(data_dst[residual_off + writer]) -
+                    step * float(data_dst[product_off + writer]);
+                const float diagonal =
+                    float(data_dst[diagonal_off + writer]);
+                const float preconditioned =
+                    diagonal > 1.0e-20 ? residual / diagonal : 0.0;
+                data_dst[solution_off + writer] = FLOAT_TYPE(
+                    float(data_dst[solution_off + writer]) +
+                    step * float(data_dst[direction_off + writer]));
+                data_dst[residual_off + writer] = FLOAT_TYPE(residual);
+                data_dst[preconditioned_off + writer] =
+                    FLOAT_TYPE(preconditioned);
+                next_residual_product += residual * preconditioned;
+            }
+            const float conjugate =
+                residual_product > 1.0e-20
+                    ? next_residual_product / residual_product
+                    : 0.0;
+            for (uint writer = 0u; writer < n_seqs; ++writer) {
+                data_dst[direction_off + writer] = FLOAT_TYPE(
+                    float(data_dst[preconditioned_off + writer]) +
+                    conjugate * float(data_dst[direction_off + writer]));
+            }
+            residual_product = next_residual_product;
+        }
+        memoryBarrierBuffer();
+        barrier();
+    }
+
+    float merged_shard[ROWS_PER_LANE];
+    [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; ++r) {
+        const uint d = r * LANES_PER_COLUMN + lane;
+        float merged = base_alpha * base_shard[r];
+        for (uint writer = 0u; writer < n_seqs; ++writer) {
+            const uint qk_off =
+                (writer / rq3) * sq3 + qk_head * sq1;
+            const float unscale = n_seqs == 1u
+                ? 1.0 : sqrt(float(data_beta[writer * sb3 + head_id * sb1]));
+            merged += float(data_k[qk_off + d]) * unscale *
+                float(data_dst[solution_off + writer]);
+        }
+        merged_shard[r] = merged;
+        data_dst[s_off + state_base + d] = FLOAT_TYPE(merged);
+    }
+
+    // Evolve the private overlay H and retain the writer's zero-mean share of
+    // the block write. If Delta=sum_i C_i, store C_i-Delta/N in each hand.
+    // These echoes sum to zero, identical writers receive zero echo, and N=1
+    // stays exactly native. This preserves writer identity without moving the
+    // shared brain or introducing a tunable self-echo coefficient.
+    for (uint writer = 0u; writer < n_seqs; ++writer) {
+        const uint qk_off = (writer / rq3) * sq3 + qk_head * sq1;
+        const uint native_base =
+            ((writer * H + head_id) * S_V + col) * S_V;
+        const float alpha =
+            exp(float(data_g[writer * sb3 + head_id * sb1]));
+        const float beta = float(data_beta[writer * sb3 + head_id * sb1]);
+        float projected = 0.0;
+        float projected_native = 0.0;
+        [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; ++r) {
+            const uint d = r * LANES_PER_COLUMN + lane;
+            const float native_value = float(data_native_state[native_base + d]);
+            const float key = float(data_k[qk_off + d]);
+            projected += alpha * (native_value - base_shard[r]) * key;
+            projected_native += alpha * native_value * key;
+        }
+        projected = float(reduce_partial(FLOAT_TYPE(projected)));
+        projected_native = float(reduce_partial(FLOAT_TYPE(projected_native)));
+        const float delta = -beta * projected;
+        const float native_delta = beta *
+            (float(data_v[writer * sv3 + head_id * sv1 + col]) - projected_native);
+
+        float attn = 0.0;
+        [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; ++r) {
+            const uint d = r * LANES_PER_COLUMN + lane;
+            const float local_hand =
+                alpha * (float(data_native_state[native_base + d]) - base_shard[r]) +
+                float(data_k[qk_off + d]) * delta;
+            const float unscale = n_seqs == 1u
+                ? 1.0 : sqrt(float(data_beta[writer * sb3 + head_id * sb1]));
+            const float self_write = float(data_k[qk_off + d]) * unscale *
+                float(data_dst[solution_off + writer]);
+            const float shared_write = merged_shard[r] - base_alpha * base_shard[r];
+            const float self_echo = n_seqs == 1u ? 0.0 :
+                self_write - shared_write / float(n_seqs);
+            const float hand = local_hand + self_echo;
+            data_dst[
+                candidate_off +
+                ((writer * H + head_id) * S_V + col) * S_V + d] =
+                FLOAT_TYPE(hand);
+            const float native_candidate =
+                alpha * float(data_native_state[native_base + d]) +
+                float(data_k[qk_off + d]) * native_delta;
+            attn += native_candidate * float(data_q[qk_off + d]);
+        }
+        attn = float(reduce_partial(FLOAT_TYPE(attn)));
+        if (lane == 0u) {
+            data_dst[(writer * H + head_id) * S_V + col] =
+                FLOAT_TYPE(attn * scale);
+        }
+    }
+}
+
 void main() {
+    if (RBB != 0u) {
+        rbb_main();
+        return;
+    }
+
     const uint head_id = gl_WorkGroupID.x;
     const uint seq_id = gl_WorkGroupID.y;
     const uint lane = gl_SubgroupInvocationID % LANES_PER_COLUMN;
-    const uint col = gl_WorkGroupID.z * COLS_PER_WG + (gl_SubgroupInvocationID / LANES_PER_COLUMN);
+    const uint col = gl_WorkGroupID.z * COLS_PER_WG +
+        gl_SubgroupID * COLS_PER_SUBGROUP +
+        (gl_SubgroupInvocationID / LANES_PER_COLUMN);
 
     const uint iq1 = head_id % neq1;
     const uint iq3 = seq_id / rq3;
 
     const uint state_size = S_V * S_V;
-    // input state holds s0 only [S_v, S_v, H, n_seqs]: per-seq stride is H*D.
     const uint state_in_base       = (seq_id * H + head_id) * state_size;
-    // output state layout per slot: same per-(seq,head) offset as the single-slot case.
     const uint state_out_base      = (seq_id * H + head_id) * state_size;
     const uint state_size_per_snap = state_size * H * n_seqs;
 
     FLOAT_TYPE s_shard[ROWS_PER_LANE];
     [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-        s_shard[r] = FLOAT_TYPE(data_state[state_in_base + col * S_V + r * LANES_PER_COLUMN + lane]);
+        const uint state_idx =
+            state_in_base + col * S_V + r * LANES_PER_COLUMN + lane;
+        s_shard[r] = FLOAT_TYPE(data_state[state_idx]);
     }
 
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
@@ -183,7 +499,9 @@ void main() {
 
     if (K == 1u) {
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-            data_dst[s_off + state_out_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+            const uint state_elem =
+                col * S_V + r * LANES_PER_COLUMN + lane;
+            data_dst[s_off + state_out_base + state_elem] = s_shard[r];
         }
     }
 }

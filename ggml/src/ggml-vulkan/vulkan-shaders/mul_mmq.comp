@@ -56,6 +56,7 @@ layout (push_constant) uniform parameter
     uint nei1;
     uint nbi1;
     uint ne11;
+    uint active_capacity;
 #else
     uint base_work_group_z;
     uint num_batches;
@@ -110,8 +111,11 @@ void main() {
     const uint ic = gl_WorkGroupID.y;
 
 #ifdef MUL_MAT_ID
-    const uint expert_idx = gl_WorkGroupID.z;
-    if (ic * BN >= data_expert_count[expert_idx]) {
+    if (gl_WorkGroupID.z >= uint(data_expert_count[0])) {
+        return;
+    }
+    const uint expert_idx = uint(data_expert_count[1 + gl_WorkGroupID.z]);
+    if (ic * BN >= expert_count(expert_idx)) {
         return;
     }
 #endif
@@ -157,30 +161,7 @@ void main() {
     const uint loadstride_b = BLOCK_SIZE * LOAD_VEC_B / BK;
 
 #ifdef MUL_MAT_ID
-#ifdef MUL_MAT_ID_USE_SUBGROUPS
-    if (bitCount(p.nei0) == 1) {
-        load_row_ids(expert_idx, true, ic);
-    } else {
-        load_row_ids(expert_idx, false, ic);
-    }
-#else
-    _ne1 = 0;
-    for (uint ii1 = 0; ii1 < p.nei1 && _ne1 < (ic + 1) * BN; ii1++) {
-        for (uint ii0 = 0; ii0 < p.nei0 && _ne1 < (ic + 1) * BN; ii0++) {
-            if (data_ids[ii1*p.nbi1 + ii0] == expert_idx) {
-                if (_ne1 >= ic * BN) {
-                    row_ids[_ne1 - ic * BN] = u16vec2(ii0, ii1);
-                }
-                _ne1++;
-            }
-        }
-    }
-
-    barrier();
-#endif
-
-    // Workgroup has no work
-    if (ic * BN >= _ne1) return;
+    load_row_ids(expert_idx, false, ic);
 #endif
 
 #ifdef MUL_MAT_ID

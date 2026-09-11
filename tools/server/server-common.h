@@ -96,7 +96,6 @@ json format_error_response(const std::string & message, const enum error_type ty
 // random string / id
 //
 
-std::string random_string();
 std::string gen_chatcmplid();
 std::string gen_tool_call_id();
 
@@ -317,6 +316,7 @@ struct server_chat_params {
     bool allow_video;
     bool enable_thinking = true;
     int  reasoning_budget = -1;
+    int  n_predict = -1;
     std::string reasoning_budget_message;
     std::string media_path;
     bool force_pure_content = false;

@@ -10,6 +10,8 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <algorithm>
+
 using json = nlohmann::ordered_json;
 
 //
@@ -75,6 +77,8 @@ json task_params::to_json(bool only_metrics) const {
             {"min_keep",                  sampling.min_keep},
             {"chat_format",               common_chat_format_name(chat_parser_params.format)},
             {"reasoning_format",          common_reasoning_format_name(chat_parser_params.reasoning_format)},
+            {"reasoning_effort",          reasoning_effort},
+            {"reasoning_budget_tokens",   sampling.reasoning_budget_tokens},
             {"reasoning_in_content",      chat_parser_params.reasoning_in_content},
             {"generation_prompt",         chat_parser_params.generation_prompt},
             {"samplers",                  samplers},
@@ -83,6 +87,9 @@ json task_params::to_json(bool only_metrics) const {
             {"post_sampling_probs",       post_sampling_probs},
             {"backend_sampling",          sampling.backend_sampling},
             {"lora",                      lora},
+            {"rerot_enabled",             rerot_enabled},
+            {"rerot_frontier",            std::string(llama_rerot_frontier_mode_name(rerot_frontier))},
+            {"rerot_trace",               rerot_trace},
         };
     }
 
@@ -134,6 +141,8 @@ json task_params::to_json(bool only_metrics) const {
         {"preserved_tokens",          sampling.preserved_tokens},
         {"chat_format",               common_chat_format_name(chat_parser_params.format)},
         {"reasoning_format",          common_reasoning_format_name(chat_parser_params.reasoning_format)},
+        {"reasoning_effort",          reasoning_effort},
+        {"reasoning_budget_tokens",   sampling.reasoning_budget_tokens},
         {"reasoning_in_content",      chat_parser_params.reasoning_in_content},
         {"generation_prompt",         chat_parser_params.generation_prompt},
         {"samplers",                  samplers},
@@ -142,7 +151,341 @@ json task_params::to_json(bool only_metrics) const {
         {"post_sampling_probs",       post_sampling_probs},
         {"backend_sampling",          sampling.backend_sampling},
         {"lora",                      lora},
+        {"rerot_enabled",             rerot_enabled},
+        {"rerot_frontier",            std::string(llama_rerot_frontier_mode_name(rerot_frontier))},
+        {"rerot_trace",               rerot_trace},
     };
+}
+
+// RERoT outer compatibility (§§18,26,A.13-A.20)
+//
+
+void task_params::apply_rerot_defaults(const common_params & base) {
+    if (!base.rerot_enabled) {
+        return; // OFF stays OFF: no allocation, no state change beyond defaults
+    }
+    rerot_enabled = base.rerot_enabled;
+    rerot_frontier = base.rerot_frontier;
+    rerot_trace = base.rerot_trace;
+}
+
+bool task_params::rerot_effective(server_task_type task_type) const {
+    if (!rerot_enabled) {
+        return false;
+    }
+    // A.19: embedding/rerank (and any non-generation path) never enters RERoT
+    // even when globally enabled. COMPLETION/INFILL stay eligible; multimodal
+    // prompts stay eligible via prelude-then-fork (A.18).
+    switch (task_type) {
+        case SERVER_TASK_TYPE_EMBEDDING:
+        case SERVER_TASK_TYPE_RERANK:
+            return false;
+        default:
+            return true;
+    }
+}
+
+bool task_params::rerot_validate_request(server_task_type task_type, bool has_media, std::string & error) const {
+    (void) has_media; // multimodal is allowed (prelude-then-fork, A.18): no gate
+    (void) error;
+    if (!rerot_enabled) {
+        return true; // OFF: no-op, no allocation
+    }
+    if (!rerot_effective(task_type)) {
+        return true; // A.19: silently inert for embedding/rerank, not an error
+    }
+
+    // Combination policy belongs to the active episode, not request
+    // validation. MTP drafts are epoch-bound, cache reuse is restricted to
+    // the ordinary prefix, and context shift truncates the shared semantic
+    // log. Rejecting these options here made the production-compatible
+    // runtime unreachable even though the lower layers already expose the
+    // required invalidation and selective-memory operations.
+    return true;
+}
+
+bool server_rerot_metrics::empty() const {
+    return episode_total == 0 && episode_active == 0
+        && nodes_created == 0 && nodes_started == 0 && nodes_retired == 0 && nodes_queued == 0
+        && queue_max == 0 && forks_total == 0 && max_depth == 0 && max_live_lanes == 0
+        && public_tokens == 0 && private_tokens == 0 && pending_tokens == 0
+        && completed_episodes == 0 && completed_model_tokens == 0
+        && parallel_model_tokens == 0 && completed_episode_seconds == 0.0
+        && parallel_seconds == 0.0
+        && frontiers == 0 && topology_barriers == 0 && refresh_total == 0
+        && mtp_invalidations == 0 && context_shifts == 0
+        && hard_aborts == 0 && final_fences == 0
+        && span_count == 0 && parked_total == 0 && archive_total == 0
+        && ddvr_seconds == 0.0
+        && people_capacity == 0 && people_resident == 0 && people_runnable == 0 && people_waiting == 0
+        && pens_capacity == 0 && pens_allocated == 0 && pens_running == 0 && pens_suspended == 0
+        && pen_queue_depth == 0 && pens_per_person_max_observed == 0 && pen_utilization == 0.0
+        && batch_people == 0 && batch_pens == 0 && frontier_rows == 0
+        && brain_bytes == 0 && hand_bytes == 0 && grouped_scratch_bytes == 0;
+}
+
+json server_rerot_metrics::to_json() const {
+    // Empty metrics must not be emitted (OFF: no metric emission). Callers
+    // check empty() first; this still returns a valid object when called.
+    return json {
+        { "rerot_episode_total",       episode_total },
+        { "rerot_episode_active",      episode_active },
+        { "rerot_nodes_created",       nodes_created },
+        { "rerot_nodes_started",       nodes_started },
+        { "rerot_nodes_retired",       nodes_retired },
+        { "rerot_nodes_queued",        nodes_queued },
+        { "rerot_queue_max",           queue_max },
+        { "rerot_forks_total",         forks_total },
+        { "rerot_max_depth",           max_depth },
+        { "rerot_max_live_lanes",      max_live_lanes },
+        { "rerot_public_tokens",              public_tokens },
+        { "rerot_private_tokens",             private_tokens },
+        { "rerot_pending_tokens",             pending_tokens },
+        { "rerot_completed_episodes",         completed_episodes },
+        { "rerot_completed_model_tokens",     completed_model_tokens },
+        { "rerot_parallel_model_tokens",      parallel_model_tokens },
+        { "rerot_completed_episode_seconds",  completed_episode_seconds },
+        { "rerot_parallel_seconds",           parallel_seconds },
+        { "rerot_frontiers",                  frontiers },
+        { "rerot_topology_barriers",   topology_barriers },
+        { "rerot_refresh_total",       refresh_total },
+        { "rerot_mtp_invalidations",   mtp_invalidations },
+        { "rerot_context_shifts",      context_shifts },
+        { "rerot_hard_aborts",         hard_aborts },
+        { "rerot_final_fences",        final_fences },
+        { "rerot_span_count",          span_count },
+        { "rerot_parked_total",        parked_total },
+        { "rerot_archive_total",       archive_total },
+        { "rerot_ddvr_seconds",        ddvr_seconds },
+
+        { "rerot_people_capacity",     people_capacity },
+        { "rerot_people_resident",     people_resident },
+        { "rerot_people_runnable",     people_runnable },
+        { "rerot_people_waiting",      people_waiting },
+
+        { "rerot_pens_capacity",       pens_capacity },
+        { "rerot_pens_allocated",      pens_allocated },
+        { "rerot_pens_running",        pens_running },
+        { "rerot_pens_suspended",      pens_suspended },
+        { "rerot_pen_queue_depth",     pen_queue_depth },
+        { "rerot_pens_per_person_max_observed", pens_per_person_max_observed },
+        { "rerot_pen_utilization",     pen_utilization },
+
+        { "rerot_batch_people",        batch_people },
+        { "rerot_batch_pens",          batch_pens },
+        { "rerot_frontier_rows",       frontier_rows },
+
+        { "rerot_brain_bytes",         brain_bytes },
+        { "rerot_hand_bytes",          hand_bytes },
+        { "rerot_grouped_scratch_bytes", grouped_scratch_bytes },
+    };
+}
+
+void server_rerot_metrics::accumulate(const server_rerot_metrics & delta) {
+    if (delta.empty()) {
+        return; // OFF/no-op delta: no work
+    }
+    episode_total       += delta.episode_total;
+    episode_active       = delta.episode_active; // gauge: last writer wins
+    nodes_created       += delta.nodes_created;
+    nodes_started       += delta.nodes_started;
+    nodes_retired       += delta.nodes_retired;
+    nodes_queued        += delta.nodes_queued;
+    queue_max            = std::max(queue_max, delta.queue_max);
+    forks_total         += delta.forks_total;
+    max_depth            = std::max(max_depth, delta.max_depth);
+    max_live_lanes       = std::max(max_live_lanes, delta.max_live_lanes);
+    public_tokens              += delta.public_tokens;
+    private_tokens             += delta.private_tokens;
+    pending_tokens             += delta.pending_tokens;
+    completed_episodes         += delta.completed_episodes;
+    completed_model_tokens     += delta.completed_model_tokens;
+    parallel_model_tokens      += delta.parallel_model_tokens;
+    completed_episode_seconds  += delta.completed_episode_seconds;
+    parallel_seconds           += delta.parallel_seconds;
+    frontiers                  += delta.frontiers;
+    topology_barriers   += delta.topology_barriers;
+    refresh_total       += delta.refresh_total;
+    mtp_invalidations   += delta.mtp_invalidations;
+    context_shifts      += delta.context_shifts;
+    hard_aborts         += delta.hard_aborts;
+    final_fences        += delta.final_fences;
+    span_count          += delta.span_count;
+    parked_total        += delta.parked_total;
+    archive_total       += delta.archive_total;
+    ddvr_seconds        += delta.ddvr_seconds;
+
+    people_capacity     = delta.people_capacity;
+    people_resident     = delta.people_resident;
+    people_runnable     = delta.people_runnable;
+    people_waiting      = delta.people_waiting;
+
+    pens_capacity       = delta.pens_capacity;
+    pens_allocated      = delta.pens_allocated;
+    pens_running        = delta.pens_running;
+    pens_suspended      = delta.pens_suspended;
+    pen_queue_depth     = delta.pen_queue_depth;
+    pens_per_person_max_observed = std::max(pens_per_person_max_observed, delta.pens_per_person_max_observed);
+    pen_utilization     = delta.pen_utilization;
+
+    batch_people        = delta.batch_people;
+    batch_pens          = delta.batch_pens;
+    frontier_rows       += delta.frontier_rows;
+
+    brain_bytes         = delta.brain_bytes;
+    hand_bytes          = delta.hand_bytes;
+    grouped_scratch_bytes = delta.grouped_scratch_bytes;
+}
+
+server_rerot_episode_key server_task::rerot_key() const {
+    return server_rerot_episode_key { id, rerot_episode_id, rerot_generation };
+}
+
+bool server_task::rerot_key_matches(int task, uint64_t episode, uint64_t gen) const {
+    if (rerot_episode_id == 0) {
+        return false; // no episode: every callback key is stale by definition
+    }
+    return id == task && rerot_episode_id == episode && rerot_generation == gen;
+}
+
+void server_task::rerot_bump_generation() {
+    ++rerot_generation;
+    for (auto & child : child_tasks) {
+        ++child.rerot_generation;
+    }
+}
+
+void server_task::assign_rerot_episodes(uint64_t & next_episode_id, uint64_t generation) {
+    if (!params.rerot_effective(type)) {
+        return; // OFF or A.19-inert: leave every episode id at 0, no allocation
+    }
+    if (next_episode_id == 0) {
+        next_episode_id = 1;
+    }
+    rerot_generation = generation;
+    rerot_episode_id = next_episode_id++;
+    if (rerot_episode_id == 0) {
+        rerot_episode_id = next_episode_id++; // never hand out episode 0 (means "none")
+    }
+    for (auto & child : child_tasks) {
+        child.rerot_generation = generation;
+        child.rerot_episode_id = next_episode_id++;
+        if (child.rerot_episode_id == 0) {
+            child.rerot_episode_id = next_episode_id++;
+        }
+    }
+    // Cross-check the visibility-domain invariant while we hold the ids:
+    // different outer completions in one n_cmpl group must never share an
+    // episode id (outer shared prompt cells stay shared as the untagged
+    // prefix; visibility diverges only via distinct episode ids).
+    GGML_ASSERT(child_tasks.empty() || rerot_episode_id != child_tasks.front().rerot_episode_id);
+}
+
+int server_task::rerot_response_owner() const {
+    // §18.3: the HTTP/SSE stream belongs to the outer completion task, never
+    // to an internal lane. Each outer completion (parent or child) owns its
+    // own response id; internal lanes map through this id and never emit.
+    return id;
+}
+
+bool server_task::rerot_effective() const {
+    return params.rerot_effective(type);
+}
+
+bool server_rerot_tool_calls_allowed(bool serial_tail_done) {
+    // §26: no tool execution during concurrent reasoning; only the final
+    // acquire fence + serial tail restores the stock tool path. A new RERoT
+    // episode starts after tool results return; old episodes never revive.
+    return serial_tail_done;
+}
+
+bool server_rerot_check_lora_inheritance(
+    const std::vector<common_adapter_lora_info> & root_loras,
+    const std::vector<common_adapter_lora_info> & lane_loras,
+    std::string & error) {
+    // A.17.1: every lane inherits the identical adapter set/scale, otherwise
+    // shared PUBLIC KV would mix adapter domains. are_lora_equal compares
+    // (scale, ptr) per slot; OFF/empty sets are trivially compatible.
+    if (are_lora_equal(root_loras, lane_loras)) {
+        return true;
+    }
+    error = "RERoT LoRA mismatch: all lanes in one episode must use the identical adapter set/scale (A.17.1)";
+    return false;
+}
+
+bool server_rerot_can_batch_with(const task_params & a, const task_params & b) {
+    // A.17.3: the existing adapter batching constraint stays in force; never
+    // force incompatible LoRA requests into one RERoT batch. Different
+    // episodes may share a physical batch only when adapters are compatible:
+    // episode_id still separates their KV visibility domains.
+    if (a.lora.size() != b.lora.size()) {
+        return false;
+    }
+    for (const auto & kv : a.lora) {
+        const auto it = b.lora.find(kv.first);
+        if (it == b.lora.end() || it->second != kv.second) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool server_rerot_visual_remap_allowed() {
+    // A.18.1: DDVR remaps reasoning text runs only; visual spatial positions
+    // keep their native multi-axis layout. Always false by construction.
+    return false;
+}
+
+bool server_rerot_fork_ready(bool has_media, bool prelude_done) {
+    // A.18 prelude-then-fork: text-only requests fork immediately; multimodal
+    // requests fork only after the shared multimodal prefill prelude.
+    if (!has_media) {
+        return true;
+    }
+    return prelude_done;
+}
+
+bool server_rerot_trace_allowed(const task_params & params) {
+    // A.14.2: lane-trace visibility is opt-in only. Default off keeps the
+    // client contract at one assistant response, one finish event, [DONE].
+    return params.rerot_enabled && params.rerot_trace;
+}
+
+json server_rerot_trace_event(
+    const std::string & kind,
+    uint64_t episode_id,
+    uint64_t node_id,
+    uint64_t frontier,
+    const json & data) {
+    // Callers must check trace_allowed() first; this still guards so OFF
+    // never allocates event payloads beyond this small object.
+    if (episode_id == 0 || kind.empty()) {
+        return json(nullptr);
+    }
+    json evt = json {
+        { "type",       "rerot.trace." + kind },
+        { "episode_id", episode_id },
+        { "node_id",    node_id },
+        { "frontier",   frontier },
+    };
+    if (!data.is_null() && !data.empty()) {
+        evt["data"] = data;
+    }
+    return evt;
+}
+
+std::vector<int> server_rerot_cancel_targets(const server_task & root) {
+    // A.15: cancelling a RERoT request clears the whole episode atomically.
+    // OFF/unassigned roots yield just their own id (no extra allocation
+    // beyond the single entry). Shared outer prompt refs are preserved by the
+    // runtime when other requests still use them.
+    std::vector<int> ids;
+    ids.reserve(1 + root.child_tasks.size());
+    ids.push_back(root.id);
+    for (const auto & child : root.child_tasks) {
+        ids.push_back(child.id);
+    }
+    return ids;
 }
 
 //
@@ -232,6 +575,80 @@ common_chat_msg task_result_state::update_chat_msg(
                 }
             }
         }
+    }
+    return chat_msg;
+}
+
+common_chat_msg task_result_state::update_rerot_msg(
+        const std::string & reasoning,
+        const std::string & content,
+        std::vector<common_chat_msg_diff> & diffs) {
+    auto msg_prv_copy = chat_msg;
+    common_chat_msg new_msg;
+
+    // For peg-native format, the parser expects full generation including thought tags.
+    // When reasoning and content are already cleanly separated by RERoT, try parsing
+    // with reasoning block reconstruction, and fall back to direct content population.
+    bool parsed_ok = false;
+    if (chat_parser_params.format == COMMON_CHAT_FORMAT_PEG_NATIVE) {
+        try {
+            std::string full_text = "<think>\n" + reasoning + "</think>\n" + content;
+            new_msg = common_chat_parse(full_text, false, chat_parser_params);
+            parsed_ok = true;
+        } catch (...) {
+            // Fall through to content-only parsing below
+        }
+    }
+
+    if (!parsed_ok) {
+        try {
+            generated_text = "</think>\n" + content;
+            new_msg = common_chat_parse(generated_text, false, chat_parser_params);
+            if (new_msg.content.rfind("</think>\n", 0) == 0) {
+                new_msg.content.erase(0, 9);
+            } else if (new_msg.content.rfind("</think>", 0) == 0) {
+                new_msg.content.erase(0, 8);
+            }
+            new_msg.reasoning_content.insert(0, reasoning);
+            parsed_ok = true;
+        } catch (...) {
+            new_msg.role = "assistant";
+            new_msg.content = content;
+            new_msg.reasoning_content = reasoning;
+        }
+    }
+
+    if (new_msg.role.empty()) {
+        new_msg.role = "assistant";
+    }
+    new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
+    chat_msg = std::move(new_msg);
+    diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
+    return chat_msg;
+}
+
+common_chat_msg task_result_state::update_rerot_content(
+        const std::string & text_added,
+        bool is_partial,
+        std::vector<common_chat_msg_diff> & diffs) {
+    if (!rerot_serial_started) {
+        rerot_reasoning_prefix = chat_msg.reasoning_content;
+        generated_text = "</think>\n";
+        rerot_serial_started = true;
+    }
+    generated_text += text_added;
+    auto msg_prv_copy = chat_msg;
+
+    auto new_msg =
+        common_chat_parse(generated_text, is_partial, chat_parser_params);
+    if (!new_msg.empty()) {
+        if (new_msg.role.empty()) {
+            new_msg.role = "assistant";
+        }
+        new_msg.reasoning_content.insert(0, rerot_reasoning_prefix);
+        new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
+        chat_msg = std::move(new_msg);
+        diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
     }
     return chat_msg;
 }
@@ -384,6 +801,16 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"tokens_cached",       n_tokens_cached},
         {"timings",             timings.to_json()},
     };
+    if (rerot_probe_tokens != 0 || rerot_frame_tokens != 0 || rerot_source_end_tokens != 0) {
+        res["rerot"] = json {
+            {"prompt_tokens",     n_prompt_tokens},
+            {"cached_tokens",     n_prompt_tokens_cache},
+            {"probe_tokens",      rerot_probe_tokens},
+            {"frame_tokens",      rerot_frame_tokens},
+            {"sampled_tokens",   n_decoded},
+            {"source_end_tokens", rerot_source_end_tokens},
+        };
+    }
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
     }
@@ -391,12 +818,23 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
 }
 
 json server_task_result_cmpl_final::usage_json_oaicompat() {
-    return json {
+    json usage = json {
         {"completion_tokens", n_decoded},
         {"prompt_tokens",     n_prompt_tokens},
         {"total_tokens",      n_decoded + n_prompt_tokens},
         {"prompt_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
     };
+    if (rerot_probe_tokens != 0 || rerot_frame_tokens != 0 || rerot_source_end_tokens != 0) {
+        usage["rerot"] = json {
+            {"prompt_tokens",     n_prompt_tokens},
+            {"cached_tokens",     n_prompt_tokens_cache},
+            {"probe_tokens",      rerot_probe_tokens},
+            {"frame_tokens",      rerot_frame_tokens},
+            {"sampled_tokens",    n_decoded},
+            {"source_end_tokens", rerot_source_end_tokens},
+        };
+    }
+    return usage;
 }
 
 json server_task_result_cmpl_final::to_json_oaicompat() {
@@ -444,6 +882,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     common_chat_msg msg;
     if (!oaicompat_msg.empty()) {
         msg = oaicompat_msg;
+    } else if (rerot_explicit_channels) {
+        msg.role = "assistant";
+        msg.content = content;
+        msg.reasoning_content = rerot_reasoning;
     } else {
         msg.role = "assistant";
         msg.content = content;
@@ -557,6 +999,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     common_chat_msg msg;
     if (!oaicompat_msg.empty()) {
         msg = oaicompat_msg;
+    } else if (rerot_explicit_channels) {
+        msg.role = "assistant";
+        msg.content = content;
+        msg.reasoning_content = rerot_reasoning;
     } else {
         msg.role = "assistant";
         msg.content = content;
@@ -767,6 +1213,10 @@ json server_task_result_cmpl_final::to_json_anthropic() {
     common_chat_msg msg;
     if (!oaicompat_msg.empty()) {
         msg = oaicompat_msg;
+    } else if (rerot_explicit_channels) {
+        msg.role = "assistant";
+        msg.content = content;
+        msg.reasoning_content = rerot_reasoning;
     } else {
         msg.role = "assistant";
         msg.content = content;
@@ -1018,7 +1468,23 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     if (is_begin) {
         return; // begin marker only flushes headers, skip parsing
     }
-    state.update_chat_msg(content, true, oaicompat_msg_diffs);
+    first_chunk = !state.stream_started;
+    state.stream_started = true;
+
+    if (is_rerot_reasoning) {
+        if (state.chat_msg.role.empty()) {
+            state.chat_msg.role = "assistant";
+        }
+        state.chat_msg.reasoning_content += content;
+        common_chat_msg_diff diff;
+        diff.reasoning_content_delta = content;
+        oaicompat_msg_diffs.push_back(std::move(diff));
+    } else if (is_rerot_content) {
+        state.update_rerot_content(
+            content, true, oaicompat_msg_diffs);
+    } else {
+        state.update_chat_msg(content, true, oaicompat_msg_diffs);
+    }
 
     // Copy current state for use in to_json_*() (reflects state BEFORE this chunk)
     thinking_block_started = state.thinking_block_started;
@@ -1033,7 +1499,7 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     // track if the accumulated message has any reasoning content
     anthropic_has_reasoning = !state.chat_msg.reasoning_content.empty();
 
-    if (res_type == TASK_RESPONSE_TYPE_OAI_RESP && !state.oai_resp_created && (is_progress || n_decoded == 1)) {
+    if (res_type == TASK_RESPONSE_TYPE_OAI_RESP && !state.oai_resp_created && (is_progress || first_chunk)) {
         state.oai_resp_created = true;
     }
 
@@ -1137,7 +1603,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat() {
 }
 
 json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
-    bool first = n_decoded == 1;
+    const bool first = first_chunk;
     std::time_t t = std::time(0);
     json choices;
 
@@ -1351,7 +1817,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_asr() {
 
 json server_task_result_cmpl_partial::to_json_anthropic() {
     json events = json::array();
-    bool first = (n_decoded == 1);
+    const bool first = first_chunk;
     // use member variables to track block state across streaming calls
     // (anthropic_thinking_block_started, anthropic_text_block_started)
 
@@ -1539,7 +2005,7 @@ json server_task_result_error::to_json() {
 // server_task_result_metrics
 //
 json server_task_result_metrics::to_json() {
-    return json {
+    json out = json {
         { "idle",                            n_idle_slots },
         { "processing",                      n_processing_slots },
         { "deferred",                        n_tasks_deferred },
@@ -1560,8 +2026,43 @@ json server_task_result_metrics::to_json() {
         { "n_decode_total",                  n_decode_total },
         { "n_busy_slots_total",              n_busy_slots_total },
 
+        { "tri_drain_total",                 tri_drain_total },
+        { "tri_maintenance_total",           tri_maintenance_total },
+        { "tri_floor_exhausted_total",       tri_floor_exhausted_total },
+        { "tri_atomic_fallback_kv_total",    tri_atomic_fallback_kv_total },
+        { "tri_atomic_fallback_recurrent_total", tri_atomic_fallback_recurrent_total },
+        { "tri_cells_freed_total",           tri_cells_freed_total },
+        { "tri_score_us_total",              tri_score_us_total },
+        { "tri_pack_us_total",               tri_pack_us_total },
+        { "tri_cells_before",                tri_cells_before },
+        { "tri_cells_after",                 tri_cells_after },
+        { "tri_cells_freed",                 tri_cells_freed },
+        { "tri_references_removed",          tri_references_removed },
+        { "tri_target_references",           tri_target_references },
+        { "tri_hard_keep",                   tri_hard_keep },
+        { "tri_shared_keep",                 tri_shared_keep },
+
         { "slots",                           slots_data },
     };
+    // RERoT suite (§A.26) is additive to Tri metrics. OFF (empty) emits
+    // nothing: no allocation for the rerot block and the pre-RERoT schema is
+    // byte-identical. Tri key meanings are unchanged.
+    if (!rerot.empty()) {
+        const json rj = rerot.to_json();
+        for (const auto & kv : rj.items()) {
+            out[kv.key()] = kv.value();
+        }
+    }
+    // XKV suite (§16) is additive the same way. OFF (empty) emits nothing:
+    // the pre-XKV schema is byte-identical and admission behavior is
+    // unchanged.
+    if (!xkv.empty()) {
+        const json xj = xkv.to_json();
+        for (const auto & kv : xj.items()) {
+            out[kv.key()] = kv.value();
+        }
+    }
+    return out;
 }
 
 //
@@ -1656,7 +2157,7 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, size_t state_size_spec) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -1673,7 +2174,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         checkpoints_size += ckpt.size();
     }
 
-    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+    const size_t state_size_new = state_size_tgt + state_size_dft + state_size_spec + checkpoints_size;
 
     // skip over-limit entries to avoid disturbing the cache
     if (limit_size > 0 && state_size_new > limit_size) {
@@ -1707,11 +2208,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 
     std::vector<uint8_t> state_data_tgt;
     std::vector<uint8_t> state_data_dft;
+    std::vector<uint8_t> state_data_spec;
 
     // check if we can allocate enough memory for the new state
     try {
         state_data_tgt.resize(state_size_tgt);
         state_data_dft.resize(state_size_dft);
+        state_data_spec.resize(state_size_spec);
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
@@ -1732,13 +2235,18 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
+            /*.spec =*/ std::move(state_data_spec),
         },
     });
 
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+        std::vector<uint8_t> * state_spec, bool * loaded_state) {
+    if (loaded_state) {
+        *loaded_state = false;
+    }
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1807,6 +2315,12 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
         }
 
+        if (state_spec) {
+            *state_spec = std::move(it_best->data.spec);
+        }
+        if (loaded_state) {
+            *loaded_state = true;
+        }
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);

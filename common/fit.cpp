@@ -3,9 +3,13 @@
 #include "log.h"
 
 #include "../src/llama-ext.h"
+#include "../src/llama-model.h"
+#include "../src/llama-xkv-factor.h"
+#include "../src/llama-xkv-codec.h"
 
 #include <array>
 #include <cassert>
+#include <cmath>
 #include <stdexcept>
 #include <cinttypes>
 #include <set>
@@ -25,6 +29,645 @@ enum common_layer_fraction_t {
 class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
+
+static bool xkv_checked_mul_u64(uint64_t a, uint64_t b, uint64_t & out) {
+    if (a == 0 || b == 0) {
+        out = 0;
+        return true;
+    }
+    if (a > UINT64_MAX / b) {
+        return false;
+    }
+    out = a * b;
+    return true;
+}
+
+static bool xkv_checked_add_u64(uint64_t a, uint64_t b, uint64_t & out) {
+    if (UINT64_MAX - a < b) {
+        return false;
+    }
+    out = a + b;
+    return true;
+}
+
+static bool xkv_checked_sum_fit_bytes(uint64_t model, uint64_t context, uint64_t compute,
+        uint64_t reserved, uint64_t headroom, uint64_t & out) {
+    uint64_t sum = 0;
+    return xkv_checked_add_u64(model, context, sum) &&
+           xkv_checked_add_u64(sum, compute, sum) &&
+           xkv_checked_add_u64(sum, reserved, sum) &&
+           xkv_checked_add_u64(sum, headroom, out);
+}
+
+bool common_xkv_fit_reserve_bytes(const llama_context_params * cparams, uint64_t scratch_bytes,
+        common_xkv_fit_reserve * out, uint64_t dedup_scratch_bytes) {
+    if (out == nullptr) {
+        return false;
+    }
+    *out = {};
+    if (cparams == nullptr || !llama_xkv_is_enabled(cparams->xkv_mode)) {
+        return true;
+    }
+    constexpr uint64_t MiB = 1024ull * 1024ull;
+    uint64_t workspace = 0;
+    uint64_t decode_cache = 0;
+    // Any overflow fails closed: the caller treats it as "does not fit".
+    if (!xkv_checked_mul_u64((uint64_t) cparams->xkv_workspace_mib, MiB, workspace) ||
+        !xkv_checked_mul_u64((uint64_t) cparams->xkv_decode_cache_mib, MiB, decode_cache)) {
+        *out = {};
+        out->total_bytes = UINT64_MAX;
+        return false;
+    }
+    if (workspace == 0) {
+        *out = {};
+        out->total_bytes = UINT64_MAX;
+        return false; // transient budget is required when XKV is enabled
+    }
+    // Sub-budget discipline: the decode sub-budget plus the exact seal
+    // scratch must fit inside the one workspace allocation (or an explicit
+    // shared-eviction protocol, which does not exist: fail closed).
+    uint64_t concurrent = 0;
+    if (!xkv_checked_add_u64(decode_cache, scratch_bytes, concurrent) || concurrent > workspace) {
+        *out = {};
+        out->total_bytes = UINT64_MAX;
+        return false;
+    }
+    out->workspace_bytes       = workspace;
+    out->decode_cache_bytes    = decode_cache;
+    out->factor_scratch_bytes  = scratch_bytes;
+    // Store-owned host dedup vectors live outside the workspace arena:
+    // carried for host-charge accounting, never device-partitioned and
+    // never double-counted against the workspace sub-budget above.
+    out->dedup_scratch_bytes   = dedup_scratch_bytes;
+    out->total_bytes           = workspace; // once: never the sum
+    return true;
+}
+
+uint32_t common_xkv_store_mib_for_bytes(uint64_t dense_ctx_bytes, double min_saving) {
+    constexpr uint64_t MiB = 1024ull * 1024ull;
+    if (dense_ctx_bytes == 0) {
+        return 0;
+    }
+    // Invalid min_saving must fail at caller (return 0), not silently change
+    // policy in production helper.
+    if (!std::isfinite(min_saving) || min_saving < 0.0 || min_saving >= 1.0) {
+        return 0;
+    }
+    // Compute conservative ceil bytes with long double (never underbudget
+    // exactly at MiB boundaries due to float truncation):
+    const long double ld_dense = (long double) dense_ctx_bytes;
+    const long double ld_factor = (long double) 1.0 - (long double) min_saving;
+    const long double ld_exact_target = ld_dense * ld_factor;
+    if (!std::isfinite(ld_exact_target) || ld_exact_target <= 0.0L || ld_exact_target > (long double) UINT64_MAX) {
+        return 0;
+    }
+    // std::ceil ensures we never underbudget mathematical target by even 1 byte
+    const long double ld_ceil_bytes = std::ceil(ld_exact_target);
+    if (ld_ceil_bytes > (long double) UINT64_MAX) {
+        return 0;
+    }
+    uint64_t est_bytes = (uint64_t) ld_ceil_bytes;
+    if (est_bytes < MiB) {
+        est_bytes = MiB; // minimum 1 MiB nonzero budget
+    }
+    // Checked ceil MiB division
+    uint64_t mib_num = 0;
+    if (!xkv_checked_add_u64(est_bytes, MiB - 1, mib_num)) {
+        return 0;
+    }
+    const uint64_t mib = mib_num / MiB;
+    if (mib == 0 || mib > UINT32_MAX) {
+        return 0;
+    }
+    return (uint32_t) mib;
+}
+
+uint32_t common_xkv_store_mib_with_overlap(
+        uint64_t dense_ctx_bytes,
+        double min_saving,
+        uint32_t seg_tokens,
+        uint32_t k_tokens) {
+    const uint32_t base = common_xkv_store_mib_for_bytes(dense_ctx_bytes, min_saving);
+    if (base == 0 || seg_tokens == 0 || k_tokens == 0) {
+        return base;
+    }
+    // One segment's dense share, same factored ratio, capped at the base:
+    // an in-flight COW replacement holds old + new versions of one segment.
+    uint64_t seg_dense = 0;
+    if (!xkv_checked_mul_u64(dense_ctx_bytes, seg_tokens, seg_dense)) {
+        return 0;
+    }
+    seg_dense = seg_dense / k_tokens;
+    if (seg_dense > dense_ctx_bytes) {
+        seg_dense = dense_ctx_bytes;
+    }
+    const uint32_t seg_mib = common_xkv_store_mib_for_bytes(seg_dense, min_saving);
+    uint64_t total_mib = base;
+    if (seg_mib > 0) {
+        uint64_t sum = 0;
+        if (!xkv_checked_add_u64(base, seg_mib > base ? base : seg_mib, sum) || sum > UINT32_MAX) {
+            return 0;
+        }
+        total_mib = sum;
+    }
+    return (uint32_t) total_mib;
+}
+
+bool common_xkv_partition_budget(uint64_t total, const uint64_t * weights, uint64_t * shares, size_t n) {
+    if (n == 0) {
+        return true;
+    }
+    if (weights == nullptr || shares == nullptr) {
+        return false;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        shares[i] = 0;
+    }
+    if (total == 0) {
+        return true;
+    }
+    uint64_t wsum = 0;
+    size_t imax = 0;
+    for (size_t i = 0; i < n; ++i) {
+        uint64_t next = 0;
+        if (!xkv_checked_add_u64(wsum, weights[i], next)) {
+            return false; // weight sums never overflow in practice; fail closed
+        }
+        wsum = next;
+        if (weights[i] > weights[imax]) {
+            imax = i;
+        }
+    }
+    if (wsum == 0) {
+        // No placement info: split equally, remainder to shares[0].
+        const uint64_t q = total / n;
+        uint64_t acc = 0;
+        for (size_t i = 0; i < n; ++i) {
+            shares[i] = q;
+            acc += q;
+        }
+        shares[0] += total - acc;
+        return true;
+    }
+    // Exact-sum partition: floor shares plus the whole remainder (which is
+    // < n) to the largest weight, so the shares sum to exactly total.
+    __uint128_t acc = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (i == imax) {
+            continue;
+        }
+        shares[i] = (uint64_t) ((__uint128_t) total * weights[i] / wsum);
+        acc += shares[i];
+    }
+    shares[imax] = total - (uint64_t) acc;
+    return true;
+}
+
+bool common_xkv_scratch_for_group(
+        uint32_t seg_tokens,
+        uint32_t chunk_tokens,
+        uint64_t feat_k,
+        uint64_t feat_v,
+        uint32_t rank_k,
+        uint32_t rank_v,
+        ggml_type landmark_type,
+        uint64_t * out_bytes,
+        ggml_type type_a_k,
+        ggml_type type_b_k,
+        ggml_type type_a_v,
+        ggml_type type_b_v) {
+    if (out_bytes == nullptr) {
+        return false;
+    }
+    *out_bytes = 0;
+    if (seg_tokens == 0 || feat_k == 0 || feat_v == 0 || rank_k == 0 || rank_v == 0) {
+        return false;
+    }
+    if (landmark_type != GGML_TYPE_F32 && landmark_type != GGML_TYPE_F16 &&
+        landmark_type != GGML_TYPE_Q8_0 && landmark_type != GGML_TYPE_TURBO4_0) {
+        return false;
+    }
+    const int64_t lm_blck = ggml_blck_size(landmark_type);
+    if (lm_blck <= 0 || (int64_t) feat_k % lm_blck != 0) {
+        return false;
+    }
+    const uint32_t chunk = chunk_tokens == 0 ? 1 : chunk_tokens;
+    std::string err;
+    // Exact rSVD factorize peaks per stream (outputs + live scratch), plus
+    // both FP factor outputs (K and V stay live into shadow evaluation).
+    uint64_t ws_k = 0;
+    uint64_t ws_v = 0;
+    uint64_t out_k = 0;
+    uint64_t out_v = 0;
+    if (!llama_xkv::estimate_factorize_matrix_workspace_bytes(seg_tokens, feat_k, rank_k, 16, 2, &ws_k, &err) ||
+        !llama_xkv::estimate_factorize_matrix_workspace_bytes(seg_tokens, feat_v, rank_v, 16, 2, &ws_v, &err) ||
+        !llama_xkv::estimate_factor_output_bytes(seg_tokens, feat_k, rank_k, &out_k, &err) ||
+        !llama_xkv::estimate_factor_output_bytes(seg_tokens, feat_v, rank_v, &out_v, &err)) {
+        return false;
+    }
+    // Simultaneous K+V peak (K output live during V factorization), same
+    // terms as estimate_factorize_kv_workspace_bytes.
+    uint64_t term2 = 0;
+    uint64_t ws_fact = ws_k;
+    if (!xkv_checked_add_u64(out_k, ws_v, term2)) {
+        return false;
+    }
+    ws_fact = std::max(ws_fact, term2);
+    // Exact candidate encoded bytes via the canonical codec descriptors
+    // (same recipe the seal path preflights). Turbo rank-128 padding is
+    // included: encoded can EXCEED FP at tiny rank, never inferred from FP
+    // logical size.
+    auto xkv_is_turbo = [](ggml_type t) {
+        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+    };
+    const uint32_t grp_k = xkv_is_turbo(type_a_k) ? 128 : 0;
+    const uint32_t grp_v = xkv_is_turbo(type_a_v) ? 128 : 0;
+    uint64_t enc_ak = 0;
+    uint64_t enc_bk = 0;
+    uint64_t enc_av = 0;
+    uint64_t enc_bv = 0;
+    uint64_t pad_ra = 0;
+    uint64_t pad_rb = 0;
+    size_t dec_tmp_ak = 0;
+    size_t dec_tmp_bk = 0;
+    size_t dec_tmp_av = 0;
+    size_t dec_tmp_bv = 0;
+    try {
+        using namespace llama_xkv;
+        const codec_desc d_ak = make_codec_desc(factor_role::a_k, type_a_k,
+            orientation::token_major, matrix_shape{(uint64_t) seg_tokens, (uint64_t) rank_k}, grp_k, 42);
+        const codec_desc d_bk = make_codec_desc(factor_role::b_k, type_b_k,
+            orientation::feature_major_transposed, matrix_shape{feat_k, (uint64_t) rank_k}, grp_k, 42);
+        const codec_desc d_av = make_codec_desc(factor_role::a_v, type_a_v,
+            orientation::token_major, matrix_shape{(uint64_t) seg_tokens, (uint64_t) rank_v}, grp_v, 43);
+        const codec_desc d_bv = make_codec_desc(factor_role::b_v, type_b_v,
+            orientation::feature_major_transposed, matrix_shape{feat_v, (uint64_t) rank_v}, grp_v, 43);
+        enc_ak = encoded_matrix_bytes(d_ak);
+        enc_bk = encoded_matrix_bytes(d_bk);
+        enc_av = encoded_matrix_bytes(d_av);
+        enc_bv = encoded_matrix_bytes(d_bv);
+            pad_ra = std::max(d_ak.padded_shape.cols, d_av.padded_shape.cols);
+            pad_rb = std::max(d_bk.padded_shape.cols, d_bv.padded_shape.cols);
+            if (!decode_rows_scratch_bytes(d_ak, dec_tmp_ak) ||
+                !decode_rows_scratch_bytes(d_bk, dec_tmp_bk) ||
+                !decode_rows_scratch_bytes(d_av, dec_tmp_av) ||
+                !decode_rows_scratch_bytes(d_bv, dec_tmp_bv)) {
+                return false;
+            }
+        } catch (...) {
+            return false;
+        }
+    uint64_t cand_encoded = 0;
+    if (!xkv_checked_add_u64(enc_ak, enc_bk, cand_encoded) ||
+        !xkv_checked_add_u64(cand_encoded, enc_av, cand_encoded) ||
+        !xkv_checked_add_u64(cand_encoded, enc_bv, cand_encoded)) {
+        return false;
+    }
+    // Quantized-shadow peak mirrors estimate_quantized_shadow_workspace_bytes:
+    // live FP factors + exact encoded streams + decode tile scratch (tile
+    // buffers sized by the padded ranks above, never the logical ranks).
+    uint64_t fp_live = 0;
+    uint64_t tile_a = 0;
+    uint64_t tile_b = 0;
+    uint64_t tile_idx = 0;
+    uint64_t ws_shadow = 0;
+    const uint64_t max_dec_tmp = (uint64_t) std::max(std::max(dec_tmp_ak, dec_tmp_bk),
+        std::max(dec_tmp_av, dec_tmp_bv));
+    uint64_t dec_tmp_budget = 0;
+    if (!xkv_checked_add_u64(out_k, out_v, fp_live) ||
+        !xkv_checked_mul_u64(64, sizeof(float), tile_a) ||
+        !xkv_checked_mul_u64(tile_a, pad_ra, tile_a) ||
+        !xkv_checked_mul_u64(64, sizeof(float), tile_b) ||
+        !xkv_checked_mul_u64(tile_b, pad_rb, tile_b) ||
+        !xkv_checked_mul_u64(128, sizeof(uint64_t), tile_idx) ||
+        !xkv_checked_add_u64(max_dec_tmp, 1024, dec_tmp_budget) ||
+        !xkv_checked_add_u64(fp_live, cand_encoded, ws_shadow) ||
+        !xkv_checked_add_u64(ws_shadow, tile_a, ws_shadow) ||
+        !xkv_checked_add_u64(ws_shadow, tile_b, ws_shadow) ||
+        !xkv_checked_add_u64(ws_shadow, tile_idx, ws_shadow) ||
+        !xkv_checked_add_u64(ws_shadow, dec_tmp_budget, ws_shadow)) {
+        return false;
+    }
+    // Group peak is the worse of factorize vs shadow (arena lease grows).
+    const uint64_t ws_group_peak = std::max(ws_fact, ws_shadow);
+    // Canonical pre-RoPE capture peak (F32 K+V rows for the segment).
+    uint64_t feat_sum = 0;
+    uint64_t cap_elems = 0;
+    uint64_t capture = 0;
+    if (!xkv_checked_add_u64(feat_k, feat_v, feat_sum) ||
+        !xkv_checked_mul_u64(seg_tokens, feat_sum, cap_elems) ||
+        !xkv_checked_mul_u64(cap_elems, sizeof(float), capture)) {
+        return false;
+    }
+    // Landmark stream bound: one pooled vector per fragment. Landmarks
+    // summarize reconstructed K only (never K+V) over feat_k, via the
+    // canonical descriptor so Turbo landmark padding matches the seal path.
+    const uint64_t n_frag = ((uint64_t) seg_tokens + chunk - 1) / chunk;
+    if (feat_k > (uint64_t) INT64_MAX || n_frag > (uint64_t) INT64_MAX) {
+        return false;
+    }
+    uint64_t landmark = 0;
+    try {
+        using namespace llama_xkv;
+        const codec_desc d_lm = make_codec_desc(factor_role::landmark, landmark_type,
+            orientation::token_major, matrix_shape{n_frag, feat_k}, 0, 777);
+        landmark = encoded_matrix_bytes(d_lm);
+    } catch (...) {
+        return false;
+    }
+    // Telemetry and staging metadata scratch:
+    // Status tensors, singular value vectors S, landmark error bounds eb,
+    // source fingerprints srcfp, and staging context overhead.
+    uint64_t n_frag_eb = 0;
+    uint64_t n_frag_srcfp = 0;
+    uint64_t telem_staging = 0;
+    if (!xkv_checked_mul_u64(n_frag, sizeof(float), n_frag_eb) ||
+        !xkv_checked_mul_u64(n_frag, sizeof(uint64_t), n_frag_srcfp) ||
+        !xkv_checked_add_u64(n_frag_eb, n_frag_srcfp, telem_staging) ||
+        !xkv_checked_add_u64(telem_staging, 4096, telem_staging)) {
+        return false;
+    }
+    // Backend stream allocator alignment padding (e.g. 256-byte alignment per stream
+    // across the 5 destination streams: A_K, B_K, A_V, B_V, and landmark).
+    constexpr uint64_t stream_alloc_align = 5ull * 256ull;
+
+    // Conservative simultaneous sum: peaks may not fully coincide, but
+    // under-reserving seal-time workspace is the unsafe direction.
+    uint64_t total = 0;
+    if (!xkv_checked_add_u64(ws_group_peak, capture, total) ||
+        !xkv_checked_add_u64(total, landmark, total) ||
+        !xkv_checked_add_u64(total, telem_staging, total) ||
+        !xkv_checked_add_u64(total, stream_alloc_align, *out_bytes)) {
+        return false;
+    }
+    return true;
+}
+
+bool common_xkv_scratch_bytes(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        uint64_t * out_bytes,
+        uint64_t * out_dedup_scratch_bytes) {
+    if (out_bytes == nullptr) {
+        return false;
+    }
+    *out_bytes = 0;
+    if (out_dedup_scratch_bytes != nullptr) {
+        *out_dedup_scratch_bytes = 0;
+    }
+    if (path_model == nullptr || mparams == nullptr || cparams == nullptr) {
+        return false;
+    }
+    if (!llama_xkv_is_enabled(cparams->xkv_mode)) {
+        return true; // OFF: no scratch
+    }
+    const uint32_t group = cparams->xkv_group_size;
+    if (group == 0 || cparams->xkv_segment_tokens == 0 ||
+        cparams->xkv_rank_k == 0 || cparams->xkv_rank_v == 0) {
+        return false;
+    }
+    // Metadata-only model (never XKV runtime) for hparams geometry.
+    llama_model_params meta_mparams = *mparams;
+    meta_mparams.no_alloc = true;
+    meta_mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+    llama_model * meta_model = llama_model_load_from_file(path_model, meta_mparams);
+    if (meta_model == nullptr) {
+        return false;
+    }
+    uint64_t dk_max = 0;
+    uint64_t dv_max = 0;
+    bool any_trunk = false;
+    uint64_t n_attn_layers = 0;
+    const auto & hp = meta_model->hparams;
+    const uint32_t n_layer = hp.n_layer();
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (hp.is_recr(il) || hp.is_swa(il)) {
+            continue;
+        }
+        // Dedup owning layers when model specifies layer KV sharing
+        // (e.g. Gemma3n / Gemma4 assistant where layers beyond n_layer_kv_from_start
+        // share/reuse earlier KV storage; other architectures have independent layers).
+        if (hp.n_layer_kv_from_start >= 0 && il >= (uint32_t) hp.n_layer_kv_from_start) {
+            continue; // Reused layer: storage is already accounted under owning layer
+        }
+        if (!hp.has_kv(il)) {
+            continue;
+        }
+        const uint64_t dk = hp.n_embd_k_gqa(il);
+        const uint64_t dv = hp.n_embd_v_gqa(il);
+        if (dk == 0 || dv == 0) {
+            continue; // no KV (projection-only layer)
+        }
+        any_trunk = true;
+        n_attn_layers++;
+        dk_max = std::max(dk_max, dk);
+        dv_max = std::max(dv_max, dv);
+    }
+    llama_model_free(meta_model);
+    if (!any_trunk) {
+        // Hybrid/MoE model with no full-attention trunk layers (or all
+        // recurrent/SWA/sharing layers): XKV factor scratch is zero. Never
+        // abort auto-fit; degrade to zero reserve with an explicit warning.
+        LOG_WRN("%s: no full-attention trunk layers found in model; degrading XKV scratch reserve to 0\n", __func__);
+        *out_bytes = 0;
+        if (out_dedup_scratch_bytes != nullptr) {
+            *out_dedup_scratch_bytes = 0;
+        }
+        return true;
+    }
+    // Largest alias-dedup group bound: every member is at most the per-layer
+    // max, so group_size * max bounds any spliced group the store builds.
+    uint64_t feat_k = 0;
+    uint64_t feat_v = 0;
+    if (!xkv_checked_mul_u64(group, dk_max, feat_k) ||
+        !xkv_checked_mul_u64(group, dv_max, feat_v)) {
+        return false;
+    }
+    // Store-owned host dedup-scratch upper bound from the fit topology
+    // (mirrors ensure_accounting_scratch_locked): 8 B per B-matrix pointer
+    // in each of the two unique vectors plus 8 B per backend handle, over
+    // published + one retired + one candidate segment.
+    if (out_dedup_scratch_bytes != nullptr) {
+        // When called before KV capacity fitting (e.g. initial recurrent probe),
+        // n_ctx_kv and n_ctx may both be 0: fall back to 512 tokens minimum.
+        const uint64_t k_raw = std::max(cparams->n_ctx_kv, cparams->n_ctx);
+        const uint64_t k_tokens = k_raw > 0 ? k_raw : 512;
+        const uint64_t seg = cparams->xkv_segment_tokens;
+        uint64_t n_seg = 0;
+        uint64_t n_groups = 0;
+        uint64_t sum_b = 0;
+        uint64_t sum_backend = 0;
+        uint64_t dedup = 0;
+        if (seg == 0 || group == 0 ||
+            !xkv_checked_add_u64((k_tokens + seg - 1) / seg, 2, n_seg) ||
+            (n_groups = (n_attn_layers + group - 1) / group) == 0 ||
+            !xkv_checked_mul_u64(2, n_groups, sum_b) ||
+            !xkv_checked_mul_u64(sum_b, n_seg, sum_b) ||
+            !xkv_checked_mul_u64(8, n_groups, sum_backend) ||
+            !xkv_checked_mul_u64(sum_backend, n_seg, sum_backend) ||
+            !xkv_checked_add_u64(sum_b, sum_b, dedup) ||
+            !xkv_checked_add_u64(dedup, sum_backend, dedup) ||
+            !xkv_checked_mul_u64(dedup, 8, dedup)) {
+            return false;
+        }
+        // Floor at the store's initial reservation (64 + 64 ptrs + 128 ids).
+        if (dedup < 2048) {
+            dedup = 2048;
+        }
+        *out_dedup_scratch_bytes = dedup;
+    }
+    return common_xkv_scratch_for_group(
+        cparams->xkv_segment_tokens, cparams->xkv_chunk_tokens,
+        feat_k, feat_v, cparams->xkv_rank_k, cparams->xkv_rank_v,
+        cparams->xkv_landmark_type, out_bytes,
+        cparams->xkv_factor_a_k, cparams->xkv_factor_b_k,
+        cparams->xkv_factor_a_v, cparams->xkv_factor_b_v);
+}
+
+uint64_t common_xkv_store_budget_bytes(const llama_context_params * cparams) {
+    if (cparams == nullptr || !llama_xkv_is_enabled(cparams->xkv_mode)) {
+        return 0;
+    }
+    // SHADOW is evaluate-only with no segment publication for every profile.
+    if (cparams->xkv_mode == LLAMA_XKV_MODE_SHADOW) {
+        return 0;
+    }
+    if (cparams->xkv_store_mib == 0) {
+        return 0; // auto-derive placeholder, resolved after auto-fit
+    }
+    uint64_t bytes = 0;
+    if (!xkv_checked_mul_u64((uint64_t) cparams->xkv_store_mib, 1024ull * 1024ull, bytes)) {
+        return UINT64_MAX;
+    }
+    return bytes;
+}
+
+uint64_t common_xkv_store_device_bytes(const llama_context_params * cparams, uint64_t store_bytes) {
+    if (cparams == nullptr) {
+        return 0;
+    }
+    // Same effective residency predicate the runtime enforces
+    // (llama_xkv_profile_is_device_owned): profile alone never decides.
+    if (!llama_xkv_profile_is_device_owned(cparams->xkv_storage_profile, cparams->xkv_factorizer)) {
+        return 0;
+    }
+    return store_bytes;
+}
+
+uint32_t common_xkv_derive_store_mib(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        uint32_t n_ctx_kv_fit,
+        ggml_log_level log_level) {
+    if (path_model == nullptr || mparams == nullptr || cparams == nullptr || n_ctx_kv_fit == 0) {
+        return 0;
+    }
+    if (!llama_xkv_is_enabled(cparams->xkv_mode)) {
+        return 0;
+    }
+    (void) log_level;
+    // Genuine dense KV equivalent: exact same-row original K/V bytes only
+    // across all owning attention layers (excluding non-KV context/compute
+    // memory). Derived directly from model hparams and effective K/V tensor
+    // row sizes × n_ctx_kv_fit.
+    llama_model_params meta_mparams = *mparams;
+    meta_mparams.no_alloc = true;
+    meta_mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+    llama_model * meta_model = llama_model_load_from_file(path_model, meta_mparams);
+    if (meta_model == nullptr) {
+        return 0;
+    }
+    const auto & hp = meta_model->hparams;
+    const uint32_t n_layer = hp.n_layer();
+    const ggml_type type_k = cparams->type_k;
+    const ggml_type type_v = cparams->type_v;
+    const bool k_is_turbo = (type_k == GGML_TYPE_TURBO3_0 || type_k == GGML_TYPE_TURBO4_0 || type_k == GGML_TYPE_TURBO2_0);
+    const bool v_is_turbo = (type_v == GGML_TYPE_TURBO3_0 || type_v == GGML_TYPE_TURBO4_0 || type_v == GGML_TYPE_TURBO2_0);
+
+    uint64_t single_token_kv_bytes = 0;
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (hp.is_recr(il) || hp.is_swa(il)) {
+            continue;
+        }
+        // Dedup owning layers when model specifies layer KV sharing
+        // (e.g. Gemma3n / Gemma4 assistant where layers beyond n_layer_kv_from_start
+        // share/reuse earlier KV storage; other architectures have independent layers).
+        if (hp.n_layer_kv_from_start >= 0 && il >= (uint32_t) hp.n_layer_kv_from_start) {
+            continue; // Reused layer: storage is already accounted under owning layer
+        }
+        if (!hp.has_kv(il)) {
+            continue;
+        }
+        const uint64_t head_k = (uint64_t) hp.n_embd_head_k(il);
+        const uint64_t head_v = (uint64_t) hp.n_embd_head_v(il);
+        const uint64_t n_head_kv = (uint64_t) hp.n_head_kv(il);
+        if (head_k == 0 || head_v == 0 || n_head_kv == 0) {
+            continue;
+        }
+        // Checked rounding for Turbo 128-alignment (never uint32 overflow):
+        uint64_t head_k_eff = head_k;
+        if (k_is_turbo && head_k % 128 != 0) {
+            uint64_t sum_pad = 0;
+            if (!xkv_checked_add_u64(head_k, 127, sum_pad)) {
+                llama_model_free(meta_model);
+                return 0;
+            }
+            head_k_eff = (sum_pad / 128) * 128;
+        }
+        uint64_t head_v_eff = head_v;
+        if (v_is_turbo && head_v % 128 != 0) {
+            uint64_t sum_pad = 0;
+            if (!xkv_checked_add_u64(head_v, 127, sum_pad)) {
+                llama_model_free(meta_model);
+                return 0;
+            }
+            head_v_eff = (sum_pad / 128) * 128;
+        }
+        // Checked multiplication and INT64_MAX validation before ggml_row_size:
+        uint64_t ne_k_u64 = 0;
+        uint64_t ne_v_u64 = 0;
+        if (!xkv_checked_mul_u64(n_head_kv, head_k_eff, ne_k_u64) ||
+            !xkv_checked_mul_u64(n_head_kv, head_v_eff, ne_v_u64) ||
+            ne_k_u64 > (uint64_t) INT64_MAX || ne_v_u64 > (uint64_t) INT64_MAX) {
+            llama_model_free(meta_model);
+            return 0;
+        }
+        const int64_t blck_k = ggml_blck_size(type_k);
+        const int64_t blck_v = ggml_blck_size(type_v);
+        if (blck_k <= 0 || blck_v <= 0 || (int64_t) ne_k_u64 % blck_k != 0 || (int64_t) ne_v_u64 % blck_v != 0) {
+            // Reject unsupported type or non-divisible block geometry without asserts
+            llama_model_free(meta_model);
+            return 0;
+        }
+        const size_t row_k = ggml_row_size(type_k, (int64_t) ne_k_u64);
+        const size_t row_v = ggml_row_size(type_v, (int64_t) ne_v_u64);
+        if (row_k == 0 || row_v == 0) {
+            llama_model_free(meta_model);
+            return 0;
+        }
+        uint64_t layer_row = 0;
+        if (!xkv_checked_add_u64((uint64_t) row_k, (uint64_t) row_v, layer_row) ||
+            !xkv_checked_add_u64(single_token_kv_bytes, layer_row, single_token_kv_bytes)) {
+            llama_model_free(meta_model);
+            return 0;
+        }
+    }
+    llama_model_free(meta_model);
+    if (single_token_kv_bytes == 0) {
+        return 0;
+    }
+    uint64_t dense_ctx = 0;
+    if (!xkv_checked_mul_u64(single_token_kv_bytes, (uint64_t) n_ctx_kv_fit, dense_ctx)) {
+        return 0;
+    }
+    // Worst-case one-segment seal/COW overlap included, so runtime never
+    // refuses maintenance at pressure for lack of budgeted overlap bytes.
+    // Backend alignment is covered by the MiB round-up.
+    return common_xkv_store_mib_with_overlap(
+        dense_ctx, cparams->xkv_min_saving, cparams->xkv_segment_tokens, n_ctx_kv_fit);
+}
 
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
@@ -48,7 +691,10 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
         const user_data_t * ud = (const user_data_t *) user_data;
-        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
+        // Forward all ERROR and WARN messages unconditionally so context creation
+        // failures are visible regardless of probe min_level.
+        const ggml_log_level level_eff = (level == GGML_LOG_LEVEL_ERROR || level == GGML_LOG_LEVEL_WARN || level >= ud->min_level)
+            ? level : GGML_LOG_LEVEL_DEBUG;
         ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
     }, &ud);
 
@@ -355,6 +1001,11 @@ static void common_params_fit_impl(
                             __func__, hp_nct, cparams->n_ctx, memory_reduction/MiB);
                     }
                 } else {
+                    // Context was not reduced (either full context requested or
+                    // model training context <= n_ctx_min).  Resolve n_ctx from
+                    // the model so downstream code (e.g. recurrent target) sees
+                    // a non-zero per-sequence context instead of 0.
+                    cparams->n_ctx = hp_nct;
                     if (n_ctx_min == UINT32_MAX) {
                         LOG_TRC("%s: user has requested full context size of %" PRIu32 " -> no change\n", __func__, hp_nct);
                     } else {
@@ -372,7 +1023,8 @@ static void common_params_fit_impl(
     }
 
     if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
-        throw common_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");
+        LOG_INF("%s: n_gpu_layers already set by user to %d; skipping parameter fitting\n", __func__, mparams->n_gpu_layers);
+        return;
     }
     if (nd > 1) {
         if (!tensor_split) {
@@ -951,6 +1603,777 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
             __func__, td[1].c_str(), td[2].c_str(), td[3].c_str(), td[4].c_str(), td[5].c_str(),
             td[6].c_str(), td[7].c_str(), td[8].c_str());
     }
+}
+
+
+common_params_fit_status common_fit_kv_cache(
+                         const char * path_model,
+           const llama_model_params * mparams,
+               llama_context_params * cparams,
+        const std::vector<std::pair<ggml_backend_dev_t, size_t>> & reserve,
+        const llama_context_params * extra_cparams,
+                     ggml_log_level   log_level) {
+    if (!cparams->kv_unified) {
+        LOG_WRN("%s: automatic KV sizing requires unified KV cache\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+    if (!cparams->offload_kqv) {
+        LOG_WRN("%s: automatic KV sizing requires device-backed KV cache\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+
+    constexpr uint32_t n_align = 256;
+    constexpr uint32_t n_max = UINT32_MAX - (UINT32_MAX % n_align);
+
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0;
+    uint32_t hp_n_ctx_train = 0;
+    uint32_t hp_n_expert = 0;
+
+    // XKV reserve is computed exactly once per fit invocation (not per
+    // probe). workspace_mib is the TOTAL transient budget (once); the exact
+    // seal scratch must fit the remainder after the decode sub-budget.
+    // OFF yields zeros and changes nothing.
+    uint64_t xkv_scratch_once = 0;
+    uint64_t xkv_dedup_once = 0;
+    if (llama_xkv_is_enabled(cparams->xkv_mode)) {
+        if (!common_xkv_scratch_bytes(path_model, mparams, cparams, &xkv_scratch_once, &xkv_dedup_once)) {
+            LOG_WRN("%s: XKV scratch estimation failed; degrading scratch reserve to 0\n", __func__);
+            xkv_scratch_once = 0;
+            xkv_dedup_once = 0;
+        }
+    }
+    common_xkv_fit_reserve xkv_res = {};
+    if (!common_xkv_fit_reserve_bytes(cparams, xkv_scratch_once, &xkv_res, xkv_dedup_once)) {
+        LOG_WRN("%s: XKV reserve accounting failed (overflow or scratch exceeds workspace-decode), aborting auto-fit\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+    if (xkv_res.total_bytes != 0) {
+        LOG_INF("%s: XKV auto-fit reserve: workspace=%llu (once) decode_cache=%llu (inside) factor_scratch=%llu (inside) dedup_scratch=%llu (host)\n",
+            __func__,
+            (unsigned long long) xkv_res.workspace_bytes,
+            (unsigned long long) xkv_res.decode_cache_bytes,
+            (unsigned long long) xkv_res.factor_scratch_bytes,
+            (unsigned long long) xkv_res.dedup_scratch_bytes);
+    }
+
+    // Persistent factor store budget (explicit configuration only) is
+    // accounted separately from transient seal-time peaks above: it caps
+    // persistent device bytes, not scratch. Derived budgets resolve after
+    // auto-fit and are capped at the dense equivalent, so they add nothing.
+    const uint64_t xkv_store_once_bytes = common_xkv_store_budget_bytes(cparams);
+    if (xkv_store_once_bytes == UINT64_MAX) {
+        LOG_WRN("%s: XKV store budget accounting overflow, aborting auto-fit\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+    if (xkv_store_once_bytes != 0) {
+        LOG_INF("%s: XKV persistent store reserve: %llu bytes (once per device, separate from transient peaks)\n",
+            __func__, (unsigned long long) xkv_store_once_bytes);
+    }
+
+    // Device-owned store share from the effective residency predicate: the
+    // reference profile and every cpu-reference TQ configuration stay
+    // host-resident (charged once below under unlimited-host fit); only TQ
+    // profiles on device factorizers are device-owned and partitioned here.
+    const uint64_t xkv_store_dev_total = common_xkv_store_device_bytes(cparams, xkv_store_once_bytes);
+    {
+        uint64_t host_charge = 0;
+        // Host bucket: store-owned dedup vectors plus the host share of the
+        // persistent store. Device xkv_global below carries only workspace +
+        // device store (no double count; dedup never lives in the arena).
+        uint64_t host_store = 0;
+        if (xkv_checked_add_u64(xkv_res.dedup_scratch_bytes,
+                xkv_store_once_bytes - xkv_store_dev_total, host_store) &&
+            xkv_checked_add_u64(xkv_res.total_bytes, host_store, host_charge)) {
+            LOG_INF("%s: XKV host-charged (once, unlimited-host fit): %llu bytes\n",
+                __func__, (unsigned long long) host_charge);
+        }
+    }
+
+    auto get_data = [&](uint32_t n_ctx_kv, common_device_memory_data_vec & data) {
+        llama_context_params test = *cparams;
+        test.n_ctx_kv = n_ctx_kv;
+        try {
+            data = common_get_device_memory_data(path_model, mparams, &test, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+        } catch (const std::exception & e) {
+            LOG_WRN("%s: KV size %u probe threw exception: %s\n", __func__, n_ctx_kv, e.what());
+            return false;
+        }
+
+        if (devs.empty()) {
+            return false;
+        }
+
+        common_device_memory_data_vec extra_data;
+        std::vector<ggml_backend_dev_t> extra_devs;
+        if (extra_cparams != nullptr) {
+            llama_context_params extra = *extra_cparams;
+            // MTP/draft contexts use the same n_ctx_kv as the target — the n_ctx_kv >= n_ctx
+            // check requires it. However, the MTP context's KV cache only covers the MTP head
+            // layers (via layer filter), so its actual memory is much smaller than the target's.
+            extra.n_ctx_kv = n_ctx_kv;
+            uint32_t extra_ngl = 0;
+            uint32_t extra_n_ctx_train = 0;
+            uint32_t extra_n_expert = 0;
+            try {
+                extra_data = common_get_device_memory_data(
+                    path_model, mparams, &extra, extra_devs,
+                    extra_ngl, extra_n_ctx_train, extra_n_expert, log_level);
+            } catch (const std::exception & e) {
+                LOG_WRN("%s: extra context KV size %u probe threw exception: %s\n", __func__, n_ctx_kv, e.what());
+                return false;
+            }
+        }
+
+        uint64_t xkv_global = 0;
+        std::vector<uint64_t> xkv_wts(devs.size(), 0);
+        std::vector<uint64_t> xkv_shares(devs.size(), 0);
+        for (size_t i = 0; i < devs.size(); ++i) {
+            xkv_wts[i] = (uint64_t) data[i].context;
+        }
+        if (!xkv_checked_add_u64(xkv_res.total_bytes, xkv_store_dev_total, xkv_global) ||
+            !common_xkv_partition_budget(xkv_global, xkv_wts.data(), xkv_shares.data(), xkv_shares.size())) {
+            return false;
+        }
+
+        for (size_t i = 0; i < devs.size(); ++i) {
+            size_t reserved = 0;
+            for (const auto & [dev, bytes] : reserve) {
+                if (dev == devs[i]) {
+                    reserved += bytes;
+                }
+            }
+
+            // Vulkan TriAttention compaction uses one reusable 8 MiB
+            // device-local memmove scratch buffer per Vulkan device. Keep
+            // this in sync with GGML_VK_MEMMOVE_SCRATCH_SIZE so --total-kv
+            // auto never consumes the memory that native pack needs later.
+            if (cparams->triattention) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(devs[i]);
+                const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+                if (reg_name && std::string(reg_name).find("Vulkan") != std::string::npos) {
+                    reserved += 8ull * 1024ull * 1024ull;
+                }
+            }
+
+            for (size_t j = 0; j < extra_devs.size(); ++j) {
+                if (extra_devs[j] == devs[i]) {
+                    reserved += extra_data[j].context;
+                }
+            }
+
+            constexpr uint64_t MiB = 1024ull * 1024ull;
+            const uint64_t runtime_headroom = std::min<uint64_t>(
+                256ull * MiB, std::max<uint64_t>(32ull * MiB, data[i].total / 100ull));
+            // XKV reserve is accounted exactly once per device evaluation
+            // (not once per reserve entry): configured workspace, decode
+            // cache, and factor scratch headroom for seal/factorize peaks.
+            // Global XKV budgets are partitioned by target-layer placement
+            // (per-device context bytes) so device shares sum to exactly the
+            // total instead of over-reserving N× on N devices.
+            // Partitioned global is workspace (once, scratch inside) plus the
+            // device-owned store share; scratch is never added outside.
+            uint64_t reserved_all = 0;
+            if (!xkv_checked_add_u64(reserved, xkv_shares[i], reserved_all)) {
+                LOG_WRN("%s: KV size %u does not fit: XKV share accounting overflow\n",
+                    __func__, n_ctx_kv);
+                return false;
+            }
+            uint64_t used = 0;
+            if (!xkv_checked_sum_fit_bytes(data[i].model, data[i].context, data[i].compute,
+                    reserved_all, runtime_headroom, used)) {
+                return false;
+            }
+            if (data[i].free <= 0 || used > (uint64_t) data[i].free) {
+                LOG_WRN("%s: KV size %u does not fit: model=%llu context=%llu compute=%llu reserved=%llu headroom=%llu used=%llu free=%lld\n",
+                    __func__, n_ctx_kv,
+                    (unsigned long long)data[i].model, (unsigned long long)data[i].context,
+                    (unsigned long long)data[i].compute, (unsigned long long)reserved_all,
+                    (unsigned long long)runtime_headroom, (unsigned long long)used,
+                    (long long)data[i].free);
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    common_device_memory_data_vec data;
+    llama_context_params baseline = *cparams;
+    baseline.n_ctx_kv = 0;
+    try {
+        data = common_get_device_memory_data(path_model, mparams, &baseline, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+    } catch (const std::exception & e) {
+        LOG_WRN("%s: failed to inspect device memory: %s\n", __func__, e.what());
+        return COMMON_PARAMS_FIT_STATUS_ERROR;
+    }
+
+    if (devs.empty()) {
+        LOG_WRN("%s: no device memory available for automatic KV sizing\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+
+    // Resolve the per-sequence context from the model's training context when the
+    // user did not specify -c.  This mirrors llama_context's own resolution and
+    // makes the value visible to common_dynamic_recurrent_target after we return.
+    if (cparams->n_ctx == 0) {
+        cparams->n_ctx = hp_n_ctx_train;
+    }
+    const uint32_t n_ctx_seq = cparams->n_ctx;
+    if (n_ctx_seq > n_max) {
+        LOG_WRN("%s: per-sequence context of %u tokens exceeds the maximum aligned KV capacity\n", __func__, n_ctx_seq);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+
+    // When TriAttention is enabled, the physical KV only needs to cover the
+    // configured residency floor plus operational overhead (recent window + ubatch),
+    // not the full per-sequence context. This allows physical KV << logical context.
+    uint32_t n_min;
+    if (cparams->triattention) {
+        const uint32_t tri_floor = (uint32_t) std::ceil((double) n_ctx_seq * cparams->triattention_ratio);
+        // operational_floor = recent_window(128) + n_ubatch, aligned
+        const uint32_t op_floor = cparams->n_ubatch + 128;
+        n_min = std::max<uint32_t>(n_align, (uint32_t) (((uint64_t) std::max(tri_floor, op_floor) + n_align - 1) / n_align * n_align));
+        LOG_INF("%s: TriAttention enabled, minimum physical KV = %u (tri_floor=%u, op_floor=%u, n_ctx_seq=%u)\n",
+                __func__, n_min, tri_floor, op_floor, n_ctx_seq);
+    } else {
+        n_min = std::max<uint32_t>(n_align, (uint32_t) (((uint64_t) n_ctx_seq + n_align - 1) / n_align * n_align));
+    }
+
+    if (!get_data(n_min, data)) {
+        LOG_WRN("%s: requested per-sequence context of %u tokens does not fit in device memory\n", __func__, n_min);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+
+    const uint32_t n_probe = (uint32_t) std::min<uint64_t>(n_max, std::max<uint64_t>((uint64_t) n_min * 2, (uint64_t) n_min + 4096));
+    if (n_probe > n_min) {
+        common_device_memory_data_vec data_probe;
+        if (get_data(n_probe, data_probe)) {
+            bool device_context_grows = false;
+            for (size_t i = 0; i < devs.size(); ++i) {
+                device_context_grows |= data_probe[i].context > data[i].context;
+            }
+            if (!device_context_grows) {
+                LOG_WRN("%s: no device-backed KV memory growth detected; automatic KV sizing is not applicable\n", __func__);
+                return COMMON_PARAMS_FIT_STATUS_FAILURE;
+            }
+        }
+    }
+
+    uint32_t lo = n_min;
+    uint32_t hi = n_min;
+
+    while (hi < n_max) {
+        const uint64_t next64 = std::min<uint64_t>(n_max, uint64_t(hi) * 2);
+        const uint32_t next = (uint32_t) next64;
+        if (next == hi || !get_data(next, data)) {
+            hi = next;
+            break;
+        }
+
+        lo = next;
+        hi = next;
+    }
+
+    if (hi == lo && hi == n_max) {
+        cparams->n_ctx_kv = lo;
+        return COMMON_PARAMS_FIT_STATUS_SUCCESS;
+    }
+
+    if (hi == lo) {
+        hi = std::min<uint32_t>(n_max, lo + n_align);
+    }
+
+    uint64_t lo_u = lo / n_align;
+    uint64_t hi_u = hi / n_align;
+
+    while (lo_u + 1 < hi_u) {
+        const uint64_t mid_u = lo_u + (hi_u - lo_u) / 2;
+        const uint32_t mid = (uint32_t) (mid_u * n_align);
+        if (get_data(mid, data)) {
+            lo_u = mid_u;
+        } else {
+            hi_u = mid_u;
+        }
+    }
+
+    cparams->n_ctx_kv = (uint32_t) (lo_u * n_align);
+    LOG_INF("%s: automatic unified KV capacity = %u tokens\n", __func__, cparams->n_ctx_kv);
+
+    return COMMON_PARAMS_FIT_STATUS_SUCCESS;
+}
+
+common_params_fit_status common_fit_recurrent_cache(
+                         const char * path_model,
+           const llama_model_params * mparams,
+               llama_context_params * cparams,
+        const std::vector<std::pair<ggml_backend_dev_t, size_t>> & reserve,
+        const llama_context_params * extra_cparams,
+                     ggml_log_level   log_level) {
+    const uint32_t n_max = std::max(1u, cparams->n_seq_max);
+    const uint32_t n_target = std::max(1u, std::min(cparams->n_seq_recurrent == 0 ? 1u : cparams->n_seq_recurrent, n_max));
+
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0;
+    uint32_t hp_n_ctx_train = 0;
+    uint32_t hp_n_expert = 0;
+
+    // XKV reserve is computed exactly once per fit invocation (not per
+    // probe): configured workspace, decode cache, and factor scratch.
+    uint64_t xkv_scratch_once = 0;
+    uint64_t xkv_dedup_once = 0;
+    if (llama_xkv_is_enabled(cparams->xkv_mode)) {
+        if (!common_xkv_scratch_bytes(path_model, mparams, cparams, &xkv_scratch_once, &xkv_dedup_once)) {
+            LOG_WRN("%s: XKV scratch estimation failed; degrading scratch reserve to 0\n", __func__);
+            xkv_scratch_once = 0;
+            xkv_dedup_once = 0;
+        }
+    }
+    common_xkv_fit_reserve xkv_res = {};
+    // Dedup vectors are host-resident (carried in the reserve); device
+    // probes below carry workspace + device store only, no double count.
+    if (!common_xkv_fit_reserve_bytes(cparams, xkv_scratch_once, &xkv_res, xkv_dedup_once)) {
+        LOG_WRN("%s: XKV reserve accounting failed, aborting auto-fit\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+    const uint64_t xkv_store_once_bytes = common_xkv_store_budget_bytes(cparams);
+    if (xkv_store_once_bytes == UINT64_MAX) {
+        LOG_WRN("%s: XKV store budget accounting overflow, aborting auto-fit\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+    const uint64_t xkv_store_dev_total = common_xkv_store_device_bytes(cparams, xkv_store_once_bytes);
+
+    auto fits = [&](uint32_t n_seq_recurrent) {
+        llama_context_params test = *cparams;
+        test.n_seq_recurrent = n_seq_recurrent;
+
+        common_device_memory_data_vec data;
+        try {
+            data = common_get_device_memory_data(
+                path_model, mparams, &test, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+        } catch (const std::exception & e) {
+            LOG_WRN("%s: recurrent capacity %u probe threw exception: %s\n", __func__, n_seq_recurrent, e.what());
+            return false;
+        }
+
+        if (devs.empty()) {
+            return true;
+        }
+
+        common_device_memory_data_vec extra_data;
+        std::vector<ggml_backend_dev_t> extra_devs;
+        if (extra_cparams != nullptr) {
+            llama_context_params extra = *extra_cparams;
+            extra.n_ctx_kv = cparams->n_ctx_kv;
+            extra.n_seq_recurrent = n_seq_recurrent;
+            uint32_t extra_ngl = 0;
+            uint32_t extra_n_ctx_train = 0;
+            uint32_t extra_n_expert = 0;
+            try {
+                extra_data = common_get_device_memory_data(
+                    path_model, mparams, &extra, extra_devs,
+                    extra_ngl, extra_n_ctx_train, extra_n_expert, log_level);
+            } catch (const std::exception & e) {
+                LOG_WRN("%s: extra context recurrent probe threw exception: %s\n", __func__, e.what());
+                return false;
+            }
+        }
+
+        uint64_t xkv_global = 0;
+        std::vector<uint64_t> xkv_wts(devs.size(), 0);
+        std::vector<uint64_t> xkv_shares(devs.size(), 0);
+        for (size_t i = 0; i < devs.size(); ++i) {
+            xkv_wts[i] = (uint64_t) data[i].context;
+        }
+        if (!xkv_checked_add_u64(xkv_res.total_bytes, xkv_store_dev_total, xkv_global) ||
+            !common_xkv_partition_budget(xkv_global, xkv_wts.data(), xkv_shares.data(), xkv_shares.size())) {
+            LOG_WRN("%s: recurrent capacity %u does not fit: XKV partition accounting overflow\n",
+                __func__, n_seq_recurrent);
+            return false;
+        }
+
+        for (size_t i = 0; i < devs.size(); ++i) {
+            uint64_t reserved = 0;
+            for (const auto & [dev, bytes] : reserve) {
+                if (dev == devs[i]) {
+                    reserved += bytes;
+                }
+            }
+            if (cparams->triattention) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(devs[i]);
+                const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+                if (reg_name && std::string(reg_name).find("Vulkan") != std::string::npos) {
+                    reserved += 8ull * 1024ull * 1024ull;
+                }
+            }
+            for (size_t j = 0; j < extra_devs.size(); ++j) {
+                if (extra_devs[j] == devs[i]) {
+                    reserved += extra_data[j].context;
+                }
+            }
+
+            constexpr uint64_t MiB = 1024ull * 1024ull;
+            const uint64_t runtime_headroom = std::min<uint64_t>(
+                256ull * MiB, std::max<uint64_t>(32ull * MiB, data[i].total / 100ull));
+            uint64_t reserved_all = 0;
+            if (!xkv_checked_add_u64(reserved, xkv_shares[i], reserved_all)) {
+                return false;
+            }
+
+            uint64_t used = 0;
+            if (!xkv_checked_sum_fit_bytes(data[i].model, data[i].context, data[i].compute,
+                    reserved_all, runtime_headroom, used)) {
+                return false;
+            }
+            if (data[i].free <= 0 || used > (uint64_t) data[i].free) {
+                LOG_WRN("%s: recurrent capacity %u does not fit on device %zu (%s): used=%llu (model=%llu ctx=%llu comp=%llu res=%llu headroom=%llu) > free=%lld\n",
+                    __func__, n_seq_recurrent, i, ggml_backend_dev_name(devs[i]),
+                    (unsigned long long) used, (unsigned long long) data[i].model,
+                    (unsigned long long) data[i].context, (unsigned long long) data[i].compute,
+                    (unsigned long long) reserved_all, (unsigned long long) runtime_headroom,
+                    (long long) data[i].free);
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    if (!fits(1)) {
+        LOG_WRN("%s: one recurrent state slot does not fit in device memory\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+
+    if (devs.empty()) {
+        cparams->n_seq_recurrent = n_target;
+        LOG_INF("%s: no device-backed recurrent memory detected; keeping %u physical slots (logical sequences = %u)\n",
+                __func__, cparams->n_seq_recurrent, cparams->n_seq_max);
+        return COMMON_PARAMS_FIT_STATUS_SUCCESS;
+    }
+
+    if (n_target == 1 || fits(n_target)) {
+        cparams->n_seq_recurrent = n_target;
+        LOG_INF("%s: recurrent state capacity = %u physical slots (target = %u, logical sequences = %u)\n",
+                __func__, cparams->n_seq_recurrent, n_target, cparams->n_seq_max);
+        return COMMON_PARAMS_FIT_STATUS_SUCCESS;
+    }
+
+    uint32_t lo = 1;
+    uint32_t hi = n_target;
+    while (lo + 1 < hi) {
+        const uint32_t mid = lo + (hi - lo) / 2;
+        if (fits(mid)) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    cparams->n_seq_recurrent = lo;
+    LOG_INF("%s: recurrent state capacity = %u physical slots (target = %u, logical sequences = %u)\n",
+            __func__, cparams->n_seq_recurrent, n_target, cparams->n_seq_max);
+    return COMMON_PARAMS_FIT_STATUS_SUCCESS;
+}
+
+common_rerot_fit_result common_fit_rerot_capacities(
+                         const char * path_model,
+           const llama_model_params * mparams,
+               llama_context_params * cparams,
+        const std::vector<std::pair<ggml_backend_dev_t, size_t>> & reserve,
+        const llama_context_params * extra_cparams,
+                     ggml_log_level   log_level) {
+    common_rerot_fit_result best;
+    best.status = COMMON_PARAMS_FIT_STATUS_FAILURE;
+
+    // Read model context training size C if not set
+    uint32_t c_context = cparams->n_ctx;
+    if (c_context == 0) {
+        llama_model_params meta_mparams = *mparams;
+        meta_mparams.no_alloc = true;
+        meta_mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+        llama_model * meta_model = llama_model_load_from_file(path_model, meta_mparams);
+        if (meta_model) {
+            int32_t n_train = llama_model_n_ctx_train(meta_model);
+            if (n_train > 0) {
+                c_context = (uint32_t) n_train;
+            }
+            llama_model_free(meta_model);
+        }
+        if (c_context == 0) {
+            c_context = 4096;
+        }
+    }
+
+    const double rho = cparams->triattention ? cparams->triattention_ratio : 1.0;
+    const uint32_t n_align = 256;
+    uint32_t k_min = 0;
+    if (cparams->triattention) {
+        uint32_t needed = std::max<uint32_t>(
+            static_cast<uint32_t>(std::ceil(rho * double(c_context))),
+            cparams->n_ubatch + 128);
+        k_min = (needed + n_align - 1) / n_align * n_align;
+    } else {
+        k_min = (c_context + n_align - 1) / n_align * n_align;
+    }
+    best.k_min = k_min;
+
+    const double e_k = std::max(1.0, (rho * double(c_context)) / 2.0);
+
+    // XKV reserve is computed exactly once per fit invocation (not per
+    // probe): configured workspace, decode cache, and factor scratch.
+    uint64_t xkv_scratch_rerot = 0;
+    uint64_t xkv_dedup_rerot = 0;
+    if (llama_xkv_is_enabled(cparams->xkv_mode)) {
+        if (!common_xkv_scratch_bytes(path_model, mparams, cparams, &xkv_scratch_rerot, &xkv_dedup_rerot)) {
+            LOG_WRN("%s: XKV scratch estimation failed; degrading scratch reserve to 0\n", __func__);
+            xkv_scratch_rerot = 0;
+            xkv_dedup_rerot = 0;
+        }
+    }
+    common_xkv_fit_reserve xkv_res_rerot = {};
+    if (!common_xkv_fit_reserve_bytes(cparams, xkv_scratch_rerot, &xkv_res_rerot, xkv_dedup_rerot)) {
+        LOG_WRN("%s: XKV reserve accounting failed, aborting auto-fit\n", __func__);
+        return best;
+    }
+    // Persistent store budget (explicit only), separate from the one
+    // workspace allocation above.
+    const uint64_t xkv_store_rerot_bytes = common_xkv_store_budget_bytes(cparams);
+    if (xkv_store_rerot_bytes == UINT64_MAX) {
+        LOG_WRN("%s: XKV store budget accounting overflow, aborting auto-fit\n", __func__);
+        return best;
+    }
+    const uint64_t xkv_store_rerot_dev = common_xkv_store_device_bytes(cparams, xkv_store_rerot_bytes);
+
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0;
+    uint32_t hp_n_ctx_train = 0;
+    uint32_t hp_n_expert = 0;
+
+    auto test_fit = [&](uint32_t b, uint32_t p, uint32_t k_val, int64_t & min_margin_out) -> bool {
+        llama_context_params test = *cparams;
+        test.n_ctx_kv = k_val;
+        test.n_person_max = b;
+        test.n_pen_max = p;
+        test.n_seq_recurrent = b;
+        test.n_seq_max = LLAMA_MAX_SEQ;
+        test.n_outputs_max = std::max(1u, p * (1u + test.n_rs_seq));
+
+        common_device_memory_data_vec data;
+        try {
+            data = common_get_device_memory_data(path_model, mparams, &test, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+        } catch (const std::exception & e) {
+            LOG_TRC("%s: probe failed for B=%u P=%u K=%u: %s\n", __func__, b, p, k_val, e.what());
+            return false;
+        }
+
+        if (devs.empty()) {
+            return false;
+        }
+
+        common_device_memory_data_vec extra_data;
+        std::vector<ggml_backend_dev_t> extra_devs;
+        if (extra_cparams != nullptr) {
+            llama_context_params extra = *extra_cparams;
+            extra.n_ctx_kv = k_val;
+            // The speculative context owns only live execution sequences. It
+            // never stores the RERoT document's parked logical sequence IDs,
+            // brains, or pens. Giving it LLAMA_MAX_SEQ forces output_reserve()
+            // to allocate one vocabulary row for thousands of nonexistent
+            // draft readers and incorrectly collapses the fitted pen arena.
+            extra.n_seq_max = std::max(1u, p);
+            extra.n_outputs_max = std::max(1u, p);
+            extra.n_person_max = 0;
+            extra.n_pen_max = 0;
+            extra.n_seq_recurrent = std::max(1u, p);
+            uint32_t extra_ngl = 0;
+            uint32_t extra_n_ctx_train = 0;
+            uint32_t extra_n_expert = 0;
+            try {
+                extra_data = common_get_device_memory_data(
+                    path_model, mparams, &extra, extra_devs,
+                    extra_ngl, extra_n_ctx_train, extra_n_expert, log_level);
+            } catch (const std::exception & e) {
+                return false;
+            }
+        }
+
+        uint64_t xkv_global = 0;
+        std::vector<uint64_t> xkv_wts(devs.size(), 0);
+        std::vector<uint64_t> xkv_shares(devs.size(), 0);
+        for (size_t i = 0; i < devs.size(); ++i) {
+            xkv_wts[i] = (uint64_t) data[i].context;
+        }
+        if (!xkv_checked_add_u64(xkv_res_rerot.total_bytes, xkv_store_rerot_dev, xkv_global) ||
+            !common_xkv_partition_budget(xkv_global, xkv_wts.data(), xkv_shares.data(), xkv_shares.size())) {
+            return false;
+        }
+
+        int64_t min_margin = INT64_MAX;
+        for (size_t i = 0; i < devs.size(); ++i) {
+            uint64_t reserved = 0;
+            for (const auto & [dev, bytes] : reserve) {
+                if (dev == devs[i]) {
+                    reserved += bytes;
+                }
+            }
+            if (cparams->triattention) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(devs[i]);
+                const char * reg_name = reg ? ggml_backend_reg_name(reg) : nullptr;
+                if (reg_name && std::string(reg_name).find("Vulkan") != std::string::npos) {
+                    reserved += 8ull * 1024ull * 1024ull;
+                }
+            }
+            for (size_t j = 0; j < extra_devs.size(); ++j) {
+                if (extra_devs[j] == devs[i]) {
+                    reserved += extra_data[j].context;
+                }
+            }
+
+            constexpr uint64_t MiB = 1024ull * 1024ull;
+            const uint64_t runtime_headroom = std::min<uint64_t>(
+                256ull * MiB, std::max<uint64_t>(32ull * MiB, data[i].total / 100ull));
+            uint64_t reserved_all = 0;
+            if (!xkv_checked_add_u64(reserved, xkv_shares[i], reserved_all)) {
+                return false;
+            }
+            uint64_t used = 0;
+            if (!xkv_checked_sum_fit_bytes(data[i].model, data[i].context, data[i].compute,
+                    reserved_all, runtime_headroom, used)) {
+                LOG_WRN("%s: KV size %u does not fit: memory total overflow\n", __func__, k_val);
+                return false;
+            }
+            if (data[i].free <= 0 || used > (uint64_t) data[i].free) {
+                return false;
+            }
+            const int64_t diff = (int64_t) data[i].free - (int64_t) used;
+            if (diff < min_margin) {
+                min_margin = diff;
+            }
+        }
+        min_margin_out = min_margin;
+        return true;
+    };
+
+    auto search_max_k = [&](uint32_t b, uint32_t p, uint32_t & max_k_out, int64_t & max_k_margin_out) -> bool {
+        int64_t test_margin = 0;
+        if (!test_fit(b, p, k_min, test_margin)) {
+            return false;
+        }
+
+        uint32_t low = k_min;
+        uint32_t high = k_min * 16;
+        if (high < 65536) high = 65536;
+
+        while (high > low && test_fit(b, p, high, test_margin)) {
+            low = high;
+            if (high > UINT32_MAX / 2) {
+                break;
+            }
+            high *= 2;
+        }
+
+        while (high - low > n_align) {
+            uint32_t mid = low + (high - low) / 2;
+            mid = (mid / n_align) * n_align;
+            if (mid <= low) {
+                break;
+            }
+            if (test_fit(b, p, mid, test_margin)) {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        max_k_out = low;
+        test_fit(b, p, max_k_out, max_k_margin_out);
+        return true;
+    };
+
+    // Negative feedback probing (§B.10 / user feedback model):
+    // Fixed 6 pens per person: P = 6 * B. Pens are dynamically allocated first-come, first-served
+    // at runtime up to the total pen capacity P.
+    // Expected KV capacity per person is E_K = rho * C / 2 (ctx / 2).
+    // No hardcoded candidate arrays:
+    // 1. Initial baseline probe at (B=1, P=6) establishes maximum possible physical KV capacity K1.
+    // 2. K1 / E_K directly establishes the physical upper bound B_max without arbitrary constants.
+    // 3. Negative feedback bisection on B:
+    //    - If (B, 6B, K_min) overflows VRAM -> overcommit negative feedback pulls high bound down.
+    //    - If it fits, observed K yields actual support capacity B_supported = floor(K / E_K).
+    //      - If B <= B_supported -> capacity is sustainable! Record best and probe higher.
+    //      - If B > B_supported  -> KV deficit negative feedback pulls high bound down to min(B-1, B_supported).
+    const uint32_t pens_per_person = 6;
+
+    // Step 1: Baseline probe at B=1, P=6
+    uint32_t k1_found = 0;
+    int64_t  m1_margin = 0;
+    if (search_max_k(1, pens_per_person, k1_found, m1_margin) && k1_found >= k_min) {
+        best.status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
+        best.b_people = 1;
+        best.p_pens = pens_per_person;
+        best.k_tokens = k1_found;
+        best.min_device_margin = m1_margin;
+
+        // Theoretical physical ceiling: more people take more brain/hand memory, so K(B) <= K1.
+        // Therefore B cannot physically exceed floor(K1 / E_K), nor LLAMA_MAX_SEQ / pens_per_person.
+        const uint32_t max_seq_people = (uint32_t) (LLAMA_MAX_SEQ / pens_per_person);
+        const uint32_t b_ceiling = std::max(1u, (uint32_t) (double(k1_found) / e_k));
+        const uint32_t b_upper = std::min(max_seq_people, b_ceiling);
+
+        uint32_t low = 2;
+        uint32_t high = b_upper;
+
+        while (low <= high) {
+            const uint32_t mid = low + (high - low + 1) / 2;
+            const uint32_t p_mid = mid * pens_per_person;
+
+            uint32_t k_mid = 0;
+            int64_t  margin_mid = 0;
+            if (!search_max_k(mid, p_mid, k_mid, margin_mid) || k_mid < k_min) {
+                // VRAM overflow: overcommit negative feedback pulls high down
+                high = mid - 1;
+            } else {
+                const uint32_t b_supported = std::max(1u, (uint32_t) std::round(double(k_mid) / e_k));
+                if (mid <= b_supported) {
+                    // Sustainable candidate: record and probe higher
+                    best.b_people = mid;
+                    best.p_pens = p_mid;
+                    best.k_tokens = k_mid;
+                    best.min_device_margin = margin_mid;
+                    low = mid + 1;
+                } else {
+                    // KV deficit: observed KV capacity only supports b_supported people.
+                    // Negative feedback pulls high down directly to min(mid - 1, b_supported).
+                    high = std::min(mid - 1, b_supported);
+                }
+            }
+        }
+
+        LOG_INF("RERoT auto-fit selected (feedback probe): B=%u people, P=%u pens, K=%u tokens (K_min=%u, min_margin=%lld B)\n",
+            best.b_people, best.p_pens, best.k_tokens, best.k_min, (long long) best.min_device_margin);
+        return best;
+    }
+
+    // Step 2: Safety fallback for ultra-constrained devices where even (B=1, P=6) does not fit:
+    for (uint32_t p_fallback = pens_per_person - 1; p_fallback >= 1; --p_fallback) {
+        uint32_t k_found = 0;
+        int64_t margin_found = 0;
+        if (!search_max_k(1, p_fallback, k_found, margin_found)) {
+            continue;
+        }
+        if (k_found < k_min) {
+            continue;
+        }
+        best.status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
+        best.b_people = 1;
+        best.p_pens = p_fallback;
+        best.k_tokens = k_found;
+        best.min_device_margin = margin_found;
+        LOG_INF("RERoT auto-fit fallback selected: B=1 person, P=%u pens, K=%u tokens (K_min=%u, min_margin=%lld B)\n",
+            best.p_pens, best.k_tokens, best.k_min, (long long) best.min_device_margin);
+        return best;
+    }
+
+    return best;
 }
 
 void common_fit_print(

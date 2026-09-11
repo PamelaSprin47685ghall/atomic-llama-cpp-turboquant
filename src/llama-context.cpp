@@ -5,23 +5,425 @@
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
+// FlashPrefill V2 policy contract (PolicyCore owner). The src-internal header
+// forwards to the public include/llama-flashprefill.h; only the public C
+// structs/helpers are used here (no internal routing dependency in this slice).
+#include "llama-flashprefill.h"
+#include "llama-flashprefill-state.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-xkv-cache.h"
+#include "llama-xkv-runtime.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
 
+// Episode persistence contract shared with the server control plane (§§25,
+// A.8-A.10). Declares the fingerprint/envelope/shift helpers implemented
+// below; the logical episode blob itself lives in tools/server/server-rerot.*.
+#include "../tools/server/server-rerot.h"
+
+#include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <numeric>
+#include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 //
 // llama_context
 //
+
+// ---------------------------------------------------------------------------
+// RERoT experimental context-side state (Stage 7 + compat core, §§11,17,20,
+// 25,A.6-A.11). All helpers below are gated by cparams.rerot_enabled +
+// episode-active. When RERoT is OFF (or no episode is active) every helper
+// returns a safe default without touching KV/recurrent/sampler/graph state,
+// so ordinary decode / state / shift / reclaim paths stay byte-identical.
+// llama_context's header is owned elsewhere, so per-context RERoT control
+// state lives in this translation-unit registry keyed by context pointer.
+// Physical KV ownership stays in llama_kv_cells; logical tree/scheduler
+// stays in tools/server/server-rerot.*. This file only tracks write tags
+// (forwarded to memory), reader-view stamps (for MTP binding), and
+// topology/publish/layout epochs (for barrier refresh + caps/fingerprint).
+// ---------------------------------------------------------------------------
+
+// Forward declaration: capability bitmap, defined alongside the other RERoT
+// context glue below. Declared early so the envelope writer (below) sees it.
+uint32_t llama_rerot_state_caps(const struct llama_context * ctx);
+
+namespace {
+
+struct llama_rerot_episode_ctx_state {
+    uint64_t episode_id = 0;
+    uint64_t topology_epoch = 1;
+    uint64_t publish_epoch = 1;
+    uint64_t layout_epoch = 1;
+    llama_rerot_frontier_mode frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+    std::map<llama_seq_id, llama_rerot_view_stamp> view_stamps;
+};
+
+struct llama_rerot_exec_binding {
+    uint64_t episode_id = 0;
+    uint32_t node_id = 0;
+    int32_t  pen_id = -1;
+};
+
+struct llama_rerot_ctx_state {
+    std::unordered_map<uint64_t, llama_rerot_episode_ctx_state> episodes;
+    std::unordered_map<llama_seq_id, llama_rerot_exec_binding> exec_bindings;
+    llama_memory_t mem = nullptr;
+};
+
+std::mutex g_rerot_mu;
+std::unordered_map<const llama_context *, llama_rerot_ctx_state> g_rerot_states;
+
+bool llama_rerot_ctx_enabled(const llama_context * ctx) {
+    return ctx != nullptr && ctx->get_cparams().rerot_enabled;
+}
+
+bool llama_rerot_ctx_is_active(const llama_context * ctx, uint64_t episode_id = 0) {
+    if (!llama_rerot_ctx_enabled(ctx)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_rerot_mu);
+    auto it = g_rerot_states.find(ctx);
+    if (it == g_rerot_states.end() || it->second.episodes.empty()) {
+        return false;
+    }
+    return episode_id == 0 || it->second.episodes.count(episode_id) != 0;
+}
+
+bool llama_rerot_mem_is_active(llama_memory_t mem) {
+    if (mem == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_rerot_mu);
+    for (const auto & kv : g_rerot_states) {
+        if (!kv.second.episodes.empty() && kv.second.mem == mem) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Versioned state fingerprint (A.8.1/A.25): model arch + RoPE config + Tri
+// calibration + RERoT version. Old binaries meeting new RERoT state must
+// reject (magic/version mismatch); new binaries keep the ordinary path when
+// no RERoT episode is active. v1 never persists RERoT episodes (explicit
+// refusal below); the fingerprint is reserved for the future episode format
+// and for caps diagnostics.
+uint64_t llama_rerot_ctx_fingerprint(const llama_context * ctx) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    const auto & cparams = ctx->get_cparams();
+    const auto & model = ctx->get_model();
+    uint64_t h = 0xcbf29ce484222325ull;
+    const auto mix = [&](uint64_t v) {
+        h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    };
+    mix((uint64_t) model.arch);
+    mix((uint64_t) model.hparams.n_ctx_train);
+    {
+        uint32_t u = 0;
+        std::memcpy(&u, &cparams.rope_freq_base, sizeof(u));
+        mix(u);
+        std::memcpy(&u, &cparams.rope_freq_scale, sizeof(u));
+        mix(u);
+    }
+    {
+        uint64_t u = 0;
+        std::memcpy(&u, &cparams.triattention_ratio, sizeof(u));
+        mix(u);
+        mix(cparams.triattention_enabled ? 0x9e3779b9ull : 0);
+    }
+    mix(LLAMA_REROT_STATE_MAGIC);
+    mix(LLAMA_REROT_STATE_VERSION);
+    return h == 0 ? 1 : h;
+}
+
+uint64_t llama_rerot_ctx_mix_fp(uint64_t h, uint64_t v) {
+    h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    return h;
+}
+
+// Fingerprint triple (§A.8.1): model arch + ctx-train size, RoPE base/scale,
+// Tri ratio/enabled calibration. Each mixes in the state magic/version so a
+// version skew also flips the triple (defense in depth; the envelope checks
+// the version explicitly first and names the offending domain on mismatch).
+uint64_t llama_rerot_ctx_fp_model(const llama_context * ctx) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    const auto & model = ctx->get_model();
+    uint64_t h = 0xcbf29ce484222325ull;
+    h = llama_rerot_ctx_mix_fp(h, (uint64_t) model.arch);
+    h = llama_rerot_ctx_mix_fp(h, (uint64_t) model.hparams.n_ctx_train);
+    h = llama_rerot_ctx_mix_fp(h, (uint64_t) LLAMA_REROT_STATE_MAGIC);
+    h = llama_rerot_ctx_mix_fp(h, (uint64_t) LLAMA_REROT_STATE_VERSION);
+    return h == 0 ? 1 : h;
+}
+
+uint64_t llama_rerot_ctx_fp_rope(const llama_context * ctx) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    const auto & cparams = ctx->get_cparams();
+    uint64_t h = 0xcbf29ce484222325ull;
+    {
+        uint32_t u = 0;
+        std::memcpy(&u, &cparams.rope_freq_base, sizeof(u));
+        h = llama_rerot_ctx_mix_fp(h, u);
+        std::memcpy(&u, &cparams.rope_freq_scale, sizeof(u));
+        h = llama_rerot_ctx_mix_fp(h, u);
+    }
+    h = llama_rerot_ctx_mix_fp(h, (uint64_t) LLAMA_REROT_STATE_MAGIC);
+    h = llama_rerot_ctx_mix_fp(h, (uint64_t) LLAMA_REROT_STATE_VERSION);
+    return h == 0 ? 1 : h;
+}
+
+uint64_t llama_rerot_ctx_fp_tri(const llama_context * ctx) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    const auto & cparams = ctx->get_cparams();
+    uint64_t h = 0xcbf29ce484222325ull;
+    {
+        uint64_t u = 0;
+        std::memcpy(&u, &cparams.triattention_ratio, sizeof(u));
+        h = llama_rerot_ctx_mix_fp(h, u);
+        h = llama_rerot_ctx_mix_fp(h, cparams.triattention_enabled ? 0x9e3779b9ull : 0);
+    }
+    h = llama_rerot_ctx_mix_fp(h, (uint64_t) LLAMA_REROT_STATE_MAGIC);
+    h = llama_rerot_ctx_mix_fp(h, (uint64_t) LLAMA_REROT_STATE_VERSION);
+    return h == 0 ? 1 : h;
+}
+
+bool llama_rerot_ctx_fail(std::string * error, const std::string & message) {
+    if (error) {
+        *error = message;
+    }
+    return false;
+}
+
+// Parsed RERoT context envelope (arch string consumed separately by the
+// caller, exactly like the ordinary state path).
+struct llama_rerot_ctx_envelope {
+    uint64_t episode_id = 0;
+    uint64_t topology_epoch = 0;
+    uint64_t publish_epoch = 0;
+    uint64_t layout_epoch = 0;
+    llama_rerot_frontier_mode frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+    std::map<llama_seq_id, llama_rerot_view_stamp> stamps;
+};
+
+// Versioned context envelope writer (§A.8.1). Emits the arch string (same
+// prefix bytes as the ordinary path) followed by magic/version/caps/
+// fingerprint triple/control state. Carries NO tensor bytes: resident
+// classified cells, write tags, and reader views are transient execution
+// state (episode-level demotion — the logical episode in the server blob plus
+// this envelope is authoritative, and views/tags are reinstalled via
+// set_write_tag / set_frontier_views before decode). Throws std::runtime_error
+// with an explicit reason for corrupt control state; the caller (a member
+// function) additionally refuses backend-sampler-bound exec seqs, whose
+// RNG/history state has no byte-serializable form here.
+void llama_rerot_ctx_write_envelope_body(llama_context * ctx, llama_io_write_i & io, uint64_t target_episode_id = 0) {
+    uint64_t episode_id = 0;
+    uint64_t topology_epoch = 0;
+    uint64_t publish_epoch = 0;
+    uint64_t layout_epoch = 0;
+    llama_rerot_frontier_mode frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+    std::map<llama_seq_id, llama_rerot_view_stamp> stamps;
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        const auto it = g_rerot_states.find(ctx);
+        if (it == g_rerot_states.end() || it->second.episodes.empty()) {
+            throw std::runtime_error("RERoT envelope write refused: no active episode on this context");
+        }
+        auto ep_it = target_episode_id != 0 ? it->second.episodes.find(target_episode_id) : it->second.episodes.begin();
+        if (ep_it == it->second.episodes.end()) {
+            throw std::runtime_error("RERoT envelope write refused: requested episode not active on this context");
+        }
+        episode_id     = ep_it->second.episode_id;
+        topology_epoch = ep_it->second.topology_epoch;
+        publish_epoch  = ep_it->second.publish_epoch;
+        layout_epoch   = ep_it->second.layout_epoch;
+        frontier_mode  = ep_it->second.frontier_mode;
+        stamps         = ep_it->second.view_stamps;
+    }
+    if (episode_id == 0 || topology_epoch == 0 || publish_epoch == 0 || layout_epoch == 0) {
+        throw std::runtime_error("RERoT envelope write refused: corrupt episode control state (zero id/epoch)");
+    }
+    const std::string arch_str = llm_arch_name(ctx->get_model().arch);
+    io.write_string(arch_str);
+
+    const uint32_t magic   = LLAMA_REROT_STATE_MAGIC;
+    const uint32_t version = LLAMA_REROT_STATE_VERSION;
+    const uint32_t caps    = llama_rerot_state_caps(ctx);
+    const uint64_t fp_model = llama_rerot_ctx_fp_model(ctx);
+    const uint64_t fp_rope  = llama_rerot_ctx_fp_rope(ctx);
+    const uint64_t fp_tri   = llama_rerot_ctx_fp_tri(ctx);
+    const int32_t mode = static_cast<int32_t>(frontier_mode);
+    const uint64_t n_stamps = static_cast<uint64_t>(stamps.size());
+    io.write(&magic,    sizeof(magic));
+    io.write(&version,  sizeof(version));
+    io.write(&caps,     sizeof(caps));
+    io.write(&fp_model, sizeof(fp_model));
+    io.write(&fp_rope,  sizeof(fp_rope));
+    io.write(&fp_tri,   sizeof(fp_tri));
+    io.write(&episode_id,     sizeof(episode_id));
+    io.write(&topology_epoch, sizeof(topology_epoch));
+    io.write(&publish_epoch,  sizeof(publish_epoch));
+    io.write(&layout_epoch,   sizeof(layout_epoch));
+    io.write(&mode, sizeof(mode));
+    io.write(&n_stamps, sizeof(n_stamps));
+    for (const auto & kv : stamps) {
+        const int32_t seq = kv.first;
+        io.write(&seq, sizeof(seq));
+        io.write(&kv.second.topology_epoch, sizeof(uint64_t));
+        io.write(&kv.second.publish_epoch,  sizeof(uint64_t));
+        io.write(&kv.second.layout_epoch,   sizeof(uint64_t));
+    }
+    const uint8_t omitted = 1; // memory tensor bytes omitted by design (see above)
+    io.write(&omitted, sizeof(omitted));
+}
+
+// Versioned context envelope reader. Validates the arch string, then the
+// magic/version/caps/fingerprint triple with an explicit reason per failure
+// (old-binary-new-state, legacy, unknown-feature, or the offending
+// model/rope/Tri domain — never best-effort). Ordinary state bytes offered
+// here fail closed at the magic check: restoring them atop an active episode
+// would orphan tree/run/epoch/parked/archive/MTP lineage.
+void llama_rerot_ctx_read_envelope_body(
+        const llama_context * ctx,
+        llama_io_read_i & io,
+        llama_rerot_ctx_envelope & env_out) {
+    const std::string cur_arch_str = llm_arch_name(ctx->get_model().arch);
+    std::string arch_str;
+    io.read_string(arch_str);
+    if (cur_arch_str != arch_str) {
+        throw std::runtime_error("RERoT envelope load refused: wrong model arch");
+    }
+    uint32_t magic = 0;
+    io.read(&magic, sizeof(magic));
+    if (magic != LLAMA_REROT_STATE_MAGIC) {
+        throw std::runtime_error("RERoT envelope load refused: magic mismatch "
+            "(ordinary state bytes cannot restore atop an active episode — they would orphan "
+            "tree/run/epoch/parked/archive/MTP lineage; clear the episode first or restore the "
+            "matching RERoT envelope)");
+    }
+    uint32_t version = 0;
+    io.read(&version, sizeof(version));
+    if (version != LLAMA_REROT_STATE_VERSION && version != 1u) {
+        if (version > LLAMA_REROT_STATE_VERSION) {
+            throw std::runtime_error("RERoT envelope load refused: old binary cannot read new RERoT state "
+                "(upgrade the binary, never best-effort restore)");
+        }
+        throw std::runtime_error("RERoT envelope load refused: legacy RERoT state is unsupported "
+            "(refusing best-effort upgrade)");
+    }
+    uint32_t caps = 0;
+    uint64_t fp_model = 0, fp_rope = 0, fp_tri = 0;
+    io.read(&caps,     sizeof(caps));
+    io.read(&fp_model, sizeof(fp_model));
+    io.read(&fp_rope,  sizeof(fp_rope));
+    io.read(&fp_tri,   sizeof(fp_tri));
+    constexpr uint32_t known_caps =
+        LLAMA_REROT_STATE_CAP_REROT | LLAMA_REROT_STATE_CAP_REROT_TREE |
+        LLAMA_REROT_STATE_CAP_REROT_PRIVATE | LLAMA_REROT_STATE_CAP_REROT_MTP |
+        LLAMA_REROT_STATE_CAP_HYBRID_REC | LLAMA_REROT_STATE_CAP_SPARSE_KV |
+        LLAMA_REROT_STATE_CAP_TRIATTENTION;
+    if ((caps & ~known_caps) != 0) {
+        throw std::runtime_error("RERoT envelope load refused: unknown state capability bits "
+            "(envelope needs a newer feature set)");
+    }
+    if ((caps & LLAMA_REROT_STATE_CAP_REROT) == 0) {
+        throw std::runtime_error("RERoT envelope load refused: blob lacks the REROT capability bit");
+    }
+    if (fp_model != llama_rerot_ctx_fp_model(ctx)) {
+        throw std::runtime_error("RERoT envelope load refused: model fingerprint mismatch "
+            "(different arch or context-train size); refusing best-effort restore");
+    }
+    if (fp_rope != llama_rerot_ctx_fp_rope(ctx)) {
+        throw std::runtime_error("RERoT envelope load refused: RoPE fingerprint mismatch "
+            "(different rope base/scale); refusing best-effort restore");
+    }
+    if (fp_tri != llama_rerot_ctx_fp_tri(ctx)) {
+        throw std::runtime_error("RERoT envelope load refused: Tri-calibration fingerprint mismatch "
+            "(different Tri ratio/enabled state); refusing best-effort restore");
+    }
+    llama_rerot_ctx_envelope env;
+    int32_t mode = -1;
+    uint64_t n_stamps = 0;
+    io.read(&env.episode_id,     sizeof(env.episode_id));
+    io.read(&env.topology_epoch, sizeof(env.topology_epoch));
+    io.read(&env.publish_epoch,  sizeof(env.publish_epoch));
+    io.read(&env.layout_epoch,   sizeof(env.layout_epoch));
+    io.read(&mode,     sizeof(mode));
+    io.read(&n_stamps, sizeof(n_stamps));
+    if (env.episode_id == 0 || env.topology_epoch == 0 || env.publish_epoch == 0 || env.layout_epoch == 0) {
+        throw std::runtime_error("RERoT envelope load refused: zero episode id or epoch");
+    }
+    if (mode != static_cast<int32_t>(LLAMA_REROT_FRONTIER_STRONG) &&
+        mode != static_cast<int32_t>(LLAMA_REROT_FRONTIER_LAG1)) {
+        throw std::runtime_error("RERoT envelope load refused: corrupt frontier mode");
+    }
+    env.frontier_mode = static_cast<llama_rerot_frontier_mode>(mode);
+    if (n_stamps > static_cast<uint64_t>(LLAMA_MAX_SEQ)) {
+        throw std::runtime_error("RERoT envelope load refused: corrupt view-stamp count");
+    }
+    for (uint64_t i = 0; i < n_stamps; ++i) {
+        int32_t seq = -1;
+        llama_rerot_view_stamp stamp{0, 0, 0};
+        io.read(&seq, sizeof(seq));
+        io.read(&stamp.topology_epoch, sizeof(uint64_t));
+        io.read(&stamp.publish_epoch,  sizeof(uint64_t));
+        io.read(&stamp.layout_epoch,   sizeof(uint64_t));
+        if (seq < 0 || seq >= LLAMA_MAX_SEQ ||
+            stamp.topology_epoch == 0 || stamp.publish_epoch == 0 || stamp.layout_epoch == 0) {
+            throw std::runtime_error("RERoT envelope load refused: corrupt view stamp");
+        }
+        if (!env.stamps.emplace(seq, stamp).second) {
+            throw std::runtime_error("RERoT envelope load refused: duplicate view stamp");
+        }
+    }
+    uint8_t omitted = 0;
+    io.read(&omitted, sizeof(omitted));
+    if (omitted != 1) {
+        throw std::runtime_error("RERoT envelope load refused: corrupt memory-omission marker");
+    }
+    env_out = std::move(env);
+}
+
+llama_rerot_visibility llama_rerot_ctx_convert_visibility(llama_rerot_kv_visibility v, bool * ok) {
+    switch (v) {
+        case LLAMA_REROT_KV_PUBLIC_LIVE:     if (ok) *ok = true;  return llama_rerot_visibility::public_live;
+        case LLAMA_REROT_KV_PRIVATE_CONTROL: if (ok) *ok = true;  return llama_rerot_visibility::private_control;
+        case LLAMA_REROT_KV_PENDING_RECORD:  if (ok) *ok = true;  return llama_rerot_visibility::pending_record;
+        default: break;
+    }
+    if (ok) *ok = false;
+    return llama_rerot_visibility::normal;
+}
+
+} // namespace
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -79,6 +481,224 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+namespace {
+
+// Process-wide conservative context identity for FlashPrefill state
+// isolation. Shared by both constructors so every context in the process
+// gets a unique serial; 0 is never issued (reserved as "unknown"). The
+// serial is unique WITHIN this process only — it restarts at 1 in every
+// process, so it can never authorize a restore on its own (see the process
+// nonce below).
+uint64_t flashprefill_next_serial() {
+    static std::atomic<uint64_t> s_serial{1};
+    uint64_t id = s_serial.fetch_add(1, std::memory_order_relaxed);
+    if (id == 0) {
+        id = s_serial.fetch_add(1, std::memory_order_relaxed);
+    }
+    return id;
+}
+
+// Fixed 128-bit process nonce for FlashPrefill state identity (StatePolicy).
+// Generated once per process, and ONLY on first use by an enabled context —
+// OFF contexts never reach this function, so OFF pays no randomness cost.
+// Probabilistic anti-collision, clearly labeled: NOT a secret and NOT a
+// security boundary, just unguessable restart discrimination so the same
+// (serial, policy, adapter) tuple from a previous process lifetime (restart,
+// or another instance over the same model.desc string) cannot validate.
+// std::random_device preferred; hardened with time/address/counter/thread
+// entropy in case the device is deterministic on the platform. Zero words are
+// remapped to 1 (zero is reserved as never-initialized everywhere).
+std::pair<uint64_t, uint64_t> flashprefill_process_nonce() {
+    static const std::pair<uint64_t, uint64_t> nonce = [] {
+        uint64_t words[2] = {0, 0};
+        try {
+            std::random_device rd;
+            for (int w = 0; w < 2; ++w) {
+                for (int k = 0; k < 2; ++k) {
+                    words[w] = (words[w] << 32) | (uint64_t) rd();
+                }
+            }
+        } catch (...) {
+            words[0] = 0;
+            words[1] = 0;
+        }
+        // Harden: mix wall time, object addresses, thread id, and a counter
+        // through splitmix64 so even a deterministic rd() still separates
+        // processes and restarts.
+        static std::atomic<uint64_t> s_mix_ctr{0x9e3779b97f4a7c15ull};
+        for (int w = 0; w < 2; ++w) {
+            uint64_t z = words[w];
+            z += (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count();
+            z += (uint64_t) (uintptr_t) &words[w];
+            z += std::hash<std::thread::id>{}(std::this_thread::get_id());
+            z += s_mix_ctr.fetch_add(0x9e3779b97f4a7c15ull, std::memory_order_relaxed);
+            z += 0x9e3779b97f4a7c15ull;
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+            z =  z ^ (z >> 31);
+            words[w] = z != 0 ? z : 1u;
+        }
+        return std::make_pair(words[0], words[1]);
+    }();
+    return nonce;
+}
+
+} // namespace
+
+static void llama_xkv_validate_cparams(const llama_cparams & cparams) {
+    if ((int)cparams.xkv_mode < (int)LLAMA_XKV_MODE_OFF || (int)cparams.xkv_mode > (int)LLAMA_XKV_MODE_SR) {
+        throw std::invalid_argument("XKV mode enum value is out of range");
+    }
+
+    if (cparams.xkv_mode == LLAMA_XKV_MODE_OFF) {
+        return;
+    }
+
+    if ((int)cparams.xkv_storage_profile < (int)LLAMA_XKV_STORAGE_PROFILE_REFERENCE ||
+        (int)cparams.xkv_storage_profile > (int)LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS) {
+        throw std::invalid_argument("XKV storage profile enum value is out of range");
+    }
+
+    if ((int)cparams.xkv_source < (int)LLAMA_XKV_SOURCE_DECODED_HOT ||
+        (int)cparams.xkv_source > (int)LLAMA_XKV_SOURCE_PREROPE_CAPTURE) {
+        throw std::invalid_argument("XKV source enum value is out of range");
+    }
+
+    if ((int)cparams.xkv_factor_balance < (int)LLAMA_XKV_FACTOR_BALANCE_UPSTREAM ||
+        (int)cparams.xkv_factor_balance > (int)LLAMA_XKV_FACTOR_BALANCE_DIAGONAL) {
+        throw std::invalid_argument("XKV factor balance enum value is out of range");
+    }
+
+    if ((int)cparams.xkv_landmark_refine < (int)LLAMA_XKV_LANDMARK_REFINE_NONE ||
+        (int)cparams.xkv_landmark_refine > (int)LLAMA_XKV_LANDMARK_REFINE_BOUNDARY) {
+        throw std::invalid_argument("XKV landmark refine enum value is out of range");
+    }
+
+    if ((int)cparams.xkv_factorizer < (int)LLAMA_XKV_FACTORIZER_CPU_REFERENCE ||
+        (int)cparams.xkv_factorizer > (int)LLAMA_XKV_FACTORIZER_CUDA) {
+        throw std::invalid_argument("XKV factorizer enum value is out of range");
+    }
+
+    // Accepted factor types (§16): only F32, F16, Q8_0, Turbo2, Turbo3, Turbo4 (reject q4/q5/bf16 etc.)
+    auto is_accepted_factor_type = [](ggml_type t) {
+        return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 ||
+               t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+    };
+
+    if (!is_accepted_factor_type(cparams.xkv_factor_a_k) ||
+        !is_accepted_factor_type(cparams.xkv_factor_b_k) ||
+        !is_accepted_factor_type(cparams.xkv_factor_a_v) ||
+        !is_accepted_factor_type(cparams.xkv_factor_b_v)) {
+        throw std::invalid_argument("XKV factor codec type is not accepted (must be F32, F16, Q8_0, Turbo2, Turbo3, or Turbo4)");
+    }
+
+    // Landmark types allowed in reference/general mode: F32, F16, Q8_0, Turbo4
+    auto is_accepted_landmark_type = [](ggml_type t) {
+        return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 ||
+               t == GGML_TYPE_TURBO4_0;
+    };
+    if (!is_accepted_landmark_type(cparams.xkv_landmark_type)) {
+        throw std::invalid_argument("XKV landmark codec type is not accepted (must be F32, F16, Q8_0, or Turbo4)");
+    }
+
+    // Enabled mode enforces unified KV
+    if (!cparams.kv_unified) {
+        throw std::invalid_argument("XKV enabled requires unified KV; refusing to run without it");
+    }
+
+    // Enabled sizes must be positive
+    if (cparams.xkv_group_size == 0) {
+        throw std::invalid_argument("XKV group size must be positive (> 0)");
+    }
+    if (cparams.xkv_rank_k == 0) {
+        throw std::invalid_argument("XKV rank K must be positive (> 0)");
+    }
+    if (cparams.xkv_rank_v == 0) {
+        throw std::invalid_argument("XKV rank V must be positive (> 0)");
+    }
+    if (cparams.xkv_segment_tokens == 0) {
+        throw std::invalid_argument("XKV segment tokens must be positive (> 0)");
+    }
+    if (cparams.xkv_chunk_tokens == 0) {
+        throw std::invalid_argument("XKV chunk tokens must be positive (> 0)");
+    }
+    // chunk_tokens <= segment_tokens
+    if (cparams.xkv_chunk_tokens > cparams.xkv_segment_tokens) {
+        throw std::invalid_argument("XKV chunk tokens must be less than or equal to segment tokens (chunk_tokens <= segment_tokens)");
+    }
+    // SR mode requires sr_budget > 0
+    if (cparams.xkv_mode == LLAMA_XKV_MODE_SR && cparams.xkv_sr_budget == 0) {
+        throw std::invalid_argument("XKV SR mode requires sr_budget > 0 (--xkv-sr-budget)");
+    }
+    // Boundary refinement requires max_rows > 0
+    if (cparams.xkv_landmark_refine == LLAMA_XKV_LANDMARK_REFINE_BOUNDARY && cparams.xkv_landmark_refine_max_rows == 0) {
+        throw std::invalid_argument("XKV boundary landmark refinement requires landmark_refine_max_rows > 0");
+    }
+    if (cparams.xkv_workspace_mib == 0) {
+        throw std::invalid_argument("XKV workspace size must be positive (> 0 MiB)");
+    }
+
+    // cache <= workspace
+    if (cparams.xkv_decode_cache_mib > cparams.xkv_workspace_mib) {
+        throw std::invalid_argument("XKV decode-cache size must be less than or equal to workspace size (cache <= workspace)");
+    }
+
+    // Fractions finite and in range [0.0, 1.0]
+    if (!std::isfinite(cparams.xkv_min_saving) || cparams.xkv_min_saving < 0.0 || cparams.xkv_min_saving > 1.0) {
+        throw std::invalid_argument("XKV min saving fraction must be finite and within [0.0, 1.0]");
+    }
+    if (!std::isfinite(cparams.xkv_min_factor_coverage) || cparams.xkv_min_factor_coverage < 0.0 || cparams.xkv_min_factor_coverage > 1.0) {
+        throw std::invalid_argument("XKV min factor coverage fraction must be finite and within [0.0, 1.0]");
+    }
+
+    // Persistent store budget validation: store_mib cannot overflow bytes
+    if (cparams.xkv_store_mib > 0) {
+        if ((uint64_t)cparams.xkv_store_mib > UINT64_MAX / (1024ULL * 1024ULL)) {
+            throw std::invalid_argument("XKV store_mib budget overflows 64-bit integer bytes");
+        }
+    }
+    // Resolution contract: only common auto-fit resolves 0. By context
+    // creation DENSE/SR must carry a nonzero fitted budget (C API callers
+    // provide it directly); 0 is never unbounded. SHADOW/OFF keep none.
+    if (cparams.xkv_mode == LLAMA_XKV_MODE_DENSE || cparams.xkv_mode == LLAMA_XKV_MODE_SR) {
+        if (cparams.xkv_store_mib == 0) {
+            throw std::invalid_argument(
+                "XKV DENSE/SR requires a nonzero factor store budget (xkv_store_mib): "
+                "C API callers must provide the fitted budget from common auto-fit");
+        }
+    } else if (cparams.xkv_store_mib != 0) {
+        throw std::invalid_argument("XKV store budget requires DENSE/SR mode (SHADOW/OFF must use xkv_store_mib == 0)");
+    }
+
+    // CUDA factorizer rejected
+    if (cparams.xkv_factorizer == LLAMA_XKV_FACTORIZER_CUDA) {
+        throw std::invalid_argument("XKV CUDA factorizer is not supported; rejected");
+    }
+
+    auto is_turbo_type = [](ggml_type t) {
+        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+    };
+
+    // Production factor profiles require four Turbo2/3/4 streams
+    if (cparams.xkv_storage_profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS ||
+        cparams.xkv_storage_profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS) {
+        if (!is_turbo_type(cparams.xkv_factor_a_k) ||
+            !is_turbo_type(cparams.xkv_factor_b_k) ||
+            !is_turbo_type(cparams.xkv_factor_a_v) ||
+            !is_turbo_type(cparams.xkv_factor_b_v)) {
+            throw std::invalid_argument("XKV production factor profiles (tq-factors / tq-factors-landmarks) require four Turbo2/3/4 streams for A_K, B_K, A_V, and B_V");
+        }
+    }
+
+    // Production landmarks require exactly Q8_0 or Turbo4
+    if (cparams.xkv_storage_profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS) {
+        const bool valid_lm = (cparams.xkv_landmark_type == GGML_TYPE_Q8_0 || cparams.xkv_landmark_type == GGML_TYPE_TURBO4_0);
+        if (!valid_lm) {
+            throw std::invalid_argument("XKV production landmarks profile requires exactly Q8_0 (q8_0) or Turbo4 (turbo4_0) landmark type");
+        }
+    }
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -96,9 +716,14 @@ llama_context::llama_context(
     const auto & hparams = model.hparams;
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
+    cparams.n_seq_max_pp = params.n_seq_max_pp == 0 ? cparams.n_seq_max : std::max(1u, params.n_seq_max_pp);
+    cparams.n_seq_recurrent = params.n_seq_recurrent == 0 ? cparams.n_seq_max : std::max(1u, std::min(params.n_seq_recurrent, cparams.n_seq_max));
     cparams.n_outputs_max = params.n_outputs_max;
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
+    }
+    if (cparams.n_seq_max_pp > cparams.n_seq_max) {
+        throw std::runtime_error("n_seq_max_pp must be <= n_seq_max");
     }
 
     cparams.n_rs_seq = params.n_rs_seq;
@@ -125,6 +750,9 @@ llama_context::llama_context(
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
     embd_layer_inp.resize(hparams.n_layer() + 1);
 
+    cparams.attention_q_pre_rope.resize(hparams.n_layer(), false);
+    attention_q_pre_rope.resize(hparams.n_layer());
+
     cparams.ctx_type     = params.ctx_type;
     cparams.pooling_type = params.pooling_type;
 
@@ -140,6 +768,13 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
     cparams.ctx_other = nullptr;
+
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.ctx_other != nullptr) {
+        compute_pool.reset(ggml_backend_sched_compute_pool_ref(params.ctx_other->get_compute_pool()));
+        LLAMA_LOG_INFO("%s: sharing compute buffers with ctx_other\n", __func__);
+    } else {
+        compute_pool.reset(ggml_backend_sched_compute_pool_new());
+    }
 
     // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -266,9 +901,78 @@ llama_context::llama_context(
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
+    const uint32_t n_outputs_min = params.rerot
+        ? std::max(1u, params.n_pen_max)
+        : cparams.n_seq_max;
+    cparams.n_outputs_max = std::max(cparams.n_outputs_max, n_outputs_min);
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.kv_size_explicit = params.n_ctx_kv != 0;
+    cparams.triattention_enabled = params.triattention;
+    cparams.triattention_ratio = params.triattention_ratio;
+    cparams.rerot_enabled = params.rerot;
+    cparams.rerot_frontier = params.rerot_frontier;
+    cparams.n_person_max = params.n_person_max;
+    cparams.n_pen_max = params.n_pen_max;
+    cparams.n_brain_rows = params.n_person_max;
+    cparams.n_hand_rows = params.n_pen_max;
+
+    // XKV (§16) parameters
+    cparams.xkv_mode                     = params.xkv_mode;
+    cparams.xkv_storage_profile          = params.xkv_storage_profile;
+    cparams.xkv_group_size               = params.xkv_group_size;
+    cparams.xkv_rank_k                   = params.xkv_rank_k;
+    cparams.xkv_rank_v                   = params.xkv_rank_v;
+    cparams.xkv_segment_tokens           = params.xkv_segment_tokens;
+    cparams.xkv_chunk_tokens             = params.xkv_chunk_tokens;
+    cparams.xkv_sr_budget                = params.xkv_sr_budget;
+    cparams.xkv_source                   = params.xkv_source;
+    cparams.xkv_factor_a_k               = params.xkv_factor_a_k;
+    cparams.xkv_factor_b_k               = params.xkv_factor_b_k;
+    cparams.xkv_factor_a_v               = params.xkv_factor_a_v;
+    cparams.xkv_factor_b_v               = params.xkv_factor_b_v;
+    cparams.xkv_factor_balance           = params.xkv_factor_balance;
+    cparams.xkv_landmark_type            = params.xkv_landmark_type;
+    cparams.xkv_landmark_refine          = params.xkv_landmark_refine;
+    cparams.xkv_landmark_refine_max_rows = params.xkv_landmark_refine_max_rows;
+    cparams.xkv_workspace_mib            = params.xkv_workspace_mib;
+    cparams.xkv_decode_cache_mib         = params.xkv_decode_cache_mib;
+    cparams.xkv_store_mib                = params.xkv_store_mib;
+    cparams.xkv_seed                     = params.xkv_seed;
+    cparams.xkv_min_saving               = params.xkv_min_saving;
+    cparams.xkv_min_factor_coverage      = params.xkv_min_factor_coverage;
+    cparams.xkv_factorizer               = params.xkv_factorizer;
+
+    if (llama_xkv_is_enabled(cparams.xkv_mode)) {
+        cparams.kv_unified = true;
+    }
+
+    llama_xkv_validate_cparams(cparams);
+
+    // FlashPrefill V2 policy: immutable for the context lifetime.
+    // ConfigIntegration owns params.flashprefill (default OFF via
+    // llama_flashprefill_default_config()); strict-validate here so a broken
+    // config fails context creation instead of silently routing dense later.
+    cparams.flashprefill = params.flashprefill;
+    if (const llama_flashprefill_error fp_err = llama_flashprefill_validate_config(&cparams.flashprefill);
+            fp_err != LLAMA_FLASHPREFILL_OK) {
+        throw std::runtime_error(format("invalid flashprefill config: %s", llama_flashprefill_error_name(fp_err)));
+    }
+
+    // Conservative per-context identity: assigned only when the policy is
+    // enabled, 0 when OFF (OFF contexts use the legacy stateless path and
+    // carry no isolation identity — including no randomness: the process
+    // nonce is only generated for enabled contexts). The serial is unique
+    // within this process; the nonce fixes the process lifetime, and the
+    // envelope compares both exact. Construction-time only; no decode-path
+    // synchronization is introduced.
+    if (llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        fp_serial = flashprefill_next_serial();
+        const auto fp_nonce = flashprefill_process_nonce();
+        fp_nonce0 = fp_nonce.first;
+        fp_nonce1 = fp_nonce.second;
+    }
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -287,7 +991,26 @@ llama_context::llama_context(
 
     if (cparams.kv_unified) {
         cparams.n_ctx_seq = cparams.n_ctx;
+
+        constexpr uint32_t n_ctx_kv_max = UINT32_MAX - (UINT32_MAX % 256);
+        if (params.n_ctx_kv > n_ctx_kv_max) {
+            throw std::runtime_error(format("n_ctx_kv (%u) exceeds the maximum aligned capacity (%u)", params.n_ctx_kv, n_ctx_kv_max));
+        }
+        cparams.n_ctx_kv = params.n_ctx_kv == 0 ? cparams.n_ctx_seq : GGML_PAD(params.n_ctx_kv, 256);
+
+        if (!params.triattention && cparams.n_ctx_kv < cparams.n_ctx_seq) {
+            throw std::runtime_error(format("n_ctx_kv (%u) must be at least n_ctx_seq (%u)", cparams.n_ctx_kv, cparams.n_ctx_seq));
+        }
+
+        if (params.triattention && cparams.n_ctx_kv < cparams.n_ubatch + cparams.triattention_recent_window) {
+            throw std::runtime_error(format("n_ctx_kv (%u) too small for TriAttention (need at least n_ubatch (%u) + recent_window (%u))",
+                cparams.n_ctx_kv, cparams.n_ubatch, cparams.triattention_recent_window));
+        }
     } else {
+        if (params.n_ctx_kv != 0) {
+            LLAMA_LOG_WARN("%s: n_ctx_kv is ignored when kv_unified is disabled\n", __func__);
+        }
+
         cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
         cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
 
@@ -299,16 +1022,44 @@ llama_context::llama_context(
             cparams.n_ctx =  cparams.n_ctx_seq * cparams.n_seq_max;
             LLAMA_LOG_WARN("%s: n_ctx is not divisible by n_seq_max - rounding down to %u\n", __func__, cparams.n_ctx);
         }
+
+        cparams.n_ctx_kv = cparams.n_ctx_seq;
     }
 
     LLAMA_LOG_INFO("%s: n_seq_max     = %u\n",   __func__, cparams.n_seq_max);
+    LLAMA_LOG_INFO("%s: n_seq_recur   = %u\n",   __func__, cparams.n_seq_recurrent);
     LLAMA_LOG_INFO("%s: n_ctx         = %u\n",   __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_ctx_seq     = %u\n",   __func__, cparams.n_ctx_seq);
+    LLAMA_LOG_INFO("%s: n_ctx_kv      = %u\n",   __func__, cparams.n_ctx_kv);
     LLAMA_LOG_INFO("%s: n_batch       = %u\n",   __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch      = %u\n",   __func__, cparams.n_ubatch);
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+    LLAMA_LOG_INFO("%s: rerot         = %s\n",   __func__, cparams.rerot_enabled ? "true" : "false");
+    if (cparams.rerot_enabled) {
+        LLAMA_LOG_INFO("%s: rerot frontier= %s\n", __func__, llama_rerot_frontier_mode_name(cparams.rerot_frontier));
+    }
+    if (llama_xkv_is_enabled(cparams.xkv_mode)) {
+        LLAMA_LOG_INFO("%s: xkv requested mode     = %s\n", __func__, llama_xkv_mode_name(params.xkv_mode));
+        LLAMA_LOG_INFO("%s: xkv effective mode     = %s\n", __func__, llama_xkv_mode_name(cparams.xkv_mode));
+        LLAMA_LOG_INFO("%s: xkv requested profile  = %s\n", __func__, llama_xkv_storage_profile_name(params.xkv_storage_profile));
+        LLAMA_LOG_INFO("%s: xkv effective profile  = %s\n", __func__, llama_xkv_storage_profile_name(cparams.xkv_storage_profile));
+        LLAMA_LOG_INFO("%s: xkv requested source   = %s\n", __func__, llama_xkv_source_name(params.xkv_source));
+        LLAMA_LOG_INFO("%s: xkv effective source   = %s\n", __func__, llama_xkv_source_name(cparams.xkv_source));
+        LLAMA_LOG_INFO("%s: xkv requested codecs   = A_K:%s, B_K:%s, A_V:%s, B_V:%s, landmark:%s\n", __func__,
+            ggml_type_name(params.xkv_factor_a_k), ggml_type_name(params.xkv_factor_b_k),
+            ggml_type_name(params.xkv_factor_a_v), ggml_type_name(params.xkv_factor_b_v),
+            ggml_type_name(params.xkv_landmark_type));
+        LLAMA_LOG_INFO("%s: xkv effective codecs   = A_K:%s, B_K:%s, A_V:%s, B_V:%s, landmark:%s\n", __func__,
+            ggml_type_name(cparams.xkv_factor_a_k), ggml_type_name(cparams.xkv_factor_b_k),
+            ggml_type_name(cparams.xkv_factor_a_v), ggml_type_name(cparams.xkv_factor_b_v),
+            ggml_type_name(cparams.xkv_landmark_type));
+        LLAMA_LOG_INFO("%s: xkv requested budgets  = workspace:%u MiB, decode_cache:%u MiB, sr_budget:%u\n", __func__,
+            params.xkv_workspace_mib, params.xkv_decode_cache_mib, params.xkv_sr_budget);
+        LLAMA_LOG_INFO("%s: xkv effective budgets  = workspace:%u MiB, decode_cache:%u MiB, sr_budget:%u\n", __func__,
+            cparams.xkv_workspace_mib, cparams.xkv_decode_cache_mib, cparams.xkv_sr_budget);
+    }
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq      = %u\n",   __func__, cparams.n_rs_seq);
@@ -369,7 +1120,7 @@ llama_context::llama_context(
 
         // graph outputs buffer
         {
-            if (output_reserve(params.n_seq_max) < params.n_seq_max) {
+            if (output_reserve(n_outputs_min) < n_outputs_min) {
                 throw std::runtime_error("failed to reserve initial output buffer");
             }
 
@@ -382,14 +1133,85 @@ llama_context::llama_context(
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
-            /*.type_k    =*/ params.type_k,
-            /*.type_v    =*/ params.type_v,
-            /*.swa_full  =*/ params.swa_full,
-            /*.ctx_type  =*/ cparams.ctx_type,
-            /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.type_k               =*/ params.type_k,
+            /*.type_v               =*/ params.type_v,
+            /*.swa_full             =*/ params.swa_full,
+            /*.ctx_type             =*/ cparams.ctx_type,
+            /*.mem_other            =*/ llama_get_memory(cparams.ctx_other),
+            /*.triattention_enabled =*/ params.triattention,
+            /*.triattention_stats   =*/ params.triattention_stats,
+            /*.xkv_mode             =*/ cparams.xkv_mode,
+            /*.xkv_segment_tokens   =*/ cparams.xkv_segment_tokens,
+            /*.xkv_chunk_tokens     =*/ cparams.xkv_chunk_tokens,
+            /*.n_ubatch             =*/ cparams.n_ubatch,
+            /*.n_batch              =*/ cparams.n_batch,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        if (params.triattention) {
+            if (!params.triattention_stats || params.triattention_stats[0] == '\0') {
+                throw std::runtime_error("TriAttention enabled but no stats file provided (use --triattention-stats)");
+            }
+
+            bool initialized = false;
+            auto init_tri = [&](llama_kv_cache * kv) {
+                if (kv) {
+                    kv->init_triattention(params.triattention_stats,
+                        cparams.triattention_ratio, cparams.triattention_recent_window, cparams);
+                    initialized = true;
+                }
+            };
+
+            if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
+                init_tri(kv);
+            } else if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
+                init_tri(iswa->get_base());
+            } else if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+                init_tri(hyb->get_mem_attn());
+            } else if (auto * hyb_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get())) {
+                if (auto * iswa = hyb_iswa->get_mem_attn()) {
+                    init_tri(iswa->get_base());
+                }
+            }
+
+            if (!initialized) {
+                throw std::runtime_error("Failed to find KV cache for TriAttention initialization");
+            }
+        }
+
+        if (cparams.xkv_mode != LLAMA_XKV_MODE_OFF) {
+            if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                // MTP draft context cache contains only speculative tail layers:
+                // null store/pool and zero XKV allocation.
+            } else {
+            bool initialized = false;
+            auto init_xkv = [&](llama_kv_cache * kv) {
+                if (kv) {
+                    kv->init_xkv_store(cparams);
+                    initialized = true;
+                }
+            };
+
+            if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
+                init_xkv(kv);
+            } else if (auto * iswa = dynamic_cast<llama_kv_cache_iswa *>(memory.get())) {
+                init_xkv(iswa->get_base());
+            } else if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+                init_xkv(hyb->get_mem_attn());
+            } else if (auto * hyb_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(memory.get())) {
+                if (auto * iswa = hyb_iswa->get_mem_attn()) {
+                    init_xkv(iswa->get_base());
+                }
+            }
+
+            if (!initialized) {
+                throw std::runtime_error("Failed to find KV cache for XKV initialization");
+            }
+            }
+        }
+    } else if (cparams.xkv_mode != LLAMA_XKV_MODE_OFF) {
+        throw std::runtime_error("Failed to find KV cache for XKV initialization");
     }
 
     // init backends
@@ -475,27 +1297,96 @@ llama_context::llama_context(
     }
 }
 
+llama_context::llama_context(const llama_model & model_in, const llama_cparams & cp, bool /* test_only */)
+    : model(model_in),
+      cparams(cp),
+      t_start_us(ggml_time_us()),
+      t_load_us(0) {
+    cparams.rerot_enabled = cp.rerot_enabled;
+    cparams.rerot_frontier = cp.rerot_frontier;
+
+    // Ensure test-only ctor initializes/validates no XKV/store resources
+    const struct llama_xkv_params xkv_defaults = llama_xkv_default_params();
+    cparams.xkv_mode                     = (enum llama_xkv_mode) LLAMA_XKV_MODE_OFF;
+    cparams.xkv_storage_profile          = (enum llama_xkv_storage_profile) xkv_defaults.storage_profile;
+    cparams.xkv_group_size               = xkv_defaults.group_size;
+    cparams.xkv_rank_k                   = xkv_defaults.rank_k;
+    cparams.xkv_rank_v                   = xkv_defaults.rank_v;
+    cparams.xkv_segment_tokens           = xkv_defaults.segment_tokens;
+    cparams.xkv_chunk_tokens             = xkv_defaults.chunk_tokens;
+    cparams.xkv_sr_budget                = xkv_defaults.sr_budget;
+    cparams.xkv_source                   = xkv_defaults.source;
+    cparams.xkv_factor_a_k               = xkv_defaults.factor_a_k;
+    cparams.xkv_factor_b_k               = xkv_defaults.factor_b_k;
+    cparams.xkv_factor_a_v               = xkv_defaults.factor_a_v;
+    cparams.xkv_factor_b_v               = xkv_defaults.factor_b_v;
+    cparams.xkv_factor_balance           = xkv_defaults.factor_balance;
+    cparams.xkv_landmark_type            = xkv_defaults.landmark_type;
+    cparams.xkv_landmark_refine          = xkv_defaults.landmark_refine;
+    cparams.xkv_landmark_refine_max_rows = xkv_defaults.landmark_refine_max_rows;
+    cparams.xkv_workspace_mib            = xkv_defaults.workspace_mib;
+    cparams.xkv_decode_cache_mib         = xkv_defaults.decode_cache_mib;
+    cparams.xkv_store_mib                = xkv_defaults.store_mib;
+    cparams.xkv_seed                     = xkv_defaults.seed;
+    cparams.xkv_min_saving               = xkv_defaults.min_saving;
+    cparams.xkv_min_factor_coverage      = xkv_defaults.min_factor_coverage;
+    cparams.xkv_factorizer               = xkv_defaults.factorizer;
+
+    // FlashPrefill: unit-test cparams may be zero-initialized (version 0),
+    // which is not a valid config. Normalize to default OFF instead of
+    // throwing so legacy control-plane tests keep working; the production
+    // constructor above strictly validates instead.
+    if (llama_flashprefill_validate_config(&cparams.flashprefill) != LLAMA_FLASHPREFILL_OK) {
+        cparams.flashprefill = llama_flashprefill_default_config();
+    }
+    if (llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        fp_serial = flashprefill_next_serial();
+        const auto fp_nonce = flashprefill_process_nonce();
+        fp_nonce0 = fp_nonce.first;
+        fp_nonce1 = fp_nonce.second;
+    }
+    opt_ctx = nullptr;
+    sched_need_reserve = false;
+}
+
 llama_context::~llama_context() {
+    // RERoT: drop per-context episode gate so a destroyed context never leaves
+    // a dangling registry key. OFF: map is empty, single lookup, no behavior change.
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        g_rerot_states.erase(this);
+    }
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
-    if (!model.hparams.no_alloc) {
+    if (sched) {
+        ggml_backend_sched_reset(sched.get());
+    }
+
+    if (sched && !model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
             ggml_backend_buffer_type_t buft    = backend_buft[i];
 
             const size_t size_exp = backend_buf_exp_size[i];
             const size_t size_act = ggml_backend_sched_get_buffer_size(sched.get(), backend);
-            if (size_exp == size_act) {
-                LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, matches expectation of %8.4f MiB\n",
+            if (size_act >= size_exp) {
+                LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, requirement is %8.4f MiB\n",
                     __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
             } else {
-                LLAMA_LOG_WARN("%s: %10s compute buffer size of %8.4f MiB, does not match expectation of %8.4f MiB\n",
+                LLAMA_LOG_WARN("%s: %10s compute buffer size of %8.4f MiB is below requirement of %8.4f MiB\n",
                     __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
             }
         }
     }
-    ggml_opt_free(opt_ctx);
+    if (opt_ctx) {
+        ggml_opt_free(opt_ctx);
+        opt_ctx = nullptr;
+    }
+
+    if (sched) {
+        ggml_backend_sched_reset(sched.get());
+    }
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -559,6 +1450,8 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_gdn_ch_probe, cparams.fused_gdn_ch);
         cparams.auto_fgdn = false;
     }
+    LLAMA_LOG_ERROR("[gdn-resolve] final fused_gdn_ar=%d fused_gdn_ch=%d\n",
+        (int) cparams.fused_gdn_ar, (int) cparams.fused_gdn_ch);
 
     if (cparams.auto_flid) {
         LLAMA_LOG_INFO("%s: resolving fused Lightning Indexer support:\n", func);
@@ -586,19 +1479,39 @@ void llama_context::sched_reserve() {
 
     synchronize();
 
+    if (sched) {
+        ggml_backend_sched_reset(sched.get());
+    }
+
     const int64_t t_start_us = ggml_time_us();
 
-    const uint32_t n_seqs = cparams.n_seq_max;
+    const uint32_t n_seqs_pp = cparams.n_seq_max_pp;
+    uint32_t n_seqs_tg = cparams.n_seq_max;
+    if (memory) {
+        const uint32_t recurrent_capacity = memory->get_recurrent_capacity();
+        if (recurrent_capacity > 0) {
+            n_seqs_tg = std::min(n_seqs_tg, recurrent_capacity);
+        }
+    }
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
-    const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    // The full reserve memory context exposes all TG KV streams, even when the PP graph
+    // itself is reserved for fewer sequences. Attention splits Q across those KV streams,
+    // so the synthetic PP token count must be divisible by both sequence counts.
+    const uint32_t n_pp_align = std::lcm(n_seqs_pp, n_seqs_tg);
+    const uint32_t n_tokens_pp = ((n_tokens + n_pp_align - 1) / n_pp_align) * n_pp_align;
+
+    const size_t max_nodes = this->graph_max_nodes(n_tokens_pp);
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    sched.reset(ggml_backend_sched_new_shared(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload, compute_pool.get()));
+    if (memory) {
+        memory->set_backend_sched(sched.get());
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -610,11 +1523,12 @@ void llama_context::sched_reserve() {
     }
 
     // avoid reserving graphs with zero outputs - assume one output per sequence
-    const int n_outputs = n_seqs;
+    const int n_outputs = n_seqs_tg;
 
-    LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
+    LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_tokens_pp = %d, n_seqs_pp = %d, n_seqs_tg = %d, n_outputs = %d\n",
+            __func__, n_tokens, n_tokens_pp, n_seqs_pp, n_seqs_tg, n_outputs);
 
-    resolve_fused_ops(mctx.get(), n_seqs);
+    resolve_fused_ops(mctx.get(), n_seqs_tg);
 
     // reserve worst-case graph
     int n_splits_pp = -1;
@@ -627,14 +1541,17 @@ void llama_context::sched_reserve() {
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
+        auto * gf = graph_reserve(n_tokens_pp, n_seqs_pp, n_outputs_pp, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
-                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+                sched.reset(ggml_backend_sched_new_shared(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload, compute_pool.get()));
+                if (memory) {
+                    memory->set_backend_sched(sched.get());
+                }
+                gf = graph_reserve(n_tokens_pp, n_seqs_pp, n_outputs_pp, mctx.get());
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
@@ -647,9 +1564,21 @@ void llama_context::sched_reserve() {
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
     {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
+        std::vector<size_t> sizes_tg;
+        if (model.hparams.no_alloc) {
+            sizes_tg.resize(backend_buf_exp_size.size());
+        }
+
+        auto * gf = graph_reserve(n_seqs_tg, n_seqs_tg, n_seqs_tg, mctx.get(),
+                model.hparams.no_alloc, model.hparams.no_alloc ? sizes_tg.data() : nullptr);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
+        }
+
+        if (model.hparams.no_alloc) {
+            for (size_t i = 0; i < backend_buf_exp_size.size(); ++i) {
+                backend_buf_exp_size[i] = std::max(backend_buf_exp_size[i], sizes_tg[i]);
+            }
         }
 
         n_splits_tg = ggml_backend_sched_get_n_splits(sched.get());
@@ -662,7 +1591,7 @@ void llama_context::sched_reserve() {
         //
         // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
         //
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_tokens_pp, n_seqs_pp, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
@@ -700,7 +1629,7 @@ void llama_context::sched_reserve() {
 }
 
 void llama_context::synchronize() {
-    if (!sched) {
+    if (!sched || n_queued_tokens == 0) {
         return;
     }
 
@@ -745,12 +1674,20 @@ ggml_backend_sched_t llama_context::get_sched() const {
     return sched.get();
 }
 
+ggml_backend_sched_compute_pool_t llama_context::get_compute_pool() const {
+    return compute_pool.get();
+}
+
 uint32_t llama_context::n_ctx() const {
     return cparams.n_ctx;
 }
 
 uint32_t llama_context::n_ctx_seq() const {
     return cparams.n_ctx_seq;
+}
+
+uint32_t llama_context::n_ctx_kv() const {
+    return cparams.n_ctx_kv;
 }
 
 uint32_t llama_context::n_batch() const {
@@ -805,6 +1742,7 @@ bool llama_context::memory_update(bool optimize) {
         // reset the previous graph result to make sure that it won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
+        ggml_backend_sched_reset(sched.get());
         gf_res_prev->reset();
 
         if (!mctx->apply()) {
@@ -831,6 +1769,28 @@ bool llama_context::memory_update(bool optimize) {
     }
 
     return true;
+}
+
+llama_memory_kv_reclaim_result llama_context::memory_reclaim_kv(const llama_memory_kv_reclaim_request & request) {
+    llama_memory_kv_reclaim_result result;
+    if (!memory) {
+        return result;
+    }
+
+    // Synchronize before reclaim — wait for any pending compute
+    ggml_backend_sched_synchronize(sched.get());
+
+    result = memory->reclaim_kv(request);
+
+    if (result.changed) {
+        // Invalidate the current graph so the next decode re-reserves
+        // the worst-case compute buffers. We do NOT clear memory data —
+        // only the compute graph reservation is invalidated.
+        sched_need_reserve = true;
+        gf_res_prev->reset();
+    }
+
+    return result;
 }
 
 enum llama_pooling_type llama_context::pooling_type() const {
@@ -974,6 +1934,12 @@ float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
     GGML_ASSERT(lid < embd_layer_inp.size() && embd_layer_inp[lid].has_data());
 
     return embd_layer_inp[lid].data;
+}
+
+float * llama_context::get_attention_q_pre_rope(uint32_t lid) {
+    GGML_ASSERT(lid < attention_q_pre_rope.size() && attention_q_pre_rope[lid].has_data());
+
+    return attention_q_pre_rope[lid].data;
 }
 
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
@@ -1174,6 +2140,15 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     sched_need_reserve = true;
 }
 
+void llama_context::set_attention_q_pre_rope(uint32_t lid, bool enable) {
+    LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
+
+    GGML_ASSERT(lid < model.hparams.n_layer());
+
+    cparams.attention_q_pre_rope[lid] = enable;
+    sched_need_reserve = true;
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -1260,11 +2235,34 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     return true;
 }
 
-void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
+bool llama_context::flashprefill_adapter_change_allowed() const {
+    // Refuse only the genuinely unsafe combination: an enabled policy (stale
+    // KV would be consumed by approximate paths) atop an active episode
+    // (clearing would orphan lineage, leaving it would mix old-weight KV with
+    // new adapters). Everything else has a safe landing (OFF legacy behavior,
+    // or enabled-only clear + re-prefill), so it is allowed.
+    if (llama_flashprefill_is_enabled(&cparams.flashprefill) &&
+        cparams.rerot_enabled && llama_rerot_ctx_is_active(this)) {
+        return false;
+    }
+    return true;
+}
+
+bool llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
     if (adapters_lora_are_same(adapters, n_adapters, scales)) {
-        return;
+        return true;
+    }
+
+    // Effective change with nowhere safe to land: refuse BEFORE applying, with
+    // zero mutation (adapters, generation, KV, graph, and schedule untouched),
+    // so the in-flight coherent graph stays valid. The caller surfaces the
+    // existing error contract (C API: -1).
+    if (!flashprefill_adapter_change_allowed()) {
+        LLAMA_LOG_ERROR("%s: refusing LoRA change: FlashPrefill is enabled atop an active RERoT episode, where stale KV can neither be cleared nor reused — end the episode (or disable the policy) and retry\n",
+                __func__);
+        return false;
     }
 
     loras.reset(new llama_adapter_loras());
@@ -1275,7 +2273,14 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
         }
     }
 
+    // Effective adapter set changed: retire the FlashPrefill state identity
+    // (pre-switch blobs/RAM reject on load). Resident KV keeps baseline
+    // semantics — never deleted here; the server owns per-slot compatibility.
+    flashprefill_on_adapter_change();
+
     sched_need_reserve = true;
+
+    return true;
 }
 
 bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
@@ -1312,12 +2317,42 @@ bool llama_context::set_adapter_cvec(
                 int32_t   il_end) {
     LLAMA_LOG_DEBUG("%s: il_start = %d, il_end = %d\n", __func__, il_start, il_end);
 
+    // Same pre-apply refusal as set_adapters_lora: an effective cvec change
+    // with nowhere safe to land is refused with zero mutation (existing bool
+    // error contract: false). cvec has no identical-set fast path, so every
+    // call counts as effective once it would apply.
+    if (!flashprefill_adapter_change_allowed()) {
+        LLAMA_LOG_ERROR("%s: refusing cvec change: FlashPrefill is enabled atop an active RERoT episode, where stale KV can neither be cleared nor reused — end the episode (or disable the policy) and retry\n",
+                __func__);
+        return false;
+    }
+
     bool res = cvec->apply(model, data, len, n_embd, il_start, il_end);
+
+    // Only a successful apply mutates the effective adapters: failed applies
+    // change nothing and must not invalidate saved state. On success retire
+    // the FlashPrefill state identity (same rule as set_adapters_lora above;
+    // resident KV keeps baseline semantics, never deleted).
+    if (res) {
+        flashprefill_on_adapter_change();
+    }
 
     sched_need_reserve = true;
 
     return res;
 }
+
+struct llama_compute_guard {
+    ggml_backend_sched_t sched;
+
+    explicit llama_compute_guard(ggml_backend_sched_t sched) : sched(sched) {
+        ggml_backend_sched_compute_begin(sched);
+    }
+
+    ~llama_compute_guard() {
+        ggml_backend_sched_compute_end(sched);
+    }
+};
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
@@ -1326,6 +2361,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    struct postcompute_guard {
+        llama_memory_context_i * mctx;
+        bool dismissed = false;
+        ~postcompute_guard() {
+            if (!dismissed && mctx) {
+                mctx->postcompute_failure();
+            }
+        }
+    } guard{mctx, false};
+
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
@@ -1333,7 +2378,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    // Bounded-XKV stale retry: snapshot+graph are rebuilt WITHOUT re-applying
+    // mctx/cells (apply() ran once above; KV writes re-execute idempotently
+    // into the same cells). Bounded graphs never reuse
+    // (llm_graph_input_xkv::can_reuse is false), so every attempt rebuilds
+    // with fresh stamps. Exhaustion fails stale at the outer batch boundary;
+    // stale output is never committed.
+    constexpr int kXkvStaleMaxRetries = 2;
+    int xkv_stale_left = kXkvStaleMaxRetries;
+    bool xkv_retry = false;
+    do {
+        xkv_retry = false;
+
+    if (!graph_reuse_disable && ggml_backend_sched_is_allocated(sched.get()) && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1384,6 +2441,56 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // graph_compute submits asynchronously: fence the scheduler so KV writes
+    // (and graph callbacks) are byte-complete before postcompute_success may
+    // transition hot rows to hot_committed. MTP sealing/state depend on it.
+    // Byte-complete fence for bounded XKV only: xkv_has_bounded gates the
+    // extra sync so OFF/SHADOW preserve baseline synchronization exactly.
+    // The fence is counted as part of the commit protocol (hot_committed
+    // means K/V bytes complete; never expose committed bytes in flight).
+    const bool xkv_bounded = res->xkv_has_bounded();
+    if (xkv_bounded) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+
+    // Bounded-XKV post-sync poll: stale/codec/workspace callback status must
+    // turn into retry/hard failure here, before postcompute_success may
+    // commit. A zeroed attention tensor alone is never success.
+    if (xkv_bounded) {
+        std::string xkv_err;
+        const int xkv_action = res->xkv_poll_postcompute(&xkv_err);
+        if (xkv_action == 2) {
+            LLAMA_LOG_ERROR("%s: XKV postcompute hard failure: %s\n", __func__, xkv_err.c_str());
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        if (xkv_action == 1) {
+            if (xkv_stale_left-- > 0) {
+                LLAMA_LOG_WARN("%s: XKV stale stamp, rebuilding snapshot/graph without re-applying cells (%d retries left)\n",
+                    __func__, xkv_stale_left);
+                xkv_retry = true;
+                continue;
+            }
+            LLAMA_LOG_ERROR("%s: XKV stale stamp, retry budget exhausted, failing at outer batch boundary: %s\n",
+                __func__, xkv_err.c_str());
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+    }
+    } while (xkv_retry);
+
+    if (mctx) {
+        // Dismissal happens only after a successful commit. On false the
+        // guard stays armed and runs the idempotent postcompute_failure
+        // rollback; the batch is treated as failed, never as decoded.
+        if (!mctx->postcompute_success()) {
+            LLAMA_LOG_ERROR("%s: postcompute commit failed\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        guard.dismissed = true;
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -1457,6 +2564,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     cparams.causal_attn = false;
 
     ggml_status status;
+    llama_compute_guard compute_guard(sched.get());
     const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
 
     cparams.causal_attn = causal_attn_org;
@@ -1700,6 +2808,703 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    // Ordinary external path: unknown execution role, conservative dense.
+    // Any snapshot from a previous explicit call never leaks into this one.
+    // OFF-gated single mode check: the config is immutable and validated at
+    // construction, so OFF implies empty snapshots/rows (no stale rows
+    // possible) and the clear is skipped entirely on the normal API path.
+    if (cparams.flashprefill.mode != LLAMA_FLASHPREFILL_MODE_OFF) {
+        flashprefill_clear_call();
+    }
+    return decode_impl(batch_inp);
+}
+
+int llama_context::decode_with_flashprefill(const llama_batch & batch_inp, const llama_flashprefill_exec * exec) {
+    // Explicit versioned path (public declaration owned by ConfigIntegration).
+    flashprefill_clear_call();
+    if (exec == nullptr) {
+        // NULL == ordinary dense (unknown roles); matches legacy decode.
+        return decode_impl(batch_inp);
+    }
+    // Validate + copy before any memory/graph state mutates or async work
+    // submits. Rejection returns -1 with the context untouched.
+    if (!flashprefill_attach_call(batch_inp, exec)) {
+        return -1;
+    }
+    return decode_impl(batch_inp);
+}
+
+void llama_context::flashprefill_clear_call() {
+    fp_rows_call.clear();
+    fp_rows_ubatch.clear();
+    fp_exec_active = false;
+    // Drop the graph-visible snapshot as well: every consumption site sets it
+    // before building graph params, so no stale rows can leak across calls.
+    cparams.flashprefill_rows.reset();
+}
+
+bool llama_context::flashprefill_bypassed() const {
+    // MTP contexts keep the pre-existing draft/verify attention path, and
+    // embedding/rerank pooling keeps the generation-independent path, no
+    // matter what row roles an explicit exec carries. Existing stage-specific
+    // MTP behavior and the TriAttention lifecycle are otherwise untouched.
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return true;
+    }
+    if (cparams.embeddings || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
+        return true;
+    }
+    return false;
+}
+
+bool llama_context::flashprefill_attach_call(const llama_batch & batch_inp, const llama_flashprefill_exec * exec) {
+    // Precondition: state cleared by the caller; exec non-NULL.
+    if (exec->version != LLAMA_FLASHPREFILL_EXEC_VERSION) {
+        LLAMA_LOG_ERROR("%s: flashprefill exec version mismatch (got %u, want %u)\n",
+                __func__, exec->version, (uint32_t) LLAMA_FLASHPREFILL_EXEC_VERSION);
+        return false;
+    }
+    if (exec->struct_size != sizeof(llama_flashprefill_exec)) {
+        LLAMA_LOG_ERROR("%s: flashprefill exec struct_size mismatch (got %u, want %zu)\n",
+                __func__, exec->struct_size, sizeof(llama_flashprefill_exec));
+        return false;
+    }
+    if (batch_inp.n_tokens < 0 || exec->n_rows != (uint32_t) batch_inp.n_tokens) {
+        LLAMA_LOG_ERROR("%s: flashprefill exec n_rows (%u) != batch n_tokens (%d)\n",
+                __func__, exec->n_rows, batch_inp.n_tokens);
+        return false;
+    }
+    if (llama_flashprefill_validate_exec(exec) != LLAMA_FLASHPREFILL_OK) {
+        LLAMA_LOG_ERROR("%s: flashprefill exec failed validation\n", __func__);
+        return false;
+    }
+    if (exec->n_rows == 0) {
+        return true; // empty view: nothing to copy, dense by construction
+    }
+    // Bypassed calls and OFF policy allocate no per-row arrays: dense path.
+    if (flashprefill_bypassed() || !llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        return true;
+    }
+    // Per-row validation: role/interval well-formedness plus sequence
+    // identity and logical-prompt boundary checks against this batch.
+    for (uint32_t i = 0; i < exec->n_rows; ++i) {
+        const llama_flashprefill_row & row = exec->rows[i];
+        if (llama_flashprefill_validate_row(&row) != LLAMA_FLASHPREFILL_OK) {
+            LLAMA_LOG_ERROR("%s: flashprefill row %u failed validation\n", __func__, i);
+            return false;
+        }
+        if (row.seq_id != LLAMA_FLASHPREFILL_SEQ_UNKNOWN) {
+            bool seq_match = false;
+            if (batch_inp.seq_id != nullptr && batch_inp.seq_id[i] != nullptr) {
+                const int32_t n_sid = batch_inp.n_seq_id != nullptr ? batch_inp.n_seq_id[i] : 1;
+                for (int32_t s = 0; s < n_sid; ++s) {
+                    if (row.seq_id == batch_inp.seq_id[i][s]) {
+                        seq_match = true;
+                        break;
+                    }
+                }
+            } else {
+                seq_match = (row.seq_id == 0); // batch default sequence is 0
+            }
+            if (!seq_match) {
+                LLAMA_LOG_ERROR("%s: flashprefill row %u seq_id %d not in batch row %u\n",
+                        __func__, i, row.seq_id, i);
+                return false;
+            }
+        }
+        if (row.prefill_known) {
+            if (row.prefill_begin < 0 || row.prefill_end <= row.prefill_begin) {
+                LLAMA_LOG_ERROR("%s: flashprefill row %u has invalid prefill interval [%d, %d)\n",
+                        __func__, i, row.prefill_begin, row.prefill_end);
+                return false;
+            }
+            if (row.logical_pos != LLAMA_FLASHPREFILL_POS_UNKNOWN &&
+                    (row.logical_pos < row.prefill_begin || row.logical_pos >= row.prefill_end)) {
+                LLAMA_LOG_ERROR("%s: flashprefill row %u logical_pos %d outside prefill interval [%d, %d)\n",
+                        __func__, i, row.logical_pos, row.prefill_begin, row.prefill_end);
+                return false;
+            }
+        }
+    }
+    // Owned copy before any async execution: the borrowed view may leave
+    // scope while GPU work is still in flight. Never stored as a pointer.
+    fp_rows_call.assign(exec->rows, exec->rows + exec->n_rows);
+    fp_exec_active = true;
+    return true;
+}
+
+bool llama_context::flashprefill_build_ubatch(const llama_ubatch & ubatch) {
+    fp_rows_ubatch.clear();
+    // Reset first: each ubatch publishes exactly its own rows, so a map-less
+    // ubatch can never inherit the previous ubatch's snapshot in its graph.
+    cparams.flashprefill_rows.reset();
+    if (!fp_exec_active || flashprefill_bypassed()) {
+        return true;
+    }
+    // Empty views and empty ubatches are legitimate dense (never a guess):
+    // an empty exec carries no rows, and synthetic reserve ubatches carry no
+    // source batch. Only a map-less ubatch WITH live rows is corruption.
+    if (fp_rows_call.empty() || ubatch.n_tokens == 0) {
+        return true;
+    }
+    // BatchIdentity owns the optional source-row map (llama_ubatch::source_row,
+    // nullptr == unavailable). A live enabled call without it cannot know
+    // which call rows survived a split/retry: explicit execution failure, not
+    // a silent fallback to dense (a corrupt-metadata error must never pass
+    // unnoticed). No half snapshot is left behind (cleared + reset above).
+    if (ubatch.source_row == nullptr) {
+        LLAMA_LOG_ERROR("%s: flashprefill source-row map missing for %u live rows (tracking disabled or synthetic reuse in the decode path)\n",
+                __func__, ubatch.n_tokens);
+        return false;
+    }
+    if (ubatch.n_tokens > fp_rows_call.size()) {
+        LLAMA_LOG_ERROR("%s: flashprefill ubatch wider than the call (%u tokens > %zu rows)\n",
+                __func__, ubatch.n_tokens, fp_rows_call.size());
+        fp_rows_ubatch.clear();
+        return false;
+    }
+    fp_rows_ubatch.reserve(ubatch.n_tokens);
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const int32_t src = ubatch.source_row[i];
+        if (src < 0 || (uint32_t) src >= fp_rows_call.size()) {
+            // Corrupt map entry: explicit execution failure with no half
+            // snapshot left behind — never silent fallback to dense.
+            LLAMA_LOG_ERROR("%s: flashprefill source-row %d out of range for ubatch row %u (%zu call rows)\n",
+                    __func__, src, i, fp_rows_call.size());
+            fp_rows_ubatch.clear();
+            cparams.flashprefill_rows.reset();
+            return false;
+        }
+        fp_rows_ubatch.push_back(fp_rows_call[(uint32_t) src]);
+    }
+    // Publish the owned snapshot to the graph slice: llm_graph_params copies
+    // cparams by value, so this ubatch's graph keeps its rows alive across
+    // async execution. Enabled-only; empty stays null (route dense).
+    if (!fp_rows_ubatch.empty()) {
+        cparams.flashprefill_rows =
+            std::make_shared<const std::vector<llama_flashprefill_row>>(fp_rows_ubatch);
+    }
+    return true;
+}
+
+uint64_t llama_context::flashprefill_policy_fingerprint() const {
+    // Sources: every approximation policy field (via PolicyCore's stable FNV
+    // over the frozen field order) + model identity (model desc string, which
+    // covers arch/type/params — a cfg-only key is explicitly NOT used, and the
+    // RERoT shape hash alone would not identify weights). Adapter domain is
+    // empty here by design: adapters attach mutably post-construction, so
+    // they cannot join this immutable lifetime key — adapter-aware identity
+    // lives in the state envelope (flashprefill_adapter_generation()) and
+    // the state cache key (flashprefill_state_cache_key()), owned by the
+    // StatePolicy slice. NOTE: model.desc() is NOT a weight hash and proves
+    // nothing about weights; cross-context durable restore is therefore
+    // rejected by the context-serial check in the envelope, and
+    // within-context RAM/checkpoint round-trips additionally require equal
+    // serial, fingerprint, and adapter generation.
+    const std::string model_id = model.desc();
+    uint64_t out = 0;
+    if (llama_flashprefill_fingerprint(&cparams.flashprefill, model_id.c_str(), nullptr, &out) !=
+            LLAMA_FLASHPREFILL_OK) {
+        return 0;
+    }
+    return out;
+}
+
+uint64_t llama_context::flashprefill_context_serial() const {
+    return fp_serial;
+}
+
+uint64_t llama_context::flashprefill_adapter_generation() const {
+    return fp_adapter_gen;
+}
+
+void llama_context::flashprefill_bump_adapter_generation() {
+    // Saturate at MAX instead of wrapping: consumers treat MAX as
+    // always-invalid (same discipline as CellGeneration), so a wrap would
+    // silently resurrect a stale identity. Bumping is idempotent-safe and
+    // touches one integer on the rare adapter-mutation path only.
+    if (fp_adapter_gen != std::numeric_limits<uint64_t>::max()) {
+        ++fp_adapter_gen;
+    }
+}
+
+void llama_context::flashprefill_on_adapter_change() {
+    // Identity bump only — FlashPrefill never deletes KV. Resident history
+    // keeps baseline semantics (the server owns per-slot LoRA/prompt
+    // compatibility; normal adapter switching neither clears nor re-prefills).
+    // Isolation across the switch comes from the retired generation: saved
+    // blobs pin the old generation and reject on load, the RAM prompt cache
+    // is dropped server-side via the retired state key, the setters below
+    // force graph/scheduler re-reservation (sched_need_reserve, baseline
+    // invalidation), and derived means are rebuilt per graph under the new
+    // generation. No sync, no clear; OFF behaves identically.
+    flashprefill_bump_adapter_generation();
+}
+
+uint64_t llama_context::flashprefill_state_cache_key() const {
+    // OFF contexts carry no isolation identity (legacy stateless path).
+    if (!llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        return 0;
+    }
+    const uint64_t policy_fp = flashprefill_policy_fingerprint();
+    if (policy_fp == 0 || fp_serial == 0 || fp_adapter_gen == 0) {
+        return 0;
+    }
+    return llama_flashprefill_state::state_cache_key(policy_fp, fp_serial, fp_adapter_gen);
+}
+
+const struct llama_flashprefill_config & llama_context::get_flashprefill_config() const {
+    return cparams.flashprefill;
+}
+
+uint32_t llama_context::flashprefill_call_rows() const {
+    return fp_exec_active ? (uint32_t) fp_rows_call.size() : 0;
+}
+
+const struct llama_flashprefill_row * llama_context::flashprefill_ubatch_rows(uint32_t * n_rows_out) const {
+    if (n_rows_out != nullptr) {
+        *n_rows_out = (uint32_t) fp_rows_ubatch.size();
+    }
+    return fp_rows_ubatch.empty() ? nullptr : fp_rows_ubatch.data();
+}
+
+llama_flashprefill_metrics::accum llama_context::flashprefill_metrics_snapshot() const {
+    return fp_metrics_accum;
+}
+
+bool llama_context::flashprefill_metrics_consume(llama_flashprefill_metrics::slice_delta & out) {
+    namespace fpmet = llama_flashprefill_metrics;
+    out = fpmet::slice_delta();
+    if (!llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        fp_metrics_mark = fp_metrics_accum;
+        return false;
+    }
+    const fpmet::slice_delta d = fpmet::accum_delta_since(fp_metrics_accum, fp_metrics_mark);
+    if (fpmet::slice_is_empty(d)) {
+        return false;
+    }
+    fp_metrics_mark = fp_metrics_accum;
+    out = d;
+    return true;
+}
+
+int llama_context::flashprefill_note_slice_success(
+        const llama_ubatch & ubatch, uint64_t layout_us, bool has_layout_us, bool plans_deferred,
+        int32_t graph_dense_reason) {
+    namespace fpmet = llama_flashprefill_metrics;
+    // OFF: no counting, no sizing work, no timer reads beyond the caller's
+    // single is_enabled check.
+    if (!llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        return 0;
+    }
+    const bool bypassed = flashprefill_bypassed();
+    if (!fp_exec_active && !bypassed) {
+        return 0; // ordinary dense call without an exec: not a flashprefill slice
+    }
+    // Model GQA fan-out for packed-row units (frozen dims; exact for the
+    // uniform-GQA models the sparse path admits). No KV reads here: SHORT
+    // and friends arrive as the authoritative graph verdict below, never
+    // inferred from global resident counts.
+    int32_t gqa_i = llama_model_n_gqa_max(&model);
+    if (gqa_i <= 0) {
+        gqa_i = 1;
+    }
+    const struct llama_flashprefill_row * rows =
+        fp_rows_ubatch.empty() ? nullptr : fp_rows_ubatch.data();
+    const uint32_t n_rows = (uint32_t) fp_rows_ubatch.size();
+    // Row-side staging only: plan totals/pool/scratch resolve at the
+    // end-of-call fold from this ubatch's queued reads (plans_deferred tells
+    // build_slice to skip the residual verdict). Dense verdicts come solely
+    // from graph_dense_reason (recorded for every ubatch, zero-plan ones
+    // included); required enforcement lives graph-side and is never
+    // second-guessed here.
+    fpmet::slice_delta delta;
+    const int32_t rc = fpmet::build_slice(delta, &cparams.flashprefill, rows, n_rows,
+            graph_dense_reason, (uint32_t) gqa_i, bypassed,
+            nullptr, 0, false, 0, 0, layout_us, has_layout_us,
+            plans_deferred);
+    if (rc != 0) {
+        LLAMA_LOG_ERROR("%s: flashprefill metrics slice failed (error %d), failing ubatch\n",
+                __func__, rc);
+        return rc;
+    }
+    // Stage (do NOT commit): the call-level commit below publishes pending
+    // into the cumulative ledger only when the whole decode_impl succeeds.
+    // A narrowed-batch retry after a partial failure therefore recounts only
+    // re-executed work — failed-call executions are never published. The
+    // empty guard also protects the live gauge from a zero overwrite.
+    if (fpmet::slice_is_empty(delta)) {
+        return 0;
+    }
+    fpmet::delta_merge(fp_metrics_pending, delta);
+    (void) ubatch;
+    return 0;
+}
+
+int llama_context::flashprefill_queue_plan_reads(const llm_graph_result & res, bool & out_queued) {
+    out_queued = false;
+    // Authoritative per-ubatch outcome (verdict + counts) is recorded for
+    // EVERY ubatch — including zero-plan dense ones — so the row staging
+    // below and the fold never mislabel a plan-less graph. Only actual plan
+    // tensors queue reads (and owe the end-sync).
+    fp_plan_summaries.push_back(res.get_flashprefill_summary());
+    fp_plan_counts.push_back(0);
+    const std::vector<ggml_tensor *> & plans = res.get_flashprefill_plans();
+    if (plans.empty()) {
+        return 0; // dense ubatch: verdict recorded, no reads, no sync owed
+    }
+    fp_plan_counts.back() = (uint32_t) plans.size();
+    // Validate everything BEFORE queueing anything: a short/OOB read must
+    // fail the slice closed, never partially queue.
+    for (auto * plan : plans) {
+        if (plan == nullptr || !ggml_is_contiguous(plan) || ggml_nelements(plan) < 24) {
+            return -1;
+        }
+        if (ggml_backend_sched_get_tensor_backend(sched.get(), plan) == nullptr) {
+            return -1;
+        }
+    }
+    // Reads queue now (validated above): stream-ordered after this ubatch's
+    // compute on each plan's backend. Each destination is a stable deque
+    // slot: later pushes (this or later ubatches) never invalidate it, so
+    // the queued copy stays valid until the end-of-call sync completes it.
+    // The pending flag is set before the first async queue so every later
+    // clear/sync decision sees it. (Summary + zeroed count already recorded
+    // above for every ubatch, plan-less ones included.)
+    fp_plan_reads_pending = true;
+    if (!fp_plan_headers) {
+        fp_plan_headers = std::make_unique<std::deque<std::array<int32_t, 24>>>();
+    }
+    for (auto * plan : plans) {
+        ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sched.get(), plan);
+        fp_plan_expected.push_back((uint64_t) ggml_nelements(plan));
+        fp_plan_headers->emplace_back();
+        fp_plan_headers->back().fill(0);
+        ggml_backend_tensor_get_async(be, plan, fp_plan_headers->back().data(), 0, 24 * sizeof(int32_t));
+    }
+    out_queued = true;
+    return 0;
+}
+
+int llama_context::flashprefill_fold_plan_reads(llama_flashprefill_metrics::slice_delta & out) {
+    namespace fpmet = llama_flashprefill_metrics;
+    out = fpmet::slice_delta();
+    // Structural precheck: the log is append-only within one call, so any
+    // mismatch is an internal bug — fail closed before interpreting a word.
+    size_t n_plans = 0;
+    for (const uint32_t c : fp_plan_counts) {
+        n_plans += (size_t) c;
+    }
+    // Header storage is required only when headers were queued; all-zero
+    // counts (pure designed-dense call) parse nothing but still consume the
+    // per-span summary actuals below.
+    if (n_plans > 0) {
+        if (!fp_plan_headers || n_plans != fp_plan_expected.size() || n_plans != fp_plan_headers->size()) {
+            return GGML_FLASHPREFILL_ERR_BAD_ARG;
+        }
+    }
+    size_t pi = 0;
+    int32_t first_error = 0;
+    for (size_t s = 0; s < fp_plan_counts.size(); ++s) {
+        const uint32_t n = fp_plan_counts[s];
+        bool span_exact_all = false;
+        for (uint32_t p = 0; p < n; ++p) {
+            ggml_flashprefill_plan_stats st = {};
+            // Header-only parse (WireReference: no list read, no full-tensor
+            // readback). Inspects every layer; the first error wins but all
+            // headers are still read for a complete diagnosis.
+            const int32_t rc = fpmet::parse_plan_header_stats(
+                    (*fp_plan_headers)[pi].data(), fp_plan_expected[pi], &st);
+            pi += 1;
+            if (rc != 0) {
+                if (first_error == 0) {
+                    first_error = rc;
+                }
+                continue;
+            }
+            if (st.error != 0) {
+                // SELECT/ATTN-reported failure (NaN poison, orphan/gap,
+                // OOB, overflow): nothing from this plan is trustworthy.
+                if (first_error == 0) {
+                    first_error = st.error;
+                }
+                continue;
+            }
+            if (st.req_exact_all != 0) {
+                span_exact_all = true;
+            }
+            fpmet::slice_delta one;
+            one.sparse_rows      = (uint64_t) st.sparse_rows;
+            one.dense_packed     = (uint64_t) st.dense_rows;
+            one.selected_blocks  = (uint64_t) st.selected_total;
+            // Executed corrections only (see build_slice): the ablation
+            // classifies proxy uses but ATTN skips them — report 0.
+            if (cparams.flashprefill.mean_correction) {
+                one.corrected_blocks = (uint64_t) st.corrected_total;
+            }
+            one.visible_tokens   = (uint64_t) st.visible_tokens;
+            one.exact_tokens     = (uint64_t) st.exact_tokens;
+            fpmet::delta_merge(out, one);
+        }
+        // Designed-dense actuals (FULL_PREFIX zero-plan spans AND partial
+        // spans alongside plan totals): authoritative query-head-layer
+        // incidences from the graph summary, same unit as plan row totals.
+        // Counted in the full_attention_layer bucket and in dense_packed
+        // (actual exec denominator); disjoint from plan layers by
+        // construction, never NO_PLAN, never invalidation.
+        {
+            const auto draws = fp_plan_summaries[s].designed_dense_rows;
+            if (draws > 0) {
+                const uint64_t v = (uint64_t) draws;
+                fpmet::slice_delta dd;
+                dd.dense_rows[fpmet::DENSE_BUCKET_FULL_PREFIX] = v;
+                dd.dense_packed = v;
+                fpmet::delta_merge(out, dd);
+            }
+        }
+        // Zero-plan spans (dense ubatches: verdict recorded, nothing built)
+        // contribute no pool or scratch — only spans that queued plans did.
+        if (n > 0 && first_error == 0) {
+            // One pool construction per executed span: this ubatch's graph
+            // ran pool/select/attn, so its pool means were (re)built here —
+            // counted once per span, never per layer. Scratch is the
+            // build's own total (shared meta once + pinned plans + max
+            // pool, real tensor capacities via ggml_nbytes, checked u64):
+            // consumed verbatim, never estimated, never maxima. Live
+            // overwrites per span (current build residency); peak maxes, so
+            // repeated ubatches on one build never double count.
+            fpmet::slice_delta t;
+            t.pool_rebuild[span_exact_all ? fpmet::POOL_REASON_EXACT_ALL : fpmet::POOL_REASON_SLICE] = 1;
+            // Sign-checked before narrowing: a corrupt negative total (if the
+            // field is signed) must read as absent, never wrap huge.
+            const auto build_raw = fp_plan_summaries[s].scratch_bytes;
+            if (build_raw > 0) {
+                const uint64_t build_bytes = (uint64_t) build_raw;
+                t.scratch_live_bytes = build_bytes;
+                t.scratch_peak_bytes = build_bytes;
+            }
+            fpmet::delta_merge(out, t);
+        }
+    }
+    if (first_error != 0) {
+        out = fpmet::slice_delta();
+        return first_error;
+    }
+    return 0;
+}
+
+void llama_context::flashprefill_sample_gpu_phases() {
+    namespace fpmet = llama_flashprefill_metrics;
+    if (!fp_plan_reads_pending) {
+        return; // no FP GPU reads queued this call: nothing to attribute
+    }
+    using phase_times_fn_t = fpmet::gpu_phase_sampler_fn;
+    // Per scheduler backend (VulkanDispatch: cumulative ns since that
+    // backend's init, post-fence; FAILED iff not a Vulkan backend — skipped,
+    // never an error). Unknown backends stamp without contributing, so a
+    // recycled backend pointer can never attribute pre-existing time; dead
+    // entries are pruned below. Backward steps contribute zero, never fail.
+    fpmet::slice_delta d;
+    d.has_gpu_us = false;
+    for (const auto & be : backends) {
+        if (!be) {
+            continue;
+        }
+        ggml_backend_t backend = be.get();
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (dev == nullptr) {
+            continue;
+        }
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == nullptr) {
+            continue;
+        }
+        auto * fn = (phase_times_fn_t) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_vk_flashprefill_times");
+        if (fn == nullptr) {
+            continue; // producer hook absent here: skip (omit, never fake)
+        }
+        uint64_t pool_ns = 0, select_ns = 0, attn_ns = 0;
+        if (fn(backend, &pool_ns, &select_ns, &attn_ns) != GGML_STATUS_SUCCESS) {
+            continue; // not a Vulkan backend for FP timing: skip
+        }
+        auto it = fp_gpu_last_by_backend.find(backend);
+        if (it == fp_gpu_last_by_backend.end()) {
+            // First sighting: stamp the baseline without contributing, so
+            // pre-existing cumulative time is never attributed to this call.
+            fp_gpu_last_by_backend[backend] = {pool_ns, select_ns, attn_ns, true};
+            continue;
+        }
+        fp_gpu_backend_last & last = it->second;
+        d.gpu_pool_us   += pool_ns   >= last.pool_ns   ? (pool_ns   - last.pool_ns)   / 1000u : 0u;
+        d.gpu_select_us += select_ns >= last.select_ns ? (select_ns - last.select_ns) / 1000u : 0u;
+        d.gpu_attn_us   += attn_ns   >= last.attn_ns   ? (attn_ns   - last.attn_ns)   / 1000u : 0u;
+        last.pool_ns = pool_ns;
+        last.select_ns = select_ns;
+        last.attn_ns = attn_ns;
+        last.stamped = true;
+        d.has_gpu_us = true;
+    }
+    // Prune dead backends (sched_reserve rebuilds): keeps the map bounded
+    // and drops recycled-pointer state.
+    for (auto it = fp_gpu_last_by_backend.begin(); it != fp_gpu_last_by_backend.end();) {
+        bool live = false;
+        for (const auto & be : backends) {
+            if (be && be.get() == it->first) {
+                live = true;
+                break;
+            }
+        }
+        if (!live) {
+            it = fp_gpu_last_by_backend.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (d.has_gpu_us && !fpmet::slice_is_empty(d)) {
+        // Preserve the folded graph residency: the gpu-times delta carries
+        // no scratch of its own, and a blind merge would overwrite live with
+        // zero. Relay first, then merge (peak max is already idempotent).
+        d.scratch_live_bytes = fp_metrics_pending.scratch_live_bytes;
+        d.scratch_peak_bytes = fp_metrics_pending.scratch_peak_bytes;
+        fpmet::delta_merge(fp_metrics_pending, d);
+    }
+    // Backend split-workspace residency (VulkanDispatch: exact bytes chosen
+    // for this backend — 0 when the split path is inactive; peak monotonic
+    // max; FAILED iff not Vulkan). Combines with graph capacities without
+    // double counting (disjoint tensors by construction): live adds the
+    // current residency; peak takes the max over live and call peak-deltas.
+    {
+        using scratch_fn_t = ggml_status (*)(ggml_backend_t, uint64_t *, uint64_t *);
+        uint64_t split_cur_sum = 0, split_peak_add = 0;
+        bool split_seen = false;
+        for (const auto & be : backends) {
+            if (!be) {
+                continue;
+            }
+            ggml_backend_t backend = be.get();
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            if (dev == nullptr) {
+                continue;
+            }
+            auto * reg = ggml_backend_dev_backend_reg(dev);
+            if (reg == nullptr) {
+                continue;
+            }
+            auto * sfn = (scratch_fn_t) ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_vk_flashprefill_scratch");
+            if (sfn == nullptr) {
+                continue;
+            }
+            uint64_t cur_b = 0, peak_b = 0;
+            if (sfn(backend, &cur_b, &peak_b) != GGML_STATUS_SUCCESS) {
+                continue;
+            }
+            auto it = fp_gpu_last_by_backend.find(backend);
+            if (it == fp_gpu_last_by_backend.end()) {
+                fp_gpu_backend_last base = {};
+                base.split_cur_b = cur_b;
+                base.split_peak_b = peak_b;
+                base.stamped = true;
+                fp_gpu_last_by_backend[backend] = base;
+                split_seen = true;
+                continue;
+            }
+            fp_gpu_backend_last & last = it->second;
+            split_cur_sum = split_cur_sum > UINT64_MAX - cur_b ? UINT64_MAX : split_cur_sum + cur_b;
+            if (peak_b >= last.split_peak_b) {
+                const uint64_t pd = peak_b - last.split_peak_b;
+                split_peak_add = split_peak_add > UINT64_MAX - pd ? UINT64_MAX : split_peak_add + pd;
+            }
+            last.split_cur_b = cur_b;
+            last.split_peak_b = peak_b;
+            split_seen = true;
+        }
+        if (split_seen) {
+            uint64_t live = fp_metrics_pending.scratch_live_bytes;
+            live = live > UINT64_MAX - split_cur_sum ? UINT64_MAX : live + split_cur_sum;
+            fp_metrics_pending.scratch_live_bytes = live;
+            uint64_t peak = fp_metrics_pending.scratch_peak_bytes;
+            if (split_peak_add > peak) {
+                peak = split_peak_add;
+            }
+            if (live > peak) {
+                peak = live;
+            }
+            fp_metrics_pending.scratch_peak_bytes = peak;
+        }
+    }
+}
+
+void llama_context::flashprefill_metrics_clear_call_state() {
+    // Immutable OFF: staging/reads cannot exist, so return before touching
+    // anything — no stat writes, no container churn, no sync.
+    if (!llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        return;
+    }
+    // Failure-path ownership: queued async copies may still be in flight
+    // (prior ubatches). Complete them with a direct scheduler sync — never
+    // the stats wrapper, which skips when n_queued_tokens==0 — before the
+    // destination slots are freed. Gated on the pending flag (outstanding
+    // copies), not container fullness: completed reads are never re-synced.
+    // OFF and dense-only calls never sync here. The success path never calls
+    // this (its end-sync already covered); no per-layer waits anywhere.
+    if (fp_plan_reads_pending && sched) {
+        ggml_backend_sched_synchronize(sched.get());
+        fp_plan_reads_pending = false;
+    }
+    fp_metrics_pending = llama_flashprefill_metrics::slice_delta();
+    fp_plan_headers.reset();
+    fp_plan_counts.clear();
+    fp_plan_expected.clear();
+    fp_plan_summaries.clear();
+}
+
+void llama_context::flashprefill_snapshot_gpu_phases() {
+    // Baseline unconditionally (caller gates on enabled): the first FP
+    // call's GPU time counts as measured instead of being dropped. Host-side
+    // counter reads only — no waits, no submits. Split-workspace baselines
+    // ride the same pass so backend peak deltas never attribute history.
+    using phase_times_fn_t = llama_flashprefill_metrics::gpu_phase_sampler_fn;
+    using scratch_fn_t = ggml_status (*)(ggml_backend_t, uint64_t *, uint64_t *);
+    for (const auto & be : backends) {
+        if (!be) {
+            continue;
+        }
+        ggml_backend_t backend = be.get();
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (dev == nullptr) {
+            continue;
+        }
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == nullptr) {
+            continue;
+        }
+        fp_gpu_backend_last & last = fp_gpu_last_by_backend[backend];
+        auto * fn = (phase_times_fn_t) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_vk_flashprefill_times");
+        if (fn != nullptr) {
+            uint64_t pool_ns = 0, select_ns = 0, attn_ns = 0;
+            if (fn(backend, &pool_ns, &select_ns, &attn_ns) == GGML_STATUS_SUCCESS) {
+                last.pool_ns = pool_ns;
+                last.select_ns = select_ns;
+                last.attn_ns = attn_ns;
+                last.stamped = true;
+            }
+        }
+        auto * sfn = (scratch_fn_t) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_vk_flashprefill_scratch");
+        if (sfn != nullptr) {
+            uint64_t cur_b = 0, peak_b = 0;
+            if (sfn(backend, &cur_b, &peak_b) == GGML_STATUS_SUCCESS) {
+                last.split_cur_b = cur_b;
+                last.split_peak_b = peak_b;
+            }
+        }
+    }
+}
+
+int llama_context::decode_impl(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1749,6 +3554,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 }
             }
         }
+    }
+
+    // FlashPrefill: opt into the BatchIdentity source-row map only when a
+    // validated exec is attached. OFF/legacy calls keep split semantics and
+    // allocation behavior bit-identical (no tracking, no extra storage).
+    if (fp_exec_active) {
+        balloc->set_source_row_tracking(true);
     }
 
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
@@ -1816,6 +3628,44 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     if (!did_optimize) {
                         did_optimize = true;
 
+                        // Try TriAttention reclaim first (if enabled).
+                        // RERoT compat (§A.11.3/A.27): recurrent-only
+                        // pressure must NOT trigger Tri KV reclaim. When a
+                        // RERoT episode is active and KV has room for this
+                        // batch but recurrent state does not, bypass Tri and
+                        // fall through to the stock recurrent victim path.
+                        // Whole-episode atomicity (§19.3) and episode-aware
+                        // preemption/demotion (§A.11/A.27): a RERoT frontier
+                        // either decodes fully or HARD_ABORTs; never commit
+                        // a partial Lane subset (the server gate enforces
+                        // this via begin_frontier, and whole-episode
+                        // preemption/demotion lives server-side via
+                        // rerot_propagate_hard_abort; this guard only avoids
+                        // lossy Tri work that the episode cannot use).
+                        if (cparams.triattention_enabled) {
+                            bool rerot_recurrent_only = false;
+                            if (cparams.rerot_enabled && llama_rerot_ctx_is_active(this)) {
+                                const uint32_t kv_cap  = memory ? memory->get_kv_capacity() : 0;
+                                const uint32_t kv_used = memory ? memory->get_kv_used() : 0;
+                                const uint32_t rc_cap  = memory ? memory->get_recurrent_capacity() : 0;
+                                const uint32_t rc_used = memory ? memory->get_recurrent_used() : 0;
+                                const uint32_t need = balloc->get_n_tokens();
+                                if (rc_cap > 0 && kv_cap > 0 && kv_used + need <= kv_cap && rc_used >= rc_cap) {
+                                    rerot_recurrent_only = true;
+                                    LLAMA_LOG_DEBUG("%s: RERoT recurrent-only pressure - bypassing TriAttention reclaim\n", __func__);
+                                }
+                            }
+                            if (!rerot_recurrent_only) {
+                                llama_memory_kv_reclaim_request req;
+                                req.drain_to_floor = true;
+                                req.required_free = balloc->get_n_tokens();
+                                auto result = memory_reclaim_kv(req);
+                                if (result.changed) {
+                                    continue;
+                                }
+                            }
+                        }
+
                         if (memory_update(true)) {
                             LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
 
@@ -1847,8 +3697,53 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    // FlashPrefill metrics call-wide state (MetricsIntegration): hygiene
+    // range reset plus GPU phase baselining, enabled-only. OFF allocates and
+    // touches nothing here (the member stays empty for the context lifetime).
+    // Single mode check (immutable validated config: OFF == disabled).
+    if (cparams.flashprefill.mode != LLAMA_FLASHPREFILL_MODE_OFF) {
+        if (fp_met_call_pos_min.size() != (size_t) LLAMA_MAX_SEQ) {
+            fp_met_call_pos_min.assign(LLAMA_MAX_SEQ, std::numeric_limits<llama_pos>::max());
+        } else {
+            std::fill(fp_met_call_pos_min.begin(), fp_met_call_pos_min.end(),
+                    std::numeric_limits<llama_pos>::max());
+        }
+        // Baseline GPU phase counters before the first submit: the end-of-
+        // call difference then measures this call — including the first FP
+        // call — instead of dropping it. Host reads, no waits.
+        flashprefill_snapshot_gpu_phases();
+    }
+
     do {
         const auto & ubatch = mctx->get_ubatch();
+        llama_compute_guard compute_guard(sched.get());
+
+        // FlashPrefill metrics layout timer (MetricsIntegration): host-only
+        // timestamp around the slice build. OFF cost is one mode check
+        // (no allocation, no sync). Unmeasured slices report has_layout=false
+        // downstream (omitted, never fake zero).
+        const bool fp_met_enabled = cparams.flashprefill.mode != LLAMA_FLASHPREFILL_MODE_OFF;
+        const int64_t fp_met_t0 = fp_met_enabled ? ggml_time_us() : 0;
+
+        // FlashPrefill: attach this ubatch's owned row snapshot (sliced via
+        // the source-row map so internal splits/retries keep exact identity).
+        // Empty snapshot == route dense. No-op when no exec is attached. A
+        // corrupt map is an explicit execution failure (-3, the existing
+        // compute-failure code): call snapshots are cleared first so no half
+        // rows can leak into a retry, and the failure is visible instead of
+        // a silent fallback to dense.
+        if (fp_exec_active) {
+            if (!flashprefill_build_ubatch(ubatch)) {
+                flashprefill_clear_call();
+                // MetricsIntegration: failed call, staged state discarded.
+                flashprefill_metrics_clear_call_state();
+                return -3;
+            }
+        }
+
+        // Host layout time for this slice (meaningful only when measured).
+        const uint64_t fp_met_layout_us =
+            fp_met_enabled ? (uint64_t) (ggml_time_us() - fp_met_t0) : 0;
 
         // count the outputs in this ubatch
         {
@@ -1892,6 +3787,81 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 memory->seq_rm(s, pos_min[s], -1);
             }
+
+            // MetricsIntegration: this call fails, so staged ubatch deltas
+            // and queued plan reads are discarded (never published); a retry
+            // recounts re-executed work only.
+            flashprefill_metrics_clear_call_state();
+
+            switch (status) {
+                case GGML_STATUS_ABORTED:      return  2;
+                case GGML_STATUS_ALLOC_FAILED: return -2;
+                case GGML_STATUS_FAILED:       return -3;
+                case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+            }
+        }
+
+        // FlashPrefill metrics (MetricsIntegration): per-ubatch staging. The
+        // compute above only SUBMITTED async GPU work — nothing GPU-side may
+        // be read as completed here. Row-side data stages now (host-owned, no
+        // wait) against the graph's authoritative per-ubatch verdict
+        // (recorded for every ubatch, zero-plan ones included — never
+        // re-derived from global KV fullness); each plan header queues a 96B
+        // async read into the owned per-call snapshot (no wait — the single
+        // end-of-call synchronize below completes them). Plan errors are
+        // inspected once after that sync, before anything commits. A nonzero
+        // status here fails like a compute failure (status rerouted into the
+        // existing cleanup path).
+        if (res && fp_met_enabled) {
+            for (uint32_t fp_met_i = 0; fp_met_i < ubatch.n_tokens; ++fp_met_i) {
+                const auto fp_met_seq = ubatch.seq_id[fp_met_i][0];
+                if (ubatch.pos[fp_met_i] < fp_met_call_pos_min[fp_met_seq]) {
+                    fp_met_call_pos_min[fp_met_seq] = ubatch.pos[fp_met_i];
+                }
+            }
+            bool fp_met_queued = false;
+            int fp_met_rc = flashprefill_queue_plan_reads(*res, fp_met_queued);
+            if (fp_met_rc == 0) {
+                fp_met_rc = flashprefill_note_slice_success(ubatch, fp_met_layout_us, true, fp_met_queued,
+                        res->get_flashprefill_summary().dense_reason);
+            }
+            if (fp_met_rc != 0) {
+                LLAMA_LOG_ERROR("%s: flashprefill slice metrics failed (error %d), failing ubatch\n",
+                        __func__, fp_met_rc);
+                res = nullptr;
+                status = GGML_STATUS_FAILED;
+            }
+        }
+
+        if (!res) {
+            // the plan check above reroutes here on metrics failure: remove
+            // the ubatch's memory entries exactly like a compute failure so
+            // no half-committed rows or partial metrics leak into a retry.
+            llama_pos fp_met_pos_min[LLAMA_MAX_SEQ];
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                fp_met_pos_min[s] = std::numeric_limits<llama_pos>::max();
+            }
+
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                const auto & seq_id = ubatch.seq_id[i][0];
+
+                fp_met_pos_min[seq_id] = std::min(fp_met_pos_min[seq_id], ubatch.pos[i]);
+            }
+
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (fp_met_pos_min[s] == std::numeric_limits<llama_pos>::max()) {
+                    continue;
+                }
+
+                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, fp_met_pos_min[s]);
+
+                memory->seq_rm(s, fp_met_pos_min[s], -1);
+            }
+
+            // MetricsIntegration: queue/note failure discards staged deltas
+            // plus queued reads exactly like a compute failure (no partial
+            // publication, no orphaned snapshots).
+            flashprefill_metrics_clear_call_state();
 
             switch (status) {
                 case GGML_STATUS_ABORTED:      return  2;
@@ -1990,6 +3960,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        extract_attention_q_pre_rope(res, n_tokens_prev, ubatch.n_tokens);
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2026,6 +3997,64 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+
+    // FlashPrefill metrics finalize (MetricsIntegration): the single
+    // completion boundary for the call. Plan reads were queued per ubatch
+    // (no waits); iff any reads are outstanding, synchronize ONCE here —
+    // consuming the would-be getter wait (getters later early-out; stats
+    // attributed once) — then inspect ALL headers before committing
+    // anything. OFF and dense-only calls skip the sync entirely (no extra
+    // waits). Any plan error fails the call (return -3 + call-wide hygiene)
+    // before downstream sampling/output/state success handling. Required-
+    // mode enforcement lives graph-side (it throws authoritatively); metrics
+    // never fails for routing — designed-dense and deny-verdict rows only
+    // count.
+    {
+        namespace fpmet = llama_flashprefill_metrics;
+        bool fp_met_call_failed = false;
+        // Per-ubatch outcome spans were recorded (summaries always, headers
+        // only for queued reads). Sync strictly for outstanding reads; the
+        // fold then consumes summaries too, so pure designed-dense calls
+        // (zero reads) resolve with no wait at all.
+        if (!fp_plan_counts.empty()) {
+            const bool fp_met_had_reads = fp_plan_reads_pending;
+            if (fp_met_had_reads) {
+                synchronize();
+                // Sample while the flag still shows outstanding reads (the
+                // sampler's own gate), then clear it: later clears must not
+                // sync again. Headers are retained for parsing below.
+                flashprefill_sample_gpu_phases();
+                fp_plan_reads_pending = false;
+            }
+            fpmet::slice_delta fp_met_plan_delta;
+            const int32_t fp_met_plan_rc = flashprefill_fold_plan_reads(fp_met_plan_delta);
+            fp_plan_headers.reset();
+            fp_plan_counts.clear();
+            fp_plan_expected.clear();
+            fp_plan_summaries.clear();
+            if (fp_met_plan_rc == 0) {
+                if (!fpmet::slice_is_empty(fp_met_plan_delta)) {
+                    fpmet::delta_merge(fp_metrics_pending, fp_met_plan_delta);
+                }
+            } else {
+                LLAMA_LOG_ERROR("%s: flashprefill plan validation failed (error %d), failing call\n",
+                        __func__, fp_met_plan_rc);
+                fp_met_call_failed = true;
+            }
+        }
+        if (fp_met_call_failed) {
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (fp_met_call_pos_min[s] == std::numeric_limits<llama_pos>::max()) {
+                    continue;
+                }
+                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n",
+                        __func__, s, fp_met_call_pos_min[s]);
+                memory->seq_rm(s, fp_met_call_pos_min[s], -1);
+            }
+            flashprefill_metrics_clear_call_state();
+            return -3;
+        }
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2080,6 +4109,33 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    // MetricsIntegration commit: the whole call succeeded, so publish the
+    // staged per-ubatch deltas into the cumulative ledger exactly once.
+    // Failure returns above discarded them; a narrowed-batch retry recounts
+    // only re-executed work — never double.
+    if (!llama_flashprefill_metrics::slice_is_empty(fp_metrics_pending)) {
+        if (!fp_metrics_accum.has_policy) {
+            const uint64_t fp_met_fp = flashprefill_policy_fingerprint();
+            if (fp_met_fp != 0) {
+                fp_metrics_accum.policy_fingerprint = fp_met_fp;
+                fp_metrics_accum.has_policy = true;
+            }
+        }
+        llama_flashprefill_metrics::accum_merge(fp_metrics_accum, fp_metrics_pending);
+    }
+    fp_metrics_pending = llama_flashprefill_metrics::slice_delta();
+
+
+
+    // XKV sealing note: no maintain() runs at the generic decode tail by design.
+    // Target verification rows committed by kv-cache-context postcompute_success
+    // are still tentative here — the speculative caller has not decided the
+    // accepted prefix yet, so sealing now could seal rows later rejected via
+    // seq_rm. Publication (sealing) happens only (a) at the pre-batch admission
+    // pressure boundary, or (b) at the speculative acceptance boundary in the
+    // server after the rejected suffix is rolled back via seq_rm. MTP draft,
+    // XKV OFF, recurrent math, and RERoT control are untouched.
+
     return 0;
 }
 
@@ -2091,7 +4147,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
-    const int64_t n_outputs_max = std::max<int64_t>(n_outputs, n_seq_max());
+    const int64_t n_outputs_max = std::max<int64_t>(
+        n_outputs,
+        cparams.rerot_enabled ? std::max(1u, cparams.n_pen_max) : n_seq_max());
 
     const auto n_batch    = cparams.n_batch;
     const auto n_vocab    = vocab.n_tokens();
@@ -2111,6 +4169,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     size_t backend_float_count = 0;
     size_t backend_token_count = 0;
     size_t embd_layer_inp_float_count = 0;
+    size_t attention_q_pre_rope_float_count = 0;
 
     logits.size     = has_logits     ? n_vocab*n_outputs_max     : 0;
     embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
@@ -2128,6 +4187,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         }
     }
 
+    for (uint32_t il = 0; il < cparams.attention_q_pre_rope.size(); ++il) {
+        if (cparams.attention_q_pre_rope[il]) {
+            const size_t q_width = (size_t) hparams.n_embd_head_k(il) * hparams.n_head(il);
+            attention_q_pre_rope_float_count += q_width * n_batch;
+        }
+    }
+
     // Allocate backend sampling output buffers if there are backend samplers configured.
     const bool has_sampling = !sampling.samplers.empty();
     if (has_sampling) {
@@ -2142,8 +4208,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
-        (                                                                         backend_token_count) * sizeof(llama_token);
+        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count +
+         attention_q_pre_rope_float_count + backend_float_count) * sizeof(float) +
+        (                                        backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -2162,6 +4229,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             embd_nextn.data = nullptr;
             for (auto & layer_inp : embd_layer_inp) {
                 layer_inp = {nullptr, 0};
+            }
+            for (auto & q : attention_q_pre_rope) {
+                q = {nullptr, 0};
             }
         }
 
@@ -2200,6 +4270,16 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             offset += embd_layer_inp[il].size * sizeof(float);
         } else {
             embd_layer_inp[il] = buffer_view<float>{nullptr, 0};
+        }
+    }
+
+    for (uint32_t il = 0; il < attention_q_pre_rope.size(); ++il) {
+        if (cparams.attention_q_pre_rope[il]) {
+            const size_t q_width = (size_t) hparams.n_embd_head_k(il) * hparams.n_head(il);
+            attention_q_pre_rope[il] = buffer_view<float>{(float *) (base + offset), q_width * n_batch};
+            offset += attention_q_pre_rope[il].size * sizeof(float);
+        } else {
+            attention_q_pre_rope[il] = buffer_view<float>{nullptr, 0};
         }
     }
 
@@ -2274,6 +4354,39 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+    }
+}
+
+void llama_context::extract_attention_q_pre_rope(
+        const llm_graph_result * res,
+        size_t                   token_offset,
+        size_t                   n_tokens) {
+    for (uint32_t il = 0; il < cparams.attention_q_pre_rope.size(); ++il) {
+        if (!cparams.attention_q_pre_rope[il]) {
+            continue;
+        }
+        if (!attention_q_pre_rope[il].has_data()) {
+            GGML_ABORT("pre-RoPE Q output buffer not allocated");
+        }
+
+        ggml_tensor * t = res->get_attn_q_pre_rope((int) il);
+        if (!t) {
+            GGML_ABORT("pre-RoPE Q tensor not found");
+        }
+
+        const size_t nbytes = ggml_nbytes(t);
+        const size_t nfloats = nbytes / sizeof(float);
+        GGML_ASSERT(n_tokens > 0);
+        GGML_ASSERT(nfloats % n_tokens == 0);
+
+        const size_t row_floats = nfloats / n_tokens;
+        const size_t dst_offset = token_offset * row_floats;
+        GGML_ASSERT(dst_offset + nfloats <= attention_q_pre_rope[il].size);
+
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+        GGML_ASSERT(backend != nullptr);
+        ggml_backend_tensor_get_async(
+            backend, t, attention_q_pre_rope[il].data + dst_offset, 0, nbytes);
     }
 }
 
@@ -2381,6 +4494,28 @@ ggml_cgraph * llama_context::graph_reserve(
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
     GGML_ASSERT(n_outputs >= 1);
 
+    // FlashPrefill reserve-sizing scope (StatePolicy): this whole function
+    // builds the synthetic sizing graph (ubatch_reserve has no source batch),
+    // so mark it for graph_params() -> llm_graph_params.
+    // flashprefill_reserve_sizing (reuse-keyed: reserve never aliases live).
+    // RAII restores the prior value on every exit — early returns, error
+    // nullptr paths, and exception unwind — so a failed reserve can never
+    // leak "synthetic" into a later live graph. Live decode graphs never pass
+    // through here and always observe false. No row guessing: the synthetic
+    // eligible snapshot below keeps prefill_known=false (dense-routed).
+    struct fp_reserve_sizing_guard {
+        llama_context & ctx;
+        bool saved;
+        explicit fp_reserve_sizing_guard(llama_context & c)
+            : ctx(c), saved(c.fp_reserve_sizing_active) {
+            ctx.fp_reserve_sizing_active = true;
+        }
+        ~fp_reserve_sizing_guard() {
+            ctx.fp_reserve_sizing_active = saved;
+        }
+    };
+    const fp_reserve_sizing_guard fp_reserve_guard(*this);
+
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs
         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
@@ -2400,6 +4535,10 @@ ggml_cgraph * llama_context::graph_reserve(
     llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
 
+    // FlashPrefill: reserve builds a synthetic sizing ubatch with no source
+    // rows and no decode snapshot (fp_rows_ubatch is never consumed here).
+    // A validated synthetic eligible snapshot is installed for this reserve
+    // graph below; per-decode row snapshots exist only in the ubatch loop.
     // set one output token per sequence in order to activate all backend samplers
     std::vector<llama_seq_id> seq_ids(n_seqs);
     for (uint32_t i = 0; i < n_seqs; ++i) {
@@ -2411,7 +4550,36 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
+    // FlashPrefill: install a validated synthetic eligible snapshot so this
+    // reserve graph carries eligible-shaped rows for scratch sizing (sizing
+    // needs eligible shape, not dense). Enabled-only and never bypassed
+    // (MTP/embeddings stay null); OFF costs one null store. The live member
+    // is saved/restored around the gparams copy below: reserve must never
+    // disturb an in-flight decode snapshot, while the copied graph params
+    // keep their own shared ownership for async safety.
+    auto fp_rows_saved = cparams.flashprefill_rows;
+    if (ubatch.n_tokens > 0 &&
+            llama_flashprefill_is_enabled(&cparams.flashprefill) &&
+            !flashprefill_bypassed()) {
+        llama_flashprefill_row fp_synth;
+        std::memset(&fp_synth, 0, sizeof(fp_synth));
+        fp_synth.version       = LLAMA_FLASHPREFILL_ROW_VERSION;
+        fp_synth.struct_size   = (uint32_t) sizeof(fp_synth);
+        fp_synth.role          = LLAMA_FLASHPREFILL_ROLE_PREFILL;
+        fp_synth.seq_id        = 0;
+        fp_synth.reader_id     = LLAMA_FLASHPREFILL_READER_NONE;
+        fp_synth.logical_pos   = LLAMA_FLASHPREFILL_POS_UNKNOWN;
+        fp_synth.prefill_known = false;
+        GGML_ASSERT(llama_flashprefill_validate_row(&fp_synth) == LLAMA_FLASHPREFILL_OK);
+        cparams.flashprefill_rows = std::make_shared<const std::vector<llama_flashprefill_row>>(
+            ubatch.n_tokens, fp_synth);
+    } else {
+        cparams.flashprefill_rows.reset();
+    }
+
     const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+
+    cparams.flashprefill_rows = std::move(fp_rows_saved);
 
     res->reset();
 
@@ -2440,6 +4608,18 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
+    // FlashPrefill: the frozen policy config rides into the graph via the
+    // .cparams copy below (immutable, OFF by default), and the per-ubatch
+    // owned rows ride as cparams.flashprefill_rows (shared ownership, so
+    // each graph copy stays alive across async execution). Null means route
+    // dense. GraphIntegration reads gparams.cparams.flashprefill_rows; the
+    // flashprefill_ubatch_rows() accessor exposes the same snapshot for
+    // non-graph consumers. No borrowed pointers cross this call.
+    // Reserve sizing: fp_reserve_sizing_active is true only inside
+    // graph_reserve()'s RAII scope (synthetic sizing graphs, including
+    // FittingIntegration probes, which build through graph_reserve), so the
+    // flag is set with no per-probe opt-in and never leaks into live decode
+    // graphs built here via process_ubatch().
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -2456,6 +4636,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
+        /*.flashprefill_reserve_sizing =*/ fp_reserve_sizing_active,
     };
 }
 
@@ -2953,10 +5134,82 @@ size_t llama_context::state_set_data(const uint8_t * src, size_t size) {
 
 static constexpr uint32_t io_magic = 0xaf143cd8;
 
+// Enabled-only distinct outer magic for per-sequence state blobs (StatePolicy).
+// Selected by the immutable context policy at every seq write/read site below;
+// OFF writers/readers retain io_magic verbatim (no OFF format bump). An OFF/old
+// reader therefore rejects an enabled blob at the 4-byte outer prefix — before
+// any memory reader runs, with no allocation and no KV mutation — and an
+// enabled reader rejects a legacy blob with a re-prefill error at the same
+// point. 'FPS1' is disjoint from the envelope body magic ('FPS0'), io_magic,
+// the RERoT/file magics, and DSV4. Prefix widths are unchanged (u32 magic +
+// seq_id) on both paths.
+static constexpr uint32_t fp_io_magic_seq = 0x46505331u; // 'FPS1'
+static_assert(sizeof(io_magic) == 4, "seq outer prefix stays one 4-byte magic word");
+
+// Enabled-only distinct sequence-file container (StatePolicy). OFF files retain
+// LLAMA_STATE_SEQ_MAGIC/VERSION verbatim (no OFF format bump, no compat shim:
+// unreleased v1 was never deployed, so legacy files under an enabled policy
+// are re-prefilled, and enabled files under OFF are rejected as unknown).
+static constexpr uint32_t fp_seq_file_magic   = 0x46505153u; // 'FPQS'
+static constexpr uint32_t fp_seq_file_version = 1u;
+
+// Tripwire assertions for the OOM audit: the framed body stays 64 bytes and
+// the marker stays tiny, so no legacy read_string ever allocates on our bytes.
+static_assert(llama_flashprefill_state::kEnvelopeBytes == 64u,
+        "envelope body width is load-bearing for the read_string blast radius");
+static_assert(llama_flashprefill_state::kFrameMarker.size() > 0 &&
+              llama_flashprefill_state::kFrameMarker.size() < 64,
+        "framing marker stays a small distinct string");
+
+// Selects the seq outer magic for this context. File-static (not a member) so
+// no header churn: the policy bit is passed in at each of the four sites.
+static uint32_t fp_seq_outer_magic_for(bool flashprefill_enabled) {
+    return flashprefill_enabled ? fp_io_magic_seq : io_magic;
+}
+
+// Reader matrix for FlashPrefill-enabled bytes (framed marker + 64-byte body),
+// traced from the actual readers — exact safe order per path:
+//
+// FULL path (no outer magic; framing is the mechanism):
+// - OFF ordinary reader: read_string reads u32 len = marker length (21, tiny
+//   alloc), yields the marker, fails cleanly at the arch-string mismatch
+//   BEFORE any memory byte is touched. The old raw layout would have read the
+//   body magic as a ~1.18 GB length (vector alloc before bounds check).
+// - OFF RERoT-active reader: identical, via its own read_string arch check
+//   ("wrong model arch"), before magic/version/caps/fingerprint checks.
+// - Enabled reader, legacy bytes: one bounded kFramedBytes read (short input
+//   throws -> missing-header), then length-word mismatch (arch_len != 21, or
+//   marker-bytes mismatch on coincidence) -> reject with re-prefill. No
+//   unbounded read_string anywhere on this path.
+// - Enabled reader, unreleased raw-64B bytes: length word reads as the body
+//   magic (~1.18 GB != 21) -> foreign-header reject. No compat shim.
+//
+// SEQ path (distinct outer magic gates BEFORE any memory reader):
+// - OFF reader + enabled blob: 4-byte outer-magic compare fails ("wrong
+//   sequence state magic", text unchanged) before the memory reader runs —
+//   no allocation, no KV mutation. Same on the ON_DEVICE temp pre-read.
+// - Enabled reader + legacy blob: outer-magic compare fails the other way ->
+//   re-prefill throw, before the framed read.
+// - Enabled reader + enabled blob: outer magic OK -> one bounded framed read
+//   (marker + body validated, identity matched) -> memory reader. Legacy and
+//   foreign bytes never reach the memory reader through this path.
+// - Memory-reader first words (defense in depth only, reachable solely by
+//   crafted blobs carrying a valid outer magic): attn-family readers
+//   (llama_kv_cache, hybrid/iswA/msa via kv_base) compare the first u32
+//   against the live n_stream (1 or n_seq_max) and throw pre-mutation on
+//   mismatch; dsv4 compares DSV4_STATE_MAGIC first and throws pre-mutation;
+//   recurrent readers take the count word into small bounded validated parses
+//   (seq path: n_seq_id==0 per-cell gate fails deterministically on marker
+//   bytes; then n_layer/type/row-size equalities) and fail via the
+//   pre-existing wipe-target + throw corrupt-input path — loud, never silent.
+//   Arbitrary-corrupt-blob robustness beyond cross-policy confusion is the
+//   pre-existing per-reader contract, unchanged by this slice.
+
 size_t llama_context::state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags) {
     llama_io_write_dummy io(flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
     try {
-        io.write(&io_magic, sizeof(io_magic));
+        const uint32_t outer_magic = fp_seq_outer_magic_for(llama_flashprefill_is_enabled(&cparams.flashprefill));
+        io.write(&outer_magic, sizeof(outer_magic));
         io.write(&seq_id, sizeof(seq_id));
 
         return state_seq_write_data(io, seq_id, flags);
@@ -2975,7 +5228,8 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     }
 
     try {
-        io->write(&io_magic, sizeof(io_magic));
+        const uint32_t outer_magic = fp_seq_outer_magic_for(llama_flashprefill_is_enabled(&cparams.flashprefill));
+        io->write(&outer_magic, sizeof(outer_magic));
         io->write(&seq_id, sizeof(seq_id));
 
         return state_seq_write_data(*io, seq_id, flags);
@@ -2993,7 +5247,12 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
 
         uint32_t magic_read;
         io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
+        const uint32_t outer_magic = fp_seq_outer_magic_for(llama_flashprefill_is_enabled(&cparams.flashprefill));
+        if (outer_magic != magic_read) {
+            if (llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+                throw std::runtime_error(
+                    "llama_context: wrong sequence state magic for a FlashPrefill-enabled context (legacy OFF blob or foreign state); re-prefill under the current policy instead of reusing this state");
+            }
             throw std::runtime_error("wrong sequence state magic");
         }
 
@@ -3010,7 +5269,12 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     try {
         uint32_t magic_read;
         io->read(&magic_read, sizeof(magic_read));
-        if (io_magic != magic_read) {
+        const uint32_t outer_magic = fp_seq_outer_magic_for(llama_flashprefill_is_enabled(&cparams.flashprefill));
+        if (outer_magic != magic_read) {
+            if (llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+                throw std::runtime_error(
+                    "llama_context: wrong sequence state magic for a FlashPrefill-enabled context (legacy OFF blob or foreign state); re-prefill under the current policy instead of reusing this state");
+            }
             throw std::runtime_error("wrong sequence state magic");
         }
 
@@ -3087,12 +5351,21 @@ bool llama_context::state_save_file(const char * filepath, const llama_token * t
 size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     llama_file file(filepath, "rb");
 
-    // version checks
+    // version checks: the container pair is selected by the immutable policy.
+    // OFF keeps the legacy pair verbatim (no OFF format bump); enabled expects
+    // its distinct pair and rejects legacy files with a re-prefill error (no
+    // compat shim: unreleased v1 was never deployed). Rejection happens before
+    // any state byte is consumed.
     {
         const uint32_t magic   = file.read_u32();
         const uint32_t version = file.read_u32();
 
-        if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
+        if (llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+            if (magic != fp_seq_file_magic || version != fp_seq_file_version) {
+                LLAMA_LOG_ERROR("%s: sequence state file was produced under a different policy (legacy OFF container %08x/%08x); re-prefill under the current policy instead of restoring\n", __func__, magic, version);
+                return 0;
+            }
+        } else if (magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION) {
             LLAMA_LOG_ERROR("%s: unknown (magic, version) for sequence state file: %08x, %08x\n", __func__, magic, version);
             return 0;
         }
@@ -3130,8 +5403,15 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
 size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * filepath, const llama_token * tokens, size_t n_token_count) {
     llama_file file(filepath, "wb");
 
-    file.write_u32(LLAMA_STATE_SEQ_MAGIC);
-    file.write_u32(LLAMA_STATE_SEQ_VERSION);
+    // Container pair selected by the immutable policy (OFF keeps the legacy
+    // pair verbatim). Prefix widths unchanged (two u32 words either way).
+    if (llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        file.write_u32(fp_seq_file_magic);
+        file.write_u32(fp_seq_file_version);
+    } else {
+        file.write_u32(LLAMA_STATE_SEQ_MAGIC);
+        file.write_u32(LLAMA_STATE_SEQ_VERSION);
+    }
 
     // save the prompt
     file.write_u32((uint32_t) n_token_count);
@@ -3147,8 +5427,136 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
     return res;
 }
 
+void llama_context::flashprefill_state_write_envelope(llama_io_write_i & io, uint32_t scope) {
+    // OFF: no-op, legacy bytes unchanged (no envelope, no sizing delta).
+    if (!llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        return;
+    }
+    namespace fpst = llama_flashprefill_state;
+    if (scope != fpst::kScopeFull && scope != fpst::kScopeSeq) {
+        throw std::runtime_error(
+            "llama_context::flashprefill_state_write_envelope: refusing save with unknown scope; re-prefill instead of persisting unidentified state");
+    }
+    const uint64_t policy_fp = flashprefill_policy_fingerprint();
+    if (policy_fp == 0) {
+        throw std::runtime_error(
+            "llama_context::flashprefill_state_write_envelope: refusing save with unavailable policy fingerprint; re-prefill instead of persisting unidentified state");
+    }
+    // The serial alone is never identity (it restarts at 1 per process): the
+    // fixed process nonce must accompany it, and both must be nonzero.
+    if (fp_nonce0 == 0 || fp_nonce1 == 0 || fp_serial == 0) {
+        throw std::runtime_error(
+            "llama_context::flashprefill_state_write_envelope: refusing save with no process nonce/context serial; re-prefill instead of persisting unidentified state");
+    }
+    constexpr uint64_t kMax = std::numeric_limits<uint64_t>::max();
+    if (fp_adapter_gen == 0 || fp_adapter_gen == kMax) {
+        throw std::runtime_error(
+            "llama_context::flashprefill_state_write_envelope: refusing save with invalid adapter generation; re-prefill under the current adapters instead of persisting unidentified state");
+    }
+    const fpst::envelope env = fpst::make_envelope(scope, policy_fp, fp_nonce0, fp_nonce1, fp_serial, fp_adapter_gen);
+    uint8_t buf[fpst::kFramedBytes];
+    if (!fpst::encode_framed_envelope(env, buf, sizeof(buf))) {
+        throw std::runtime_error(
+            "llama_context::flashprefill_state_write_envelope: refusing save: envelope encode failed; re-prefill instead of persisting unidentified state");
+    }
+    io.write(buf, sizeof(buf));
+    LLAMA_LOG_DEBUG("%s: wrote FlashPrefill %s\n", __func__, fpst::describe_envelope(env).c_str());
+    // NOTE (OOM audit): the framing's length-prefixed marker comes first, so
+    // an OFF/old reader's read_string sees a SMALL length, allocates a few
+    // bytes, and fails cleanly at its arch-string mismatch. Under the old raw
+    // layout the body magic would have been misread as a ~1.18 GB length
+    // (allocation before bounds check in llama-io.cpp). OFF read code stays
+    // byte-identical — no silent load is possible, and no unbounded allocation
+    // either. Seq blobs additionally carry the distinct outer magic above, so
+    // OFF seq readers reject before any memory reader runs.
+}
+
+void llama_context::flashprefill_state_read_envelope(llama_io_read_i & io, uint32_t expected_scope) {
+    // OFF: no-op, legacy read path unchanged (full: its read_string arch check
+    // rejects enabled bytes fail-closed on the small marker; seq: the outer
+    // magic check above rejects before any memory reader runs).
+    if (!llama_flashprefill_is_enabled(&cparams.flashprefill)) {
+        return;
+    }
+    namespace fpst = llama_flashprefill_state;
+    // One bounded fixed-size read — never read_string (which allocates on the
+    // streamed length before bounds-checking). Short/truncated input throws
+    // here and becomes the missing-header error below, before any KV byte is
+    // consumed or any context/memory state mutates.
+    uint8_t buf[fpst::kFramedBytes];
+    try {
+        io.read(buf, sizeof(buf));
+    } catch (const std::exception & err) {
+        throw std::runtime_error(
+            std::string("llama_context: flashprefill state missing/truncated policy header; re-prefill under the current policy instead of reusing this state (read failed: ") + err.what() + ")");
+    }
+    fpst::envelope stored;
+    std::string error;
+    if (!fpst::decode_framed_envelope(buf, sizeof(buf), &stored, nullptr, &error)) {
+        throw std::runtime_error(std::string("llama_context: ") + error);
+    }
+    const uint64_t policy_fp = flashprefill_policy_fingerprint();
+    if (policy_fp == 0) {
+        throw std::runtime_error(
+            "llama_context: flashprefill state cannot validate: live policy fingerprint unavailable; re-prefill under the current policy instead of reusing this state");
+    }
+    if (!fpst::match_envelope(stored, expected_scope, policy_fp, fp_nonce0, fp_nonce1, fp_serial, fp_adapter_gen, &error)) {
+        throw std::runtime_error(std::string("llama_context: ") + error);
+    }
+    LLAMA_LOG_DEBUG("%s: accepted FlashPrefill %s\n", __func__, fpst::describe_envelope(stored).c_str());
+}
+
 size_t llama_context::state_write_data(llama_io_write_i & io) {
     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
+
+    // RERoT versioned episode persistence (§§25,A.8): an active episode saves
+    // a control envelope (arch + REROT_STATE_MAGIC/VERSION + caps + model/
+    // rope/Tri fingerprints + epochs + per-seq MTP view stamps) instead of
+    // ordinary tensor bytes. The logical episode (server blob + this envelope)
+    // is authoritative; resident classified cells, write tags, and reader
+    // views are transient execution state reinstalled via set_write_tag /
+    // set_frontier_views (episode-level demotion). OFF stays untouched: the
+    // gate below is false unless rerot_enabled + episode-active.
+    if (cparams.rerot_enabled && llama_rerot_ctx_is_active(this)) {
+        // Narrow refusal: backend sampler state bound to an episode exec seq
+        // has no byte-serializable form here. Common (non-backend) sampling
+        // rows live server-side and persist via the episode sampler_blob.
+        std::vector<llama_seq_id> stamped_seqs;
+        {
+            std::lock_guard<std::mutex> lock(g_rerot_mu);
+            const auto it = g_rerot_states.find(this);
+            if (it != g_rerot_states.end()) {
+                for (const auto & ep_kv : it->second.episodes) {
+                    for (const auto & kv : ep_kv.second.view_stamps) {
+                        stamped_seqs.push_back(kv.first);
+                    }
+                }
+            }
+        }
+        for (const auto seq : stamped_seqs) {
+            const auto jt = sampling.samplers.find(seq);
+            if (jt != sampling.samplers.end() && jt->second != nullptr) {
+                throw std::runtime_error(
+                    "llama_context::state_write_data: refusing RERoT persist with backend sampler state bound to "
+                    "exec seq " + std::to_string(seq) + " (sampler RNG/history has no serial form here; quiesce "
+                    "backend sampling for RERoT lanes or checkpoint the sampler server-side)");
+            }
+        }
+        // FlashPrefill policy envelope (StatePolicy): enabled-only identity
+        // header ahead of every byte below (RERoT envelope included), placed
+        // AFTER the refusal above so a refused save emits no bytes at all.
+        // OFF is a no-op — legacy bytes unchanged. Throws (converted to a 0
+        // return by the state_get_size/get_data/save_file wrappers) when the
+        // identity is unavailable, so unidentified state is never persisted.
+        flashprefill_state_write_envelope(io, llama_flashprefill_state::kScopeFull);
+        llama_rerot_ctx_write_envelope_body(this, io);
+        return io.n_bytes();
+    }
+
+    // Same framed envelope on the ordinary path: enabled-only marker + body
+    // ahead of the arch string + memory bytes (OFF read_string trips on the
+    // small marker, never on the body magic). OFF is a no-op.
+    flashprefill_state_write_envelope(io, llama_flashprefill_state::kScopeFull);
 
     // write model info
     {
@@ -3169,6 +5577,47 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
+
+    // FlashPrefill policy envelope (StatePolicy): enabled-only prevalidation
+    // BEFORE any KV byte is consumed or context/memory state mutates. Missing
+    // header (legacy OFF bytes), unknown version/scope, or any identity
+    // mismatch throws (converted to a 0 return by the state_set_data/
+    // load_file wrappers) with a re-prefill path — the original Tri/RERoT
+    // checks below run unchanged afterwards and keep their own diagnostics.
+    // OFF is a no-op — legacy read path unchanged.
+    flashprefill_state_read_envelope(io, llama_flashprefill_state::kScopeFull);
+
+    // RERoT versioned episode restore (§§25,A.8): atop an active episode only
+    // a matching envelope restores (exact episode id, magic/version/caps/
+    // fingerprint triple validated inside, never best-effort). Ordinary bytes
+    // fail closed at the magic check — they would orphan tree/run/epoch/
+    // parked/archive/MTP lineage. Memory tensor state is not touched here:
+    // pair with the server runtime load_episode for the logical tree, then
+    // reinstall views before decode. OFF is untouched.
+    if (cparams.rerot_enabled && llama_rerot_ctx_is_active(this)) {
+        llama_rerot_ctx_envelope env;
+        llama_rerot_ctx_read_envelope_body(this, io, env);
+        {
+            std::lock_guard<std::mutex> lock(g_rerot_mu);
+            auto it = g_rerot_states.find(this);
+            if (it == g_rerot_states.end() || it->second.episodes.empty()) {
+                throw std::runtime_error(
+                    "llama_context::state_read_data: RERoT context inactive during restore; refusing install");
+            }
+            auto & ep_st = it->second.episodes[env.episode_id];
+            ep_st.episode_id = env.episode_id;
+            ep_st.topology_epoch = env.topology_epoch;
+            ep_st.publish_epoch  = env.publish_epoch;
+            ep_st.layout_epoch   = env.layout_epoch;
+            ep_st.frontier_mode  = env.frontier_mode;
+            ep_st.view_stamps    = std::move(env.stamps);
+            for (const auto & kv : ep_st.view_stamps) {
+                it->second.exec_bindings[kv.first] = {env.episode_id, 0, (int32_t) kv.first};
+            }
+            it->second.mem       = memory.get();
+        }
+        return io.n_bytes();
+    }
 
     // read model info
     {
@@ -3194,7 +5643,26 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
 }
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // RERoT granularity guard (§§25,A.8): a single seq's bytes cannot capture
+    // shared episode state (tree topology, run visibility/epochs, parked
+    // recurrent lineage, archive refs, MTP view stamps). Per-seq slot save is
+    // therefore genuinely unserializable while an episode is active — persist
+    // the whole episode instead (state_write_data envelope plus the server
+    // server_rerot save_episode blob; episode-level demotion preferred over
+    // per-lane swap). OFF untouched (gate false).
+    if (cparams.rerot_enabled && llama_rerot_ctx_is_active(this)) {
+        throw std::runtime_error(
+            "llama_context::state_seq_write_data: refusing per-seq slot save while a RERoT episode is active "
+            "(shared visibility/epochs/lineage need whole-episode persist: state_write_data envelope + "
+            "server_rerot save_episode; per-seq bytes would silently drop them)");
+    }
     GGML_UNUSED(seq_id);
+
+    // FlashPrefill policy envelope (StatePolicy): enabled-only framed identity
+    // header after the outer magic+seq_id prefix (distinct enabled magic, so
+    // OFF readers already rejected above), ahead of the memory seq bytes. OFF
+    // is a no-op — legacy seq bytes unchanged.
+    flashprefill_state_write_envelope(io, llama_flashprefill_state::kScopeSeq);
 
     if (memory) {
         memory->state_write(io, seq_id, flags);
@@ -3204,6 +5672,26 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // RERoT granularity guard: no per-seq restore into an active episode (it
+    // would orphan the shared run table/epochs/lineage). Restore the whole
+    // episode instead (matching state_read_data envelope plus the server
+    // server_rerot load_episode blob, with magic/version/caps/fingerprint
+    // triple validated and mismatches explicitly rejected).
+    // PARTIAL_ONLY (recurrent state only) is explicitly permitted to support
+    // queued parent state restoration without pinning GPU VRAM.
+    // FlashPrefill policy envelope (StatePolicy): enabled-only prevalidation
+    // BEFORE the memory seq bytes are consumed (the distinct outer magic+seq_id
+    // prefix was already consumed and checked by the caller). Missing/unknown/mismatching
+    // headers throw with a re-prefill path; OFF is a no-op. Runs before the
+    // RERoT granularity guard so unidentified bytes never reach it.
+    flashprefill_state_read_envelope(io, llama_flashprefill_state::kScopeSeq);
+
+    if (cparams.rerot_enabled && llama_rerot_ctx_is_active(this) &&
+        (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        throw std::runtime_error(
+            "llama_context::state_seq_read_data: refusing per-seq slot restore while a RERoT episode is active "
+            "(shared episode state needs whole-episode restore; per-seq bytes would orphan lineage)");
+    }
     GGML_UNUSED(seq_id);
 
     if (memory) {
@@ -3424,6 +5912,11 @@ void llama_context::opt_epoch_iter(
                 }
             }
             ggml_opt_eval(opt_ctx, result);
+            // Training must not advance on an uncommitted cache state.
+            if (!mctx->postcompute_success()) {
+                LLAMA_LOG_ERROR("%s: postcompute commit failed, aborting epoch\n", __func__);
+                break;
+            }
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
             }
@@ -3487,11 +5980,15 @@ void llama_context::opt_epoch(
 //
 
 llama_context_params llama_context_default_params() {
+    const struct llama_xkv_params xkv_defaults = llama_xkv_default_params();
+
     llama_context_params result = {
         /*.n_ctx                       =*/ 512,
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
+        /*.n_seq_max_pp                =*/ 0,
+        /*.n_seq_recurrent             =*/ 0,
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
@@ -3524,6 +6021,39 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.n_ctx_kv                    =*/ 0,
+        /*.triattention                =*/ false,
+        /*.triattention_stats          =*/ nullptr,
+        /*.triattention_ratio          =*/ 3.0 / 32.0,
+        /*.rerot                       =*/ false,
+        /*.rerot_frontier              =*/ LLAMA_REROT_FRONTIER_STRONG,
+        /*.n_person_max                =*/ 0,
+        /*.n_pen_max                   =*/ 0,
+        /*.flashprefill                =*/ llama_flashprefill_default_config(),
+        /*.xkv_mode                    =*/ (enum llama_xkv_mode) LLAMA_XKV_MODE_OFF,
+        /*.xkv_storage_profile         =*/ (enum llama_xkv_storage_profile) xkv_defaults.storage_profile,
+        /*.xkv_group_size              =*/ xkv_defaults.group_size,
+        /*.xkv_rank_k                  =*/ xkv_defaults.rank_k,
+        /*.xkv_rank_v                  =*/ xkv_defaults.rank_v,
+        /*.xkv_segment_tokens          =*/ xkv_defaults.segment_tokens,
+        /*.xkv_chunk_tokens            =*/ xkv_defaults.chunk_tokens,
+        /*.xkv_sr_budget               =*/ xkv_defaults.sr_budget,
+        /*.xkv_source                  =*/ xkv_defaults.source,
+        /*.xkv_factor_a_k              =*/ xkv_defaults.factor_a_k,
+        /*.xkv_factor_b_k              =*/ xkv_defaults.factor_b_k,
+        /*.xkv_factor_a_v              =*/ xkv_defaults.factor_a_v,
+        /*.xkv_factor_b_v              =*/ xkv_defaults.factor_b_v,
+        /*.xkv_factor_balance          =*/ xkv_defaults.factor_balance,
+        /*.xkv_landmark_type           =*/ xkv_defaults.landmark_type,
+        /*.xkv_landmark_refine         =*/ xkv_defaults.landmark_refine,
+        /*.xkv_landmark_refine_max_rows=*/ xkv_defaults.landmark_refine_max_rows,
+        /*.xkv_workspace_mib           =*/ xkv_defaults.workspace_mib,
+        /*.xkv_decode_cache_mib        =*/ xkv_defaults.decode_cache_mib,
+        /*.xkv_store_mib               =*/ xkv_defaults.store_mib,
+        /*.xkv_seed                    =*/ xkv_defaults.seed,
+        /*.xkv_min_saving              =*/ xkv_defaults.min_saving,
+        /*.xkv_min_factor_coverage     =*/ xkv_defaults.min_factor_coverage,
+        /*.xkv_factorizer              =*/ xkv_defaults.factorizer,
     };
 
     return result;
@@ -3691,6 +6221,10 @@ uint32_t llama_n_ctx_seq(const llama_context * ctx) {
     return ctx->n_ctx_seq();
 }
 
+uint32_t llama_n_ctx_kv(const llama_context * ctx) {
+    return ctx->n_ctx_kv();
+}
+
 uint32_t llama_n_batch(const llama_context * ctx) {
     return ctx->n_batch();
 }
@@ -3701,6 +6235,10 @@ uint32_t llama_n_ubatch(const llama_context * ctx) {
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {
     return ctx->n_seq_max();
+}
+
+uint32_t llama_n_seq_recurrent(const llama_context * ctx) {
+    return ctx->get_cparams().n_seq_recurrent;
 }
 
 uint32_t llama_n_rs_seq(const llama_context * ctx) {
@@ -3804,6 +6342,10 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
     ctx->set_embeddings_layer_inp(lid, value);
 }
 
+void llama_set_attention_q_pre_rope(llama_context * ctx, uint32_t lid, bool value) {
+    ctx->set_attention_q_pre_rope(lid, value);
+}
+
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
 }
@@ -3834,6 +6376,12 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     return ctx->get_embeddings_layer_inp(lid);
 }
 
+float * llama_get_attention_q_pre_rope(llama_context * ctx, uint32_t lid) {
+    ctx->synchronize();
+
+    return ctx->get_attention_q_pre_rope(lid);
+}
+
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
     return ctx->set_sampler(seq_id, smpl);
 }
@@ -3841,6 +6389,10 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
+    return ctx->get_sampled_token_ith(i);
+}
+
+llama_token llama_get_sampled_token_ith_no_sync(llama_context * ctx, int32_t i) {
     return ctx->get_sampled_token_ith(i);
 }
 
@@ -3904,9 +6456,10 @@ int32_t llama_set_adapters_lora(
         GGML_ASSERT(n_adapters == 0 && "invalid llama_set_adapters_lora call");
     }
 
-    ctx->set_adapters_lora(adapters, n_adapters, scales);
-
-    return 0;
+    // Existing int32_t error contract: 0 applied (or identical no-op), -1
+    // refused (effective change unsafe: FlashPrefill enabled atop an active
+    // RERoT episode — zero mutation, coherent graph untouched).
+    return ctx->set_adapters_lora(adapters, n_adapters, scales) ? 0 : -1;
 }
 
 int32_t llama_set_adapter_cvec(
@@ -3926,11 +6479,39 @@ int32_t llama_set_adapter_cvec(
 //
 
 void llama_memory_clear(llama_memory_t mem, bool data) {
-    if (!mem) {
-        return;
+    // Truly noexcept: the whole body is guarded; the catch path uses only a
+    // static message (no allocation while reporting). Legacy void entry:
+    // logs an explicit refusal and returns unchanged. Callers that must
+    // branch use llama_memory_try_clear.
+    try {
+        if (!mem) {
+            return;
+        }
+        std::string err;
+        if (!mem->try_clear(data, &err)) {
+            LLAMA_LOG_ERROR("%s: memory clear refused: %s\n", __func__, err.c_str());
+        }
+    } catch (...) {
+        LLAMA_LOG_ERROR("llama_memory_clear failed with exception\n");
     }
+}
 
-    mem->clear(data);
+bool llama_memory_try_clear(llama_memory_t mem, bool data) {
+    // Truly noexcept: guarded throughout; the catch path allocates nothing
+    // and reports false.
+    try {
+        if (!mem) {
+            return false;
+        }
+        std::string err;
+        if (!mem->try_clear(data, &err)) {
+            LLAMA_LOG_ERROR("%s: memory clear failed: %s\n", __func__, err.c_str());
+            return false;
+        }
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 bool llama_memory_seq_rm(
@@ -3958,6 +6539,793 @@ void llama_memory_seq_cp(
     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
+bool llama_memory_seq_rm_attention(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return true;
+    }
+
+    return mem->seq_rm_attention(seq_id, p0, p1);
+}
+
+void llama_memory_seq_cp_attention(
+        llama_memory_t mem,
+          llama_seq_id seq_id_src,
+          llama_seq_id seq_id_dst,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return;
+    }
+
+    mem->seq_cp_attention(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_memory_seq_rm_recurrent(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return true;
+    }
+
+    return mem->seq_rm_recurrent(seq_id, p0, p1);
+}
+
+void llama_memory_seq_cp_recurrent(
+        llama_memory_t mem,
+          llama_seq_id seq_id_src,
+          llama_seq_id seq_id_dst,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return;
+    }
+
+    mem->seq_cp_recurrent(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_memory_rerot_set_write_tag(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+    const llama_rerot_kv_write_tag * tag) {
+    if (!mem || !tag) {
+        return false;
+    }
+
+    llama_rerot_visibility visibility;
+    switch (tag->visibility) {
+        case LLAMA_REROT_KV_PUBLIC_LIVE:
+            visibility = llama_rerot_visibility::public_live;
+            break;
+        case LLAMA_REROT_KV_PRIVATE_CONTROL:
+            visibility = llama_rerot_visibility::private_control;
+            break;
+        case LLAMA_REROT_KV_PENDING_RECORD:
+            visibility = llama_rerot_visibility::pending_record;
+            break;
+        default:
+            return false;
+    }
+
+    llama_kv_rerot_meta internal;
+    internal.episode_id = tag->episode_id;
+    internal.node_id = tag->node_id;
+    internal.run_id = tag->run_id;
+    internal.publish_epoch = tag->publish_epoch;
+    internal.frontier = tag->frontier;
+    internal.visibility = visibility;
+    return mem->rerot_set_write_tag(seq_id, internal);
+}
+
+void llama_memory_rerot_clear_write_tag(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    if (mem) {
+        mem->rerot_clear_write_tag(seq_id);
+    }
+}
+
+size_t llama_memory_rerot_publish_run(
+        llama_memory_t mem,
+        uint64_t episode_id,
+        uint32_t run_id,
+        uint64_t publish_epoch) {
+    if (!mem) {
+        return 0;
+    }
+    return mem->rerot_publish_run(episode_id, run_id, publish_epoch);
+}
+
+size_t llama_memory_rerot_reclassify_run(
+        llama_memory_t mem,
+        uint64_t episode_id,
+        uint32_t run_id,
+        llama_rerot_kv_visibility expected,
+        llama_rerot_kv_visibility replacement,
+        uint64_t publish_epoch) {
+    if (!mem) {
+        return 0;
+    }
+    const auto convert = [](llama_rerot_kv_visibility value) {
+        switch (value) {
+            case LLAMA_REROT_KV_PUBLIC_LIVE:    return llama_rerot_visibility::public_live;
+            case LLAMA_REROT_KV_PRIVATE_CONTROL:return llama_rerot_visibility::private_control;
+            case LLAMA_REROT_KV_PENDING_RECORD: return llama_rerot_visibility::pending_record;
+        }
+        return llama_rerot_visibility::normal;
+    };
+    return mem->rerot_reclassify_run(
+        episode_id, run_id, convert(expected), convert(replacement), publish_epoch);
+}
+
+size_t llama_memory_rerot_add_run_ref(
+        llama_memory_t mem,
+        uint64_t episode_id,
+        uint32_t run_id,
+        llama_seq_id seq_id) {
+    if (!mem) {
+        return 0;
+    }
+    return mem->rerot_add_run_ref(episode_id, run_id, seq_id);
+}
+
+bool llama_memory_rerot_set_reader_view(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+    const llama_rerot_reader_view_desc * view) {
+    if (!mem || !view || !view->ordered_run_ids || view->n_ordered_runs == 0 ||
+        view->episode_id == 0 || view->reader_node_id == UINT32_MAX || view->query_run_id == UINT32_MAX) {
+        return false;
+    }
+
+    llama_rerot_reader_state internal;
+    internal.episode_id = view->episode_id;
+    internal.reader = view->reader_node_id;
+    internal.query_run = view->query_run_id;
+    internal.frontier = view->frontier;
+    internal.topology_epoch = view->stamp.topology_epoch;
+    internal.publish_epoch = view->stamp.publish_epoch;
+    internal.layout_epoch = view->stamp.layout_epoch;
+    internal.frontier_mode = view->frontier_mode;
+    internal.ordered_runs.assign(view->ordered_run_ids, view->ordered_run_ids + view->n_ordered_runs);
+    return mem->rerot_set_reader_view(seq_id, internal);
+}
+
+void llama_memory_rerot_clear_reader_view(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    if (mem) {
+        mem->rerot_clear_reader_view(seq_id);
+    }
+}
+
+size_t llama_memory_rerot_capture_hand_seed(
+        llama_memory_t mem,
+          llama_seq_id source_seq,
+               uint8_t * dst,
+                size_t   size) {
+    if (!mem) {
+        return 0;
+    }
+    if (!dst) {
+        return mem->rerot_hand_seed_size(source_seq);
+    }
+    std::vector<uint8_t> blob;
+    if (!mem->rerot_capture_hand_seed(source_seq, blob) || blob.empty()) {
+        return 0;
+    }
+    if (size < blob.size()) {
+        return blob.size();
+    }
+    std::memcpy(dst, blob.data(), blob.size());
+    return blob.size();
+}
+
+bool llama_memory_rerot_apply_hand_seed(
+        llama_memory_t mem,
+          llama_seq_id dest_seq,
+         const uint8_t * src,
+                size_t   size) {
+    if (!mem || !src || size == 0) {
+        return false;
+    }
+    const std::vector<uint8_t> blob(src, src + size);
+    return mem->rerot_apply_hand_seed(dest_seq, blob);
+}
+
+bool llama_memory_rerot_commit_rbb_frontier(
+        llama_memory_t mem,
+              uint32_t person_id,
+    const llama_seq_id * candidate_seqs,
+         const uint8_t * is_public_write,
+                size_t n_candidates) {
+    if (!mem || !candidate_seqs || !is_public_write || n_candidates == 0) {
+        return false;
+    }
+    return mem->rerot_commit_rbb_frontier(person_id, candidate_seqs, is_public_write, n_candidates);
+}
+
+//
+// RERoT experimental context glue (Stage 7 + compat core)
+// All entries are gated by rerot_enabled + episode-active; OFF returns safe
+// defaults with no state touched.
+//
+
+bool llama_rerot_episode_begin(
+        llama_context * ctx,
+               uint64_t episode_id,
+    const llama_rerot_episode_params * params) {
+    if (!llama_rerot_ctx_enabled(ctx) || episode_id == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_rerot_mu);
+    auto & st = g_rerot_states[ctx];
+    if (st.episodes.count(episode_id) != 0) {
+        LLAMA_LOG_ERROR("%s: episode %" PRIu64 " already active on this context\n",
+            __func__, episode_id);
+        return false;
+    }
+    llama_rerot_episode_ctx_state ep_st;
+    ep_st.episode_id = episode_id;
+    ep_st.topology_epoch = params ? params->topology_epoch : 1;
+    ep_st.publish_epoch  = params ? params->publish_epoch  : 1;
+    ep_st.layout_epoch   = params ? params->layout_epoch   : 1;
+    if (ep_st.topology_epoch == 0) { ep_st.topology_epoch = 1; }
+    if (ep_st.publish_epoch  == 0) { ep_st.publish_epoch  = 1; }
+    if (ep_st.layout_epoch   == 0) { ep_st.layout_epoch   = 1; }
+    ep_st.frontier_mode = params ? params->frontier_mode : ctx->get_cparams().rerot_frontier;
+    st.episodes[episode_id] = std::move(ep_st);
+    st.mem = ctx->get_memory();
+    return true;
+}
+
+void llama_rerot_episode_end(llama_context * ctx, uint64_t episode_id) {
+    if (!llama_rerot_ctx_enabled(ctx) || episode_id == 0) {
+        return;
+    }
+    llama_memory_t mem = nullptr;
+    std::vector<llama_seq_id> to_clear;
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        auto it = g_rerot_states.find(ctx);
+        if (it == g_rerot_states.end() || it->second.episodes.count(episode_id) == 0) {
+            return;
+        }
+        mem = it->second.mem;
+        for (auto bit = it->second.exec_bindings.begin(); bit != it->second.exec_bindings.end();) {
+            if (bit->second.episode_id == episode_id) {
+                to_clear.push_back(bit->first);
+                bit = it->second.exec_bindings.erase(bit);
+            } else {
+                ++bit;
+            }
+        }
+        it->second.episodes.erase(episode_id);
+        if (it->second.episodes.empty()) {
+            g_rerot_states.erase(it);
+        }
+    }
+    // Clear episode control state ONLY for sequences bound to this episode (§§B.5, B.13 Phase 2).
+    // B/C views/tags/stamps remain strictly intact.
+    if (mem) {
+        for (llama_seq_id s : to_clear) {
+            mem->rerot_clear_write_tag(s);
+            mem->rerot_clear_reader_view(s);
+        }
+        mem->rerot_release_episode(episode_id);
+    }
+}
+
+bool llama_rerot_is_active(const struct llama_context * ctx, uint64_t episode_id) {
+    return llama_rerot_ctx_is_active(ctx, episode_id);
+}
+
+uint32_t llama_memory_get_brain_capacity(const struct llama_context * ctx) {
+    return ctx && ctx->get_memory() ? ctx->get_memory()->get_brain_capacity() : 0;
+}
+
+uint32_t llama_memory_get_hand_capacity(const struct llama_context * ctx) {
+    return ctx && ctx->get_memory() ? ctx->get_memory()->get_hand_capacity() : 0;
+}
+
+uint32_t llama_memory_get_brain_used(const struct llama_context * ctx) {
+    return ctx && ctx->get_memory() ? ctx->get_memory()->get_brain_used() : 0;
+}
+
+uint32_t llama_memory_get_hand_used(const struct llama_context * ctx) {
+    return ctx && ctx->get_memory() ? ctx->get_memory()->get_hand_used() : 0;
+}
+
+bool llama_rerot_set_write_tag(
+        llama_context * ctx,
+          llama_seq_id seq_id,
+    const llama_rerot_write_tag * tag) {
+    if (!llama_rerot_ctx_enabled(ctx) || tag == nullptr) {
+        return false;
+    }
+    if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ) {
+        return false;
+    }
+    llama_memory_t mem = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        auto it = g_rerot_states.find(ctx);
+        if (it == g_rerot_states.end() || it->second.episodes.count(tag->episode_id) == 0) {
+            return false;
+        }
+        // Sequence binding constraint (§B.5): same seq cannot be bound to two different episodes
+        auto bit = it->second.exec_bindings.find(seq_id);
+        if (bit != it->second.exec_bindings.end() && bit->second.episode_id != tag->episode_id) {
+            return false;
+        }
+        it->second.exec_bindings[seq_id] = {tag->episode_id, tag->node_id, (int32_t) seq_id};
+        mem = it->second.mem;
+    }
+    if (mem == nullptr) {
+        mem = ctx->get_memory();
+    }
+    bool ok = false;
+    const llama_rerot_visibility internal_vis = llama_rerot_ctx_convert_visibility(tag->visibility, &ok);
+    if (!ok) {
+        return false;
+    }
+    // Publication-epoch contract mirrors the KV rules: only PUBLIC_LIVE
+    // carries a non-zero epoch. apply_ubatch() copies this tag into each
+    // newly allocated cell (§11.2 hook point).
+    if ((internal_vis == llama_rerot_visibility::public_live) == (tag->publish_epoch == 0)) {
+        return false;
+    }
+    if (mem != nullptr) {
+        llama_rerot_kv_write_tag mem_tag;
+        mem_tag.episode_id = tag->episode_id;
+        mem_tag.node_id = tag->node_id;
+        mem_tag.run_id = tag->run_id;
+        mem_tag.publish_epoch = tag->publish_epoch;
+        mem_tag.frontier = tag->frontier;
+        mem_tag.visibility = tag->visibility;
+        return llama_memory_rerot_set_write_tag(mem, seq_id, &mem_tag);
+    }
+    return true;
+}
+
+size_t llama_rerot_publish_run(
+        llama_context * ctx,
+    const llama_rerot_publish * req) {
+    if (!llama_rerot_ctx_enabled(ctx) || req == nullptr || req->episode_id == 0 || req->publish_epoch == 0) {
+        return 0;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        auto it = g_rerot_states.find(ctx);
+        if (it == g_rerot_states.end() || it->second.episodes.count(req->episode_id) == 0) {
+            return 0;
+        }
+        auto & ep_st = it->second.episodes[req->episode_id];
+        if (req->publish_epoch < ep_st.publish_epoch) {
+            // Stale publish: epochs only move forward (§A.6).
+            return 0;
+        }
+        ep_st.publish_epoch = req->publish_epoch;
+    }
+    llama_memory_t mem = ctx->get_memory();
+    if (mem != nullptr) {
+        return llama_memory_rerot_publish_run(mem, req->episode_id, req->run_id, req->publish_epoch);
+    }
+    return 1;
+}
+
+bool llama_rerot_set_frontier_views(
+        llama_context * ctx,
+    const llama_rerot_frontier_reader_view * views,
+                  size_t n_views) {
+    if (!llama_rerot_ctx_enabled(ctx) || views == nullptr || n_views == 0) {
+        return false;
+    }
+    const uint64_t episode_id = views[0].episode_id;
+    llama_memory_t mem = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        auto it = g_rerot_states.find(ctx);
+        if (it == g_rerot_states.end() || it->second.episodes.count(episode_id) == 0) {
+            return false;
+        }
+        for (size_t i = 0; i < n_views; ++i) {
+            const auto & v = views[i];
+            if (v.episode_id != episode_id) {
+                return false;
+            }
+            auto bit = it->second.exec_bindings.find(v.seq_id);
+            if (bit != it->second.exec_bindings.end() && bit->second.episode_id != episode_id) {
+                return false; // same seq cannot be bound to two episodes
+            }
+        }
+        mem = it->second.mem;
+    }
+    if (mem == nullptr) {
+        mem = ctx->get_memory();
+    }
+    // Validate all descriptors before mutating any (all-or-nothing frontier
+    // installation for graph-reuse stability, §A.21).
+    for (size_t i = 0; i < n_views; ++i) {
+        const auto & v = views[i];
+        if (v.ordered_run_ids == nullptr || v.n_ordered_runs == 0 ||
+            v.reader_node_id == UINT32_MAX || v.query_run_id == UINT32_MAX ||
+            v.seq_id < 0 || v.seq_id >= LLAMA_MAX_SEQ) {
+            return false;
+        }
+    }
+    if (mem != nullptr) {
+        for (size_t i = 0; i < n_views; ++i) {
+            const auto & v = views[i];
+            llama_rerot_reader_view_desc desc;
+            desc.episode_id = v.episode_id;
+            desc.reader_node_id = v.reader_node_id;
+            desc.query_run_id = v.query_run_id;
+            desc.frontier = v.frontier;
+            desc.frontier_mode = v.frontier_mode;
+            desc.stamp = v.stamp;
+            desc.ordered_run_ids = v.ordered_run_ids;
+            desc.n_ordered_runs = v.n_ordered_runs;
+            if (!llama_memory_rerot_set_reader_view(mem, v.seq_id, &desc)) {
+                return false;
+            }
+        }
+    }
+    // Record stamps for MTP staleness binding (§A.6) only after all views
+    // installed successfully.
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        auto it = g_rerot_states.find(ctx);
+        if (it == g_rerot_states.end() || it->second.episodes.count(episode_id) == 0) {
+            return false;
+        }
+        auto & ep_st = it->second.episodes[episode_id];
+        for (size_t i = 0; i < n_views; ++i) {
+            ep_st.view_stamps[views[i].seq_id] = views[i].stamp;
+            it->second.exec_bindings[views[i].seq_id] = {episode_id, views[i].reader_node_id, (int32_t) views[i].seq_id};
+            if (views[i].stamp.topology_epoch > ep_st.topology_epoch) {
+                ep_st.topology_epoch = views[i].stamp.topology_epoch;
+            }
+            if (views[i].stamp.publish_epoch > ep_st.publish_epoch) {
+                ep_st.publish_epoch = views[i].stamp.publish_epoch;
+            }
+            if (views[i].stamp.layout_epoch > ep_st.layout_epoch) {
+                ep_st.layout_epoch = views[i].stamp.layout_epoch;
+            }
+        }
+    }
+    return true;
+}
+
+bool llama_rerot_freeze_to_archive(
+        llama_context * ctx,
+               uint64_t episode_id,
+             llama_seq_id exec_seq,
+             llama_seq_id archive_seq,
+                   size_t * kept_out) {
+    if (kept_out) {
+        *kept_out = 0;
+    }
+    if (!llama_rerot_ctx_enabled(ctx) || episode_id == 0 || exec_seq < 0 || archive_seq < 0 ||
+        exec_seq == archive_seq || exec_seq >= LLAMA_MAX_SEQ || archive_seq >= LLAMA_MAX_SEQ) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        auto it = g_rerot_states.find(ctx);
+        if (it == g_rerot_states.end() || it->second.episodes.count(episode_id) == 0) {
+            return false;
+        }
+        it->second.exec_bindings.erase(exec_seq);
+        it->second.episodes[episode_id].view_stamps.erase(exec_seq);
+    }
+    llama_memory_t mem = ctx->get_memory();
+    if (mem == nullptr) {
+        return false;
+    }
+    // Direct KV path (§7.2): PUBLIC_LIVE cells gain archive_seq as keeper,
+    // exec_seq attention refs are released without moving K/V and without
+    // touching visibility metadata. Hybrid models additionally release the
+    // recurrent exec handle (lane-local COW lineage already parked by the
+    // server runtime via seq_cp_recurrent).
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        size_t kept = 0;
+        if (!kv->rerot_can_freeze_to_archive(episode_id, exec_seq, archive_seq, &kept)) {
+            return false;
+        }
+        kept = kv->rerot_freeze_to_archive(episode_id, exec_seq, archive_seq);
+        // Recurrent side is a no-op for pure-attention memory (vacuously
+        // successful per llama_memory_i defaults); hybrid callers release
+        // recurrent exec refs via seq_rm_recurrent separately.
+        mem->seq_rm_recurrent(exec_seq, -1, -1);
+        if (kept_out) {
+            *kept_out = kept;
+        }
+        return true;
+    }
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        llama_kv_cache * attn = hybrid->get_mem_attn();
+        if (attn == nullptr || !attn->rerot_can_freeze_to_archive(episode_id, exec_seq, archive_seq, nullptr)) {
+            return false;
+        }
+        const size_t kept = attn->rerot_freeze_to_archive(episode_id, exec_seq, archive_seq);
+        if (!mem->seq_rm_recurrent(exec_seq, -1, -1)) {
+            return false;
+        }
+        if (kept_out) {
+            *kept_out = kept;
+        }
+        return true;
+    }
+    // ISWA and other composites have no direct freeze helper; the server
+    // runtime performs the equivalent archive via rerot_add_run_ref per
+    // PUBLIC run + seq_rm_attention/recurrent, so report unsupported here
+    // rather than silently dropping public history.
+    return false;
+}
+
+uint32_t llama_rerot_state_caps(const llama_context * ctx) {
+    if (!llama_rerot_ctx_enabled(ctx)) {
+        return (uint32_t) LLAMA_REROT_STATE_CAP_NONE;
+    }
+    uint32_t caps = 0;
+    bool active = false;
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        auto it = g_rerot_states.find(ctx);
+        active = it != g_rerot_states.end() && !it->second.episodes.empty();
+    }
+    if (active) {
+        caps |= (uint32_t) LLAMA_REROT_STATE_CAP_REROT;
+        caps |= (uint32_t) LLAMA_REROT_STATE_CAP_REROT_TREE;
+        caps |= (uint32_t) LLAMA_REROT_STATE_CAP_REROT_PRIVATE;
+        caps |= (uint32_t) LLAMA_REROT_STATE_CAP_REROT_MTP;
+    }
+    llama_memory_t mem = ctx->get_memory();
+    if (mem) {
+        if (mem->get_recurrent_capacity() > 0) {
+            caps |= (uint32_t) LLAMA_REROT_STATE_CAP_HYBRID_REC;
+        }
+        if (mem->positions_are_sparse()) {
+            caps |= (uint32_t) LLAMA_REROT_STATE_CAP_SPARSE_KV;
+        }
+    }
+    if (ctx->get_cparams().triattention_enabled) {
+        caps |= (uint32_t) LLAMA_REROT_STATE_CAP_TRIATTENTION;
+    }
+    return caps;
+}
+
+bool llama_rerot_refresh_barrier(llama_context * ctx, uint64_t episode_id) {
+    if (!llama_rerot_ctx_enabled(ctx) || episode_id == 0) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        auto it = g_rerot_states.find(ctx);
+        if (it == g_rerot_states.end() || it->second.episodes.count(episode_id) == 0) {
+            return false;
+        }
+    }
+    ctx->synchronize();
+    return true;
+}
+
+bool llama_rerot_mtp_is_stale(
+        llama_context * ctx,
+          llama_seq_id seq_id,
+    const llama_rerot_view_stamp * stamp) {
+    // Fast path: if RERoT is disabled, stamp is null, uninitialized ({0, 0, 0}),
+    // or seq_id is out of range, this path incurs zero overhead and returns false (§A.6, §A.12).
+    if (!llama_rerot_ctx_enabled(ctx) || stamp == nullptr || seq_id < 0 || seq_id >= LLAMA_MAX_SEQ) {
+        return false;
+    }
+    if (stamp->topology_epoch == 0 && stamp->publish_epoch == 0 && stamp->layout_epoch == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_rerot_mu);
+    auto it = g_rerot_states.find(ctx);
+    if (it == g_rerot_states.end() || it->second.episodes.empty()) {
+        return false;
+    }
+    // Check execution binding first to isolate this sequence to its owning episode (§§B.5, A.6).
+    auto bit = it->second.exec_bindings.find(seq_id);
+    if (bit != it->second.exec_bindings.end()) {
+        auto ep_it = it->second.episodes.find(bit->second.episode_id);
+        if (ep_it != it->second.episodes.end()) {
+            const auto & ep_st = ep_it->second;
+            // Any newer peer PUBLIC commit or topology/layout epoch advance in the owning episode
+            // invalidates the draft (§A.6.1, §A.6.2).
+            if (ep_st.publish_epoch > stamp->publish_epoch ||
+                ep_st.topology_epoch > stamp->topology_epoch ||
+                ep_st.layout_epoch > stamp->layout_epoch) {
+                return true;
+            }
+            auto jt = ep_st.view_stamps.find(seq_id);
+            if (jt != ep_st.view_stamps.end()) {
+                const auto & cur = jt->second;
+                return cur.topology_epoch != stamp->topology_epoch ||
+                       cur.publish_epoch  != stamp->publish_epoch  ||
+                       cur.layout_epoch   != stamp->layout_epoch;
+            }
+        }
+    }
+    // Fallback search across episodes for sequences not explicitly bound in exec_bindings
+    for (const auto & ep_kv : it->second.episodes) {
+        const auto & ep_st = ep_kv.second;
+        auto jt = ep_st.view_stamps.find(seq_id);
+        if (jt != ep_st.view_stamps.end()) {
+            if (ep_st.publish_epoch > stamp->publish_epoch ||
+                ep_st.topology_epoch > stamp->topology_epoch ||
+                ep_st.layout_epoch > stamp->layout_epoch) {
+                return true;
+            }
+            const auto & cur = jt->second;
+            return cur.topology_epoch != stamp->topology_epoch ||
+                   cur.publish_epoch  != stamp->publish_epoch  ||
+                   cur.layout_epoch   != stamp->layout_epoch;
+        }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// RERoT episode persistence + shift entry points (§§25,A.8-A.10, declared in
+// tools/server/server-rerot.h). All gated by rerot_enabled + episode-active;
+// OFF returns safe defaults with no state touched.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct llama_rerot_ctx_vec_io : public llama_io_write_i {
+    std::vector<uint8_t> buf;
+    void write(const void * src, size_t size) override {
+        const auto * b = static_cast<const uint8_t *>(src);
+        buf.insert(buf.end(), b, b + size);
+    }
+    void write_tensor(ggml_tensor *, size_t, size_t) override {
+        throw std::runtime_error("RERoT envelope carries no tensor bytes");
+    }
+    size_t n_bytes() override {
+        return buf.size();
+    }
+};
+
+} // namespace
+
+server_rerot_state_fingerprints llama_rerot_context_fingerprints(const struct llama_context * ctx) {
+    server_rerot_state_fingerprints fp;
+    if (ctx == nullptr || !ctx->get_cparams().rerot_enabled) {
+        return fp;
+    }
+    fp.caps     = llama_rerot_state_caps(ctx);
+    fp.model_fp = llama_rerot_ctx_fp_model(ctx);
+    fp.rope_fp  = llama_rerot_ctx_fp_rope(ctx);
+    fp.tri_fp   = llama_rerot_ctx_fp_tri(ctx);
+    return fp;
+}
+
+bool llama_rerot_context_save_envelope_episode(
+        struct llama_context * ctx,
+        uint64_t episode_id,
+        std::vector<uint8_t> & blob_out,
+        std::string * error_out) {
+    if (ctx == nullptr) {
+        return llama_rerot_ctx_fail(error_out, "RERoT envelope save refused: null context");
+    }
+    if (!llama_rerot_ctx_enabled(ctx)) {
+        return llama_rerot_ctx_fail(error_out, "RERoT envelope save refused: RERoT is disabled on this context");
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        const auto it = g_rerot_states.find(ctx);
+        if (it == g_rerot_states.end() || it->second.episodes.empty()) {
+            return llama_rerot_ctx_fail(error_out, "RERoT envelope save refused: no active episode on this context");
+        }
+        if (episode_id != 0 && it->second.episodes.count(episode_id) == 0) {
+            return llama_rerot_ctx_fail(error_out, "RERoT envelope save refused: specified episode is not active");
+        }
+    }
+    try {
+        llama_rerot_ctx_vec_io io;
+        llama_rerot_ctx_write_envelope_body(ctx, io, episode_id);
+        blob_out = std::move(io.buf);
+        return true;
+    } catch (const std::exception & ex) {
+        return llama_rerot_ctx_fail(error_out, ex.what());
+    }
+}
+
+bool llama_rerot_context_save_envelope(
+        struct llama_context * ctx,
+        std::vector<uint8_t> & blob_out,
+        std::string * error_out) {
+    return llama_rerot_context_save_envelope_episode(ctx, 0, blob_out, error_out);
+}
+
+bool llama_rerot_context_load_envelope(
+        struct llama_context * ctx,
+        const uint8_t * data,
+        size_t size,
+        std::string * error_out) {
+    if (ctx == nullptr || data == nullptr || size == 0) {
+        return llama_rerot_ctx_fail(error_out, "RERoT envelope load refused: empty blob or null target");
+    }
+    if (!llama_rerot_ctx_enabled(ctx)) {
+        return llama_rerot_ctx_fail(error_out, "RERoT envelope load refused: RERoT is disabled on this context "
+            "(envelope restore requires rerot_enabled; ordinary state stays on the ordinary path)");
+    }
+    try {
+        llama_io_read_host io(data, size);
+        llama_rerot_ctx_envelope env;
+        llama_rerot_ctx_read_envelope_body(ctx, io, env);
+        if (io.n_bytes() != size) {
+            return llama_rerot_ctx_fail(error_out, "RERoT envelope load refused: trailing garbage after envelope");
+        }
+        std::lock_guard<std::mutex> lock(g_rerot_mu);
+        auto & ctx_st = g_rerot_states[ctx];
+        llama_rerot_episode_ctx_state ep_st;
+        ep_st.episode_id = env.episode_id;
+        ep_st.topology_epoch = env.topology_epoch;
+        ep_st.publish_epoch = env.publish_epoch;
+        ep_st.layout_epoch = env.layout_epoch;
+        ep_st.frontier_mode = env.frontier_mode;
+        ep_st.view_stamps = std::move(env.stamps);
+        for (const auto & kv : ep_st.view_stamps) {
+            ctx_st.exec_bindings[kv.first] = {env.episode_id, 0, (int32_t) kv.first};
+        }
+        ctx_st.episodes[env.episode_id] = std::move(ep_st);
+        ctx_st.mem = ctx->get_memory();
+        return true;
+    } catch (const std::exception & ex) {
+        return llama_rerot_ctx_fail(error_out, ex.what());
+    }
+}
+
+bool llama_rerot_context_apply_shift(
+        struct llama_context * ctx,
+        uint64_t episode_id,
+        uint64_t tokens_removed,
+        uint64_t new_layout_epoch,
+        uint64_t new_publish_epoch,
+        std::string * error_out) {
+    if (ctx == nullptr || !llama_rerot_ctx_enabled(ctx)) {
+        return false;
+    }
+    if (episode_id == 0 || new_layout_epoch == 0 || new_publish_epoch == 0) {
+        return llama_rerot_ctx_fail(error_out, "RERoT shift apply refused: zero episode id or epoch");
+    }
+    std::lock_guard<std::mutex> lock(g_rerot_mu);
+    auto it = g_rerot_states.find(ctx);
+    if (it == g_rerot_states.end() || it->second.episodes.count(episode_id) == 0) {
+        return llama_rerot_ctx_fail(error_out, "RERoT shift apply refused: no matching active episode on this context");
+    }
+    auto & ep_st = it->second.episodes[episode_id];
+    if (new_layout_epoch > ep_st.layout_epoch) {
+        ep_st.layout_epoch = new_layout_epoch;
+    }
+    if (new_publish_epoch > ep_st.publish_epoch) {
+        ep_st.publish_epoch = new_publish_epoch;
+    }
+    if (tokens_removed == 0) {
+        return true;
+    }
+    for (auto & kv : ep_st.view_stamps) {
+        if (kv.second.publish_epoch < new_publish_epoch) {
+            kv.second.publish_epoch = new_publish_epoch;
+        }
+        if (kv.second.layout_epoch < new_layout_epoch) {
+            kv.second.layout_epoch = new_layout_epoch;
+        }
+    }
+    return true;
+}
+
 void llama_memory_seq_keep(
         llama_memory_t mem,
           llama_seq_id seq_id) {
@@ -3978,6 +7346,16 @@ void llama_memory_seq_add(
         return;
     }
 
+    // RERoT compat (§§A.9-A.10): active DDVR PUBLIC runs must never use the
+    // ordinary linear seq_add shift path (virtual positions are reader views,
+    // not storage positions). v1 refuses the shift with an explicit log and
+    // performs no mutation. OFF is untouched (mem-active is false).
+    if (llama_rerot_mem_is_active(mem)) {
+        LLAMA_LOG_ERROR("%s: refusing KV shift (seq_add) while a RERoT episode is active "
+            "(v1: shared-memory log truncation only via episode-aware shift; ordinary n_cache_reuse forbidden)\n", __func__);
+        return;
+    }
+
     mem->seq_add(seq_id, p0, p1, delta);
 }
 
@@ -3988,6 +7366,13 @@ void llama_memory_seq_div(
              llama_pos p1,
                    int d) {
     if (!mem) {
+        return;
+    }
+
+    // Same RERoT shift guard as seq_add (§§A.9-A.10): no ordinary position
+    // division on active shared-memory views. OFF untouched.
+    if (llama_rerot_mem_is_active(mem)) {
+        LLAMA_LOG_ERROR("%s: refusing KV shift (seq_div) while a RERoT episode is active (v1 unsupported)\n", __func__);
         return;
     }
 
@@ -4014,8 +7399,125 @@ llama_pos llama_memory_seq_pos_max(
     return mem->seq_pos_max(seq_id);
 }
 
+bool llama_memory_get_kv_usage(llama_memory_t mem, llama_memory_kv_usage * usage) {
+    if (!mem || !usage) {
+        return false;
+    }
+
+    const uint32_t capacity = mem->get_kv_capacity();
+    if (capacity == 0) {
+        return false;
+    }
+
+    usage->capacity = capacity;
+    usage->used     = mem->get_kv_used();
+    return true;
+}
+
+uint32_t llama_memory_seq_get_kv_used(llama_memory_t mem, llama_seq_id seq_id) {
+    if (!mem) {
+        return 0;
+    }
+
+    return mem->get_kv_seq_used(seq_id);
+}
+
+bool llama_memory_get_recurrent_usage(llama_memory_t mem, llama_memory_kv_usage * usage) {
+    if (!mem || !usage) {
+        return false;
+    }
+
+    const uint32_t capacity = mem->get_recurrent_capacity();
+    if (capacity == 0) {
+        return false;
+    }
+
+    usage->capacity = capacity;
+    usage->used     = mem->get_recurrent_used();
+    return true;
+}
+
+uint32_t llama_memory_seq_get_recurrent_used(llama_memory_t mem, llama_seq_id seq_id) {
+    if (!mem) {
+        return 0;
+    }
+
+    return mem->get_recurrent_seq_used(seq_id);
+}
+
+const char * llama_memory_limit_reason_name(enum llama_memory_limit_reason reason) {
+    switch (reason) {
+        case LLAMA_MEMORY_LIMIT_NONE:          return "none";
+        case LLAMA_MEMORY_LIMIT_LOGICAL_CELLS: return "logical_cells";
+        case LLAMA_MEMORY_LIMIT_HOT_SLOTS:     return "hot_slots";
+        case LLAMA_MEMORY_LIMIT_FACTOR_STORE:  return "factor_store";
+        case LLAMA_MEMORY_LIMIT_WORKSPACE:     return "workspace";
+        case LLAMA_MEMORY_LIMIT_RECURRENT:     return "recurrent";
+        default:                               return "unknown";
+    }
+}
+
+bool llama_memory_get_admission_snapshot(llama_memory_t mem, llama_memory_admission_snapshot * out) {
+    if (!mem || !out) {
+        return false;
+    }
+
+    return mem->get_admission_snapshot(out);
+}
+
+bool llama_memory_get_xkv_runtime_snapshot(llama_memory_t mem, llama_memory_xkv_runtime_snapshot * out) {
+    if (!mem || !out) {
+        return false;
+    }
+
+    return mem->get_xkv_runtime_snapshot(out);
+}
+
+llama_memory_maintenance_status llama_memory_maintain_safe_boundary(llama_memory_t mem) {
+    if (!mem) {
+        return LLAMA_MEMORY_MAINTENANCE_NO_ACTION;
+    }
+
+    return mem->maintain_safe_boundary();
+}
+
+const char * llama_memory_maintenance_status_name(enum llama_memory_maintenance_status status) {
+    switch (status) {
+        case LLAMA_MEMORY_MAINTENANCE_PROGRESS:        return "progress";
+        case LLAMA_MEMORY_MAINTENANCE_NO_ACTION:       return "no_action";
+        case LLAMA_MEMORY_MAINTENANCE_FLOOR_EXHAUSTED:  return "floor_exhausted";
+        case LLAMA_MEMORY_MAINTENANCE_RETRY_STALE:     return "retry_stale";
+        case LLAMA_MEMORY_MAINTENANCE_ERROR:           return "error";
+        default:                                        return "unknown";
+    }
+}
+
+const char * llama_memory_xkv_skip_reason_name(enum llama_memory_xkv_skip_reason reason) {
+    switch (reason) {
+        case LLAMA_MEMORY_XKV_SKIP_NONE:                 return "none";
+        case LLAMA_MEMORY_XKV_SKIP_NOT_COMMITTED:        return "not_committed";
+        case LLAMA_MEMORY_XKV_SKIP_UNSUPPORTED_CONFIG:   return "unsupported_config";
+        case LLAMA_MEMORY_XKV_SKIP_PREFLIGHT_OOM:        return "preflight_oom";
+        case LLAMA_MEMORY_XKV_SKIP_FACTORIZATION_FAILED: return "factorization_failed";
+        case LLAMA_MEMORY_XKV_SKIP_CODEC_ERROR:          return "codec_error";
+        case LLAMA_MEMORY_XKV_SKIP_ERROR_THRESHOLD:      return "error_threshold_exceeded";
+        case LLAMA_MEMORY_XKV_SKIP_NO_SAVING:            return "no_saving";
+        case LLAMA_MEMORY_XKV_SKIP_ABORTED:              return "aborted";
+        case LLAMA_MEMORY_XKV_SKIP_LANDMARK_REQUIRED:    return "landmark_required";
+        default:                                          return "unknown";
+    }
+}
+
 bool llama_memory_can_shift(llama_memory_t mem) {
     if (!mem) {
+        return false;
+    }
+
+    // RERoT compat (§A.10.3): ordinary chunk-reuse shifting is only legal on
+    // serial prefixes / frozen ordinary coordinates. While an episode is
+    // active report not-shiftable so server cache-reuse gates stay OFF.
+    // OFF untouched (mem-active is false).
+    if (llama_rerot_mem_is_active(mem)) {
         return false;
     }
 
@@ -4163,6 +7665,44 @@ int32_t llama_decode(
     return ret;
 }
 
+// FlashPrefill V2 explicit execution path (public declaration owned by
+// ConfigIntegration in include/llama.h; versioned + counted contract there).
+int32_t llama_decode_with_flashprefill(
+        llama_context * ctx,
+          llama_batch   batch,
+            const llama_flashprefill_exec * exec) {
+    if (ctx == nullptr) {
+        LLAMA_LOG_ERROR("%s: context cannot be NULL\n", __func__);
+        return -1;
+    }
+    const int ret = ctx->decode_with_flashprefill(batch, exec);
+    if (ret != 0 && ret != 1) {
+        LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
+    }
+
+    return ret;
+}
+
+// Immutable policy fingerprint for state/cache isolation and metrics
+// (public declaration owned by ConfigIntegration in include/llama.h).
+uint64_t llama_flashprefill_policy_fingerprint(const llama_context * ctx) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    return ctx->flashprefill_policy_fingerprint();
+}
+
+// Persistent state/cache key: policy fingerprint + context serial + adapter
+// generation (StatePolicy owner; public declaration in include/llama.h next
+// to the fingerprint getter above).
+uint64_t llama_flashprefill_state_cache_key(const llama_context * ctx) {
+    if (ctx == nullptr) {
+        return 0;
+    }
+    return ctx->flashprefill_state_cache_key();
+}
+
+
 //
 // perf
 //
@@ -4238,4 +7778,31 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+llama_memory_kv_reclaim_result llama_memory_reclaim_kv(
+        llama_memory_t mem,
+        const llama_memory_kv_reclaim_request * request) {
+    llama_memory_kv_reclaim_result result;
+    if (!mem || !request) {
+        return result;
+    }
+    return mem->reclaim_kv(*request);
+}
+
+llama_memory_kv_reclaim_result llama_context_reclaim_kv(
+        llama_context * ctx,
+        const llama_memory_kv_reclaim_request * request) {
+    llama_memory_kv_reclaim_result result;
+    if (!ctx || !request) {
+        return result;
+    }
+    return ctx->memory_reclaim_kv(*request);
+}
+
+bool llama_memory_positions_are_sparse(llama_memory_t mem) {
+    if (!mem) {
+        return false;
+    }
+    return mem->positions_are_sparse();
 }

@@ -345,8 +345,8 @@ static int run_generate(const std::string & snapshot_dir) {
         fprintf(stderr, "Fetching model metadata for %s from %s...\n", name.c_str(), spec.repo);
         auto result = gguf_fetch_model_meta(spec.repo, spec.quant);
         if (!result.has_value()) {
-            fprintf(stderr, "ERROR: could not fetch model metadata for %s\n", name.c_str());
-            return 1;
+            fprintf(stderr, "SKIP: could not fetch model metadata for %s\n", name.c_str());
+            continue;
         }
 
         const auto &                remote  = result.value();

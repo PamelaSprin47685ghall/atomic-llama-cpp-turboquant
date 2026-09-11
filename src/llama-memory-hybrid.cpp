@@ -22,6 +22,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                 ggml_type   type_r,
                 ggml_type   type_s,
                  uint32_t   rs_size,
+                 uint32_t   n_brain_max,
+                 uint32_t   n_hand_max,
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
@@ -29,7 +31,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+    const llama_cparams   * cparams) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -49,7 +52,8 @@ llama_memory_hybrid::llama_memory_hybrid(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
         nullptr,
-        nullptr
+        nullptr,
+        cparams
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -57,8 +61,10 @@ llama_memory_hybrid::llama_memory_hybrid(
         type_s,
         offload,
         rs_size,
-        n_seq_max,
+        unified ? LLAMA_MAX_SEQ : n_seq_max,
         n_rs_seq,
+        n_brain_max,
+        n_hand_max,
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
             : filter_recr
@@ -115,8 +121,19 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
+        // Target attention uses real hot reservations when bounded; the
+        // recurrent cache takes none. Failure fails prepare with zero residue.
+        std::vector<llama_xkv::xkv_hot_reservation> hot_res_attn;
+        {
+            std::string res_err;
+            if (!mem_attn->reserve_hot_slots(heads_attn, ubatches, hot_res_attn, &res_err)) {
+                LLAMA_LOG_ERROR("%s: %s\n", __func__, res_err.c_str());
+                return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+            }
+        }
+
         return std::make_unique<llama_memory_hybrid_context>(
-                this, std::move(heads_attn), std::move(ubatches));
+                this, std::move(heads_attn), std::move(ubatches), std::move(hot_res_attn));
     } while(false);
 
     return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -135,23 +152,222 @@ bool llama_memory_hybrid::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+uint32_t llama_memory_hybrid::get_kv_capacity() const {
+    return mem_attn->get_kv_capacity();
+}
+
+uint32_t llama_memory_hybrid::get_kv_used() const {
+    return mem_attn->get_kv_used();
+}
+
+uint32_t llama_memory_hybrid::get_kv_seq_used(llama_seq_id seq_id) const {
+    return mem_attn->get_kv_seq_used(seq_id);
+}
+
+uint32_t llama_memory_hybrid::get_kv_hot_capacity() const {
+    return mem_attn ? mem_attn->get_kv_hot_capacity() : get_kv_capacity();
+}
+
+bool llama_memory_hybrid::can_use_legacy_attention() const {
+    return mem_attn ? mem_attn->can_use_legacy_attention() : true;
+}
+
+bool llama_memory_hybrid::is_xkv_bounded_hot() const {
+    return mem_attn ? mem_attn->is_xkv_bounded_hot() : false;
+}
+
+bool llama_memory_hybrid::get_admission_snapshot(struct llama_memory_admission_snapshot * out) const {
+    if (out == nullptr) {
+        return false;
+    }
+    llama_memory_admission_snapshot attn = {};
+    if (mem_attn != nullptr && !mem_attn->get_admission_snapshot(&attn)) {
+        attn = {};
+    }
+    const uint32_t recr_cap  = mem_recr ? mem_recr->get_recurrent_capacity() : 0;
+    const uint32_t recr_used = mem_recr ? mem_recr->get_recurrent_used()     : 0;
+    *out = llama_memory_admission_combine(attn, recr_cap, recr_used);
+    return out->logical_capacity != 0 || out->recurrent_capacity != 0;
+}
+
+llama_memory_maintenance_status llama_memory_hybrid::maintain_safe_boundary() {
+    return mem_attn ? mem_attn->maintain_safe_boundary()
+                      : LLAMA_MEMORY_MAINTENANCE_NO_ACTION;
+}
+
+bool llama_memory_hybrid::get_xkv_runtime_snapshot(
+        struct llama_memory_xkv_runtime_snapshot * out) const {
+    if (out == nullptr) {
+        return false;
+    }
+    // Runtime observation lives in the attention cache; recurrent-only
+    // hybrids report unbound so the server shows not_evaluated.
+    return mem_attn ? mem_attn->get_xkv_runtime_snapshot(out) : false;
+}
+
+uint32_t llama_memory_hybrid::get_recurrent_capacity() const {
+    return mem_recr->get_recurrent_capacity();
+}
+
+uint32_t llama_memory_hybrid::get_recurrent_used() const {
+    return mem_recr->get_recurrent_used();
+}
+
+uint32_t llama_memory_hybrid::get_recurrent_seq_used(llama_seq_id seq_id) const {
+    return mem_recr->get_recurrent_seq_used(seq_id);
+}
+
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);
 }
 
-bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    // Try removing from the recurrent cache first since it may fail. If it does
-    // fail, the cache will not have been mutated.
-    if (!mem_recr->seq_rm(seq_id, p0, p1)) {
+bool llama_memory_hybrid::try_clear(bool data, std::string * err) {
+    if (!mem_attn->try_clear(data, err)) {
         return false;
     }
-    return mem_attn->seq_rm(seq_id, p0, p1);
+    return mem_recr->try_clear(data, err);
+}
+
+bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // Attention removal can fail if bounded removal release/preflight fails.
+    // Remove attention first; if attention removal fails, recurrent cache is
+    // left untouched.
+    if (!mem_attn->seq_rm(seq_id, p0, p1)) {
+        return false;
+    }
+    return mem_recr->seq_rm(seq_id, p0, p1);
 }
 
 void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_memory_hybrid::seq_rm_attention(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return mem_attn->seq_rm(seq_id, p0, p1);
+}
+
+void llama_memory_hybrid::seq_cp_attention(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst,
+        llama_pos p0,
+        llama_pos p1) {
+    mem_attn->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_memory_hybrid::seq_rm_recurrent(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return mem_recr->seq_rm(seq_id, p0, p1);
+}
+
+void llama_memory_hybrid::seq_cp_recurrent(
+        llama_seq_id seq_id_src,
+        llama_seq_id seq_id_dst,
+        llama_pos p0,
+        llama_pos p1) {
+    mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+}
+
+bool llama_memory_hybrid::rerot_set_write_tag(
+        llama_seq_id seq_id,
+        const llama_kv_rerot_meta & tag) {
+    if (!mem_recr->rerot_set_write_tag(seq_id, tag)) {
+        return false;
+    }
+    if (!mem_attn->rerot_set_write_tag(seq_id, tag)) {
+        mem_recr->rerot_clear_write_tag(seq_id);
+        return false;
+    }
+    return true;
+}
+
+void llama_memory_hybrid::rerot_clear_write_tag(llama_seq_id seq_id) {
+    mem_attn->rerot_clear_write_tag(seq_id);
+    mem_recr->rerot_clear_write_tag(seq_id);
+}
+
+void llama_memory_hybrid::rerot_release_episode(uint64_t episode_id) {
+    mem_recr->rerot_release_episode(episode_id);
+}
+
+bool llama_memory_hybrid::rerot_can_publish_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        size_t * count) const {
+    return mem_attn->rerot_can_publish_run(episode_id, run_id, count);
+}
+
+bool llama_memory_hybrid::rerot_can_reclassify_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_rerot_visibility expected,
+        llama_rerot_visibility replacement,
+        uint64_t publish_epoch,
+        size_t * count) const {
+    return mem_attn->rerot_can_reclassify_run(
+        episode_id, run_id, expected, replacement, publish_epoch, count);
+}
+
+size_t llama_memory_hybrid::rerot_publish_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        uint64_t publish_epoch) {
+    return mem_attn->rerot_publish_run(episode_id, run_id, publish_epoch);
+}
+
+size_t llama_memory_hybrid::rerot_reclassify_run(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_rerot_visibility expected,
+        llama_rerot_visibility replacement,
+        uint64_t publish_epoch) {
+    return mem_attn->rerot_reclassify_run(
+        episode_id, run_id, expected, replacement, publish_epoch);
+}
+
+bool llama_memory_hybrid::rerot_can_add_run_ref(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_seq_id seq_id,
+        size_t * count) const {
+    return mem_attn->rerot_can_add_run_ref(episode_id, run_id, seq_id, count);
+}
+
+size_t llama_memory_hybrid::rerot_add_run_ref(
+        uint64_t episode_id,
+        llama_rerot_run_id run_id,
+        llama_seq_id seq_id) {
+    return mem_attn->rerot_add_run_ref(episode_id, run_id, seq_id);
+}
+
+bool llama_memory_hybrid::rerot_set_reader_view(
+        llama_seq_id seq_id,
+        const llama_rerot_reader_state & view) {
+    return mem_attn->rerot_set_reader_view(seq_id, view);
+}
+
+void llama_memory_hybrid::rerot_clear_reader_view(llama_seq_id seq_id) {
+    mem_attn->rerot_clear_reader_view(seq_id);
+}
+
+size_t llama_memory_hybrid::rerot_hand_seed_size(llama_seq_id source_seq) const {
+    return mem_recr ? mem_recr->rerot_hand_seed_size(source_seq) : 0;
+}
+
+bool llama_memory_hybrid::rerot_capture_hand_seed(llama_seq_id source_seq, std::vector<uint8_t> & seed_out) {
+    return mem_recr ? mem_recr->rerot_capture_hand_seed(source_seq, seed_out) : false;
+}
+
+bool llama_memory_hybrid::rerot_apply_hand_seed(llama_seq_id dest_seq, const std::vector<uint8_t> & seed_in) {
+    return mem_recr ? mem_recr->rerot_apply_hand_seed(dest_seq, seed_in) : false;
+}
+
+bool llama_memory_hybrid::rerot_commit_rbb_frontier(
+        uint32_t person_id,
+        const llama_seq_id * candidate_seqs,
+        const uint8_t * is_public_write,
+        size_t n_candidates) {
+    return mem_recr ? mem_recr->rerot_commit_rbb_frontier(person_id, candidate_seqs, is_public_write, n_candidates) : false;
 }
 
 void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
@@ -201,6 +417,14 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     mem_recr->state_read(io, seq_id, flags);
 }
 
+llama_memory_kv_reclaim_result llama_memory_hybrid::reclaim_kv(const llama_memory_kv_reclaim_request & request) {
+    return mem_attn->reclaim_kv(request);
+}
+
+bool llama_memory_hybrid::positions_are_sparse() const {
+    return mem_attn->positions_are_sparse();
+}
+
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
     return mem_attn.get();
 }
@@ -229,16 +453,21 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
 llama_memory_hybrid_context::llama_memory_hybrid_context(
               llama_memory_hybrid * mem,
                   slot_info_vec_t   sinfos_attn,
-        std::vector<llama_ubatch>   ubatches) :
+        std::vector<llama_ubatch>   ubatches,
+        std::vector<llama_xkv::xkv_hot_reservation> hot_res_attn) :
     ubatches(std::move(ubatches)),
     // note: here we copy the ubatches. not sure if this is ideal
-    ctx_attn(new llama_kv_cache_context(mem->get_mem_attn(), std::move(sinfos_attn), this->ubatches)),
+    // Target attention receives the real hot reservations.
+    ctx_attn(new llama_kv_cache_context(mem->get_mem_attn(), std::move(sinfos_attn), this->ubatches, std::move(hot_res_attn))),
     ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
 
 bool llama_memory_hybrid_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
+
+    postcompute_finalized = false;
+    postcompute_ok = false;
 
     ctx_attn->next();
     ctx_recr->next();
@@ -253,12 +482,51 @@ bool llama_memory_hybrid_context::next() {
 bool llama_memory_hybrid_context::apply() {
     assert(!llama_memory_status_is_fail(status));
 
+    postcompute_finalized = false;
+    postcompute_ok = false;
+
     bool res = true;
 
     res = res & ctx_attn->apply();
     res = res & ctx_recr->apply();
 
     return res;
+}
+
+bool llama_memory_hybrid_context::postcompute_success() {
+    // Exactly-once forward to attention and recurrent (null-guarded for
+    // failure-status contexts). A failed success leaves the forward open.
+    if (postcompute_finalized) {
+        return postcompute_ok;
+    }
+    const bool ok_attn = ctx_attn ? ctx_attn->postcompute_success() : true;
+    const bool ok_recr = ctx_recr ? ctx_recr->postcompute_success() : true;
+    postcompute_ok = ok_attn && ok_recr;
+    if (postcompute_ok) {
+    postcompute_finalized = true;
+    }
+    return postcompute_ok;
+    }
+
+bool llama_memory_hybrid_context::postcompute_failure() {
+    if (postcompute_finalized) {
+        return postcompute_ok;
+    }
+    const bool ok_attn = ctx_attn ? ctx_attn->postcompute_failure() : true;
+    const bool ok_recr = ctx_recr ? ctx_recr->postcompute_failure() : true;
+    postcompute_ok = ok_attn && ok_recr;
+    if (postcompute_ok) {
+    postcompute_finalized = true;
+    }
+    return postcompute_ok;
+    }
+
+ggml_tensor * llama_memory_hybrid_context::get_xkv_hot_k(ggml_context * ctx, int32_t il) const {
+    return ctx_attn ? ctx_attn->get_xkv_hot_k(ctx, il) : nullptr;
+}
+
+ggml_tensor * llama_memory_hybrid_context::get_xkv_hot_v(ggml_context * ctx, int32_t il) const {
+    return ctx_attn ? ctx_attn->get_xkv_hot_v(ctx, il) : nullptr;
 }
 
 llama_memory_status llama_memory_hybrid_context::get_status() const {

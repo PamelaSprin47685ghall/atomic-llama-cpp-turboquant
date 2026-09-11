@@ -1903,3 +1903,6 @@ blk.39.attn_v.weight q8_0
 blk.39.ffn_down.weight q8_0
 blk.39.ffn_gate.weight q8_0
 blk.39.ffn_up.weight q8_0
+
+[NVFP4] nvfp4
+output.weight q6_K

@@ -207,6 +207,24 @@ struct plan_case {
     const char * dflash;
     const char * eagle3;
     const char * dspark;
+
+    plan_case(const char * name,
+              const std::vector<std::string> & files,
+              const char * hf_repo,
+              const char * hf_file,
+              bool sidecars,
+              bool order_dependent,
+              const char * primary,
+              std::vector<std::string> model_files,
+              const char * mmproj,
+              const char * mtp,
+              const char * dflash,
+              const char * eagle3,
+              const char * dspark)
+        : name(name), files(files), hf_repo(hf_repo), hf_file(hf_file),
+          sidecars(sidecars), order_dependent(order_dependent),
+          primary(primary), model_files(std::move(model_files)),
+          mmproj(mmproj), mtp(mtp), dflash(dflash), eagle3(eagle3), dspark(dspark) {}
 };
 
 static const plan_case plan_cases[] = {

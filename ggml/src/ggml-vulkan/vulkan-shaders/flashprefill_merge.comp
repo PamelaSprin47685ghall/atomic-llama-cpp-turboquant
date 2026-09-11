@@ -1,0 +1,92 @@
+#version 450
+// FlashPrefill V2 MERGE: bounded split-merge for Guide8.1/Phase4.
+// Merges ATTN-partial M/L/O scratch (bindings 8/9/10) into final O
+// (binding 7) with reference mlo_merge equations: empty identity (l==0),
+// per-split rescaling, sink mass already unique in exactly one partial
+// (never re-added here). One workgroup per metadata row; cooperative Dv
+// lanes, uniform control, no subgroup assumption. Plan error (binding 4,
+// readonly here) checked first: flagged plans yield zeros. Scratch sizing
+// (fit-counted): n_rows * n_splits * (2 + Dv) floats.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+#include "types.glsl"
+#include "flashprefill-interface.h"
+
+layout(local_size_x_id = FP_SPEC_WGSIZE, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = FP_SPEC_WGSIZE) const uint WorkGroupSize = 64;
+
+layout(binding = FP_BIND_PLAN) readonly buffer PLANB { int data_plan[]; };
+layout(binding = FP_BIND_META) readonly buffer METAB { int data_meta[]; };
+layout(binding = FP_BIND_DST) buffer OUTB { float data_out[]; };
+layout(binding = 8) readonly buffer SCR_M { float data_scr_m[]; };
+layout(binding = 9) readonly buffer SCR_L { float data_scr_l[]; };
+layout(binding = 10) readonly buffer SCR_O { float data_scr_o[]; };
+
+layout(push_constant) uniform FpMergePushBlock { FP_MERGE_PUSH_FIELDS } p;
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationIndex;
+    uint wgsize = gl_WorkGroupSize.x;
+
+    if (p.meta_words < FP_META_HDR_WORDS || p.plan_words < FP_PLAN_HDR_WORDS) return;
+    if (data_meta[FP_MH_MAGIC] != int(FP_MAGIC_META)) return;
+    if (data_meta[FP_MH_VERSION] != int(FP_VERSION)) return;
+    if (data_plan[FP_PH_MAGIC] != int(FP_MAGIC_PLAN)) return;
+    if (data_plan[FP_PH_VERSION] != int(FP_VERSION)) return;
+    if (data_plan[FP_PH_ERROR] != int(FP_OK)) return; // propagate before output
+    uint n_row = uint(data_meta[FP_MH_N_ROW]);
+    if (r >= n_row) return; // cap-grid (r_cap) guard
+    uint rb = uint(data_meta[FP_MH_ROW_OFF]) + r * 8u;
+    int src_q = data_meta[rb + FP_RW_SRC_Q];
+    int q_head = data_meta[rb + FP_RW_Q_HEAD];
+    uint Hq = uint(data_meta[FP_MH_N_QHEADS]);
+    if (src_q < 0 || q_head < 0 || uint(q_head) >= Hq) return;
+    // n_splits actual: dispatch uniformity guarantees all partials present.
+    // Merge over [0, n_splits) with mlo_merge equations (uniform M/L).
+    // First find valid range: splits are dense 0..S-1; S read from scratch
+    // dims? Push carries cap; actual S is dispatch-constant per launch.
+    // Reuse n_splits_cap as actual (dispatch sizes scratch exactly).
+    uint S = p.n_splits_cap;
+    if (S == 0u) return;
+    const float NEGH = uintBitsToFloat(0xFEFFFFFFu);
+    float M = NEGH;
+    float L = 0.0f;
+    bool have = false;
+    for (uint s = 0u; s < S; ++s) {
+        float ms = data_scr_m[r * S + s];
+        float ls = data_scr_l[r * S + s];
+        if (!(ls > 0.0f) || !fp_isfinite(ms) || !fp_isfinite(ls)) continue; // empty
+        if (!have) { M = ms; L = ls; have = true; }
+        else {
+            float m_new = max(M, ms);
+            L = L * exp(M - m_new) + ls * exp(ms - m_new);
+            M = m_new;
+        }
+    }
+    uint dv = p.dv;
+    uint u_hq = uint(q_head);
+    uint u_sq = uint(src_q);
+    if (!have || !(L > 0.0f) || !fp_isfinite(L)) {
+        for (uint d = tid; d < dv; d += wgsize) {
+            data_out[d + dv * (u_hq + Hq * u_sq)] = 0.0f;
+        }
+        return;
+    }
+    float invL = 1.0f / L;
+    for (uint d = tid; d < dv; d += wgsize) {
+        float acc = 0.0f;
+        for (uint s = 0u; s < S; ++s) {
+            float ms = data_scr_m[r * S + s];
+            float ls = data_scr_l[r * S + s];
+            if (!(ls > 0.0f) || !fp_isfinite(ms)) continue;
+            float o = data_scr_o[(r * S + s) * dv + d];
+            acc += exp(ms - M) * o;
+        }
+        float v = acc * invL;
+        float FLT_MAX = uintBitsToFloat(0x7F7FFFFFu);
+        data_out[d + dv * (u_hq + Hq * u_sq)] = clamp(v, -FLT_MAX, FLT_MAX);
+    }
+}

@@ -650,6 +650,296 @@ static void test_mrope(testing & t) {
     });
 }
 
+static void test_source_row(testing & t) {
+    llama_vocab vocab;
+
+    auto expect_map = [](testing & t, const llama_ubatch & ub, std::initializer_list<int32_t> expected) {
+        t.assert_equal((uint32_t) expected.size(), ub.n_tokens);
+        t.assert_true("tracking on: source_row is available", ub.source_row != nullptr);
+        t.assert_true("tracking on: owned map matches", ub.data && ub.data->source_row.size() == expected.size());
+        uint32_t i = 0;
+        for (int32_t want : expected) {
+            t.assert_equal(want, ub.source_row[i]);
+            t.assert_equal(want, ub.data->source_row[i]);
+            ++i;
+        }
+    };
+
+    // each ubatch row's payload must match the original batch row named by source_row,
+    // proving the map preserves input indices without reordering recurrent/sample data
+    auto expect_content_matches_map = [](testing & t, const llama_ubatch & ub, const batch_builder & bb) {
+        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+            const int32_t src = ub.source_row[i];
+            t.assert_equal(bb.pos[src], ub.pos[i]);
+            t.assert_equal(bb.n_seq_id[src], ub.n_seq_id[i]);
+            t.assert_equal(bb.logits[src], ub.output[i]);
+            for (uint32_t k = 0; k < bb.n_embd; ++k) {
+                t.assert_equal(100.0f*src + k, ub.embd[i*bb.n_embd + k]);
+            }
+            for (int32_t s = 0; s < bb.n_seq_id[src]; ++s) {
+                t.assert_equal(bb.seq[src][s], ub.seq_id[i][s]);
+            }
+        }
+    };
+
+    t.test("disabled_is_null_no_alloc", [&](testing & t) {
+        // default OFF: all split paths leave source_row null with no owned allocation,
+        // and existing split semantics are unchanged
+        {
+            batch_builder bb;
+            for (int i = 0; i < 3; ++i) {
+                bb.add(i, {0}, i == 2);
+            }
+            llama_batch_allocr ba(1);
+            t.assert_true(!ba.get_source_row_tracking());
+            t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+            llama_ubatch ub = ba.split_simple(10);
+            t.assert_equal(3u, ub.n_tokens);
+            t.assert_true("OFF: null means unavailable", ub.source_row == nullptr);
+            t.assert_true("OFF: no map allocation", ub.data->source_row.empty());
+        }
+        {
+            batch_builder bb;
+            for (int i = 0; i < 4; ++i) {
+                bb.add(i, {0}, i == 3);
+            }
+            for (int i = 0; i < 2; ++i) {
+                bb.add(i, {1}, i == 1);
+            }
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+            llama_ubatch ub = ba.split_equal(8, false, 0);
+            t.assert_equal(4u, ub.n_tokens);
+            t.assert_true(ub.source_row == nullptr);
+            t.assert_true(ub.data->source_row.empty());
+        }
+        {
+            batch_builder bb;
+            for (llama_seq_id s = 0; s < 2; ++s) {
+                bb.add(0, {s}, false);
+                bb.add(1, {s}, true);
+            }
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+            llama_ubatch ub = ba.split_seq(8);
+            t.assert_equal(2u, ub.n_tokens);
+            t.assert_true(ub.source_row == nullptr);
+            t.assert_true(ub.data->source_row.empty());
+        }
+        {
+            llama_batch_allocr ba(1);
+            ba.set_source_row_tracking(true);
+            llama_ubatch ub = ba.ubatch_reserve(3, 2);
+            t.assert_true("reserve never carries a map", ub.source_row == nullptr);
+            t.assert_true(ub.data->source_row.empty());
+        }
+        {
+            // consumed batch returns empty ubatch with null map, not a guessed coordinate
+            batch_builder bb;
+            bb.add(0, {0}, true);
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+            t.assert_equal(1u, ba.split_simple(10).n_tokens);
+            llama_ubatch done = ba.split_simple(10);
+            t.assert_equal(0u, done.n_tokens);
+            t.assert_true(done.source_row == nullptr);
+        }
+    });
+
+    t.test("simple_maps_rows", [&](testing & t) {
+        batch_builder bb;
+        for (int i = 0; i < 5; ++i) {
+            bb.add(i, {0}, i == 4);
+        }
+
+        llama_batch_allocr ba(1);
+        ba.set_source_row_tracking(true);
+        t.assert_true(ba.get_source_row_tracking());
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+
+        llama_ubatch ub0 = ba.split_simple(2);
+        expect_map(t, ub0, {0, 1});
+        expect_content_matches_map(t, ub0, bb);
+
+        // shared_ptr ownership matches the other ubatch arrays: copies keep the map alive
+        llama_ubatch ub0_copy = ub0;
+        t.assert_true(ub0_copy.source_row == ub0.source_row);
+        t.assert_true(ub0_copy.data == ub0.data);
+
+        llama_ubatch ub1 = ba.split_simple(2);
+        expect_map(t, ub1, {2, 3});
+        expect_content_matches_map(t, ub1, bb);
+
+        llama_ubatch ub2 = ba.split_simple(2);
+        expect_map(t, ub2, {4});
+        expect_content_matches_map(t, ub2, bb);
+
+        t.assert_equal(5u, ba.get_n_used());
+        t.assert_equal(0u, ba.split_simple(2).n_tokens);
+
+        // output routing is unchanged by tracking
+        const auto & out_ids = ba.get_out_ids();
+        t.assert_equal((size_t) 1, out_ids.size());
+        t.assert_equal(4, out_ids[0]);
+
+        // split_reset allows a clean resplit with identical fresh maps, no stale reuse
+        ba.split_reset();
+        llama_ubatch ub_all = ba.split_simple(10);
+        expect_map(t, ub_all, {0, 1, 2, 3, 4});
+    });
+
+    t.test("equal_maps_rows_reordered", [&](testing & t) {
+        batch_builder bb;
+        for (int i = 0; i < 4; ++i) {
+            bb.add(i, {0}, i == 3);
+        }
+        for (int i = 0; i < 2; ++i) {
+            bb.add(i, {1}, i == 1);
+        }
+
+        llama_batch_allocr ba(1);
+        ba.set_source_row_tracking(true);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+
+        // reordered per sequence set: [s0 s0 s1 s1] maps back to original rows [0 1 4 5]
+        llama_ubatch ub = ba.split_equal(8, false, 0);
+        expect_map(t, ub, {0, 1, 4, 5});
+        expect_content_matches_map(t, ub, bb);
+
+        ub = ba.split_equal(8, false, 0);
+        expect_map(t, ub, {2, 3});
+        expect_content_matches_map(t, ub, bb);
+
+        t.assert_equal(0u, ba.split_equal(8, false, 0).n_tokens);
+        t.assert_equal(6u, ba.get_n_used());
+    });
+
+    t.test("seq_maps_rows", [&](testing & t) {
+        batch_builder bb;
+        for (llama_seq_id s = 0; s < 3; ++s) {
+            bb.add(0, {s}, false);
+            bb.add(1, {s}, true);
+        }
+
+        llama_batch_allocr ba(1);
+        ba.set_source_row_tracking(true);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+
+        for (llama_seq_id s = 0; s < 3; ++s) {
+            llama_ubatch ub = ba.split_seq(8);
+            expect_map(t, ub, {(int32_t)(2*s), (int32_t)(2*s + 1)});
+            expect_content_matches_map(t, ub, bb);
+            t.assert_equal(s, ub.seq_id[0][0]);
+        }
+
+        t.assert_equal(0u, ba.split_seq(8).n_tokens);
+        t.assert_equal(6u, ba.get_n_used());
+    });
+
+    t.test("keep_tail_defers_with_map", [&](testing & t) {
+        // non-contiguous/deferred path: seq 1 is gathered then returned to the pool,
+        // so the first ubatch must map only to the kept rows
+        batch_builder bb;
+        for (int i = 0; i < 2; ++i) {
+            bb.add(i, {0}, i == 1);
+        }
+        for (int i = 0; i < 3; ++i) {
+            bb.add(i, {1}, i == 2);
+        }
+
+        llama_batch_allocr ba(1);
+        ba.set_source_row_tracking(true);
+        t.assert_true(ba.init(bb.make(), vocab, nullptr, bb.n_embd, 4, false));
+
+        llama_ubatch ub = ba.split_equal(4, true, 2);
+        expect_map(t, ub, {0, 1});
+        t.assert_equal(2u, ba.get_n_used());
+
+        ub = ba.split_equal(4, true, 2);
+        expect_map(t, ub, {2, 3, 4});
+        expect_content_matches_map(t, ub, bb);
+        t.assert_equal(5u, ba.get_n_used());
+        t.assert_equal(0u, ba.split_equal(4, true, 2).n_tokens);
+    });
+
+    t.test("sliced_retry_adds_off", [&](testing & t) {
+        // server-style sliced retry: batch.get_view(off, n) borrows a window; the fresh
+        // init maps relative to the slice, so off + source_row recovers the original row
+        batch_builder full;
+        for (int i = 0; i < 6; ++i) {
+            full.add(i, {0}, i == 5);
+        }
+        llama_batch full_batch = full.make();
+
+        const int32_t off = 2;
+        const int32_t n = 3;
+        llama_batch view = full_batch;
+        view.n_tokens = n;
+        view.embd     = full_batch.embd + (int64_t) off*full.n_embd;
+        view.pos      = full_batch.pos + off;
+        view.n_seq_id = full_batch.n_seq_id + off;
+        view.seq_id   = full_batch.seq_id + off;
+        view.logits   = full_batch.logits + off;
+
+        llama_batch_allocr ba(1);
+        ba.set_source_row_tracking(true);
+        t.assert_true(ba.init(view, vocab, nullptr, full.n_embd, 4, false));
+
+        llama_ubatch ub = ba.split_simple(10);
+        expect_map(t, ub, {0, 1, 2});
+        for (uint32_t i = 0; i < ub.n_tokens; ++i) {
+            const int32_t orig = off + ub.source_row[i];
+            t.assert_equal(full.pos[orig], ub.pos[i]);
+            t.assert_equal(100.0f*orig, ub.embd[i*full.n_embd]);
+        }
+
+        // re-init on the same allocr with the full batch drops the slice map entirely
+        t.assert_true(ba.init(full_batch, vocab, nullptr, full.n_embd, 4, false));
+        llama_ubatch ub_full = ba.split_simple(10);
+        expect_map(t, ub_full, {0, 1, 2, 3, 4, 5});
+    });
+
+    t.test("reinit_and_reserve_drop_prior_map", [&](testing & t) {
+        batch_builder ba_bb;
+        for (int i = 0; i < 3; ++i) {
+            ba_bb.add(i, {0}, i == 2);
+        }
+        batch_builder bb_bb;
+        for (int i = 0; i < 2; ++i) {
+            bb_bb.add(i, {1}, i == 1);
+        }
+
+        llama_batch_allocr ba(1);
+        ba.set_source_row_tracking(true);
+
+        t.assert_true(ba.init(ba_bb.make(), vocab, nullptr, ba_bb.n_embd, 4, false));
+        llama_ubatch ub_a = ba.split_simple(10);
+        expect_map(t, ub_a, {0, 1, 2});
+
+        // memory_init-style reuse: a new init must not expose the prior batch map
+        t.assert_true(ba.init(bb_bb.make(), vocab, nullptr, bb_bb.n_embd, 4, false));
+        llama_ubatch ub_b = ba.split_simple(10);
+        expect_map(t, ub_b, {0, 1});
+        expect_content_matches_map(t, ub_b, bb_bb);
+
+        // the prior ubatch keeps its own map alive via shared_ptr, unaffected by reuse
+        t.assert_equal(0, ub_a.source_row[0]);
+        t.assert_equal(2, ub_a.source_row[2]);
+
+        // reserve reuse never carries a prior map even with tracking enabled
+        llama_ubatch r = ba.ubatch_reserve(2, 1);
+        t.assert_true(r.source_row == nullptr);
+        t.assert_true(r.data->source_row.empty());
+
+        // disabling tracking yields null maps on subsequent splits
+        ba.set_source_row_tracking(false);
+        ba.init(bb_bb.make(), vocab, nullptr, bb_bb.n_embd, 4, false);
+        llama_ubatch ub_off = ba.split_simple(10);
+        t.assert_true(ub_off.source_row == nullptr);
+        t.assert_true(ub_off.data->source_row.empty());
+    });
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -665,10 +955,11 @@ int main(int argc, char ** argv) {
         t.set_filter(argv[1]);
     }
 
-    t.test("init",      test_init);
-    t.test("split",     test_split);
-    t.test("keep_tail", test_keep_tail);
-    t.test("mrope",     test_mrope);
+    t.test("init",       test_init);
+    t.test("split",      test_split);
+    t.test("keep_tail",  test_keep_tail);
+    t.test("mrope",      test_mrope);
+    t.test("source_row", test_source_row);
 
     return t.summary();
 }

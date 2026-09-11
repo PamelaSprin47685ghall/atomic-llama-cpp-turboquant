@@ -395,6 +395,9 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
+static inline bool is_turbo_kv(ggml_type t) {
+    return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+}
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     switch (type) {
@@ -534,13 +537,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // TurboQuant KV cache types: VEC kernels are instantiated for D in {64, 128, 256} only.
-    const auto is_turbo_kv = [](ggml_type t) {
-        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
-    };
-    if ((is_turbo_kv(K->type) || is_turbo_kv(V->type)) && K->ne[0] % 64 != 0) {
+    if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
     }
 
+    if ((is_turbo_kv(K->type) || is_turbo_kv(V->type)) && K->ne[0] % 64 != 0) {
+        return BEST_FATTN_KERNEL_NONE;
+    }
     if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
     }
@@ -564,6 +567,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_VEC;
     }
 #endif // GGML_USE_HIP
+
+    // For TurboQuant KV cache, prefer the native VEC kernel for small/medium batches (<= 16 queries)
+    // to avoid allocating massive f16 dequantization buffers (512+ MiB for 262k context).
+    if ((is_turbo_kv(K->type) || is_turbo_kv(V->type)) && can_use_vector_kernel && Q->ne[1] <= 16) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
@@ -684,8 +693,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
         case BEST_FATTN_KERNEL_MMA_F16:
-            need_f16_K = true;
-            need_f16_V = true;
+            need_f16_K = K->type != GGML_TYPE_F16 && !is_turbo_kv(K->type);
+            need_f16_V = V->type != GGML_TYPE_F16 && !is_turbo_kv(V->type);
             break;
         case BEST_FATTN_KERNEL_VEC:
             need_f16_K = K->type == GGML_TYPE_F32;

@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include "../wanxiangqi/common/params.h"
+
 #include "llama-cpp.h"
 
 #include "ggml-opt.h"
@@ -12,10 +14,12 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 #include <map>
 #include <algorithm>
 #include <fstream>
+#include <cmath>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0A00
@@ -445,14 +449,19 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
-struct common_params {
+struct common_params : wanxiangqi_common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
+    uint32_t n_ctx_kv              =     0; // unified KV capacity, 0 == n_ctx
+    bool n_ctx_kv_auto             = false; // use all available device memory for the unified KV cache
+    std::vector<std::pair<ggml_backend_dev_t, size_t>> n_ctx_kv_reserve;
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
+    bool    n_parallel_explicit   = false; // whether -np / --parallel was explicitly provided by caller
+    int32_t n_parallel_pp         =     0; // number of parallel sequences reserved for prompt processing, 0 = n_parallel
     int32_t n_sequences           =     1; // number of sequences to decode
     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
     int32_t grp_attn_n            =     1; // group-attention factor
@@ -569,6 +578,54 @@ struct common_params {
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
+    bool triattention_enabled = false;
+    std::string triattention_stats;
+    double triattention_ratio = 3.0 / 32.0;
+    bool rerot_enabled = false;
+    llama_rerot_frontier_mode rerot_frontier = LLAMA_REROT_FRONTIER_STRONG;
+    // Explicit opt-in for RERoT lane-trace SSE events (rerot.trace.*). Default off:
+    // streaming stays a single assistant response with one finish event + [DONE].
+    bool rerot_trace = false;
+
+    // FlashPrefill V2 policy (PREFILL.md §12). Initialized from the PolicyCore
+    // frozen defaults (mode OFF); transferred by value into
+    // llama_context_params by common_context_params_to_llama() and immutable
+    // for the context lifetime. CLI handlers below only mutate this struct and
+    // never touch Tri/RERoT/speculative state.
+    struct llama_flashprefill_config flashprefill = llama_flashprefill_default_config();
+
+    // RERoT joint B/P/K capacity fit results (§§B.0, B.3, B.10). Internal fit outputs only;
+    // no production per-person or total-pen CLI is exposed.
+    uint32_t rerot_person_max = 0; // auto-selected B (people / independent brains)
+    uint32_t rerot_pen_max    = 0; // auto-selected P (pens / execution states)
+    uint32_t rerot_brain_rows = 0; // derived from B
+    uint32_t rerot_hand_rows  = 0; // derived from P
+
+    // XKV (§16) parameters
+    enum llama_xkv_mode            xkv_mode                 = LLAMA_XKV_MODE_OFF;
+    enum llama_xkv_storage_profile xkv_storage_profile      = LLAMA_XKV_STORAGE_PROFILE_REFERENCE;
+    uint32_t                       xkv_group_size           = 4;
+    uint32_t                       xkv_rank_k               = 384;
+    uint32_t                       xkv_rank_v               = 576;
+    uint32_t                       xkv_segment_tokens       = 4096;
+    uint32_t                       xkv_chunk_tokens         = 8;
+    uint32_t                       xkv_sr_budget            = 0;
+    enum llama_xkv_source          xkv_source               = LLAMA_XKV_SOURCE_DECODED_HOT;
+    enum ggml_type                 xkv_factor_a_k           = GGML_TYPE_TURBO4_0;
+    enum ggml_type                 xkv_factor_b_k           = GGML_TYPE_TURBO4_0;
+    enum ggml_type                 xkv_factor_a_v           = GGML_TYPE_TURBO4_0;
+    enum ggml_type                 xkv_factor_b_v           = GGML_TYPE_TURBO4_0;
+    enum llama_xkv_factor_balance  xkv_factor_balance       = LLAMA_XKV_FACTOR_BALANCE_UPSTREAM;
+    enum ggml_type                 xkv_landmark_type        = GGML_TYPE_Q8_0;
+    enum llama_xkv_landmark_refine xkv_landmark_refine      = LLAMA_XKV_LANDMARK_REFINE_NONE;
+    uint32_t                       xkv_landmark_refine_max_rows = 64;
+    uint32_t                       xkv_workspace_mib        = 256;
+    uint32_t                       xkv_decode_cache_mib     = 64;
+    uint32_t                       xkv_store_mib            = 0;
+    uint64_t                       xkv_seed                 = 6362273814452121649ULL;
+    double                         xkv_min_saving           = 0.10;
+    double                         xkv_min_factor_coverage  = 0.50;
+    enum llama_xkv_factorizer      xkv_factorizer           = LLAMA_XKV_FACTORIZER_CPU_REFERENCE;
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation
@@ -745,6 +802,435 @@ struct common_params {
     bool is_gen_docs = false; // whether we are running inside llama-gen-docs
 };
 
+// RERoT outer compatibility, Stage-0 gates (§§18,26,A.13-A.20).
+//
+// Ownership note: the llama_rerot_* C-API (episode begin/end, write tags,
+// publish, frontier views, freeze-to-archive, caps) is owned by ContextGlue in
+// include/llama.h. Nothing here declares competing prototypes; these helpers
+// only validate CLI/request configuration and size host scratch so the
+// runtime (tools/server/server-rerot.*, core src/llama-rerot.*) can consume
+// frozen API. Dynamic Tri/speculation/state compatibility lives in the server
+// runtime; this helper validates only static process configuration.
+// RERoT OFF: every helper below is a trivial predicate returning
+// false/zero/ok with no allocation and no logging.
+
+struct common_rerot_gate {
+    bool ok = true;
+    std::string error;
+    std::string warning;
+};
+
+inline bool common_rerot_speculative_active(const common_params & params) {
+    for (const auto t : params.speculative.types) {
+        if (t != COMMON_SPECULATIVE_TYPE_NONE) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Effective per-request switch. Embedding/rerank (and any non-generation
+// path) never enters RERoT even when globally enabled (A.19). No allocation.
+inline bool common_rerot_effective_for_request(bool global_enabled, bool is_embedding_or_rerank) {
+    return global_enabled && !is_embedding_or_rerank;
+}
+
+// Static configuration gate. Requires kv_unified. TriAttention remains a
+// legal memory layer; speculative draft pauses on RERoT frontiers and active
+// state-save/context-shift operations fail closed in the server runtime.
+// Multimodal prompts are allowed: RERoT fork happens after shared prefill
+// and DDVR never remaps visual positions (A.18), so no gate here.
+// RERoT OFF: returns ok with no allocation.
+inline common_rerot_gate common_rerot_validate_stage0(const common_params & params) {
+    common_rerot_gate gate;
+    if (!params.rerot_enabled) {
+        return gate;
+    }
+    if (!params.kv_unified) {
+        gate.ok = false;
+        gate.error = "RERoT requires unified KV (--kv-unified); refusing to run without it";
+        return gate;
+    }
+    // §B.3.1 / Phase 0: Lock --total-kv auto as joint B/P/K auto-fit mode.
+    // Explicit -np / --parallel in full-auto mode conflicts with automated people/pen derivation.
+    if (params.n_ctx_kv_auto && params.n_parallel_explicit && params.n_parallel > 0) {
+        gate.ok = false;
+        gate.error = "RERoT full-auto (--total-kv auto) derives total people B and pens P automatically; "
+                     "explicit -np / --parallel conflicts with joint B/P/K capacity selection. "
+                     "Remove -np / --parallel to use automatic capacity.";
+        return gate;
+    }
+    if (params.embedding) {
+        gate.warning = "RERoT is enabled globally but ignored for embedding mode (A.19: embeddings never enter RERoT)";
+    }
+    // ContextGlue + TriIntegration + EpisodePersist compat:
+    // TriAttention acts as legal lossy reclaimer for RERoT shared KV (§§23, A.4).
+    // Speculative decoding / MTP drafts are bound to the reader's topology/publish/layout epochs.
+    // Context shift and cache reuse are intercepted per-episode via shared-memory log truncation (§§25, A.9).
+    return gate;
+}
+
+// XKV static validation gate (§16).
+struct common_xkv_gate {
+    bool ok = true;
+    std::string error;
+    std::string warning;
+};
+
+inline common_xkv_gate common_xkv_validate_stage0(const common_params & params) {
+    common_xkv_gate gate;
+
+    // Enum range validation for programmatic params
+    if ((int)params.xkv_mode < 0 || (int)params.xkv_mode > (int)LLAMA_XKV_MODE_SR) {
+        gate.ok = false;
+        gate.error = "XKV mode enum value is out of range";
+        return gate;
+    }
+
+    if (params.xkv_mode == LLAMA_XKV_MODE_OFF) {
+        // A persistent factor store budget without XKV is meaningless.
+        if (params.xkv_store_mib != 0) {
+            gate.ok = false;
+            gate.error = "XKV store budget requires XKV to be enabled (off with nonzero --xkv-store-mib)";
+            return gate;
+        }
+        // OFF must not silently ignore non-default flags: every other
+        // option must equal its default.
+        if (params.xkv_storage_profile != LLAMA_XKV_STORAGE_PROFILE_REFERENCE) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-storage-profile was provided";
+            return gate;
+        }
+        if (params.xkv_group_size != 4) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-group-size was provided";
+            return gate;
+        }
+        if (params.xkv_rank_k != 384) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-rank-k was provided";
+            return gate;
+        }
+        if (params.xkv_rank_v != 576) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-rank-v was provided";
+            return gate;
+        }
+        if (params.xkv_segment_tokens != 4096) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-segment-tokens was provided";
+            return gate;
+        }
+        if (params.xkv_chunk_tokens != 8) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-chunk-tokens was provided";
+            return gate;
+        }
+        if (params.xkv_sr_budget != 0) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-sr-budget was provided";
+            return gate;
+        }
+        if (params.xkv_source != LLAMA_XKV_SOURCE_DECODED_HOT) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-source was provided";
+            return gate;
+        }
+        if (params.xkv_factor_a_k != GGML_TYPE_TURBO4_0) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-factor-a-k was provided";
+            return gate;
+        }
+        if (params.xkv_factor_b_k != GGML_TYPE_TURBO4_0) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-factor-b-k was provided";
+            return gate;
+        }
+        if (params.xkv_factor_a_v != GGML_TYPE_TURBO4_0) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-factor-a-v was provided";
+            return gate;
+        }
+        if (params.xkv_factor_b_v != GGML_TYPE_TURBO4_0) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-factor-b-v was provided";
+            return gate;
+        }
+        if (params.xkv_factor_balance != LLAMA_XKV_FACTOR_BALANCE_UPSTREAM) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-factor-balance was provided";
+            return gate;
+        }
+        if (params.xkv_landmark_type != GGML_TYPE_Q8_0) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-landmark-type was provided";
+            return gate;
+        }
+        if (params.xkv_landmark_refine != LLAMA_XKV_LANDMARK_REFINE_NONE) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-landmark-refine was provided";
+            return gate;
+        }
+        if (params.xkv_landmark_refine_max_rows != 64) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-landmark-refine-max-rows was provided";
+            return gate;
+        }
+        if (params.xkv_workspace_mib != 256) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-workspace-mib was provided";
+            return gate;
+        }
+        if (params.xkv_decode_cache_mib != 64) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-decode-cache-mib was provided";
+            return gate;
+        }
+        if (params.xkv_min_saving != 0.10) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-min-saving was provided";
+            return gate;
+        }
+        if (params.xkv_min_factor_coverage != 0.50) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-min-factor-coverage was provided";
+            return gate;
+        }
+        if (params.xkv_factorizer != LLAMA_XKV_FACTORIZER_CPU_REFERENCE) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-factorizer was provided";
+            return gate;
+        }
+        if (params.xkv_seed != 6362273814452121649ULL) {
+            gate.ok = false;
+            gate.error = "XKV is OFF but non-default --xkv-seed was provided";
+            return gate;
+        }
+        return gate;
+    }
+
+    if ((int)params.xkv_storage_profile < 0 || (int)params.xkv_storage_profile > (int)LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS) {
+        gate.ok = false;
+        gate.error = "XKV storage profile enum value is out of range";
+        return gate;
+    }
+    if ((int)params.xkv_source < 0 || (int)params.xkv_source > (int)LLAMA_XKV_SOURCE_PREROPE_CAPTURE) {
+        gate.ok = false;
+        gate.error = "XKV source enum value is out of range";
+        return gate;
+    }
+    if ((int)params.xkv_factor_balance < 0 || (int)params.xkv_factor_balance > (int)LLAMA_XKV_FACTOR_BALANCE_DIAGONAL) {
+        gate.ok = false;
+        gate.error = "XKV factor balance enum value is out of range";
+        return gate;
+    }
+    if ((int)params.xkv_landmark_refine < 0 || (int)params.xkv_landmark_refine > (int)LLAMA_XKV_LANDMARK_REFINE_BOUNDARY) {
+        gate.ok = false;
+        gate.error = "XKV landmark refine enum value is out of range";
+        return gate;
+    }
+    if ((int)params.xkv_factorizer < 0 || (int)params.xkv_factorizer > (int)LLAMA_XKV_FACTORIZER_CUDA) {
+        gate.ok = false;
+        gate.error = "XKV factorizer enum value is out of range";
+        return gate;
+    }
+
+    // Accepted factor types (§16): only F32, F16, Q8_0, Turbo2, Turbo3, Turbo4 (reject q4/q5/bf16 etc.)
+    auto is_accepted_factor_type = [](ggml_type t) {
+        return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 ||
+               t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+    };
+
+    if (!is_accepted_factor_type(params.xkv_factor_a_k) ||
+        !is_accepted_factor_type(params.xkv_factor_b_k) ||
+        !is_accepted_factor_type(params.xkv_factor_a_v) ||
+        !is_accepted_factor_type(params.xkv_factor_b_v)) {
+        gate.ok = false;
+        gate.error = "XKV factor codec type is not accepted (must be F32, F16, Q8_0, Turbo2, Turbo3, or Turbo4)";
+        return gate;
+    }
+
+    // Landmark types allowed in reference/general mode: F32, F16, Q8_0, Turbo4
+    auto is_accepted_landmark_type = [](ggml_type t) {
+        return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_Q8_0 ||
+               t == GGML_TYPE_TURBO4_0;
+    };
+    if (!is_accepted_landmark_type(params.xkv_landmark_type)) {
+        gate.ok = false;
+        gate.error = "XKV landmark codec type is not accepted (must be F32, F16, Q8_0, or Turbo4)";
+        return gate;
+    }
+
+    // Enabled mode enforces unified KV
+    if (!params.kv_unified) {
+        gate.ok = false;
+        gate.error = "XKV enabled requires unified KV (--kv-unified); refusing to run without it";
+        return gate;
+    }
+
+    // Enabled sizes must be positive
+    if (params.xkv_group_size == 0) {
+        gate.ok = false;
+        gate.error = "XKV group size must be positive (> 0)";
+        return gate;
+    }
+    if (params.xkv_rank_k == 0) {
+        gate.ok = false;
+        gate.error = "XKV rank K must be positive (> 0)";
+        return gate;
+    }
+    if (params.xkv_rank_v == 0) {
+        gate.ok = false;
+        gate.error = "XKV rank V must be positive (> 0)";
+        return gate;
+    }
+    if (params.xkv_segment_tokens == 0) {
+        gate.ok = false;
+        gate.error = "XKV segment tokens must be positive (> 0)";
+        return gate;
+    }
+    if (params.xkv_chunk_tokens == 0) {
+        gate.ok = false;
+        gate.error = "XKV chunk tokens must be positive (> 0)";
+        return gate;
+    }
+    // chunk_tokens <= segment_tokens
+    if (params.xkv_chunk_tokens > params.xkv_segment_tokens) {
+        gate.ok = false;
+        gate.error = "XKV chunk tokens must be less than or equal to segment tokens (chunk_tokens <= segment_tokens)";
+        return gate;
+    }
+    // SR mode requires sr_budget > 0
+    if (params.xkv_mode == LLAMA_XKV_MODE_SR && params.xkv_sr_budget == 0) {
+        gate.ok = false;
+        gate.error = "XKV SR mode requires sr_budget > 0 (--xkv-sr-budget)";
+        return gate;
+    }
+    // Boundary refinement requires max_rows > 0
+    if (params.xkv_landmark_refine == LLAMA_XKV_LANDMARK_REFINE_BOUNDARY && params.xkv_landmark_refine_max_rows == 0) {
+        gate.ok = false;
+        gate.error = "XKV boundary landmark refinement requires landmark_refine_max_rows > 0";
+        return gate;
+    }
+    if (params.xkv_workspace_mib == 0) {
+        gate.ok = false;
+        gate.error = "XKV workspace size must be positive (> 0 MiB)";
+        return gate;
+    }
+    // cache <= workspace
+    if (params.xkv_decode_cache_mib > params.xkv_workspace_mib) {
+        gate.ok = false;
+        gate.error = "XKV decode-cache size must be less than or equal to workspace size (cache <= workspace)";
+        return gate;
+    }
+
+    // Fractions finite and in range [0.0, 1.0]
+    if (!std::isfinite(params.xkv_min_saving) || params.xkv_min_saving < 0.0 || params.xkv_min_saving > 1.0) {
+        gate.ok = false;
+        gate.error = "XKV min saving fraction must be finite and within [0.0, 1.0]";
+        return gate;
+    }
+    if (!std::isfinite(params.xkv_min_factor_coverage) || params.xkv_min_factor_coverage < 0.0 || params.xkv_min_factor_coverage > 1.0) {
+        gate.ok = false;
+        gate.error = "XKV min factor coverage fraction must be finite and within [0.0, 1.0]";
+        return gate;
+    }
+
+    // SHADOW is evaluate-only with no segment publication for every profile:
+    // a persistent store budget there is a configuration error (it would
+    // reserve unused memory and imply a store in metrics). Transient
+    // workspace/decode cache stay allowed. Zero is the only legitimate
+    // unsettled value for OFF (above) and all of SHADOW; DENSE/SR with zero
+    // is an auto-fit-derived placeholder resolved after KV auto-fit.
+    if (params.xkv_mode == LLAMA_XKV_MODE_SHADOW && params.xkv_store_mib != 0) {
+        gate.ok = false;
+        gate.error = "XKV SHADOW mode publishes no segments (--xkv-store-mib must be 0)";
+        return gate;
+    }
+
+    // CUDA factorizer rejected
+    if (params.xkv_factorizer == LLAMA_XKV_FACTORIZER_CUDA) {
+        gate.ok = false;
+        gate.error = "XKV CUDA factorizer is not supported; rejected";
+        return gate;
+    }
+
+    // Vulkan-hybrid factorizer is unfinished: fail closed before allocation.
+    if (params.xkv_factorizer == LLAMA_XKV_FACTORIZER_VULKAN_HYBRID) {
+        gate.ok = false;
+        gate.error = "XKV vulkan-hybrid factorizer is not yet implemented; rejected";
+        return gate;
+    }
+
+    // prerope-capture source is not implemented: explicit unsupported.
+    if (params.xkv_source == LLAMA_XKV_SOURCE_PREROPE_CAPTURE) {
+        gate.ok = false;
+        gate.error = "XKV prerope-capture source is not yet implemented; rejected";
+        return gate;
+    }
+
+    // SR mode selects via landmarks: tq-factors (no landmarks) is impossible.
+    if (params.xkv_mode == LLAMA_XKV_MODE_SR &&
+        params.xkv_storage_profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS) {
+        gate.ok = false;
+        gate.error = "XKV SR mode requires tq-factors-landmarks storage profile (tq-factors has no landmarks)";
+        return gate;
+    }
+
+    // Reference profile has no device-resident production path: a Vulkan
+    // factorizer with reference must not silently become DEVICE_OWNED.
+    if (params.xkv_storage_profile == LLAMA_XKV_STORAGE_PROFILE_REFERENCE &&
+        params.xkv_factorizer == LLAMA_XKV_FACTORIZER_VULKAN) {
+        gate.ok = false;
+        gate.error = "XKV reference profile requires cpu-reference factorizer (device residency not supported for reference)";
+        return gate;
+    }
+
+    auto is_turbo_type = [](ggml_type t) {
+        return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+    };
+
+    // Production factor profiles require four Turbo2/3/4 streams
+    if (params.xkv_storage_profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS ||
+        params.xkv_storage_profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS) {
+        if (!is_turbo_type(params.xkv_factor_a_k) ||
+            !is_turbo_type(params.xkv_factor_b_k) ||
+            !is_turbo_type(params.xkv_factor_a_v) ||
+            !is_turbo_type(params.xkv_factor_b_v)) {
+            gate.ok = false;
+            gate.error = "XKV production factor profiles (tq-factors / tq-factors-landmarks) require four Turbo2/3/4 streams for A_K, B_K, A_V, and B_V";
+            return gate;
+        }
+    }
+
+    // Production landmarks require exactly Q8_0 or Turbo4
+    if (params.xkv_storage_profile == LLAMA_XKV_STORAGE_PROFILE_TQ_FACTORS_LANDMARKS) {
+        const bool valid_lm = (params.xkv_landmark_type == GGML_TYPE_Q8_0 || params.xkv_landmark_type == GGML_TYPE_TURBO4_0);
+        if (!valid_lm) {
+            gate.ok = false;
+            gate.error = "XKV production landmarks profile requires exactly Q8_0 (q8_0) or Turbo4 (turbo4_0) landmark type";
+            return gate;
+        }
+    }
+
+    return gate;
+}
+
+// Worst-case RERoT runtime scratch to include in auto-fit reserve accounting
+// (A.12): span-table/DDVR phase inputs, frontier query rows, parked-recurrent
+// metadata descriptors, episode host metadata. Large recurrent state itself
+// stays under the existing recurrent capacity and is not double-counted.
+// RERoT OFF: returns 0 (no reservation, no allocation).
+inline size_t common_rerot_scratch_reserve_bytes(const common_params & params) {
+    if (!params.rerot_enabled) {
+        return 0;
+    }
+    // 8 MiB per process covers the metadata-scale scratch above; KV/recurrent
+    // payloads are sized by the existing fit paths. Kept constant (not scaled
+    // by n_parallel) so the estimate stays stable across server slot counts.
+    return 8ull * 1024ull * 1024ull;
+}
+
 // call once at the start of a program if it uses libcommon
 // initializes the logging system and prints info about the build
 void common_init();
@@ -773,6 +1259,9 @@ bool set_process_priority(enum ggml_sched_priority prio);
 
 LLAMA_COMMON_ATTRIBUTE_FORMAT(1, 2)
 std::string string_format(const char * fmt, ...);
+
+// Random base62 identifiers, independent of model sampling.
+std::string random_string(size_t length = 32);
 
 std::string string_strip(const std::string & str);
 std::string string_get_sortable_timestamp();
@@ -938,7 +1427,11 @@ struct llama_context_params   common_context_params_to_llama(const common_params
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
-void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
+// returns true when applied (or already identical, a no-op); false when the
+// core refused the change before applying anything (FlashPrefill enabled atop
+// an active RERoT episode). On false the context still carries the previous
+// adapters, so callers must fail the request, never decode under them.
+bool common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
 
 // model endpoint from env
 std::string common_get_model_endpoint();

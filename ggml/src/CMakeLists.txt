@@ -195,10 +195,12 @@ add_library(ggml-base
             ../include/ggml-backend.h
             ../include/ggml-cpp.h
             ../include/ggml-opt.h
+            ../include/ggml-flashprefill.h
             ../include/gguf.h
             ggml.c
             ggml.cpp
             ggml-alloc.c
+            ggml-flashprefill.cpp
             ggml-backend.cpp
             ggml-backend-meta.cpp
             ggml-opt.cpp
@@ -207,6 +209,15 @@ add_library(ggml-base
             ggml-quants.c
             ggml-quants.h
             ggml-turbo-quant.c
+            ggml-xkv-reconstruct.cpp
+            ../include/ggml-xkv.h
+            ggml-xkv-attention.cpp
+            ggml-vulkan-landmark.cpp
+            ggml-xkv-landmark-build.cpp
+            ggml-xkv-factor.cpp
+            ../include/ggml-xkv-factor.h
+            ../include/ggml-vulkan-landmark.h
+            ../include/ggml-xkv-landmark-build.h
             gguf.cpp)
 
 set_target_properties(ggml-base PROPERTIES

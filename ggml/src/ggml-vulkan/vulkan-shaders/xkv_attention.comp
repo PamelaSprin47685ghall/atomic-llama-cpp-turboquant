@@ -1,0 +1,357 @@
+#version 450
+
+// xkv_attention.comp — native XKV dual-source indexed attention (Stage 2, v1).
+//
+// P0 ARCHITECTURE (XKV-SR §7.2): production chains TILED dispatches, each
+// folding one workspace-bounded cold tile into an explicit DAG carry output
+// (binding 9, layout O,m,l) — one global online softmax, never a materialized
+// dense union. Hot rows participate via tile-0 entries in the same
+// accumulator; sink applies once (first tile / single-shot).
+//
+// Canonical domain first: hot Turbo rows decode to canonical (exact centroid
+// tables + exact inverse WHT with sign tables, mirroring
+// ggml_turbo_wht_inverse_row); cold K/V are canonical reconstruct outputs; Q
+// is canonical post-RoPE; V accumulates canonical. No WHT-shortcut
+// assumptions; pair-domain fast paths require proven compatibility.
+//
+// Malformed offsets/source/index/group write the status code and NaN-poison
+// the failing query row (fail-closed; status writers only ever write nonzero).
+// All-masked/empty queries write zero (never NaN). Capacity padding at/after
+// offsets[n_queries] is strictly ignored. Duplicates accumulate in entry order
+// unless the reject-dupes flag is set (then malformed).
+//
+// No host pointers, no host readback, no per-decode re-upload. One dispatch
+// per KV head per tile; the scheduler owns the overall sync.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+// Correctness-first implementation: one invocation owns one query/GQA row.
+// This avoids per-invocation 3x1024 arrays multiplied by a 64-thread workgroup.
+layout (local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+// 28 x 4B = 112B push constants
+layout (push_constant) uniform parameter {
+    uint dim_k;
+    uint dim_v;
+    uint gqa;
+    uint n_groups;
+    uint n_queries;
+    uint hot_rows;
+    uint n_cold;
+    uint n_entries;
+    uint kv_head;
+    uint stream;
+    uint flags;         // bit0 reject_dupes, bit1 entries_2wide, bit2 has_sinks,
+                        // bit3 first_tile, bit4 has_carry, bit5 final_tile
+    uint entry_stride;  // 2 or 4
+    float scale;
+    float softcap;
+    uint k_hot_type;    // 0=F32 1=F16 8=Q8_0 42=T2 43=T3 44=T4
+    uint v_hot_type;
+    uint k_cold_type;   // 0=F32 1=F16
+    uint v_cold_type;
+    uint q_nb1;         // byte strides
+    uint q_nb2;
+    uint kh_nb1;
+    uint kh_nb2;
+    uint kh_nb3;
+    uint vh_nb1;
+    uint vh_nb2;
+    uint vh_nb3;
+    uint kc_nb1;
+    uint vc_nb1;
+} p;
+
+layout (binding = 0, std430) readonly buffer Q       { float q_data[]; };
+layout (binding = 1, std430) readonly buffer KH      { uint8_t kh[]; };
+layout (binding = 2, std430) readonly buffer VH      { uint8_t vh[]; };
+layout (binding = 3, std430) readonly buffer KC      { uint8_t kc[]; };
+layout (binding = 4, std430) readonly buffer VC      { uint8_t vc[]; };
+layout (binding = 5, std430) readonly buffer ENT     { int entries[]; };
+layout (binding = 6, std430) readonly buffer OFF     { int offsets[]; };
+layout (binding = 7, std430) readonly buffer SNK     { float sinks[]; };
+layout (binding = 8, std430) buffer         STA      { int status[]; };
+layout (binding = 9, std430) buffer         DST      { float dst[]; };
+layout (binding = 10, std430) readonly buffer CAR   { float carry[]; };
+
+const float C2[4] = float[4](-0.133462, -0.039994, 0.039994, 0.133462);
+const float C3[8] = float[8](
+    -0.190685, -0.117832, -0.065717, -0.021460,
+     0.021460,  0.065717,  0.117832,  0.190685);
+const float C4[16] = float[16](
+    -0.173926, -0.117195, -0.089527, -0.068756,
+    -0.051262, -0.035597, -0.020989, -0.006938,
+     0.006938,  0.020989,  0.035597,  0.051262,
+     0.068756,  0.089527,  0.117195,  0.173926);
+
+// Inverse-WHT sign tables (match ggml turbo_cpu_s1/s2; cf. ggml_turbo_wht_inverse_row).
+const float XS1[128] = float[128](
+    -1., 1., 1., -1., -1., 1., -1., 1., -1., -1., 1., 1., 1., 1., 1., 1.,
+     1., -1., 1., -1., 1., -1., -1., 1., 1., 1., -1., 1., 1., -1., -1., -1.,
+    -1., 1., 1., -1., 1., 1., -1., 1., -1., 1., 1., -1., -1., 1., -1., 1.,
+     1., 1., 1., -1., -1., -1., -1., -1., 1., -1., 1., 1., 1., 1., -1., 1.,
+    -1., -1., 1., -1., -1., -1., 1., -1., -1., -1., 1., -1., -1., -1., 1., 1.,
+     1., -1., -1., 1., 1., 1., -1., -1., 1., 1., -1., 1., 1., -1., 1., -1.,
+    -1., 1., 1., -1., 1., -1., 1., -1., 1., 1., 1., 1., -1., 1., -1., 1.,
+     1., -1., 1., 1., -1., -1., -1., -1., -1., 1., 1., -1., 1., 1., -1., 1.);
+const float XS2[128] = float[128](
+     1., 1., 1., 1., -1., 1., 1., -1., 1., -1., -1., -1., 1., -1., -1., -1.,
+     1., 1., -1., -1., 1., -1., 1., -1., 1., -1., -1., 1., -1., 1., 1., 1.,
+     1., 1., -1., -1., -1., 1., -1., -1., -1., -1., -1., -1., 1., 1., 1., -1.,
+     1., -1., 1., 1., 1., -1., -1., 1., -1., -1., -1., -1., -1., -1., 1., 1.,
+     1., -1., 1., -1., -1., -1., -1., 1., -1., 1., -1., 1., -1., -1., 1., 1.,
+    -1., 1., -1., 1., 1., -1., 1., -1., -1., -1., -1., 1., -1., -1., 1., -1.,
+     1., -1., 1., 1., 1., -1., -1., 1., -1., 1., -1., 1., 1., -1., -1., 1.,
+    -1., 1., -1., 1., 1., -1., 1., -1., 1., -1., -1., -1., -1., -1., 1., -1.);
+
+float u8f16(uint8_t b0, uint8_t b1) {
+    uint h = uint(b0) | (uint(b1) << 8u);
+    return unpackHalf2x16(h).x;
+}
+float u8f32(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3) {
+    uint w = uint(b0) | (uint(b1) << 8u) | (uint(b2) << 16u) | (uint(b3) << 24u);
+    return uintBitsToFloat(w);
+}
+
+void poison_row(uint q, uint h) {
+    uint base = (q * p.gqa + h) * (p.dim_v + 2u);
+    for (uint d = 0u; d < p.dim_v + 2u; ++d) dst[base + d] = uintBitsToFloat(0x7fc00000u);
+}
+
+// Decode one hot row (canonical domain) into K[dim]. Turbo types inverse-rotate.
+void hot_row(uint which, uint base, uint type, uint dim, inout float K[1024]) {
+    if (type == 0u) {
+        for (uint d = 0u; d < dim; ++d) {
+            if (which == 0u) K[d] = u8f32(kh[base + d * 4u], kh[base + d * 4u + 1u], kh[base + d * 4u + 2u], kh[base + d * 4u + 3u]);
+            else K[d] = u8f32(vh[base + d * 4u], vh[base + d * 4u + 1u], vh[base + d * 4u + 2u], vh[base + d * 4u + 3u]);
+        }
+        return;
+    }
+    if (type == 1u) {
+        for (uint d = 0u; d < dim; ++d) {
+            if (which == 0u) K[d] = u8f16(kh[base + d * 2u], kh[base + d * 2u + 1u]);
+            else K[d] = u8f16(vh[base + d * 2u], vh[base + d * 2u + 1u]);
+        }
+        return;
+    }
+    if (type == 8u) {
+        for (uint d = 0u; d < dim; ++d) {
+            uint b = d / 32u; uint j = d % 32u;
+            uint boff = base + b * 34u;
+            float dd; int qv;
+            if (which == 0u) {
+                dd = u8f16(kh[boff], kh[boff + 1u]);
+                qv = int(kh[boff + 2u + j]);
+            } else {
+                dd = u8f16(vh[boff], vh[boff + 1u]);
+                qv = int(vh[boff + 2u + j]);
+            }
+            if (qv >= 128) qv -= 256;
+            K[d] = dd * float(qv);
+        }
+        return;
+    }
+    // Turbo2/3/4: centroid dequant per 128-group, then exact inverse WHT
+    // (D(s2) -> butterfly -> x/√128 x s1), mirroring ggml_turbo_wht_inverse_row.
+    uint ng = dim / 128u;
+    for (uint g = 0u; g < ng; ++g) {
+        float tmp[128];
+        if (type == 42u) {
+            uint boff = base + g * 34u;
+            float norm = (which == 0u) ? u8f16(kh[boff], kh[boff + 1u]) : u8f16(vh[boff], vh[boff + 1u]);
+            for (uint j = 0u; j < 128u; ++j) {
+                uint qb = (which == 0u) ? uint(kh[boff + 2u + j / 4u]) : uint(vh[boff + 2u + j / 4u]);
+                tmp[j] = norm * C2[(qb >> (2u * (j % 4u))) & 3u];
+            }
+        } else if (type == 43u) {
+            uint boff = base + g * 50u;
+            float norm = (which == 0u) ? u8f16(kh[boff], kh[boff + 1u]) : u8f16(vh[boff], vh[boff + 1u]);
+            for (uint j = 0u; j < 128u; ++j) {
+                uint qb = (which == 0u) ? uint(kh[boff + 2u + j / 4u]) : uint(vh[boff + 2u + j / 4u]);
+                uint sb = (which == 0u) ? uint(kh[boff + 2u + 32u + j / 8u]) : uint(vh[boff + 2u + 32u + j / 8u]);
+                uint low2 = (qb >> (2u * (j % 4u))) & 3u;
+                uint hi1 = (sb >> (j % 8u)) & 1u;
+                tmp[j] = norm * C3[low2 | (hi1 << 2u)];
+            }
+        } else {
+            uint boff = base + g * 68u;
+            float norm = (which == 0u) ? u8f16(kh[boff], kh[boff + 1u]) : u8f16(vh[boff], vh[boff + 1u]);
+            for (uint j = 0u; j < 128u; ++j) {
+                uint qb = (which == 0u) ? uint(kh[boff + 4u + j / 2u]) : uint(vh[boff + 4u + j / 2u]);
+                tmp[j] = norm * C4[(qb >> (4u * (j % 2u))) & 15u];
+            }
+        }
+        for (uint i = 0u; i < 128u; ++i) tmp[i] *= XS2[i];
+        for (uint hh = 1u; hh < 128u; hh *= 2u) {
+            for (uint i = 0u; i < 128u; i += hh * 2u) {
+                for (uint j = i; j < i + hh; ++j) {
+                    float a = tmp[j], c = tmp[j + hh];
+                    tmp[j] = a + c; tmp[j + hh] = a - c;
+                }
+            }
+        }
+        for (uint i = 0u; i < 128u; ++i) K[g * 128u + i] = tmp[i] * 0.08838834764831845 * XS1[i];
+    }
+}
+
+float cold_ld(uint which, uint base, uint r, uint type) {
+    if (type == 0u) {
+        if (which == 0u) return u8f32(kc[base + r * 4u], kc[base + r * 4u + 1u], kc[base + r * 4u + 2u], kc[base + r * 4u + 3u]);
+        return u8f32(vc[base + r * 4u], vc[base + r * 4u + 1u], vc[base + r * 4u + 2u], vc[base + r * 4u + 3u]);
+    }
+    if (which == 0u) return u8f16(kc[base + r * 2u], kc[base + r * 2u + 1u]);
+    return u8f16(vc[base + r * 2u], vc[base + r * 2u + 1u]);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint total = p.n_queries * p.gqa;
+    if (gid >= total) return;
+    uint q = gid / p.gqa;
+    uint h = gid % p.gqa;
+
+    if (p.entry_stride != 2u && p.entry_stride != 4u) {
+        atomicCompSwap(status[0], 0, 6); poison_row(q, h); return;
+    }
+    bool wide2 = (p.entry_stride == 2u);
+    bool reject_dupes = (p.flags & 1u) != 0u;
+    bool has_sinks = (p.flags & 4u) != 0u;
+    bool first_tile = (p.flags & 8u) != 0u;
+    bool has_carry = (p.flags & 16u) != 0u;
+    bool final_tile = (p.flags & 32u) != 0u;
+    bool apply_sink = has_sinks && first_tile;
+    float eff = p.softcap > 0.0 ? p.scale / p.softcap : p.scale;
+
+    // Carry orders tiles. A sticky failure from an earlier tile invalidates
+    // the whole chain; do not consume or normalize its poisoned carry.
+    if (!first_tile && status[0] != 0) {
+        poison_row(q, h);
+        return;
+    }
+
+    int ob = offsets[q];
+    int oe = offsets[q + 1u];
+    if (ob < 0 || oe < ob || uint(oe) > p.n_entries) {
+        atomicCompSwap(status[0], 0, 1); poison_row(q, h); return;
+    }
+
+    float M; float L;
+    float O[1024];
+    if (!has_carry || first_tile) {
+        M = -1.7014117e38; L = 0.0;
+        for (uint d = 0u; d < p.dim_v; ++d) O[d] = 0.0;
+    } else {
+        uint cb = (q * p.gqa + h) * (p.dim_v + 2u);
+        for (uint d = 0u; d < p.dim_v; ++d) O[d] = carry[cb + d];
+        M = carry[cb + p.dim_v]; L = carry[cb + p.dim_v + 1u];
+    }
+
+    float QV[1024];
+    float KV[1024];
+    float VV[1024];
+    int staged_group = -1;
+
+    for (int e = ob; e < oe; ++e) {
+        uint ue = uint(e);
+        int source; int row; int group;
+        if (wide2) {
+            int key = entries[ue * 2u + 0u];
+            group = entries[ue * 2u + 1u];
+            if (key < 0) { atomicCompSwap(status[0], 0, 3); poison_row(q, h); return; }
+            if (uint(key) < p.hot_rows) { source = 1; row = key; }
+            else { source = 2; row = key - int(p.hot_rows); }
+        } else {
+            source = entries[ue * 4u + 0u];
+            row    = entries[ue * 4u + 1u];
+            group  = entries[ue * 4u + 2u];
+            if (entries[ue * 4u + 3u] == 0) continue;
+        }
+        if (source != 1 && source != 2) { atomicCompSwap(status[0], 0, 2); poison_row(q, h); return; }
+        if (group < 0 || uint(group) >= p.n_groups) { atomicCompSwap(status[0], 0, 4); poison_row(q, h); return; }
+        bool is_hot = (source == 1);
+        if (row < 0 || (is_hot ? uint(row) >= p.hot_rows : uint(row) >= p.n_cold)) {
+            atomicCompSwap(status[0], 0, 3); poison_row(q, h); return;
+        }
+        if (reject_dupes) {
+            for (int d2 = ob; d2 < e; ++d2) {
+                uint u2 = uint(d2);
+                int s2; int r2;
+                if (wide2) {
+                    int k2 = entries[u2 * 2u + 0u];
+                    if (k2 < 0) continue;
+                    if (uint(k2) < p.hot_rows) { s2 = 1; r2 = k2; }
+                    else { s2 = 2; r2 = k2 - int(p.hot_rows); }
+                } else {
+                    if (entries[u2 * 4u + 3u] == 0) continue;
+                    s2 = entries[u2 * 4u + 0u];
+                    r2 = entries[u2 * 4u + 1u];
+                }
+                if (s2 == source && r2 == row) { atomicCompSwap(status[0], 0, 5); poison_row(q, h); return; }
+            }
+        }
+        if (group != staged_group) {
+            uint qb = uint(group) * p.q_nb2 + h * p.q_nb1;
+            for (uint d = 0u; d < p.dim_k; ++d) QV[d] = q_data[qb / 4u + d];
+            staged_group = group;
+        }
+        if (is_hot) {
+            uint base = p.kv_head * p.kh_nb1 + uint(row) * p.kh_nb2 + p.stream * p.kh_nb3;
+            hot_row(0u, base, p.k_hot_type, p.dim_k, KV);
+        } else {
+            uint base = uint(row) * p.kc_nb1;
+            for (uint d = 0u; d < p.dim_k; ++d) KV[d] = cold_ld(0u, base, d, p.k_cold_type);
+        }
+        float dot = 0.0;
+        for (uint d = 0u; d < p.dim_k; ++d) dot += QV[d] * KV[d];
+        float s = dot * eff;
+        if (p.softcap > 0.0) s = p.softcap * tanh(s);
+        if (isnan(s) || isinf(s)) continue; // non-finite treated as masked
+        if (is_hot) {
+            uint base = p.kv_head * p.vh_nb1 + uint(row) * p.vh_nb2 + p.stream * p.vh_nb3;
+            hot_row(1u, base, p.v_hot_type, p.dim_v, VV);
+        } else {
+            uint base = uint(row) * p.vc_nb1;
+            for (uint d = 0u; d < p.dim_v; ++d) VV[d] = cold_ld(1u, base, d, p.v_cold_type);
+        }
+        float old_scale = 1.0; float value_scale = 1.0;
+        if (M <= -1.7014117e38 / 2.0) {
+            M = s; L = 1.0;
+            for (uint d = 0u; d < p.dim_v; ++d) O[d] = VV[d];
+        } else {
+            if (s > M) { old_scale = exp(M - s); M = s; }
+            else { value_scale = exp(s - M); }
+            for (uint d = 0u; d < p.dim_v; ++d) O[d] = O[d] * old_scale + value_scale * VV[d];
+            L = L * old_scale + value_scale;
+        }
+    }
+
+    if (apply_sink) {
+        float ss = sinks[h];
+        if (ss == ss && ss > -1e30) {
+            if (M <= -1.7014117e38 / 2.0) { M = ss; L = 1.0; }
+            else if (ss > M) {
+                float f = exp(M - ss); M = ss;
+                for (uint d = 0u; d < p.dim_v; ++d) O[d] *= f;
+                L = L * f + 1.0;
+            } else {
+                L += exp(ss - M);
+            }
+        }
+    }
+
+    uint obase = (q * p.gqa + h) * (p.dim_v + 2u);
+    if (final_tile && L > 0.0 && L == L) {
+        float inv = 1.0 / L;
+        for (uint d = 0u; d < p.dim_v; ++d) dst[obase + d] = O[d] * inv;
+    } else if (final_tile) {
+        for (uint d = 0u; d < p.dim_v; ++d) dst[obase + d] = 0.0;
+    } else {
+        for (uint d = 0u; d < p.dim_v; ++d) dst[obase + d] = O[d];
+    }
+    dst[obase + p.dim_v] = M;
+    dst[obase + p.dim_v + 1u] = L;
+}

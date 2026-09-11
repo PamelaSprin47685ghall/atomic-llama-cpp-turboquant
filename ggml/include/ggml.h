@@ -565,6 +565,7 @@ extern "C" {
 
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_EXT_BANDED,
+        GGML_OP_FLASH_ATTN_EXT_REROT,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -597,6 +598,18 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        GGML_OP_FLASH_PREFILL_POOL,
+        GGML_OP_FLASH_PREFILL_SELECT,
+        GGML_OP_FLASH_PREFILL_ATTN,
+        GGML_OP_XKV_RECONSTRUCT,
+        GGML_OP_XKV_ATTENTION,
+        GGML_OP_XKV_FACTORIZE,
+        GGML_OP_XKV_CANONICALIZE,
+        GGML_OP_XKV_LANDMARK,
+        GGML_OP_XKV_LANDMARK_BUILD,
+        GGML_OP_XKV_LANDMARK_ROWS,
+        GGML_OP_XKV_LANDMARK_MERGE,
 
         GGML_OP_COUNT,
     };
@@ -1374,6 +1387,74 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 alpha,
             float                 limit);
+
+    // FlashPrefill V2 exact-all / sparse-correction ops (separate identities, not RERoT).
+    // All capacities are explicit host scalars; backends must not read GPU counts to size outputs.
+    // op_params carry a 16x int32 (64 B) ggml_flashprefill_op_params by value, no host pointers.
+    //   POOL:   src[0]=K (cache), src[1]=V (cache), src[2]=metadata (I32),
+    //           src[3]=k_dep (optional ordering edge on K write, else NULL),
+    //           src[4]=v_dep (optional ordering edge on V write, else NULL) -> pool F32
+    //   SELECT: src[0]=Q (F32), src[1]=pool (F32), src[2]=metadata (I32) -> plan I32
+    //   ATTN:   src[0]=Q (F32), src[1]=K, src[2]=V, src[3]=pool (F32),
+    //           src[4]=plan (I32), src[5]=metadata (I32),
+    //           src[6]=sinks (optional F32, NULL when absent) -> output F32
+    // Agreed shapes (RERoT-style): Q F32 [Dk, n_groups, Hq, 1];
+    // K/V actual cache [D, nkv, Hkv, 1]; pool F32 [Dk+Dv, Hkv, Fcap];
+    // output F32 [Dv, Hq, n_output_queries, 1]. max_sel is the maximum
+    // actual per (tile, head) use count, not the global use count.
+    // k_dep/v_dep are ordering-only; backends must honor the edge, never read contents.
+    GGML_API struct ggml_tensor * ggml_flash_prefill_pool(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * metadata,
+            struct ggml_tensor  * k_dep,
+            struct ggml_tensor  * v_dep,
+            int32_t               dk,
+            int32_t               dv,
+            int32_t               n_kv_heads,
+            int64_t               f_cap);
+
+    GGML_API struct ggml_tensor * ggml_flash_prefill_select(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * pool,
+            struct ggml_tensor  * metadata,
+            int64_t               n_tiles,
+            int64_t               n_kv_heads,
+            int64_t               max_sel,
+            float                 scale,
+            float                 alpha,
+            float                 softcap,
+            int32_t               exact_all,
+            bool                  mean_correction);
+
+    GGML_API struct ggml_tensor * ggml_flash_prefill_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * pool,
+            struct ggml_tensor  * plan,
+            struct ggml_tensor  * metadata,
+            struct ggml_tensor  * sinks,
+            int64_t               n_output_queries,
+            int64_t               n_heads,
+            int32_t               dv,
+            float                 scale,
+            float                 softcap,
+            bool                  mean_correction);
+
+    GGML_API void ggml_flash_prefill_select_set_mean_correction(
+            struct ggml_tensor * t,
+            bool                 mean_correction);
+    GGML_API bool ggml_flash_prefill_select_get_mean_correction(
+            const struct ggml_tensor * t);
+    GGML_API void ggml_flash_prefill_attn_set_mean_correction(
+            struct ggml_tensor * t,
+            bool                 mean_correction);
+    GGML_API bool ggml_flash_prefill_attn_get_mean_correction(
+            const struct ggml_tensor * t);
 
     // normalize along rows
     GGML_API struct ggml_tensor * ggml_norm(
@@ -2448,6 +2529,26 @@ extern "C" {
             float                 scale,
             int64_t               rel_extent);
 
+    // Indexed RERoT attention. q_groups contains one fully position-encoded
+    // query row for each distinct reader-relative effective position:
+    //   q_groups: [n_embd_k, n_groups, n_head, 1]
+    //   k:        [n_embd_k, n_kv, n_head_kv, 1]
+    //   v:        [n_embd_v, n_kv, n_head_kv, 1]
+    //   entries:  I32 [2, n_entries], (physical_k_index, q_group_index)
+    //   offsets:  I32 [n_queries + 1], entry range per output query
+    //   result:   [n_embd_v, n_head, n_queries, 1]
+    // All entries in one query range participate in a single global softmax.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_rerot(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q_groups,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * entries,
+            struct ggml_tensor  * offsets,
+            struct ggml_tensor  * sinks,
+            float                 scale,
+            float                 logit_softcap);
+
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
@@ -2605,6 +2706,29 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    // RERoT Parallel Delta: concurrent PUBLIC writers advance one shared brain
+    // through a coherence-normalized regularized block update. Writer i uses
+    // density_i = sum_j cos^2(k_i,k_j) over active writers; orthogonal writes
+    // retain the native strength while duplicate evidence does not become N
+    // times more confident merely because N pens emitted it. native_state is
+    // brain_state + private hand H. The current-token output is the exact
+    // native transition T_i(B+H_i); the shared block B' is committed for the
+    // next frontier and is not read instantaneously by peer queries in the
+    // same recurrent layer. The result carries the propagated private
+    // overlay plus the writer's centered block contribution C_i-mean(C), whose
+    // sum over writers is exactly zero; this preserves per-pen write identity
+    // without changing the shared brain. N=1 is a strict native-recurrence
+    // special case (no regularization and zero centered contribution).
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_rbb(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * brain_state,
+            struct ggml_tensor  * native_state);
+
     // TurboQuant Walsh-Hadamard Transform (O(d log d) rotation for KV cache compression)
     // Applies WHT rotation to 128-element groups along ne[0]: sign1 → butterfly → sign2 → normalize
     // direction: 0 = forward (signs1 → WHT → signs2), 1 = inverse (signs2 → WHT → signs1)
@@ -2614,6 +2738,41 @@ extern "C" {
             int                   direction,
             int                   group_size,    // 0 = auto (64 or 128 from ne[0])
             struct ggml_tensor  * scale);        // NULL = no InnerQ scaling
+
+    // TurboQuant decoding target domain
+    enum ggml_turbo_decode_domain {
+        GGML_TURBO_DECODE_ROTATED   = 0, // raw centroids in WHT-rotated domain
+        GGML_TURBO_DECODE_CANONICAL = 1, // inverse WHT applied to recover canonical floats
+    };
+
+    // Re-entrant row quantization/dequantization for TurboQuant types (CPU)
+    // Supported types: GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0.
+    // For XKV v1, group_size must be 128; n_elements must be a positive multiple of 128.
+    // dequantize direction: 0 = rotated domain (raw centroids), 1 = canonical domain (inverts WHT).
+    // Returns true on success, false on invalid argument / unsupported type.
+    GGML_API bool ggml_quantize_turbo_row(
+            enum ggml_type   type,
+            const float    * src,
+            void           * dst,
+            int64_t          n_elements,
+            int              group_size);
+
+    GGML_API bool ggml_dequantize_turbo_row(
+            enum ggml_type   type,
+            const void     * src,
+            float          * dst,
+            int64_t          n_elements,
+            int              group_size,
+            enum ggml_turbo_decode_domain domain);
+
+    // Return compiled layout/table fingerprint for TurboQuant type, or 0 if unsupported for XKV.
+    // Hashes compiled block size, struct size, centroids, WHT signs, and compilation mode.
+    GGML_API uint64_t ggml_turbo_layout_fingerprint(enum ggml_type type);
+
+    // Re-entrant forward and inverse Walsh-Hadamard transform row helpers for group_size (128).
+    // In XKV v1, group_size must be 128; x must contain at least group_size elements.
+    GGML_API void ggml_turbo_wht_row(float * x, int group_size);
+    GGML_API void ggml_turbo_wht_inverse_row(float * x, int group_size);
 
     // DSA lightning indexer
     //

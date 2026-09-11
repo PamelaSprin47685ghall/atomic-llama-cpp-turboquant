@@ -98,6 +98,9 @@ add_library(${TARGET}
     reasoning-budget.h
     sampling.cpp
     sampling.h
+    ${PROJECT_SOURCE_DIR}/wanxiangqi/common/arg-options.cpp
+    ${PROJECT_SOURCE_DIR}/wanxiangqi/common/arg-options.h
+    ${PROJECT_SOURCE_DIR}/wanxiangqi/common/params.h
     speculative.cpp
     speculative.h
     subproc.cpp

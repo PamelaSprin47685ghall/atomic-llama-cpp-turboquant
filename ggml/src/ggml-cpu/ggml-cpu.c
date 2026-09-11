@@ -14,6 +14,10 @@
 #include "vec.h"
 #include "ops.h"
 #include "ggml.h"
+#include "ggml-xkv.h"
+#include "ggml-cpu-xkv-factor.h"
+#include "ggml-cpu-xkv-landmark-build.h"
+#include "ggml-cpu-xkv-landmark.h"
 #include "common.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -621,6 +625,9 @@ struct ggml_state {
 static struct ggml_state g_state = {0};
 
 void ggml_barrier(struct ggml_threadpool * tp) {
+    if (tp == NULL) {
+        return;
+    }
     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
     if (n_threads == 1) {
         return;
@@ -2050,6 +2057,42 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_flash_attn_ext(params, tensor);
             } break;
+        case GGML_OP_FLASH_ATTN_EXT_REROT:
+            {
+                ggml_compute_forward_flash_attn_ext_rerot(params, tensor);
+            } break;
+        case GGML_OP_XKV_RECONSTRUCT:
+            {
+                ggml_compute_forward_xkv_reconstruct(params, tensor);
+            } break;
+        case GGML_OP_XKV_ATTENTION:
+            {
+                ggml_compute_forward_xkv_attention(params, tensor);
+            } break;
+        case GGML_OP_XKV_FACTORIZE:
+            {
+                ggml_compute_forward_xkv_factorize(params, tensor);
+            } break;
+        case GGML_OP_XKV_CANONICALIZE:
+            {
+                ggml_compute_forward_xkv_canonicalize(params, tensor);
+            } break;
+        case GGML_OP_XKV_LANDMARK:
+            {
+                ggml_compute_forward_xkv_landmark(params, tensor);
+            } break;
+        case GGML_OP_XKV_LANDMARK_BUILD:
+            {
+                ggml_compute_forward_xkv_landmark_build(params, tensor);
+            } break;
+        case GGML_OP_XKV_LANDMARK_ROWS:
+            {
+                ggml_compute_forward_xkv_landmark_rows(params, tensor);
+            } break;
+        case GGML_OP_XKV_LANDMARK_MERGE:
+            {
+                ggml_compute_forward_xkv_landmark_merge(params, tensor);
+            } break;
         case GGML_OP_FLASH_ATTN_BACK:
             {
                 int32_t t = ggml_get_op_params_i32(tensor, 0);
@@ -2116,6 +2159,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
+            } break;
+        case GGML_OP_FLASH_PREFILL_POOL:
+            {
+                ggml_compute_forward_flash_prefill_pool(params, tensor);
+            } break;
+        case GGML_OP_FLASH_PREFILL_SELECT:
+            {
+                ggml_compute_forward_flash_prefill_select(params, tensor);
+            } break;
+        case GGML_OP_FLASH_PREFILL_ATTN:
+            {
+                ggml_compute_forward_flash_prefill_attn(params, tensor);
             } break;
         case GGML_OP_DSV4_HC_COMB:
             {
@@ -2451,12 +2506,30 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_TOP_K:
         case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_FLASH_ATTN_EXT_BANDED:
+        case GGML_OP_FLASH_ATTN_EXT_REROT:
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
+        case GGML_OP_FLASH_PREFILL_POOL:
+        case GGML_OP_FLASH_PREFILL_SELECT:
+        case GGML_OP_FLASH_PREFILL_ATTN:
             {
                 n_tasks = n_threads;
+            } break;
+        case GGML_OP_XKV_RECONSTRUCT:
+            {
+                n_tasks = 1;
+            } break;
+        case GGML_OP_XKV_ATTENTION:
+        case GGML_OP_XKV_FACTORIZE:
+        case GGML_OP_XKV_CANONICALIZE:
+        case GGML_OP_XKV_LANDMARK:
+        case GGML_OP_XKV_LANDMARK_BUILD:
+        case GGML_OP_XKV_LANDMARK_ROWS:
+        case GGML_OP_XKV_LANDMARK_MERGE:
+            {
+                n_tasks = 1;
             } break;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_GATED_LINEAR_ATTN:
@@ -2937,14 +3010,14 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_SET_ROWS:
                     {
                         if (node->src[0]->type == GGML_TYPE_F16 && node->type != GGML_TYPE_F16) {
-                            cur = ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] * n_tasks;
+                            cur = (ggml_type_size(GGML_TYPE_F32) * node->src[0]->ne[0] + CACHE_LINE_SIZE) * n_tasks;
                         }
                     } break;
                 case GGML_OP_SOFT_MAX:
                 case GGML_OP_ROPE:
                 case GGML_OP_ROPE_BACK:
                     {
-                        cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
+                        cur = (ggml_type_size(GGML_TYPE_F32) * (node->ne[0] + CACHE_LINE_SIZE_F32)) * n_tasks + CACHE_LINE_SIZE;
                     } break;
                 case GGML_OP_CONV_TRANSPOSE_1D:
                     {
@@ -3016,6 +3089,106 @@ struct ggml_cplan ggml_graph_plan(
 
                         cur += MAX(prefill, decode);
                     } break;
+                case GGML_OP_FLASH_ATTN_EXT_REROT:
+                    {
+                        const int64_t DK = node->src[1]->ne[0];
+                        const int64_t DV = node->src[2]->ne[0];
+                        // F32 indexed attention decodes K here without rounding Q.
+                        const enum ggml_type vec_dot_type = node->op_params[3] == GGML_PREC_F32
+                            ? GGML_TYPE_F32 : type_traits_cpu[node->src[1]->type].vec_dot_type;
+                        const size_t q_row = GGML_PAD(ggml_row_size(vec_dot_type, DK), CACHE_LINE_SIZE);
+                        cur += (q_row + 2 * sizeof(float) * DV + CACHE_LINE_SIZE) * n_tasks;
+                    } break;
+                case GGML_OP_XKV_RECONSTRUCT:
+                    {
+                        // Bounded workspace for the no-heap core (see ggml-cpu-xkv.cpp).
+                        ggml_xkv_reconstruct_params p;
+                        memcpy(&p, node->op_params, sizeof(p));
+                        size_t need = 0;
+                        if (ggml_xkv_core_scratch_floats(&p, node->src[0]->ne[0], node->src[2]->ne[0],
+                                                         &need, NULL, 0)) {
+                            cur += need * sizeof(float);
+                        } else {
+                            cur += (size_t)4096 * sizeof(float);
+                        }
+                    } break;
+                case GGML_OP_XKV_ATTENTION:
+                    {
+                        // Bounded tmp (Dk+Dv floats, see ggml-cpu-xkv-attention.cpp).
+                        ggml_xkv_attention_params p;
+                        memcpy(&p, node->op_params, sizeof(p));
+                        size_t need = 0;
+                        if (ggml_xkv_attn_tmp_floats(&p, &need, NULL, 0)) {
+                            cur += need * sizeof(float);
+                        } else {
+                            cur += (size_t)2048 * sizeof(float);
+                        }
+                    } break;
+                case GGML_OP_FLASH_PREFILL_POOL:
+                    {
+                        // Per-thread: decoded K row + decoded V row (F32) +
+                        // double means accumulators. Dk+Dv == dst ne0.
+                        // CPU-ref reserve only (never feeds GPU fitting);
+                        // checked multiplication saturates instead of
+                        // wrapping to an under-allocation.
+                        const int64_t DkDv = node->ne[0] > 0 ? node->ne[0] : 0;
+                        const size_t fbytes = (size_t)DkDv * sizeof(float);
+                        const size_t sums_off = (fbytes + 7u) & ~7u;
+                        size_t per_thread = sums_off + 64u;
+                        if ((size_t)DkDv > (SIZE_MAX - per_thread) / sizeof(double)) {
+                            cur = SIZE_MAX;
+                        } else {
+                            per_thread += (size_t)DkDv * sizeof(double);
+                            if (n_tasks > 0 && per_thread > (SIZE_MAX - cur) / (size_t)n_tasks) {
+                                cur = SIZE_MAX;
+                            } else {
+                                cur += per_thread * (size_t)n_tasks;
+                            }
+                        }
+                    } break;
+                case GGML_OP_FLASH_PREFILL_SELECT:
+                    {
+                        // Per-thread: aggregates + S energies + use/frag index
+                        // buffers, conservatively bounded by plan words
+                        // (max_sel_pair <= plan words). Matches ops.cpp.
+                        // CPU-ref reserve only; checked multiplication.
+                        const int64_t W = node->ne[0] > 0 ? node->ne[0] : 0;
+                        const size_t stride = sizeof(double) + 2u * sizeof(int32_t);
+                        if ((size_t)W > (SIZE_MAX - 128u) / stride) {
+                            cur = SIZE_MAX;
+                        } else {
+                            const size_t per_thread = 128u + (size_t)W * stride;
+                            if (n_tasks > 0 && per_thread > (SIZE_MAX - cur) / (size_t)n_tasks) {
+                                cur = SIZE_MAX;
+                            } else {
+                                cur += per_thread * (size_t)n_tasks;
+                            }
+                        }
+                    } break;
+                case GGML_OP_FLASH_PREFILL_ATTN:
+                    {
+                        // Per-thread: decoded K row + decoded V row + MLO
+                        // accum + finalize tmp. Dk from Q, Dv from dst.
+                        // CPU-ref reserve only; checked multiplication.
+                        const int64_t DK = (node->src[0] && node->src[0]->ne[0] > 0) ? node->src[0]->ne[0] : 0;
+                        const int64_t DV = node->ne[0] > 0 ? node->ne[0] : 0;
+                        size_t per_thread = 64u;
+                        if ((size_t)DK > (SIZE_MAX - per_thread) / sizeof(float)) {
+                            cur = SIZE_MAX;
+                        } else {
+                            per_thread += (size_t)DK * sizeof(float);
+                            if ((size_t)DV > (SIZE_MAX - per_thread) / (sizeof(float) * 3u)) {
+                                cur = SIZE_MAX;
+                            } else {
+                                per_thread += (size_t)DV * sizeof(float) * 3u;
+                                if (n_tasks > 0 && per_thread > (SIZE_MAX - cur) / (size_t)n_tasks) {
+                                    cur = SIZE_MAX;
+                                } else {
+                                    cur += per_thread * (size_t)n_tasks;
+                                }
+                            }
+                        }
+                    } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {
                         const int64_t    D = node->src[0]->ne[0];
@@ -3042,7 +3215,7 @@ struct ggml_cplan ggml_graph_plan(
                         const int64_t S_v = node->src[2]->ne[0];
                         const int64_t K   = ggml_get_op_params_i32(node, 0);
                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);
-                        cur = per_thread * sizeof(float) * n_tasks;
+                        cur = (per_thread + CACHE_LINE_SIZE_F32) * sizeof(float) * n_tasks;
                     } break;
                 case GGML_OP_TURBO_WHT:
                     {

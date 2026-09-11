@@ -24,6 +24,8 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
+                     uint32_t   n_brain_max,
+                     uint32_t   n_hand_max,
         const layer_filter_cb & filter);
 
     ~llama_memory_recurrent() = default;
@@ -49,6 +51,11 @@ public:
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
+    bool seq_rm_attention(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
+    void seq_cp_attention(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+    bool seq_rm_recurrent(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
+    void seq_cp_recurrent(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
@@ -61,6 +68,47 @@ public:
 
     bool get_can_shift() const override;
 
+    uint32_t get_recurrent_capacity() const override;
+    uint32_t get_recurrent_used()     const override;
+    uint32_t get_recurrent_seq_used(llama_seq_id seq_id) const override;
+
+    // RERoT grouped layout queries (§§B.3.2, B.6, B.13 Phase 3)
+    uint32_t get_brain_capacity() const override;
+    uint32_t get_hand_capacity()  const override;
+    uint32_t get_brain_used()     const override;
+    uint32_t get_hand_used()      const override;
+
+    void set_grouped_layout(uint32_t n_brains, uint32_t n_hands) override;
+    bool is_grouped_layout() const { return n_brain_rows > 0 && n_hand_rows > 0; }
+    bool uses_native_child_state(llama_seq_id seq_id) const;
+    bool is_s_shared(int32_t il) const;
+
+    // Shared fork hand seed (§B.6.4):
+    // Materializes/captures immutable fork seed for queued children without duplicating full recurrent rows.
+    struct hand_seed {
+        uint64_t fork_id = 0;
+        int32_t source_hand_row = -1;
+        llama_pos source_pos = -1;
+        std::vector<std::vector<uint8_t>> conv_tail_bytes; // layer -> conv state bytes
+        std::vector<std::vector<uint8_t>> state_bytes;     // layer -> private S or shared hand state
+    };
+
+    std::shared_ptr<hand_seed> capture_hand_seed(uint64_t fork_id, llama_seq_id source_seq);
+    bool apply_hand_seed(llama_seq_id dest_seq, const std::shared_ptr<hand_seed> & seed);
+
+    size_t rerot_hand_seed_size(llama_seq_id source_seq) const override;
+    bool rerot_capture_hand_seed(llama_seq_id source_seq, std::vector<uint8_t> & seed_out) override;
+    bool rerot_apply_hand_seed(llama_seq_id dest_seq, const std::vector<uint8_t> & seed_in) override;
+    bool rerot_set_write_tag(llama_seq_id seq_id, const llama_kv_rerot_meta & tag) override;
+    void rerot_clear_write_tag(llama_seq_id seq_id) override;
+    void rerot_release_episode(uint64_t episode_id) override;
+
+    bool rerot_commit_rbb_frontier(
+            uint32_t person_id,
+            const llama_seq_id * candidate_seqs,
+            const uint8_t * is_public_write,
+            size_t n_candidates) override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -69,6 +117,12 @@ public:
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
+
+    // RERoT grouped layout fields (§§B.6, B.13 Phase 3)
+    uint32_t n_brain_rows = 0;
+    uint32_t n_hand_rows  = 0;
+    uint32_t brain_capacity = 0;
+    uint32_t hand_capacity  = 0;
 
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
@@ -89,7 +143,6 @@ public:
         llama_pos pos  = -1;
         int32_t   src  = -1; // used to know where states should be copied from
         int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
-        int32_t   tail = -1;
 
         std::set<llama_seq_id> seq_id;
 
@@ -107,13 +160,27 @@ public:
     };
 
     std::vector<mem_cell> cells;
+    std::vector<int32_t> tails; // logical seq_id -> physical hand row
+
+    // RERoT grouped state ownership. A sequence owns one hand row through
+    // tails[] and references one episode-global brain row here.
+    std::vector<int32_t> seq_brain;
+    std::vector<uint64_t> seq_episode;
+    std::vector<llama_rerot_node_id> seq_node;
+    std::vector<uint8_t> seq_public_write;
+    std::map<uint64_t, int32_t> episode_brain;
+    std::vector<uint64_t> brain_episode;
 
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
     std::vector<ggml_tensor *> p_l; // optional PLE conv state
+    std::vector<ggml_tensor *> d_l; // compact per-hand delta from the shared brain
+    std::vector<uint8_t> s_shared_l;
 
 private:
+    friend class llama_memory_recurrent_context;
+
     //const llama_model & model;
     const llama_hparams & hparams;
 
@@ -127,12 +194,22 @@ private:
     size_t size_r_bytes() const;
     size_t size_p_bytes() const;
     size_t size_s_bytes() const;
+    size_t size_d_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    void state_write_data(
+            llama_io_write_i & io,
+            const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+            const std::vector<int32_t> & brain_rows) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
-    bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
+    bool state_read_data(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id);
+
+    int32_t brain_row_for_seq(llama_seq_id seq_id) const;
+    int32_t brain_read_row_for_seq(llama_seq_id seq_id) const;
+    int32_t acquire_brain_row(uint64_t episode_id, llama_seq_id seq_id);
+    void clear_brain_row(int32_t brain_row);
+    void clear_hand_row(int32_t hand_row);
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {
@@ -158,6 +235,9 @@ public:
     bool next()  override;
     bool apply() override;
 
+    // POSTCOMPUTE committed-state audit (split-ubatch carry debug).
+    bool postcompute_success() override;
+
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
@@ -169,12 +249,20 @@ public:
     uint32_t get_head() const;
     int32_t  get_rs_z() const;
     uint32_t get_size() const;
+    uint32_t get_brain_size() const;
+    bool is_grouped() const;
 
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
+    ggml_tensor * get_d_l(int32_t il) const;
+    bool is_s_shared(int32_t il) const;
 
     int32_t s_copy(int i) const;
+    int32_t brain_copy(int i) const;
+    bool is_public_write(int i) const;
+    bool is_child_row(int i) const;
+    std::map<int32_t, std::vector<int32_t>> public_brain_groups() const;
 
 private:
     const llama_memory_status status;

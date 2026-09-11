@@ -8,11 +8,13 @@
 #include "base64.hpp"
 
 #include "server-common.h"
+#include "server-task.h"
+#include "server-rerot.h"
 
-#include <random>
 #include <sstream>
 #include <fstream>
 #include <limits>
+#include <chrono>
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -61,21 +63,6 @@ json format_error_response(const std::string & message, const enum error_type ty
 //
 // random string / id
 //
-
-std::string random_string() {
-    static const std::string str("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz");
-
-    std::random_device rd;
-    std::mt19937 generator(rd());
-
-    std::string result(32, ' ');
-
-    for (int i = 0; i < 32; ++i) {
-        result[i] = str[generator() % str.size()];
-    }
-
-    return result;
-}
 
 std::string gen_chatcmplid() {
     return "chatcmpl-" + random_string();
@@ -942,6 +929,23 @@ json oaicompat_chat_params_parse(
 {
     json llama_params;
 
+    const auto parse_reasoning_effort = [&]() -> std::string {
+        if (!body.contains("reasoning_effort") || body.at("reasoning_effort").is_null()) {
+            return {};
+        }
+        if (!body.at("reasoning_effort").is_string()) {
+            throw std::invalid_argument("reasoning_effort must be a string");
+        }
+        const std::string effort = body.at("reasoning_effort").get<std::string>();
+        if (effort != "none" && effort != "low" && effort != "medium" &&
+            effort != "high" && effort != "xhigh" && effort != "max") {
+            throw std::invalid_argument(
+                "reasoning_effort must be one of: none, low, medium, high, xhigh, max");
+        }
+        return effort;
+    };
+    const std::string reasoning_effort = parse_reasoning_effort();
+
     auto tools = json_value(body, "tools", json());
     auto has_tools = tools.is_array() && !tools.empty();
     auto stream = json_value(body, "stream", false);
@@ -1069,6 +1073,21 @@ json oaicompat_chat_params_parse(
 
     common_chat_templates_inputs inputs;
     inputs.messages               = common_chat_msgs_parse_oaicompat(messages);
+
+    // Reconcile client-returned chronicle reasoning back to canonical PAC-DFS.
+    // Streamed episodes emit completion-order chunks; when the client sends
+    // them back in history, exact known chronicle strings are mapped back to
+    // the canonical document order so prompt caching and KV reuse succeed.
+    // Unseen or tampered reasoning is strictly preserved as-is.
+    for (auto & msg : inputs.messages) {
+        if (msg.role == "assistant" && !msg.reasoning_content.empty()) {
+            auto canonical = server_rerot_resolve_canonical_reasoning(msg.reasoning_content);
+            if (canonical.has_value()) {
+                msg.reasoning_content = std::move(*canonical);
+            }
+        }
+    }
+
     inputs.tools                  = common_chat_tools_parse_oaicompat(tools);
     inputs.tool_choice            = common_chat_tool_choice_parse_oaicompat(tool_choice);
     inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();
@@ -1119,12 +1138,13 @@ json oaicompat_chat_params_parse(
         throw std::invalid_argument("invalid type for \"enable_thinking\" (expected boolean, got string)");
     }
 
-    // Parse also the OAI "reasoning_effort": "none" specific value
-    if (body.contains("reasoning_effort")) {
-        auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
-        if (reasoning_effort == "none") {
-            inputs.enable_thinking = false;
-        } // other reasoning_effort values are model-specific and not yet handled
+    // OpenAI-compatible reasoning effort is authoritative over an equivalent
+    // template kwarg. Templates that understand reasoning_effort receive it
+    // verbatim; the generic reasoning-budget sampler below supplies a
+    // deterministic fallback for templates exposing thinking start/end tags.
+    if (!reasoning_effort.empty()) {
+        inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
+        inputs.enable_thinking = reasoning_effort != "none";
     }
 
     inputs.force_pure_content = opt.force_pure_content;
@@ -1134,9 +1154,15 @@ json oaicompat_chat_params_parse(
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;
+    llama_params["rerot_chat_messages"] = messages;
+    if (tools.is_array()) {
+        llama_params["rerot_chat_tools"] = tools;
+    }
+    llama_params["rerot_chat_now_ms"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+        inputs.now.time_since_epoch()).count();
     if (!chat_params.grammar.empty()) {
         llama_params["grammar"]      = chat_params.grammar;
-        llama_params["grammar_type"] = std::string("tool_calls");
+        llama_params["grammar_type"] = !inputs.json_schema.empty() ? std::string("output_format") : std::string("tool_calls");
     }
     llama_params["grammar_lazy"] = chat_params.grammar_lazy;
     auto grammar_triggers        = json::array();
@@ -1156,12 +1182,42 @@ json oaicompat_chat_params_parse(
 
     llama_params["message_delimiters"] = chat_params.message_delimiters.to_json();
 
-    // Reasoning budget: pass parameters through to sampling layer
+    // Reasoning budget: explicit token budgets win. Native effort-aware chat
+    // templates receive reasoning_effort directly above. Only when a backend
+    // needs a legacy token budget do we translate named effort using the
+    // de-facto open-source compatibility ladder for budget-only models:
+    //   low=.20, medium=.50, high=.80, xhigh=.95, max=1.00.
+    // Cline keeps max distinct at 1.00; OpenRouter currently collapses xhigh
+    // and max to .95 to reserve answer space. We expose both names, so keeping
+    // them distinct is less surprising; the max_tokens-1 clamp below still
+    // reserves at least one token outside the thinking budget.
+    // This is NOT Anthropic's native semantics: current Claude effort is a
+    // soft behavioral signal, not a strict token allocation. Do not invent an
+    // absolute budget when the request has no finite output cap.
+    // RERoT must capture the same ordinary C0 sampler configuration. Its
+    // internal planning/worker phases disable budgets on their own copies.
     {
+        const bool explicit_budget =
+            (body.contains("reasoning_budget_tokens") && !body.at("reasoning_budget_tokens").is_null()) ||
+            (body.contains("thinking_budget_tokens") && !body.at("thinking_budget_tokens").is_null());
         int reasoning_budget = json_value(body, "reasoning_budget_tokens",
-                               json_value(body, "thinking_budget_tokens", -1));
-        if (reasoning_budget == -1) {
-            reasoning_budget = opt.reasoning_budget;
+                               json_value(body, "thinking_budget_tokens", opt.reasoning_budget));
+        if (!explicit_budget && !reasoning_effort.empty()) {
+            int output_budget = json_value(body, "max_completion_tokens",
+                                json_value(body, "max_tokens",
+                                json_value(body, "n_predict", opt.n_predict)));
+            if (reasoning_effort == "none") {
+                reasoning_budget = 0;
+            } else if (output_budget > 0) {
+                int ratio_per_mille = 200;
+                if (reasoning_effort == "medium") ratio_per_mille = 500;
+                if (reasoning_effort == "high")   ratio_per_mille = 800;
+                if (reasoning_effort == "xhigh")  ratio_per_mille = 950;
+                if (reasoning_effort == "max")    ratio_per_mille = 1000;
+                const int64_t mapped = (int64_t(output_budget) * ratio_per_mille) / 1000;
+                const int upper = std::max(1, std::min(128000, output_budget - 1));
+                reasoning_budget = std::min(upper, std::max(1024, int(mapped)));
+            }
         }
 
         if (!chat_params.thinking_end_tags.empty()) {
@@ -1625,4 +1681,141 @@ server_tokens format_prompt_rerank(
     }
 
     return result;
+}
+
+//
+// RERoT outer compatibility: request plumbing (§§18,26,A.13-A.20)
+//
+// server-schema.cpp ignores unknown keys, so per-request RERoT overrides
+// ("rerot", "rerot_frontier", "rerot_trace") are applied here after
+// eval_llama_cmpl_schema(), starting from the server-global common_params.
+// Call sequence for server-context (owns the call site, not this file):
+//   task.params = eval_llama_cmpl_schema(...);
+//   task.params.apply_rerot_defaults(params_base);  // or next fn (includes it)
+//   server_rerot_apply_request_json(task, data, params_base);
+//   if (!server_rerot_validate_task(task, error)) -> 400 invalid_request.
+// The frozen llama_rerot_* C-API itself (ContextGlue, include/llama.h) is
+// consumed by tools/server/server-rerot.*; nothing here redeclares it.
+// RERoT OFF and embedding/rerank paths are no-ops with no allocation.
+
+void server_rerot_apply_request_json(server_task & task, const json & data, const common_params & base) {
+    task.params.apply_rerot_defaults(base);
+
+    auto has_value = [](const json & body, const char * key) {
+        const auto it = body.find(key);
+        return it != body.end() && !it->is_null();
+    };
+
+    if (has_value(data, "rerot")) {
+        const json & v = data.at("rerot");
+        if (!v.is_boolean()) {
+            throw std::invalid_argument("Field 'rerot': expected boolean");
+        }
+        const bool want = v.get<bool>();
+        if (!want) {
+            task.params.rerot_enabled = false;
+            task.params.rerot_trace = false;
+        } else {
+            if (!base.rerot_enabled) {
+                throw std::invalid_argument(
+                    "Field 'rerot': server was not started with --rerot");
+            }
+            task.params.rerot_enabled = true;
+            // frontier/trace keep base values unless overridden below
+        }
+    }
+
+    if (has_value(data, "rerot_frontier")) {
+        const json & v = data.at("rerot_frontier");
+        if (!v.is_string()) {
+            throw std::invalid_argument("Field 'rerot_frontier': expected 'strong' or 'lag1'");
+        }
+        if (!base.rerot_enabled) {
+            throw std::invalid_argument(
+                "Field 'rerot_frontier': server was not started with --rerot");
+        }
+        const std::string mode = v.get<std::string>();
+        if (mode == "strong") {
+            task.params.rerot_frontier = LLAMA_REROT_FRONTIER_STRONG;
+        } else if (mode == "lag1") {
+            task.params.rerot_frontier = LLAMA_REROT_FRONTIER_LAG1;
+        } else {
+            throw std::invalid_argument("Field 'rerot_frontier': expected 'strong' or 'lag1'");
+        }
+        task.params.rerot_enabled = true;
+    }
+
+    if (has_value(data, "rerot_trace")) {
+        const json & v = data.at("rerot_trace");
+        if (!v.is_boolean()) {
+            throw std::invalid_argument("Field 'rerot_trace': expected boolean");
+        }
+        const bool want_trace = v.get<bool>();
+        if (want_trace) {
+            if (!base.rerot_enabled) {
+                throw std::invalid_argument(
+                    "Field 'rerot_trace': server was not started with --rerot");
+            }
+            task.params.rerot_enabled = true;
+            task.params.rerot_trace = true;
+        } else {
+            task.params.rerot_trace = false;
+        }
+    }
+
+    if (!task.params.rerot_enabled && task.params.rerot_trace) {
+        // Trace without reasoning is meaningless; keep OFF zero-regression.
+        task.params.rerot_trace = false;
+    }
+
+    task.rerot_original_user_text.clear();
+    if (task.params.rerot_enabled) {
+        // oaicompat_chat_params_parse preserves the original messages beside
+        // the rendered prompt. Capture only the last real user text so the
+        // final acquire cannot confuse the surviving Lane's local assignment
+        // with the outer request. Text parts are joined; media stays in the
+        // already-evaluated shared prelude and is not duplicated here.
+        const auto messages_it = data.find("messages");
+        if (messages_it != data.end() && messages_it->is_array()) {
+            for (auto it = messages_it->rbegin(); it != messages_it->rend(); ++it) {
+                if (!it->is_object() ||
+                    json_value(*it, "role", std::string()) != "user" ||
+                    !it->contains("content")) {
+                    continue;
+                }
+                const json & content = it->at("content");
+                if (content.is_string()) {
+                    task.rerot_original_user_text = content.get<std::string>();
+                } else if (content.is_array()) {
+                    for (const auto & part : content) {
+                        if (!part.is_object() ||
+                            json_value(part, "type", std::string()) != "text") {
+                            continue;
+                        }
+                        const std::string text = json_value(part, "text", std::string());
+                        if (text.empty()) {
+                            continue;
+                        }
+                        if (!task.rerot_original_user_text.empty()) {
+                            task.rerot_original_user_text.push_back('\n');
+                        }
+                        task.rerot_original_user_text += text;
+                    }
+                }
+                break;
+            }
+        } else {
+            const auto prompt_it = data.find("prompt");
+            if (prompt_it != data.end() && prompt_it->is_string()) {
+                task.rerot_original_user_text = prompt_it->get<std::string>();
+            }
+        }
+    }
+}
+
+bool server_rerot_validate_task(const server_task & task, std::string & error) {
+    // A.19 + multimodal (A.18) need the media flag; has_media() is a cheap
+    // map-empty check with no allocation. OFF tasks always pass.
+    const bool has_media = task.tokens.has_media();
+    return task.params.rerot_validate_request(task.type, has_media, error);
 }

@@ -109,7 +109,7 @@ if (Vulkan_FOUND)
         "GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT"
     )
 
-    target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
+    target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan SPIRV-Headers::SPIRV-Headers)
     target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
     # Workaround to the "can't dereference invalidated vector iterator" bug in clang-cl debug build
@@ -201,6 +201,10 @@ if (Vulkan_FOUND)
     set (_ggml_vk_input_dir  "${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders")
     set (_ggml_vk_output_dir "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders.spv")
 
+    # FlashPrefill V2: flashprefill_pool/select/attn.comp plus the joint
+    # vulkan-shaders/flashprefill-interface.h (Shader-owned) are picked up by
+    # these globs automatically; no per-file entry. Pipelines stay lazy in
+    # ggml-vulkan.cpp (no OFF cost), scratch reuses scheduler graph buffers.
     file(GLOB _ggml_vk_shader_files CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.comp")
 
     # Because external projects do not provide source-level tracking,

@@ -65,7 +65,12 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 // if grammar_first is true, the grammar is applied before the samplers (slower)
 // useful in cases where all the resulting candidates (not just the sampled one) must fit the grammar
 //
-llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
+llama_token common_sampler_sample(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        int idx,
+        bool grammar_first = false,
+        bool synchronize = true);
 
 // generalized version of common_sampler_sample
 //
@@ -91,6 +96,25 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
+
+// Accepted prompt/generated token history used by penalty samplers.
+llama_tokens common_sampler_get_token_history(const struct common_sampler * gsmpl);
+
+// Replaces the grammar on a live sampler while preserving RNG, penalty,
+// adaptive, and reasoning-budget state (including a DONE phase). Installs the
+// sampling params' grammar fields (grammar, lazy, triggers, preserved tokens).
+// Lazy activation only: when the new grammar is lazy, the committed native end
+// is replayed into it so triggers observe it — end evidence prefers the
+// recorded budget match, else the server-supplied committed boundary
+// (exact committed token ids, e.g. for budget-free synthesis whose sampler
+// has no rbudget). Never replays into a non-lazy grammar. Empty grammar frees
+// the grammar sampler. Returns false when the vocab is missing or the new
+// grammar fails to parse.
+bool common_sampler_replace_grammar(
+    struct common_sampler * gsmpl,
+    const struct llama_vocab * vocab,
+    const struct common_params_sampling & params,
+    const llama_tokens * committed_end = nullptr);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);

@@ -1,0 +1,572 @@
+#version 450
+// FlashPrefill V2 ATTN: per-row sparse attention with proxy-mean correction.
+// Cooperative split-1 final (phase 0) + bounded split-partial (phase 1).
+// One workgroup per metadata row (= one output (source_query,q_head)).
+// All threads share uniform control; dot/value lanes cooperate via shared
+// reductions; no tid!=0 early return (every thread joins barriers and owns
+// strided Dv lanes). Split protocol (Guide8.1/Phase4): phase from push
+// word reserved0 (0=final,1=partial). Partial writes M/L/O to scratch
+// bindings 8/9/10 for MERGE; sink mass included only when
+// split_id==sink_split (unique assignment, never doubled). Merge implements
+// reference mlo_merge (same equations); CPU mlo_* remains the math
+// reference, not the Vulkan split executor. Backend barriers order
+// POOL->SELECT->ATTN(-partial->MERGE); scratch sized by fit.
+// Reads only selected token lists plus one mean per proxy use, one stable
+// softmax (online M/L, count/softcap/sinks), empty identity. Dk!=Dv,
+// dim64/128/256 + legal padding, arbitrary GQA. Failures write zeros AND
+// atomicMax the writable plan error word (never valid-looking zeros).
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+#include "types.glsl"
+#include "flashprefill-interface.h"
+
+layout(local_size_x_id = FP_SPEC_WGSIZE, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = FP_SPEC_WGSIZE) const uint WorkGroupSize = 64;
+layout(constant_id = FP_SPEC_FATYPE_K) const uint FaTypeK = 0;
+layout(constant_id = FP_SPEC_FATYPE_V) const uint FaTypeV = 0;
+layout(constant_id = FP_SPEC_FBLOCKB_K) const uint FaBlockBytesK = 2;
+layout(constant_id = FP_SPEC_FBLOCKB_V) const uint FaBlockBytesV = 2;
+
+#define FLOAT_TYPE float
+#define FLOAT_TYPEV4 vec4
+#define BINDING_IDX_K 0
+#define BINDING_IDX_V 1
+
+layout(binding = FP_BIND_K) readonly buffer K_F16 { float16_t data_k[]; };
+layout(binding = FP_BIND_K) readonly buffer K_F16V4 { f16vec4 data_kv4[]; };
+layout(binding = FP_BIND_V) readonly buffer V_F16 { float16_t data_v[]; };
+layout(binding = FP_BIND_V) readonly buffer V_F16V4 { f16vec4 data_vv4[]; };
+
+#include "flash_attn_dequant.glsl"
+
+layout(binding = FP_BIND_Q) readonly buffer QB { float data_q[]; };
+layout(binding = FP_BIND_POOL) readonly buffer POOLB { float data_pool[]; };
+layout(binding = FP_BIND_PLAN) buffer PLANB { int data_plan[]; };
+layout(binding = FP_BIND_META) readonly buffer METAB { int data_meta[]; };
+layout(binding = FP_BIND_SINKS) readonly buffer SINKB { float data_sinks[]; };
+layout(binding = FP_BIND_DST) buffer OUTB { float data_out[]; };
+layout(binding = 8) buffer SCR_M { float data_scr_m[]; };
+layout(binding = 9) buffer SCR_L { float data_scr_l[]; };
+layout(binding = 10) buffer SCR_O { float data_scr_o[]; };
+
+layout(push_constant) uniform FpAttnPushBlock { FP_ATTN_PUSH_FIELDS } p;
+
+shared float attn_sh[256];
+shared uint attn_coverage_bad;
+
+float attn_q_at(uint q_group, uint q_head, uint d) {
+    return data_q[(q_group * p.q_nb1 + q_head * p.q_nb2) / 4u + d];
+}
+
+vec4 attn_load_k4(uint tok, uint head, uint base) {
+    if (FaTypeK == FP_FA_TYPE_F16) {
+        uint bb = tok * p.k_nb1 + head * p.k_nb2 + base * 2u;
+        if ((bb & 7u) == 0u) return vec4(data_kv4[bb / 8u]);
+        uint ei = bb / 2u;
+        return vec4(float(data_k[ei]), float(data_k[ei+1u]), float(data_k[ei+2u]), float(data_k[ei+3u]));
+    }
+    uint blk = fp_block_elems(FaTypeK);
+    uint total = (tok * p.k_nb1 + head * p.k_nb2) / FaBlockBytesK + base / blk;
+    return vec4(dequantize4(total, base % blk, 0u, BINDING_IDX_K));
+}
+
+vec4 attn_load_v4(uint tok, uint head, uint base) {
+    if (FaTypeV == FP_FA_TYPE_F16) {
+        uint bb = tok * p.v_nb1 + head * p.v_nb2 + base * 2u;
+        if ((bb & 7u) == 0u) return vec4(data_vv4[bb / 8u]);
+        uint ei = bb / 2u;
+        return vec4(float(data_v[ei]), float(data_v[ei+1u]), float(data_v[ei+2u]), float(data_v[ei+3u]));
+    }
+    uint blk = fp_block_elems(FaTypeV);
+    uint total = (tok * p.v_nb1 + head * p.v_nb2) / FaBlockBytesV + base / blk;
+    return vec4(dequantize4(total, base % blk, 0u, BINDING_IDX_V));
+}
+
+// Cooperative dot(Q[qg,hq], K[tok,head]) over Dk; uniform return via shared.
+float attn_dot_qk(uint qg, uint hq, uint tok, uint head, uint dk) {
+    uint tid = gl_LocalInvocationIndex;
+    uint wgsize = gl_WorkGroupSize.x;
+    float partial = 0.0f;
+    for (uint d = tid; d < dk; d += wgsize) {
+        float q = attn_q_at(qg, hq, d);
+        vec4 kv = attn_load_k4(tok, head, d & ~3u);
+        partial += q * kv[d & 3u];
+    }
+    attn_sh[tid] = partial;
+    barrier();
+    for (uint s = wgsize / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) attn_sh[tid] += attn_sh[tid + s];
+        barrier();
+    }
+    float dot = attn_sh[0];
+    barrier();
+    return dot;
+}
+
+// Cooperative dot(Q[qg,hq], kbar[frag,head]) over Dk; uniform return.
+float attn_dot_qkbar(uint qg, uint hq, uint frag, uint head, uint dk, uint Hkv, uint dtot) {
+    uint tid = gl_LocalInvocationIndex;
+    uint wgsize = gl_WorkGroupSize.x;
+    float partial = 0.0f;
+    for (uint d = tid; d < dk; d += wgsize) {
+        partial += attn_q_at(qg, hq, d) * data_pool[(frag * Hkv + head) * dtot + d];
+    }
+    attn_sh[tid] = partial;
+    barrier();
+    for (uint s = wgsize / 2u; s > 0u; s >>= 1u) {
+        if (tid < s) attn_sh[tid] += attn_sh[tid + s];
+        barrier();
+    }
+    float dot = attn_sh[0];
+    barrier();
+    return dot;
+}
+
+void main() {
+    uint r = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationIndex;
+    uint wgsize = gl_WorkGroupSize.x;
+
+#ifdef NEEDS_INIT_IQ_SHMEM
+    if (fp_type_needs_shmem(FaTypeK) || fp_type_needs_shmem(FaTypeV)) {
+        init_iq_shmem(gl_WorkGroupSize);
+    }
+#endif
+
+    uint phase = p.split_phase;    // 0=final split1, 1=partial
+    uint split_id = p.split_id;
+    uint n_splits = p.n_splits;
+    uint sink_split = p.sink_split;
+
+    // Device actuals (caps in push only; see interface.h).
+    bool bad = false;
+    int bad_code = int(FP_ERR_BAD_LAYOUT);
+    if (p.meta_words < FP_META_HDR_WORDS || p.plan_words < FP_PLAN_HDR_WORDS) bad = true;
+    uint n_row = 0u, n_use = 0u, c_cap = 0u, frag_off = 0u, row_off = 0u, use_off = 0u, ctab = 0u;
+    uint n_frag = 0u, Hkv = 0u, n_groups = 0u, Hq = 0u;
+    uint T = 0u, max_sel = 0u, exact_off = 24u, proxy_off = 24u, counts_off = 24u;
+    if (!bad) {
+        if (data_meta[FP_MH_MAGIC] != int(FP_MAGIC_META)) { bad = true; }
+        if (data_meta[FP_MH_VERSION] != int(FP_VERSION)) { bad = true; }
+        n_frag = uint(data_meta[FP_MH_N_FRAG]);
+        n_row = uint(data_meta[FP_MH_N_ROW]);
+        n_use = uint(data_meta[FP_MH_N_USE]);
+        c_cap = uint(data_meta[FP_MH_C_CAP]);
+        uint r_cap = uint(data_meta[FP_MH_R_CAP]);
+        uint u_cap = uint(data_meta[FP_MH_U_CAP]);
+        frag_off = uint(data_meta[FP_MH_FRAG_OFF]);
+        row_off = uint(data_meta[FP_MH_ROW_OFF]);
+        use_off = uint(data_meta[FP_MH_USE_OFF]);
+        ctab = uint(data_meta[FP_MH_CELL_OFF]);
+        // Stale-offset close-out (output writer): valid magic with in-cap
+        // counts but relocated tables would otherwise read garbage cells
+        // in-range with no error flag. Word sizes + exact table geometry
+        // (caps-only: mf_fcap must equal the host cap) are enforced here.
+        uint mf_fcap = uint(data_meta[FP_MH_F_CAP]);
+        if (uint(data_meta[FP_MH_HDR_WORDS]) != uint(FP_META_HDR_WORDS)) { bad = true; }
+        if (uint(data_meta[FP_MH_FRAG_WORDS]) != 8u) { bad = true; }
+        if (uint(data_meta[FP_MH_ROW_WORDS]) != 8u) { bad = true; }
+        if (uint(data_meta[FP_MH_USE_WORDS]) != 8u) { bad = true; }
+        if (mf_fcap != p.f_cap) { bad = true; }
+        if (frag_off != 32u) { bad = true; }
+        if (row_off != 32u + 8u * mf_fcap) { bad = true; }
+        if (use_off != row_off + 8u * r_cap) { bad = true; }
+        if (ctab != use_off + 8u * u_cap) { bad = true; }
+        if (p.meta_words < ctab + c_cap) { bad = true; }
+        if (uint(data_meta[FP_MH_DK]) != p.dk || uint(data_meta[FP_MH_DV]) != p.dv) { bad = true; }
+        Hkv = uint(data_meta[FP_MH_N_HKV]);
+        n_groups = uint(data_meta[FP_MH_N_GROUPS]);
+        Hq = uint(data_meta[FP_MH_N_QHEADS]);
+        if (n_frag > p.f_cap || n_row > p.r_cap || n_use > p.u_cap) { bad = true; bad_code = int(FP_ERR_CAP_EXCEEDED); }
+        if (uint(data_meta[FP_MH_N_CELL]) > p.c_cap) { bad = true; bad_code = int(FP_ERR_CAP_EXCEEDED); }
+        if (Hkv > p.hkv_cap || n_groups > p.q_groups_cap || Hq > p.q_heads_cap) { bad = true; }
+        if (data_plan[FP_PH_MAGIC] != int(FP_MAGIC_PLAN)) { bad = true; }
+        if (data_plan[FP_PH_VERSION] != int(FP_VERSION)) { bad = true; }
+        T = uint(data_plan[FP_PH_N_TILES]);
+        uint Hplan = uint(data_plan[FP_PH_N_HEADS]);
+        max_sel = uint(data_plan[FP_PH_MAX_SEL]);
+        exact_off = uint(data_plan[FP_PH_EXACT_OFF]);
+        proxy_off = uint(data_plan[FP_PH_PROXY_OFF]);
+        counts_off = uint(data_plan[FP_PH_COUNTS_OFF]);
+        if (Hplan != Hkv || T == 0u || Hkv == 0u) { bad = true; }
+        if (exact_off != 24u || proxy_off != 24u + T * Hkv * max_sel) { bad = true; }
+        if (counts_off != proxy_off + T * Hkv * max_sel) { bad = true; }
+        if (data_plan[FP_PH_ERROR] != int(FP_OK)) { bad = true; bad_code = int(data_plan[FP_PH_ERROR]); }
+        if (phase == 1u && (n_splits == 0u || split_id >= n_splits)) { bad = true; bad_code = int(FP_ERR_BAD_ARG); }
+    }
+    // Cap-grid guard (dispatch uses r_cap): uniform return, no output mapped.
+    if (!bad && r >= n_row) return;
+    if (bad) {
+        // No safe output mapping (row unreadable or plan flagged); raise the
+        // writable plan error so the failure propagates before any client
+        // output is consumed (backend barrier), instead of valid zeros.
+        // ERROR is word 10 INSIDE the 24-word header. Requiring 34 words
+        // silently accepted malformed metadata with a one-use (28-word)
+        // plan, leaving the caller to consume an unwritten output tensor.
+        if (p.plan_words >= FP_PLAN_HDR_WORDS && tid == 0u) {
+            atomicMax(data_plan[FP_PH_ERROR], bad_code);
+        }
+        return;
+    }
+
+    uint rb = row_off + r * 8u;
+    int src_q = data_meta[rb + FP_RW_SRC_Q];
+    int kv_head = data_meta[rb + FP_RW_KV_HEAD];
+    int tile = data_meta[rb + FP_RW_TILE];
+    int q_head = data_meta[rb + FP_RW_Q_HEAD];
+    bool row_bad = false;
+    if (src_q < 0 || uint(src_q) >= p.n_output_cap) row_bad = true;
+    if (kv_head < 0 || uint(kv_head) >= Hkv) row_bad = true;
+    if (q_head < 0 || uint(q_head) >= Hq) row_bad = true;
+    if (tile < 0 || uint(tile) >= T) row_bad = true;
+    if (row_bad) {
+        if (tid == 0u) atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_RANGE));
+        return;
+    }
+    uint u_tile = uint(tile), u_kv = uint(kv_head), u_hq = uint(q_head), u_sq = uint(src_q);
+    uint pair = u_tile * Hkv + u_kv;
+    int n_exact = data_plan[counts_off + pair * 2u + 0u];
+    int n_proxy = data_plan[counts_off + pair * 2u + 1u];
+    if (n_exact < 0 || n_proxy < 0 || uint(n_exact) > max_sel || uint(n_proxy) > max_sel) {
+        // Cooperative zeros to mapped output + error raise (uniform).
+        for (uint d = tid; d < p.dv; d += wgsize) {
+            data_out[d + p.dv * (u_hq + Hq * u_sq)] = 0.0f;
+        }
+        if (tid == 0u) atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_PLAN_COVERAGE));
+        return;
+    }
+    if (p.reserved4 == 0u) {
+        // External/leaf plans are untrusted. Check the same complete metadata
+        // set, partitioned across lanes, so a missing or duplicated use can
+        // never masquerade as valid zeros. Direct SELECT output skips this
+        // quadratic consumer revalidation only when it consumed this exact
+        // metadata tensor and therefore validated/covered the same uses.
+        if (tid == 0u) attn_coverage_bad = 0u;
+        barrier();
+        for (uint u = tid; u < n_use; u += wgsize) {
+            uint ub = use_off + u * 8u;
+            if (data_meta[ub + FP_UW_TILE] != int(u_tile)) continue;
+            if (data_meta[ub + FP_UW_KV_HEAD] != int(u_kv)) continue;
+            if (data_meta[ub + FP_UW_SRC_Q] != int(u_sq)) continue;
+            int found = 0;
+            for (int k = 0; k < n_exact; ++k) {
+                if (data_plan[exact_off + pair * max_sel + uint(k)] == int(u)) found++;
+            }
+            for (int k = 0; k < n_proxy; ++k) {
+                if (data_plan[proxy_off + pair * max_sel + uint(k)] == int(u)) found++;
+            }
+            if (found != 1) {
+                atomicOr(attn_coverage_bad, 1u);
+            }
+        }
+        barrier();
+        if (attn_coverage_bad != 0u) {
+            for (uint d = tid; d < p.dv; d += wgsize) {
+                data_out[d + p.dv * (u_hq + Hq * u_sq)] = 0.0f;
+            }
+            if (tid == 0u) atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_PLAN_COVERAGE));
+            return;
+        }
+    }
+
+    float sink_logit = 0.0f;
+    bool have_sink = false;
+    if (p.sinks_present != 0u) {
+        // Unique sink assignment: only sink_split's partial carries it.
+        // Final split1 (phase 0) always carries it (n_splits==1 effective).
+        if (phase == 0u || split_id == sink_split) {
+            sink_logit = data_sinks[u_hq];
+            if (!fp_isfinite(sink_logit)) {
+                for (uint d = tid; d < p.dv; d += wgsize) {
+                    data_out[d + p.dv * (u_hq + Hq * u_sq)] = 0.0f;
+                }
+                if (tid == 0u) atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_BAD_INPUT));
+                return;
+            }
+            have_sink = true;
+        }
+    }
+
+    // Token subrange for this split (bounded split; split1 covers all).
+    // Exact/proxy token enumeration order is deterministic (plan order,
+    // increasing use index; cells in stored order). Splits partition the
+    // flattened exact-token sequence; proxy blocks go to split by use order.
+    // Simpler correct partition: stride by (split_id, n_splits) over the
+    // flattened exact-token index and over proxy uses. Deterministic and
+    // disjoint; merge is order-independent (mlo associative up to fp order,
+    // same reference equations; sink unique).
+    uint dtot = p.dk + p.dv;
+    const float NEGH = uintBitsToFloat(0xFEFFFFFFu);
+    float M = NEGH;
+    float L = 0.0f;
+    bool have = false;
+    // Up to four output components per lane stay in registers. Accumulate
+    // the numerator with the same online M/L rescaling, eliminating a
+    // second QK pass and per-token global output read/modify/write. Larger
+    // value heads retain the general two-pass path below without truncation.
+    const bool online_values = p.dv <= 4u * wgsize;
+    float values[4] = float[4](0.0f, 0.0f, 0.0f, 0.0f);
+    // Flattened exact-token cursor for stride assignment.
+    uint tok_cursor = 0u;
+    for (int k = 0; k < n_exact; ++k) {
+        int ui = data_plan[exact_off + pair * max_sel + uint(k)];
+        uint ub = use_off + uint(ui) * 8u;
+        if (data_meta[ub + FP_UW_SRC_Q] != int(u_sq)) continue;
+        int qg = data_meta[ub + FP_UW_Q_GROUP];
+        int so = data_meta[ub + FP_UW_SUB_OFF];
+        int sc = data_meta[ub + FP_UW_SUB_CNT];
+        for (int j = 0; j < sc; ++j) {
+            bool mine = (phase == 0u) || ((tok_cursor % n_splits) == split_id);
+            tok_cursor++;
+            if (!mine) continue;
+            int cell = data_meta[ctab + uint(so) + uint(j)];
+            float z = attn_dot_qk(uint(qg), u_hq, uint(cell), u_kv, p.dk);
+            z = fp_softcap_apply(p.scale * z, p.softcap);
+            // Cooperative dot already barriered; replicated M/L update.
+            float m_new = have ? max(M, z) : z;
+            float keep = have ? exp(M - m_new) : 0.0f;
+            float weight = exp(z - m_new);
+            L = L * keep + weight;
+            if (online_values) {
+                [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+                    uint d = tid + i * wgsize;
+                    if (d < p.dv) {
+                        vec4 v = attn_load_v4(uint(cell), u_kv, d & ~3u);
+                        values[i] = values[i] * keep + weight * v[d & 3u];
+                    }
+                }
+            }
+            M = m_new;
+            have = true;
+        }
+    }
+    if (p.mean_correction != 0u) {
+        uint px_cursor = 0u;
+        for (int k = 0; k < n_proxy; ++k) {
+            int ui = data_plan[proxy_off + pair * max_sel + uint(k)];
+            uint ub = use_off + uint(ui) * 8u;
+            if (data_meta[ub + FP_UW_SRC_Q] != int(u_sq)) continue;
+            bool mine = (phase == 0u) || ((px_cursor % n_splits) == split_id);
+            px_cursor++;
+            if (!mine) continue;
+            int qg = data_meta[ub + FP_UW_Q_GROUP];
+            int frag = data_meta[ub + FP_UW_FRAG];
+            int sc = data_meta[ub + FP_UW_SUB_CNT];
+            int so = data_meta[ub + FP_UW_SUB_OFF];
+            // Production enforcement: proxy entries must be full-fragment
+            // and non-mandatory (plan validation invariant). Partial proxy
+            // would correct with a polluted mean: execution error, zeros.
+            uint pfb = frag_off + uint(frag) * 8u;
+            bool pfull = (so == data_meta[pfb + FP_FR_CELL_OFF])
+                      && (sc == data_meta[pfb + FP_FR_CELL_CNT]);
+            bool pmand = (data_meta[ub + FP_UW_FLAGS] & FP_USE_FLAG_MANDATORY) != 0;
+            if (!pfull || pmand) {
+                for (uint d = tid; d < p.dv; d += wgsize) {
+                    data_out[d + p.dv * (u_hq + Hq * u_sq)] = 0.0f;
+                }
+                if (tid == 0u) atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_MANDATORY_AS_PROXY));
+                return;
+            }
+            float z = attn_dot_qkbar(uint(qg), u_hq, uint(frag), u_kv, p.dk, Hkv, dtot);
+            z = fp_softcap_apply(p.scale * z, p.softcap) + log(float(sc));
+            float m_new = have ? max(M, z) : z;
+            float keep = have ? exp(M - m_new) : 0.0f;
+            float weight = exp(z - m_new);
+            L = L * keep + weight;
+            if (online_values) {
+                uint vbase = (uint(frag) * Hkv + u_kv) * dtot + p.dk;
+                [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+                    uint d = tid + i * wgsize;
+                    if (d < p.dv) values[i] = values[i] * keep + weight * data_pool[vbase + d];
+                }
+            }
+            M = m_new;
+            have = true;
+        }
+    }
+    if (have_sink) {
+        float m_new = have ? max(M, sink_logit) : sink_logit;
+        float keep = have ? exp(M - m_new) : 0.0f;
+        L = L * keep + exp(sink_logit - m_new);
+        if (online_values) {
+            [[unroll]] for (uint i = 0u; i < 4u; ++i) values[i] *= keep;
+        }
+        M = m_new;
+        have = true;
+    }
+
+    if (online_values) {
+        if (phase == 1u && tid == 0u) {
+            data_scr_m[r * n_splits + split_id] = have ? M : uintBitsToFloat(0xFF800000u);
+            data_scr_l[r * n_splits + split_id] = have ? L : 0.0f;
+        }
+        [[unroll]] for (uint i = 0u; i < 4u; ++i) {
+            uint d = tid + i * wgsize;
+            if (d >= p.dv) continue;
+            if (phase == 1u) {
+                data_scr_o[(r * n_splits + split_id) * p.dv + d] = values[i];
+            } else {
+                data_out[d + p.dv * (u_hq + Hq * u_sq)] = have && L > 0.0f ? values[i] / L : 0.0f;
+            }
+        }
+        return;
+    }
+
+    if (phase == 1u) {
+        // Partial write to scratch (uniform M/L; O accumulated below needs
+        // second token pass, so partial O must be computed here too).
+        // Layouts (fit-counted): M/L [n_rows x n_splits], O [n_rows x
+        // n_splits x Dv] contiguous row-major.
+        uint scr_base_ml = (r * n_splits + split_id);
+        if (!have) {
+            if (tid == 0u) {
+                data_scr_m[scr_base_ml] = uintBitsToFloat(0xFF800000u); // -inf
+                data_scr_l[scr_base_ml] = 0.0f;
+            }
+            for (uint d = tid; d < p.dv; d += wgsize) {
+                data_scr_o[(r * n_splits + split_id) * p.dv + d] = 0.0f;
+            }
+            return;
+        }
+        // Zero partial O cooperatively, then accumulate (second dot pass).
+        for (uint d = tid; d < p.dv; d += wgsize) {
+            data_scr_o[(r * n_splits + split_id) * p.dv + d] = 0.0f;
+        }
+        memoryBarrierBuffer();
+        barrier();
+        tok_cursor = 0u;
+        for (int k = 0; k < n_exact; ++k) {
+            int ui = data_plan[exact_off + pair * max_sel + uint(k)];
+            uint ub = use_off + uint(ui) * 8u;
+            if (data_meta[ub + FP_UW_SRC_Q] != int(u_sq)) continue;
+            int qg = data_meta[ub + FP_UW_Q_GROUP];
+            int so = data_meta[ub + FP_UW_SUB_OFF];
+            int sc = data_meta[ub + FP_UW_SUB_CNT];
+            for (int j = 0; j < sc; ++j) {
+                bool mine = ((tok_cursor % n_splits) == split_id);
+                tok_cursor++;
+                if (!mine) continue;
+                int cell = data_meta[ctab + uint(so) + uint(j)];
+                float z = attn_dot_qk(uint(qg), u_hq, uint(cell), u_kv, p.dk);
+                z = fp_softcap_apply(p.scale * z, p.softcap);
+                float w = exp(z - M);
+                for (uint d = tid; d < p.dv; d += wgsize) {
+                    vec4 vv = attn_load_v4(uint(cell), u_kv, d & ~3u);
+                    data_scr_o[(r * n_splits + split_id) * p.dv + d] += w * vv[d & 3u];
+                }
+            }
+        }
+        if (p.mean_correction != 0u) {
+            uint px_cursor = 0u;
+            for (int k = 0; k < n_proxy; ++k) {
+                int ui = data_plan[proxy_off + pair * max_sel + uint(k)];
+                uint ub = use_off + uint(ui) * 8u;
+                if (data_meta[ub + FP_UW_SRC_Q] != int(u_sq)) continue;
+                bool mine = ((px_cursor % n_splits) == split_id);
+                px_cursor++;
+                if (!mine) continue;
+                int qg = data_meta[ub + FP_UW_Q_GROUP];
+                int frag = data_meta[ub + FP_UW_FRAG];
+                int sc = data_meta[ub + FP_UW_SUB_CNT];
+                int so = data_meta[ub + FP_UW_SUB_OFF];
+                uint vfb = frag_off + uint(frag) * 8u;
+                if ((so != data_meta[vfb + FP_FR_CELL_OFF])
+                    || (sc != data_meta[vfb + FP_FR_CELL_CNT])
+                    || ((data_meta[ub + FP_UW_FLAGS] & FP_USE_FLAG_MANDATORY) != 0)) {
+                    for (uint d = tid; d < p.dv; d += wgsize) {
+                        data_scr_o[(r * n_splits + split_id) * p.dv + d] = 0.0f;
+                    }
+                    if (tid == 0u) {
+                        data_scr_m[(r * n_splits + split_id)] = uintBitsToFloat(0xFF800000u);
+                        data_scr_l[(r * n_splits + split_id)] = 0.0f;
+                        atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_MANDATORY_AS_PROXY));
+                    }
+                    return;
+                }
+                float z = attn_dot_qkbar(uint(qg), u_hq, uint(frag), u_kv, p.dk, Hkv, dtot);
+                z = fp_softcap_apply(p.scale * z, p.softcap) + log(float(sc));
+                float w = exp(z - M);
+                for (uint d = tid; d < p.dv; d += wgsize) {
+                    float vb = data_pool[(uint(frag) * Hkv + u_kv) * dtot + p.dk + d];
+                    data_scr_o[(r * n_splits + split_id) * p.dv + d] += w * vb;
+                }
+            }
+        }
+        if (tid == 0u) {
+            data_scr_m[scr_base_ml] = M;
+            data_scr_l[scr_base_ml] = L;
+        }
+        return;
+    }
+
+    // Phase 0 final: empty -> zeros; else normalize cooperatively.
+    if (!have) {
+        for (uint d = tid; d < p.dv; d += wgsize) {
+            data_out[d + p.dv * (u_hq + Hq * u_sq)] = 0.0f;
+        }
+        return;
+    }
+    // Zero, accumulate, normalize (two dot passes total with M/L pass).
+    for (uint d = tid; d < p.dv; d += wgsize) {
+        data_out[d + p.dv * (u_hq + Hq * u_sq)] = 0.0f;
+    }
+    memoryBarrierBuffer();
+    barrier();
+    for (int k = 0; k < n_exact; ++k) {
+        int ui = data_plan[exact_off + pair * max_sel + uint(k)];
+        uint ub = use_off + uint(ui) * 8u;
+        if (data_meta[ub + FP_UW_SRC_Q] != int(u_sq)) continue;
+        int qg = data_meta[ub + FP_UW_Q_GROUP];
+        int so = data_meta[ub + FP_UW_SUB_OFF];
+        int sc = data_meta[ub + FP_UW_SUB_CNT];
+        for (int j = 0; j < sc; ++j) {
+            int cell = data_meta[ctab + uint(so) + uint(j)];
+            float z = attn_dot_qk(uint(qg), u_hq, uint(cell), u_kv, p.dk);
+            z = fp_softcap_apply(p.scale * z, p.softcap);
+            float w = exp(z - M);
+            for (uint d = tid; d < p.dv; d += wgsize) {
+                vec4 vv = attn_load_v4(uint(cell), u_kv, d & ~3u);
+                data_out[d + p.dv * (u_hq + Hq * u_sq)] += w * vv[d & 3u];
+            }
+        }
+    }
+    if (p.mean_correction != 0u) {
+        for (int k = 0; k < n_proxy; ++k) {
+            int ui = data_plan[proxy_off + pair * max_sel + uint(k)];
+            uint ub = use_off + uint(ui) * 8u;
+            if (data_meta[ub + FP_UW_SRC_Q] != int(u_sq)) continue;
+            int qg = data_meta[ub + FP_UW_Q_GROUP];
+            int frag = data_meta[ub + FP_UW_FRAG];
+            int sc = data_meta[ub + FP_UW_SUB_CNT];
+            int so = data_meta[ub + FP_UW_SUB_OFF];
+            uint wfb = frag_off + uint(frag) * 8u;
+            if ((so != data_meta[wfb + FP_FR_CELL_OFF])
+                || (sc != data_meta[wfb + FP_FR_CELL_CNT])
+                || ((data_meta[ub + FP_UW_FLAGS] & FP_USE_FLAG_MANDATORY) != 0)) {
+                for (uint d = tid; d < p.dv; d += wgsize) {
+                    data_out[d + p.dv * (u_hq + Hq * u_sq)] = 0.0f;
+                }
+                if (tid == 0u) atomicMax(data_plan[FP_PH_ERROR], int(FP_ERR_MANDATORY_AS_PROXY));
+                return;
+            }
+            float z = attn_dot_qkbar(uint(qg), u_hq, uint(frag), u_kv, p.dk, Hkv, dtot);
+            z = fp_softcap_apply(p.scale * z, p.softcap) + log(float(sc));
+            float w = exp(z - M);
+            for (uint d = tid; d < p.dv; d += wgsize) {
+                float vb = data_pool[(uint(frag) * Hkv + u_kv) * dtot + p.dk + d];
+                data_out[d + p.dv * (u_hq + Hq * u_sq)] += w * vb;
+            }
+        }
+    }
+    float invL = 1.0f / L;
+    for (uint d = tid; d < p.dv; d += wgsize) {
+        uint o_idx = d + p.dv * (u_hq + Hq * u_sq);
+        float v = data_out[o_idx] * invL;
+        float FLT_MAX = uintBitsToFloat(0x7F7FFFFFu);
+        data_out[o_idx] = clamp(v, -FLT_MAX, FLT_MAX);
+    }
+}

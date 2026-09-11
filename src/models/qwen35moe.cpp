@@ -302,6 +302,11 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
     // Apply Q normalization
     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "Qcur_normed", il);
+    // RERoT: expose the raw pre-RoPE Q (full-attention layers only; this helper
+    // runs only for non-recurrent layers) for host-side inspection when enabled.
+    if (cparams.attention_q_pre_rope[il]) {
+        res->t_attn_q_pre_rope[il] = Qcur;
+    }
 
     ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
     cb(Kcur, "Kcur", il);
@@ -323,29 +328,65 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
 
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
-    // Apply IMRoPE
-    Qcur = ggml_rope_multi(
-            ctx0, Qcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow
-            );
-
     Kcur = ggml_rope_multi(
             ctx0, Kcur, inp_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow
             );
 
-    cb(Qcur, "Qcur", il);
     cb(Kcur, "Kcur", il);
     cb(Vcur, "Vcur", il);
 
     // Attention computation
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp,
-                nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    // RERoT v1 (text-only Ornith/Qwen3.5 hybrid): this full-attention layer consumes
+    // the raw pre-RoPE Q above. The reader-relative IMRoPE/DDVR transform
+    // ((p+delta, p+delta, p+delta, 0); 4th axis always 0 for text runs) is applied
+    // inside build_rerot_q_groups via the per-group virtual positions, using this
+    // episode's fixed RoPE params (n_rot/sections/rope_type/freq_* below).
+    // Partial/interleaved dims (head_dim 256 / rotary_dim 64) ride along via n_rot +
+    // sections; TurboQuant Q-WHT ordering (RoPE -> WHT -> dot) and head_dim padding
+    // use the actual tensor type/ne/nb inside build_attn_rerot, so Q passes through
+    // unpadded here. Image/audio embedding batches never take the DDVR path: they
+    // fall through to ordinary serial IMRoPE below and visual spatial positions are
+    // never remapped (graph-input side additionally guarantees rerot_active()==false
+    // for those batches).
+    // Semantic RERoT activation (cache state, not span-tensor presence): the
+    // compact sparse path never builds the legacy O(QK) entry lists merely
+    // to mark RERoT active. Legacy DDVR spans are built lazily, only when an
+    // actual dense RERoT fallback layer demands them (see
+    // build_attn_inp_kv_impl).
+    const bool rerot_text = inp->rerot_semantic() &&
+        ubatch.token != nullptr && ubatch.embd == nullptr;
+    // FlashPrefill V2 sparse path (GraphIntegration): RERoT route keeps the
+    // dedicated raw-Q hook (phased groups, single shared softmax); the
+    // ordinary route ropes exactly once below and lets the shared build_attn
+    // try the sparse path internally (single try, no double fallback).
+    // Null = dense (OFF, mixed roles, decode/MTP/embedding, special bias,
+    // SWA, unsupported). Gating + wo tail below are shared unchanged.
+    if (rerot_text) {
+        if (ggml_tensor * fp_cur = try_build_attn_flashprefill(inp,
+                    Qcur, nullptr,
+                    Kcur, Vcur, sections, nullptr, nullptr, kq_scale, il)) {
+            cur = fp_cur;
+        } else {
+            ggml_tensor * Qgroups = build_rerot_q_groups(inp, Qcur, nullptr, sections, il);
+            cur = build_attn_rerot(inp,
+                        nullptr, nullptr, nullptr,
+                        Qgroups, Kcur, Vcur, nullptr, kq_scale, il);
+        }
+    } else {
+        ggml_tensor * Qroped = ggml_rope_multi(
+                ctx0, Qcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow
+                );
+        cb(Qroped, "Qcur", il);
+        cur = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    Qroped, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    }
     cb(cur, "attn_pregate", il);
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
@@ -412,8 +453,36 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    ggml_tensor * state_base = nullptr;
+    ggml_tensor * hand_echo_all = nullptr;
+    ggml_tensor * state = nullptr;
+    const bool parallel_delta = uses_parallel_delta(inp, il);
+    if (mctx_cur->is_s_shared(il)) {
+        hand_echo_all = mctx_cur->get_d_l(il);
+        ggml_tensor * state_base_rows = nullptr;
+        if (parallel_delta) {
+            state_base = ggml_view_1d(
+                ctx0, ssm_states_all, hparams.n_embd_s(),
+                (size_t) inp->rbb_groups[0].brain_row * ssm_states_all->nb[1]);
+            state_base_rows =
+                build_rs_shared(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        } else {
+            state_base =
+                build_rs_shared(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+            state_base_rows = state_base;
+        }
+        ggml_tensor * hand_echo =
+            build_rs(inp, hand_echo_all, hparams.n_embd_s(), n_seqs);
+        // Group count/brain row cannot identify an ordinary root: two real
+        // episodes may have exactly that shape. Ordinary hands are zero;
+        // every row obeys the same effective-state contract B + H.
+        state = ggml_add(ctx0, state_base_rows, ggml_cast(ctx0, hand_echo, GGML_TYPE_F32));
+    } else {
+        state = build_rs(
+            inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    }
+    state = ggml_reshape_4d(
+        ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
@@ -472,7 +541,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
+    ggml_tensor * output = build_recurrent_attn(
+        inp, ssm_states_all, state_base, hand_echo_all,
+        q_conv, k_conv, v_conv, gate, beta, state, il);
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

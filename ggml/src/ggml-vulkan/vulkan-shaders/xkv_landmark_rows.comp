@@ -1,0 +1,340 @@
+#version 450
+
+// xkv_landmark_rows.comp — Device fragment→row CSR expansion for XKV landmarks (v3).
+//
+// Expands per-query selected fragment ids into explicit row-ref CSR consumable by
+// GGML_OP_XKV_RECONSTRUCT and attention entries for GGML_OP_XKV_ATTENTION with NO host round-trip.
+//
+// Single-workgroup bounded window extraction (Main directives):
+//  1. No E*refine_cap staging:
+//     Single lane sequentially scans all E expanded queries using one shared per-query
+//     working array <= refine_cap (<= 1024). Output buffers are allocated to tile_capacity =
+//     min(1024, E * refine_cap); writes strictly target [0, tile_capacity). No OOB possible
+//     even when E * refine_cap > 1024.
+//  2. Arena filtering before cap accounting:
+//     arena_filter selects one arena (frag_kv[f*3 + 1] == arena_filter; UINT32_MAX == all).
+//     Selected rows must lie within [global_row_base, global_row_base + arena_row_count).
+//     Emitted row_refs[0] is the arena-local a_row (global_row - global_row_base).
+//  3. Reconstruct ABI:
+//     row_refs quad is [arena_local_a_row, 0, 0, kv_head]. Group and layer are 0 for
+//     the one-layer, one-group per-arena reconstruct op.
+//  4. Dedup key is (arena_local_a_row, ddvr_slot):
+//     Same physical row across different DDVR slots produces separate entries so each
+//     slot is attended.
+//  5. Compact ordinal tile window:
+//     Outputs are the intersection of the flattened parent-major rows with the requested
+//     window [output_row_begin, output_row_begin + tile_capacity).
+//     rec_idx is tile-local (0..emitted - 1), row_ptrs counts only this window,
+//     and entries use source = GGML_XKV_ATTN_SOURCE_COLD (2) with valid masking.
+//  6. Padded rows:
+//     Unused tail slots [emitted, tile_capacity) are padded with safe dummy row 0 refs
+//     ([0,0,0,0]), pos = 0, and valid = 0 entries with source = 2.
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_control_flow_attributes : enable
+
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// 16 words = 64 bytes push constant ABI (matches host ggml_xkv_landmark_rows_params layout)
+layout (push_constant) uniform parameter {
+    uint version;
+    uint n_queries;        // E: expanded selector queries
+    uint top_k;            // number of candidate fragments per selector query
+    uint n_frags;          // total fragments
+    uint refine_cap;       // per-query row bound
+    uint fstride;          // frag_meta stride (4 or 6)
+    uint flags;            // FLAG_SPARSE_ROWS
+    uint max_frag_rows;    // max rows per fragment
+    uint n_rows_total;     // total rows in storage view (for bounds check)
+    uint n_parent_queries; // N: parent query count (0 => identity E==N)
+    uint has_query_map;    // 1 if sel_idx has stride top_k + 2, 0 if top_k
+    uint arena_filter;     // frag_kv[1] arena ordinal; UINT32_MAX == all arenas
+    uint global_row_base;  // arena window base in global row ids
+    uint arena_row_count;  // rows in this arena (refs[0] validated < count)
+    uint output_row_begin; // compact ordinal tile start (windowing)
+    uint status_flag;      // 0 = no-op, 1 = run
+} p;
+
+layout (binding = 0, std430) readonly buffer SEL      { int sel_idx[]; };
+layout (binding = 1, std430) readonly buffer FMETA    { int frag_meta[]; };
+layout (binding = 2, std430) readonly buffer ROWOFF   { int frag_row_off[]; };
+layout (binding = 3, std430) readonly buffer ROWIDS   { int frag_row_ids[]; };
+layout (binding = 4, std430) readonly buffer FRAGKV   { int frag_kv[]; };
+layout (binding = 5, std430) readonly buffer ROWPOS   { int row_pos[]; };
+layout (binding = 6, std430) buffer ROWPTRS           { uint row_ptrs[]; };
+layout (binding = 7, std430) buffer ROWREFS           { int row_refs[]; };
+layout (binding = 8, std430) buffer ROWOUTPOS         { int row_out_pos[]; };
+layout (binding = 9, std430) buffer ROWENTRIES        { int row_entries[]; };
+layout (binding = 10, std430) buffer ROWSTATUS        { int row_status[]; };
+
+shared int s_row[1024];
+shared int s_hed[1024];
+shared int s_slot[1024];
+shared int s_pos[1024];
+
+void insert_query_row(uint cap, int lrow, int hed, int slot, int gpos,
+                      inout uint uniq, inout bool overflow) {
+    uint upos = uniq;
+    for (uint i = 0u; i < uniq; ++i) {
+        int er = s_row[i];
+        int es = s_slot[i];
+        if (er == lrow && es == slot) return;
+        if (er > lrow || (er == lrow && es > slot)) {
+            upos = i;
+            break;
+        }
+    }
+
+    uint old_uniq = uniq;
+    if (uniq < cap) {
+        ++uniq;
+    } else {
+        overflow = true;
+        if (upos >= cap) return;
+        old_uniq = cap - 1u;
+    }
+    for (uint i = old_uniq; i > upos; --i) {
+        s_row[i]  = s_row[i - 1u];
+        s_hed[i]  = s_hed[i - 1u];
+        s_slot[i] = s_slot[i - 1u];
+        s_pos[i]  = s_pos[i - 1u];
+    }
+    s_row[upos]  = lrow;
+    s_hed[upos]  = hed;
+    s_slot[upos] = slot;
+    s_pos[upos]  = gpos;
+}
+
+void main() {
+    if (gl_WorkGroupID.x != 0u || gl_LocalInvocationID.x != 0u) return;
+    if (p.status_flag == 0u) return;
+
+    uint E = p.n_queries;
+    uint N = (p.n_parent_queries > 0u) ? p.n_parent_queries : E;
+    uint cap = p.refine_cap;
+
+    bool filter_all = (p.arena_filter == 0xFFFFFFFFu);
+    if (row_status[0] != 0 || p.top_k == 0u || p.top_k > 128u ||
+        cap == 0u || cap > 1024u || E == 0u || N == 0u || N > E ||
+        p.has_query_map > 1u ||
+        (p.has_query_map == 0u && p.n_parent_queries != 0u) ||
+        (p.has_query_map != 0u && p.n_parent_queries == 0u) ||
+        (p.fstride != 4u && p.fstride != 6u) ||
+        (filter_all && (p.global_row_base != 0u || p.arena_row_count != p.n_rows_total)) ||
+        (!filter_all && (p.arena_row_count == 0u || p.arena_row_count > p.n_rows_total ||
+                         p.global_row_base >= p.n_rows_total ||
+                         p.global_row_base + p.arena_row_count > p.n_rows_total))) {
+        row_status[0] = 1;
+        row_status[1] = 0; row_status[2] = 0; row_status[3] = 0;
+        return;
+    }
+
+    // Reset parent counts: row_ptrs has length N + 1
+    for (uint n = 0u; n <= N; ++n) {
+        row_ptrs[n] = 0u;
+    }
+
+    int prev_parent = -1;
+    int prev_slot = -1;
+    uint sel_stride = p.top_k + (p.has_query_map != 0u ? 2u : 0u);
+
+    // Validate complete query map upfront
+    if (p.has_query_map != 0u) {
+        for (uint e = 0u; e < E; ++e) {
+            int parent = sel_idx[e * sel_stride + 0u];
+            int slot = sel_idx[e * sel_stride + 1u];
+            if (parent < 0 || uint(parent) >= N || slot < 0 ||
+                parent < prev_parent || (parent == prev_parent && slot <= prev_slot)) {
+                row_status[0] = 2; // ERR_INPUT
+                row_status[1] = 0; row_status[2] = 0; row_status[3] = 0;
+                return;
+            }
+            prev_parent = parent;
+            prev_slot = slot;
+        }
+    }
+
+    uint tile_cap = E * cap;
+    if (tile_cap > 1024u) tile_cap = 1024u;
+
+    uint win_start = p.output_row_begin;
+    uint win_end = win_start + tile_cap;
+
+    uint running_total = 0u;
+    uint written = 0u;
+    uint total_hits = 0u;
+
+    uint sel[128];
+
+    for (uint e = 0u; e < E; ++e) {
+        int parent = (p.has_query_map != 0u) ? sel_idx[e * sel_stride + 0u] : int(e);
+        int mapped_slot = (p.has_query_map != 0u) ? sel_idx[e * sel_stride + 1u] : 0;
+        uint sel_offset = (p.has_query_map != 0u) ? 2u : 0u;
+
+        uint nsel = 0u;
+        for (uint i = 0u; i < p.top_k; ++i) {
+            int f = sel_idx[e * sel_stride + sel_offset + i];
+            if (f < 0) break;
+            if (uint(f) >= p.n_frags) {
+                row_status[0] = 2;
+                row_status[1] = 0; row_status[2] = 0; row_status[3] = 0;
+                return;
+            }
+            sel[nsel++] = uint(f);
+        }
+
+        // Sort selected fragment IDs
+        for (uint i = 1u; i < nsel; ++i) {
+            uint k = sel[i];
+            uint j = i;
+            while (j > 0u && sel[j - 1u] > k) { sel[j] = sel[j - 1u]; --j; }
+            sel[j] = k;
+        }
+
+        uint uniq = 0u;
+        bool overflow = false;
+
+        for (uint s = 0u; s < nsel; ++s) {
+            uint f = sel[s];
+            uint frag_arena = uint(frag_kv[f * 3u + 1u]);
+            if (!filter_all && frag_arena != p.arena_filter) continue;
+
+            int hed = frag_kv[f * 3u + 2u];
+            int slot_val = (p.has_query_map != 0u) ? mapped_slot :
+                ((p.fstride >= 6u) ? frag_meta[f * p.fstride + 5u] : 0);
+            if (slot_val < 0) {
+                row_status[0] = 2;
+                row_status[1] = 0; row_status[2] = 0; row_status[3] = 0;
+                return;
+            }
+
+            bool use_list = (p.flags & 1u) != 0u;
+            int list_off = 0, list_nxt = 0;
+            int rb = 0, rc = 0;
+
+            if (use_list) {
+                list_off = frag_row_off[f];
+                list_nxt = frag_row_off[f + 1u];
+                if (list_off >= 0 && list_nxt > list_off) {
+                    if (uint(list_nxt - list_off) > p.max_frag_rows) {
+                        row_status[0] = 2;
+                        row_status[1] = 0; row_status[2] = 0; row_status[3] = 0;
+                        return;
+                    }
+                } else {
+                    use_list = false;
+                    rb = frag_meta[f * p.fstride + 0u];
+                    rc = frag_meta[f * p.fstride + 1u];
+                    if (rc <= 0 || uint(rc) > p.max_frag_rows) {
+                        row_status[0] = 2;
+                        row_status[1] = 0; row_status[2] = 0; row_status[3] = 0;
+                        return;
+                    }
+                }
+            } else {
+                rb = frag_meta[f * p.fstride + 0u];
+                rc = frag_meta[f * p.fstride + 1u];
+                if (rc <= 0 || uint(rc) > p.max_frag_rows) {
+                    row_status[0] = 2;
+                    row_status[1] = 0; row_status[2] = 0; row_status[3] = 0;
+                    return;
+                }
+            }
+
+            if (!use_list) {
+                if (rb < 0 || (uint(rb) + uint(rc)) > p.n_rows_total) {
+                    row_status[0] = 2;
+                    row_status[1] = 0; row_status[2] = 0; row_status[3] = 0;
+                    return;
+                }
+                for (int r = 0; r < rc; ++r) {
+                    int grow = rb + r;
+                    if (uint(grow) < p.global_row_base ||
+                        uint(grow) >= p.global_row_base + p.arena_row_count) {
+                        row_status[0] = 2;
+                        row_status[1] = 0; row_status[2] = 0; row_status[3] = 0;
+                        return;
+                    }
+                    int lrow = int(uint(grow) - p.global_row_base);
+                    int gpos = row_pos[uint(grow)];
+                    insert_query_row(cap, lrow, hed, slot_val, gpos, uniq, overflow);
+                }
+            } else {
+                for (int k = list_off; k < list_nxt; ++k) {
+                    int grow = frag_row_ids[uint(k)];
+                    if (grow < 0) continue;
+                    if (uint(grow) >= p.n_rows_total) {
+                        row_status[0] = 2;
+                        row_status[1] = 0; row_status[2] = 0; row_status[3] = 0;
+                        return;
+                    }
+                    if (uint(grow) < p.global_row_base ||
+                        uint(grow) >= p.global_row_base + p.arena_row_count) {
+                        row_status[0] = 2;
+                        row_status[1] = 0; row_status[2] = 0; row_status[3] = 0;
+                        return;
+                    }
+                    int lrow = int(uint(grow) - p.global_row_base);
+                    int gpos = row_pos[uint(grow)];
+                    insert_query_row(cap, lrow, hed, slot_val, gpos, uniq, overflow);
+                }
+            }
+        }
+
+        if (overflow) ++total_hits;
+
+        // Bounded window emission: intersection of [q_start, q_end) with [win_start, win_end)
+        uint q_start = running_total;
+        uint q_end = running_total + uniq;
+        running_total += uniq;
+
+        uint isect_start = max(q_start, win_start);
+        uint isect_end = min(q_end, win_end);
+
+        if (isect_start < isect_end) {
+            uint take = isect_end - isect_start;
+            uint q_off = isect_start - q_start;
+            for (uint i = 0u; i < take; ++i) {
+                uint dst_idx = written + i;
+                uint src_idx = q_off + i;
+                row_refs[dst_idx * 4u + 0u] = s_row[src_idx];
+                row_refs[dst_idx * 4u + 1u] = 0;
+                row_refs[dst_idx * 4u + 2u] = 0;
+                row_refs[dst_idx * 4u + 3u] = s_hed[src_idx];
+                row_out_pos[dst_idx] = s_pos[src_idx];
+                row_entries[dst_idx * 4u + 0u] = 2; // GGML_XKV_ATTN_SOURCE_COLD
+                row_entries[dst_idx * 4u + 1u] = int(dst_idx); // tile-local
+                row_entries[dst_idx * 4u + 2u] = s_slot[src_idx];
+                row_entries[dst_idx * 4u + 3u] = 1; // valid
+            }
+            row_ptrs[uint(parent) + 1u] += take;
+            written += take;
+        }
+    }
+
+    // Prefix sums for N parent queries
+    for (uint n = 0u; n < N; ++n) {
+        row_ptrs[n + 1u] += row_ptrs[n];
+    }
+
+    // Pad unused tail slots in the tile
+    for (uint j = written; j < tile_cap; ++j) {
+        row_refs[j * 4u + 0u] = 0;
+        row_refs[j * 4u + 1u] = 0;
+        row_refs[j * 4u + 2u] = 0;
+        row_refs[j * 4u + 3u] = 0;
+        row_out_pos[j] = 0;
+        row_entries[j * 4u + 0u] = 2; // GGML_XKV_ATTN_SOURCE_COLD
+        row_entries[j * 4u + 1u] = int(j);
+        row_entries[j * 4u + 2u] = 0;
+        row_entries[j * 4u + 3u] = 0; // valid = 0 masks padding
+    }
+
+    row_status[0] = 0;
+    row_status[1] = int(written);
+    row_status[2] = int(total_hits);
+    row_status[3] = int(running_total);
+}

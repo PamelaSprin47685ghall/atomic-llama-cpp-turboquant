@@ -23,8 +23,10 @@ typedef std::unique_ptr<gguf_context, gguf_context_deleter> gguf_context_ptr;
 // ggml-alloc
 
 struct ggml_gallocr_deleter { void operator()(ggml_gallocr_t galloc) { ggml_gallocr_free(galloc); } };
+struct ggml_gallocr_buffer_pool_deleter { void operator()(ggml_gallocr_buffer_pool_t pool) { ggml_gallocr_buffer_pool_free(pool); } };
 
 typedef std::unique_ptr<ggml_gallocr, ggml_gallocr_deleter> ggml_gallocr_ptr;
+typedef std::unique_ptr<ggml_gallocr_buffer_pool, ggml_gallocr_buffer_pool_deleter> ggml_gallocr_buffer_pool_ptr;
 
 // ggml-backend
 
@@ -32,8 +34,10 @@ struct ggml_backend_deleter        { void operator()(ggml_backend_t backend)    
 struct ggml_backend_buffer_deleter { void operator()(ggml_backend_buffer_t buffer) { ggml_backend_buffer_free(buffer); } };
 struct ggml_backend_event_deleter  { void operator()(ggml_backend_event_t event)   { ggml_backend_event_free(event); } };
 struct ggml_backend_sched_deleter  { void operator()(ggml_backend_sched_t sched)   { ggml_backend_sched_free(sched); } };
+struct ggml_backend_sched_compute_pool_deleter { void operator()(ggml_backend_sched_compute_pool_t pool) { ggml_backend_sched_compute_pool_free(pool); } };
 
 typedef std::unique_ptr<ggml_backend,        ggml_backend_deleter>        ggml_backend_ptr;
 typedef std::unique_ptr<ggml_backend_buffer, ggml_backend_buffer_deleter> ggml_backend_buffer_ptr;
 typedef std::unique_ptr<ggml_backend_event,  ggml_backend_event_deleter>  ggml_backend_event_ptr;
 typedef std::unique_ptr<ggml_backend_sched,  ggml_backend_sched_deleter>  ggml_backend_sched_ptr;
+typedef std::unique_ptr<ggml_backend_sched_compute_pool, ggml_backend_sched_compute_pool_deleter> ggml_backend_sched_compute_pool_ptr;

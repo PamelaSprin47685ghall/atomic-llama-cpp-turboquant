@@ -2448,3 +2448,6 @@ blk.44.attn_v.weight q8_0
 blk.44.ffn_down_shexp.weight q8_0
 blk.44.ffn_gate_shexp.weight q8_0
 blk.44.ffn_up_shexp.weight q8_0
+
+[NVFP4] nvfp4
+output.weight q6_K
