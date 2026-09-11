@@ -1576,7 +1576,11 @@ bool llama_model_loader::load_all_data(
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
-                file->read_raw(cur->data, n_size);
+                if (!dry_run) {
+                    file->read_raw(cur->data, n_size);
+                }
+                // dry run: the read above is skipped, everything after it (the upload of this
+                // tensor) still runs, so the driver sees the same writes as a real load.
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));

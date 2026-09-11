@@ -704,6 +704,60 @@ static llama_model * common_fit_probe_model(const char * path_model, const llama
     return model_cached;
 }
 
+// GTT (system memory) used by a device, from the kernel. The dry probe allocates and writes
+// like a real load, so if the weights or the pool do not fit in VRAM the driver starts
+// migrating pages to system memory; that is the failure mode that ends in a system-wide OOM
+// (measured: 45 GiB of shmem, then the OOM killer). The fit therefore checks this after every
+// probe and aborts at once instead of measuring how far past the edge it went.
+static bool common_fit_device_gtt(ggml_backend_dev_t dev, uint64_t & gtt_out) {
+    if (dev == nullptr) {
+        return false;
+    }
+    ggml_backend_dev_props props = {};
+    ggml_backend_dev_get_props(dev, &props);
+    if (props.device_id == nullptr || props.device_id[0] == '\0') {
+        return false;
+    }
+    const std::string bdf = props.device_id;
+
+    DIR * dir = opendir("/sys/class/drm");
+    if (dir == nullptr) {
+        return false;
+    }
+    while (dirent * ent = readdir(dir)) {
+        const std::string name = ent->d_name;
+        if (name.rfind("card", 0) != 0 || name.find('-') != std::string::npos) {
+            continue;
+        }
+        const std::string base = "/sys/class/drm/" + name + "/device";
+        char target[PATH_MAX];
+        const ssize_t n = readlink(base.c_str(), target, sizeof(target) - 1);
+        if (n <= 0) {
+            continue;
+        }
+        target[n] = '\0';
+        const std::string path = target;
+        const size_t pos = path.rfind(bdf);
+        if (pos == std::string::npos) {
+            continue;
+        }
+        const size_t end = pos + bdf.size();
+        if (end < path.size() && path[end] != '/') {
+            continue;
+        }
+        FILE * f = fopen((base + "/mem_info_gtt_used").c_str(), "r");
+        if (f == nullptr) {
+            continue;
+        }
+        const bool ok = fscanf(f, "%" SCNu64, &gtt_out) == 1;
+        fclose(f);
+        closedir(dir);
+        return ok;
+    }
+    closedir(dir);
+    return false;
+}
+
 // Free/total VRAM of a backend device from the kernel's own accounting.
 //
 // The backend's ggml_backend_dev_memory() is not VRAM free space on RADV: it reports the
@@ -814,10 +868,14 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = no_alloc;
-    mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
-    // Load mode stays NONE for both kinds of probe: the buffers are laid out exactly as the real
-    // load lays them out (offload to the devices, host side as the caller configured it) and are
-    // never filled, which is what makes the probe dry. Only the space matters here.
+    // Dry probe (no_alloc == false): every buffer is allocated exactly as a real load allocates
+    // it - same offload, same load mode, same host side - and the weight transfer is skipped.
+    // That is the whole difference to a real load, so its memory picture is the real one.
+    mparams_copy.dry_run = !no_alloc;
+    if (no_alloc) {
+        // metadata-only probe: no buffers at all, nothing to transfer either
+        mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+    }
 
     // The dry (no_alloc = false) probe owns its model: caching it would keep ~52 GiB of device
     // buffers alive, and it is the only probe that allocates at all.
@@ -2034,6 +2092,40 @@ common_params_fit_status common_fit_kv_cache(
     for (size_t i = 0; i < devs.size() && i < data.size(); ++i) {
         free_base[i] = data[i].free;
     }
+    // The budget base must be read with nothing allocated. The dry probe above allocates and
+    // frees the whole model, but the driver keeps those pages in its own pool instead of
+    // returning them to the kernel, so a base read from inside the probe is optimistic by
+    // exactly that amount (measured: the real load then ran 1-2 GiB short per device and the
+    // driver migrated that much to system memory). The kernel numbers at process start are
+    // the ones the real load will see.
+    for (size_t i = 0; i < devs.size(); ++i) {
+        uint64_t vram_free  = 0;
+        uint64_t vram_total = 0;
+        if (common_fit_device_vram(devs[i], vram_free, vram_total) &&
+            (free_base[i] == 0 || vram_free > (uint64_t) free_base[i])) {
+            free_base[i] = (int64_t) vram_free;
+        }
+    }
+
+    // Circuit breaker. A dry probe allocates and writes like a real load, so if the candidate
+    // does not fit, the driver starts migrating pages to system memory - the road that ends in
+    // a system-wide OOM and a forced reboot. Nothing here needs to know how far past the edge
+    // it went: as soon as any device shows GTT usage, the candidate is rejected.
+    const uint64_t gtt_limit = 64ull << 20;
+    const auto gtt_spilled = [&]() {
+        for (size_t i = 0; i < devs.size(); ++i) {
+            uint64_t gtt = 0;
+            if (common_fit_device_gtt(devs[i], gtt) && gtt > gtt_limit) {
+                LOG_WRN("%s: device %s has %llu MiB in system memory - aborting before it grows\n",
+                        __func__, ggml_backend_dev_name(devs[i]), (unsigned long long) (gtt >> 20));
+                return true;
+            }
+        }
+        return false;
+    };
+    if (gtt_spilled()) {
+        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
 
     // Resolve the per-sequence context from the model's training context when the
     // user did not specify -c.  This mirrors llama_context's own resolution and
@@ -2165,17 +2257,50 @@ common_params_fit_status common_fit_kv_cache(
             if (bind < devs.size() && np_est >= 1) {
                 uint32_t np_ok  = 1;
                 int64_t  s_ok   = slack_of(data);
+                uint32_t np_prev = np_ok;   // the measured point before np_ok, for the zero crossing
+                int64_t  s_prev  = s_ok;
                 uint32_t np_bad = 0;
                 int64_t  s_bad  = 0;
                 uint32_t np_try = (uint32_t) std::min<uint64_t>(np_est, LLAMA_MAX_SEQ);
                 int      probes = 0;
-                for (int step = 0; step < 5 && np_try > np_ok; ++step) {
+                int      spilled = 0;   // system-memory spills tolerated while bracketing
+                for (int step = 0; step < 8 && np_try > np_ok; ++step) {
                     const uint64_t pool_try = std::min<uint64_t>((uint64_t) np_try * target, n_max);
                     common_device_memory_data_vec d_np;
-                    const bool fits = get_data((uint32_t) pool_try, d_np, np_try);
+                    // The verification probe is dry, not metadata-only: it allocates exactly as the
+                    // real load will (same buffers, same offload) and skips only the transfer, so
+                    // the free memory it reports is the one the real load gets. Extrapolating the
+                    // pool's cost from a single slope is what kept missing by 1-2 GiB per device
+                    // (measured increment 842 MiB predicted vs 2062 MiB real on Vulkan2).
+                    bool fits = false;
+                    try {
+                        llama_context_params test = *cparams;
+                        test.n_ctx_kv  = (uint32_t) pool_try;
+                        test.n_seq_max = np_try;
+                        d_np = common_get_device_memory_data(path_model, mparams, &test, devs,
+                                                             hp_ngl, hp_n_ctx_train, hp_n_expert, log_level, /*no_alloc=*/false);
+                        fits = !d_np.empty() && slack_of(d_np) >= 0;
+                    } catch (const std::exception & e) {
+                        LOG_WRN("%s: dry probe (%u slots, %llu tokens) failed: %s\n",
+                                __func__, np_try, (unsigned long long) pool_try, e.what());
+                    }
                     const int64_t s_try = slack_of(d_np);
                     probes++;
-                    if (fits) {
+                    if (gtt_spilled()) {
+                        // Past the edge: take it as the failing bound and interpolate down. Only
+                        // one spill is tolerated - a second means the bracket is not converging
+                        // and every further attempt would cost the machine more system memory.
+                        np_bad = np_try;
+                        s_bad  = s_try;
+                        if (spilled++ > 0) {
+                            LOG_WRN("%s: second spill at %u slots - aborting\n", __func__, np_try);
+                            return COMMON_PARAMS_FIT_STATUS_FAILURE;
+                        }
+                        LOG_WRN("%s: %u slots spilled into system memory; interpolating down\n",
+                                __func__, np_try);
+                    } else if (fits) {
+                        np_prev = np_ok;
+                        s_prev  = s_ok;
                         np_ok = np_try;
                         s_ok  = s_try;
                     } else {
@@ -2189,7 +2314,14 @@ common_params_fit_status common_fit_kv_cache(
                     } else if (np_bad > np_ok) {
                         np_next = ((uint64_t) np_ok + np_bad) / 2;
                     } else {
-                        np_next = (uint64_t) np_try + 1;
+                        // both probed points fit, so extrapolate where the measured slack line
+                        // hits zero: the dry probes are cheap and this converges to the ceiling
+                        // instead of stepping one slot at a time.
+                        if (np_ok > np_prev && s_prev > s_ok) {
+                            np_next = (uint64_t) np_prev + (uint64_t) ((__int128) s_prev * (np_ok - np_prev) / (s_prev - s_ok));
+                        } else {
+                            np_next = (uint64_t) np_try + 1;
+                        }
                     }
                     if (np_next <= np_ok || np_next > LLAMA_MAX_SEQ) {
                         break;

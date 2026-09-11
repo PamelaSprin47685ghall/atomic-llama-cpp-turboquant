@@ -81,6 +81,11 @@ struct llama_model_loader {
     bool use_direct_io = false;
     bool check_tensors;
     bool no_alloc;
+    // dry run: perform every allocation and every write exactly as a real load does (the
+    // upload path included) and only skip reading the weights from disk. Vulkan allocates
+    // lazily, so a load that never writes does not exercise the driver's residency logic and
+    // its memory picture is not the real one.
+    bool dry_run = false;
     bool load_mtp;
 
     // when true, done_getting_tensors() tolerates GGUF files that contain

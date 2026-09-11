@@ -17335,6 +17335,17 @@ static void ggml_backend_vk_free(ggml_backend_t backend) {
 
     ggml_vk_cleanup(ctx);
 
+    // Release the device-level scratch as well. It is host-visible (on RADV that means the GTT
+    // heap, i.e. system memory) and sized by the largest tensor copied, and it used to live
+    // until the vk_device was destroyed, which only happens at process exit. A load / unload /
+    // load cycle therefore kept ~1 GiB per device pinned in system memory for ever (measured:
+    // 5.3 GiB per cycle, 42.8 GiB of shmem over eight cycles, system-wide OOM). Both buffers
+    // are re-created on demand by ggml_vk_ensure_sync_staging_buffer().
+    if (ctx->device != nullptr) {
+        ggml_vk_destroy_buffer(ctx->device->sync_staging);
+        ctx->device->sync_staging = nullptr;
+    }
+
     delete ctx;
     delete backend;
 }
@@ -18958,8 +18969,12 @@ void ggml_backend_vk_get_device_memory(int device, size_t * free, size_t * total
         if (is_integrated_gpu || (heap.flags & vk::MemoryHeapFlagBits::eDeviceLocal)) {
             *total += heap.size;
 
+            // heap.size, not heapBudget: RADV computes the budget of the device-local heap
+            // including the system-memory fallback, so an empty 16 GiB card reports ~17 GiB of
+            // budget and every capacity decision that trusts it overcommits (that is how the
+            // fit ended up pushing weights into GTT and taking the machine into the OOM killer).
             if (membudget_supported && i < budgetprops.heapUsage.size()) {
-                *free += budgetprops.heapBudget[i] - budgetprops.heapUsage[i];
+                *free += heap.size > budgetprops.heapUsage[i] ? heap.size - budgetprops.heapUsage[i] : 0;
             } else {
                 *free += heap.size;
             }
