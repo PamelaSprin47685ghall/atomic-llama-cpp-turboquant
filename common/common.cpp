@@ -1575,14 +1575,36 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     if (dynamic_kv && !params.rerot_enabled) {
-        const auto status = common_fit_recurrent_cache(
-            params.model.path.c_str(), &mparams, &cparams, params.n_ctx_kv_reserve,
-            extra_cparams,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
-        if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
-            COM_ERR("%s", "failed to size recurrent state pool automatically\n");
-            return;
+        // The KV fit and the recurrent fit draw on the same budget, so they must not be solved
+        // one after the other: the KV solve already reserves the measured per-slot cost for
+        // every slot it selected (max_kv(np) >= np * target), and a second search over the same
+        // memory then rejects the configuration the first one just accepted. The recurrent
+        // capacity is therefore the solved slot count, and the search only runs when the KV
+        // solve did not decide it.
+        if (cparams.n_seq_max > 0 && cparams.n_ctx_kv > 0) {
+            cparams.n_seq_recurrent = cparams.n_seq_max;
+            COM_INF("recurrent capacity = %u slots (from the KV solve)\n", cparams.n_seq_recurrent);
+        } else {
+            const auto status = common_fit_recurrent_cache(
+                params.model.path.c_str(), &mparams, &cparams, params.n_ctx_kv_reserve,
+                extra_cparams,
+                params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+                COM_ERR("%s", "failed to size recurrent state pool automatically\n");
+                return;
+            }
         }
+    }
+
+    // Adopt the solved slot count. The server-side slot limit (and with it the batch size and
+    // the per-slot accounting) has to follow the capacity the fit just solved; leaving the
+    // auto placeholder in place divides the pool into slices far below the solved average
+    // (measured: 22 advertised slots for a pool solved as 6 x 131072).
+    if (dynamic_kv && cparams.n_seq_max > 0 && (int) cparams.n_seq_max != params.n_parallel) {
+        COM_INF("auto-fit: %u parallel slots, %u KV tokens\n", cparams.n_seq_max, cparams.n_ctx_kv);
+        params.n_parallel    = (int) cparams.n_seq_max;
+        params.n_parallel_pp = 1;
+        params.n_ctx_kv      = cparams.n_ctx_kv;
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);

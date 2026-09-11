@@ -202,4 +202,5 @@ common_device_memory_data_vec common_get_device_memory_data(
                            uint32_t & hp_ngl,
                            uint32_t & hp_n_ctx_train,
                            uint32_t & hp_n_expert,
-                     ggml_log_level   log_level);
+                     ggml_log_level   log_level,
+                                bool   no_alloc = true);

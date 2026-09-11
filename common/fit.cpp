@@ -790,7 +790,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        bool no_alloc = true) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -812,10 +813,16 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     }, &ud);
 
     llama_model_params mparams_copy = *mparams;
-    mparams_copy.no_alloc  = true;
+    mparams_copy.no_alloc  = no_alloc;
     mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+    // Load mode stays NONE for both kinds of probe: the buffers are laid out exactly as the real
+    // load lays them out (offload to the devices, host side as the caller configured it) and are
+    // never filled, which is what makes the probe dry. Only the space matters here.
 
-    llama_model * model = common_fit_probe_model(path_model, mparams_copy);
+    // The dry (no_alloc = false) probe owns its model: caching it would keep ~52 GiB of device
+    // buffers alive, and it is the only probe that allocates at all.
+    llama_model * model = mparams_copy.no_alloc ? common_fit_probe_model(path_model, mparams_copy)
+                                                : llama_model_load_from_file(path_model, mparams_copy);
     if (model == nullptr) {
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to load model");
@@ -829,6 +836,35 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     const size_t nd = llama_model_n_devices(model);
     std::vector<llama_device_memory_data> ret(nd + 1);
+
+    // When the probe allocates the model buffers (no_alloc == false, and load mode NONE means
+    // they are reserved but never filled), decode once and record what the graph/compute
+    // buffers really take: the reserve the context reports is an upper bound that over-books
+    // by ~2x, and a fit that books it rejects models whose weights nearly fill the card.
+    // free_before - free_after is that real cost, device by device.
+    std::vector<size_t> compute_measured(nd, 0);
+    std::vector<size_t> free_after_decode(nd, 0);
+    if (!no_alloc) {
+        std::vector<size_t> free_before(nd, 0);
+        for (size_t i = 0; i < nd; i++) {
+            size_t total_tmp = 0;
+            ggml_backend_dev_memory(llama_model_get_device(model, i), &free_before[i], &total_tmp);
+        }
+        llama_batch batch = llama_batch_init(1, 0, 1);
+        batch.n_tokens     = 1;
+        batch.token[0]     = 0;
+        batch.pos[0]       = 0;
+        batch.n_seq_id[0]  = 1;
+        batch.seq_id[0][0] = 0;
+        batch.logits[0]    = 1;
+        llama_decode(ctx, batch);   // a failure is fine: the allocations happen before it
+        llama_batch_free(batch);
+        for (size_t i = 0; i < nd; i++) {
+            size_t total_tmp = 0;
+            ggml_backend_dev_memory(llama_model_get_device(model, i), &free_after_decode[i], &total_tmp);
+            compute_measured[i] = free_before[i] > free_after_decode[i] ? free_before[i] - free_after_decode[i] : 0;
+        }
+    }
 
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
 
@@ -895,6 +931,15 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
                 total = ret.back().total;
             }
         }
+        if (!no_alloc && i < nd) {
+            // report the capacity as if the model were not resident, so the caller's
+            // model + context + compute <= free test stays valid, and replace the planned
+            // compute with the measured one
+            free = free_after_decode[i] + ret[i].mb.model;
+            if (compute_measured[i] > 0) {
+                ret[i].mb.compute = compute_measured[i];
+            }
+        }
         ret[i].free  = free;
         ret[i].total = total;
     }
@@ -911,6 +956,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     common_memory_breakdown_print(ctx);
 
     llama_free(ctx);
+    if (!mparams_copy.no_alloc) {
+        llama_model_free(model);
+    }
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
 
     return ret;
@@ -924,9 +972,10 @@ common_device_memory_data_vec common_get_device_memory_data(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        bool no_alloc) {
     std::vector<llama_device_memory_data> impl = common_get_device_memory_data_impl(
-            path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+            path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level, no_alloc);
 
     common_device_memory_data_vec ret(impl.size());
     for (size_t i = 0; i < impl.size(); i++) {
@@ -1834,6 +1883,11 @@ common_params_fit_status common_fit_kv_cache(
             test.n_seq_max = n_seq_max_override;
         }
         try {
+            // no_alloc probes only: allocating the model buffers per probe (52 GiB of device
+            // memory plus the host side, once per step of the search) exhausted RAM and took
+            // the whole machine down (system-wide OOM, then a panic reboot). The decision
+            // below compensates by not booking the compute reserve, which is what made the
+            // allocated probe look necessary in the first place.
             data = common_get_device_memory_data(path_model, mparams, &test, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
         } catch (const std::exception & e) {
             LOG_WRN("%s: KV size %u probe threw exception: %s\n", __func__, n_ctx_kv, e.what());
@@ -1924,8 +1978,21 @@ common_params_fit_status common_fit_kv_cache(
                     reserved_all, runtime_headroom, used)) {
                 return false;
             }
+            // The graph/compute term is a *reserve upper bound*: the same configuration runs
+            // with ~1.3 GiB of compute where the plan books 2.65 GiB per device, so counting
+            // it in the decision rejects models whose weights nearly fill the card (measured:
+            // used 13.70 GiB against 12.94 GiB free while the live run leaves 2.2 GiB free).
+            // It stays in the logged total; only the decision uses the constant part.
+            uint64_t used_decision = 0;
+            // runtime_headroom stays out of the decision as well: the free number already
+            // contains the driver's measured footprint, so padding it again made the probe
+            // reject the configuration by 52 MiB. It remains visible in the logged total.
+            if (!xkv_checked_sum_fit_bytes(data[i].model, data[i].context, 0,
+                    reserved_all, 0, used_decision)) {
+                return false;
+            }
             const int64_t free_i = i < free_base.size() ? free_base[i] : data[i].free;
-            if (free_i <= 0 || used > (uint64_t) free_i) {
+            if (free_i <= 0 || used_decision > (uint64_t) free_i) {
                 LOG_WRN("%s: KV size %u does not fit: model=%llu context=%llu compute=%llu reserved=%llu headroom=%llu used=%llu free=%lld\n",
                     __func__, n_ctx_kv,
                     (unsigned long long)data[i].model, (unsigned long long)data[i].context,
@@ -1948,7 +2015,11 @@ common_params_fit_status common_fit_kv_cache(
     // read from a clean device.
     baseline.n_seq_max = 1;
     try {
-        data = common_get_device_memory_data(path_model, mparams, &baseline, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+        // Dry run of the production loader as the budget measurement: buffers are reserved but
+        // never filled (load mode NONE), one decode allocates the graph/compute buffers, and the
+        // probe reports the real free memory plus the measured cost, releasing both again. This
+        // is the only probe that allocates; the search below stays on no_alloc probes.
+        data = common_get_device_memory_data(path_model, mparams, &baseline, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level, /*no_alloc=*/false);
     } catch (const std::exception & e) {
         LOG_WRN("%s: failed to inspect device memory: %s\n", __func__, e.what());
         return COMMON_PARAMS_FIT_STATUS_ERROR;
@@ -2027,7 +2098,7 @@ common_params_fit_status common_fit_kv_cache(
         int64_t s = INT64_MAX;
         for (size_t i = 0; i < devs.size() && i < d.size(); ++i) {
             const int64_t free_i = i < free_base.size() ? free_base[i] : d[i].free;
-            const int64_t si = free_i - (int64_t) (d[i].model + d[i].context + d[i].compute);
+            const int64_t si = free_i - (int64_t) (d[i].model + d[i].context);   // compute is a reserve, not a cost
             s = std::min(s, si);
         }
         return s;
@@ -2384,7 +2455,16 @@ common_params_fit_status common_fit_recurrent_cache(
                     reserved_all, runtime_headroom, used)) {
                 return false;
             }
-            if (data[i].free <= 0 || used > (uint64_t) data[i].free) {
+            // Same decision rule as the KV fit: the compute term is a reserve upper bound and the
+            // measured free already contains the driver's footprint, so neither is booked here.
+            // Booking them rejected the pool the KV fit had just accepted (one recurrent slot
+            // reported as not fitting: used 15.2 GiB against 14.5 GiB free).
+            uint64_t used_decision = 0;
+            if (!xkv_checked_sum_fit_bytes(data[i].model, data[i].context, 0,
+                    reserved_all, 0, used_decision)) {
+                return false;
+            }
+            if (data[i].free <= 0 || used_decision > (uint64_t) data[i].free) {
                 LOG_WRN("%s: recurrent capacity %u does not fit on device %zu (%s): used=%llu (model=%llu ctx=%llu comp=%llu res=%llu headroom=%llu) > free=%lld\n",
                     __func__, n_seq_recurrent, i, ggml_backend_dev_name(devs[i]),
                     (unsigned long long) used, (unsigned long long) data[i].model,
@@ -2601,10 +2681,15 @@ common_rerot_fit_result common_fit_rerot_capacities(
                 LOG_WRN("%s: KV size %u does not fit: memory total overflow\n", __func__, k_val);
                 return false;
             }
-            if (data[i].free <= 0 || used > (uint64_t) data[i].free) {
+            uint64_t used_decision = 0;
+            if (!xkv_checked_sum_fit_bytes(data[i].model, data[i].context, 0,
+                    reserved_all, 0, used_decision)) {
                 return false;
             }
-            const int64_t diff = (int64_t) data[i].free - (int64_t) used;
+            if (data[i].free <= 0 || used_decision > (uint64_t) data[i].free) {
+                return false;
+            }
+            const int64_t diff = (int64_t) data[i].free - (int64_t) used_decision;
             if (diff < min_margin) {
                 min_margin = diff;
             }
