@@ -941,7 +941,29 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         for (size_t i = 0; i < nd; i++) {
             size_t total_tmp = 0;
             ggml_backend_dev_memory(llama_model_get_device(model, i), &free_after_decode[i], &total_tmp);
-            compute_measured[i] = free_before[i] > free_after_decode[i] ? free_before[i] - free_after_decode[i] : 0;
+        }
+        // Second decode, and then measure across both: the first one faults in whatever the driver
+        // had only reserved - Vulkan allocates lazily and the KV pool is the largest of those - so
+        // its own delta charges the pool to the graph as well. The caller subtracts the declared
+        // context (the pool) from what is measured here, so what is left after both decodes is the
+        // steady cost of running, counted once.
+        {
+            llama_batch batch2 = llama_batch_init(1, 0, 1);
+            batch2.n_tokens     = 1;
+            batch2.token[0]     = 0;
+            batch2.pos[0]       = 1;
+            batch2.n_seq_id[0]  = 1;
+            batch2.seq_id[0][0] = 0;
+            batch2.logits[0]    = 1;
+            llama_decode(ctx, batch2);
+            llama_batch_free(batch2);
+        }
+        for (size_t i = 0; i < nd; i++) {
+            size_t total_tmp = 0;
+            size_t free_final = 0;
+            ggml_backend_dev_memory(llama_model_get_device(model, i), &free_final, &total_tmp);
+            free_after_decode[i] = free_final;
+            compute_measured[i] = free_before[i] > free_final ? free_before[i] - free_final : 0;
         }
     }
 
@@ -1064,7 +1086,11 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             // compute with the measured one
             free = free_after_decode[i] + ret[i].mb.model;
             if (compute_measured[i] > 0) {
-                ret[i].mb.compute = compute_measured[i];
+                // The measured delta is what the context costs on top of the weights, and the
+                // declared context (the pool) is already part of it: book only the remainder, so
+                // the fit's decision does not charge the pool twice.
+                ret[i].mb.compute = compute_measured[i] > ret[i].mb.context
+                    ? compute_measured[i] - ret[i].mb.context : 0;
             }
         }
         ret[i].free  = free;
