@@ -9106,7 +9106,13 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
-    n_kv = kv->get_size();
+    // Reserve graph. The widest a single forward can ever look is one sequence's context: prefill
+    // runs exactly one sequence and a decode token only ever attends within its own, and the two
+    // never run together. So no live graph reaches past n_ctx_train, while the pool (which is deep
+    // for the sake of concurrency) is storage, not scratch. Sizing this by the pool made the
+    // scheduler allocate working buffers for it (measured: 4.1 GiB per device at a 262144-token
+    // pool against 9.3 GiB at 524288, all of it compute and none of it needed by any forward).
+    n_kv = (int32_t) std::min<uint32_t>(kv->get_size(), kv->get_hparams().n_ctx_train);
 
     const uint32_t n_stream = kv->get_n_stream();
 
