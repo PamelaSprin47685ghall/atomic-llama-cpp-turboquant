@@ -2395,24 +2395,51 @@ common_params_fit_status common_fit_kv_cache(
                 for (int step = 0; step < 8 && np_try > np_ok; ++step) {
                     const uint64_t pool_try = std::min<uint64_t>((uint64_t) np_try * target, n_max);
                     common_device_memory_data_vec d_np;
+                    // Gate before probing. On this box a probe that does not fit is paid for in
+                    // system memory: measured 5 GiB of growing Shmem plus 19 GiB of GTT against a
+                    // card with 657 MiB free, which is the road to the OOM that took the machine
+                    // down. So a candidate whose predicted KV (from the measured slope) plus the
+                    // last measured graph cost does not fit is failed here without allocating it,
+                    // and the interpolation still gets a bound to work with.
+                    bool    gated  = false;
+                    int64_t s_gate = INT64_MAX;
+                    for (size_t i = 0; i < devs.size() && i < data.size(); ++i) {
+                        // Slope from the two capacities that were measured: bytes of KV per token
+                        // on this device. Zero means the probing did not see this device grow, and
+                        // then only its fixed costs are counted.
+                        const uint64_t slope = (n_probe > n_min && i < data_probe.size() &&
+                                                data_probe[i].context > data[i].context)
+                                             ? (data_probe[i].context - data[i].context) / (n_probe - n_min) : 0;
+                        const uint64_t pred_ctx = slope * (pool_try > n_min ? pool_try - n_min : 0);
+                        const uint64_t need     = pred_ctx + data[i].context + data[i].compute;
+                        const int64_t  free_i   = i < free_base.size() ? free_base[i] : (int64_t) data[i].free;
+                        s_gate = std::min(s_gate, free_i - (int64_t) need);
+                    }
+                    if (s_gate < -(int64_t) (512ull << 20)) {
+                        gated = true;
+                        LOG_WRN("%s: %u slots x %llu tokens refused before probing (predicted slack %lld MiB)\n",
+                                __func__, np_try, (unsigned long long) pool_try, (long long) (s_gate >> 20));
+                    }
                     // The verification probe is dry, not metadata-only: it allocates exactly as the
                     // real load will (same buffers, same offload) and skips only the transfer, so
                     // the free memory it reports is the one the real load gets. Extrapolating the
                     // pool's cost from a single slope is what kept missing by 1-2 GiB per device
                     // (measured increment 842 MiB predicted vs 2062 MiB real on Vulkan2).
                     bool fits = false;
-                    try {
-                        llama_context_params test = *cparams;
-                        test.n_ctx_kv  = (uint32_t) pool_try;
-                        test.n_seq_max = np_try;
-                        d_np = common_get_device_memory_data(path_model, mparams, &test, devs,
-                                                             hp_ngl, hp_n_ctx_train, hp_n_expert, log_level, /*no_alloc=*/false);
-                        fits = !d_np.empty() && slack_of(d_np) >= 0;
-                    } catch (const std::exception & e) {
-                        LOG_WRN("%s: dry probe (%u slots, %llu tokens) failed: %s\n",
-                                __func__, np_try, (unsigned long long) pool_try, e.what());
+                    if (!gated) {
+                        try {
+                            llama_context_params test = *cparams;
+                            test.n_ctx_kv  = (uint32_t) pool_try;
+                            test.n_seq_max = np_try;
+                            d_np = common_get_device_memory_data(path_model, mparams, &test, devs,
+                                                                 hp_ngl, hp_n_ctx_train, hp_n_expert, log_level, /*no_alloc=*/false);
+                            fits = !d_np.empty() && slack_of(d_np) >= 0;
+                        } catch (const std::exception & e) {
+                            LOG_WRN("%s: dry probe (%u slots, %llu tokens) failed: %s\n",
+                                    __func__, np_try, (unsigned long long) pool_try, e.what());
+                        }
                     }
-                    const int64_t s_try = slack_of(d_np);
+                    const int64_t s_try = gated ? s_gate : slack_of(d_np);
                     probes++;
                     if (gtt_spilled()) {
                         // Past the edge: take it as the failing bound and interpolate down. Only
