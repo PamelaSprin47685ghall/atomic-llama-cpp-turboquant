@@ -710,6 +710,26 @@ static llama_model * common_fit_probe_model(const char * path_model, const llama
 // migrating pages to system memory; that is the failure mode that ends in a system-wide OOM
 // (measured: 45 GiB of shmem, then the OOM killer). The fit therefore checks this after every
 // probe and aborts at once instead of measuring how far past the edge it went.
+// Shmem of the host, in kB. This is the only signal that told the truth about a load that does
+// not fit: the CPU-offloaded tensors live in GTT by design and the driver pools its freed device
+// buffers, so GTT climbs for healthy runs too - but pages that end up in system memory because
+// the card is full are shmem, and 34 GiB of them took the machine down once already.
+static uint64_t common_fit_shmem_kb() {
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (f == nullptr) {
+        return 0;
+    }
+    char line[256];
+    uint64_t shmem_kb = 0;
+    while (fgets(line, sizeof(line), f) != nullptr) {
+        if (sscanf(line, "Shmem: %" SCNu64 " kB", &shmem_kb) == 1) {
+            break;
+        }
+    }
+    fclose(f);
+    return shmem_kb;
+}
+
 static bool common_fit_device_gtt(ggml_backend_dev_t dev, uint64_t & gtt_out) {
     if (dev == nullptr) {
         return false;
@@ -2178,34 +2198,13 @@ common_params_fit_status common_fit_kv_cache(
         }
     }
 
-    // Circuit breaker. A dry probe allocates and writes like a real load, so if the candidate
-    // does not fit, the driver starts migrating pages to system memory - the road that ends in
-    // a system-wide OOM and a forced reboot. Nothing here needs to know how far past the edge
-    // it went: as soon as any device shows GTT usage, the candidate is rejected.
-    const uint64_t gtt_limit = 64ull << 20;
-    std::vector<uint64_t> gtt_base;   // per device, captured on the first reading
+    // No device-side GTT check here. GTT is not the signal: the CPU-offloaded tensors live in it
+    // by design (~5 GiB per card for per_layer_token_embd) and the driver keeps its freed device
+    // buffers in its own pool rather than returning them, so a run that is perfectly healthy
+    // shows tens of GiB of GTT (measured: 19.7 GiB of GTT with Shmem flat at 11 MiB). What only
+    // ever happens when the system is really out of memory is Shmem and MemAvailable moving - the
+    // 34 GiB of Shmem that took the machine down earlier.
     const auto gtt_spilled = [&]() {
-        for (size_t i = 0; i < devs.size(); ++i) {
-            uint64_t gtt = 0;
-            if (!common_fit_device_gtt(devs[i], gtt)) {
-                continue;
-            }
-            // Baseline, not an absolute limit: the CPU-offloaded tensors legitimately live in GTT
-            // (measured: ~5 GiB per card for per_layer_token_embd), so the first reading is the
-            // reference and only growth past it means the driver started evicting device memory.
-            if (i >= gtt_base.size()) {
-                gtt_base.resize(i + 1, 0);
-            }
-            if (gtt_base[i] == 0) {
-                gtt_base[i] = gtt;
-                continue;
-            }
-            if (gtt > gtt_base[i] + gtt_limit) {
-                LOG_WRN("%s: device %s has %llu MiB in system memory - aborting before it grows\n",
-                        __func__, ggml_backend_dev_name(devs[i]), (unsigned long long) (gtt >> 20));
-                return true;
-            }
-        }
         // The device is only half the picture: the load path can also fill host memory with
         // spilled pages. Measured on this box: 34 GiB of Shmem and an exhausted swap, after which
         // every further GPU allocation failed and the machine went down. A clean box sits at a few
@@ -2459,6 +2458,32 @@ common_params_fit_status common_fit_kv_cache(
                 }
                 cparams->n_seq_max = np_ok;
                 cparams->n_ctx_kv  = (uint32_t) std::max<uint64_t>((uint64_t) np_ok * target, n_min);
+                // Feedback before committing. Everything above is the cost model's opinion, and
+                // that opinion has been wrong about this fork's memory repeatedly: a configuration
+                // it accepted pushed 19 GiB into system memory on the first device. Load the chosen
+                // configuration once (dry, like every probe) and let the devices answer. A spill
+                // steps the slot count down, and the loop is bounded - a machine that pays for
+                // repeated mistakes is a machine that goes down.
+                for (int verify = 0; verify < 3; ++verify) {
+                    common_device_memory_data_vec d_chk;
+                    const uint64_t shmem_before = common_fit_shmem_kb();
+                    const bool     loaded       = get_data(cparams->n_ctx_kv, d_chk, cparams->n_seq_max);
+                    const uint64_t shmem_growth = common_fit_shmem_kb() - shmem_before;
+                    if (loaded && !gtt_spilled() && shmem_growth < (256ull << 10)) {   // < 256 MiB
+                        break;
+                    }
+                    LOG_WRN("%s: verification of %u slots x %u tokens grew host Shmem by %llu MiB\n",
+                            __func__, cparams->n_seq_max, cparams->n_ctx_kv,
+                            (unsigned long long) (shmem_growth >> 10));
+                    if (cparams->n_seq_max <= 1) {
+                        LOG_WRN("%s: the chosen configuration spills with a single slot\n", __func__);
+                        return COMMON_PARAMS_FIT_STATUS_FAILURE;
+                    }
+                    cparams->n_seq_max -= 1;
+                    cparams->n_ctx_kv = (uint32_t) std::max<uint64_t>((uint64_t) cparams->n_seq_max * target, n_min);
+                    LOG_WRN("%s: verification spilled; stepping down to %u slots x %u tokens\n",
+                            __func__, cparams->n_seq_max, cparams->n_ctx_kv);
+                }
                 LOG_INF("%s: automatic unified KV capacity = %u tokens for %u slots x %u avg "
                         "(estimate %llu, %d probes, binding device %s)\n",
                         __func__, cparams->n_ctx_kv, cparams->n_seq_max, target,
