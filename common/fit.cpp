@@ -10,10 +10,14 @@
 #include <array>
 #include <cassert>
 #include <cmath>
+#include <climits>
+#include <cstdio>
+#include <dirent.h>
 #include <stdexcept>
 #include <cinttypes>
 #include <set>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
@@ -669,6 +673,115 @@ uint32_t common_xkv_derive_store_mib(
         dense_ctx, cparams->xkv_min_saving, cparams->xkv_segment_tokens, n_ctx_kv_fit);
 }
 
+// A probe differs from the previous one only in its context parameters, but it used to
+// reload the model every time -- metadata and tensor map for every shard, seconds on a
+// 79 GB model, repeated for every step of the fit's search (and the RERoT fit repeats the
+// whole search per slot count). Probe models are loaded with no_alloc, so they hold no
+// device memory at all; keeping the last one alive makes a probe cost only its context.
+static llama_model * common_fit_probe_model(const char * path_model, const llama_model_params & mparams) {
+    static std::string   key_cached;
+    static llama_model * model_cached = nullptr;
+
+    std::string key = std::string(path_model) + "|" + std::to_string((int) mparams.no_alloc) + "|" +
+                      std::to_string(mparams.n_gpu_layers) + "|" + std::to_string((int) mparams.split_mode) + "|" +
+                      std::to_string(mparams.main_gpu) + "|" + std::to_string((int) mparams.load_mode);
+    for (int i = 0; i < llama_max_devices(); i++) {
+        key += "|";
+        key += mparams.devices != nullptr && mparams.devices[i] != nullptr ? ggml_backend_dev_name(mparams.devices[i]) : "-";
+        key += ":";
+        key += std::to_string(mparams.tensor_split[i]);
+    }
+
+    if (model_cached != nullptr && key == key_cached) {
+        return model_cached;
+    }
+    if (model_cached != nullptr) {
+        llama_model_free(model_cached);
+        model_cached = nullptr;
+    }
+    model_cached = llama_model_load_from_file(path_model, mparams);
+    key_cached   = key;
+    return model_cached;
+}
+
+// Free/total VRAM of a backend device from the kernel's own accounting.
+//
+// The backend's ggml_backend_dev_memory() is not VRAM free space on RADV: it reports the
+// driver's own budget, which on an otherwise empty 16 GB card can be a few GB and has
+// nothing to do with the physical capacity. Every fit decision compares a planned total
+// against it, so the search either rejects everything ("does not fit") or accepts values
+// the driver then has to migrate away. On Linux/amdgpu the kernel exposes exact per-card
+// numbers; the DRM card is matched to the backend device through its PCI slot name
+// (device_id, e.g. "0000:03:00.0"). Falls back to the API value when unavailable.
+static bool common_fit_device_vram(ggml_backend_dev_t dev, uint64_t & free_out, uint64_t & total_out) {
+    if (dev == nullptr) {
+        return false;
+    }
+    ggml_backend_dev_props props = {};
+    ggml_backend_dev_get_props(dev, &props);
+    if (props.device_id == nullptr || props.device_id[0] == '\0') {
+        return false;
+    }
+    const std::string bdf = props.device_id;
+
+    DIR * dir = opendir("/sys/class/drm");
+    if (dir == nullptr) {
+        return false;
+    }
+
+    bool ok = false;
+    while (dirent * ent = readdir(dir)) {
+        const std::string name = ent->d_name;
+        if (name.rfind("card", 0) != 0 || name.find('-') != std::string::npos) {
+            continue;   // connectors show up as cardN-XXX
+        }
+        const std::string base = "/sys/class/drm/" + name + "/device";
+        char target[PATH_MAX];
+        const ssize_t n = readlink(base.c_str(), target, sizeof(target) - 1);
+        if (n <= 0) {
+            continue;
+        }
+        target[n] = '\0';
+        const std::string path = target;
+        const size_t pos = path.rfind(bdf);
+        if (pos == std::string::npos) {
+            continue;
+        }
+        const size_t end = pos + bdf.size();
+        if (end < path.size() && path[end] != '/') {
+            continue;
+        }
+
+        uint64_t used = 0;
+        uint64_t total = 0;
+        FILE * f = fopen((base + "/mem_info_vram_used").c_str(), "r");
+        if (f == nullptr) {
+            continue;
+        }
+        const bool got_used = fscanf(f, "%" SCNu64, &used) == 1;
+        fclose(f);
+        if (!got_used) {
+            continue;
+        }
+        f = fopen((base + "/mem_info_vram_total").c_str(), "r");
+        if (f == nullptr) {
+            continue;
+        }
+        const bool got_total = fscanf(f, "%" SCNu64, &total) == 1;
+        fclose(f);
+        if (!got_total || total == 0) {
+            continue;
+        }
+
+        free_out  = total > used ? total - used : 0;
+        total_out = total;
+        ok = true;
+        break;
+    }
+    closedir(dir);
+    return ok;
+}
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -702,7 +815,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     mparams_copy.no_alloc  = true;
     mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
 
-    llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
+    llama_model * model = common_fit_probe_model(path_model, mparams_copy);
     if (model == nullptr) {
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to load model");
@@ -710,7 +823,6 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     llama_context * ctx = llama_init_from_model(model, *cparams);
     if (ctx == nullptr) {
-        llama_model_free(model);
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to create llama_context from model");
     }
@@ -760,6 +872,16 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         size_t total;
         ggml_backend_dev_memory(dev, &free, &total);
 
+        // prefer the kernel's accounting: the backend budget is not VRAM free space on RADV
+        {
+            uint64_t vram_free  = 0;
+            uint64_t vram_total = 0;
+            if (common_fit_device_vram(dev, vram_free, vram_total)) {
+                free  = (size_t) vram_free;
+                total = (size_t) vram_total;
+            }
+        }
+
         // Some non-GPU accelerator backends, such as BLAS, report 0/0 and rely on
         // the host-memory fallback. For GPU-like backends, keep 0/0 so --fit does
         // not assign anything to a device with an unknown memory budget.
@@ -789,7 +911,6 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     common_memory_breakdown_print(ctx);
 
     llama_free(ctx);
-    llama_model_free(model);
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
 
     return ret;
@@ -1606,6 +1727,12 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
 }
 
 
+// Working margin per device for the automatic KV sizing: what must stay free for the
+// driver's own allocations and transients. Measured on the 5x RX 6800 box - below the
+// driver's eviction watermark it migrates pages to system memory and throughput collapses:
+// free ~2.0-2.6 GiB -> 21-22 tok/s, free ~0.25 GiB -> 1.85 tok/s (9 GiB migrated per card).
+static constexpr uint64_t FIT_KV_MARGIN = 3ull << 29; // 1.5 GiB
+
 common_params_fit_status common_fit_kv_cache(
                          const char * path_model,
            const llama_model_params * mparams,
@@ -1690,9 +1817,22 @@ common_params_fit_status common_fit_kv_cache(
         }
     }
 
-    auto get_data = [&](uint32_t n_ctx_kv, common_device_memory_data_vec & data) {
+    // Budget base for every projection: the free memory is read once, before any context is
+    // built. The driver keeps its pooled device allocations after a probe's context is
+    // freed, so a live reading shrinks probe by probe and later ones reject a configuration
+    // that the runtime fits (measured: used 14.7 GiB against a shrunken free 12.3 GiB).
+    std::vector<int64_t> free_base;
+
+    auto get_data = [&](uint32_t n_ctx_kv, common_device_memory_data_vec & data, uint32_t n_seq_max_override = 0) {
         llama_context_params test = *cparams;
         test.n_ctx_kv = n_ctx_kv;
+        // n_seq_max override: the server's placeholder slot count
+        // (llama_max_parallel_sequences) makes every probe unusable for a hybrid model,
+        // because the recurrent state alone then costs more than the device has. The
+        // solve below probes one and two slots at the real capacity instead.
+        if (n_seq_max_override > 0) {
+            test.n_seq_max = n_seq_max_override;
+        }
         try {
             data = common_get_device_memory_data(path_model, mparams, &test, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
         } catch (const std::exception & e) {
@@ -1784,13 +1924,14 @@ common_params_fit_status common_fit_kv_cache(
                     reserved_all, runtime_headroom, used)) {
                 return false;
             }
-            if (data[i].free <= 0 || used > (uint64_t) data[i].free) {
+            const int64_t free_i = i < free_base.size() ? free_base[i] : data[i].free;
+            if (free_i <= 0 || used > (uint64_t) free_i) {
                 LOG_WRN("%s: KV size %u does not fit: model=%llu context=%llu compute=%llu reserved=%llu headroom=%llu used=%llu free=%lld\n",
                     __func__, n_ctx_kv,
                     (unsigned long long)data[i].model, (unsigned long long)data[i].context,
                     (unsigned long long)data[i].compute, (unsigned long long)reserved_all,
                     (unsigned long long)runtime_headroom, (unsigned long long)used,
-                    (long long)data[i].free);
+                    (long long) (i < free_base.size() ? free_base[i] : data[i].free));
                 return false;
             }
         }
@@ -1801,6 +1942,11 @@ common_params_fit_status common_fit_kv_cache(
     common_device_memory_data_vec data;
     llama_context_params baseline = *cparams;
     baseline.n_ctx_kv = 0;
+    // one slot as well: with the caller's placeholder (llama_max_parallel_sequences()) the
+    // probe really allocates the recurrent state for that many sequences (~9 GiB here) and
+    // the free memory it reports is what is left *after* that - the budget base has to be
+    // read from a clean device.
+    baseline.n_seq_max = 1;
     try {
         data = common_get_device_memory_data(path_model, mparams, &baseline, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
     } catch (const std::exception & e) {
@@ -1811,6 +1957,11 @@ common_params_fit_status common_fit_kv_cache(
     if (devs.empty()) {
         LOG_WRN("%s: no device memory available for automatic KV sizing\n", __func__);
         return COMMON_PARAMS_FIT_STATUS_FAILURE;
+    }
+
+    free_base.assign(devs.size(), 0);
+    for (size_t i = 0; i < devs.size() && i < data.size(); ++i) {
+        free_base[i] = data[i].free;
     }
 
     // Resolve the per-sequence context from the model's training context when the
@@ -1840,14 +1991,18 @@ common_params_fit_status common_fit_kv_cache(
         n_min = std::max<uint32_t>(n_align, (uint32_t) (((uint64_t) n_ctx_seq + n_align - 1) / n_align * n_align));
     }
 
-    if (!get_data(n_min, data)) {
+    // np=1 for the first probe: the caller's slot count is a placeholder in the auto case
+    // (llama_max_parallel_sequences()), whose recurrent state alone exceeds the device on a
+    // hybrid model, so without this override every fit rejects the requested context before
+    // the solve below can even estimate the real slot ceiling.
+    if (!get_data(n_min, data, /*n_seq_max_override=*/1)) {
         LOG_WRN("%s: requested per-sequence context of %u tokens does not fit in device memory\n", __func__, n_min);
         return COMMON_PARAMS_FIT_STATUS_FAILURE;
     }
 
     const uint32_t n_probe = (uint32_t) std::min<uint64_t>(n_max, std::max<uint64_t>((uint64_t) n_min * 2, (uint64_t) n_min + 4096));
+    common_device_memory_data_vec data_probe;
     if (n_probe > n_min) {
-        common_device_memory_data_vec data_probe;
         if (get_data(n_probe, data_probe)) {
             bool device_context_grows = false;
             for (size_t i = 0; i < devs.size(); ++i) {
@@ -1860,45 +2015,249 @@ common_params_fit_status common_fit_kv_cache(
         }
     }
 
-    uint32_t lo = n_min;
-    uint32_t hi = n_min;
+    // ---- slots and pool ------------------------------------------------------------------
+    // np=1 has been probed above. Estimate the slot ceiling from the probed slopes, probe at
+    // that ceiling, and then interpolate (false position) between the last fitting and the
+    // first failing np until the bracket closes - every step stays inside the bracket.
+    //   k_i    = (context(2*n_min) - context(n_min)) / n_min   KV bytes per token
+    //   slot_i = free(1 slot) - free(2 slots)                  per-slot state
+    // The pool must keep every slot at `target` tokens on average:
+    //   pool(np) = n_min + (room_i - (np-1)*slot_i)/k_i >= np*target
+    auto slack_of = [&devs, &free_base](const common_device_memory_data_vec & d) {
+        int64_t s = INT64_MAX;
+        for (size_t i = 0; i < devs.size() && i < d.size(); ++i) {
+            const int64_t free_i = i < free_base.size() ? free_base[i] : d[i].free;
+            const int64_t si = free_i - (int64_t) (d[i].model + d[i].context + d[i].compute);
+            s = std::min(s, si);
+        }
+        return s;
+    };
 
-    while (hi < n_max) {
-        const uint64_t next64 = std::min<uint64_t>(n_max, uint64_t(hi) * 2);
-        const uint32_t next = (uint32_t) next64;
-        if (next == hi || !get_data(next, data)) {
-            hi = next;
+    if (n_probe > n_min && !data_probe.empty()) {
+        common_device_memory_data_vec data_np2;
+        if (get_data(n_min, data_np2, /*n_seq_max_override=*/2)) {
+            const uint32_t target = std::max<uint32_t>(n_align, n_ctx_seq / 2);
+            // Everything below is computed from the probes: k_i (KV bytes per token) from the
+            // two capacities, slot_i (per-slot state) from the two slot counts, room_i from
+            // the free memory the kernel reports for the one-slot probe. From those, for any
+            // slot count the maximum KV capacity is a function
+            //
+            //     max_kv(np) = min_i ( room_i - (np - 1) * slot_i ) / k_i + n_min
+            //
+            // and the question is the largest np whose slots all still keep `target` tokens:
+            //     max_kv(np) >= np * target
+            const auto kv_of = [&](size_t i) -> uint64_t {
+                const uint64_t bytes = data_probe[i].context > data[i].context ?
+                    (uint64_t) (data_probe[i].context - data[i].context) : 0;
+                return bytes / (n_probe - n_min);
+            };
+            const auto slot_of = [&](size_t i) -> uint64_t {
+                return (uint64_t) std::max<int64_t>(data[i].free - data_np2[i].free, 0);
+            };
+            const auto room_of = [&](size_t i) -> uint64_t {
+                const int64_t free_i = i < free_base.size() ? free_base[i] : data[i].free;
+                return (uint64_t) free_i > FIT_KV_MARGIN ? (uint64_t) free_i - FIT_KV_MARGIN : 0;
+            };
+            const auto max_kv_of = [&](uint32_t np) -> uint64_t {
+                uint64_t best = 0;
+                bool any = false;
+                for (size_t i = 0; i < devs.size(); ++i) {
+                    const uint64_t k_i = kv_of(i);
+                    if (k_i == 0) {
+                        continue;
+                    }
+                    const uint64_t used_slots = (uint64_t) (np > 0 ? np - 1 : 0) * slot_of(i);
+                    const uint64_t room = room_of(i) > used_slots ? room_of(i) - used_slots : 0;
+                    const uint64_t cap  = (uint64_t) n_min + room / k_i;
+                    if (!any || cap < best) {
+                        best = cap;
+                        any  = true;
+                    }
+                }
+                return any ? best : 0;
+            };
+
+            uint64_t np_est = 0;
+            size_t   bind   = devs.size();
+            for (size_t i = 0; i < devs.size(); ++i) {
+                const uint64_t k_i = kv_of(i);
+                if (k_i == 0 || data[i].free <= 0) {
+                    continue;
+                }
+                const uint64_t np_i = (room_of(i) + (uint64_t) n_min * k_i + slot_of(i)) /
+                                      ((uint64_t) target * k_i + slot_of(i));
+                if (bind == devs.size() || np_i < np_est) {
+                    np_est = np_i;
+                    bind   = i;
+                }
+            }
+            if (bind < devs.size() && np_est >= 1) {
+                uint32_t np_ok  = 1;
+                int64_t  s_ok   = slack_of(data);
+                uint32_t np_bad = 0;
+                int64_t  s_bad  = 0;
+                uint32_t np_try = (uint32_t) std::min<uint64_t>(np_est, LLAMA_MAX_SEQ);
+                int      probes = 0;
+                for (int step = 0; step < 5 && np_try > np_ok; ++step) {
+                    const uint64_t pool_try = std::min<uint64_t>((uint64_t) np_try * target, n_max);
+                    common_device_memory_data_vec d_np;
+                    const bool fits = get_data((uint32_t) pool_try, d_np, np_try);
+                    const int64_t s_try = slack_of(d_np);
+                    probes++;
+                    if (fits) {
+                        np_ok = np_try;
+                        s_ok  = s_try;
+                    } else {
+                        np_bad = np_try;
+                        s_bad  = s_try;
+                    }
+                    uint64_t np_next;
+                    if (np_bad > np_ok && s_ok > 0 && s_ok > s_bad) {
+                        // interpolate where the probed slack crosses zero, inside the bracket
+                        np_next = (uint64_t) np_ok + (uint64_t) ((__int128) s_ok * (np_bad - np_ok) / (s_ok - s_bad));
+                    } else if (np_bad > np_ok) {
+                        np_next = ((uint64_t) np_ok + np_bad) / 2;
+                    } else {
+                        np_next = (uint64_t) np_try + 1;
+                    }
+                    if (np_next <= np_ok || np_next > LLAMA_MAX_SEQ) {
+                        break;
+                    }
+                    np_try = (uint32_t) np_next;
+                }
+                cparams->n_seq_max = np_ok;
+                cparams->n_ctx_kv  = (uint32_t) std::max<uint64_t>((uint64_t) np_ok * target, n_min);
+                LOG_INF("%s: automatic unified KV capacity = %u tokens for %u slots x %u avg "
+                        "(estimate %llu, %d probes, binding device %s)\n",
+                        __func__, cparams->n_ctx_kv, cparams->n_seq_max, target,
+                        (unsigned long long) np_est, probes,
+                        ggml_backend_dev_name(devs[bind]));
+                return COMMON_PARAMS_FIT_STATUS_SUCCESS;
+            }
+        }
+    }
+
+    // ---- fallback: pool-only secant over the probed slack ---------------------------------
+    // The capacity is smooth and nearly linear in n_ctx_kv, so two probed points predict the
+    // zero crossing and every further probe only refines it. Steps stay inside the bracket;
+    // bisection is the fallback when the interpolation stalls.
+    uint32_t x_ok  = n_min;   // fits: probed above
+    int64_t  s_ok  = slack_of(data);
+    uint32_t x_bad = 0;       // largest capacity known not to fit (0 = none yet)
+    int64_t  s_bad = 0;
+    uint32_t x_try = (uint32_t) std::min<uint64_t>(n_max, std::max<uint64_t>((uint64_t) n_min * 2, (uint64_t) n_min + 4096));
+    x_try = (uint32_t) (x_try / n_align * n_align);
+
+    int n_probes = 0;
+    for (int step = 0; step < 6 && x_try > x_ok; ++step) {
+        common_device_memory_data_vec d_try;
+        const bool fits = get_data(x_try, d_try);
+        const int64_t s_try = slack_of(d_try);
+        n_probes++;
+
+        if (fits) {
+            x_ok = x_try;
+            s_ok = s_try;
+            if (x_ok >= n_max) {
+                break;
+            }
+        } else {
+            x_bad = x_try;
+            s_bad = s_try;
+        }
+
+        uint64_t x_next;
+        if (x_bad > x_ok && s_ok > 0 && s_ok > s_bad) {
+            // secant: where the line through the two probes crosses zero slack
+            x_next = (uint64_t) x_ok + (uint64_t) ((__int128) s_ok * (x_bad - x_ok) / (s_ok - s_bad));
+        } else if (x_bad > x_ok) {
+            x_next = ((uint64_t) x_ok + x_bad) / 2;
+        } else {
+            x_next = std::min<uint64_t>(n_max, (uint64_t) x_ok * 2);   // no upper bound known yet
+        }
+        x_next = x_next / n_align * n_align;
+        if (x_bad > x_ok && x_next >= x_bad) {
+            x_next = ((uint64_t) x_ok + x_bad) / 2 / n_align * n_align;   // secant left the bracket
+        }
+        if (x_next <= x_ok) {
+            x_next = (uint64_t) x_ok + n_align;
+        }
+        if (x_next > n_max || x_next <= x_ok) {
             break;
         }
-
-        lo = next;
-        hi = next;
+        x_try = (uint32_t) x_next;
     }
 
-    if (hi == lo && hi == n_max) {
-        cparams->n_ctx_kv = lo;
-        return COMMON_PARAMS_FIT_STATUS_SUCCESS;
-    }
-
-    if (hi == lo) {
-        hi = std::min<uint32_t>(n_max, lo + n_align);
-    }
-
-    uint64_t lo_u = lo / n_align;
-    uint64_t hi_u = hi / n_align;
-
-    while (lo_u + 1 < hi_u) {
-        const uint64_t mid_u = lo_u + (hi_u - lo_u) / 2;
-        const uint32_t mid = (uint32_t) (mid_u * n_align);
-        if (get_data(mid, data)) {
-            lo_u = mid_u;
-        } else {
-            hi_u = mid_u;
+    cparams->n_ctx_kv = x_ok;
+    LOG_INF("%s: automatic unified KV capacity = %u tokens (%d secant probes)\n", __func__, cparams->n_ctx_kv, n_probes);
+    // ---- slots and pool ----------------------------------------------------------------
+    // Both slopes come from probes, and the solve is an interpolation between probed points
+    // rather than an extrapolation:
+    //   k_i    = (context(2*n_min) - context(n_min)) / n_min      KV bytes per token
+    //   slot_i = free(1 slot) - free(2 slots)                     per-slot state
+    // The pool must give every slot at least `target` tokens on average:
+    //   pool(np) = n_min + (room_i - (np-1)*slot_i) / k_i  >=  np * target
+    //   np       <= (room_i + n_min*k_i + slot_i) / (target*k_i + slot_i)
+    // The first np is then verified with a probe, and any correction interpolates between
+    // the last fitting np and the first failing one, so no probe is ever extrapolated.
+    if (n_probe > n_min) {
+        common_device_memory_data_vec data_np2;
+        if (get_data(n_min, data_np2, /*n_seq_max_override=*/2)) {
+            const uint32_t target = std::max<uint32_t>(n_align, n_ctx_seq / 2);
+            uint64_t np_hi   = UINT64_MAX;
+            size_t   bind    = devs.size();
+            for (size_t i = 0; i < devs.size(); ++i) {
+                const uint64_t kv_bytes = data_probe[i].context > data[i].context ?
+                    (uint64_t) (data_probe[i].context - data[i].context) : 0;
+                const uint64_t k_i = kv_bytes / (n_probe - n_min);
+                if (k_i == 0 || data[i].free <= 0) {
+                    continue;
+                }
+                const uint64_t slot_i = (uint64_t) std::max<int64_t>(data[i].free - data_np2[i].free, 0);
+                const uint64_t room_i = (uint64_t) data[i].free > FIT_KV_MARGIN ? (uint64_t) data[i].free - FIT_KV_MARGIN : 0;
+                const uint64_t np_i = (room_i + (uint64_t) n_min * k_i + slot_i) /
+                                      ((uint64_t) target * k_i + slot_i);
+                if (np_i < np_hi) {
+                    np_hi = np_i;
+                    bind  = i;
+                }
+            }
+            if (bind < devs.size() && np_hi >= 1) {
+                uint32_t np_ok  = 1;                                  // one slot always fits (probed)
+                uint32_t np_try = (uint32_t) std::min<uint64_t>(np_hi, LLAMA_MAX_SEQ);
+                uint32_t np_bad = 0;
+                int probes = 0;
+                for (int step = 0; step < 4 && np_try > np_ok; ++step) {
+                    const uint64_t pool_of = (uint64_t) np_try * target;
+                    common_device_memory_data_vec d_np;
+                    const bool fits = get_data((uint32_t) std::min<uint64_t>(pool_of, n_max), d_np, np_try);
+                    probes++;
+                    if (fits) {
+                        np_ok = np_try;
+                    } else {
+                        np_bad = np_try;
+                    }
+                    uint64_t np_next;
+                    if (np_bad > np_ok) {
+                        np_next = ((uint64_t) np_ok + np_bad) / 2;      // interpolate inside the bracket
+                    } else {
+                        np_next = (uint64_t) np_try + 1;
+                    }
+                    if (np_next <= np_ok || np_next > LLAMA_MAX_SEQ) {
+                        break;
+                    }
+                    np_try = (uint32_t) np_next;
+                }
+                cparams->n_seq_max = np_ok;
+                cparams->n_ctx_kv  = (uint32_t) std::max<uint64_t>((uint64_t) np_ok * target, n_min);
+                LOG_INF("%s: automatic unified KV capacity = %u tokens for %u slots x %u avg "
+                        "(%d slot probes, binding device %s)\n",
+                        __func__, cparams->n_ctx_kv, cparams->n_seq_max, target, probes,
+                        bind < devs.size() ? ggml_backend_dev_name(devs[bind]) : "?");
+                return COMMON_PARAMS_FIT_STATUS_SUCCESS;
+            }
         }
     }
-
-    cparams->n_ctx_kv = (uint32_t) (lo_u * n_align);
-    LOG_INF("%s: automatic unified KV capacity = %u tokens\n", __func__, cparams->n_ctx_kv);
 
     return COMMON_PARAMS_FIT_STATUS_SUCCESS;
 }
