@@ -2,10 +2,16 @@
 //
 // Standalone hardware verification benchmark for Vulkan 5-GPU P2P collective operations:
 //   1. Physical full-mesh DMA-BUF import/export between 5 discrete AMD GPUs (Navi 21 / RX 6800).
-//   2. Two-stage AllReduce (Phase 1: ReduceScatter PUSH -> Phase 2: Local compute sum + AllGather PUSH).
+//   2. Two-stage AllReduce (Phase 1: ReduceScatter PUSH -> Barrier -> Local compute sum -> Barrier -> Phase 2: AllGather PUSH).
 //   3. Mathematical correctness test: Rank i inputs float(i + 1) across all elements.
 //      Verification: Every single element across all 5 GPUs must strictly evaluate to 15.0f (0 mismatch).
-//   4. Multi-round latency benchmarking with full command buffer pre-recording (no per-layer CPU stall).
+//   4. Multi-round latency benchmarking with full timing (µs/AllReduce and total ms per token pass).
+//   5. Accurate accounting:
+//      Total vector size S = 40 KiB (10,240 FP32 elements)
+//      Slice per rank S/5  = 8 KiB (2,048 FP32 elements)
+//      Phase 1 sent: 4 * 8 KiB = 32 KiB per rank
+//      Phase 2 sent: 4 * 8 KiB = 32 KiB per rank
+//      Total sent per rank = 64 KiB (= 1.6 * S)
 
 #include <vulkan/vulkan.h>
 #include <iostream>
@@ -27,9 +33,9 @@
 
 const uint32_t NUM_GPUS = 5;
 const uint32_t NUM_ELEMENTS = 10240; // 40 KiB FP32
-const VkDeviceSize TOTAL_BYTES = NUM_ELEMENTS * sizeof(float);
-const uint32_t CHUNK_ELEMENTS = NUM_ELEMENTS / NUM_GPUS; // 2048 floats per rank
-const VkDeviceSize CHUNK_BYTES = CHUNK_ELEMENTS * sizeof(float); // 8192 B (8 KiB)
+const VkDeviceSize TOTAL_BYTES = NUM_ELEMENTS * sizeof(float); // 40,960 B (40 KiB)
+const uint32_t CHUNK_ELEMENTS = NUM_ELEMENTS / NUM_GPUS; // 2,048 floats per rank
+const VkDeviceSize CHUNK_BYTES = CHUNK_ELEMENTS * sizeof(float); // 8,192 B (8 KiB)
 
 struct GPUContext {
     VkPhysicalDevice physDev;
@@ -304,7 +310,7 @@ int main() {
     }
 
     // Record Two-Stage AllReduce:
-    // Phase 1: ReduceScatter
+    // Phase 1: ReduceScatter (Each rank sends 4 chunks of 8 KiB = 32 KiB sent per rank)
     VkCommandBufferBeginInfo beg = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     for (uint32_t i = 0; i < NUM_GPUS; ++i) {
         VK_CHECK(vkBeginCommandBuffer(ctx[i].cmdPhase1, &beg));
@@ -326,11 +332,11 @@ int main() {
         VK_CHECK(vkEndCommandBuffer(ctx[i].cmdPhase1));
     }
 
-    // Phase 2: Compute Sum + AllGather PUSH
+    // Phase 2: Compute Sum + AllGather PUSH (Each rank pushes reduced chunk of 8 KiB to 4 peers = 32 KiB sent per rank)
     for (uint32_t i = 0; i < NUM_GPUS; ++i) {
         VK_CHECK(vkBeginCommandBuffer(ctx[i].cmdPhase2, &beg));
 
-        // 1. Compute reduction sum
+        // 1. Compute reduction sum in local VRAM
         VkMemoryBarrier mb1 = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT };
         vkCmdPipelineBarrier(ctx[i].cmdPhase2, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb1, 0, nullptr, 0, nullptr);
 
@@ -343,7 +349,7 @@ int main() {
         VkMemoryBarrier mb2 = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT };
         vkCmdPipelineBarrier(ctx[i].cmdPhase2, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb2, 0, nullptr, 0, nullptr);
 
-        // 2. AllGather PUSH
+        // 2. AllGather PUSH: chunk i -> all 4 peers' finalBuf at chunk i
         VkBufferCopy agCpy = { (VkDeviceSize)i * CHUNK_BYTES, (VkDeviceSize)i * CHUNK_BYTES, CHUNK_BYTES };
         for (uint32_t j = 0; j < NUM_GPUS; ++j) {
             if (i == j) continue;
@@ -356,8 +362,8 @@ int main() {
         VK_CHECK(vkEndCommandBuffer(ctx[i].cmdPhase2));
     }
 
-    std::cout << "=== Running Two-Stage AllReduce with Stage Synchronization ===" << std::endl;
-    // Step 1: Phase 1
+    std::cout << "=== 1. Executing Two-Stage AllReduce with Stage Synchronization ===" << std::endl;
+    // Step 1: Phase 1 (ReduceScatter PUSH)
     for (uint32_t i = 0; i < NUM_GPUS; ++i) {
         VkSubmitInfo sub = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &ctx[i].cmdPhase1, 0, nullptr };
         VK_CHECK(vkQueueSubmit(ctx[i].queue, 1, &sub, ctx[i].fence));
@@ -367,7 +373,7 @@ int main() {
         VK_CHECK(vkResetFences(ctx[i].dev, 1, &ctx[i].fence));
     }
 
-    // Step 2: Phase 2
+    // Step 2: Phase 2 (Compute Sum + AllGather PUSH)
     for (uint32_t i = 0; i < NUM_GPUS; ++i) {
         VkSubmitInfo sub = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &ctx[i].cmdPhase2, 0, nullptr };
         VK_CHECK(vkQueueSubmit(ctx[i].queue, 1, &sub, ctx[i].fence));
@@ -378,6 +384,7 @@ int main() {
     }
 
     // Step 3: Strict mathematical verification across all 51,200 elements
+    std::cout << "\n=== 2. Mathematical Correctness Verification (All 51,200 elements) ===" << std::endl;
     size_t totalErrors = 0;
     for (uint32_t i = 0; i < NUM_GPUS; ++i) {
         VkCommandBuffer cb;
@@ -416,11 +423,50 @@ int main() {
     }
 
     if (totalErrors == 0) {
-        std::cout << "\n>>> 100% PERFECT ALLREDUCE VERIFICATION! ALL 51,200 ELEMENTS ARE 15.0 ACROSS ALL 5 GPUS! <<<" << std::endl;
+        std::cout << ">>> 100% PERFECT ALLREDUCE VERIFICATION! ALL 51,200 ELEMENTS ARE 15.0 ACROSS ALL 5 GPUS! <<<" << std::endl;
     } else {
-        std::cout << "\n>>> VERIFICATION FAILED: total errors = " << totalErrors << " <<<" << std::endl;
+        std::cout << ">>> VERIFICATION FAILED: total errors = " << totalErrors << " <<<" << std::endl;
         return 1;
     }
+
+    // Step 4: Multi-round Latency Benchmarking (100 runs)
+    std::cout << "\n=== 3. Latency Benchmarking (100 Iterations of True Two-Stage AllReduce) ===" << std::endl;
+    const int RUNS = 100;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int r = 0; r < RUNS; ++r) {
+        // Phase 1 (ReduceScatter)
+        for (uint32_t i = 0; i < NUM_GPUS; ++i) {
+            VkSubmitInfo sub = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &ctx[i].cmdPhase1, 0, nullptr };
+            vkQueueSubmit(ctx[i].queue, 1, &sub, ctx[i].fence);
+        }
+        for (uint32_t i = 0; i < NUM_GPUS; ++i) {
+            vkWaitForFences(ctx[i].dev, 1, &ctx[i].fence, VK_TRUE, UINT64_MAX);
+            vkResetFences(ctx[i].dev, 1, &ctx[i].fence);
+        }
+
+        // Phase 2 (Compute Sum + AllGather)
+        for (uint32_t i = 0; i < NUM_GPUS; ++i) {
+            VkSubmitInfo sub = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &ctx[i].cmdPhase2, 0, nullptr };
+            vkQueueSubmit(ctx[i].queue, 1, &sub, ctx[i].fence);
+        }
+        for (uint32_t i = 0; i < NUM_GPUS; ++i) {
+            vkWaitForFences(ctx[i].dev, 1, &ctx[i].fence, VK_TRUE, UINT64_MAX);
+            vkResetFences(ctx[i].dev, 1, &ctx[i].fence);
+        }
+    }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double total_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+    double per_ar_us = total_us / RUNS;
+
+    std::cout << "Data Accounting per AllReduce:" << std::endl;
+    std::cout << "  Total reconstructed vector (S)      : " << TOTAL_BYTES << " bytes (40 KiB)" << std::endl;
+    std::cout << "  Slice per rank (S/5)                : " << CHUNK_BYTES << " bytes (8 KiB)" << std::endl;
+    std::cout << "  Phase 1 sent (4 * S/5)              : " << 4 * CHUNK_BYTES << " bytes (32 KiB)" << std::endl;
+    std::cout << "  Phase 2 sent (4 * S/5)              : " << 4 * CHUNK_BYTES << " bytes (32 KiB)" << std::endl;
+    std::cout << "  Total data sent per rank (1.6 * S)  : " << 8 * CHUNK_BYTES << " bytes (64 KiB)" << std::endl;
+    std::cout << "Timing Results:" << std::endl;
+    std::cout << "  Latency per full Two-Stage AllReduce: " << std::fixed << std::setprecision(2) << per_ar_us << " µs" << std::endl;
+    std::cout << "  Cumulative 96 AllReduces per Token  : " << std::setprecision(2) << (per_ar_us * 96 / 1000.0) << " ms" << std::endl;
 
     return 0;
 }
