@@ -2379,16 +2379,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // allocated for the whole session.
     {
         const int phase = ubatch.n_tokens > ubatch.n_seqs ? 1 : 0;   // 1 = prompt processing
-        if (phase != last_graph_phase && ggml_backend_sched_phase_release_enabled()) {
+        if (phase != last_graph_phase) {
             if (last_graph_phase >= 0) {
-                auto * gf_phase = phase == 1
-                    ? graph_reserve(res_n_tokens_pp, res_n_seqs_pp, res_n_outputs_pp, mctx, false)
-                    : graph_reserve(res_n_seqs_tg, res_n_seqs_tg, res_n_seqs_tg, mctx, false);
-                if (gf_phase == nullptr) {
-                    LLAMA_LOG_ERROR("%s: failed to reserve %s buffers\n", __func__, phase == 1 ? "pp" : "tg");
-                    ret = GGML_STATUS_ALLOC_FAILED;
-                    return nullptr;
-                }
+                // Invalidate the previous graph result first: its tensors (the cached inputs of
+                // the phase that just ended, s_copy and friends among them) still point into the
+                // buffers that are about to be handed back, and a view over one of them is what
+                // the view bound assert catches. Only then release.
+                gf_res_prev->reset();
+                ggml_backend_sched_release_buffers(sched.get());
+                // No reserve here: the graph that is about to be built re-derives its own sizes,
+                // and the scheduler grows what it needs on the first graph of the new phase.
             }
             last_graph_phase = phase;
         }
@@ -4571,11 +4571,6 @@ ggml_cgraph * llama_context::graph_reserve(
     // reserving for one of them releases what the other was holding - that is the phased
     // behaviour, expressed through the reserve that already exists instead of a second mechanism.
     ggml_backend_sched_release_buffers(sched.get());
-    // Opt-in until every holder that outlives a ubatch (flashprefill plans, k_idxs, cached graph
-    // results) has been made to drop its tensors on the same boundary as well.
-    if (ggml_backend_sched_phase_release_enabled()) {
-        ggml_backend_sched_release_buffers(sched.get());
-    }
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this

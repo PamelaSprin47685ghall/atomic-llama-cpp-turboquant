@@ -790,11 +790,19 @@ void ggml_gallocr_buffer_pool_trim(ggml_gallocr_buffer_pool_t pool) {
                     need = n > need ? n : need;
                 }
             }
-            if (need == 0 || need >= cur) {
+            if (need >= cur) {
                 continue;
             }
+            // need == 0 means nothing needs this chunk at all any more: free it and let the next
+            // reserve allocate what its own graph asks for. Treating that case as "nothing to do"
+            // is what made the release a no-op.
             ggml_gallocr_buffer_pool_invalidate_chunk(pool, buf->chunks[c]);
             ggml_backend_buffer_free(buf->chunks[c]);
+            buf->chunks[c] = NULL;
+            if (need == 0) {
+                pool->generation++;
+                continue;   // nothing needs it; the next reserve allocates what its graph asks for
+            }
             buf->chunks[c] = ggml_backend_buft_alloc_buffer(pool->entries[e].buft, need);
             if (buf->chunks[c] == NULL) {
                 continue;   // the next reserve allocates it again

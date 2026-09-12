@@ -1854,7 +1854,19 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         data_size *= ne[i];
     }
 
-    GGML_ASSERT(view_src == NULL || data_size == 0 || data_size + view_offs <= ggml_nbytes(view_src));
+    if (!(view_src == NULL || data_size == 0 || data_size + view_offs <= ggml_nbytes(view_src))) {
+        // Name the offender instead of only aborting: the source tensor, its shape, and the view
+        // that was asked for. A phase change can leave a tensor pointing into a buffer that has
+        // already been handed back, and this is what tells which one it is.
+        GGML_ABORT("view over '%s' (type %s, ne=[%lld,%lld,%lld,%lld], nbytes=%zu) "
+                   "wants data_size=%zu at view_offs=%zu (n_dims=%d, ne=[%lld,%lld,%lld,%lld])",
+                ggml_get_name(view_src), ggml_type_name(view_src->type),
+                (long long) view_src->ne[0], (long long) view_src->ne[1],
+                (long long) view_src->ne[2], (long long) view_src->ne[3], ggml_nbytes(view_src),
+                data_size, view_offs, n_dims,
+                (long long) (n_dims > 0 ? ne[0] : 0), (long long) (n_dims > 1 ? ne[1] : 0),
+                (long long) (n_dims > 2 ? ne[2] : 0), (long long) (n_dims > 3 ? ne[3] : 0));
+    }
 
     void * data = view_src != NULL ? view_src->data : NULL;
     if (data != NULL) {

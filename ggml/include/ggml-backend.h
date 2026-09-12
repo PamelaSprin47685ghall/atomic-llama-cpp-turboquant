@@ -388,11 +388,6 @@ extern "C" {
     // graph. Call only after every reusable graph has been invalidated.
     GGML_API void                 ggml_backend_sched_release_buffers(ggml_backend_sched_t sched);
 
-    // Whether a reserve may release the compute buffers before re-deriving them. Off unless
-    // LLAMA_PHASE_RELEASE=1: tensors that outlive a ubatch (flashprefill plans, k_idxs, cached
-    // graph results) can still point into a released chunk, so this stays opt-in until each of
-    // those holders releases them on the same boundary.
-    GGML_API bool                 ggml_backend_sched_phase_release_enabled(void);
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);

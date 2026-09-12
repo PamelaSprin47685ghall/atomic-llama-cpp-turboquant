@@ -2090,17 +2090,16 @@ void ggml_backend_sched_release_buffers(ggml_backend_sched_t sched) {
     std::lock_guard<std::recursive_mutex> lock(sched->compute_pool->mutex);
     ggml_gallocr_release_buffers(sched->galloc);
     sched->is_alloc = false;
-    sched->is_reset = false;   // the next graph must re-carve its tensors
+    // Forget the backend ids and the copy tensors as well: those copies live in the buffers that
+    // were just handed back, and a stale entry here is a tensor whose data is gone - which shows
+    // up as a view over a source that no longer covers it. This is the same invalidation
+    // ggml_backend_sched_reset performs, so the next graph re-creates what it needs.
+    ggml_hash_set_reset(&sched->hash_set);
+    memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+    memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+    sched->is_reset = true;
 }
 
-// Whether a reserve may hand the compute buffers back before re-deriving them. Off by default:
-// with reuse across ubatches (flashprefill plans, k_idxs, cached graph results) some tensor can
-// still point into a released chunk, which shows up as a view over a source that is too small.
-// The mechanism is in place so the remaining holders can be found and fixed one by one.
-bool ggml_backend_sched_phase_release_enabled() {
-    const char * env = getenv("LLAMA_PHASE_RELEASE");
-    return env != nullptr && env[0] == '1' && env[1] == '\0';
-}
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
     GGML_ASSERT(sched);
