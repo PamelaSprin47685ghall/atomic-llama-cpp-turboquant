@@ -2197,12 +2197,14 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
 // driver's own allocations and transients. Measured on the 5x RX 6800 box - below the
 // driver's eviction watermark it migrates pages to system memory and throughput collapses:
 // free ~2.0-2.6 GiB -> 21-22 tok/s, free ~0.25 GiB -> 1.85 tok/s (9 GiB migrated per card).
-// Measured on the 5x RX 6800 box: at a 393216-token pool the loosest card keeps ~430 MiB free
-// while the tightest is over by ~264 MiB - and the driver migrates whole buffers, so that
-// shortfall costs two ~800 MiB KV layers pushed into system memory (GTT 1569 MiB on that card,
-// 14 MiB on the others). The margin has to cover the migration granularity, not just the
-// arithmetic difference: 2 GiB leaves every card room for another layer-sized buffer.
-static constexpr uint64_t FIT_KV_MARGIN = 2ull << 30; // 2 GiB
+// Working margin per device. It used to be 1.5-2 GiB because a pool that did not fit lost whole
+// KV-sized buffers to system memory. That no longer applies: the compute buffers of a phase are
+// released when the other phase starts (see llama_context::process_ubatch), which gives every
+// card several gigabytes back, measured 12093-13198 MiB in use after a prefill where the pool
+// alone had pushed it to 15721-16296. What is left is the driver's own transient need, so the
+// margin is small again - and a small margin is what lets the fit fill the cards instead of
+// leaving the space the driver never asked for.
+static constexpr uint64_t FIT_KV_MARGIN = 512ull << 20; // 512 MiB
 
 common_params_fit_status common_fit_kv_cache(
                          const char * path_model,
@@ -2489,6 +2491,19 @@ common_params_fit_status common_fit_kv_cache(
     try {
         // Dry run of the production loader as the budget measurement: buffers are reserved but
         // never filled (load mode NONE), one decode allocates the graph/compute buffers, and the
+        // Budget base, read before any probe touches the driver. A probe allocates and frees the
+        // whole model, and how much of that the driver keeps is not predictable from here - which
+        // is why two runs of one configuration used to disagree (393216 against 655360). The
+        // kernel counters at this point are the ones a real load starts from.
+        free_base.assign(devs.size(), 0);
+        for (size_t i = 0; i < devs.size(); ++i) {
+            uint64_t vram_free  = 0;
+            uint64_t vram_total = 0;
+            if (common_fit_device_vram(devs[i], vram_free, vram_total)) {
+                free_base[i] = (int64_t) vram_free;
+            }
+        }
+
         // probe reports the real free memory plus the measured cost, releasing both again. This
         // is the only probe that allocates; the search below stays on no_alloc probes.
         data = common_get_device_memory_data(path_model, mparams, &baseline, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level, /*no_alloc=*/false);
@@ -2555,6 +2570,34 @@ common_params_fit_status common_fit_kv_cache(
         return COMMON_PARAMS_FIT_STATUS_FAILURE;
     }
 
+    // Validity oracle for the probes. A candidate that does not fit does not lower the device's
+    // free memory the way the cost model says: its buffers move to system memory instead, and the
+    // device-side numbers then look *better*. Measured: a 1703936-token probe reported a 24.9 GiB
+    // context and a positive slack, because the memory had already left the card. So a probe that
+    // moves the device-local GTT above its baseline is not a measurement of a feasible point - it
+    // is the edge - and the candidate belongs on the failing side.
+    std::vector<uint64_t> gtt_base;
+    const auto gtt_moved = [&]() {
+        for (size_t i = 0; i < devs.size(); ++i) {
+            uint64_t gtt = 0;
+            if (!common_fit_device_gtt(devs[i], gtt)) {
+                continue;
+            }
+            if (i >= gtt_base.size()) {
+                gtt_base.resize(i + 1, 0);
+            }
+            if (gtt_base[i] == 0) {
+                gtt_base[i] = gtt;
+                continue;
+            }
+            if (gtt > gtt_base[i] + (64ull << 20)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    gtt_moved();   // baseline: the state before the first probe
+
     // Resolve the per-sequence context from the model's training context when the
     // user did not specify -c.  This mirrors llama_context's own resolution and
     // makes the value visible to common_dynamic_recurrent_target after we return.
@@ -2590,15 +2633,18 @@ common_params_fit_status common_fit_kv_cache(
     // to reach, i.e. n_ctx_seq), so it is never traded away here. The number of slots is what the
     // solve below spends the remaining memory on, with n_ctx_seq/2 per slot as the average floor.
 
-    // Budget base, read now, before anything is loaded: the cards are idle here. A reading taken
-    // after a probe picks up the driver's pooled leftovers, and every later candidate is then
-    // rejected against a shrunken number (measured: 12.3 GiB free against a real 17.1 GiB).
-    free_base.assign(devs.size(), 0);
-    for (size_t i = 0; i < devs.size(); ++i) {
-        uint64_t vram_free  = 0;
-        uint64_t vram_total = 0;
-        if (common_fit_device_vram(devs[i], vram_free, vram_total)) {
-            free_base[i] = (int64_t) vram_free;
+    // Fallback only: the base was read before the first probe, and that reading is the reference.
+    // A reading taken here - after probes have allocated and freed the whole model - depends on
+    // what the driver decided to keep, which is exactly what made two runs of one configuration
+    // disagree (393216 against 655360).
+    if (free_base.empty()) {
+        free_base.assign(devs.size(), 0);
+        for (size_t i = 0; i < devs.size(); ++i) {
+            uint64_t vram_free  = 0;
+            uint64_t vram_total = 0;
+            if (common_fit_device_vram(devs[i], vram_free, vram_total)) {
+                free_base[i] = (int64_t) vram_free;
+            }
         }
     }
 
@@ -2714,54 +2760,59 @@ common_params_fit_status common_fit_kv_cache(
                 uint32_t np_try = (uint32_t) std::min<uint64_t>(np_est, LLAMA_MAX_SEQ);
                 int      probes = 0;
                 int      spilled = 0;   // system-memory spills tolerated while bracketing
+                uint64_t prev_interval = UINT64_MAX;   // for the Brent stall rule below
                 for (int step = 0; step < 8 && np_try > np_ok; ++step) {
                     const uint64_t pool_try = std::min<uint64_t>((uint64_t) np_try * target, n_max);
                     common_device_memory_data_vec d_np;
-                    // Gate before probing. On this box a probe that does not fit is paid for in
-                    // system memory: measured 5 GiB of growing Shmem plus 19 GiB of GTT against a
-                    // card with 657 MiB free, which is the road to the OOM that took the machine
-                    // down. So a candidate whose predicted KV (from the measured slope) plus the
-                    // last measured graph cost does not fit is failed here without allocating it,
-                    // and the interpolation still gets a bound to work with.
-                    bool    gated  = false;
-                    int64_t s_gate = INT64_MAX;
-                    for (size_t i = 0; i < devs.size() && i < data.size(); ++i) {
-                        // Slope from the two capacities that were measured: bytes of KV per token
-                        // on this device. Zero means the probing did not see this device grow, and
-                        // then only its fixed costs are counted.
-                        const uint64_t slope = (n_probe > n_min && i < data_probe.size() &&
-                                                data_probe[i].context > data[i].context)
-                                             ? (data_probe[i].context - data[i].context) / (n_probe - n_min) : 0;
-                        const uint64_t pred_ctx = slope * (pool_try > n_min ? pool_try - n_min : 0);
-                        const uint64_t need     = pred_ctx + data[i].context + data[i].compute;
-                        const int64_t  free_i   = i < free_base.size() ? free_base[i] : (int64_t) data[i].free;
-                        s_gate = std::min(s_gate, free_i - (int64_t) need);
-                    }
-                    if (s_gate < -(int64_t) (512ull << 20)) {
-                        gated = true;
-                        LOG_WRN("%s: %u slots x %llu tokens refused before probing (predicted slack %lld MiB)\n",
-                                __func__, np_try, (unsigned long long) pool_try, (long long) (s_gate >> 20));
-                    }
+
                     // The verification probe is dry, not metadata-only: it allocates exactly as the
                     // real load will (same buffers, same offload) and skips only the transfer, so
                     // the free memory it reports is the one the real load gets. Extrapolating the
                     // pool's cost from a single slope is what kept missing by 1-2 GiB per device
                     // (measured increment 842 MiB predicted vs 2062 MiB real on Vulkan2).
                     bool fits = false;
-                    if (!gated) {
-                        try {
-                            llama_context_params test = *cparams;
-                            test.n_ctx_kv  = (uint32_t) pool_try;
-                            test.n_seq_max = np_try;
-                            d_np = common_get_device_memory_data(path_model, mparams, &test, devs,
-                                                                 hp_ngl, hp_n_ctx_train, hp_n_expert, log_level, /*no_alloc=*/false);
-                            fits = !d_np.empty() && slack_of(d_np) >= 0;
-                        } catch (const std::exception & e) {
-                            LOG_WRN("%s: dry probe (%u slots, %llu tokens) failed: %s\n",
-                                    __func__, np_try, (unsigned long long) pool_try, e.what());
+                    // Every candidate is placed, never predicted. A number that comes from the cost
+                    // model past the edge is not a measurement - and a fit that decides on those
+                    // gave two different answers for one configuration (9 slots in the KV pass, 7
+                    // in the next). The probe is safe because it allocates like a real load and
+                    // releases again, and the host breaker stops it if the system starts paying.
+                    try {
+                        llama_context_params test = *cparams;
+                        test.n_ctx_kv  = (uint32_t) pool_try;
+                        test.n_seq_max = np_try;
+                        const uint64_t shmem_before = common_fit_shmem_kb();
+                        d_np = common_get_device_memory_data(path_model, mparams, &test, devs,
+                                                             hp_ngl, hp_n_ctx_train, hp_n_expert, log_level, /*no_alloc=*/false);
+                        fits = !d_np.empty() && slack_of(d_np) >= 0;
+                        // A probe that overflows its cards puts the surplus in system memory, and it
+                        // takes it back when the probe ends - which is why device counters read
+                        // normal afterwards and cannot classify the candidate. Host Shmem is where
+                        // that memory lands and stays measurable: a probe that grows it is the
+                        // edge, and its slack is the number that is not a measurement.
+                        // Clamp: a probe may also *release* host memory the previous one left behind,
+                        // and a negative delta read as unsigned is a nonsense number (it printed as
+                        // 1.8e16 MiB before). Only growth is evidence of an overflow.
+                        const uint64_t shmem_after  = common_fit_shmem_kb();
+                        const uint64_t shmem_growth = shmem_after > shmem_before ? shmem_after - shmem_before : 0;
+                        if (shmem_growth > (64ull << 10)) {   // > 64 MiB
+                            LOG_WRN("%s: probe (%u slots, %llu tokens) grew host Shmem by %llu MiB - not a feasible point\n",
+                                    __func__, np_try, (unsigned long long) pool_try,
+                                    (unsigned long long) (shmem_growth >> 10));
+                            fits = false;
                         }
+                    } catch (const std::exception & e) {
+                        LOG_WRN("%s: dry probe (%u slots, %llu tokens) failed: %s\n",
+                                __func__, np_try, (unsigned long long) pool_try, e.what());
                     }
-                    const int64_t s_try = gated ? s_gate : slack_of(d_np);
+                    // The bound for the interpolation comes from this probe's own measurement,
+                    // never from a prediction.
+                    const int64_t s_try = slack_of(d_np);
+                    if (gtt_moved()) {
+                        // Not a feasible point (see gtt_moved): the device's own counters moved, so
+                        // this candidate is the edge and goes on the failing side. Its slack is not
+                        // used - that is the number that is not a measurement.
+                        fits = false;
+                    }
                     probes++;
                     if (gtt_spilled()) {
                         // Past the edge: take it as the failing bound and interpolate down. Only
@@ -2785,15 +2836,36 @@ common_params_fit_status common_fit_kv_cache(
                         s_bad  = s_try;
                     }
                     uint64_t np_next;
-                    if (np_bad > np_ok && s_ok > 0 && s_ok > s_bad) {
-                        // interpolate where the probed slack crosses zero, inside the bracket
-                        np_next = (uint64_t) np_ok + (uint64_t) ((__int128) s_ok * (np_bad - np_ok) / (s_ok - s_bad));
-                    } else if (np_bad > np_ok) {
-                        np_next = ((uint64_t) np_ok + np_bad) / 2;
+                    // One-sided oracle: a probe that does not fit yields only "no" - a slack measured
+                    // past the edge belongs to a configuration that could not be placed, so it is not
+                    // a number to fit a line through. The line therefore comes from the feasible
+                    // measurements alone: two of them give the marginal cost per slot, and where that
+                    // line reaches zero is the edge. Safeguard (the Illinois idea for this shape of
+                    // oracle): keep the step strictly inside the bracket, and bisect whenever the
+                    // extrapolation would not move it - an endpoint that keeps repeating has to be
+                    // given up on, which is what makes false position stall in the first place.
+                    if (np_bad > np_ok) {
+                        if (np_ok > np_prev && s_prev > s_ok) {
+                            np_next = (uint64_t) np_ok + (uint64_t) ((__int128) s_ok * (np_ok - np_prev) / (s_prev - s_ok));
+                        } else {
+                            np_next = ((uint64_t) np_ok + np_bad) / 2;
+                        }
+                        if (np_next <= np_ok || np_next >= np_bad) {
+                            np_next = ((uint64_t) np_ok + np_bad) / 2;
+                        }
+                        // Stall safeguard (the Brent rule): a step that did not halve the bracket
+                        // counts as no progress, so the next one bisects. Without it an extrapolation
+                        // that keeps returning the same interior point can stall the search, which is
+                        // the classic failure of false position on one-sided data.
+                        const uint64_t interval = np_bad - np_ok;
+                        if (interval > 2 && interval * 2 > prev_interval) {
+                            np_next = ((uint64_t) np_ok + np_bad) / 2;
+                        }
+                        prev_interval = np_next > np_ok ? np_bad - np_next : interval;
                     } else {
-                        // both probed points fit, so extrapolate where the measured slack line
-                        // hits zero: the dry probes are cheap and this converges to the ceiling
-                        // instead of stepping one slot at a time.
+                        // Nothing has failed yet, so the edge is only known to be above: extrapolate
+                        // where the feasible line reaches zero, or step one slot when there is not
+                        // yet a second feasible point to draw it through.
                         if (np_ok > np_prev && s_prev > s_ok) {
                             np_next = (uint64_t) np_prev + (uint64_t) ((__int128) s_prev * (np_ok - np_prev) / (s_prev - s_ok));
                         } else {
