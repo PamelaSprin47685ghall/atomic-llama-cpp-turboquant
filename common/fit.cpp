@@ -2197,7 +2197,12 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
 // driver's own allocations and transients. Measured on the 5x RX 6800 box - below the
 // driver's eviction watermark it migrates pages to system memory and throughput collapses:
 // free ~2.0-2.6 GiB -> 21-22 tok/s, free ~0.25 GiB -> 1.85 tok/s (9 GiB migrated per card).
-static constexpr uint64_t FIT_KV_MARGIN = 3ull << 29; // 1.5 GiB
+// Measured on the 5x RX 6800 box: at a 393216-token pool the loosest card keeps ~430 MiB free
+// while the tightest is over by ~264 MiB - and the driver migrates whole buffers, so that
+// shortfall costs two ~800 MiB KV layers pushed into system memory (GTT 1569 MiB on that card,
+// 14 MiB on the others). The margin has to cover the migration granularity, not just the
+// arithmetic difference: 2 GiB leaves every card room for another layer-sized buffer.
+static constexpr uint64_t FIT_KV_MARGIN = 2ull << 30; // 2 GiB
 
 common_params_fit_status common_fit_kv_cache(
                          const char * path_model,
