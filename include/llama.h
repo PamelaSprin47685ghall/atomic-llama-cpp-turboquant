@@ -1029,6 +1029,12 @@ extern "C" {
     // If data == true, the data buffers will also be cleared together with the metadata
     // Legacy entry: logs an explicit refusal and returns unchanged on
     // failure. Never throws.
+    // Back every buffer of the context's memory in device memory. A driver that allocates lazily
+    // (RADV does) reserves those buffers but only backs them when they are written, so a
+    // measurement that skips this sees a footprint the real work does not have. The automatic
+    // capacity fit calls this in its dry probes so that what it measures is what a load gets.
+    LLAMA_API void llama_memory_materialize(struct llama_context * ctx);
+
     LLAMA_API void llama_memory_clear(
             llama_memory_t mem,
                       bool data);

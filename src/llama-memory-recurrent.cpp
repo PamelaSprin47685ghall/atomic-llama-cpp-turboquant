@@ -559,6 +559,17 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_brea
     return ret;
 }
 
+// See llama_memory_i::materialize: the recurrent state is as lazily backed as the attention
+// cache, and a probe that leaves it untouched measures a footprint the real run does not have.
+void llama_memory_recurrent::materialize() const {
+    for (const auto & [_, buf] : ctxs_bufs) {
+        // Same as the KV cache: these are multi-buffers, so no base check (see there).
+        if (buf) {
+            ggml_backend_buffer_clear(buf.get(), 0);
+        }
+    }
+}
+
 llama_memory_context_ptr llama_memory_recurrent::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
         balloc.split_reset();

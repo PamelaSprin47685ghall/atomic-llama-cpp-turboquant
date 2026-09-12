@@ -1221,6 +1221,22 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() 
     return ret;
 }
 
+// Back the whole cache in device memory. A driver that allocates lazily (RADV does) reserves
+// these buffers at creation but only backs them when they are written, so a probe that never
+// fills the cache measures a footprint the real run does not have - and the pool it accepted
+// then gets pushed out of VRAM into system memory the moment a request writes it. Touching
+// every byte here makes a probe's numbers the ones the real load will see.
+void llama_kv_cache::materialize() const {
+    for (const auto & [ctx, buf] : ctxs_bufs) {
+        // No base check: the cache buffers are multi-buffers, whose base is deliberately not
+        // defined, and the clear handler covers exactly that case. Guarding on the base is what
+        // made this whole function a no-op.
+        if (buf) {
+            ggml_backend_buffer_clear(buf.get(), 0);
+        }
+    }
+}
+
 bool llama_kv_cache::reserve_hot_slots(slot_info_vec_t & sinfos,
                                         const std::vector<llama_ubatch> & ubatches,
                                         std::vector<llama_xkv::xkv_hot_reservation> & out_reservations,

@@ -1023,6 +1023,15 @@ llama_context::llama_context(
 
     LLAMA_LOG_INFO("%s: n_seq_max     = %u\n",   __func__, cparams.n_seq_max);
     LLAMA_LOG_INFO("%s: n_seq_recur   = %u\n",   __func__, cparams.n_seq_recurrent);
+    // Every parameter that decides the memory layout, on one line: when two invocations with the
+    // same KV capacity behave differently (one keeps its pool in VRAM, the other pushes KV-sized
+    // buffers into GTT), the difference is inside this set - printing it turns that comparison
+    // into a diff instead of a guess.
+    LLAMA_LOG_INFO("%s: layout: n_ctx=%u n_ctx_seq=%u n_ctx_kv=%u n_seq_max=%u n_seq_max_pp=%u "
+                   "n_seq_recurrent=%u n_batch=%u n_ubatch=%u kv_unified=%d op_offload=%d offload_kqv=%d\n",
+                   __func__, cparams.n_ctx, cparams.n_ctx_seq, cparams.n_ctx_kv, cparams.n_seq_max,
+                   cparams.n_seq_max_pp, cparams.n_seq_recurrent, cparams.n_batch, cparams.n_ubatch,
+                   (int) cparams.kv_unified, (int) cparams.op_offload, (int) cparams.offload_kqv);
     LLAMA_LOG_INFO("%s: n_ctx         = %u\n",   __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_ctx_seq     = %u\n",   __func__, cparams.n_ctx_seq);
     LLAMA_LOG_INFO("%s: n_ctx_kv      = %u\n",   __func__, cparams.n_ctx_kv);
@@ -1690,6 +1699,12 @@ uint32_t llama_context::n_ctx_seq() const {
 
 uint32_t llama_context::n_ctx_kv() const {
     return cparams.n_ctx_kv;
+}
+
+void llama_context::materialize_memory() const {
+    if (memory) {
+        memory->materialize();
+    }
 }
 
 uint32_t llama_context::n_batch() const {
@@ -6259,6 +6274,15 @@ uint32_t llama_n_ctx_seq(const llama_context * ctx) {
 
 uint32_t llama_n_ctx_kv(const llama_context * ctx) {
     return ctx->n_ctx_kv();
+}
+
+// Back the whole memory in device memory: a lazily allocating driver reserves those buffers but
+// only backs them when they are written, so a measurement that skips this sees a footprint the
+// real work does not have (see llama_memory_i::materialize).
+void llama_memory_materialize(struct llama_context * ctx) {
+    if (ctx != nullptr) {
+        ctx->materialize_memory();
+    }
 }
 
 uint32_t llama_n_batch(const llama_context * ctx) {

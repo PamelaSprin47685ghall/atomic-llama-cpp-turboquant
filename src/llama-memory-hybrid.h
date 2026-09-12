@@ -138,6 +138,8 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+    // Back every buffer of both halves (attention cache and recurrent state) in device memory.
+    void materialize() const override;
 
     // state write/load
 

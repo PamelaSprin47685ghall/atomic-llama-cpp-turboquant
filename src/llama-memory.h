@@ -222,6 +222,11 @@ public:
     virtual bool get_can_shift() const = 0;
 
     virtual uint32_t get_kv_capacity() const { return 0; }
+    // Touch every buffer this memory owns, so a driver that allocates lazily backs it now.
+    // The fit's dry probe needs this: without it a probe measures a pool that is reserved but
+    // not yet resident, accepts a capacity the real load cannot hold, and the difference shows
+    // up later as KV-sized allocations pushed out of VRAM into system memory (GTT).
+    virtual void materialize() const {}
     virtual uint32_t get_kv_used()     const { return 0; }
     virtual uint32_t get_kv_seq_used(llama_seq_id seq_id) const { GGML_UNUSED(seq_id); return 0; }
 

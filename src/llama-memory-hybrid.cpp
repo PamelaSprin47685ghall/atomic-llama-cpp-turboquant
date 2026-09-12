@@ -403,6 +403,13 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
     return mb;
 }
 
+// Both halves, because a probe has to see the real footprint of both: the attention cache and the
+// recurrent state are backed lazily by the driver just like everything else.
+void llama_memory_hybrid::materialize() const {
+    mem_attn->materialize();
+    mem_recr->materialize();
+}
+
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         mem_attn->state_write(io, seq_id, flags);

@@ -1180,6 +1180,13 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     std::vector<size_t> free_after_decode(nd, 0);
     if (!no_alloc) {
         std::vector<size_t> free_before(nd, 0);
+        // Back the whole memory before taking the baseline: a lazily allocating driver (RADV)
+        // reserves the cache but only backs it when written, so a probe that skips this measures
+        // a pool that is not resident - and then accepts a capacity the real load cannot hold,
+        // which shows up as KV-sized allocations pushed out of VRAM into system memory (GTT).
+        // With this, what a dry probe measures is what a real load gets, and a candidate that
+        // cannot hold its own pool fails here instead of in production.
+        llama_memory_materialize(ctx);
         for (size_t i = 0; i < nd; i++) {
             size_t total_tmp = 0;
             ggml_backend_dev_memory(llama_model_get_device(model, i), &free_before[i], &total_tmp);

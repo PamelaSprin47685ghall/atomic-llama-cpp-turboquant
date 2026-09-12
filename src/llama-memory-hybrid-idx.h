@@ -63,6 +63,8 @@ public:
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+    // Both halves of the hybrid plus the indexer cache.
+    void materialize() const override;
 
     // state write/load
 

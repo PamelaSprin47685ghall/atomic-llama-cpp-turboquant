@@ -295,6 +295,9 @@ public:
     int32_t               get_attn_rot_k_nrot() const;
     int32_t               get_attn_rot_v_nrot() const;
     const std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> & get_ctxs_bufs() const { return ctxs_bufs; }
+
+    // Back every cache buffer in device memory (see llama_memory_i::materialize).
+    void materialize() const override;
     std::vector<ggml_context *> get_buffer_contexts() const;
     uint32_t              get_stream_for_seq(llama_seq_id seq_id) const;
     bool                  validate_seq_id(llama_seq_id seq_id) const;

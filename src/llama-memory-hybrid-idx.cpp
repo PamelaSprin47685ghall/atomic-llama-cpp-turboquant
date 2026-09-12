@@ -221,6 +221,15 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
     return mb;
 }
 
+// The indexer mirrors the attention cache, so it has to be backed too (see
+// llama_memory_i::materialize).
+void llama_memory_hybrid_idx::materialize() const {
+    llama_memory_hybrid::materialize();
+    if (mem_idx) {
+        mem_idx->materialize();
+    }
+}
+
 void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     llama_memory_hybrid::state_write(io, seq_id, flags);
 

@@ -75,6 +75,8 @@ struct llama_context {
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
     uint32_t n_ctx_kv()  const;
+    // Back the whole memory in device memory (see llama_memory_i::materialize).
+    void materialize_memory() const;
     uint32_t n_batch()   const;
     uint32_t n_ubatch()  const;
     uint32_t n_seq_max() const;

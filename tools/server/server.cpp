@@ -182,17 +182,20 @@ int llama_server(common_params & params, int argc, char ** argv) {
         if (params.n_parallel < 0) {
             const bool dynamic_kv = params.n_ctx_kv_auto || params.n_ctx_kv > 0;
             params.n_parallel = dynamic_kv ? (int) llama_max_parallel_sequences() : 4;
-            // Prompt processing is serial by design: it is the phase whose graph is large, and the
-            // two phases never overlap, so it reserves and admits exactly one sequence at a time
-            // (a0c798b51 set this unconditionally). Letting it follow n_parallel with a fixed KV
-            // capacity let the server admit several prompts at once - measured: five concurrent
-            // 10k-token prefills took the Vulkan device down (vk::Queue::submit: ErrorDeviceLost)
-            // with the queue reporting decode() failures afterwards.
-            params.n_parallel_pp = 1;
             params.kv_unified = true;
 
             SRV_TRC("n_parallel is set to auto, using n_parallel = %d and kv_unified = true\n", params.n_parallel);
         }
+
+        // Prompt processing is serial by design, whatever the slot count: it is the phase whose
+        // graph is large, the two phases never overlap, and the server admits one prompt at a time
+        // (a0c798b51 set this unconditionally). Leaving it at 0 makes n_seq_max_pp fall back to
+        // n_parallel, and with -np given the auto branch above never runs at all: measured, a
+        // pinned 5-slot configuration then reserved its prompt-processing graph for five sequences
+        // - 1591/1044/1045 MiB per card pushed out of VRAM into GTT at load, against 14 MiB for the
+        // same capacity when the slot count was left to the fit - and five concurrent prefills
+        // took the Vulkan device down.
+        params.n_parallel_pp = 1;
     }
 
     // for consistency between server router mode and single-model mode, we set the same model name as alias
