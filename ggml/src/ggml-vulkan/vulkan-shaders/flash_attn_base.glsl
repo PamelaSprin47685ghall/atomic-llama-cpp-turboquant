@@ -316,6 +316,13 @@ void gqaStore(const in uint32_t r, const in uint32_t c, const in O_TYPEV4 elems,
 // get_fa_spec_constants): 0 = ordinary FA (default, so existing pipelines keep
 // working unchanged), 1 = RERoT-DDVR path (entry point rerot_main).
 layout (constant_id = 16) const uint32_t RerotMode = 0;
+// constant_id 17 selects the native sparse path (sparse_main, same file).
+// 0 = dense (default; existing pipelines keep working unchanged),
+// 1 = sparse per-query mask compaction (PR27970): bindings 0..6 identical to
+// ordinary FA, binding 7 carries the on-device compacted mask buffer
+// (aliased with RE_ENTRIES: identical binding/indexing/type, disjoint at
+// runtime since SparseMode and RerotMode are never set together).
+layout (constant_id = 17) const uint32_t SparseMode = 0;
 
 // Q-group views (F32). Aliased at bindings 0/1/2 exactly like the quant views
 // in flash_attn_dequant.glsl; unique block names keep them distinct.
@@ -332,6 +339,13 @@ layout (binding = 2) readonly buffer RV_F16V4 { f16vec4   rerot_vv4[]; };
 // range (one global softmax per range).
 layout (binding = 7) readonly buffer RE_ENTRIES { int rerot_entries[]; };
 layout (binding = 8) readonly buffer RO_OFFSETS { int rerot_offsets[]; };
+// Compacted sparse-mask buffer (PR27970): layout [a_0, ..., a_{R-1} |
+// per row (k_idx0, m_bits0), (k_idx1, m_bits1), ...] where R = distinct mask
+// rows, a_r >= 0 is the active count and -1 signals overflow (the kernel
+// must fall back to dense iteration over 0..KV-1 for that row). Same binding
+// and int element type as RE_ENTRIES (fresh names to satisfy GLSL multi-
+// block rules); RE_ENTRIES is dead when SparseMode == 1.
+layout (binding = 7) readonly buffer SM_ENTRIES { int sparse_meta[]; };
 
 // Defined by flash_attn_dequant.glsl (included after this file in scalar
 // modules); declared here so rerot_main() below can reference it. Modules
@@ -1015,5 +1029,9 @@ void rerot_main() {
         data_o[lm_base + Nflat] = D_TYPE(Mf);
     }
 }
+
+#if !defined(MMQ) && !defined(FLOAT16)
+void sparse_main();
+#endif
 
 #endif // !defined(COOPMAT) && !defined(GL_NV_cooperative_matrix2)

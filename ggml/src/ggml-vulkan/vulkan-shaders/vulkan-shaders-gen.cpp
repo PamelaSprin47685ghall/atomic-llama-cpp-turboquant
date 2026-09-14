@@ -923,6 +923,7 @@ void process_shaders() {
     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
+    string_to_spv("flash_attn_sparse_compact", "flash_attn_sparse_compact.comp", {});
 
     // FlashPrefill V2 (single F32 variant per op; K/V runtime specialization
     // via FaTypeK/V + FaBlockBytes spec constants like FA, no coopmat dupes).
@@ -931,6 +932,11 @@ void process_shaders() {
     string_to_spv("flashprefill_select", "flashprefill_select.comp", {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV4", "vec4"}, {"DATA_A_IQ4_NL", "1"}});
     string_to_spv("flashprefill_attn", "flashprefill_attn.comp", {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV4", "vec4"}, {"DATA_A_IQ4_NL", "1"}});
     string_to_spv("flashprefill_merge", "flashprefill_merge.comp", {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV4", "vec4"}});
+
+    // TP5 collective transport (TP5.md T12): mesh sum + canonical F16 wire pack.
+    string_to_spv("tp5_sum_f32", "tp5_sum_f32.comp", {});
+    string_to_spv("tp5_sum_f16", "tp5_sum_f16.comp", {});
+    string_to_spv("tp5_pack_f16", "tp5_pack_f16.comp", {});
 
     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});
     string_to_spv("quantize_q8_1_subgroup", "quantize_q8_1.comp", {{"USE_SUBGROUPS", "1"}});

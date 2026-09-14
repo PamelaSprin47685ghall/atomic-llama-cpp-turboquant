@@ -91,6 +91,14 @@ void main() {
         return;
     }
 
+#if !defined(MMQ) && !defined(FLOAT16)
+    // Sparse attention uses constant-folded branch to sparse_main when SparseMode == 1.
+    if (SparseMode == 1u) {
+        sparse_main();
+        return;
+    }
+#endif
+
 #ifdef NEEDS_INIT_IQ_SHMEM
     if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
         init_iq_shmem(gl_WorkGroupSize);
@@ -780,3 +788,382 @@ void main() {
         }
     }
 }
+
+#if !defined(MMQ) && !defined(FLOAT16)
+FLOAT_TYPEV4 sparse_load_k(uint key, uint d, uint k_stride, uint k_offset) {
+    if (USE_DECODE_K == false) {
+#if !defined(DATA_A_TURBO3_0)
+        return FLOAT_TYPEV4(data_kv4[k_offset / 4u + key * k_stride / 4u + d]);
+#else
+        return FLOAT_TYPEV4(0.0);
+#endif
+    }
+    uint coord = key * k_stride * BLOCK_SIZE_K + 4u * d;
+    return dequantize4(coord / BLOCK_SIZE_K, coord % BLOCK_SIZE_K, k_offset, BINDING_IDX_K);
+}
+
+FLOAT_TYPEV4 sparse_load_v(uint key, uint d, uint v_stride, uint v_offset) {
+    if (USE_DECODE_V == false) {
+#if !defined(DATA_A_TURBO3_0)
+        return FLOAT_TYPEV4(data_vv4[v_offset / 4u + key * v_stride / 4u + d]);
+#else
+        return FLOAT_TYPEV4(0.0);
+#endif
+    }
+    uint coord = key * v_stride * BLOCK_SIZE_V + 4u * d;
+    return dequantize4(coord / BLOCK_SIZE_V, coord % BLOCK_SIZE_V, v_offset, BINDING_IDX_V);
+}
+
+const uint32_t SPARSE_HSV4_PER_THREAD = (HSV / 4u + D_split - 1u) / D_split;
+const uint32_t SPARSE_COL_GROUPS = WorkGroupSize / D_split;
+const uint32_t SPARSE_MAXC = (Bc + SPARSE_COL_GROUPS - 1u) / SPARSE_COL_GROUPS;
+
+void sparse_main() {
+#ifdef NEEDS_INIT_IQ_SHMEM
+    if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
+        init_iq_shmem(gl_WorkGroupSize);
+    }
+#endif
+
+    init_indices();
+
+    const uint tid = gl_LocalInvocationIndex;
+    const uint WGS = gl_WorkGroupSize.x;
+    const uint d_tid = tid % D_split;
+    const uint col_group = tid / D_split;
+    const uint col_groups = WGS / D_split;
+    const uint HSK4 = HSK / 4u;
+    const uint HSV4 = HSV / 4u;
+    const uint HSV4_per_thread = SPARSE_HSV4_PER_THREAD;
+
+    if (LIMIT_OCCUPANCY_SHMEM > 0) {
+        occupancy_limiter[tid] = vec4(float(tid));
+        barrier();
+        if (occupancy_limiter[tid] == vec4(99999.0)) {
+            data_ov4[0] = D_TYPEV4(occupancy_limiter[tid]);
+        }
+    }
+
+    const uint S = max(p.k_num, 1u);
+    const uint n_kv_max = uint(sparse_meta[0]);
+    // Per contract & vk_flash_attn_push_constants: actual Q.ne1 (Nqueries) is pc.ne2 (dst->ne[2]).
+    // Compactor push constant p.N is explicitly dispatched with actual Nqueries = q->ne[1],
+    // completely decoupling metadata indexing from mask tensor row padding.
+    const uint Nqueries = p.ne2;
+    const uint nem2 = p.nem2;
+    const uint nem3 = p.nem3;
+    const uint num_rows = Nqueries * nem2 * nem3;
+    const uint header_size = ((1u + num_rows + 3u) / 4u) * 4u;
+
+    const uint q_stride = (p.gqa_ratio > 1) ? (p.nb02 / 4) : p.nb01;
+    const uint k_stride = p.nb11;
+    const uint v_stride = p.nb21;
+    const uint q_offset = gqa_iq1 * p.nb01 + (iq2 * p.nb02 + iq3 * p.nb03) / 4;
+
+    const uint num_tile_rows = (p.gqa_ratio > 1) ? min(Br, N) : Br;
+
+    for (uint r = 0u; r < num_tile_rows; ++r) {
+        const uint global_row = (p.gqa_ratio > 1) ? r : (i * Br + r);
+        if ((p.gqa_ratio > 1 && global_row >= N) || (p.gqa_ratio <= 1 && global_row >= N)) {
+            continue;
+        }
+
+        const uint cur_query  = (p.gqa_ratio > 1) ? gqa_iq1 : global_row;
+        const uint cur_head   = (p.gqa_ratio > 1) ? (iq2 + r) : iq2;
+        const uint cur_stream = iq3;
+
+        barrier();
+        uint q_vec4_base = q_offset / 4u + (i * Br + r) * (q_stride / 4u);
+        for (uint d = tid; d < HSK4; d += WGS) {
+            Qf[d] = FLOAT_TYPEV4(data_qv4[q_vec4_base + d] * p.scale);
+        }
+        barrier();
+
+        ACC_TYPE slope = ACC_TYPE(1.0);
+        if (p.max_bias > 0.0f) {
+            slope = perElemOpComputeSlope(r, 0u, ACC_TYPE(0), iq2);
+        }
+
+        uint kh = cur_head / (p.neq2 / p.nek2);
+        uint vh = cur_head / (p.neq2 / p.nev2);
+        uint k_offset = (kh * p.nb12 + ik3 * p.nb13) / FaBlockBytesK;
+        uint v_offset = (vh * p.nb22 + iv3 * p.nb23) / FaBlockBytesV;
+
+        uint mask_head   = (nem2 > 0u) ? (cur_head % nem2) : 0u;
+        uint mask_stream = (nem3 > 0u) ? (cur_stream % nem3) : 0u;
+        uint mask_row_idx = (mask_stream * nem2 + mask_head) * Nqueries + cur_query;
+        int active_count = sparse_meta[1u + mask_row_idx];
+        uint pairs_offset = header_size + mask_row_idx * (n_kv_max * 2u);
+
+        bool is_fallback = (active_count < 0);
+        uint total_items = is_fallback ? p.KV : uint(active_count);
+        uint chunk = (total_items + S - 1u) / S;
+        uint my_b = split_k_index * chunk;
+        uint my_e = min(total_items, (split_k_index + 1u) * chunk);
+
+        uint m_offset = gqa_iq1 * KV;
+        if (p.nem2 > 1u || p.nem3 > 1u) {
+            m_offset += ((iq3 % p.nem3) * p.nem2 + (iq2 % p.nem2)) * p.nem1 * KV;
+        }
+        uint m_dense_offset = m_offset + (cur_query % (p.nem1 > 0u ? p.nem1 : p.KV)) * m_stride;
+
+        const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
+        float Lf = 0.0f;
+        float Mf = NEG_FLT_MAX_OVER_2;
+        FLOAT_TYPEV4 Of[HSV4_per_thread];
+        for (uint di = 0u; di < HSV4_per_thread; ++di) {
+            Of[di] = FLOAT_TYPEV4(0.0);
+        }
+
+        float scol[SPARSE_MAXC];
+        bool cvalid[SPARSE_MAXC];
+        uint k_keys[SPARSE_MAXC];
+
+        for (uint b = my_b; b < my_e; b += Bc) {
+            uint b_end = min(b + Bc, my_e);
+            uint ncol = 0u;
+
+            for (uint c = col_group; c < Bc; c += col_groups) {
+                uint e = b + c;
+                float sc = NEG_FLT_MAX_OVER_2;
+                bool ok = false;
+                uint k_idx = 0u;
+                if (e < b_end) {
+                    float m_val = 0.0f;
+                    if (is_fallback) {
+                        k_idx = e;
+                        m_val = float(data_m[m_dense_offset + k_idx]);
+                    } else {
+                        k_idx = uint(sparse_meta[pairs_offset + 2u * e + 0u]);
+                        m_val = intBitsToFloat(sparse_meta[pairs_offset + 2u * e + 1u]);
+                    }
+
+                    // Skip negative infinity only. Preserve all finite values (including -65504)
+                    // and allow NaN / +inf to execute full dense arithmetic rather than disappear.
+                    bool is_neg_inf = isinf(m_val) && (m_val < 0.0f);
+                    if (!is_neg_inf) {
+                        FLOAT_TYPE acc = FLOAT_TYPE(0.0);
+                        for (uint d = d_tid; d < HSK4; d += D_split) {
+                            FLOAT_TYPEV4 K_val = sparse_load_k(k_idx, d, k_stride, k_offset);
+                            acc = dot_product(Qf[d], K_val, acc);
+                        }
+                        if (SubGroupSize > 0u) {
+                            for (uint st = 1u; st < D_split; st <<= 1u) {
+                                acc += subgroupShuffleXor(acc, st);
+                            }
+                        }
+                        sc = float(acc);
+                        if (LOGIT_SOFTCAP) {
+                            sc = p.logit_softcap * tanh(sc);
+                        }
+                        if (MASK_ENABLE) {
+                            sc += float(slope) * m_val;
+                        }
+                        ok = true;
+                    }
+                }
+                scol[ncol] = sc;
+                cvalid[ncol] = ok;
+                k_keys[ncol] = k_idx;
+                ++ncol;
+            }
+
+            float local_max = NEG_FLT_MAX_OVER_2;
+            for (uint t = 0u; t < ncol; ++t) {
+                if (cvalid[t]) {
+                    local_max = max(local_max, scol[t]);
+                }
+            }
+            float bmax = NEG_FLT_MAX_OVER_2;
+            if (SubGroupSize > 0u) {
+                for (uint st = 1u; st < SubGroupSize; st <<= 1u) {
+                    local_max = max(local_max, subgroupShuffleXor(local_max, st));
+                }
+                barrier();
+                if (gl_SubgroupInvocationID == 0u) {
+                    tmpsh[gl_SubgroupID] = local_max;
+                }
+                barrier();
+                bmax = tmpsh[0];
+                for (uint sg = 1u; sg < num_subgroups; ++sg) {
+                    bmax = max(bmax, tmpsh[sg]);
+                }
+            } else {
+                barrier();
+                tmpsh[tid] = local_max;
+                barrier();
+                for (uint st = WGS / 2u; st > 0u; st >>= 1u) {
+                    if (tid < st) {
+                        tmpsh[tid] = max(tmpsh[tid], tmpsh[tid + st]);
+                    }
+                    barrier();
+                }
+                bmax = tmpsh[0];
+            }
+
+            float Mold = Mf;
+            Mf = max(bmax, Mold);
+            float eM = exp(Mold - Mf);
+            Lf *= eM;
+            for (uint di = 0u; di < HSV4_per_thread; ++di) {
+                Of[di] *= FLOAT_TYPE(eM);
+            }
+
+            for (uint t = 0u; t < ncol; ++t) {
+                if (cvalid[t]) {
+                    float Pw = exp(scol[t] - Mf);
+                    if (d_tid == 0u) {
+                        Lf += Pw;
+                    }
+                    FLOAT_TYPE Pwv = FLOAT_TYPE(Pw);
+                    uint k_key = k_keys[t];
+                    for (uint di = 0u; di < HSV4_per_thread; ++di) {
+                        uint d = di * D_split + d_tid;
+                        if (d < HSV4) {
+                            FLOAT_TYPEV4 V_val = sparse_load_v(k_key, d, v_stride, v_offset);
+                            Of[di] += Pwv * V_val;
+                        }
+                    }
+                }
+            }
+        }
+
+        barrier();
+        if (d_tid != 0u) {
+            Lf = 0.0f;
+        }
+        if (SubGroupSize > 0u) {
+            for (uint st = 1u; st < SubGroupSize; st <<= 1u) {
+                Lf += subgroupShuffleXor(Lf, st);
+            }
+            barrier();
+            if (gl_SubgroupInvocationID == 0u) {
+                tmpsh[gl_SubgroupID] = Lf;
+            }
+            barrier();
+            Lf = tmpsh[0];
+            for (uint sg = 1u; sg < num_subgroups; ++sg) {
+                Lf += tmpsh[sg];
+            }
+
+            for (uint di = 0u; di < HSV4_per_thread; ++di) {
+                for (uint st = D_split; st < SubGroupSize; st <<= 1u) {
+                    if (!OLD_AMD_WINDOWS) {
+                        Of[di] += subgroupShuffleXor(Of[di], st);
+                    } else {
+                        Of[di] += FLOAT_TYPEV4(subgroupShuffleXor(vec4(Of[di]), st));
+                    }
+                }
+                barrier();
+                if (gl_SubgroupInvocationID == d_tid) {
+                    tmpshv4[gl_SubgroupID * D_split + d_tid] = Of[di];
+                }
+                barrier();
+                Of[di] = tmpshv4[d_tid];
+                for (uint sg = 1u; sg < num_subgroups; ++sg) {
+                    Of[di] += tmpshv4[sg * D_split + d_tid];
+                }
+            }
+        } else {
+            barrier();
+            tmpsh[tid] = Lf;
+            barrier();
+            for (uint st = WGS / 2u; st > 0u; st >>= 1u) {
+                if (tid < st) {
+                    tmpsh[tid] += tmpsh[tid + st];
+                }
+                barrier();
+            }
+            Lf = tmpsh[0];
+
+            for (uint di = 0u; di < HSV4_per_thread; ++di) {
+                barrier();
+                tmpshv4[tid] = Of[di];
+                barrier();
+                for (uint s = WGS / 2u; s >= D_split; s >>= 1u) {
+                    if (tid < s) {
+                        tmpshv4[tid] += tmpshv4[tid + s];
+                    }
+                    barrier();
+                }
+                Of[di] = tmpshv4[d_tid];
+            }
+        }
+
+        if (p.k_num > 1u) {
+            if (p.gqa_ratio > 1u) {
+                uint o_offset = HSV * p.ne1 * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3)) / 4u;
+                if (col_group == 0u) {
+                    for (uint di = 0u; di < HSV4_per_thread; ++di) {
+                        uint d = di * D_split + d_tid;
+                        if (d < HSV4) {
+                            gqaStore(r, d, Of[di], o_offset, iq2, N);
+                        }
+                    }
+                }
+                if (d_tid == 0u && col_group == 0u) {
+                    o_offset = HSV * p.ne1 * p.k_num * p.ne2 * p.ne3 + p.ne1 * 2u * (split_k_index + p.k_num * (gqa_iq1 + p.ne2 * iq3));
+                    perElemOpStoreCol0(r, 0u, ACC_TYPE(Lf), o_offset, iq2, N);
+                    perElemOpStoreCol0(r, 0u, ACC_TYPE(Mf), o_offset + p.ne1, iq2, N);
+                }
+            } else {
+                uint o_offset = HSV * p.ne1 * (split_k_index + p.k_num * (global_row + p.ne2 * iq3)) / 4u;
+                if (col_group == 0u) {
+                    for (uint di = 0u; di < HSV4_per_thread; ++di) {
+                        uint d = di * D_split + d_tid;
+                        if (d < HSV4) {
+                            data_ov4[o_offset + iq2 * HSV / 4u + d] = D_TYPEV4(Of[di]);
+                        }
+                    }
+                }
+                if (d_tid == 0u && col_group == 0u) {
+                    uint lm_offset = HSV * p.ne1 * p.k_num * p.ne2 * p.ne3 + p.ne1 * 2u * (split_k_index + p.k_num * (global_row + p.ne2 * iq3));
+                    data_o[lm_offset + iq2] = D_TYPE(Lf);
+                    data_o[lm_offset + p.ne1 + iq2] = D_TYPE(Mf);
+                }
+            }
+        } else {
+            if ((p.mask_n_head_log2 & SINK_ENABLE_BIT) != 0u) {
+                float sink = perElemOpGetSink(r, 0u, ACC_TYPE(0), iq2);
+                float ms = 1.0f;
+                float vs = 1.0f;
+                if (sink > Mf) {
+                    ms = exp(Mf - sink);
+                    for (uint di = 0u; di < HSV4_per_thread; ++di) {
+                        Of[di] *= FLOAT_TYPE(ms);
+                    }
+                    Mf = sink;
+                } else {
+                    vs = exp(sink - Mf);
+                }
+                Lf = Lf * ms + vs;
+            }
+            float Lfrcp = (Lf == 0.0f) ? 0.0f : (1.0f / Lf);
+            for (uint di = 0u; di < HSV4_per_thread; ++di) {
+                Of[di] *= FLOAT_TYPE(Lfrcp);
+#if defined(FLOAT_TYPE_MAX)
+                Of[di] = clamp(Of[di], -FLOAT_TYPE_MAX, FLOAT_TYPE_MAX);
+#endif
+            }
+            if (col_group == 0u) {
+                uint o_offset = (gqa_iq1 * p.ne1 * HSV + iq3 * p.ne2 * p.ne1 * HSV) / 4u;
+                if (p.gqa_ratio > 1u) {
+                    for (uint di = 0u; di < HSV4_per_thread; ++di) {
+                        uint d = di * D_split + d_tid;
+                        if (d < HSV4) {
+                            gqaStore(r, d, Of[di], o_offset, iq2, N);
+                        }
+                    }
+                } else {
+                    for (uint di = 0u; di < HSV4_per_thread; ++di) {
+                        uint d = di * D_split + d_tid;
+                        if (d < HSV4) {
+                            data_ov4[o_offset + (iq2 * HSV + global_row * p.ne1 * HSV) / 4u + d] = D_TYPEV4(Of[di]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+#endif // !defined(MMQ) && !defined(FLOAT16)

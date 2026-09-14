@@ -1171,6 +1171,16 @@ struct test_case {
         return nmse(a, b, n);
     }
 
+    virtual double err_tensor(ggml_tensor * t, const float * a, const float * b, size_t n) {
+        GGML_UNUSED(t);
+        return err(a, b, n);
+    }
+
+    virtual double err_tensor(ggml_tensor * t1, ggml_tensor * t2, const float * a, const float * b, size_t n) {
+        GGML_UNUSED(t2);
+        return err_tensor(t1, a, b, n);
+    }
+
     virtual float grad_eps() {
         return 1e-1f;
     }
@@ -1471,7 +1481,7 @@ struct test_case {
                 }
             }
 
-            double err = ud->tc->err(f1.data(), f2.data(), f1.size());
+            double err = ud->tc->err_tensor(t1, t2, f1.data(), f2.data(), f1.size());
             if (err > ud->tc->max_err(ud->backend1)) {
                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
                 //for (int i = 0; i < (int) f1.size(); i++) {
@@ -6067,17 +6077,65 @@ struct test_topk_moe : public test_case {
     // Verify two outputs
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { selected_experts, weights }; }
 
-    // allow output in arbitrary order
-    double err(const float * a, const float * b, size_t n) override {
-        std::vector<float> a2(n);
-        std::vector<float> b2(n);
-        for (size_t i = 0; i < n; ++i) {
-            a2[i] = a[i];
-            b2[i] = b[i];
+    // Store the actual readback outputs from backend1 and backend2
+    std::vector<int32_t> b1_experts;
+    std::vector<int32_t> b2_experts;
+
+    double err_tensor(ggml_tensor * t1, ggml_tensor * t2, const float * a, const float * b, size_t n) override {
+        GGML_UNUSED(t2);
+        const int64_t n_tokens = ne[1];
+        const int64_t k = n_expert_used;
+        GGML_ASSERT(n == (size_t)(n_tokens * k));
+
+        const bool is_experts = (t1->type == GGML_TYPE_I32) || (strcmp(t1->name, "selected_experts") == 0);
+        const bool is_weights = (t1->type == GGML_TYPE_F32) || (strcmp(t1->name, "weights") == 0);
+
+        if (is_experts) {
+            b1_experts.assign(n, 0);
+            b2_experts.assign(n, 0);
+            for (size_t i = 0; i < n; ++i) {
+                b1_experts[i] = (int32_t) a[i];
+                b2_experts[i] = (int32_t) b[i];
+            }
+            // Check index set preservation per row
+            double diff = 0.0;
+            for (int64_t r = 0; r < n_tokens; ++r) {
+                std::vector<int32_t> ea(k);
+                std::vector<int32_t> eb(k);
+                for (int64_t c = 0; c < k; ++c) {
+                    ea[c] = (int32_t) a[r * k + c];
+                    eb[c] = (int32_t) b[r * k + c];
+                }
+                std::sort(ea.begin(), ea.end());
+                std::sort(eb.begin(), eb.end());
+                diff += jdst(ea.data(), eb.data(), k);
+            }
+            return diff;
+        } else if (is_weights) {
+            GGML_ASSERT(!b1_experts.empty() && !b2_experts.empty() && "selected_experts must be verified before weights to pair IDs");
+            // Enforce canonical paired ordering per token row: sort (expert_id, weight) pairs by expert_id
+            double diff = 0.0;
+            for (int64_t r = 0; r < n_tokens; ++r) {
+                std::vector<std::pair<int32_t, float>> pairs1(k);
+                std::vector<std::pair<int32_t, float>> pairs2(k);
+                for (int64_t c = 0; c < k; ++c) {
+                    const size_t idx = r * k + c;
+                    pairs1[c] = { b1_experts[idx], a[idx] };
+                    pairs2[c] = { b2_experts[idx], b[idx] };
+                }
+                std::sort(pairs1.begin(), pairs1.end());
+                std::sort(pairs2.begin(), pairs2.end());
+                std::vector<float> w1(k);
+                std::vector<float> w2(k);
+                for (int64_t c = 0; c < k; ++c) {
+                    w1[c] = pairs1[c].second;
+                    w2[c] = pairs2[c].second;
+                }
+                diff += nmse(w1.data(), w2.data(), k);
+            }
+            return diff;
         }
-        std::sort(a2.begin(), a2.end());
-        std::sort(b2.begin(), b2.end());
-        return nmse(a2.data(), b2.data(), n);
+        return nmse(a, b, n);
     }
 };
 
@@ -9191,9 +9249,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
     // m == 1, with n on both sides of MMVF_MAX_BATCH_SIZE (8): mmvf below, operand swap above
-    for (int64_t n : {1, 7, 8, 9, 16, 128, 512}) {
+    for (int64_t n : {1, 7, 8, 9, 16, 127, 128, 511, 512}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1, n, 2048, {1, 1}, {1, 1}));
     }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1, 512, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1, 512, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1, 509, 2051, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1, 509, 2051, {1, 1}, {1, 1}));
+
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 31, 509, 2051, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
 
 #if 0
     {
