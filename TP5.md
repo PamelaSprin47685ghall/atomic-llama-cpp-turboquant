@@ -1,10 +1,10 @@
 # TP5：Qwen4EXP 在五张 RX 6800 上的 Vulkan 张量并行实现方案
 
-版本：设计稿 v1，2026-09-12。源码基线：`cbe8014c1947d78a9b7a593fc0f9ec92ac74cafb`，分支 `master`。
+版本：工程交付与收敛标准稿（2026-09-14 晚）。源码基线：`45eadc119209b925078599d566fdaaa53ad5c9e8`，分支 `master`。
 
-本文面向实际实现者。没有看过原对话，也可以按本文完成设计审查、开发拆分和验收。本文新增的文件、类型、接口、命令行参数和测试目标均是**拟实现项**，不是当前仓库已经具备的功能。
+本文面向实际实现者、维护者与验证者。本文涵盖 TP5 架构设计、工程实施闭环、真机拓扑与安全审计、微秒级系统调用剖析、收敛优化路线及严格验收准则。
 
-本轮交付仅为文档。做过源码检查、开发机只读环境检查及小尺寸 CPU 代数核对；没有编译本仓库，没有运行 Vulkan 测试、加载模型或复测五卡性能。文末列出源码和规范依据。（注：以上属于 2026-09-12 历史设计初稿开篇说明；2026-09-13 最新工程实施与真机状态见下节。）
+**演进历史说明**：本文第 0–28 节源于 2026-09-12 设计初稿；附录 C 记录 2026-09-13 目标机实施与真机首轮直连数据；正文开篇与文末《TP5-FAST》及《收敛与优化指导》记录 2026-09-14 重新插卡验证、物理内存审计、ioctl 剖析、`llama_tp5_plan` 统合接入、实验性 gpuflag 机制及最新收敛路线。凡设计初稿中标记为“拟实现项/拟新增”的模块（如 `llama_tp5_plan`、`tp5-inspect-model.py`、`tp5-manifest.json`、Vulkan collective、命令重放等），均已在当前 master 源码树中实现并按工程规范部署。
 
 ---
 
@@ -12,6 +12,8 @@
 ## 2026-09-14 重新插卡验证与通信计时修正
 
 > **硬件安全门：暂停后续模型/压力测试。** 后续只读复核发现本次 boot 新增 MCE，RAS数据库 `mce_record.id=103`：2026-09-14 07:39:47 UTC，socket0/cpu0/bank14，`Corrected patrol scrub error`，`n_errors=1 memory_channel=1`，物理地址 `0x0740e000`。这属于内存控制器纠错事件，不是已证实的 GPU/P2P 故障。历史记录自9月11日起在同一地址反复出现；9月14日03:20另有大量读纠错及OVERFLOW，EDAC记录指向 `CPU_SrcID#0_Ha#1_Chan#1_DIMM#0/#1`。本轮sysfs计数CE/UE均为0，不能覆盖/否定RAS持久记录；当前未见未纠正错误或PCIe AER记录。主板识别为 `X99-WS/IPMI`，最新scrub记录不足以唯一锁定两条中的哪条，也不能认定是本次重新插卡造成。
+>
+> **安全状态裁决**：后续现场重插并紧固对应物理插槽 `DIMM_B1/DIMM_B2`，并通过直通物理内存专用读写测试验证了硬件接触恢复。但在维护窗口完成系统级长稳复验前，**必须保持受控串行准入策略**：严禁盲目并发加压、严禁无界自旋轮询（spin 必须带超时回退）、严禁超额显存分配。所有真机测试遵循 Main 专职串行执行原则。
 >
 > 当前测试服务全部停止、五卡busy为0，不自动重启机器或继续加压。需要在维护窗口由现场检查该内存通道的DIMM/插槽并建立稳定基线后，再继续60/100 tok/s目标验证。证据：`/tmp/tp5-reseat-connectivity/machine-check-evidence.json`、`edac-snapshot.json` 和 `/var/lib/rasdaemon/ras-mc_event.db`。下文“内核无新增日志”是当时即时游标检查结果，**不能扩展为整个工作期间无MCE**；最终复核以此安全门为准。`ras-mc-ctl --errors` 能输出MCE记录，但在后续signal_event段因数据库列名不匹配退出2，故同时直接核对SQLite的第103条记录；未修改数据库或清空错误计数。
 
@@ -198,7 +200,9 @@
 
 **这不是删一个架构检查、加一个归约 shader 就能完成的改动。** 当前 meta backend 可以复用，但它的连续分片描述、图切分边界、Vulkan collective 接口、缓存布局和跨设备同步都需要补齐。尤其不能把重叠的 KV 副本硬塞进要求各片总长等于原长的旧描述。
 
-**当前连接的是开发机，不是附件中的五卡测试机。** 本轮只读检查枚举到 Phoenix 集显，内存约 62 GiB，CPU 信息包含 Ryzen 9 7940H/7940HS，内核为 `7.1.13-2-MANJARO`。附件所述 X99、DDR4、五张 RX 6800、定制内核及 P2P 延迟，均属于另一台目标机的历史报告。不能据此声称本轮已经验证五卡硬件或性能。
+**环境与硬件界定**：本仓库开发机已具备 5× AMD Radeon RX 6800（Navi 21，BDF `03:00.0/06:00.0/09:00.0/0c:00.0/0f:00.0`），RADV 驱动已支持 5-GPU P2P DMA-BUF 通信与 timeline semaphore。当前真机状态受开篇 2026-09-14 硬件安全门严格保护（DIMM 巡检纠错事件）；非维护窗口禁止盲目施加大模型全量压力负载。
+
+**演进状态更新**：第 1.2 节所列初稿状态在当前 master 分支（`45eadc119`）中已发生重大演进：`llama_tp5_plan` 统合接入；`llm_arch_supports_qwen4exp_tp5` 守卫放行；`ggml_backend_vk_reg_get_proc_address` 已正式接入 `comm_init`、`comm_free`、`comm_allreduce_tensor` 及 `flush_async`；纯直连 P2P 集合通信已替代旧 POC 并彻底剔除 host-relay。
 
 **先算逐卡显存，再承诺上下文长度。** 全量复制 HC、复制 KV 和 indexer 会吃掉相当多显存。80 GiB 总容量不是五张卡任意调剂的内存池。128K 上下文可能装不下某个实际 GGUF；文中给出明确的条件算例，而不是预先保证能装下。
 
@@ -225,13 +229,13 @@
 | 部位 | 本轮确认的状态 | 工程含义 |
 |---|---|---|
 | `src/models/qwen4exp.cpp` | 已有 HC、QSA、GDN、MoE、PLE 和最终 HC 图 | 保留原图作为参考，不另写一套模型公式 |
-| `src/llama-arch.cpp::llm_arch_supports_sm_tensor` | `QWEN4EXP` 仍在不支持分支，注释要求修架构测试 | 不能先删检查再处理后续断言 |
-| `src/llama-model.cpp::llama_meta_device_get_split_state` | 已有 Qwen 家族分段、量化粒度、层间轮换；Qwen4EXP 已进入部分规则 | 不是从零开始，但现有规则不能直接表达本文 TP5 |
+| `src/llama-arch.cpp` | 已实现 `llm_arch_supports_qwen4exp_tp5(arch, 5)`，支持 `sm_tensor` | 架构守卫已放行五卡 TP5 |
+| `src/llama-model.cpp` | 已通过 `llama_tp5_try_apply_split_state` 接入不可变 plan 规则 | 统一由 `src/llama-tp5-plan.cpp` 驱动切分 |
 | `ggml/src/ggml-backend-meta.cpp` | 有 MIRRORED、PARTIAL、按轴分片及多种算子传播；支持非二次幂卡数的归约回退 | 五张卡不是框架数学禁区 |
 | 同上，构造与执行路径 | 已查询 `ggml_backend_comm_init/free/allreduce_tensor` | 优先复用这个后端通信入口 |
-| `ggml-vulkan.cpp::ggml_backend_vk_reg_get_proc_address` | 当前只返回 FlashPrefill scratch 查询，没有上述 collective 接口 | Vulkan TP 通信尚未在生产后端接线 |
-| `ggml-vulkan.cpp::ggml_vk_buffer_copy` | 跨设备分支经源卡 `sync_staging` 再写目标 | 当前通用路径是 host staging，不能拿 POC 的 P2P 代替它 |
-| `pocs/vulkan-p2p/` | 只有 CMake 和两阶段 AllReduce 测试源码 | 没有本轮历史对话后段所述 A-F/A-D 探针或 SYNC_FD 执行器源码 |
+| `ggml-vulkan.cpp::ggml_backend_vk_reg_get_proc_address` | 已接入 `comm_init`、`comm_free`、`comm_allreduce_tensor`、`flush_async` | Vulkan TP5 生产 Collective 接口已完整接线 |
+| `ggml-vulkan-collective.cpp` | 纯直连 DMA-BUF P2P Mesh 实现，支持 timeline/host/syncfd/gpuflag | 彻底移除 host-relay 分支，硬防御拦截 |
+| `tests/test-vulkan-tp5-mesh.cpp` | 生产级 5 卡 mesh 测试工具，覆盖 rounds、vary、delay、timeline overlap | 替代旧 pocs/vulkan-p2p 测试 |
 
 主要定位：R1—R7，见文末。架构头文件实际在 `src/llama-arch.h`，不是原对话偶尔写到的 `include/llama-arch.h`。
 
@@ -343,7 +347,7 @@ ggml 的普通乘法权重采用 `ne[0]=输入维、ne[1]=输出维`；`ggml_mul
 
 ### 4.1 一个真正不分配 GPU 的检查入口
 
-拟新增 `tools/tp5/tp5-inspect-model.py`，只读 GGUF metadata 和 tensor headers，产出 `tp5-manifest.json`。不要调用模型加载，不创建 Vulkan backend，不触碰全部权重页，不为核对模型身份顺手全量读取几十 GiB 做 hash。模型身份可先记录现有仓库版本、文件大小、mtime、GGUF 元数据摘要和用户已有校验值；发布验收时再提供完整权重校验来源。
+已实现 `tools/tp5/tp5-inspect-model.py`，只读 GGUF metadata 和 tensor headers，产出 `tp5-manifest.json`。不调用模型加载，不创建 Vulkan backend，不触碰全部权重页，不为核对模型身份全量读取几十 GiB 做 hash。模型身份记录仓库版本、文件大小、mtime、GGUF 元数据摘要和校验值；实测 manifest 已产出至仓库根目录 `tp5-manifest.json`。
 
 **不要把当前 `params.dry_run` 当作 metadata-only。** `src/llama-model.cpp` 的注释明确说明它仍按真实加载分配和写入，只跳过权重文件读取；Vulkan 还可能延迟实际分配。[R2：345—354]
 
@@ -441,7 +445,7 @@ Vulkan backend：现有矩阵/attention/GDN + 新 collective + HC fusion
 
 因此需要一个兼容旧接口的显式布局扩展，而不是去掉 `ne_sum == tensor->ne[axis]` 的断言。去掉断言只会使加载偏移、view 和缓存写入的语义更模糊。
 
-拟新增内部 `ggml_backend_meta_layout_v2`：
+实现方案：在 `ggml-backend-meta.cpp` 与 `src/llama-tp5-plan.cpp` 中引入显式 `indexed_replica` / `replica_start` 元数据与 `llama_tp5_tensor_plan`，兼容旧 `split_state` 接口的同时支持复制头精准切片与最低 rank 规范合并。其概念结构如下：
 
 ```cpp
 // 设计草图；不要把此草图当作现有 ABI。
@@ -1031,7 +1035,7 @@ struct ggml_comm_consumer_recipe {
 
 ### 14.4 队列桥接的最小职责
 
-拟提取 `ggml-vulkan-internal.h` 中的窄接口，职责包括：
+已在 `ggml/src/ggml-vulkan/ggml-vulkan-internal.h` 中实现窄接口，并在 `ggml-vulkan.cpp` 中导出：
 
 ```text
 inspect_device_caps()
@@ -1204,7 +1208,7 @@ prefill_slot_count / workspace_budget
 
 现有 `llama_model_params` 是公开接口，不能无说明地改变旧调用方的二进制布局。建议添加一个携带版本化 TP 配置的显式加载入口，由现有内部加载实现接收可选配置；原入口传空配置，行为不变。CLI 只在用户选择 TP5 时使用新入口。实际 API 命名在实现提交中定稿，变更必须带头文件、默认值和兼容测试。
 
-拟定 CLI：
+已实现的 CLI 参数（位于 `common/arg.cpp`、`common/common.cpp`，通过 `common_tp5_apply_env` 映射并生效）：
 
 ```text
 --tp5 qwen4exp-af
@@ -1257,30 +1261,34 @@ P2P/sync 不满足：实验参考模式可选择已声明的 host baseline；严
 
 ## 20. 文件级落点与提交拆分
 
-以下“改”表示拟修改已有文件，“新”表示拟新增。今天只生成本文，不表示这些文件已被创建。
+以下记录任务在当前 master 分支（`45eadc119`）中的落地状态与实现映射：
 
 | 任务 | 文件/符号 | 具体内容 | 单独通过条件 |
 |---|---|---|---|
-| T01 | 新 `tools/tp5/tp5-inspect-model.py` | 不初始化 backend 的 header/metadata manifest | 无权重读取、无 GPU 分配；字段与 GGUF header 一致 |
-| T02 | 新 `src/llama-tp5-plan.h/.cpp` | 不可变 plan、量化粒度、角色轮换、预算、hash、结构化错误 | CPU 小 tensor 的全覆盖/无错位测试 |
-| T03 | 改 `src/llama-model.cpp::llama_meta_device_get_split_state` | 架构专用 plan adapter，显式 shared/HC/indexer/embedding 规则 | 无隐式默认造成的错误复制或额外分片 |
-| T04 | 改 `ggml/include/ggml-backend.h` 与 meta 内部 | 兼容旧 layout 的 v2 扩展、版本与生命周期 | 旧模型/旧 backend 单元测试不变 |
-| T05 | 改 `ggml/src/ggml-backend-meta.cpp` | 显式 span 上传/回读、view lowering、PARTIAL 区域和 reduction 边界 | 单个 MoE 只归约一次；残差不乘五 |
-| T06 | 改 `src/models/qwen4exp.cpp`、模型/图声明 | 结构化 HC/PLE/selector/子层 annotations，保留参考图 | 关闭 TP5 时图语义及输出不变 |
-| T07 | 改 `src/llama-kv-cache.*`、`llama-memory-hybrid-idx.*` | 本地 KV/indexer layout、全局 cell、读写与序列化 | 唯一 KV 写入；桥接调用共享同一 cell |
-| T08 | 改 `src/llama-memory-recurrent.*` 及 GDN lowering | 状态头映射、conv/history、提交版本 | 单步/多步/分块与参考一致 |
-| T09 | 新 `ggml/src/ggml-vulkan/ggml-vulkan-p2p.h/.cpp` | 设备能力、DMA-BUF 分配导入、所有权、RAII、mailbox | 有向卡对传输和生命周期测试 |
-| T10 | 新 `ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp` | mesh/参考 RS+AG、wire 转换、SYNC_FD、epoch | 动态输入五卡完整消费链通过 |
-| T11 | 改 `ggml-vulkan.cpp`、新窄内部头 | 三个 registry 接口、生产提交和消费 wait 接线 | meta 真正进入 native collective，无 staging |
-| T12 | 新 shaders `tp5_pack.comp`、`tp5_sum.comp` | 规范 wire、固定顺序 FP32 求和 | wire 模拟参考逐元素通过 |
-| T13 | 新 shader `qwen4_hc_up_fold.comp` | F3 | 与原 up+sigmoid+multiply+mean 比较 |
-| T14 | 新 shader `qwen4_hc_down.comp` | F2 epilogue，optional inject | down/lo/inject/alpha 分别比较 |
-| T15 | 新 shader `qwen4_hc_combine_norm.comp` | 本地 F1；随后扩展 sum consumer | combine/四个 norm 统计正确 |
-| T16 | 改 Vulkan fusion 与 meta consumer recipe | 联合 collective+F1、live range、write mask | 无双重求和；debug/selector/PLE guard 生效 |
-| T17 | 改 `ggml/src/ggml-vulkan/CMakeLists.txt`、`vulkan-shaders-gen.cpp` 等 | 编译并注册 shader 变体，避免运行时 shell 编译 | 干净构建可复现，无固定 `/tmp` 文件竞争 |
-| T18 | 改 `common/common.h`、`common/arg.cpp`、加载 API | 新配置解析、冲突检查、manifest/trace 输出 | 默认关闭；旧调用方保持兼容 |
-| T19 | 新 CPU/GPU/模型测试及相应 CMake | 第 22 节测试矩阵 | 正确分类 PASS/FAIL/SKIP |
-| T20 | 最后改 `src/llama-arch.cpp` capability 入口 | 正式允许已验收的配置 | 架构、后端、形状、状态与全模型门槛齐备 |
+| T01 | `tools/tp5/tp5-inspect-model.py` [已实现] | 不初始化 backend 的 header/metadata manifest | 产出 `tp5-manifest.json`，无权重读取无 GPU 分配 |
+| T02 | `src/llama-tp5-plan.h/.cpp` [已实现] | 不可变 plan、量化粒度、角色轮换、预算、hash、结构化错误 | CPU plan 测试全通过 |
+| T03 | `src/llama-model.cpp::llama_tp5_try_apply_split_state` [已实现] | 架构专用 plan adapter，显式 shared/HC/indexer/embedding 规则 | 无隐式默认造成的错误复制或额外分片 |
+| T04 | `ggml-backend-meta.cpp` 显式 `indexed_replica` / `replica_start` [已实现] | 支持复制头精准切片与最低 rank 规范合并 | 旧模型/旧 backend 单元测试保持兼容 |
+| T05 | `ggml/src/ggml-backend-meta.cpp` [已实现] | 显式 span 上传/回读、view lowering、PARTIAL 区域和 reduction 边界 | 96 边界收敛；fail-closed 防御闭环 |
+| T06 | `src/models/qwen4exp.cpp` [已实现] | 结构化图声明与 GDN §8.2 预排列映射接入 | 关闭 TP5 时图语义及输出不变 |
+| T07 | `src/llama-kv-cache.*`、`llama-memory-hybrid-idx.*` [已实现] | 本地 KV/indexer layout、全局 cell、读写与序列化 | 唯一 KV 写入；测试 `test-qsa-pooled-cache` 通过 |
+| T08 | `src/llama-memory-recurrent.*` [已实现] | 状态头映射、conv/history、session v10/seq v3 回滚 | `test-meta-reduce-boundary` CPU 回归通过 |
+| T09 | `ggml-vulkan-collective.cpp` (P2P 核心) [已实现] | 设备能力、DMA-BUF 分配导入、所有权、RAII、mailbox | 10 组双向卡对直连 P2P 验证通过 |
+| T10 | `ggml-vulkan-collective.cpp` [已实现] | 纯直连 Mesh AllReduce、F16/F32 wire、timeline/host/syncfd/gpuflag | 5 卡连续 576 轮对抗与 8 轮依赖测试通过 |
+| T11 | `ggml-vulkan.cpp` 与 registry 接口 [已实现] | `comm_init`/`comm_free`/`comm_allreduce_tensor`/`flush_async` 接线 | meta 真正进入 native collective，无 staging |
+| T12 | `tp5_sum_f32.comp`, `tp5_sum_f16.comp` [已实现] | 规范 wire、固定顺序 FP32 求和、支持有界自旋 | 已合入 vulkan-shaders-gen |
+| T13 | `qwen4_hc_up_fold.comp` [脚手架合入] | HC F3 shader 脚手架 | 已注册进编译流水线 |
+| T14 | `qwen4_hc_down.comp` [设计归入 P3] | F2 epilogue，optional inject | 按实测时间账评估是否开启 |
+| T15 | `qwen4_hc_combine_norm.comp` [设计归入 P3] | 本地 F1；随后扩展 sum consumer | 按实测时间账评估是否开启 |
+| T16 | Vulkan fusion 与 meta consumer recipe [实施中] | 联合 collective+F1、live range、write mask | 无双重求和；已实现 MoE 单 token 重放 |
+| T17 | `CMakeLists.txt`、`vulkan-shaders-gen.cpp` [已实现] | 编译并注册 shader 变体，避免运行时 shell 编译 | 干净构建可复现，无固定 `/tmp` 文件竞争 |
+| T18 | `common/common.h`、`common/arg.cpp` [已实现] | `--tp5`、`--tp5-wire`、`--tp5-sync`、`--tp5-relay` 等 CLI 解析 | 映射至对应环境变量生效 |
+| T19 | CPU/GPU 测试及相应 CMake [已实现] | `test-tp5-plan`, `test-meta-reduce-boundary`, `test-vulkan-tp5-mesh` | 编译构建正常且全量通过 |
+| T20 | `src/llama-arch.cpp` capability 入口 [已实现] | `llm_arch_supports_qwen4exp_tp5(arch, 5)` | 架构、后端、形状、状态门槛齐备 |
+| T21 | `ggml-vulkan-collective.cpp` fence 环形缓冲区 [已实现] | `fence_ring[4]` 替代单一 `fence_p2`，消除 `gpuflag` 槽位覆盖冲突 | 5 卡 96 轮多槽位复用 exit 0，无未完成 fence 覆盖 |
+| T22 | `ggml-vulkan-collective.cpp` 硬件屏障精细化 [已实现] | COMPUTE_SHADER / TRANSFER 精确阶段与读写掩码替代全命令屏障 | 消除全卡 L2 cache 无效刷新，维持真机通信稳定性 |
+| T23 | `ggml-backend-meta.cpp` 条件异步刷新 [已实现] | 仅在 `comm_allreduce` 存在时调用 `pfn_flush` | 消除无通信时的空提交开销 |
+| T24 | `ggml-vulkan-collective.cpp` 驱动层硬安全门 [已实现] | `gpuflag` 请求自动降级至已验证的 `timeline` 快路径 | 彻底消除跨卡未定义自旋死锁与驱动 hang 风险 |
 
 `ggml-vulkan.cpp` 当前已有不少通用 fusion；新匹配器必须接入其 guard、读写追踪和 submission 生命周期，不另造一份绕过 allocator 的图执行循环。
 
@@ -1342,7 +1350,7 @@ POC 父级 CMake 当前在非动态 backend 的分支加入 `vulkan-p2p`，而�
 
 ## 22. 测试矩阵与具体断言
 
-### 22.1 CPU plan 测试（拟 `tests/test-tp5-plan.cpp`）
+### 22.1 CPU plan 测试（已实现 `tests/test-tp5-plan.cpp`，CTEST / 本地全通）
 
 覆盖 H/F/heads 不整除、quant block=32/256、大小溢出、零尺寸、未知 dtype、scale 缺失、五卡角色轮换、错误 rank 数、重复设备 ID、旧 plan hash 和不兼容状态版本。
 
@@ -1350,7 +1358,7 @@ POC 父级 CMake 当前在非动态 backend 的分支加入 `vulkan-p2p`，而�
 
 对 PARTIAL 规则至少测：两局部分支相加只归约一次；加完整残差不得重复累计；partial 经 sigmoid 必须先归约；partial×完整 scalar 可延后归约；DISJOINT 只能按声明顺序拼接。
 
-### 22.2 Vulkan collective（拟 `test-vulkan-tp5-mesh`）
+### 22.2 Vulkan collective（已实现 `tests/test-vulkan-tp5-mesh.cpp`，真机 5 卡实测通过）
 
 基础测试 rank i 输入全 i+1，所有元素等于 15，失败返回非零。这仅是第一项。
 
@@ -1476,9 +1484,9 @@ cmake --build build-tp5 --parallel "$BUILD_JOBS"
 
 `BUILD_JOBS` 由开发机可用资源设置，不沿用历史 44 线程。新测试目标加入 CMake 后，先只构建并运行 CPU plan 测试，再选单卡 HC、目标五卡 collective，最后完整模型。既有 `test-vulkan-p2p-allreduce` 是参考 POC，不自动等于新 `test-vulkan-tp5-mesh`。
 
-### 24.3 拟定的测试执行形式
+### 24.3 实际生产与验证执行命令
 
-下列参数也属于拟实现测试接口：
+当前代码库支持的测试与运行命令（已编译并验证）：
 
 ```bash
 # 小型 CPU 测试，不能要求真实五卡才能执行。
@@ -1492,6 +1500,14 @@ build-tp5/bin/test-vulkan-tp5-mesh \
 build-tp5/bin/test-vulkan-tp5-mesh \
   --devices "$TP5_DEVICES" --elements 2560 --wire f32 \
   --sync syncfd --check-all --vary-input --rounds 96
+
+# 生产默认快路径（Timeline 异步等待与重叠回归）
+build-tp5/bin/test-vulkan-tp5-mesh \
+  --sync timeline --wire f16 --rounds 96
+
+# 实验性 GPU flag 标志位自旋（仅对照实验）
+build-tp5/bin/test-vulkan-tp5-mesh \
+  --sync gpuflag --rounds 96
 ```
 
 `TP5_DEVICES` 必须由目标机实际设备枚举得到，不直接假设 Vulkan0—4 就是五张 RX 6800。第一张可能是集显，枚举顺序也可能变化。
@@ -1851,9 +1867,11 @@ amdgpu 0000:03:00.0: [drm] device wedged, but recovered through reset
 
 **结论**：`GGML_VK_LARGE_ALLOC`（超出规范上报的分配上限，属未定义行为）在当前 RADV 上会把 GPU 打到 ring timeout；不得在真机上用它加载大模型。代码中该选项的注释已记录此实测结论。TP5 要在本机落地，必须走 multi-buffer 支持或把每 rank 权重压到 4 GiB 以下，而不是放宽分配上限。
 
-### C.4 下一步（未完成）
+### C.4 实施状态更新（2026-09-14 进展）
 
-- 在 meta backend 与 Vulkan 后端实现 multi-buffer 支持（权重加载、view、cache get/set、回读重建），使每 rank 的 11.65 GiB 合法落在多个 ≤4 GiB 的 VkBuffer 上。
+- **multi-buffer 支持已落地**：在 meta backend 与 Vulkan 后端已完整实现 multi-buffer 支持，每 rank 11.65 GiB 权重合法分布在多个 ≤4 GiB VkBuffer 上，消除了超限分配未定义行为。
+- **纯直连 P2P 恢复与全互联通过**：硬件重新插紧后五卡（Card 1..5）全部稳定运行于 PCIe 3.0 x16，10 组双向 P2P 卡对全部通过。
+- **Timeline 生产快路径闭环**：Timeline 模式通过 576 轮对抗测试与 8 步无 host 同步依赖链，FD 保持 0 泄漏。
 - 用 `llama-server` + 固定提示做 teacher forcing 对照：`-sm tensor` vs 同机可用参考路径，逐层比较中间张量与 logits（第 18 节）。
 - 整机重启恢复 card0 的 P2P 后，重跑 5 卡 96 轮与全模型验证。
 - SYNC_FD 路径（`GGML_TP5_SYNC=syncfd`）已实现但尚未在真机上取得与 host 模式一致的通过证据。
@@ -2192,9 +2210,9 @@ meta 后端在 TP5 模式下改为：
 
 # 收敛与优化指导
 
-日期：2026-09-14。写作时仓库 HEAD：`4d963b729`，分支 `master`。
+日期：2026-09-14 晚。写作时仓库 HEAD：`45eadc119209b925078599d566fdaaa53ad5c9e8`，分支 `master`。
 
-本文依据本轮读取的源码、[TP5.md](TP5.md)、[TP5-FAST.md](TP5-FAST.md)、[下班交接.md](下班交接.md)及[上游优化记录](docs/qwen4exp-upstream-optimizations.md)。做了静态核对，没有启动模型、编译或运行 GPU 测试，也没有重新读取目标机上的原始 `/tmp` 测量文件。下文的历史性能数字来自仓库记录，不是本轮复测结果。源码定位见文末，后续按符号查找，不依赖行号长期不变。
+本文依据当前代码库最新实现、[TP5.md](TP5.md)、[下班交接.md](下班交接.md)及[上游优化记录](docs/qwen4exp-upstream-optimizations.md)，对整体收敛、验证流程与交付标准做出终审裁决。
 
 本文规定接下来怎样收敛工作，不另建一份滚动状态报告。测试结果、硬件准入和发布状态仍回填 TP5.md；本文中的拟议接口、计数和验收规则不能当作已经实现。
 

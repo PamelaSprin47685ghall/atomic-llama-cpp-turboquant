@@ -10,17 +10,17 @@
 
 layout(local_size_x = 1) in;
 
-layout(std430, binding = 0) buffer OwnMailbox {
+layout(std430, binding = 0) coherent volatile buffer OwnMailbox {
     uint mailbox[];
 };
 
-layout(std430, binding = 1) buffer Peer0 { uint peer0[]; };
-layout(std430, binding = 2) buffer Peer1 { uint peer1[]; };
-layout(std430, binding = 3) buffer Peer2 { uint peer2[]; };
-layout(std430, binding = 4) buffer Peer3 { uint peer3[]; };
-layout(std430, binding = 5) buffer Peer4 { uint peer4[]; };
-layout(std430, binding = 6) buffer Peer5 { uint peer5[]; };
-layout(std430, binding = 7) buffer Peer6 { uint peer6[]; };
+layout(std430, binding = 1) coherent volatile buffer Peer0 { uint peer0[]; };
+layout(std430, binding = 2) coherent volatile buffer Peer1 { uint peer1[]; };
+layout(std430, binding = 3) coherent volatile buffer Peer2 { uint peer2[]; };
+layout(std430, binding = 4) coherent volatile buffer Peer3 { uint peer3[]; };
+layout(std430, binding = 5) coherent volatile buffer Peer4 { uint peer4[]; };
+layout(std430, binding = 6) coherent volatile buffer Peer5 { uint peer5[]; };
+layout(std430, binding = 7) coherent volatile buffer Peer6 { uint peer6[]; };
 layout(std430, binding = 8) buffer EpochBuf {
     uint epoch_seq;
     uint epoch_spin_max;

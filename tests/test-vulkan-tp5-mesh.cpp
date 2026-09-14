@@ -670,6 +670,10 @@ int main(int argc, char ** argv) {
         for (int pr = 0; pr < producer_rounds; ++pr) {
             std::vector<std::vector<float>> rank_results;
             run_producer_round(comm, producers, elements, pr, true, true, rank_results);
+            if (g_failures > 0) {
+                fprintf(stderr, "  producer round %d failed; aborting producer rounds\n", pr);
+                break;
+            }
             check_producer_result(rank_results, elements, P, pr, true, true, is_f16_wire);
         }
         if (g_failures == 0) fprintf(stderr, "  %d real GPU graph-producer rounds (async compute->flush->AR): OK\n", producer_rounds);

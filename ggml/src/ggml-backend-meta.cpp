@@ -2882,7 +2882,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     pfn_flush = (tp5_flush_async_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_flush_async");
                 }
                 for (size_t j = 0; j < n_backends; j++) {
-                    if (pfn_flush) {
+                    if (pfn_flush && backend_ctx->comm_allreduce) {
                         pfn_flush(backend_ctx->backend_configs[j].backend);
                     } else {
                         ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);

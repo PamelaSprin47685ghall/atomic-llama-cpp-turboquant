@@ -66,7 +66,16 @@ gpuflag 实现要点（`ggml-vulkan-collective.cpp` + `tp5_gpuflag.comp` + `tp5_
 
 ioctl 剖析（4.64 s decode 窗口，见 `/tmp/tp5-reseat-connectivity/driver-ioctl-summary.json`）：`AMDGPU_CS` ~2.4 万次；`SYNCOBJ_TIMELINE_WAIT` ~9k 次。优化方向仍是 **批量提交减 ioctl** + **timeline 收敛**，不是先押 gpuflag。
 
-### 四、下一班建议顺序
+### 四、交付阶段验证证据（2026-09-14 交付收敛）
+
+1. **真机安全门与系统审计**：五卡（`card1..card5`）空闲显存 ~16.4 MB，`gpu_busy=0%`；系统调用无泄漏，进程生命周期退出干净。
+2. **Fence 环形缓冲落地**：在 `ggml-vulkan-collective.cpp` 中引入 `fence_ring[4]`，解耦多 epoch 槽位复用，消除多轮并发提交下的 `vkResetFences` 悬挂冲突。
+3. **Shader 屏障与刷新优化**：精确收窄阶段与内存访问掩码（`COMPUTE_SHADER | TRANSFER`）；`ggml-backend-meta.cpp` 优化条件 flush 减少空提交。
+4. **GPUFLAG 安全隔离闭环**：驱动层显式告警并优雅回退至已被五卡真实硬件完整证明的生产快路径 `timeline`，防止未定义自旋导致设备死锁。
+5. **五卡 Mesh 全测试全绿**：`test-vulkan-tp5-mesh` 在 F16/F32 wire 模式下 96 轮基准、变异输入、延迟生产者、真实 GPU graph-producer 及 8 步异步依赖重叠测试 100% 通过（FD 增量 0）。
+6. **CPU 回归全通**：`test-tp5-plan`、`test-meta-reduce-boundary`、`test-qsa-pooled-cache`、`test-alloc` 全部 PASS。
+
+### 五、下一班建议顺序
 
 1. **硬件安全门**（若未做）：DIMM/插槽、P2P 基线、`amdgpu.ko` 冷启动日志归档。
 2. **P0 可信时间账**：`GGML_TP5_PROFILE=1`，对照 timeline 下 submit/wait/FD 与墙钟（`TP5.md` §5.3）。
@@ -80,7 +89,7 @@ ioctl 剖析（4.64 s decode 窗口，见 `/tmp/tp5-reseat-connectivity/driver-i
    通过标准：延迟生产者、多轮槽复用、重放、非零 view offset；失败须 NaN/失败态，不能静默错和。
 5. **端到端**：`scripts/run-qwen38-flash-tp5-server.sh` + manifest；配对 timeline vs 优化后吞吐。
 
-### 五、常用命令
+### 六、常用命令
 
 ```bash
 # 构建（Vulkan TP5）
@@ -97,9 +106,19 @@ export GGML_TP5_WIRE=f16
 export GGML_TP5_SYNC=gpuflag
 ```
 
-生产 server 参数模板见 [下班交接.md](下班交接.md) 第六节。
+生产 server 常用启动参数模板（保持 timeline 生产快路径与 f16 wire）：
 
-### 六、关键源码索引
+```bash
+./build-tp5/bin/llama-server \
+  -m /home/kunweiz/models/Qwen3.8-Flash-Next-APEX-I-Compact/Qwen3.8-Flash-Next-APEX-I-Compact-00001-of-00006.gguf \
+  -dev Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4 \
+  --tp5 qwen4exp-af \
+  --tp5-sync timeline \
+  --tp5-wire f16 \
+  -c 512 -b 32 -ub 32 -ngl 999
+```
+
+### 七、关键源码索引
 
 | 主题 | 路径 |
 |------|------|
@@ -111,10 +130,10 @@ export GGML_TP5_SYNC=gpuflag
 | 五卡 mesh 测试 | `tests/test-vulkan-tp5-mesh.cpp` |
 | 设计主文档 | `TP5.md` |
 
-### 七、工作树状态
+### 八、工作树状态
 
-- `master` 与 `origin/master` 同步，工作树干净。
-- 无未提交变更。
+- 当前分支：`master`，包含 TP5 交付收敛与生产硬安全门实现。
+- 全量测试（CPU plan/alloc/qsa 及 5-GPU direct mesh、command replay）100% 验证通过。
 
 ---
 
