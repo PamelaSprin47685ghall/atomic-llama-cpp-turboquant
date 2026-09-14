@@ -150,7 +150,8 @@ int main(int argc, char ** argv) {
             }
 
             for (int token = 0; token < n_vocab; ++token) {
-                if (std::fabs(logits_src[token] - logits_tgt[token]) > eps) {
+                if (!std::isfinite(logits_src[token]) || !std::isfinite(logits_tgt[token]) ||
+                    std::fabs(logits_src[token] - logits_tgt[token]) > eps) {
                     fprintf(stderr, "%s : %s logits mismatch at position %d, token %d (%g != %g)\n",
                             __func__, mode, pos, token, (double) logits_src[token], (double) logits_tgt[token]);
                     return false;
@@ -176,6 +177,46 @@ int main(int argc, char ** argv) {
 
     if (!replay_and_compare("partial", ctx_dst.get())) {
         return 1;
+    }
+
+    // Device-resident on-device checkpoint verification (LLAMA_STATE_SEQ_FLAGS_ON_DEVICE):
+    // On-device checkpoint state belongs to the originating context (ctx->mem_storage[seq_id]).
+    // Test save/advance/rollback/restore within the SAME context (ctx_dst) and compare against
+    // the independent host oracle (ctx_src), covering accepted and rejected rollback transitions.
+    {
+        // Roll back ctx_dst and ctx_src to rollback_pos
+        if (!llama_memory_seq_rm(llama_get_memory(ctx_src.get()), 0, rollback_pos, -1) ||
+            !llama_memory_seq_rm(llama_get_memory(ctx_dst.get()), 0, rollback_pos, -1)) {
+            fprintf(stderr, "%s : on-device rollback reset failed\n", __func__);
+            return 1;
+        }
+
+        constexpr llama_state_seq_flags on_device_flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+        common_prompt_checkpoint ckpt_on_device;
+
+        // 1. Take on-device checkpoint on ctx_dst
+        ckpt_on_device.update_tgt(ctx_dst.get(), 0, on_device_flags);
+
+        // 2. Decode speculative draft tokens on ctx_dst (advancing state tentatively)
+        for (uint32_t i = 0; i < n_rollback; ++i) {
+            const llama_pos pos = rollback_pos + i;
+            if (!decode_one(ctx_dst.get(), tokens[pos], pos)) {
+                fprintf(stderr, "%s : on-device draft decode failed at %d\n", __func__, pos);
+                return 1;
+            }
+        }
+
+        // 3. Rejected draft: restore on-device checkpoint on SAME context (ctx_dst)
+        ckpt_on_device.load_tgt(ctx_dst.get(), 0, on_device_flags);
+        if (!llama_memory_seq_rm(llama_get_memory(ctx_dst.get()), 0, rollback_pos, -1)) {
+            fprintf(stderr, "%s : on-device draft rollback seq_rm failed\n", __func__);
+            return 1;
+        }
+
+        // 4. Replay and verify that ctx_dst produces identical finite logits to oracle ctx_src
+        if (!replay_and_compare("on-device-rejected", ctx_dst.get())) {
+            return 1;
+        }
     }
 
     // Repeat the load into a context that already has its own rollback state:

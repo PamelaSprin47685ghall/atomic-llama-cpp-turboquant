@@ -881,6 +881,14 @@ llama_context::llama_context(
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = true;
+    // In tensor-parallel (TP5) mode, the fused GDN shader's internal 'head_id % neq1'
+    // mispairs local Q/K heads with local V heads (TP5.md 8.2). Disable fused GDN
+    // so the graph uses the pure autoregressive DeltaNet with explicit head broadcasting.
+    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        cparams.fused_gdn_ar = false;
+        cparams.fused_gdn_ch = true;
+        cparams.auto_fgdn    = false;
+    }
 
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;
@@ -3935,6 +3943,23 @@ int llama_context::decode_impl(const llama_batch & batch_inp) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+
+                static const int meta_debug = []() {
+                    const char * env = getenv("GGML_META_DEBUG");
+                    return env ? atoi(env) : 0;
+                }();
+                if (meta_debug > 0) {
+                    ggml_backend_synchronize(backend_res);
+                    float max_l = -1e9f, min_l = 1e9f; int max_idx = -1;
+                    for (int v = 0; v < n_vocab; v++) {
+                        if (logits_out[v] > max_l) { max_l = logits_out[v]; max_idx = v; }
+                        if (logits_out[v] < min_l) { min_l = logits_out[v]; }
+                    }
+                    const float val0  = n_vocab > 0 ? logits_out[0] : 0.0f;
+                    const float val14 = n_vocab > 14 ? logits_out[14] : 0.0f;
+                    fprintf(stderr, "[tp5-logits-stat] min=%f max=%f top_id=%d val[0]=%f val[14]=%f\n",
+                            min_l, max_l, max_idx, val0, val14);
+                }
             }
         }
 
@@ -4962,8 +4987,30 @@ public:
 
             auto & mbuf = mbufs_new[buft];
 
-            mbuf.org.push_back(ggml_view_1d      (mbuf.ctx.get(), winfo.tensor, n, winfo.offset));
-            mbuf.cpy.push_back(ggml_new_tensor_1d(mbuf.ctx.get(), winfo.tensor->type, n));
+            // Preserve original row geometry when the slice covers whole row(s) of winfo.tensor
+            // rather than flattening to an anonymous 1D slice. This ensures that meta/TensorParallel
+            // buffers preserve their exact split dimension (e.g. AXIS_0 / AXIS_1 head slices) and
+            // strides across all shards.
+            ggml_tensor * org = nullptr;
+            ggml_tensor * cpy = nullptr;
+            const int64_t row_size = winfo.tensor->nb[1];
+            if (row_size > 0 && (winfo.offset % row_size == 0) && (winfo.size % row_size == 0) && winfo.tensor->ne[2] == 1 && winfo.tensor->ne[3] == 1) {
+                const int64_t ne0 = winfo.tensor->ne[0];
+                const int64_t ne1 = winfo.size / row_size;
+                org = ggml_view_2d(mbuf.ctx.get(), winfo.tensor, ne0, ne1, winfo.tensor->nb[1], winfo.offset);
+                cpy = ggml_new_tensor_2d(mbuf.ctx.get(), winfo.tensor->type, ne0, ne1);
+            } else {
+                org = ggml_view_1d(mbuf.ctx.get(), winfo.tensor, n, winfo.offset);
+                cpy = ggml_new_tensor_1d(mbuf.ctx.get(), winfo.tensor->type, n);
+            }
+
+            if (winfo.tensor->name[0] != '\0') {
+                ggml_set_name(cpy, winfo.tensor->name);
+                ggml_set_name(org, winfo.tensor->name);
+            }
+
+            mbuf.org.push_back(org);
+            mbuf.cpy.push_back(cpy);
         }
 
         for (auto & [buft, mbuf] : mbufs_new) {
@@ -5093,7 +5140,20 @@ public:
 
             auto & mbuf = mbufs_new[buft];
 
-            mbuf.org.push_back(ggml_view_1d(mbuf.ctx.get(), rinfo.tensor, n, rinfo.offset));
+            ggml_tensor * org = nullptr;
+            const int64_t row_size = rinfo.tensor->nb[1];
+            if (row_size > 0 && (rinfo.offset % row_size == 0) && (rinfo.size % row_size == 0) && rinfo.tensor->ne[2] == 1 && rinfo.tensor->ne[3] == 1) {
+                const int64_t ne0 = rinfo.tensor->ne[0];
+                const int64_t ne1 = rinfo.size / row_size;
+                org = ggml_view_2d(mbuf.ctx.get(), rinfo.tensor, ne0, ne1, rinfo.tensor->nb[1], rinfo.offset);
+            } else {
+                org = ggml_view_1d(mbuf.ctx.get(), rinfo.tensor, n, rinfo.offset);
+            }
+
+            if (rinfo.tensor->name[0] != '\0') {
+                ggml_set_name(org, rinfo.tensor->name);
+            }
+            mbuf.org.push_back(org);
 
             ggml_backend_view_init(mbuf.org.back());
         }

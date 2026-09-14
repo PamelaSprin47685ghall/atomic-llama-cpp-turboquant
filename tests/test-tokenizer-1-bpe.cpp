@@ -8,6 +8,7 @@
 #include <codecvt>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <locale>
 #include <string>
 #include <thread>

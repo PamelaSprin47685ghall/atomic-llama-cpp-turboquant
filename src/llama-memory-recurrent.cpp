@@ -1040,6 +1040,18 @@ void llama_memory_recurrent::clear_hand_row(int32_t hand_row) {
         }
     }
 
+    for (size_t il = 0; il < p_l.size(); ++il) {
+        ggml_tensor * p = p_l[il];
+        if (p) {
+            const size_t row_size = ggml_row_size(p->type, p->ne[0]);
+            std::vector<uint8_t> zero(row_size, 0);
+            for (uint32_t snapshot = 0; snapshot <= n_rs_seq; ++snapshot) {
+                const size_t row = (size_t) snapshot * size + (uint32_t) hand_row;
+                ggml_backend_tensor_set(p, zero.data(), row * row_size, row_size);
+            }
+        }
+    }
+
     for (size_t il = 0; il < s_l.size(); ++il) {
         if (is_s_shared((int32_t) il)) {
             ggml_tensor * d = d_l[il];
@@ -1798,6 +1810,25 @@ void llama_memory_recurrent::state_write_data(
         }
     }
 
+    // Iterate and write all the PLE conv (P) tensors where present
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        const int32_t has_p = (p_l[il] != nullptr) ? 1 : 0;
+        io.write(&has_p, sizeof(has_p));
+        if (!has_p) continue;
+
+        const int32_t p_type_i = (int32_t) p_l[il]->type;
+        io.write(&p_type_i, sizeof(p_type_i));
+
+        const uint64_t p_size_row = ggml_row_size(p_l[il]->type, p_l[il]->ne[0]);
+        io.write(&p_size_row, sizeof(p_size_row));
+
+        for (const auto & range : cell_ranges) {
+            const size_t range_size = range.second - range.first;
+            const size_t buf_size = range_size * p_size_row;
+            io.write_tensor(p_l[il], range.first * p_size_row, buf_size);
+        }
+    }
+
     if (!s_trans) {
         for (uint32_t il = 0; il < n_layer; ++il) {
             // skip null layers (read_data will handle this by checking "r_l" and "s_l" for null)
@@ -2045,6 +2076,42 @@ bool llama_memory_recurrent::state_read_data(
         if (cell_count) {
             // Read and set the keys for the whole cell range
             io.read_tensor(r_l[il], head * r_size_row, cell_count * r_size_row);
+        }
+    }
+
+    // Read PLE conv (P) tensors where present
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        int32_t has_p = 0;
+        io.read(&has_p, sizeof(has_p));
+        if (!has_p) {
+            if (p_l[il] != nullptr) {
+                LLAMA_LOG_ERROR("%s: state missing PLE conv tensor for layer %u (model requires PLE)\n", __func__, il);
+                return false;
+            }
+            continue;
+        }
+
+        int32_t p_type_i_ref;
+        io.read(&p_type_i_ref, sizeof(p_type_i_ref));
+        uint64_t p_size_row_ref;
+        io.read(&p_size_row_ref, sizeof(p_size_row_ref));
+
+        if (p_l[il] == nullptr) {
+            LLAMA_LOG_ERROR("%s: state carries PLE conv tensor for layer %u but model has none\n", __func__, il);
+            return false;
+        }
+        if ((int32_t) p_l[il]->type != p_type_i_ref) {
+            LLAMA_LOG_ERROR("%s: mismatched p type (%d != %d, layer %d)\n", __func__, (int) p_l[il]->type, p_type_i_ref, il);
+            return false;
+        }
+        const size_t p_size_row = ggml_row_size(p_l[il]->type, p_l[il]->ne[0]);
+        if (p_size_row != p_size_row_ref) {
+            LLAMA_LOG_ERROR("%s: mismatched p row size (%zu != %zu, layer %d)\n", __func__, p_size_row, (size_t) p_size_row_ref, il);
+            return false;
+        }
+
+        if (cell_count) {
+            io.read_tensor(p_l[il], head * p_size_row, cell_count * p_size_row);
         }
     }
 

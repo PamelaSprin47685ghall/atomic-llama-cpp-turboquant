@@ -6531,8 +6531,8 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     LLAMA_LOG_DEBUG("[cpy_k] layer %d: k_cur [%lld, %lld], n_tokens=%lld, n_embd_gqa=%lld, k type=%d\n",
         il, (long long)k_cur->ne[0], (long long)k_cur->ne[1], (long long)n_tokens, (long long)n_embd_gqa, (int)k->type);
 
-    // Logging hook to inspect k_idxs values when available on host
-    if (k_idxs && k_idxs->data && ggml_backend_buffer_is_host(k_idxs->buffer)) {
+    // Logging hook to inspect k_idxs values when available on host (diagnostic opt-in)
+    if (debug > 0 && k_idxs && k_idxs->data && ggml_backend_buffer_is_host(k_idxs->buffer)) {
         const int64_t * idxs_ptr = (const int64_t *) k_idxs->data;
         for (int64_t i = 0; i < std::min<int64_t>(10, n_tokens); ++i) {
             LLAMA_LOG_ERROR("[cpy_k] layer %d: token %lld -> k_idx %lld\n", il, (long long)i, (long long)idxs_ptr[i]);
@@ -6721,11 +6721,13 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     // with RoPE position and output flag. RoPE of finite inputs with finite
     // positions is finite, so finite positions here pin the NaN to pre-rope
     // Kcur (matmul/norm); a non-finite position pins it to the RoPE cache.
-    for (uint32_t i = 0; i < n_tokens; ++i) {
-        const long long pos = ubatch->pos ? (long long)ubatch->pos[i] : -1ll;
-        const int out = ubatch->output ? (int)ubatch->output[i] : -1;
-        LLAMA_LOG_ERROR("[k_idxs] ubatch_row %u -> dst slot %lld (pos %lld out %d hot %d)\n",
-            i, (long long)data[i], pos, out, (int)use_hot);
+    if (debug > 0) {
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const long long pos = ubatch->pos ? (long long)ubatch->pos[i] : -1ll;
+            const int out = ubatch->output ? (int)ubatch->output[i] : -1;
+            LLAMA_LOG_ERROR("[k_idxs] ubatch_row %u -> dst slot %lld (pos %lld out %d hot %d)\n",
+                i, (long long)data[i], pos, out, (int)use_hot);
+        }
     }
 }
 
@@ -7665,7 +7667,7 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
             io.write(&pos,      sizeof(pos));
             io.write(&n_seq_id, sizeof(n_seq_id));
 
-            if (hparams.n_pos_per_embd() > 1) {
+            if (has_cell_ext()) {
                 const llama_kv_cell_ext ext = cells.ext_get(i);
                 io.write(&ext, sizeof(ext));
             }
@@ -9034,6 +9036,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         ubatch.seq_id_unq[0] = dest_seq_id;
 
+        std::vector<llama_kv_cell_ext> exts;
+        if (has_cell_ext()) {
+            exts.resize(cell_count);
+        }
+
         for (uint32_t i = 0; i < cell_count; ++i) {
             llama_pos pos;
             uint32_t n_seq_id;
@@ -9046,12 +9053,15 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 return false;
             }
 
-            if (hparams.n_pos_per_embd() > 1) {
+            if (has_cell_ext()) {
                 llama_kv_cell_ext ext;
                 io.read(&ext, sizeof(ext));
+                exts[i] = ext;
 
-                ubatch.pos[i + ubatch.n_tokens]   = ext.y;
-                ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
+                if (hparams.n_pos_per_embd() > 1) {
+                    ubatch.pos[i + ubatch.n_tokens]   = ext.y;
+                    ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
+                }
             }
 
             // read the sequence id, but directly discard it - we will use dest_seq_id instead
@@ -9074,6 +9084,13 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         // TODO: we cannot yet restore llama_kv_cell_ext as the apply_ubatch() does not support it yet
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
         apply_ubatch(sinfo, ubatch);
+
+        if (has_cell_ext()) {
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                const uint32_t idx = sinfo.idxs[0][i];
+                cells.ext_set(idx, exts[i]);
+            }
+        }
 
         LLAMA_LOG_DEBUG("%s: cell_count = %d, dest_seq_id = %d\n", __func__, cell_count, dest_seq_id);
 
@@ -9104,7 +9121,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
             cells.pos_set(i, pos);
 
-            if (hparams.n_pos_per_embd() > 1) {
+            if (has_cell_ext()) {
                 llama_kv_cell_ext ext;
                 io.read(&ext, sizeof(ext));
                 cells.ext_set(i, ext);
