@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -385,7 +386,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ssm_beta        ("blk\\.\\d*\\.ssm_beta.weight");
     static const std::regex pattern_ssm_beta_alpha  ("blk\\.\\d*\\.ssm_ba.weight");
     static const std::regex pattern_r_cache         ("cache_r_l\\d*");
-    static const std::regex pattern_s_cache         ("cache_s_l\\d*");
+    // cache_s_l* holds the per-head recurrent state; cache_d_l* holds the RERoT hand-echo
+    // overlay for the same layer with the identical row layout. Both must follow the same
+    // head slicing, otherwise the group-layer combine (state_base + hand_echo) sees two
+    // different split states for the same shape and the meta backend refuses to place it.
+    static const std::regex pattern_s_cache         ("cache_(s|d)_l\\d*");
     static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
     static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
 
@@ -395,6 +400,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ffn_gate_bias     ("blk\\.\\d*\\.ffn_gate(_exps)?.bias");
     static const std::regex pattern_ffn_gate_up_weight("blk\\.\\d*\\.ffn_gate_up(_exps)?.weight");
     static const std::regex pattern_ffn_down_weight   ("blk\\.\\d*\\.ffn_down(_exps)?.weight");
+    static const std::regex pattern_ffn_up_shexp_weight  ("blk\\.\\d*\\.ffn_up_shexp\\.weight");
+    static const std::regex pattern_ffn_gate_shexp_weight("blk\\.\\d*\\.ffn_gate_shexp\\.weight");
+    static const std::regex pattern_ffn_down_shexp_weight("blk\\.\\d*\\.ffn_down_shexp\\.weight");
+    static const std::regex pattern_hc_weight            ("(blk\\.\\d*\\.)?hc_.*\\.weight");
+    static const std::regex pattern_indexer_weight       ("blk\\.\\d*\\.indexer\\..*\\.weight");
     static const std::regex pattern_ffn_down_bias     ("blk\\.\\d*\\.ffn_down.bias");
     static const std::regex pattern_ffn_down_exps_bias("blk\\.\\d*\\.ffn_down_exps.bias");
 
@@ -432,23 +442,27 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             GGML_ASSERT(length_prefix != std::string::npos);
             prefix = tensor_name.substr(0, length_prefix + 1);
             il = std::stoull(tensor_name.substr(4, length_prefix));
-            rotation = get_il_eff(il) % ud->n_devices;
+            // TP5.md 4.4: In TP5 test build, keep rotation=0 (fixed role) to eliminate layer rotation binding errors
+            rotation = (ud->model->arch == LLM_ARCH_QWEN4EXP && ud->n_devices == 5) ? 0 : (get_il_eff(il) % ud->n_devices);
         } else if (tensor_name.substr(0, 6) == "cache_") {
             const size_t layer_index_start = tensor_name.find("_l", 6);
             GGML_ASSERT(layer_index_start != std::string::npos);
             il = std::stoull(tensor_name.substr(layer_index_start + 2));
             prefix = "blk." + std::to_string(il) + ".";
-            rotation = get_il_eff(il) % ud->n_devices;
+            rotation = (ud->model->arch == LLM_ARCH_QWEN4EXP && ud->n_devices == 5) ? 0 : (get_il_eff(il) % ud->n_devices);
         } else {
             il = 0;
             rotation = hparams.n_layer() % ud->n_devices;
         }
         const ggml_tensor * tensor_axis_0 = suffix.empty() ? tensor : ud->model->get_tensor((prefix + suffix).c_str());
-        if (tensor_axis_0 == nullptr) {
-            GGML_ASSERT(!suffix_fallback.empty());
+        if (tensor_axis_0 == nullptr && !suffix_fallback.empty()) {
             tensor_axis_0 = ud->model->get_tensor((prefix + suffix_fallback).c_str());
         }
-        GGML_ASSERT(tensor_axis_0 != nullptr);
+        if (tensor_axis_0 == nullptr) {
+            // When loading a detached draft head sidecar or partial block where the reference
+            // tensor is not present, fall back to tensor itself so split layout uses its own geometry
+            tensor_axis_0 = tensor;
+        }
         return {axis, tensor_axis_0, il, rotation};
     };
 
@@ -470,6 +484,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(tensor->ne[1] == 1 ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_kv_cache) || std::regex_match(tensor_name, pattern_attn_sinks)) {
+            // The qwen4exp indexer cache shares the cache_k_l*/cache_v_l* names with the
+            // attention cache but has indexer_head_size columns (one MQA head) instead of
+            // n_embd_k_gqa. TP5.md 7.4 keeps the indexer and its top-k selection replicated
+            // on every rank in the first version: the block mask must be identical across
+            // ranks, so this cache is mirrored rather than head-sliced.
+            if (hparams.indexer_n_head > 0 && ud->model->arch == LLM_ARCH_QWEN4EXP &&
+                    tensor->ne[0] == (int64_t) hparams.indexer_head_size) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED, "attn_output.weight");
+            }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
@@ -503,6 +526,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_gate_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
+        if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) || std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight", "ffn_down_exps.weight");
+        }
         if (std::regex_match(tensor_name, pattern_ffn_up_bias) || std::regex_match(tensor_name, pattern_ffn_gate_bias)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
         }
@@ -511,6 +537,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
         if (std::regex_match(tensor_name, pattern_ffn_down_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
+        }
+        if (std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight", "ffn_down_exps.weight");
+        }
+        if (std::regex_match(tensor_name, pattern_hc_weight) || std::regex_match(tensor_name, pattern_indexer_weight)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
         if (std::regex_match(tensor_name, pattern_ffn_down_bias)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
@@ -521,6 +553,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         // output
         if (std::regex_match(tensor_name, pattern_output_weight)) {
+            // TP5.md 10.1: For Qwen4EXP TP5, keeping output.weight mirrored (only 380MB in Q6_K)
+            // ensures rank 0 directly computes full unfragmented vocabulary logits, avoiding
+            // any cross-backend logits extraction truncation.
+            if (ud->model->arch == LLM_ARCH_QWEN4EXP) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
@@ -647,15 +685,24 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t granularity_q = std::lcm(n_embd_q, blck_size_perf);
             if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_q_bias)) {
                 GGML_ASSERT(segments.size() == 1);
+                // Qwen4EXP has 24 Q heads with 2 KV heads (n_gqa = 12).
+                // Using n_embd_q = 12*256 = 3072 makes granularity 6144, which splits 24 heads
+                // over 5 devices as [0, 0, 12, 0, 12] heads (dropping 3 devices completely)!
+                // Slicing at whole-head boundaries (2*head_dim = 512) gives proper [4, 5, 5, 5, 5] heads:
+                if (ud->model->arch == LLM_ARCH_QWEN4EXP) {
+                    return {std::lcm(2 * (int64_t) hparams.n_embd_head_k(il), blck_size_perf)};
+                }
                 // some models have Q gate tensors, for those cases the granularity needs to be doubled:
-                if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
-                        ud->model->arch == LLM_ARCH_QWEN4EXP) {
+                if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE) {
                     return {std::lcm(2*n_embd_q, blck_size_perf)};
                 }
                 return {granularity_q};
             }
             if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
                 GGML_ASSERT(segments.size() == 1);
+                if (ud->model->arch == LLM_ARCH_QWEN4EXP) {
+                    return {std::lcm((int64_t) hparams.n_embd_head_k(il), blck_size_perf)};
+                }
                 return {granularity_q};
             }
 
@@ -700,6 +747,31 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (j > 0) {
                 tensor_split_scan[j] += tensor_split_scan[j - 1];
             }
+        }
+        // TP5.md 3.3 / 7.1 / 4.4: Qwen4EXP Attention KV Weights & Cache role table [1, 1, 2, 1, 1]
+        // 2 KV heads over 5 devices cannot be cleanly partitioned without replicas.
+        // wk/wv weights (axis 1) and cache_k/cache_v (axis 0) must follow the identical
+        // head allocation so that Kcur and cache_k share the exact same split state.
+        // Bridge role (index 2) holds both KV0 and KV1; others hold one head.
+        const bool is_qwen4exp_attn_kv = (ud->model->arch == LLM_ARCH_QWEN4EXP &&
+                                          ud->n_devices == 5 &&
+                                          (std::regex_match(tensor_name, pattern_kv_cache) ||
+                                           std::regex_match(tensor_name, pattern_kv_weight)) &&
+                                          tensor->ne[0] != (int64_t) hparams.indexer_head_size);
+        if (is_qwen4exp_attn_kv) {
+            const int64_t head_dim = hparams.n_embd_head_k(tc.il); // 256
+            const int kv_roles[5] = {1, 1, 2, 1, 1};
+            const int kv_head_starts[5] = {0, 0, 0, 1, 1};
+            split_state.indexed_replica = true;
+            for (size_t j = 0; j < 5; ++j) {
+                // TP5.md 4.4: Use fixed role mapping in test build to eliminate rotation binding errors
+                const size_t role = j;
+                split_state.ne[j] = kv_roles[role] * head_dim;
+                split_state.replica_start[j] = kv_head_starts[role] * head_dim;
+            }
+            split_state.nr[0] = 1;
+            split_state.n_segments = 1;
+            return split_state;
         }
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
         const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
@@ -1183,6 +1255,14 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 
     ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT_KV, hparams.n_head_kv_arr, hparams.n_layer(), false);
 
+    if (hparams.n_layer_nextn > 0 && hparams.n_layer() > 0) {
+        for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+            hparams.n_head_arr[il]     = hparams.n_head_arr[hparams.n_layer() - 1];
+            hparams.n_head_kv_arr[il]  = hparams.n_head_kv_arr[hparams.n_layer() - 1];
+            hparams.n_ff_arr[il]       = hparams.n_ff_arr[hparams.n_layer() - 1];
+        }
+    }
+
     bool rope_finetuned = false;
     ml.get_key(LLM_KV_ROPE_SCALING_FINETUNED, rope_finetuned, false);
     hparams.rope_finetuned = rope_finetuned;
@@ -1553,7 +1633,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
-    ml.done_getting_tensors();
+    ml.done_getting_tensors(ml.partial_load);
 
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
     // If sidecar scales exist, the output weight must be an actual output tensor.
@@ -1705,6 +1785,65 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     return true;
 }
+
+#ifndef _WIN32
+const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char * tensor_name, const ggml_tensor * t) {
+    if (ml.lazy.mode != LLAMA_LAZY_MODE_DIRECT) {
+        return nullptr;
+    }
+
+    if (!t) {
+        return nullptr;
+    }
+
+    if (const auto it = lazy_readers.find(tensor_name); it != lazy_readers.end()) {
+        return it->second.get();
+    }
+
+    const auto * w = ml.get_weight(tensor_name);
+    if (!w) {
+        // e.g. synthesised from metadata, no file rows to read
+        return nullptr;
+    }
+
+    // an independently opened buffered descriptor: dup() would share the
+    // loader's open file description, whose readahead advice and O_DIRECT
+    // flag would fight the small scattered row reads
+    const int fd = ::open(ml.files[w->idx]->name().c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        // e.g. a FILE*-backed model has no reopenable path; the tensor is
+        // still lazy, so keep serving it through the mmap reads
+        LLAMA_LOG_WARN("%s: could not open %s for direct reads (%s), using lazy mmap reads\n",
+                __func__, ml.files[w->idx]->name().c_str(), strerror(errno));
+        return nullptr;
+    }
+
+#ifdef __linux__
+    // rows are tiny and scattered, so sequential readahead would be pure waste
+    ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+#endif
+
+    // in-flight reads are IO queue depth, not compute; 2x cores worked well
+    // on NVMe and stays sane on smaller machines
+    const int n_threads = 2 * (int) std::max(1u, std::thread::hardware_concurrency());
+
+    auto reader = std::make_unique<llama_lazy_reader>(fd, w->offs,
+            ggml_row_size(t->type, t->ne[0]), t->ne[1], n_threads, t->type, t->ne[0]);
+
+    LLAMA_LOG_INFO("%s: direct reads enabled for %s: %" PRId64 " rows of %zu bytes at file offset %zu, %d threads\n",
+            __func__, tensor_name, reader->n_rows, reader->row_size, w->offs, n_threads);
+
+    lazy_readers[tensor_name] = std::move(reader);
+    return lazy_readers.at(tensor_name).get();
+}
+#else
+const llama_lazy_reader * llama_model_base::load_lazy_reader(llama_model_loader & ml, const char *, const ggml_tensor *) {
+    if (ml.lazy.mode == LLAMA_LAZY_MODE_DIRECT) {
+        LLAMA_LOG_WARN("%s: --lazy-mode on-direct is not supported on this platform, using lazy mmap reads\n", __func__);
+    }
+    return nullptr;
+}
+#endif
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
@@ -2297,8 +2436,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 // The MTP head is dense-attention only on hybrid Qwen3-Next/3.5/3.6, so use a plain
                 // attention KV cache for the MTP context instead of the hybrid wrapper.
                 const bool mtp_on_hybrid_qwen =
-                    params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-                    (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
+                    (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP || (arch == LLM_ARCH_QWEN4EXP && static_cast<const llama_model_qwen4exp *>(this)->is_mtp_only)) &&
+                    (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP);
 
                 if (llm_arch_is_recurrent(arch)) {
                     res = new llama_memory_recurrent(
@@ -2561,6 +2700,7 @@ llama_model_params llama_model_default_params() {
         /*.n_gpu_layers                =*/ -1,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_MMAP,
+        /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,

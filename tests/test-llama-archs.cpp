@@ -113,6 +113,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_layer = 3;
     } else if (arch == LLM_ARCH_CHAMELEON) {
         n_vocab = 10240;
+    } else if (arch == LLM_ARCH_QWEN4EXP) {
+        n_embd  = 128;
+        n_head  = 2;
+        n_ff    = 192;
+        n_layer = 4; // need interval 2 so we have full_attention and linear layers
     }
 
     const uint32_t n_embd_head = n_embd / n_head;
@@ -141,6 +146,33 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_TIME_MIX_EXTRA_DIM,      uint32_t(64));
     ms.add_kv(LLM_KV_TIME_DECAY_EXTRA_DIM,    uint32_t(128));
     ms.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL, uint32_t(2));
+
+    if (arch == LLM_ARCH_QWEN4EXP) {
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,    uint32_t(2));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(32));
+        ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, 1e-5f);
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, uint32_t(2));
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, uint32_t(32));
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,      uint32_t(4));
+        // Interval 2: linear layers 0/2, full attention layers 1/3; enable QSA at 3.
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,    std::vector<uint32_t>({0, 0, 0, 2}));
+        ms.add_kv(LLM_KV_SSM_CONV_KERNEL,              uint32_t(4));
+        ms.add_kv(LLM_KV_SSM_INNER_SIZE,               uint32_t(128));
+        ms.add_kv(LLM_KV_SSM_STATE_SIZE,               uint32_t(32));
+        ms.add_kv(LLM_KV_SSM_TIME_STEP_RANK,           uint32_t(2));
+        ms.add_kv(LLM_KV_SSM_GROUP_COUNT,              uint32_t(2));
+
+        // PLE convolution history belongs to a recurrent layer.
+        ms.add_kv(LLM_KV_PLE_LAYERS,                   std::vector<uint32_t>({0}));
+        ms.add_kv(LLM_KV_PLE_NGRAM_SIZE,               uint32_t(2));
+        ms.add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,          uint32_t(2));
+        ms.add_kv(LLM_KV_PLE_CONV_KERNEL,              uint32_t(4));
+        ms.add_kv(LLM_KV_PLE_EOS_TOKEN_ID,             uint32_t(0));
+        ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,   n_embd / 2);
+        ms.add_kv(LLM_KV_PLE_LAYER_MULTIPLIERS,        std::vector<uint64_t>({1234567ULL, 7654321ULL}));
+        ms.add_kv(LLM_KV_PLE_HEAD_OFFSETS,             std::vector<uint64_t>({0, 32}));
+        ms.add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,         std::vector<uint64_t>({32, 32}));
+    }
 
     if (arch == LLM_ARCH_PLAMO2 || arch == LLM_ARCH_JAMBA || arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE ||
             arch == LLM_ARCH_GRANITE_HYBRID || arch == LLM_ARCH_LFM2 || arch == LLM_ARCH_LFM2MOE || arch == LLM_ARCH_KIMI_LINEAR) {
@@ -374,6 +406,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_STEP35:
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_MELLUM:
+        case LLM_ARCH_QWEN4EXP:
             return true;
         default:
             return false;

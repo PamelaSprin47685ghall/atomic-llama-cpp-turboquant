@@ -522,7 +522,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         int           il) {
     const int64_t n_seq_tokens = q->ne[2];
 
-    LLAMA_LOG_ERROR("[gdn-dispatch] il=%d n_seq_tokens=%lld fused_ar=%d fused_ch=%d -> %s\n",
+    LLAMA_LOG_DEBUG("[gdn-dispatch] il=%d n_seq_tokens=%lld fused_ar=%d fused_ch=%d -> %s\n",
         il, (long long) n_seq_tokens, (int) cparams.fused_gdn_ar, (int) cparams.fused_gdn_ch,
         n_seq_tokens == 1 ? (cparams.fused_gdn_ar ? "FUSED-AR" : "AUTOREG") : (cparams.fused_gdn_ch ? "FUSED-CH" : "CHUNKING"));
 

@@ -18,6 +18,8 @@ add_library(llama
             llama-chat.cpp
             llama-context.cpp
             llama-cparams.cpp
+            llama-tp5-plan.h
+            llama-tp5-plan.cpp
             llama-flashprefill.h
             llama-flashprefill.cpp
             llama-flashprefill-metrics.h
