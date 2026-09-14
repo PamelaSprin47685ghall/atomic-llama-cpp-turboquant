@@ -2555,13 +2555,6 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.model                 = params_spec.mparams;
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
-        // If draft devices not explicitly set, inherit from target model to ensure GPU offloading
-        if (result.devices.empty()) {
-            result.devices = params.devices;
-        }
-        if (result.n_gpu_layers < 0 && params.n_gpu_layers > 0) {
-            result.n_gpu_layers = params.n_gpu_layers;
-        }
 
         if (params_spec.cpuparams.n_threads > 0) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
@@ -2637,10 +2630,6 @@ common_speculative_init_result::common_speculative_init_result(
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
-        // Ensure draft model uses same backend and tensor split mode if TP5 is enabled
-        if (params.tp5.enabled && mparams.split_mode == LLAMA_SPLIT_MODE_NONE) {
-            mparams.split_mode = LLAMA_SPLIT_MODE_TENSOR;
-        }
         llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());

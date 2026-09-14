@@ -36,7 +36,7 @@ export GGML_TP5_SYNC=${GGML_TP5_SYNC:-timeline}
 export GGML_TP5_RELAY=${GGML_TP5_RELAY:-off}
 export GGML_VK_CMD_REPLAY=${GGML_VK_CMD_REPLAY:-1}
 export GGML_VK_ALLOW_GRAPHICS_QUEUE=${GGML_VK_ALLOW_GRAPHICS_QUEUE:-1}
-TP5_ARGS=${TP5_ARGS:---tp5 qwen4exp-af --tp5-wire f16 --tp5-sync timeline -md "$MTP_MODEL" --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-ngl 999}
+TP5_ARGS=${TP5_ARGS:---tp5 qwen4exp-af --tp5-wire f16 --tp5-sync timeline -md "$MTP_MODEL" --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0}
 
 say() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
@@ -95,7 +95,7 @@ stdbuf -oL -eL "$BIN" -m "$MODEL" \
     -ctk q8_0 -ctv turbo4 \
     -b 2048 -ub 512 \
     --reasoning-preserve \
-    -c "$N_CTX_SLOT" -np "$N_SLOTS" --kv-size "$KV_SIZE" \
+    -c "$N_CTX_SLOT" -np "$N_SLOTS" \
     --host "$HOST" --port "$PORT" \
     $EXTRA_ARGS > "$LOG" 2>&1 &
 
