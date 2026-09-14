@@ -160,3 +160,8 @@ AGENTS.local.md
 
 # Checked-in manual artifacts
 !/wanxiangqi/generated/repetition-envelope.h
+
+# Local build/scratch artifacts
+
+/a.spv
+/pocs/vulkan-p2p/test-vulkan-p2p-allreduce

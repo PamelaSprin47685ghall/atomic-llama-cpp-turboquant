@@ -4,7 +4,187 @@
 
 本文面向实际实现者。没有看过原对话，也可以按本文完成设计审查、开发拆分和验收。本文新增的文件、类型、接口、命令行参数和测试目标均是**拟实现项**，不是当前仓库已经具备的功能。
 
-本轮交付仅为文档。做过源码检查、开发机只读环境检查及小尺寸 CPU 代数核对；没有编译本仓库，没有运行 Vulkan 测试、加载模型或复测五卡性能。文末列出源码和规范依据。
+本轮交付仅为文档。做过源码检查、开发机只读环境检查及小尺寸 CPU 代数核对；没有编译本仓库，没有运行 Vulkan 测试、加载模型或复测五卡性能。文末列出源码和规范依据。（注：以上属于 2026-09-12 历史设计初稿开篇说明；2026-09-13 最新工程实施与真机状态见下节。）
+
+---
+
+
+## 2026-09-14 重新插卡验证与通信计时修正
+
+> **硬件安全门：暂停后续模型/压力测试。** 后续只读复核发现本次 boot 新增 MCE，RAS数据库 `mce_record.id=103`：2026-09-14 07:39:47 UTC，socket0/cpu0/bank14，`Corrected patrol scrub error`，`n_errors=1 memory_channel=1`，物理地址 `0x0740e000`。这属于内存控制器纠错事件，不是已证实的 GPU/P2P 故障。历史记录自9月11日起在同一地址反复出现；9月14日03:20另有大量读纠错及OVERFLOW，EDAC记录指向 `CPU_SrcID#0_Ha#1_Chan#1_DIMM#0/#1`。本轮sysfs计数CE/UE均为0，不能覆盖/否定RAS持久记录；当前未见未纠正错误或PCIe AER记录。主板识别为 `X99-WS/IPMI`，最新scrub记录不足以唯一锁定两条中的哪条，也不能认定是本次重新插卡造成。
+>
+> 当前测试服务全部停止、五卡busy为0，不自动重启机器或继续加压。需要在维护窗口由现场检查该内存通道的DIMM/插槽并建立稳定基线后，再继续60/100 tok/s目标验证。证据：`/tmp/tp5-reseat-connectivity/machine-check-evidence.json`、`edac-snapshot.json` 和 `/var/lib/rasdaemon/ras-mc_event.db`。下文“内核无新增日志”是当时即时游标检查结果，**不能扩展为整个工作期间无MCE**；最终复核以此安全门为准。`ras-mc-ctl --errors` 能输出MCE记录，但在后续signal_event段因数据库列名不匹配退出2，故同时直接核对SQLite的第103条记录；未修改数据库或清空错误计数。
+
+- 重新插卡后五卡 `03:00.0/06:00.0/09:00.0/0c:00.0/0f:00.0` 全部绑定 amdgpu，sysfs 当前链路均为 8.0 GT/s ×16。五卡独立传输、十组双向 P2P 卡对（20 个方向）全部通过；未使用 host-relay，未加载模型。
+- 用户询问内核补丁与MCE关系后的只读核对：9月11日11:20:30已有相同地址0x0740e000的corrected scrub；对应boot `3f41df2e0d7f4ceeaf6bf0c8a2871b1c` 使用发行版7.0.0-31-generic，同boot后续内核回溯标记Not tainted。当前amdgpu模块安装文件时间为9月13日23:25:53（仅文件时间，不冒充首次加载时间）。9月14日03:20的boot `68b06e7658f94c319385bb3b500c6272` 亦为发行版内核，并在amdgpu初始化前已报告Bank8内存读错误；早期启动记录可能含保留硬件状态，不以此绝对排除上次运行的影响。
+- 据此更支持“内存通道/平台原已有可靠性问题”，不支持把所有MCE的起因都归给当前补丁；但没有受控A/B，仍不能排除补丁改变DMA路径、访问负载或触发条件而加重错误。普通DMA误写可造成数据破坏，但正常内存控制器会为写入重新生成ECC，因此它不等同于这里的ECC巡检纠错。`bus_dma_limit=44`约束IOVA分配，不是物理RAM地址；本机128GiB RAM远低于16TiB，不能把低地址MCE直接当作44位截断证据。GPU内部48位MC范围也不能单独证明总线P2P安全。历史部分boot含`pci=noaer`，故历史AER日志缺失不能用于排除PCIe问题；当前cmdline不含此参数。证据：`kernel-mce-causal-boots.json`、`kernel-mce-causal-summary.json`，同在 `/tmp/tp5-reseat-connectivity/`。本轮未切换内核、未加载模型、未执行A/B负载。
+- 五卡 2560 元素、16 轮变化输入的 F32/SYNC_FD、F16/SYNC_FD、F16/timeline 均通过，每组另含四轮真实 GPU producer；timeline 另通过八步无中间 host-sync 的依赖链。测试期间内核零新增日志，FD 增量为零，结束后显存回到原基线、GPU busy 全部为零。证据：`/tmp/tp5-reseat-connectivity/results.json` 和同目录逐卡对日志。
+- 修正 `ggml-vulkan-collective.cpp` 的计时重叠：旧 `p1_sub = t2-t1` 已包含 backpressure，却在 timeline 总计中再次加上 backpressure。现将其划为不重叠的区间，backpressure 包含 in-flight owner 槽位回收，`p1_sub` 从该区间结束后计时。旧 `CPU SUBMIT+BP TOTAL` 不能当作无重复的总耗时，也不是 GPU 执行时间。
+- 修正后五卡 F16/timeline 同一小测试通过（exit 0、内核无新增日志、FD 22→22）；一组暖态八次归约打印 `p1_sub=0.93 ms, cpu_backpressure=0.06 ms, p2_sub=1.11 ms, TOTAL=2.09 ms`（显示分项四舍五入）。这是调用区间统计，不包含全部外层工作，不能外推模型 tok/s。证据：`/tmp/tp5-reseat-connectivity/profile-corrected.log`。
+- 60/100 tok/s 目标仍未达成；以下旧状态与测量按其原测试时点解释。
+- 后续单实例真实模型测量 `tp5ReseatProfile`（无 sidecar、ctx512、b/ub32、Q8K/Turbo4V、F16/timeline、replay on）在中文提示“9.11和9.9哪个大？只回答较大的数字。”下错误回答 `9.11`。该次 5 个 completion tokens 的 1.65 tok/s **不是有效质量/性能验收**，不能宣称重复数字问题或整体数值正确性已全局解决。该请求与早期提示不相同，尚不能仅凭答案差异确定数值回归根因。
+- 当前该单实例日志显示每组 96 次归约、97 个子图（包含非归约尾部）；暖态部分 decode 的 `compute_async` 约149–297 ms、`comm` 约136–330 ms。二者都是主机调用区间，等待包含设备执行，不能直接称作纯 CPU 计算或纯 GPU 通信。已停止实例，逐卡显存回到基线，内核零新增日志。响应证据：`/tmp/tp5-reseat-connectivity/model-timing-response.json`；详细日志保留在 supervised process `tp5ReseatProfile`。
+- 复制 KV 序列化修复的 CPU 回归已通过：`build-tp5-cpu/bin/test-meta-reduce-boundary` 验证显式 `indexed_replica/replica_start`，Q8_0 两头 544 字节行按 `[272,272,544,272,272]` 分布在五 rank，canonical readback 只取每段最低 rank 的有效副本。覆盖 host 保存/脏写/非零偏移视图恢复、异步 API 中间行偏移、相邻行不变及 axis-2 F32 布局；原有归约与 recurrent checkpoint 回归也通过。此处只证明 CPU-backed meta transport，不代表真实 MTP 连续请求已验收。
+- 随后的真实模型准入发现新 reshape 快捷分支把 `[256,2,2]→[512,2]` 中“维度数值恰好相等”误作分片轴不变。已删除该快捷分支，按既有线性尺寸映射计算轴，并追加保留两个头数据的 CPU reshape 回归；重建后全套上述 CPU 回归通过。
+- **真实 MTP 连续请求复验通过**：单实例 `tp5MTPIndexedRestore`，显式 `--spec-type draft-mtp`、同一 sidecar、五卡、ctx512、b/ub32、F16/timeline、replay on；连续两次相同 `Once upon a time,` / max_tokens32 / temperature0 / seed1 请求均完成、文本逐字一致，第二请求不再触发 KV 恢复断言。实际 draft 分别 15/32、13/36 接受，eval 吞吐仅 1.47/1.43 tok/s，未达性能目标，也不证明广泛任务质量或长稳。运行中显存约13.4–13.7 GB/卡；内核无新增日志；测试完成后停止实例。响应和计数证据：`/tmp/tp5-reseat-connectivity/mtp-restored-request-{0,1}.json`，服务日志 `tp5MTPIndexedRestore`。
+
+- MoE 单 token 重放资格判断已修正：`MUL_MAT_ID` 输出是 `[rows, selected_experts, tokens, 1]`，旧检查错用 `ne[1]`，导致多专家 decode 子图不 eligible；现使用 `ne[2]`，普通 MUL_MAT 仍使用 `ne[1]`。新增真实单卡动态专家 ID/输入回归在修复前因重放计数不符失败，修复后数值通过且出现3次命中；完整 Vulkan 重放套件9/9通过，内核无新增日志。证据：`/tmp/tp5-reseat-connectivity/moe-replay-before.log`、`replay-nine-tests.log`。模型端吞吐收益尚待独立测量。
+- 中文数字比较错答的独立 CPU 对照：同一主干、同一 prompt/seed1/temperature0、Q8K/Turbo4V、reasoning off、CPU-only构建（`-ngl 0 -dev none`）同样输出 `9.11`。这不能单独证明 TP5 数值退化；也不能据此把错答算作质量通过。证据：`/tmp/tp5-reseat-connectivity/cpu-quality-reference.json`；CPU实例已停止，期间显存保持空闲基线。
+- MoE 修复后单实例 TP5 复测（`GGML_META_DEBUG=1`，带诊断开销）中文比较输出仍与 CPU 相同，5 tokens 为1.90 tok/s；计数请求完整正确输出1至12，38 tokens 为2.36 tok/s。后段主机计时为96归约/97子图，compute_async约111–132 ms、comm约222–261 ms；其中backpressure约201–216 ms，不能把它直接等同于纯跨卡传输耗时。内核无新增日志，实例已停止。证据：`/tmp/tp5-reseat-connectivity/moe-model-after-{0,1}.json` 和 `tp5ReseatProfile` 日志；尚无达到60/100 tok/s的证据。
+- 关闭 `GGML_META_DEBUG` 后同一计数请求为2.38 tok/s（38 tokens/15959 ms），未见仅靠关闭日志实现的大幅改善。单次运行时 sysfs 采样五卡 busy 为8/23/24/23/13%，显存约12.5–12.7 GB/卡，PCIe均8 GT/s×16；这只是瞬时采样，不据此断言纯GPU执行时间。证据：`quiet-benchmark-sensors.json` 及服务 `tp5MoEQuietBench`。
+- 对独立进程 `tp5IoctlTrace` 运行有界 ioctl trace，1至3计数请求正确完成；根据响应结尾减去eval时长估算的4.645秒decode窗口中，单一主线程有23930次AMDGPU_CS（累计751 ms）、9058次TIMELINE_WAIT（721 ms）、4851次SYNCOBJ_WAIT（99 ms）及4913次GEM_CREATE（76 ms）。strace自身会扰动时延，且该窗口边界为估算，不能作为吞吐基准或把全部等待归因于纯通信。证据：`driver-ioctl.trace`、`driver-ioctl-summary.json`、`driver-ioctl-request.json`，均在 `/tmp/tp5-reseat-connectivity/`。
+- 停载后的离线归因边界：保存的轨迹中五个DRM fd各有4761–4859次CS、981–985次GEM_CREATE，未显示仅单一fd异常集中的特征；fd本身不作为稳定PCI设备身份。`ggml_vk_submit()`一次调用可携带多个VkSubmitInfo，而staging同步读写也有提交/等待路径，不能把每次AMDGPU_CS都算成一次AllReduce。当前trace只保留ioctl参数指针，无用户态栈和分配大小，不能判定GEM_CREATE来自命令池、staging或其它driver分配。源码确认collective的t0在`tp5_record_plan()`之前，录制/淘汰成本已经计入p1_rec；不能据未经证明的“计时遗漏”或“64项缓存必然抖动”继续改代码。分fd结果：`driver-ioctl-by-fd.json`。精确来源仍需硬件维护后受控采样/计数关联，本轮仅分析既有文件，没有启动进程或负载。
+- 固件与微码现状核对：主板 `ASUSTeK X99-WS/IPMI` 当前 BIOS 为 `4001`（2019-05-28），华硕官方支持页该主板的最新官方 BIOS 正是 `4001`；处理器 E5-2699A v4（CPUID `0x000406f1`）当前运行微码为 `0xb000040`，Ubuntu 26.04 `intel-microcode` 与 Intel 官方发布的该 CPU 最新公开微码正是 `0xb000040`（2021-05-19/2021-06-08 release）。官方标准渠道在此 CPU/主板上没有更高版本的官方 BIOS 或微码可升。
+- 故“升级官方最新 BIOS/微码”在当前软硬件配置下已处于最新状态，无法通过该软件途径消除内存通道纠错；硬件维护（DIMM/插槽接触、单条轮换）与 BIOS 内存运行参数检查仍为唯一有效的前进路径。
+- **该 trace 的停止阶段异常**：监督器停止strace进程树时日志出现第二次interrupt，随后主进程SIGSEGV（地址0x78），exit139；请求本身已完成。尚未定位退出异常根因，不宣称正常清理退出。五卡显存最终恢复基线、内核无新增日志；后续须区分双重信号处理/对象销毁问题与推理期问题。
+- 重复信号路径已改用 `std::_Exit(1)`，不再从信号处理器调用 stdio / `exit` 并重入全局析构；首个信号的正常关闭路径未改变。实际无模型 router 进程、一个未传完的本地 HTTP 请求、相同监督器 stop 路径的 smoke 中，strace 记录相隔约0.94 ms的两次SIGTERM（不同线程）后直接 `exit_group(1)`，无SIGSEGV、无残留server，内核无新增日志。证据：`/tmp/tp5-reseat-connectivity/shutdown-signals.trace`。这是重复信号强退行为证明，不是模型推理或所有退出场景的验收；未为复验该信号路径再次加载大模型。
+
+## 2026-09-13 当前实施现状与工程交接
+
+### 1. 目标状态与验收红线（全部未达成，保持 OPEN）
+
+- **TP5 > 60 tok/s 与全集成 > 100 tok/s 目标未达成**：TP5 端到端正确生成与吞吐验收尚未通过，两项目标继续保持 **OPEN**；下文 CPU 验证与集合通信微基准不代替 TP5 验收。
+- **历史吞吐率基准声明无效**：早期在 GPU 上测得的“64 次重复输出字符 '3'，吞吐率 3.02 tok/s”属于模型退化输出（生成与提示词无关的重复字符），是**无效（INVALID）的吞吐率基准**，不可作为性能参考或向外推演。
+- **全模型有限正确生成初步验证，但 96 道归约、60/100 目标与全集成验收继续保持 OPEN**：Main 已完成 5-GPU 真实 6 分片模型全卡加载与受控推理测试，在短测试用例下成功获得正确回答（生成 `"9.9"` 及 `"1..12"`），证实五卡直连通信与计算链路打通。但当前测得的生成吞吐（约 2.25~2.55 tok/s）仅为短序列微测试用例耗时，**绝非目标性能基准**；首次真实 AllReduce 追踪显示每层存在 3 次归约（`attnout`, `routedout`, `sharedgatedout`），**96 道归约目标仍未达成**；全模型完整质量评测、长上下文与 60/100 tok/s 验收继续保持 **OPEN**。
+- **GPU 重复输出 '3' 退化在当前两项受测 Prompt 下确认修复**：在本次 5 卡纯直连真实模型推理中，模型分别输出有效回答 `"9.9"`（4 tokens，stop）与有序计数 `"1 2 3 4 5 6 7 8 9 10 11 12"`（27 tokens，stop），未见历史退化自旋输出，针对这两项具体用例确认修复。但在大模型全场景生成质量、长上下文评测与吞吐性能上仍保持 **OPEN**。
+- **无 Host 回退硬闭环达成（No-Host Fallback Closed）**：底层 Vulkan collective 已彻底移除 relay 通信算法且 CLI 预先硬拦截；上层 `ggml-backend-meta.cpp` 经修复与 CPU mock 校验，当 native communicator 初始化失败时构造函数直接返回 nullptr 并完整清理已分配 backends，确认不会隐式回退到通用 CPU 跨卡通信，**无 host 回退链路正式标记为闭环（CLOSED）**。
+
+### 2. 硬件拓扑映射与硬件安全恢复（从全局停机转为受控准入）
+
+- **当前实际卡槽与 PCI BDF 拓扑（Card 1..5）**：
+  - **Card 1**: `0000:0f:00.0`
+  - **Card 2**: `0000:09:00.0`
+  - **Card 3**: `0000:0c:00.0`
+  - **Card 4**: `0000:06:00.0`
+  - **Card 5**: `0000:03:00.0`
+  *(当前 5 卡实际物理 BDF 对应为 0f / 09 / 0c / 06 / 03，非连续旧拓扑)*
+- **18:59..19:18 DMAR IOMMU 权限故障事件（历史事实记录）**：
+  目标机在 18:59 至 19:18 期间连续触发 DMAR IOMMU 权限故障（PTE faults，非已证实的硬件损坏），涉及全部五张卡（PCIe `03:00.0`、`06:00.0`、`09:00.0`、`0c:00.0`、`0f:00.0`）以及故障 IOVA 地址 `0xffff7ab2000`。非特权 `journalctl -k` 只读可用并已独立证实 18:59..19:18 全量 PTE faults。
+- **GPU 安全门更新：受控串行准入替代全局停机**：
+  经内核 `bus_dma_limit = 44` 补丁加载及用户态 Host Barrier 联合修复，硬件级 DMA 访问故障与五卡 P2P 通信已完成全链路实机验证并闭环。此前设立的全局绝对停机（GLOBAL SAFETY HOLD）正式解除，转入**受控串行准入策略**：
+  - **仅允许 Main 专职执行串行、有界、受限的 GPU 运行时验证**；
+  - **严禁**非 Main 的 subagents 自行启动或提交任何 GPU 进程；
+  - **严禁**盲目加载全量大模型、严禁并发执行多个 GPU 任务、严禁无界自旋轮询（spin）、严禁通过显存分配器 override 强行超额分配；
+  - 用户铁律保持生效：**绝对禁止 host-relay 与隐式 CPU 跨卡回退**，跨卡传输必须为真实 peer VRAM P2P 直连。
+- **Sudo 权限过期与非特权日志监控状态**：当前目标机 `sudo` 提权授权已过期；后续内核日志监控全面切换为由用户授权的非特权 `journalctl -k -b` JSON cursor 增量读取；监控确认**零新增 GPU 错误**，不再发起任何需特权的新操作。
+- **安全基本原则**：**单测数值通过 ≠ 硬件安全准入（Numeric proof != safety approval）**。微基准或 P2P 通信通过不等于大模型全图安全，任何脱机测试或局部算子正确性，均不得作为绕过安全边界或随意启动未经审查的 GPU 大模型的许可。
+
+#### 2.1 只读排查发现的 DMA 地址宽度差异
+
+- 五卡 sysfs 的 `dma_mask_bits` / `consistent_dma_mask_bits` 均为 **48**。本机 `/usr/src/linux-source-7.0.0/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c` 也将 `dma_set_mask_and_coherent` 改为 `DMA_BIT_MASK(48)`，而 [Linux v7.0 上游同一路径](https://github.com/torvalds/linux/blob/v7.0/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c) 使用 **44**；两者的内部 `mc_mask` 都是 48 位。内部 MC/GPU 页表地址宽度不能单独证明 PCIe DMA 地址宽度。
+- 本机 `amdgpu_device_is_peer_accessible` 保留 `amdgpu_device_check_iommu_remap`，但其后备地址范围检查改用 GPU `mc_mask`；[上游版本](https://github.com/torvalds/linux/blob/v7.0/drivers/gpu/drm/amd/amdgpu/amdgpu_device.c) 使用设备 `dma_mask`。**并非无条件允许 P2P**，也未证明此 P2P 分支造成普通单卡 host-staging 故障。
+- **运行模块身份历史记录**：故障排查阶段，初始运行 amdgpu 的 GNU build-id 为 `e5aa3e30f14f392e2787eac3569fd2a17eb0b984`，srcversion 为 `C4F528284950929D0550D1B`，模块 SHA-256 为 `96a23904ab197c7809dbd4c9eb7ffdddaf0247b460b60befa66ba7f8195c718a`；其 `gmc_v10_0_sw_init` 反汇编确认将 `0xffffffffffff` 传给 `dma_set_mask` 与 `dma_set_coherent_mask`。
+- 运行内核 `/sys/kernel/notes` 的 build-id 为 `3d97037d2a17680fbcb9d5c1b2e469fb3069e0fb`，与 `/usr/src/linux-source-7.0.0/vmlinux` 匹配。通过只读 `/proc/kcore` 获取 VT-d 页表，证实 SSPT 根表 PA `0x10cf96000` 索引 31 为零，历史故障 IOVA `0x0ffff7ab2000/3000` 无有效根映射，而高位 `0xfffff7ab2000/3000` 存在有效映射，高低地址恰有 `high & ((1ULL << 44) - 1) == fault` 的截断关系。
+
+#### 2.2 保留高 BAR、约束 DMA/IOVA 的内核修复加载与真机全链路闭环验证
+
+- **用户硬约束**：五卡能力必须保留；不准 host-relay，不准隐式 CPU 跨卡回退。跨卡验收只能使用真实 peer VRAM P2P。原有 host-relay 数值证据不再是目标方案的验收依据。
+- **真实 BIOS 证据**：ASUS X99-WS/IPMI、BIOS 4001 的实际 DSDT 中，`\_SB.PCI0.P0RS` 的 QWordMemory 固定声明 `0x380000000000..0x383fffffffff`（56 TiB 起、256 GiB 窗口），`_CRS` 直接返回该资源模板。五卡 16 GiB BAR 位于该高窗口；保留原始表 `/tmp/tp5-dsdt.aml` 与反汇编 `/tmp/tp5-dsdt.dsl`。未改动 ACPI、BIOS 或 PCI 物理寄存器。
+- **内核修复方案（高物理 BAR 与 44 位总线限制隔离）**：
+  保留 `dma_set_mask_and_coherent(..., DMA_BIT_MASK(48))` 与高 BAR 不变，在其前设置 `dev->bus_dma_limit = min_not_zero(dev->bus_dma_limit, (u64)DMA_BIT_MASK(44))`。使 `iommu_dma_alloc_iova()` 的 IOVA 分配被严格限制在 44 位以内，AMDGPU peer VRAM 导出走 `dma_map_resource()`，成功将高位物理 BAR 映射为低位安全 IOVA。
+- **内核模块成功加载与五卡重绑定**：
+  - 模块 build-id：`5c548acdeadffecf0dd4550595c1e4653aa1f78f`（产物文件 `/tmp/tp5-dma-window/amdgpu-candidate.ko`）。
+  - 首次加载参数异常与恢复：首次尝试 insmod 时在 GPU 初始化前失败退出，原因在于模块参数序列化逻辑将 `backlight=-1` 传入了 `bint` 类型参数导致内核解析失败；立即重试并剔除了默认的 `bint=-1` 参数后成功加载；**全程无需物理机重启，无需修改 BIOS**。
+  - 五卡绑定状态验证：全部五张卡（BDF `03:00.0`, `06:00.0`, `09:00.0`, `0c:00.0`, `0f:00.0`）正常绑定至修复后的 amdgpu，sysfs 中 `dma_mask_bits` 保持 48，高 BAR 地址保持不变（`0x380000000000..0x3823ffffffff`），空闲状态 refcnt=0，GPU 负载 0%（证据：`/tmp/tp5-dma-window/post-reload.json`）。
+- **逐级真机通信验证（全项通过，dmesg 零新增错误记录）**：
+  - **第一级：五卡单卡 10 KiB 隔离传输验证**：五张卡独立执行 `test-vulkan-command-replay --transfer-only`，每卡 10 KiB 输入与 10 KiB 偏置写入传输后，前 2048 个 float 精确一致，全量 5 卡全部 PASS，dmesg 保持零新增 DMAR PTE 记录（证据：`/tmp/tp5-dma-window/transfer-results.json`）。
+  - **第二级：10 组无序卡对（20 个有向 P2P 链路）直连验证**：运行 `test-vulkan-command-replay --p2p-pair`，覆盖全部 10 组双向卡对，vary 变异测试与真实 GPU 图生产者（GPU producer）写入均完全通过，内核日志无新增错误（证据：`/tmp/tp5-dma-window/direct-pair-results.json` 及各 `pair-*-*.log`）。
+  - **第三级：五卡纯直连 Mesh AllReduce 压力测试**：运行纯直连重编二进制（`artifact://838`）的 `test-vulkan-tp5-mesh`（F16 导线、syncfd 信号、2560 元素），连续通过 16 轮变异测试、8 轮真实 GPU 图生产者（async compute -> flush -> AR）测试、以及 2 个 epoch 共 576 轮对抗回归测试（adversarial regression suite 288x2）。测试前后文件句柄数保持 22 → 22（增量 0，无 fd 泄漏），内核日志监控 `direct-only-five-kernel.log` 保持完全为空（证据：`/tmp/tp5-dma-window/direct-only-five-stress.log`）。
+  - **测试封装器输出辨析**：外层测试脚本最初因未匹配到字面大写字符串 `"PASS"` 误判报错，而底层测试进程实际以 exit 0 退出并打印标准 `"OK"`，已确认为真实通过。
+  - **真实 Peer VRAM 驻留物理硬证据**：`/tmp/tp5-dma-window/five-peer-residency-after-copy.json` 证实，全部 5 张导出卡的缓冲区均为真实 `28672 byte VRAM VISIBLE`（inode 1457..1461），且接收端全部 20 个导入缓冲区严格引用相同的 inode。导入端在显存记账中显示的 `GTT` 代表 GART 物理地址空间映射（用于 PCIe P2P 寻址），**绝非** CPU 内存或主机中转。
+  - **传输修复补丁在场状态说明**：在数据传输阶段损坏消除时，内核态 `bus_dma_limit=44` 约束与用户态 Host Barrier 补丁两项修改**同时在场（both patches present）**；不宣称已具备排除其他变量的严格因果链证明二者各自单独是否严格必要。
+- **驱动持久化部署与引导镜像验证**：
+  - 持久化模块：已安装至 `/lib/modules/7.0.14/updates/tp5/amdgpu.ko`，SHA-256 为 `b8c6ad0ff8d55efb002e5ee0a38dd1688502953a69e1b92761d9f564fd0c96a7`。
+  - 源码更新：`/usr/src/linux-source-7.0.0/drivers/gpu/drm/amd/amdgpu/gmc_v10_0.c` 已应用 `dma-window.patch`。
+  - depmod 与 initramfs 更新：已完成 `depmod -a 7.0.14`（`modinfo -n amdgpu` 确认为 updates 路径）以及 `update-initramfs -u -k 7.0.14`，生成的 initramfs SHA-256 为 `0483181217e36591bda990223cc47b25ee6d54add612dea9d609c8e4de6c54d1`。
+  - initrd 解包校验：解包提取的 `usr/lib/modules/7.0.14/updates/tp5/amdgpu.ko` SHA-256 与安装模块完全一致（匹配证据：`/tmp/tp5-dma-window/initrd-module-sha256.txt`）。
+  - 备份与引导未验证限制：在 `/root/tp5-dma-window-5c548acd/` 下保存了包含 `deployment.json`、原始模块、补丁与全部日志的完整备份。**重要限制**：本机未执行物理重启，**引导启动执行（boot execution）从 initramfs 加载驱动的状态尚未进行真机冷启动验证**。
+
+### 3. 已交付与当前验证证据（事实基线）
+
+#### 3.1 CPU 侧已验证证据
+- **主模型 6-shard Qwen3.8 CPU 完整推理验证**：
+  `Qwen3.8-Flash-Next-APEX-I-Compact` 六分片模型，在 CPU directPLE、F16KV、ctx512、b/ub32、np1 下成功执行，端到端返回正确推理结果 `"9.9"`（证据文件：`/tmp/tp5-cpu-reference-response.json`）。
+- **原生 Sidecar CPU Draft-MTP 投机推理验证**：
+  - 短序列：`nmax=2` 正确回答 `"9.9"`（draft 2/2 全接受，predicted 生成阶段耗时 740 ms，证据文件：`/tmp/tp5-cpu-mtp-response.json`）；
+  - 长序列：生成 `"1 2 3 4 5 6 7 8 9 10 11 12"`（draft 18/18 全接受，predicted 生成阶段耗时 6588 ms，证据文件：`/tmp/tp5-cpu-mtp-long-response.json`）。
+- **Tiny CPU 算子与状态回滚验证**：
+  - QSA 完整重算 vs 增量缓存，结合 IQ4 PLE（mmap 与 direct 两种读取方式），2432 个比对数值实现 `max_abs_error = 0`；
+  - Tiny MTP 完整图 vs 分离式执行（detached），1536 个比对数值实现 `max_abs_error = 0`；
+  - 循环状态（Recurrent state）ON_DEVICE dirty PLE/QSA 快照回滚：在修复 `p_l` PLE 卷积历史快照缺失及 KV token 序列化记账（session 版本 10，seq 版本 3）后，通过 ASAN 及 Release 构建下的完整（full）、部分（partial）及同上下文（samectx）回滚断言（`build-tp5-cpu/bin/test-recurrent-state-rollback` 通过）。
+- **多 Rank 内存与归约边界**：
+  - CPU 5-rank 非均匀行拷贝（`[10, 10, 10, 10, 8] * 64`，共 3072 floats）精确恢复，未影响其它行（`build-tp5-cpu/bin/test-meta-reduce-boundary` 通过）；
+  - 默认 CPU 归约门控求和（gated sum 1 AllReduce）单测试例精确通过；全模型是否达到目标 96 道归约边界、以及其数值正确性仍未实测；
+  - #27301 内存分配器 CPU 测试通过，GPU 融合集成尚待推进；
+  - DEBUG 1 CPU 归约 + 分配器 + checkpoint 测试全部通过（`artifact://704`，覆盖门控/非线性/扇出/交错数值，已移除 mutating getter debug format）；
+  - CPU 配对 TopK oracle 32/32 测试通过（256 专家，22 tokens，k=6；注：仅作为 CPU oracle 参考，不证明 Vulkan GPU 融合）。
+  - **最新 CPU 联合单测全通（CTEST 4/4 通过）**：涵盖 `allocator`、`tp5plan`、`qsa-pooled` 以及 `meta-reduce`（含 native communicator 初始化失败与缺失 allreduce 清理 mock 路径，证实 comm_init 返回 nullptr 时安全 fail-closed 且无泄漏）。
+- **真实 48 层图的元数据离线探针未能提供归约数量证据**：仅链接 CPU 构建，使用真实六分片元数据、`no_alloc=true`、显式五 CPU meta ranks、ctx256/b1/ub1 与 Q8/Turbo4 KV；初始化建立 8995-node 图，但外层 scheduler 的 `graph splits = 2` **不是** meta AllReduce 数量。4 GiB 地址空间限制先在固定 meta 元数据 arena 分配处触发；提高至有界 12 GiB 后，decode 在 `ggml_backend_tensor_alloc` 断言，仍未进入 meta graph compute。dummy 权重已有 buffer、却没有 data，不满足执行分配契约；未绕过断言、未执行权重计算，两个调试进程均已终止。保留 `/tmp/tp5-topology-metadata.log`；全模型 96 道归约与其 GPU 数值正确性仍未证明。
+
+#### 3.2 GPU 侧有限证据与回归状态（受限及失败项）
+- **GPU 0 历史有限数值证据**：早期 GPU 0 上 sparse 11 用例数值通过（含 Q8 / Turbo），mask 变异 3 次 replay 命中；6 个数值与生命周期回放用例通过（含同图 offset、145 保留、270 驱逐）。
+- **真机 5-GPU 纯直连（Direct P2P）全分片真实大模型首轮生成验证（已获得有限正确生成证据）**：
+  - 运行配置：Main 执行 `tp5DirectRecovery`，使用配置 `b32 ub32 ctx512 np1 kv512, Q8K/Turbo4V, directPLE, -lmnone, --nohost, --norepack, F32wire SYNCFD relayoff replayoff`，成功将全部 6 个模型分片完整载入 5 张 RX 6800 GPU。
+  - 服务健康状态：Health 端点返回 HTTP 200。
+  - 逐卡显存驻留（VRAM）：五卡实际占用分别为 `[12446113792, 12679655424, 12478074880, 12679847936, 12679671808]` 字节（约 11.59 ~ 11.81 GiB/卡，各卡均在 16 GiB 物理容量安全范围内）。
+  - 首轮推理正确性实证：
+    - 用例 1（参考推理）：Prompt 33 tokens，生成 4 completion tokens，正确返回 `"9.9"`（finish_reason: `stop`，生成耗时 1775 ms，吞吐 2.2534 tok/s；证据文件：`/tmp/tp5-direct-recovery-request.json` 与 `/tmp/tp5-direct-recovery-response.json`）。
+    - 用例 2（长输出计数）：Prompt 36 tokens（1 cached），生成 27 completion tokens，精确按序输出 `"1 2 3 4 5 6 7 8 9 10 11 12"`（finish_reason: `stop`，生成耗时 10593 ms，吞吐 2.5488 tok/s；证据文件：`/tmp/tp5-direct-count-request.json` 与 `/tmp/tp5-direct-count-response.json`）。
+  - 严格边界与不可外推限制：
+    - **不宣称严格 CPU 等价性**：CPU 参考推理使用 34 tokens prompt 且 KV 缓存配置不同（如 F16KV vs Turbo4V），与本次 33 tokens GPU 运行配置存在差异。
+    - **96 道归约目标未达成**：首次真实 AllReduce 追踪记录显示每层执行 3 次归约（`attnout`, `routedout`, `sharedgatedout`），未满足 96 目标架构折叠。
+  - **全程内核监控与优雅停机释放**：两次推理请求执行与 Main 发起优雅停机后，内核日志监控（`/tmp/tp5-direct-model-kernel.log`）**保持完全为空（零新增内核报错）**；模型进程退出后全部 5 张卡的显存均已完全释放恢复至基线 17.2 MB（空闲状态）。当前用于本次推理的构建产物 SHA-256 见 `/tmp/tp5-direct-model-artifacts.sha256`。
+  - **全质量与性能目标限制**：本次测试证实基础正确生成能力，但全模型长文本、复杂 Prompt 质量评测与 60/100 tok/s 性能验收继续保持 **OPEN**。
+- **最新受控排查异常发现（均为 CPU 用户态故障，非硬件级或驱动重置）**：
+  - **Replay 修复闭环与单测全通（8/8 PASS）**：经确定性整型修复与精确计数序列修正后，Replay 完整生命周期测试套件全部以 exit 0 通过（8/8 PASS，证据：`/tmp/tp5-replay-lifecycle-test-pass.log`，覆盖交替输入命中/记录、算子参数变异、形状变异、View 偏移重绑失效、145 个大子图工作集命中、270 图容量淘汰重用、10KB 传输保序及 M=32/N=509/K=2112 split-K 预分配）。
+  - **真机全模型 Replay ON + Timeline F16 联合验证（正确生成，无段错误，内核清洁）**：在真机 5-GPU 纯直连下，开启 Replay ON 与 Timeline F16，运行模型推理成功以 finish_reason `stop` 精确生成 `"9.9"` 与 `"1 2 3 4 5 6 7 8 9 10 11 12"`。无启动前或用户态 SIGSEGV 崩溃，内核监控保持完全清洁；27 token 计数生成吞吐测得为 **3.08 tok/s**（注：此为短用例局部耗时，**绝非目标性能基准**）。
+  - **Timeline 5-GPU 压力测试与真机未配对吞吐基线**：Timeline 在 F32 与 F16 模式下均在 5 卡纯直连下无故障通过全部 576 轮对抗测试与 8 轮依赖消费图测试；真机模型在配对提交优化（pair-submit）前的未配对提交状态下测得基线约为 **~2.89 tok/s**。配对提交（pair-submit）以及模型在配对条件下的端到端执行仍在专职推进中。
+  - **配对 Timeline 优化首测异常记录（禁止视为优化成果）**：最新尝试的配对 Timeline 优化在首轮受限 2-GPU F16 测试中**未通过**（在第 3 轮 easy sum 归约中产生 59 个元素比对不匹配，无 GPU 内核故障，见 `/tmp/tp5-timeline-paired-first.log`）。此前基于已测试二进制的未配对 F32/F16 证据、96 道归约模型与各项生命周期证明依然有效；当前源码工作树中的配对提交代码处于失效状态，待专职修复/回滚并由 Main 重新测试。**严禁宣称跨卡同步优化已达成目标（NOT validated at goal）**。
+  - **微型 GPU 检查点 CLI 越界修复并已重新构建验证（EXIT 0）**：`common/fit.cpp` 修复后已完成重新构建；此前崩溃的 `-dev Vulkan0` 微型 checkpoint CLI 运行成功以 exit 0 退出，完整通过 full/partial/ON_DEVICE dirty 回滚断言（证据：`/tmp/tp5-tiny-gpu-checkpoint-after-fit.log` 与 `placement.log`）；日志虽未显式打印 GPU 名字，但 Main 通过 DAP 单步调试已确认 `ctx->backends[0]` 名称确为 `Vulkan0` 并顺利执行退出，内核保持清洁。
+  - **真机五张独立物理 GPU 跨卡非均匀行拷贝实测通过（组件级验证）**：执行 `test-meta-reduce-boundary --vulkan-state-copy-only`，成功以 exit 0 退出；在 5 张物理 RX 6800 卡上实测非均匀行拷贝（`[10, 10, 10, 10, 8] * 64`，共 3072 floats），row 1 恢复数值与 CPU 精确一致，前后相邻行 row 0 与 row 2 保持未被触碰（证据：`/tmp/tp5-native-five-gpu-copy.log`），内核日志 JSON 为空数组（`/tmp/tp5-native-five-gpu-copy-kernel.json`）。**重要边界**：这证明原生 TP5 设备侧行拷贝在组件级别（component-wise）已经实现并验证，**绝不等于真实大模型 MTP 端到端已经完成**。
+  - **性质界定与状态**：硬件级 DMA 访问与五卡 P2P 物理链路保持稳定健康；TopK 32/32 及融合分发/small-M swap/split-k 证据已在状态文档记录。
+- **传输回归与 Host Barrier 验证**：历史在宿主 staging 内存出现的脏读已通过 Host Barrier 显式同步与内核 DMA 窗口联合修复；新增传输回归用例已进入 `test-vulkan-command-replay --transfer-only` 并在 5 卡全量通过。
+- **纯直连（Direct-Only）Collective 重构与 CLI 硬防御**：
+  - 重新构建产物（构建编号 `artifact://838`）成功，彻底移除底层 Vulkan collective 的 host-relay 代码分支；
+  - CLI 参数硬拦截验证：运行 `test-vulkan-tp5-mesh` 并传入 `--relay host` 或 `--relay auto`，程序在 Vulkan 驱动初始化之前即以退出码 2 直接拦截并报错退出（证据文件：`/tmp/tp5-dma-window/direct-only-cli.json`）。
+- **五卡纯直连压力测试与性能基准辨析**：
+  - `test-vulkan-tp5-mesh` 在 5 卡直连下完成 576 轮对抗压力测试与 8 轮真实 GPU 生产者测试（`direct-only-five-stress.log`），句柄数稳定在 22，内核零新增报错。
+  - 性能 Profile 分析：测试中 96 次连续 AllReduce 累计总耗时约为 **92.60 ms ~ 102.54 ms**（Phase 1 提交 ~8-10ms、等待 ~41-44ms、Phase 2 广播提交 ~42-48ms）。**该指标仅为连续通信基准耗时，绝非整网或大模型推理吞吐率（NOT throughput）**。
+- **构建产物哈希范围限定说明**：
+  - 下表所列 SHA-256 仅对应**历史构建产物切片（构建编号 artifact://697）**，仅用作历史构建追溯存证；最新纯直连二进制（如 artifact://838）已完成重新编译，**不得将当前最新产物与历史旧哈希混淆标注**。
+
+历史构建切片产物 SHA-256（对应历史构建编号 `artifact://697`，不代表当前最新产物）：
+
+| `build-tp5/bin/` 历史产物 (artifact://697) | SHA-256 |
+|---|---|
+| `libggml-vulkan.so.0.18.1` | `5e8522a04ca785e4025a1ec80b884b67d1c3912ff00bbd29f06f1fd31103394b` |
+| `libggml-base.so.0.18.1` | `778e7c4fe13a56fd7089574d89dd2f499de1acb1884dc8bf623df69225752270` |
+| `libllama.so.0.0.1905` | `6f35abd108882a297c30a3414b8c25e1bf54da7238d9a2168736d01d9b03c566` |
+| `libllama-server-impl.so` | `86ebb6329a13532190bd7d95a5192e4583f116703dd9a0806444af1b3ea2fa5b` |
+
+- **当前未闭环项（继续保持 OPEN）**：
+  - 96 道归约门控全模型 GPU 图执行未满足（当前实测为 3 AllReduce/layer）；
+  - 7 补丁集成全功能大模型 GPU 运行尚未放行；
+  - 目标 60/100 tok/s 指标保持 OPEN；
+  - `ggml-backend-meta.cpp` 的 `comm_init == nullptr` 上层 fail-closed 修复仍在进行中，暂不可宣称全局彻底关闭回退。
+
+### 4. 涉及代码范围与安全验证目标
+
+经内核与 Host Barrier 修复后，原全局停机已转为**受控串行准入**。仅允许 Main 在严格受限条件下运行 GPU 验证。**严禁 subagents 执行 GPU 命令；严禁盲目加载大模型、多进程并发、无界自旋或显存溢出分配。**
+
+- **涉及的核心代码领域**：
+  - `ggml/src/ggml-vulkan/ggml-vulkan.cpp`、`ggml-vulkan-collective.cpp`：纯直连 Collective 实现、彻底剔除 host-relay、CLI 预先拦截防御、Host Barrier 同步修复；
+  - `ggml/src/ggml-backend-meta.cpp`：Multi-buffer 权重切分适配、局部线性区（PARTIAL 边界）合并、Gated-sum 归约合并、`comm_init` fail-closed 防御；
+  - `src/llama-tp5-plan.cpp`、`src/llama-tp5-plan.h`：TP5 物理 rank 角色轮换表、GDN 头模映射、QSA 桥接头分发；
+  - `src/llama-kv-cache.cpp`、`src/llama-memory-recurrent.cpp`：跨卡非均分 KV 槽同步、循环网络状态快照恢复（session v10/seq v3 协议）。
+- **现存允许执行的安全验证目标（纯 CPU 单测与 Main 专职受控 GPU 验证）**：
+  - `build-tp5-cpu/bin/test-meta-reduce-boundary`：验证 CPU 5-rank 归约边界与非均匀行拷贝；
+  - `build-tp5-cpu/bin/test-recurrent-state-rollback`：验证 CPU 循环状态快照与回滚一致性；
+  - `build-tp5-cpu/bin/test-tp5-plan`：验证张量切分计划与头映射元数据；
+  - 静态分析与 CPU 参考响应校验（`/tmp/tp5-cpu-reference-response.json` 等）；
+  - Main 专职串行有界微基准验证（仅限隔离传输、P2P 卡对与直连 stress 脚本，严禁大模型）。
+
+---
 
 ## 0. 先读这四个结论
 
@@ -1594,3 +1774,80 @@ if __name__ == '__main__':
 ```
 
 最终原则：**先使每个值的数学含义、物理位置和就绪条件清楚，再减少搬运与 dispatch；任何性能结论都回到同一条正确的完整执行链。**
+
+---
+
+## 附录 C. 本轮实测状态（2026-09-13，目标机 5x RX 6800）
+
+本节记录实测事实、证据与当前阻塞点。未实测的项目继续标为未验收（第 25 节口径不变）。
+
+### C.1 已交付且已实测
+
+| 任务 | 交付物 | 证据 |
+|---|---|---|
+| T01 | `tools/tp5/tp5-inspect-model.py` | 对 83 GB 六分片 `Qwen3.8-Flash-Next-APEX-I-Compact` 全部 1224 个 tensor 产出 manifest；真实类型：`ffn_down_exps`=IQ4_NL(块 32，128 通道/rank 合法)、gate/up_exps 逐层 IQ3_XXS/IQ2_S/IQ3_S、`attn_q`=Q5_K 头交错、indexer 投影 BF16、HC 全 Q8_0 |
+| T02 | `src/llama-tp5-plan.h/.cpp`、`tests/test-tp5-plan.cpp` | `ctest test-tp5-plan` **Passed**；角色表 `[5,5,5,5,4]`、KV 轮换 `[14,14,15,15,14]`、GDN 头 `[10,10,10,10,8]`、量化切片拒绝用例均覆盖 |
+| T09-T12 | `ggml-vulkan-collective.cpp`、`ggml-vulkan-internal.h`、`vulkan-shaders/tp5_{sum_f32,sum_f16,pack_f16}.comp`、registry 三个入口 | `test-vulkan-tp5-mesh` 在 4 张 RX 6800 上 96 轮动态输入逐元素精确通过（FP32 与 FP16 wire），0 FD 泄漏，0.23 s/96 轮；2 卡对 (1,2)、(2,3) 亦通过 |
+| T20 | `llm_arch_supports_sm_tensor(QWEN4EXP)` 放行 | `llama-cli -sm tensor` 不再被架构门拒绝 |
+
+实现的实测细节（均可复现）：
+- 单阶段 PUSH mesh：发送卡把完整 wire 载荷 `vkCmdCopyBuffer` 写入自身与 4 个对端的 mailbox 槽位；两阶段提交 + 阶段一全卡 fence 汇合后才做本地求和（跨 PCIe DMA 不能被本地 barrier 代替）。
+- 求和 shader 必须用 `stride_elems = max_elems` 索引槽位，早期用 `n_elems` 会读到未初始化区（数据全为 0）。
+- 张量偏移必须用 `vk_tensor_offset(t) + t->view_offs`；`dev_buffer->ptr` 在显存 buffer 上恒为 null，据此算偏移会全落到 0。
+- 跨设备 DMA 在本驱动上**只有 graphics queue 能真正落盘**；默认的 async-compute 队列会静默失败（结果全 0）。因此集合通信必须 `GGML_VK_ALLOW_GRAPHICS_QUEUE=1`。
+- `GGML_VK_LARGE_ALLOC=1` 会放宽 `maxMemoryAllocationSize`/`maxBufferSize`/`suballocation_block_size` 到设备本地堆大小。
+
+### C.2 当前阻塞点（未验收，需继续）
+
+1. **单次分配上限 vs 每 rank 权重**：RADV 上报 `maxMemoryAllocationSize = 0xfffffffc`（4 GiB）。每 rank 权重约 11.65 GiB（manifest 实测），meta backend 的分配器必然把它切成 multi-buffer，而 `ggml-backend-meta.cpp:1187` 明确不支持 multi-buffer（`GGML_ASSERT`/abort）。真正修复是给 meta backend 与 Vulkan 后端补 multi-buffer 支持（T04/T05 的缺口）；用 `GGML_VK_LARGE_ALLOC` 绕过有实测代价（见 C.3）。
+2. **HC combine 之后的 split-state**：已修三处（shared expert 正则以 `_shexp` 覆盖、indexer 缓存按 `indexer_head_size` 判定为 MIRRORED 以复制 top-k、`cache_d_l*` hand-echo 行与 `cache_s_l*` 同规则切分）。`GGML_OP_SET_ROWS`/`ADD` 的断言已通过，图可跑到真实解码。
+3. **模型级正确性已对照，结论为不正确（未验收）**：multi-buffer 支持落地后，`-sm tensor` 可在 RADV 的 4 GiB 单次分配上限下加载 11.65 GiB/rank（5 卡各约 72% 显存，无 `GGML_VK_LARGE_ALLOC`），图可执行且不再崩溃。同一固定提示与 seed（`seed=12345, temperature=0, n_predict=32`）的 A/B：
+
+   | 配置 | reasoning 输出 | 速度 |
+   |---|---|---|
+   | `-sm layer`（本机可用参考） | `We need answer user: "9.11 or 9.9, which is bigger?" Need final just number. Compare`（语义正确） | 25.86 tok/s（38.7 ms/token） |
+   | `-sm tensor`（TP5） | `////////////////////////////////`（退化） | 2.79 tok/s（359 ms/token） |
+
+   因此 TP5 的缺陷**不在通信层**，而在模型图的切分语义。本轮已把范围收敛到具体算子，证据如下。
+
+   **（a）通信层已被实测证明在工作**：在真实模型路径上加探针，集合通信逐子层被调用且全部成功、张量解析为 Vulkan buffer 成功：
+
+   ```text
+   ggml-vulkan-collective: init 5 ranks, wire=f16 sync=host, sdma_push=0/5
+   [tp5-diag] allreduce: ne=5120 name[0]=linear_attn_out-0 op[0]=MUL_MAT devref=OK
+   [tp5-diag] allreduce result: OK (ok=1 fail=0)
+   [tp5-diag] allreduce: ne=5120 name[0]=ffn_moe_out-0    op[0]=ADD     devref=OK
+   [tp5-diag] allreduce result: OK (ok=2 fail=0)
+   [tp5-diag] allreduce: ne=5120 name[0]=ffn_shexp_gated-0 op[0]=MUL    devref=OK
+   [tp5-diag] allreduce result: OK (ok=3 fail=0)
+   ```
+
+   **（b）症状指向"本地部分和算错"而非通信错**：完全不同的提示（`9.11 vs 9.9` 与 `1 + 1 =`）在同一 seed 下产出**同一个 token**，即模型输出与上下文无关；同时宿主侧读到的 logits 只在标点区间（token id 0..14）有区分度。把 LM head 改为 MIRRORED（每卡本地算出完整 248320 维 logits，Q6_K 仅约 380 MB）后症状不变，排除了 logits 跨卡拼接截断这一假设。
+
+   **（c）首要嫌疑（已定位到具体机制，未实现）**：GDN 占 48 层中的 36 层，其 Q/K 头映射必须按 TP5.md §8.2 做**预排列**——全局 V 头 h 使用 Q/K 头 `h % 16`，而各卡当前拿到的是**局部编号**的 Q/K 头，GDN kernel 的 `head_id % neq1` 因此在本卡内重新编号，导致除 rank 0 以外所有卡的 Q/K 配对错误。当前 `attn_qkv` 仍按旧的连续分段规则切分（每段 `key_dim`，粒度 256），并未实现"按本地 V 头顺序预排列 Q/K 及卷积通道"。
+
+   **（d）次要问题**：`ffn_moe_out` 与 `ffn_shexp_gated` 被**分别**归约（每层 2 次 collective），而 TP5.md §6.2 要求本地先合并 routed/shared 再只做一次公共归约。这不影响正确性但违反既定设计，且使 collective 事件数翻倍。
+
+   **（e）已修复的真实缺陷清单**（本轮，均为实测触发后修复）：多 buffer 支持（权重 >4 GiB/rank 时的分配）、view 子 buffer 继承、`vk_tensor_offset + view_offs` 偏移、F16 wire 槽位步长、跨设备 DMA 必须走 graphics queue、meta 图重建时子图描述符未重新分配（`needs_rebuild`）、gallocr 中 `p_hn`/`hn`/`view_src` 的外部张量误判与 `MAX_FREE_BLOCKS` 越界、`get_tensor` 副本越界写、`GGML_OP_TURBO_WHT` 缺失、Q/WO 切分粒度（`lcm(2*da, blck)` 与 `lcm(da, blck)`）、KV 权重与缓存同表切分、桥接卡两次合法 GQA 调用、indexer 缓存镜像、hand-echo 行同规则切分、comm_allreduce 前后同步屏障。
+4. **`llama-cli` 在该 fork 内嵌 server 并等待 router**：主线程停在 HTTP 客户端 poll。端到端验证应直接用 `llama-server` + `/v1/chat/completions`。
+
+### C.3 真机安全事件（必须记录）
+
+2026-09-13 02:42，在 `GGML_VK_LARGE_ALLOC=1` 与 `GGML_VK_ALLOW_GRAPHICS_QUEUE=1` 同时开启下加载完整模型（layer split）时：
+
+```
+amdgpu 0000:03:00.0: ring gfx_0.0.0 timeout, signaled seq=122289, emitted seq=122291
+amdgpu 0000:03:00.0:  Process llama-server pid 37217 thread llama-server pid 37217
+amdgpu 0000:03:00.0: [drm] device wedged, but recovered through reset
+```
+
+驱动通过 GPU reset 自愈，未触发内核 panic。但 reset 之后 **card0（0000:03:00.0）的 P2P DMA-BUF 通路失效**：含 card0 的卡对集合通信返回全 0，而不含 card0 的卡对（1,2）、（2,3）、（1,2,3,4）全部精确通过。`rocm-smi --showtopoaccess` 仍误报 True。恢复 card0 的 P2P 需要整机重启（驱动级 reset 不足以恢复 DMA-BUF/P2P 状态）。
+
+**结论**：`GGML_VK_LARGE_ALLOC`（超出规范上报的分配上限，属未定义行为）在当前 RADV 上会把 GPU 打到 ring timeout；不得在真机上用它加载大模型。代码中该选项的注释已记录此实测结论。TP5 要在本机落地，必须走 multi-buffer 支持或把每 rank 权重压到 4 GiB 以下，而不是放宽分配上限。
+
+### C.4 下一步（未完成）
+
+- 在 meta backend 与 Vulkan 后端实现 multi-buffer 支持（权重加载、view、cache get/set、回读重建），使每 rank 的 11.65 GiB 合法落在多个 ≤4 GiB 的 VkBuffer 上。
+- 用 `llama-server` + 固定提示做 teacher forcing 对照：`-sm tensor` vs 同机可用参考路径，逐层比较中间张量与 logits（第 18 节）。
+- 整机重启恢复 card0 的 P2P 后，重跑 5 卡 96 轮与全模型验证。
+- SYNC_FD 路径（`GGML_TP5_SYNC=syncfd`）已实现但尚未在真机上取得与 host 模式一致的通过证据。
