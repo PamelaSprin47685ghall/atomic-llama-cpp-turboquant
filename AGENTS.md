@@ -1,0 +1,121 @@
+# AGENTS.md
+
+## 真机安全门（任何 agent 开工前必读）
+
+真机测试必须小心；把机器弄死会造成好几天的时间浪费。**不要**未经检查启动大模型、叠加 GPU 负载或重启生产服务。
+
+如果 GPU 挂住是很危险的，因为机器会检测 hang 然后自动重启，浪费很多时间。
+
+- 五卡 RX 6800 目标机曾出现 MCE（`0x0740e000`）；维护窗口内才允许大模型/压力验收。
+- 未解除硬件安全门前：**禁止**盲目加载全量大模型、并发多 GPU 任务、无界自旋轮询、超额显存分配。
+- 部分 rank 提交失败时：**禁止**用 `vkDeviceWaitIdle` 赌 peer signal，也**禁止**主机伪造成功让消费者读未完成载荷。
+
+RERoT 设计、验证入口与路线见 [RERoT.md](RERoT.md)。TP5 设计与收敛路线见 [TP5.md](TP5.md)。更长的 09-14 现场报告见 [下班交接.md](下班交接.md)。
+
+---
+
+## 下班交接｜2026-09-14（晚）
+
+**分支：** `master` @ `0bd9cd922`（已推送 `origin/master`）  
+**目标：** 5× AMD RX 6800 上 Qwen3.8-Flash TP5；生产快路径仍是 **timeline**，不是 gpuflag。
+
+### 一、本轮已合入（按 commit）
+
+| Commit | 内容 |
+|--------|------|
+| `c07616c28` | `llama_tp5_plan` 与 model split 统一；GDN §8.2 Q/K 预排列；`GGML_TP5_PROFILE`；`--tp5*` CLI；MoE/meta 回归；HC F3 shader 脚手架 |
+| `0bd9cd922` | **实验性** `GGML_TP5_SYNC=gpuflag` 全流程：ready/consumed 标志、shader 有界自旋、失败写 NaN、`epoch_buf` 动态 seq（可重放 plan） |
+
+**本地已编译通过：** `test-tp5-plan`、`ggml-vulkan`。  
+**未在开发机跑：** 五卡 mesh / 端到端 tok/s（开发机不是测试机）。
+
+### 二、TP5 同步模式现状（代码事实）
+
+| 模式 | 环境变量 / CLI | 用途 |
+|------|----------------|------|
+| **timeline** | `GGML_TP5_SYNC=timeline` / `--tp5-sync timeline` | **生产默认快路径**；队列 timeline 等待，已验五卡 F16 |
+| host | `host` | 调试/参考；大量 fence + `vkDeviceWaitIdle` |
+| syncfd | `syncfd` | 对照；高主机 SYNC_FD 账 |
+| **gpuflag** | `gpuflag` 或 `gpu` | **实验开关**；GPU 读 mailbox 标志自旋，**未在目标机验收** |
+
+gpuflag 实现要点（`ggml-vulkan-collective.cpp` + `tp5_gpuflag.comp` + `tp5_sum_*.comp`）：
+
+1. **P1 前**：等所有 mailbox 上 `consumed[my_rank] >= seq-1`（槽位复用）
+2. **P1 后**：向本卡及 peer mailbox 写 `ready[my_rank] = seq`
+3. **P2 求和**：对每个 slot 自旋 `ready[r] >= seq`；超时 → NaN + error flag
+4. **P2 后**：写 `consumed[r] = seq`
+5. **seq** 在 host-coherent `epoch_buf` 每轮更新，**不**烘焙进可重放 CB
+
+可选：`GGML_TP5_SPIN_MAX`（默认 `100000000`）。
+
+**重要纠正（相对旧版《下班交接》第五节）：**
+
+- 不能把 strace 窗口里 ~721 ms `TIMELINE_WAIT` 直接当成「换自旋就能省掉的纯同步开销」；其中含设备未完成工作，且受 strace 扰动（见 `TP5.md`）。
+- gpuflag **不是**「打开就提速」；Vulkan Device scope **不保证**跨卡可见性，须在 **RADV/五卡** 上单独做正确性/性能证明后才能谈替换 timeline。
+- timeline 主线不变；gpuflag 仅用于对照实验。
+
+### 三、性能基线（目标机 09-14，未因本轮 commit 重测）
+
+| 指标 | 状态 |
+|------|------|
+| 端到端 decode | ~1.9–2.4 tok/s（目标 60 tok/s） |
+| 子图 | 96 归约 + 1 尾部 ≈ 97 阶段/ token |
+| 命令重放 | MoE decode 轴修复后 9/9 单元测试通过 |
+| MTP | 可加载；KV 复制序列化已修；曾测 draft 接受率 ~47% |
+| 正确性 | 计数 `1..12`、比较题与 CPU 参考对齐 |
+
+ioctl 剖析（4.64 s decode 窗口，见 `/tmp/tp5-reseat-connectivity/driver-ioctl-summary.json`）：`AMDGPU_CS` ~2.4 万次；`SYNCOBJ_TIMELINE_WAIT` ~9k 次。优化方向仍是 **批量提交减 ioctl** + **timeline 收敛**，不是先押 gpuflag。
+
+### 四、下一班建议顺序
+
+1. **硬件安全门**（若未做）：DIMM/插槽、P2P 基线、`amdgpu.ko` 冷启动日志归档。
+2. **P0 可信时间账**：`GGML_TP5_PROFILE=1`，对照 timeline 下 submit/wait/FD 与墙钟（`TP5.md` §5.3）。
+3. **P2 批量提交**：先试 2-stage 合并 `vkQueueSubmit`，用 ioctl/墙钟证明收益。
+4. **gpuflag 实验**（仅开关开启后）：
+   ```bash
+   ./build/bin/test-vulkan-tp5-mesh --sync gpuflag --rounds 96 --check-all
+   ./build/bin/test-vulkan-tp5-mesh --sync gpuflag --delay-producer --vary-input
+   ./build/bin/test-vulkan-tp5-mesh --sync timeline --rounds 96   # 对照
+   ```
+   通过标准：延迟生产者、多轮槽复用、重放、非零 view offset；失败须 NaN/失败态，不能静默错和。
+5. **端到端**：`scripts/run-qwen38-flash-tp5-server.sh` + manifest；配对 timeline vs 优化后吞吐。
+
+### 五、常用命令
+
+```bash
+# 构建（Vulkan TP5）
+cmake --build build -j$(nproc)
+
+# CPU 回归（开发机可跑）
+build/bin/test-tp5-plan
+build/bin/test-meta-reduce-boundary
+
+# 生产倾向配置
+export GGML_TP5_SYNC=timeline
+export GGML_TP5_WIRE=f16
+# 实验 gpuflag（目标机）
+export GGML_TP5_SYNC=gpuflag
+```
+
+生产 server 参数模板见 [下班交接.md](下班交接.md) 第六节。
+
+### 六、关键源码索引
+
+| 主题 | 路径 |
+|------|------|
+| 集体通信 / 同步 | `ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp` |
+| gpuflag shader | `ggml/src/ggml-vulkan/vulkan-shaders/tp5_gpuflag.comp` |
+| 求和 + 自旋 | `ggml/src/ggml-vulkan/vulkan-shaders/tp5_sum_f32.comp`, `tp5_sum_f16.comp` |
+| Plan / GDN 头映射 | `src/llama-tp5-plan.cpp`, `src/llama-model.cpp` |
+| CLI | `common/arg.cpp`, `common/common.cpp` |
+| 五卡 mesh 测试 | `tests/test-vulkan-tp5-mesh.cpp` |
+| 设计主文档 | `TP5.md` |
+
+### 七、工作树状态
+
+- `master` 与 `origin/master` 同步，工作树干净。
+- 无未提交变更。
+
+---
+
+*接班工程师：先读本节与 `TP5.md` 文末收敛章节，再在目标机按第四节顺序验证；勿在开发机假设五卡结果。*
