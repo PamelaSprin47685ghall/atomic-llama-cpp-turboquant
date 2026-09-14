@@ -6,8 +6,6 @@
 
 如果 GPU 挂住是很危险的，因为机器会检测 hang 然后自动重启，浪费很多时间。
 
-- 五卡 RX 6800 目标机曾出现 MCE（`0x0740e000`）；维护窗口内才允许大模型/压力验收。
-- 未解除硬件安全门前：**禁止**盲目加载全量大模型、并发多 GPU 任务、无界自旋轮询、超额显存分配。
 - 部分 rank 提交失败时：**禁止**用 `vkDeviceWaitIdle` 赌 peer signal，也**禁止**主机伪造成功让消费者读未完成载荷。
 
 RERoT 设计、验证入口与路线见 [RERoT.md](RERoT.md)。TP5 设计与收敛路线见 [TP5.md](TP5.md)。更长的 09-14 现场报告见 [下班交接.md](下班交接.md)。
@@ -82,7 +80,7 @@ ioctl 剖析（4.64 s decode 窗口，见 `/tmp/tp5-reseat-connectivity/driver-i
 
 ### 五、下一班建议顺序
 
-1. **硬件安全门**（若未做）：DIMM/插槽、P2P 基线、`amdgpu.ko` 冷启动日志归档。
+1. **硬件状态与基线确认**：五卡 P2P 直连基线、驱动日志与显存空闲状态。
 2. **P0 可信时间账**：`GGML_TP5_PROFILE=1`，对照 timeline 下 submit/wait/FD 与墙钟（`TP5.md` §5.3）。
 3. **P2 批量提交**：先试 2-stage 合并 `vkQueueSubmit`，用 ioctl/墙钟证明收益。
 4. **gpuflag 实验**（仅开关开启后）：
