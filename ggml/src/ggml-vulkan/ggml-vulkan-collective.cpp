@@ -189,13 +189,14 @@ struct tp5_comm {
     uint64_t workspace_gen = 1;
 
     // Bounded immutable per-binding plan cache
-    static constexpr size_t MAX_CACHED_PLANS = 64;
+    // For 96 distinct subgraphs in Qwen4EXP TP5, keep 256 entries to eliminate LRU thrashing.
+    static constexpr size_t MAX_CACHED_PLANS = 256;
     std::vector<tp5_cached_plan> cached_plans;
 
     uint64_t allreduce_calls = 0;
     uint64_t host_waits = 0;
     uint64_t last_drained_epoch = 0;
-    static constexpr uint64_t MAX_OUTSTANDING_EPOCHS = 4;
+    static constexpr uint64_t MAX_OUTSTANDING_EPOCHS = 16;
 
     struct tp5_in_flight_slot {
         uint64_t epoch = 0;
@@ -903,10 +904,10 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
 
         // Global GPU hardware pipeline barrier: ensure preceding COMPUTE shaders have fully flushed to VRAM
         VkMemoryBarrier mb_pre{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
+            VK_ACCESS_SHADER_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT};
         vkCmdPipelineBarrier(plan.cmd_p1[i],
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             (c.wire == tp5_wire_type::F32 ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
             0, 1, &mb_pre, 0, nullptr, 0, nullptr);
 
@@ -1015,9 +1016,9 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
 
         VkMemoryBarrier mb_post{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
             VK_ACCESS_SHADER_WRITE_BIT,
-            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT};
+            VK_ACCESS_SHADER_READ_BIT};
         vkCmdPipelineBarrier(plan.cmd_p2[i],
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0, 1, &mb_post, 0, nullptr, 0, nullptr);
 
         if (vkEndCommandBuffer(plan.cmd_p2[i]) != VK_SUCCESS) {
@@ -1150,11 +1151,7 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
         return false;
     }
 
-    for (size_t j = 0; j < c.n_ranks; ++j) {
-        if (c.backends[j]) {
-            ggml_vk_tp5_flush_async(c.backends[j]);
-        }
-    }
+    // ggml-backend-meta already flushed before comm_allreduce; no double flush needed
 
     if (n_elems > c.max_elems) {
         if (!tp5_setup_workspace(c, n_elems)) return false;
@@ -1309,7 +1306,7 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                     if (j == i) continue;
                     wait_sems[wait_cnt] = r.peer_timeline_sems[j];
                     wait_vals[wait_cnt] = 2 * (epoch - 1);
-                    wait_stages[wait_cnt] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                    wait_stages[wait_cnt] = VK_PIPELINE_STAGE_TRANSFER_BIT;
                     wait_cnt++;
                 }
             }

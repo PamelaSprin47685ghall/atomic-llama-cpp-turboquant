@@ -356,10 +356,6 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             }
         }
 
-        bool ok = llama_prepare_model_devices(params, model_ptr.get());
-        if (!ok) {
-            return {-1, nullptr};
-        }
 
         auto * model = dynamic_cast<llama_model_base *>(model_ptr.get());
         if (model == nullptr) {
@@ -388,6 +384,11 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             model->load_vocab(ml);
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model vocabulary: " + std::string(e.what()));
+        }
+
+        bool ok = llama_prepare_model_devices(params, model_ptr.get());
+        if (!ok) {
+            return {-1, nullptr};
         }
 
         model->load_stats(ml);

@@ -465,7 +465,7 @@ bool llama_tp5_try_apply_split_state(
     }
 
     // Runtime caches keep the dedicated logic in llama-model.cpp (rotation, conv history).
-    if (tp5_name_matches(tensor_name, "cache_")) {
+    if (strstr(tensor_name, "cache_") != nullptr) {
         return false;
     }
 

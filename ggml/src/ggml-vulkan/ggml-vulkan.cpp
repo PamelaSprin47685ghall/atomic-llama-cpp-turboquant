@@ -19141,27 +19141,37 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             prof->compute_replay_hits++;
         }
         ggml_vk_submit_transfer_ctx(ctx);
-        for (vk::CommandBuffer cb : it->second.cmd_bufs) {
-            vk::SubmitInfo si{};
-            si.commandBufferCount = 1;
-            si.pCommandBuffers = &cb;
+        if (!it->second.cmd_bufs.empty()) {
+            std::vector<vk::SubmitInfo> submits;
+            submits.reserve(it->second.cmd_bufs.size());
             vk::TimelineSemaphoreSubmitInfo tl_info{};
             vk::PipelineStageFlags stage{};
-            if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
+            bool need_transfer_wait = ctx->device->async_use_transfer_queue &&
+                                      ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value;
+            if (need_transfer_wait) {
                 tl_info.waitSemaphoreValueCount = 1;
                 tl_info.pWaitSemaphoreValues = &ctx->transfer_semaphore.value;
                 stage = ctx->device->transfer_queue->stage_flags;
-                si.waitSemaphoreCount = 1;
-                si.pWaitSemaphores = &ctx->transfer_semaphore.s;
-                si.pWaitDstStageMask = &stage;
-                si.setPNext(&tl_info);
-                ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
+            }
+            for (size_t c_idx = 0; c_idx < it->second.cmd_bufs.size(); ++c_idx) {
+                vk::SubmitInfo si{};
+                si.commandBufferCount = 1;
+                si.pCommandBuffers = &it->second.cmd_bufs[c_idx];
+                if (c_idx == 0 && need_transfer_wait) {
+                    si.waitSemaphoreCount = 1;
+                    si.pWaitSemaphores = &ctx->transfer_semaphore.s;
+                    si.pWaitDstStageMask = &stage;
+                    si.setPNext(&tl_info);
+                    ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
+                }
+                submits.push_back(si);
             }
             if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
-                prof->queue_submits++;
-                prof->submit_batches++;
+                prof->queue_submits += (uint64_t) submits.size();
+                prof->submit_batches += 1;
             }
-            ctx->device->compute_queue->handle->submit({ si }, nullptr);
+            // Batch all command buffers into a single submit call to halve driver ioctl overhead
+            ctx->device->compute_queue->handle->submit(submits, nullptr);
         }
         ctx->submit_pending = true;
         if (!ctx->device->support_async) {

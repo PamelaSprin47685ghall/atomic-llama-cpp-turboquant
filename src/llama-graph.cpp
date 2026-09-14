@@ -2652,12 +2652,6 @@ void llm_graph_context::cb(ggml_tensor * cur, const char * name, int il) const {
     if (cb_func) {
         cb_func(ubatch, cur, name, il);
     }
-    static int probe_count = 0;
-    if (probe_count < 15 && (strcmp(name, "attn_output") == 0 || strcmp(name, "linear_attn_out") == 0 || strcmp(name, "ffn_out") == 0 || strcmp(name, "result_output") == 0)) {
-        probe_count++;
-        fprintf(stderr, "[graph-probe #%d] il=%d node='%s' op=%s ne=[%lld, %lld]\n",
-                probe_count, il, name, ggml_op_name(cur->op), (long long)cur->ne[0], (long long)cur->ne[1]);
-    }
     // NaN detection probe: identify the exact first layer and operator that poisons the network
     static bool nan_found = false;
     if (!nan_found && cur && cur->data && (cur->flags & GGML_TENSOR_FLAG_COMPUTE)) {
