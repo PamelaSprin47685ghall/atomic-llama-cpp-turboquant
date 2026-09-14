@@ -1,4 +1,5 @@
 #include "ggml-vulkan.h"
+#include "ggml-tp5-profile.h"
 #include <vulkan/vulkan_core.h>
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
@@ -19132,6 +19133,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         !it->second.cmd_bufs.empty() &&
         ggml_vk_cache_fingerprint_match(it->second, cgraph)) {
         ctx->replay_hits++;
+        if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+            prof->compute_replay_hits++;
+        }
         ggml_vk_submit_transfer_ctx(ctx);
         for (vk::CommandBuffer cb : it->second.cmd_bufs) {
             vk::SubmitInfo si{};
@@ -19158,6 +19162,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         return GGML_STATUS_SUCCESS;
     } else if (replay_eligible) {
         ctx->replay_misses++;
+        if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+            prof->compute_replay_misses++;
+        }
     }
 
     if (ggml_vk_cmd_replay_enabled() &&

@@ -431,6 +431,111 @@ std::vector<int64_t> llama_tp5_plan::weight_bytes_per_rank(
     return out;
 }
 
+int64_t llama_tp5_gdn_qk_global_head(const llama_tp5_plan & plan, int64_t global_v_head) {
+    if (plan.Nk <= 0) {
+        return 0;
+    }
+    return global_v_head % plan.Nk;
+}
+
+static bool tp5_name_matches(const char * name, const char * prefix) {
+    return name && prefix && strncmp(name, prefix, strlen(prefix)) == 0;
+}
+
+bool llama_tp5_try_apply_split_state(
+        const llama_tp5_plan & plan,
+        const char * tensor_name,
+        const struct ggml_tensor * tensor,
+        int64_t indexer_head_size,
+        struct ggml_backend_meta_split_state & out) {
+    if (!tensor_name || !tensor) {
+        return false;
+    }
+
+    memset(&out, 0, sizeof(out));
+    out.nr[0] = 1;
+    out.n_segments = 1;
+
+    const std::string name(tensor_name);
+
+    // Production override (TP5.md §10.1): mirrored LM head on rank 0.
+    if (name == "output.weight") {
+        out.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+        return true;
+    }
+
+    // Runtime caches keep the dedicated logic in llama-model.cpp (rotation, conv history).
+    if (tp5_name_matches(tensor_name, "cache_")) {
+        return false;
+    }
+
+    bool ok = false;
+    llama_tp5_error err;
+    const int64_t blck = ggml_blck_size(tensor->type);
+    llama_tp5_tensor_plan tp = plan.plan_tensor(name, tensor->ne, (uint32_t) tensor->type, blck, ok, err);
+    if (!ok) {
+        return false;
+    }
+
+    auto apply_axis_split = [&](ggml_backend_meta_split_axis axis) -> bool {
+        out.axis = axis;
+        int64_t total = tensor->ne[axis];
+        int64_t planned = 0;
+        for (uint32_t r = 0; r < plan.ranks; ++r) {
+            planned += tp.per_rank_len[r];
+        }
+        if (planned == total) {
+            for (uint32_t r = 0; r < plan.ranks; ++r) {
+                out.ne[r] = tp.per_rank_len[r];
+            }
+            return true;
+        }
+        // Fused GDN qkv/conv keeps legacy row count (2*K+V) while ownership follows V heads.
+        if (tp.semantic == llama_tp5_semantic::GDN_QKV || tp.semantic == llama_tp5_semantic::GDN_CONV) {
+            int64_t assigned = 0;
+            for (uint32_t r = 0; r < plan.ranks; ++r) {
+                if (r + 1 == plan.ranks) {
+                    out.ne[r] = total - assigned;
+                } else {
+                    out.ne[r] = (total * plan.gdn_v_heads[r]) / plan.Nv;
+                    assigned += out.ne[r];
+                }
+            }
+            return true;
+        }
+        return false;
+    };
+
+    switch (tp.layout) {
+        case llama_tp5_layout::MIRRORED:
+        case llama_tp5_layout::CPU_RESIDENT:
+            out.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+            return true;
+        case llama_tp5_layout::SPLIT_AXIS0:
+            if (!apply_axis_split(GGML_BACKEND_SPLIT_AXIS_0)) {
+                return false;
+            }
+            return true;
+        case llama_tp5_layout::SPLIT_AXIS1:
+            if (!apply_axis_split(GGML_BACKEND_SPLIT_AXIS_1)) {
+                return false;
+            }
+            return true;
+        case llama_tp5_layout::SPLIT_AXIS1_REPL: {
+            static const int kv_head_starts[LLAMA_TP5_MAX_RANKS] = {0, 0, 0, 1, 1};
+            out.axis = GGML_BACKEND_SPLIT_AXIS_1;
+            out.indexed_replica = true;
+            for (uint32_t r = 0; r < plan.ranks; ++r) {
+                out.ne[r] = tp.per_rank_len[r];
+                out.replica_start[r] = (r < 5 ? kv_head_starts[r] : 0) * plan.da;
+            }
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
 bool llama_tp5_plan::validate(const llama_hparams & hp, uint32_t n_devices, llama_tp5_error & err) const {
     if (ranks != n_devices) {
         err.code = "TP5_E_RANKS";

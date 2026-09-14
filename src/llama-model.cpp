@@ -20,6 +20,7 @@
 #include "llama-memory-recurrent.h"
 
 #include "llama.h"
+#include "llama-tp5-plan.h"
 #include "models/models.h"
 
 #include "ggml.h"
@@ -336,6 +337,16 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
         model->arch = arch;
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && !llm_arch_supports_sm_tensor(arch)) {
             throw std::runtime_error(std::string("LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '") + llm_arch_name(arch) + "'");
+        }
+        if (arch == LLM_ARCH_QWEN4EXP && params.split_mode == LLAMA_SPLIT_MODE_TENSOR && params.devices) {
+            uint32_t n_devs = 0;
+            while (params.devices[n_devs]) {
+                n_devs++;
+            }
+            if (!llm_arch_supports_qwen4exp_tp5(arch, n_devs)) {
+                LLAMA_LOG_WARN("%s: Qwen4EXP TP5 plan expects 5 tensor devices, got %u; split rules may be suboptimal\n",
+                               __func__, n_devs);
+            }
         }
     }
 
@@ -735,6 +746,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     ggml_backend_meta_split_state split_state;
     memset(&split_state, 0, sizeof(split_state));
+
+    if (ud->has_tp5_plan &&
+            llama_tp5_try_apply_split_state(ud->tp5_plan, tensor_name.c_str(), tensor,
+                                            hparams.indexer_head_size, split_state)) {
+        return split_state;
+    }
+
     tensor_config tc = get_tensor_config();
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {

@@ -1,4 +1,5 @@
 #include "llama.h"
+#include "llama-tp5-plan.h"
 
 #include "llama-impl.h"
 
@@ -156,6 +157,23 @@ int64_t llama_time_us(void) {
     return ggml_time_us();
 }
 
+static void llama_prepare_tp5_plan(llama_model * model, size_t n_devs) {
+    model->get_split_state_ud.has_tp5_plan = false;
+    if (model->arch != LLM_ARCH_QWEN4EXP || n_devs < 2) {
+        return;
+    }
+    llama_tp5_error err;
+    const int64_t n_vocab = model->vocab.n_tokens();
+    if (llama_tp5_plan_build(model->hparams, (uint32_t) n_devs, n_vocab,
+                             model->get_split_state_ud.tp5_plan, err)) {
+        model->get_split_state_ud.has_tp5_plan = true;
+        LLAMA_LOG_INFO("%s: TP5 plan active for qwen4exp (%zu ranks, %u collective events/token)\n",
+                       __func__, n_devs, model->get_split_state_ud.tp5_plan.expected_events);
+    } else {
+        LLAMA_LOG_WARN("%s: TP5 plan not built: %s %s\n", __func__, err.code.c_str(), err.detail.c_str());
+    }
+}
+
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
     // create list of devices to use with this model
@@ -175,6 +193,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
             model->get_split_state_ud.n_devices = n_devs;
             model->get_split_state_ud.model = model;
+            llama_prepare_tp5_plan(model, n_devs);
             model->devices.push_back({
                 true, ggml_backend_meta_device(
                 params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
@@ -216,6 +235,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             GGML_ASSERT(!devs.empty());
             model->get_split_state_ud.n_devices = devs.size();
             model->get_split_state_ud.model     = model;
+            llama_prepare_tp5_plan(model, devs.size());
             gpus.push_back({
                 true, ggml_backend_meta_device(
                 devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)

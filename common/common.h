@@ -638,6 +638,18 @@ struct common_params : wanxiangqi_common_params {
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
+    // TP5 (Qwen4EXP five-GPU tensor parallel); maps to GGML_TP5_* when enabled.
+    struct common_params_tp5 {
+        bool        enabled  = false;
+        std::string plan     = "qwen4exp-af";
+        std::string wire     = "f16";      // f32 | f16
+        std::string sync     = "timeline"; // host | syncfd | timeline
+        std::string collective = "mesh";
+        std::string manifest;              // optional tp5-manifest.json path
+        std::string trace;
+        bool        cmd_replay = true;
+    } tp5;
+
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
@@ -1229,6 +1241,9 @@ inline size_t common_rerot_scratch_reserve_bytes(const common_params & params) {
 // call once at the start of a program if it uses libcommon
 // initializes the logging system and prints info about the build
 void common_init();
+
+// Apply TP5 CLI selections to GGML_TP5_* environment (no-op when tp5.enabled is false).
+void common_tp5_apply_env(const common_params & params);
 
 void common_params_print_info(const common_params & params, bool print_devices = true);
 std::string common_params_get_system_info(const common_params & params);

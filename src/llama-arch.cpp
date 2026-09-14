@@ -1114,6 +1114,10 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
     }
 }
 
+bool llm_arch_supports_qwen4exp_tp5(const llm_arch & arch, uint32_t n_tensor_devices) {
+    return arch == LLM_ARCH_QWEN4EXP && n_tensor_devices == 5;
+}
+
 bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_GROK:

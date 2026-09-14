@@ -29,11 +29,13 @@ KV_SIZE=${KV_SIZE:-1441792}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 
 export GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=${GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM:-1}
+# CLI --tp5* flags (common_tp5_apply_env) override these when passed on the command line.
 export GGML_TP5_WIRE=${GGML_TP5_WIRE:-f16}
-export GGML_TP5_SYNC=${GGML_TP5_SYNC:-syncfd}
+export GGML_TP5_SYNC=${GGML_TP5_SYNC:-timeline}
 export GGML_TP5_RELAY=${GGML_TP5_RELAY:-off}
-export GGML_VK_CMD_REPLAY=${GGML_VK_CMD_REPLAY:-0}
+export GGML_VK_CMD_REPLAY=${GGML_VK_CMD_REPLAY:-1}
 export GGML_VK_ALLOW_GRAPHICS_QUEUE=${GGML_VK_ALLOW_GRAPHICS_QUEUE:-1}
+TP5_ARGS=${TP5_ARGS:---tp5 qwen4exp-af --tp5-wire f16 --tp5-sync timeline}
 
 say() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
@@ -83,6 +85,7 @@ trap cleanup EXIT INT TERM
 # --- Launch TP5 Server --------------------------------------------------------------------
 say "Launching TP5 server on $HOST:$PORT (model: $(basename "$MODEL"))..."
 stdbuf -oL -eL "$BIN" -m "$MODEL" \
+    $TP5_ARGS \
     -sm tensor \
     -ngl 999 \
     -lm none \

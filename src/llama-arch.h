@@ -784,4 +784,7 @@ bool llm_arch_is_recurrent      (const llm_arch & arch);
 bool llm_arch_is_hybrid         (const llm_arch & arch);
 bool llm_arch_is_diffusion      (const llm_arch & arch);
 bool llm_arch_supports_sm_tensor(const llm_arch & arch);
+
+// Parameterized TP5 gate (TP5.md §15.3 / T20): Qwen4EXP requires exactly five tensor devices.
+bool llm_arch_supports_qwen4exp_tp5(const llm_arch & arch, uint32_t n_tensor_devices);
 bool llm_arch_supports_rs_rollback(const llm_arch & arch);

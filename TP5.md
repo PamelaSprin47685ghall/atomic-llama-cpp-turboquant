@@ -1857,3 +1857,713 @@ amdgpu 0000:03:00.0: [drm] device wedged, but recovered through reset
 - 用 `llama-server` + 固定提示做 teacher forcing 对照：`-sm tensor` vs 同机可用参考路径，逐层比较中间张量与 logits（第 18 节）。
 - 整机重启恢复 card0 的 P2P 后，重跑 5 卡 96 轮与全模型验证。
 - SYNC_FD 路径（`GGML_TP5_SYNC=syncfd`）已实现但尚未在真机上取得与 host 模式一致的通过证据。
+
+---
+
+# TP5-FAST：60/100 tok/s 的最快实现（纯理论设计，先设计后实验）
+
+本文是对 [TP5.md](TP5.md) 与 [下班交接.md](下班交接.md) 的**理论收敛**：不做新实验，只依据已有实测日志与现有源码，推导“最快的实现形态”，给出逐项预算、每 token 的提交结构、文件级改动清单与实施顺序。所有实验（GPU 加载、压力测试）按 TP5.md 2026-09-14 的硬件安全门推迟到维护窗口之后。
+
+标记约定：
+
+| 标记 | 含义 |
+|---|---|
+| **实测** | 2026-09-13/14 已有的真实运行日志（本文引用具体数值） |
+| **代码事实** | 本仓库当前源码可直接核对（给出文件与符号） |
+| **推导** | 由前两类推出，未独立测量 |
+
+---
+
+## 0. 结论速览
+
+1. **当前 323 ms/token（3.09 tok/s）里，数学计算不到 1 ms。** 4B 激活参数 / token ⇒ 全模型约 8 GFLOP；分摊到 5 卡为 1.6 GFLOP/卡，按 RX 6800 可行的 5–8 TFLOP/s 计算约 **0.2–0.3 ms**；每卡每 token 需要流过的权重约 264 MB，按 512 GB/s 约 **0.5 ms**。剩下 ~99% 全是提交次数、等待次数与逐 stage 的 dispatch/barrier 开销。
+2. **结构上每 token 有 97 个串行 stage（96 次归约 + 1 个尾部）**，这是 48 层 ×（attention 输出部分和 + FFN 输出部分和）的必然结果，不能靠再合并归约消掉；能动的只有**每 stage 的成本**。
+3. 因此 60 tok/s（16.6 ms/token）要求 **每 stage ≤ 171 µs**；100 tok/s（10 ms）要求 **≤ 103 µs**。按 93 节点/stage/rank 的现状（≈1.5 ms/stage），差 10–15 倍，必须同时做两件事：
+   - **把主机与内核驱动从关键路径上彻底移除**（每 token 从 ~1600 次 CS、~600 次 wait、~330 次 GEM_CREATE 降到 10 次以内主机操作）；
+   - **把每 stage 的 dispatch 数从 ~93 降到 ≤50（60 tok/s）/ ≤30（100 tok/s）**，即算子融合与 HC 四流向量化。
+4. 最快形态的名字叫**“每卡每 token 一次提交的预录 epoch 链”**：97 个 stage 的跨卡依赖全部用永久 timeline semaphore 在 GPU 侧表达，每个 rank 每 token 只发一次 `vkQueueSubmit`（提交数组内含 2×97 个 `VkSubmitInfo`），主机在整个 token 内不等待、不导出/导入、不分配。
+5. 预期路径（推导，待维护窗口后实测）：323 ms →（F1+F5）60–90 ms →（F2+F3）40–60 ms →（F4 融合）20–35 ms →（F7 MTP 1.5–2×）→ **16.6 ms 以内** →（F8 上游补丁）→ **10 ms 以内**。
+6. 理论地板 **7–13 ms/token（77–140 tok/s）**，由 `97 × N_disp × t_disp` 决定；因此 60 tok/s 可达，100 tok/s 必须 N_disp ≤ 30 **且** MTP 与上游融合全部到位。
+
+---
+
+## 1. 临界路径模型
+
+### 1.1 公式
+
+\[
+T_{\text{token}} \;=\; \underbrace{\max\bigl(T_{\text{host}},\; T_{\text{gpu}}\bigr)}_{\text{重叠后}}
+\;+\;T_{\text{finalize}}
+\]
+
+其中
+
+\[
+T_{\text{gpu}} \;=\; \sum_{s=0}^{96}\;\max_{i\in\text{rank}}\Bigl(\underbrace{N_{\text{disp}}(s,i)\cdot t_{\text{disp}}}_{\text{本地 dispatch}}
+\;+\;\underbrace{N_{\text{barrier}}(s,i)\cdot t_{\text{bar}}}_{\text{barrier/cache flush}}
+\;+\;\underbrace{t_{\text{push}}}_{\text{4 路 P2P 写}}\;+\;\underbrace{t_{\text{sum}}}_{\text{求和 kernel}}\Bigr)
+\;+\;\sum_{s}t_{\text{edge}}(s)
+\]
+
+\[
+t_{\text{edge}}(s) \;=\; \text{队列级 wait 处理} + \text{对端写可见延迟} + \text{语义释放/获取}
+\]
+
+关键含义：
+
+* 求和外层是 **max over ranks**：每 stage 由最慢的卡决定，其余四卡闲置等待。
+* `t_disp`（单次 dispatch 的引擎+驱动成本）与 `t_edge`（跨卡边）是常数级开销，**它们乘的是 97 与 9,000 这两个大数**，所以优化的唯一方向是把这两个乘数或常数压下来。
+* 只有当 `T_host ≥ T_gpu` 时主机才是瓶颈；当前两种同步模式的测量都显示 **主机与 GPU 都没被重叠掉**（见 1.3）。
+
+### 1.2 预算表
+
+| 目标 | T/token | 每 stage 预算 | 备注 |
+|---|---:|---:|---|
+| 现状 | 323 ms | 3330 µs | 2026-09-14 实测 |
+| 60 tok/s | 16.6 ms | **171 µs** | 目标一 |
+| 100 tok/s | 10.0 ms | **103 µs** | 目标二 |
+
+每 stage 171 µs 的构成（推导，两种情形）：
+
+| 情形 | dispatch 数/rank | t_disp | 本地 dispatch 合计 | 边 + 求和 | stage 合计 |
+|---|---:|---:|---:|---:|---:|
+| 现状量级（保守 t_disp=16 µs，含未收敛 barrier） | 93 | 16 µs | 1490 µs | ~40 µs | **~1.5 ms（与实测 stage 1.5 ms 吻合）** |
+| 修复 barrier 后（t_disp=3 µs） | 50 | 3 µs | 150 µs | ~15 µs | **~165 µs ✅ 60 tok/s** |
+| 融合 + MTP（t_disp=3 µs） | 30 | 3 µs | 90 µs | ~12 µs | **~102 µs ✅ 100 tok/s** |
+
+**这张表就是本方案的定量依据**：不融合算子，60 tok/s 无法到达；融合到 30 dispatch，100 tok/s 才有余量。
+
+### 1.3 实测证据（2026-09-14 两个同步模式，MTP 开，ctx512/b32/ub32）
+
+| 指标 | HOST 模式（默认） | TIMELINE 模式 | 来源 |
+|---|---:|---:|---|
+| decode | **323.2 ms/token**（21 tokens） | **310.2 ms/token** | `/v1/chat/completions` timings |
+| prompt | 198.2 ms/token | 190.4 ms/token | 同上 |
+| subgraph 调用 | 480 / token（97×5） | 480 / token | `[vk-compute-profile]` |
+| vk-compute 主机区间 | 150–165 ms | 150–163 ms | 同上（replay 命中后 314–338 µs/次；未命中 992–1674 µs/次） |
+| collective 分项 | p1_rec 4.2 / p1_sub 12.9 / **p1_wait 145.2** / p2_sub 57.0 ms | p1_sub 18.3 / **backpressure 141.0** / p2_sub 14.2 ms | `[tp5-profile]` |
+| collective 合计 | ≈219 ms | ≈175 ms | 同上 |
+
+两种模式的 collective 都落到 **≈1.5 ms/stage**，且在一个模式是“等 GPU fence”，在另一个模式是“等 GPU 追到 epoch-4”，说明**这是 GPU 侧的真实推进速率，不是主机线程慢**。同一模型 09-14 的 sysfs 采样显示五卡 busy 仅 **8/23/24/23/13%**（TP5.md 09-14 段），即 GPU 大部分时间在等而不是在算——与“1.5 ms/stage 远大于数学量级”一致。
+
+内核侧账本（TP5.md 09-14 段，4.64 s decode 窗口）：`AMDGPU_CS 23,930`、`SYNCOBJ_TIMELINE_WAIT 9,058`、`SYNCOBJ_WAIT 4,851`、`GEM_CREATE 4,913`。按该窗口约 15 个 token 折算：**≈1,600 次 CS、≈600 次 timeline wait、≈330 次 GEM_CREATE 每 token**。
+
+### 1.4 上界的另一面：不是算力、也不是带宽
+
+| 项 | 每 token 每卡 | 结论 |
+|---|---:|---|
+| 激活 FLOPs | ~1.6 GFLOP | 0.2–0.3 ms |
+| 需要读的权重字节 | ~264 MB | 0.5 ms @512 GB/s |
+| P2P 发送字节（96 事件 × 4 对端 × 5 KiB，F16） | ~1.9 MiB | 0.16 ms @12 GB/s |
+| 求和 kernel 元素数 | 96 × 2560 | 可忽略 |
+
+⇒ **所有“物理量”加起来不到 1 ms，剩下的 322 ms 全是结构开销。**这就是为什么本方案只谈提交、等待、dispatch、barrier 四项，不谈算力与带宽。
+
+---
+
+## 2. 现状的六个结构性缺陷（代码定位）
+
+| 编号 | 缺陷 | 代码位置（当前工作树） | 量化后果 |
+|---|---|---|---|
+| D1 | 每 stage 两次主机同步提交 + HOST 模式每 stage 5 次 `vkDeviceWaitIdle` | `ggml-vulkan-collective.cpp::tp5_allreduce_mesh`、`tp5_wait_all_p1/p2`、`tp5_p2p_visibility_barrier` | 480 次 device drain + 970 次 fence wait 每 token |
+| D2 | 流水线深度被硬限在 4 个 epoch，且 mailbox 每发送者只有 1 个槽（无 epoch 环） | `tp5_comm::MAX_OUTSTANDING_EPOCHS = 4`、`in_flight_ring[]`、`tp5_setup_workspace` 里 `mailbox_bytes = n_ranks * stride + flags` | 主机最多领先 4 个 stage，之后必然阻塞；drain 路径本身要进内核等 syncobj |
+| D3 | 每个 stage 由 meta 后端单独 `graph_compute_async` + flush 提交，collective 再提交 2 次 | `ggml-backend-meta.cpp` 主循环（`ggml_backend_graph_compute_async` + `ggml_backend_vk_flush_async`）、`tp5_record_plan` | 每 rank 每 token ≈291 次提交；驱动/内核每次 15–30 µs |
+| D4 | 每 stage 3–4 次全流水线 barrier（`ALL_COMMANDS` + `MEMORY_WRITE`） | `tp5_record_plan` 的 `mb_pre` / `mb_wire` / `mb_p1` 与 P2 的 `mb_post` | 每 token ~400 次 L2 flush/drain，每次 1–3 µs，且阻止引擎流水 |
+| D5 | 每 stage ~93 个 dispatch（主因：HC 四流逐流复制计算、MoE 分片、layout/copy 节点） | `src/models/qwen4exp.cpp` HC/QSA/MoE 图 + `src/llama-graph.cpp` | 9,000 dispatch/rank/token，是 1.5 ms/stage 的主体 |
+| D6 | 每 token ~330 次 `GEM_CREATE`（staging/描述符池抖动），SYNC_FD 路径还有 480 export + 1920 import 主机账 | `ggml-vulkan.cpp` staging 与 `tp5_export/import`（SYNC_FD 分支） | 内核 76 ms/窗口；主机 syscall 数进入关键路径（TP5.md §13.6 早已警告） |
+
+四条属于“结构”，两条属于“数量”。**D1–D4 是必须先修的，因为它们决定“能不能让 GPU 连续跑”；D5 决定“能跑多快”。**
+
+---
+
+## 3. 最快形态：每卡每 token 一次提交的预录 epoch 链
+
+### 3.1 总体结构（推导 + 现有机制组合）
+
+```text
+每个 rank（rank i ∈ 0..4）在 token 开始时发出 1 次 vkQueueSubmit：
+  VkSubmitInfo 数组（按 stage 顺序，同一队列内顺序执行，本地依赖自动成立）：
+
+  s = 0..96:
+    [S1_s]  waits:  credit[j][s mod R] ≥ s-R   (j≠i, 4 个永久 timeline semaphore)
+            cmds : 本地 subgraph 全部节点（预录 CB）
+                   + wire pack（canonical f16）
+                   + 本地 PUSH（写自己的 mailbox 槽 i）
+                   + 4 路 peer PUSH（写对端 mailbox 槽 i，P2P copy）
+            signal: push_done[i] = 2s+1
+
+    [S2_s]  waits:  push_done[j] = 2s+1 (j≠i, 4 个导入的 peer timeline)
+            cmds : 求和 kernel（固定 rank 顺序）→ 写回本地部分和/结果张量
+            signal: consumed[i][s mod R] = s
+
+  最后：tail 子图（LM head 切片）→ 采样前回读一次
+```
+
+* **token 内主机只做 5 次 submit + 1 次最终回读**；不再有 fence wait、device idle、export/import、CB 分配、GEM_CREATE。
+* **跨卡依赖全部由 semaphore 表达**，因此这不是 TP5.md §13.5 禁止的“一条大 CB 只等头尾 fence”：每 stage 的 4 条远端依赖都在提交数组里显式表达，`S2_s` 的 wait value 就是 §13.3 要求的 `wait[s][j][i]`。
+* `s = 96` 之后是尾部（LM head / 采样前处理），它不需要归约（**实测**：97 个子图里只有 96 次归约）。
+
+### 3.2 为什么需要 R 槽 mailbox + credit 环（修 D2）
+
+当前结构里 `mailbox` 每个发送者只有 **一个** 槽（`mailbox_buf` 大小 = `n_ranks*stride + flags`），跨 epoch 复用靠“只允许 4 个 epoch 在飞行 + drain”来兜底，于是主机必然每 4 个 stage 进一次内核等 syncobj。这正是实测里 `cpu_backpressure ≈ 141 ms/token`、以及 600 次/token `SYNCOBJ_TIMELINE_WAIT` 的来源。
+
+改成 `R = 16` 槽（5 卡 × 16 × 5120 B ≈ 400 KiB，可忽略）：
+
+* 发送者在 epoch `s` 使用 `slot = s mod R`；
+* 接收者在 epoch `s` 求和完成后 signal `consumed[i][slot] = s`；
+* 发送者下一次使用同一槽（epoch `s+R`）前 wait `consumed[j][slot] ≥ s`。
+
+由于 `R=16` 远大于 5 卡之间的正常抖动，**这些 credit wait 在稳态几乎总是已满足**（引擎只花“检查已信号量”的常数成本），主机因此可以一次性把整个 token 排空，`cpu_backpressure` 从 141 ms 掉到 ~0。这也是 §12.3 的“显式状态机”的自然扩展：mailbox 从“单槽 + 全局 drain”变成“R 槽 + 每槽 epoch credit”。
+
+### 3.3 为什么能砍掉 1,600 次 CS（修 D3）
+
+要让“每卡一次提交”成立，必须让 meta 后端**不再自己提交**：它当前对每个 subgraph 调 `graph_compute_async`（Vulkan 后端内部 submit）再 `flush_async`。需要一个新的窄接口（`ggml-vulkan-internal.h` 已存在同样风格的桥梁）：
+
+```cpp
+// ggml-vulkan.cpp（新增，仅内部）
+VkCommandBuffer ggml_vk_tp5_record_subgraph(ggml_backend_t backend, ggml_cgraph * cgraph);
+// 语义：保证 replay 命中（miss 时现场录制并缓存），把该 subgraph 的 CB 交回调用者，不提交。
+// 失效规则沿用 TP5.md §14.5：buffer 世代 / 形状 / 量化类型 / wire 类型变化即缓存失效。
+```
+
+meta 后端在 TP5 模式下改为：
+
+1. 对每个 stage，向 5 个 rank 各取一次 `record_subgraph`（缓存命中）；
+2. 与 collective 的 pack/PUSH/求和 CB 一起组成 §3.1 的提交数组；
+3. **一次** `vkQueueSubmit` 交给 collective 的提交函数（每 rank 一次），自身不再 submit/flush。
+
+这样每 token 的主机操作从“291 次 submit/rank”变成“1 次 submit/rank”。
+
+### 3.4 为什么能把 t_disp 从 16 µs 压到 3 µs（修 D4/D5）
+
+* **barrier 精确化**：按 TP5.md §13.7 的模板，把三处 `ALL_COMMANDS_BIT + MEMORY_WRITE` 换成：
+  `COMPUTE_SHADER→TRANSFER`（输出给 PUSH）、`TRANSFER→COMPUTE_SHADER`（PUSH 给求和）、
+  `COMPUTE_SHADER→COMPUTE_SHADER`（求和给下一 stage）。只有在真正需要跨设备可见性的那一条上做 release/acquire，其余用本地 `MEMORY_BARRIER`（不带 L2 全冲刷）。
+* **dispatch 粗化（F4）**：
+  - **HC 四流向量化**：`C=4` 的每一组标量算子合成一次 dispatch（把流维度放进 `ne[2]`/workgroup 维度），预计把 HC 段节点数除以 ~4；
+  - MoE：gate/up 已合并，进一步把 shared expert 与 routed 的本地部分和**在同一 kernel 内合并**（§6.2 已要求“本地合并后只归约一次”），并消除 zero-size 专家分片产生的空 dispatch；
+  - 消除 layout/copy/view 类节点的实际 dispatch（能 alias 的不要真拷）；
+  - norm+rope+… 沿用上游已有融合。
+  目标 **≤50 dispatch/stage（60 tok/s）/ ≤30（100 tok/s）**，以 `GGML_VK_PERF_LOGGER` 或自建 dispatch 直方图作为证据。
+
+### 3.5 同步模式与主机账本
+
+| 模式 | 每 token 主机操作 | 用途 |
+|---|---|---|
+| **TIMELINE（新默认）** | 5 submit + 1 回读 + 0 export/import | 生产快路径 |
+| SYNC_FD（保留） | 480 export + 1920 import + FD dup/close | 兼容/对照，不进快路径（§13.6 已警告主机账） |
+| HOST（保留） | 970 fence wait + 480 device idle | 仅调试与参考正确性 |
+
+`GGML_TP5_SYNC` 的默认值应从 `HOST` 改为 `TIMELINE`（**代码事实**：`ggml_backend_vk_tp5_comm_init` 在未设置时选 HOST），HOST 保留为显式选项。TIMELINE 已在 09-14 的五卡 F16 测试中通过，包括 8 步无中间 host-sync 的依赖链（TP5.md 09-14 段）。
+
+### 3.6 可选的第二期：在途 flag 自旋（F6）
+
+`tp5_sum_f32.comp` 已经带 `use_flags` / `spin_max` push constant，`tp5_flags_byte_offset` 也已分配 flag 区（当前 `use_flags = 0` 未启用）。启用后每 stage 可去掉 4 个远端 push wait：
+
+* 发送者：4 路 P2P copy 完成后写 `flag[slot_i] = seq`（需要 release 语义）；
+* 接收者求和 shader：先自旋读 4 个 flag 直到等于本轮 `seq`，再求和（需要 acquire 语义）。
+
+收益：每 token 减少 96×5×4 = 1,920 次队列级 semaphore wait。风险与前提：TP5.md §26.3 明确要求“另写设备/驱动内存模型的完整证明和验证程序”。因此列为**第二期**，前置条件是一个独立验证程序：人工延后一个生产者、消费者在未完成时提交自旋 kernel、校验读到的是**本轮**数据（§13.8 的严格版本），并在五卡上覆盖 PCIe 写顺序、flag 与 payload 的可见性配对。
+
+### 3.7 MTP 与上游补丁的位置
+
+* **F7 MTP**：把“每输出 token 的验证步数”从 1 摊销到 ~1/mean_len（实测 mean len 3.00，接受率 14/14；09-14 另有 15/32、13/36）。它不改变 §3.1 的结构，只是把 1 步变成同结构的 k 步；要求 draft 图也走“预录 + 一次提交”，否则 §1.1 里 `T_host` 又被 draft 路径拉高。
+* **F8 上游补丁**（`docs/qwen4exp-upstream-optimizations.md`）：TopK 融合、Split-K、真稀疏注意力、增量池化 KV。它们减少的是**每 token 的 GPU 工作量与部分 dispatch**，在 §1.1 里表现为 `t_disp` 与 `N_disp` 的乘数下降；不集成它们，100 tok/s 的余量不足。
+
+---
+
+## 4. 每 token 账本：现状 vs 最快形态
+
+| 项 | 现状（实测/推导） | 最快形态（目标） |
+|---|---:|---:|
+| `vkQueueSubmit`（主机） | ~1,455 次（97×(5+10)） | **5 次** |
+| 内核 `AMDGPU_CS` | ~1,600 次 | ≤50 次（由驱动对提交数组的打包决定） |
+| `SYNCOBJ_*_WAIT`（主机） | ~600 次 | **0**（GPU 侧 wait） |
+| `vkDeviceWaitIdle` | 480 次（HOST 模式） | **0** |
+| `GEM_CREATE` | ~330 次 | **0**（全部持久化） |
+| SYNC_FD export/import | 0（未启用）→ 若启用 2,400 次 | **0** |
+| 队列级 semaphore wait（GPU） | 480 × 5 | 96 × 5 × (4 push + 4 credit) = 3,840（第二期用 flag 自旋降到 96 × 5 × 4 = 1,920，且不再有 push wait） |
+| per-stage barrier | 3–4 次全冲刷 | 2 次精确 scope |
+| dispatch/stage/rank | ~93 | ≤50（F4 后 ≤30） |
+| 最终回读 + CPU 采样 | 1 次 | 1 次（不可省，进 `T_finalize`） |
+
+---
+
+## 5. 与两份文档的契约一致性
+
+| 契约 | 本设计是否满足 |
+|---|---|
+| TP5.md §13.5「不能预录一条大 CB 只在头尾 fence」 | 满足：跨卡依赖按 stage 显式表达为 semaphore wait/signal；预录的是 CB 与描述符，载荷每 epoch 更新 |
+| TP5.md §13.3「一道输出边界的提交顺序」 | 满足：S1 覆盖 produce+convert+push+release+signal，S2 覆盖 4 个远端 wait + 求和；差别只是把两次提交合并进同一次 `vkQueueSubmit` 的数组 |
+| TP5.md §13.4 SYNC_FD 规则 | 仅 SYNC_FD 模式适用；快路径改用永久 OPAQUE timeline（§26.3 的“不默认使用”被遵守：它只是我们的**快路径选项**，HOST/SYNC_FD 两种参考路径保留，且需独立验证程序） |
+| TP5.md §13.6 主机账本 | 满足并强化：给出 before/after 计数表（§4） |
+| TP5.md §11.1/§11.3 固定顺序求和、canonical wire | 不变（求和 shader 与 pack 路径不改语义） |
+| TP5.md §13.7 barrier 模板 | 被落实（D4 修复即按该表） |
+| TP5.md §12 mailbox 所有权/状态机 | 扩展为 R 槽 + epoch credit，需要补 §12.3 的状态机文档 |
+| TP5.md §17.4「计算通信重叠是后续项」 | 遵守：本方案先消除开销，不做 GEMM 分块重叠 |
+| TP5.md §25 验收红线 | 不变：不删保护、不把 forced token 计入吞吐、先正确后快 |
+| 下班交接.md 任务一（批量提交消除 ioctl） | 本方案的任务一（F1） |
+| 下班交接.md 任务二（GPU flag 自旋） | 本方案的 F6（第二期，带前置验证） |
+| 下班交接.md 任务三（上游补丁） | F8 |
+
+---
+
+## 6. 实施顺序（每步都有可证伪的验收）
+
+> 执行时机：TP5.md 2026-09-14 硬件安全门解除后（现场内存通道检查 + 维护窗口），先纯 CPU 逻辑验证，再单卡，再五卡。
+
+### 阶段 A：主机与内核退出关键路径（F1 + F5）——预期 323 ms → 60–90 ms
+
+1. `ggml-vulkan-collective.cpp`
+   - 新增 `tp5_chain_begin/append/submit`：为每 rank 维护一个提交数组（stage 顺序），`append(stage, cb_s1, cb_s2, wait_infos...)`，`submit()` 一次发出；
+   - `tp5_allreduce_mesh` 拆成 `tp5_chain_plan`（录制/缓存）与 `tp5_chain_submit`（提交），删除每调用一次的 `tp5_wait_all_p1/p2` 与 `tp5_p2p_visibility_barrier` 在快路径上的调用；
+   - 默认 `sync_mode = TIMELINE`（保留 `GGML_TP5_SYNC=host|syncfd` 显式覆盖）。
+2. `ggml-vulkan.cpp`：新增 `ggml_vk_tp5_record_subgraph()`（§3.3），并在 `ggml_backend_vk_reg_get_proc_address` 暴露。
+3. `ggml-backend-meta.cpp`：TP5 模式下主循环改为“录制 + 追加”，由集体的链提交统一发出；保留原有逐 stage 提交路径作为 `GGML_TP5_CHAIN=0` 的对照。
+4. 验收（后续实测）：
+   - 每 token `vkQueueSubmit` ≤ 10（可用 LD_PRELOAD 或 `GGML_VK_TP5_SUBMIT_COUNT` 计数）；
+   - 每 token `SYNCOBJ_*_WAIT` ≤ 5，`GEM_CREATE` ≈ 0；
+   - 固定 prompt 输出与参考逐字一致（`1..12`、`9.9`），96 边界不变；
+   - 记录 `[tp5-profile]` 与 GPU busy%。
+
+### 阶段 B：R 槽 mailbox + credit 环（F2）——预期 60–90 ms → 40–60 ms
+
+1. `tp5_setup_workspace`：mailbox 改为 `R × n_ranks × stride + flags`（`R=16` 可配）；
+2. `tp5_record_plan`：`slot = epoch mod R`；
+3. 新增 `consumed[i][slot]` timeline 值，S2 求和后 signal，S1 在 `s ≥ R` 时 wait 四个 peer 的 credit；
+4. **CPU 侧先行验证**：把 epoch 链的状态机抽成纯逻辑参考（沿用 `tests/test-tp5-plan.cpp` 风格），穷举 R=2/4/16 下的复用顺序与危险窗口；
+5. 验收：`cpu_backpressure` 从 141 ms 降到 ≤ 5 ms/token；任意人工延后一个 rank 的对抗测试不出现跨 epoch 数据混淆（§13.8 风格）。
+
+### 阶段 C：barrier 精确化（F3）——预期再省 5–8 ms/token
+
+按 §13.7 表改写 `tp5_record_plan` 的三处 barrier；验收：`[vk-compute-profile]` 与 stage 时间下降，且五卡 96 轮数值测试仍逐元素精确。
+
+### 阶段 D：dispatch 粗化（F4）——预期 40–60 ms → 20–35 ms
+
+1. HC 四流向量化（`src/models/qwen4exp.cpp` + 相关 shader）；
+2. MoE 本地 routed/shared 合并（`ggml-backend-meta.cpp` 的 `can_defer_linear_partial` 已存在，需确保 qwen4exp 图形态真正命中）；
+3. 消除 empty dispatch 与纯 layout copy；
+4. 验收：`N_disp/stage` 直方图 ≤50；固定 prompt 输出一致。
+
+### 阶段 E：MTP 提速（F7）与上游补丁（F8）
+
+* MTP：draft 图走同一条链；验收 `draft_n_accepted / draft_n` 与 tok/s；
+* 上游：逐补丁单独提交、单独测量（TopK 融合 → Split-K → 稀疏注意力 → 池化 KV），每项记录对 `N_disp` 与 tok/s 的影响。
+
+### 阶段 F（可选）：flag 自旋（F6）
+
+前置：独立的设备/驱动内存模型验证程序（§13.8 的严格版本）通过后，才允许把 4 个 push wait 换成 shader 自旋。
+
+---
+
+## 7. 风险、地板与禁止项
+
+**风险**
+
+| 风险 | 说明 | 缓解 |
+|---|---|---|
+| 队列级 wait 的引擎成本未知 | 3,840 次/token 的 wait 若每次 2–3 µs，就是 8–11 ms | 先量测；必要时上 F6 |
+| 单队列串行放大最慢卡 | stage 由 max over ranks 决定 | 保持各 rank 张量形状一致；对称角色表已保证（`[5,5,5,5,4]`、`[14,14,15,15,14]`） |
+| RADV 对提交数组的打包方式 | `vkQueueSubmit(array)` 可能仍按 wait 边界拆 ioctl | 以 CS 计数为准；必要时按 stage 合并 reduce 边界 |
+| 大 CB 的 replay 失效 | 张量指针/形状变化会静默退化成录制 | 沿用 §14.5 的 fingerprint；计数 miss |
+| 显存 | R 槽 mailbox 400 KiB、链 CB 若干 MiB，均可忽略 | 逐卡预算按 TP5.md §4 重算 |
+| 硬件安全门 | MCE 记录（TP5.md 2026-09-14） | 维护窗口后先做只读检查与阶梯压测 |
+
+**理论地板**：`97 × N_disp × t_disp`。若 `t_disp = 3 µs`、`N_disp = 15`，地板 ≈ 4.4 ms/token（≈227 tok/s）；实际还受 `T_finalize`（回读 + CPU 采样，0.5–2 ms）与 stage 间可见性延迟限制，故**7–13 ms/token 是可信地板**。
+
+**禁止项**（与两份文档一致）：不做 host-relay；不用一条大 CB 替代真实依赖；不用 flag 自旋替代验证程序；不把 forced token 算作有效吞吐；不在没有 per-stage 证据时宣布达标；不为了 tok/s 牺牲 96 边界与数值一致性。
+
+---
+
+## 8. 待执行验证清单（安全门解除后按序）
+
+```text
+1) build-tp5-cpu: test-tp5-plan / test-meta-reduce-boundary / test-recurrent-state-rollback / test-qsa-pooled-cache
+2) 单卡: 阶段 A 的提交计数与固定输出对比（不加载全模型）
+3) 五卡: test-vulkan-tp5-mesh（F16/timeline，96 轮 + 对抗轮次）
+4) 五卡全模型: 固定 prompt（计数 1..12 / 9.9），逐字一致 + timings
+5) 阶段 A–F 每步: [tp5-profile]、[vk-compute-profile]、CS/WAIT/GEM_CREATE 计数、GPU busy%、VRAM 峰值
+6) 质量与长稳: TP5.md §25 的功能/性能/兼容矩阵逐项补齐
+```
+
+**当前状态（本文写作时）**：`llama-server` 已停止，五卡显存回到 17.2 MB 基线；本文只做设计，未运行任何 GPU 负载。
+
+---
+
+# 收敛与优化指导
+
+日期：2026-09-14。写作时仓库 HEAD：`4d963b729`，分支 `master`。
+
+本文依据本轮读取的源码、[TP5.md](TP5.md)、[TP5-FAST.md](TP5-FAST.md)、[下班交接.md](下班交接.md)及[上游优化记录](docs/qwen4exp-upstream-optimizations.md)。做了静态核对，没有启动模型、编译或运行 GPU 测试，也没有重新读取目标机上的原始 `/tmp` 测量文件。下文的历史性能数字来自仓库记录，不是本轮复测结果。源码定位见文末，后续按符号查找，不依赖行号长期不变。
+
+本文规定接下来怎样收敛工作，不另建一份滚动状态报告。测试结果、硬件准入和发布状态仍回填 TP5.md；本文中的拟议接口、计数和验收规则不能当作已经实现。
+
+## 一、先停止“再开一个开关就会快”的工作方式
+
+现在不是差一点调参。TP5.md 最近一项关闭 `GGML_META_DEBUG` 的计数请求为 **38 tokens / 15959 ms，约 2.38 tok/s**。以这个短请求的量级看，从约 **420 ms/token** 到 **16.67 ms/token**，需要约 **25 倍**提升。它不是正式长稳基准，但足以说明：再得到几个百分比的局部改进，不能解释如何到达 60。[T1]
+
+接下来只保留一条主线：
+
+```text
+固定同一个模型、输入和有效配置
+        ↓
+把每个 decode 步的时间与工作量算清
+        ↓
+消除实测存在的重复录制、分配与主机串行提交
+        ↓
+按设备时间找出真正昂贵的算子，做少量融合
+        ↓
+普通 decode 稳定后，再独立验收 MTP 与长上下文
+```
+
+**不再用“有这个功能”“单测通过”“开关已经打开”代替“这个路径实际命中，并使正确生成更快”。** 批量提交是值得优先验证的候选，不是已证明的 60 tok/s 答案。没有必要否定目标，也不能预先保证目标必达。
+
+60 tok/s 的报告必须明确 MTP 是否参与，并同时保留 MTP OFF 的主干结果。先优化普通 decode，是为了找到主干成本，不是永久关闭投机。只有开启 MTP 才达到的数字，应写“TP5 + MTP”，不能写成普通 TP5 的提升；100 tok/s 另列为后续全集成目标。
+
+### 1.1 已经完成的，不要反复当新任务
+
+| 事项 | 当前可用证据 | 后续应做什么 |
+|---|---|---|
+| 主干归约边界 | 最近模型记录已有 96 次归约、97 个子图；最后一个是尾部 | 保留结构断言。旧文中的“仍有 144 次”不再指导当前排期 |
+| 计算子图重放 | MoE token 轴判断已修正；记录有 9/9 Vulkan 回归 | 测真实模型的 eligible、hit、miss 原因和节省时间，而不是再宣布一次“重放完成” |
+| KV 副本序列化与 MTP 连续请求 | CPU 回归及两次真实连续请求已有有限通过证据 | 保留恢复回归；另测投机净收益与更广质量 |
+| 纯 P2P 通信 | 已有逐卡对及五卡有限验证；原生通信失败时拒绝继续的路径已接入 | 不重新加入 host-relay；性能重构不得破坏失败处理 |
+| 七项上游优化 | 跟踪文档称已移植、编译，验证层次不同 | 检查目标形状是否走到对应实现，不再以“全部合入”作为下一轮性能方案 |
+
+以上不等于大模型完整验收。尤其是 MTP 的 **1.47 / 1.43 tok/s** 只证明对应连续请求完成，不证明它带来加速。这两次请求与 2.38 tok/s 的计数请求不同，也不能直接拿二者相除当 MTP 减速比。[T1][T3][S1]
+
+### 1.2 硬件准入不能由性能文档自行解除
+
+TP5.md 最新安全门仍要求处理新增 MCE 后再继续模型与压力测试；《下班交接》另有“短时测试后彻底消除”的表述。两者有冲突，本轮没有独立硬件证据裁决。**在 TP5.md 的正式准入记录更新前，按暂停处理。** 一次短测无错误、一次 sysfs 计数为零，都不能替代持久 RAS 记录与受控稳定性确认。[T1][T2]
+
+现在可以做静态审查、计数器设计、离线日志解析，以及在合适开发环境执行有界的纯逻辑测试；不要把它们扩大成故障目标机上的 CPU 内存压力或 GPU 准入。后续目标机验证只允许一个有明确清理责任的执行者串行开展，不自动重启、不叠加服务、不用 OOM 或 GPU hang 探边界。
+
+## 二、先纠正会把后续工作带偏的几笔账
+
+### 2.1 23,930 次提交不是“每 token”
+
+TP5.md 写的是：一个**约 4.645 秒、边界由响应时间估算的 decode 窗口**内，观察到 23,930 次 `AMDGPU_CS`、9,058 次 `TIMELINE_WAIT`、4,851 次 `SYNCOBJ_WAIT`、4,913 次 `GEM_CREATE`。《下班交接》把它们改写成每 token，再推导可以回收 700 多毫秒，这个分母错了。[T1][T2]
+
+正确处理只有两种：恢复该窗口内准确的有效输出 token 数及 target/draft 步数，按对应分母统计；恢复不了，就保留“每窗口”数字。不能再假定窗口恰好包含 15 个 token，继续推导一个貌似精确的每 token 表。
+
+`strace` 本身会扰动时延，窗口边界也不是精确事件标记。这份轨迹可帮助寻找调用来源，不能直接作为无干扰吞吐基准。`GEM_CREATE` 只有次数、没有调用栈及大小时，不能判定全是 staging、scratch 或描述符池；先定位，再改分配器。
+
+### 2.2 当前两个 profiler 都不能直接按“一行就是一个 token”解释
+
+**meta 层存在明确的统计边界错误。** `ggml_backend_meta_graph_compute()` 只在“不是最后一个子图、实际进入通信”的分支增加 `step_cnt`，却按 `n_subgraphs` 的整数倍打印。97 个子图时，一轮只有 96 次增加；每 97 次打印会跨过 token/图执行边界，且没有把最后一个尾部子图纳入这笔分项账。[S1]
+
+**Vulkan 层默认每 480 次调用打印。** 五 rank、每 rank 97 个子图的名义调用总量是 **485，不是 480**；实际路径还可能受重放快路径、图拆分和 MTP 影响。固定调用计数不是 token 边界。[S3]
+
+此外，这些聚合计数采用函数内 `static` 状态，不能天然区分请求、context、主干和 draft。修复不能只是把 97 改成 96、480 改成 485：必须显式带上一次图执行及其用途，并单独计尾部。
+
+### 2.3 `compute_async`、`comm`、`backpressure` 不是三个独立硬件瓶颈
+
+这些现有计时首先是**主机调用区间**。调用内可以包含驱动开销，也可以在等待此前提交的 GPU 工作。把 `backpressure=200 ms` 改为 GPU wait，并不代表省掉了 200 ms；可能只是把同一个等待移到最后一次同步。[S1][S2]
+
+不能把 meta 的 `comm` 再加上 collective 内部各分项；不能把主机等待时间与它等待的 GPU 时间再相加。也不能仅凭瞬时 GPU busy 较低，就断言实际数学计算不足 1 ms。
+
+还有一处边界要保留：`tp5_allreduce_mesh()` 的 `t0` 在 `tp5_record_plan()` 之前，录制和该区间内的淘汰成本已计入 `p1_rec`。不要重复修一个并不存在的“录制时间漏计”。但它之前的 flush、workspace 检查、绑定解析和缓存查找并未因此自动包含在内，需要外层完整计时。[S2]
+
+### 2.4 峰值算力与带宽只能给条件下的下界
+
+`工作字节数 / 峰值带宽`、`FLOPs / 峰值算力` 是理想条件下的时间下界，不是实际 kernel 耗时。用这两个数不到 1 ms，不能推出余下 99% 全是可消除的结构开销。[T4]
+
+当前应从实际 GGUF 切片和图中建立每 rank 的字节账：被选中的专家权重、复制 HC、attention/GDN 投影、反量化、state、临时结果、PLE 输入和 LM head。不能用模型昵称、总文件大小或“激活 4B”直接得到每卡 264 MB。`tp5-manifest.json` 目前 `source_commit` 为空，内存预算字段也未统一显式单位，应先绑定 artifact，并统一为字节。[T5]
+
+同样，**ggml 节点数不等于 dispatch 数**。view/reshape 可能不派发，融合会减少派发，split-K 又可能增加派发。因此“约 9,000 个节点”等于“每卡约 9,000 次 dispatch”的推导不能用于承诺吞吐。
+
+### 2.5 减少 `vkQueueSubmit` 调用，不等于同比减少内核提交
+
+现有 `ggml_vk_submit()` 已经会构造多个 `VkSubmitInfo`，在一次 queue submit 调用中提交。外面再包一层数组，不会自动把里面的驱动工作合并掉。[S3]
+
+下一次实验必须同时计四层数量：**API 调用、提交批次、command buffer、驱动 CS**。Vulkan 允许一次调用提交多个批次，并不承诺它们变成一个内核 job。[V1]
+
+### 2.6 “HC 四流整体除以四”不是当前源码的直接优化空间
+
+`build_hc_mix()` 的 RMSNorm、down/up 投影和门控已经按张量表达；显式逐流循环主要在末尾 collapse：第一流 `cont`，后续各流 `add`，最后求平均。`build_hc_combine()` 则是广播、门控乘和残差加。[S4]
+
+所以可以验证“融合 collapse”“融合注入与残差”，但不能把整个 HC 描述成四份独立完整计算，再承诺融合后成本除以四。
+
+## 三、把开关收成配置，不再做组合穷举
+
+### 3.1 先把实际解析规则打印出来
+
+当前几项开关的规则并不一致：[S2][S3]
+
+| 开关 | 当前源码行为 | 收敛要求 |
+|---|---|---|
+| `GGML_VK_CMD_REPLAY` | 未设置时计算子图重放关闭；用 `atoi` 判断 | 配置中明确写 `1` 或 `0`，不用模糊的 `on` |
+| `GGML_TP5_CMD_REPLAY` | 未设置则继承上一项；两者都未设置时 collective 重放默认打开 | 两项分别声明，避免“开了 replay”却只开了一半 |
+| `GGML_TP5_SYNC` | `timeline`、`syncfd` 有专门分支；未设置及未知值进入 HOST；`gpu/gpuflag` 明确拒绝 | 已验配置明确选模式；后续把未知值改为报错，不静默选慢路径 |
+| `GGML_TP5_WIRE` | 只有精确的 `f32` 选择 F32，其余进入 F16 | 显式枚举并验证拼写，不能把输错参数当成一次有效消融 |
+| `GGML_VK_PERF_LOGGER` | 启用后，现有计算子图重放资格检查直接返回 false | 带它的算子 profile 不能冒充 replay ON 的性能 |
+| 多个 `GGML_VK_DISABLE_*` 及 logger 开关 | 部分按环境变量是否存在判断 | 这类开关设为 `0` 仍可能生效；关闭应真正 unset |
+
+第一项工程交付应是**启动时输出一次 resolved configuration**：用户输入、实际取值、回落/拒绝原因、计算重放与通信重放分别是否启用。同时记录影响图优化、融合、异步、可见设备和内存策略的环境变量。不增加逐 token 的高频日志。
+
+本轮不直接修改全局默认值。先有显式配置下的同条件证据，再决定默认路径。HOST、SYNC_FD 仍可作为明确的参考/诊断模式保留；它们不是 host-relay，也不能混为一谈。
+
+### 3.2 只维护三个实验配置，生产配置最多一个
+
+下表是**后续测试配置约定，不是已经新增的 CLI preset**。共同条件：同一主干、五 rank、直接 P2P、MTP OFF；KV 类型、PLE 模式、prompt、batch/context、量化与采样配置完全固定。硬件安全门解除前不运行。
+
+| 配置 | wire / sync | 计算重放 / collective 重放 | 用途 |
+|---|---|---|---|
+| REF | F32 / timeline | 0 / 0 | 功能参考，允许慢；与既有 CPU 数值参考共同使用 |
+| BASE | F32 / timeline | 1 / 1 | 主干性能基线。建立时先单独开通信重放，再开计算重放，保留这一步的归因证据 |
+| CAND | F16 / timeline | 1 / 1 | 在 BASE 上只改变 wire；通过精度与性能门后才考虑晋升 |
+
+REF 在 timeline 下使用 one-shot collective plan 时会等待其完成再销毁，所以它慢并不奇怪，不能把销毁等待直接删掉换取分数。[S2]
+
+此后每次只在最近通过验收的基线上改一个因素。已有 TopK、small-M、稀疏注意力、增量池化、PLE 等按固定构建和条件执行；不要一轮同时改模型、wire、重放、prompt、MTP 和 kernel 后寻找“最快组合”。已经失败的候选留在版本记录，不永久变成一个新开关。
+
+## 四、先固定什么叫 60 tok/s
+
+### 4.1 主指标与辅助指标分开
+
+主指标是**单个逻辑请求、单条输出序列的稳态有效生成吞吐**。五卡共同计算一条序列，不能把五卡数量乘到 token 数上。主干与 MTP 分别报告；prefill、首字延迟、冷启动、恢复和总请求耗时另列。
+
+```text
+decode_tok_s = 对应测量窗口内实际输出的有效 token 总数 / 窗口耗时
+```
+
+必须说明窗口起止事件、是否包含第一个由 prefill logits 采样的 token，以及最后一次 flush 的归属。不能用一个口径计 token，另一个口径计时间。多次测试的总吞吐按 `sum(tokens) / sum(time)`，不直接平均各轮 tok/s。
+
+draft 提议、被拒绝 token、强制喂入 token、重放计算都不增加有效生成数。与任务无关的重复输出不能作为“正确生成性能”验收；应保留其底层执行记录，但明确标为质量失败。
+
+### 4.2 用固定 token tape 隔离数值，用自由生成验收质量
+
+建议先建立一个可放进已审查小 context 的固定工作负载，例如 128-token 前缀和 256 步续写位置；最终长度以目标模型实际 token 化和资源预算为准。这只是隔离实验，不代表长上下文目标。
+
+固定 tape 模式逐步喂入相同 token，核对对应 logits、关键输出及 state，避免两条实现从某一步采样分叉后无法比较。它**不是自由生成质量验收**。还必须用相同 prompt、模板、seed、采样和停止规则做自由生成，覆盖短推理、计数、代码或其它可检查结果，以及真实任务样本。
+
+比较 `9.11/9.9` 的两条路径都答错，只能证明这个受测输出相同，不能证明 TP5 数值全局正确。比较 F16 wire 或新融合时，误差准则应在测试前按算子和端到端层级确定，不能事后放宽到“总算通过”。[T1]
+
+每个候选至少保留五组配对运行；交替 A/B 顺序，分别标明 warmup、编译/缓存冷态和稳定段。短输出不足以覆盖稳定段时补充固定 tape 数据，不强制延长自由生成冒充质量提升。报告吞吐、逐步延迟分布、最大 rank 耗时、显存/RSS、FD 与错误事件。长上下文另建工作负载，不能通过缩短上下文宣称所有场景达标。
+
+### 4.3 每份结果绑定完整身份
+
+至少保存：Git commit 与未提交补丁身份、二进制和实际加载库哈希、构建选项、模型六个分片及 sidecar 身份、模板和 tokenized prompt、全部实际参数与环境变量、设备 BDF 顺序、内核/驱动身份、cache 状态和原始响应。`actual_model_validated: true` 不替代这些记录。[T5]
+
+### 4.4 把目标写成时间预算，而不是性能预言
+
+| 吞吐 | 平均有效输出时间 | 用法 |
+|---|---:|---|
+| 最近短请求约 2.38 tok/s | 约 420 ms | 说明差距，不能充当正式基线 |
+| 10 tok/s | 100 ms | 第一项大幅改善的观察点，不是承诺 |
+| 30 tok/s | 33.33 ms | 继续检查剩余主导项 |
+| 60 tok/s | 16.67 ms | 当前目标 |
+| 100 tok/s | 10 ms | 后续全集成目标 |
+
+在当前 96 个主干归约边界的分解下，若入口、尾部、采样及其它不可归入主干 stage 的临界路径时间为 `T_fixed`，60 目标留给主干的**平均预算**为 `(16.67 ms - T_fixed) / 96`。把 97 个阶段均分约为 172 µs，只能帮助理解量级，不意味着每个阶段都具有相同成本，更不意味着 96 次归约独占全部预算。
+
+先找单独就超过目标预算的项目。对于临界路径中独立占比为 p 的部分，即使彻底消除，整体加速上限也只是 `1/(1-p)`。多个有重叠的优化不能把宣传加速比直接相乘。
+
+## 五、P0：先做可信的每步账本
+
+### 5.1 修正计时归属，保留主机与设备两条时间线
+
+在 meta 图执行入口创建本次统计上下文，至少携带：`request_id / graph_exec_id / target_or_draft / prefill_decode_verify / token_position / batch_tokens / rank / stage / collective_epoch`。这些是拟议内部诊断字段，不是新增公开 API。
+
+图入口开始、最后一个尾部结束时关闭统计，不能靠某个函数被调用 96 或 480 次猜边界。主线程调用区间用单调时钟；同一条时间线给出互不重叠的分类，未归因部分明确留下。嵌套分项只解释父区间，不再次加总。[S1][S2][S3]
+
+| 必须区分的部分 | 最少记录内容 |
+|---|---|
+| 图与录制 | build/reuse、eligible、hit/miss、miss 原因、录制与绑定时间 |
+| 主机提交 | queue submit 调用数、每次批次数、CB 数、主机调用时间 |
+| 等待 | 等待位置、目标 epoch、对象回收/最终读回/状态恢复等原因、阻塞时间 |
+| GPU 工作 | 各 rank 的 compute、pack、P2P、sum 和尾部时间区间；实际 dispatch/copy 数 |
+| 内存与资源 | 应用分配次数与字节、pool 增长、scratch 世代、descriptor/CB 创建和退休 |
+| 外层工作 | PLE 读取/上传、logits 回读、采样、KV/state 保存恢复及未归因时间 |
+
+不要求所有条目一次做成复杂 profiler。第一步先修图边界，加入低开销计数；再给主导阶段加设备计时。**不要为了观测而每层同步 GPU。**
+
+### 5.2 设备计时不能悄悄关闭被测快路径
+
+现有 `GGML_VK_PERF_LOGGER` 会影响 replay eligibility。用它找算子可以，但结果必须标明重放关闭，不能把其 profile 原封不动解释为快路径。[S3]
+
+对重放路径，使用持久 query pool 和有界的采样窗口；在适当完成边界后批量读回，不逐 dispatch 等查询结果。处理 query 槽复用、CB 重放、在途生命周期及 reset 顺序；记录 `timestampValidBits`、`timestampPeriod` 和计时 stage。[V2]
+
+各 GPU 原始 timestamp 不能直接相减。跨卡时间线具备校准能力时，记录共同主机时域及校准误差；否则先分别报告各卡区间与依赖，不伪造微秒级跨卡重叠图。校准也需要按漂移情况更新。[V3]
+
+### 5.3 先回答五个问题，再选优化
+
+1. 稳态每个 target 步实际有多少 eligible 子图？哪些重放未命中、为什么？
+2. 等待时，GPU 在执行有用工作，还是因后续提交尚未到达而空闲？
+3. 一次 API 提交对应多少批次、CB 和驱动 CS？
+4. 暖态仍在创建的对象来自哪里、大小多少、是否因过早释放而重建？
+5. 哪个 stage、哪个 rank 决定当前步完成？入口和尾部占多少？
+
+**P0 的完成物**：一份可按真实 token/图执行切分的基准记录；一张带计时范围的时间账；一张热点排序表。若这些问题仍回答不了，不进入全图提交和大规模 shader 重写。
+
+## 六、P1：先收敛现有路径，再改变提交结构
+
+### 6.1 分开检查两个重放缓存
+
+计算子图和 collective plan 是两类缓存，不共享一个“命中率”结论。分别记录冷态首次录制、稳态命中、形状/offset/参数/缓冲世代变化、资源淘汰等原因。性能应关注未命中造成的时间，而不是追求所有图 100% 命中。[S2][S3]
+
+动态专家 ID、输入值、KV 写入位置、view 偏移和 scratch 世代都要进入真实回归。允许动态变化的内容必须由本轮正确输入提供；需要失效的绑定必须失效。不能因为 decode 大体同形，就断言所有指针和状态永远固定。
+
+当前 collective 的 plan key 包含 buffer、offset、size、wire、workspace 世代等；只有证明工作集大于容量并发生反复淘汰，才调整缓存容量。不要直接把 64 改成更大数字再宣布消除了抖动。被淘汰的命令和所有引用资源仍须等设备完成后退休。[S2]
+
+### 6.2 只持久化实测反复创建的资源
+
+根据 P0 证据处理 CB、descriptor、scratch、staging 和元数据数组，预分配已知上界、按世代复用、在完成边界回收。保留显存上界和异常清理。只看到 GEM_CREATE 次数，不能证明扩大任意一个应用缓存会减少它。
+
+meta 层通信前 flush，collective 入口又 flush，值得计数核对；但空 flush 可能不产生提交，不能先认定每次都重复下发。若证明确有重复，优先收成一个清楚的提交所有者，而不是在两层分别加跳过标志。[S1][S2]
+
+**P1 的完成物**：稳态资源不再因已定位的可避免原因反复创建；重放失效均能解释；同条件正确生成更快，或者得到“录制/分配不是主导项”的明确否定证据。后一种也是有效结论，应据此停止深挖这一支。
+
+## 七、P2：验证分段批量提交，不直接押注“每卡一次”
+
+### 7.1 值得保留的方向
+
+沿用现有五个 backend/device、分片计划和 collective。把“录制”“提交”“资源退休”分开，让上层可以拿到**带资源所有权的本地执行计划**，而不是只拿一个裸 `VkCommandBuffer`。[S1][S2][S3]
+
+先试把相邻少量 stage 的提交组织成一批，例如 2 个，再根据证据扩到 4 个或更多。最终每卡每 token 一次 API 提交可以作为实验目标，但不作为先验最优解。提交数量太少也可能增加准备时延和在途资源占用；验收依据是关键路径，不是表面 API 数。
+
+一个安全的计划至少拥有：对应 CB、descriptor、输入输出及临时 buffer 引用、scratch/绑定世代、同步依赖和完成后退休规则。不能复用普通路径中会在下一子图 reset 的资源，随后让 GPU 延迟读取它。
+
+### 7.2 依赖链不能被“同一队列”四个字省略
+
+当前主干应表达的是 96 个带归约的 stage，加一个独立尾部，而不是 97 次归约：
+
+```text
+stage s 本地计算
+    → 本地输出可供 pack / PUSH 读取
+    → 当前 epoch 的本地与远端载荷写入
+    → 各生产者 release / signal
+    → 接收方 wait / acquire
+    → 固定顺序求和
+    → 本 rank 下一 stage 的消费者
+
+stage 95 完成 → 尾部计算 → 必要的最终读回与采样
+```
+
+Vulkan 的 submission order 本身不建立普通命令之间完整的 execution/memory dependency。合并到一个提交数组或同一队列后，本地 RAW 依赖与跨设备可见性仍要表达，不能删成“按顺序执行所以安全”。[V4]
+
+精确化 barrier 时，逐个说明 buffer 范围、生产/消费 stage、access、外部内存及 queue-family 所有权规则。不要把 `ALL_COMMANDS` 机械替换成较窄掩码，就宣称固定减少若干微秒；也不要把主机等待当作正确外部内存协议的替代品。
+
+### 7.3 先区分 owner 环、mailbox 槽与数学依赖
+
+当前 `MAX_OUTSTANDING_EPOCHS=4` 对应在途对象管理及主机 drain。与此同时，timeline 的 P1 明确等待其它 rank 的 `2*(epoch-1)`，P2 等待其它 rank 的 `2*epoch-1`，自身 P2 完成后 signal `2*epoch`。前者约束前一轮消费与下一轮写入，不是可以不加替代就删除的慢代码。[S2]
+
+因此，三件事必须分开：**主机最多提前准备多少轮、同一载荷地址何时允许重写、下一 stage 数学上何时可以读取结果。** 增大前两者的容量，不会消除第三者。
+
+只有测出单槽复用或资源管理迫使了不必要的主机停顿，才引入 R 槽 mailbox 与消费 credit。每槽需要 `(communicator_generation, epoch, slot)` 的明确归属，旧读者全部完成后才能覆盖；申请 R 槽的显存、descriptor 和计划缓存也要计预算。不能预先断言 R=16 就让 141 ms 背压变成零。
+
+timeline 的值在同一 semaphore 生命周期内必须单调推进，不能每个 token 重新从零开始。能力查询、最大在途差值、跨请求复用、计数溢出和销毁都要有边界。wait-before-signal 允许延后提交生产者，但相应生产者永远不再提交时，就可能无法推进。[V5]
+
+### 7.4 失败路径先于大模型性能测试
+
+先用离线事件模型验证读写次序和资源复用，再在硬件准入后做小尺寸真实 GPU producer/consumer：变更输入、延迟某个生产者、多次槽复用、非零 offset、形状切换以及受控提交失败路径。
+
+部分 rank 已提交、另一个 rank 失败时，不能盲目 `DeviceWaitIdle` 等待永远不会到来的 peer signal；也不能由主机补一个“成功”信号，让消费者读取未完成载荷。保留现有拒绝继续的语义，为失败状态设计经过审查的退出和资源处理，不把一个通用析构函数当成解决方案。[S2][V5]
+
+**GPU 显存 flag 自旋不进入本轮收敛主线。** 当前代码已明确拒绝 `gpu/gpuflag`。它同时引入跨设备可见性、调度前进性和 hang 风险，不是换个同步开关；若将来研究，须单列设计与安全准入，不依附这次 60 tok/s 验收。[S2]
+
+**P2 的完成物**：数值与生命周期通过；有效 token 时间下降；API/批次/驱动提交数量有前后对照；最终等待没有把省下的中间等待原样搬回来。如果只有 API 次数下降、墙钟不降，应停止继续扩大提交批量，转向设备工作与依赖分析。
+
+## 八、P3：按实测热点做融合，不按 PR 数量排进度
+
+| 候选 | 具体落点 | 必须先拿到的证据与边界 |
+|---|---|---|
+| HC collapse | `build_hc_mix()` 的逐流加总、cont、scale | 实际派发与耗时；融合均值而非重写全部 HC，保持归一化、门控和量化语义 |
+| HC 注入与残差 | `build_hc_combine()` 的 scale/sigmoid/broadcast/mul/add | 确认已有后端融合没有消除这些成本；避免物化 repeat，保留非连续布局与生命周期 |
+| MoE 小矩阵和路由 | `MUL_MAT_ID`、TopK、shared/routed 本地合并 | 测真实专家数、选中数、每 rank 通道和量化；不跨非线性错误移动归约 |
+| GDN / attention 的 rank 不均衡 | 头分配和实际 kernel 调度 | 看每 stage 最慢 rank，而不是平均时间；不要仅凭轮换角色就认定已经均衡 |
+| QSA 稀疏与池化 | compact、实际 FA、增量缓存命中 | 分开短/长上下文，记录有效 KV 密度和 dense fallback；不得通过截断越界条目变快 |
+| PLE 与尾部 | direct read/上传、最终 HC、LM head、logits 回读 | 计入 96 边界之外；缓存读和冷 I/O 分开，不假设它们免费 |
+
+HC 首轮只选 collapse 或 combine 中实测最贵的一项。保留原公式参考，覆盖不同 token 数、dtype、view、量化和支持的 adapter 条件；一个局部融合的收益必须在整步账本中出现。[S4]
+
+目标 manifest 给出的 MoE 是 **512 experts、top-10、每 rank 128 通道**。已有 TopK 算子证明采用过 **256 experts、22 tokens、top-6**，这不能直接证明单 token 主路径采用同一融合，更不能替代目标形状的性能测试。small-M/split-K 也要测实际量化和 M=1，以及后续 MTP 的小批量；切分更多不一定更快。[T3][T5]
+
+当前 GDN state 头分配为 `[10,10,10,10,8]`，Q 头角色为 `[5,5,5,5,4]`，KV 角色中有一份双头。它们提示应该按 rank 看热点，但不单独证明哪张卡慢。优化应依据最长的实际执行区间，不能先重写分片方案。[T5]
+
+QSA 的压实仍扫描掩码，稀疏 FA 才按活跃项工作。ctx512 上的主导成本与长上下文可能不同；不要用短请求否定长上下文优化，也不要拿上游长文本增益乘到当前短请求上。[T3]
+
+## 九、MTP 单独算净收益，不用接受率代替速度
+
+对一个投机周期，设 `A` 为最终实际输出的 token 数，包括被接受的 draft 以及该算法真实产生的 target token；已经计过的 token 不重复计入。则：
+
+```text
+MTP 有效 token 时间
+  = sum(draft + verify + checkpoint + rollback + 其它不可重叠开销)
+    / sum(A)
+
+配对加速比
+  = 同条件 MTP OFF 的有效 token 时间 / MTP ON 的有效 token 时间
+```
+
+接受 15/32 个 draft 不代表加速 47%，平均接受长度也不自动变成吞吐倍数。接受、拒绝、补采、状态保存恢复和多 token verify 都要记账。[T1]
+
+当前计算子图 replay 资格要求 matmul token batch 为 1，多 token verify 不能直接继承这条资格。声称“MTP 只是同一个静态图一次多算几步”是不够的；必须核对 verify 实际使用的图、kernel、分配和命中率。需要扩展重放时，新增受验证的形状/状态规则，不能直接删除 batch 检查。[S3]
+
+先测短 draft 长度的配对结果，再决定是否增加长度。保留连续请求、部分接受、全拒绝、KV 副本偏移、recurrent/PLE/QSA 回滚与取消恢复测试。没有稳定净收益的配置不进入性能默认，但实现和回归仍保留，不能为了快而破坏状态完整性。
+
+## 十、实施顺序与停止条件
+
+| 顺序 | 主要文件/职责 | 此阶段交付 | 不满足时怎么办 |
+|---|---|---|---|
+| P0 | `ggml-backend-meta.cpp`、Vulkan/collective 的配置和诊断 | 正确图边界、resolved config、可信基准与时间账 | 不启动全图重构；继续定位缺失证据 |
+| P1 | 两类 replay cache、录制与资源管理 | 已定位的暖态重复工作消除，或确认它不是主导项 | 停止盲目扩缓存和调分配参数 |
+| P2 | meta→Vulkan→collective 的提交与退休契约 | 有界分段提交、正确依赖、真实关键路径改善 | API 次数好看但时间不降，就不扩大批量 |
+| P3 | `qwen4exp.cpp` 与对应 Vulkan kernel | 一项一项可归因的目标形状融合收益 | 无实际命中或净收益就不晋升 |
+| P4 | speculative、state/KV、长上下文及服务集成 | MTP 净收益、长稳、质量、资源与恢复矩阵 | 不用局部成功替代全集成验收 |
+
+P0 之后可以并行做彼此独立的离线代码工作，但真实目标机始终串行。测量、提交链和 kernel 不应同时修改同一条基线，否则无法归因。
+
+### 10.1 每个性能改动只接受一张证据单
+
+```text
+假说：哪个已测区间由什么重复工作造成？
+改动：只改变哪个机制，保留哪些数学和资源约束？
+命中：目标模型确实进入了新路径吗？
+前后：同一工作负载的 ms/token、分项、计数及资源峰值。
+正确性：数值参考、自由生成、状态恢复和异常路径。
+结论：晋升 / 保留实验 / 撤回；附 artifact、原始结果与回滚点。
+```
+
+把“值得晋升”的最小收益阈值在测量前约定。可以先采用超过基线波动、且配对中位时间改善至少 5% 的工程门；微小但必要的正确性/维护改动另行说明，不冒充性能成果。一个热点方向连续两轮没有支持证据，就回到时间账重排优先级，而不是再叠第三个开关。
+
+任一数值失败、旧 epoch 污染、host-relay、无法清理的挂起、资源持续增长或新增硬件错误，均停止该候选晋升。禁止用强制关闭任务、少算层、减少专家、缩短目标上下文、丢 KV、放宽容差或重复无效输出换取达标数字。
+
+### 10.2 达到 60 后也不能立即宣布完成
+
+至少同时具备：冻结工作负载下可重复的有效吞吐；同条件质量非劣与数值门；上下文长度和 MTP 参与状态明确；逐卡显存和主机资源有界；持续请求及恢复无回归；安全准入和 artifact 可追溯。完整长上下文或全集成尚未测，就明确列出，不沿用短请求的结论。
+
+**下一轮最有价值的交付不是第八个优化开关，而是：一份可信基线、一笔按真实步划分的时间账，以及一个在这笔账上确实减少了毫秒数的改动。**
+
+## 十一、与现有三份文档的关系
+
+TP5.md 保留模型数学、分片、P2P、状态与历史证据；最新状态覆盖旧段落，不重复执行已完成任务。《下班交接》保留交接线索，但其 per-token ioctl、硬件“彻底消除”和全面数值正确等扩大结论不作为验收依据。
+
+TP5-FAST.md 的“提交计划＋timeline＋资源生命周期＋少量融合”可作为候选架构输入；以下内容降为待验证假说或予以修正：数学计算不足 1 ms、节点数直接充当 dispatch、任意固定单 dispatch 延迟、预计阶段加速路线、单次 API 提交必然大幅减少 CS、R 槽必然消除全部背压、同队列自动保证数据依赖，以及尚未证明的 60/100 tok/s 可达性结论。[T4]
+
+这里不是要求再写第四套实现。恰恰相反：**只保留一个默认执行路径、一个完整参考路径和有期限的候选实验；让计时、数学、资源和发布状态各有一份明确依据。**
+
+## 依据与定位
+
+### 仓库记录
+
+- **[T1]** [TP5.md](TP5.md)，开篇“2026-09-14 重新插卡验证与通信计时修正”：安全门、2.38 tok/s、96/97 边界、MTP 两次请求、ioctl 窗口与归因限制。本文未独立复读其引用的目标机原始日志。
+- **[T2]** [下班交接.md](下班交接.md)，一、三、四、五节：当前吞吐、硬件结论、ioctl 解释和后续路线；本文明确指出其需要收回的扩大结论。
+- **[T3]** [上游优化记录](docs/qwen4exp-upstream-optimizations.md)，最新纠正、状态矩阵及各项算子证据。这里引用的是本地移植记录，不是对上游 PR 当前状态的重新查询。
+- **[T4]** [TP5-FAST.md](TP5-FAST.md)，第 0—4 节：预算、现状归因、epoch 链与预测；作为设计假说审查，不视为实测证明。
+- **[T5]** [tp5-manifest.json](tp5-manifest.json)，开头的 `source_commit`、`model_identity`、`hparams`、`attention`、`gdn`、`memory_budget_per_rank`。
+
+### 源码
+
+- **[S1]** [ggml-backend-meta.cpp](ggml/src/ggml-backend-meta.cpp)：`ggml_backend_meta_graph_compute()`，本轮定位约 2845—2934 行；异步计算、flush、归约、debug 计数及 native communicator 失败处理。构造阶段能力检查约 2010 行起。
+- **[S2]** [ggml-vulkan-collective.cpp](ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp)：`tp5_comm`、`tp5_allreduce_mesh()`、`ggml_backend_vk_tp5_comm_init()`；本轮定位约 170—176、863—1260、1280—1350 行。关注 owner 环、plan key、两阶段 timeline、计时范围和环境变量解析。
+- **[S3]** [ggml-vulkan.cpp](ggml/src/ggml-vulkan/ggml-vulkan.cpp)：`ggml_vk_cmd_replay_enabled()` 与 `ggml_vk_cgraph_decode_replay_eligible()`，约 2475—2525 行；`ggml_vk_submit()`，约 3355—3447 行；计算 profile 聚合，约 19615 行起。
+- **[S4]** [qwen4exp.cpp](src/models/qwen4exp.cpp)：`build_hc_mix()` / `build_hc_combine()`，约 357—428 行。以现有公式和真实图为融合参考，不照抄“全部四流复制”的描述。
+
+### Vulkan 官方规范与样例（2026-09-14 查询）
+
+- **[V1]** [vkQueueSubmit](https://docs.vulkan.org/refpages/latest/refpages/source/vkQueueSubmit.html)：一次调用可包含多个 submission batch；不能由调用数推导内核 job 数。
+- **[V2]** [Queries](https://docs.vulkan.org/spec/latest/chapters/queries.html)：设备 timestamp、有效位、周期和查询操作的约束。
+- **[V3]** [Calibrated Timestamps](https://docs.vulkan.org/features/latest/features/proposals/VK_EXT_calibrated_timestamps.html)：跨时域校准、最大误差与漂移。
+- **[V4]** [Synchronization and Cache Control](https://docs.vulkan.org/spec/latest/chapters/synchronization.html)：submission order 与 execution/memory dependency 的区别。
+- **[V5]** [Timeline semaphore 官方样例](https://docs.vulkan.org/samples/latest/samples/extensions/timeline_semaphore/README.html)：单调计数、wait-before-signal、提交深度和停止时的前进性问题；样例不是本项目跨设备内存正确性的替代证明。

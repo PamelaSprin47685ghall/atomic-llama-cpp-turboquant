@@ -20,6 +20,7 @@
 #include "ggml-vulkan-internal.h"
 #include "ggml-vulkan-shaders.hpp"
 #include "ggml-vulkan.h"
+#include "ggml-tp5-profile.h"
 
 #include <vulkan/vulkan.h>
 
@@ -912,6 +913,7 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
     tp5_cached_plan * plan = nullptr;
     tp5_cached_plan one_shot;
     bool is_cached = false;
+    bool plan_cache_hit = false;
 
     if (c.cmd_replay_enabled) {
         for (auto & p : c.cached_plans) {
@@ -919,6 +921,10 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                 plan = &p;
                 plan->last_used_call = c.allreduce_calls;
                 is_cached = true;
+                plan_cache_hit = true;
+                if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+                    prof->collective_plan_hits++;
+                }
                 break;
             }
         }
@@ -927,6 +933,9 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
     auto t0 = std::chrono::high_resolution_clock::now();
 
     if (!plan) {
+        if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+            prof->collective_plan_misses++;
+        }
         tp5_cached_plan new_plan;
         new_plan.key = key;
         new_plan.cmd_p1.resize(c.n_ranks, VK_NULL_HANDLE);
@@ -1215,7 +1224,12 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
 
     static uint64_t total_p1_rec = 0, total_p1_sub = 0, total_p1_wait = 0, total_p2_rec = 0, total_p2_sub = 0, total_bp = 0;
     static int stat_count = 0;
-    total_bp      += std::chrono::duration_cast<std::chrono::microseconds>(t_bp1 - t_bp0).count();
+    const auto bp_us = std::chrono::duration_cast<std::chrono::microseconds>(t_bp1 - t_bp0).count();
+    total_bp      += bp_us;
+    if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+        prof->backpressure_us += (uint64_t) bp_us;
+        prof->collective_calls++;
+    }
     total_p1_rec  += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
     total_p1_sub  += std::chrono::duration_cast<std::chrono::microseconds>(t2 - t_bp1).count();
     total_p1_wait += std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count();

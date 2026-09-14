@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include "ggml-backend.h"
 #include "llama-hparams.h"
 
 #include <array>
@@ -128,3 +129,16 @@ struct llama_tp5_plan {
 bool llama_tp5_plan_build(const llama_hparams & hp, uint32_t n_devices,
                           int64_t n_vocab,
                           llama_tp5_plan & out, llama_tp5_error & err);
+
+// TP5.md §8.2: global V head h uses Q/K head (h % Nk) after prearrangement.
+int64_t llama_tp5_gdn_qk_global_head(const llama_tp5_plan & plan, int64_t global_v_head);
+
+// Map a named tensor to meta split_state via the immutable plan.
+// Returns false when the plan has no rule (caller keeps legacy split logic).
+// indexer_head_size: pass hparams.indexer_head_size for cache_k/v indexer detection.
+bool llama_tp5_try_apply_split_state(
+        const llama_tp5_plan & plan,
+        const char * tensor_name,
+        const struct ggml_tensor * tensor,
+        int64_t indexer_head_size,
+        struct ggml_backend_meta_split_state & out);

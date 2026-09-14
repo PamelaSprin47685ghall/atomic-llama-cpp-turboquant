@@ -352,6 +352,8 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const 
     return std::make_unique<graph>(*this, params);
 }
 
+// TP5 HC annotation boundary (TP5.md §9): F3 fold -> build_hc_mix; F1 combine -> build_hc_combine.
+// Each sublayer output partial is reduced once at the meta graph boundary (not inside HC).
 // Hyper-connections keep hc parallel residual streams [n_embd, hc, T] in place of layer norms.
 // Returns the mixed [n_embd, T] stream; `inject` gets the [hc, T] scatter weights.
 ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(

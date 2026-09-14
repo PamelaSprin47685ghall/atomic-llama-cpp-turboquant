@@ -3009,6 +3009,54 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_NO_HOST"));
     add_opt(common_arg(
+        {"--tp5"}, "PLAN",
+        "enable TP5 tensor parallel (e.g. qwen4exp-af); sets GGML_TP5_* env",
+        [](common_params & params, const std::string & value) {
+            params.tp5.enabled = true;
+            params.tp5.plan  = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--tp5-wire"}, "TYPE",
+        "TP5 wire dtype: f32 | f16 (default: f16)",
+        [](common_params & params, const std::string & value) {
+            params.tp5.enabled = true;
+            params.tp5.wire = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--tp5-sync"}, "MODE",
+        "TP5 sync: host | syncfd | timeline (default: timeline)",
+        [](common_params & params, const std::string & value) {
+            params.tp5.enabled = true;
+            params.tp5.sync = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--tp5-manifest"}, "FILE",
+        "optional TP5 manifest JSON for load-time budget checks",
+        [](common_params & params, const std::string & value) {
+            params.tp5.enabled = true;
+            params.tp5.manifest = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--tp5-trace"}, "FILE",
+        "optional TP5 trace output path",
+        [](common_params & params, const std::string & value) {
+            params.tp5.enabled = true;
+            params.tp5.trace = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--tp5-no-replay"},
+        "disable TP5 command replay (GGML_VK_CMD_REPLAY=0)",
+        [](common_params & params) {
+            params.tp5.enabled = true;
+            params.tp5.cmd_replay = false;
+        }
+    ));
+    add_opt(common_arg(
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(
             "KV cache data type for K\n"

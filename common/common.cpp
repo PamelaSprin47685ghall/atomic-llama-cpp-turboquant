@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
+#include <cstdlib>
 #include <cmath>
 #include <chrono>
 #include <cstdarg>
@@ -399,6 +400,32 @@ void common_init() {
     common_log_set_timestamps(common_log_main(), true);
 
     llama_log_set(common_log_default_callback, NULL);
+}
+
+void common_tp5_apply_env(const common_params & params) {
+    if (!params.tp5.enabled) {
+        return;
+    }
+    if (!params.tp5.wire.empty()) {
+        setenv("GGML_TP5_WIRE", params.tp5.wire.c_str(), 1);
+    }
+    if (!params.tp5.sync.empty()) {
+        setenv("GGML_TP5_SYNC", params.tp5.sync.c_str(), 1);
+    }
+    setenv("GGML_TP5_RELAY", "off", 1);
+    setenv("GGML_VK_CMD_REPLAY", params.tp5.cmd_replay ? "1" : "0", 1);
+    if (!params.tp5.manifest.empty()) {
+        if (!std::filesystem::exists(params.tp5.manifest)) {
+            throw std::runtime_error("TP5 manifest not found: " + params.tp5.manifest);
+        }
+        setenv("GGML_TP5_MANIFEST", params.tp5.manifest.c_str(), 1);
+    }
+    if (!params.tp5.trace.empty()) {
+        setenv("GGML_TP5_TRACE", params.tp5.trace.c_str(), 1);
+    }
+    LOG_INF("%s: TP5 enabled plan=%s wire=%s sync=%s replay=%d\n", __func__,
+            params.tp5.plan.c_str(), params.tp5.wire.c_str(), params.tp5.sync.c_str(),
+            (int) params.tp5.cmd_replay);
 }
 
 void common_params_print_info(const common_params & params, bool print_devices) {
@@ -1722,6 +1749,8 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_tp5_apply_env(params);
+
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();

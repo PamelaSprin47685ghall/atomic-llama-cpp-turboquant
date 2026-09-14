@@ -203,6 +203,7 @@ add_library(ggml-base
             ggml-flashprefill.cpp
             ggml-backend.cpp
             ggml-backend-meta.cpp
+            ggml-tp5-profile.cpp
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h

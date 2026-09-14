@@ -5,6 +5,8 @@
 #include "llama-tp5-plan.h"
 #include "llama-hparams.h"
 
+#include "ggml.h"
+
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -357,6 +359,57 @@ static void test_gqa_bridge_head_mapping_algebra() {
     fprintf(stderr, "  GQA Bridge head mapping algebra: 100%% exact match across all 24 heads\n");
 }
 
+// TP5.md §8.2: each global V head h maps Q/K to head (h % Nk).
+static void test_gdn_headmap_modulo() {
+    fprintf(stderr, "--- test_gdn_headmap_modulo ---\n");
+    llama_hparams hp = make_hparams();
+    llama_tp5_plan plan;
+    llama_tp5_error err;
+    TEST_ASSERT(llama_tp5_plan_build(hp, 5, 248320, plan, err));
+
+    for (int64_t h = 0; h < plan.Nv; ++h) {
+        const int64_t qk = llama_tp5_gdn_qk_global_head(plan, h);
+        TEST_ASSERT(qk == h % plan.Nk);
+    }
+
+    // Prearranged local blocks must cover every global V head exactly once.
+    int64_t covered = 0;
+    for (uint32_t r = 0; r < plan.ranks; ++r) {
+        covered += plan.gdn_v_heads[r];
+        TEST_ASSERT(plan.gdn_v_ranges[r][1] - plan.gdn_v_ranges[r][0] == plan.gdn_v_heads[r]);
+        if (r > 0) {
+            TEST_ASSERT(plan.gdn_v_ranges[r][0] == plan.gdn_v_ranges[r - 1][1]);
+        }
+    }
+    TEST_ASSERT(covered == plan.Nv);
+}
+
+static void test_tp5_split_state_gdn_qkv() {
+    fprintf(stderr, "--- test_tp5_split_state_gdn_qkv ---\n");
+    llama_hparams hp = make_hparams();
+    llama_tp5_plan plan;
+    llama_tp5_error err;
+    TEST_ASSERT(llama_tp5_plan_build(hp, 5, 248320, plan, err));
+
+    struct ggml_init_params params = { 64 * 1024 * 1024, nullptr, false };
+    struct ggml_context * ctx = ggml_init(params);
+    TEST_ASSERT(ctx != nullptr);
+
+    int64_t ne[4] = { 2560, 10240, 1, 1 };
+    ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ne[0], ne[1]);
+    ggml_set_name(t, "blk.0.attn_qkv.weight");
+
+    ggml_backend_meta_split_state ss{};
+    TEST_ASSERT(llama_tp5_try_apply_split_state(plan, t->name, t, hp.indexer_head_size, ss));
+    TEST_ASSERT(ss.axis == GGML_BACKEND_SPLIT_AXIS_1);
+    int64_t total = 0;
+    for (int r = 0; r < 5; ++r) total += ss.ne[r];
+    TEST_ASSERT(total == ne[1]); // fused 2*K+V layout split by V-head ownership
+    TEST_ASSERT(ss.ne[0] == 2133 && ss.ne[4] == 1708); // 10240 * 10/48 and remainder
+
+    ggml_free(ctx);
+}
+
 static void test_nextn_layer_plan_bounds() {
     fprintf(stderr, "--- test_nextn_layer_plan_bounds ---\n");
     llama_hparams hp = make_hparams();
@@ -396,6 +449,8 @@ int main() {
     test_validate();
     test_other_rank_counts();
     test_gqa_bridge_head_mapping_algebra();
+    test_gdn_headmap_modulo();
+    test_tp5_split_state_gdn_qkv();
     test_nextn_layer_plan_bounds();
 
     if (g_failures > 0) {

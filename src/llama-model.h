@@ -7,6 +7,7 @@
 #include "llama-memory.h"
 #include "llama-vocab.h"
 #include "llama-lazy-reader.h"
+#include "llama-tp5-plan.h"
 
 #include <cstdint>
 #include <map>
@@ -591,6 +592,8 @@ struct llama_device {
 struct llama_meta_device_get_split_state_userdata {
     size_t                     n_devices;
     const struct llama_model * model;
+    bool                       has_tp5_plan = false;
+    struct llama_tp5_plan      tp5_plan;
 };
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);

@@ -4,8 +4,10 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
+#include "ggml-tp5-profile.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -2214,6 +2216,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+
+    static std::atomic<uint64_t> s_tp5_exec_id{0};
+    ggml_tp5_profile_begin(++s_tp5_exec_id, cgraph->n_nodes <= 4);
+    struct ggml_tp5_profile_scope {
+        ~ggml_tp5_profile_scope() { ggml_tp5_profile_end(); }
+    } tp5_profile_scope;
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
