@@ -1,0 +1,6 @@
+# /etc/sudoers.d/99-gpu-reset
+# 允许 kunweiz 用户免密执行 GPU PCIe 硬件复位脚本
+kunweiz ALL=(ALL) NOPASSWD: /home/kunweiz/atomic-llama-cpp-turboquant/scripts/reset-gpu-pci.sh
+kunweiz ALL=(ALL) NOPASSWD: /usr/bin/tee /sys/bus/pci/devices/0000\:*/reset
+kunweiz ALL=(ALL) NOPASSWD: /usr/bin/tee /sys/bus/pci/devices/0000\:*/remove
+kunweiz ALL=(ALL) NOPASSWD: /usr/bin/tee /sys/bus/pci/rescan
