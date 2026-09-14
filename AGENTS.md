@@ -75,8 +75,9 @@ ioctl 剖析（4.64 s decode 窗口，见 `/tmp/tp5-reseat-connectivity/driver-i
 5. **五卡 Mesh 全测试全绿**：`test-vulkan-tp5-mesh` 在 F16/F32 wire 模式下 96 轮基准、变异输入、延迟生产者、真实 GPU graph-producer 及 8 步异步依赖重叠测试 100% 通过（FD 增量 0）。
 6. **CPU 回归全通**：`test-tp5-plan`、`test-meta-reduce-boundary`、`test-qsa-pooled-cache`、`test-alloc` 全部 PASS。
 7. **一键 GPU 复位与死锁自愈工具**：
-   - 用户态清理（免 root）：`./scripts/reset-gpu-user.sh`
-   - PCIe 总线硬件级复位（防主机 hang/重启）：`sudo ./scripts/reset-gpu-pci.sh [card1..card5|all]`
+   - **一键自愈恢复（首选，已配免密）**：`./scripts/reset-gpu.sh`
+   - 用户态排空：`./scripts/reset-gpu-user.sh`
+   - PCIe 总线级硬件复位（已配 NOPASSWD sudo）：`sudo ./scripts/reset-gpu-pci.sh [card1..card5|all]`
 
 ### 五、下一班建议顺序
 
