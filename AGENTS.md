@@ -78,6 +78,7 @@ ioctl 剖析（4.64 s decode 窗口，见 `/tmp/tp5-reseat-connectivity/driver-i
    - **一键自愈恢复（首选，已配免密）**：`./scripts/reset-gpu.sh`
    - 用户态排空：`./scripts/reset-gpu-user.sh`
    - PCIe 总线级硬件复位（已配 NOPASSWD sudo）：`sudo ./scripts/reset-gpu-pci.sh [card1..card5|all]`
+8. **P0 可信时间账全链路埋点完成**：`ggml_tp5_profile` 在 `ggml-vulkan.cpp`、`ggml-vulkan-collective.cpp` 与 `ggml-backend-meta.cpp` 完整挂载，全面捕获 queue submits、submit batches、host waits（次数与微秒）及 FD export/import。
 
 ### 五、下一班建议顺序
 
