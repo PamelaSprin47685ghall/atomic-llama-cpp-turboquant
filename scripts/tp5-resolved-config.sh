@@ -6,7 +6,7 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 OUT=${1:-/tmp/tp5-resolved-config.json}
 
 git_commit=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
-bin=${BIN:-$REPO/build/bin/llama-server}
+bin=${BIN:-$REPO/build-tp5/bin/llama-server}
 
 cat >"$OUT" <<EOF
 {
@@ -18,7 +18,7 @@ cat >"$OUT" <<EOF
   "GGML_VK_CMD_REPLAY": "${GGML_VK_CMD_REPLAY:-1}",
   "GGML_TP5_PROFILE": "${GGML_TP5_PROFILE:-}",
   "GGML_VK_ALLOW_GRAPHICS_QUEUE": "${GGML_VK_ALLOW_GRAPHICS_QUEUE:-}",
-  "note": "dev-machine snapshot; target-machine GPU tests skipped"
+  "note": "target-machine configuration; production fast path: timeline + f16 wire"
 }
 EOF
 

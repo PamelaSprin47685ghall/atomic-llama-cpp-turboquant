@@ -1,6 +1,6 @@
 {
  "schema_version": 1,
- "source_commit": null,
+ "source_commit": "3031761cc870565032fcb434a48e188a7e169ed4",
  "plan": "qwen4exp_tp5_af",
  "model_identity": {
   "name": "Qwen3.8 Flash Next",
