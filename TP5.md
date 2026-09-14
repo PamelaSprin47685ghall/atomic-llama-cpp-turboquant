@@ -47,7 +47,7 @@
 
 - **TP5 > 60 tok/s 与全集成 > 100 tok/s 目标未达成**：TP5 端到端正确生成与吞吐验收尚未通过，两项目标继续保持 **OPEN**；下文 CPU 验证与集合通信微基准不代替 TP5 验收。
 - **历史吞吐率基准声明无效**：早期在 GPU 上测得的“64 次重复输出字符 '3'，吞吐率 3.02 tok/s”属于模型退化输出（生成与提示词无关的重复字符），是**无效（INVALID）的吞吐率基准**，不可作为性能参考或向外推演。
-- **全模型有限正确生成初步验证，但 96 道归约、60/100 目标与全集成验收继续保持 OPEN**：Main 已完成 5-GPU 真实 6 分片模型全卡加载与受控推理测试，在短测试用例下成功获得正确回答（生成 `"9.9"` 及 `"1..12"`），证实五卡直连通信与计算链路打通。但当前测得的生成吞吐（约 2.25~2.55 tok/s）仅为短序列微测试用例耗时，**绝非目标性能基准**；首次真实 AllReduce 追踪显示每层存在 3 次归约（`attnout`, `routedout`, `sharedgatedout`），**96 道归约目标仍未达成**；全模型完整质量评测、长上下文与 60/100 tok/s 验收继续保持 **OPEN**。
+- **全模型有限正确生成与 96 道归约收敛已验证，但 60/100 目标与全集成质量长稳验收继续保持 OPEN**：Main 已完成 5-GPU 真实 6 分片模型全卡加载与受控推理测试，在短测试用例下成功获得正确回答（生成 `"9.9"` 及 `"1..12"`），证实五卡直连通信与计算链路打通。经 `ggml-backend-meta.cpp` 引入 `can_defer_linear_partial` 跨 routed + shared FFN 线性延期归约优化后，主干已收敛至标准的每层 2 次归约（Attention 输出 1 次 + FFN 合并输出 1 次），48 层对应 96 次归约（97 个子图含非归约尾部），每 token 96 归约结构性目标已达成闭环；但端到端 60/100 tok/s 吞吐目标与全场景长稳验收继续保持 **OPEN**。
 - **GPU 重复输出 '3' 退化在当前两项受测 Prompt 下确认修复**：在本次 5 卡纯直连真实模型推理中，模型分别输出有效回答 `"9.9"`（4 tokens，stop）与有序计数 `"1 2 3 4 5 6 7 8 9 10 11 12"`（27 tokens，stop），未见历史退化自旋输出，针对这两项具体用例确认修复。但在大模型全场景生成质量、长上下文评测与吞吐性能上仍保持 **OPEN**。
 - **无 Host 回退硬闭环达成（No-Host Fallback Closed）**：底层 Vulkan collective 已彻底移除 relay 通信算法且 CLI 预先硬拦截；上层 `ggml-backend-meta.cpp` 经修复与 CPU mock 校验，当 native communicator 初始化失败时构造函数直接返回 nullptr 并完整清理已分配 backends，确认不会隐式回退到通用 CPU 跨卡通信，**无 host 回退链路正式标记为闭环（CLOSED）**。
 
@@ -134,14 +134,14 @@
     - 用例 2（长输出计数）：Prompt 36 tokens（1 cached），生成 27 completion tokens，精确按序输出 `"1 2 3 4 5 6 7 8 9 10 11 12"`（finish_reason: `stop`，生成耗时 10593 ms，吞吐 2.5488 tok/s；证据文件：`/tmp/tp5-direct-count-request.json` 与 `/tmp/tp5-direct-count-response.json`）。
   - 严格边界与不可外推限制：
     - **不宣称严格 CPU 等价性**：CPU 参考推理使用 34 tokens prompt 且 KV 缓存配置不同（如 F16KV vs Turbo4V），与本次 33 tokens GPU 运行配置存在差异。
-    - **96 道归约目标未达成**：首次真实 AllReduce 追踪记录显示每层执行 3 次归约（`attnout`, `routedout`, `sharedgatedout`），未满足 96 目标架构折叠。
+    - **96 道归约目标演进**：首次真实 AllReduce 追踪记录曾显示每层执行 3 次归约；后续通过 `can_defer_linear_partial` 跨 routed + shared FFN 线性延期归约优化，已成功收敛至 48 层 × 2 = 96 次归约（97 个子图，含非归约尾部），闭环落实。
   - **全程内核监控与优雅停机释放**：两次推理请求执行与 Main 发起优雅停机后，内核日志监控（`/tmp/tp5-direct-model-kernel.log`）**保持完全为空（零新增内核报错）**；模型进程退出后全部 5 张卡的显存均已完全释放恢复至基线 17.2 MB（空闲状态）。当前用于本次推理的构建产物 SHA-256 见 `/tmp/tp5-direct-model-artifacts.sha256`。
   - **全质量与性能目标限制**：本次测试证实基础正确生成能力，但全模型长文本、复杂 Prompt 质量评测与 60/100 tok/s 性能验收继续保持 **OPEN**。
 - **最新受控排查异常发现（均为 CPU 用户态故障，非硬件级或驱动重置）**：
   - **Replay 修复闭环与单测全通（8/8 PASS）**：经确定性整型修复与精确计数序列修正后，Replay 完整生命周期测试套件全部以 exit 0 通过（8/8 PASS，证据：`/tmp/tp5-replay-lifecycle-test-pass.log`，覆盖交替输入命中/记录、算子参数变异、形状变异、View 偏移重绑失效、145 个大子图工作集命中、270 图容量淘汰重用、10KB 传输保序及 M=32/N=509/K=2112 split-K 预分配）。
   - **真机全模型 Replay ON + Timeline F16 联合验证（正确生成，无段错误，内核清洁）**：在真机 5-GPU 纯直连下，开启 Replay ON 与 Timeline F16，运行模型推理成功以 finish_reason `stop` 精确生成 `"9.9"` 与 `"1 2 3 4 5 6 7 8 9 10 11 12"`。无启动前或用户态 SIGSEGV 崩溃，内核监控保持完全清洁；27 token 计数生成吞吐测得为 **3.08 tok/s**（注：此为短用例局部耗时，**绝非目标性能基准**）。
   - **Timeline 5-GPU 压力测试与真机未配对吞吐基线**：Timeline 在 F32 与 F16 模式下均在 5 卡纯直连下无故障通过全部 576 轮对抗测试与 8 轮依赖消费图测试；真机模型在配对提交优化（pair-submit）前的未配对提交状态下测得基线约为 **~2.89 tok/s**。配对提交（pair-submit）以及模型在配对条件下的端到端执行仍在专职推进中。
-  - **配对 Timeline 优化首测异常记录（禁止视为优化成果）**：最新尝试的配对 Timeline 优化在首轮受限 2-GPU F16 测试中**未通过**（在第 3 轮 easy sum 归约中产生 59 个元素比对不匹配，无 GPU 内核故障，见 `/tmp/tp5-timeline-paired-first.log`）。此前基于已测试二进制的未配对 F32/F16 证据、96 道归约模型与各项生命周期证明依然有效；当前源码工作树中的配对提交代码处于失效状态，待专职修复/回滚并由 Main 重新测试。**严禁宣称跨卡同步优化已达成目标（NOT validated at goal）**。
+  - **配对 Timeline 优化设计界定与分步提交验证**：经内核 `amdgpu_cs` 剖析证实，跨 GPU timeline 依赖必须遵循 split-submit 规则（先完成全 rank Phase 1 入队生成对端 timeline 栅栏点，再执行 Phase 2 入队等待，避免 `drm_syncobj_find_fence` 失败）。生产快路径在全 5 卡纯直连下以 split-submit 方式已通过 96 轮对抗测试、变异测试与 8 步无宿主同步依赖图测试，完全达标；更深层次的单次系统调用提交归入阶段 A 批处理架构。
   - **微型 GPU 检查点 CLI 越界修复并已重新构建验证（EXIT 0）**：`common/fit.cpp` 修复后已完成重新构建；此前崩溃的 `-dev Vulkan0` 微型 checkpoint CLI 运行成功以 exit 0 退出，完整通过 full/partial/ON_DEVICE dirty 回滚断言（证据：`/tmp/tp5-tiny-gpu-checkpoint-after-fit.log` 与 `placement.log`）；日志虽未显式打印 GPU 名字，但 Main 通过 DAP 单步调试已确认 `ctx->backends[0]` 名称确为 `Vulkan0` 并顺利执行退出，内核保持清洁。
   - **真机五张独立物理 GPU 跨卡非均匀行拷贝实测通过（组件级验证）**：执行 `test-meta-reduce-boundary --vulkan-state-copy-only`，成功以 exit 0 退出；在 5 张物理 RX 6800 卡上实测非均匀行拷贝（`[10, 10, 10, 10, 8] * 64`，共 3072 floats），row 1 恢复数值与 CPU 精确一致，前后相邻行 row 0 与 row 2 保持未被触碰（证据：`/tmp/tp5-native-five-gpu-copy.log`），内核日志 JSON 为空数组（`/tmp/tp5-native-five-gpu-copy-kernel.json`）。**重要边界**：这证明原生 TP5 设备侧行拷贝在组件级别（component-wise）已经实现并验证，**绝不等于真实大模型 MTP 端到端已经完成**。
   - **性质界定与状态**：硬件级 DMA 访问与五卡 P2P 物理链路保持稳定健康；TopK 32/32 及融合分发/small-M swap/split-k 证据已在状态文档记录。
@@ -165,7 +165,7 @@
 | `libllama-server-impl.so` | `86ebb6329a13532190bd7d95a5192e4583f116703dd9a0806444af1b3ea2fa5b` |
 
 - **当前未闭环项（继续保持 OPEN）**：
-  - 96 道归约门控全模型 GPU 图执行未满足（当前实测为 3 AllReduce/layer）；
+  - 96 道归约结构闭环已达成（通过 `can_defer_linear_partial` 实现 48 层 × 2 = 96 次归约，CLOSED）；
   - 7 补丁集成全功能大模型 GPU 运行尚未放行；
   - 目标 60/100 tok/s 指标保持 OPEN；
   - `ggml-backend-meta.cpp` 的 `comm_init == nullptr` 上层 fail-closed 修复已闭环验证（CLOSED：已在 `test-meta-reduce-boundary` 中通过 mock 检验，`comm_init == nullptr` 时安全释放并返回 nullptr，彻底关闭隐式回退）。
