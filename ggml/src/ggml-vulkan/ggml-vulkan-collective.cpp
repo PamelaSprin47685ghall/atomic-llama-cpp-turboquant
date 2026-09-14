@@ -47,10 +47,24 @@ struct tp5_fd {
 namespace {
 
 enum class tp5_wire_type { F32, F16 };
-enum class tp5_sync_mode { HOST, SYNCFD, TIMELINE };
+enum class tp5_sync_mode { HOST, SYNCFD, TIMELINE, GPUFLAG };
 
 static VkDeviceSize tp5_flags_byte_offset(size_t n_ranks, VkDeviceSize stride) {
     return (VkDeviceSize) n_ranks * stride;
+}
+
+static VkDeviceSize tp5_flags_region_bytes(size_t n_ranks, tp5_sync_mode sync_mode) {
+    const size_t n_words = (sync_mode == tp5_sync_mode::GPUFLAG) ? (2 * n_ranks + 1) : n_ranks;
+    return (VkDeviceSize) n_words * sizeof(uint32_t);
+}
+
+static uint32_t tp5_default_spin_max() {
+    const char * env = getenv("GGML_TP5_SPIN_MAX");
+    if (env && env[0]) {
+        const long v = strtol(env, nullptr, 10);
+        if (v > 0) return (uint32_t) v;
+    }
+    return 100000000u;
 }
 
 struct tp5_rank {
@@ -106,9 +120,17 @@ struct tp5_rank {
     // Pipelines
     VkPipeline sum_pipe = VK_NULL_HANDLE;
     VkPipeline pack_pipe = VK_NULL_HANDLE;
+    VkPipeline flag_pipe = VK_NULL_HANDLE;
     VkPipelineLayout pipe_layout = VK_NULL_HANDLE;
+    VkPipelineLayout flag_pipe_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    VkDescriptorSetLayout flag_dsl = VK_NULL_HANDLE;
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
+
+    // Per-epoch params for GPUFLAG replay-safe dynamic seq (host-coherent)
+    VkBuffer epoch_buf = VK_NULL_HANDLE;
+    VkDeviceMemory epoch_mem = VK_NULL_HANDLE;
+    uint32_t * epoch_host = nullptr;
 };
 
 struct tp5_binding_key {
@@ -122,6 +144,7 @@ struct tp5_binding_key {
 
 struct tp5_comm;
 static bool tp5_drain_epoch(tp5_comm & c, uint64_t epoch, uint64_t timeout_ns = 5000000000ULL);
+static bool tp5_gpuflag_drain_ring_slot(tp5_comm & c);
 
 struct tp5_plan_key {
     size_t n_elems = 0;
@@ -148,6 +171,7 @@ struct tp5_cached_plan {
     std::vector<VkCommandBuffer> cmd_p2;
     std::vector<VkDescriptorSet> ds_sum;
     std::vector<VkDescriptorSet> ds_pack;
+    std::vector<VkDescriptorSet> ds_flag;
     uint64_t last_used_call = 0;
 };
 
@@ -158,6 +182,7 @@ struct tp5_comm {
     tp5_wire_type wire = tp5_wire_type::F32;
     tp5_sync_mode sync_mode = tp5_sync_mode::HOST;
     bool cmd_replay_enabled = true;
+    uint32_t spin_max = 100000000u;
     size_t max_elems = 0;
     uint64_t workspace_gen = 1;
 
@@ -208,6 +233,10 @@ struct tp5_comm {
                 vkFreeDescriptorSets(r.vkdev, r.desc_pool, 1, &plan.ds_pack[i]);
                 plan.ds_pack[i] = VK_NULL_HANDLE;
             }
+            if (i < plan.ds_flag.size() && plan.ds_flag[i] != VK_NULL_HANDLE && r.desc_pool != VK_NULL_HANDLE) {
+                vkFreeDescriptorSets(r.vkdev, r.desc_pool, 1, &plan.ds_flag[i]);
+                plan.ds_flag[i] = VK_NULL_HANDLE;
+            }
         }
     }
 
@@ -218,7 +247,9 @@ struct tp5_comm {
                 return;
             }
         }
-        if (sync_mode != tp5_sync_mode::TIMELINE) {
+        if (sync_mode == tp5_sync_mode::GPUFLAG) {
+            tp5_gpuflag_drain_ring_slot(*this);
+        } else if (sync_mode != tp5_sync_mode::TIMELINE) {
         for (auto & r : ranks) {
             if (r.vkdev != VK_NULL_HANDLE) {
                 vkDeviceWaitIdle(r.vkdev);
@@ -247,7 +278,9 @@ struct tp5_comm {
                 return;
             }
         }
-        if (sync_mode != tp5_sync_mode::TIMELINE) {
+        if (sync_mode == tp5_sync_mode::GPUFLAG) {
+            tp5_gpuflag_drain_ring_slot(*this);
+        } else if (sync_mode != tp5_sync_mode::TIMELINE) {
         for (auto & r : ranks) {
             if (r.vkdev != VK_NULL_HANDLE) {
                 vkDeviceWaitIdle(r.vkdev);
@@ -279,20 +312,68 @@ static bool tp5_create_shader_module(VkDevice dev,
     return vkCreateShaderModule(dev, &ci, nullptr, out) == VK_SUCCESS;
 }
 
+bool tp5_alloc_host_visible_buffer(tp5_rank & r, VkDeviceSize size, VkBuffer & buf, VkDeviceMemory & mem, void ** mapped) {
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = size;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(r.vkdev, &bci, nullptr, &buf) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(r.vkdev, buf, &req);
+    VkPhysicalDeviceMemoryProperties props{};
+    ggml_vk_tp5_mem_props(r.device, &props);
+    uint32_t mt = find_memory_type(props, req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mt == UINT32_MAX) {
+        vkDestroyBuffer(r.vkdev, buf, nullptr);
+        buf = VK_NULL_HANDLE;
+        return false;
+    }
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = mt;
+    if (vkAllocateMemory(r.vkdev, &ai, nullptr, &mem) != VK_SUCCESS) {
+        vkDestroyBuffer(r.vkdev, buf, nullptr);
+        buf = VK_NULL_HANDLE;
+        return false;
+    }
+    if (vkBindBufferMemory(r.vkdev, buf, mem, 0) != VK_SUCCESS) {
+        vkDestroyBuffer(r.vkdev, buf, nullptr);
+        buf = VK_NULL_HANDLE;
+        vkFreeMemory(r.vkdev, mem, nullptr);
+        mem = VK_NULL_HANDLE;
+        return false;
+    }
+    if (mapped) {
+        void * ptr = nullptr;
+        if (vkMapMemory(r.vkdev, mem, 0, size, 0, &ptr) != VK_SUCCESS) {
+            vkDestroyBuffer(r.vkdev, buf, nullptr);
+            buf = VK_NULL_HANDLE;
+            vkFreeMemory(r.vkdev, mem, nullptr);
+            mem = VK_NULL_HANDLE;
+            return false;
+        }
+        *mapped = ptr;
+    }
+    return true;
+}
+
 bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
     {
-        VkDescriptorSetLayoutBinding b[3] = {
+        VkDescriptorSetLayoutBinding b[4] = {
             {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
             {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
             {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         };
         VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        ci.bindingCount = 3;
+        ci.bindingCount = 4;
         ci.pBindings = b;
         if (vkCreateDescriptorSetLayout(r.vkdev, &ci, nullptr, &r.dsl) != VK_SUCCESS) return false;
     }
     {
-        VkPushConstantRange pc{VK_SHADER_STAGE_COMPUTE_BIT, 0, 24};
+        VkPushConstantRange pc{VK_SHADER_STAGE_COMPUTE_BIT, 0, 20};
         VkPipelineLayoutCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         ci.setLayoutCount = 1;
         ci.pSetLayouts = &r.dsl;
@@ -324,6 +405,46 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
     if (mod_pack != VK_NULL_HANDLE) vkDestroyShaderModule(r.vkdev, mod_pack, nullptr);
     if (!ok) return false;
 
+    if (c.sync_mode == tp5_sync_mode::GPUFLAG) {
+        VkDescriptorSetLayoutBinding fb[9] = {
+            {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        };
+        VkDescriptorSetLayoutCreateInfo fci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        fci.bindingCount = 9;
+        fci.pBindings = fb;
+        if (vkCreateDescriptorSetLayout(r.vkdev, &fci, nullptr, &r.flag_dsl) != VK_SUCCESS) return false;
+
+        VkPushConstantRange fpc{VK_SHADER_STAGE_COMPUTE_BIT, 0, 12};
+        VkPipelineLayoutCreateInfo fpli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        fpli.setLayoutCount = 1;
+        fpli.pSetLayouts = &r.flag_dsl;
+        fpli.pushConstantRangeCount = 1;
+        fpli.pPushConstantRanges = &fpc;
+        if (vkCreatePipelineLayout(r.vkdev, &fpli, nullptr, &r.flag_pipe_layout) != VK_SUCCESS) return false;
+
+        VkShaderModule mod_flag = VK_NULL_HANDLE;
+        if (!tp5_create_shader_module(r.vkdev, tp5_gpuflag_data, tp5_gpuflag_len, &mod_flag)) return false;
+        VkComputePipelineCreateInfo fci_pipe{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        fci_pipe.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        fci_pipe.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        fci_pipe.stage.module = mod_flag;
+        fci_pipe.stage.pName = "main";
+        fci_pipe.layout = r.flag_pipe_layout;
+        ok = vkCreateComputePipelines(r.vkdev, VK_NULL_HANDLE, 1, &fci_pipe, nullptr, &r.flag_pipe) == VK_SUCCESS;
+        vkDestroyShaderModule(r.vkdev, mod_flag, nullptr);
+        if (!ok) return false;
+
+        if (!tp5_alloc_host_visible_buffer(r, 16, r.epoch_buf, r.epoch_mem, (void **) &r.epoch_host)) return false;
+    }
+
     VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1024};
     VkDescriptorPoolCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     ci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
@@ -338,19 +459,70 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
 // Bind mailbox payload (slots only, excludes flag tail) -> out_tensor in the sum descriptor set.
 void tp5_update_sum_descriptor(tp5_rank & r, VkDescriptorSet ds,
                                VkBuffer out_tensor_buf, VkDeviceSize out_offset, VkDeviceSize out_size,
-                               VkDeviceSize payload_bytes, VkDeviceSize flags_byte_offset, VkDeviceSize flags_bytes) {
+                               VkDeviceSize payload_bytes, VkDeviceSize flags_byte_offset, VkDeviceSize flags_bytes,
+                               bool bind_epoch) {
     VkDescriptorBufferInfo in_info{r.mailbox_buf, 0, payload_bytes};
     VkDescriptorBufferInfo out_info{out_tensor_buf, out_offset, out_size};
     VkDescriptorBufferInfo flag_info{r.mailbox_buf, flags_byte_offset, flags_bytes};
-    VkWriteDescriptorSet w[3] = {
+    VkWriteDescriptorSet w[4] = {
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 0, 0, 1,
          VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &in_info, nullptr},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 1, 0, 1,
          VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &out_info, nullptr},
         {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 2, 0, 1,
          VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &flag_info, nullptr},
+        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 3, 0, 1,
+         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, nullptr, nullptr},
     };
-    vkUpdateDescriptorSets(r.vkdev, 3, w, 0, nullptr);
+    VkDescriptorBufferInfo epoch_info{r.epoch_buf, 0, 16};
+    if (bind_epoch && r.epoch_buf != VK_NULL_HANDLE) {
+        w[3].pBufferInfo = &epoch_info;
+    } else {
+        w[3].descriptorCount = 0;
+    }
+    vkUpdateDescriptorSets(r.vkdev, bind_epoch ? 4u : 3u, w, 0, nullptr);
+}
+
+void tp5_update_flag_descriptor(tp5_rank & r, size_t my_rank, VkDescriptorSet ds, VkDeviceSize mailbox_bytes) {
+    VkDescriptorBufferInfo own{r.mailbox_buf, 0, mailbox_bytes};
+    VkDescriptorBufferInfo peer_infos[8];
+    VkWriteDescriptorSet w[9] = {};
+    for (uint32_t i = 0; i < 9; ++i) {
+        w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[i].dstSet = ds;
+        w[i].dstBinding = i;
+        w[i].descriptorCount = 1;
+        w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w[i].pBufferInfo = &own;
+    }
+    w[0].pBufferInfo = &own;
+    for (const auto & im : r.imports) {
+        const size_t peer = (size_t) im.peer;
+        if (peer >= 8) continue;
+        peer_infos[peer].buffer = im.buf;
+        peer_infos[peer].offset = 0;
+        peer_infos[peer].range = mailbox_bytes;
+        uint32_t binding = (peer < my_rank) ? (uint32_t) (peer + 1) : (uint32_t) peer;
+        if (binding > 0 && binding < 8) {
+            w[binding].pBufferInfo = &peer_infos[peer];
+        }
+    }
+    VkDescriptorBufferInfo epoch_info{r.epoch_buf, 0, 16};
+    w[8].pBufferInfo = &epoch_info;
+    vkUpdateDescriptorSets(r.vkdev, 9, w, 0, nullptr);
+}
+
+struct tp5_flag_pc {
+    uint32_t mode;
+    uint32_t flags_base_u32;
+    uint32_t ready_off_u32;
+};
+
+void tp5_record_flag_dispatch(VkCommandBuffer cmd, tp5_rank & r, VkDescriptorSet ds_flag, const tp5_flag_pc & pc) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.flag_pipe);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.flag_pipe_layout, 0, 1, &ds_flag, 0, nullptr);
+    vkCmdPushConstants(cmd, r.flag_pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(cmd, 1, 1, 1);
 }
 
 void tp5_update_pack_descriptor(tp5_rank & r, VkDescriptorSet ds,
@@ -542,10 +714,17 @@ void tp5_destroy_rank(tp5_rank & r) {
     if (r.mailbox_buf) { vkDestroyBuffer(r.vkdev, r.mailbox_buf, nullptr); r.mailbox_buf = VK_NULL_HANDLE; }
     if (r.mailbox_mem) { vkFreeMemory(r.vkdev, r.mailbox_mem, nullptr); r.mailbox_mem = VK_NULL_HANDLE; }
 
+    if (r.epoch_host) { vkUnmapMemory(r.vkdev, r.epoch_mem); r.epoch_host = nullptr; }
+    if (r.epoch_buf) { vkDestroyBuffer(r.vkdev, r.epoch_buf, nullptr); r.epoch_buf = VK_NULL_HANDLE; }
+    if (r.epoch_mem) { vkFreeMemory(r.vkdev, r.epoch_mem, nullptr); r.epoch_mem = VK_NULL_HANDLE; }
+
     if (r.sum_pipe) { vkDestroyPipeline(r.vkdev, r.sum_pipe, nullptr); r.sum_pipe = VK_NULL_HANDLE; }
     if (r.pack_pipe) { vkDestroyPipeline(r.vkdev, r.pack_pipe, nullptr); r.pack_pipe = VK_NULL_HANDLE; }
+    if (r.flag_pipe) { vkDestroyPipeline(r.vkdev, r.flag_pipe, nullptr); r.flag_pipe = VK_NULL_HANDLE; }
     if (r.pipe_layout) { vkDestroyPipelineLayout(r.vkdev, r.pipe_layout, nullptr); r.pipe_layout = VK_NULL_HANDLE; }
+    if (r.flag_pipe_layout) { vkDestroyPipelineLayout(r.vkdev, r.flag_pipe_layout, nullptr); r.flag_pipe_layout = VK_NULL_HANDLE; }
     if (r.dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.dsl, nullptr); r.dsl = VK_NULL_HANDLE; }
+    if (r.flag_dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.flag_dsl, nullptr); r.flag_dsl = VK_NULL_HANDLE; }
     if (r.desc_pool) { vkDestroyDescriptorPool(r.vkdev, r.desc_pool, nullptr); r.desc_pool = VK_NULL_HANDLE; }
     if (r.cmd_pool) { vkDestroyCommandPool(r.vkdev, r.cmd_pool, nullptr); r.cmd_pool = VK_NULL_HANDLE; }
 }
@@ -557,6 +736,13 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
             c.fail("setup_workspace: drain failed before workspace reallocation");
             return false;
         }
+    } else if (c.sync_mode == tp5_sync_mode::GPUFLAG) {
+        for (auto & r : c.ranks) {
+            if (r.vkdev != VK_NULL_HANDLE && r.fence_p2 != VK_NULL_HANDLE) {
+                vkWaitForFences(r.vkdev, 1, &r.fence_p2, VK_TRUE, UINT64_MAX);
+                vkResetFences(r.vkdev, 1, &r.fence_p2);
+            }
+        }
     }
     c.clear_cached_plans();
     if (c.failed) return false;
@@ -565,7 +751,7 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
     const size_t wire_b = c.wire == tp5_wire_type::F16 ? 2 : 4;
     const VkDeviceSize wire_bytes = (VkDeviceSize) max_elems * wire_b;
     const VkDeviceSize stride = wire_bytes;
-    const VkDeviceSize flags_bytes = (VkDeviceSize) c.n_ranks * sizeof(uint32_t);
+    const VkDeviceSize flags_bytes = tp5_flags_region_bytes(c.n_ranks, c.sync_mode);
     const VkDeviceSize mailbox_bytes = (VkDeviceSize) c.n_ranks * stride + flags_bytes;
 
     for (auto & r : c.ranks) {
@@ -650,18 +836,26 @@ struct tp5_sum_pc {
     uint32_t n_elems;
     uint32_t n_slots;
     uint32_t stride_elems;
-    uint32_t expected_seq;
     uint32_t use_flags;
-    uint32_t spin_max;
+    uint32_t ready_off_u32;
 };
 
 bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<tensor_dev_ref> & trefs,
-                     size_t n_elems, VkDeviceSize flags_base, uint32_t seq) {
+                     size_t n_elems, VkDeviceSize flags_base) {
     const size_t wire_b = c.wire == tp5_wire_type::F16 ? 2 : 4;
     const VkDeviceSize payload = (VkDeviceSize) n_elems * wire_b;
     const VkDeviceSize stride = (VkDeviceSize) c.max_elems * wire_b;
     const VkDeviceSize tensor_bytes = (VkDeviceSize) n_elems * sizeof(float);
     const VkDeviceSize payload_bytes = (VkDeviceSize) c.n_ranks * stride;
+    const VkDeviceSize flags_bytes = tp5_flags_region_bytes(c.n_ranks, c.sync_mode);
+    const VkDeviceSize mailbox_bytes = payload_bytes + flags_bytes;
+    const uint32_t flags_base_u32 = (uint32_t) (flags_base / sizeof(uint32_t));
+    const bool gpuflag = (c.sync_mode == tp5_sync_mode::GPUFLAG);
+    const tp5_flag_pc flag_pc_base{0u, flags_base_u32, 0u};
+
+    if (gpuflag) {
+        plan.ds_flag.resize(c.n_ranks, VK_NULL_HANDLE);
+    }
 
     // Allocate per-plan command buffers and descriptor sets
     for (size_t i = 0; i < c.n_ranks; ++i) {
@@ -686,6 +880,15 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                 return false;
             }
         }
+        if (gpuflag) {
+            VkDescriptorSetAllocateInfo fai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr,
+                                            r.desc_pool, 1, &r.flag_dsl};
+            if (vkAllocateDescriptorSets(r.vkdev, &fai, &plan.ds_flag[i]) != VK_SUCCESS) {
+                c.fail("allocation of flag descriptor set failed on rank " + std::to_string(i));
+                return false;
+            }
+            tp5_update_flag_descriptor(r, i, plan.ds_flag[i], mailbox_bytes);
+        }
     }
 
     // Record Phase 1 command buffers (SIMULTANEOUS_USE allows asynchronous resubmission across pipelined calls)
@@ -705,6 +908,17 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
         vkCmdPipelineBarrier(plan.cmd_p1[i],
             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
             0, 1, &mb_pre, 0, nullptr, 0, nullptr);
+
+        if (gpuflag) {
+            tp5_flag_pc wait_pc = flag_pc_base;
+            wait_pc.mode = 0u;
+            tp5_record_flag_dispatch(plan.cmd_p1[i], r, plan.ds_flag[i], wait_pc);
+            VkMemoryBarrier mb_flag_wait{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
+            vkCmdPipelineBarrier(plan.cmd_p1[i], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb_flag_wait, 0, nullptr, 0, nullptr);
+        }
 
         // 1. tensor -> canonical wire copy
         if (c.wire == tp5_wire_type::F32) {
@@ -741,13 +955,23 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
         vkCmdPipelineBarrier(plan.cmd_p1[i], VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                              0, 1, &mb_p1, 0, nullptr, 0, nullptr);
 
+        if (gpuflag) {
+            tp5_flag_pc pub_pc = flag_pc_base;
+            pub_pc.mode = 1u;
+            tp5_record_flag_dispatch(plan.cmd_p1[i], r, plan.ds_flag[i], pub_pc);
+            VkMemoryBarrier mb_flag_pub{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT};
+            vkCmdPipelineBarrier(plan.cmd_p1[i], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb_flag_pub, 0, nullptr, 0, nullptr);
+        }
+
         if (vkEndCommandBuffer(plan.cmd_p1[i]) != VK_SUCCESS) {
             c.fail("end cmd_p1 failed on rank " + std::to_string(i));
             return false;
         }
     }
 
-    // Record Phase 2 command buffers (flags = 0: fully replayable)
+    // Record Phase 2 command buffers (timeline/host: flags unused; gpuflag: spin + consumed publish)
     for (size_t i = 0; i < c.n_ranks; ++i) {
         tp5_rank & r = c.ranks[i];
         if (vkBeginCommandBuffer(plan.cmd_p2[i], &beg) != VK_SUCCESS) {
@@ -755,13 +979,15 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
             return false;
         }
 
-        VkMemoryBarrier mb_p2_in{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
-        vkCmdPipelineBarrier(plan.cmd_p2[i], VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 1, &mb_p2_in, 0, nullptr, 0, nullptr);
+        if (!gpuflag) {
+            VkMemoryBarrier mb_p2_in{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+            vkCmdPipelineBarrier(plan.cmd_p2[i], VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &mb_p2_in, 0, nullptr, 0, nullptr);
+        }
 
         tp5_update_sum_descriptor(r, plan.ds_sum[i], trefs[i].buf, trefs[i].offset, tensor_bytes,
-                                  payload_bytes, flags_base, c.n_ranks * sizeof(uint32_t));
+                                  payload_bytes, flags_base, flags_bytes, gpuflag);
         vkCmdBindPipeline(plan.cmd_p2[i], VK_PIPELINE_BIND_POINT_COMPUTE, r.sum_pipe);
         vkCmdBindDescriptorSets(plan.cmd_p2[i], VK_PIPELINE_BIND_POINT_COMPUTE, r.pipe_layout, 0, 1, &plan.ds_sum[i], 0, nullptr);
 
@@ -769,12 +995,22 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
             (uint32_t) n_elems,
             (uint32_t) c.n_ranks,
             (uint32_t) c.max_elems,
-            seq,
-            0u,
+            gpuflag ? 1u : 0u,
             0u,
         };
         vkCmdPushConstants(plan.cmd_p2[i], r.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(plan.cmd_p2[i], (uint32_t)((n_elems + 255) / 256), 1, 1);
+
+        if (gpuflag) {
+            VkMemoryBarrier mb_sum{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT};
+            vkCmdPipelineBarrier(plan.cmd_p2[i], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_sum, 0, nullptr, 0, nullptr);
+            tp5_flag_pc done_pc = flag_pc_base;
+            done_pc.mode = 2u;
+            tp5_record_flag_dispatch(plan.cmd_p2[i], r, plan.ds_flag[i], done_pc);
+        }
 
         VkMemoryBarrier mb_post{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
             VK_ACCESS_SHADER_WRITE_BIT,
@@ -853,6 +1089,30 @@ bool tp5_drain_epoch(tp5_comm & c, uint64_t epoch, uint64_t timeout_ns) {
             c.in_flight_ring[s].owners.clear();
             c.in_flight_ring[s].epoch = 0;
         }
+    }
+    return true;
+}
+
+void tp5_update_epoch_bufs(tp5_comm & c, uint32_t seq) {
+    for (size_t i = 0; i < c.n_ranks; ++i) {
+        tp5_rank & r = c.ranks[i];
+        if (!r.epoch_host) continue;
+        r.epoch_host[0] = seq;
+        r.epoch_host[1] = c.spin_max;
+        r.epoch_host[2] = (uint32_t) i;
+        r.epoch_host[3] = (uint32_t) c.n_ranks;
+    }
+}
+
+static bool tp5_gpuflag_drain_ring_slot(tp5_comm & c) {
+    for (size_t i = 0; i < c.n_ranks; ++i) {
+        tp5_rank & r = c.ranks[i];
+        if (r.fence_p2 == VK_NULL_HANDLE) continue;
+        if (vkWaitForFences(r.vkdev, 1, &r.fence_p2, VK_TRUE, 5000000000ULL) != VK_SUCCESS) {
+            c.fail("gpuflag ring drain failed on rank " + std::to_string(i));
+            return false;
+        }
+        vkResetFences(r.vkdev, 1, &r.fence_p2);
     }
     return true;
 }
@@ -944,9 +1204,12 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
         if (c.wire == tp5_wire_type::F16) {
             new_plan.ds_pack.resize(c.n_ranks, VK_NULL_HANDLE);
         }
+        if (c.sync_mode == tp5_sync_mode::GPUFLAG) {
+            new_plan.ds_flag.resize(c.n_ranks, VK_NULL_HANDLE);
+        }
         new_plan.last_used_call = c.allreduce_calls;
 
-        if (!tp5_record_plan(c, new_plan, trefs, n_elems, flags_base, seq)) {
+        if (!tp5_record_plan(c, new_plan, trefs, n_elems, flags_base)) {
             c.destroy_plan(new_plan);
             return false;
         }
@@ -990,6 +1253,20 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
         for (size_t j = 0; j < c.n_ranks; ++j) {
             slot.owners[j] = trefs[j].owner;
         }
+    } else if (c.sync_mode == tp5_sync_mode::GPUFLAG) {
+        size_t ring_idx = (size_t)((epoch - 1) % tp5_comm::MAX_OUTSTANDING_EPOCHS);
+        auto & slot = c.in_flight_ring[ring_idx];
+        if (slot.epoch > 0) {
+            if (!tp5_gpuflag_drain_ring_slot(c)) return false;
+            slot.owners.clear();
+            slot.epoch = 0;
+        }
+        slot.epoch = epoch;
+        slot.owners.resize(c.n_ranks);
+        for (size_t j = 0; j < c.n_ranks; ++j) {
+            slot.owners[j] = trefs[j].owner;
+        }
+        tp5_update_epoch_bufs(c, seq);
     }
 
     const auto t_bp1 = std::chrono::high_resolution_clock::now();
@@ -1035,6 +1312,17 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                 // Do NOT call vkQueueWaitIdle on prior ranks: their submitted commands may be blocked
                 // waiting on missing peer timeline signals that will never arrive!
                 c.fail("Phase 1 timeline submit failed on rank " + std::to_string(i));
+                return false;
+            }
+        }
+    } else if (c.sync_mode == tp5_sync_mode::GPUFLAG) {
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            tp5_rank & r = c.ranks[i];
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &plan->cmd_p1[i];
+            if (vkQueueSubmit(r.queue, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) {
+                c.fail("Phase 1 gpuflag submit failed on rank " + std::to_string(i));
                 return false;
             }
         }
@@ -1131,7 +1419,7 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
             GGML_ABORT("ggml-vulkan-collective: unrecoverable runtime failure: Phase 1 fence wait failed\n");
         }
     }
-    if (c.sync_mode != tp5_sync_mode::TIMELINE) {
+    if (c.sync_mode != tp5_sync_mode::TIMELINE && c.sync_mode != tp5_sync_mode::GPUFLAG) {
     tp5_p2p_visibility_barrier(c);
     }
 
@@ -1175,6 +1463,22 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                 c.fail("Phase 2 timeline submit failed on rank " + std::to_string(i));
                 return false;
             }
+        }
+    } else if (c.sync_mode == tp5_sync_mode::GPUFLAG) {
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            tp5_rank & r = c.ranks[i];
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &plan->cmd_p2[i];
+            vkResetFences(r.vkdev, 1, &r.fence_p2);
+            if (vkQueueSubmit(r.queue, 1, &si, r.fence_p2) != VK_SUCCESS) {
+                c.fail("Phase 2 gpuflag submit failed on rank " + std::to_string(i));
+                return false;
+            }
+        }
+        if (!tp5_wait_all_p2(c)) {
+            if (!is_cached) c.destroy_plan(one_shot);
+            return false;
         }
     } else {
     for (size_t i = 0; i < c.n_ranks; ++i) {
@@ -1307,9 +1611,10 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
     } else if (sync_env && strcmp(sync_env, "syncfd") == 0) {
         c->sync_mode = tp5_sync_mode::SYNCFD;
     } else if (sync_env && (strcmp(sync_env, "gpu") == 0 || strcmp(sync_env, "gpuflag") == 0)) {
-        fprintf(stderr, "ggml-vulkan-collective: sync mode '%s' (GPU spin polling) is unsafe and rejected; use 'host', 'syncfd', or 'timeline'\n", sync_env);
-        delete c;
-        return nullptr;
+        c->sync_mode = tp5_sync_mode::GPUFLAG;
+        c->spin_max = tp5_default_spin_max();
+        fprintf(stderr, "ggml-vulkan-collective: WARNING: sync mode '%s' is experimental GPU-flag spin; "
+                        "not validated for production (timeline remains default fast path)\n", sync_env);
     } else {
         c->sync_mode = tp5_sync_mode::HOST;
     }
@@ -1387,7 +1692,8 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
             VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
             vkCreateFence(r.vkdev, &fi, nullptr, &r.fence_p1);
         }
-        if (c->sync_mode == tp5_sync_mode::HOST || c->sync_mode == tp5_sync_mode::SYNCFD) {
+        if (c->sync_mode == tp5_sync_mode::HOST || c->sync_mode == tp5_sync_mode::SYNCFD ||
+            c->sync_mode == tp5_sync_mode::GPUFLAG) {
             VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
             vkCreateFence(r.vkdev, &fi, nullptr, &r.fence_p2);
         }
@@ -1536,7 +1842,8 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
 
     {
         const char * sync_name = (c->sync_mode == tp5_sync_mode::TIMELINE) ? "timeline" :
-                                 (c->sync_mode == tp5_sync_mode::SYNCFD) ? "syncfd" : "host";
+                                 (c->sync_mode == tp5_sync_mode::SYNCFD) ? "syncfd" :
+                                 (c->sync_mode == tp5_sync_mode::GPUFLAG) ? "gpuflag" : "host";
         fprintf(stderr, "ggml-vulkan-collective: init %zu ranks, wire=%s sync=%s relay=off, "
                         "replay=%s\n",
                 n, c->wire == tp5_wire_type::F16 ? "f16" : "f32",
@@ -1559,7 +1866,9 @@ void ggml_backend_vk_tp5_comm_free(void * comm) {
         }
     }
     c->clear_cached_plans();
-    if (c->sync_mode != tp5_sync_mode::TIMELINE) {
+    if (c->sync_mode == tp5_sync_mode::GPUFLAG) {
+        tp5_gpuflag_drain_ring_slot(*c);
+    } else if (c->sync_mode != tp5_sync_mode::TIMELINE) {
     for (auto & r : c->ranks) {
         if (r.vkdev != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(r.vkdev);

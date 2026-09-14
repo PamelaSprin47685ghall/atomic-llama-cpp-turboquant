@@ -14,7 +14,7 @@
 //   5. resource accounting: no fd leak across rounds (count /proc/self/fd)
 //
 // Usage: test-vulkan-tp5-mesh [--devices 0,1,2,3,4] [--elements 2560]
-//                              [--rounds 96] [--wire f32|f16] [--sync host|syncfd|timeline]
+//                              [--rounds 96] [--wire f32|f16] [--sync host|syncfd|timeline|gpuflag]
 //                              [--check-all] [--vary-input] [--delay-producer]
 //                              [--adversarial] [--epochs 1]
 
@@ -553,13 +553,15 @@ int main(int argc, char ** argv) {
         else if (a == "--wire")       { wire_str = next(); setenv("GGML_TP5_WIRE", wire_str.c_str(), 1); }
         else if (a == "--sync") {
             sync_str = next();
-            if (sync_str == "gpu" || sync_str == "gpuflag") {
-                fprintf(stderr, "test-vulkan-tp5-mesh: sync mode '%s' (GPU spin polling) is unsafe and rejected; use 'host', 'syncfd', or 'timeline'\n", sync_str.c_str());
+            if (sync_str == "gpu") {
+                sync_str = "gpuflag";
+            }
+            if (sync_str != "host" && sync_str != "syncfd" && sync_str != "timeline" && sync_str != "gpuflag") {
+                fprintf(stderr, "test-vulkan-tp5-mesh: invalid sync mode '%s'; use 'host', 'syncfd', 'timeline', or 'gpuflag'\n", sync_str.c_str());
                 return 2;
             }
-            if (sync_str != "host" && sync_str != "syncfd" && sync_str != "timeline") {
-                fprintf(stderr, "test-vulkan-tp5-mesh: invalid sync mode '%s'; only 'host', 'syncfd', or 'timeline' allowed\n", sync_str.c_str());
-                return 2;
+            if (sync_str == "gpuflag") {
+                fprintf(stderr, "test-vulkan-tp5-mesh: WARNING: gpuflag is experimental GPU-flag spin sync\n");
             }
             setenv("GGML_TP5_SYNC", sync_str.c_str(), 1);
         }

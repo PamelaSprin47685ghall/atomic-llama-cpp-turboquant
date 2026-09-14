@@ -938,6 +938,7 @@ void process_shaders() {
     string_to_spv("tp5_sum_f16", "tp5_sum_f16.comp", {});
     string_to_spv("qwen4_hc_up_fold", "qwen4_hc_up_fold.comp", {});
     string_to_spv("tp5_pack_f16", "tp5_pack_f16.comp", {});
+    string_to_spv("tp5_gpuflag", "tp5_gpuflag.comp", {});
 
     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});
     string_to_spv("quantize_q8_1_subgroup", "quantize_q8_1.comp", {{"USE_SUBGROUPS", "1"}});

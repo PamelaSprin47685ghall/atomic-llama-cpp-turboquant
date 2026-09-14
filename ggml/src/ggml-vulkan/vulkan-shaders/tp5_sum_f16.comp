@@ -2,7 +2,7 @@
 
 // TP5 mesh AllReduce: fixed-rank-order sum over sender-major mailbox slots.
 // F16 wire variant: reads float16_t slots, accumulates in FP32 (TP5.md 18.2).
-// GPU-flag sync: optional spin on per-slot readiness flags (binding 2).
+// GPU-flag sync (GGML_TP5_SYNC=gpuflag): spin on per-slot ready flags before read.
 
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
@@ -16,27 +16,65 @@ layout(std430, binding = 1) writeonly buffer OutBuf {
     float out_data[];
 };
 
-layout(std430, binding = 2) readonly buffer FlagBuf {
+layout(std430, binding = 2) buffer FlagBuf {
     uint flags[];
 };
+
+layout(std430, binding = 3) readonly buffer EpochBuf {
+    uint epoch_seq;
+    uint epoch_spin_max;
+    uint epoch_my_rank;
+    uint epoch_n_ranks;
+} epoch;
 
 layout(push_constant) uniform Params {
     uint n_elems;
     uint n_slots;
     uint stride_elems;
-    uint expected_seq;
     uint use_flags;
-    uint spin_max;
+    uint ready_off_u32;
 } p;
+
+bool tp5_spin_ready(uint slot, out bool timed_out) {
+    timed_out = false;
+    if (p.use_flags == 0u) {
+        return true;
+    }
+    const uint need = epoch.epoch_seq;
+    uint spins = 0u;
+    while (flags[p.ready_off_u32 + slot] < need) {
+        if (++spins > epoch.epoch_spin_max) {
+            timed_out = true;
+            return false;
+        }
+    }
+    return true;
+}
 
 void main() {
     uint e = gl_GlobalInvocationID.x;
     if (e >= p.n_elems) {
         return;
     }
+
+    bool failed = false;
     float acc = 0.0;
     for (uint r = 0u; r < p.n_slots; ++r) {
+        bool timed_out = false;
+        if (!tp5_spin_ready(r, timed_out)) {
+            failed = timed_out;
+            break;
+        }
         acc += float(in_data[uint(r) * p.stride_elems + e]);
     }
+
+    if (failed) {
+        if (e == 0u) {
+            flags[p.ready_off_u32 + 2u * p.n_slots] = 1u;
+        }
+        out_data[e] = uintBitsToFloat(0x7fc00000u);
+        return;
+    }
+
     out_data[e] = acc;
 }

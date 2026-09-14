@@ -1,0 +1,128 @@
+#version 450
+
+// TP5 experimental GPU-flag sync helpers (GGML_TP5_SYNC=gpuflag).
+// Cross-device visibility is NOT guaranteed by Vulkan Device scope; this path
+// documents RADV/AMDGPU-specific assumptions and must pass dedicated mesh tests.
+//
+// mode 0: wait until every mailbox has consumed[my_rank] >= seq-1 (slot reuse)
+// mode 1: publish ready[my_rank] = seq on own mailbox and all peer mailboxes
+// mode 2: publish consumed[r] = seq for all slots r on own mailbox (post-reduce)
+
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) buffer OwnMailbox {
+    uint mailbox[];
+};
+
+layout(std430, binding = 1) buffer Peer0 { uint peer0[]; };
+layout(std430, binding = 2) buffer Peer1 { uint peer1[]; };
+layout(std430, binding = 3) buffer Peer2 { uint peer2[]; };
+layout(std430, binding = 4) buffer Peer3 { uint peer3[]; };
+layout(std430, binding = 5) buffer Peer4 { uint peer4[]; };
+layout(std430, binding = 6) buffer Peer5 { uint peer5[]; };
+layout(std430, binding = 7) buffer Peer6 { uint peer6[]; };
+layout(std430, binding = 8) buffer EpochBuf {
+    uint epoch_seq;
+    uint epoch_spin_max;
+    uint epoch_my_rank;
+    uint epoch_n_ranks;
+} epoch;
+
+layout(push_constant) uniform Params {
+    uint mode;
+    uint flags_base_u32; // byte offset of flag tail / 4
+    uint ready_off_u32;  // consumed_off_u32 = ready_off_u32 + n_ranks
+} p;
+
+bool tp5_spin_ge(uint buf_idx, uint word_idx, uint need, out bool timed_out) {
+    timed_out = false;
+    if (need == 0u) {
+        return true;
+    }
+    uint spins = 0u;
+    while (true) {
+        uint v = 0u;
+        switch (buf_idx) {
+        case 0u: v = mailbox[word_idx]; break;
+        case 1u: v = peer0[word_idx]; break;
+        case 2u: v = peer1[word_idx]; break;
+        case 3u: v = peer2[word_idx]; break;
+        case 4u: v = peer3[word_idx]; break;
+        case 5u: v = peer4[word_idx]; break;
+        case 6u: v = peer5[word_idx]; break;
+        case 7u: v = peer6[word_idx]; break;
+        default: return false;
+        }
+        if (v >= need) {
+            return true;
+        }
+        if (++spins > epoch.epoch_spin_max) {
+            timed_out = true;
+            return false;
+        }
+    }
+}
+
+void tp5_write_flag(uint buf_idx, uint word_idx, uint value) {
+    switch (buf_idx) {
+    case 0u: mailbox[word_idx] = value; break;
+    case 1u: peer0[word_idx] = value; break;
+    case 2u: peer1[word_idx] = value; break;
+    case 3u: peer2[word_idx] = value; break;
+    case 4u: peer3[word_idx] = value; break;
+    case 5u: peer4[word_idx] = value; break;
+    case 6u: peer5[word_idx] = value; break;
+    case 7u: peer6[word_idx] = value; break;
+    default: break;
+    }
+}
+
+uint tp5_peer_buf_idx(uint peer_rank) {
+    if (peer_rank == epoch.epoch_my_rank) {
+        return 0u;
+    }
+    if (peer_rank < epoch.epoch_my_rank) {
+        return peer_rank + 1u;
+    }
+    return peer_rank;
+}
+
+void main() {
+    const uint n = epoch.epoch_n_ranks;
+    const uint consumed_base = p.flags_base_u32 + p.ready_off_u32 + n;
+    const uint error_word = p.flags_base_u32 + p.ready_off_u32 + 2u * n;
+
+    if (p.mode == 0u) {
+        if (epoch.epoch_seq <= 1u) {
+            return;
+        }
+        const uint need = epoch.epoch_seq - 1u;
+        const uint word = consumed_base + epoch.epoch_my_rank;
+        bool any_timeout = false;
+        for (uint peer = 0u; peer < n; ++peer) {
+            bool timed_out = false;
+            if (!tp5_spin_ge(tp5_peer_buf_idx(peer), word, need, timed_out)) {
+                any_timeout = timed_out;
+            }
+        }
+        if (any_timeout) {
+            mailbox[error_word] = 1u;
+        }
+        return;
+    }
+
+    if (p.mode == 1u) {
+        const uint word = p.flags_base_u32 + p.ready_off_u32 + epoch.epoch_my_rank;
+        for (uint peer = 0u; peer < n; ++peer) {
+            tp5_write_flag(tp5_peer_buf_idx(peer), word, epoch.epoch_seq);
+        }
+        return;
+    }
+
+    if (p.mode == 2u) {
+        for (uint r = 0u; r < n; ++r) {
+            mailbox[consumed_base + r] = epoch.epoch_seq;
+        }
+        return;
+    }
+}
