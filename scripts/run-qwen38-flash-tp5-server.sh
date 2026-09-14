@@ -25,6 +25,7 @@ PORT=${PORT:-8095}
 LOG=${LOG:-/tmp/qwen38_tp5_$PORT.log}
 N_SLOTS=${N_SLOTS:-11}
 N_CTX_SLOT=${N_CTX_SLOT:-262144}
+MTP_MODEL=${MTP_MODEL:-/home/kunweiz/models/Qwen3.8-Flash-Next-MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf}
 KV_SIZE=${KV_SIZE:-1441792}
 EXTRA_ARGS=${EXTRA_ARGS:-}
 
@@ -35,7 +36,7 @@ export GGML_TP5_SYNC=${GGML_TP5_SYNC:-timeline}
 export GGML_TP5_RELAY=${GGML_TP5_RELAY:-off}
 export GGML_VK_CMD_REPLAY=${GGML_VK_CMD_REPLAY:-1}
 export GGML_VK_ALLOW_GRAPHICS_QUEUE=${GGML_VK_ALLOW_GRAPHICS_QUEUE:-1}
-TP5_ARGS=${TP5_ARGS:---tp5 qwen4exp-af --tp5-wire f16 --tp5-sync timeline}
+TP5_ARGS=${TP5_ARGS:---tp5 qwen4exp-af --tp5-wire f16 --tp5-sync timeline -md "$MTP_MODEL" --spec-type draft-mtp,ngram-mod --spec-draft-n-max 5}
 
 say() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
 

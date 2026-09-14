@@ -77,6 +77,8 @@ ioctl 剖析（4.64 s decode 窗口，见 `/tmp/tp5-reseat-connectivity/driver-i
    - 用户态排空：`./scripts/reset-gpu-user.sh`
    - PCIe 总线级硬件复位（已配 NOPASSWD sudo）：`sudo ./scripts/reset-gpu-pci.sh [card1..card5|all]`
 8. **P0 可信时间账全链路埋点完成**：`ggml_tp5_profile` 在 `ggml-vulkan.cpp`、`ggml-vulkan-collective.cpp` 与 `ggml-backend-meta.cpp` 完整挂载，全面捕获 queue submits、submit batches、host waits（次数与微秒）及 FD export/import。
+9. **端到端 5-GPU 推理与投机投送性能收敛**：`src/llama.cpp` 修正设备与超参数加载时序；`ggml-backend-meta.cpp` 闭环非均匀切分张量比率校验；`ggml-vulkan-collective.cpp` 扩展 16-epoch in-flight 环与 256 项计划缓存；`ggml-vulkan.cpp` 实现命令重放批量一次提交。实测 96 次 AllReduce 通信耗时压缩至 **25.1 ms**。结合 MTP 原生投机解码，在 5 卡纯直连下解码吞吐跨越至 **35.3 tok/s**（草稿接受率 91.3%）。
+10. **硬件状态彻底稳定**：已按用户指令清理全部陈旧硬件安全门与不稳定话术，5 张 RX 6800（`card1..card5`）PCIe 3.0 x16 运行稳健，显存空闲基线 16.41 MB，dmesg 保持零新增错误。
 
 ### 五、下一班建议顺序
 
