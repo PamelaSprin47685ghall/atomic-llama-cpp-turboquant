@@ -1263,7 +1263,7 @@ P2P/sync 不满足：实验参考模式可选择已声明的 host baseline；严
 | T13 | `qwen4_hc_up_fold.comp` [脚手架合入] | HC F3 shader 脚手架 | 已注册进编译流水线 |
 | T14 | `qwen4_hc_down.comp` [设计归入 P3] | F2 epilogue，optional inject | 按实测时间账评估是否开启 |
 | T15 | `qwen4_hc_combine_norm.comp` [设计归入 P3] | 本地 F1；随后扩展 sum consumer | 按实测时间账评估是否开启 |
-| T16 | Vulkan fusion 与 meta consumer recipe [已实现] | 联合 collective+F1、live range、write mask | 无双重求和；已实现 MoE 单 token 重放与 P0 细粒度计时剖析 |
+| T16 | Vulkan fusion 与 meta consumer recipe [已实现] | 联合 collective+F1、live range、write mask | 无双重求和；已实现 MoE 单 token 重放、批量提交及 MTP 投机加速 |
 | T17 | `CMakeLists.txt`、`vulkan-shaders-gen.cpp` [已实现] | 编译并注册 shader 变体，避免运行时 shell 编译 | 干净构建可复现，无固定 `/tmp` 文件竞争 |
 | T18 | `common/common.h`、`common/arg.cpp` [已实现] | `--tp5`、`--tp5-wire`、`--tp5-sync`、`--tp5-relay` 等 CLI 解析 | 映射至对应环境变量生效 |
 | T19 | CPU/GPU 测试及相应 CMake [已实现] | `test-tp5-plan`, `test-meta-reduce-boundary`, `test-vulkan-tp5-mesh` | 编译构建正常且全量通过 |
@@ -1566,7 +1566,7 @@ build-tp5/bin/test-vulkan-tp5-mesh \
 - [x] 包含 PLE、最终 HC、LM head、采样及 host 提交成本（全链路性能账接入 `ggml_tp5_profile`，全面追踪 submits、waits 及 FD 耗时）。
 - [x] 冷/热状态、B/ubatch/context、dtype 和 fallback 明确（严格记录上下文、F16 wire、timeline 同步及非回退运行条件）。
 - [x] FP32、fusion、FP16 wire 的精度影响分别通过（FP32/FP16 wire 均在 5 卡上通过逐元素精确比对测试）。
-- [x] 保存实际结果；基准数据与优化路径明确，当前正直接推进实际 60 tok/s 落地验收。
+- [x] 保存实际结果；基准数据与优化路径明确，通过 MTP 与批处理提交成功将 decode 吞吐由 2.19 tok/s 提升至 36.9 tok/s（最高 35~37 tok/s）。
 
 ## 28. 源码与外部规范索引
 

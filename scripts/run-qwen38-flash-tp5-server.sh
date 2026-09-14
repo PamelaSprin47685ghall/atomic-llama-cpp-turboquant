@@ -36,7 +36,7 @@ export GGML_TP5_SYNC=${GGML_TP5_SYNC:-timeline}
 export GGML_TP5_RELAY=${GGML_TP5_RELAY:-off}
 export GGML_VK_CMD_REPLAY=${GGML_VK_CMD_REPLAY:-1}
 export GGML_VK_ALLOW_GRAPHICS_QUEUE=${GGML_VK_ALLOW_GRAPHICS_QUEUE:-1}
-TP5_ARGS=${TP5_ARGS:---tp5 qwen4exp-af --tp5-wire f16 --tp5-sync timeline -md "$MTP_MODEL" --spec-type draft-mtp,ngram-mod --spec-draft-n-max 5}
+TP5_ARGS=${TP5_ARGS:---tp5 qwen4exp-af --tp5-wire f16 --tp5-sync timeline -md "$MTP_MODEL" --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-ngl 999}
 
 say() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
 

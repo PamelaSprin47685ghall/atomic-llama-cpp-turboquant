@@ -4916,6 +4916,12 @@ private:
                 bool measure_model_bytes = has_draft;
 
                 common_params params_dft = common_base_params_to_speculative(params_base);
+                if (params_dft.devices.empty() && !params_base.devices.empty()) {
+                    params_dft.devices = params_base.devices;
+                }
+                if (params_dft.n_gpu_layers < 0 && params_base.n_gpu_layers > 0) {
+                    params_dft.n_gpu_layers = params_base.n_gpu_layers;
+                }
 
                 auto mparams_dft = common_model_params_to_llama(params_dft);
                 auto cparams_dft = common_context_params_to_llama(params_dft);
@@ -5034,6 +5040,12 @@ private:
 
             {
                 common_params params_dft = common_base_params_to_speculative(params_base);
+                if (params_dft.devices.empty() && !params_base.devices.empty()) {
+                    params_dft.devices = params_base.devices;
+                }
+                if (params_dft.n_gpu_layers < 0 && params_base.n_gpu_layers > 0) {
+                    params_dft.n_gpu_layers = params_base.n_gpu_layers;
+                }
 
                 // progress callback
                 params_dft.load_progress_callback           = load_progress_callback;
