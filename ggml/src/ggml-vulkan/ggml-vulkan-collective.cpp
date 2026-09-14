@@ -1036,6 +1036,9 @@ bool tp5_wait_all_p1(tp5_comm & c) {
             return false;
         }
         c.host_waits++;
+        if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+            prof->host_wait_count++;
+        }
         vkResetFences(r.vkdev, 1, &r.fence_p1);
     }
     return true;
@@ -1047,6 +1050,9 @@ bool tp5_wait_all_p2(tp5_comm & c) {
         if (vkWaitForFences(r.vkdev, 1, &r.fence_p2, VK_TRUE, 5000000000ULL) != VK_SUCCESS) {
             c.fail("Phase 2 fence wait failed on rank " + std::to_string(i));
             return false;
+        }
+        if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+            prof->host_wait_count++;
         }
         vkResetFences(r.vkdev, 1, &r.fence_p2);
     }
@@ -1078,9 +1084,15 @@ bool tp5_drain_epoch(tp5_comm & c, uint64_t epoch, uint64_t timeout_ns) {
         wi.semaphoreCount = 1;
         wi.pSemaphores = &r.timeline_sem;
         wi.pValues = &target_val;
+        auto t_wait_start = std::chrono::high_resolution_clock::now();
         if (r.pfn_wait_semaphores(r.vkdev, &wi, timeout_ns) != VK_SUCCESS) {
             c.fail("drain_epoch: wait failed or timed out for epoch " + std::to_string(epoch) + " on rank " + std::to_string(i));
             return false;
+        }
+        auto t_wait_end = std::chrono::high_resolution_clock::now();
+        if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+            prof->host_wait_count++;
+            prof->host_wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t_wait_end - t_wait_start).count();
         }
     }
     c.last_drained_epoch = std::max(c.last_drained_epoch, epoch);
@@ -1318,6 +1330,10 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
             si.signalSemaphoreCount = 1;
             si.pSignalSemaphores = &r.timeline_sem;
 
+            if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+                prof->queue_submits++;
+                prof->submit_batches++;
+            }
             if (vkQueueSubmit(r.queue, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) {
                 // Do NOT call vkQueueWaitIdle on prior ranks: their submitted commands may be blocked
                 // waiting on missing peer timeline signals that will never arrive!
@@ -1332,6 +1348,10 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
             VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
             si.commandBufferCount = 1;
             si.pCommandBuffers = &plan->cmd_p1[i];
+            if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+                prof->queue_submits++;
+                prof->submit_batches++;
+            }
             if (vkQueueSubmit(r.queue, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) {
                 c.fail("Phase 1 gpuflag submit failed on rank " + std::to_string(i));
                 return false;
@@ -1349,6 +1369,10 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                 si.pSignalSemaphores = &r.sem_p1_done;
             }
             VkFence f = (c.sync_mode == tp5_sync_mode::SYNCFD) ? VK_NULL_HANDLE : r.fence_p1;
+            if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+                prof->queue_submits++;
+                prof->submit_batches++;
+            }
             if (vkQueueSubmit(q, 1, &si, f) != VK_SUCCESS) {
                 for (size_t k = 0; k < i; ++k) {
                     vkQueueWaitIdle(c.ranks[k].queue);
@@ -1372,6 +1396,9 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
             gfi.semaphore = r_src.sem_p1_done;
             gfi.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
             int sync_fd = -1;
+            if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+                prof->fd_exports++;
+            }
             VkResult res = r_src.pfn_get_sem_fd(r_src.vkdev, &gfi, &sync_fd);
             if (res != VK_SUCCESS) {
                 for (size_t k = 0; k < c.n_ranks; ++k) {
@@ -1404,6 +1431,9 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                 ifi.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
                 ifi.flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT;
                 ifi.fd = fd_for_import;
+                if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+                    prof->fd_imports++;
+                }
                 VkResult imp_res = r_dst.pfn_import_sem_fd(r_dst.vkdev, &ifi);
                 if (imp_res != VK_SUCCESS) {
                     if (fd_for_import >= 0) {
@@ -1473,6 +1503,10 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
             si.signalSemaphoreCount = 1;
             si.pSignalSemaphores = &r.timeline_sem;
 
+            if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+                prof->queue_submits++;
+                prof->submit_batches++;
+            }
             if (vkQueueSubmit(r.queue, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) {
                 // Do NOT call vkQueueWaitIdle on prior ranks: avoid deadlock on missing signals
                 c.fail("Phase 2 timeline submit failed on rank " + std::to_string(i));
@@ -1487,6 +1521,10 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
             si.commandBufferCount = 1;
             si.pCommandBuffers = &plan->cmd_p2[i];
             vkResetFences(r.vkdev, 1, &r.fence_ring[ring_idx]);
+            if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+                prof->queue_submits++;
+                prof->submit_batches++;
+            }
             if (vkQueueSubmit(r.queue, 1, &si, r.fence_ring[ring_idx]) != VK_SUCCESS) {
                 c.fail("Phase 2 gpuflag submit failed on rank " + std::to_string(i));
                 return false;
@@ -1510,6 +1548,10 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
         si.commandBufferCount = 1;
         si.pCommandBuffers = &plan->cmd_p2[i];
         vkResetFences(r.vkdev, 1, &r.fence_p2);
+        if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+            prof->queue_submits++;
+            prof->submit_batches++;
+        }
         if (vkQueueSubmit(r.queue, 1, &si, r.fence_p2) != VK_SUCCESS) {
             for (size_t k = 0; k < i; ++k) {
                 vkQueueWaitIdle(c.ranks[k].queue);

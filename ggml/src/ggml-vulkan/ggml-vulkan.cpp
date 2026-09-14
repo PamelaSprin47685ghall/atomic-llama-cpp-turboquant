@@ -3436,6 +3436,10 @@ static void ggml_vk_submit(vk_context& ctx, vk::Fence fence) {
         }
     }
 
+    if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+        prof->queue_submits++;
+        prof->submit_batches += submit_infos.size();
+    }
     ctx->p->q->handle->submit(submit_infos, fence);
 
     ctx->seqs.clear();
@@ -19152,6 +19156,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 si.pWaitDstStageMask = &stage;
                 si.setPNext(&tl_info);
                 ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
+            }
+            if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+                prof->queue_submits++;
+                prof->submit_batches++;
             }
             ctx->device->compute_queue->handle->submit({ si }, nullptr);
         }

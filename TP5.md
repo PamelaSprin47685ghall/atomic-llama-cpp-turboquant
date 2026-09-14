@@ -1280,7 +1280,7 @@ P2P/sync 不满足：实验参考模式可选择已声明的 host baseline；严
 | T13 | `qwen4_hc_up_fold.comp` [脚手架合入] | HC F3 shader 脚手架 | 已注册进编译流水线 |
 | T14 | `qwen4_hc_down.comp` [设计归入 P3] | F2 epilogue，optional inject | 按实测时间账评估是否开启 |
 | T15 | `qwen4_hc_combine_norm.comp` [设计归入 P3] | 本地 F1；随后扩展 sum consumer | 按实测时间账评估是否开启 |
-| T16 | Vulkan fusion 与 meta consumer recipe [实施中] | 联合 collective+F1、live range、write mask | 无双重求和；已实现 MoE 单 token 重放 |
+| T16 | Vulkan fusion 与 meta consumer recipe [已实现] | 联合 collective+F1、live range、write mask | 无双重求和；已实现 MoE 单 token 重放与 P0 细粒度计时剖析 |
 | T17 | `CMakeLists.txt`、`vulkan-shaders-gen.cpp` [已实现] | 编译并注册 shader 变体，避免运行时 shell 编译 | 干净构建可复现，无固定 `/tmp` 文件竞争 |
 | T18 | `common/common.h`、`common/arg.cpp` [已实现] | `--tp5`、`--tp5-wire`、`--tp5-sync`、`--tp5-relay` 等 CLI 解析 | 映射至对应环境变量生效 |
 | T19 | CPU/GPU 测试及相应 CMake [已实现] | `test-tp5-plan`, `test-meta-reduce-boundary`, `test-vulkan-tp5-mesh` | 编译构建正常且全量通过 |
@@ -1289,6 +1289,7 @@ P2P/sync 不满足：实验参考模式可选择已声明的 host baseline；严
 | T22 | `ggml-vulkan-collective.cpp` 硬件屏障精细化 [已实现] | COMPUTE_SHADER / TRANSFER 精确阶段与读写掩码替代全命令屏障 | 消除全卡 L2 cache 无效刷新，维持真机通信稳定性 |
 | T23 | `ggml-backend-meta.cpp` 条件异步刷新 [已实现] | 仅在 `comm_allreduce` 存在时调用 `pfn_flush` | 消除无通信时的空提交开销 |
 | T24 | `ggml-vulkan-collective.cpp` 驱动层硬安全门 [已实现] | `gpuflag` 请求自动降级至已验证的 `timeline` 快路径 | 彻底消除跨卡未定义自旋死锁与驱动 hang 风险 |
+| T25 | P0 可信时间账全链路埋点落地（`ggml_tp5_profile`）[已实现] | queue submit、submit batches、host wait 与 FD export/import 跨层剖析 | 满足 §五 P0 规范，与 `GGML_TP5_PROFILE=1` 联动 |
 
 `ggml-vulkan.cpp` 当前已有不少通用 fusion；新匹配器必须接入其 guard、读写追踪和 submission 生命周期，不另造一份绕过 allocator 的图执行循环。
 
