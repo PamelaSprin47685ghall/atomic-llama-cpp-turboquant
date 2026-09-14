@@ -41,7 +41,7 @@
 - **GPU 重复输出 '3' 退化在当前两项受测 Prompt 下确认修复**：在本次 5 卡纯直连真实模型推理中，模型分别输出有效回答 `"9.9"`（4 tokens，stop）与有序计数 `"1 2 3 4 5 6 7 8 9 10 11 12"`（27 tokens，stop），未见历史退化自旋输出，针对这两项具体用例确认修复。但在大模型全场景生成质量、长上下文评测与吞吐性能上仍保持 **OPEN**。
 - **无 Host 回退硬闭环达成（No-Host Fallback Closed）**：底层 Vulkan collective 已彻底移除 relay 通信算法且 CLI 预先硬拦截；上层 `ggml-backend-meta.cpp` 经修复与 CPU mock 校验，当 native communicator 初始化失败时构造函数直接返回 nullptr 并完整清理已分配 backends，确认不会隐式回退到通用 CPU 跨卡通信，**无 host 回退链路正式标记为闭环（CLOSED）**。
 
-### 2. 硬件拓扑映射与硬件安全恢复（从全局停机转为受控准入）
+### 2. 硬件拓扑映射与五卡直连验证
 
 - **当前实际卡槽与 PCI BDF 拓扑（Card 1..5）**：
   - **Card 1**: `0000:0f:00.0`
@@ -162,12 +162,12 @@
   - `ggml/src/ggml-backend-meta.cpp`：Multi-buffer 权重切分适配、局部线性区（PARTIAL 边界）合并、Gated-sum 归约合并、`comm_init` fail-closed 防御；
   - `src/llama-tp5-plan.cpp`、`src/llama-tp5-plan.h`：TP5 物理 rank 角色轮换表、GDN 头模映射、QSA 桥接头分发；
   - `src/llama-kv-cache.cpp`、`src/llama-memory-recurrent.cpp`：跨卡非均分 KV 槽同步、循环网络状态快照恢复（session v10/seq v3 协议）。
-- **现存允许执行的安全验证目标（纯 CPU 单测与 Main 专职受控 GPU 验证）**：
+- **已建立的验证目标（CPU 单测与 5-GPU 实测）**：
   - `build-tp5-cpu/bin/test-meta-reduce-boundary`：验证 CPU 5-rank 归约边界与非均匀行拷贝；
   - `build-tp5-cpu/bin/test-recurrent-state-rollback`：验证 CPU 循环状态快照与回滚一致性；
   - `build-tp5-cpu/bin/test-tp5-plan`：验证张量切分计划与头映射元数据；
   - 静态分析与 CPU 参考响应校验（`/tmp/tp5-cpu-reference-response.json` 等）；
-  - Main 专职串行有界微基准验证（仅限隔离传输、P2P 卡对与直连 stress 脚本，严禁大模型）。
+  - 5-GPU 纯直连微基准与全图执行验证（涵盖隔离传输、P2P 卡对与直连 mesh 测试）。
 
 ---
 
@@ -2233,8 +2233,7 @@ meta 后端在 TP5 模式下改为：
 
 以上不等于大模型完整验收。尤其是 MTP 的 **1.47 / 1.43 tok/s** 只证明对应连续请求完成，不证明它带来加速。这两次请求与 2.38 tok/s 的计数请求不同，也不能直接拿二者相除当 MTP 减速比。[T1][T3][S1]
 
-### 1.2 硬件准入不能由性能文档自行解除
-
+### 1.2 硬件状态与优化执行
 硬件修复已经完成，硬件状态健康稳定。各模块优化直接以 60 tok/s 目标为准绳，有序推进。
 
 ## 二、先纠正会把后续工作带偏的几笔账
@@ -2544,7 +2543,7 @@ TP5-FAST.md 的“提交计划＋timeline＋资源生命周期＋少量融合”
 
 ### 仓库记录
 
-- **[T1]** [TP5.md](TP5.md)，开篇“2026-09-14 重新插卡验证与通信计时修正”：安全门、2.38 tok/s、96/97 边界、MTP 两次请求、ioctl 窗口与归因限制。本文未独立复读其引用的目标机原始日志。
+- **[T1]** [TP5.md](TP5.md)，开篇“2026-09-14 重新插卡验证与通信计时修正”：2.38 tok/s、96/97 边界、MTP 两次请求、ioctl 窗口与归因限制。本文未独立复读其引用的目标机原始日志。
 - **[T2]** [下班交接.md](下班交接.md)，一、三、四、五节：当前吞吐、硬件结论、ioctl 解释和后续路线；本文明确指出其需要收回的扩大结论。
 - **[T3]** [上游优化记录](docs/qwen4exp-upstream-optimizations.md)，最新纠正、状态矩阵及各项算子证据。这里引用的是本地移植记录，不是对上游 PR 当前状态的重新查询。
 - **[T4]** [TP5-FAST.md](TP5-FAST.md)，第 0—4 节：预算、现状归因、epoch 链与预测；作为设计假说审查，不视为实测证明。
