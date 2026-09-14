@@ -11,7 +11,7 @@
 #include <string.h>
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
-#define MAX_FREE_BLOCKS 256
+#define MAX_FREE_BLOCKS 2048
 
 //#define GGML_ALLOCATOR_DEBUG
 
@@ -838,6 +838,8 @@ void ggml_gallocr_release_buffers(ggml_gallocr_t galloc) {
         ggml_dyn_tallocr_reset(galloc->buf_tallocs[i]);
     }
     ggml_gallocr_buffer_pool_trim(galloc->buffer_pool);
+    galloc->n_nodes = 0;
+    galloc->n_leafs = 0;
 }
 
 typedef struct ggml_gallocr * ggml_gallocr_t;
@@ -861,6 +863,13 @@ static bool ggml_gallocr_is_allocated(ggml_gallocr_t galloc, struct ggml_tensor 
 static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_tensor * node, struct ggml_tensor * parent) {
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
     struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);
+    if (hn == NULL || p_hn == NULL) {
+        return;
+    }
+    if (p_hn->buffer_id < 0 || p_hn->buffer_id >= galloc->n_buffers ||
+        hn->buffer_id < 0   || hn->buffer_id >= galloc->n_buffers) {
+        return;
+    }
 
     size_t parent_size = ggml_backend_buft_get_alloc_size(galloc->bufts[p_hn->buffer_id], parent);
     size_t node_size = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], node);
@@ -869,6 +878,9 @@ static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_ten
 
     // note: we want after the freeing the chunks to continue to be aligned
     struct ggml_dyn_tallocr * p_alloc = galloc->buf_tallocs[p_hn->buffer_id];
+    if (p_alloc == NULL) {
+        return;
+    }
     parent_size = aligned_offset(NULL, parent_size, p_alloc->alignment);
     node_size = aligned_offset(NULL, node_size, p_alloc->alignment);
 
@@ -884,13 +896,17 @@ static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_ten
 static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor * node, int buffer_id) {
     GGML_ASSERT(buffer_id >= 0);
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
+    if (hn == NULL) {
+        return;
+    }
 
     if (!ggml_gallocr_is_allocated(galloc, node) && !ggml_impl_is_view(node)) {
         hn->allocated = true;
         assert(hn->addr.offset == 0);
 
-        // try to reuse a parent's buffer (inplace)
-        if (ggml_op_can_inplace(node->op)) {
+        // try to reuse a parent's buffer (inplace); allow disabling for complex tensor-parallel subgraphs
+        const bool allow_inplace = (getenv("GGML_DISABLE_INPLACE") == NULL);
+        if (allow_inplace && ggml_op_can_inplace(node->op)) {
             for (int i = 0; i < GGML_MAX_SRC; i++) {
                 struct ggml_tensor * parent = node->src[i];
                 if (parent == NULL) {
@@ -915,10 +931,19 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                 }
 
                 struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);
+                if (p_hn == NULL) {
+                    continue;
+                }
                 if (p_hn->n_children == 1 && p_hn->n_views == 0) {
                     if (ggml_impl_is_view(parent)) {
                         struct ggml_tensor * view_src = parent->view_src;
+                        if (!ggml_gallocr_is_own(galloc, view_src)) {
+                            continue;
+                        }
                         struct hash_node * view_src_hn = ggml_gallocr_hash_get(galloc, view_src);
+                        if (view_src_hn == NULL) {
+                            continue;
+                        }
                         if (view_src_hn->n_views == 1 && view_src_hn->n_children == 0 && view_src->data == parent->data) {
                             AT_PRINTF("reusing view parent %s (%s) for %s\n", parent->name, view_src->name, node->name);
                             assert(view_src_hn->addr.chunk == p_hn->addr.chunk && view_src_hn->addr.offset == p_hn->addr.offset);
@@ -1085,9 +1110,9 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
 
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
-    size_t min_hash_size = graph->n_nodes + graph->n_leafs;
-    // add 25% margin to avoid hash collisions
-    min_hash_size += min_hash_size / 4;
+    // Generous margin for tensor-parallel subgraphs with auxiliary views and external nodes
+    size_t min_hash_size = 2 * (size_t)(graph->n_nodes + graph->n_leafs) + 512;
+    min_hash_size = ggml_hash_size(min_hash_size);
 
     // initialize hash table
     if (galloc->hash_set.size < min_hash_size) {

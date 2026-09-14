@@ -432,6 +432,11 @@ extern "C" {
         int64_t  ne[16*GGML_BACKEND_META_MAX_DEVICES];
         uint32_t nr[16];
         uint32_t n_segments;
+
+        // For tensors with indexed replicas (indexed_replica = true, n_segments = 1, nr[0] = 1):
+        // Explicit logical starting element along the split axis for each device.
+        bool     indexed_replica;
+        int64_t  replica_start[GGML_BACKEND_META_MAX_DEVICES];
     };
 
     // function to assign split states for statically allocated tensors, compute tensor split states will be assigned to be compatible:
@@ -442,6 +447,8 @@ extern "C" {
     //       express this as a backend registry functionality instead
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+
+    GGML_API struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index);
 
     //
     // Utils
