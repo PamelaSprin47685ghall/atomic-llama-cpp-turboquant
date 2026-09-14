@@ -23,6 +23,7 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t d
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(void);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
+GGML_BACKEND_API uint64_t           ggml_backend_vk_get_sparse_dispatch_count(ggml_backend_t backend);
 
 #ifdef  __cplusplus
 }

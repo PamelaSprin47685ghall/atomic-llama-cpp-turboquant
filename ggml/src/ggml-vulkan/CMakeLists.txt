@@ -61,6 +61,8 @@ if (Vulkan_FOUND)
 
     ggml_add_backend_library(ggml-vulkan
                              ggml-vulkan.cpp
+                             ggml-vulkan-collective.cpp
+                             ggml-vulkan-internal.h
                              ../../include/ggml-vulkan.h
                             )
 

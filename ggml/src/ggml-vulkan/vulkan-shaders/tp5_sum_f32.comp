@@ -1,0 +1,40 @@
+#version 450
+
+// TP5 mesh AllReduce: fixed-rank-order sum over sender-major mailbox slots.
+// FP32 wire variant. One thread per element; FP32 accumulation.
+// GPU-flag sync: optional spin on per-slot readiness flags (binding 2).
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer InBuf {
+    float in_data[];
+};
+
+layout(std430, binding = 1) writeonly buffer OutBuf {
+    float out_data[];
+};
+
+layout(std430, binding = 2) readonly buffer FlagBuf {
+    uint flags[];
+};
+
+layout(push_constant) uniform Params {
+    uint n_elems;
+    uint n_slots;
+    uint stride_elems;
+    uint expected_seq;
+    uint use_flags;
+    uint spin_max;
+} p;
+
+void main() {
+    uint e = gl_GlobalInvocationID.x;
+    if (e >= p.n_elems) {
+        return;
+    }
+    float acc = 0.0;
+    for (uint r = 0u; r < p.n_slots; ++r) {
+        acc += in_data[uint(r) * p.stride_elems + e];
+    }
+    out_data[e] = acc;
+}
