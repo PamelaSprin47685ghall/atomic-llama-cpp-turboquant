@@ -941,11 +941,19 @@ static llama_model * common_fit_probe_model(const char * path_model, const llama
     std::string key = std::string(path_model) + "|" + std::to_string((int) mparams.no_alloc) + "|" +
                       std::to_string(mparams.n_gpu_layers) + "|" + std::to_string((int) mparams.split_mode) + "|" +
                       std::to_string(mparams.main_gpu) + "|" + std::to_string((int) mparams.load_mode);
-    for (int i = 0; i < llama_max_devices(); i++) {
-        key += "|";
-        key += mparams.devices != nullptr && mparams.devices[i] != nullptr ? ggml_backend_dev_name(mparams.devices[i]) : "-";
-        key += ":";
-        key += std::to_string(mparams.tensor_split[i]);
+    key += "|devices";
+    if (mparams.devices != nullptr) {
+        for (size_t i = 0; mparams.devices[i] != nullptr; ++i) {
+            key += "|";
+            key += ggml_backend_dev_name(mparams.devices[i]);
+        }
+    }
+    key += "|tensor_split";
+    if (mparams.tensor_split != nullptr) {
+        for (int i = 0; i < llama_max_devices(); ++i) {
+            key += ":";
+            key += std::to_string(mparams.tensor_split[i]);
+        }
     }
 
     if (model_cached != nullptr && key == key_cached) {

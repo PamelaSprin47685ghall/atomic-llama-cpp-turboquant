@@ -13,6 +13,17 @@
 #include <vector>
 #include <utility>
 
+static inline llama_state_seq_flags get_spec_checkpoint_flags(const llama_context * ctx) {
+    llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    if (ctx != nullptr) {
+        const llama_model * model = llama_get_model(ctx);
+        if (model != nullptr && (llama_model_is_recurrent(model) || llama_model_is_hybrid(model))) {
+            flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+        }
+    }
+    return flags;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -175,7 +186,7 @@ int main(int argc, char ** argv) {
                     llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), seq_id));
 
             if (use_ckpt_dft) {
-                ckpt.update_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                ckpt.update_dft(ctx_dft.get(), seq_id, get_spec_checkpoint_flags(ctx_dft.get()));
             }
 
             // generate a new draft
@@ -196,12 +207,12 @@ int main(int argc, char ** argv) {
             // this allows us to restore the state if partial draft acceptance occurs
             if (!draft.empty()) {
                 if (use_ckpt_tgt) {
-                    ckpt.update_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_tgt(ctx_tgt, seq_id, get_spec_checkpoint_flags(ctx_tgt));
                 }
             }
 
             {
-                ckpt.load_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                ckpt.load_dft(ctx_dft.get(), seq_id, get_spec_checkpoint_flags(ctx_dft.get()));
 
                 llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, ckpt.pos_max + 1, -1);
             }
@@ -261,13 +272,13 @@ int main(int argc, char ** argv) {
             draft = std::move(ids);
 
             {
-                ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                ckpt.load_tgt(ctx_tgt, seq_id, get_spec_checkpoint_flags(ctx_tgt));
 
                 llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, ckpt.pos_max + 1, -1);
             }
 
             {
-                ckpt.load_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                ckpt.load_dft(ctx_dft.get(), seq_id, get_spec_checkpoint_flags(ctx_dft.get()));
 
                 llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, ckpt.pos_max + 1, -1);
             }

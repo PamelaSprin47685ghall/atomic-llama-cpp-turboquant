@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cassert>
+#include <stdexcept>
 #include <fstream>
 #include <sstream>
 #include <regex>

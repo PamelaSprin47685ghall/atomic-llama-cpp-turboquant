@@ -47,6 +47,19 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+static inline llama_state_seq_flags get_spec_checkpoint_flags(const llama_context * ctx) {
+    llama_state_seq_flags flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+    if (ctx != nullptr) {
+        const llama_model * model = llama_get_model(ctx);
+        if (model != nullptr && (llama_model_is_recurrent(model) || llama_model_is_hybrid(model))) {
+            // In addition to model recurrence, verify the backend actually supports device memory cloning
+            // (i.e. Vulkan/CUDA/Metal or TensorParallel meta backend with cpy_tensor)
+            flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+        }
+    }
+    return flags;
+}
+
 struct server_token_hack::impl {
     llama_context * ctx;
     wanxiangqi_repetition_guard repetition_guard;
@@ -8368,9 +8381,9 @@ private:
                 if (rerot_owns_slot(slot.id)) {
                     if (slot.rerot_has_draft_stamp && ctx_tgt != nullptr &&
                         llama_rerot_mtp_is_stale(ctx_tgt, slot.id, &slot.rerot_draft_stamp)) {
-                        slot.spec_ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        slot.spec_ckpt.load_tgt(slot.ctx_tgt, slot.id, get_spec_checkpoint_flags(slot.ctx_tgt));
                         if (slot.ctx_dft) {
-                            slot.spec_ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            slot.spec_ckpt.load_dft(slot.ctx_dft, slot.id, get_spec_checkpoint_flags(slot.ctx_dft));
                         }
                         common_speculative_set_state(spec.get(), slot.id, slot.spec_ckpt.data_spec);
                         slot.mem.seq_rm(slot.id, slot.spec_ckpt.pos_max + 1, -1);
@@ -8405,7 +8418,7 @@ private:
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
 
                         if (use_ckpt_dft) {
-                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, get_spec_checkpoint_flags(ctx_dft));
                         }
                         slot.spec_ckpt.data_spec.clear();
                         common_speculative_get_state(spec.get(), slot.id, slot.spec_ckpt.data_spec);
@@ -8454,7 +8467,7 @@ private:
 
             if (ctx_dft) {
                 if (use_ckpt_dft) {
-                    ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.load_dft(ctx_dft, slot.id, get_spec_checkpoint_flags(ctx_dft));
                 }
 
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
@@ -8473,7 +8486,7 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_tgt(ctx_tgt, slot.id, get_spec_checkpoint_flags(ctx_tgt));
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -8485,7 +8498,7 @@ private:
                 }
 
                 if (use_ckpt_dft) {
-                    ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_dft(ctx_dft, slot.id, get_spec_checkpoint_flags(ctx_dft));
                 }
             }
         });
@@ -9653,9 +9666,9 @@ private:
             // restore the checkpoint, and re-draft next frontier. OFF: false.
             if (rerot_owns_slot(slot.id) && slot.rerot_has_draft_stamp && ctx_tgt != nullptr &&
                 llama_rerot_mtp_is_stale(ctx_tgt, slot.id, &slot.rerot_draft_stamp)) {
-                slot.spec_ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                slot.spec_ckpt.load_tgt(slot.ctx_tgt, slot.id, get_spec_checkpoint_flags(slot.ctx_tgt));
                 if (slot.ctx_dft) {
-                    slot.spec_ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    slot.spec_ckpt.load_dft(slot.ctx_dft, slot.id, get_spec_checkpoint_flags(slot.ctx_dft));
                 }
                 common_speculative_set_state(spec.get(), slot.id, slot.spec_ckpt.data_spec);
                 slot.mem.seq_rm(slot.id, slot.spec_ckpt.pos_max + 1, -1);
@@ -9705,10 +9718,10 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        ckpt.load_tgt(slot.ctx_tgt, slot.id, get_spec_checkpoint_flags(slot.ctx_tgt));
 
                         if (slot.ctx_dft) {
-                            ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            ckpt.load_dft(slot.ctx_dft, slot.id, get_spec_checkpoint_flags(slot.ctx_dft));
                         }
                         common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
 
