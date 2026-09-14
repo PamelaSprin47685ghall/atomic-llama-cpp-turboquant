@@ -168,7 +168,7 @@
   - 96 道归约门控全模型 GPU 图执行未满足（当前实测为 3 AllReduce/layer）；
   - 7 补丁集成全功能大模型 GPU 运行尚未放行；
   - 目标 60/100 tok/s 指标保持 OPEN；
-  - `ggml-backend-meta.cpp` 的 `comm_init == nullptr` 上层 fail-closed 修复仍在进行中，暂不可宣称全局彻底关闭回退。
+  - `ggml-backend-meta.cpp` 的 `comm_init == nullptr` 上层 fail-closed 修复已闭环验证（CLOSED：已在 `test-meta-reduce-boundary` 中通过 mock 检验，`comm_init == nullptr` 时安全释放并返回 nullptr，彻底关闭隐式回退）。
 
 ### 4. 涉及代码范围与安全验证目标
 
