@@ -1662,13 +1662,15 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
     const char * sync_env = getenv("GGML_TP5_SYNC");
     if (sync_env && strcmp(sync_env, "timeline") == 0) {
         c->sync_mode = tp5_sync_mode::TIMELINE;
+    } else if (sync_env && strcmp(sync_env, "host") == 0) {
+        c->sync_mode = tp5_sync_mode::HOST;
     } else if (sync_env && strcmp(sync_env, "syncfd") == 0) {
         c->sync_mode = tp5_sync_mode::SYNCFD;
     } else if (sync_env && (strcmp(sync_env, "gpu") == 0 || strcmp(sync_env, "gpuflag") == 0)) {
         fprintf(stderr, "ggml-vulkan-collective: sync mode 'gpuflag' is experimental and unsafe under current driver memory model; falling back to timeline\n");
         c->sync_mode = tp5_sync_mode::TIMELINE;
     } else {
-        c->sync_mode = tp5_sync_mode::HOST;
+        c->sync_mode = tp5_sync_mode::TIMELINE;
     }
 
     const char * replay_env = getenv("GGML_TP5_CMD_REPLAY");

@@ -534,7 +534,7 @@ int main(int argc, char ** argv) {
     bool adversarial = false;
     int epochs = 1;
     std::string wire_str = "f16"; // default matches production collective
-    std::string sync_str = "host";
+    std::string sync_str = "timeline";
     std::string relay_str = "off";
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];

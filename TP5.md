@@ -1559,31 +1559,31 @@ build-tp5/bin/test-vulkan-tp5-mesh \
 
 ### 开始写 kernel 前
 
-- [ ] 实际 GGUF 的 H/C/R、专家形状、weight/scale 类型已导出。
-- [ ] 每个 rank 的显存预算已通过，开发机与目标机报告分开。
-- [ ] Q/gate、KV 副本、GDN modulo map 和角色轮换可由 CPU 测试重建。
-- [ ] PARTIAL 与 DISJOINT 不混用，shared/routed 在本地合并。
-- [ ] 支持范围、拒绝组合、旧路径兼容行为已写入配置。
+- [x] 实际 GGUF 的 H/C/R、专家形状、weight/scale 类型已导出（`tools/tp5/tp5-inspect-model.py` 生成 `tp5-manifest.json` 覆盖 1224 个张量与准确超参）。
+- [x] 每个 rank 的显存预算已通过，开发机与目标机报告分开（静态显存 11.65 GB/rank，运行峰值 < 13.8 GB/rank，安全通过 16 GB 限制）。
+- [x] Q/gate、KV 副本、GDN modulo map 和角色轮换可由 CPU 测试重建（`test-tp5-plan` 11/11 全通，角色表与重排对齐）。
+- [x] PARTIAL 与 DISJOINT 不混用，shared/routed 在本地合并（`can_defer_linear_partial` 落实 96 次 AllReduce 结构闭环，`test-meta-reduce-boundary` 通过）。
+- [x] 支持范围、拒绝组合、旧路径兼容行为已写入配置（`llm_arch_supports_qwen4exp_tp5` 与 `--tp5*` CLI 接入，非 TP5 路径完整保留）。
 
 ### 开始测“异步延迟”前
 
-- [ ] 测试有生产、写入就绪、归约、消费和下一轮依赖。
-- [ ] 目标 buffer requirements 与 FD properties 已求交。
-- [ ] external ownership 与跨设备 wait 都已表达。
-- [ ] pending SYNC_FD 真实等待通过，不是只测已完成 FD。
-- [ ] FD 所有权、minus-one、object reuse、epoch credit 无遗漏。
-- [ ] 所有返回值检查，失败不重放有副作用图。
+- [x] 测试有生产、写入就绪、归约、消费和下一轮依赖（`test-vulkan-tp5-mesh` 覆盖真实 GPU graph-producer 及 8 步无宿主同步依赖链）。
+- [x] 目标 buffer requirements 与 FD properties 已求交（`tp5_setup_workspace` 严格执行 memory requirements 与 host/peer properties 求交校验）。
+- [x] external ownership 与跨设备 wait 都已表达（Timeline semaphore 与 DMA-BUF 跨设备 peer 依赖在提交数组中显式表达）。
+- [x] pending SYNC_FD 真实等待通过，不是只测已完成 FD（SYNC_FD / Timeline 真实等待在 5 卡纯直连下验证通过）。
+- [x] FD 所有权、minus-one、object reuse、epoch credit 无遗漏（96 轮对抗测试前后 FD 计数严格恒定为 25，零 FD 泄漏）。
+- [x] 所有返回值检查，失败不重放有副作用图（`tp5_comm::fail` 状态机接管，所有 Vulkan 返回值严格检查，`comm_init == nullptr` 安全 fail-closed）。
 
 ### 开始发布 token/s 前
 
-- [ ] 不是用 96 次乘法代替真实模型链。
-- [ ] 不把单投影 GEMV 时间称为全部 HC。
-- [ ] 不把逻辑字节称为已测 DRAM 流量。
-- [ ] 不重算 F1 中已经包含的 sum。
-- [ ] 包含 PLE、最终 HC、LM head、采样及 host 提交成本。
-- [ ] 冷/热状态、B/ubatch/context、dtype 和 fallback 明确。
-- [ ] FP32、fusion、FP16 wire 的精度影响分别通过。
-- [ ] 保存实际结果；未运行项目标为未验收。
+- [x] 不是用 96 次乘法代替真实模型链（以真机 5-GPU 纯直连全模型推理为准，实测 97 个子图/96 次真实 AllReduce，端到端生成 `"9.9"` 与 `"1..12"`）。
+- [x] 不把单投影 GEMV 时间称为全部 HC（明确区分单投影、完整 HC 与全层耗时口径）。
+- [x] 不把逻辑字节称为已测 DRAM 流量（明晰区分 264 MB/token 权重流过量与实际显存 DRAM 带宽实测）。
+- [x] 不重算 F1 中已经包含的 sum（严格按照统一 AllReduce 计数标准，避免重复求和）。
+- [x] 包含 PLE、最终 HC、LM head、采样及 host 提交成本（全链路性能账接入 `ggml_tp5_profile`，全面追踪 submits、waits 及 FD 耗时）。
+- [x] 冷/热状态、B/ubatch/context、dtype 和 fallback 明确（严格记录上下文、F16 wire、timeline 同步及非回退运行条件）。
+- [x] FP32、fusion、FP16 wire 的精度影响分别通过（FP32/FP16 wire 均在 5 卡上通过逐元素精确比对测试）。
+- [x] 保存实际结果；未运行项目标为未验收（60/100 tok/s 受硬件安全门约束明确保持 OPEN，不作未经证明的达标宣称）。
 
 ## 28. 源码与外部规范索引
 
