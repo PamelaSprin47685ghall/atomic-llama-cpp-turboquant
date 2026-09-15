@@ -875,6 +875,9 @@ static void test_split_k_preallocate_lifecycle(test_env & env) {
         CHECK_CLOSE(res_sk[i], res_sk_ref[i], 1e-4f);
     }
 
+    hits_before = 0; misses_before = 0;
+    env.get_stats(env.backend_gpu, &hits_before, &misses_before);
+
     // Step 3: Vary the decode inputs after scratch growth and verify new values (no stale replay).
     std::vector<float> x_decode_new(decode_dim, 9.0f);
     ggml_backend_tensor_set(fix_decode.x, x_decode_new.data(), 0, decode_dim * sizeof(float));

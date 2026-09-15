@@ -2929,8 +2929,14 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
 
         if (all_replay_cached) {
-            // Submit the entire 96-stage token computation and P2P communication chain in O(1) CPU submits!
+            // Submit the entire 96-stage token computation and P2P communication chain in O(1) CPU submits without blocking!
             if (pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors)) {
+                // Retain output tensor memory valid on GPUs across the chain
+                for (size_t s = 0; s < backend_ctx->n_subgraphs - 1; ++s) {
+                    for (size_t j = 0; j < n_backends; ++j) {
+                        backend_ctx->backend_configs[j].cgraphs[s].cgraph_main->nodes[backend_ctx->backend_configs[j].cgraphs[s].cgraph_main->n_nodes - 1]->flags |= GGML_TENSOR_FLAG_COMPUTE;
+                    }
+                }
                 // Execute the final tail subgraph (LM head slice)
                 size_t tail_idx = backend_ctx->n_subgraphs - 1;
                 for (size_t j = 0; j < n_backends; ++j) {

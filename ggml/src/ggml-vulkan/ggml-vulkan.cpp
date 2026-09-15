@@ -3857,12 +3857,12 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
     }
 
     subctx->s->buffer->buf.pipelineBarrier(
-        subctx->p->q->stage_flags,
-        subctx->p->q->stage_flags,
+        vk::PipelineStageFlagBits::eComputeShader,
+        vk::PipelineStageFlagBits::eComputeShader,
         {},
         { {
-          { !transfer_queue ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) },
-          { !transfer_queue ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) }
+          { vk::AccessFlagBits::eShaderWrite },
+          { vk::AccessFlagBits::eShaderRead }
         } },
         {},
         {}
@@ -19122,7 +19122,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     // Evict if cache exceeds working set capacity (256 entries to hold all 145/97 TP5 subgraphs comfortably)
     // Do this BEFORE looking up or creating cache_entry to avoid invalidating a live reference!
-    if (ctx->cgraph_cmd_cache.size() > 512) {
+    if (ctx->cgraph_cmd_cache.size() >= 256) {
         ggml_vk_cache_invalidate_all(ctx);
     }
 
@@ -20067,14 +20067,9 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
 
     ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
     ggml_vk_init(ctx, dev_num);
-
-    // Pre-allocate peak scratch buffer sizes for TP5 decode so they NEVER reallocate and invalidate replay cache:
-    // Peak sizes: split_k: 4MB, moe_route: 4MB, add_partials: 64KB, sparse_meta: 256KB
-    ctx->prealloc_split_k = ggml_vk_create_buffer_device(ctx->device, 4 * 1024 * 1024);
-    ctx->prealloc_moe_route = ggml_vk_create_buffer_device(ctx->device, 4 * 1024 * 1024);
-    ctx->prealloc_add_rms_partials = ggml_vk_create_buffer_device(ctx->device, 64 * 1024);
-    ctx->prealloc_sparse_meta = ggml_vk_create_buffer_device(ctx->device, 256 * 1024);
-    ctx->prealloc_y = ggml_vk_create_buffer_device(ctx->device, 4 * 1024 * 1024);
+    // Prealloc buffers allocate on demand during execution
+    ctx->prealloc_add_rms_partials = nullptr;
+    ctx->prealloc_sparse_meta = nullptr;
 
     ggml_backend_t vk_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_vk_guid(),
