@@ -2455,6 +2455,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+        // Assign deterministic UID to decode graph so meta backend and device backends
+        // can stably reuse subgraphs and command buffers without rebuilding (O(1) replay).
+        if (gf && ubatch.n_tokens == 1) {
+            ggml_graph_set_uid(gf, 0x5100000000000000ULL);
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -4652,6 +4657,9 @@ ggml_cgraph * llama_context::graph_reserve(
     res->reset();
 
     auto * gf = model.build_graph(gparams);
+    if (gf && ubatch.n_tokens == 1) {
+        ggml_graph_set_uid(gf, 0x5100000000000000ULL);
+    }
 
     this->n_outputs = save_n_outputs;
 

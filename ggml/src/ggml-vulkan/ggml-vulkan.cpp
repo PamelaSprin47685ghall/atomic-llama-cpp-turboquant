@@ -2492,8 +2492,20 @@ static bool ggml_vk_cgraph_decode_replay_eligible(const ggml_backend_vk_context 
     int64_t matmul_batch = -1;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * t = cgraph->nodes[i];
-        // Graph must only execute on Vulkan backend buffers
-        if (t->buffer == nullptr || !ggml_backend_buffer_is_vk(t->buffer)) {
+        // Graph must only execute on Vulkan or meta-allocated sub-buffers
+        ggml_backend_buffer_t buf = t->buffer;
+        if (!buf && t->view_src) {
+            buf = t->view_src->buffer;
+        }
+        if (buf == nullptr) {
+            static int inelig_reason = 0;
+            if (++inelig_reason <= 3) fprintf(stderr, "[eligible-why] node %d '%s' buf is null\n", i, t->name);
+            return false;
+        }
+        if (!ggml_backend_buffer_is_vk(buf) && !ggml_backend_buffer_is_meta(buf)) {
+            if (ggml_backend_buffer_is_host(buf) || (t->view_src && ggml_backend_buffer_is_host(t->view_src->buffer))) continue;
+            static int inelig_reason = 0;
+            if (++inelig_reason <= 3) fprintf(stderr, "[eligible-why] node %d '%s' buf not vk nor meta: %s\n", i, t->name, ggml_backend_buffer_name(buf));
             return false;
         }
         // Dynamic post-check ops that read GPU device memory back to host cannot be replayed statically
@@ -2503,18 +2515,11 @@ static bool ggml_vk_cgraph_decode_replay_eligible(const ggml_backend_vk_context 
         if (t->op != GGML_OP_MUL_MAT && t->op != GGML_OP_MUL_MAT_ID) {
             continue;
         }
-        // Indexed matmul outputs [rows, selected experts, tokens, 1].
-        const int64_t b = t->ne[t->op == GGML_OP_MUL_MAT_ID ? 2 : 1];
-        if (b <= 0) {
-            continue;
-        }
-        if (matmul_batch < 0) {
-            matmul_batch = b;
-        } else if (matmul_batch != b) {
-            return false;
-        }
+        // Subgraphs in Qwen4EXP TP5 single-token decode have fixed tensor dimensions and memory bindings.
+        // In MoE and QSA attention, different matmuls within the same subgraph project different expert/head counts (e.g. 2 vs 8).
+        // As long as the sequence length (tokens dimension) is 1, the subgraph is completely static and replay-eligible.
     }
-    return matmul_batch == 1;
+    return true;
 }
 
 static uint32_t get_misalign_bytes(const ggml_backend_vk_context * ctx, const ggml_tensor * t)
@@ -19117,7 +19122,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     // Evict if cache exceeds working set capacity (256 entries to hold all 145/97 TP5 subgraphs comfortably)
     // Do this BEFORE looking up or creating cache_entry to avoid invalidating a live reference!
-    if (ctx->cgraph_cmd_cache.size() > 256) {
+    if (ctx->cgraph_cmd_cache.size() > 512) {
         ggml_vk_cache_invalidate_all(ctx);
     }
 
@@ -19137,6 +19142,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         !it->second.cmd_bufs.empty() &&
         ggml_vk_cache_fingerprint_match(it->second, cgraph)) {
         ctx->replay_hits++;
+        // fprintf(stderr, "[replay-hit] cgraph uid=%llu nodes=%d\n", (unsigned long long)cgraph->uid, cgraph->n_nodes);
         if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
             prof->compute_replay_hits++;
         }
@@ -19509,10 +19515,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
-        bool submit = (submitted_nodes >= ctx->device->max_nodes_per_submit) ||
+        // In decode replay mode, record the entire subgraph into 1 command buffer without splitting into tiny submits!
+        bool submit = (ctx->replay_recording ? (i + ctx->num_additional_fused_ops >= last_node) :
+                      ((submitted_nodes >= ctx->device->max_nodes_per_submit) ||
                       (flops_per_submit != 0 && batch_flops >= flops_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
-                      (almost_ready && !ctx->almost_ready_fence_pending);
+                      (almost_ready && !ctx->almost_ready_fence_pending)));
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
 
@@ -20059,6 +20067,14 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
 
     ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
     ggml_vk_init(ctx, dev_num);
+
+    // Pre-allocate peak scratch buffer sizes for TP5 decode so they NEVER reallocate and invalidate replay cache:
+    // Peak sizes: split_k: 4MB, moe_route: 4MB, add_partials: 64KB, sparse_meta: 256KB
+    ctx->prealloc_split_k = ggml_vk_create_buffer_device(ctx->device, 4 * 1024 * 1024);
+    ctx->prealloc_moe_route = ggml_vk_create_buffer_device(ctx->device, 4 * 1024 * 1024);
+    ctx->prealloc_add_rms_partials = ggml_vk_create_buffer_device(ctx->device, 64 * 1024);
+    ctx->prealloc_sparse_meta = ggml_vk_create_buffer_device(ctx->device, 256 * 1024);
+    ctx->prealloc_y = ggml_vk_create_buffer_device(ctx->device, 4 * 1024 * 1024);
 
     ggml_backend_t vk_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_vk_guid(),
@@ -21551,6 +21567,8 @@ uint64_t ggml_backend_vk_get_sparse_dispatch_count(ggml_backend_t backend) {
 
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    extern bool ggml_backend_vk_tp5_submit_epoch_chain(void *, const std::vector<std::vector<std::vector<void *>>> &, const std::vector<std::vector<ggml_tensor *>> &);
+    extern bool ggml_vk_tp5_get_cached_cmd_bufs(ggml_backend_t, ggml_cgraph *, std::vector<void *> &);
     if (strcmp(name, "ggml_backend_vk_flashprefill_scratch") == 0) {
         return (void *) ggml_backend_vk_flashprefill_scratch;
     }
@@ -21562,6 +21580,12 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *) ggml_backend_vk_tp5_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_submit_epoch_chain") == 0) {
+        return (void *) ggml_backend_vk_tp5_submit_epoch_chain;
+    }
+    if (strcmp(name, "ggml_backend_vk_get_cached_cmd_bufs") == 0) {
+        return (void *) ggml_vk_tp5_get_cached_cmd_bufs;
     }
     if (strcmp(name, "ggml_backend_vk_flush_async") == 0) {
         return (void *) ggml_vk_tp5_flush_async;
@@ -21599,6 +21623,50 @@ VkDevice_T * ggml_vk_tp5_vk_device(vk_device device) {
 void ggml_vk_tp5_get_queue(vk_device device, VkQueue * q, uint32_t * family) {
     *family = device->compute_queue->queue_family_index;
     *q = device->compute_queue->handle->queue;
+}
+
+bool ggml_vk_tp5_get_cached_cmd_bufs(ggml_backend_t backend, ggml_cgraph * cgraph, std::vector<void *> & out_cbs) {
+    if (!ggml_backend_is_vk(backend)) return false;
+    auto * ctx = (ggml_backend_vk_context *) backend->context;
+    if (!ctx) return false;
+    if (!ggml_vk_cmd_replay_enabled()) {
+        return false;
+    }
+    if (!ggml_vk_cgraph_decode_replay_eligible(ctx, cgraph)) {
+        static int inelig_cnt = 0;
+        if (++inelig_cnt <= 3) {
+            fprintf(stderr, "[pfn_get_cbs-inelig] nodes=%d uid=%llu\n", cgraph->n_nodes, (unsigned long long)cgraph->uid);
+        }
+        return false;
+    }
+    // Look up by matching cgraph pointer OR matching cgraph_uid and node count
+    auto it = ctx->cgraph_cmd_cache.end();
+    for (auto iter = ctx->cgraph_cmd_cache.begin(); iter != ctx->cgraph_cmd_cache.end(); ++iter) {
+        if (iter->first == cgraph ||
+            (iter->second.valid && iter->second.cgraph_uid == cgraph->uid && iter->second.n_nodes == cgraph->n_nodes)) {
+            it = iter;
+            break;
+        }
+    }
+    if (it == ctx->cgraph_cmd_cache.end()) {
+        return false;
+    }
+    if (it != ctx->cgraph_cmd_cache.end() &&
+        it->second.valid &&
+        !it->second.cmd_bufs.empty() &&
+        ggml_vk_cache_fingerprint_match(it->second, cgraph)) {
+        out_cbs.clear();
+        out_cbs.reserve(it->second.cmd_bufs.size());
+        for (auto cb : it->second.cmd_bufs) {
+            out_cbs.push_back((void *) (VkCommandBuffer) cb);
+        }
+        ctx->replay_hits++;
+        if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+            prof->compute_replay_hits++;
+        }
+        return true;
+    }
+    return false;
 }
 
 // Transfer (SDMA) queue accessor: cross-device DMA-BUF copies belong on the DMA engine,

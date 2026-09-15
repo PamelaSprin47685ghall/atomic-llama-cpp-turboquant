@@ -3005,6 +3005,9 @@ extern "C" {
 
     GGML_API void   ggml_graph_add_node(struct ggml_cgraph * cgraph, struct ggml_tensor * tensor);
 
+    GGML_API uint64_t ggml_graph_get_uid(const struct ggml_cgraph * cgraph);
+    GGML_API void     ggml_graph_set_uid(struct ggml_cgraph * cgraph, uint64_t uid);
+
     GGML_API size_t ggml_graph_overhead(void);
     GGML_API size_t ggml_graph_overhead_custom(size_t size, bool grads);
 

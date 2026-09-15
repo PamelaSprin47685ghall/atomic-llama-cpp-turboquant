@@ -2260,7 +2260,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     } tp5_profile_scope;
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
-    const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
+    const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid) || (cgraph->n_nodes != backend_ctx->max_nnodes);
 
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
@@ -2736,7 +2736,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     const size_t hash_pos_ij = ggml_hash_insert(&cgraph_ij->visited_hash_set, node_ij);
                     cgraph_ij->use_counts[hash_pos_ij] = cgraph->use_counts[hash_pos_orig];
                 }
-                cgraph_ij->uid = ggml_graph_next_uid();
+                // Stable UID across decode tokens when graph structure does not change (TP5.md 13.5)
+                // Replay cache in simple backends looks up by cgraph_uid to hit recorded command buffers.
+                uint64_t stable_subgraph_uid = (cgraph->uid != 0) ? ((cgraph->uid << 16) | (uint64_t) i_graph) : ggml_graph_next_uid();
+                cgraph_ij->uid = stable_subgraph_uid;
             }
         }
     }
@@ -2887,21 +2890,65 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     };
 
 
-    for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
-        std::chrono::high_resolution_clock::time_point t_step0;
-        if (backend_ctx->debug > 0) {
-            t_step0 = std::chrono::high_resolution_clock::now();
+    // FAST PATH: Single-submit epoch chain for TP5 decode (O(1) CPU submissions per token)
+    typedef bool (*tp5_submit_epoch_chain_t)(void * comm_ctx,
+                                            const std::vector<std::vector<std::vector<void *>>> & stage_compute_cbs,
+                                            const std::vector<std::vector<ggml_tensor *>> & stage_tensors);
+    typedef bool (*tp5_get_cached_cmd_bufs_t)(ggml_backend_t backend, ggml_cgraph * cgraph, std::vector<void *> & out_cbs);
+    static tp5_submit_epoch_chain_t pfn_submit_chain = nullptr;
+    static tp5_get_cached_cmd_bufs_t pfn_get_cbs = nullptr;
+    static bool pfn_chain_checked = false;
+    if (!pfn_chain_checked && backend_ctx->comm_ctx && n_backends == 5) {
+        pfn_chain_checked = true;
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_ctx->backend_configs[0].backend));
+        pfn_submit_chain = (tp5_submit_epoch_chain_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_submit_epoch_chain");
+        pfn_get_cbs = (tp5_get_cached_cmd_bufs_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_get_cached_cmd_bufs");
+    }
+
+    if (pfn_submit_chain && pfn_get_cbs && backend_ctx->comm_ctx && n_backends == 5) {
+        bool all_replay_cached = true;
+        size_t miss_i = 0, miss_j = 0;
+        std::vector<std::vector<std::vector<void *>>> stage_compute_cbs(backend_ctx->n_subgraphs - 1);
+        std::vector<std::vector<ggml_tensor *>> stage_tensors(backend_ctx->n_subgraphs - 1);
+
+        for (size_t i = 0; i < backend_ctx->n_subgraphs - 1; ++i) {
+            stage_compute_cbs[i].resize(n_backends);
+            stage_tensors[i].resize(n_backends);
+            for (size_t j = 0; j < n_backends; ++j) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+                stage_tensors[i][j] = cgraph_ij->nodes[cgraph_ij->n_nodes - 1];
+                if (!pfn_get_cbs(bcj.backend, cgraph_ij, stage_compute_cbs[i][j])) {
+                    miss_i = i;
+                    miss_j = j;
+                    all_replay_cached = false;
+                    break;
+                }
+            }
+            if (!all_replay_cached) break;
         }
+
+        if (all_replay_cached) {
+            // Submit the entire 96-stage token computation and P2P communication chain in O(1) CPU submits!
+            if (pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors)) {
+                // Execute the final tail subgraph (LM head slice)
+                size_t tail_idx = backend_ctx->n_subgraphs - 1;
+                for (size_t j = 0; j < n_backends; ++j) {
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[tail_idx].cgraph_main);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
                 return GGML_STATUS_FAILED;
             }
-        }
-        std::chrono::high_resolution_clock::time_point t_step1;
-        if (backend_ctx->debug > 0) {
-            t_step1 = std::chrono::high_resolution_clock::now();
         }
 
         if (n_backends > 1 && i < backend_ctx->n_subgraphs - 1) {
@@ -2922,10 +2969,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         pfn_flush(backend_ctx->backend_configs[j].backend);
                     }
                 }
-                std::chrono::high_resolution_clock::time_point t_step2;
-                if (backend_ctx->debug > 0) {
-                    t_step2 = std::chrono::high_resolution_clock::now();
-                }
                 std::vector<ggml_tensor *> nodes;
                 nodes.reserve(n_backends);
                 for (size_t j = 0; j < n_backends; j++) {
@@ -2934,26 +2977,6 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
                 }
                 backend_allreduce_success = backend_ctx->comm_allreduce(backend_ctx->comm_ctx, nodes.data());
-                // In TP5 timeline mode, let subgraphs pipeline asynchronously across stages
-                // without doing any host wait or polling in the loop.
-                if (backend_ctx->debug > 0) {
-                    auto t_step3 = std::chrono::high_resolution_clock::now();
-                    static uint64_t dur_compute = 0, dur_flush = 0, dur_comm = 0;
-                    static int step_cnt = 0;
-                    dur_compute += std::chrono::duration_cast<std::chrono::microseconds>(t_step1 - t_step0).count();
-                    dur_flush   += std::chrono::duration_cast<std::chrono::microseconds>(t_step2 - t_step1).count();
-                    dur_comm    += std::chrono::duration_cast<std::chrono::microseconds>(t_step3 - t_step2).count();
-                    step_cnt++;
-                    const size_t prof_n = backend_ctx->n_subgraphs > 0 ? backend_ctx->n_subgraphs : 1;
-                    if (step_cnt % prof_n == 0) {
-                        fprintf(stderr, "[meta-loop-profile] %zu subgraphs total CPU breakdown: "
-                                        "compute_async=%.2f ms, flush=%.2f ms, comm=%.2f ms | LOOP TOTAL=%.2f ms\n",
-                                prof_n,
-                                dur_compute / 1000.0, dur_flush / 1000.0, dur_comm / 1000.0,
-                                (dur_compute + dur_flush + dur_comm) / 1000.0);
-                        dur_compute = dur_flush = dur_comm = 0;
-                    }
-                }
             }
 
             if (!backend_allreduce_success) {

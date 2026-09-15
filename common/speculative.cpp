@@ -2551,10 +2551,18 @@ common_params common_base_params_to_speculative(const common_params & params) {
     common_params result = params;
 
     if (has_draft) {
-        result.devices               = params_spec.devices;
+        if (params_spec.devices.empty() && !params.devices.empty()) {
+            result.devices = params.devices;
+        }
+        if (!params_spec.devices.empty()) {
+            result.devices           = params_spec.devices;
+        }
         result.model                 = params_spec.mparams;
-        result.n_gpu_layers          = params_spec.n_gpu_layers;
+        result.n_gpu_layers          = (params_spec.n_gpu_layers >= 0) ? params_spec.n_gpu_layers : params.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+            result.split_mode        = LLAMA_SPLIT_MODE_TENSOR;
+        }
 
         if (params_spec.cpuparams.n_threads > 0) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
