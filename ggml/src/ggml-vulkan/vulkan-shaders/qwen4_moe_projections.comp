@@ -1,0 +1,564 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define GGML_TABLE_IQ3_XXS
+#if defined(MOE_ROUTED_IQ2_S_IQ3_XXS)
+#    define GGML_TABLE_IQ2_S
+#else
+#    define GGML_TABLE_IQ3_S
+#endif
+#include "types.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE      = 64;
+layout(constant_id = 1) const uint NUM_ROWS_ROUTED = 1;
+layout(constant_id = 2) const uint NUM_ROWS_SHARED = 1;
+
+#if defined(MOE_ROUTED_IQ2_S_IQ3_XXS)
+layout(std430, binding = 0) readonly buffer RoutedGateWeights {
+    block_iq2_s routed_gate_weights[];
+};
+
+layout(std430, binding = 0) readonly buffer RoutedGateWeightsPacked16 {
+    block_iq2_s_packed16 routed_gate_weights_packed16[];
+};
+
+layout(std430, binding = 1) readonly buffer RoutedUpWeights {
+    block_iq3_xxs routed_up_weights[];
+};
+
+layout(std430, binding = 1) readonly buffer RoutedUpWeightsPacked16 {
+    block_iq3_xxs_packed16 routed_up_weights_packed16[];
+};
+#elif defined(MOE_ROUTED_IQ3_XXS_IQ3_S)
+layout(std430, binding = 0) readonly buffer RoutedGateWeights {
+    block_iq3_xxs routed_gate_weights[];
+};
+
+layout(std430, binding = 0) readonly buffer RoutedGateWeightsPacked16 {
+    block_iq3_xxs_packed16 routed_gate_weights_packed16[];
+};
+
+layout(std430, binding = 1) readonly buffer RoutedUpWeights {
+    block_iq3_s routed_up_weights[];
+};
+
+layout(std430, binding = 1) readonly buffer RoutedUpWeightsPacked16 {
+    block_iq3_s_packed16 routed_up_weights_packed16[];
+};
+#else
+#    error "Either MOE_ROUTED_IQ2_S_IQ3_XXS or MOE_ROUTED_IQ3_XXS_IQ3_S must be defined"
+#endif
+
+layout(std430, binding = 2) readonly buffer SharedGateWeights {
+    block_q6_K shared_gate_weights[];
+};
+
+layout(std430, binding = 2) readonly buffer SharedGateWeightsPacked16 {
+    block_q6_K_packed16 shared_gate_weights_packed16[];
+};
+
+layout(std430, binding = 3) readonly buffer SharedUpWeights {
+    block_q6_K shared_up_weights[];
+};
+
+layout(std430, binding = 3) readonly buffer SharedUpWeightsPacked16 {
+    block_q6_K_packed16 shared_up_weights_packed16[];
+};
+
+layout(std430, binding = 4) readonly buffer CommonInput {
+    float common_input[];
+};
+
+layout(std430, binding = 4) readonly buffer CommonInputV4 {
+    vec4 common_input_v4[];
+};
+
+layout(std430, binding = 5) readonly buffer ExpertIDs {
+    int32_t expert_ids[];
+};
+
+layout(std430, binding = 6) readonly buffer ScalarGateWeights {
+    float scalar_gate_weights[];
+};
+
+layout(std430, binding = 6) readonly buffer ScalarGateWeightsV4 {
+    vec4 scalar_gate_weights_v4[];
+};
+
+layout(std430, binding = 7) writeonly buffer RoutedSwigluOut {
+    float routed_swiglu_out[];
+};
+
+layout(std430, binding = 8) writeonly buffer SharedSwigluOut {
+    float shared_swiglu_out[];
+};
+
+layout(std430, binding = 9) writeonly buffer ScalarGateOut {
+    float scalar_gate_out[];
+};
+
+layout(push_constant) uniform PushParams {
+    uint width;
+    uint expert_k;
+    uint shared_k;
+    uint selected;
+}
+
+p;
+
+shared float sccache[2][BLOCK_SIZE / 16][16];
+
+// The host requires one native-sized subgroup per workgroup.
+void reduce_pair(inout float t_gate[NUM_ROWS_ROUTED], inout float t_up[NUM_ROWS_ROUTED], const uint num_rows) {
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        t_gate[n] = subgroupAdd(t_gate[n]);
+        t_up[n]   = subgroupAdd(t_up[n]);
+    }
+}
+
+#if defined(MOE_ROUTED_IQ2_S_IQ3_XXS)
+
+void compute_routed_pair(const uint first_global_row, const uint num_rows, const uint tid) {
+    const uint num_blocks_per_row = (p.width + 255u) / 256u;
+    const uint blocks_per_wg      = gl_WorkGroupSize.x / 16u;
+    const uint itid               = tid % 16u;
+    const uint ix                 = tid / 16u;
+    const uint nibble_shift       = 4u * (itid & 1u);
+    const uint ib32               = itid / 2u;
+
+    float temp_gate[NUM_ROWS_ROUTED];
+    float temp_up[NUM_ROWS_ROUTED];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS_ROUTED; ++n) {
+        temp_gate[n] = 0.0;
+        temp_up[n]   = 0.0;
+    }
+
+    for (uint i = ix; i < num_blocks_per_row; i += blocks_per_wg) {
+        const uint y_idx = i * 256u + 16u * itid;
+
+        [[unroll]] for (uint l = 0u; l < 2u; ++l) {
+            const vec4 b0 = common_input_v4[y_idx / 4u + 2u * l + 0u];
+            const vec4 b4 = common_input_v4[y_idx / 4u + 2u * l + 1u];
+
+            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                const uint global_row = first_global_row + n;
+                const uint exp_slot   = global_row / p.expert_k;
+                const uint row_in_exp = global_row % p.expert_k;
+                const uint exp_id     = uint(expert_ids[exp_slot]);
+                const uint ibi        = (exp_id * p.expert_k + row_in_exp) * num_blocks_per_row + i;
+
+                // Gate IQ2_S
+                {
+                    const float d     = float(routed_gate_weights[ibi].d);
+                    const uint  scale = (routed_gate_weights[ibi].scales[ib32] >> nibble_shift) & 0xFu;
+                    const float db    = d * (0.5 + float(scale)) * 0.25;
+
+                    const uint    qh     = uint(routed_gate_weights[ibi].qh[ib32]);
+                    const u8vec2  qs16   = unpack8(uint32_t(routed_gate_weights_packed16[ibi].qs[itid])).xy;
+                    const u8vec2  sign16 = unpack8(uint32_t(routed_gate_weights_packed16[ibi].qs[16u + itid])).xy;
+                    const uint8_t sign   = sign16[l];
+                    const uint    qs     = uint(qs16[l]) | ((qh << (8u - nibble_shift - 2u * l)) & 0x300u);
+                    const uvec2   grid   = iq2s_grid[qs];
+                    const vec4    grid0  = vec4(unpack8(grid.x));
+                    const vec4    grid1  = vec4(unpack8(grid.y));
+
+                    const float sum_gate =
+                        fma(b0.x, ((sign & 1u) != 0u ? -grid0.x : grid0.x),
+                            fma(b0.y, ((sign & 2u) != 0u ? -grid0.y : grid0.y),
+                                fma(b0.z, ((sign & 4u) != 0u ? -grid0.z : grid0.z),
+                                    fma(b0.w, ((sign & 8u) != 0u ? -grid0.w : grid0.w),
+                                        fma(b4.x, ((sign & 16u) != 0u ? -grid1.x : grid1.x),
+                                            fma(b4.y, ((sign & 32u) != 0u ? -grid1.y : grid1.y),
+                                                fma(b4.z, ((sign & 64u) != 0u ? -grid1.z : grid1.z),
+                                                    fma(b4.w, ((sign & 128u) != 0u ? -grid1.w : grid1.w), 0.0))))))));
+                    temp_gate[n] = fma(db, sum_gate, temp_gate[n]);
+                }
+
+                // Up IQ3_XXS
+                {
+                    const float d         = float(routed_up_weights[ibi].d);
+                    const uint  signscale = pack32(u16vec2(routed_up_weights_packed16[ibi].qs[32u + 2u * ib32],
+                                                           routed_up_weights_packed16[ibi].qs[32u + 2u * ib32 + 1u]));
+                    const float db        = d * 0.5 * (0.5 + float(signscale >> 28u));
+
+                    const uint qs0   = uint(routed_up_weights[ibi].qs[8u * ib32 + 4u * (itid & 1u) + 2u * l]);
+                    const uint qs1   = uint(routed_up_weights[ibi].qs[8u * ib32 + 4u * (itid & 1u) + 2u * l + 1u]);
+                    const uint sign  = bitfieldExtract(signscale, int(7u * (2u * (itid & 1u) + l)), 7);
+                    const uint sign7 = bitCount(sign);
+                    const vec4 grid0 = vec4(unpack8(iq3xxs_grid[qs0]));
+                    const vec4 grid1 = vec4(unpack8(iq3xxs_grid[qs1]));
+
+                    const float sum_up =
+                        fma(b0.x, ((sign & 1u) != 0u ? -grid0.x : grid0.x),
+                            fma(b0.y, ((sign & 2u) != 0u ? -grid0.y : grid0.y),
+                                fma(b0.z, ((sign & 4u) != 0u ? -grid0.z : grid0.z),
+                                    fma(b0.w, ((sign & 8u) != 0u ? -grid0.w : grid0.w),
+                                        fma(b4.x, ((sign & 16u) != 0u ? -grid1.x : grid1.x),
+                                            fma(b4.y, ((sign & 32u) != 0u ? -grid1.y : grid1.y),
+                                                fma(b4.z, ((sign & 64u) != 0u ? -grid1.z : grid1.z),
+                                                    fma(b4.w, ((sign7 & 1u) != 0u ? -grid1.w : grid1.w), 0.0))))))));
+                    temp_up[n] = fma(db, sum_up, temp_up[n]);
+                }
+            }
+        }
+    }
+
+    reduce_pair(temp_gate, temp_up, num_rows);
+
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const float g                           = temp_gate[n];
+            const float u                           = temp_up[n];
+            const float silu                        = g / (1.0 + exp(-g));
+            routed_swiglu_out[first_global_row + n] = silu * u;
+        }
+    }
+}
+
+#elif defined(MOE_ROUTED_IQ3_XXS_IQ3_S)
+
+void compute_routed_pair(const uint first_global_row, const uint num_rows, const uint tid) {
+    const uint num_blocks_per_row = (p.width + 255u) / 256u;
+
+    float temp_gate[NUM_ROWS_ROUTED];
+    float temp_up[NUM_ROWS_ROUTED];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS_ROUTED; ++n) {
+        temp_gate[n] = 0.0;
+        temp_up[n]   = 0.0;
+    }
+
+    // Pass 1: Gate IQ3_XXS (16 threads per block)
+    {
+        const uint blocks_per_wg16 = gl_WorkGroupSize.x / 16u;
+        const uint itid16          = tid % 16u;
+        const uint ix16            = tid / 16u;
+        const uint ib32            = itid16 / 2u;
+
+        for (uint i = ix16; i < num_blocks_per_row; i += blocks_per_wg16) {
+            const uint y_idx = i * 256u + 16u * itid16;
+
+            [[unroll]] for (uint l = 0u; l < 2u; ++l) {
+                const vec4 b0 = common_input_v4[y_idx / 4u + 2u * l + 0u];
+                const vec4 b4 = common_input_v4[y_idx / 4u + 2u * l + 1u];
+
+                [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                    const uint global_row = first_global_row + n;
+                    const uint exp_slot   = global_row / p.expert_k;
+                    const uint row_in_exp = global_row % p.expert_k;
+                    const uint exp_id     = uint(expert_ids[exp_slot]);
+                    const uint ibi        = (exp_id * p.expert_k + row_in_exp) * num_blocks_per_row + i;
+
+                    const float d         = float(routed_gate_weights[ibi].d);
+                    const uint  signscale = pack32(u16vec2(routed_gate_weights_packed16[ibi].qs[32u + 2u * ib32],
+                                                           routed_gate_weights_packed16[ibi].qs[32u + 2u * ib32 + 1u]));
+                    const float db        = d * 0.5 * (0.5 + float(signscale >> 28u));
+
+                    const uint qs0   = uint(routed_gate_weights[ibi].qs[8u * ib32 + 4u * (itid16 & 1u) + 2u * l]);
+                    const uint qs1   = uint(routed_gate_weights[ibi].qs[8u * ib32 + 4u * (itid16 & 1u) + 2u * l + 1u]);
+                    const uint sign  = bitfieldExtract(signscale, int(7u * (2u * (itid16 & 1u) + l)), 7);
+                    const uint sign7 = bitCount(sign);
+                    const vec4 grid0 = vec4(unpack8(iq3xxs_grid[qs0]));
+                    const vec4 grid1 = vec4(unpack8(iq3xxs_grid[qs1]));
+
+                    const float sum_gate =
+                        fma(b0.x, ((sign & 1u) != 0u ? -grid0.x : grid0.x),
+                            fma(b0.y, ((sign & 2u) != 0u ? -grid0.y : grid0.y),
+                                fma(b0.z, ((sign & 4u) != 0u ? -grid0.z : grid0.z),
+                                    fma(b0.w, ((sign & 8u) != 0u ? -grid0.w : grid0.w),
+                                        fma(b4.x, ((sign & 16u) != 0u ? -grid1.x : grid1.x),
+                                            fma(b4.y, ((sign & 32u) != 0u ? -grid1.y : grid1.y),
+                                                fma(b4.z, ((sign & 64u) != 0u ? -grid1.z : grid1.z),
+                                                    fma(b4.w, ((sign7 & 1u) != 0u ? -grid1.w : grid1.w), 0.0))))))));
+                    temp_gate[n] = fma(db, sum_gate, temp_gate[n]);
+                }
+            }
+        }
+    }
+
+    // Pass 2: Up IQ3_S (8 threads per block)
+    {
+        const uint blocks_per_wg8 = gl_WorkGroupSize.x / 8u;
+        const uint itid8          = tid % 8u;
+        const uint ix8            = tid / 8u;
+        const uint ib32           = itid8;
+
+        for (uint i = ix8; i < num_blocks_per_row; i += blocks_per_wg8) {
+            const uint y_idx = i * 256u + 32u * ib32;
+
+            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                const uint global_row = first_global_row + n;
+                const uint exp_slot   = global_row / p.expert_k;
+                const uint row_in_exp = global_row % p.expert_k;
+                const uint exp_id     = uint(expert_ids[exp_slot]);
+                const uint ibi        = (exp_id * p.expert_k + row_in_exp) * num_blocks_per_row + i;
+
+                const float d      = float(routed_up_weights[ibi].d);
+                const uint  scale  = (uint(routed_up_weights[ibi].scales[ib32 / 2u]) >> (4u * (ib32 & 1u))) & 0xFu;
+                const float dscale = d * (1.0 + 2.0 * float(scale));
+                const uint  qh     = uint(routed_up_weights[ibi].qh[ib32]);
+
+                float sum_up = 0.0;
+                [[unroll]] for (uint l = 0u; l < 4u; ++l) {
+                    const u8vec2 qs    = unpack8(uint32_t(routed_up_weights_packed16[ibi].qs[4u * ib32 + l])).xy;
+                    const uint   sign  = uint(routed_up_weights[ibi].signs[4u * ib32 + l]);
+                    const vec4   grid0 = vec4(unpack8(iq3s_grid[uint(qs.x) | ((qh << (8u - 2u * l)) & 0x100u)]));
+                    const vec4   grid1 = vec4(unpack8(iq3s_grid[uint(qs.y) | ((qh << (7u - 2u * l)) & 0x100u)]));
+
+                    const vec4 b0 = common_input_v4[y_idx / 4u + 2u * l + 0u];
+                    const vec4 b4 = common_input_v4[y_idx / 4u + 2u * l + 1u];
+
+                    sum_up = fma(
+                        b0.x, ((sign & 1u) != 0u ? -grid0.x : grid0.x),
+                        fma(b0.y, ((sign & 2u) != 0u ? -grid0.y : grid0.y),
+                            fma(b0.z, ((sign & 4u) != 0u ? -grid0.z : grid0.z),
+                                fma(b0.w, ((sign & 8u) != 0u ? -grid0.w : grid0.w),
+                                    fma(b4.x, ((sign & 16u) != 0u ? -grid1.x : grid1.x),
+                                        fma(b4.y, ((sign & 32u) != 0u ? -grid1.y : grid1.y),
+                                            fma(b4.z, ((sign & 64u) != 0u ? -grid1.z : grid1.z),
+                                                fma(b4.w, ((sign & 128u) != 0u ? -grid1.w : grid1.w), sum_up))))))));
+                }
+                temp_up[n] = fma(dscale, sum_up, temp_up[n]);
+            }
+        }
+    }
+
+    reduce_pair(temp_gate, temp_up, num_rows);
+
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const float g                           = temp_gate[n];
+            const float u                           = temp_up[n];
+            const float silu                        = g / (1.0 + exp(-g));
+            routed_swiglu_out[first_global_row + n] = silu * u;
+        }
+    }
+}
+
+#endif
+
+void calc_superblock_q6_k(const bool  is_gate,
+                          const uint  itid,
+                          const uint  ix,
+                          const uint  ql_offset,
+                          const uint  qh_offset,
+                          const uint  s_offset,
+                          const uint  y_offset,
+                          const uint  i,
+                          const uint  num_blocks_per_row,
+                          const uint  first_row,
+                          const uint  num_rows,
+                          const bool  all_threads,
+                          inout float t[NUM_ROWS_SHARED],
+                          inout uint  csel) {
+    const uint y_idx = i * 256u + y_offset;
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint ib0 = (first_row + n) * num_blocks_per_row;
+        csel ^= 1u;
+
+        if (!all_threads) {
+            if (i < num_blocks_per_row) {
+                sccache[csel][ix][itid] = is_gate ? float(shared_gate_weights[ib0 + i].scales[itid]) :
+                                                    float(shared_up_weights[ib0 + i].scales[itid]);
+            }
+            barrier();
+
+            if (i >= num_blocks_per_row)
+                continue;
+        }
+
+        const uint32_t ql0_u32 = is_gate ?
+                                     (uint32_t(shared_gate_weights_packed16[ib0 + i].ql[ql_offset / 2u]) |
+                                      (uint32_t(shared_gate_weights_packed16[ib0 + i].ql[ql_offset / 2u + 1u]) << 16)) :
+                                     (uint32_t(shared_up_weights_packed16[ib0 + i].ql[ql_offset / 2u]) |
+                                      (uint32_t(shared_up_weights_packed16[ib0 + i].ql[ql_offset / 2u + 1u]) << 16));
+        const uint32_t ql32_u32 =
+            is_gate ? (uint32_t(shared_gate_weights_packed16[ib0 + i].ql[ql_offset / 2u + 16u]) |
+                       (uint32_t(shared_gate_weights_packed16[ib0 + i].ql[ql_offset / 2u + 17u]) << 16)) :
+                      (uint32_t(shared_up_weights_packed16[ib0 + i].ql[ql_offset / 2u + 16u]) |
+                       (uint32_t(shared_up_weights_packed16[ib0 + i].ql[ql_offset / 2u + 17u]) << 16));
+
+        const uint32_t ql0_u32_lo4  = ql0_u32 & 0x0F0F0F0Fu;
+        const uint32_t ql0_u32_hi4  = (ql0_u32 >> 4) & 0x0F0F0F0Fu;
+        const uint32_t ql32_u32_lo4 = ql32_u32 & 0x0F0F0F0Fu;
+        const uint32_t ql32_u32_hi4 = (ql32_u32 >> 4) & 0x0F0F0F0Fu;
+
+        const uint32_t qh_u32  = is_gate ?
+                                     (uint32_t(shared_gate_weights_packed16[ib0 + i].qh[qh_offset / 2u]) |
+                                     (uint32_t(shared_gate_weights_packed16[ib0 + i].qh[qh_offset / 2u + 1u]) << 16)) :
+                                     (uint32_t(shared_up_weights_packed16[ib0 + i].qh[qh_offset / 2u]) |
+                                     (uint32_t(shared_up_weights_packed16[ib0 + i].qh[qh_offset / 2u + 1u]) << 16));
+        const uint32_t qh0_u32 = (qh_u32 & 0x03030303u) << 4;
+        const uint32_t qh2_u32 = (qh_u32 & 0x0C0C0C0Cu) << 2;
+        const uint32_t qh4_u32 = (qh_u32 & 0x30303030u);
+        const uint32_t qh6_u32 = (qh_u32 & 0xC0C0C0C0u) >> 2;
+
+        const uint32_t q0_u32 = ql0_u32_lo4 | qh0_u32;
+        const uint32_t q1_u32 = ql32_u32_lo4 | qh2_u32;
+        const uint32_t q2_u32 = ql0_u32_hi4 | qh4_u32;
+        const uint32_t q3_u32 = ql32_u32_hi4 | qh6_u32;
+
+        const vec4 q0 = vec4(unpack8(q0_u32)) - 32.0;
+        const vec4 q1 = vec4(unpack8(q1_u32)) - 32.0;
+        const vec4 q2 = vec4(unpack8(q2_u32)) - 32.0;
+        const vec4 q3 = vec4(unpack8(q3_u32)) - 32.0;
+
+        if (all_threads) {
+            sccache[csel][ix][itid] = is_gate ? float(shared_gate_weights[ib0 + i].scales[itid]) :
+                                                float(shared_up_weights[ib0 + i].scales[itid]);
+            barrier();
+        }
+
+        const float d = is_gate ? float(shared_gate_weights[ib0 + i].d) : float(shared_up_weights[ib0 + i].d);
+
+        const vec4 by0  = common_input_v4[y_idx / 4u];
+        const vec4 by32 = common_input_v4[y_idx / 4u + 8u];
+        const vec4 by64 = common_input_v4[y_idx / 4u + 16u];
+        const vec4 by96 = common_input_v4[y_idx / 4u + 24u];
+
+        float sum[4] = { 0.0, 0.0, 0.0, 0.0 };
+        [[unroll]] for (uint l = 0u; l < 4u; ++l) {
+            sum[0] = fma(by0[l], q0[l], sum[0]);
+            sum[1] = fma(by32[l], q1[l], sum[1]);
+            sum[2] = fma(by64[l], q2[l], sum[2]);
+            sum[3] = fma(by96[l], q3[l], sum[3]);
+        }
+        t[n] = fma(fma(sum[0], sccache[csel][ix][s_offset],
+                       fma(sum[1], sccache[csel][ix][s_offset + 2u],
+                           fma(sum[2], sccache[csel][ix][s_offset + 4u], sum[3] * sccache[csel][ix][s_offset + 6u]))),
+                   d, t[n]);
+    }
+}
+
+void compute_shared_q6(const uint first_shared_row, const uint num_rows, const uint tid) {
+    const uint num_blocks_per_row = (p.width + 255u) / 256u;
+    const uint it_size            = gl_WorkGroupSize.x / 16u;
+    const uint itid               = tid % 16u;
+    const uint ix                 = tid / 16u;
+
+    const uint v_im     = itid / 8u;
+    const uint v_in     = itid - 8u * v_im;
+    const uint l0       = 4u * v_in;
+    const uint is_scale = v_in / 4u;
+
+    const uint ql_offset = 64u * v_im + l0;
+    const uint qh_offset = 32u * v_im + l0;
+    const uint s_offset  = 8u * v_im + is_scale;
+    const uint y_offset  = 128u * v_im + l0;
+
+    float temp_gate[NUM_ROWS_SHARED];
+    float temp_up[NUM_ROWS_SHARED];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS_SHARED; ++n) {
+        temp_gate[n] = 0.0;
+        temp_up[n]   = 0.0;
+    }
+
+    const uint nbr_par_th = num_blocks_per_row % it_size;
+    const uint nbr_all_th = num_blocks_per_row - nbr_par_th;
+
+    // Gate Q6_K pass
+    uint csel = 0u;
+    uint i0   = 0u;
+    [[unroll]] for (; i0 < nbr_all_th; i0 += it_size) {
+        calc_superblock_q6_k(true, itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix, num_blocks_per_row,
+                             first_shared_row, num_rows, true, temp_gate, csel);
+    }
+    calc_superblock_q6_k(true, itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix, num_blocks_per_row,
+                         first_shared_row, num_rows, false, temp_gate, csel);
+
+    barrier();
+
+    // Up Q6_K pass
+    csel = 0u;
+    i0   = 0u;
+    [[unroll]] for (; i0 < nbr_all_th; i0 += it_size) {
+        calc_superblock_q6_k(false, itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix, num_blocks_per_row,
+                             first_shared_row, num_rows, true, temp_up, csel);
+    }
+    calc_superblock_q6_k(false, itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix, num_blocks_per_row,
+                         first_shared_row, num_rows, false, temp_up, csel);
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        temp_gate[n] = subgroupAdd(temp_gate[n]);
+        temp_up[n]   = subgroupAdd(temp_up[n]);
+    }
+
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            const float g                           = temp_gate[n];
+            const float u                           = temp_up[n];
+            const float silu                        = g / (1.0 + exp(-g));
+            shared_swiglu_out[first_shared_row + n] = silu * u;
+        }
+    }
+}
+
+void compute_scalar_gate(const uint tid) {
+    const uint num_v4 = p.width / 4u;
+    float      sum    = 0.0;
+    for (uint i = tid; i < num_v4; i += gl_WorkGroupSize.x) {
+        const vec4 a = scalar_gate_weights_v4[i];
+        const vec4 b = common_input_v4[i];
+        sum          = fma(a.x, b.x, fma(a.y, b.y, fma(a.z, b.z, fma(a.w, b.w, sum))));
+    }
+    for (uint i = num_v4 * 4u + tid; i < p.width; i += gl_WorkGroupSize.x) {
+        sum = fma(scalar_gate_weights[i], common_input[i], sum);
+    }
+
+    const float final_sum = subgroupAdd(sum);
+    if (tid == 0) {
+        scalar_gate_out[0] = final_sum;
+    }
+}
+
+void main() {
+    const uint wg_id = gl_WorkGroupID.x;
+    const uint tid   = gl_LocalInvocationID.x;
+
+    const uint total_routed_rows = p.selected * p.expert_k;
+    const uint routed_wgs        = (total_routed_rows + NUM_ROWS_ROUTED - 1u) / NUM_ROWS_ROUTED;
+    const uint shared_wgs        = (p.shared_k + NUM_ROWS_SHARED - 1u) / NUM_ROWS_SHARED;
+
+    if (wg_id < routed_wgs) {
+#if defined(MOE_ROUTED_IQ2_S_IQ3_XXS)
+        init_iq2s_shmem(gl_WorkGroupSize);
+#else
+        init_iq3s_shmem(gl_WorkGroupSize);
+#endif
+        init_iq3xxs_shmem(gl_WorkGroupSize);
+        const uint first_global_row = wg_id * NUM_ROWS_ROUTED;
+        if (first_global_row >= total_routed_rows) {
+            return;
+        }
+        // Match native matvec's constant full-tile instance. A dynamic min()
+        // changes RADV's loop lowering and floating-point contraction order.
+        if (first_global_row + NUM_ROWS_ROUTED <= total_routed_rows) {
+            compute_routed_pair(first_global_row, NUM_ROWS_ROUTED, tid);
+        } else {
+            compute_routed_pair(first_global_row, total_routed_rows - first_global_row, tid);
+        }
+    } else if (wg_id < routed_wgs + shared_wgs) {
+        const uint shared_wg_id     = wg_id - routed_wgs;
+        const uint first_shared_row = shared_wg_id * NUM_ROWS_SHARED;
+        if (first_shared_row >= p.shared_k) {
+            return;
+        }
+        if (first_shared_row + NUM_ROWS_SHARED <= p.shared_k) {
+            compute_shared_q6(first_shared_row, NUM_ROWS_SHARED, tid);
+        } else {
+            compute_shared_q6(first_shared_row, p.shared_k - first_shared_row, tid);
+        }
+    } else if (wg_id == routed_wgs + shared_wgs) {
+        compute_scalar_gate(tid);
+    }
+}

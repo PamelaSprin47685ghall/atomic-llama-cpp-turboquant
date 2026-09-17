@@ -1,22 +1,20 @@
 #version 450
 
-// TP5 HC F3: fold four HC streams after local up+sigmoid (TP5.md §9.3).
-// Standalone shader; integration gated by GGML_TP5_HC_F3 until target-machine validation.
+// Fold four HC streams after their gates have been computed. Each invocation
+// owns four adjacent hidden elements; no cross-workgroup synchronization.
 
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-
-layout(local_size_x = 256) in;
+layout(local_size_x = 64) in;
 
 layout(std430, binding = 0) readonly buffer GateBuf {
-    float gate[];
+    vec4 gate[];
 };
 
 layout(std430, binding = 1) readonly buffer LoBuf {
-    float lo[];
+    vec4 lo[];
 };
 
 layout(std430, binding = 2) writeonly buffer OutBuf {
-    float out_data[];
+    vec4 out_data[];
 };
 
 layout(push_constant) uniform Params {
@@ -27,12 +25,17 @@ layout(push_constant) uniform Params {
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
-    if (i >= p.n_elems) {
+    uint stride = p.n_elems / 4u;
+    if (i >= stride) {
         return;
     }
-    float acc = 0.0;
-    for (uint s = 0u; s < p.n_streams; ++s) {
-        acc += gate[s * p.n_elems + i] * lo[s * p.n_elems + i];
+    // Match the unfused MUL, ADD, ADD, ADD, SCALE order. In particular, do
+    // not contract a multiply into an add or introduce an initial +0.
+    precise vec4 acc = gate[i] * lo[i];
+    for (uint s = 1u; s < p.n_streams; ++s) {
+        precise vec4 product = gate[s * stride + i] * lo[s * stride + i];
+        acc                  = acc + product;
     }
-    out_data[i] = acc * p.inv_c;
+    precise vec4 result = acc * p.inv_c;
+    out_data[i]         = result;
 }

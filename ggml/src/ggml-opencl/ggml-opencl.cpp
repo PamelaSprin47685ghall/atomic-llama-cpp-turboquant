@@ -7488,11 +7488,11 @@ static ggml_guid_t ggml_backend_opencl_guid() {
 static ggml_backend_i ggml_backend_opencl_i = {
     /* .get_name                = */ ggml_backend_opencl_name,
     /* .free                    = */ ggml_backend_opencl_free,
-    /* .set_tensor_async        = */ NULL,  /* ggml_backend_opencl_set_tensor_async */
-    /* .get_tensor_async        = */ NULL,  /* ggml_backend_opencl_get_tensor_async */
+    /* .set_tensor_async        = */ NULL, /* ggml_backend_opencl_set_tensor_async */
+    /* .get_tensor_async        = */ NULL, /* ggml_backend_opencl_get_tensor_async */
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
-    /* .cpy_tensor_async        = */ NULL,  /* ggml_backend_opencl_cpy_tensor_async */
+    /* .cpy_tensor_async        = */ NULL, /* ggml_backend_opencl_cpy_tensor_async */
     /* .synchronize             = */ ggml_backend_opencl_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
@@ -7502,6 +7502,7 @@ static ggml_backend_i ggml_backend_opencl_i = {
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
     /* .graph_optimize          = */ NULL,
+    /* .set_tensor_snapshot_async = */ NULL,
 };
 
 ggml_backend_t ggml_backend_opencl_init(void) {

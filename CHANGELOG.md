@@ -12,7 +12,127 @@ Releases before `b10269-1.5.0` predate this file; see the git history.
 
 ## Unreleased
 
+Earlier TP5 measurements using `--no-mmap` ran with an empty lazy PLE table.
+Those historical throughput and GPU-to-GPU equivalence results are not
+full-model correctness acceptance; repaired-model measurements are required.
+
+### Fixed
+
+- **Whole-region Vulkan decode and collective boundaries.** GDN, attention,
+  routed/shared MoE, and HC regions preserve their native arithmetic and cache
+  ownership while eliminating intermediate dispatches. Terminal producers can
+  emit the exact F16 wire representation alongside their F32 output; repeated
+  reductions without a new producer still repack current data. Sparse mask
+  compaction can share attention preparation, with independent-buffer fallback.
+  The verified five-card checkpoint records 669 compute + 96 collective
+  dispatches per token and bitwise-identical 280-step canonical logits. HC
+  SUM/normalization fusion is numerically checked but is not an independently
+  proven throughput improvement. The no-MTP 50 tok/s target remains unmet;
+  further 8-to-6 dispatch lowering is paused at the user's request.
+
+- **Bounded meta reconstruction and replay validation.** Reduction subgraphs
+  allocate graph/hash capacity for their own spans rather than the entire model.
+  Deferral analysis indexes nodes through the existing graph identity hash and
+  stops ancestor traversal at the current reduction boundary. Replay validates
+  current live bindings, shapes, operation parameters, offsets, and Vulkan
+  buffers without dereferencing retired captured tensor addresses; splitting
+  a formerly shared source still invalidates its recorded bindings. See `TP5.md`
+  for measured cold/warm costs and the remaining collective-recording bottleneck.
+  Interrupted shared-P1 ownership scaffolding is not part of this checkpoint.
+
+- **CPU attention honors explicit F32 accumulation.** F16 value caches no
+  longer force F16 accumulators when `GGML_PREC_F32` is requested. Both direct
+  decode and split-KV paths retain F32 value sums through online-softmax
+  rescaling. A constant-value regression drops from roughly 3.88e-4 error to
+  1.19e-7; the default-precision path and cache storage types are unchanged.
+
+- **Vulkan replay preserves pending uploads.** Pinned host uploads and event
+  waits on the ordinary compute context are flushed asynchronously before
+  recording or submitting replay buffers, rather than discarded by a context
+  reset. A minimal pinned-upload regression failed before the repair. The real
+  five-GPU layer model now produces bitwise-identical replay/non-replay logits
+  across 11 positions and the complete 248320-token vocabulary.
+
+- **Lazy tensor payload and lifetime.** On-demand tables remain mapped after
+  loader retirement, including when other weights use non-mmap loading.
+  Preallocated fallback buffers are loaded instead of silently left empty.
+  This fixes both a CPU PLE gather crash and zero PLE results under `--no-mmap`.
+  Regression coverage includes mapped-only, eager-fallback, and mixed contexts.
+  The real GPU PLE gather now matches all 2560 CPU elements bitwise; CPU mmap
+  and non-mmap loading match over 11×248320 logits. Full CPU/GPU model parity
+  remains a separate acceptance check.
+
+- **Ordinary Qwen4EXP recurrence and Vulkan HC fold.** Indexed hybrid memory now
+  forwards explicit RERoT capacities instead of enabling grouped recurrence when
+  RERoT is off, and preserves the requested recurrent capacity. Four-stream HC
+  folds now match the native 11-node multiply/reshape/reduce graph, with the
+  original floating-point order. Graph optimization preserves the fold and its
+  input lifetimes; Vulkan roots are at least 16-byte aligned. Unaligned views
+  and externally observed intermediates retain the unfused path. Real-model
+  profiling confirms 1057 fused calls per rank across the 11-position tape,
+  with all 11×248320 logits bitwise unchanged. Complete 171-token counting
+  reaches 5.69–5.72 tok/s after the PLE repair, not the 100 tok/s goal.
+
+- **Qwen4EXP tensor-split GDN layout.** Native Q/K/V projections, convolution
+  histories, and per-head decay parameters now use the same repeated-segment
+  ownership. Column-parallel matmul and convolution preserve that layout instead
+  of collapsing it into contiguous rank slices. A five-rank CPU regression
+  matches 10,240 convolution outputs and 48 decay gates exactly; bounded
+  five-GPU counting and arithmetic requests now produce correct text. This is
+  not full-model numerical or 100 tok/s acceptance; see `TP5.md` for limits.
+
+- **Vulkan indexed replay and GDN fusion.** Device-side gather/scatter operations
+  may replay with changing indices and cache writes; the new six-round regression
+  checks all cache rows exactly. Native-layout tensor inference again uses normal
+  fused-GDN capability detection. Bounded, non-speculative five-GPU counting
+  improved from 3.17 to 4.27 tok/s while preserving the tested answers; these are
+  short samples, not sustained-throughput acceptance. Replay profile counters now
+  distinguish queue API calls from submission batches correctly.
+
+- **Vulkan TP5 R=2 correctness and fused submission.** Both reduction phases now
+  use the same aligned two-bank mailbox mapping. Replay plans retain their
+  buffers, validate source bindings and scratch generations, and register
+  externally submitted work for synchronization. Adjacent SUM/compute/PUSH
+  stages are fused without dropping required memory dependencies. Five-RX-6800
+  F16/F32 numerical and dependent-replay checks pass; warm 96-stage paired
+  median speedups are 1.660×/1.462× (microbenchmark, not end-to-end or tail-latency
+  guarantees). See `TP5.md` for protocol, complete timing samples, and limits.
+
 ### Added
+
+- **Owned asynchronous input snapshots; backend plugin ABI 3.** Supporting
+  backends capture host bytes before returning and order destination writes
+  after prior device work, so callers may immediately reuse the host storage.
+  Composite backends check all destinations before capture. Backends without
+  this capability retain the existing synchronized path. Out-of-tree backend
+  plugins must be rebuilt for the new interface version.
+
+- **Opt-in replicated TP5 attention/GDN.** `GGML_TP5_REPLICATE_ATTN=1`
+  mirrors native attention weights and caches while retaining expert channel
+  partitioning. The real five-GPU model executes 48 rather than 96 reductions;
+  complete 171-token counting requests measure 5.35–5.40 tok/s, not 100 tok/s.
+  Peak observed VRAM is about 13.25 GiB per card. CPU/GPU full-model numerical
+  acceptance remains open. The header-only inspector supports the matching
+  `--replicate-attention` mode and fixes double-counted KV layer instances.
+
+- **Single-submission decode chain includes the model tail.** The final
+  non-reducing subgraph now travels inside each rank's one batched submission
+  instead of a separate async submit per rank, so the completion signal and the
+  tail it must order are published together. The hot path records five queue
+  API calls and 485 submission batches per decode graph; these are not driver
+  submit counts. Mesh tests verify a dependent GPU tail against a CPU oracle
+  and reject malformed tails before submission. Short model requests are
+  correct, but no isolated throughput improvement from tail batching is proven.
+  After correcting an earlier pre-change artifact mix-up, a fresh capture
+  hitting the five-call path matches non-replay over 11×248320 logits bitwise.
+
+- **TP5 replay-chain GPU timing.** `GGML_TP5_GPU_TIMING=N` captures one
+  timeline chain with per-rank SUM/compute/PUSH intervals and inter-batch gaps.
+  The same capture reports host queue-call durations and compute, collective,
+  and marker command-buffer counts after every rank has been submitted.
+  Queries are availability-only and never reused in flight. Extra command
+  buffers and barriers perturb timing; use separate runs for throughput.
+
 
 - **FlashPrefill V2 sparse prefill (experimental, opt-in, default off;
   implementation and compile delivered, runtime acceptance NOT RUN).**

@@ -574,7 +574,7 @@ static ggml_backend_i ggml_backend_metal_i = {
     /* .get_tensor_async        = */ ggml_backend_metal_get_tensor_async,
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
-    /* .cpy_tensor_async        = */ ggml_backend_metal_cpy_tensor_async, // only needed for multi-GPU setups
+    /* .cpy_tensor_async        = */ ggml_backend_metal_cpy_tensor_async,  // only needed for multi-GPU setups
     /* .synchronize             = */ ggml_backend_metal_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
@@ -584,6 +584,7 @@ static ggml_backend_i ggml_backend_metal_i = {
     /* .event_record            = */ ggml_backend_metal_event_record,
     /* .event_wait              = */ ggml_backend_metal_event_wait,
     /* .graph_optimize          = */ ggml_backend_metal_graph_optimize,
+    /* .set_tensor_snapshot_async = */ NULL,
 };
 
 static ggml_guid_t ggml_backend_metal_guid(void) {

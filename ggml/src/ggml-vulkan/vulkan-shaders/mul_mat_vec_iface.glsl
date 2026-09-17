@@ -27,7 +27,36 @@ layout (binding = 1) readonly buffer BV4 {B_TYPEV4 data_b_v4[];};
 layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
 layout (binding = 3) readonly buffer Fuse0 {D_TYPE data_fuse0[];};
+#ifdef MOE_SHARED_UP_SWIGLU
+layout(binding = 3) readonly buffer Gate {
+    A_TYPE data_gate[];
+};
+
+layout(binding = 3) readonly buffer GatePacked {
+    A_TYPE_PACKED16 data_gate_packed16[];
+};
+#endif
 layout (binding = 4) readonly buffer Fuse1 {D_TYPE data_fuse1[];};
+
+#ifdef MUL_MAT_ID
+#    ifdef TP5_WIRE_OUTPUT
+#        ifdef MOE_DOWN_FOLD
+#            ifdef MOE_FUSE_SHARED_DOWN
+layout(binding = 9) writeonly buffer WireOut {
+    float16_t data_wire[];
+};
+#            else
+layout(binding = 8) writeonly buffer WireOut {
+    float16_t data_wire[];
+};
+#            endif
+#        endif
+#    endif
+#elif defined(TP5_WIRE_OUTPUT)
+layout(binding = 5) writeonly buffer WireOut {
+    float16_t data_wire[];
+};
+#endif
 
 #ifdef MUL_MAT_ID
 layout (binding = 5) readonly buffer IDS {int data_ids[];};
@@ -35,4 +64,30 @@ layout (binding = 5) readonly buffer IDS {int data_ids[];};
 #ifdef MUL_MAT_ID_GROUPED
 layout (binding = 6) readonly buffer EXPERT_COUNTS {uint data_expert_count[];};
 #endif
+#ifdef MOE_DOWN_FOLD
+#    ifdef MOE_FUSE_SHARED_DOWN
+layout(binding = 6) readonly buffer SharedDownWeights {
+    block_q8_0 data_shared_down[];
+};
 
+layout(binding = 6) readonly buffer SharedDownWeightsPacked {
+    block_q8_0_packed16 data_shared_down_packed16[];
+};
+
+layout(binding = 7) readonly buffer SharedGate {
+    float shared_gate[];
+};
+
+layout(binding = 8) readonly buffer SharedSwiglu {
+    float shared_swiglu[];
+};
+#    else
+layout(binding = 6) readonly buffer SharedDown {
+    float shared_down[];
+};
+
+layout(binding = 7) readonly buffer SharedGate {
+    float shared_gate[];
+};
+#    endif
+#endif

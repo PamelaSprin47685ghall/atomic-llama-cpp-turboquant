@@ -51,14 +51,18 @@ bool split_heads_quant(int64_t n, uint32_t ranks, int64_t unit, int64_t blck,
 }
 
 bool is_moe_gate_up(const std::string & base) {
-    return base == "ffn_gate_exps.weight" || base == "ffn_up_exps.weight";
+    return base == "ffn_gate_exps.weight" || base == "ffn_up_exps.weight" || base == "ffn_gate_exp.weight" ||
+           base == "ffn_up_exp.weight" || base == "ffn_gate_up_exps.weight" || base == "ffn_gate_up_exp.weight";
 }
 
 } // namespace
 
-bool llama_tp5_plan_build(const llama_hparams & hp, uint32_t n_devices,
-                          int64_t n_vocab,
-                          llama_tp5_plan & out, llama_tp5_error & err) {
+bool llama_tp5_plan_build(const llama_hparams & hp,
+                          uint32_t              n_devices,
+                          int64_t               n_vocab,
+                          bool                  replicate_attention,
+                          llama_tp5_plan &      out,
+                          llama_tp5_error &     err) {
     if (n_devices < 2 || n_devices > LLAMA_TP5_MAX_RANKS) {
         err.code = "TP5_E_RANKS";
         err.detail = "ranks=" + std::to_string(n_devices) + " (2..8 supported)";
@@ -67,6 +71,7 @@ bool llama_tp5_plan_build(const llama_hparams & hp, uint32_t n_devices,
 
     out = {};
     out.ranks = n_devices;
+    out.replicate_attention = replicate_attention;
     out.H  = hp.n_embd;
     out.L  = hp.n_layer();
     out.C  = hp.dsv4_hc_mult;
@@ -106,31 +111,63 @@ bool llama_tp5_plan_build(const llama_hparams & hp, uint32_t n_devices,
     out.is_recr.resize(total_layers);
     out.n_full = 0;
     for (size_t il = 0; il < total_layers; ++il) {
-        out.is_recr[il] = il < hp.n_layer_all ? hp.is_recr((uint32_t) il) : false;
+        // Qwen4EXP pattern: full attention every 4th layer (3, 7, 11, 15, ...), others are linear/GDN
+        out.is_recr[il] = (il < (size_t) out.L) && ((il + 1) % 4 != 0);
         if (il < (size_t) out.L && !out.is_recr[il]) out.n_full++;
+    }
+
+    if (out.Nkv <= 0 || out.Nq <= 0 || out.Nq % out.Nkv != 0) {
+        err.code   = "TP5_E_Q_SPLIT";
+        err.detail = "query heads must form complete nonempty GQA groups";
+        return false;
+    }
+
+    if (replicate_attention) {
+        for (uint32_t r = 0; r < n_devices; ++r) {
+            out.q_role_counts[r]  = out.Nq;
+            out.kv_role_counts[r] = out.Nkv;
+            out.kv_instances[r]   = out.n_full * out.Nkv;
+            out.gdn_v_heads[r]    = out.Nv;
+            out.gdn_qk_heads[r]   = out.Nk;
+            out.gdn_v_ranges.push_back({ 0, out.Nv });
+        }
+        out.expected_events = (uint32_t) out.L;
+        return true;
     }
 
     // --- QSA roles (TP5.md 7.1) ---
     {
-        std::string serr;
-        std::array<int32_t, LLAMA_TP5_MAX_RANKS> q{};
-        if (!split_heads_quant(out.Nq, n_devices, 2 * out.da, 2 * out.da, q, serr)) {
-            // q|gate interleave means rows move in 2*da units; any whole-head
-            // boundary is legal for the row split, so unit==blck is fine here
+        if (out.Nq < n_devices) {
             err.code = "TP5_E_Q_SPLIT";
-            err.detail = serr;
+            err.detail = "not enough query heads for nonempty rank-local attention";
             return false;
         }
-        for (uint32_t r = 0; r < n_devices; ++r) out.q_role_counts[r] = q[r];
-        // KV role table: bridge role (index 2) holds both KV heads
-        for (uint32_t r = 0; r < n_devices; ++r) out.kv_role_counts[r] = 1;
-        if (n_devices > 2) out.kv_role_counts[2] = 2;
-        // rotated instances per physical rank (TP5.md 4.4)
-        for (uint32_t r = 0; r < n_devices; ++r) out.kv_instances[r] = 0;
-        for (uint32_t o = 0; o < out.n_full; ++o) {
-            for (uint32_t role = 0; role < n_devices; ++role) {
-                out.kv_instances[(role + o) % n_devices] += out.kv_role_counts[role];
+        const int64_t q_per_kv = out.Nq / out.Nkv;
+        if (n_devices <= out.Nkv) {
+            int32_t first_kv = 0;
+            for (uint32_t r = 0; r < n_devices; ++r) {
+                const int32_t count   = (int32_t) (out.Nkv / n_devices + (r < out.Nkv % n_devices));
+                out.q_role_counts[r]  = (int32_t) (count * q_per_kv);
+                out.kv_role_counts[r] = count;
+                out.kv_head_starts[r] = first_kv;
+                first_kv += count;
             }
+        } else {
+            // Replicate a KV head only within its own query group. A rank must
+            // never straddle unequal portions of two groups: local GQA uses a
+            // single uniform query/KV ratio, not an arbitrary head map.
+            uint32_t rank = 0;
+            for (int64_t kv = 0; kv < out.Nkv; ++kv) {
+                const int64_t parts = n_devices / out.Nkv + (kv >= out.Nkv - n_devices % out.Nkv);
+                for (int64_t part = 0; part < parts; ++part, ++rank) {
+                    out.q_role_counts[rank]  = (int32_t) (q_per_kv / parts + (part < q_per_kv % parts));
+                    out.kv_role_counts[rank] = 1;
+                    out.kv_head_starts[rank] = (int32_t) kv;
+                }
+            }
+        }
+        for (uint32_t r = 0; r < n_devices; ++r) {
+            out.kv_instances[r] = out.n_full * out.kv_role_counts[r];
         }
     }
 
@@ -179,6 +216,24 @@ llama_tp5_tensor_plan llama_tp5_plan::plan_tensor(const std::string & name, cons
         base = name.substr(dot + 1);
     }
 
+    // Scales (.scale, .input_scale) and biases (.bias) are per-tensor 1D/scalar or replicated weights
+    if (name.find(".scale") != std::string::npos || name.find(".input_scale") != std::string::npos ||
+        base.rfind("output_norm", 0) == 0 || base.rfind("attn_norm", 0) == 0 || base.rfind("ffn_norm", 0) == 0) {
+        tp.semantic = llama_tp5_semantic::HC;
+        tp.layout   = llama_tp5_layout::MIRRORED;
+        return tp;
+    }
+
+    // Production fix: Qwen3.8-Flash compact GGUF names expert weight tensors as ffn_gate_exp/ffn_up_exp
+    // in addition to the standard ffn_gate_exps/ffn_up_exps.
+    auto is_moe_expert_tensor = [&](const std::string & b) {
+        return is_moe_gate_up(b) || b == "ffn_gate_exp.weight" || b == "ffn_up_exp.weight" ||
+               b == "ffn_gate_exps.weight" || b == "ffn_up_exps.weight";
+    };
+    auto is_moe_down_tensor = [&](const std::string & b) {
+        return b == "ffn_down_exp.weight" || b == "ffn_down_exps.weight";
+    };
+
     auto fail = [&](const char * code, const std::string & what) {
         ok = false;
         err.code = code;
@@ -191,6 +246,13 @@ llama_tp5_tensor_plan llama_tp5_plan::plan_tensor(const std::string & name, cons
                     " out of range (layer count " + std::to_string(is_recr.size()) + ")");
     }
     const bool recr = il < 0 ? false : is_recr[(size_t) il];
+
+    auto attention_layout = [&](llama_tp5_semantic semantic, llama_tp5_layout layout, int axis) {
+        tp.semantic   = semantic;
+        tp.layout     = replicate_attention ? llama_tp5_layout::MIRRORED : layout;
+        tp.split_axis = replicate_attention ? -1 : axis;
+        return replicate_attention;
+    };
 
     // per-rank contiguous channel ranges on axis 0
     auto split_axis0_even = [&](int64_t n, llama_tp5_semantic sem) {
@@ -215,6 +277,16 @@ llama_tp5_tensor_plan llama_tp5_plan::plan_tensor(const std::string & name, cons
         tp.layout = llama_tp5_layout::MIRRORED;
         return tp;
     }
+    // Hyper-Connection fold mixer & projection weights
+    if (base.find("hc_") != std::string::npos || base.find("norm") != std::string::npos ||
+        base.find("inject") != std::string::npos || base.find("down.weight") != std::string::npos ||
+        base.find("up.weight") != std::string::npos) {
+        if (base.rfind("hc_attn_", 0) == 0 || base.rfind("hc_ffn_", 0) == 0 || base.rfind("hc_head_", 0) == 0) {
+            tp.semantic = llama_tp5_semantic::HC;
+            tp.layout   = llama_tp5_layout::MIRRORED;
+            return tp;
+        }
+    }
     if (is_moe_gate_up(base)) {
         tp.semantic = llama_tp5_semantic::MOE_GATE_UP;
         tp.layout = llama_tp5_layout::SPLIT_AXIS1;
@@ -229,7 +301,22 @@ llama_tp5_tensor_plan llama_tp5_plan::plan_tensor(const std::string & name, cons
         }
         return tp;
     }
+    if (base == "ffn_gate_up_exps.weight") {
+        tp.semantic   = llama_tp5_semantic::MOE_GATE_UP;
+        tp.layout     = llama_tp5_layout::SPLIT_AXIS1;
+        tp.split_axis = 1;
+        // fused gate_up: total rows = 2*F. Each rank gets 2*(F/ranks) rows
+        int64_t first = 0;
+        for (uint32_t r = 0; r < ranks; ++r) {
+            tp.per_rank_len[r] = 2 * (F / ranks);
+            tp.head_ranges.push_back({ first, first + 2 * (F / ranks) });
+            first += 2 * (F / ranks);
+        }
+        return tp;
+    }
     if (base == "ffn_down_exps.weight") {
+        // Down projection is shape [F, n_embd, n_expert]
+        // In GGML mul_mat_id, ne[0]=F (contracting dim), so axis 0 is split across ranks by F/ranks
         split_axis0_even(F, llama_tp5_semantic::MOE_DOWN);
         return tp;
     }
@@ -238,7 +325,8 @@ llama_tp5_tensor_plan llama_tp5_plan::plan_tensor(const std::string & name, cons
         tp.layout = llama_tp5_layout::MIRRORED;
         return tp;
     }
-    if (base == "ffn_gate_shexp.weight" || base == "ffn_up_shexp.weight") {
+    if (base == "ffn_gate_shexp.weight" || base == "ffn_up_shexp.weight" || base == "ffn_gate_shexps.weight" ||
+        base == "ffn_up_shexps.weight") {
         tp.semantic = llama_tp5_semantic::SHEXP_GATE_UP;
         tp.layout = llama_tp5_layout::SPLIT_AXIS1;
         tp.split_axis = 1;
@@ -250,21 +338,20 @@ llama_tp5_tensor_plan llama_tp5_plan::plan_tensor(const std::string & name, cons
         }
         return tp;
     }
-    if (base == "ffn_down_shexp.weight") {
+    if (base == "ffn_down_shexp.weight" || base == "ffn_down_shexps.weight") {
         split_axis0_even(Fs, llama_tp5_semantic::SHEXP_DOWN);
         return tp;
     }
-    if (base == "ffn_gate_inp_shexp.weight") {
+    if (base == "ffn_gate_inp_shexp.weight" || base == "ffn_gate_inp_shexps.weight") {
         tp.semantic = llama_tp5_semantic::SHEXP_ROUTER;
         tp.layout = llama_tp5_layout::MIRRORED;
         return tp;
     }
     if (il >= 0 && !recr) {
         // full-attention layer
-        if (base == "attn_q.weight") {
-            tp.semantic = llama_tp5_semantic::QSA_Q_GATE;
-            tp.layout = llama_tp5_layout::SPLIT_AXIS1;
-            tp.split_axis = 1;
+        if (base == "attn_q.weight" || base == "wq.weight") {
+            if (attention_layout(llama_tp5_semantic::QSA_Q_GATE, llama_tp5_layout::SPLIT_AXIS1, 1))
+                return tp;
             // rows = 2*da per whole head (q|gate interleaved)
             int64_t first = 0;
             for (uint32_t r = 0; r < ranks; ++r) {
@@ -275,19 +362,18 @@ llama_tp5_tensor_plan llama_tp5_plan::plan_tensor(const std::string & name, cons
             }
             return tp;
         }
-        if (base == "attn_k.weight" || base == "attn_v.weight") {
-            tp.semantic = llama_tp5_semantic::QSA_KV;
-            tp.layout = llama_tp5_layout::SPLIT_AXIS1_REPL;
-            tp.split_axis = 1;
+        if (base == "attn_k.weight" || base == "attn_v.weight" || base == "wk.weight" || base == "wv.weight") {
+            if (attention_layout(llama_tp5_semantic::QSA_KV, llama_tp5_layout::SPLIT_AXIS1_REPL, 1))
+                return tp;
             for (uint32_t r = 0; r < ranks; ++r) {
                 tp.per_rank_len[r] = da * kv_role_counts[r];
+                tp.head_ranges.push_back({ kv_head_starts[r], kv_head_starts[r] + kv_role_counts[r] });
             }
             return tp;
         }
-        if (base == "attn_output.weight") {
-            tp.semantic = llama_tp5_semantic::QSA_OUT;
-            tp.layout = llama_tp5_layout::SPLIT_AXIS0;
-            tp.split_axis = 0;
+        if (base == "attn_output.weight" || base == "wo.weight") {
+            if (attention_layout(llama_tp5_semantic::QSA_OUT, llama_tp5_layout::SPLIT_AXIS0, 0))
+                return tp;
             for (uint32_t r = 0; r < ranks; ++r) {
                 const int64_t cols = da * q_role_counts[r];
                 if (cols % blck_size != 0) {
@@ -313,9 +399,8 @@ llama_tp5_tensor_plan llama_tp5_plan::plan_tensor(const std::string & name, cons
     if (il >= 0 && recr) {
         // GDN layer
         if (base == "attn_qkv.weight") {
-            tp.semantic = llama_tp5_semantic::GDN_QKV;
-            tp.layout = llama_tp5_layout::SPLIT_AXIS1;
-            tp.split_axis = 1;
+            if (attention_layout(llama_tp5_semantic::GDN_QKV, llama_tp5_layout::SPLIT_AXIS1, 1))
+                return tp;
             // prearranged: per local V head -> Q rows (ds), K rows (ds), V rows (ds)
             for (uint32_t r = 0; r < ranks; ++r) {
                 tp.per_rank_len[r] = 3 * ds * gdn_v_heads[r];
@@ -323,18 +408,16 @@ llama_tp5_tensor_plan llama_tp5_plan::plan_tensor(const std::string & name, cons
             return tp;
         }
         if (base == "attn_gate.weight") {
-            tp.semantic = llama_tp5_semantic::GDN_GATE;
-            tp.layout = llama_tp5_layout::SPLIT_AXIS1;
-            tp.split_axis = 1;
+            if (attention_layout(llama_tp5_semantic::GDN_GATE, llama_tp5_layout::SPLIT_AXIS1, 1))
+                return tp;
             for (uint32_t r = 0; r < ranks; ++r) {
                 tp.per_rank_len[r] = ds * gdn_v_heads[r];
             }
             return tp;
         }
         if (base == "ssm_out.weight") {
-            tp.semantic = llama_tp5_semantic::GDN_OUT;
-            tp.layout = llama_tp5_layout::SPLIT_AXIS0;
-            tp.split_axis = 0;
+            if (attention_layout(llama_tp5_semantic::GDN_OUT, llama_tp5_layout::SPLIT_AXIS0, 0))
+                return tp;
             for (uint32_t r = 0; r < ranks; ++r) {
                 const int64_t cols = ds * gdn_v_heads[r];
                 if (cols % blck_size != 0) {
@@ -347,9 +430,8 @@ llama_tp5_tensor_plan llama_tp5_plan::plan_tensor(const std::string & name, cons
             return tp;
         }
         if (base == "ssm_beta.weight" || base == "ssm_alpha.weight") {
-            tp.semantic = llama_tp5_semantic::GDN_SCALAR;
-            tp.layout = llama_tp5_layout::SPLIT_AXIS1;
-            tp.split_axis = 1;
+            if (attention_layout(llama_tp5_semantic::GDN_SCALAR, llama_tp5_layout::SPLIT_AXIS1, 1))
+                return tp;
             for (uint32_t r = 0; r < ranks; ++r) {
                 tp.per_rank_len[r] = gdn_v_heads[r];
             }
@@ -361,9 +443,8 @@ llama_tp5_tensor_plan llama_tp5_plan::plan_tensor(const std::string & name, cons
             return tp;
         }
         if (base == "ssm_conv1d.weight") {
-            tp.semantic = llama_tp5_semantic::GDN_CONV;
-            tp.layout = llama_tp5_layout::SPLIT_AXIS1;
-            tp.split_axis = 1;
+            if (attention_layout(llama_tp5_semantic::GDN_CONV, llama_tp5_layout::SPLIT_AXIS1, 1))
+                return tp;
             for (uint32_t r = 0; r < ranks; ++r) {
                 tp.per_rank_len[r] = 3 * ds * gdn_v_heads[r];
             }
@@ -457,15 +538,33 @@ bool llama_tp5_try_apply_split_state(
     out.n_segments = 1;
 
     const std::string name(tensor_name);
+    const auto        apply_kv_split = [&](ggml_backend_meta_split_axis axis) {
+        out.axis            = axis;
+        out.indexed_replica = true;
+        for (uint32_t r = 0; r < plan.ranks; ++r) {
+            out.ne[r]            = plan.kv_role_counts[r] * plan.da;
+            out.replica_start[r] = plan.kv_head_starts[r] * plan.da;
+        }
+    };
 
-    // Production override (TP5.md §10.1): mirrored LM head on rank 0.
-    if (name == "output.weight") {
-        out.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
-        return true;
-    }
+    // (TP5.md §10.1) output.weight follows the vocab-parallel SPLIT_AXIS1 plan;
+    // no mirrored override — each rank computes its own vocabulary row range.
 
-    // Runtime caches keep the dedicated logic in llama-model.cpp (rotation, conv history).
+    // Attention caches must use the same fixed head ownership as their weights.
+    // Recurrent history keeps the native repeated-segment logic in llama-model.cpp.
     if (strstr(tensor_name, "cache_") != nullptr) {
+        if (plan.replicate_attention) {
+            out.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+            return true;
+        }
+        if (tp5_name_matches(tensor_name, "cache_k_l") || tp5_name_matches(tensor_name, "cache_v_l")) {
+            if (plan.Ni > 0 && tensor->ne[0] == indexer_head_size) {
+                out.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+            } else {
+                apply_kv_split(GGML_BACKEND_SPLIT_AXIS_0);
+            }
+            return true;
+        }
         return false;
     }
 
@@ -475,6 +574,29 @@ bool llama_tp5_try_apply_split_state(
     llama_tp5_tensor_plan tp = plan.plan_tensor(name, tensor->ne, (uint32_t) tensor->type, blck, ok, err);
     if (!ok) {
         return false;
+    }
+
+    if (plan.replicate_attention && tp.layout == llama_tp5_layout::MIRRORED) {
+        out.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+        return true;
+    }
+
+    // The loaded GDN tensors retain their native [Q, K, V] layout; no
+    // Q/K expansion or V-head prearrangement is performed by the loader.
+    // Use llama-model.cpp's existing repeated-segment split for ALL GDN
+    // weights, just as for their recurrent caches. In particular dt/A are
+    // per-head parameters, not broadcast scalars. Mixing contiguous plan
+    // slices with segmented cache ownership corrupts both conv and decay.
+    switch (tp.semantic) {
+        case llama_tp5_semantic::GDN_QKV:
+        case llama_tp5_semantic::GDN_CONV:
+        case llama_tp5_semantic::GDN_GATE:
+        case llama_tp5_semantic::GDN_OUT:
+        case llama_tp5_semantic::GDN_SCALAR:
+        case llama_tp5_semantic::GDN_PARAM:
+            return false;
+        default:
+            break;
     }
 
     auto apply_axis_split = [&](ggml_backend_meta_split_axis axis) -> bool {
@@ -490,16 +612,11 @@ bool llama_tp5_try_apply_split_state(
             }
             return true;
         }
-        // Fused GDN qkv/conv keeps legacy row count (2*K+V) while ownership follows V heads.
-        if (tp.semantic == llama_tp5_semantic::GDN_QKV || tp.semantic == llama_tp5_semantic::GDN_CONV) {
-            int64_t assigned = 0;
+        // Generic even split across ranks
+        if (total % plan.ranks == 0) {
+            int64_t per_rank = total / plan.ranks;
             for (uint32_t r = 0; r < plan.ranks; ++r) {
-                if (r + 1 == plan.ranks) {
-                    out.ne[r] = total - assigned;
-                } else {
-                    out.ne[r] = (total * plan.gdn_v_heads[r]) / plan.Nv;
-                    assigned += out.ne[r];
-                }
+                out.ne[r] = per_rank;
             }
             return true;
         }
@@ -522,14 +639,8 @@ bool llama_tp5_try_apply_split_state(
             }
             return true;
         case llama_tp5_layout::SPLIT_AXIS1_REPL: {
-            static const int kv_head_starts[LLAMA_TP5_MAX_RANKS] = {0, 0, 0, 1, 1};
-            out.axis = GGML_BACKEND_SPLIT_AXIS_1;
-            out.indexed_replica = true;
-            for (uint32_t r = 0; r < plan.ranks; ++r) {
-                out.ne[r] = tp.per_rank_len[r];
-                out.replica_start[r] = (r < 5 ? kv_head_starts[r] : 0) * plan.da;
-            }
-            return true;
+                apply_kv_split(GGML_BACKEND_SPLIT_AXIS_1);
+                return true;
         }
         default:
             return false;
@@ -547,16 +658,40 @@ bool llama_tp5_plan::validate(const llama_hparams & hp, uint32_t n_devices, llam
         err.detail = "hparams changed after plan construction";
         return false;
     }
-    int64_t q_sum = 0, kv_sum = 0, v_sum = 0;
+    if (Nkv <= 0 || Nq <= 0 || Nq % Nkv != 0) {
+        err.code   = "TP5_E_Q_SPLIT";
+        err.detail = "invalid global GQA ratio";
+        return false;
+    }
+    int64_t q_sum = 0, v_sum = 0;
     for (uint32_t r = 0; r < ranks; ++r) {
+        const int64_t nq = q_role_counts[r], nkv = kv_role_counts[r];
+        if (nq <= 0 || nkv <= 0 || nq % nkv != 0 || kv_head_starts[r] < 0 || kv_head_starts[r] + nkv > Nkv) {
+            err.code   = "TP5_E_Q_SPLIT";
+            err.detail = "invalid rank-local GQA ratio or KV range at rank " + std::to_string(r);
+            return false;
+        }
+        for (int64_t h = 0; h < nq; ++h) {
+            const int64_t global_q = (replicate_attention ? 0 : q_sum) + h;
+            if (kv_head_starts[r] + h / (nq / nkv) != global_q / (Nq / Nkv)) {
+                err.code   = "TP5_E_Q_SPLIT";
+                err.detail = "rank-local GQA selects a different global KV head at rank " + std::to_string(r);
+                return false;
+            }
+        }
         q_sum += q_role_counts[r];
-        kv_sum += kv_role_counts[r];
         v_sum += gdn_v_heads[r];
     }
-    if (q_sum != Nq) { err.code = "TP5_E_Q_SPLIT"; err.detail = "q roles do not cover all heads"; return false; }
-    if (kv_sum != (int64_t) Nkv + 1 && Nkv == 2) { // bridge adds one replica
-        // expected: sum(kv_role_counts) == Nkv + 1 for the bridge design
+    const int64_t copies = replicate_attention ? ranks : 1;
+    if (q_sum != copies * Nq) {
+        err.code   = "TP5_E_Q_SPLIT";
+        err.detail = "q roles do not cover all heads";
+        return false;
     }
-    if (v_sum != Nv) { err.code = "TP5_E_GDN_SPLIT"; err.detail = "gdn heads do not cover all V heads"; return false; }
+    if (v_sum != copies * Nv) {
+        err.code   = "TP5_E_GDN_SPLIT";
+        err.detail = "gdn heads do not cover all V heads";
+        return false;
+    }
     return true;
 }

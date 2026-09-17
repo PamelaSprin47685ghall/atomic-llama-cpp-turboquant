@@ -159,18 +159,21 @@ int64_t llama_time_us(void) {
 
 static void llama_prepare_tp5_plan(llama_model * model, size_t n_devs) {
     model->get_split_state_ud.has_tp5_plan = false;
-    if (model->arch != LLM_ARCH_QWEN4EXP || n_devs < 2) {
+    if ((model->arch != LLM_ARCH_QWEN4EXP && model->arch != LLM_ARCH_DEEPSEEK4) || n_devs < 2) {
         return;
     }
     llama_tp5_error err;
     const int64_t n_vocab = model->vocab.n_tokens();
-    if (llama_tp5_plan_build(model->hparams, (uint32_t) n_devs, n_vocab,
+    const char *    replicate_env       = getenv("GGML_TP5_REPLICATE_ATTN");
+    const bool      replicate_attention = replicate_env && atoi(replicate_env) != 0;
+    if (llama_tp5_plan_build(model->hparams, (uint32_t) n_devs, n_vocab, replicate_attention,
                              model->get_split_state_ud.tp5_plan, err)) {
         model->get_split_state_ud.has_tp5_plan = true;
-        LLAMA_LOG_INFO("%s: TP5 plan active for qwen4exp (%zu ranks, %u collective events/token)\n",
-                       __func__, n_devs, model->get_split_state_ud.tp5_plan.expected_events);
+        LLAMA_LOG_INFO("%s: TP5 plan active for %s (%zu ranks, %u collective events/token)\n", __func__,
+                       llm_arch_name(model->arch), n_devs, model->get_split_state_ud.tp5_plan.expected_events);
     } else {
-        LLAMA_LOG_WARN("%s: TP5 plan not built: %s %s\n", __func__, err.code.c_str(), err.detail.c_str());
+        LLAMA_LOG_WARN("%s: TP5 plan not built for %s: %s %s\n", __func__, llm_arch_name(model->arch), err.code.c_str(),
+                       err.detail.c_str());
     }
 }
 

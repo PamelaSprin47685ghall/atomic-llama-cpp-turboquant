@@ -564,12 +564,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
         // output
         if (std::regex_match(tensor_name, pattern_output_weight)) {
-            // TP5.md 10.1: For Qwen4EXP TP5, keeping output.weight mirrored (only 380MB in Q6_K)
-            // ensures rank 0 directly computes full unfragmented vocabulary logits, avoiding
-            // any cross-backend logits extraction truncation.
-            if (ud->model->arch == LLM_ARCH_QWEN4EXP) {
-                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-            }
+            // TP5.md 10.1: vocab-parallel LM head. output.weight is split on axis 1
+            // (each rank owns a vocabulary row range); the meta backend gathers the
+            // per-rank logits slices into the host buffer during tensor_get_async.
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
@@ -765,31 +762,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (j > 0) {
                 tensor_split_scan[j] += tensor_split_scan[j - 1];
             }
-        }
-        // TP5.md 3.3 / 7.1 / 4.4: Qwen4EXP Attention KV Weights & Cache role table [1, 1, 2, 1, 1]
-        // 2 KV heads over 5 devices cannot be cleanly partitioned without replicas.
-        // wk/wv weights (axis 1) and cache_k/cache_v (axis 0) must follow the identical
-        // head allocation so that Kcur and cache_k share the exact same split state.
-        // Bridge role (index 2) holds both KV0 and KV1; others hold one head.
-        const bool is_qwen4exp_attn_kv = (ud->model->arch == LLM_ARCH_QWEN4EXP &&
-                                          ud->n_devices == 5 &&
-                                          (std::regex_match(tensor_name, pattern_kv_cache) ||
-                                           std::regex_match(tensor_name, pattern_kv_weight)) &&
-                                          tensor->ne[0] != (int64_t) hparams.indexer_head_size);
-        if (is_qwen4exp_attn_kv) {
-            const int64_t head_dim = hparams.n_embd_head_k(tc.il); // 256
-            const int kv_roles[5] = {1, 1, 2, 1, 1};
-            const int kv_head_starts[5] = {0, 0, 0, 1, 1};
-            split_state.indexed_replica = true;
-            for (size_t j = 0; j < 5; ++j) {
-                // TP5.md 4.4: Use fixed role mapping in test build to eliminate rotation binding errors
-                const size_t role = j;
-                split_state.ne[j] = kv_roles[role] * head_dim;
-                split_state.replica_start[j] = kv_head_starts[role] * head_dim;
-            }
-            split_state.nr[0] = 1;
-            split_state.n_segments = 1;
-            return split_state;
         }
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
         const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
@@ -1732,20 +1704,34 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
+                if (buffer_from_host_ptr_supported && is_default_buft) {
+                    ml.init_lazy_tensors(ctx, dev, bufs);
+                }
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
             }
             if (buf == nullptr) {
-                throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                // A lazy-only context is already fully bound. Distinguish that
+                // case from a real allocation failure with unbound tensors.
+                if (bufs.empty()) {
+                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                }
+                for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+                    if (!t->data) {
+                        throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                    }
+                }
             }
-            if (use_mlock && ggml_backend_buffer_is_host(buf)) {
+            if (buf && use_mlock && ggml_backend_buffer_is_host(buf)) {
                 pimpl->mlock_bufs.emplace_back(new llama_mlock);
                 auto & mlock_buf = pimpl->mlock_bufs.back();
                 mlock_buf->init   (ggml_backend_buffer_get_base(buf));
                 mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
             }
-            bufs.emplace_back(buf);
-            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-                buf_map.emplace(idx, buf);
+            if (buf) {
+                bufs.emplace_back(buf);
+                for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                    buf_map.emplace(idx, buf);
+                }
             }
         }
 
@@ -2541,7 +2527,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
                             /* recurrent_type_v  */ GGML_TYPE_F32,
-                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* recurrent_kv_size */ recurrent_size,
+                            /* recurrent_brains */ cparams.n_person_max,
+                            /* recurrent_hands  */ cparams.n_pen_max,
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
                             /* offload           */ cparams.offload_kqv,

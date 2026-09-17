@@ -1,0 +1,257 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#ifdef SUBGROUP_REDUCTIONS
+#    extension GL_KHR_shader_subgroup_basic : require
+#    extension GL_KHR_shader_subgroup_shuffle : require
+#endif
+
+layout(push_constant) uniform parameter {
+    uint  n_rows;
+    uint  n_experts_push;
+    uint  n_expert_used;
+    float clamp_min;
+    float clamp_max;
+    uint  gating_func;
+    uint  has_bias;
+    uint  with_norm;
+    float output_scale;
+    float output_bias;
+};
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 32;
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0, std430) readonly buffer Logits {
+    float logits[];
+};
+
+layout(binding = 1, std430) readonly buffer BiasProbs {
+    float bias[];
+};
+
+layout(binding = 2, std430) writeonly buffer Weights {
+    float weights[];
+};
+
+layout(binding = 3, std430) writeonly buffer Ids {
+    int ids[];
+};
+
+const float INFINITY = 1.0 / 0.0;
+
+shared float sh_logits[512];
+shared float sh_probs[512];
+#ifndef SUBGROUP_REDUCTIONS
+shared float sh_vals[64];
+shared uint  sh_counts[64];
+shared uint  sh_ids[64];
+#endif
+shared ivec2 sh_sorted[512];
+
+#ifdef SUBGROUP_REDUCTIONS
+// The host requires one full subgroup per workgroup. Preserve the native
+// halving tree, not the implementation-defined ordering of subgroupAdd.
+float subgroup_sum_tree(float value, uint first_stride) {
+    const uint lane = gl_SubgroupInvocationID;
+    [[unroll]] for (uint stride = first_stride; stride > 0; stride >>= 1) {
+        const float other = subgroupShuffle(value, lane ^ stride);
+        if (lane < stride)
+            value += other;
+    }
+    return subgroupShuffle(value, 0u);
+}
+#endif
+
+void main() {
+    const uint tid       = gl_LocalInvocationID.x;
+    const uint n_experts = 512;
+
+    // Stage 1: Stage ALL 512 input logits into shared memory before any outputs are written.
+    // This makes the kernel completely safe when weights or ids overlap with logits in memory.
+    [[unroll]] for (uint i = tid; i < n_experts; i += BLOCK_SIZE) { sh_logits[i] = logits[i]; }
+    barrier();
+
+    // Stage 2: Native-equivalent softmax reproducing soft_max.comp exactly with host BLOCK_SIZE.
+    // 2a. Find max across 512 staged logits using BLOCK_SIZE stride and workgroup tree reduction.
+    float max_val = -INFINITY;
+    [[unroll]] for (uint i = tid; i < n_experts; i += BLOCK_SIZE) { max_val = max(max_val, sh_logits[i]); }
+#ifdef SUBGROUP_REDUCTIONS
+    [[unroll]] for (uint stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        const float other = subgroupShuffle(max_val, tid ^ stride);
+        if (tid < stride)
+            max_val = max(max_val, other);
+    }
+    max_val = subgroupShuffle(max_val, 0u);
+#else
+    sh_vals[tid] = max_val;
+    barrier();
+
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sh_vals[tid] = max(sh_vals[tid], sh_vals[tid + s]);
+        }
+        barrier();
+    }
+    max_val = sh_vals[0];
+    barrier();
+#endif
+
+    // 2b. Compute exp(x - max_val) and reduce sum.
+    float sum = 0.0f;
+    [[unroll]] for (uint i = tid; i < n_experts; i += BLOCK_SIZE) {
+        float val   = exp(sh_logits[i] - max_val);
+        sh_probs[i] = val;
+        sum += val;
+    }
+#ifdef SUBGROUP_REDUCTIONS
+    sum = subgroup_sum_tree(sum, BLOCK_SIZE / 2);
+#else
+    sh_vals[tid] = sum;
+    barrier();
+
+    [[unroll]] for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sh_vals[tid] += sh_vals[tid + s];
+        }
+        barrier();
+    }
+    sum = sh_vals[0];
+    barrier();
+#endif
+
+    // 2c. Normalize probabilities with rcpdivisor = 1.0f / sum (matching soft_max.comp line 147).
+    float rcpdivisor = 1.0f / sum;
+    [[unroll]] for (uint i = tid; i < n_experts; i += BLOCK_SIZE) {
+        sh_probs[i] *= rcpdivisor;
+        sh_logits[i] = sh_probs[i];
+    }
+    barrier();
+
+    // Unique maxima have the same order under every sorting network. Detect
+    // ties while selecting; only ambiguous selections need the native network.
+    bool native_sort = false;
+    for (uint rank = 0; rank < n_expert_used; ++rank) {
+        float best    = -INFINITY;
+        uint  best_id = 0;
+        uint  count   = 0;
+        for (uint col = tid; col < n_experts; col += BLOCK_SIZE) {
+            float value = sh_logits[col];
+            if (value > best) {
+                best    = value;
+                best_id = col;
+                count   = 1;
+            } else if (value == best) {
+                ++count;
+            }
+        }
+#ifdef SUBGROUP_REDUCTIONS
+        for (uint stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+            const float other       = subgroupShuffle(best, tid ^ stride);
+            const uint  other_id    = subgroupShuffle(best_id, tid ^ stride);
+            const uint  other_count = subgroupShuffle(count, tid ^ stride);
+            if (tid < stride) {
+                if (other > best) {
+                    best    = other;
+                    best_id = other_id;
+                    count   = other_count;
+                } else if (other == best) {
+                    count += other_count;
+                }
+            }
+        }
+        const float selected_value = subgroupShuffle(best, 0u);
+        const uint  selected_id    = subgroupShuffle(best_id, 0u);
+        native_sort                = subgroupShuffle(count, 0u) != 1;
+#else
+        sh_vals[tid]   = best;
+        sh_ids[tid]    = best_id;
+        sh_counts[tid] = count;
+        barrier();
+        for (uint s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                if (sh_vals[tid + s] > sh_vals[tid]) {
+                    sh_vals[tid]   = sh_vals[tid + s];
+                    sh_ids[tid]    = sh_ids[tid + s];
+                    sh_counts[tid] = sh_counts[tid + s];
+                } else if (sh_vals[tid + s] == sh_vals[tid]) {
+                    sh_counts[tid] += sh_counts[tid + s];
+                }
+            }
+            barrier();
+        }
+        native_sort                = sh_counts[0] != 1;
+        const float selected_value = sh_vals[0];
+        const uint  selected_id    = sh_ids[0];
+#endif
+        if (native_sort)
+            break;
+        if (tid == 0) {
+            sh_sorted[n_experts - rank - 1] = ivec2(int(selected_id), floatBitsToInt(selected_value));
+            sh_logits[selected_id]          = -INFINITY;
+        }
+        barrier();
+    }
+
+    // Reproduce argsort.comp's value-only bitonic network, including its tie
+    // permutation. TOP_K's index tie-break is a different operation.
+    if (native_sort) {
+        for (uint col = tid; col < n_experts; col += BLOCK_SIZE) {
+            sh_sorted[col] = ivec2(int(col), floatBitsToInt(sh_probs[col]));
+        }
+        barrier();
+        [[unroll]] for (uint k = 2; k <= n_experts; k *= 2) {
+            [[unroll]] for (uint j = k / 2; j > 0; j /= 2) {
+                for (uint col = tid; col < n_experts; col += BLOCK_SIZE) {
+                    uint ixj = col ^ j;
+                    if (ixj > col) {
+                        uint  i0 = (col & k) == 0 ? col : ixj;
+                        uint  i1 = (col & k) == 0 ? ixj : col;
+                        ivec2 a  = sh_sorted[i0];
+                        ivec2 b  = sh_sorted[i1];
+                        if (intBitsToFloat(a.y) > intBitsToFloat(b.y)) {
+                            sh_sorted[i0] = b;
+                            sh_sorted[i1] = a;
+                        }
+                    }
+                }
+                barrier();
+            }
+        }
+    }
+
+    // Stage 4: Sum top-k weights matching sum_rows.comp tree reduction:
+    // Elements 0..n_expert_used-1 placed in lanes 0..n_expert_used-1, zero beyond.
+#ifdef SUBGROUP_REDUCTIONS
+    float selected = tid < n_expert_used ? intBitsToFloat(sh_sorted[n_experts - tid - 1].y) : 0.0f;
+    float wt_sum   = subgroup_sum_tree(selected, 16);
+#else
+    sh_vals[tid] = 0.0f;
+    if (tid < n_expert_used) {
+        sh_vals[tid] = intBitsToFloat(sh_sorted[n_experts - tid - 1].y);
+    }
+    barrier();
+
+    // At most 16 selected values: larger native groups only add zero lanes
+    // before this same final 32-lane reduction tree.
+    [[unroll]] for (uint s = 16; s > 0; s >>= 1) {
+        if (tid < s) {
+            sh_vals[tid] += sh_vals[tid + s];
+        }
+        barrier();
+    }
+    float wt_sum = sh_vals[0];
+#endif
+
+    // Clamp sum
+    wt_sum = clamp(wt_sum, clamp_min, clamp_max);
+    barrier();
+
+    // Stage 5: Output write with exact IEEE-754 float division (matching native div.comp).
+    // All inputs from logits were fully consumed in Stage 1, so overwriting logits is 100% safe.
+    if (tid < n_expert_used) {
+        ids[tid]       = sh_sorted[n_experts - tid - 1].x;
+        float unnorm_w = intBitsToFloat(sh_sorted[n_experts - tid - 1].y);
+        weights[tid]   = output_scale * (unnorm_w / wt_sum) + output_bias;
+    }
+}

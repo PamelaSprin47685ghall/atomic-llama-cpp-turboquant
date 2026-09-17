@@ -5,10 +5,13 @@
 // GPU-flag sync (GGML_TP5_SYNC=gpuflag): spin on per-slot ready flags before read.
 
 layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint N_SLOTS = 8;
 
 layout(std430, binding = 0) readonly buffer InBuf {
     float in_data[];
-};
+}
+
+in_slots[N_SLOTS];
 
 layout(std430, binding = 1) writeonly buffer OutBuf {
     float out_data[];
@@ -28,7 +31,6 @@ layout(std430, binding = 3) readonly buffer EpochBuf {
 layout(push_constant) uniform Params {
     uint n_elems;
     uint n_slots;
-    uint stride_elems;
     uint use_flags;
     uint ready_off_u32; // consumed at ready_off_u32 + n_slots; error at + 2*n_slots
 } p;
@@ -63,7 +65,7 @@ void main() {
             failed = timed_out;
             break;
         }
-        acc += in_data[uint(r) * p.stride_elems + e];
+        acc += in_slots[r].in_data[e];
     }
 
     if (failed) {

@@ -1,0 +1,65 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer AttnBuf {
+    float data_attn[];
+};
+
+layout(binding = 1) readonly buffer GammaBuf {
+    float data_gamma[];
+};
+
+layout(binding = 2) readonly buffer ZBuf {
+    float data_z[];
+};
+
+layout(binding = 3) writeonly buffer OutBuf {
+    float data_out[];
+};
+
+layout(push_constant) uniform Parameters {
+    float epsilon;
+};
+
+shared float sumsh[512];
+
+void main() {
+    const uint head_id = gl_WorkGroupID.x;
+    const uint tid     = gl_LocalInvocationID.x;
+    const uint offset  = head_id * 128u;
+
+    // Width is fixed at 128. Only threads tid < 128 load elements.
+    float xi = 0.0;
+    if (tid < 128u) {
+        xi = data_attn[offset + tid];
+    }
+    float sum = xi * xi;
+
+    sumsh[tid] = sum;
+    barrier();
+
+    // Native RMS 512-thread halving tree: 256 -> 128 -> 64 -> 32 -> 16 -> 8 -> 4 -> 2 -> 1
+    [[unroll]] for (int s = 256; s > 0; s >>= 1) {
+        if (tid < s) {
+            sum += sumsh[tid + s];
+            sumsh[tid] = sum;
+        }
+        barrier();
+    }
+    sum = sumsh[0];
+
+    const float mean  = sum / 128.0;
+    const float scale = inversesqrt(mean + epsilon);
+
+    if (tid < 128u) {
+        const float attention_val = data_attn[offset + tid];
+        const float normalized    = scale * attention_val;
+        const float gamma_val     = data_gamma[tid];
+        const float z_val         = data_z[offset + tid];
+        const float gate          = 1.0 / (1.0 + exp(-z_val));
+        data_out[offset + tid]    = normalized * gamma_val * gate;
+    }
+}

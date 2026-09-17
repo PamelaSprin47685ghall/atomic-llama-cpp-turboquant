@@ -921,6 +921,15 @@ void process_shaders() {
 
     string_to_spv("split_k_reduce", "mul_mat_split_k_reduce.comp", {});
     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
+    string_to_spv("fa_split_k_reduce_gate", "flash_attn_split_k_reduce.comp",
+                  {
+                      { "ATTN_GATE", "1" }
+    });
+    string_to_spv("fa_output_gate", "flash_attn_split_k_reduce.comp",
+                  {
+                      { "ATTN_GATE",      "1" },
+                      { "ATTN_GATE_ONLY", "1" }
+    });
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
     string_to_spv("flash_attn_sparse_compact", "flash_attn_sparse_compact.comp", {});
@@ -937,6 +946,131 @@ void process_shaders() {
     string_to_spv("tp5_sum_f32", "tp5_sum_f32.comp", {});
     string_to_spv("tp5_sum_f16", "tp5_sum_f16.comp", {});
     string_to_spv("qwen4_hc_up_fold", "qwen4_hc_up_fold.comp", {});
+    string_to_spv("qwen4_hc_segment_norm", "qwen4_hc_segment_norm.comp", {});
+    string_to_spv("qwen4_hc_sum_f16", "qwen4_hc_segment_norm.comp",
+                  {
+                      { "TP5_HC_SUM", "1" }
+    });
+    string_to_spv("qwen4_gdn_segment_prep", "qwen4_gdn_segment_prep.comp", {});
+    string_to_spv("qwen4_gdn_segment_delta", "qwen4_gdn_segment_delta.comp", {});
+    string_to_spv("qwen4_gdn_segment_norm", "qwen4_gdn_segment_norm.comp", {});
+    string_to_spv("qwen4_gdn_cached_prep", "qwen4_gdn_segment_prep.comp",
+                  {
+                      { "GDN_CACHED_INPUT", "1" }
+    });
+    string_to_spv("qwen4_gdn_cached_delta", "qwen4_gdn_segment_delta.comp",
+                  {
+                      { "GDN_CACHED_INPUT", "1" }
+    });
+    string_to_spv("qwen4_gdn_cached_delta_norm", "qwen4_gdn_segment_delta.comp",
+                  {
+                      { "GDN_CACHED_INPUT", "1" },
+                      { "GDN_FUSED_NORM",   "1" }
+    });
+    for (const auto & variant : {
+             std::pair{ "qwen4_hc_down_silu",    "HC_DOWN_SILU" },
+             std::pair{ "qwen4_hc_project_fold", "HC_UP_FOLD"   }
+    }) {
+        string_to_spv(variant.first, "mul_mat_vec.comp",
+                      merge_maps(base_dict, {
+                                                { "DATA_A_Q8_0",               "1"     },
+                                                { "B_TYPE",                    "float" },
+                                                { "B_TYPEV2",                  "vec2"  },
+                                                { "B_TYPEV4",                  "vec4"  },
+                                                { "D_TYPE",                    "float" },
+                                                { "USE_SUBGROUP_ADD_NO_SHMEM", "1"     },
+                                                { variant.second,              "1"     }
+        }));
+    }
+    string_to_spv("qwen4_moe_down_fold", "mul_mat_vec.comp",
+                  merge_maps(base_dict, {
+                                            { "DATA_A_IQ4_NL",             "1"     },
+                                            { "B_TYPE",                    "float" },
+                                            { "B_TYPEV2",                  "vec2"  },
+                                            { "B_TYPEV4",                  "vec4"  },
+                                            { "D_TYPE",                    "float" },
+                                            { "USE_SUBGROUP_ADD_NO_SHMEM", "1"     },
+                                            { "MUL_MAT_ID",                "1"     },
+                                            { "MOE_DOWN_FOLD",             "1"     }
+    }));
+    string_to_spv("qwen4_moe_down_fold_shared", "mul_mat_vec.comp",
+                  merge_maps(base_dict, {
+                                            { "DATA_A_IQ4_NL",             "1"     },
+                                            { "B_TYPE",                    "float" },
+                                            { "B_TYPEV2",                  "vec2"  },
+                                            { "B_TYPEV4",                  "vec4"  },
+                                            { "D_TYPE",                    "float" },
+                                            { "USE_SUBGROUP_ADD_NO_SHMEM", "1"     },
+                                            { "MUL_MAT_ID",                "1"     },
+                                            { "MOE_DOWN_FOLD",             "1"     },
+                                            { "MOE_FUSE_SHARED_DOWN",      "1"     }
+    }));
+    string_to_spv("qwen4_output_q5k_wire", "mul_mat_vec_q5_k.comp",
+                  merge_maps(base_dict, {
+                                            { "DATA_A_Q5_K",               "1"     },
+                                            { "B_TYPE",                    "float" },
+                                            { "B_TYPEV2",                  "vec2"  },
+                                            { "B_TYPEV4",                  "vec4"  },
+                                            { "D_TYPE",                    "float" },
+                                            { "USE_SUBGROUP_ADD_NO_SHMEM", "1"     },
+                                            { "TP5_WIRE_OUTPUT",           "1"     }
+    }));
+    string_to_spv("qwen4_moe_down_fold_wire", "mul_mat_vec.comp",
+                  merge_maps(base_dict, {
+                                            { "DATA_A_IQ4_NL",             "1"     },
+                                            { "B_TYPE",                    "float" },
+                                            { "B_TYPEV2",                  "vec2"  },
+                                            { "B_TYPEV4",                  "vec4"  },
+                                            { "D_TYPE",                    "float" },
+                                            { "USE_SUBGROUP_ADD_NO_SHMEM", "1"     },
+                                            { "MUL_MAT_ID",                "1"     },
+                                            { "MOE_DOWN_FOLD",             "1"     },
+                                            { "TP5_WIRE_OUTPUT",           "1"     }
+    }));
+    string_to_spv("qwen4_moe_down_fold_shared_wire", "mul_mat_vec.comp",
+                  merge_maps(base_dict, {
+                                            { "DATA_A_IQ4_NL",             "1"     },
+                                            { "B_TYPE",                    "float" },
+                                            { "B_TYPEV2",                  "vec2"  },
+                                            { "B_TYPEV4",                  "vec4"  },
+                                            { "D_TYPE",                    "float" },
+                                            { "USE_SUBGROUP_ADD_NO_SHMEM", "1"     },
+                                            { "MUL_MAT_ID",                "1"     },
+                                            { "MOE_DOWN_FOLD",             "1"     },
+                                            { "MOE_FUSE_SHARED_DOWN",      "1"     },
+                                            { "TP5_WIRE_OUTPUT",           "1"     }
+    }));
+    string_to_spv("qwen4_moe_shared_up_swiglu", "mul_mat_vec_q6_k.comp",
+                  merge_maps(base_dict, {
+                                            { "DATA_A_Q6_K",               "1"     },
+                                            { "B_TYPE",                    "float" },
+                                            { "B_TYPEV2",                  "vec2"  },
+                                            { "B_TYPEV4",                  "vec4"  },
+                                            { "D_TYPE",                    "float" },
+                                            { "USE_SUBGROUP_ADD_NO_SHMEM", "1"     },
+                                            { "MOE_SHARED_UP_SWIGLU",      "1"     }
+    }));
+    string_to_spv("qwen4_moe_projections_iq2s_iq3xxs", "qwen4_moe_projections.comp",
+                  {
+                      { "MOE_ROUTED_IQ2_S_IQ3_XXS", "1" }
+    });
+    string_to_spv("qwen4_moe_projections_iq3xxs_iq3s", "qwen4_moe_projections.comp",
+                  {
+                      { "MOE_ROUTED_IQ3_XXS_IQ3_S", "1" }
+    });
+    string_to_spv("qwen4_gdn_projections", "qwen4_attention_projections.comp",
+                  {
+                      { "GDN_PROJECTIONS", "1" }
+    });
+    string_to_spv("qwen4_qsa_projections", "qwen4_attention_projections.comp",
+                  {
+                      { "QSA_PROJECTIONS", "1" }
+    });
+    string_to_spv("qwen4_attention_prep", "qwen4_attention_prep.comp", {});
+    string_to_spv("qwen4_attention_prep_compact", "qwen4_attention_prep.comp",
+                  {
+                      { "ATTENTION_PREP_COMPACT", "1" }
+    });
     string_to_spv("tp5_pack_f16", "tp5_pack_f16.comp", {});
     string_to_spv("tp5_gpuflag", "tp5_gpuflag.comp", {});
 
@@ -1214,6 +1348,11 @@ void process_shaders() {
     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
 
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
+    string_to_spv("topk_moe_staged_f32", "topk_moe_staged.comp", {});
+    string_to_spv("topk_moe_staged_subgroup_f32", "topk_moe_staged.comp",
+                  {
+                      { "SUBGROUP_REDUCTIONS", "1" }
+    });
 
     for (auto &c : compiles) {
         c.wait();

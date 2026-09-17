@@ -1425,6 +1425,28 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     }
 }
 
+void llama_model_loader::init_lazy_tensors(ggml_context *                         ctx,
+                                           ggml_backend_dev_t                     dev,
+                                           std::vector<ggml_backend_buffer_ptr> & buffers) {
+    if (no_alloc || !lazy.any()) {
+        return;
+    }
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        if (!lazy.has(t) || t->data) {
+            continue;
+        }
+        const auto &            weight  = require_weight(ggml_get_name(t));
+        const auto &            mapping = mappings.at(weight.idx);
+        void *                  data    = static_cast<char *>(mapping->addr()) + weight.offs;
+        const size_t            size    = ggml_nbytes(t);
+        ggml_backend_buffer_ptr buffer(ggml_backend_dev_buffer_from_host_ptr(dev, data, size, size));
+        if (!buffer || ggml_backend_tensor_alloc(buffer.get(), t, data) != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error(format("unable to bind lazy tensor %s", ggml_get_name(t)));
+        }
+        buffers.push_back(std::move(buffer));
+    }
+}
+
 void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const {
     GGML_ASSERT(!mappings.empty());
     const auto & mapping = mappings.at(idx);
@@ -1598,15 +1620,30 @@ bool llama_model_loader::load_all_data(
         // lazy tensors in direct mode are read on-demand by the arch reader;
         // lazy tensors in mmap mode are served via mmap pointer without reading the file
         if (lazy.has(cur)) {
-            size_done += n_size;
             if (use_mmap || mappings.size() > weight->idx) {
                 const auto & mapping = mappings.at(weight->idx);
                 uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
                 if (bufs.count(weight->idx) && cur->data == nullptr) {
                     ggml_backend_tensor_alloc(bufs.at(weight->idx), cur, data);
                 }
+                // Lazy readers still dereference this mapping after loading.
+                // Include its payload in the retained range before final trim.
+                if (cur->data == data) {
+                    if (use_mmap) {
+                        auto & mmap_used = mmaps_used[weight->idx];
+                        mmap_used.first  = std::min(mmap_used.first, weight->offs);
+                        mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
+                    }
+                    size_done += n_size;
+                    continue;
+                }
             }
-            continue;
+            if (lazy.mode == LLAMA_LAZY_MODE_DIRECT) {
+                size_done += n_size;
+                continue;
+            }
+            // An eagerly allocated buffer is not the mapped payload. Load it
+            // normally instead of silently leaving a lazy-marked tensor empty.
         }
 
         if (use_mmap) {

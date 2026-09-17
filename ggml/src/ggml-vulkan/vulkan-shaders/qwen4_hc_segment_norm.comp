@@ -1,0 +1,278 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#ifdef TP5_HC_SUM
+#    extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+// Preserve an independent 512-lane RMS tree per residual stream. The fused
+// variant pairs two streams so their five-slot sum can share LDS storage.
+#ifdef TP5_HC_SUM
+layout(local_size_x = 1024) in;
+const bool COMBINE     = true;
+const bool FUSE_INJECT = true;
+#else
+layout(local_size_x = 512) in;
+layout(constant_id = 0) const bool COMBINE     = false;
+layout(constant_id = 1) const bool FUSE_INJECT = false;
+#endif
+layout(constant_id = 2) const uint INJECT_BLOCK_SIZE = 32u;
+
+layout(std430, binding = 0) readonly buffer Residual {
+    float residual[];
+};
+
+struct hc_inject_block_q8_0 {
+    float16_t d;
+    int16_t   qs[16];
+};
+#ifdef TP5_HC_SUM
+// Separate descriptors preserve isolated-BO mailboxes. Only the first pair
+// commits the F32 sum; the other pair independently fills its local LDS copy.
+layout(std430, binding = 1) readonly buffer Slot0 {
+    float16_t slot0[];
+};
+
+layout(std430, binding = 2) readonly buffer Slot1 {
+    float16_t slot1[];
+};
+
+layout(std430, binding = 3) readonly buffer Slot2 {
+    float16_t slot2[];
+};
+
+layout(std430, binding = 4) readonly buffer Slot3 {
+    float16_t slot3[];
+};
+
+layout(std430, binding = 5) readonly buffer Slot4 {
+    float16_t slot4[];
+};
+
+layout(std430, binding = 6) readonly buffer Gamma {
+    float gamma[];
+};
+
+layout(std430, binding = 7) writeonly buffer Combined {
+    float combined[];
+};
+
+layout(std430, binding = 8) writeonly buffer Normalized {
+    float normalized[];
+};
+
+layout(std430, binding = 9) readonly buffer InjectWeights {
+    hc_inject_block_q8_0 inject_weights[];
+};
+
+layout(std430, binding = 10) readonly buffer InjectInput {
+    float inject_input[];
+};
+
+layout(std430, binding = 11) writeonly buffer SumOutput {
+    float sum_output[];
+};
+#else
+layout(std430, binding = 1) readonly buffer Block {
+    float block_out[];
+};
+
+layout(std430, binding = 2) readonly buffer Inject {
+    float inject[];
+};
+
+layout(std430, binding = 3) readonly buffer Gamma {
+    float gamma[];
+};
+
+layout(std430, binding = 4) writeonly buffer Combined {
+    float combined[];
+};
+
+layout(std430, binding = 5) writeonly buffer Normalized {
+    float normalized[];
+};
+
+layout(std430, binding = 6) readonly buffer InjectWeights {
+    hc_inject_block_q8_0 inject_weights[];
+};
+
+layout(std430, binding = 7) readonly buffer InjectInput {
+    float inject_input[];
+};
+#endif
+layout(push_constant) uniform Params {
+    uint  width;
+    float epsilon;
+}
+
+p;
+#ifdef TP5_HC_SUM
+shared float partials[1024];
+shared float fused_slot[2];
+shared float block_sums[4096];
+#else
+shared float partials[512];
+shared float fused_slot;
+#endif
+
+float block_value(uint col, uint stream) {
+#ifdef TP5_HC_SUM
+    float value = 0.0;
+    value += float(slot0[col]);
+    value += float(slot1[col]);
+    value += float(slot2[col]);
+    value += float(slot3[col]);
+    value += float(slot4[col]);
+    if (stream == 0u)
+        sum_output[col] = value;
+    return value;
+#else
+    return block_out[col];
+#endif
+}
+
+void normalize(uint iterations) {
+#ifdef TP5_HC_SUM
+    const uint row          = gl_LocalInvocationID.x / 512u;
+    const uint tid          = gl_LocalInvocationID.x % 512u;
+    const uint stream       = 2u * gl_WorkGroupID.x + row;
+    const uint partial_base = row * 512u;
+#else
+    const uint stream       = gl_WorkGroupID.x;
+    const uint tid          = gl_LocalInvocationID.x;
+    const uint partial_base = 0u;
+#endif
+    const uint offset = stream * p.width;
+
+    float values[8];
+
+    if (COMBINE && FUSE_INJECT) {
+        if (tid < INJECT_BLOCK_SIZE) {
+            const uint k_dim     = 4u * p.width;
+            uint       num_iters = k_dim / (8u * INJECT_BLOCK_SIZE);
+            if (num_iters * 8u * INJECT_BLOCK_SIZE + 8u * tid < k_dim) {
+                num_iters++;
+            }
+            const uint quant_k = 32u;
+            const uint col     = 8u * tid;
+            const uint iqs     = col % quant_k;
+            const uint iybs    = col - iqs;
+
+            float temp = 0.0;
+            for (uint si = 0u; si < num_iters; ++si) {
+                const uint b_idx = si * 8u * INJECT_BLOCK_SIZE + iybs + iqs;
+                const vec4 bv0   = vec4(inject_input[b_idx], inject_input[b_idx + 1u], inject_input[b_idx + 2u],
+                                        inject_input[b_idx + 3u]);
+                const vec4 bv1   = vec4(inject_input[b_idx + 4u], inject_input[b_idx + 5u], inject_input[b_idx + 6u],
+                                        inject_input[b_idx + 7u]);
+
+                const uint ib = (stream * k_dim + si * 8u * INJECT_BLOCK_SIZE + col) / quant_k;
+
+                const i8vec2 v0_0 = unpack8(int32_t(inject_weights[ib].qs[iqs / 2u])).xy;
+                const i8vec2 v0_1 = unpack8(int32_t(inject_weights[ib].qs[iqs / 2u + 1u])).xy;
+                const vec4   v0   = vec4(v0_0.x, v0_0.y, v0_1.x, v0_1.y);
+
+                const i8vec2 v1_0 = unpack8(int32_t(inject_weights[ib].qs[(iqs + 4u) / 2u])).xy;
+                const i8vec2 v1_1 = unpack8(int32_t(inject_weights[ib].qs[(iqs + 4u) / 2u + 1u])).xy;
+                const vec4   v1   = vec4(v1_0.x, v1_0.y, v1_1.x, v1_1.y);
+
+                // RADV lowers the native two-dot sum as one reverse-order FMA
+                // chain. Preserve it despite precise scatter propagating here.
+                float rowtmp = dot(bv1, v1);
+                rowtmp       = fma(bv0.w, v0.w, rowtmp);
+                rowtmp       = fma(bv0.z, v0.z, rowtmp);
+                rowtmp       = fma(bv0.y, v0.y, rowtmp);
+                rowtmp       = fma(bv0.x, v0.x, rowtmp);
+                temp         = fma(rowtmp, float(inject_weights[ib].d), temp);
+            }
+            temp = subgroupAdd(temp);
+            if (tid == 0u) {
+#ifdef TP5_HC_SUM
+                fused_slot[row] = temp;
+#else
+                fused_slot = temp;
+#endif
+            }
+        }
+        barrier();
+    }
+
+    float sum    = 0.0;
+    float weight = 0.0;
+    if (COMBINE) {
+#ifdef TP5_HC_SUM
+        const float raw_inject = fused_slot[row];
+#else
+        const float raw_inject = FUSE_INJECT ? fused_slot : inject[stream];
+#endif
+        precise float scaled  = raw_inject * 0.25 + 0.0;
+        precise float sigmoid = 1.0 / (1.0 + exp(-scaled));
+        weight                = sigmoid * 2.0 + 0.0;
+    }
+    [[unroll]] for (uint i = 0u; i < iterations; ++i) {
+        const uint col   = tid + i * 512u;
+        float      value = 0.0;
+        if (col < p.width) {
+            value = residual[offset + col];
+            if (COMBINE) {
+#ifdef TP5_HC_SUM
+                precise float product = block_sums[col] * weight;
+#else
+                precise float product = block_value(col, stream) * weight;
+#endif
+                precise float result   = value + product;
+                value                  = result;
+                combined[offset + col] = value;
+            }
+        }
+        values[i] = value;
+        sum += value * value;
+    }
+    partials[partial_base + tid] = sum;
+    barrier();
+    [[unroll]] for (uint stride = 256u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            sum += partials[partial_base + tid + stride];
+            partials[partial_base + tid] = sum;
+        }
+        barrier();
+    }
+    const float mean  = partials[partial_base] / float(p.width);
+    const float scale = inversesqrt(mean + p.epsilon);
+    [[unroll]] for (uint i = 0u; i < iterations; ++i) {
+        const uint col = tid + i * 512u;
+        if (col < p.width) {
+            float norm               = scale * values[i];
+            normalized[offset + col] = norm * gamma[offset + col];
+        }
+    }
+}
+
+void main() {
+#ifdef TP5_HC_SUM
+    for (uint col = gl_LocalInvocationID.x; col < p.width; col += 1024u) {
+        block_sums[col] = block_value(col, 2u * gl_WorkGroupID.x);
+    }
+    barrier();
+#endif
+    // Match rms_norm.comp's constant loop instances, not a dynamic loop:
+    // RADV contracts their sum-of-squares arithmetic differently.
+    const uint blocks = (p.width + 511u) / 512u;
+    if (blocks > 4u)
+        normalize(8u);
+    else if (blocks == 4u)
+        normalize(4u);
+    else if (blocks == 3u)
+        normalize(3u);
+    else if (blocks == 2u)
+        normalize(2u);
+    else
+        normalize(1u);
+}

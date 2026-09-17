@@ -1,0 +1,237 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+
+#include "rope_params.glsl"
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0, std430) readonly buffer Q {
+    float query[];
+};
+
+layout(binding = 1, std430) readonly buffer K {
+    float key[];
+};
+
+layout(binding = 2, std430) readonly buffer V {
+    float value[];
+};
+#if ATTENTION_PREP_COMPACT
+layout(binding = 3, std430) readonly buffer Gamma {
+    float gamma_data[];
+};
+
+layout(binding = 4, std430) readonly buffer Pos {
+    int rope_data_pos[];
+};
+
+layout(binding = 5, std430) readonly buffer KRows {
+    uvec2 k_rows[];
+};
+
+layout(binding = 6, std430) readonly buffer VRows {
+    uvec2 v_rows[];
+};
+
+layout(binding = 7, std430) writeonly buffer QOut {
+    float q_out[];
+};
+
+layout(binding = 8, std430) writeonly buffer KOut {
+    float16_t k_out[];
+};
+
+layout(binding = 9, std430) writeonly buffer VOut {
+    float16_t v_out[];
+};
+
+layout(binding = 10, std430) readonly buffer M {
+    float16_t data_m[];
+};
+
+layout(binding = 11, std430) writeonly buffer SM {
+    int data_sm[];
+};
+#else
+layout(binding = 3, std430) readonly buffer QGamma {
+    float q_gamma[];
+};
+
+layout(binding = 4, std430) readonly buffer KGamma {
+    float k_gamma[];
+};
+
+layout(binding = 5, std430) readonly buffer Pos {
+    int rope_data_pos[];
+};
+
+layout(binding = 6, std430) readonly buffer KRows {
+    uvec2 k_rows[];
+};
+
+layout(binding = 7, std430) readonly buffer VRows {
+    uvec2 v_rows[];
+};
+
+layout(binding = 8, std430) writeonly buffer QOut {
+    float q_out[];
+};
+
+layout(binding = 9, std430) writeonly buffer KOut {
+    float16_t k_out[];
+};
+
+layout(binding = 10, std430) writeonly buffer VOut {
+    float16_t v_out[];
+};
+#endif
+
+#if ATTENTION_PREP_COMPACT
+#    include "flash_attn_sparse_compact.glsl"
+#endif
+
+layout(push_constant) uniform parameter {
+    rope_params rope;
+    uint        q_heads;
+    uint        kv_heads;
+    uint        q_stride;
+    uint        k_row_stride;
+    uint        v_row_stride;
+    float       q_eps;
+    float       k_eps;
+#if ATTENTION_PREP_COMPACT
+    uint             q_gamma_offset;
+    uint             k_gamma_offset;
+    CompactionParams compact;
+#endif
+}
+
+p;
+
+shared float sumsh[512];
+shared float rope_data_a[1024];
+#define RMS_NORM_ROPE_FUSION 1
+#define ROPE_D_TYPE          float
+#define rope_data_d          q_out
+// Frequency factors are absent in this region; the host checks that invariant.
+#if ATTENTION_PREP_COMPACT
+#    define rope_data_ff gamma_data
+#else
+#    define rope_data_ff q_gamma
+#endif
+#define rope_data_i k_rows
+#include "rope_funcs.glsl"
+#undef ROPE_D_TYPE
+#undef rope_data_d
+
+// Keep the native F16 conversion at the rotary expression. An intermediate
+// F32 LDS store adds a rounding boundary absent from the F16 cache kernel.
+#define ROPE_D_TYPE    float16_t
+#define rope_data_d    k_out
+#define rope_a_coord   rope_a_coord_f16
+#define rope_yarn_ramp rope_yarn_ramp_f16
+#define rope_yarn      rope_yarn_f16
+#define rope_norm      rope_norm_f16
+#define rope_neox      rope_neox_f16
+#define rope_multi     rope_multi_f16
+#define rope_vision    rope_vision_f16
+#include "rope_funcs.glsl"
+#undef rope_a_coord
+#undef rope_yarn_ramp
+#undef rope_yarn
+#undef rope_norm
+#undef rope_neox
+#undef rope_multi
+#undef rope_vision
+#undef ROPE_D_TYPE
+#undef rope_data_d
+
+void main() {
+    const uint tid   = gl_LocalInvocationID.x;
+    const uint group = gl_WorkGroupID.x;
+
+#if ATTENTION_PREP_COMPACT
+    const uint prep_groups = p.q_heads + 2 * p.kv_heads;
+    if (group >= prep_groups) {
+        const uint row = group - prep_groups;
+        const uint q   = row % p.compact.N;
+        const uint rem = row / p.compact.N;
+        const uint iq2 = rem % p.compact.nem2;
+        const uint iq3 = rem / p.compact.nem2;
+        run_sparse_compact(q, iq2, iq3, p.compact);
+        return;
+    }
+#endif
+
+    const uint width = p.rope.ne00;
+    if (group >= p.q_heads + p.kv_heads) {
+        const uint head = group - p.q_heads - p.kv_heads;
+        for (uint d = tid; d < width; d += 512) {
+            v_out[v_rows[0].x * p.v_row_stride + head * width + d] = float16_t(value[head * width + d]);
+        }
+        return;
+    }
+    const bool is_q = group < p.q_heads;
+    const uint head = is_q ? group : group - p.q_heads;
+    const uint base = head * (is_q ? p.q_stride : width);
+    float      sum  = 0.0f;
+    // Match rms_norm.comp's 512-lane, constant-unrolled accumulation and tree.
+    if (width <= 512) {
+        float x = tid < width ? (is_q ? query[base + tid] : key[base + tid]) : 0.0f;
+        sum += x * x;
+    } else {
+        [[unroll]] for (uint i = 0; i < 2; ++i) {
+            uint  d = tid + i * 512;
+            float x = d < width ? (is_q ? query[base + d] : key[base + d]) : 0.0f;
+            sum += x * x;
+        }
+    }
+    sumsh[tid] = sum;
+    barrier();
+    [[unroll]] for (uint s = 256; s > 0; s >>= 1) {
+        if (tid < s) {
+            sum += sumsh[tid + s];
+            sumsh[tid] = sum;
+        }
+        barrier();
+    }
+    const float scale = inversesqrt(sumsh[0] / float(width) + (is_q ? p.q_eps : p.k_eps));
+    for (uint d = tid; d < width; d += 512) {
+        float x = is_q ? query[base + d] : key[base + d];
+#if ATTENTION_PREP_COMPACT
+        float gamma = is_q ? gamma_data[p.q_gamma_offset + d] : gamma_data[p.k_gamma_offset + d];
+#else
+        float gamma = is_q ? q_gamma[d] : k_gamma[d];
+#endif
+        rope_data_a[d] = scale * x * gamma;
+    }
+    barrier();
+    rope_params rp     = p.rope;
+    rp.nb11            = width;
+    rp.nb12            = width;
+    rp.nb13            = width;
+    rp.set_rows_stride = 0;
+    rp.d_offset        = is_q ? head * width : k_rows[0].x * p.k_row_stride + head * width;
+    for (uint d = 2 * tid; d < width; d += 1024) {
+        if (is_q) {
+            if (rp.rope_mode == 0)
+                rope_norm(d, 0, 0, 0, rp);
+            else if (rp.rope_mode == 2)
+                rope_neox(d, 0, 0, 0, rp);
+            else
+                rope_multi(d, 0, 0, 0, rp);
+        } else {
+            if (rp.rope_mode == 0)
+                rope_norm_f16(d, 0, 0, 0, rp);
+            else if (rp.rope_mode == 2)
+                rope_neox_f16(d, 0, 0, 0, rp);
+            else
+                rope_multi_f16(d, 0, 0, 0, rp);
+        }
+    }
+}

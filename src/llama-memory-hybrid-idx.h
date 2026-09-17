@@ -18,98 +18,100 @@
 
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
-    llama_memory_hybrid_idx(
-        const llama_model & model,
-                            /* attn */
-                ggml_type   type_k,
-                ggml_type   type_v,
-                     bool   v_trans,
-                 uint32_t   kv_size,
-                 uint32_t   n_pad,
-                 uint32_t   n_swa,
-           llama_swa_type   swa_type,
-                            /* recurrent */
-                ggml_type   type_r,
-                ggml_type   type_s,
-                 uint32_t   rs_size,
-                            /* common */
-                 uint32_t   n_seq_max,
-                 uint32_t   n_rs_seq,
-                     bool   offload,
-                     bool   unified,
-                            /* layer filters */
-    const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr,
-                            /* the indexer cache exists only if this is given */
-    const layer_filter_cb & filter_idx);
+  llama_memory_hybrid_idx(const llama_model &     model,
+                          /* attn */
+                          ggml_type               type_k,
+                          ggml_type               type_v,
+                          bool                    v_trans,
+                          uint32_t                kv_size,
+                          uint32_t                n_pad,
+                          uint32_t                n_swa,
+                          llama_swa_type          swa_type,
+                          /* recurrent */
+                          ggml_type               type_r,
+                          ggml_type               type_s,
+                          uint32_t                rs_size,
+                          uint32_t                n_brain_max,
+                          uint32_t                n_hand_max,
+                          /* common */
+                          uint32_t                n_seq_max,
+                          uint32_t                n_rs_seq,
+                          bool                    offload,
+                          bool                    unified,
+                          /* layer filters */
+                          const layer_filter_cb & filter_attn,
+                          const layer_filter_cb & filter_recr,
+                          /* the indexer cache exists only if this is given */
+                          const layer_filter_cb & filter_idx);
 
-    ~llama_memory_hybrid_idx() = default;
+  ~llama_memory_hybrid_idx() = default;
 
-    //
-    // llama_memory_i
-    //
+  //
+  // llama_memory_i
+  //
 
-    llama_memory_context_ptr init_batch(
-            llama_batch_allocr & balloc,
-            uint32_t n_ubatch,
-            bool embd_all) override;
+  llama_memory_context_ptr init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) override;
 
-    llama_memory_context_ptr init_full() override;
+  llama_memory_context_ptr init_full() override;
 
-    llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
+  llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
-    void clear(bool data) override;
+  void clear(bool data) override;
 
-    bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
-    void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
-    void seq_keep(llama_seq_id seq_id)                                                          override;
-    void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
-    void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
+  bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
+  void seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+  void seq_keep(llama_seq_id seq_id) override;
+  void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) override;
+  void seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) override;
 
-    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
-    // Both halves of the hybrid plus the indexer cache.
-    void materialize() const override;
+  std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+  // Both halves of the hybrid plus the indexer cache.
+  void                                         materialize() const override;
 
-    // state write/load
+  // state write/load
 
-    void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
-    void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
+  void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
+  void state_read(llama_io_read_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
-    //
-    // llama_memory_hybrid_idx specific API
-    //
+  //
+  // llama_memory_hybrid_idx specific API
+  //
 
-    llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
+  llama_kv_cache * get_mem_idx() const;  // nullptr when the model carries no indexer
 
-    // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
-    // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
-    //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
-    //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
-    //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
-    //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
-    // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
-    // the caller then adds the attention mask, the only part of the bias that varies within a block
-    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias,
-                       ggml_tensor * dirty_cells = nullptr,
-                       ggml_tensor * dirty_pos   = nullptr,
-                       ggml_tensor * dirty_rows  = nullptr) const;
+  // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
+  // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
+  //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
+  //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
+  //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
+  //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
+  // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
+  // the caller then adds the attention mask, the only part of the bias that varies within a block
+  void set_input_qsa(ggml_tensor *        cell_blk,
+                     ggml_tensor *        blk_cells,
+                     ggml_tensor *        blk_pos,
+                     ggml_tensor *        bias,
+                     const llama_ubatch * ubatch,
+                     uint32_t             ratio,
+                     bool                 blk_bias,
+                     ggml_tensor *        dirty_cells = nullptr,
+                     ggml_tensor *        dirty_pos   = nullptr,
+                     ggml_tensor *        dirty_rows  = nullptr) const;
 
-    // [TAG_QSA_POOLED_CACHE] cache of the indexer's block summary keys (mean-pooled,
-    // normalized, roped), one f32 row per position block, written by the graph via set_rows.
-    // Only complete blocks are scored and a complete block's members never change, so rows are
-    // write-once per content epoch. Validity is a per-sequence block watermark; seq_rm clamps
-    // it and replay recomputes the range. Rows at or beyond the watermark may hold stale but
-    // finite data and are masked by the -inf bias. Single-stream memories only.
-    ggml_tensor * get_pooled_k(int32_t il) const;              // nullptr: no indexer / multi-stream
-    uint32_t get_pooled_rows() const { return pooled_rows; }   // rows per stream, incl. trailing dustbin row
+  // [TAG_QSA_POOLED_CACHE] cache of the indexer's block summary keys (mean-pooled,
+  // normalized, roped), one f32 row per position block, written by the graph via set_rows.
+  // Only complete blocks are scored and a complete block's members never change, so rows are
+  // write-once per content epoch. Validity is a per-sequence block watermark; seq_rm clamps
+  // it and replay recomputes the range. Rows at or beyond the watermark may hold stale but
+  // finite data and are masked by the -inf bias. Single-stream memories only.
+  ggml_tensor * get_pooled_k(int32_t il) const;                  // nullptr: no indexer / multi-stream
+  uint32_t      get_pooled_rows() const { return pooled_rows; }  // rows per stream, incl. trailing dustbin row
 
-    // blocks of seq_id whose pooled rows are known valid; mutable like a cache's bookkeeping
-    int64_t & pooled_valid(llama_seq_id seq_id) const;
+  // blocks of seq_id whose pooled rows are known valid; mutable like a cache's bookkeeping
+  int64_t & pooled_valid(llama_seq_id seq_id) const;
 
-    // Resets all pooled-cache watermarks (e.g. on compute failure or clear)
-    void clear_pooled_cache() { pooled_reset(-1); }
+  // Resets all pooled-cache watermarks (e.g. on compute failure or clear)
+  void clear_pooled_cache() { pooled_reset(-1); }
 
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step

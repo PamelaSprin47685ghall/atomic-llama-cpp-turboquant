@@ -1,0 +1,172 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_clustered : enable
+
+layout(constant_id = 0) const uint SUBGROUP_SIZE = 64;
+
+const uint LANES_PER_COLUMN = 8;
+const uint ROWS_PER_LANE    = 16;  // 128 / 8
+const uint S_V              = 128;
+
+const uint COLS_PER_SUBGROUP = SUBGROUP_SIZE / LANES_PER_COLUMN;
+#ifdef GDN_FUSED_NORM
+const uint WORKGROUP_SIZE = 1024;
+#else
+const uint WORKGROUP_SIZE = 256;
+#endif
+const uint SUBGROUPS_PER_WG = WORKGROUP_SIZE / SUBGROUP_SIZE;
+const uint COLS_PER_WG      = COLS_PER_SUBGROUP * SUBGROUPS_PER_WG;
+
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint  value_heads;
+    uint  key_heads;
+    float scale;
+#ifdef GDN_FUSED_NORM
+    float epsilon;
+#endif
+};
+
+layout(binding = 0) readonly buffer QBuf {
+    float data_q[];
+};
+
+layout(binding = 1) readonly buffer KBuf {
+    float data_k[];
+};
+
+layout(binding = 2) readonly buffer VBuf {
+    float data_v[];
+};
+
+layout(binding = 3) readonly buffer GBuf {
+    float data_g[];
+};
+
+layout(binding = 4) readonly buffer BetaBuf {
+    float data_beta[];
+};
+
+layout(binding = 5) readonly buffer StateInBuf {
+    float data_state_in[];
+};
+
+layout(binding = 6) writeonly buffer StateOutBuf {
+    float data_state_out[];
+};
+
+layout(binding = 7) writeonly buffer AttnBuf {
+    float data_attn[];
+};
+#if defined(GDN_CACHED_INPUT)
+layout(binding = 8) readonly buffer StateRowIDBuf {
+    int data_state_row_id[];
+};
+#endif
+#ifdef GDN_FUSED_NORM
+layout(binding = 9) readonly buffer GammaBuf {
+    float data_gamma[];
+};
+
+layout(binding = 10) readonly buffer ZBuf {
+    float data_z[];
+};
+
+shared float head_attn[128];
+shared float norm_sum[512];
+#endif
+
+void main() {
+    const uint head_id = gl_WorkGroupID.x;
+    const uint lane    = gl_SubgroupInvocationID % 8u;
+    const uint column  = gl_WorkGroupID.z * COLS_PER_WG + gl_SubgroupID * COLS_PER_SUBGROUP +
+                        (gl_SubgroupInvocationID / LANES_PER_COLUMN);
+
+    const uint qk_head = head_id % key_heads;
+
+#if defined(GDN_CACHED_INPUT)
+    const uint state_row     = uint(data_state_row_id[0]);
+    const uint state_in_base = state_row * (128u * 128u * value_heads) + head_id * (128u * 128u) + column * 128u;
+#else
+    const uint state_in_base = head_id * (128u * 128u) + column * 128u;
+#endif
+    const uint state_base = head_id * (128u * 128u) + column * 128u;
+    const uint qk_base    = qk_head * 128u;
+    const uint v_base     = head_id * 128u;
+
+    float s_shard[16];
+    [[unroll]] for (uint r = 0u; r < 16u; ++r) {
+        const uint row = r * 8u + lane;
+        s_shard[r]     = data_state_in[state_in_base + row];
+    }
+
+    const float beta_val = data_beta[head_id];
+    const float g_val    = exp(data_g[head_id]);
+    const float v_val    = data_v[v_base + column];
+
+    float k_reg[16];
+    float q_reg[16];
+    [[unroll]] for (uint r = 0u; r < 16u; ++r) {
+        const uint row = r * 8u + lane;
+        k_reg[r]       = data_k[qk_base + row];
+        q_reg[r]       = data_q[qk_base + row];
+    }
+
+    float kv_shard = 0.0;
+    [[unroll]] for (uint r = 0u; r < 16u; ++r) { kv_shard += g_val * s_shard[r] * k_reg[r]; }
+    const float kv_col = subgroupClusteredAdd(kv_shard, 8u);
+
+    const float delta_col = (v_val - kv_col) * beta_val;
+
+    float attn_partial = 0.0;
+    [[unroll]] for (uint r = 0u; r < 16u; ++r) {
+        const float new_s = g_val * s_shard[r] + k_reg[r] * delta_col;
+        s_shard[r]        = new_s;
+        attn_partial += new_s * q_reg[r];
+    }
+    const float attn_col = subgroupClusteredAdd(attn_partial, 8u);
+
+    if (lane == 0u) {
+#ifdef GDN_FUSED_NORM
+        // One workgroup owns all 128 columns. The F32 handoff preserves the
+        // original delta-output rounding before the native normalization tree.
+        head_attn[column] = attn_col * scale;
+#else
+        data_attn[head_id * 128u + column] = attn_col * scale;
+#endif
+    }
+
+    [[unroll]] for (uint r = 0u; r < 16u; ++r) {
+        const uint row                   = r * 8u + lane;
+        data_state_out[state_base + row] = s_shard[r];
+    }
+#ifdef GDN_FUSED_NORM
+    barrier();
+    const uint tid = gl_LocalInvocationID.x;
+    float      xi  = 0.0f;
+    if (tid < 128u)
+        xi = head_attn[tid];
+    float sum = xi * xi;
+    if (tid < 512u)
+        norm_sum[tid] = sum;
+    barrier();
+    // Match qwen4_gdn_segment_norm.comp, including its zero upper lanes.
+    [[unroll]] for (uint stride = 256u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            sum += norm_sum[tid + stride];
+            norm_sum[tid] = sum;
+        }
+        barrier();
+    }
+    const float norm_scale = inversesqrt(norm_sum[0] / 128.0f + epsilon);
+    if (tid < 128u) {
+        const uint  offset     = head_id * 128u + tid;
+        const float normalized = norm_scale * head_attn[tid];
+        const float gate       = 1.0f / (1.0f + exp(-data_z[offset]));
+        data_attn[offset]      = normalized * data_gamma[tid] * gate;
+    }
+#endif
+}

@@ -1,0 +1,226 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint  key_heads;
+    uint  value_heads;
+    float q_epsilon;
+    float k_epsilon;
+};
+
+#if defined(GDN_CACHED_INPUT)
+layout(binding = 0) readonly buffer HistoryCacheBuf {
+    float data_history_cache[];
+};
+
+layout(binding = 1) readonly buffer ConvWeightBuf {
+    float data_conv_weight[];
+};
+
+layout(binding = 2) readonly buffer RawAlphaBuf {
+    float data_raw_alpha[];
+};
+
+layout(binding = 3) readonly buffer AlphaBiasBuf {
+    float data_alpha_bias[];
+};
+
+layout(binding = 4) readonly buffer AlphaScaleBuf {
+    float data_alpha_scale[];
+};
+
+layout(binding = 5) readonly buffer RawBetaBuf {
+    float data_raw_beta[];
+};
+
+layout(binding = 6) writeonly buffer CombinedQKVBuf {
+    float data_combined_qkv[];
+};
+
+layout(binding = 7) writeonly buffer GBuf {
+    float data_g[];
+};
+
+layout(binding = 8) writeonly buffer BetaBuf {
+    float data_beta[];
+};
+
+layout(binding = 9) readonly buffer RawQKVBuf {
+    float data_raw_qkv[];
+};
+
+layout(binding = 10) readonly buffer HistoryRowIDBuf {
+    int data_history_row_id[];
+};
+
+layout(binding = 11) writeonly buffer HistoryDstBuf {
+    float data_history_dst[];
+};
+#else
+layout(binding = 0) readonly buffer ConcatBuf {
+    float data_concat[];
+};
+
+layout(binding = 1) readonly buffer ConvWeightBuf {
+    float data_conv_weight[];
+};
+
+layout(binding = 2) readonly buffer RawAlphaBuf {
+    float data_raw_alpha[];
+};
+
+layout(binding = 3) readonly buffer AlphaBiasBuf {
+    float data_alpha_bias[];
+};
+
+layout(binding = 4) readonly buffer AlphaScaleBuf {
+    float data_alpha_scale[];
+};
+
+layout(binding = 5) readonly buffer RawBetaBuf {
+    float data_raw_beta[];
+};
+
+layout(binding = 6) writeonly buffer QBuf {
+    float data_q[];
+};
+
+layout(binding = 7) writeonly buffer KBuf {
+    float data_k[];
+};
+
+layout(binding = 8) writeonly buffer VBuf {
+    float data_v[];
+};
+
+layout(binding = 9) writeonly buffer GBuf {
+    float data_g[];
+};
+
+layout(binding = 10) writeonly buffer BetaBuf {
+    float data_beta[];
+};
+#endif
+
+shared float sh_sum[512];
+
+float op_silu(float x) {
+    return x / (1.0f + exp(-x));
+}
+
+float op_softplus(float x) {
+    return (x > 20.0f) ? x : log(1.0f + exp(x));
+}
+
+float op_sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
+void main() {
+    const uint group_id = gl_WorkGroupID.x;
+    const uint tid      = gl_LocalInvocationID.x;
+
+    if (group_id >= 2u * key_heads + value_heads) {
+        return;
+    }
+
+    // For tid < 128, compute 4-tap convolution dot product and native SiLU
+    float silu_val = 0.0f;
+    if (tid < 128u) {
+        const uint channel = group_id * 128u + tid;
+        const uint base    = 4u * channel;
+
+#if defined(GDN_CACHED_INPUT)
+        const uint total_channels = (2u * key_heads + value_heads) * 128u;
+        const uint hist_row       = uint(data_history_row_id[0]);
+        const uint hist_base      = hist_row * (3u * total_channels) + channel * 3u;
+
+        const float h0      = data_history_cache[hist_base + 0u];
+        const float h1      = data_history_cache[hist_base + 1u];
+        const float h2      = data_history_cache[hist_base + 2u];
+        const float raw_val = data_raw_qkv[channel];
+
+        const float conv_val =
+            dot(vec4(h0, h1, h2, raw_val), vec4(data_conv_weight[base], data_conv_weight[base + 1u],
+                                                data_conv_weight[base + 2u], data_conv_weight[base + 3u]));
+
+        // Update history cache destination view with tail {h1, h2, raw_val}
+        const uint dst_hist_base             = channel * 3u;
+        data_history_dst[dst_hist_base + 0u] = h1;
+        data_history_dst[dst_hist_base + 1u] = h2;
+        data_history_dst[dst_hist_base + 2u] = raw_val;
+#else
+        const float conv_val =
+            dot(vec4(data_concat[base], data_concat[base + 1u], data_concat[base + 2u], data_concat[base + 3u]),
+                vec4(data_conv_weight[base], data_conv_weight[base + 1u], data_conv_weight[base + 2u],
+                     data_conv_weight[base + 3u]));
+#endif
+
+        silu_val = op_silu(conv_val);
+    }
+
+    if (group_id < 2u * key_heads) {
+        // Q or K group: uniform workgroup branch
+        const bool  is_q     = (group_id < key_heads);
+        const uint  head_idx = is_q ? group_id : (group_id - key_heads);
+        const float eps      = is_q ? q_epsilon : k_epsilon;
+
+        // Populate shared memory for 512-thread halving tree
+        sh_sum[tid] = (tid < 128u) ? (silu_val * silu_val) : 0.0f;
+        barrier();
+
+        // Original 512-thread shared-halving L2 reduction tree
+        [[unroll]] for (int s = 256; s > 0; s >>= 1) {
+            if (tid < uint(s)) {
+                sh_sum[tid] += sh_sum[tid + uint(s)];
+            }
+            barrier();
+        }
+
+        // Native denominator: 1.0 / max(sqrt(sum), epsilon)
+        const float scale = 1.0f / max(sqrt(sh_sum[0]), eps);
+
+        if (tid < 128u) {
+            const float norm_val = scale * silu_val;
+#if defined(GDN_CACHED_INPUT)
+            data_combined_qkv[group_id * 128u + tid] = norm_val;
+#else
+            const uint dst_idx = head_idx * 128u + tid;
+            if (is_q) {
+                data_q[dst_idx] = norm_val;
+            } else {
+                data_k[dst_idx] = norm_val;
+            }
+#endif
+        }
+    } else {
+        // V group: uniform workgroup branch
+        const uint v_head = group_id - 2u * key_heads;
+
+        // V groups write SiLU values directly
+        if (tid < 128u) {
+#if defined(GDN_CACHED_INPUT)
+            data_combined_qkv[group_id * 128u + tid] = silu_val;
+#else
+            data_v[v_head * 128u + tid] = silu_val;
+#endif
+        }
+
+        // V-group tid 0 uniquely produces its alpha activation and beta sigmoid
+        if (tid == 0u) {
+            const float raw_a   = data_raw_alpha[v_head];
+            const float a_bias  = data_alpha_bias[v_head];
+            const float a_scale = data_alpha_scale[v_head];
+            const float raw_b   = data_raw_beta[v_head];
+
+            const float a_biased   = raw_a + a_bias;
+            const float a_softplus = op_softplus(a_biased);
+
+            data_g[v_head]    = a_softplus * a_scale;
+            data_beta[v_head] = op_sigmoid(raw_b);
+        }
+    }
+}

@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <array>
 
 // Opaque device handle implemented in ggml-vulkan.cpp as vk_device.
 // The typedef here must match ggml-vulkan.cpp's exactly.
@@ -42,6 +43,10 @@ struct vk_tp5_device_caps {
     uint32_t timeline_opaque_fd_features = 0;
     uint64_t max_storage_buffer_range = 0;
     uint64_t min_storage_buffer_offset_alignment = 0;
+    bool     storage_buffer_array_dynamic_indexing   = false;
+    uint32_t max_storage_buffer_descriptors          = 0;
+    float    timestamp_period                        = 0;
+    uint32_t timestamp_valid_bits                    = 0;
     char device_uuid[16] = {};
     uint32_t vendor_id = 0;
     uint32_t device_id = 0;
@@ -61,6 +66,41 @@ void ggml_vk_tp5_mem_props(vk_device device, void * out); // VkPhysicalDeviceMem
 bool ggml_vk_tp5_tensor_dev_ref(struct ggml_tensor * t, struct VkBuffer_T ** buf,
                                 uint64_t * off, uint64_t * size, vk_buffer * owner = nullptr);
 
+// Configure the next graph's terminal producer, without recording or waiting.
+// A packed companion is available only after actual recording or validated
+// replay. Taking it consumes the record, so repeated allreduces repack F32.
+void ggml_vk_tp5_set_wire_output(ggml_backend_t backend, struct ggml_tensor * tensor);
+bool ggml_vk_tp5_take_wire_output(ggml_backend_t       backend,
+                                  struct ggml_tensor * tensor,
+                                  struct VkBuffer_T ** buf,
+                                  uint64_t *           off,
+                                  uint64_t *           size,
+                                  vk_buffer *          owner);
+
+struct vk_tp5_hc_binding {
+    struct VkBuffer_T * buffer = nullptr;
+    uint64_t            offset = 0;
+    uint64_t            size   = 0;
+    vk_buffer           owner;
+};
+
+struct vk_tp5_hc_sum {
+    uint32_t                         width   = 0;
+    float                            epsilon = 0;
+    vk_tp5_hc_binding                block;
+    // residual, gamma, combined output, normalized output, inject weights/input
+    std::array<vk_tp5_hc_binding, 6> bindings;
+};
+
+// A recipe exists only for the committed first CB of a replay entry. Ordinary
+// execution retains this CB; a chain may omit it only after producing both HC
+// outputs in the preceding collective's P2, using the exact block binding.
+bool ggml_vk_tp5_hc_consumer(ggml_backend_t backend, void * first_cb, vk_tp5_hc_sum * recipe);
+bool ggml_vk_tp5_hc_sum_pipeline(vk_device                         device,
+                                 struct VkPipeline_T **            pipeline,
+                                 struct VkPipelineLayout_T **      layout,
+                                 struct VkDescriptorSetLayout_T ** dsl);
+
 // Transfer (SDMA) queue for the collective's cross-device P2P copies.
 // Returns false when the device has no distinct transfer queue, in which case
 // the transport falls back to the compute queue. The graphics ring is not used:
@@ -69,4 +109,4 @@ bool ggml_vk_tp5_transfer_queue(vk_device device, struct VkQueue_T ** q, uint32_
 
 void ggml_vk_tp5_sync_device(vk_device device);
 void ggml_vk_tp5_flush_async(ggml_backend_t backend);
-
+void ggml_vk_tp5_mark_queue_submitted(ggml_backend_t backend);

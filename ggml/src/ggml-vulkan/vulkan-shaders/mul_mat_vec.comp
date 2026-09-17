@@ -5,7 +5,11 @@
 #include "mul_mat_vec_base.glsl"
 #include "dequant_funcs.glsl"
 
+#ifdef MOE_DOWN_FOLD
+layout(local_size_x_id = 3, local_size_y = 1, local_size_z = 1) in;
+#else
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+#endif
 
 #if !defined(DATA_A_F32) && !defined(DATA_A_F16) && !defined(DATA_A_BF16)
 #define K_PER_ITER 8
@@ -113,7 +117,11 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
         uint ibi = first_row*p.ncols;
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
             const uint ib = (ibi + col)/QUANT_K; // block index
+#ifdef HC_UP_FOLD
+            ibi += p.ncols * p.stride_d;
+#else
             ibi += p.ncols;
+#endif
 
 #if K_PER_ITER == 8
             vec4 v = dequantize4(ib, iqs, a_offset);
@@ -181,7 +189,63 @@ void iter_aligned_nonquant(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint
 #endif
 
 void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+#ifdef MOE_DOWN_FOLD
+    const uint tid = gl_LocalInvocationID.x % BLOCK_SIZE;
+#    ifdef MOE_FUSE_SHARED_DOWN
+    if (gl_LocalInvocationID.x < BLOCK_SIZE) {
+        uint num_shared_iters = p.shared_k / (8u * BLOCK_SIZE);
+        if (num_shared_iters * 8u * BLOCK_SIZE + 8u * tid < p.shared_k) {
+            num_shared_iters++;
+        }
+        const uint quant_k = 32u;
+        const uint col     = 8u * tid;
+        const uint iqs     = col % quant_k;
+        const uint iybs    = col - iqs;
+
+        FLOAT_TYPE shared_temp[NUM_ROWS];
+        [[unroll]] for (uint n = 0u; n < num_rows; ++n) { shared_temp[n] = FLOAT_TYPE(0); }
+
+        for (uint si = 0u; si < num_shared_iters; ++si) {
+            const uint b_idx = si * 8u * BLOCK_SIZE + iybs + iqs;
+            const vec4 bv0   = vec4(shared_swiglu[b_idx], shared_swiglu[b_idx + 1u], shared_swiglu[b_idx + 2u],
+                                    shared_swiglu[b_idx + 3u]);
+            const vec4 bv1   = vec4(shared_swiglu[b_idx + 4u], shared_swiglu[b_idx + 5u], shared_swiglu[b_idx + 6u],
+                                    shared_swiglu[b_idx + 7u]);
+
+            uint       ibi           = (first_row * p.shared_k + si * 8u * BLOCK_SIZE + col) / quant_k;
+            const uint stride_blocks = p.shared_k / quant_k;
+            [[unroll]] for (uint n = 0u; n < num_rows; ++n) {
+                const uint ib = ibi;
+                ibi += stride_blocks;
+
+                const i8vec2 v0 = unpack8(int32_t(data_shared_down_packed16[ib].qs[iqs / 2u])).xy;
+                const i8vec2 v1 = unpack8(int32_t(data_shared_down_packed16[ib].qs[iqs / 2u + 1u])).xy;
+                const vec4   v  = vec4(v0.x, v0.y, v1.x, v1.y);
+
+                const i8vec2 v2_0 = unpack8(int32_t(data_shared_down_packed16[ib].qs[(iqs + 4u) / 2u])).xy;
+                const i8vec2 v2_1 = unpack8(int32_t(data_shared_down_packed16[ib].qs[(iqs + 4u) / 2u + 1u])).xy;
+                const vec4   v2   = vec4(v2_0.x, v2_0.y, v2_1.x, v2_1.y);
+
+                // Match RADV's contracted native Q8 two-dot sum, even though
+                // the precise final fold propagates to this computation.
+                FLOAT_TYPE rowtmp = dot(bv1, v2);
+                rowtmp            = fma(bv0.w, v.w, rowtmp);
+                rowtmp            = fma(bv0.z, v.z, rowtmp);
+                rowtmp            = fma(bv0.y, v.y, rowtmp);
+                rowtmp            = fma(bv0.x, v.x, rowtmp);
+                shared_temp[n]    = fma(rowtmp, FLOAT_TYPE(data_shared_down_packed16[ib].d), shared_temp[n]);
+            }
+        }
+
+        [[unroll]] for (uint n = 0u; n < num_rows; ++n) { shared_temp[n] = subgroupAdd(shared_temp[n]); }
+        if (tid == 0u) {
+            [[unroll]] for (uint n = 0u; n < num_rows; ++n) { shared_down_outputs[n] = shared_temp[n]; }
+        }
+    }
+#    endif
+#else
     const uint tid = gl_LocalInvocationID.x;
+#endif
 
     get_offsets(a_offset, b_offset, d_offset);
     const bool is_aligned_nonquant =
@@ -295,6 +359,17 @@ void main() {
 #endif
 
     // do NUM_ROWS at a time, unless there aren't enough remaining rows
+#ifdef MOE_DOWN_FOLD
+    if (first_row < p.stride_d) {
+        const uint rows = min(NUM_ROWS, p.stride_d - first_row);
+        fold_slot       = gl_LocalInvocationID.x / BLOCK_SIZE;
+        compute_outputs(first_row, rows);
+    }
+#elif defined(HC_UP_FOLD)
+    if (first_row < p.stride_d) {
+        compute_outputs(first_row, NUM_ROWS);
+    }
+#else
     if (first_row + NUM_ROWS <= p.stride_d) {
         compute_outputs(first_row, NUM_ROWS);
     } else {
@@ -303,4 +378,5 @@ void main() {
         }
         compute_outputs(first_row, min(NUM_ROWS, p.stride_d - first_row));
     }
+#endif
 }

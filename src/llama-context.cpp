@@ -881,14 +881,6 @@ llama_context::llama_context(
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = true;
-    // In tensor-parallel (TP5) mode, the fused GDN shader's internal 'head_id % neq1'
-    // mispairs local Q/K heads with local V heads (TP5.md 8.2). Disable fused GDN
-    // so the graph uses the pure autoregressive DeltaNet with explicit head broadcasting.
-    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        cparams.fused_gdn_ar = false;
-        cparams.fused_gdn_ch = true;
-        cparams.auto_fgdn    = false;
-    }
 
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;

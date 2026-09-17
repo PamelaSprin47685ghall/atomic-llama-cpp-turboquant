@@ -1,0 +1,627 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#include "types.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint BLOCK_SIZE     = 64;
+layout(constant_id = 1) const uint NUM_ROWS_QUANT = 2;
+layout(constant_id = 2) const uint NUM_ROWS_DENSE = 2;
+
+#if defined(GDN_PROJECTIONS)
+
+// GDN Projections:
+// 0: QKV (Q5_K)
+// 1: Z (Q5_K)
+// 2: alpha (Q6_K)
+// 3: beta (Q6_K)
+layout(std430, binding = 0) readonly buffer Weights0 {
+    block_q5_K weights0[];
+};
+
+layout(std430, binding = 0) readonly buffer Weights0Packed16 {
+    block_q5_K_packed16 weights0_packed16[];
+};
+
+layout(std430, binding = 1) readonly buffer Weights1 {
+    block_q5_K weights1[];
+};
+
+layout(std430, binding = 1) readonly buffer Weights1Packed16 {
+    block_q5_K_packed16 weights1_packed16[];
+};
+
+layout(std430, binding = 2) readonly buffer Weights2 {
+    block_q6_K weights2[];
+};
+
+layout(std430, binding = 2) readonly buffer Weights2Packed16 {
+    block_q6_K_packed16 weights2_packed16[];
+};
+
+layout(std430, binding = 3) readonly buffer Weights3 {
+    block_q6_K weights3[];
+};
+
+layout(std430, binding = 3) readonly buffer Weights3Packed16 {
+    block_q6_K_packed16 weights3_packed16[];
+};
+
+#    define WEIGHTS_Q6_A          weights2
+#    define WEIGHTS_Q6_A_PACKED16 weights2_packed16
+#    define WEIGHTS_Q6_B          weights3
+#    define WEIGHTS_Q6_B_PACKED16 weights3_packed16
+#    define OUT_Q6_A              out2
+#    define OUT_Q6_B              out3
+
+#elif defined(QSA_PROJECTIONS)
+
+// QSA Projections:
+// 0: Q (Q5_K)
+// 1: K (Q6_K)
+// 2: V (Q6_K)
+// 3: indexK (BF16)
+layout(std430, binding = 0) readonly buffer Weights0 {
+    block_q5_K weights0[];
+};
+
+layout(std430, binding = 0) readonly buffer Weights0Packed16 {
+    block_q5_K_packed16 weights0_packed16[];
+};
+
+layout(std430, binding = 1) readonly buffer Weights1 {
+    block_q6_K weights1[];
+};
+
+layout(std430, binding = 1) readonly buffer Weights1Packed16 {
+    block_q6_K_packed16 weights1_packed16[];
+};
+
+layout(std430, binding = 2) readonly buffer Weights2 {
+    block_q6_K weights2[];
+};
+
+layout(std430, binding = 2) readonly buffer Weights2Packed16 {
+    block_q6_K_packed16 weights2_packed16[];
+};
+
+layout(std430, binding = 3) readonly buffer Weights3 {
+    uint16_t weights3[];
+};
+
+layout(std430, binding = 3) readonly buffer Weights3Packed32 {
+    uint32_t weights3_packed32[];
+};
+
+#    define WEIGHTS_Q6_A          weights1
+#    define WEIGHTS_Q6_A_PACKED16 weights1_packed16
+#    define WEIGHTS_Q6_B          weights2
+#    define WEIGHTS_Q6_B_PACKED16 weights2_packed16
+#    define OUT_Q6_A              out1
+#    define OUT_Q6_B              out2
+
+#else
+#    error "Either GDN_PROJECTIONS or QSA_PROJECTIONS must be defined"
+#endif
+
+layout(std430, binding = 4) readonly buffer CommonInput {
+    float common_input[];
+};
+
+layout(std430, binding = 4) readonly buffer CommonInputV2 {
+    vec2 common_input_v2[];
+};
+
+layout(std430, binding = 4) readonly buffer CommonInputV4 {
+    vec4 common_input_v4[];
+};
+
+layout(std430, binding = 5) writeonly buffer Out0 {
+    float out0[];
+};
+
+layout(std430, binding = 6) writeonly buffer Out1 {
+    float out1[];
+};
+
+layout(std430, binding = 7) writeonly buffer Out2 {
+    float out2[];
+};
+
+layout(std430, binding = 8) writeonly buffer Out3 {
+    float out3[];
+};
+
+layout(push_constant) uniform PushParams {
+    uint width;
+    uint rows0;
+    uint rows1;
+    uint rows2;
+}
+
+p;
+
+shared float sccache_a[2][BLOCK_SIZE / 16][16];
+shared float sccache_b[2][BLOCK_SIZE / 16][16];
+
+void calc_superblock_q5_k(const uint  matrix_idx,
+                          const uint  v_im,
+                          const uint  l0,
+                          const uint  q_offset,
+                          const uint  y_offset,
+                          const uint  i,
+                          const uint  num_blocks_per_row,
+                          const uint  first_row,
+                          const uint  num_rows,
+                          inout float temp[NUM_ROWS_QUANT]) {
+    const uint y1_idx = i * 256u + y_offset;
+    const uint y2_idx = y1_idx + 128u;
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint ib0 = (first_row + n) * num_blocks_per_row;
+        const vec2 dm  = matrix_idx == 0u ? vec2(weights0[ib0 + i].dm)
+#if defined(GDN_PROJECTIONS)
+                                           :
+                                           vec2(weights1[ib0 + i].dm);
+#else
+                                           :
+                                           vec2(0.0);
+#endif
+
+        const uint32_t scale0_u32 = matrix_idx == 0u ? uint32_t(weights0_packed16[ib0 + i].scales[v_im])
+#if defined(GDN_PROJECTIONS)
+                                                       :
+                                                       uint32_t(weights1_packed16[ib0 + i].scales[v_im]);
+#else
+                                                       :
+                                                       0u;
+#endif
+        const uint32_t scale4_u32 = matrix_idx == 0u ? uint32_t(weights0_packed16[ib0 + i].scales[v_im + 2u])
+#if defined(GDN_PROJECTIONS)
+                                                       :
+                                                       uint32_t(weights1_packed16[ib0 + i].scales[v_im + 2u]);
+#else
+                                                       :
+                                                       0u;
+#endif
+        const uint32_t scale8_u32 = matrix_idx == 0u ? uint32_t(weights0_packed16[ib0 + i].scales[v_im + 4u])
+#if defined(GDN_PROJECTIONS)
+                                                       :
+                                                       uint32_t(weights1_packed16[ib0 + i].scales[v_im + 4u]);
+#else
+                                                       :
+                                                       0u;
+#endif
+
+        const uint32_t scale_0_4_l   = (scale4_u32 << 16) | scale0_u32;
+        const uint32_t scale_0_4_h   = (scale_0_4_l & 0xC0C0C0C0u) >> 2;
+        const vec4     scale_0_4_l_f = vec4(unpack8(scale_0_4_l & 0x3F3F3F3Fu));
+        const vec4     scale8_f      = vec4(unpack8((((scale8_u32 << 12) | scale8_u32) & 0x0F0F0F0Fu) | scale_0_4_h));
+
+        const float sc0 = scale_0_4_l_f.x;
+        const float sc1 = scale_0_4_l_f.y;
+        const float sc2 = scale_0_4_l_f.z;
+        const float sc3 = scale_0_4_l_f.w;
+        const float sc4 = scale8_f.x;
+        const float sc5 = scale8_f.y;
+        const float sc6 = scale8_f.z;
+        const float sc7 = scale8_f.w;
+
+        const uint32_t qs0_16_u32 = matrix_idx == 0u ?
+                                        (uint32_t(weights0_packed16[ib0 + i].qs[q_offset / 2u]) |
+                                         (uint32_t(weights0_packed16[ib0 + i].qs[q_offset / 2u + 8u]) << 16))
+#if defined(GDN_PROJECTIONS)
+                                        :
+                                        (uint32_t(weights1_packed16[ib0 + i].qs[q_offset / 2u]) |
+                                         (uint32_t(weights1_packed16[ib0 + i].qs[q_offset / 2u + 8u]) << 16));
+#else
+                                        :
+                                        0u;
+#endif
+        const uint32_t qs64_80_u32 = matrix_idx == 0u ?
+                                         (uint32_t(weights0_packed16[ib0 + i].qs[q_offset / 2u + 32u]) |
+                                          (uint32_t(weights0_packed16[ib0 + i].qs[q_offset / 2u + 40u]) << 16))
+#if defined(GDN_PROJECTIONS)
+                                         :
+                                         (uint32_t(weights1_packed16[ib0 + i].qs[q_offset / 2u + 32u]) |
+                                          (uint32_t(weights1_packed16[ib0 + i].qs[q_offset / 2u + 40u]) << 16));
+#else
+                                         :
+                                         0u;
+#endif
+
+        uint32_t qs0_16_u32_lo4  = qs0_16_u32 & 0x0F0F0F0Fu;
+        uint32_t qs0_16_u32_hi4  = (qs0_16_u32 >> 4) & 0x0F0F0F0Fu;
+        uint32_t qs64_80_u32_lo4 = qs64_80_u32 & 0x0F0F0F0Fu;
+        uint32_t qs64_80_u32_hi4 = (qs64_80_u32 >> 4) & 0x0F0F0F0Fu;
+
+        const uint32_t qh =
+            matrix_idx == 0u ?
+                pack32(u16vec2(weights0_packed16[ib0 + i].qh[l0 / 2u], weights0_packed16[ib0 + i].qh[l0 / 2u + 8u]))
+#if defined(GDN_PROJECTIONS)
+                :
+                pack32(u16vec2(weights1_packed16[ib0 + i].qh[l0 / 2u], weights1_packed16[ib0 + i].qh[l0 / 2u + 8u]));
+#else
+                :
+                0u;
+#endif
+
+        const uint32_t qs0_16_lo4_offset16  = ((qh >> (2u * v_im)) & 0x01010101u) << 4;
+        const uint32_t qs0_16_hi4_offset16  = ((qh >> (2u * v_im)) & 0x02020202u) << 3;
+        const uint32_t qs64_80_lo4_offset16 = ((qh >> (2u * v_im)) & 0x10101010u);
+        const uint32_t qs64_80_hi4_offset16 = ((qh >> (2u * v_im)) & 0x20202020u) >> 1;
+
+        qs0_16_u32_lo4 += qs0_16_lo4_offset16;
+        qs0_16_u32_hi4 += qs0_16_hi4_offset16;
+        qs64_80_u32_lo4 += qs64_80_lo4_offset16;
+        qs64_80_u32_hi4 += qs64_80_hi4_offset16;
+
+        const vec4 qs0_16_lo4  = vec4(unpack8(qs0_16_u32_lo4));
+        const vec4 qs64_80_lo4 = vec4(unpack8(qs64_80_u32_lo4));
+        const vec4 qs0_16_hi4  = vec4(unpack8(qs0_16_u32_hi4));
+        const vec4 qs64_80_hi4 = vec4(unpack8(qs64_80_u32_hi4));
+
+        const float q4_0  = qs0_16_lo4.x;
+        const float q4_1  = qs0_16_lo4.y;
+        const float q4_2  = qs0_16_lo4.z;
+        const float q4_3  = qs0_16_lo4.w;
+        const float q4_4  = qs0_16_hi4.x;
+        const float q4_5  = qs0_16_hi4.y;
+        const float q4_6  = qs0_16_hi4.z;
+        const float q4_7  = qs0_16_hi4.w;
+        const float q4_8  = qs64_80_lo4.x;
+        const float q4_9  = qs64_80_lo4.y;
+        const float q4_10 = qs64_80_lo4.z;
+        const float q4_11 = qs64_80_lo4.w;
+        const float q4_12 = qs64_80_hi4.x;
+        const float q4_13 = qs64_80_hi4.y;
+        const float q4_14 = qs64_80_hi4.z;
+        const float q4_15 = qs64_80_hi4.w;
+
+        const vec2 by10  = common_input_v2[y1_idx / 2u];
+        const vec2 by116 = common_input_v2[y1_idx / 2u + 8u];
+        const vec2 by132 = common_input_v2[y1_idx / 2u + 16u];
+        const vec2 by148 = common_input_v2[y1_idx / 2u + 24u];
+        const vec2 by20  = common_input_v2[y2_idx / 2u];
+        const vec2 by216 = common_input_v2[y2_idx / 2u + 8u];
+        const vec2 by232 = common_input_v2[y2_idx / 2u + 16u];
+        const vec2 by248 = common_input_v2[y2_idx / 2u + 24u];
+
+        const float sx = fma(by10.x, q4_0, fma(by10.y, q4_1, fma(by116.x, q4_2, by116.y * q4_3)));
+        const float sy = fma(by132.x, q4_4, fma(by132.y, q4_5, fma(by148.x, q4_6, by148.y * q4_7)));
+        const float sz = fma(by20.x, q4_8, fma(by20.y, q4_9, fma(by216.x, q4_10, by216.y * q4_11)));
+        const float sw = fma(by232.x, q4_12, fma(by232.y, q4_13, fma(by248.x, q4_14, by248.y * q4_15)));
+        const float smin =
+            fma(by10.x + by10.y + by116.x + by116.y, sc2,
+                fma(by132.x + by132.y + by148.x + by148.y, sc3,
+                    fma(by20.x + by20.y + by216.x + by216.y, sc6, (by232.x + by232.y + by248.x + by248.y) * sc7)));
+        temp[n] = fma(dm.x, fma(sx, sc0, fma(sy, sc1, fma(sz, sc4, sw * sc5))), fma(-dm.y, smin, temp[n]));
+    }
+}
+
+void compute_q5_k(const uint matrix_idx, const uint first_row, const uint num_rows, const uint tid) {
+    const uint num_blocks_per_row = (p.width + 255u) / 256u;
+
+    const uint it_size = gl_WorkGroupSize.x / 16u;
+    const uint itid    = tid % 16u;
+    const uint ix      = tid / 16u;
+
+    const uint il = itid / 4u;
+    const uint ir = itid - 4u * il;
+
+    const uint v_im = il / 2u;
+    const uint v_in = il % 2u;
+
+    const uint l0       = 4u * ir + 2u * v_in;
+    const uint q_offset = 32u * v_im + l0;
+    const uint y_offset = 64u * v_im + l0;
+
+    float temp[NUM_ROWS_QUANT];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS_QUANT; ++n) { temp[n] = 0.0; }
+
+    [[unroll]] for (uint i = ix; i < num_blocks_per_row; i += it_size) {
+        calc_superblock_q5_k(matrix_idx, v_im, l0, q_offset, y_offset, i, num_blocks_per_row, first_row, num_rows,
+                             temp);
+    }
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) { temp[n] = subgroupAdd(temp[n]); }
+
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            if (matrix_idx == 0u) {
+                out0[first_row + n] = temp[n];
+            }
+#if defined(GDN_PROJECTIONS)
+            else {
+                out1[first_row + n] = temp[n];
+            }
+#endif
+        }
+    }
+}
+
+void calc_superblock_paired_q6_k(const uint  itid,
+                                 const uint  ix,
+                                 const uint  ql_offset,
+                                 const uint  qh_offset,
+                                 const uint  s_offset,
+                                 const uint  y_offset,
+                                 const uint  i,
+                                 const uint  num_blocks_per_row,
+                                 const uint  first_row,
+                                 const uint  num_rows,
+                                 const bool  all_threads,
+                                 inout float temp_a[NUM_ROWS_QUANT],
+                                 inout float temp_b[NUM_ROWS_QUANT],
+                                 inout uint  csel) {
+    const uint y_idx = i * 256u + y_offset;
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        const uint ib0 = (first_row + n) * num_blocks_per_row;
+        csel ^= 1u;
+
+        if (!all_threads) {
+            if (i < num_blocks_per_row) {
+                sccache_a[csel][ix][itid] = float(WEIGHTS_Q6_A[ib0 + i].scales[itid]);
+                sccache_b[csel][ix][itid] = float(WEIGHTS_Q6_B[ib0 + i].scales[itid]);
+            }
+            barrier();
+
+            if (i >= num_blocks_per_row)
+                continue;
+        }
+
+        // Dequantize matrix A weights
+        const uint32_t ql0_a_u32 = uint32_t(WEIGHTS_Q6_A_PACKED16[ib0 + i].ql[ql_offset / 2u]) |
+                                   (uint32_t(WEIGHTS_Q6_A_PACKED16[ib0 + i].ql[ql_offset / 2u + 1u]) << 16);
+        const uint32_t ql32_a_u32 = uint32_t(WEIGHTS_Q6_A_PACKED16[ib0 + i].ql[ql_offset / 2u + 16u]) |
+                                    (uint32_t(WEIGHTS_Q6_A_PACKED16[ib0 + i].ql[ql_offset / 2u + 17u]) << 16);
+
+        const uint32_t ql0_a_u32_lo4  = ql0_a_u32 & 0x0F0F0F0Fu;
+        const uint32_t ql0_a_u32_hi4  = (ql0_a_u32 >> 4) & 0x0F0F0F0Fu;
+        const uint32_t ql32_a_u32_lo4 = ql32_a_u32 & 0x0F0F0F0Fu;
+        const uint32_t ql32_a_u32_hi4 = (ql32_a_u32 >> 4) & 0x0F0F0F0Fu;
+
+        const uint32_t qh_a_u32 = uint32_t(WEIGHTS_Q6_A_PACKED16[ib0 + i].qh[qh_offset / 2u]) |
+                                  (uint32_t(WEIGHTS_Q6_A_PACKED16[ib0 + i].qh[qh_offset / 2u + 1u]) << 16);
+        const uint32_t qh0_a_u32 = (qh_a_u32 & 0x03030303u) << 4;
+        const uint32_t qh2_a_u32 = (qh_a_u32 & 0x0C0C0C0Cu) << 2;
+        const uint32_t qh4_a_u32 = (qh_a_u32 & 0x30303030u);
+        const uint32_t qh6_a_u32 = (qh_a_u32 & 0xC0C0C0C0u) >> 2;
+
+        const uint32_t q0_a_u32 = ql0_a_u32_lo4 | qh0_a_u32;
+        const uint32_t q1_a_u32 = ql32_a_u32_lo4 | qh2_a_u32;
+        const uint32_t q2_a_u32 = ql0_a_u32_hi4 | qh4_a_u32;
+        const uint32_t q3_a_u32 = ql32_a_u32_hi4 | qh6_a_u32;
+
+        const vec4 q0_a = vec4(unpack8(q0_a_u32)) - 32.0;
+        const vec4 q1_a = vec4(unpack8(q1_a_u32)) - 32.0;
+        const vec4 q2_a = vec4(unpack8(q2_a_u32)) - 32.0;
+        const vec4 q3_a = vec4(unpack8(q3_a_u32)) - 32.0;
+
+        // Dequantize matrix B weights
+        const uint32_t ql0_b_u32 = uint32_t(WEIGHTS_Q6_B_PACKED16[ib0 + i].ql[ql_offset / 2u]) |
+                                   (uint32_t(WEIGHTS_Q6_B_PACKED16[ib0 + i].ql[ql_offset / 2u + 1u]) << 16);
+        const uint32_t ql32_b_u32 = uint32_t(WEIGHTS_Q6_B_PACKED16[ib0 + i].ql[ql_offset / 2u + 16u]) |
+                                    (uint32_t(WEIGHTS_Q6_B_PACKED16[ib0 + i].ql[ql_offset / 2u + 17u]) << 16);
+
+        const uint32_t ql0_b_u32_lo4  = ql0_b_u32 & 0x0F0F0F0Fu;
+        const uint32_t ql0_b_u32_hi4  = (ql0_b_u32 >> 4) & 0x0F0F0F0Fu;
+        const uint32_t ql32_b_u32_lo4 = ql32_b_u32 & 0x0F0F0F0Fu;
+        const uint32_t ql32_b_u32_hi4 = (ql32_b_u32 >> 4) & 0x0F0F0F0Fu;
+
+        const uint32_t qh_b_u32 = uint32_t(WEIGHTS_Q6_B_PACKED16[ib0 + i].qh[qh_offset / 2u]) |
+                                  (uint32_t(WEIGHTS_Q6_B_PACKED16[ib0 + i].qh[qh_offset / 2u + 1u]) << 16);
+        const uint32_t qh0_b_u32 = (qh_b_u32 & 0x03030303u) << 4;
+        const uint32_t qh2_b_u32 = (qh_b_u32 & 0x0C0C0C0Cu) << 2;
+        const uint32_t qh4_b_u32 = (qh_b_u32 & 0x30303030u);
+        const uint32_t qh6_b_u32 = (qh_b_u32 & 0xC0C0C0C0u) >> 2;
+
+        const uint32_t q0_b_u32 = ql0_b_u32_lo4 | qh0_b_u32;
+        const uint32_t q1_b_u32 = ql32_b_u32_lo4 | qh2_b_u32;
+        const uint32_t q2_b_u32 = ql0_b_u32_hi4 | qh4_b_u32;
+        const uint32_t q3_b_u32 = ql32_b_u32_hi4 | qh6_b_u32;
+
+        const vec4 q0_b = vec4(unpack8(q0_b_u32)) - 32.0;
+        const vec4 q1_b = vec4(unpack8(q1_b_u32)) - 32.0;
+        const vec4 q2_b = vec4(unpack8(q2_b_u32)) - 32.0;
+        const vec4 q3_b = vec4(unpack8(q3_b_u32)) - 32.0;
+
+        if (all_threads) {
+            sccache_a[csel][ix][itid] = float(WEIGHTS_Q6_A[ib0 + i].scales[itid]);
+            sccache_b[csel][ix][itid] = float(WEIGHTS_Q6_B[ib0 + i].scales[itid]);
+            barrier();
+        }
+
+        const float d_a = float(WEIGHTS_Q6_A[ib0 + i].d);
+        const float d_b = float(WEIGHTS_Q6_B[ib0 + i].d);
+
+        // Load common activation vector once
+        const vec4 by0  = common_input_v4[y_idx / 4u];
+        const vec4 by32 = common_input_v4[y_idx / 4u + 8u];
+        const vec4 by64 = common_input_v4[y_idx / 4u + 16u];
+        const vec4 by96 = common_input_v4[y_idx / 4u + 24u];
+
+        float sum_a[4] = { 0.0, 0.0, 0.0, 0.0 };
+        [[unroll]] for (uint l = 0u; l < 4u; ++l) {
+            sum_a[0] = fma(by0[l], q0_a[l], sum_a[0]);
+            sum_a[1] = fma(by32[l], q1_a[l], sum_a[1]);
+            sum_a[2] = fma(by64[l], q2_a[l], sum_a[2]);
+            sum_a[3] = fma(by96[l], q3_a[l], sum_a[3]);
+        }
+        temp_a[n] = fma(
+            fma(sum_a[0], sccache_a[csel][ix][s_offset],
+                fma(sum_a[1], sccache_a[csel][ix][s_offset + 2u],
+                    fma(sum_a[2], sccache_a[csel][ix][s_offset + 4u], sum_a[3] * sccache_a[csel][ix][s_offset + 6u]))),
+            d_a, temp_a[n]);
+
+        float sum_b[4] = { 0.0, 0.0, 0.0, 0.0 };
+        [[unroll]] for (uint l = 0u; l < 4u; ++l) {
+            sum_b[0] = fma(by0[l], q0_b[l], sum_b[0]);
+            sum_b[1] = fma(by32[l], q1_b[l], sum_b[1]);
+            sum_b[2] = fma(by64[l], q2_b[l], sum_b[2]);
+            sum_b[3] = fma(by96[l], q3_b[l], sum_b[3]);
+        }
+        temp_b[n] = fma(
+            fma(sum_b[0], sccache_b[csel][ix][s_offset],
+                fma(sum_b[1], sccache_b[csel][ix][s_offset + 2u],
+                    fma(sum_b[2], sccache_b[csel][ix][s_offset + 4u], sum_b[3] * sccache_b[csel][ix][s_offset + 6u]))),
+            d_b, temp_b[n]);
+    }
+}
+
+void compute_paired_q6_k(const uint first_row, const uint num_rows, const uint tid) {
+    const uint num_blocks_per_row = (p.width + 255u) / 256u;
+    const uint it_size            = gl_WorkGroupSize.x / 16u;
+    const uint itid               = tid % 16u;
+    const uint ix                 = tid / 16u;
+
+    const uint v_im     = itid / 8u;
+    const uint v_in     = itid - 8u * v_im;
+    const uint l0       = 4u * v_in;
+    const uint is_scale = v_in / 4u;
+
+    const uint ql_offset = 64u * v_im + l0;
+    const uint qh_offset = 32u * v_im + l0;
+    const uint s_offset  = 8u * v_im + is_scale;
+    const uint y_offset  = 128u * v_im + l0;
+
+    float temp_a[NUM_ROWS_QUANT];
+    float temp_b[NUM_ROWS_QUANT];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS_QUANT; ++n) {
+        temp_a[n] = 0.0;
+        temp_b[n] = 0.0;
+    }
+
+    const uint nbr_par_th = num_blocks_per_row % it_size;
+    const uint nbr_all_th = num_blocks_per_row - nbr_par_th;
+
+    uint csel = 0u;
+    uint i0   = 0u;
+    [[unroll]] for (; i0 < nbr_all_th; i0 += it_size) {
+        calc_superblock_paired_q6_k(itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix, num_blocks_per_row,
+                                    first_row, num_rows, true, temp_a, temp_b, csel);
+    }
+    calc_superblock_paired_q6_k(itid, ix, ql_offset, qh_offset, s_offset, y_offset, i0 + ix, num_blocks_per_row,
+                                first_row, num_rows, false, temp_a, temp_b, csel);
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+        temp_a[n] = subgroupAdd(temp_a[n]);
+        temp_b[n] = subgroupAdd(temp_b[n]);
+    }
+
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            OUT_Q6_A[first_row + n] = temp_a[n];
+            OUT_Q6_B[first_row + n] = temp_b[n];
+        }
+    }
+}
+
+#if defined(QSA_PROJECTIONS)
+void compute_bf16(const uint first_row, const uint num_rows, const uint tid) {
+    const uint step      = 4u * BLOCK_SIZE;
+    const uint num_iters = (p.width + step - 1u) / step;
+
+    float temp[NUM_ROWS_DENSE];
+    [[unroll]] for (uint n = 0; n < NUM_ROWS_DENSE; ++n) { temp[n] = 0.0; }
+
+    for (uint i = 0u; i < num_iters; ++i) {
+        const uint col = i * step + 4u * tid;
+        if (col >= p.width)
+            continue;
+        const vec4 b = common_input_v4[col / 4u];
+
+        [[unroll]] for (uint n = 0u; n < num_rows; ++n) {
+            const uint global_row = first_row + n;
+            const uint ib         = (global_row * p.width + col) / 2u;
+
+            const uint word0 = weights3_packed32[ib];
+            const uint word1 = weights3_packed32[ib + 1u];
+
+            const vec4 v = vec4(uintBitsToFloat((word0 & 0x0000ffffu) << 16), uintBitsToFloat(word0 & 0xffff0000u),
+                                uintBitsToFloat((word1 & 0x0000ffffu) << 16), uintBitsToFloat(word1 & 0xffff0000u));
+
+            temp[n] += dot(v, b);
+        }
+    }
+
+    [[unroll]] for (uint n = 0; n < num_rows; ++n) { temp[n] = subgroupAdd(temp[n]); }
+
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) { out3[first_row + n] = temp[n]; }
+    }
+}
+#endif
+
+void main() {
+    const uint wg_id = gl_WorkGroupID.x;
+    const uint tid   = gl_LocalInvocationID.x;
+
+    const uint wgs0 = (p.rows0 + NUM_ROWS_QUANT - 1u) / NUM_ROWS_QUANT;
+    const uint wgs1 = (p.rows1 + NUM_ROWS_QUANT - 1u) / NUM_ROWS_QUANT;
+#if defined(GDN_PROJECTIONS)
+    const uint wgs2 = (p.rows2 + NUM_ROWS_QUANT - 1u) / NUM_ROWS_QUANT;
+#elif defined(QSA_PROJECTIONS)
+    const uint wgs2 = (p.rows2 + NUM_ROWS_DENSE - 1u) / NUM_ROWS_DENSE;
+#endif
+
+    if (wg_id < wgs0) {
+        const uint first_row = wg_id * NUM_ROWS_QUANT;
+        if (first_row >= p.rows0)
+            return;
+        if (first_row + NUM_ROWS_QUANT <= p.rows0) {
+            compute_q5_k(0u, first_row, NUM_ROWS_QUANT, tid);
+        } else {
+            compute_q5_k(0u, first_row, p.rows0 - first_row, tid);
+        }
+    } else if (wg_id < wgs0 + wgs1) {
+        const uint first_row = (wg_id - wgs0) * NUM_ROWS_QUANT;
+#if defined(GDN_PROJECTIONS)
+        if (first_row >= p.rows1)
+            return;
+        if (first_row + NUM_ROWS_QUANT <= p.rows1) {
+            compute_q5_k(1u, first_row, NUM_ROWS_QUANT, tid);
+        } else {
+            compute_q5_k(1u, first_row, p.rows1 - first_row, tid);
+        }
+#elif defined(QSA_PROJECTIONS)
+        if (first_row >= p.rows1)
+            return;
+        if (first_row + NUM_ROWS_QUANT <= p.rows1) {
+            compute_paired_q6_k(first_row, NUM_ROWS_QUANT, tid);
+        } else {
+            compute_paired_q6_k(first_row, p.rows1 - first_row, tid);
+        }
+#endif
+    } else if (wg_id < wgs0 + wgs1 + wgs2) {
+#if defined(GDN_PROJECTIONS)
+        const uint first_row = (wg_id - wgs0 - wgs1) * NUM_ROWS_QUANT;
+        if (first_row >= p.rows2)
+            return;
+        if (first_row + NUM_ROWS_QUANT <= p.rows2) {
+            compute_paired_q6_k(first_row, NUM_ROWS_QUANT, tid);
+        } else {
+            compute_paired_q6_k(first_row, p.rows2 - first_row, tid);
+        }
+#elif defined(QSA_PROJECTIONS)
+        const uint first_row = (wg_id - wgs0 - wgs1) * NUM_ROWS_DENSE;
+        if (first_row >= p.rows2)
+            return;
+        if (first_row + NUM_ROWS_DENSE <= p.rows2) {
+            compute_bf16(first_row, NUM_ROWS_DENSE, tid);
+        } else {
+            compute_bf16(first_row, p.rows2 - first_row, tid);
+        }
+#endif
+    }
+}

@@ -11,6 +11,13 @@
 #define EXPERT_COUNT 8
 #endif
 
+#if defined(TP5_WIRE_OUTPUT) && !defined(USE_SUBGROUP_ADD_NO_SHMEM)
+#    error "TP5_WIRE_OUTPUT requires USE_SUBGROUP_ADD_NO_SHMEM"
+#endif
+#ifdef TP5_WIRE_OUTPUT
+#    extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
 #include "mul_mat_vec_iface.glsl"
 
 layout (push_constant) uniform parameter
@@ -38,6 +45,9 @@ layout (push_constant) uniform parameter
     uint nbi1;
     uint routed;
 #endif
+#    ifdef MOE_FUSE_SHARED_DOWN
+    uint shared_k;
+#    endif
 #else
     uint base_work_group_y;
     uint ne02;
@@ -49,7 +59,10 @@ layout (push_constant) uniform parameter
 
 #ifdef MUL_MAT_ID
 uint expert_id;
-#ifdef MUL_MAT_ID_GROUPED
+#    ifdef MOE_DOWN_FOLD
+uint fold_slot;
+#    endif
+#    ifdef MUL_MAT_ID_GROUPED
 uint expert_count;
 uint expert_row0;
 
@@ -75,7 +88,11 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
     uint expert_i0;
     uint expert_i1;
 
-#ifdef MUL_MAT_ID_GROUPED
+#    ifdef MOE_DOWN_FOLD
+    expert_i0 = fold_slot;
+    expert_i1 = 0u;
+    expert_id = data_ids[expert_i0];
+#    elif defined(MUL_MAT_ID_GROUPED)
     const uint active_idx = gl_WorkGroupID.y;
     const uint tile = data_expert_count[p.grouped_list_offset + active_idx];
     expert_id = tile & 0xffffu;
@@ -84,7 +101,7 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
     const uint packed = mat_vec_packed_row(0u);
     expert_i0 = packed & 0xffffu;
     expert_i1 = packed >> 16;
-#else
+#    else
     if (p.routed != 0) {
         const uint assignment_idx = gl_WorkGroupID.y;
         expert_id = uint(data_ids[1 + 2*assignment_idx]);
@@ -96,7 +113,7 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
         expert_i1 = gl_WorkGroupID.z / p.groups_z;
         expert_id = data_ids[expert_i0 + expert_i1 * p.nbi1];
     }
-#endif
+#    endif
 #else
     const uint batch_idx = gl_WorkGroupID.y + p.base_work_group_y;
 #endif
@@ -138,6 +155,17 @@ layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 layout (constant_id = 1) const uint NUM_ROWS = 1;
 layout (constant_id = 2) const uint NUM_COLS = 1;
 
+#ifdef MOE_DOWN_FOLD
+shared float expert_outputs[10][NUM_ROWS];
+#    ifdef MOE_FUSE_SHARED_DOWN
+shared float shared_down_outputs[NUM_ROWS];
+#    endif
+#endif
+#ifdef MOE_SHARED_UP_SWIGLU
+bool       shared_gate_projection = true;
+FLOAT_TYPE shared_gate_value[NUM_COLS][NUM_ROWS];
+#endif
+
 bool mat_vec_col_active(const uint j) {
 #ifdef MUL_MAT_ID_GROUPED
     return j < expert_count;
@@ -167,7 +195,9 @@ uint mat_vec_d_col_offset(const uint j, const uint d_offset) {
 }
 
 uint mat_vec_first_row() {
-#ifdef MUL_MAT_ID_GROUPED
+#ifdef HC_UP_FOLD
+    return gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z;
+#elif defined(MUL_MAT_ID_GROUPED)
     return NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
 #elif defined(MUL_MAT_ID)
     if (p.routed != 0) {
@@ -187,14 +217,60 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
             temp[j][n] = subgroupAdd(temp[j][n]);
         }
     }
+#    ifdef MOE_SHARED_UP_SWIGLU
+    if (shared_gate_projection) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            [[unroll]] for (uint n = 0; n < num_rows; ++n) { shared_gate_value[j][n] = temp[j][n]; }
+        }
+        return;
+    }
+#    endif
 
+#    ifdef MOE_DOWN_FOLD
+    if (tid == 0) {
+        [[unroll]] for (uint n = 0u; n < num_rows; ++n) {
+            expert_outputs[fold_slot][n] = temp[0][n] * data_fuse0[fold_slot];
+        }
+    }
+    barrier();
+    const uint row = gl_LocalInvocationID.x;
+    if (row < num_rows) {
+        precise float folded = expert_outputs[0][row];
+        [[unroll]] for (uint expert = 1u; expert < 10u; ++expert) { folded = folded + expert_outputs[expert][row]; }
+        const float gate = 1.0 / (1.0 + exp(-shared_gate[0]));
+#        ifdef MOE_FUSE_SHARED_DOWN
+        precise float shared_value = shared_down_outputs[row] * gate;
+#        else
+        precise float shared_value = shared_down[first_row + row] * gate;
+#        endif
+        precise float result    = folded + shared_value;
+        data_d[first_row + row] = result;
+#        ifdef TP5_WIRE_OUTPUT
+        data_wire[first_row + row] = float16_t(result);
+#        endif
+    }
+#    elif defined(HC_UP_FOLD)
+    if (tid == 0) {
+        precise float acc = 0.0;
+        [[unroll]] for (uint n = 0; n < NUM_ROWS; ++n) {
+            precise float gate    = 1.0 / (1.0 + exp(-temp[0][n]));
+            precise float product = data_fuse0[n * p.stride_d + first_row] * gate;
+            if (n == 0u)
+                acc = product;
+            else
+                acc = acc + product;
+        }
+        precise float result = acc * 0.25 + 0.0;
+        data_d[first_row]    = result;
+    }
+#    else
     if (tid == 0) {
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
             if (!mat_vec_col_active(j)) {
                 continue;
             }
             [[unroll]] for (uint n = 0; n < num_rows; ++n) {
-#ifdef MUL_MAT_ID
+#        ifdef MUL_MAT_ID
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse0[expert_id*p.stride_d + first_row + n]);
                 }
@@ -206,18 +282,30 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                     const uint expert_i0 = mat_vec_expert_slot(j);
                     temp[j][n] *= FLOAT_TYPE(data_fuse1[expert_i0]);
                 }
-#else
+#        else
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse0[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
                 if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
                     temp[j][n] += FLOAT_TYPE(data_fuse1[j*p.batch_stride_d + d_offset + first_row + n]);
                 }
-#endif
+#        endif
+#        ifdef HC_DOWN_SILU
+                precise float scaled = temp[j][n] * 0.25 + 0.0;
+                temp[j][n]           = scaled / (1.0 + exp(-scaled));
+#        endif
+#        ifdef MOE_SHARED_UP_SWIGLU
+                const float gate = shared_gate_value[j][n];
+                temp[j][n]       = gate / (1.0 + exp(-gate)) * temp[j][n];
+#        endif
                 data_d[mat_vec_d_col_offset(j, d_offset) + first_row + n] = D_TYPE(temp[j][n]);
+#        ifdef TP5_WIRE_OUTPUT
+                data_wire[mat_vec_d_col_offset(j, d_offset) + first_row + n] = float16_t(temp[j][n]);
+#        endif
             }
         }
     }
+#    endif
 }
 #else
 shared FLOAT_TYPE tmpsh[NUM_COLS][NUM_ROWS][BLOCK_SIZE];

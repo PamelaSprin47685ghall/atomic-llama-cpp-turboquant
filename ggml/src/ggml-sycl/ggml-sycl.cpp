@@ -5554,9 +5554,9 @@ static ggml_backend_i ggml_backend_sycl_interface = {
     /* .get_tensor_async        = */ ggml_backend_sycl_get_tensor_async,
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
-    /* .cpy_tensor_async        = */ NULL, // ggml_backend_sycl_cpy_tensor_async,
-                                           // // TODO: update for the new
-                                           // interface
+    /* .cpy_tensor_async        = */ NULL,  // ggml_backend_sycl_cpy_tensor_async,
+                                            // // TODO: update for the new
+                                            // interface
     /* .synchronize             = */ ggml_backend_sycl_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
@@ -5566,6 +5566,7 @@ static ggml_backend_i ggml_backend_sycl_interface = {
     /* .event_record            = */ ggml_backend_sycl_event_record,
     /* .event_wait              = */ ggml_backend_sycl_event_wait,
     /* .graph_optimize          = */ NULL,
+    /* .set_tensor_snapshot_async = */ NULL,
 };
 
 static ggml_guid_t ggml_backend_sycl_guid() {

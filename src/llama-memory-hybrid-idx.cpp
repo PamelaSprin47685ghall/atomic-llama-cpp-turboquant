@@ -17,35 +17,50 @@
 // llama_memory_hybrid_idx
 //
 
-llama_memory_hybrid_idx::llama_memory_hybrid_idx(
-        const llama_model & model,
-                            /* attn */
-                ggml_type   type_k,
-                ggml_type   type_v,
-                     bool   v_trans,
-                 uint32_t   kv_size,
-                 uint32_t   n_pad,
-                 uint32_t   n_swa,
-           llama_swa_type   swa_type,
-                            /* recurrent */
-                ggml_type   type_r,
-                ggml_type   type_s,
-                 uint32_t   rs_size,
-                            /* common */
-                 uint32_t   n_seq_max,
-                 uint32_t   n_rs_seq,
-                     bool   offload,
-                     bool   unified,
-                            /* layer filters */
-    const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr,
-    const layer_filter_cb & filter_idx) :
-    llama_memory_hybrid(
-        model,
-        type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
-        type_r, type_s, rs_size, n_seq_max, n_seq_max,
-        n_seq_max, n_rs_seq, offload, unified,
-        filter_attn, filter_recr, nullptr),
+llama_memory_hybrid_idx::llama_memory_hybrid_idx(const llama_model &     model,
+                                                 /* attn */
+                                                 ggml_type               type_k,
+                                                 ggml_type               type_v,
+                                                 bool                    v_trans,
+                                                 uint32_t                kv_size,
+                                                 uint32_t                n_pad,
+                                                 uint32_t                n_swa,
+                                                 llama_swa_type          swa_type,
+                                                 /* recurrent */
+                                                 ggml_type               type_r,
+                                                 ggml_type               type_s,
+                                                 uint32_t                rs_size,
+                                                 uint32_t                n_brain_max,
+                                                 uint32_t                n_hand_max,
+                                                 /* common */
+                                                 uint32_t                n_seq_max,
+                                                 uint32_t                n_rs_seq,
+                                                 bool                    offload,
+                                                 bool                    unified,
+                                                 /* layer filters */
+                                                 const layer_filter_cb & filter_attn,
+                                                 const layer_filter_cb & filter_recr,
+                                                 const layer_filter_cb & filter_idx) :
+    llama_memory_hybrid(model,
+                        type_k,
+                        type_v,
+                        v_trans,
+                        kv_size,
+                        n_pad,
+                        n_swa,
+                        swa_type,
+                        type_r,
+                        type_s,
+                        rs_size,
+                        n_brain_max,
+                        n_hand_max,
+                        n_seq_max,
+                        n_rs_seq,
+                        offload,
+                        unified,
+                        filter_attn,
+                        filter_recr,
+                        nullptr),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own

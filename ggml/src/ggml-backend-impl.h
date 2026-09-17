@@ -8,24 +8,24 @@
 extern "C" {
 #endif
 
-    #define GGML_BACKEND_API_VERSION 2
+#define GGML_BACKEND_API_VERSION 3
 
-    //
-    // Backend buffer type
-    //
+//
+// Backend buffer type
+//
 
-    struct ggml_backend_buffer_type_i {
-        const char *          (*get_name)      (ggml_backend_buffer_type_t buft);
-        // allocate a buffer of this type
-        ggml_backend_buffer_t (*alloc_buffer)  (ggml_backend_buffer_type_t buft, size_t size);
-        // tensor alignment
-        size_t                (*get_alignment) (ggml_backend_buffer_type_t buft);
-        // (optional) max buffer size that can be allocated (defaults to SIZE_MAX)
-        size_t                (*get_max_size)  (ggml_backend_buffer_type_t buft);
-        // (optional) data size needed to allocate the tensor, including padding (defaults to ggml_nbytes)
-        size_t                (*get_alloc_size)(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
-        // (optional) check if tensor data is in host memory and uses standard ggml tensor layout (defaults to false)
-        bool                  (*is_host)       (ggml_backend_buffer_type_t buft);
+struct ggml_backend_buffer_type_i {
+    const char * (*get_name)(ggml_backend_buffer_type_t buft);
+    // allocate a buffer of this type
+    ggml_backend_buffer_t (*alloc_buffer)(ggml_backend_buffer_type_t buft, size_t size);
+    // tensor alignment
+    size_t (*get_alignment)(ggml_backend_buffer_type_t buft);
+    // (optional) max buffer size that can be allocated (defaults to SIZE_MAX)
+    size_t (*get_max_size)(ggml_backend_buffer_type_t buft);
+    // (optional) data size needed to allocate the tensor, including padding (defaults to ggml_nbytes)
+    size_t (*get_alloc_size)(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
+    // (optional) check if tensor data is in host memory and uses standard ggml tensor layout (defaults to false)
+    bool (*is_host)(ggml_backend_buffer_type_t buft);
     };
 
     struct ggml_backend_buffer_type {
@@ -155,6 +155,18 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
+        // (optional) capture host bytes now, queue the tensor write after prior backend work.
+        // Success lets the caller immediately overwrite/free data; unlike set_tensor_async,
+        // the backend must not borrow the source pointer. A false return must enqueue no
+        // work and change nothing. dry_run only checks support (also without side effects),
+        // allowing composite backends to validate every destination before capturing any.
+        bool (*set_tensor_snapshot_async)(ggml_backend_t       backend,
+                                          struct ggml_tensor * tensor,
+                                          const void *         data,
+                                          size_t               offset,
+                                          size_t               size,
+                                          bool                 dry_run);
     };
 
     struct ggml_backend {

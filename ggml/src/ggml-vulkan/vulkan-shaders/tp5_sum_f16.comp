@@ -7,10 +7,13 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint N_SLOTS = 8;
 
 layout(std430, binding = 0) readonly buffer InBuf {
     float16_t in_data[];
-};
+}
+
+in_slots[N_SLOTS];
 
 layout(std430, binding = 1) writeonly buffer OutBuf {
     float out_data[];
@@ -30,7 +33,6 @@ layout(std430, binding = 3) readonly buffer EpochBuf {
 layout(push_constant) uniform Params {
     uint n_elems;
     uint n_slots;
-    uint stride_elems;
     uint use_flags;
     uint ready_off_u32;
 } p;
@@ -65,7 +67,7 @@ void main() {
             failed = timed_out;
             break;
         }
-        acc += float(in_data[uint(r) * p.stride_elems + e]);
+        acc += float(in_slots[r].in_data[e]);
     }
 
     if (failed) {

@@ -488,15 +488,18 @@ static bool test_repeated_graph_mask_mutation(ggml_backend_t backend_gpu, ggml_b
     cfg.hsk = 128;
     cfg.hsv = 128;
     cfg.nq = 1; // single query decode batch == 1
-    cfg.nkv = 64;
+    cfg.nkv      = 512;
     cfg.hq = 4;
     cfg.hkv = 2;
     cfg.nstream = 1;
-    cfg.n_kv_max = 32;
+    cfg.n_kv_max = 300;
     cfg.type_k = GGML_TYPE_Q8_0;
     cfg.type_v = GGML_TYPE_TURBO4_0;
 
     fa_graph_fixture fix_gpu(cfg, backend_gpu, true); // with replay matmul
+    test_config      cfg_offset = cfg;
+    cfg_offset.use_view_offset  = true;
+    fa_graph_fixture fix_gpu_offset(cfg_offset, backend_gpu, true);
     fa_graph_fixture fix_cpu(cfg, backend_cpu, true);
     fix_cpu.out->op_params[4] = 0; // CPU dense reference
 
@@ -513,25 +516,34 @@ static bool test_repeated_graph_mask_mutation(ggml_backend_t backend_gpu, ggml_b
 
     for (int step = 0; step < 4; ++step) {
         // Mutate the mask specifically in each step:
-        // step 0: first 16 keys active
-        // step 1: last 16 keys active (keys 48..63)
-        // step 2: even keys active (0, 2, 4, ... up to n_kv_max)
-        // step 3: keys 10..25 active
+        // Cross both subgroup and 256-key compaction tile boundaries.
+        // The same logical data in different allocations/views must retain
+        // exactly the same attention reduction order.
         for (int64_t kv = 0; kv < cfg.nkv; ++kv) {
             bool active = false;
-            if (step == 0) active = (kv < 16);
-            else if (step == 1) active = (kv >= 48);
-            else if (step == 2) active = (kv % 2 == 0 && kv < 32);
-            else active = (kv >= 10 && kv < 26);
+            if (step == 0)
+                active = (kv < 65);
+            else if (step == 1)
+                active = (kv >= 383);
+            else if (step == 2)
+                active = (kv % 2 == 0);
+            else
+                active = (kv >= 10 && kv < 287);
             td.mask_f16[kv] = ggml_fp32_to_fp16(active ? 0.0f : -INFINITY);
         }
 
         upload_fixture_inputs(fix_gpu, cfg, td);
+        upload_fixture_inputs(fix_gpu_offset, cfg_offset, td);
         upload_fixture_inputs(fix_cpu, cfg, td);
 
         std::vector<float> out_gpu;
+        std::vector<float> out_gpu_offset;
         std::vector<float> out_cpu;
         CHECK_TRUE(compute_and_read_output(fix_gpu, backend_gpu, out_gpu), "GPU repeated compute failed");
+        CHECK_TRUE(compute_and_read_output(fix_gpu_offset, backend_gpu, out_gpu_offset), "GPU offset replay failed");
+        CHECK_TRUE(out_gpu.size() == out_gpu_offset.size() &&
+                       std::memcmp(out_gpu.data(), out_gpu_offset.data(), out_gpu.size() * sizeof(float)) == 0,
+                   "Sparse attention changed with allocation/view placement");
         CHECK_TRUE(compute_and_read_output(fix_cpu, backend_cpu, out_cpu), "CPU repeated compute failed");
 
         char step_name[64];

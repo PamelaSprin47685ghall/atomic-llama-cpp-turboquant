@@ -1560,17 +1560,110 @@ static void test_meta_indexed_replica_tp5_q8() {
     ggml_backend_free(meta_backend);
 }
 
+static void test_meta_scheduler_keepalive_dependencies() {
+    fprintf(stderr, "--- test_meta_scheduler_keepalive_dependencies ---\n");
+    auto * cpu_dev = get_cpu_dev();
+    TEST_ASSERT(cpu_dev != nullptr);
+    test_split_ctx split{
+        2, { "keepalive_weight", "keepalive_activation" }
+    };
+    ggml_backend_dev_t devices[]{ cpu_dev, cpu_dev };
+    auto *             meta_dev = ggml_backend_meta_device(devices, 2, test_get_split_state, &split);
+    TEST_ASSERT(meta_dev != nullptr);
+    auto * meta = ggml_backend_dev_init(meta_dev, nullptr);
+    auto * cpu  = ggml_backend_cpu_init();
+    TEST_ASSERT(meta != nullptr && cpu != nullptr);
+    constexpr int k = 8, n = 4;
+    auto *        weights_ctx = ggml_init({ 256 * 1024, nullptr, true });
+    auto *        host_ctx    = ggml_init({ 256 * 1024, nullptr, true });
+    TEST_ASSERT(weights_ctx != nullptr && host_ctx != nullptr);
+    auto * weight     = ggml_new_tensor_2d(weights_ctx, GGML_TYPE_F32, k, n);
+    auto * activation = ggml_new_tensor_1d(weights_ctx, GGML_TYPE_F32, k);
+    ggml_set_name(weight, "keepalive_weight");
+    ggml_set_name(activation, "keepalive_activation");
+    auto weights = ggml_backend_alloc_ctx_tensors_from_buft(weights_ctx, ggml_backend_dev_buffer_type(meta_dev));
+    TEST_ASSERT(weights != nullptr);
+    ggml_backend_buffer_set_usage(weights, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    auto * residual = ggml_new_tensor_1d(host_ctx, GGML_TYPE_F32, n);
+    ggml_set_input(residual);
+    auto host = ggml_backend_alloc_ctx_tensors(host_ctx, cpu);
+    TEST_ASSERT(host != nullptr);
+    float weight_values[k * n];
+    for (int i = 0; i < k * n; ++i)
+        weight_values[i] = float(i + 1);
+    ggml_backend_tensor_set(weight, weight_values, 0, sizeof(weight_values));
+
+    // Exercise the real optimizer API with dependencies that need not share a
+    // buffer type or nonempty shape. Only lifetime, not math layout, is extended.
+    static ggml_tensor * kept[2];
+    meta->iface.graph_optimize = [](ggml_backend_t, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
+        auto * until = ggml_graph_node(graph, ggml_graph_n_nodes(graph) - 1);
+        for (auto * tensor : kept)
+            params->add_alloc_dep(params->user_data, tensor, until);
+    };
+    for (bool foreign : { false, true }) {
+        auto * ctx = ggml_init({ 1024 * 1024, nullptr, true });
+        TEST_ASSERT(ctx != nullptr);
+        auto * empty = ggml_view_1d(ctx, activation, 0, 0);
+        TEST_ASSERT(ggml_backend_view_init(empty) == GGML_STATUS_SUCCESS);
+        auto * out = ggml_add(ctx, ggml_sqr(ctx, ggml_mul_mat(ctx, weight, activation)), residual);
+        ggml_set_output(out);
+        auto * graph = ggml_new_graph_custom(ctx, 128, false);
+        ggml_build_forward_expand(graph, out);
+        kept[0] = weight;
+        kept[1] = foreign ? residual : empty;
+        ggml_backend_t backends[]{ meta, cpu };
+        auto           scheduler = ggml_backend_sched_new(backends, nullptr, 2, 128, false, true);
+        TEST_ASSERT(scheduler != nullptr);
+        ggml_backend_sched_set_tensor_backend(scheduler, out, meta);
+        TEST_ASSERT(ggml_backend_sched_alloc_graph(scheduler, graph));
+        for (int round = 0; round < 2; ++round) {
+            float act[k], res[n], actual[n];
+            for (int j = 0; j < k; ++j)
+                act[j] = float(j + 1 + round) * 0.125f;
+            for (int i = 0; i < n; ++i)
+                res[i] = float(1 + round) + float(i) * 0.25f;
+            ggml_backend_tensor_set(activation, act, 0, sizeof(act));
+            ggml_backend_tensor_set(residual, res, 0, sizeof(res));
+            TEST_ASSERT(ggml_backend_sched_graph_compute(scheduler, graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get(out, actual, 0, sizeof(actual));
+            for (int i = 0; i < n; ++i) {
+                float dot = 0.0f;
+                for (int j = 0; j < k; ++j)
+                    dot += weight_values[i * k + j] * act[j];
+                TEST_ASSERT_MSG(actual[i] == dot * dot + res[i], "keepalive dependencies changed the computed result");
+            }
+        }
+        ggml_backend_sched_free(scheduler);
+        ggml_free(ctx);
+    }
+    kept[0] = kept[1] = nullptr;
+    ggml_backend_buffer_free(host);
+    ggml_backend_buffer_free(weights);
+    ggml_free(host_ctx);
+    ggml_free(weights_ctx);
+    ggml_backend_free(cpu);
+    ggml_backend_free(meta);
+}
+
 int main(int argc, char ** argv) {
     bool vulkan_state_copy_only = false;
+    bool alloc_deps_only        = false;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--vulkan-state-copy-only") == 0) {
             vulkan_state_copy_only = true;
+        } else if (strcmp(argv[i], "--alloc-deps-only") == 0) {
+            alloc_deps_only = true;
         } else {
             fprintf(stderr, "test-meta-reduce-boundary: unknown CLI argument '%s'\n", argv[i]);
             return 1;
         }
     }
 
+    if (alloc_deps_only) {
+        test_meta_scheduler_keepalive_dependencies();
+        return g_failures ? 1 : 0;
+    }
     if (vulkan_state_copy_only) {
         test_meta_recurrent_snapshot_uneven_tp5(true);
         if (g_failures > 0) {
@@ -1589,6 +1682,7 @@ int main(int argc, char ** argv) {
     test_meta_recurrent_snapshot_uneven_tp5(false);
     test_meta_advertised_comm_fail_closed();
     test_meta_indexed_replica_tp5_q8();
+    test_meta_scheduler_keepalive_dependencies();
 
     if (g_failures > 0) {
         fprintf(stderr, "test-meta-reduce-boundary: %d failures\n", g_failures);

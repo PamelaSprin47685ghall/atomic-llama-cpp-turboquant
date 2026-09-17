@@ -231,6 +231,10 @@ struct llama_model_loader {
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 
+    // Bind lazy payloads before eager context allocation; returned owners must
+    // outlive the tensors, while mappings retain the underlying file pages.
+    void init_lazy_tensors(ggml_context * ctx, ggml_backend_dev_t dev, std::vector<ggml_backend_buffer_ptr> & buffers);
+
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
 
     // for backwards compatibility, does not support ggml-backend

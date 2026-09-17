@@ -74,6 +74,7 @@ struct llama_tp5_tensor_plan {
 // The full immutable plan for one model + rank count.
 struct llama_tp5_plan {
     uint32_t ranks = 0;
+    bool     replicate_attention = false;
 
     // hparams-derived sizes (validated copies)
     int64_t H = 0, L = 0, C = 0, R = 0;
@@ -89,18 +90,19 @@ struct llama_tp5_plan {
 
     // QSA role table (TP5.md 7.1)
     std::array<int32_t, LLAMA_TP5_MAX_RANKS> q_role_counts{};
-    std::array<int32_t, LLAMA_TP5_MAX_RANKS> kv_role_counts{};   // [1,1,2,1,1]
-    // rotated KV head instances per physical rank (TP5.md 4.4)
+    std::array<int32_t, LLAMA_TP5_MAX_RANKS> kv_role_counts{};
+    std::array<int32_t, LLAMA_TP5_MAX_RANKS> kv_head_starts{};
+    // KV head instances across full layers, with the same fixed weight/cache roles.
     std::array<int32_t, LLAMA_TP5_MAX_RANKS> kv_instances{};
 
     // GDN V/state heads per rank (TP5.md 8.1): [10,10,10,10,8]
     std::array<int32_t, LLAMA_TP5_MAX_RANKS> gdn_v_heads{};
     // global V head ranges per rank: [first, last)
     std::vector<std::array<int64_t, 2>> gdn_v_ranges;
-    // prearranged local Q/K head count per rank (== v heads, modulo map)
+    // Sharded prearrangement: Q/K count equals V count; replicas use native Nk.
     std::array<int32_t, LLAMA_TP5_MAX_RANKS> gdn_qk_heads{};
 
-    // expected collective events per token (2 per layer)
+    // One FFN reduction per layer, plus attention when it is sharded.
     uint32_t expected_events = 0;
 
     // Plan for one named tensor; returns error via ok=false.
@@ -126,15 +128,21 @@ struct llama_tp5_plan {
 // Build the plan from hparams (no GGUF access; shapes come from hp).
 // Returns ok=false with a structured error when the configuration is
 // unsupported (wrong rank count, illegal head splits, ...).
-bool llama_tp5_plan_build(const llama_hparams & hp, uint32_t n_devices,
-                          int64_t n_vocab,
-                          llama_tp5_plan & out, llama_tp5_error & err);
+bool llama_tp5_plan_build(const llama_hparams & hp,
+                          uint32_t              n_devices,
+                          int64_t               n_vocab,
+                          bool                  replicate_attention,
+                          llama_tp5_plan &      out,
+                          llama_tp5_error &     err);
 
 // TP5.md §8.2: global V head h uses Q/K head (h % Nk) after prearrangement.
 int64_t llama_tp5_gdn_qk_global_head(const llama_tp5_plan & plan, int64_t global_v_head);
 
 // Map a named tensor to meta split_state via the immutable plan.
-// Returns false when the plan has no rule (caller keeps legacy split logic).
+// Sharded native GDN weights/caches retain the caller's repeated-segment layout;
+// the loader does not implement this plan's hypothetical Q/K prearrangement.
+// Replicated attention instead mirrors its native weights and complete caches.
+// Returns false for delegated tensors or when the plan has no applicable rule.
 // indexer_head_size: pass hparams.indexer_head_size for cache_k/v indexer detection.
 bool llama_tp5_try_apply_split_state(
         const llama_tp5_plan & plan,

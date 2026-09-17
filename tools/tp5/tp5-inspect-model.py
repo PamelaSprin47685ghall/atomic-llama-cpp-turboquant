@@ -147,9 +147,10 @@ def discover_shards(path):
 class Plan:
     """TP5 A-F plan for qwen4exp: role tables, per-rank slices, budgets."""
 
-    def __init__(self, kvs, ranks):
+    def __init__(self, kvs, ranks, replicate_attention):
         a = 'qwen4exp.'
         self.ranks = ranks
+        self.replicate_attention = replicate_attention
         self.H = kvs[a + 'embedding_length']
         self.L = kvs[a + 'block_count']
         self.C = kvs[a + 'hyper_connection.count']
@@ -177,18 +178,38 @@ class Plan:
         self.is_recr = [not ((i + 1) % self.full_interval == 0) for i in range(self.L)]
         self.n_full = sum(1 for r in self.is_recr if not r)
 
-        # QSA role table (TP5.md §7.1): Q roles [5,5,5,5,4], KV instances [1,1,2,1,1]
-        q_per_role = self._split_heads(self.Nq, ranks)          # [5,5,5,5,4]
-        kv_role = [1] * ranks
-        kv_role[2] = 2                                           # bridge role
-        self.q_role_counts = q_per_role
-        self.kv_role_counts = kv_role
+        if self.Nkv <= 0 or self.Nq <= 0 or self.Nq % self.Nkv:
+            raise ValueError('query heads must form complete nonempty GQA groups')
+        if replicate_attention:
+            self.q_role_counts = [self.Nq] * ranks
+            self.kv_role_counts = [self.Nkv] * ranks
+            self.kv_head_starts = [0] * ranks
+            self.kv_instances = [self.n_full * self.Nkv] * ranks
+            self.gdn_v_heads = [self.Nv] * ranks
+            self.gdn_qk_instances = self.Nk * ranks
+            return
 
-        # rotated KV instances per physical rank over n_full layers (TP5.md §4.4)
-        self.kv_instances = [0] * ranks
-        for o in range(self.n_full):
-            for role, cnt in enumerate(kv_role):
-                self.kv_instances[(role + o) % ranks] += cnt
+        # A local attention call has one uniform GQA ratio. Keep each query
+        # partition within one KV group, or assign whole groups to a rank.
+        if self.Nq < ranks:
+            raise ValueError('not enough query heads for nonempty rank-local attention')
+        q_per_kv = self.Nq // self.Nkv
+        self.kv_head_starts = []
+        if ranks <= self.Nkv:
+            self.kv_role_counts = self._split_heads(self.Nkv, ranks)
+            self.q_role_counts = [count * q_per_kv for count in self.kv_role_counts]
+            first_kv = 0
+            for count in self.kv_role_counts:
+                self.kv_head_starts.append(first_kv)
+                first_kv += count
+        else:
+            self.q_role_counts = []
+            self.kv_role_counts = [1] * ranks
+            for kv in range(self.Nkv):
+                parts = ranks // self.Nkv + (kv >= self.Nkv - ranks % self.Nkv)
+                self.q_role_counts.extend(self._split_heads(q_per_kv, parts))
+                self.kv_head_starts.extend([kv] * parts)
+        self.kv_instances = [self.n_full * count for count in self.kv_role_counts]
 
         # GDN V/state heads per rank: [10,10,10,10,8] for Nv=48, ranks=5
         self.gdn_v_heads = self._split_heads(self.Nv, ranks)
@@ -246,6 +267,12 @@ class Plan:
         return counts
 
     def tensor_role(self, name):
+        semantic, kind, axis, length = self._tensor_role(name)
+        if self.replicate_attention and semantic.startswith(('qsa_', 'gdn_')):
+            return (semantic, 'mirrored', None, None)
+        return (semantic, kind, axis, length)
+
+    def _tensor_role(self, name):
         """Return (semantic, split_kind, axis, per_rank_len_fn or None)."""
         m = re.match(r'blk\.(\d+)\.(.+)', name)
         il = int(m.group(1)) if m else None
@@ -366,12 +393,11 @@ class Plan:
                         b = tensor_nbytes(tname, [local] + list(t['ne'][1:]))
                     per_rank[r] += b
                 detail.append((t['name'], semantic, kind, full_bytes, None))
-        # KV cache: n_full layers * ctx * 2(KV) * kv_instances[r] * da * bytes
+        # kv_instances already sums the owned KV heads across all full layers.
         ts, bs = TYPE_TRAITS[kv_type_name]
         el_bytes = ts / bs
-        kv_bytes = [self.n_full * ctx * 2 * self.kv_instances[r] * self.da * el_bytes for r in range(self.ranks)]
+        kv_bytes = [ctx * 2 * self.kv_instances[r] * self.da * el_bytes for r in range(self.ranks)]
         # GDN state: 36 layers * Nv_local * ds*ds * 4B (F32)
-        gdn_bytes = [self.L - self.n_full, ] * self.ranks  # placeholder replaced below
         gdn_bytes = [sum(1 for x in self.is_recr if x) * self.gdn_v_heads[r] * self.ds * self.ds * 4 for r in range(self.ranks)]
         # indexer cache: n_full * ctx * di * 2B (F16), replicated
         idx_bytes = [self.n_full * ctx * self.di * 2] * self.ranks
@@ -384,6 +410,7 @@ def main():
     ap = argparse.ArgumentParser(description='TP5 header-only GGUF manifest generator')
     ap.add_argument('--model', required=True, help='GGUF file or directory of shards')
     ap.add_argument('--ranks', type=int, default=5)
+    ap.add_argument('--replicate-attention', action='store_true', help='Mirror attention/GDN, matching GGML_TP5_REPLICATE_ATTN=1')
     ap.add_argument('--context', type=int, default=131072)
     ap.add_argument('--kv-dtype', default='F16', choices=sorted(TYPE_TRAITS))
     ap.add_argument('--output', default='tp5-manifest.json')
@@ -409,7 +436,7 @@ def main():
         raise Tp5Error('TP5_E_ARCH', architecture=arch,
                        reason='this plan generator only covers qwen4exp')
 
-    plan = Plan(kvs, args.ranks)
+    plan = Plan(kvs, args.ranks, args.replicate_attention)
 
     # vocab from tokenizer metadata
     if plan.n_vocab is None:
@@ -449,10 +476,12 @@ def main():
         'hc': {'layout': 'mirrored', 'compute': 'af', 'reference_available': True},
         'moe': {'partition': 'intra_expert', 'channels_per_rank': plan.F // plan.ranks},
         'attention': {
+            'layout': 'mirrored' if plan.replicate_attention else 'sharded',
             'q_role_counts': plan.q_role_counts,
             'kv_role_counts': plan.kv_role_counts,
-            'kv_instances_rotated': plan.kv_instances,
-            'rotation': 'full_attention_ordinal_mod_5',
+            'kv_head_starts': plan.kv_head_starts,
+            'kv_instances': plan.kv_instances,
+            'rotation': 'none',
         },
         'gdn': {
             'state_head_counts': plan.gdn_v_heads,
@@ -463,7 +492,7 @@ def main():
             'decode_algorithm': 'mesh_sum',
             'wire_type': 'f32',
             'accumulation_type': 'f32',
-            'expected_main_events': 2 * plan.L,
+            'expected_main_events': plan.L if plan.replicate_attention else 2 * plan.L,
         },
         'memory_budget_per_rank': {
             'weights_static': [round(b / GiB, 4) for b in per_rank],

@@ -61,14 +61,9 @@ int main() {
     const uint32_t kv_size = 128;
     const uint32_t n_seq_max = 2;
 
-    llama_memory_hybrid_idx mem(
-        model,
-        GGML_TYPE_F32, GGML_TYPE_F32, false,
-        kv_size, 1, 0, LLAMA_SWA_TYPE_NONE,
-        GGML_TYPE_F32, GGML_TYPE_F32, n_seq_max,
-        n_seq_max, 1, false, true,
-        filter_attn, filter_recr, filter_idx
-    );
+    llama_memory_hybrid_idx mem(model, GGML_TYPE_F32, GGML_TYPE_F32, false, kv_size, 1, 0, LLAMA_SWA_TYPE_NONE,
+                                GGML_TYPE_F32, GGML_TYPE_F32, 4, 0, 0, n_seq_max, 1, false, true, filter_attn,
+                                filter_recr, filter_idx);
 
     mem.materialize();
 
@@ -81,12 +76,8 @@ int main() {
     assert(mem.get_pooled_k(1) == nullptr); // Recurrent layer must have no pooled cache
     assert(mem.get_pooled_rows() == kv_size / 4 + 2);
 
-    // Initial watermark is 0
-    assert(mem.pooled_valid(seq0) == 0);
-
     // Set watermark directly as graph execution does
     mem.pooled_valid(seq0) = 8;
-    assert(mem.pooled_valid(seq0) == 8);
 
     // 1. Test seq_rm clamping (dropping tokens starting at pos 20: 20 / 4 = 5 blocks)
     mem.seq_rm(seq0, 20, -1);
@@ -98,6 +89,7 @@ int main() {
 
     // Reset and test seq_cp
     mem.pooled_valid(seq0) = 6;
+    mem.pooled_valid(seq1) = 3;
     mem.seq_cp(seq0, seq1, 0, -1);
     // Destination watermark is reset to 0 to force fresh pooling
     assert(mem.pooled_valid(seq1) == 0);

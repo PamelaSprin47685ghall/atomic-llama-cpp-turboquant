@@ -1614,6 +1614,7 @@ static const struct ggml_backend_i ggml_backend_et_i = {
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
     /* .graph_optimize          = */ NULL,
+    /* .set_tensor_snapshot_async = */ NULL,
 };
 
 static const char * ggml_backend_et_device_get_name(ggml_backend_dev_t dev) {

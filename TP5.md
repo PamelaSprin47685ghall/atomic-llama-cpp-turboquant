@@ -8,6 +8,232 @@
 
 ---
 
+## 2026-09-15 R=2、原生 GDN 布局修复与端到端验收（进行中）
+
+本节记录本轮源码与串行真机验证，覆盖以下旧段落对 R 槽、单次提交和资源生命周期的推测；不把短请求或微基准扩大成全模型质量、长上下文或 MTP 验收。
+
+### 当前总目标：不启用 MTP 达到 50 tok/s（未达成）
+
+2026-09-16 用户将目标明确改为 **50 tok/s、纯 TP、单序列**，并要求直接压低通信开销，不以计算/通信 overlap 或 MTP 替代。下文旧实验中的 100 tok/s 为历史目标。
+
+#### 高频命令与整段降低：最新已验证检查点
+
+用户指定先处理成千上万次 dispatch/barrier，再处理百次、十次和单次开销。**每卡每 token 不超过 96×8 次真实 dispatch** 的计数门已达到：最新为 **765（k=7.96875）**，包含通信、完整 PLE、词表投影和尾部。**2026-09-17 按用户指示暂停8→6**：目前没有显著吞吐收益的实测依据，不继续为了计数增加复杂融合；后续工作聚焦已测得的主机校验与冷录制开销。减少计数不等于吞吐验收，**无 MTP 50 tok/s 尚未达到**。
+
+**2026-09-17 提交前冻结复核：**
+
+- 无插桩、`--spec-type none`、同一五卡 timeline/F16 配置，两次完整171-token计数请求为 **38.4871 / 39.5132 tok/s**，输出精确一致、自然停止，server退出0。本次没有重跑关闭HC的配对，因此不能将综合变化当作HC模块的独立提速。结果：`/tmp/tp5-checkpoint-server.json`。
+- 当前源码重新构建后，CPU六个程序（meta、alloc、plan、pooled-cache、lazy-mmap、F32 attention precision）、Vulkan replay **23项**、sparse attention、五卡F16/F32 mesh全部通过。mesh覆盖变异输入、延迟producer、非零view、异步依赖与末段compute，两种wire的FD增量均0。HC回归覆盖288种recipe及缓存清理/重建；观察器确认每卡实际执行 **584次** `hc_sum_f16`，不是仅测试回退路径。
+- 最终 **280×248320 logits 与canonical逐位一致**，五卡均为669计算＋96通信；参考验证仍用相同top-k=256覆盖第257位置的选择/pooled-cache转换，不改变上述吞吐请求的默认top-k。证据：`/tmp/tp5-checkpoint-transition280.bin`、`/tmp/tp5-checkpoint-transition280-counts.csv`、`/tmp/tp5-checkpoint-churn-counts.csv`、`/tmp/tp5-checkpoint-evidence.json`。
+- 重放校验现为单次live-binding遍历，调用内复用backend-buffer解析，保持对重绑定、共享source分裂、shape/op参数/offset变化的校验；meta复用chain容器容量。**跨HC plan共享P1记录尚未实现**：用户终止该agent后，未完成的所有权脚手架已撤出；不把它计入本次功能或收益。第二步冷录制及进一步达到50的工作仍未完成。所有验证进程已退出，五卡恢复空闲基线；未声称取得不可读的内核日志。
+
+- 保留重放、按实际提交 CB 计数：计算 dispatch **2471→1822→1357→1169→1025→881→821→785→774→681→669**，计算 pipeline barrier **2059→1504→1056→962→913→831→795→759→555**，计算 fill **97→0**。最新五卡各为 **669 计算＋96 collective＝765 dispatch/token**；另有 collective barrier 396 次。该计数来自实际执行，不是 graph node 数或 queue API 次数。
+- **终端 producer 直接生成 F16 wire**：Q5_K 输出投影与 routed/shared MoE down/fold 同时保留原生 F32 输出并写 F16 companion，P1 直接复制 companion；只接受确实记录/验证重放的终端 producer，重复归约但没有新 producer 时必须重新 pack 当前 F32。转换严格沿用 `float16_t(value)`；`packHalf2x16` 曾被真实 mesh 数值回归否决。单独启用时为785计算＋97通信；完整 MoE 图在 PLE 前展开后为774＋96。280步逐位通过：`/tmp/tp5-producer-wire-transition280.bin`。
+- **P2 SUM 与下一段 HC 注入/归一化合并**：仅在整条 timeline/F16 chain 的精确输入/输出绑定、范围及所有权验证通过后，替代下一段已缓存 prefix CB；普通执行仍保留 prefix/suffix。实际命中93次，774计算降到681；固定 rank 加法、原生512-lane RMS树不变。当前配对版本为2个1024线程 workgroup，各处理两条 residual stream，保留 F32 sum 输出；无跨卡自旋。280步逐位通过：`/tmp/tp5-hc-pair-transition280.bin`。这是数值/计数已验证候选，尚未证明端到端加速。
+- **FA preparation 合并 sparse compaction**：12个 attention 区域全部命中；同一 dispatch 的额外 workgroup 执行原 canonical compaction，共用既有后置屏障。Q/K gamma 只在同一真实 VkBuffer 且范围合法时合并 descriptor，独立 BO 自动回退；metadata owner 或完整参数不匹配仍走独立 compactor。原生直接 F16 RoPE 写回不变。计算681→669；280×248320 logits 与 canonical 逐位相同：`/tmp/tp5-attention-compact-transition280.bin` 及对应 `*-counts.csv`。22项 replay、sparse attention 全通过；扩展回归覆盖不同 gamma BO、跨256-key tile、overflow fallback、有限 -65504 mask、缓存 guard、变化 row 与下游 view。
+- **HC 候选的吞吐退化已拆分，未掩盖**：配对1024线程版本无插桩完整171-token请求仅 **34.6117 / 35.1629 tok/s**，关闭 HC 合并的此前匹配对照为 **36.2685 / 36.8050**。加入 FA compact 后，用轻量 host cadence 观察器配对：HC开启 **34.4363 / 35.1930**，关闭 **36.2642 / 36.7940**。开启时每次请求首步 decode为 **840.55 / 767.22 ms**，第二步 **182.42 / 156.99 ms**；关闭时首步 **805.78 / 721.04 ms**，第二步 **23.85 / 23.01 ms**。暖态周期均值分别 **23.438 / 23.179 ms**。多数整请求退化集中在冷录制/建 plan，仍有小幅暖态差异；第二次请求也有 prefill→decode 冷转换，不能将第二次请求当作无冷开销。证据：`/tmp/tp5-hc-cadence-comparison.json`。计数门达成后再处理这些单次开销；不宣称已到50。
+- **Meta 冷分析收敛**：主子图及 hash 容量按各自归约区间分配，而非每段复制整个模型容量；重建判断使用当前图节点数而不是历史最大值。线性 deferral 分析复用图的 identity hash 查节点位置，并在区间起点截断已经越过归约边界的祖先遍历。容量修改单独没有解释主要冷延迟；加入索引及区间限制后，同参数、同轻量 cadence 观察器的首步 decode 降至 **373.20 / 308.45 ms**，完整171-token请求为 **38.1582 / 38.6543 tok/s**，暖态均值 **23.405 ms**。第二步建 collective plan 仍需约160–180 ms，仍非50验收。CPU meta/alloc/plan回归及280步canonical逐位通过，实际dispatch仍765：`/tmp/tp5-meta-bounded-evidence.json`、`/tmp/tp5-meta-bounded-transition280.bin`。后续录制成本观察中，第二步约1860次 CB allocation 与1875次 begin，分别约63/62 ms；暖态主机 `get_cached_cmd_bufs` 汇总约2.72 ms、chain submit约1.01 ms。后两项是主机函数计时，不是GPU kernel时长：`/tmp/tp5-host-phases.csv`。
+- 前述 GDN“未命中”已被新证据覆盖：保留合法边界 view 后真实命中 36 个 GDN 区域；另消除重复全屏障、无需求的 RMS scratch 清零、共享专家 gate/up 中间派发和 QSA 池化切片复制。HC 注入并入 scatter/norm 实际命中 **94** 次，Q8 shared-down 并入 routed-down/fold 命中 **47** 次。后两项在旧模型图上将计算计数从 1822 降至1681，11×248320 logits 与原检查点逐位一致：`/tmp/tp5-region-wave-reference-fixed-{logits.bin,counts.csv}`。
+- QSA 选择宽度覆盖全部 cache cells 时，保留 raw indexer K 的投影/写回，仅删除无效的 query、pool、评分、排序和选择 mask 构建；仍使用同一 sparse attention 路径。pooled watermark 不提前推进，后续进入选择路径时从保留的 raw keys 补齐。此处没有降低默认 top-k 或缩短吞吐测量上下文。
+- 两处布局相关数值问题已复现并修复：512-expert 有界 router 统一原生 tie/reduction 语义，不再由输出是否别名决定专家顺序；sparse compaction 用 subgroup 前缀生成固定 KV 顺序，替代跨 subgroup 抢 atomic slot 的顺序。稠密 HC 注入另显式保持原生 RADV Q8 的 8 项 FMA 次序。对应回归均先失败、修复后通过；不通过放宽容差接受。
+- **280 步完整数值对照通过**：仅为触发边界，验证进程设 `c=512`、`qwen4exp.attention.indexer.top_k=int:256`，跨过第257个位置恢复选择路径与延迟 pooled refill；参考图与优化图全部 **280×248320 logits 逐位相同**。两边使用相同修正后 backend：`/tmp/tp5-qsa-canonical-{reference,optimized}.bin` 及对应 `*-counts.csv`。Vulkan replay 19 项、sparse attention（含跨 subgroup/256-key tile、view 和重放）、CPU pooled-cache/meta/plan 回归通过。
+- 路由/共享专家整组投影已验收：IQ2_S/IQ3_XXS 与 IQ3_XXS/IQ3_S 两类 routed gate/up、共享 Q6 gate/up、scalar gate 合并一轮投影，再接现有 down/fold。真实命中 **47** 层，首层特殊前缀保留原路径。必须保留原生常量整 tile 分支；动态 `min` 曾改变编译器 FMA 收缩，已由逐位回归复现并修正。11×248320 logits 与 QSA 检查点逐位一致；完整 Vulkan replay 19 项和 sparse attention 回归通过：`/tmp/tp5-moe-projections-{logits.bin,counts.csv,regions.csv}`。
+- **独立投影组降低已验证，端到端提速未证明**：GDN 的 QKV/Z/alpha/beta 与 QSA 的 Q/K/V/raw-indexer-K 各从4次派发合为1次，实际命中36＋12组。模型图只前移无副作用投影；GDN 后半段迁移为27节点，保留外部 projection/state reshape 边界。最初漏保留3个 projection reshape 导致后半段退回原生、计数反升至1349；修复后36个 GDN 核心全部命中，计数为上项1025。最终11×248320 logits 逐位一致，Vulkan replay20项及 CPU plan/meta/pooled-cache/alloc 回归通过：`/tmp/tp5-projection-bounds-{logits.bin,counts.csv,regions.csv}`。
+- **按实际 tile 限定累加器**：移除新 attention/MoE shader 中无依据的8行私有数组，使用原生2/4行 specialization。RADV 编译码大小：GDN **38552→16748 bytes**，QSA **33452→14400**，两类 MoE **52944→28060 / 60444→33424**；attention VGPR72→64，第二类 MoE80→72，均无 spill。数值未变；有插桩、热权重的有界 shader 实验不能外推端到端收益。原始资源账 `/tmp/tp5-attention-projection-costs-{before,bounded}.log`、`/tmp/tp5-moe-projection-footprint-{before,bounded}.log`。
+- **GDN 缓存与计算完整阶段**：四路投影、直接历史卷积/归一化、直接状态行 delta、输出 norm、输出投影共5次派发；省去 history/state GET_ROWS、CONCAT、历史复制的4次中间派发。52节点普通边界与54节点首次 ID-view 边界均命中，共36层；实际 GET_ROWS 使用每 rank 的 ID 副本，不以主机 view 指针身份作匹配。历史与状态只读选中行，写回目标行；空 clear/extra-copy 可消除，非空副作用必须回退。280×248320 logits 与 QSA canonical 优化检查点逐位一致，覆盖257位置切换：`/tmp/tp5-gdn-cached-transition280-{logits.bin,counts.csv,regions.csv}`。
+- **分配生命周期标记修复**：scheduler 的 allocation-only dependency 原先以 kept tensor 的 VIEW 表示，继承非空载荷与后端布局，混入空 Meta view 或 CPU 输入时触发 Meta split 断言。现用零元素 `GGML_OP_NONE` 保留同一组 src 生命周期边，不伪造数学 view；未削弱后端断言。CPU 回归先 exit134、修复后 targeted/full meta/alloc 均通过；Vulkan replay21项和 sparse attention 回归通过。新增缓存区域回归核对52/54边界、动态ID、同源/异源行、完整缓存与guard、下游view，以及非空 clear/extra-copy 回退：`/tmp/tp5-meta-keepalive-regression.json`。
+- **全注意力完整阶段**：四路投影、raw indexer K 写回、合并 Q/K norm＋RoPE＋KV 写回、sparse compact/attention、带 gate 的 split-K reduction、输出投影共7次派发（非 split-K 保留独立的一次 output gate）。最后一层独立 residual GET_ROWS 原来穿插在 FA 与 gate 之间；显式展开完整 attention 后再选输出行，全部12层命中，36层缓存 GDN 保持命中。280×248320 logits 与 canonical 检查点逐位一致，包含257位置 QSA 路径切换：`/tmp/tp5-fa-complete-transition280-{logits.bin,counts.csv,regions.csv}`。
+- **两处集成回归已修复**：scratch 扩容取消 replay 后，恢复当前命令池与 context 持有关系，直接提交正在记录的 context，删除同步时会失效的 tensor→weak-context 映射；长 KV 下游 view 从读旧数据恢复正确。K RoPE 必须沿用原生直接 F16 写回，不能额外落一次 F32 shared 输出；实模曾在第11层 rank2–4 的 K cache 单元素偏1个FP16 ULP，现完整280步逐位通过。回归覆盖完整缓存/guard、动态 row/position/mask、稀疏 live count 切换、split/非split gate、下游view；Vulkan replay22项和 sparse attention 全通过：`/tmp/tp5-fa-scratch-lifecycle-regression.json`、`/tmp/tp5-fa-f16-conversion-regression.json`。
+- **GDN delta＋norm 整段归约**：有界1024线程 workgroup 独占一个128列状态头，8-lane cluster 的列内计算顺序不变；F32 shared 交接后，保留原512-lane RMS树及零上半区。状态行原地更新无需跨 workgroup 同步。缓存 GDN 从5降到4次派发，36层均命中；RADV 编译VGPR64、LDS3072 bytes、无spill。变更由实际workgroup能力门控制，`GGML_VK_DISABLE_GDN_DELTA_NORM=1` 为对照。
+- **Router 单 subgroup 归约**：只在完整单subgroup、shuffle及size-control能力满足的RADV/RDNA2启用。xor-shuffle严格保留原半折树的加法、max、tie count顺序，不使用顺序未规定的 `subgroupAdd`；重复分数仍进入原bitonic网络。512专家、top10唯一值路径源码上的workgroup barrier 从93减到13（若48层均走此路径，每token少3840次；这不是 Vulkan pipeline barrier 计数，也未测定运行时tie频率）。编译码2680→2112 bytes、LDS9216→8192 bytes、无spill；`GGML_VK_DISABLE_ROUTER_SUBGROUP=1` 为对照。原生/新路径精确路由与归一化回归均通过。
+- 两项共同启用后，22项 replay 回归、280×248320 canonical logits逐位通过：`/tmp/tp5-gdn-router-transition280-{logits.bin,counts.csv,regions.csv}`。无插桩、无MTP、同参数完整171-token请求为 **37.1054 / 37.4934 tok/s**；精确输出、自然结束、server exit0。只开router为 **37.1245 / 37.4160**；只开GDN合并为 **36.6053 / 37.1099**。本组对照未显示GDN合并的独立吞吐收益；router呈小幅观测改善，不能外推50。上一全attention检查点为 **36.0341 / 37.0053**。证据：`/tmp/tp5-gdn-router-server.json`、`/tmp/tp5-router-only-server.json`、`/tmp/tp5-gdn-delta-only-server.json`。该785计算 dispatch 的历史检查点尚未达到50或k≤8；最新计数见本节开头。
+- 无插桩真实 server：原默认 top-k、`c=256,b=32,ub=32,np=1`、timeline/F16 wire、F32 激活、`--spec-type none`，两次完整 `1..60` 均精确生成171 tokens并自然结束。QSA 检查点为 **34.5528 / 35.0939 tok/s**，整组 MoE 后为 **35.4831 / 36.1769 tok/s**：`/tmp/tp5-moe-projections-server.json`。服务单次 SIGINT 后 exit=0；未核验无权限读取的 dmesg。**50 tok/s 尚未达到**。
+- 上述 attention 投影组的同配置关闭/开启对照为 **35.9469 / 36.4389** 与 **35.8473 / 36.3735 tok/s**；再收窄 attention/MoE 累加器后为 **35.9712 / 36.3885 tok/s**。四路投影确实减少144次派发，但这些请求未显示可归因的吞吐提升，不把计数下降写成达速。全部精确171 tokens、自然结束、服务 exit=0：`/tmp/tp5-attention-projections-{control-server,server}.json`、`/tmp/tp5-projection-bounds-server.json`。
+- **已撤回 HC norm/down 整段候选**：97 次真实命中把计算 dispatch 1357 降至1260，串行四-stream 与并行四-stream 两版均通过11步逐位数值对照，但吞吐分别仅 **32.5255 / 32.5267**、**32.7881 / 33.1680 tok/s**，低于上项基线。候选 shader、pipeline 与实验环境开关已删除；不以减少计数冒充加速。证据：`/tmp/tp5-hc-norm-down-rejected.json`。
+
+本轮通信隔离证据（相同模型、原生 attention 分片、F16 wire、F32 激活）：
+- 修正 `GGML_TP5_GPU_TIMING` 的 PUSH 归因：增加提交内部的 PUSH 起点，单列 `push_gap_us`。原先约 23 ms 的 PUSH 区间包含提交间等待；96 阶段实际 PUSH 为 **1.07–1.36 ms**，PUSH 前等待为 **18.30–20.50 ms**。不能将后者称为 PCIe 拷贝固有延迟。`tp5PushBoundaryProbe` 的 11-position 全词表 logits 与原基线逐位相同。
+- `GGML_TP5_ISOLATE_BO=1` 现将接收载荷按 **sender × 两个 bank** 分配独立 DMA-BUF，消除无关发送方/相邻 bank 共享一个 reservation 的依赖。P2 保持原固定 rank 顺序求和（最新版本已直接读 inbox，移除最初的本地 gather）；timeline wait 同时覆盖 TRANSFER/COMPUTE。保留原 R=2 信用、真实完成信号、失败语义及本地计算/PUSH 提交分界；无 host relay、无自旋。FD 在全部导入后关闭。
+- 五卡 F16 mesh 的变化输入、延迟生产者、65/33/48 阶段、奇数长度/view、65/66 阶段真实 cached compute→AR→tail 全通过。96 阶段通信链中位数从独立 SUM 实验的 **28.794 ms** 降到 **7.070 ms**；不是模型 tok/s。
+- 同一 11-position tape 的插桩模型 span 从 **61.44 ms** 降到 **28.25 ms**，全词表 logits **逐位相同**：`/tmp/tp5-logits-{push-boundary,sender-mailbox}.bin`。将 SUM/compute/PUSH 再拆成三份（46.19 ms）或合并计算/PUSH（30.94 ms）的临时分支已撤回；不保留实验数字模式。
+- 无时间戳的真实 server 两次完整 `1..60`，各 171 tokens、自然结束、输出精确正确：**22.1594 / 22.2856 tok/s**。`/tmp/tp5-sender-mailbox-server-results.json`；服务已停止，五卡 busy=0、显存回到原基线。该生成耗时明显高于短 tape 的插桩链，下一步按真实生成长度检查重放命中和通信等待。**50 tok/s 尚未达到**，不以微基准或短 tape 外推达标。
+- 持续生成诊断已排除暖态逐 token 重录：`tp5MailboxDecodeProfile` 在 exec=6..174 均为 `creplay=485/0`、`submits=5,batches=960`；第 64 条链 span 仍约 **27.96 ms**。`tp5SplitTransferProfile` 将额外开销定位为 **15 个输入张量 CPU→Meta 复制 8.6–10.5 ms/token**，CPU 子图只有约 **40 µs**，重放绑定检查另约 **3.4–4.9 ms**。逐输入探针显示 4–10240 byte 的小载荷每次约 **0.55–0.72 ms**；这是串行 host/device 复制同步账，不是 GPU 矩阵计算。`/tmp/tp5-logits-input-copy-profile.bin` 与原 logits 逐位相同。
+- **小输入立即快照上传**：backend 内部 ABI 升至 **3**，增加可选 `set_tensor_snapshot_async`。成功必须在返回前捕获源字节；dry-run/拒绝不得提交写入。调度器仅对 host 源尝试该能力，并先同步源 backend；Meta mirrored 写入先检查所有 rank，再录制。Vulkan 对不超过 64 KiB、4-byte 对齐的范围使用 `vkCmdUpdateBuffer`，在正常 compute queue 上保留读写依赖及 replay-prefix flush；其他范围/后端沿用原同步路径。其余 15 个 backend 显式置空该能力，旧 ABI 插件不能误载入。
+- `tp5SnapshotModelProbe`：输入复制降至约 **0.91–1.31 ms/token**，`/tmp/tp5-logits-snapshot.bin` 的 11-position 全词表 logits 与基线**逐位相同**。Vulkan 重放 13 项全部通过，含源 host 数组立即覆写、非零 view/guard、拒绝与 dry-run 无副作用、重放读取新快照；`test-alloc`、CPU `test-meta-reduce-boundary` 通过。旧测试对默认 256 项缓存的断言已替换为 1025 个图后读取新输入的行为验证，并修正 fixture 实际包含 5 个 tensor 的上下文尺寸计算。
+- 移除临时 host 计时打印后的真实 server 完整 `1..60` 两轮（各 171 tokens，自然结束、精确正确）：**26.9475 / 27.3920 tok/s**，`/tmp/tp5-snapshot-server-results.json`。五卡 busy=0、显存恢复原基线；仍不达 50 tok/s。下一步继续压低重放提交的重复元数据校验成本，不改变数学计算、精度或验收长度。
+- **重放指纹去重**：同一 tensor 的字段只保存/检查一次；每个 node/source slot 的绑定关系仍完整记录。先确认所有旧地址仍是当前图的 live binding，才读取去重集合；图对象重建时退回完整的逐绑定值比较，避免解引用退休地址。类型、shape/stride、view offset、数据/设备 buffer、op/op_params 的失效检查不减。13 项 Vulkan 回归通过；`/tmp/tp5-logits-dedup.bin` 与原 11-position logits 逐位相同。两轮无插桩 `1..60` 为 **27.3591 / 27.8418 tok/s**：`/tmp/tp5-dedup-server-results.json`。这是小幅观测改善，不外推为达标；服务退出后五卡 busy/显存恢复原基线。
+- **直接 inbox SUM**：F16/F32 shader 使用按 rank 数专门化的固定 descriptor array，直接读取每个 sender 的本地 bank，移除五卡每 token **2400 次**中间 `vkCmdCopyBuffer` 及隔离模式的连续载荷副本；普通 mailbox 以对齐 slice 绑定同一接口。严格检查 core uniform storage-buffer array indexing 和 descriptor limits，不启用 descriptorIndexing/BDA。原逐 rank 加法顺序、F16 wire 舍入、R=2 信用和失败语义不变。SPIR-V（Vulkan 1.3）验证、两卡特殊 rank 数、三卡普通 mailbox、五卡 F16/F32 各 96 轮及全部 chain/view/延迟生产者回归通过，FD 增量 0。96 阶段中位数 **6.878 ms**（同轮前一版 **7.099 ms**）；模型 span 约 **27.62 ms**，`/tmp/tp5-logits-direct-sum.bin` 与原 11-position logits 逐位相同。完整无插桩 `1..60` 为 **27.1101 / 27.9112 tok/s**（`--spec-type none`），`/tmp/tp5-direct-sum-server-results.json`；与前版吞吐差距很小，不能据此宣称显著提速或达到 50。所有 GPU 资源已归还原空闲基线。
+
+- **上传与算子 profiler 兼容修复**：立即快照可能留下待提交的 compute prefix；原 profiler 在建立 timestamp query 前断言 context 为空，有界 Q6 probe 已复现断言。现先正常结束并提交 prefix，再建立 profiler context，不删除断言、不丢弃上传。修复后 probe 与旧输出逐位一致，`GGML_VK_PERF_LOGGER=1 ... test-vulkan-command-replay --snapshot-only` 通过；profiler 有意禁用重放，因此只在普通模式检查 replay counters，两个模式都验证实际输出与 host 源生命周期。
+- **原生算子账**：`tp5NativeOperatorProfile` 正常退出；11-position logits 与原基线逐位一致，五卡恢复空闲。`/tmp/tp5-native-operator-profile.json` 记录五个设备表，反复出现的 Q8_0 `K=320,M=10240` 和 ADD/MUL/SIGMOID/SCALE 是下一轮候选；profiler 插入逐算子屏障且禁用 replay，其时间只用于热点排序，不是生产吞吐。当前 F16 wire 对修正后 CPU 数学 oracle 的 11/11 top-1 相同，最大 KL **1.855e-7**、相对 L2 **2.710e-4**、绝对差 **0.003658**：`/tmp/tp5-current-cpu-parity.json`；不能把下面 F32 wire 的更小误差归给 F16 wire。
+
+- **HC 整段融合（当前已验收的局部区域，不是整个 token）**：RMS/gamma→Q8 down/scale/SiLU→Q8 up/sigmoid/四流折叠为 3 dispatch；前接残差注入时为 4 dispatch。有界图实录分别从 8→3、15→4 dispatch，不把 queue API 次数当 dispatch。Meta 通过 allocation-only advice 保留融合输入和内部临时量，不重排跨卡归约；修复了旧分配把 low-rank 输入与最终 mixed 输出共址的问题。另修复共享 12-binding descriptor set 在较短布局复用时残留已释放 BO 的问题；原 RADV `CS rejected -2` 复现修复后正常退出，未执行 GPU reset。
+- **HC 舍入与整模数值证据**：实际第 4 层输入复现 RMS 动态循环与原生常量展开的差异；按原生循环实例展开后，捕获区域及全部 2160 条 rank-local HC 观察记录逐位一致。最终无 callback 的 11×248320 logits 在相同 allocator 下融合开/关也逐位一致：`/tmp/tp5-logits-hc-narrow-{advice,disabled}.bin`。分配依赖会改变部分原生融合的别名资格，因此这组向量不是旧 `push-boundary` 向量的逐位副本；对同一修正后 CPU oracle，top-1 **11/11**、最大 KL **1.3184e-7**、相对 L2 **2.7538e-4**、绝对差 **0.003500**，未放宽数值门。回归补上直接 Vulkan 与 mirrored Meta、变化输入、布局收缩、view/fallback、下游读取，以及融合 RMS 对原生 GPU RMS 的逐位检查。
+- **HC 真实纯 TP 配对吞吐**：相同 `c=256,b=32,ub=32,np=1`、timeline/F16 wire、`--spec-type none`、完整 `1..60` 工作负载，融合关闭 **27.5108 / 27.9210 tok/s**，开启 **30.4908 / 31.0750 tok/s**；四轮均为精确 171-token 输出并自然结束。`/tmp/tp5-hc-region-server-results.json`，全卡资源恢复原空闲基线。**50 tok/s 未达成**；继续压缩归约边界内的 MoE/GDN 计算区域，不将这一个 HC 区域称为整段计算已完成。
+- **词表并行 LM head（已验收）**：移除 `output.weight` 的镜像覆盖（`llama-model.cpp` 与 `llama-tp5-plan.cpp` 两处），恢复 SPLIT_AXIS1 词表行切分；meta 后端 `get_tensor_async` 按行聚合各卡 logits。整模 11×248320 logits 融合/参考逐位一致；尾部 `tail_compute_us` 由 ~1107→~265 µs/卡。`1..60` 暖轮配对：30.0/31.4→30.5/31.7 tok/s（增益被 host 循环部分遮蔽）。
+- **GDN 整段融合（实现存在，本次整模路径未命中）**：实现意图是将卷积+SiLU+L2+门控+状态更新等 30 节点合为 7 dispatch。此前开关配对整模 logits 逐位一致、CPU oracle 11/11 top-1、max KL 1.375e-7，以及吞吐无明显变化，并不足以证明实际应用了融合。后续保留重放的 dispatch 实录显示每 token 仍执行 **36 个 `gated_delta_net_f32_d128`、72 个 `l2_norm_f32`，没有 `gdn_segment_*` pipeline**；须先修复真实图匹配并证明命中，不能把旧配对称为整模融合验收。
+- **撤回此前的“39–45 tok/s 结构上限”**：旧估算混用了请求平均值、短 tape GPU 时间和未闭合的 host 余项；GPU span/compute 已包含尾部投影，再加 tail 会重复计数。阶段间 gap 也不能直接称为 timeline 传播，更不能据此断言 50 tok/s 必须依赖 overlap。旧算子归因还只读取了日志尾部，不能当完整 token 的算子总账。
+- **2026-09-16 延迟重新闭账**（`/tmp/tp5-latency-accounting-evidence.json`）：纯 TP/timeline/F16、完整 `1..60` 两轮各 171 tokens。无 GPU 插桩的 host 观察器测得 335 个暖态周期均值 **27.441 ms**、中位 **27.321 ms**；互斥分账为 Meta 图处理/提交 **3.617 ms**、调度器非图路径 **0.819 ms**、CPU 图 **0.031 ms**、decode 其他 **0.075 ms**、decode 外采样/服务循环 **0.655 ms**、等待设备完成并读回 logits **22.243 ms**。最后一项不是纯搬运时间；queue submit **0.326 ms** 已包含在 Meta 账内，不能重复相加。
+- **大项是每次请求的 prefill→decode 转换**：第一步单 token decode **883.546 / 834.499 ms**，相对暖态额外 **856.760 / 807.713 ms/请求**，按 171 tokens 摊销 **5.010 / 4.723 ms/token**。独立 profiler 配对显示转换处 `creplay=0/485, submits=1450`，下一步 `creplay=485/0, submits=10`（含 5 次上传 prefix）；不是暖态持续逐 token 重录。首轮整个 predicted **5527.165 ms** 已与逐调用时间闭合，边界余项 **0.646 ms/请求**。
+- **GPU 分账仅作诊断，不与上述 host 控制组硬相加**：完整恢复 **5×96** 阶段记录。rank2 的 **23.292 ms** = compute **16.625 ms**（已含 tail **0.284 ms**）+ SUM/PUSH **2.406 ms** + 阶段间/PUSH 前空档 **4.261 ms**；其余 rank 的空档 **7.029–8.081 ms** 含等慢卡，五卡不能相加。rank2 在 **95/96** 阶段 compute 最长；逐阶段最慢值与五卡均值之差合计 **2.217 ms**，不是可独立叠加的已证收益。时间戳增加每卡 483 个 CB，捕获 token 还出现约 150 ms 的 Meta 插桩设置区间，因此该 token 不用于正常吞吐或 host 预算。
+- **观察器对照与边界**：无插桩 server 为 **30.801 / 31.067 tok/s**，仅 host 观察器为 **30.938 / 31.274 tok/s**，请求时间差在 **0.7%** 内；不把波动解释为负开销。所有请求输出精确正确，三个正式测量进程单次 SIGINT 后 exit=0，五卡 busy=0、显存回原基线。上述转换损失、主机路径和 GPU 空档是优化候选量，尚未证明可全部消除；未改数学计算或启用 overlap/MTP。dmesg 访问受权限限制，不能声称核验了零新增驱动错误。
+- **GDN 头分布事实**：实际加载后每卡 V 头数 [6,12,6,12,12]（`ssm_out.weight` 行数 768/1536 实证），不是 plan 算法的 [10,10,10,10,8]——`llama_tp5_try_apply_split_state` 对全部 GDN 语义 return false，实际切分走 `llama-model.cpp` 的重复段路径。重均衡需改该路径或让 GDN 语义接受 plan 切分。
+- **计算命令段不是纯计算（2026-09-16 进一步拆账）**：`/tmp/tp5-compute-interval-evidence.json` 保留真实 replay，仅观察 Vulkan2 的 97 个计算 CB；三种模式所有 11×248320 logits 均与参考逐位一致，选取 7 个 `creplay=485/0` 暖态 token。仅段首尾时间戳为 **16.210 ms/token**；逐 dispatch 模式整段 **17.235 ms**，dispatch 服务区间 **12.718 ms**；逐屏障模式整段 **17.498 ms**，屏障区间 **4.628 ms**。token 5 有 **2471 dispatch、2059 pipeline barrier**。扣除配对观测到的 **1.025 / 1.288 ms** 插桩增量后，两种口径估计原命令段中约 **3.34–3.49 ms（约 21%）** 为段内非 dispatch 开销；这是扰动修正估计，不是严格下界或已证明可全部删除的收益。12.718 ms 仍含 launch、调度与访存，不能改称纯 ALU 时间。该段内开销与前文段间/PUSH 前空档属于不同区间，但不同实验的值不能直接拼成无插桩总账。
+- **PP 30 tok/s 对照口径**：接受用户实测 PP **30 tok/s**，没有为确认该数值重跑 PP。TP 的 HC 权重保持 MIRRORED；本次 rank2 上 `hc_segment_norm`、`hc_down_silu`、`hc_project_fold` 各 **97 次/token**，合计 **3.065 ms**，已包含在 dispatch 服务时间中，并非五卡均分的计算。MoE router、PLE 也按 plan 镜像。比较 PP/TP 时必须分开可分片工作、镜像重复工作、段内调度/屏障和通信；不能把 PP 端到端 33.3 ms 直接除以五，也不能把 TP 的 16 ms 命令段当计算下限。
+
+**已修复 correctness blocker：non-mmap lazy PLE 空载荷。** 同一首 token 的 CPU/GPU 逐张量对照中，普通词嵌入逐位相同，但旧 GPU PLE gather 的 2560 个元素全部为零，CPU 全部非零。32 KiB CPU-only loader 回归复现：全局 mmap 加载通过，非 mmap 加载断言失败（exit 134）。原因是 lazy 标记令加载器跳过已有普通缓冲区的读入。现在 lazy 表在普通上下文分配前单独绑定映射，不能绑定映射的普通缓冲区正常加载；映射保留真实所有权。mapped-only、eager-fallback、mixed 和 direct-mode mapped fallback 五种回归均通过，CPU plan/meta 回归通过。
+
+此前本节采用 `--no-mmap` 的模型吞吐与 GPU 之间的 logits 等价，只证明该缺陷下的运行/重放行为，**不能作为完整正确模型验收**。真实前缀跟踪 `/tmp/tp5-first-layer-comparison.json`、失败证明 `/tmp/tp5-ple-zero-reproduction.json`。修复后证据：
+- GPU PLE gather **2560 元素与 CPU 逐位一致**：`/tmp/tp5-ple-fixed-proof.json`。
+- CPU mmap / non-mmap **11×248320 logits 逐位一致**：`/tmp/tp5-cpu-loading-mode-proof.json`。
+- CPU attention 精度修复前，复制注意力 TP5 对 CPU 的 top-1 **11/11**，最大 KL **0.043849**（旧值约 1.03），但最大绝对 logit 差仍 **2.336**，**不是全量数值一致**：`/tmp/tp5-ple-fixed-cpu-comparison.json`。
+- 首个 HC down 投影已独立对照实际 GGUF Q8_0 权重和捕获输入的 F64 点积：GPU 最大误差 **1.1051e-5**，CPU 对原始 F32 输入参考为 **0.134518**；用运行库实际 `quantize_row_q8_0` 量化 CPU 输入后，CPU 对对应 F64 参考降至 **2.5224e-5**。这证明该投影的主要差异来自 CPU 输入再量化，不证明其解释全模型差异。`/tmp/tp5-hc-projection-f64-proof.json`。
+- PLE 修复后、CPU attention 精度修复前，layer 对 CPU 的同一 11-position tape top-1 也为 **11/11**，最大 KL **0.056928**；layer 对 TP5 最大 KL **0.021982**：`/tmp/tp5-layer-fixed-reference-comparison.json`。这些含不同激活再量化的路径不是逐位 oracle；同数学路径的对照另列如下。逐节点 callback 会拆分图；layer 首 token logits 不变，但 TP5 首 token 改变（最大差 **0.602544**），所以其 rank-local trace 仅用于诊断，不能作为无插桩整图等价证明：`/tmp/tp5-tensor-observer-effects.json`。直接读取 PARTIAL meta 张量会触发现有不支持分支；后续探针读取真实 rank-local 张量，不伪造全局值。
+- **激活再量化对照**：两种 GPU 布局同时设置已有的 `GGML_VK_DISABLE_MMVQ=1`，保留 GGUF 权重、F16 KV、F32 wire、上下文、单序列和完整计算，11×248320 logits 的 layer/TP5 最大 KL 降至 **5.795e-10**，最大相对 L2 **1.490e-5**，top-1 **11/11**：`/tmp/tp5-no-mmvq-numeric-proof.json`。只关闭近似激活量化，不削减权重精度或模型；未更改默认开关。短算子测量显示 Q5_K 路径更慢，不能宣称这是性能优化。
+- **CPU F32 attention 缺陷已修复**：显式 `GGML_PREC_F32` 原先仍把 F16 V 累加到 F16 临时向量。普通 decode 与 split-KV 的恒定 V/递增 score 回归均从约 **3.88e-4** 降到 **1.19e-7**；保留 `tests/test-flash-attn-precision.cpp`，默认精度和 KV 存储格式不变。CPU bias 小集及 pooled-cache 回归通过。
+- **全量数学参考对照**：一次性 CPU oracle 直接从原始 GGUF 解码权重行，以 F32 激活和 F64 点积计算所有量化 matmul（含真实 MoE 路由）；先以实际 Q8 权重验证普通 matmul、3 路专家/2 token 地址计算，与独立 F64 参考逐位相同，再跑完整模型。采用修复后的 F32 attention，对上述禁用 MMVQ 的 TP5，**11×248320 logits** top-1 **11/11**，最大 KL **6.978e-9**、最大相对 L2 **5.110e-5**、最大绝对差 **7.460e-4**：`/tmp/tp5-cpu-f32-fixed-attention-proof.json`。不是跨后端逐位相等，也不把这组结果归给默认 MMVQ 路径。临时 CPU oracle 源码注入、禁用 repack 的 preload 与 smoke 程序均已移除；只保留真实 F32 累加修复和回归。
+- 同一验数配置的无观察/吞吐复验：移除 tensor callback 和 CPU 注入后，保留 `GGML_VK_DISABLE_MMVQ=1` 的真实 TP5 全词表 logits 与对应层边界观察结果逐位相同，上述 CPU 数学误差不变：`/tmp/tp5-f32-acceptance-proof.json`。相同 F32 激活配置启动真实 server，两个完整 `1..60` 输出均 **171 token**、自然停止，分别 **5.6825 / 5.6407 tok/s**：`/tmp/tp5-f32-acceptance-server-results.json`。单序列、`c=256`、原模型/权重/KV 格式、无 MTP；server 已停止。该配置已有完整数学参考证据，**100 tok/s 仍未达到**。
+- **内核 BO 驻留隔离与真实端到端提升**：在 RDNA2/RADV 上引入 `GGML_TP5_ISOLATE_BO=1` 与 `RADV_DEBUG=nobolist`。将每 stage 提交中的本地计算与跨卡 PUSH 拆分成独立 `VkSubmitInfo`，并用真实完成的 timeline 偶数 signal（SUM 完成）作为分界，阻止 Mesa 将无 signal 的 batch 重新合并。只读 ioctl probe 实测确认 local compute 提交从携带 4 个 peer mailbox 变为 0：`/tmp/tp5-residency-signal-separated-mesh-proof.json`、`/tmp/tp5-residency-model-submit-counts.json`。**11×248320 logits 与基线逐位相同（max_abs=0）**：`/tmp/tp5-residency-separated-logit-proof.json`。相同 F32 激活配置启动真实 server，两个完整 171-token 输出提升至 **14.3627 / 14.8983 tok/s**（提升约 2.6 倍）：`/tmp/tp5-residency-separated-server-results.json`。驱动层仍有分 stage ioctl，尚未实现常数级 CPU 参与。
+- **原生 Attention 分片（QSA）正确性缺陷修复**：
+  - **根本原因**：原计划采用通用均匀切分产生 Q `[5,5,5,5,4]` 和 KV `[1,1,2,1,1]`。Rank 2（Q[10,15)）跨越 GQA 分界线（第 12 头），前 2 头归 KV0、后 3 头归 KV1。但每个后端 kernel（`flash_attn.comp` 等）执行单次局部 GQA 时依赖均匀整数除法 `kh = head / (nq/nkv)`；在 Rank 2 上 $nq=5, nkv=2 \implies$ 比例为 2，导致 local head 4 计算 $4/2=2$，**读取越界的第 3 个 KV 头**。实测第 3 层（首个全注意力层）24 个头中刚好 23 个与正确 V 完全逐位相同，唯独 Q14（Rank 2 local head 4）越界产生 `max_abs=3.37109` 的错误。
+  - **单源修复**：在 `src/llama-tp5-plan.cpp` 中将 Q 划分改为 GQA 分组对齐的 `[6,6,4,4,4]`，对应 KV `[1,1,1,1,1]` 与起始头 `{0,0,1,1,1}`。每个 rank 严格处于单个 KV 组内，局部比例分别变为 6 和 4（均整除）。同时在 `llama-tp5-plan.cpp` 中统一权重与 `cache_k_l* / cache_v_l*` 的头切分，彻底删除 `llama-model.cpp` 中的陈旧硬编码 `[1,1,2,1,1]` 桥接路径。
+  - **测试与数学验证**：删除 `tests/test-tp5-plan.cpp` 中虚构两次独立 GQA 调用的静态桥接代数测试；改为调用真实 CPU `ggml_flash_attn_ext` 算子执行各 rank 单次 GQA 验证，全通。在真实 GPU 模型上重新测量 11-step logits：**top-1 匹配恢复为 11/11（此前为 9/11）**，对比 CPU 数学 Oracle 的最大 KL 降至 **8.13e-9**，最大相对 L2 为 **5.16e-5**，最大绝对误差为 **6.92e-4**：`/tmp/tp5-repaired-native-gqa-proof.json`。
+  - **吞吐与通信开销分析**：在原生 QSA 修复后启动真实 server 测量：两个 171-token 输出为 **12.6917 / 12.1429 tok/s**：`/tmp/tp5-native-gqa-server-results.json`。虽然消除了注意力层在全部卡上的重复计算，但由于全注意力层也引入了 48 次额外的 AllReduce（总 stage 数由 48 增至 96），在当前每 stage 依赖 ioctl/fence 的驱动机制下，通信与调度等待开销（96 stage span 约 168 ms）抵消了单卡计算节省（compute 约 17.7 ms vs 21.7 ms）。
+- 修复后重新启动 `tp5PleFixedServer`，无 MTP、F32 wire、`c=256`、单序列，两个请求均完整生成 `1..60` 共 **171 token**、自然停止，**5.2883 / 5.3665 tok/s**；`17+25` 输出 `42`。`/tmp/tp5-ple-fixed-server-results.json`、`/tmp/tp5-ple-fixed-arithmetic.json`。模型进程已停止，五卡恢复空闲；**100 tok/s 尚未达成**。
+- HC 原生图与分配对齐修复后，相同参数及请求顺序的两个 171-token 输出为 **5.6925 / 5.7209 tok/s**，均完整且自然停止。`/tmp/tp5-hc-aligned-server-results.json`；进程 `tp5HcAlignedServer` 已停止。是这两个配对样本的改善，不是跨任务稳定收益或 100 tok/s 验收。
+- 同模型 layer-split 控制组（非 TP5、同五卡、修复后的 PLE、相同上下文/请求、无 MTP）两次完整 171-token 为 **31.5161 / 31.6493 tok/s**：`/tmp/tp5-layer-control-results.json`。仅用于定位架构差距，不替代 TP5 验收，也不能把两者时间差全算作通信。
+- PLE/HC 修复后的真实 GPU 第 3 条链重新计时：每卡 48 阶段、49 批；span **155.76–161.46 ms**、本地 compute **23.50–26.69 ms**、阶段空档 **125.57–136.48 ms**，SUM **0.453–0.566 ms**、PUSH **0.960–2.934 ms**。主机 API 提交 **24–58 µs/rank**，不能代替 RADV 延迟工作线程的 ioctl 时间。计时版 11×248320 logits 与正确基线逐位相同：`/tmp/tp5-corrected-gpu-timing.log`、`/tmp/tp5-corrected-gpu-timing-proof.json`。空档不等于纯通信或可全部消除的成本。
+- 取消 `GGML_VK_ALLOW_GRAPHICS_QUEUE`、使用已有专用 compute queue：F32 mesh 含 65/66 阶段通过、FD 增量 0，11-position logits 仍逐位相同；第 3 条链 span **162.01–170.84 ms**，未改善阶段空档。`/tmp/tp5-dedicated-compute-timing.log`、`/tmp/tp5-dedicated-compute-proof.json`。没有据此改变生产配置，也未把单链时间当作完整生成吞吐。
+- **IQ4_NL expert rows4→8 实验已撤回**：已有 specialization 在 RDNA2 下的热重复 K128 算子从 **12.05→10.82 µs**，K640 控制从 **27.15→26.26 µs**；但真实模型对应 kernel 每卡均值只由 **20.70–25.96→20.20–25.03 µs**，约 2–4% 改善，没有全模型关键路径收益证明。K32/K96/K128 的短行/尾行和 K640 CPU 参考通过，11×248320 logits 逐位不变。`/tmp/tp5-iq4-rows8-proof.json`、`/tmp/tp5-iq4-rows8-aggregate-profile.log`。已移除临时 tile 改动，重建并复测尾行；不保留未经整体收益证明的架构特调。
+- 仅在完整 `l_last-*` 层边界观察，可避免逐节点 callback 的 PARTIAL 截断问题：CPU、layer、TP5 三者的 **11-position 全词表 logits 分别与各自无观察基线逐位一致**。已保存全部 **48×11** 层边界比较：`/tmp/tp5-all-layer-comparison.json`、`/tmp/tp5-layer-divergence-summary.json`。首 token 的前 9 层 TP5/layer 相对 L2 约 **1e-7**，第 9 层约 **2.66e-5**，到末层约 **0.00516**；后续 token 的差异向浅层传播。首层独立五 rank 输出相对 layer 最大差 **1.49e-8**：`/tmp/tp5-layer-boundary-proof.json`。这是定位误差传播的证据，不是归因已闭环或全模型数值验收通过。
+- **运行中内核的 import 标志丢失已确认，性能因果尚未确认**：仅分配 64 KiB、零 GPU 提交的 libdrm 查询在 renderD128→129 得到 export flags **648 (0x288)**、import flags **512 (0x200)**，即 `AMDGPU_GEM_CREATE_EXPLICIT_SYNC` 在跨卡 DMA-BUF import 后消失：`/tmp/tp5-import-flags-proof.json`。与 [Linux v7.0 import 白名单](https://raw.githubusercontent.com/torvalds/linux/v7.0/drivers/gpu/drm/amd/amdgpu/amdgpu_dma_buf.c) 一致；[CS 路径](https://raw.githubusercontent.com/torvalds/linux/v7.0/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c) 据此选择 `AMDGPU_SYNC_NE_OWNER`，[fence 过滤](https://raw.githubusercontent.com/torvalds/linux/v7.0/drivers/gpu/drm/amd/amdgpu/amdgpu_sync.c) 可加入外卡依赖。这不是全部空档的归因证明：调度器依赖不同于提交线程同步等待，`dma_fence_default_wait` 的具体调用栈仍不可读。未修改内核、驱动参数或同步约束；一次性查询程序已删除。
+- **有界提交窗口实验已撤回**：本机 `amdgpu/sched_jobs=32`；Linux v7.0 的 `amdgpu_cs_sync_rings()` 在 BO reservation 加锁后调用 `amdgpu_ctx_wait_prev_fence()`，提示队列深度可能影响阻塞，但不是运行中 7.0.14 的栈证明。将 49 批分成 24/24/1，所有 rank 提交每窗后才等真实 timeline（只退休已完成 SUM 的 epoch），保持计算和依赖不变。F32/F16 mesh 含 65/66 阶段 cached compute/tail 通过，FD 增量 0；**11×248320 logits 与正确基线逐位相同**：`/tmp/tp5-window24-logit-proof.json`。两次完整 171-token 为 **5.8178 / 5.8230 tok/s**：`/tmp/tp5-window24-server-results.json`，相对前述样本仅约 2%，未达到 5% 晋升门，且链提交从 5 增至 15 次并增加 host wait。短请求采样仍出现 `drm_exec_lock_obj` 和 `dma_fence_default_wait`：`/tmp/tp5-window24-wchan.json`；不能据此确认或排除唯一根因。临时 `GGML_TP5_CHAIN_BATCHES` 实现和开关已移除，恢复完整链提交，没有修改驱动参数。
+
+#### 1. 核心同步选型实验裁决：彻底放弃自旋，押注 Timeline 融合提交
+通过独立驱动级探针（`/tmp/tp5-sync-probe/`）在 5 卡硬件上实测：
+- **双卡 4 轮耗时**：Timeline 为 **0.498 ms**（中位数），Spin 为 **22.694 ms**（中位数），**Timeline 性能领先 45.5 倍**。
+- **稳定性与成功率**：Timeline 100% 成功（0 超时 0 错误）；Spin 出现 100% 超时（硬件时间戳揭示 Card 0 与 Card 1 启动时序存在微秒级错位，导致自旋预算耗尽直接写死超时，且无法自愈）。
+- **五卡扩展性**：Timeline 在 5 卡 16 轮连续交换下达到 **8.466 ms**（平均约 529 µs / 轮）。这是 16 轮独立探针，不是模型的 96 次归约，不能据此外推 100 tok/s 的通信预算已满足。
+
+#### 2. 测量边界与常驻内核限制
+- 先前 `submits=10, batches=490` 是某次执行的应用计数，不代表当前正确模型每步都命中整链。计数器语义和路径命中必须与同一次有效生成绑定。
+- `25.1 ms` 即使是完整通信耗时，也超过 **10 ms/token** 的总预算；而现有 `p1_sub/p2_sub/compute_async` 主要是主机调用区间，不能当作独立 GPU 临界路径或纯 dispatch 开销相加。
+- 一次 `vkQueueSubmit` 可以包含很多批次、命令缓冲和 dispatch；减少 API 调用不等于实现单 dispatch 模型。
+- **常驻 mega-kernel 尚未实现或验收**。Vulkan queue timeline 等待发生在提交边界，不能令正在执行的 shader 在每层内部等待 timeline；LDS 是工作组局部存储，不是全 GPU 可共享的激活缓存。不能在没有跨工作组调度/同步与跨设备可见性证明时声称全 token 常驻可行。
+- 撤回此前“计算 6–7 ms、通信 ≤2.5 ms、全部中间量留在 LDS、稳定 100 tok/s”的无证据预测。保留正确归约边界，先依据实际 GPU 时间戳验证局部算子融合，不部署未经证明的跨卡自旋。
+
+#### 3. 原生 GDN 布局缺陷与当前有效模型证据
+- 实际 `attn_qkv` / `ssm_conv1d` 是 `Q[2048],K[2048],V[6144]`；加载器没有做设计稿中的 Q/K 预排列。连续切为 `[2133,2133,2133,2133,1708]` 与已分段的 recurrent cache 不一致，且 `ssm_dt/ssm_a` 是每个 V head 的参数，不能当作镜像标量广播。
+- 运行时 GDN 权重与缓存统一使用 `llama-model.cpp` 已有的 modulo 分段路径；`ggml-backend-meta.cpp` 的列并行 matmul 与 SSM_CONV 保留 `nr`。`n_segments=1,nr[0]=5` 表示一个重复五次的 Q/K/V 基础段，不是五个独立 segment 描述。
+- `test-tp5-plan` 不再用“行数总和相等”证明错误切片；新增实际五 CPU rank 图，覆盖带历史值的 10240 通道卷积和 48 head 的 decay gate。保留原生布局但丢弃 `nr` 时观察到卷积 9440 项、gate 44 项错配；修复后卷积 **0/10240**、gate **0/48**，gate 与未切分 CPU 同算子图逐项精确相等。
+- 同一真实模型、相同 token=16 的独立跟踪：`hc_init` 与 CPU 精确相等；修复后 `conv_output_raw-0` 相对误差由 1.2946 降至 0.01518，`gate-0` 由 1.2306 降至 0.01081。前面的 HC 量化路径已有数值差异；这些数字仅用于定位，**不视为全模型严格数值验收**。跟踪中某些分段 view 的 meta readback 不支持，触发主机断言；不是推理时设备 hang。
+- 无回调的真实 `--split-mode tensor`、5×RX6800、timeline/F32、c256/b32/ub32/np1、无 MTP，三个请求 HTTP 200：计数带空格、`17+25 → 42`、无空格精确 `1,2,3,4,5,6,7,8,9,10,11,12`。无空格计数 27 tokens / 8506.023 ms = **3.1742 tok/s**，不是 100 tok/s。证据：`/tmp/tp5-native-gdn-results.json`，监督进程日志 `tp5NativeGDNServer`。
+- 上述修复布局后的首次正确生成尚未命中整链：样本为 `submits=3329,batches=3329,collective=96,creplay=5/0`；图节点数被旧计数器误作 decode 判据，故 `decode=0` 不能说明请求不是单 token 解码。
+- 随后移除纯设备 GET_ROWS/SET_ROWS 的错误重放禁用；动态行回归连续六轮变更源值、gather ID、scatter 位置，精确核对 cache 全部行并确认重放命中。当前 CPU plan、meta boundary、Vulkan replay **10 项**均通过。还纠正了 Vulkan 重放路径把 queue API 调用数和 SubmitInfo 批次数写反的问题。
+- 相同无空格计数及算术请求再次正确；计数冷/暖样本 **3.9655 / 4.0002 tok/s**。有效单 token 路径计数为 `submits=10,batches=490,creplay=485/0,collective=96`，不把 API 次数误称为内核 driver ioctl 次数。证据 `/tmp/tp5-row-replay-results.json`，日志 `tp5RowsReplayServer`。
+- 原生 modulo 分段恢复后，移除 tensor 模式强制禁用 fused GDN 的特判，恢复原有自动能力探测。相同计数/算术继续正确；计数冷/暖 **4.2582 / 4.2652 tok/s**，仍是 10 次 queue API 调用、96 次归约。证据 `/tmp/tp5-fused-gdn-results.json`，日志 `tp5FusedGDNServer`。这些 27-token 样本是优化进展，不是长序列稳态或全模型严格数值验收。
+- 另以现有 `GGML_VK_PERF_LOGGER` 做两次有界两-token 设备时间戳诊断；该模式禁用重放，不能用其墙钟声称生产路径性能。首窗口混有初始化的 n=2 图，已排除；后窗口只含 n=1。五个后窗口的算子时间总和分别为 **66.2711 / 78.1778 / 84.5164 / 75.7261 / 77.6017 ms**，每窗口覆盖两个单-token 图。跨卡求和不是单 token 临界路径。
+  明显热点包括 HC Q8_0 `[320→10240]`（194 次、合计 7.88–10.53 ms/窗口）与部分 Q5_K `[2560→2560]`（单次约 85–90 µs），不能继续把总延迟一律归因于 dispatch。完整日志及提取结果为 `/tmp/tp5-device-timing.log`、`/tmp/tp5-device-timing-analysis.json`；下一轮须区分真实 driver 提交次数、跨卡等待和这些矩阵形状的设备计算成本。
+- 已补做独立 strace：暖请求原始 prompt=`1`、`n_predict=4`；从服务端 `predicted_ms` 反推的 decode 窗口内，记录 **1728 次 AMDGPU_CS、1440 次 SYNCOBJ_TIMELINE_WAIT、15950 次 SYNCOBJ_WAIT**。该请求初次采样之后执行三个 decode 图，折合约 **576 CS、480 timeline wait / decode 图**，不是 10 次 driver ioctl；同期应用计数仍是每图 `submits=10,batches=490`。`wait_n=0` 也没有覆盖驱动内部等待/轮询。窗口边界由 HTTP 结束时间和服务端耗时推算，strace 有扰动，不能把其墙钟当作生产性能。
+  原始记录 `/tmp/tp5-native-replay-ioctl.trace`、请求与时间窗 `/tmp/tp5-native-replay-ioctl-window.json`、计数 `/tmp/tp5-native-replay-ioctl-summary.json`。下一步必须针对真实提交批次和依赖处理，而不是继续宣传 10 次 API 调用等于 10 次硬件提交。
+- 已试验在没有 near-completion 标记时以阻塞 fence 替代整图 CPU 轮询。10 项 replay 回归和真实计数/算术均正确，但冷/暖计数仅 **4.1292 / 4.2239 tok/s**，没有改善此前 **4.2582 / 4.2652 tok/s** 样本；因此**撤销该实验改动**，不把潜在减少轮询当作已实现吞吐收益。证据 `/tmp/tp5-blocking-tail-results.json`，日志 `tp5BlockingTailServer`。
+
+用户明确的验收目标是：同一真实模型、五卡、单请求单输出序列，**关闭 MTP/投机解码，稳态有效 decode 吞吐至少 50 tok/s，且正确性不退化**。不以多请求聚合吞吐、降低模型精度、减少专家/计算量、缩短已冻结上下文或放宽数值容差替代该目标。历史段落中的 60/100 tok/s 目标及依赖 MTP 的速度预测不再作为当前验收标准；当前方法直接降低串行通信开销，不依赖计算/通信 overlap。
+
+#### 4. HC fold 融合与非 RERoT recurrent 语义修复
+- 早期约 15.3 µs vs 57.4 µs 的算子烟测使用逐 stream CONT/MUL 的旧图，不能证明当前模型触发融合。真实 `build_hc_mix` 是整块 MUL → RESHAPE → VIEW/CONT/ADD → SCALE 的 **11 节点图**。匹配器和回归已整体迁移到该原生结构，不保留旧图兼容分支；图重排器保留融合窗口及分配依赖，回归通过实际 scheduler 分配路径运行。
+- 第一份真实 decode 局部图 `/tmp/tp5-decode-hc-alias.log` 显示两个窗口均 `can_elide=1`、输出不与输入重叠，但输入地址尾部为 `…758`，只满足设备 4-byte 分配对齐，导致 vec4 的 16-byte 检查拒绝。Vulkan 根张量分配现取 `max(16, minStorageBufferOffsetAlignment)`，**未放宽**内核别名、对齐或中间值观察检查。aligned/nonzero view、4-byte unaligned view fallback、被观察中间 view 和多轮变更输入均与 CPU **逐位一致**。
+- 真模型 profile 从每卡 **32 次增至 1057 次 HC_FOLD4**，后者约 **3.33–4.10 µs/次**。`/tmp/tp5-hc-native-kernel-profile.log`、`/tmp/tp5-hc-aligned-kernel-profile.log` 保留前后账；profile 含预热且会插入等待，不用其总时间当作吞吐。对齐后 **11×248320 logits 与 PLE 修复后的基线逐位一致**，证据 `/tmp/tp5-hc-aligned-proof.json`。关闭 profiler 后吞吐见本节顶部；11 项 replay、F32/F16 五卡 mesh（包含 65/66 阶段 cached compute→AR→tail）全部通过。
+- `llama_memory_hybrid_idx` 先前把普通 `n_seq_max` 冒充 RERoT B/H 容量，导致默认关闭 RERoT 时仍激活 grouped recurrence；36 个 recurrent 层被执行为 102 个 GDN，而非 36 个。构造器现在显式接收实际 B/H，模型工厂传入实际 `recurrent_size`，不再暗中改变普通模型语义。已有 pooled-cache 生命周期回归以 recurrent capacity=4、sequence capacity=2、B/H=0 验证；旧实现构造时报 grouped capacity 异常，修复后生命周期行为通过。
+- 两项修改后，全部 Vulkan replay **11 项**通过；相同模型、tensor/timeline/F32、无 MTP、短计数和算术仍精确正确。当时测得计数冷/暖 **5.1108 / 5.1493 tok/s**（27-token 样本，伴随只读 sysfs 采样），但该构建的 replay 仍会丢弃 pinned 上传，所以这些数值**不能**与上传修复后的结果并列比较；修正后同二进制的有效配对见本节后文。证据 `/tmp/tp5-native-hc-results.json`、`/tmp/tp5-native-hc-clocks.json`，监督日志 `tp5NativeHCServer`。仍只是短样本，**100 tok/s 和全模型 CPU 数值验收未完成**。
+- 只读采样显示五卡低利用率，四卡 core 约 1600 MHz、card2 约 1200 MHz，memory 1000 MHz；没有修改已有时钟或功耗策略。最新停载后五卡 busy=0，card1 VRAM **17,203,200 bytes**、card2–4 **17,207,296 bytes**、card5 **31,952,896 bytes**；此前此处把 MiB 近似数当作十进制 bytes，现纠正，证据 `/tmp/tp5-replay-prefix-idle.json`。本轮无法读取 dmesg，非特权 journal 无记录；不声称已独立证明内核零错误。
+
+此前 layer-split 的 27-token 暖态冒烟为 23.6258 tok/s（42.3266 ms/token），不是 TP5 基线。它与 100 tok/s 的 10 ms/token 相差约 4.2327×，但不能据此估算真实 tensor 模式的差距。R=2 的数值通过和微基准改善是局部完成，**不是总目标完成**，也没有证明 100 tok/s 已可达。
+
+#### 5. 单次重放链 GPU 时间账与 CPU 参考入口修复
+- 新增默认关闭的 `GGML_TP5_GPU_TIMING=N`：仅给第 N 次成功构建的 timeline 重放链加入时间戳，按每卡 SUM/compute/PUSH、依赖尾部 compute 和相邻批次空档输出。查询只读 availability，不额外等待；不复用在途查询，不比较跨卡绝对时钟。标记有执行屏障和额外 CB，因此是**有扰动诊断**，不计为生产 tok/s；链后的主机采样不在 span 中。
+- 把最终非归约子图（LM head 切片）并入每卡单次提交：以前它单独 `graph_compute_async`，完成信号不覆盖它。并在 collective 提交入口校验 `stage_compute_cbs.size() == n_stages + 1` 且所有 CB 非空（无效尾部在**任何归约提交前**失败，有回归覆盖）。五卡 mesh 的 65/66 步 cached matmul→AR→**尾部 affine** 逐元素精确等于 CPU oracle，包括新的尾部期望值校验。
+- 同二进制的短请求对照（真实五卡 tensor、无 MTP、F32 wire）：重放关 **3.47/3.55/3.57 tok/s**，重放开（链+尾部）**4.64/4.94 tok/s**；两组预热/请求顺序不同，不能作为严格配对或单独归因于尾部合批。应用埋点的 `submits` **3321→5**、`wait_us` **87.9 ms→0** 不包含全部驱动内部等待；chain 前后 backpressure 约 **1.7 ms→25 µs** 来自另一组样本。没有测得完整 CPU submit 墙钟为零。与修复上传后、合并尾部前的 **5.1647/5.1782 tok/s** 比较，尾部合批加阻塞 fence 尚未显示吞吐收益。证据 `/tmp/tp5-replay-ab.json`、`/tmp/tp5-tail-chain-results.json`、`/tmp/tp5-prefix-baseline-results.json`。
+- 尾部合批后的计数 `1..12` 与 `42` 正确，mesh 尾部 oracle 精确通过。此前 `/tmp/tp5-chained-tail-model-proof.json` 误用了合批前向量，现已独立补测：`tp5TailProofCurrent` 明确命中 `submits=5, batches=485`，新 `/tmp/tp5-logits-tail-current.bin` 与非重放参考的 **11×248320 logits 逐位相同、max_abs=0**。有效证据为 `/tmp/tp5-tail-current-proof.json`。当前 F16 mesh（带时间戳、含依赖尾部）及 11 项 replay 也通过。
+- `ggml_vk_wait_for_fence` 去掉对整张图的忙轮询：无 almost-ready 标记时改用阻塞 `waitForFences`，避免每 token 一个核心的空转和大量 ioctl；有标记时的原有快速路径保留。
+- 归因边界：约 **202–215 ms/token** 尚未拆成完整关键路径。粗粒度 sysfs busy 百分比不能直接换算成逐 token 的有效计算时间；带屏障时间戳的 gaps 也不能全归因于跨卡传播，更不能据此排除 PCIe、驱动或 CPU 的贡献。设备间和 CPU/GPU 的 logits 差异相近也**不能排除 TP5 缺陷**。下一步验证当前链的数值与 CPU 成本，并尝试减少必要归约阶段；不把推测写成根因。
+- F32 五卡实际 mesh：4 轮变化输入、4 轮 GPU producer、8 步异步依赖、65/33/48 阶段（扩容、奇数长度和 view）、65/66 步 cached matmul→AR 均通过，FD 26→26。33 阶段捕获覆盖后续不同长度链，查询无覆盖；第一次调用漏设 `GGML_VK_CMD_REPLAY=1` 时 cached-compute 子测因重放关闭失败，按该子测前提开启后全通过，没有隐藏该失败。
+- 同一真实模型、固定 tape `1,2,3,4,5,6`，`GGML_TP5_GPU_TIMING=3` 捕获 96 阶段。五卡各自 span 为 **151.728–154.815 ms**，compute **17.331–21.782 ms**，SUM **0.745–0.971 ms**，PUSH **1.822–2.183 ms**，空档 **127.987–134.341 ms**。不是把五卡求和；空档包含 peer 就绪、提交/驱动/调度和插桩效应，不能全部命名为 PCIe 拷贝或可直接消除的开销。原始账 `/tmp/tp5-replay-chain-gpu-timing.log`、`/tmp/tp5-replay-chain-gpu-summary.json`；进程 `tp5LogitsTensor` 正常 exit 0。
+- CPU 完整 logits 对照发现另一个真实缺陷：lazy PLE 的 mmap 指针没有加入 `mmaps_used`，加载结束时仍被 `unmap_fragment` 释放，随后 IQ4_NL GET_ROWS 崩溃。修复保留真实映射区间；32 KiB 临时 GGUF 回归在旧实现 exit 139，修复后加载结束再读首/中/尾页均精确相等。真实 CPU 同 tape 随后完成 11×248320 logits，正常退出；有/无 warmup CPU 向量逐位相同。没有用强制 direct mode 绕过 mmap 生命周期问题。
+- 此前无 warmup 的完整 CPU/tensor 对照 top-1 为 8/11 相同，KL 最大约 **1.8664**；这明确**不构成全模型数值通过**。layer 无 warmup 控制首向量为零，不可拿它当 oracle；正在改用与生产相同 warmup 的受控对照。证据 `/tmp/tp5-logits-cpu-tensor-comparison.json`，原向量 `/tmp/tp5-logits-{cpu,layer,tensor}.bin`。
+- layer 的全零并非 warmup 问题：有 warmup 仍复现，关闭 replay 才恢复正确执行。缩成 16 维 pinned-input→matmul→async-readback 回归时，旧实现输出 **0.5**、CPU 参考 **-2.0**。原因是 replay 开始录制时 reset 普通 compute context，丢弃尚未提交的 pinned 上传；cache hit 同样可能越过这些上传。现复用现有 `ggml_vk_tp5_flush_async` 在录制/hit 前提交前置命令，**不引入 host wait**。11 项 replay 回归通过；真实五卡 layer 同 tape 的 **11×248320 logits 与关闭 replay 逐位相同，max_abs=0**。证据 `/tmp/tp5-replay-prefix-model-proof.json`、`/tmp/tp5-logits-layer-{no-replay,replay-fixed}.bin`。这证明 replay 等价，不证明 CPU/GPU 整模分布等价；后者仍未通过。
+- 上传修复后，同配置 tensor 的计数冷/暖为 **5.1647 / 5.1782 tok/s**，算术仍为 `42`；请求 `/tmp/tp5-prefix-baseline-results.json`。暖计数整请求（含 4-token prefill）主线程 CPU **6536.7 ms**，另五个活跃线程各 **185.5–245.4 ms**；主线程 runqueue wait **3.5 ms**，另五线程均小于 **0.3 ms**。这些是 `/proc/<pid>/task/*/schedstat` 区间差值，不是纯 decode 的分项 GPU 时间；证据 `/tmp/tp5-prefix-thread-counters.json`。没有因推测 CPU 调度争用而改 affinity/优先级/系统策略。
+- GDN 独立检查补上原生 **16 Q/K heads→48 V heads、head_size=128、单 token** 非二次幂重复布局，在 Vulkan0 对 CPU 参考通过；这仅排查该算子，不消除整模 CPU/GPU 差异。上传修复后 CPU/tensor 全词表 top-1 仍为 8/11 相同、KL 最大约 **2.5126**，见 `/tmp/tp5-logits-corrected-comparison.json`，不放宽验收阈值。
+- 检查 Mesa 26.0.8 全局 BO residency 列表假说：临时关闭 BDA/bindless features，并以 `RADV_DEBUG=nobolist` 对照。11 项 replay、五卡 mesh 依赖链和 4 个小 IM2COL 描述符路径样本通过；真实 tensor 计数/算术正确，但计数仅 **4.9616 / 5.0630 tok/s**，在该次对照中未显示收益（当时链路径尚未包含尾部）。已撤销临时 feature 开关，不保留无实测收益的配置复杂度。请求 `/tmp/tp5-no-bolist-results.json`，进程 `tp5NoBoListServer` 已停止。
+
+后续证据必须首先覆盖真实模型的融合链命中与未命中原因，再按完整 decode 步的临界路径区分 host、设备计算、跨卡依赖和尾部/采样成本。优化取舍以不启用 MTP 的模型配对结果决定；当前短计数结果和 96 阶段微基准不能直接代替它。
+
+#### 6. 可选 attention/GDN 复制（非默认，已运行）
+- `GGML_TP5_REPLICATE_ATTN=1` 在构造纯 CPU plan 时选择每卡完整 attention/GDN 权重和缓存；专家/共享专家仍按原通道切分，模型、激活精度和上下文不变。默认仍分片。镜像 FA 仅接受全部输入镜像，不接受混合所有权；原生 conv/gate 与两 KV head 的 FA 在五个 CPU backend 上数值检查通过。
+- 六个真实 GGUF 分片的 attention/GDN 权重合计约 **1.728 GiB**；原实测最高显存约 **11.84 GiB/卡**，以增加完整副本作保守上界后才加载。复制模式实测峰值约 **13.25 GiB/卡**，无叠加模型/GPU 负载。离线工具 `tools/tp5/tp5-inspect-model.py --replicate-attention` 同步输出镜像布局和 48 次归约；KV 预算不再把已累加的 layer/head 实例数重复乘层数。清单 `/tmp/tp5-replicated-manifest.json` 仅是静态预算，不是运行正确性证明。
+- 真实执行为 **48 次归约、5 次应用 queue 调用、245 批**，不是 5 次驱动 ioctl。`1..12` 和 `42` 精确正确；`1..60` 两次完整自然结束，各 **171 token**，分别 **5.4035 / 5.3546 tok/s**。首次 max_tokens=128 时只是生成到 `46` 并以 `length` 结束，前缀精确正确；随后在同一 256 上下文内把输出上限改为 192 完成请求。证据 `/tmp/tp5-replicated-server-results.json`，进程 `tp5ReplicatedServer` 已停止。
+- 与 layer 非重放 GPU 参考的 11-position 全 logits 对照：top-1 **11/11** 相同，max KL **0.05985**；与 CPU 仍只有 **8/11** top-1 相同、max KL **1.02953**。不声称 CPU 数值验收通过。证据 `/tmp/tp5-replicated-logit-comparison.json`、`/tmp/tp5-logits-replicated.bin`。
+- 第三次链的插桩 48 阶段 span **161.49–167.57 ms**、compute（含尾部）**24.49–28.94 ms**、SUM **0.46–0.74 ms**、PUSH **0.95–1.09 ms**、gaps **130.91–141.61 ms**。减少归约后 gaps 并未同比减少；不能把旧 gaps 简单乘 1/2 来预测吞吐。原始账 `/tmp/tp5-replicated-gpu-timing.log`。
+- 第 64 次链补测：每卡 **49 batch、49 compute CB、96 collective CB**，诊断另加 **195 marker CB**。五次 `vkQueueSubmit` 墙钟分别 **59/42/42/29/33 µs**，前置 flush **1 µs**；打印延后至所有 rank 提交之后。GPU span **166.94–173.89 ms**、compute **25.13–29.43 ms**、gaps **135.88–145.99 ms**，尾部 compute **1.16–1.31 ms**。API 返回很快不证明驱动后台提交没有成本；gaps 也不能全部归因于跨卡传输。该请求完整输出 171 token，但包含一次诊断，不作无扰动吞吐样本。证据 `/tmp/tp5-replicated-submit-timing.log`、`/tmp/tp5-replicated-submit-response.json`；进程 `tp5RepSubmitTiming` 已停止。
+
+#### 7. 驱动提交阻塞定位（尚未归因闭环）
+- 当前 F32、48 阶段、2560 元素的独立 mesh 配对中位数：普通路径 **41.603 ms**，整链 **27.312 ms**，所有输出及 FD 增量检查通过。不能用它替代载入真实权重后的模型时间。
+- 临时 libc ioctl 探针只计时真实调用、事后写每 PID 文件，不改变设备命令或依赖。真实模型暖请求（含 4-token prefill、27-token 输出）有 **10295 次 AMDGPU_CS**：跨线程墙钟累计 **7677.61 ms**、线程 CPU 累计 **534.43 ms**，p95 墙钟 **3338.98 µs**，无 CS 错误。**6480 次 TIMELINE_WAIT** 的累计墙钟 **812.08 ms**、CPU **69.24 ms**。跨线程时间重叠，不能相加当作请求临界路径。证据 `/tmp/tp5-drm-durable-summary.json`、`/tmp/tp5-drm-durable-requests.json`、`/tmp/tp5-drm-durable.508014`。早期 destructor-only 探针未成功保留模型记录，不作证据。
+- 独立的 `/proc` wait-channel 采样观察到五个提交线程在 `drm_exec_lock_obj` 和 `dma_fence_default_wait` 阻塞；不是仅由 API 返回时间推断。原始采样 `/tmp/tp5-driver-wchan.json`。这定位到 reservation-lock/fence 路径，但尚未证明是隐式 DMA-BUF 依赖、VM 验证还是其他持锁等待。`/proc/.../stack` 权限不足；没有提权、修改驱动或更改机器策略。相关模型进程均已停止。
+- BO chunk 实测中，暖态主要图形 CS 为 **19 个 BO / 4 个 IB**，另有 16/3 等类别；不能把 BO 数量描述为整个模型的逐张量列表。原始记录 `/tmp/tp5-drm-bo-scope.513121`、汇总 `/tmp/tp5-drm-bo-scope-summary.json`。
+- 已尝试同时拆开 SUM / 本地 compute / PUSH submission，并关闭未使用的 BDA/bindless 特性配合 `RADV_DEBUG=nobolist`。保留每卡一次 queue API、同队列屏障与原 timeline 依赖；48 阶段从 **245** 增为 **725 batch**。五卡依赖链与 11 项 replay 回归通过，真实 **11×248320 logits 与原复制模式逐位相同**（`/tmp/tp5-isolated-logit-proof.json`）。但两个完整 171-token 请求仅 **5.2161 / 5.4743 tok/s**（`/tmp/tp5-isolated-server-results.json`），没有稳定收益，故**已撤销该实验代码和开关**，不引入更多生产分支。恢复路径重新构建，F32 mesh（含 GPU timing）与 11 项 replay 全部通过。显式 chain-regression 测试现在自行启用其所需的 compute replay，避免把缺少测试环境变量误判为链执行失败。
+- 归因纪律：25–29 ms compute 是**所有 48 阶段之和**，不是每个 stage 的时间。`drm_exec_lock_obj` 采样不证明该锁持有至整个 GPU job 完成；没有直接证据前，不把 `5×compute≈span` 当成因果证明。IQ3_S/IQ4_NL 的单-token indexed matvec 选择检查 `ids.ne[1]`（token 数），不是 `ids.ne[0]`（激活专家数）；active=10 本身不会触发旧的 8-token 阈值。
+
+用户指定的方法：CPU 参与压缩到每 token 最小常数次，由 GPU 自协调推进，尽量减少控制信令延迟。必须分别计数应用层 queue API、submission batch 与驱动提交，不能把五次 API 调用写成五次设备工作。消除重复信用、确认和中间完成通知；必要的数据就绪、内存可见性与失败语义仍须保留。热路径避免逐层 host wait、录制和分配，不以未经验证的跨设备自旋替换已证明的依赖。
+
+**模型冒烟归因纠正**：此前 23.63 tok/s 启动命令没有 `--split-mode tensor`。代码中 `--tp5` 只设置 TP5 配置，`common_params::split_mode` 仍默认 `LLAMA_SPLIT_MODE_LAYER`，只有 tensor 模式才创建 meta backend。因此该结果仅是五卡 layer-split 冒烟，不能视为 R=2/TP5 端到端证据；真实 TP5 基线须重新建立并确认路径命中。五卡 mesh 的直接融合入口数值及配对结果不受此归因错误影响。
+
+显式 tensor 复测已创建五 rank native communicator。计数请求的暖态执行记录为 `submits=1465, batches=1465, collective=96, creplay=480/0, plan=96/0`，未走整链融合，且产生乱码并返回 HTTP 500（peg-native 解析失败）。其 48-token/15.197 s 执行时间 **不作为有效生成性能**。模型已停载、未新增 GPU 错误；失败响应与日志为 `/tmp/tp5-tensor-baseline-response.json`、`/tmp/tp5-tensor-baseline.log`。同步方法对照先在隔离的有界载荷实验中进行，不用这个失败模型输出挑选赢家。
+
+### 协议与速度来源
+
+- 两个真实 mailbox bank，统一用 `(epoch - 1) & 1` 选择；P1、P2、普通入口和整链入口使用同一映射。每个 bank/slot 的 stride 满足所有设备的 storage-buffer alignment；奇数长度 F16 的传输末尾补齐到整字，但求和仍仅访问有效元素。
+- 保留本队列 COMPUTE/TRANSFER 的 RAW/WAR/WAW 屏障及 P2 等待 peer ready 的 timeline 依赖，不依赖“同队列自然有序”。R=2 的槽位信用可由既有依赖传递得到：`peer P2(e-2) → peer P1(e-1) ready → local P2(e-1) → local P1(e)`。因此不必再为 P1 重复提交 epoch−2 peer wait；此证明不适用于 R=1。
+- 整链批次为 `[compute(0), P1(0)]`、随后各个 `[P2(s-1), compute(s), P1(s)]`、最终 `[P2(last)]`。96 阶段由每卡 192/288 个批次降为 **97 个批次、一次 vkQueueSubmit**。单纯把原来的批次塞进一次 API 调用，实测没有获得稳定收益；本轮保留的是相邻 SUM/compute/PUSH 融合。
+- ready 值为 `2e-1`；中间 P2(e) 的完成被下一次 ready `2e+1` 覆盖，故既有 `wait >= 2e` 的退休语义不变。链尾显式 signal `2e`，无须等待下一次调用才能退休。没有 host 伪造信号，也没有用 wait-idle 补救部分 rank 提交失败；部分提交失败直接终止，禁止回退后继续消费。
+- 先验证整链及最大 workspace，再建立计划；固定预留 256 项 cache，取计划地址之前决定是否淘汰，避免扩容/淘汰悬空指针。描述符池按双 bank 与 cache 上限计容。128-epoch owner 窗口与两个 payload bank 分离；每次覆盖 owner 槽位前完成退休，最多在链边界背压，不逐层主机等待。
+- replay cache 保持真实 buffer/scratch 生命周期，检查源/输出绑定、参数、view offset 和 scratch generation。图指针优先查找；UID=0 是未设置，不能让另一个图遮蔽准确命中。外部队列提交设置 backend 的 pending-work 状态；待提交上传与 transfer timeline 在整链前发布，正常 synchronize 能观察真实完成。
+
+### 五卡正确性与配对计时
+
+设备为五张 RX 6800 / RADV NAVI21；`timeline`、direct mesh、无 gpuflag/host relay。相同 96 阶段 × 2560 元素，普通正确 R=2 与融合 R=2 各自预热，五对 AB/BA 交替；计时包含提交和最终 GPU 完成，输入重置/逐项校验在计时外，两边均校验。
+
+| Wire | 普通 R=2 中位 ms | 融合 R=2 中位 ms | 配对加速比中位数 |
+|---|---:|---:|---:|
+| F16 | 77.901 | 47.136 | 1.660× |
+| F32 | 73.533 | 49.569 | 1.462× |
+
+全部原始配对 `(ordinary_ms, fused_ms)`：
+
+- F16：`(73.832,45.931), (77.558,44.785), (80.818,47.746), (77.901,47.136), (78.287,47.149)`。
+- F32：`(72.134,49.328), (73.533,50.589), (73.485,48.544), (74.394,49.569), (80.419,155.217)`。最后一对有明显离群，未剔除；这些中位数不构成尾延迟保证。
+
+两种 wire 均通过：16 轮变化输入、4 轮真实 GPU producer、8 步无中间 host-sync 依赖链、65/33/48 阶段整链（146 epochs，覆盖两种起始 bank、扩容、2573 奇数长度、非零 offset 及 guard bytes）、129 阶段提交前拒绝，以及额外 65/66 步 **真实 cached matmul → AR → matmul** 依赖链。新增整链结果与对应 wire 的 CPU oracle 精确相等，不放宽容差；FD 为 25→25。
+
+复现命令（先按真机安全门确认五卡空闲；F32 将 `--wire f16` 改为 `f32`；两次串行运行）：
+
+```bash
+GGML_VK_ALLOW_GRAPHICS_QUEUE=1 GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1 GGML_VK_CMD_REPLAY=1 \
+  build-tp5/bin/test-vulkan-tp5-mesh --devices 0,1,2,3,4 \
+  --elements 2560 --rounds 16 --wire f16 --sync timeline --check-all --vary-input \
+  --delay-producer --run-chain-regression --benchmark-chain --chain-stages 96
+```
+
+`test-vulkan-command-replay` 9 项全过；`test-tp5-plan` 与 `test-meta-reduce-boundary` 均通过。独立 CPU 调度烟测使用生产 timeline 依赖构造器，遍历五 rank / 八 epoch 的 1757 个可达状态，无错误 bank 读取且能结束；旧 R=1 无信用模型存在覆盖反例。模型不替代真实 GPU 测试，也不代表所有 Vulkan 实现的跨设备可见性证明。
+
+### 有界模型冒烟与边界
+
+重新编译的 `build-tp5/bin/llama-server`，Qwen3.8-Flash-Next-APEX-I-Compact 六分片，五卡 `qwen4exp-af`、timeline/F16、replay on、`c=256, b=ub=32, np=1`、未启 MTP，temperature=0、seed=1、max_tokens=48：两次计数均精确输出 `1,2,3,4,5,6,7,8,9,10,11,12`；更换输入 `17+25` 输出 `42`。两次计数各生成 27 tokens，接口报告 decode 为 13.652 与暖态 23.626 tok/s。响应保留在 `/tmp/tp5-r2-inference-results.json`。
+
+这是有限输入冒烟，不是端到端前后配对基准；不据此宣称全模型吞吐提升比例、不启用 MTP 的 100 tok/s 或长上下文质量达标。微基准直接验证融合入口；此次模型进程的额外 debugger attach 被系统 ptrace 策略拒绝，未独立采到逐 token 融合命中计数。
+
+测试服务已停止；五卡显存回到测试前基线（前四卡约 16.41 MiB，第五卡约 30.47 MiB），无新增 GPU hang/reset/VM fault。内核新增的两条 ptrace 拒绝审计不是 GPU 错误。没有重启生产服务或执行 GPU reset。
+
 ## 2026-09-14 重新插卡验证与通信计时修正
 
 - 重新插卡后五卡 `03:00.0/06:00.0/09:00.0/0c:00.0/0f:00.0` 全部绑定 amdgpu，sysfs 当前链路均为 8.0 GT/s ×16。五卡独立传输、十组双向 P2P 卡对（20 个方向）全部通过；未使用 host-relay，硬件级接触与内存通道全部正常。
@@ -2214,12 +2440,12 @@ meta 后端在 TP5 模式下改为：
         ↓
 按设备时间找出真正昂贵的算子，做少量融合
         ↓
-普通 decode 稳定后，再独立验收 MTP 与长上下文
+普通 decode 按冻结上下文验收 100 tok/s；MTP 不参与本轮目标
 ```
 
-**不再用“有这个功能”“单测通过”“开关已经打开”代替“这个路径实际命中，并使正确生成更快”。** 批量提交是值得优先验证的候选，不是已证明的 60 tok/s 答案。没有必要否定目标，也不能预先保证目标必达。
+**不再用“有这个功能”“单测通过”“开关已经打开”代替“这个路径实际命中，并使正确生成更快”。** 批量提交的局部收益不是已证明的不启用 MTP 的 100 tok/s 答案。没有必要否定目标，也不能预先保证目标必达。
 
-60 tok/s 的报告必须明确 MTP 是否参与，并同时保留 MTP OFF 的主干结果。先优化普通 decode，是为了找到主干成本，不是永久关闭投机。只有开启 MTP 才达到的数字，应写“TP5 + MTP”，不能写成普通 TP5 的提升；100 tok/s 另列为后续全集成目标。
+当前验收只接受 MTP OFF 的主干达到 100 tok/s。只有开启 MTP 才达到的数字，应写“TP5 + MTP”，不能计入本轮目标，也不能把 100 tok/s 降为后续投机或全集成目标。
 
 ### 1.1 已经完成的，不要反复当新任务
 
@@ -2234,7 +2460,7 @@ meta 后端在 TP5 模式下改为：
 以上不等于大模型完整验收。尤其是 MTP 的 **1.47 / 1.43 tok/s** 只证明对应连续请求完成，不证明它带来加速。这两次请求与 2.38 tok/s 的计数请求不同，也不能直接拿二者相除当 MTP 减速比。[T1][T3][S1]
 
 ### 1.2 硬件状态与优化执行
-硬件修复已经完成，硬件状态健康稳定。各模块优化直接以 60 tok/s 目标为准绳，有序推进。
+硬件修复已经完成，硬件状态健康稳定。各模块优化以正确性不退化、不启用 MTP 达到 100 tok/s 为准绳；真实负载仍须串行并执行安全门。
 
 ## 二、先纠正会把后续工作带偏的几笔账
 
@@ -2313,11 +2539,11 @@ REF 在 timeline 下使用 one-shot collective plan 时会等待其完成再销�
 
 此后每次只在最近通过验收的基线上改一个因素。已有 TopK、small-M、稀疏注意力、增量池化、PLE 等按固定构建和条件执行；不要一轮同时改模型、wire、重放、prompt、MTP 和 kernel 后寻找“最快组合”。已经失败的候选留在版本记录，不永久变成一个新开关。
 
-## 四、先固定什么叫 60 tok/s
+## 四、先固定什么叫不启用 MTP 达到 100 tok/s
 
 ### 4.1 主指标与辅助指标分开
 
-主指标是**单个逻辑请求、单条输出序列的稳态有效生成吞吐**。五卡共同计算一条序列，不能把五卡数量乘到 token 数上。主干与 MTP 分别报告；prefill、首字延迟、冷启动、恢复和总请求耗时另列。
+主指标是**关闭 MTP/投机解码时，单个逻辑请求、单条输出序列的稳态有效生成吞吐**。五卡共同计算一条序列，不能把五卡数量乘到 token 数上，也不能用并发请求的聚合速率替代单序列指标。prefill、首字延迟、冷启动、恢复和总请求耗时另列；MTP 不计入本轮验收。
 
 ```text
 decode_tok_s = 对应测量窗口内实际输出的有效 token 总数 / 窗口耗时
@@ -2345,13 +2571,13 @@ draft 提议、被拒绝 token、强制喂入 token、重放计算都不增加�
 
 | 吞吐 | 平均有效输出时间 | 用法 |
 |---|---:|---|
-| 最近短请求约 2.38 tok/s | 约 420 ms | 说明差距，不能充当正式基线 |
+| R=2 暖态短请求约 23.63 tok/s | 约 42.33 ms | 27-token 冒烟观察，不能充当正式稳态基线 |
 | 10 tok/s | 100 ms | 第一项大幅改善的观察点，不是承诺 |
 | 30 tok/s | 33.33 ms | 继续检查剩余主导项 |
-| 60 tok/s | 16.67 ms | 当前目标 |
-| 100 tok/s | 10 ms | 后续全集成目标 |
+| 60 tok/s | 16.67 ms | 中间观察点，不满足当前目标 |
+| 100 tok/s | 10 ms | 当前验收目标，MTP OFF、正确性不退化 |
 
-在当前 96 个主干归约边界的分解下，若入口、尾部、采样及其它不可归入主干 stage 的临界路径时间为 `T_fixed`，60 目标留给主干的**平均预算**为 `(16.67 ms - T_fixed) / 96`。把 97 个阶段均分约为 172 µs，只能帮助理解量级，不意味着每个阶段都具有相同成本，更不意味着 96 次归约独占全部预算。
+在当前 96 个主干归约边界的分解下，若入口、尾部、采样及其它不可归入主干 stage 的临界路径时间为 `T_fixed`，100 tok/s 目标留给主干的**平均预算**为 `(10 ms - T_fixed) / 96`。把 97 个阶段均分约为 103 µs，只能帮助理解量级，不意味着每个阶段都具有相同成本，更不意味着 96 次归约独占全部预算。
 
 先找单独就超过目标预算的项目。对于临界路径中独立占比为 p 的部分，即使彻底消除，整体加速上限也只是 `1/(1-p)`。多个有重叠的优化不能把宣传加速比直接相乘。
 
@@ -2456,7 +2682,7 @@ timeline 的值在同一 semaphore 生命周期内必须单调推进，不能每
 
 部分 rank 已提交、另一个 rank 失败时，不能盲目 `DeviceWaitIdle` 等待永远不会到来的 peer signal；也不能由主机补一个“成功”信号，让消费者读取未完成载荷。保留现有拒绝继续的语义，为失败状态设计经过审查的退出和资源处理，不把一个通用析构函数当成解决方案。[S2][V5]
 
-**GPU 显存 flag 自旋不进入本轮收敛主线。** 当前代码已明确拒绝 `gpu/gpuflag`。它同时引入跨设备可见性、调度前进性和 hang 风险，不是换个同步开关；若将来研究，须单列设计与安全准入，不依附这次 60 tok/s 验收。[S2]
+**GPU 显存 flag 自旋不进入本轮收敛主线。** 当前代码已明确拒绝 `gpu/gpuflag`。它同时引入跨设备可见性、调度前进性和 hang 风险，不是换个同步开关；若将来研究，须单列设计与安全准入，不依附这次不启用 MTP 的 100 tok/s 验收。[S2]
 
 **P2 的完成物**：数值与生命周期通过；有效 token 时间下降；API/批次/驱动提交数量有前后对照；最终等待没有把省下的中间等待原样搬回来。如果只有 API 次数下降、墙钟不降，应停止继续扩大提交批量，转向设备工作与依赖分析。
 
@@ -2525,9 +2751,9 @@ P0 之后可以并行做彼此独立的离线代码工作，但真实目标机�
 
 任一数值失败、旧 epoch 污染、host-relay、无法清理的挂起、资源持续增长或新增硬件错误，均停止该候选晋升。禁止用强制关闭任务、少算层、减少专家、缩短目标上下文、丢 KV、放宽容差或重复无效输出换取达标数字。
 
-### 10.2 达到 60 后也不能立即宣布完成
+### 10.2 不启用 MTP 达到 100 后仍须通过正确性与稳定性验收
 
-至少同时具备：冻结工作负载下可重复的有效吞吐；同条件质量非劣与数值门；上下文长度和 MTP 参与状态明确；逐卡显存和主机资源有界；持续请求及恢复无回归；安全准入和 artifact 可追溯。完整长上下文或全集成尚未测，就明确列出，不沿用短请求的结论。
+至少同时具备：冻结工作负载、单输出序列、MTP OFF 下可重复的有效吞吐达到 100 tok/s；同条件质量非劣与数值门；上下文长度明确且没有为提速缩短；逐卡显存和主机资源有界；持续请求及恢复无回归；安全准入和 artifact 可追溯。完整长上下文或全集成尚未测，就明确列出，不沿用短请求的结论。
 
 **下一轮最有价值的交付不是第八个优化开关，而是：一份可信基线、一笔按真实步划分的时间账，以及一个在这笔账上确实减少了毫秒数的改动。**
 

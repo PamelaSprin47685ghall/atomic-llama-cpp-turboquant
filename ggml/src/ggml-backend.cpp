@@ -1607,7 +1607,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             if (it != alloc_deps.end()) {
                 const std::vector<ggml_tensor *> & keep = it->second;
                 for (size_t k = 0; k < keep.size(); k += GGML_MAX_SRC) {
-                    struct ggml_tensor * dep = ggml_view_tensor(sched->ctx, keep[k]);
+                    // Lifetime edges have no payload or inherited backend layout.
+                    // A view of keep[k] would make meta initialization interpret
+                    // other kept tensors (including CPU inputs) as math sources.
+                    struct ggml_tensor * dep = ggml_new_tensor_1d(sched->ctx, GGML_TYPE_F32, 0);
                     for (size_t s = 0; s < GGML_MAX_SRC && k + s < keep.size(); s++) {
                         dep->src[s] = keep[k + s];
                     }
@@ -1737,6 +1740,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+            // Snapshot-capable backends own the host bytes before returning and
+            // order destination writes on their stream. This preserves INPUT
+            // reuse semantics without a host wait for every small device copy.
+            if (ggml_backend_buffer_is_host(input->buffer) && split_backend->iface.set_tensor_snapshot_async &&
+                split_backend->iface.set_tensor_snapshot_async(split_backend, input_cpy, input->data, 0,
+                                                               ggml_nbytes(input), true)) {
+                ggml_backend_synchronize(input_backend);
+                const bool captured = split_backend->iface.set_tensor_snapshot_async(
+                    split_backend, input_cpy, input->data, 0, ggml_nbytes(input), false);
+                GGML_ASSERT(captured);
+                continue;
+            }
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done

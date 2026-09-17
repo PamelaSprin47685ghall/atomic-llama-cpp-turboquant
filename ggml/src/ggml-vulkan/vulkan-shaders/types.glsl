@@ -1214,7 +1214,7 @@ struct block_iq2_s_packed16
     uint16_t scales[QUANT_K_IQ2_S/64];
 };
 
-#if defined(DATA_A_IQ2_S)
+#    if defined(DATA_A_IQ2_S) || defined(GGML_TABLE_IQ2_S)
 
 const uvec2 iq2s_grid_const[1024] = {
     uvec2(0x08080808, 0x08080808), uvec2(0x0808082b, 0x08080808), uvec2(0x08081919, 0x08080808), uvec2(0x08082b08, 0x08080808),
@@ -1477,8 +1477,13 @@ const uvec2 iq2s_grid_const[1024] = {
 
 shared uvec2 iq2s_grid[1024];
 
-#define NEEDS_INIT_IQ_SHMEM
+#        if defined(DATA_A_IQ2_S)
+#            define NEEDS_INIT_IQ_SHMEM
+
 void init_iq_shmem(uvec3 wgsize)
+#        else
+void init_iq2s_shmem(uvec3 wgsize)
+#        endif
 {
     // copy the table into shared memory and sync
     [[unroll]] for (uint i = 0; i < iq2s_grid.length(); i += wgsize.x) {
@@ -1489,14 +1494,16 @@ void init_iq_shmem(uvec3 wgsize)
     barrier();
 }
 
-#define QUANT_K QUANT_K_IQ2_S
-#define QUANT_R QUANT_R_IQ2_S
-#define A_TYPE block_iq2_s
-#define A_TYPE_PACKED16 block_iq2_s_packed16
-#endif
+#        if defined(DATA_A_IQ2_S)
+#            define QUANT_K         QUANT_K_IQ2_S
+#            define QUANT_R         QUANT_R_IQ2_S
+#            define A_TYPE          block_iq2_s
+#            define A_TYPE_PACKED16 block_iq2_s_packed16
+#        endif
+#    endif
 
-#define QUANT_K_IQ3_XXS 256
-#define QUANT_R_IQ3_XXS 1
+#    define QUANT_K_IQ3_XXS 256
+#    define QUANT_R_IQ3_XXS 1
 
 struct block_iq3_xxs
 {
@@ -1510,7 +1517,7 @@ struct block_iq3_xxs_packed16
     uint16_t qs[QUANT_K_IQ3_XXS/8 + QUANT_K_IQ3_XXS/16];
 };
 
-#if defined(DATA_A_IQ3_XXS)
+#    if defined(DATA_A_IQ3_XXS) || defined(GGML_TABLE_IQ3_XXS)
 
 const uint32_t iq3xxs_grid_const[256] = {
     0x04040404, 0x04040414, 0x04040424, 0x04040c0c, 0x04040c1c, 0x04040c3e, 0x04041404, 0x04041414,
@@ -1549,8 +1556,13 @@ const uint32_t iq3xxs_grid_const[256] = {
 
 shared uint32_t iq3xxs_grid[256];
 
-#define NEEDS_INIT_IQ_SHMEM
+#        if defined(DATA_A_IQ3_XXS)
+#            define NEEDS_INIT_IQ_SHMEM
+
 void init_iq_shmem(uvec3 wgsize)
+#        else
+void init_iq3xxs_shmem(uvec3 wgsize)
+#        endif
 {
     // copy the table into shared memory and sync
     [[unroll]] for (uint i = 0; i < iq3xxs_grid.length(); i += wgsize.x) {
@@ -1561,14 +1573,16 @@ void init_iq_shmem(uvec3 wgsize)
     barrier();
 }
 
-#define QUANT_K QUANT_K_IQ3_XXS
-#define QUANT_R QUANT_R_IQ3_XXS
-#define A_TYPE block_iq3_xxs
-#define A_TYPE_PACKED16 block_iq3_xxs_packed16
-#endif
+#        if defined(DATA_A_IQ3_XXS)
+#            define QUANT_K         QUANT_K_IQ3_XXS
+#            define QUANT_R         QUANT_R_IQ3_XXS
+#            define A_TYPE          block_iq3_xxs
+#            define A_TYPE_PACKED16 block_iq3_xxs_packed16
+#        endif
+#    endif
 
-#define QUANT_K_IQ3_S 256
-#define QUANT_R_IQ3_S 1
+#    define QUANT_K_IQ3_S 256
+#    define QUANT_R_IQ3_S 1
 
 struct block_iq3_s
 {
@@ -1588,7 +1602,7 @@ struct block_iq3_s_packed16
     uint16_t scales[QUANT_K_IQ3_S/64/2];
 };
 
-#if defined(DATA_A_IQ3_S)
+#    if defined(DATA_A_IQ3_S) || defined(GGML_TABLE_IQ3_S)
 
 const uint32_t iq3s_grid_const[512] = {
     0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
@@ -1659,8 +1673,13 @@ const uint32_t iq3s_grid_const[512] = {
 
 shared uint32_t iq3s_grid[512];
 
-#define NEEDS_INIT_IQ_SHMEM
+#        if defined(DATA_A_IQ3_S)
+#            define NEEDS_INIT_IQ_SHMEM
+
 void init_iq_shmem(uvec3 wgsize)
+#        else
+void init_iq3s_shmem(uvec3 wgsize)
+#        endif
 {
     // copy the table into shared memory and sync
     [[unroll]] for (uint i = 0; i < iq3s_grid.length(); i += wgsize.x) {
@@ -1671,14 +1690,16 @@ void init_iq_shmem(uvec3 wgsize)
     barrier();
 }
 
-#define QUANT_K QUANT_K_IQ3_S
-#define QUANT_R QUANT_R_IQ3_S
-#define A_TYPE block_iq3_s
-#define A_TYPE_PACKED16 block_iq3_s_packed16
-#endif
+#        if defined(DATA_A_IQ3_S)
+#            define QUANT_K         QUANT_K_IQ3_S
+#            define QUANT_R         QUANT_R_IQ3_S
+#            define A_TYPE          block_iq3_s
+#            define A_TYPE_PACKED16 block_iq3_s_packed16
+#        endif
+#    endif
 
-#define QUANT_K_IQ4_XS 256
-#define QUANT_R_IQ4_XS 1
+#    define QUANT_K_IQ4_XS 256
+#    define QUANT_R_IQ4_XS 1
 
 struct block_iq4_xs
 {
