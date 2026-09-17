@@ -3095,6 +3095,16 @@ struct ggml_backend_vk_buffer_context {
 
 // Include source/leaf bindings as well as outputs: source allocations and view
 // offsets can change while the output tensor and graph pointer remain unchanged.
+static const ggml_tensor * ggml_vk_resolve_root_tensor(const ggml_tensor * t, size_t & total_offs) {
+    const ggml_tensor * r = t;
+    total_offs = 0;
+    while (r->view_src) {
+        total_offs += r->view_offs;
+        r = r->view_src;
+    }
+    return r;
+}
+
 static void ggml_vk_cache_build_fingerprint(ggml_backend_vk_context::vk_cached_subgraph & entry,
                                             const ggml_cgraph * cgraph) {
     entry.fingerprint.clear();
@@ -3107,9 +3117,11 @@ static void ggml_vk_cache_build_fingerprint(ggml_backend_vk_context::vk_cached_s
             return;
         entry.fingerprint.emplace_back();
         auto & fp    = entry.fingerprint.back();
+        size_t total_offs = 0;
+        const ggml_tensor * root = ggml_vk_resolve_root_tensor(t, total_offs);
         fp.tensor    = t;
-        fp.data = t->view_src ? t->view_src->data : t->data;
-        fp.view_offs = t->view_offs;
+        fp.data      = root->data;
+        fp.view_offs = total_offs;
         fp.type = (uint32_t) t->type;
         fp.op = (int32_t) t->op;
         for (int k = 0; k < 4; ++k) {
@@ -3117,7 +3129,7 @@ static void ggml_vk_cache_build_fingerprint(ggml_backend_vk_context::vk_cached_s
             fp.nb[k] = t->nb[k];
         }
         memcpy(fp.op_params, t->op_params, sizeof(fp.op_params));
-        ggml_backend_buffer_t buffer = t->buffer ? t->buffer : (t->view_src ? t->view_src->buffer : nullptr);
+        ggml_backend_buffer_t buffer = root->buffer ? root->buffer : t->buffer;
         if (buffer && ggml_backend_buffer_is_vk(buffer) && !ggml_backend_buffer_is_multi_buffer(buffer)) {
             auto * buf_ctx = (ggml_backend_vk_buffer_context *) buffer->context;
             fp.dev_buffer = (buf_ctx && buf_ctx->dev_buffer) ? (VkBuffer) buf_ctx->dev_buffer->buffer : VK_NULL_HANDLE;
@@ -3169,22 +3181,13 @@ static bool ggml_vk_cache_fingerprint_match(const ggml_backend_vk_context *     
         if (memcmp(fp.op_params, t->op_params, sizeof(fp.op_params)) != 0)
             return false;
 
-        // Intermediate computed nodes have their storage managed by the graph allocator;
-        // their host data pointers may alternate across double-buffered graph evaluations
-        // while their GPU buffers and graph topologies are invariant. Only input/leaf
-        // tensors need strict data/device buffer matching.
-        const bool is_input = (t->flags & GGML_TENSOR_FLAG_INPUT) != 0 || (t->op == GGML_OP_NONE);
-        if (is_input) {
-            void * data = t->view_src ? t->view_src->data : t->data;
-            if (fp.data != data || fp.view_offs != t->view_offs)
-                return false;
-            ggml_backend_buffer_t buffer = t->buffer ? t->buffer : (t->view_src ? t->view_src->buffer : nullptr);
-            if (fp.dev_buffer != VK_NULL_HANDLE && fp.dev_buffer != current_buffer(buffer))
-                return false;
-        } else {
-            if (fp.view_offs != t->view_offs)
-                return false;
-        }
+        size_t total_offs = 0;
+        const ggml_tensor * root = ggml_vk_resolve_root_tensor(t, total_offs);
+        if (fp.data != root->data || fp.view_offs != total_offs)
+            return false;
+        ggml_backend_buffer_t buffer = root->buffer ? root->buffer : t->buffer;
+        if (fp.dev_buffer != current_buffer(buffer))
+            return false;
         return true;
     };
     bool   same_tensors = true;
