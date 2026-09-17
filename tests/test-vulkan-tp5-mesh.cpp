@@ -678,9 +678,17 @@ static void run_cached_compute_chain_regression(void * comm, bool is_f16_wire) {
             for (auto backend : g_backends) {
                 ggml_backend_synchronize(backend);
             }
+            auto t_pass_start = std::chrono::high_resolution_clock::now();
             TEST_ASSERT(g_submit_epoch_chain(comm, pass_cbs, tensors));
             for (auto backend : g_backends) {
                 ggml_backend_synchronize(backend);
+            }
+            auto t_pass_end = std::chrono::high_resolution_clock::now();
+            double pass_ms = std::chrono::duration<double, std::milli>(t_pass_end - t_pass_start).count();
+            static int pass_log_cnt = 0;
+            if (++pass_log_cnt <= 6) {
+                fprintf(stderr, ">>> [TRUE-CHAIN-BENCHMARK] steps=%d total: %.3f ms (avg per AllReduce: %.2f us) <<<\n",
+                        steps, pass_ms, (pass_ms / steps) * 1000.0);
             }
 
             // The last AllReduce writes stage tensor[steps - 1] (steps % 2 == 0 ? b : a).
