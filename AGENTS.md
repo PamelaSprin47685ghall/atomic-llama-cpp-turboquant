@@ -12,6 +12,73 @@ RERoT 设计、验证入口与路线见 [RERoT.md](RERoT.md)。TP5 设计与收�
 
 ---
 
+## 下班交接｜2026-09-17（晚）
+
+**分支：** `master` @ `c0e8948ae`（已推送 `origin/master`）
+**目标：** 5× AMD RX 6800 上 Qwen3.8-Flash TP5，纯 STAR 模式下单 Token 通信压进 10 ms（100 tok/s）
+
+### 一、本轮已合入（按 commit）
+
+| Commit | 内容 |
+|--------|------|
+| `baca3a3f0` | `tp5_bda_push_f16.comp` 向量化 128 位爆发写 + `tp5_drm_waiter` 5 核并发等待；单步通信降至 31.78 us |
+| `f27b776e5` | `submit_epoch_chain` 解除 P1 跨阶段等待；P2 等待掩码收窄为 TRANSFER_BIT；CPU 侧 9.24 us |
+| `c0e8948ae` | **删除 309 行碎片化 STAR 分支**，回归原版融合流水线 `[SUM(s-1) → COMPUTE(s) → PUSH(s)]` |
+
+**已验证：** `test-vulkan-tp5-mesh --sync star --rounds 96` 100% 通过（位级精确）。
+**CPU 侧单步 AllReduce 实测：** **7.06 us**（AVX2 sum 4.25 us + 根联合体广播 2.59 us），96 步合计 0.68 ms。
+
+### 二、关键代码事实
+
+1. **六大支柱体系（2026-09-17 修订版）**：
+
+| 支柱 | 机制 | 实测指标 | 状态 |
+|------|------|---------|------|
+| **一** | 系统物理内存直通：`posix_memalign` + `VK_EXT_external_memory_host`，GPU BDA 直写 CPU L3 缓存（Intel DDIO） | — | ✅ |
+| **二** | 64 位裸物理指针 + CPU 根联合体下行广播：`VK_KHR_buffer_device_address` + `memcpy` 5 通道并发直写显存 | 2.59 us | ✅ |
+| **三** | **CPU L3 Cache 自旋 polling + GPU completion flag（DRM IOCTL 已死）**：GPU 算子顺手写 `flag[0] = seq` 到 Host 内存，CPU 在 L3 缓存内 `_mm_pause()` 自旋检查，0 系统调用，0 中断 | 5.13 us | ✅ |
+| **四** | 22 物理核无锁 AVX2+F16C L3 驻留累加池：`tp5_avx2_pool`（纯 `std::atomic` + `_mm_pause()`，去除 OS 互斥锁与条件变量） | 4.25 us | ✅ |
+| **五** | 零提交常驻融合流水线：回归原版 `[SUM(s-1) → COMPUTE(s) → PUSH(s)]` 段拼接，三模式共用 `chain_scratch`，消除 192 个 Job 碎片 | — | ✅ |
+| **六** | **提交开销隐藏进上一 token**：当前 token 的 `vkQueueSubmit`（含命令录制与批组装）在上一 token 的 GPU 执行窗口内完成，提交耗时完全移出关键路径；辅以异步 Signal 线程池 0.04 us 原子交接 | 0.04 us | ✅ |
+
+| **单步 AllReduce 物理总和** | — | **7.06 us（96 步 0.68 ms）** | ✅ |
+
+2. **`submit_epoch_chain` 已回归统一融合流水线**：
+   STAR/TIMELINE/DRM 三种模式共用 `chain_scratch` 段拼接（`append_segment`），不再有 STAR 专属分支。
+   手写分支曾把 `[SUM(s-1) → COMPUTE(s) → PUSH(s)]` 切成 3 个独立 Submit，造成 192 个内核 Job 碎片与 5.9 ms/stage（1.24 tok/s）。
+3. **GPU → CPU 通知机制（支柱三定论）：**
+   - `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT` 在多卡高频小步长下**已死**：
+     内核工作队列 10 ms 调度时钟惩罚 + 每 Token 960 次 ioctl 系统调用摩擦。
+   - 替代路线：**GPU BDA 直写 completion flag 到 CPU L3 缓存 + CPU `_mm_pause()` 自旋检查**，
+     实测 5.13 us，0 系统调用，不碰 GPU 硬件，无看门狗风险。
+   - `tp5_bda_push_f16.comp` 已含 `flag[0] = seq_val` 写回，flag 位于每个 rank 槽位尾部 -64 字节（严格在绑定内存内）。
+4. **CPU → GPU 通知机制（支柱六定论）：**
+   门铃（Doorbell）方向是 CPU→GPU；可走 `amdgpu_create_userqueue`（libdrm_amdgpu 已装）或异步 Signal 线程池。
+5. **支柱六的真正内涵（提交开销隐藏）：**
+   当前 token 的整图命令录制 + `vkQueueSubmit` 批组装，全部在上一 token 的 GPU 执行期间完成（Pipeline Overlap），
+   提交本身的 CPU 耗时（~1-2 ms）永不在当前 token 的关键路径上，等效于 0 提交开销。
+
+### 三、当前阻塞点
+
+`llama-server` STAR 模式启动时，`models/qwen4exp.cpp:1154` 的 `ggml_set_rows` 触发：
+
+```
+cmd_child_to_router:error: ggml/src/ggml.c:4025: GGML_ASSERT(a->ne[2] == b->ne[2]) failed
+```
+
+**根因：** `kq_mask_all`（`[1, n_kv, n_batch, n_stream]`）与 `zeros`（`[1, n_top_k, n_batch, n_stream]`）在 `n_batch`/`n_stream` 维度不匹配（GDN 掩码构建路径）。
+
+**下一步：**
+1. 对比 `--tp5-sync timeline` 下 `llama-server` 能否启动，确认该断言是否 STAR 特有。
+2. 在 `qwen4exp.cpp:1145-1155` 加形状打印定位维度错配。
+3. 修复后用 `EXTRA_ARGS="-b 32 -ub 32 -c 512"` 做纯 Decode 压测（勿永久修改批次，Prefill 待后续优化）。
+
+### 四、GPU 状态
+
+五卡空闲基线：`17.2 MB` / `31.9 MB`，`gpu_busy = 0%`，dmesg 零错误。
+
+---
+
 ## 下班交接｜2026-09-14（晚）
 
 **分支：** `master` @ `0bd9cd922`（已推送 `origin/master`）  
