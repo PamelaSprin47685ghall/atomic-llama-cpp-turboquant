@@ -175,11 +175,8 @@ public:
     }
 
     ~tp5_avx2_pool() {
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_stop.store(true, std::memory_order_release);
-        }
-        m_cv_work.notify_all();
+        m_stop.store(true, std::memory_order_release);
+        m_task_epoch.fetch_add(1, std::memory_order_release);
         for (auto & t : m_workers) {
             if (t.joinable()) {
                 t.join();
@@ -190,60 +187,40 @@ public:
     tp5_avx2_pool(const tp5_avx2_pool &) = delete;
     tp5_avx2_pool & operator=(const tp5_avx2_pool &) = delete;
 
-    // Dispatches a task across all persistent worker threads and waits for completion
+    // Dispatches a task across all persistent worker threads using pure lockless atomic spin-wait
     void parallel_for(task_fn fn) {
         if (!fn) return;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_current_task = std::move(fn);
-            m_completed_count.store(0, std::memory_order_relaxed);
-            m_task_epoch.fetch_add(1, std::memory_order_release);
+        m_current_task = fn;
+        m_completed_count.store(0, std::memory_order_relaxed);
+        m_task_epoch.fetch_add(1, std::memory_order_release);
+        while (m_completed_count.load(std::memory_order_acquire) < NUM_WORKERS) {
+#if defined(__x86_64__) || defined(_M_X64)
+            _mm_pause();
+#endif
         }
-        m_cv_work.notify_all();
-
-        // Wait for all workers to finish the task
-        std::unique_lock<std::mutex> lock(m_mutex);
-        m_cv_done.wait(lock, [this]() {
-            return m_completed_count.load(std::memory_order_acquire) == NUM_WORKERS;
-        });
-        m_current_task = nullptr;
     }
 
 private:
     void worker_loop(size_t id) {
         uint64_t last_epoch = 0;
-        while (true) {
-            task_fn task;
-            {
-                std::unique_lock<std::mutex> lock(m_mutex);
-                m_cv_work.wait(lock, [this, &last_epoch]() {
-                    return m_stop.load(std::memory_order_acquire) ||
-                           m_task_epoch.load(std::memory_order_acquire) > last_epoch;
-                });
-
-                if (m_stop.load(std::memory_order_acquire)) {
-                    break;
+        while (!m_stop.load(std::memory_order_relaxed)) {
+            uint64_t cur_epoch = m_task_epoch.load(std::memory_order_acquire);
+            if (cur_epoch > last_epoch) {
+                last_epoch = cur_epoch;
+                if (m_stop.load(std::memory_order_relaxed)) break;
+                if (m_current_task) {
+                    m_current_task(id, NUM_WORKERS);
                 }
-
-                last_epoch = m_task_epoch.load(std::memory_order_acquire);
-                task = m_current_task;
-            }
-
-            if (task) {
-                task(id, NUM_WORKERS);
-            }
-
-            if (m_completed_count.fetch_add(1, std::memory_order_acq_rel) + 1 == NUM_WORKERS) {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                m_cv_done.notify_one();
+                m_completed_count.fetch_add(1, std::memory_order_release);
+            } else {
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#endif
             }
         }
     }
 
     std::vector<std::thread> m_workers;
-    std::mutex m_mutex;
-    std::condition_variable m_cv_work;
-    std::condition_variable m_cv_done;
     std::atomic<bool> m_stop{false};
     std::atomic<uint64_t> m_task_epoch{0};
     std::atomic<size_t> m_completed_count{0};

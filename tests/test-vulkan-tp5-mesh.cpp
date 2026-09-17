@@ -1881,6 +1881,8 @@ int main(int argc, char ** argv) {
 
     // 2) varying inputs + multi-round chain
     {
+        for (auto b : g_backends) ggml_backend_synchronize(b);
+        auto t_start = std::chrono::high_resolution_clock::now();
         for (int r = 0; r < rounds; ++r) {
             std::vector<std::vector<float>> rank_results;
             run_round(comm, tensors, elements, r, vary, delay, 0, false, rank_results, &delay_workloads);
@@ -1888,6 +1890,11 @@ int main(int argc, char ** argv) {
                 check_result(rank_results, elements, P, r, vary, 0, false, is_f16_wire);
             }
         }
+        for (auto b : g_backends) ggml_backend_synchronize(b);
+        auto t_end = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+        fprintf(stderr, "\n>>> [BENCHMARK] %d AllReduces total: %.3f ms (avg: %.2f us, throughput: %.2f tok/s) <<<\n",
+                rounds, ms, (ms / rounds) * 1000.0, 1000.0 / ms);
         if (g_failures == 0) fprintf(stderr, "  %d rounds (vary=%d): OK\n", rounds, (int) vary);
     }
 

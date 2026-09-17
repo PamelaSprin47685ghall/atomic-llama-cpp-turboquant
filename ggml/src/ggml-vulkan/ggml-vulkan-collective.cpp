@@ -2345,6 +2345,15 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
     const uint64_t epoch = ++c.allreduce_calls;
     const size_t bank = tp5_mailbox_bank(epoch);
 
+    static double acc_p1_sub_us = 0;
+    static double acc_wait_us = 0;
+    static double acc_avx2_us = 0;
+    static double acc_bcast_us = 0;
+    static double acc_p2_sub_us = 0;
+    static uint64_t call_cnt = 0;
+
+    auto t_start = std::chrono::high_resolution_clock::now();
+
     for (auto backend : c.backends) {
         ggml_vk_tp5_flush_async(backend);
     }
@@ -2438,6 +2447,8 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
         ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
     }
 
+    auto t_after_p1 = std::chrono::high_resolution_clock::now();
+
     // =========================================================================
     // PILLAR 3: NATIVE DRM SYNCOBJ TIMELINE WAIT (Bypassing Vulkan stack)
     // =========================================================================
@@ -2478,6 +2489,8 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
         }
     }
 
+    auto t_after_wait = std::chrono::high_resolution_clock::now();
+
     // =========================================================================
     // PILLAR 4: 22-CORE DEDICATED AVX2+F16C L3 CACHE DIRECT ACCUMULATION
     // =========================================================================
@@ -2495,6 +2508,8 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
         tp5_avx2_accumulate_star(rank_ptrs, acc_out, n_elems, 0, 1, tensors[0]->type == GGML_TYPE_F32);
     }
 
+    auto t_after_avx2 = std::chrono::high_resolution_clock::now();
+
     // =========================================================================
     // PILLAR 2: CPU ROOT COMPLEX DOWNSTREAM BROADCAST
     // =========================================================================
@@ -2504,6 +2519,8 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
             std::memcpy(c.ranks[i].bcast_host[bank], acc_out, bcast_bytes);
         }
     }
+
+    auto t_after_bcast = std::chrono::high_resolution_clock::now();
 
     // =========================================================================
     // 5. Submit Phase 2 unpack compute on each GPU to write back into local tensor
@@ -2558,6 +2575,33 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
 
         vkQueueSubmit(r.queue, 1, &si, VK_NULL_HANDLE);
         ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
+    }
+
+    auto t_after_p2 = std::chrono::high_resolution_clock::now();
+
+    acc_p1_sub_us += std::chrono::duration<double, std::micro>(t_after_p1 - t_start).count();
+    acc_wait_us   += std::chrono::duration<double, std::micro>(t_after_wait - t_after_p1).count();
+    acc_avx2_us   += std::chrono::duration<double, std::micro>(t_after_avx2 - t_after_wait).count();
+    acc_bcast_us  += std::chrono::duration<double, std::micro>(t_after_bcast - t_after_avx2).count();
+    acc_p2_sub_us += std::chrono::duration<double, std::micro>(t_after_p2 - t_after_bcast).count();
+    call_cnt++;
+
+    if (call_cnt % 96 == 0) {
+        fprintf(stderr, "\n[REAL-PILLAR-PROFILER (avg over %llu calls)]\n"
+                        "  1. P1 vkQueueSubmit:      %6.2f us (96 steps: %5.2f ms)\n"
+                        "  2. DRM Timeline Wait:     %6.2f us (96 steps: %5.2f ms)\n"
+                        "  3. 22-Core AVX2 Sum:      %6.2f us (96 steps: %5.2f ms)\n"
+                        "  4. CPU Root Bcast:        %6.2f us (96 steps: %5.2f ms)\n"
+                        "  5. P2 vkQueueSubmit:      %6.2f us (96 steps: %5.2f ms)\n"
+                        "  TOTAL ALLREDUCE PER STEP: %6.2f us (96 steps: %5.2f ms)\n\n",
+                (unsigned long long)call_cnt,
+                acc_p1_sub_us / call_cnt, (acc_p1_sub_us / call_cnt * 96) / 1000.0,
+                acc_wait_us / call_cnt,   (acc_wait_us / call_cnt * 96) / 1000.0,
+                acc_avx2_us / call_cnt,   (acc_avx2_us / call_cnt * 96) / 1000.0,
+                acc_bcast_us / call_cnt,  (acc_bcast_us / call_cnt * 96) / 1000.0,
+                acc_p2_sub_us / call_cnt, (acc_p2_sub_us / call_cnt * 96) / 1000.0,
+                (acc_p1_sub_us + acc_wait_us + acc_avx2_us + acc_bcast_us + acc_p2_sub_us) / call_cnt,
+                ((acc_p1_sub_us + acc_wait_us + acc_avx2_us + acc_bcast_us + acc_p2_sub_us) / call_cnt * 96) / 1000.0);
     }
 
     return true;
