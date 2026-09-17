@@ -1,33 +1,36 @@
 #version 450
 
+// 6-Pillar Ultimate Vectorized BDA Push:
+// Reads vec4 (4 x float = 16 bytes) aligned,
+// converts on-the-fly to f16vec4 (4 x float16 = 8 bytes),
+// and performs burst-aligned PCIe store into Host RAM!
+
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-
-// TP5 Pure BDA Push F16 Compute Shader:
-// Zero-Descriptor architecture: directly reads from 64-bit source physical address
-// and writes to 64-bit destination physical address.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 
 layout(local_size_x = 64) in;
 
-layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer SrcBdaBuffer {
-    uvec4 src_data[];
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer SrcBdaF32 {
+    vec4 src_data[];
 };
 
-layout(buffer_reference, std430, buffer_reference_align = 16) writeonly buffer DstBdaBuffer {
-    uvec4 dst_data[];
+layout(buffer_reference, std430, buffer_reference_align = 8) writeonly buffer DstBdaF16 {
+    f16vec4 dst_data[];
 };
 
 layout(push_constant) uniform Params {
     uint64_t src_bda_addr;
     uint64_t dst_bda_addr;
-    uint n_uvec4;
+    uint n_vec4;
 } p;
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    if (idx >= p.n_uvec4) {
+    if (idx >= p.n_vec4) {
         return;
     }
 
-    DstBdaBuffer(p.dst_bda_addr).dst_data[idx] = SrcBdaBuffer(p.src_bda_addr).src_data[idx];
+    vec4 v = SrcBdaF32(p.src_bda_addr).src_data[idx];
+    DstBdaF16(p.dst_bda_addr).dst_data[idx] = f16vec4(v);
 }

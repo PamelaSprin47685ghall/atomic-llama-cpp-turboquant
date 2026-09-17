@@ -66,6 +66,7 @@ void ggml_vk_tp5_get_queue(vk_device device, struct VkQueue_T ** q, uint32_t * f
 void ggml_vk_tp5_mem_props(vk_device device, void * out); // VkPhysicalDeviceMemoryProperties*
 bool ggml_vk_tp5_tensor_dev_ref(struct ggml_tensor * t, struct VkBuffer_T ** buf,
                                 uint64_t * off, uint64_t * size, vk_buffer * owner = nullptr);
+uint64_t ggml_vk_tp5_get_tensor_bda(struct ggml_tensor * t);
 
 // Configure the next graph's terminal producer, without recording or waiting.
 // A packed companion is available only after actual recording or validated

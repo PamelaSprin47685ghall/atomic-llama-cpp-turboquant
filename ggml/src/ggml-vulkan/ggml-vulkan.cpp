@@ -25499,8 +25499,33 @@ bool ggml_vk_tp5_tensor_dev_ref(ggml_tensor * t, VkBuffer * buf, VkDeviceSize * 
     // Standard Vulkan backend offset calculation:
     *off = (VkDeviceSize)(vk_tensor_offset(t) + t->view_offs);
     *size = (VkDeviceSize) ggml_nbytes(t);
+    if (buf_ctx->dev_buffer->bda_addr == 0) {
+        auto pfn_bda = (PFN_vkGetBufferDeviceAddressKHR)
+            vkGetDeviceProcAddr(buf_ctx->dev_buffer->device->device, "vkGetBufferDeviceAddressKHR");
+        if (pfn_bda) {
+            VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            dai.buffer = (VkBuffer)vb;
+            buf_ctx->dev_buffer->bda_addr = pfn_bda(buf_ctx->dev_buffer->device->device, &dai);
+        }
+    }
     if (owner) *owner = buf_ctx->dev_buffer;
     return true;
+}
+
+uint64_t ggml_vk_tp5_get_tensor_bda(ggml_tensor * t) {
+    if (!t || !t->buffer || !ggml_backend_buffer_is_vk(t->buffer)) return 0;
+    auto * buf_ctx = (ggml_backend_vk_buffer_context *) t->buffer->context;
+    if (!buf_ctx || !buf_ctx->dev_buffer) return 0;
+    if (buf_ctx->dev_buffer->bda_addr == 0) {
+        auto pfn_bda = (PFN_vkGetBufferDeviceAddressKHR)
+            vkGetDeviceProcAddr(buf_ctx->dev_buffer->device->device, "vkGetBufferDeviceAddressKHR");
+        if (pfn_bda) {
+            VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            dai.buffer = (VkBuffer)buf_ctx->dev_buffer->buffer;
+            buf_ctx->dev_buffer->bda_addr = pfn_bda(buf_ctx->dev_buffer->device->device, &dai);
+        }
+    }
+    return (uint64_t)buf_ctx->dev_buffer->bda_addr + (uint64_t)(vk_tensor_offset(t) + t->view_offs);
 }
 
 bool ggml_vk_tp5_hc_consumer(ggml_backend_t backend, void * first_cb, vk_tp5_hc_sum * recipe) {

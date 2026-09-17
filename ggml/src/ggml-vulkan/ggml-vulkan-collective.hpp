@@ -228,6 +228,89 @@ private:
 };
 
 // 5-Worker Parallel DRM Signaler for non-blocking atomic signaling handoff
+// Dedicated 5-Worker Parallel DRM Waiter for concurrent 5-GPU timeline waiting
+class tp5_drm_waiter {
+public:
+    static constexpr size_t NUM_WAITERS = 5;
+
+    tp5_drm_waiter() {
+        for (size_t i = 0; i < NUM_WAITERS; ++i) {
+            m_dri_fd[i] = -1;
+            m_syncobj[i] = 0;
+            m_target_point[i].store(0, std::memory_order_relaxed);
+            m_done[i].store(true, std::memory_order_relaxed);
+            m_running[i].store(true, std::memory_order_relaxed);
+            m_threads[i] = std::thread([this, i]() {
+                waiter_loop(i);
+            });
+        }
+    }
+
+    ~tp5_drm_waiter() {
+        for (size_t i = 0; i < NUM_WAITERS; ++i) {
+            m_running[i].store(false, std::memory_order_relaxed);
+            if (m_threads[i].joinable()) m_threads[i].join();
+        }
+    }
+
+    inline void set_node(size_t idx, int fd, uint32_t syncobj) {
+        if (idx < NUM_WAITERS) {
+            m_dri_fd[idx] = fd;
+            m_syncobj[idx] = syncobj;
+        }
+    }
+
+    inline void wait_all(uint64_t point) {
+        for (size_t i = 0; i < NUM_WAITERS; ++i) {
+            m_done[i].store(false, std::memory_order_relaxed);
+            m_target_point[i].store(point, std::memory_order_release);
+        }
+        for (size_t i = 0; i < NUM_WAITERS; ++i) {
+            while (!m_done[i].load(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
+                _mm_pause();
+#endif
+            }
+        }
+    }
+
+private:
+    void waiter_loop(size_t idx) {
+        uint64_t last = 0;
+        while (m_running[idx].load(std::memory_order_relaxed)) {
+            uint64_t cur = m_target_point[idx].load(std::memory_order_acquire);
+            if (cur > last) {
+                last = cur;
+                int fd = m_dri_fd[idx];
+                uint32_t h = m_syncobj[idx];
+                if (fd >= 0 && h > 0) {
+                    uint64_t p = cur;
+                    struct drm_syncobj_timeline_wait args{};
+                    args.handles = (uint64_t)&h;
+                    args.points = (uint64_t)&p;
+                    args.count_handles = 1;
+                    args.timeout_nsec = 5000000000ULL;
+                    args.flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT;
+                    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                    args.timeout_nsec += (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+                    ioctl(fd, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &args);
+                }
+                m_done[idx].store(true, std::memory_order_release);
+            } else {
+#if defined(__x86_64__) || defined(__i386__)
+                _mm_pause();
+#endif
+            }
+        }
+    }
+
+    int m_dri_fd[NUM_WAITERS];
+    uint32_t m_syncobj[NUM_WAITERS];
+    alignas(64) std::atomic<uint64_t> m_target_point[NUM_WAITERS];
+    alignas(64) std::atomic<bool> m_done[NUM_WAITERS];
+    alignas(64) std::atomic<bool> m_running[NUM_WAITERS];
+    std::thread m_threads[NUM_WAITERS];
+};
 class tp5_drm_signaler {
 public:
     static constexpr size_t NUM_SIGNALERS = 5;
@@ -266,6 +349,18 @@ public:
         m_syncobj_handle[worker_idx] = syncobj_handle;
         m_done_flag[worker_idx] = done_flag;
         m_target_point[worker_idx].store(point, std::memory_order_release);
+    }
+
+    // Lockless spin-wait ensuring all pending async signals are delivered to kernel
+    inline void wait_all_flushed() {
+        for (size_t i = 0; i < NUM_SIGNALERS; ++i) {
+            uint64_t tgt = m_target_point[i].load(std::memory_order_acquire);
+            while (m_signaled_point[i].load(std::memory_order_acquire) < tgt) {
+#if defined(__x86_64__) || defined(__i386__)
+                _mm_pause();
+#endif
+            }
+        }
     }
 
 private:
