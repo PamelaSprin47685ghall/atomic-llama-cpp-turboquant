@@ -57,6 +57,7 @@ vk_tp5_device_caps ggml_vk_tp5_device_caps(vk_device device);
 // Raw device access for the transport's Vulkan calls (allocation, import,
 // barriers, command buffers). The transport serializes against the queue
 // handle above; it never touches the device's own mutex-protected state.
+struct VkPhysicalDevice_T * ggml_vk_tp5_vk_physical_device(vk_device device);
 struct VkDevice_T * ggml_vk_tp5_vk_device(vk_device device);
 
 // Additional bridge points consumed by ggml-vulkan-collective.cpp.

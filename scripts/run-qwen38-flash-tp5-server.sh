@@ -170,6 +170,8 @@ trap cleanup EXIT INT TERM
 # --- Launch TP5 Server --------------------------------------------------------------------
 say "Launching TP5 server on $HOST:$PORT (model: $(basename "$MODEL"))..."
 stdbuf -oL -eL "$BIN" -m "$MODEL" \
+    -dev Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4 \
+    --fit off \
     $TP5_ARGS \
     -sm tensor \
     -ngl 999 \

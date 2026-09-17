@@ -3716,8 +3716,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             // One queue call per rank; owner retirement may wait once per chain,
             // never between individual compute/reduction stages.
+            static int chain_hit_log = 0;
             if (pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors)) {
+                if (++chain_hit_log <= 5 || chain_hit_log % 100 == 0) {
+                    fprintf(stderr, "[tp5-meta] SUBMIT_EPOCH_CHAIN SUCCESS: persistent signaling active! (hits=%d)\n", chain_hit_log);
+                }
                 return GGML_STATUS_SUCCESS;
+            } else {
+                static int chain_fail_log = 0;
+                if (++chain_fail_log <= 5) {
+                    fprintf(stderr, "[tp5-meta] SUBMIT_EPOCH_CHAIN FAILED, falling back to slow loop\n");
+                }
             }
         }
     }

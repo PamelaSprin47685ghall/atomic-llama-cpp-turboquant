@@ -2854,6 +2854,7 @@ struct ggml_backend_vk_context {
     };
     vk::CommandBuffer last_submitted_cmd_buf = VK_NULL_HANDLE;
     uint64_t scratch_generation = 0;
+    const char * invalidate_reason = nullptr;
     std::unordered_map<const ggml_cgraph *, vk_cached_subgraph> cgraph_cmd_cache;
 
     // A companion is published only by an actual dual-output producer, or a
@@ -2934,9 +2935,11 @@ static bool ggml_vk_cgraph_decode_replay_eligible(const ggml_backend_vk_context 
     static int            inelig_log_count      = 0;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * t = cgraph->nodes[i];
-        ggml_backend_buffer_t buf = t->buffer;
-        if (!buf && t->view_src) {
-            buf = t->view_src->buffer;
+        const ggml_tensor * root = t;
+        ggml_backend_buffer_t buf = root->buffer;
+        while (!buf && root->view_src) {
+            root = root->view_src;
+            buf  = root->buffer;
         }
         // View/Reshape operations do not allocate distinct storage and can inherit source buffer
         if (t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_TRANSPOSE &&
@@ -3246,9 +3249,10 @@ static void ggml_vk_cache_entry_free_resources(ggml_backend_vk_context * ctx, gg
 static void ggml_vk_cache_invalidate_all(ggml_backend_vk_context * ctx) {
     if (!ctx->cgraph_cmd_cache.empty()) {
         static int inv_log = 0;
-        if (++inv_log <= 5) {
-            fprintf(stderr, "[cache-invalidate-all] sz=%zu scratch_gen=%llu\n",
-                    ctx->cgraph_cmd_cache.size(), (unsigned long long) ctx->scratch_generation);
+        if (++inv_log <= 40) {
+            fprintf(stderr, "[cache-invalidate-all] sz=%zu scratch_gen=%llu reason=%s\n",
+                    ctx->cgraph_cmd_cache.size(), (unsigned long long) ctx->scratch_generation, ctx->invalidate_reason ? ctx->invalidate_reason : "?");
+            ctx->invalidate_reason = nullptr;
         }
     }
     // Drain GPU completion FIRST before freeing descriptor pools and resetting command buffers
@@ -8359,7 +8363,9 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->name = GGML_VK_NAME + std::to_string(idx);
 
         const char * isolate_bo_env = getenv("GGML_TP5_ISOLATE_BO");
-        if (isolate_bo_env && atoi(isolate_bo_env) != 0) {
+        const char * tp5_sync_env = getenv("GGML_TP5_SYNC");
+        const bool is_star_mode = tp5_sync_env && (strcmp(tp5_sync_env, "star") == 0 || strcmp(tp5_sync_env, "l3_star") == 0);
+        if (!is_star_mode && isolate_bo_env && atoi(isolate_bo_env) != 0) {
             if (device->architecture != AMD_RDNA2 || device->driver_id != vk::DriverId::eMesaRadv) {
                 GGML_ABORT("GGML_TP5_ISOLATE_BO requires RADV on RDNA2\n");
             }
@@ -13082,7 +13088,14 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context *       ctx,
     // and the per-row m and L values (ne1 rows). We store all the matrices first, followed by the rows.
     // For matrices, the order is (inner to outer) [HSV, ne1, k, ne2, ne3].
     // For L/M, the order is (inner to outer) [ne1, k, ne2, ne3].
-    const uint64_t split_k_size = split_k > 1 ? (HSV * ne1 * sizeof(float) + ne1 * sizeof(float) * 2) * split_k * ne2 * ne3 : 0;
+    // Bucket KV by 512 tokens so the split-k scratch size stays constant across the
+    // autoregressive decode window. Without this, KV grows by 1 per token, split_k
+    // recomputes to a new size, and ggml_vk_preallocate_buffers invalidates the entire
+    // replay cache every single token, defeating persistent command-chain reuse.
+    const uint32_t kv_bucketed = ((KV + 511u) / 512u) * 512u;
+    uint32_t       split_kv_b = ROUNDUP_POW2(std::max(1u, kv_bucketed / std::max(1u, split_k)), alignment);
+    uint32_t       split_k_b  = CEIL_DIV(kv_bucketed, split_kv_b);
+    const uint64_t split_k_size = split_k > 1 ? (HSV * ne1 * sizeof(float) + ne1 * sizeof(float) * 2) * split_k_b * ne2 * ne3 : 0;
     if (split_k_size > ctx->device->properties.limits.maxStorageBufferRange) {
         GGML_ABORT("Requested preallocation size is too large");
     }
@@ -15190,6 +15203,7 @@ static void ggml_vk_hc_segment(ggml_backend_vk_context * ctx, vk_context & subct
             ctx->recording_quant_owners.push_back(ctx->hc_quant_scratch);
         }
         if (ctx->hc_quant_scratch) {
+            ctx->invalidate_reason = "hc_quant_scratch";
             ggml_vk_cache_invalidate_all(ctx);
         }
         ctx->hc_quant_scratch = ggml_vk_create_buffer_device(ctx->device, hc_quant_bytes);
@@ -17177,6 +17191,7 @@ static vk_subbuffer ggml_vk_router_converted_weight(ggml_backend_vk_context * ct
                 lru = i;
             }
         }
+        ctx->invalidate_reason = "router_lru";
         ggml_vk_cache_invalidate_all(ctx);
         ggml_vk_destroy_buffer(ctx->router_converted[lru].buffer);
         ctx->router_converted.erase(ctx->router_converted.begin() + lru);
@@ -19049,8 +19064,10 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
     }
 
     bool any_reallocated = false;
+    const char * realloc_trigger = "none";
     if (ctx->prealloc_x == nullptr || (ctx->prealloc_size_x > 0 && ctx->prealloc_x->size < ctx->prealloc_size_x)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(x_size: " << ctx->prealloc_size_x << ")");
+        realloc_trigger = "x";
         // Resize buffer
         if (ctx->prealloc_x != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_x);
@@ -19060,6 +19077,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
     }
     if (ctx->prealloc_y == nullptr || (ctx->prealloc_size_y > 0 && ctx->prealloc_y->size < ctx->prealloc_size_y)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(y_size: " << ctx->prealloc_size_y << ")");
+        realloc_trigger = "y";
         // Resize buffer
         if (ctx->prealloc_y != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_y);
@@ -19072,6 +19090,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
     }
     if (ctx->prealloc_split_k == nullptr || (ctx->prealloc_size_split_k > 0 && ctx->prealloc_split_k->size < ctx->prealloc_size_split_k)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(split_k_size: " << ctx->prealloc_size_split_k << ")");
+        realloc_trigger = "split_k";
         // Resize buffer
         if (ctx->prealloc_split_k != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_split_k);
@@ -19081,6 +19100,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
     }
     if (ctx->prealloc_moe_route == nullptr || (ctx->prealloc_size_moe_route > 0 && ctx->prealloc_moe_route->size < ctx->prealloc_size_moe_route)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(moe_route_size: " << ctx->prealloc_size_moe_route << ")");
+        realloc_trigger = "moe_route";
         if (ctx->prealloc_moe_route != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_moe_route);
         }
@@ -19093,6 +19113,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
     }
     if (ctx->prealloc_add_rms_partials == nullptr || (ctx->prealloc_size_add_rms_partials > 0 && ctx->prealloc_add_rms_partials->size < ctx->prealloc_size_add_rms_partials)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(add_partials_size: " << ctx->prealloc_size_add_rms_partials << ")");
+        realloc_trigger = "add_rms_partials";
         // Resize buffer
         if (ctx->prealloc_add_rms_partials != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
@@ -19102,6 +19123,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
     }
     if (ctx->prealloc_size_sparse_meta > 0 && (ctx->prealloc_sparse_meta == nullptr || ctx->prealloc_sparse_meta->size < ctx->prealloc_size_sparse_meta)) {
         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(sparse_meta_size: " << ctx->prealloc_size_sparse_meta << ")");
+        realloc_trigger = "sparse_meta";
         if (ctx->prealloc_sparse_meta != nullptr) {
             ggml_vk_destroy_buffer(ctx->prealloc_sparse_meta);
         }
@@ -19110,6 +19132,20 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
     }
     if (any_reallocated) {
         ctx->scratch_generation++;
+        ctx->invalidate_reason = "scratch_prealloc";
+        static int prealloc_log = 0;
+        if (++prealloc_log <= 12) {
+            fprintf(stderr, "[prealloc-realloc] trigger=%s x=%zu/%zu y=%zu/%zu splitk=%zu/%zu moe=%zu/%zu addrms=%zu/%zu sparse_meta=%zu/%zu\n",
+                    realloc_trigger,
+                    ctx->prealloc_size_x, ctx->prealloc_x ? ctx->prealloc_x->size : 0,
+                    ctx->prealloc_size_y, ctx->prealloc_y ? ctx->prealloc_y->size : 0,
+                    ctx->prealloc_size_split_k, ctx->prealloc_split_k ? ctx->prealloc_split_k->size : 0,
+                    ctx->prealloc_size_moe_route, ctx->prealloc_moe_route ? ctx->prealloc_moe_route->size : 0,
+                    ctx->prealloc_size_add_rms_partials,
+                    ctx->prealloc_add_rms_partials ? ctx->prealloc_add_rms_partials->size : 0,
+                    ctx->prealloc_size_sparse_meta,
+                    ctx->prealloc_sparse_meta ? ctx->prealloc_sparse_meta->size : 0);
+        }
         ggml_vk_cache_invalidate_all(ctx);
     }
 
@@ -19999,6 +20035,7 @@ static void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer) {
         // Drain before destroying: cached CBs may hold bindings.
         for (auto * bctx : affected) {
             ggml_vk_synchronize(bctx);
+            bctx->invalidate_reason = "buffer_free_router_conv";
             ggml_vk_cache_invalidate_all(bctx);
             for (size_t i = 0; i < bctx->router_converted.size(); ) {
                 if (bctx->router_converted[i].src_vk_buffer == freed_handle) {
@@ -20089,6 +20126,7 @@ static void ggml_vk_router_invalidate_weight_write(ggml_backend_vk_buffer_contex
     // reference them. Order: drain -> invalidate cache -> destroy + erase.
     for (auto * bctx : affected) {
         ggml_vk_synchronize(bctx);
+        bctx->invalidate_reason = "router_write_conv";
         ggml_vk_cache_invalidate_all(bctx);
         for (size_t i = 0; i < bctx->router_converted.size(); ) {
             auto & conv = bctx->router_converted[i];
@@ -22235,6 +22273,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // Evict if cache exceeds working set capacity (512 entries to hold trunk 97 + MTP 4 subgraphs + variations)
     // Do this BEFORE looking up or creating cache_entry to avoid invalidating a live reference!
     if (ctx->cgraph_cmd_cache.size() >= 512) {
+        ctx->invalidate_reason = "cache_capacity_512";
         ggml_vk_cache_invalidate_all(ctx);
     }
 
@@ -25202,6 +25241,10 @@ vk_device ggml_vk_tp5_backend_device(ggml_backend_t backend) {
     if (!ggml_backend_is_vk(backend)) return nullptr;
     auto * ctx = (ggml_backend_vk_context *) backend->context;
     return ctx->device;
+}
+
+VkPhysicalDevice_T * ggml_vk_tp5_vk_physical_device(vk_device device) {
+    return (VkPhysicalDevice_T *) (VkPhysicalDevice) device->physical_device;
 }
 
 VkDevice_T * ggml_vk_tp5_vk_device(vk_device device) {

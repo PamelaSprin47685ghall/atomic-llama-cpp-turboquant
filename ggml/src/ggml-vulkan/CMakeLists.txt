@@ -112,7 +112,8 @@ if (Vulkan_FOUND)
     )
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan SPIRV-Headers::SPIRV-Headers)
-    target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+    target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan SPIRV-Headers::SPIRV-Headers drm)
+    target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR} /usr/include/libdrm)
 
     # Workaround to the "can't dereference invalidated vector iterator" bug in clang-cl debug build
     # Possibly relevant: https://stackoverflow.com/questions/74748276/visual-studio-no-displays-the-correct-length-of-stdvector

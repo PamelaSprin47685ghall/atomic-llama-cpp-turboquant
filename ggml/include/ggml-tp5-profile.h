@@ -25,6 +25,7 @@ struct ggml_tp5_profile {
     std::atomic<uint64_t> compute_replay_misses{0};
     std::atomic<uint64_t> collective_plan_hits{0};
     std::atomic<uint64_t> collective_plan_misses{0};
+    std::atomic<uint64_t> drm_wait_hits{0};
 
     void reset(uint64_t new_id, bool decode);
     void print_summary() const;

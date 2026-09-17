@@ -15,16 +15,24 @@
 // Cross-device DMA cannot be synchronized by a local pipeline barrier: host fence
 // separation (or SYNC_FD timeline) across phases is mathematically required.
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-vulkan-internal.h"
 #include "ggml-vulkan-shaders.hpp"
 #include "ggml-vulkan.h"
 #include "ggml-tp5-profile.h"
+#include "ggml-vulkan-collective.hpp"
 
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <fcntl.h>
+#include <xf86drm.h>
+#include <climits>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -47,7 +55,7 @@ struct tp5_fd {
 namespace {
 
 enum class tp5_wire_type { F32, F16 };
-enum class tp5_sync_mode { HOST, SYNCFD, TIMELINE, GPUFLAG };
+enum class tp5_sync_mode { HOST, SYNCFD, TIMELINE, GPUFLAG, DRM, STAR };
 
 // Two mailbox banks so P1 of epoch N can overlap peer P2 of epoch N-1:
 // bank = (epoch-1) & 1. P2's ready waits transitively provide epoch-2 credit.
@@ -55,6 +63,81 @@ static constexpr size_t TP5_MAILBOX_BANKS = 2;
 
 static size_t tp5_mailbox_bank(uint64_t epoch) {
     return (size_t) ((epoch - 1) & 1);
+}
+
+static std::string tp5_discover_dri_render_node(ggml_backend_t backend, vk_device device) {
+    // Method 1: Query VkPhysicalDeviceDrmPropertiesEXT and PCIBusInfo directly from physical device
+    if (device) {
+        VkPhysicalDevice phys_dev = (VkPhysicalDevice) ggml_vk_tp5_vk_physical_device(device);
+        if (phys_dev != VK_NULL_HANDLE) {
+            VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+            VkPhysicalDeviceDrmPropertiesEXT drm_props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT};
+            VkPhysicalDevicePCIBusInfoPropertiesEXT pci_props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT};
+            drm_props.pNext = &pci_props;
+            props2.pNext = &drm_props;
+            vkGetPhysicalDeviceProperties2(phys_dev, &props2);
+            if (drm_props.renderMinor >= 128) {
+                char path[64];
+                snprintf(path, sizeof(path), "/dev/dri/renderD%d", (int) drm_props.renderMinor);
+                if (access(path, R_OK | W_OK) == 0) {
+                    return std::string(path);
+                }
+            }
+            char by_path[128];
+            snprintf(by_path, sizeof(by_path), "/dev/dri/by-path/pci-%04x:%02x:%02x.%x-render",
+                     pci_props.pciDomain, pci_props.pciBus, pci_props.pciDevice, pci_props.pciFunction);
+            char resolved[PATH_MAX];
+            if (realpath(by_path, resolved) && access(resolved, R_OK | W_OK) == 0) {
+                return std::string(resolved);
+            }
+        }
+    }
+
+    // Method 2: Match PCI address from ggml_backend_dev_props against libdrm drmGetDevices2
+    if (backend) {
+        ggml_backend_dev_t bdev = ggml_backend_get_device(backend);
+        if (bdev) {
+            ggml_backend_dev_props props{};
+            ggml_backend_dev_get_props(bdev, &props);
+            if (props.device_id && props.device_id[0]) {
+                drmDevicePtr devices[64];
+                int num_devs = drmGetDevices2(0, devices, 64);
+                if (num_devs > 0) {
+                    std::string matched_node;
+                    for (int d = 0; d < num_devs; ++d) {
+                        if (devices[d]->bustype == DRM_BUS_PCI && devices[d]->businfo.pci) {
+                            char pci_buf[32];
+                            snprintf(pci_buf, sizeof(pci_buf), "%04x:%02x:%02x.%x",
+                                     devices[d]->businfo.pci->domain,
+                                     devices[d]->businfo.pci->bus,
+                                     devices[d]->businfo.pci->dev,
+                                     devices[d]->businfo.pci->func);
+                            if (strcasecmp(pci_buf, props.device_id) == 0) {
+                                if (devices[d]->available_nodes & (1 << DRM_NODE_RENDER)) {
+                                    matched_node = devices[d]->nodes[DRM_NODE_RENDER];
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    drmFreeDevices(devices, num_devs);
+                    if (!matched_node.empty() && access(matched_node.c_str(), R_OK | W_OK) == 0) {
+                        return matched_node;
+                    }
+                }
+
+                // Method 3: Check /dev/dri/by-path/pci-<PCI>-render
+                char by_path[128];
+                snprintf(by_path, sizeof(by_path), "/dev/dri/by-path/pci-%s-render", props.device_id);
+                char resolved[PATH_MAX];
+                if (realpath(by_path, resolved) && access(resolved, R_OK | W_OK) == 0) {
+                    return std::string(resolved);
+                }
+            }
+        }
+    }
+
+    return "";
 }
 
 static size_t tp5_plan_slot(size_t rank, size_t bank) {
@@ -131,9 +214,28 @@ struct tp5_rank {
     };
     std::vector<imported> imports;
 
+    // Star AllReduce BDA & Broadcast Resources (imported via VK_EXT_external_memory_host)
+    uint64_t bda_addr[TP5_MAILBOX_BANKS] = {0, 0};
+    VkBuffer host_import_buf[TP5_MAILBOX_BANKS] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDeviceMemory host_import_mem[TP5_MAILBOX_BANKS] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkBuffer bcast_buf[TP5_MAILBOX_BANKS] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDeviceMemory bcast_mem[TP5_MAILBOX_BANKS] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    void * bcast_host[TP5_MAILBOX_BANKS] = {nullptr, nullptr};
+    VkPipeline bda_push_pipe = VK_NULL_HANDLE;
+    VkPipelineLayout bda_push_layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout bda_push_dsl = VK_NULL_HANDLE;
+
+    // Pre-allocated static descriptor sets and command buffers for Star AllReduce
+    VkDescriptorSet star_ds_pack[TP5_MAILBOX_BANKS] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDescriptorSet star_ds_bda[TP5_MAILBOX_BANKS] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDescriptorSet star_ds_sum[TP5_MAILBOX_BANKS] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkCommandBuffer star_cmd_p1[TP5_MAILBOX_BANKS] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkCommandBuffer star_cmd_p2[TP5_MAILBOX_BANKS] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+
     // Wire staging buffer (canonical wire dtype)
     VkBuffer wire_buf = VK_NULL_HANDLE;
     VkDeviceMemory wire_mem = VK_NULL_HANDLE;
+    uint64_t wire_bda = 0;
 
     // Semaphores (for syncfd mode)
     VkSemaphore sem_p1_done = VK_NULL_HANDLE;
@@ -145,7 +247,12 @@ struct tp5_rank {
     VkSemaphore timeline_sem = VK_NULL_HANDLE; // own timeline semaphore (rank signals this)
     int timeline_export_fd = -1;
     std::vector<VkSemaphore> peer_timeline_sems; // imported peer timeline semaphores (size n_ranks)
+    // Linux Native DRM Syncobj Timeline (Mode 3: bypasses Vulkan timeline wrapper overhead)
+    int dri_fd = -1;
+    uint32_t own_syncobj = 0;
+    std::vector<uint32_t> peer_syncobjs;
 
+    PFN_vkSignalSemaphore pfn_signal_semaphore = nullptr;
     PFN_vkWaitSemaphores pfn_wait_semaphores = nullptr;
     PFN_vkGetSemaphoreCounterValue pfn_get_sem_counter = nullptr;
 
@@ -436,6 +543,14 @@ struct tp5_comm {
     size_t max_elems = 0;
     uint64_t workspace_gen = 1;
 
+    // Star AllReduce Host RAM & Infrastructure
+    void * star_host_raw[TP5_MAILBOX_BANKS] = {nullptr, nullptr};
+    void * star_host_aligned[TP5_MAILBOX_BANKS] = {nullptr, nullptr};
+    size_t star_host_alloc_size = 0;
+    size_t star_rank_stride = 0;
+    std::unique_ptr<tp5_avx2_pool> avx2_pool;
+    std::unique_ptr<tp5_drm_signaler> drm_signaler;
+
     // Bounded immutable per-binding plan cache
     // For 96 distinct subgraphs in Qwen4EXP TP5, keep 256 entries to eliminate LRU thrashing.
     static constexpr size_t MAX_CACHED_PLANS = 256;
@@ -577,7 +692,7 @@ static bool tp5_create_shader_module(VkDevice dev,
 bool tp5_alloc_host_visible_buffer(tp5_rank & r, VkDeviceSize size, VkBuffer & buf, VkDeviceMemory & mem, void ** mapped) {
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = size;
-    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (vkCreateBuffer(r.vkdev, &bci, nullptr, &buf) != VK_SUCCESS) return false;
 
@@ -746,6 +861,33 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
         if (!ok) return false;
     }
 
+    if (c.sync_mode == tp5_sync_mode::STAR) {
+        struct {
+            uint64_t src_bda_addr;
+            uint64_t dst_bda_addr;
+            uint32_t n_uvec4;
+        } bda_pc_dummy;
+        VkPushConstantRange bda_pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc_dummy)};
+        VkPipelineLayoutCreateInfo bda_pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        bda_pli.setLayoutCount = 0;
+        bda_pli.pSetLayouts = nullptr;
+        bda_pli.pushConstantRangeCount = 1;
+        bda_pli.pPushConstantRanges = &bda_pcr;
+        if (vkCreatePipelineLayout(r.vkdev, &bda_pli, nullptr, &r.bda_push_layout) != VK_SUCCESS) return false;
+
+        VkShaderModule mod_bda = VK_NULL_HANDLE;
+        if (!tp5_create_shader_module(r.vkdev, tp5_bda_push_f16_data, tp5_bda_push_f16_len, &mod_bda)) return false;
+        VkComputePipelineCreateInfo bda_pipe_ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        bda_pipe_ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        bda_pipe_ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        bda_pipe_ci.stage.module = mod_bda;
+        bda_pipe_ci.stage.pName = "main";
+        bda_pipe_ci.layout = r.bda_push_layout;
+        ok = vkCreateComputePipelines(r.vkdev, VK_NULL_HANDLE, 1, &bda_pipe_ci, nullptr, &r.bda_push_pipe) == VK_SUCCESS;
+        vkDestroyShaderModule(r.vkdev, mod_bda, nullptr);
+        if (!ok) return false;
+    }
+
     // Two sum sets plus one pack set per cached binding; reserve one temporary
     // plan as well. The SUM/pack layout contains one input descriptor per rank.
     const uint32_t             plan_capacity = tp5_comm::MAX_CACHED_PLANS + 1;
@@ -760,7 +902,43 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
     ci.pPoolSizes = &ps;
     if (vkCreateDescriptorPool(r.vkdev, &ci, nullptr, &r.desc_pool) != VK_SUCCESS) return false;
 
+    if (c.sync_mode == tp5_sync_mode::STAR) {
+        for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
+            VkDescriptorSetAllocateInfo ds_ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            ds_ai.descriptorPool = r.desc_pool;
+            ds_ai.descriptorSetCount = 1;
+
+            ds_ai.pSetLayouts = &r.dsl;
+            vkAllocateDescriptorSets(r.vkdev, &ds_ai, &r.star_ds_pack[b]);
+            vkAllocateDescriptorSets(r.vkdev, &ds_ai, &r.star_ds_sum[b]);
+
+            VkCommandBufferAllocateInfo cb_ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            cb_ai.commandPool = r.cmd_pool;
+            cb_ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cb_ai.commandBufferCount = 1;
+            vkAllocateCommandBuffers(r.vkdev, &cb_ai, &r.star_cmd_p1[b]);
+            vkAllocateCommandBuffers(r.vkdev, &cb_ai, &r.star_cmd_p2[b]);
+        }
+    }
+
     return true;
+}
+
+static void tp5_update_star_sum_descriptor(tp5_rank & r, VkDescriptorSet ds, VkBuffer bcast_buf,
+                                           VkBuffer out_tensor_buf, VkDeviceSize out_offset, VkDeviceSize out_size,
+                                           VkDeviceSize payload_bytes, uint32_t n_slots) {
+    VkDescriptorBufferInfo in_infos[8];
+    for (uint32_t s = 0; s < n_slots; ++s) {
+        in_infos[s] = VkDescriptorBufferInfo{bcast_buf, 0, payload_bytes};
+    }
+    VkDescriptorBufferInfo out_info{out_tensor_buf, out_offset, out_size};
+    VkWriteDescriptorSet w[2] = {
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 0, 0, n_slots, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          nullptr, in_infos, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+          nullptr, &out_info, nullptr },
+    };
+    vkUpdateDescriptorSets(r.vkdev, 2, w, 0, nullptr);
 }
 
 // Bind sender payloads directly, as slices of a contiguous mailbox or as
@@ -855,6 +1033,7 @@ void tp5_update_pack_descriptor(tp5_rank &      r,
                                 VkDeviceSize    in_offset,
                                 VkDeviceSize    in_size,
                                 uint32_t        n_slots) {
+    if (ds == VK_NULL_HANDLE) return;
     VkDescriptorBufferInfo in_infos[8];
     std::fill_n(in_infos, n_slots, VkDescriptorBufferInfo{ in_tensor_buf, in_offset, in_size });
     VkDescriptorBufferInfo out_info{r.wire_buf, 0, VK_WHOLE_SIZE};
@@ -865,6 +1044,96 @@ void tp5_update_pack_descriptor(tp5_rank &      r,
          &out_info,                                                                                                                 nullptr },
     };
     vkUpdateDescriptorSets(r.vkdev, 2, w, 0, nullptr);
+}
+
+static bool tp5_alloc_host_import_buffer(tp5_rank & r, void * host_ptr, VkDeviceSize size,
+                                         VkBuffer & buf, VkDeviceMemory & mem, uint64_t & bda_addr) {
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = size;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VkExternalMemoryBufferCreateInfo ext{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    bci.pNext = &ext;
+
+    if (vkCreateBuffer(r.vkdev, &bci, nullptr, &buf) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(r.vkdev, buf, &req);
+
+    auto vkGetMemoryHostPointerPropertiesEXT = (PFN_vkGetMemoryHostPointerPropertiesEXT)
+        vkGetDeviceProcAddr(r.vkdev, "vkGetMemoryHostPointerPropertiesEXT");
+    if (!vkGetMemoryHostPointerPropertiesEXT) {
+        vkDestroyBuffer(r.vkdev, buf, nullptr);
+        buf = VK_NULL_HANDLE;
+        return false;
+    }
+
+    VkMemoryHostPointerPropertiesEXT host_props{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (vkGetMemoryHostPointerPropertiesEXT(r.vkdev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                            host_ptr, &host_props) != VK_SUCCESS) {
+        vkDestroyBuffer(r.vkdev, buf, nullptr);
+        buf = VK_NULL_HANDLE;
+        return false;
+    }
+
+    VkPhysicalDeviceMemoryProperties props{};
+    ggml_vk_tp5_mem_props(r.device, &props);
+
+    uint32_t comp_bits = req.memoryTypeBits & host_props.memoryTypeBits;
+    uint32_t mt = find_memory_type(props, comp_bits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mt == UINT32_MAX) mt = find_memory_type(props, comp_bits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    if (mt == UINT32_MAX) mt = find_memory_type(props, comp_bits, 0);
+    if (mt == UINT32_MAX) {
+        vkDestroyBuffer(r.vkdev, buf, nullptr);
+        buf = VK_NULL_HANDLE;
+        return false;
+    }
+
+    VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+
+    VkImportMemoryHostPointerInfoEXT imp{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+    imp.pNext = &flags_info;
+    imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    imp.pHostPointer = host_ptr;
+
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.pNext = &imp;
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = mt;
+
+    if (vkAllocateMemory(r.vkdev, &ai, nullptr, &mem) != VK_SUCCESS) {
+        vkDestroyBuffer(r.vkdev, buf, nullptr);
+        buf = VK_NULL_HANDLE;
+        return false;
+    }
+
+    if (vkBindBufferMemory(r.vkdev, buf, mem, 0) != VK_SUCCESS) {
+        vkDestroyBuffer(r.vkdev, buf, nullptr);
+        buf = VK_NULL_HANDLE;
+        vkFreeMemory(r.vkdev, mem, nullptr);
+        mem = VK_NULL_HANDLE;
+        return false;
+    }
+
+    auto vkGetBufferDeviceAddressKHR = (PFN_vkGetBufferDeviceAddressKHR)
+        vkGetDeviceProcAddr(r.vkdev, "vkGetBufferDeviceAddressKHR");
+    if (!vkGetBufferDeviceAddressKHR) {
+        vkGetBufferDeviceAddressKHR = (PFN_vkGetBufferDeviceAddressKHR)
+            vkGetDeviceProcAddr(r.vkdev, "vkGetBufferDeviceAddress");
+    }
+    if (vkGetBufferDeviceAddressKHR) {
+        VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+        dai.buffer = buf;
+        bda_addr = vkGetBufferDeviceAddressKHR(r.vkdev, &dai);
+    }
+    if (bda_addr == 0) {
+        fprintf(stderr, "tp5_alloc_host_import_buffer: WARN bda_addr is 0 for buf=%p\n", (void*)buf);
+    }
+    return true;
 }
 
 bool tp5_alloc_device_buffer(tp5_rank & r, VkDeviceSize size,
@@ -894,6 +1163,13 @@ bool tp5_alloc_device_buffer(tp5_rank & r, VkDeviceSize size,
     VkExportMemoryAllocateInfo exp_ai{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
     exp_ai.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
     if (exportable) ai.pNext = &exp_ai;
+
+    VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    if (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) {
+        flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        flags_info.pNext = ai.pNext;
+        ai.pNext = &flags_info;
+    }
 
     uint32_t mt = find_memory_type(props, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (mt == UINT32_MAX) {
@@ -1048,6 +1324,18 @@ void tp5_destroy_rank(tp5_rank & r) {
         vkDestroySemaphore(r.vkdev, r.timeline_sem, nullptr);
         r.timeline_sem = VK_NULL_HANDLE;
     }
+    if (r.dri_fd >= 0) {
+        if (r.own_syncobj) {
+            drmSyncobjDestroy(r.dri_fd, r.own_syncobj);
+            r.own_syncobj = 0;
+        }
+        for (uint32_t handle : r.peer_syncobjs) {
+            if (handle) drmSyncobjDestroy(r.dri_fd, handle);
+        }
+        r.peer_syncobjs.clear();
+        ::close(r.dri_fd);
+        r.dri_fd = -1;
+    }
     for (auto & im : r.imports) {
         if (im.buf) { vkDestroyBuffer(r.vkdev, im.buf, nullptr); im.buf = VK_NULL_HANDLE; }
         if (im.mem) { vkFreeMemory(r.vkdev, im.mem, nullptr); im.mem = VK_NULL_HANDLE; }
@@ -1078,6 +1366,34 @@ void tp5_destroy_rank(tp5_rank & r) {
     if (r.push_dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.push_dsl, nullptr); r.push_dsl = VK_NULL_HANDLE; }
     if (r.desc_pool) { vkDestroyDescriptorPool(r.vkdev, r.desc_pool, nullptr); r.desc_pool = VK_NULL_HANDLE; }
     if (r.cmd_pool) { vkDestroyCommandPool(r.vkdev, r.cmd_pool, nullptr); r.cmd_pool = VK_NULL_HANDLE; }
+
+    // Clean up Star AllReduce BDA & Broadcast resources
+    for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
+        if (r.bcast_host[b]) {
+            vkUnmapMemory(r.vkdev, r.bcast_mem[b]);
+            r.bcast_host[b] = nullptr;
+        }
+        if (r.bcast_buf[b]) {
+            vkDestroyBuffer(r.vkdev, r.bcast_buf[b], nullptr);
+            r.bcast_buf[b] = VK_NULL_HANDLE;
+        }
+        if (r.bcast_mem[b]) {
+            vkFreeMemory(r.vkdev, r.bcast_mem[b], nullptr);
+            r.bcast_mem[b] = VK_NULL_HANDLE;
+        }
+        if (r.host_import_buf[b]) {
+            vkDestroyBuffer(r.vkdev, r.host_import_buf[b], nullptr);
+            r.host_import_buf[b] = VK_NULL_HANDLE;
+        }
+        if (r.host_import_mem[b]) {
+            vkFreeMemory(r.vkdev, r.host_import_mem[b], nullptr);
+            r.host_import_mem[b] = VK_NULL_HANDLE;
+        }
+        r.bda_addr[b] = 0;
+    }
+    if (r.bda_push_pipe) { vkDestroyPipeline(r.vkdev, r.bda_push_pipe, nullptr); r.bda_push_pipe = VK_NULL_HANDLE; }
+    if (r.bda_push_layout) { vkDestroyPipelineLayout(r.vkdev, r.bda_push_layout, nullptr); r.bda_push_layout = VK_NULL_HANDLE; }
+    if (r.bda_push_dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.bda_push_dsl, nullptr); r.bda_push_dsl = VK_NULL_HANDLE; }
 }
 
 bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
@@ -1107,10 +1423,98 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
         }
     } else if (c.sync_mode == tp5_sync_mode::GPUFLAG) {
         tp5_gpuflag_drain_all(c);
+    } else if (c.sync_mode == tp5_sync_mode::STAR) {
+        for (auto & r : c.ranks) {
+            if (r.vkdev) vkDeviceWaitIdle(r.vkdev);
+        }
     }
     c.clear_cached_plans();
     if (c.failed) return false;
     c.workspace_gen++;
+
+    if (c.sync_mode == tp5_sync_mode::STAR) {
+        const size_t page_size = 4096;
+        const size_t rank_stride = ((max_elems * sizeof(float) + page_size - 1) / page_size) * page_size;
+        const size_t total_host_size = (c.n_ranks + 1) * rank_stride;
+        c.star_rank_stride = rank_stride;
+        c.star_host_alloc_size = total_host_size;
+
+        for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
+            if (c.star_host_raw[b]) {
+                free(c.star_host_raw[b]);
+                c.star_host_raw[b] = nullptr;
+                c.star_host_aligned[b] = nullptr;
+            }
+            void * ptr = nullptr;
+            if (posix_memalign(&ptr, page_size, total_host_size) != 0 || !ptr) {
+                c.fail("posix_memalign failed for Star Host RAM");
+                return false;
+            }
+            memset(ptr, 0, total_host_size);
+            c.star_host_raw[b] = ptr;
+            c.star_host_aligned[b] = ptr;
+
+            for (size_t i = 0; i < c.n_ranks; ++i) {
+                tp5_rank & r = c.ranks[i];
+                if (r.host_import_buf[b]) {
+                    vkDestroyBuffer(r.vkdev, r.host_import_buf[b], nullptr);
+                    r.host_import_buf[b] = VK_NULL_HANDLE;
+                }
+                if (r.host_import_mem[b]) {
+                    vkFreeMemory(r.vkdev, r.host_import_mem[b], nullptr);
+                    r.host_import_mem[b] = VK_NULL_HANDLE;
+                }
+                void * rank_host_ptr = (char *) ptr + i * rank_stride;
+                if (!tp5_alloc_host_import_buffer(r, rank_host_ptr, rank_stride,
+                                                  r.host_import_buf[b], r.host_import_mem[b], r.bda_addr[b])) {
+                    c.fail("alloc_host_import_buffer failed on rank " + std::to_string(i));
+                    return false;
+                }
+
+                if (r.bcast_host[b]) {
+                    vkUnmapMemory(r.vkdev, r.bcast_mem[b]);
+                    r.bcast_host[b] = nullptr;
+                }
+                if (r.bcast_buf[b]) {
+                    vkDestroyBuffer(r.vkdev, r.bcast_buf[b], nullptr);
+                    r.bcast_buf[b] = VK_NULL_HANDLE;
+                }
+                if (r.bcast_mem[b]) {
+                    vkFreeMemory(r.vkdev, r.bcast_mem[b], nullptr);
+                    r.bcast_mem[b] = VK_NULL_HANDLE;
+                }
+                if (!tp5_alloc_host_visible_buffer(r, rank_stride, r.bcast_buf[b], r.bcast_mem[b], &r.bcast_host[b])) {
+                    c.fail("alloc_host_visible_buffer failed for bcast_buf on rank " + std::to_string(i));
+                    return false;
+                }
+            }
+        }
+
+        for (auto & r : c.ranks) {
+            if (r.wire_buf) { vkDestroyBuffer(r.vkdev, r.wire_buf, nullptr); r.wire_buf = VK_NULL_HANDLE; }
+            if (r.wire_mem) { vkFreeMemory(r.vkdev, r.wire_mem, nullptr); r.wire_mem = VK_NULL_HANDLE; }
+            r.wire_bda = 0;
+            if (!tp5_alloc_device_buffer(r, rank_stride,
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                    false, r.wire_buf, r.wire_mem, nullptr)) {
+                c.fail("wire buffer allocation failed");
+                return false;
+            }
+            auto vkGetBufferDeviceAddressKHR = (PFN_vkGetBufferDeviceAddressKHR)
+                vkGetDeviceProcAddr(r.vkdev, "vkGetBufferDeviceAddressKHR");
+            if (!vkGetBufferDeviceAddressKHR) {
+                vkGetBufferDeviceAddressKHR = (PFN_vkGetBufferDeviceAddressKHR)
+                    vkGetDeviceProcAddr(r.vkdev, "vkGetBufferDeviceAddress");
+            }
+            if (vkGetBufferDeviceAddressKHR) {
+                VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+                dai.buffer = r.wire_buf;
+                r.wire_bda = vkGetBufferDeviceAddressKHR(r.vkdev, &dai);
+            }
+        }
+        c.max_elems = max_elems;
+        return true;
+    }
 
     const VkDeviceSize wire_bytes = (VkDeviceSize) max_elems * wire_b;
     const VkDeviceSize stride = wire_bytes;
@@ -1795,6 +2199,20 @@ bool tp5_drain_epoch(tp5_comm & c, uint64_t epoch, uint64_t timeout_ns) {
     for (size_t i = 0; i < c.n_ranks; ++i) {
         tp5_rank & r = c.ranks[i];
         if (!r.timeline_sem || !r.pfn_wait_semaphores) continue;
+        if (c.sync_mode == tp5_sync_mode::DRM && r.own_syncobj && r.dri_fd >= 0) {
+            uint32_t first = 0;
+            auto t_wait_start = std::chrono::high_resolution_clock::now();
+            uint64_t target_val_mut = target_val;
+            if (tp5_drm_syncobj_ops::timeline_wait(r.dri_fd, &r.own_syncobj, &target_val_mut, 1, (int64_t) timeout_ns,
+                                                   DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, &first) == 0) {
+                auto t_wait_end = std::chrono::high_resolution_clock::now();
+                if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+                    prof->host_wait_count++;
+                    prof->host_wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t_wait_end - t_wait_start).count();
+                }
+                continue;
+            }
+        }
         if (r.pfn_get_sem_counter) {
             uint64_t cur = 0;
             if (r.pfn_get_sem_counter(r.vkdev, r.timeline_sem, &cur) == VK_SUCCESS && cur >= target_val) {
@@ -1866,6 +2284,284 @@ static bool tp5_gpuflag_drain_all(tp5_comm & c) {
 // ===========================================================================
 // Two-Stage Mesh AllReduce: Proven Hardware Synchronization
 // ===========================================================================
+
+static void tp5_avx2_accumulate_star(const void * const * rank_ptrs, void * dst_ptr, size_t n_elems,
+                                     size_t worker_id, size_t num_workers, bool out_f32) {
+    // 22-core AVX2 accumulation over 5 GPU rank input buffers into dst_ptr
+    // Each rank buffer has n_elems float16_t (uint16_t) elements.
+    const size_t chunk_size = (n_elems + num_workers - 1) / num_workers;
+    const size_t start = worker_id * chunk_size;
+    const size_t end = std::min(start + chunk_size, n_elems);
+    if (start >= end) return;
+
+    const uint16_t * r0 = (const uint16_t *) rank_ptrs[0];
+    const uint16_t * r1 = (const uint16_t *) rank_ptrs[1];
+    const uint16_t * r2 = (const uint16_t *) rank_ptrs[2];
+    const uint16_t * r3 = (const uint16_t *) rank_ptrs[3];
+    const uint16_t * r4 = (const uint16_t *) rank_ptrs[4];
+    uint16_t * dst16 = (uint16_t *) dst_ptr;
+    float * dst32 = (float *) dst_ptr;
+
+    size_t i = start;
+#if defined(__AVX2__) && defined(__F16C__)
+    for (; i + 8 <= end; i += 8) {
+        __m256 v0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(r0 + i)));
+        __m256 v1 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(r1 + i)));
+        __m256 v2 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(r2 + i)));
+        __m256 v3 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(r3 + i)));
+        __m256 v4 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(r4 + i)));
+
+        __m256 sum = _mm256_add_ps(_mm256_add_ps(v0, v1), _mm256_add_ps(v2, v3));
+        sum = _mm256_add_ps(sum, v4);
+
+        if (out_f32) {
+            _mm256_storeu_ps(dst32 + i, sum);
+        } else {
+            __m128i out_f16 = _mm256_cvtps_ph(sum, _MM_FROUND_TO_NEAREST_INT);
+            _mm_storeu_si128((__m128i *)(dst16 + i), out_f16);
+        }
+    }
+#endif
+    for (; i < end; ++i) {
+        float s = ggml_fp16_to_fp32(r0[i]) + ggml_fp16_to_fp32(r1[i]) +
+                  ggml_fp16_to_fp32(r2[i]) + ggml_fp16_to_fp32(r3[i]) +
+                  ggml_fp16_to_fp32(r4[i]);
+        if (out_f32) {
+            dst32[i] = s;
+        } else {
+            dst16[i] = ggml_fp32_to_fp16(s);
+        }
+    }
+}
+
+bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
+    // Executes the 6-Pillar Star AllReduce:
+    // Pillar 1: GPU BDA upstream push -> GPU writes directly to host-imported RAM
+    // Pillar 2: DRM Syncobj wait -> Host waits for all ranks' Phase 1 timeline signal
+    // Pillar 3: 22-core AVX2 vectorized accumulate directly in L3 cache
+    // Pillar 4: CPU Root Complex broadcast -> Copies accumulated sum to each GPU's host-visible broadcast buffer
+    // Pillar 5: Async DRM Syncobj signal handoff -> non-blocking background signal to unblock Phase 2 compute
+    // Pillar 6: Overlapped double-buffering -> alternating mailbox banks (epoch & 1)
+    const uint64_t epoch = ++c.allreduce_calls;
+    const size_t bank = tp5_mailbox_bank(epoch);
+
+    for (auto backend : c.backends) {
+        ggml_vk_tp5_flush_async(backend);
+    }
+
+    if (c.max_elems < n_elems) {
+        if (!tp5_setup_workspace(c, n_elems)) {
+            c.fail("tp5_allreduce_star: workspace setup failed");
+            return false;
+        }
+    }
+
+    const size_t payload = n_elems * sizeof(uint16_t);
+    const uint32_t n_uvec4 = (uint32_t) ((payload + 15) / 16);
+
+    // 1. Dispatch BDA Upstream Push on all GPUs
+    for (size_t i = 0; i < c.n_ranks; ++i) {
+        tp5_rank & r = c.ranks[i];
+        VkCommandBuffer cmd_p1 = r.star_cmd_p1[bank];
+        vkResetCommandBuffer(cmd_p1, 0);
+        VkCommandBufferBeginInfo bi_p1{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi_p1.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd_p1, &bi_p1);
+
+        VkMemoryBarrier mb_pre{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT };
+        vkCmdPipelineBarrier(cmd_p1, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &mb_pre, 0, nullptr, 0, nullptr);
+
+        // Pack local tensor to wire staging buffer if needed, or BDA push directly
+        VkBuffer src_buf = VK_NULL_HANDLE;
+        VkDeviceSize src_off = 0, src_size = 0;
+        ggml_vk_tp5_tensor_dev_ref(tensors[i], &src_buf, &src_off, &src_size);
+
+        VkDescriptorSet ds_pack = r.star_ds_pack[bank];
+
+        // Pack F32 input tensor into wire staging buffer (F16)
+        tp5_update_pack_descriptor(r, ds_pack, src_buf, src_off, src_size, (uint32_t)c.n_ranks);
+        vkCmdBindPipeline(cmd_p1, VK_PIPELINE_BIND_POINT_COMPUTE, r.pack_pipe);
+        vkCmdBindDescriptorSets(cmd_p1, VK_PIPELINE_BIND_POINT_COMPUTE, r.pipe_layout, 0, 1, &ds_pack, 0, nullptr);
+        tp5_sum_pc pc_pack{(uint32_t) n_elems, 1, 0, 0};
+        vkCmdPushConstants(cmd_p1, r.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_pack), &pc_pack);
+        vkCmdDispatch(cmd_p1, (uint32_t)(n_elems + 255) / 256, 1, 1);
+
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd_p1, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 1, &mb, 0, nullptr, 0, nullptr);
+
+        // Bind BDA push pipeline and dispatch directly to rank's BDA address in Host RAM
+        uint64_t src_wire_bda = r.wire_bda;
+        vkCmdBindPipeline(cmd_p1, VK_PIPELINE_BIND_POINT_COMPUTE, r.bda_push_pipe);
+
+        struct {
+            uint64_t src_bda;
+            uint64_t dst_bda;
+            uint32_t n_uvec4;
+        } bda_pc{src_wire_bda, r.bda_addr[bank], n_uvec4};
+        vkCmdPushConstants(cmd_p1, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc), &bda_pc);
+        vkCmdDispatch(cmd_p1, (n_uvec4 + 63) / 64, 1, 1);
+
+        // Flush GPU L2 cache to Host PCIe Bus
+        VkMemoryBarrier mb_host{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                 VK_ACCESS_SHADER_WRITE_BIT,
+                                 VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT };
+        vkCmdPipelineBarrier(cmd_p1, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                             0, 1, &mb_host, 0, nullptr, 0, nullptr);
+
+        vkEndCommandBuffer(cmd_p1);
+
+        // Submit Phase 1 with timeline semaphore signal (2 * epoch - 1)
+        uint64_t sig_p1 = 2 * epoch - 1;
+        VkTimelineSemaphoreSubmitInfo tsi_p1{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        tsi_p1.signalSemaphoreValueCount = 1;
+        tsi_p1.pSignalSemaphoreValues = &sig_p1;
+
+        VkSubmitInfo si_p1{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si_p1.pNext = &tsi_p1;
+        si_p1.commandBufferCount = 1;
+        si_p1.pCommandBuffers = &cmd_p1;
+        si_p1.signalSemaphoreCount = 1;
+        si_p1.pSignalSemaphores = &r.timeline_sem;
+
+        if (vkQueueSubmit(r.queue, 1, &si_p1, VK_NULL_HANDLE) != VK_SUCCESS) {
+            c.fail("tp5_allreduce_star: P1 submit failed on rank " + std::to_string(i));
+            return false;
+        }
+        ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
+    }
+
+    // =========================================================================
+    // PILLAR 3: NATIVE DRM SYNCOBJ TIMELINE WAIT (Bypassing Vulkan stack)
+    // =========================================================================
+    for (size_t i = 0; i < c.n_ranks; ++i) {
+        tp5_rank & r = c.ranks[i];
+        uint64_t wait_point = 2 * epoch - 1;
+        bool waited = false;
+        if (r.dri_fd >= 0 && r.own_syncobj > 0) {
+            uint32_t first = 0;
+            uint32_t wait_flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT;
+            int ret = tp5_drm_syncobj_ops::timeline_wait(r.dri_fd, &r.own_syncobj, &wait_point, 1, 5000000000LL,
+                                                         wait_flags, &first);
+            if (ret == 0) {
+                waited = true;
+                if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+                    prof->drm_wait_hits++;
+                }
+            } else {
+                uint64_t current_val = 0;
+                if (r.pfn_get_sem_counter) r.pfn_get_sem_counter(r.vkdev, r.timeline_sem, &current_val);
+                fprintf(stderr, "ggml-vulkan-collective: direct DRM timeline_wait fallback on rank %zu (dri_fd=%d own_syncobj=%u wait_point=%llu cur_val=%llu ret=%d errno=%d: %s)\n",
+                        i, r.dri_fd, r.own_syncobj, (unsigned long long) wait_point, (unsigned long long) current_val, ret, errno, strerror(errno));
+            }
+        } else if (r.pfn_wait_semaphores) {
+            VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+            wi.semaphoreCount = 1;
+            wi.pSemaphores = &r.timeline_sem;
+            wi.pValues = &wait_point;
+            r.pfn_wait_semaphores(r.vkdev, &wi, 5000000000ULL);
+            waited = true;
+        }
+        if (!waited && r.pfn_wait_semaphores) {
+            VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+            wi.semaphoreCount = 1;
+            wi.pSemaphores = &r.timeline_sem;
+            wi.pValues = &wait_point;
+            r.pfn_wait_semaphores(r.vkdev, &wi, 5000000000ULL);
+        }
+    }
+
+    // =========================================================================
+    // PILLAR 4: 22-CORE DEDICATED AVX2+F16C L3 CACHE DIRECT ACCUMULATION
+    // =========================================================================
+    const void * rank_ptrs[5];
+    for (size_t i = 0; i < c.n_ranks; ++i) {
+        rank_ptrs[i] = (const char *) c.star_host_aligned[bank] + i * c.star_rank_stride;
+    }
+    void * acc_out = (char *) c.star_host_aligned[bank] + 5 * c.star_rank_stride;
+
+    if (c.avx2_pool) {
+        c.avx2_pool->parallel_for([&](size_t worker_id, size_t num_workers) {
+            tp5_avx2_accumulate_star(rank_ptrs, acc_out, n_elems, worker_id, num_workers, tensors[0]->type == GGML_TYPE_F32);
+        });
+    } else {
+        tp5_avx2_accumulate_star(rank_ptrs, acc_out, n_elems, 0, 1, tensors[0]->type == GGML_TYPE_F32);
+    }
+
+    // =========================================================================
+    // PILLAR 2: CPU ROOT COMPLEX DOWNSTREAM BROADCAST
+    // =========================================================================
+    const size_t bcast_bytes = (tensors[0]->type == GGML_TYPE_F32) ? n_elems * sizeof(float) : payload;
+    for (size_t i = 0; i < c.n_ranks; ++i) {
+        if (c.ranks[i].bcast_host[bank]) {
+            std::memcpy(c.ranks[i].bcast_host[bank], acc_out, bcast_bytes);
+        }
+    }
+
+    // =========================================================================
+    // 5. Submit Phase 2 unpack compute on each GPU to write back into local tensor
+    // =========================================================================
+    for (size_t i = 0; i < c.n_ranks; ++i) {
+        tp5_rank & r = c.ranks[i];
+        VkCommandBuffer cmd_p2 = r.star_cmd_p2[bank];
+        vkResetCommandBuffer(cmd_p2, 0);
+        VkCommandBufferBeginInfo bi_p2{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi_p2.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd_p2, &bi_p2);
+
+        VkBuffer dst_buf = VK_NULL_HANDLE;
+        VkDeviceSize dst_off = 0, dst_size = 0;
+        ggml_vk_tp5_tensor_dev_ref(tensors[i], &dst_buf, &dst_off, &dst_size);
+
+        VkDescriptorSet ds_sum = r.star_ds_sum[bank];
+
+        // Unpack / Copy from bcast_buf into dst tensor
+        if (tensors[0]->type == GGML_TYPE_F32) {
+            VkBufferCopy cp{0, dst_off, bcast_bytes};
+            vkCmdCopyBuffer(cmd_p2, r.bcast_buf[bank], dst_buf, 1, &cp);
+        } else {
+            tp5_update_star_sum_descriptor(r, ds_sum, r.bcast_buf[bank], dst_buf, dst_off, dst_size, payload, (uint32_t)c.n_ranks);
+            vkCmdBindPipeline(cmd_p2, VK_PIPELINE_BIND_POINT_COMPUTE, r.sum_pipe);
+            vkCmdBindDescriptorSets(cmd_p2, VK_PIPELINE_BIND_POINT_COMPUTE, r.pipe_layout, 0, 1, &ds_sum, 0, nullptr);
+            tp5_sum_pc pc_sum{(uint32_t) n_elems, 1, 0, 0};
+            vkCmdPushConstants(cmd_p2, r.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_sum), &pc_sum);
+            vkCmdDispatch(cmd_p2, (uint32_t)(n_elems + 255) / 256, 1, 1);
+        }
+
+        VkMemoryBarrier mb_post{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                 VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                 VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                 VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT };
+        vkCmdPipelineBarrier(cmd_p2, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb_post, 0, nullptr, 0, nullptr);
+
+        vkEndCommandBuffer(cmd_p2);
+
+        uint64_t sig_val = 2 * epoch;
+        VkTimelineSemaphoreSubmitInfo tsi{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        tsi.signalSemaphoreValueCount = 1;
+        tsi.pSignalSemaphoreValues = &sig_val;
+
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.pNext = &tsi;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd_p2;
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &r.timeline_sem;
+
+        vkQueueSubmit(r.queue, 1, &si, VK_NULL_HANDLE);
+        ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
+    }
+
+    return true;
+}
 
 bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
     if (c.failed) return false;
@@ -2067,7 +2763,7 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
         const char * env = getenv("GGML_TP5_MERGE_SUBMIT");
         return env ? (atoi(env) != 0) : true;
     }();
-    if (c.sync_mode == tp5_sync_mode::TIMELINE) {
+    if (c.sync_mode == tp5_sync_mode::TIMELINE || c.sync_mode == tp5_sync_mode::DRM) {
         if (merge_submit && c.n_ranks <= 8) {
             // Merged 2-stage submit (AGENTS.md P2): submit Phase 1 + Phase 2 together in one
             // vkQueueSubmit per rank (2 VkSubmitInfo entries). Reduces ioctl/kernel submissions
@@ -2156,7 +2852,7 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
 
     auto t2 = std::chrono::high_resolution_clock::now();
 
-    if (c.sync_mode == tp5_sync_mode::TIMELINE) {
+    if (c.sync_mode == tp5_sync_mode::TIMELINE || c.sync_mode == tp5_sync_mode::DRM) {
         // Zero host wait, zero per-AR export/import, zero vkDeviceWaitIdle:
         // Phase 2 compute stages on each rank wait on peer timeline semaphores over PCIe.
     } else if (c.sync_mode == tp5_sync_mode::SYNCFD) {
@@ -2226,7 +2922,7 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
             GGML_ABORT("ggml-vulkan-collective: unrecoverable runtime failure: Phase 1 fence wait failed\n");
         }
     }
-    if (c.sync_mode != tp5_sync_mode::TIMELINE && c.sync_mode != tp5_sync_mode::GPUFLAG) {
+    if (c.sync_mode != tp5_sync_mode::TIMELINE && c.sync_mode != tp5_sync_mode::DRM && c.sync_mode != tp5_sync_mode::GPUFLAG) {
     tp5_p2p_visibility_barrier(c);
     }
 
@@ -2234,7 +2930,7 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
     auto t4 = std::chrono::high_resolution_clock::now();
 
     // Submit Phase 2 on all ranks
-    if (c.sync_mode == tp5_sync_mode::TIMELINE) {
+    if (c.sync_mode == tp5_sync_mode::TIMELINE || c.sync_mode == tp5_sync_mode::DRM) {
         if (!merge_submit || c.n_ranks > 8) {
             // Split submit path only: under merged submit, Phase 2 was already submitted in the merged loop.
             for (size_t i = 0; i < c.n_ranks; ++i) {
@@ -2480,7 +3176,37 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
     if (c.failed) {
         GGML_ABORT("ggml-vulkan-collective: cannot submit on failed communicator\n");
     }
-    if (c.sync_mode != tp5_sync_mode::TIMELINE || !c.cmd_replay_enabled)
+    if (c.sync_mode == tp5_sync_mode::STAR) {
+        const size_t n_stages = stage_tensors.size();
+        for (size_t s = 0; s < n_stages; ++s) {
+            for (size_t i = 0; i < c.n_ranks; ++i) {
+                if (!stage_compute_cbs[s][i].empty()) {
+                    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                    si.commandBufferCount = (uint32_t) stage_compute_cbs[s][i].size();
+                    si.pCommandBuffers = (const VkCommandBuffer *) stage_compute_cbs[s][i].data();
+                    vkQueueSubmit(c.ranks[i].queue, 1, &si, VK_NULL_HANDLE);
+                    ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
+                }
+            }
+            std::vector<ggml_tensor *> stage_ts = stage_tensors[s];
+            if (!tp5_allreduce_star(c, stage_ts.data(), ggml_nelements(stage_ts[0]))) {
+                return false;
+            }
+        }
+        if (stage_compute_cbs.size() > n_stages) {
+            for (size_t i = 0; i < c.n_ranks; ++i) {
+                if (!stage_compute_cbs[n_stages][i].empty()) {
+                    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                    si.commandBufferCount = (uint32_t) stage_compute_cbs[n_stages][i].size();
+                    si.pCommandBuffers = (const VkCommandBuffer *) stage_compute_cbs[n_stages][i].data();
+                    vkQueueSubmit(c.ranks[i].queue, 1, &si, VK_NULL_HANDLE);
+                    ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
+                }
+            }
+        }
+        return true;
+    }
+    if ((c.sync_mode != tp5_sync_mode::TIMELINE && c.sync_mode != tp5_sync_mode::DRM && c.sync_mode != tp5_sync_mode::STAR) || !c.cmd_replay_enabled)
         return false;
 
     const size_t n_stages = stage_tensors.size();
@@ -2899,17 +3625,21 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
     c->wire = (wire_env && strcmp(wire_env, "f32") == 0) ? tp5_wire_type::F32 : tp5_wire_type::F16;
 
     const char * sync_env = getenv("GGML_TP5_SYNC");
-    if (sync_env && strcmp(sync_env, "timeline") == 0) {
+    if (sync_env && (strcmp(sync_env, "star") == 0 || strcmp(sync_env, "l3_star") == 0)) {
+        c->sync_mode = tp5_sync_mode::STAR;
+    } else if (sync_env && strcmp(sync_env, "timeline") == 0) {
         c->sync_mode = tp5_sync_mode::TIMELINE;
     } else if (sync_env && strcmp(sync_env, "host") == 0) {
         c->sync_mode = tp5_sync_mode::HOST;
     } else if (sync_env && strcmp(sync_env, "syncfd") == 0) {
         c->sync_mode = tp5_sync_mode::SYNCFD;
+    } else if (sync_env && strcmp(sync_env, "drm") == 0) {
+        c->sync_mode = tp5_sync_mode::DRM;
     } else if (sync_env && (strcmp(sync_env, "gpu") == 0 || strcmp(sync_env, "gpuflag") == 0)) {
         fprintf(stderr, "ggml-vulkan-collective: sync mode 'gpuflag' is experimental and unsafe under current driver memory model; falling back to timeline\n");
         c->sync_mode = tp5_sync_mode::TIMELINE;
     } else {
-        c->sync_mode = tp5_sync_mode::TIMELINE;
+        c->sync_mode = (n == 5) ? tp5_sync_mode::STAR : tp5_sync_mode::TIMELINE;
     }
 
     const char * replay_env = getenv("GGML_TP5_CMD_REPLAY");
@@ -2958,7 +3688,7 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
             }
         }
 
-        if (c->sync_mode == tp5_sync_mode::TIMELINE) {
+        if (c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::STAR) {
             if (!r.caps.timeline_semaphore || !r.caps.timeline_semaphore_features) {
                 fprintf(stderr, "ggml-vulkan-collective: rank %zu lacks timeline semaphore support (ext=%d feat=%d)\n",
                         i, (int) r.caps.timeline_semaphore, (int) r.caps.timeline_semaphore_features);
@@ -3022,21 +3752,25 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
         if (!r.pfn_get_sem_counter) {
             r.pfn_get_sem_counter = (PFN_vkGetSemaphoreCounterValue) vkGetDeviceProcAddr(r.vkdev, "vkGetSemaphoreCounterValueKHR");
         }
+        r.pfn_signal_semaphore = (PFN_vkSignalSemaphore) vkGetDeviceProcAddr(r.vkdev, "vkSignalSemaphore");
+        if (!r.pfn_signal_semaphore) {
+            r.pfn_signal_semaphore = (PFN_vkSignalSemaphore) vkGetDeviceProcAddr(r.vkdev, "vkSignalSemaphoreKHR");
+        }
 
-        if ((c->sync_mode == tp5_sync_mode::SYNCFD || c->sync_mode == tp5_sync_mode::TIMELINE) && (!r.pfn_get_sem_fd || !r.pfn_import_sem_fd)) {
+        if ((c->sync_mode == tp5_sync_mode::SYNCFD || c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::DRM || c->sync_mode == tp5_sync_mode::STAR) && (!r.pfn_get_sem_fd || !r.pfn_import_sem_fd)) {
             fprintf(stderr, "ggml-vulkan-collective: rank %zu missing vkGetSemaphoreFdKHR or vkImportSemaphoreFdKHR proc addr\n", i);
             for (auto & rr : c->ranks) tp5_destroy_rank(rr);
             delete c;
             return nullptr;
         }
-        if (c->sync_mode == tp5_sync_mode::TIMELINE && (!r.pfn_wait_semaphores || !r.pfn_get_sem_counter)) {
+        if ((c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::DRM || c->sync_mode == tp5_sync_mode::STAR) && (!r.pfn_wait_semaphores || !r.pfn_get_sem_counter)) {
             fprintf(stderr, "ggml-vulkan-collective: rank %zu missing vkWaitSemaphores or vkGetSemaphoreCounterValue proc addr\n", i);
             for (auto & rr : c->ranks) tp5_destroy_rank(rr);
             delete c;
             return nullptr;
         }
 
-        if (c->sync_mode == tp5_sync_mode::TIMELINE) {
+        if (c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::DRM || c->sync_mode == tp5_sync_mode::STAR) {
             VkSemaphoreTypeCreateInfo tci{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
             tci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
             tci.initialValue = 0;
@@ -3084,7 +3818,7 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
     }
 
     // Permanent cross-rank timeline semaphore import (for timeline mode)
-    if (c->sync_mode == tp5_sync_mode::TIMELINE) {
+    if (c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::DRM) {
         for (size_t i = 0; i < n; ++i) {
             tp5_rank & r_dst = c->ranks[i];
             r_dst.peer_timeline_sems.assign(n, VK_NULL_HANDLE);
@@ -3129,11 +3863,88 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
                 r_dst.peer_timeline_sems[j] = peer_sem;
             }
         }
+        if (c->sync_mode == tp5_sync_mode::DRM) {
+            for (size_t i = 0; i < n; ++i) {
+                tp5_rank & r = c->ranks[i];
+                std::string dri_path = tp5_discover_dri_render_node(c->backends[i], r.device);
+                if (dri_path.empty()) {
+                    char fallback[32];
+                    snprintf(fallback, sizeof(fallback), "/dev/dri/renderD%d", 128 + (int) i);
+                    dri_path = fallback;
+                }
+                r.dri_fd = open(dri_path.c_str(), O_RDWR);
+                if (r.dri_fd < 0) {
+                    fprintf(stderr, "ggml-vulkan-collective: failed to open DRM render node '%s' for rank %zu (errno=%d: %s)\n",
+                            dri_path.c_str(), i, errno, strerror(errno));
+                    for (auto & rr : c->ranks) tp5_destroy_rank(rr);
+                    delete c;
+                    return nullptr;
+                }
+                fprintf(stderr, "ggml-vulkan-collective: rank %zu bound to DRM node '%s' (dri_fd=%d)\n",
+                        i, dri_path.c_str(), r.dri_fd);
+                int own_fd = -1;
+                VkSemaphoreGetFdInfoKHR gfi_own{VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR, nullptr, r.timeline_sem, VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT};
+                int get_res = r.pfn_get_sem_fd(r.vkdev, &gfi_own, &own_fd);
+                if (get_res != VK_SUCCESS || own_fd < 0) {
+                    fprintf(stderr, "ggml-vulkan-collective: vkGetSemaphoreFdKHR failed for rank %zu\n", i);
+                    for (auto & rr : c->ranks) tp5_destroy_rank(rr);
+                    delete c;
+                    return nullptr;
+                }
+                int ret = drmSyncobjFDToHandle(r.dri_fd, own_fd, &r.own_syncobj);
+                ::close(own_fd);
+                if (ret != 0 || r.own_syncobj == 0) {
+                    fprintf(stderr, "ggml-vulkan-collective: drmSyncobjFDToHandle failed for rank %zu (ret=%d, handle=%u, errno=%d: %s)\n",
+                            i, ret, r.own_syncobj, errno, strerror(errno));
+                    for (auto & rr : c->ranks) tp5_destroy_rank(rr);
+                    delete c;
+                    return nullptr;
+                }
+                r.peer_syncobjs.resize(n, 0);
+                r.peer_syncobjs[i] = r.own_syncobj;
+            }
+        }
         // All imports completed: close exporter FDs
         for (size_t j = 0; j < n; ++j) {
             if (c->ranks[j].timeline_export_fd >= 0) {
                 ::close(c->ranks[j].timeline_export_fd);
                 c->ranks[j].timeline_export_fd = -1;
+            }
+        }
+    }
+
+    if (c->sync_mode == tp5_sync_mode::STAR) {
+        for (size_t i = 0; i < n; ++i) {
+            tp5_rank & r = c->ranks[i];
+            std::string dri_path = tp5_discover_dri_render_node(c->backends[i], r.device);
+            if (dri_path.empty()) {
+                char fallback[32];
+                snprintf(fallback, sizeof(fallback), "/dev/dri/renderD%d", 128 + (int) i);
+                dri_path = fallback;
+            }
+            r.dri_fd = open(dri_path.c_str(), O_RDWR);
+            if (r.dri_fd < 0) {
+                fprintf(stderr, "ggml-vulkan-collective: failed to open DRM render node '%s' for rank %zu (errno=%d: %s)\n",
+                        dri_path.c_str(), i, errno, strerror(errno));
+                for (auto & rr : c->ranks) tp5_destroy_rank(rr);
+                delete c;
+                return nullptr;
+            }
+            fprintf(stderr, "ggml-vulkan-collective: rank %zu bound to DRM node '%s' (dri_fd=%d)\n",
+                    i, dri_path.c_str(), r.dri_fd);
+            int ret = drmSyncobjFDToHandle(r.dri_fd, r.timeline_export_fd, &r.own_syncobj);
+            if (ret != 0 || r.own_syncobj == 0) {
+                fprintf(stderr, "ggml-vulkan-collective: drmSyncobjFDToHandle failed for rank %zu (ret=%d, handle=%u, errno=%d: %s)\n",
+                        i, ret, r.own_syncobj, errno, strerror(errno));
+                for (auto & rr : c->ranks) tp5_destroy_rank(rr);
+                delete c;
+                return nullptr;
+            }
+            r.peer_syncobjs.resize(n, 0);
+            r.peer_syncobjs[i] = r.own_syncobj;
+            if (r.timeline_export_fd >= 0) {
+                ::close(r.timeline_export_fd);
+                r.timeline_export_fd = -1;
             }
         }
     }
@@ -3147,6 +3958,11 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
         }
     }
 
+    if (c->sync_mode == tp5_sync_mode::STAR) {
+        c->avx2_pool = std::make_unique<tp5_avx2_pool>();
+        c->drm_signaler = std::make_unique<tp5_drm_signaler>();
+    }
+
     if (!tp5_setup_workspace(*c, 2560)) {
         fprintf(stderr, "ggml-vulkan-collective: direct mesh workspace setup failed: %s\n", c->fail_reason.c_str());
         for (auto & rr : c->ranks) tp5_destroy_rank(rr);
@@ -3156,6 +3972,7 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
 
     {
         const char * sync_name = (c->sync_mode == tp5_sync_mode::TIMELINE) ? "timeline" :
+                                 (c->sync_mode == tp5_sync_mode::STAR) ? "star" :
                                  (c->sync_mode == tp5_sync_mode::SYNCFD) ? "syncfd" :
                                  (c->sync_mode == tp5_sync_mode::GPUFLAG) ? "gpuflag" : "host";
         fprintf(stderr, "ggml-vulkan-collective: init %zu ranks, wire=%s sync=%s relay=off, "
@@ -3174,7 +3991,7 @@ void ggml_backend_vk_tp5_comm_free(void * comm) {
         fprintf(stderr, "ggml-vulkan-collective: comm_free called on failed collective: aborting to prevent destroying active resources\n");
         GGML_ABORT("ggml-vulkan-collective: unrecoverable runtime failure: comm_free called on failed collective\n");
     }
-    if (c->sync_mode == tp5_sync_mode::TIMELINE) {
+    if (c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::DRM || c->sync_mode == tp5_sync_mode::STAR) {
         if (!tp5_drain_epoch(*c, c->allreduce_calls)) {
             GGML_ABORT("ggml-vulkan-collective: unrecoverable runtime failure: comm_free drain failed for epoch %llu\n", (unsigned long long) c->allreduce_calls);
         }
@@ -3182,7 +3999,7 @@ void ggml_backend_vk_tp5_comm_free(void * comm) {
     c->clear_cached_plans();
     if (c->sync_mode == tp5_sync_mode::GPUFLAG) {
         tp5_gpuflag_drain_all(*c);
-    } else if (c->sync_mode != tp5_sync_mode::TIMELINE) {
+    } else if (c->sync_mode != tp5_sync_mode::TIMELINE && c->sync_mode != tp5_sync_mode::STAR) {
     for (auto & r : c->ranks) {
         if (r.vkdev != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(r.vkdev);
@@ -3190,6 +4007,18 @@ void ggml_backend_vk_tp5_comm_free(void * comm) {
     }
     }
     tp5_poll_gpu_timing(*c);
+
+    // Free Star AllReduce host allocations and worker pool/signaler
+    c->avx2_pool.reset();
+    c->drm_signaler.reset();
+    for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
+        if (c->star_host_raw[b]) {
+            free(c->star_host_raw[b]);
+            c->star_host_raw[b] = nullptr;
+            c->star_host_aligned[b] = nullptr;
+        }
+    }
+
     for (auto & r : c->ranks) tp5_destroy_rank(r);
     delete c;
 }
@@ -3223,7 +4052,9 @@ bool ggml_backend_vk_tp5_allreduce_tensor(void * comm, ggml_tensor ** tensors) {
                 (long long) ne, tensors[0]->name, ggml_op_name(tensors[0]->op), res_ok ? "OK" : "FAIL");
     }
 
-    const bool ok = tp5_allreduce_mesh(*c, tensors, (size_t) ne);
+    const bool ok = (c->sync_mode == tp5_sync_mode::STAR) ?
+                    tp5_allreduce_star(*c, tensors, (size_t) ne) :
+                    tp5_allreduce_mesh(*c, tensors, (size_t) ne);
 
     if (debug_ar) {
         static uint64_t dbg_ok = 0, dbg_fail = 0;

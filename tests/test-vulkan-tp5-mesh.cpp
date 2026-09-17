@@ -14,7 +14,7 @@
 //   5. resource accounting: no fd leak across rounds (count /proc/self/fd)
 //
 // Usage: test-vulkan-tp5-mesh [--devices 0,1,2,3,4] [--elements 2560]
-//                              [--rounds 96] [--wire f32|f16] [--sync host|syncfd|timeline|gpuflag]
+//                              [--rounds 96] [--wire f32|f16] [--sync host|syncfd|timeline|star|l3_star|gpuflag]
 //                              [--check-all] [--vary-input] [--delay-producer]
 //                              [--adversarial] [--epochs 1] [--chain-stages N]
 //                              [--run-chain-regression] [--benchmark-chain]
@@ -1759,9 +1759,11 @@ int main(int argc, char ** argv) {
             sync_str = next();
             if (sync_str == "gpu") {
                 sync_str = "gpuflag";
+            } else if (sync_str == "l3_star") {
+                sync_str = "star";
             }
-            if (sync_str != "host" && sync_str != "syncfd" && sync_str != "timeline" && sync_str != "gpuflag") {
-                fprintf(stderr, "test-vulkan-tp5-mesh: invalid sync mode '%s'; use 'host', 'syncfd', 'timeline', or 'gpuflag'\n", sync_str.c_str());
+            if (sync_str != "host" && sync_str != "syncfd" && sync_str != "timeline" && sync_str != "star" && sync_str != "gpuflag" && sync_str != "drm") {
+                fprintf(stderr, "test-vulkan-tp5-mesh: invalid sync mode '%s'; use 'host', 'syncfd', 'timeline', 'star', 'l3_star', 'gpuflag', or 'drm'\n", sync_str.c_str());
                 return 2;
             }
             if (sync_str == "gpuflag") {
@@ -1793,7 +1795,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "test-vulkan-tp5-mesh: require 1..128 chain stages, positive elements, nonnegative rounds\n");
         return 2;
     }
-    if (sync_str == "timeline" && (run_chain_reg || adversarial)) {
+    if ((sync_str == "timeline" || sync_str == "star") && (run_chain_reg || adversarial)) {
         // The cached-compute fixture explicitly exercises replay, which is
         // otherwise opt-in independently of collective-plan replay.
         setenv("GGML_VK_CMD_REPLAY", "1", 1);
@@ -1860,7 +1862,7 @@ int main(int argc, char ** argv) {
     // Bounded asynchronous timeline overlap step graphs (ping-pong between tensors and tensors_view)
     std::vector<rank_step_graph> step_graphs_0;
     std::vector<rank_step_graph> step_graphs_1;
-    if (sync_str == "timeline") {
+    if (sync_str == "timeline" || sync_str == "star" || sync_str == "drm") {
         for (size_t j = 0; j < P; ++j) {
             step_graphs_0.push_back(create_rank_step_graph(g_backends[j], tensors_view[j], tensors[j], elements, j, false));
             step_graphs_1.push_back(create_rank_step_graph(g_backends[j], tensors[j], tensors_view[j], elements, j, true));
@@ -1911,7 +1913,7 @@ int main(int argc, char ** argv) {
     // zero host read or synchronize between individual collectives.
     // Reuses existing rank tensors (tensors and nonzero-offset tensors_view) and backend graphs.
     // Final readback compares against explicit CPU oracle across all ranks and elements.
-    if (sync_str == "timeline") {
+    if (sync_str == "timeline" || sync_str == "star" || sync_str == "drm") {
         const int timeline_steps = 8;
         fprintf(stderr, "  running asynchronous timeline overlap regression (%d dependent steps, %zu elements, zero host-sync)...\n",
                 timeline_steps, elements);
@@ -1974,7 +1976,7 @@ int main(int argc, char ** argv) {
 
     // 4.5) Epoch-chain regression & paired benchmark:
     // Run explicitly or as part of the adversarial suite.
-    if (sync_str == "timeline" && (run_chain_reg || adversarial)) {
+    if ((sync_str == "timeline" || sync_str == "star" || sync_str == "drm") && (run_chain_reg || adversarial)) {
         fprintf(stderr, "\n--- Starting Epoch-Chain Regression Suite ---\n");
         run_epoch_chain_regression(comm, g_backends, is_f16_wire);
         if (g_failures == 0)
@@ -1985,7 +1987,7 @@ int main(int argc, char ** argv) {
             run_hc_sum_regression(comm);
     }
 
-    if (benchmark_chain && sync_str == "timeline" && g_failures == 0) {
+    if (benchmark_chain && (sync_str == "timeline" || sync_str == "star" || sync_str == "drm") && g_failures == 0) {
         run_paired_chain_benchmark(comm, g_backends, elements, chain_stages, is_f16_wire);
     }
 

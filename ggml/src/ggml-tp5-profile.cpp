@@ -21,6 +21,7 @@ void ggml_tp5_profile::reset(uint64_t new_id, bool decode) {
     compute_replay_misses = 0;
     collective_plan_hits = 0;
     collective_plan_misses = 0;
+    drm_wait_hits = 0;
 }
 
 void ggml_tp5_profile::print_summary() const {
@@ -29,11 +30,13 @@ void ggml_tp5_profile::print_summary() const {
             "submits=%" PRIu64 " batches=%" PRIu64 " "
             "wait_us=%" PRIu64 " wait_n=%" PRIu64 " bp_us=%" PRIu64 " "
             "collective=%" PRIu64 " fd_exp=%" PRIu64 " fd_imp=%" PRIu64 " "
+            "drm_wait=%" PRIu64 " "
             "creplay=%" PRIu64 "/%" PRIu64 " plan=%" PRIu64 "/%" PRIu64 "\n",
             graph_exec_id, (int) is_decode,
             queue_submits.load(), submit_batches.load(),
             host_wait_us.load(), host_wait_count.load(), backpressure_us.load(),
             collective_calls.load(), fd_exports.load(), fd_imports.load(),
+            drm_wait_hits.load(),
             compute_replay_hits.load(), compute_replay_misses.load(),
             collective_plan_hits.load(), collective_plan_misses.load());
 }
