@@ -1,0 +1,37 @@
+#version 450
+
+// TP5 P2P Compute Shader Multicast:
+// Simultaneously broadcasts 2560 F16 values (320 uvec4 / 128-bit transfers)
+// to 5 destinations (local mailbox + 4 peer inboxes) using parallel compute units.
+// Bypasses the sequential SDMA hardware queue that serialized 4 copy operations into ~200us.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer SrcBuf {
+    uvec4 src_data[];
+};
+
+layout(std430, binding = 1) coherent writeonly buffer Dst0 { uvec4 dst0[]; };
+layout(std430, binding = 2) coherent writeonly buffer Dst1 { uvec4 dst1[]; };
+layout(std430, binding = 3) coherent writeonly buffer Dst2 { uvec4 dst2[]; };
+layout(std430, binding = 4) coherent writeonly buffer Dst3 { uvec4 dst3[]; };
+layout(std430, binding = 5) coherent writeonly buffer Dst4 { uvec4 dst4[]; };
+
+layout(push_constant) uniform Params {
+    uint n_uvec4; // 320 for 2560 F16
+} p;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.n_uvec4) {
+        return;
+    }
+
+    uvec4 val = src_data[idx];
+
+    dst0[idx] = val;
+    dst1[idx] = val;
+    dst2[idx] = val;
+    dst3[idx] = val;
+    dst4[idx] = val;
+}

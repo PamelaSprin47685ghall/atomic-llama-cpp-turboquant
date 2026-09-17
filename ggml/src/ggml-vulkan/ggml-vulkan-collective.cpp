@@ -162,6 +162,10 @@ struct tp5_rank {
     VkPipeline            hc_sum_pipe[2]      = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkPipelineLayout      hc_sum_layout[2]    = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkDescriptorSetLayout hc_sum_dsl[2]       = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    // P2P parallel multicast compute shader: writes to local + 4 peer mailboxes concurrently
+    VkPipeline            push_pipe           = VK_NULL_HANDLE;
+    VkPipelineLayout      push_layout         = VK_NULL_HANDLE;
+    VkDescriptorSetLayout push_dsl            = VK_NULL_HANDLE;
 
     // Per-epoch params for GPUFLAG replay-safe dynamic seq (host-coherent)
     VkBuffer epoch_buf = VK_NULL_HANDLE;
@@ -335,6 +339,7 @@ struct tp5_p1_resources {
     std::vector<VkCommandBuffer>  cmd_p1;
     std::vector<VkDescriptorSet>  ds_pack;
     std::vector<VkDescriptorSet>  ds_flag;
+    std::vector<VkDescriptorSet>  ds_push;
     std::vector<VkDevice>         devices;
     std::vector<VkCommandPool>    cmd_pools;
     std::vector<VkDescriptorPool> desc_pools;
@@ -372,6 +377,18 @@ struct tp5_p1_resources {
             if (dev != VK_NULL_HANDLE && dp != VK_NULL_HANDLE && ds_flag[i] != VK_NULL_HANDLE) {
                 vkFreeDescriptorSets(dev, dp, 1, &ds_flag[i]);
                 ds_flag[i] = VK_NULL_HANDLE;
+            }
+        }
+        for (size_t idx = 0; idx < ds_push.size(); ++idx) {
+            const size_t i = idx / TP5_MAILBOX_BANKS;
+            if (i >= devices.size() || i >= desc_pools.size()) {
+                break;
+            }
+            VkDevice         dev = devices[i];
+            VkDescriptorPool dp  = desc_pools[i];
+            if (dev != VK_NULL_HANDLE && dp != VK_NULL_HANDLE && ds_push[idx] != VK_NULL_HANDLE) {
+                vkFreeDescriptorSets(dev, dp, 1, &ds_push[idx]);
+                ds_push[idx] = VK_NULL_HANDLE;
             }
         }
         owners.clear();
@@ -694,10 +711,45 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
         if (!tp5_alloc_host_visible_buffer(r, 16, r.epoch_buf, r.epoch_mem, (void **) &r.epoch_host)) return false;
     }
 
+    if (c.n_ranks == 5 && c.wire == tp5_wire_type::F16) {
+        VkDescriptorSetLayoutBinding pb[6] = {
+            { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+            { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+            { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+            { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+            { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+            { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        };
+        VkDescriptorSetLayoutCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        pci.bindingCount = 6;
+        pci.pBindings = pb;
+        if (vkCreateDescriptorSetLayout(r.vkdev, &pci, nullptr, &r.push_dsl) != VK_SUCCESS) return false;
+
+        VkPushConstantRange ppc{VK_SHADER_STAGE_COMPUTE_BIT, 0, 4};
+        VkPipelineLayoutCreateInfo ppli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        ppli.setLayoutCount = 1;
+        ppli.pSetLayouts = &r.push_dsl;
+        ppli.pushConstantRangeCount = 1;
+        ppli.pPushConstantRanges = &ppc;
+        if (vkCreatePipelineLayout(r.vkdev, &ppli, nullptr, &r.push_layout) != VK_SUCCESS) return false;
+
+        VkShaderModule mod_push = VK_NULL_HANDLE;
+        if (!tp5_create_shader_module(r.vkdev, tp5_p2p_push_f16_data, tp5_p2p_push_f16_len, &mod_push)) return false;
+        VkComputePipelineCreateInfo pci_pipe{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pci_pipe.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        pci_pipe.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pci_pipe.stage.module = mod_push;
+        pci_pipe.stage.pName = "main";
+        pci_pipe.layout = r.push_layout;
+        ok = vkCreateComputePipelines(r.vkdev, VK_NULL_HANDLE, 1, &pci_pipe, nullptr, &r.push_pipe) == VK_SUCCESS;
+        vkDestroyShaderModule(r.vkdev, mod_push, nullptr);
+        if (!ok) return false;
+    }
+
     // Two sum sets plus one pack set per cached binding; reserve one temporary
     // plan as well. The SUM/pack layout contains one input descriptor per rank.
     const uint32_t             plan_capacity = tp5_comm::MAX_CACHED_PLANS + 1;
-    const uint32_t             sets_per_plan = TP5_MAILBOX_BANKS + 1 + (c.sync_mode == tp5_sync_mode::GPUFLAG ? 1 : 0);
+    const uint32_t             sets_per_plan = TP5_MAILBOX_BANKS * 2 + 1 + (c.sync_mode == tp5_sync_mode::GPUFLAG ? 1 : 0);
     VkDescriptorPoolSize       ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                              plan_capacity * (std::max(uint32_t(c.n_ranks + 3), 12u) * sets_per_plan +
                                               (c.sync_mode == tp5_sync_mode::GPUFLAG ? 5 : 0)) };
@@ -1017,10 +1069,13 @@ void tp5_destroy_rank(tp5_rank & r) {
     if (r.sum_pipe) { vkDestroyPipeline(r.vkdev, r.sum_pipe, nullptr); r.sum_pipe = VK_NULL_HANDLE; }
     if (r.pack_pipe) { vkDestroyPipeline(r.vkdev, r.pack_pipe, nullptr); r.pack_pipe = VK_NULL_HANDLE; }
     if (r.flag_pipe) { vkDestroyPipeline(r.vkdev, r.flag_pipe, nullptr); r.flag_pipe = VK_NULL_HANDLE; }
+    if (r.push_pipe) { vkDestroyPipeline(r.vkdev, r.push_pipe, nullptr); r.push_pipe = VK_NULL_HANDLE; }
     if (r.pipe_layout) { vkDestroyPipelineLayout(r.vkdev, r.pipe_layout, nullptr); r.pipe_layout = VK_NULL_HANDLE; }
     if (r.flag_pipe_layout) { vkDestroyPipelineLayout(r.vkdev, r.flag_pipe_layout, nullptr); r.flag_pipe_layout = VK_NULL_HANDLE; }
+    if (r.push_layout) { vkDestroyPipelineLayout(r.vkdev, r.push_layout, nullptr); r.push_layout = VK_NULL_HANDLE; }
     if (r.dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.dsl, nullptr); r.dsl = VK_NULL_HANDLE; }
     if (r.flag_dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.flag_dsl, nullptr); r.flag_dsl = VK_NULL_HANDLE; }
+    if (r.push_dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.push_dsl, nullptr); r.push_dsl = VK_NULL_HANDLE; }
     if (r.desc_pool) { vkDestroyDescriptorPool(r.vkdev, r.desc_pool, nullptr); r.desc_pool = VK_NULL_HANDLE; }
     if (r.cmd_pool) { vkDestroyCommandPool(r.vkdev, r.cmd_pool, nullptr); r.cmd_pool = VK_NULL_HANDLE; }
 }
@@ -1260,6 +1315,36 @@ static void tp5_update_hc_descriptor(tp5_rank &             rank,
     vkUpdateDescriptorSets(rank.vkdev, count, writes, 0, nullptr);
 }
 
+static void tp5_update_push_descriptor(tp5_comm & c, tp5_rank & r, size_t rank_idx, VkDescriptorSet ds,
+                                       VkBuffer src_buf, VkDeviceSize src_off, VkDeviceSize payload, size_t bank,
+                                       VkDeviceSize slot_off) {
+    VkDescriptorBufferInfo infos[6]{};
+    infos[0] = { src_buf, src_off, payload };
+    // Binding 1: Local mailbox
+    infos[1] = { c.isolate_mailbox ? r.inboxes[tp5_plan_slot(rank_idx, bank)].buf : r.mailbox_buf,
+                 c.isolate_mailbox ? 0 : slot_off,
+                 payload };
+    // Binding 2..5: 4 peer imports
+    size_t peer_idx = 0;
+    for (size_t p = 0; p < r.imports.size(); ++p) {
+        if (c.isolate_mailbox && r.imports[p].bank != bank) continue;
+        if (peer_idx < 4) {
+            infos[2 + peer_idx] = { r.imports[p].buf, c.isolate_mailbox ? 0 : slot_off, payload };
+            ++peer_idx;
+        }
+    }
+    VkWriteDescriptorSet writes[6]{};
+    for (uint32_t i = 0; i < 2 + (uint32_t) peer_idx; ++i) {
+        writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet          = ds;
+        writes[i].dstBinding      = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo     = &infos[i];
+    }
+    vkUpdateDescriptorSets(r.vkdev, 2 + (uint32_t) peer_idx, writes, 0, nullptr);
+}
+
 bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<tensor_dev_ref> & trefs,
                      size_t n_elems, VkDeviceSize flags_base) {
     plan.owners.clear();
@@ -1367,6 +1452,18 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                         return false;
                     }
                 }
+                if (r.push_pipe != VK_NULL_HANDLE && c.n_ranks == 5) {
+                    new_p1->ds_push.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
+                    VkDescriptorSetAllocateInfo pai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, r.desc_pool, 1,
+                                                    &r.push_dsl };
+                    for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
+                        const size_t idx = tp5_plan_slot(i, b);
+                        if (vkAllocateDescriptorSets(r.vkdev, &pai, &new_p1->ds_push[idx]) != VK_SUCCESS) {
+                            c.fail("allocation of push descriptor set failed on rank " + std::to_string(i));
+                            return false;
+                        }
+                    }
+                }
             }
             if (gpuflag) {
                 VkDescriptorSetAllocateInfo fai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, r.desc_pool,
@@ -1381,6 +1478,10 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
 
         VkCommandBufferUsageFlags cb_flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
         VkCommandBufferBeginInfo  beg{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, cb_flags, nullptr };
+        static const bool allow_parallel_push = [] {
+            const char * env = getenv("GGML_TP5_PARALLEL_PUSH");
+            return env && (atoi(env) != 0);
+        }();
         for (size_t i = 0; i < c.n_ranks; ++i) {
             tp5_rank & r          = c.ranks[i];
             const bool has_packed = (trefs[i].packed_buf != VK_NULL_HANDLE);
@@ -1399,6 +1500,20 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                 }
 
                 if (has_packed) {
+                    const bool use_parallel_push = allow_parallel_push &&
+                                                   (r.push_pipe != VK_NULL_HANDLE && c.n_ranks == 5 &&
+                                                    (payload % 16 == 0) && r.imports.size() >= 4 &&
+                                                    (c.wire == tp5_wire_type::F16));
+                    if (use_parallel_push) {
+                        tp5_update_push_descriptor(c, r, i, new_p1->ds_push[idx], trefs[i].packed_buf,
+                                                   trefs[i].packed_offset, payload, b, slot_off);
+                        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.push_pipe);
+                        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.push_layout, 0, 1,
+                                                &new_p1->ds_push[idx], 0, nullptr);
+                        const uint32_t n_uvec4 = (uint32_t) (payload / 16);
+                        vkCmdPushConstants(cmd, r.push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &n_uvec4);
+                        vkCmdDispatch(cmd, (n_uvec4 + 63) / 64, 1, 1);
+                    } else {
                     VkMemoryBarrier mb_pre{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT,
                                             VK_ACCESS_TRANSFER_READ_BIT };
                     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
@@ -1414,6 +1529,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                         }
                         VkBufferCopy peer_cp{ trefs[i].packed_offset, c.isolate_mailbox ? 0 : slot_off, payload };
                         vkCmdCopyBuffer(cmd, trefs[i].packed_buf, r.imports[p].buf, 1, &peer_cp);
+                    }
                     }
                 } else {
                     VkMemoryBarrier mb_pre{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
@@ -1454,12 +1570,28 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     VkMemoryBarrier mb_wire{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                                              (c.wire == tp5_wire_type::F32 ? VK_ACCESS_TRANSFER_WRITE_BIT :
                                                                              VK_ACCESS_SHADER_WRITE_BIT),
-                                             VK_ACCESS_TRANSFER_READ_BIT };
+                                             (c.wire == tp5_wire_type::F16 && r.push_pipe != VK_NULL_HANDLE ?
+                                                  VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT) };
                     vkCmdPipelineBarrier(cmd,
                                          (c.wire == tp5_wire_type::F32 ? VK_PIPELINE_STAGE_TRANSFER_BIT :
                                                                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
-                                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb_wire, 0, nullptr, 0, nullptr);
+                                         (c.wire == tp5_wire_type::F16 && r.push_pipe != VK_NULL_HANDLE && allow_parallel_push ?
+                                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT),
+                                         0, 1, &mb_wire, 0, nullptr, 0, nullptr);
 
+                    const bool use_parallel_push = allow_parallel_push &&
+                                                   (r.push_pipe != VK_NULL_HANDLE && c.n_ranks == 5 &&
+                                                    (payload % 16 == 0) && r.imports.size() >= 4 &&
+                                                    (c.wire == tp5_wire_type::F16));
+                    if (use_parallel_push) {
+                        tp5_update_push_descriptor(c, r, i, new_p1->ds_push[idx], r.wire_buf, 0, payload, b, slot_off);
+                        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.push_pipe);
+                        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.push_layout, 0, 1,
+                                                &new_p1->ds_push[idx], 0, nullptr);
+                        const uint32_t n_uvec4 = (uint32_t) (payload / 16);
+                        vkCmdPushConstants(cmd, r.push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 4, &n_uvec4);
+                        vkCmdDispatch(cmd, (n_uvec4 + 63) / 64, 1, 1);
+                    } else {
                     VkBufferCopy local_cp{ 0, c.isolate_mailbox ? 0 : slot_off, payload };
                     vkCmdCopyBuffer(cmd, r.wire_buf,
                                     c.isolate_mailbox ? r.inboxes[tp5_plan_slot(i, b)].buf : r.mailbox_buf, 1,
@@ -1471,11 +1603,19 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                         VkBufferCopy peer_cp{ 0, c.isolate_mailbox ? 0 : slot_off, payload };
                         vkCmdCopyBuffer(cmd, r.wire_buf, r.imports[p].buf, 1, &peer_cp);
                     }
+                    }
                 }
 
-                VkMemoryBarrier mb_p1{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
+                const bool any_p_push = allow_parallel_push &&
+                                        (r.push_pipe != VK_NULL_HANDLE && c.n_ranks == 5 &&
+                                         (payload % 16 == 0) && r.imports.size() >= 4 &&
+                                         (c.wire == tp5_wire_type::F16));
+                VkMemoryBarrier mb_p1{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                       any_p_push ? VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT,
                                        VK_ACCESS_SHADER_READ_BIT };
-                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                vkCmdPipelineBarrier(cmd,
+                                     any_p_push ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
                                      &mb_p1, 0, nullptr, 0, nullptr);
 
                 if (gpuflag) {

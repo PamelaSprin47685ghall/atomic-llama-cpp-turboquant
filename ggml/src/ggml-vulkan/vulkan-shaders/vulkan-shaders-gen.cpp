@@ -945,6 +945,7 @@ void process_shaders() {
     // TP5 collective transport (TP5.md T12): mesh sum + canonical F16 wire pack.
     string_to_spv("tp5_sum_f32", "tp5_sum_f32.comp", {});
     string_to_spv("tp5_sum_f16", "tp5_sum_f16.comp", {});
+    string_to_spv("tp5_p2p_push_f16", "tp5_p2p_push_f16.comp", {});
     string_to_spv("qwen4_hc_up_fold", "qwen4_hc_up_fold.comp", {});
     string_to_spv("qwen4_hc_segment_norm", "qwen4_hc_segment_norm.comp", {});
     string_to_spv("qwen4_hc_sum_f16", "qwen4_hc_segment_norm.comp",
