@@ -3312,7 +3312,7 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
         std::vector<std::vector<uint64_t>> all_sig_p1(c.n_ranks, std::vector<uint64_t>(n_stages));
         std::vector<std::vector<uint64_t>> all_wait_p2(c.n_ranks, std::vector<uint64_t>(n_stages));
         std::vector<std::vector<uint64_t>> all_sig_p2(c.n_ranks, std::vector<uint64_t>(n_stages));
-        std::vector<VkPipelineStageFlags> wait_stages(n_stages, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
+        std::vector<VkPipelineStageFlags> wait_stages(n_stages, VK_PIPELINE_STAGE_TRANSFER_BIT);
         VkPipelineStageFlags wait_compute_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
 
         for (size_t i = 0; i < c.n_ranks; ++i) {
@@ -3380,16 +3380,9 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
                 vkEndCommandBuffer(cmd_p1);
 
                 sig_p1_vals[s] = 2 * stage_epoch - 1;
-                if (s > 0) {
-                    wait_p1_vals[s] = 2 * (stage_epoch - 1);
-                    tsi_list[2 * s] = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, nullptr, 1, &wait_p1_vals[s], 1, &sig_p1_vals[s]};
-                    VkSubmitInfo si_p1{VK_STRUCTURE_TYPE_SUBMIT_INFO, &tsi_list[2 * s], 1, &r.timeline_sem, &wait_compute_mask, 1, &r.star_chain_p1[s], 1, &r.timeline_sem};
-                    rank_submits.push_back(si_p1);
-                } else {
-                    tsi_list[2 * s] = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, nullptr, 0, nullptr, 1, &sig_p1_vals[s]};
-                    VkSubmitInfo si_p1{VK_STRUCTURE_TYPE_SUBMIT_INFO, &tsi_list[2 * s], 0, nullptr, nullptr, 1, &r.star_chain_p1[s], 1, &r.timeline_sem};
-                    rank_submits.push_back(si_p1);
-                }
+                tsi_list[2 * s] = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO, nullptr, 0, nullptr, 1, &sig_p1_vals[s]};
+                VkSubmitInfo si_p1{VK_STRUCTURE_TYPE_SUBMIT_INFO, &tsi_list[2 * s], 0, nullptr, nullptr, 1, &r.star_chain_p1[s], 1, &r.timeline_sem};
+                rank_submits.push_back(si_p1);
 
                 // C. Record P2 Command Buffer for stage s
                 VkCommandBuffer & cmd_p2 = r.star_chain_p2[s];

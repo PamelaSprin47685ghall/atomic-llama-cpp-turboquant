@@ -1070,6 +1070,11 @@ static void run_paired_chain_benchmark(void *                              comm,
         }
         for (auto backend : backends)
             ggml_backend_synchronize(backend);
+        if (batched) {
+            std::vector<float> pre0(n_elems);
+            read_tensor(tensors[0][0], pre0);
+            fprintf(stderr, "TEST_RUN pre0[0]=%f\n", pre0[0]);
+        }
         const auto start = std::chrono::steady_clock::now();
         if (batched) {
             if (!g_submit_epoch_chain(comm, cbs, tensors))
