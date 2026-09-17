@@ -951,6 +951,18 @@ void process_shaders() {
                   {
                       { "TP5_HC_SUM", "1" }
     });
+    // NativeHC zone: Q8-companion producer variant (13 descriptors, binding 12
+    // is the quantized companion) and standalone companion variant (binding 8).
+    // Both are approximate-path producers for GGML_VK_HC_DOT=q8.
+    string_to_spv("qwen4_hc_sum_f16_q8", "qwen4_hc_segment_norm.comp",
+                  {
+                      { "TP5_HC_SUM", "1" },
+                      { "TP5_HC_Q8",   "1" }
+    });
+    string_to_spv("qwen4_hc_segment_norm_q8", "qwen4_hc_segment_norm.comp",
+                  {
+                      { "TP5_HC_Q8", "1" }
+    });
     string_to_spv("qwen4_gdn_segment_prep", "qwen4_gdn_segment_prep.comp", {});
     string_to_spv("qwen4_gdn_segment_delta", "qwen4_gdn_segment_delta.comp", {});
     string_to_spv("qwen4_gdn_segment_norm", "qwen4_gdn_segment_norm.comp", {});
@@ -982,6 +994,48 @@ void process_shaders() {
                                                 { variant.second,              "1"     }
         }));
     }
+    // NativeHC zone: opt-in HC down/up variant generation.
+    // (a) Reassociated long-K down variants (GGML_VK_HC_DOWN_WG=32|64|128):
+    //     workgroup spans 1-4 subgroups; per-lane FMA chain preserved;
+    //     cross-subgroup fold via shared memory. Reassociated, not bitwise.
+    //     One SPIR-V serves all three workgroup sizes; the runtime supplies
+    // BLOCK_SIZE as a specialization constant per pipeline.
+    string_to_spv("qwen4_hc_down_silu_wg", "mul_mat_vec.comp",
+                  merge_maps(base_dict, {
+                                            { "DATA_A_Q8_0",               "1"     },
+                                            { "B_TYPE",                    "float" },
+                                            { "B_TYPEV2",                  "vec2"  },
+                                            { "B_TYPEV4",                  "vec4"  },
+                                            { "D_TYPE",                    "float" },
+                                            { "USE_SUBGROUP_ADD_NO_SHMEM", "1"     },
+                                            { "HC_DOWN_SILU",              "1"     }
+                  }));
+    // (b) Approximate integer-dot down (GGML_VK_HC_DOT=q8): B activations are
+    //     the Q8_0 companion; B_TYPE is the quant block so the shared
+    //     binding-1 buffer exposes it directly.
+    string_to_spv("qwen4_hc_down_silu_q8dot", "mul_mat_vec.comp",
+                  merge_maps(base_dict, {
+                                            { "DATA_A_Q8_0",               "1"                  },
+                                            { "B_TYPE",                    "block_q8_0_packed16" },
+                                            { "B_TYPEV4",                  "block_q8_0_packed16" },
+                                            { "D_TYPE",                    "float"              },
+                                            { "USE_SUBGROUP_ADD_NO_SHMEM", "1"                  },
+                                            { "HC_DOWN_SILU",              "1"                  },
+                                            { "HC_DOWN_Q8_DOT",            "1"                  }
+                  }));
+    // (c) Specialized R320 up fold (GGML_VK_HC_UP_R320=1): fixed-tail K=320
+    //     schedule, 4-stream sigmoid/fold retained, no padding to 512.
+    string_to_spv("qwen4_hc_project_fold_r320", "mul_mat_vec.comp",
+                  merge_maps(base_dict, {
+                                            { "DATA_A_Q8_0",               "1"     },
+                                            { "B_TYPE",                    "float" },
+                                            { "B_TYPEV2",                  "vec2"  },
+                                            { "B_TYPEV4",                  "vec4"  },
+                                            { "D_TYPE",                    "float" },
+                                            { "USE_SUBGROUP_ADD_NO_SHMEM", "1"     },
+                                            { "HC_UP_FOLD",                "1"     },
+                                            { "HC_UP_R320",                "1"     }
+                  }));
     string_to_spv("qwen4_moe_down_fold", "mul_mat_vec.comp",
                   merge_maps(base_dict, {
                                             { "DATA_A_IQ4_NL",             "1"     },
@@ -1040,6 +1094,23 @@ void process_shaders() {
                                             { "MOE_FUSE_SHARED_DOWN",      "1"     },
                                             { "TP5_WIRE_OUTPUT",           "1"     }
     }));
+    // Paired-expert K=128 MoE down fold: two selected experts per wave32
+    // workgroup with independent half-wave reductions (native active-16-lane
+    // order preserved per expert). Opt-in until paired validation lands.
+    string_to_spv("qwen4_moe_down_k128", "qwen4_moe_down_k128.comp", {});
+    string_to_spv("qwen4_moe_down_k128_shared", "qwen4_moe_down_k128.comp",
+                  {
+                      { "MOE_K128_FUSE_SHARED_DOWN", "1" }
+    });
+    string_to_spv("qwen4_moe_down_k128_wire", "qwen4_moe_down_k128.comp",
+                  {
+                      { "MOE_K128_WIRE_OUTPUT", "1" }
+    });
+    string_to_spv("qwen4_moe_down_k128_shared_wire", "qwen4_moe_down_k128.comp",
+                  {
+                      { "MOE_K128_FUSE_SHARED_DOWN", "1" },
+                      { "MOE_K128_WIRE_OUTPUT",      "1" }
+    });
     string_to_spv("qwen4_moe_shared_up_swiglu", "mul_mat_vec_q6_k.comp",
                   merge_maps(base_dict, {
                                             { "DATA_A_Q6_K",               "1"     },
@@ -1353,6 +1424,15 @@ void process_shaders() {
                   {
                       { "SUBGROUP_REDUCTIONS", "1" }
     });
+
+    // Dedicated Qwen4 replicated router gate matmul (RouterPaths zone).
+    // One variant per router weight mode; the subgroup variant mirrors the
+    // native dmmv subgroup reduction on RADV.
+    for (const auto & mode : {std::pair{"f32", "ROUTER_W_F32"}, std::pair{"f16", "ROUTER_W_F16"}, std::pair{"q8_0", "ROUTER_W_Q8_0"}}) {
+        string_to_spv(std::string("qwen4_router_") + mode.first, "qwen4_router.comp", {{mode.second, "1"}});
+        string_to_spv(std::string("qwen4_router_") + mode.first + "_subgroup", "qwen4_router.comp",
+                      {{mode.second, "1"}, {"SUBGROUP_REDUCTIONS", "1"}});
+    }
 
     for (auto &c : compiles) {
         c.wait();

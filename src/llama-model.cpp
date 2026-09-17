@@ -26,6 +26,7 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 
+
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -793,6 +794,48 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     GGML_UNUSED(userdata);
 }
 
+// TP5 QSA head map (opt-in GGML_TP5_QSA_HEADMAP=1): stamp the per-rank local
+// TP5 local-node head map hook (opt-in GGML_TP5_QSA_HEADMAP=1 /
+// GGML_TP5_GDN_HEADMAP=1): stamps the per-rank local arithmetic head map on
+// the meta backend's rank-local clones. One shared hook dispatches on
+// node->op: FLASH_ATTN_EXT gets the Q->KV map (QSA), GATED_DELTA_NET gets
+// the V->QK map (GDN). The userdata is the device's split-state userdata
+// that carries the plan.
+static bool llama_tp5_local_node_hook(struct ggml_tensor * local_node, size_t rank, void * userdata) {
+    const llama_meta_device_get_split_state_userdata * ud =
+        (const llama_meta_device_get_split_state_userdata *) userdata;
+    if (ud == nullptr || !ud->has_tp5_plan) {
+        return false;
+    }
+    if (local_node->op == GGML_OP_FLASH_ATTN_EXT && ud->tp5_plan.qsa_headmap) {
+        if (!llama_tp5_qsa_headmap_stamp(ud->tp5_plan, (uint32_t) rank, local_node)) {
+            GGML_ABORT("invalid TP5 QSA local geometry for rank %zu, node '%s'", rank, local_node->name);
+        }
+        return true;
+    }
+    if (local_node->op == GGML_OP_GATED_DELTA_NET && ud->tp5_plan.gdn_headmap_enabled) {
+        if (!llama_tp5_gdn_headmap_stamp(ud->tp5_plan, (uint32_t) rank, local_node)) {
+            GGML_ABORT("invalid TP5 GDN local geometry for rank %zu, node '%s'", rank, local_node->name);
+        }
+        return true;
+    }
+    return false;
+}
+
+// Physical backend capability is checked before constructing the meta device.
+// Install the shared arithmetic hook on that device, never in process globals.
+static void llama_tp5_headmap_install(const llama_model * model) {
+    const auto & state = model->get_split_state_ud;
+    if (!state.has_tp5_plan || (!state.tp5_plan.qsa_headmap && !state.tp5_plan.gdn_headmap_enabled)) {
+        return;
+    }
+    for (const auto & dev : model->devices) {
+        if (dev.is_meta) {
+            ggml_backend_meta_set_local_node_hook(dev.dev, llama_tp5_local_node_hook);
+        }
+    }
+}
+
 const char * llm_type_name(llm_type type) {
     switch (type) {
         case LLM_TYPE_14M:           return "14M";
@@ -1361,6 +1404,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
         __func__, llama_load_mode_name(params.load_mode));
+
+    // TP5 head maps (opt-in GGML_TP5_QSA_HEADMAP/GGML_TP5_GDN_HEADMAP):
+    // register the shared local-node hook and fail closed on devices that
+    // cannot honor the mapped layout (refuses the load instead of silently
+    // running the wrong uniform ratio).
+    llama_tp5_headmap_install(this);
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);

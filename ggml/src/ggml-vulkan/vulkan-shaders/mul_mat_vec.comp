@@ -5,10 +5,141 @@
 #include "mul_mat_vec_base.glsl"
 #include "dequant_funcs.glsl"
 
+#if defined(HC_DOWN_SILU) && defined(HC_DOWN_Q8_DOT)
+#extension GL_EXT_integer_dot_product : require
+#endif
+
 #ifdef MOE_DOWN_FOLD
 layout(local_size_x_id = 3, local_size_y = 1, local_size_z = 1) in;
 #else
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+#endif
+
+uint a_offset, b_offset, d_offset, y_offset;
+
+#if defined(HC_DOWN_SILU) && !defined(HC_DOWN_NATIVE_REDUCTION)
+// Opt-in reassociated long-K HC down variant (GGML_VK_HC_DOWN_WG=32|64|128).
+// A workgroup of BLOCK_SIZE lanes cooperatively reduces one output row:
+// each lane keeps the native per-lane two-dot FMA chain over its K slice,
+// then partials are combined across subgroups through shared memory. The
+// cross-lane partial-sum order differs from the native single-subgroup
+// subgroupAdd tree, so results are reassociated, NOT bitwise identical.
+shared FLOAT_TYPE hc_down_partial[32][NUM_COLS];
+#ifdef HC_DOWN_Q8_DOT
+// Opt-in approximate path (GGML_VK_HC_DOT=q8): the B activations are read
+// from a Q8_0 companion produced by the fused HC norm/sum shader, and each
+// 32-element quant block contracts through dotPacked4x8EXT. This is
+// approximate: activations pass through an int8 quantization grid.
+#define B_QUANT_K 32u
+// B_TYPE is block_q8_0_packed16 for this variant, so the shared interface
+// buffer B (binding 1) already exposes the companion as data_b[].
+#endif
+
+#if defined(HC_DOWN_SILU) && !defined(HC_DOWN_NATIVE_REDUCTION) && !defined(HC_DOWN_Q8_DOT)
+// Multi-subgroup reduction for the reassociated long-K variant: subgroupAdd
+// within each subgroup (native lane tree preserved), then a deterministic
+// ascending-order shared-memory fold across the (at most 4) subgroups.
+// Only one workgroup row is produced per dispatch (NUM_ROWS == 1).
+void hc_down_reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint d_offset,
+                           const uint first_row, const uint num_rows, const uint tid) {
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+            temp[j][n] = subgroupAdd(temp[j][n]);
+        }
+    }
+    const uint n_sub = gl_NumSubgroups;
+    if (gl_SubgroupInvocationID == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+                hc_down_partial[gl_SubgroupID][j] = temp[j][n];
+            }
+        }
+    }
+    barrier();
+    if (tid == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            precise FLOAT_TYPE acc = hc_down_partial[0][j];
+            [[unroll]] for (uint s = 1; s < 32; ++s) {
+                if (s < n_sub) {
+                    acc = acc + hc_down_partial[s][j];
+                }
+            }
+            temp[j][0] = acc;
+        }
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            precise float scaled = temp[j][0] * 0.25 + 0.0;
+            temp[j][0]           = scaled / (1.0 + exp(-scaled));
+            data_d[mat_vec_d_col_offset(j, d_offset) + first_row] = D_TYPE(temp[j][0]);
+        }
+    }
+}
+#endif
+#endif
+
+#if defined(HC_DOWN_SILU) && defined(HC_DOWN_Q8_DOT)
+// Approximate integer-dot HC down (GGML_VK_HC_DOT=q8). Reads the Q8_0
+// activation companion from binding 1 (data_b, typed block_q8_0_packed16), and
+// contracts each 32-element block with dotPacked4x8EXT. Weights remain Q8_0
+// (binding 0, data_a_packed16). The result is approximate: activations pass
+// through an int8 grid. Per-element absolute quantization error is about
+// scale/2 (plus F16 scale rounding); output error must be measured, not
+// derived — cancellation near zero makes relative-error claims false.
+// NOT bitwise; NOT lossless. The whole-32-block-per-lane schedule also
+// changes the F32 accumulation order vs the native 8-columns-per-lane path.
+// One subgroup per row as native; subgroupAdd reduction unchanged.
+void hc_down_q8dot_compute(const uint32_t first_row) {
+    const uint tid = gl_LocalInvocationID.x;
+    get_offsets(a_offset, b_offset, d_offset);
+
+    FLOAT_TYPE temp[NUM_COLS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        temp[j] = FLOAT_TYPE(0);
+    }
+
+    // Each lane strides 8 columns per iter like the native K_PER_ITER==8 path;
+    // both A and B are Q8_0 so a full 32-element quant block is consumed per
+    // lane pair of iterations. Simpler and exact per-block: each lane handles
+    // whole 32-element blocks; K is a multiple of 32 for Q8_0.
+    const uint blocks_per_row = p.ncols / B_QUANT_K;
+    for (uint blk = tid; blk < blocks_per_row; blk += BLOCK_SIZE) {
+        const uint ib_a = first_row * blocks_per_row + blk + a_offset;
+        const uint ib_b = blk + b_offset / B_QUANT_K;
+        // qs[] entries are int16, each packing TWO int8 quants. Sign-extending
+        // a single 16-bit entry to 32 bits would corrupt dotPacked4x8EXT with
+        // spurious high-byte products; instead repack each PAIR of 16-bit
+        // entries into one 32-bit word (low entry in bytes 0-1, high entry in
+        // bytes 2-3) so each word holds exactly four int8 quants.
+        int32_t w[8];
+        [[unroll]] for (uint p = 0; p < 8; ++p) {
+            w[p] = int32_t((uint32_t(data_a_packed16[ib_a].qs[2 * p]) & 0xffffu) |
+                           (uint32_t(uint16_t(data_a_packed16[ib_a].qs[2 * p + 1])) << 16u));
+        }
+        const FLOAT_TYPE da = FLOAT_TYPE(data_a_packed16[ib_a].d);
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            const uint ibb = ib_b + j * (p.batch_stride_b / B_QUANT_K);
+            int32_t q_sum = 0;
+            [[unroll]] for (uint p = 0; p < 8; ++p) {
+                const int32_t bq = int32_t((uint32_t(data_b[ibb].qs[2 * p]) & 0xffffu) |
+                                          (uint32_t(uint16_t(data_b[ibb].qs[2 * p + 1])) << 16u));
+                q_sum += dotPacked4x8EXT(w[p], bq);
+            }
+            temp[j] = fma(FLOAT_TYPE(q_sum), da * FLOAT_TYPE(data_b[ibb].d), temp[j]);
+        }
+    }
+
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        temp[j] = subgroupAdd(temp[j]);
+    }
+    if (tid == 0) {
+        [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+            precise float scaled = temp[j] * 0.25 + 0.0;
+            temp[j]              = scaled / (1.0 + exp(-scaled));
+            data_d[mat_vec_d_col_offset(j, d_offset) + first_row] = D_TYPE(temp[j]);
+        }
+    }
+}
 #endif
 
 #if !defined(DATA_A_F32) && !defined(DATA_A_F16) && !defined(DATA_A_BF16)
@@ -18,8 +149,7 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 #endif
 
 
-uint a_offset, b_offset, d_offset, y_offset;
-
+#if !defined(HC_DOWN_Q8_DOT)
 vec4 load_b(const uint j, const uint iybs, const uint iqs, const bool lastiter, out bool OOB_y, out bool OOB_z, out bool OOB_w) {
     // Check if the latter elements are OOB, and don't fetch B or accumulate it.
     OOB_y = lastiter && (iybs + iqs + y_offset >= p.ncols);
@@ -45,10 +175,13 @@ vec4 load_b(const uint j, const uint iybs, const uint iqs, const bool lastiter, 
                  0, 0, 0);
     }
 }
+#endif
 
 void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint tid, const uint i, bool lastiter)
 {
-#if K_PER_ITER == 8 && !defined(MUL_MAT_ID)
+// The q8dot variant redefines B as a quant block buffer; the shared
+// float-vector fast path cannot read it and is never dispatched there.
+#if K_PER_ITER == 8 && !defined(MUL_MAT_ID) && !defined(HC_DOWN_Q8_DOT)
     // Recurrent decode stores concurrent Lane vectors as columns sharing one
     // matrix. For the dominant one-row tile, dequantize that matrix block once
     // and reuse it for every Lane instead of repeating the weight load/work.
@@ -95,7 +228,7 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
         const uint iqs = (col%QUANT_K)/QUANT_R; // quant index
         const uint iybs = col - col%QUANT_K; // y block start index
 
-#if K_PER_ITER == 8
+#if K_PER_ITER == 8 && !defined(HC_DOWN_Q8_DOT)
 #if QUANT_R == 2
         // Note that we end up fetching bogus elements here, but its fine as they'll be
         // within an accessible block.
@@ -108,11 +241,13 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
         const vec4 bv1 = vec4(data_b_v4[(j*p.batch_stride_b + b_offset + iybs + iqs) / 4 + 1]);
 #endif
 #else
+#if !defined(HC_DOWN_Q8_DOT)
         bool OOB_y;
         bool OOB_z;
         bool OOB_w;
 
         const vec4 b = load_b(j, iybs, iqs, lastiter, OOB_y, OOB_z, OOB_w);
+#endif
 #endif
         uint ibi = first_row*p.ncols;
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
@@ -123,7 +258,7 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
             ibi += p.ncols;
 #endif
 
-#if K_PER_ITER == 8
+#if K_PER_ITER == 8 && !defined(HC_DOWN_Q8_DOT)
             vec4 v = dequantize4(ib, iqs, a_offset);
             vec4 v2 = dequantize4(ib, iqs+(4/QUANT_R), a_offset);
 
@@ -141,6 +276,10 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
                 rowtmp *= dm.x;
 
             temp[j][n] += rowtmp;
+#elif defined(HC_DOWN_Q8_DOT)
+            // Unreachable: main routes the q8dot variant to
+            // hc_down_q8dot_compute and never dispatches iter().
+            temp[j][n] += FLOAT_TYPE(0);
 #else
             if (!OOB_w) {
                 const vec4 v = dequantize4(ib, iqs, a_offset);
@@ -244,7 +383,14 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     }
 #    endif
 #else
+#    ifdef HC_DOWN_SILU
+    // Reassociated long-K variant: HC_DOWN_WG lanes cooperatively reduce one
+    // output row. tid addresses lanes within the row's workgroup; the K loop
+    // stride is the workgroup size instead of the native single-subgroup size.
+#        define tid gl_LocalInvocationID.x
+#    else
     const uint tid = gl_LocalInvocationID.x;
+#    endif
 #endif
 
     get_offsets(a_offset, b_offset, d_offset);
@@ -348,14 +494,71 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
     }
 #endif
 
+// NativeHC zone: variant-specific reduction. The reassociated wg variant uses
+// its own multi-subgroup fold; the q8dot variant never reaches here (main
+// routes it to hc_down_q8dot_compute). All other paths use the shared
+// reduce_result from mul_mat_vec_base.glsl.
+#if defined(HC_DOWN_SILU) && !defined(HC_DOWN_NATIVE_REDUCTION) && !defined(HC_DOWN_Q8_DOT)
+    hc_down_reduce_result(temp, d_offset, first_row, num_rows, tid);
+#else
     reduce_result(temp, d_offset, first_row, num_rows, tid);
+#endif
 }
+
+#if defined(HC_UP_FOLD) && defined(HC_UP_R320)
+// Specialized R320 up fold (GGML_VK_HC_UP_R320=1): the exact production shape
+// K=320 (HC rank slice) with compile-time tail handling. 320 columns = 10
+// lanes' worth of 8-column iterations per 32-lane subgroup plus a fixed
+// 64-column remainder handled without the native dynamic num_iters tail
+// logic. The 4-stream sigmoid/fold semantics and the precise fold order are
+// identical to the native HC_UP_FOLD path; only the K-loop schedule differs.
+// Numerically the lane accumulation order is preserved (each lane covers the
+// same K slice as native), so per-lane partials are bitwise identical to
+// native; the final subgroupAdd tree is unchanged.
+void hc_up_r320_compute(const uint32_t first_row) {
+    get_offsets(a_offset, b_offset, d_offset);
+    const uint tid = gl_LocalInvocationID.x;
+
+    FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
+    [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+        [[unroll]] for (uint i = 0; i < NUM_ROWS; ++i) {
+            temp[j][i] = FLOAT_TYPE(0);
+        }
+    }
+
+    // K=320, K_PER_ITER=8, BLOCK_SIZE=32: iteration 0 covers columns
+    // 0..255 across all 32 lanes; the fixed 64-column tail (256..319) is
+    // covered by lanes 0..7 of iteration 1.
+    iter(temp, first_row, NUM_ROWS, tid, 0u, false);
+    if (tid < 8u) {
+        iter(temp, first_row, NUM_ROWS, tid, 8u, false);
+    }
+
+    reduce_result(temp, d_offset, first_row, NUM_ROWS, tid);
+}
+#endif
 
 void main() {
     const uint first_row = mat_vec_first_row();
 
 #ifdef NEEDS_INIT_IQ_SHMEM
     init_iq_shmem(gl_WorkGroupSize);
+#endif
+
+#if defined(HC_DOWN_SILU) && defined(HC_DOWN_Q8_DOT)
+    // Approximate integer-dot path: one row per workgroup, Q8 companion B.
+    if (first_row < p.stride_d) {
+        hc_down_q8dot_compute(first_row);
+    }
+    return;
+#endif
+
+#if defined(HC_UP_FOLD) && defined(HC_UP_R320)
+    // Specialized fixed-tail R320 up fold: one row per workgroup as native.
+    if (first_row < p.stride_d) {
+        hc_up_r320_compute(first_row);
+    }
+    return;
 #endif
 
     // do NUM_ROWS at a time, unless there aren't enough remaining rows

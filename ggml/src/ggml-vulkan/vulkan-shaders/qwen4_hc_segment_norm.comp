@@ -10,6 +10,10 @@
 #ifdef TP5_HC_SUM
 #    extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
+#ifdef TP5_HC_Q8
+#    extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#    extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 
 // Preserve an independent 512-lane RMS tree per residual stream. The fused
 // variant pairs two streams so their five-slot sum can share LDS storage.
@@ -78,6 +82,18 @@ layout(std430, binding = 10) readonly buffer InjectInput {
 layout(std430, binding = 11) writeonly buffer SumOutput {
     float sum_output[];
 };
+#ifdef TP5_HC_Q8
+// NativeHC zone: Q8_0 activation companion (fused layout, binding 12). The
+// collective's 13-descriptor update binds the quantized scratch here.
+struct hc_q8_block {
+    float16_t d;
+    int8_t    qs[32];
+};
+
+layout(std430, binding = 12) writeonly buffer Q8Companion {
+    hc_q8_block q8_companion[];
+};
+#endif
 #else
 layout(std430, binding = 1) readonly buffer Block {
     float block_out[];
@@ -106,6 +122,22 @@ layout(std430, binding = 6) readonly buffer InjectWeights {
 layout(std430, binding = 7) readonly buffer InjectInput {
     float inject_input[];
 };
+#endif
+
+#ifdef TP5_HC_Q8
+#    ifndef TP5_HC_SUM
+// NativeHC zone: Q8_0 activation companion for the approximate integer-dot
+// HC down path (GGML_VK_HC_DOT=q8). Standalone variant: binding 8. The fused
+// TP5_HC_SUM layout declares the same block at binding 12 (SumOutput moves).
+struct hc_q8_block {
+    float16_t d;
+    int8_t    qs[32];
+};
+
+layout(std430, binding = 8) writeonly buffer Q8Companion {
+    hc_q8_block q8_companion[];
+};
+#    endif
 #endif
 layout(push_constant) uniform Params {
     uint  width;
@@ -250,9 +282,46 @@ void normalize(uint iterations) {
         const uint col = tid + i * 512u;
         if (col < p.width) {
             float norm               = scale * values[i];
-            normalized[offset + col] = norm * gamma[offset + col];
+            const float scaled_norm  = norm * gamma[offset + col];
+            normalized[offset + col] = scaled_norm;
         }
     }
+
+#ifdef TP5_HC_Q8
+    // NativeHC zone: emit the Q8_0 activation companion for the approximate
+    // integer-dot HC down (GGML_VK_HC_DOT=q8). Stage the scaled normalized
+    // values through shared memory (partials is dead after the RMS tree), one
+    // 512-wide pass at a time; the lane owning a block's first element packs
+    // it with d = amax/127, q = rint(v/d) clamped to [-127,127]. This is the
+    // activation-quantization work; the companion is approximate by design.
+    // A barrier here is mandatory: every lane must finish reading the RMS
+    // partials before any lane overwrites them for the Q8 stage (the last
+    // RMS-tree barrier only orders the sum write, not its consumers).
+    barrier();
+    [[unroll]] for (uint i = 0u; i < iterations; ++i) {
+        const uint col = tid + i * 512u;
+        partials[partial_base + tid] = col < p.width ? scale * values[i] * gamma[offset + col] : 0.0;
+        barrier();
+        if (tid < 16u && (i * 512u + tid * 32u) < p.width) {
+            const uint base_col = i * 512u + tid * 32u;
+            float      amax     = 0.0;
+            [[unroll]] for (uint e = 0u; e < 32u; ++e) {
+                amax = max(amax, abs(partials[partial_base + base_col % 512u + e]));
+            }
+            const float  d = amax / 127.0;
+            // Zero block: keep d=0, q=0. inv_d=0 (not 1/0) keeps rint finite.
+            const float inv_d = d > 0.0 ? 1.0 / d : 0.0;
+            const uint   ib = (offset + base_col) / 32u;
+            hc_q8_block block;
+            block.d = float16_t(d);
+            [[unroll]] for (uint e = 0u; e < 32u; ++e) {
+                block.qs[e] = int8_t(clamp(roundEven(partials[partial_base + base_col % 512u + e] * inv_d), -127.0, 127.0));
+            }
+            q8_companion[ib] = block;
+        }
+        barrier();
+    }
+#endif
 }
 
 void main() {

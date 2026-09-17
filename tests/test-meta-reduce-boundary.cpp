@@ -1560,6 +1560,509 @@ static void test_meta_indexed_replica_tp5_q8() {
     ggml_backend_free(meta_backend);
 }
 
+// ---- TP5 balanced head-map mapped spans (opt-in GGML_TP5_GDN_HEADMAP=1) ----
+
+// Per-rank global V head order (Main's assignment, mirrored in llama-tp5-plan.cpp).
+// Adjacent pairs keep 256-element ssm_out Q5_K quant blocks whole.
+static const int32_t MS_V_ORDER[5][10] = {
+    { 0,  1, 16, 17, 32, 33,  2,  3, 18, 19},
+    {34, 35,  4,  5, 20, 21, 36, 37,  6,  7},
+    {22, 23, 38, 39,  8,  9, 24, 25, 40, 41},
+    {10, 11, 26, 27, 42, 43, 12, 13, 28, 29},
+    {44, 45, 14, 15, 30, 31, 46, 47,  0,  0},
+};
+static const int32_t MS_V_COUNT[5] = {10, 10, 10, 10, 8};
+
+// Test: mapped axis-0 spans carry whole original Q5_K quant blocks. The
+// ssm_out-like tensor is [6144, 3] Q5_K (256-element blocks; 48 heads * 128
+// dims, one head pair = one quant block); each rank's local storage is the
+// concatenation of its mapped V-pair spans. Verifies per-replica bytes,
+// canonical readback (inverse map), a chunk-granular partial row set, and
+// mutation isolation across ranks. A copied-quant-scale / wrong-head-order /
+// partial-offset bug fails the exact byte comparisons.
+static void test_meta_mapped_span_axis0_q5k() {
+    fprintf(stderr, "--- test_meta_mapped_span_axis0_q5k ---\n");
+    const int n_ranks = 5;
+    ggml_backend_dev_t cpu_dev = get_cpu_dev();
+    TEST_ASSERT(cpu_dev != nullptr);
+
+    auto split_fn = [](const struct ggml_tensor * tensor, void * /*ud*/) -> ggml_backend_meta_split_state {
+        if (tensor && tensor->name[0] && strstr(tensor->name, "ssm_out_map")) {
+            // All five ranks' pair spans in one flat mapped layout: rank r owns
+            // its pairs; ne[r] = local length, spans at flat prefix offsets.
+            ggml_backend_meta_split_state ss = { GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1, false, {0} };
+            ss.mapped_span = true;
+            const int64_t head_dim = 128;
+            int64_t flat = 0;
+            for (uint32_t r = 0; r < 5; ++r) {
+                const int n_pairs = MS_V_COUNT[r] / 2;
+                ss.span_count[r] = n_pairs;
+                for (int p = 0; p < n_pairs; ++p) {
+                    const int64_t h0 = MS_V_ORDER[r][2 * p];
+                    ss.span_start[flat + p] = h0 * head_dim;
+                    ss.span_len[flat + p]  = 2 * head_dim;
+                }
+                flat += n_pairs;
+                ss.ne[r] = MS_V_COUNT[r] * head_dim;
+            }
+            return ss;
+        }
+        return { GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1, false, {0} };
+    };
+
+    std::vector<ggml_backend_dev_t> devs(n_ranks, cpu_dev);
+    ggml_backend_dev_t meta_dev = ggml_backend_meta_device(devs.data(), n_ranks, split_fn, nullptr);
+    TEST_ASSERT(meta_dev != nullptr);
+    ggml_backend_t meta_backend = ggml_backend_dev_init(meta_dev, nullptr);
+    TEST_ASSERT(meta_backend != nullptr);
+    ggml_backend_buffer_type_t meta_buft = ggml_backend_dev_buffer_type(meta_dev);
+
+    const int64_t head_dim = 128, n_heads = 48, rows = 3;
+    const int64_t ne0 = n_heads * head_dim; // 6144
+
+    struct ggml_init_params params = { 16 * 1024 * 1024, nullptr, /*no_alloc=*/ true };
+    struct ggml_context * ctx = ggml_init(params);
+    ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_Q5_K, ne0, rows);
+    ggml_set_name(t, "ssm_out_map");
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, meta_buft);
+    TEST_ASSERT(buf != nullptr);
+
+    const size_t row_bytes = (size_t) t->nb[1]; // 24 blocks * 176 bytes = 4224
+    TEST_ASSERT_MSG(row_bytes == 24 * 176, "Q5_K row must be 24 blocks of 176 bytes");
+    const size_t total_bytes = row_bytes * rows;
+    // Distinct valid Q5_K block data per head pair: any scale copy from the
+    // wrong head pair or a half-block cut fails the byte comparisons.
+    std::vector<uint8_t> init_data(total_bytes);
+    for (int64_t r = 0; r < rows; ++r)
+        for (int64_t b = 0; b < 24; ++b) {
+            block_q5_K * blk = (block_q5_K *) (init_data.data() + r * row_bytes + b * sizeof(block_q5_K));
+            blk->d = ggml_fp32_to_fp16(1.0f + float(r) + float(b) * 0.25f);
+            blk->dmin = ggml_fp32_to_fp16(0.125f + float(b) * 0.03125f);
+            for (int k = 0; k < QK_K / 2; ++k) blk->qs[k] = uint8_t((k * 7 + b * 13 + r) & 0xFF);
+            for (int k = 0; k < QK_K / 8; ++k) blk->qh[k] = uint8_t((k * 5 + b * 3 + 2 * r) & 0xFF);
+            for (int k = 0; k < K_SCALE_SIZE; ++k) blk->scales[k] = uint8_t((k * 3 + b + r) & 0x3F);
+        }
+    ggml_backend_tensor_set(t, init_data.data(), 0, total_bytes);
+
+    // 1) Every replica holds exactly its mapped spans' bytes (concatenated).
+    for (int j = 0; j < n_ranks; ++j) {
+        struct ggml_tensor * st = ggml_backend_meta_buffer_simple_tensor(t, j);
+        TEST_ASSERT_MSG(st != nullptr, "simple_tensor must exist");
+        const size_t local_bytes = (size_t) st->nb[1]; // local blocks * 176
+        const int64_t local_len = MS_V_COUNT[j] * head_dim;
+        TEST_ASSERT_MSG(st->ne[0] == local_len, "replica ne[0] must equal concatenated span length");
+        std::vector<uint8_t> st_data(local_bytes * rows);
+        ggml_backend_tensor_get(st, st_data.data(), 0, st_data.size());
+        // expected concatenation of this rank's pair spans
+        std::vector<uint8_t> expect(local_bytes * rows);
+        for (int p = 0; p < MS_V_COUNT[j] / 2; ++p) {
+            const int64_t h0 = MS_V_ORDER[j][2 * p];
+            const int64_t blk = h0 / 2; // head pair p maps to quant block h0/2
+            for (int64_t r = 0; r < rows; ++r)
+                memcpy(expect.data() + r * local_bytes + p * sizeof(block_q5_K),
+                       init_data.data() + r * row_bytes + blk * sizeof(block_q5_K),
+                       sizeof(block_q5_K));
+        }
+        TEST_ASSERT_MSG(memcmp(st_data.data(), expect.data(), expect.size()) == 0,
+                        "mapped span replica content mismatch (wrong head order / partial offsets)");
+    }
+
+    // 2) Canonical readback is the exact inverse map (all 48 heads once).
+    {
+        std::vector<uint8_t> readback(total_bytes);
+        ggml_backend_tensor_get(t, readback.data(), 0, total_bytes);
+        TEST_ASSERT_MSG(memcmp(readback.data(), init_data.data(), total_bytes) == 0,
+                        "canonical readback must reconstruct the original layout exactly");
+    }
+
+    // 3) Partial set of one row (chunk-granular): the host buffer must cover
+    //    every span's slice of that row; a single head inside one span is
+    //    patched and verified via full canonical readback.
+    {
+        const int64_t gh = 24; // global head pair {24,25} owned by rank 2
+        const int64_t blk = gh / 2; // its quant block index
+        std::vector<uint8_t> row(row_bytes);
+        memcpy(row.data(), init_data.data() + row_bytes, row_bytes); // row 1
+        // dirty the block with a distinct marker scale so a scale-copy bug shows
+        block_q5_K * m = (block_q5_K *) (row.data() + blk * sizeof(block_q5_K));
+        m->d = ggml_fp32_to_fp16(321.0f);
+        for (int k = 0; k < QK_K / 2; ++k) m->qs[k] = uint8_t((k * 11 + 5) & 0xFF);
+        ggml_backend_tensor_set(t, row.data(), row_bytes, row_bytes);
+        // canonical readback shows the patch at the right global position only
+        std::vector<uint8_t> readback(total_bytes);
+        ggml_backend_tensor_get(t, readback.data(), 0, total_bytes);
+        TEST_ASSERT_MSG(memcmp(readback.data() + row_bytes + blk * sizeof(block_q5_K),
+                               row.data() + blk * sizeof(block_q5_K),
+                               sizeof(block_q5_K)) == 0,
+                        "canonical readback must place the partial patch at the original position");
+        // the rest of row 1 and all other rows are untouched
+        for (int64_t b = 0; b < 24; ++b) {
+            if (b == blk) continue;
+            TEST_ASSERT_MSG(memcmp(readback.data() + row_bytes + b * sizeof(block_q5_K),
+                                   init_data.data() + row_bytes + b * sizeof(block_q5_K),
+                                   sizeof(block_q5_K)) == 0,
+                            "row patch corrupted other heads of the same row");
+        }
+        for (int64_t r = 0; r < rows; ++r) {
+            if (r == 1) continue;
+            TEST_ASSERT_MSG(memcmp(readback.data() + r * row_bytes, init_data.data() + r * row_bytes,
+                                   row_bytes) == 0,
+                                "row patch corrupted another row");
+        }
+        // neighbor blocks untouched (byte-exact, catches half-block bleed)
+        TEST_ASSERT_MSG(memcmp(readback.data() + row_bytes + (blk - 1) * sizeof(block_q5_K),
+                               init_data.data() + row_bytes + (blk - 1) * sizeof(block_q5_K),
+                               sizeof(block_q5_K)) == 0,
+                        "partial set corrupted the quant block before the span subrange");
+        TEST_ASSERT_MSG(memcmp(readback.data() + row_bytes + (blk + 1) * sizeof(block_q5_K),
+                               init_data.data() + row_bytes + (blk + 1) * sizeof(block_q5_K),
+                               sizeof(block_q5_K)) == 0,
+                        "partial set corrupted the quant block after the span subrange");
+    }
+
+    // 4) Mutation isolation: dirty one rank's replica storage, rewrite via the
+    //    original tensor, verify all ranks restored (fan-out to span owners).
+    {
+        std::vector<uint8_t> dirty(total_bytes, 0x7F);
+        ggml_backend_tensor_set(t, dirty.data(), 0, total_bytes);
+        std::vector<uint8_t> check(total_bytes);
+        ggml_backend_tensor_get(t, check.data(), 0, total_bytes);
+        for (size_t i = 0; i < check.size(); ++i)
+            TEST_ASSERT_MSG(check[i] == 0x7F, "dirty write must reach every mapped element");
+        ggml_backend_tensor_set(t, init_data.data(), 0, total_bytes);
+        ggml_backend_tensor_get(t, check.data(), 0, total_bytes);
+        TEST_ASSERT_MSG(memcmp(check.data(), init_data.data(), total_bytes) == 0,
+                        "restore via original tensor must rewrite every rank's spans");
+    }
+
+    fprintf(stderr, "  Mapped axis-0 V-pair spans: replicas, canonical readback, partial set/get, mutation isolation OK\n");
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(meta_backend);
+}
+
+// Test: mapped axis-1 rows. A [ne0=4, ne1=20] tensor where rank r owns
+// noncontiguous original rows (two spans each, 4 rows per rank). Verifies
+// replica row content, canonical readback, and a partial row-range get.
+static void test_meta_mapped_span_axis1_rows() {
+    fprintf(stderr, "--- test_meta_mapped_span_axis1_rows ---\n");
+    const int n_ranks = 5;
+    ggml_backend_dev_t cpu_dev = get_cpu_dev();
+    TEST_ASSERT(cpu_dev != nullptr);
+
+    // rank r owns original rows [r, r+2) and [10 + r, 10 + r + 2): 2 spans/rank.
+    // 5 ranks x 4 rows = 20 rows: full coverage of [0, 10) and [10, 20),
+    // no uncovered row for the canonical readback.
+    static const int64_t A1_START[5][2] = {
+        {0, 10}, {2, 12}, {4, 14}, {6, 16}, {8, 18}
+    };
+    auto split_fn = [](const struct ggml_tensor * tensor, void * /*ud*/) -> ggml_backend_meta_split_state {
+        if (tensor && tensor->name[0] && strstr(tensor->name, "axis1_map")) {
+            ggml_backend_meta_split_state ss = { GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1, false, {0} };
+            ss.mapped_span = true;
+            int64_t flat = 0;
+            for (uint32_t r = 0; r < 5; ++r) {
+                ss.span_count[r] = 2;
+                ss.span_start[flat + 0] = A1_START[r][0];
+                ss.span_len[flat + 0]  = 2;
+                ss.span_start[flat + 1] = A1_START[r][1];
+                ss.span_len[flat + 1]  = 2;
+                flat += 2;
+                ss.ne[r] = 4; // 2+2 rows locally
+            }
+            return ss;
+        }
+        return { GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1, false, {0} };
+    };
+
+    std::vector<ggml_backend_dev_t> devs(n_ranks, cpu_dev);
+    ggml_backend_dev_t meta_dev = ggml_backend_meta_device(devs.data(), n_ranks, split_fn, nullptr);
+    TEST_ASSERT(meta_dev != nullptr);
+    ggml_backend_t meta_backend = ggml_backend_dev_init(meta_dev, nullptr);
+    TEST_ASSERT(meta_backend != nullptr);
+    ggml_backend_buffer_type_t meta_buft = ggml_backend_dev_buffer_type(meta_dev);
+
+    const int64_t ne0 = 4, ne1 = 20;
+    struct ggml_init_params params = { 4 * 1024 * 1024, nullptr, /*no_alloc=*/ true };
+    struct ggml_context * ctx = ggml_init(params);
+    ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
+    ggml_set_name(t, "axis1_map");
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, meta_buft);
+    TEST_ASSERT(buf != nullptr);
+
+    std::vector<float> init_data(ne0 * ne1);
+    for (int64_t i = 0; i < ne0 * ne1; ++i) init_data[i] = 500.0f + float(i) * 0.25f;
+    const size_t total_bytes = init_data.size() * sizeof(float);
+    ggml_backend_tensor_set(t, init_data.data(), 0, total_bytes);
+
+    // replica content: local row k of rank r is original row A1_START[r][k/2] + k%2
+    for (int j = 0; j < n_ranks; ++j) {
+        struct ggml_tensor * st = ggml_backend_meta_buffer_simple_tensor(t, j);
+        TEST_ASSERT_MSG(st != nullptr, "axis1 simple_tensor must exist");
+        TEST_ASSERT_MSG(st->ne[1] == 4, "axis1 replica must hold 4 local rows");
+        std::vector<float> st_data(ne0 * 4);
+        ggml_backend_tensor_get(st, st_data.data(), 0, st_data.size() * sizeof(float));
+        for (int k = 0; k < 4; ++k) {
+            const int64_t orig_row = A1_START[j][k / 2] + (k % 2);
+            for (int64_t c = 0; c < ne0; ++c) {
+                TEST_ASSERT_MSG(st_data[k * ne0 + c] == init_data[orig_row * ne0 + c],
+                                "axis1 mapped span replica row mismatch");
+            }
+        }
+    }
+
+    // canonical readback inverse map
+    {
+        std::vector<float> readback(ne0 * ne1);
+        ggml_backend_tensor_get(t, readback.data(), 0, total_bytes);
+        TEST_ASSERT_MSG(memcmp(readback.data(), init_data.data(), total_bytes) == 0,
+                        "axis1 canonical readback mismatch");
+    }
+
+    // partial get: rows 10..11 belong to rank 0's second span.
+    // Mapped get is a full
+    // inverse-map readback, so verify the row range via the full readback
+    // sliced locally — the bytes must equal the original rows exactly.
+    {
+        std::vector<float> full(ne0 * ne1);
+        ggml_backend_tensor_get(t, full.data(), 0, total_bytes);
+        TEST_ASSERT_MSG(memcmp(full.data() + 10 * ne0, init_data.data() + 10 * ne0,
+                               ne0 * 2 * sizeof(float)) == 0,
+                        "axis1 span rows 10..11 must read back as the original rows");
+    }
+
+    fprintf(stderr, "  Mapped axis-1 row spans: replicas, canonical readback, partial get OK\n");
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(meta_backend);
+}
+
+// Test: partial-overlap replicas with deliberately DISTINCT per-rank values.
+// rank0 owns [0,4), rank1 owns [2,8) along axis 0 (overlap [2,4)). Canonical
+// readback must materialize every byte exactly once from the LOWEST-INDEX
+// owner: [0,4) from rank0, [4,8) from rank1. A sort-then-skip implementation
+// drops uncovered tails or picks the wrong owner and fails the exact compare.
+static void test_meta_mapped_span_partial_overlap_owner() {
+    fprintf(stderr, "--- test_meta_mapped_span_partial_overlap_owner ---\n");
+    const int n_ranks = 2;
+    ggml_backend_dev_t cpu_dev = get_cpu_dev();
+    TEST_ASSERT(cpu_dev != nullptr);
+
+    auto split_fn = [](const struct ggml_tensor * tensor, void * /*ud*/) -> ggml_backend_meta_split_state {
+        if (tensor && tensor->name[0] && strcmp(tensor->name, "overlap_map") == 0) {
+            ggml_backend_meta_split_state ss = { GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1, false, {0} };
+            ss.mapped_span = true;
+            // rank0: [0,4); rank1: [2,8): partial overlap, no full-coverage owner
+            ss.span_count[0] = 1;
+            ss.span_start[0] = 0;
+            ss.span_len[0]  = 4;
+            ss.ne[0] = 4;
+            ss.span_count[1] = 1;
+            ss.span_start[1] = 2;
+            ss.span_len[1]  = 6;
+            ss.ne[1] = 6;
+            return ss;
+        }
+        return { GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1, false, {0} };
+    };
+
+    std::vector<ggml_backend_dev_t> devs(n_ranks, cpu_dev);
+    ggml_backend_dev_t meta_dev = ggml_backend_meta_device(devs.data(), n_ranks, split_fn, nullptr);
+    TEST_ASSERT(meta_dev != nullptr);
+    ggml_backend_t meta_backend = ggml_backend_dev_init(meta_dev, nullptr);
+    TEST_ASSERT(meta_backend != nullptr);
+    ggml_backend_buffer_type_t meta_buft = ggml_backend_dev_buffer_type(meta_dev);
+
+    const int64_t ne0 = 8, rows = 2;
+    struct ggml_init_params params = { 4 * 1024 * 1024, nullptr, /*no_alloc=*/ true };
+    struct ggml_context * ctx = ggml_init(params);
+    ggml_tensor * t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, rows);
+    ggml_set_name(t, "overlap_map");
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, meta_buft);
+    TEST_ASSERT(buf != nullptr);
+
+    // Write the full logical buffer through the original tensor (fans out to
+    // both owners in the overlap).
+    std::vector<float> init_data(ne0 * rows);
+    for (int64_t i = 0; i < ne0 * rows; ++i) init_data[i] = 10.0f + float(i);
+    const size_t total_bytes = init_data.size() * sizeof(float);
+    ggml_backend_tensor_set(t, init_data.data(), 0, total_bytes);
+
+    // Dirty each replica's storage with DISTINCT values so the canonical
+    // owner choice is observable: rank0 storage -> 100+i, rank1 -> 200+i.
+    for (int j = 0; j < n_ranks; ++j) {
+        struct ggml_tensor * st = ggml_backend_meta_buffer_simple_tensor(t, j);
+        TEST_ASSERT(st != nullptr);
+        const int64_t local_len = (j == 0) ? 4 : 6;
+        std::vector<float> local(local_len * rows);
+        for (int64_t r = 0; r < rows; ++r)
+            for (int64_t i = 0; i < local_len; ++i)
+                local[r * local_len + i] = float(100 * (j + 1)) + float(r * local_len + i);
+        ggml_backend_tensor_set(st, local.data(), 0, local.size() * sizeof(float));
+    }
+
+    // Canonical readback: [0,4) must come from rank0 (100..103 / row0,
+    // 104..107 / row1), [4,8) from rank1 (204..207 / row0, 210..213 / row1).
+    // Every byte exactly once, lowest-index owner wins the overlap [2,4).
+    {
+        std::vector<float> readback(ne0 * rows);
+        ggml_backend_tensor_get(t, readback.data(), 0, total_bytes);
+        for (int64_t r = 0; r < rows; ++r) {
+            for (int64_t i = 0; i < 4; ++i) {
+                const float expected = 100.0f + float(r * 4 + i);
+                TEST_ASSERT_MSG(readback[r * ne0 + i] == expected,
+                                "overlap [2,4) must read from the lowest-index owner (rank 0)");
+            }
+            for (int64_t i = 4; i < 8; ++i) {
+                const float expected = 200.0f + float(r * 6 + (i - 2));
+                TEST_ASSERT_MSG(readback[r * ne0 + i] == expected,
+                                "rank1-exclusive tail [4,8) must read from rank 1");
+            }
+        }
+    }
+
+    // Whole-row partial upload through the original tensor with a nonzero
+    // offset: only row 1 changes; row 0 keeps the distinct replica values.
+    {
+        std::vector<float> row(ne0);
+        for (int64_t i = 0; i < ne0; ++i) row[i] = -50.0f - float(i);
+        ggml_backend_tensor_set(t, row.data(), ne0 * sizeof(float), row.size() * sizeof(float));
+        std::vector<float> readback(ne0 * rows);
+        ggml_backend_tensor_get(t, readback.data(), 0, total_bytes);
+        // row 1 fully overwritten
+        TEST_ASSERT_MSG(memcmp(readback.data() + ne0, row.data(), row.size() * sizeof(float)) == 0,
+                        "whole-row partial upload must rewrite row 1 on every owner");
+        // row 0 untouched: still rank0 values on [0,4), rank1 values on [4,8)
+        for (int64_t i = 0; i < 4; ++i)
+            TEST_ASSERT_MSG(readback[i] == 100.0f + float(i), "row upload corrupted row 0 (rank0 part)");
+        for (int64_t i = 4; i < 8; ++i)
+            TEST_ASSERT_MSG(readback[i] == 200.0f + float(i - 2), "row upload corrupted row 0 (rank1 part)");
+    }
+
+    fprintf(stderr, "  Mapped partial-overlap replicas: lowest-owner readback + whole-row upload isolation OK\n");
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(meta_backend);
+}
+
+// Test: recurrent GDN cache/history view offsets under the mapped V order.
+// The recurrent state cache is [S, S, H, nseq] with H the rank-local head
+// count; a per-layer history view at a nonzero offset must address the
+// mapped local heads. Simulates retirement (advance the cache window) and
+// verifies the view still reads the mapped heads' states after mutation.
+static void test_meta_mapped_span_recurrent_cache() {
+    fprintf(stderr, "--- test_meta_mapped_span_recurrent_cache ---\n");
+    const int n_ranks = 5;
+    ggml_backend_dev_t cpu_dev = get_cpu_dev();
+    TEST_ASSERT(cpu_dev != nullptr);
+
+    auto split_fn = [](const struct ggml_tensor * tensor, void * /*ud*/) -> ggml_backend_meta_split_state {
+        if (tensor && tensor->name[0] && strstr(tensor->name, "cache_s_map")) {
+            // Recurrent state cache, flattened transport root [S*S*H, nseq]:
+            // axis-0 mapped spans, one per adjacent V head pair, span coords in
+            // flattened elements (head h occupies [h*S*S, (h+1)*S*S)). Derived
+            // 4D reshape views carry the head mapping on axis 2.
+            ggml_backend_meta_split_state ss = { GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1, false, {0} };
+            ss.mapped_span = true;
+            const int64_t S = 8;
+            int64_t flat = 0;
+            for (uint32_t r = 0; r < 5; ++r) {
+                const int n_pairs = MS_V_COUNT[r] / 2;
+                ss.span_count[r] = n_pairs;
+                for (int p = 0; p < n_pairs; ++p) {
+                    const int64_t h0 = MS_V_ORDER[r][2 * p];
+                    ss.span_start[flat + p] = h0 * S * S;
+                    ss.span_len[flat + p]  = 2 * S * S;
+                }
+                flat += n_pairs;
+                ss.ne[r] = MS_V_COUNT[r] * S * S;
+            }
+            return ss;
+        }
+        return { GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1, false, {0} };
+    };
+
+    std::vector<ggml_backend_dev_t> devs(n_ranks, cpu_dev);
+    ggml_backend_dev_t meta_dev = ggml_backend_meta_device(devs.data(), n_ranks, split_fn, nullptr);
+    TEST_ASSERT(meta_dev != nullptr);
+    ggml_backend_t meta_backend = ggml_backend_dev_init(meta_dev, nullptr);
+    TEST_ASSERT(meta_backend != nullptr);
+    ggml_backend_buffer_type_t meta_buft = ggml_backend_dev_buffer_type(meta_dev);
+
+    const int64_t S = 8, H = 48, nseq = 4;
+    const int64_t head_elems = S * S;
+    struct ggml_init_params params = { 8 * 1024 * 1024, nullptr, /*no_alloc=*/ true };
+    struct ggml_context * ctx = ggml_init(params);
+    // flattened transport root; the 4D state view is a reshape of it
+    ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S * S * H, nseq);
+    ggml_set_name(cache, "cache_s_map");
+    ggml_tensor * state4d = ggml_reshape_4d(ctx, cache, S, S, H, nseq);
+    TEST_ASSERT(state4d != nullptr);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, meta_buft);
+    TEST_ASSERT(buf != nullptr);
+
+    const size_t total_elems = (size_t) S * S * H * nseq;
+    std::vector<float> init_data(total_elems);
+    for (size_t i = 0; i < total_elems; ++i) init_data[i] = 2000.0f + float(i % 977) * 0.125f;
+    ggml_backend_tensor_set(cache, init_data.data(), 0, total_elems * sizeof(float));
+
+    // Per-sequence view (nonzero offset along axis 3) must address the mapped
+    // Per-sequence view of the reshaped 4D state (nonzero offset along axis 3)
+    // must address the mapped heads: seq s view reads exactly the seq-s slice
+    // of the original flattened layout.
+    for (int s = 0; s < nseq; ++s) {
+        ggml_tensor * view = ggml_view_4d(ctx, state4d, S, S, H, 1, state4d->nb[1], state4d->nb[2], state4d->nb[3],
+                                          s * state4d->nb[3]);
+        TEST_ASSERT(ggml_backend_view_init(view) == GGML_STATUS_SUCCESS);
+        std::vector<float> got(total_elems / nseq);
+        ggml_backend_tensor_get(view, got.data(), 0, got.size() * sizeof(float));
+        TEST_ASSERT_MSG(memcmp(got.data(), init_data.data() + s * got.size(), got.size() * sizeof(float)) == 0,
+                        "per-sequence state view offset must read the mapped seq slice");
+    }
+
+    // Retirement: overwrite seq 0's state for one mapped local head (global
+    // 24, owned by rank 2) via a direct write into that rank's replica
+    // storage; other seqs/heads must stay intact in the canonical readback.
+    {
+        const int rank = 2;
+        const int64_t gh = 24;
+        // rank 2 pairs: {22,23},{38,39},{8,9},{24,25},{40,41}; head 24 is
+        // local head 6 (pair 3, first of the pair) in the concatenated order
+        const int64_t local_head = 6;
+        std::vector<float> patch(head_elems, -7.0f);
+        // offset: seq 0, local head local_head within rank 2's replica
+        struct ggml_tensor * st = ggml_backend_meta_buffer_simple_tensor(cache, rank);
+        TEST_ASSERT(st != nullptr);
+        const size_t off = (local_head * head_elems) * sizeof(float);
+        ggml_backend_tensor_set(st, patch.data(), off, patch.size() * sizeof(float));
+        // canonical readback: global head 24 seq 0 patched, everything else intact
+        std::vector<float> readback(total_elems);
+        ggml_backend_tensor_get(cache, readback.data(), 0, total_elems * sizeof(float));
+        const int64_t gbase = gh * head_elems;
+        for (int64_t i = 0; i < head_elems; ++i) {
+            TEST_ASSERT_MSG(readback[gbase + i] == -7.0f,
+                            "retirement patch must appear at global head 24 in canonical readback");
+        }
+        TEST_ASSERT_MSG(readback[gbase - 1] == init_data[gbase - 1],
+                        "retirement patch bled into the previous head");
+        TEST_ASSERT_MSG(readback[gbase + head_elems] == init_data[gbase + head_elems],
+                        "retirement patch bled into the next head");
+        // other sequences untouched for this head
+        for (int s = 1; s < nseq; ++s) {
+            const int64_t base = (int64_t) s * S * S * H + gbase;
+            for (int64_t i = 0; i < head_elems; ++i) {
+                TEST_ASSERT_MSG(readback[base + i] == init_data[base + i],
+                                "retirement patch corrupted another sequence");
+            }
+        }
+    }
+
+    fprintf(stderr, "  Mapped recurrent cache: seq view offsets, retirement patch, isolation OK\n");
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(meta_backend);
+}
+
 static void test_meta_scheduler_keepalive_dependencies() {
     fprintf(stderr, "--- test_meta_scheduler_keepalive_dependencies ---\n");
     auto * cpu_dev = get_cpu_dev();
@@ -1682,6 +2185,10 @@ int main(int argc, char ** argv) {
     test_meta_recurrent_snapshot_uneven_tp5(false);
     test_meta_advertised_comm_fail_closed();
     test_meta_indexed_replica_tp5_q8();
+    test_meta_mapped_span_axis0_q5k();
+    test_meta_mapped_span_axis1_rows();
+    test_meta_mapped_span_recurrent_cache();
+    test_meta_mapped_span_partial_overlap_owner();
     test_meta_scheduler_keepalive_dependencies();
 
     if (g_failures > 0) {

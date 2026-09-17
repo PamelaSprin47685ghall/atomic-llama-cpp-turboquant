@@ -75,6 +75,23 @@ layout (push_constant) uniform parameter {
 #define SINK_ENABLE_BIT (1<<24)
 #define N_LOG2_MASK 0xFFFF
 
+// TP5 QSA private local head map (opt-in GGML_TP5_QSA_HEADMAP=1). The host
+// stamps an explicit per-local-Q-head KV head map when the integer
+// neq2/nek2 ratio is NOT the true assignment (e.g. local Q5 over KV2 with
+// map [0,0,1,1,1]). Push constants cannot grow past 128 B, so the map rides
+// the ALiBi m0/m1 overlay -- only when max_bias == 0 -- plus this reserved
+// flag bit in mask_n_head_log2. Ordinary ALiBi runs never set the bit and
+// keep the generic slope path unchanged.
+#define TP5_HEADMAP_FLAG (1u << 25)
+
+uint32_t tp5_headmap_count() {
+    return uint32_t(p.m0);
+}
+
+uint32_t tp5_headmap_entry(const in uint32_t h) {
+    return (floatBitsToUint(p.m1) >> (3u * h)) & 0x7u;
+}
+
 layout (binding = 4) readonly buffer S {float data_s[];};
 
 layout (binding = 5) writeonly buffer O {D_TYPE data_o[];};
@@ -251,6 +268,15 @@ void init_indices()
     // v indices
     iv3 = iq3 / rv3;
     iv2 = iq2 / rv2;
+
+    // TP5 QSA head map: replace the integer-ratio GQA derivation with the
+    // explicit per-head map. The host forces gqa_ratio == 1 for mapped
+    // nodes, so iq2 is the plain local Q head index and every row in a
+    // workgroup shares one KV head (no cross-head mix within a tile).
+    if ((p.mask_n_head_log2 & TP5_HEADMAP_FLAG) != 0u) {
+        ik2 = tp5_headmap_entry(iq2);
+        iv2 = ik2;
+    }
 
     // nb?1 are already divided by the type size and are in units of elements.
     // When using grouped query attention, Q is indexed by iq2, so the stride

@@ -36,6 +36,10 @@ layout(push_constant) uniform Parameters {
     uint neq1, rq3;
     float scale;
     uint K;
+    // TP5 GDN head map (opt-in): bit 31 set when a map is present; the low
+    // 30 bits pack up to 10 3-bit per-V-head QK head indices (entry i at
+    // bits 3*i..3*i+2). Zero keeps the native uniform broadcast.
+    uint headmap;
 };
 
 layout(binding = 0) readonly  buffer QBuf           { FLOAT_TYPE data_q[];            };
@@ -100,11 +104,16 @@ FLOAT_TYPE reduce_partial(FLOAT_TYPE partial) {
 
 void rbb_main() {
     const uint head_id = gl_WorkGroupID.x;
+    // RBB has no mapped variant: the host fails closed before enqueue when a
+    // TP5 GDN head map is present, so the native broadcast is always correct
+    // here.
     const uint lane = gl_SubgroupInvocationID % LANES_PER_COLUMN;
     const uint local_col = gl_SubgroupID * COLS_PER_SUBGROUP +
         gl_SubgroupInvocationID / LANES_PER_COLUMN;
     const uint col = gl_WorkGroupID.z * COLS_PER_WG + local_col;
     const uint state_base = head_id * S_V * S_V + col * S_V;
+    // Native broadcast only: mapped nodes fail closed on the host before
+    // this RBB path can be enqueued (no mapped RBB variant exists).
     const uint qk_head = head_id % neq1;
 
     // Eight runtime-sized vectors per (head, state column). The block solve
@@ -414,7 +423,11 @@ void main() {
         gl_SubgroupID * COLS_PER_SUBGROUP +
         (gl_SubgroupInvocationID / LANES_PER_COLUMN);
 
-    const uint iq1 = head_id % neq1;
+    // TP5 GDN head map: explicit Q/K head index for this V head, or the
+    // native uniform broadcast when absent.
+    const uint iq1 = (headmap & 0x80000000u) != 0u
+        ? ((headmap >> (3u * head_id)) & 0x7u)
+        : (head_id % neq1);
     const uint iq3 = seq_id / rq3;
 
     const uint state_size = S_V * S_V;

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace {
 
@@ -169,6 +170,49 @@ bool llama_tp5_plan_build(const llama_hparams & hp,
         for (uint32_t r = 0; r < n_devices; ++r) {
             out.kv_instances[r] = out.n_full * out.kv_role_counts[r];
         }
+
+        // --- Balanced QSA head map (opt-in GGML_TP5_QSA_HEADMAP=1) ---
+        // Q counts [5,5,5,5,4] with starts [0,5,10,15,20] over KV counts
+        // [1,1,2,1,1] with starts [0,0,0,1,1]: every rank computes a nonzero
+        // attention slice. The rank-local Q/KV integer ratio is NOT the true
+        // global GQA assignment (rank 2 holds Q heads from two KV groups), so
+        // FLASH_ATTN_EXT consumers must use the explicit local q->kv map
+        // (rank 2: [0,0,1,1,1]; all other ranks: all zeros).
+        if (llama_tp5_qsa_headmap_enabled()) {
+            static const int32_t Q_COUNT[5] = {5, 5, 5, 5, 4};
+            static const int32_t Q_START[5] = {0, 5, 10, 15, 20};
+            static const int32_t KV_COUNT[5] = {1, 1, 2, 1, 1};
+            static const int32_t KV_START[5] = {0, 0, 0, 1, 1};
+
+            const bool geometry_ok = n_devices == 5 && out.Nq == 24 && out.Nkv == 2 && out.da > 0 &&
+                                     out.da % 256 == 0 && out.n_full > 0;
+            if (!geometry_ok) {
+                err.code   = "TP5_E_QSA_HEADMAP";
+                err.detail = "balanced QSA head map requires 5 ranks, Nq=24, Nkv=2 and a head dim "
+                             "multiple of 256 (got ranks=" + std::to_string(n_devices) +
+                             ", Nq=" + std::to_string(out.Nq) + ", Nkv=" + std::to_string(out.Nkv) +
+                             ", da=" + std::to_string(out.da) + ")";
+                return false;
+            }
+            for (uint32_t r = 0; r < n_devices; ++r) {
+                out.q_role_counts[r]  = Q_COUNT[r];
+                out.kv_role_counts[r] = KV_COUNT[r];
+                out.kv_head_starts[r] = KV_START[r];
+                out.kv_instances[r]   = out.n_full * KV_COUNT[r];
+            }
+            out.local_qkv_map.assign(n_devices, {});
+            for (int64_t h = 0; h < out.Nq; ++h) {
+                const int64_t gkv = h / (out.Nq / out.Nkv);
+                for (uint32_t r = 0; r < n_devices; ++r) {
+                    for (int32_t l = 0; l < Q_COUNT[r]; ++l) {
+                        if (Q_START[r] + l == h) {
+                            out.local_qkv_map[r][l] = (int32_t) (gkv - KV_START[r]);
+                        }
+                    }
+                }
+            }
+            out.qsa_headmap = true;
+        }
     }
 
     // --- GDN V/state heads (TP5.md 8.1) ---
@@ -193,6 +237,84 @@ bool llama_tp5_plan_build(const llama_hparams & hp,
             err.detail = "head ranges do not cover all V heads";
             return false;
         }
+    }
+
+    // --- Balanced GDN head map (opt-in GGML_TP5_GDN_HEADMAP=1) ---
+    // Main-chosen paired-head assignment (see llama-tp5-plan.h). Adjacent V
+    // head pairs move together so 256-element ssm_out quant blocks stay whole;
+    // each rank keeps the unique QK heads its V heads reference. Native
+    // repeated-segment layout is kept when the flag is off (all arrays zero,
+    // gdn_headmap_enabled = false).
+    if (getenv("GGML_TP5_GDN_HEADMAP") && atoi(getenv("GGML_TP5_GDN_HEADMAP")) != 0) {
+        // Per-rank global V head order and unique QK head lists from Main's
+        // assignment (verified against /tmp/tp5-balanced-head-map-oracle.json:
+        // 48 unique V heads covered exactly once, 22 QK copies, all adjacent pairs).
+        static const int32_t V_ORDER[5][10] = {
+            { 0,  1, 16, 17, 32, 33,  2,  3, 18, 19},
+            {34, 35,  4,  5, 20, 21, 36, 37,  6,  7},
+            {22, 23, 38, 39,  8,  9, 24, 25, 40, 41},
+            {10, 11, 26, 27, 42, 43, 12, 13, 28, 29},
+            {44, 45, 14, 15, 30, 31, 46, 47,  0,  0},
+        };
+        static const int32_t V_COUNT[5] = {10, 10, 10, 10, 8};
+        static const int32_t QK_UNIQUE[5][6] = {
+            { 0,  1,  2,  3,  0, 0},
+            { 2,  3,  4,  5,  6, 7},
+            { 6,  7,  8,  9,  0, 0},
+            {10, 11, 12, 13,  0, 0},
+            {12, 13, 14, 15,  0, 0},
+        };
+        static const int32_t QK_COUNT[5] = {4, 6, 4, 4, 4};
+
+        const bool geometry_ok = out.Nv == 48 && out.Nk == 16 && n_devices == 5 && out.ds > 0 &&
+                                 (2 * out.ds) % 256 == 0; // V head PAIRS move together: 2*ds = one quant block
+        if (!geometry_ok) {
+            err.code = "TP5_E_GDN_HEADMAP";
+            err.detail = "balanced GDN head map requires Nv=48, Nk=16, 5 ranks and "
+                         "ssm_d_state pairs not quant-aligned, 2*ds % 256 != 0 (got Nv=" + std::to_string(out.Nv) +
+                         ", Nk=" + std::to_string(out.Nk) + ", ranks=" + std::to_string(n_devices) +
+                         ", ds=" + std::to_string(out.ds) + ")";
+            return false;
+        }
+        // Verify coverage: every global V head exactly once, every V pair adjacent,
+        // every referenced QK head present in the rank's unique list.
+        {
+            std::vector<int> v_seen(out.Nv, 0);
+            for (uint32_t r = 0; r < n_devices; ++r) {
+                for (int32_t i = 0; i < V_COUNT[r]; ++i) {
+                    const int32_t h = V_ORDER[r][i];
+                    if (h < 0 || h >= out.Nv) { err.code = "TP5_E_GDN_HEADMAP"; err.detail = "V head out of range"; return false; }
+                    v_seen[h]++;
+                    // pair invariant: every head's partner (h^1) must sit at
+                    // an adjacent slot so 256-element ssm_out quant blocks
+                    // (2*ds) stay inside single spans
+                    {
+                        const int32_t partner = h ^ 1;
+                        const bool adj = (i > 0 && V_ORDER[r][i - 1] == partner) ||
+                                        (i + 1 < V_COUNT[r] && V_ORDER[r][i + 1] == partner);
+                        if (!adj) {
+                            err.code = "TP5_E_GDN_HEADMAP"; err.detail = "V heads must move in adjacent pairs"; return false;
+                        }
+                    }
+                    const int32_t qk = h % out.Nk;
+                    bool found = false;
+                    for (int32_t q = 0; q < QK_COUNT[r]; ++q) {
+                        found = found || QK_UNIQUE[r][q] == qk;
+                    }
+                    if (!found) { err.code = "TP5_E_GDN_HEADMAP"; err.detail = "rank V head references QK head outside its unique list"; return false; }
+                }
+            }
+            for (int64_t h = 0; h < out.Nv; ++h) {
+                if (v_seen[h] != 1) { err.code = "TP5_E_GDN_HEADMAP"; err.detail = "V heads must be covered exactly once"; return false; }
+            }
+        }
+        for (uint32_t r = 0; r < n_devices; ++r) {
+            out.gdn_v_global_count[r]  = V_COUNT[r];
+            out.gdn_qk_unique_count[r] = QK_COUNT[r];
+            for (int32_t i = 0; i < V_COUNT[r]; ++i)  out.gdn_v_global[r][i]  = V_ORDER[r][i];
+            for (int32_t i = 0; i < QK_COUNT[r]; ++i) out.gdn_qk_unique[r][i] = QK_UNIQUE[r][i];
+        }
+        out.gdn_headmap_enabled = true;
     }
 
     out.expected_events = (uint32_t)(2 * out.L);
@@ -438,6 +560,12 @@ llama_tp5_tensor_plan llama_tp5_plan::plan_tensor(const std::string & name, cons
             return tp;
         }
         if (base == "ssm_a" || base == "ssm_dt.bias" || base == "ssm_norm.weight") {
+            if (gdn_headmap_enabled && base != "ssm_norm.weight") {
+                if (attention_layout(llama_tp5_semantic::GDN_SCALAR, llama_tp5_layout::SPLIT_AXIS0, 0))
+                    return tp;
+                for (uint32_t r = 0; r < ranks; ++r) tp.per_rank_len[r] = gdn_v_global_count[r];
+                return tp;
+            }
             tp.semantic = llama_tp5_semantic::GDN_PARAM;
             tp.layout = llama_tp5_layout::MIRRORED;
             return tp;
@@ -519,6 +647,96 @@ int64_t llama_tp5_gdn_qk_global_head(const llama_tp5_plan & plan, int64_t global
     return global_v_head % plan.Nk;
 }
 
+int32_t llama_tp5_gdn_local_qk(const llama_tp5_plan & plan, uint32_t rank, int32_t v_idx) {
+    if (!plan.gdn_headmap_enabled || rank >= plan.ranks ||
+            v_idx < 0 || v_idx >= plan.gdn_v_global_count[rank]) {
+        return -1;
+    }
+    const int32_t global_v  = plan.gdn_v_global[rank][v_idx];
+    const int32_t global_qk = (int32_t) llama_tp5_gdn_qk_global_head(plan, global_v);
+    for (int32_t q = 0; q < plan.gdn_qk_unique_count[rank]; ++q) {
+        if (plan.gdn_qk_unique[rank][q] == global_qk) {
+            return q;
+        }
+    }
+    return -1; // unreachable: plan build validated QK coverage
+}
+
+bool llama_tp5_gdn_headmap_stamp(const llama_tp5_plan & plan, uint32_t rank, struct ggml_tensor * gdn_node) {
+    if (!plan.gdn_headmap_enabled || rank >= plan.ranks || gdn_node == nullptr ||
+        gdn_node->op != GGML_OP_GATED_DELTA_NET || !gdn_node->src[0] || !gdn_node->src[1] ||
+        !gdn_node->src[2] || !gdn_node->src[5]) {
+        return false;
+    }
+    const int32_t count = plan.gdn_v_global_count[rank];
+    if (count < 1 || count > GGML_TP5_HEADMAP_MAX_ENTRIES ||
+        gdn_node->src[0]->ne[1] != plan.gdn_qk_unique_count[rank] ||
+        gdn_node->src[1]->ne[1] != plan.gdn_qk_unique_count[rank] ||
+        gdn_node->src[2]->ne[1] != count || gdn_node->src[5]->ne[2] != count) {
+        return false;
+    }
+    uint8_t local_qk[GGML_TP5_HEADMAP_MAX_ENTRIES] = {};
+    for (int32_t i = 0; i < count; ++i) {
+        const int32_t q = llama_tp5_gdn_local_qk(plan, rank, i);
+        if (q < 0 || q >= 8) {
+            return false;
+        }
+        local_qk[i] = (uint8_t) q;
+    }
+    ggml_tp5_headmap_set(gdn_node, local_qk, count);
+    return true;
+}
+
+bool llama_tp5_qsa_headmap_enabled(void) {
+    const char * env = getenv("GGML_TP5_QSA_HEADMAP");
+    return env && atoi(env) != 0;
+}
+
+int64_t llama_tp5_qsa_global_kv_head(const llama_tp5_plan & plan, int64_t global_q_head) {
+    if (plan.Nkv <= 0) {
+        return 0;
+    }
+    return global_q_head / (plan.Nq / plan.Nkv);
+}
+
+bool llama_tp5_qsa_headmap_stamp(const llama_tp5_plan & plan, uint32_t rank, struct ggml_tensor * fa_node) {
+    if (!plan.qsa_headmap || fa_node == nullptr || fa_node->op != GGML_OP_FLASH_ATTN_EXT) {
+        return false;
+    }
+    if (rank >= plan.ranks || rank >= plan.local_qkv_map.size()) {
+        return false;
+    }
+    const int32_t count = plan.q_role_counts[rank];
+    if (count <= 0 || count > GGML_TP5_HEADMAP_MAX_ENTRIES) {
+        return false;
+    }
+    // Only stamp nodes whose rank-local geometry matches the plan's Q/KV
+    // role counts; anything else is an ordinary node and stays native.
+    if (fa_node->src[0] == nullptr || fa_node->src[1] == nullptr || fa_node->src[2] == nullptr ||
+            fa_node->src[0]->ne[2] != count ||
+            fa_node->src[1]->ne[2] != plan.kv_role_counts[rank] ||
+            fa_node->src[2]->ne[2] != plan.kv_role_counts[rank]) {
+        return false;
+    }
+    // The map overlays the unused m0/m1 ALiBi push constants: fail closed on
+    // a mapped node that actually uses ALiBi instead of silently corrupting it.
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) fa_node->op_params + 1, sizeof(float));
+    if (max_bias != 0.0f) {
+        return false;
+    }
+    uint8_t map[GGML_TP5_HEADMAP_MAX_ENTRIES];
+    for (int32_t h = 0; h < count; ++h) {
+        const int32_t kv = plan.local_qkv_map[rank][h];
+        if (kv < 0 || kv >= 8) {
+            return false;
+        }
+        map[h] = (uint8_t) kv;
+    }
+    ggml_tp5_headmap_set(fa_node, map, count);
+    return true;
+}
+
 static bool tp5_name_matches(const char * name, const char * prefix) {
     return name && prefix && strncmp(name, prefix, strlen(prefix)) == 0;
 }
@@ -565,6 +783,89 @@ bool llama_tp5_try_apply_split_state(
             }
             return true;
         }
+        if (plan.gdn_headmap_enabled && tp5_name_matches(tensor_name, "cache_ple_r_l")) {
+            out.axis = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+            return true;
+        }
+        if (plan.gdn_headmap_enabled &&
+                (tp5_name_matches(tensor_name, "cache_r_l") || tp5_name_matches(tensor_name, "cache_s_l") ||
+                 tp5_name_matches(tensor_name, "cache_d_l"))) {
+            // Recurrent caches under the balanced GDN head map: the flat
+            // storage root is axis 0 with per-head (or per-head-pair for the
+            // 256-element state blocks) mapped spans following the same V
+            // order as the weights; derived 4D state views carry the map to
+            // axis 2 via the meta reshape propagation.
+            // Conv history has (kernel-1) consecutive values per channel;
+            // recurrent state has ds*ds consecutive values per V head.
+            const bool is_conv = tp5_name_matches(tensor_name, "cache_r_l");
+            out.axis = GGML_BACKEND_SPLIT_AXIS_0;
+            out.mapped_span = true;
+            out.n_segments = 1;
+            out.nr[0] = 1;
+            const int64_t channels = plan.ds * (2 * plan.Nk + plan.Nv);
+            GGML_ASSERT(is_conv ? tensor->ne[0] % channels == 0 :
+                                  tensor->ne[0] == plan.ds * plan.ds * plan.Nv);
+            const int64_t ds = is_conv ? plan.ds * (tensor->ne[0] / channels) : plan.ds * plan.ds;
+            GGML_ASSERT(ds > 0);
+            int32_t flat = 0;
+            for (uint32_t r = 0; r < plan.ranks; ++r) {
+                int32_t n_spans = 0;
+                if (is_conv) {
+                    // [Q unique | K unique | V ordered] like the QKV rows
+                    const int32_t nq = plan.gdn_qk_unique_count[r];
+                    for (int pass = 0; pass < 2; ++pass) {
+                        const int64_t off = pass == 0 ? 0 : plan.Nk * ds;
+                        int32_t i = 0;
+                        while (i < nq) {
+                            int32_t run = 1;
+                            while (i + run < nq &&
+                                   plan.gdn_qk_unique[r][i + run] == plan.gdn_qk_unique[r][i + run - 1] + 1) {
+                                ++run;
+                            }
+                            out.span_start[flat] = off + (int64_t) plan.gdn_qk_unique[r][i] * ds;
+                            out.span_len[flat]   = run * ds;
+                            ++flat; ++n_spans;
+                            i += run;
+                        }
+                    }
+                    // V ordered at 2*Nk*ds
+                    {
+                        int32_t i = 0;
+                        const int32_t nv = plan.gdn_v_global_count[r];
+                        while (i < nv) {
+                            int32_t run = 1;
+                            while (i + run < nv &&
+                                   plan.gdn_v_global[r][i + run] == plan.gdn_v_global[r][i + run - 1] + 1) {
+                                ++run;
+                            }
+                            out.span_start[flat] = 2 * plan.Nk * ds + (int64_t) plan.gdn_v_global[r][i] * ds;
+                            out.span_len[flat]   = run * ds;
+                            ++flat; ++n_spans;
+                            i += run;
+                        }
+                    }
+                    out.ne[r] = 2 * ds * nq + ds * plan.gdn_v_global_count[r];
+                } else {
+                    // One span per contiguous V-head run, in state elements.
+                    const int32_t nv = plan.gdn_v_global_count[r];
+                    int32_t i = 0;
+                    while (i < nv) {
+                        int32_t run = 1;
+                        while (i + run < nv &&
+                               plan.gdn_v_global[r][i + run] == plan.gdn_v_global[r][i + run - 1] + 1) {
+                            ++run;
+                        }
+                        out.span_start[flat] = (int64_t) plan.gdn_v_global[r][i] * ds;
+                        out.span_len[flat]   = run * ds;
+                        ++flat; ++n_spans;
+                        i += run;
+                    }
+                    out.ne[r] = ds * nv;
+                }
+                out.span_count[r] = n_spans;
+            }
+            return true;
+        }
         return false;
     }
 
@@ -582,11 +883,145 @@ bool llama_tp5_try_apply_split_state(
     }
 
     // The loaded GDN tensors retain their native [Q, K, V] layout; no
-    // Q/K expansion or V-head prearrangement is performed by the loader.
-    // Use llama-model.cpp's existing repeated-segment split for ALL GDN
-    // weights, just as for their recurrent caches. In particular dt/A are
-    // per-head parameters, not broadcast scalars. Mixing contiguous plan
-    // slices with segmented cache ownership corrupts both conv and decay.
+    // Balanced GDN head map (opt-in GGML_TP5_GDN_HEADMAP=1): GDN weights and
+    // recurrent caches are expressed as bounded mapped spans over the
+    // original element ranges instead of the native repeated-segment split.
+    // QKV/conv rows are [Q unique | K unique | V ordered] per rank: whole
+    // quant-row copies, no requantization; V/state/output columns keep the
+    // same global V identities (48 covered exactly once). With the flag off,
+    // the native repeated-segment fallback below is used unchanged.
+    if (plan.gdn_headmap_enabled) {
+        const int64_t ds = plan.ds;
+        // per-rank unique QK head spans: each QK head h contributes a Q span
+        // [h*ds,(h+1)*ds) and a K span [Nk*ds + h*ds, Nk*ds + (h+1)*ds) —
+        // adjacent Q/K pairs coalesce into one span each where contiguous.
+        // Local storage layout is [ALL unique Q][ALL unique K][V ordered]:
+        // emit the full Q pass first, then the full K pass (coalescing
+        // contiguous runs inside each pass), then the V spans.
+        auto push_qk_spans = [&](uint32_t r, int32_t & n_spans, int32_t & flat, int64_t k_off) {
+            const int32_t nq = plan.gdn_qk_unique_count[r];
+            for (int pass = 0; pass < 2; ++pass) {
+                const int64_t off = pass == 0 ? 0 : k_off;
+                int32_t i = 0;
+                while (i < nq) {
+                    int32_t run = 1;
+                    while (i + run < nq &&
+                           plan.gdn_qk_unique[r][i + run] == plan.gdn_qk_unique[r][i + run - 1] + 1) {
+                        ++run;
+                    }
+                    const int32_t h = plan.gdn_qk_unique[r][i];
+                    out.span_start[flat] = off + (int64_t) h * ds;
+                    out.span_len[flat]   = run * ds;
+                    ++flat; ++n_spans;
+                    i += run;
+                }
+            }
+        };
+        auto push_v_spans = [&](uint32_t r, int32_t & n_spans, int32_t & flat, int64_t v_off) {
+            const int32_t nv = plan.gdn_v_global_count[r];
+            int32_t i = 0;
+            while (i < nv) {
+                int32_t run = 1;
+                while (i + run < nv &&
+                       plan.gdn_v_global[r][i + run] == plan.gdn_v_global[r][i + run - 1] + 1) {
+                    ++run;
+                }
+                out.span_start[flat] = v_off + (int64_t) plan.gdn_v_global[r][i] * ds;
+                out.span_len[flat]   = run * ds;
+                ++flat; ++n_spans;
+                i += run;
+            }
+        };
+
+        switch (tp.semantic) {
+            case llama_tp5_semantic::GDN_QKV:
+            case llama_tp5_semantic::GDN_CONV: {
+                // rows: [Q unique | K unique | V ordered] (axis 1)
+                out.axis = GGML_BACKEND_SPLIT_AXIS_1;
+                out.mapped_span = true;
+                out.n_segments = 1;
+                out.nr[0] = 1;
+                int32_t flat = 0;
+                for (uint32_t r = 0; r < plan.ranks; ++r) {
+                    int32_t n_spans = 0;
+                    push_qk_spans(r, n_spans, flat, plan.Nk * ds);
+                    push_v_spans(r, n_spans, flat, 2 * plan.Nk * ds);
+                    out.span_count[r] = n_spans;
+                    // local rows: Q unique + K unique + V ordered
+                    out.ne[r] = 2 * ds * plan.gdn_qk_unique_count[r] +
+                                ds * plan.gdn_v_global_count[r];
+                }
+                return true;
+            }
+            case llama_tp5_semantic::GDN_GATE: {
+                // gate rows: V ordered (axis 1)
+                out.axis = GGML_BACKEND_SPLIT_AXIS_1;
+                out.mapped_span = true;
+                out.n_segments = 1;
+                out.nr[0] = 1;
+                int32_t flat = 0;
+                for (uint32_t r = 0; r < plan.ranks; ++r) {
+                    int32_t n_spans = 0;
+                    push_v_spans(r, n_spans, flat, 0);
+                    out.span_count[r] = n_spans;
+                    out.ne[r] = ds * plan.gdn_v_global_count[r];
+                }
+                return true;
+            }
+            case llama_tp5_semantic::GDN_OUT: {
+                // ssm_out columns: V ordered (axis 0); whole 256-element
+                // original head-pair blocks stay inside single spans.
+                out.axis = GGML_BACKEND_SPLIT_AXIS_0;
+                out.mapped_span = true;
+                out.n_segments = 1;
+                out.nr[0] = 1;
+                int32_t flat = 0;
+                for (uint32_t r = 0; r < plan.ranks; ++r) {
+                    int32_t n_spans = 0;
+                    push_v_spans(r, n_spans, flat, 0);
+                    out.span_count[r] = n_spans;
+                    out.ne[r] = ds * plan.gdn_v_global_count[r];
+                }
+                return true;
+            }
+            case llama_tp5_semantic::GDN_SCALAR: {
+                // Projection rows and per-head dt/A vectors share V identity.
+                out.axis = ggml_backend_meta_split_axis(tp.split_axis);
+                out.mapped_span = true;
+                out.n_segments = 1;
+                out.nr[0] = 1;
+                int32_t flat = 0;
+                for (uint32_t r = 0; r < plan.ranks; ++r) {
+                    const int32_t nv = plan.gdn_v_global_count[r];
+                    int32_t n_spans = 0;
+                    int32_t i = 0;
+                    while (i < nv) {
+                        int32_t run = 1;
+                        while (i + run < nv &&
+                               plan.gdn_v_global[r][i + run] == plan.gdn_v_global[r][i + run - 1] + 1) {
+                            ++run;
+                        }
+                        out.span_start[flat] = plan.gdn_v_global[r][i];
+                        out.span_len[flat]   = run;
+                        ++flat; ++n_spans;
+                        i += run;
+                    }
+                    out.span_count[r] = n_spans;
+                    out.ne[r] = nv;
+                }
+                return true;
+            }
+            default:
+                break;
+        }
+    }
+
+    // Native fallback (flag off): the loaded GDN tensors retain their native
+    // [Q, K, V] layout; llama-model.cpp's existing repeated-segment split is
+    // used for ALL GDN weights, just as for their recurrent caches. In
+    // particular dt/A are per-head parameters, not broadcast scalars. Mixing
+    // contiguous plan slices with segmented cache ownership corrupts both
+    // conv and decay.
     switch (tp.semantic) {
         case llama_tp5_semantic::GDN_QKV:
         case llama_tp5_semantic::GDN_CONV:
@@ -666,20 +1101,26 @@ bool llama_tp5_plan::validate(const llama_hparams & hp, uint32_t n_devices, llam
     int64_t q_sum = 0, v_sum = 0;
     for (uint32_t r = 0; r < ranks; ++r) {
         const int64_t nq = q_role_counts[r], nkv = kv_role_counts[r];
-        if (nq <= 0 || nkv <= 0 || nq % nkv != 0 || kv_head_starts[r] < 0 || kv_head_starts[r] + nkv > Nkv) {
+        // With the QSA head map the rank-local Q/KV ratio may be nonuniform
+        // (rank 2: Q5 over KV2), so the integer-ratio check only applies to
+        // the native layout. The mapped assignment itself is verified below.
+        if (nq <= 0 || nkv <= 0 || kv_head_starts[r] < 0 || kv_head_starts[r] + nkv > Nkv ||
+                (!qsa_headmap && nq % nkv != 0)) {
             err.code   = "TP5_E_Q_SPLIT";
             err.detail = "invalid rank-local GQA ratio or KV range at rank " + std::to_string(r);
             return false;
         }
-        for (int64_t h = 0; h < nq; ++h) {
-            const int64_t global_q = (replicate_attention ? 0 : q_sum) + h;
-            if (kv_head_starts[r] + h / (nq / nkv) != global_q / (Nq / Nkv)) {
-                err.code   = "TP5_E_Q_SPLIT";
-                err.detail = "rank-local GQA selects a different global KV head at rank " + std::to_string(r);
-                return false;
+        if (!qsa_headmap) {
+            for (int64_t h = 0; h < nq; ++h) {
+                const int64_t global_q = (replicate_attention ? 0 : q_sum) + h;
+                if (kv_head_starts[r] + h / (nq / nkv) != global_q / (Nq / Nkv)) {
+                    err.code   = "TP5_E_Q_SPLIT";
+                    err.detail = "rank-local GQA selects a different global KV head at rank " + std::to_string(r);
+                    return false;
+                }
             }
         }
-        q_sum += q_role_counts[r];
+        q_sum += nq;
         v_sum += gdn_v_heads[r];
     }
     const int64_t copies = replicate_attention ? ranks : 1;
@@ -692,6 +1133,23 @@ bool llama_tp5_plan::validate(const llama_hparams & hp, uint32_t n_devices, llam
         err.code   = "TP5_E_GDN_SPLIT";
         err.detail = "gdn heads do not cover all V heads";
         return false;
+    }
+    if (qsa_headmap) {
+        if (local_qkv_map.size() != ranks) {
+            err.code   = "TP5_E_QSA_HEADMAP";
+            err.detail = "local q->kv map missing for the mapped layout";
+            return false;
+        }
+        for (uint32_t r = 0; r < ranks; ++r) {
+            for (int32_t h = 0; h < q_role_counts[r]; ++h) {
+                const int32_t kv = local_qkv_map[r][h];
+                if (kv < 0 || kv >= kv_role_counts[r]) {
+                    err.code   = "TP5_E_QSA_HEADMAP";
+                    err.detail = "local q->kv map out of range at rank " + std::to_string(r);
+                    return false;
+                }
+            }
+        }
     }
     return true;
 }

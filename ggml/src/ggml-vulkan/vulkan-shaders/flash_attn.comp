@@ -884,8 +884,15 @@ void sparse_main() {
             slope = perElemOpComputeSlope(r, 0u, ACC_TYPE(0), iq2);
         }
 
-        uint kh = cur_head / (p.neq2 / p.nek2);
-        uint vh = cur_head / (p.neq2 / p.nev2);
+        uint kh, vh;
+        if ((p.mask_n_head_log2 & TP5_HEADMAP_FLAG) != 0u) {
+            // TP5 QSA explicit head map: no integer GQA ratio assumption.
+            kh = tp5_headmap_entry(cur_head);
+            vh = kh;
+        } else {
+            kh = cur_head / (p.neq2 / p.nek2);
+            vh = cur_head / (p.neq2 / p.nev2);
+        }
         uint k_offset = (kh * p.nb12 + ik3 * p.nb13) / FaBlockBytesK;
         uint v_offset = (vh * p.nb22 + iv3 * p.nb23) / FaBlockBytesV;
 

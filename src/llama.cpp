@@ -157,10 +157,15 @@ int64_t llama_time_us(void) {
     return ggml_time_us();
 }
 
-static void llama_prepare_tp5_plan(llama_model * model, size_t n_devs) {
+static bool llama_prepare_tp5_plan(llama_model * model, ggml_backend_dev_t * devices, size_t n_devs) {
     model->get_split_state_ud.has_tp5_plan = false;
+    const char * gdn_map = getenv("GGML_TP5_GDN_HEADMAP");
+    const bool mapping_requested = (gdn_map && atoi(gdn_map) != 0) || llama_tp5_qsa_headmap_enabled();
     if ((model->arch != LLM_ARCH_QWEN4EXP && model->arch != LLM_ARCH_DEEPSEEK4) || n_devs < 2) {
-        return;
+        if (mapping_requested) {
+            LLAMA_LOG_ERROR("%s: requested TP5 head map is unsupported for this model/device layout\n", __func__);
+        }
+        return !mapping_requested;
     }
     llama_tp5_error err;
     const int64_t n_vocab = model->vocab.n_tokens();
@@ -168,13 +173,42 @@ static void llama_prepare_tp5_plan(llama_model * model, size_t n_devs) {
     const bool      replicate_attention = replicate_env && atoi(replicate_env) != 0;
     if (llama_tp5_plan_build(model->hparams, (uint32_t) n_devs, n_vocab, replicate_attention,
                              model->get_split_state_ud.tp5_plan, err)) {
+        if (mapping_requested) {
+            for (size_t rank = 0; rank < n_devs; ++rank) {
+                const char * backend = ggml_backend_reg_name(ggml_backend_dev_backend_reg(devices[rank]));
+                if (strcmp(backend, "CPU") != 0 && strcmp(backend, "Vulkan") != 0) {
+                    LLAMA_LOG_ERROR("%s: device %s (%s) does not support the TP5 head-map ABI\n",
+                                    __func__, ggml_backend_dev_name(devices[rank]), backend);
+                    return false;
+                }
+            }
+        }
         model->get_split_state_ud.has_tp5_plan = true;
+        const llama_tp5_plan & tp5 = model->get_split_state_ud.tp5_plan;
+        if (tp5.gdn_headmap_enabled) {
+            // Explicit opt-in mapped layout: print the real per-rank V/QK
+            // geometry so diagnostics distinguish the mapped layout from the
+            // native repeated-segment fallback (never claim balanced counts
+            // when the native path is active).
+            std::string v_counts, qk_counts;
+            for (uint32_t r = 0; r < tp5.ranks; ++r) {
+                if (r > 0) { v_counts += "/"; qk_counts += "/"; }
+                v_counts += std::to_string(tp5.gdn_v_global_count[r]);
+                qk_counts += std::to_string(tp5.gdn_qk_unique_count[r]);
+            }
+            LLAMA_LOG_INFO("%s: TP5 GDN head map ACTIVE (GGML_TP5_GDN_HEADMAP=1): per-rank V [%s], unique QK [%s], "
+                           "local QKV rows [Q unique | K unique | V ordered]\n", __func__, v_counts.c_str(), qk_counts.c_str());
+        } else {
+            LLAMA_LOG_INFO("%s: TP5 GDN head map disabled (native repeated-segment fallback; set GGML_TP5_GDN_HEADMAP=1 to enable)\n", __func__);
+        }
         LLAMA_LOG_INFO("%s: TP5 plan active for %s (%zu ranks, %u collective events/token)\n", __func__,
                        llm_arch_name(model->arch), n_devs, model->get_split_state_ud.tp5_plan.expected_events);
     } else {
         LLAMA_LOG_WARN("%s: TP5 plan not built for %s: %s %s\n", __func__, llm_arch_name(model->arch), err.code.c_str(),
                        err.detail.c_str());
+        return !mapping_requested;
     }
+    return true;
 }
 
 // returns true on success
@@ -196,7 +230,9 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
             model->get_split_state_ud.n_devices = n_devs;
             model->get_split_state_ud.model = model;
-            llama_prepare_tp5_plan(model, n_devs);
+            if (!llama_prepare_tp5_plan(model, params.devices, n_devs)) {
+                return false;
+            }
             model->devices.push_back({
                 true, ggml_backend_meta_device(
                 params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
@@ -238,7 +274,9 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             GGML_ASSERT(!devs.empty());
             model->get_split_state_ud.n_devices = devs.size();
             model->get_split_state_ud.model     = model;
-            llama_prepare_tp5_plan(model, devs.size());
+            if (!llama_prepare_tp5_plan(model, devs.data(), devs.size())) {
+                return false;
+            }
             gpus.push_back({
                 true, ggml_backend_meta_device(
                 devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)

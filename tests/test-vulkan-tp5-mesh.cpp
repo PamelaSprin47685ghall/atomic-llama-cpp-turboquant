@@ -617,7 +617,7 @@ static void run_cached_compute_chain_regression(void * comm, bool is_f16_wire) {
     const size_t                 P        = g_backends.size();
     const size_t                 elements = 32;
     std::vector<ggml_tensor *>   a(P), b(P);
-    std::vector<rank_step_graph> even, odd;
+    std::vector<rank_step_graph> even, odd, alt;
     for (size_t rank = 0; rank < P; ++rank) {
         a[rank] = alloc_tensor(g_backends[rank], elements);
         b[rank] = alloc_tensor(g_backends[rank], elements);
@@ -625,15 +625,23 @@ static void run_cached_compute_chain_regression(void * comm, bool is_f16_wire) {
         fill_tensor(b[rank], std::vector<float>(elements, 0.0f));
         even.push_back(create_rank_step_graph(g_backends[rank], b[rank], a[rank], elements, rank, false, true));
         odd.push_back(create_rank_step_graph(g_backends[rank], a[rank], b[rank], elements, rank, true, true));
+        // Alternative tail compute graph: uses a different rank-scaled bias formula to produce distinct observable values
+        alt.push_back(create_rank_step_graph(g_backends[rank], b[rank], a[rank], elements, rank, false, true));
+        std::vector<float> alt_bias(elements);
+        for (size_t e = 0; e < elements; ++e) {
+            alt_bias[e] = float(int(rank + 1) * 11 + int(e % 5) * 4 + 7) * 0.125f;
+        }
+        fill_tensor(alt[rank].bias, alt_bias);
         // First-ever scratch growth can cancel recording; the second pass
         // records both graphs in the final scratch generation.
         for (int warmup = 0; warmup < 2; ++warmup) {
             TEST_ASSERT(ggml_backend_graph_compute(g_backends[rank], even[rank].gf) == GGML_STATUS_SUCCESS);
             TEST_ASSERT(ggml_backend_graph_compute(g_backends[rank], odd[rank].gf) == GGML_STATUS_SUCCESS);
+            TEST_ASSERT(ggml_backend_graph_compute(g_backends[rank], alt[rank].gf) == GGML_STATUS_SUCCESS);
         }
     }
     for (int steps : { 65, 66 }) {
-        std::vector<std::vector<void *>> even_cbs(P), odd_cbs(P);
+        std::vector<std::vector<void *>> even_cbs(P), odd_cbs(P), alt_cbs(P);
         for (size_t rank = 0; rank < P; ++rank) {
             std::vector<float> input(elements);
             for (size_t e = 0; e < elements; ++e)
@@ -641,6 +649,7 @@ static void run_cached_compute_chain_regression(void * comm, bool is_f16_wire) {
             fill_tensor(b[rank], input);
             TEST_ASSERT(g_get_cached_cmd_bufs(g_backends[rank], even[rank].gf, even_cbs[rank]));
             TEST_ASSERT(g_get_cached_cmd_bufs(g_backends[rank], odd[rank].gf, odd_cbs[rank]));
+            TEST_ASSERT(g_get_cached_cmd_bufs(g_backends[rank], alt[rank].gf, alt_cbs[rank]));
         }
         std::vector<std::vector<std::vector<void *>>> cbs(steps + 1);
         std::vector<std::vector<ggml_tensor *>>       tensors(steps);
@@ -653,25 +662,85 @@ static void run_cached_compute_chain_regression(void * comm, bool is_f16_wire) {
         auto invalid_cbs = cbs;
         invalid_cbs.back()[0].push_back(nullptr);
         TEST_ASSERT(!g_submit_epoch_chain(comm, invalid_cbs, tensors));
-        TEST_ASSERT(g_submit_epoch_chain(comm, cbs, tensors));
-        for (auto backend : g_backends)
-            ggml_backend_synchronize(backend);
+
         std::vector<std::vector<float>> oracle;
         compute_cpu_timeline_oracle(P, elements, steps, is_f16_wire, oracle);
-        const auto & result = steps % 2 == 0 ? a : b;
-        for (size_t rank = 0; rank < P; ++rank) {
-            std::vector<float> output(elements);
-            read_tensor(result[rank], output);
-            for (size_t e = 0; e < elements; ++e) {
-                const float tail_bias = steps % 2 == 0 ? float(int(rank + 1) * 3 + int(e % 7) * 2 - 5) * 0.125f :
-                                                         float(int(rank + 1) * 5 + int(e % 11) * 2 - 9) * 0.125f;
-                const float expected  = oracle[rank][e] * 0.125f + tail_bias;
-                TEST_ASSERT(std::isfinite(output[e]) && output[e] == expected);
+
+        auto run_pass = [&](const std::vector<std::vector<std::vector<void *>>> & pass_cbs, bool has_tail,
+                            bool is_alt_tail) {
+            for (size_t rank = 0; rank < P; ++rank) {
+                std::vector<float> input(elements);
+                for (size_t e = 0; e < elements; ++e) {
+                    input[e] = float(int(rank + 1) * 7 + int(e % 13) * 3 - 11) * 0.25f;
+                }
+                fill_tensor(b[rank], input);
             }
+            for (auto backend : g_backends) {
+                ggml_backend_synchronize(backend);
+            }
+            TEST_ASSERT(g_submit_epoch_chain(comm, pass_cbs, tensors));
+            for (auto backend : g_backends) {
+                ggml_backend_synchronize(backend);
+            }
+
+            // The last AllReduce writes stage tensor[steps - 1] (steps % 2 == 0 ? b : a).
+            // When tail compute is present, it computes from tensor[steps - 1] into destination (steps % 2 == 0 ? a : b).
+            // When tail compute is empty, tensor[steps - 1] holds the final reduction output.
+            const auto & target_tensors = has_tail ? (steps % 2 == 0 ? a : b) : (steps % 2 == 0 ? b : a);
+            for (size_t rank = 0; rank < P; ++rank) {
+                std::vector<float> output(elements);
+                read_tensor(target_tensors[rank], output);
+                for (size_t e = 0; e < elements; ++e) {
+                    float expected = oracle[rank][e];
+                    if (has_tail) {
+                        const float tail_bias =
+                            is_alt_tail ? float(int(rank + 1) * 11 + int(e % 5) * 4 + 7) * 0.125f :
+                                          (steps % 2 == 0 ? float(int(rank + 1) * 3 + int(e % 7) * 2 - 5) * 0.125f :
+                                                            float(int(rank + 1) * 5 + int(e % 11) * 2 - 9) * 0.125f);
+                        expected = expected * 0.125f + tail_bias;
+                    }
+                    TEST_ASSERT(std::isfinite(output[e]) && output[e] == expected);
+                }
+            }
+        };
+
+        // Initial cold execution
+        run_pass(cbs, true, false);
+        // Replay with warm template
+        run_pass(cbs, true, false);
+
+        // Transition to empty tail compute CBs
+        auto cbs_empty = cbs;
+        for (size_t rank = 0; rank < P; ++rank) {
+            cbs_empty.back()[rank].clear();
         }
-        fprintf(stderr, "  cached GPU compute -> AR -> final compute: %d reductions, exact CPU oracle: OK\n", steps);
+        run_pass(cbs_empty, false, false);
+        // Replay empty tail template
+        run_pass(cbs_empty, false, false);
+
+        // Transition to equal-count different-handle compute tail (distinguishes CB identity vs count)
+        auto cbs_alt = cbs;
+        for (size_t rank = 0; rank < P; ++rank) {
+            cbs_alt.back()[rank] = alt_cbs[rank];
+        }
+        // The alternate graph reads b and writes a, matching the even chain tail.
+        if (steps % 2 == 0) {
+            for (size_t rank = 0; rank < P; ++rank) {
+                TEST_ASSERT(alt_cbs[rank].size() == even_cbs[rank].size());
+            }
+            run_pass(cbs_alt, true, true);
+            run_pass(cbs_alt, true, true);
+        }
+
+        // Transition back to original tail compute CBs
+        run_pass(cbs, true, false);
+        run_pass(cbs, true, false);
+
+        fprintf(stderr,
+                "  cached GPU compute -> AR -> final compute (%d reductions, replay, empty/restored tail): OK\n",
+                steps);
     }
-    for (auto * graphs : { &even, &odd }) {
+    for (auto * graphs : { &even, &odd, &alt }) {
         for (auto & graph : *graphs) {
             ggml_backend_buffer_free(graph.buf);
             ggml_free(graph.ctx);
@@ -877,6 +946,95 @@ static void run_epoch_chain_regression(void * comm, const std::vector<ggml_backe
                                     "FAIL: tail guard byte corruption at byte %zu in call %d stage %zu rank %zu (got "
                                     "0x%02x != 0x55)\n",
                                     b, call_idx, s, j, tail_check[b]);
+                            g_failures++;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Immediate unchanged replay on warm compiled-chain template:
+        // Refill stage tensors with fresh values, recompute CPU oracle, and verify template replay
+        for (size_t s = 0; s < N_STAGES; ++s) {
+            stage_data[s].cpu_expect.assign(n_elems, 0.0f);
+            const bool is_view_stage = (s % 4 == 2);
+            for (size_t j = 0; j < P; ++j) {
+                if (is_view_stage && stage_data[s].view_parents[j]) {
+                    std::vector<uint8_t> head_guard(stage_data[s].head_guard_bytes, 0xAA);
+                    std::vector<uint8_t> tail_guard(stage_data[s].tail_guard_bytes, 0x55);
+                    ggml_backend_tensor_set(stage_data[s].view_parents[j], head_guard.data(), 0,
+                                            stage_data[s].head_guard_bytes);
+                    ggml_backend_tensor_set(stage_data[s].view_parents[j], tail_guard.data(),
+                                            stage_data[s].head_guard_bytes + n_elems * sizeof(float),
+                                            stage_data[s].tail_guard_bytes);
+                }
+                for (size_t e = 0; e < n_elems; ++e) {
+                    float val = generate_test_val((int) (call_idx * 100 + s + 50), (int) (s + 7), j, e, true, true);
+                    stage_data[s].cpu_inputs[j][e] = val;
+                }
+                fill_tensor(stage_data[s].tensors[j], stage_data[s].cpu_inputs[j]);
+            }
+            for (size_t e = 0; e < n_elems; ++e) {
+                float sum = 0.0f;
+                for (size_t j = 0; j < P; ++j) {
+                    float v = stage_data[s].cpu_inputs[j][e];
+                    sum += is_f16_wire ? ggml_fp16_to_fp32(ggml_fp32_to_fp16(v)) : v;
+                }
+                stage_data[s].cpu_expect[e] = sum;
+            }
+        }
+        for (size_t j = 0; j < P; ++j) {
+            ggml_backend_synchronize(backends[j]);
+        }
+        ok = g_submit_epoch_chain(comm, stage_cbs, stage_tensors);
+        if (!ok) {
+            fprintf(stderr, "FAIL: submit_epoch_chain replay returned false for call %d (%zu stages)\n", call_idx,
+                    N_STAGES);
+            g_failures++;
+            return;
+        }
+        for (size_t j = 0; j < P; ++j) {
+            ggml_backend_synchronize(backends[j]);
+        }
+        for (size_t s = 0; s < N_STAGES; ++s) {
+            for (size_t j = 0; j < P; ++j) {
+                std::vector<float> got(n_elems);
+                read_tensor(stage_data[s].tensors[j], got);
+                for (size_t e = 0; e < n_elems; ++e) {
+                    float expect = stage_data[s].cpu_expect[e];
+                    float actual = got[e];
+                    if (!std::isfinite(actual) || !std::isfinite(expect) || actual != expect) {
+                        if (g_failures < 10) {
+                            fprintf(stderr,
+                                    "MISMATCH (chain replay call %d stage %zu) rank=%zu elem=%zu got=%f expect=%f\n",
+                                    call_idx, s, j, e, actual, expect);
+                        }
+                        g_failures++;
+                    }
+                }
+                if (stage_data[s].head_guard_bytes > 0 && stage_data[s].view_parents[j]) {
+                    std::vector<uint8_t> head_check(stage_data[s].head_guard_bytes);
+                    ggml_backend_tensor_get(stage_data[s].view_parents[j], head_check.data(), 0,
+                                            stage_data[s].head_guard_bytes);
+                    for (size_t b = 0; b < stage_data[s].head_guard_bytes; ++b) {
+                        if (head_check[b] != 0xAA) {
+                            fprintf(stderr,
+                                    "FAIL: head guard byte corruption on replay in call %d stage %zu rank %zu\n",
+                                    call_idx, s, j);
+                            g_failures++;
+                            break;
+                        }
+                    }
+                    std::vector<uint8_t> tail_check(stage_data[s].tail_guard_bytes);
+                    const size_t         tail_offset = stage_data[s].head_guard_bytes + n_elems * sizeof(float);
+                    ggml_backend_tensor_get(stage_data[s].view_parents[j], tail_check.data(), tail_offset,
+                                            stage_data[s].tail_guard_bytes);
+                    for (size_t b = 0; b < stage_data[s].tail_guard_bytes; ++b) {
+                        if (tail_check[b] != 0x55) {
+                            fprintf(stderr,
+                                    "FAIL: tail guard byte corruption on replay in call %d stage %zu rank %zu\n",
+                                    call_idx, s, j);
                             g_failures++;
                             break;
                         }
@@ -1153,6 +1311,7 @@ static void run_hc_sum_regression(void * comm) {
     struct consumer {
         ggml_cgraph * producer_graph;
         ggml_cgraph * graph;
+        ggml_cgraph * ineligible_graph;
         ggml_tensor * source;
         ggml_tensor * block;
         ggml_tensor * residual;
@@ -1162,6 +1321,7 @@ static void run_hc_sum_regression(void * comm) {
         ggml_tensor * combined;
         ggml_tensor * normalized;
         ggml_tensor * output;
+        ggml_tensor * ineligible_output;
     };
 
     std::vector<consumer>                   consumers(ranks);
@@ -1204,9 +1364,33 @@ static void run_hc_sum_regression(void * comm) {
             ggml_set_output(t);
         p.graph = ggml_new_graph_custom(ctx, 128, false);
         ggml_build_forward_expand(p.graph, p.output);
+
+        // Alternate consumer graph for HC eligible -> ineligible transition regression:
+        // Takes the SAME producer wire block tensor (outputs[0] == p.block) from stage 0,
+        // but uses a replay-eligible decode matmul (weight * block + bias) that lacks
+        // the 6-tensor HC pattern, so ggml_vk_tp5_hc_consumer returns false.
+        auto * inel_weight  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, width);
+        auto * inel_bias    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+        p.ineligible_output = ggml_add(ctx, ggml_mul_mat(ctx, inel_weight, p.block), inel_bias);
+        ggml_set_output(p.ineligible_output);
+        p.ineligible_graph = ggml_new_graph_custom(ctx, 32, false);
+        ggml_build_forward_expand(p.ineligible_graph, p.ineligible_output);
+
         auto buffer = ggml_backend_alloc_ctx_tensors(ctx, g_backends[rank]);
         TEST_ASSERT(buffer);
         g_allocated_buffers.push_back(buffer);
+
+        std::vector<float> inel_w_diag(width * width, 0.0f);
+        for (int i = 0; i < width; ++i) {
+            inel_w_diag[i * width + i] = 2.0f;
+        }
+        ggml_backend_tensor_set(inel_weight, inel_w_diag.data(), 0, inel_w_diag.size() * sizeof(float));
+        std::vector<float> inel_b(width);
+        for (int i = 0; i < width; ++i) {
+            inel_b[i] = float((int(rank + 1) * 7 + i % 19) % 23 - 11) * 0.125f;
+        }
+        ggml_backend_tensor_set(inel_bias, inel_b.data(), 0, inel_b.size() * sizeof(float));
+
         int seed = 0;
         for (auto * weight : { inject_weight, down_weight, up_weight }) {
             std::vector<float> values(ggml_nelements(weight));
@@ -1297,6 +1481,141 @@ static void run_hc_sum_regression(void * comm) {
             for (int e = 0; e < width; ++e)
                 TEST_ASSERT(std::isfinite(values[e]) && values[e] == expected[round][e]);
         }
+    }
+
+    {
+        std::vector<std::vector<ggml_tensor *>> inel_outputs(2, std::vector<ggml_tensor *>(ranks));
+        for (size_t rank = 0; rank < ranks; ++rank) {
+            inel_outputs[0][rank] = consumers[rank].block;
+            inel_outputs[1][rank] = consumers[rank].ineligible_output;
+        }
+
+        // Precompute references with prepare_graph(false) then warm cache entries with prepare_graph(true)
+        const int                       inel_rounds = 2;
+        std::vector<std::vector<float>> inel_expected(inel_rounds, std::vector<float>(width, 0.0f));
+        for (int r = 0; r < inel_rounds; ++r) {
+            inputs(10 + r);
+            for (size_t rank = 0; rank < ranks; ++rank) {
+                auto & p = consumers[rank];
+                TEST_ASSERT(g_prepare_graph(comm, rank, p.producer_graph, false));
+                TEST_ASSERT(ggml_backend_graph_compute_async(g_backends[rank], p.producer_graph) ==
+                            GGML_STATUS_SUCCESS);
+            }
+            TEST_ASSERT(g_allreduce(comm, inel_outputs[0].data()));
+            for (size_t rank = 0; rank < ranks; ++rank) {
+                auto & p = consumers[rank];
+                TEST_ASSERT(g_prepare_graph(comm, rank, p.ineligible_graph, false));
+                TEST_ASSERT(ggml_backend_graph_compute(g_backends[rank], p.ineligible_graph) == GGML_STATUS_SUCCESS);
+                std::vector<float> values(width);
+                read_tensor(p.ineligible_output, values);
+                for (int e = 0; e < width; ++e) {
+                    inel_expected[r][e] += ggml_fp16_to_fp32(ggml_fp32_to_fp16(values[e]));
+                }
+            }
+            TEST_ASSERT(g_allreduce(comm, inel_outputs[1].data()));
+        }
+
+        // Record both graphs with the same producer-wire identity used by the chain.
+        for (int warmup = 0; warmup < 2; ++warmup) {
+            for (size_t rank = 0; rank < ranks; ++rank) {
+                for (auto * graph : { consumers[rank].producer_graph, consumers[rank].ineligible_graph }) {
+                    TEST_ASSERT(g_prepare_graph(comm, rank, graph, true));
+                    TEST_ASSERT(ggml_backend_graph_compute(g_backends[rank], graph) == GGML_STATUS_SUCCESS);
+                }
+            }
+        }
+
+        auto run_ineligible_pass = [&](int r) {
+            inputs(10 + r);
+            std::vector<std::vector<std::vector<void *>>> cbs(3, std::vector<std::vector<void *>>(ranks));
+            for (size_t rank = 0; rank < ranks; ++rank) {
+                TEST_ASSERT(g_prepare_graph(comm, rank, consumers[rank].producer_graph, true));
+                TEST_ASSERT(g_get_cached_cmd_bufs(g_backends[rank], consumers[rank].producer_graph, cbs[0][rank]));
+                TEST_ASSERT(g_prepare_graph(comm, rank, consumers[rank].ineligible_graph, true));
+                TEST_ASSERT(g_get_cached_cmd_bufs(g_backends[rank], consumers[rank].ineligible_graph, cbs[1][rank]));
+            }
+            TEST_ASSERT(g_submit_epoch_chain(comm, cbs, inel_outputs));
+            for (size_t rank = 0; rank < ranks; ++rank) {
+                ggml_backend_synchronize(g_backends[rank]);
+                std::vector<float> values(width);
+                read_tensor(consumers[rank].ineligible_output, values);
+                for (int e = 0; e < width; ++e) {
+                    TEST_ASSERT(std::isfinite(values[e]) && values[e] == inel_expected[r][e]);
+                }
+            }
+        };
+
+        run_ineligible_pass(0);
+        run_ineligible_pass(1);
+
+        const int                                    restore_rounds = 2;
+        std::vector<std::vector<float>>              hc_expected(restore_rounds, std::vector<float>(width, 0.0f));
+        std::vector<std::vector<std::vector<float>>> hc_intermediate(
+            restore_rounds, std::vector<std::vector<float>>(ranks, std::vector<float>(2 * streams * width)));
+        for (int r = 0; r < restore_rounds; ++r) {
+            inputs(20 + r);
+            for (size_t rank = 0; rank < ranks; ++rank) {
+                auto & p = consumers[rank];
+                TEST_ASSERT(g_prepare_graph(comm, rank, p.producer_graph, false));
+                TEST_ASSERT(ggml_backend_graph_compute_async(g_backends[rank], p.producer_graph) ==
+                            GGML_STATUS_SUCCESS);
+            }
+            TEST_ASSERT(g_allreduce(comm, outputs[0].data()));
+            for (size_t rank = 0; rank < ranks; ++rank) {
+                auto & p = consumers[rank];
+                TEST_ASSERT(g_prepare_graph(comm, rank, p.graph, false));
+                TEST_ASSERT(ggml_backend_graph_compute(g_backends[rank], p.graph) == GGML_STATUS_SUCCESS);
+                auto & data = hc_intermediate[r][rank];
+                ggml_backend_tensor_get(p.combined, data.data(), 0, streams * width * sizeof(float));
+                ggml_backend_tensor_get(p.normalized, data.data() + streams * width, 0,
+                                        streams * width * sizeof(float));
+                std::vector<float> values(width);
+                read_tensor(p.output, values);
+                for (int e = 0; e < width; ++e) {
+                    hc_expected[r][e] += ggml_fp16_to_fp32(ggml_fp32_to_fp16(values[e]));
+                }
+            }
+            TEST_ASSERT(g_allreduce(comm, outputs[1].data()));
+        }
+
+        for (int warmup = 0; warmup < 2; ++warmup) {
+            for (size_t rank = 0; rank < ranks; ++rank) {
+                for (auto * graph : { consumers[rank].producer_graph, consumers[rank].graph }) {
+                    TEST_ASSERT(g_prepare_graph(comm, rank, graph, true));
+                    TEST_ASSERT(ggml_backend_graph_compute(g_backends[rank], graph) == GGML_STATUS_SUCCESS);
+                }
+            }
+        }
+
+        auto run_hc_restore_pass = [&](int r) {
+            inputs(20 + r);
+            std::vector<std::vector<std::vector<void *>>> cbs(3, std::vector<std::vector<void *>>(ranks));
+            for (size_t stage = 0; stage < 2; ++stage) {
+                for (size_t rank = 0; rank < ranks; ++rank) {
+                    auto * graph = stage == 0 ? consumers[rank].producer_graph : consumers[rank].graph;
+                    TEST_ASSERT(g_prepare_graph(comm, rank, graph, true));
+                    TEST_ASSERT(g_get_cached_cmd_bufs(g_backends[rank], graph, cbs[stage][rank]));
+                }
+            }
+            TEST_ASSERT(g_submit_epoch_chain(comm, cbs, outputs));
+            for (size_t rank = 0; rank < ranks; ++rank) {
+                ggml_backend_synchronize(g_backends[rank]);
+                std::vector<float> data(2 * streams * width), values(width);
+                auto &             p = consumers[rank];
+                ggml_backend_tensor_get(p.combined, data.data(), 0, streams * width * sizeof(float));
+                ggml_backend_tensor_get(p.normalized, data.data() + streams * width, 0,
+                                        streams * width * sizeof(float));
+                TEST_ASSERT(std::memcmp(data.data(), hc_intermediate[r][rank].data(), data.size() * sizeof(float)) ==
+                            0);
+                read_tensor(p.output, values);
+                for (int e = 0; e < width; ++e) {
+                    TEST_ASSERT(std::isfinite(values[e]) && values[e] == hc_expected[r][e]);
+                }
+            }
+        };
+
+        run_hc_restore_pass(0);
+        run_hc_restore_pass(1);
     }
 
     // Retained shared P1CB lifetime & HC plan churn regression:

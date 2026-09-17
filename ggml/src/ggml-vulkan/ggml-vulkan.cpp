@@ -52,6 +52,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <iomanip>
 #include <iostream>
@@ -218,6 +219,12 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 struct ggml_backend_vk_context;
 
 #define MAX_PARAMETER_COUNT 12
+// NativeHC zone: descriptor binding count for the shared DSL. Normally 12;
+// 13 only when GGML_VK_HC_DOT=q8 is active (hc_sum_f16_q8 declares binding 12
+// for the Q8 companion). MAX_PARAMETER_COUNT stays 12: multi_add layouts and
+// runtime arrays are unchanged; the 13-binding pipeline is dispatched only by
+// the collective chain.
+#define HC_DESCRIPTOR_BINDING_COUNT 13
 // Max number of adds that can be fused without exceeding MAX_PARAMETER_COUNT.
 #define MAX_FUSED_ADDS (MAX_PARAMETER_COUNT - 3)
 
@@ -933,6 +940,8 @@ struct vk_device_struct {
     bool shader_64b_indexing;
 
     bool integer_dot_product;
+    // NativeHC zone: shared DSL binding count (12 normally, 13 with HC q8).
+    uint32_t descriptor_binding_count = MAX_PARAMETER_COUNT;
     // 0: default, 1: force mmvq, -1: disable mmvq
     int32_t mmvq_mode;
 
@@ -1046,13 +1055,36 @@ struct vk_device_struct {
     vk_pipeline pipeline_hc_segment_norm[2];
     vk_pipeline pipeline_hc_inject_norm;
     vk_pipeline pipeline_hc_sum_f16;
+    // NativeHC zone (GGML_VK_HC_DOT=q8): Q8-companion producer variants. The
+    // standalone 9-binding variants cover all 97 HC norm sites (combine 0/1
+    // plus inject-fused); the fused 13-binding variant is collective-dispatched
+    // only (bindings 1-5 are mailbox slots).
+    vk_pipeline pipeline_hc_segment_norm_q8[2];
+    vk_pipeline pipeline_hc_inject_norm_q8;
+    // Q8-companion variant of the fused HC sum/norm producer (13 descriptors;
+    // binding 12 is the quantized companion). Created only when GGML_VK_HC_DOT=q8.
+    vk_pipeline pipeline_hc_sum_f16_q8;
     vk_pipeline pipeline_hc_down_silu;
     vk_pipeline pipeline_hc_project_fold;
+    // Opt-in reassociated long-K HC down variants (GGML_VK_HC_DOWN_WG=32|64|128).
+    // Index 0..2 maps to workgroup sizes 32/64/128. Reassociated, not bitwise.
+    vk_pipeline pipeline_hc_down_silu_wg[3];
+    // Opt-in approximate Q8-companion + integer-dot HC down (GGML_VK_HC_DOT=q8).
+    // Requires the Q8 companion emitted by the HC norm/sum producer.
+    vk_pipeline pipeline_hc_down_silu_q8dot;
+    // Opt-in specialized R320 HC up fold (GGML_VK_HC_UP_R320=1): fixed 320-row
+    // tail layout with 4-stream sigmoid/fold retained, no padding to 512.
+    vk_pipeline pipeline_hc_project_fold_r320;
     vk_pipeline pipeline_moe_down_fold;
     vk_pipeline pipeline_moe_down_fold_shared;
     vk_pipeline pipeline_output_q5k_wire;
     vk_pipeline pipeline_moe_down_fold_wire;
     vk_pipeline pipeline_moe_down_fold_shared_wire;
+    // Paired-expert K=128 variants (opt-in GGML_VK_MOE_DOWN_K128=1).
+    vk_pipeline pipeline_moe_down_k128;
+    vk_pipeline pipeline_moe_down_k128_shared;
+    vk_pipeline pipeline_moe_down_k128_wire;
+    vk_pipeline pipeline_moe_down_k128_shared_wire;
     vk_pipeline pipeline_moe_shared_up_swiglu;
     vk_pipeline pipeline_moe_projections[2];
     vk_pipeline pipeline_attention_projections[2];
@@ -1239,6 +1271,11 @@ struct vk_device_struct {
     vk_pipeline pipeline_topk_moe[num_topk_moe_pipelines][2];
     vk_pipeline pipeline_topk_moe_staged;
 
+    // Dedicated Qwen4 replicated router gate matmul (RouterPaths zone).
+    // [0]=f32, [1]=f16, [2]=q8_0; index 1 of the pair is the subgroup-reduction
+    // variant matching the native dmmv subgroup pipeline on RADV.
+    vk_pipeline pipeline_qwen4_router[3][2];
+
     std::vector<vk_pipeline_ref> all_pipelines;
 
     std::vector<std::tuple<void*, size_t, vk_buffer>> pinned_memory;
@@ -1341,7 +1378,9 @@ struct vk_subbuffer {
     uint64_t size;
 
     operator vk::DescriptorBufferInfo() const {
-        return { buffer->buffer, offset, size };
+        // A null buffer (unused binding slot) must convert to a harmless
+        // descriptor instead of dereferencing the null shared_ptr.
+        return { buffer ? buffer->buffer : vk::Buffer{}, offset, size };
     }
 };
 
@@ -1456,6 +1495,11 @@ struct vk_mat_vec_id_push_constants {
 struct vk_moe_down_shared_push_constants {
     vk_mat_vec_id_push_constants routed;
     uint32_t                     shared_k;
+};
+
+struct vk_moe_down_k128_push_constants {
+    uint32_t width; // output row length (multiple of 256; K/experts/shared_k
+                    // are fixed specialization constants in the shader)
 };
 
 struct vk_mat_vec_id_grouped_push_constants {
@@ -1759,6 +1803,51 @@ struct vk_gdn_segment_prep_push_constants {
     float    k_epsilon;
 };
 
+// TP5 GDN head-map (GGML_TP5_GDN_HEADMAP=1): canonical decode via
+// ggml_tp5_headmap_get (ggml-backend.h). Tri-state: 0 = absent (native
+// uniform V head h -> QK head h % key_heads), count >= 1 = valid map,
+// -1 = invalid encoding -> fail closed, never a silent native fallback.
+// This thin wrapper only adds the GPU push-constant word packing
+// (bit 31 = present, low 30 bits = packed 3-bit indices).
+struct ggml_tp5_gdn_headmap {
+    uint32_t count;      // entry count (meaningful only when valid)
+    uint8_t  qk[GGML_TP5_HEADMAP_MAX_ENTRIES]; // qk[i] = local QK head used by local V head i
+    bool     present;    // magic matched (map was stamped)
+    bool     valid;      // present && encoding valid
+};
+
+static inline struct ggml_tp5_gdn_headmap ggml_tp5_gdn_headmap_decode(const ggml_tensor * node) {
+    struct ggml_tp5_gdn_headmap map {};
+    uint8_t local_heads[GGML_TP5_HEADMAP_MAX_ENTRIES];
+    const int32_t state = ggml_tp5_headmap_get(node, local_heads);
+    if (state == 0) {
+        return map;
+    }
+    map.present = true;
+    if (state < 0) {
+        return map; // invalid: distinct fail-closed state
+    }
+    map.count = (uint32_t) state;
+    for (uint32_t i = 0; i < map.count; ++i) {
+        map.qk[i] = local_heads[i];
+    }
+    map.valid = true;
+    return map;
+}
+
+// Pack a decoded map into the single GPU push-constant word: bit 31 marks
+// presence, the low 30 bits carry up to 10 3-bit indices (LSB-first).
+static inline uint32_t ggml_tp5_gdn_headmap_pack(const struct ggml_tp5_gdn_headmap * map) {
+    if (!map->valid) {
+        return 0u;
+    }
+    uint32_t packed = 0u;
+    for (uint32_t i = 0; i < map->count; ++i) {
+        packed |= (uint32_t) (map->qk[i] & 0x7u) << (3u * i);
+    }
+    return 0x80000000u | (packed & 0x3fffffffu);
+}
+
 struct vk_moe_projections_push_constants {
     uint32_t width;
     uint32_t expert_k;
@@ -1770,6 +1859,10 @@ struct vk_gdn_segment_delta_push_constants {
     uint32_t value_heads;
     uint32_t key_heads;
     float    scale;
+    // TP5 GDN head map (opt-in): packed 3-bit per-local-V-head QK indices.
+    // Zero when absent; bit 31 set when a map is present. Stays well inside
+    // the 128-byte push-constant limit.
+    uint32_t headmap;
 };
 
 struct vk_gdn_segment_norm_push_constants {
@@ -1812,6 +1905,14 @@ struct vk_op_topk_moe_push_constants {
     uint32_t with_norm;
     float output_scale;
     float output_bias;
+};
+
+// Dedicated Qwen4 replicated router gate matmul (RouterPaths zone).
+struct vk_op_router_push_constants {
+    uint32_t ncols;       // K (2560)
+    uint32_t n_experts;   // 512
+    uint32_t expert_tile; // expert rows per workgroup
+    uint32_t pad;
 };
 
 struct vk_op_add_id_push_constants {
@@ -2053,6 +2154,9 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    // TP5 GDN head map (opt-in): packed 3-bit per-V-head QK head indices.
+    // Zero when absent; bit 31 set when a map is present.
+    uint32_t headmap;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -2297,6 +2401,14 @@ struct ggml_vk_garbage_collector {
 
 static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subctx);
 static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested = nullptr);
+
+// Dedicated Qwen4 replicated router gate matmul (RouterPaths zone).
+static bool ggml_vk_router_gate_eligible(ggml_backend_vk_context * ctx, const ggml_tensor * src0,
+                                         const ggml_tensor * src1, const ggml_tensor * dst);
+static bool ggml_vk_is_router_gate_shape(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
+static vk_subbuffer ggml_vk_router_converted_weight(ggml_backend_vk_context * ctx, const ggml_tensor * src0);
+static void ggml_vk_router_gate_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx,
+                                        const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 static void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx);
 static bool ggml_vk_intel_windows_driver_equals_or_newer_than(uint32_t driver_version, uint32_t threshold_major, uint32_t threshold_minor);
 
@@ -2638,7 +2750,58 @@ struct ggml_backend_vk_context {
     topk_moe_mode fused_topk_moe_mode {};
     bool fused_topk_moe_scale {};
     bool          fused_topk_moe_staged{};
-    bool          fused_hc_fold4{};
+
+    // Dedicated Qwen4 replicated router gate matmul (RouterPaths zone).
+    // Opt-in via GGML_VK_ROUTER_WEIGHTS=f32|f16|q8_0 (default f32) and
+    // GGML_VK_ROUTER_TILING=1 (default 0 = generic dmmv dispatch, for A/B).
+    // f16/q8_0 own a one-time device-side conversion of each immutable F32
+    // router weight tensor; the cache key is the source tensor pointer and
+    // the buffer is destroyed in ggml_vk_cleanup.
+    enum class router_weight_mode : int { f32 = 0, f16 = 1, q8_0 = 2 };
+    router_weight_mode router_weights = router_weight_mode::f32;
+    bool router_tiling = false;
+    struct router_converted_weight {
+        // Identity is (mode, VkBuffer handle, byte offset, byte size) of the
+        // source weight tensor, NOT the tensor pointer: a freed-and-reallocated
+        // tensor at the same address must not match a stale entry.
+        VkBuffer src_vk_buffer = VK_NULL_HANDLE;
+        uint64_t src_offset = 0;
+        uint64_t src_size = 0;
+        vk_buffer buffer;
+        uint64_t size = 0;
+        uint64_t last_used = 0;
+    };
+    // One entry per live (source range, mode): the full model has 48 distinct
+    // router weights per rank and all cached replay CBs must keep their
+    // converted bindings alive simultaneously. Bounded at 2*128 entries
+    // (48 f16 + 48 q8_0 + headroom); entries are dropped on source write,
+    // buffer free, or LRU eviction when the bound is exceeded.
+    std::vector<router_converted_weight> router_converted;
+    static constexpr size_t kRouterConvertedMax = 256;
+    uint64_t router_converted_clock = 0;
+    uint64_t router_converted_last_used = 0;
+    // Bounded opt-in diagnostic (GGML_VK_ROUTER_WEIGHTS companion,
+    // GGML_VK_ROUTER_DIAG_LAYERS=N): per-layer top-10 ids, normalized weights
+    // and score10/11 softmax margins. Data is COPIED INTO OWNED PER-LAYER
+    // GPU STORAGE inside the replayable compute command buffer (so warm
+    // replay re-copies fresh data every token), and read back to host ONLY
+    // when the collector calls ggml_backend_vk_router_diag after a completed
+    // decode. No implicit readbacks during normal synchronize when disabled.
+    //
+    // Per-layer record layout (24 floats), slot = stable layer id:
+    //   [0..9]  top-10 expert ids (as float bits of int value)
+    //   [10..19] top-10 normalized weights
+    //   [20]    score10-score11 softmax margin (host double recompute over
+    //           the captured gate logits at readback time)
+    //   [21]    softmax score of rank 10
+    //   [22]    softmax score of rank 11
+    //   [23]    numeric actual blk layer id parsed from the router weight
+    //           tensor name; stable hash fallback for artificial test names.
+    uint32_t router_diag_layers = 0;
+    vk_buffer router_diag_gpu;                 // owned: records (24/layer) + gate logits (512/layer)
+    std::vector<float> router_diag_host;      // snapshot from the most recent explicit read
+    uint32_t router_diag_slots_used = 0;      // max actual layer id captured + 1
+    bool fused_hc_fold4{};
     vk_hc_segment fused_hc_segment = vk_hc_segment::NONE;
     bool          fused_moe_output_segment{};
     bool          fused_moe_projections{};
@@ -2707,6 +2870,18 @@ struct ggml_backend_vk_context {
     const ggml_tensor *                                     wire_producer = nullptr;
     vk_buffer                                               wire_scratch;
     vk_buffer                                               wire_recorded;
+    // NativeHC zone: Q8_0 companion scratch for GGML_VK_HC_DOT=q8, sized to the
+    // normalized activation tensor. GROWTH INVALIDATION: when a larger graph
+    // forces reallocation, every live recording that bound the old buffer is
+    // invalidated (its recorded descriptors point at freed memory). All
+    // recordings' owners are pinned in recording_quant_owners so the old
+    // buffer outlives them; the cache entries themselves are freed below.
+    vk_buffer                                               hc_quant_scratch;
+    // Every companion buffer used by any live recording (a recording can span
+    // multiple HC sites; growth replaces the buffer mid-recording only between
+    // recordings, but multiple distinct buffers may still be live across
+    // entries). Pinned via the existing buffer_owners mechanism.
+    std::vector<vk_buffer>                                  recording_quant_owners;
     std::unordered_map<const ggml_tensor *, vk_wire_output> wire_outputs;
     void *                                                  hc_prefix_recorded = nullptr;
     vk_tp5_hc_sum                                           hc_sum_recorded;
@@ -2984,18 +3159,33 @@ static bool ggml_vk_cache_fingerprint_match(const ggml_backend_vk_context *     
         return current;
     };
     auto match = [&](const ggml_tensor * t, const ggml_backend_vk_context::vk_tensor_fingerprint & fp) {
-        void * data = t->view_src ? t->view_src->data : t->data;
-        if (fp.data != data || fp.view_offs != t->view_offs || fp.type != (uint32_t) t->type ||
-            fp.op != (int32_t) t->op)
+        if (fp.type != (uint32_t) t->type || fp.op != (int32_t) t->op) {
             return false;
+        }
         for (int k = 0; k < 4; ++k) {
             if (fp.ne[k] != t->ne[k] || fp.nb[k] != t->nb[k])
                 return false;
         }
         if (memcmp(fp.op_params, t->op_params, sizeof(fp.op_params)) != 0)
             return false;
-        ggml_backend_buffer_t buffer = t->buffer ? t->buffer : (t->view_src ? t->view_src->buffer : nullptr);
-        return fp.dev_buffer == current_buffer(buffer);
+
+        // Intermediate computed nodes have their storage managed by the graph allocator;
+        // their host data pointers may alternate across double-buffered graph evaluations
+        // while their GPU buffers and graph topologies are invariant. Only input/leaf
+        // tensors need strict data/device buffer matching.
+        const bool is_input = (t->flags & GGML_TENSOR_FLAG_INPUT) != 0 || (t->op == GGML_OP_NONE);
+        if (is_input) {
+            void * data = t->view_src ? t->view_src->data : t->data;
+            if (fp.data != data || fp.view_offs != t->view_offs)
+                return false;
+            ggml_backend_buffer_t buffer = t->buffer ? t->buffer : (t->view_src ? t->view_src->buffer : nullptr);
+            if (fp.dev_buffer != VK_NULL_HANDLE && fp.dev_buffer != current_buffer(buffer))
+                return false;
+        } else {
+            if (fp.view_offs != t->view_offs)
+                return false;
+        }
+        return true;
     };
     bool   same_tensors = true;
     size_t index = 0, n_unique = 0;
@@ -3051,6 +3241,13 @@ static void ggml_vk_cache_entry_free_resources(ggml_backend_vk_context * ctx, gg
 }
 
 static void ggml_vk_cache_invalidate_all(ggml_backend_vk_context * ctx) {
+    if (!ctx->cgraph_cmd_cache.empty()) {
+        static int inv_log = 0;
+        if (++inv_log <= 5) {
+            fprintf(stderr, "[cache-invalidate-all] sz=%zu scratch_gen=%llu\n",
+                    ctx->cgraph_cmd_cache.size(), (unsigned long long) ctx->scratch_generation);
+        }
+    }
     // Drain GPU completion FIRST before freeing descriptor pools and resetting command buffers
     // so in-flight commands and descriptors are not destroyed while GPU is still reading them!
     if (ctx->replay_cmd_pool_init || !ctx->cgraph_cmd_cache.empty()) {
@@ -3407,7 +3604,8 @@ static void ggml_vk_create_pipeline_func(vk_device& device, vk_pipeline& pipelin
                  ", (" << wg_denoms[0] << "," << wg_denoms[1] << "," << wg_denoms[2] << "), specialization_constants, " <<
                  disable_robustness << ", " << require_full_subgroups << ", " << required_subgroup_size << ")");
     GGML_ASSERT(parameter_count > 0);
-    GGML_ASSERT(parameter_count <= MAX_PARAMETER_COUNT);
+    GGML_ASSERT(parameter_count <= MAX_PARAMETER_COUNT ||
+                 (parameter_count == HC_DESCRIPTOR_BINDING_COUNT && device->descriptor_binding_count >= 13));
     GGML_ASSERT(wg_denoms[0] > 0 && wg_denoms[1] > 0 && wg_denoms[2] > 0); // NOLINT
 
     vk::ShaderModuleCreateInfo shader_module_create_info({}, spv_size, reinterpret_cast<const uint32_t *>(spv_data));
@@ -3694,7 +3892,7 @@ static void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx
         pool_remaining = VK_DEVICE_DESCRIPTOR_POOL_SIZE;
 
         if (pool_idx >= ctx->descriptor_pools.size()) {
-            vk::DescriptorPoolSize descriptor_pool_size(vk::DescriptorType::eStorageBuffer, MAX_PARAMETER_COUNT * VK_DEVICE_DESCRIPTOR_POOL_SIZE);
+            vk::DescriptorPoolSize descriptor_pool_size(vk::DescriptorType::eStorageBuffer, device->descriptor_binding_count * VK_DEVICE_DESCRIPTOR_POOL_SIZE);
             vk::DescriptorPoolCreateInfo descriptor_pool_create_info({}, VK_DEVICE_DESCRIPTOR_POOL_SIZE, descriptor_pool_size);
             ctx->descriptor_pools.push_back(device->device.createDescriptorPool(descriptor_pool_create_info));
         }
@@ -6012,6 +6210,30 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                     qwen4_hc_segment_norm_len, qwen4_hc_segment_norm_data, "main", 8,
                                     sizeof(vk_hc_segment_norm_push_constants), { 1, 1, 1 }, { combine }, 1);
         }
+        // NativeHC zone: GGML_VK_HC_DOT=q8 shared option state. Strict parse:
+        // only exactly "q8" requests the approximate path. If requested but the
+        // device cannot run it (no integer dot product), ABORT before any GPU
+        // work rather than silently falling back to native.
+        static const bool hc_dot_q8 = [] {
+            const char * env = getenv("GGML_VK_HC_DOT");
+            return env && strcmp(env, "q8") == 0;
+        }();
+        if (hc_dot_q8 && !device->integer_dot_product) {
+            GGML_ABORT("GGML_VK_HC_DOT=q8 requested but the device does not support the integer dot product extension");
+        }
+        // Standalone Q8-companion norm variants (9 bindings; binding 8 is the
+        // companion). These cover ALL 97 HC norm sites (combine 0/1 plus the
+        // inject-fused variant below). Independent of GGML_VK_DISABLE_HC_SUM:
+        // that flag only disables the collective fused sum; standalone companion
+        // production still runs for the q8 down consumer.
+        if (hc_dot_q8) {
+            for (uint32_t combine = 0; combine < 2; ++combine) {
+                ggml_vk_create_pipeline(device, device->pipeline_hc_segment_norm_q8[combine],
+                                        combine ? "hc_segment_norm_q8_c1" : "hc_segment_norm_q8_c0",
+                                        qwen4_hc_segment_norm_q8_len, qwen4_hc_segment_norm_q8_data, "main", 9,
+                                        sizeof(vk_hc_segment_norm_push_constants), { 1, 1, 1 }, { combine, 0, 1 }, 1);
+            }
+        }
         // This variant preserves RADV's native Q8 contraction order explicitly.
         if (device->driver_id == vk::DriverId::eMesaRadv) {
             if (!getenv("GGML_VK_DISABLE_HC_SUM") && device->properties.limits.maxComputeWorkGroupInvocations >= 1024 &&
@@ -6020,10 +6242,31 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                         qwen4_hc_sum_f16_data, "main", 12, sizeof(vk_hc_segment_norm_push_constants),
                                         { 1, 1, 1 }, { 1, 1, subgroup_size }, 1, true, true, force_subgroup_size);
             }
+            // NativeHC zone: the fused Q8-companion producer (13 descriptors,
+            // binding 12 companion) must exist whenever hc_dot_q8 is set,
+            // independent of GGML_VK_DISABLE_HC_SUM — the 93 collective HC
+            // producers need it even when the standalone sum is disabled. The
+            // 1024-invocation device limits still apply (local_size 1024).
+            if (hc_dot_q8 && device->properties.limits.maxComputeWorkGroupInvocations >= 1024 &&
+                device->properties.limits.maxComputeWorkGroupSize[0] >= 1024) {
+                ggml_vk_create_pipeline(device, device->pipeline_hc_sum_f16_q8, "hc_sum_f16_q8",
+                                        qwen4_hc_sum_f16_q8_len, qwen4_hc_sum_f16_q8_data, "main", 13,
+                                        sizeof(vk_hc_segment_norm_push_constants), { 1, 1, 1 },
+                                        { 1, 1, subgroup_size }, 1, true, true, force_subgroup_size);
+            }
             ggml_vk_create_pipeline(device, device->pipeline_hc_inject_norm, "hc_inject_norm",
                                     qwen4_hc_segment_norm_len, qwen4_hc_segment_norm_data, "main", 8,
                                     sizeof(vk_hc_segment_norm_push_constants), { 1, 1, 1 }, { 1, 1, subgroup_size }, 1,
                                     true, true, force_subgroup_size);
+            // NativeHC zone: inject-fused standalone Q8 companion variant (9
+            // bindings, spec constants COMBINE=1/FUSE_INJECT=1). Covers the
+            // fuse_inject HC sites in the 97-site companion coverage.
+            if (hc_dot_q8) {
+                ggml_vk_create_pipeline(device, device->pipeline_hc_inject_norm_q8, "hc_inject_norm_q8",
+                                        qwen4_hc_segment_norm_q8_len, qwen4_hc_segment_norm_q8_data, "main", 9,
+                                        sizeof(vk_hc_segment_norm_push_constants), { 1, 1, 1 }, { 1, 1, 32 }, 1,
+                                        true, true, force_subgroup_size);
+            }
         }
         ggml_vk_create_pipeline(device, device->pipeline_hc_down_silu, "hc_down_silu", qwen4_hc_down_silu_len,
                                 qwen4_hc_down_silu_data, "main", 5, sizeof(vk_mat_vec_push_constants), { 1, 1, 1 },
@@ -6031,6 +6274,65 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_hc_project_fold, "hc_project_fold", qwen4_hc_project_fold_len,
                                 qwen4_hc_project_fold_data, "main", 5, sizeof(vk_mat_vec_push_constants), { 1, 1, 1 },
                                 { subgroup_size, 4, 1 }, 1, true, true, force_subgroup_size);
+        // NativeHC zone: opt-in HC variant pipelines. All are opt-in only; the
+        // native pipelines above remain the default dispatch selection.
+        {
+            // GGML_VK_HC_DOWN_WG=32|64|128 selects a reassociated long-K HC down
+            // variant whose workgroup spans multiple subgroups. Each lane keeps
+            // the native per-lane two-dot FMA chain; partials cross subgroups
+            // through shared memory, so the reduction order is reassociated.
+            static const uint32_t hc_down_wg = [] {
+                const char * env = getenv("GGML_VK_HC_DOWN_WG");
+                if (!env || !*env) {
+                    return uint32_t(0);
+                }
+                const uint32_t value = uint32_t(atoi(env));
+                // Strict 32|64|128. An invalid non-empty value is an error,
+                // not a silent native fallback.
+                if (value != 32 && value != 64 && value != 128) {
+                    GGML_ABORT("GGML_VK_HC_DOWN_WG must be 32, 64 or 128 (got '%s')", env);
+                }
+                return value;
+            }();
+            static const uint32_t hc_down_wg_index =
+                hc_down_wg == 32 ? 0u : hc_down_wg == 64 ? 1u : hc_down_wg == 128 ? 2u : ~0u;
+            if (hc_down_wg_index != ~0u) {
+                // One SPIR-V serves all three workgroup sizes; BLOCK_SIZE is
+                // the per-pipeline specialization constant.
+                ggml_vk_create_pipeline(
+                    device, device->pipeline_hc_down_silu_wg[hc_down_wg_index],
+                    hc_down_wg_index == 0   ? "hc_down_silu_wg32" :
+                    hc_down_wg_index == 1   ? "hc_down_silu_wg64" :
+                                              "hc_down_silu_wg128",
+                    qwen4_hc_down_silu_wg_len, qwen4_hc_down_silu_wg_data,
+                    "main", 5, sizeof(vk_mat_vec_push_constants), { 1, 1, 1 },
+                    { hc_down_wg, 1, 1 }, 1, true, false);
+            }
+            // GGML_VK_HC_DOT=q8 selects the approximate integer-dot HC down
+            // consumer. The companion producers were created above; results are
+            // approximate (int8 activation grid).
+            if (hc_dot_q8) {
+                ggml_vk_create_pipeline(device, device->pipeline_hc_down_silu_q8dot, "hc_down_silu_q8dot",
+                                        qwen4_hc_down_silu_q8dot_len, qwen4_hc_down_silu_q8dot_data, "main", 5,
+                                        sizeof(vk_mat_vec_push_constants), { 1, 1, 1 }, { subgroup_size, 1, 1 }, 1,
+                                        true, true, force_subgroup_size);
+            }
+            // GGML_VK_HC_UP_R320=1 selects a specialized R320 up fold with fixed
+            // 320-row layout handling and the 4-stream sigmoid/fold retained.
+            static const bool hc_up_r320 = [] {
+                const char * env = getenv("GGML_VK_HC_UP_R320");
+                if (env && strcmp(env, "1") != 0) {
+                    GGML_ABORT("GGML_VK_HC_UP_R320 must be exactly '1' (got '%s')", env);
+                }
+                return env && strcmp(env, "1") == 0;
+            }();
+            if (hc_up_r320) {
+                ggml_vk_create_pipeline(device, device->pipeline_hc_project_fold_r320, "hc_project_fold_r320",
+                                        qwen4_hc_project_fold_r320_len, qwen4_hc_project_fold_r320_data, "main", 5,
+                                        sizeof(vk_mat_vec_push_constants), { 1, 1, 1 }, { subgroup_size, 4, 1 }, 1,
+                                        true, true, force_subgroup_size);
+            }
+        }
         if (10 * subgroup_size16 <= device->properties.limits.maxComputeWorkGroupInvocations &&
             10 * subgroup_size16 <= device->properties.limits.maxComputeWorkGroupSize[0]) {
             if (device->driver_id == vk::DriverId::eMesaRadv && use_subgroups16) {
@@ -6074,6 +6376,40 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                 qwen4_moe_shared_up_swiglu_len, qwen4_moe_shared_up_swiglu_data, "main", 5,
                                 sizeof(vk_mat_vec_push_constants), { rm_kq, 1, 1 }, { subgroup_size16, rm_kq, 1 }, 1,
                                 true, true, force_subgroup_size16);
+        // Paired-expert K=128 MoE down fold: two selected experts share one
+        // wave32 workgroup (logical 16-lane halves, 5 waves / 160 threads
+        // per 4-row tile). Opt-in GGML_VK_MOE_DOWN_K128=1 until paired
+        // validation; requires real wave32 + subgroup shuffle support.
+        const char * moe_down_k128_env = getenv("GGML_VK_MOE_DOWN_K128");
+        const bool   moe_down_k128_on =
+            moe_down_k128_env && strcmp(moe_down_k128_env, "1") == 0;
+        if (moe_down_k128_on && device->subgroup_size == 32 &&
+            device->architecture == AMD_RDNA2 && device->driver_id == vk::DriverId::eMesaRadv &&
+            device->subgroup_arithmetic && device->subgroup_shuffle && device->subgroup_size_control &&
+            device->subgroup_require_full_support && device->subgroup_min_size <= 32 &&
+            32 <= device->subgroup_max_size &&
+            device->properties.limits.maxComputeWorkGroupSize[0] >= 160 &&
+            device->properties.limits.maxComputeWorkGroupInvocations >= 160) {
+            ggml_vk_create_pipeline(device, device->pipeline_moe_down_k128, "moe_down_k128",
+                                    qwen4_moe_down_k128_len, qwen4_moe_down_k128_data, "main", 7,
+                                    sizeof(vk_moe_down_k128_push_constants), { 4, 1, 1 }, { 160 }, 1, true,
+                                    true, 32);
+            if (subgroup_size16 == subgroup_size) {
+                ggml_vk_create_pipeline(device, device->pipeline_moe_down_k128_shared, "moe_down_k128_shared",
+                                        qwen4_moe_down_k128_shared_len, qwen4_moe_down_k128_shared_data, "main", 8,
+                                        sizeof(vk_moe_down_k128_push_constants), { 4, 1, 1 }, { 160 }, 1,
+                                        true, true, 32);
+                ggml_vk_create_pipeline(device, device->pipeline_moe_down_k128_wire, "moe_down_k128_wire",
+                                        qwen4_moe_down_k128_wire_len, qwen4_moe_down_k128_wire_data, "main", 8,
+                                        sizeof(vk_moe_down_k128_push_constants), { 4, 1, 1 }, { 160 }, 1,
+                                        true, true, 32);
+                ggml_vk_create_pipeline(device, device->pipeline_moe_down_k128_shared_wire,
+                                        "moe_down_k128_shared_wire", qwen4_moe_down_k128_shared_wire_len,
+                                        qwen4_moe_down_k128_shared_wire_data, "main", 9,
+                                        sizeof(vk_moe_down_k128_push_constants), { 4, 1, 1 }, { 160 }, 1,
+                                        true, true, 32);
+            }
+        }
         if (device->subgroup_clustered && device->subgroup_size % 8 == 0 &&
             device->properties.limits.maxComputeWorkGroupInvocations >= 512) {
             ggml_vk_create_pipeline(device, device->pipeline_gdn_segment_prep, "gdn_segment_prep",
@@ -7147,6 +7483,41 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                  subgroup_reductions ? device->subgroup_size : soft_max_req_sg);
     }
 
+    // Dedicated Qwen4 replicated router gate matmul (RouterPaths zone).
+    // Same subgroup gating as the staged topk: RADV wave32 with full
+    // subgroup support takes the subgroupAdd reduction variant.
+    {
+        constexpr uint32_t TILE_THREADS_ROUTER = 256;
+        const bool router_sg =
+            device->architecture == AMD_RDNA2 && device->driver_id == vk::DriverId::eMesaRadv &&
+            device->subgroup_size == 32 && device->subgroup_arithmetic &&
+            device->subgroup_shuffle && device->subgroup_size_control && device->subgroup_require_full_support &&
+            device->subgroup_min_size <= device->subgroup_size && device->subgroup_size <= device->subgroup_max_size &&
+            !getenv("GGML_VK_DISABLE_ROUTER_SUBGROUP");
+        struct { const char * name; size_t len; const void * data; size_t sg_len; const void * sg_data; } router_variants[3] = {
+            { "qwen4_router_f32",  qwen4_router_f32_len,  qwen4_router_f32_data,
+              qwen4_router_f32_subgroup_len,  qwen4_router_f32_subgroup_data },
+            { "qwen4_router_f16",  qwen4_router_f16_len,  qwen4_router_f16_data,
+              qwen4_router_f16_subgroup_len,  qwen4_router_f16_subgroup_data },
+            { "qwen4_router_q8_0", qwen4_router_q8_0_len, qwen4_router_q8_0_data,
+              qwen4_router_q8_0_subgroup_len, qwen4_router_q8_0_subgroup_data },
+        };
+        for (int m = 0; m < 3; ++m) {
+            ggml_vk_create_pipeline2(device, device->pipeline_qwen4_router[m][0],
+                                     std::string(router_variants[m].name),
+                                     router_variants[m].len, router_variants[m].data, "main",
+                                     3, sizeof(vk_op_router_push_constants), { 1, 1, 1 },
+                                     { 32, TILE_THREADS_ROUTER }, 1, false, false, 0);
+            if (router_sg) {
+                ggml_vk_create_pipeline2(device, device->pipeline_qwen4_router[m][1],
+                                         std::string(router_variants[m].name) + "_subgroup",
+                                         router_variants[m].sg_len, router_variants[m].sg_data, "main",
+                                         3, sizeof(vk_op_router_push_constants), { 1, 1, 1 },
+                                         { 32, TILE_THREADS_ROUTER }, 1, false, true, device->subgroup_size);
+            }
+        }
+    }
+
     // Drop compile_mutex so other threads can walk while we compile.
     compile_lock.unlock();
 
@@ -8090,9 +8461,17 @@ static vk_device ggml_vk_get_device(size_t idx) {
         }
 
 
+        // NativeHC zone: the shared DSL gains a 13th binding only when the
+        // HC q8 companion path is requested (strict "q8").
+        {
+            const char * hc_dot_env = getenv("GGML_VK_HC_DOT");
+            device->descriptor_binding_count =
+                (hc_dot_env && strcmp(hc_dot_env, "q8") == 0) ? uint32_t(HC_DESCRIPTOR_BINDING_COUNT) :
+                                                                 uint32_t(MAX_PARAMETER_COUNT);
+        }
         std::vector<vk::DescriptorSetLayoutBinding> dsl_binding;
         std::vector<vk::DescriptorBindingFlags> dsl_binding_flags;
-        for (uint32_t i = 0; i < MAX_PARAMETER_COUNT; i++) {
+        for (uint32_t i = 0; i < device->descriptor_binding_count; i++) {
             dsl_binding.push_back({i, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute});
             dsl_binding_flags.push_back({});
         }
@@ -8687,6 +9066,38 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->prealloc_moe_route_last_ids = nullptr;
     ctx->prealloc_moe_route_grouped_max = 0;
     ctx->prealloc_moe_route_split_singletons = false;
+
+    // Dedicated Qwen4 replicated router gate matmul (RouterPaths zone).
+    // GGML_VK_ROUTER_WEIGHTS=f32|f16|q8_0 (default f32) and independent
+    // tiling opt-in GGML_VK_ROUTER_TILING=1 (default off, native generic
+    // dmmv dispatch) for paired A/B validation.
+    if (const char * env = getenv("GGML_VK_ROUTER_WEIGHTS")) {
+        if (strcmp(env, "f16") == 0) {
+            ctx->router_weights = ggml_backend_vk_context::router_weight_mode::f16;
+        } else if (strcmp(env, "q8_0") == 0) {
+            ctx->router_weights = ggml_backend_vk_context::router_weight_mode::q8_0;
+        } else {
+            ctx->router_weights = ggml_backend_vk_context::router_weight_mode::f32;
+            if (strcmp(env, "f32") != 0) {
+                std::cerr << "ggml_vulkan: unknown GGML_VK_ROUTER_WEIGHTS='" << env
+                          << "', using f32" << std::endl;
+            }
+        }
+    }
+    if (const char * env = getenv("GGML_VK_ROUTER_TILING")) {
+        ctx->router_tiling = atoi(env) != 0;
+    }
+    if (const char * env = getenv("GGML_VK_ROUTER_DIAG_LAYERS")) {
+        ctx->router_diag_layers = std::min(atoi(env), 97);
+        if (ctx->router_diag_layers > 0) {
+            // Records region (24 floats/layer) + gate-logits region
+            // (512 floats/layer) for the margin recompute.
+            ctx->router_diag_gpu = ggml_vk_create_buffer_device(
+                ctx->device, (24u + 512u) * ctx->router_diag_layers * sizeof(float));
+            ctx->router_diag_host.assign(24u * ctx->router_diag_layers, 0.0f);
+        }
+    }
+
     // Fixed size of 1KB, for deterministic behavior
     ctx->prealloc_size_add_rms_partials = 1024;
 
@@ -9249,17 +9660,20 @@ template <typename T, uint32_t N> const T *push_constant_data(const std::array<T
 static void ggml_vk_write_descriptor_set(ggml_backend_vk_context *                       ctx,
                                          vk::DescriptorSet                               set,
                                          std::initializer_list<vk::DescriptorBufferInfo> buffers) {
-    GGML_ASSERT(buffers.size() > 0 && buffers.size() <= MAX_PARAMETER_COUNT);
+    GGML_ASSERT(buffers.size() > 0 && buffers.size() <= ctx->device->descriptor_binding_count);
+    GGML_ASSERT(buffers.size() <= MAX_PARAMETER_COUNT ||
+                ctx->device->descriptor_binding_count == HC_DESCRIPTOR_BINDING_COUNT);
     const auto live = std::find_if(buffers.begin(), buffers.end(),
                                    [](const vk::DescriptorBufferInfo & buffer) { return bool(buffer.buffer); });
     GGML_ASSERT(live != buffers.end());
-    std::array<vk::DescriptorBufferInfo, MAX_PARAMETER_COUNT> bindings;
+    // NativeHC zone: the shared array covers the 13-binding HC q8 layout too;
+    // the DSL has exactly descriptor_binding_count bindings, so every slot is
+    // always written (no inactive slots exist to retain stale BOs).
+    std::array<vk::DescriptorBufferInfo, HC_DESCRIPTOR_BINDING_COUNT> bindings;
     std::copy(buffers.begin(), buffers.end(), bindings.begin());
-    // All pipelines share this layout. Reused sets must not retain freed BOs
-    // in inactive slots: RADV's explicit residency list visits every binding.
-    std::fill(bindings.begin() + buffers.size(), bindings.end(), *live);
+    std::fill(bindings.begin() + buffers.size(), bindings.begin() + ctx->device->descriptor_binding_count, *live);
     const vk::WriteDescriptorSet write{
-        set, 0, 0, MAX_PARAMETER_COUNT, vk::DescriptorType::eStorageBuffer, nullptr, bindings.data()
+        set, 0, 0, ctx->device->descriptor_binding_count, vk::DescriptorType::eStorageBuffer, nullptr, bindings.data()
     };
     ctx->device->device.updateDescriptorSets({ write }, {});
 }
@@ -9277,15 +9691,20 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     GGML_ASSERT(wg0 <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
                 wg1 <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
                 wg2 <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
-    GGML_ASSERT(descriptor_buffer_infos.size() <= MAX_PARAMETER_COUNT);
-    GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
+    GGML_ASSERT(descriptor_buffer_infos.size() <= ctx->device->descriptor_binding_count);
+    GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size() ||
+                // NativeHC zone: pipelines with fewer declared parameters than
+                // the DSL binding count share the layout; extra slots are
+                // filled with a live buffer by ggml_vk_write_descriptor_set.
+                pipeline->parameter_count <= ctx->device->descriptor_binding_count);
     GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
 
     vk::DescriptorSet descriptor_set;
     if (ctx->replay_recording) {
         // Allocate dedicated immutable descriptor sets from dedicated descriptor pools for replay
         if (ctx->replay_recording_sets.empty()) {
-            vk::DescriptorPoolSize pool_size(vk::DescriptorType::eStorageBuffer, MAX_PARAMETER_COUNT * 64);
+            vk::DescriptorPoolSize pool_size(vk::DescriptorType::eStorageBuffer,
+                                               ctx->device->descriptor_binding_count * 64);
             vk::DescriptorPoolCreateInfo pool_ci({}, 64, pool_size);
             vk::DescriptorPool dedicated_pool = ctx->device->device.createDescriptorPool(pool_ci);
             ctx->replay_recording_pools.push_back(dedicated_pool);
@@ -9322,14 +9741,15 @@ static void ggml_vk_dispatch_pipeline_indirect(
     GGML_ASSERT(dynamic_axis < 3);
     GGML_ASSERT(indirect.offset % sizeof(uint32_t) == 0);
     GGML_ASSERT(indirect.size >= 3 * sizeof(uint32_t));
-    GGML_ASSERT(descriptor_buffer_infos.size() <= MAX_PARAMETER_COUNT);
+    GGML_ASSERT(descriptor_buffer_infos.size() <= ctx->device->descriptor_binding_count);
     GGML_ASSERT(pipeline->parameter_count == descriptor_buffer_infos.size());
     GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
 
     vk::DescriptorSet descriptor_set;
     if (ctx->replay_recording) {
         if (ctx->replay_recording_sets.empty()) {
-            vk::DescriptorPoolSize pool_size(vk::DescriptorType::eStorageBuffer, MAX_PARAMETER_COUNT * 64);
+            vk::DescriptorPoolSize pool_size(vk::DescriptorType::eStorageBuffer,
+                                               ctx->device->descriptor_binding_count * 64);
             vk::DescriptorPoolCreateInfo pool_ci({}, 64, pool_size);
             vk::DescriptorPool dedicated_pool = ctx->device->device.createDescriptorPool(pool_ci);
             ctx->replay_recording_pools.push_back(dedicated_pool);
@@ -11282,6 +11702,26 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     ggml_tensor * src1 = dst->src[1];
     VK_LOG_DEBUG("ggml_vk_mul_mat(" << src0 << ", " << src1 << ", " << dst << ")");
 
+    // Dedicated Qwen4 replicated router gate matmul (RouterPaths zone).
+    // Opt-in tiling path; falls through to the generic dmmv dispatch when
+    // disabled or ineligible, so the native default is unchanged.
+    if (ggml_vk_router_gate_eligible(ctx, src0, src1, dst)) {
+        ggml_vk_router_gate_mul_mat(ctx, subctx, src0, src1, dst);
+        return;
+    }
+    // Fail closed: a router-gate-shaped node with a requested non-F32
+    // router precision that cannot execute (tiling disabled, shape or
+    // pipeline ineligible) must be observable, never a silent generic F32
+    // run presented as the requested experiment.
+    if (ctx->router_weights != ggml_backend_vk_context::router_weight_mode::f32 &&
+        ggml_vk_is_router_gate_shape(src0, src1, dst)) {
+        GGML_ABORT("ggml_vulkan: GGML_VK_ROUTER_WEIGHTS=%s requested but the router gate node cannot "
+                   "execute in that mode (GGML_VK_ROUTER_TILING=%d, shape/contiguity/pipeline checks "
+                   "failed); refusing to silently run F32",
+                   ctx->router_weights == ggml_backend_vk_context::router_weight_mode::f16 ? "f16" : "q8_0",
+                   ctx->router_tiling ? 1 : 0);
+    }
+
     // Handle huge A matrix by splitting the M dimensions. This works well for convolution use cases
     // where the M dimension is very large.
     // Split_k doesn't work with M splitting.
@@ -12358,11 +12798,68 @@ static bool ggml_vk_flash_attn_rerot_tune(const vk_device & device, uint32_t hsk
     return false;
 }
 
+// TP5 QSA private local head map (opt-in GGML_TP5_QSA_HEADMAP=1).
+// META-produced rank-local GGML_OP_FLASH_ATTN_EXT nodes may carry an
+// explicit per-local-Q-head -> local-KV-head map in op_params when the
+// integer neq2/nek2 ratio is NOT the true assignment (e.g. local Q5 over
+// KV2 with map [0,0,1,1,1]). Wire ABI is the canonical ggml_tp5_headmap_*
+// contract (ggml-backend.h): op_params i32 slots 8/9/10 = magic
+// GGML_TP5_HEADMAP_MAGIC / packed 3-bit indices / count.
+// Slots 8..10 are unused by ordinary FLASH_ATTN_EXT (slots 0..4 are scale,
+// max_bias, logit_softcap, prec, n_kv_max). A node without the magic is an
+// ordinary node and keeps the uniform integer-ratio GQA behavior.
+static bool ggml_vk_fa_headmap_decode(const ggml_tensor * node, uint32_t * packed, uint32_t * count) {
+    uint8_t heads[GGML_TP5_HEADMAP_MAX_ENTRIES];
+    const int32_t n = ggml_tp5_headmap_get(node, heads);
+    // 0 = no map (ordinary node); -1 = present-but-invalid encoding.
+    if (n <= 0) {
+        return false;
+    }
+    // FA-shape violations fail closed (dispatch-time assert): never
+    // fall back to the uniform integer-ratio mapping.
+    GGML_ASSERT((uint32_t) n == (uint32_t) node->src[0]->ne[2]);
+    uint32_t packed_val = 0;
+    for (int32_t h = 0; h < n; ++h) {
+        GGML_ASSERT((uint32_t) heads[h] < (uint32_t) node->src[1]->ne[2]);
+        packed_val |= uint32_t(heads[h]) << (3 * h);
+    }
+    *packed = packed_val;
+    *count  = (uint32_t) n;
+    return true;
+}
+
+// Non-aborting validation for capability queries: returns true only when the
+// node carries a valid FA head map (count == q->ne[2], every entry <
+// k->ne[2]); false for absent OR invalid maps. Callers must treat false as
+// "not supported on this backend", never as "run the uniform ratio".
+static bool ggml_vk_fa_headmap_valid(const ggml_tensor * node) {
+    uint8_t heads[GGML_TP5_HEADMAP_MAX_ENTRIES];
+    const int32_t n = ggml_tp5_headmap_get(node, heads);
+    if (n <= 0 || node->src[0] == nullptr || node->src[1] == nullptr) {
+        return false;
+    }
+    if ((uint32_t) n != (uint32_t) node->src[0]->ne[2]) {
+        return false;
+    }
+    for (int32_t h = 0; h < n; ++h) {
+        if ((uint32_t) heads[h] >= (uint32_t) node->src[1]->ne[2]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static uint32_t ggml_vk_flash_attn_gqa_ratio(const ggml_tensor * q,
                                              const ggml_tensor * k,
                                              const ggml_tensor * v,
+                                             const ggml_tensor * node,
                                              uint32_t            mask_heads,
                                              uint32_t            max_gqa) {
+    // Mapped nodes never use the grouped-query optimization: the map is not
+    // an integer ratio, so each workgroup must own exactly one Q head.
+    if (node->op == GGML_OP_FLASH_ATTN_EXT && node->op_params[8] == GGML_TP5_HEADMAP_MAGIC) {
+        return 1;
+    }
     const uint32_t ratio = q->ne[2] / k->ne[2];
     return q->ne[1] <= 8 && ratio > 1 && ratio <= max_gqa && ratio * k->ne[2] == q->ne[2] && k->ne[2] == v->ne[2] &&
                    mask_heads <= 1 ?
@@ -12373,7 +12870,10 @@ static uint32_t ggml_vk_flash_attn_gqa_ratio(const ggml_tensor * q,
 static uint64_t ggml_vk_sparse_meta_size(const ggml_tensor * q, const ggml_tensor * mask, uint32_t max_keys) {
     const uint64_t rows   = uint64_t(q->ne[1]) * std::max<int64_t>(1, mask->ne[2]) * std::max<int64_t>(1, mask->ne[3]);
     const uint64_t header = ((1 + rows + 3) / 4) * 4;
-    return (header + rows * uint64_t(max_keys) * 2) * sizeof(int32_t);
+    // Bucketing by 512 tokens: avoids per-token scratch reallocation and global
+    // replay cache invalidation churn as the KV cache length increments by 1.
+    const uint64_t bucketed_keys = ((uint64_t(max_keys) + 511u) / 512u) * 512u;
+    return (header + rows * bucketed_keys * 2) * sizeof(int32_t);
 }
 
 static vk_op_flash_attn_sparse_compact_push_constants ggml_vk_sparse_compact_params(const ggml_tensor * q,
@@ -12473,7 +12973,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context *       ctx,
         get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k->type, v->type, f32acc);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
-    const uint32_t gqa_ratio = ggml_vk_flash_attn_gqa_ratio(q, k, v, nem2, max_gqa);
+    const uint32_t gqa_ratio = ggml_vk_flash_attn_gqa_ratio(q, k, v, dst, nem2, max_gqa);
     if (gqa_ratio > 1) {
         // grouped query attention - make the N dimension equal to gqa_ratio, reduce
         // workgroups proportionally in y dimension. The shader will detect gqa_ratio > 1
@@ -12645,8 +13145,8 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context *       ctx,
 
     const uint32_t n_head_kv   = neq2;
     const uint32_t n_head_log2 = 1u << (uint32_t) floorf(log2f((float) n_head_kv));
-    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
-    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+    float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
     vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
     vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
@@ -12657,6 +13157,29 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context *       ctx,
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
 
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
+
+    // TP5 QSA head map: overlay the packed map on the ALiBi m0/m1 push
+    // constants. This is only legal when max_bias == 0 (m0/m1 are unused by
+    // the shader in that case); mapped nodes with max_bias != 0 already
+    // failed closed in the support check. m0 carries the entry count as a
+    // float, m1 carries the packed 3-bit indices via floatBitsToUint.
+    uint32_t tp5_packed = 0;
+    uint32_t tp5_count  = 0;
+    const bool tp5_mapped_node = dst->op_params[8] == GGML_TP5_HEADMAP_MAGIC;
+    if (tp5_mapped_node) {
+        // A mapped node that reached dispatch with an invalid map or an
+        // unsupported combination is a scheduling bug: supports_op already
+        // rejected it. Assert (never silently run the uniform ratio).
+        GGML_ASSERT(ggml_vk_fa_headmap_decode(dst, &tp5_packed, &tp5_count) &&
+                    "TP5 mapped FA node reached dispatch with an invalid head map");
+        GGML_ASSERT(max_bias == 0.0f && "TP5 headmap FA requires max_bias == 0");
+        GGML_ASSERT((mask == nullptr || nem2 == 1) &&
+                    "TP5 headmap FA requires a shared mask (mask->ne[2] == 1)");
+        GGML_ASSERT(gqa_ratio == 1);
+        mask_n_head_log2 |= 1u << 25;
+        m0 = (float) tp5_count;
+        memcpy(&m1, &tp5_packed, sizeof(m1));
+    }
 
     if (use_mask_opt)
     {
@@ -14569,7 +15092,8 @@ static void ggml_vk_segment_project(ggml_backend_vk_context * ctx,
                                     const ggml_tensor *       input,
                                     const ggml_tensor *       output,
                                     vk_pipeline &             pipeline,
-                                    const ggml_tensor *       extra) {
+                                    const ggml_tensor *       extra,
+                                    const vk_subbuffer *      b_override = nullptr) {
     const ggml_tensor *             weights = matmul->src[0];
     const uint32_t                  k       = static_cast<uint32_t>(weights->ne[0]);
     const uint32_t                  m       = static_cast<uint32_t>(output->ne[0]);
@@ -14589,8 +15113,11 @@ static void ggml_vk_segment_project(ggml_backend_vk_context * ctx,
         return;
     }
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    // NativeHC zone: b_override substitutes the B (activation) binding — used
+    // by the q8dot down consumer, whose B is the Q8_0 companion scratch.
+    const vk_subbuffer b_sub = b_override ? *b_override : ggml_vk_tensor_subbuffer(ctx, input);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                              { ggml_vk_tensor_subbuffer(ctx, weights), ggml_vk_tensor_subbuffer(ctx, input), out,
+                              { ggml_vk_tensor_subbuffer(ctx, weights), b_sub, out,
                                 extra ? ggml_vk_tensor_subbuffer(ctx, extra) : out, out },
                               pc, { m, 1, 1 });
 }
@@ -14612,6 +15139,17 @@ static void ggml_vk_hc_segment(ggml_backend_vk_context * ctx, vk_context & subct
                                 ctx->device->pipeline_hc_sum_f16 && ctx->recorded_dispatches == 0 &&
                                 !ctx->do_add_rms_partials && !ctx->add_rms_partials_initialized &&
                                 subctx->seqs.size() == 1 && subctx->seqs.front().size() == 1;
+    // NativeHC zone: opt-in variant selection. The native pipelines remain the
+    // default; a variant is used only when its pipeline was created (opt-in env
+    // plus RADV/capability gates in ggml_vk_load_shaders). Only one wg variant
+    // is ever created, so the first non-null entry is the selected one.
+    vk_pipeline & down_pipeline = ctx->device->pipeline_hc_down_silu_q8dot ? ctx->device->pipeline_hc_down_silu_q8dot :
+                                ctx->device->pipeline_hc_down_silu_wg[0] ? ctx->device->pipeline_hc_down_silu_wg[0] :
+                                ctx->device->pipeline_hc_down_silu_wg[1] ? ctx->device->pipeline_hc_down_silu_wg[1] :
+                                ctx->device->pipeline_hc_down_silu_wg[2] ? ctx->device->pipeline_hc_down_silu_wg[2] :
+                                ctx->device->pipeline_hc_down_silu;
+    vk_pipeline & up_pipeline = ctx->device->pipeline_hc_project_fold_r320 ? ctx->device->pipeline_hc_project_fold_r320 :
+                               ctx->device->pipeline_hc_project_fold;
 
     if (combine && !fuse_inject) {
         ggml_vk_segment_project(
@@ -14623,14 +15161,60 @@ static void ggml_vk_hc_segment(ggml_backend_vk_context * ctx, vk_context & subct
     memcpy(&pc.epsilon, norm->op_params, sizeof(pc.epsilon));
     vk_pipeline & norm_pipeline =
         fuse_inject ? ctx->device->pipeline_hc_inject_norm : ctx->device->pipeline_hc_segment_norm[combine];
+    // NativeHC zone (GGML_VK_HC_DOT=q8): the standalone 9-binding Q8-companion
+    // producer covers EVERY HC norm site — combine 0/1, fuse_inject or not —
+    // so all 97 producers emit the companion. The 13-binding fused variant is
+    // collective-dispatched only (bindings 1-5 are mailbox slots). The F32
+    // normalized output and the other 8 bindings are unchanged; binding 8
+    // receives a Q8_0 companion scratch (one 34-byte block per 32 elements).
+    const bool hc_quant_producer =
+        (fuse_inject ? (ctx->device->pipeline_hc_inject_norm_q8 != nullptr)
+                     : (ctx->device->pipeline_hc_segment_norm_q8[combine] != nullptr)) &&
+        ctx->device->pipeline_hc_down_silu_q8dot && ggml_nelements(normalized) % 32 == 0;
+    // Q8_0 row bytes via ggml_row_size (block count * 34), NOT blck_size (32):
+    // blck_size would underallocate by 2 bytes per block.
+    const uint64_t hc_quant_bytes =
+        hc_quant_producer ? uint64_t(ggml_row_size(GGML_TYPE_Q8_0, ggml_nelements(normalized))) : 0;
+    if (hc_quant_producer && (!ctx->hc_quant_scratch || ctx->hc_quant_scratch->size < hc_quant_bytes)) {
+        // Growth invalidation: every live recording that bound the old buffer
+        // holds recorded descriptors into freed memory. Pin the old buffer for
+        // the recordings that used it (via recording_quant_owners, drained into
+        // each cache entry's buffer_owners at commit), then invalidate ALL cache
+        // entries: their recorded dispatches reference the replaced allocation.
+        if (ctx->hc_quant_scratch && !ctx->recording_quant_owners.empty() &&
+            std::find(ctx->recording_quant_owners.begin(), ctx->recording_quant_owners.end(),
+                      ctx->hc_quant_scratch) == ctx->recording_quant_owners.end()) {
+            ctx->recording_quant_owners.push_back(ctx->hc_quant_scratch);
+        }
+        if (ctx->hc_quant_scratch) {
+            ggml_vk_cache_invalidate_all(ctx);
+        }
+        ctx->hc_quant_scratch = ggml_vk_create_buffer_device(ctx->device, hc_quant_bytes);
+    }
+    if (hc_quant_producer && ctx->replay_recording &&
+        std::find(ctx->recording_quant_owners.begin(), ctx->recording_quant_owners.end(),
+                  ctx->hc_quant_scratch) == ctx->recording_quant_owners.end()) {
+        // Pin the buffer used by the recording currently being built.
+        ctx->recording_quant_owners.push_back(ctx->hc_quant_scratch);
+    }
+    if (hc_quant_producer) {
+        norm_pipeline = fuse_inject ? ctx->device->pipeline_hc_inject_norm_q8 :
+                                     ctx->device->pipeline_hc_segment_norm_q8[combine];
+    }
     ggml_pipeline_request_descriptor_sets(ctx, norm_pipeline, 1);
+    // Only materialize the companion subbuffer when the Q8 producer is active;
+    // otherwise the scratch is null and eager DescriptorBufferInfo conversion
+    // of a null vk_buffer would crash before the dispatch even runs.
+    const vk_subbuffer hc_quant_sub = hc_quant_producer ? vk_subbuffer{ ctx->hc_quant_scratch, 0, hc_quant_bytes }
+                                                       : vk_subbuffer{ ctx->hc_quant_scratch, 0, 0 };
     ggml_vk_dispatch_pipeline(
         ctx, subctx, norm_pipeline,
         { ggml_vk_tensor_subbuffer(ctx, residual), ggml_vk_tensor_subbuffer(ctx, block),
           ggml_vk_tensor_subbuffer(ctx, inject), ggml_vk_tensor_subbuffer(ctx, normalized->src[1]),
           ggml_vk_tensor_subbuffer(ctx, combined), ggml_vk_tensor_subbuffer(ctx, normalized),
           ggml_vk_tensor_subbuffer(ctx, combine ? inject->src[0] : residual),
-          ggml_vk_tensor_subbuffer(ctx, combine ? inject->src[1] : residual) },
+          ggml_vk_tensor_subbuffer(ctx, combine ? inject->src[1] : residual),
+          hc_quant_sub },
         pc, { 4, 1, 1 });
     ggml_vk_segment_barrier(ctx, subctx);
     if (capture_prefix) {
@@ -14643,16 +15227,21 @@ static void ggml_vk_hc_segment(ggml_backend_vk_context * ctx, vk_context & subct
         ctx->hc_sum_recorded.block    = binding(block);
         ctx->hc_sum_recorded.bindings = { binding(residual),   binding(normalized->src[1]), binding(combined),
                                           binding(normalized), binding(inject->src[0]),     binding(inject->src[1]) };
+        ctx->hc_sum_recorded.quantized = {};
+        if (hc_quant_producer) {
+            ctx->hc_sum_recorded.quantized = { (VkBuffer) hc_quant_sub.buffer->buffer, hc_quant_sub.offset,
+                                               hc_quant_sub.size, hc_quant_sub.buffer };
+        }
         ctx->hc_prefix_recorded       = (void *) (VkCommandBuffer) subctx->s->buffer->buf;
         // Both CBs remain in ordinary execution. Only the collective chain
         // may replace this exact prefix with a completed fused P2 dispatch.
         ggml_vk_ctx_begin(ctx->device, subctx);
     }
-    ggml_vk_segment_project(ctx, subctx, graph->nodes[base + 3], normalized, lo, ctx->device->pipeline_hc_down_silu,
-                            nullptr);
+    const bool hc_quant_consumer = down_pipeline == ctx->device->pipeline_hc_down_silu_q8dot;
+    ggml_vk_segment_project(ctx, subctx, graph->nodes[base + 3], normalized, lo, down_pipeline,
+                            nullptr, hc_quant_consumer ? &hc_quant_sub : nullptr);
     ggml_vk_segment_barrier(ctx, subctx);
-    ggml_vk_segment_project(ctx, subctx, graph->nodes[base + 6], lo, mixed, ctx->device->pipeline_hc_project_fold,
-                            normalized);
+    ggml_vk_segment_project(ctx, subctx, graph->nodes[base + 6], lo, mixed, up_pipeline, normalized);
 }
 
 static void ggml_vk_moe_output_segment(ggml_backend_vk_context * ctx,
@@ -14709,12 +15298,65 @@ static void ggml_vk_moe_output_segment(ggml_backend_vk_context * ctx,
     auto & wire_pipeline =
         fuse_shared_down ? ctx->device->pipeline_moe_down_fold_shared_wire : ctx->device->pipeline_moe_down_fold_wire;
     const bool    wire_output = ctx->wire_producer == node(28) && wire_pipeline;
+
+    // Paired-expert K=128 fast path: two selected experts per wave32 workgroup
+    // with independent half-wave reductions. Exact shape gate (K==128, 10
+    // selected experts, shared K==128 when fusing shared-down); pipelines are
+    // only created under the opt-in GGML_VK_MOE_DOWN_K128=1 flag, so anything
+    // unsupported keeps the native pipeline.
+    const bool    k128_fuse_shared = fuse_shared_down && shared_k == 128;
+    vk_pipeline & k128_pipeline =
+        k128_fuse_shared ? (wire_output ? ctx->device->pipeline_moe_down_k128_shared_wire :
+                                         ctx->device->pipeline_moe_down_k128_shared) :
+                           (wire_output ? ctx->device->pipeline_moe_down_k128_wire :
+                                         ctx->device->pipeline_moe_down_k128);
+    const bool use_k128 = k128_pipeline && k == 128 && experts == 10 &&
+                          (!fuse_shared_down || shared_k == 128) &&
+                          (!wire_output || k128_fuse_shared || ctx->device->pipeline_moe_down_k128_wire);
+    const vk_subbuffer out  = ggml_vk_tensor_subbuffer(ctx, node(28));
+    const vk_subbuffer wire{ ctx->wire_scratch, 0, m * sizeof(ggml_fp16_t) };
+    if (use_k128) {
+        const vk_moe_down_k128_push_constants k128_pc{ m };
+        ggml_pipeline_request_descriptor_sets(ctx, k128_pipeline, 1);
+        if (k128_fuse_shared && wire_output) {
+            ggml_vk_dispatch_pipeline(
+                ctx, subctx, k128_pipeline,
+                { ggml_vk_tensor_subbuffer(ctx, routed->src[0]), ggml_vk_tensor_subbuffer(ctx, routed->src[1]), out,
+                  ggml_vk_tensor_subbuffer(ctx, node(1)->src[1]), ggml_vk_tensor_subbuffer(ctx, routed->src[2]),
+                  ggml_vk_tensor_subbuffer(ctx, node(24)->src[0]), ggml_vk_tensor_subbuffer(ctx, node(23)),
+                  ggml_vk_tensor_subbuffer(ctx, node(25)), wire },
+                k128_pc, { m, 1, 1 });
+        } else if (wire_output) {
+            ggml_vk_dispatch_pipeline(
+                ctx, subctx, k128_pipeline,
+                { ggml_vk_tensor_subbuffer(ctx, routed->src[0]), ggml_vk_tensor_subbuffer(ctx, routed->src[1]), out,
+                  ggml_vk_tensor_subbuffer(ctx, node(1)->src[1]), ggml_vk_tensor_subbuffer(ctx, routed->src[2]),
+                  ggml_vk_tensor_subbuffer(ctx, node(24)), ggml_vk_tensor_subbuffer(ctx, node(25)), wire },
+                k128_pc, { m, 1, 1 });
+        } else if (k128_fuse_shared) {
+            ggml_vk_dispatch_pipeline(
+                ctx, subctx, k128_pipeline,
+                { ggml_vk_tensor_subbuffer(ctx, routed->src[0]), ggml_vk_tensor_subbuffer(ctx, routed->src[1]), out,
+                  ggml_vk_tensor_subbuffer(ctx, node(1)->src[1]), ggml_vk_tensor_subbuffer(ctx, routed->src[2]),
+                  ggml_vk_tensor_subbuffer(ctx, node(24)->src[0]), ggml_vk_tensor_subbuffer(ctx, node(23)),
+                  ggml_vk_tensor_subbuffer(ctx, node(25)) },
+                k128_pc, { m, 1, 1 });
+        } else {
+            ggml_vk_dispatch_pipeline(
+                ctx, subctx, k128_pipeline,
+                { ggml_vk_tensor_subbuffer(ctx, routed->src[0]), ggml_vk_tensor_subbuffer(ctx, routed->src[1]), out,
+                  ggml_vk_tensor_subbuffer(ctx, node(1)->src[1]), ggml_vk_tensor_subbuffer(ctx, routed->src[2]),
+                  ggml_vk_tensor_subbuffer(ctx, node(24)), ggml_vk_tensor_subbuffer(ctx, node(25)) },
+                k128_pc, { m, 1, 1 });
+        }
+        if (wire_output)
+            ctx->wire_recorded = ctx->wire_scratch;
+        return;
+    }
     vk_pipeline & pipeline    = wire_output ? wire_pipeline :
                                               (fuse_shared_down ? ctx->device->pipeline_moe_down_fold_shared :
                                                                   ctx->device->pipeline_moe_down_fold);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
-    const vk_subbuffer out = ggml_vk_tensor_subbuffer(ctx, node(28));
-    const vk_subbuffer wire{ ctx->wire_scratch, 0, m * sizeof(ggml_fp16_t) };
     if (fuse_shared_down && wire_output) {
         ggml_vk_dispatch_pipeline(
             ctx, subctx, pipeline,
@@ -14800,6 +15442,17 @@ static void ggml_vk_gdn_segment(ggml_backend_vk_context * ctx, vk_context & subc
     };
 
     const uint32_t                           key_heads = node(3)->ne[1], value_heads = node(6)->ne[1];
+    // TP5 GDN head map (opt-in): per-local-V-head QK indices from the GDN op
+    // params. Absent map keeps the native uniform V->QK broadcast.
+    const ggml_tp5_gdn_headmap               gdn_headmap = ggml_tp5_gdn_headmap_decode(node(15));
+    if (gdn_headmap.present) {
+        GGML_ASSERT(gdn_headmap.valid && "TP5 GDN head map count out of range");
+        GGML_ASSERT(gdn_headmap.count == value_heads && "TP5 GDN head map must cover every V head");
+        for (uint32_t i = 0; i < gdn_headmap.count; ++i) {
+            GGML_ASSERT(gdn_headmap.qk[i] < key_heads && "TP5 GDN head map index out of range");
+        }
+    }
+    const uint32_t headmap_pc = ggml_tp5_gdn_headmap_pack(&gdn_headmap);
     const vk_gdn_segment_prep_push_constants prep_pc{ key_heads, value_heads, ggml_get_op_params_f32(node(3), 0),
                                                       ggml_get_op_params_f32(node(5), 0) };
     auto &                                   prep =
@@ -14822,7 +15475,7 @@ static void ggml_vk_gdn_segment(ggml_backend_vk_context * ctx, vk_context & subc
     }
     ggml_vk_segment_barrier(ctx, subctx);
 
-    const vk_gdn_segment_delta_push_constants delta_pc{ value_heads, key_heads, 1.0f / sqrtf(128.0f) };
+    const vk_gdn_segment_delta_push_constants delta_pc{ value_heads, key_heads, 1.0f / sqrtf(128.0f), headmap_pc };
     if (ctx->fused_gdn_cached_segment && ctx->device->pipeline_gdn_cached_delta_norm) {
         auto &                                 delta_norm = ctx->device->pipeline_gdn_cached_delta_norm;
         const vk_gdn_delta_norm_push_constants pc{ delta_pc, ggml_get_op_params_f32(node(20), 0) };
@@ -15195,6 +15848,19 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         (rbb == 1 && K == 1 && n_tokens == 1 &&
          n_seqs >= 1));
 
+    // TP5 GDN head map (opt-in): fail closed before enqueue rather than
+    // silently running a wrong uniform Q/K broadcast.
+    const ggml_tp5_gdn_headmap headmap = ggml_tp5_gdn_headmap_decode(dst);
+    if (headmap.present) {
+        GGML_ASSERT(headmap.valid && "TP5 GDN head map count out of range");
+        GGML_ASSERT(rbb == 0 && "TP5 GDN head map requires the non-RBB path");
+        GGML_ASSERT(headmap.count == H && "TP5 GDN head map must cover every V head");
+        for (uint32_t i = 0; i < headmap.count; ++i) {
+            GGML_ASSERT(headmap.qk[i] < src_q->ne[1] && headmap.qk[i] < dst->src[1]->ne[1] &&
+                        "TP5 GDN head map index out of range");
+        }
+    }
+
     const uint32_t s_off = S_v * H * n_tokens * n_seqs;
 
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
@@ -15222,6 +15888,8 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
     const float scale = 1.0f / sqrtf((float)S_v);
+    // Bit 31 marks presence; the low 30 bits hold up to 10 packed 3-bit indices.
+    const uint32_t headmap_pc = ggml_tp5_gdn_headmap_pack(&headmap);
     const vk_op_gated_delta_net_push_constants pc = {
         H, n_tokens, n_seqs, s_off,
         sq1, sq2, sq3,
@@ -15229,7 +15897,8 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         sb1, sb2, sb3,
         neq1, rq3,
         scale,
-        K
+        K,
+        headmap_pc
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -16209,7 +16878,7 @@ static void ggml_vk_attention_segment(ggml_backend_vk_context * ctx,
             groups <= ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
             const auto     tuning = get_fa_tuning_params_scalar(ctx->device, k->ne[0], v->ne[0], q->ne[1], k->ne[1],
                                                                 k->type, v->type, true);
-            const uint32_t gqa = ggml_vk_flash_attn_gqa_ratio(q, k, v, mask->ne[2], std::min(tuning.block_rows, 32u));
+            const uint32_t gqa = ggml_vk_flash_attn_gqa_ratio(q, k, v, fa, mask->ne[2], std::min(tuning.block_rows, 32u));
             const vk_attention_prep_compact_push_constants compact_pc{
                 pc, uint32_t((q_gamma.offset - start) / sizeof(float)),
                 uint32_t((k_gamma.offset - start) / sizeof(float)),
@@ -16400,6 +17069,200 @@ static void ggml_vk_soft_max_back(ggml_backend_vk_context * ctx, vk_context& sub
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_SOFT_MAX_BACK, { (uint32_t)src0->ne[0], (uint32_t)ggml_nrows(src0), op_params[0], op_params[1], 0.0f, 0.0f });
 }
 
+// Dedicated Qwen4 replicated router gate matmul (RouterPaths zone).
+//
+// Shape contract: the replicated router gate mul_mat is
+//   dst[512,1] = W[512,2560] @ x[2560,1]
+// with W F32 contiguous, x F32 contiguous, single row, no fusion, and
+// (for the tiling path) the generic dmmv eligibility satisfied. The
+// dedicated kernel computes the same logits with the input vector staged
+// once per 8-expert workgroup tile instead of once per expert workgroup.
+static uint32_t n_experts_tile_check(const ggml_tensor * src0) {
+    return (uint32_t) src0->ne[1];
+}
+
+// True when the node is the replicated router gate shape regardless of
+// tiling/mode eligibility: used to fail closed when a requested non-F32
+// router precision cannot actually execute.
+static bool ggml_vk_is_router_gate_shape(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+           src0->ne[0] == 2560 && src0->ne[1] == 512 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+           src1->ne[0] == 2560 && ggml_nrows(src1) == 1 && dst->ne[0] == 512 && dst->ne[1] == 1;
+}
+
+static bool ggml_vk_router_gate_eligible(ggml_backend_vk_context * ctx, const ggml_tensor * src0,
+                                         const ggml_tensor * src1, const ggml_tensor * dst) {
+    if (!ctx->router_tiling) {
+        return false;
+    }
+    if (ctx->num_additional_fused_ops != 0) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (src0->ne[0] != 2560 || src0->ne[1] != 512 || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+        src1->ne[0] != 2560 || ggml_nrows(src1) != 1 || dst->ne[0] != 512 || dst->ne[1] != 1) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    if (get_misalign_bytes(ctx, src0) != 0 || get_misalign_bytes(ctx, src1) != 0 || get_misalign_bytes(ctx, dst) != 0) {
+        return false;
+    }
+    // The SHMEM-reduction variant barriers after the per-row partial write;
+    // a partial expert tile would diverge the barrier. Require whole tiles.
+    if (n_experts_tile_check(src0) % 8 != 0) {
+        return false;
+    }
+    // The shader stages the full input vector in shared memory.
+    if (src0->ne[0] > ctx->device->properties.limits.maxComputeSharedMemorySize / sizeof(float)) {
+        return false;
+    }
+    const int mode_idx = (int) ctx->router_weights;
+    return ctx->device->pipeline_qwen4_router[mode_idx][0] != nullptr ||
+           ctx->device->pipeline_qwen4_router[mode_idx][1] != nullptr;
+}
+
+// One-time device-side conversion of an immutable F32 router weight tensor
+// into the requested execution precision. Reuses the existing cpy pipelines
+// (contig f32->f16 / f32->q8_0 quantize) so no new conversion shader exists.
+// The conversion runs in its own submitted command buffer, outside any
+// replay recording, so cached replay command buffers never contain it.
+static vk_subbuffer ggml_vk_router_converted_weight(ggml_backend_vk_context * ctx, const ggml_tensor * src0) {
+    const int mode_slot = ctx->router_weights == ggml_backend_vk_context::router_weight_mode::f16 ? 0 : 1;
+
+    // Source identity: the device buffer + byte range backing the weight
+    // tensor (stable across graph rebuilds; invalidated on overlapping
+    // writes by ggml_vk_router_invalidate_weight_write).
+    const vk_subbuffer src_sub = ggml_vk_tensor_subbuffer(ctx, src0);
+    const VkBuffer src_key = src_sub.buffer ? src_sub.buffer->buffer : VK_NULL_HANDLE;
+
+    const uint64_t n_elem = ggml_nelements(src0);
+    const ggml_type dst_type = mode_slot == 0 ? GGML_TYPE_F16 : GGML_TYPE_Q8_0;
+    const uint64_t dst_size =
+        mode_slot == 0 ? n_elem * sizeof(ggml_fp16_t)
+                       : (n_elem / ggml_blck_size(GGML_TYPE_Q8_0)) * ggml_type_size(GGML_TYPE_Q8_0);
+
+    // Fast path: an existing conversion for exactly this (mode, buffer,
+    // range). This is the steady state for all 48 layers: one conversion per
+    // weight tensor for the whole process lifetime, never per token.
+    const uint64_t now = ++ctx->router_converted_clock;
+    for (auto & cache : ctx->router_converted) {
+        if (cache.src_vk_buffer == src_key && cache.src_offset == src_sub.offset &&
+            cache.src_size == src_sub.size && cache.buffer &&
+            cache.size == dst_size) {
+            cache.last_used = now;
+            return vk_subbuffer{ cache.buffer, 0, cache.size };
+        }
+    }
+
+    // Flush any in-flight work before mutating the cache: cached replay
+    // command buffers may still hold bindings to evicted conversions, so
+    // eviction also invalidates the replay cache (a legal drain: the next
+    // graph re-records).
+    ggml_vk_synchronize(ctx);
+
+    // Bounded LRU eviction: drop the least recently used entry when the
+    // table is full. Drain and retire cached CBs BEFORE destroying: they may
+    // hold bindings to the evicted conversion.
+    if (ctx->router_converted.size() >= ggml_backend_vk_context::kRouterConvertedMax) {
+        size_t lru = 0;
+        for (size_t i = 1; i < ctx->router_converted.size(); ++i) {
+            if (ctx->router_converted[i].last_used < ctx->router_converted[lru].last_used) {
+                lru = i;
+            }
+        }
+        ggml_vk_cache_invalidate_all(ctx);
+        ggml_vk_destroy_buffer(ctx->router_converted[lru].buffer);
+        ctx->router_converted.erase(ctx->router_converted.begin() + lru);
+    }
+
+    vk_buffer conv_buf = ggml_vk_create_buffer_device(ctx->device, dst_size);
+    {
+        vk_context subctx = ggml_vk_create_context(ctx, ctx->compute_cmd_pool);
+        ggml_vk_ctx_begin(ctx->device, subctx);
+        vk_pipeline pipeline =
+            mode_slot == 0 ? ggml_vk_get_cpy_pipeline(ctx, src0, nullptr, GGML_TYPE_F16)
+                           : ggml_vk_get_cpy_pipeline(ctx, src0, nullptr, dst_type);
+        GGML_ASSERT(pipeline != nullptr);
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+        vk_subbuffer in = ggml_vk_tensor_subbuffer(ctx, src0);
+        vk_subbuffer out{ conv_buf, 0, dst_size };
+        const uint32_t ne = (uint32_t) n_elem;
+        // The destination is a dense contiguous buffer of the target type:
+        // dst strides are the dense F32 strides (the shader's dst_idx_quant
+        // divides the flat element index by QUANT_K to index blocks).
+        vk_op_unary_push_constants pc = vk_op_unary_push_constants_init(src0, src0, ne);
+        pc.nb10 = 1;
+        pc.nb11 = (uint32_t) src0->ne[0];
+        pc.nb12 = (uint32_t)(src0->ne[0] * src0->ne[1]);
+        pc.nb13 = (uint32_t)(src0->ne[0] * src0->ne[1] * src0->ne[2]);
+        init_pushconst_fastdiv(pc);
+        pc.misalign_offsets = 0;
+        // Element counts mirror the GGML_OP_CPY case in ggml_vk_op_f32:
+        // the f16 contig cpy pipeline uses 512-element workgroups, and the
+        // f32->quant copy_to_quant pipeline uses 32*QUANT_K-element groups
+        // (ne pre-divided by the destination block size).
+        uint32_t ne_dispatch = ne;
+        if (mode_slot == 1) {
+            ne_dispatch = CEIL_DIV(ne, (uint32_t) ggml_blck_size(GGML_TYPE_Q8_0));
+        }
+        std::array<uint32_t, 3> elements;
+        if (ne_dispatch > 262144) {
+            elements = { 512, 512, CEIL_DIV(ne_dispatch, 262144) };
+        } else if (ne_dispatch > 512) {
+            elements = { 512, CEIL_DIV(ne_dispatch, 512), 1 };
+        } else {
+            elements = { ne_dispatch, 1, 1 };
+        }
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { in, out }, pc, elements);
+        ggml_vk_ctx_end(subctx);
+        ggml_vk_submit(subctx, {});
+        ctx->submit_pending = true;
+        ggml_vk_synchronize(ctx);
+    }
+
+    ggml_backend_vk_context::router_converted_weight entry {};
+    entry.src_vk_buffer = src_key;
+    entry.src_offset = src_sub.offset;
+    entry.src_size = src_sub.size;
+    entry.buffer = conv_buf;
+    entry.size = dst_size;
+    entry.last_used = now;
+    ctx->router_converted.push_back(entry);
+    return vk_subbuffer{ conv_buf, 0, dst_size };
+}
+
+static void ggml_vk_router_gate_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx,
+                                        const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const int mode_idx = (int) ctx->router_weights;
+    vk_pipeline pipeline = ctx->device->pipeline_qwen4_router[mode_idx][1];
+    if (!pipeline) {
+        pipeline = ctx->device->pipeline_qwen4_router[mode_idx][0];
+    }
+    GGML_ASSERT(pipeline != nullptr);
+
+    vk_subbuffer a_buf = ggml_vk_tensor_subbuffer(ctx, src0);
+    if (mode_idx != 0) {
+        a_buf = ggml_vk_router_converted_weight(ctx, src0);
+    }
+    const vk_subbuffer b_buf = ggml_vk_tensor_subbuffer(ctx, src1);
+    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    constexpr uint32_t tile_threads = 256;
+    constexpr uint32_t block_size = 32;
+    const uint32_t expert_tile = tile_threads / block_size; // 8
+    const uint32_t n_experts = (uint32_t) src0->ne[1];
+    const uint32_t ncols = (uint32_t) src0->ne[0];
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const vk_op_router_push_constants pc { ncols, n_experts, expert_tile, 0 };
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { a_buf, b_buf, d_buf }, pc,
+                              { CEIL_DIV(n_experts, expert_tile), 1, 1 });
+}
+
 static void ggml_vk_topk_moe(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_cgraph * cgraph, int node_idx) {
     topk_moe_mode mode = ctx->fused_topk_moe_mode;
     const bool has_bias = mode == TOPK_MOE_SIGMOID_NORM_BIAS || mode == TOPK_MOE_SQRT_SOFTPLUS_NORM_BIAS;
@@ -16486,6 +17349,103 @@ static void ggml_vk_topk_moe(ggml_backend_vk_context * ctx, vk_context& subctx, 
                                                  std::array<uint32_t, 3>{ CEIL_DIV(n_rows, rows_per_block), 1, 1 };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {logits_buf, bias_buf, weights_buf, ids_buf}, pc, elements);
+
+    // RouterPaths zone: per-layer diagnostic capture, identical for the
+    // generic dmmv path and the dedicated router matmul (the gate matmul no
+    // longer touches diagnostics). All copies are recorded in THIS
+    // (replayable) command buffer, so warm cached-CB replay refreshes the
+    // owned per-layer GPU storage every token. Layer identity comes from
+    // the gate MUL_MAT weight operand that produced the logits (views
+    // unwrapped), so the slot is the actual blk.N of the real router
+    // weight tensor; layers outside the configured cap are skipped (no
+    // modulo aliasing, no hash fallback).
+    if (ctx->router_diag_layers != 0 && ctx->fused_topk_moe_staged &&
+        n_experts == 512 && n_rows == 1 && n_expert_used == 10 &&
+        mode == TOPK_MOE_EARLY_SOFTMAX_NORM && ctx->router_diag_gpu) {
+        const ggml_tensor * wsrc = nullptr;
+        if (logits->op == GGML_OP_MUL_MAT) {
+            wsrc = logits->src[0];
+        } else if (logits->view_src != nullptr && logits->view_src->op == GGML_OP_MUL_MAT) {
+            wsrc = logits->view_src->src[0];
+        } else if (logits->op == GGML_OP_VIEW && logits->src[0] != nullptr &&
+                   logits->src[0]->op == GGML_OP_MUL_MAT) {
+            wsrc = logits->src[0]->src[0];
+        }
+        if (wsrc != nullptr) {
+            int64_t layer = -1;
+            const char * nm = wsrc->name;
+            if (nm[0] == '\0' && wsrc->view_src != nullptr) {
+                nm = wsrc->view_src->name;
+            }
+            if (strncmp(nm, "blk.", 4) == 0 && nm[4] >= '0' && nm[4] <= '9') {
+                layer = 0;
+                for (const char * c = nm + 4; *c >= '0' && *c <= '9'; ++c) {
+                    layer = layer * 10 + (*c - '0');
+                    if (layer > 100000) { layer = -1; break; }
+                }
+            }
+            if (layer >= 0 && (uint64_t) layer < (uint64_t) ctx->router_diag_layers) {
+                const uint32_t slot = (uint32_t) layer;
+                const uint64_t rec_base = (uint64_t) 24u * slot;
+                const uint64_t logits_base =
+                    (uint64_t) 24u * ctx->router_diag_layers + (uint64_t) 512u * slot;
+
+                // COMPUTE/ShaderWrite (topk outputs + gate logits) ->
+                // TRANSFER/TransferRead before the copies.
+                for (const vk_subbuffer * src : { &ids_buf, &weights_buf, &logits_buf }) {
+                    vk::BufferMemoryBarrier b;
+                    b.setSrcAccessMask(vk::AccessFlagBits::eShaderWrite)
+                     .setDstAccessMask(vk::AccessFlagBits::eTransferRead)
+                     .setSrcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                     .setDstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                     .setBuffer(src->buffer->buffer)
+                     .setOffset(0)
+                     .setSize(VK_WHOLE_SIZE);
+                    subctx->s->buffer->buf.pipelineBarrier(
+                        vk::PipelineStageFlagBits::eComputeShader,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        {}, {}, { b }, {});
+                }
+
+                vk_buffer diag = ctx->router_diag_gpu;
+                vk_buffer ids_src = ids_buf.buffer;
+                vk_buffer w_src = weights_buf.buffer;
+                vk_buffer lg_src = logits_buf.buffer;
+                // ids: 10 x int32 in record slots [0..9].
+                ggml_vk_buffer_copy_async(subctx, diag, rec_base * sizeof(float),
+                                          ids_src, ids_buf.offset, 10 * sizeof(int32_t));
+                // normalized weights: 10 x float in record slots [10..19].
+                ggml_vk_buffer_copy_async(subctx, diag, (rec_base + 10u) * sizeof(float),
+                                          w_src, weights_buf.offset, 10 * sizeof(float));
+                // gate logits: 512 x float for the margin recompute.
+                ggml_vk_buffer_copy_async(subctx, diag, logits_base * sizeof(float),
+                                          lg_src, logits_buf.offset, 512 * sizeof(float));
+
+                // TRANSFER/TransferWrite -> COMPUTE/ShaderRead|ShaderWrite
+                // on the diag storage: the ids/weights scratch is reused by
+                // later compute ops in this same command buffer, and the
+                // diag storage is read by the accessor's staging copy.
+                {
+                    vk::BufferMemoryBarrier b;
+                    b.setSrcAccessMask(vk::AccessFlagBits::eTransferWrite)
+                     .setDstAccessMask(vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite)
+                     .setSrcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                     .setDstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                     .setBuffer(diag->buffer)
+                     .setOffset(0)
+                     .setSize(VK_WHOLE_SIZE);
+                    subctx->s->buffer->buf.pipelineBarrier(
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::PipelineStageFlagBits::eComputeShader,
+                        {}, {}, { b }, {});
+                }
+
+                if (slot + 1u > ctx->router_diag_slots_used) {
+                    ctx->router_diag_slots_used = slot + 1u;
+                }
+            }
+        }
+    }
 }
 
 static void ggml_vk_rope(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx, bool backprop) {
@@ -18921,6 +19881,15 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_sparse_meta);
     ggml_vk_destroy_buffer(ctx->sync_staging);
 
+    // RouterPaths zone: owned converted router weight buffers and the
+    // owned diagnostic GPU storage (bounded teardown, no stale conversions).
+    for (auto & conv : ctx->router_converted) {
+        ggml_vk_destroy_buffer(conv.buffer);
+    }
+    ctx->router_converted.clear();
+    ggml_vk_destroy_buffer(ctx->router_diag_gpu);
+    ctx->router_diag_slots_used = 0;
+
     ctx->prealloc_y_last_pipeline_used = nullptr;
     ctx->prealloc_y_last_tensor_used = nullptr;
     ctx->prealloc_y_last_decode_vector_staging = false;
@@ -19008,9 +19977,63 @@ static void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     // When any buffer is freed, invalidate cached replays on its device to prevent false matches on reused buffer handles
     vk_device dev = ctx->device.lock();
     if (dev) {
-        std::lock_guard<std::recursive_mutex> guard(dev->mutex);
-        for (auto * bctx : dev->registered_contexts) {
+        const VkBuffer freed_handle = ctx->dev_buffer ? ctx->dev_buffer->buffer : VK_NULL_HANDLE;
+        std::vector<ggml_backend_vk_context *> affected;
+        {
+            std::lock_guard<std::recursive_mutex> guard(dev->mutex);
+            for (auto * bctx : dev->registered_contexts) {
+                for (const auto & conv : bctx->router_converted) {
+                    if (conv.src_vk_buffer == freed_handle) {
+                        affected.push_back(bctx);
+                        break;
+                    }
+                }
+            }
+        }
+        // RouterPaths zone: evict ONLY conversions whose source buffer is
+        // the one being freed (other buffers' conversions stay alive), and
+        // keep the owned diag storage (it lives until context cleanup).
+        // Drain before destroying: cached CBs may hold bindings.
+        for (auto * bctx : affected) {
+            ggml_vk_synchronize(bctx);
             ggml_vk_cache_invalidate_all(bctx);
+            for (size_t i = 0; i < bctx->router_converted.size(); ) {
+                if (bctx->router_converted[i].src_vk_buffer == freed_handle) {
+                    ggml_vk_destroy_buffer(bctx->router_converted[i].buffer);
+                    bctx->router_converted.erase(bctx->router_converted.begin() + i);
+                } else {
+                    ++i;
+                }
+            }
+        }
+        // Unrelated buffers still require the existing global replay
+        // Narrowed invalidation: only invalidate cache entries that actually reference
+        // the freed buffer. Completely unrelated temporary buffers (such as prompt eval
+        // scratch) must not wipe the entire device's decode command replay cache!
+        {
+            std::lock_guard<std::recursive_mutex> guard(dev->mutex);
+            for (auto * bctx : dev->registered_contexts) {
+                bool any_freed = false;
+                for (auto it = bctx->cgraph_cmd_cache.begin(); it != bctx->cgraph_cmd_cache.end(); ) {
+                    bool uses_freed = false;
+                    for (const auto & owner : it->second.buffer_owners) {
+                        if (owner && owner->buffer == freed_handle) {
+                            uses_freed = true;
+                            break;
+                        }
+                    }
+                    if (uses_freed) {
+                        any_freed = true;
+                        ggml_vk_cache_entry_free_resources(bctx, it->second);
+                        it = bctx->cgraph_cmd_cache.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                if (any_freed) {
+                    ggml_vk_synchronize(bctx);
+                }
+            }
         }
     }
     ggml_vk_destroy_buffer(ctx->dev_buffer);
@@ -19031,6 +20054,54 @@ static enum ggml_status ggml_backend_vk_buffer_init_tensor(ggml_backend_buffer_t
     return GGML_STATUS_SUCCESS;
 }
 
+// RouterPaths zone: invalidate converted router weights whose source bytes
+// are (partially) overwritten by a real weight write/copy/memset. Keyed by
+// byte-range overlap on the same VkBuffer, so input-vector writes never flush
+// router conversions. Called with the device mutex NOT held; takes it.
+static void ggml_vk_router_invalidate_weight_write(ggml_backend_vk_buffer_context * buf_ctx, const ggml_tensor * tensor,
+                                                   size_t offset, size_t size) {
+    vk_device dev = buf_ctx->device.lock();
+    if (!dev) {
+        return;
+    }
+    const uint64_t w_off = vk_tensor_offset(tensor) + tensor->view_offs + offset;
+    const uint64_t w_end = w_off + size;
+    const VkBuffer freed_handle = buf_ctx->dev_buffer ? buf_ctx->dev_buffer->buffer : VK_NULL_HANDLE;
+    std::vector<ggml_backend_vk_context *> affected;
+    {
+        std::lock_guard<std::recursive_mutex> guard(dev->mutex);
+        for (auto * bctx : dev->registered_contexts) {
+            for (const auto & conv : bctx->router_converted) {
+                if (conv.src_vk_buffer == freed_handle &&
+                    w_off < conv.src_offset + conv.src_size &&
+                    conv.src_offset < w_end) {
+                    affected.push_back(bctx);
+                    break;
+                }
+            }
+        }
+    }
+    // Drain and retire BEFORE destroying: cached replay command buffers may
+    // still hold bindings to the conversions, and in-flight work may still
+    // reference them. Order: drain -> invalidate cache -> destroy + erase.
+    for (auto * bctx : affected) {
+        ggml_vk_synchronize(bctx);
+        ggml_vk_cache_invalidate_all(bctx);
+        for (size_t i = 0; i < bctx->router_converted.size(); ) {
+            auto & conv = bctx->router_converted[i];
+            const bool overlap = conv.src_vk_buffer == freed_handle &&
+                                 w_off < conv.src_offset + conv.src_size &&
+                                 conv.src_offset < w_end;
+            if (overlap) {
+                ggml_vk_destroy_buffer(conv.buffer);
+                bctx->router_converted.erase(bctx->router_converted.begin() + i);
+            } else {
+                ++i;
+            }
+        }
+    }
+}
+
 static void ggml_backend_vk_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     VK_LOG_DEBUG("ggml_backend_vk_buffer_memset_tensor(" << buffer << ", " << tensor << ", " << value << ", " << offset << ", " << size << ")");
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
@@ -19040,6 +20111,7 @@ static void ggml_backend_vk_buffer_memset_tensor(ggml_backend_buffer_t buffer, g
         return;
     }
 
+    ggml_vk_router_invalidate_weight_write(buf_ctx, tensor, offset, size);
     uint32_t val32 = (uint32_t)value * 0x01010101;
     ggml_vk_buffer_memset(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, val32, size);
 }
@@ -19053,6 +20125,7 @@ static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml
         return;
     }
 
+    ggml_vk_router_invalidate_weight_write(buf_ctx, tensor, offset, size);
     ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
 }
 
@@ -19067,6 +20140,7 @@ static void ggml_backend_vk_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, g
         return;
     }
 
+    ggml_vk_router_invalidate_weight_write(buf_ctx, tensor, offset, size * n_copies);
     ggml_vk_buffer_write_2d(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, stride_data, stride_tensor, size, n_copies);
 }
 
@@ -19110,6 +20184,7 @@ static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, cons
         vk_buffer src_buf = src_buf_ctx->dev_buffer;
         vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
 
+        ggml_vk_router_invalidate_weight_write(dst_buf_ctx, dst, 0, ggml_nbytes(src));
         ggml_vk_buffer_copy(dst_buf, vk_tensor_offset(dst) + dst->view_offs, src_buf, vk_tensor_offset(src) + src->view_offs, ggml_nbytes(src));
 
         return true;
@@ -19435,6 +20510,7 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
     }
 
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
+    ggml_vk_router_invalidate_weight_write(buf_ctx, tensor, offset, size * n_copies);
 
     vk_context cpy_ctx;
 
@@ -19508,6 +20584,7 @@ static bool ggml_backend_vk_set_tensor_snapshot_async(ggml_backend_t backend,
         return true;
 
     auto *     buf_ctx    = (ggml_backend_vk_buffer_context *) tensor->buffer->context;
+    ggml_vk_router_invalidate_weight_write(buf_ctx, tensor, offset, size);
     vk_context upload_ctx = ggml_vk_get_compute_ctx(ctx);
     // UpdateBuffer captures pData during recording. Queue both dependencies
     // with the upload, not a host fence per tensor; replay flushes this prefix
@@ -19698,6 +20775,11 @@ static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
     ggml_vk_synchronize(ctx);
+
+    // RouterPaths zone: no implicit diagnostic readback here. The owned
+    // per-layer GPU storage is refreshed by the recorded CB copies every
+    // pass (including warm replays) and read back only when the collector
+    // calls ggml_backend_vk_router_diag after a completed decode.
 
     ggml_vk_graph_cleanup(ctx);
 }
@@ -20622,6 +21704,12 @@ static bool ggml_vk_can_fuse_attention_segment(ggml_backend_vk_context * ctx, co
         return valid(t, type) && ggml_is_contiguous(t) && ggml_nelements(t) == size;
     };
     const int64_t width = node(7)->ne[0], heads = node(7)->ne[1], kv_heads = node(12)->ne[1];
+    // TP5 QSA head-mapped FA nodes carry an explicit per-Q-head KV map; the
+    // fused attention segment's prep shaders assume the uniform integer
+    // heads/kv_heads ratio, so mapped nodes must not take this fusion.
+    if (node(26)->op_params[8] == GGML_TP5_HEADMAP_MAGIC) {
+        return false;
+    }
     if (width < 2 || width > 1024 || width % 2 || heads <= 0 || kv_heads <= 0 || heads % kv_heads ||
         node(7)->ne[2] != 1 || node(7)->ne[3] != 1 || node(7)->nb[0] != sizeof(float) ||
         node(7)->nb[1] != 2 * width * sizeof(float) || node(7)->view_offs != 0 || !valid(node(7), GGML_TYPE_F32) ||
@@ -20699,6 +21787,7 @@ static bool ggml_vk_can_fuse_attention_segment(ggml_backend_vk_context * ctx, co
     return true;
 }
 
+
 static bool ggml_vk_can_fuse_gdn_segment(ggml_backend_vk_context * ctx, const ggml_cgraph * graph, int first) {
     static const bool disabled = getenv("GGML_VK_DISABLE_GDN_SEGMENT") != nullptr;
     // Projection/state reshapes and the cache-destination view are retained
@@ -20756,8 +21845,21 @@ static bool ggml_vk_can_fuse_gdn_segment(ggml_backend_vk_context * ctx, const gg
         return valid(t, GGML_TYPE_F32) && t->ne[0] == n0 && t->ne[1] == n1 && t->ne[2] == 1 && t->ne[3] == 1;
     };
     const int64_t hk = node(3)->ne[1], hv = node(6)->ne[1];
-    if (hk < 1 || hk > 32 || hv < 1 || hv > 96 || hv != 3 * hk)
+    // TP5 GDN head map (opt-in): the map carries an explicit QK index for
+    // every V head, so the uniform 3x ratio no longer holds (e.g. V10/QK4,
+    // V8/QK4). Without a map the native uniform layout is required.
+    const ggml_tp5_gdn_headmap gdn_headmap = ggml_tp5_gdn_headmap_decode(node(15));
+    if (gdn_headmap.present) {
+        if (!gdn_headmap.valid || hk < 1 || hk > 32 || hv < 1 || hv > 96 ||
+            hv != (int64_t) gdn_headmap.count)
+            return false;
+        for (uint32_t i = 0; i < gdn_headmap.count; ++i) {
+            if (gdn_headmap.qk[i] >= (uint32_t) hk)
+                return false;
+        }
+    } else if (hk < 1 || hk > 32 || hv < 1 || hv > 96 || hv != 3 * hk) {
         return false;
+    }
     const int64_t channels = 128 * (2 * hk + hv), head_values = 128 * hv, state_values = 128 * head_values;
     if (!shape(node(0), channels, 1) || !shape(node(0)->src[0], 4, channels) || !shape(node(0)->src[1], 4, channels) ||
         !shape(node(1), channels, 1) || ggml_get_unary_op(node(1)) != GGML_UNARY_OP_SILU || !shape(node(2), 128, hk) ||
@@ -21064,6 +22166,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     ctx->wire_recorded.reset();
     ctx->hc_prefix_recorded = nullptr;
+    // NativeHC zone: a new recording starts; its companion pins accumulate
+    // fresh. (Live entries keep their committed pins via buffer_owners.)
+    ctx->recording_quant_owners.clear();
     ctx->hc_sum_recorded    = {};
     ggml_tensor * terminal  = cgraph->n_nodes ? cgraph->nodes[cgraph->n_nodes - 1] : nullptr;
     if (terminal) {
@@ -21081,6 +22186,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             // Existing replay entries and collective plans retain the old
             // allocation; do not drain or mutate their recorded descriptors.
             ctx->wire_scratch = ggml_vk_create_buffer_device(ctx->device, bytes);
+        }
+    }
+
+    // RouterPaths zone: per-token diagnostic bookkeeping. The slot bindings
+    // are keyed by logits-tensor identity; the token counter lets the
+    // collector distinguish stale bindings after graph rebuilds.
+    // RouterPaths zone: pre-pass one-time router weight conversion (f16/q8_0
+    // modes). Must run BEFORE replay recording starts: the conversion
+    // submits and synchronizes its own command buffer and may replace a
+    // cached converted buffer, neither of which is safe mid-recording.
+    if (ctx->router_weights != ggml_backend_vk_context::router_weight_mode::f32 && ctx->router_tiling) {
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr &&
+                ggml_vk_router_gate_eligible(ctx, node->src[0], node->src[1], node)) {
+                ggml_vk_router_converted_weight(ctx, node->src[0]);
+            }
         }
     }
 
@@ -21138,7 +22260,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     if (it != ctx->cgraph_cmd_cache.end() && replay_enabled && replay_eligible && it->second.valid &&
         it->second.n_nodes == cgraph->n_nodes && it->second.scratch_gen == ctx->scratch_generation &&
-        !it->second.cmd_bufs.empty() && ggml_vk_cache_fingerprint_match(ctx, it->second, cgraph)) {
+        ggml_vk_cache_fingerprint_match(ctx, it->second, cgraph)) {
         ctx->replay_hits++;
         ggml_vk_publish_wire_output(ctx, terminal, it->second.wire_output);
         if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
@@ -21800,13 +22922,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 (double)total_vk_compute_us / vk_profile_batch);
         total_vk_compute_us = 0;
     }
-    if (ctx->replay_recording && !ctx->replay_pending_bufs.empty()) {
+    if (ctx->replay_recording) {
         auto & cache_entry = ctx->cgraph_cmd_cache[cgraph];
         cache_entry.valid = true;
         cache_entry.n_nodes = cgraph->n_nodes;
         cache_entry.cgraph_uid = cgraph->uid;
         cache_entry.scratch_gen = ctx->scratch_generation;
-        cache_entry.wire_requested = ctx->wire_target != nullptr;
+        cache_entry.wire_requested = cgraph->n_nodes > 0 && ctx->wire_target == cgraph->nodes[cgraph->n_nodes - 1];
         cache_entry.wire_output    = ctx->wire_recorded;
         cache_entry.cmd_bufs = ctx->replay_pending_bufs;
         cache_entry.hc_sum_prefix  = ctx->hc_prefix_recorded && cache_entry.cmd_bufs.size() > 1 &&
@@ -21841,7 +22963,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         for (const auto & buffer : { ctx->prealloc_x, ctx->prealloc_y, ctx->prealloc_split_k, ctx->prealloc_moe_route,
                                      ctx->prealloc_add_rms_partials, ctx->prealloc_sparse_meta })
             retain_buffer(buffer);
+        // NativeHC zone: pin every companion buffer used by THIS recording. A
+        // recording may span multiple HC sites and buffer growth may have
+        // swapped the scratch mid-lifetime, so pin the whole vector, not just
+        // the latest pointer. The vector is cleared per recording below.
+        for (const auto & buffer : ctx->recording_quant_owners)
+            retain_buffer(buffer);
         ggml_vk_cache_build_fingerprint(cache_entry, cgraph);
+        ctx->recording_quant_owners.clear();
         ctx->replay_recording = false;
         ctx->replay_pending_bufs.clear();
     } else if (ctx->replay_recording) {
@@ -22736,6 +23865,34 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 bool coopmat2 = device->coopmat2;
                 uint32_t HSK = op->src[1]->ne[0];
                 uint32_t HSV = op->src[2]->ne[0];
+                // TP5 QSA explicit head map: all FA pipeline families (scalar,
+                // coopmat1/2, dense + sparse + split_k) derive their K/V head
+                // indices through init_indices()/sparse_main, which honor the
+                // map. The map overlays the unused m0/m1 push constants, so
+                // mapped nodes require max_bias == 0. Mask-head selection is
+                // not map-aware (the model uses one shared mask row set), so
+                // mapped nodes require mask == nullptr || mask->ne[2] == 1.
+                // A present-but-invalid map (bad count / index out of range)
+                // returns false here rather than aborting the scheduler.
+                // Every unsupported mapped combination fails closed so no GPU
+                // work runs with the wrong uniform-ratio assumption.
+                const bool tp5_mapped = op->op_params[8] == GGML_TP5_HEADMAP_MAGIC;
+                if (tp5_mapped && !ggml_vk_fa_headmap_valid(op)) {
+                    return false;
+                }
+                if (tp5_mapped) {
+                    float max_bias_chk = 0.0f;
+                    memcpy(&max_bias_chk, (const float *) op->op_params + 1, sizeof(float));
+                    if (max_bias_chk != 0.0f) {
+                        return false;
+                    }
+                    if (op->src[3] && op->src[3]->ne[2] > 1) {
+                        return false;
+                    }
+                    if (op->src[2]->ne[2] != op->src[1]->ne[2]) {
+                        return false;
+                    }
+                }
                 if ((HSK % 8) != 0 || (HSV % 8) != 0) {
                     return false;
                 }
@@ -22806,6 +23963,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return false;
                 }
                 if (k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type)) {
+                    return false;
+                }
+                // TP5 QSA explicit head map is not implemented for the
+                // RERoT-DDVR indexed path; fail closed rather than run the
+                // uniform integer-ratio assumption.
+                if (op->op_params[8] == GGML_TP5_HEADMAP_MAGIC) {
                     return false;
                 }
                 if (q->nb[1] % sizeof(float) != 0 || q->nb[2] % sizeof(float) != 0) {
@@ -23524,6 +24687,30 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     (op->src[6] == nullptr || op->src[6]->type != GGML_TYPE_F32)) {
                     return false;
                 }
+                // TP5 GDN head map (opt-in): validate before enqueue so no
+                // GPU work runs with a wrong uniform Q/K broadcast. The map
+                // must cover every V head and stay in Q/K head range; the
+                // RBB paths fail closed (no mapped RBB variant exists).
+                {
+                    const ggml_tp5_gdn_headmap headmap = ggml_tp5_gdn_headmap_decode(op);
+                    if (headmap.present) {
+                        if (!headmap.valid) {
+                            return false;
+                        }
+                        if (ggml_get_op_params_i32(op, 1) != 0) {
+                            return false;
+                        }
+                        if (op->src[2]->ne[1] != (int64_t) headmap.count) {
+                            return false;
+                        }
+                        for (uint32_t i = 0; i < headmap.count; ++i) {
+                            if (headmap.qk[i] >= (uint32_t) op->src[0]->ne[1] ||
+                                headmap.qk[i] >= (uint32_t) op->src[1]->ne[1]) {
+                                return false;
+                            }
+                        }
+                    }
+                }
                 return op->type == GGML_TYPE_F32;
             }
         case GGML_OP_SSM_SCAN:
@@ -23851,6 +25038,108 @@ uint64_t ggml_backend_vk_get_sparse_dispatch_count(ggml_backend_t backend) {
     return ctx ? ctx->sparse_dispatch_count : 0;
 }
 
+// RouterPaths zone: bounded opt-in router diagnostic accessor for paired
+// validation. Returns a pointer to 24 * layers floats (nullptr when the
+// diagnostic is disabled), and stores the captured layer count in *layers.
+// Per-layer layout (24 floats): [0..9] top-10 expert ids, [10..19] top-10
+// normalized weights, [20] score10-score11 softmax margin, [21]/[22] the
+// softmax scores of ranks 10 and 11, [23] reserved zero. Data is refreshed
+// by ggml_backend_synchronize() after each graph compute.
+// RouterPaths zone: explicit diagnostic readback for Main's collector.
+// Contract: call AFTER a completed decode (get_logits / graph_compute_async
+// completion); this is the only place a host readback of the router
+// diagnostic storage happens. Every call returns the LATEST records: the
+// owned per-layer GPU storage is refreshed by CB-recorded copies on every
+// compute pass, warm cached-CB replay included.
+//
+// Per-layer record layout (24 floats, slot = stable layer id):
+//   [0..9]   top-10 expert ids (float bits of the int32 id values)
+//   [10..19] top-10 normalized router weights
+//   [20]     score10-score11 softmax margin (double-precision host recompute
+//            over this token's gate logits captured in owned storage)
+//   [21]     softmax score of rank 10
+//   [22]     softmax score of rank 11
+//   [23]     numeric actual blk layer id parsed from the router weight name
+//            (stable hash fallback for artificial test names)
+const float * ggml_backend_vk_router_diag(ggml_backend_t backend, uint32_t * layers) {
+    if (!ggml_backend_is_vk(backend)) {
+        return nullptr;
+    }
+    auto * ctx = (ggml_backend_vk_context *) backend->context;
+    if (!ctx || ctx->router_diag_layers == 0 || !ctx->router_diag_gpu) {
+        if (layers) {
+            *layers = 0;
+        }
+        return nullptr;
+    }
+    // Explicit disturbance: drain in-flight work, then read the whole owned
+    // storage (records + per-layer gate logits) on EVERY call. The caller
+    // contract is to invoke this only after a completed decode; each call
+    // returns the latest records (warm cached-CB replay refreshes the owned
+    // GPU storage every token via the CB-recorded copies).
+    ggml_vk_synchronize(ctx);
+    std::vector<float> gpu(24u * ctx->router_diag_layers +
+                           512u * ctx->router_diag_layers);
+    ggml_vk_buffer_read(ctx->router_diag_gpu, 0, gpu.data(), gpu.size() * sizeof(float));
+
+    const uint32_t n_records = ctx->router_diag_layers;
+    const uint32_t logits_base = 24u * n_records;
+    ctx->router_diag_host.assign(24u * n_records, 0.0f);
+    for (uint32_t slot = 0; slot < n_records; ++slot) {
+        float * out = ctx->router_diag_host.data() + 24u * slot;
+        const float * rec = gpu.data() + 24u * slot;
+        const float * logits = gpu.data() + logits_base + 512u * slot;
+
+        int32_t ids[10];
+        memcpy(ids, rec + 0, sizeof(ids));
+        for (uint32_t r = 0; r < 10u; ++r) {
+            out[r] = (float) ids[r];
+            out[10u + r] = rec[10u + r];
+        }
+        // Slot 23 is the actual blk.N layer id: the capture path only
+        // records real, in-range layers, so slot == layer id by construction.
+        // Skip empty slots (never bound): ids would be all zero.
+        bool bound = false;
+        for (uint32_t r = 0; r < 10u; ++r) {
+            if (ids[r] != 0 || rec[r] != 0.0f) {
+                bound = true;
+                break;
+            }
+        }
+        if (!bound) {
+            std::fill(out, out + 24u, 0.0f);
+            continue;
+        }
+        // Double-precision softmax margin over this token's gate logits.
+        double max_l = logits[0];
+        for (uint32_t e = 0; e < 512u; ++e) max_l = std::max(max_l, (double) logits[e]);
+        double sum_p = 0.0;
+        for (uint32_t e = 0; e < 512u; ++e) sum_p += std::exp((double) logits[e] - max_l);
+        const uint32_t id10 = (uint32_t) ids[9];
+        double p10 = std::exp((double) logits[id10] - max_l) / sum_p;
+        double best = -1.0;
+        for (uint32_t e = 0; e < 512u; ++e) {
+            bool selected = false;
+            for (uint32_t r = 0; r < 10u; ++r) {
+                if ((uint32_t) ids[r] == e) { selected = true; break; }
+            }
+            if (!selected) {
+                const double p = std::exp((double) logits[e] - max_l) / sum_p;
+                if (p > best) best = p;
+            }
+        }
+        const double p11 = best;
+        out[20] = (float) (p10 - p11);
+        out[21] = (float) p10;
+        out[22] = (float) p11;
+        out[23] = (float) slot;
+    }
+    if (layers) {
+        *layers = ctx->router_diag_slots_used;
+    }
+    return ctx->router_diag_host.data();
+}
+
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     extern bool ggml_backend_vk_tp5_submit_epoch_chain(void *, const std::vector<std::vector<std::vector<void *>>> &, const std::vector<std::vector<ggml_tensor *>> &);
@@ -23858,6 +25147,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     extern bool ggml_vk_tp5_get_cached_cmd_bufs(ggml_backend_t, ggml_cgraph *, std::vector<void *> &);
     if (strcmp(name, "ggml_backend_vk_flashprefill_scratch") == 0) {
         return (void *) ggml_backend_vk_flashprefill_scratch;
+    }
+    if (strcmp(name, "ggml_backend_vk_router_diag") == 0) {
+        return (void *) ggml_backend_vk_router_diag;
     }
     if (strcmp(name, "ggml_backend_graph_alloc_deps") == 0) {
         return (void *) ggml_vk_graph_alloc_deps;
@@ -23953,7 +25245,7 @@ bool ggml_vk_tp5_get_cached_cmd_bufs(ggml_backend_t backend, ggml_cgraph * cgrap
         return false;
     }
     if (it != ctx->cgraph_cmd_cache.end() && it->second.valid && it->second.n_nodes == cgraph->n_nodes &&
-        it->second.scratch_gen == ctx->scratch_generation && !it->second.cmd_bufs.empty() &&
+        it->second.scratch_gen == ctx->scratch_generation &&
         ggml_vk_cache_fingerprint_match(ctx, it->second, cgraph)) {
         out_cbs.clear();
         out_cbs.reserve(it->second.cmd_bufs.size());
@@ -24177,10 +25469,11 @@ bool ggml_vk_tp5_hc_consumer(ggml_backend_t backend, void * first_cb, vk_tp5_hc_
 }
 
 bool ggml_vk_tp5_hc_sum_pipeline(vk_device               device,
+                                 bool                     quantized,
                                  VkPipeline *            pipeline,
                                  VkPipelineLayout *      layout,
                                  VkDescriptorSetLayout * dsl) {
-    auto & p = device->pipeline_hc_sum_f16;
+    auto & p = quantized ? device->pipeline_hc_sum_f16_q8 : device->pipeline_hc_sum_f16;
     if (!p)
         return false;
     if (!p->compiled)
@@ -24607,7 +25900,25 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
 
         if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
             const float * params = (const float *)tensor->op_params;
-            tensor_clone = ggml_flash_attn_ext(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3], params[0], params[1], params[2]);
+            // Mapped nodes build the clone node directly: ggml_flash_attn_ext's
+            // uniform-ratio shape assert (q->ne[2] % k->ne[2] == 0) is exactly
+            // what the map exists to break.
+            if (tensor->op_params[8] == GGML_TP5_HEADMAP_MAGIC) {
+                const int64_t ne[4] = { src_clone[2]->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3] };
+                tensor_clone = ggml_new_tensor(ggml_ctx, GGML_TYPE_F32, 4, ne);
+                // Copy the FULL used op_params prefix (slots 0..10): scale,
+                // max_bias, logit_softcap, prec (3), n_kv_max (4), and the
+                // head map (8..10). Dropping prec/n_kv_max would run the
+                // CPU oracle with GGML_PREC_DEFAULT accumulation.
+                memcpy(tensor_clone->op_params, tensor->op_params, 11 * sizeof(int32_t));
+                tensor_clone->op = GGML_OP_FLASH_ATTN_EXT;
+                tensor_clone->src[0] = src_clone[0];
+                tensor_clone->src[1] = src_clone[1];
+                tensor_clone->src[2] = src_clone[2];
+                tensor_clone->src[3] = src_clone[3];
+            } else {
+                tensor_clone = ggml_flash_attn_ext(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3], params[0], params[1], params[2]);
+            }
             if (src_clone[4]) {
                 ggml_flash_attn_ext_add_sinks(tensor_clone, src_clone[4]);
             }

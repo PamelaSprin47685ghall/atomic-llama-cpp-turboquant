@@ -1274,6 +1274,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
         llm_graph_input_rs * inp,
         ggml_tensor *        cur,
         int                  il) {
+    if (model.get_split_state_ud.has_tp5_plan && model.get_split_state_ud.tp5_plan.gdn_headmap_enabled &&
+        (!cparams.fused_gdn_ar || !cparams.fused_gdn_ch)) {
+        GGML_ABORT("GGML_TP5_GDN_HEADMAP=1 requires fused GDN for decode and prefill; uniform Q/K repeat cannot represent the mapped heads");
+    }
     const auto * mctx_cur = inp->mctx;
 
     const int64_t d_inner      = hparams.ssm_d_inner;

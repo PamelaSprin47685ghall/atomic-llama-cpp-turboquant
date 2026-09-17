@@ -16,7 +16,61 @@
 
 2026-09-16 用户将目标明确改为 **50 tok/s、纯 TP、单序列**，并要求直接压低通信开销，不以计算/通信 overlap 或 MTP 替代。下文旧实验中的 100 tok/s 为历史目标。
 
-#### 高频命令与整段降低：最新已验证检查点
+#### BO 驻留与调度管理：2026-09-17 本轮依据
+
+以下五组是**用户提供的新增真机实测**，不是本轮助手重新跑出的结果：HEAD `37cc4531f`，Mesa `26.0.8-1ubuntu0.3` / RADV，五张 RX6800，timeline/F16、`GGML_TP5_ISOLATE_BO=1`、96阶段；现有 paired-chain benchmark预热后五组交替配对，计时包含设备完成，不含输入填充和结果读回。全部数值通过、退出0、FD增量0；用户报告测试后显存/繁忙度恢复基线，其journal窗口无新增GPU fault/timeout/reset。
+
+|配置|每rank每阶段载荷|逐次中位数|整链中位数|
+|---|---:|---:|---:|
+|nobolist，2560元素|5 KiB|6.429 ms|7.078 ms|
+|nobolist，256元素|512 B|5.722 ms|6.382 ms|
+|nobolist，25600元素|50 KiB|16.183 ms|16.511 ms|
+|仅取消nobolist，2560元素|5 KiB|71.961 ms|77.015 ms|
+|恢复nobolist，2560元素|5 KiB|6.520 ms|6.969 ms|
+
+结论限于该微基准：nobolist是当前配置的关键条件；小载荷有显著固定成本；一次queue API调用不等于更快。这条F16纯通信路径包含pack，不代表模型中producer-wire/HC融合后的通信耗时，不能从模型25.65 ms/token中直接减掉约7 ms，也不能声称已有正确nobolist基线上另有11倍收益。当前隔离路径96阶段生成每rank192个`VkSubmitInfo`批次；这不是实测`AMDGPU_CS` ioctl数。
+
+源代码核对使用Mesa上游26.0.8 tag对应的 `60e95b787857afbc9a00b693b91c0d9c8923a430`，**不冒充已审计Ubuntu全部补丁或正在运行的内核路径**：
+
+- [`radv_amdgpu_get_bo_list`](https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa/+/60e95b787857afbc9a00b693b91c0d9c8923a430/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c) 合并global resident BO与各CS/preamble/postamble的BO引用；请求的handle列表经`AMDGPU_CHUNK_ID_BO_HANDLES`提交。winsys在构造列表至提交结束间持有global-list读锁。支持“引用范围可能放大管理成本”的方向，**尚未定位77 ms由哪个锁、fence、内核阶段或GPU等待主导**。
+- [`radv_CreateDevice`](https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa/+/60e95b787857afbc9a00b693b91c0d9c8923a430/src/amd/vulkan/radv_device.c) 只有在BDA、descriptor indexing和相关update-after-bind/partially-bound功能未启用时才接受nobolist关闭global list；环境变量存在本身不证明生效。[2026-03-23合入的上游删除提交](https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa/+/09f83982e25607d6a8544b5b95cf7575cf1dff18?format=JSON) 明确称其为调试开关，不能依赖升级后继续存在。
+- [`radv_amdgpu_bo.c`](https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa/+/60e95b787857afbc9a00b693b91c0d9c8923a430/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c) 在没有`RADEON_FLAG_IMPLICIT_SYNC`时已经请求`AMDGPU_GEM_CREATE_EXPLICIT_SYNC`；查询BO创建信息时也会恢复implicit-sync标志。因此“再加显式同步flag”不一定是新能力，须先取得实际outbox/inbox与导入BO的flags和依赖来源。
+- [`dma-resv.h`](https://raw.githubusercontent.com/torvalds/linux/master/include/linux/dma-resv.h) 明确KERNEL用途保护内存管理，除已有固定驻留等规定例外外必须等待；BOOKKEEP还包含页表更新、TLB刷新及显式同步用户提交。不能按一个usage标签把必要依赖全部丢掉。未核对实际amdgpu提交路径前，不宣称具体reservation锁或fence是瓶颈。
+
+本轮实现边界：保持已有timeline、双bank、隔离路径中真实的compute-ready信号、producer wire和算子数学；完整fingerprint继续校验。先复用整链的plan索引/提交模板，再拆分P1/P2所有权，分别量暖态调度和冷录制。CPU `VkSubmitInfo`等参数只需保活至提交API返回；comm互斥可保护可复用host模板，GPU引用的CB/BO仍须按现有in-flight退休。暂不修改驱动、删除隔离信号或开启shader自旋。进入驱动补丁前，须观测每次真实ioctl的BO集合/flags、依赖来源与完成顺序，并区分用户态、内核态和设备等待；CPU采样少不代表其余墙钟全在内核。
+
+纯TP入口使用 `scripts/run-qwen38-flash-tp5-server.sh --baseline`；`--baseline --print-config` 只打印配置，不启动驱动或模型。它固定none-MTP、单slot、c256/b32/ub32、timeline/F16，默认在驱动初始化前设nobolist/ISOLATE_BO，并打印有效argv、相关环境、当前worktree commit/diff hash、实际exe/DSO哈希及安装包版本。显式空RADV_DEBUG保留给受控对照；启动仍需GPU空闲安全门。worktree标签不等于现有二进制构建来源，须同时保留构建记录和哈希。默认生产MTP/11slot入口不变，不作为纯TP基线。
+
+#### 2026-09-17 调度与P1共享验收
+
+在下述kernel专项修改前，`37cc4531f` 加本轮collective修改已重建为 `b1938-37cc4531f`。整链缓存复用plan索引和host提交数组，仍逐轮解析真实绑定、packed/HC资格，并比较完整compute CB序列；plan/workspace代际、bank奇偶或尾部变化均重建。P1按实际源绑定（含packed解释方式）共享，P2保留独立recipe；in-flight持有P1直至真实完成。`GGML_TP5_CHAIN_CACHE=0`、`GGML_TP5_SHARE_P1=0`分别作对照，未改变timeline协议、隔离信号或kernel数学。
+
+- 新launcher `--baseline` 实际启动四个无观察器server，顺序off/on/on/off；每进程两个完整171-token请求，均精确输出1..60、自然停止、退出0。两个开关均关闭：**38.9184、39.0888、38.4916、39.6549 tok/s**；均开启：**39.5454、40.5899、39.7433、40.0731**。四样本中位数 **39.0036→39.9082**；只是该配对工作负载的约2.3%观测改善，不是50验收或纯暖态收益。
+- 独立host观察器：第二个单token decode的collective冷录制，CB allocation调用 **1860→930**，begin **1875→945**；模板开启/P1关闭时chain函数 **146.14/147.35 ms**，P1开启后 **80.48/75.10 ms**。这是每请求冷转换，不计为逐token节省。336个无CB分配暖态样本的chain函数中位数，双关/仅模板/双开分别 **0.920/0.797/0.773 ms**；主机函数计时含queue API，不是GPU耗时。
+- **280×248320 logits与canonical逐位相同**，第140步各卡仍669计算＋96collective、555计算barrier。23项Vulkan replay、F16/F32五卡mesh通过；新增等长不同CB tail、空tail、HC资格来回切换及暖重放，连同workspace/view/bank/288-plan churn通过，FD增量0。观察器实际记录每卡 **586次hc_sum_f16**，不是只走fallback。
+- 证据：`/tmp/tp5-scheduling-evidence.json`、`/tmp/tp5-scheduling-requests.json`、`/tmp/tp5SchedProfile{Off,Template,Both}-host.csv`、`/tmp/tp5-scheduling-transition280.bin`及counts、`/tmp/tp5-scheduling-binary-provenance.json`。该构建 `libggml-vulkan.so` SHA256为 `54675b0a688af399f4f9954424c06a2a8397c5e33baf9294ec233bdd0b08b175`；后续kernel工作树修改不属于这些运行的二进制来源。每次启动前检查五卡空闲/显存基线，未重启生产服务或修改驱动。
+
+用户随后要求并行推进复制HC/router字节账、长K HC与短K MoE专用kernel、全rank新计时、显式head mapping均衡，以及独立opt-in精度实验；这些项目不在本节调度收益中冒领。旧rank2/2471-dispatch时间账不能代表当前669-dispatch路径；`hc_sum_f16`含数学工作，不能从总时间中简单扣作纯通信。
+
+#### 2026-09-17 当前融合路径的五卡时间账
+
+在上述调度构建、尚未加入新kernel的二进制上，teacher-forced完整模型的第140个decode调用已采集五个物理枚举设备，不再只测rank2。低密度模式只把每queue两个timestamp CB放入**原有**提交API的首尾，不增加queue API调用、host wait或rank同步；端点覆盖本queue首个提交至最后提交，包含等待和空隙。五卡分别 **24.976、24.510、24.458、24.209、24.112 ms**；不能把它们相加，也不能把最长窗口直接解释为该卡纯计算最重。
+
+独立较密的category模式仍会扰动执行：无CB分配暖态decode中位数约 **25.199→26.968 ms（+7.0%）**。下表是另一次category捕获所选执行边界的累计间隔，**不是未扰动的纯ALU时间**。router投影以实际F32 GEMV `K=2560/M=512` push constants识别，每卡48次；top-k另列。HCsum列同时含HC数学与归约，不称纯通信。
+
+|物理rank|HC down|HC up/fold|HCsum|router投影|router top-k|MoE down|GDN state|
+|---|---:|---:|---:|---:|---:|---:|---:|
+|0|1.243|1.252|2.137|0.727|0.971|1.561|0.556|
+|1|1.232|1.268|2.129|0.729|0.974|1.548|0.675|
+|2|1.523|1.441|2.452|0.772|1.209|1.939|0.774|
+|3|1.218|1.259|2.105|0.733|0.980|1.521|0.669|
+|4|1.216|1.252|2.120|0.731|0.976|1.521|0.678|
+
+单位ms。全部145步的端点/category捕获logits与canonical前缀逐位一致。完整分类含GDN/QSA投影、state/attention与明确unknown桶，见 `/tmp/tp5-native-timing-evidence.json`、`/tmp/tp5NativeQueueEndpoints.csv`、`/tmp/tp5NativeCategoryLedger.csv`；不把未归类差额全叫通信或内核管理。每个queue只有一对端点query；category mode不是低扰动吞吐验收。
+
+实际warm cached-graph元数据另在140/141步记录，每卡均观察到194个HC down/up矩阵（97对）和48个F32 router，合计 **675,430,400＋251,658,240逻辑权重字节/card/token**。完整decode天然轮换这些层，不使用单个热HC权重的循环代替。元数据观察不复制权重、不添加同步；五卡5305条绑定/ID形状记录都是真实cache hit。来源 `/tmp/tp5-current-working-set-evidence.json`、`/tmp/tp5-native-weight-bindings-safe.csv` 与 `/tmp/tp5-current-kernel-ledger.csv`。旧geometry CSV的首列2/3是decode step、writer固定Vulkan2，不能误称rank2/rank3；用户884.14 MiB字节账仍仅表示逻辑读取量，不是DRAM计数器。
+
+#### 高频命令与整段降低：此前已验证检查点
 
 用户指定先处理成千上万次 dispatch/barrier，再处理百次、十次和单次开销。**每卡每 token 不超过 96×8 次真实 dispatch** 的计数门已达到：最新为 **765（k=7.96875）**，包含通信、完整 PLE、词表投影和尾部。**2026-09-17 按用户指示暂停8→6**：目前没有显著吞吐收益的实测依据，不继续为了计数增加复杂融合；后续工作聚焦已测得的主机校验与冷录制开销。减少计数不等于吞吐验收，**无 MTP 50 tok/s 尚未达到**。
 

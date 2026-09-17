@@ -412,6 +412,36 @@ extern "C" {
         GGML_BACKEND_SPLIT_AXIS_NONE    = 98,
         GGML_BACKEND_SPLIT_AXIS_UNKNOWN = 99,
     };
+
+    // TP5 private local-node arithmetic head map (opt-in GGML_TP5_GDN_HEADMAP=1 /
+    // GGML_TP5_QSA_HEADMAP=1). Only META-produced rank-local
+    // GGML_OP_GATED_DELTA_NET / GGML_OP_FLASH_ATTN_EXT nodes carry this; global
+    // graph nodes keep ordinary op_params. ABI (op_params int32 slots):
+    //   slot  8: magic 0x54503548 ('TP5H')
+    //   slot  9: packed 3-bit local head indices, entry h at bits (3*h .. 3*h+2)
+    //            (LSB-first, up to 10 entries)
+    //   slot 10: entry count (1..10)
+    // For GATED_DELTA_NET the entries are per-local-V-head local QK head indices
+    // (qk[i] < k->ne[1]); for FLASH_ATTN_EXT they are per-local-Q-head local KV
+    // head indices (kv[h] < k->ne[2]). Slots 8..10 are unused by ordinary nodes
+    // of both ops. A node without the magic keeps native uniform behavior.
+    // Absent (no magic) and invalid (magic but bad count/index) are distinct:
+    // absent = native uniform mapping; invalid = fail closed, never a silent
+    // fallback to uniform.
+#define GGML_TP5_HEADMAP_MAGIC 0x54503548
+#define GGML_TP5_HEADMAP_MAX_ENTRIES 10
+
+    // Pack count local head indices (each in [0,7]) into slot 9 and write
+    // magic/count. count must be in [1, GGML_TP5_HEADMAP_MAX_ENTRIES];
+    // indices must be < 8. Aborts on violation.
+    GGML_API void ggml_tp5_headmap_set(struct ggml_tensor * op, const uint8_t * local_heads, int32_t count);
+
+    // Returns the entry count (>= 1) and fills local_heads[0..count-1] when the
+    // magic is present and the encoding is valid; returns 0 when the magic is
+    // absent (native node); returns -1 when the magic is present but the
+    // encoding is invalid (count out of range or an index >= 8). Consumers must
+    // treat -1 as an execution error, never fall back to uniform mapping.
+    GGML_API int32_t ggml_tp5_headmap_get(const struct ggml_tensor * op, uint8_t * local_heads);
     GGML_API const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis split_axis);
 
     struct ggml_backend_meta_split_state {
@@ -437,6 +467,44 @@ extern "C" {
         // Explicit logical starting element along the split axis for each device.
         bool     indexed_replica;
         int64_t  replica_start[GGML_BACKEND_META_MAX_DEVICES];
+
+        // TP5 balanced head mapping (opt-in): bounded indexed spans mapping
+        // noncontiguous original-element ranges -> concatenated rank-local
+        // storage (GGML_TP5_GDN_HEADMAP=1 / GGML_TP5_QSA_HEADMAP=1).
+        //
+        // When mapped_span = true (implies n_segments == 1 && nr[0] == 1 and
+        // axis is 0 or 1): each device j owns span_count[j] spans; span s of
+        // device j covers original logical elements
+        //   [span_start[idx], span_start[idx] + span_len[idx])
+        // along the split axis, where idx = span_count[0] + ... + span_count[j-1] + s
+        // (flat prefix-sum layout, spans stored in device order). The device's
+        // local storage is the concatenation of its spans in span order, so
+        // ne[j] == sum of span_len over device j's spans.
+        //
+        // Physical transport (set/get/async copies) only happens on the
+        // flattened storage root (axis 0/1). Derived tensors may reshape/view
+        // the storage onto other axes (e.g. recurrent state [128,128,V,nseq]
+        // reshaped from the flat state cache lands on axis 2): the mapping is
+        // carried through with coordinates rescaled by the flattened inner
+        // block (e.g. 128*128 = 16384 elements per head), preserving the
+        // per-head identity map. Such derived split states keep mapped_span
+        // true with the rescaled span geometry; they never abort and never
+        // silently drop to a dense/uniform fallback.
+        //
+        // Overlapping logical ranges across devices are allowed only as
+        // replicas of identical original data (e.g. shared Q/K head pairs):
+        // set_tensor writes every owning device, get_tensor reads a
+        // deterministic single owner (lowest device index covering the range).
+        // No silent partial fallback: unsupported combinations abort.
+#define GGML_BACKEND_META_MAX_SPANS_PER_DEVICE 16
+#define GGML_BACKEND_META_MAX_SPANS (GGML_BACKEND_META_MAX_SPANS_PER_DEVICE * GGML_BACKEND_META_MAX_DEVICES)
+        bool     mapped_span;
+        // span_count[j] <= GGML_BACKEND_META_MAX_SPANS_PER_DEVICE; spans of
+        // device j live at flat indices [offset(j), offset(j) + span_count[j])
+        // with offset(j) = span_count[0] + ... + span_count[j-1].
+        int32_t  span_count[GGML_BACKEND_META_MAX_DEVICES];
+        int64_t  span_start[GGML_BACKEND_META_MAX_SPANS];
+        int64_t  span_len[GGML_BACKEND_META_MAX_SPANS];
     };
 
     // function to assign split states for statically allocated tensors, compute tensor split states will be assigned to be compatible:
@@ -448,6 +516,26 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+
+    // TP5 local-node head map (opt-in GGML_TP5_QSA_HEADMAP=1 / GGML_TP5_GDN_HEADMAP=1):
+    // optional per-rank local arithmetic head map stamped on the rank-local clones
+    // the meta backend creates. The meta backend calls this hook when it clones a
+    // GGML_OP_FLASH_ATTN_EXT or GGML_OP_GATED_DELTA_NET node; rank is the
+    // simple-backend index. The hook stamps the private op_params head-map ABI
+    // (ggml_tp5_headmap_set) on the rank-local node only; the global graph node
+    // is never touched. Return value: whether a map was stamped. A NULL hook
+    // (default) keeps native uniform behavior.
+    //
+    // The hook is per meta device (stored in its device context), set via
+    // ggml_backend_meta_set_local_node_hook BEFORE creating buffers/backends
+    // from the device; it reuses the device's get_split_state userdata, so a
+    // second model's device never sees the first model's hook and a freed
+    // model leaves no dangling global state. One hook serves both GDN and FA;
+    // it dispatches on node->op.
+    typedef bool (*ggml_backend_meta_local_node_hook_t)(struct ggml_tensor * local_node, size_t rank, void * userdata);
+
+    GGML_API void ggml_backend_meta_set_local_node_hook(ggml_backend_dev_t meta_dev,
+                                                        ggml_backend_meta_local_node_hook_t hook);
     GGML_API struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index);
 
     //

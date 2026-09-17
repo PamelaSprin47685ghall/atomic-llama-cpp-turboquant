@@ -18,6 +18,16 @@ full-model correctness acceptance; repaired-model measurements are required.
 
 ### Fixed
 
+- **TP5 replay scheduling and shared transfer recordings.** Warm epoch chains
+  reuse submission templates without skipping live binding, HC recipe, or full
+  command-buffer sequence validation. Compatible reductions share owned P1
+  recordings while retaining private P2 recipes and GPU retirement lifetimes.
+  The measured cold collective recording allocation count falls from 1860 to
+  930; paired no-MTP request medians are 39.00 versus 39.91 tok/s, not the 50
+  tok/s target. Canonical 280-step logits remain bitwise unchanged. The server
+  launcher adds `--baseline` and non-launching `--baseline --print-config` for
+  fixed single-slot no-MTP comparisons with environment and binary provenance.
+
 - **Whole-region Vulkan decode and collective boundaries.** GDN, attention,
   routed/shared MoE, and HC regions preserve their native arithmetic and cache
   ownership while eliminating intermediate dispatches. Terminal producers can
@@ -38,7 +48,7 @@ full-model correctness acceptance; repaired-model measurements are required.
   buffers without dereferencing retired captured tensor addresses; splitting
   a formerly shared source still invalidates its recorded bindings. See `TP5.md`
   for measured cold/warm costs and the remaining collective-recording bottleneck.
-  Interrupted shared-P1 ownership scaffolding is not part of this checkpoint.
+  The later shared-P1 implementation and its measurements are listed above.
 
 - **CPU attention honors explicit F32 accumulation.** F16 value caches no
   longer force F16 accumulators when `GGML_PREC_F32` is requested. Both direct

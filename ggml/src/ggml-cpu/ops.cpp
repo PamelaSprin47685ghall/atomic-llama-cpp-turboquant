@@ -5,6 +5,7 @@
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "ggml-flashprefill.h"
 #include "unary-ops.h"
 #include "vec.h"
@@ -8519,6 +8520,30 @@ static inline float ggml_flash_attn_ext_banded_load(
     }
 }
 
+// TP5 QSA private local head map (opt-in GGML_TP5_QSA_HEADMAP=1).
+// META-produced rank-local FLASH_ATTN_EXT nodes may carry an explicit
+// per-local-Q-head -> local-KV-head map in op_params when the integer
+// neq2/nek2 ratio is NOT the true assignment (e.g. local Q5 over KV2 with
+// map [0,0,1,1,1]). Wire ABI is the canonical ggml_tp5_headmap_* contract
+// (ggml-backend.h).
+// Returns the mapped local KV head for local Q head h, or -1 when the node
+// carries no map (ordinary uniform-ratio GQA).
+static int32_t ggml_fa_tp5_headmap_get(const ggml_tensor * dst, uint32_t h) {
+    if (dst->op != GGML_OP_FLASH_ATTN_EXT) {
+        return -1;
+    }
+    uint8_t heads[GGML_TP5_HEADMAP_MAX_ENTRIES];
+    const int32_t count = ggml_tp5_headmap_get(dst, heads);
+    if (count == 0) {
+        return -1;
+    }
+    // Invalid encoding (count == -1) or FA-shape violations fail closed.
+    GGML_ASSERT(count > 0 && "TP5 FA head map encoding is invalid");
+    GGML_ASSERT(h < (uint32_t) count && (uint32_t) count == (uint32_t) dst->src[0]->ne[2]);
+    GGML_ASSERT((uint32_t) heads[h] < (uint32_t) dst->src[1]->ne[2]);
+    return (int32_t) heads[h];
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -8630,13 +8655,14 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
 
-        // k indices
+        // k indices (TP5 head map, when present, replaces the integer ratio)
+        const int32_t tp5_kv = ggml_fa_tp5_headmap_get(dst, iq2);
         const int ik3 = iq3 / rk3;
-        const int ik2 = iq2 / rk2;
+        const int ik2 = tp5_kv >= 0 ? tp5_kv : (int) (iq2 / rk2);
 
         // v indices
         const int iv3 = iq3 / rv3;
-        const int iv2 = iq2 / rv2;
+        const int iv2 = tp5_kv >= 0 ? tp5_kv : (int) (iq2 / rv2);
 
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
         q_to_vec_dot(pq, Q_q, DK);
@@ -8888,13 +8914,14 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
         memset(VKQ32, 0, Q_TILE_SZ * DV * sizeof(float));
         memset(mask32, 0, Q_TILE_SZ * KV_TILE_SZ * sizeof(float));
 
-        // k indices
+        // k indices (TP5 head map, when present, replaces the integer ratio)
+        const int32_t tp5_kv = ggml_fa_tp5_headmap_get(dst, iq2);
         const int ik3 = iq3 / rk3;
-        const int ik2 = iq2 / rk2;
+        const int ik2 = tp5_kv >= 0 ? tp5_kv : (int) (iq2 / rk2);
 
         // v indices
         const int iv3 = iq3 / rv3;
-        const int iv2 = iq2 / rv2;
+        const int iv2 = tp5_kv >= 0 ? tp5_kv : (int) (iq2 / rv2);
 
         {
             float * Q_f32 = (float *)Q_q;
@@ -9177,7 +9204,24 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    // TP5 mapped nodes: fail closed on unsupported combinations before any
+    // compute. Mask-head selection is not map-aware (the model uses one
+    // shared mask row set), so a per-KV-head mask (ne[2] > 1) is rejected.
+    if (dst->op_params[8] == GGML_TP5_HEADMAP_MAGIC) {
+        float max_bias_chk = 0.0f;
+        memcpy(&max_bias_chk, (const float *) dst->op_params + 1, sizeof(float));
+        GGML_ASSERT(max_bias_chk == 0.0f && "TP5 headmap FA requires max_bias == 0");
+        GGML_ASSERT((dst->src[3] == nullptr || dst->src[3]->ne[2] == 1) &&
+                    "TP5 headmap FA requires a shared mask (mask->ne[2] == 1)");
+        GGML_ASSERT(dst->src[2]->ne[2] == dst->src[1]->ne[2] &&
+                    "TP5 headmap FA requires matching K/V head counts");
+    }
+    // TP5 head-mapped nodes must not take the split-KV fast path: its
+    // per-head KV chunking assumes the uniform integer GQA ratio. The
+    // one_chunk reference path below honors the map per head.
+    const bool tp5_mapped = dst->op_params[8] == GGML_TP5_HEADMAP_MAGIC;
+
+    const bool use_split_kv_path = !use_ref && !tp5_mapped && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9234,7 +9278,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref && rel == nullptr &&
+        // TP5 head map: the tiled GEMM path bakes the uniform integer-ratio
+        // KV head per tile; mapped nodes use the one_chunk reference path.
+        bool use_tiled = !use_ref && !tp5_mapped && rel == nullptr &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
@@ -9284,6 +9330,10 @@ void ggml_compute_forward_flash_attn_ext(
 void ggml_compute_forward_flash_attn_ext_rerot(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    // TP5 QSA explicit head map is not implemented for the indexed RERoT
+    // path; fail closed rather than run the uniform integer-ratio assumption.
+    GGML_ASSERT(dst->op_params[8] != GGML_TP5_HEADMAP_MAGIC &&
+                "TP5 head map is not supported for FLASH_ATTN_EXT_REROT");
     const ggml_tensor * q       = dst->src[0];
     const ggml_tensor * k       = dst->src[1];
     const ggml_tensor * v       = dst->src[2];
@@ -10958,6 +11008,26 @@ void ggml_compute_forward_solve_tri(const struct ggml_compute_params * params, s
     }
 }
 
+// TP5 GDN head-map (GGML_TP5_GDN_HEADMAP=1): canonical decode via
+// ggml_tp5_headmap_get (ggml-backend.h). Tri-state: 0 = absent (native
+// uniform broadcast V head h -> Q/K head h % neq1), count >= 1 = valid,
+// -1 = invalid encoding -> fail closed, never a silent native fallback.
+static int ggml_tp5_gdn_headmap_decode_cpu(const ggml_tensor * dst, uint32_t * qk, uint32_t * count) {
+    uint8_t local_heads[GGML_TP5_HEADMAP_MAX_ENTRIES];
+    const int32_t state = ggml_tp5_headmap_get(dst, local_heads);
+    if (state <= 0) {
+        return state; // 0 = absent, -1 = invalid
+    }
+    GGML_ASSERT((uint32_t) state == (uint32_t) dst->src[2]->ne[1]);
+    for (int32_t i = 0; i < state; ++i) {
+        qk[i] = local_heads[i];
+        GGML_ASSERT(qk[i] < (uint32_t) dst->src[0]->ne[1]);
+        GGML_ASSERT(qk[i] < (uint32_t) dst->src[1]->ne[1]);
+    }
+    *count = (uint32_t) state;
+    return 1;
+}
+
 // ggml_compute_forward_gated_delta_net
 static void ggml_compute_forward_gated_delta_net_one_chunk(
     const ggml_compute_params * params,
@@ -11031,12 +11101,28 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const float scale = 1.0f / sqrtf((float) S_v);
 
+    // TP5 GDN head map (opt-in): explicit Q/K head index per V head. The
+    // native modulo broadcast stays the default when no map is stamped.
+    // A stamped-but-invalid map aborts rather than silently going native.
+    uint32_t headmap_qk[10] = {};
+    uint32_t headmap_count  = 0;
+    const int  headmap_state  = ggml_tp5_gdn_headmap_decode_cpu(dst, headmap_qk, &headmap_count);
+    const bool headmap_valid  = headmap_state == 1;
+    if (headmap_state < 0) {
+        GGML_ABORT("TP5 GDN head map present with invalid encoding");
+    }
+    if (headmap_valid) {
+        // Mapped nodes must not take the RBB path (no mapped variant exists).
+        GGML_ASSERT(ggml_get_op_params_i32(dst, 1) == 0);
+        GGML_ASSERT(headmap_count == (uint32_t) H);
+    }
+
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t iv1 = ir % H; // head_index
         const int64_t iv3 = ir / H; // sequence
 
-        const int64_t iq1 = iv1 % neq1;
-        const int64_t ik1 = iv1 % nek1;
+        const int64_t iq1 = headmap_valid ? (int64_t) headmap_qk[iv1] : (iv1 % neq1);
+        const int64_t ik1 = headmap_valid ? (int64_t) headmap_qk[iv1] : (iv1 % nek1);
 
         const int64_t iq3 = iv3 / rq3;
         const int64_t ik3 = iv3 / rk3;
@@ -11272,6 +11358,13 @@ static void ggml_compute_forward_gated_delta_net_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     if (ggml_get_op_params_i32(dst, 1) != 0) {
+        // No mapped RBB variant exists; fail closed instead of running the
+        // uniform modulo broadcast on a head-mapped node.
+        {
+            uint8_t unused[GGML_TP5_HEADMAP_MAX_ENTRIES];
+            GGML_ASSERT(ggml_tp5_headmap_get(dst, unused) == 0 &&
+                        "TP5 GDN head map requires the non-RBB path");
+        }
         ggml_compute_forward_gated_delta_net_rbb_f32(params, dst);
         return;
     }

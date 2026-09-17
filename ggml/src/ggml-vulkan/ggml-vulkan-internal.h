@@ -90,6 +90,7 @@ struct vk_tp5_hc_sum {
     vk_tp5_hc_binding                block;
     // residual, gamma, combined output, normalized output, inject weights/input
     std::array<vk_tp5_hc_binding, 6> bindings;
+    vk_tp5_hc_binding                quantized;
 };
 
 // A recipe exists only for the committed first CB of a replay entry. Ordinary
@@ -97,6 +98,7 @@ struct vk_tp5_hc_sum {
 // outputs in the preceding collective's P2, using the exact block binding.
 bool ggml_vk_tp5_hc_consumer(ggml_backend_t backend, void * first_cb, vk_tp5_hc_sum * recipe);
 bool ggml_vk_tp5_hc_sum_pipeline(vk_device                         device,
+                                 bool                              quantized,
                                  struct VkPipeline_T **            pipeline,
                                  struct VkPipelineLayout_T **      layout,
                                  struct VkDescriptorSetLayout_T ** dsl);

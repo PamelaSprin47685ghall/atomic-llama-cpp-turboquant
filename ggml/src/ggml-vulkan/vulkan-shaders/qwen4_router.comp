@@ -1,0 +1,182 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#ifdef SUBGROUP_REDUCTIONS
+#    extension GL_KHR_shader_subgroup_basic : require
+#    extension GL_KHR_shader_subgroup_arithmetic : require
+#endif
+
+#include "types.glsl"
+
+// Dedicated Qwen4 replicated router gate matmul (RouterPaths zone).
+// Computes logits[e] = dot(W[e, :], x) for the 512x2560 router gate in a
+// single dispatch, replacing the generic dmmv dispatch for this shape.
+//
+// Tiling / input reuse: one workgroup covers TILE_THREADS/BLOCK_SIZE expert
+// rows (one BLOCK_SIZE-lane group per expert row). The 2560-element input
+// vector x is staged into shared memory once per workgroup and reused by
+// every expert row of the tile, instead of being re-fetched from global
+// memory by every expert's workgroup as in the generic path.
+//
+// Arithmetic is exactly the native mul_mat_vec path for each weight mode:
+//   ROUTER_W_F32  (mul_mat_vec_f32_f32_f32): K_PER_ITER=4, per lane
+//       temp += dot(vec4(w), vec4(x)) over ncols/(4*BLOCK_SIZE) iterations,
+//       then the row result is the BLOCK_SIZE-lane reduction.
+//   ROUTER_W_F16  (mul_mat_vec_f16_f32_f32): same loop with the F16 weights
+//       promoted to float per element.
+//   ROUTER_W_Q8_0 (mul_mat_vec_q8_0_f32_f32): K_PER_ITER=8, per lane
+//       rowtmp  = dot(vec4(x0), vec4(q0)); rowtmp += dot(vec4(x1), vec4(q1));
+//       rowtmp *= d; temp += rowtmp;
+//       with q0/q1 the 32-block dequantized octets at iqs = col % 32.
+//
+// SUBGROUP_REDUCTIONS selects subgroupAdd for the row reduction, matching
+// the native subgroup dmmv variant (RADV). Without it, the shared-memory
+// sequential lane sum of the native SHMEM variant is reproduced exactly.
+
+layout(push_constant) uniform parameter {
+    uint ncols;       // K (2560)
+    uint n_experts;   // 512
+    uint expert_tile; // experts per workgroup
+    uint _pad;
+};
+
+layout(constant_id = 0) const uint BLOCK_SIZE = 32;
+layout(constant_id = 1) const uint TILE_THREADS = 256;
+
+// Workgroup size is TILE_THREADS (constant_id 1); BLOCK_SIZE (constant_id 0)
+// is the per-expert-row lane count and must divide TILE_THREADS.
+layout(local_size_x_id = 1, local_size_y = 1, local_size_z = 1) in;
+
+#if defined(ROUTER_W_F32)
+layout(binding = 0) readonly buffer A {
+    float data_a[];
+};
+#elif defined(ROUTER_W_F16)
+layout(binding = 0) readonly buffer A {
+    float16_t data_a[];
+};
+#elif defined(ROUTER_W_Q8_0)
+layout(binding = 0) readonly buffer A {
+    block_q8_0 data_a[];
+};
+#endif
+
+layout(binding = 1) readonly buffer B {
+    float data_b[];
+};
+
+layout(binding = 2) writeonly buffer D {
+    float data_d[];
+};
+
+shared float sh_x[2560];
+
+#ifndef SUBGROUP_REDUCTIONS
+shared float sh_row[256];
+#endif
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;              // 0 .. TILE_THREADS-1
+    const uint row = gl_LocalInvocationID.x / BLOCK_SIZE; // expert row within tile
+#ifdef SUBGROUP_REDUCTIONS
+    const uint lane = gl_SubgroupInvocationID;
+#else
+    const uint lane = gl_LocalInvocationID.x % BLOCK_SIZE;
+#endif
+    const uint expert = gl_WorkGroupID.x * expert_tile + row;
+
+    // Stage the input vector into shared memory once per workgroup.
+    // (Unconditional: no thread may skip this barrier.)
+    for (uint i = tid; i < ncols; i += TILE_THREADS) {
+        sh_x[i] = data_b[i];
+    }
+    barrier();
+    if (expert >= n_experts) {
+        return;
+    }
+
+#if defined(ROUTER_W_F32) || defined(ROUTER_W_F16)
+    // Native K_PER_ITER == 4 path (iter_aligned_nonquant).
+    const uint k_per_iter = 4;
+    float temp = 0.0;
+    const uint num_iters = ncols / (k_per_iter * BLOCK_SIZE);
+    for (uint it = 0; it < num_iters; ++it) {
+        const uint col = k_per_iter * (it * BLOCK_SIZE + lane);
+#if defined(ROUTER_W_F32)
+        const vec4 v = vec4(data_a[expert * ncols + col + 0u],
+                            data_a[expert * ncols + col + 1u],
+                            data_a[expert * ncols + col + 2u],
+                            data_a[expert * ncols + col + 3u]);
+#else
+        const vec4 v = vec4(float(data_a[expert * ncols + col + 0u]),
+                            float(data_a[expert * ncols + col + 1u]),
+                            float(data_a[expert * ncols + col + 2u]),
+                            float(data_a[expert * ncols + col + 3u]));
+#endif
+        const vec4 b = vec4(sh_x[col + 0u], sh_x[col + 1u], sh_x[col + 2u], sh_x[col + 3u]);
+        temp += dot(v, b);
+    }
+    // Native K_PER_ITER == 4 handles the K tail with OOB masks; the router
+    // gate K is a multiple of 4*BLOCK_SIZE (2560 = 20*128) so there is no
+    // tail. Guard anyway for other replicated shapes.
+    if (num_iters * k_per_iter * BLOCK_SIZE < ncols) {
+        const uint col0 = num_iters * k_per_iter * BLOCK_SIZE + k_per_iter * lane;
+        [[unroll]] for (uint e = 0; e < k_per_iter; ++e) {
+            const uint col = col0 + e;
+            if (col < ncols) {
+                const float a = float(data_a[expert * ncols + col]);
+                temp += a * sh_x[col];
+            }
+        }
+    }
+#else
+    // Q8_0: native K_PER_ITER == 8 path (iter()).
+    const uint k_per_iter = 8;
+    float temp = 0.0;
+    const uint num_iters = ncols / (k_per_iter * BLOCK_SIZE);
+    const uint quant_k = 32;
+    for (uint it = 0; it < num_iters; ++it) {
+        const uint col = k_per_iter * (it * BLOCK_SIZE + lane);
+        const uint iqs = col % quant_k;
+        const vec4 b0 = vec4(sh_x[col + 0u], sh_x[col + 1u], sh_x[col + 2u], sh_x[col + 3u]);
+        const vec4 b1 = vec4(sh_x[col + 4u], sh_x[col + 5u], sh_x[col + 6u], sh_x[col + 7u]);
+        const uint blk = (expert * ncols + col) / quant_k;
+        const float d = float(data_a[blk].d);
+        // Native dequantize4(Q8_0) returns unscaled ints; get_dm().x is
+        // applied after the two dots (rowtmp *= dm.x), which this mirrors.
+        const vec4 v0 = vec4(float(int(data_a[blk].qs[iqs + 0u])),
+                             float(int(data_a[blk].qs[iqs + 1u])),
+                             float(int(data_a[blk].qs[iqs + 2u])),
+                             float(int(data_a[blk].qs[iqs + 3u])));
+        const vec4 v1 = vec4(float(int(data_a[blk].qs[iqs + 4u])),
+                             float(int(data_a[blk].qs[iqs + 5u])),
+                             float(int(data_a[blk].qs[iqs + 6u])),
+                             float(int(data_a[blk].qs[iqs + 7u])));
+        float rowtmp = dot(b0, v0);
+        rowtmp += dot(b1, v1);
+        rowtmp *= d;
+        temp += rowtmp;
+    }
+#endif
+
+    // Row reduction, matching the native dmmv variant.
+#ifdef SUBGROUP_REDUCTIONS
+    temp = subgroupAdd(temp);
+    if (lane == 0) {
+        data_d[expert] = temp;
+    }
+#else
+    // SHMEM variant: sequential sum over lanes in lane order.
+    sh_row[gl_LocalInvocationID.x] = temp;
+    barrier();
+    if (lane == 0) {
+        float sum = sh_row[row * BLOCK_SIZE + 0u];
+        for (uint l = 1u; l < BLOCK_SIZE; ++l) {
+            sum += sh_row[row * BLOCK_SIZE + l];
+        }
+        data_d[expert] = sum;
+    }
+#endif
+}

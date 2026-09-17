@@ -1,0 +1,298 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+// Paired-expert IQ4_NL K=128 MoE down projection + fold.
+//
+// Fixed specialization: the host gate (ggml_vk_moe_output_segment +
+// ggml_vk_can_fuse_moe_output_segment) only selects this kernel for
+// K == 128, 10 selected experts, width % 256 == 0 (hence full 4-row tiles)
+// and, when shared-down is fused, shared K == 128. Everything else keeps the
+// native moe_down_fold* pipeline.
+//
+// The native pipeline (moe_down_fold*) runs one 320-thread workgroup per
+// 4-row tile: 10 waves of 32 lanes, one selected expert per wave, 16 active
+// dot lanes (K_PER_ITER 8 * rm_iq 2 == 16) plus 16 zero lanes per wave.
+// This variant packs two selected experts into the two logical 16-lane
+// halves of each wave32 and processes the same 4-row tile with 160 threads
+// (5 waves): 10 experts -> 5 waves / 160 threads per 4 rows.
+//
+// Numerical contract: each expert's partials reduce over its own 16 lanes
+// only (independent half-wave reduction), never a full-wave subgroupAdd that
+// would mix the two experts sharing a wave. The 16-lane XOR butterfly
+// (steps 1,2,4,8) reproduces the native 32-lane subgroupAdd over 16 partials
+// + 16 zeros: the native step-16 combine adds exactly 0.0 to the low-half
+// tree result, and the low half's internal tree is the same butterfly.
+// ASSUMED (not proven): RADV lowers subgroupAdd to this butterfly order.
+// The paired MoE fixture (memcmp vs the native unfused GPU path) detects
+// any deviation from the native reduction order.
+//
+// The 10-expert fold, shared-down fusion and F16 wire output mirror
+// mul_mat_vec.comp's MOE_DOWN_FOLD reduce_result exactly: ordered expert sum
+// (precise), gate = 1/(1+exp(-shared_gate[0])), result = folded + shared.
+
+#define DATA_A_IQ4_NL 1
+#define FLOAT_TYPE float
+#include "types.glsl"
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint WG_SIZE = 160; // 5 waves * 32 lanes
+
+// Fixed specialization constants (host-guaranteed shapes).
+const uint K         = 128u; // routed K
+const uint SELECTED  = 10u;  // selected experts
+const uint NUM_ROWS  = 4u;   // rows per workgroup (native rm_iq)
+#ifdef MOE_K128_FUSE_SHARED_DOWN
+const uint SHARED_K  = 128u; // shared down K when fused
+#endif
+
+layout(std430, binding = 0) readonly buffer RoutedWeights {
+    block_iq4_nl routed_weights[];
+};
+layout(std430, binding = 0) readonly buffer RoutedWeightsPacked16 {
+    block_iq4_nl_packed16 routed_weights_packed16[];
+};
+layout(std430, binding = 1) readonly buffer RoutedActivations {
+    float routed_activations[];
+};
+layout(std430, binding = 2) writeonly buffer FoldedOut {
+    float folded_out[];
+};
+layout(std430, binding = 3) readonly buffer RouterWeights {
+    float router_weights[];
+};
+layout(std430, binding = 4) readonly buffer ExpertIDs {
+    int32_t expert_ids[];
+};
+#ifdef MOE_K128_FUSE_SHARED_DOWN
+layout(std430, binding = 5) readonly buffer SharedDownWeights {
+    block_q8_0 shared_down_weights[];
+};
+layout(std430, binding = 5) readonly buffer SharedDownWeightsPacked16 {
+    block_q8_0_packed16 shared_down_weights_packed16[];
+};
+layout(std430, binding = 6) readonly buffer SharedSwigluIn {
+    float shared_swiglu_in[];
+};
+layout(std430, binding = 7) readonly buffer SharedGateIn {
+    float shared_gate_in[];
+};
+#    ifdef MOE_K128_WIRE_OUTPUT
+layout(std430, binding = 8) writeonly buffer WireOut {
+    float16_t wire_out[];
+};
+#    endif
+#else
+layout(std430, binding = 5) readonly buffer SharedDownIn {
+    float shared_down_in[];
+};
+layout(std430, binding = 6) readonly buffer SharedGateIn {
+    float shared_gate_in[];
+};
+#    ifdef MOE_K128_WIRE_OUTPUT
+layout(std430, binding = 7) writeonly buffer WireOut {
+    float16_t wire_out[];
+};
+#    endif
+#endif
+
+layout(push_constant) uniform PushParams {
+    uint width; // output row length (routed->ne[0]); multiple of 256
+} p;
+
+// Native-order IQ4_NL decode, mirroring mul_mat_vec.comp's K_PER_ITER==8
+// iter() path (num_rows == 1, QUANT_R == 2, rm_iq == 2):
+//   lane tid covers col = 8*tid, iqs = (col % 32) / 2, iybs = col - col % 32,
+//   ib = (row * ncols + col) / 32,
+//   v  = dequantize4(ib, iqs), v2 = dequantize4(ib, iqs + 2),
+//   rowtmp = dot(bv0, v) + dot(bv1, v2), then *= d.
+// For QUANT_R == 2 the activation pairing is interleaved: dequantize nibbles
+// (iqs, iqs+16, iqs+1, iqs+17) pair with bv0 = (b[iqs], b[iqs+16], b[iqs+1],
+// b[iqs+17]) and likewise +2/+18 for bv1.
+vec4 decode_iq4nl_pair(const uint ib, const uint iqs) {
+    const uint vui = uint(routed_weights_packed16[ib].qs[iqs / 2u]);
+    return vec4(kvalues_iq4nl[vui & 0xFu], kvalues_iq4nl[(vui >> 4u) & 0xFu],
+                kvalues_iq4nl[(vui >> 8u) & 0xFu], kvalues_iq4nl[vui >> 12u]);
+}
+
+// Independent half-wave reduction: sums one expert's 16 partials with the
+// XOR butterfly (steps 1,2,4,8), preserving the native active-16-lane
+// subgroupAdd order without touching the sibling expert's half.
+float half_wave_sum(float v, const bool low_half) {
+    const uint base = low_half ? 0u : 16u;
+    [[unroll]] for (uint step = 1u; step < 16u; step <<= 1u) {
+        v += subgroupShuffle(v, base + ((gl_SubgroupInvocationID - base) ^ step));
+    }
+    return v;
+}
+
+shared float expert_outputs[SELECTED][NUM_ROWS];
+#ifdef MOE_K128_FUSE_SHARED_DOWN
+shared float shared_down_output[NUM_ROWS];
+#endif
+
+void main() {
+    init_iq_shmem(gl_WorkGroupSize);
+
+    const uint first_row = gl_WorkGroupID.x * NUM_ROWS;
+    if (first_row >= p.width) {
+        return;
+    }
+    // width % 256 == 0 (host gate) => every tile is a full 4-row tile.
+    const uint lane = gl_LocalInvocationID.x; // 0..159; wave = lane / 32
+
+    const uint wave = lane / 32u;
+    const uint sl   = gl_SubgroupInvocationID; // 0..31 within the wave
+    const bool low  = sl < 16u;
+    // Experts 2w (low half) and 2w+1 (upper half) share wave w; 5 waves
+    // cover all 10 selected experts.
+    const uint expert = wave * 2u + (low ? 0u : 1u);
+    const uint tid16  = sl & 15u; // native-equivalent dot-lane index
+
+    float temp[NUM_ROWS];
+    {
+        const uint expert_id = uint(expert_ids[expert]);
+        // Native offsets: b_offset = expert * stride_b (ne11 == experts,
+        // stride_b == k); a_offset = expert_id * batch_stride_a / 32
+        // = expert_id * k * width / 32 (block units).
+        const uint b_base = expert * K;
+        const uint a_base = expert_id * p.width * (K / 32u);
+
+        const uint col  = 8u * tid16;
+        const uint iqs  = (col % 32u) / 2u; // 0, 4, 8 or 12
+        const uint iybs = col - (col % 32u);
+
+        // QUANT_R == 2 interleaved activation loads (y_offset == 16).
+        const vec4 bv02 = vec4(routed_activations[b_base + iybs + iqs],
+                               routed_activations[b_base + iybs + iqs + 1u],
+                               routed_activations[b_base + iybs + iqs + 2u],
+                               routed_activations[b_base + iybs + iqs + 3u]);
+        const vec4 bv13 = vec4(routed_activations[b_base + iybs + iqs + 16u],
+                               routed_activations[b_base + iybs + iqs + 17u],
+                               routed_activations[b_base + iybs + iqs + 18u],
+                               routed_activations[b_base + iybs + iqs + 19u]);
+        const vec4 bv0  = vec4(bv02.x, bv13.x, bv02.y, bv13.y);
+        const vec4 bv1  = vec4(bv02.z, bv13.z, bv02.w, bv13.w);
+
+        // num_rows consecutive output rows share the activation vector;
+        // only the weight block index ib changes per row (native iter()).
+        [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+            const uint ib = (first_row * K + n * K + col) / 32u;
+            vec4       vn  = decode_iq4nl_pair(a_base + ib, iqs);
+            vec4       vn2 = decode_iq4nl_pair(a_base + ib, iqs + 2u);
+            const vec2 dmn = vec2(float(routed_weights[a_base + ib].d), 0.0);
+            if (dmn.y != 0.0) {
+                vn  = vn * dmn.x + dmn.y;
+                vn2 = vn2 * dmn.x + dmn.y;
+            }
+
+            float rowtmp = dot(bv0, vn);
+            rowtmp += dot(bv1, vn2);
+            if (dmn.y == 0.0) {
+                rowtmp *= dmn.x;
+            }
+            temp[n] = rowtmp;
+        }
+    }
+
+    // Per-expert native-order reduction over its own 16 logical lanes only.
+    [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+        temp[n] = half_wave_sum(temp[n], low);
+    }
+
+    // Native: tid == 0 of each wave stores
+    // expert_outputs[fold_slot] = temp * router_weight[fold_slot].
+    if (sl == 0u || sl == 16u) {
+        [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+            expert_outputs[expert][n] = temp[n] * router_weights[expert];
+        }
+    }
+
+#ifdef MOE_K128_FUSE_SHARED_DOWN
+    // Shared K=128 Q8_0 down projection, mirroring the native
+    // MOE_FUSE_SHARED_DOWN block (first BLOCK_SIZE threads, lanes 0..15
+    // active): col = 8*tid, iqs = col % 32,
+    // ibi = (first_row*shared_k + col)/32 advancing by stride_blocks per row;
+    // contracted Q8 two-dot sum.
+    if (wave == 0u) {
+        const uint quant_k = 32u;
+        const uint col     = 8u * tid16;
+        const uint iqs     = col % quant_k;
+        const uint iybs    = col - iqs;
+        // num_shared_iters == 1 when shared_k == 128 and BLOCK_SIZE == 32.
+        const uint b_idx = iybs + iqs;
+        uint       ibi   = (first_row * SHARED_K + col) / quant_k;
+        const uint stride_blocks = SHARED_K / quant_k;
+
+        float shared_temp[NUM_ROWS];
+        [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) { shared_temp[n] = 0.0; }
+        if (sl < 16u) {
+            const vec4 bv0 = vec4(shared_swiglu_in[b_idx], shared_swiglu_in[b_idx + 1u],
+                                  shared_swiglu_in[b_idx + 2u], shared_swiglu_in[b_idx + 3u]);
+            const vec4 bv1 = vec4(shared_swiglu_in[b_idx + 4u], shared_swiglu_in[b_idx + 5u],
+                                  shared_swiglu_in[b_idx + 6u], shared_swiglu_in[b_idx + 7u]);
+
+            [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+                const uint ib = ibi;
+                ibi += stride_blocks;
+
+                const i8vec2 v0_0 = unpack8(int32_t(shared_down_weights_packed16[ib].qs[iqs / 2u])).xy;
+                const i8vec2 v0_1 = unpack8(int32_t(shared_down_weights_packed16[ib].qs[iqs / 2u + 1u])).xy;
+                const vec4   v    = vec4(v0_0.x, v0_0.y, v0_1.x, v0_1.y);
+
+                const i8vec2 v2_0 = unpack8(int32_t(shared_down_weights_packed16[ib].qs[(iqs + 4u) / 2u])).xy;
+                const i8vec2 v2_1 = unpack8(int32_t(shared_down_weights_packed16[ib].qs[(iqs + 4u) / 2u + 1u])).xy;
+                const vec4   v2   = vec4(v2_0.x, v2_0.y, v2_1.x, v2_1.y);
+
+                // Match RADV's contracted native Q8 two-dot sum.
+                float rowtmp = dot(bv1, v2);
+                rowtmp       = fma(bv0.w, v.w, rowtmp);
+                rowtmp       = fma(bv0.z, v.z, rowtmp);
+                rowtmp       = fma(bv0.y, v.y, rowtmp);
+                rowtmp       = fma(bv0.x, v.x, rowtmp);
+                shared_temp[n] = fma(rowtmp, float(shared_down_weights_packed16[ib].d), 0.0);
+            }
+        }
+
+        // Native reduces with a 32-lane subgroupAdd over 16 partials + 16
+        // zeros == the same 16-lane butterfly. Uniform within the wave.
+        [[unroll]] for (uint n = 0u; n < NUM_ROWS; ++n) {
+            const float shared_sum = half_wave_sum(shared_temp[n], true);
+            if (sl == 0u) {
+                shared_down_output[n] = shared_sum;
+            }
+        }
+    }
+#endif
+
+    barrier();
+
+    if (lane < NUM_ROWS) {
+        const uint n = lane;
+        // Native fold: ordered sum over the 10 selected experts, then the
+        // gated shared contribution; wire output packs the same float.
+        precise float folded = expert_outputs[0][n];
+        [[unroll]] for (uint e = 1u; e < SELECTED; ++e) {
+            folded = folded + expert_outputs[e][n];
+        }
+        const float gate = 1.0 / (1.0 + exp(-shared_gate_in[0]));
+#ifdef MOE_K128_FUSE_SHARED_DOWN
+        precise float shared_value = shared_down_output[n] * gate;
+#else
+        precise float shared_value = shared_down_in[first_row + n] * gate;
+#endif
+        precise float result = folded + shared_value;
+        folded_out[first_row + n] = result;
+#ifdef MOE_K128_WIRE_OUTPUT
+        wire_out[first_row + n] = float16_t(result);
+#endif
+    }
+}

@@ -25,6 +25,10 @@ layout(push_constant) uniform Parameters {
     uint  value_heads;
     uint  key_heads;
     float scale;
+    // TP5 GDN head map (opt-in): bit 31 set when a map is present; the low
+    // 30 bits pack up to 10 3-bit per-local-V-head QK head indices. Zero
+    // keeps the native uniform V->QK broadcast (head_id % key_heads).
+    uint  headmap;
 #ifdef GDN_FUSED_NORM
     float epsilon;
 #endif
@@ -81,11 +85,15 @@ shared float norm_sum[512];
 
 void main() {
     const uint head_id = gl_WorkGroupID.x;
+    // TP5 GDN head map: explicit QK index for this V head, or the native
+    // uniform broadcast when absent. No repeat-modulo assumption for the
+    // irregular mapped layout.
+    const uint qk_head = (headmap & 0x80000000u) != 0u
+        ? ((headmap >> (3u * head_id)) & 0x7u)
+        : (head_id % key_heads);
     const uint lane    = gl_SubgroupInvocationID % 8u;
     const uint column  = gl_WorkGroupID.z * COLS_PER_WG + gl_SubgroupID * COLS_PER_SUBGROUP +
                         (gl_SubgroupInvocationID / LANES_PER_COLUMN);
-
-    const uint qk_head = head_id % key_heads;
 
 #if defined(GDN_CACHED_INPUT)
     const uint state_row     = uint(data_state_row_id[0]);

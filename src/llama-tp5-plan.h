@@ -12,6 +12,7 @@
 #include "ggml-backend.h"
 #include "llama-hparams.h"
 
+#include <cstdlib>
 #include <array>
 #include <cstdint>
 #include <string>
@@ -75,6 +76,12 @@ struct llama_tp5_tensor_plan {
 struct llama_tp5_plan {
     uint32_t ranks = 0;
     bool     replicate_attention = false;
+    // Opt-in nonuniform QSA head map (GGML_TP5_QSA_HEADMAP=1): Q counts
+    // [5,5,5,5,4] with starts [0,5,10,15,20] over KV counts [1,1,2,1,1] with
+    // starts [0,0,0,1,1]. The rank-local Q/KV integer ratio is NOT the true
+    // global GQA assignment (rank 2 holds Q heads of two different KV groups),
+    // so FLASH_ATTN_EXT consumers must use the explicit local q->kv map.
+    bool     qsa_headmap = false;
 
     // hparams-derived sizes (validated copies)
     int64_t H = 0, L = 0, C = 0, R = 0;
@@ -95,12 +102,43 @@ struct llama_tp5_plan {
     // KV head instances across full layers, with the same fixed weight/cache roles.
     std::array<int32_t, LLAMA_TP5_MAX_RANKS> kv_instances{};
 
+    // Per-rank local q->kv map: local_qkv_map[r][local_q] = local KV index
+    // (rank 2: [0,0,1,1,1]; every other rank: all zeros).
+    // Sized by the shared GGML_TP5_HEADMAP_MAX_ENTRIES ABI.
+    std::vector<std::array<int32_t, GGML_TP5_HEADMAP_MAX_ENTRIES>> local_qkv_map;
+
     // GDN V/state heads per rank (TP5.md 8.1): [10,10,10,10,8]
     std::array<int32_t, LLAMA_TP5_MAX_RANKS> gdn_v_heads{};
     // global V head ranges per rank: [first, last)
     std::vector<std::array<int64_t, 2>> gdn_v_ranges;
     // Sharded prearrangement: Q/K count equals V count; replicas use native Nk.
     std::array<int32_t, LLAMA_TP5_MAX_RANKS> gdn_qk_heads{};
+
+    // --- TP5 balanced GDN head map (opt-in GGML_TP5_GDN_HEADMAP=1) ---
+    // Main-chosen paired-head assignment: each original V head h uses original
+    // QK head (h % Nk); adjacent 128-dim V head PAIRS move together so the
+    // 256-element ssm_out quant blocks stay whole. Per-rank global V head order
+    // and unique QK head lists (V [10,10,10,10,8], unique QK [4,6,4,4,4],
+    // 22 QK copies total vs 16 native: +15% QKV projection rows).
+    // Populated only by llama_tp5_plan_build when the mapping is enabled;
+    // all-zero gdn_headmap_enabled means native repeated-segment layout.
+    static constexpr int LLAMA_TP5_GDN_MAX_V_HEADS   = 10; // max V heads per rank
+    static constexpr int LLAMA_TP5_GDN_MAX_QK_HEADS  = 6;  // max unique QK heads per rank
+    bool gdn_headmap_enabled = false;
+    // gdn_v_global[r][i]: original global V head index at rank-local V slot i
+    std::array<std::array<int32_t, LLAMA_TP5_GDN_MAX_V_HEADS>, LLAMA_TP5_MAX_RANKS> gdn_v_global{};
+    // gdn_qk_unique[r][i]: original global QK head index at rank-local unique-QK slot i
+    std::array<std::array<int32_t, LLAMA_TP5_GDN_MAX_QK_HEADS>, LLAMA_TP5_MAX_RANKS> gdn_qk_unique{};
+    // number of valid entries per rank in the arrays above
+    std::array<int32_t, LLAMA_TP5_MAX_RANKS> gdn_v_global_count{};
+    std::array<int32_t, LLAMA_TP5_MAX_RANKS> gdn_qk_unique_count{};
+
+    // Local QKV channel offsets (elements along the projection row axis):
+    // local row layout is [Q unique | K unique | V ordered] with
+    // q_off = 0, k_off = ds * gdn_qk_unique_count[r],
+    // v_off = ds * (2 * gdn_qk_unique_count[r]).
+    int64_t gdn_local_qk_rows(uint32_t rank) const { return ds * gdn_qk_unique_count[rank]; }
+    int64_t gdn_local_v_off(uint32_t rank) const { return 2 * gdn_local_qk_rows(rank); }
 
     // One FFN reduction per layer, plus attention when it is sharded.
     uint32_t expected_events = 0;
@@ -137,6 +175,37 @@ bool llama_tp5_plan_build(const llama_hparams & hp,
 
 // TP5.md §8.2: global V head h uses Q/K head (h % Nk) after prearrangement.
 int64_t llama_tp5_gdn_qk_global_head(const llama_tp5_plan & plan, int64_t global_v_head);
+
+// True when the QSA headmap opt-in is active for this model+rank count
+// True when the QSA headmap opt-in is requested via GGML_TP5_QSA_HEADMAP=1.
+// The plan build fails closed (TP5_E_QSA_HEADMAP) unless the geometry is
+// exactly the balanced QWEN4EXP 5-rank Q24/KV2 assignment.
+bool llama_tp5_qsa_headmap_enabled(void);
+
+// Stamp the per-local-Q-head -> local-KV-head map of the given rank onto a
+// rank-local GGML_OP_FLASH_ATTN_EXT node using the shared ggml_tp5_headmap_set
+// ABI (op_params i32 slots 8/9/10). The global graph node is never stamped;
+// only META-produced rank-local clones carry the map. No-op returning false
+// when the headmap is disabled or rank is out of range.
+bool llama_tp5_qsa_headmap_stamp(const llama_tp5_plan & plan, uint32_t rank, struct ggml_tensor * fa_node);
+
+// Global Q head h -> global KV head (uniform global GQA ratio).
+int64_t llama_tp5_qsa_global_kv_head(const llama_tp5_plan & plan, int64_t global_q_head);
+
+// Balanced head-map helpers (opt-in GGML_TP5_GDN_HEADMAP=1):
+//
+// Rank-local QK head index used by rank-local V slot v_idx on the given rank
+// (position of the original QK head (gdn_v_global[rank][v_idx] % Nk) inside
+// gdn_qk_unique[rank]). Returns -1 when the head map is disabled or v_idx is
+// out of range.
+int32_t llama_tp5_gdn_local_qk(const llama_tp5_plan & plan, uint32_t rank, int32_t v_idx);
+
+// Pack the per-rank local V->QK map into the op_params head-map ABI
+// (ggml_tp5_headmap_set): entries llama_tp5_gdn_local_qk(plan, rank, i) for
+// i in [0, gdn_v_global_count[rank]). No-op returning false when the head map
+// is disabled or the map does not fit the 3-bit packing (count > 10 or an
+// index >= 8).
+bool llama_tp5_gdn_headmap_stamp(const llama_tp5_plan & plan, uint32_t rank, struct ggml_tensor * gdn_node);
 
 // Map a named tensor to meta split_state via the immutable plan.
 // Sharded native GDN weights/caches retain the caller's repeated-segment layout;
