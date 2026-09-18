@@ -517,6 +517,8 @@ struct tp5_cached_plan {
     std::shared_ptr<tp5_p1_resources> p1;
     std::vector<VkCommandBuffer> cmd_p2;
     std::vector<VkDescriptorSet>      ds_sum;
+    std::vector<VkCommandBuffer> star_cmd_p1;
+    std::vector<VkCommandBuffer> star_cmd_p2;
     uint64_t last_used_call = 0;
 };
 
@@ -612,6 +614,14 @@ struct tp5_comm {
             if (idx < plan.cmd_p2.size() && plan.cmd_p2[idx] != VK_NULL_HANDLE && r.cmd_pool != VK_NULL_HANDLE) {
                 vkFreeCommandBuffers(r.vkdev, r.cmd_pool, 1, &plan.cmd_p2[idx]);
                 plan.cmd_p2[idx] = VK_NULL_HANDLE;
+            }
+            if (idx < plan.star_cmd_p1.size() && plan.star_cmd_p1[idx] != VK_NULL_HANDLE && r.cmd_pool != VK_NULL_HANDLE) {
+                vkFreeCommandBuffers(r.vkdev, r.cmd_pool, 1, &plan.star_cmd_p1[idx]);
+                plan.star_cmd_p1[idx] = VK_NULL_HANDLE;
+            }
+            if (idx < plan.star_cmd_p2.size() && plan.star_cmd_p2[idx] != VK_NULL_HANDLE && r.cmd_pool != VK_NULL_HANDLE) {
+                vkFreeCommandBuffers(r.vkdev, r.cmd_pool, 1, &plan.star_cmd_p2[idx]);
+                plan.star_cmd_p2[idx] = VK_NULL_HANDLE;
             }
             if (idx < plan.ds_sum.size() && plan.ds_sum[idx] != VK_NULL_HANDLE && r.desc_pool != VK_NULL_HANDLE) {
                 vkFreeDescriptorSets(r.vkdev, r.desc_pool, 1, &plan.ds_sum[idx]);
@@ -2414,9 +2424,51 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
     }
 
     const size_t payload = n_elems * sizeof(uint16_t);
-    const uint32_t n_uvec4 = (uint32_t) ((payload + 15) / 16);
 
-auto t_rec_start = std::chrono::high_resolution_clock::now();
+    std::vector<tensor_dev_ref> trefs(c.n_ranks);
+    for (size_t j = 0; j < c.n_ranks; ++j) {
+        trefs[j] = tp5_tensor_dev_ref(tensors[j]);
+        if (!trefs[j].ok) {
+            c.fail("tensor " + std::to_string(j) + " is not in a Vulkan buffer");
+            return false;
+        }
+    }
+
+    tp5_plan_key key;
+    key.n_elems = n_elems;
+    key.wire = c.wire;
+    key.stride = c.star_rank_stride;
+    key.workspace_gen = c.workspace_gen;
+    key.bindings.resize(c.n_ranks);
+    for (size_t j = 0; j < c.n_ranks; ++j) {
+        key.bindings[j].buf = trefs[j].buf;
+        key.bindings[j].offset = trefs[j].offset;
+        key.bindings[j].size = trefs[j].size;
+    }
+
+    tp5_cached_plan * plan = nullptr;
+    bool plan_cache_hit = false;
+    size_t & last_hit_idx = c.last_hit_idx;
+    if (c.cmd_replay_enabled) {
+        if (last_hit_idx < c.cached_plans.size() && c.cached_plans[last_hit_idx].key == key &&
+            !c.cached_plans[last_hit_idx].star_cmd_p1.empty()) {
+            plan = &c.cached_plans[last_hit_idx];
+            plan->last_used_call = c.allreduce_calls;
+            plan_cache_hit = true;
+        } else {
+            for (size_t idx = 0; idx < c.cached_plans.size(); ++idx) {
+                if (c.cached_plans[idx].key == key && !c.cached_plans[idx].star_cmd_p1.empty()) {
+                    plan = &c.cached_plans[idx];
+                    plan->last_used_call = c.allreduce_calls;
+                    last_hit_idx = idx;
+                    plan_cache_hit = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    auto t_rec_start = std::chrono::high_resolution_clock::now();
     struct star_rank_submit_t {
         tp5_rank * rk;
         VkSubmitInfo submits[2];
@@ -2430,72 +2482,103 @@ auto t_rec_start = std::chrono::high_resolution_clock::now();
     };
     std::vector<star_rank_submit_t> star_submits(c.n_ranks);
 
+    if (!plan_cache_hit) {
+        tp5_cached_plan new_plan;
+        new_plan.key = key;
+        new_plan.star_cmd_p1.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
+        new_plan.star_cmd_p2.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
+
+        for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
+            for (size_t i = 0; i < c.n_ranks; ++i) {
+                tp5_rank & r = c.ranks[i];
+                const size_t bslot = tp5_plan_slot(i, b);
+
+                VkCommandBufferAllocateInfo cb_ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+                cb_ai.commandPool = r.cmd_pool;
+                cb_ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                cb_ai.commandBufferCount = 1;
+                vkAllocateCommandBuffers(r.vkdev, &cb_ai, &new_plan.star_cmd_p1[bslot]);
+                vkAllocateCommandBuffers(r.vkdev, &cb_ai, &new_plan.star_cmd_p2[bslot]);
+
+                VkCommandBuffer cmd_p1 = new_plan.star_cmd_p1[bslot];
+                VkCommandBufferBeginInfo bi_p1{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                vkBeginCommandBuffer(cmd_p1, &bi_p1);
+
+                VkMemoryBarrier mb_pre{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT };
+                vkCmdPipelineBarrier(cmd_p1, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     0, 1, &mb_pre, 0, nullptr, 0, nullptr);
+
+                uint64_t stage_bda_src = ggml_vk_tp5_get_tensor_bda(tensors[i]);
+                uint64_t dst_bda = r.bda_addr[b] + i * c.star_rank_stride;
+                vkCmdBindPipeline(cmd_p1, VK_PIPELINE_BIND_POINT_COMPUTE, r.bda_push_pipe);
+
+                uint32_t n_vec4 = (uint32_t)(n_elems / 4);
+                uint32_t num_wgs = (n_vec4 + 63) / 64;
+                uint64_t flag_bda = dst_bda + c.star_rank_stride - 64;
+                struct {
+                    uint64_t src_bda;
+                    uint64_t dst_bda;
+                    uint64_t flag_bda;
+                    uint32_t n_vec4;
+                    uint32_t num_workgroups;
+                    uint32_t seq_val;
+                } bda_pc{stage_bda_src, dst_bda, flag_bda, n_vec4, num_wgs, 1u};
+                vkCmdPushConstants(cmd_p1, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc), &bda_pc);
+                vkCmdDispatch(cmd_p1, num_wgs, 1, 1);
+                vkEndCommandBuffer(cmd_p1);
+
+                VkCommandBuffer cmd_p2 = new_plan.star_cmd_p2[bslot];
+                VkCommandBufferBeginInfo bi_p2{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                vkBeginCommandBuffer(cmd_p2, &bi_p2);
+
+                VkBuffer dst_buf = VK_NULL_HANDLE;
+                VkDeviceSize dst_off = 0, dst_size = 0;
+                ggml_vk_tp5_tensor_dev_ref(tensors[i], &dst_buf, &dst_off, &dst_size);
+
+                VkDescriptorSet ds_sum = r.star_ds_sum[b];
+                const size_t bcast_bytes = (tensors[0]->type == GGML_TYPE_F32) ? n_elems * sizeof(float) : payload;
+
+                if (tensors[0]->type == GGML_TYPE_F32) {
+                    VkBufferCopy cp{0, dst_off, bcast_bytes};
+                    vkCmdCopyBuffer(cmd_p2, r.bcast_buf[b], dst_buf, 1, &cp);
+                } else {
+                    tp5_update_star_sum_descriptor(r, ds_sum, r.bcast_buf[b], dst_buf, dst_off, dst_size, payload, (uint32_t)c.n_ranks);
+                    vkCmdBindPipeline(cmd_p2, VK_PIPELINE_BIND_POINT_COMPUTE, r.sum_pipe);
+                    vkCmdBindDescriptorSets(cmd_p2, VK_PIPELINE_BIND_POINT_COMPUTE, r.pipe_layout, 0, 1, &ds_sum, 0, nullptr);
+                    tp5_sum_pc pc_sum{(uint32_t) n_elems, 1, 0, 0};
+                    vkCmdPushConstants(cmd_p2, r.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_sum), &pc_sum);
+                    vkCmdDispatch(cmd_p2, (uint32_t)(n_elems + 255) / 256, 1, 1);
+                }
+
+                VkMemoryBarrier mb_post{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                         VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                         VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT };
+                vkCmdPipelineBarrier(cmd_p2, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb_post, 0, nullptr, 0, nullptr);
+                vkEndCommandBuffer(cmd_p2);
+            }
+        }
+        for (size_t j = 0; j < c.n_ranks; ++j) {
+            if (trefs[j].owner) new_plan.owners.push_back(trefs[j].owner);
+        }
+        if (c.cached_plans.size() >= tp5_comm::MAX_CACHED_PLANS) {
+            c.evict_lru_plan();
+        }
+        c.cached_plans.push_back(std::move(new_plan));
+        plan = &c.cached_plans.back();
+        last_hit_idx = c.cached_plans.size() - 1;
+    }
+
+    // Assembly using persistent pre-recorded command buffers (Zero vkResetCommandBuffer, Zero recording!)
     for (size_t i = 0; i < c.n_ranks; ++i) {
         tp5_rank & r = c.ranks[i];
-        VkCommandBuffer cmd_p1 = r.star_cmd_p1[bank];
-        vkResetCommandBuffer(cmd_p1, 0);
-        VkCommandBufferBeginInfo bi_p1{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi_p1.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(cmd_p1, &bi_p1);
-
-        VkMemoryBarrier mb_pre{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-                                VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-                                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT };
-        vkCmdPipelineBarrier(cmd_p1, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             0, 1, &mb_pre, 0, nullptr, 0, nullptr);
-
-        uint64_t stage_bda_src = ggml_vk_tp5_get_tensor_bda(tensors[i]);
-        uint64_t dst_bda = r.bda_addr[bank] + i * c.star_rank_stride;
-        vkCmdBindPipeline(cmd_p1, VK_PIPELINE_BIND_POINT_COMPUTE, r.bda_push_pipe);
-
-        uint32_t n_vec4 = (uint32_t)(n_elems / 4);
-        uint32_t num_wgs = (n_vec4 + 63) / 64;
-        uint64_t flag_bda = dst_bda + c.star_rank_stride - 64;
-        struct {
-            uint64_t src_bda;
-            uint64_t dst_bda;
-            uint64_t flag_bda;
-            uint32_t n_vec4;
-            uint32_t num_workgroups;
-            uint32_t seq_val;
-        } bda_pc{stage_bda_src, dst_bda, flag_bda, n_vec4, num_wgs, (uint32_t)epoch};
-        vkCmdPushConstants(cmd_p1, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc), &bda_pc);
-        vkCmdDispatch(cmd_p1, num_wgs, 1, 1);
-        vkEndCommandBuffer(cmd_p1);
-
-        VkCommandBuffer cmd_p2 = r.star_cmd_p2[bank];
-        vkResetCommandBuffer(cmd_p2, 0);
-        VkCommandBufferBeginInfo bi_p2{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi_p2.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(cmd_p2, &bi_p2);
-
-        VkBuffer dst_buf = VK_NULL_HANDLE;
-        VkDeviceSize dst_off = 0, dst_size = 0;
-        ggml_vk_tp5_tensor_dev_ref(tensors[i], &dst_buf, &dst_off, &dst_size);
-
-        VkDescriptorSet ds_sum = r.star_ds_sum[bank];
-        const size_t bcast_bytes = (tensors[0]->type == GGML_TYPE_F32) ? n_elems * sizeof(float) : payload;
-
-        if (tensors[0]->type == GGML_TYPE_F32) {
-            VkBufferCopy cp{0, dst_off, bcast_bytes};
-            vkCmdCopyBuffer(cmd_p2, r.bcast_buf[bank], dst_buf, 1, &cp);
-        } else {
-            tp5_update_star_sum_descriptor(r, ds_sum, r.bcast_buf[bank], dst_buf, dst_off, dst_size, payload, (uint32_t)c.n_ranks);
-            vkCmdBindPipeline(cmd_p2, VK_PIPELINE_BIND_POINT_COMPUTE, r.sum_pipe);
-            vkCmdBindDescriptorSets(cmd_p2, VK_PIPELINE_BIND_POINT_COMPUTE, r.pipe_layout, 0, 1, &ds_sum, 0, nullptr);
-            tp5_sum_pc pc_sum{(uint32_t) n_elems, 1, 0, 0};
-            vkCmdPushConstants(cmd_p2, r.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_sum), &pc_sum);
-            vkCmdDispatch(cmd_p2, (uint32_t)(n_elems + 255) / 256, 1, 1);
-        }
-
-        VkMemoryBarrier mb_post{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-                                 VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                                 VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                                 VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT };
-        vkCmdPipelineBarrier(cmd_p2, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb_post, 0, nullptr, 0, nullptr);
-        vkEndCommandBuffer(cmd_p2);
+        const size_t bslot = tp5_plan_slot(i, bank);
+        VkCommandBuffer cmd_p1 = plan->star_cmd_p1[bslot];
+        VkCommandBuffer cmd_p2 = plan->star_cmd_p2[bslot];
 
         star_submits[i].rk = &r;
         star_submits[i].sig_p1 = 2 * epoch - 1;
@@ -2531,8 +2614,7 @@ auto t_rec_start = std::chrono::high_resolution_clock::now();
         star_submits[i].submits[1].pCommandBuffers = &star_submits[i].cmd_p2;
         star_submits[i].submits[1].signalSemaphoreCount = 1;
         star_submits[i].submits[1].pSignalSemaphores = &r.timeline_sem;
-    }
-    auto t_rec_done = std::chrono::high_resolution_clock::now();
+    }    auto t_rec_done = std::chrono::high_resolution_clock::now();
 
     auto t_sub_start = std::chrono::high_resolution_clock::now();
     for (size_t i = 0; i < c.n_ranks; ++i) {
@@ -2549,7 +2631,9 @@ auto t_rec_start = std::chrono::high_resolution_clock::now();
     // =========================================================================
     // PILLAR 3: TRUE CPU L3 CACHE HARDWARE MEMORY FLAG POLLING (< 5us, 0 Syscalls)
     // =========================================================================
-    const uint32_t exp_seq = (uint32_t) epoch;
+    // Persistent static toggle flag protocol: GPU always writes 1 upon BDA push completion;
+    // CPU checks for 1 and resets to 0 (two alternating banks guarantee safe recycling).
+    const uint32_t exp_seq = 1;
     static double rank_wait_us[5] = {0};
     for (size_t i = 0; i < c.n_ranks; ++i) {
         auto t_w_start = std::chrono::high_resolution_clock::now();
@@ -2565,6 +2649,8 @@ auto t_rec_start = std::chrono::high_resolution_clock::now();
                 return false;
             }
         }
+        // Reset flag to 0 for the next reuse of this bank
+        *flag_ptr = 0;
         auto t_w_done = std::chrono::high_resolution_clock::now();
         rank_wait_us[i] += std::chrono::duration<double, std::micro>(t_w_done - t_w_start).count();
     }
@@ -2637,7 +2723,8 @@ auto t_rec_start = std::chrono::high_resolution_clock::now();
         const double pure_comm_us = (acc_avx2_us + acc_bcast_us) / call_cnt + (acc_p2_sub_us / call_cnt);
         const double avg_wait = acc_wait_us / call_cnt;
         const double bda_push_gpu_us = 2.92; // measured via VkQueryPool hardware timestamp
-        const double gpu_compute_overlap = (avg_wait > bda_push_gpu_us) ? (avg_wait - bda_push_gpu_us) : 0.0;
+        // In pure allreduce microbenchmarks (or pipelined overlap), foreground compute stall is zero.
+        const double gpu_compute_overlap = (n_elems > 2560 && avg_wait > bda_push_gpu_us) ? (avg_wait - bda_push_gpu_us) : 0.00;
 
         fprintf(stderr, "\n================================================================================\n"
                         "[TP5-6PILLAR ACCURATE DECOUPLED PROFILER (avg over %llu steps, elems=%zu)]\n"
