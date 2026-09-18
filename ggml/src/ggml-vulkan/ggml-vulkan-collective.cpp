@@ -877,9 +877,8 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
             uint64_t dst_bda_addr;
             uint64_t flag_bda_addr;
             uint32_t n_uvec4;
-            uint32_t rank_idx;
+            uint32_t num_workgroups;
             uint32_t seq_val;
-            uint32_t mode;
         } bda_pc_dummy;
         VkPushConstantRange bda_pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc_dummy)};
         VkPipelineLayoutCreateInfo bda_pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -2451,37 +2450,18 @@ auto t_rec_start = std::chrono::high_resolution_clock::now();
         vkCmdBindPipeline(cmd_p1, VK_PIPELINE_BIND_POINT_COMPUTE, r.bda_push_pipe);
 
         uint32_t n_vec4 = (uint32_t)(n_elems / 4);
+        uint32_t num_wgs = (n_vec4 + 63) / 64;
         uint64_t flag_bda = dst_bda + c.star_rank_stride - 64;
         struct {
             uint64_t src_bda;
             uint64_t dst_bda;
             uint64_t flag_bda;
             uint32_t n_vec4;
-            uint32_t rank_idx;
+            uint32_t num_workgroups;
             uint32_t seq_val;
-            uint32_t mode;
-        } bda_pc{stage_bda_src, dst_bda, flag_bda, n_vec4, (uint32_t)i, (uint32_t)epoch, 0u};
+        } bda_pc{stage_bda_src, dst_bda, flag_bda, n_vec4, num_wgs, (uint32_t)epoch};
         vkCmdPushConstants(cmd_p1, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc), &bda_pc);
-        vkCmdDispatch(cmd_p1, (n_vec4 + 63) / 64, 1, 1);
-
-        VkMemoryBarrier mb_data_done{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-                                      VK_ACCESS_SHADER_WRITE_BIT,
-                                      VK_ACCESS_SHADER_WRITE_BIT };
-        vkCmdPipelineBarrier(cmd_p1, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             0, 1, &mb_data_done, 0, nullptr, 0, nullptr);
-
-        bda_pc.mode = 1;
-        vkCmdPushConstants(cmd_p1, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc), &bda_pc);
-        vkCmdDispatch(cmd_p1, 1, 1, 1);
-
-        VkMemoryBarrier mb_host{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-                                 VK_ACCESS_SHADER_WRITE_BIT,
-                                 VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT };
-        vkCmdPipelineBarrier(cmd_p1, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                             0, 1, &mb_host, 0, nullptr, 0, nullptr);
-
+        vkCmdDispatch(cmd_p1, num_wgs, 1, 1);
         vkEndCommandBuffer(cmd_p1);
 
         VkCommandBuffer cmd_p2 = r.star_cmd_p2[bank];
