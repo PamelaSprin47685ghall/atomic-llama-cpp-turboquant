@@ -257,6 +257,7 @@ struct tp5_rank {
     std::vector<uint32_t> peer_syncobjs;
     VkSemaphore host_ready_sem = VK_NULL_HANDLE;
     uint32_t host_ready_syncobj = 0;
+    VkEvent host_ready_event[TP5_MAILBOX_BANKS] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
 
     PFN_vkSignalSemaphore pfn_signal_semaphore = nullptr;
     PFN_vkWaitSemaphores pfn_wait_semaphores = nullptr;
@@ -1425,6 +1426,12 @@ void tp5_destroy_rank(tp5_rank & r) {
         }
         r.bda_addr[b] = 0;
     }
+    for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
+        if (r.host_ready_event[b] != VK_NULL_HANDLE) {
+            vkDestroyEvent(r.vkdev, r.host_ready_event[b], nullptr);
+            r.host_ready_event[b] = VK_NULL_HANDLE;
+        }
+    }
     if (r.bda_push_pipe) { vkDestroyPipeline(r.vkdev, r.bda_push_pipe, nullptr); r.bda_push_pipe = VK_NULL_HANDLE; }
     if (r.bda_push_layout) { vkDestroyPipelineLayout(r.vkdev, r.bda_push_layout, nullptr); r.bda_push_layout = VK_NULL_HANDLE; }
     if (r.bda_push_dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.bda_push_dsl, nullptr); r.bda_push_dsl = VK_NULL_HANDLE; }
@@ -2384,6 +2391,9 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
     const uint64_t epoch = ++c.allreduce_calls;
     const size_t bank = tp5_mailbox_bank(epoch);
 
+    static double acc_flush_us = 0;
+    static double acc_pure_sub_us = 0;
+    static double acc_rec_us = 0;
     static double acc_p1_sub_us = 0;
     static double acc_wait_us = 0;
     static double acc_avx2_us = 0;
@@ -2393,9 +2403,11 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
 
     auto t_start = std::chrono::high_resolution_clock::now();
 
+    auto t_flush_start = std::chrono::high_resolution_clock::now();
     for (auto backend : c.backends) {
         ggml_vk_tp5_flush_async(backend);
     }
+    auto t_flush_done = std::chrono::high_resolution_clock::now();
 
     if (c.max_elems < n_elems) {
         if (!tp5_setup_workspace(c, n_elems)) {
@@ -2423,6 +2435,7 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
     };
     std::vector<star_rank_submit_t> star_submits(c.n_ranks);
     
+    auto t_rec_start = std::chrono::high_resolution_clock::now();
     for (size_t i = 0; i < c.n_ranks; ++i) {
         tp5_rank & r = c.ranks[i];
         VkCommandBuffer cmd_p1 = r.star_cmd_p1[bank];
@@ -2499,12 +2512,21 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
         si_p1.signalSemaphoreCount = 1;
         si_p1.pSignalSemaphores = &r.timeline_sem;
 
+        // CPU resets doorbell event before recording & submitting Phase 2
+        vkResetEvent(r.vkdev, r.host_ready_event[bank]);
+
         // Pre-record Phase 2 Command Buffer
         VkCommandBuffer cmd_p2 = r.star_cmd_p2[bank];
         vkResetCommandBuffer(cmd_p2, 0);
         VkCommandBufferBeginInfo bi_p2{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi_p2.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(cmd_p2, &bi_p2);
+
+        // Hardware Doorbell: GPU CP pauses here until CPU rings the doorbell (vkSetEvent, 6 ns)
+        vkCmdWaitEvents(cmd_p2, 1, &r.host_ready_event[bank],
+                        VK_PIPELINE_STAGE_HOST_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        0, nullptr, 0, nullptr, 0, nullptr);
 
         VkBuffer dst_buf = VK_NULL_HANDLE;
         VkDeviceSize dst_off = 0, dst_size = 0;
@@ -2534,21 +2556,19 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb_post, 0, nullptr, 0, nullptr);
         vkEndCommandBuffer(cmd_p2);
 
-        // Phase 2 waits on host_ready_sem (epoch) and signals timeline_sem (2 * epoch)
-        uint64_t wait_ready = epoch;
+        // Phase 2 is gated by host_ready_event doorbell and signals timeline_sem (2 * epoch)
         uint64_t sig_p2 = 2 * epoch;
-        VkPipelineStageFlags wait_dst_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
         VkTimelineSemaphoreSubmitInfo tsi_p2{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-        tsi_p2.waitSemaphoreValueCount = 1;
-        tsi_p2.pWaitSemaphoreValues = &wait_ready;
+        tsi_p2.waitSemaphoreValueCount = 0;
+        tsi_p2.pWaitSemaphoreValues = nullptr;
         tsi_p2.signalSemaphoreValueCount = 1;
         tsi_p2.pSignalSemaphoreValues = &sig_p2;
 
         VkSubmitInfo si_p2{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si_p2.pNext = &tsi_p2;
-        si_p2.waitSemaphoreCount = 1;
-        si_p2.pWaitSemaphores = &r.host_ready_sem;
-        si_p2.pWaitDstStageMask = &wait_dst_stage;
+        si_p2.waitSemaphoreCount = 0;
+        si_p2.pWaitSemaphores = nullptr;
+        si_p2.pWaitDstStageMask = nullptr;
         si_p2.commandBufferCount = 1;
         si_p2.pCommandBuffers = &cmd_p2;
         si_p2.signalSemaphoreCount = 1;
@@ -2557,10 +2577,8 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
         star_submits[i].rk = &r;
         star_submits[i].sig_p1_val = sig_p1;
         star_submits[i].sig_p2_val = sig_p2;
-        star_submits[i].wait_ready_val = wait_ready;
         star_submits[i].cmd_p1_val = cmd_p1;
         star_submits[i].cmd_p2_val = cmd_p2;
-        star_submits[i].wait_stage_val = wait_dst_stage;
         // Copy TSI structs so their lifetimes extend past the recording loop
         star_submits[i].tsi_p1 = tsi_p1;
         star_submits[i].tsi_p2 = tsi_p2;
@@ -2573,12 +2591,17 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
         star_submits[i].si_p2 = si_p2;
         star_submits[i].si_p2.pNext = &star_submits[i].tsi_p2;
         star_submits[i].si_p2.pCommandBuffers = &star_submits[i].cmd_p2_val;
-        star_submits[i].si_p2.pWaitDstStageMask = &star_submits[i].wait_stage_val;
-        star_submits[i].tsi_p2.pWaitSemaphoreValues = &star_submits[i].wait_ready_val;
+        star_submits[i].si_p2.waitSemaphoreCount = 0;
+        star_submits[i].si_p2.pWaitSemaphores = nullptr;
+        star_submits[i].si_p2.pWaitDstStageMask = nullptr;
+        star_submits[i].tsi_p2.waitSemaphoreValueCount = 0;
+        star_submits[i].tsi_p2.pWaitSemaphoreValues = nullptr;
         star_submits[i].tsi_p2.pSignalSemaphoreValues = &star_submits[i].sig_p2_val;
     }
 
     // 2. Parallel vkQueueSubmit on all 5 GPUs via persistent thread pool
+    auto t_rec_done = std::chrono::high_resolution_clock::now();
+    auto t_sub_start = std::chrono::high_resolution_clock::now();
     if (c.submit_pool) {
         std::atomic<int> submit_fail{0};
         c.submit_pool->parallel_for([&](size_t i) {
@@ -2604,13 +2627,16 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
             ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
         }
     }
-auto t_after_p1 = std::chrono::high_resolution_clock::now();
+auto t_sub_done = std::chrono::high_resolution_clock::now();
+    auto t_after_p1 = std::chrono::high_resolution_clock::now();
 
     // =========================================================================
     // PILLAR 3: TRUE CPU L3 CACHE HARDWARE MEMORY FLAG POLLING (< 5us, 0 Syscalls)
     // =========================================================================
     const uint32_t exp_seq = (uint32_t) epoch;
+    static double rank_wait_us[5] = {0};
     for (size_t i = 0; i < c.n_ranks; ++i) {
+        auto t_w_start = std::chrono::high_resolution_clock::now();
         volatile uint32_t * flag_ptr = (volatile uint32_t *)((char *)c.star_host_aligned[bank] + (i + 1) * c.star_rank_stride - 64);
         uint64_t spin_cnt = 0;
         while (*flag_ptr != exp_seq) {
@@ -2623,6 +2649,14 @@ auto t_after_p1 = std::chrono::high_resolution_clock::now();
                 return false;
             }
         }
+        auto t_w_done = std::chrono::high_resolution_clock::now();
+        rank_wait_us[i] += std::chrono::duration<double, std::micro>(t_w_done - t_w_start).count();
+    }
+    if (call_cnt % 96 == 95) {
+        fprintf(stderr, "  [FLAG-WAIT-PER-RANK (us)] r0=%.2f r1=%.2f r2=%.2f r3=%.2f r4=%.2f\n",
+                rank_wait_us[0] / 96.0, rank_wait_us[1] / 96.0, rank_wait_us[2] / 96.0,
+                rank_wait_us[3] / 96.0, rank_wait_us[4] / 96.0);
+        for (int k = 0; k < 5; ++k) rank_wait_us[k] = 0;
     }
 
     auto t_after_wait = std::chrono::high_resolution_clock::now();
@@ -2676,34 +2710,17 @@ auto t_after_p1 = std::chrono::high_resolution_clock::now();
     auto t_after_bcast = std::chrono::high_resolution_clock::now();
 
     // =========================================================================
-    // PILLAR 6: ATOMIC ASYNC SIGNAL HANDOFF (Wakes up GPU Phase 2 already queued on hardware!)
-    // ZERO runtime second submission!
+    // PILLAR 6: ZERO-SYSCALL HARDWARE DOORBELL HANDOFF (vkSetEvent ~6 ns per GPU!)
+    // Completely bypasses slow DRM IOCTL / vkSignalSemaphore!
     // =========================================================================
-    if (c.drm_signaler) {
-        for (size_t i = 0; i < c.n_ranks; ++i) {
-            tp5_rank & r = c.ranks[i];
-            if (r.dri_fd >= 0 && r.host_ready_syncobj > 0) {
-                c.drm_signaler->signal_async(i, r.dri_fd, r.host_ready_syncobj, epoch);
-            } else if (r.pfn_signal_semaphore && r.host_ready_sem) {
-                VkSemaphoreSignalInfo ssi{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, nullptr, r.host_ready_sem, epoch};
-                r.pfn_signal_semaphore(r.vkdev, &ssi);
-            }
-        }
-    } else {
-        for (size_t i = 0; i < c.n_ranks; ++i) {
-            tp5_rank & r = c.ranks[i];
-            uint64_t sig_epoch = epoch;
-            if (r.dri_fd >= 0 && r.host_ready_syncobj > 0) {
-                tp5_drm_syncobj_ops::timeline_signal(r.dri_fd, &r.host_ready_syncobj, &sig_epoch, 1);
-            } else if (r.pfn_signal_semaphore && r.host_ready_sem) {
-                VkSemaphoreSignalInfo ssi{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, nullptr, r.host_ready_sem, sig_epoch};
-                r.pfn_signal_semaphore(r.vkdev, &ssi);
-            }
-        }
+    for (size_t i = 0; i < c.n_ranks; ++i) {
+        vkSetEvent(c.ranks[i].vkdev, c.ranks[i].host_ready_event[bank]);
     }
-
     auto t_after_p2 = std::chrono::high_resolution_clock::now();
 
+    acc_flush_us += std::chrono::duration<double, std::micro>(t_flush_done - t_flush_start).count();
+    acc_pure_sub_us += std::chrono::duration<double, std::micro>(t_sub_done - t_sub_start).count();
+    acc_rec_us += std::chrono::duration<double, std::micro>(t_rec_done - t_rec_start).count();
     acc_p1_sub_us += std::chrono::duration<double, std::micro>(t_after_p1 - t_start).count();
     acc_wait_us   += std::chrono::duration<double, std::micro>(t_after_wait - t_after_p1).count();
     acc_avx2_us   += std::chrono::duration<double, std::micro>(t_after_avx2 - t_after_wait).count();
@@ -2713,14 +2730,18 @@ auto t_after_p1 = std::chrono::high_resolution_clock::now();
 
     if (call_cnt % 96 == 0) {
         fprintf(stderr, "\n[REAL-PILLAR-PROFILER (avg over %llu calls)]\n"
-                        "  1. P1 vkQueueSubmit:      %6.2f us (96 steps: %5.2f ms)\n"
+                        " -1. Flush Async (Compute): %6.2f us (96 steps: %5.2f ms)\n"
+                        "  0. CPU CB Recording:      %6.2f us (96 steps: %5.2f ms)\n"
+                        "  1. Parallel Queue Submit: %6.2f us (96 steps: %5.2f ms)\n"
                         "  2. DRM Timeline Wait:     %6.2f us (96 steps: %5.2f ms)\n"
                         "  3. 22-Core AVX2 Sum:      %6.2f us (96 steps: %5.2f ms)\n"
                         "  4. CPU Root Bcast:        %6.2f us (96 steps: %5.2f ms)\n"
                         "  5. P2 vkQueueSubmit:      %6.2f us (96 steps: %5.2f ms)\n"
                         "  TOTAL ALLREDUCE PER STEP: %6.2f us (96 steps: %5.2f ms)\n\n",
                 (unsigned long long)call_cnt,
-                acc_p1_sub_us / call_cnt, (acc_p1_sub_us / call_cnt * 96) / 1000.0,
+                acc_flush_us / call_cnt, (acc_flush_us / call_cnt * 96) / 1000.0,
+                acc_rec_us / call_cnt, (acc_rec_us / call_cnt * 96) / 1000.0,
+                (acc_pure_sub_us) / call_cnt, ((acc_pure_sub_us) / call_cnt * 96) / 1000.0,
                 acc_wait_us / call_cnt,   (acc_wait_us / call_cnt * 96) / 1000.0,
                 acc_avx2_us / call_cnt,   (acc_avx2_us / call_cnt * 96) / 1000.0,
                 acc_bcast_us / call_cnt,  (acc_bcast_us / call_cnt * 96) / 1000.0,
@@ -4078,6 +4099,11 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
                 for (auto & rr : c->ranks) tp5_destroy_rank(rr);
                 delete c;
                 return nullptr;
+            }
+            // Create dedicated host_ready_event doorbells for zero-syscall CPU -> GPU Phase 2 handoff
+            for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
+                VkEventCreateInfo eci{VK_STRUCTURE_TYPE_EVENT_CREATE_INFO};
+                vkCreateEvent(r.vkdev, &eci, nullptr, &r.host_ready_event[b]);
             }
             // Create dedicated host_ready_sem for lockless CPU -> GPU Phase 2 handoff
             VkSemaphoreTypeCreateInfo tci_ready{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
