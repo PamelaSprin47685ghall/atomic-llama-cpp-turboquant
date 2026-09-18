@@ -2612,11 +2612,23 @@ auto t_rec_start = std::chrono::high_resolution_clock::now();
     // PILLAR 6: ATOMIC ASYNC SIGNAL HANDOFF (Wakes up GPU Phase 2 via timeline sem)
     // ZERO risk of GPU event hangs, completely thread-safe & monotonic!
     // =========================================================================
-    for (size_t i = 0; i < c.n_ranks; ++i) {
-        tp5_rank & r = c.ranks[i];
-        if (r.pfn_signal_semaphore && r.host_ready_sem) {
-            VkSemaphoreSignalInfo ssi{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, nullptr, r.host_ready_sem, epoch};
-            r.pfn_signal_semaphore(r.vkdev, &ssi);
+    if (c.drm_signaler) {
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            tp5_rank & r = c.ranks[i];
+            if (r.dri_fd >= 0 && r.host_ready_syncobj > 0) {
+                c.drm_signaler->signal_async(i, r.dri_fd, r.host_ready_syncobj, epoch);
+            } else if (r.pfn_signal_semaphore && r.host_ready_sem) {
+                VkSemaphoreSignalInfo ssi{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, nullptr, r.host_ready_sem, epoch};
+                r.pfn_signal_semaphore(r.vkdev, &ssi);
+            }
+        }
+    } else {
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            tp5_rank & r = c.ranks[i];
+            if (r.pfn_signal_semaphore && r.host_ready_sem) {
+                VkSemaphoreSignalInfo ssi{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, nullptr, r.host_ready_sem, epoch};
+                r.pfn_signal_semaphore(r.vkdev, &ssi);
+            }
         }
     }
     auto t_after_p2 = std::chrono::high_resolution_clock::now();
