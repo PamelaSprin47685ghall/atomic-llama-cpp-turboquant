@@ -264,6 +264,18 @@ static void run_round(void *                                   comm,
 
 static void check_result(const std::vector<std::vector<float>> & got_ranks, size_t n_elems,
                          size_t P, int round, bool vary, int binding_id, bool fractional, bool is_f16_wire) {
+    if (got_ranks.size() < P) {
+        fprintf(stderr, "check_result: got_ranks size %zu < P %zu\n", got_ranks.size(), P);
+        g_failures++;
+        return;
+    }
+    for (size_t j = 0; j < P; ++j) {
+        if (got_ranks[j].size() < n_elems) {
+            fprintf(stderr, "check_result: rank %zu size %zu < n_elems %zu\n", j, got_ranks[j].size(), n_elems);
+            g_failures++;
+            return;
+        }
+    }
     for (size_t e = 0; e < n_elems; ++e) {
         float expect = 0.0f;
         if (vary) {
@@ -385,6 +397,18 @@ static void run_producer_round(void * comm, const std::vector<rank_producer_grap
 
 static void check_producer_result(const std::vector<std::vector<float>> & got_ranks, size_t n_elems,
                                   size_t P, int round, bool vary, bool fractional, bool is_f16_wire) {
+    if (got_ranks.size() < P) {
+        fprintf(stderr, "check_producer_result: got_ranks size %zu < P %zu\n", got_ranks.size(), P);
+        g_failures++;
+        return;
+    }
+    for (size_t j = 0; j < P; ++j) {
+        if (got_ranks[j].size() < n_elems) {
+            fprintf(stderr, "check_producer_result: rank %zu size %zu < n_elems %zu\n", j, got_ranks[j].size(), n_elems);
+            g_failures++;
+            return;
+        }
+    }
     for (size_t e = 0; e < n_elems; ++e) {
         float expect = 0.0f;
         for (size_t j = 0; j < P; ++j) {
