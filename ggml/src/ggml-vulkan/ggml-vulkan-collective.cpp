@@ -900,8 +900,9 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
             uint64_t dst_bda_addr;
             uint64_t flag_bda_addr;
             uint32_t n_uvec4;
-            uint32_t num_workgroups;
+            uint32_t rank_idx;
             uint32_t seq_val;
+            uint32_t mode;
         } bda_pc_dummy;
         VkPushConstantRange bda_pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc_dummy)};
         VkPipelineLayoutCreateInfo bda_pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -1973,10 +1974,10 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
 
                 if (c.sync_mode == tp5_sync_mode::STAR) {
                     VkMemoryBarrier mb_pre{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-                                            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-                                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT };
-                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                            VK_ACCESS_SHADER_WRITE_BIT,
+                                            VK_ACCESS_SHADER_READ_BIT };
+                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                          0, 1, &mb_pre, 0, nullptr, 0, nullptr);
 
                     uint64_t stage_bda_src = 0;
@@ -1989,20 +1990,34 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     }
                     uint64_t dst_bda = r.bda_addr[b] + i * c.star_rank_stride;
                     uint32_t n_vec4 = (uint32_t)(n_elems / 4);
-                    uint32_t num_wgs = (n_vec4 + 63) / 64;
                     uint64_t flag_bda = dst_bda + c.star_rank_stride - 64;
+
+                    // Dispatch 1: Payload Data (Mode 0)
                     struct {
                         uint64_t src_bda;
                         uint64_t dst_bda;
                         uint64_t flag_bda;
                         uint32_t n_vec4;
-                        uint32_t num_workgroups;
+                        uint32_t rank_idx;
                         uint32_t seq_val;
-                    } bda_pc{stage_bda_src, dst_bda, flag_bda, n_vec4, num_wgs, 1u};
-
+                        uint32_t mode;
+                    } bda_pc{stage_bda_src, dst_bda, flag_bda, n_vec4, (uint32_t)i, 1u, 0u};
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.bda_push_pipe);
                     vkCmdPushConstants(cmd, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc), &bda_pc);
-                    vkCmdDispatch(cmd, num_wgs, 1, 1);
+                    vkCmdDispatch(cmd, (n_vec4 + 63) / 64, 1, 1);
+
+                    // Hardware Pipeline Barrier: Enforces complete cache drain and PCIe visibility before flag write
+                    VkMemoryBarrier mb_host{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                             VK_ACCESS_SHADER_WRITE_BIT,
+                                             VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
+                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         0, 1, &mb_host, 0, nullptr, 0, nullptr);
+
+                    // Dispatch 2: Flag Write (Mode 1, guaranteed 100% data arrival in Host memory)
+                    bda_pc.mode = 1;
+                    vkCmdPushConstants(cmd, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc), &bda_pc);
+                    vkCmdDispatch(cmd, 1, 1, 1);
                     if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
                         c.fail("end cmd_p1 star failed on rank " + std::to_string(i));
                         return false;
@@ -2195,9 +2210,9 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                 vkCmdCopyBuffer(cmd, r.bcast_buf[b], trefs[i].buf, 1, &cp);
                 VkMemoryBarrier mb_post{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                                          VK_ACCESS_TRANSFER_WRITE_BIT,
-                                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT };
+                                         VK_ACCESS_SHADER_READ_BIT };
                 vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb_post, 0, nullptr, 0, nullptr);
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_post, 0, nullptr, 0, nullptr);
                 if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
                     c.fail("end cmd_p2 star failed on rank " + std::to_string(i));
                     return false;
@@ -2573,10 +2588,10 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                 vkBeginCommandBuffer(cmd_p1, &bi_p1);
 
                 VkMemoryBarrier mb_pre{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-                                        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-                                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT };
-                vkCmdPipelineBarrier(cmd_p1, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                        VK_ACCESS_SHADER_WRITE_BIT,
+                                        VK_ACCESS_SHADER_READ_BIT };
+                vkCmdPipelineBarrier(cmd_p1, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                      0, 1, &mb_pre, 0, nullptr, 0, nullptr);
 
                 uint64_t stage_bda_src = ggml_vk_tp5_get_tensor_bda(tensors[i]);
@@ -2584,18 +2599,34 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                 vkCmdBindPipeline(cmd_p1, VK_PIPELINE_BIND_POINT_COMPUTE, r.bda_push_pipe);
 
                 uint32_t n_vec4 = (uint32_t)(n_elems / 4);
-                uint32_t num_wgs = (n_vec4 + 63) / 64;
                 uint64_t flag_bda = dst_bda + c.star_rank_stride - 64;
+
+                // Dispatch 1: Payload Data (Mode 0)
                 struct {
                     uint64_t src_bda;
                     uint64_t dst_bda;
                     uint64_t flag_bda;
                     uint32_t n_vec4;
-                    uint32_t num_workgroups;
+                    uint32_t rank_idx;
                     uint32_t seq_val;
-                } bda_pc{stage_bda_src, dst_bda, flag_bda, n_vec4, num_wgs, 1u};
+                    uint32_t mode;
+                } bda_pc{stage_bda_src, dst_bda, flag_bda, n_vec4, (uint32_t)i, 1u, 0u};
+                vkCmdBindPipeline(cmd_p1, VK_PIPELINE_BIND_POINT_COMPUTE, r.bda_push_pipe);
                 vkCmdPushConstants(cmd_p1, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc), &bda_pc);
-                vkCmdDispatch(cmd_p1, num_wgs, 1, 1);
+                vkCmdDispatch(cmd_p1, (n_vec4 + 63) / 64, 1, 1);
+
+                // Hardware Pipeline Barrier: Enforces complete cache drain and PCIe visibility before flag write
+                VkMemoryBarrier mb_host{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                         VK_ACCESS_SHADER_WRITE_BIT,
+                                         VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT };
+                vkCmdPipelineBarrier(cmd_p1, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     0, 1, &mb_host, 0, nullptr, 0, nullptr);
+
+                // Dispatch 2: Flag Write (Mode 1, guaranteed 100% data arrival in Host memory)
+                bda_pc.mode = 1;
+                vkCmdPushConstants(cmd_p1, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc), &bda_pc);
+                vkCmdDispatch(cmd_p1, 1, 1, 1);
                 vkEndCommandBuffer(cmd_p1);
 
                 VkCommandBuffer cmd_p2 = new_plan.star_cmd_p2[bslot];
@@ -2622,11 +2653,10 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                 }
 
                 VkMemoryBarrier mb_post{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-                                         VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                                         VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT };
-                vkCmdPipelineBarrier(cmd_p2, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb_post, 0, nullptr, 0, nullptr);
+                                         VK_ACCESS_TRANSFER_WRITE_BIT,
+                                         VK_ACCESS_SHADER_READ_BIT };
+                vkCmdPipelineBarrier(cmd_p2, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_post, 0, nullptr, 0, nullptr);
                 vkEndCommandBuffer(cmd_p2);
             }
         }
