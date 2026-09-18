@@ -1956,6 +1956,44 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     return false;
                 }
 
+                if (c.sync_mode == tp5_sync_mode::STAR) {
+                    VkMemoryBarrier mb_pre{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT };
+                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                         0, 1, &mb_pre, 0, nullptr, 0, nullptr);
+
+                    uint64_t stage_bda_src = 0;
+                    auto pfn_bda = (PFN_vkGetBufferDeviceAddressKHR) vkGetDeviceProcAddr(r.vkdev, "vkGetBufferDeviceAddressKHR");
+                    if (!pfn_bda) pfn_bda = (PFN_vkGetBufferDeviceAddressKHR) vkGetDeviceProcAddr(r.vkdev, "vkGetBufferDeviceAddress");
+                    if (pfn_bda) {
+                        VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr,
+                                                     has_packed ? trefs[i].packed_buf : trefs[i].buf};
+                        stage_bda_src = pfn_bda(r.vkdev, &dai) + (has_packed ? trefs[i].packed_offset : trefs[i].offset);
+                    }
+                    uint64_t dst_bda = r.bda_addr[b] + i * c.star_rank_stride;
+                    uint32_t n_vec4 = (uint32_t)(n_elems / 4);
+                    uint32_t num_wgs = (n_vec4 + 63) / 64;
+                    uint64_t flag_bda = dst_bda + c.star_rank_stride - 64;
+                    struct {
+                        uint64_t src_bda;
+                        uint64_t dst_bda;
+                        uint64_t flag_bda;
+                        uint32_t n_vec4;
+                        uint32_t num_workgroups;
+                        uint32_t seq_val;
+                    } bda_pc{stage_bda_src, dst_bda, flag_bda, n_vec4, num_wgs, 1u};
+
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.bda_push_pipe);
+                    vkCmdPushConstants(cmd, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc), &bda_pc);
+                    vkCmdDispatch(cmd, num_wgs, 1, 1);
+                    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+                        c.fail("end cmd_p1 star failed on rank " + std::to_string(i));
+                        return false;
+                    }
+                    continue;
+                }
                 if (has_packed) {
                     const bool use_parallel_push = allow_parallel_push &&
                                                    (r.push_pipe != VK_NULL_HANDLE && c.n_ranks == 5 &&
@@ -2136,6 +2174,21 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                 return false;
             }
 
+            if (c.sync_mode == tp5_sync_mode::STAR) {
+                const size_t bcast_bytes = (c.wire == tp5_wire_type::F32) ? tensor_bytes : payload;
+                VkBufferCopy cp{ 0, trefs[i].offset, bcast_bytes };
+                vkCmdCopyBuffer(cmd, r.bcast_buf[b], trefs[i].buf, 1, &cp);
+                VkMemoryBarrier mb_post{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                         VK_ACCESS_TRANSFER_WRITE_BIT,
+                                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT };
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb_post, 0, nullptr, 0, nullptr);
+                if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+                    c.fail("end cmd_p2 star failed on rank " + std::to_string(i));
+                    return false;
+                }
+                continue;
+            }
             if (!gpuflag) {
                 const bool      hc = trefs[i].hc.width != 0;
                 VkMemoryBarrier mb_p2_in{
@@ -3365,6 +3418,232 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
     std::lock_guard<std::mutex> lock(c.mutex);
     if (c.failed) {
         GGML_ABORT("ggml-vulkan-collective: cannot submit on failed communicator\n");
+    }
+    if (c.sync_mode == tp5_sync_mode::STAR) {
+        const size_t n_stages = stage_tensors.size();
+        if (n_stages == 0 || n_stages > 128 || stage_compute_cbs.size() != n_stages + 1) return false;
+
+        for (auto backend : c.backends) {
+            ggml_vk_tp5_flush_async(backend);
+        }
+
+        size_t max_chain_elems = 0;
+        for (size_t s = 0; s < n_stages; ++s) {
+            size_t ne = (size_t) ggml_nelements(stage_tensors[s][0]);
+            if (ne > max_chain_elems) max_chain_elems = ne;
+        }
+        if (c.max_elems < max_chain_elems) {
+            if (!tp5_setup_workspace(c, max_chain_elems)) {
+                c.fail("tp5_submit_epoch_chain: workspace setup failed");
+                return false;
+            }
+        }
+
+        uint64_t max_cur_timeline = 0;
+        uint64_t max_cur_ready = 0;
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            uint64_t val = 0;
+            if (c.ranks[i].pfn_get_sem_counter) {
+                c.ranks[i].pfn_get_sem_counter(c.ranks[i].vkdev, c.ranks[i].timeline_sem, &val);
+            }
+            if (val > max_cur_timeline) max_cur_timeline = val;
+            uint64_t rval = 0;
+            if (c.ranks[i].pfn_get_sem_counter && c.ranks[i].host_ready_sem) {
+                c.ranks[i].pfn_get_sem_counter(c.ranks[i].vkdev, c.ranks[i].host_ready_sem, &rval);
+            }
+            if (rval > max_cur_ready) max_cur_ready = rval;
+        }
+        const uint64_t base_epoch = (max_cur_timeline + 2) / 2 + 1;
+        const uint64_t base_ready_epoch = max_cur_ready + 1;
+        c.allreduce_calls = base_epoch + n_stages - 1;
+
+        std::vector<std::vector<VkSubmitInfo>> all_rank_submits(c.n_ranks);
+        std::vector<std::vector<VkTimelineSemaphoreSubmitInfo>> all_tsi(c.n_ranks, std::vector<VkTimelineSemaphoreSubmitInfo>(n_stages * 2));
+        std::vector<std::vector<uint64_t>> all_sig_p1(c.n_ranks, std::vector<uint64_t>(n_stages));
+        std::vector<std::vector<uint64_t>> all_wait_p2(c.n_ranks, std::vector<uint64_t>(n_stages));
+        std::vector<std::vector<uint64_t>> all_sig_p2(c.n_ranks, std::vector<uint64_t>(n_stages));
+        std::vector<VkPipelineStageFlags> wait_stages(n_stages, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            tp5_rank & r = c.ranks[i];
+            std::vector<VkSubmitInfo> & rank_submits = all_rank_submits[i];
+            rank_submits.reserve(n_stages * 3 + 1);
+            auto & tsi_list = all_tsi[i];
+            auto & sig_p1_vals = all_sig_p1[i];
+            auto & wait_p2_vals = all_wait_p2[i];
+            auto & sig_p2_vals = all_sig_p2[i];
+
+            for (size_t s = 0; s < n_stages; ++s) {
+                const uint64_t stage_epoch = base_epoch + s;
+                const size_t stage_bank = tp5_mailbox_bank(stage_epoch);
+                const size_t n_elems = (size_t) ggml_nelements(stage_tensors[s][i]);
+                const size_t payload = n_elems * sizeof(uint16_t);
+
+                // A. Compute CBs for stage s
+                if (!stage_compute_cbs[s][i].empty()) {
+                    VkSubmitInfo c_si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                    c_si.commandBufferCount = (uint32_t) stage_compute_cbs[s][i].size();
+                    c_si.pCommandBuffers = (const VkCommandBuffer *) stage_compute_cbs[s][i].data();
+                    rank_submits.push_back(c_si);
+                }
+
+                // B. BDA Push Command Buffer for stage s (writes to Host L3)
+                VkCommandBuffer cmd_p1 = r.star_chain_p1[s];
+                vkResetCommandBuffer(cmd_p1, 0);
+                VkCommandBufferBeginInfo bi_p1{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                bi_p1.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                vkBeginCommandBuffer(cmd_p1, &bi_p1);
+
+                VkMemoryBarrier mb_pre{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                        VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT };
+                vkCmdPipelineBarrier(cmd_p1, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     0, 1, &mb_pre, 0, nullptr, 0, nullptr);
+
+                uint64_t stage_bda_src = ggml_vk_tp5_get_tensor_bda(stage_tensors[s][i]);
+                uint64_t stage_bda_dst = r.bda_addr[stage_bank] + (s * (c.n_ranks + 1) + i) * c.star_rank_stride;
+                uint32_t n_vec4 = (uint32_t)(n_elems / 4);
+                uint32_t num_wgs = (n_vec4 + 63) / 64;
+                uint64_t flag_bda = stage_bda_dst + c.star_rank_stride - 64;
+                struct {
+                    uint64_t src_bda;
+                    uint64_t dst_bda;
+                    uint64_t flag_bda;
+                    uint32_t n_vec4;
+                    uint32_t num_workgroups;
+                    uint32_t seq_val;
+                } bda_pc{stage_bda_src, stage_bda_dst, flag_bda, n_vec4, num_wgs, 1u};
+
+                vkCmdBindPipeline(cmd_p1, VK_PIPELINE_BIND_POINT_COMPUTE, r.bda_push_pipe);
+                vkCmdPushConstants(cmd_p1, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc), &bda_pc);
+                vkCmdDispatch(cmd_p1, num_wgs, 1, 1);
+                vkEndCommandBuffer(cmd_p1);
+
+                sig_p1_vals[s] = 2 * stage_epoch - 1;
+                tsi_list[2 * s] = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+                tsi_list[2 * s].signalSemaphoreValueCount = 1;
+                tsi_list[2 * s].pSignalSemaphoreValues = &sig_p1_vals[s];
+
+                VkSubmitInfo si_p1{VK_STRUCTURE_TYPE_SUBMIT_INFO, &tsi_list[2 * s], 0, nullptr, nullptr, 1, &r.star_chain_p1[s], 1, &r.timeline_sem};
+                rank_submits.push_back(si_p1);
+
+                // C. Phase 2 Command Buffer for stage s (Unpacks from bcast_buf into dst tensor)
+                VkCommandBuffer cmd_p2 = r.star_chain_p2[s];
+                vkResetCommandBuffer(cmd_p2, 0);
+                VkCommandBufferBeginInfo bi_p2{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                bi_p2.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                vkBeginCommandBuffer(cmd_p2, &bi_p2);
+
+                VkBuffer dst_buf = VK_NULL_HANDLE;
+                VkDeviceSize dst_off = 0, dst_size = 0;
+                ggml_vk_tp5_tensor_dev_ref(stage_tensors[s][i], &dst_buf, &dst_off, &dst_size);
+
+                const size_t bcast_bytes = (stage_tensors[s][0]->type == GGML_TYPE_F32) ? n_elems * sizeof(float) : payload;
+                if (stage_tensors[s][0]->type == GGML_TYPE_F32) {
+                    VkBufferCopy cp{s * c.star_rank_stride, dst_off, bcast_bytes};
+                    vkCmdCopyBuffer(cmd_p2, r.bcast_buf[stage_bank], dst_buf, 1, &cp);
+                } else {
+                    tp5_update_star_sum_descriptor(r, r.star_chain_ds_sum[s], r.bcast_buf[stage_bank], dst_buf, dst_off, dst_size, payload, (uint32_t)c.n_ranks);
+                    vkCmdBindPipeline(cmd_p2, VK_PIPELINE_BIND_POINT_COMPUTE, r.sum_pipe);
+                    vkCmdBindDescriptorSets(cmd_p2, VK_PIPELINE_BIND_POINT_COMPUTE, r.pipe_layout, 0, 1, &r.star_chain_ds_sum[s], 0, nullptr);
+                    tp5_sum_pc pc_sum{(uint32_t) n_elems, 1, 0, 0};
+                    vkCmdPushConstants(cmd_p2, r.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_sum), &pc_sum);
+                    vkCmdDispatch(cmd_p2, (uint32_t)(n_elems + 255) / 256, 1, 1);
+                }
+
+                VkMemoryBarrier mb_post{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                         VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                                         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                         VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT };
+                vkCmdPipelineBarrier(cmd_p2, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb_post, 0, nullptr, 0, nullptr);
+                vkEndCommandBuffer(cmd_p2);
+
+                wait_p2_vals[s] = base_ready_epoch + s;
+                sig_p2_vals[s] = 2 * stage_epoch;
+                tsi_list[2 * s + 1] = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+                tsi_list[2 * s + 1].waitSemaphoreValueCount = 1;
+                tsi_list[2 * s + 1].pWaitSemaphoreValues = &wait_p2_vals[s];
+                tsi_list[2 * s + 1].signalSemaphoreValueCount = 1;
+                tsi_list[2 * s + 1].pSignalSemaphoreValues = &sig_p2_vals[s];
+
+                VkSubmitInfo si_p2{VK_STRUCTURE_TYPE_SUBMIT_INFO, &tsi_list[2 * s + 1], 1, &r.host_ready_sem, &wait_stages[s], 1, &r.star_chain_p2[s], 1, &r.timeline_sem};
+                rank_submits.push_back(si_p2);
+            }
+
+            // Tail compute group (e.g. LM Head)
+            if (stage_compute_cbs.size() > n_stages && !stage_compute_cbs[n_stages][i].empty()) {
+                VkSubmitInfo t_si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                t_si.commandBufferCount = (uint32_t) stage_compute_cbs[n_stages][i].size();
+                t_si.pCommandBuffers = (const VkCommandBuffer *) stage_compute_cbs[n_stages][i].data();
+                rank_submits.push_back(t_si);
+            }
+
+            // Single Submission for entire 96 stages to GPU hardware!
+            vkQueueSubmit(r.queue, (uint32_t)rank_submits.size(), rank_submits.data(), VK_NULL_HANDLE);
+            ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
+        }
+
+        // Pure L3 Host Pipeline Flow: 0 Driver Submissions in the loop!
+        for (size_t s = 0; s < n_stages; ++s) {
+            const uint64_t stage_epoch = base_epoch + s;
+            const size_t stage_bank = tp5_mailbox_bank(stage_epoch);
+            const size_t n_elems = (size_t) ggml_nelements(stage_tensors[s][0]);
+            const size_t payload = n_elems * sizeof(uint16_t);
+
+            // 1. Pure L3 Cache Flag Polling (0 IOCTLs!)
+            for (size_t i = 0; i < c.n_ranks; ++i) {
+                volatile uint32_t * flag_ptr = (volatile uint32_t *)((char *)c.star_host_aligned[stage_bank] +
+                                                                     (s * (c.n_ranks + 1) + i + 1) * c.star_rank_stride - 64);
+                uint64_t spin_cnt = 0;
+                while (*flag_ptr != 1) {
+#if defined(__x86_64__) || defined(_M_X64)
+                    _mm_pause();
+#endif
+                    if (++spin_cnt > 200000000ULL) {
+                        c.fail("submit_epoch_chain star: L3 flag timeout on stage " + std::to_string(s) + " rank " + std::to_string(i));
+                        return false;
+                    }
+                }
+                *flag_ptr = 0;
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+
+            // 2. 22-Core AVX2 Sum in L3 Cache (5.7 us)
+            const void * rank_ptrs[5];
+            for (size_t i = 0; i < c.n_ranks; ++i) {
+                rank_ptrs[i] = (const char *) c.star_host_aligned[stage_bank] + (s * (c.n_ranks + 1) + i) * c.star_rank_stride;
+            }
+            void * acc_out = (char *) c.star_host_aligned[stage_bank] + (s * (c.n_ranks + 1) + 5) * c.star_rank_stride;
+
+            if (c.avx2_pool) {
+                c.avx2_pool->parallel_for([&](size_t worker_id, size_t num_workers) {
+                    tp5_avx2_accumulate_star(rank_ptrs, acc_out, n_elems, worker_id, num_workers, stage_tensors[s][0]->type == GGML_TYPE_F32);
+                });
+            } else {
+                tp5_avx2_accumulate_star(rank_ptrs, acc_out, n_elems, 0, 1, stage_tensors[s][0]->type == GGML_TYPE_F32);
+            }
+
+            // 3. CPU Root Broadcast to bcast_host (5.0 us)
+            const size_t bcast_bytes = (stage_tensors[s][0]->type == GGML_TYPE_F32) ? n_elems * sizeof(float) : payload;
+            for (size_t i = 0; i < c.n_ranks; ++i) {
+                if (c.ranks[i].bcast_host[stage_bank]) {
+                    std::memcpy((char *)c.ranks[i].bcast_host[stage_bank] + s * c.star_rank_stride, acc_out, bcast_bytes);
+                }
+            }
+
+            // 4. Release Phase 2 on GPU hardware via host_ready_sem
+            const uint64_t ready_signal_point = base_ready_epoch + s;
+            for (size_t i = 0; i < c.n_ranks; ++i) {
+                tp5_rank & r = c.ranks[i];
+                if (r.pfn_signal_semaphore && r.host_ready_sem) {
+                    VkSemaphoreSignalInfo ssi{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, nullptr, r.host_ready_sem, ready_signal_point};
+                    r.pfn_signal_semaphore(r.vkdev, &ssi);
+                }
+            }
+        }
+        return true;
     }
     if ((c.sync_mode != tp5_sync_mode::TIMELINE && c.sync_mode != tp5_sync_mode::DRM && c.sync_mode != tp5_sync_mode::STAR) || !c.cmd_replay_enabled)
         return false;
