@@ -396,3 +396,87 @@ private:
     std::atomic<bool> * m_done_flag[NUM_SIGNALERS];
     std::atomic<bool> m_stop{false};
 };
+
+// 5-Worker Parallel Vulkan Submit Pool: one persistent thread per rank.
+// vkQueueSubmit is externally synchronized per queue but distinct ranks own
+// distinct VkQueue handles, so rank submissions are fully parallel-safe.
+// Serial submit over 5 ranks costs ~130 us (26 us each); parallel dispatch
+// collapses that to the per-call max (~30 us). Same lockless epoch pattern
+// as tp5_avx2_pool: caller supplies a fn(i) executed by worker i for i < n.
+class tp5_submit_pool {
+public:
+    static constexpr size_t NUM_WORKERS = 8;
+
+    using task_fn = std::function<void(size_t rank_idx)>;
+
+    tp5_submit_pool() {
+        m_stop.store(false, std::memory_order_relaxed);
+        m_task_epoch.store(0, std::memory_order_relaxed);
+        m_completed_count.store(0, std::memory_order_relaxed);
+        m_task_count.store(0, std::memory_order_relaxed);
+
+        m_workers.reserve(NUM_WORKERS);
+        for (size_t i = 0; i < NUM_WORKERS; ++i) {
+            m_workers.emplace_back([this, i]() {
+                worker_loop(i);
+            });
+        }
+    }
+
+    ~tp5_submit_pool() {
+        m_stop.store(true, std::memory_order_release);
+        m_task_epoch.fetch_add(1, std::memory_order_release);
+        for (auto & t : m_workers) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+    }
+
+    tp5_submit_pool(const tp5_submit_pool &) = delete;
+    tp5_submit_pool & operator=(const tp5_submit_pool &) = delete;
+
+    // Dispatches fn(i) on worker i for i in [0, n). Returns when all n are done.
+    // The caller's captures (VkSubmitInfo arrays etc.) must stay alive until return.
+    void parallel_for(task_fn fn, size_t n) {
+        if (!fn || n == 0) return;
+        m_current_task = fn;
+        m_completed_count.store(0, std::memory_order_relaxed);
+        m_task_count.store(n, std::memory_order_relaxed);
+        m_task_epoch.fetch_add(1, std::memory_order_release);
+        while (m_completed_count.load(std::memory_order_acquire) < n) {
+#if defined(__x86_64__) || defined(_M_X64)
+            _mm_pause();
+#endif
+        }
+    }
+
+private:
+    void worker_loop(size_t id) {
+        uint64_t last_epoch = 0;
+        while (!m_stop.load(std::memory_order_relaxed)) {
+            uint64_t cur_epoch = m_task_epoch.load(std::memory_order_acquire);
+            if (cur_epoch > last_epoch) {
+                last_epoch = cur_epoch;
+                if (m_stop.load(std::memory_order_relaxed)) break;
+                size_t n = m_task_count.load(std::memory_order_relaxed);
+                if (m_current_task && id < n) {
+                    m_current_task(id);
+                }
+                m_completed_count.fetch_add(1, std::memory_order_release);
+            } else {
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#endif
+            }
+        }
+    }
+
+    std::vector<std::thread> m_workers;
+    std::atomic<bool> m_stop{false};
+    std::atomic<uint64_t> m_task_epoch{0};
+    std::atomic<size_t> m_completed_count{0};
+    std::atomic<size_t> m_task_count{0};
+    task_fn m_current_task;
+};
+

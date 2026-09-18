@@ -557,6 +557,7 @@ struct tp5_comm {
     size_t star_rank_stride = 0;
     std::unique_ptr<tp5_avx2_pool> avx2_pool;
     std::unique_ptr<tp5_drm_signaler> drm_signaler;
+    std::unique_ptr<tp5_submit_pool> submit_pool;
     std::unique_ptr<tp5_drm_waiter> drm_waiter;
 
     // Bounded immutable per-binding plan cache
@@ -877,6 +878,7 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
             uint32_t n_uvec4;
             uint32_t rank_idx;
             uint32_t seq_val;
+            uint32_t mode;
         } bda_pc_dummy;
         VkPushConstantRange bda_pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc_dummy)};
         VkPipelineLayoutCreateInfo bda_pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -2405,7 +2407,22 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
     const size_t payload = n_elems * sizeof(uint16_t);
     const uint32_t n_uvec4 = (uint32_t) ((payload + 15) / 16);
 
-    // 1. Dispatch BDA Upstream Push on all GPUs
+    // 1. Record STAR BDA Push + Phase 2 command buffers on all GPUs
+    struct star_rank_submit_t {
+        tp5_rank * rk;
+        VkSubmitInfo si_p1;
+        VkSubmitInfo si_p2;
+        VkTimelineSemaphoreSubmitInfo tsi_p1;
+        VkTimelineSemaphoreSubmitInfo tsi_p2;
+        uint64_t sig_p1_val;
+        uint64_t sig_p2_val;
+        uint64_t wait_ready_val;
+        VkCommandBuffer cmd_p1_val;
+        VkCommandBuffer cmd_p2_val;
+        VkPipelineStageFlags wait_stage_val;
+    };
+    std::vector<star_rank_submit_t> star_submits(c.n_ranks);
+    
     for (size_t i = 0; i < c.n_ranks; ++i) {
         tp5_rank & r = c.ranks[i];
         VkCommandBuffer cmd_p1 = r.star_cmd_p1[bank];
@@ -2436,9 +2453,28 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
             uint32_t n_vec4;
             uint32_t rank_idx;
             uint32_t seq_val;
-        } bda_pc{stage_bda_src, dst_bda, flag_bda, n_vec4, (uint32_t)i, (uint32_t)epoch};
+            uint32_t mode;
+        } bda_pc{stage_bda_src, dst_bda, flag_bda, n_vec4, (uint32_t)i, (uint32_t)epoch, 0u};
         vkCmdPushConstants(cmd_p1, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc), &bda_pc);
         vkCmdDispatch(cmd_p1, (n_vec4 + 63) / 64, 1, 1);
+
+        // Drain GPU data writes to host RAM before writing the completion flag.
+        // Without this barrier the host may observe flag=seq before the payload
+        // is fully visible (host-coherent memory exempts the flush but not the
+        // ordering: the flag dispatch below must not execute before this barrier).
+        VkMemoryBarrier mb_data_done{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                      VK_ACCESS_SHADER_WRITE_BIT,
+                                      VK_ACCESS_SHADER_WRITE_BIT };
+        vkCmdPipelineBarrier(cmd_p1, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             0, 1, &mb_data_done, 0, nullptr, 0, nullptr);
+
+        // Dispatch 2: single-workgroup flag write (mode=1). Ordered after
+        // dispatch 1 by the barrier above; the host cannot observe flag=seq
+        // before every data workgroup finished its payload write.
+        bda_pc.mode = 1;
+        vkCmdPushConstants(cmd_p1, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc), &bda_pc);
+        vkCmdDispatch(cmd_p1, 1, 1, 1);
 
         // Flush GPU L2 cache to Host PCIe Bus
         VkMemoryBarrier mb_host{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
@@ -2518,15 +2554,57 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
         si_p2.signalSemaphoreCount = 1;
         si_p2.pSignalSemaphores = &r.timeline_sem;
 
-        VkSubmitInfo submits[2] = {si_p1, si_p2};
-        if (vkQueueSubmit(r.queue, 2, submits, VK_NULL_HANDLE) != VK_SUCCESS) {
-            c.fail("tp5_allreduce_star: merged submit failed on rank " + std::to_string(i));
-            return false;
-        }
-        ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
+        star_submits[i].rk = &r;
+        star_submits[i].sig_p1_val = sig_p1;
+        star_submits[i].sig_p2_val = sig_p2;
+        star_submits[i].wait_ready_val = wait_ready;
+        star_submits[i].cmd_p1_val = cmd_p1;
+        star_submits[i].cmd_p2_val = cmd_p2;
+        star_submits[i].wait_stage_val = wait_dst_stage;
+        // Copy TSI structs so their lifetimes extend past the recording loop
+        star_submits[i].tsi_p1 = tsi_p1;
+        star_submits[i].tsi_p2 = tsi_p2;
+        // Patch si_p1/si_p2 pointers to the stable copies
+        star_submits[i].si_p1 = si_p1;
+        star_submits[i].si_p1.pNext = &star_submits[i].tsi_p1;
+        star_submits[i].si_p1.pCommandBuffers = &star_submits[i].cmd_p1_val;
+        star_submits[i].tsi_p1.pWaitSemaphoreValues = nullptr; // P1 has no waits
+        star_submits[i].tsi_p1.pSignalSemaphoreValues = &star_submits[i].sig_p1_val;
+        star_submits[i].si_p2 = si_p2;
+        star_submits[i].si_p2.pNext = &star_submits[i].tsi_p2;
+        star_submits[i].si_p2.pCommandBuffers = &star_submits[i].cmd_p2_val;
+        star_submits[i].si_p2.pWaitDstStageMask = &star_submits[i].wait_stage_val;
+        star_submits[i].tsi_p2.pWaitSemaphoreValues = &star_submits[i].wait_ready_val;
+        star_submits[i].tsi_p2.pSignalSemaphoreValues = &star_submits[i].sig_p2_val;
     }
 
-    auto t_after_p1 = std::chrono::high_resolution_clock::now();
+    // 2. Parallel vkQueueSubmit on all 5 GPUs via persistent thread pool
+    if (c.submit_pool) {
+        std::atomic<int> submit_fail{0};
+        c.submit_pool->parallel_for([&](size_t i) {
+            tp5_rank & r = *star_submits[i].rk;
+            VkSubmitInfo submits[2] = { star_submits[i].si_p1, star_submits[i].si_p2 };
+            if (vkQueueSubmit(r.queue, 2, submits, VK_NULL_HANDLE) != VK_SUCCESS) {
+                submit_fail.store(1, std::memory_order_relaxed);
+            }
+            ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
+        }, c.n_ranks);
+        if (submit_fail.load(std::memory_order_relaxed)) {
+            c.fail("tp5_allreduce_star: parallel merged submit failed");
+            return false;
+        }
+    } else {
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            tp5_rank & r = *star_submits[i].rk;
+            VkSubmitInfo submits[2] = { star_submits[i].si_p1, star_submits[i].si_p2 };
+            if (vkQueueSubmit(r.queue, 2, submits, VK_NULL_HANDLE) != VK_SUCCESS) {
+                c.fail("tp5_allreduce_star: merged submit failed on rank " + std::to_string(i));
+                return false;
+            }
+            ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
+        }
+    }
+auto t_after_p1 = std::chrono::high_resolution_clock::now();
 
     // =========================================================================
     // PILLAR 3: TRUE CPU L3 CACHE HARDWARE MEMORY FLAG POLLING (< 5us, 0 Syscalls)
@@ -2541,12 +2619,18 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
 #endif
             if (++spin_cnt > 200000000ULL) {
                 fprintf(stderr, "SPIN_TIMEOUT step: rank %zu ptr=%p val=%u exp=%u\n", i, (void*)flag_ptr, *flag_ptr, exp_seq);
-                break;
+                c.fail("allreduce_star: GPU flag timeout on rank " + std::to_string(i));
+                return false;
             }
         }
     }
 
     auto t_after_wait = std::chrono::high_resolution_clock::now();
+
+    // Memory fence: ensure GPU payload writes are fully observable by CPU
+    // before the AVX2 accumulate reads them.  On x86 TSO this is zero-cost;
+    // only a compiler barrier, which is correct after the flag-volatile exit.
+    std::atomic_thread_fence(std::memory_order_acquire);
 
     // =========================================================================
     // PILLAR 4: 22-CORE DEDICATED AVX2+F16C L3 CACHE DIRECT ACCUMULATION
@@ -4038,6 +4122,7 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
         c->avx2_pool = std::make_unique<tp5_avx2_pool>();
         c->drm_signaler = std::make_unique<tp5_drm_signaler>();
         c->drm_waiter   = std::make_unique<tp5_drm_waiter>();
+        c->submit_pool  = std::make_unique<tp5_submit_pool>();
         for (size_t i = 0; i < n; ++i) {
             c->drm_waiter->set_node(i, c->ranks[i].dri_fd, c->ranks[i].own_syncobj);
         }
