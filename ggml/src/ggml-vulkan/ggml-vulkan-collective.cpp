@@ -2632,27 +2632,27 @@ auto t_rec_start = std::chrono::high_resolution_clock::now();
     call_cnt++;
 
     if (call_cnt % 96 == 0) {
-        fprintf(stderr, "\n[REAL-PILLAR-PROFILER (avg over %llu calls)]\n"
-                        " -1. Flush Async (Compute): %6.2f us (96 steps: %5.2f ms)\n"
-                        "  0. CPU CB Recording:      %6.2f us (96 steps: %5.2f ms)\n"
-                        "  1. Parallel Queue Submit: %6.2f us (96 steps: %5.2f ms)\n"
-                        "  2. DRM Timeline Wait:     %6.2f us (96 steps: %5.2f ms)\n"
-                        "  3. 22-Core AVX2 Sum:      %6.2f us (96 steps: %5.2f ms)\n"
-                        "  4. CPU Root Bcast:        %6.2f us (96 steps: %5.2f ms)\n"
-                        "  5. P2 vkQueueSubmit:      %6.2f us (96 steps: %5.2f ms)\n"
-                        "  TOTAL ALLREDUCE PER STEP: %6.2f us (96 steps: %5.2f ms)\n\n",
-                (unsigned long long)call_cnt,
-                acc_flush_us / call_cnt, (acc_flush_us / call_cnt * 96) / 1000.0,
-                acc_rec_us / call_cnt, (acc_rec_us / call_cnt * 96) / 1000.0,
-                (acc_pure_sub_us) / call_cnt, ((acc_pure_sub_us) / call_cnt * 96) / 1000.0,
-                acc_wait_us / call_cnt,   (acc_wait_us / call_cnt * 96) / 1000.0,
-                acc_avx2_us / call_cnt,   (acc_avx2_us / call_cnt * 96) / 1000.0,
-                acc_bcast_us / call_cnt,  (acc_bcast_us / call_cnt * 96) / 1000.0,
-                acc_p2_sub_us / call_cnt, (acc_p2_sub_us / call_cnt * 96) / 1000.0,
-                (acc_p1_sub_us + acc_wait_us + acc_avx2_us + acc_bcast_us + acc_p2_sub_us) / call_cnt,
-                ((acc_p1_sub_us + acc_wait_us + acc_avx2_us + acc_bcast_us + acc_p2_sub_us) / call_cnt * 96) / 1000.0);
+        const double pure_comm_us = (acc_avx2_us + acc_bcast_us) / call_cnt;
+        fprintf(stderr, "\n[tp5-step-profile (avg over %llu calls, elems=%zu)]\n"
+                        "  [1. Pure Physical Comm]:     %7.2f us (AVX2: %.2f us + Bcast: %.2f us) <-- [9us Target]\n"
+                        "  [2. P2 Doorbell Handshake]:   %7.2f us (Timeline Semaphore Signal)\n"
+                        "  [3. CPU Command Recording]:   %7.2f us (Pre-recording Setup)\n"
+                        "  [4. Vulkan Queue Submit]:    %7.2f us (RADV CS IOCTL / Kernel Submission)\n"
+                        "  [5. Preceding Compute/Queue]:%7.2f us (GPU Model Layer Forward Compute & Queue Wait)\n"
+                        "  --------------------------------------------------------------------------------\n"
+                        "  * Pure Physical Step (1+2):  %7.2f us\n"
+                        "  * Host Step Total (1+2+3+4): %7.2f us\n"
+                        "  * Step Time with GPU Wait:   %7.2f us\n\n",
+                (unsigned long long)call_cnt, n_elems,
+                pure_comm_us, acc_avx2_us / call_cnt, acc_bcast_us / call_cnt,
+                acc_p2_sub_us / call_cnt,
+                acc_rec_us / call_cnt,
+                acc_pure_sub_us / call_cnt,
+                acc_wait_us / call_cnt,
+                pure_comm_us + acc_p2_sub_us / call_cnt,
+                pure_comm_us + acc_p2_sub_us / call_cnt + acc_rec_us / call_cnt + acc_pure_sub_us / call_cnt,
+                (acc_p1_sub_us + acc_wait_us + acc_avx2_us + acc_bcast_us + acc_p2_sub_us) / call_cnt);
     }
-
     return true;
 }
 
