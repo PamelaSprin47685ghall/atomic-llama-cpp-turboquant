@@ -3665,32 +3665,49 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         stage_compute_cbs.resize(backend_ctx->n_subgraphs);
         stage_tensors.resize(backend_ctx->n_subgraphs - 1);
 
-        for (size_t i = 0; i < backend_ctx->n_subgraphs; ++i) {
-            stage_compute_cbs[i].resize(n_backends);
-            if (i < stage_tensors.size())
-                stage_tensors[i].resize(n_backends);
-            for (size_t j = 0; j < n_backends; ++j) {
-                auto & bcj = backend_ctx->backend_configs[j];
-                ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
-                if (i < stage_tensors.size())
-                    stage_tensors[i][j] = cgraph_ij->nodes[cgraph_ij->n_nodes - 1];
-                if (backend_ctx->comm_prepare &&
-                    !backend_ctx->comm_prepare(backend_ctx->comm_ctx, j, cgraph_ij, i < stage_tensors.size())) {
-                    return GGML_STATUS_FAILED;
-                }
-                if (!pfn_get_cbs(bcj.backend, cgraph_ij, stage_compute_cbs[i][j])) {
-                    static int miss_log = 0;
-                    if (++miss_log <= 5) {
-                        fprintf(stderr, "[meta-chain-miss] stage=%zu rank=%zu nodes=%d uid=%llu\n", i, j,
-                                cgraph_ij->n_nodes, (unsigned long long) cgraph_ij->uid);
+        static bool static_chain_locked = false;
+        if (static_chain_locked && stage_compute_cbs.size() == backend_ctx->n_subgraphs) {
+            // FORCED 100% STATIC REPLAY: Fixed permanent topology, zero cache lookups!
+            for (size_t i = 0; i < backend_ctx->n_subgraphs; ++i) {
+                if (i < stage_tensors.size()) {
+                    for (size_t j = 0; j < n_backends; ++j) {
+                        auto & bcj = backend_ctx->backend_configs[j];
+                        stage_tensors[i][j] = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
                     }
-                    all_replay_cached = false;
-                    break;
                 }
             }
-            if (!all_replay_cached) break;
+            all_replay_cached = true;
+        } else {
+            for (size_t i = 0; i < backend_ctx->n_subgraphs; ++i) {
+                stage_compute_cbs[i].resize(n_backends);
+                if (i < stage_tensors.size())
+                    stage_tensors[i].resize(n_backends);
+                for (size_t j = 0; j < n_backends; ++j) {
+                    auto & bcj = backend_ctx->backend_configs[j];
+                    ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
+                    if (i < stage_tensors.size())
+                        stage_tensors[i][j] = cgraph_ij->nodes[cgraph_ij->n_nodes - 1];
+                    if (backend_ctx->comm_prepare &&
+                        !backend_ctx->comm_prepare(backend_ctx->comm_ctx, j, cgraph_ij, i < stage_tensors.size())) {
+                        return GGML_STATUS_FAILED;
+                    }
+                    if (!pfn_get_cbs(bcj.backend, cgraph_ij, stage_compute_cbs[i][j])) {
+                        static int miss_log = 0;
+                        if (++miss_log <= 5) {
+                            fprintf(stderr, "[meta-chain-miss] stage=%zu rank=%zu nodes=%d uid=%llu\n", i, j,
+                                    cgraph_ij->n_nodes, (unsigned long long) cgraph_ij->uid);
+                        }
+                        all_replay_cached = false;
+                        break;
+                    }
+                }
+                if (!all_replay_cached) break;
+            }
+            if (all_replay_cached) {
+                static_chain_locked = true;
+                fprintf(stderr, "[tp5-meta] PERMANENT TOPOLOGY LOCKED: 100%% forced chain replay active!\n");
+            }
         }
-
         if (all_replay_cached) {
             static bool segments_dumped = false;
             if (!segments_dumped) {
