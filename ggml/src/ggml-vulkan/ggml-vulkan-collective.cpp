@@ -1558,8 +1558,6 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
                 r.wire_bda = vkGetBufferDeviceAddressKHR(r.vkdev, &dai);
             }
         }
-        c.max_elems = max_elems;
-        return true;
     }
 
     const VkDeviceSize wire_bytes = (VkDeviceSize) max_elems * wire_b;
@@ -2419,17 +2417,20 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
     const size_t payload = n_elems * sizeof(uint16_t);
     const uint32_t n_uvec4 = (uint32_t) ((payload + 15) / 16);
 
-    // 1. Record STAR BDA Push + Phase 2 command buffers on all GPUs
+auto t_rec_start = std::chrono::high_resolution_clock::now();
     struct star_rank_submit_t {
         tp5_rank * rk;
-        VkSubmitInfo si;
-        VkTimelineSemaphoreSubmitInfo tsi;
-        uint64_t sig_p2_val;
-        VkCommandBuffer cbs[2];
+        VkSubmitInfo submits[2];
+        VkTimelineSemaphoreSubmitInfo tsi[2];
+        uint64_t sig_p1;
+        uint64_t wait_ready;
+        uint64_t sig_p2;
+        VkPipelineStageFlags wait_stage;
+        VkCommandBuffer cmd_p1;
+        VkCommandBuffer cmd_p2;
     };
     std::vector<star_rank_submit_t> star_submits(c.n_ranks);
-    
-    auto t_rec_start = std::chrono::high_resolution_clock::now();
+
     for (size_t i = 0; i < c.n_ranks; ++i) {
         tp5_rank & r = c.ranks[i];
         VkCommandBuffer cmd_p1 = r.star_cmd_p1[bank];
@@ -2445,13 +2446,11 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 1, &mb_pre, 0, nullptr, 0, nullptr);
 
-        // Direct BDA read from source tensor -> on-the-fly F32 to F16 conversion -> direct write to Host RAM
         uint64_t stage_bda_src = ggml_vk_tp5_get_tensor_bda(tensors[i]);
         uint64_t dst_bda = r.bda_addr[bank] + i * c.star_rank_stride;
         vkCmdBindPipeline(cmd_p1, VK_PIPELINE_BIND_POINT_COMPUTE, r.bda_push_pipe);
 
         uint32_t n_vec4 = (uint32_t)(n_elems / 4);
-        // Safe in-bounds flag location within rank's own allocated stride
         uint64_t flag_bda = dst_bda + c.star_rank_stride - 64;
         struct {
             uint64_t src_bda;
@@ -2465,10 +2464,6 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
         vkCmdPushConstants(cmd_p1, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc), &bda_pc);
         vkCmdDispatch(cmd_p1, (n_vec4 + 63) / 64, 1, 1);
 
-        // Drain GPU data writes to host RAM before writing the completion flag.
-        // Without this barrier the host may observe flag=seq before the payload
-        // is fully visible (host-coherent memory exempts the flush but not the
-        // ordering: the flag dispatch below must not execute before this barrier).
         VkMemoryBarrier mb_data_done{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                                       VK_ACCESS_SHADER_WRITE_BIT,
                                       VK_ACCESS_SHADER_WRITE_BIT };
@@ -2476,14 +2471,10 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 1, &mb_data_done, 0, nullptr, 0, nullptr);
 
-        // Dispatch 2: single-workgroup flag write (mode=1). Ordered after
-        // dispatch 1 by the barrier above; the host cannot observe flag=seq
-        // before every data workgroup finished its payload write.
         bda_pc.mode = 1;
         vkCmdPushConstants(cmd_p1, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc), &bda_pc);
         vkCmdDispatch(cmd_p1, 1, 1, 1);
 
-        // Flush GPU L2 cache to Host PCIe Bus
         VkMemoryBarrier mb_host{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                                  VK_ACCESS_SHADER_WRITE_BIT,
                                  VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT };
@@ -2493,21 +2484,11 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
 
         vkEndCommandBuffer(cmd_p1);
 
-        // CPU resets doorbell event before recording & submitting Phase 2
-        vkResetEvent(r.vkdev, r.host_ready_event[bank]);
-
-        // Pre-record Phase 2 Command Buffer
         VkCommandBuffer cmd_p2 = r.star_cmd_p2[bank];
         vkResetCommandBuffer(cmd_p2, 0);
         VkCommandBufferBeginInfo bi_p2{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         bi_p2.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(cmd_p2, &bi_p2);
-
-        // Hardware Doorbell: GPU CP pauses here until CPU rings the doorbell (vkSetEvent, 6 ns)
-        vkCmdWaitEvents(cmd_p2, 1, &r.host_ready_event[bank],
-                        VK_PIPELINE_STAGE_HOST_BIT,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                        0, nullptr, 0, nullptr, 0, nullptr);
 
         VkBuffer dst_buf = VK_NULL_HANDLE;
         VkDeviceSize dst_off = 0, dst_size = 0;
@@ -2516,7 +2497,6 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
         VkDescriptorSet ds_sum = r.star_ds_sum[bank];
         const size_t bcast_bytes = (tensors[0]->type == GGML_TYPE_F32) ? n_elems * sizeof(float) : payload;
 
-        // Unpack / Copy from bcast_buf into dst tensor
         if (tensors[0]->type == GGML_TYPE_F32) {
             VkBufferCopy cp{0, dst_off, bcast_bytes};
             vkCmdCopyBuffer(cmd_p2, r.bcast_buf[bank], dst_buf, 1, &cp);
@@ -2537,53 +2517,54 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb_post, 0, nullptr, 0, nullptr);
         vkEndCommandBuffer(cmd_p2);
 
-        // Single Fused Submit per GPU: [cmd_p1 (BDA Push) -> cmd_p2 (Doorbell Wait + Unpack)]
-        // Signals timeline_sem at 2*epoch upon completion of Phase 2.
         star_submits[i].rk = &r;
-        star_submits[i].sig_p2_val = 2 * epoch;
-        star_submits[i].cbs[0] = cmd_p1;
-        star_submits[i].cbs[1] = cmd_p2;
+        star_submits[i].sig_p1 = 2 * epoch - 1;
+        star_submits[i].wait_ready = epoch;
+        star_submits[i].sig_p2 = 2 * epoch;
+        star_submits[i].wait_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+        star_submits[i].cmd_p1 = cmd_p1;
+        star_submits[i].cmd_p2 = cmd_p2;
 
-        star_submits[i].tsi = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-        star_submits[i].tsi.signalSemaphoreValueCount = 1;
-        star_submits[i].tsi.pSignalSemaphoreValues = &star_submits[i].sig_p2_val;
+        star_submits[i].tsi[0] = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        star_submits[i].tsi[0].signalSemaphoreValueCount = 1;
+        star_submits[i].tsi[0].pSignalSemaphoreValues = &star_submits[i].sig_p1;
 
-        star_submits[i].si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        star_submits[i].si.pNext = &star_submits[i].tsi;
-        star_submits[i].si.commandBufferCount = 2;
-        star_submits[i].si.pCommandBuffers = star_submits[i].cbs;
-        star_submits[i].si.signalSemaphoreCount = 1;
-        star_submits[i].si.pSignalSemaphores = &r.timeline_sem;
+        star_submits[i].submits[0] = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        star_submits[i].submits[0].pNext = &star_submits[i].tsi[0];
+        star_submits[i].submits[0].commandBufferCount = 1;
+        star_submits[i].submits[0].pCommandBuffers = &star_submits[i].cmd_p1;
+        star_submits[i].submits[0].signalSemaphoreCount = 1;
+        star_submits[i].submits[0].pSignalSemaphores = &r.timeline_sem;
+
+        star_submits[i].tsi[1] = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        star_submits[i].tsi[1].waitSemaphoreValueCount = 1;
+        star_submits[i].tsi[1].pWaitSemaphoreValues = &star_submits[i].wait_ready;
+        star_submits[i].tsi[1].signalSemaphoreValueCount = 1;
+        star_submits[i].tsi[1].pSignalSemaphoreValues = &star_submits[i].sig_p2;
+
+        star_submits[i].submits[1] = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        star_submits[i].submits[1].pNext = &star_submits[i].tsi[1];
+        star_submits[i].submits[1].waitSemaphoreCount = 1;
+        star_submits[i].submits[1].pWaitSemaphores = &r.host_ready_sem;
+        star_submits[i].submits[1].pWaitDstStageMask = &star_submits[i].wait_stage;
+        star_submits[i].submits[1].commandBufferCount = 1;
+        star_submits[i].submits[1].pCommandBuffers = &star_submits[i].cmd_p2;
+        star_submits[i].submits[1].signalSemaphoreCount = 1;
+        star_submits[i].submits[1].pSignalSemaphores = &r.timeline_sem;
     }
-
-    // 2. Parallel vkQueueSubmit on all 5 GPUs via persistent thread pool
     auto t_rec_done = std::chrono::high_resolution_clock::now();
+
     auto t_sub_start = std::chrono::high_resolution_clock::now();
-    if (c.submit_pool) {
-        std::atomic<int> submit_fail{0};
-        c.submit_pool->parallel_for([&](size_t i) {
-            tp5_rank & r = *star_submits[i].rk;
-            if (vkQueueSubmit(r.queue, 1, &star_submits[i].si, VK_NULL_HANDLE) != VK_SUCCESS) {
-                submit_fail.store(1, std::memory_order_relaxed);
-            }
-            ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
-        }, c.n_ranks);
-        if (submit_fail.load(std::memory_order_relaxed)) {
-            c.fail("tp5_allreduce_star: parallel merged submit failed");
+    for (size_t i = 0; i < c.n_ranks; ++i) {
+        tp5_rank & r = *star_submits[i].rk;
+        if (vkQueueSubmit(r.queue, 2, star_submits[i].submits, VK_NULL_HANDLE) != VK_SUCCESS) {
+            c.fail("tp5_allreduce_star: merged submit failed on rank " + std::to_string(i));
             return false;
         }
-    } else {
-        for (size_t i = 0; i < c.n_ranks; ++i) {
-            tp5_rank & r = *star_submits[i].rk;
-            if (vkQueueSubmit(r.queue, 1, &star_submits[i].si, VK_NULL_HANDLE) != VK_SUCCESS) {
-                c.fail("tp5_allreduce_star: merged submit failed on rank " + std::to_string(i));
-                return false;
-            }
-            ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
-        }
+        ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
     }
-auto t_sub_done = std::chrono::high_resolution_clock::now();
-    auto t_after_p1 = std::chrono::high_resolution_clock::now();
+    auto t_sub_done = std::chrono::high_resolution_clock::now();
+    auto t_after_p1 = t_sub_done;
 
     // =========================================================================
     // PILLAR 3: TRUE CPU L3 CACHE HARDWARE MEMORY FLAG POLLING (< 5us, 0 Syscalls)
@@ -2615,10 +2596,6 @@ auto t_sub_done = std::chrono::high_resolution_clock::now();
     }
 
     auto t_after_wait = std::chrono::high_resolution_clock::now();
-
-    // Memory fence: ensure GPU payload writes are fully observable by CPU
-    // before the AVX2 accumulate reads them.  On x86 TSO this is zero-cost;
-    // only a compiler barrier, which is correct after the flag-volatile exit.
     std::atomic_thread_fence(std::memory_order_acquire);
 
     // =========================================================================
@@ -2630,24 +2607,12 @@ auto t_sub_done = std::chrono::high_resolution_clock::now();
     }
     void * acc_out = (char *) c.star_host_aligned[bank] + 5 * c.star_rank_stride;
 
-    if (c.allreduce_calls == 1) {
-        for (size_t i = 0; i < c.n_ranks; ++i) {
-            const uint16_t * rp = (const uint16_t *) rank_ptrs[i];
-            fprintf(stderr, "STEP 1 rank %zu: [0]=%f\n", i, ggml_fp16_to_fp32(rp[0]));
-        }
-    }
-
     if (c.avx2_pool) {
         c.avx2_pool->parallel_for([&](size_t worker_id, size_t num_workers) {
             tp5_avx2_accumulate_star(rank_ptrs, acc_out, n_elems, worker_id, num_workers, tensors[0]->type == GGML_TYPE_F32);
         });
     } else {
         tp5_avx2_accumulate_star(rank_ptrs, acc_out, n_elems, 0, 1, tensors[0]->type == GGML_TYPE_F32);
-    }
-
-    if (c.allreduce_calls == 1) {
-        const float * op = (const float *) acc_out;
-        fprintf(stderr, "STEP 1 acc_out: [0]=%f\n", op[0]);
     }
 
     auto t_after_avx2 = std::chrono::high_resolution_clock::now();
@@ -2661,15 +2626,18 @@ auto t_sub_done = std::chrono::high_resolution_clock::now();
             std::memcpy(c.ranks[i].bcast_host[bank], acc_out, bcast_bytes);
         }
     }
-
     auto t_after_bcast = std::chrono::high_resolution_clock::now();
 
     // =========================================================================
-    // PILLAR 6: ZERO-SYSCALL HARDWARE DOORBELL HANDOFF (vkSetEvent ~6 ns per GPU!)
-    // Completely bypasses slow DRM IOCTL / vkSignalSemaphore!
+    // PILLAR 6: ATOMIC ASYNC SIGNAL HANDOFF (Wakes up GPU Phase 2 via timeline sem)
+    // ZERO risk of GPU event hangs, completely thread-safe & monotonic!
     // =========================================================================
     for (size_t i = 0; i < c.n_ranks; ++i) {
-        vkSetEvent(c.ranks[i].vkdev, c.ranks[i].host_ready_event[bank]);
+        tp5_rank & r = c.ranks[i];
+        if (r.pfn_signal_semaphore && r.host_ready_sem) {
+            VkSemaphoreSignalInfo ssi{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, nullptr, r.host_ready_sem, epoch};
+            r.pfn_signal_semaphore(r.vkdev, &ssi);
+        }
     }
     auto t_after_p2 = std::chrono::high_resolution_clock::now();
 
@@ -3321,7 +3289,7 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
     if (c.failed) {
         GGML_ABORT("ggml-vulkan-collective: cannot submit on failed communicator\n");
     }
-    if ((c.sync_mode != tp5_sync_mode::TIMELINE && c.sync_mode != tp5_sync_mode::DRM) || !c.cmd_replay_enabled)
+    if ((c.sync_mode != tp5_sync_mode::TIMELINE && c.sync_mode != tp5_sync_mode::DRM && c.sync_mode != tp5_sync_mode::STAR) || !c.cmd_replay_enabled)
         return false;
 
     const size_t n_stages = stage_tensors.size();
@@ -3933,7 +3901,7 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
     }
 
     // Permanent cross-rank timeline semaphore import (for timeline mode)
-    if (c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::DRM) {
+    if (c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::DRM || c->sync_mode == tp5_sync_mode::STAR) {
         for (size_t i = 0; i < n; ++i) {
             tp5_rank & r_dst = c->ranks[i];
             r_dst.peer_timeline_sems.assign(n, VK_NULL_HANDLE);
@@ -4047,7 +4015,20 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
             }
             fprintf(stderr, "ggml-vulkan-collective: rank %zu bound to DRM node '%s' (dri_fd=%d)\n",
                     i, dri_path.c_str(), r.dri_fd);
-            int ret = drmSyncobjFDToHandle(r.dri_fd, r.timeline_export_fd, &r.own_syncobj);
+            int own_sync_fd = r.timeline_export_fd;
+            bool need_close_own = false;
+            if (own_sync_fd < 0) {
+                VkSemaphoreGetFdInfoKHR gfi_own{VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR};
+                gfi_own.semaphore = r.timeline_sem;
+                gfi_own.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+                if (r.pfn_get_sem_fd(r.vkdev, &gfi_own, &own_sync_fd) == VK_SUCCESS && own_sync_fd >= 0) {
+                    need_close_own = true;
+                }
+            }
+            int ret = (own_sync_fd >= 0) ? drmSyncobjFDToHandle(r.dri_fd, own_sync_fd, &r.own_syncobj) : -1;
+            if (need_close_own && own_sync_fd >= 0) {
+                ::close(own_sync_fd);
+            }
             if (ret != 0 || r.own_syncobj == 0) {
                 fprintf(stderr, "ggml-vulkan-collective: drmSyncobjFDToHandle failed for rank %zu (ret=%d, handle=%u, errno=%d: %s)\n",
                         i, ret, r.own_syncobj, errno, strerror(errno));
