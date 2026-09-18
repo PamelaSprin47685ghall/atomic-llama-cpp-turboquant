@@ -25283,11 +25283,6 @@ bool ggml_vk_tp5_get_cached_cmd_bufs(ggml_backend_t backend, ggml_cgraph * cgrap
         }
     }
     if (it == ctx->cgraph_cmd_cache.end()) {
-        static int notfound_cnt = 0;
-        if (++notfound_cnt <= 5) {
-            fprintf(stderr, "[pfn_get_cbs-notfound] nodes=%d uid=%llu cache_sz=%zu\n", cgraph->n_nodes,
-                    (unsigned long long) cgraph->uid, ctx->cgraph_cmd_cache.size());
-        }
         return false;
     }
     if (it != ctx->cgraph_cmd_cache.end() && it->second.valid && it->second.n_nodes == cgraph->n_nodes &&
