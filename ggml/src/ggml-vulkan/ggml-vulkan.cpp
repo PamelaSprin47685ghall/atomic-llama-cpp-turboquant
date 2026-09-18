@@ -9067,9 +9067,9 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->event_idx = 0;
 
     ctx->prealloc_size_x = 0;
-    ctx->prealloc_size_y = 0;
-    ctx->prealloc_size_split_k = 0;
-    ctx->prealloc_size_sparse_meta = 0;
+    ctx->prealloc_size_y = 65536;            // Baseline 64 KB
+    ctx->prealloc_size_split_k = 262144;     // Baseline 256 KB
+    ctx->prealloc_size_sparse_meta = 65536;  // Baseline 64 KB
     ctx->prealloc_size_moe_route = 0;
     ctx->prealloc_moe_route_need_sync = false;
     ctx->prealloc_moe_route_last_ids = nullptr;
@@ -19938,9 +19938,9 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->prealloc_moe_route_need_sync          = false;
 
     ctx->prealloc_size_x = 0;
-    ctx->prealloc_size_y = 0;
-    ctx->prealloc_size_split_k = 0;
-    ctx->prealloc_size_sparse_meta = 0;
+    ctx->prealloc_size_y = 65536;            // Baseline 64 KB
+    ctx->prealloc_size_split_k = 262144;     // Baseline 256 KB
+    ctx->prealloc_size_sparse_meta = 65536;  // Baseline 64 KB
 
     for (auto& event : ctx->gc.events) {
         ctx->device->device.destroyEvent(event);

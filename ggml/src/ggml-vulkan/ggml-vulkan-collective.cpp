@@ -3366,7 +3366,7 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
     if (c.failed) {
         GGML_ABORT("ggml-vulkan-collective: cannot submit on failed communicator\n");
     }
-    if ((c.sync_mode != tp5_sync_mode::TIMELINE && c.sync_mode != tp5_sync_mode::DRM && c.sync_mode != tp5_sync_mode::STAR) || !c.cmd_replay_enabled)
+    if ((c.sync_mode != tp5_sync_mode::TIMELINE && c.sync_mode != tp5_sync_mode::DRM) || !c.cmd_replay_enabled)
         return false;
 
     const size_t n_stages = stage_tensors.size();

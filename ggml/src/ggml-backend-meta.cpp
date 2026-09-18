@@ -2966,6 +2966,12 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
 }
 
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    static int meta_compute_calls = 0;
+    if (++meta_compute_calls <= 10 || meta_compute_calls % 100 == 0) {
+        fprintf(stderr, "[META_GRAPH_COMPUTE] call=%d nodes=%d n_backends=%zu\n",
+                meta_compute_calls, cgraph->n_nodes, ggml_backend_meta_n_backends(backend));
+    }
+
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
@@ -3634,6 +3640,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     static tp5_submit_epoch_chain_t pfn_submit_chain = nullptr;
     static tp5_get_cached_cmd_bufs_t pfn_get_cbs = nullptr;
     static bool pfn_chain_checked = false;
+    static bool printed_route_once = false;
+    if (!printed_route_once) {
+        printed_route_once = true;
+        fprintf(stderr, "[tp5-route-check] comm_ctx=%p n_backends=%zu n_subgraphs=%zu pfn_submit_chain=%p pfn_get_cbs=%p\n",
+                backend_ctx->comm_ctx, n_backends, backend_ctx->n_subgraphs, (void*)pfn_submit_chain, (void*)pfn_get_cbs);
+    }
     if (!pfn_chain_checked && backend_ctx->comm_ctx && n_backends == 5) {
         pfn_chain_checked = true;
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_ctx->backend_configs[0].backend));
