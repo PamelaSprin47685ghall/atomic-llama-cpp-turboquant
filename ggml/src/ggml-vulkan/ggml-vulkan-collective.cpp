@@ -2422,16 +2422,10 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
     // 1. Record STAR BDA Push + Phase 2 command buffers on all GPUs
     struct star_rank_submit_t {
         tp5_rank * rk;
-        VkSubmitInfo si_p1;
-        VkSubmitInfo si_p2;
-        VkTimelineSemaphoreSubmitInfo tsi_p1;
-        VkTimelineSemaphoreSubmitInfo tsi_p2;
-        uint64_t sig_p1_val;
+        VkSubmitInfo si;
+        VkTimelineSemaphoreSubmitInfo tsi;
         uint64_t sig_p2_val;
-        uint64_t wait_ready_val;
-        VkCommandBuffer cmd_p1_val;
-        VkCommandBuffer cmd_p2_val;
-        VkPipelineStageFlags wait_stage_val;
+        VkCommandBuffer cbs[2];
     };
     std::vector<star_rank_submit_t> star_submits(c.n_ranks);
     
@@ -2499,19 +2493,6 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
 
         vkEndCommandBuffer(cmd_p1);
 
-        // Submit Phase 1 with timeline semaphore signal (2 * epoch - 1)
-        uint64_t sig_p1 = 2 * epoch - 1;
-        VkTimelineSemaphoreSubmitInfo tsi_p1{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-        tsi_p1.signalSemaphoreValueCount = 1;
-        tsi_p1.pSignalSemaphoreValues = &sig_p1;
-
-        VkSubmitInfo si_p1{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si_p1.pNext = &tsi_p1;
-        si_p1.commandBufferCount = 1;
-        si_p1.pCommandBuffers = &cmd_p1;
-        si_p1.signalSemaphoreCount = 1;
-        si_p1.pSignalSemaphores = &r.timeline_sem;
-
         // CPU resets doorbell event before recording & submitting Phase 2
         vkResetEvent(r.vkdev, r.host_ready_event[bank]);
 
@@ -2556,47 +2537,23 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb_post, 0, nullptr, 0, nullptr);
         vkEndCommandBuffer(cmd_p2);
 
-        // Phase 2 is gated by host_ready_event doorbell and signals timeline_sem (2 * epoch)
-        uint64_t sig_p2 = 2 * epoch;
-        VkTimelineSemaphoreSubmitInfo tsi_p2{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-        tsi_p2.waitSemaphoreValueCount = 0;
-        tsi_p2.pWaitSemaphoreValues = nullptr;
-        tsi_p2.signalSemaphoreValueCount = 1;
-        tsi_p2.pSignalSemaphoreValues = &sig_p2;
-
-        VkSubmitInfo si_p2{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si_p2.pNext = &tsi_p2;
-        si_p2.waitSemaphoreCount = 0;
-        si_p2.pWaitSemaphores = nullptr;
-        si_p2.pWaitDstStageMask = nullptr;
-        si_p2.commandBufferCount = 1;
-        si_p2.pCommandBuffers = &cmd_p2;
-        si_p2.signalSemaphoreCount = 1;
-        si_p2.pSignalSemaphores = &r.timeline_sem;
-
+        // Single Fused Submit per GPU: [cmd_p1 (BDA Push) -> cmd_p2 (Doorbell Wait + Unpack)]
+        // Signals timeline_sem at 2*epoch upon completion of Phase 2.
         star_submits[i].rk = &r;
-        star_submits[i].sig_p1_val = sig_p1;
-        star_submits[i].sig_p2_val = sig_p2;
-        star_submits[i].cmd_p1_val = cmd_p1;
-        star_submits[i].cmd_p2_val = cmd_p2;
-        // Copy TSI structs so their lifetimes extend past the recording loop
-        star_submits[i].tsi_p1 = tsi_p1;
-        star_submits[i].tsi_p2 = tsi_p2;
-        // Patch si_p1/si_p2 pointers to the stable copies
-        star_submits[i].si_p1 = si_p1;
-        star_submits[i].si_p1.pNext = &star_submits[i].tsi_p1;
-        star_submits[i].si_p1.pCommandBuffers = &star_submits[i].cmd_p1_val;
-        star_submits[i].tsi_p1.pWaitSemaphoreValues = nullptr; // P1 has no waits
-        star_submits[i].tsi_p1.pSignalSemaphoreValues = &star_submits[i].sig_p1_val;
-        star_submits[i].si_p2 = si_p2;
-        star_submits[i].si_p2.pNext = &star_submits[i].tsi_p2;
-        star_submits[i].si_p2.pCommandBuffers = &star_submits[i].cmd_p2_val;
-        star_submits[i].si_p2.waitSemaphoreCount = 0;
-        star_submits[i].si_p2.pWaitSemaphores = nullptr;
-        star_submits[i].si_p2.pWaitDstStageMask = nullptr;
-        star_submits[i].tsi_p2.waitSemaphoreValueCount = 0;
-        star_submits[i].tsi_p2.pWaitSemaphoreValues = nullptr;
-        star_submits[i].tsi_p2.pSignalSemaphoreValues = &star_submits[i].sig_p2_val;
+        star_submits[i].sig_p2_val = 2 * epoch;
+        star_submits[i].cbs[0] = cmd_p1;
+        star_submits[i].cbs[1] = cmd_p2;
+
+        star_submits[i].tsi = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        star_submits[i].tsi.signalSemaphoreValueCount = 1;
+        star_submits[i].tsi.pSignalSemaphoreValues = &star_submits[i].sig_p2_val;
+
+        star_submits[i].si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        star_submits[i].si.pNext = &star_submits[i].tsi;
+        star_submits[i].si.commandBufferCount = 2;
+        star_submits[i].si.pCommandBuffers = star_submits[i].cbs;
+        star_submits[i].si.signalSemaphoreCount = 1;
+        star_submits[i].si.pSignalSemaphores = &r.timeline_sem;
     }
 
     // 2. Parallel vkQueueSubmit on all 5 GPUs via persistent thread pool
@@ -2606,8 +2563,7 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
         std::atomic<int> submit_fail{0};
         c.submit_pool->parallel_for([&](size_t i) {
             tp5_rank & r = *star_submits[i].rk;
-            VkSubmitInfo submits[2] = { star_submits[i].si_p1, star_submits[i].si_p2 };
-            if (vkQueueSubmit(r.queue, 2, submits, VK_NULL_HANDLE) != VK_SUCCESS) {
+            if (vkQueueSubmit(r.queue, 1, &star_submits[i].si, VK_NULL_HANDLE) != VK_SUCCESS) {
                 submit_fail.store(1, std::memory_order_relaxed);
             }
             ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
@@ -2619,8 +2575,7 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
     } else {
         for (size_t i = 0; i < c.n_ranks; ++i) {
             tp5_rank & r = *star_submits[i].rk;
-            VkSubmitInfo submits[2] = { star_submits[i].si_p1, star_submits[i].si_p2 };
-            if (vkQueueSubmit(r.queue, 2, submits, VK_NULL_HANDLE) != VK_SUCCESS) {
+            if (vkQueueSubmit(r.queue, 1, &star_submits[i].si, VK_NULL_HANDLE) != VK_SUCCESS) {
                 c.fail("tp5_allreduce_star: merged submit failed on rank " + std::to_string(i));
                 return false;
             }
