@@ -2517,16 +2517,16 @@ auto t_rec_start = std::chrono::high_resolution_clock::now();
         star_submits[i].submits[0].pSignalSemaphores = &r.timeline_sem;
 
         star_submits[i].tsi[1] = {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-        star_submits[i].tsi[1].waitSemaphoreValueCount = 1;
-        star_submits[i].tsi[1].pWaitSemaphoreValues = &star_submits[i].wait_ready;
+        star_submits[i].tsi[1].waitSemaphoreValueCount = 0;
+        star_submits[i].tsi[1].pWaitSemaphoreValues = nullptr;
         star_submits[i].tsi[1].signalSemaphoreValueCount = 1;
         star_submits[i].tsi[1].pSignalSemaphoreValues = &star_submits[i].sig_p2;
 
         star_submits[i].submits[1] = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
         star_submits[i].submits[1].pNext = &star_submits[i].tsi[1];
-        star_submits[i].submits[1].waitSemaphoreCount = 1;
-        star_submits[i].submits[1].pWaitSemaphores = &r.host_ready_sem;
-        star_submits[i].submits[1].pWaitDstStageMask = &star_submits[i].wait_stage;
+        star_submits[i].submits[1].waitSemaphoreCount = 0;
+        star_submits[i].submits[1].pWaitSemaphores = nullptr;
+        star_submits[i].submits[1].pWaitDstStageMask = nullptr;
         star_submits[i].submits[1].commandBufferCount = 1;
         star_submits[i].submits[1].pCommandBuffers = &star_submits[i].cmd_p2;
         star_submits[i].submits[1].signalSemaphoreCount = 1;
@@ -2537,7 +2537,7 @@ auto t_rec_start = std::chrono::high_resolution_clock::now();
     auto t_sub_start = std::chrono::high_resolution_clock::now();
     for (size_t i = 0; i < c.n_ranks; ++i) {
         tp5_rank & r = *star_submits[i].rk;
-        if (vkQueueSubmit(r.queue, 2, star_submits[i].submits, VK_NULL_HANDLE) != VK_SUCCESS) {
+        if (vkQueueSubmit(r.queue, 1, &star_submits[i].submits[0], VK_NULL_HANDLE) != VK_SUCCESS) {
             c.fail("tp5_allreduce_star: merged submit failed on rank " + std::to_string(i));
             return false;
         }
@@ -2612,24 +2612,14 @@ auto t_rec_start = std::chrono::high_resolution_clock::now();
     // PILLAR 6: ATOMIC ASYNC SIGNAL HANDOFF (Wakes up GPU Phase 2 via timeline sem)
     // ZERO risk of GPU event hangs, completely thread-safe & monotonic!
     // =========================================================================
-    if (c.drm_signaler) {
-        for (size_t i = 0; i < c.n_ranks; ++i) {
-            tp5_rank & r = c.ranks[i];
-            if (r.dri_fd >= 0 && r.host_ready_syncobj > 0) {
-                c.drm_signaler->signal_async(i, r.dri_fd, r.host_ready_syncobj, epoch);
-            } else if (r.pfn_signal_semaphore && r.host_ready_sem) {
-                VkSemaphoreSignalInfo ssi{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, nullptr, r.host_ready_sem, epoch};
-                r.pfn_signal_semaphore(r.vkdev, &ssi);
-            }
+    // Phase 2 Direct Launch (Zero wait semaphores, 100% hardware speed!)
+    for (size_t i = 0; i < c.n_ranks; ++i) {
+        tp5_rank & r = *star_submits[i].rk;
+        if (vkQueueSubmit(r.queue, 1, &star_submits[i].submits[1], VK_NULL_HANDLE) != VK_SUCCESS) {
+            c.fail("tp5_allreduce_star: Phase 2 submit failed on rank " + std::to_string(i));
+            return false;
         }
-    } else {
-        for (size_t i = 0; i < c.n_ranks; ++i) {
-            tp5_rank & r = c.ranks[i];
-            if (r.pfn_signal_semaphore && r.host_ready_sem) {
-                VkSemaphoreSignalInfo ssi{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, nullptr, r.host_ready_sem, epoch};
-                r.pfn_signal_semaphore(r.vkdev, &ssi);
-            }
-        }
+        ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
     }
     auto t_after_p2 = std::chrono::high_resolution_clock::now();
 
