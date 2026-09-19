@@ -12,6 +12,10 @@
 - **严禁依赖不稳定的设备级自旋等待**：下行信号必须使用驱动原生或有安全保障的同步原语（如 Timeline Semaphore 或受控的事件机制），不得绕过硬件调度规范。
 - **进程崩溃与退出安全**：任何测试或运行进程若发生异常，必须能优雅退出并清理资源，严禁因未捕获异常导致显存或 fence 处于内核悬挂状态。
 
+### 🚨 2026-09-19 RELAY 复发事故
+
+真实 `llama-server --tp5-sync relay` 在第二个请求的 epoch-chain 重用阶段发生 payload timeout，随后主机非正常重启；上一启动周期的 journal 损坏，无法从持久日志恢复完整 hang 栈。结论按真机事故处理：**RELAY 的 local-VRAM shader doorbell / GPU 等待路径已在生产入口和硬件测试入口 fail-closed 禁用。** 在新的、独立证明安全的驱动级同步方案出现前，禁止重新启用、禁止用更大的 spin bound 重试、禁止以 `vkDeviceWaitIdle` 或进程 abort 作为恢复手段。
+
 ### 🚨 2026-09-18 事故反思与血的教训
 
 **事故现场**：

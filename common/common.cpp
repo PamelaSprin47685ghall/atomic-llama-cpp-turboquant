@@ -412,11 +412,7 @@ void common_tp5_apply_env(const common_params & params) {
     if (!params.tp5.sync.empty()) {
         setenv("GGML_TP5_SYNC", params.tp5.sync.c_str(), 1);
     }
-    if (params.tp5.sync != "relay") {
-        setenv("GGML_TP5_RELAY", "off", 1);
-    } else {
-        unsetenv("GGML_TP5_RELAY");
-    }
+    unsetenv("GGML_TP5_RELAY");
     setenv("GGML_VK_CMD_REPLAY", params.tp5.cmd_replay ? "1" : "0", 1);
     if (!params.tp5.manifest.empty()) {
         if (!std::filesystem::exists(params.tp5.manifest)) {

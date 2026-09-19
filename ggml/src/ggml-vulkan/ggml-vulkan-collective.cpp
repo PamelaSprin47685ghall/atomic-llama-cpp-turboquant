@@ -1525,6 +1525,10 @@ void tp5_destroy_rank(tp5_rank & r) {
 }
 
 bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
+    if (c.sync_mode == tp5_sync_mode::RELAY) {
+        c.fail("RELAY is disabled after an unsafe RADV/Navi21 reset");
+        return false;
+    }
     // Every rank slot and both bank descriptors must satisfy all devices'
     // storage-buffer alignment, including odd-sized F16 payloads.
     const size_t wire_b    = c.wire == tp5_wire_type::F16 ? 2 : 4;
@@ -1551,7 +1555,7 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
         }
     } else if (c.sync_mode == tp5_sync_mode::GPUFLAG) {
         tp5_gpuflag_drain_all(c);
-    } else if (c.sync_mode == tp5_sync_mode::STAR || c.sync_mode == tp5_sync_mode::RELAY) {
+    } else if (c.sync_mode == tp5_sync_mode::STAR) {
         for (auto & r : c.ranks) {
             if (r.vkdev) vkDeviceWaitIdle(r.vkdev);
         }
@@ -4310,9 +4314,6 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
     if (timing_env && atoi(timing_env) > 0)
         c->timing_chain = (uint64_t) atoi(timing_env);
 
-    const char * relay_env = getenv("GGML_TP5_RELAY");
-    (void) relay_env;
-
     const char * wire_env = getenv("GGML_TP5_WIRE");
     c->wire = (wire_env && strcmp(wire_env, "f32") == 0) ? tp5_wire_type::F32 : tp5_wire_type::F16;
 
@@ -4320,7 +4321,9 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
     if (sync_env && (strcmp(sync_env, "star") == 0 || strcmp(sync_env, "l3_star") == 0)) {
         c->sync_mode = tp5_sync_mode::STAR;
     } else if (sync_env && strcmp(sync_env, "relay") == 0) {
-        c->sync_mode = tp5_sync_mode::RELAY;
+        fprintf(stderr, "ggml-vulkan-collective: sync mode 'relay' is disabled after an unsafe RADV/Navi21 reset; use timeline or star\n");
+        delete c;
+        return nullptr;
     } else if (sync_env && strcmp(sync_env, "timeline") == 0) {
         c->sync_mode = tp5_sync_mode::TIMELINE;
     } else if (sync_env && strcmp(sync_env, "host") == 0) {
@@ -4854,6 +4857,12 @@ bool ggml_backend_vk_tp5_prepare_graph(void * comm, size_t rank, ggml_cgraph * g
 // Isolated hardware experiment: CPU arithmetic remains part of the protocol;
 // only GPU queue progression is autonomous. No model graph uses this entrypoint.
 int ggml_vk_tp5_relay_probe(ggml_backend_t * backends, size_t n, const ggml_vk_relay_config & cfg) {
+    (void) backends;
+    (void) n;
+    (void) cfg;
+    fprintf(stderr, "relay: disabled after an unsafe RADV/Navi21 reset; no GPU work was submitted\n");
+    return 1;
+
     if (n != 5 || !backends || cfg.stages < 1 || cfg.stages > 96 || cfg.replays < 1 || cfg.replays > 32 ||
         cfg.elements < 1 || cfg.elements > 4096 || cfg.spin_max < 1 || cfg.spin_max > 1000000 ||
         cfg.delay_us > 2000 || cfg.withhold_stage > cfg.stages || cfg.partial_submit_ranks >= n ||

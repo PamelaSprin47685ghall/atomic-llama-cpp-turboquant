@@ -31,15 +31,14 @@ void main() {
         uint expected = status.words[1];
         if (status.words[2] == 0u && expected != 0u) {
             memoryBarrierBuffer();
-            for (uint spin = 0u; spin < p.spin_max; ++spin) {
-                if (inbox[0] == expected) {
-                    // Consume the generation-matched doorbell exactly once.
-                    // The CPU publishes payload first, then this word; no
-                    // lane other than lane 0 touches the control word.
-                    inbox[0] = 0u;
-                    ready = 1u;
-                    break;
-                }
+            // P2 is submitted only after the host has published payload and
+            // this matching doorbell. Never poll from a shader: a missed
+            // handoff must fail once rather than pinning an amdgpu queue.
+            if (inbox[0] == expected) {
+                // Consume the generation-matched doorbell exactly once. No
+                // lane other than lane 0 touches the control word.
+                inbox[0] = 0u;
+                ready = 1u;
             }
             if (ready == 0u) {
                 status.words[2] = expected;

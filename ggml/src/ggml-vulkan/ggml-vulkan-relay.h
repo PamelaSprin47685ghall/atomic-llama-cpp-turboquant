@@ -4,7 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 
-// Hardware experiment only. Not a production collective or a sync-mode alias.
+// Quarantined after an unsafe RADV/Navi21 reset. Not a production collective
+// or a sync-mode alias; calls fail closed without submitting GPU work.
 struct ggml_vk_relay_config {
     uint32_t stages = 2;
     uint32_t replays = 4;
@@ -16,7 +17,6 @@ struct ggml_vk_relay_config {
     bool stale_doorbell = false;
 };
 
-// Returns 0 when the requested success/failure scenario passes, 1 for a failed
-// check, 2 if submitted GPU work could not be drained (resources retained).
+// Always returns 1 while RELAY remains quarantined.
 GGML_BACKEND_API int ggml_vk_tp5_relay_probe(ggml_backend_t * backends, size_t n,
                                            const ggml_vk_relay_config & config);

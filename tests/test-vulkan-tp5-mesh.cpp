@@ -14,7 +14,7 @@
 //   5. resource accounting: no fd leak across rounds (count /proc/self/fd)
 //
 // Usage: test-vulkan-tp5-mesh [--devices 0,1,2,3,4] [--elements 2560]
-//                              [--rounds 96] [--wire f32|f16] [--sync host|syncfd|timeline|star|relay|l3_star|gpuflag]
+//                              [--rounds 96] [--wire f32|f16] [--sync host|syncfd|timeline|star|l3_star|gpuflag|drm]
 //                              [--check-all] [--vary-input] [--delay-producer]
 //                              [--adversarial] [--epochs 1] [--chain-stages N]
 //                              [--run-chain-regression] [--benchmark-chain]
@@ -1776,7 +1776,6 @@ int main(int argc, char ** argv) {
     bool             benchmark_chain = false;
     std::string wire_str = "f16"; // default matches production collective
     std::string sync_str = "timeline";
-    std::string relay_str = "off";
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
@@ -1799,8 +1798,12 @@ int main(int argc, char ** argv) {
             } else if (sync_str == "l3_star") {
                 sync_str = "star";
             }
-            if (sync_str != "host" && sync_str != "syncfd" && sync_str != "timeline" && sync_str != "star" && sync_str != "relay" && sync_str != "gpuflag" && sync_str != "drm") {
-                fprintf(stderr, "test-vulkan-tp5-mesh: invalid sync mode '%s'; use 'host', 'syncfd', 'timeline', 'star', 'relay', 'l3_star', 'gpuflag', or 'drm'\n", sync_str.c_str());
+            if (sync_str == "relay") {
+                fprintf(stderr, "test-vulkan-tp5-mesh: relay is disabled after an unsafe RADV/Navi21 reset; no GPU work was submitted\n");
+                return 2;
+            }
+            if (sync_str != "host" && sync_str != "syncfd" && sync_str != "timeline" && sync_str != "star" && sync_str != "gpuflag" && sync_str != "drm") {
+                fprintf(stderr, "test-vulkan-tp5-mesh: invalid sync mode '%s'; use 'host', 'syncfd', 'timeline', 'star', 'l3_star', 'gpuflag', or 'drm'\n", sync_str.c_str());
                 return 2;
             }
             if (sync_str == "gpuflag") {
@@ -1809,12 +1812,9 @@ int main(int argc, char ** argv) {
             setenv("GGML_TP5_SYNC", sync_str.c_str(), 1);
         }
         else if (a == "--relay") {
-            relay_str = next();
-            if (relay_str != "off") {
-                fprintf(stderr, "test-vulkan-tp5-mesh: invalid relay mode '%s'; host-relay is prohibited, only '--relay off' is allowed\n", relay_str.c_str());
-                return 2;
-            }
-            setenv("GGML_TP5_RELAY", relay_str.c_str(), 1);
+            (void) next();
+            fprintf(stderr, "test-vulkan-tp5-mesh: --relay is disabled after an unsafe RADV/Navi21 reset; no GPU work was submitted\n");
+            return 2;
         }
         else if (a == "--check-all")  check_all = true;
         else if (a == "--vary-input") vary = true;
@@ -2020,14 +2020,14 @@ int main(int argc, char ** argv) {
 
     // 4.5) Epoch-chain regression & paired benchmark:
     // Run explicitly or as part of the adversarial suite.
-    if ((sync_str == "timeline" || sync_str == "star" || sync_str == "drm" || sync_str == "relay") && (run_chain_reg || adversarial)) {
+    if ((sync_str == "timeline" || sync_str == "star" || sync_str == "drm") && (run_chain_reg || adversarial)) {
         fprintf(stderr, "\n--- Starting Epoch-Chain Regression Suite ---\n");
         run_epoch_chain_regression(comm, g_backends, is_f16_wire);
-        if (g_failures == 0 && sync_str != "relay")
+        if (g_failures == 0)
             run_cached_compute_chain_regression(comm, is_f16_wire);
-        if (g_failures == 0 && is_f16_wire && sync_str != "relay")
+        if (g_failures == 0 && is_f16_wire)
             run_producer_wire_regression(comm);
-        if (g_failures == 0 && is_f16_wire && sync_str != "relay")
+        if (g_failures == 0 && is_f16_wire)
             run_hc_sum_regression(comm);
     }
 
