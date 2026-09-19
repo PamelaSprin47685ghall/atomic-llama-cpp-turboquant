@@ -1,6 +1,6 @@
 #version 450
 
-// RELAY real-graph P2: wait on a CPU-written local-VRAM epoch, then copy the
+// RELAY real-graph P2: validate a CPU-written local-VRAM epoch, then copy the
 // CPU-reduced F32 payload into the tensor consumed by the next graph stage.
 // This is deliberately a copy/doorbell kernel, not a model operator.
 #extension GL_EXT_buffer_reference : require
@@ -15,7 +15,7 @@ layout(push_constant) uniform Params {
     uint64_t status_bda;
     uint n_elems;
     uint seq;
-    uint spin_max;
+    uint reserved_spin;
     uint dst_offset_words;
     uint reserved0;
     uint reserved1;

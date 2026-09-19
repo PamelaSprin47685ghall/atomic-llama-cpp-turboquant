@@ -327,8 +327,8 @@ struct tp5_timeline_batch {
         uint32_t       count      = 0;
         if (wait_value != 0) {
             if (is_relay) {
-                // RELAY's P2 command owns the bounded local-VRAM doorbell
-                // wait; no host semaphore wait or CPU signal is needed.
+                // RELAY's P2 validates a pre-published local-VRAM doorbell;
+                // no device-side polling or host semaphore wait is allowed.
             } else if (is_star) {
                 waits[0]  = rank.host_ready_sem;
                 values[0] = epoch;
@@ -2322,9 +2322,9 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.relay_copy_pipe);
                     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.relay_copy_layout, 0, 1,
                                             &plan.relay_ds[idx], 0, nullptr);
-                    struct { uint64_t status_bda; uint32_t n_elems; uint32_t seq; uint32_t spin_max;
+                    struct { uint64_t status_bda; uint32_t n_elems; uint32_t seq; uint32_t reserved_spin;
                              uint32_t dst_offset_words; uint32_t reserved0; uint32_t reserved1; } relay_pc{
-                        r.bda_addr[b] + c.star_rank_stride - 64, (uint32_t)n_elems, 1u, c.spin_max,
+                        r.bda_addr[b] + c.star_rank_stride - 64, (uint32_t)n_elems, 1u, 0u,
                         0u, 0u, 0u};
                     vkCmdPushConstants(cmd, r.relay_copy_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                        sizeof(relay_pc), &relay_pc);
