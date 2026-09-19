@@ -14,7 +14,7 @@
 
 ### 🚨 2026-09-19 RELAY 复发事故
 
-真实 `llama-server --tp5-sync relay` 在第二个请求的 epoch-chain 重用阶段发生 payload timeout，随后主机非正常重启；上一启动周期的 journal 损坏，无法从持久日志恢复完整 hang 栈。结论按真机事故处理：**RELAY 的 local-VRAM shader doorbell / GPU 等待路径已在生产入口和硬件测试入口 fail-closed 禁用。** 在新的、独立证明安全的驱动级同步方案出现前，禁止重新启用、禁止用更大的 spin bound 重试、禁止以 `vkDeviceWaitIdle` 或进程 abort 作为恢复手段。
+真实 `llama-server --tp5-sync relay` 在第二个请求的 epoch-chain 重用阶段发生 payload timeout，随后主机非正常重启；上一启动周期的 journal 损坏，无法从持久日志恢复完整 hang 栈。结论按真机事故处理：**RELAY 的 local-VRAM shader doorbell / GPU 等待路径已在生产入口和硬件测试入口 fail-closed 禁用。** 在新的、独立证明安全的驱动级同步方案出现前，禁止重新启用、禁止用更大的 spin bound 重试、禁止以 `vkDeviceWaitIdle` 或进程 abort 作为恢复手段。若未来重新设计，P2 必须在 CPU 完整发布 payload+doorbell 后才提交、shader 不得轮询，并且每个已提交 timeline 值必须在任何资源释放前由驱动原生 wait 有界排空；当前 `comm_free` 的失败 abort 路径不满足该重启条件。
 
 ### 🚨 2026-09-18 事故反思与血的教训
 

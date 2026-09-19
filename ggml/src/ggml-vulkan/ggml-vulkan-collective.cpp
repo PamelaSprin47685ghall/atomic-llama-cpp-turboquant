@@ -4294,7 +4294,7 @@ extern "C" {
 void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
     const char * star_spin_env = getenv("GGML_TP5_STAR_SPIN");
     if (star_spin_env && atoi(star_spin_env) != 0) {
-        fprintf(stderr, "ggml-vulkan-collective: GGML_TP5_STAR_SPIN is retired; use test-vulkan-tp5-relay --run\n");
+        fprintf(stderr, "ggml-vulkan-collective: GGML_TP5_STAR_SPIN is retired; use timeline or star\n");
         return nullptr;
     }
     if (n < 1 || n > 8) {
