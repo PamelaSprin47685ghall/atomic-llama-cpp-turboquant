@@ -901,6 +901,7 @@ struct vk_device_struct {
     uint64_t suballocation_block_size;
     uint64_t min_imported_host_pointer_alignment;
     bool external_memory_host {};
+    bool device_coherent_memory {};
     bool fp16;
     bool bf16;
     bool pipeline_robustness;
@@ -7663,6 +7664,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 device->memory_priority = true;
             } else if (strcmp("VK_EXT_external_memory_host", properties.extensionName) == 0) {
                 device->external_memory_host = true;
+            } else if (strcmp(VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME, properties.extensionName) == 0) {
+                device->device_coherent_memory = true;
 #if defined(VK_EXT_shader_64bit_indexing)
             } else if (strcmp("VK_EXT_shader_64bit_indexing", properties.extensionName) == 0) {
                 device->shader_64b_indexing = true;
@@ -7938,6 +7941,15 @@ static vk_device ggml_vk_get_device(size_t idx) {
             last_struct->pNext = (VkBaseOutStructure *)&memory_priority_features;
             last_struct = (VkBaseOutStructure *)&memory_priority_features;
             device_extensions.push_back("VK_EXT_memory_priority");
+        }
+
+        VkPhysicalDeviceCoherentMemoryFeaturesAMD coherent_memory_features{};
+        coherent_memory_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COHERENT_MEMORY_FEATURES_AMD;
+        coherent_memory_features.deviceCoherentMemory = VK_TRUE;
+        if (device->device_coherent_memory) {
+            last_struct->pNext = (VkBaseOutStructure *)&coherent_memory_features;
+            last_struct = (VkBaseOutStructure *)&coherent_memory_features;
+            device_extensions.push_back(VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME);
         }
 
         VkPhysicalDeviceSubgroupSizeControlFeaturesEXT subgroup_size_control_features;
@@ -8365,7 +8377,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
         const char * isolate_bo_env = getenv("GGML_TP5_ISOLATE_BO");
         const char * tp5_sync_env = getenv("GGML_TP5_SYNC");
         const bool is_star_mode = tp5_sync_env && (strcmp(tp5_sync_env, "star") == 0 || strcmp(tp5_sync_env, "l3_star") == 0);
-        if (!is_star_mode && isolate_bo_env && atoi(isolate_bo_env) != 0) {
+        const bool is_relay_mode = tp5_sync_env && strcmp(tp5_sync_env, "relay") == 0;
+        if (!is_star_mode && !is_relay_mode && isolate_bo_env && atoi(isolate_bo_env) != 0) {
             if (device->architecture != AMD_RDNA2 || device->driver_id != vk::DriverId::eMesaRadv) {
                 GGML_ABORT("GGML_TP5_ISOLATE_BO requires RADV on RDNA2\n");
             }
@@ -25413,6 +25426,9 @@ vk_tp5_device_caps ggml_vk_tp5_device_caps(vk_device device) {
         }
         if (strncmp(p.extensionName, "VK_EXT_external_memory_dma_buf", 256) == 0) {
             caps.external_memory_dma_buf = true;
+        }
+        if (strncmp(p.extensionName, VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME, 256) == 0) {
+            caps.device_coherent_memory = true;
         }
         if (strncmp(p.extensionName, "VK_KHR_external_semaphore_fd", 256) == 0) {
             caps.external_semaphore_fd = true;

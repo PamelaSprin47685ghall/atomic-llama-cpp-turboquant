@@ -1,0 +1,155 @@
+#version 450
+
+// RELAY PoC: GPU state initialization / bounded host-to-device relay consumption.
+//
+// Hardware experimental path:
+// - Direct coherent reads from VRAM inbox written via CPU posted writes.
+// - Reuses TIMELINE pre-recorded entire stage chain and STAR GPU->host BDA push.
+// - Note on visibility: This is an experimental path. Coherent/volatile qualifiers
+//   alone do NOT establish portable host-device synchronization without proper
+//   domain barriers and cache flushes/invalidations. Cache bypass / L2 residency
+//   behavior is GPU- and driver-dependent and not guaranteed across architectures.
+
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64) in;
+
+// Bind 0: coherent volatile uint inbox[] (64-byte header = 16 uints, then F32 input words)
+layout(std430, binding = 0) coherent volatile buffer InboxBuffer {
+    uint inbox[];
+};
+
+// Bind 1: F32 state[]
+layout(std430, binding = 1) buffer StateBuffer {
+    float state[];
+};
+
+// Bind 2: coherent volatile uint control[] (always bank0 buffer header)
+// control[0] = CPU ready for bank0
+// control[1] = CPU abort flag
+// control[2] = GPU sticky error stage
+// control[4] = CPU run seed
+layout(std430, binding = 2) coherent volatile buffer ControlBuffer {
+    uint control[];
+};
+
+// BDA buffer reference for host status array:
+// word0: upload seq (written by existing push shader)
+// word1: GPU entered seq
+// word2: GPU error stage
+// word3: GPU consumed seq
+// word[3 + seq]: completed wait's unsuccessful polling iterations
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer HostStatusBuf {
+    uint status_words[];
+};
+
+// Push constants: exactly 32 bytes (8 x 4 bytes)
+// uint64_t status_bda (8 bytes, offset 0)
+// uint n_elems        (4 bytes, offset 8)
+// uint seq            (4 bytes, offset 12)
+// uint rank           (4 bytes, offset 16)
+// uint spin_max       (4 bytes, offset 20)
+// uint mode           (4 bytes, offset 24)
+// uint reserved       (4 bytes, offset 28)
+layout(push_constant) uniform Params {
+    uint64_t status_bda;
+    uint n_elems;
+    uint seq;
+    uint rank;
+    uint spin_max;
+    uint mode;
+    uint reserved;
+} p;
+
+shared bool s_ready;
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+
+    if (p.mode == 0u) {
+        // Mode 0: Initialize state
+        // state[e] = float(rank+1)*0.25 + float(e%7)*0.03125 + float(control[4]%8)*0.0625
+        float base_rank = float(p.rank + 1u) * 0.25;
+        float seed_term = float(control[4] % 8u) * 0.0625;
+        for (uint e = lane; e < p.n_elems; e += 64u) {
+            state[e] = base_rank + float(e % 7u) * 0.03125 + seed_term;
+        }
+        return;
+    }
+
+    if (p.mode == 1u) {
+        // Mode 1: Relay consume
+        // Only lane 0 waits finite spin < spin_max
+        if (lane == 0u) {
+            s_ready = false;
+
+            // Check sticky error or abort first
+            if (control[2] != 0u || control[1] != 0u) {
+                // Aborted or prior sticky error
+                if (control[1] != 0u && control[2] == 0u) {
+                    control[2] = p.seq; // Set sticky first error on abort
+                }
+                HostStatusBuf(p.status_bda).status_words[2] = control[2];
+                s_ready = false;
+            } else {
+                // Report entered seq via BDA and memoryBarrierBuffer before waiting
+                HostStatusBuf(p.status_bda).status_words[1] = p.seq;
+                memoryBarrierBuffer();
+
+                // Finite spin wait
+                for (uint spin = 0u; spin < p.spin_max; ++spin) {
+                    if (control[1] != 0u) {
+                        // Abort signal received during wait
+                        if (control[2] == 0u) {
+                            control[2] = p.seq;
+                        }
+                        HostStatusBuf(p.status_bda).status_words[2] = p.seq;
+                        s_ready = false;
+                        break;
+                    }
+
+                    // Ready succeeds iff inbox[0] == seq (no GPU writes inbox[0])
+                    if (inbox[0] == p.seq) {
+                        s_ready = true;
+                        HostStatusBuf(p.status_bda).status_words[3u + p.seq] = spin;
+                        break;
+                    }
+                }
+
+                if (!s_ready && control[1] == 0u) {
+                    // Timeout
+                    if (control[2] == 0u) {
+                        control[2] = p.seq; // Sticky first error only
+                    }
+                    HostStatusBuf(p.status_bda).status_words[2] = p.seq;
+                }
+            }
+        }
+
+        // Share boolean ready to workgroup with barrier
+        barrier();
+
+        // Failure returns whole workgroup BEFORE input reads or state writes
+        if (!s_ready) {
+            return;
+        }
+
+        // Success: memoryBarrierBuffer then each lane strided processes e < n_elems
+        memoryBarrierBuffer();
+
+        float base_rank = float(p.rank + 1u) * 0.25;
+        // inbox has 64-byte header (16 uints), followed by F32 input words at inbox[16 + e]
+        for (uint e = lane; e < p.n_elems; e += 64u) {
+            state[e] = uintBitsToFloat(inbox[16u + e]) * 0.125 + base_rank + float(e % 7u) * 0.03125;
+        }
+
+        // All lanes finish their state stores before lane 0 publishes consumed.
+        memoryBarrierBuffer();
+        barrier();
+
+        if (lane == 0u) {
+            HostStatusBuf(p.status_bda).status_words[3] = p.seq;
+        }
+    }
+}

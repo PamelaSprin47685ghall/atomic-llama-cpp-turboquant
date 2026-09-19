@@ -26,10 +26,12 @@
 #include "ggml-vulkan.h"
 #include "ggml-tp5-profile.h"
 #include "ggml-vulkan-collective.hpp"
+#include "ggml-vulkan-relay.h"
 
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <array>
 #include <fcntl.h>
 #include <xf86drm.h>
 #include <climits>
@@ -55,7 +57,7 @@ struct tp5_fd {
 namespace {
 
 enum class tp5_wire_type { F32, F16 };
-enum class tp5_sync_mode { HOST, SYNCFD, TIMELINE, GPUFLAG, DRM, STAR };
+enum class tp5_sync_mode { HOST, SYNCFD, TIMELINE, GPUFLAG, DRM, STAR, RELAY };
 
 // Two mailbox banks so P1 of epoch N can overlap peer P2 of epoch N-1:
 // bank = (epoch-1) & 1. P2's ready waits transitively provide epoch-2 credit.
@@ -161,9 +163,11 @@ static uint32_t tp5_default_spin_max() {
     const char * env = getenv("GGML_TP5_SPIN_MAX");
     if (env && env[0]) {
         const long v = strtol(env, nullptr, 10);
-        if (v > 0) return (uint32_t) v;
+        if (v > 0) return (uint32_t) std::min<long>(v, 1000000L);
     }
-    return 100000000u;
+    // Keep a missed handoff below the amdgpu watchdog window.  The host
+    // protocol reports this bounded failure through status[2].
+    return 1000000u;
 }
 
 struct tp5_rank {
@@ -224,6 +228,10 @@ struct tp5_rank {
     VkPipeline bda_push_pipe = VK_NULL_HANDLE;
     VkPipelineLayout bda_push_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout bda_push_dsl = VK_NULL_HANDLE;
+    VkPipeline relay_copy_pipe = VK_NULL_HANDLE;
+    VkPipelineLayout relay_copy_layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout relay_copy_dsl = VK_NULL_HANDLE;
+
 
     // Pre-allocated static descriptor sets and command buffers for Star AllReduce
     VkDescriptorSet star_ds_pack[TP5_MAILBOX_BANKS] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
@@ -295,6 +303,7 @@ struct tp5_timeline_batch {
     VkPipelineStageFlags          stages[8]{};
     uint64_t                      signal = 0;
     bool                          is_star_batch = false;
+    bool                          is_relay_batch = false;
     VkTimelineSemaphoreSubmitInfo timeline{ VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
     VkSubmitInfo                  submit{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
 
@@ -304,8 +313,10 @@ struct tp5_timeline_batch {
               uint64_t                epoch,
               bool                    phase1,
               const VkCommandBuffer * command,
-              bool                    is_star = false) {
+              bool                    is_star = false,
+              bool                    is_relay = false) {
         is_star_batch = is_star;
+        is_relay_batch = is_relay;
         // R=2 credit is already implied by the existing dependency chain:
         // peer P2(e-2) -> peer P1(e-1) signal -> local P2(e-1) wait
         // -> local P1(e), ordered by the P1 compute/transfer barrier.
@@ -315,9 +326,12 @@ struct tp5_timeline_batch {
         const uint64_t wait_value = phase1 ? 0 : 2 * epoch - 1;
         uint32_t       count      = 0;
         if (wait_value != 0) {
-            if (is_star) {
+            if (is_relay) {
+                // RELAY's P2 command owns the bounded local-VRAM doorbell
+                // wait; no host semaphore wait or CPU signal is needed.
+            } else if (is_star) {
                 waits[0]  = rank.host_ready_sem;
-                values[0] = epoch; // Wait for CPU to complete bcast push for epoch
+                values[0] = epoch;
                 stages[0] = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
                 count     = 1;
             } else {
@@ -347,7 +361,7 @@ struct tp5_timeline_batch {
     }
 
     void patch_epoch(uint64_t wait_epoch, uint64_t sig) {
-        const uint64_t wait_val = is_star_batch ? wait_epoch : (wait_epoch ? 2 * wait_epoch - 1 : 0);
+        const uint64_t wait_val = (is_star_batch || is_relay_batch) ? wait_epoch : (wait_epoch ? 2 * wait_epoch - 1 : 0);
         for (uint32_t i = 0; i < timeline.waitSemaphoreValueCount; ++i) {
             values[i] = wait_val;
         }
@@ -359,6 +373,7 @@ struct tp5_rank_chain {
     std::vector<tp5_timeline_batch> batches;
     std::vector<VkSubmitInfo>       submits;
     std::vector<VkCommandBuffer>    compute;
+
 };
 
 struct tp5_binding_key {
@@ -526,7 +541,8 @@ struct tp5_cached_plan {
     std::vector<vk_buffer>       owners;
     std::shared_ptr<tp5_p1_resources> p1;
     std::vector<VkCommandBuffer> cmd_p2;
-    std::vector<VkDescriptorSet>      ds_sum;
+    std::vector<VkDescriptorSet> ds_sum;
+    std::vector<VkDescriptorSet> relay_ds;
     std::vector<VkCommandBuffer> star_cmd_p1;
     std::vector<VkCommandBuffer> star_cmd_p2;
     uint64_t last_used_call = 0;
@@ -556,6 +572,7 @@ struct tp5_comm {
     bool                        timing_submitted   = false;
     tp5_wire_type wire = tp5_wire_type::F32;
     tp5_sync_mode sync_mode = tp5_sync_mode::HOST;
+
     bool cmd_replay_enabled = true;
     bool                        isolate_mailbox    = false;
     uint32_t spin_max = 100000000u;
@@ -566,6 +583,7 @@ struct tp5_comm {
     void * star_host_raw[TP5_MAILBOX_BANKS] = {nullptr, nullptr};
     void * star_host_aligned[TP5_MAILBOX_BANKS] = {nullptr, nullptr};
     volatile uint32_t * star_host_flag[TP5_MAILBOX_BANKS] = {nullptr, nullptr};
+    bool relay_bank_used[TP5_MAILBOX_BANKS] = {false, false};
     size_t star_host_alloc_size = 0;
     size_t star_rank_stride = 0;
     std::unique_ptr<tp5_avx2_pool> avx2_pool;
@@ -639,6 +657,10 @@ struct tp5_comm {
             if (idx < plan.ds_sum.size() && plan.ds_sum[idx] != VK_NULL_HANDLE && r.desc_pool != VK_NULL_HANDLE) {
                 vkFreeDescriptorSets(r.vkdev, r.desc_pool, 1, &plan.ds_sum[idx]);
                 plan.ds_sum[idx] = VK_NULL_HANDLE;
+            }
+            if (idx < plan.relay_ds.size() && plan.relay_ds[idx] != VK_NULL_HANDLE && r.desc_pool != VK_NULL_HANDLE) {
+                vkFreeDescriptorSets(r.vkdev, r.desc_pool, 1, &plan.relay_ds[idx]);
+                plan.relay_ds[idx] = VK_NULL_HANDLE;
             }
         }
         plan.owners.clear();
@@ -722,7 +744,9 @@ static bool tp5_create_shader_module(VkDevice dev,
     return vkCreateShaderModule(dev, &ci, nullptr, out) == VK_SUCCESS;
 }
 
-bool tp5_alloc_host_visible_buffer(tp5_rank & r, VkDeviceSize size, VkBuffer & buf, VkDeviceMemory & mem, void ** mapped) {
+bool tp5_alloc_host_visible_buffer(tp5_rank & r, VkDeviceSize size, VkBuffer & buf, VkDeviceMemory & mem, void ** mapped,
+                                  VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                  uint32_t * memory_type = nullptr) {
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = size;
     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -733,8 +757,7 @@ bool tp5_alloc_host_visible_buffer(tp5_rank & r, VkDeviceSize size, VkBuffer & b
     vkGetBufferMemoryRequirements(r.vkdev, buf, &req);
     VkPhysicalDeviceMemoryProperties props{};
     ggml_vk_tp5_mem_props(r.device, &props);
-    uint32_t mt = find_memory_type(props, req.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    uint32_t mt = find_memory_type(props, req.memoryTypeBits, required);
     if (mt == UINT32_MAX) {
         vkDestroyBuffer(r.vkdev, buf, nullptr);
         buf = VK_NULL_HANDLE;
@@ -766,6 +789,7 @@ bool tp5_alloc_host_visible_buffer(tp5_rank & r, VkDeviceSize size, VkBuffer & b
         }
         *mapped = ptr;
     }
+    if (memory_type) *memory_type = mt;
     return true;
 }
 
@@ -894,7 +918,7 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
         if (!ok) return false;
     }
 
-    if (c.sync_mode == tp5_sync_mode::STAR) {
+    if (c.sync_mode == tp5_sync_mode::STAR || c.sync_mode == tp5_sync_mode::RELAY) {
         struct {
             uint64_t src_bda_addr;
             uint64_t dst_bda_addr;
@@ -925,10 +949,41 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
         if (!ok) return false;
     }
 
+    if (c.sync_mode == tp5_sync_mode::RELAY) {
+        VkDescriptorSetLayoutBinding rb[2] = {
+            {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        };
+        VkDescriptorSetLayoutCreateInfo rdci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        rdci.bindingCount = 2;
+        rdci.pBindings = rb;
+        if (vkCreateDescriptorSetLayout(r.vkdev, &rdci, nullptr, &r.relay_copy_dsl) != VK_SUCCESS) return false;
+        VkPushConstantRange rpc{VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+        VkPipelineLayoutCreateInfo rlci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        rlci.setLayoutCount = 1;
+        rlci.pSetLayouts = &r.relay_copy_dsl;
+        rlci.pushConstantRangeCount = 1;
+        rlci.pPushConstantRanges = &rpc;
+        if (vkCreatePipelineLayout(r.vkdev, &rlci, nullptr, &r.relay_copy_layout) != VK_SUCCESS) return false;
+        VkShaderModule relay_mod = VK_NULL_HANDLE;
+        if (!tp5_create_shader_module(r.vkdev, tp5_relay_copy_f32_data, tp5_relay_copy_f32_len, &relay_mod)) return false;
+        VkComputePipelineCreateInfo relay_ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        relay_ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        relay_ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        relay_ci.stage.module = relay_mod;
+        relay_ci.stage.pName = "main";
+        relay_ci.layout = r.relay_copy_layout;
+        ok = vkCreateComputePipelines(r.vkdev, VK_NULL_HANDLE, 1, &relay_ci, nullptr, &r.relay_copy_pipe) == VK_SUCCESS;
+        vkDestroyShaderModule(r.vkdev, relay_mod, nullptr);
+        if (!ok) return false;
+    }
+
     // Two sum sets plus one pack set per cached binding; reserve one temporary
     // plan as well. The SUM/pack layout contains one input descriptor per rank.
     const uint32_t             plan_capacity = tp5_comm::MAX_CACHED_PLANS + 1;
-    const uint32_t             sets_per_plan = TP5_MAILBOX_BANKS * 2 + 1 + (c.sync_mode == tp5_sync_mode::GPUFLAG ? 1 : 0);
+    const uint32_t             sets_per_plan = TP5_MAILBOX_BANKS * 2 + 1 +
+                                               (c.sync_mode == tp5_sync_mode::GPUFLAG ? 1 : 0) +
+                                               (c.sync_mode == tp5_sync_mode::RELAY ? TP5_MAILBOX_BANKS : 0);
     VkDescriptorPoolSize       ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                              plan_capacity * (std::max(uint32_t(c.n_ranks + 3), 12u) * sets_per_plan +
                                               (c.sync_mode == tp5_sync_mode::GPUFLAG ? 5 : 0)) };
@@ -1418,12 +1473,15 @@ void tp5_destroy_rank(tp5_rank & r) {
     if (r.pack_pipe) { vkDestroyPipeline(r.vkdev, r.pack_pipe, nullptr); r.pack_pipe = VK_NULL_HANDLE; }
     if (r.flag_pipe) { vkDestroyPipeline(r.vkdev, r.flag_pipe, nullptr); r.flag_pipe = VK_NULL_HANDLE; }
     if (r.push_pipe) { vkDestroyPipeline(r.vkdev, r.push_pipe, nullptr); r.push_pipe = VK_NULL_HANDLE; }
+    if (r.relay_copy_pipe) { vkDestroyPipeline(r.vkdev, r.relay_copy_pipe, nullptr); r.relay_copy_pipe = VK_NULL_HANDLE; }
     if (r.pipe_layout) { vkDestroyPipelineLayout(r.vkdev, r.pipe_layout, nullptr); r.pipe_layout = VK_NULL_HANDLE; }
     if (r.flag_pipe_layout) { vkDestroyPipelineLayout(r.vkdev, r.flag_pipe_layout, nullptr); r.flag_pipe_layout = VK_NULL_HANDLE; }
     if (r.push_layout) { vkDestroyPipelineLayout(r.vkdev, r.push_layout, nullptr); r.push_layout = VK_NULL_HANDLE; }
+    if (r.relay_copy_layout) { vkDestroyPipelineLayout(r.vkdev, r.relay_copy_layout, nullptr); r.relay_copy_layout = VK_NULL_HANDLE; }
     if (r.dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.dsl, nullptr); r.dsl = VK_NULL_HANDLE; }
     if (r.flag_dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.flag_dsl, nullptr); r.flag_dsl = VK_NULL_HANDLE; }
     if (r.push_dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.push_dsl, nullptr); r.push_dsl = VK_NULL_HANDLE; }
+    if (r.relay_copy_dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.relay_copy_dsl, nullptr); r.relay_copy_dsl = VK_NULL_HANDLE; }
     if (r.desc_pool) { vkDestroyDescriptorPool(r.vkdev, r.desc_pool, nullptr); r.desc_pool = VK_NULL_HANDLE; }
     if (r.cmd_pool) { vkDestroyCommandPool(r.vkdev, r.cmd_pool, nullptr); r.cmd_pool = VK_NULL_HANDLE; }
 
@@ -1460,6 +1518,10 @@ void tp5_destroy_rank(tp5_rank & r) {
     if (r.bda_push_pipe) { vkDestroyPipeline(r.vkdev, r.bda_push_pipe, nullptr); r.bda_push_pipe = VK_NULL_HANDLE; }
     if (r.bda_push_layout) { vkDestroyPipelineLayout(r.vkdev, r.bda_push_layout, nullptr); r.bda_push_layout = VK_NULL_HANDLE; }
     if (r.bda_push_dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.bda_push_dsl, nullptr); r.bda_push_dsl = VK_NULL_HANDLE; }
+    if (r.relay_copy_pipe) { vkDestroyPipeline(r.vkdev, r.relay_copy_pipe, nullptr); r.relay_copy_pipe = VK_NULL_HANDLE; }
+    if (r.relay_copy_layout) { vkDestroyPipelineLayout(r.vkdev, r.relay_copy_layout, nullptr); r.relay_copy_layout = VK_NULL_HANDLE; }
+    if (r.relay_copy_dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.relay_copy_dsl, nullptr); r.relay_copy_dsl = VK_NULL_HANDLE; }
+
 }
 
 bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
@@ -1489,7 +1551,7 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
         }
     } else if (c.sync_mode == tp5_sync_mode::GPUFLAG) {
         tp5_gpuflag_drain_all(c);
-    } else if (c.sync_mode == tp5_sync_mode::STAR) {
+    } else if (c.sync_mode == tp5_sync_mode::STAR || c.sync_mode == tp5_sync_mode::RELAY) {
         for (auto & r : c.ranks) {
             if (r.vkdev) vkDeviceWaitIdle(r.vkdev);
         }
@@ -1497,18 +1559,28 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
     c.clear_cached_plans();
     if (c.failed) return false;
     c.workspace_gen++;
+    for (bool & used : c.relay_bank_used) used = false;
 
-    if (c.sync_mode == tp5_sync_mode::STAR) {
+    if (c.sync_mode == tp5_sync_mode::STAR || c.sync_mode == tp5_sync_mode::RELAY) {
         const size_t page_size = 4096;
-        const size_t max_chain_stages = 128;
-        const size_t rank_stride = ((max_elems * sizeof(float) + page_size - 1) / page_size) * page_size;
+        const size_t rank_stride = ((max_elems * sizeof(float) + 64 + page_size - 1) / page_size) * page_size;
         const size_t stage_stride = (c.n_ranks + 1) * rank_stride;
-        const size_t total_host_size = max_chain_stages * stage_stride;
-        const size_t total_bcast_size = max_chain_stages * rank_stride;
+        // Stages reuse two banks; no command addresses a stage-indexed slot.
+        // Importing 128 unused copies makes amdgpu walk that entire USERPTR
+        // range at every submit, especially after prefill grows the workspace.
+        const size_t total_host_size = stage_stride;
+        const size_t total_bcast_size = rank_stride;
         c.star_rank_stride = rank_stride;
         c.star_host_alloc_size = total_host_size;
 
         for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
+            // Imported memory must be released before its backing host pages.
+            for (auto & r : c.ranks) {
+                if (r.host_import_buf[b]) vkDestroyBuffer(r.vkdev, r.host_import_buf[b], nullptr);
+                if (r.host_import_mem[b]) vkFreeMemory(r.vkdev, r.host_import_mem[b], nullptr);
+                r.host_import_buf[b] = VK_NULL_HANDLE;
+                r.host_import_mem[b] = VK_NULL_HANDLE;
+            }
             if (c.star_host_raw[b]) {
                 free(c.star_host_raw[b]);
                 c.star_host_raw[b] = nullptr;
@@ -1535,7 +1607,7 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
                     vkFreeMemory(r.vkdev, r.host_import_mem[b], nullptr);
                     r.host_import_mem[b] = VK_NULL_HANDLE;
                 }
-                if (!tp5_alloc_host_import_buffer(r, ptr, total_alloc_size,
+                if (!tp5_alloc_host_import_buffer(r, (char *) ptr + i * rank_stride, rank_stride,
                                                   r.host_import_buf[b], r.host_import_mem[b], r.bda_addr[b])) {
                     c.fail("alloc_host_import_buffer failed on rank " + std::to_string(i));
                     return false;
@@ -1553,7 +1625,12 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
                     vkFreeMemory(r.vkdev, r.bcast_mem[b], nullptr);
                     r.bcast_mem[b] = VK_NULL_HANDLE;
                 }
-                if (!tp5_alloc_host_visible_buffer(r, total_bcast_size, r.bcast_buf[b], r.bcast_mem[b], &r.bcast_host[b])) {
+                const VkMemoryPropertyFlags relay_memory = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                    VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD | VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
+                if (!tp5_alloc_host_visible_buffer(r, total_bcast_size, r.bcast_buf[b], r.bcast_mem[b], &r.bcast_host[b],
+                                                   c.sync_mode == tp5_sync_mode::RELAY ? relay_memory :
+                                                   (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))) {
                     c.fail("alloc_host_visible_buffer failed for bcast_buf on rank " + std::to_string(i));
                     return false;
                 }
@@ -1564,7 +1641,7 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
             if (r.wire_buf) { vkDestroyBuffer(r.vkdev, r.wire_buf, nullptr); r.wire_buf = VK_NULL_HANDLE; }
             if (r.wire_mem) { vkFreeMemory(r.vkdev, r.wire_mem, nullptr); r.wire_mem = VK_NULL_HANDLE; }
             r.wire_bda = 0;
-            const size_t total_wire_size = (c.sync_mode == tp5_sync_mode::STAR) ? (max_chain_stages * rank_stride) : rank_stride;
+            const size_t total_wire_size = rank_stride;
             if (!tp5_alloc_device_buffer(r, total_wire_size,
                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                     false, r.wire_buf, r.wire_mem, nullptr)) {
@@ -1583,6 +1660,11 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
                 r.wire_bda = vkGetBufferDeviceAddressKHR(r.vkdev, &dai);
             }
         }
+        // STAR never reads a peer VRAM mailbox. With BDA enabled, RADV's
+        // global BO list would nevertheless include those unused imports and
+        // introduce inter-rank reservation dependencies on every submission.
+        c.max_elems = max_elems;
+        return true;
     }
 
     const VkDeviceSize wire_bytes = (VkDeviceSize) max_elems * wire_b;
@@ -1972,7 +2054,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     return false;
                 }
 
-                if (c.sync_mode == tp5_sync_mode::STAR) {
+                if (c.sync_mode == tp5_sync_mode::STAR || c.sync_mode == tp5_sync_mode::RELAY) {
                     VkMemoryBarrier mb_pre{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                                             VK_ACCESS_SHADER_WRITE_BIT,
                                             VK_ACCESS_SHADER_READ_BIT };
@@ -1988,7 +2070,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                                                      has_packed ? trefs[i].packed_buf : trefs[i].buf};
                         stage_bda_src = pfn_bda(r.vkdev, &dai) + (has_packed ? trefs[i].packed_offset : trefs[i].offset);
                     }
-                    uint64_t dst_bda = r.bda_addr[b] + i * c.star_rank_stride;
+                    uint64_t dst_bda = r.bda_addr[b];
                     uint32_t n_vec4 = (uint32_t)(n_elems / 4);
                     uint64_t flag_bda = dst_bda + c.star_rank_stride - 64;
 
@@ -2001,10 +2083,10 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                         uint32_t rank_idx;
                         uint32_t seq_val;
                         uint32_t mode;
-                    } bda_pc{stage_bda_src, dst_bda, flag_bda, n_vec4, (uint32_t)i, 1u, 0u};
+                    } bda_pc{stage_bda_src, dst_bda, flag_bda, n_vec4, (uint32_t)n_elems, 1u, 0u};
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.bda_push_pipe);
                     vkCmdPushConstants(cmd, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc), &bda_pc);
-                    vkCmdDispatch(cmd, (n_vec4 + 63) / 64, 1, 1);
+                    vkCmdDispatch(cmd, (uint32_t)(n_elems + 255) / 256, 1, 1);
 
                     // Hardware Pipeline Barrier: Enforces complete cache drain and PCIe visibility before flag write
                     VkMemoryBarrier mb_host{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
@@ -2165,6 +2247,9 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
     plan.p1 = p1_res;
     plan.cmd_p2.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
     plan.ds_sum.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
+    if (c.sync_mode == tp5_sync_mode::RELAY) {
+        plan.relay_ds.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
+    }
 
     // Allocate per-plan Phase 2 command buffers and descriptor sets (2 mailbox banks × n_ranks)
     for (size_t i = 0; i < c.n_ranks; ++i) {
@@ -2188,6 +2273,16 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                 c.fail("allocation of sum descriptor set failed on rank " + std::to_string(i));
                 return false;
             }
+            if (c.sync_mode == tp5_sync_mode::RELAY) {
+                VkDescriptorSetAllocateInfo relay_ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+                relay_ai.descriptorPool = r.desc_pool;
+                relay_ai.descriptorSetCount = 1;
+                relay_ai.pSetLayouts = &r.relay_copy_dsl;
+                if (vkAllocateDescriptorSets(r.vkdev, &relay_ai, &plan.relay_ds[idx]) != VK_SUCCESS) {
+                    c.fail("allocation of RELAY descriptor set failed on rank " + std::to_string(i));
+                    return false;
+                }
+            }
         }
     }
 
@@ -2204,15 +2299,45 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                 return false;
             }
 
-            if (c.sync_mode == tp5_sync_mode::STAR) {
-                const size_t bcast_bytes = (c.wire == tp5_wire_type::F32) ? tensor_bytes : payload;
-                VkBufferCopy cp{ 0, trefs[i].offset, bcast_bytes };
-                vkCmdCopyBuffer(cmd, r.bcast_buf[b], trefs[i].buf, 1, &cp);
-                VkMemoryBarrier mb_post{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-                                         VK_ACCESS_TRANSFER_WRITE_BIT,
-                                         VK_ACCESS_SHADER_READ_BIT };
-                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_post, 0, nullptr, 0, nullptr);
+            if (c.sync_mode == tp5_sync_mode::STAR || c.sync_mode == tp5_sync_mode::RELAY) {
+                const size_t bcast_bytes = tensor_bytes; // CPU accumulation produces F32, regardless of wire type.
+                if (c.sync_mode == tp5_sync_mode::RELAY) {
+                    VkDescriptorBufferInfo src_info{r.bcast_buf[b], 0, c.star_rank_stride};
+                    VkDescriptorBufferInfo dst_info{trefs[i].buf, trefs[i].offset, tensor_bytes};
+                    VkWriteDescriptorSet writes[2]{};
+                    for (uint32_t w = 0; w < 2; ++w) {
+                        writes[w].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                        writes[w].dstSet = plan.relay_ds[idx];
+                        writes[w].dstBinding = w;
+                        writes[w].descriptorCount = 1;
+                        writes[w].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    }
+                    writes[0].pBufferInfo = &src_info;
+                    writes[1].pBufferInfo = &dst_info;
+                    vkUpdateDescriptorSets(r.vkdev, 2, writes, 0, nullptr);
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.relay_copy_pipe);
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.relay_copy_layout, 0, 1,
+                                            &plan.relay_ds[idx], 0, nullptr);
+                    struct { uint64_t status_bda; uint32_t n_elems; uint32_t seq; uint32_t spin_max;
+                             uint32_t dst_offset_words; uint32_t reserved0; uint32_t reserved1; } relay_pc{
+                        r.bda_addr[b] + c.star_rank_stride - 64, (uint32_t)n_elems, 1u, c.spin_max,
+                        0u, 0u, 0u};
+                    vkCmdPushConstants(cmd, r.relay_copy_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                       sizeof(relay_pc), &relay_pc);
+                    vkCmdDispatch(cmd, 1, 1, 1);
+                    VkMemoryBarrier mb_post{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_post, 0, nullptr, 0, nullptr);
+                } else {
+                    VkBufferCopy cp{ 0, trefs[i].offset, bcast_bytes };
+                    vkCmdCopyBuffer(cmd, r.bcast_buf[b], trefs[i].buf, 1, &cp);
+                    VkMemoryBarrier mb_post{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                             VK_ACCESS_TRANSFER_WRITE_BIT,
+                                             VK_ACCESS_SHADER_READ_BIT };
+                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_post, 0, nullptr, 0, nullptr);
+                }
                 if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
                     c.fail("end cmd_p2 star failed on rank " + std::to_string(i));
                     return false;
@@ -2421,6 +2546,21 @@ static bool tp5_gpuflag_drain_all(tp5_comm & c) {
 // Two-Stage Mesh AllReduce: Proven Hardware Synchronization
 // ===========================================================================
 
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+__attribute__((target("avx2,f16c")))
+static size_t tp5_star_sum_avx2(const void * const * ranks, float * dst, size_t begin, size_t end) {
+    size_t i = begin;
+    for (; i + 8 <= end; i += 8) {
+        __m256 sum = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) ((const uint16_t *) ranks[0] + i)));
+        for (size_t r = 1; r < 5; ++r) {
+            sum = _mm256_add_ps(sum, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *) ((const uint16_t *) ranks[r] + i))));
+        }
+        _mm256_storeu_ps(dst + i, sum);
+    }
+    return i;
+}
+#endif
+
 static void tp5_avx2_accumulate_star(const void * const * rank_ptrs, void * dst_ptr, size_t n_elems,
                                      size_t worker_id, size_t num_workers, bool out_f32) {
     // 22-core AVX2 accumulation over 5 GPU rank input buffers into dst_ptr
@@ -2439,6 +2579,11 @@ static void tp5_avx2_accumulate_star(const void * const * rank_ptrs, void * dst_
     float * dst32 = (float *) dst_ptr;
 
     size_t i = start;
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+    if (out_f32 && __builtin_cpu_supports("avx2") && __builtin_cpu_supports("f16c")) {
+        i = tp5_star_sum_avx2(rank_ptrs, dst32, i, end);
+    }
+#endif
 #if defined(__AVX2__) && defined(__F16C__)
     for (; i + 8 <= end; i += 8) {
         __m256 v0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(r0 + i)));
@@ -2447,7 +2592,7 @@ static void tp5_avx2_accumulate_star(const void * const * rank_ptrs, void * dst_
         __m256 v3 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(r3 + i)));
         __m256 v4 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(r4 + i)));
 
-        __m256 sum = _mm256_add_ps(_mm256_add_ps(v0, v1), _mm256_add_ps(v2, v3));
+        __m256 sum = _mm256_add_ps(_mm256_add_ps(_mm256_add_ps(v0, v1), v2), v3);
         sum = _mm256_add_ps(sum, v4);
 
         if (out_f32) {
@@ -2470,7 +2615,258 @@ static void tp5_avx2_accumulate_star(const void * const * rank_ptrs, void * dst_
     }
 }
 
+struct tp5_star_times {
+    double wait_us = 0;
+    double sum_us = 0;
+    double broadcast_us = 0;
+};
+
+static bool tp5_relay_prepare_bank(tp5_comm & c, size_t bank) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (size_t i = 0; i < c.n_ranks; ++i) {
+        auto * status = (volatile uint32_t *) ((char *) c.star_host_aligned[bank] + i * c.star_rank_stride +
+                                               c.star_rank_stride - 64);
+        const uint32_t previous = status[1];
+        if (status[2] != 0u) {
+            c.fail("RELAY previous GPU wait failed on rank " + std::to_string(i));
+            return false;
+        }
+        if (previous == 0u) {
+            if (status[3] != 0u) {
+                c.fail("RELAY stale completion on rank " + std::to_string(i));
+                return false;
+            }
+            continue;
+        }
+        while (status[3] != previous) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                c.fail("RELAY mailbox bank reuse timeout on rank " + std::to_string(i));
+                return false;
+            }
+#if defined(__x86_64__) || defined(_M_X64)
+            _mm_pause();
+#endif
+        }
+        status[1] = 0u;
+        status[2] = 0u;
+        status[3] = 0u;
+    }
+    c.relay_bank_used[bank] = false;
+    return true;
+}
+
+static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star_times * times = nullptr,
+                             bool relay = false) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::seconds(2);
+    const void * rank_ptrs[5];
+    for (size_t i = 0; i < c.n_ranks; ++i) {
+        rank_ptrs[i] = (const char *) c.star_host_aligned[bank] + i * c.star_rank_stride;
+        auto * flag = (volatile uint32_t *) ((char *) c.star_host_aligned[bank] +
+                                            (i + 1) * c.star_rank_stride - 64);
+        for (uint64_t spin = 0; *flag != 1; ++spin) {
+            if ((spin & 1023) == 0 && std::chrono::steady_clock::now() >= deadline) {
+                c.fail("STAR payload timeout on rank " + std::to_string(i));
+                if (getenv("GGML_TP5_RELAY_DEBUG")) {
+                    const auto * status = (const volatile uint32_t *) ((const char *) c.star_host_aligned[bank] +
+                                                                         i * c.star_rank_stride + c.star_rank_stride - 64);
+                    fprintf(stderr, "[tp5-relay-debug] payload-timeout bank=%zu rank=%zu flag=%u status=[%u,%u,%u,%u]\n",
+                            bank, i, *flag, status[0], status[1], status[2], status[3]);
+                }
+                return false;
+            }
+#if defined(__x86_64__) || defined(_M_X64)
+            _mm_pause();
+#endif
+        }
+        *flag = 0;
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const auto ready = std::chrono::steady_clock::now();
+    void * sum = (char *) c.star_host_aligned[bank] + 5 * c.star_rank_stride;
+    // Decode payloads fit in L1/L2; waking 22 workers costs more than the sum.
+    const bool out_f32 = true;
+    if (c.avx2_pool && n_elems >= 262144) {
+        if (!c.avx2_pool->parallel_for([&](size_t id, size_t count) {
+                tp5_avx2_accumulate_star(rank_ptrs, sum, n_elems, id, count, out_f32);
+            })) {
+            c.fail("STAR CPU reduction timeout");
+            return false;
+        }
+    } else {
+        tp5_avx2_accumulate_star(rank_ptrs, sum, n_elems, 0, 1, out_f32);
+    }
+    const auto reduced = std::chrono::steady_clock::now();
+    const size_t bcast_bytes = n_elems * sizeof(float);
+    for (size_t i = 0; i < c.n_ranks; ++i) {
+        std::memcpy((char *) c.ranks[i].bcast_host[bank] + (relay ? 64 : 0), sum, bcast_bytes);
+        if (relay) {
+            ((volatile uint32_t *) c.ranks[i].bcast_host[bank])[0] = 0;
+        }
+    }
+#if defined(__x86_64__) || defined(_M_X64)
+    _mm_sfence(); // Publish write-combined VRAM stores before the next queue submit.
+#endif
+    if (relay) {
+        // Host-coherent is not a substitute for a device memory-domain flush;
+        // explicitly publish payload before the doorbell on every VkDevice.
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+            range.memory = c.ranks[i].bcast_mem[bank];
+            range.offset = 0;
+            range.size = VK_WHOLE_SIZE;
+            if (vkFlushMappedMemoryRanges(c.ranks[i].vkdev, 1, &range) != VK_SUCCESS) {
+                c.fail("RELAY host payload flush failed on rank " + std::to_string(i));
+                return false;
+            }
+            const auto * status = (volatile uint32_t *) ((char *) c.star_host_aligned[bank] + i * c.star_rank_stride +
+                                                         c.star_rank_stride - 64);
+            const uint32_t seq = status[1];
+            if (seq == 0u) {
+                c.fail("RELAY missing epoch on rank " + std::to_string(i));
+                return false;
+            }
+            ((volatile uint32_t *) c.ranks[i].bcast_host[bank])[0] = seq;
+            if (vkFlushMappedMemoryRanges(c.ranks[i].vkdev, 1, &range) != VK_SUCCESS) {
+                c.fail("RELAY doorbell flush failed on rank " + std::to_string(i));
+                return false;
+            }
+        }
+        c.relay_bank_used[bank] = true;
+    }
+    if (times) {
+        times->wait_us = std::chrono::duration<double, std::micro>(ready - start).count();
+        times->sum_us = std::chrono::duration<double, std::micro>(reduced - ready).count();
+        times->broadcast_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - reduced).count();
+    }
+    return true;
+}
+
+static bool tp5_relay_wait_epoch(tp5_comm & c, uint64_t epoch) {
+    const size_t bank = tp5_mailbox_bank(epoch);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    for (size_t i = 0; i < c.n_ranks; ++i) {
+        auto * status = (volatile uint32_t *) ((char *) c.star_host_aligned[bank] + i * c.star_rank_stride +
+                                               c.star_rank_stride - 64);
+        while (status[3] != (uint32_t) epoch) {
+            if (status[2] != 0u) {
+                c.fail("RELAY GPU wait timeout on rank " + std::to_string(i) +
+                       " (epoch=" + std::to_string(epoch) + ", error=" + std::to_string(status[2]) + ")");
+                return false;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                c.fail("RELAY completion timeout on rank " + std::to_string(i) +
+                       " (epoch=" + std::to_string(epoch) + ", expected=" + std::to_string(status[1]) +
+                       ", done=" + std::to_string(status[3]) + ")");
+                return false;
+            }
+#if defined(__x86_64__) || defined(_M_X64)
+            _mm_pause();
+#endif
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+    }
+    return true;
+}
+
+static bool tp5_relay_submit_commands(tp5_comm & c, size_t rank, const std::vector<VkCommandBuffer> & commands,
+                                      uint64_t signal_value) {
+    if (commands.empty()) return true;
+    tp5_rank & r = c.ranks[rank];
+    VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    timeline.signalSemaphoreValueCount = 1;
+    timeline.pSignalSemaphoreValues = &signal_value;
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.pNext = &timeline;
+    submit.commandBufferCount = (uint32_t) commands.size();
+    submit.pCommandBuffers = commands.data();
+    submit.signalSemaphoreCount = 1;
+    submit.pSignalSemaphores = &r.timeline_sem;
+    if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+        ++prof->queue_submits;
+        ++prof->submit_batches;
+    }
+    if (vkQueueSubmit(r.queue, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS) {
+        c.fail("RELAY epoch chain submit failed on rank " + std::to_string(rank));
+        return false;
+    }
+    ggml_vk_tp5_mark_queue_submitted(c.backends[rank]);
+    return true;
+}
+
+static bool tp5_relay_submit_epoch_chain(
+        tp5_comm & c, const std::vector<std::vector<std::vector<void *>>> & stage_compute_cbs,
+        const std::vector<tp5_plan_key> & keys, size_t n_stages) {
+    // Submit compute/P1, publish its host payload, then submit P2.  A P2
+    // command is never resident before its matching doorbell: on RADV a
+    // bounded shader wait can otherwise expire before the host handoff.
+    for (size_t s = 0; s < n_stages; ++s) {
+        const uint64_t epoch = c.allreduce_calls + s + 1;
+        const size_t bank = tp5_mailbox_bank(epoch);
+        if (!tp5_relay_prepare_bank(c, bank)) return false;
+
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            auto * status = (volatile uint32_t *) ((char *) c.star_host_aligned[bank] +
+                                                   i * c.star_rank_stride + c.star_rank_stride - 64);
+            status[1] = (uint32_t) epoch;
+            status[2] = 0u;
+            status[3] = 0u;
+        }
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_sfence();
+#endif
+
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            std::vector<VkCommandBuffer> commands;
+            const size_t first_compute =
+                s > 0 && c.cached_plans[c.chain_plan_indices[s - 1]].key.hc[i].width ? 1 : 0;
+            for (size_t cb = first_compute; cb < stage_compute_cbs[s][i].size(); ++cb) {
+                commands.push_back((VkCommandBuffer) stage_compute_cbs[s][i][cb]);
+            }
+            const auto & plan = c.cached_plans[c.chain_plan_indices[s]];
+            commands.push_back(plan.p1->cmd_p1[tp5_plan_slot(i, bank)]);
+            if (!tp5_relay_submit_commands(c, i, commands, 2 * epoch - 1)) return false;
+        }
+
+        tp5_star_times step;
+        if (!tp5_star_handoff(c, bank, keys[s].n_elems, &step, true)) {
+            fprintf(stderr, "[tp5-relay-chain] handoff failed stage=%zu epoch=%llu bank=%zu status:",
+                    s, (unsigned long long) epoch, bank);
+            for (size_t i = 0; i < c.n_ranks; ++i) {
+                const auto * status = (const volatile uint32_t *) ((const char *) c.star_host_aligned[bank] +
+                                                                     i * c.star_rank_stride + c.star_rank_stride - 64);
+                fprintf(stderr, " r%zu=[%u,%u,%u,%u]", i, status[0], status[1], status[2], status[3]);
+            }
+            if (s > 0) {
+                const size_t previous_bank = tp5_mailbox_bank(epoch - 1);
+                fprintf(stderr, " previous_bank=%zu", previous_bank);
+                for (size_t i = 0; i < c.n_ranks; ++i) {
+                    const auto * status = (const volatile uint32_t *) ((const char *) c.star_host_aligned[previous_bank] +
+                                                                         i * c.star_rank_stride + c.star_rank_stride - 64);
+                    fprintf(stderr, " r%zu=[%u,%u,%u,%u,%u]", i, status[0], status[1], status[2], status[3], status[4]);
+                }
+            }
+            fputc('\n', stderr);
+            return false;
+        }
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            const auto & plan = c.cached_plans[c.chain_plan_indices[s]];
+            std::vector<VkCommandBuffer> commands{plan.cmd_p2[tp5_plan_slot(i, bank)]};
+            if (s + 1 == n_stages) {
+        const size_t first_tail = plan.key.hc[i].width ? 1 : 0;
+        for (size_t cb = first_tail; cb < stage_compute_cbs.back()[i].size(); ++cb) {
+            commands.push_back((VkCommandBuffer) stage_compute_cbs.back()[i][cb]);
+        }
+    }
+            if (!tp5_relay_submit_commands(c, i, commands, 2 * epoch)) return false;
+        }
+    }
+    c.allreduce_calls += n_stages;
+    return true;
+}
+
 bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
+
     // Executes the 6-Pillar Star AllReduce:
     // Pillar 1: GPU BDA upstream push -> GPU writes directly to host-imported RAM
     // Pillar 2: DRM Syncobj wait -> Host waits for all ranks' Phase 1 timeline signal
@@ -2595,7 +2991,7 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                                      0, 1, &mb_pre, 0, nullptr, 0, nullptr);
 
                 uint64_t stage_bda_src = ggml_vk_tp5_get_tensor_bda(tensors[i]);
-                uint64_t dst_bda = r.bda_addr[b] + i * c.star_rank_stride;
+                uint64_t dst_bda = r.bda_addr[b];
                 vkCmdBindPipeline(cmd_p1, VK_PIPELINE_BIND_POINT_COMPUTE, r.bda_push_pipe);
 
                 uint32_t n_vec4 = (uint32_t)(n_elems / 4);
@@ -2610,10 +3006,10 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                     uint32_t rank_idx;
                     uint32_t seq_val;
                     uint32_t mode;
-                } bda_pc{stage_bda_src, dst_bda, flag_bda, n_vec4, (uint32_t)i, 1u, 0u};
+                } bda_pc{stage_bda_src, dst_bda, flag_bda, n_vec4, (uint32_t)n_elems, 1u, 0u};
                 vkCmdBindPipeline(cmd_p1, VK_PIPELINE_BIND_POINT_COMPUTE, r.bda_push_pipe);
                 vkCmdPushConstants(cmd_p1, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc), &bda_pc);
-                vkCmdDispatch(cmd_p1, (n_vec4 + 63) / 64, 1, 1);
+                vkCmdDispatch(cmd_p1, (uint32_t)(n_elems + 255) / 256, 1, 1);
 
                 // Hardware Pipeline Barrier: Enforces complete cache drain and PCIe visibility before flag write
                 VkMemoryBarrier mb_host{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
@@ -2655,7 +3051,8 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                 VkMemoryBarrier mb_post{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                                          VK_ACCESS_TRANSFER_WRITE_BIT,
                                          VK_ACCESS_SHADER_READ_BIT };
-                vkCmdPipelineBarrier(cmd_p2, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                vkCmdPipelineBarrier(cmd_p2,
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT,
                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_post, 0, nullptr, 0, nullptr);
                 vkEndCommandBuffer(cmd_p2);
             }
@@ -2712,7 +3109,8 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
         star_submits[i].submits[1].pCommandBuffers = &star_submits[i].cmd_p2;
         star_submits[i].submits[1].signalSemaphoreCount = 1;
         star_submits[i].submits[1].pSignalSemaphores = &r.timeline_sem;
-    }    auto t_rec_done = std::chrono::high_resolution_clock::now();
+    }
+    auto t_rec_done = std::chrono::high_resolution_clock::now();
 
     auto t_sub_start = std::chrono::high_resolution_clock::now();
     for (size_t i = 0; i < c.n_ranks; ++i) {
@@ -2726,84 +3124,26 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
     auto t_sub_done = std::chrono::high_resolution_clock::now();
     auto t_after_p1 = t_sub_done;
 
-    // =========================================================================
-    // PILLAR 3: TRUE CPU L3 CACHE HARDWARE MEMORY FLAG POLLING (< 5us, 0 Syscalls)
-    // =========================================================================
-    // Persistent static toggle flag protocol: GPU always writes 1 upon BDA push completion;
-    // CPU checks for 1 and resets to 0 (two alternating banks guarantee safe recycling).
-    const uint32_t exp_seq = 1;
-    static double rank_wait_us[5] = {0};
-    for (size_t i = 0; i < c.n_ranks; ++i) {
-        auto t_w_start = std::chrono::high_resolution_clock::now();
-        volatile uint32_t * flag_ptr = (volatile uint32_t *)((char *)c.star_host_aligned[bank] + (i + 1) * c.star_rank_stride - 64);
-        uint64_t spin_cnt = 0;
-        while (*flag_ptr != exp_seq) {
-#if defined(__x86_64__) || defined(_M_X64)
-            _mm_pause();
-#endif
-            if (++spin_cnt > 200000000ULL) {
-                fprintf(stderr, "SPIN_TIMEOUT step: rank %zu ptr=%p val=%u exp=%u\n", i, (void*)flag_ptr, *flag_ptr, exp_seq);
-                c.fail("allreduce_star: GPU flag timeout on rank " + std::to_string(i));
-                return false;
-            }
-        }
-        // Reset flag to 0 for the next reuse of this bank
-        *flag_ptr = 0;
-        auto t_w_done = std::chrono::high_resolution_clock::now();
-        rank_wait_us[i] += std::chrono::duration<double, std::micro>(t_w_done - t_w_start).count();
+    tp5_star_times handoff;
+    if (!tp5_star_handoff(c, bank, n_elems, &handoff)) {
+        return false;
     }
-    if (call_cnt % 96 == 95) {
-        fprintf(stderr, "  [FLAG-WAIT-PER-RANK (us)] r0=%.2f r1=%.2f r2=%.2f r3=%.2f r4=%.2f\n",
-                rank_wait_us[0] / 96.0, rank_wait_us[1] / 96.0, rank_wait_us[2] / 96.0,
-                rank_wait_us[3] / 96.0, rank_wait_us[4] / 96.0);
-        for (int k = 0; k < 5; ++k) rank_wait_us[k] = 0;
-    }
-
-    auto t_after_wait = std::chrono::high_resolution_clock::now();
-    std::atomic_thread_fence(std::memory_order_acquire);
-
-    // =========================================================================
-    // PILLAR 4: 22-CORE DEDICATED AVX2+F16C L3 CACHE DIRECT ACCUMULATION
-    // =========================================================================
-    const void * rank_ptrs[5];
-    for (size_t i = 0; i < c.n_ranks; ++i) {
-        rank_ptrs[i] = (const char *) c.star_host_aligned[bank] + i * c.star_rank_stride;
-    }
-    void * acc_out = (char *) c.star_host_aligned[bank] + 5 * c.star_rank_stride;
-
-    if (c.avx2_pool) {
-        c.avx2_pool->parallel_for([&](size_t worker_id, size_t num_workers) {
-            tp5_avx2_accumulate_star(rank_ptrs, acc_out, n_elems, worker_id, num_workers, tensors[0]->type == GGML_TYPE_F32);
-        });
-    } else {
-        tp5_avx2_accumulate_star(rank_ptrs, acc_out, n_elems, 0, 1, tensors[0]->type == GGML_TYPE_F32);
-    }
-
-    auto t_after_avx2 = std::chrono::high_resolution_clock::now();
-
-    // =========================================================================
-    // PILLAR 2: CPU ROOT COMPLEX DOWNSTREAM BROADCAST
-    // =========================================================================
-    const size_t bcast_bytes = (tensors[0]->type == GGML_TYPE_F32) ? n_elems * sizeof(float) : payload;
-    for (size_t i = 0; i < c.n_ranks; ++i) {
-        if (c.ranks[i].bcast_host[bank]) {
-            std::memcpy(c.ranks[i].bcast_host[bank], acc_out, bcast_bytes);
-        }
-    }
-    auto t_after_bcast = std::chrono::high_resolution_clock::now();
+    const auto t_after_bcast = std::chrono::high_resolution_clock::now();
 
     // =========================================================================
     // PILLAR 6: ATOMIC ASYNC SIGNAL HANDOFF (Wakes up GPU Phase 2 via timeline sem)
     // ZERO risk of GPU event hangs, completely thread-safe & monotonic!
     // =========================================================================
-    // Phase 2 Direct Launch (Zero wait semaphores, 100% hardware speed!)
-    for (size_t i = 0; i < c.n_ranks; ++i) {
-        tp5_rank & r = *star_submits[i].rk;
-        if (vkQueueSubmit(r.queue, 1, &star_submits[i].submits[1], VK_NULL_HANDLE) != VK_SUCCESS) {
-            c.fail("tp5_allreduce_star: Phase 2 submit failed on rank " + std::to_string(i));
-            return false;
+    // Phase 2 is submitted only after the CPU publishes the broadcast payload.
+    {
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            tp5_rank & r = *star_submits[i].rk;
+            if (vkQueueSubmit(r.queue, 1, &star_submits[i].submits[1], VK_NULL_HANDLE) != VK_SUCCESS) {
+                c.fail("tp5_allreduce_star: Phase 2 submit failed on rank " + std::to_string(i));
+                return false;
+            }
+            ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
         }
-        ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
     }
     auto t_after_p2 = std::chrono::high_resolution_clock::now();
 
@@ -2811,42 +3151,19 @@ bool tp5_allreduce_star(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
     acc_pure_sub_us += std::chrono::duration<double, std::micro>(t_sub_done - t_sub_start).count();
     acc_rec_us += std::chrono::duration<double, std::micro>(t_rec_done - t_rec_start).count();
     acc_p1_sub_us += std::chrono::duration<double, std::micro>(t_after_p1 - t_start).count();
-    acc_wait_us   += std::chrono::duration<double, std::micro>(t_after_wait - t_after_p1).count();
-    acc_avx2_us   += std::chrono::duration<double, std::micro>(t_after_avx2 - t_after_wait).count();
-    acc_bcast_us  += std::chrono::duration<double, std::micro>(t_after_bcast - t_after_avx2).count();
+    acc_wait_us   += handoff.wait_us;
+    acc_avx2_us   += handoff.sum_us;
+    acc_bcast_us  += handoff.broadcast_us;
     acc_p2_sub_us += std::chrono::duration<double, std::micro>(t_after_p2 - t_after_bcast).count();
     call_cnt++;
 
-    if (call_cnt % 96 == 0) {
-        const double pure_comm_us = (acc_avx2_us + acc_bcast_us) / call_cnt + (acc_p2_sub_us / call_cnt);
-        const double avg_wait = acc_wait_us / call_cnt;
-        const double bda_push_gpu_us = 2.92; // measured via VkQueryPool hardware timestamp
-        // In pure allreduce microbenchmarks (or pipelined overlap), foreground compute stall is zero.
-        const double gpu_compute_overlap = (n_elems > 2560 && avg_wait > bda_push_gpu_us) ? (avg_wait - bda_push_gpu_us) : 0.00;
-
-        fprintf(stderr, "\n================================================================================\n"
-                        "[TP5-6PILLAR ACCURATE DECOUPLED PROFILER (avg over %llu steps, elems=%zu)]\n"
-                        "  >>> PURE PHYSICAL COMMUNICATION (6-Pillar Core):\n"
-                        "      - GPU Hardware BDA Push:        %6.2f us (Measured on AMD Navi21 VkQueryPool)\n"
-                        "      - 22-Core AVX2 Sum in L3:       %6.2f us (Pillar 4 lockless pool)\n"
-                        "      - CPU Root Complex Broadcast:   %6.2f us (Pillar 2 direct VRAM store)\n"
-                        "      - Async Timeline Doorbell:      %6.2f us (Pillar 6 lockless handoff)\n"
-                        "      * TOTAL PURE TRANSPORT TIME:    %6.2f us  <--- [9us Target Met!]\n"
-                        "  >>> CPU DRIVER / SUBMIT OVERHEAD (Eliminated in submit_epoch_chain):\n"
-                        "      - Vulkan Queue Submit API:      %6.2f us\n"
-                        "      - Command Buffer Setup:         %6.2f us\n"
-                        "  >>> PRECEDING MODEL LAYER COMPUTE (GPU Foreground Work):\n"
-                        "      - Neural Net Layer Compute:     %6.2f us (Attention / GEMM in compute_ctx)\n"
-                        "================================================================================\n\n",
-                (unsigned long long)call_cnt, n_elems,
-                bda_push_gpu_us,
-                acc_avx2_us / call_cnt,
-                acc_bcast_us / call_cnt,
-                acc_p2_sub_us / call_cnt,
-                pure_comm_us + bda_push_gpu_us,
-                acc_pure_sub_us / call_cnt,
-                acc_rec_us / call_cnt,
-                gpu_compute_overlap);
+    if (call_cnt % 96 == 0 && ggml_tp5_profile_active()) {
+        fprintf(stderr, "[tp5-star-step] calls=%llu elems=%zu flush_us=%.3f record_us=%.3f "
+                        "p1_submit_us=%.3f flag_wait_us=%.3f sum_us=%.3f broadcast_us=%.3f "
+                        "p2_submit_us=%.3f (host wall times; P2 completion excluded)\n",
+                (unsigned long long) call_cnt, n_elems, acc_flush_us / call_cnt, acc_rec_us / call_cnt,
+                acc_pure_sub_us / call_cnt, acc_wait_us / call_cnt, acc_avx2_us / call_cnt,
+                acc_bcast_us / call_cnt, acc_p2_sub_us / call_cnt);
     }
 return true;
 }
@@ -2998,7 +3315,8 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
 
     // Bound retained resources independently of the two payload banks.
     const auto t_bp0 = t1;
-    if (c.sync_mode == tp5_sync_mode::TIMELINE && c.allreduce_calls >= tp5_comm::MAX_OUTSTANDING_EPOCHS) {
+    if ((c.sync_mode == tp5_sync_mode::TIMELINE || c.sync_mode == tp5_sync_mode::RELAY) &&
+        c.allreduce_calls >= tp5_comm::MAX_OUTSTANDING_EPOCHS) {
         uint64_t drain_target = c.allreduce_calls + 1 - tp5_comm::MAX_OUTSTANDING_EPOCHS;
         if (drain_target > c.last_drained_epoch) {
             if (!tp5_drain_epoch(c, drain_target)) return false;
@@ -3006,7 +3324,7 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
     }
     // Maintain ring of in-flight buffer owners: drain slot's previous epoch before reusing,
     // then retain input buffer shared_ptrs so VkBuffer/VkDeviceMemory stay alive until P2 completes.
-    if (c.sync_mode == tp5_sync_mode::TIMELINE) {
+    if (c.sync_mode == tp5_sync_mode::TIMELINE || c.sync_mode == tp5_sync_mode::RELAY) {
         size_t ring_idx = (size_t)((epoch - 1) % tp5_comm::MAX_OUTSTANDING_EPOCHS);
         auto & slot = c.in_flight_ring[ring_idx];
         if (slot.epoch > 0) {
@@ -3044,6 +3362,10 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
     }
 
     const auto t_bp1 = std::chrono::high_resolution_clock::now();
+
+    if (c.sync_mode == tp5_sync_mode::RELAY && !tp5_relay_prepare_bank(c, tp5_mailbox_bank(epoch))) {
+        return false;
+    }
 
     // Submit Phase 1 on all ranks
     const bool p1_on_transfer = false;
@@ -3139,6 +3461,32 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
     }
 
     auto t2 = std::chrono::high_resolution_clock::now();
+    bool relay_p2_submitted = false;
+    if (c.sync_mode == tp5_sync_mode::RELAY) {
+        // The relay P2 command must already be resident at its bounded local
+        // VRAM wait before the CPU publishes the reduction payload.
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            tp5_rank & r = c.ranks[i];
+            const size_t bslot = tp5_plan_slot(i, tp5_mailbox_bank(epoch));
+            auto * status = (volatile uint32_t *) ((char *) c.star_host_aligned[tp5_mailbox_bank(epoch)] +
+                                                   i * c.star_rank_stride + c.star_rank_stride - 64);
+            if (status[2] != 0u || status[3] != 0u) {
+                c.fail("RELAY mailbox status not idle on rank " + std::to_string(i) +
+                       " (epoch=" + std::to_string(epoch) + ", expected=" + std::to_string(status[1]) +
+                       ", error=" + std::to_string(status[2]) + ", done=" + std::to_string(status[3]) + ")");
+                return false;
+            }
+            status[1] = (uint32_t) epoch;
+            tp5_timeline_batch batch;
+            batch.init(r, i, c.n_ranks, epoch, false, &plan->cmd_p2[bslot], false, true);
+            if (vkQueueSubmit(r.queue, 1, &batch.submit, VK_NULL_HANDLE) != VK_SUCCESS) {
+                c.fail("RELAY pre-submitted Phase 2 failed on rank " + std::to_string(i));
+                return false;
+            }
+            ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
+        }
+        relay_p2_submitted = true;
+    }
 
     if (c.sync_mode == tp5_sync_mode::TIMELINE || c.sync_mode == tp5_sync_mode::DRM) {
         // Zero host wait, zero per-AR export/import, zero vkDeviceWaitIdle:
@@ -3205,12 +3553,19 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                 ::close(sync_fd);
             }
         }
+    } else if (c.sync_mode == tp5_sync_mode::RELAY) {
+        tp5_star_times relay_times;
+        if (!tp5_star_handoff(c, tp5_mailbox_bank(epoch), n_elems, &relay_times, true)) {
+            return false;
+        }
+        if (!tp5_relay_wait_epoch(c, epoch)) return false;
     } else if (c.sync_mode != tp5_sync_mode::GPUFLAG) {
         if (!tp5_wait_all_p1(c)) {
             GGML_ABORT("ggml-vulkan-collective: unrecoverable runtime failure: Phase 1 fence wait failed\n");
         }
     }
-    if (c.sync_mode != tp5_sync_mode::TIMELINE && c.sync_mode != tp5_sync_mode::DRM && c.sync_mode != tp5_sync_mode::GPUFLAG) {
+    if (c.sync_mode != tp5_sync_mode::TIMELINE && c.sync_mode != tp5_sync_mode::DRM &&
+        c.sync_mode != tp5_sync_mode::GPUFLAG && c.sync_mode != tp5_sync_mode::RELAY) {
     tp5_p2p_visibility_barrier(c);
     }
 
@@ -3240,6 +3595,21 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                 ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
             }
         }
+    } else if (c.sync_mode == tp5_sync_mode::RELAY && !relay_p2_submitted) {
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            tp5_rank & r = c.ranks[i];
+            const size_t bslot = tp5_plan_slot(i, tp5_mailbox_bank(epoch));
+            tp5_timeline_batch batch;
+            batch.init(r, i, c.n_ranks, epoch, false, &plan->cmd_p2[bslot], false, true);
+            if (vkQueueSubmit(r.queue, 1, &batch.submit, VK_NULL_HANDLE) != VK_SUCCESS) {
+                c.fail("RELAY Phase 2 submit failed on rank " + std::to_string(i));
+                return false;
+            }
+            ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
+        }
+    } else if (c.sync_mode == tp5_sync_mode::RELAY) {
+        // Already submitted before the CPU handoff; the bounded local-VRAM
+        // shader wait owns progression from this point.
     } else if (c.sync_mode == tp5_sync_mode::GPUFLAG) {
         size_t ring_idx = (size_t)((epoch - 1) % tp5_comm::MAX_OUTSTANDING_EPOCHS);
         for (size_t i = 0; i < c.n_ranks; ++i) {
@@ -3295,8 +3665,15 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
 
     auto t5 = std::chrono::high_resolution_clock::now();
 
+    if (c.sync_mode == tp5_sync_mode::RELAY && getenv("GGML_TP5_RELAY_DRAIN")) {
+        if (!tp5_drain_epoch(c, epoch)) {
+            c.fail("RELAY debug drain failed");
+            return false;
+        }
+    }
+
     if (!is_cached) {
-        if (c.sync_mode == tp5_sync_mode::TIMELINE) {
+        if (c.sync_mode == tp5_sync_mode::TIMELINE || c.sync_mode == tp5_sync_mode::RELAY) {
             if (!tp5_drain_epoch(c, epoch)) {
                 c.fail("one_shot plan drain failed before destruction");
                 return false;
@@ -3464,7 +3841,8 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
     if (c.failed) {
         GGML_ABORT("ggml-vulkan-collective: cannot submit on failed communicator\n");
     }
-    if ((c.sync_mode != tp5_sync_mode::TIMELINE && c.sync_mode != tp5_sync_mode::DRM && c.sync_mode != tp5_sync_mode::STAR) || !c.cmd_replay_enabled)
+    if ((c.sync_mode != tp5_sync_mode::TIMELINE && c.sync_mode != tp5_sync_mode::DRM &&
+         c.sync_mode != tp5_sync_mode::STAR && c.sync_mode != tp5_sync_mode::RELAY) || !c.cmd_replay_enabled)
         return false;
 
     const size_t n_stages = stage_tensors.size();
@@ -3521,7 +3899,7 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
                 return false;
             if (ggml_nbytes(t) > c.ranks[j].caps.max_storage_buffer_range)
                 return false;
-            if (c.wire == tp5_wire_type::F16) {
+            if (c.wire == tp5_wire_type::F16 && c.sync_mode != tp5_sync_mode::STAR && c.sync_mode != tp5_sync_mode::RELAY) {
                 uint64_t poff = 0, psize = 0;
                 if (ggml_vk_tp5_take_wire_output(c.backends[j], t, &ref.packed_buf, &poff, &psize, &ref.packed_owner)) {
                     ref.packed_offset                 = (VkDeviceSize) poff;
@@ -3542,7 +3920,7 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
             key.bindings[j]        = { ref.buf, ref.offset, ref.size };
             key.packed_bindings[j] = { ref.packed_buf, ref.packed_offset, ref.packed_size };
             const auto & consumer  = stage_compute_cbs[s + 1][j];
-            if (consumer.size() > 1) {
+            if (consumer.size() > 1 && c.sync_mode != tp5_sync_mode::STAR && c.sync_mode != tp5_sync_mode::RELAY) {
                 tp5_hc_consumer_ref(c, j, consumer.front(), ref, n_elems, key.hc[j]);
             }
             max_elems = std::max(max_elems, n_elems);
@@ -3639,9 +4017,10 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
     if (capture_requested && !capture) {
         fprintf(stderr, "[tp5-gpu-timing] capture unavailable; submitting original chain\n");
     }
-    const bool isolate_bo = c.isolate_mailbox;
+    const bool isolate_bo = c.isolate_mailbox && c.sync_mode != tp5_sync_mode::STAR && c.sync_mode != tp5_sync_mode::RELAY;
     const char * chain_cache_env   = getenv("GGML_TP5_CHAIN_CACHE");
-    const bool   allow_chain_cache = (chain_cache_env == nullptr || atoi(chain_cache_env) != 0);
+    const bool   allow_chain_cache = c.sync_mode != tp5_sync_mode::RELAY &&
+                                     (chain_cache_env == nullptr || atoi(chain_cache_env) != 0);
 
     bool can_reuse_chain =
         allow_chain_cache && !capture && c.compiled_chain.valid && c.compiled_chain.n_stages == n_stages &&
@@ -3694,7 +4073,8 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
                     return;
                 auto & batch = scratch.batches[slot];
                 batch.init(c.ranks[i], i, c.n_ranks, wait_epoch ? wait_epoch : 1, wait_epoch == 0,
-                           scratch.compute.data() + begin, c.sync_mode == tp5_sync_mode::STAR);
+                           scratch.compute.data() + begin, c.sync_mode == tp5_sync_mode::STAR,
+                           c.sync_mode == tp5_sync_mode::RELAY);
                 batch.signal                             = signal;
                 batch.timeline.signalSemaphoreValueCount = signal ? 1 : 0;
                 batch.submit.signalSemaphoreCount        = signal ? 1 : 0;
@@ -3740,7 +4120,8 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
                 // Fuse SUM(s-1) -> compute(s) -> PUSH(s). Wait for the previous
                 // ready epoch, signal the next ready epoch. P2/P1 barriers retain
                 // local RAW/WAR/WAW ordering; R=2 permits peer SUM/PUSH overlap.
-                batch.init(c.ranks[i], i, c.n_ranks, s > 0 ? epoch - 1 : epoch, s == 0, scratch.compute.data() + first, c.sync_mode == tp5_sync_mode::STAR);
+                batch.init(c.ranks[i], i, c.n_ranks, s > 0 ? epoch - 1 : epoch, s == 0, scratch.compute.data() + first,
+                           c.sync_mode == tp5_sync_mode::STAR, c.sync_mode == tp5_sync_mode::RELAY);
                 batch.signal                    = 2 * epoch - 1;
                 batch.submit.commandBufferCount = (uint32_t) (cursor - first);
                 scratch.submits.push_back(batch.submit);
@@ -3768,7 +4149,8 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
                 append_segment(2 * n_stages, final_first, cursor, last_epoch, 2 * last_epoch);
                 continue;
             }
-            final.init(c.ranks[i], i, c.n_ranks, last_epoch, false, scratch.compute.data() + final_first, c.sync_mode == tp5_sync_mode::STAR);
+            final.init(c.ranks[i], i, c.n_ranks, last_epoch, false, scratch.compute.data() + final_first,
+                       c.sync_mode == tp5_sync_mode::STAR, c.sync_mode == tp5_sync_mode::RELAY);
             final.submit.commandBufferCount = (uint32_t) (cursor - final_first);
             scratch.submits.push_back(final.submit);
         }
@@ -3785,6 +4167,7 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
             c.compiled_chain.stage_compute_cbs  = stage_compute_cbs;
         }
     }
+
     // Retain EVERY rank before submission; ring reclamation above ensures
     // these assignments cannot drop owners referenced by pending commands.
     for (size_t s = 0; s < n_stages; ++s) {
@@ -3807,87 +4190,75 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
     const auto prefix_start = capture ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (auto backend : c.backends)
         ggml_vk_tp5_flush_async(backend);
+    if (c.sync_mode == tp5_sync_mode::RELAY) {
+        if (c.allreduce_calls > c.last_drained_epoch && !tp5_drain_epoch(c, c.allreduce_calls)) {
+            return false;
+        }
+        if (!tp5_relay_submit_epoch_chain(c, stage_compute_cbs, keys, n_stages)) {
+            return false;
+        }
+        return true;
+    }
     const auto prefix_end        = capture ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     int64_t    submit_wall_us[8] = {};
+    const bool measure_submit = capture || ggml_tp5_profile_active();
+    tp5_star_times chain_handoff;
+    double signal_us = 0.0;
+    // STAR is submitted once per rank. Default STAR releases each dependent
+    // segment with the host timeline semaphore.
     for (size_t i = 0; i < c.n_ranks; ++i) {
         auto & submits = c.chain_scratch[i].submits;
         if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
             ++prof->queue_submits;
             prof->submit_batches += submits.size();
         }
-        const auto submit_start = capture ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto submit_start = measure_submit ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (vkQueueSubmit(c.ranks[i].queue, (uint32_t) submits.size(), submits.data(), VK_NULL_HANDLE) != VK_SUCCESS) {
             c.fail("epoch chain submit failed on rank " + std::to_string(i));
-            // No fallback, no fake peer signal and no wait-idle on a partial chain.
             GGML_ABORT("ggml-vulkan-collective: partially submitted epoch chain cannot continue\n");
         }
-        if (capture)
-            submit_wall_us[i] =
-                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - submit_start)
-                    .count();
+        if (measure_submit) {
+            submit_wall_us[i] += std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - submit_start).count();
+        }
         ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
     }
-    // Print only after EVERY rank was submitted, avoiding logging-induced peer starvation.
-    if (c.sync_mode == tp5_sync_mode::STAR) {
+    if (c.sync_mode == tp5_sync_mode::STAR || c.sync_mode == tp5_sync_mode::RELAY) {
         for (size_t s = 0; s < n_stages; ++s) {
-            const uint64_t stage_epoch = c.allreduce_calls + s + 1;
-            const size_t stage_bank = tp5_mailbox_bank(stage_epoch);
-            const size_t n_elems = (size_t) ggml_nelements(stage_tensors[s][0]);
-            const size_t payload = n_elems * sizeof(uint16_t);
-
-            // 1. Pure L3 Cache Flag Polling (0 IOCTLs!)
-            for (size_t i = 0; i < c.n_ranks; ++i) {
-                volatile uint32_t * flag_ptr = (volatile uint32_t *)((char *)c.star_host_aligned[stage_bank] +
-                                                                     (i + 1) * c.star_rank_stride - 64);
-                uint64_t spin_cnt = 0;
-                while (*flag_ptr != 1) {
-#if defined(__x86_64__) || defined(_M_X64)
-                    _mm_pause();
-#endif
-                    if (++spin_cnt > 200000000ULL) {
-                        c.fail("submit_epoch_chain star: L3 flag timeout on stage " + std::to_string(s) + " rank " + std::to_string(i));
-                        return false;
-                    }
+            const uint64_t epoch = c.allreduce_calls + s + 1;
+            tp5_star_times step;
+            if (!tp5_star_handoff(c, tp5_mailbox_bank(epoch), keys[s].n_elems, &step,
+                                  c.sync_mode == tp5_sync_mode::RELAY)) {
+                GGML_ABORT("ggml-vulkan-collective: relay/star chain handoff failed\n");
+            }
+            chain_handoff.wait_us += step.wait_us;
+            chain_handoff.sum_us += step.sum_us;
+            chain_handoff.broadcast_us += step.broadcast_us;
+            const auto signal_start = measure_submit ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (c.sync_mode == tp5_sync_mode::STAR) for (size_t i = 0; i < c.n_ranks; ++i) {
+                auto & rank = c.ranks[i];
+                if (!rank.pfn_signal_semaphore || rank.host_ready_sem == VK_NULL_HANDLE) {
+                    c.fail("STAR host timeline signal unavailable on rank " + std::to_string(i));
+                    GGML_ABORT("ggml-vulkan-collective: STAR host signal unavailable\n");
                 }
-                // Atomically clear both 32-bit flag and 32-bit atomic counter in one 64-bit zero store!
-                volatile uint64_t * flag_and_counter = (volatile uint64_t *)flag_ptr;
-                *flag_and_counter = 0;
-            }
-            std::atomic_thread_fence(std::memory_order_acquire);
-
-            // 2. 22-Core AVX2 Sum in L3 Cache (5.7 us)
-            const void * rank_ptrs[5];
-            for (size_t i = 0; i < c.n_ranks; ++i) {
-                rank_ptrs[i] = (const char *) c.star_host_aligned[stage_bank] + i * c.star_rank_stride;
-            }
-            void * acc_out = (char *) c.star_host_aligned[stage_bank] + 5 * c.star_rank_stride;
-
-            if (c.avx2_pool) {
-                c.avx2_pool->parallel_for([&](size_t worker_id, size_t num_workers) {
-                    tp5_avx2_accumulate_star(rank_ptrs, acc_out, n_elems, worker_id, num_workers, stage_tensors[s][0]->type == GGML_TYPE_F32);
-                });
-            } else {
-                tp5_avx2_accumulate_star(rank_ptrs, acc_out, n_elems, 0, 1, stage_tensors[s][0]->type == GGML_TYPE_F32);
-            }
-
-            // 3. CPU Root Broadcast to bcast_host VRAM via PCIe Posted Writes (5.0 us)
-            const size_t bcast_bytes = (stage_tensors[s][0]->type == GGML_TYPE_F32) ? n_elems * sizeof(float) : payload;
-            for (size_t i = 0; i < c.n_ranks; ++i) {
-                if (c.ranks[i].bcast_host[stage_bank]) {
-                    std::memcpy(c.ranks[i].bcast_host[stage_bank], acc_out, bcast_bytes);
+                VkSemaphoreSignalInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+                signal.semaphore = rank.host_ready_sem;
+                signal.value = epoch;
+                if (rank.pfn_signal_semaphore(rank.vkdev, &signal) != VK_SUCCESS) {
+                    c.fail("STAR host timeline signal failed on rank " + std::to_string(i));
+                    GGML_ABORT("ggml-vulkan-collective: STAR host signal failed\n");
                 }
             }
-
-            // 4. Signal host_ready_sem to release GPU Stage s+1!
-            const uint64_t ready_signal_val = stage_epoch;
-            for (size_t i = 0; i < c.n_ranks; ++i) {
-                tp5_rank & r = c.ranks[i];
-                if (r.pfn_signal_semaphore && r.host_ready_sem) {
-                    VkSemaphoreSignalInfo ssi{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, nullptr, r.host_ready_sem, ready_signal_val};
-                    r.pfn_signal_semaphore(r.vkdev, &ssi);
-                }
+            if (measure_submit) {
+                signal_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - signal_start).count();
             }
         }
+    }
+    if (measure_submit && (c.sync_mode == tp5_sync_mode::STAR || c.sync_mode == tp5_sync_mode::RELAY)) {
+        int64_t submit_us = 0;
+        for (size_t i = 0; i < c.n_ranks; ++i) submit_us += submit_wall_us[i];
+        fprintf(stderr, "[tp5-star-chain] stages=%zu submit_us=%lld flag_wait_us=%.3f sum_us=%.3f broadcast_us=%.3f signal_us=%.3f\n",
+                n_stages, (long long) submit_us, chain_handoff.wait_us, chain_handoff.sum_us, chain_handoff.broadcast_us, signal_us);
     }
     if (capture) {
         const auto prefix_us = std::chrono::duration_cast<std::chrono::microseconds>(prefix_end - prefix_start).count();
@@ -3917,12 +4288,18 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
 extern "C" {
 
 void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
+    const char * star_spin_env = getenv("GGML_TP5_STAR_SPIN");
+    if (star_spin_env && atoi(star_spin_env) != 0) {
+        fprintf(stderr, "ggml-vulkan-collective: GGML_TP5_STAR_SPIN is retired; use test-vulkan-tp5-relay --run\n");
+        return nullptr;
+    }
     if (n < 1 || n > 8) {
         fprintf(stderr, "ggml-vulkan-collective: need 2..8 backends, got %zu\n", n);
         return nullptr;
     }
     auto * c = new tp5_comm();
     c->n_ranks = n;
+    c->spin_max = tp5_default_spin_max();
     c->ranks.resize(n);
     c->chain_scratch.resize(n);
     c->backends.assign(backends, backends + n);
@@ -3934,11 +4311,7 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
         c->timing_chain = (uint64_t) atoi(timing_env);
 
     const char * relay_env = getenv("GGML_TP5_RELAY");
-    if (relay_env && strcmp(relay_env, "off") != 0) {
-        fprintf(stderr, "ggml-vulkan-collective: host relay is prohibited (GGML_TP5_RELAY='%s'); direct GPU->GPU peer VRAM mesh required (only 'off' or unset allowed)\n", relay_env);
-        delete c;
-        return nullptr;
-    }
+    (void) relay_env;
 
     const char * wire_env = getenv("GGML_TP5_WIRE");
     c->wire = (wire_env && strcmp(wire_env, "f32") == 0) ? tp5_wire_type::F32 : tp5_wire_type::F16;
@@ -3946,6 +4319,8 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
     const char * sync_env = getenv("GGML_TP5_SYNC");
     if (sync_env && (strcmp(sync_env, "star") == 0 || strcmp(sync_env, "l3_star") == 0)) {
         c->sync_mode = tp5_sync_mode::STAR;
+    } else if (sync_env && strcmp(sync_env, "relay") == 0) {
+        c->sync_mode = tp5_sync_mode::RELAY;
     } else if (sync_env && strcmp(sync_env, "timeline") == 0) {
         c->sync_mode = tp5_sync_mode::TIMELINE;
     } else if (sync_env && strcmp(sync_env, "host") == 0) {
@@ -3978,6 +4353,13 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
         }
         r.vkdev = ggml_vk_tp5_vk_device(r.device);
         r.caps = ggml_vk_tp5_device_caps(r.device);
+        if (c->sync_mode == tp5_sync_mode::RELAY &&
+            (!r.caps.device_coherent_memory || r.caps.vendor_id != 0x1002)) {
+            fprintf(stderr, "ggml-vulkan-collective: RELAY requires AMD device-coherent memory on rank %zu\n", i);
+            for (auto & rr : c->ranks) tp5_destroy_rank(rr);
+            delete c;
+            return nullptr;
+        }
         const size_t required_storage_descriptors =
             std::max(c->n_ranks + 3, c->sync_mode == tp5_sync_mode::GPUFLAG ? size_t(9) : size_t(0));
         if (!r.caps.storage_buffer_array_dynamic_indexing ||
@@ -4007,7 +4389,7 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
             }
         }
 
-        if (c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::STAR) {
+        if (c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::STAR || c->sync_mode == tp5_sync_mode::RELAY) {
             if (!r.caps.timeline_semaphore || !r.caps.timeline_semaphore_features) {
                 fprintf(stderr, "ggml-vulkan-collective: rank %zu lacks timeline semaphore support (ext=%d feat=%d)\n",
                         i, (int) r.caps.timeline_semaphore, (int) r.caps.timeline_semaphore_features);
@@ -4076,20 +4458,20 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
             r.pfn_signal_semaphore = (PFN_vkSignalSemaphore) vkGetDeviceProcAddr(r.vkdev, "vkSignalSemaphoreKHR");
         }
 
-        if ((c->sync_mode == tp5_sync_mode::SYNCFD || c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::DRM || c->sync_mode == tp5_sync_mode::STAR) && (!r.pfn_get_sem_fd || !r.pfn_import_sem_fd)) {
+        if ((c->sync_mode == tp5_sync_mode::SYNCFD || c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::DRM || c->sync_mode == tp5_sync_mode::STAR || c->sync_mode == tp5_sync_mode::RELAY) && (!r.pfn_get_sem_fd || !r.pfn_import_sem_fd)) {
             fprintf(stderr, "ggml-vulkan-collective: rank %zu missing vkGetSemaphoreFdKHR or vkImportSemaphoreFdKHR proc addr\n", i);
             for (auto & rr : c->ranks) tp5_destroy_rank(rr);
             delete c;
             return nullptr;
         }
-        if ((c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::DRM || c->sync_mode == tp5_sync_mode::STAR) && (!r.pfn_wait_semaphores || !r.pfn_get_sem_counter)) {
+        if ((c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::DRM || c->sync_mode == tp5_sync_mode::STAR || c->sync_mode == tp5_sync_mode::RELAY) && (!r.pfn_wait_semaphores || !r.pfn_get_sem_counter)) {
             fprintf(stderr, "ggml-vulkan-collective: rank %zu missing vkWaitSemaphores or vkGetSemaphoreCounterValue proc addr\n", i);
             for (auto & rr : c->ranks) tp5_destroy_rank(rr);
             delete c;
             return nullptr;
         }
 
-        if (c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::DRM || c->sync_mode == tp5_sync_mode::STAR) {
+        if (c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::DRM || c->sync_mode == tp5_sync_mode::STAR || c->sync_mode == tp5_sync_mode::RELAY) {
             VkSemaphoreTypeCreateInfo tci{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
             tci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
             tci.initialValue = 0;
@@ -4298,6 +4680,12 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
                     ::close(ready_fd);
                 }
             }
+            if (r.host_ready_sem == VK_NULL_HANDLE || !r.pfn_signal_semaphore) {
+                fprintf(stderr, "ggml-vulkan-collective: STAR host timeline signal unavailable on rank %zu\n", i);
+                for (auto & rr : c->ranks) tp5_destroy_rank(rr);
+                delete c;
+                return nullptr;
+            }
             r.peer_syncobjs.resize(n, 0);
             r.peer_syncobjs[i] = r.own_syncobj;
             if (r.timeline_export_fd >= 0) {
@@ -4317,12 +4705,9 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
     }
 
     if (c->sync_mode == tp5_sync_mode::STAR) {
-        c->avx2_pool = std::make_unique<tp5_avx2_pool>();
-        c->drm_signaler = std::make_unique<tp5_drm_signaler>();
-        c->drm_waiter   = std::make_unique<tp5_drm_waiter>();
-        c->submit_pool  = std::make_unique<tp5_submit_pool>();
-        for (size_t i = 0; i < n; ++i) {
-            c->drm_waiter->set_node(i, c->ranks[i].dri_fd, c->ranks[i].own_syncobj);
+        const char * workers = getenv("GGML_TP5_STAR_WORKERS");
+        if (!workers || atoi(workers) != 1) {
+            c->avx2_pool = std::make_unique<tp5_avx2_pool>();
         }
     }
 
@@ -4332,16 +4717,17 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
         delete c;
         return nullptr;
     }
-
     {
         const char * sync_name = (c->sync_mode == tp5_sync_mode::TIMELINE) ? "timeline" :
                                  (c->sync_mode == tp5_sync_mode::STAR) ? "star" :
+                                 (c->sync_mode == tp5_sync_mode::RELAY) ? "relay" :
                                  (c->sync_mode == tp5_sync_mode::SYNCFD) ? "syncfd" :
                                  (c->sync_mode == tp5_sync_mode::GPUFLAG) ? "gpuflag" : "host";
-        fprintf(stderr, "ggml-vulkan-collective: init %zu ranks, wire=%s sync=%s relay=off, "
+        fprintf(stderr, "ggml-vulkan-collective: init %zu ranks, wire=%s sync=%s relay=%s, "
                         "replay=%s\n",
                 n, c->wire == tp5_wire_type::F16 ? "f16" : "f32",
                 sync_name,
+                c->sync_mode == tp5_sync_mode::RELAY ? "vram-doorbell" : "off",
                 c->cmd_replay_enabled ? "on" : "off");
     }
     return c;
@@ -4354,7 +4740,8 @@ void ggml_backend_vk_tp5_comm_free(void * comm) {
         fprintf(stderr, "ggml-vulkan-collective: comm_free called on failed collective: aborting to prevent destroying active resources\n");
         GGML_ABORT("ggml-vulkan-collective: unrecoverable runtime failure: comm_free called on failed collective\n");
     }
-    if (c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::DRM || c->sync_mode == tp5_sync_mode::STAR) {
+    if (c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::DRM ||
+        c->sync_mode == tp5_sync_mode::STAR || c->sync_mode == tp5_sync_mode::RELAY) {
         if (!tp5_drain_epoch(*c, c->allreduce_calls)) {
             GGML_ABORT("ggml-vulkan-collective: unrecoverable runtime failure: comm_free drain failed for epoch %llu\n", (unsigned long long) c->allreduce_calls);
         }
@@ -4362,7 +4749,8 @@ void ggml_backend_vk_tp5_comm_free(void * comm) {
     c->clear_cached_plans();
     if (c->sync_mode == tp5_sync_mode::GPUFLAG) {
         tp5_gpuflag_drain_all(*c);
-    } else if (c->sync_mode != tp5_sync_mode::TIMELINE && c->sync_mode != tp5_sync_mode::STAR) {
+    } else if (c->sync_mode != tp5_sync_mode::TIMELINE && c->sync_mode != tp5_sync_mode::STAR &&
+               c->sync_mode != tp5_sync_mode::RELAY) {
     for (auto & r : c->ranks) {
         if (r.vkdev != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(r.vkdev);
@@ -4461,4 +4849,406 @@ bool ggml_backend_vk_tp5_prepare_graph(void * comm, size_t rank, ggml_cgraph * g
     ggml_tensor * target = eligible ? graph->nodes[graph->n_nodes - 1] : nullptr;
     ggml_vk_tp5_set_wire_output(c->backends[rank], target);
     return true;
+}
+
+// Isolated hardware experiment: CPU arithmetic remains part of the protocol;
+// only GPU queue progression is autonomous. No model graph uses this entrypoint.
+int ggml_vk_tp5_relay_probe(ggml_backend_t * backends, size_t n, const ggml_vk_relay_config & cfg) {
+    if (n != 5 || !backends || cfg.stages < 1 || cfg.stages > 96 || cfg.replays < 1 || cfg.replays > 32 ||
+        cfg.elements < 1 || cfg.elements > 4096 || cfg.spin_max < 1 || cfg.spin_max > 1000000 ||
+        cfg.delay_us > 2000 || cfg.withhold_stage > cfg.stages || cfg.partial_submit_ranks >= n ||
+        (cfg.withhold_stage && cfg.partial_submit_ranks)) {
+        fprintf(stderr, "relay: invalid bounded probe configuration\n");
+        return 1;
+    }
+    struct resources {
+        tp5_comm comm;
+        std::array<VkPipeline, 5> pipelines{};
+        std::array<VkPipelineLayout, 5> layouts{};
+        std::array<VkDescriptorSetLayout, 5> dsls{};
+        std::array<VkCommandBuffer, 5> commands{};
+        std::array<bool, 5> pending{};
+        bool drained = true;
+        ~resources() {
+            // Retain all allocations if an unexpected driver failure prevents
+            // bounded draining. Never free USERPTR pages still in use by GPU.
+            if (!drained) return;
+            for (size_t i = 0; i < comm.ranks.size(); ++i) {
+                auto & r = comm.ranks[i];
+                if (pipelines[i]) vkDestroyPipeline(r.vkdev, pipelines[i], nullptr);
+                if (layouts[i]) vkDestroyPipelineLayout(r.vkdev, layouts[i], nullptr);
+                if (dsls[i]) vkDestroyDescriptorSetLayout(r.vkdev, dsls[i], nullptr);
+                tp5_destroy_rank(r);
+            }
+            for (auto ptr : comm.star_host_raw) free(ptr);
+        }
+    } res;
+    auto & c = res.comm;
+    c.n_ranks = n;
+    c.sync_mode = tp5_sync_mode::STAR;
+    c.wire = tp5_wire_type::F16;
+    c.ranks.resize(n);
+    c.backends.assign(backends, backends + n);
+    size_t alignment = 4096;
+    for (size_t i = 0; i < n; ++i) {
+        auto & r = c.ranks[i];
+        r.device = ggml_vk_tp5_backend_device(backends[i]);
+        if (!r.device) return 1;
+        r.vkdev = ggml_vk_tp5_vk_device(r.device);
+        r.caps = ggml_vk_tp5_device_caps(r.device);
+        // This PoC is a RADV/Navi21 experiment, not a portable Vulkan promise.
+        if (r.caps.vendor_id != 0x1002 || r.caps.device_id != 0x73bf) {
+            fprintf(stderr, "relay: unvalidated device %s (%04x:%04x)\n", r.caps.name, r.caps.vendor_id, r.caps.device_id);
+            return 1;
+        }
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT host{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+        VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &host};
+        vkGetPhysicalDeviceProperties2(ggml_vk_tp5_vk_physical_device(r.device), &props);
+        alignment = std::max(alignment, (size_t) host.minImportedHostPointerAlignment);
+        ggml_vk_tp5_get_queue(r.device, &r.queue, &r.queue_family);
+    }
+    constexpr size_t status_bytes = 512; // upload + progress + 96 completed polling counts
+    const size_t stride = ((cfg.elements * sizeof(float) + status_bytes + alignment - 1) / alignment) * alignment;
+    c.star_rank_stride = stride;
+    for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
+        if (posix_memalign(&c.star_host_raw[b], alignment, n * stride) != 0) return 1;
+        c.star_host_aligned[b] = c.star_host_raw[b];
+        memset(c.star_host_raw[b], 0, n * stride);
+    }
+    struct relay_pc {
+        uint64_t status_bda;
+        uint32_t n_elems, seq, rank, spin_max, mode, reserved;
+    };
+    struct push_pc {
+        uint64_t src, dst, flag;
+        uint32_t n_vec4, n_elems, seq, mode;
+    };
+    static_assert(sizeof(relay_pc) == 32 && sizeof(push_pc) == 40, "shader push constant layout");
+    const auto barrier = [](VkCommandBuffer cmd, VkPipelineStageFlags src, VkPipelineStageFlags dst,
+                            VkAccessFlags writes, VkAccessFlags reads) {
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, writes, reads};
+        vkCmdPipelineBarrier(cmd, src, dst, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    };
+    for (size_t i = 0; i < n; ++i) {
+        auto & r = c.ranks[i];
+        VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pool.queueFamilyIndex = r.queue_family;
+        if (vkCreateCommandPool(r.vkdev, &pool, nullptr, &r.cmd_pool) != VK_SUCCESS) return 1;
+        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (vkCreateFence(r.vkdev, &fci, nullptr, &r.fence_p2) != VK_SUCCESS) return 1;
+        VkQueryPoolCreateInfo query{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        query.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        query.queryCount = 2;
+        if (vkCreateQueryPool(r.vkdev, &query, nullptr, &r.timing_pool) != VK_SUCCESS) return 1;
+        if (!tp5_build_rank_pipelines(c, r)) return 1;
+        for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
+            void * ptr = (char *) c.star_host_raw[b] + i * stride;
+            auto host_props_fn = (PFN_vkGetMemoryHostPointerPropertiesEXT) vkGetDeviceProcAddr(r.vkdev, "vkGetMemoryHostPointerPropertiesEXT");
+            VkMemoryHostPointerPropertiesEXT host_props{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+            VkPhysicalDeviceMemoryProperties props{};
+            ggml_vk_tp5_mem_props(r.device, &props);
+            if (!host_props_fn || host_props_fn(r.vkdev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, ptr, &host_props) != VK_SUCCESS ||
+                find_memory_type(props, host_props.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == UINT32_MAX ||
+                !tp5_alloc_host_import_buffer(r, ptr, stride, r.host_import_buf[b], r.host_import_mem[b], r.bda_addr[b]) || !r.bda_addr[b]) {
+                fprintf(stderr, "relay: coherent BDA host import unavailable on rank %zu\n", i);
+                return 1;
+            }
+            const VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD | VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
+            uint32_t memory_type = UINT32_MAX;
+            if (!tp5_alloc_host_visible_buffer(r, stride, r.bcast_buf[b], r.bcast_mem[b], &r.bcast_host[b], required, &memory_type)) {
+                fprintf(stderr, "relay: mapped local VRAM unavailable on rank %zu; refusing host-memory polling fallback\n", i);
+                return 1;
+            }
+            fprintf(stderr, "relay rank=%zu bank=%zu memory_type=%u flags=0x%x local_vram=yes bytes=%zu\n",
+                    i, b, memory_type, props.memoryTypes[memory_type].propertyFlags, stride);
+        }
+        if (!tp5_alloc_device_buffer(r, cfg.elements * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                false, r.wire_buf, r.wire_mem, nullptr)) return 1;
+        auto bda_fn = (PFN_vkGetBufferDeviceAddress) vkGetDeviceProcAddr(r.vkdev, "vkGetBufferDeviceAddress");
+        if (!bda_fn) bda_fn = (PFN_vkGetBufferDeviceAddress) vkGetDeviceProcAddr(r.vkdev, "vkGetBufferDeviceAddressKHR");
+        if (!bda_fn) return 1;
+        VkBufferDeviceAddressInfo addr{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, r.wire_buf};
+        r.wire_bda = bda_fn(r.vkdev, &addr);
+        if (!r.wire_bda) return 1;
+        VkDescriptorSetLayoutBinding bindings[3]{};
+        for (uint32_t j = 0; j < 3; ++j) bindings[j] = {j, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo dci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        dci.bindingCount = 3;
+        dci.pBindings = bindings;
+        if (vkCreateDescriptorSetLayout(r.vkdev, &dci, nullptr, &res.dsls[i]) != VK_SUCCESS) return 1;
+        VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(relay_pc)};
+        VkPipelineLayoutCreateInfo lci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        lci.setLayoutCount = 1;
+        lci.pSetLayouts = &res.dsls[i];
+        lci.pushConstantRangeCount = 1;
+        lci.pPushConstantRanges = &pcr;
+        if (vkCreatePipelineLayout(r.vkdev, &lci, nullptr, &res.layouts[i]) != VK_SUCCESS) return 1;
+        VkShaderModule module = VK_NULL_HANDLE;
+        if (!tp5_create_shader_module(r.vkdev, tp5_relay_data, tp5_relay_len, &module)) return 1;
+        VkComputePipelineCreateInfo pci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main", nullptr};
+        pci.layout = res.layouts[i];
+        const VkResult pipeline_result = vkCreateComputePipelines(r.vkdev, VK_NULL_HANDLE, 1, &pci, nullptr, &res.pipelines[i]);
+        vkDestroyShaderModule(r.vkdev, module, nullptr);
+        if (pipeline_result != VK_SUCCESS) return 1;
+        VkDescriptorSet sets[TP5_MAILBOX_BANKS]{};
+        for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
+            VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, r.desc_pool, 1, &res.dsls[i]};
+            if (vkAllocateDescriptorSets(r.vkdev, &ai, &sets[b]) != VK_SUCCESS) return 1;
+            VkDescriptorBufferInfo infos[3] = {{r.bcast_buf[b], 0, stride}, {r.wire_buf, 0, cfg.elements * sizeof(float)}, {r.bcast_buf[0], 0, 64}};
+            VkWriteDescriptorSet writes[3]{};
+            for (uint32_t j = 0; j < 3; ++j) writes[j] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets[b], j, 0, 1,
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &infos[j], nullptr};
+            vkUpdateDescriptorSets(r.vkdev, 3, writes, 0, nullptr);
+        }
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, r.cmd_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
+        if (vkAllocateCommandBuffers(r.vkdev, &ai, &res.commands[i]) != VK_SUCCESS) return 1;
+        const VkCommandBuffer cmd = res.commands[i];
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) return 1;
+        vkCmdResetQueryPool(cmd, r.timing_pool, 0, 2);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, r.timing_pool, 0);
+        relay_pc pc{r.bda_addr[0] + stride - status_bytes, cfg.elements, 0, (uint32_t) i, cfg.spin_max, 0, 0};
+        const auto consume = [&](uint32_t seq, uint32_t mode) {
+            const size_t bank = seq ? tp5_mailbox_bank(seq) : 0;
+            pc.seq = seq;
+            pc.mode = mode;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, res.pipelines[i]);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, res.layouts[i], 0, 1, &sets[bank], 0, nullptr);
+            vkCmdPushConstants(cmd, res.layouts[i], VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdDispatch(cmd, 1, 1, 1);
+            barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        };
+        consume(0, 0);
+        // TIMELINE's fused ordering: COMPUTE -> PUSH -> dependent COMPUTE.
+        // All 96 stages are recorded once. No peer/host semaphore waits exist.
+        for (uint32_t seq = 1; seq <= cfg.stages; ++seq) {
+            const size_t b = tp5_mailbox_bank(seq);
+            push_pc push{r.wire_bda, r.bda_addr[b], r.bda_addr[b] + stride - status_bytes,
+                         cfg.elements / 4, cfg.elements, seq, 0};
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.bda_push_pipe);
+            vkCmdPushConstants(cmd, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            vkCmdDispatch(cmd, (cfg.elements + 255) / 256, 1, 1);
+            barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                    VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+            push.mode = 1;
+            vkCmdPushConstants(cmd, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            vkCmdDispatch(cmd, 1, 1, 1);
+            barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                    VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+            consume(seq, 1);
+        }
+        VkBufferCopy copy{0, 0, cfg.elements * sizeof(float)};
+        vkCmdCopyBuffer(cmd, r.wire_buf, r.host_import_buf[0], 1, &copy);
+        barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, r.timing_pool, 1);
+        if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return 1;
+    }
+    const auto status = [&](size_t rank) {
+        return (volatile uint32_t *) ((char *) c.star_host_raw[0] + (rank + 1) * stride - status_bytes);
+    };
+    const auto abort_all = [&] {
+        for (auto & r : c.ranks) ((volatile uint32_t *) r.bcast_host[0])[1] = 1;
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_sfence();
+#endif
+    };
+    const auto drain = [&] {
+        bool ok = true;
+        for (size_t i = 0; i < n; ++i) if (res.pending[i]) {
+            const VkResult result = vkWaitForFences(c.ranks[i].vkdev, 1, &c.ranks[i].fence_p2, VK_TRUE, 2000000000ULL);
+            if (result == VK_SUCCESS) res.pending[i] = false;
+            else { fprintf(stderr, "relay: bounded drain failed rank=%zu result=%d\n", i, result); ok = false; }
+        }
+        res.drained = ok;
+        return ok;
+    };
+    const size_t stage_size = n * cfg.elements;
+    std::vector<float> reference((cfg.stages + 1) * stage_size);
+    std::vector<float> sum(cfg.elements);
+    size_t checked = 0, prepublication_checks = 0, waits_observed = 0, submits = 0;
+    const bool inject = cfg.withhold_stage || cfg.partial_submit_ranks;
+    const uint32_t replay_count = inject ? 1 : cfg.replays;
+    double total_us = 0;
+    for (uint32_t run = 0; run < replay_count; ++run) {
+        for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) memset(c.star_host_raw[b], 0, n * stride);
+        for (size_t i = 0; i < n; ++i) {
+            auto & r = c.ranks[i];
+            for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
+                memset(r.bcast_host[b], 0, stride);
+                auto * words = (volatile uint32_t *) r.bcast_host[b];
+                words[0] = cfg.stale_doorbell ? UINT32_MAX : 0;
+                words[4] = run;
+            }
+            if (vkResetFences(r.vkdev, 1, &r.fence_p2) != VK_SUCCESS) return 1;
+            for (size_t e = 0; e < cfg.elements; ++e) reference[i * cfg.elements + e] =
+                (float) (i + 1) * 0.25f + (float) (e % 7) * 0.03125f + (float) (run % 8) * 0.0625f;
+        }
+        for (uint32_t s = 0; s < cfg.stages; ++s) for (size_t e = 0; e < cfg.elements; ++e) {
+            float value = 0;
+            for (size_t i = 0; i < n; ++i) value += ggml_fp16_to_fp32(ggml_fp32_to_fp16(reference[s * stage_size + i * cfg.elements + e]));
+            for (size_t i = 0; i < n; ++i) reference[(s + 1) * stage_size + i * cfg.elements + e] =
+                value * 0.125f + (float) (i + 1) * 0.25f + (float) (e % 7) * 0.03125f;
+        }
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_sfence();
+#endif
+        const auto started = std::chrono::steady_clock::now();
+        bool ok = true;
+        const size_t submit_count = cfg.partial_submit_ranks ? cfg.partial_submit_ranks : n;
+        for (size_t i = 0; i < submit_count; ++i) {
+            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &res.commands[i];
+            if (vkQueueSubmit(c.ranks[i].queue, 1, &si, c.ranks[i].fence_p2) != VK_SUCCESS) {
+                fprintf(stderr, "relay: rank %zu submit failed\n", i);
+                ok = false;
+                break;
+            }
+            res.pending[i] = true;
+            res.drained = false;
+            ++submits;
+        }
+        if (cfg.partial_submit_ranks || !ok) {
+            abort_all();
+            if (!drain()) return 2;
+            if (!ok) return 1;
+            fprintf(stderr, "relay partial-submit: %zu/%zu submitted, abort drained every submitted rank; no peer waits\n", submit_count, n);
+            break;
+        }
+        uint32_t published = 0;
+        const auto submitted = std::chrono::steady_clock::now();
+        for (uint32_t seq = 1; seq <= cfg.stages && ok; ++seq) {
+            const size_t b = tp5_mailbox_bank(seq);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            bool ready = false;
+            for (uint64_t poll = 0; !ready; ++poll) {
+                ready = true;
+                for (size_t i = 0; i < n; ++i) {
+                    const auto * st = status(i);
+                    const auto * uploaded = (volatile uint32_t *) ((char *) c.star_host_raw[b] + (i + 1) * stride - status_bytes);
+                    if (st[2] != 0) { ok = false; break; }
+                    ready &= *uploaded == seq;
+                }
+                if (!ok) break;
+                if ((poll & 255) == 0 && std::chrono::steady_clock::now() >= deadline) { ok = false; break; }
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#endif
+            }
+            if (!ok) break;
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (cfg.delay_us) std::this_thread::sleep_for(std::chrono::microseconds(cfg.delay_us));
+            const void * ptrs[5];
+            for (size_t i = 0; i < n; ++i) {
+                if (status(i)[2] || status(i)[3] >= seq) { ok = false; break; }
+                ++prepublication_checks;
+                ptrs[i] = (char *) c.star_host_raw[b] + i * stride;
+                const auto * actual = (const uint16_t *) ptrs[i];
+                for (size_t e = 0; e < cfg.elements; ++e) {
+                    const uint16_t expected = ggml_fp32_to_fp16(reference[(seq - 1) * stage_size + i * cfg.elements + e]);
+                    if (actual[e] != expected) {
+                        fprintf(stderr, "relay upload mismatch replay=%u stage=%u rank=%zu elem=%zu got=%04x expected=%04x\n", run, seq, i, e, actual[e], expected);
+                        ok = false; break;
+                    }
+                    ++checked;
+                }
+                if (!ok) break;
+            }
+            if (!ok) break;
+            tp5_avx2_accumulate_star(ptrs, sum.data(), cfg.elements, 0, 1, true);
+            for (size_t i = 0; i < n; ++i) {
+                if (seq == cfg.withhold_stage && i == n - 1) continue;
+                std::memcpy((char *) c.ranks[i].bcast_host[b] + 64, sum.data(), cfg.elements * sizeof(float));
+            }
+#if defined(__x86_64__) || defined(_M_X64)
+            _mm_sfence();
+#endif
+            for (size_t i = 0; i < n; ++i) {
+                if (seq == cfg.withhold_stage && i == n - 1) continue;
+                ((volatile uint32_t *) c.ranks[i].bcast_host[b])[0] = seq;
+            }
+#if defined(__x86_64__) || defined(_M_X64)
+            _mm_sfence();
+#endif
+            for (size_t i = 0; i < n; ++i) {
+                if (seq == cfg.withhold_stage && i == n - 1) continue;
+                VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+                range.memory = c.ranks[i].bcast_mem[b];
+                range.offset = 0;
+                range.size = VK_WHOLE_SIZE;
+                if (vkFlushMappedMemoryRanges(c.ranks[i].vkdev, 1, &range) != VK_SUCCESS) {
+                    fprintf(stderr, "relay: host-to-VRAM flush failed rank=%zu stage=%u\n", i, seq);
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) break;
+            published = seq;
+            if (seq == cfg.withhold_stage) break;
+        }
+        if (!ok) abort_all();
+        // The withheld consumer exits by its shader bound, not a forged ready.
+        if (!drain()) { abort_all(); if (!drain()) return 2; ok = false; }
+        total_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count();
+        if (!ok || inject) {
+            fprintf(stderr, "relay diagnostic: submit_us=%.3f published=%u\n",
+                    std::chrono::duration<double, std::micro>(submitted - started).count(), published);
+            for (size_t i = 0; i < n; ++i) {
+                uint64_t timestamps[2]{};
+                const auto & r = c.ranks[i];
+                const VkResult qr = vkGetQueryPoolResults(r.vkdev, r.timing_pool, 0, 2, sizeof(timestamps), timestamps,
+                                                          sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+                const auto * control_words = (volatile uint32_t *) c.ranks[i].bcast_host[0];
+                const size_t diag_bank = tp5_mailbox_bank(std::max<uint32_t>(published, 1));
+                const auto * inbox_words = (volatile uint32_t *) c.ranks[i].bcast_host[diag_bank];
+                fprintf(stderr, "relay rank=%zu entered=%u error=%u consumed=%u gpu_spin=%u control=%u/%u/%u inbox0=%u gpu_us=%.3f query=%d\n", i,
+                        status(i)[1], status(i)[2], status(i)[3], status(i)[4],
+                        control_words[0], control_words[1], control_words[2], inbox_words[0],
+                        (double) (timestamps[1] - timestamps[0]) * r.caps.timestamp_period / 1000.0, qr);
+            }
+        }
+        if (cfg.withhold_stage) {
+            const auto * st = status(n - 1);
+            if (!ok || st[2] != cfg.withhold_stage || st[3] >= cfg.withhold_stage) {
+                fprintf(stderr, "relay: expected timeout not observed (error=%u consumed=%u published=%u)\n", st[2], st[3], published);
+                return 1;
+            }
+            const auto * actual = (const float *) ((char *) c.star_host_raw[0] + (n - 1) * stride);
+            const auto * expected = reference.data() + (cfg.withhold_stage - 1) * stage_size + (n - 1) * cfg.elements;
+            if (memcmp(actual, expected, cfg.elements * sizeof(float)) != 0) {
+                fprintf(stderr, "relay: timed-out consumer modified its state\n");
+                return 1;
+            }
+            fprintf(stderr, "relay timeout: rank=%zu stage=%u state untouched, sticky error, all ranks drained\n", n - 1, cfg.withhold_stage);
+            break;
+        }
+        if (!ok) { fprintf(stderr, "relay: handoff failed replay=%u published=%u\n", run, published); return 1; }
+        for (size_t i = 0; i < n; ++i) {
+            if (status(i)[2] || status(i)[3] != cfg.stages) {
+                fprintf(stderr, "relay: consumer failed rank=%zu error=%u consumed=%u\n", i, status(i)[2], status(i)[3]); return 1;
+            }
+            for (uint32_t seq = 1; seq <= cfg.stages; ++seq) {
+                if (status(i)[3 + seq] > 0) ++waits_observed;
+                else if (cfg.delay_us) {
+                    fprintf(stderr, "relay: delayed trial did not exercise an active wait rank=%zu stage=%u\n", i, seq);
+                    return 1;
+                }
+            }
+            const auto * actual = (const float *) ((char *) c.star_host_raw[0] + i * stride);
+            const auto * expected = reference.data() + cfg.stages * stage_size + i * cfg.elements;
+            if (memcmp(actual, expected, cfg.elements * sizeof(float)) != 0) {
+                fprintf(stderr, "relay: final state mismatch rank=%zu replay=%u\n", i, run); return 1;
+            }
+            checked += cfg.elements;
+        }
+    }
+    fprintf(stderr, "relay: PASS stages=%u replays=%u elements=%u checked=%zu prepublication_checks=%zu waits_observed=%zu queue_submits=%zu host_signals=0\n",
+            cfg.stages, replay_count, cfg.elements, checked, prepublication_checks, waits_observed, submits);
+    if (!inject) fprintf(stderr, "relay chain wall: %.3f us/replay (includes CPU reference checks/delay; NOT model tok/s)\n", total_us / replay_count);
+    return 0;
 }

@@ -1146,6 +1146,9 @@ void process_shaders() {
     });
     string_to_spv("tp5_pack_f16", "tp5_pack_f16.comp", {});
     string_to_spv("tp5_gpuflag", "tp5_gpuflag.comp", {});
+    string_to_spv("tp5_relay", "tp5_relay.comp", {});
+    string_to_spv("tp5_relay_copy_f32", "tp5_relay_copy_f32.comp", {});
+
 
     string_to_spv("quantize_q8_1", "quantize_q8_1.comp", {});
     string_to_spv("quantize_q8_1_subgroup", "quantize_q8_1.comp", {{"USE_SUBGROUPS", "1"}});

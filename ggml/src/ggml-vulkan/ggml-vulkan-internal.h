@@ -32,6 +32,7 @@ vk_device ggml_vk_tp5_backend_device(ggml_backend_t backend);
 struct vk_tp5_device_caps {
     bool external_memory_fd      = false;
     bool external_memory_dma_buf = false;
+    bool device_coherent_memory = false;
     bool external_semaphore_fd   = false;
     bool timeline_semaphore      = false;
     bool timeline_semaphore_features = false;

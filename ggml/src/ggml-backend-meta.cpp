@@ -3746,7 +3746,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             // One queue call per rank; owner retirement may wait once per chain,
             // never between individual compute/reduction stages.
             static int chain_hit_log = 0;
-            if (pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors)) {
+            auto t_chain_call_0 = std::chrono::high_resolution_clock::now();
+            bool chain_ok = pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors);
+            auto t_chain_call_1 = std::chrono::high_resolution_clock::now();
+            double chain_call_ms = std::chrono::duration<double, std::milli>(t_chain_call_1 - t_chain_call_0).count();
+            fprintf(stderr, "\n[META_CHAIN_EXEC_TIME] pfn_submit_chain took %6.2f ms (ok=%d, n_stages=%zu)\n\n",
+                    chain_call_ms, (int)chain_ok, backend_ctx->n_subgraphs);
+            if (chain_ok) {
                 if (++chain_hit_log <= 5 || chain_hit_log % 100 == 0) {
                     fprintf(stderr, "[tp5-meta] SUBMIT_EPOCH_CHAIN SUCCESS: persistent signaling active! (hits=%d)\n", chain_hit_log);
                 }

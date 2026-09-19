@@ -1823,10 +1823,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return true;
     }
 
-    // load tensor data
-    for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
-            return false;
+    // load tensor data (supports instant startup ablation via GGML_SKIP_WEIGHT_LOAD)
+    if (getenv("GGML_SKIP_WEIGHT_LOAD")) {
+        fprintf(stderr, "\n[ABLATION] GGML_SKIP_WEIGHT_LOAD active: bypassing weight loading for instant test iteration!\n\n");
+    } else {
+        for (auto & [ctx, buf_map] : ctx_buf_maps) {
+            if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+                return false;
+            }
         }
     }
 

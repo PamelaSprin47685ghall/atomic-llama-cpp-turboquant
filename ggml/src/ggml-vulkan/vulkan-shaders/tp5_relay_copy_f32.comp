@@ -1,0 +1,64 @@
+#version 450
+
+// RELAY real-graph P2: wait on a CPU-written local-VRAM epoch, then copy the
+// CPU-reduced F32 payload into the tensor consumed by the next graph stage.
+// This is deliberately a copy/doorbell kernel, not a model operator.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) coherent volatile buffer InboxBuffer { uint inbox[]; };
+layout(std430, binding = 1) writeonly buffer DstBuffer { float dst[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer StatusBuffer { uint words[]; };
+
+layout(push_constant) uniform Params {
+    uint64_t status_bda;
+    uint n_elems;
+    uint seq;
+    uint spin_max;
+    uint dst_offset_words;
+    uint reserved0;
+    uint reserved1;
+} p;
+
+shared uint ready;
+
+void main() {
+    uint lane = gl_LocalInvocationID.x;
+    if (lane == 0u) {
+        ready = 0u;
+        StatusBuffer status = StatusBuffer(p.status_bda);
+        uint expected = status.words[1];
+        if (status.words[2] == 0u && expected != 0u) {
+            memoryBarrierBuffer();
+            for (uint spin = 0u; spin < p.spin_max; ++spin) {
+                if (inbox[0] == expected) {
+                    // Consume the generation-matched doorbell exactly once.
+                    // The CPU publishes payload first, then this word; no
+                    // lane other than lane 0 touches the control word.
+                    inbox[0] = 0u;
+                    ready = 1u;
+                    break;
+                }
+            }
+            if (ready == 0u) {
+                status.words[2] = expected;
+                status.words[4] = inbox[0];
+            }
+        } else if (expected == 0u) {
+            status.words[2] = 0xffffffffu;
+        }
+    }
+    barrier();
+    if (ready == 0u) return;
+    memoryBarrierBuffer();
+    for (uint e = lane; e < p.n_elems; e += 64u) {
+        dst[p.dst_offset_words + e] = uintBitsToFloat(inbox[16u + e]);
+    }
+    memoryBarrierBuffer();
+    barrier();
+    if (lane == 0u) {
+        StatusBuffer status = StatusBuffer(p.status_bda);
+        status.words[3] = status.words[1];
+    }
+}
