@@ -1,21 +1,21 @@
 #version 450
 
-// RELAY real-graph P2: validate a CPU-written local-VRAM epoch, then copy the
-// CPU-reduced F32 payload into the tensor consumed by the next graph stage.
-// This is deliberately a copy/doorbell kernel, not a model operator.
+// RELAY real-graph P2: it is resident before the CPU publishes the reduced
+// payload. CPU writes local VRAM through BAR; this shader waits only on that
+// generation doorbell and then consumes the payload autonomously.
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
 layout(local_size_x = 64) in;
 layout(std430, binding = 0) coherent volatile buffer InboxBuffer { uint inbox[]; };
 layout(std430, binding = 1) writeonly buffer DstBuffer { float dst[]; };
-layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer StatusBuffer { uint words[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent volatile buffer StatusBuffer { uint words[]; };
 
 layout(push_constant) uniform Params {
     uint64_t status_bda;
     uint n_elems;
     uint seq;
-    uint reserved_spin;
+    uint spin_max;
     uint dst_offset_words;
     uint reserved0;
     uint reserved1;
@@ -30,18 +30,25 @@ void main() {
         StatusBuffer status = StatusBuffer(p.status_bda);
         uint expected = status.words[1];
         if (status.words[2] == 0u && expected != 0u) {
-            memoryBarrierBuffer();
-            // P2 is submitted only after the host has published payload and
-            // this matching doorbell. Never poll from a shader: a missed
-            // handoff must fail once rather than pinning an amdgpu queue.
-            if (inbox[0] == expected) {
-                // Consume the generation-matched doorbell exactly once. No
-                // lane other than lane 0 touches the control word.
-                inbox[0] = 0u;
-                ready = 1u;
+            for (uint spin = 0u; spin < p.spin_max; ++spin) {
+                memoryBarrierBuffer();
+                // A host-side bounded handoff failure requests an immediate
+                // fail-closed exit; do not burn the remaining spin budget.
+                if ((spin & 1023u) == 0u && status.words[2] != 0u) {
+                    break;
+                }
+                if (inbox[0] == expected) {
+                    // Consume the generation-matched doorbell exactly once.
+                    // No lane other than lane 0 touches the control word.
+                    inbox[0] = 0u;
+                    ready = 1u;
+                    break;
+                }
             }
             if (ready == 0u) {
-                status.words[2] = expected;
+                if (status.words[2] == 0u) {
+                    status.words[2] = expected;
+                }
                 status.words[4] = inbox[0];
             }
         } else if (expected == 0u) {
@@ -49,7 +56,16 @@ void main() {
         }
     }
     barrier();
-    if (ready == 0u) return;
+    if (ready == 0u) {
+        // A timed-out P2 must not leave a plausible previous activation for
+        // later graph work. Status records the failure; NaNs make the GPU
+        // data path fail closed without a host synchronization round-trip.
+        for (uint e = lane; e < p.n_elems; e += 64u) {
+            dst[p.dst_offset_words + e] = uintBitsToFloat(0x7fc00000u);
+        }
+        memoryBarrierBuffer();
+        return;
+    }
     memoryBarrierBuffer();
     for (uint e = lane; e < p.n_elems; e += 64u) {
         dst[p.dst_offset_words + e] = uintBitsToFloat(inbox[16u + e]);

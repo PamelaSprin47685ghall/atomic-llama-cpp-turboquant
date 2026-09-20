@@ -4,6 +4,12 @@
 
 本文面向实际实现者、维护者与验证者。本文涵盖 TP5 架构设计、工程实施闭环、真机拓扑与安全审计、微秒级系统调用剖析、收敛优化路线及严格验收准则。
 
+## RELAY 名称与语义铁律（当前有效）
+
+`RELAY` 不是“CPU 做完归约后提交一个 P2 copy”的泛称。它仅指自治的 GPU-resident doorbell relay：P1/P2 在 CPU reduce 前已预提交到每卡 queue；P2 在本卡 local-VRAM 上有界轮询 doorbell；CPU 仅通过 BAR/映射 VRAM 写入归约 payload 和匹配 generation，GPU 无需知道写入者为何或何时改变该 VRAM。P2 看见匹配 generation 后消费 payload 并写 completion；达到严格 `spin_max` 必须写失败态并退出。
+
+**严禁以任何降级冒充 RELAY。** CPU payload 发布后才提交 P2、P2 one-shot doorbell check、host timeline signal、CPU 直接推进 P2，均属于 `CPU-gated STAR` 或其他非-RELAY 路径；不得使用 relay CLI/env、测试名、benchmark 标签或 tok/s 结果，且不得 silent fallback 或别名混称。本文中所有旧的 timeline/direct/host-relay 历史叙述不改变这一定义。
+
 **演进历史说明**：本文第 0–28 节源于 2026-09-12 设计初稿；附录 C 记录 2026-09-13 目标机实施与真机首轮直连数据；正文开篇与文末《TP5-FAST》及《收敛与优化指导》记录 2026-09-14 重新插卡验证、物理内存审计、ioctl 剖析、`llama_tp5_plan` 统合接入、实验性 gpuflag 机制及最新收敛路线。凡设计初稿中标记为“拟实现项/拟新增”的模块（如 `llama_tp5_plan`、`tp5-inspect-model.py`、`tp5-manifest.json`、Vulkan collective、命令重放等），均已在当前 master 源码树中实现并按工程规范部署。
 
 ---

@@ -232,6 +232,9 @@ extern "C" {
     // Context management and operations for faster communication between backends, used for tensor parallelism (meta backend)
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
+    // Optional shutdown extension. false means that native work did not drain;
+    // the caller MUST retain the communicator and its child backends.
+    typedef bool   (*ggml_backend_comm_free_safe_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
 
     // Split buffer type for tensor parallelism (old)

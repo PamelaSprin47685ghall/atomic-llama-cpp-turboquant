@@ -9,12 +9,34 @@
 - 部分 rank 提交失败时：**禁止**用 `vkDeviceWaitIdle` 赌 peer signal，也**禁止**主机伪造成功让消费者读未完成载荷。
 - **严禁无保护/无界自旋**：无论 CPU 还是 GPU，任何自旋必须设置严格的有界退出计数（如有限迭代上限）或超时退避，且超时后必须执行标准错误路径（如 fail/abort 并排空退出），绝不允许死循环自旋。
 - **严禁在 Shader 中引入无界 while 自旋**：GPU 计算单元死锁会直接阻断 amdgpu 驱动退出，引发内核 `dma_fence_wait_timeout`，导致 `khungtaskd` 触发系统级 Panic / Watchdog 重启！
-- **严禁依赖不稳定的设备级自旋等待**：下行信号必须使用驱动原生或有安全保障的同步原语（如 Timeline Semaphore 或受控的事件机制），不得绕过硬件调度规范。
+- **严禁依赖不稳定的设备级自旋等待**：下行信号必须使用驱动原生或有安全保障的同步原语（如 Timeline Semaphore 或受控的事件机制），不得绕过硬件调度规范。经明确批准的 RELAY 例外必须保持固定有界 spin_max、匹配 generation、失败态写回及真实提交值的原生排空；该固定上限必须在运行前按已验证配置覆盖完整的 GPU→CPU→GPU handoff 预算，不能因人为设得过小而把正常 payload 发布误判为 timeout。不得把此例外推广为无界 GPU 自旋，也不得在 timeout 后动态或递增地扩大上限重试。
 - **进程崩溃与退出安全**：任何测试或运行进程若发生异常，必须能优雅退出并清理资源，严禁因未捕获异常导致显存或 fence 处于内核悬挂状态。
 
 ### 🚨 2026-09-19 RELAY 复发事故
 
-真实 `llama-server --tp5-sync relay` 在第二个请求的 epoch-chain 重用阶段发生 payload timeout，随后主机非正常重启；上一启动周期的 journal 损坏，无法从持久日志恢复完整 hang 栈。结论按真机事故处理：**RELAY 的 local-VRAM shader doorbell / GPU 等待路径已在生产入口和硬件测试入口 fail-closed 禁用。** 在新的、独立证明安全的驱动级同步方案出现前，禁止重新启用、禁止用更大的 spin bound 重试、禁止以 `vkDeviceWaitIdle` 或进程 abort 作为恢复手段。若未来重新设计，P2 必须在 CPU 完整发布 payload+doorbell 后才提交、shader 不得轮询，并且每个已提交 timeline 值必须在任何资源释放前由驱动原生 wait 有界排空；当前 `comm_free` 的失败 abort 路径不满足该重启条件。
+真实 `llama-server --tp5-sync relay` 在第二个请求的 epoch-chain 重用阶段发生 payload timeout，随后主机非正常重启；上一启动周期的 journal 损坏，无法从持久日志恢复完整 hang 栈。**RELAY 的 local-VRAM shader doorbell / GPU 等待路径仍是显式 opt-in，不改变默认 TIMELINE。** 本轮在用户明确批准后恢复了原始自治 bounded-spin 路径，并完成五卡 mesh 与短 real-model decode 验证；这不等于长时间压力稳定性证明。禁止把 timeout 当作 retry 而动态或递增地增大 spin bound；运行前可在明确批准的单一配置上设定一个覆盖完整 GPU→CPU→GPU handoff 预算的固定上限。禁止以 `vkDeviceWaitIdle` 或进程 abort 作为恢复手段。每个已提交 timeline 值必须在任何资源释放前由驱动原生 wait 有界排空；失败时必须保留无法证明已完成的资源。
+
+#### RELAY 名称与语义铁律
+
+`relay` 只指**自治的 GPU-resident doorbell relay**：P1 和 P2 都在 CPU reduce 前预提交；P2 在本队列中有界轮询本卡 local-VRAM doorbell，CPU 只通过 BAR/映射 VRAM 写入归约 payload 与同代 doorbell，GPU 不接受 CPU semaphore/二次 submit 来推进 P2。`spin_max` 是覆盖该完整 GPU→CPU→GPU handoff 的预先校准协议预算，不是缩短正确 handoff 的人为 timeout；P2 必须在看见匹配 generation 后消费 payload、写 completion，超出该固定预算必须写失败态并退出。
+
+**严禁以任何降级冒充 RELAY：** CPU 发布 payload 后才提交 P2、P2 只做一次 doorbell 检查、host timeline signal、CPU 直接推进 P2，均是 `CPU-gated STAR` 或其他非-RELAY 路径。它们不得使用 `--tp5-sync relay`、`GGML_TP5_SYNC=relay`、RELAY 测试名、RELAY benchmark 标签或 RELAY tok/s 结果；不得静默 fallback、别名伪装或在报告中混称。
+
+#### RELAY 受控重入证据（2026-09-19）
+
+用户明确批准恢复原始 RELAY 后，当前实现只允许上述真实自治语义：五卡 test-vulkan-tp5-mesh --sync relay --rounds 1 --elements 2560 --check-all 通过，包含真实 GPU graph-producer、位级 constant-input 校验和 FD delta 0。随后同一固定配置、同一 GGUF、同五张 Vulkan RX 6800 上完成 real llama-server 请求复用：首个请求和第二个请求均 HTTP 200，epoch-chain 重用通过，服务无 Compute error；server 通过受控 SIGTERM 停止。
+
+这些是短请求的当前证据，不是长时间压力稳定性授权；任何失败仍必须 fail-closed、原生有界排空，不能静默回退为 CPU-gated STAR，也不能把降级路径命名为 RELAY。
+
+### 🚨 2026-09-19 TIMELINE 真实模型事故
+
+`llama-server --tp5-sync timeline` 的首个完成请求正常返回；随后一次 epoch-chain 提交期间，内核在 `0000:06:00.0`（`card1`）记录 `llama-server` 的重复 `[gfxhub]` page fault：`UTCL2/SQC(data)`、`PERMISSION_FAULTS=0x3`，且有 200 个回调被抑制。该启动周期在 fault 后无正常 shutdown 记录地结束，后续启动发现 journal 未清理；`pstore` 无 panic 记录。因此只可确认 TIMELINE 提交、GPU VM fault 与非正常重启的时间关联，**不得把任何单一组件宣称为已证实根因。**
+
+- **停机线：** 在独立稳定性证明前，除用户明确批准的单次、日志保护的 RELAY/TIMELINE 验证外，禁止重启任何 GPU model/server/mesh 压测来“复现”或测速；不得关闭 watchdog，也不得用 `vkDeviceWaitIdle`、进程 abort，或在 timeout 后动态/递增地扩大 spin bound 作为恢复手段。运行前已校准、覆盖完整 GPU→CPU→GPU handoff 的固定 spin_max 不属于这种恢复性重试。
+- **重放不变量：** 禁止以进程级“永久 topology lock”跳过 `pfn_get_cbs` 的当前图 fingerprint / scratch-generation 校验。只有当前图的缓存命令缓冲已重新验证后才能交给 epoch chain；chain 内部可独立复用已验证的 handles。
+- **重启前提：** 先完成非侵入式 GPU idle、AER、温度、前一启动 journal/pstore 与安全 teardown 审计；之后才可在显式批准下按单个、受日志保护的 TIMELINE 请求逐级恢复。
+- **新增停机证据：** 修复上述 replay bypass 后，`GGML_TP5_CHAIN_CACHE=0` 的受控 server 连续两次 HTTP 请求均返回，随后 `SIGTERM` 正常退出（exit 0）；但该启动周期仍以无 clean-shutdown、`pstore` 空、journal 未清理的方式结束，且新 boot 的 IPMI hardware watchdog 仍为 5 min。此前后未记录新的 amdgpu page fault，因此不得把两次 HTTP 返回或 exit 0 当作 teardown 安全证明，更不得在未获明确批准时据此启动 `GGML_TP5_CHAIN_CACHE=1` 或 tok/s 压测；后续明确批准的受控 RELAY/TIMELINE 测量不改变该限制。
+- **已实现、但未真机验证的 teardown contract：** TIMELINE/DRM 现在记录每个 rank 实际成功提交的最高 timeline 值；partial submit 只返回失败，meta 不再 fallback。`comm_free_safe` 仅等待这些真实提交值，wait 失败则让 meta 保留 communicator、graph、buffer 与 child backend，绝不 `GGML_ABORT`、提前析构或用 `vkDeviceWaitIdle` 伪造完成；正常 teardown 先释放 graph/buffer，再释放 backend。此项只有静态构建/CPU 证据，**不是**恢复 GPU 测试的授权。
 
 ### 🚨 2026-09-18 事故反思与血的教训
 

@@ -2857,6 +2857,13 @@ struct ggml_backend_vk_context {
     uint64_t scratch_generation = 0;
     const char * invalidate_reason = nullptr;
     std::unordered_map<const ggml_cgraph *, vk_cached_subgraph> cgraph_cmd_cache;
+    // Reused only within one strict fingerprint comparison. It never survives
+    // a comparison generation, so every replay lookup still validates its live
+    // bindings; the caller separately checks the current scratch generation.
+    uint64_t replay_fingerprint_memo_generation = 0;
+    std::vector<uint64_t> replay_fingerprint_memo_epoch;
+    std::vector<const ggml_tensor *> replay_fingerprint_memo_tensor;
+    std::vector<uint8_t> replay_fingerprint_memo_result;
 
     // A companion is published only by an actual dual-output producer, or a
     // fingerprint-validated replay of that producer. The communicator takes it
@@ -2918,7 +2925,7 @@ static bool ggml_vk_cmd_replay_enabled() {
 }
 
 static void ggml_vk_cache_build_fingerprint(ggml_backend_vk_context::vk_cached_subgraph & entry, const ggml_cgraph * cgraph);
-static bool ggml_vk_cache_fingerprint_match(const ggml_backend_vk_context *                     ctx,
+static bool ggml_vk_cache_fingerprint_match(ggml_backend_vk_context *                           ctx,
                                             const ggml_backend_vk_context::vk_cached_subgraph & entry,
                                             const ggml_cgraph *                                 cgraph);
 static void ggml_vk_cache_entry_free_resources(ggml_backend_vk_context * ctx, ggml_backend_vk_context::vk_cached_subgraph & entry);
@@ -3149,7 +3156,7 @@ static void ggml_vk_cache_build_fingerprint(ggml_backend_vk_context::vk_cached_s
     }
 }
 
-static bool ggml_vk_cache_fingerprint_match(const ggml_backend_vk_context *                     ctx,
+static bool ggml_vk_cache_fingerprint_match(ggml_backend_vk_context *                           ctx,
                                             const ggml_backend_vk_context::vk_cached_subgraph & entry,
                                             const ggml_cgraph *                                 cgraph) {
     const bool wire_requested = cgraph->n_nodes > 0 && ctx->wire_target == cgraph->nodes[cgraph->n_nodes - 1];
@@ -3194,8 +3201,39 @@ static bool ggml_vk_cache_fingerprint_match(const ggml_backend_vk_context *     
             return false;
         return true;
     };
-    bool   same_tensors = true;
-    size_t index = 0, n_unique = 0;
+    bool     same_tensors = true;
+    bool     memo_active  = false;
+    uint64_t memo_generation = 0;
+    size_t   index = 0, n_unique = 0;
+    const auto memoized_match = [&](const ggml_tensor * t,
+                                    const ggml_backend_vk_context::vk_tensor_fingerprint & fp,
+                                    uint32_t fingerprint_index) {
+        if (!memo_active) {
+            memo_active = true;
+            memo_generation = ++ctx->replay_fingerprint_memo_generation;
+            if (memo_generation == 0) {
+                std::fill(ctx->replay_fingerprint_memo_epoch.begin(),
+                          ctx->replay_fingerprint_memo_epoch.end(), 0);
+                memo_generation = 1;
+                ctx->replay_fingerprint_memo_generation = memo_generation;
+            }
+            const size_t n_fingerprints = entry.fingerprint.size();
+            if (ctx->replay_fingerprint_memo_epoch.size() < n_fingerprints) {
+                ctx->replay_fingerprint_memo_epoch.resize(n_fingerprints);
+                ctx->replay_fingerprint_memo_tensor.resize(n_fingerprints);
+                ctx->replay_fingerprint_memo_result.resize(n_fingerprints);
+            }
+        }
+        if (ctx->replay_fingerprint_memo_epoch[fingerprint_index] == memo_generation &&
+            ctx->replay_fingerprint_memo_tensor[fingerprint_index] == t) {
+            return ctx->replay_fingerprint_memo_result[fingerprint_index] != 0;
+        }
+        const bool matches = match(t, fp);
+        ctx->replay_fingerprint_memo_epoch[fingerprint_index] = memo_generation;
+        ctx->replay_fingerprint_memo_tensor[fingerprint_index] = t;
+        ctx->replay_fingerprint_memo_result[fingerprint_index] = matches;
+        return matches;
+    };
     auto   visit = [&](const ggml_tensor * t, int source_slot) {
         if (index == entry.fingerprint_bindings.size())
             return false;
@@ -3208,9 +3246,12 @@ static bool ggml_vk_cache_fingerprint_match(const ggml_backend_vk_context *     
             ++n_unique;
         same_tensors = same_tensors && t == fp.tensor;
         // Read only live addresses reached from the current graph. A repeated
-        // captured address reuses its first comparison; after any rebind, keep
-        // comparing every remaining edge, including formerly shared sources.
-        return (!first && same_tensors) || match(t, fp);
+        // captured address reuses its first comparison. Once a different live
+        // address appears, memoize only repeated (fingerprint-index, tensor)
+        // pairs within this call; every new pair still receives a full strict
+        // root/data/offset/buffer comparison.
+        return (!first && same_tensors) ||
+               (same_tensors ? match(t, fp) : memoized_match(t, fp, binding.fingerprint_index));
     };
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * t = cgraph->nodes[i];
@@ -25082,6 +25123,7 @@ static enum ggml_status ggml_backend_vk_flashprefill_scratch(ggml_backend_t back
 extern "C" {
 void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n);
 void ggml_backend_vk_tp5_comm_free(void * comm);
+bool ggml_backend_vk_tp5_comm_free_safe(void * comm);
 bool ggml_backend_vk_tp5_allreduce_tensor(void * comm, ggml_tensor ** tensors);
 }
 
@@ -25214,6 +25256,9 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     }
     if (strcmp(name, "ggml_backend_comm_free") == 0) {
         return (void *) ggml_backend_vk_tp5_comm_free;
+    }
+    if (strcmp(name, "ggml_backend_comm_free_safe") == 0) {
+        return (void *) ggml_backend_vk_tp5_comm_free_safe;
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *) ggml_backend_vk_tp5_allreduce_tensor;

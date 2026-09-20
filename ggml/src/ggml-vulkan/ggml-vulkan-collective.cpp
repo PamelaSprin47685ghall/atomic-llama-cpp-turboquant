@@ -160,14 +160,27 @@ static VkDeviceSize tp5_flags_region_bytes(size_t n_ranks, tp5_sync_mode sync_mo
 }
 
 static uint32_t tp5_default_spin_max() {
+    constexpr long max_bounded_spin = 100000000L;
     const char * env = getenv("GGML_TP5_SPIN_MAX");
     if (env && env[0]) {
         const long v = strtol(env, nullptr, 10);
-        if (v > 0) return (uint32_t) std::min<long>(v, 1000000L);
+        // This fixed startup budget covers the complete GPU -> CPU -> GPU
+        // handoff. It is bounded above and is never enlarged after a timeout.
+        if (v > 0) return (uint32_t) std::min<long>(v, max_bounded_spin);
     }
     // Keep a missed handoff below the amdgpu watchdog window.  The host
     // protocol reports this bounded failure through status[2].
-    return 1000000u;
+    return (uint32_t) max_bounded_spin;
+}
+
+static uint32_t tp5_default_relay_handoff_timeout_ms() {
+    constexpr long max_bounded_timeout_ms = 10000L;
+    const char * env = getenv("GGML_TP5_RELAY_HANDOFF_TIMEOUT_MS");
+    if (env && env[0]) {
+        const long v = strtol(env, nullptr, 10);
+        if (v > 0) return (uint32_t) std::min<long>(v, max_bounded_timeout_ms);
+    }
+    return 2000u;
 }
 
 struct tp5_rank {
@@ -270,6 +283,9 @@ struct tp5_rank {
     PFN_vkSignalSemaphore pfn_signal_semaphore = nullptr;
     PFN_vkWaitSemaphores pfn_wait_semaphores = nullptr;
     PFN_vkGetSemaphoreCounterValue pfn_get_sem_counter = nullptr;
+    // Highest own-timeline value known to have been accepted by vkQueueSubmit.
+    // It is the only safe drain target after a partial multi-rank submission.
+    uint64_t last_submitted_timeline_value = 0;
 
     // Pipelines
     VkPipeline sum_pipe = VK_NULL_HANDLE;
@@ -387,6 +403,7 @@ struct tp5_binding_key {
 
 struct tp5_comm;
 static bool tp5_drain_epoch(tp5_comm & c, uint64_t epoch, uint64_t timeout_ns = 5000000000ULL);
+static bool tp5_drain_submitted(tp5_comm & c, uint64_t timeout_ns = 5000000000ULL);
 static bool tp5_gpuflag_drain_epoch(tp5_comm & c, size_t ring_idx);
 static bool tp5_gpuflag_drain_all(tp5_comm & c);
 
@@ -576,6 +593,7 @@ struct tp5_comm {
     bool cmd_replay_enabled = true;
     bool                        isolate_mailbox    = false;
     uint32_t spin_max = 100000000u;
+    uint32_t relay_handoff_timeout_ms = 2000u;
     size_t max_elems = 0;
     uint64_t workspace_gen = 1;
 
@@ -671,9 +689,10 @@ struct tp5_comm {
         plans_gen++;
     }
 
-    void clear_cached_plans() {
+    void clear_cached_plans(bool queues_drained = false) {
         invalidate_chain();
-        if (sync_mode == tp5_sync_mode::TIMELINE) {
+        if ((sync_mode == tp5_sync_mode::TIMELINE || sync_mode == tp5_sync_mode::DRM ||
+             sync_mode == tp5_sync_mode::RELAY) && !queues_drained) {
             if (!tp5_drain_epoch(*this, allreduce_calls)) {
                 fail("clear_cached_plans: drain failed before plan destruction");
                 return;
@@ -681,7 +700,8 @@ struct tp5_comm {
         }
         if (sync_mode == tp5_sync_mode::GPUFLAG) {
             tp5_gpuflag_drain_all(*this);
-        } else if (sync_mode != tp5_sync_mode::TIMELINE) {
+        } else if (sync_mode != tp5_sync_mode::TIMELINE && sync_mode != tp5_sync_mode::DRM &&
+                   sync_mode != tp5_sync_mode::RELAY) {
         for (auto & r : ranks) {
             if (r.vkdev != VK_NULL_HANDLE) {
                 vkDeviceWaitIdle(r.vkdev);
@@ -704,7 +724,8 @@ struct tp5_comm {
                 lru_idx = i;
             }
         }
-        if (sync_mode == tp5_sync_mode::TIMELINE) {
+        if (sync_mode == tp5_sync_mode::TIMELINE || sync_mode == tp5_sync_mode::DRM ||
+            sync_mode == tp5_sync_mode::RELAY) {
             if (!tp5_drain_epoch(*this, allreduce_calls)) {
                 fail("evict_lru_plan: drain failed before plan eviction");
                 return;
@@ -712,7 +733,8 @@ struct tp5_comm {
         }
         if (sync_mode == tp5_sync_mode::GPUFLAG) {
             tp5_gpuflag_drain_all(*this);
-        } else if (sync_mode != tp5_sync_mode::TIMELINE) {
+        } else if (sync_mode != tp5_sync_mode::TIMELINE && sync_mode != tp5_sync_mode::DRM &&
+                   sync_mode != tp5_sync_mode::RELAY) {
         for (auto & r : ranks) {
             if (r.vkdev != VK_NULL_HANDLE) {
                 vkDeviceWaitIdle(r.vkdev);
@@ -1525,10 +1547,6 @@ void tp5_destroy_rank(tp5_rank & r) {
 }
 
 bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
-    if (c.sync_mode == tp5_sync_mode::RELAY) {
-        c.fail("RELAY is disabled after an unsafe RADV/Navi21 reset");
-        return false;
-    }
     // Every rank slot and both bank descriptors must satisfy all devices'
     // storage-buffer alignment, including odd-sized F16 payloads.
     const size_t wire_b    = c.wire == tp5_wire_type::F16 ? 2 : 4;
@@ -1548,7 +1566,8 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
         }
     }
     // Clear all cached plans and drain in-flight GPU execution before modifying workspace buffers
-    if (c.sync_mode == tp5_sync_mode::TIMELINE) {
+    if (c.sync_mode == tp5_sync_mode::TIMELINE || c.sync_mode == tp5_sync_mode::DRM ||
+        c.sync_mode == tp5_sync_mode::RELAY) {
         if (!tp5_drain_epoch(c, c.allreduce_calls)) {
             c.fail("setup_workspace: drain failed before workspace reallocation");
             return false;
@@ -1667,6 +1686,26 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
         // STAR never reads a peer VRAM mailbox. With BDA enabled, RADV's
         // global BO list would nevertheless include those unused imports and
         // introduce inter-rank reservation dependencies on every submission.
+        if (c.sync_mode == tp5_sync_mode::RELAY && c.allreduce_calls != 0) {
+            // setup_workspace native-drained every prior real submission
+            // before replacing host-import memory. Reconstruct the two
+            // completed bank generations so the next prequeued chain can
+            // retain its no-host-wait handoff across a workspace resize.
+            for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
+                const uint64_t completed = tp5_mailbox_bank(c.allreduce_calls) == b ?
+                    c.allreduce_calls : c.allreduce_calls - 1;
+                for (size_t i = 0; i < c.n_ranks; ++i) {
+                    auto * status = (volatile uint32_t *) ((char *) c.star_host_aligned[b] +
+                                                           i * c.star_rank_stride + c.star_rank_stride - 64);
+                    status[1] = (uint32_t) completed;
+                    status[3] = (uint32_t) completed;
+                }
+            }
+            std::atomic_thread_fence(std::memory_order_release);
+#if defined(__x86_64__) || defined(_M_X64)
+            _mm_sfence();
+#endif
+        }
         c.max_elems = max_elems;
         return true;
     }
@@ -2104,6 +2143,15 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     bda_pc.mode = 1;
                     vkCmdPushConstants(cmd, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc), &bda_pc);
                     vkCmdDispatch(cmd, 1, 1, 1);
+                    // P1 and autonomous P2 share one queue submission in
+                    // RELAY. Publish the flag itself to HOST before P2 can
+                    // occupy the queue, not only the preceding payload.
+                    VkMemoryBarrier mb_flag{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                             VK_ACCESS_SHADER_WRITE_BIT,
+                                             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_HOST_READ_BIT };
+                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                                         0, 1, &mb_flag, 0, nullptr, 0, nullptr);
                     if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
                         c.fail("end cmd_p1 star failed on rank " + std::to_string(i));
                         return false;
@@ -2322,17 +2370,22 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.relay_copy_pipe);
                     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.relay_copy_layout, 0, 1,
                                             &plan.relay_ds[idx], 0, nullptr);
-                    struct { uint64_t status_bda; uint32_t n_elems; uint32_t seq; uint32_t reserved_spin;
+                    struct { uint64_t status_bda; uint32_t n_elems; uint32_t seq; uint32_t spin_max;
                              uint32_t dst_offset_words; uint32_t reserved0; uint32_t reserved1; } relay_pc{
-                        r.bda_addr[b] + c.star_rank_stride - 64, (uint32_t)n_elems, 1u, 0u,
+                        r.bda_addr[b] + c.star_rank_stride - 64, (uint32_t)n_elems, 1u, c.spin_max,
                         0u, 0u, 0u};
                     vkCmdPushConstants(cmd, r.relay_copy_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                        sizeof(relay_pc), &relay_pc);
                     vkCmdDispatch(cmd, 1, 1, 1);
+                    // P1(e+1)'s host flag is reused as transitive ownership
+                    // credit for bank(e). Make the P2 completion status
+                    // visible to HOST before that later P1 can publish.
                     VkMemoryBarrier mb_post{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-                                            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+                                            VK_ACCESS_SHADER_WRITE_BIT,
+                                            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_HOST_READ_BIT};
                     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_post, 0, nullptr, 0, nullptr);
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                                         0, 1, &mb_post, 0, nullptr, 0, nullptr);
                 } else {
                     VkBufferCopy cp{ 0, trefs[i].offset, bcast_bytes };
                     vkCmdCopyBuffer(cmd, r.bcast_buf[b], trefs[i].buf, 1, &cp);
@@ -2458,45 +2511,63 @@ bool tp5_p2p_visibility_barrier(tp5_comm & c) {
     return true;
 }
 
+static void tp5_note_timeline_submission(tp5_rank & r, uint64_t signal_value) {
+    r.last_submitted_timeline_value = std::max(r.last_submitted_timeline_value, signal_value);
+}
+
+static bool tp5_wait_timeline_value(tp5_comm & c, size_t rank_index, uint64_t target_val, uint64_t timeout_ns) {
+    if (target_val == 0) {
+        return true;
+    }
+    tp5_rank & r = c.ranks[rank_index];
+    if (r.timeline_sem == VK_NULL_HANDLE || r.pfn_wait_semaphores == nullptr) {
+        c.fail("native timeline wait unavailable on rank " + std::to_string(rank_index));
+        return false;
+    }
+    if (c.sync_mode == tp5_sync_mode::DRM && r.own_syncobj && r.dri_fd >= 0) {
+        uint32_t first = 0;
+        auto t_wait_start = std::chrono::high_resolution_clock::now();
+        uint64_t target_val_mut = target_val;
+        if (tp5_drm_syncobj_ops::timeline_wait(r.dri_fd, &r.own_syncobj, &target_val_mut, 1, (int64_t) timeout_ns,
+                                               DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, &first) == 0) {
+            auto t_wait_end = std::chrono::high_resolution_clock::now();
+            if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+                prof->host_wait_count++;
+                prof->host_wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t_wait_end - t_wait_start).count();
+            }
+            return true;
+        }
+    }
+    if (r.pfn_get_sem_counter) {
+        uint64_t cur = 0;
+        if (r.pfn_get_sem_counter(r.vkdev, r.timeline_sem, &cur) == VK_SUCCESS && cur >= target_val) {
+            return true;
+        }
+    }
+    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &r.timeline_sem;
+    wi.pValues = &target_val;
+    auto t_wait_start = std::chrono::high_resolution_clock::now();
+    if (r.pfn_wait_semaphores(r.vkdev, &wi, timeout_ns) != VK_SUCCESS) {
+        c.fail("native timeline wait failed or timed out for value " + std::to_string(target_val) +
+               " on rank " + std::to_string(rank_index));
+        return false;
+    }
+    auto t_wait_end = std::chrono::high_resolution_clock::now();
+    if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+        prof->host_wait_count++;
+        prof->host_wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t_wait_end - t_wait_start).count();
+    }
+    return true;
+}
+
 bool tp5_drain_epoch(tp5_comm & c, uint64_t epoch, uint64_t timeout_ns) {
     if (epoch == 0 || epoch <= c.last_drained_epoch) return true;
     const uint64_t target_val = 2 * epoch;
     for (size_t i = 0; i < c.n_ranks; ++i) {
-        tp5_rank & r = c.ranks[i];
-        if (!r.timeline_sem || !r.pfn_wait_semaphores) continue;
-        if (c.sync_mode == tp5_sync_mode::DRM && r.own_syncobj && r.dri_fd >= 0) {
-            uint32_t first = 0;
-            auto t_wait_start = std::chrono::high_resolution_clock::now();
-            uint64_t target_val_mut = target_val;
-            if (tp5_drm_syncobj_ops::timeline_wait(r.dri_fd, &r.own_syncobj, &target_val_mut, 1, (int64_t) timeout_ns,
-                                                   DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, &first) == 0) {
-                auto t_wait_end = std::chrono::high_resolution_clock::now();
-                if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
-                    prof->host_wait_count++;
-                    prof->host_wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t_wait_end - t_wait_start).count();
-                }
-                continue;
-            }
-        }
-        if (r.pfn_get_sem_counter) {
-            uint64_t cur = 0;
-            if (r.pfn_get_sem_counter(r.vkdev, r.timeline_sem, &cur) == VK_SUCCESS && cur >= target_val) {
-                continue;
-            }
-        }
-        VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
-        wi.semaphoreCount = 1;
-        wi.pSemaphores = &r.timeline_sem;
-        wi.pValues = &target_val;
-        auto t_wait_start = std::chrono::high_resolution_clock::now();
-        if (r.pfn_wait_semaphores(r.vkdev, &wi, timeout_ns) != VK_SUCCESS) {
-            c.fail("drain_epoch: wait failed or timed out for epoch " + std::to_string(epoch) + " on rank " + std::to_string(i));
+        if (!tp5_wait_timeline_value(c, i, target_val, timeout_ns)) {
             return false;
-        }
-        auto t_wait_end = std::chrono::high_resolution_clock::now();
-        if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
-            prof->host_wait_count++;
-            prof->host_wait_us += std::chrono::duration_cast<std::chrono::microseconds>(t_wait_end - t_wait_start).count();
         }
     }
     c.last_drained_epoch = std::max(c.last_drained_epoch, epoch);
@@ -2506,6 +2577,15 @@ bool tp5_drain_epoch(tp5_comm & c, uint64_t epoch, uint64_t timeout_ns) {
             c.in_flight_ring[s].owners.clear();
             c.in_flight_ring[s].p1.reset();
             c.in_flight_ring[s].epoch = 0;
+        }
+    }
+    return true;
+}
+
+bool tp5_drain_submitted(tp5_comm & c, uint64_t timeout_ns) {
+    for (size_t i = 0; i < c.n_ranks; ++i) {
+        if (!tp5_wait_timeline_value(c, i, c.ranks[i].last_submitted_timeline_value, timeout_ns)) {
+            return false;
         }
     }
     return true;
@@ -2625,44 +2705,119 @@ struct tp5_star_times {
     double broadcast_us = 0;
 };
 
-static bool tp5_relay_prepare_bank(tp5_comm & c, size_t bank) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+// Host failure must release every already queued P2 without waiting for its
+// full spin budget. The shader polls status[2] and turns its destination into
+// NaNs; real timeline values still prove completion before destruction.
+static void tp5_relay_request_abort(tp5_comm & c) {
+    for (size_t bank = 0; bank < TP5_MAILBOX_BANKS; ++bank) {
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            auto * status = (volatile uint32_t *) ((char *) c.star_host_aligned[bank] +
+                                                   i * c.star_rank_stride + c.star_rank_stride - 64);
+            status[2] = status[1] == 0u ? UINT32_MAX : status[1];
+            status[4] = UINT32_MAX;
+        }
+    }
+    std::atomic_thread_fence(std::memory_order_release);
+#if defined(__x86_64__) || defined(_M_X64)
+    _mm_sfence();
+#endif
+}
+
+// Arm one bank for its next generation without a host wait. For epoch e > 2,
+// P1(e-1)'s host payload flag can only be visible after P2(e-2) completed on
+// the same queue, so the callback in the following handoff has transitive
+// ownership credit for reusing bank(e). Any broken ordering fails closed.
+static bool tp5_relay_arm_bank(tp5_comm & c, uint64_t epoch) {
+    if (epoch == 0) {
+        c.fail("RELAY cannot arm generation zero");
+        return false;
+    }
+    const size_t   bank              = tp5_mailbox_bank(epoch);
+    const uint32_t previous_expected = epoch > TP5_MAILBOX_BANKS ? (uint32_t) (epoch - TP5_MAILBOX_BANKS) : 0u;
+    std::atomic_thread_fence(std::memory_order_acquire);
     for (size_t i = 0; i < c.n_ranks; ++i) {
         auto * status = (volatile uint32_t *) ((char *) c.star_host_aligned[bank] + i * c.star_rank_stride +
                                                c.star_rank_stride - 64);
-        const uint32_t previous = status[1];
         if (status[2] != 0u) {
             c.fail("RELAY previous GPU wait failed on rank " + std::to_string(i));
             return false;
         }
-        if (previous == 0u) {
-            if (status[3] != 0u) {
-                c.fail("RELAY stale completion on rank " + std::to_string(i));
-                return false;
-            }
-            continue;
+        if (status[1] != previous_expected) {
+            c.fail("RELAY bank generation mismatch on rank " + std::to_string(i) +
+                   " (expected=" + std::to_string(previous_expected) +
+                   ", found=" + std::to_string(status[1]) + ")");
+            return false;
         }
-        while (status[3] != previous) {
-            if (std::chrono::steady_clock::now() >= deadline) {
-                c.fail("RELAY mailbox bank reuse timeout on rank " + std::to_string(i));
-                return false;
-            }
-#if defined(__x86_64__) || defined(_M_X64)
-            _mm_pause();
-#endif
+        if (previous_expected != 0u && status[3] != previous_expected) {
+            c.fail("RELAY transitive bank credit missing on rank " + std::to_string(i) +
+                   " (epoch=" + std::to_string(epoch) + ")");
+            return false;
         }
-        status[1] = 0u;
+        if (previous_expected == 0u && status[3] != 0u) {
+            c.fail("RELAY stale completion on rank " + std::to_string(i));
+            return false;
+        }
+        status[0] = 0u;
+        status[1] = (uint32_t) epoch;
         status[2] = 0u;
         status[3] = 0u;
+        status[4] = 0u;
     }
     c.relay_bank_used[bank] = false;
+    std::atomic_thread_fence(std::memory_order_release);
+#if defined(__x86_64__) || defined(_M_X64)
+    _mm_sfence();
+#endif
     return true;
 }
 
+// The previous chain pre-arms its successor from the final P1 flag. Accept
+// that ready state without a host wait; otherwise arm from already completed
+// predecessor credit. Mixed generations are a protocol failure, never a wait.
+static bool tp5_relay_ensure_armed_epoch(tp5_comm & c, uint64_t epoch) {
+    if (epoch == 0) {
+        c.fail("RELAY cannot ensure generation zero");
+        return false;
+    }
+    const size_t bank = tp5_mailbox_bank(epoch);
+    const uint32_t expected = (uint32_t) epoch;
+    bool armed = false;
+    bool unarmed = false;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    for (size_t i = 0; i < c.n_ranks; ++i) {
+        const auto * status = (const volatile uint32_t *) ((const char *) c.star_host_aligned[bank] +
+                                                            i * c.star_rank_stride + c.star_rank_stride - 64);
+        if (status[1] == expected) {
+            armed = true;
+            if (status[0] != 0u || status[2] != 0u || status[3] != 0u) {
+                c.fail("RELAY pre-armed bank is not idle on rank " + std::to_string(i) +
+                       " (epoch=" + std::to_string(epoch) + ", flag=" + std::to_string(status[0]) +
+                       ", error=" + std::to_string(status[2]) + ", done=" + std::to_string(status[3]) + ")");
+                return false;
+            }
+        } else {
+            unarmed = true;
+        }
+    }
+    if (armed && unarmed) {
+        c.fail("RELAY bank generation differs across ranks for epoch " + std::to_string(epoch));
+        return false;
+    }
+    return armed || tp5_relay_arm_bank(c, epoch);
+}
+
 static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star_times * times = nullptr,
-                             bool relay = false) {
+                             bool relay = false, uint64_t arm_next_epoch = 0) {
+    struct relay_abort_guard {
+        tp5_comm & comm;
+        bool active;
+        ~relay_abort_guard() {
+            if (active) tp5_relay_request_abort(comm);
+        }
+    } abort_guard{c, relay};
     const auto start = std::chrono::steady_clock::now();
-    const auto deadline = start + std::chrono::seconds(2);
+    const auto deadline = start + (relay ? std::chrono::milliseconds(c.relay_handoff_timeout_ms) :
+                                           std::chrono::seconds(2));
     const void * rank_ptrs[5];
     for (size_t i = 0; i < c.n_ranks; ++i) {
         rank_ptrs[i] = (const char *) c.star_host_aligned[bank] + i * c.star_rank_stride;
@@ -2687,6 +2842,12 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
     }
     std::atomic_thread_fence(std::memory_order_acquire);
     const auto ready = std::chrono::steady_clock::now();
+    // P1(e) cannot set its host flag until P2(e-1) completed on the same
+    // queue. Re-arm bank(e+1) before the CPU reduction so a queued, or the
+    // next chain's, P2(e+1) sees its generation without another host submit.
+    if (relay && arm_next_epoch != 0 && !tp5_relay_arm_bank(c, arm_next_epoch)) {
+        return false;
+    }
     void * sum = (char *) c.star_host_aligned[bank] + 5 * c.star_rank_stride;
     // Decode payloads fit in L1/L2; waking 22 workers costs more than the sum.
     const bool out_f32 = true;
@@ -2712,17 +2873,12 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
     _mm_sfence(); // Publish write-combined VRAM stores before the next queue submit.
 #endif
     if (relay) {
-        // Host-coherent is not a substitute for a device memory-domain flush;
-        // explicitly publish payload before the doorbell on every VkDevice.
+        // Keep the payload-before-doorbell protocol, but flush each mapped
+        // local-VRAM allocation once. This is the same store/fence/flush
+        // ordering validated by the RELAY probe: when a device observes its
+        // doorbell, every earlier payload store is already in that flush.
+        uint32_t seqs[5] = {};
         for (size_t i = 0; i < c.n_ranks; ++i) {
-            VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
-            range.memory = c.ranks[i].bcast_mem[bank];
-            range.offset = 0;
-            range.size = VK_WHOLE_SIZE;
-            if (vkFlushMappedMemoryRanges(c.ranks[i].vkdev, 1, &range) != VK_SUCCESS) {
-                c.fail("RELAY host payload flush failed on rank " + std::to_string(i));
-                return false;
-            }
             const auto * status = (volatile uint32_t *) ((char *) c.star_host_aligned[bank] + i * c.star_rank_stride +
                                                          c.star_rank_stride - 64);
             const uint32_t seq = status[1];
@@ -2730,9 +2886,21 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
                 c.fail("RELAY missing epoch on rank " + std::to_string(i));
                 return false;
             }
-            ((volatile uint32_t *) c.ranks[i].bcast_host[bank])[0] = seq;
+            seqs[i] = seq;
+        }
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            ((volatile uint32_t *) c.ranks[i].bcast_host[bank])[0] = seqs[i];
+        }
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_sfence();
+#endif
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
+            range.memory = c.ranks[i].bcast_mem[bank];
+            range.offset = 0;
+            range.size = VK_WHOLE_SIZE;
             if (vkFlushMappedMemoryRanges(c.ranks[i].vkdev, 1, &range) != VK_SUCCESS) {
-                c.fail("RELAY doorbell flush failed on rank " + std::to_string(i));
+                c.fail("RELAY payload-doorbell flush failed on rank " + std::to_string(i));
                 return false;
             }
         }
@@ -2743,129 +2911,89 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
         times->sum_us = std::chrono::duration<double, std::micro>(reduced - ready).count();
         times->broadcast_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - reduced).count();
     }
-    return true;
-}
-
-static bool tp5_relay_wait_epoch(tp5_comm & c, uint64_t epoch) {
-    const size_t bank = tp5_mailbox_bank(epoch);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    for (size_t i = 0; i < c.n_ranks; ++i) {
-        auto * status = (volatile uint32_t *) ((char *) c.star_host_aligned[bank] + i * c.star_rank_stride +
-                                               c.star_rank_stride - 64);
-        while (status[3] != (uint32_t) epoch) {
-            if (status[2] != 0u) {
-                c.fail("RELAY GPU wait timeout on rank " + std::to_string(i) +
-                       " (epoch=" + std::to_string(epoch) + ", error=" + std::to_string(status[2]) + ")");
-                return false;
-            }
-            if (std::chrono::steady_clock::now() >= deadline) {
-                c.fail("RELAY completion timeout on rank " + std::to_string(i) +
-                       " (epoch=" + std::to_string(epoch) + ", expected=" + std::to_string(status[1]) +
-                       ", done=" + std::to_string(status[3]) + ")");
-                return false;
-            }
-#if defined(__x86_64__) || defined(_M_X64)
-            _mm_pause();
-#endif
-        }
-        std::atomic_thread_fence(std::memory_order_acquire);
-    }
-    return true;
-}
-
-static bool tp5_relay_submit_commands(tp5_comm & c, size_t rank, const std::vector<VkCommandBuffer> & commands,
-                                      uint64_t signal_value) {
-    if (commands.empty()) return true;
-    tp5_rank & r = c.ranks[rank];
-    VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-    timeline.signalSemaphoreValueCount = 1;
-    timeline.pSignalSemaphoreValues = &signal_value;
-    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submit.pNext = &timeline;
-    submit.commandBufferCount = (uint32_t) commands.size();
-    submit.pCommandBuffers = commands.data();
-    submit.signalSemaphoreCount = 1;
-    submit.pSignalSemaphores = &r.timeline_sem;
-    if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
-        ++prof->queue_submits;
-        ++prof->submit_batches;
-    }
-    if (vkQueueSubmit(r.queue, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS) {
-        c.fail("RELAY epoch chain submit failed on rank " + std::to_string(rank));
-        return false;
-    }
-    ggml_vk_tp5_mark_queue_submitted(c.backends[rank]);
+    abort_guard.active = false;
     return true;
 }
 
 static bool tp5_relay_submit_epoch_chain(
         tp5_comm & c, const std::vector<std::vector<std::vector<void *>>> & stage_compute_cbs,
         const std::vector<tp5_plan_key> & keys, size_t n_stages) {
-    // Submit compute/P1, publish its host payload, then submit P2.  A P2
-    // command is never resident before its matching doorbell: on RADV a
-    // bounded shader wait can otherwise expire before the host handoff.
-    for (size_t s = 0; s < n_stages; ++s) {
-        const uint64_t epoch = c.allreduce_calls + s + 1;
-        const size_t bank = tp5_mailbox_bank(epoch);
-        if (!tp5_relay_prepare_bank(c, bank)) return false;
+    // Each rank submits one ordered command-buffer stream:
+    // [compute(0), P1(1), P2(1), compute(1), P1(2), ...]. P2 is therefore
+    // resident before the CPU sees P1's host flag; two mailbox banks are
+    // reused only after transitive completion credit from the next P1 flag.
+    if (n_stages == 0 || keys.size() != n_stages || stage_compute_cbs.size() != n_stages + 1 ||
+        c.chain_scratch.size() != c.n_ranks) {
+        c.fail("RELAY epoch chain scratch shape invalid");
+        return false;
+    }
+    const uint64_t first_epoch = c.allreduce_calls + 1;
+    const uint64_t last_epoch  = first_epoch + n_stages - 1;
+    if (last_epoch > UINT32_MAX) {
+        c.fail("RELAY epoch exceeds 32-bit doorbell generation");
+        return false;
+    }
 
-        for (size_t i = 0; i < c.n_ranks; ++i) {
-            auto * status = (volatile uint32_t *) ((char *) c.star_host_aligned[bank] +
-                                                   i * c.star_rank_stride + c.star_rank_stride - 64);
-            status[1] = (uint32_t) epoch;
-            status[2] = 0u;
-            status[3] = 0u;
-        }
-#if defined(__x86_64__) || defined(_M_X64)
-        _mm_sfence();
-#endif
+    // The first P2 can start as soon as P1 does. A prior chain has already
+    // armed this generation; the initial chain arms it from idle state.
+    if (!tp5_relay_ensure_armed_epoch(c, first_epoch)) {
+        return false;
+    }
 
-        for (size_t i = 0; i < c.n_ranks; ++i) {
-            std::vector<VkCommandBuffer> commands;
-            const size_t first_compute =
-                s > 0 && c.cached_plans[c.chain_plan_indices[s - 1]].key.hc[i].width ? 1 : 0;
-            for (size_t cb = first_compute; cb < stage_compute_cbs[s][i].size(); ++cb) {
-                commands.push_back((VkCommandBuffer) stage_compute_cbs[s][i][cb]);
-            }
-            const auto & plan = c.cached_plans[c.chain_plan_indices[s]];
-            commands.push_back(plan.p1->cmd_p1[tp5_plan_slot(i, bank)]);
-            if (!tp5_relay_submit_commands(c, i, commands, 2 * epoch - 1)) return false;
-        }
-
-        tp5_star_times step;
-        if (!tp5_star_handoff(c, bank, keys[s].n_elems, &step, true)) {
-            fprintf(stderr, "[tp5-relay-chain] handoff failed stage=%zu epoch=%llu bank=%zu status:",
-                    s, (unsigned long long) epoch, bank);
-            for (size_t i = 0; i < c.n_ranks; ++i) {
-                const auto * status = (const volatile uint32_t *) ((const char *) c.star_host_aligned[bank] +
-                                                                     i * c.star_rank_stride + c.star_rank_stride - 64);
-                fprintf(stderr, " r%zu=[%u,%u,%u,%u]", i, status[0], status[1], status[2], status[3]);
-            }
-            if (s > 0) {
-                const size_t previous_bank = tp5_mailbox_bank(epoch - 1);
-                fprintf(stderr, " previous_bank=%zu", previous_bank);
-                for (size_t i = 0; i < c.n_ranks; ++i) {
-                    const auto * status = (const volatile uint32_t *) ((const char *) c.star_host_aligned[previous_bank] +
-                                                                         i * c.star_rank_stride + c.star_rank_stride - 64);
-                    fprintf(stderr, " r%zu=[%u,%u,%u,%u,%u]", i, status[0], status[1], status[2], status[3], status[4]);
-                }
-            }
-            fputc('\n', stderr);
+    const uint64_t final_signal = 2 * last_epoch;
+    bool submitted_any = false;
+    for (size_t i = 0; i < c.n_ranks; ++i) {
+        auto & scratch = c.chain_scratch[i];
+        if (scratch.compute.size() < 2 * n_stages || scratch.compute.size() > UINT32_MAX) {
+            if (submitted_any) tp5_relay_request_abort(c);
+            c.fail("RELAY epoch chain command layout invalid on rank " + std::to_string(i));
             return false;
         }
-        for (size_t i = 0; i < c.n_ranks; ++i) {
-            const auto & plan = c.cached_plans[c.chain_plan_indices[s]];
-            std::vector<VkCommandBuffer> commands{plan.cmd_p2[tp5_plan_slot(i, bank)]};
-            if (s + 1 == n_stages) {
-        const size_t first_tail = plan.key.hc[i].width ? 1 : 0;
-        for (size_t cb = first_tail; cb < stage_compute_cbs.back()[i].size(); ++cb) {
-            commands.push_back((VkCommandBuffer) stage_compute_cbs.back()[i][cb]);
+        VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        timeline.signalSemaphoreValueCount = 1;
+        timeline.pSignalSemaphoreValues    = &final_signal;
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.pNext                = &timeline;
+        submit.commandBufferCount   = (uint32_t) scratch.compute.size();
+        submit.pCommandBuffers      = scratch.compute.data();
+        submit.signalSemaphoreCount = 1;
+        submit.pSignalSemaphores    = &c.ranks[i].timeline_sem;
+        if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+            ++prof->queue_submits;
+            ++prof->submit_batches;
+        }
+        if (vkQueueSubmit(c.ranks[i].queue, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS) {
+            tp5_relay_request_abort(c);
+            c.fail("RELAY full-chain submit failed on rank " + std::to_string(i));
+            return false;
+        }
+        ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
+        tp5_note_timeline_submission(c.ranks[i], final_signal);
+        submitted_any = true;
+    }
+
+    for (size_t s = 0; s < n_stages; ++s) {
+        const uint64_t epoch = first_epoch + s;
+        // e+1 reuses bank(e-1). P1(e)'s flag is its transitive proof that
+        // P2(e-1) completed, so arm e+1 before publishing e's payload. The
+        // final stage also prepares the next epoch chain without a host wait.
+        const uint64_t arm_next_epoch = epoch < UINT32_MAX ? epoch + 1 : 0;
+        if (!tp5_star_handoff(c, tp5_mailbox_bank(epoch), keys[s].n_elems, nullptr, true,
+                              arm_next_epoch)) {
+            fprintf(stderr, "[tp5-relay-chain] handoff failed stage=%zu epoch=%llu bank=%zu\n",
+                    s, (unsigned long long) epoch, tp5_mailbox_bank(epoch));
+            return false;
         }
     }
-            if (!tp5_relay_submit_commands(c, i, commands, 2 * epoch)) return false;
-        }
+
+    // Match TIMELINE's asynchronous chain contract: the final P2 and graph
+    // tail remain in flight behind their real final timeline value. Capacity
+    // backpressure and teardown drain that actual submission; no per-chain
+    // host wait or second P2 submission is permitted here.
+    c.allreduce_calls = last_epoch;
+    if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+        prof->collective_calls += n_stages;
     }
-    c.allreduce_calls += n_stages;
     return true;
 }
 
@@ -3253,6 +3381,18 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
     tp5_cached_plan one_shot;
     bool is_cached = false;
     bool plan_cache_hit = false;
+    struct one_shot_retain_guard {
+        tp5_comm & comm;
+        tp5_cached_plan & plan;
+        bool & cached;
+        bool armed = false;
+
+        ~one_shot_retain_guard() {
+            if (armed && !cached) {
+                comm.cached_plans.push_back(std::move(plan));
+            }
+        }
+    } retain_one_shot{c, one_shot, is_cached};
 
     size_t & last_hit_idx = c.last_hit_idx;
     if (c.cmd_replay_enabled) {
@@ -3367,17 +3507,60 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
 
     const auto t_bp1 = std::chrono::high_resolution_clock::now();
 
-    if (c.sync_mode == tp5_sync_mode::RELAY && !tp5_relay_prepare_bank(c, tp5_mailbox_bank(epoch))) {
+    if (c.sync_mode == tp5_sync_mode::RELAY && !tp5_relay_ensure_armed_epoch(c, epoch)) {
         return false;
     }
 
     // Submit Phase 1 on all ranks
+    retain_one_shot.armed = !is_cached;
     const bool p1_on_transfer = false;
     static const bool merge_submit = [] {
         const char * env = getenv("GGML_TP5_MERGE_SUBMIT");
         return env ? (atoi(env) != 0) : true;
     }();
-    if (c.sync_mode == tp5_sync_mode::TIMELINE || c.sync_mode == tp5_sync_mode::DRM) {
+    if (c.sync_mode == tp5_sync_mode::RELAY) {
+        const size_t bank = tp5_mailbox_bank(epoch);
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            auto * status = (volatile uint32_t *) ((char *) c.star_host_aligned[bank] +
+                                                   i * c.star_rank_stride + c.star_rank_stride - 64);
+            if (status[0] != 0u || status[1] != (uint32_t) epoch || status[2] != 0u || status[3] != 0u) {
+                c.fail("RELAY mailbox status not idle on rank " + std::to_string(i) +
+                       " (epoch=" + std::to_string(epoch) + ", expected=" + std::to_string(status[1]) +
+                       ", flag=" + std::to_string(status[0]) + ", error=" + std::to_string(status[2]) +
+                       ", done=" + std::to_string(status[3]) + ")");
+                return false;
+            }
+        }
+        // Submit P1 and P2 together as one ordered queue batch per rank. P2
+        // is resident before the CPU reduction; no post-handoff submit or
+        // host semaphore releases it.
+        const uint64_t final_signal = 2 * epoch;
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            tp5_rank & r = c.ranks[i];
+            const size_t bslot = tp5_plan_slot(i, bank);
+            const VkCommandBuffer commands[] = { plan->p1->cmd_p1[bslot], plan->cmd_p2[bslot] };
+            VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+            timeline.signalSemaphoreValueCount = 1;
+            timeline.pSignalSemaphoreValues    = &final_signal;
+            VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            submit.pNext                = &timeline;
+            submit.commandBufferCount   = 2;
+            submit.pCommandBuffers      = commands;
+            submit.signalSemaphoreCount = 1;
+            submit.pSignalSemaphores    = &r.timeline_sem;
+            if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+                ++prof->queue_submits;
+                ++prof->submit_batches;
+            }
+            if (vkQueueSubmit(r.queue, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS) {
+                tp5_relay_request_abort(c);
+                c.fail("RELAY full one-shot submit failed on rank " + std::to_string(i));
+                return false;
+            }
+            ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
+            tp5_note_timeline_submission(r, final_signal);
+        }
+    } else if (c.sync_mode == tp5_sync_mode::TIMELINE || c.sync_mode == tp5_sync_mode::DRM) {
         if (merge_submit && c.n_ranks <= 8) {
             // Merged 2-stage submit (AGENTS.md P2): submit Phase 1 + Phase 2 together in one
             // vkQueueSubmit per rank (2 VkSubmitInfo entries). Reduces ioctl/kernel submissions
@@ -3387,7 +3570,7 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
             for (size_t i = 0; i < c.n_ranks; ++i) {
                 tp5_rank & r = c.ranks[i];
                 const size_t bslot = tp5_plan_slot(i, tp5_mailbox_bank(epoch));
-                b1[i].init(r, i, c.n_ranks, epoch, true,  &plan->p1->cmd_p1[bslot]);
+                b1[i].init(r, i, c.n_ranks, epoch, true, &plan->p1->cmd_p1[bslot]);
                 b2[i].init(r, i, c.n_ranks, epoch, false, &plan->cmd_p2[bslot]);
                 VkSubmitInfo submits[2] = { b1[i].submit, b2[i].submit };
 
@@ -3397,15 +3580,16 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                 }
                 if (vkQueueSubmit(r.queue, 2, submits, VK_NULL_HANDLE) != VK_SUCCESS) {
                     c.fail("Phase 1+2 merged timeline submit failed on rank " + std::to_string(i));
-                    GGML_ABORT("ggml-vulkan-collective: partially submitted merged timeline epoch cannot continue\n");
+                    return false;
                 }
                 ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
+                tp5_note_timeline_submission(r, b2[i].signal);
             }
         } else {
             // Split submit: Phase 1 enqueued on all ranks first; Phase 2 enqueued in second loop below.
             for (size_t i = 0; i < c.n_ranks; ++i) {
                 tp5_rank & r = c.ranks[i];
-                const size_t       bslot = tp5_plan_slot(i, tp5_mailbox_bank(epoch));
+                const size_t bslot = tp5_plan_slot(i, tp5_mailbox_bank(epoch));
                 tp5_timeline_batch batch;
                 batch.init(r, i, c.n_ranks, epoch, true, &plan->p1->cmd_p1[bslot]);
                 const VkSubmitInfo & si = batch.submit;
@@ -3416,81 +3600,13 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                 }
                 if (vkQueueSubmit(r.queue, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) {
                     c.fail("Phase 1 timeline submit failed on rank " + std::to_string(i));
-                    GGML_ABORT("ggml-vulkan-collective: partially submitted timeline epoch cannot continue\n");
+                    return false;
                 }
-            }
-        }
-    } else if (c.sync_mode == tp5_sync_mode::GPUFLAG) {
-        size_t ring_idx = (size_t)((epoch - 1) % tp5_comm::MAX_OUTSTANDING_EPOCHS);
-        for (size_t i = 0; i < c.n_ranks; ++i) {
-            tp5_rank & r = c.ranks[i];
-            const size_t bslot = tp5_plan_slot(i, tp5_mailbox_bank(epoch));
-            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-            si.commandBufferCount = 1;
-            si.pCommandBuffers    = &plan->p1->cmd_p1[bslot];
-            if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
-                prof->queue_submits++;
-                prof->submit_batches++;
-            }
-            if (vkQueueSubmit(r.queue, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) {
-                c.fail("Phase 1 gpuflag submit failed on rank " + std::to_string(i));
-                return false;
-            }
-        }
-    } else {
-        for (size_t i = 0; i < c.n_ranks; ++i) {
-            tp5_rank & r = c.ranks[i];
-            const size_t bslot = tp5_plan_slot(i, tp5_mailbox_bank(epoch));
-            VkQueue q = p1_on_transfer ? r.transfer_queue : r.queue;
-            VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-            si.commandBufferCount = 1;
-            si.pCommandBuffers    = &plan->p1->cmd_p1[bslot];
-            if (c.sync_mode == tp5_sync_mode::SYNCFD) {
-                si.signalSemaphoreCount = 1;
-                si.pSignalSemaphores = &r.sem_p1_done;
-            }
-            VkFence f = (c.sync_mode == tp5_sync_mode::SYNCFD) ? VK_NULL_HANDLE : r.fence_p1;
-            if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
-                prof->queue_submits++;
-                prof->submit_batches++;
-            }
-            if (vkQueueSubmit(q, 1, &si, f) != VK_SUCCESS) {
-                for (size_t k = 0; k < i; ++k) {
-                    vkQueueWaitIdle(c.ranks[k].queue);
-                }
-                c.fail("Phase 1 submit failed on rank " + std::to_string(i));
-                GGML_ABORT("ggml-vulkan-collective: unrecoverable runtime failure: Phase 1 submit failed on rank %zu\n", i);
+                tp5_note_timeline_submission(r, batch.signal);
             }
         }
     }
-
     auto t2 = std::chrono::high_resolution_clock::now();
-    bool relay_p2_submitted = false;
-    if (c.sync_mode == tp5_sync_mode::RELAY) {
-        // The relay P2 command must already be resident at its bounded local
-        // VRAM wait before the CPU publishes the reduction payload.
-        for (size_t i = 0; i < c.n_ranks; ++i) {
-            tp5_rank & r = c.ranks[i];
-            const size_t bslot = tp5_plan_slot(i, tp5_mailbox_bank(epoch));
-            auto * status = (volatile uint32_t *) ((char *) c.star_host_aligned[tp5_mailbox_bank(epoch)] +
-                                                   i * c.star_rank_stride + c.star_rank_stride - 64);
-            if (status[2] != 0u || status[3] != 0u) {
-                c.fail("RELAY mailbox status not idle on rank " + std::to_string(i) +
-                       " (epoch=" + std::to_string(epoch) + ", expected=" + std::to_string(status[1]) +
-                       ", error=" + std::to_string(status[2]) + ", done=" + std::to_string(status[3]) + ")");
-                return false;
-            }
-            status[1] = (uint32_t) epoch;
-            tp5_timeline_batch batch;
-            batch.init(r, i, c.n_ranks, epoch, false, &plan->cmd_p2[bslot], false, true);
-            if (vkQueueSubmit(r.queue, 1, &batch.submit, VK_NULL_HANDLE) != VK_SUCCESS) {
-                c.fail("RELAY pre-submitted Phase 2 failed on rank " + std::to_string(i));
-                return false;
-            }
-            ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
-        }
-        relay_p2_submitted = true;
-    }
 
     if (c.sync_mode == tp5_sync_mode::TIMELINE || c.sync_mode == tp5_sync_mode::DRM) {
         // Zero host wait, zero per-AR export/import, zero vkDeviceWaitIdle:
@@ -3507,11 +3623,8 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
             }
             VkResult res = r_src.pfn_get_sem_fd(r_src.vkdev, &gfi, &sync_fd);
             if (res != VK_SUCCESS) {
-                for (size_t k = 0; k < c.n_ranks; ++k) {
-                    vkQueueWaitIdle(c.ranks[k].queue);
-                }
                 c.fail("GetSemaphoreFdKHR failed on rank " + std::to_string(src));
-                GGML_ABORT("ggml-vulkan-collective: unrecoverable runtime failure: GetSemaphoreFdKHR failed on rank %zu\n", src);
+                return false;
             }
             for (size_t dst = 0; dst < c.n_ranks; ++dst) {
                 if (dst == src) continue;
@@ -3522,11 +3635,8 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                     fd_for_import = ::dup(sync_fd);
                     if (fd_for_import < 0) {
                         ::close(sync_fd);
-                        for (size_t k = 0; k < c.n_ranks; ++k) {
-                            vkQueueWaitIdle(c.ranks[k].queue);
-                        }
                         c.fail("dup sync_fd failed for rank " + std::to_string(dst));
-                        GGML_ABORT("ggml-vulkan-collective: unrecoverable runtime failure: dup sync_fd failed for rank %zu\n", dst);
+                        return false;
                     }
                 }
 
@@ -3546,11 +3656,8 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                     if (sync_fd >= 0) {
                         ::close(sync_fd);
                     }
-                    for (size_t k = 0; k < c.n_ranks; ++k) {
-                        vkQueueWaitIdle(c.ranks[k].queue);
-                    }
                     c.fail("ImportSemaphoreFdKHR failed on rank " + std::to_string(dst));
-                    GGML_ABORT("ggml-vulkan-collective: unrecoverable runtime failure: ImportSemaphoreFdKHR failed on rank %zu\n", dst);
+                    return false;
                 }
             }
             if (sync_fd >= 0) {
@@ -3559,13 +3666,13 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
         }
     } else if (c.sync_mode == tp5_sync_mode::RELAY) {
         tp5_star_times relay_times;
-        if (!tp5_star_handoff(c, tp5_mailbox_bank(epoch), n_elems, &relay_times, true)) {
+        const uint64_t arm_next_epoch = epoch < UINT32_MAX ? epoch + 1 : 0;
+        if (!tp5_star_handoff(c, tp5_mailbox_bank(epoch), n_elems, &relay_times, true, arm_next_epoch)) {
             return false;
         }
-        if (!tp5_relay_wait_epoch(c, epoch)) return false;
     } else if (c.sync_mode != tp5_sync_mode::GPUFLAG) {
         if (!tp5_wait_all_p1(c)) {
-            GGML_ABORT("ggml-vulkan-collective: unrecoverable runtime failure: Phase 1 fence wait failed\n");
+            return false;
         }
     }
     if (c.sync_mode != tp5_sync_mode::TIMELINE && c.sync_mode != tp5_sync_mode::DRM &&
@@ -3594,26 +3701,14 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                 if (vkQueueSubmit(r.queue, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) {
                     // Do NOT call vkQueueWaitIdle on prior ranks: avoid deadlock on missing signals
                     c.fail("Phase 2 timeline submit failed on rank " + std::to_string(i));
-                    GGML_ABORT("ggml-vulkan-collective: partially submitted timeline epoch cannot continue\n");
+                    return false;
                 }
                 ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
+                tp5_note_timeline_submission(r, batch.signal);
             }
-        }
-    } else if (c.sync_mode == tp5_sync_mode::RELAY && !relay_p2_submitted) {
-        for (size_t i = 0; i < c.n_ranks; ++i) {
-            tp5_rank & r = c.ranks[i];
-            const size_t bslot = tp5_plan_slot(i, tp5_mailbox_bank(epoch));
-            tp5_timeline_batch batch;
-            batch.init(r, i, c.n_ranks, epoch, false, &plan->cmd_p2[bslot], false, true);
-            if (vkQueueSubmit(r.queue, 1, &batch.submit, VK_NULL_HANDLE) != VK_SUCCESS) {
-                c.fail("RELAY Phase 2 submit failed on rank " + std::to_string(i));
-                return false;
-            }
-            ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
         }
     } else if (c.sync_mode == tp5_sync_mode::RELAY) {
-        // Already submitted before the CPU handoff; the bounded local-VRAM
-        // shader wait owns progression from this point.
+        // P2 is already resident behind P1 on each queue.
     } else if (c.sync_mode == tp5_sync_mode::GPUFLAG) {
         size_t ring_idx = (size_t)((epoch - 1) % tp5_comm::MAX_OUTSTANDING_EPOCHS);
         for (size_t i = 0; i < c.n_ranks; ++i) {
@@ -3654,27 +3749,17 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
             prof->submit_batches++;
         }
         if (vkQueueSubmit(r.queue, 1, &si, r.fence_p2) != VK_SUCCESS) {
-            for (size_t k = 0; k < i; ++k) {
-                vkQueueWaitIdle(c.ranks[k].queue);
-            }
             c.fail("Phase 2 submit failed on rank " + std::to_string(i));
-            GGML_ABORT("ggml-vulkan-collective: unrecoverable runtime failure: Phase 2 submit failed on rank %zu\n", i);
+            return false;
         }
     }
 
     if (!tp5_wait_all_p2(c)) {
-        GGML_ABORT("ggml-vulkan-collective: unrecoverable runtime failure: Phase 2 fence wait failed\n");
+        return false;
     }
     }
 
     auto t5 = std::chrono::high_resolution_clock::now();
-
-    if (c.sync_mode == tp5_sync_mode::RELAY && getenv("GGML_TP5_RELAY_DRAIN")) {
-        if (!tp5_drain_epoch(c, epoch)) {
-            c.fail("RELAY debug drain failed");
-            return false;
-        }
-    }
 
     if (!is_cached) {
         if (c.sync_mode == tp5_sync_mode::TIMELINE || c.sync_mode == tp5_sync_mode::RELAY) {
@@ -3683,6 +3768,7 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
                 return false;
             }
         }
+        retain_one_shot.armed = false;
         c.destroy_plan(one_shot);
     }
 
@@ -3843,7 +3929,7 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
     tp5_comm & c = *reinterpret_cast<tp5_comm *>(comm_handle);
     std::lock_guard<std::mutex> lock(c.mutex);
     if (c.failed) {
-        GGML_ABORT("ggml-vulkan-collective: cannot submit on failed communicator\n");
+        return false;
     }
     if ((c.sync_mode != tp5_sync_mode::TIMELINE && c.sync_mode != tp5_sync_mode::DRM &&
          c.sync_mode != tp5_sync_mode::STAR && c.sync_mode != tp5_sync_mode::RELAY) || !c.cmd_replay_enabled)
@@ -3931,7 +4017,7 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
         }
     }
     if (max_elems > c.max_elems && !tp5_setup_workspace(c, max_elems)) {
-        GGML_ABORT("ggml-vulkan-collective: epoch chain workspace setup failed\n");
+        return false;
     }
     const size_t       wire_b     = c.wire == tp5_wire_type::F16 ? 2 : 4;
     const VkDeviceSize stride     = (VkDeviceSize) c.max_elems * wire_b;
@@ -3974,7 +4060,7 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
             if (c.cached_plans.size() >= tp5_comm::MAX_CACHED_PLANS) {
                 c.clear_cached_plans();
                 if (c.failed) {
-                    GGML_ABORT("ggml-vulkan-collective: chain plan retirement failed\n");
+                    return false;
                 }
                 s = (size_t) -1;
                 continue;
@@ -3986,7 +4072,7 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
             std::vector<tensor_dev_ref> stage_refs(refs.begin() + s * c.n_ranks, refs.begin() + (s + 1) * c.n_ranks);
             if (!tp5_record_plan(c, new_p, stage_refs, new_p.key.n_elems, flags_base)) {
                 c.destroy_plan(new_p);
-                GGML_ABORT("ggml-vulkan-collective: epoch chain plan recording failed\n");
+                return false;
             }
             found_idx = c.cached_plans.size();
             c.cached_plans.push_back(std::move(new_p));
@@ -4007,7 +4093,7 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
         last_epoch > tp5_comm::MAX_OUTSTANDING_EPOCHS ? last_epoch - tp5_comm::MAX_OUTSTANDING_EPOCHS : 0;
     const auto bp_start = std::chrono::steady_clock::now();
     if (!tp5_drain_epoch(c, retire_before)) {
-        GGML_ABORT("ggml-vulkan-collective: epoch chain owner retirement failed\n");
+        return false;
     }
     if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
         prof->backpressure_us +=
@@ -4023,8 +4109,11 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
     }
     const bool isolate_bo = c.isolate_mailbox && c.sync_mode != tp5_sync_mode::STAR && c.sync_mode != tp5_sync_mode::RELAY;
     const char * chain_cache_env   = getenv("GGML_TP5_CHAIN_CACHE");
-    const bool   allow_chain_cache = c.sync_mode != tp5_sync_mode::RELAY &&
-                                     (chain_cache_env == nullptr || atoi(chain_cache_env) != 0);
+    // This reuses only the submission layout after the caller rebuilt and
+    // compared current stage command handles, plan keys, and generations; it
+    // is not a topology lock or a graph-validation bypass. RELAY needs the
+    // same reusable full-chain layout to keep every P2 prequeued.
+    const bool   allow_chain_cache = chain_cache_env == nullptr || atoi(chain_cache_env) != 0;
 
     bool can_reuse_chain =
         allow_chain_cache && !capture && c.compiled_chain.valid && c.compiled_chain.n_stages == n_stages &&
@@ -4195,9 +4284,6 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
     for (auto backend : c.backends)
         ggml_vk_tp5_flush_async(backend);
     if (c.sync_mode == tp5_sync_mode::RELAY) {
-        if (c.allreduce_calls > c.last_drained_epoch && !tp5_drain_epoch(c, c.allreduce_calls)) {
-            return false;
-        }
         if (!tp5_relay_submit_epoch_chain(c, stage_compute_cbs, keys, n_stages)) {
             return false;
         }
@@ -4219,13 +4305,18 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
         const auto submit_start = measure_submit ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (vkQueueSubmit(c.ranks[i].queue, (uint32_t) submits.size(), submits.data(), VK_NULL_HANDLE) != VK_SUCCESS) {
             c.fail("epoch chain submit failed on rank " + std::to_string(i));
-            GGML_ABORT("ggml-vulkan-collective: partially submitted epoch chain cannot continue\n");
+            return false;
         }
         if (measure_submit) {
             submit_wall_us[i] += std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - submit_start).count();
         }
         ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
+        uint64_t last_signal = 0;
+        for (const auto & batch : c.chain_scratch[i].batches) {
+            last_signal = std::max(last_signal, batch.signal);
+        }
+        tp5_note_timeline_submission(c.ranks[i], last_signal);
     }
     if (c.sync_mode == tp5_sync_mode::STAR || c.sync_mode == tp5_sync_mode::RELAY) {
         for (size_t s = 0; s < n_stages; ++s) {
@@ -4233,7 +4324,7 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
             tp5_star_times step;
             if (!tp5_star_handoff(c, tp5_mailbox_bank(epoch), keys[s].n_elems, &step,
                                   c.sync_mode == tp5_sync_mode::RELAY)) {
-                GGML_ABORT("ggml-vulkan-collective: relay/star chain handoff failed\n");
+                return false;
             }
             chain_handoff.wait_us += step.wait_us;
             chain_handoff.sum_us += step.sum_us;
@@ -4243,14 +4334,14 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
                 auto & rank = c.ranks[i];
                 if (!rank.pfn_signal_semaphore || rank.host_ready_sem == VK_NULL_HANDLE) {
                     c.fail("STAR host timeline signal unavailable on rank " + std::to_string(i));
-                    GGML_ABORT("ggml-vulkan-collective: STAR host signal unavailable\n");
+                    return false;
                 }
                 VkSemaphoreSignalInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
                 signal.semaphore = rank.host_ready_sem;
                 signal.value = epoch;
                 if (rank.pfn_signal_semaphore(rank.vkdev, &signal) != VK_SUCCESS) {
                     c.fail("STAR host timeline signal failed on rank " + std::to_string(i));
-                    GGML_ABORT("ggml-vulkan-collective: STAR host signal failed\n");
+                    return false;
                 }
             }
             if (measure_submit) {
@@ -4304,6 +4395,7 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
     auto * c = new tp5_comm();
     c->n_ranks = n;
     c->spin_max = tp5_default_spin_max();
+    c->relay_handoff_timeout_ms = tp5_default_relay_handoff_timeout_ms();
     c->ranks.resize(n);
     c->chain_scratch.resize(n);
     c->backends.assign(backends, backends + n);
@@ -4321,9 +4413,7 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
     if (sync_env && (strcmp(sync_env, "star") == 0 || strcmp(sync_env, "l3_star") == 0)) {
         c->sync_mode = tp5_sync_mode::STAR;
     } else if (sync_env && strcmp(sync_env, "relay") == 0) {
-        fprintf(stderr, "ggml-vulkan-collective: sync mode 'relay' is disabled after an unsafe RADV/Navi21 reset; use timeline or star\n");
-        delete c;
-        return nullptr;
+        c->sync_mode = tp5_sync_mode::RELAY;
     } else if (sync_env && strcmp(sync_env, "timeline") == 0) {
         c->sync_mode = tp5_sync_mode::TIMELINE;
     } else if (sync_env && strcmp(sync_env, "host") == 0) {
@@ -4727,32 +4817,41 @@ void * ggml_backend_vk_tp5_comm_init(ggml_backend_t * backends, size_t n) {
                                  (c->sync_mode == tp5_sync_mode::SYNCFD) ? "syncfd" :
                                  (c->sync_mode == tp5_sync_mode::GPUFLAG) ? "gpuflag" : "host";
         fprintf(stderr, "ggml-vulkan-collective: init %zu ranks, wire=%s sync=%s relay=%s, "
-                        "replay=%s\n",
+                        "replay=%s, relay_handoff_timeout_ms=%u\n",
                 n, c->wire == tp5_wire_type::F16 ? "f16" : "f32",
                 sync_name,
                 c->sync_mode == tp5_sync_mode::RELAY ? "vram-doorbell" : "off",
-                c->cmd_replay_enabled ? "on" : "off");
+                c->cmd_replay_enabled ? "on" : "off", c->relay_handoff_timeout_ms);
     }
     return c;
 }
 
-void ggml_backend_vk_tp5_comm_free(void * comm) {
-    if (!comm) return;
+bool ggml_backend_vk_tp5_comm_free_safe(void * comm) {
+    if (!comm) return true;
     auto * c = (tp5_comm *) comm;
+    std::lock_guard<std::mutex> lock(c->mutex);
+    const bool timeline_mode = c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::DRM ||
+                               c->sync_mode == tp5_sync_mode::RELAY;
     if (c->failed) {
-        fprintf(stderr, "ggml-vulkan-collective: comm_free called on failed collective: aborting to prevent destroying active resources\n");
-        GGML_ABORT("ggml-vulkan-collective: unrecoverable runtime failure: comm_free called on failed collective\n");
-    }
-    if (c->sync_mode == tp5_sync_mode::TIMELINE || c->sync_mode == tp5_sync_mode::DRM ||
-        c->sync_mode == tp5_sync_mode::STAR || c->sync_mode == tp5_sync_mode::RELAY) {
+        if (!timeline_mode || !tp5_drain_submitted(*c)) {
+            fprintf(stderr, "ggml-vulkan-collective: failed collective could not drain actual submissions; retaining resources\n");
+            return false;
+        }
+    } else if (timeline_mode || c->sync_mode == tp5_sync_mode::STAR || c->sync_mode == tp5_sync_mode::RELAY) {
         if (!tp5_drain_epoch(*c, c->allreduce_calls)) {
-            GGML_ABORT("ggml-vulkan-collective: unrecoverable runtime failure: comm_free drain failed for epoch %llu\n", (unsigned long long) c->allreduce_calls);
+            fprintf(stderr, "ggml-vulkan-collective: native teardown drain failed for epoch %llu; retaining resources\n",
+                    (unsigned long long) c->allreduce_calls);
+            return false;
         }
     }
-    c->clear_cached_plans();
+    c->clear_cached_plans(timeline_mode);
+    if (!timeline_mode && c->failed) {
+        fprintf(stderr, "ggml-vulkan-collective: plan cleanup failed; retaining resources\n");
+        return false;
+    }
     if (c->sync_mode == tp5_sync_mode::GPUFLAG) {
         tp5_gpuflag_drain_all(*c);
-    } else if (c->sync_mode != tp5_sync_mode::TIMELINE && c->sync_mode != tp5_sync_mode::STAR &&
+    } else if (!timeline_mode && c->sync_mode != tp5_sync_mode::STAR &&
                c->sync_mode != tp5_sync_mode::RELAY) {
     for (auto & r : c->ranks) {
         if (r.vkdev != VK_NULL_HANDLE) {
@@ -4775,6 +4874,13 @@ void ggml_backend_vk_tp5_comm_free(void * comm) {
 
     for (auto & r : c->ranks) tp5_destroy_rank(r);
     delete c;
+    return true;
+}
+
+void ggml_backend_vk_tp5_comm_free(void * comm) {
+    if (!ggml_backend_vk_tp5_comm_free_safe(comm)) {
+        fprintf(stderr, "ggml-vulkan-collective: unsafe communicator teardown retained for process lifetime\n");
+    }
 }
 
 bool ggml_backend_vk_tp5_allreduce_tensor(void * comm, ggml_tensor ** tensors) {
@@ -4857,12 +4963,6 @@ bool ggml_backend_vk_tp5_prepare_graph(void * comm, size_t rank, ggml_cgraph * g
 // Isolated hardware experiment: CPU arithmetic remains part of the protocol;
 // only GPU queue progression is autonomous. No model graph uses this entrypoint.
 int ggml_vk_tp5_relay_probe(ggml_backend_t * backends, size_t n, const ggml_vk_relay_config & cfg) {
-    (void) backends;
-    (void) n;
-    (void) cfg;
-    fprintf(stderr, "relay: disabled after an unsafe RADV/Navi21 reset; no GPU work was submitted\n");
-    return 1;
-
     if (n != 5 || !backends || cfg.stages < 1 || cfg.stages > 96 || cfg.replays < 1 || cfg.replays > 32 ||
         cfg.elements < 1 || cfg.elements > 4096 || cfg.spin_max < 1 || cfg.spin_max > 1000000 ||
         cfg.delay_us > 2000 || cfg.withhold_stage > cfg.stages || cfg.partial_submit_ranks >= n ||

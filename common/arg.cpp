@@ -3026,12 +3026,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--tp5-sync"}, "MODE",
-        "TP5 sync: host | syncfd | timeline | star | l3_star | gpuflag (default: timeline; relay is disabled for safety)",
+        "TP5 sync: host | syncfd | timeline | star | l3_star | relay | gpuflag (default: timeline)",
         [](common_params & params, const std::string & value) {
             params.tp5.enabled = true;
-            if (value == "relay") {
-                throw std::invalid_argument("TP5 sync mode 'relay' is disabled after an unsafe RADV/Navi21 reset");
-            }
             if (value == "star" || value == "l3_star") {
                 params.tp5.sync = "star";
             } else {

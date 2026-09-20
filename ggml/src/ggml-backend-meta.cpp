@@ -2632,6 +2632,65 @@ struct ggml_backend_meta_context {
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
     ggml_backend_comm_prepare_graph_t    comm_prepare   = nullptr;
 
+    bool release_comm() {
+        if (comm_ctx == nullptr) {
+            return true;
+        }
+        if (backend_configs.empty()) {
+            GGML_LOG_ERROR("%s: communicator has no child backends\n", __func__);
+            return false;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(
+            ggml_backend_get_device(backend_configs[0].backend));
+        ggml_backend_comm_free_safe_t comm_free_safe = (ggml_backend_comm_free_safe_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_free_safe");
+        if (comm_free_safe != nullptr) {
+            if (!comm_free_safe(comm_ctx)) {
+                GGML_LOG_ERROR("%s: native communicator did not drain; retaining meta and child backends\n", __func__);
+                return false;
+            }
+        } else {
+            ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_free");
+            GGML_ASSERT(comm_free != nullptr);
+            comm_free(comm_ctx);
+        }
+        comm_ctx = nullptr;
+        return true;
+    }
+
+    void release_backends() {
+        std::vector<ggml_backend_t> child_backends;
+        child_backends.reserve(backend_configs.size());
+        for (auto & bc : backend_configs) {
+            // These buffers are allocated from bc.backend and must be freed
+            // before its Vulkan context/device is destroyed.
+            bc.bufs.clear();
+            child_backends.push_back(bc.backend);
+        }
+        backend_configs.clear();
+        for (ggml_backend_t child : child_backends) {
+            ggml_backend_free(child);
+        }
+    }
+
+    void release_graph_state() {
+        chain_tensors.clear();
+        chain_compute_cbs.clear();
+        nodes_aux.clear();
+        cgraphs_aux.clear();
+        ctx.reset();
+    }
+
+    bool shutdown() {
+        if (!release_comm()) {
+            return false;
+        }
+        release_graph_state();
+        release_backends();
+        return true;
+    }
+
     ggml_backend_meta_context(ggml_backend_dev_t meta_dev, const char * params) {
         const size_t n_devs = ggml_backend_meta_dev_n_devs(meta_dev);
         n_reduce_steps = std::ceil(std::log2(n_devs));
@@ -2648,10 +2707,7 @@ struct ggml_backend_meta_context {
             ggml_backend_t simple_backend = ggml_backend_dev_init(simple_dev, params);
             if (simple_backend == nullptr) {
                 GGML_LOG_ERROR("%s: failed to initialize simple backend for device '%s'\n", __func__, ggml_backend_dev_name(simple_dev));
-                for (auto & bc : backend_configs) {
-                    ggml_backend_free(bc.backend);
-                }
-                backend_configs.clear();
+                release_backends();
                 return;
             }
             simple_backends.push_back(simple_backend);
@@ -2682,10 +2738,7 @@ struct ggml_backend_meta_context {
                         comm_allreduce == nullptr ? "comm_allreduce_tensor" : "",
                         (comm_allreduce == nullptr && comm_free == nullptr) ? " and " : "",
                         comm_free == nullptr ? "comm_free" : "");
-                    for (auto & bc : backend_configs) {
-                        ggml_backend_free(bc.backend);
-                    }
-                    backend_configs.clear();
+                    release_backends();
                     return;
                 }
                 comm_ctx = comm_init(simple_backends.data(), simple_backends.size());
@@ -2693,10 +2746,7 @@ struct ggml_backend_meta_context {
                     // Native collective initialization rejected (e.g. peer mesh unavailable):
                     // fail backend init cleanly so graph_compute never silently falls back to host relay.
                     GGML_LOG_ERROR("%s: native communicator initialization failed\n", __func__);
-                    for (auto & bc : backend_configs) {
-                        ggml_backend_free(bc.backend);
-                    }
-                    backend_configs.clear();
+                    release_backends();
                     return;
                 }
             }
@@ -2704,15 +2754,8 @@ struct ggml_backend_meta_context {
     }
 
     ~ggml_backend_meta_context() {
-        if (comm_ctx != nullptr) {
-            ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
-                ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
-            GGML_ASSERT(comm_free != nullptr);
-            comm_free(comm_ctx);
-        }
-        for (auto & bc : backend_configs) {
-            ggml_backend_free(bc.backend);
-        }
+        GGML_ASSERT(comm_ctx == nullptr);
+        GGML_ASSERT(backend_configs.empty());
     }
 };
 
@@ -2725,6 +2768,13 @@ static const char * ggml_backend_meta_get_name(ggml_backend_t backend) {
 static void ggml_backend_meta_free(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_meta(backend));
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+    if (!backend_ctx->shutdown()) {
+        // A false return means native GPU work did not drain within its bounded
+        // wait. Deliberately leak this meta backend rather than destroy buffers
+        // or devices that may still be referenced by the driver.
+        GGML_LOG_ERROR("%s: retaining unsafe meta backend after failed native teardown\n", __func__);
+        return;
+    }
     delete backend_ctx;
     delete backend;
 }
@@ -3665,48 +3715,30 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         stage_compute_cbs.resize(backend_ctx->n_subgraphs);
         stage_tensors.resize(backend_ctx->n_subgraphs - 1);
 
-        static bool static_chain_locked = false;
-        if (static_chain_locked && stage_compute_cbs.size() == backend_ctx->n_subgraphs) {
-            // FORCED 100% STATIC REPLAY: Fixed permanent topology, zero cache lookups!
-            for (size_t i = 0; i < backend_ctx->n_subgraphs; ++i) {
-                if (i < stage_tensors.size()) {
-                    for (size_t j = 0; j < n_backends; ++j) {
-                        auto & bcj = backend_ctx->backend_configs[j];
-                        stage_tensors[i][j] = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
-                    }
-                }
-            }
-            all_replay_cached = true;
-        } else {
-            for (size_t i = 0; i < backend_ctx->n_subgraphs; ++i) {
-                stage_compute_cbs[i].resize(n_backends);
+        for (size_t i = 0; i < backend_ctx->n_subgraphs; ++i) {
+            stage_compute_cbs[i].resize(n_backends);
+            if (i < stage_tensors.size())
+                stage_tensors[i].resize(n_backends);
+            for (size_t j = 0; j < n_backends; ++j) {
+                auto & bcj = backend_ctx->backend_configs[j];
+                ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                 if (i < stage_tensors.size())
-                    stage_tensors[i].resize(n_backends);
-                for (size_t j = 0; j < n_backends; ++j) {
-                    auto & bcj = backend_ctx->backend_configs[j];
-                    ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
-                    if (i < stage_tensors.size())
-                        stage_tensors[i][j] = cgraph_ij->nodes[cgraph_ij->n_nodes - 1];
-                    if (backend_ctx->comm_prepare &&
-                        !backend_ctx->comm_prepare(backend_ctx->comm_ctx, j, cgraph_ij, i < stage_tensors.size())) {
-                        return GGML_STATUS_FAILED;
-                    }
-                    if (!pfn_get_cbs(bcj.backend, cgraph_ij, stage_compute_cbs[i][j])) {
-                        static int miss_log = 0;
-                        if (++miss_log <= 5) {
-                            fprintf(stderr, "[meta-chain-miss] stage=%zu rank=%zu nodes=%d uid=%llu\n", i, j,
-                                    cgraph_ij->n_nodes, (unsigned long long) cgraph_ij->uid);
-                        }
-                        all_replay_cached = false;
-                        break;
-                    }
+                    stage_tensors[i][j] = cgraph_ij->nodes[cgraph_ij->n_nodes - 1];
+                if (backend_ctx->comm_prepare &&
+                    !backend_ctx->comm_prepare(backend_ctx->comm_ctx, j, cgraph_ij, i < stage_tensors.size())) {
+                    return GGML_STATUS_FAILED;
                 }
-                if (!all_replay_cached) break;
+                if (!pfn_get_cbs(bcj.backend, cgraph_ij, stage_compute_cbs[i][j])) {
+                    static int miss_log = 0;
+                    if (++miss_log <= 5) {
+                        fprintf(stderr, "[meta-chain-miss] stage=%zu rank=%zu nodes=%d uid=%llu\n", i, j,
+                                cgraph_ij->n_nodes, (unsigned long long) cgraph_ij->uid);
+                    }
+                    all_replay_cached = false;
+                    break;
+                }
             }
-            if (all_replay_cached) {
-                static_chain_locked = true;
-                fprintf(stderr, "[tp5-meta] PERMANENT TOPOLOGY LOCKED: 100%% forced chain replay active!\n");
-            }
+            if (!all_replay_cached) break;
         }
         if (all_replay_cached) {
             static bool segments_dumped = false;
@@ -3745,13 +3777,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
             // One queue call per rank; owner retirement may wait once per chain,
             // never between individual compute/reduction stages.
-            static int chain_hit_log = 0;
-            auto t_chain_call_0 = std::chrono::high_resolution_clock::now();
-            bool chain_ok = pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors);
-            auto t_chain_call_1 = std::chrono::high_resolution_clock::now();
-            double chain_call_ms = std::chrono::duration<double, std::milli>(t_chain_call_1 - t_chain_call_0).count();
-            fprintf(stderr, "\n[META_CHAIN_EXEC_TIME] pfn_submit_chain took %6.2f ms (ok=%d, n_stages=%zu)\n\n",
-                    chain_call_ms, (int)chain_ok, backend_ctx->n_subgraphs);
+            static const bool chain_timing_enabled = getenv("GGML_TP5_PROFILE") != nullptr;
+            static int        chain_hit_log = 0;
+            bool              chain_ok;
+            if (chain_timing_enabled) {
+                const auto t_chain_call_0 = std::chrono::high_resolution_clock::now();
+                chain_ok = pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors);
+                const auto t_chain_call_1 = std::chrono::high_resolution_clock::now();
+                const double chain_call_ms = std::chrono::duration<double, std::milli>(t_chain_call_1 - t_chain_call_0).count();
+                fprintf(stderr, "\n[META_CHAIN_EXEC_TIME] pfn_submit_chain took %6.2f ms (ok=%d, n_stages=%zu)\n\n",
+                        chain_call_ms, (int)chain_ok, backend_ctx->n_subgraphs);
+            } else {
+                chain_ok = pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors);
+            }
             if (chain_ok) {
                 if (++chain_hit_log <= 5 || chain_hit_log % 100 == 0) {
                     fprintf(stderr, "[tp5-meta] SUBMIT_EPOCH_CHAIN SUCCESS: persistent signaling active! (hits=%d)\n", chain_hit_log);
@@ -3760,8 +3798,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             } else {
                 static int chain_fail_log = 0;
                 if (++chain_fail_log <= 5) {
-                    fprintf(stderr, "[tp5-meta] SUBMIT_EPOCH_CHAIN FAILED, falling back to slow loop\n");
+                    fprintf(stderr, "[tp5-meta] SUBMIT_EPOCH_CHAIN FAILED; refusing fallback after native submission\n");
                 }
+                return GGML_STATUS_FAILED;
             }
         }
     }
