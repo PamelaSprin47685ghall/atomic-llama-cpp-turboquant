@@ -26,6 +26,26 @@ struct ggml_tp5_profile {
     std::atomic<uint64_t> collective_plan_hits{0};
     std::atomic<uint64_t> collective_plan_misses{0};
     std::atomic<uint64_t> drm_wait_hits{0};
+    // RELAY full-chain soft-scheduling ledger. All values are accumulated
+    // only while GGML_TP5_PROFILE is active; hot-path code does not sample
+    // clocks or counters otherwise.
+    std::atomic<uint64_t> relay_chains{0};
+    std::atomic<uint64_t> relay_direct_stages{0};
+    std::atomic<uint64_t> relay_fallback_stages{0};
+    std::atomic<uint64_t> relay_route_patch_us{0};
+    std::atomic<uint64_t> relay_submit_us{0};
+    std::atomic<uint64_t> relay_ready_wait_us{0};
+    std::atomic<uint64_t> relay_ready_wait_max_us{0};
+    std::atomic<uint64_t> relay_ready_skew_us{0};
+    std::atomic<uint64_t> relay_ready_skew_max_us{0};
+    std::atomic<uint64_t> relay_arm_us{0};
+    std::atomic<uint64_t> relay_cpu_data_us{0};
+    std::atomic<uint64_t> relay_generation_us{0};
+    std::atomic<uint64_t> relay_handoff_total_us{0};
+    std::atomic<uint64_t> relay_poll_iters{0};
+    std::atomic<uint64_t> relay_gpu_spin_iters{0};
+    std::atomic<uint64_t> relay_gpu_spin_samples{0};
+    std::atomic<uint64_t> relay_gpu_spin_max{0};
 
     void reset(uint64_t new_id, bool decode);
     void print_summary() const;

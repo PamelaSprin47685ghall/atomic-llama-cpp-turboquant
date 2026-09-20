@@ -22,11 +22,13 @@ layout(push_constant) uniform Params {
 } p;
 
 shared uint ready;
+shared uint spin_used;
 
 void main() {
     uint lane = gl_LocalInvocationID.x;
     if (lane == 0u) {
         ready = 0u;
+        spin_used = 0u;
         StatusBuffer status = StatusBuffer(p.status_bda);
         uint expected = status.words[1];
         if (status.words[2] == 0u && expected != 0u) {
@@ -42,14 +44,19 @@ void main() {
                     // before publishing the next generation, avoiding a
                     // needless GPU write into host-mapped VRAM.
                     ready = 1u;
+                    spin_used = spin;
                     break;
                 }
             }
             if (ready == 0u) {
+                spin_used = p.spin_max;
                 if (status.words[2] == 0u) {
                     status.words[2] = expected;
                 }
                 status.words[4] = inbox[0];
+            }
+            if (p.reserved0 != 0u) {
+                status.words[5] = spin_used;
             }
         } else if (expected == 0u) {
             status.words[2] = 0xffffffffu;

@@ -22,9 +22,28 @@ void ggml_tp5_profile::reset(uint64_t new_id, bool decode) {
     collective_plan_hits = 0;
     collective_plan_misses = 0;
     drm_wait_hits = 0;
+    relay_chains = 0;
+    relay_direct_stages = 0;
+    relay_fallback_stages = 0;
+    relay_route_patch_us = 0;
+    relay_submit_us = 0;
+    relay_ready_wait_us = 0;
+    relay_ready_wait_max_us = 0;
+    relay_ready_skew_us = 0;
+    relay_ready_skew_max_us = 0;
+    relay_arm_us = 0;
+    relay_cpu_data_us = 0;
+    relay_generation_us = 0;
+    relay_handoff_total_us = 0;
+    relay_poll_iters = 0;
+    relay_gpu_spin_iters = 0;
+    relay_gpu_spin_samples = 0;
+    relay_gpu_spin_max = 0;
 }
 
 void ggml_tp5_profile::print_summary() const {
+    const uint64_t spin_n = relay_gpu_spin_samples.load();
+    const uint64_t spin_total = relay_gpu_spin_iters.load();
     fprintf(stderr,
             "[tp5-profile] exec=%" PRIu64 " decode=%d "
             "submits=%" PRIu64 " batches=%" PRIu64 " "
@@ -39,6 +58,29 @@ void ggml_tp5_profile::print_summary() const {
             drm_wait_hits.load(),
             compute_replay_hits.load(), compute_replay_misses.load(),
             collective_plan_hits.load(), collective_plan_misses.load());
+    if (relay_chains.load() != 0) {
+        fprintf(stderr,
+                "[tp5-relay-profile] exec=%" PRIu64 " chains=%" PRIu64
+                " stages=%" PRIu64 " direct=%" PRIu64 " fallback=%" PRIu64
+                " route_us=%" PRIu64 " submit_us=%" PRIu64
+                " ready_us=%" PRIu64 " ready_max_us=%" PRIu64
+                " skew_us=%" PRIu64 " skew_max_us=%" PRIu64
+                " arm_us=%" PRIu64 " cpu_data_us=%" PRIu64
+                " generation_us=%" PRIu64 " handoff_us=%" PRIu64
+                " polls=%" PRIu64 " gpu_spin_avg=%.1f gpu_spin_max=%" PRIu64
+                " gpu_spin_n=%" PRIu64 "\n",
+                graph_exec_id, relay_chains.load(),
+                relay_direct_stages.load() + relay_fallback_stages.load(),
+                relay_direct_stages.load(), relay_fallback_stages.load(),
+                relay_route_patch_us.load(), relay_submit_us.load(),
+                relay_ready_wait_us.load(), relay_ready_wait_max_us.load(),
+                relay_ready_skew_us.load(), relay_ready_skew_max_us.load(),
+                relay_arm_us.load(), relay_cpu_data_us.load(),
+                relay_generation_us.load(), relay_handoff_total_us.load(),
+                relay_poll_iters.load(),
+                spin_n ? double(spin_total) / double(spin_n) : 0.0,
+                relay_gpu_spin_max.load(), spin_n);
+    }
 }
 
 ggml_tp5_profile * ggml_tp5_profile_active() {

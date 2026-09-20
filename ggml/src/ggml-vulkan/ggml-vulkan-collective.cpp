@@ -1653,6 +1653,10 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
                 }
                 bool bcast_ok = false;
                 if (c.sync_mode == tp5_sync_mode::RELAY) {
+                    static const bool force_uncached = [] {
+                        const char * env = getenv("GGML_TP5_RELAY_FORCE_UNCACHED");
+                        return env && atoi(env) != 0;
+                    }();
                     // Prefer cached device-coherent local VRAM. The AMD
                     // coherence bit already provides automatic host<->device
                     // visibility when paired with HOST_COHERENT; forcing
@@ -1661,13 +1665,21 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
                     const VkMemoryPropertyFlags relay_cached =
                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD;
-                    bcast_ok = tp5_alloc_host_visible_buffer(r, total_bcast_size, r.bcast_buf[b], r.bcast_mem[b],
-                                                             &r.bcast_host[b], relay_cached);
+                    const VkMemoryPropertyFlags relay_uncached =
+                        relay_cached | VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
+                    bool used_uncached = force_uncached;
+                    if (!force_uncached) {
+                        bcast_ok = tp5_alloc_host_visible_buffer(r, total_bcast_size, r.bcast_buf[b], r.bcast_mem[b],
+                                                                 &r.bcast_host[b], relay_cached);
+                    }
                     if (!bcast_ok) {
-                        const VkMemoryPropertyFlags relay_uncached =
-                            relay_cached | VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
+                        used_uncached = true;
                         bcast_ok = tp5_alloc_host_visible_buffer(r, total_bcast_size, r.bcast_buf[b], r.bcast_mem[b],
                                                                  &r.bcast_host[b], relay_uncached);
+                    }
+                    if (bcast_ok && getenv("GGML_TP5_PROFILE")) {
+                        fprintf(stderr, "[tp5-relay-config] rank=%zu bank=%zu bcast_cache=%s\n",
+                                i, b, used_uncached ? "uncached" : "cached");
                     }
                 } else {
                     bcast_ok = tp5_alloc_host_visible_buffer(
@@ -2424,6 +2436,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
             if (c.sync_mode == tp5_sync_mode::STAR || c.sync_mode == tp5_sync_mode::RELAY) {
                 const size_t bcast_bytes = tensor_bytes; // CPU accumulation produces F32, regardless of wire type.
                 if (c.sync_mode == tp5_sync_mode::RELAY) {
+                    const uint32_t profile_spin = getenv("GGML_TP5_PROFILE") ? 1u : 0u;
                     if (trefs[i].hc.width) {
                         // Fast RELAY path: the downstream HC consumer itself
                         // owns the bounded doorbell wait. Once the generation
@@ -2442,7 +2455,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                             uint32_t spin_max;
                             uint32_t reserved;
                         } relay_hc_pc{trefs[i].hc.width, trefs[i].hc.epsilon,
-                                      r.bda_addr[b] + c.star_rank_stride - 64, c.spin_max, 0u};
+                                      r.bda_addr[b] + c.star_rank_stride - 64, c.spin_max, profile_spin};
                         static_assert(sizeof(relay_hc_pc) == 24);
                         vkCmdPushConstants(cmd, r.hc_sum_layout[pipe_idx], VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                            sizeof(relay_hc_pc), &relay_hc_pc);
@@ -2469,7 +2482,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                         struct { uint64_t status_bda; uint32_t n_elems; uint32_t seq; uint32_t spin_max;
                                  uint32_t dst_offset_words; uint32_t reserved0; uint32_t reserved1; } relay_pc{
                             r.bda_addr[b] + c.star_rank_stride - 64, (uint32_t)n_elems, 1u, c.spin_max,
-                            0u, 0u, 0u};
+                            0u, profile_spin, 0u};
                         vkCmdPushConstants(cmd, r.relay_copy_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                            sizeof(relay_pc), &relay_pc);
                         vkCmdDispatch(cmd, 1, 1, 1);
@@ -2913,7 +2926,24 @@ struct tp5_star_times {
     double wait_us = 0;
     double sum_us = 0;
     double broadcast_us = 0;
+    double first_ready_us = 0;
+    double ready_skew_us = 0;
+    double arm_us = 0;
+    double cpu_data_us = 0;
+    double generation_us = 0;
+    double total_us = 0;
+    uint64_t poll_iters = 0;
+    uint32_t retired_epoch = 0;
+    std::array<double, 8> rank_ready_us{};
+    std::array<uint32_t, 8> retired_spin{};
 };
+
+static void tp5_profile_atomic_max(std::atomic<uint64_t> & dst, uint64_t value) {
+    uint64_t current = dst.load(std::memory_order_relaxed);
+    while (current < value &&
+           !dst.compare_exchange_weak(current, value, std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+}
 
 // Host failure must release every already queued P2 without waiting for its
 // full spin budget. The shader polls status[2] and turns its destination into
@@ -2973,6 +3003,7 @@ static bool tp5_relay_arm_bank(tp5_comm & c, uint64_t epoch) {
         status[2] = 0u;
         status[3] = 0u;
         status[4] = 0u;
+        status[5] = 0u;
     }
     c.relay_bank_used[bank] = false;
     std::atomic_thread_fence(std::memory_order_release);
@@ -3042,6 +3073,7 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
                                            std::chrono::seconds(2));
     const void * rank_ptrs[5];
     volatile uint32_t * flags[5] = {};
+    std::array<bool, 8> ready_seen{};
     for (size_t i = 0; i < c.n_ranks; ++i) {
         rank_ptrs[i] = (const char *) c.star_host_aligned[bank] + i * c.star_rank_stride;
         flags[i] = direct_ready ? direct_ready[i] :
@@ -3052,10 +3084,17 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
         }
     }
     uint32_t pending = c.n_ranks == 32 ? UINT32_MAX : ((1u << c.n_ranks) - 1u);
+    uint64_t poll_iters = 0;
     for (uint64_t spin = 0; pending != 0u; ++spin) {
+        ++poll_iters;
         for (size_t i = 0; i < c.n_ranks; ++i) {
             const uint32_t bit = 1u << i;
             if ((pending & bit) && *flags[i] == 1u) {
+                if (times && !ready_seen[i]) {
+                    ready_seen[i] = true;
+                    times->rank_ready_us[i] = std::chrono::duration<double, std::micro>(
+                        std::chrono::steady_clock::now() - start).count();
+                }
                 if (!direct_ready)
                     *flags[i] = 0u;
                 pending &= ~bit;
@@ -3087,11 +3126,37 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
     }
     std::atomic_thread_fence(std::memory_order_acquire);
     const auto ready = times ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (times) {
+        times->poll_iters = poll_iters;
+        double first = times->rank_ready_us[0];
+        double last  = times->rank_ready_us[0];
+        for (size_t i = 1; i < c.n_ranks; ++i) {
+            first = std::min(first, times->rank_ready_us[i]);
+            last  = std::max(last, times->rank_ready_us[i]);
+        }
+        times->first_ready_us = first;
+        times->ready_skew_us  = last - first;
+    }
     // Producer-ready/P1-ready for e is observed only after P2(e-1) on the
     // same queue. Re-arm bank(e+1) before the CPU reduction so an already
     // resident P2(e+1) can observe its generation without another submit.
+    if (times && relay && arm_next_epoch > TP5_MAILBOX_BANKS) {
+        const uint32_t retired_epoch = (uint32_t) (arm_next_epoch - TP5_MAILBOX_BANKS);
+        const size_t retired_bank = tp5_mailbox_bank(arm_next_epoch);
+        times->retired_epoch = retired_epoch;
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            const auto * status = (const volatile uint32_t *) ((const char *) c.star_host_aligned[retired_bank] +
+                i * c.star_rank_stride + c.star_rank_stride - 64);
+            times->retired_spin[i] = status[5];
+        }
+    }
+    const auto arm_start = times ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (relay && arm_next_epoch != 0 && !tp5_relay_arm_bank(c, arm_next_epoch)) {
         return false;
+    }
+    const auto data_start = times ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (times) {
+        times->arm_us = std::chrono::duration<double, std::micro>(data_start - arm_start).count();
     }
     void * sum = (char *) c.star_host_aligned[bank] + 5 * c.star_rank_stride;
     float * bcast_ptrs[5] = {};
@@ -3134,6 +3199,9 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
         }
     }
     const auto reduced = times ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (times) {
+        times->cpu_data_us = std::chrono::duration<double, std::micro>(reduced - data_start).count();
+    }
 #if defined(__x86_64__) || defined(_M_X64)
     _mm_sfence(); // Order posted BAR payload stores before publishing the generation.
 #endif
@@ -3179,9 +3247,12 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
         c.relay_bank_used[bank] = true;
     }
     if (times) {
+        const auto finished = std::chrono::steady_clock::now();
         times->wait_us = std::chrono::duration<double, std::micro>(ready - start).count();
         times->sum_us = std::chrono::duration<double, std::micro>(reduced - ready).count();
-        times->broadcast_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - reduced).count();
+        times->broadcast_us = std::chrono::duration<double, std::micro>(finished - reduced).count();
+        times->generation_us = times->broadcast_us;
+        times->total_us = std::chrono::duration<double, std::micro>(finished - start).count();
     }
     abort_guard.active = false;
     return true;
@@ -3190,6 +3261,11 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
 static bool tp5_relay_submit_epoch_chain(
         tp5_comm & c, const std::vector<std::vector<std::vector<void *>>> & stage_compute_cbs,
         const std::vector<tp5_plan_key> & keys, size_t n_stages) {
+    ggml_tp5_profile * prof = ggml_tp5_profile_active();
+    static const bool relay_stage_detail = [] {
+        const char * env = getenv("GGML_TP5_PROFILE_RELAY_STAGES");
+        return env && atoi(env) != 0;
+    }();
     // Each rank submits one ordered command-buffer stream:
     // direct producer: [compute+host-payload(0), P2(1), compute+host-payload(1), ...]
     // fallback:        [compute(0), P1(1), P2(1), compute(1), P1(2), ...]
@@ -3214,6 +3290,7 @@ static bool tp5_relay_submit_epoch_chain(
         return false;
     }
 
+    const auto route_begin = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     size_t n_direct_stages = 0;
     for (size_t s = 0; s < n_stages; ++s) {
         auto & direct_ready = c.relay_ready_routes[s];
@@ -3234,9 +3311,11 @@ static bool tp5_relay_submit_epoch_chain(
         }
     }
     std::atomic_thread_fence(std::memory_order_release);
+    const auto route_end = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     const uint64_t final_signal = 2 * last_epoch;
     bool submitted_any = false;
+    double submit_wall_us = 0.0;
     for (size_t i = 0; i < c.n_ranks; ++i) {
         auto & scratch = c.chain_scratch[i];
         const size_t min_collective_cbs = 2 * n_stages - n_direct_stages;
@@ -3258,14 +3337,28 @@ static bool tp5_relay_submit_epoch_chain(
             ++prof->queue_submits;
             ++prof->submit_batches;
         }
+        const auto submit_begin = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (vkQueueSubmit(c.ranks[i].queue, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS) {
             tp5_relay_request_abort(c);
             c.fail("RELAY full-chain submit failed on rank " + std::to_string(i));
             return false;
         }
+        if (prof) {
+            submit_wall_us += std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - submit_begin).count();
+        }
         ggml_vk_tp5_mark_queue_submitted(c.backends[i]);
         tp5_note_timeline_submission(c.ranks[i], final_signal);
         submitted_any = true;
+    }
+
+    std::vector<tp5_star_times> stage_times;
+    std::vector<std::array<uint32_t, 8>> stage_spins;
+    if (prof) {
+        stage_times.resize(n_stages);
+        stage_spins.resize(n_stages);
+        for (auto & spins : stage_spins)
+            spins.fill(UINT32_MAX);
     }
 
     for (size_t s = 0; s < n_stages; ++s) {
@@ -3276,11 +3369,31 @@ static bool tp5_relay_submit_epoch_chain(
         // completed. Arm e+1 before reducing/publishing e.
         const uint64_t arm_next_epoch = epoch < UINT32_MAX ? epoch + 1 : 0;
         const bool direct = tp5_relay_direct_stage(keys[s], c.n_ranks);
-        if (!tp5_star_handoff(c, tp5_mailbox_bank(epoch), keys[s].n_elems, nullptr, true,
+        tp5_star_times * step = prof ? &stage_times[s] : nullptr;
+        if (!tp5_star_handoff(c, tp5_mailbox_bank(epoch), keys[s].n_elems, step, true,
                               arm_next_epoch, direct ? c.relay_ready_routes[s].data() : nullptr)) {
             fprintf(stderr, "[tp5-relay-chain] handoff failed stage=%zu epoch=%llu bank=%zu\n",
                     s, (unsigned long long) epoch, tp5_mailbox_bank(epoch));
             return false;
+        }
+        if (prof && step->retired_epoch >= first_epoch && step->retired_epoch <= last_epoch) {
+            const size_t retired_stage = (size_t) (step->retired_epoch - first_epoch);
+            if (retired_stage < stage_spins.size())
+                stage_spins[retired_stage] = step->retired_spin;
+        }
+    }
+
+    // Never wait for the final P2 merely to profile it. If it already
+    // completed by the time host handoffs finish, opportunistically sample it;
+    // otherwise its spin count remains pending/unknown for this chain.
+    if (prof && n_stages != 0) {
+        const size_t last_stage = n_stages - 1;
+        const size_t bank = tp5_mailbox_bank(last_epoch);
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            const auto * status = (const volatile uint32_t *) ((const char *) c.star_host_aligned[bank] +
+                i * c.star_rank_stride + c.star_rank_stride - 64);
+            if (status[3] == (uint32_t) last_epoch)
+                stage_spins[last_stage][i] = status[5];
         }
     }
 
@@ -3289,8 +3402,66 @@ static bool tp5_relay_submit_epoch_chain(
     // backpressure and teardown drain that actual submission; no per-chain
     // host wait or second P2 submission is permitted here.
     c.allreduce_calls = last_epoch;
-    if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+    if (prof) {
         prof->collective_calls += n_stages;
+        ++prof->relay_chains;
+        prof->relay_direct_stages += n_direct_stages;
+        prof->relay_fallback_stages += n_stages - n_direct_stages;
+        prof->relay_route_patch_us += (uint64_t) (std::chrono::duration<double, std::micro>(
+            route_end - route_begin).count() + 0.5);
+        prof->relay_submit_us += (uint64_t) (submit_wall_us + 0.5);
+
+        for (size_t s = 0; s < n_stages; ++s) {
+            const auto & step = stage_times[s];
+            const uint64_t wait_us = (uint64_t) (step.wait_us + 0.5);
+            const uint64_t skew_us = (uint64_t) (step.ready_skew_us + 0.5);
+            prof->relay_ready_wait_us += wait_us;
+            prof->relay_ready_skew_us += skew_us;
+            prof->relay_arm_us += (uint64_t) (step.arm_us + 0.5);
+            prof->relay_cpu_data_us += (uint64_t) (step.cpu_data_us + 0.5);
+            prof->relay_generation_us += (uint64_t) (step.generation_us + 0.5);
+            prof->relay_handoff_total_us += (uint64_t) (step.total_us + 0.5);
+            prof->relay_poll_iters += step.poll_iters;
+            tp5_profile_atomic_max(prof->relay_ready_wait_max_us, wait_us);
+            tp5_profile_atomic_max(prof->relay_ready_skew_max_us, skew_us);
+
+            uint64_t spin_sum = 0;
+            uint64_t spin_max = 0;
+            uint64_t spin_n = 0;
+            for (size_t i = 0; i < c.n_ranks; ++i) {
+                const uint32_t spins = stage_spins[s][i];
+                if (spins == UINT32_MAX)
+                    continue;
+                spin_sum += spins;
+                spin_max = std::max<uint64_t>(spin_max, spins);
+                ++spin_n;
+            }
+            prof->relay_gpu_spin_iters += spin_sum;
+            prof->relay_gpu_spin_samples += spin_n;
+            tp5_profile_atomic_max(prof->relay_gpu_spin_max, spin_max);
+
+            if (relay_stage_detail) {
+                fprintf(stderr,
+                        "[tp5-relay-stage] exec=%llu stage=%zu epoch=%llu direct=%d wire=%s elems=%zu "
+                        "ready_first_us=%.3f ready_all_us=%.3f skew_us=%.3f arm_us=%.3f "
+                        "cpu_data_us=%.3f generation_us=%.3f total_us=%.3f polls=%llu "
+                        "gpu_spin_avg=%.1f gpu_spin_max=%llu gpu_spin_n=%llu "
+                        "ready_rank_us=",
+                        (unsigned long long) prof->graph_exec_id, s,
+                        (unsigned long long) (first_epoch + s),
+                        tp5_relay_direct_stage(keys[s], c.n_ranks) ? 1 : 0,
+                        c.wire == tp5_wire_type::F32 ? "f32" : "f16", keys[s].n_elems,
+                        step.first_ready_us, step.wait_us, step.ready_skew_us, step.arm_us,
+                        step.cpu_data_us, step.generation_us, step.total_us,
+                        (unsigned long long) step.poll_iters,
+                        spin_n ? double(spin_sum) / double(spin_n) : -1.0,
+                        (unsigned long long) spin_max, (unsigned long long) spin_n);
+                for (size_t i = 0; i < c.n_ranks; ++i) {
+                    fprintf(stderr, "%s%.3f", i ? "," : "", step.rank_ready_us[i]);
+                }
+                fputc('\n', stderr);
+            }
+        }
     }
     return true;
 }
@@ -4254,6 +4425,12 @@ static void tp5_poll_gpu_timing(tp5_comm & c) {
                     "[tp5-gpu-stage] rank=%zu stage=%zu gap_us=%.3f sum_us=%.3f compute_us=%.3f push_us=%.3f "
                     "push_gap_us=%.3f\n",
                     rank, s, gap, us(q, q + 1), us(q + 1, q + 2), us(q + 3, q + 4), us(q + 2, q + 3));
+            if (c.sync_mode == tp5_sync_mode::RELAY) {
+                fprintf(stderr,
+                        "[tp5-relay-gpu-stage] rank=%zu stage=%zu p2_us=%.3f compute_us=%.3f "
+                        "producer_slot_us=%.3f gap_us=%.3f\n",
+                        rank, s, us(q, q + 1), us(q + 1, q + 2), us(q + 3, q + 4), gap);
+            }
         }
         sum += us(count - 3, count - 2);
         const double tail_compute = us(count - 2, count - 1);
@@ -4263,6 +4440,12 @@ static void tp5_poll_gpu_timing(tp5_comm & c) {
                 "[tp5-gpu-timing] rank=%zu stages=%zu span_us=%.3f sum_us=%.3f compute_us=%.3f push_us=%.3f "
                 "gaps_us=%.3f tail_compute_us=%.3f push_gap_us=%.3f\n",
                 rank, c.timing_stages, us(0, count - 1), sum, compute, push, gaps, tail_compute, push_gap);
+        if (c.sync_mode == tp5_sync_mode::RELAY) {
+            fprintf(stderr,
+                    "[tp5-relay-gpu] rank=%zu stages=%zu span_us=%.3f p2_us=%.3f compute_us=%.3f "
+                    "producer_slot_us=%.3f gaps_us=%.3f tail_compute_us=%.3f\n",
+                    rank, c.timing_stages, us(0, count - 1), sum, compute, push, gaps, tail_compute);
+        }
         r.timing_reported = true;
     }
 }
@@ -4460,18 +4643,16 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
 
     // Build all ranks before submitting any rank; allocations and pointer
     // fixups cannot fail halfway through an inter-device dependency chain.
-    bool has_direct_stage = false;
     size_t n_direct_stages = 0;
     if (c.sync_mode == tp5_sync_mode::RELAY) {
         for (size_t s = 0; s < n_stages; ++s) {
             if (tp5_relay_direct_stage(keys[s], c.n_ranks)) {
-                has_direct_stage = true;
                 ++n_direct_stages;
             }
         }
     }
     const bool capture_requested = ++c.chain_calls == c.timing_chain;
-    const bool capture           = capture_requested && !has_direct_stage && tp5_prepare_gpu_timing(c, n_stages);
+    const bool capture           = capture_requested && tp5_prepare_gpu_timing(c, n_stages);
     if (capture_requested && !capture) {
         fprintf(stderr, "[tp5-gpu-timing] capture unavailable; submitting original chain\n");
     }
@@ -4660,6 +4841,8 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
         if (!tp5_relay_submit_epoch_chain(c, stage_compute_cbs, keys, n_stages)) {
             return false;
         }
+        if (capture)
+            c.timing_submitted = true;
         return true;
     }
     const auto prefix_end        = capture ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -4734,10 +4917,13 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
         for (size_t i = 0; i < c.n_ranks; ++i) {
             const auto & scratch = c.chain_scratch[i];
             const size_t markers = c.ranks[i].timing_markers.size();
+            const size_t collective_cbs =
+                c.sync_mode == tp5_sync_mode::RELAY ? 2 * n_stages - n_direct_stages : 2 * n_stages;
             fprintf(stderr,
                     "[tp5-host-timing] rank=%zu batches=%zu compute_cbs=%zu collective_cbs=%zu marker_cbs=%zu "
                     "submit_wall_us=%lld\n",
-                    i, scratch.submits.size(), scratch.compute.size() - 2 * n_stages - markers, 2 * n_stages, markers,
+                    i, scratch.submits.size(), scratch.compute.size() - collective_cbs - markers,
+                    collective_cbs, markers,
                     (long long) submit_wall_us[i]);
         }
     }
