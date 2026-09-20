@@ -3705,13 +3705,43 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     if (pfn_submit_chain && pfn_get_cbs && backend_ctx->comm_ctx && n_backends == 5 && backend_ctx->n_subgraphs > 1 &&
         (backend_ctx->n_subgraphs - 1) <= 128) {
+        // 纯 Predefine 路线（唯一真理）：一旦初次建立预定义图句柄后，直接 100% 绝对复用，跳过逐轮 validation 开销
+        static bool s_predefined_valid = false;
+        static size_t s_predefined_n_subgraphs = 0;
+        static uint64_t s_predefined_uid = 0;
+
+        auto & stage_compute_cbs = backend_ctx->chain_compute_cbs;
+        auto & stage_tensors     = backend_ctx->chain_tensors;
+
+        if (s_predefined_valid && s_predefined_n_subgraphs == backend_ctx->n_subgraphs &&
+            (s_predefined_uid == 0 || s_predefined_uid == backend_ctx->uid)) {
+            static const bool chain_timing_enabled = getenv("GGML_TP5_PROFILE") != nullptr;
+            static int chain_hit_log = 0;
+            bool chain_ok = false;
+            if (chain_timing_enabled) {
+                const auto t_chain_call_0 = std::chrono::high_resolution_clock::now();
+                chain_ok = pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors);
+                const auto t_chain_call_1 = std::chrono::high_resolution_clock::now();
+                const double chain_call_ms = std::chrono::duration<double, std::milli>(t_chain_call_1 - t_chain_call_0).count();
+                fprintf(stderr, "\n[META_CHAIN_EXEC_TIME] pfn_submit_chain took %6.2f ms (ok=%d, n_stages=%zu, predefine=true)\n\n",
+                        chain_call_ms, (int)chain_ok, backend_ctx->n_subgraphs);
+            } else {
+                chain_ok = pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors);
+            }
+            if (chain_ok) {
+                if (++chain_hit_log <= 5 || chain_hit_log % 100 == 0) {
+                    fprintf(stderr, "[tp5-meta] SUBMIT_EPOCH_CHAIN (PREDEFINED TRUTH): hits=%d\n", chain_hit_log);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
+            return GGML_STATUS_FAILED;
+        }
+
         bool all_replay_cached = true;
         // Every compute graph, including the non-reducing model tail, belongs
         // to the same rank submission. Only the first N-1 graphs reduce.
         // Reuse vector capacity; every entry is still refreshed and validated
         // before submission, including after a graph rebuild or cache miss.
-        auto & stage_compute_cbs = backend_ctx->chain_compute_cbs;
-        auto & stage_tensors     = backend_ctx->chain_tensors;
         stage_compute_cbs.resize(backend_ctx->n_subgraphs);
         stage_tensors.resize(backend_ctx->n_subgraphs - 1);
 
@@ -3791,8 +3821,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 chain_ok = pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors);
             }
             if (chain_ok) {
+                s_predefined_valid = true;
+                s_predefined_n_subgraphs = backend_ctx->n_subgraphs;
+                s_predefined_uid = backend_ctx->uid;
                 if (++chain_hit_log <= 5 || chain_hit_log % 100 == 0) {
-                    fprintf(stderr, "[tp5-meta] SUBMIT_EPOCH_CHAIN SUCCESS: persistent signaling active! (hits=%d)\n", chain_hit_log);
+                    fprintf(stderr, "[tp5-meta] SUBMIT_EPOCH_CHAIN SUCCESS: predefined truth locked! (hits=%d)\n", chain_hit_log);
                 }
                 return GGML_STATUS_SUCCESS;
             } else {

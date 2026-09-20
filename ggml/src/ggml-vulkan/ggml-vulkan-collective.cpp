@@ -59,8 +59,6 @@ namespace {
 enum class tp5_wire_type { F32, F16 };
 enum class tp5_sync_mode { HOST, SYNCFD, TIMELINE, GPUFLAG, DRM, STAR, RELAY };
 
-// Two mailbox banks so P1 of epoch N can overlap peer P2 of epoch N-1:
-// bank = (epoch-1) & 1. P2's ready waits transitively provide epoch-2 credit.
 static constexpr size_t TP5_MAILBOX_BANKS = 2;
 
 static size_t tp5_mailbox_bank(uint64_t epoch) {
@@ -2148,9 +2146,9 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     // occupy the queue, not only the preceding payload.
                     VkMemoryBarrier mb_flag{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                                              VK_ACCESS_SHADER_WRITE_BIT,
-                                             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_HOST_READ_BIT };
+                             VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_HOST_READ_BIT };
                     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
                                          0, 1, &mb_flag, 0, nullptr, 0, nullptr);
                     if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
                         c.fail("end cmd_p1 star failed on rank " + std::to_string(i));
@@ -2824,7 +2822,7 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
         auto * flag = (volatile uint32_t *) ((char *) c.star_host_aligned[bank] +
                                             (i + 1) * c.star_rank_stride - 64);
         for (uint64_t spin = 0; *flag != 1; ++spin) {
-            if ((spin & 1023) == 0 && std::chrono::steady_clock::now() >= deadline) {
+            if (std::chrono::steady_clock::now() >= deadline) {
                 c.fail("STAR payload timeout on rank " + std::to_string(i));
                 if (getenv("GGML_TP5_RELAY_DEBUG")) {
                     const auto * status = (const volatile uint32_t *) ((const char *) c.star_host_aligned[bank] +
@@ -3989,7 +3987,7 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
                 return false;
             if (ggml_nbytes(t) > c.ranks[j].caps.max_storage_buffer_range)
                 return false;
-            if (c.wire == tp5_wire_type::F16 && c.sync_mode != tp5_sync_mode::STAR && c.sync_mode != tp5_sync_mode::RELAY) {
+            if (c.wire == tp5_wire_type::F16 && c.sync_mode != tp5_sync_mode::STAR) {
                 uint64_t poff = 0, psize = 0;
                 if (ggml_vk_tp5_take_wire_output(c.backends[j], t, &ref.packed_buf, &poff, &psize, &ref.packed_owner)) {
                     ref.packed_offset                 = (VkDeviceSize) poff;
@@ -4010,7 +4008,7 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
             key.bindings[j]        = { ref.buf, ref.offset, ref.size };
             key.packed_bindings[j] = { ref.packed_buf, ref.packed_offset, ref.packed_size };
             const auto & consumer  = stage_compute_cbs[s + 1][j];
-            if (consumer.size() > 1 && c.sync_mode != tp5_sync_mode::STAR && c.sync_mode != tp5_sync_mode::RELAY) {
+            if (consumer.size() > 1 && c.sync_mode != tp5_sync_mode::STAR) {
                 tp5_hc_consumer_ref(c, j, consumer.front(), ref, n_elems, key.hc[j]);
             }
             max_elems = std::max(max_elems, n_elems);

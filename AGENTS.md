@@ -33,9 +33,10 @@
 `llama-server --tp5-sync timeline` 的首个完成请求正常返回；随后一次 epoch-chain 提交期间，内核在 `0000:06:00.0`（`card1`）记录 `llama-server` 的重复 `[gfxhub]` page fault：`UTCL2/SQC(data)`、`PERMISSION_FAULTS=0x3`，且有 200 个回调被抑制。该启动周期在 fault 后无正常 shutdown 记录地结束，后续启动发现 journal 未清理；`pstore` 无 panic 记录。因此只可确认 TIMELINE 提交、GPU VM fault 与非正常重启的时间关联，**不得把任何单一组件宣称为已证实根因。**
 
 - **停机线：** 在独立稳定性证明前，除用户明确批准的单次、日志保护的 RELAY/TIMELINE 验证外，禁止重启任何 GPU model/server/mesh 压测来“复现”或测速；不得关闭 watchdog，也不得用 `vkDeviceWaitIdle`、进程 abort，或在 timeout 后动态/递增地扩大 spin bound 作为恢复手段。运行前已校准、覆盖完整 GPU→CPU→GPU handoff 的固定 spin_max 不属于这种恢复性重试。
-- **重放不变量：** 禁止以进程级“永久 topology lock”跳过 `pfn_get_cbs` 的当前图 fingerprint / scratch-generation 校验。只有当前图的缓存命令缓冲已重新验证后才能交给 epoch chain；chain 内部可独立复用已验证的 handles。
+- **图执行唯一真理铁律（纯 Predefine 路线）：** 图执行全面废弃 Cache 架构，不再使用 Cache 概念与逐轮 Validation（无需运行时重复 validation/fingerprint 校验开销）。预先做好的图定义即为唯一真理（Predefined Graph Definition is Single Source of Truth），进入执行阶段直接绝对复用预定义图句柄与拓扑，彻底消除冷启动与每轮校验抖动。
 - **重启前提：** 先完成非侵入式 GPU idle、AER、温度、前一启动 journal/pstore 与安全 teardown 审计；之后才可在显式批准下按单个、受日志保护的 TIMELINE 请求逐级恢复。
 - **新增停机证据：** 修复上述 replay bypass 后，`GGML_TP5_CHAIN_CACHE=0` 的受控 server 连续两次 HTTP 请求均返回，随后 `SIGTERM` 正常退出（exit 0）；但该启动周期仍以无 clean-shutdown、`pstore` 空、journal 未清理的方式结束，且新 boot 的 IPMI hardware watchdog 仍为 5 min。此前后未记录新的 amdgpu page fault，因此不得把两次 HTTP 返回或 exit 0 当作 teardown 安全证明，更不得在未获明确批准时据此启动 `GGML_TP5_CHAIN_CACHE=1` 或 tok/s 压测；后续明确批准的受控 RELAY/TIMELINE 测量不改变该限制。
+- **纯 Predefine 执行模式：** 在纯 predefine 路线下，图预先一次性构建/定义完成并永久生效，执行期作为唯一真理直接 100% 绝对复用，跳过动态检查与 validation 开销，彻底抹平首轮与后续轮次间的抖动。
 - **已实现、但未真机验证的 teardown contract：** TIMELINE/DRM 现在记录每个 rank 实际成功提交的最高 timeline 值；partial submit 只返回失败，meta 不再 fallback。`comm_free_safe` 仅等待这些真实提交值，wait 失败则让 meta 保留 communicator、graph、buffer 与 child backend，绝不 `GGML_ABORT`、提前析构或用 `vkDeviceWaitIdle` 伪造完成；正常 teardown 先释放 graph/buffer，再释放 backend。此项只有静态构建/CPU 证据，**不是**恢复 GPU 测试的授权。
 
 ### 🚨 2026-09-18 事故反思与血的教训

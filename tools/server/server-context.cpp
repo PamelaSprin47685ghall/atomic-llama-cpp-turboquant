@@ -5405,6 +5405,22 @@ private:
             }
         }
 
+        // Predefine 纯路线：模型加载时预先完成单 token decode 的图定义，作为唯一真理锁定，彻底消除后续首轮及轮次间波动
+        if (ctx_tgt && !params_base.warmup) {
+            SRV_INF("%s: Predefining decode graph at load time (sole truth)...\n", __func__);
+            llama_batch dummy_batch = llama_batch_init(1, 0, 1);
+            dummy_batch.n_tokens = 1;
+            dummy_batch.token[0] = 1;
+            dummy_batch.pos[0] = 0;
+            dummy_batch.n_seq_id[0] = 1;
+            dummy_batch.seq_id[0][0] = 0;
+            dummy_batch.logits[0] = 1;
+            llama_decode(ctx_tgt, dummy_batch);
+            llama_batch_free(dummy_batch);
+            llama_synchronize(ctx_tgt);
+            SRV_INF("%s: Predefined decode graph locked.\n", __func__);
+        }
+
         return true;
     }
 

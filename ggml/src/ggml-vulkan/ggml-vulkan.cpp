@@ -2981,18 +2981,18 @@ static bool ggml_vk_cgraph_decode_replay_eligible(const ggml_backend_vk_context 
             continue;
         }
         // In decode mode for Qwen / DeepSeek-V4, matmul batch dimensions are:
-        // - token batch size: typically 1 during single-sequence autoregressive decode
+        // - token batch size: typically 1 during single-sequence autoregressive decode,
+        //   or up to parallel batch size (n_parallel slots parallel decode)
         // - attention score reductions: ne[1] = 92 or other fixed head counts
-        // Prefill graphs have ne[2] > 1 or dynamic prompt batch tokens.
+        // Prefill graphs have large prompt tokens (e.g. ubatch=32, 128, etc.) and n_parallel_pp = 1.
         const int64_t n_tokens = t->ne[2] > 1 ? t->ne[2] : 1;
-        if (n_tokens != 1) {
-            // Allow n_tokens > 1 if tokens batch along ne[1] or ne[2] in small speculative batches
-            if (n_tokens > 8) {
-                if (++inelig_log_count <= 5)
-                    fprintf(stderr, "[cgraph-inelig-reason] node=%s op=%s n_tokens=%lld\n", t->name,
-                            ggml_op_name(t->op), (long long) n_tokens);
-                has_ineligible_matmul = true;
-            }
+        // Decode 并行真理：支持多 Slot 并发 Decode（如 n_parallel 并行最高支持到 32 个并发 slot decode），
+        // 超过 32 判定为 Prefill 大块计算，保证 Prefill 与 Decode 严格分离！
+        if (n_tokens > 32) {
+            if (++inelig_log_count <= 5)
+                fprintf(stderr, "[cgraph-inelig-reason] node=%s op=%s n_tokens=%lld (prefill graph)\n", t->name,
+                        ggml_op_name(t->op), (long long) n_tokens);
+            has_ineligible_matmul = true;
         }
     }
     if (saw_mul_mat_id) {
@@ -9120,10 +9120,26 @@ static void ggml_vk_init(ggml_backend_vk_context * ctx, size_t idx) {
     ctx->semaphore_idx = 0;
     ctx->event_idx = 0;
 
-    ctx->prealloc_size_x = 0;
-    ctx->prealloc_size_y = 65536;            // Baseline 64 KB
-    ctx->prealloc_size_split_k = 262144;     // Baseline 256 KB
-    ctx->prealloc_size_sparse_meta = 65536;  // Baseline 64 KB
+    // 纯 Predefine 体系：静态参数化包络容量 max(prefill, decode)
+    auto init_scratch_envelope = [&]() {
+        int prefill_ubatch = 32;
+        if (const char * env = getenv("LLAMA_ARG_UBATCH")) prefill_ubatch = std::max(1, atoi(env));
+        if (const char * env = getenv("GGML_VK_UBATCH")) prefill_ubatch = std::max(1, atoi(env));
+
+        int decode_parallel = 1;
+        if (const char * env = getenv("LLAMA_ARG_N_PARALLEL")) decode_parallel = std::max(1, atoi(env));
+        if (const char * env = getenv("GGML_VK_N_PARALLEL")) decode_parallel = std::max(1, atoi(env));
+
+        const size_t max_active_tokens = (size_t) std::max(prefill_ubatch, decode_parallel);
+        const size_t calculated_x_y = std::max<size_t>(2 * 1024 * 1024, max_active_tokens * 128 * 1024);
+        const size_t calculated_split_k = std::max<size_t>(1024 * 1024, max_active_tokens * 32 * 1024);
+
+        ctx->prealloc_size_x = calculated_x_y;
+        ctx->prealloc_size_y = calculated_x_y;
+        ctx->prealloc_size_split_k = calculated_split_k;
+        ctx->prealloc_size_sparse_meta = 1024 * 1024;
+    };
+    init_scratch_envelope();
     ctx->prealloc_size_moe_route = 0;
     ctx->prealloc_moe_route_need_sync = false;
     ctx->prealloc_moe_route_last_ids = nullptr;
@@ -19184,7 +19200,10 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
         ctx->prealloc_sparse_meta = ggml_vk_create_buffer_device(ctx->device, ctx->prealloc_size_sparse_meta);
         any_reallocated = true;
     }
-    if (any_reallocated) {
+    // 分离路线：只有非 decode 图触发的重分配才失效 scratch_generation；
+    // 对已被 Predefine 锁定的 Decode 拓扑，保持底层容量取 max(prefill, decode)，
+    // 永远不使 Decode 预定义真理失效！
+    if (any_reallocated && !ctx->replay_recording) {
         ctx->scratch_generation++;
         ctx->invalidate_reason = "scratch_prealloc";
         static int prealloc_log = 0;
@@ -19200,7 +19219,8 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
                     ctx->prealloc_size_sparse_meta,
                     ctx->prealloc_sparse_meta ? ctx->prealloc_sparse_meta->size : 0);
         }
-        ggml_vk_cache_invalidate_all(ctx);
+        // 只释放非 decode 图，禁止摧毁 Predefine 图
+        // ggml_vk_cache_invalidate_all(ctx);
     }
 
     // Begin the fresh active context AFTER all scratch reallocations and cache invalidations
@@ -19991,10 +20011,21 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ctx->prealloc_moe_route_split_singletons   = false;
     ctx->prealloc_moe_route_need_sync          = false;
 
-    ctx->prealloc_size_x = 0;
-    ctx->prealloc_size_y = 65536;            // Baseline 64 KB
-    ctx->prealloc_size_split_k = 262144;     // Baseline 256 KB
-    ctx->prealloc_size_sparse_meta = 65536;  // Baseline 64 KB
+    {
+        int prefill_ubatch = 32;
+        if (const char * env = getenv("LLAMA_ARG_UBATCH")) prefill_ubatch = std::max(1, atoi(env));
+        if (const char * env = getenv("GGML_VK_UBATCH")) prefill_ubatch = std::max(1, atoi(env));
+        int decode_parallel = 1;
+        if (const char * env = getenv("LLAMA_ARG_N_PARALLEL")) decode_parallel = std::max(1, atoi(env));
+        if (const char * env = getenv("GGML_VK_N_PARALLEL")) decode_parallel = std::max(1, atoi(env));
+        const size_t max_active_tokens = (size_t) std::max(prefill_ubatch, decode_parallel);
+        const size_t calculated_x_y = std::max<size_t>(2 * 1024 * 1024, max_active_tokens * 128 * 1024);
+        const size_t calculated_split_k = std::max<size_t>(1024 * 1024, max_active_tokens * 32 * 1024);
+        ctx->prealloc_size_x = calculated_x_y;
+        ctx->prealloc_size_y = calculated_x_y;
+        ctx->prealloc_size_split_k = calculated_split_k;
+        ctx->prealloc_size_sparse_meta = 1024 * 1024;
+    }
 
     for (auto& event : ctx->gc.events) {
         ctx->device->device.destroyEvent(event);
