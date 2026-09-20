@@ -18,7 +18,7 @@
 
 #### RELAY 名称与语义铁律
 
-`relay` 只指**自治的 GPU-resident doorbell relay**：P1 和 P2 都在 CPU reduce 前预提交；P2 在本队列中有界轮询本卡 local-VRAM doorbell，CPU 只通过 BAR/映射 VRAM 写入归约 payload 与同代 doorbell，GPU 不接受 CPU semaphore/二次 submit 来推进 P2。`spin_max` 是覆盖该完整 GPU→CPU→GPU handoff 的预先校准协议预算，不是缩短正确 handoff 的人为 timeout；P2 必须在看见匹配 generation 后消费 payload、写 completion，超出该固定预算必须写失败态并退出。
+`relay` 只指**自治、双方预等待的 state-observation relay**：direct terminal producer 在原模型 compute 中直接按所选 wire 宽度（F16/F32）写 host-imported payload，CPU 在 queue submit 前已经轮询 stable route-ready；producer 只把 ready 状态从 0 改为 1，不存在 callback/唤醒。下行 P2 同样提前驻留，在本队列中有界轮询本卡 local-VRAM generation；CPU reduce 后只写 payload 与同代 generation，GPU 不接受 CPU semaphore/二次 submit 来推进 P2。旧 P1 仅是 direct producer 不具备时的兼容 fallback，不属于主热路径。`spin_max` 是覆盖完整 GPU→CPU→GPU handoff 的预先校准协议预算，不是缩短正确 handoff 的人为 timeout；P2 必须在看见匹配 generation 后消费 payload、写 completion，超出该固定预算必须写失败态并退出。
 
 **严禁以任何降级冒充 RELAY：** CPU 发布 payload 后才提交 P2、P2 只做一次 doorbell 检查、host timeline signal、CPU 直接推进 P2，均是 `CPU-gated STAR` 或其他非-RELAY 路径。它们不得使用 `--tp5-sync relay`、`GGML_TP5_SYNC=relay`、RELAY 测试名、RELAY benchmark 标签或 RELAY tok/s 结果；不得静默 fallback、别名伪装或在报告中混称。
 

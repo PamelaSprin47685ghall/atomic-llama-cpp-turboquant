@@ -9,7 +9,8 @@
 typedef bool (*ggml_backend_comm_prepare_graph_t)(void *               comm_ctx,
                                                   size_t               rank,
                                                   struct ggml_cgraph * cgraph,
-                                                  bool                 reduce);
+                                                  bool                 reduce,
+                                                  size_t               stage);
 
 #include <algorithm>
 #include <atomic>
@@ -3755,7 +3756,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (i < stage_tensors.size())
                     stage_tensors[i][j] = cgraph_ij->nodes[cgraph_ij->n_nodes - 1];
                 if (backend_ctx->comm_prepare &&
-                    !backend_ctx->comm_prepare(backend_ctx->comm_ctx, j, cgraph_ij, i < stage_tensors.size())) {
+                    !backend_ctx->comm_prepare(backend_ctx->comm_ctx, j, cgraph_ij, i < stage_tensors.size(), i)) {
                     return GGML_STATUS_FAILED;
                 }
                 if (!pfn_get_cbs(bcj.backend, cgraph_ij, stage_compute_cbs[i][j])) {
@@ -3843,7 +3844,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             auto & bcj = backend_ctx->backend_configs[j];
             if (backend_ctx->comm_prepare &&
                 !backend_ctx->comm_prepare(backend_ctx->comm_ctx, j, bcj.cgraphs[i].cgraph_main,
-                                           i < backend_ctx->n_subgraphs - 1)) {
+                                           i < backend_ctx->n_subgraphs - 1, i)) {
                 return GGML_STATUS_FAILED;
             }
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);

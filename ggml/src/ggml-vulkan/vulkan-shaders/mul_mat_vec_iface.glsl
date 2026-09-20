@@ -38,25 +38,71 @@ layout(binding = 3) readonly buffer GatePacked {
 #endif
 layout (binding = 4) readonly buffer Fuse1 {D_TYPE data_fuse1[];};
 
+#ifdef TP5_RELAY_OUTPUT
+#    ifdef TP5_RELAY_OUTPUT_F32
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent writeonly buffer TP5RelayWire {
+    float data[];
+};
+#    else
+layout(buffer_reference, std430, buffer_reference_align = 2) coherent writeonly buffer TP5RelayWire {
+    float16_t data[];
+};
+#    endif
+#endif
+
 #ifdef MUL_MAT_ID
-#    ifdef TP5_WIRE_OUTPUT
+#    if defined(TP5_WIRE_OUTPUT) || defined(TP5_RELAY_OUTPUT)
 #        ifdef MOE_DOWN_FOLD
 #            ifdef MOE_FUSE_SHARED_DOWN
+#                ifdef TP5_RELAY_OUTPUT
+layout(std430, binding = 9) coherent readonly buffer TP5RelayRoute {
+    uint64_t payload_bda;
+    uint ready;
+    uint reserved;
+} tp5_relay_route;
+#                else
 layout(binding = 9) writeonly buffer WireOut {
     float16_t data_wire[];
 };
+#                endif
 #            else
+#                ifdef TP5_RELAY_OUTPUT
+layout(std430, binding = 8) coherent readonly buffer TP5RelayRoute {
+    uint64_t payload_bda;
+    uint ready;
+    uint reserved;
+} tp5_relay_route;
+#                else
 layout(binding = 8) writeonly buffer WireOut {
     float16_t data_wire[];
 };
+#                endif
 #            endif
 #        endif
 #    endif
+#elif defined(TP5_RELAY_OUTPUT)
+layout(std430, binding = 5) coherent readonly buffer TP5RelayRoute {
+    uint64_t payload_bda;
+    uint ready;
+    uint reserved;
+} tp5_relay_route;
 #elif defined(TP5_WIRE_OUTPUT)
 layout(binding = 5) writeonly buffer WireOut {
     float16_t data_wire[];
 };
 #endif
+
+void tp5_write_wire(const uint index, const float value) {
+#ifdef TP5_RELAY_OUTPUT
+#    ifdef TP5_RELAY_OUTPUT_F32
+    TP5RelayWire(tp5_relay_route.payload_bda).data[index] = value;
+#    else
+    TP5RelayWire(tp5_relay_route.payload_bda).data[index] = float16_t(value);
+#    endif
+#elif defined(TP5_WIRE_OUTPUT)
+    data_wire[index] = float16_t(value);
+#endif
+}
 
 #ifdef MUL_MAT_ID
 layout (binding = 5) readonly buffer IDS {int data_ids[];};

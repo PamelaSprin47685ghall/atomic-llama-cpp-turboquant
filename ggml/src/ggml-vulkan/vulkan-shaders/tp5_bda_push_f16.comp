@@ -4,7 +4,9 @@
 // on-the-fly F16 conversion, direct coherent write to host-imported RAM.
 //
 // Formally verified Vulkan Memory Model completion protocol:
-// - Mode 0 (Data Dispatch): All workgroups concurrently convert and write payload data.
+// - Mode 0: all workgroups concurrently convert F32 and write F16 payload data.
+// - Mode 2: all workgroups copy an already-produced F16 companion in 128-bit bursts.
+// - Mode 3/4: one workgroup performs the same F32/packed-F16 payload write.
 // - Hardware Pipeline Barrier (HOST_BIT): Enforces complete cache drain and PCIe visibility.
 // - Mode 1 (Flag Dispatch): Single invocation writes completion flag, physically guaranteed
 //   to arrive after 100% of payload data has landed in CPU Host L3 memory (0% race failure).
@@ -19,12 +21,32 @@ layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Sr
     vec4 src_data[];
 };
 
+layout(buffer_reference, std430, buffer_reference_align = 16) coherent writeonly buffer DstBdaF32 {
+    vec4 dst_data[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer SrcBdaU128 {
+    uvec4 src_data[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) coherent writeonly buffer DstBdaU128 {
+    uvec4 dst_data[];
+};
+
 layout(buffer_reference, std430, buffer_reference_align = 8) coherent writeonly buffer DstBdaF16 {
     f16vec4 dst_data[];
 };
 
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer SrcTail {
     float data[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent writeonly buffer DstTailF32 {
+    float data[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly buffer SrcTailF16 {
+    float16_t data[];
 };
 
 layout(buffer_reference, std430, buffer_reference_align = 2) coherent writeonly buffer DstTail {
@@ -42,12 +64,54 @@ layout(push_constant) uniform Params {
     uint n_vec4;
     uint n_elems;
     uint seq_val;
-    uint mode; // 0 = Data payload dispatch, 1 = Atomic completion flag dispatch
+    uint mode; // 0/2 = F16 payload, 1 = flag, 3/4 = one-WG F16 payload, 5/6 = F32 payload
 } p;
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    if (p.mode == 0) {
+    if (p.mode == 6) {
+        const uint lane = gl_LocalInvocationID.x;
+        for (uint block = lane; block < p.n_vec4; block += 64u) {
+            DstBdaF32(p.dst_bda_addr).dst_data[block] = SrcBdaF32(p.src_bda_addr).src_data[block];
+        }
+        if (lane == 0u) {
+            for (uint e = 4u * p.n_vec4; e < p.n_elems; ++e) {
+                DstTailF32(p.dst_bda_addr).data[e] = SrcTail(p.src_bda_addr).data[e];
+            }
+        }
+    } else if (p.mode == 5) {
+        if (idx < p.n_vec4) {
+            DstBdaF32(p.dst_bda_addr).dst_data[idx] = SrcBdaF32(p.src_bda_addr).src_data[idx];
+        }
+        if (idx == p.n_vec4) {
+            for (uint e = 4u * idx; e < p.n_elems; ++e) {
+                DstTailF32(p.dst_bda_addr).data[e] = SrcTail(p.src_bda_addr).data[e];
+            }
+        }
+    } else if (p.mode == 3 || p.mode == 4) {
+        const bool packed = p.mode == 4;
+        const uint lane = gl_LocalInvocationID.x;
+        if (packed) {
+            for (uint block = lane; block < p.n_vec4; block += 64u) {
+                DstBdaU128(p.dst_bda_addr).dst_data[block] = SrcBdaU128(p.src_bda_addr).src_data[block];
+            }
+            if (lane == 0u) {
+                for (uint e = 8u * p.n_vec4; e < p.n_elems; ++e) {
+                    DstTail(p.dst_bda_addr).data[e] = SrcTailF16(p.src_bda_addr).data[e];
+                }
+            }
+        } else {
+            for (uint block = lane; block < p.n_vec4; block += 64u) {
+                vec4 v = SrcBdaF32(p.src_bda_addr).src_data[block];
+                DstBdaF16(p.dst_bda_addr).dst_data[block] = f16vec4(v);
+            }
+            if (lane == 0u) {
+                for (uint e = 4u * p.n_vec4; e < p.n_elems; ++e) {
+                    DstTail(p.dst_bda_addr).data[e] = float16_t(SrcTail(p.src_bda_addr).data[e]);
+                }
+            }
+        }
+    } else if (p.mode == 0) {
         if (idx < p.n_vec4) {
             vec4 v = SrcBdaF32(p.src_bda_addr).src_data[idx];
             DstBdaF16(p.dst_bda_addr).dst_data[idx] = f16vec4(v);
@@ -55,6 +119,15 @@ void main() {
         if (idx == p.n_vec4) {
             for (uint e = 4 * idx; e < p.n_elems; ++e) {
                 DstTail(p.dst_bda_addr).data[e] = float16_t(SrcTail(p.src_bda_addr).data[e]);
+            }
+        }
+    } else if (p.mode == 2) {
+        if (idx < p.n_vec4) {
+            DstBdaU128(p.dst_bda_addr).dst_data[idx] = SrcBdaU128(p.src_bda_addr).src_data[idx];
+        }
+        if (idx == p.n_vec4) {
+            for (uint e = 8 * idx; e < p.n_elems; ++e) {
+                DstTail(p.dst_bda_addr).data[e] = SrcTailF16(p.src_bda_addr).data[e];
             }
         }
     } else {

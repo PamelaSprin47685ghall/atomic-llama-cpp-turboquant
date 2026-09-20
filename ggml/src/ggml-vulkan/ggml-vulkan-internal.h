@@ -69,16 +69,34 @@ bool ggml_vk_tp5_tensor_dev_ref(struct ggml_tensor * t, struct VkBuffer_T ** buf
                                 uint64_t * off, uint64_t * size, vk_buffer * owner = nullptr);
 uint64_t ggml_vk_tp5_get_tensor_bda(struct ggml_tensor * t);
 
+static constexpr size_t VK_TP5_RELAY_ROUTE_MAX = 128;
+static constexpr size_t VK_TP5_RELAY_ROUTE_STRIDE = 256;
+struct vk_tp5_relay_route_entry {
+    uint64_t payload_bda = 0;
+    uint32_t ready       = 0;
+    uint32_t reserved    = 0;
+};
+static_assert(sizeof(vk_tp5_relay_route_entry) == 16);
+static_assert(VK_TP5_RELAY_ROUTE_STRIDE % sizeof(vk_tp5_relay_route_entry) == 0);
+
 // Configure the next graph's terminal producer, without recording or waiting.
 // A packed companion is available only after actual recording or validated
 // replay. Taking it consumes the record, so repeated allreduces repack F32.
-void ggml_vk_tp5_set_wire_output(ggml_backend_t backend, struct ggml_tensor * tensor);
+void ggml_vk_tp5_set_wire_output(ggml_backend_t backend, struct ggml_tensor * tensor,
+                                 bool compute_consumer = false, size_t relay_stage = SIZE_MAX,
+                                 bool relay_f32 = false);
 bool ggml_vk_tp5_take_wire_output(ggml_backend_t       backend,
                                   struct ggml_tensor * tensor,
                                   struct VkBuffer_T ** buf,
                                   uint64_t *           off,
                                   uint64_t *           size,
-                                  vk_buffer *          owner);
+                                  vk_buffer *          owner,
+                                  bool *               relay_direct = nullptr,
+                                  size_t               relay_stage = SIZE_MAX,
+                                  size_t *             relay_stage_out = nullptr);
+bool ggml_vk_tp5_get_relay_ready(ggml_backend_t backend, size_t stage, volatile uint32_t ** ready_ptr);
+bool ggml_vk_tp5_update_relay_route(ggml_backend_t backend, size_t stage, uint64_t payload_bda,
+                                    volatile uint32_t ** ready_ptr);
 
 struct vk_tp5_hc_binding {
     struct VkBuffer_T * buffer = nullptr;
@@ -100,8 +118,11 @@ struct vk_tp5_hc_sum {
 // execution retains this CB; a chain may omit it only after producing both HC
 // outputs in the preceding collective's P2, using the exact block binding.
 bool ggml_vk_tp5_hc_consumer(ggml_backend_t backend, void * first_cb, vk_tp5_hc_sum * recipe);
+// relay=false selects the five-slot TIMELINE sum consumer; relay=true selects
+// the bounded local-VRAM generation wait + CPU-reduced F32 consumer.
 bool ggml_vk_tp5_hc_sum_pipeline(vk_device                         device,
                                  bool                              quantized,
+                                 bool                              relay,
                                  struct VkPipeline_T **            pipeline,
                                  struct VkPipelineLayout_T **      layout,
                                  struct VkDescriptorSetLayout_T ** dsl);

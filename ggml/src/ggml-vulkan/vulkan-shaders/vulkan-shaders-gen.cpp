@@ -961,6 +961,18 @@ void process_shaders() {
                       { "TP5_HC_SUM", "1" },
                       { "TP5_HC_Q8",   "1" }
     });
+    // RELAY consumer variants fold the bounded local-VRAM doorbell wait
+    // directly into the HC consumer. The CPU-reduced payload is already F32,
+    // so no standalone relay-copy dispatch is needed before HC compute.
+    string_to_spv("qwen4_hc_relay_f32", "qwen4_hc_segment_norm.comp",
+                  {
+                      { "TP5_HC_RELAY", "1" }
+    });
+    string_to_spv("qwen4_hc_relay_f32_q8", "qwen4_hc_segment_norm.comp",
+                  {
+                      { "TP5_HC_RELAY", "1" },
+                      { "TP5_HC_Q8",    "1" }
+    });
     string_to_spv("qwen4_hc_segment_norm_q8", "qwen4_hc_segment_norm.comp",
                   {
                       { "TP5_HC_Q8", "1" }
@@ -1071,6 +1083,27 @@ void process_shaders() {
                                             { "USE_SUBGROUP_ADD_NO_SHMEM", "1"     },
                                             { "TP5_WIRE_OUTPUT",           "1"     }
     }));
+    string_to_spv("qwen4_output_q5k_relay", "mul_mat_vec_q5_k.comp",
+                  merge_maps(base_dict, {
+                                            { "DATA_A_Q5_K",               "1"     },
+                                            { "B_TYPE",                    "float" },
+                                            { "B_TYPEV2",                  "vec2"  },
+                                            { "B_TYPEV4",                  "vec4"  },
+                                            { "D_TYPE",                    "float" },
+                                            { "USE_SUBGROUP_ADD_NO_SHMEM", "1"     },
+                                            { "TP5_RELAY_OUTPUT",          "1"     }
+    }));
+    string_to_spv("qwen4_output_q5k_relay_f32", "mul_mat_vec_q5_k.comp",
+                  merge_maps(base_dict, {
+                                            { "DATA_A_Q5_K",               "1"     },
+                                            { "B_TYPE",                    "float" },
+                                            { "B_TYPEV2",                  "vec2"  },
+                                            { "B_TYPEV4",                  "vec4"  },
+                                            { "D_TYPE",                    "float" },
+                                            { "USE_SUBGROUP_ADD_NO_SHMEM", "1"     },
+                                            { "TP5_RELAY_OUTPUT",          "1"     },
+                                            { "TP5_RELAY_OUTPUT_F32",      "1"     }
+    }));
     string_to_spv("qwen4_moe_down_fold_wire", "mul_mat_vec.comp",
                   merge_maps(base_dict, {
                                             { "DATA_A_IQ4_NL",             "1"     },
@@ -1082,6 +1115,31 @@ void process_shaders() {
                                             { "MUL_MAT_ID",                "1"     },
                                             { "MOE_DOWN_FOLD",             "1"     },
                                             { "TP5_WIRE_OUTPUT",           "1"     }
+    }));
+    string_to_spv("qwen4_moe_down_fold_relay", "mul_mat_vec.comp",
+                  merge_maps(base_dict, {
+                                            { "DATA_A_IQ4_NL",             "1"     },
+                                            { "B_TYPE",                    "float" },
+                                            { "B_TYPEV2",                  "vec2"  },
+                                            { "B_TYPEV4",                  "vec4"  },
+                                            { "D_TYPE",                    "float" },
+                                            { "USE_SUBGROUP_ADD_NO_SHMEM", "1"     },
+                                            { "MUL_MAT_ID",                "1"     },
+                                            { "MOE_DOWN_FOLD",             "1"     },
+                                            { "TP5_RELAY_OUTPUT",          "1"     }
+    }));
+    string_to_spv("qwen4_moe_down_fold_relay_f32", "mul_mat_vec.comp",
+                  merge_maps(base_dict, {
+                                            { "DATA_A_IQ4_NL",             "1"     },
+                                            { "B_TYPE",                    "float" },
+                                            { "B_TYPEV2",                  "vec2"  },
+                                            { "B_TYPEV4",                  "vec4"  },
+                                            { "D_TYPE",                    "float" },
+                                            { "USE_SUBGROUP_ADD_NO_SHMEM", "1"     },
+                                            { "MUL_MAT_ID",                "1"     },
+                                            { "MOE_DOWN_FOLD",             "1"     },
+                                            { "TP5_RELAY_OUTPUT",          "1"     },
+                                            { "TP5_RELAY_OUTPUT_F32",      "1"     }
     }));
     string_to_spv("qwen4_moe_down_fold_shared_wire", "mul_mat_vec.comp",
                   merge_maps(base_dict, {
@@ -1096,6 +1154,33 @@ void process_shaders() {
                                             { "MOE_FUSE_SHARED_DOWN",      "1"     },
                                             { "TP5_WIRE_OUTPUT",           "1"     }
     }));
+    string_to_spv("qwen4_moe_down_fold_shared_relay", "mul_mat_vec.comp",
+                  merge_maps(base_dict, {
+                                            { "DATA_A_IQ4_NL",             "1"     },
+                                            { "B_TYPE",                    "float" },
+                                            { "B_TYPEV2",                  "vec2"  },
+                                            { "B_TYPEV4",                  "vec4"  },
+                                            { "D_TYPE",                    "float" },
+                                            { "USE_SUBGROUP_ADD_NO_SHMEM", "1"     },
+                                            { "MUL_MAT_ID",                "1"     },
+                                            { "MOE_DOWN_FOLD",             "1"     },
+                                            { "MOE_FUSE_SHARED_DOWN",      "1"     },
+                                            { "TP5_RELAY_OUTPUT",          "1"     }
+    }));
+    string_to_spv("qwen4_moe_down_fold_shared_relay_f32", "mul_mat_vec.comp",
+                  merge_maps(base_dict, {
+                                            { "DATA_A_IQ4_NL",             "1"     },
+                                            { "B_TYPE",                    "float" },
+                                            { "B_TYPEV2",                  "vec2"  },
+                                            { "B_TYPEV4",                  "vec4"  },
+                                            { "D_TYPE",                    "float" },
+                                            { "USE_SUBGROUP_ADD_NO_SHMEM", "1"     },
+                                            { "MUL_MAT_ID",                "1"     },
+                                            { "MOE_DOWN_FOLD",             "1"     },
+                                            { "MOE_FUSE_SHARED_DOWN",      "1"     },
+                                            { "TP5_RELAY_OUTPUT",          "1"     },
+                                            { "TP5_RELAY_OUTPUT_F32",      "1"     }
+    }));
     // Paired-expert K=128 MoE down fold: two selected experts per wave32
     // workgroup with independent half-wave reductions (native active-16-lane
     // order preserved per expert). Opt-in until paired validation lands.
@@ -1108,10 +1193,30 @@ void process_shaders() {
                   {
                       { "MOE_K128_WIRE_OUTPUT", "1" }
     });
+    string_to_spv("qwen4_moe_down_k128_relay", "qwen4_moe_down_k128.comp",
+                  {
+                      { "MOE_K128_RELAY_OUTPUT", "1" }
+    });
+    string_to_spv("qwen4_moe_down_k128_relay_f32", "qwen4_moe_down_k128.comp",
+                  {
+                      { "MOE_K128_RELAY_OUTPUT",     "1" },
+                      { "MOE_K128_RELAY_OUTPUT_F32", "1" }
+    });
     string_to_spv("qwen4_moe_down_k128_shared_wire", "qwen4_moe_down_k128.comp",
                   {
                       { "MOE_K128_FUSE_SHARED_DOWN", "1" },
                       { "MOE_K128_WIRE_OUTPUT",      "1" }
+    });
+    string_to_spv("qwen4_moe_down_k128_shared_relay", "qwen4_moe_down_k128.comp",
+                  {
+                      { "MOE_K128_FUSE_SHARED_DOWN", "1" },
+                      { "MOE_K128_RELAY_OUTPUT",     "1" }
+    });
+    string_to_spv("qwen4_moe_down_k128_shared_relay_f32", "qwen4_moe_down_k128.comp",
+                  {
+                      { "MOE_K128_FUSE_SHARED_DOWN", "1" },
+                      { "MOE_K128_RELAY_OUTPUT",     "1" },
+                      { "MOE_K128_RELAY_OUTPUT_F32", "1" }
     });
     string_to_spv("qwen4_moe_shared_up_swiglu", "mul_mat_vec_q6_k.comp",
                   merge_maps(base_dict, {

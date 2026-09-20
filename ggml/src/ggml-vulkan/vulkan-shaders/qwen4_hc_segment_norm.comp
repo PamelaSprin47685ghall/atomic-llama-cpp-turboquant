@@ -7,8 +7,13 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
-#ifdef TP5_HC_SUM
+#if defined(TP5_HC_SUM) || defined(TP5_HC_RELAY)
+#    define TP5_HC_COLLECTIVE 1
 #    extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+#ifdef TP5_HC_RELAY
+#    extension GL_EXT_buffer_reference : require
+#    extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #endif
 #ifdef TP5_HC_Q8
 #    extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
@@ -17,7 +22,7 @@
 
 // Preserve an independent 512-lane RMS tree per residual stream. The fused
 // variant pairs two streams so their five-slot sum can share LDS storage.
-#ifdef TP5_HC_SUM
+#ifdef TP5_HC_COLLECTIVE
 layout(local_size_x = 1024) in;
 const bool COMBINE     = true;
 const bool FUSE_INJECT = true;
@@ -36,7 +41,8 @@ struct hc_inject_block_q8_0 {
     float16_t d;
     int16_t   qs[16];
 };
-#ifdef TP5_HC_SUM
+#ifdef TP5_HC_COLLECTIVE
+#    ifdef TP5_HC_SUM
 // Separate descriptors preserve isolated-BO mailboxes. Only the first pair
 // commits the F32 sum; the other pair independently fills its local LDS copy.
 layout(std430, binding = 1) readonly buffer Slot0 {
@@ -58,6 +64,14 @@ layout(std430, binding = 4) readonly buffer Slot3 {
 layout(std430, binding = 5) readonly buffer Slot4 {
     float16_t slot4[];
 };
+#    else
+// RELAY keeps the CPU-reduced F32 payload in this rank's local, host-mapped
+// VRAM. Header word 0 is the generation doorbell; word 1 is a per-dispatch
+// completion counter; payload begins at byte 64.
+layout(std430, binding = 1) coherent volatile buffer RelayInbox {
+    uint relay_inbox[];
+};
+#    endif
 
 layout(std430, binding = 6) readonly buffer Gamma {
     float gamma[];
@@ -125,10 +139,10 @@ layout(std430, binding = 7) readonly buffer InjectInput {
 #endif
 
 #ifdef TP5_HC_Q8
-#    ifndef TP5_HC_SUM
+#    ifndef TP5_HC_COLLECTIVE
 // NativeHC zone: Q8_0 activation companion for the approximate integer-dot
 // HC down path (GGML_VK_HC_DOT=q8). Standalone variant: binding 8. The fused
-// TP5_HC_SUM layout declares the same block at binding 12 (SumOutput moves).
+// collective layouts declare the same block at binding 12 (SumOutput moves).
 struct hc_q8_block {
     float16_t d;
     int8_t    qs[32];
@@ -142,10 +156,15 @@ layout(std430, binding = 8) writeonly buffer Q8Companion {
 layout(push_constant) uniform Params {
     uint  width;
     float epsilon;
+#ifdef TP5_HC_RELAY
+    uint64_t status_bda;
+    uint     spin_max;
+    uint     reserved;
+#endif
 }
 
 p;
-#ifdef TP5_HC_SUM
+#ifdef TP5_HC_COLLECTIVE
 shared float partials[1024];
 shared float fused_slot[2];
 shared float block_sums[4096];
@@ -165,13 +184,98 @@ float block_value(uint col, uint stream) {
     if (stream == 0u)
         sum_output[col] = value;
     return value;
+#elif defined(TP5_HC_RELAY)
+    float value = uintBitsToFloat(relay_inbox[16u + col]);
+    if (stream == 0u)
+        sum_output[col] = value;
+    return value;
 #else
     return block_out[col];
 #endif
 }
 
+#ifdef TP5_HC_RELAY
+layout(buffer_reference, std430, buffer_reference_align = 4) coherent volatile buffer RelayStatus {
+    uint words[];
+};
+
+shared uint relay_ready;
+shared uint relay_expected;
+
+bool relay_wait_ready() {
+    const uint lane = gl_LocalInvocationID.x;
+    if (lane == 0u) {
+        RelayStatus status = RelayStatus(p.status_bda);
+        relay_ready        = 0u;
+        relay_expected     = status.words[1];
+        if (status.words[2] == 0u && relay_expected != 0u) {
+            for (uint spin = 0u; spin < p.spin_max; ++spin) {
+                if ((spin & 1023u) == 0u && status.words[2] != 0u)
+                    break;
+                if (relay_inbox[0] == relay_expected) {
+                    relay_ready = 1u;
+                    break;
+                }
+            }
+            if (relay_ready == 0u) {
+                if (status.words[2] == 0u)
+                    status.words[2] = relay_expected;
+                status.words[4] = relay_inbox[0];
+            }
+        } else if (relay_expected == 0u) {
+            status.words[2] = 0xffffffffu;
+        }
+    }
+    barrier();
+    if (relay_ready != 0u)
+        memoryBarrierBuffer();
+    return relay_ready != 0u;
+}
+
+void relay_poison() {
+    const uint row    = gl_LocalInvocationID.x / 512u;
+    const uint tid    = gl_LocalInvocationID.x % 512u;
+    const uint stream = 2u * gl_WorkGroupID.x + row;
+    const uint offset = stream * p.width;
+    const float nanv  = uintBitsToFloat(0x7fc00000u);
+
+    for (uint col = tid; col < p.width; col += 512u) {
+        combined[offset + col]   = nanv;
+        normalized[offset + col] = nanv;
+    }
+    if (gl_WorkGroupID.x == 0u) {
+        for (uint col = gl_LocalInvocationID.x; col < p.width; col += 1024u)
+            sum_output[col] = nanv;
+    }
+#ifdef TP5_HC_Q8
+    const uint n_blocks = (p.width + 31u) / 32u;
+    for (uint block_idx = tid; block_idx < n_blocks; block_idx += 512u) {
+        hc_q8_block block;
+        block.d = float16_t(nanv);
+        [[unroll]] for (uint e = 0u; e < 32u; ++e)
+            block.qs[e] = int8_t(0);
+        q8_companion[stream * n_blocks + block_idx] = block;
+    }
+#endif
+    memoryBarrierBuffer();
+}
+
+void relay_publish_completion() {
+    memoryBarrierBuffer();
+    barrier();
+    if (gl_LocalInvocationID.x == 0u) {
+        const uint prior = atomicAdd(relay_inbox[1], 1u);
+        if (prior + 1u == gl_NumWorkGroups.x) {
+            RelayStatus status = RelayStatus(p.status_bda);
+            status.words[3] = relay_expected;
+            memoryBarrierBuffer();
+        }
+    }
+}
+#endif
+
 void normalize(uint iterations) {
-#ifdef TP5_HC_SUM
+#ifdef TP5_HC_COLLECTIVE
     const uint row          = gl_LocalInvocationID.x / 512u;
     const uint tid          = gl_LocalInvocationID.x % 512u;
     const uint stream       = 2u * gl_WorkGroupID.x + row;
@@ -226,7 +330,7 @@ void normalize(uint iterations) {
             }
             temp = subgroupAdd(temp);
             if (tid == 0u) {
-#ifdef TP5_HC_SUM
+#ifdef TP5_HC_COLLECTIVE
                 fused_slot[row] = temp;
 #else
                 fused_slot = temp;
@@ -239,7 +343,7 @@ void normalize(uint iterations) {
     float sum    = 0.0;
     float weight = 0.0;
     if (COMBINE) {
-#ifdef TP5_HC_SUM
+#ifdef TP5_HC_COLLECTIVE
         const float raw_inject = fused_slot[row];
 #else
         const float raw_inject = FUSE_INJECT ? fused_slot : inject[stream];
@@ -254,7 +358,7 @@ void normalize(uint iterations) {
         if (col < p.width) {
             value = residual[offset + col];
             if (COMBINE) {
-#ifdef TP5_HC_SUM
+#ifdef TP5_HC_COLLECTIVE
                 precise float product = block_sums[col] * weight;
 #else
                 precise float product = block_value(col, stream) * weight;
@@ -325,7 +429,13 @@ void normalize(uint iterations) {
 }
 
 void main() {
-#ifdef TP5_HC_SUM
+#ifdef TP5_HC_RELAY
+    if (!relay_wait_ready()) {
+        relay_poison();
+        return;
+    }
+#endif
+#ifdef TP5_HC_COLLECTIVE
     for (uint col = gl_LocalInvocationID.x; col < p.width; col += 1024u) {
         block_sums[col] = block_value(col, 2u * gl_WorkGroupID.x);
     }
@@ -344,4 +454,7 @@ void main() {
         normalize(2u);
     else
         normalize(1u);
+#ifdef TP5_HC_RELAY
+    relay_publish_completion();
+#endif
 }

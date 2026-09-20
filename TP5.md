@@ -6,9 +6,31 @@
 
 ## RELAY 名称与语义铁律（当前有效）
 
-`RELAY` 不是“CPU 做完归约后提交一个 P2 copy”的泛称。它仅指自治的 GPU-resident doorbell relay：P1/P2 在 CPU reduce 前已预提交到每卡 queue；P2 在本卡 local-VRAM 上有界轮询 doorbell；CPU 仅通过 BAR/映射 VRAM 写入归约 payload 和匹配 generation，GPU 无需知道写入者为何或何时改变该 VRAM。P2 看见匹配 generation 后消费 payload 并写 completion；达到严格 `spin_max` 必须写失败态并退出。
+`RELAY` 不是“谁完成后再通知另一边继续”的机制。它的主语义是**双方先进入等待状态，状态满足后自然继续**：GPU 的 terminal producer 直接按所选 wire 宽度（F16/F32）把 payload 写入 host-imported RAM；CPU 从 queue submit 前就持续轮询每个 stage 的 stable route-ready word；producer 只是在原 compute CB 尾部把 ready 从 0 写成 1。下行方向同理：P2 早已驻留并在本卡 local-VRAM 上有界轮询 generation；CPU reduce 后只写 payload 与 generation。没有 post-handoff submit、host semaphore signal、callback 或显式“唤醒”动作。达到严格 `spin_max` 必须写失败态并退出。旧 P1 只保留为 direct-producer 不具备时的兼容 fallback。
 
 **严禁以任何降级冒充 RELAY。** CPU payload 发布后才提交 P2、P2 one-shot doorbell check、host timeline signal、CPU 直接推进 P2，均属于 `CPU-gated STAR` 或其他非-RELAY 路径；不得使用 relay CLI/env、测试名、benchmark 标签或 tok/s 结果，且不得 silent fallback 或别名混称。本文中所有旧的 timeline/direct/host-relay 历史叙述不改变这一定义。
+
+### RELAY soft-scheduling 快路径（2026-09-20，已实现、未真机验证）
+
+本轮第一目标只压**软调度**，不把算法级 lookahead/late-binding 混进基线。RELAY 仍以单个小 workgroup 的 bounded-spin P2 作为默认门闩，整 token 每 rank 一次 full-chain submit；stage 间不使用 peer semaphore、host timeline signal 或二次 P2 submit。具备 direct producer 的 stage **不再录制、不再提交 P1**：Q5_K output projection、MoE down/fold、shared-down 及 K128 特化直接双写本地 F32 结果与 host payload。producer 后只保留必要的 COMPUTE→HOST payload publish，以及 stable route table 上 4-byte `ready=1` 的 TRANSFER→HOST state publication；CPU 在此之前早已轮询该 word。
+
+replay 不直接绑定会随 workspace/bank 改变的 host payload BO。每个 Vulkan backend 持有一块长期稳定、CPU-cacheable、通过 external-memory-host 导入的 route table；每个 stage 使用 256-byte 对齐 slot，内容只有动态 `payload_bda + ready`。cached producer descriptor 永远绑定同一个 route slot，workspace resize 或 bank 轮换只更新 slot 里的 BDA，不修改 descriptor 或 command buffer。replay cache identity 固定 `route_stage`，而该 cache entry 实际是否录成 direct producer 由其独立资格位保存并在 warm replay 时重新发布。只有五个 rank 都拿到 direct 资格时 collective 才删除该 stage 的 P1，否则整 stage 回到旧路径。cold/one-shot RELAY 也使用同一资格：direct producer 已执行时只预提交 P2，不再补录或提交 P1。
+
+上行 host payload 仍使用两个 bank。direct producer 不会越过尚未消费的同 bank payload：producer(e) 在本 queue 上位于 P2(e-1) 之后，而 P2(e-1) 只有在 CPU 已经消费 e-1 并发布下行 generation 后才能完成；因此 producer(e) 开始覆盖 bank(e) 时，CPU 必然更早已经消费 e-2 的同 bank payload。这个 ownership credit 由 queue order 与既有 P2 spin 自然成立，不需要 P1 充当信用节点。
+
+CPU→GPU 下行 local VRAM 优先选择 `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT | DEVICE_COHERENT_AMD`，**不再主动要求 `DEVICE_UNCACHED_AMD`**；只有目标机没有 cached device-coherent memory type 时才退到 uncached。这样 64-byte doorbell 与紧随其后的 decode payload 可以利用 GPU cache / Infinity Cache，而 `HOST_COHERENT + DEVICE_COHERENT_AMD` 已提供 host/device memory-domain 自动可见性。快路径按 `payload stores → sfence → generation stores → sfence` 发布，不再默认每 rank 调一次 `vkFlushMappedMemoryRanges`；`GGML_TP5_RELAY_FORCE_FLUSH=1` 可恢复旧诊断路径。CPU 上行 polling 改为一个 pending-rank bitmask 同时扫五卡 ready word，deadline 只周期检查，避免 hot spin 每轮读取 steady clock。
+
+wire 宽度重新作为性能变量，而不是先验固定 F16。RELAY 的 F16 与 F32 现在走**同一套 direct-route/replay/ready/P2 调度机制**：F16 producer 直接按 canonical `float16_t(result)` 写 host payload，CPU 用 AVX2+F16C 解包求和；F32 producer 直接写 float，CPU 用纯 AVX2 求和，省掉 pack/unpack 但上行字节数翻倍。fallback P1 也分别有 F16 conversion/copy 与 F32 literal-copy 模式，因此 `--tp5-wire f16` / `f32` 的比较不会混入不同调度路径。小 decode payload 的 CPU reduce 与五路 BAR broadcast 都是一遍 fan-out，不再先物化 host F32 sum 后再 `memcpy` 五遍。
+
+### RELAY fused-consumer / LateBind 试验入口（第二步，默认关闭）
+
+RELAY 的 HC 边界现在可把**有界 doorbell 自旋直接并入下一段 HC consumer**：预提交的同一个 dispatch 在每个 workgroup 内轮询本卡 local-VRAM generation，generation 匹配后不退出、不经过第二次 dispatch，而是原地继续执行 CPU-reduced F32 consume、inject、RMS/gamma、normalized 输出以及可选 Q8 companion。整链仍保持一次预提交和原有 fixed `spin_max`/sticky error/native timeline drain；没有 host semaphore signal，也没有二次 P2 submit。
+
+多 workgroup 不抢占或清除 generation doorbell。CPU 在复用 bank 并发布新 payload 前把 header generation 与 completion counter 清零，payload 写完后最后发布 generation；各 workgroup 只读 generation，并在完成后对本卡 header completion counter 做 32-bit atomic increment，最后一个 workgroup 写 `status[3]`。这样避免“先到 workgroup 清门铃、后到 workgroup 永远看不到”的死锁，也不引入跨 workgroup 软件全局 barrier。非 HC 首消费者仍走原有单-workgroup `tp5_relay_copy_f32` fallback；不得为了追求单 dispatch 把任意多-workgroup算子塞进驻留自旋 barrier。
+
+该大 workgroup fused-consumer 现在只在显式 `GGML_TP5_RELAY_FUSED_HC=1` 时启用；默认关闭，因为“1024-thread workgroup 先自旋”会占据大量 residency，不属于第一步的轻量门闩目标。后续若按 LateBind 路线把独立计算移到自旋之前，再重新评估该入口。
+
+这次提交只完成源码与协议接线，**没有执行 shader 编译、GPU mesh、真实模型或吞吐测试**，因此不能把上述任一路径写成硬件验收或性能数字。
 
 **演进历史说明**：本文第 0–28 节源于 2026-09-12 设计初稿；附录 C 记录 2026-09-13 目标机实施与真机首轮直连数据；正文开篇与文末《TP5-FAST》及《收敛与优化指导》记录 2026-09-14 重新插卡验证、物理内存审计、ioctl 剖析、`llama_tp5_plan` 统合接入、实验性 gpuflag 机制及最新收敛路线。凡设计初稿中标记为“拟实现项/拟新增”的模块（如 `llama_tp5_plan`、`tp5-inspect-model.py`、`tp5-manifest.json`、Vulkan collective、命令重放等），均已在当前 master 源码树中实现并按工程规范部署。
 

@@ -31,16 +31,16 @@ void main() {
         uint expected = status.words[1];
         if (status.words[2] == 0u && expected != 0u) {
             for (uint spin = 0u; spin < p.spin_max; ++spin) {
-                memoryBarrierBuffer();
                 // A host-side bounded handoff failure requests an immediate
                 // fail-closed exit; do not burn the remaining spin budget.
                 if ((spin & 1023u) == 0u && status.words[2] != 0u) {
                     break;
                 }
                 if (inbox[0] == expected) {
-                    // Consume the generation-matched doorbell exactly once.
-                    // No lane other than lane 0 touches the control word.
-                    inbox[0] = 0u;
+                    // Generation matching is exact; leave the doorbell stable
+                    // for the lifetime of this activation. The CPU clears it
+                    // before publishing the next generation, avoiding a
+                    // needless GPU write into host-mapped VRAM.
                     ready = 1u;
                     break;
                 }

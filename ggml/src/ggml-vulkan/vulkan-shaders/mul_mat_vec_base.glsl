@@ -14,7 +14,14 @@
 #if defined(TP5_WIRE_OUTPUT) && !defined(USE_SUBGROUP_ADD_NO_SHMEM)
 #    error "TP5_WIRE_OUTPUT requires USE_SUBGROUP_ADD_NO_SHMEM"
 #endif
-#ifdef TP5_WIRE_OUTPUT
+#if defined(TP5_RELAY_OUTPUT) && !defined(USE_SUBGROUP_ADD_NO_SHMEM)
+#    error "TP5_RELAY_OUTPUT requires USE_SUBGROUP_ADD_NO_SHMEM"
+#endif
+#ifdef TP5_RELAY_OUTPUT
+#    extension GL_EXT_buffer_reference : require
+#    extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#endif
+#if defined(TP5_WIRE_OUTPUT) || defined(TP5_RELAY_OUTPUT)
 #    extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
 
@@ -245,8 +252,8 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
 #        endif
         precise float result    = folded + shared_value;
         data_d[first_row + row] = result;
-#        ifdef TP5_WIRE_OUTPUT
-        data_wire[first_row + row] = float16_t(result);
+#        if defined(TP5_WIRE_OUTPUT) || defined(TP5_RELAY_OUTPUT)
+        tp5_write_wire(first_row + row, result);
 #        endif
     }
 #    elif defined(HC_UP_FOLD)
@@ -299,8 +306,8 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                 temp[j][n]       = gate / (1.0 + exp(-gate)) * temp[j][n];
 #        endif
                 data_d[mat_vec_d_col_offset(j, d_offset) + first_row + n] = D_TYPE(temp[j][n]);
-#        ifdef TP5_WIRE_OUTPUT
-                data_wire[mat_vec_d_col_offset(j, d_offset) + first_row + n] = float16_t(temp[j][n]);
+#        if defined(TP5_WIRE_OUTPUT) || defined(TP5_RELAY_OUTPUT)
+                tp5_write_wire(mat_vec_d_col_offset(j, d_offset) + first_row + n, temp[j][n]);
 #        endif
             }
         }
