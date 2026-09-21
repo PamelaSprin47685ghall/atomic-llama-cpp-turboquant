@@ -178,14 +178,27 @@ M3 实施必须以以下三条为不可谈判前提，本文所有双长度契�
 - **Terminal Producer 区域（区 4）**：`354b5b1f8`。盘点与第 14 组测试确认生产代码无需修改（`inp_out_ids` 容量分配、D2H 活跃截断、采样器活跃行消费、LateBind 行程序截断天然就绪）。
 - **RELAY / 消费者通道**：代码盘点确认天然以活跃 payload 元素消费，无需额外修改。
 
-### 7.2 GDN GPU 侧状态
+### 7.2 GDN GPU 侧状态与单卡验证事实
 - **着色器与管线接线**：多步变长内核 `qwen4_gdn_multistep_delta.comp`（`e09beffc7`）、`prep`/`norm`（`a74a03725`）、管线句柄创建与基于 `op_params[2]` 的容量分派接线、以及 `ggml_vk_can_fuse_gdn_segment` 容量匹配放宽（`5407c211b`）已完成结构闭环。
-- **安全隔离态**：虽然 GPU 着色器与分派接线已完成结构性闭环，但由于真机未验，生产准入函数 `evaluate_target_capacity_admission` 对所有 GDN/recurrent 模型仍维持严格的 **fail-closed** 拦截，安全回退精确路径。
+- **单卡真机验证通过（最新事实）**：单卡 GDN 多步容量融合已在真实 RX 6800 上通过单算子密闭回归测试 `tests/test-vulkan-gdn-multistep.cpp`（提交 `e508881d7`）：
+  - 覆盖范围：活跃步 $A \in \{1, 2, 4\}$、容量 $C = 4$；
+  - 核心断言证据：
+    1. 尾部脏数据隔离：变异无效输入步 $[A, C)$，GPU 最终循环状态位级一致（bit-identical）；
+    2. 数值精度：活跃步输出与最终循环状态和 CPU 参考实现严格对齐（parity 残差约 $10^{-6}$ 量级）；
+    3. 融合派发命中：执行日志确认捕获 `GDN_SEGMENT` 融合派发，段耗时约为 82–99 $\mu$s/段；
+    4. 单步传统路径回归 100% 通过。
+  - 修复链提交支撑（按序）：
+    - `bff0c009b`：Q/K/V 交织视图 matcher 约束放宽；
+    - `3d3822c90`：循环状态切片偏移修正为 `n_time * head_values`；
+    - `d6579d1bb`：prep 卷积输入布局对齐；
+    - `a2638e056`：segment_project 多行分派支持；
+    - `2d0b67c15`：norm 树状规约与 gamma 头偏移修复。
+- **生产准入护栏仍维持**：尽管单卡算子级验证全通，生产准入函数 `evaluate_target_capacity_admission`（`src/llama-context.cpp:2432-2440`）对 GDN/recurrent 模型依然保持严格的 **fail-closed** 拦截；解禁的前置条件保持不变。
 
 ### 7.3 剩余闭合前置
-1. **真机 RX 6800 运行验证**：在目标硬件上验证多步 SPIR-V 执行、`dmesg` 零 VM Fault / ring timeout，以及循环状态与 CPU 参考的位级一致性。
-2. **解除 GDN fail-closed 决策**：在真机实测证据确凿后，方可由负责人裁决解除 `evaluate_target_capacity_admission` 中的循环状态 fail-closed 门禁。
-3. **容量路径启用的端到端证据**：端到端吞吐测速与正确性校验（须在真机获批前提下执行）。
+1. **多卡与模型级一致性真机验证**：在 5 卡 TP5 / 完整模型端到端上下文下验证多步 GDN 执行、`dmesg` 零新增 GPUVM fault / timeout，以及跨卡 AllReduce 后的状态连续性。
+2. **解除 GDN fail-closed 决策**：在多卡/全模型级实测证据确凿后，方可由负责人裁决解除 `evaluate_target_capacity_admission` 中的循环状态 fail-closed 门禁。
+3. **容量路径启用的端到端证据**：端到端吞吐测速与端到端文本生成正确性校验（须在真机获批前提下执行）。
 
 ### 7.4 保持不匹配的未闭合回退项
 以下场景在图匹配与准入层显式保持不匹配或 fail-closed 回退至精确单定义 / 传统路径：
