@@ -167,6 +167,8 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_TQ3_1S        = 43, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_TQ4_1S        = 44, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_PQ2_0         = 141, // except 1d tensors (Prism-private group-128 Q2_0; kept < 0x400 to avoid the LLAMA_FTYPE_GUESSED bit)
+        LLAMA_FTYPE_MOSTLY_PQ2_0_LEGACY  = 142, // legacy ftype id in some published ggufs
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
