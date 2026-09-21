@@ -23598,8 +23598,10 @@ static bool ggml_vk_can_fuse_gdn_segment(ggml_backend_vk_context * ctx, const gg
             ggml_get_op_params_i32(node(15), 2) != active_param) {
             return false;
         }
+        // In capacity mode (n_time > 1), state snapshots in gdn_out start after all n_time attention scores:
+        // offset in bytes = attn_score_elems * sizeof(float) = n_time * head_values * sizeof(float).
         if (!valid(node(16), GGML_TYPE_F32) || ggml_nelements(node(16)) != state_values ||
-            node(16)->view_src != node(15) || node(16)->view_offs != head_values * sizeof(float) ||
+            node(16)->view_src != node(15) || node(16)->view_offs != (size_t) n_time * head_values * sizeof(float) ||
             !valid(node(17), GGML_TYPE_F32) || ggml_nelements(node(17)) != state_values ||
             !valid(node(18), GGML_TYPE_F32) || ggml_nelements(node(18)) != state_values) {
             return false;
