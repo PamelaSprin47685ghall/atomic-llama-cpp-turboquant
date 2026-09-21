@@ -2051,7 +2051,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     // RERoT needs many logical ids for parked/archive sequences, but only one
     // live recurrent state per physical server slot. The context keeps these
     // capacities separate so the seq-id arena does not multiply recurrent VRAM.
-    cparams.n_seq_recurrent   = params.rerot_enabled ? params.n_parallel : 0;
+    // When RERoT is enabled, an isolated probe branch requires a second concurrent
+    // sequence alongside C0, so the minimum physical recurrent capacity is 2.
+    const uint32_t n_parallel_eff = params.n_parallel > 0 ? (uint32_t) params.n_parallel : 1u;
+    const uint32_t pen_cap        = params.rerot_pen_max > 0 ? (uint32_t) params.rerot_pen_max : n_parallel_eff;
+    cparams.n_seq_recurrent       = params.rerot_enabled ? std::max({ n_parallel_eff, pen_cap, 2u }) : 0;
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
     cparams.n_batch           = params.n_batch;

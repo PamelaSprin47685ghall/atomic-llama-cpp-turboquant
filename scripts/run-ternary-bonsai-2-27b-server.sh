@@ -143,7 +143,7 @@ HEALTH_HOST="$HOST"
 [[ "$HEALTH_HOST" == "0.0.0.0" ]] && HEALTH_HOST="127.0.0.1"
 
 for i in $(seq 1 120); do
-    sleep 2
+    sleep 1
     if curl -sf --max-time 2 "http://${HEALTH_HOST}:${PORT}/health" >/dev/null 2>&1; then
         ready=1
         say "Server healthy & listening @ $((i * 2))s!"

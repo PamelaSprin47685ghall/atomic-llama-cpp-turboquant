@@ -1536,6 +1536,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     };
 
     add_opt(common_arg(
+        {"--rerot-pens", "--rerot-pen-max"}, "N",
+        string_format("maximum physical execution pens for RERoT (default: %u, 0 = auto/n_parallel)", params.rerot_pen_max),
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("error: --rerot-pens must be greater than 0\n");
+            }
+            params.rerot_pen_max = (uint32_t) value;
+                if (params.rerot_person_max == 0) {
+                    params.rerot_person_max = params.n_parallel > 0 ? (uint32_t) params.n_parallel : 1u;
+        }
+        }
+    ).set_env("LLAMA_ARG_REROT_PENS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+            {"--rerot-people", "--rerot-person-max"}, "N",
+            string_format("maximum concurrent people (brains) for RERoT (default: %u, 0 = n_parallel)", params.rerot_person_max),
+            [](common_params & params, int value) {
+                if (value <= 0) {
+                    throw std::invalid_argument("error: --rerot-people must be greater than 0\n");
+        }
+                params.rerot_person_max = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_REROT_PEOPLE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"-h", "--help", "--usage"},
         "print usage and exit",
         [](common_params & params) {
@@ -1743,7 +1766,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_SIZE"));
     add_opt(common_arg(
-        {"--kv-size", "--total-kv", "-kv"}, "N|auto",
+        {"-kv", "--kv-size", "--total-kv"}, "N|auto",
         string_format("unified KV cache capacity in tokens (default: %u, 0 = ctx-size, auto = use all available device memory)", params.n_ctx_kv),
         [](common_params & params, const std::string & value) {
             if (value == "auto") {
