@@ -602,6 +602,16 @@ private:
     bool key_valid = false;
     uint64_t epoch = 0;
 
+    // P5 live-prefix upload: the zero tail of each capacity-bucketed span
+    // tensor is written exactly once per allocation (first fill after a
+    // capacity change). Later frontiers with the same capacity only upload
+    // the live prefix; the tail stays zero because fill_spans never writes
+    // non-zero values past the live counts and consumers (Q gather, RoPE,
+    // indexed attention) never read past the offsets-bounded entries.
+    // Recorded capacity (0 = none yet) rather than a bool so a capacity
+    // change forces one fresh full upload.
+    uint32_t zeroed_capacity = 0;
+
     // Pipeline-parallel lifetime: per-instance staging snapshot. Never a
     // static; never an alias of layout internals. Overwrites happen only via
     // fill_spans, ordered after the previous frontier's graph completion.

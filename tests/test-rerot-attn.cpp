@@ -1882,6 +1882,130 @@ static void test_rerot_capacity_bucket_separation() {
     ggml_backend_free(backend);
 }
 
+// P5 live-prefix upload: after a full-capacity upload zeroes the tail, a
+// later frontier that rewrites ONLY the live prefix (what fill_spans does
+// between capacity-stable rebuilds) must produce output identical to a
+// from-scratch full upload of the same live data. This pins the invariant
+// that the zero tail never needs re-uploading and is never read.
+static void test_rerot_live_prefix_upload_invariant() {
+    std::puts("--- RERoT live-prefix upload invariant (P5) ---");
+
+    constexpr int d = 8;
+    constexpr int dv = 6;
+    constexpr int hq = 2;
+    constexpr int hkv = 1;
+    constexpr int nq = 2;
+    constexpr int nkv = 8;
+    constexpr float scale = 0.35f;
+    constexpr float softcap = 0.0f;
+
+    const int ng = 5;   // live groups (capacity bucket = 32)
+    const int ne = 7;   // live entries (capacity bucket = 256)
+    const uint32_t group_cap = llm_graph_input_attn_rerot::group_capacity_bucket(ng);
+    const uint32_t entry_cap = llm_graph_input_attn_rerot::entry_capacity_bucket(ne);
+    CHECK(group_cap == 32);
+    CHECK(entry_cap == 256);
+
+    // Frontier A data (live prefix), then frontier B data (different).
+    std::vector<int32_t> entries_a(2 * ne), entries_b(2 * ne);
+    for (int i = 0; i < ne; ++i) {
+        entries_a[2 * i + 0] = i % nkv;
+        entries_a[2 * i + 1] = i % ng;
+        entries_b[2 * i + 0] = (nkv - 1) - (i % nkv);
+        entries_b[2 * i + 1] = (ng - 1) - (i % ng);
+    }
+    const std::vector<int32_t> offsets = { 0, 3, ne };
+
+    auto build_q = [&]() {
+        std::vector<float> q(size_t(d) * group_cap * hq, 0.0f);
+        for (int h = 0; h < hq; ++h) {
+            for (int g = 0; g < ng; ++g) {
+                for (int id = 0; id < d; ++id) {
+                    q[(size_t(h) * group_cap + g) * d + id] = value_q(g, h, id);
+                }
+            }
+        }
+        return q;
+    };
+
+    const std::vector<float> q_a = build_q();
+    const std::vector<float> q_b = build_q();
+
+    std::vector<float> k_data(size_t(d) * nkv * hkv);
+    std::vector<float> v_data(size_t(dv) * nkv * hkv);
+    for (int h = 0; h < hkv; ++h) {
+        for (int key = 0; key < nkv; ++key) {
+            for (int id = 0; id < d; ++id) {
+                k_data[(size_t(h) * nkv + key) * d + id] = value_k(key, h, id);
+            }
+            for (int id = 0; id < dv; ++id) {
+                v_data[(size_t(h) * nkv + key) * dv + id] = value_v(key, h, id);
+            }
+        }
+    }
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    CHECK(backend != nullptr);
+
+    ggml_init_params params = { 64 * 1024 * 1024, nullptr, true };
+    ggml_context_ptr ctx(ggml_init(params));
+    CHECK(bool(ctx));
+    if (!ctx) {
+        ggml_backend_free(backend);
+        return;
+    }
+
+    ggml_tensor * q = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d, group_cap, hq, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d, nkv, hkv, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, dv, nkv, hkv, 1);
+    ggml_tensor * e = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 2, entry_cap);
+    ggml_tensor * o = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, offsets.size());
+    ggml_tensor * out = ggml_flash_attn_ext_rerot(ctx.get(), q, k, v, e, o, nullptr, scale, softcap);
+    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    CHECK(bool(buffer));
+
+    // Frontier A: full-capacity upload (zero tail established).
+    ggml_backend_tensor_set(q, q_a.data(), 0, q_a.size() * sizeof(float));
+    ggml_backend_tensor_set(k, k_data.data(), 0, k_data.size() * sizeof(float));
+    ggml_backend_tensor_set(v, v_data.data(), 0, v_data.size() * sizeof(float));
+    ggml_backend_tensor_set(e, entries_a.data(), 0, entries_a.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(o, offsets.data(), 0, offsets.size() * sizeof(int32_t));
+
+    // Frontier B: PREFIX-ONLY re-upload of q and entries (the P5 fast
+    // path). q is [d, group_cap, hq]: head h's live rows live at
+    // h * group_cap * d, so the live prefix is one chunk PER HEAD (mirrors
+    // fill_spans' per-coordinate q_pos chunks). Tail stays at frontier-A
+    // zeros.
+    for (int h = 0; h < hq; ++h) {
+        const size_t head_off = (size_t) h * group_cap * d * sizeof(float);
+        ggml_backend_tensor_set(q, q_b.data() + head_off / sizeof(float), head_off, size_t(d) * ng * sizeof(float));
+    }
+    ggml_backend_tensor_set(e, entries_b.data(), 0, entries_b.size() * sizeof(int32_t));
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 32, false);
+    ggml_build_forward_expand(graph, out);
+    CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_synchronize(backend);
+
+    std::vector<float> actual(ggml_nelements(out));
+    ggml_backend_tensor_get(out, actual.data(), 0, actual.size() * sizeof(float));
+
+    // Reference: frontier-B live data only.
+    const auto expected = reference(d, dv, hq, hkv, nq, entries_b, offsets, scale, softcap, {});
+    CHECK(actual.size() == expected.size());
+    for (size_t i = 0; i < actual.size(); ++i) {
+        if (std::fabs(actual[i] - expected[i]) > 2e-5f) {
+            std::fprintf(stderr, "prefix-upload mismatch idx=%zu: actual=%g expected=%g\n",
+                         i, actual[i], expected[i]);
+            ++failures;
+            break;
+        }
+    }
+
+    ggml_backend_free(backend);
+}
+
 int main(int argc, char ** argv) {
     test_error_metric_rejects_invalid_outputs();
     if (argc == 3 && std::strcmp(argv[1], "--rbb-replay") == 0) return replay_rbb_snapshot(argv[2]);
@@ -1892,6 +2016,7 @@ int main(int argc, char ** argv) {
     }
     std::puts("=== RERoT indexed attention test ===");
     test_rerot_capacity_bucket_separation();
+    test_rerot_live_prefix_upload_invariant();
     test_indexed_basic();
     test_ddvr_imrope_via_indexed_op();
     test_frontier_strong_vs_lag1();

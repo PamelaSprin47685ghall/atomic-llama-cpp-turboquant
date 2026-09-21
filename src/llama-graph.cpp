@@ -790,6 +790,10 @@ void llm_graph_input_attn_rerot::build_span_tensors(
     key_valid = true;
     this->sched = sched;
 
+    // Fresh tensor allocations: the zero tail is not resident until the
+    // first fill_spans performs a full-capacity upload (P5).
+    zeroed_capacity = 0;
+
     q_indices = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, key.group_cap);
     ggml_set_input(q_indices);
 
@@ -980,10 +984,78 @@ void llm_graph_input_attn_rerot::fill_spans(
         }
     };
 
-    upload_tensor_snapshot_or_fallback(q_indices, st_q_indices.data(), ggml_nbytes(q_indices));
-    upload_tensor_snapshot_or_fallback(q_pos,     st_q_pos.data(),     ggml_nbytes(q_pos));
-    upload_tensor_snapshot_or_fallback(entries,   st_entries.data(),   ggml_nbytes(entries));
-    upload_tensor_snapshot_or_fallback(offsets,   st_offsets.data(),   ggml_nbytes(offsets));
+    // P5 chunked upload: same preflight/fallback discipline, non-zero dst
+    // offset. Used for q_pos whose coordinate k lives at k * group_cap.
+    auto upload_at_offset_or_fallback = [sched](ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+        if (size == 0) {
+            return;
+        }
+        bool snapshotted = false;
+        if (sched && tensor && tensor->buffer && data &&
+            ggml_is_contiguous(tensor) &&
+            size <= 65536 && (size & 3) == 0 && (offset & 3) == 0 &&
+            offset + size <= ggml_nbytes(tensor)) {
+
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
+            if (backend) {
+                if (ggml_backend_tensor_set_snapshot_async(backend, tensor, data, offset, size, true)) {
+                    snapshotted = ggml_backend_tensor_set_snapshot_async(backend, tensor, data, offset, size, false);
+                }
+            }
+            if (!snapshotted && !backend) {
+                const int n_backends = ggml_backend_sched_get_n_backends(sched);
+                for (int i = 0; i < n_backends; ++i) {
+                    ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+                    if (b) {
+                        if (ggml_backend_tensor_set_snapshot_async(b, tensor, data, offset, size, true)) {
+                            snapshotted = ggml_backend_tensor_set_snapshot_async(b, tensor, data, offset, size, false);
+                            if (snapshotted) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!snapshotted) {
+            ggml_backend_tensor_set(tensor, data, offset, size);
+        }
+    };
+
+    // P5 live-prefix upload: after the first fill for a given capacity, the
+    // zero tail of each capacity-bucketed tensor is already resident and
+    // stays zero (fill_spans only writes live rows). Upload just the live
+    // prefix; a capacity change re-uploads full capacity once. offsets is
+    // always exact-sized (no padding) and always uploads fully. q_indices
+    // and entries are dense prefixes. q_pos is NOT one prefix: coordinate k
+    // lives at k * group_cap (capacity stride), so IMRoPE's 4-tuple needs
+    // one chunk per coordinate. All sizes stay 4-byte aligned (int32).
+    const uint32_t cap_now = (uint32_t) group_cap;
+    const bool full_upload = zeroed_capacity != cap_now;
+    if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+        prof->ring.push(4 /* upload-audit */, 3 /* full-vs-prefix */, 0, cap_now, full_upload ? 1 : 0);
+    }
+    const size_t q_idx_bytes  = full_upload ? ggml_nbytes(q_indices) : n_groups * sizeof(int32_t);
+    const size_t ent_bytes    = full_upload ? ggml_nbytes(entries)   : n_entries * 2 * sizeof(int32_t);
+    const size_t off_bytes    = ggml_nbytes(offsets);
+
+    upload_tensor_snapshot_or_fallback(q_indices, st_q_indices.data(), q_idx_bytes);
+    if (full_upload) {
+        upload_tensor_snapshot_or_fallback(q_pos, st_q_pos.data(), ggml_nbytes(q_pos));
+    } else {
+        // Per-coordinate live chunks: coordinate k occupies
+        // [k * group_cap, k * group_cap + n_groups).
+        for (uint32_t k = 0; k < n_pos; ++k) {
+            const int32_t * chunk = st_q_pos.data() + (size_t) k * group_cap;
+            upload_at_offset_or_fallback(q_pos, chunk, (size_t) k * group_cap * sizeof(int32_t), n_groups * sizeof(int32_t));
+        }
+    }
+    upload_tensor_snapshot_or_fallback(entries,   st_entries.data(),   ent_bytes);
+    upload_tensor_snapshot_or_fallback(offsets,   st_offsets.data(),   off_bytes);
+    if (full_upload) {
+        zeroed_capacity = cap_now;
+    }
 
     // Upload-audit probe: t2 marks tensor_set upload finish
     const auto t2 = std::chrono::steady_clock::now();
@@ -991,13 +1063,21 @@ void llm_graph_input_attn_rerot::fill_spans(
     if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
         const uint64_t staging_us  = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
         const uint64_t set_us      = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
-        const uint64_t total_bytes = (uint64_t) (ggml_nbytes(q_indices) + ggml_nbytes(q_pos) + ggml_nbytes(entries) + ggml_nbytes(offsets));
+        const uint64_t total_bytes = (uint64_t) (q_idx_bytes + (full_upload ? ggml_nbytes(q_pos) : n_groups * n_pos * sizeof(int32_t)) + ent_bytes + off_bytes);
         prof->upload_bytes.fetch_add(total_bytes, std::memory_order_relaxed);
         prof->h2d_bytes.fetch_add(total_bytes, std::memory_order_relaxed);
         prof->layout_view_build_us.fetch_add(staging_us, std::memory_order_relaxed);
         prof->layout_view_build_count.fetch_add(1, std::memory_order_relaxed);
         prof->ring.push(4 /* custom/upload-audit */, 0 /* staging */, 0, (uint32_t) total_bytes, staging_us);
         prof->ring.push(4 /* custom/upload-audit */, 1 /* set */,     0, (uint32_t) total_bytes, set_us);
+        // P2 evidence: Q-prep (gather + RoPE over q_indices rows) processes
+        // the full group capacity; record live vs capacity so the padding
+        // waste is attributable per frontier.
+        prof->live_groups.fetch_add(n_groups, std::memory_order_relaxed);
+        prof->cap_groups.fetch_add((uint64_t) group_cap, std::memory_order_relaxed);
+        prof->live_entries.fetch_add(n_entries, std::memory_order_relaxed);
+        prof->cap_entries.fetch_add((uint64_t) entries->ne[1], std::memory_order_relaxed);
+        prof->ring.push(4 /* upload-audit */, 4 /* live-vs-cap groups */, (uint16_t) n_pos, (uint32_t) n_groups, (uint64_t) group_cap);
     }
 
     ++epoch;

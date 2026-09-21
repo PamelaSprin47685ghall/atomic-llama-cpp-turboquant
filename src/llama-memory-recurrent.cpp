@@ -1010,20 +1010,21 @@ void llama_memory_recurrent::clear_brain_row(int32_t brain_row) {
             continue;
         }
         const size_t row_size = ggml_row_size(s->type, s->ne[0]);
-        std::vector<uint8_t> zero(row_size, 0);
-        ggml_backend_tensor_set(
-            s, zero.data(), (uint32_t) brain_row * row_size, row_size);
-        ggml_backend_tensor_set(
-            s, zero.data(),
-            (n_brain_rows + (uint32_t) brain_row) * row_size,
-            row_size);
-        for (uint32_t snapshot = 1; snapshot <= n_rs_seq; ++snapshot) {
-            const size_t row =
-                2 * (size_t) n_brain_rows +
-                (size_t) (snapshot - 1) * n_brain_rows +
-                (uint32_t) brain_row;
-            ggml_backend_tensor_set(
-                s, zero.data(), row * row_size, row_size);
+        // Source must cover max(2, n_rs_seq) rows for the strided consumer.
+        const size_t max_copies = n_rs_seq > 2 ? (size_t) n_rs_seq : 2;
+        std::vector<uint8_t> zeros(max_copies * row_size, 0);
+        // P11: public + planner planes are one strided run of 2 rows
+        // (stride n_brain_rows); rollback planes are another strided run
+        // (n_rs_seq copies). Same bytes written as the per-row loop.
+        ggml_backend_tensor_set_2d(
+            s, zeros.data(), (size_t) brain_row * row_size, row_size,
+            2, (size_t) n_brain_rows * row_size, row_size);
+        if (n_rs_seq > 0) {
+            ggml_backend_tensor_set_2d(
+                s, zeros.data(),
+                (2 * (size_t) n_brain_rows + (size_t) brain_row) * row_size,
+                row_size, n_rs_seq,
+                (size_t) n_brain_rows * row_size, row_size);
         }
     }
     if (backend_sched) {
@@ -1043,51 +1044,40 @@ void llama_memory_recurrent::clear_hand_row(int32_t hand_row) {
         ggml_backend_sched_synchronize(backend_sched);
     }
 
-    for (size_t il = 0; il < r_l.size(); ++il) {
-        ggml_tensor * r = r_l[il];
-        if (r) {
-            const size_t row_size = ggml_row_size(r->type, r->ne[0]);
-            std::vector<uint8_t> zero(row_size, 0);
-            for (uint32_t snapshot = 0; snapshot <= n_rs_seq; ++snapshot) {
-                const size_t row = (size_t) snapshot * size + (uint32_t) hand_row;
-                ggml_backend_tensor_set(r, zero.data(), row * row_size, row_size);
-            }
+    // P11 clear transaction: one zero buffer per tensor, one strided 2d
+    // write across all (n_rs_seq + 1) snapshots instead of a fresh zero
+    // vector + tensor_set per snapshot. Rows are contiguous per snapshot
+    // (row = snapshot * size + hand_row), so stride_tensor = size *
+    // row_size. The source must cover n_copies rows (stride_data =
+    // row_size): a single row would be read out of bounds by the strided
+    // consumer. Backends without set_tensor_2d fall back to identical
+    // per-row sets inside ggml_backend_tensor_set_2d.
+    const uint32_t n_copies = n_rs_seq + 1;
+    auto clear_strided = [&](ggml_tensor * tensor) {
+        if (!tensor) {
+            return;
         }
+        const size_t row_size = ggml_row_size(tensor->type, tensor->ne[0]);
+        std::vector<uint8_t> zeros((size_t) n_copies * row_size, 0);
+        ggml_backend_tensor_set_2d(
+            tensor, zeros.data(),
+            (size_t) hand_row * row_size, row_size,
+            n_copies, size * row_size, row_size);
+    };
+
+    for (size_t il = 0; il < r_l.size(); ++il) {
+        clear_strided(r_l[il]);
     }
 
     for (size_t il = 0; il < p_l.size(); ++il) {
-        ggml_tensor * p = p_l[il];
-        if (p) {
-            const size_t row_size = ggml_row_size(p->type, p->ne[0]);
-            std::vector<uint8_t> zero(row_size, 0);
-            for (uint32_t snapshot = 0; snapshot <= n_rs_seq; ++snapshot) {
-                const size_t row = (size_t) snapshot * size + (uint32_t) hand_row;
-                ggml_backend_tensor_set(p, zero.data(), row * row_size, row_size);
-            }
-        }
+        clear_strided(p_l[il]);
     }
 
     for (size_t il = 0; il < s_l.size(); ++il) {
         if (is_s_shared((int32_t) il)) {
-            ggml_tensor * d = d_l[il];
-            if (d) {
-                const size_t row_size = ggml_row_size(d->type, d->ne[0]);
-                std::vector<uint8_t> zero(row_size, 0);
-                for (uint32_t snapshot = 0; snapshot <= n_rs_seq; ++snapshot) {
-                    const size_t row = (size_t) snapshot * size + (uint32_t) hand_row;
-                    ggml_backend_tensor_set(d, zero.data(), row * row_size, row_size);
-                }
-            }
+            clear_strided(d_l[il]);
         } else {
-            ggml_tensor * s = s_l[il];
-            if (s) {
-                const size_t row_size = ggml_row_size(s->type, s->ne[0]);
-                std::vector<uint8_t> zero(row_size, 0);
-                for (uint32_t snapshot = 0; snapshot <= n_rs_seq; ++snapshot) {
-                    const size_t row = (size_t) snapshot * size + (uint32_t) hand_row;
-                    ggml_backend_tensor_set(s, zero.data(), row * row_size, row_size);
-                }
-            }
+            clear_strided(s_l[il]);
         }
     }
     if (backend_sched) {
