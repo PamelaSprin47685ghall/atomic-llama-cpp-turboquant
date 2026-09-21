@@ -943,6 +943,15 @@ void process_shaders() {
     string_to_spv("flashprefill_attn", "flashprefill_attn.comp", {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV4", "vec4"}, {"DATA_A_IQ4_NL", "1"}});
     string_to_spv("flashprefill_merge", "flashprefill_merge.comp", {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV4", "vec4"}});
 
+    // RERoT indexed FlashAttention: dedicated independent shader module
+    // (no ordinary FA shared memory footprint, reuses flash_attn_dequant.glsl)
+    string_to_spv("flash_attn_rerot", "flash_attn_rerot.comp", {
+        {"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"FLOAT_TYPEV4", "vec4"},
+        {"ACC_TYPE", "float"}, {"ACC_TYPEV2", "vec2"}, {"ACC_TYPEV4", "vec4"},
+        {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"},
+        {"DATA_A_IQ4_NL", "1"}
+    });
+
     // TP5 collective transport (TP5.md T12): mesh sum + canonical F16 wire pack.
     string_to_spv("tp5_sum_f32", "tp5_sum_f32.comp", {});
     string_to_spv("tp5_sum_f16", "tp5_sum_f16.comp", {});

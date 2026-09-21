@@ -53,6 +53,8 @@ add_library(llama
             llama-model.cpp
             llama-quant.cpp
             llama-rerot.cpp
+            llama-rerot-profile.h
+            llama-rerot-profile.cpp
             llama-sampler.cpp
             llama-triattention.cpp
             llama-vocab.cpp

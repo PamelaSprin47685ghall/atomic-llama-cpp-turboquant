@@ -1102,6 +1102,307 @@ llama_rerot_query_layout llama_rerot_build_query_layout(
     return result;
 }
 
+llama_rerot_kv_snapshot llama_rerot_kv_snapshot::from_keys(
+        const std::vector<llama_rerot_key_record> & keys,
+        uint64_t episode_id) {
+    llama_rerot_kv_snapshot snapshot;
+    snapshot.episode_id = episode_id;
+
+    std::unordered_set<uint32_t> physical_seen;
+    physical_seen.reserve(keys.size());
+
+    for (const auto & key : keys) {
+        if (!physical_seen.insert(key.key_index).second) {
+            throw std::invalid_argument("RERoT key records contain a duplicate physical key");
+        }
+        if (key.storage_pos < 0) {
+            throw std::invalid_argument("RERoT key storage position must be non-negative");
+        }
+
+        const auto & meta = key.meta;
+        if (!meta.active()) {
+            if (key.owned_by_reader) {
+                snapshot.base_cells.push_back({ key.key_index, key.storage_pos, 1ULL });
+            }
+            continue;
+        }
+
+        if (snapshot.episode_id == 0) {
+            snapshot.episode_id = meta.episode_id;
+        } else if (meta.episode_id != snapshot.episode_id) {
+            continue;
+        }
+
+        snapshot.run_buckets[meta.run_id].push_back({
+            key.key_index,
+            key.storage_pos,
+            meta.frontier,
+            meta.node_id,
+            meta.visibility,
+            key.owned_by_reader ? 1ULL : 0ULL
+        });
+    }
+
+    std::stable_sort(snapshot.base_cells.begin(), snapshot.base_cells.end(),
+        [](const llama_rerot_snapshot_base_cell & a, const llama_rerot_snapshot_base_cell & b) {
+            if (a.storage_pos != b.storage_pos) {
+                return a.storage_pos < b.storage_pos;
+            }
+            return a.key_index < b.key_index;
+        });
+
+    for (auto & pair : snapshot.run_buckets) {
+        std::stable_sort(pair.second.begin(), pair.second.end(),
+            [](const llama_rerot_snapshot_cell & a, const llama_rerot_snapshot_cell & b) {
+                if (a.storage_pos != b.storage_pos) {
+                    return a.storage_pos < b.storage_pos;
+                }
+                if (a.frontier != b.frontier) {
+                    return a.frontier < b.frontier;
+                }
+                return a.key_index < b.key_index;
+            });
+    }
+
+    return snapshot;
+}
+
+llama_rerot_kv_snapshot llama_rerot_kv_snapshot::from_multi_reader_keys(
+        const std::vector<llama_rerot_key_record> & keys,
+        const std::vector<llama_rerot_reader_state> & readers,
+        const std::vector<std::vector<bool>> & reader_key_ownership) {
+    llama_rerot_kv_snapshot snapshot;
+    if (readers.empty()) {
+        return snapshot;
+    }
+    snapshot.episode_id = readers[0].episode_id;
+    for (uint32_t i = 0; i < readers.size(); ++i) {
+        if (readers[i].seq_id >= 0) {
+            snapshot.seq_to_index[readers[i].seq_id] = i;
+        }
+        if (readers[i].reader != LLAMA_REROT_NODE_INVALID) {
+            snapshot.node_to_index[readers[i].reader] = i;
+        }
+    }
+
+    std::unordered_set<uint32_t> physical_seen;
+    physical_seen.reserve(keys.size());
+
+    for (size_t k = 0; k < keys.size(); ++k) {
+        const auto & key = keys[k];
+        if (!physical_seen.insert(key.key_index).second) {
+            throw std::invalid_argument("RERoT key records contain a duplicate physical key");
+        }
+        if (key.storage_pos < 0) {
+            throw std::invalid_argument("RERoT key storage position must be non-negative");
+        }
+
+        uint64_t mask = 0;
+        for (uint32_t i = 0; i < readers.size(); ++i) {
+            if (k < reader_key_ownership[i].size() && reader_key_ownership[i][k]) {
+                mask |= (1ULL << i);
+            }
+        }
+
+        const auto & meta = key.meta;
+        if (!meta.active()) {
+            if (mask != 0) {
+                snapshot.base_cells.push_back({ key.key_index, key.storage_pos, mask });
+            }
+            continue;
+        }
+
+        if (meta.episode_id != snapshot.episode_id) {
+            continue;
+        }
+
+        snapshot.run_buckets[meta.run_id].push_back({
+            key.key_index,
+            key.storage_pos,
+            meta.frontier,
+            meta.node_id,
+            meta.visibility,
+            mask
+        });
+    }
+
+    std::stable_sort(snapshot.base_cells.begin(), snapshot.base_cells.end(),
+        [](const llama_rerot_snapshot_base_cell & a, const llama_rerot_snapshot_base_cell & b) {
+            if (a.storage_pos != b.storage_pos) {
+                return a.storage_pos < b.storage_pos;
+            }
+            return a.key_index < b.key_index;
+        });
+
+    for (auto & pair : snapshot.run_buckets) {
+        std::stable_sort(pair.second.begin(), pair.second.end(),
+            [](const llama_rerot_snapshot_cell & a, const llama_rerot_snapshot_cell & b) {
+                if (a.storage_pos != b.storage_pos) {
+                    return a.storage_pos < b.storage_pos;
+                }
+                if (a.frontier != b.frontier) {
+                    return a.frontier < b.frontier;
+                }
+                return a.key_index < b.key_index;
+            });
+    }
+
+    return snapshot;
+}
+
+llama_rerot_query_layout llama_rerot_build_query_layout(
+        const llama_rerot_reader_state & reader,
+        llama_pos query_storage_pos,
+        const llama_rerot_kv_snapshot & snapshot) {
+    if (!reader.active()) {
+        throw std::invalid_argument("RERoT reader state is inactive");
+    }
+    if (reader.reader == LLAMA_REROT_NODE_INVALID || reader.query_run == LLAMA_REROT_RUN_INVALID) {
+        throw std::invalid_argument("RERoT reader or query run is invalid");
+    }
+    if (query_storage_pos < 0) {
+        throw std::invalid_argument("RERoT query storage position must be non-negative");
+    }
+
+    std::unordered_map<llama_rerot_run_id, uint32_t> run_rank;
+    run_rank.reserve(reader.ordered_runs.size());
+    for (uint32_t i = 0; i < reader.ordered_runs.size(); ++i) {
+        if (reader.ordered_runs[i] == LLAMA_REROT_RUN_INVALID ||
+            !run_rank.emplace(reader.ordered_runs[i], i).second) {
+            throw std::invalid_argument("RERoT reader view contains an invalid or duplicate run id");
+        }
+    }
+    if (run_rank.find(reader.query_run) == run_rank.end()) {
+        throw std::invalid_argument("RERoT query run is absent from the reader view");
+    }
+
+    struct visible_entry {
+        uint32_t key_index = 0;
+        llama_pos storage_pos = 0;
+        llama_pos virtual_pos = 0;
+    };
+
+    std::vector<visible_entry> base;
+    base.reserve(snapshot.base_cells.size());
+    for (const auto & b : snapshot.base_cells) {
+        if (snapshot.is_owned(b.seq_mask, reader) && b.storage_pos <= query_storage_pos) {
+            base.push_back({ b.key_index, b.storage_pos, 0 });
+        }
+    }
+
+    struct tagged_entry {
+        uint32_t key_index = 0;
+        llama_pos storage_pos = 0;
+        llama_rerot_node_id node_id = LLAMA_REROT_NODE_INVALID;
+        llama_rerot_run_id run_id = LLAMA_REROT_RUN_INVALID;
+        bool owned = false;
+        llama_pos virtual_pos = 0;
+    };
+
+    std::vector<tagged_entry> tagged;
+    if (snapshot.episode_id == 0 || snapshot.episode_id == reader.episode_id) {
+        for (const auto run_id : reader.ordered_runs) {
+            const auto it = snapshot.run_buckets.find(run_id);
+            if (it == snapshot.run_buckets.end()) {
+                continue;
+            }
+            ++snapshot.bucket_lookup_count;
+            for (const auto & cell : it->second) {
+                const bool owned = snapshot.is_owned(cell.seq_mask, reader);
+                bool visible = false;
+                switch (cell.visibility) {
+                    case llama_rerot_visibility::public_live:
+                        if (cell.node_id == reader.reader) {
+                            visible = cell.frontier <= reader.frontier && owned &&
+                                      cell.storage_pos <= query_storage_pos;
+                        } else if (reader.frontier_mode == LLAMA_REROT_FRONTIER_STRONG) {
+                            visible = cell.frontier < reader.frontier;
+                        } else if (reader.frontier > 0) {
+                            visible = cell.frontier < reader.frontier - 1;
+                        }
+                        break;
+                    case llama_rerot_visibility::private_control:
+                    case llama_rerot_visibility::pending_record:
+                        visible = cell.node_id == reader.reader && owned &&
+                                  cell.storage_pos <= query_storage_pos;
+                        break;
+                    case llama_rerot_visibility::normal:
+                        break;
+                }
+
+                if (visible) {
+                    tagged.push_back({ cell.key_index, cell.storage_pos, cell.node_id, run_id, owned, 0 });
+                }
+            }
+        }
+    }
+
+    llama_pos virtual_pos = 0;
+    for (auto & item : base) {
+        item.virtual_pos = virtual_pos++;
+    }
+    for (auto & item : tagged) {
+        item.virtual_pos = virtual_pos++;
+    }
+
+    llama_pos query_virtual_pos = virtual_pos;
+    bool query_found = false;
+    for (const auto & item : tagged) {
+        if (item.node_id == reader.reader && item.run_id == reader.query_run &&
+            item.owned && item.storage_pos == query_storage_pos) {
+            query_virtual_pos = item.virtual_pos;
+            query_found = true;
+        }
+    }
+
+    if (!query_found && query_virtual_pos > std::numeric_limits<llama_pos>::max()) {
+        throw std::overflow_error("RERoT query virtual position overflow");
+    }
+
+    struct grouped_entries {
+        llama_pos effective_pos = 0;
+        std::vector<uint32_t> key_indices;
+    };
+    std::map<llama_pos, grouped_entries> grouped;
+
+    const auto add_key = [&](uint32_t key_index, llama_pos storage_pos, llama_pos virt_pos) {
+        const int64_t effective = int64_t(query_virtual_pos) + int64_t(storage_pos) - int64_t(virt_pos);
+        if (effective < 0 || effective > std::numeric_limits<llama_pos>::max()) {
+            throw std::overflow_error("RERoT effective query position is outside llama_pos range");
+        }
+        auto & bucket = grouped[static_cast<llama_pos>(effective)];
+        bucket.effective_pos = static_cast<llama_pos>(effective);
+        bucket.key_indices.push_back(key_index);
+    };
+
+    for (const auto & item : base) {
+        add_key(item.key_index, item.storage_pos, item.virtual_pos);
+    }
+    for (const auto & item : tagged) {
+        add_key(item.key_index, item.storage_pos, item.virtual_pos);
+    }
+
+    llama_rerot_query_layout result;
+    result.query_virtual_pos = query_virtual_pos;
+    result.groups.reserve(grouped.size());
+    size_t entry_count = 0;
+    for (const auto & item : grouped) {
+        entry_count += item.second.key_indices.size();
+    }
+    result.entries.reserve(entry_count);
+
+    for (const auto & item : grouped) {
+        const uint32_t group_index = static_cast<uint32_t>(result.groups.size());
+        result.groups.push_back({ 0, item.second.effective_pos });
+        for (const uint32_t key_index : item.second.key_indices) {
+            result.entries.push_back({ key_index, group_index });
+        }
+    }
+
+    ++snapshot.query_eval_count;
+    return result;
+}
+
 llama_rerot_rope_pos llama_rerot_text_position(int64_t pos) {
     return { pos, pos, pos, 0 };
 }

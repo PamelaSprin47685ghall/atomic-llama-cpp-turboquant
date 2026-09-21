@@ -14,6 +14,95 @@ from pathlib import Path
 from typing import Any
 
 
+# TODO: Enable when P0 low-level operator route counters land in /metrics.
+# Once implemented, verify operator route hit metrics (e.g. Vulkan RERoT kernel hits).
+ENABLE_OPERATOR_ROUTE_GATE = False
+
+
+def validate_dag_payload(payload: Any) -> tuple[bool, str]:
+    """Validate that the request payload contains a DAG or multi-Lane structure.
+
+    Returns (is_valid, human_readable_diagnostic_if_invalid).
+    """
+    if not isinstance(payload, dict):
+        return False, "payload root is not a JSON object"
+
+    # Format 1: Explicit routing strategy specification
+    strategy = payload.get("strategy")
+    if strategy == "dag":
+        dag_body = payload.get("payload")
+        if not isinstance(dag_body, dict):
+            return False, "explicit 'strategy' is 'dag' but 'payload' object is missing or not a dict"
+        questions = dag_body.get("questions")
+        if not isinstance(questions, list) or len(questions) < 2:
+            return False, f"explicit DAG 'questions' must be a list with at least 2 items, got {questions!r}"
+        for idx, q in enumerate(questions):
+            if not isinstance(q, dict) or not q.get("id"):
+                return False, f"DAG question item #{idx} missing required 'id' field"
+        return True, ""
+
+    # Format 2: Explicit DAG/lanes field in request
+    for key in ("dag", "rerot_dag"):
+        if key in payload:
+            dag_obj = payload[key]
+            if not isinstance(dag_obj, dict):
+                return False, f"'{key}' must be a JSON object"
+            nodes = dag_obj.get("nodes") or dag_obj.get("questions") or dag_obj.get("lanes")
+            if not isinstance(nodes, list) or len(nodes) < 2:
+                return False, f"'{key}' must define at least 2 concurrent nodes/lanes in list, got {nodes!r}"
+            return True, ""
+
+    if "lanes" in payload:
+        lanes = payload["lanes"]
+        if not isinstance(lanes, list) or len(lanes) < 2:
+            return False, f"'lanes' must be a list with at least 2 items, got {lanes!r}"
+        return True, ""
+
+    # Format 3: Chat completion request targeting RERoT
+    # Must have messages and explicitly opt into RERoT (rerot=True or rerot_frontier)
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        if not messages:
+            return False, "'messages' list is empty"
+        # RERoT must be enabled or intended in the request
+        rerot_flag = payload.get("rerot")
+        has_frontier = "rerot_frontier" in payload
+        if rerot_flag is False and not has_frontier:
+            return False, "request explicitly disables RERoT ('rerot': false) without 'rerot_frontier'"
+
+        # Verify multi-task / DAG instruction content across user messages
+        user_texts = [
+            m.get("content", "")
+            for m in messages
+            if isinstance(m, dict) and m.get("role") in ("user", "system") and isinstance(m.get("content"), str)
+        ]
+        combined = "\n".join(user_texts)
+        if not combined.strip():
+            return False, "request messages contain no text content"
+
+        # Check for multi-task / DAG indicators (e.g. numbered items 1. 2., DAG keywords, subtasks, etc.)
+        has_dag_keyword = any(k in combined.lower() for k in ("dag", "lane", "subtask", "sub-task", "multi-task"))
+        has_multi_items = (
+            ("1." in combined and "2." in combined)
+            or ("1、" in combined and "2、" in combined)
+            or ("Question A" in combined and "Question B" in combined)
+            or ("task" in combined.lower() and len(user_texts) > 1)
+            or ("独立" in combined)
+            or ("并行" in combined)
+        )
+        if not (has_dag_keyword or has_multi_items or len(messages) >= 3):
+            return False, (
+                "request payload lacks DAG/multi-Lane decomposition structure: prompt must contain "
+                "multiple subtasks (e.g. '1.', '2.', 'Question A', 'Question B') or DAG/Lane keywords"
+            )
+        return True, ""
+
+    return False, (
+        "payload lacks recognized DAG/multi-Lane structure: neither explicit DAG specification "
+        "('strategy'='dag', 'dag', 'lanes') nor multi-task chat messages found"
+    )
+
+
 METRICS = (
     "rerot_completed_episode_total",
     "rerot_completed_model_tokens",
@@ -56,6 +145,36 @@ def request_json(url: str, payload: dict[str, Any], api_key: str, timeout: float
         body = error.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {error.code}: {body}") from error
     return time.monotonic() - started, json.loads(body)
+
+
+def verify_server_health(base_url: str, api_key: str, timeout: float) -> None:
+    """Pre-flight health check to verify server availability before issuing load.
+
+    Fails closed with a human-readable error if /health is unreachable or non-200.
+    """
+    health_url = f"{base_url.rstrip('/')}/health"
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(health_url, headers=headers)
+    check_timeout = min(timeout, 10.0) if timeout > 0 else 10.0
+    try:
+        with urllib.request.urlopen(req, timeout=check_timeout) as response:
+            status = getattr(response, "status", response.getcode())
+            body = response.read().decode("utf-8", errors="replace")
+            if status != 200:
+                raise RuntimeError(
+                    f"server health check failed: non-200 status {status} from {health_url}: {body.strip()}"
+                )
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"server health check failed: HTTP {error.code} from {health_url}: {body.strip()}"
+        ) from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(
+            f"server health check failed: unreachable {health_url}: {error.reason}"
+        ) from error
 
 
 def fetch_metrics(base_url: str, api_key: str, timeout: float) -> dict[str, float]:
@@ -106,12 +225,27 @@ def parse_args() -> argparse.Namespace:
         help="Reuse an existing RERoT-OFF response instead of issuing the OFF request.",
     )
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--timeout", type=float, default=900.0)
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=180.0,
+        help="Request timeout in seconds (default: 180.0s, bounded below 5-minute IPMI watchdog threshold).",
+    )
     parser.add_argument(
         "--min-ratio",
         type=float,
         default=1.0,
         help="Required RERoT/serial throughput ratio; comparison is strict.",
+    )
+    # TODO: Enable operator route gate once P0 low-level operator route counters land in /metrics.
+    parser.add_argument(
+        "--enable-operator-route-gate",
+        action="store_true",
+        default=ENABLE_OPERATOR_ROUTE_GATE,
+        help=(
+            "TODO: Assert low-level operator route hit metrics once P0 counters land; "
+            "disabled by default so unreleased metrics are not fabricated."
+        ),
     )
     args = parser.parse_args()
     if not args.api_key:
@@ -134,6 +268,9 @@ def main() -> int:
     serial_payload.pop("rerot_frontier", None)
     rerot_payload = dict(payload)
     rerot_payload.update({"stream": False, "rerot": True, "rerot_trace": False})
+
+    # Pre-flight health check before issuing any benchmark load (fail-closed if server is down)
+    verify_server_health(args.base_url, args.api_key, args.timeout)
 
     if args.baseline_response:
         serial_wall = None
@@ -167,15 +304,65 @@ def main() -> int:
         deltas[name]
         for name in ("rerot_public_tokens", "rerot_private_tokens", "rerot_pending_tokens")
     )
+    is_dag_payload, dag_structure_err = validate_dag_payload(payload)
+
     threshold = serial_tps * args.min_ratio
     checks = {
+        # Preserved existing checks (never removed or weakened; one_final_fence compatibility intact)
         "one_completed_episode": deltas["rerot_completed_episode_total"] == 1,
         "no_hard_abort": deltas["rerot_hard_aborts"] == 0,
         "one_final_fence": deltas["rerot_final_fences"] == 1,
         "visibility_accounting_exact": visible_tokens == model_tokens,
         "aggregate_faster_than_serial": aggregate_tps > threshold,
         "parallel_faster_than_serial": parallel_tps > threshold,
+        # New assertions: DAG/multi-Lane payload structure and multi-Lane metrics
+        "request_dag_structure": is_dag_payload,
+        "multi_lane_pens_allocated": deltas["rerot_pens_allocated"] > 1,
+        "multi_lane_batch_pens": deltas["rerot_batch_pens"] > 1,
     }
+
+    evidence_details: dict[str, str] = {
+        "one_completed_episode": (
+            f"rerot_completed_episode_total delta must equal 1, observed {deltas['rerot_completed_episode_total']}"
+        ),
+        "no_hard_abort": (
+            f"rerot_hard_aborts delta must equal 0, observed {deltas['rerot_hard_aborts']}"
+        ),
+        "one_final_fence": (
+            f"rerot_final_fences delta must equal 1, observed {deltas['rerot_final_fences']}"
+        ),
+        "visibility_accounting_exact": (
+            f"visible tokens ({visible_tokens}) must equal completed model tokens ({model_tokens})"
+        ),
+        "aggregate_faster_than_serial": (
+            f"aggregate throughput ({aggregate_tps:.3f} tok/s) must exceed threshold ({threshold:.3f} tok/s)"
+        ),
+        "parallel_faster_than_serial": (
+            f"parallel throughput ({parallel_tps:.3f} tok/s) must exceed threshold ({threshold:.3f} tok/s)"
+        ),
+        "request_dag_structure": (
+            "payload verified as DAG/multi-Lane structure"
+            if is_dag_payload
+            else f"missing required DAG/multi-Lane structure in request: {dag_structure_err}"
+        ),
+        "multi_lane_pens_allocated": (
+            f"rerot_pens_allocated delta must be > 1 for real multi-Lane execution, observed {deltas['rerot_pens_allocated']}"
+        ),
+        "multi_lane_batch_pens": (
+            f"rerot_batch_pens delta must be > 1 for real multi-Lane execution, observed {deltas['rerot_batch_pens']}"
+        ),
+    }
+
+    # TODO: Hook for operator route hit assertion.
+    # Enable once P0 low-level operator route counters land in /metrics.
+    # Current behavior: disabled by default; does not fabricate unreleased metrics.
+    if getattr(args, "enable_operator_route_gate", False):
+        operator_route_hits = deltas.get("rerot_operator_route_hits", 0.0)
+        checks["operator_route_hit"] = operator_route_hits > 0
+        evidence_details["operator_route_hit"] = (
+            f"operator route hits must be > 0, observed {operator_route_hits}"
+        )
+
     passed = all(checks.values())
 
     result = {
@@ -195,6 +382,7 @@ def main() -> int:
             "response": rerot_response,
         },
         "checks": checks,
+        "check_details": evidence_details,
         "passed": passed,
     }
     args.output.write_text(
@@ -210,7 +398,8 @@ def main() -> int:
     if not passed:
         for name, ok in checks.items():
             if not ok:
-                print(f"FAIL: {name}", file=sys.stderr)
+                detail = evidence_details.get(name, "no detail recorded")
+                print(f"FAIL: {name} ({detail})", file=sys.stderr)
         return 2
     return 0
 

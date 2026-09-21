@@ -501,6 +501,7 @@ struct server_rerot_episode {
     bool strategy_decided = false;
     bool probing = false;
     llama_rerot_node_id synthesis_node = LLAMA_REROT_NODE_INVALID;
+    mutable int64_t t_synthesis_eligible_us = 0;
     std::string source_end_marker;
     std::string think_start_marker = "<think>";
     std::string probe_bytes;

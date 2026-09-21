@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 #include "llama-predefined-hidden.h"
+#include "llama-rerot-profile.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -18,6 +19,8 @@
 
 #include "ggml-backend.h"
 #include "llama-xkv-graph-ref.h"
+
+#include <mutex>
 
 // FlashPrefill V2 wire schema + reference math (WireReference owner;
 // GraphIntegration consumes the I32 metadata/plan pack helpers only).
@@ -590,11 +593,23 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
 // llm_graph_input_attn_rerot (RERoT DDVR graph input, §§9-12, 21)
 // ---------------------------------------------------------------------------
 
-uint32_t llm_graph_input_attn_rerot::capacity_bucket(uint32_t n) {
+
+uint32_t llm_graph_input_attn_rerot::group_capacity_bucket(uint32_t n) {
     if (n == 0) {
         return 0;
     }
-    return ((n + SPAN_BUCKET - 1) / SPAN_BUCKET) * SPAN_BUCKET;
+    return ((n + SPAN_GROUP_BUCKET - 1) / SPAN_GROUP_BUCKET) * SPAN_GROUP_BUCKET;
+}
+
+uint32_t llm_graph_input_attn_rerot::entry_capacity_bucket(uint32_t n) {
+    if (n == 0) {
+        return 0;
+    }
+    return ((n + SPAN_ENTRY_BUCKET - 1) / SPAN_ENTRY_BUCKET) * SPAN_ENTRY_BUCKET;
+}
+
+uint32_t llm_graph_input_attn_rerot::capacity_bucket(uint32_t n) {
+    return entry_capacity_bucket(n);
 }
 
 bool llm_graph_input_attn_rerot::graph_reuse_disabled() {
@@ -688,8 +703,8 @@ llm_rerot_span_reuse_key llm_graph_input_attn_rerot::make_key(
         llama_rerot_frontier_mode mode) {
     llm_rerot_span_reuse_key k;
     k.n_tokens   = n_tokens;
-    k.group_cap  = capacity_bucket(n_groups);
-    k.entry_cap  = capacity_bucket(n_entries);
+    k.group_cap  = group_capacity_bucket(n_groups);
+    k.entry_cap  = entry_capacity_bucket(n_entries);
     k.variant    = variant;
     k.rerot_on   = rerot_on;
     k.frontier_mode = mode;
@@ -729,6 +744,7 @@ void llm_graph_input_attn_rerot::build_span_tensors(
         (uint32_t) layout.entries.size(),
         select_variant(sched), true, cparams.rerot_frontier);
     key_valid = true;
+    this->sched = sched;
 
     q_indices = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, key.group_cap);
     ggml_set_input(q_indices);
@@ -781,6 +797,7 @@ bool llm_graph_input_attn_rerot::spans_can_reuse(
     if (cur != key) {
         return false;
     }
+    this->sched = sched;
     // Sanity: topology must equal the recorded capacity buckets. Span data
     // churn (virtual_pos0 / storage_pos0 / counts within capacity /
     // visibility) intentionally does not appear here.
@@ -834,6 +851,9 @@ void llm_graph_input_attn_rerot::fill_spans(
         throw std::runtime_error("RERoT DDVR: query offsets do not match tensor shape");
     }
 
+    // Upload-audit probe: t0 marks CPU staging start (ADR: zero-allocation, bounded timing)
+    const auto t0 = std::chrono::steady_clock::now();
+
     // Per-instance staging snapshot: no statics, no aliasing of layout
     // internals, so a later frontier cannot overwrite span tables still
     // referenced by an in-flight graph. Callers order fill_spans after the
@@ -868,10 +888,73 @@ void llm_graph_input_attn_rerot::fill_spans(
         st_offsets[i] = (int32_t) layout.query_offsets[i];
     }
 
-    ggml_backend_tensor_set(q_indices, st_q_indices.data(), 0, ggml_nbytes(q_indices));
-    ggml_backend_tensor_set(q_pos,     st_q_pos.data(),     0, ggml_nbytes(q_pos));
-    ggml_backend_tensor_set(entries,   st_entries.data(),   0, ggml_nbytes(entries));
-    ggml_backend_tensor_set(offsets,   st_offsets.data(),   0, ggml_nbytes(offsets));
+    // Upload-audit probe: t1 marks CPU staging finish
+    const auto t1 = std::chrono::steady_clock::now();
+
+    ggml_backend_sched_t sched = this->sched;
+
+    auto upload_tensor_snapshot_or_fallback = [sched](ggml_tensor * tensor, const void * data, size_t size) {
+        if (size == 0) {
+            return;
+        }
+        bool snapshotted = false;
+        // Immediate snapshot preflight and fallback validation:
+        // Reject null, unallocated buffer, non-contiguous layout, size > 64KiB (65536),
+        // unaligned size ((size & 3) != 0), or write beyond tensor capacity.
+        if (sched && tensor && tensor->buffer && data &&
+            ggml_is_contiguous(tensor) &&
+            size <= 65536 && (size & 3) == 0 &&
+            size <= ggml_nbytes(tensor)) {
+
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
+            if (backend) {
+                // Preflight dry-run validates dst_offset alignment, default buffer type,
+                // replay recording status, non-MIRRORED split, and child cards for meta backend.
+                if (ggml_backend_tensor_set_snapshot_async(backend, tensor, data, 0, size, true)) {
+                    snapshotted = ggml_backend_tensor_set_snapshot_async(backend, tensor, data, 0, size, false);
+                }
+            }
+            if (!snapshotted && !backend) {
+                const int n_backends = ggml_backend_sched_get_n_backends(sched);
+                for (int i = 0; i < n_backends; ++i) {
+                    ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+                    if (b) {
+                        if (ggml_backend_tensor_set_snapshot_async(b, tensor, data, 0, size, true)) {
+                            snapshotted = ggml_backend_tensor_set_snapshot_async(b, tensor, data, 0, size, false);
+                            if (snapshotted) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!snapshotted) {
+            // Fallback: synchronous tensor set
+            ggml_backend_tensor_set(tensor, data, 0, size);
+        }
+    };
+
+    upload_tensor_snapshot_or_fallback(q_indices, st_q_indices.data(), ggml_nbytes(q_indices));
+    upload_tensor_snapshot_or_fallback(q_pos,     st_q_pos.data(),     ggml_nbytes(q_pos));
+    upload_tensor_snapshot_or_fallback(entries,   st_entries.data(),   ggml_nbytes(entries));
+    upload_tensor_snapshot_or_fallback(offsets,   st_offsets.data(),   ggml_nbytes(offsets));
+
+    // Upload-audit probe: t2 marks tensor_set upload finish
+    const auto t2 = std::chrono::steady_clock::now();
+
+    if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+        const uint64_t staging_us  = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        const uint64_t set_us      = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+        const uint64_t total_bytes = (uint64_t) (ggml_nbytes(q_indices) + ggml_nbytes(q_pos) + ggml_nbytes(entries) + ggml_nbytes(offsets));
+        prof->upload_bytes.fetch_add(total_bytes, std::memory_order_relaxed);
+        prof->h2d_bytes.fetch_add(total_bytes, std::memory_order_relaxed);
+        prof->layout_view_build_us.fetch_add(staging_us, std::memory_order_relaxed);
+        prof->layout_view_build_count.fetch_add(1, std::memory_order_relaxed);
+        prof->ring.push(4 /* custom/upload-audit */, 0 /* staging */, 0, (uint32_t) total_bytes, staging_us);
+        prof->ring.push(4 /* custom/upload-audit */, 1 /* set */,     0, (uint32_t) total_bytes, set_us);
+    }
 
     ++epoch;
 }
@@ -2555,6 +2638,14 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
         }
 
+        if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+            prof->graph_def_count.fetch_add(1, std::memory_order_relaxed);
+            const bool n_tokens_changed = (this->params.ubatch.n_tokens != params.ubatch.n_tokens);
+            const uint16_t reason = n_tokens_changed ? 1 /* n_tokens 变化 */ : 2 /* 参数变化 */;
+            prof->ring.push(4 /* custom/rebuild */, 2 /* graph_def_rebuild */, reason,
+                            (uint32_t) params.ubatch.n_tokens, (uint64_t) this->params.ubatch.n_tokens);
+        }
+
         return false;
     }
 
@@ -2572,6 +2663,16 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
         }
 
         res = res && cur;
+    }
+
+    if (!res) {
+        if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+            prof->graph_def_count.fetch_add(1, std::memory_order_relaxed);
+            // Inputs reported incompatible: capacity bucket crossed or input topology mismatch
+            const uint16_t reason = 3 /* 容量跨桶 / input topology mismatch */;
+            prof->ring.push(4 /* custom/rebuild */, 2 /* graph_def_rebuild */, reason,
+                            (uint32_t) params.ubatch.n_tokens, (uint64_t) inputs.size());
+        }
     }
 
     if (debug > 0) {
@@ -2689,6 +2790,22 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+static const ggml_tensor * normalize_hadamard_memo_key_tensor(const ggml_tensor * t) {
+    if (!t) {
+        return nullptr;
+    }
+    // Memo key normalization: if t is a direct view sharing the exact same elements
+    // from offset 0, normalize to its base view_src tensor descriptor.
+    // If offs != 0, nelements differ, or view_src chain has multiple levels, preserve original t.
+    if (t->view_src != nullptr &&
+        t->view_offs == 0 &&
+        t->view_src->view_src == nullptr &&
+        ggml_nelements(t) == ggml_nelements(t->view_src)) {
+        return t->view_src;
+    }
+    return t;
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
@@ -2697,7 +2814,9 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     ggml_tensor * cur_mm = cur;
     if (hadamard_rotations && hadamard_rotations->count(w)) {
         const auto & t = hadamard_rotations->at(w);
-        const auto memo_key = std::make_pair((const ggml_tensor *) cur, (const ggml_tensor *) t.rot);
+        const auto memo_key = std::make_pair(
+            normalize_hadamard_memo_key_tensor(cur),
+            normalize_hadamard_memo_key_tensor(t.rot));
         const auto memo_it  = hadamard_memo.find(memo_key);
         if (memo_it != hadamard_memo.end()) {
             cur_mm = memo_it->second;
@@ -2757,7 +2876,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     ggml_tensor * cur_mm = cur;
     if (hadamard_rotations && hadamard_rotations->count(w)) {
         const auto & t = hadamard_rotations->at(w);
-        const auto memo_key = std::make_pair((const ggml_tensor *) cur, (const ggml_tensor *) t.rot);
+        const auto memo_key = std::make_pair(
+            normalize_hadamard_memo_key_tensor(cur),
+            normalize_hadamard_memo_key_tensor(t.rot));
         const auto memo_it  = hadamard_memo.find(memo_key);
         if (memo_it != hadamard_memo.end()) {
             cur_mm = memo_it->second;
@@ -4132,6 +4253,9 @@ ggml_tensor * llm_graph_context::build_rerot_q_groups(
         // prebuilt inputs (full prefix, fp-null fallbacks) skip this as a
         // cheap null-check no-op. Null mctx falls through to the loud
         // asserts below (never silent stock attention).
+        if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+            prof->route_hit(llama_rerot_route::cpu_fallback);
+        }
         const auto * attn = inp->mctx;
         if (attn != nullptr) {
             inp->rerot_spans.build_span_tensors(
@@ -4208,6 +4332,9 @@ ggml_tensor * llm_graph_context::build_attn_rerot(
     // Layer-aware gate: SWA/recurrent/MTP layers stay stock (P0-10).
     const bool takes_xkv_rerot = llm_xkv_route_layer(cparams, inp->mctx, il);
     if (takes_xkv_rerot) {
+        if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+            prof->route_hit(llama_rerot_route::xkv);
+        }
         return llm_build_attn_xkv(this, inp, wo, wo_b, wo_s, q_groups, k_cur, v_cur,
             nullptr, sinks, kq_scale, il);
     }
@@ -4251,6 +4378,11 @@ ggml_tensor * llm_graph_context::build_attn_rerot(
     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
     if (v_trans) {
         v = ggml_transpose(ctx0, v);
+    }
+
+    if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+        prof->route_hit(llama_rerot_route::indexed_rerot);
+        prof->ring.push(1 /* route */, (uint8_t) llama_rerot_route::indexed_rerot, (uint16_t) il, (uint32_t) n_tokens, 0);
     }
 
     ggml_tensor * cur = ggml_flash_attn_ext_rerot(

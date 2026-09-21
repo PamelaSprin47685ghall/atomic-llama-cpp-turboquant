@@ -57,22 +57,29 @@ if pgrep -x ninja >/dev/null || pgrep -f 'cc1plus|/bin/ld ' >/dev/null; then
 fi
 
 # Ensure target Vulkan GPU is idle and clean before launching
-# Allow desktop window compositor / browser baselines (< 2.0 GiB)
-MAX_BASELINE_VRAM=$((2 * 1024 * 1024 * 1024))
+MAX_BASELINE_VRAM=${MAX_BASELINE_VRAM:-$((50 * 1024 * 1024))}
 
-for _ in $(seq 1 10); do
+for _ in $(seq 1 30); do
     busy=0
+    cards_checked=0
     for c in /sys/class/drm/card[0-9]; do
         [[ -d "$c" ]] || continue
         if [[ -f "$c/device/mem_info_vram_used" && -f "$c/device/gpu_busy_percent" ]]; then
-            u=$(cat "$c/device/mem_info_vram_used" 2>/dev/null || echo 0)
-            if [[ "$u" =~ ^[0-9]+$ ]]; then
-                if [ "$u" -gt "$MAX_BASELINE_VRAM" ]; then
-                    busy=1
-                fi
+            cards_checked=$((cards_checked + 1))
+            u=$(cat "$c/device/mem_info_vram_used" 2>/dev/null || echo "")
+            gpu_busy=$(cat "$c/device/gpu_busy_percent" 2>/dev/null || echo "")
+            if [[ ! "$u" =~ ^[0-9]+$ || ! "$gpu_busy" =~ ^[0-9]+$ ]]; then
+                busy=1
+                continue
+            fi
+            if [ "$u" -gt "$MAX_BASELINE_VRAM" ] || [ "$gpu_busy" -ne 0 ]; then
+                busy=1
             fi
         fi
     done
+    if [ "$cards_checked" -eq 0 ]; then
+        busy=1
+    fi
     [ $busy -eq 0 ] && break
     sleep 1
 done
@@ -100,7 +107,10 @@ cleanup() {
             kill -0 "$PID" 2>/dev/null || break
             sleep 1
         done
-        kill -9 "$PID" 2>/dev/null || true
+        if kill -0 "$PID" 2>/dev/null; then
+            say "Process $PID still active after 15s graceful shutdown timeout; sending SIGKILL..."
+            kill -9 "$PID" 2>/dev/null || true
+        fi
         wait "$PID" 2>/dev/null || true
     fi
 }

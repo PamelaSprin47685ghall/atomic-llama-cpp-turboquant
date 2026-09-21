@@ -5609,8 +5609,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // half-operand module silently rounded Turbo K/V before the otherwise
         // F32 kernel. It never uses MMQ's Q8 query quantization either.
         GGML_ASSERT(fa.first.f32acc);
-        const void * spv_data = flash_attn_f32_f16_fp32_data;
-        const size_t spv_size = flash_attn_f32_f16_fp32_len;
+        const void * spv_data = flash_attn_rerot_data;
+        const size_t spv_size = flash_attn_rerot_len;
         const uint32_t subgroup_size = fa.first.subgroup_size;
         ggml_vk_create_pipeline(device, fa.second, "flash_attn_rerot", spv_size, spv_data, "main", 9,
                                 sizeof(vk_flash_attn_push_constants), {1, 1, 1},
@@ -13146,40 +13146,24 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
 // Shared-memory estimate for the RERoT-DDVR kernel (rerot_main): f32-only
 // math, one staged Q row, one K/V block reused for K then V, no mask, no MMQ
 // workspace. Conservative on the IQ4_NL table (f16 there). Must be kept in
-// sync with the rerot block in flash_attn_base.glsl.
+// sync with flash_attn_rerot.comp.
 //
-// CRITICAL: the rerot pipeline compiles the whole scalar flash_attn.comp
-// module, so the driver bills the ORDINARY-path shared arrays too
-// (tmpsh/tmpshv4/masksh/Qf/kvsh/occupancy_limiter in flash_attn.comp) on top
-// of the rerot arrays below. Budgeting only the rerot half selected
-// workgroups needing ~75 KB on a 48 KB device; the over-limit dispatch
-// faulted the queue and the host spun forever in ggml_vk_wait_for_fence
-// (NVIDIA RTX 2080 Ti: reported Shared Memory Size 74496 > 49152).
-// Keep every term in sync with both declaration sites.
+// Separated RERoT pipeline compiles its dedicated flash_attn_rerot.comp
+// module, so the driver bills ONLY the RERoT shared arrays below
+// (rerot_qf, rerot_run_end, rerot_kvsh, rerot_tmpsh, rerot_tmpv4, rerot_occlim).
+// The ordinary-path shared arrays from flash_attn.comp are no longer included.
+// Keep every term in sync with flash_attn_rerot.comp declarations.
 static bool ggml_vk_flash_attn_rerot_shmem_support(const vk_device & device, const vk_fa_tuning_params & params, uint32_t hsk, uint32_t hsv) {
     const uint32_t wg_size = params.workgroup_size;
     const uint32_t Bc = params.block_cols;
     const uint32_t D = std::max(hsk, hsv);
     const uint32_t Br = params.block_rows;
-    const uint32_t sgs = params.subgroup_size;
     // Round each array to 16 B (vec4 alignment); round the module total to
     // 128 B (driver reporting granularity, verified against
     // VK_KHR_pipeline_executable_properties on NVIDIA).
     auto aligned = [](uint64_t bytes) { return (bytes + 15u) & ~uint64_t(15u); };
     uint64_t total_size = 0;
-    // Ordinary path (flash_attn.comp, fp32 module: FLOAT_TYPE float):
-    // tmpsh/tmpshv4[tmpsh_size], masksh[Bc*(Br+1)], Qf[Br*(HSK/4+1)],
-    // kvsh[staging ? Bc*(D/4+1) : 1], occupancy_limiter[max(LIMIT,1)].
-    const uint32_t tmpsh_n = sgs > 0
-        ? (wg_size / std::max(sgs, 1u)) * (params.row_split == 1 ? params.d_split : 1u)
-        : wg_size;
-    total_size += aligned(uint64_t(tmpsh_n) * sizeof(float));
-    total_size += aligned(uint64_t(tmpsh_n) * 4 * sizeof(float));
-    total_size += aligned(uint64_t(Bc) * (Br + 1) * sizeof(float));
-    total_size += aligned(uint64_t(Br) * (hsk / 4 + 1) * 4 * sizeof(float));
-    total_size += aligned((params.shmem_staging ? uint64_t(Bc) * (D / 4 + 1) : 1u) * 4 * sizeof(float));
-    total_size += aligned(uint64_t(std::max(params.limit_occupancy_shmem, 1u)) * 4 * sizeof(float));
-    // Rerot path (flash_attn_base.glsl): rerot_qf[Br*(HSK/4+1)],
+    // Rerot dedicated path (flash_attn_rerot.comp): rerot_qf[Br*(HSK/4+1)],
     // rerot_run_end, rerot_kvsh[staging ? Bc*(D/4+1) : 1],
     // rerot_tmpsh[WGS], rerot_tmpv4[WGS], rerot_occlim[max(LIMIT,1)].
     total_size += aligned(uint64_t(Br) * (hsk / 4 + 1) * 4 * sizeof(float));
@@ -13884,6 +13868,15 @@ static void ggml_vk_flash_attn_rerot(ggml_backend_vk_context * ctx, vk_context &
         const uint32_t desired = std::max(1u, (shader_cores * 2u) / std::max(1u, rows));
         const uint32_t entries_per_query = std::max(1u, n_entries / n_queries);
         split_k = std::min(desired, entries_per_query);
+    }
+
+    if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+        prof->vk_rerot_dispatch.fetch_add(1, std::memory_order_relaxed);
+        prof->vk_rerot_split_k_total.fetch_add(split_k, std::memory_order_relaxed);
+        uint64_t cur_sk_max = prof->vk_rerot_split_k_max.load(std::memory_order_relaxed);
+        while (cur_sk_max < split_k && !prof->vk_rerot_split_k_max.compare_exchange_weak(cur_sk_max, split_k, std::memory_order_relaxed)) {}
+        prof->vk_rerot_queries.fetch_add(n_queries, std::memory_order_relaxed);
+        prof->vk_rerot_entries.fetch_add(n_entries, std::memory_order_relaxed);
     }
 
     const uint64_t n_flat = (uint64_t)n_queries * n_head_q;
@@ -22407,8 +22400,16 @@ static int ggml_vk_attention_projection_variant(const ggml_cgraph * graph, int f
         if (node->op != GGML_OP_MUL_MAT || !node->src[0] || node->src[1] != input)
             return -1;
     }
-    if (graph->nodes[first]->src[0]->type != GGML_TYPE_Q5_K)
+    if (graph->nodes[first]->src[0]->type != GGML_TYPE_Q5_K) {
+        if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+            const ggml_type t0 = graph->nodes[first]->src[0]->type;
+            const auto reason = (t0 == GGML_TYPE_PQ2_0)
+                ? ggml_tp5_rerot_reject_reason::unsupported_quant_pq2_0
+                : ggml_tp5_rerot_reject_reason::unsupported_type;
+            prof->vk_rerot_reject_reasons[(size_t) reason].fetch_add(1, std::memory_order_relaxed);
+        }
         return -1;
+    }
     const ggml_type t1 = graph->nodes[first + 1]->src[0]->type;
     const ggml_type t2 = graph->nodes[first + 2]->src[0]->type;
     const ggml_type t3 = graph->nodes[first + 3]->src[0]->type;
@@ -22416,6 +22417,12 @@ static int ggml_vk_attention_projection_variant(const ggml_cgraph * graph, int f
         return 0;
     if (t1 == GGML_TYPE_Q6_K && t2 == GGML_TYPE_Q6_K && t3 == GGML_TYPE_BF16)
         return 1;
+    if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+        const auto reason = (t1 == GGML_TYPE_PQ2_0 || t2 == GGML_TYPE_PQ2_0 || t3 == GGML_TYPE_PQ2_0)
+            ? ggml_tp5_rerot_reject_reason::unsupported_quant_pq2_0
+            : ggml_tp5_rerot_reject_reason::unsupported_type;
+        prof->vk_rerot_reject_reasons[(size_t) reason].fetch_add(1, std::memory_order_relaxed);
+    }
     return -1;
 }
 
@@ -22722,9 +22729,20 @@ static bool ggml_vk_can_fuse_gdn_segment(ggml_backend_vk_context * ctx, const gg
         node(19)->view_offs != 0 || !shape(node(20), 128, hv) || !shape(node(21), 128, hv) ||
         !shape(node(21)->src[1], 128, 1) || !shape(node(22)->src[0], head_values, 1) || !shape(node(22), 128, hv) ||
         !shape(node(23), 128, hv) || ggml_get_unary_op(node(23)) != GGML_UNARY_OP_SIGMOID ||
-        !shape(node(24), 128, hv) || !shape(node(25), head_values, 1) ||
-        !projection(node(26), GGML_TYPE_Q5_K, node(25), node(26)->ne[0]))
+        !shape(node(24), 128, hv) || !shape(node(25), head_values, 1))
         return false;
+    if (!projection(node(26), GGML_TYPE_Q5_K, node(25), node(26)->ne[0])) {
+        if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+            const ggml_tensor * w26 = node(26)->src[0];
+            if (w26 && w26->type != GGML_TYPE_Q5_K) {
+                const auto reason = (w26->type == GGML_TYPE_PQ2_0)
+                    ? ggml_tp5_rerot_reject_reason::unsupported_quant_pq2_0
+                    : ggml_tp5_rerot_reject_reason::unsupported_type;
+                prof->vk_rerot_reject_reasons[(size_t) reason].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        return false;
+    }
     for (const int index : { 3, 5, 20 }) {
         const float epsilon = ggml_get_op_params_f32(node(index), 0);
         if (!std::isfinite(epsilon) || epsilon <= 0.0f)
@@ -24927,6 +24945,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 vk_fa_tuning_params rerot_tuning;
                 if (!ggml_vk_flash_attn_rerot_tune(device, HSK, HSV, (uint32_t) k->ne[1], k->type, v->type, 1, rerot_tuning)) {
+                    if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+                        prof->vk_rerot_shmem_reject.fetch_add(1, std::memory_order_relaxed);
+                        prof->vk_rerot_reject_reasons[(size_t) ggml_tp5_rerot_reject_reason::shmem_tune].fetch_add(1, std::memory_order_relaxed);
+                    }
                     return false;
                 }
                 return true;

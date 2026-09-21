@@ -208,6 +208,32 @@ struct server_rerot_metrics {
     uint64_t hand_bytes = 0;
     uint64_t grouped_scratch_bytes = 0;
 
+    // Phase timing and call counts (§P0)
+    double   probe_seconds = 0.0;
+    uint64_t probe_count = 0;
+    double   prefix_rebuild_seconds = 0.0;
+    uint64_t prefix_rebuild_count = 0;
+    uint64_t ordinary_prompt_tokens = 0;
+    uint64_t dag_lcp_tokens = 0;
+    uint64_t replay_from_tokens = 0;
+    uint64_t actual_replayed_tokens = 0;
+    double   fixed_entry_seconds = 0.0;
+    uint64_t fixed_entry_count = 0;
+    double   synthesis_switch_seconds = 0.0;
+    uint64_t synthesis_switch_count = 0;
+
+    // Post-decode synchronization timing (§P0 / §P11 evidence)
+    uint64_t sync_capture_us = 0;
+    uint64_t sync_capture_count = 0;
+    uint64_t sync_capture_with_work_us = 0;
+    uint64_t sync_capture_with_work_count = 0;
+    uint64_t sync_sample_us = 0;
+    uint64_t sync_sample_count = 0;
+    uint64_t sync_sample_no_work_us = 0;
+    uint64_t sync_sample_no_work_count = 0;
+    uint64_t sync_sample_with_work_us = 0;
+    uint64_t sync_sample_with_work_count = 0;
+
     bool empty() const;
     json to_json() const;
     void accumulate(const server_rerot_metrics & delta);
@@ -1115,6 +1141,14 @@ struct server_task_result_cmpl_final : server_task_result {
     uint64_t rerot_probe_tokens = 0;
     uint64_t rerot_frame_tokens = 0;
     uint64_t rerot_source_end_tokens = 0;
+    double   rerot_probe_seconds = 0.0;
+    double   rerot_prefix_rebuild_seconds = 0.0;
+    uint64_t rerot_ordinary_prompt_tokens = 0;
+    uint64_t rerot_dag_lcp_tokens = 0;
+    uint64_t rerot_replay_from_tokens = 0;
+    uint64_t rerot_actual_replayed_tokens = 0;
+    double   rerot_fixed_entry_seconds = 0.0;
+    double   rerot_synthesis_switch_seconds = 0.0;
 
     bool post_sampling_probs;
     std::vector<completion_token_output> probs_output;

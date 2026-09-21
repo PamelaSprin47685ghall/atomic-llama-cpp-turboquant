@@ -324,6 +324,14 @@ void ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_
     backend->iface.get_tensor_2d_async(backend, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
+bool ggml_backend_tensor_set_snapshot_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, bool dry_run) {
+    if (!backend || backend->iface.set_tensor_snapshot_async == NULL) {
+        return false;
+    }
+
+    return backend->iface.set_tensor_snapshot_async(backend, tensor, data, offset, size, dry_run);
+}
+
 void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;

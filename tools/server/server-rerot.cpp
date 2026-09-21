@@ -3558,6 +3558,9 @@ std::vector<llama_rerot_node_id> server_rerot_runtime::get_eligible_dag_nodes(ui
             continue;
         }
         if (nr.remaining_preds == 0) {
+            if (static_cast<llama_rerot_node_id>(i) == ep->synthesis_node && ep->t_synthesis_eligible_us == 0) {
+                ep->t_synthesis_eligible_us = ggml_time_us();
+            }
             eligible.push_back(static_cast<llama_rerot_node_id>(i));
         }
     }

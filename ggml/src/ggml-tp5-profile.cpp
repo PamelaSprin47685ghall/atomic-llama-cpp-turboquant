@@ -2,6 +2,18 @@
 
 #include <cstdlib>
 
+const char * ggml_tp5_rerot_reject_reason_name(ggml_tp5_rerot_reject_reason reason) {
+    switch (reason) {
+        case ggml_tp5_rerot_reject_reason::none:                    return "none";
+        case ggml_tp5_rerot_reject_reason::shmem_tune:              return "shmem_tune";
+        case ggml_tp5_rerot_reject_reason::unsupported_shape:       return "unsupported_shape";
+        case ggml_tp5_rerot_reject_reason::unsupported_type:        return "unsupported_type";
+        case ggml_tp5_rerot_reject_reason::subgroup:                return "subgroup";
+        case ggml_tp5_rerot_reject_reason::unsupported_quant_pq2_0: return "unsupported_quant_pq2_0";
+        default:                                                     return "unknown";
+    }
+}
+
 static ggml_tp5_profile * g_prof = nullptr;
 static std::mutex         g_prof_mu;
 static ggml_tp5_profile   g_prof_storage;
@@ -46,6 +58,15 @@ void ggml_tp5_profile::reset(uint64_t new_id, bool decode) {
     relay_gpu_spin_iters = 0;
     relay_gpu_spin_samples = 0;
     relay_gpu_spin_max = 0;
+    vk_rerot_dispatch = 0;
+    vk_rerot_split_k_total = 0;
+    vk_rerot_split_k_max = 0;
+    vk_rerot_queries = 0;
+    vk_rerot_entries = 0;
+    vk_rerot_shmem_reject = 0;
+    for (size_t i = 0; i < (size_t) ggml_tp5_rerot_reject_reason::count; ++i) {
+        vk_rerot_reject_reasons[i] = 0;
+    }
 }
 
 void ggml_tp5_profile::print_summary() const {
@@ -96,6 +117,26 @@ void ggml_tp5_profile::print_summary() const {
                 relay_y_publish_us.load(), relay_q_publish_us.load(),
                 relay_q_spin_samples.load() ? double(relay_q_spin_iters.load()) / double(relay_q_spin_samples.load()) : -1.0,
                 relay_q_spin_max.load(), relay_q_spin_samples.load());
+    }
+    const uint64_t r_rej_type = vk_rerot_reject_reasons[(size_t) ggml_tp5_rerot_reject_reason::unsupported_type].load();
+    const uint64_t r_rej_pq2_0 = vk_rerot_reject_reasons[(size_t) ggml_tp5_rerot_reject_reason::unsupported_quant_pq2_0].load();
+    if (vk_rerot_dispatch.load() != 0 || vk_rerot_shmem_reject.load() != 0 || r_rej_type != 0 || r_rej_pq2_0 != 0) {
+        const uint64_t r_disp = vk_rerot_dispatch.load();
+        const uint64_t r_sk_tot = vk_rerot_split_k_total.load();
+        fprintf(stderr,
+                "[tp5-rerot-profile] exec=%" PRIu64 " dispatch=%" PRIu64
+                " split_k_avg=%.2f split_k_max=%" PRIu64
+                " queries=%" PRIu64 " entries=%" PRIu64
+                " shmem_reject=%" PRIu64 " reject_tune=%" PRIu64
+                " reject_type=%" PRIu64 " reject_pq2_0=%" PRIu64 "\n",
+                graph_exec_id, r_disp,
+                r_disp ? double(r_sk_tot) / double(r_disp) : 0.0,
+                vk_rerot_split_k_max.load(),
+                vk_rerot_queries.load(), vk_rerot_entries.load(),
+                vk_rerot_shmem_reject.load(),
+                vk_rerot_reject_reasons[(size_t) ggml_tp5_rerot_reject_reason::shmem_tune].load(),
+                r_rej_type,
+                r_rej_pq2_0);
     }
 }
 

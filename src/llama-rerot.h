@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // Internal, experimental support for Recursive Elastic Ring-of-Thought (RERoT).
@@ -188,6 +189,7 @@ struct llama_rerot_reader_state {
 
     llama_rerot_frontier_mode frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
     std::vector<llama_rerot_run_id> ordered_runs;
+    llama_seq_id seq_id = -1;
 
     void reset() {
         episode_id = 0;
@@ -199,6 +201,7 @@ struct llama_rerot_reader_state {
         layout_epoch = 0;
         frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
         ordered_runs.clear();
+        seq_id = -1;
     }
 
     bool active() const {
@@ -258,6 +261,90 @@ llama_rerot_query_layout llama_rerot_build_query_layout(
     const llama_rerot_reader_state & reader,
     llama_pos query_storage_pos,
     const std::vector<llama_rerot_key_record> & keys);
+
+// Snapshot representation of an active cell in a run bucket.
+struct llama_rerot_snapshot_cell {
+    uint32_t key_index = 0;
+    llama_pos storage_pos = 0;
+    uint64_t frontier = 0;
+    llama_rerot_node_id node_id = LLAMA_REROT_NODE_INVALID;
+    llama_rerot_visibility visibility = llama_rerot_visibility::normal;
+    uint64_t seq_mask = 0; // bitmask of batch-local sequence ownership
+};
+
+// Snapshot representation of an untagged prefix/base cell.
+struct llama_rerot_snapshot_base_cell {
+    uint32_t key_index = 0;
+    llama_pos storage_pos = 0;
+    uint64_t seq_mask = 0; // bitmask of batch-local sequence ownership
+};
+
+// Read-only KV snapshot capturing cell metadata, prefix slices, and run indexes
+// for all queries within a single batch. Strictly stack-local; discarded after
+// batch attention layout construction.
+struct llama_rerot_kv_snapshot {
+    uint64_t episode_id = 0;
+
+    // Ordered prefix cells, pre-sorted by (storage_pos, key_index).
+    std::vector<llama_rerot_snapshot_base_cell> base_cells;
+
+    // Active tagged cells grouped by run_id. Each bucket is pre-sorted
+    // by (storage_pos, frontier, key_index).
+    std::unordered_map<llama_rerot_run_id, std::vector<llama_rerot_snapshot_cell>> run_buckets;
+
+    // Sequence index mapping for batch-local seq_ids (up to 64 sequences per ubatch).
+    std::unordered_map<llama_seq_id, uint32_t> seq_to_index;
+
+    // Reader node to sequence index mapping (for multi-lane/agent scenarios or tests).
+    std::unordered_map<llama_rerot_node_id, uint32_t> node_to_index;
+
+    // Diagnostic/verification counters (used by differential tests to prove sharing).
+    mutable size_t query_eval_count = 0;
+    mutable size_t bucket_lookup_count = 0;
+
+    bool is_owned(uint64_t mask, const llama_rerot_reader_state & reader) const {
+        if (mask == 0) {
+            return false;
+        }
+        if (seq_to_index.empty() && node_to_index.empty()) {
+            return (mask & 1ULL) != 0;
+        }
+        if (reader.seq_id >= 0) {
+            const auto it = seq_to_index.find(reader.seq_id);
+            if (it != seq_to_index.end()) {
+                return (mask & (1ULL << it->second)) != 0;
+            }
+        }
+        if (reader.reader != LLAMA_REROT_NODE_INVALID) {
+            const auto it = node_to_index.find(reader.reader);
+            if (it != node_to_index.end()) {
+                return (mask & (1ULL << it->second)) != 0;
+            }
+        }
+        if (seq_to_index.size() == 1) {
+            return (mask & 1ULL) != 0;
+        }
+        return false;
+    }
+
+    // Factory method for testing: capture from key records (single reader).
+    static llama_rerot_kv_snapshot from_keys(
+        const std::vector<llama_rerot_key_record> & keys,
+        uint64_t episode_id = 0);
+
+    // Factory method for testing: capture from key records with multiple reader sequences.
+    static llama_rerot_kv_snapshot from_multi_reader_keys(
+        const std::vector<llama_rerot_key_record> & keys,
+        const std::vector<llama_rerot_reader_state> & readers,
+        const std::vector<std::vector<bool>> & reader_key_ownership);
+};
+
+// Fast shared-snapshot overload: builds layout for one query from the pre-indexed
+// run buckets and sorted base slices captured for the current batch.
+llama_rerot_query_layout llama_rerot_build_query_layout(
+    const llama_rerot_reader_state & reader,
+    llama_pos query_storage_pos,
+    const llama_rerot_kv_snapshot & snapshot);
 
 // Pure logical document/tree model. It never stores physical KV indices.
 class llama_rerot_document {

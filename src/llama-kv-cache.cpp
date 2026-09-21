@@ -2,6 +2,7 @@
 #include "llama-triattention.h"
 #include "llama-kv-transform.h"
 #include "llama-turbo-config.h"
+#include "llama-rerot-profile.h"
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -6160,6 +6161,7 @@ bool llama_kv_cache::rerot_set_reader_view(
     }
 
     rerot_reader_views[seq_id] = view;
+    rerot_reader_views[seq_id].seq_id = seq_id;
     fp_bump();
     return true;
 }
@@ -6211,25 +6213,100 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
     result.query_offsets.reserve(size_t(result.n_queries) + 1);
     result.query_offsets.push_back(0);
 
+    std::vector<llama_seq_id> batch_seqs;
+    batch_seqs.reserve(ubatch.n_tokens);
+    for (uint32_t q = 0; q < ubatch.n_tokens; ++q) {
+        const llama_seq_id seq_id = ubatch.seq_id[q][0];
+        if (std::find(batch_seqs.begin(), batch_seqs.end(), seq_id) == batch_seqs.end()) {
+            batch_seqs.push_back(seq_id);
+        }
+    }
+
+    // Phase timing probe: capture snapshot start
+    const auto t_snap_start = std::chrono::steady_clock::now();
+
+    llama_rerot_kv_snapshot snapshot;
+    for (uint32_t i = 0; i < batch_seqs.size(); ++i) {
+        const auto s_id = batch_seqs[i];
+        snapshot.seq_to_index[s_id] = i;
+        if (s_id >= 0 && (size_t) s_id < rerot_reader_views.size()) {
+            const auto & r = rerot_reader_views[s_id];
+            if (r.active()) {
+                snapshot.episode_id = r.episode_id;
+                if (r.reader != LLAMA_REROT_NODE_INVALID) {
+                    snapshot.node_to_index[r.reader] = i;
+                }
+            }
+        }
+    }
+
+    for (uint32_t key = 0; key < n_kv; ++key) {
+        if (cells.is_empty(key)) {
+            continue;
+        }
+        const llama_pos storage_pos = cells.pos_get(key);
+        const auto meta = cells.rerot_get(key);
+
+        uint64_t seq_mask = 0;
+        for (uint32_t i = 0; i < batch_seqs.size(); ++i) {
+            if (cells.seq_has(key, batch_seqs[i])) {
+                seq_mask |= (1ULL << i);
+            }
+        }
+
+        if (!meta.active()) {
+            if (seq_mask != 0) {
+                snapshot.base_cells.push_back({ key, storage_pos, seq_mask });
+            }
+            continue;
+        }
+
+        if (snapshot.episode_id != 0 && meta.episode_id != snapshot.episode_id) {
+            continue;
+        }
+
+        snapshot.run_buckets[meta.run_id].push_back({
+            key,
+            storage_pos,
+            meta.frontier,
+            meta.node_id,
+            meta.visibility,
+            seq_mask
+        });
+    }
+
+    std::stable_sort(snapshot.base_cells.begin(), snapshot.base_cells.end(),
+        [](const llama_rerot_snapshot_base_cell & a, const llama_rerot_snapshot_base_cell & b) {
+            if (a.storage_pos != b.storage_pos) {
+                return a.storage_pos < b.storage_pos;
+            }
+            return a.key_index < b.key_index;
+        });
+
+    for (auto & pair : snapshot.run_buckets) {
+        std::stable_sort(pair.second.begin(), pair.second.end(),
+            [](const llama_rerot_snapshot_cell & a, const llama_rerot_snapshot_cell & b) {
+                if (a.storage_pos != b.storage_pos) {
+                    return a.storage_pos < b.storage_pos;
+                }
+                if (a.frontier != b.frontier) {
+                    return a.frontier < b.frontier;
+                }
+                return a.key_index < b.key_index;
+            });
+    }
+
+    const auto t_snap_end = std::chrono::steady_clock::now();
+    const uint64_t snap_us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t_snap_end - t_snap_start).count();
+
+    // Layout timing probe: query layout loop start
+    const auto t_layout_start = std::chrono::steady_clock::now();
+
     for (uint32_t query = 0; query < ubatch.n_tokens; ++query) {
         const llama_seq_id seq_id = ubatch.seq_id[query][0];
         const auto & reader = rerot_reader_views.at(seq_id);
 
-        std::vector<llama_rerot_key_record> keys;
-        keys.reserve(n_kv);
-        for (uint32_t key = 0; key < n_kv; ++key) {
-            if (cells.is_empty(key)) {
-                continue;
-            }
-            keys.push_back({
-                key,
-                cells.pos_get(key),
-                cells.seq_has(key, seq_id),
-                cells.rerot_get(key),
-            });
-        }
-
-        auto query_layout = llama_rerot_build_query_layout(reader, ubatch.pos[query], keys);
+        auto query_layout = llama_rerot_build_query_layout(reader, ubatch.pos[query], snapshot);
         const uint32_t group_base = static_cast<uint32_t>(result.groups.size());
         for (auto group : query_layout.groups) {
             group.query_index = query;
@@ -6242,10 +6319,32 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
         result.query_offsets.push_back(static_cast<uint32_t>(result.entries.size()));
     }
 
+    const auto t_layout_end = std::chrono::steady_clock::now();
+    const uint64_t layout_us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t_layout_end - t_layout_start).count();
+
     std::string error;
     if (!result.validate(n_kv, &error)) {
         throw std::runtime_error("invalid RERoT attention layout: " + error);
     }
+
+    // Accumulate batch layout timing and counts to active profile ledger
+    if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+        prof->layout_view_build_us.fetch_add(snap_us + layout_us, std::memory_order_relaxed);
+        prof->layout_view_build_count.fetch_add(ubatch.n_tokens, std::memory_order_relaxed);
+        prof->actual_query_rows.fetch_add(ubatch.n_tokens, std::memory_order_relaxed);
+        prof->live_groups.fetch_add(result.groups.size(), std::memory_order_relaxed);
+        prof->cap_groups.fetch_add(result.groups.capacity(), std::memory_order_relaxed);
+        prof->live_entries.fetch_add(result.entries.size(), std::memory_order_relaxed);
+        prof->cap_entries.fetch_add(result.entries.capacity(), std::memory_order_relaxed);
+        prof->run_count.fetch_add(snapshot.run_buckets.size(), std::memory_order_relaxed);
+
+        uint64_t prev_hwm = prof->high_watermark_n_kv.load(std::memory_order_relaxed);
+        while (n_kv > prev_hwm && !prof->high_watermark_n_kv.compare_exchange_weak(prev_hwm, n_kv, std::memory_order_relaxed)) {}
+
+        prof->ring.push(4 /* custom/layout-audit */, 1 /* snapshot */, (uint16_t) snapshot.run_buckets.size(), (uint32_t) n_kv, snap_us);
+        prof->ring.push(4 /* custom/layout-audit */, 2 /* layout */, (uint16_t) result.groups.size(), (uint32_t) result.entries.size(), layout_us);
+    }
+
     return result;
 }
 

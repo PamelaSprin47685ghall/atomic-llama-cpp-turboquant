@@ -520,8 +520,15 @@ struct llm_rerot_span_reuse_key {
 // already baked into the entry set by the layout builder.
 class llm_graph_input_attn_rerot {
 public:
-    static constexpr uint32_t SPAN_BUCKET = 256;
+    // Capacity buckets for RERoT span buffers.
+    // - SPAN_ENTRY_BUCKET: entry capacity stays 256.
+    // - SPAN_GROUP_BUCKET: group capacity is 32 (typical decode Lane count is small;
+    //   power-of-2 preserves alignment; worst-case padding waste is reduced from 256x to 32x).
+    static constexpr uint32_t SPAN_GROUP_BUCKET = 32;
+    static constexpr uint32_t SPAN_ENTRY_BUCKET = 256;
 
+    static uint32_t group_capacity_bucket(uint32_t n);
+    static uint32_t entry_capacity_bucket(uint32_t n);
     static uint32_t capacity_bucket(uint32_t n);
     static bool graph_reuse_disabled();
     static bool is_supported_arch(const llama_hparams & hparams);
@@ -585,6 +592,8 @@ public:
     uint64_t applied_epoch() const { return epoch; }
 
 private:
+    mutable ggml_backend_sched_t sched = nullptr;
+
     llm_rerot_span_reuse_key key;
     bool key_valid = false;
     uint64_t epoch = 0;

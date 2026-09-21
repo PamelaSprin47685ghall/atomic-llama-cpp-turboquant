@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-rerot-profile.h"
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -369,6 +370,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
         if (ggml_tensor * fp_cur = try_build_attn_flashprefill(inp,
                     Qcur, nullptr,
                     Kcur, Vcur, sections, nullptr, nullptr, kq_scale, il)) {
+            if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+                prof->route_hit(llama_rerot_route::flashprefill);
+            }
             cur = fp_cur;
         } else {
             ggml_tensor * Qgroups = build_rerot_q_groups(inp, Qcur, nullptr, sections, il);

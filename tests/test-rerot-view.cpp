@@ -1171,8 +1171,470 @@ static void test_chapter09_exhaustive_dag_properties() {
     CHECK(dag_count > 0);
 }
 
+static void assert_query_layouts_identical(
+        const llama_rerot_query_layout & old_layout,
+        const llama_rerot_query_layout & new_layout,
+        const char * scenario) {
+    if (old_layout.query_virtual_pos != new_layout.query_virtual_pos) {
+        std::fprintf(stderr, "FAIL [%s]: query_virtual_pos mismatch: old=%ld, new=%ld\n",
+                     scenario, (long) old_layout.query_virtual_pos, (long) new_layout.query_virtual_pos);
+        ++g_failures;
+    }
+    if (old_layout.groups.size() != new_layout.groups.size()) {
+        std::fprintf(stderr, "FAIL [%s]: groups.size mismatch: old=%zu, new=%zu\n",
+                     scenario, old_layout.groups.size(), new_layout.groups.size());
+        ++g_failures;
+    } else {
+        for (size_t g = 0; g < old_layout.groups.size(); ++g) {
+            if (old_layout.groups[g].effective_pos != new_layout.groups[g].effective_pos) {
+                std::fprintf(stderr, "FAIL [%s]: group[%zu].effective_pos mismatch: old=%ld, new=%ld\n",
+                             scenario, g, (long) old_layout.groups[g].effective_pos, (long) new_layout.groups[g].effective_pos);
+                ++g_failures;
+            }
+        }
+    }
+    if (old_layout.entries.size() != new_layout.entries.size()) {
+        std::fprintf(stderr, "FAIL [%s]: entries.size mismatch: old=%zu, new=%zu\n",
+                     scenario, old_layout.entries.size(), new_layout.entries.size());
+        ++g_failures;
+    } else {
+        for (size_t e = 0; e < old_layout.entries.size(); ++e) {
+            if (old_layout.entries[e].key_index != new_layout.entries[e].key_index ||
+                old_layout.entries[e].group_index != new_layout.entries[e].group_index) {
+                std::fprintf(stderr, "FAIL [%s]: entry[%zu] mismatch: old=(key=%u, grp=%u), new=(key=%u, grp=%u)\n",
+                             scenario, e,
+                             old_layout.entries[e].key_index, old_layout.entries[e].group_index,
+                             new_layout.entries[e].key_index, new_layout.entries[e].group_index);
+                ++g_failures;
+            }
+        }
+    }
+}
+
+static void test_differential_query_layout_snapshot() {
+    constexpr uint64_t episode = 20260921;
+
+    // Dimension 1: Capacity boundaries (0 keys, 1 key, empty run)
+    {
+        llama_rerot_reader_state reader;
+        reader.episode_id = episode;
+        reader.reader = 1;
+        reader.query_run = 10;
+        reader.frontier = 1;
+        reader.ordered_runs = { 10 };
+
+        // 0 keys
+        std::vector<llama_rerot_key_record> keys_empty;
+        auto snap_empty = llama_rerot_kv_snapshot::from_keys(keys_empty, episode);
+        auto old_empty = llama_rerot_build_query_layout(reader, 0, keys_empty);
+        auto new_empty = llama_rerot_build_query_layout(reader, 0, snap_empty);
+        assert_query_layouts_identical(old_empty, new_empty, "boundary_0_keys");
+
+        // 1 base key
+        std::vector<llama_rerot_key_record> keys_1_base = {
+            { 5, 0, true, {} }
+        };
+        auto snap_1_base = llama_rerot_kv_snapshot::from_keys(keys_1_base, episode);
+        auto old_1_base = llama_rerot_build_query_layout(reader, 0, keys_1_base);
+        auto new_1_base = llama_rerot_build_query_layout(reader, 0, snap_1_base);
+        assert_query_layouts_identical(old_1_base, new_1_base, "boundary_1_base_key");
+
+        // 1 tagged key
+        std::vector<llama_rerot_key_record> keys_1_tagged = {
+            { 8, 0, true, public_meta(episode, 1, 10, 0) }
+        };
+        auto snap_1_tagged = llama_rerot_kv_snapshot::from_keys(keys_1_tagged, episode);
+        auto old_1_tagged = llama_rerot_build_query_layout(reader, 0, keys_1_tagged);
+        auto new_1_tagged = llama_rerot_build_query_layout(reader, 0, snap_1_tagged);
+        assert_query_layouts_identical(old_1_tagged, new_1_tagged, "boundary_1_tagged_key");
+    }
+
+    // Dimensions 2-8: Multi-query packing, row permutation, P/W roles, partial causal prefill,
+    // private/pending/public, physical holes, non-zero view offset.
+    {
+        constexpr llama_rerot_node_id planner = 1;
+        constexpr llama_rerot_node_id worker1 = 2;
+        constexpr llama_rerot_node_id worker2 = 3;
+        constexpr llama_rerot_run_id run_p  = 10;
+        constexpr llama_rerot_run_id run_w1 = 20;
+        constexpr llama_rerot_run_id run_w2 = 30;
+
+        // Base prefix with non-zero view offset (storage 100..109) and physical holes
+        std::vector<llama_rerot_key_record> keys;
+        for (uint32_t i = 0; i < 10; ++i) {
+            // Hole: physical key 10 + i * 3
+            keys.push_back({ 10 + i * 3, 100 + static_cast<llama_pos>(i), true, {} });
+        }
+
+        // Planner public runs (storage 110..119)
+        for (uint32_t i = 0; i < 10; ++i) {
+            keys.push_back({ 50 + i * 2, 110 + static_cast<llama_pos>(i), false,
+                public_meta(episode, planner, run_p, i / 3) });
+        }
+
+        // Worker 1 public + private + pending records (storage 120..134)
+        for (uint32_t i = 0; i < 5; ++i) {
+            keys.push_back({ 80 + i, 120 + static_cast<llama_pos>(i), false,
+                public_meta(episode, worker1, run_w1, i / 2) });
+        }
+        for (uint32_t i = 0; i < 5; ++i) {
+            llama_kv_rerot_meta priv;
+            priv.episode_id = episode;
+            priv.node_id = worker1;
+            priv.run_id = run_w1;
+            priv.frontier = 2;
+            priv.visibility = llama_rerot_visibility::private_control;
+            keys.push_back({ 90 + i, 125 + static_cast<llama_pos>(i), false, priv });
+        }
+        for (uint32_t i = 0; i < 5; ++i) {
+            llama_kv_rerot_meta pend;
+            pend.episode_id = episode;
+            pend.node_id = worker1;
+            pend.run_id = run_w1;
+            pend.frontier = 3;
+            pend.visibility = llama_rerot_visibility::pending_record;
+            keys.push_back({ 100 + i, 130 + static_cast<llama_pos>(i), false, pend });
+        }
+
+        // Worker 2 public runs (storage 135..144)
+        for (uint32_t i = 0; i < 10; ++i) {
+            keys.push_back({ 120 + i, 135 + static_cast<llama_pos>(i), false,
+                public_meta(episode, worker2, run_w2, i / 4) });
+        }
+
+        // Row permutation: shuffle the physical order of keys to verify layout builder
+        // is immune to memory order and physical index assignment.
+        std::mt19937 g(1337);
+        std::shuffle(keys.begin(), keys.end(), g);
+
+        // Test readers
+        llama_rerot_reader_state r_planner;
+        r_planner.episode_id = episode;
+        r_planner.reader = planner;
+        r_planner.query_run = run_p;
+        r_planner.frontier = 2;
+        r_planner.frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+        r_planner.ordered_runs = { run_p, run_w1, run_w2 };
+
+        llama_rerot_reader_state r_w1_strong;
+        r_w1_strong.episode_id = episode;
+        r_w1_strong.reader = worker1;
+        r_w1_strong.query_run = run_w1;
+        r_w1_strong.frontier = 2;
+        r_w1_strong.frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+        r_w1_strong.ordered_runs = { run_p, run_w2, run_w1 };
+
+        llama_rerot_reader_state r_w1_lag1 = r_w1_strong;
+        r_w1_lag1.frontier_mode = LLAMA_REROT_FRONTIER_LAG1;
+
+        llama_rerot_reader_state r_w2;
+        r_w2.episode_id = episode;
+        r_w2.reader = worker2;
+        r_w2.query_run = run_w2;
+        r_w2.frontier = 1;
+        r_w2.frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+        r_w2.ordered_runs = { run_p, run_w1, run_w2 };
+
+        // Test queries: different readers, partial causal prefill cutoff positions
+        struct test_query {
+            llama_rerot_reader_state reader;
+            llama_pos query_storage_pos;
+            llama_rerot_node_id owner_node;
+            const char * desc;
+        };
+
+        const std::vector<test_query> queries = {
+            { r_planner,   105, planner, "planner_cutoff_mid_prefix" },
+            { r_planner,   115, planner, "planner_cutoff_mid_p_run" },
+            { r_w1_strong, 122, worker1, "w1_strong_mid_public" },
+            { r_w1_strong, 127, worker1, "w1_strong_mid_private" },
+            { r_w1_strong, 132, worker1, "w1_strong_mid_pending" },
+            { r_w1_lag1,   122, worker1, "w1_lag1_mid_public" },
+            { r_w1_lag1,   134, worker1, "w1_lag1_end" },
+            { r_w2,        138, worker2, "w2_strong_mid_run" },
+        };
+
+        for (const auto & q : queries) {
+            auto keys_copy = keys;
+            for (auto & k : keys_copy) {
+                if (k.meta.active()) {
+                    if (k.meta.node_id == q.owner_node) {
+                        k.owned_by_reader = true;
+                    }
+                }
+            }
+
+            auto snapshot = llama_rerot_kv_snapshot::from_keys(keys_copy, episode);
+            auto old_l = llama_rerot_build_query_layout(q.reader, q.query_storage_pos, keys_copy);
+            auto new_l = llama_rerot_build_query_layout(q.reader, q.query_storage_pos, snapshot);
+
+            assert_query_layouts_identical(old_l, new_l, q.desc);
+            CHECK(snapshot.query_eval_count == 1);
+        }
+
+        // Shared snapshot test across a packed batch of queries:
+        // Build snapshot once for worker 1, evaluate 3 queries sharing the same snapshot
+        {
+            auto keys_w1 = keys;
+            for (auto & k : keys_w1) {
+                if (k.meta.active() && k.meta.node_id == worker1) {
+                    k.owned_by_reader = true;
+                }
+            }
+            auto shared_snap = llama_rerot_kv_snapshot::from_keys(keys_w1, episode);
+            for (llama_pos pos : { 121, 126, 133 }) {
+                auto old_l = llama_rerot_build_query_layout(r_w1_strong, pos, keys_w1);
+                auto new_l = llama_rerot_build_query_layout(r_w1_strong, pos, shared_snap);
+                assert_query_layouts_identical(old_l, new_l, "shared_batch_query");
+            }
+            // Snapshot was evaluated 3 times without re-creation
+            CHECK(shared_snap.query_eval_count == 3);
+            CHECK(shared_snap.bucket_lookup_count > 0);
+        }
+    }
+
+    // Dimension 9: Large n_kv test (hundreds of keys)
+    {
+        constexpr size_t total_keys = 600;
+        constexpr llama_rerot_node_id n_a = 1;
+        constexpr llama_rerot_node_id n_b = 2;
+        constexpr llama_rerot_run_id r_a = 101;
+        constexpr llama_rerot_run_id r_b = 102;
+
+        std::vector<llama_rerot_key_record> keys;
+        keys.reserve(total_keys);
+
+        // 100 prefix keys
+        for (uint32_t i = 0; i < 100; ++i) {
+            keys.push_back({ i, static_cast<llama_pos>(i), true, {} });
+        }
+        // 250 keys for node A
+        for (uint32_t i = 0; i < 250; ++i) {
+            keys.push_back({ 100 + i, static_cast<llama_pos>(100 + i), true,
+                public_meta(episode, n_a, r_a, i / 25) });
+        }
+        // 250 keys for node B
+        for (uint32_t i = 0; i < 250; ++i) {
+            keys.push_back({ 350 + i, static_cast<llama_pos>(100 + i), false,
+                public_meta(episode, n_b, r_b, i / 25) });
+        }
+
+        llama_rerot_reader_state reader;
+        reader.episode_id = episode;
+        reader.reader = n_a;
+        reader.query_run = r_a;
+        reader.frontier = 5;
+        reader.frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+        reader.ordered_runs = { r_b, r_a };
+
+        auto snapshot = llama_rerot_kv_snapshot::from_keys(keys, episode);
+
+        for (llama_pos q_pos : { 150, 200, 250, 300, 349 }) {
+            auto old_l = llama_rerot_build_query_layout(reader, q_pos, keys);
+            auto new_l = llama_rerot_build_query_layout(reader, q_pos, snapshot);
+            assert_query_layouts_identical(old_l, new_l, "large_n_kv_differential");
+        }
+        CHECK(snapshot.query_eval_count == 5);
+    }
+
+    // Discrimination test: Verify that the new path strictly depends on snapshot's shared run buckets,
+    // so that if someone changes the new path back to per-query reconstruction from raw keys,
+    // the test will fail!
+    {
+        std::vector<llama_rerot_key_record> raw_keys = {
+            { 0, 0, true, {} },
+            { 1, 1, true, public_meta(episode, 1, 10, 0) },
+            { 2, 2, true, public_meta(episode, 1, 10, 0) },
+            { 3, 3, true, public_meta(episode, 1, 10, 0) },
+        };
+
+        llama_rerot_reader_state reader;
+        reader.episode_id = episode;
+        reader.reader = 1;
+        reader.query_run = 10;
+        reader.frontier = 1;
+        reader.ordered_runs = { 10 };
+
+        auto snap = llama_rerot_kv_snapshot::from_keys(raw_keys, episode);
+        // Prune the run bucket in the snapshot
+        snap.run_buckets[10].pop_back();
+
+        auto layout_from_snap = llama_rerot_build_query_layout(reader, 3, snap);
+        auto layout_from_raw  = llama_rerot_build_query_layout(reader, 3, raw_keys);
+
+        // Snapshot layout has 3 visible keys (1 base + 2 tagged), while raw has 4 keys (1 base + 3 tagged)
+        CHECK(layout_from_snap.entries.size() == 3);
+        CHECK(layout_from_raw.entries.size() == 4);
+        CHECK(layout_from_snap.entries.size() < layout_from_raw.entries.size());
+    }
+
+    // Dimension 10: Multi-reader snapshot factory coverage (from_multi_reader_keys) & discrimination
+    {
+        // 10.1 Single-reader parity: from_multi_reader_keys vs from_keys on identical inputs
+        {
+            std::vector<llama_rerot_key_record> single_keys = {
+                { 101, 10, true,  {} },
+                { 102, 11, false, {} },
+                { 103, 12, true,  public_meta(episode, 1, 10, 0) },
+                { 104, 13, false, public_meta(episode, 1, 10, 1) },
+                { 105, 14, true,  public_meta(episode, 2, 20, 0) },
+            };
+
+            llama_rerot_reader_state r_single;
+            r_single.episode_id = episode;
+            r_single.reader = 1;
+            r_single.seq_id = 0;
+            r_single.query_run = 10;
+            r_single.frontier = 2;
+            r_single.frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+            r_single.ordered_runs = { 10, 20 };
+
+            std::vector<bool> single_ownership;
+            for (const auto & k : single_keys) {
+                single_ownership.push_back(k.owned_by_reader);
+            }
+
+            auto snap_single = llama_rerot_kv_snapshot::from_keys(single_keys, episode);
+            auto snap_multi  = llama_rerot_kv_snapshot::from_multi_reader_keys(single_keys, { r_single }, { single_ownership });
+
+            // Field-by-field parity assertion
+            CHECK(snap_single.episode_id == snap_multi.episode_id);
+            CHECK(snap_single.base_cells.size() == snap_multi.base_cells.size());
+            for (size_t i = 0; i < snap_single.base_cells.size(); ++i) {
+                CHECK(snap_single.base_cells[i].key_index == snap_multi.base_cells[i].key_index);
+                CHECK(snap_single.base_cells[i].storage_pos == snap_multi.base_cells[i].storage_pos);
+                CHECK(snap_single.base_cells[i].seq_mask == snap_multi.base_cells[i].seq_mask);
+            }
+
+            CHECK(snap_single.run_buckets.size() == snap_multi.run_buckets.size());
+            for (const auto & pair : snap_single.run_buckets) {
+                auto it = snap_multi.run_buckets.find(pair.first);
+                CHECK(it != snap_multi.run_buckets.end());
+                CHECK(pair.second.size() == it->second.size());
+                for (size_t i = 0; i < pair.second.size(); ++i) {
+                    const auto & c1 = pair.second[i];
+                    const auto & c2 = it->second[i];
+                    CHECK(c1.key_index == c2.key_index);
+                    CHECK(c1.storage_pos == c2.storage_pos);
+                    CHECK(c1.frontier == c2.frontier);
+                    CHECK(c1.node_id == c2.node_id);
+                    CHECK(c1.visibility == c2.visibility);
+                    CHECK(c1.seq_mask == c2.seq_mask);
+                }
+            }
+
+            // Both produce bit-identical query layout
+            auto l_single = llama_rerot_build_query_layout(r_single, 14, snap_single);
+            auto l_multi  = llama_rerot_build_query_layout(r_single, 14, snap_multi);
+            assert_query_layouts_identical(l_single, l_multi, "multi_reader_factory_single_parity");
+        }
+
+        // 10.2 Multi-reader partitioning & strict discrimination
+        {
+            constexpr llama_rerot_node_id node_0 = 10;
+            constexpr llama_rerot_node_id node_1 = 20;
+            constexpr llama_rerot_run_id  run_shared = 50;
+
+            llama_rerot_reader_state reader_0;
+            reader_0.episode_id = episode;
+            reader_0.reader = node_0;
+            reader_0.seq_id = 0;
+            reader_0.query_run = run_shared;
+            reader_0.frontier = 2;
+            reader_0.frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+            reader_0.ordered_runs = { run_shared };
+
+            llama_rerot_reader_state reader_1;
+            reader_1.episode_id = episode;
+            reader_1.reader = node_1;
+            reader_1.seq_id = 1;
+            reader_1.query_run = run_shared;
+            reader_1.frontier = 2;
+            reader_1.frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+            reader_1.ordered_runs = { run_shared };
+
+            // Distinct keys partitioned among readers:
+            // key 0: base key, owned solely by reader 0 (expected mask 0b01 = 1)
+            // key 1: base key, owned solely by reader 1 (expected mask 0b10 = 2)
+            // key 2: base key, shared by both readers   (expected mask 0b11 = 3)
+            // key 3: tagged key, owned solely by reader 0 (expected mask 0b01 = 1)
+            // key 4: tagged key, owned solely by reader 1 (expected mask 0b10 = 2)
+            // key 5: tagged key, shared by both readers   (expected mask 0b11 = 3)
+            std::vector<llama_rerot_key_record> keys = {
+                { 0, 0, false, {} },
+                { 1, 1, false, {} },
+                { 2, 2, false, {} },
+                { 3, 3, false, public_meta(episode, node_0, run_shared, 2) },
+                { 4, 4, false, public_meta(episode, node_1, run_shared, 2) },
+                { 5, 5, false, public_meta(episode, node_0, run_shared, 0) },
+            };
+
+            std::vector<bool> own_0 = { true,  false, true,  true,  false, true  };
+            std::vector<bool> own_1 = { false, true,  true,  false, true,  true  };
+
+            auto snap = llama_rerot_kv_snapshot::from_multi_reader_keys(
+                keys,
+                { reader_0, reader_1 },
+                { own_0, own_1 }
+            );
+
+            // Verify mapping registrations
+            CHECK(snap.seq_to_index.at(0) == 0);
+            CHECK(snap.seq_to_index.at(1) == 1);
+            CHECK(snap.node_to_index.at(node_0) == 0);
+            CHECK(snap.node_to_index.at(node_1) == 1);
+
+            // Verify base_cells bitmasks
+            CHECK(snap.base_cells.size() == 3);
+            for (const auto & cell : snap.base_cells) {
+                if (cell.key_index == 0) CHECK(cell.seq_mask == 1ULL);
+                if (cell.key_index == 1) CHECK(cell.seq_mask == 2ULL);
+                if (cell.key_index == 2) CHECK(cell.seq_mask == 3ULL);
+            }
+
+            // Verify tagged run_bucket bitmasks
+            const auto & b = snap.run_buckets.at(run_shared);
+            CHECK(b.size() == 3);
+            for (const auto & cell : b) {
+                if (cell.key_index == 3) CHECK(cell.seq_mask == 1ULL);
+                if (cell.key_index == 4) CHECK(cell.seq_mask == 2ULL);
+                if (cell.key_index == 5) CHECK(cell.seq_mask == 3ULL);
+            }
+
+            // Verify is_owned isolation across readers
+            CHECK(snap.is_owned(1ULL, reader_0) == true);
+            CHECK(snap.is_owned(2ULL, reader_0) == false);
+            CHECK(snap.is_owned(3ULL, reader_0) == true);
+
+            CHECK(snap.is_owned(1ULL, reader_1) == false);
+            CHECK(snap.is_owned(2ULL, reader_1) == true);
+            CHECK(snap.is_owned(3ULL, reader_1) == true);
+
+            // Verify layout generation produces mutually isolated views
+            auto l0 = llama_rerot_build_query_layout(reader_0, 10, snap);
+            auto l1 = llama_rerot_build_query_layout(reader_1, 10, snap);
+
+            CHECK(l0.entries.size() == 4);
+            CHECK(l1.entries.size() == 4);
+
+            std::set<uint32_t> k0, k1;
+            for (const auto & e : l0.entries) k0.insert(e.key_index);
+            for (const auto & e : l1.entries) k1.insert(e.key_index);
+
+            // Reader 0 sees exactly keys {0, 2, 3, 5}
+            CHECK(k0.count(0) == 1 && k0.count(2) == 1 && k0.count(3) == 1 && k0.count(5) == 1);
+            CHECK(k0.count(1) == 0 && k0.count(4) == 0);
+
+            // Reader 1 sees exactly keys {1, 2, 4, 5}
+            CHECK(k1.count(1) == 1 && k1.count(2) == 1 && k1.count(4) == 1 && k1.count(5) == 1);
+            CHECK(k1.count(0) == 0 && k1.count(3) == 0);
+        }
+    }
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT View Tests ===\n");
+    test_differential_query_layout_snapshot();
     test_dag_cycle_preferred_topo();
     test_dag_reader_view_assembly();
     test_dag_running_and_ready_suspended_keep_public_runs();

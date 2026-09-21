@@ -202,7 +202,12 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-rerot-recurrent.cpp)
     target_include_directories(test-rerot-recurrent PRIVATE ${PROJECT_SOURCE_DIR}/src)
     target_link_libraries(test-rerot-recurrent PRIVATE llama)
+    llama_build_and_test(test-rerot-profile.cpp)
+    target_include_directories(test-rerot-profile PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test-rerot-profile PRIVATE llama)
     llama_build_and_test(test-rerot-attn.cpp)
+    target_include_directories(test-rerot-attn PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test-rerot-attn PRIVATE llama)
     # Opt-in real-model teacher-forcing diagnostic; no model is downloaded
     # and this is not registered among the hermetic correctness tests.
     llama_build(test-rerot-model-batch.cpp)
@@ -218,7 +223,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ${PROJECT_SOURCE_DIR}/src
         ${PROJECT_SOURCE_DIR}/tools/server
         ${PROJECT_SOURCE_DIR}/tools/mtmd)
-    target_link_libraries(test-rerot-runtime PRIVATE llama llama-common)
+    target_link_libraries(test-rerot-runtime PRIVATE llama llama-common server-context)
     llama_build_and_test(test-triattention-score.cpp)
     target_include_directories(test-triattention-score PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-triattention-kv.cpp)

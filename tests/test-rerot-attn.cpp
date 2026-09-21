@@ -1,3 +1,4 @@
+#include "llama-graph.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
@@ -1739,6 +1740,148 @@ static int replay_rbb_snapshot(const std::string & directory) {
     return failures ? 1 : 0;
 }
 
+static void test_rerot_capacity_bucket_separation() {
+    std::puts("--- RERoT capacity bucket separation (P1) ---");
+
+    // (b) 容量行为确实改变：n_groups=20 时分配的 group 容量为 32 而非 256
+    // （该断言在把 group 桶改回 256 时必须失败，即它真能甄别新旧行为）。
+    {
+        const uint32_t g_cap_20 = llm_graph_input_attn_rerot::group_capacity_bucket(20);
+        CHECK(g_cap_20 == 32);
+        const auto key_20 = llm_graph_input_attn_rerot::make_key(
+            1, 20, 100, llm_rerot_kernel_variant::REROT_KERNEL_CPU, true, llama_rerot_frontier_mode::LLAMA_REROT_FRONTIER_STRONG);
+        CHECK(key_20.group_cap == 32);
+        CHECK(key_20.entry_cap == 256);
+    }
+
+    // (a) 同一布局下有效输出与参考完全一致
+    // 覆盖 group 数 1/20/31/32/33/255/256/257 与 entry 数 1/255/256/257 的组合至少各一，含跨桶。
+    struct TestCase {
+        int ng;
+        int ne;
+    };
+    const std::vector<TestCase> cases = {
+        { 1,   1 },    // group_cap=32,  entry_cap=256
+        { 20,  255 },  // group_cap=32,  entry_cap=256
+        { 31,  256 },  // group_cap=32,  entry_cap=256
+        { 32,  257 },  // group_cap=32,  entry_cap=512 (跨 entry 桶)
+        { 33,  1 },    // group_cap=64,  entry_cap=256 (跨 group 桶)
+        { 255, 255 },  // group_cap=256, entry_cap=256
+        { 256, 256 },  // group_cap=256, entry_cap=256
+        { 257, 257 },  // group_cap=288, entry_cap=512 (跨 group 桶与 entry 桶)
+    };
+
+    constexpr int d = 8;
+    constexpr int dv = 6;
+    constexpr int hq = 2;
+    constexpr int hkv = 1;
+    constexpr int nq = 1;
+    constexpr int nkv = 8;
+    constexpr float scale = 0.35f;
+    constexpr float softcap = 0.0f;
+    const std::vector<float> sinks = {};
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    CHECK(backend != nullptr);
+
+    for (const auto & tc : cases) {
+        const int ng = tc.ng;
+        const int ne = tc.ne;
+
+        const uint32_t group_cap = llm_graph_input_attn_rerot::group_capacity_bucket(ng);
+        const uint32_t entry_cap = llm_graph_input_attn_rerot::entry_capacity_bucket(ne);
+
+        CHECK(group_cap >= (uint32_t)ng);
+        CHECK(entry_cap >= (uint32_t)ne);
+
+        // 构造有效 entry 与 offsets
+        std::vector<int32_t> valid_entries(2 * ne);
+        for (int i = 0; i < ne; ++i) {
+            valid_entries[2 * i + 0] = i % nkv; // key index
+            valid_entries[2 * i + 1] = i % ng;  // group index in [0, ng)
+        }
+        const std::vector<int32_t> offsets = { 0, ne };
+
+        // 分配并填充 padding 0 的 entries 缓冲区（容量为 entry_cap）
+        std::vector<int32_t> padded_entries(2 * entry_cap, 0);
+        std::memcpy(padded_entries.data(), valid_entries.data(), valid_entries.size() * sizeof(int32_t));
+
+        // 分配并填充 padding 0 的 q 数据缓冲区（容量为 group_cap）
+        std::vector<float> padded_q(size_t(d) * group_cap * hq, 0.0f);
+        for (int h = 0; h < hq; ++h) {
+            for (int g = 0; g < ng; ++g) {
+                for (int id = 0; id < d; ++id) {
+                    padded_q[(size_t(h) * group_cap + g) * d + id] = value_q(g, h, id);
+                }
+            }
+        }
+
+        // 填充 k 与 v
+        std::vector<float> k_data(size_t(d) * nkv * hkv);
+        std::vector<float> v_data(size_t(dv) * nkv * hkv);
+        for (int h = 0; h < hkv; ++h) {
+            for (int key = 0; key < nkv; ++key) {
+                for (int id = 0; id < d; ++id) {
+                    k_data[(size_t(h) * nkv + key) * d + id] = value_k(key, h, id);
+                }
+                for (int id = 0; id < dv; ++id) {
+                    v_data[(size_t(h) * nkv + key) * dv + id] = value_v(key, h, id);
+                }
+            }
+        }
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ 64 * 1024 * 1024,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx(ggml_init(params));
+        CHECK(bool(ctx));
+        if (!ctx) continue;
+
+        // 张量分配采用容量桶尺寸（模拟 build_span_tensors）
+        ggml_tensor * q = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d, group_cap, hq, 1);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d, nkv, hkv, 1);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, dv, nkv, hkv, 1);
+        ggml_tensor * e = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 2, entry_cap);
+        ggml_tensor * o = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, offsets.size());
+
+        ggml_tensor * out = ggml_flash_attn_ext_rerot(ctx.get(), q, k, v, e, o, nullptr, scale, softcap);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+
+        ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+        CHECK(bool(buffer));
+
+        ggml_backend_tensor_set(q, padded_q.data(), 0, padded_q.size() * sizeof(float));
+        ggml_backend_tensor_set(k, k_data.data(), 0, k_data.size() * sizeof(float));
+        ggml_backend_tensor_set(v, v_data.data(), 0, v_data.size() * sizeof(float));
+        ggml_backend_tensor_set(e, padded_entries.data(), 0, padded_entries.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(o, offsets.data(), 0, offsets.size() * sizeof(int32_t));
+
+        ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 32, false);
+        ggml_build_forward_expand(graph, out);
+        CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_synchronize(backend);
+
+        std::vector<float> actual(ggml_nelements(out));
+        ggml_backend_tensor_get(out, actual.data(), 0, actual.size() * sizeof(float));
+
+        // 参考基准：仅在有效 entries 和 live groups 上计算
+        const auto expected = reference(d, dv, hq, hkv, nq, valid_entries, offsets, scale, softcap, sinks);
+        CHECK(actual.size() == expected.size());
+        for (size_t i = 0; i < actual.size(); ++i) {
+            if (std::fabs(actual[i] - expected[i]) > 2e-5f) {
+                std::fprintf(stderr, "bucket test mismatch case(ng=%d, ne=%d) idx=%zu: actual=%g expected=%g\n",
+                             ng, ne, i, actual[i], expected[i]);
+                ++failures;
+                break;
+            }
+        }
+    }
+
+    ggml_backend_free(backend);
+}
+
 int main(int argc, char ** argv) {
     test_error_metric_rejects_invalid_outputs();
     if (argc == 3 && std::strcmp(argv[1], "--rbb-replay") == 0) return replay_rbb_snapshot(argv[2]);
@@ -1748,6 +1891,7 @@ int main(int argc, char ** argv) {
         return failures == 0 ? 0 : 1;
     }
     std::puts("=== RERoT indexed attention test ===");
+    test_rerot_capacity_bucket_separation();
     test_indexed_basic();
     test_ddvr_imrope_via_indexed_op();
     test_frontier_strong_vs_lag1();

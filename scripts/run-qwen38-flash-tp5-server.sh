@@ -129,6 +129,7 @@ if pgrep -x ninja >/dev/null || pgrep -f 'cc1plus|/bin/ld ' >/dev/null; then
 fi
 
 # Ensure all 5 GPUs are completely idle before launching
+MAX_BASELINE_VRAM=${MAX_BASELINE_VRAM:-$((50 * 1024 * 1024))}
 for _ in $(seq 1 30); do
     busy=0
     for c in card1 card2 card3 card4 card5; do
@@ -138,7 +139,7 @@ for _ in $(seq 1 30); do
             say "REFUSED: Cannot read GPU safety state for $c."
             exit 3
         fi
-        if [ "$u" -gt 200000000 ] || [ "$gpu_busy" -ne 0 ]; then
+        if [ "$u" -gt "$MAX_BASELINE_VRAM" ] || [ "$gpu_busy" -ne 0 ]; then
             busy=1
         fi
     done
@@ -151,10 +152,6 @@ if [ $busy -ne 0 ]; then
     exit 3
 fi
 
-if [ "$BASELINE" -eq 1 ]; then
-    exec "${baseline_cmd[@]}"
-fi
-
 cleanup() {
     if [ -n "${PID:-}" ]; then
         say "Gracefully terminating llama-server (pid=$PID)..."
@@ -163,11 +160,23 @@ cleanup() {
             kill -0 "$PID" 2>/dev/null || break
             sleep 1
         done
-        kill -9 "$PID" 2>/dev/null || true
+        if kill -0 "$PID" 2>/dev/null; then
+            say "Process $PID still active after 15s graceful shutdown timeout; sending SIGKILL..."
+            kill -9 "$PID" 2>/dev/null || true
+        fi
         wait "$PID" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT INT TERM
+
+if [ "$BASELINE" -eq 1 ]; then
+    "${baseline_cmd[@]}" &
+    PID=$!
+    wait "$PID"
+    status=$?
+    PID=
+    exit "$status"
+fi
 
 # --- Launch TP5 Server --------------------------------------------------------------------
 say "Launching TP5 server on $HOST:$PORT (model: $(basename "$MODEL"))..."

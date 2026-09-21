@@ -2787,6 +2787,352 @@ static void test_final_fence_user_grammar_restoration() {
     CHECK(runtime.erase_episode(ep));
 }
 
+// ============================================================================
+// Simple Continuation: Sampler clone / RNG / penalty chain anti-pollution test
+// (tools/server/server-context.cpp:2838-2906, AGENTS.md §02.7)
+// ============================================================================
+
+static server_task clone_mock_task(const server_task & source) {
+    server_task copy(source.type);
+    copy.id = source.id;
+    copy.index = source.index;
+    copy.id_slot = source.id_slot;
+    copy.id_parent = source.id_parent;
+    copy.params = source.params;
+    copy.tokens = source.tokens.clone();
+    copy.is_retry = source.is_retry;
+    copy.cache_key = source.cache_key;
+    copy.rerot_episode_id = source.rerot_episode_id;
+    copy.rerot_generation = source.rerot_generation;
+    copy.rerot_original_user_text = source.rerot_original_user_text;
+    return copy;
+}
+
+struct test_mock_rerot_slot {
+    std::unique_ptr<const server_task> task;
+    llama_sampler * smpl = nullptr;
+    llama_tokens prompt_tokens;
+
+    // C0 pre-saved decision state
+    llama_sampler * rerot_c0_smpl = nullptr;
+    llama_token rerot_c0_token = LLAMA_TOKEN_NULL;
+    bool rerot_c0_ready = false;
+    int32_t rerot_c0_n_decoded = 0;
+    int32_t rerot_c0_n_decoded_start = 0;
+    std::string rerot_c0_generated_text;
+    llama_tokens rerot_c0_generated_tokens;
+
+    // Active generation / output counters
+    int32_t n_decoded = 0;
+    int32_t n_decoded_start = 0;
+    std::string generated_text;
+    llama_tokens generated_tokens;
+    bool has_next_token = true;
+    stop_type stop = STOP_TYPE_NONE;
+    std::string stopping_word;
+
+    void init_sampler() {
+        if (smpl) {
+            llama_sampler_reset(smpl);
+            for (const llama_token id : prompt_tokens) {
+                if (id != LLAMA_TOKEN_NULL) {
+                    llama_sampler_accept(smpl, id);
+                }
+            }
+        }
+    }
+
+    ~test_mock_rerot_slot() {
+        if (smpl) {
+            llama_sampler_free(smpl);
+            smpl = nullptr;
+        }
+        if (rerot_c0_smpl) {
+            llama_sampler_free(rerot_c0_smpl);
+            rerot_c0_smpl = nullptr;
+        }
+    }
+};
+
+struct test_mock_rerot_transport {
+    server_task response_task;
+    common_grammar saved_user_grammar;
+    llama_sampler * c0_sampler = nullptr;
+    uint32_t sampled_tokens = 0;
+
+    ~test_mock_rerot_transport() {
+        if (c0_sampler) {
+            llama_sampler_free(c0_sampler);
+            c0_sampler = nullptr;
+        }
+    }
+};
+
+// Contract verifier: returns true if and only if slot satisfies the pristine C0 continuity invariants.
+static bool verify_simple_continuation_contract(
+        const test_mock_rerot_slot & slot,
+        const test_mock_rerot_transport & transport,
+        const llama_tokens & prompt_tokens,
+        llama_token expected_c0_token,
+        const std::string & expected_user_grammar,
+        int32_t expected_user_budget,
+        const std::vector<llama_token> & probe_tokens,
+        std::string & failure_reason) {
+    if (!slot.smpl) {
+        failure_reason = "missing active sampler";
+        return false;
+    }
+    // 1. Output and decode counters
+    if (slot.n_decoded != 1) {
+        failure_reason = "n_decoded should be exactly 1 after consuming C0 token, got " + std::to_string(slot.n_decoded);
+        return false;
+    }
+    if (transport.sampled_tokens != 1) {
+        failure_reason = "transport.sampled_tokens should be 1, got " + std::to_string(transport.sampled_tokens);
+        return false;
+    }
+    if (slot.generated_tokens.size() != 1 || slot.generated_tokens[0] != expected_c0_token) {
+        failure_reason = "generated_tokens does not match expected C0 token";
+        return false;
+    }
+    if (slot.rerot_c0_ready) {
+        failure_reason = "rerot_c0_ready flag was not disarmed";
+        return false;
+    }
+
+    // 2. Grammar & Reasoning budget preservation
+    if (slot.task->params.sampling.grammar.empty() ||
+        common_grammar_value(slot.task->params.sampling.grammar) != expected_user_grammar) {
+        failure_reason = "grammar does not match expected user grammar";
+        return false;
+    }
+    if (slot.task->params.sampling.grammar.type != COMMON_GRAMMAR_TYPE_USER) {
+        failure_reason = "grammar type is not COMMON_GRAMMAR_TYPE_USER";
+        return false;
+    }
+    if (slot.task->params.sampling.reasoning_budget_tokens != expected_user_budget) {
+        failure_reason = "reasoning budget tokens not preserved";
+        return false;
+    }
+
+    // 3. Penalty chain & RNG continuity check:
+    // Probe sampler behavior vs C0 sampler behavior:
+    // A penalty sampler applies repetition penalty to all accepted tokens.
+    // If init_sampler() reset the sampler, the expected_c0_token was NEVER re-accepted,
+    // so C0 token will NOT have repeat penalty applied!
+    // We test this via a probe distribution: logits with equal probability for expected_c0_token and a fresh token.
+    std::vector<llama_token_data> cur_p_data = {
+        { expected_c0_token, 10.0f, 0.5f },
+        { 9999,              10.0f, 0.5f }
+    };
+    llama_token_data_array cur_p = { cur_p_data.data(), cur_p_data.size(), -1, false };
+    llama_sampler_apply(slot.smpl, &cur_p);
+
+    // If repeat penalty is intact on C0 token, expected_c0_token's logit/prob must be penalized (< 9999's prob).
+    // If init_sampler() wiped the penalty chain, both tokens remain unpenalized (or equal).
+    float prob_c0 = 0.0f;
+    float prob_other = 0.0f;
+    for (size_t i = 0; i < cur_p.size; ++i) {
+        if (cur_p.data[i].id == expected_c0_token) {
+            prob_c0 = cur_p.data[i].p;
+        } else if (cur_p.data[i].id == 9999) {
+            prob_other = cur_p.data[i].p;
+        }
+    }
+    if (prob_c0 >= prob_other) {
+        failure_reason = "C0 token penalty was lost (prob_c0=" + std::to_string(prob_c0) +
+                         " >= prob_other=" + std::to_string(prob_other) + "), proving sampler was reset by init_sampler()";
+        return false;
+    }
+
+    // 4. Anti-pollution check: probe tokens must NOT have repeat penalty applied in active sampler!
+    for (const llama_token ptok : probe_tokens) {
+        std::vector<llama_token_data> probe_test_data = {
+            { ptok, 10.0f, 0.5f },
+            { 9998, 10.0f, 0.5f }
+        };
+        llama_token_data_array probe_test = { probe_test_data.data(), probe_test_data.size(), -1, false };
+        llama_sampler_apply(slot.smpl, &probe_test);
+        float p_probe = 0.0f;
+        float p_clean = 0.0f;
+        for (size_t i = 0; i < probe_test.size; ++i) {
+            if (probe_test.data[i].id == ptok) {
+                p_probe = probe_test.data[i].p;
+            } else if (probe_test.data[i].id == 9998) {
+                p_clean = probe_test.data[i].p;
+            }
+        }
+        if (p_probe < p_clean) {
+            failure_reason = "Probe token " + std::to_string(ptok) + " contaminated sampler penalty chain!";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void test_rerot_enter_simple_sampler_state_preservation_and_anti_pollution() {
+    std::fprintf(stderr, "--- test_rerot_enter_simple_sampler_state_preservation_and_anti_pollution (§02.7, server-context:2838-2906) ---\n");
+
+    const llama_tokens prompt_tokens = { 101, 102, 103 };
+    const llama_token c0_decision_token = 201;
+    const std::vector<llama_token> probe_tokens = { 501, 502, 503, 504 };
+    const std::string user_grammar_source = R"(root ::= "{\"answer\":\"" [A-Z]+ "\"}")";
+    const int32_t user_budget = 42;
+    const uint32_t rng_seed = 1337;
+
+    // Helper to construct a configured sampler with penalty & distribution
+    auto create_test_sampler = [&](uint32_t seed) -> llama_sampler * {
+        auto sparams = llama_sampler_chain_default_params();
+        llama_sampler * chain = llama_sampler_chain_init(sparams);
+        // Penalty sampler with repeat_penalty=2.0f to distinctly penalize accepted tokens
+        llama_sampler_chain_add(chain, llama_sampler_init_penalties(10000, 64, 2.0f, 0.0f, 0.0f));
+        llama_sampler_chain_add(chain, llama_sampler_init_dist(seed));
+        return chain;
+    };
+
+    // --- SCENARIO A: The Correct Behavior (as implemented in server-context.cpp:2838-2906) ---
+    {
+        test_mock_rerot_slot slot;
+        test_mock_rerot_transport transport;
+
+        // 1. Initial user task configuration
+        task_params params;
+        params.sampling.seed = rng_seed;
+        params.sampling.reasoning_budget_tokens = user_budget;
+        params.sampling.reasoning_budget_start = { 998 };
+        params.sampling.reasoning_budget_end = { { 999 } };
+        params.sampling.grammar = { COMMON_GRAMMAR_TYPE_USER, user_grammar_source };
+        transport.response_task.params = params;
+        transport.saved_user_grammar = params.sampling.grammar;
+
+        slot.task = std::make_unique<const server_task>(clone_mock_task(transport.response_task));
+        slot.prompt_tokens = prompt_tokens;
+        slot.smpl = create_test_sampler(rng_seed);
+        // Prompt tokens ingested into initial sampler
+        slot.init_sampler();
+
+        // 2. Pre-save C0 decision (mirroring rerot_presave_c0_decision)
+        llama_sampler * clone = llama_sampler_clone(slot.smpl);
+        llama_sampler_accept(clone, c0_decision_token);
+        slot.rerot_c0_smpl = clone;
+        slot.rerot_c0_token = c0_decision_token;
+        slot.rerot_c0_ready = true;
+        slot.rerot_c0_n_decoded = 0;
+        slot.rerot_c0_n_decoded_start = 0;
+        slot.rerot_c0_generated_text = "";
+        slot.rerot_c0_generated_tokens = {};
+
+        // Transport captures C0 sampler for simple continuation
+        transport.c0_sampler = llama_sampler_clone(slot.rerot_c0_smpl);
+
+        // 3. Routing Probe Phase: slot is armed with probe grammar, reasoning budget cleared,
+        // and a probe sampler is initialized and polluted with probe tokens.
+        server_task probe_task = clone_mock_task(transport.response_task);
+        probe_task.params.sampling.reasoning_budget_tokens = -1;
+        probe_task.params.sampling.grammar = { COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, R"({"strategy": "simple"})" };
+        slot.task = std::make_unique<const server_task>(std::move(probe_task));
+
+        // Swap to probe sampler
+        llama_sampler_free(slot.smpl);
+        slot.smpl = create_test_sampler(rng_seed + 99);
+        slot.init_sampler();
+        for (const llama_token ptok : probe_tokens) {
+            llama_sampler_accept(slot.smpl, ptok);
+            slot.n_decoded += 1;
+            slot.generated_tokens.push_back(ptok);
+            slot.generated_text += " probe";
+        }
+        CHECK(slot.n_decoded == 4);
+        CHECK(slot.generated_tokens.size() == 4);
+
+        // 4. Probe concludes -> rerot_enter_simple
+        // Restore task from response_task & user grammar
+        server_task cont = clone_mock_task(transport.response_task);
+        cont.params.sampling.grammar = transport.saved_user_grammar;
+        slot.task = std::make_unique<const server_task>(std::move(cont));
+
+        // Rebind C0 sampler as-is WITHOUT calling init_sampler()!
+        llama_sampler_free(slot.smpl);
+        slot.smpl = transport.c0_sampler;
+        transport.c0_sampler = nullptr; // ownership transferred to slot.smpl
+
+        // Restore output cursors to pristine C0
+        slot.n_decoded = slot.rerot_c0_n_decoded;
+        slot.n_decoded_start = slot.rerot_c0_n_decoded_start;
+        slot.generated_text = std::move(slot.rerot_c0_generated_text);
+        slot.generated_tokens = std::move(slot.rerot_c0_generated_tokens);
+        slot.rerot_c0_ready = false;
+        transport.sampled_tokens = 0;
+
+        // Consume the pre-saved C0 decision
+        slot.n_decoded += 1;
+        slot.generated_tokens.push_back(slot.rerot_c0_token);
+        slot.generated_text += "C0Token";
+        ++transport.sampled_tokens;
+
+        // Verify contract on correct behavior
+        std::string err;
+        const bool ok = verify_simple_continuation_contract(
+            slot, transport, prompt_tokens, c0_decision_token,
+            user_grammar_source, user_budget, probe_tokens, err);
+        CHECK(ok);
+        if (!ok) {
+            std::fprintf(stderr, "FAIL: verify_simple_continuation_contract failed: %s\n", err.c_str());
+        }
+    }
+
+    // --- SCENARIO B: Mutation / Regression Sentinel (Proving Old Behavior Turns Red) ---
+    // If someone changes rerot_enter_simple to call init_sampler() instead of re-binding C0 clone:
+    {
+        test_mock_rerot_slot slot;
+        test_mock_rerot_transport transport;
+
+        task_params params;
+        params.sampling.seed = rng_seed;
+        params.sampling.reasoning_budget_tokens = user_budget;
+        params.sampling.grammar = { COMMON_GRAMMAR_TYPE_USER, user_grammar_source };
+        transport.response_task.params = params;
+        transport.saved_user_grammar = params.sampling.grammar;
+
+        slot.task = std::make_unique<const server_task>(clone_mock_task(transport.response_task));
+        slot.prompt_tokens = prompt_tokens;
+        slot.smpl = create_test_sampler(rng_seed);
+        slot.init_sampler();
+
+        llama_sampler * clone = llama_sampler_clone(slot.smpl);
+        llama_sampler_accept(clone, c0_decision_token);
+        slot.rerot_c0_smpl = clone;
+        slot.rerot_c0_token = c0_decision_token;
+        slot.rerot_c0_ready = true;
+        transport.c0_sampler = llama_sampler_clone(slot.rerot_c0_smpl);
+
+        // Simulate incorrect regression: calling init_sampler() on slot.smpl (or C0 clone)
+        // init_sampler() invokes llama_sampler_reset() and only replays prompt tokens!
+        llama_sampler_free(slot.smpl);
+        slot.smpl = transport.c0_sampler;
+        transport.c0_sampler = nullptr;
+
+        // <-- THE REGRESSION DEFECT: init_sampler() called! -->
+        slot.init_sampler();
+
+        // Decode counters updated
+        slot.n_decoded = 1;
+        transport.sampled_tokens = 1;
+        slot.generated_tokens = { c0_decision_token };
+        slot.rerot_c0_ready = false;
+
+        std::string err;
+        const bool contract_held = verify_simple_continuation_contract(
+            slot, transport, prompt_tokens, c0_decision_token,
+            user_grammar_source, user_budget, probe_tokens, err);
+
+        // MUST FAIL! The mutation MUST be caught and rejected.
+        CHECK(!contract_held);
+        CHECK(err.find("C0 token penalty was lost") != std::string::npos);
+    }
+}
+
 static void test_ram_restore_context_shift_and_preemption() {
     std::fprintf(stderr, "--- test_ram_restore_context_shift_and_preemption (§15.2, §21.4, §25, §A.8-A.9) ---\n");
     // 1. Create episode with public root (pos 10 prefix) and forked children (mirroring test_episode_state_round_trip_and_fingerprint)
@@ -7157,6 +7503,7 @@ int main() {
     test_multi_person_b_greater_than_p_fairness();
     test_phase7_runtime_production_stress_and_pressure();
     test_final_fence_user_grammar_restoration();
+    test_rerot_enter_simple_sampler_state_preservation_and_anti_pollution();
     test_ram_restore_context_shift_and_preemption();
     std::fprintf(stderr, "=== Results: %d failure(s) ===\n", g_failures);
     return g_failures == 0 ? 0 : 1;

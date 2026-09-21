@@ -83,14 +83,6 @@ shared vec4 occupancy_limiter[LIMIT_OCCUPANCY_SHMEM > 0 ? LIMIT_OCCUPANCY_SHMEM 
 #endif
 
 void main() {
-    // SPIR-V has one exported entry point. RERoT uses a separately
-    // specialized pipeline whose constant-folded branch enters the indexed
-    // DDVR kernel; ordinary FA specializes RerotMode to zero.
-    if (RerotMode == 1u) {
-        rerot_main();
-        return;
-    }
-
 #if !defined(MMQ) && !defined(FLOAT16)
     // Sparse attention uses constant-folded branch to sparse_main when SparseMode == 1.
     if (SparseMode == 1u) {

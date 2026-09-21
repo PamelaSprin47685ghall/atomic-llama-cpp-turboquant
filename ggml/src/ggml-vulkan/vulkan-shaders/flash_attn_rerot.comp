@@ -1,0 +1,720 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_vote : enable
+
+#include "types.glsl"
+#include "dot_product_funcs.glsl"
+#include "flash_attn_base.glsl"
+#include "flash_attn_dequant.glsl"
+
+// Q-group views (F32). Aliased at bindings 0/1/2 exactly like the quant views
+// in flash_attn_dequant.glsl; unique block names keep them distinct.
+layout (binding = 0) readonly buffer RQ_F32   { float     rerot_q[]; };
+layout (binding = 0) readonly buffer RQV4     { vec4      rerot_qv4[]; };
+// Direct F16 views for FaTypeK/V == F16 (USE_DECODE_* false), mirroring the
+// data_kv4 / data_vv4 declarations of flash_attn.comp.
+layout (binding = 1) readonly buffer RK_F16   { float16_t rerot_k[]; };
+layout (binding = 1) readonly buffer RK_F16V4 { f16vec4   rerot_kv4[]; };
+layout (binding = 2) readonly buffer RV_F16   { float16_t rerot_v[]; };
+layout (binding = 2) readonly buffer RV_F16V4 { f16vec4   rerot_vv4[]; };
+// DDVR span descriptors: entries[2*e+0] = physical key index,
+// entries[2*e+1] = Q-group index; offsets[q]..offsets[q+1] is query q's entry
+// range (one global softmax per range).
+layout (binding = 7) readonly buffer RE_ENTRIES { int rerot_entries[]; };
+layout (binding = 8) readonly buffer RO_OFFSETS { int rerot_offsets[]; };
+
+// Push-constant overlay for rerot_main(): the SAME vk_flash_attn_push_constants
+// block (128 B, layout unchanged), reinterpreted as built by
+// ggml_vk_flash_attn_rerot(): N = n_queries, KV = n_kv_physical, ne1 = Dv,
+// ne2 = n_head_q, ne3 = n_queries, neq2 = n_head_q, nek2 = n_head_kv,
+// nev2 = n_head_v, nem1 = n_entries, nem2 = n_groups, nb01/nb02 = Q
+// group/head strides, nb11/nb12 and nb21/nb22 = K/V key/head strides in
+// ordinary units, k_num = entry-split count. max_bias/m0/m1 are unused
+// (no ALiBi/mask in the indexed op).
+
+// Horizontal sum in f32. RERoT forces f32 accumulation (the graph pins the op
+// to GGML_PREC_F32 and all quantized K/V already require it), so unlike the
+// ordinary path there is no f16acc variant to preserve.
+float rerot_hsum(vec4 a) {
+    return a.x + a.y + a.z + a.w;
+}
+
+vec4 rerot_load_k(const in uint key, const in uint dvec, const in uint k_stride, const in uint k_offset) {
+    if (USE_DECODE_K == false) {
+        return vec4(rerot_kv4[k_offset / 4u + key * k_stride / 4u + dvec]);
+    }
+    uint coord = key * k_stride * BLOCK_SIZE_K + 4u * dvec;
+    return vec4(dequantize4(coord / BLOCK_SIZE_K, coord % BLOCK_SIZE_K, k_offset, BINDING_IDX_K));
+}
+
+vec4 rerot_load_v(const in uint key, const in uint dvec, const in uint v_stride, const in uint v_offset) {
+    if (USE_DECODE_V == false) {
+        return vec4(rerot_vv4[v_offset / 4u + key * v_stride / 4u + dvec]);
+    }
+    uint coord = key * v_stride * BLOCK_SIZE_V + 4u * dvec;
+    return vec4(dequantize4(coord / BLOCK_SIZE_V, coord % BLOCK_SIZE_V, v_offset, BINDING_IDX_V));
+}
+
+// Br is the number of GQA heads sharing a staged K/V tile. Br=1 retains
+// the generic scalar path and its workgroup-wide reduction scratch.
+const uint32_t REROT_Q_WORDS = HSK / 4u + 1u;
+const uint32_t REROT_D = HSK > HSV ? HSK : HSV;
+const uint32_t REROT_KV_STRIDE = REROT_D / 4u + 1u;
+const uint32_t REROT_NUM_SUBGROUPS = SubGroupSize == 0u ? 0u : WorkGroupSize / SubGroupSize;
+const uint32_t REROT_COL_GROUPS = WorkGroupSize / D_split;
+const uint32_t REROT_GROUPED_COLS = SubGroupSize >= D_split ? SubGroupSize / D_split : 1u;
+const uint32_t REROT_HSV4_PER_THREAD = (HSV / 4u + D_split - 1u) / D_split;
+shared vec4 rerot_qf[Br * REROT_Q_WORDS];
+shared uint rerot_run_end;
+shared vec4 rerot_kvsh[SHMEM_STAGING != 0 ? Bc * REROT_KV_STRIDE : 1];
+shared float rerot_tmpsh[WorkGroupSize];
+shared vec4 rerot_tmpv4[WorkGroupSize];
+shared vec4 rerot_occlim[LIMIT_OCCUPANCY_SHMEM > 0 ? LIMIT_OCCUPANCY_SHMEM : 1];
+
+// Each D_split-lane group owns strided entry-columns. Every lane in a group
+// retains the group's scores but only its HSV/D_split output slice.
+const uint32_t REROT_MAXC = (Bc + REROT_COL_GROUPS - 1u) / REROT_COL_GROUPS;
+
+// Use -FLT_MAX/2 rather than -inf to reduce the possibility of NaNs, matching
+// the ordinary path's convention.
+const float REROT_NEG = -1.7014117e38;
+const float REROT_NAN = 0.0 / 0.0;
+
+// One subgroup owns one Q head; the whole workgroup stages each K/V tile
+// once for every head in the group. Per-head accumulators stay in registers.
+void rerot_grouped_main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint lane = gl_SubgroupInvocationID;
+    const uint local_h = gl_SubgroupID;
+    const uint S = max(p.k_num, 1u);
+    const uint q = gl_WorkGroupID.x / S;
+    const uint split = gl_WorkGroupID.x % S;
+    const uint h_base = gl_WorkGroupID.y * Br;
+    const uint h = h_base + local_h;
+    if (q >= p.N || h_base >= p.neq2) {
+        return;
+    }
+    const uint d_tid = lane % D_split;
+    const uint col_group = lane / D_split;
+    const uint col_groups = REROT_GROUPED_COLS;
+    const uint k_offset = ((h_base / (p.neq2 / p.nek2)) * p.nb12) / FaBlockBytesK;
+    const uint v_offset = ((h_base / (p.neq2 / p.nev2)) * p.nb22) / FaBlockBytesV;
+    const uint HSK4 = HSK / 4u;
+    const uint HSV4 = HSV / 4u;
+    const int off_b = rerot_offsets[q];
+    const int off_e = rerot_offsets[q + 1u];
+    bool poison = (off_b < 0 || off_e < off_b || uint(off_e) > p.nem1);
+    const uint len = (!poison && off_e > off_b) ? uint(off_e - off_b) : 0u;
+    const uint base = off_b > 0 ? uint(off_b) : 0u;
+    const uint chunk = (len + S - 1u) / S;
+    uint begin = base + split * chunk;
+    const uint end = min(base + len, base + (split + 1u) * chunk);
+
+    float L = 0.0;
+    float M = REROT_NEG;
+    vec4 O[REROT_HSV4_PER_THREAD];
+    for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+        O[di] = vec4(0.0);
+    }
+    float scores[(Bc + REROT_GROUPED_COLS - 1u) / REROT_GROUPED_COLS];
+    bool valid[(Bc + REROT_GROUPED_COLS - 1u) / REROT_GROUPED_COLS];
+    uint previous_group = 0xffffffffu;
+
+    while (begin < end) {
+        const int group_signed = rerot_entries[2u * begin + 1u];
+        const bool group_ok = (group_signed >= 0 && uint(group_signed) < p.nem2);
+        if (!group_ok) {
+            poison = true;
+        }
+        const uint group = uint(group_signed);
+        // Find the first group boundary cooperatively within this tile.
+        // There is no serial scan of the reader's entire key range.
+        if (tid == 0u) {
+            rerot_run_end = min(begin + Bc, end);
+        }
+        barrier();
+        const uint limit = min(begin + Bc, end);
+        for (uint e = begin + tid; e < limit; e += WorkGroupSize) {
+            if (uint(rerot_entries[2u * e + 1u]) != group) {
+                atomicMin(rerot_run_end, e);
+            }
+        }
+        barrier();
+        const uint tile_end = rerot_run_end;
+        if (group != previous_group && group_ok) {
+            const uint q_base = group * (p.nb01 / 4u) + (h * p.nb02) / 4u;
+            for (uint d = lane; d < HSK4; d += SubGroupSize) {
+                rerot_qf[local_h * REROT_Q_WORDS + d] =
+                    rerot_qv4[q_base + d] * p.scale;
+            }
+        }
+        previous_group = group;
+        for (uint idx = tid; idx < Bc * HSK4; idx += WorkGroupSize) {
+            const uint c = idx / HSK4;
+            const uint d = idx % HSK4;
+            vec4 value = vec4(0.0);
+            if (begin + c < tile_end && group_ok) {
+                const int key_signed = rerot_entries[2u * (begin + c)];
+                if (KV_bounds_check) {
+                    if (key_signed < 0 || uint(key_signed) >= p.KV) {
+                        poison = true;
+                    } else {
+                        value = rerot_load_k(uint(key_signed), d, p.nb11, k_offset);
+                    }
+                } else {
+                    value = rerot_load_k(uint(key_signed), d, p.nb11, k_offset);
+                }
+            }
+            rerot_kvsh[c * REROT_KV_STRIDE + d] = value;
+        }
+        barrier();
+
+        uint count = 0u;
+        float block_max = REROT_NEG;
+        for (uint c = col_group; c < Bc; c += col_groups) {
+            const uint e = begin + c;
+            bool ok = e < tile_end && group_ok;
+            if (ok && KV_bounds_check) {
+                const int k_chk = rerot_entries[2u * e];
+                if (k_chk < 0 || uint(k_chk) >= p.KV) {
+                    poison = true;
+                    ok = false;
+                }
+            }
+            float score = REROT_NEG;
+            if (ok) {
+                vec4 dot = vec4(0.0);
+                for (uint d = d_tid; d < HSK4; d += D_split) {
+                    dot = fma(
+                        rerot_qf[local_h * REROT_Q_WORDS + d],
+                        rerot_kvsh[c * REROT_KV_STRIDE + d], dot);
+                }
+                score = rerot_hsum(dot);
+                for (uint st = 1u; st < D_split; st <<= 1u) {
+                    score += subgroupShuffleXor(score, st);
+                }
+                if (LOGIT_SOFTCAP) {
+                    score = p.logit_softcap * tanh(score);
+                }
+                if (isnan(score)) {
+                    poison = true;
+                }
+            }
+            scores[count] = score;
+            valid[count++] = ok;
+            block_max = max(block_max, score);
+        }
+        for (uint st = 1u; st < SubGroupSize; st <<= 1u) {
+            block_max = max(block_max, subgroupShuffleXor(block_max, st));
+        }
+        const float next_max = max(M, block_max);
+        const float rescale = exp(M - next_max);
+        M = next_max;
+        L *= rescale;
+        for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+            O[di] *= rescale;
+        }
+
+        barrier();
+        for (uint idx = tid; idx < Bc * HSV4; idx += WorkGroupSize) {
+            const uint c = idx / HSV4;
+            const uint d = idx % HSV4;
+            vec4 value = vec4(0.0);
+            if (begin + c < tile_end && group_ok) {
+                const int key_signed = rerot_entries[2u * (begin + c)];
+                if (KV_bounds_check) {
+                    if (key_signed < 0 || uint(key_signed) >= p.KV) {
+                        poison = true;
+                    } else {
+                        value = rerot_load_v(uint(key_signed), d, p.nb21, v_offset);
+                    }
+                } else {
+                    value = rerot_load_v(uint(key_signed), d, p.nb21, v_offset);
+                }
+            }
+            rerot_kvsh[c * REROT_KV_STRIDE + d] = value;
+        }
+        barrier();
+        count = 0u;
+        for (uint c = col_group; c < Bc; c += col_groups) {
+            const float weight = valid[count] ? exp(scores[count] - M) : 0.0;
+            ++count;
+            if (d_tid == 0u) {
+                L += weight;
+            }
+            for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+                const uint d = di * D_split + d_tid;
+                if (d < HSV4) {
+                    O[di] = fma(vec4(weight),
+                        rerot_kvsh[c * REROT_KV_STRIDE + d], O[di]);
+                }
+            }
+        }
+        barrier();
+        begin = tile_end;
+    }
+
+    // Poison must enter the cross-lane reduction: key-OOB / NaN scores are
+    // detected by only some lanes, and NaN through the shuffle adds makes the
+    // whole row NaN on every lane (matching the CPU reference's poisoned row).
+    if (poison) {
+        L = REROT_NAN;
+        M = REROT_NAN;
+        for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+            O[di] = vec4(REROT_NAN);
+        }
+    }
+    for (uint st = 1u; st < SubGroupSize; st <<= 1u) {
+        L += subgroupShuffleXor(L, st);
+    }
+    for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+        for (uint st = D_split; st < SubGroupSize; st <<= 1u) {
+            O[di] += subgroupShuffleXor(O[di], st);
+        }
+    }
+    // Count the sink once, in split zero, and include its maximum in the
+    // ordinary split-K reduction state.
+    if (split == 0u && (p.mask_n_head_log2 & SINK_ENABLE_BIT) != 0u) {
+        const float sink = float(data_s[h]);
+        const float next_max = max(M, sink);
+        const float rescale = exp(M - next_max);
+        L = L * rescale + exp(sink - next_max);
+        for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+            O[di] *= rescale;
+        }
+        M = next_max;
+    }
+    const uint flat_row = h + p.ne2 * q;
+    const uint n_flat = p.ne2 * p.N;
+    const uint out_base = S == 1u ? flat_row * HSV4 : (n_flat * split + flat_row) * HSV4;
+    const float normalization = S == 1u ? (L != 0.0 ? 1.0 / L : 0.0) : 1.0;
+    if (col_group == 0u) {
+        for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+            const uint d = di * D_split + d_tid;
+            if (d < HSV4) {
+                data_ov4[out_base + d] = D_TYPEV4(O[di] * normalization);
+            }
+        }
+    }
+    if (S > 1u && lane == 0u) {
+        const uint lm_base = HSV * n_flat * S + 2u * n_flat * split + flat_row;
+        data_o[lm_base] = D_TYPE(L);
+        data_o[lm_base + n_flat] = D_TYPE(M);
+    }
+}
+
+void rerot_main() {
+    if (RerotMode != 1u) {
+        return;
+    }
+#ifdef NEEDS_INIT_IQ_SHMEM
+    if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
+        init_iq_shmem(gl_WorkGroupSize);
+    }
+#endif
+
+    if (Br > 1u) {
+        rerot_grouped_main();
+        return;
+    }
+
+    const uint tid = gl_LocalInvocationIndex;
+    const uint WGS = gl_WorkGroupSize.x;
+    const uint d_tid = tid % D_split;
+    const uint col_group = tid / D_split;
+
+    if (LIMIT_OCCUPANCY_SHMEM > 0) {
+        // Same occupancy-throttle idiom as the ordinary path.
+        rerot_occlim[tid] = vec4(float(tid));
+
+        barrier();
+
+        if (rerot_occlim[tid] == vec4(99999.0)) {
+            data_ov4[0] = D_TYPEV4(rerot_occlim[tid]);
+        }
+    }
+
+    // Grid: x = n_queries * n_splits, y = n_head_q, z = 1 (Br = 1: one query
+    // row per workgroup; heads are unfolded, GQA maps h -> kv head below).
+    const uint S = p.k_num > 0u ? p.k_num : 1u;
+    const uint q = gl_WorkGroupID.x / S;
+    const uint s = gl_WorkGroupID.x % S;
+    const uint h = gl_WorkGroupID.y;
+    if (q >= p.N || h >= p.neq2) {
+        return;
+    }
+
+    uint kh, vh;
+    if ((p.mask_n_head_log2 & TP5_HEADMAP_FLAG) != 0u) {
+        // Same explicit TP5 Q->KV mapping contract as ordinary FA. Mapped
+        // RERoT is dispatched with Br=1, so no workgroup assumes several
+        // adjacent Q heads share one KV tile.
+        kh = tp5_headmap_entry(h);
+        vh = kh;
+    } else {
+        const uint gqa_div = (p.nek2 > 0u) ? (p.neq2 / p.nek2) : 1u;
+        const uint vdiv    = (p.nev2 > 0u) ? (p.neq2 / p.nev2) : 1u;
+        kh = (gqa_div > 0u) ? (h / gqa_div) : h;
+        vh = (vdiv    > 0u) ? (h / vdiv)    : h;
+    }
+
+    // This query's global entry range, split across entry-splits. Splits of an
+    // empty range stay empty; their partials (L = 0) are identity elements for
+    // the split-K reduce.
+    const int off_b = rerot_offsets[q];
+    const int off_e = rerot_offsets[q + 1u];
+    bool poison = (off_b < 0 || off_e < off_b || uint(off_e) > p.nem1);
+    const uint len = (!poison && off_e > off_b) ? uint(off_e - off_b) : 0u;
+    const uint base = off_b > 0 ? uint(off_b) : 0u;
+    const uint chunk = (len + S - 1u) / S;
+    const uint start = base + s * chunk;
+    const uint stop  = min(base + len, base + (s + 1u) * chunk);
+
+    const uint k_stride = p.nb11;
+    const uint v_stride = p.nb21;
+    const uint k_offset = (kh * p.nb12) / FaBlockBytesK;
+    const uint v_offset = (vh * p.nb22) / FaBlockBytesV;
+    const uint q_grp_stride = p.nb01 / 4u;
+    const uint HSK4 = HSK / 4u;
+    const uint HSV4 = HSV / 4u;
+
+    float Lf = 0.0;
+    float Mf = REROT_NEG;
+    vec4 Of[REROT_HSV4_PER_THREAD];
+    for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+        Of[di] = vec4(0.0);
+    }
+
+    float scol[REROT_MAXC];
+    bool  cvalid[REROT_MAXC];
+
+    uint run_b = start;
+    while (run_b < stop) {
+        const int g_signed = rerot_entries[2u * run_b + 1u];
+        const bool run_ok = (g_signed >= 0 && uint(g_signed) < p.nem2);
+        if (!run_ok) {
+            poison = true;
+        }
+        const uint g = uint(g_signed);
+
+        uint run_e = run_b + 1u;
+        while (run_e < stop && uint(rerot_entries[2u * run_e + 1u]) == g) {
+            ++run_e;
+        }
+
+        if (run_ok) {
+            const uint q_base = g * q_grp_stride + (h * p.nb02) / 4u;
+            for (uint d = tid; d < HSK4; d += WGS) {
+                rerot_qf[d] = rerot_qv4[q_base + d] * p.scale;
+            }
+        }
+        barrier();
+
+        for (uint b = run_b; b < run_e; b += Bc) {
+            const uint b_end = min(b + Bc, run_e);
+
+            if (SHMEM_STAGING != 0) {
+                barrier();
+                for (uint idx = tid; idx < Bc * HSK4; idx += WGS) {
+                    const uint c = idx / HSK4;
+                    const uint d = idx % HSK4;
+                    const uint e = b + c;
+                    vec4 Kv = vec4(0.0);
+                    if (e < b_end && run_ok) {
+                        const int key_signed = rerot_entries[2u * e];
+                        if (KV_bounds_check) {
+                            if (key_signed < 0 || uint(key_signed) >= p.KV) {
+                                poison = true;
+                            } else {
+                                Kv = rerot_load_k(uint(key_signed), d, k_stride, k_offset);
+                            }
+                        } else {
+                            Kv = rerot_load_k(uint(key_signed), d, k_stride, k_offset);
+                        }
+                    }
+                    rerot_kvsh[c * REROT_KV_STRIDE + d] = Kv;
+                }
+                barrier();
+            }
+
+            // D_split lanes cooperate on each strided-owned column. This keeps
+            // each lane's K dot and V accumulator slice small enough to stay
+            // in registers at the 256-dimensional production head size.
+            uint ncol = 0u;
+            for (uint c = col_group; c < Bc; c += REROT_COL_GROUPS) {
+                const uint e = b + c;
+                float sc = REROT_NEG;
+                bool ok = false;
+                if (e < b_end && run_ok) {
+                    const int key_signed = rerot_entries[2u * e];
+                    if (KV_bounds_check && (key_signed < 0 || uint(key_signed) >= p.KV)) {
+                        poison = true;
+                    } else {
+                        const uint key = uint(key_signed);
+                        vec4 acc = vec4(0.0);
+                        if (SHMEM_STAGING != 0) {
+                            for (uint d = d_tid; d < HSK4; d += D_split) {
+                                acc = fma(rerot_qf[d], rerot_kvsh[c * REROT_KV_STRIDE + d], acc);
+                            }
+                        } else {
+                            for (uint d = d_tid; d < HSK4; d += D_split) {
+                                acc = fma(rerot_qf[d], rerot_load_k(key, d, k_stride, k_offset), acc);
+                            }
+                        }
+                        sc = rerot_hsum(acc);
+                        if (SubGroupSize > 0u) {
+                            for (uint st = 1u; st < D_split; st <<= 1u) {
+                                sc += subgroupShuffleXor(sc, st);
+                            }
+                        }
+                        if (LOGIT_SOFTCAP) {
+                            sc = p.logit_softcap * tanh(sc);
+                        }
+                        if (isnan(sc)) {
+                            poison = true;
+                        }
+                        ok = true;
+                    }
+                }
+                scol[ncol] = sc;
+                cvalid[ncol] = ok;
+                ++ncol;
+            }
+
+            // Block max across threads. Subgroups collapse each wave first,
+            // leaving only one shared value per subgroup; devices that
+            // disable subgroups retain the full shared-memory tree.
+            float local_max = REROT_NEG;
+            for (uint t = 0u; t < ncol; ++t) {
+                local_max = max(local_max, scol[t]);
+            }
+            float bmax = REROT_NEG;
+            if (SubGroupSize > 0u) {
+                for (uint st = 1u; st < SubGroupSize; st <<= 1u) {
+                    local_max = max(local_max, subgroupShuffleXor(local_max, st));
+                }
+                barrier();
+                if (gl_SubgroupInvocationID == 0u) {
+                    rerot_tmpsh[gl_SubgroupID] = local_max;
+                }
+                barrier();
+                bmax = rerot_tmpsh[0];
+                for (uint sg = 1u; sg < REROT_NUM_SUBGROUPS; ++sg) {
+                    bmax = max(bmax, rerot_tmpsh[sg]);
+                }
+            } else {
+                barrier();
+                rerot_tmpsh[tid] = local_max;
+                barrier();
+                for (uint st = WGS / 2u; st > 0u; st >>= 1u) {
+                    if (tid < st) {
+                        rerot_tmpsh[tid] = max(rerot_tmpsh[tid], rerot_tmpsh[tid + st]);
+                    }
+                    barrier();
+                }
+                bmax = rerot_tmpsh[0];
+            }
+            const float Mold = Mf;
+            Mf = max(bmax, Mold);
+            const float eM = exp(Mold - Mf);
+            Lf *= eM;
+            for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+                Of[di] *= eM;
+            }
+
+            if (SHMEM_STAGING != 0) {
+                barrier();
+                for (uint idx = tid; idx < Bc * HSV4; idx += WGS) {
+                    const uint c = idx / HSV4;
+                    const uint d = idx % HSV4;
+                    const uint e = b + c;
+                    vec4 Vv = vec4(0.0);
+                    if (e < b_end && run_ok) {
+                        const int key_signed = rerot_entries[2u * e];
+                        if (KV_bounds_check) {
+                            if (key_signed < 0 || uint(key_signed) >= p.KV) {
+                                poison = true;
+                            } else {
+                                Vv = rerot_load_v(uint(key_signed), d, v_stride, v_offset);
+                            }
+                        } else {
+                            Vv = rerot_load_v(uint(key_signed), d, v_stride, v_offset);
+                        }
+                    }
+                    rerot_kvsh[c * REROT_KV_STRIDE + d] = Vv;
+                }
+                barrier();
+            }
+
+            uint t = 0u;
+            for (uint c = col_group; c < Bc; c += REROT_COL_GROUPS) {
+                const uint e = b + c;
+                const float Pw = cvalid[t] ? exp(scol[t] - Mf) : 0.0;
+                ++t;
+                if (d_tid == 0u) {
+                    Lf += Pw;
+                }
+                const vec4 Pwv = vec4(Pw);
+                for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+                    const uint d = di * D_split + d_tid;
+                    if (d >= HSV4) {
+                        continue;
+                    }
+                    vec4 Vv;
+                    if (SHMEM_STAGING != 0) {
+                        Vv = rerot_kvsh[c * REROT_KV_STRIDE + d];
+                    } else {
+                        Vv = vec4(0.0);
+                        if (e < b_end && run_ok) {
+                            const int key_signed = rerot_entries[2u * e];
+                            if (KV_bounds_check) {
+                                if (key_signed < 0 || uint(key_signed) >= p.KV) {
+                                    poison = true;
+                                } else {
+                                    Vv = rerot_load_v(uint(key_signed), d, v_stride, v_offset);
+                                }
+                            } else {
+                                Vv = rerot_load_v(uint(key_signed), d, v_stride, v_offset);
+                            }
+                        }
+                    }
+                    Of[di] = fma(Pwv, Vv, Of[di]);
+                }
+            }
+        }
+
+        barrier();
+        run_b = run_e;
+    }
+
+    // Poison must enter the cross-lane reduction: key-OOB / NaN scores are
+    // detected by only some lanes, and NaN through the shuffle/shared adds
+    // makes the whole row NaN on every lane (CPU reference poisons the row).
+    if (poison) {
+        Lf = REROT_NAN;
+        Mf = REROT_NAN;
+        for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+            Of[di] = vec4(REROT_NAN);
+        }
+    }
+    // Every block max was workgroup-wide, so Mf is already identical across
+    // threads. Reduce only the disjoint L/O column partials.
+    if (SubGroupSize > 0u) {
+        for (uint st = 1u; st < SubGroupSize; st <<= 1u) {
+            Lf += subgroupShuffleXor(Lf, st);
+        }
+        barrier();
+        if (gl_SubgroupInvocationID == 0u) {
+            rerot_tmpsh[gl_SubgroupID] = Lf;
+        }
+        barrier();
+        Lf = rerot_tmpsh[0];
+        for (uint sg = 1u; sg < REROT_NUM_SUBGROUPS; ++sg) {
+            Lf += rerot_tmpsh[sg];
+        }
+
+        for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+            for (uint st = D_split; st < SubGroupSize; st <<= 1u) {
+                Of[di] += subgroupShuffleXor(Of[di], st);
+            }
+            barrier();
+            if (gl_SubgroupInvocationID == d_tid) {
+                rerot_tmpv4[gl_SubgroupID * D_split + d_tid] = Of[di];
+            }
+            barrier();
+            Of[di] = rerot_tmpv4[d_tid];
+            for (uint sg = 1u; sg < REROT_NUM_SUBGROUPS; ++sg) {
+                Of[di] += rerot_tmpv4[sg * D_split + d_tid];
+            }
+        }
+    } else {
+        barrier();
+        rerot_tmpsh[tid] = Lf;
+        barrier();
+        for (uint st = WGS / 2u; st > 0u; st >>= 1u) {
+            if (tid < st) {
+                rerot_tmpsh[tid] += rerot_tmpsh[tid + st];
+            }
+            barrier();
+        }
+        Lf = rerot_tmpsh[0];
+
+        for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+            barrier();
+            rerot_tmpv4[tid] = Of[di];
+            barrier();
+            for (uint st = WGS / 2u; st > 0u; st >>= 1u) {
+                if (tid < st) {
+                    rerot_tmpv4[tid] += rerot_tmpv4[tid + st];
+                }
+                barrier();
+            }
+            Of[di] = rerot_tmpv4[0];
+        }
+    }
+
+    if (S == 1u && (p.mask_n_head_log2 & SINK_ENABLE_BIT) != 0u) {
+        // Sink handling mirrors the ordinary path (split-K + sinks forces the
+        // single-split path host-side, so the reduce never sees sinks).
+        const float sink = float(data_s[h]);
+        float ms = 1.0f;
+        float vs = 1.0f;
+        if (sink > Mf) {
+            ms = exp(Mf - sink);
+            for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+                Of[di] *= ms;
+            }
+        } else {
+            vs = exp(sink - Mf);
+        }
+        Lf = Lf * ms + vs;
+    }
+
+    // Empty ranges (Lf == 0) yield zeros, matching the CPU reference.
+    const float rcp = (Lf != 0.0f) ? (1.0f / Lf) : 0.0f;
+
+    if (S == 1u) {
+        // Contiguous dst [Dv, n_head_q, n_queries] (asserted host-side).
+        const uint o_base = ((q * p.ne2) + h) * HSV4;
+        if (col_group == 0u) {
+            for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+                const uint d = di * D_split + d_tid;
+                if (d < HSV4) {
+                    data_ov4[o_base + d] = D_TYPEV4(Of[di] * rcp);
+                }
+            }
+        }
+        return;
+    }
+
+    // Entry-split partials in flash_attn_split_k_reduce layout with flattened
+    // rows n = h + n_head_q * q (ne1 = n_queries * n_head_q, ne2 = ne3 = 1).
+    const uint Nflat = p.ne2 * p.N;
+    const uint n = h + p.ne2 * q;
+    const uint o_base = HSV * Nflat * s + HSV * n;
+    if (col_group == 0u) {
+        for (uint di = 0u; di < REROT_HSV4_PER_THREAD; ++di) {
+            const uint d = di * D_split + d_tid;
+            if (d < HSV4) {
+                data_ov4[o_base / 4u + d] = D_TYPEV4(Of[di]);
+            }
+        }
+    }
+    if (tid == 0u) {
+        const uint lm_base = HSV * Nflat * S + 2u * Nflat * s + n;
+        data_o[lm_base] = D_TYPE(Lf);
+        data_o[lm_base + Nflat] = D_TYPE(Mf);
+    }
+}
+
+void main() {
+    rerot_main();
+}

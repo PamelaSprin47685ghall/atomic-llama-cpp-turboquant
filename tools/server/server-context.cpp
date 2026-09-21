@@ -1672,6 +1672,15 @@ private:
         // re-tokenization, which would risk boundary mismatches.
         std::unordered_map<llama_rerot_node_id, llama_tokens> source_end_token_ids;
         std::unordered_map<llama_rerot_node_id, llama_tokens> source_end_candidate_stage;
+        int64_t t_probe_start_us = 0;
+        double probe_seconds = 0.0;
+        double prefix_rebuild_seconds = 0.0;
+        uint64_t ordinary_prompt_tokens = 0;
+        uint64_t dag_lcp_tokens = 0;
+        uint64_t replay_from_tokens = 0;
+        uint64_t actual_replayed_tokens = 0;
+        double fixed_entry_seconds = 0.0;
+        double synthesis_switch_seconds = 0.0;
 
         explicit rerot_transport_state(server_task && task)
             : response_task(std::move(task)) {
@@ -2343,6 +2352,7 @@ private:
         if (lcp == ordinary_n) {
             return true; // suffix-only fast path: memory already holds C0
         }
+        const int64_t t_prefix_start_us = ggml_time_us();
         // Ensure all asynchronously scheduled compute or transfer commands on this context
         // are fully retired on the GPU before issuing destructive memory resets.
         // A race between an in-flight compute kernel and an immediate host clear/write
@@ -2372,17 +2382,11 @@ private:
             return false;
         }
         slot.prompt.tokens.keep_first(base);
-        {
-            // The root lineage tape is transport-owned (runtime never sees
-            // it): truncate it alongside the slot tape so no stale ordinary
-            // suffix survives the rebuild. finish_plan_prefix overwrites it
-            // with the replayed tape afterwards.
-            auto transport_it = rerot_transport.find(episode_id);
-            if (transport_it != rerot_transport.end()) {
-                auto lineage_it = transport_it->second->lineage_tokens.find(0);
-                if (lineage_it != transport_it->second->lineage_tokens.end()) {
-                    lineage_it->second.keep_first(base);
-                }
+        auto transport_it = rerot_transport.find(episode_id);
+        if (transport_it != rerot_transport.end()) {
+            auto lineage_it = transport_it->second->lineage_tokens.find(0);
+            if (lineage_it != transport_it->second->lineage_tokens.end()) {
+                lineage_it->second.keep_first(base);
             }
         }
         std::string prep_err;
@@ -2393,8 +2397,24 @@ private:
                     (prep_err.empty() ? std::string() : ": " + prep_err));
             return false;
         }
+        const size_t actual_replayed = dag_tokens.size() > base ? (dag_tokens.size() - base) : 0;
         SRV_INF("RERoT DAG prefix rebuild: episode=%" PRIu64 " ordinary=%zu lcp=%zu dag=%zu replay_from=%zu\n",
             episode_id, ordinary_n, lcp, dag_tokens.size(), base);
+        const int64_t prefix_dur_us = ggml_time_us() - t_prefix_start_us;
+        const double prefix_dur_s = (double) prefix_dur_us / 1.0e6;
+        rerot_metrics.prefix_rebuild_seconds += prefix_dur_s;
+        ++rerot_metrics.prefix_rebuild_count;
+        rerot_metrics.ordinary_prompt_tokens += ordinary_n;
+        rerot_metrics.dag_lcp_tokens += lcp;
+        rerot_metrics.replay_from_tokens += base;
+        rerot_metrics.actual_replayed_tokens += actual_replayed;
+        if (transport_it != rerot_transport.end()) {
+            transport_it->second->prefix_rebuild_seconds += prefix_dur_s;
+            transport_it->second->ordinary_prompt_tokens = ordinary_n;
+            transport_it->second->dag_lcp_tokens = lcp;
+            transport_it->second->replay_from_tokens = base;
+            transport_it->second->actual_replayed_tokens = actual_replayed;
+        }
         return true;
     }
 
@@ -2769,6 +2789,12 @@ private:
         }
         episode->probing = true;
         episode->strategy_decided = false;
+        {
+            auto transport_it = rerot_transport.find(episode_id);
+            if (transport_it != rerot_transport.end()) {
+                transport_it->second->t_probe_start_us = ggml_time_us();
+            }
+        }
         if (!rerot->arm_isolated_probe(episode_id, slot.id)) {
             rerot->hard_abort(episode_id, "rerot_resource_exhausted: isolated probe sequence unavailable");
             rerot_propagate_hard_abort();
@@ -3045,8 +3071,16 @@ private:
                 }
             }
         }
+        const int64_t t_entry_start_us = ggml_time_us();
         const llama_tokens native_probe = rerot_native_fixed_entry_tokens(
             slot, "1", "handoff", false, tags.second, tags.first);
+        const int64_t entry_dur_us = ggml_time_us() - t_entry_start_us;
+        const double entry_dur_s = (double) entry_dur_us / 1.0e6;
+        rerot_metrics.fixed_entry_seconds += entry_dur_s;
+        ++rerot_metrics.fixed_entry_count;
+        if (transport_it != rerot_transport.end()) {
+            transport_it->second->fixed_entry_seconds += entry_dur_s;
+        }
         if (native_probe.empty()) {
             rerot->hard_abort(
                 episode_id,
@@ -3125,14 +3159,28 @@ private:
         if (!decision.error.empty()) {
             return true;
         }
+        const uint64_t probe_ep_id = slot.rerot_episode_id;
+        auto probe_transport_it = rerot_transport.find(probe_ep_id);
+        const int64_t t_probe_start_us = probe_transport_it != rerot_transport.end() ? probe_transport_it->second->t_probe_start_us : 0;
+        bool probe_ok = false;
         if (decision.is_simple()) {
-            return rerot_enter_simple(slot, slot.rerot_episode_id);
+            probe_ok = rerot_enter_simple(slot, slot.rerot_episode_id);
+        } else if (decision.is_dag()) {
+            probe_ok = rerot_enter_dag(slot, slot.rerot_episode_id, decision);
+        } else {
+            rerot->hard_abort(slot.rerot_episode_id, "rerot_protocol_error: routing probe produced an invalid strategy");
+            return false;
         }
-        if (decision.is_dag()) {
-            return rerot_enter_dag(slot, slot.rerot_episode_id, decision);
+        if (probe_ok && t_probe_start_us > 0) {
+            const int64_t probe_dur_us = ggml_time_us() - t_probe_start_us;
+            const double probe_dur_s = (double) probe_dur_us / 1.0e6;
+            rerot_metrics.probe_seconds += probe_dur_s;
+            ++rerot_metrics.probe_count;
+            if (probe_transport_it != rerot_transport.end()) {
+                probe_transport_it->second->probe_seconds += probe_dur_s;
+            }
         }
-        rerot->hard_abort(slot.rerot_episode_id, "rerot_protocol_error: routing probe produced an invalid strategy");
-        return false;
+        return probe_ok;
     }
 
 
@@ -3714,6 +3762,7 @@ private:
                 const auto pending = rerot->dag_step_next_pending(episode_id);
                 if (pending.has_value()) {
                     const llama_rerot_node_id nid = *pending;
+                    const bool is_synth = (nid == episode->synthesis_node);
                     if (episode->suspended.count(nid) != 0) {
                         if (!rerot->resume_pen(episode_id, nid, free_slot->id, free_slot->id) ||
                             !rerot_prepare_child_slot(episode_id, nid, *free_slot)) {
@@ -3725,6 +3774,17 @@ private:
                                !rerot_prepare_child_slot(episode_id, nid, *free_slot)) {
                         rerot->hard_abort(episode_id, "rerot_state_error: child admission failed");
                         return false;
+                    }
+                    if (is_synth) {
+                        const int64_t start_us = episode->t_synthesis_eligible_us > 0 ? episode->t_synthesis_eligible_us : ggml_time_us();
+                        const int64_t dur_us = std::max<int64_t>(0, ggml_time_us() - start_us);
+                        const double dur_s = (double) dur_us / 1.0e6;
+                        rerot_metrics.synthesis_switch_seconds += dur_s;
+                        ++rerot_metrics.synthesis_switch_count;
+                        auto transport_it = rerot_transport.find(episode_id);
+                        if (transport_it != rerot_transport.end()) {
+                            transport_it->second->synthesis_switch_seconds += dur_s;
+                        }
                     }
                     continue;
                 }
@@ -3742,6 +3802,17 @@ private:
                     !rerot_prepare_child_slot(episode_id, admitted, *free_slot)) {
                     rerot->hard_abort(episode_id, "rerot_state_error: child admission failed");
                     return false;
+                }
+                if (admitted == episode->synthesis_node) {
+                    const int64_t start_us = episode->t_synthesis_eligible_us > 0 ? episode->t_synthesis_eligible_us : ggml_time_us();
+                    const int64_t dur_us = std::max<int64_t>(0, ggml_time_us() - start_us);
+                    const double dur_s = (double) dur_us / 1.0e6;
+                    rerot_metrics.synthesis_switch_seconds += dur_s;
+                    ++rerot_metrics.synthesis_switch_count;
+                    auto transport_it = rerot_transport.find(episode_id);
+                    if (transport_it != rerot_transport.end()) {
+                        transport_it->second->synthesis_switch_seconds += dur_s;
+                    }
                 }
                 continue;
             }
@@ -6953,6 +7024,17 @@ private:
                 res->rerot_frame_tokens = episode->frame_tokens;
                 res->rerot_source_end_tokens = episode->source_end_tokens;
             }
+            auto transport_it = rerot_transport.find(slot.rerot_episode_id);
+            if (transport_it != rerot_transport.end()) {
+                res->rerot_probe_seconds = transport_it->second->probe_seconds;
+                res->rerot_prefix_rebuild_seconds = transport_it->second->prefix_rebuild_seconds;
+                res->rerot_ordinary_prompt_tokens = transport_it->second->ordinary_prompt_tokens;
+                res->rerot_dag_lcp_tokens = transport_it->second->dag_lcp_tokens;
+                res->rerot_replay_from_tokens = transport_it->second->replay_from_tokens;
+                res->rerot_actual_replayed_tokens = transport_it->second->actual_replayed_tokens;
+                res->rerot_fixed_entry_seconds = transport_it->second->fixed_entry_seconds;
+                res->rerot_synthesis_switch_seconds = transport_it->second->synthesis_switch_seconds;
+            }
         }
 
         queue_results.send(std::move(res));
@@ -9424,8 +9506,8 @@ private:
             }
         });
 
+        bool rerot_capture_needed = false;
         if (rerot_ok) {
-            bool rerot_capture_needed = false;
             iterate(slots, [&](server_slot & slot) {
                 rerot_capture_needed |=
                     slot.rerot_internal &&
@@ -9434,7 +9516,13 @@ private:
                     slot.i_batch >= off && slot.i_batch < off + n_batch_tokens;
             });
             if (rerot_capture_needed) {
+                const int64_t t0 = ggml_time_us();
                 llama_synchronize(ctx_tgt);
+                const int64_t dur_us = ggml_time_us() - t0;
+                rerot_metrics.sync_capture_us += dur_us;
+                ++rerot_metrics.sync_capture_count;
+                rerot_metrics.sync_capture_with_work_us += dur_us;
+                ++rerot_metrics.sync_capture_with_work_count;
             }
             iterate(slots, [&](server_slot & slot) {
                 if (!rerot_capture_pending_decision(slot, off, n_batch_tokens)) {
@@ -9466,7 +9554,19 @@ private:
                         server_rerot_injection_kind::none;
             });
             if (rerot_needs_sample) {
+                const bool had_new_gpu_work = !rerot_capture_needed;
+                const int64_t t0 = ggml_time_us();
                 llama_synchronize(ctx_tgt);
+                const int64_t dur_us = ggml_time_us() - t0;
+                rerot_metrics.sync_sample_us += dur_us;
+                ++rerot_metrics.sync_sample_count;
+                if (had_new_gpu_work) {
+                    rerot_metrics.sync_sample_with_work_us += dur_us;
+                    ++rerot_metrics.sync_sample_with_work_count;
+                } else {
+                    rerot_metrics.sync_sample_no_work_us += dur_us;
+                    ++rerot_metrics.sync_sample_no_work_count;
+                }
             }
 
             std::string rerot_trace_batch;
@@ -10578,6 +10678,28 @@ void server_routes::init_routes() {
             emit_rerot("counter", "rerot_parked_total", "RERoT recurrent lineages parked.", r.parked_total);
             emit_rerot("counter", "rerot_archive_total", "RERoT public runs archived.", r.archive_total);
             emit_rerot("counter", "rerot_ddvr_seconds", "Wall time spent building RERoT DDVR views.", r.ddvr_seconds);
+
+            emit_rerot("counter", "rerot_probe_seconds", "Wall time spent in RERoT isolated routing probe.", r.probe_seconds);
+            emit_rerot("counter", "rerot_probe_count", "Total RERoT isolated routing probe executions.", r.probe_count);
+            emit_rerot("counter", "rerot_prefix_rebuild_seconds", "Wall time spent in RERoT DAG prefix rebuild.", r.prefix_rebuild_seconds);
+            emit_rerot("counter", "rerot_prefix_rebuild_count", "Total RERoT DAG prefix rebuild executions.", r.prefix_rebuild_count);
+            emit_rerot("counter", "rerot_ordinary_prompt_tokens", "Cumulative ordinary prompt tokens before RERoT DAG prefix rebuild.", r.ordinary_prompt_tokens);
+            emit_rerot("counter", "rerot_dag_lcp_tokens", "Cumulative token LCP between ordinary prompt and DAG template in RERoT rebuild.", r.dag_lcp_tokens);
+            emit_rerot("counter", "rerot_replay_from_tokens", "Cumulative rebuild replay starting positions in RERoT prefix rebuild.", r.replay_from_tokens);
+            emit_rerot("counter", "rerot_actual_replayed_tokens", "Cumulative tokens actually replayed during RERoT DAG prefix rebuild.", r.actual_replayed_tokens);
+            emit_rerot("counter", "rerot_fixed_entry_seconds", "Wall time spent rendering RERoT fixed entry templates.", r.fixed_entry_seconds);
+            emit_rerot("counter", "rerot_fixed_entry_count", "Total RERoT fixed entry template renders.", r.fixed_entry_count);
+            emit_rerot("counter", "rerot_synthesis_switch_seconds", "Wall time spent switching and admitting DAG synthesis.", r.synthesis_switch_seconds);
+            emit_rerot("counter", "rerot_synthesis_switch_count", "Total DAG synthesis transitions executed.", r.synthesis_switch_count);
+
+            emit_rerot("counter", "rerot_sync_capture_us", "GPU synchronization duration at post-decode decision capture.", r.sync_capture_us);
+            emit_rerot("counter", "rerot_sync_capture_count", "Total GPU synchronizations at post-decode decision capture.", r.sync_capture_count);
+            emit_rerot("counter", "rerot_sync_sample_us", "GPU synchronization duration at post-decode sampling.", r.sync_sample_us);
+            emit_rerot("counter", "rerot_sync_sample_count", "Total GPU synchronizations at post-decode sampling.", r.sync_sample_count);
+            emit_rerot("counter", "rerot_sync_sample_no_work_us", "GPU synchronization duration at sampling where no new GPU work was submitted since last sync (redundant wait).", r.sync_sample_no_work_us);
+            emit_rerot("counter", "rerot_sync_sample_no_work_count", "Total GPU synchronizations at sampling without new GPU work since last sync.", r.sync_sample_no_work_count);
+            emit_rerot("counter", "rerot_sync_sample_with_work_us", "GPU synchronization duration at sampling with un-synchronized GPU work.", r.sync_sample_with_work_us);
+            emit_rerot("counter", "rerot_sync_sample_with_work_count", "Total GPU synchronizations at sampling with un-synchronized GPU work.", r.sync_sample_with_work_count);
 
             emit_rerot("gauge", "rerot_people_capacity", "Maximum concurrent people / independent brains (B).", r.people_capacity);
             emit_rerot("gauge", "rerot_people_resident", "Currently resident people / independent brains.", r.people_resident);

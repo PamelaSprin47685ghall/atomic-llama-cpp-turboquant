@@ -221,7 +221,18 @@ bool server_rerot_metrics::empty() const {
         && pens_capacity == 0 && pens_allocated == 0 && pens_running == 0 && pens_suspended == 0
         && pen_queue_depth == 0 && pens_per_person_max_observed == 0 && pen_utilization == 0.0
         && batch_people == 0 && batch_pens == 0 && frontier_rows == 0
-        && brain_bytes == 0 && hand_bytes == 0 && grouped_scratch_bytes == 0;
+        && brain_bytes == 0 && hand_bytes == 0 && grouped_scratch_bytes == 0
+        && probe_seconds == 0.0 && probe_count == 0
+        && prefix_rebuild_seconds == 0.0 && prefix_rebuild_count == 0
+        && ordinary_prompt_tokens == 0 && dag_lcp_tokens == 0
+        && replay_from_tokens == 0 && actual_replayed_tokens == 0
+        && fixed_entry_seconds == 0.0 && fixed_entry_count == 0
+        && synthesis_switch_seconds == 0.0 && synthesis_switch_count == 0
+        && sync_capture_us == 0 && sync_capture_count == 0
+        && sync_capture_with_work_us == 0 && sync_capture_with_work_count == 0
+        && sync_sample_us == 0 && sync_sample_count == 0
+        && sync_sample_no_work_us == 0 && sync_sample_no_work_count == 0
+        && sync_sample_with_work_us == 0 && sync_sample_with_work_count == 0;
 }
 
 json server_rerot_metrics::to_json() const {
@@ -278,6 +289,30 @@ json server_rerot_metrics::to_json() const {
         { "rerot_brain_bytes",         brain_bytes },
         { "rerot_hand_bytes",          hand_bytes },
         { "rerot_grouped_scratch_bytes", grouped_scratch_bytes },
+
+        { "rerot_probe_seconds",            probe_seconds },
+        { "rerot_probe_count",              probe_count },
+        { "rerot_prefix_rebuild_seconds",   prefix_rebuild_seconds },
+        { "rerot_prefix_rebuild_count",     prefix_rebuild_count },
+        { "rerot_ordinary_prompt_tokens",   ordinary_prompt_tokens },
+        { "rerot_dag_lcp_tokens",           dag_lcp_tokens },
+        { "rerot_replay_from_tokens",       replay_from_tokens },
+        { "rerot_actual_replayed_tokens",   actual_replayed_tokens },
+        { "rerot_fixed_entry_seconds",      fixed_entry_seconds },
+        { "rerot_fixed_entry_count",        fixed_entry_count },
+        { "rerot_synthesis_switch_seconds", synthesis_switch_seconds },
+        { "rerot_synthesis_switch_count",   synthesis_switch_count },
+
+        { "rerot_sync_capture_us",              sync_capture_us },
+        { "rerot_sync_capture_count",           sync_capture_count },
+        { "rerot_sync_capture_with_work_us",     sync_capture_with_work_us },
+        { "rerot_sync_capture_with_work_count",  sync_capture_with_work_count },
+        { "rerot_sync_sample_us",               sync_sample_us },
+        { "rerot_sync_sample_count",            sync_sample_count },
+        { "rerot_sync_sample_no_work_us",       sync_sample_no_work_us },
+        { "rerot_sync_sample_no_work_count",    sync_sample_no_work_count },
+        { "rerot_sync_sample_with_work_us",     sync_sample_with_work_us },
+        { "rerot_sync_sample_with_work_count",  sync_sample_with_work_count },
     };
 }
 
@@ -335,6 +370,30 @@ void server_rerot_metrics::accumulate(const server_rerot_metrics & delta) {
     brain_bytes         = delta.brain_bytes;
     hand_bytes          = delta.hand_bytes;
     grouped_scratch_bytes = delta.grouped_scratch_bytes;
+
+    probe_seconds              += delta.probe_seconds;
+    probe_count                += delta.probe_count;
+    prefix_rebuild_seconds     += delta.prefix_rebuild_seconds;
+    prefix_rebuild_count       += delta.prefix_rebuild_count;
+    ordinary_prompt_tokens     += delta.ordinary_prompt_tokens;
+    dag_lcp_tokens             += delta.dag_lcp_tokens;
+    replay_from_tokens         += delta.replay_from_tokens;
+    actual_replayed_tokens     += delta.actual_replayed_tokens;
+    fixed_entry_seconds        += delta.fixed_entry_seconds;
+    fixed_entry_count          += delta.fixed_entry_count;
+    synthesis_switch_seconds   += delta.synthesis_switch_seconds;
+    synthesis_switch_count     += delta.synthesis_switch_count;
+
+    sync_capture_us            += delta.sync_capture_us;
+    sync_capture_count         += delta.sync_capture_count;
+    sync_capture_with_work_us  += delta.sync_capture_with_work_us;
+    sync_capture_with_work_count += delta.sync_capture_with_work_count;
+    sync_sample_us             += delta.sync_sample_us;
+    sync_sample_count          += delta.sync_sample_count;
+    sync_sample_no_work_us     += delta.sync_sample_no_work_us;
+    sync_sample_no_work_count  += delta.sync_sample_no_work_count;
+    sync_sample_with_work_us   += delta.sync_sample_with_work_us;
+    sync_sample_with_work_count+= delta.sync_sample_with_work_count;
 }
 
 server_rerot_episode_key server_task::rerot_key() const {
@@ -802,7 +861,7 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         {"timings",             timings.to_json()},
     };
     if (rerot_probe_tokens != 0 || rerot_frame_tokens != 0 || rerot_source_end_tokens != 0) {
-        res["rerot"] = json {
+        json rerot_obj = json {
             {"prompt_tokens",     n_prompt_tokens},
             {"cached_tokens",     n_prompt_tokens_cache},
             {"probe_tokens",      rerot_probe_tokens},
@@ -810,6 +869,25 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
             {"sampled_tokens",   n_decoded},
             {"source_end_tokens", rerot_source_end_tokens},
         };
+        if (rerot_probe_seconds > 0.0) {
+            rerot_obj["probe_seconds"] = rerot_probe_seconds;
+        }
+        if (rerot_prefix_rebuild_seconds > 0.0) {
+            rerot_obj["prefix_rebuild_seconds"] = rerot_prefix_rebuild_seconds;
+        }
+        if (rerot_ordinary_prompt_tokens > 0 || rerot_actual_replayed_tokens > 0) {
+            rerot_obj["ordinary_prompt_tokens"] = rerot_ordinary_prompt_tokens;
+            rerot_obj["dag_lcp_tokens"] = rerot_dag_lcp_tokens;
+            rerot_obj["replay_from_tokens"] = rerot_replay_from_tokens;
+            rerot_obj["actual_replayed_tokens"] = rerot_actual_replayed_tokens;
+        }
+        if (rerot_fixed_entry_seconds > 0.0) {
+            rerot_obj["fixed_entry_seconds"] = rerot_fixed_entry_seconds;
+        }
+        if (rerot_synthesis_switch_seconds > 0.0) {
+            rerot_obj["synthesis_switch_seconds"] = rerot_synthesis_switch_seconds;
+        }
+        res["rerot"] = std::move(rerot_obj);
     }
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
@@ -825,7 +903,7 @@ json server_task_result_cmpl_final::usage_json_oaicompat() {
         {"prompt_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
     };
     if (rerot_probe_tokens != 0 || rerot_frame_tokens != 0 || rerot_source_end_tokens != 0) {
-        usage["rerot"] = json {
+        json rerot_obj = json {
             {"prompt_tokens",     n_prompt_tokens},
             {"cached_tokens",     n_prompt_tokens_cache},
             {"probe_tokens",      rerot_probe_tokens},
@@ -833,6 +911,25 @@ json server_task_result_cmpl_final::usage_json_oaicompat() {
             {"sampled_tokens",    n_decoded},
             {"source_end_tokens", rerot_source_end_tokens},
         };
+        if (rerot_probe_seconds > 0.0) {
+            rerot_obj["probe_seconds"] = rerot_probe_seconds;
+        }
+        if (rerot_prefix_rebuild_seconds > 0.0) {
+            rerot_obj["prefix_rebuild_seconds"] = rerot_prefix_rebuild_seconds;
+        }
+        if (rerot_ordinary_prompt_tokens > 0 || rerot_actual_replayed_tokens > 0) {
+            rerot_obj["ordinary_prompt_tokens"] = rerot_ordinary_prompt_tokens;
+            rerot_obj["dag_lcp_tokens"] = rerot_dag_lcp_tokens;
+            rerot_obj["replay_from_tokens"] = rerot_replay_from_tokens;
+            rerot_obj["actual_replayed_tokens"] = rerot_actual_replayed_tokens;
+        }
+        if (rerot_fixed_entry_seconds > 0.0) {
+            rerot_obj["fixed_entry_seconds"] = rerot_fixed_entry_seconds;
+        }
+        if (rerot_synthesis_switch_seconds > 0.0) {
+            rerot_obj["synthesis_switch_seconds"] = rerot_synthesis_switch_seconds;
+        }
+        usage["rerot"] = std::move(rerot_obj);
     }
     return usage;
 }
