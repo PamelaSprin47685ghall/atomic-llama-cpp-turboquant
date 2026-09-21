@@ -2639,6 +2639,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     loras            (params.loras),
     mctx             (params.mctx),
     cross            (params.cross),
+    hadamard_rotations(params.hadamard_rotations),
+    hadamard_inverses(params.hadamard_inverses),
     fp_reserve_sizing(params.flashprefill_reserve_sizing),
     samplers         (params.samplers),
     cb_func          (params.cb),
@@ -2672,7 +2674,15 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * cur,
           ggml_tensor * w_s,
         enum ggml_prec   prec) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    ggml_tensor * cur_mm = cur;
+    if (hadamard_rotations && hadamard_rotations->count(w)) {
+        const auto & t = hadamard_rotations->at(w);
+        if (t.signs) {
+            cur_mm = ggml_mul(ctx0, cur_mm, t.signs);
+        }
+        cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
+    }
+    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
 
     if (prec != GGML_PREC_DEFAULT) {
         // Set precision on the base MUL_MAT before an optional scale/LoRA attachment changes the root op.
@@ -2709,7 +2719,15 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    ggml_tensor * cur_mm = cur;
+    if (hadamard_rotations && hadamard_rotations->count(w)) {
+        const auto & t = hadamard_rotations->at(w);
+        if (t.signs) {
+            cur_mm = ggml_mul(ctx0, cur_mm, t.signs);
+        }
+        cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
+    }
+    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur_mm, ids);
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];

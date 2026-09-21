@@ -558,7 +558,7 @@ vec2 get_dm(uint ib, uint a_offset) {
 }
 #endif
 
-#if defined(DATA_A_Q2_0) || defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
+#if defined(DATA_A_Q2_0) || defined(DATA_A_PQ2_0) || defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(float(data_a[a_offset + ib].d), 0);
 }
@@ -571,11 +571,6 @@ vec2 get_dm(uint ib, uint a_offset) {
 }
 #endif
 
-#if defined(DATA_A_Q2_0) || defined(DATA_A_PQ2_0)
-vec2 get_dm(uint ib, uint a_offset) {
-    return vec2(float(data_a[a_offset + ib].d), 0);
-}
-#endif
 #if defined(DATA_A_MXFP4)
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(e8m0_to_fp32(data_a[a_offset + ib].e), 0);

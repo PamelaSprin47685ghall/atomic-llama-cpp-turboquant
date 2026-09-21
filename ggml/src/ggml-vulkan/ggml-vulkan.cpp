@@ -11906,11 +11906,16 @@ static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_con
 }
 
 static int ggml_vk_fwht_pipeline_idx(int64_t n) {
+    // keep in sync with the width list in ggml_vk_load_shaders and GGML_VK_FWHT_NUM_SIZES
     switch (n) {
         case 64:  return 0;
         case 128: return 1;
         case 256: return 2;
         case 512: return 3;
+        case 1024: return 4;
+        case 2048: return 5;
+        case 4096: return 6;
+        case 8192: return 7;
         default:  return -1;
     }
 }
