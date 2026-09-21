@@ -24790,38 +24790,25 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         if (ctx->tp5_recording_program) {
             auto & program = *ctx->tp5_recording_program;
             if (program.predefined_capacity_rows != 0) {
-                program.predefined_complete =
-                    program.predefined_classified_dispatches ==
-                    program.commands.count(vk_tp5_command_tape::kind::dispatch);
-                // Phase 1 coverage finalize (fail-open): populate the
-                // semantic record and emit a diagnostic when some class
-                // lacks proof. Deliberately does NOT change
-                // predefined_complete, does NOT reject(), and does NOT
-                // touch the warm-token update path.
-                {
-                    auto & cov = program.predefined_coverage;
-                    const size_t captured = program.commands.count(vk_tp5_command_tape::kind::dispatch);
-                    const size_t classified = program.predefined_classified_dispatches;
-                    cov.copy_total = (uint32_t) program.commands.count(vk_tp5_command_tape::kind::copy);
-                    cov.barrier_total = (uint32_t) program.commands.count(vk_tp5_command_tape::kind::barrier);
-                    cov.state_total = (uint32_t) program.commands.count(vk_tp5_command_tape::kind::state);
-                    cov.uncovered_dispatch = captured > classified ? (uint32_t)(captured - classified) : 0;
-                    if (cov.uncovered_dispatch != 0) {
-                        char buf[160];
-                        std::snprintf(buf, sizeof(buf),
-                            "%u dispatch(es) captured without static/dynamic classification",
-                            cov.uncovered_dispatch);
-                        vk_tp5_coverage_set_gap(cov, buf);
-                    } else if (cov.copy_total != 0) {
-                        char buf[160];
-                        std::snprintf(buf, sizeof(buf),
-                            "%u copy/fill/update op(s) use definition-time fixed ranges (no effective-range proof; view/KV/output-index/push-constant capacity params likewise unproven)",
-                            cov.copy_total);
-                        vk_tp5_coverage_set_gap(cov, buf);
-                    }
-                    cov.would_reject = vk_tp5_coverage_would_reject(cov);
-                    vk_tp5_coverage_report(cov, program.predefined_capacity_rows, captured, classified);
-                }
+                // Definition-time semantic coverage evaluation across 5 categories
+                // (fixed_compute, dynamic_compute, data_movement, state_writes, dependency_boundaries).
+                auto & cov = program.predefined_coverage;
+                const size_t captured = program.commands.count(vk_tp5_command_tape::kind::dispatch);
+                const size_t classified = program.predefined_classified_dispatches;
+                const size_t copies = program.commands.count(vk_tp5_command_tape::kind::copy);
+                const size_t barriers = program.commands.count(vk_tp5_command_tape::kind::barrier);
+                const size_t states = program.commands.count(vk_tp5_command_tape::kind::state);
+
+                vk_tp5_coverage_evaluate(cov, program.predefined_capacity_rows, captured, classified,
+                                         copies, barriers, states);
+
+                // Upgraded predefined_complete: true iff all 5 semantic categories are resolved
+                // as safe (fixed_safe or dynamic_safe) with zero unresolved categories and zero uncovered dispatches.
+                // An unresolved category blocks dynamic row execution under the gate at line 27647:
+                // (!program.predefined_complete && active_rows != capacity_rows) -> fail-closed.
+                program.predefined_complete = vk_tp5_coverage_is_complete(cov);
+
+                vk_tp5_coverage_report(cov, program.predefined_capacity_rows, captured, classified);
             }
             program.buffers = cache_entry.buffer_owners;
             program.hc = cache_entry.hc_sum_prefix ? ctx->hc_sum_recorded : vk_tp5_hc_sum{};

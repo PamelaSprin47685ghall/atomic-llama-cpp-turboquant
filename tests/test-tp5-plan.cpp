@@ -11,6 +11,7 @@
 #include "ggml.h"
 
 #include "../ggml/src/ggml-impl.h" // ggml_set_op_params (private FA node construction)
+#include "../ggml/src/ggml-vulkan/ggml-vulkan-collective.hpp"
 
 #include <memory>
 #include <cstdio>
@@ -1159,31 +1160,80 @@ static void test_tp5_latebind_protocol_invariants() {
         TEST_ASSERT(payload_offset(L, false) == 64 + L);
     }
 
-    // Invariant 7: F32-Q exact fallback execution order constraint
-    // Emulated command stream order check:
-    enum StageOp { OP_SCATTER, OP_LATE_Q_READ, OP_BARRIER_READ_WRITE, OP_NORM_WRITE };
-    std::vector<StageOp> exact_sequence = {
-        OP_SCATTER,
-        OP_LATE_Q_READ,
-        OP_BARRIER_READ_WRITE,
-        OP_NORM_WRITE
-    };
-    // Assert OP_LATE_Q_READ precedes OP_NORM_WRITE with an intervening barrier
-    auto q_pos = std::find(exact_sequence.begin(), exact_sequence.end(), OP_LATE_Q_READ);
-    auto norm_pos = std::find(exact_sequence.begin(), exact_sequence.end(), OP_NORM_WRITE);
-    auto bar_pos = std::find(exact_sequence.begin(), exact_sequence.end(), OP_BARRIER_READ_WRITE);
-    TEST_ASSERT(q_pos < bar_pos && bar_pos < norm_pos);
+    // Invariant 7: Definition-time WAR contract verification for Exact F32 and Aggressive Q8
+    // Validates against production tp5_latebind_semantic_step & tp5_validate_latebind_war_schedule.
+    std::string war_err;
 
-    // If an old buggy sequence is constructed (norm before late_q), verify our invariant detects the hazard
-    std::vector<StageOp> buggy_sequence = {
-        OP_SCATTER,
-        OP_NORM_WRITE,
-        OP_LATE_Q_READ
+    // 1. Exact F32 canonical schedule: READ_TREFS (late_q) -> BARRIER_WAR_TREFS (q_norm_barrier) -> WRITE_TREFS (late_norm)
+    std::vector<tp5_latebind_semantic_step> canonical_exact = {
+        { tp5_latebind_semantic_step::kind::READ_TREFS,        "late_q" },
+        { tp5_latebind_semantic_step::kind::BARRIER_WAR_TREFS, "q_norm_barrier" },
+        { tp5_latebind_semantic_step::kind::WRITE_TREFS,       "late_norm" },
     };
-    auto b_q_pos = std::find(buggy_sequence.begin(), buggy_sequence.end(), OP_LATE_Q_READ);
-    auto b_norm_pos = std::find(buggy_sequence.begin(), buggy_sequence.end(), OP_NORM_WRITE);
-    // Old sequence violates read-before-write invariant
-    TEST_ASSERT(!(b_q_pos < b_norm_pos));
+    TEST_ASSERT(tp5_validate_latebind_war_schedule(false, canonical_exact, war_err));
+
+    // 2. Aggressive Q8 canonical schedule:
+    // READ_TREFS (late_act_q8) -> BARRIER_ACT_BUF (act_ready) -> BARRIER_WAR_TREFS (q_norm_barrier) -> WRITE_TREFS (late_norm) -> DISPATCH_Q8DOT (late_q8dot)
+    // Note: No barrier between late_norm and late_q8dot (zero-barrier overlap).
+    std::vector<tp5_latebind_semantic_step> canonical_agg = {
+        { tp5_latebind_semantic_step::kind::READ_TREFS,        "late_act_q8" },
+        { tp5_latebind_semantic_step::kind::BARRIER_ACT_BUF,   "act_ready" },
+        { tp5_latebind_semantic_step::kind::BARRIER_WAR_TREFS, "q_norm_barrier" },
+        { tp5_latebind_semantic_step::kind::WRITE_TREFS,       "late_norm" },
+        { tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT,    "late_q8dot" },
+    };
+    TEST_ASSERT(tp5_validate_latebind_war_schedule(true, canonical_agg, war_err));
+
+    // 3. Negative regression 1: Aggressive Q8 missing WAR barrier on trefs (the pre-fix defect)
+    std::vector<tp5_latebind_semantic_step> reg_agg_no_war = {
+        { tp5_latebind_semantic_step::kind::READ_TREFS,        "late_act_q8" },
+        { tp5_latebind_semantic_step::kind::BARRIER_ACT_BUF,   "act_ready" },
+        { tp5_latebind_semantic_step::kind::WRITE_TREFS,       "late_norm" },
+        { tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT,    "late_q8dot" },
+    };
+    TEST_ASSERT(!tp5_validate_latebind_war_schedule(true, reg_agg_no_war, war_err));
+    TEST_ASSERT(war_err.find("missing BARRIER_WAR_TREFS") != std::string::npos);
+
+    // 4. Negative regression 2: Exact F32 missing WAR barrier on trefs
+    std::vector<tp5_latebind_semantic_step> reg_exact_no_war = {
+        { tp5_latebind_semantic_step::kind::READ_TREFS,        "late_q" },
+        { tp5_latebind_semantic_step::kind::WRITE_TREFS,       "late_norm" },
+    };
+    TEST_ASSERT(!tp5_validate_latebind_war_schedule(false, reg_exact_no_war, war_err));
+    TEST_ASSERT(war_err.find("missing BARRIER_WAR_TREFS") != std::string::npos);
+
+    // 5. Negative regression 3: Misplaced barrier (after write instead of before write)
+    std::vector<tp5_latebind_semantic_step> reg_barrier_after_write = {
+        { tp5_latebind_semantic_step::kind::READ_TREFS,        "late_act_q8" },
+        { tp5_latebind_semantic_step::kind::BARRIER_ACT_BUF,   "act_ready" },
+        { tp5_latebind_semantic_step::kind::WRITE_TREFS,       "late_norm" },
+        { tp5_latebind_semantic_step::kind::BARRIER_WAR_TREFS, "q_norm_barrier" },
+        { tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT,    "late_q8dot" },
+    };
+    TEST_ASSERT(!tp5_validate_latebind_war_schedule(true, reg_barrier_after_write, war_err));
+    TEST_ASSERT(war_err.find("BARRIER_WAR_TREFS must precede WRITE_TREFS") != std::string::npos);
+
+    // 6. Negative regression 4: Write before read hazard (norm overwrites before Q reads)
+    std::vector<tp5_latebind_semantic_step> reg_write_before_read = {
+        { tp5_latebind_semantic_step::kind::WRITE_TREFS,       "late_norm" },
+        { tp5_latebind_semantic_step::kind::BARRIER_WAR_TREFS, "q_norm_barrier" },
+        { tp5_latebind_semantic_step::kind::READ_TREFS,        "late_q" },
+    };
+    TEST_ASSERT(!tp5_validate_latebind_war_schedule(false, reg_write_before_read, war_err));
+    TEST_ASSERT(war_err.find("READ_TREFS must precede BARRIER_WAR_TREFS") != std::string::npos);
+
+    // 7. Negative regression 5: Barrier mistakenly inserted between norm and Q8dot
+    // Violates the requirement that norm and Q8dot have zero execution barriers between them.
+    std::vector<tp5_latebind_semantic_step> reg_barrier_in_q8dot = {
+        { tp5_latebind_semantic_step::kind::READ_TREFS,        "late_act_q8" },
+        { tp5_latebind_semantic_step::kind::BARRIER_ACT_BUF,   "act_ready" },
+        { tp5_latebind_semantic_step::kind::BARRIER_WAR_TREFS, "q_norm_barrier" },
+        { tp5_latebind_semantic_step::kind::WRITE_TREFS,       "late_norm" },
+        { tp5_latebind_semantic_step::kind::BARRIER_ACT_BUF,   "extra_barrier" },
+        { tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT,    "late_q8dot" },
+    };
+    TEST_ASSERT(!tp5_validate_latebind_war_schedule(true, reg_barrier_in_q8dot, war_err));
+    TEST_ASSERT(war_err.find("zero-barrier overlap violated") != std::string::npos);
 
     fprintf(stderr, "  LateBind protocol invariants: Q control/payload non-overlapping, word alignment verified, F32-Q order asserted\n");
 }

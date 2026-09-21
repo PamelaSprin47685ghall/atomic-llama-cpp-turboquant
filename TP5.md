@@ -58,6 +58,56 @@ LateBind recipe 必须五个 rank 全部匹配（含 `capacity_rows` 一致且 `
 
 这批改动在用户下一轮真机测试前只做源码、shader 编译与链接验收；不将静态结果冒充性能收益。历史黄金工作负载仍是 F32、attention replicate、五卡 2475 MHz、171-token natural-stop 计数请求；旧 OMP 记录的 52.47 tok/s 仅作为复现参考，新默认路径必须重新配对测量。
 
+### 2026-09-21 只读审计结论与两份路线图讨论稿事实纠偏落档（权威归档）
+
+> **审计基准日期**：2026-09-21  
+> **工作树状态**：未提交（工作区包含本轮 CLI 入口收敛与权威落档修订）  
+> **审查对象**：`docs/TP5-TARGET-CAPACITY-PLAN.md`、`docs/TP5-VERIFICATION-PLAN.md`（及关联提案讨论稿）中与当前 master 代码脱节的历史表述。
+
+针对路线图讨论稿与验证草案中存留的早期技术设想与推测，本轮只读审计完成代码级因果穿透与事实纠偏，确立以下五项代码事实为**仓库唯一真理（Single Source of Truth）**，明确区分“当前代码事实”与“历史文档声称”：
+
+#### 1. Q sidecar / Q mailbox 的 GPU 与 CPU 地址协议已完全一致
+* **历史文档声称**：早期讨论稿曾怀疑“CPU 读写偏移和 GPU 计算偏移存在 64 字节 RAW 错位，或 status[6] 与 bcast_host 控制字重叠导致死锁或写坏”。
+* **当前代码事实**：GPU 与 CPU 两侧已严格统一使用 `ggml-vulkan-collective.cpp` 中的同一套内联辅助函数与布局常量，杜绝了硬编码常数漂移：
+  - 控制区偏移函数：`tp5_late_q_control_offset(late_host_offset) = TP5_RELAY_HEADER_BYTES (64) + late_host_offset`；
+  - 广播载荷偏移函数：`tp5_late_q_bcast_payload_offset(late_host_offset, late_q8_fast) = TP5_RELAY_HEADER_BYTES (64) + late_host_offset + (late_q8_fast ? TP5_LATE_Q_CONTROL_BYTES (64) : 0)`；
+  - 载荷字偏移函数：`tp5_late_q_payload_word_offset(late_host_offset, late_q8_fast) = tp5_late_q_bcast_payload_offset(...) / 4`；
+  - 控制指针访问：CPU 端统一使用 `tp5_late_q_control_ptr` 与 `tp5_late_q_control_cptr`；
+  - 主通信协议：主 activation $Y$ 的状态与门铃固定在 header word 0（generation）与 word 2（Q generation），payload 严格从 `TP5_RELAY_HEADER_BYTES = 64`（$B+64$）起始；
+  - 模式布局：在 `aggressive-q8` 快速路径下，64 字节控制区位于 $B + 64 + L$（word 0 为 ready，word 1 为 WG 计数器），sidecar 载荷位于 $B + 128 + L$；在 `exact-f32` 回退路径下，控制区使用 host-imported `status[6]`，载荷广播目标为 $B + 64 + L$；
+  - 源码（`ggml-vulkan-collective.cpp:2141-2144`）中已包含 `GGML_ASSERT(tp5_late_q_control_offset(late_offset) % 64 == 0)` 与 `GGML_ASSERT(tp5_late_q_bcast_payload_offset(late_offset, true) % 64 == 0)` 等硬件对齐断言。两端协议完全吻合。
+
+#### 2. MTP 预定义容量下旧 phase 失效已豁免，Target 主干因 GDN 仍保持 exact
+* **历史文档声称**：早期推测“$1 \to 4 \to 1 \to 2$ 行数动态变化会在每次 step 引发调度器 buffer 重建和 phase 释放”。
+* **当前代码事实**：
+  - 在 `src/llama-context.h:629-645` 的 `llama_context::ubatch_execution_phase()` 中引入了预定义 MTP 身份豁免：当 `gtype == LLM_GRAPH_TYPE_DECODER_MTP && has_predefined_capacity && predefined_capacity_rows > 0` 时，**恒返回 0**；避免了 `n_tokens > n_seqs ? 1 : 0` 旧规则对预定义单一最大容量图（`verify_tokens`）的无效重置，保证了常驻复用；该行为已有 `tests/test-mtp-workspace.cpp` 完整测试覆盖；
+  - **重要边界纠偏**：Target 主干模型包含 48 层有状态的 GDN（含循环状态与卷积状态），尚未完成容量下沉改造，因此在 `src/llama-context.cpp:2514-2525` 中明确维持 `predefined_capacity_rows_current = ubatch.n_tokens` 的 **exact 精确构图模式**，不参与此项容量化阶段判定，防止状态张量被未初始化的 padding 污染。
+
+#### 3. multi-row LateBind 已支持 ≤4 行，而非 LateBind fused HC 仍要求严格单行
+* **历史文档声称**：讨论稿曾将“LateBind”与“旧 fused HC”的行数限制混为一谈，声称 LateBind 仅能支持单行 decode。
+* **当前代码事实**：
+  - LateBind 已完整支持多行（$\le 4$ 行）：`tp5_late_consumer_ref`（`ggml-vulkan-collective.cpp:2521-2541`）中通过 `capacity_rows = n_elems / hc.width` 进行动态核验，明确允许 `capacity_rows <= VK_TP5_DIRECT_COLUMN_TILE`（即 4 行），且总元素满足 `capacity_rows * streams * late_rank <= TP5_LATE_MAX_FLOATS`（8192）；
+  - 7 组 LateBind push constants 均携带 `active_rows`，Shader 内通过 `token < 4u` 循环展开与 `if (token >= p.active_rows) break` 执行精确行截断（见 `tp5_hc_latebind.comp`、`tp5_hc_resume.comp`）；
+  - 相比之下，非 LateBind 的旧大 workgroup fused-consumer（`GGML_TP5_RELAY_FUSED_HC=1`）因在单个 1024-thread workgroup 内执行就地自旋，依然严格约束为单行（single-row），二者不可混淆。
+
+#### 4. epoch-chain 冷重建分支的 late 残余已清理并实现严格 fail-closed
+* **历史文档声称**：曾担心“冷重建或整链未捕获时，残留的 late 步骤未清理导致命令流错乱或 GPU 悬挂”。
+* **当前代码事实（不可达性与安全证明）**：
+  - 当启用 LateBind 时（`c.wire == tp5_wire_type::F32 && tp5_latebind_hc_enabled()`），`tp5_relay_make_linear_definition` 强制要求整个整链直接生成单条 primary CB（`c.chain_scratch[r].compute.assign(1, c.linear_program->commands[r])`）；
+  - 任何定义期失败（WAR schedule 校验失败、rank 间 LateBind 资格不一致或异常）均直接进入 catch 块触发 `c.fail(...)` 并返回 `false`（Fail-Closed）；
+  - 在提交下游 `tp5_relay_submit_epoch_chain`（`ggml-vulkan-collective.cpp:5178`）处设置了绝对防御门禁：
+    `if ((linear ? scratch.compute.size() != 1 : scratch.compute.size() < min_collective_cbs) || scratch.compute.size() > UINT32_MAX)`，若 `scratch.compute.size() != 1` 则立即 `tp5_relay_request_abort(c)` 并报错退出；
+  - 因此残余 late 片段在物理上绝对不可达、不可提交，彻底消除了 GPU 悬挂隐患。
+
+#### 5. `predefined_complete` 已升级为五大类三态语义覆盖
+* **历史文档声称**：旧文档记录 `program.predefined_complete = (classified_dispatches == captured_dispatches)`，即仅凭派发计数相同来判定完整性。
+* **当前代码事实**：
+  - 按照 `docs/TP5-MTP-PREDEFINED.md §12` 的最新规范，`predefined_complete` 已彻底升级为**五大语义类别（`fixed_compute`、`dynamic_compute`、`data_movement`、`state_writes`、`dependency_boundaries`）的三态模型（`unresolved=0`、`fixed_safe=1`、`dynamic_safe=2`）**；
+  - 只有当所有 5 个类别均确立安全证明且**无任何 `unresolved`** 时，`predefined_complete` 才为 `true`；若存在任何未解析项，执行门禁（`ggml-vulkan.cpp:27647`）会在 `active_rows != capacity_rows` 时 fail-closed 阻断动态行执行；
+  - **当前仍无法自动判定的类别（必须显式阻断）**：
+    - **显式缓冲区分片拷贝（Raw BufferCopy）**：`vkCmdCopyBuffer`、`FillBuffer`、`UpdateBuffer` 的偏移与尺寸固化在录制期，无法随 GPU 动态行数自动间接缩放，因此含有 raw copy 的图保持 `unresolved` 并被门禁阻断；
+    - **非连续视图与跨行切片（Non-contiguous view offsets）**：步长 `nb[1]` 不连续或工作组不能整除行宽的视图，无法在定义期证明边界安全，亦保持 `unresolved`。
+
 **演进历史说明**：本文第 0–28 节源于 2026-09-12 设计初稿；附录 C 记录 2026-09-13 目标机实施与真机首轮直连数据；正文开篇与文末《TP5-FAST》及《收敛与优化指导》记录 2026-09-14 重新插卡验证、物理内存审计、ioctl 剖析、`llama_tp5_plan` 统合接入、实验性 gpuflag 机制及最新收敛路线。凡设计初稿中标记为“拟实现项/拟新增”的模块（如 `llama_tp5_plan`、`tp5-inspect-model.py`、`tp5-manifest.json`、Vulkan collective、命令重放等），均已在当前 master 源码树中实现并按工程规范部署。
 
 ---

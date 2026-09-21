@@ -389,3 +389,66 @@ if (phase != last_graph_phase) {
   [tp5-mtp-cycle-summary] cycles=2 avg_draft_us=1210.0 avg_target_us=3050.0 avg_catchup_us=345.0 avg_handoff_us=33.5 avg_total_us=4638.5 draft_tokens=6 accepted_tokens=3 final_tokens=5 eff=0.500
   ```
   便于自动化脚本提取平均每 token 耗时以及 MTP 的加速收益比。
+
+## 12. 定义期语义覆盖与 `predefined_complete` 升级（Definition-Time Semantic Coverage & Upgraded predefined_complete）
+
+### 12.1 背景与语义升级
+
+在旧实现中，`program.predefined_complete` 仅仅通过简单的派发数量比较得出：
+```cpp
+program.predefined_complete = (classified_dispatches == captured_dispatches);
+```
+该比较存在五大已知盲点：固定 `vkCmdCopyBuffer` 范围、张量视图偏移（view offset）、KV 写入有效范围、输出投影索引（output indices）以及烘焙在 push constants 中的容量参数。旧版仅在 `vk_tp5_predefined_coverage` 中收集诊断并以 fail-open 模式在 `stderr` 打印警告，`predefined_complete` 仍置为 `true`。
+
+本升级将 `predefined_complete` 彻底重构为**定义期语义覆盖（Definition-Time Semantic Coverage）**：
+只有当定义在所有五个语义类别中均建立代码级安全证明、且**不存在任何 `unresolved` 状态**时，`predefined_complete` 才被置为 `true`。
+
+### 12.2 五大语义类别与三态模型
+
+定义期覆盖引入三态枚举：
+- `unresolved` (0)：在动态行执行（`active_rows < capacity_rows`）下不安全或无法证明；
+- `fixed_safe` (1)：已证明与行数无关（在任何活跃行下行为绝对恒定、无副作用越界）；
+- `dynamic_safe` (2)：已证明随有效行数（`active_tokens` / `active_outputs` 等）严格动态裁剪，不越界。
+
+五大盲点映射至以下五大类别：
+
+1. **`fixed_compute`（固定计算）**：
+   - 含义：与活跃行数无关的计算（通过 `ggml_vk_predefined_classify_static` 标记）。
+   - 判定：全部派发被分类时为 `fixed_safe`；存在未分类派发时为 `unresolved`。
+2. **`dynamic_compute`（动态计算）**：
+   - 含义：基于 tokens / outputs / context extent 动态缩放的间接派发。
+   - 判定：所有派发均通过 `ggml_vk_predefined_indirect_slot` 成功间接化时为 `dynamic_safe`；纯静态图为 `fixed_safe`；存在未分类派发时为 `unresolved`。
+3. **`data_movement`（数据搬运）**：
+   - 对应盲点：**盲点 1（fixed copy/fill/update ranges）** 与 **盲点 2（view offset）**。
+   - 判定：若命令带捕获了 `vkCmdCopyBuffer` / `FillBuffer` / `UpdateBuffer`（`copy_total != 0`），由于其偏移与大小固化于录制期，无法提供动态有效范围证明，判为 `unresolved`，并记录 `first_gap` 诊断；在无 raw copy 的纯计算图中，张量 view 偏移受 indirect dispatch 边界保护，判为 `fixed_safe`。
+4. **`state_writes`（状态写入）**：
+   - 对应盲点：**盲点 3（KV write ranges）** 与 **盲点 4（output indices）**。
+   - 判定：MTP 计算图中的 KV 写入（`set_rows_indirect`）和输出逻辑（`output_dispatch_indirect`）均经行除数整除验证与间接工作组缩放，证明不污染非活跃槽，判为 `dynamic_safe`；若存在未受控写入或未分类派发，判为 `unresolved`。
+5. **`dependency_boundaries`（依赖边界）**：
+   - 对应盲点：**盲点 5（push-constant capacity params）** 与同步栅障（pipeline barriers）。
+   - 判定：Pipeline barriers 原样完整捕获保存在命令带中；Shader push constants 虽描述物理容量，但通过行级整除性校验（如 `raw_per_row % divisor == 0`）保证尾部工作组绝不越界跨行污染，判为 `fixed_safe`；存在未分类派发时判为 `unresolved`。
+
+### 12.3 门禁链阻断规则与执行资格
+
+在 `ggml-vulkan.cpp:27647` 处的执行门禁：
+```cpp
+(!program.predefined_complete && active_rows != capacity_rows) || ... -> return false;
+```
+形成了严格的 **Fail-Closed** 安全屏障：
+- **通过（Permitted）**：当且仅当 `predefined_complete == true`（即 5 类无一 `unresolved`），才授予动态行执行资格（`active_rows != capacity_rows`，如 1 行或 4 行小前缀执行）；
+- **阻断（Blocked）**：若任何类别判定为 `unresolved`，`predefined_complete` 恒为 `false`，动态行执行被底层物理拒绝，仅退回到 `active_rows == capacity_rows` 的全量执行。
+
+### 12.4 当前真实 Definition 的状态与局限性说明
+
+1. **当前 MTP Draft / Catch-up Definition**：
+   - `commands.count(copy) == 0`，无原始固定拷贝；
+   - 所有派发均被 static 或 indirect 分类，`uncovered_dispatch == 0`；
+   - GEMM、Norm、Attn、Softmax、SetRows 均满足整除性校验；
+   - **结论**：五项全为 safe（`fixed_safe` 或 `dynamic_safe`），`predefined_complete = true`，成功保持动态行执行能力，零性能退化。
+2. **Target 主干 Definition（尚未全量容量化）**：
+   - 尚有未间接化算子，`uncovered_dispatch > 0`，判定为 `unresolved`，`predefined_complete = false`，门禁正确阻止其动态行执行，保持原有精确构图路径。
+3. **哪些类别目前仍无法全自动证明及原因**：
+   - **显式缓冲区分片拷贝（Raw BufferCopy）**：如果未来的预定义图中包含宿主向设备或设备内的裸 `vkCmdCopyBuffer`，由于 Vulkan 结构体中的 `srcOffset/dstOffset/size` 在录制时被字面固化，缺乏类似 `dispatchIndirect` 的 GPU 动态读取能力，因此后端无法在定义期自动推断有效行范围，必须显式保持为 `unresolved` 并被门禁阻断，直到引入间接拷贝机制或专用算子。
+   - **非连续视图与跨行切片（Non-contiguous view offsets）**：对于行间距 `nb[1]` 与元素大小不连续或工作组大小无法整除行宽度的非常规张量视图，无法单靠定义期元数据证明尾部线程不越界，因此维持未分类并保持 `unresolved`。
+
+这一设计在零运行时开销、零逐 token 遍历的前提下，彻底完成了从脆弱的派发计数到强健的定义期语义覆盖的升级。

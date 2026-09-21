@@ -118,6 +118,9 @@ std::string common_speculative_format_cycle_summary(const common_speculative_cyc
 // Record target verification wall-clock time for the ongoing MTP cycle.
 void common_speculative_record_target_verify_us(common_speculative * spec, uint64_t target_verify_us);
 
+// Get target verification wall-clock time currently staged for the ongoing MTP cycle.
+uint64_t common_speculative_get_target_verify_us(const common_speculative * spec);
+
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 

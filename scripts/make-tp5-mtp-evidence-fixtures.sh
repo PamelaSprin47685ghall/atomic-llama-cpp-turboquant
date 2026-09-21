@@ -15,6 +15,7 @@
 #   hidden_fail.log      rc=1  [E] generation 错配
 #   cycle_missing.log    rc=1  [F] 零 cycle 行（PROFILE 下缺失即 FAIL）
 #   conservation_fail.log rc=1 [F] 时间恒等式背离 + Token 守恒背离 + target_us=0
+#   cycle_seq_fail.log   rc=1  [F] 周期序号不连续（单调连续性断言拦截）
 #   state_spin_fail.log  rc=1  [L][M][D] sidecar 超时 + CHAIN FAILED + DeviceLost
 # ==============================================================================
 
@@ -74,6 +75,16 @@ cat > "$OUT_DIR/conservation_fail.log" <<'EOF'
 [tp5-mtp-graph] type=3 reuse=1 definition_uid=0x510000000001 n_reused=1 ubatch_tokens=4
 [tp5-mtp-cycle] cycle=1 draft_us=1200 target_us=3500 catchup_us=800 handoff_us=50 total_us=9999 draft_tokens=3 accepted_tokens=2 final_tokens=3 eff=0.667 dev_hidden=1
 [tp5-mtp-cycle] cycle=2 draft_us=1000 target_us=0 catchup_us=200 handoff_us=40 total_us=1240 draft_tokens=3 accepted_tokens=1 final_tokens=5 eff=0.333 dev_hidden=0
+[tp5-meta] SUBMIT_EPOCH_CHAIN (PREDEFINED TRUTH): hits=1
+EOF
+
+# ----------------------------------------------------- cycle_seq_fail.log ---
+cat > "$OUT_DIR/cycle_seq_fail.log" <<'EOF'
+[tp5-numerical-mode] mode=reference reason=disabled-by-env wire=f16 late=no direct=p1
+[tp5-mtp-graph] type=3 reuse=0 definition_uid=0x510000000001 ubatch_tokens=1
+[tp5-mtp-graph] type=3 reuse=1 definition_uid=0x510000000001 n_reused=1 ubatch_tokens=4
+[tp5-mtp-cycle] cycle=1 draft_us=1200 target_us=3500 catchup_us=800 handoff_us=50 total_us=5550 draft_tokens=3 accepted_tokens=2 final_tokens=3 eff=0.667 dev_hidden=1
+[tp5-mtp-cycle] cycle=3 draft_us=1000 target_us=3000 catchup_us=200 handoff_us=40 total_us=4240 draft_tokens=3 accepted_tokens=0 final_tokens=1 eff=0.000 dev_hidden=1
 [tp5-meta] SUBMIT_EPOCH_CHAIN (PREDEFINED TRUTH): hits=1
 EOF
 

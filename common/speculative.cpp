@@ -1374,6 +1374,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     uint64_t cur_cycle_catchup_us       = 0;
     uint32_t cur_cycle_draft_tokens     = 0;
     uint32_t cur_cycle_accepted_tokens  = 0;
+    uint64_t cur_cycle_local_id         = 0;
     common_speculative * parent_spec    = nullptr;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
@@ -1500,33 +1501,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // arrays once, including on a partially constructed driver.
     }
 
-    void reset() override {
-        auto * ctx_dft = this->params.ctx_dft;
-        if (ctx_dft) {
-            if (auto * mem = llama_get_memory(ctx_dft)) {
-                llama_memory_clear(mem, true);
-            }
-            llama_set_nextn_layer_offset(ctx_dft, 0);
-        }
-
-        common_batch_clear(batch);
-        workspace->reset();
-        device_target_generation = 0;
-        if (device_hidden && !llama_predefined_hidden_reset(ctx_dft)) {
-            throw std::runtime_error("device MTP hidden reset failed");
-        }
-        std::fill(paused.begin(), paused.end(), false);
-        std::fill(drafting.begin(), drafting.end(), false);
-        std::fill(i_last.begin(), i_last.end(), -1);
-        std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
-        std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
-        for (auto & h : chain_h) {
-            h.clear();
-        }
-        for (auto & smpl : smpls) {
-            common_sampler_reset(smpl.get());
-        }
-    }
+    void reset() override;
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         const int32_t N = (int32_t) prompt.size();
@@ -1720,7 +1695,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return process_impl(batch_in, &defer);
     }
 
+    struct cycle_settle_guard {
+        common_speculative_impl_draft_mtp * self;
+        bool settled = false;
+
+        ~cycle_settle_guard() {
+            if (!settled && self) {
+                self->record_cycle_settle();
+            }
+        }
+
+        void settle() {
+            if (!settled && self) {
+                self->record_cycle_settle();
+                settled = true;
+            }
+        }
+    };
+
     bool commit() override {
+        cycle_settle_guard guard{this, false};
+
         const uint32_t n_commit = workspace->total_commit_rows();
         if (n_commit > (uint32_t) n_batch_alloc) {
             SPC_ERR("%s", "MTP catch-up exceeds predefined capacity\n");
@@ -1729,6 +1724,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (n_commit == 0) {
             clear_staged();
+            guard.settle();
             return true;
         }
 
@@ -1771,9 +1767,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (prof_active) {
             cur_cycle_catchup_us += (ggml_time_us() - t_catchup_start);
-            record_cycle_settle();
         }
 
+        guard.settle();
         return true;
     }
 
@@ -2505,50 +2501,91 @@ struct common_speculative {
     common_speculative_cycle_summary cycle_summary;
 };
 
+void common_speculative_impl_draft_mtp::reset() {
+    auto * ctx_dft = this->params.ctx_dft;
+    if (ctx_dft) {
+        if (auto * mem = llama_get_memory(ctx_dft)) {
+            llama_memory_clear(mem, true);
+        }
+        llama_set_nextn_layer_offset(ctx_dft, 0);
+    }
+
+    common_batch_clear(batch);
+    workspace->reset();
+    device_target_generation = 0;
+    if (device_hidden && !llama_predefined_hidden_reset(ctx_dft)) {
+        throw std::runtime_error("device MTP hidden reset failed");
+    }
+    std::fill(paused.begin(), paused.end(), false);
+    std::fill(drafting.begin(), drafting.end(), false);
+    std::fill(i_last.begin(), i_last.end(), -1);
+    std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
+    std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
+    for (auto & h : chain_h) {
+        h.clear();
+    }
+    for (auto & smpl : smpls) {
+        common_sampler_reset(smpl.get());
+    }
+
+    // Reset per-cycle accumulators to prevent cross-request contamination
+    cur_cycle_draft_us        = 0;
+    cur_cycle_handoff_us      = 0;
+    cur_cycle_catchup_us      = 0;
+    cur_cycle_draft_tokens    = 0;
+    cur_cycle_accepted_tokens = 0;
+    if (parent_spec) {
+        parent_spec->last_target_verify_us = 0;
+    }
+}
+
 void common_speculative_impl_draft_mtp::record_cycle_settle() {
-    if (!parent_spec) {
-        return;
-    }
     const bool prof_active = std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr;
-    if (!prof_active) {
-        return;
+    if (prof_active) {
+        common_speculative_cycle_record rec;
+        if (parent_spec) {
+            rec.cycle_id = ++parent_spec->cycle_id;
+        } else {
+            rec.cycle_id = ++cur_cycle_local_id;
+        }
+        rec.draft_us         = cur_cycle_draft_us;
+        rec.target_verify_us = parent_spec ? parent_spec->last_target_verify_us : 0;
+        rec.catchup_us       = cur_cycle_catchup_us;
+        rec.handoff_us       = cur_cycle_handoff_us;
+        rec.total_us         = rec.draft_us + rec.target_verify_us + rec.catchup_us + rec.handoff_us;
+        rec.draft_tokens     = cur_cycle_draft_tokens;
+        rec.accepted_tokens  = cur_cycle_accepted_tokens;
+        rec.final_tokens     = cur_cycle_accepted_tokens + 1; // accepted + sampled token
+        rec.device_hidden    = device_hidden;
+
+        // Accumulate into summary
+        if (parent_spec) {
+            auto & s = parent_spec->cycle_summary;
+            s.total_cycles++;
+            s.total_draft_us         += rec.draft_us;
+            s.total_target_verify_us += rec.target_verify_us;
+            s.total_catchup_us       += rec.catchup_us;
+            s.total_handoff_us       += rec.handoff_us;
+            s.total_us               += rec.total_us;
+            s.total_draft_tokens     += rec.draft_tokens;
+            s.total_accepted_tokens  += rec.accepted_tokens;
+            s.total_final_tokens     += rec.final_tokens;
+        }
+
+        // Print structured log
+        const std::string line = common_speculative_format_cycle_record(rec);
+        std::fprintf(stderr, "%s\n", line.c_str());
     }
 
-    common_speculative_cycle_record rec;
-    rec.cycle_id         = ++parent_spec->cycle_id;
-    rec.draft_us         = cur_cycle_draft_us;
-    rec.target_verify_us = parent_spec->last_target_verify_us;
-    rec.catchup_us       = cur_cycle_catchup_us;
-    rec.handoff_us       = cur_cycle_handoff_us;
-    rec.total_us         = rec.draft_us + rec.target_verify_us + rec.catchup_us + rec.handoff_us;
-    rec.draft_tokens     = cur_cycle_draft_tokens;
-    rec.accepted_tokens  = cur_cycle_accepted_tokens;
-    rec.final_tokens     = cur_cycle_accepted_tokens + 1; // accepted + sampled token
-    rec.device_hidden    = device_hidden;
-
-    // Accumulate into summary
-    auto & s = parent_spec->cycle_summary;
-    s.total_cycles++;
-    s.total_draft_us         += rec.draft_us;
-    s.total_target_verify_us += rec.target_verify_us;
-    s.total_catchup_us       += rec.catchup_us;
-    s.total_handoff_us       += rec.handoff_us;
-    s.total_us               += rec.total_us;
-    s.total_draft_tokens     += rec.draft_tokens;
-    s.total_accepted_tokens  += rec.accepted_tokens;
-    s.total_final_tokens     += rec.final_tokens;
-
-    // Print structured log
-    const std::string line = common_speculative_format_cycle_record(rec);
-    std::fprintf(stderr, "%s\n", line.c_str());
-
-    // Reset per-cycle accumulators
+    // Reset per-cycle accumulators unconditionally
     cur_cycle_draft_us         = 0;
     cur_cycle_handoff_us       = 0;
     cur_cycle_catchup_us       = 0;
     cur_cycle_draft_tokens     = 0;
     cur_cycle_accepted_tokens  = 0;
-    parent_spec->last_target_verify_us = 0;
+    if (parent_spec) {
+        parent_spec->last_target_verify_us = 0;
+    }
 }
 
 static common_ngram_map get_common_ngram_map(
@@ -2968,7 +3005,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .dparams   = */ common_speculative_draft_params_vec(n_seq),
         /* .impls     = */ std::move(impls),
         /* .impl_last = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
-        /* .mtp_defer = */ std::vector<bool>(n_seq, false)
+        /* .mtp_defer = */ std::vector<bool>(n_seq, false),
+        /* .cycle_id              = */ 0,
+        /* .last_target_verify_us = */ 0,
+        /* .cycle_summary         = */ {}
     };
 
     for (auto & impl : result->impls) {
@@ -3054,6 +3094,8 @@ void common_speculative_reset(common_speculative * spec) {
     if (spec == nullptr) {
         return;
     }
+
+    spec->last_target_verify_us = 0;
 
     for (auto & impl : spec->impls) {
         impl->reset();
@@ -3247,6 +3289,10 @@ void common_speculative_record_target_verify_us(common_speculative * spec, uint6
     if (spec) {
         spec->last_target_verify_us = target_verify_us;
     }
+}
+
+uint64_t common_speculative_get_target_verify_us(const common_speculative * spec) {
+    return spec ? spec->last_target_verify_us : 0;
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {

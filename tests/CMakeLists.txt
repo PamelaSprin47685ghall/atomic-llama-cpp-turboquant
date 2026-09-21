@@ -417,7 +417,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     # TP5 plan: pure CPU role tables / slice legality (TP5.md T02, 22.1)
     llama_build_and_test(test-tp5-plan.cpp)
-    target_include_directories(test-tp5-plan PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_include_directories(test-tp5-plan PRIVATE ${PROJECT_SOURCE_DIR}/src /usr/include/libdrm)
 
     # TP5 meta backend CPU reduction boundaries and linear region deferral
     llama_build_and_test(test-meta-reduce-boundary.cpp)

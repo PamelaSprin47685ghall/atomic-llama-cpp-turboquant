@@ -64,9 +64,9 @@ enum class tp5_sync_mode { HOST, SYNCFD, TIMELINE, GPUFLAG, DRM, STAR, RELAY };
 static constexpr size_t TP5_MAILBOX_BANKS = 2;
 static constexpr size_t TP5_LATE_MAX_FLOATS = 8192; // up to 4 rows * 4 streams * rank <= 512
 enum class tp5_numerical_mode {
-    REFERENCE,      // 参考模式：常规无 LateBind 路径，完全遵循原图/标准 AllReduce 数值
-    EXACT_F32,      // F32 LateBind 模式：启用 LateBind 解耦，但 Q 充分统计量保持 FP32 精确路径
-    AGGRESSIVE_Q8   // Aggressive 模式：启用 LateBind + Q8 激活量化 + Q8xQ8 整数点积 + FP16 sidecar
+    REFERENCE,      // 未启用 LateBind（REFERENCE/回退模式）：常规无 LateBind 路径，完全遵循原图/标准 AllReduce 数值
+    EXACT_F32,      // 调度收益但数学严格等价（EXACT_F32 模式）：启用 LateBind 解耦提前搬运，但 Q 充分统计量保持 FP32 精确路径无量化
+    AGGRESSIVE_Q8   // Aggressive 模式：启用 LateBind + Q8 激活量化 + Q8xQ8 整数点积 + FP16 sidecar 紧凑传输
 };
 
 enum class tp5_numerical_reason {
@@ -87,6 +87,15 @@ static inline const char * tp5_numerical_mode_name(tp5_numerical_mode mode) {
         case tp5_numerical_mode::REFERENCE:     return "reference";
         case tp5_numerical_mode::EXACT_F32:     return "exact-f32";
         case tp5_numerical_mode::AGGRESSIVE_Q8: return "aggressive-q8";
+        default:                                return "unknown";
+    }
+}
+
+static inline const char * tp5_numerical_mode_desc(tp5_numerical_mode mode) {
+    switch (mode) {
+        case tp5_numerical_mode::REFERENCE:     return "reference-no-latebind";
+        case tp5_numerical_mode::EXACT_F32:     return "exact-f32-strict-math";
+        case tp5_numerical_mode::AGGRESSIVE_Q8: return "aggressive-q8-quantized";
         default:                                return "unknown";
     }
 }
@@ -829,6 +838,8 @@ struct tp5_linear_program {
     std::vector<VkCommandPool> pools;
     std::vector<VkCommandBuffer> commands;
     std::vector<std::shared_ptr<const vk_tp5_graph_program>> graphs;
+    // Definition-time semantic sequence record for validation & regression testing:
+    std::vector<tp5_latebind_semantic_step> late_steps;
     ~tp5_linear_program() {
         // Owners release this object only after native drain, or before its
         // first submission. Rebuilds retain old programs until that drain.
@@ -3225,8 +3236,9 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
     const uint32_t mode_bit = 1u << (uint32_t) plan.numerical_mode;
     if ((reported_modes_mask.fetch_or(mode_bit, std::memory_order_relaxed) & mode_bit) == 0) {
         fprintf(stderr,
-                "[tp5-numerical-mode] mode=%s reason=%s wire=%s late=%s direct=%s\n",
+                "[tp5-numerical-mode] mode=%s desc=%s reason=%s wire=%s late=%s direct=%s\n",
                 tp5_numerical_mode_name(plan.numerical_mode),
+                tp5_numerical_mode_desc(plan.numerical_mode),
                 tp5_numerical_reason_name(plan.numerical_reason),
                 c.wire == tp5_wire_type::F32 ? "f32" : "f16",
                 late_plan ? "yes" : "no",
@@ -4956,23 +4968,18 @@ static bool tp5_define_linear_chain(tp5_comm & c,
                     if (q_contract <= q_begin) {
                         c.fail("LateBind aggressive Q8 semantic split is missing"); return false;
                     }
-                    // P1 -> scatter -> ACT-Q8 -> ACT visibility -> norm(Y)
-                    // -> Q8dot. The only ACT dependency barrier is deliberately
-                    // before norm, so norm and the large Q8 contraction have no
-                    // execution barrier between them.
-                    if (!emit(pre, injected ? inject_end : 0, q_contract) ||
-                        !emit(p2, 0, norm_end) ||
-                        !emit(pre, q_contract)) {
+                    // P1 -> scatter -> ACT-Q8 -> ACT visibility -> WAR barrier (trefs) -> norm(Y)
+                    // -> Q8dot.
+                    // The WAR barrier on trefs (SHADER_READ -> SHADER_WRITE) guarantees late_act_q8
+                    // finishes reading z_p before late_norm overwrites it with canonical y.
+                    // Symmetrically with the exact-F32 branch, this barrier is placed strictly
+                    // before norm, preserving the zero-barrier overlap between norm and Q8dot.
+                    if (!emit(pre, injected ? inject_end : 0, q_contract)) {
                         return false;
                     }
-                } else {
-                    // Exact fallback: late_q reads z_p from outgoing->key.bindings[r],
-                    // while norm overwrites the same buffer with canonical y. To prevent
-                    // the RAW hazard, late_q and sidecar publication must strictly precede
-                    // norm, separated by an execution/memory barrier on the tensor buffer.
-                    if (!emit(pre, injected ? inject_end : 0)) {
-                        return false;
-                    }
+                    linear->late_steps.push_back({tp5_latebind_semantic_step::kind::READ_TREFS, "late_act_q8"});
+                    linear->late_steps.push_back({tp5_latebind_semantic_step::kind::BARRIER_ACT_BUF, "act_ready"});
+
                     VkBufferMemoryBarrier q_norm_barrier{
                         VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
                         VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
@@ -4985,9 +4992,45 @@ static bool tp5_define_linear_chain(tp5_comm & c,
                                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                          0, 0, nullptr, 1, &q_norm_barrier, 0, nullptr);
                     ++barriers;
+                    linear->late_steps.push_back({tp5_latebind_semantic_step::kind::BARRIER_WAR_TREFS, "q_norm_barrier"});
+
                     if (!emit(p2, 0, norm_end)) {
                         return false;
                     }
+                    linear->late_steps.push_back({tp5_latebind_semantic_step::kind::WRITE_TREFS, "late_norm"});
+
+                    if (!emit(pre, q_contract)) {
+                        return false;
+                    }
+                    linear->late_steps.push_back({tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT, "late_q8dot"});
+                } else {
+                    // Exact fallback: late_q reads z_p from outgoing->key.bindings[r],
+                    // while norm overwrites the same buffer with canonical y. To prevent
+                    // the RAW hazard, late_q and sidecar publication must strictly precede
+                    // norm, separated by an execution/memory barrier on the tensor buffer.
+                    if (!emit(pre, injected ? inject_end : 0)) {
+                        return false;
+                    }
+                    linear->late_steps.push_back({tp5_latebind_semantic_step::kind::READ_TREFS, "late_q"});
+
+                    VkBufferMemoryBarrier q_norm_barrier{
+                        VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
+                        VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                        outgoing->key.bindings[r].buf,
+                        outgoing->key.bindings[r].offset,
+                        outgoing->key.bindings[r].size
+                    };
+                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         0, 0, nullptr, 1, &q_norm_barrier, 0, nullptr);
+                    ++barriers;
+                    linear->late_steps.push_back({tp5_latebind_semantic_step::kind::BARRIER_WAR_TREFS, "q_norm_barrier"});
+
+                    if (!emit(p2, 0, norm_end)) {
+                        return false;
+                    }
+                    linear->late_steps.push_back({tp5_latebind_semantic_step::kind::WRITE_TREFS, "late_norm"});
                 }
             }
             timestamp(5 * s + 4);
@@ -4995,12 +5038,21 @@ static bool tp5_define_linear_chain(tp5_comm & c,
         if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
             c.fail("LateBind linear primary end failed"); return false;
         }
+        if (!linear->late_steps.empty()) {
+            std::string war_err;
+            if (!tp5_validate_latebind_war_schedule(q8_sites > 0, linear->late_steps, war_err)) {
+                c.fail("LateBind linear WAR schedule validation failed on rank " + std::to_string(r) + ": " + war_err);
+                return false;
+            }
+        }
         const char * active_num_mode = (late_sites == 0) ? "reference" :
                                        (q8_sites > 0 ? "aggressive-q8" : "exact-f32");
-        fprintf(stderr, "[tp5-linear-definition] rank=%zu stages=%zu primary_cbs=1 mode=%s late=%zu "
+        const char * active_num_desc = (late_sites == 0) ? "reference-no-latebind" :
+                                       (q8_sites > 0 ? "aggressive-q8-quantized" : "exact-f32-strict-math");
+        fprintf(stderr, "[tp5-linear-definition] rank=%zu stages=%zu primary_cbs=1 mode=%s desc=%s late=%zu "
                         "q8_fast=%zu scatter_early=%zu overlap=norm-q sidecar_pub=fused "
                         "dispatches=%zu barriers=%zu copies=%zu timing=%d\n",
-                r, n_stages, active_num_mode, late_sites, q8_sites, hoisted, dispatches, barriers, copies, capture ? 1 : 0);
+                r, n_stages, active_num_mode, active_num_desc, late_sites, q8_sites, hoisted, dispatches, barriers, copies, capture ? 1 : 0);
     }
     if (c.linear_program) c.retired_linear_programs.push_back(std::move(c.linear_program));
     c.linear_program = std::move(linear);
@@ -6583,6 +6635,10 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
     const bool   allow_chain_cache = chain_cache_env == nullptr || atoi(chain_cache_env) != 0;
     const bool linear = c.sync_mode == tp5_sync_mode::RELAY && c.wire == tp5_wire_type::F32 &&
                         tp5_latebind_hc_enabled();
+    if (!linear && n_late_stages > 0) {
+        c.fail("LateBind stage requested in non-linear submit_epoch_chain; LateBind requires RELAY F32 linear program lowering");
+        return false;
+    }
 
     bool can_reuse_chain =
         allow_chain_cache && !capture && c.compiled_chain.valid && c.compiled_chain.n_stages == n_stages &&
@@ -6644,13 +6700,17 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
                 n_compute += stage[i].size();
             for (size_t s = 0; s < n_stages; ++s) {
                 const auto & stage_key = c.cached_plans[c.chain_plan_indices[s]].key;
+                // LateBind stages are strictly lowered via tp5_define_linear_chain.
+                // It is impossible for a late stage to reach this non-linear rebuild path.
+                // Fail-closed immediately if any late key is unexpectedly observed.
                 if (stage_key.late[i].late_rank) {
-                    n_compute -= 2;
+                    c.fail("LateBind stage key detected in non-linear epoch chain rebuild; LateBind requires linear program lowering");
+                    return false;
                 } else if (stage_key.hc[i].width) {
                     --n_compute;
                 }
             }
-            scratch.compute.resize(n_compute + 2 * n_stages - n_direct_stages + n_late_stages +
+            scratch.compute.resize(n_compute + 2 * n_stages - n_direct_stages +
                                    (capture ? 5 * n_stages + 3 : 0));
             const auto append_segment = [&](size_t slot, size_t begin, size_t end, uint64_t wait_epoch,
                                             uint64_t signal) {
@@ -6682,7 +6742,11 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
                 size_t first_compute = 0;
                 if (s > 0) {
                     const auto & prev_key = c.cached_plans[c.chain_plan_indices[s - 1]].key;
-                    first_compute = prev_key.late[i].late_rank ? 2 : prev_key.hc[i].width ? 1 : 0;
+                    if (prev_key.late[i].late_rank) {
+                        c.fail("LateBind stage key detected in non-linear compute offset");
+                        return false;
+                    }
+                    first_compute = prev_key.hc[i].width ? 1 : 0;
                 }
                 for (size_t cb = first_compute; cb < stage_compute_cbs[s][i].size(); ++cb) {
                     scratch.compute[cursor++] = (VkCommandBuffer) stage_compute_cbs[s][i][cb];
@@ -6691,22 +6755,17 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
                     scratch.compute[cursor++] = c.ranks[i].timing_markers[5 * s + 2];
                 const size_t compute_end = cursor;
                 const auto & current_plan = c.cached_plans[c.chain_plan_indices[s]];
-                const bool late_stage = current_plan.key.late[i].late_rank != 0;
+                if (current_plan.key.late[i].late_rank != 0) {
+                    c.fail("LateBind plan detected in non-linear submit_epoch_chain");
+                    return false;
+                }
                 const bool direct_stage =
                     c.sync_mode == tp5_sync_mode::RELAY &&
                     tp5_relay_direct_stage(current_plan.key, c.n_ranks);
-                if (capture && !late_stage)
+                if (capture)
                     scratch.compute[cursor++] = c.ranks[i].timing_markers[5 * s + 3];
                 if (!direct_stage) {
-                    // Publish the main activation first.  The CPU can begin
-                    // reducing y while the same GPU queue continues with the
-                    // LateBind sufficient-statistic precompute below.
                     scratch.compute[cursor++] = current_plan.p1->cmd_p1[bslot];
-                }
-                if (capture && late_stage)
-                    scratch.compute[cursor++] = c.ranks[i].timing_markers[5 * s + 3];
-                if (late_stage) {
-                    scratch.compute[cursor++] = current_plan.cmd_late_pre[bslot];
                 }
                 if (capture)
                     scratch.compute[cursor++] = c.ranks[i].timing_markers[5 * s + 4];
@@ -6741,7 +6800,11 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
             if (capture)
                 scratch.compute[cursor++] = c.ranks[i].timing_markers[5 * n_stages + 1];
             const auto & last_key = c.cached_plans[c.chain_plan_indices.back()].key;
-            const size_t first_tail = last_key.late[i].late_rank ? 2 : last_key.hc[i].width ? 1 : 0;
+            if (last_key.late[i].late_rank) {
+                c.fail("LateBind tail stage detected in non-linear submit_epoch_chain");
+                return false;
+            }
+            const size_t first_tail = last_key.hc[i].width ? 1 : 0;
             for (size_t cb = first_tail; cb < stage_compute_cbs.back()[i].size(); ++cb) {
                 scratch.compute[cursor++] = (VkCommandBuffer) stage_compute_cbs.back()[i][cb];
             }

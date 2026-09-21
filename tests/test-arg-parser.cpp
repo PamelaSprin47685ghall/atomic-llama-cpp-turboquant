@@ -1700,6 +1700,62 @@ static void test(void) {
         }
     }
 
+    {
+        printf("test-arg-parser: test --tp5-latebind CLI parsing and env mapping\n\n");
+
+        // 1. Default (unspecified): latebind is empty, does not override existing GGML_TP5_LATEBIND
+        {
+            common_params p;
+            argv = {"binary_name", "--tp5", "qwen4exp-af"};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p, LLAMA_EXAMPLE_SERVER));
+            assert(p.tp5.enabled);
+            assert(p.tp5.latebind.empty());
+        }
+
+        // 2. Explicit off
+        {
+            common_params p;
+            argv = {"binary_name", "--tp5", "qwen4exp-af", "--tp5-latebind", "off"};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p, LLAMA_EXAMPLE_SERVER));
+            assert(p.tp5.enabled);
+            assert(p.tp5.latebind == "off");
+            common_tp5_apply_env(p);
+            assert(std::string(getenv("GGML_TP5_LATEBIND") ? getenv("GGML_TP5_LATEBIND") : "") == "0");
+            assert(std::string(getenv("GGML_TP5_LATEBIND_EXACT_Q") ? getenv("GGML_TP5_LATEBIND_EXACT_Q") : "") == "0");
+        }
+
+        // 3. Explicit exact
+        {
+            common_params p;
+            argv = {"binary_name", "--tp5-latebind", "exact"};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p, LLAMA_EXAMPLE_SERVER));
+            assert(p.tp5.enabled);
+            assert(p.tp5.latebind == "exact");
+            common_tp5_apply_env(p);
+            assert(std::string(getenv("GGML_TP5_LATEBIND") ? getenv("GGML_TP5_LATEBIND") : "") == "hc-down");
+            assert(std::string(getenv("GGML_TP5_LATEBIND_EXACT_Q") ? getenv("GGML_TP5_LATEBIND_EXACT_Q") : "") == "1");
+        }
+
+        // 4. Explicit aggressive
+        {
+            common_params p;
+            argv = {"binary_name", "--tp5-latebind", "aggressive"};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), p, LLAMA_EXAMPLE_SERVER));
+            assert(p.tp5.enabled);
+            assert(p.tp5.latebind == "aggressive");
+            common_tp5_apply_env(p);
+            assert(std::string(getenv("GGML_TP5_LATEBIND") ? getenv("GGML_TP5_LATEBIND") : "") == "hc-down");
+            assert(std::string(getenv("GGML_TP5_LATEBIND_EXACT_Q") ? getenv("GGML_TP5_LATEBIND_EXACT_Q") : "") == "0");
+        }
+
+        // 5. Invalid values fail cleanly
+        {
+            common_params p_invalid;
+            argv = {"binary_name", "--tp5-latebind", "invalid"};
+            assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), p_invalid, LLAMA_EXAMPLE_SERVER));
+        }
+    }
+
     printf("test-arg-parser: all tests OK\n\n");
 }
 

@@ -648,6 +648,7 @@ struct common_params : wanxiangqi_common_params {
         std::string manifest;              // optional tp5-manifest.json path
         std::string trace;
         bool        cmd_replay = true;
+        std::string latebind;              // off | exact | aggressive (empty = preserve existing env)
     } tp5;
 
     bool single_turn       = false; // single turn chat conversation

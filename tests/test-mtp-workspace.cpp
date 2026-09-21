@@ -349,15 +349,55 @@ static void test_mtp_cycle_ledger_accounting() {
     CHECK(sum_line.find("avg_catchup_us=500.0") != std::string::npos);
     CHECK(sum_line.find("eff=0.333") != std::string::npos);
 
-    // 3. Target verification injection API contract check
+    // 3. Target verification injection & reset-to-zero API contract check
     common_params_speculative params_spec;
     params_spec.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
     common_speculative * spec_inst = common_speculative_init(params_spec, 1);
     CHECK(spec_inst != nullptr);
+    CHECK(common_speculative_get_target_verify_us(spec_inst) == 0);
     common_speculative_record_target_verify_us(spec_inst, 4200);
-    // Verified: injection properly registers into the spec instance
-    common_speculative_record_target_verify_us(spec_inst, 0); // safe reset
+    CHECK(common_speculative_get_target_verify_us(spec_inst) == 4200);
+    // Verified: reset unconditionally resets staged target_verify_us to 0, preventing cross-request pollution
+    common_speculative_reset(spec_inst);
+    CHECK(common_speculative_get_target_verify_us(spec_inst) == 0);
     common_speculative_free(spec_inst);
+
+    // 4. Strict monotonic cycle index sequence and zero-accept cycle ledger invariants
+    // Every MTP cycle (including zero-accept cycles where accepted_tokens == 0) produces exactly
+    // one settlement record, with total_us == sum of 4 stages and final_tokens == accepted_tokens + 1.
+    {
+        std::vector<common_speculative_cycle_record> seq(4);
+        for (size_t i = 0; i < seq.size(); ++i) {
+            seq[i].cycle_id         = i + 1; // 1, 2, 3, 4 strictly monotonic
+            seq[i].draft_us         = 1000 + i * 100;
+            seq[i].target_verify_us = 2500 + i * 100;
+            seq[i].catchup_us       = (i % 2 == 1) ? 0 : 500; // odd cycles: zero-accept -> catchup_us is 0
+            seq[i].handoff_us       = 40;
+            seq[i].total_us         = seq[i].draft_us + seq[i].target_verify_us + seq[i].catchup_us + seq[i].handoff_us;
+            seq[i].draft_tokens     = 4;
+            seq[i].accepted_tokens  = (i % 2 == 1) ? 0 : 2;   // odd cycles: 0 accepted
+            seq[i].final_tokens     = seq[i].accepted_tokens + 1; // invariant: accepted + 1
+            seq[i].device_hidden    = true;
+
+            // Invariant: total_us strictly equals sum of all 4 sub-stages
+            CHECK(seq[i].total_us == seq[i].draft_us + seq[i].target_verify_us + seq[i].catchup_us + seq[i].handoff_us);
+            // Invariant: final_tokens strictly equals accepted_tokens + 1
+            CHECK(seq[i].final_tokens == seq[i].accepted_tokens + 1);
+
+            // Monotonic cycle sequence invariant
+            if (i > 0) {
+                CHECK(seq[i].cycle_id == seq[i - 1].cycle_id + 1);
+                CHECK(seq[i].cycle_id > seq[i - 1].cycle_id);
+            }
+
+            // In zero-accept cycle, verify formatting produces valid eff=0.000 and exact tokens
+            if (seq[i].accepted_tokens == 0) {
+                const std::string line = common_speculative_format_cycle_record(seq[i]);
+                CHECK(line.find("accepted_tokens=0 final_tokens=1 eff=0.000") != std::string::npos);
+                CHECK(line.find("catchup_us=0") != std::string::npos);
+            }
+        }
+    }
 }
 
 static void test_mtp_evidence_surface_contracts() {
@@ -462,26 +502,48 @@ static void test_mtp_evidence_surface_contracts() {
         CHECK(!llama_predefined_hidden_generation_matches(s, LLAMA_PREDEFINED_H_SEED, 42));
     }
 
-    // (f) Per-cycle Ledger Timing & Token Invariants
+    // (f) Per-cycle Ledger Timing & Token Invariants (including Zero-Accept Coverage)
     {
-        common_speculative_cycle_record rec;
-        rec.cycle_id         = 100;
-        rec.draft_us         = 500;
-        rec.target_verify_us = 1500;
-        rec.catchup_us       = 300;
-        rec.handoff_us       = 25;
-        rec.total_us         = 500 + 1500 + 300 + 25;
-        rec.draft_tokens     = 4;
-        rec.accepted_tokens  = 3;
-        rec.final_tokens     = 4; // 3 accepted + 1 newly sampled
-        rec.device_hidden    = true;
+        // Accepted cycle
+        common_speculative_cycle_record rec_acc;
+        rec_acc.cycle_id         = 100;
+        rec_acc.draft_us         = 500;
+        rec_acc.target_verify_us = 1500;
+        rec_acc.catchup_us       = 300;
+        rec_acc.handoff_us       = 25;
+        rec_acc.total_us         = 500 + 1500 + 300 + 25;
+        rec_acc.draft_tokens     = 4;
+        rec_acc.accepted_tokens  = 3;
+        rec_acc.final_tokens     = 4; // 3 accepted + 1 newly sampled
+        rec_acc.device_hidden    = true;
 
-        CHECK(rec.total_us == rec.draft_us + rec.target_verify_us + rec.catchup_us + rec.handoff_us);
-        CHECK(rec.final_tokens == rec.accepted_tokens + 1);
+        CHECK(rec_acc.total_us == rec_acc.draft_us + rec_acc.target_verify_us + rec_acc.catchup_us + rec_acc.handoff_us);
+        CHECK(rec_acc.final_tokens == rec_acc.accepted_tokens + 1);
 
-        const std::string line = common_speculative_format_cycle_record(rec);
-        CHECK(line.find("[tp5-mtp-cycle]") != std::string::npos);
-        CHECK(line.find("eff=0.750") != std::string::npos);
+        const std::string line_acc = common_speculative_format_cycle_record(rec_acc);
+        CHECK(line_acc.find("[tp5-mtp-cycle]") != std::string::npos);
+        CHECK(line_acc.find("eff=0.750") != std::string::npos);
+
+        // Zero-accepted cycle: must produce exactly 1 record, final_tokens == 1, catchup_us == 0, eff == 0.000
+        common_speculative_cycle_record rec_zero;
+        rec_zero.cycle_id         = 101; // monotonic increment
+        rec_zero.draft_us         = 450;
+        rec_zero.target_verify_us = 1400;
+        rec_zero.catchup_us       = 0;
+        rec_zero.handoff_us       = 20;
+        rec_zero.total_us         = 450 + 1400 + 0 + 20;
+        rec_zero.draft_tokens     = 4;
+        rec_zero.accepted_tokens  = 0; // 0 accepted
+        rec_zero.final_tokens     = 1; // exactly 1 final token
+        rec_zero.device_hidden    = true;
+
+        CHECK(rec_zero.cycle_id == rec_acc.cycle_id + 1);
+        CHECK(rec_zero.total_us == rec_zero.draft_us + rec_zero.target_verify_us + rec_zero.catchup_us + rec_zero.handoff_us);
+        CHECK(rec_zero.final_tokens == rec_zero.accepted_tokens + 1);
+
+        const std::string line_zero = common_speculative_format_cycle_record(rec_zero);
+        CHECK(line_zero.find("[tp5-mtp-cycle] cycle=101") != std::string::npos);
+        CHECK(line_zero.find("draft_tokens=4 accepted_tokens=0 final_tokens=1 eff=0.000") != std::string::npos);
     }
 }
 

@@ -82,3 +82,48 @@ done
   使“status[2] 全零”成为脚本可判定的硬门禁。决定人：Manager；实现归属 `ggml/**` 负责人（本任务不碰 `ggml/**`）。
 - **R3 脚本执行位**：`scripts/check-tp5-mtp-evidence.sh` 与 `scripts/make-tp5-mtp-evidence-fixtures.sh`
   当前无执行位。在 DevOps 部署时执行一次 `chmod +x` 即可；此前的标准调用方式为 `bash scripts/<name>.sh`。
+
+---
+
+## 五、架构决策记录 (ADR)：MTP 周期账本结算闭合契约与状态重置
+
+### 1. 上下文与约束 (Context & Constraints)
+- **历史缺口**：
+  1. `record_cycle_settle()` 仅在 `commit()` 尾部调用；当 `n_commit == 0`（零接受周期）时，原代码直接 `clear_staged()` 并 `return true`，跳过结算，导致零接受周期账本完全缺失；
+  2. 若在容量超限或内部解码错误等异常路径提前跳出，当轮累加器（`cur_cycle_*_us`、`cur_cycle_*_tokens`）与外部注入的 `last_target_verify_us` 停留在实例中，与后续周期或跨请求发生脏累加与时间串线；
+  3. 门禁脚本 `scripts/check-tp5-mtp-evidence.sh` 原先未对 `cycle_id` 进行单调递增连续性断言，也未对零接受周期覆盖进行检查。
+- **约束**：不得修改数学计算与调度器逻辑；不得触碰 `src/llama-predefined-hidden.cpp`；保持正常路径行为与字段语义不变；不引入每 token 额外开销。
+
+### 2. 选定方案 (Chosen Path)
+1. **RAII 结算守卫 (`cycle_settle_guard`)**：
+   在 `common_speculative_impl_draft_mtp::commit()` 入口挂载栈上守卫对象。无论正常提交、`n_commit == 0` 快速返回，还是容量超限、解码失败或中途抛出异常退出，守卫析构函数均确保 `record_cycle_settle()` 恰好执行一次，杜绝遗漏与跨周期污染。
+2. **累加器与 Target 验证计时无条件归零**：
+   `record_cycle_settle()` 在格式化日志（若激活 profile）后，无条件将 `cur_cycle_*_us`、`cur_cycle_*_tokens` 及 `parent_spec->last_target_verify_us` 原子置零；同时在 `reset()` 与 `common_speculative_reset()` 中双重清理，杜绝跨会话残留。
+3. **单调连续周期序号 (`cycle_id`)**：
+   周期序号由 `parent_spec->cycle_id`（若无 parent 则由本地 `cur_cycle_local_id`）严格单调递增（1, 2, 3...），并通过 `[tp5-mtp-cycle] cycle=N` 呈现。
+4. **测试与门禁闭环**：
+   在 `tests/test-mtp-workspace.cpp` 中增加零接受周期账本、单调递增连续性及 reset 归零断言；在 `scripts/check-tp5-mtp-evidence.sh` 门禁 [F] 中增加序号递增连续性（`F_BAD_SEQ`）与零接受覆盖（`F_BAD_ZERO_COVERAGE`）硬门禁。
+
+### 3. 被否决的备选方案与否决理由 (Credible Alternatives & Why Rejected)
+- **备选 A：仅在 `if (n_commit == 0)` 处手工加一行 `record_cycle_settle()`**：
+  *否决理由*：只能解决正常零接受分支，无法解决 `n_commit > n_batch_alloc`、`commit_row` 失败或异常退出时的累加器残留，漏保异常路径。
+- **备选 B：在每个 return 分支手工补写结算**：
+  *否决理由*：极易在新代码维护或提前退出时遗漏，不具备 RAII 守卫的异常安全保证。
+- **备选 C：仅在激活 PROFILE 环境变量时才重置累加器**：
+  *否决理由*：若非 PROFILE 运行一段时间后动态切换环境变量，将导致累加器爆表；无条件重置仅耗费几个标量赋值，零可测开销，能保证确定性状态机。
+
+### 4. 架构后果 (Consequences)
+- 每个 MTP 周期（无论是否接受、无论正常或异常）产生且仅产生一条严密闭合的账本记录；
+- 零接受周期完整进入审计，且满足 $final_tokens == 1$ 与 $eff == 0.000$；
+- 门禁脚本具备对缺失周期和跳步的敏锐拦截能力；
+- 零额外每 token 运行时开销。
+
+### 5. 触发重新审视的新证据 (Triggers for Revisit)
+- 若未来引入无需 `commit()` 的异步流水线推测模式（非 defer 模式），需将周期结算触发点扩展至 `process()` 阶段；
+- 若未来实现纯 GPU 端硬件时间戳（Vulkan Timestamp Query Pool）并直接在片上完成 AllReduce 计时汇总，则结算逻辑需适配 host-mapped 异步查询机制。
+
+### 6. 治理契约与文件 (Governing Contracts)
+- 接口与结构定义：`common/speculative.h`
+- 周期生命周期实现：`common/speculative.cpp`
+- 单元契约回归：`tests/test-mtp-workspace.cpp`
+- 自动化门禁脚本：`scripts/check-tp5-mtp-evidence.sh`

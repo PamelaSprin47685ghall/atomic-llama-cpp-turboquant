@@ -3084,6 +3084,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--tp5-latebind"}, "MODE",
+        "TP5 LateBind numerical mode: off | exact | aggressive (default: preserve GGML_TP5_LATEBIND env)",
+        [](common_params & params, const std::string & value) {
+            params.tp5.enabled = true;
+            if (value == "off" || value == "exact" || value == "aggressive") {
+                params.tp5.latebind = value;
+            } else {
+                throw std::invalid_argument(string_format("error: invalid value for --tp5-latebind: '%s' (allowed: off, exact, aggressive)\n", value.c_str()));
+            }
+        }
+    ));
+    add_opt(common_arg(
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(
             "KV cache data type for K\n"

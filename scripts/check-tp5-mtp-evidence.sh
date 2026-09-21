@@ -111,7 +111,11 @@ else
     F_BAD_TARGET=0
     F_BAD_HIDDEN=0
     F_BAD_ACCEPT=0
+    F_BAD_SEQ=0
+    ZERO_ACCEPT_COUNT=0
+    EXPECTED_CYCLE=1
     while IFS= read -r line; do
+        cycle=$(echo "$line" | sed -n 's/.*cycle=\([0-9][0-9]*\).*/\1/p')
         draft_us=$(echo "$line" | sed -n 's/.*draft_us=\([0-9][0-9]*\).*/\1/p')
         target_us=$(echo "$line" | sed -n 's/.*target_us=\([0-9][0-9]*\).*/\1/p')
         catchup_us=$(echo "$line" | sed -n 's/.*catchup_us=\([0-9][0-9]*\).*/\1/p')
@@ -121,8 +125,16 @@ else
         accepted_tk=$(echo "$line" | sed -n 's/.*accepted_tokens=\([0-9][0-9]*\).*/\1/p')
         final_tk=$(echo "$line" | sed -n 's/.*final_tokens=\([0-9][0-9]*\).*/\1/p')
         dev_hidden=$(echo "$line" | sed -n 's/.*dev_hidden=\([0-9][0-9]*\).*/\1/p')
-        : "${draft_us:=0}" "${target_us:=0}" "${catchup_us:=0}" "${handoff_us:=0}" "${total_us:=0}"
+        : "${cycle:=0}" "${draft_us:=0}" "${target_us:=0}" "${catchup_us:=0}" "${handoff_us:=0}" "${total_us:=0}"
         : "${draft_tk:=0}" "${accepted_tk:=0}" "${final_tk:=0}" "${dev_hidden:=0}"
+        if [[ "$cycle" -ne "$EXPECTED_CYCLE" ]]; then
+            F_BAD_SEQ=$((F_BAD_SEQ + 1))
+            echo "  ! 周期序号不连续 (期望 cycle=$EXPECTED_CYCLE, 实际 cycle=$cycle): $line"
+        fi
+        EXPECTED_CYCLE=$((cycle + 1))
+        if [[ "$accepted_tk" -eq 0 ]]; then
+            ZERO_ACCEPT_COUNT=$((ZERO_ACCEPT_COUNT + 1))
+        fi
         if [[ $((draft_us + target_us + catchup_us + handoff_us)) -ne "$total_us" ]]; then
             F_BAD_IDENTITY=$((F_BAD_IDENTITY + 1))
             echo "  ! 时间恒等式背离: $line"
@@ -145,15 +157,23 @@ else
         fi
     done < <(grep '\[tp5-mtp-cycle\] cycle=' "$LOG_FILE" || true)
 
+    echo "  - 零接受周期数 (accepted_tokens=0): $ZERO_ACCEPT_COUNT"
+    if [[ "$ZERO_ACCEPT_COUNT" -eq 0 ]]; then
+        echo "  ! 未覆盖零接受周期（受控验证须包含至少 1 次零接受周期账本以证实无跳过结算）"
+        F_BAD_ZERO_COVERAGE=1
+    else
+        F_BAD_ZERO_COVERAGE=0
+    fi
+
     SUMMARY_LINE=$(grep '\[tp5-mtp-cycle-summary\]' "$LOG_FILE" | tail -n 1 || true)
     if [[ -n "$SUMMARY_LINE" ]]; then
         echo "  - 账本统计汇总: $SUMMARY_LINE"
     fi
-    F_TOTAL=$((F_BAD_IDENTITY + F_BAD_TOKEN + F_BAD_TARGET + F_BAD_HIDDEN + F_BAD_ACCEPT))
+    F_TOTAL=$((F_BAD_IDENTITY + F_BAD_TOKEN + F_BAD_TARGET + F_BAD_HIDDEN + F_BAD_ACCEPT + F_BAD_SEQ + F_BAD_ZERO_COVERAGE))
     if [[ "$F_TOTAL" -eq 0 ]]; then
-        echo "  -> [PASS] 全部 $CYCLE_COUNT 个周期满足时间恒等式、Token 守恒、target_us>0、dev_hidden==1。"
+        echo "  -> [PASS] 全部 $CYCLE_COUNT 个周期满足时间恒等式、Token 守恒、序号连续单调递增、覆盖零接受（$ZERO_ACCEPT_COUNT 次）、target_us>0、dev_hidden==1。"
     else
-        echo "  -> [FAIL] 账本违例：恒等式背离=${F_BAD_IDENTITY} 守恒背离=${F_BAD_TOKEN} target零值=${F_BAD_TARGET} 非直传=${F_BAD_HIDDEN} 超收=${F_BAD_ACCEPT}。"
+        echo "  -> [FAIL] 账本违例：恒等式背离=${F_BAD_IDENTITY} 守恒背离=${F_BAD_TOKEN} target零值=${F_BAD_TARGET} 非直传=${F_BAD_HIDDEN} 超收=${F_BAD_ACCEPT} 序号不连续=${F_BAD_SEQ} 零接受缺失=${F_BAD_ZERO_COVERAGE}。"
         FAILURES=$((FAILURES + 1))
     fi
 fi

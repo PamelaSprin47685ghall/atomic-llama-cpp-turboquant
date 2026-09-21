@@ -489,3 +489,95 @@ private:
     bool m_stop = false;
 };
 
+// Definition-time LateBind execution semantics and WAR contract verification.
+// Pure CPU-verifiable semantic steps; zero runtime overhead on warm tokens.
+struct tp5_latebind_semantic_step {
+    enum class kind {
+        READ_TREFS,           // late_q (exact) or late_act_q8 (aggressive) reads z_p from bindings[r]
+        BARRIER_ACT_BUF,      // act_ready barrier on late_act_q8_buf (aggressive only)
+        BARRIER_WAR_TREFS,    // explicit SHADER_READ -> SHADER_WRITE barrier on bindings[r]
+        WRITE_TREFS,          // late_norm writes canonical y to bindings[r]
+        DISPATCH_Q8DOT        // late_q8dot contraction (aggressive only, no barrier after norm)
+    };
+    kind type;
+    const char * name;
+};
+
+// Validates that the LateBind command sequence satisfies the Write-After-Read (WAR)
+// hazard contract on trefs (bindings[r]) and preserves the zero-barrier overlap
+// between norm and Q8dot. Returns true on success; fills err on violation.
+static inline bool tp5_validate_latebind_war_schedule(
+        bool aggressive_q8,
+        const std::vector<tp5_latebind_semantic_step> & steps,
+        std::string & err) {
+    int read_idx = -1;
+    int act_barrier_idx = -1;
+    int war_barrier_idx = -1;
+    int write_idx = -1;
+    int q8dot_idx = -1;
+
+    for (int i = 0; i < (int) steps.size(); ++i) {
+        switch (steps[i].type) {
+            case tp5_latebind_semantic_step::kind::READ_TREFS:
+                if (read_idx != -1) { err = "duplicate READ_TREFS"; return false; }
+                read_idx = i;
+                break;
+            case tp5_latebind_semantic_step::kind::BARRIER_ACT_BUF:
+                if (act_barrier_idx == -1) { act_barrier_idx = i; }
+                break;
+            case tp5_latebind_semantic_step::kind::BARRIER_WAR_TREFS:
+                if (war_barrier_idx == -1) { war_barrier_idx = i; }
+                break;
+            case tp5_latebind_semantic_step::kind::WRITE_TREFS:
+                if (write_idx != -1) { err = "duplicate WRITE_TREFS"; return false; }
+                write_idx = i;
+                break;
+            case tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT:
+                if (q8dot_idx != -1) { err = "duplicate DISPATCH_Q8DOT"; return false; }
+                q8dot_idx = i;
+                break;
+        }
+    }
+
+    if (read_idx == -1) { err = "missing READ_TREFS"; return false; }
+    if (war_barrier_idx == -1) { err = "missing BARRIER_WAR_TREFS"; return false; }
+    if (write_idx == -1) { err = "missing WRITE_TREFS"; return false; }
+
+    // Core WAR rule: READ must precede WAR barrier, WAR barrier must precede WRITE
+    if (read_idx >= war_barrier_idx) {
+        err = "READ_TREFS must precede BARRIER_WAR_TREFS";
+        return false;
+    }
+    if (war_barrier_idx >= write_idx) {
+        err = "BARRIER_WAR_TREFS must precede WRITE_TREFS";
+        return false;
+    }
+
+    if (aggressive_q8) {
+        if (act_barrier_idx == -1) { err = "missing BARRIER_ACT_BUF for aggressive Q8"; return false; }
+        if (q8dot_idx == -1) { err = "missing DISPATCH_Q8DOT for aggressive Q8"; return false; }
+        if (read_idx >= act_barrier_idx) {
+            err = "READ_TREFS (act_q8) must precede BARRIER_ACT_BUF";
+            return false;
+        }
+        if (act_barrier_idx >= war_barrier_idx) {
+            err = "BARRIER_ACT_BUF must precede BARRIER_WAR_TREFS";
+            return false;
+        }
+        if (write_idx >= q8dot_idx) {
+            err = "WRITE_TREFS (norm) must precede DISPATCH_Q8DOT";
+            return false;
+        }
+        // Invariant: No barrier between WRITE_TREFS and DISPATCH_Q8DOT
+        if (q8dot_idx != write_idx + 1) {
+            err = "unexpected barrier between norm and Q8dot: zero-barrier overlap violated";
+            return false;
+        }
+    } else {
+        if (act_barrier_idx != -1) { err = "unexpected BARRIER_ACT_BUF in exact F32 mode"; return false; }
+        if (q8dot_idx != -1) { err = "unexpected DISPATCH_Q8DOT in exact F32 mode"; return false; }
+    }
+
+    return true;
+}
+
