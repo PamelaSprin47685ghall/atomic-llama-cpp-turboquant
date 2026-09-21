@@ -1732,6 +1732,251 @@ void llama_rerot_shared_world::append_keys(const std::vector<llama_rerot_key_rec
     }
 }
 
+// Twelfth round: production upsert + O(1) tail append. The cache level
+// feeds the world from apply_ubatch (ring recycle: same key index, new
+// content), publish/reclassify (meta-only rewrites), and the decode tail
+// (fresh key index extending a contiguous+uniform run). These three
+// primitives keep the world valid without ever re-running the structural
+// pass on the hot path.
+
+bool llama_rerot_shared_world::try_append_key_fast(const llama_rerot_key_record & key) {
+    if (key.storage_pos < 0) {
+        return false;
+    }
+    if (key.key_index < key_at.size() && key_at[key.key_index] != UINT32_MAX) {
+        return false; // not new: upsert territory
+    }
+    if (!key.meta.active()) {
+        return false; // untagged tail append needs the sorted insert; rare
+    }
+    // Locate the run bucket.
+    run * target = nullptr;
+    for (auto & cand : runs_) {
+        if (cand.episode_id == key.meta.episode_id && cand.run_id == key.meta.run_id &&
+            cand.owner_node == key.meta.node_id) {
+            target = &cand;
+            break;
+        }
+    }
+    if (!target || target->rows.empty() || !target->contiguous || !target->uniform) {
+        return false; // fresh run / non-contiguous / mixed meta: general path
+    }
+    // Tail extension preconditions: storage +1, same (visibility, frontier),
+    // tagged tail order (storage, frontier, key_index ascending).
+    const auto & tail = records[target->rows.back()];
+    if (key.storage_pos != tail.storage_pos + 1 ||
+        key.meta.visibility != tail.meta.visibility ||
+        key.meta.frontier != tail.meta.frontier ||
+        key.key_index < tail.key_index) {
+        return false;
+    }
+    // O(1) extend: identity tables, storage, dev, fast_keys all grow by one.
+    const size_t pos = records.size();
+    records.push_back(key);
+    if (key.key_index >= key_at.size()) {
+        key_at.resize(size_t(key.key_index) + 1, UINT32_MAX);
+    }
+    key_at[key.key_index] = uint32_t(pos);
+    target->rows.push_back(uint32_t(pos));
+    target->storage.push_back(key.storage_pos);
+    target->d2t.push_back(uint32_t(target->d2t.size()));
+    target->t2d.push_back(uint32_t(target->t2d.size()));
+    target->dev.push_back(int64_t(key.storage_pos) - int64_t(target->dev.size()));
+    target->fast_keys.push_back(key.key_index);
+    // uniform/contiguous flags stay true by the preconditions above.
+    return true;
+}
+
+void llama_rerot_shared_world::upsert_keys(const std::vector<llama_rerot_key_record> & keys) {
+    if (keys.empty()) {
+        return;
+    }
+    // Validate everything first (fail-loud, no partial mutation), then apply.
+    // A replacement must keep storage_pos only when it keeps the key; a
+    // recycled key may change storage_pos freely (the old row leaves).
+    for (const auto & key : keys) {
+        if (key.storage_pos < 0) {
+            throw std::invalid_argument("RERoT key storage position must be non-negative");
+        }
+    }
+
+    // Split: new indices vs replaced indices.
+    std::vector<size_t> fresh, recycled;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto & key = keys[i];
+        if (key.key_index < key_at.size() && key_at[key.key_index] != UINT32_MAX) {
+            recycled.push_back(i);
+        } else {
+            fresh.push_back(i);
+        }
+    }
+
+    // Remove every recycled record from its current home (run rows /
+    // untagged order), then mark its key_at slot absent so the append below
+    // treats it as new. The record copy stays at its records position
+    // (positions are stable); only structural membership is dropped.
+    // Remember the old position so the append rewrites it in place.
+    std::vector<uint32_t> old_pos(keys.size(), UINT32_MAX);
+    for (const size_t i : recycled) {
+        const auto & key = keys[i];
+        const size_t pos = size_t(key_at[key.key_index]);
+        old_pos[i] = uint32_t(pos);
+        const auto & old = records[pos];
+        if (old.meta.active()) {
+            for (size_t ri = 0; ri < runs_.size(); ++ri) {
+                auto & r = runs_[ri];
+                if (r.episode_id != old.meta.episode_id || r.run_id != old.meta.run_id ||
+                    r.owner_node != old.meta.node_id) {
+                    continue;
+                }
+                const auto it = std::find(r.rows.begin(), r.rows.end(), uint32_t(pos));
+                if (it != r.rows.end()) {
+                    r.rows.erase(it);
+                }
+                break;
+            }
+        } else {
+            const auto it = std::find(untagged_sorted_.begin(), untagged_sorted_.end(),
+                                      uint32_t(pos));
+            if (it != untagged_sorted_.end()) {
+                untagged_sorted_.erase(it);
+            }
+        }
+        key_at[key.key_index] = UINT32_MAX;
+    }
+
+    // Append every incoming record (fresh and recycled alike) at the tail of
+    // `records`, then route into its bucket. Arrival-order violations fall
+    // back to per-run tagged re-sorts (bounded by the touched runs).
+    std::vector<uint32_t> touched_runs;
+    const auto note_run = [&](const run * r) {
+        const uint32_t ri = uint32_t(r - runs_.data());
+        if (std::find(touched_runs.begin(), touched_runs.end(), ri) == touched_runs.end()) {
+            touched_runs.push_back(ri);
+        }
+    };
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto & key = keys[i];
+        if (key.key_index >= key_at.size()) {
+            key_at.resize(size_t(key.key_index) + 1, UINT32_MAX);
+        }
+        size_t pos;
+        if (old_pos[i] != UINT32_MAX) {
+            pos = size_t(old_pos[i]); // recycled: rewrite the old position
+            records[pos] = key;
+        } else {
+            pos = records.size(); // fresh: new tail position
+            records.push_back(key);
+        }
+        key_at[key.key_index] = uint32_t(pos);
+
+        if (!key.meta.active()) {
+            insert_untagged(uint32_t(pos));
+            continue;
+        }
+        run * target = nullptr;
+        for (auto & cand : runs_) {
+            if (cand.episode_id == key.meta.episode_id && cand.run_id == key.meta.run_id &&
+                cand.owner_node == key.meta.node_id) {
+                target = &cand;
+                break;
+            }
+        }
+        if (!target) {
+            runs_.push_back(run{});
+            target = &runs_.back();
+            target->episode_id = key.meta.episode_id;
+            target->run_id = key.meta.run_id;
+            target->owner_node = key.meta.node_id;
+        }
+        target->rows.push_back(uint32_t(pos));
+        note_run(target);
+    }
+
+    // Re-derive structure on every touched run (a removal can break
+    // contiguity anywhere; a mid-run insert can break tagged order).
+    for (const uint32_t ri : touched_runs) {
+        auto & r = runs_[ri];
+        std::sort(r.rows.begin(), r.rows.end(), [&](uint32_t a, uint32_t b) {
+            const auto & ka = records[a];
+            const auto & kb = records[b];
+            if (ka.storage_pos != kb.storage_pos) {
+                return ka.storage_pos < kb.storage_pos;
+            }
+            if (ka.meta.frontier != kb.meta.frontier) {
+                return ka.meta.frontier < kb.meta.frontier;
+            }
+            return ka.key_index < kb.key_index;
+        });
+        rebuild_run_structure(r);
+        recompute_uniform(r);
+    }
+    // Runs emptied by removal stay (empty buckets are harmless and keep
+    // bucket identity for a later arrival); the numeric pass skips them via
+    // n_pass == 0.
+}
+
+void llama_rerot_shared_world::remove_keys(const std::vector<uint32_t> & key_indices) {
+    if (key_indices.empty()) {
+        return;
+    }
+    // Validate first (fail-loud): every key must exist.
+    std::vector<size_t> positions;
+    positions.reserve(key_indices.size());
+    for (const uint32_t k : key_indices) {
+        if (k >= key_at.size() || key_at[k] == UINT32_MAX) {
+            throw std::invalid_argument("RERoT key removal references an absent physical key");
+        }
+        positions.push_back(size_t(key_at[k]));
+    }
+
+    std::vector<run *> touched_runs;
+    const auto note = [&](run * r) {
+        if (std::find(touched_runs.begin(), touched_runs.end(), r) == touched_runs.end()) {
+            touched_runs.push_back(r);
+        }
+    };
+
+    for (const size_t pos : positions) {
+        const auto & rec = records[pos];
+        if (rec.meta.active()) {
+            for (auto & r : runs_) {
+                if (r.episode_id == rec.meta.episode_id && r.run_id == rec.meta.run_id &&
+                    r.owner_node == rec.meta.node_id) {
+                    const auto it = std::find(r.rows.begin(), r.rows.end(), uint32_t(pos));
+                    if (it != r.rows.end()) {
+                        r.rows.erase(it);
+                        note(&r);
+                    }
+                    break;
+                }
+            }
+        } else {
+            const auto it = std::find(untagged_sorted_.begin(), untagged_sorted_.end(),
+                                      uint32_t(pos));
+            if (it != untagged_sorted_.end()) {
+                untagged_sorted_.erase(it);
+            }
+        }
+        key_at[rec.key_index] = UINT32_MAX;
+        // The record slot stays (positions are stable); it is now absent
+        // from every structural index, so no pass can reach it.
+    }
+
+    for (run * r : touched_runs) {
+        if (r->rows.empty()) {
+            continue; // empty buckets are harmless (n_pass == 0)
+        }
+        // Removal can only break tagged order if the comparator keys of the
+        // remaining rows changed — they did not (removal preserves relative
+        // order), so rows stay sorted; only the derived tables need a
+        // rebuild (d2t/t2d/dev shift by the removal).
+        rebuild_run_structure(*r);
+        recompute_uniform(*r);
+    }
+}
+
 void llama_rerot_shared_world::set_key_meta(const std::vector<llama_rerot_key_record> & keys) {
     if (keys.empty()) {
         return;

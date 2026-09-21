@@ -362,6 +362,7 @@ static void test_rerot_snapshot_isolation();
 static void test_tri_fill_first_interaction();
 static void test_arena_lease_zero_heap();
 static void test_rerot_shared_reader_multi_query();
+static void test_rerot_world_incremental_decode();
 static void test_ddvr_two_query_groups();
 static void test_zero_alloc_warmed_maintain();
 static void test_r3_reference_landmarks();
@@ -1029,6 +1030,7 @@ int main() {
     test_tri_fill_first_interaction();
     test_arena_lease_zero_heap();
     test_rerot_shared_reader_multi_query();
+    test_rerot_world_incremental_decode();
     test_ddvr_two_query_groups();
     test_zero_alloc_warmed_maintain();
     test_r3_reference_landmarks();
@@ -1599,6 +1601,136 @@ static void test_rerot_shared_reader_multi_query() {
             TEST_ASSERT(cells0.pos_get(layout.entries[e].key_index) <= positions[q]);
         }
     }
+}
+
+// Twelfth round: the persistent shared world is wired into the cache level
+// (apply_ubatch upsert, publish/reclassify set_key_meta, CellGeneration as
+// the untracked-mutation safety net). This probe drives the PRODUCTION
+// sequence — multi-run commit, several decode appends, publish, more
+// appends, ring recycle (same cell index rewritten with a new run) — and
+// after EVERY step compares the cache-level layout against the per-query
+// oracle rebuilt from the cells (the same contract as
+// test_rerot_shared_reader_multi_query, but across world mutations).
+static void test_rerot_world_incremental_decode() {
+    fprintf(stderr, "--- test_rerot_world_incremental_decode ---\n");
+    rt_test_model model(2);
+    llama_cparams cp = rt_cparams(LLAMA_XKV_MODE_SHADOW, 8, 16, 2);
+    cp.rerot_enabled = true;
+    llama_kv_cache kv(model, model.hparams, GGML_TYPE_F32, GGML_TYPE_F32,
+        false, false, true, 64, 1, 1, 0, LLAMA_SWA_TYPE_NONE,
+        nullptr, nullptr, nullptr, nullptr, &cp);
+    kv.init_xkv_store(cp);
+
+    // Root public run 1 (foreign).
+    llama_kv_rerot_meta root_tag;
+    root_tag.episode_id = 7; root_tag.node_id = 1; root_tag.run_id = 1;
+    root_tag.publish_epoch = 1; root_tag.frontier = 3;
+    root_tag.visibility = llama_rerot_visibility::public_live;
+    commit_tokens(kv, 0, {0, 1, 2}, true, &root_tag);
+
+    // Own pending run 2 (to be published mid-probe).
+    llama_kv_rerot_meta own_tag;
+    own_tag.episode_id = 7; own_tag.node_id = 2; own_tag.run_id = 2;
+    own_tag.publish_epoch = 0; own_tag.frontier = 10;
+    own_tag.visibility = llama_rerot_visibility::pending_record;
+    commit_tokens(kv, 0, {4, 5}, true, &own_tag);
+
+    llama_rerot_reader_state reader;
+    reader.episode_id = 7; reader.reader = 2; reader.query_run = 2;
+    reader.frontier = 10; reader.frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+    reader.ordered_runs = {1, 2};
+
+    const auto check_layout = [&](const std::vector<llama_pos> & positions) {
+        TEST_ASSERT(kv.rerot_set_reader_view(0, reader));
+        std::vector<llama_token> tokens(positions.size(), 101);
+        std::vector<int32_t> n_seq_id(positions.size(), 1);
+        llama_seq_id seq0 = 0;
+        std::vector<llama_seq_id *> seq_ptrs(positions.size(), &seq0);
+        llama_ubatch ub = {};
+        ub.token = tokens.data(); ub.pos = const_cast<llama_pos *>(positions.data());
+        ub.n_tokens = (int32_t) positions.size();
+        ub.n_seq_tokens = (int32_t) positions.size();
+        ub.n_seqs = 1; ub.n_seqs_unq = 1; ub.seq_id_unq = &seq0;
+        ub.n_seq_id = n_seq_id.data(); ub.seq_id = seq_ptrs.data();
+        auto sinfos = kv.prepare({ub});
+        TEST_ASSERT(!sinfos.empty());
+        std::vector<xkv_hot_reservation> no_res;
+        llama_kv_cache_context ctx(&kv, sinfos, {ub}, std::move(no_res));
+        TEST_ASSERT(ctx.apply());
+
+        const auto & layout = ctx.get_rerot_attn_layout();
+        TEST_ASSERT(!layout.empty());
+
+        // Oracle: per-query build over the resident key table.
+        const auto & cells0 = kv.get_cells(0);
+        std::vector<llama_rerot_key_record> oracle_keys;
+        for (uint32_t idx = 0; idx < cells0.size(); ++idx) {
+            if (cells0.is_empty(idx)) continue;
+            oracle_keys.push_back({ idx, cells0.pos_get(idx), cells0.seq_has(idx, seq0),
+                                    cells0.rerot_get(idx) });
+        }
+        for (size_t q = 0; q < positions.size(); ++q) {
+            const auto oracle = llama_rerot_build_query_layout(reader, positions[q], oracle_keys);
+            const uint32_t e0 = layout.query_offsets[q];
+            const uint32_t e1 = layout.query_offsets[q + 1];
+            TEST_ASSERT(e1 - e0 == oracle.entries.size());
+            std::vector<std::pair<uint32_t, llama_pos>> got, want;
+            for (uint32_t e = e0; e < e1; ++e) {
+                const auto & entry = layout.entries[e];
+                TEST_ASSERT(entry.group_index < layout.groups.size());
+                got.emplace_back(entry.key_index,
+                                  layout.groups[entry.group_index].effective_pos);
+            }
+            for (size_t i = 0; i < oracle.entries.size(); ++i) {
+                want.emplace_back(oracle.entries[i].key_index,
+                                  oracle.groups[oracle.entries[i].group_index].effective_pos);
+            }
+            std::sort(got.begin(), got.end());
+            std::sort(want.begin(), want.end());
+            TEST_ASSERT(got == want);
+        }
+    };
+
+    // Phase 1: layout with pending run 2 (invisible to foreign readers, own
+    // gated) — builds the world the first time.
+    check_layout({5, 9, 4});
+
+    // Phase 2: decode appends extend run 2 (world upsert path).
+    commit_tokens(kv, 0, {6, 7}, true, &own_tag);
+    check_layout({7, 5});
+
+    // Phase 3: publish run 2 (set_key_meta path; visibility flips).
+    TEST_ASSERT(kv.rerot_publish_run(7, 2, 4) == 4);
+    check_layout({7, 5, 9});
+
+    // Phase 4: more appends AFTER publish (mixed-bucket run: uniform probe
+    // must flip false; tagged order still holds).
+    llama_kv_rerot_meta own_pub = own_tag;
+    own_pub.visibility = llama_rerot_visibility::public_live;
+    own_pub.publish_epoch = 4;
+    commit_tokens(kv, 0, {8}, true, &own_pub);
+    check_layout({8, 5});
+
+    // Phase 5: ring recycle — free the tail cell and rewrite it under a
+    // NEW run id (upsert replacement path).
+    {
+        // Remove positions >= 8 of seq 0 (the {8} cell), then rewrite.
+        kv.seq_rm(0, 8, -1);
+        llama_kv_rerot_meta run3 = own_pub;
+        run3.run_id = 3; run3.frontier = 11;
+        commit_tokens(kv, 0, {8}, true, &run3);
+        reader.query_run = 3;
+        reader.ordered_runs = {1, 2, 3};
+            check_layout({8, 5});
+        reader.query_run = 2;
+        reader.ordered_runs = {1, 2, 3};
+            check_layout({8, 5});
+    }
+
+    // Phase 6: untracked mutation (seq_keep bumps the generation) — the
+    // safety net must force a rebuild and stay correct.
+    kv.seq_keep(0);
+    check_layout({5, 9});
 }
 
 static void test_ddvr_two_query_groups() {

@@ -3977,6 +3977,21 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             if (has_write_tag) {
                 cells.rerot_set(idx, write_tag);
             }
+
+            // Twelfth round: collect the world increment for this written
+            // cell (ring recycle: the same key index may have just been
+            // freed above and is now rewritten — upsert handles it). Only
+            // when the world is current at entry: a stale world rebuilds
+            // from the cells anyway, and the increments would be dropped.
+            if (!dry_run && rerot_world_valid && !v_cells.empty() &&
+                rerot_world_gen == v_cells[sinfo.strm[0]].get_generation()) {
+                rerot_world_pending.push_back({
+                    idx,
+                    cells.pos_get(idx),
+                    false,
+                    cells.rerot_get(idx),
+                });
+            }
         }
     }
 
@@ -4019,6 +4034,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     // note: we want to preserve the invariant that all positions between [pos_min, pos_max] for each sequence
     //       will be present in the cache. so we have to purge any position which is less than those we would overwrite
     //       ref: https://github.com/ggml-org/llama.cpp/pull/13746#issuecomment-2916057092
+    std::vector<uint32_t> world_purged;
     for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
         if (seq_pos_max_rm[s] == -1) {
             continue;
@@ -4032,6 +4048,18 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             LLAMA_LOG_DEBUG("%s: purging positions [%d, %d] of sequence %d from KV cache\n",
                     __func__, cells.seq_pos_min(s), seq_pos_max_rm[s], s);
 
+            // Twelfth round: the purge removes cells at OTHER positions
+            // (the overwritten history); those key indices are NOT part of
+            // the upsert set, so the world must drop them explicitly.
+            if (!dry_run && rerot_world_valid) {
+                const llama_pos purge_lo = cells.seq_pos_min(s);
+                const llama_pos purge_hi = seq_pos_max_rm[s];
+                for (uint32_t i = 0; i < cells.size(); ++i) {
+                    if (cells.pos_in(i, purge_lo, purge_hi) && cells.seq_has(i, s)) {
+                        world_purged.push_back(i);
+                    }
+                }
+            }
             seq_rm(s, cells.seq_pos_min(s), seq_pos_max_rm[s] + 1);
         }
     }
@@ -4041,6 +4069,39 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         auto & head = v_heads[sinfo.strm[s]];
 
         head = sinfo.idxs[s].back() + 1;
+    }
+    // Twelfth round: flush the collected world increments. After the purge
+    // phase the written cells are the exact post-apply truth for their key
+    // indices; the generation check in ensure_rerot_world() catches any
+    // path that bypassed this collection (dry runs never reach here).
+    if (!dry_run && (!rerot_world_pending.empty() || !world_purged.empty())) {
+        // Incremental maintenance ONLY when the world is current: an
+        // untracked mutation (seq_rm/keep/cp, compaction, ...) may have
+        // bumped the generation since the last build — the world is stale
+        // and the increments would apply on top of a wrong base. Drop them
+        // (the rebuild rescans the cells; the pending records describe
+        // exactly the cells it will read anyway).
+        const bool world_current = rerot_world_valid && !v_cells.empty() &&
+            rerot_world_gen == v_cells[sinfo.strm[0]].get_generation();
+        if (world_current) {
+            // Purge first (the freed indices are not in the upsert set),
+            // then upsert the written cells. Both were derived from the
+            // exact post-mutation cells state, so the generation can be
+            // re-synced: every cell mutation inside this apply is captured
+            // by the two operations.
+            try {
+                if (!world_purged.empty()) {
+                    rerot_world.remove_keys(world_purged);
+                }
+                if (!rerot_world_pending.empty()) {
+                    rerot_world.upsert_keys(rerot_world_pending);
+                }
+                rerot_world_gen = v_cells[sinfo.strm[0]].get_generation();
+            } catch (const std::exception &) {
+                rerot_world_valid = false; // fail safe: full rebuild
+            }
+        }
+        rerot_world_pending.clear();
     }
     fp_bump();
 }
@@ -5790,12 +5851,38 @@ size_t llama_kv_cache::rerot_publish_run(
     std::vector<std::pair<uint32_t, uint32_t>> matches;
     GGML_ASSERT(rerot_find_run_cells(episode_id, run_id, &matches) == count);
 
+    const bool world_current_pre = rerot_world_valid && !v_cells.empty() &&
+        rerot_world_gen == v_cells[matches.front().first].get_generation();
     for (const auto & match : matches) {
         const bool published = v_cells[match.first].rerot_publish(
             match.second, episode_id, run_id, publish_epoch);
         GGML_ASSERT(published);
     }
 
+    // Twelfth round: publish is a meta-only rewrite (visibility/publish_epoch)
+    // that preserves (storage, frontier, key_index) and the run bucket —
+    // exactly set_key_meta's contract. O(rows of the run) on the world.
+    // Only when the world was current BEFORE the cell rewrites (a stale
+    // world rebuilds from the cells; the meta increments would be dropped).
+    if (world_current_pre) {
+        std::vector<llama_rerot_key_record> recs;
+        recs.reserve(matches.size());
+        for (const auto & match : matches) {
+            const auto & cells = v_cells[match.first];
+            recs.push_back({
+                match.second,
+                cells.pos_get(match.second),
+                false,
+                cells.rerot_get(match.second),
+            });
+        }
+        rerot_world_set_meta(recs);
+        if (rerot_world_valid) {
+            // The cell rewrites bumped the generation; set_key_meta fully
+            // captured them, so re-sync (same discipline as apply_ubatch).
+            rerot_world_gen = v_cells[matches.front().first].get_generation();
+        }
+    }
     fp_bump();
     return matches.size();
 }
@@ -5815,10 +5902,34 @@ size_t llama_kv_cache::rerot_reclassify_run(
     std::vector<std::pair<uint32_t, uint32_t>> matches;
     GGML_ASSERT(rerot_find_run_cells(episode_id, run_id, &matches) == count);
 
+    const bool world_current_pre = rerot_world_valid && !v_cells.empty() &&
+        rerot_world_gen == v_cells[matches.front().first].get_generation();
     for (const auto & match : matches) {
         const bool changed = v_cells[match.first].rerot_reclassify(
             match.second, episode_id, run_id, expected, replacement, publish_epoch);
         GGML_ASSERT(changed);
+    }
+
+    // Twelfth round: reclassify is a meta-only rewrite; set_key_meta
+    // refreshes the world copies (a frontier change re-probes the tagged
+    // order of the run — set_key_meta handles it). Only when the world was
+    // current BEFORE the rewrites (same discipline as publish).
+    if (world_current_pre) {
+        std::vector<llama_rerot_key_record> recs;
+        recs.reserve(matches.size());
+        for (const auto & match : matches) {
+            const auto & cells = v_cells[match.first];
+            recs.push_back({
+                match.second,
+                cells.pos_get(match.second),
+                false,
+                cells.rerot_get(match.second),
+            });
+        }
+        rerot_world_set_meta(recs);
+        if (rerot_world_valid) {
+            rerot_world_gen = v_cells[matches.front().first].get_generation();
+        }
     }
     fp_bump();
     return matches.size();
@@ -6193,6 +6304,54 @@ bool llama_kv_cache::rerot_batch_active(const llama_ubatch & ubatch) const {
     return any;
 }
 
+// World maintenance (twelfth round). Lazy opt-in mirrors fp_epoch: the
+// first RERoT layout build enables CellGeneration tracking (one bump per
+// mutation, zero when OFF), records the baseline generation, and pays one
+// full structural pass over the resident cells. Subsequent builds validate
+// the recorded generation against the cells counter: equal -> the world is
+// current (the tracked entry points maintained it); different -> some
+// untracked mutation happened (seq_rm/keep/cp/add/div, compaction, state
+// restore, clear) -> drop and rebuild once. The rebuild is exactly the
+// eleventh-round cost, so the worst case is never worse than the status
+// quo, and every untracked path stays zero-overhead.
+const llama_rerot_shared_world & llama_kv_cache::ensure_rerot_world() const {
+    const auto & cells = v_cells[0];
+    if (!rerot_world_active) {
+        // One-time lazy opt-in (same discipline as flashprefill_enable_tracking).
+        rerot_world_active = true;
+        const_cast<llama_kv_cells &>(cells).set_generation_enabled(true);
+        // The enable itself bumped the generation; snapshot AFTER the bump so
+        // the first validity check compares against a stable baseline.
+        rerot_world_valid = false;
+    }
+
+    if (rerot_world_valid && rerot_world_gen == cells.get_generation()) {
+        return rerot_world;
+    }
+
+    // Full structural rebuild over the resident cells (the structural event
+    // cost, eleventh round). Records mirror the one-shot path exactly:
+    // key_index == cell index, storage from pos_get, meta from rerot_get.
+    std::vector<llama_rerot_key_record> keys;
+    const uint32_t scan_end = std::min<uint32_t>(uint32_t(cells.size()), cells.used_max_p1());
+    keys.reserve(scan_end);
+    for (uint32_t key = 0; key < scan_end; ++key) {
+        if (cells.is_empty(key)) {
+            continue;
+        }
+        keys.push_back({
+            key,
+            cells.pos_get(key),
+            false,
+            cells.rerot_get(key),
+        });
+    }
+    rerot_world.build_world(keys);
+    rerot_world_gen = cells.get_generation();
+    rerot_world_valid = true;
+    return rerot_world;
+}
+
 llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
         const llama_ubatch & ubatch,
         uint32_t n_kv) const {
@@ -6249,30 +6408,15 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
         group->rows.push_back(query);
     }
 
-    // Q3 host-side shared supply (2026-09-22 fifth round): ONE structural
-    // pass serves EVERY distinct reader group. The third round scanned the
-    // resident cells once but still copied the full key table per group and
-    // re-ran the classification/sort work per reader; the fifth round feeds
-    // all readers from ONE shared key world — per-(episode, run) segments
-    // with deviation ordering computed once, per reader only the ownership-
-    // dependent filtering. The scan bound is used_max_p1() (no used cell
-    // lives at or past it), so empty tail cells beyond the highest used
-    // index cost nothing. Record contents are identical to the per-group
-    // build by construction.
-    std::vector<llama_rerot_key_record> shared_keys;
-    const uint32_t scan_end = std::min<uint32_t>(n_kv, cells.used_max_p1());
-    shared_keys.reserve(scan_end);
-    for (uint32_t key = 0; key < scan_end; ++key) {
-        if (cells.is_empty(key)) {
-            continue;
-        }
-        shared_keys.push_back({
-            key,
-            cells.pos_get(key),
-            false,
-            cells.rerot_get(key),
-        });
-    }
+    // Twelfth round: the structural pass is a persistent world maintained
+    // incrementally by the tracked mutation entry points (apply_ubatch
+    // upsert, publish/reclassify set_key_meta); every untracked mutation is
+    // caught by the CellGeneration counter and forces one full rebuild
+    // (never worse than the eleventh-round status quo). The layout builder
+    // below consumes the world directly — per frontier only the per-reader
+    // ownership filtering and the per-query numeric pass run.
+    const llama_rerot_shared_world & world = ensure_rerot_world();
+    const auto & shared_keys = world.keys_ref();
     // Per-group query positions + ownership columns (the caller's seq_has
     // column per group: base rows and own-run rows of that reader's seq).
     std::vector<std::vector<llama_pos>> group_qpos;
@@ -6302,16 +6446,16 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
         group_readers.push_back(*group.view);
     }
     {
-        // ONE pass over resident cells fills every reader's ownership bit
-        // at once: cell bitsets are read once, not once per reader.
-        for (uint32_t key = 0; key < shared_keys.size(); ++key) {
-            // shared_keys is dense over non-empty cells in scan order, so
-            // its element k has key_index k (built by the push_back loop
-            // above; key_index == the cell index).
-            const auto & cell_seq = cells.seq_get_all(shared_keys[key].key_index);
+        // ONE pass over the world's records fills every reader's ownership
+        // bit at once: cell bitsets are read once, not once per reader. The
+        // bit index is the RECORDS POSITION in the world (the numeric pass
+        // indexes ownership bits by records position, matching run rows and
+        // the untagged order).
+        for (uint32_t pos = 0; pos < shared_keys.size(); ++pos) {
+            const auto & cell_seq = cells.seq_get_all(shared_keys[pos].key_index);
             for (size_t g = 0; g < group_seqs.size(); ++g) {
                 if (cell_seq.test(group_seqs[g])) {
-                    owned_words[g][key >> 6] |= 1ull << (key & 63);
+                    owned_words[g][pos >> 6] |= 1ull << (pos & 63);
                 }
             }
         }
@@ -6324,8 +6468,8 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
         GGML_ASSERT(owned_words[g].size() >= owned_words_per_col);
         owned_views[g] = { owned_words[g].data(), owned_words[g].size() };
     }
-    const auto multi = llama_rerot_build_query_layouts_multi_reader_bits(
-        group_readers, group_qpos, shared_keys, owned_views);
+    const auto multi = llama_rerot_build_query_layouts_multi_reader_world(
+        group_readers, group_qpos, world, owned_views);
     // Reserve the assembly targets once: per-group push_back reallocation
     // over ~R x n_kv entries was a measurable fraction of the cache-side
     // cost at production shapes.

@@ -464,6 +464,14 @@ public:
         const llama_ubatch & ubatch,
         uint32_t n_kv) const;
 
+    // World maintenance (twelfth round). ensure_rerot_world() brings the
+    // persistent shared world to the current cells state: valid + generation
+    // match -> reuse; anything else -> one full structural rebuild over the
+    // resident cells (the eleventh-round cost, paid only at structural
+    // events and untracked mutations). Returns a reference to the world
+    // with keys_ref() positions matching the CURRENT cells state.
+    const llama_rerot_shared_world & ensure_rerot_world() const;
+
     bool rerot_batch_active(const llama_ubatch & ubatch) const;
 
     // Resolve a logical PAC-DFS view after any TriAttention eviction or cache
@@ -808,6 +816,52 @@ private:
     void fp_bump() {
         if (fp_active) {
             ++fp_epoch;
+        }
+    }
+
+    // Persistent RERoT shared world (2026-09-22 twelfth round, fourth
+    // question: most frontiers are numeric-only). The structural pass of
+    // the multi-reader layout builder lives in llama_rerot_shared_world and
+    // is maintained INCREMENTALLY by the tracked mutation entry points:
+    //   - apply_ubatch (non-dry): upsert of every written cell (ring
+    //     recycle = same key index, new content);
+    //   - rerot_publish_run / rerot_reclassify_run: set_key_meta batch;
+    //   - rerot_add_run_ref: ownership only (no record change needed —
+    //     ownership is per-reader, rebuilt per layout from seq_has).
+    // Every OTHER mutation path is covered by the CellGeneration counter
+    // (bumped by every cells mutation): the world records the generation it
+    // was built at, and any mismatch forces one full rebuild — the same
+    // lazy opt-in pattern as fp_epoch (set_generation_enabled is called
+    // once when the world first activates; OFF keeps zero overhead).
+    mutable llama_rerot_shared_world rerot_world;
+    mutable bool rerot_world_active = false;
+    mutable bool rerot_world_valid = false;
+    mutable uint64_t rerot_world_gen = 0;   // cells generation at last build
+    // Pending increments for a not-yet-valid world (mutations that happen
+    // while the world is invalid are covered by the full rebuild).
+    mutable std::vector<llama_rerot_key_record> rerot_world_pending;
+
+    // Feed the world: called by the tracked mutation entry points. When the
+    // world is valid, the increment is applied immediately; when invalid,
+    // the records are dropped (the rebuild rescans the cells).
+    void rerot_world_upsert(const std::vector<llama_rerot_key_record> & recs) const {
+        if (!rerot_world_valid || recs.empty()) {
+            return;
+        }
+        rerot_world.upsert_keys(recs);
+    }
+
+    // Meta-only refresh (publish/reclassify): same discipline.
+    void rerot_world_set_meta(const std::vector<llama_rerot_key_record> & recs) const {
+        if (!rerot_world_valid || recs.empty()) {
+            return;
+        }
+        try {
+            rerot_world.set_key_meta(recs);
+        } catch (...) {
+            // A meta update escaping its run bucket (should not happen on
+            // the tracked paths): fail safe, drop the world.
+            rerot_world_valid = false;
         }
     }
 

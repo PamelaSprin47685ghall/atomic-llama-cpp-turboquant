@@ -106,6 +106,44 @@
 
 ---
 
+## 下班交接｜2026-09-22（第十二轮，cache 级 shared_world 接入：decode 热路径 1.3–1.6×）
+
+**分支：** `master`（本轮 commit 见 git log；注意 HEAD 已含他人合并的远端 TP5/P0-P14 提交，第十一轮 `787080bfd` 在历史里）
+**主题：** 第十一轮留下的最大项：把 `llama_rerot_shared_world` 接进 cache 级生产路径（`rerot_build_attn_layout`）。结构事件（apply/publish/reclassify）增量维护 world，普通 frontier 只付 ownership 位图＋数值 pass。全程 CPU。
+
+### 一、改动
+
+1. **world 生产原语**（`src/llama-rerot.h/.cpp`）：`upsert_keys`（环形复用：同 key_index 内容全换——旧 run 删行、按新 meta 入桶，records 位置稳定；内部桶序破坏回退 per-run tagged 重排）、`remove_keys`（apply purge 的被覆盖 cells）、`try_append_key_fast`（O(1) contiguous+uniform 尾追，本轮已实现未接线——下一班热循环用）。
+2. **cache 级**（`src/llama-kv-cache.h/.cpp`）：mutable world＋`rerot_world_gen`（CellGeneration 快照）；`ensure_rerot_world()` gen 匹配→复用/不匹配→一次全量重建（**最坏不劣于改动前**）；懒 `set_generation_enabled`（flashprefill 同模式，OFF 零开销）。增量接线：`apply_ubatch`（upsert 收集＋purge remove 收集＋gen resync）、publish/reclassify（set_key_meta 批量）。ownership 位图改按 world records 位置索引。
+3. **测试**（`tests/test-xkv-runtime.cpp`）：`test_rerot_world_incremental_decode`——6 阶段生产序列（pending 布局→追加→publish→publish 后追加→环形复用 seq_rm＋同 idx 新 run→seq_keep 安全网），每阶段 cache 级 layout 与逐 query oracle 对拍。
+
+### 二、本轮抓的真竞态（写进 RERoT.md §21.1 第十二轮）
+
+未跟踪变异（`seq_rm` 等）bump CellGeneration 后，若仍对**脏 world** 应用增量再 resync gen，脏数据会被 gen 匹配"洗白"——增量路径必须做**前置 gen 校验**（收集与应用两处），不匹配丢弃增量（重建时从 cells 重扫，无损）。测试 Phase 5/6 钉住：修复前 got=want+1 全行偏移。
+
+### 三、实测（cache 级 bench min-of-5，stash 对照）
+
+|形状|旧（每 frontier 全量）|新（增量摊销）|加速|
+|---|---|---|---|
+|R=6 K=65536|46919 us|28810 us|**1.63×**|
+|R=6 K=131072|90135 us|58461 us|**1.54×**|
+|R=12 K=262144|297450 us|230617 us|**1.29×**|
+
+低于纯模块的 4.6×：cache 侧剩余大头是 (a) ownership 位图每 frontier 从 `seq_get_all` 全量重建（R×K 位测试）、(b) layout assembly 拷贝。数值 pass 本身不可省。
+
+### 四、下一班
+
+1. **ownership 位图增量化**（新最大项）：world 已知道每 frontier 哪些 records 变了；位图可在 apply 时只改新写 cell 的位（R 个 reader 各 1 位/cell）。需要把位图从 layout 局部变量上移为 world 伴随结构。
+2. `try_append_key_fast` 接线进 `apply_ubatch` 的 upsert 路径（O(1) 尾追 vs upsert 的桶扫描）。
+3. layout assembly 增量化（entries/groups 的 reserve+push_back 每次全量）——低优先级。
+4. 真机 semantic-smoke（需批准）。
+
+### 五、验证
+
+全 rerot/xkv/flashprefill 电池 0 failure（landmark-standalone 2 failures 为预存基线，stash 验证）；test-rerot-view/attn/runtime 全绿；`test_rerot_world_incremental_decode` 六阶段 oracle 对拍通过。
+
+---
+
 ## 下班交接｜2026-09-22（第十一轮，结构 pass 提取为持久 shared_world：frontier 摊销 4.6–6.1×）
 
 **分支：** `master`（本轮 commit 见 git log）

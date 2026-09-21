@@ -2459,6 +2459,19 @@ c3648d789  DAG logical/view/fixed-entry implementation
 - **语义修复（本轮抓到的真 bug）**：旧 probe 只检查 (storage, frontier) 非降序，不检查 key_index tie-break——meta 改写使两行 (storage, frontier) 相等时，增量路径保持旧序而 oracle 全量重建按 key_index 重排，输出分叉。修复为完整字典序 probe（三处：build/append tail/set_key_meta），200 轮对拍全绿。
 - **cache 级接入未做（下一班）**：生产 key_index==cell idx，环形复用时同 idx 内容全换（append_keys 的"新 key_index"前提不成立），需要 `replace_keys`（旧桶删行 O(run)）＋ `apply_ubatch` 逐 token on_cell 协调＋purge/回滚路径失效语义。纯模块已就绪并有对拍安全网。
 
+**第十二轮：cache 级 shared_world 接入（09-22 深夜，第四问落地 decode 热路径）**：
+
+- **对象**：第十一轮的 world 停在纯模块；生产入口 `llama_kv_cache::rerot_build_attn_layout` 仍每 frontier 全量重建结构。本轮把 world 接进 cache：结构事件（apply/publish/reclassify）增量维护，普通 frontier 只付 ownership 位图＋数值 pass。
+- **改动**：
+  - `llama_rerot_shared_world` 新增三个生产原语：`upsert_keys`（环形复用：同 key_index 内容全换，旧 run 删行、新 meta 入桶，records 位置稳定）、`remove_keys`（apply purge 删除的被覆盖 cells）、`try_append_key_fast`（O(1) contiguous+uniform 尾追，供后续热循环用）。
+  - `llama_kv_cache` 持有 mutable world＋`rerot_world_gen`（CellGeneration 计数器快照）。`ensure_rerot_world()`：gen 匹配→复用；不匹配→一次全量重建（不劣于第十一轮前状态）。懒开启 `set_generation_enabled`（与 flashprefill 同模式，OFF 零开销）。
+  - 增量接线：`apply_ubatch`（写 cell 收集 upsert、purge 收集 remove、gen resync）、`rerot_publish_run`/`rerot_reclassify_run`（set_key_meta 批量刷新）。
+  - **关键安全设计（本轮抓的竞态）**：增量应用前必须校验 gen 前置匹配——`seq_rm` 等未跟踪变异 bump gen 后，若仍对脏 world 应用增量再 resync gen，脏数据会被 gen 匹配"洗白"。修复：收集与应用两处都做前置 gen 校验，不匹配则丢弃增量（重建时从 cells 重扫，语义无损）。
+  - ownership 位图改按 world records 位置索引（`seq_get_all(key_index)` 逐 record 测试），位宽 = records.size()。
+- **实测**（cache 级 bench，min-of-5，stash 对照）：R=6 K=65536：46919→28810 us（**1.63×**）；R=6 K=131072：90135→58461（**1.54×**）；R=12 K=262144：297450→230617（**1.29×**）。
+- **剩余大头**（下一班）：ownership 位图每 frontier 从 `seq_get_all` 全量重建（R×K 位测试）——可增量化（新 cell 写入只改自己位）；layout assembly（entries/groups 拷贝）也可增量。数值 pass 本身（bench_world 单次 ~111ms@R=12K=262144）已不可省。
+- **验证**：`test_rerot_world_incremental_decode`（test-xkv-runtime）：6 阶段生产序列——pending 布局→decode 追加→publish→publish 后追加（uniform 翻转）→环形复用（seq_rm＋同 idx 新 run）→未跟踪变异（seq_keep 安全网）——**每阶段后 cache 级 layout 与逐 query oracle 对拍**。全电池绿。
+
 ### 21.2 验证证据
 
 - `test-rerot-math`：0 failure。Q3 对拍独立全 softmax oracle（含不可见读者、合并顺序无关性）；Q5 对拍稠密 §2.3 逐步递推（12 步，α<1，异构 β，秩每步恰 +1，dense/output 双等价，多 lane 共享投影位级一致）；Q6 24 个随机 chunk（T=1..8，含 β=0 纯衰减，此时 M=G·I、Y=0 精确成立）对拍逐步 oracle ≤1e-10；Q7 全部四种编码存在下对拍 (code−1) 解码 oracle，整数 activation 时位级相等。
@@ -2474,6 +2487,7 @@ c3648d789  DAG logical/view/fixed-entry implementation
   第九轮：属性上收不改任何输出字节（同输入同输出，纯计算位置移动），由同套 45/45 全绿钉住。
   第十轮：bits 与 bytes 两条路径由 test-rerot-view 新增探针逐迭代位级对拍（同一 base_owned 打包后走 bits 核心，与字节重载输出逐 layout identical），加全套 45/45。
   第十一轮：`test_multi_reader_layouts_vs_oracle` 加 world 探针（每迭代：半表 build_world＋半表 append_keys＋publish 式 set_key_meta，与字节路径逐 layout identical）；新增 `test_shared_world_incremental`（乱序 append、重复 append 抛错、桶逃逸 meta 抛错、meta 改写后对拍 oracle，60 轮）；bits 一次性路径与 world 持久路径由 bench_world 位级对拍（每 rep）。全家 rerot/xkv/flashprefill 全绿。
+  第十二轮：cache 级 world 由 `test_rerot_world_incremental_decode` 钉住（六阶段生产序列逐阶段 oracle 对拍，含环形复用与未跟踪变异安全网）；全 rerot/xkv/flashprefill 电池绿。
 - 开发机预存失败（与本轮无关，基线复现）：test-tokenizers-ggml-vocabs、test-quantize-fns、test-llama-archs、test-backend-ops timeout；test-vulkan-tp5-mesh/command-replay 需 ≥2 Vulkan 设备（开发机仅 1 块 780M iGPU）。
 
 ### 21.3 边界与下一步（第二轮修订）
@@ -2484,4 +2498,4 @@ c3648d789  DAG logical/view/fixed-entry implementation
 - Q7 的 LUT 路径在 GPU 上“减乘法≠减耗时”，需实测；块 scale 与 Hadamard 域不得交换。
 - Q8（跳块上界）与 Q10（K×H 联合投机）是近似/研究路线：本轮已把它们的**数学契约与可执行反例**落成参考代码（界、验证引擎、naive 对照），但收益测量、接受率账目与生产接入仍未做，不得与等义改写的收益混记。Q10 的保守“全笔通过才前进”方案在独立接受率 a、b 笔下整步通过率为 a^b，联合草稿必须学会预测多笔相互影响后的下一 frontier，而不是 b 条各自向前冲的草稿。
 - Q2/Q4 生产化已推进到单一共享 key world＋生产形态快路径（decode 热路径，见 21.1 第五～十轮）：结构扫描与排序对 R 个 reader 各只做一次，reader 无关段属性（uniform、fast_keys）已上收共享结构 pass（R=12 K=262144 builder −50%），ownership 列 bitset 直供（cache 级 R×K 字节展开删除），Q=6（MTP verify）数值通道已 1.85×（8758 us，接近 entry 输出 memcpy 地板）；剩余方向：让写入布局主动维持长而规则的 span（`llama_rerot_span_long_fraction` 是验收指标）；把 run-order 签名接入 flashprefill 的 `llama_rerot_split_table_fragments` 调用点，结构事件才重算 fragments，数值增长走增量前缀和——注意 flashprefill 侧已有 fp_key+freshness 整层缓存，fragment 级缓存的边际收益需先证明再动手。
-- Q3 host 侧：数值通道（Q=1 时 ~1.9ms/6 readers，即 entry 发射本体）已接近地板；结构 pass 已提取为 `llama_rerot_shared_world`（第十一轮，摊销 4.6–6.1×）。剩余工作全在 cache 级接入：`replace_keys`（环形 cell 复用）＋ `apply_ubatch` on_cell 协调 ＋ purge/回滚失效语义；接入后每 frontier 只付数值 pass。真机收益需目标机 `rerot-semantic-smoke.py` 对比 decode host 时间（开发机数字是合成键，不是模型证据）。
+- Q3 host 侧：数值通道（Q=1 时 ~1.9ms/6 readers，即 entry 发射本体）已接近地板；结构 pass 已提取为 `llama_rerot_shared_world` 并**接入 cache 级生产路径**（第十二轮：apply/publish/reclassify 增量维护＋CellGeneration 安全网，cache 级 1.3–1.6×）。剩余：ownership 位图增量化（每 frontier R×K 位测试是新的最大项）、layout assembly 增量化。剩余工作全在 cache 级接入：`replace_keys`（环形 cell 复用）＋ `apply_ubatch` on_cell 协调 ＋ purge/回滚失效语义；接入后每 frontier 只付数值 pass。真机收益需目标机 `rerot-semantic-smoke.py` 对比 decode host 时间（开发机数字是合成键，不是模型证据）。

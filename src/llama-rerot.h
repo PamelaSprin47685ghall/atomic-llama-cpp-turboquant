@@ -475,6 +475,29 @@ public:
     // `keys` must describe ONLY changed records (key index must exist).
     void set_key_meta(const std::vector<llama_rerot_key_record> & keys);
 
+    // Production upsert (twelfth round, cache-level integration): like
+    // append_keys, but a key index that ALREADY exists is REPLACED in place
+    // (the ring-buffer recycle shape: apply_ubatch frees the victim cell and
+    // immediately rewrites the same index). The old record leaves its run
+    // bucket / untagged order; the new one enters (or stays) per its own
+    // metadata. Interior order changes fall back to a tagged re-sort of the
+    // touched run (never a world rebuild). Same validation as the other
+    // incremental entries.
+    void upsert_keys(const std::vector<llama_rerot_key_record> & keys);
+
+    // O(1) tail-append fast path for the decode hot loop: the key index
+    // must be NEW and its run contiguous+uniform with the arrival extending
+    // the tail (storage +1, same (visibility, frontier)). Returns false
+    // WITHOUT mutating when any precondition fails; the caller falls back
+    // to upsert_keys.
+    bool try_append_key_fast(const llama_rerot_key_record & key);
+
+    // Remove records by key index (the apply_ubatch purge path: cells freed
+    // by the position-overwrite purge are not part of the upsert set). The
+    // records leave their run buckets / untagged order; `records` positions
+    // stay stable (key_at marks them absent). Throws on an absent key.
+    void remove_keys(const std::vector<uint32_t> & key_indices);
+
     size_t n_keys() const { return key_at.size(); }
     bool empty() const { return key_at.empty(); }
     // Access the record for key index k (k < n_keys()); the world's copy,
