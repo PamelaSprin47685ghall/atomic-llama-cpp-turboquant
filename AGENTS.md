@@ -106,6 +106,48 @@
 
 ---
 
+## 下班交接｜2026-09-22（第五轮，Q3 共享 key world＋双 bug 修复）
+
+**分支：** `master`（本轮 commit 见 git log）
+**主题：** 把 Q3 host 侧推向单一共享 key world——R 个 pen 共享一次结构扫描＋排序，每 reader 只付 ownership 过滤＋数值 pass；同时修复第四轮两个已提交 bug。全程 CPU 验证（未启动模型/GPU）。
+
+### 一、两个已提交 bug（本轮先修，再谈优化）
+
+| Bug | 症状 | 根因 | 修复 |
+|---|---|---|---|
+| own private/pending 行被施加 frontier 门 | 探针：own private `frontier=9 > reader.frontier=3` 行被 shared builder 丢弃，oracle 保留 | shared builder 对**所有** own 行做 `frontier <= F && owned`；oracle 对 private/pending 只查 `node==reader && owned && causal cut`（pending 行就是当前写入批次） | private/pending 豁免 frontier 门（与 flashprefill builder 判定对齐）；200 轮对拍加 future-frontier arm |
+| 段内 storage 重复下偏差序置换破坏截断 | 探针：段内 storage `[0,1,1,2]` 时 7 个 case 全分歧（截断/own-row 均错） | 第四轮把段 storage 数组置换进偏差序（`s−i`），MTP verify 共享位置时置换非恒等、数组失序，`upper_bound` 二分失效 | 段内**双序**：tagged 序（升序 storage，截断＋own-row 用）与偏差序（置换 `d2t/t2d`，归并用）；截断是 tagged 前缀，归并按 `d2t[dp] < cut` 过滤 |
+
+两个 bug 第四轮 200 轮对拍都没抓到（测试世界没有段内 storage 重复、没有 future-frontier private 行）——对拍 generater 的形状覆盖就是安全边界，本轮都把形状加进了对拍。
+
+### 二、新生产路径：多 reader 共享 world
+
+- 新纯函数 `llama_rerot_build_query_layouts_multi_reader(readers, qpos, keys, base_owned)`（`src/llama-rerot.{h,cpp}`）：一次结构 pass 按 **(episode, run, owner-node)** 分桶（run id 可被多 node 先后持有——`test_sr_shared_physical_rows_3_ddvr_slots` 的 pub(1)/priv(9) 同 run_id 1 钉住），每桶 oracle 的 (storage, frontier, idx) 排序＋偏差序；每 reader：own 段（owner==reader，可多 run，causal 截断）、foreign 段（frontier 规则，不截断）、base 臂（`base_owned[r]` 列），逐 query k 路归并。
+- `rerot_build_attn_layout` 接入：一次扫描（上界 `used_max_p1()`，跳过空洞尾巴）＋一次 multi 调用；**每组不再整表拷贝 keys**（第三轮的 R×K memcpy 取消）。
+- own 判定语义：**段 owner node == reader**（不是 run==query_run——reader 的 node 可拥有多个 run：query run＋private run，`test_rerot_shared_reader_multi_query` 的 run 2+3 钉住）；query-row 查找限 query run 段。
+
+### 三、验证与实测
+
+- `test-rerot-view`：0 failure；新增 `test_multi_reader_layouts_vs_oracle`（200 轮三路对拍：multi vs 单 reader shared vs per-query oracle，全臂＋段内重复＋future-frontier private＋LAG1＋乱序物理序＋每 reader 独立 query 批次）。
+- `test-xkv-runtime`：all passed（cache 级路径含 own 多 run、同 run_id 双 node）。
+- 全家 ctest **45/45**。
+- **实测**（开发机 CPU，合成 K 键，production shape）：R=6：42293→17885 us（**2.36×**）；K=262144 R=6：259597→115992（2.24×）；R=12：92168→34039（2.71×）；R=1：1.10×（无冗余可省仍略快）。对 per-query oracle R=6/K=65536：112728→17885（6.3×）。乱序最坏：17758（不退化）。
+
+### 四、纠错与教训
+
+1. 首版 multi 把 own 误判为 `run==query_run`，漏掉 reader 自己 node 的 private run——cache 测试立即抓出（该 reader 同时拥有 run 2 和 3）。经验：oracle 按**行**的 node 判定 own，共享世界必须按 **(run, node) 桶**组织，不能按 run。
+2. 首版 per-segment 分裂 FULL/gated 两个列表导致同段两种 vis_before，虚拟编号与 oracle 不符——oracle 的虚拟编号只按**段**连续编号。教训：集合划分要跟随 oracle 的编号单位。
+3. 测试世界 peer run id 从 72 起编号与 own_priv(73) 撞号，制造了生产者不存在的形状——run id 全局唯一是数据前提，测试要守。
+
+### 五、下一步
+
+1. Q3 host 侧剩余：foreign 段 frontier 过滤在 reader 共享 (frontier, mode) 时组间相同，可按 cohort 预过滤共享。
+2. 结构 pass 仍是最大项（K=65536 共享排序约 3.3ms）——rank/node 分桶＋近排序检测（生产形态物理序≈写入序）可再省约 20%。
+3. Q2 剩余：写入布局维持长 span（`span_long_fraction` 验收指标）。
+4. 真机收益目标机 `rerot-semantic-smoke.py` 对比 decode host 时间。
+
+---
+
 ## 下班交接｜2026-09-22（第四轮，数值通道 k 路归并＋跨 reader 共享供给）
 
 **分支：** `master`（本轮 commit 见 git log；基于 `8772195ac`）

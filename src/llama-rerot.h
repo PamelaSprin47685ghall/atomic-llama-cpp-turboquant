@@ -279,6 +279,26 @@ std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
     const std::vector<llama_pos> & query_storage_pos,
     const std::vector<llama_rerot_key_record> & keys);
 
+// Multi-reader counterpart (2026-09-22 fifth round, Q3 host-side deepening).
+// R pens of one frontier share ONE key world: the structural pass — episode
+// filter, run classification, per-run ascending storage arrays, deviation
+// (s - i) ordering — is computed ONCE over `keys` and served to every
+// reader; each reader then pays only its ownership-dependent work (own-run
+// gate, base-arm membership) plus its per-query numeric pass.
+// `keys` must be ONE shared table whose owned_by_reader column is IGNORED
+// (ownership is per (reader, run) and derived from meta.run_id ==
+// reader.query_run inside); readers must share one episode. Output[r][i] is
+// EXACTLY llama_rerot_build_query_layout(readers[r], query_pos[r][i],
+// keys-with-r's-ownership-column) — same groups, entries, order and
+// query_virtual_pos as the per-group shared builder. Throws the same
+// exceptions as the per-query builder (reader validity, positions, run
+// view, duplicate keys, negative storage).
+std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layouts_multi_reader(
+    const std::vector<llama_rerot_reader_state> & readers,
+    const std::vector<std::vector<llama_pos>> & query_storage_pos,
+    const std::vector<llama_rerot_key_record> & keys,
+    const std::vector<std::vector<uint8_t>> & base_owned);
+
 // Pure logical document/tree model. It never stores physical KV indices.
 class llama_rerot_document {
 public:

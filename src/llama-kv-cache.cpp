@@ -6245,81 +6245,69 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
         group->rows.push_back(query);
     }
 
-    // Q3 host-side shared supply (2026-09-22 third round): one scan of the
-    // physical cell table serves EVERY distinct reader group. The old loop
-    // rebuilt the full key table per group (O(R * n_kv) cell visits with
-    // rerot_get/pos_get/seq_has per visit); the shared scan visits each
-    // resident cell once, then fills each group's ownership column from the
-    // per-sequence membership bitsets. The record contents (index, storage,
-    // ownership, meta) are identical to the per-group build by construction.
-    {
-        std::vector<llama_rerot_key_record> shared_keys;
-        shared_keys.reserve(n_kv);
-        std::vector<std::vector<uint8_t>> owned(groups.size());
-        for (uint32_t key = 0; key < n_kv; ++key) {
-            if (cells.is_empty(key)) {
-                continue;
-            }
-            shared_keys.push_back({
-                key,
-                cells.pos_get(key),
-                false,
-                cells.rerot_get(key),
-            });
+    // Q3 host-side shared supply (2026-09-22 fifth round): ONE structural
+    // pass serves EVERY distinct reader group. The third round scanned the
+    // resident cells once but still copied the full key table per group and
+    // re-ran the classification/sort work per reader; the fifth round feeds
+    // all readers from ONE shared key world — per-(episode, run) segments
+    // with deviation ordering computed once, per reader only the ownership-
+    // dependent filtering. The scan bound is used_max_p1() (no used cell
+    // lives at or past it), so empty tail cells beyond the highest used
+    // index cost nothing. Record contents are identical to the per-group
+    // build by construction.
+    std::vector<llama_rerot_key_record> shared_keys;
+    const uint32_t scan_end = std::min<uint32_t>(n_kv, cells.used_max_p1());
+    shared_keys.reserve(scan_end);
+    for (uint32_t key = 0; key < scan_end; ++key) {
+        if (cells.is_empty(key)) {
+            continue;
         }
-        for (size_t g = 0; g < groups.size(); ++g) {
-            const llama_seq_id seq_id = ubatch.seq_id[groups[g].rows.front()][0];
-            owned[g].assign(shared_keys.size(), 0);
-            // seq_has is a bitset test per cell; fill the ownership column
-            // for this group only where the sequence is a member.
-            for (size_t k = 0; k < shared_keys.size(); ++k) {
-                owned[g][k] = cells.seq_has(shared_keys[k].key_index, seq_id) ? 1 : 0;
-            }
-        }
-
-        for (size_t g = 0; g < groups.size(); ++g) {
-        const auto & group = groups[g];
-        const auto & reader = *group.view;
-
-        // One structural scan per distinct reader state: classify, order,
-        // and precompute per-run causal-cut arrays ONCE. Every query row of
-        // this reader then performs only numeric work (binary-search cuts,
-        // virtual arithmetic, one stable sort of its visible entries) via
-        // llama_rerot_build_query_layouts_shared — the structure/numeric
-        // separation of the 2026-09-22 round. Rows sharing a reader-view
-        // slot share one execution sequence, so ownership is constant for
-        // the group and is filled once here.
-        // Rows sharing one reader-view slot share one execution sequence
-        // (the view IS per-sequence), so ownership is constant for the
-        // group and is resolved once from the first row.
-        std::vector<llama_pos> query_pos;
-        query_pos.reserve(group.rows.size());
+        shared_keys.push_back({
+            key,
+            cells.pos_get(key),
+            false,
+            cells.rerot_get(key),
+        });
+    }
+    // Per-group query positions + ownership columns (the caller's seq_has
+    // column per group: base rows and own-run rows of that reader's seq).
+    std::vector<std::vector<llama_pos>> group_qpos;
+    std::vector<std::vector<uint8_t>> group_owned;
+    std::vector<llama_rerot_reader_state> group_readers;
+    group_qpos.reserve(groups.size());
+    group_owned.reserve(groups.size());
+    group_readers.reserve(groups.size());
+    for (const auto & group : groups) {
+        const llama_seq_id seq_id = ubatch.seq_id[group.rows.front()][0];
+        std::vector<llama_pos> qpos;
+        qpos.reserve(group.rows.size());
         for (const uint32_t query : group.rows) {
-            query_pos.push_back(ubatch.pos[query]);
+            qpos.push_back(ubatch.pos[query]);
         }
-
-        // Fill this group's key table from the shared supply: the record
-        // layout is identical to the per-group build; only the ownership
-        // column differs per group.
-        std::vector<llama_rerot_key_record> keys(shared_keys);
-        for (size_t k = 0; k < keys.size(); ++k) {
-            keys[k].owned_by_reader = owned[g][k] != 0;
+        std::vector<uint8_t> owned(shared_keys.size(), 0);
+        for (size_t k = 0; k < shared_keys.size(); ++k) {
+            owned[k] = cells.seq_has(shared_keys[k].key_index, seq_id) ? 1 : 0;
         }
-
-        const auto query_layouts = llama_rerot_build_query_layouts_shared(reader, query_pos, keys);
-        for (size_t i = 0; i < group.rows.size(); ++i) {
+        group_qpos.push_back(std::move(qpos));
+        group_owned.push_back(std::move(owned));
+        group_readers.push_back(*group.view);
+    }
+    const auto multi = llama_rerot_build_query_layouts_multi_reader(
+        group_readers, group_qpos, shared_keys, group_owned);
+    for (size_t g = 0; g < groups.size(); ++g) {
+        const auto & group = groups[g];
+        for (size_t i = 0; i < group.rows.size() && i < multi[g].size(); ++i) {
             const uint32_t query = group.rows[i];
             const uint32_t group_base = static_cast<uint32_t>(result.groups.size());
-            for (auto g : query_layouts[i].groups) {
-                g.query_index = query;
-                result.groups.push_back(g);
+            for (auto grp : multi[g][i].groups) {
+                grp.query_index = query;
+                result.groups.push_back(grp);
             }
-            for (auto entry : query_layouts[i].entries) {
+            for (auto entry : multi[g][i].entries) {
                 entry.group_index += group_base;
                 result.entries.push_back(entry);
             }
             result.query_offsets.push_back(static_cast<uint32_t>(result.entries.size()));
-        }
         }
     }
     std::string error;

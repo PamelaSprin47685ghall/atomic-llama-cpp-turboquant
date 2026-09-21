@@ -1016,12 +1016,20 @@ std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
             }
 
             // Frontier gate first (query-independent structure):
-            //   own rows:      frontier <= reader.frontier (else dropped)
+            //   own public:    frontier <= reader.frontier (else dropped)
             //   foreign rows:  STRONG: frontier < reader.frontier
             //                  LAG1:   reader.frontier > 0 &&
             //                          frontier < reader.frontier - 1
+            // Private/pending rows are exempt (the oracle gates them only
+            // on node==reader && owned && the per-query causal cut — a
+            // pending row of a future frontier is the CURRENT write batch
+            // and stays visible to its own reader; the 2026-09-22 fifth
+            // round probe caught this builder dropping such rows).
             bool frontier_ok = false;
-            if (meta.node_id == reader.reader) {
+            if (meta.visibility != llama_rerot_visibility::public_live &&
+                meta.node_id == reader.reader) {
+                frontier_ok = true;
+            } else if (meta.node_id == reader.reader) {
                 frontier_ok = meta.frontier <= reader.frontier && key.owned_by_reader;
             } else if (reader.frontier_mode == LLAMA_REROT_FRONTIER_STRONG) {
                 frontier_ok = meta.frontier < reader.frontier;
@@ -1093,9 +1101,25 @@ std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
     // reproduced identically.
     struct segment {
         uint32_t rank = 0;
-        std::vector<const llama_rerot_key_record *> rows; // d-sorted (see above)
-        std::vector<llama_pos> storage;  // parallel ascending storage array (emission order)
-        std::vector<int64_t> dev;        // d_i = storage[i] - i, parallel to rows
+        // Ascending tagged-order arrays (emission order): the causal cut and
+        // the own-row lookup binary-search THESE. The 09-22 fifth-round
+        // probe caught the 4th round permuting `storage` into deviation
+        // order: with duplicate storage positions inside one run (MTP
+        // verify rows share a position) the permutation is non-identity,
+        // leaving `storage` non-monotonic and the binary-search cut wrong.
+        std::vector<const llama_rerot_key_record *> rows_t;  // tagged order
+        std::vector<llama_pos> storage;                      // ascending (== tagged order)
+        // Deviation-order arrays: the k-way merge walks THESE. A row's
+        // deviation d = storage - emission_index is query-independent, and
+        // the stable (d, emission) order is exactly the oracle's stable_sort
+        // output for those rows.
+        std::vector<uint32_t> d2t;   // d-position -> tagged index (the permutation)
+        std::vector<const llama_rerot_key_record *> rows_d; // d-order rows
+        std::vector<int64_t> dev;    // d_i at d-positions
+        // Tagged -> d-position inverse, for per-query cut filtering: the
+        // causal cut selects a tagged-order PREFIX, which is an arbitrary
+        // SUBSET of d-positions (not a prefix — d dips at duplicates).
+        std::vector<uint32_t> t2d;   // tagged index -> d-position
         bool causal = false;              // own-run segment: cut applies
     };
     std::vector<segment> segments;
@@ -1108,7 +1132,7 @@ std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
             bool causal = false;
             size_t j = i;
             while (j < tagged.size() && tagged[j].rank == rank) {
-                seg.rows.push_back(tagged[j].key);
+                seg.rows_t.push_back(tagged[j].key);
                 seg.storage.push_back(tagged[j].key->storage_pos);
                 causal |= tagged[j].causal;
                 ++j;
@@ -1121,10 +1145,11 @@ std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
                 }
             }
             seg.causal = causal;
-            // Stable order by deviation d = s - i (i = emission index).
-            // ties keep emission order, mirroring the oracle's
-            // stable_sort over the same rows.
-            std::vector<uint32_t> order(seg.rows.size());
+            // Deviation ordering (stable by (d, emission index)) as a
+            // PERMUTATION of the tagged arrays — `storage` stays ascending
+            // for the binary-search cut; the merge walks the permuted
+            // rows_d/dev lists and filters by tagged index per query.
+            std::vector<uint32_t> order(seg.rows_t.size());
             for (uint32_t k = 0; k < order.size(); ++k) {
                 order[k] = k;
             }
@@ -1137,17 +1162,17 @@ std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
                 return a < b;
             });
             {
-                std::vector<const llama_rerot_key_record *> rows2(seg.rows.size());
-                std::vector<llama_pos> storage2(seg.rows.size());
-                std::vector<int64_t> dev2(seg.rows.size());
-                for (size_t k = 0; k < order.size(); ++k) {
-                    rows2[k] = seg.rows[order[k]];
-                    storage2[k] = seg.storage[order[k]];
-                    dev2[k] = int64_t(storage2[k]) - int64_t(order[k]);
+                const size_t n = seg.rows_t.size();
+                seg.d2t = std::move(order);
+                seg.rows_d.resize(n);
+                seg.dev.resize(n);
+                seg.t2d.assign(n, 0);
+                for (size_t k = 0; k < n; ++k) {
+                    const uint32_t t = seg.d2t[k];
+                    seg.rows_d[k] = seg.rows_t[t];
+                    seg.dev[k] = int64_t(seg.storage[t]) - int64_t(t);
+                    seg.t2d[t] = uint32_t(k);
                 }
-                seg.rows = std::move(rows2);
-                seg.storage = std::move(storage2);
-                seg.dev = std::move(dev2);
             }
             segments.push_back(std::move(seg));
             i = j;
@@ -1221,9 +1246,14 @@ std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
         for (size_t s = 0; s < segments.size(); ++s) {
             const auto & seg = segments[s];
             if (!seg.causal) {
-                cut_of[s] = seg.rows.size();
+                cut_of[s] = seg.rows_d.size();
                 continue;
             }
+            // The cut is a TAGGED-ORDER PREFIX (rows with storage <= q_pos,
+            // storage is ascending in tagged order). In d-positions that
+            // prefix is an arbitrary SUBSET — d dips at duplicate storage —
+            // so record the tagged cut index; the merge filters d-positions
+            // by t2d[dp] < tagged_cut below.
             const auto cut = std::upper_bound(seg.storage.begin(), seg.storage.end(), q_pos);
             cut_of[s] = size_t(cut - seg.storage.begin());
         }
@@ -1289,7 +1319,16 @@ std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
                 any = true;
             }
             for (size_t s = 0; s < segments.size(); ++s) {
-                if (merge_pos[s + 1] >= cut_of[s]) {
+                // Advance past d-positions whose tagged index failed the
+                // causal cut (the cut is a tagged-order prefix; in d-order
+                // the surviving rows are an arbitrary subset).
+                while (merge_pos[s + 1] < segments[s].rows_d.size() &&
+                       (segments[s].causal
+                            ? segments[s].d2t[merge_pos[s + 1]] >= cut_of[s]
+                            : false)) {
+                    ++merge_pos[s + 1];
+                }
+                if (merge_pos[s + 1] >= segments[s].rows_d.size()) {
                     continue;
                 }
                 const int64_t v = qv + segments[s].dev[merge_pos[s + 1]] - int64_t(vis_before[s + 1]);
@@ -1313,9 +1352,10 @@ std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
             }
             for (size_t s = 0; s < segments.size(); ++s) {
                 const auto & seg = segments[s];
-                while (merge_pos[s + 1] < cut_of[s] &&
+                while (merge_pos[s + 1] < seg.rows_d.size() &&
+                       (!seg.causal || seg.d2t[merge_pos[s + 1]] < cut_of[s]) &&
                        qv + seg.dev[merge_pos[s + 1]] - int64_t(vis_before[s + 1]) == best) {
-                    layout.entries.push_back({ seg.rows[merge_pos[s + 1]]->key_index, group_index });
+                    layout.entries.push_back({ seg.rows_d[merge_pos[s + 1]]->key_index, group_index });
                     ++merge_pos[s + 1];
                     emitted = true;
                 }
@@ -1332,6 +1372,483 @@ std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
             layout.groups.push_back({ 0, llama_pos(best) });
         }
         result.push_back(std::move(layout));
+    }
+    return result;
+}
+
+// Multi-reader shared-world builder (2026-09-22 fifth round, Q3 host side).
+// R pens of one frontier share ONE key world: ONE structural pass over
+// `keys` — per-(episode, run) segments in the oracle's tagged order with
+// the deviation (s - i) permutation, plus the untagged (storage, idx)
+// order — serves EVERY reader. Per reader, only the ownership-dependent
+// work remains:
+//   - segment set: runs of reader.ordered_runs, own = (run == query_run);
+//   - per-row frontier classification: own public/private/pending rows
+//     gated (own private/pending carry NO frontier gate — the oracle checks
+//     node==reader && owned && causal cut only), foreign public rows FULL
+//     iff the frontier rule passes, foreign private/pending invisible;
+//   - base arm: untagged rows owned by the reader (base_owned column);
+//   - the per-query numeric pass (causal cuts + k-way deviation merge).
+// Output[r][i] is EXACTLY llama_rerot_build_query_layouts_shared(
+// readers[r], query_pos[r], keys-with-reader-r's-ownership-column) — the
+// single-reader builder stays the oracle (tests compare all three paths).
+// With R pens on one frontier the scan+sort cost drops from R copies to one.
+std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layouts_multi_reader(
+        const std::vector<llama_rerot_reader_state> & readers,
+        const std::vector<std::vector<llama_pos>> & query_storage_pos,
+        const std::vector<llama_rerot_key_record> & keys,
+        const std::vector<std::vector<uint8_t>> & base_owned) {
+    if (readers.size() != query_storage_pos.size() || base_owned.size() != readers.size()) {
+        throw std::invalid_argument("RERoT multi-reader: reader/query/ownership counts differ");
+    }
+    for (size_t r = 0; r < readers.size(); ++r) {
+        const auto & reader = readers[r];
+        if (!reader.active()) {
+            throw std::invalid_argument("RERoT reader state is inactive");
+        }
+        if (reader.reader == LLAMA_REROT_NODE_INVALID || reader.query_run == LLAMA_REROT_RUN_INVALID) {
+            throw std::invalid_argument("RERoT reader or query run is invalid");
+        }
+        if (base_owned[r].size() != keys.size()) {
+            throw std::invalid_argument("RERoT multi-reader: ownership column width mismatch");
+        }
+        for (const llama_pos pos : query_storage_pos[r]) {
+            if (pos < 0) {
+                throw std::invalid_argument("RERoT query storage position must be non-negative");
+            }
+        }
+    }
+
+    // ---- ONE structural pass over the shared key world. ----
+    struct shared_run {
+        uint64_t episode_id = 0;
+        llama_rerot_run_id run_id = LLAMA_REROT_RUN_INVALID;
+        // Owner node: rows are bucketed by (episode, run, node) so a run id
+        // shared by two nodes (possible in the cell lifetime: a run id is
+        // re-assigned per node after retirement) never merges owners. The
+        // single-reader builder filters per row by node_id; this bucket key
+        // reproduces that grouping exactly.
+        llama_rerot_node_id owner_node = LLAMA_REROT_NODE_INVALID;
+        std::vector<uint32_t> rows;      // key indices, tagged order
+        std::vector<llama_pos> storage;  // ascending (== tagged order)
+        std::vector<uint32_t> d2t;       // d-position -> tagged index
+        std::vector<uint32_t> t2d;       // tagged index -> d-position
+        std::vector<int64_t> dev;        // d = storage - tagged idx, at d-positions
+    };
+    std::vector<shared_run> runs;
+    std::vector<uint32_t> untagged_sorted;
+    {
+        std::vector<uint8_t> physical_seen; // same dedup contract as above
+        std::vector<uint32_t> untagged;
+        for (size_t ki = 0; ki < keys.size(); ++ki) {
+            const auto & key = keys[ki];
+            if (key.key_index >= physical_seen.size()) {
+                physical_seen.resize(size_t(key.key_index) + 1, 0);
+            }
+            if (physical_seen[key.key_index]++) {
+                throw std::invalid_argument("RERoT key records contain a duplicate physical key");
+            }
+            if (key.storage_pos < 0) {
+                throw std::invalid_argument("RERoT key storage position must be non-negative");
+            }
+            const auto & meta = key.meta;
+            if (!meta.active()) {
+                untagged.push_back(uint32_t(ki));
+                continue;
+            }
+            shared_run * run = nullptr;
+            for (auto & cand : runs) {
+                if (cand.episode_id == meta.episode_id && cand.run_id == meta.run_id &&
+                    cand.owner_node == meta.node_id) {
+                    run = &cand;
+                    break;
+                }
+            }
+            if (!run) {
+                runs.push_back(shared_run{});
+                run = &runs.back();
+                run->episode_id = meta.episode_id;
+                run->run_id = meta.run_id;
+                run->owner_node = meta.node_id;
+            }
+            run->rows.push_back(uint32_t(ki));
+        }
+        for (auto & run : runs) {
+            std::sort(run.rows.begin(), run.rows.end(), [&](uint32_t a, uint32_t b) {
+                const auto & ka = keys[a];
+                const auto & kb = keys[b];
+                if (ka.storage_pos != kb.storage_pos) {
+                    return ka.storage_pos < kb.storage_pos;
+                }
+                if (ka.meta.frontier != kb.meta.frontier) {
+                    return ka.meta.frontier < kb.meta.frontier;
+                }
+                return ka.key_index < kb.key_index;
+            });
+            const size_t n = run.rows.size();
+            run.storage.resize(n);
+            for (size_t i = 0; i < n; ++i) {
+                run.storage[i] = keys[run.rows[i]].storage_pos;
+            }
+            std::vector<uint32_t> order(n);
+            for (uint32_t k = 0; k < n; ++k) {
+                order[k] = k;
+            }
+            std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                const int64_t da = int64_t(run.storage[a]) - int64_t(a);
+                const int64_t db = int64_t(run.storage[b]) - int64_t(b);
+                if (da != db) {
+                    return da < db;
+                }
+                return a < b;
+            });
+            run.d2t = std::move(order);
+            run.t2d.assign(n, 0);
+            run.dev.resize(n);
+            for (size_t p = 0; p < n; ++p) {
+                const uint32_t t = run.d2t[p];
+                run.dev[p] = int64_t(run.storage[t]) - int64_t(t);
+                run.t2d[t] = uint32_t(p);
+            }
+        }
+        untagged_sorted = std::move(untagged);
+        std::sort(untagged_sorted.begin(), untagged_sorted.end(), [&](uint32_t a, uint32_t b) {
+            if (keys[a].storage_pos != keys[b].storage_pos) {
+                return keys[a].storage_pos < keys[b].storage_pos;
+            }
+            return keys[a].key_index < keys[b].key_index;
+        });
+    }
+
+    std::vector<std::vector<llama_rerot_query_layout>> result(readers.size());
+    for (size_t r = 0; r < readers.size(); ++r) {
+        const auto & reader = readers[r];
+        const auto & owned_col = base_owned[r];
+
+        std::unordered_map<llama_rerot_run_id, uint32_t> run_rank;
+        run_rank.reserve(reader.ordered_runs.size());
+        for (uint32_t i = 0; i < reader.ordered_runs.size(); ++i) {
+            if (reader.ordered_runs[i] == LLAMA_REROT_RUN_INVALID ||
+                !run_rank.emplace(reader.ordered_runs[i], i).second) {
+                throw std::invalid_argument("RERoT reader view contains an invalid or duplicate run id");
+            }
+        }
+        if (run_rank.find(reader.query_run) == run_rank.end()) {
+            throw std::invalid_argument("RERoT query run is absent from the reader view");
+        }
+
+        // Reader-facing segments in rank order. ONE row list per segment:
+        // the frontier-passing subset of the shared run, in der
+        // (subsequence of the shared deviation order — still d-sorted).
+        // Only the reader's OWN segment is causally cut per query; foreign
+        // segments (frontier-passing public rows) are FULL. The gated mask
+        // over tagged indices drives both the per-query cut and the own-row
+        // virtual arithmetic.
+        struct seg_view {
+            const shared_run * run = nullptr;
+            bool own = false;
+            std::vector<uint32_t> dp;     // d-positions of the passing rows
+            std::vector<uint32_t> pass_prefix; // tagged idx -> passing rows before it
+        };
+        std::vector<seg_view> segs;
+        for (const auto run_id : reader.ordered_runs) {
+            // One entry per (run, node) bucket of this run id: the reader's
+            // own-node buckets are causal/own; foreign-node buckets of the
+            // same run id are FOREIGN segments (frontier rule), exactly as
+            // the single-reader builder's per-row node test classifies them.
+            for (const auto & found : runs) {
+                if (found.episode_id != reader.episode_id || found.run_id != run_id) {
+                    continue;
+                }
+            // Own rows = the run's OWNER NODE is the reader (a reader's node
+            // can own several runs: its query run plus earlier private
+            // runs) — matching the single-reader builder's per-row
+            // node_id == reader.reader test, which the cache-level oracle
+            // pins (test_rerot_shared_reader_multi_query owns runs 2+3).
+                const bool own = found.owner_node == reader.reader;
+            seg_view sv;
+            sv.run = &found;
+            sv.own = own;
+            std::vector<uint8_t> pass(found.rows.size(), 0);
+            for (size_t i = 0; i < found.rows.size(); ++i) {
+                const auto & meta = keys[found.rows[i]].meta;
+                if (meta.visibility == llama_rerot_visibility::public_live) {
+                    if (own) {
+                        if (meta.frontier <= reader.frontier && owned_col[found.rows[i]]) {
+                            pass[i] = 1;
+                        }
+                    } else if (reader.frontier_mode == LLAMA_REROT_FRONTIER_STRONG) {
+                        if (meta.frontier < reader.frontier) {
+                            pass[i] = 1;
+                        }
+                    } else if (reader.frontier > 0) {
+                        if (meta.frontier < reader.frontier - 1) {
+                            pass[i] = 1;
+                        }
+                    }
+                } else if (own && (meta.visibility == llama_rerot_visibility::private_control ||
+                                   meta.visibility == llama_rerot_visibility::pending_record)) {
+                    // No frontier gate for own private/pending rows (the
+                    // oracle checks node==reader && owned && causal cut
+                    // only — pinned by the fifth-round probe).
+                    if (owned_col[found.rows[i]]) {
+                        pass[i] = 1;
+                    }
+                }
+            }
+            // Walk the shared deviation order and keep the passing rows:
+            // dp stays ascending in d-position, so each list is sorted by
+            // effective (the merge's precondition). Iterating tagged order
+            // instead would emit d-positions in their permutation order.
+            bool any_pass = false;
+            for (size_t p = 0; p < found.rows.size(); ++p) {
+                if (pass[found.d2t[p]]) {
+                    sv.dp.push_back(uint32_t(p));
+                    any_pass = true;
+                }
+            }
+            if (!any_pass) {
+                continue;
+            }
+            // Passing-prefix counts over tagged indices: the own-row virtual
+            // position = rows before the own gated list + passing rows with
+            // tagged index < local; and the per-query causal cut count is
+            // the number of passing rows with tagged index < tagged_cut.
+            sv.pass_prefix.assign(found.rows.size() + 1, 0);
+            for (size_t i = 0; i < found.rows.size(); ++i) {
+                sv.pass_prefix[i + 1] = sv.pass_prefix[i] + uint32_t(pass[i]);
+            }
+            segs.push_back(std::move(sv));
+            }
+        }
+
+        // Base arm: untagged rows owned by THIS reader, (storage, idx)
+        // order, deviation-ordered (same identity as the single-reader
+        // builder: d = storage[j] - j over the full array, prefix cuts keep
+        // stable order).
+        std::vector<uint32_t> base;
+        for (const uint32_t ki : untagged_sorted) {
+            if (owned_col[ki]) {
+                base.push_back(ki);
+            }
+        }
+        std::vector<llama_pos> base_storage(base.size());
+        for (size_t i = 0; i < base.size(); ++i) {
+            base_storage[i] = keys[base[i]].storage_pos;
+        }
+        std::vector<uint32_t> base_order(base.size());
+        for (uint32_t k = 0; k < base_order.size(); ++k) {
+            base_order[k] = k;
+        }
+        if (!base.empty()) {
+            std::sort(base_order.begin(), base_order.end(), [&](uint32_t a, uint32_t b) {
+                const int64_t da = int64_t(base_storage[a]) - int64_t(a);
+                const int64_t db = int64_t(base_storage[b]) - int64_t(b);
+                if (da != db) {
+                    return da < db;
+                }
+                return a < b;
+            });
+        }
+        std::vector<int64_t> base_dev(base.size());
+        for (size_t k = 0; k < base_order.size(); ++k) {
+            base_dev[k] = int64_t(base_storage[base_order[k]]) - int64_t(base_order[k]);
+        }
+
+        // ---- Per-reader numeric pass. ----
+        // Merge lists: list 0 = base arm (gated, prefix cut over the
+        // ascending storage array); then per segment, in rank order, the
+        // FULL d-positions and the gated d-positions as two lists. List
+        // order = the oracle's emission order (base, then rank order,
+        // FULL before gated inside one segment — the tagged comparator
+        // interleaves them by (storage, frontier, idx), but the oracle's
+        // stable_sort groups by EFFECTIVE value, not by list; the merge
+        // below only needs each list individually sorted by effective,
+        // which holds: both are filtered subsequences of the shared
+        // deviation order).
+        struct list_ref {
+            const shared_run * run = nullptr; // nullptr = base arm
+            const std::vector<uint32_t> * dp = nullptr; // d-positions (or base_order)
+            const std::vector<int64_t> * dev = nullptr;
+            bool gated = false;
+        };
+        std::vector<list_ref> lists;
+        lists.reserve(1 + segs.size());
+        lists.push_back(list_ref{ nullptr, &base_order, &base_dev, true });
+        for (const auto & sv : segs) {
+            lists.push_back(list_ref{ sv.run, &sv.dp, &sv.run->dev, sv.own });
+        }
+
+        std::vector<uint64_t> vis_count(lists.size(), 0);
+        std::vector<uint64_t> vis_before(lists.size(), 0);
+        std::vector<size_t> merge_pos(lists.size(), 0);
+
+        // Per-segment causal cuts (tagged-order prefix) reused per query.
+        std::vector<size_t> seg_cut(segs.size(), 0);
+
+        for (size_t qi = 0; qi < query_storage_pos[r].size(); ++qi) {
+            const llama_pos q_pos = query_storage_pos[r][qi];
+
+            // Causal cuts: base prefix + per-segment tagged prefix.
+            size_t base_cut = 0;
+            {
+                const auto cut = std::upper_bound(base_storage.begin(), base_storage.end(), q_pos);
+                base_cut = size_t(cut - base_storage.begin());
+            }
+            {
+                size_t si = 0;
+                for (const auto & sv : segs) {
+                    if (!sv.own) {
+                        // Foreign segment: FULL, never causally cut.
+                        seg_cut[si] = sv.run->rows.size();
+                    } else {
+                        const auto cut = std::upper_bound(sv.run->storage.begin(), sv.run->storage.end(), q_pos);
+                        seg_cut[si] = size_t(cut - sv.run->storage.begin());
+                    }
+                    ++si;
+                }
+            }
+
+            // Visible counts per list (list order = emission order): the base
+            // arm's causal prefix, then each segment's passing rows.
+            {
+                uint64_t total = 0;
+                vis_before[0] = 0;
+                vis_count[0] = uint64_t(base_cut);
+                total = vis_count[0];
+                size_t si = 0;
+                for (const auto & sv : segs) {
+                    vis_before[si + 1] = total;
+                    if (sv.own) {
+                        // Passing rows with tagged index < cut.
+                        vis_count[si + 1] = uint64_t(sv.pass_prefix[seg_cut[si]]);
+                    } else {
+                        vis_count[si + 1] = uint64_t(sv.dp.size());
+                    }
+                    total += vis_count[si + 1];
+                    ++si;
+                }
+            }
+
+            // Own-row lookup (oracle LAST-match): the query run's segment,
+            // last storage == q_pos in tagged order. The row's virtual index
+            // = visible rows before the own segment + passing rows of the
+            // segment with tagged index < local (the passing set is a
+            // subsequence of tagged order, and all passing rows before the
+            // own row are causally visible: their storage <= q_pos).
+            uint64_t total = 0;
+            for (size_t li = 0; li <= segs.size(); ++li) {
+                total += vis_count[li];
+            }
+            llama_pos query_virtual_pos = llama_pos(total);
+            {
+                size_t si = 0;
+                for (const auto & sv : segs) {
+                    if (sv.own && sv.run->run_id == reader.query_run) {
+                        const auto & st = sv.run->storage;
+                        const auto it = std::lower_bound(st.begin(), st.end(), q_pos);
+                        if (it != st.end() && *it == q_pos) {
+                            size_t local = size_t(it - st.begin());
+                            while (local + 1 < st.size() && st[local + 1] == q_pos) {
+                                ++local;
+                            }
+                            query_virtual_pos = llama_pos(vis_before[si + 1] +
+                                uint64_t(sv.pass_prefix[local]));
+                        }
+                        break;
+                    }
+                    ++si;
+                }
+            }
+            if (query_virtual_pos > std::numeric_limits<llama_pos>::max()) {
+                throw std::overflow_error("RERoT query virtual position overflow");
+            }
+
+            // K-way merge over the deviation-sorted lists (same shape as
+            // the single-reader builder: effective = qv + d - B).
+            llama_rerot_query_layout layout;
+            layout.query_virtual_pos = query_virtual_pos;
+            layout.entries.reserve(size_t(total));
+            for (auto & p : merge_pos) {
+                p = 0;
+            }
+            const int64_t qv = int64_t(query_virtual_pos);
+            while (true) {
+                // Base cursor: advance past cut rows (prefix cut over the
+                // ascending array; base_order is d-order).
+                while (merge_pos[0] < base_order.size() && base_order[merge_pos[0]] >= base_cut) {
+                    ++merge_pos[0];
+                }
+                int64_t best = std::numeric_limits<int64_t>::max();
+                bool any = false;
+                if (merge_pos[0] < base_order.size()) {
+                    best = qv + base_dev[merge_pos[0]] - int64_t(vis_before[0]);
+                    any = true;
+                }
+                {
+                    size_t li = 1;
+                    size_t si = 0;
+                    for (const auto & sv : segs) {
+                        if (sv.own) {
+                            // Advance past d-positions that failed the causal
+                            // cut (the cut is a tagged-order prefix; in d-order
+                            // the surviving passing rows are an arbitrary
+                            // subset — d dips at duplicate storage).
+                            while (merge_pos[li] < sv.dp.size() &&
+                                   sv.run->d2t[sv.dp[merge_pos[li]]] >= seg_cut[si]) {
+                                ++merge_pos[li];
+                            }
+                        }
+                        if (merge_pos[li] < sv.dp.size()) {
+                            const uint32_t dp = sv.dp[merge_pos[li]];
+                            const int64_t v = qv + sv.run->dev[dp] - int64_t(vis_before[li]);
+                            if (!any || v < best) {
+                                best = v;
+                                any = true;
+                            }
+                        }
+                        ++li;
+                        ++si;
+                    }
+                }
+                if (!any) {
+                    break;
+                }
+                const uint32_t group_index = uint32_t(layout.groups.size());
+                bool emitted = false;
+                while (merge_pos[0] < base_order.size() && base_order[merge_pos[0]] < base_cut &&
+                       qv + base_dev[merge_pos[0]] - int64_t(vis_before[0]) == best) {
+                    const uint32_t emi = base_order[merge_pos[0]];
+                    layout.entries.push_back({ keys[base[emi]].key_index, group_index });
+                    ++merge_pos[0];
+                    emitted = true;
+                }
+                {
+                    size_t li = 1;
+                    size_t si = 0;
+                    for (const auto & sv : segs) {
+                        while (merge_pos[li] < sv.dp.size() &&
+                               (!sv.own || sv.run->d2t[sv.dp[merge_pos[li]]] < seg_cut[si]) &&
+                               qv + sv.run->dev[sv.dp[merge_pos[li]]] - int64_t(vis_before[li]) == best) {
+                            const uint32_t dp = sv.dp[merge_pos[li]];
+                            layout.entries.push_back({ keys[sv.run->rows[sv.run->d2t[dp]]].key_index, group_index });
+                            ++merge_pos[li];
+                            emitted = true;
+                        }
+                        ++li;
+                        ++si;
+                    }
+                }
+                if (!emitted) {
+                    throw std::runtime_error("RERoT shared layout: k-way merge lost a group head");
+                }
+                if (best < 0 || best > std::numeric_limits<llama_pos>::max()) {
+                    throw std::overflow_error("RERoT effective query position is outside llama_pos range");
+                }
+                layout.groups.push_back({ 0, llama_pos(best) });
+            }
+            result[r].push_back(std::move(layout));
+        }
     }
     return result;
 }
