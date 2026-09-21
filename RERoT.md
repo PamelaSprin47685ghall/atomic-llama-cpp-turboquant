@@ -2336,6 +2336,7 @@ DAG RERoT implementation candidate
 | DDVR | `tests/test-rerot-ddvr.cpp` |
 | attention | `tests/test-rerot-attn.cpp` |
 | recurrent | `tests/test-rerot-recurrent.cpp` |
+| 数学参考层（Q3/Q5/Q6/Q7） | `src/llama-rerot-math.h`, `src/llama-rerot-math.cpp`, `tests/test-rerot-math.cpp` |
 | model fixed-tape | `tests/test-rerot-model-single.cpp`, `test-rerot-model-batch.cpp`, `test-rerot-model-permute.cpp` |
 
 纯文档/源码核对后常用的低风险检查：
@@ -2373,3 +2374,34 @@ c3648d789  DAG logical/view/fixed-entry implementation
 4. 历史数字保留 artifact/version 边界。
 5. 研究假说不升级为默认 fallback，除非有明确决定和门。
 6. 不再新增新的 RERoT 指南/审计/交接作为并行事实源。
+
+---
+
+## 21. 计算组织研究线（2026-09-21 轮）
+
+本节记录“重画计算组织而非先调 kernel”研究线的当前落地状态。十个研究问题（共享单位、段级 reader view、公共 KV 块服务多读者、DAG 结构/数值分离、GDN 共同基底+低秩增量、已知序列块递推、PQ2 位平面、充分统计量、联合采样、K×H 网格）中，本轮把四条等义数学落成了代码，并重构了 indexed 布局的 host 侧扫描。
+
+### 21.1 已落地（当前 HEAD，全部 CPU 验证）
+
+**数学参考层 `src/llama-rerot-math.{h,cpp}`**（纯 FP64，无 KV/server/graph 依赖）：
+
+1. **[Q3] 共享 KV 多读者块 attention**：`llama_rerot_shared_block_attention` 一次读一个物理块、为每个可见读者独立产生 (m, z, u) 在线 softmax 状态；`llama_rerot_attn_state_merge` 按读者合并。共享的是数据供给，不是 softmax 统计量——与 §2.5 STRONG 语义一致。
+2. **[Q5] GDN 共同基底+低秩增量**：`S_i = a_i·B + U_i·V_i^T`，每步精确追加一个秩一项（`llama_rerot_gdn_lowrank_step`）；共享基底的 `B^T x` 投影一次计算多消费者复用（`llama_rerot_gdn_base_project`）。不是 shared-RBB，不合并 lane 状态；基底只读。
+3. **[Q6] 已知 token 块递推（WY 折叠）**：`llama_rerot_gdn_chunk_fold` 把 T 步已知（teacher-forced）token 折成 `(M, Y)` 紧凑仿射转移：`M = I − K·W·K^T`，`W = (I+L)^{-1}·diag(β)`，`L[j,c] = β_j(k_j·k_c)` (j>c，**行索引 β**)，`Y` 为零状态臂。生产 kernel 应按秩算子 `x → G·(x − K(W(K^T x)))` 应用，并把同一折叠块应用到多 lane 状态。
+4. **[Q7] PQ2_0 位平面恒等式**：`{0,1,2,3}→{−1,0,+1,+2}` 使块内积变成 `Σ_{b0=1}x + 2Σ_{b1=1}x − Σx`（`llama_rerot_pq2_bitplane_dot`）或每 4 权重一次 16 表 LUT（`llama_rerot_pq2_lut_dot`）。与 ggml 整数路径位级一致（整数 activation 时）。
+
+**indexed 布局 host 侧重构 `llama_kv_cache::rerot_build_attn_layout`**：旧路径每 query 行重建整份 n_kv key 表并重新排序（O(Q·n_kv) 扫描+排序，每行 ~40B·n_kv 临时内存）。新路径按 distinct reader state 分组（同一 pen 的 decode 行、MTP verify 行共享同一可见性世界），每组一次扫描+一次排序，per query 只做因果截断与相位分组。输出与逐 query 调 `llama_rerot_build_query_layout` 构造性一致。
+
+### 21.2 验证证据
+
+- `test-rerot-math`：0 failure。Q3 对拍独立全 softmax oracle（含不可见读者、合并顺序无关性）；Q5 对拍稠密 §2.3 逐步递推（12 步，α<1，异构 β，秩每步恰 +1，dense/output 双等价，多 lane 共享投影位级一致）；Q6 24 个随机 chunk（T=1..8，含 β=0 纯衰减，此时 M=G·I、Y=0 精确成立）对拍逐步 oracle ≤1e-10；Q7 全部四种编码存在下对拍 (code−1) 解码 oracle，整数 activation 时位级相等。
+- RERoT/xkv/flashprefill 全家 45/45 ctest 通过（含 `test_ddvr_two_query_groups` 的多 reader、多 query 行、跨 reader 可见性、精确组计数断言）。
+- 开发机预存失败（与本轮无关，基线复现）：test-tokenizers-ggml-vocabs、test-quantize-fns、test-llama-archs、test-backend-ops timeout；test-vulkan-tp5-mesh/command-replay 需 ≥2 Vulkan 设备（开发机仅 1 块 780M iGPU）。
+
+### 21.3 边界与下一步
+
+- 数学参考层是 kernel 契约与 oracle，**未进入生产 decode 路径**；任何 GPU 化必须先过 F32 数值门（Q5 的代数重排在 F32 下不保证逐位一致；Q6 的 WY 重结合同理）。
+- Q5 的 r 从离开共同基底起算，固定入口 F_i token 也计入；r 超过阈值（约 d_k·d_v / (2(d_k+d_v))）时应转稠密，不能丢弃小增量或强造基底。
+- Q6 只适用于已知 token（固定入口重放、MTP 验证块）；attention 仍按每行视图执行，不得因 GDN 块化放松因果。
+- Q7 的 LUT 路径在 GPU 上“减乘法≠减耗时”，需实测；块 scale 与 Hadamard 域不得交换。
+- Q8（跳块上界）与 Q10（K×H 联合投机）是近似/研究路线，未动，不得与等义改写的收益混记。

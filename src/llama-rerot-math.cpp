@@ -1,0 +1,609 @@
+// llama-rerot-math.cpp — pure mathematical reference implementations for the
+// RERoT compute-organization research line (2026-09-21 round). See
+// llama-rerot-math.h for scope and contracts. FP64 throughout: these are
+// oracles and kernel contracts, not production kernels.
+
+#include "llama-rerot-math.h"
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
+
+namespace {
+
+[[noreturn]] void invalid_arg(const char * message) {
+    throw std::invalid_argument(message);
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// [Q3] Shared-KV multi-reader block attention
+// ---------------------------------------------------------------------------
+
+void llama_rerot_attn_state_merge(llama_rerot_attn_state & dst, const llama_rerot_attn_state & src) {
+    if (dst.empty() != src.empty()) {
+        invalid_arg("RERoT attn merge: empty/non-empty state mismatch");
+    }
+    if (dst.empty()) {
+        return;
+    }
+    if (dst.u.size() != src.u.size()) {
+        invalid_arg("RERoT attn merge: value dimension mismatch");
+    }
+
+    const double m = std::max(dst.m, src.m);
+    const double w_dst = std::exp(dst.m - m);
+    const double w_src = std::exp(src.m - m);
+
+    dst.z = w_dst * dst.z + w_src * src.z;
+    for (size_t i = 0; i < dst.u.size(); ++i) {
+        dst.u[i] = w_dst * dst.u[i] + w_src * src.u[i];
+    }
+    dst.m = m;
+}
+
+std::vector<llama_rerot_attn_state> llama_rerot_shared_block_attention(
+    const std::vector<double> & queries,
+    const std::vector<double> & keys,
+    const std::vector<double> & values,
+    uint32_t n_readers,
+    uint32_t head_dim,
+    uint32_t value_dim,
+    const std::vector<uint8_t> & reader_visible,
+    double scale) {
+    if (n_readers == 0) {
+        invalid_arg("RERoT shared block attention: no readers");
+    }
+    if (head_dim == 0 || value_dim == 0) {
+        invalid_arg("RERoT shared block attention: zero dimension");
+    }
+    if (queries.size() != size_t(n_readers) * head_dim) {
+        invalid_arg("RERoT shared block attention: queries size mismatch");
+    }
+    const size_t n_block = keys.size() / head_dim;
+    if (keys.size() != n_block * head_dim || n_block == 0) {
+        invalid_arg("RERoT shared block attention: keys size mismatch");
+    }
+    if (values.size() != n_block * value_dim) {
+        invalid_arg("RERoT shared block attention: values size mismatch");
+    }
+    if (reader_visible.size() != n_readers) {
+        invalid_arg("RERoT shared block attention: visibility size mismatch");
+    }
+
+    std::vector<llama_rerot_attn_state> states(n_readers);
+    std::vector<uint32_t> visible_readers;
+    visible_readers.reserve(n_readers);
+    for (uint32_t r = 0; r < n_readers; ++r) {
+        if (reader_visible[r] != 0) {
+            visible_readers.push_back(r);
+        }
+    }
+    if (visible_readers.empty()) {
+        return states;
+    }
+
+    // One pass over the shared block: each K/V row is read once and every
+    // visible reader consumes it while it is resident. Readers share the data
+    // supply, never the softmax statistics (each keeps its own m/z/u).
+    for (size_t j = 0; j < n_block; ++j) {
+        const double * key = keys.data() + j * head_dim;
+        const double * val = values.data() + j * value_dim;
+
+        for (const uint32_t r : visible_readers) {
+            const double * query = queries.data() + size_t(r) * head_dim;
+
+            double dot = 0.0;
+            for (uint32_t e = 0; e < head_dim; ++e) {
+                dot += query[e] * key[e];
+            }
+            const double score = scale * dot;
+
+            llama_rerot_attn_state & state = states[r];
+            if (state.empty()) {
+                state.m = score;
+                state.z = 1.0;
+                state.u.assign(val, val + value_dim);
+            } else {
+                const double m = std::max(state.m, score);
+                const double w_old = std::exp(state.m - m);
+                const double w_new = std::exp(score - m);
+                state.z = w_old * state.z + w_new;
+                for (uint32_t e = 0; e < value_dim; ++e) {
+                    state.u[e] = w_old * state.u[e] + w_new * val[e];
+                }
+                state.m = m;
+            }
+        }
+    }
+    return states;
+}
+
+std::vector<double> llama_rerot_attn_state_output(const llama_rerot_attn_state & state) {
+    if (state.empty()) {
+        invalid_arg("RERoT attn output: state is empty");
+    }
+    if (!(state.z > 0.0) || !std::isfinite(state.z)) {
+        invalid_arg("RERoT attn output: non-positive or non-finite normalizer");
+    }
+    std::vector<double> out(state.u.size());
+    for (size_t i = 0; i < out.size(); ++i) {
+        out[i] = state.u[i] / state.z;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// [Q5] GDN common base + per-lane low-rank increments
+// ---------------------------------------------------------------------------
+//
+// Layout conventions (shared by every helper below):
+//   base : [d_k * d_v] row-major, B[j, e] = base[j * d_v + e]
+//   u    : [d_k * r] row-major,  U[j, c] = u[j * r + c]
+//   v    : [d_v * r] row-major,  V[e, c] = v[e * r + c]
+//   S    : [d_k * d_v] row-major, S = a * B + U V^T
+
+std::vector<double> llama_rerot_gdn_base_project(
+    const std::vector<double> & base,
+    const std::vector<double> & x_vectors,
+    uint32_t d_k,
+    uint32_t d_v) {
+    if (d_k == 0 || d_v == 0) {
+        invalid_arg("RERoT GDN base project: zero dimension");
+    }
+    if (base.size() != size_t(d_k) * d_v) {
+        invalid_arg("RERoT GDN base project: base size mismatch");
+    }
+    if (x_vectors.empty() || x_vectors.size() % d_k != 0) {
+        invalid_arg("RERoT GDN base project: x vectors size mismatch");
+    }
+    const size_t n_vectors = x_vectors.size() / d_k;
+    std::vector<double> out(n_vectors * d_v);
+    // B^T x = sum_j x_j * B[j, :] — one pass over the shared base serves all
+    // vectors (all lanes' k_i / q_i in one call).
+    for (size_t n = 0; n < n_vectors; ++n) {
+        const double * x = x_vectors.data() + n * d_k;
+        double * o = out.data() + n * d_v;
+        for (uint32_t j = 0; j < d_k; ++j) {
+            const double xj = x[j];
+            if (xj == 0.0) {
+                continue;
+            }
+            const double * brow = base.data() + size_t(j) * d_v;
+            for (uint32_t e = 0; e < d_v; ++e) {
+                o[e] += xj * brow[e];
+            }
+        }
+    }
+    return out;
+}
+
+llama_rerot_gdn_lowrank_state llama_rerot_gdn_lowrank_step(
+    const llama_rerot_gdn_lowrank_state & state,
+    const std::vector<double> & k,
+    const std::vector<double> & v,
+    double alpha,
+    double beta,
+    const std::vector<double> & base_proj_k) {
+    if (k.empty() || v.empty()) {
+        invalid_arg("RERoT GDN lowrank step: empty k/v");
+    }
+    const uint32_t d_k = uint32_t(k.size());
+    const uint32_t d_v = uint32_t(v.size());
+    const uint32_t r = state.r;
+    if (state.u.size() != size_t(d_k) * r || state.v.size() != size_t(d_v) * r) {
+        invalid_arg("RERoT GDN lowrank step: state size mismatch");
+    }
+    if (base_proj_k.size() != d_v) {
+        invalid_arg("RERoT GDN lowrank step: base projection size mismatch");
+    }
+
+    // Sbar^T k = alpha * (a * (B^T k) + V (U^T k)); B^T k arrives precomputed
+    // (shared-base projection, reused by every consumer of the same base).
+    std::vector<double> u_t_k(r, 0.0);
+    for (uint32_t c = 0; c < r; ++c) {
+        double dot = 0.0;
+        for (uint32_t j = 0; j < d_k; ++j) {
+            dot += state.u[size_t(j) * r + c] * k[j];
+        }
+        u_t_k[c] = dot;
+    }
+    std::vector<double> sbar_t_k(d_v, 0.0);
+    for (uint32_t e = 0; e < d_v; ++e) {
+        double acc = state.a * base_proj_k[e];
+        for (uint32_t c = 0; c < r; ++c) {
+            acc += state.v[size_t(e) * r + c] * u_t_k[c];
+        }
+        sbar_t_k[e] = alpha * acc;
+    }
+
+    // delta = v - Sbar^T k. Factored update (exact, no approximation):
+    //   S' = alpha*a * B + [alpha*U | beta*k] [V | delta]^T
+    // i.e. every old U column scales by alpha, V columns stay, and one new
+    // rank-1 term (beta*k) delta^T appends. Rank grows by one per step.
+    llama_rerot_gdn_lowrank_state next;
+    next.a = alpha * state.a;
+    next.r = r + 1;
+    next.u.assign(size_t(d_k) * next.r, 0.0);
+    next.v.assign(size_t(d_v) * next.r, 0.0);
+    for (uint32_t j = 0; j < d_k; ++j) {
+        double * urow = next.u.data() + size_t(j) * next.r;
+        for (uint32_t c = 0; c < r; ++c) {
+            urow[c] = alpha * state.u[size_t(j) * r + c];
+        }
+        urow[r] = beta * k[j];
+    }
+    for (uint32_t e = 0; e < d_v; ++e) {
+        double * vrow = next.v.data() + size_t(e) * next.r;
+        for (uint32_t c = 0; c < r; ++c) {
+            vrow[c] = state.v[size_t(e) * r + c];
+        }
+        vrow[r] = v[e] - sbar_t_k[e];
+    }
+    return next;
+}
+
+std::vector<double> llama_rerot_gdn_lowrank_output(
+    const llama_rerot_gdn_lowrank_state & state,
+    const std::vector<double> & q,
+    const std::vector<double> & base_proj_q) {
+    if (q.empty()) {
+        invalid_arg("RERoT GDN lowrank output: empty q");
+    }
+    const uint32_t d_k = uint32_t(q.size());
+    const uint32_t r = state.r;
+    if (r == 0 || state.u.size() != size_t(d_k) * r || state.v.size() % r != 0) {
+        invalid_arg("RERoT GDN lowrank output: state size mismatch");
+    }
+    const uint32_t d_v = uint32_t(state.v.size() / r);
+    if (base_proj_q.size() != d_v) {
+        invalid_arg("RERoT GDN lowrank output: base projection size mismatch");
+    }
+
+    // o = S^T q = a * (B^T q) + V (U^T q); B^T q arrives precomputed.
+    std::vector<double> u_t_q(r, 0.0);
+    for (uint32_t c = 0; c < r; ++c) {
+        double dot = 0.0;
+        for (uint32_t j = 0; j < d_k; ++j) {
+            dot += state.u[size_t(j) * r + c] * q[j];
+        }
+        u_t_q[c] = dot;
+    }
+    std::vector<double> out(d_v);
+    for (uint32_t e = 0; e < d_v; ++e) {
+        double acc = state.a * base_proj_q[e];
+        for (uint32_t c = 0; c < r; ++c) {
+            acc += state.v[size_t(e) * r + c] * u_t_q[c];
+        }
+        out[e] = acc;
+    }
+    return out;
+}
+
+std::vector<double> llama_rerot_gdn_lowrank_dense(
+    const llama_rerot_gdn_lowrank_state & state,
+    const std::vector<double> & base,
+    uint32_t d_k,
+    uint32_t d_v) {
+    if (base.size() != size_t(d_k) * d_v) {
+        invalid_arg("RERoT GDN lowrank dense: base size mismatch");
+    }
+    if (state.u.size() != size_t(d_k) * state.r || state.v.size() != size_t(d_v) * state.r) {
+        invalid_arg("RERoT GDN lowrank dense: state size mismatch");
+    }
+
+    std::vector<double> s(size_t(d_k) * d_v, 0.0);
+    for (uint32_t j = 0; j < d_k; ++j) {
+        for (uint32_t e = 0; e < d_v; ++e) {
+            double acc = state.a * base[size_t(j) * d_v + e];
+            for (uint32_t c = 0; c < state.r; ++c) {
+                acc += state.u[size_t(j) * state.r + c] * state.v[size_t(e) * state.r + c];
+            }
+            s[size_t(j) * d_v + e] = acc;
+        }
+    }
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+// [Q6] Known-token chunk recurrence (WY-style compact transition)
+// ---------------------------------------------------------------------------
+//
+// Recurrence (RERoT.md §2.3): S_t = alpha_t (I - beta_t k_t k_t^T) S_{t-1}
+// + beta_t k_t v_t^T, i.e. an affine map S_T = Phi S_0 + Y with
+// Phi = A_T ... A_1, A_t = alpha_t (I - beta_t k_t k_t^T),
+// Y = the same composition applied to zero (exact by linearity).
+//
+// Phi = G * M with G = prod alphas and M the product of the rank-1
+// corrections. WY factorization of M (verified by induction on T):
+//   M = I - K W K^T,   W = (I + L)^{-1} diag(beta),
+//   L[j, c] = beta_j (k_j . k_c)   for j > c (strictly lower, ROW-indexed
+//   beta — the column-indexed variant is NOT the same map when betas differ).
+// A production kernel never materializes M: it applies the rank-T operator
+// x -> G * (x - K (W (K^T x))), and the payoff is folding ONE chunk once and
+// applying it to many lanes' states as shared matrix work.
+
+namespace {
+
+// Solve (I + L) x = b, L strictly lower row-major [t * t]. Forward substitution.
+std::vector<double> solve_unit_lower(const std::vector<double> & l, std::vector<double> b) {
+    const size_t t = b.size();
+    for (size_t i = 0; i < t; ++i) {
+        double acc = b[i];
+        const double * row = l.data() + i * t;
+        for (size_t j = 0; j < i; ++j) {
+            acc -= row[j] * b[j];
+        }
+        if (!std::isfinite(acc)) {
+            invalid_arg("RERoT GDN chunk fold: non-finite unit-lower solve");
+        }
+        b[i] = acc;
+    }
+    return b;
+}
+
+} // namespace
+
+llama_rerot_gdn_chunk llama_rerot_gdn_chunk_fold(
+    uint32_t d_k,
+    uint32_t d_v,
+    const std::vector<double> & ks,
+    const std::vector<double> & vs,
+    const std::vector<double> & alphas,
+    const std::vector<double> & betas) {
+    if (d_k == 0 || d_v == 0) {
+        invalid_arg("RERoT GDN chunk fold: zero dimension");
+    }
+    if (ks.empty() || ks.size() % d_k != 0) {
+        invalid_arg("RERoT GDN chunk fold: ks size mismatch");
+    }
+    const size_t t = ks.size() / d_k;
+    if (t == 0) {
+        invalid_arg("RERoT GDN chunk fold: empty chunk");
+    }
+    if (vs.size() != t * d_v || alphas.size() != t || betas.size() != t) {
+        invalid_arg("RERoT GDN chunk fold: chunk size mismatch");
+    }
+
+    // Y = zero-state arm of the recurrence, step by step (exact).
+    std::vector<double> y(size_t(d_k) * d_v, 0.0);
+    std::vector<double> sbar_t_k(d_v);
+    for (size_t step = 0; step < t; ++step) {
+        const double * k = ks.data() + step * d_k;
+        const double * v = vs.data() + step * d_v;
+        const double a = alphas[step];
+        const double b = betas[step];
+
+        for (uint32_t e = 0; e < d_v; ++e) {
+            double dot = 0.0;
+            for (uint32_t j = 0; j < d_k; ++j) {
+                dot += y[size_t(j) * d_v + e] * k[j];
+            }
+            sbar_t_k[e] = a * dot;
+        }
+        for (size_t idx = 0; idx < y.size(); ++idx) {
+            y[idx] *= a;
+        }
+        for (uint32_t j = 0; j < d_k; ++j) {
+            const double coeff = b * k[j];
+            for (uint32_t e = 0; e < d_v; ++e) {
+                y[size_t(j) * d_v + e] += coeff * (v[e] - sbar_t_k[e]);
+            }
+        }
+    }
+
+    // W columns: solve (I + L) w = beta_c e_c for each column c.
+    std::vector<double> gram(t * t, 0.0);
+    for (size_t i = 0; i < t; ++i) {
+        const double * ki = ks.data() + i * d_k;
+        for (size_t j = 0; j <= i; ++j) {
+            const double * kj = ks.data() + j * d_k;
+            double dot = 0.0;
+            for (uint32_t e = 0; e < d_k; ++e) {
+                dot += ki[e] * kj[e];
+            }
+            gram[i * t + j] = dot;
+        }
+    }
+    std::vector<double> l(t * t, 0.0);
+    for (size_t j = 0; j < t; ++j) {
+        for (size_t c = 0; c < j; ++c) {
+            l[j * t + c] = betas[j] * gram[j * t + c];
+        }
+    }
+    std::vector<std::vector<double>> w_cols(t);
+    for (size_t c = 0; c < t; ++c) {
+        std::vector<double> e(t, 0.0);
+        e[c] = betas[c];
+        w_cols[c] = solve_unit_lower(l, std::move(e));
+    }
+
+    double g_total = 1.0;
+    for (size_t i = 0; i < t; ++i) {
+        g_total *= alphas[i];
+    }
+
+    // M[:, j] = G * (e_j - K (W (K^T e_j))) — materialized for the reference
+    // layer; production keeps the rank-T application.
+    llama_rerot_gdn_chunk chunk;
+    chunk.y = std::move(y);
+    chunk.m.assign(size_t(d_k) * d_k, 0.0);
+    std::vector<double> kt_ej(t);
+    std::vector<double> w(t);
+    for (uint32_t j = 0; j < d_k; ++j) {
+        for (size_t step = 0; step < t; ++step) {
+            kt_ej[step] = ks[step * d_k + j];
+        }
+        std::fill(w.begin(), w.end(), 0.0);
+        for (size_t c = 0; c < t; ++c) {
+            const double coeff = kt_ej[c];
+            if (coeff == 0.0) {
+                continue;
+            }
+            const std::vector<double> & col = w_cols[c];
+            for (size_t r = 0; r < t; ++r) {
+                w[r] += coeff * col[r];
+            }
+        }
+        for (uint32_t i = 0; i < d_k; ++i) {
+            double acc = (i == j) ? 1.0 : 0.0;
+            for (size_t r = 0; r < t; ++r) {
+                acc -= w[r] * ks[r * d_k + i];
+            }
+            chunk.m[size_t(i) * d_k + j] = g_total * acc;
+        }
+    }
+    return chunk;
+}
+
+std::vector<double> llama_rerot_gdn_chunk_apply(
+    const llama_rerot_gdn_chunk & chunk,
+    const std::vector<double> & s_in,
+    uint32_t d_k,
+    uint32_t d_v) {
+    if (chunk.m.size() != size_t(d_k) * d_k || chunk.y.size() != size_t(d_k) * d_v) {
+        invalid_arg("RERoT GDN chunk apply: chunk size mismatch");
+    }
+    if (s_in.size() != size_t(d_k) * d_v) {
+        invalid_arg("RERoT GDN chunk apply: state size mismatch");
+    }
+
+    // S_out = M S_in + Y. A production kernel applies M by its rank-T
+    // factorization; the reference materializes the product.
+    std::vector<double> out(size_t(d_k) * d_v, 0.0);
+    for (uint32_t j = 0; j < d_k; ++j) {
+        const double * mrow = chunk.m.data() + size_t(j) * d_k;
+        double * orow = out.data() + size_t(j) * d_v;
+        for (uint32_t c = 0; c < d_k; ++c) {
+            const double coeff = mrow[c];
+            if (coeff == 0.0) {
+                continue;
+            }
+            const double * srow = s_in.data() + size_t(c) * d_v;
+            for (uint32_t e = 0; e < d_v; ++e) {
+                orow[e] += coeff * srow[e];
+            }
+        }
+    }
+    for (size_t idx = 0; idx < out.size(); ++idx) {
+        out[idx] += chunk.y[idx];
+    }
+    return out;
+}
+
+std::vector<double> llama_rerot_gdn_steps_reference(
+    const std::vector<double> & s0,
+    uint32_t d_k,
+    uint32_t d_v,
+    const std::vector<double> & ks,
+    const std::vector<double> & vs,
+    const std::vector<double> & alphas,
+    const std::vector<double> & betas) {
+    if (d_k == 0 || d_v == 0 || s0.size() != size_t(d_k) * d_v) {
+        invalid_arg("RERoT GDN steps reference: state size mismatch");
+    }
+    if (ks.empty() || ks.size() % d_k != 0) {
+        invalid_arg("RERoT GDN steps reference: ks size mismatch");
+    }
+    const size_t t = ks.size() / d_k;
+    if (vs.size() != t * d_v || alphas.size() != t || betas.size() != t) {
+        invalid_arg("RERoT GDN steps reference: chunk size mismatch");
+    }
+
+    std::vector<double> s = s0;
+    std::vector<double> sbar_t_k(d_v);
+    for (size_t step = 0; step < t; ++step) {
+        const double * k = ks.data() + step * d_k;
+        const double * v = vs.data() + step * d_v;
+        const double a = alphas[step];
+        const double b = betas[step];
+
+        for (uint32_t e = 0; e < d_v; ++e) {
+            double dot = 0.0;
+            for (uint32_t j = 0; j < d_k; ++j) {
+                dot += s[size_t(j) * d_v + e] * k[j];
+            }
+            sbar_t_k[e] = a * dot;
+        }
+        for (size_t idx = 0; idx < s.size(); ++idx) {
+            s[idx] *= a;
+        }
+        for (uint32_t j = 0; j < d_k; ++j) {
+            const double coeff = b * k[j];
+            for (uint32_t e = 0; e < d_v; ++e) {
+                s[size_t(j) * d_v + e] += coeff * (v[e] - sbar_t_k[e]);
+            }
+        }
+    }
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+// [Q7] PQ2_0 bit-plane subset-sum inner product
+// ---------------------------------------------------------------------------
+
+double llama_rerot_pq2_bitplane_dot(const uint8_t * qs, const double * x, uint32_t n) {
+    if (!qs || !x) {
+        invalid_arg("RERoT PQ2 bitplane dot: null input");
+    }
+    if (n == 0 || n % 4 != 0) {
+        invalid_arg("RERoT PQ2 bitplane dot: n must be a positive multiple of 4");
+    }
+
+    // code layout matches ggml dequantize_row_pq2_0: byte j/4, shift (j%4)*2,
+    // code {0,1,2,3} -> {-1,0,+1,+2} via (code - 1) = b0 + 2*b1 - 1.
+    double sum_all = 0.0;
+    double sum_b0 = 0.0;
+    double sum_b1 = 0.0;
+    for (uint32_t j = 0; j < n; ++j) {
+        const uint8_t byte = qs[j / 4];
+        const uint32_t shift = (j % 4) * 2;
+        const uint8_t code = (byte >> shift) & 0x3;
+        const double xj = x[j];
+        sum_all += xj;
+        if (code & 0x1) {
+            sum_b0 += xj;
+        }
+        if (code & 0x2) {
+            sum_b1 += xj;
+        }
+    }
+    // sum_j (b0_j + 2 b1_j - 1) x_j
+    return sum_b0 + 2.0 * sum_b1 - sum_all;
+}
+
+double llama_rerot_pq2_lut_dot(const uint8_t * qs, const double * x, uint32_t n) {
+    if (!qs || !x) {
+        invalid_arg("RERoT PQ2 LUT dot: null input");
+    }
+    if (n == 0 || n % 4 != 0) {
+        invalid_arg("RERoT PQ2 LUT dot: n must be a positive multiple of 4");
+    }
+
+    // Per group of 4 weights: T[m] = sum of x_j over the subset selected by
+    // the 4-bit mask m. The group's contribution is T[m0] + 2*T[m1] - T[15]
+    // where m0/m1 are the group's low/high bit-plane masks — one table build
+    // and two lookups per 4 weights (T-MAC-style), not one lookup per weight.
+    double total = 0.0;
+    double t[16];
+    for (uint32_t group = 0; group < n / 4; ++group) {
+        t[0] = 0.0;
+        for (uint32_t m = 1; m < 16; ++m) {
+            const uint32_t idx = __builtin_ctz(m);
+            t[m] = t[m & (m - 1)] + x[group * 4 + idx];
+        }
+
+        const uint32_t byte = qs[group];
+        uint32_t m0 = 0;
+        uint32_t m1 = 0;
+        for (uint32_t sub = 0; sub < 4; ++sub) {
+            const uint8_t code = (byte >> (sub * 2)) & 0x3;
+            m0 |= (code & 0x1u) << sub;
+            m1 |= ((code >> 1) & 0x1u) << sub;
+        }
+        total += t[m0] + 2.0 * t[m1] - t[15];
+    }
+    return total;
+}

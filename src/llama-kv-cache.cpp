@@ -6210,11 +6210,45 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
     result.n_queries = ubatch.n_tokens;
     result.query_offsets.reserve(size_t(result.n_queries) + 1);
     result.query_offsets.push_back(0);
-
+    // Per-reader-view shared scan (2026-09-21 compute-organization round).
+    // The old loop rebuilt the full n_kv key table and re-sorted it for every
+    // query row (O(Q * n_kv) scans + sorts, ~n_kv * 40B per-row temporaries).
+    // Rows sharing one reader state (one pen's decode rows, MTP verify
+    // rows) share the same visibility world: scan + sort once per DISTINCT
+    // reader state, then per query apply only the two per-query gates
+    // (causal storage bound, query-run current-row match) and the phase
+    // grouping. Output is byte-identical to per-query
+    // llama_rerot_build_query_layout by construction: same visible set,
+    // same ordering keys, same effective-position arithmetic.
+    struct scan_key {
+        const llama_rerot_reader_state * view = nullptr;
+        std::vector<uint32_t> rows; // ubatch rows, in order
+    };
+    std::vector<scan_key> groups;
     for (uint32_t query = 0; query < ubatch.n_tokens; ++query) {
         const llama_seq_id seq_id = ubatch.seq_id[query][0];
         const auto & reader = rerot_reader_views.at(seq_id);
+        scan_key * group = nullptr;
+        for (auto & cand : groups) {
+            // Reader states are stable for the duration of one ubatch
+            // (mutations bump epochs and force a rebuild); pointer identity
+            // is the exact equality of the visibility world.
+            if (cand.view == &reader) {
+                group = &cand;
+                break;
+            }
+        }
+        if (!group) {
+            groups.push_back(scan_key{ &reader, {} });
+            group = &groups.back();
+        }
+        group->rows.push_back(query);
+    }
 
+    for (const auto & group : groups) {
+        const auto & reader = *group.view;
+
+        // One scan + one sort per distinct reader state.
         std::vector<llama_rerot_key_record> keys;
         keys.reserve(n_kv);
         for (uint32_t key = 0; key < n_kv; ++key) {
@@ -6224,24 +6258,30 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
             keys.push_back({
                 key,
                 cells.pos_get(key),
-                cells.seq_has(key, seq_id),
+                false, // ownership is per query row; filled per row below
                 cells.rerot_get(key),
             });
         }
 
-        auto query_layout = llama_rerot_build_query_layout(reader, ubatch.pos[query], keys);
-        const uint32_t group_base = static_cast<uint32_t>(result.groups.size());
-        for (auto group : query_layout.groups) {
-            group.query_index = query;
-            result.groups.push_back(group);
-        }
-        for (auto entry : query_layout.entries) {
-            entry.group_index += group_base;
-            result.entries.push_back(entry);
-        }
-        result.query_offsets.push_back(static_cast<uint32_t>(result.entries.size()));
-    }
+        for (const uint32_t query : group.rows) {
+            const llama_seq_id seq_id = ubatch.seq_id[query][0];
+            for (auto & key : keys) {
+                key.owned_by_reader = cells.seq_has(key.key_index, seq_id);
+            }
 
+            auto query_layout = llama_rerot_build_query_layout(reader, ubatch.pos[query], keys);
+            const uint32_t group_base = static_cast<uint32_t>(result.groups.size());
+            for (auto g : query_layout.groups) {
+                g.query_index = query;
+                result.groups.push_back(g);
+            }
+            for (auto entry : query_layout.entries) {
+                entry.group_index += group_base;
+                result.entries.push_back(entry);
+            }
+            result.query_offsets.push_back(static_cast<uint32_t>(result.entries.size()));
+        }
+    }
     std::string error;
     if (!result.validate(n_kv, &error)) {
         throw std::runtime_error("invalid RERoT attention layout: " + error);
