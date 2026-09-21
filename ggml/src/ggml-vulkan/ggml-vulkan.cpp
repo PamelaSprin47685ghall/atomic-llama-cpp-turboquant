@@ -1129,6 +1129,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_gdn_segment_prep;
     vk_pipeline pipeline_gdn_segment_delta;
     vk_pipeline pipeline_gdn_segment_norm;
+    vk_pipeline pipeline_gdn_multistep_prep;
+    vk_pipeline pipeline_gdn_multistep_delta;
+    vk_pipeline pipeline_gdn_multistep_norm;
     vk_pipeline pipeline_gdn_cached_prep;
     vk_pipeline pipeline_gdn_cached_delta;
     vk_pipeline pipeline_gdn_cached_delta_norm;
@@ -1911,6 +1914,40 @@ struct vk_gdn_segment_delta_push_constants {
     // Zero when absent; bit 31 set when a map is present. Stays well inside
     // the 128-byte push-constant limit.
     uint32_t headmap;
+};
+
+struct vk_gdn_multistep_prep_push_constants {
+    uint32_t key_heads;
+    uint32_t value_heads;
+    float    scale;
+    uint32_t headmap;
+    uint32_t active_tokens;
+    uint32_t capacity_steps;
+    uint32_t n_snapshots;
+    float    q_epsilon;
+    float    k_epsilon;
+};
+
+struct vk_gdn_multistep_delta_push_constants {
+    uint32_t value_heads;
+    uint32_t key_heads;
+    float    scale;
+    uint32_t headmap;
+    uint32_t active_tokens;
+    uint32_t capacity_steps;
+    uint32_t n_snapshots;
+};
+
+struct vk_gdn_multistep_norm_push_constants {
+    uint32_t key_heads;
+    uint32_t value_heads;
+    float    scale;
+    uint32_t headmap;
+    uint32_t active_tokens;
+    uint32_t capacity_steps;
+    uint32_t n_snapshots;
+    float    q_epsilon;
+    float    k_epsilon;
 };
 
 struct vk_gdn_segment_norm_push_constants {
@@ -6735,6 +6772,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             ggml_vk_create_pipeline(device, device->pipeline_gdn_segment_norm, "gdn_segment_norm",
                                     qwen4_gdn_segment_norm_len, qwen4_gdn_segment_norm_data, "main", 4,
                                     sizeof(vk_gdn_segment_norm_push_constants), { 1, 1, 1 }, {}, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_gdn_multistep_prep, "gdn_multistep_prep",
+                                    qwen4_gdn_multistep_prep_len, qwen4_gdn_multistep_prep_data, "main", 11,
+                                    sizeof(vk_gdn_multistep_prep_push_constants), { 1, 1, 1 }, {}, 1);
+            ggml_vk_create_pipeline(device, device->pipeline_gdn_multistep_delta, "gdn_multistep_delta",
+                                    qwen4_gdn_multistep_delta_len, qwen4_gdn_multistep_delta_data, "main", 9,
+                                    sizeof(vk_gdn_multistep_delta_push_constants), { 1, 1, 1 }, { device->subgroup_size },
+                                    1, true, true, device->subgroup_size);
+            ggml_vk_create_pipeline(device, device->pipeline_gdn_multistep_norm, "gdn_multistep_norm",
+                                    qwen4_gdn_multistep_norm_len, qwen4_gdn_multistep_norm_data, "main", 4,
+                                    sizeof(vk_gdn_multistep_norm_push_constants), { 1, 1, 1 }, {}, 1);
             ggml_vk_create_pipeline(device, device->pipeline_gdn_cached_prep, "gdn_cached_prep",
                                     qwen4_gdn_cached_prep_len, qwen4_gdn_cached_prep_data, "main", 12,
                                     sizeof(vk_gdn_segment_prep_push_constants), { 1, 1, 1 }, {}, 1);
@@ -16851,64 +16898,115 @@ static void ggml_vk_gdn_segment(ggml_backend_vk_context * ctx, vk_context & subc
         }
     }
     const uint32_t headmap_pc = ggml_tp5_gdn_headmap_pack(&gdn_headmap);
-    const vk_gdn_segment_prep_push_constants prep_pc{ key_heads, value_heads, ggml_get_op_params_f32(node(3), 0),
-                                                      ggml_get_op_params_f32(node(5), 0) };
-    auto &                                   prep =
-        ctx->fused_gdn_cached_segment ? ctx->device->pipeline_gdn_cached_prep : ctx->device->pipeline_gdn_segment_prep;
-    ggml_pipeline_request_descriptor_sets(ctx, prep, 1);
-    if (ctx->fused_gdn_cached_segment) {
+
+    // Check if the GDN segment is in capacity multi-step mode
+    const int32_t gdn_k            = ggml_get_op_params_i32(node(15), 0);
+    const int32_t gdn_active_param = ggml_get_op_params_i32(node(15), 2);
+    const int64_t node_n_tokens    = node(15)->src[2]->ne[2];
+    const bool    is_multistep_cap = gdn_active_param > 0 && node_n_tokens > 1;
+
+    if (is_multistep_cap && ctx->device->pipeline_gdn_multistep_prep) {
+        // Multi-step capacity dispatch pathway
+        const vk_gdn_multistep_prep_push_constants m_prep_pc{
+            key_heads, value_heads, 1.0f / sqrtf(128.0f), headmap_pc,
+            uint32_t(gdn_active_param), uint32_t(node_n_tokens), uint32_t(gdn_k > 0 ? gdn_k : 1),
+            ggml_get_op_params_f32(node(3), 0), ggml_get_op_params_f32(node(5), 0)
+        };
+        auto & m_prep = ctx->device->pipeline_gdn_multistep_prep;
+        ggml_pipeline_request_descriptor_sets(ctx, m_prep, 1);
         ggml_vk_dispatch_pipeline(
-            ctx, subctx, prep,
-            { binding(cache_node(4)), binding(node(0)->src[1]), binding(cache_node(2)), binding(node(8)->src[1]),
-              binding(node(10)->src[1]), binding(cache_node(3)), binding(node(1)), binding(node(10)), binding(node(13)),
-              binding(cache_node(0)), binding(cache_node(7)->src[1]), binding(cache_node(17)) },
-            prep_pc, { 2 * key_heads + value_heads, 1, 1 });
-    } else {
-        ggml_vk_dispatch_pipeline(
-            ctx, subctx, prep,
+            ctx, subctx, m_prep,
             { binding(node(0)->src[0]), binding(node(0)->src[1]), binding(node(7)->src[0]), binding(node(8)->src[1]),
               binding(node(10)->src[1]), binding(node(12)->src[0]), binding(node(3)), binding(node(5)),
               binding(node(6)), binding(node(10)), binding(node(13)) },
-            prep_pc, { 2 * key_heads + value_heads, 1, 1 });
-    }
-    ggml_vk_segment_barrier(ctx, subctx);
+            m_prep_pc, { 2 * key_heads + value_heads, 1, 1 });
+        ggml_vk_segment_barrier(ctx, subctx);
 
-    const vk_gdn_segment_delta_push_constants delta_pc{ value_heads, key_heads, 1.0f / sqrtf(128.0f), headmap_pc };
-    if (ctx->fused_gdn_cached_segment && ctx->device->pipeline_gdn_cached_delta_norm) {
-        auto &                                 delta_norm = ctx->device->pipeline_gdn_cached_delta_norm;
-        const vk_gdn_delta_norm_push_constants pc{ delta_pc, ggml_get_op_params_f32(node(20), 0) };
-        ggml_pipeline_request_descriptor_sets(ctx, delta_norm, 1);
+        const vk_gdn_multistep_delta_push_constants m_delta_pc{
+            value_heads, key_heads, 1.0f / sqrtf(128.0f), headmap_pc,
+            uint32_t(gdn_active_param), uint32_t(node_n_tokens), uint32_t(gdn_k > 0 ? gdn_k : 1)
+        };
+        auto & m_delta = ctx->device->pipeline_gdn_multistep_delta;
+        ggml_pipeline_request_descriptor_sets(ctx, m_delta, 1);
+        ggml_vk_dispatch_pipeline(ctx, subctx, m_delta,
+                                  { binding(node(3)), binding(node(5)), binding(node(6)), binding(node(10)),
+                                    binding(node(13)), binding(node(14)), binding(node(18)), binding(node(15)),
+                                    binding(node(18)) },
+                                  m_delta_pc, { value_heads, 1, 4 });
+        ggml_vk_segment_barrier(ctx, subctx);
+
+        const vk_gdn_multistep_norm_push_constants m_norm_pc{
+            key_heads, value_heads, 1.0f / sqrtf(128.0f), headmap_pc,
+            uint32_t(gdn_active_param), uint32_t(node_n_tokens), uint32_t(gdn_k > 0 ? gdn_k : 1),
+            0.0f, 0.0f
+        };
+        auto & m_norm = ctx->device->pipeline_gdn_multistep_norm;
+        ggml_pipeline_request_descriptor_sets(ctx, m_norm, 1);
         ggml_vk_dispatch_pipeline(
-            ctx, subctx, delta_norm,
-            { binding(node(2)), binding(node(4)), binding(node(6)), binding(node(10)), binding(node(13)),
-              binding(cache_node(18)), binding(node(18)), binding(node(24)), binding(cache_node(21)->src[1]),
-              binding(node(21)->src[1]), binding(node(22)->src[0]) },
-            pc, { value_heads, 1, 1 });
+            ctx, subctx, m_norm,
+            { binding(node(19)), binding(node(21)->src[1]), binding(node(22)->src[0]), binding(node(24)) }, m_norm_pc,
+            { value_heads, 1, 1 });
     } else {
-        auto & delta = ctx->fused_gdn_cached_segment ? ctx->device->pipeline_gdn_cached_delta :
-                                                       ctx->device->pipeline_gdn_segment_delta;
-        ggml_pipeline_request_descriptor_sets(ctx, delta, 1);
+        // Standard single-step autoregressive pathway (100% status quo preserved)
+        const vk_gdn_segment_prep_push_constants prep_pc{ key_heads, value_heads, ggml_get_op_params_f32(node(3), 0),
+                                                          ggml_get_op_params_f32(node(5), 0) };
+        auto & prep =
+            ctx->fused_gdn_cached_segment ? ctx->device->pipeline_gdn_cached_prep : ctx->device->pipeline_gdn_segment_prep;
+        ggml_pipeline_request_descriptor_sets(ctx, prep, 1);
         if (ctx->fused_gdn_cached_segment) {
             ggml_vk_dispatch_pipeline(
-                ctx, subctx, delta,
-                { binding(node(2)), binding(node(4)), binding(node(6)), binding(node(10)), binding(node(13)),
-                  binding(cache_node(18)), binding(node(18)), binding(node(15)), binding(cache_node(21)->src[1]) },
-                delta_pc, { value_heads, 1, 4 });
+                ctx, subctx, prep,
+                { binding(cache_node(4)), binding(node(0)->src[1]), binding(cache_node(2)), binding(node(8)->src[1]),
+                  binding(node(10)->src[1]), binding(cache_node(3)), binding(node(1)), binding(node(10)), binding(node(13)),
+                  binding(cache_node(0)), binding(cache_node(7)->src[1]), binding(cache_node(17)) },
+                prep_pc, { 2 * key_heads + value_heads, 1, 1 });
         } else {
-            ggml_vk_dispatch_pipeline(ctx, subctx, delta,
-                                      { binding(node(3)), binding(node(5)), binding(node(6)), binding(node(10)),
-                                        binding(node(13)), binding(node(14)), binding(node(18)), binding(node(15)) },
-                                      delta_pc, { value_heads, 1, 4 });
+            ggml_vk_dispatch_pipeline(
+                ctx, subctx, prep,
+                { binding(node(0)->src[0]), binding(node(0)->src[1]), binding(node(7)->src[0]), binding(node(8)->src[1]),
+                  binding(node(10)->src[1]), binding(node(12)->src[0]), binding(node(3)), binding(node(5)),
+                  binding(node(6)), binding(node(10)), binding(node(13)) },
+                prep_pc, { 2 * key_heads + value_heads, 1, 1 });
         }
         ggml_vk_segment_barrier(ctx, subctx);
 
-        const vk_gdn_segment_norm_push_constants norm_pc{ ggml_get_op_params_f32(node(20), 0) };
-        auto &                                   norm = ctx->device->pipeline_gdn_segment_norm;
-        ggml_pipeline_request_descriptor_sets(ctx, norm, 1);
-        ggml_vk_dispatch_pipeline(
-            ctx, subctx, norm,
-            { binding(node(19)), binding(node(21)->src[1]), binding(node(22)->src[0]), binding(node(24)) }, norm_pc,
-            { value_heads, 1, 1 });
+        const vk_gdn_segment_delta_push_constants delta_pc{ value_heads, key_heads, 1.0f / sqrtf(128.0f), headmap_pc };
+        if (ctx->fused_gdn_cached_segment && ctx->device->pipeline_gdn_cached_delta_norm) {
+            auto &                                 delta_norm = ctx->device->pipeline_gdn_cached_delta_norm;
+            const vk_gdn_delta_norm_push_constants pc{ delta_pc, ggml_get_op_params_f32(node(20), 0) };
+            ggml_pipeline_request_descriptor_sets(ctx, delta_norm, 1);
+            ggml_vk_dispatch_pipeline(
+                ctx, subctx, delta_norm,
+                { binding(node(2)), binding(node(4)), binding(node(6)), binding(node(10)), binding(node(13)),
+                  binding(cache_node(18)), binding(node(18)), binding(node(24)), binding(cache_node(21)->src[1]),
+                  binding(node(21)->src[1]), binding(node(22)->src[0]) },
+                pc, { value_heads, 1, 1 });
+        } else {
+            auto & delta = ctx->fused_gdn_cached_segment ? ctx->device->pipeline_gdn_cached_delta :
+                                                           ctx->device->pipeline_gdn_segment_delta;
+            ggml_pipeline_request_descriptor_sets(ctx, delta, 1);
+            if (ctx->fused_gdn_cached_segment) {
+                ggml_vk_dispatch_pipeline(
+                    ctx, subctx, delta,
+                    { binding(node(2)), binding(node(4)), binding(node(6)), binding(node(10)), binding(node(13)),
+                      binding(cache_node(18)), binding(node(18)), binding(node(15)), binding(cache_node(21)->src[1]) },
+                    delta_pc, { value_heads, 1, 4 });
+            } else {
+                ggml_vk_dispatch_pipeline(ctx, subctx, delta,
+                                          { binding(node(3)), binding(node(5)), binding(node(6)), binding(node(10)),
+                                            binding(node(13)), binding(node(14)), binding(node(18)), binding(node(15)) },
+                                          delta_pc, { value_heads, 1, 4 });
+            }
+            ggml_vk_segment_barrier(ctx, subctx);
+
+            const vk_gdn_segment_norm_push_constants norm_pc{ ggml_get_op_params_f32(node(20), 0) };
+            auto &                                   norm = ctx->device->pipeline_gdn_segment_norm;
+            ggml_pipeline_request_descriptor_sets(ctx, norm, 1);
+            ggml_vk_dispatch_pipeline(
+                ctx, subctx, norm,
+                { binding(node(19)), binding(node(21)->src[1]), binding(node(22)->src[0]), binding(node(24)) }, norm_pc,
+                { value_heads, 1, 1 });
+        }
     }
     ggml_vk_segment_barrier(ctx, subctx, ctx->wire_producer == node(26));
     project(node(26));
@@ -23439,45 +23537,89 @@ static bool ggml_vk_can_fuse_gdn_segment(ggml_backend_vk_context * ctx, const gg
         return false;
     }
     const int64_t channels = 128 * (2 * hk + hv), head_values = 128 * hv, state_values = 128 * head_values;
-    if (!shape(node(0), channels, 1) || !shape(node(0)->src[0], 4, channels) || !shape(node(0)->src[1], 4, channels) ||
-        !shape(node(1), channels, 1) || ggml_get_unary_op(node(1)) != GGML_UNARY_OP_SILU || !shape(node(2), 128, hk) ||
-        !shape(node(3), 128, hk) || !shape(node(4), 128, hk) || !shape(node(5), 128, hk) || !shape(node(6), 128, hv) ||
-        node(2)->view_src != node(1) || node(2)->view_offs != 0 || node(4)->view_src != node(1) ||
-        node(4)->view_offs != 128 * hk * sizeof(float) || node(6)->view_src != node(1) ||
-        node(6)->view_offs != 256 * hk * sizeof(float))
-        return false;
 
-    const std::array<const ggml_tensor *, 6> external_inputs{ node(7)->src[0], node(12)->src[0], node(22)->src[0],
-                                                              node(8)->src[1], node(10)->src[1], node(21)->src[1] };
-    for (int n = 0; n < 27; ++n) {
-        for (const ggml_tensor * external : external_inputs) {
-            if (node(n) == external)
-                return false;
+    const int32_t active_param = ggml_get_op_params_i32(node(15), 2);
+    const bool is_capacity = active_param > 0;
+    const int64_t n_time = node(15)->src[2]->ne[2];
+
+    if (is_capacity) {
+        // Multi-step capacity mode pattern relaxation
+        if (n_time <= 1 || n_time > 8 || active_param > n_time ||
+            !ctx->device->pipeline_gdn_multistep_prep ||
+            !ctx->device->pipeline_gdn_multistep_delta ||
+            !ctx->device->pipeline_gdn_multistep_norm) {
+            return false;
         }
+        // Basic connectivity and tensor validity
+        if (!valid(node(0), GGML_TYPE_F32) || node(0)->ne[0] != channels || node(0)->ne[1] != n_time ||
+            !valid(node(1), GGML_TYPE_F32) || node(1)->ne[0] != channels || node(1)->ne[1] != n_time ||
+            ggml_get_unary_op(node(1)) != GGML_UNARY_OP_SILU) {
+            return false;
+        }
+        if (!valid(node(2), GGML_TYPE_F32) || node(2)->ne[0] != 128 || node(2)->ne[1] != hk || node(2)->ne[2] != n_time ||
+            !valid(node(3), GGML_TYPE_F32) || node(3)->ne[0] != 128 || node(3)->ne[1] != hk || node(3)->ne[2] != n_time ||
+            !valid(node(4), GGML_TYPE_F32) || node(4)->ne[0] != 128 || node(4)->ne[1] != hk || node(4)->ne[2] != n_time ||
+            !valid(node(5), GGML_TYPE_F32) || node(5)->ne[0] != 128 || node(5)->ne[1] != hk || node(5)->ne[2] != n_time ||
+            !valid(node(6), GGML_TYPE_F32) || node(6)->ne[0] != 128 || node(6)->ne[1] != hv || node(6)->ne[2] != n_time) {
+            return false;
+        }
+        if (!valid(node(14), GGML_TYPE_F32) || node(14)->ne[0] != 128 || node(14)->ne[1] != 128 || node(14)->ne[2] != hv ||
+            node(14)->ne[3] != 1) {
+            return false;
+        }
+        if (!valid(node(15), GGML_TYPE_F32) || node(15)->ne[0] != head_values || node(15)->ne[1] != n_time + 128 ||
+            ggml_get_op_params_i32(node(15), 0) != 1 || ggml_get_op_params_i32(node(15), 1) != 0 ||
+            ggml_get_op_params_i32(node(15), 2) != active_param) {
+            return false;
+        }
+        if (!valid(node(16), GGML_TYPE_F32) || ggml_nelements(node(16)) != state_values ||
+            node(16)->view_src != node(15) || node(16)->view_offs != head_values * sizeof(float) ||
+            !valid(node(17), GGML_TYPE_F32) || ggml_nelements(node(17)) != state_values ||
+            !valid(node(18), GGML_TYPE_F32) || ggml_nelements(node(18)) != state_values) {
+            return false;
+        }
+    } else {
+        // Standard single-step autoregressive pattern (100% byte-for-byte status quo)
+        if (!shape(node(0), channels, 1) || !shape(node(0)->src[0], 4, channels) || !shape(node(0)->src[1], 4, channels) ||
+            !shape(node(1), channels, 1) || ggml_get_unary_op(node(1)) != GGML_UNARY_OP_SILU || !shape(node(2), 128, hk) ||
+            !shape(node(3), 128, hk) || !shape(node(4), 128, hk) || !shape(node(5), 128, hk) || !shape(node(6), 128, hv) ||
+            node(2)->view_src != node(1) || node(2)->view_offs != 0 || node(4)->view_src != node(1) ||
+            node(4)->view_offs != 128 * hk * sizeof(float) || node(6)->view_src != node(1) ||
+            node(6)->view_offs != 256 * hk * sizeof(float))
+            return false;
+
+        const std::array<const ggml_tensor *, 6> external_inputs{ node(7)->src[0], node(12)->src[0], node(22)->src[0],
+                                                                  node(8)->src[1], node(10)->src[1], node(21)->src[1] };
+        for (int n = 0; n < 27; ++n) {
+            for (const ggml_tensor * external : external_inputs) {
+                if (node(n) == external)
+                    return false;
+            }
+        }
+        const auto projection = [&](const ggml_tensor * t, ggml_type type, const ggml_tensor * in, int64_t rows) {
+            const ggml_tensor * w = t->src[0];
+            return valid(w, type) && w->ne[2] == 1 && w->ne[3] == 1 && w->ne[1] == rows &&
+                   w->ne[0] % ggml_blck_size(type) == 0 && t->src[1] == in && shape(in, w->ne[0], 1) && shape(t, rows, 1);
+        };
+        if (!shape(node(7)->src[0], hv, 1) || !shape(node(7), hv, 1) || !shape(node(8), hv, 1) ||
+            !shape(node(8)->src[1], hv, 1) || !shape(node(9), hv, 1) ||
+            ggml_get_unary_op(node(9)) != GGML_UNARY_OP_SOFTPLUS || !shape(node(10), hv, 1) ||
+            !shape(node(10)->src[1], hv, 1) || !shape(node(11), 1, hv) || !shape(node(12)->src[0], hv, 1) ||
+            !shape(node(12), 1, hv) || !shape(node(13), 1, hv) || ggml_get_unary_op(node(13)) != GGML_UNARY_OP_SIGMOID ||
+            !valid(node(14), GGML_TYPE_F32) || node(14)->ne[0] != 128 || node(14)->ne[1] != 128 || node(14)->ne[2] != hv ||
+            node(14)->ne[3] != 1 || !shape(node(15), head_values, 129) || ggml_get_op_params_i32(node(15), 0) != 1 ||
+            ggml_get_op_params_i32(node(15), 1) != 0 || ggml_get_op_params_i32(node(15), 2) != 0 ||
+            !valid(node(16), GGML_TYPE_F32) || ggml_nelements(node(16)) != state_values || node(16)->view_src != node(15) ||
+            node(16)->view_offs != head_values * sizeof(float) || !valid(node(17), GGML_TYPE_F32) ||
+            ggml_nelements(node(17)) != state_values || !valid(node(18), GGML_TYPE_F32) ||
+            ggml_nelements(node(18)) != state_values || !shape(node(19), 128, hv) || node(19)->view_src != node(15) ||
+            node(19)->view_offs != 0 || !shape(node(20), 128, hv) || !shape(node(21), 128, hv) ||
+            !shape(node(21)->src[1], 128, 1) || !shape(node(22)->src[0], head_values, 1) || !shape(node(22), 128, hv) ||
+            !shape(node(23), 128, hv) || ggml_get_unary_op(node(23)) != GGML_UNARY_OP_SIGMOID ||
+            !shape(node(24), 128, hv) || !shape(node(25), head_values, 1) ||
+            !projection(node(26), GGML_TYPE_Q5_K, node(25), node(26)->ne[0]))
+            return false;
     }
-    const auto projection = [&](const ggml_tensor * t, ggml_type type, const ggml_tensor * in, int64_t rows) {
-        const ggml_tensor * w = t->src[0];
-        return valid(w, type) && w->ne[2] == 1 && w->ne[3] == 1 && w->ne[1] == rows &&
-               w->ne[0] % ggml_blck_size(type) == 0 && t->src[1] == in && shape(in, w->ne[0], 1) && shape(t, rows, 1);
-    };
-    if (!shape(node(7)->src[0], hv, 1) || !shape(node(7), hv, 1) || !shape(node(8), hv, 1) ||
-        !shape(node(8)->src[1], hv, 1) || !shape(node(9), hv, 1) ||
-        ggml_get_unary_op(node(9)) != GGML_UNARY_OP_SOFTPLUS || !shape(node(10), hv, 1) ||
-        !shape(node(10)->src[1], hv, 1) || !shape(node(11), 1, hv) || !shape(node(12)->src[0], hv, 1) ||
-        !shape(node(12), 1, hv) || !shape(node(13), 1, hv) || ggml_get_unary_op(node(13)) != GGML_UNARY_OP_SIGMOID ||
-        !valid(node(14), GGML_TYPE_F32) || node(14)->ne[0] != 128 || node(14)->ne[1] != 128 || node(14)->ne[2] != hv ||
-        node(14)->ne[3] != 1 || !shape(node(15), head_values, 129) || ggml_get_op_params_i32(node(15), 0) != 1 ||
-        ggml_get_op_params_i32(node(15), 1) != 0 || ggml_get_op_params_i32(node(15), 2) != 0 ||
-        !valid(node(16), GGML_TYPE_F32) || ggml_nelements(node(16)) != state_values || node(16)->view_src != node(15) ||
-        node(16)->view_offs != head_values * sizeof(float) || !valid(node(17), GGML_TYPE_F32) ||
-        ggml_nelements(node(17)) != state_values || !valid(node(18), GGML_TYPE_F32) ||
-        ggml_nelements(node(18)) != state_values || !shape(node(19), 128, hv) || node(19)->view_src != node(15) ||
-        node(19)->view_offs != 0 || !shape(node(20), 128, hv) || !shape(node(21), 128, hv) ||
-        !shape(node(21)->src[1], 128, 1) || !shape(node(22)->src[0], head_values, 1) || !shape(node(22), 128, hv) ||
-        !shape(node(23), 128, hv) || ggml_get_unary_op(node(23)) != GGML_UNARY_OP_SIGMOID ||
-        !shape(node(24), 128, hv) || !shape(node(25), head_values, 1) ||
-        !projection(node(26), GGML_TYPE_Q5_K, node(25), node(26)->ne[0]))
-        return false;
     for (const int index : { 3, 5, 20 }) {
         const float epsilon = ggml_get_op_params_f32(node(index), 0);
         if (!std::isfinite(epsilon) || epsilon <= 0.0f)
