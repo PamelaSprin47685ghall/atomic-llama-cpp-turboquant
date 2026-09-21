@@ -884,13 +884,18 @@ struct tp5_comm {
             }
         }
         }
+        // Cover actual submissions, including a partial rank submit whose
+        // epoch never reached allreduce_calls. Never free emitted CB owners
+        // on the strength of a logical epoch alone.
+        if ((linear_program || !retired_linear_programs.empty()) && !tp5_drain_submitted(*this)) {
+            fail("linear definition drain failed before resource release");
+            return;
+        }
+        linear_program.reset();
+        retired_linear_programs.clear();
         for (auto & plan : cached_plans) {
             destroy_plan(plan);
         }
-        // No submitted command refers to these programs after the drain
-        // above. Their graph owners pin immutable descriptor pools separately.
-        linear_program.reset();
-        retired_linear_programs.clear();
         cached_plans.clear();
     }
 
@@ -2255,19 +2260,25 @@ static bool tp5_late_consumer_ref(tp5_comm &       c,
     vk_tp5_hc_sum hc;
     if (!ggml_vk_tp5_hc_consumer(c.backends[rank], first_cb, &hc) ||
         hc.width != n_elems || hc.streams != 4 || hc.width == 0 || (hc.width % 256u) != 0u ||
-        hc.width > 4096 || hc.late_rank == 0 || hc.late_rank % 4 != 0 ||
+        hc.width > 4096 || hc.late_rank == 0 || hc.late_rank % 4 != 0 || hc.quantized.buffer != nullptr ||
         size_t(hc.streams) * hc.late_rank > TP5_LATE_MAX_FLOATS ||
         hc.block.buffer != ref.buf || hc.block.offset != ref.offset || hc.block.size != ref.size)
         return false;
     auto & r = c.ranks[rank];
+    if (r.caps.max_storage_buffer_descriptors < 9) return false;
     const auto valid = [&](const vk_tp5_hc_binding & binding) {
         return binding.buffer && binding.owner && binding.size &&
                binding.size <= r.caps.max_storage_buffer_range &&
-               binding.offset % std::max(uint64_t(4), r.caps.min_storage_buffer_offset_alignment) == 0;
+               binding.offset % std::max(uint64_t(16), r.caps.min_storage_buffer_offset_alignment) == 0;
     };
-    for (const auto & binding : hc.bindings)
-        if (!valid(binding))
+    for (const auto & binding : hc.bindings) {
+        if (!valid(binding) ||
+            (binding.buffer == ref.buf &&
+             (binding.offset <= ref.offset ? ref.offset - binding.offset < binding.size :
+                                             binding.offset - ref.offset < ref.size)))
             return false;
+    }
+    if (ref.offset % 16 != 0) return false;
     if (!valid(hc.down_weight) || !valid(hc.lo))
         return false;
     if (hc.lo.size < uint64_t(hc.late_rank) * sizeof(float))
@@ -5660,7 +5671,11 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
         }
         bool late_all = tp5_latebind_hc_enabled() && c.sync_mode == tp5_sync_mode::RELAY;
         for (size_t j = 0; j < c.n_ranks; ++j) {
-            late_all = late_all && key.late[j].late_rank != 0;
+            late_all = late_all && key.late[j].late_rank != 0 &&
+                       key.late[j].late_rank == key.late[0].late_rank &&
+                       key.late[j].streams == key.late[0].streams &&
+                       key.late[j].width == key.late[0].width &&
+                       key.late[j].epsilon_bits == key.late[0].epsilon_bits;
         }
         if (late_all) {
             // The exact LateBind finalizer subsumes the old HC prefix. Keep a
