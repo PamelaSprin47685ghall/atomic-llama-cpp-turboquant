@@ -2145,11 +2145,17 @@ llama_rerot_query_layout llama_rerot_build_query_layout(
     base.reserve(keys.size());
     tagged.reserve(keys.size());
 
-    std::unordered_set<uint32_t> physical_seen;
-    physical_seen.reserve(keys.size());
+    // Duplicate-physical-key check as a byte bitmap (same swap the shared and
+    // multi-reader builders made in earlier rounds: the unordered_set cost
+    // dominates the scan at production K). Semantics unchanged — first
+    // duplicate in scan order throws, same message.
+    std::vector<uint8_t> physical_seen;
 
     for (const auto & key : keys) {
-        if (!physical_seen.insert(key.key_index).second) {
+        if (key.key_index >= physical_seen.size()) {
+            physical_seen.resize(size_t(key.key_index) + 1, 0);
+        }
+        if (physical_seen[key.key_index]++) {
             throw std::invalid_argument("RERoT key records contain a duplicate physical key");
         }
         if (key.storage_pos < 0) {
