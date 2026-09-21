@@ -106,6 +106,51 @@
 
 ---
 
+## 下班交接｜2026-09-22（第六轮，multi-reader 布局生产形态快路径）
+
+**分支：** `master`（本轮 commit 见 git log）
+**主题：** 第五轮 `llama_rerot_build_query_layouts_multi_reader` 的三条生产形态快路径。全程 CPU 验证（未启动模型/GPU）。单文件改动（`src/llama-rerot.cpp`，+179/−44）。
+
+### 一、相位剖面驱动（先测后改）
+
+gprof 太粗、无 perf；用函数体拷贝＋相位计时的 throwaway 剖面（`struct/filter/numeric` 三段）：
+
+| 形态（K=65536 合成键） | struct | filter | numeric | 合计 |
+|---|---|---|---|---|
+| Q=1 R=6（decode，第五轮） | 3.1ms | 1.7ms | 2.8ms | 7.9ms |
+| Q=1 R=6（本轮后） | 1.0ms | 0.33ms | 1.8ms | **3.2ms** |
+| Q=6 R=6（MTP verify） | 1.1ms | 1.3ms | ~15ms | ~16ms |
+
+numeric 在 Q=1 时即 39 万 entry 发射（输出本体），接近地板；Q=6 时数值通道主导（每 query 重扫），维持。
+
+### 二、三条快路径（全部“探测为真才走，为假回通用”）
+
+1. **tagged 序预检跳排序**：append-only run 行到达序＝tagged (storage, frontier, idx) 序（tie 由 key_index 升序到达保证）。O(n) 非降探测，失败才 std::sort。
+2. **连续 storage 恒等偏差序**：桶内 storage 严格 +1 连续 ⟹ d=s₀ 常数 ⟹ 偏差序恒等，d2t/t2d 退化为顺序填充。空洞/重复（reclaim、MTP verify 共位）回通用排序＋置换。
+3. **uniform 桶＋全拥有恒等列表**：(visibility, frontier) 桶内全一致 ⟹ frontier 门整桶一次判定；own 桶 ownership 全 1（生产形态）⟹ dp/prefix 恒等，不物化。`seg_view.identity` 旗标＋`dp_size/dp_at/prefix_at` 访问器。foreign 桶天然恒等（不过滤）。
+
+### 三、实测与验证
+
+- **decode 形态（Q=1）**：R=6：7882→**3900 us（2.0×）**；R=1：6200→1946（**3.2×**）；K=262144 R=6：28864 us。Q=6 R=6 维持 ~16.4ms（数值通道主导，未动）。
+- 对 legacy（每组拷贝＋单 reader builder）Q=1 R=6：36961→3900 = **9.5×**；对 per-query oracle：21278→3900 = **5.5×**。
+- 乱序最坏形态不退化（快路径正确回退）。
+- `test-rerot-view` 0 failure（200 轮三路对拍：乱序世界走通用分支、恒等世界走快路径，输出逐字节一致）；`test-xkv-runtime` 全过（部分拥有、混合 frontier 桶覆盖非 uniform 回退）；rerot/xkv/flashprefill 全家 ctest **45/45**。
+
+### 四、纠错与教训
+
+1. **本轮唯一 bug（8054 断言失败）**：第二版编辑把 tagged 排序调用整个删掉、只留探测——本意是“探测为真跳过排序”，实际变成“永远不排序”（探测结果无人消费）。200 轮对拍立即抓住。教训：快路径必须写成 `if (!fast) { general }`，不能删除 general 分支；bisect 时发现“禁用快路径仍失败”即说明 general 路径被破坏。
+2. **flat merge 实验回退**：曾把归并改为“每 query 物化 (effective, key) 平面对再归并”——Q=6 时多出 37MB 中间流量，17885→25663 us 回退，`git checkout` 回退。教训：剖面说 numeric 慢不等于加拷贝层能救；发射本体不可省。
+3. 机器噪声：同配置多次运行波动 ±30–60%（legacy 41.7k↔66.9k）。结论取安静窗口的首次运行＋相对比较。
+
+### 五、下一步
+
+1. 真机收益：目标机 `rerot-semantic-smoke.py` 对比 decode host 时间（开发机数字是合成键）。
+2. Q=6（MTP verify 形态）数值通道 ~15ms 是下一个大头：每 query 重扫全部列表。可探索 per-query 增量（相邻 query 位置差小）或按 query 分组共享截断。
+3. GPU 化 Q3（多读者共享块）：host 侧供给已三次加速（第五轮共享 world＋本轮快路径），GPU 侧未动。
+4. 磁盘 99%（余 1.8G）：必要时清 ~/.cache/ccache(1.2G)、~/.cache/semble(918M)。
+
+---
+
 ## 下班交接｜2026-09-22（第五轮，Q3 共享 key world＋双 bug 修复）
 
 **分支：** `master`（本轮 commit 见 git log）
