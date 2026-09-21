@@ -106,6 +106,50 @@
 
 ---
 
+## 下班交接｜2026-09-22（第九轮，reader 无关段属性上收结构 pass：R 越大省越多）
+
+**分支：** `master`（本轮 commit 见 git log）
+**主题：** 第八轮交接列的结构期 rank/node 分桶探测。单文件 `src/llama-rerot.cpp`。全程 CPU。
+
+### 一、改动：uniform 探测与 fast_keys 列上收到 shared run
+
+第八轮后 builder 的 reader 侧仍有两处 **R×K 重复工作**：
+
+1. **uniform 探测**：每个 reader 对每个段重读全部行 meta 验证 (visibility, frontier) 一致——但 uniform 是 **run 桶属性**（同一桶的行对所有 reader 相同），与 reader 无关。
+2. **fast_keys 列**：`keys[rows[p]].key_index` 内容 reader 无关，第八轮却每 reader 重建一次。
+
+**改动**：`shared_run` 增加 `uniform/u_vis/u_frontier`＋`fast_keys`，结构 pass 的 run 循环一次算好；reader 侧 uniform 分支直接读共享旗标（连首行 `keys[rows[0]].meta` 随机读都省了）。输出字节不变（纯计算位置移动）。
+
+### 二、实测（-O2 独立编译 min-of-10，production shape）
+
+|形状|第八轮|第九轮|Δ|
+|---|---|---|---|
+|R=6 K=65536|2904 us|2434|−16%|
+|R=12 K=65536|4612|3680|−20%|
+|R=6 K=262144|19419|12461|−36%|
+|R=12 K=262144|34035|16967|−50%|
+|R=1 K=65536|1665|1658|0（预期：无共享可收）|
+
+管线级：Q=1 R=6 总 4884→4475（−8%）；**Q=6 R=6 K=262144 总 66118→55506（−16%）**，build 34777→23260（−33%）。收益随 R、K 增长——正是“多笔共享结构”研究线的方向性验证。
+
+### 三、评估后放弃（两件，均有实测依据）
+
+1. **run 桶查找换 hash map**：unordered_map 每 key 的 hash＋probe 开销超过 6–12 桶线性扫描（struct pass 1396→2600 us 反向实测）。教训：桶数两位数时别上 hash。
+2. **Q2 写入布局主动维持长 span**：`find_slot` 已是 cont=true 连续分配；碎片来自 SWA 回收/环回/MTP 重复，修它需要 per-run 分配策略（侵入 find_slot 环语义，风险大），且第六轮快路径已对空洞优雅降级。等有生产 span 消费者再动。
+
+### 四、验证
+
+`test-rerot-view`（200 轮三路对拍）0 failure；`test-rerot-math`/`ddvr` 0 failure；`test-xkv-runtime` 全过；rerot/xkv/flashprefill 全家 **45/45**；`git diff --check` 干净。
+
+### 五、下一步
+
+1. 真机收益：目标机 `rerot-semantic-smoke.py`（需模型＋server）。
+2. **GPU 化 Q3**（公共 KV 块服务多读者）：host 侧九轮加速完毕，GPU 侧未动。
+3. reader 侧剩余：owned_col 字节扫描（R×K）——需 bitset 消费 overload 接口（llama-rerot 与 llama-kv-cells 解耦约束），收益 ~R×K/8，候选。
+4. Q2 写入布局维持长 span：等生产 span 消费者（已评估，见上）。
+
+---
+
 ## 下班交接｜2026-09-22（第八轮，Q=6 MTP verify 数值通道快发射＋磁盘清理）
 
 **分支：** `master`（本轮 commit 见 git log）

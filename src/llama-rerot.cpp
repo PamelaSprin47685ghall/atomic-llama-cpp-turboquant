@@ -1445,6 +1445,17 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
         std::vector<uint32_t> t2d;       // tagged index -> d-position
         std::vector<int64_t> dev;        // d = storage - tagged idx, at d-positions
         bool contiguous = false;       // storage strictly +1 (dev constant)
+        // Uniform (visibility, frontier) over all rows — computed ONCE in
+        // the structural pass (ninth round). The per-reader seg construction
+        // previously re-probed every row's meta per reader (R x n reads);
+        // for uniform buckets the probe result is a run property.
+        bool uniform = false;
+        llama_rerot_visibility u_vis = llama_rerot_visibility::normal;
+        uint64_t u_frontier = 0;
+        // Contiguous-run fast-path key column (eighth round, moved to the
+        // shared run in the ninth): key ids in d-order. Reader-independent
+        // content (keys[rows[p]].key_index), previously rebuilt per reader.
+        std::vector<uint32_t> fast_keys;
     };
     std::vector<shared_run> runs;
     std::vector<uint32_t> untagged_sorted;
@@ -1566,6 +1577,34 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
                 }
             }
         }
+        // Shared per-run properties (ninth round): uniformity of
+        // (visibility, frontier) over the bucket's rows, and the
+        // contiguous-run fast key column — both reader-independent, both
+        // previously recomputed per reader.
+        for (auto & run : runs) {
+            const size_t n = run.rows.size();
+            const auto & m0 = keys[run.rows[0]].meta;
+            run.uniform = true;
+            for (size_t i = 1; i < n; ++i) {
+                const auto & m = keys[run.rows[i]].meta;
+                if (m.visibility != m0.visibility || m.frontier != m0.frontier) {
+                    run.uniform = false;
+                    break;
+                }
+            }
+            if (run.uniform) {
+                run.u_vis = m0.visibility;
+                run.u_frontier = m0.frontier;
+            }
+            if (run.contiguous) {
+                // Identity deviation order: fast_keys[p] = key id at
+                // d-position p == tagged index p.
+                run.fast_keys.resize(n);
+                for (size_t p = 0; p < n; ++p) {
+                    run.fast_keys[p] = keys[run.rows[p]].key_index;
+                }
+            }
+        }
         untagged_sorted = std::move(untagged);
         std::sort(untagged_sorted.begin(), untagged_sorted.end(), [&](uint32_t a, uint32_t b) {
             if (keys[a].storage_pos != keys[b].storage_pos) {
@@ -1612,7 +1651,6 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
             // (dev is constant), so the ==best recheck hoists out entirely.
             std::vector<uint32_t> dp;     // d-positions of the passing rows
             std::vector<uint32_t> pass_prefix; // tagged idx -> passing rows before it
-            std::vector<uint32_t> fast_keys;  // identity+contiguous: key ids in d-order
         };
         const auto dp_size = [](const seg_view & s) -> size_t {
             return s.identity ? s.run->rows.size() : s.dp.size();
@@ -1649,28 +1687,20 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
             // for the whole bucket and only the ownership column (a byte
             // array, sequential) is read per row. Mixed buckets keep the
             // general per-row path.
-            bool uniform = true;
-            {
-                const auto & m0 = keys[found.rows[0]].meta;
-                for (size_t i = 1; i < found.rows.size(); ++i) {
-                    const auto & m = keys[found.rows[i]].meta;
-                    if (m.visibility != m0.visibility || m.frontier != m0.frontier) {
-                        uniform = false;
-                        break;
-                    }
-                }
-                if (uniform) {
-                    const auto vis = m0.visibility;
+            bool uniform = found.uniform;
+            if (uniform) {
+                {
+                    const auto vis = found.u_vis;
                     bool gate = false;
                     bool need_own = false;
                     if (vis == llama_rerot_visibility::public_live) {
                         if (own) {
-                            gate = m0.frontier <= reader.frontier;
+                            gate = found.u_frontier <= reader.frontier;
                             need_own = true;
                         } else if (reader.frontier_mode == LLAMA_REROT_FRONTIER_STRONG) {
-                            gate = m0.frontier < reader.frontier;
+                            gate = found.u_frontier < reader.frontier;
                         } else {
-                            gate = reader.frontier > 0 && m0.frontier < reader.frontier - 1;
+                            gate = reader.frontier > 0 && found.u_frontier < reader.frontier - 1;
                         }
                     } else if (own && (vis == llama_rerot_visibility::private_control ||
                                        vis == llama_rerot_visibility::pending_record)) {
@@ -1777,23 +1807,6 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
             }
         }
 
-        // Contiguous-run fast-path key columns (eighth round). For a
-        // contiguous run with the identity passing set (uniform bucket —
-        // the production shape), the emission chain per entry is three
-        // dependent random reads (dp_at -> d2t -> rows -> keys). This
-        // precomputed column makes it ONE sequential read, built once per
-        // reader and shared by every query of the batch (the Q=6 MTP-verify
-        // shape re-enters the merge six times over the same lists).
-        for (auto & sv : segs) {
-            if (!sv.identity || !sv.run->contiguous) {
-                continue;
-            }
-            const size_t n = sv.run->rows.size();
-            sv.fast_keys.resize(n);
-            for (size_t p = 0; p < n; ++p) {
-                sv.fast_keys[p] = keys[sv.run->rows[p]].key_index;
-            }
-        }
 
         // Base arm: untagged rows owned by THIS reader, (storage, idx)
         // order, deviation-ordered (same identity as the single-reader
@@ -2000,7 +2013,7 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
                     size_t li = 1;
                     size_t si = 0;
                     for (const auto & sv : segs) {
-                        if (!sv.fast_keys.empty()) {
+                        if (!sv.run->fast_keys.empty()) {
                             // Contiguous identity segment: dev is constant, so
                             // the ==best recheck hoists out and the entry
                             // emission is one sequential read over fast_keys
@@ -2015,13 +2028,13 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
                                     // (identity permutation), so the cut is a
                                     // simple prefix bound.
                                     while (p < dp_size(sv) && p < seg_cut[si]) {
-                                        layout.entries.push_back({ sv.fast_keys[p], group_index });
+                                        layout.entries.push_back({ sv.run->fast_keys[p], group_index });
                                         ++p;
                                         emitted = true;
                                     }
                                 } else {
                                     while (p < dp_size(sv)) {
-                                        layout.entries.push_back({ sv.fast_keys[p], group_index });
+                                        layout.entries.push_back({ sv.run->fast_keys[p], group_index });
                                         ++p;
                                         emitted = true;
                                     }
