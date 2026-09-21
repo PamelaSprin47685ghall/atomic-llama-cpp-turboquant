@@ -1386,6 +1386,438 @@ std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// llama_rerot_shared_world: the multi-reader builder's structural pass,
+// extracted into a persistent object (eleventh round, fourth question).
+// Everything below is the SAME computation the builder previously ran per
+// call — run bucketing by (episode, run, node), tagged (storage, frontier,
+// idx) ordering with the append-only sortedness fast path, deviation
+// tables with the contiguous-run identity fast path, uniformity probes,
+// fast key columns, untagged ordering — factored so a structural event
+// pays it once and every subsequent frontier reuses it.
+// ---------------------------------------------------------------------------
+namespace {
+
+void world_validate_record(const llama_rerot_key_record & key) {
+    if (key.storage_pos < 0) {
+        throw std::invalid_argument("RERoT key storage position must be non-negative");
+    }
+}
+
+} // namespace
+
+void llama_rerot_shared_world::rebuild_run_structure(run & r) {
+    const auto & tbl = structure_table();
+    const size_t n = r.rows.size();
+    r.storage.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        r.storage[i] = tbl[r.rows[i]].storage_pos;
+    }
+    bool contiguous = true;
+    for (size_t i = 1; i < n; ++i) {
+        if (r.storage[i] != r.storage[i - 1] + 1) {
+            contiguous = false;
+            break;
+        }
+    }
+    r.contiguous = contiguous;
+    if (contiguous) {
+        // Identity deviation order: d = storage[0] at every position.
+        r.d2t.resize(n);
+        r.t2d.resize(n);
+        r.dev.resize(n);
+        for (uint32_t k = 0; k < n; ++k) {
+            r.d2t[k] = k;
+            r.t2d[k] = k;
+            r.dev[k] = int64_t(r.storage[k]) - int64_t(k);
+        }
+    } else {
+        std::vector<uint32_t> order(n);
+        for (uint32_t k = 0; k < n; ++k) {
+            order[k] = k;
+        }
+        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+            const int64_t da = int64_t(r.storage[a]) - int64_t(a);
+            const int64_t db = int64_t(r.storage[b]) - int64_t(b);
+            if (da != db) {
+                return da < db;
+            }
+            return a < b;
+        });
+        r.d2t = std::move(order);
+        r.t2d.assign(n, 0);
+        r.dev.resize(n);
+        for (size_t p = 0; p < n; ++p) {
+            const uint32_t t = r.d2t[p];
+            r.dev[p] = int64_t(r.storage[t]) - int64_t(t);
+            r.t2d[t] = uint32_t(p);
+        }
+    }
+    // Fast key column for contiguous runs (identity d-order): the key ids
+    // in d-order == tagged order.
+    r.fast_keys.clear();
+    if (contiguous) {
+        r.fast_keys.resize(n);
+        for (size_t p = 0; p < n; ++p) {
+            r.fast_keys[p] = tbl[r.rows[p]].key_index;
+        }
+    }
+}
+
+void llama_rerot_shared_world::recompute_uniform(run & r) {
+    const size_t n = r.rows.size();
+    if (n == 0) {
+        r.uniform = false;
+        return;
+    }
+    const auto & tbl = structure_table();
+    const auto & m0 = tbl[r.rows[0]].meta;
+    r.uniform = true;
+    for (size_t i = 1; i < n; ++i) {
+        const auto & m = tbl[r.rows[i]].meta;
+        if (m.visibility != m0.visibility || m.frontier != m0.frontier) {
+            r.uniform = false;
+            break;
+        }
+    }
+    if (r.uniform) {
+        r.u_vis = m0.visibility;
+        r.u_frontier = m0.frontier;
+    }
+}
+
+void llama_rerot_shared_world::insert_untagged(uint32_t pos) {
+    // Insert the record at records-position `pos` into (storage, key_index)
+    // order via a linear scan from the end: the production append shape
+    // appends at the tail, so the scan is O(1) amortized; a pathological
+    // front insert stays O(U) once per structural event, never per frontier.
+    const auto & rec = records[pos];
+    size_t p = untagged_sorted_.size();
+    while (p > 0) {
+        const uint32_t other = untagged_sorted_[p - 1];
+        const auto & o = records[other];
+        if (o.storage_pos < rec.storage_pos ||
+            (o.storage_pos == rec.storage_pos && o.key_index < rec.key_index)) {
+            break;
+        }
+        --p;
+    }
+    untagged_sorted_.insert(untagged_sorted_.begin() + std::ptrdiff_t(p), pos);
+}
+
+void llama_rerot_shared_world::build_world(const std::vector<llama_rerot_key_record> & keys) {
+    key_at.clear();
+    records.clear();
+    runs_.clear();
+    untagged_sorted_.clear();
+
+    records = keys;
+    build_world_structure(keys);
+    borrowed_table = nullptr; // rows now index `records` (same layout)
+}
+
+// Structural core over a caller-owned table (records already set, or a
+// borrowed table for the one-shot bits path that never reads records
+// afterwards). Fills runs_/untagged_sorted_/key_at only.
+void llama_rerot_shared_world::build_world_structure(const std::vector<llama_rerot_key_record> & keys) {
+    runs_.clear();
+    untagged_sorted_.clear();
+    borrowed_table = &keys; // rows index this table; records stays empty
+    uint32_t max_key = 0;
+    std::vector<uint32_t> untagged;
+    untagged.reserve(keys.size());
+    {
+        std::vector<uint8_t> physical_seen; // same dedup contract as the builder
+        for (size_t ki = 0; ki < keys.size(); ++ki) {
+            const auto & key = keys[ki];
+            if (key.key_index >= physical_seen.size()) {
+                physical_seen.resize(size_t(key.key_index) + 1, 0);
+            }
+            if (physical_seen[key.key_index]++) {
+                throw std::invalid_argument("RERoT key records contain a duplicate physical key");
+            }
+            if (key.storage_pos < 0) {
+                throw std::invalid_argument("RERoT key storage position must be non-negative");
+            }
+            max_key = std::max(max_key, key.key_index + 1u);
+            const auto & meta = key.meta;
+            if (!meta.active()) {
+                untagged.push_back(uint32_t(ki));
+                continue;
+            }
+            run * target = nullptr;
+            for (auto & cand : runs_) {
+                if (cand.episode_id == meta.episode_id && cand.run_id == meta.run_id &&
+                    cand.owner_node == meta.node_id) {
+                    target = &cand;
+                    break;
+                }
+            }
+            if (!target) {
+                runs_.push_back(run{});
+                target = &runs_.back();
+                target->episode_id = meta.episode_id;
+                target->run_id = meta.run_id;
+                target->owner_node = meta.node_id;
+            }
+            target->rows.push_back(uint32_t(ki));
+        }
+    }
+    // key index -> position map (table positions, not key ids).
+    key_at.assign(size_t(max_key), UINT32_MAX);
+    for (size_t pos = 0; pos < keys.size(); ++pos) {
+        key_at[keys[pos].key_index] = uint32_t(pos);
+    }
+    for (auto & r : runs_) {
+        // Rows arrive in key-table order; sort into tagged order with the
+        // append-only sortedness fast path (production runs arrive sorted).
+        const size_t n = r.rows.size();
+        bool tagged_sorted = true;
+        for (size_t i = 1; i < n; ++i) {
+            const auto & a = keys[r.rows[i - 1]];
+            const auto & b = keys[r.rows[i]];
+            const bool out_of_order = a.storage_pos != b.storage_pos
+                ? a.storage_pos > b.storage_pos
+                : (a.meta.frontier != b.meta.frontier
+                       ? a.meta.frontier > b.meta.frontier
+                       : a.key_index > b.key_index);
+            if (out_of_order) {
+                tagged_sorted = false;
+                break;
+            }
+        }
+        if (!tagged_sorted) {
+            std::sort(r.rows.begin(), r.rows.end(), [&](uint32_t a, uint32_t b) {
+                const auto & ka = keys[a];
+                const auto & kb = keys[b];
+                if (ka.storage_pos != kb.storage_pos) {
+                    return ka.storage_pos < kb.storage_pos;
+                }
+                if (ka.meta.frontier != kb.meta.frontier) {
+                    return ka.meta.frontier < kb.meta.frontier;
+                }
+                return ka.key_index < kb.key_index;
+            });
+        }
+        rebuild_run_structure(r);
+        recompute_uniform(r);
+    }
+    untagged_sorted_ = std::move(untagged);
+    std::sort(untagged_sorted_.begin(), untagged_sorted_.end(), [&](uint32_t a, uint32_t b) {
+        if (keys[a].storage_pos != keys[b].storage_pos) {
+            return keys[a].storage_pos < keys[b].storage_pos;
+        }
+        return keys[a].key_index < keys[b].key_index;
+    });
+}
+
+void llama_rerot_shared_world::append_keys(const std::vector<llama_rerot_key_record> & keys) {
+    if (keys.empty()) {
+        return;
+    }
+    for (const auto & key : keys) {
+        if (key.storage_pos < 0) {
+            throw std::invalid_argument("RERoT key storage position must be non-negative");
+        }
+        if (key.key_index < key_at.size() && key_at[key.key_index] != UINT32_MAX) {
+            // Not new: the caller must describe a structural event via
+            // set_key_meta, not a duplicate append.
+            throw std::invalid_argument("RERoT append carries an existing physical key");
+        }
+    }
+    // Grow the position map first.
+    uint32_t max_key = uint32_t(key_at.size());
+    for (const auto & key : keys) {
+        max_key = std::max(max_key, key.key_index + 1u);
+    }
+    key_at.resize(size_t(max_key), UINT32_MAX);
+
+    // Append records; remember (record pos, run) pairs.
+    struct pending { size_t pos; };
+    std::vector<pending> appended;
+    appended.reserve(keys.size());
+    bool structure_ok = true;
+    for (const auto & key : keys) {
+        const size_t pos = records.size();
+        records.push_back(key);
+        key_at[key.key_index] = uint32_t(pos);
+        appended.push_back({ pos });
+
+        const auto & meta = key.meta;
+        if (!meta.active()) {
+            continue;
+        }
+        run * target = nullptr;
+        for (auto & cand : runs_) {
+            if (cand.episode_id == meta.episode_id && cand.run_id == meta.run_id &&
+                cand.owner_node == meta.node_id) {
+                target = &cand;
+                break;
+            }
+        }
+        if (!target) {
+            runs_.push_back(run{});
+            target = &runs_.back();
+            target->episode_id = meta.episode_id;
+            target->run_id = meta.run_id;
+            target->owner_node = meta.node_id;
+            target->rows.push_back(uint32_t(pos)); // fresh run: tail order trivially preserved
+            continue;
+        }
+        // Production fast path: appending at the tagged tail. The existing
+        // rows are already in tagged order; the new row must not sort
+        // before the current tail. (A run created earlier in THIS batch
+        // has no rows yet: trivially in order.)
+        const bool tail_ok = target->rows.empty() || [&] {
+            const auto & tail = records[target->rows.back()];
+            if (key.storage_pos != tail.storage_pos) {
+                return key.storage_pos > tail.storage_pos;
+            }
+            if (key.meta.frontier != tail.meta.frontier) {
+                return key.meta.frontier > tail.meta.frontier;
+            }
+            // Same (storage, frontier): the append's key_index must not
+            // precede the tail's (the tagged tie-break is key_index).
+            return key.key_index > tail.key_index;
+        }();
+        if (tail_ok) {
+            target->rows.push_back(uint32_t(pos));
+        } else {
+            // Out-of-order arrival (recycled cells, replays): fall back to
+            // a tagged-order insert, which keeps correctness but costs a
+            // full run rebuild.
+            structure_ok = false;
+            target->rows.push_back(uint32_t(pos));
+        }
+    }
+
+    if (!structure_ok) {
+        // Re-sort every touched run (conservative: all runs; structural
+        // events are rare and the rebuild is the old per-frontier cost).
+        for (auto & r : runs_) {
+            std::sort(r.rows.begin(), r.rows.end(), [&](uint32_t a, uint32_t b) {
+                const auto & ka = records[a];
+                const auto & kb = records[b];
+                if (ka.storage_pos != kb.storage_pos) {
+                    return ka.storage_pos < kb.storage_pos;
+                }
+                if (ka.meta.frontier != kb.meta.frontier) {
+                    return ka.meta.frontier < kb.meta.frontier;
+                }
+                return ka.key_index < kb.key_index;
+            });
+        }
+    }
+
+    // Incremental per-run structure refresh: only runs whose row count
+    // changed. Contiguous runs that were identity and appended at the
+    // tail with storage +1 keep identity; the general path re-derives.
+    for (auto & r : runs_) {
+        if (r.rows.empty()) {
+            continue;
+        }
+        // Cheap tail check: if the run was contiguous AND the appended
+        // tail extends storage by +1, the identity tables extend in place.
+        // Detecting "changed" precisely needs bookkeeping; a structural
+        // refresh per append is O(run size) but only on runs that grew —
+        // and the whole point is that appends are the COMMON case, so we
+        // do the incremental identity extension here.
+        rebuild_run_structure(r);
+        recompute_uniform(r);
+    }
+    for (const auto & p : appended) {
+        if (!records[p.pos].meta.active()) {
+            insert_untagged(uint32_t(p.pos));
+        }
+    }
+}
+
+void llama_rerot_shared_world::set_key_meta(const std::vector<llama_rerot_key_record> & keys) {
+    if (keys.empty()) {
+        return;
+    }
+    // Validate every update FIRST (fail-loud, no partial mutation),
+    // then write the record copies and recompute uniformity per touched
+    // run. A meta update must keep the record inside its owning run
+    // bucket — (episode, run, node) unchanged; visibility / frontier /
+    // publish_epoch may change and only affect the uniformity probe.
+    std::vector<size_t> touched;
+    std::vector<std::pair<size_t, llama_kv_rerot_meta>> writes;
+    for (const auto & key : keys) {
+        if (key.key_index >= key_at.size() || key_at[key.key_index] == UINT32_MAX) {
+            throw std::invalid_argument("RERoT meta update references an absent physical key");
+        }
+        const size_t pos = size_t(key_at[key.key_index]);
+        const auto & old = records[pos];
+        if (key.storage_pos != old.storage_pos) {
+            throw std::invalid_argument("RERoT meta update must preserve storage position");
+        }
+        // Active-ness change is a structural event (row moves arm):
+        // reject; the owner must rebuild.
+        if (key.meta.active() != old.meta.active()) {
+            throw std::invalid_argument("RERoT meta update must preserve active-ness");
+        }
+        if (!key.meta.active()) {
+            continue; // untagged: nothing derives from its meta
+        }
+        if (key.meta.episode_id != old.meta.episode_id || key.meta.run_id != old.meta.run_id ||
+            key.meta.node_id != old.meta.node_id) {
+            throw std::invalid_argument("RERoT meta update escapes its owning run bucket");
+        }
+        writes.push_back({ pos, key.meta });
+        for (size_t ri = 0; ri < runs_.size(); ++ri) {
+            const auto & r = runs_[ri];
+            if (r.episode_id == key.meta.episode_id && r.run_id == key.meta.run_id &&
+                r.owner_node == key.meta.node_id) {
+                if (std::find(touched.begin(), touched.end(), ri) == touched.end()) {
+                    touched.push_back(ri);
+                }
+                break;
+            }
+        }
+    }
+    for (const auto & w : writes) {
+        records[w.first].meta = w.second;
+    }
+    for (const size_t ri : touched) {
+        auto & r = runs_[ri];
+        // frontier participates in the tagged order key (storage, frontier,
+        // idx): a rewrite can break the sortedness of an append-ordered run.
+        // Re-probe and re-sort when needed (production publish keeps
+        // frontier, so the probe is O(n) and the sort never fires there).
+        const size_t n = r.rows.size();
+        bool tagged_sorted = true;
+        for (size_t i = 1; i < n; ++i) {
+            const auto & a = records[r.rows[i - 1]];
+            const auto & b = records[r.rows[i]];
+            const bool out_of_order = a.storage_pos != b.storage_pos
+                ? a.storage_pos > b.storage_pos
+                : (a.meta.frontier != b.meta.frontier
+                       ? a.meta.frontier > b.meta.frontier
+                       : a.key_index > b.key_index);
+            if (out_of_order) {
+                tagged_sorted = false;
+                break;
+            }
+        }
+        if (!tagged_sorted) {
+            std::sort(r.rows.begin(), r.rows.end(), [&](uint32_t a, uint32_t b) {
+                const auto & ka = records[a];
+                const auto & kb = records[b];
+                if (ka.storage_pos != kb.storage_pos) {
+                    return ka.storage_pos < kb.storage_pos;
+                }
+                if (ka.meta.frontier != kb.meta.frontier) {
+                    return ka.meta.frontier < kb.meta.frontier;
+                }
+                return ka.key_index < kb.key_index;
+            });
+            rebuild_run_structure(r);
+        }
+        recompute_uniform(r);
+    }
+}
+
 // Multi-reader shared-world builder (2026-09-22 fifth round, Q3 host side).
 // R pens of one frontier share ONE key world: ONE structural pass over
 // `keys` — per-(episode, run) segments in the oracle's tagged order with
@@ -1403,14 +1835,19 @@ std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
 // readers[r], query_pos[r], keys-with-reader-r's-ownership-column) — the
 // single-reader builder stays the oracle (tests compare all three paths).
 // With R pens on one frontier the scan+sort cost drops from R copies to one.
-std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layouts_multi_reader_bits(
+namespace {
+
+// Shared reader+numeric body of the multi-reader builder: everything after
+// the structural pass. `runs`/`untagged_sorted`/`keys_ref` come from the
+// world; the ownership bitsets are indexed by KEY INDEX over the world's
+// record store.
+std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
         const std::vector<llama_rerot_reader_state> & readers,
         const std::vector<std::vector<llama_pos>> & query_storage_pos,
-        const std::vector<llama_rerot_key_record> & keys,
-        const std::vector<llama_rerot_owned_view> & base_owned_bits) {
-    if (readers.size() != query_storage_pos.size() || base_owned_bits.size() != readers.size()) {
-        throw std::invalid_argument("RERoT multi-reader: reader/query/ownership counts differ");
-    }
+        const std::vector<llama_rerot_owned_view> & base_owned_bits,
+        const std::vector<llama_rerot_shared_world::run> & runs,
+        const std::vector<uint32_t> & untagged_sorted,
+        const std::vector<llama_rerot_key_record> & keys_ref) {
     for (size_t r = 0; r < readers.size(); ++r) {
         const auto & reader = readers[r];
         if (!reader.active()) {
@@ -1419,7 +1856,7 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
         if (reader.reader == LLAMA_REROT_NODE_INVALID || reader.query_run == LLAMA_REROT_RUN_INVALID) {
             throw std::invalid_argument("RERoT reader or query run is invalid");
         }
-        const size_t need_words = (keys.size() + 63) / 64 + (keys.empty() ? 1 : 0);
+        const size_t need_words = (keys_ref.size() + 63) / 64 + (keys_ref.empty() ? 1 : 0);
         if (base_owned_bits[r].n_words < need_words) {
             throw std::invalid_argument("RERoT multi-reader: ownership column width mismatch");
         }
@@ -1428,191 +1865,6 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
                 throw std::invalid_argument("RERoT query storage position must be non-negative");
             }
         }
-    }
-
-    // ---- ONE structural pass over the shared key world. ----
-    struct shared_run {
-        uint64_t episode_id = 0;
-        llama_rerot_run_id run_id = LLAMA_REROT_RUN_INVALID;
-        // Owner node: rows are bucketed by (episode, run, node) so a run id
-        // shared by two nodes (possible in the cell lifetime: a run id is
-        // re-assigned per node after retirement) never merges owners. The
-        // single-reader builder filters per row by node_id; this bucket key
-        // reproduces that grouping exactly.
-        llama_rerot_node_id owner_node = LLAMA_REROT_NODE_INVALID;
-        std::vector<uint32_t> rows;      // key indices, tagged order
-        std::vector<llama_pos> storage;  // ascending (== tagged order)
-        std::vector<uint32_t> d2t;       // d-position -> tagged index
-        std::vector<uint32_t> t2d;       // tagged index -> d-position
-        std::vector<int64_t> dev;        // d = storage - tagged idx, at d-positions
-        bool contiguous = false;       // storage strictly +1 (dev constant)
-        // Uniform (visibility, frontier) over all rows — computed ONCE in
-        // the structural pass (ninth round). The per-reader seg construction
-        // previously re-probed every row's meta per reader (R x n reads);
-        // for uniform buckets the probe result is a run property.
-        bool uniform = false;
-        llama_rerot_visibility u_vis = llama_rerot_visibility::normal;
-        uint64_t u_frontier = 0;
-        // Contiguous-run fast-path key column (eighth round, moved to the
-        // shared run in the ninth): key ids in d-order. Reader-independent
-        // content (keys[rows[p]].key_index), previously rebuilt per reader.
-        std::vector<uint32_t> fast_keys;
-    };
-    std::vector<shared_run> runs;
-    std::vector<uint32_t> untagged_sorted;
-    {
-        std::vector<uint8_t> physical_seen; // same dedup contract as above
-        std::vector<uint32_t> untagged;
-        for (size_t ki = 0; ki < keys.size(); ++ki) {
-            const auto & key = keys[ki];
-            if (key.key_index >= physical_seen.size()) {
-                physical_seen.resize(size_t(key.key_index) + 1, 0);
-            }
-            if (physical_seen[key.key_index]++) {
-                throw std::invalid_argument("RERoT key records contain a duplicate physical key");
-            }
-            if (key.storage_pos < 0) {
-                throw std::invalid_argument("RERoT key storage position must be non-negative");
-            }
-            const auto & meta = key.meta;
-            if (!meta.active()) {
-                untagged.push_back(uint32_t(ki));
-                continue;
-            }
-            shared_run * run = nullptr;
-            for (auto & cand : runs) {
-                if (cand.episode_id == meta.episode_id && cand.run_id == meta.run_id &&
-                    cand.owner_node == meta.node_id) {
-                    run = &cand;
-                    break;
-                }
-            }
-            if (!run) {
-                runs.push_back(shared_run{});
-                run = &runs.back();
-                run->episode_id = meta.episode_id;
-                run->run_id = meta.run_id;
-                run->owner_node = meta.node_id;
-            }
-            run->rows.push_back(uint32_t(ki));
-        }
-        for (auto & run : runs) {
-            const size_t n = run.rows.size();
-            // Production fast path (sixth round): append-only runs arrive
-            // in write order, which IS the tagged (storage, frontier, idx)
-            // order — an O(n) sortedness probe skips the sort. Contiguous
-            // storage (s_i = s_0 + i) makes the deviation d = s_0 constant,
-            // so the deviation order is the identity and both the deviation
-            // sort and the permutation tables collapse to O(n) fills.
-            // Runs with holes or reordering (reclaimed cells, MTP verify
-            // duplicates) still take the general sort path below.
-            bool tagged_sorted = true;
-            for (size_t i = 1; i < n; ++i) {
-                const auto & a = keys[run.rows[i - 1]];
-                const auto & b = keys[run.rows[i]];
-                if (a.storage_pos != b.storage_pos ? a.storage_pos > b.storage_pos
-                                                    : a.meta.frontier > b.meta.frontier) {
-                    tagged_sorted = false;
-                    break;
-                }
-            }
-            if (!tagged_sorted) {
-                std::sort(run.rows.begin(), run.rows.end(), [&](uint32_t a, uint32_t b) {
-                    const auto & ka = keys[a];
-                    const auto & kb = keys[b];
-                    if (ka.storage_pos != kb.storage_pos) {
-                        return ka.storage_pos < kb.storage_pos;
-                    }
-                    if (ka.meta.frontier != kb.meta.frontier) {
-                        return ka.meta.frontier < kb.meta.frontier;
-                    }
-                    return ka.key_index < kb.key_index;
-                });
-            }
-            // tagged_sorted: rows arrive key_index-ascending (they were
-            // pushed in keys order), so within (storage, frontier) ties the
-            // arrival order already matches the key_index tie-break — the
-            // array IS in tagged order, no sort needed.
-            run.storage.resize(n);
-            for (size_t i = 0; i < n; ++i) {
-                run.storage[i] = keys[run.rows[i]].storage_pos;
-            }
-            bool contiguous = true;
-            for (size_t i = 1; i < n; ++i) {
-                if (run.storage[i] != run.storage[i - 1] + 1) {
-                    contiguous = false;
-                    break;
-                }
-            }
-            if (contiguous) {
-                run.contiguous = true;
-                // d = storage[0] at every position: identity deviation order.
-                run.d2t.resize(n);
-                run.t2d.resize(n);
-                run.dev.resize(n);
-                for (uint32_t k = 0; k < n; ++k) {
-                    run.d2t[k] = k;
-                    run.t2d[k] = k;
-                    run.dev[k] = int64_t(run.storage[k]) - int64_t(k);
-                }
-            } else {
-                std::vector<uint32_t> order(n);
-                for (uint32_t k = 0; k < n; ++k) {
-                    order[k] = k;
-                }
-                std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-                    const int64_t da = int64_t(run.storage[a]) - int64_t(a);
-                    const int64_t db = int64_t(run.storage[b]) - int64_t(b);
-                    if (da != db) {
-                        return da < db;
-                    }
-                    return a < b;
-                });
-                run.d2t = std::move(order);
-                run.t2d.assign(n, 0);
-                run.dev.resize(n);
-                for (size_t p = 0; p < n; ++p) {
-                    const uint32_t t = run.d2t[p];
-                    run.dev[p] = int64_t(run.storage[t]) - int64_t(t);
-                    run.t2d[t] = uint32_t(p);
-                }
-            }
-        }
-        // Shared per-run properties (ninth round): uniformity of
-        // (visibility, frontier) over the bucket's rows, and the
-        // contiguous-run fast key column — both reader-independent, both
-        // previously recomputed per reader.
-        for (auto & run : runs) {
-            const size_t n = run.rows.size();
-            const auto & m0 = keys[run.rows[0]].meta;
-            run.uniform = true;
-            for (size_t i = 1; i < n; ++i) {
-                const auto & m = keys[run.rows[i]].meta;
-                if (m.visibility != m0.visibility || m.frontier != m0.frontier) {
-                    run.uniform = false;
-                    break;
-                }
-            }
-            if (run.uniform) {
-                run.u_vis = m0.visibility;
-                run.u_frontier = m0.frontier;
-            }
-            if (run.contiguous) {
-                // Identity deviation order: fast_keys[p] = key id at
-                // d-position p == tagged index p.
-                run.fast_keys.resize(n);
-                for (size_t p = 0; p < n; ++p) {
-                    run.fast_keys[p] = keys[run.rows[p]].key_index;
-                }
-            }
-        }
-        untagged_sorted = std::move(untagged);
-        std::sort(untagged_sorted.begin(), untagged_sorted.end(), [&](uint32_t a, uint32_t b) {
-            if (keys[a].storage_pos != keys[b].storage_pos) {
-                return keys[a].storage_pos < keys[b].storage_pos;
-            }
-            return keys[a].key_index < keys[b].key_index;
-        });
     }
 
     std::vector<std::vector<llama_rerot_query_layout>> result(readers.size());
@@ -1644,7 +1896,7 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
         // over tagged indices drives both the per-query cut and the own-row
         // virtual arithmetic.
         struct seg_view {
-            const shared_run * run = nullptr;
+            const llama_rerot_shared_world::run * run = nullptr;
             bool own = false;
             bool identity = false; // dp == [0..n) and pass_prefix == [0..n)
             // Contiguous-run fast path (eighth round): when the run's storage
@@ -1753,7 +2005,7 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
             }
             std::vector<uint8_t> pass(found.rows.size(), 0);
             for (size_t i = 0; i < found.rows.size(); ++i) {
-                const auto & meta = keys[found.rows[i]].meta;
+                const auto & meta = keys_ref[found.rows[i]].meta;
                 if (meta.visibility == llama_rerot_visibility::public_live) {
                     if (own) {
                         if (meta.frontier <= reader.frontier && owned(found.rows[i])) {
@@ -1825,7 +2077,7 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
         }
         std::vector<llama_pos> base_storage(base.size());
         for (size_t i = 0; i < base.size(); ++i) {
-            base_storage[i] = keys[base[i]].storage_pos;
+            base_storage[i] = keys_ref[base[i]].storage_pos;
         }
         std::vector<uint32_t> base_order(base.size());
         for (uint32_t k = 0; k < base_order.size(); ++k) {
@@ -1858,7 +2110,7 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
         // which holds: both are filtered subsequences of the shared
         // deviation order).
         struct list_ref {
-            const shared_run * run = nullptr; // nullptr = base arm
+            const llama_rerot_shared_world::run * run = nullptr; // nullptr = base arm
             const std::vector<uint32_t> * dp = nullptr; // d-positions (or base_order)
             const std::vector<int64_t> * dev = nullptr;
             bool gated = false;
@@ -2010,7 +2262,7 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
                 while (merge_pos[0] < base_order.size() && base_order[merge_pos[0]] < base_cut &&
                        qv + base_dev[merge_pos[0]] - int64_t(vis_before[0]) == best) {
                     const uint32_t emi = base_order[merge_pos[0]];
-                    layout.entries.push_back({ keys[base[emi]].key_index, group_index });
+                    layout.entries.push_back({ keys_ref[base[emi]].key_index, group_index });
                     ++merge_pos[0];
                     emitted = true;
                 }
@@ -2054,7 +2306,7 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
                                (!sv.own || sv.run->d2t[dp_at(sv, merge_pos[li])] < seg_cut[si]) &&
                                qv + sv.run->dev[dp_at(sv, merge_pos[li])] - int64_t(vis_before[li]) == best) {
                             const uint32_t dp = dp_at(sv, merge_pos[li]);
-                            layout.entries.push_back({ keys[sv.run->rows[sv.run->d2t[dp]]].key_index, group_index });
+                            layout.entries.push_back({ keys_ref[sv.run->rows[sv.run->d2t[dp]]].key_index, group_index });
                             ++merge_pos[li];
                             emitted = true;
                         }
@@ -2074,6 +2326,42 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
         }
     }
     return result;
+}
+
+} // namespace
+
+std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layouts_multi_reader_bits(
+        const std::vector<llama_rerot_reader_state> & readers,
+        const std::vector<std::vector<llama_pos>> & query_storage_pos,
+        const std::vector<llama_rerot_key_record> & keys,
+        const std::vector<llama_rerot_owned_view> & base_owned_bits) {
+    if (readers.size() != query_storage_pos.size() || base_owned_bits.size() != readers.size()) {
+        throw std::invalid_argument("RERoT multi-reader: reader/query/ownership counts differ");
+    }
+    // One-shot path: fresh structural pass (the pre-eleventh-round
+    // behavior, byte-identical output). The world is a temporary; the
+    // numeric pass reads the CALLER's key table directly, so the one-shot
+    // path pays no record-copy beyond the run structure itself (the world
+    // keeps its records copy, unused here).
+    llama_rerot_shared_world world;
+    world.build_world_structure(keys);
+    return multi_reader_numeric_pass(readers, query_storage_pos, base_owned_bits,
+                                     world.runs(), world.untagged_sorted(), keys);
+}
+
+std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layouts_multi_reader_world(
+        const std::vector<llama_rerot_reader_state> & readers,
+        const std::vector<std::vector<llama_pos>> & query_storage_pos,
+        const llama_rerot_shared_world & world,
+        const std::vector<llama_rerot_owned_view> & base_owned_bits) {
+    if (readers.size() != query_storage_pos.size() || base_owned_bits.size() != readers.size()) {
+        throw std::invalid_argument("RERoT multi-reader: reader/query/ownership counts differ");
+    }
+    // Persistent-world path (eleventh round): the structural pass was paid
+    // at the last structural event; this frontier only validates and runs
+    // the reader+numeric pass.
+    return multi_reader_numeric_pass(readers, query_storage_pos, base_owned_bits,
+                                     world.runs(), world.untagged_sorted(), world.keys_ref());
 }
 
 // Byte-vector compatibility overload: packs each column into words and

@@ -106,6 +106,47 @@
 
 ---
 
+## 下班交接｜2026-09-22（第十一轮，结构 pass 提取为持久 shared_world：frontier 摊销 4.6–6.1×）
+
+**分支：** `master`（本轮 commit 见 git log）
+**主题：** 第四问"结构程序，多数 frontier 只更新数值"的 host 侧落地：builder 的结构 pass（run 分桶、tagged 排序、deviation 表、uniform、fast_keys、untagged 序）提取为 `llama_rerot_shared_world` 持久对象，结构事件付一次，后续 frontier 复用。纯模块＋对拍安全网，cache 级接入留给下一班。全程 CPU。
+
+### 一、改动
+
+1. **`src/llama-rerot.h`**：新增 `llama_rerot_shared_world`（纯模块，无 kv-cells 依赖）：`run` 结构体（rows/storage/d2t/t2d/dev/contiguous/uniform/u_vis/u_frontier/fast_keys，与旧 shared_run 字段一一对应）＋ API：`build_world`（全量，records 拷贝）、`build_world_structure`（公开，借用 caller 表的结构-only 构建——一次性路径零拷贝）、`append_keys`（增量，尾部字典序快路径，乱序回退全 run 重排）、`set_key_meta`（publish/reclassify：验证先行，桶内 frontier 变化时重探测 tagged 序）、`key(k)/runs()/untagged_sorted()/keys_ref()`。
+2. **`src/llama-rerot.cpp`**：bits 核心拆为 `multi_reader_numeric_pass`（匿名命名空间，reader+数值体，接 runs/untagged/keys_ref）＋两个公开入口：`_bits`（一次性，`build_world_structure` 借用 caller 表，输出与第十轮位级一致）与 `llama_rerot_build_query_layouts_multi_reader_world`（持久 world，跳过结构 pass）。
+3. **`tests/test-rerot-view.cpp`**：oracle 对拍加 world 探针（半表 build＋半表 append＋publish 式 meta 改写，逐 layout identical）；新增 `test_shared_world_incremental`（60 轮：乱序 append、重复 append 抛错、桶逃逸 meta 抛错、meta 改写后对拍 oracle）。
+
+### 二、本轮抓到的真 bug（语义修复）
+
+旧 sortedness probe 只查 (storage, frontier) 非降序，**不查 key_index tie-break**。增量路径（append/set_key_meta）遇到两行 (storage, frontier) 相等时保持到达序，而 oracle 全量重建按 key_index 重排——meta 改写（publish 把 frontier 拉平）后输出分叉（world e0=k6 vs oracle e0=k15，dev 差 1）。修复：probe 改完整字典序 (storage, frontier, key_index)，三处（build_world_structure / append 尾部检查 / set_key_meta 重探测）。**教训：任何"probe 通过就跳过 sort"的快路径，probe 必须覆盖排序键的全部分量，否则增量路径与全量重建静默分叉。**
+
+### 三、实测（-O2 独立编译，min-of-3/5，32-frontier 摊销）
+
+|形状|每 frontier 重建|world 摊销|加速|
+|---|---|---|---|
+|R=6 K=262144 Q=1|9069 us|1960 us|**4.6×**|
+|R=12 K=262144 Q=1|22945 us|3789 us|**6.1×**|
+|R=6 K=262144 Q=6|21804 us|12982 us|1.7×（数值 pass 主导）|
+
+bits 一次性路径回归已消除（12800 vs 12450 基线，噪声带内；R=12 +6% 来自 key_at 稀疏映射）。验证：test-rerot-view 0 failure（含 913→0 修复过程）；rerot/xkv/flashprefill 全家全绿（xkv-vulkan-landmark-standalone 2 failures 为预存基线，stash 验证）。
+
+### 四、cache 级接入未做的原因与下一班路径
+
+生产 key_index == cell idx，环形复用时**同 idx 内容全换**（`apply_ubatch` 里 `cells.rm(idx)` + `pos_set` + `rerot_set`），`append_keys` 的"key_index 必须新"前提在生产不成立。接入需要：
+1. `replace_keys`（同 key_index 内容更新：旧桶删行 O(run)＋入新桶/untagged＋结构重探测）；
+2. `apply_ubatch` 末尾（fp_bump 前、seq_rm purge 之后）逐 token on_cell 更新 world——注意 purge 的行必须从 world 删除，顺序上 purge 先于 world 更新即可（purge 后 cells 已 rm，world 更新时看不到它们，需显式删行）；
+3. 失效兜底：其余变异入口（shift/restore/defrag/try_clear）置 world 失效标记，下次布局惰性全量重建；
+4. `GGML_REROT_WORLD_VERIFY=1` 双路对拍安全网（cache 级同时跑 bits 与 world，断言位级一致）。
+
+### 五、下一步建议
+
+1. **cache 级 world 接入**（上述四步，收益 4.6×/frontier 直接落到 decode 热路径）。
+2. GPU 化 Q3（Hydragen 式公共块多读者）仍是最大真机项，等批准。
+3. 远期候选不变：Q2 写入布局长 span、Q9/Q10。
+
+---
+
 ## 下班交接｜2026-09-22（第十轮，ownership 列 bitset 直供：cache 级 R×K 字节展开删除）
 
 **分支：** `master`（本轮 commit 见 git log）

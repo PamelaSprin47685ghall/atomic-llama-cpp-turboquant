@@ -2451,6 +2451,14 @@ c3648d789  DAG logical/view/fixed-entry implementation
 - **实测**（-O2 min-of-10）：builder 内 bytes→bits −5%（R=6 K=262144：13090→12450）到 −10%（R=12 K=65536：3943→3547）；R=1 无差（预期）。cache 级另省整个 R×K 字节展开（约 2×R×K 次内存访问，未计入 builder 数字）。
 - **接口教训**：纯函数模块的"类型独立"不必靠字节展开买——POD view（指针＋宽度）同样零依赖，还省转换。
 
+**第十一轮：结构 pass 提取为持久 shared_world（09-22 深夜，第四问"结构程序"）**：
+
+- **对象**：第十轮后 builder 的结构 pass（run 分桶、tagged 排序、deviation 表、uniform 探测、fast_keys、untagged 序）仍是**每个 frontier 全量重算**——而它是 key 表的纯函数，生产形态下两次结构事件之间只发生 append 与 publish（元数据改写），结构不必重建。这正是第四问"多数 frontier 只更新数值"在 host 侧的落点。
+- **改动**：`llama_rerot_shared_world`（llama-rerot 纯模块，pimpl 无关）：`build_world`（全量，含 records 拷贝）、`build_world_structure`（借用 caller 表的结构-only 构建，一次性 bits 路径零拷贝）、`append_keys`（增量追加，尾部字典序快路径，乱序回退全 run 重排）、`set_key_meta`（publish/reclassify 元数据改写：验证先行、桶内 frontier 变化时重探测 tagged 序）。builder 拆为 `multi_reader_numeric_pass`（共享 reader+数值体）＋两个入口：`_bits`（一次性，结构-only world，行为与第十轮位级一致）与 `_world`（持久 world，跳过结构 pass）。
+- **实测**（-O2 独立编译，32-frontier 摊销）：R=6 K=262144 Q=1：9069→1960 us（**4.6×**）；R=12 K=262144 Q=1：22945→3789（**6.1×**）；R=6 K=262144 Q=6：21804→12982（**1.7×**，Q 大时数值 pass 主导）。bits 一次性路径回归已消除（12800 vs 12450 基线，噪声带内；R=12 +6% 来自 key_at 稀疏映射，world 路径摊销后无此项）。
+- **语义修复（本轮抓到的真 bug）**：旧 probe 只检查 (storage, frontier) 非降序，不检查 key_index tie-break——meta 改写使两行 (storage, frontier) 相等时，增量路径保持旧序而 oracle 全量重建按 key_index 重排，输出分叉。修复为完整字典序 probe（三处：build/append tail/set_key_meta），200 轮对拍全绿。
+- **cache 级接入未做（下一班）**：生产 key_index==cell idx，环形复用时同 idx 内容全换（append_keys 的"新 key_index"前提不成立），需要 `replace_keys`（旧桶删行 O(run)）＋ `apply_ubatch` 逐 token on_cell 协调＋purge/回滚路径失效语义。纯模块已就绪并有对拍安全网。
+
 ### 21.2 验证证据
 
 - `test-rerot-math`：0 failure。Q3 对拍独立全 softmax oracle（含不可见读者、合并顺序无关性）；Q5 对拍稠密 §2.3 逐步递推（12 步，α<1，异构 β，秩每步恰 +1，dense/output 双等价，多 lane 共享投影位级一致）；Q6 24 个随机 chunk（T=1..8，含 β=0 纯衰减，此时 M=G·I、Y=0 精确成立）对拍逐步 oracle ≤1e-10；Q7 全部四种编码存在下对拍 (code−1) 解码 oracle，整数 activation 时位级相等。
@@ -2465,6 +2473,7 @@ c3648d789  DAG logical/view/fixed-entry implementation
   第八轮：快发射由同两个 cache 级测试钉住（MTP verify 形状正是快路径的目标形态），加上 `test_shared_layouts_vs_oracle`/`test_multi_reader_layouts_vs_oracle` 的 200 轮三路对拍（乱序/重复/混合世界强制走通用分支）；全家 45/45。
   第九轮：属性上收不改任何输出字节（同输入同输出，纯计算位置移动），由同套 45/45 全绿钉住。
   第十轮：bits 与 bytes 两条路径由 test-rerot-view 新增探针逐迭代位级对拍（同一 base_owned 打包后走 bits 核心，与字节重载输出逐 layout identical），加全套 45/45。
+  第十一轮：`test_multi_reader_layouts_vs_oracle` 加 world 探针（每迭代：半表 build_world＋半表 append_keys＋publish 式 set_key_meta，与字节路径逐 layout identical）；新增 `test_shared_world_incremental`（乱序 append、重复 append 抛错、桶逃逸 meta 抛错、meta 改写后对拍 oracle，60 轮）；bits 一次性路径与 world 持久路径由 bench_world 位级对拍（每 rep）。全家 rerot/xkv/flashprefill 全绿。
 - 开发机预存失败（与本轮无关，基线复现）：test-tokenizers-ggml-vocabs、test-quantize-fns、test-llama-archs、test-backend-ops timeout；test-vulkan-tp5-mesh/command-replay 需 ≥2 Vulkan 设备（开发机仅 1 块 780M iGPU）。
 
 ### 21.3 边界与下一步（第二轮修订）
@@ -2475,4 +2484,4 @@ c3648d789  DAG logical/view/fixed-entry implementation
 - Q7 的 LUT 路径在 GPU 上“减乘法≠减耗时”，需实测；块 scale 与 Hadamard 域不得交换。
 - Q8（跳块上界）与 Q10（K×H 联合投机）是近似/研究路线：本轮已把它们的**数学契约与可执行反例**落成参考代码（界、验证引擎、naive 对照），但收益测量、接受率账目与生产接入仍未做，不得与等义改写的收益混记。Q10 的保守“全笔通过才前进”方案在独立接受率 a、b 笔下整步通过率为 a^b，联合草稿必须学会预测多笔相互影响后的下一 frontier，而不是 b 条各自向前冲的草稿。
 - Q2/Q4 生产化已推进到单一共享 key world＋生产形态快路径（decode 热路径，见 21.1 第五～十轮）：结构扫描与排序对 R 个 reader 各只做一次，reader 无关段属性（uniform、fast_keys）已上收共享结构 pass（R=12 K=262144 builder −50%），ownership 列 bitset 直供（cache 级 R×K 字节展开删除），Q=6（MTP verify）数值通道已 1.85×（8758 us，接近 entry 输出 memcpy 地板）；剩余方向：让写入布局主动维持长而规则的 span（`llama_rerot_span_long_fraction` 是验收指标）；把 run-order 签名接入 flashprefill 的 `llama_rerot_split_table_fragments` 调用点，结构事件才重算 fragments，数值增长走增量前缀和——注意 flashprefill 侧已有 fp_key+freshness 整层缓存，fragment 级缓存的边际收益需先证明再动手。
-- Q3 host 侧的下一步：数值通道（Q=1 时 ~1.8ms/6 readers，即 entry 发射本体）已接近地板；结构 pass 1.0ms 中桶扫描是剩余项。真机收益需目标机 `rerot-semantic-smoke.py` 对比 decode host 时间（开发机数字是合成键，不是模型证据）。
+- Q3 host 侧：数值通道（Q=1 时 ~1.9ms/6 readers，即 entry 发射本体）已接近地板；结构 pass 已提取为 `llama_rerot_shared_world`（第十一轮，摊销 4.6–6.1×）。剩余工作全在 cache 级接入：`replace_keys`（环形 cell 复用）＋ `apply_ubatch` on_cell 协调 ＋ purge/回滚失效语义；接入后每 frontier 只付数值 pass。真机收益需目标机 `rerot-semantic-smoke.py` 对比 decode host 时间（开发机数字是合成键，不是模型证据）。

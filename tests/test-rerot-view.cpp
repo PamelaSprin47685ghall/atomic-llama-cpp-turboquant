@@ -1496,6 +1496,44 @@ static void test_multi_reader_layouts_vs_oracle() {
                 threw_bits = true;
             }
             CHECK(threw_bits == threw_multi);
+            // Eleventh round: persistent shared world. Build incrementally
+            // (half the table, then append the rest, then a publish-style
+            // meta rewrite) and require output identical to the byte path.
+            bool threw_world = false;
+            try {
+                llama_rerot_shared_world world;
+                const size_t half = keys.size() / 2;
+                std::vector<llama_rerot_key_record> first(keys.begin(), keys.begin() + half);
+                std::vector<llama_rerot_key_record> rest(keys.begin() + half, keys.end());
+                world.build_world(first);
+                world.append_keys(rest);
+                // Publish-style meta rewrite: same records, frontier+1.
+                if (!keys.empty()) {
+                    std::vector<llama_rerot_key_record> updated;
+                    for (const auto & k : keys) {
+                        llama_rerot_key_record u = k;
+                        if (u.meta.active()) {
+                            u.meta.publish_epoch += 1;
+                        }
+                        updated.push_back(u);
+                    }
+                    world.set_key_meta(updated);
+                }
+                const auto multi_world = llama_rerot_build_query_layouts_multi_reader_world(
+                    readers, qpos, world, views);
+                CHECK(multi_world.size() == multi.size());
+                for (uint32_t p = 0; p < R; ++p) {
+                    const std::string rtag = "world iter " + std::to_string(iter) + " reader " + std::to_string(p);
+                    CHECK(multi_world[p].size() == multi[p].size());
+                    for (size_t i = 0; i < multi_world[p].size() && i < multi[p].size(); ++i) {
+                        const std::string tag = rtag + " pos " + std::to_string(qpos[p][i]);
+                        CHECK(layouts_identical(multi_world[p][i], multi[p][i], tag.c_str()));
+                    }
+                }
+            } catch (const std::exception &) {
+                threw_world = true;
+            }
+            CHECK(threw_world == threw_multi);
         }
         std::vector<std::vector<llama_rerot_query_layout>> ref(R);
         try {
@@ -1537,6 +1575,147 @@ static void test_multi_reader_layouts_vs_oracle() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Eleventh round: llama_rerot_shared_world — the structural pass extracted
+// into a persistent object. This test drives the incremental surface
+// directly: out-of-order append (recycled-cell shape), duplicate append
+// (must throw), meta rewrite (publish shape), meta that escapes the run
+// bucket (must throw), and layout equivalence vs the from-scratch bits
+// path after every mutation step.
+// ---------------------------------------------------------------------------
+static void test_shared_world_incremental() {
+    constexpr uint64_t episode = 4242;
+    std::mt19937_64 rng(0xE11E11E11ull);
+
+    for (int iter = 0; iter < 60; ++iter) {
+        // Base world: 3 runs (2 own-node runs + 1 peer), some untagged.
+        std::vector<llama_rerot_key_record> keys;
+        uint32_t next_idx = 0;
+        const auto push = [&](llama_pos storage, llama_kv_rerot_meta meta) {
+            keys.push_back({ next_idx++, storage, false, meta });
+        };
+        push(0, {});
+        push(1, {});
+        push(2, {});
+        for (llama_pos s = 0; s < 6; ++s) {
+            push(s, make_meta(episode, 1, 10, llama_rerot_visibility::public_live, 3));
+        }
+        push(6, make_meta(episode, 1, 11, llama_rerot_visibility::private_control, 0));
+        push(7, make_meta(episode, 1, 11, llama_rerot_visibility::pending_record, 0));
+        for (llama_pos s = 0; s < 4; ++s) {
+            push(s, make_meta(episode, 2, 20, llama_rerot_visibility::public_live, 1));
+        }
+        std::shuffle(keys.begin(), keys.end(), rng);
+
+        llama_rerot_shared_world world;
+        world.build_world(keys);
+
+        // Reader: own node 1, query run 10, peers first.
+        llama_rerot_reader_state reader;
+        reader.episode_id = episode;
+        reader.reader = 1;
+        reader.query_run = 10;
+        reader.frontier = 3;
+        reader.frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+        reader.ordered_runs = { 20, 11, 10 };
+
+        const auto layout_for = [&](const std::vector<llama_rerot_key_record> & table,
+                                    const llama_pos q) {
+            // From-scratch reference over `table` with full ownership.
+            std::vector<llama_rerot_key_record> owned(table);
+            for (auto & k : owned) {
+                k.owned_by_reader = true; // world rows are all resident; the
+                                          // bitset below mirrors that
+            }
+            return llama_rerot_build_query_layout(reader, q, owned);
+        };
+
+        // Ownership bitset: every resident row owned (probe shape).
+        const auto make_views = [&](size_t n_keys, size_t R) {
+            const size_t words = (n_keys + 63) / 64 + 1;
+            std::vector<std::vector<uint64_t>> w(R, std::vector<uint64_t>(words, ~0ull));
+            std::vector<llama_rerot_owned_view> v(R);
+            for (size_t r = 0; r < R; ++r) {
+                v[r] = { w[r].data(), w[r].size() };
+            }
+            return std::make_pair(std::move(w), std::move(v));
+        };
+
+        // Step 1: append out-of-order rows (recycled-cell shape: storage
+        // below the current tail of run 10).
+        std::vector<llama_rerot_key_record> appended;
+        appended.push_back({ next_idx++, 3, false,
+            make_meta(episode, 1, 10, llama_rerot_visibility::public_live, 2) });
+        appended.push_back({ next_idx++, 9, false, {} });
+        world.append_keys(appended);
+        keys.insert(keys.end(), appended.begin(), appended.end());
+        {
+            const auto [w, v] = make_views(keys.size(), 1);
+            const auto got = llama_rerot_build_query_layouts_multi_reader_world(
+                { reader }, { { 8 } }, world, v);
+            const auto ref = layout_for(keys, 8);
+            CHECK(got.size() == 1 && got[0].size() == 1);
+            if (got.size() == 1 && got[0].size() == 1) {
+                CHECK(layouts_identical(got[0][0], ref, "world out-of-order append"));
+            }
+        }
+
+        // Step 2: duplicate append must throw and leave the world usable.
+        bool threw = false;
+        try {
+            world.append_keys({ keys.front() });
+        } catch (const std::invalid_argument &) {
+            threw = true;
+        }
+        CHECK(threw);
+
+        // Step 3: publish-style meta rewrite (pending -> public).
+        std::vector<llama_rerot_key_record> updated;
+        for (const auto & k : keys) {
+            llama_rerot_key_record u = k;
+            if (u.meta.active() && u.meta.visibility == llama_rerot_visibility::pending_record) {
+                u.meta.visibility = llama_rerot_visibility::public_live;
+                u.meta.publish_epoch = 9;
+            } else if (u.meta.active()) {
+                u.meta.frontier = 2;
+            }
+            updated.push_back(u);
+        }
+        world.set_key_meta(updated);
+        for (auto & k : keys) {
+            k.meta = world.key(k.key_index).meta;
+        }
+        {
+            const auto [w, v] = make_views(keys.size(), 1);
+            const auto got = llama_rerot_build_query_layouts_multi_reader_world(
+                { reader }, { { 5 } }, world, v);
+            const auto ref = layout_for(keys, 5);
+            CHECK(got.size() == 1 && got[0].size() == 1);
+            if (got.size() == 1 && got[0].size() == 1) {
+                CHECK(layouts_identical(got[0][0], ref, "world meta rewrite"));
+            }
+        }
+
+        // Step 4: meta that escapes the run bucket must throw. Pick an
+        // ACTIVE record (untagged records carry no bucket and are skipped).
+        threw = false;
+        const llama_rerot_key_record * active_rec = nullptr;
+        for (const auto & k : keys) {
+            if (k.meta.active()) { active_rec = &k; break; }
+        }
+        if (active_rec) {
+            try {
+                llama_rerot_key_record u = *active_rec;
+                u.meta.run_id = 999;
+                world.set_key_meta({ u });
+            } catch (const std::invalid_argument &) {
+                threw = true;
+            }
+            CHECK(threw);
+        }
+    }
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT View Tests ===\n");
     test_dag_cycle_preferred_topo();
@@ -1558,6 +1737,7 @@ int main() {
     test_run_epoch_contract();
     test_shared_layouts_vs_oracle();
     test_multi_reader_layouts_vs_oracle();
+    test_shared_world_incremental();
     std::fprintf(stderr, "=== Results: %d failure(s) ===\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }
