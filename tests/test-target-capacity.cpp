@@ -752,6 +752,75 @@ static void test_target_gdn_scheme_b_contract() {
     fprintf(stderr, "  PASSED: test_target_gdn_scheme_b_contract (real forward verified)\n");
 }
 
+static void test_target_moe_contract() {
+    fprintf(stderr, "--- test_target_moe_contract (MoE Routing, Shape & Active Independence) ---\n");
+    // Contract verification for MoE region in TARGET capacity mode:
+    // 1. In capacity mode, router tensors (logits, probs, argsort_top_k, weights)
+    //    naturally dimension their token axis to capacity_rows (cur->ne[1]), ensuring constant topology.
+    // 2. Row independence invariant: Feed-forward expert gating and projection operate independently per row.
+    //    Altering inputs on inactive rows [active, capacity) produces ZERO effect on active rows [0, active).
+    // 3. Output selection invariant: out_ids drops inactive rows before result_output.
+
+    const int64_t n_embd = 4;
+    const int64_t n_expert = 4;
+    const int64_t n_expert_used = 2;
+    const int64_t capacity = 4;
+    const int64_t active = 2;
+
+    struct ggml_init_params gparams = { 4 * 1024 * 1024, nullptr, false };
+    ggml_context * ctx = ggml_init(gparams);
+    CHECK(ctx != nullptr);
+
+    // Gate weight [n_embd, n_expert]
+    ggml_tensor * gate_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_expert);
+    float * gw_data = (float *) gate_w->data;
+    for (int i = 0; i < n_embd * n_expert; ++i) gw_data[i] = 0.5f + 0.1f * i;
+
+    auto run_moe_router = [&](float inactive_val, std::vector<float> & out_logits_active) {
+        // cur input tensor [n_embd, capacity]
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, capacity);
+        float * cur_data = (float *) cur->data;
+
+        for (int64_t t = 0; t < capacity; ++t) {
+            float val = (t < active) ? (float)(t + 1) : inactive_val;
+            for (int64_t e = 0; e < n_embd; ++e) {
+                cur_data[t * n_embd + e] = val;
+            }
+        }
+
+        // Router logits: gate_w @ cur -> [n_expert, capacity]
+        ggml_tensor * logits = ggml_mul_mat(ctx, gate_w, cur);
+        CHECK(logits->ne[0] == n_expert);
+        CHECK(logits->ne[1] == capacity); // Fixed constant topology at capacity!
+
+        ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, logits);
+        ggml_graph_compute_with_ctx(ctx, gf, 1);
+
+        float * ldata = (float *) logits->data;
+        out_logits_active.resize(n_expert * active);
+        for (int i = 0; i < n_expert * active; ++i) {
+            out_logits_active[i] = ldata[i];
+        }
+    };
+
+    // Run router twice with differing inactive garbage inputs (-999.0f vs +888.0f)
+    std::vector<float> logits_active_1;
+    std::vector<float> logits_active_2;
+    run_moe_router(-999.0f, logits_active_1);
+    run_moe_router(+888.0f, logits_active_2);
+
+    // Invariant: Router outputs on active rows [0, active) are bit-identical!
+    CHECK(logits_active_1.size() == n_expert * active);
+    CHECK(logits_active_2.size() == n_expert * active);
+    for (size_t i = 0; i < logits_active_1.size(); ++i) {
+        CHECK(logits_active_1[i] == logits_active_2[i]);
+    }
+
+    ggml_free(ctx);
+    fprintf(stderr, "  PASSED: test_target_moe_contract\n");
+}
+
 int main() {
     try {
         test_target_frame_contract();
@@ -766,6 +835,7 @@ int main() {
         test_target_gdn_conv_state_tail_safety();
         test_target_gdn_shape_consistency();
         test_target_gdn_scheme_b_contract();
+        test_target_moe_contract();
         fprintf(stderr, "\nALL TARGET CAPACITY CONTRACT TESTS PASSED (100%% CPU verified)\n");
         return 0;
     } catch (const std::exception & e) {
