@@ -84,7 +84,9 @@ void main() {
 #endif
 
 #ifdef TP5_LATE_Q
-layout(local_size_x = 64) in;
+// Match the native HC W_down single-subgroup topology. Using 64 lanes here
+// with only one subgroupAdd drops the second subgroup on RDNA2/wave32.
+layout(local_size_x = 32) in;
 
 layout(std430, binding = 0) readonly buffer DownWeights {
     late_q8_0 w[];
@@ -123,7 +125,7 @@ void main() {
         float acc = 0.0;
         const uint base = stream * p.width;
         const float s   = scatter[stream];
-        for (uint col = 8u * lane; col < p.width; col += 8u * 64u) {
+        for (uint col = 8u * lane; col < p.width; col += 8u * 32u) {
             const uint valid = min(8u, p.width - col);
             float xv[8];
             [[unroll]] for (uint e = 0u; e < 8u; ++e) {
@@ -218,7 +220,12 @@ bool wait_generation() {
         ready     = 0u;
         expected  = status[p.status_word_offset + 1u];
         spin_used = 0u;
-        if (status[p.status_word_offset + 2u] == 0u && expected != 0u) {
+        // spin_max==0 means a preceding tiny tp5_relay_copy_f32 dispatch in
+        // the same command buffer already consumed the generation. This keeps
+        // the 1024-thread exact-RMS finalizer off the watchdog-sensitive spin.
+        if (p.spin_max == 0u && status[p.status_word_offset + 2u] == 0u && expected != 0u) {
+            ready = 1u;
+        } else if (status[p.status_word_offset + 2u] == 0u && expected != 0u) {
             for (uint spin = 0u; spin < p.spin_max; ++spin) {
                 if ((spin & 1023u) == 0u && status[p.status_word_offset + 2u] != 0u) {
                     break;

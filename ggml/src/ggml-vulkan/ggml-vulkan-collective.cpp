@@ -67,6 +67,11 @@ static bool tp5_latebind_hc_enabled() {
     return env && (strcmp(env, "hc-down") == 0 || strcmp(env, "1") == 0 || strcmp(env, "on") == 0);
 }
 
+static bool tp5_latebind_fused_finalize_enabled() {
+    const char * env = getenv("GGML_TP5_LATEBIND_FUSED_FINALIZE");
+    return env && atoi(env) != 0;
+}
+
 static size_t tp5_mailbox_bank(uint64_t epoch) {
     return (size_t) ((epoch - 1) & 1);
 }
@@ -2652,7 +2657,8 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     c.fail("allocation of LateBind descriptor set failed on rank " + std::to_string(i));
                     return false;
                 }
-            } else if (c.sync_mode == tp5_sync_mode::RELAY && !trefs[i].hc.width) {
+            }
+            if (c.sync_mode == tp5_sync_mode::RELAY && !trefs[i].hc.width) {
                 VkDescriptorSetAllocateInfo relay_ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
                 relay_ai.descriptorPool = r.desc_pool;
                 relay_ai.descriptorSetCount = 1;
@@ -2779,8 +2785,47 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                 const size_t bcast_bytes = tensor_bytes; // CPU accumulation produces F32, regardless of wire type.
                 if (c.sync_mode == tp5_sync_mode::RELAY) {
                     const uint32_t profile_spin = getenv("GGML_TP5_PROFILE") ? 1u : 0u;
+                    const auto record_relay_copy = [&]() {
+                        VkDescriptorBufferInfo src_info{r.bcast_buf[b], 0, 64 + tensor_bytes};
+                        VkDescriptorBufferInfo dst_info{trefs[i].buf, trefs[i].offset, tensor_bytes};
+                        VkWriteDescriptorSet writes[2]{};
+                        for (uint32_t w = 0; w < 2; ++w) {
+                            writes[w].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                            writes[w].dstSet = plan.relay_ds[idx];
+                            writes[w].dstBinding = w;
+                            writes[w].descriptorCount = 1;
+                            writes[w].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                        }
+                        writes[0].pBufferInfo = &src_info;
+                        writes[1].pBufferInfo = &dst_info;
+                        vkUpdateDescriptorSets(r.vkdev, 2, writes, 0, nullptr);
+                        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.relay_copy_pipe);
+                        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.relay_copy_layout, 0, 1,
+                                                &plan.relay_ds[idx], 0, nullptr);
+                        struct { uint64_t status_bda; uint32_t n_elems; uint32_t seq; uint32_t spin_max;
+                                 uint32_t dst_offset_words; uint32_t reserved0; uint32_t reserved1; } relay_pc{
+                            r.bda_addr[b] + c.star_rank_stride - 64, (uint32_t)n_elems, 1u, c.spin_max,
+                            0u, profile_spin, 0u};
+                        vkCmdPushConstants(cmd, r.relay_copy_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                           sizeof(relay_pc), &relay_pc);
+                        vkCmdDispatch(cmd, 1, 1, 1);
+                    };
                     if (late_plan) {
                         const auto & late = trefs[i].late;
+                        const bool fused_finalize = tp5_latebind_fused_finalize_enabled();
+                        if (!fused_finalize) {
+                            // Keep the watchdog-sensitive bounded spin in the
+                            // established 64-thread P2. The exact 1024-thread
+                            // RMS/finalize dispatch follows in the SAME command
+                            // buffer after generation has already been observed.
+                            record_relay_copy();
+                            VkMemoryBarrier mb_late_wait{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                                        VK_ACCESS_SHADER_WRITE_BIT,
+                                                        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+                            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                                                 1, &mb_late_wait, 0, nullptr, 0, nullptr);
+                        }
                         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_finalize_pipe);
                         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_finalize_layout, 0, 1,
                                                 &plan.late_finalize_ds[idx], 0, nullptr);
@@ -2794,9 +2839,9 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                             float    epsilon;
                             uint32_t status_word_offset;
                         } late_pc{
-                            late.width, late.late_rank, late.streams, c.spin_max,
+                            late.width, late.late_rank, late.streams, fused_finalize ? c.spin_max : 0u,
                             (uint32_t) ((64 + c.late_host_offset) / sizeof(uint32_t)),
-                            profile_spin, late.epsilon,
+                            fused_finalize ? profile_spin : 0u, late.epsilon,
                             (uint32_t) ((c.star_rank_stride - 64) / sizeof(uint32_t))
                         };
                         static_assert(sizeof(late_pc) == 32);
@@ -2829,29 +2874,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     } else {
                         // Generic fallback for the few collective boundaries
                         // whose first consumer is not an HC prefix.
-                        VkDescriptorBufferInfo src_info{r.bcast_buf[b], 0, 64 + tensor_bytes};
-                        VkDescriptorBufferInfo dst_info{trefs[i].buf, trefs[i].offset, tensor_bytes};
-                        VkWriteDescriptorSet writes[2]{};
-                        for (uint32_t w = 0; w < 2; ++w) {
-                            writes[w].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                            writes[w].dstSet = plan.relay_ds[idx];
-                            writes[w].dstBinding = w;
-                            writes[w].descriptorCount = 1;
-                            writes[w].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                        }
-                        writes[0].pBufferInfo = &src_info;
-                        writes[1].pBufferInfo = &dst_info;
-                        vkUpdateDescriptorSets(r.vkdev, 2, writes, 0, nullptr);
-                        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.relay_copy_pipe);
-                        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.relay_copy_layout, 0, 1,
-                                                &plan.relay_ds[idx], 0, nullptr);
-                        struct { uint64_t status_bda; uint32_t n_elems; uint32_t seq; uint32_t spin_max;
-                                 uint32_t dst_offset_words; uint32_t reserved0; uint32_t reserved1; } relay_pc{
-                            r.bda_addr[b] + c.star_rank_stride - 64, (uint32_t)n_elems, 1u, c.spin_max,
-                            0u, profile_spin, 0u};
-                        vkCmdPushConstants(cmd, r.relay_copy_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                           sizeof(relay_pc), &relay_pc);
-                        vkCmdDispatch(cmd, 1, 1, 1);
+                        record_relay_copy();
                     }
                     // Only order P2 outputs into subsequent GPU work. Host
                     // visibility of status[3] is supplied transitively by the
