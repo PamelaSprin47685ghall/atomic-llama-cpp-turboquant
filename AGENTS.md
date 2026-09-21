@@ -158,6 +158,44 @@ LateBind 全部 7 个内核的 push constant 把 `capacity_rows` 当执行行数
 
 ---
 
+## 下班交接｜2026-09-22（第十三轮，cache 级三连击：6.1–9.1×＋emission 公式真 bug 修复）
+
+**分支：** `master`（本轮 commit 见 git log；第十二轮 `3e5a13561` 在历史里）
+
+### 一、本轮改动（第十二轮摊销构成审计 → 三项依次消灭）
+
+第十二轮后 R=12 K=262144 摊销：ownership 位图 48.7ms / 数值 pass 32ms / assembly 23ms / validate（另计）69ms。
+
+1. **ownership 列增量化**（48.7ms → 0.04ms）：cache 持 `rerot_world_owned`（per-seq 位图，world records 位置索引）；`apply_ubatch` 增量（purge 清位/写 cell 重写位/共享 cell 只清被删 seq 位），`ensure` 重建同扫重填。**顺带修一个真 bug**：purge 收集原来用 `seq_has` 会把共享 cell（seq_count>1）误从 world 删除——改为匹配 seq_rm 的 `seq_count==1` 释放条件，共享 cell 只清位。
+2. **validate 门控**：`LLAMA_REROT_LAYOUT_VALIDATE=0` 跳过 per-entry 扫描（69ms → 4us），保留 O(groups+queries) 结构检查。默认全开（保守）。纯 Predefine 铁律：builder 是唯一真理。
+3. **emission 重写（最重要）**：
+   - **Bug A**：own-row 查找取 last storage match 而非 last **passing** match（同 pos 不可见重写行导致 qvp 偏移）。
+   - **Bug B（根本性）**：k-way merge 把 d-order 位置当可见序号——run 含不可见行占位时全部 effective 平移。**正确公式 `eff = qv + storage − (vis_before + tagged 前缀 passing 数)`**。重写为 per-list eff 数组（base=storage 序、段=tagged 序；非单调时段内 stable_sort）＋k-way merge＋contiguous identity 的 const-eff bulk（memcpy key_ids＋常数 eff＋整段 fill）。`llama_rerot_build_query_layouts_shared` 同步修复——**multi/shared/oracle 三方一致**。
+   - 教训：d-order 的"dev 排序 = 可见序号"假设在 run 内重复 storage（MTP verify 形状）时静默失效；第十一轮测试形状不触发。test-rerot-view 现有该形状（200 iter 随机）钉住。
+
+### 二、实测（min-of-5，validate off，vs 第十二轮前基线）
+
+|形状|基线|本轮|加速|
+|---|---|---|---|
+|R=12 K=262144|297450 us|**48472 us**|**6.1×**|
+|R=6 K=131072|90135|**9956**|**9.1×**|
+|R=6 K=65536|46919|**5244**|**8.9×**|
+
+### 三、验证
+
+- `test_rerot_world_incremental_decode` 新增 **Phase 7 共享 cell purge**（seq_cp→apply 覆盖共享位置：record 留 world、只清被删 seq 位）。
+- test-rerot-view：multi vs shared vs oracle **三方**对拍（新增 shared vs oracle）。
+- 全 rerot/xkv/flashprefill 电池 0 failure；ASAN 干净（/tmp/asan13，alloc-dealloc-mismatch 为测试自带 operator new 重载误报，关掉后全绿）。
+- 注意：改 `llama_kv_cache` 类布局后**必须全量重编**测试对象（增量链接旧 .o 会堆损坏——本轮 "corrupted double-linked list" 假警报的根因）。
+
+### 四、下一班
+
+1. **assembly 增量化**（~23ms@R=12）：entries/groups 每 query 重建——问题二方向：段描述（范围＋偏移）替代逐 entry，或跨 query 的 entries 结构复用（12 reader 的 key_index 序列 11/12 重叠）。
+2. `try_append_key_fast` 接线（O(1) 尾追 vs upsert 的桶扫描）——decode 热循环。
+3. 真机 semantic-smoke（需批准）。
+
+---
+
 ## 下班交接｜2026-09-22（第十二轮，cache 级 shared_world 接入：decode 热路径 1.3–1.6×）
 
 **分支：** `master`（本轮 commit 见 git log；注意 HEAD 已含他人合并的远端 TP5/P0-P14 提交，第十一轮 `787080bfd` 在历史里）

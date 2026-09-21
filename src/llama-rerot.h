@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -504,6 +505,15 @@ public:
     // reflecting every accepted update.
     const llama_rerot_key_record & key(uint32_t k) const {
         return records[size_t(key_index_to_pos(k))];
+    }
+
+    // Records position of a live key index (throws std::out_of_range on an
+    // absent/unknown index — callers on the tracked paths hold live keys).
+    uint32_t pos_of(uint32_t k) const {
+        if (k >= key_at.size() || key_at[k] == UINT32_MAX) {
+            throw std::out_of_range("RERoT world: absent key index");
+        }
+        return key_at[k];
     }
 
     const std::vector<run> & runs() const { return runs_; }

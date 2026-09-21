@@ -1731,6 +1731,26 @@ static void test_rerot_world_incremental_decode() {
     // safety net must force a rebuild and stay correct.
     kv.seq_keep(0);
     check_layout({5, 9});
+
+    // Phase 7: SHARED-cell purge (thirteenth round bug pin). seq 1 shares
+    // every seq-0 cell (seq_cp); an apply that purges a shared position
+    // must NOT remove the record from the world — the cell survives with
+    // seq_count > 1 (only seq 0's reference drops). A world that dropped
+    // it would lose the key from every layout until a rebuild.
+    kv.seq_cp(0, 1, 0, -1);
+    {
+        // Overwrite position 5 (shared by seq 0 and seq 1): the purge of
+        // the OLD pos-5 cell must see seq_count == 2 and keep the record.
+        llama_kv_rerot_meta tag;
+        tag.episode_id = 7; tag.node_id = 2; tag.run_id = 2;
+        tag.publish_epoch = 4; tag.frontier = 12;
+        tag.visibility = llama_rerot_visibility::public_live;
+        commit_tokens(kv, 0, {5}, true, &tag);
+        check_layout({5, 9});
+        // The shared cells (positions != 5) are still owned by seq 0: the
+        // layouts above already prove the world kept them (the oracle
+        // rebuilds from cells and would disagree otherwise).
+    }
 }
 
 static void test_ddvr_two_query_groups() {

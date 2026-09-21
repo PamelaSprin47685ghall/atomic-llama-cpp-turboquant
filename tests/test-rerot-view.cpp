@@ -1569,6 +1569,7 @@ static void test_multi_reader_layouts_vs_oracle() {
                     const auto oracle = llama_rerot_build_query_layout(readers[p], qpos[p][i], keys_p);
                     const std::string tag = rtag + " oracle pos " + std::to_string(qpos[p][i]);
                     CHECK(layouts_identical(multi[p][i], oracle, tag.c_str()));
+                    CHECK(layouts_identical(ref[p][i], oracle, tag.c_str()));
                 }
             }
         }

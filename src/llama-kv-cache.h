@@ -718,6 +718,10 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
+    // Test-only accessor: the persistent world (differential probes).
+    const llama_rerot_shared_world & get_rerot_world_for_test() const { return rerot_world; }
+    const std::unordered_map<llama_seq_id, std::vector<uint64_t>> & get_rerot_world_owned_for_test() const { return rerot_world_owned; }
+
 private:
     bool compact_planned(llama_kv_cells_vec & planned_cells);
     const llama_model & model;
@@ -840,6 +844,16 @@ private:
     // Pending increments for a not-yet-valid world (mutations that happen
     // while the world is invalid are covered by the full rebuild).
     mutable std::vector<llama_rerot_key_record> rerot_world_pending;
+    // Ownership columns (thirteenth round): per-sequence bitsets indexed by
+    // the world's RECORDS POSITION (same index space as the layout's
+    // ownership bitmaps — run rows and the untagged order). Maintained by
+    // the same tracked entry points as the world (apply purge clears the
+    // victim's bits, apply upsert rewrites the written cell's bits, add_run_ref
+    // sets the referenced cell's bit); a world rebuild refills them in the
+    // same scan. Lazy per-sequence columns: only sequences that actually
+    // own cells get a column. A missing column reads as all-zero (the
+    // sequence owns nothing) — the layout's ownership probe.
+    mutable std::unordered_map<llama_seq_id, std::vector<uint64_t>> rerot_world_owned;
 
     // Feed the world: called by the tracked mutation entry points. When the
     // world is valid, the increment is applied immediately; when invalid,

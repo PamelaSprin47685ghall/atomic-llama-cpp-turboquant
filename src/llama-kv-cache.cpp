@@ -4035,6 +4035,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     //       will be present in the cache. so we have to purge any position which is less than those we would overwrite
     //       ref: https://github.com/ggml-org/llama.cpp/pull/13746#issuecomment-2916057092
     std::vector<uint32_t> world_purged;
+    // Shared cells whose reference to ONE sequence drops (record stays in
+    // the world; only the ownership bit clears).
+    std::vector<std::pair<uint32_t, llama_seq_id>> world_purge_shared;
     for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
         if (seq_pos_max_rm[s] == -1) {
             continue;
@@ -4055,7 +4058,11 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 const llama_pos purge_lo = cells.seq_pos_min(s);
                 const llama_pos purge_hi = seq_pos_max_rm[s];
                 for (uint32_t i = 0; i < cells.size(); ++i) {
-                    if (cells.pos_in(i, purge_lo, purge_hi) && cells.seq_has(i, s)) {
+                    // Match seq_rm's release condition exactly: a SHARED
+                    // cell (seq_count > 1) only drops this sequence's
+                    // reference and survives — it must stay in the world.
+                    if (cells.pos_in(i, purge_lo, purge_hi) && cells.seq_has(i, s) &&
+                        cells.seq_count(i) == 1) {
                         world_purged.push_back(i);
                     }
                 }
@@ -4090,11 +4097,68 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             // re-synced: every cell mutation inside this apply is captured
             // by the two operations.
             try {
+                // Capture the purge victims' RECORDS POSITIONS before the
+                // removal (key_at marks them absent afterwards; positions
+                // themselves stay stable, but the lookup needs the live
+                // mapping).
+                std::vector<uint32_t> purge_positions;
                 if (!world_purged.empty()) {
+                    purge_positions.reserve(world_purged.size());
+                    for (const uint32_t victim : world_purged) {
+                        purge_positions.push_back(rerot_world.pos_of(victim));
+                    }
                     rerot_world.remove_keys(world_purged);
                 }
                 if (!rerot_world_pending.empty()) {
                     rerot_world.upsert_keys(rerot_world_pending);
+                }
+                // Ownership columns (thirteenth round): purge victims lose
+                // their bits in every column (the cells are gone); written
+                // cells get their bits REWRITTEN from the post-apply cells
+                // truth (seq_add above is the final word — a recycled index
+                // may have changed sequences entirely). Fresh appends grow
+                // every existing column to the new records width; a
+                // sequence with no column yet gets one on first ownership.
+                {
+                    const size_t n_words = (rerot_world.keys_ref().size() + 63) / 64 +
+                                           (rerot_world.keys_ref().empty() ? 1 : 0);
+                    for (auto & kv : rerot_world_owned) {
+                        kv.second.resize(n_words, 0);
+                    }
+                    for (const uint32_t pos : purge_positions) {
+                        for (auto & kv : rerot_world_owned) {
+                            kv.second[pos >> 6] &= ~(1ull << (pos & 63));
+                        }
+                    }
+                    // Shared victims: the record stays; only the dropped
+                    // sequence's ownership bit clears.
+                    for (const auto & [victim, seq] : world_purge_shared) {
+                        const uint32_t pos = rerot_world.pos_of(victim);
+                        auto it = rerot_world_owned.find(seq);
+                        if (it != rerot_world_owned.end()) {
+                            it->second[pos >> 6] &= ~(1ull << (pos & 63));
+                        }
+                    }
+                    const auto & cells_after = v_cells[sinfo.strm[0]];
+                    for (const auto & rec : rerot_world_pending) {
+                        const uint32_t pos = rerot_world.pos_of(rec.key_index);
+                        const auto & seqs = cells_after.seq_get_all(rec.key_index);
+                        // Clear the record's bit in every column, then set
+                        // it in the owning columns.
+                        for (auto & kv : rerot_world_owned) {
+                            kv.second[pos >> 6] &= ~(1ull << (pos & 63));
+                        }
+                        for (size_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                            if (seqs.test(s)) {
+                                auto it = rerot_world_owned.emplace(
+                                    llama_seq_id(s), std::vector<uint64_t>()).first;
+                                if (it->second.empty()) {
+                                    it->second.assign(n_words, 0);
+                                }
+                                it->second[pos >> 6] |= 1ull << (pos & 63);
+                            }
+                        }
+                    }
                 }
                 rerot_world_gen = v_cells[sinfo.strm[0]].get_generation();
             } catch (const std::exception &) {
@@ -6347,6 +6411,29 @@ const llama_rerot_shared_world & llama_kv_cache::ensure_rerot_world() const {
         });
     }
     rerot_world.build_world(keys);
+    // Thirteenth round: refill the per-sequence ownership columns in the
+    // same scan discipline — one column per sequence that owns at least
+    // one record, indexed by records position. The layout's ownership
+    // probe then reads these columns instead of re-testing every record
+    // against the cells (R x K bitset tests per frontier).
+    rerot_world_owned.clear();
+    {
+        const size_t n_words = (keys.size() + 63) / 64 + (keys.empty() ? 1 : 0);
+        std::unordered_map<llama_seq_id, std::vector<uint64_t>> cols;
+        for (size_t p = 0; p < keys.size(); ++p) {
+            const auto & seqs = cells.seq_get_all(keys[p].key_index);
+            for (size_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (seqs.test(s)) {
+                    auto it = cols.emplace(llama_seq_id(s), std::vector<uint64_t>()).first;
+                    if (it->second.empty()) {
+                        it->second.assign(n_words, 0);
+                    }
+                    it->second[p >> 6] |= 1ull << (p & 63);
+                }
+            }
+        }
+        rerot_world_owned = std::move(cols);
+    }
     rerot_world_gen = cells.get_generation();
     rerot_world_valid = true;
     return rerot_world;
@@ -6446,17 +6533,15 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
         group_readers.push_back(*group.view);
     }
     {
-        // ONE pass over the world's records fills every reader's ownership
-        // bit at once: cell bitsets are read once, not once per reader. The
-        // bit index is the RECORDS POSITION in the world (the numeric pass
-        // indexes ownership bits by records position, matching run rows and
-        // the untagged order).
-        for (uint32_t pos = 0; pos < shared_keys.size(); ++pos) {
-            const auto & cell_seq = cells.seq_get_all(shared_keys[pos].key_index);
-            for (size_t g = 0; g < group_seqs.size(); ++g) {
-                if (cell_seq.test(group_seqs[g])) {
-                    owned_words[g][pos >> 6] |= 1ull << (pos & 63);
-                }
+        // Thirteenth round: the ownership columns are maintained
+        // incrementally by the tracked mutation entry points (the same
+        // discipline as the world itself) and refilled by the rebuild —
+        // the per-frontier R x K bitset test pass is GONE. A missing
+        // column reads as all-zero (the sequence owns nothing).
+        for (size_t g = 0; g < group_seqs.size(); ++g) {
+            const auto it = rerot_world_owned.find(group_seqs[g]);
+            if (it != rerot_world_owned.end() && it->second.size() == owned_words_per_col) {
+                owned_words[g].assign(it->second.begin(), it->second.end());
             }
         }
     }
@@ -6501,12 +6586,13 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
             result.query_offsets.push_back(static_cast<uint32_t>(result.entries.size()));
         }
     }
-    const auto t_layout_end = std::chrono::steady_clock::now();
-    const uint64_t layout_us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t_layout_end - t_layout_start).count();
     std::string error;
     if (!result.validate(n_kv, &error)) {
         throw std::runtime_error("invalid RERoT attention layout: " + error);
     }
+    const auto t_layout_end = std::chrono::steady_clock::now();
+    const uint64_t layout_us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+        t_layout_end - t_layout_start).count();
 
     // Accumulate batch layout timing and counts to active profile ledger
     if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
