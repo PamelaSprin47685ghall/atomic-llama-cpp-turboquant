@@ -106,6 +106,39 @@
 
 ---
 
+## 下班交接｜2026-09-22（第八轮，Q=6 MTP verify 数值通道快发射＋磁盘清理）
+
+**分支：** `master`（本轮 commit 见 git log）
+**主题：** 攻下第七轮交接列出的最大遗留项：Q=6（MTP verify 形态）数值通道。单文件改动 `src/llama-rerot.cpp`（+61/−1）。全程 CPU。
+
+### 一、磁盘清理（班首）
+
+`~/.cache/semble`（918M）删除；`build/bin` 陈旧版本化 .so 剪除（保留符号链接指向的当前版）。99% → 98%（余 2.7G）。注意：每次 make 会再生成新版本号 .so，剪除脚本可重复执行。
+
+### 二、改动：连续 run＋恒等通过集的快发射列
+
+- **对象**：Q=6 时每 query 的 k 路归并对每 entry 走 `dp_at → d2t[dp] → rows[t] → keys[ki].key_index` 三次**依赖随机读**，且每 entry 重算 `qv + dev[dp] − vis_before` 与 best 比较。
+- **改动**：结构期两个既有探测（第六轮引入）——storage 严格 +1（dev 常数）＋恒等通过集——联合成立时，为段预计算 `fast_keys`（key-id 顺序列，每 reader 一次、全 query 批共享）。发射：`==best` 重检提升出循环；own 段因果截断退化为 `p < seg_cut` 前缀上界（恒等置换下 tagged 序 == d 序）；foreign 段顺序倾倒。不成立的段保留通用分支（快路径铁律）。
+- **实测**（-O2 独立编译管线基准，R=6）：Q=1：build 3372→2983 us（−12%）；**Q=6：16210→8758 us（1.85×）**；Q=6 K=262144：34.8ms（结构 ~1.8ms＋每 query ~1.2ms，接近 65k entry 输出 memcpy 地板）。相位：Q=6 总 18.3ms 中 validate 1.9ms、装配 ~7.6ms（后者是纯拷贝，见第七轮评估：不值得改对拍接口）。
+
+### 三、纠错（本轮唯一 bug）
+
+首版 foreign 快分支漏置 `emitted` 旗标 → `test_rerot_shared_reader_multi_query`（MTP verify 形状）以 "k-way merge lost a group head" 立即抓住。最小复现（`/tmp/repro_fast.cpp`：root/own/priv 三 run 世界，5 个跨界 query 位置）修复后 5/5 与逐 query oracle 逐字节一致。**教训：发射类快分支的每个出口都要置 emitted——丢头异常是免费的对拍哨兵，别急着删调试输出前先读懂它。**
+
+### 四、验证
+
+`test-rerot-view`（200 轮三路对拍）0 failure；`test-rerot-math`/`test-rerot-ddvr` 0 failure；`test-xkv-runtime` 全过；rerot/xkv/flashprefill 全家 **45/45**；`git diff --check` 干净。
+
+### 五、下一步
+
+1. 真机收益：目标机 `rerot-semantic-smoke.py`（需模型＋server，本机不可行）。
+2. GPU 化 Q3（公共 KV 块服务多读者）：host 侧已五轮加速（Q=6 builder 8.8ms），GPU 侧未动；数学契约在 `llama-rerot-math.h`（`llama_rerot_shared_block_attention`）。
+3. 装配融合（1.9ms@Q=1）：需改 oracle 对拍接口，收益小，维持第七轮评估。
+4. Q2 写入布局维持长 span（`llama_rerot_span_long_fraction` 验收）。
+5. Release 构建重测（磁盘已腾出 2.7G，可选）。
+
+---
+
 ## 下班交接｜2026-09-22（第七轮，cache 级布局路径：validate 位图＋ownership 单趟＋装配 reserve）
 
 **分支：** `master`（本轮 commit 见 git log）

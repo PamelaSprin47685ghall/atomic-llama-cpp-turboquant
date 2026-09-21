@@ -1444,6 +1444,7 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
         std::vector<uint32_t> d2t;       // d-position -> tagged index
         std::vector<uint32_t> t2d;       // tagged index -> d-position
         std::vector<int64_t> dev;        // d = storage - tagged idx, at d-positions
+        bool contiguous = false;       // storage strictly +1 (dev constant)
     };
     std::vector<shared_run> runs;
     std::vector<uint32_t> untagged_sorted;
@@ -1532,6 +1533,7 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
                 }
             }
             if (contiguous) {
+                run.contiguous = true;
                 // d = storage[0] at every position: identity deviation order.
                 run.d2t.resize(n);
                 run.t2d.resize(n);
@@ -1600,9 +1602,17 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
         struct seg_view {
             const shared_run * run = nullptr;
             bool own = false;
-            bool identity = false; // dp == [0..n) and pass_prefix == [0..n]
+            bool identity = false; // dp == [0..n) and pass_prefix == [0..n)
+            // Contiguous-run fast path (eighth round): when the run's storage
+            // is strictly +1 (production shape) AND the passing set is the
+            // identity (uniform fully-owned/foreign buckets), the per-entry
+            // emission chain dp_at -> d2t[dp] -> rows[t] -> keys[ki].key_index
+            // collapses to a sequential read over this precomputed key-id
+            // array, and the effective value is CONSTANT over the whole list
+            // (dev is constant), so the ==best recheck hoists out entirely.
             std::vector<uint32_t> dp;     // d-positions of the passing rows
             std::vector<uint32_t> pass_prefix; // tagged idx -> passing rows before it
+            std::vector<uint32_t> fast_keys;  // identity+contiguous: key ids in d-order
         };
         const auto dp_size = [](const seg_view & s) -> size_t {
             return s.identity ? s.run->rows.size() : s.dp.size();
@@ -1764,6 +1774,24 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
                 sv.pass_prefix[i + 1] = sv.pass_prefix[i] + uint32_t(pass[i]);
             }
             segs.push_back(std::move(sv));
+            }
+        }
+
+        // Contiguous-run fast-path key columns (eighth round). For a
+        // contiguous run with the identity passing set (uniform bucket —
+        // the production shape), the emission chain per entry is three
+        // dependent random reads (dp_at -> d2t -> rows -> keys). This
+        // precomputed column makes it ONE sequential read, built once per
+        // reader and shared by every query of the batch (the Q=6 MTP-verify
+        // shape re-enters the merge six times over the same lists).
+        for (auto & sv : segs) {
+            if (!sv.identity || !sv.run->contiguous) {
+                continue;
+            }
+            const size_t n = sv.run->rows.size();
+            sv.fast_keys.resize(n);
+            for (size_t p = 0; p < n; ++p) {
+                sv.fast_keys[p] = keys[sv.run->rows[p]].key_index;
             }
         }
 
@@ -1972,6 +2000,38 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
                     size_t li = 1;
                     size_t si = 0;
                     for (const auto & sv : segs) {
+                        if (!sv.fast_keys.empty()) {
+                            // Contiguous identity segment: dev is constant, so
+                            // the ==best recheck hoists out and the entry
+                            // emission is one sequential read over fast_keys
+                            // (replacing the dp_at -> d2t -> rows -> keys
+                            // chain of dependent random reads).
+                            const int64_t v =
+                                qv + sv.run->dev[0] - int64_t(vis_before[li]);
+                            if (v == best) {
+                                size_t p = merge_pos[li];
+                                if (sv.own) {
+                                    // Causal cut in tagged order == d-order here
+                                    // (identity permutation), so the cut is a
+                                    // simple prefix bound.
+                                    while (p < dp_size(sv) && p < seg_cut[si]) {
+                                        layout.entries.push_back({ sv.fast_keys[p], group_index });
+                                        ++p;
+                                        emitted = true;
+                                    }
+                                } else {
+                                    while (p < dp_size(sv)) {
+                                        layout.entries.push_back({ sv.fast_keys[p], group_index });
+                                        ++p;
+                                        emitted = true;
+                                    }
+                                }
+                                merge_pos[li] = uint32_t(p);
+                            }
+                            ++li;
+                            ++si;
+                            continue;
+                        }
                         while (merge_pos[li] < dp_size(sv) &&
                                (!sv.own || sv.run->d2t[dp_at(sv, merge_pos[li])] < seg_cut[si]) &&
                                qv + sv.run->dev[dp_at(sv, merge_pos[li])] - int64_t(vis_before[li]) == best) {
