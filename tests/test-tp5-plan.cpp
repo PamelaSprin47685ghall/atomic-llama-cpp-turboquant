@@ -1169,9 +1169,37 @@ static void test_tp5_latebind_protocol_invariants() {
         // Invariant 6: Exact fallback path consistency
         // In exact mode (!fast), control is in host-imported RAM status[6], and payload broadcast is at B + 64 + L
         TEST_ASSERT(payload_offset(L, false) == 64 + L);
+
+        // Invariant 7: Workspace capacity bounds check covers control block + payload in both exact and fast modes
+        // In exact mode (!fast), wire is F32, payload starts at B + 64 + L, so end is 64 + L + wire_bytes.
+        // In fast mode (fast), wire is F16, payload starts at B + 128 + L (after 64B control), so end is 128 + L + wire_bytes.
+        // Old check used (L + wire_bytes + 64) which under-counted by 64B in fast mode.
+        const size_t late_counts[] = { 1024, 2048, 2560 };
+        for (size_t late_count : late_counts) {
+            const size_t exact_wire_bytes = late_count * sizeof(float);
+            const size_t fast_wire_bytes  = late_count * sizeof(uint16_t); // ggml_fp16_t wire
+
+            const size_t exact_payload_end = payload_offset(L, false) + exact_wire_bytes;
+            const size_t fast_payload_end  = payload_offset(L, true)  + fast_wire_bytes;
+
+            const size_t old_exact_check = L + exact_wire_bytes + 64;
+            const size_t old_fast_check  = L + fast_wire_bytes  + 64;
+
+            // In exact mode, old check happened to match single-source payload end
+            TEST_ASSERT(exact_payload_end == old_exact_check);
+
+            // In fast mode, old check under-counted by exactly TP5_LATE_Q_CONTROL_BYTES (64B)
+            TEST_ASSERT(fast_payload_end > old_fast_check);
+            TEST_ASSERT(fast_payload_end - old_fast_check == TP5_LATE_Q_CONTROL_BYTES);
+
+            // A stride between old check and new check must fail the single-source bounds check
+            const size_t borderline_stride = old_fast_check + 32; // > old check, but < real payload end
+            TEST_ASSERT(old_fast_check <= borderline_stride);
+            TEST_ASSERT(fast_payload_end > borderline_stride); // correctly identified as exceeding workspace
+        }
     }
 
-    // Invariant 7: Definition-time WAR contract verification for Exact F32 and Aggressive Q8
+    // Invariant 8: Definition-time WAR contract verification for Exact F32 and Aggressive Q8
     // Validates against production tp5_latebind_semantic_step & tp5_validate_latebind_war_schedule.
     std::string war_err;
 

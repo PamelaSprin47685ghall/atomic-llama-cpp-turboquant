@@ -4671,7 +4671,9 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
     if (relay && late_count != 0) {
         const size_t late_wire_bytes =
             late_count * (late_sidecar_f16 ? sizeof(ggml_fp16_t) : sizeof(float));
-        if (late_count > c.late_max_floats || c.late_host_offset + late_wire_bytes + 64 > c.star_rank_stride) {
+        const size_t late_payload_end =
+            tp5_late_q_bcast_payload_offset(c.late_host_offset, late_sidecar_f16) + late_wire_bytes;
+        if (late_count > c.late_max_floats || late_payload_end > c.star_rank_stride) {
             c.fail("RELAY LateBind sidecar exceeds workspace");
             return false;
         }
