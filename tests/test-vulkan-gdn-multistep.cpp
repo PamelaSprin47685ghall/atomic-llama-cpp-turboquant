@@ -8,7 +8,7 @@
 //    canonical CPU reference operator on active rows [0, active).
 // 2. State tail isolation: verifies that changing inactive token inputs [active, capacity)
 //    produces bit-identical final recurrent states on GPU.
-// 3. Step coverage: evaluates active steps A in {1, 2, 4} with capacity C = 4.
+// 3. Step coverage: evaluates active steps A in {1, 2, 4} with capacity C = 4, and A in {1, 2, 4, 8} with C = 8.
 // 4. Graceful skip: exits cleanly when Vulkan backend or device 0 is unavailable.
 
 #include "ggml.h"
@@ -420,13 +420,28 @@ int main() {
         return 1;
     }
 
-    const int64_t capacity = 4;
+    struct test_case {
+        int64_t capacity;
+        int64_t active;
+    };
 
-    // Test cases: A in {1, 2, 4} with C = 4
-    for (int64_t active : {1, 2, 4}) {
-        if (!test_gdn_multistep_step(fix, capacity, active)) {
+    // Test matrix:
+    // 1. C = 4 baseline suite: A in {1, 2, 4} (100% status quo preserved)
+    // 2. C = 8 maximum capacity envelope suite: A in {1, 2, 4, 8}
+    const std::vector<test_case> cases = {
+        {4, 1},
+        {4, 2},
+        {4, 4},
+        {8, 1},
+        {8, 2},
+        {8, 4},
+        {8, 8},
+    };
+
+    for (const auto & tc : cases) {
+        if (!test_gdn_multistep_step(fix, tc.capacity, tc.active)) {
             std::fprintf(stderr, "FAILED on active=%lld, capacity=%lld\n",
-                         (long long)active, (long long)capacity);
+                         (long long)tc.active, (long long)tc.capacity);
             return 1;
         }
     }
