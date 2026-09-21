@@ -37,6 +37,9 @@ void ggml_tp5_profile::reset(uint64_t new_id, bool decode) {
     relay_sidecar_data_us = 0;
     relay_y_publish_us = 0;
     relay_q_publish_us = 0;
+    relay_q_spin_iters = 0;
+    relay_q_spin_samples = 0;
+    relay_q_spin_max = 0;
     relay_generation_us = 0;
     relay_handoff_total_us = 0;
     relay_poll_iters = 0;
@@ -87,9 +90,12 @@ void ggml_tp5_profile::print_summary() const {
         fprintf(stderr,
                 "[tp5-latebind-profile] exec=%" PRIu64 " sidecar_wait_us=%" PRIu64
                 " sidecar_data_us=%" PRIu64 " y_publish_us=%" PRIu64 " q_publish_us=%" PRIu64
+                " q_spin_avg=%.1f q_spin_max=%" PRIu64 " q_spin_n=%" PRIu64
                 " cpu_data_excludes_wait=1\n",
                 graph_exec_id, relay_sidecar_wait_us.load(), relay_sidecar_data_us.load(),
-                relay_y_publish_us.load(), relay_q_publish_us.load());
+                relay_y_publish_us.load(), relay_q_publish_us.load(),
+                relay_q_spin_samples.load() ? double(relay_q_spin_iters.load()) / double(relay_q_spin_samples.load()) : -1.0,
+                relay_q_spin_max.load(), relay_q_spin_samples.load());
     }
 }
 

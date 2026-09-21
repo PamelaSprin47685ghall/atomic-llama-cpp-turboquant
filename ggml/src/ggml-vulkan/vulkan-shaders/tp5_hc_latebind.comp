@@ -7,6 +7,10 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
+#if defined(TP5_LATE_INJECT) || defined(TP5_LATE_Q)
+#include "tp5_hc_subgroup.glsl"
+#endif
+
 // Exact LateBind-TP for Qwen4EXP HC.
 //
 // INJECT: compute the four exact scatter weights from the already-known HC
@@ -72,7 +76,7 @@ void main() {
         rowtmp       = fma(b0.x, v0.x, rowtmp);
         acc           = fma(rowtmp, float(w[ib].d), acc);
     }
-    acc = subgroupAdd(acc);
+    acc = tp5_hc_sum32(acc);
     if (lane == 0u) {
         // Match build_hc_combine / the existing fused HC path exactly for
         // the production 4-stream model: MUL by 0.25, then the explicit +0.
@@ -168,7 +172,7 @@ void main() {
     }
 
     [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
-        acc[stream] = subgroupAdd(acc[stream]);
+        acc[stream] = tp5_hc_sum32(acc[stream]);
         if (lane == 0u) {
             q_out[stream * p.rank_dim + row] = acc[stream];
         }

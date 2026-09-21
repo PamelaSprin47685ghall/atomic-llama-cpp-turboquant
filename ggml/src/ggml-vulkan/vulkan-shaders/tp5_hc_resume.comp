@@ -141,8 +141,11 @@ void finalize_stream(const uint iterations) {
     }
 }
 void main() {
-    if (p.streams != 4u || gl_WorkGroupID.x >= p.streams || p.width == 0u || p.width > 4096u)
-        return; // rejected by the host recipe before recording
+    if (p.streams != 4u || gl_WorkGroupID.x >= p.streams || p.width == 0u || p.width > 4096u) {
+        if (gl_LocalInvocationID.x == 0u)
+            atomicCompSwap(status[p.status_word_offset + 2u], 0u, 0xffffffffu);
+        return; // also rejected by the host recipe before recording
+    }
     const uint blocks = (p.width + 511u) / 512u;
     if (blocks > 4u) finalize_stream(8u);
     else if (blocks == 4u) finalize_stream(4u);
@@ -155,6 +158,10 @@ void main() {
 #ifdef TP5_RESUME_LO
 void main() {
     const uint lane = gl_LocalInvocationID.x;
+    if (p.streams != 4u || p.rank_dim == 0u || p.rank_dim > 512u) {
+        if (lane == 0u) atomicCompSwap(status[p.status_word_offset + 2u], 0u, 0xffffffffu);
+        return;
+    }
     const vec4 scale = vec4(inverse_rho[0], inverse_rho[1], inverse_rho[2], inverse_rho[3]);
     if (!await_input()) {
         for (uint row = lane; row < p.rank_dim; row += 64u)

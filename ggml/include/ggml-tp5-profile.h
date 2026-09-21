@@ -44,6 +44,9 @@ struct ggml_tp5_profile {
     std::atomic<uint64_t> relay_sidecar_data_us{0};
     std::atomic<uint64_t> relay_y_publish_us{0};
     std::atomic<uint64_t> relay_q_publish_us{0};
+    std::atomic<uint64_t> relay_q_spin_iters{0};
+    std::atomic<uint64_t> relay_q_spin_samples{0};
+    std::atomic<uint64_t> relay_q_spin_max{0};
     std::atomic<uint64_t> relay_generation_us{0};
     std::atomic<uint64_t> relay_handoff_total_us{0};
     std::atomic<uint64_t> relay_poll_iters{0};

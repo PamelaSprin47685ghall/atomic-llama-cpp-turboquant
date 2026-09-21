@@ -7,6 +7,7 @@
 #include <vulkan/vulkan_core.h>
 #include <algorithm>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <string>
 #include <vector>
@@ -19,6 +20,7 @@ struct vk_tp5_command_tape {
     };
     std::vector<instruction> code;
     std::vector<VkCommandBuffer> sources;
+    std::vector<vk_buffer> buffer_owners;
     bool valid = true;
     std::string rejection;
 
@@ -46,6 +48,7 @@ struct vk_tp5_graph_program {
     VkDevice device = VK_NULL_HANDLE;
     std::vector<VkDescriptorPool> descriptor_pools;
     std::vector<vk_buffer> buffers;
+    std::vector<std::shared_ptr<void>> pipeline_owners;
     vk_tp5_hc_binding normalized;
     size_t hc_norm_end = 0;
     size_t hc_down_end = 0;
@@ -62,6 +65,13 @@ struct vk_tp5_graph_program {
 inline vk_tp5_command_tape *& vk_tp5_active_tape() {
     static thread_local vk_tp5_command_tape * current = nullptr;
     return current;
+}
+inline void vk_tp5_pin_buffer(const vk_buffer & buffer) {
+    if (auto * tape = vk_tp5_active_tape()) {
+        if (buffer && std::find(tape->buffer_owners.begin(), tape->buffer_owners.end(), buffer) ==
+                          tape->buffer_owners.end())
+            tape->buffer_owners.push_back(buffer);
+    }
 }
 struct vk_tp5_capture_scope {
     vk_tp5_command_tape * previous = vk_tp5_active_tape();

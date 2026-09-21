@@ -1405,6 +1405,9 @@ struct vk_subbuffer {
     operator vk::DescriptorBufferInfo() const {
         // A null buffer (unused binding slot) must convert to a harmless
         // descriptor instead of dereferencing the null shared_ptr.
+        // Definition IR must also pin scratch/converted-weight allocations
+        // that are not reachable through the original ggml tensor graph.
+        vk_tp5_pin_buffer(buffer);
         return { buffer ? buffer->buffer : vk::Buffer{}, offset, size };
     }
 };
@@ -3419,7 +3422,7 @@ static void ggml_vk_cache_invalidate_all(ggml_backend_vk_context * ctx) {
     ctx->wire_outputs.clear();
     ctx->hc_consumers.clear();
     ctx->tp5_programs.clear();
-    if (ctx->tp5_recording_program)
+    if (ctx->replay_recording && ctx->tp5_recording_program)
         ctx->tp5_recording_program->commands.reject("source graph invalidated during definition");
     if (ctx->replay_cmd_pool_init) {
         ctx->device->device.resetCommandPool(ctx->replay_cmd_pool.pool);
@@ -10047,6 +10050,8 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     }
     ggml_vk_write_descriptor_set(ctx, descriptor_set, descriptor_buffer_infos);
 
+    if (ctx->tp5_recording_program && vk_tp5_active_tape() == &ctx->tp5_recording_program->commands)
+        ctx->tp5_recording_program->pipeline_owners.push_back(pipeline);
     vk_tp5_hpp_commands(subctx->s->buffer->buf).pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, push_constant_size(push_constants), push_constant_data(push_constants));
     vk_tp5_hpp_commands(subctx->s->buffer->buf).bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
     vk_tp5_hpp_commands(subctx->s->buffer->buf).bindDescriptorSets(vk::PipelineBindPoint::eCompute,
@@ -10092,6 +10097,8 @@ static void ggml_vk_dispatch_pipeline_indirect(
     }
     ggml_vk_write_descriptor_set(ctx, descriptor_set, descriptor_buffer_infos);
 
+    if (ctx->tp5_recording_program && vk_tp5_active_tape() == &ctx->tp5_recording_program->commands)
+        ctx->tp5_recording_program->pipeline_owners.push_back(pipeline);
     vk::BufferMemoryBarrier before_update;
     before_update.setSrcAccessMask(vk::AccessFlagBits::eIndirectCommandRead)
                  .setDstAccessMask(vk::AccessFlagBits::eTransferWrite)
@@ -23776,6 +23783,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->replay_recording = false;
     }
 
+    definition_scope.activate(nullptr);
+    ctx->tp5_recording_program.reset();
     ggml_vk_publish_wire_output(ctx, terminal, ctx->wire_recorded,
                                 ctx->wire_relay_recorded, ctx->wire_relay_stage, ctx->wire_relay_f32);
     return GGML_STATUS_SUCCESS;

@@ -926,6 +926,12 @@ struct tp5_comm {
             }
         }
         }
+        if ((linear_program || !retired_linear_programs.empty()) && !tp5_drain_submitted(*this)) {
+            fail("linear definition drain failed before plan eviction");
+            return;
+        }
+        linear_program.reset();
+        retired_linear_programs.clear();
         destroy_plan(cached_plans[lru_idx]);
         cached_plans.erase(cached_plans.begin() + lru_idx);
     }
@@ -3730,6 +3736,7 @@ struct tp5_star_times {
     uint32_t retired_epoch = 0;
     std::array<double, 8> rank_ready_us{};
     std::array<uint32_t, 8> retired_spin{};
+    std::array<uint32_t, 8> retired_q_spin{};
 };
 
 static void tp5_profile_atomic_max(std::atomic<uint64_t> & dst, uint64_t value) {
@@ -3876,6 +3883,9 @@ static bool tp5_late_stage(const tp5_plan_key & key, size_t n_ranks) {
 static bool tp5_relay_publish_generation(tp5_comm & c, size_t bank, uint32_t word) {
     // word 0 is Y, word 2 is Q. Both are data readiness, never CPU queue
     // scheduling. Preserve the established payload -> fence -> epoch order.
+    if (c.n_ranks != 5 || bank >= TP5_MAILBOX_BANKS || (word != 0 && word != 2)) {
+        c.fail("invalid RELAY publication route"); return false;
+    }
     uint32_t epochs[8] = {};
     for (size_t i = 0; i < c.n_ranks; ++i) {
         const auto * status = (const volatile uint32_t *) ((const char *) c.star_host_aligned[bank] +
@@ -3885,6 +3895,9 @@ static bool tp5_relay_publish_generation(tp5_comm & c, size_t bank, uint32_t wor
             return false;
         }
         epochs[i] = status[1];
+        if (i && epochs[i] != epochs[0]) {
+            c.fail("RELAY publication epochs disagree across ranks"); return false;
+        }
     }
 #if defined(__x86_64__) || defined(_M_X64)
     _mm_sfence();
@@ -4001,6 +4014,7 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
             const auto * status = (const volatile uint32_t *) ((const char *) c.star_host_aligned[retired_bank] +
                 i * c.star_rank_stride + c.star_rank_stride - 64);
             times->retired_spin[i] = status[5];
+            times->retired_q_spin[i] = status[7];
         }
     }
     const auto arm_start = times ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -4019,6 +4033,7 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
             auto * header = (volatile uint32_t *) c.ranks[i].bcast_host[bank];
             header[0] = 0; // generation doorbell; CPU publishes it last
             header[1] = 0; // fused multi-workgroup completion counter
+            if (late_count) header[2] = 0; // independent Q generation
         }
     }
     // RELAY decode payloads fit in L1/L2. Fan the reduction directly into the
@@ -4114,7 +4129,9 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
                              times->sidecar_data_us;
     }
 #if defined(__x86_64__) || defined(_M_X64)
-    _mm_sfence(); // Order posted BAR payload stores before publishing the generation.
+    // LateBind already ordered each independent publication in its helper.
+    if (!(relay && late_count))
+        _mm_sfence(); // Order ordinary BAR payload stores before generation.
 #endif
     if (relay && late_count == 0) {
         // bcast_mem is always HOST_COHERENT + DEVICE_COHERENT_AMD (cached
@@ -4184,7 +4201,15 @@ static vk_tp5_relay_payload_binding tp5_relay_payload_binding(const tp5_comm & c
 // no CB-index skip convention, and no IR traversal on a warm token.
 static bool tp5_define_linear_chain(tp5_comm & c,
         const std::vector<std::vector<std::vector<void *>>> & source_cbs,
-        size_t n_stages, bool capture) {
+        size_t n_stages, bool capture) try {
+    // Bound definition churn (for example CHAIN_CACHE=0 or changing shapes).
+    // The ordinary warm 48/96-stage program never enters this path.
+    if (c.retired_linear_programs.size() >= 8) {
+        if (!tp5_drain_submitted(c)) {
+            c.fail("LateBind definition retirement could not drain submitted work"); return false;
+        }
+        c.retired_linear_programs.clear();
+    }
     auto linear = std::make_shared<tp5_linear_program>();
     linear->devices.resize(c.n_ranks, VK_NULL_HANDLE);
     linear->pools.resize(c.n_ranks, VK_NULL_HANDLE);
@@ -4325,6 +4350,12 @@ static bool tp5_define_linear_chain(tp5_comm & c,
     for (size_t r = 0; r < c.n_ranks; ++r)
         c.chain_scratch[r].compute.assign(1, c.linear_program->commands[r]);
     return true;
+} catch (const std::exception & error) {
+    c.fail(std::string("LateBind definition failed before submission: ") + error.what());
+    return false;
+} catch (...) {
+    c.fail("LateBind definition failed before submission");
+    return false;
 }
 
 static bool tp5_relay_submit_epoch_chain(
@@ -4398,6 +4429,21 @@ static bool tp5_relay_submit_epoch_chain(
     const auto route_end = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     const uint64_t final_signal = 2 * last_epoch;
+    // Allocate diagnostic storage before the first rank is submitted; an
+    // allocation failure must never strand an already queued GPU waiter.
+    std::vector<tp5_star_times> stage_times;
+    std::vector<std::array<uint32_t, 8>> stage_spins, stage_q_spins;
+    if (prof) {
+        try {
+            stage_times.resize(n_stages);
+            stage_spins.resize(n_stages);
+            stage_q_spins.resize(n_stages);
+            for (auto & spins : stage_spins) spins.fill(UINT32_MAX);
+            for (auto & spins : stage_q_spins) spins.fill(UINT32_MAX);
+        } catch (...) {
+            c.fail("RELAY profile allocation failed before submission"); return false;
+        }
+    }
     bool submitted_any = false;
     double submit_wall_us = 0.0;
     for (size_t i = 0; i < c.n_ranks; ++i) {
@@ -4438,15 +4484,6 @@ static bool tp5_relay_submit_epoch_chain(
         submitted_any = true;
     }
 
-    std::vector<tp5_star_times> stage_times;
-    std::vector<std::array<uint32_t, 8>> stage_spins;
-    if (prof) {
-        stage_times.resize(n_stages);
-        stage_spins.resize(n_stages);
-        for (auto & spins : stage_spins)
-            spins.fill(UINT32_MAX);
-    }
-
     for (size_t s = 0; s < n_stages; ++s) {
         const uint64_t epoch = first_epoch + s;
         // e+1 reuses bank(e-1). A direct producer's route-ready (or legacy
@@ -4466,8 +4503,10 @@ static bool tp5_relay_submit_epoch_chain(
         }
         if (prof && step->retired_epoch >= first_epoch && step->retired_epoch <= last_epoch) {
             const size_t retired_stage = (size_t) (step->retired_epoch - first_epoch);
-            if (retired_stage < stage_spins.size())
+            if (retired_stage < stage_spins.size()) {
                 stage_spins[retired_stage] = step->retired_spin;
+                stage_q_spins[retired_stage] = step->retired_q_spin;
+            }
         }
     }
 
@@ -4480,8 +4519,10 @@ static bool tp5_relay_submit_epoch_chain(
         for (size_t i = 0; i < c.n_ranks; ++i) {
             const auto * status = (const volatile uint32_t *) ((const char *) c.star_host_aligned[bank] +
                 i * c.star_rank_stride + c.star_rank_stride - 64);
-            if (status[3] == (uint32_t) last_epoch)
+            if (status[3] == (uint32_t) last_epoch) {
                 stage_spins[last_stage][i] = status[5];
+                stage_q_spins[last_stage][i] = status[7];
+            }
         }
     }
 
@@ -4531,6 +4572,17 @@ static bool tp5_relay_submit_epoch_chain(
             prof->relay_gpu_spin_iters += spin_sum;
             prof->relay_gpu_spin_samples += spin_n;
             tp5_profile_atomic_max(prof->relay_gpu_spin_max, spin_max);
+            uint64_t q_sum = 0, q_max = 0, q_n = 0;
+            if (tp5_late_stage(keys[s], c.n_ranks)) {
+                for (size_t i = 0; i < c.n_ranks; ++i) {
+                    const uint32_t spins = stage_q_spins[s][i];
+                    if (spins == UINT32_MAX) continue;
+                    q_sum += spins; q_max = std::max<uint64_t>(q_max, spins); ++q_n;
+                }
+                prof->relay_q_spin_iters += q_sum;
+                prof->relay_q_spin_samples += q_n;
+                tp5_profile_atomic_max(prof->relay_q_spin_max, q_max);
+            }
 
             if (relay_stage_detail) {
                 fprintf(stderr,
@@ -4553,9 +4605,12 @@ static bool tp5_relay_submit_epoch_chain(
                 }
                 fputc('\n', stderr);
                 fprintf(stderr, "[tp5-latebind-stage] exec=%llu stage=%zu sidecar_wait_us=%.3f "
-                                "sidecar_data_us=%.3f y_publish_us=%.3f q_publish_us=%.3f\n",
+                                "sidecar_data_us=%.3f y_publish_us=%.3f q_publish_us=%.3f "
+                                "q_spin_avg=%.1f q_spin_max=%llu q_spin_n=%llu\n",
                         (unsigned long long) prof->graph_exec_id, s, step.sidecar_wait_us,
-                        step.sidecar_data_us, step.y_publish_us, step.q_publish_us);
+                        step.sidecar_data_us, step.y_publish_us, step.q_publish_us,
+                        q_n ? double(q_sum) / double(q_n) : -1.0,
+                        (unsigned long long) q_max, (unsigned long long) q_n);
             }
         }
     }
