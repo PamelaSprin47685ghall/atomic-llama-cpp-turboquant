@@ -2539,8 +2539,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // reserved, which releases what the finished phase was holding (graph_reserve does the
     // invalidation and the release in that order). Without it the larger phase's buffers stay
     // allocated for the whole session.
+    //
+    // Predefined MTP exemption: Predefined MTP sessions share a single unified execution definition
+    // (capacity_rows = capacity->verify_tokens) across both 1-token draft and multi-token catch-up.
+    // Categorizing multi-token catch-up as phase 1 (prompt processing) broke graph reuse by
+    // triggering reset() and sched buffer release. Predefined MTP stays in phase 0.
     {
-        const int phase = ubatch.n_tokens > ubatch.n_seqs ? 1 : 0;   // 1 = prompt processing
+        const int phase = ubatch_execution_phase(
+                gtype,
+                predefined_capacity() != nullptr,
+                predefined_capacity_rows_current,
+                ubatch.n_tokens,
+                ubatch.n_seqs);
         if (phase != last_graph_phase) {
             if (last_graph_phase >= 0) {
                 // Invalidate the previous graph result first: its tensors (the cached inputs of

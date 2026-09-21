@@ -290,3 +290,104 @@ producer-completion 规则约束，不允许在消费者仍读取时改 slot。
 已登记但未编译/执行 `test-tp5-row-program`：固定定义的长度反复变化、四列尾块、
 descriptor 容量拒绝、工作组上限、整数溢出、bank 末尾 status 隔离、ADD 尾块保护。
 这些是纯 CPU 规则用例，不代替两种 wire、两种 Q5_K 算术与真实 MTP 的数值验收。
+
+## 10. 执行定义身份与旧 phase 失效边界（Execution Definition Identity vs Legacy Phase Boundary）
+
+### 10.1 背景与根因
+
+在 `src/llama-context.cpp` 的 `process_ubatch()` 中，存在历史阶段切换管理：
+
+```cpp
+const int phase = ubatch.n_tokens > ubatch.n_seqs ? 1 : 0; // 1 = prompt processing
+if (phase != last_graph_phase) {
+    if (last_graph_phase >= 0) {
+        gf_res_prev->reset();
+        ggml_backend_sched_release_buffers(sched.get());
+    }
+    last_graph_phase = phase;
+}
+```
+
+**该逻辑在 Target 主干模型上的必要性：**
+1. **显存安全**：Prompt prefill 与 token generation 在常规推理中互斥；prefill 分配的大张量若不释放，会常驻锁定显存造成 OOM；
+2. **张量视图边界断言（View Bound Assert）**：上一阶段缓存的输入张量指针指向即将回收/变动的缓冲区，若不通过 `gf_res_prev->reset()` 清空，后续构图与视图重叠会触发底层断言崩溃；
+3. **48 层 Target 主干未全量容量化**：Target 模型尚未完全切入统一固定容量模式，仍须依赖显式的 Prefill/Decode 边界隔离。
+
+### 10.2 冲突：旧 phase 逻辑对预定义 MTP 的破坏
+
+在单序列 MTP 投机解码中，上下文在 Draft 阶段与 Catch-up 阶段反复切换：
+- **Draft 步**：每次采样 1 行（`n_tokens = 1, n_seqs = 1`）$	o$ `phase = 0`；
+- **Catch-up 步**：提交验证接受的多行（如接受 3 个 candidate + 1 个 sampled，`n_tokens = 4, n_seqs = 1`）$	o$ `phase = 1`。
+
+在典型的 1 $	o$ 4 $	o$ 1 $	o$ 2 序列中，旧逻辑会触发 3 次 phase 翻转（0 $	o$ 1 $	o$ 0 $	o$ 1）：
+1. 每次翻转强制执行 `gf_res_prev->reset()` 和 `ggml_backend_sched_release_buffers(sched.get())`；
+2. `sched->is_alloc = false` 导致后续 `can_reuse` 判定必然失败；
+3. 即使 `src/llama-graph.h` 中已预留 `predefined_mtp_dynamic` 豁免逻辑（允许 MTP 在 `n_tokens` 变化时命中同一图），也会被提前强行截断，迫使每步重新调用 `model.build_graph()`、分配全新 `definition_uid` 并重录 GPU 命令。
+
+### 10.3 解决方案：以“执行定义身份”为依据的豁免
+
+预定义 MTP 在 `prepare_predefined_mtp()` 初始化时，Target 与 MTP 已共享固定最大容量池（`retain_capacity = true`、`capacity_sealed = true`），且在 `process_ubatch()` 中已为 Draft 和 Catch-up 统一设定了固定执行容量：
+`predefined_capacity_rows_current = capacity->verify_tokens`。
+
+因此，**MTP 的 Draft 与 Catch-up 在物理上属于完全相同的“执行定义身份（Execution Definition Identity）”**，并非 Prompt Prefill 与 Token Generation 之间的互斥生命周期交替。
+
+在 `llama_context::ubatch_execution_phase()` 中引入执行定义身份判定：
+- **判定条件**：
+  `gtype == LLM_GRAPH_TYPE_DECODER_MTP && has_predefined_capacity && predefined_capacity_rows > 0`
+- **行为**：满足该条件的预定义 MTP 恒定归入统一阶段 `phase = 0`，不以 `n_tokens > n_seqs` 作为判断依据。
+- **效果**：
+  1. 1 $	o$ 4 $	o$ 1 $	o$ 2 序列保持恒定 `phase = 0`，零次 reset，零次 sched buffer release；
+  2. `sched->is_alloc` 保持为 `true`，`can_reuse` 顺利命中 `predefined_mtp_dynamic`，实现预定义图与 GPU 命令缓冲区的常驻复用；
+  3. Target 主干模型、常规 prefill/decode 以及未开启预定义的普通 MTP 严格保留原有的 phase 判定与缓冲区释放逻辑，不变量完整守住；
+  4. 判定开销为常数级逻辑判断，零逐 token 开销。
+
+## 11. MTP 完整 Cycle 计时账本（Full-Cycle Timing Ledger）
+
+### 11.1 设计背景与目标
+
+在投机解码中，单图 MTP 的收益不仅取决于 Draft 步的生成速度（tok/s），更取决于**完整 cycle 的闭合时间账**：
+若仅优化 Draft，而忽视 Catch-up 重放或 Target 验证交接，可能会出现“Draft 很快但总延迟变慢”的负收益。
+
+为在单序列与多序列 Qwen4EXP TP5 真机运行中精确测量真实效益，在 `common/speculative` 层接入了无开销、结构化的 **Cycle 计时账本**。
+
+### 11.2 四大阶段与产出度量
+
+每个投机解码 Cycle 包含四个互斥阶段及 token 产出度量：
+
+| 字段 | 含义 | 测量位置 |
+| --- | --- | --- |
+| `draft_us` | MTP 生成候选 Token 阶段的真实微秒耗时 | `common_speculative_impl_draft_mtp::draft()` |
+| `target_us` | Target 主干模型验证批次并采样的微秒耗时 | `common_speculative_record_target_verify_us()`（在 `tools/server/server-context.cpp` 中覆盖从 `llama_decode(ctx_tgt, batch_view)` 到 `common_sampler_sample_and_accept_n()` 完成的全过程，并在 `common_speculative_commit()` 前注入） |
+| `catchup_us` | MTP 接收 Target 验证结果后执行 Catch-up 重放的状态同步耗时 | `common_speculative_impl_draft_mtp::commit()` |
+| `handoff_us` | Target Hidden 状态向 MTP Workspace 交接的耗时（设备内直接拷贝或主机内存搬运） | `common_speculative_impl_draft_mtp::process_impl()` |
+| `total_us` | 单 Cycle 总耗时（`draft_us + target_us + catchup_us + handoff_us`） | `commit()` 结算处自动累加 |
+| `draft_tokens` | 该 Cycle 中 MTP 生成并提交给 Target 验证的候选 Token 数 | `draft()` 结果统计 |
+| `accepted_tokens` | Target 模型验证并通过的候选 Token 数 | `accept()` 累加 |
+| `final_tokens` | 该 Cycle 最终有效产生的新 Token 数（固定等于 `1 + accepted_tokens`） | 结算时计算 |
+| `eff` | 草稿接受效率（`accepted_tokens / draft_tokens`） | 纯函数格式化计算 |
+| `dev_hidden` | 是否命中设备侧零 CPU 拷贝交接（`1` = Device Hidden, `0` = Host Memcpy） | 运行时状态标志 |
+
+### 11.3 启用方式与输出风格
+
+- **环境变量开关**：
+  复用既有系统剖析开关：
+  ```bash
+  export GGML_TP5_PROFILE=1
+  # 或单独开启 MTP 周期账本：
+  export GGML_TP5_MTP_PROFILE=1
+  ```
+  未设置上述环境变量时，系统在热路径仅做单次空指针/环境检查，时钟采集与累加逻辑完全跳过，实现零开销。
+
+- **结构化输出示例**：
+  每 Cycle 完成后在 `stderr` 输出单行结构化日志：
+  ```text
+  [tp5-mtp-cycle] cycle=1 draft_us=1240 target_us=3120 catchup_us=480 handoff_us=35 total_us=4875 draft_tokens=3 accepted_tokens=2 final_tokens=3 eff=0.667 dev_hidden=1
+  [tp5-mtp-cycle] cycle=2 draft_us=1180 target_us=2980 catchup_us=210 handoff_us=32 total_us=4402 draft_tokens=3 accepted_tokens=1 final_tokens=2 eff=0.333 dev_hidden=1
+  ```
+
+- **会话结束汇总**：
+  在 `common_speculative_print_stats()` 中统一输出全局均值汇总行：
+  ```text
+  [tp5-mtp-cycle-summary] cycles=2 avg_draft_us=1210.0 avg_target_us=3050.0 avg_catchup_us=345.0 avg_handoff_us=33.5 avg_total_us=4638.5 draft_tokens=6 accepted_tokens=3 final_tokens=5 eff=0.500
+  ```
+  便于自动化脚本提取平均每 token 耗时以及 MTP 的加速收益比。

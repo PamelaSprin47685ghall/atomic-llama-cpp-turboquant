@@ -1404,6 +1404,7 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+    int64_t t_tgt_verify_start = 0;
 
     bool add_bos_token = true;
 
@@ -9231,6 +9232,9 @@ private:
         // (OFF) keep the ordinary dense route. MTP draft/target verification
         // and speculative replay rows are dense by role, so they ride the same
         // call without a global disable and with the active-lane pause intact.
+        const bool mtp_prof_active = spec && (std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr);
+        t_tgt_verify_start = mtp_prof_active ? ggml_time_us() : 0;
+
         const int ret = batch.fp_rows.empty()
             ? llama_decode(ctx_tgt, batch_view)
             : llama_decode_with_flashprefill(ctx_tgt, batch_view, &fp_exec);
@@ -9856,6 +9860,13 @@ private:
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
+
+        const bool mtp_prof_active = spec && (std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr);
+        if (mtp_prof_active && t_tgt_verify_start > 0) {
+            const int64_t t_tgt_verify_us = ggml_time_us() - t_tgt_verify_start;
+            common_speculative_record_target_verify_us(spec.get(), t_tgt_verify_us);
+            t_tgt_verify_start = 0;
+        }
 
         if (!common_speculative_commit(spec.get())) {
             throw std::runtime_error("failed to commit deferred speculative state");

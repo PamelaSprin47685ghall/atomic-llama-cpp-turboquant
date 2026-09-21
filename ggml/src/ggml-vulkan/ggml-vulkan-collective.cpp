@@ -62,7 +62,123 @@ enum class tp5_sync_mode { HOST, SYNCFD, TIMELINE, GPUFLAG, DRM, STAR, RELAY };
 
 static constexpr size_t TP5_MAILBOX_BANKS = 2;
 static constexpr size_t TP5_LATE_MAX_FLOATS = 2048; // 4 streams * rank <= 512
+enum class tp5_numerical_mode {
+    REFERENCE,      // 参考模式：常规无 LateBind 路径，完全遵循原图/标准 AllReduce 数值
+    EXACT_F32,      // F32 LateBind 模式：启用 LateBind 解耦，但 Q 充分统计量保持 FP32 精确路径
+    AGGRESSIVE_Q8   // Aggressive 模式：启用 LateBind + Q8 激活量化 + Q8xQ8 整数点积 + FP16 sidecar
+};
+
+enum class tp5_numerical_reason {
+    NONE,
+    DISABLED_BY_ENV,
+    NON_RELAY_SYNC,
+    NON_F32_WIRE,
+    NO_LATE_TENSORS,
+    EXACT_Q_REQUESTED,
+    MISSING_HARDWARE_INT_DOT,
+    UNSUPPORTED_WAVE32,
+    UNALIGNED_LATE_SHAPE,
+    PIPELINE_UNAVAILABLE
+};
+
+static inline const char * tp5_numerical_mode_name(tp5_numerical_mode mode) {
+    switch (mode) {
+        case tp5_numerical_mode::REFERENCE:     return "reference";
+        case tp5_numerical_mode::EXACT_F32:     return "exact-f32";
+        case tp5_numerical_mode::AGGRESSIVE_Q8: return "aggressive-q8";
+        default:                                return "unknown";
+    }
+}
+
+static inline const char * tp5_numerical_reason_name(tp5_numerical_reason reason) {
+    switch (reason) {
+        case tp5_numerical_reason::NONE:                     return "none";
+        case tp5_numerical_reason::DISABLED_BY_ENV:          return "disabled-by-env";
+        case tp5_numerical_reason::NON_RELAY_SYNC:           return "non-relay-sync";
+        case tp5_numerical_reason::NON_F32_WIRE:             return "non-f32-wire";
+        case tp5_numerical_reason::NO_LATE_TENSORS:          return "no-late-tensors";
+        case tp5_numerical_reason::EXACT_Q_REQUESTED:        return "exact-q-requested";
+        case tp5_numerical_reason::MISSING_HARDWARE_INT_DOT: return "missing-hardware-int-dot";
+        case tp5_numerical_reason::UNSUPPORTED_WAVE32:       return "unsupported-wave32";
+        case tp5_numerical_reason::UNALIGNED_LATE_SHAPE:     return "unaligned-late-shape";
+        case tp5_numerical_reason::PIPELINE_UNAVAILABLE:     return "pipeline-unavailable";
+        default:                                             return "unknown";
+    }
+}
+
+struct tp5_numerical_spec {
+    bool latebind_env_enabled = false;
+    bool is_relay_sync        = false;
+    bool is_f32_wire          = false;
+    bool has_late_tensors     = false;
+    bool exact_q_requested    = false;
+    bool hw_int_dot           = false;
+    bool hw_wave32            = false;
+    bool shape_aligned        = false;
+    bool pipeline_ready       = false;
+};
+
+static inline std::pair<tp5_numerical_mode, tp5_numerical_reason> tp5_resolve_numerical_mode(
+        const tp5_numerical_spec & spec) {
+    if (!spec.latebind_env_enabled) {
+        return { tp5_numerical_mode::REFERENCE, tp5_numerical_reason::DISABLED_BY_ENV };
+    }
+    if (!spec.is_relay_sync) {
+        return { tp5_numerical_mode::REFERENCE, tp5_numerical_reason::NON_RELAY_SYNC };
+    }
+    if (!spec.is_f32_wire) {
+        return { tp5_numerical_mode::REFERENCE, tp5_numerical_reason::NON_F32_WIRE };
+    }
+    if (!spec.has_late_tensors) {
+        return { tp5_numerical_mode::REFERENCE, tp5_numerical_reason::NO_LATE_TENSORS };
+    }
+    if (spec.exact_q_requested) {
+        return { tp5_numerical_mode::EXACT_F32, tp5_numerical_reason::EXACT_Q_REQUESTED };
+    }
+    if (!spec.hw_int_dot) {
+        return { tp5_numerical_mode::EXACT_F32, tp5_numerical_reason::MISSING_HARDWARE_INT_DOT };
+    }
+    if (!spec.hw_wave32) {
+        return { tp5_numerical_mode::EXACT_F32, tp5_numerical_reason::UNSUPPORTED_WAVE32 };
+    }
+    if (!spec.shape_aligned) {
+        return { tp5_numerical_mode::EXACT_F32, tp5_numerical_reason::UNALIGNED_LATE_SHAPE };
+    }
+    if (!spec.pipeline_ready) {
+        return { tp5_numerical_mode::EXACT_F32, tp5_numerical_reason::PIPELINE_UNAVAILABLE };
+    }
+    return { tp5_numerical_mode::AGGRESSIVE_Q8, tp5_numerical_reason::NONE };
+}
+
+static constexpr size_t TP5_RELAY_HEADER_BYTES = 64;
 static constexpr size_t TP5_LATE_Q_CONTROL_BYTES = 64;
+static constexpr size_t TP5_LATE_Q_READY_WORD = 0;
+static constexpr size_t TP5_LATE_Q_COUNTER_WORD = 1;
+
+// LateBind Q sidecar layout helper (single source of truth for both CPU and GPU push constants).
+// In aggressive Q8 fast path, the 64-byte control area lives at B + 64 + L, and payload starts at B + 128 + L.
+// In exact fallback path, control uses status[6] (host-imported RAM), and payload broadcast destination is B + 64 + L.
+static inline size_t tp5_late_q_control_offset(size_t late_host_offset) {
+    return TP5_RELAY_HEADER_BYTES + late_host_offset;
+}
+
+static inline volatile uint32_t * tp5_late_q_control_ptr(void * bcast_host, size_t late_host_offset) {
+    if (!bcast_host || late_host_offset == 0) return nullptr;
+    return (volatile uint32_t *) ((char *) bcast_host + tp5_late_q_control_offset(late_host_offset));
+}
+
+static inline const volatile uint32_t * tp5_late_q_control_cptr(const void * bcast_host, size_t late_host_offset) {
+    if (!bcast_host || late_host_offset == 0) return nullptr;
+    return (const volatile uint32_t *) ((const char *) bcast_host + tp5_late_q_control_offset(late_host_offset));
+}
+
+static inline size_t tp5_late_q_bcast_payload_offset(size_t late_host_offset, bool late_q8_fast) {
+    return TP5_RELAY_HEADER_BYTES + late_host_offset + (late_q8_fast ? TP5_LATE_Q_CONTROL_BYTES : 0);
+}
+
+static inline uint32_t tp5_late_q_payload_word_offset(size_t late_host_offset, bool late_q8_fast) {
+    return (uint32_t) (tp5_late_q_bcast_payload_offset(late_host_offset, late_q8_fast) / 4);
+}
 
 static bool tp5_latebind_hc_enabled() {
     const char * env = getenv("GGML_TP5_LATEBIND");
@@ -680,6 +796,8 @@ struct tp5_cached_plan {
     std::vector<VkDeviceMemory>  late_act_q8_mem;
     std::vector<VkBuffer>        late_lo_q8_buf;
     std::vector<VkDeviceMemory>  late_lo_q8_mem;
+    tp5_numerical_mode           numerical_mode = tp5_numerical_mode::REFERENCE;
+    tp5_numerical_reason         numerical_reason = tp5_numerical_reason::NONE;
     bool                         late_q8_fast = false;
     bool                         late_sidecar_f16 = false;
     std::vector<VkCommandBuffer> star_cmd_p1;
@@ -2014,6 +2132,12 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
     const size_t late_bytes   = late_enabled ? TP5_LATE_MAX_FLOATS *
         (late_q8_workspace ? sizeof(ggml_fp16_t) : sizeof(float)) : 0;
     c.late_host_offset        = late_offset;
+    if (late_enabled && late_q8_workspace) {
+        GGML_ASSERT(tp5_late_q_control_offset(late_offset) % 64 == 0);
+        GGML_ASSERT(tp5_late_q_bcast_payload_offset(late_offset, true) % 64 == 0);
+        GGML_ASSERT(tp5_late_q_control_offset(late_offset) + TP5_LATE_Q_CONTROL_BYTES <=
+                    tp5_late_q_bcast_payload_offset(late_offset, true));
+    }
     for (const auto & r : c.ranks) {
         const uint64_t relay_header = c.sync_mode == tp5_sync_mode::RELAY ? 64u : 0u;
         const uint64_t required =
@@ -3057,25 +3181,53 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
     bool late_plan = c.sync_mode == tp5_sync_mode::RELAY && !trefs.empty();
     for (size_t i = 0; late_plan && i < c.n_ranks; ++i)
         late_plan = trefs[i].late.late_rank != 0;
-    plan.late_q8_fast = late_plan && !tp5_latebind_exact_q_requested();
-    for (size_t i = 0; plan.late_q8_fast && i < c.n_ranks; ++i) {
-        plan.late_q8_fast =
-            c.ranks[i].caps.integer_dot_product && c.ranks[i].caps.subgroup_size_control &&
-            c.ranks[i].caps.subgroup_min_size <= 32u && c.ranks[i].caps.subgroup_max_size >= 32u &&
-            trefs[i].late.streams == 4u && trefs[i].late.width % 32u == 0u &&
-            trefs[i].late.late_rank % 16u == 0u &&
-            c.ranks[i].late_act_q8_pipe != VK_NULL_HANDLE && c.ranks[i].late_q8dot_pipe != VK_NULL_HANDLE &&
-            c.ranks[i].late_lo_q8_pipe != VK_NULL_HANDLE && c.ranks[i].late_up_q8dot_pipe != VK_NULL_HANDLE;
+    tp5_numerical_spec num_spec;
+    num_spec.latebind_env_enabled = tp5_latebind_hc_enabled();
+    num_spec.is_relay_sync        = (c.sync_mode == tp5_sync_mode::RELAY);
+    num_spec.is_f32_wire          = (c.wire == tp5_wire_type::F32);
+    num_spec.has_late_tensors     = late_plan;
+    num_spec.exact_q_requested    = tp5_latebind_exact_q_requested();
+    num_spec.hw_int_dot           = true;
+    num_spec.hw_wave32            = true;
+    num_spec.shape_aligned        = true;
+    num_spec.pipeline_ready       = true;
+    for (size_t i = 0; i < c.n_ranks; ++i) {
+        num_spec.hw_int_dot     = num_spec.hw_int_dot && c.ranks[i].caps.integer_dot_product;
+        num_spec.hw_wave32      = num_spec.hw_wave32 && c.ranks[i].caps.subgroup_size_control &&
+                                  c.ranks[i].caps.subgroup_min_size <= 32u && c.ranks[i].caps.subgroup_max_size >= 32u;
+        num_spec.shape_aligned  = num_spec.shape_aligned && trefs[i].late.streams == 4u &&
+                                  trefs[i].late.width % 32u == 0u && trefs[i].late.late_rank % 16u == 0u;
+        num_spec.pipeline_ready = num_spec.pipeline_ready &&
+                                  c.ranks[i].late_act_q8_pipe != VK_NULL_HANDLE && c.ranks[i].late_q8dot_pipe != VK_NULL_HANDLE &&
+                                  c.ranks[i].late_lo_q8_pipe != VK_NULL_HANDLE && c.ranks[i].late_up_q8dot_pipe != VK_NULL_HANDLE;
     }
+    const auto resolved = tp5_resolve_numerical_mode(num_spec);
+    plan.numerical_mode  = resolved.first;
+    plan.numerical_reason = resolved.second;
+    plan.late_q8_fast    = (plan.numerical_mode == tp5_numerical_mode::AGGRESSIVE_Q8);
     plan.late_sidecar_f16 = plan.late_q8_fast;
+
+    static std::atomic<uint32_t> reported_modes_mask{0};
+    const uint32_t mode_bit = 1u << (uint32_t) plan.numerical_mode;
+    if ((reported_modes_mask.fetch_or(mode_bit, std::memory_order_relaxed) & mode_bit) == 0) {
+        fprintf(stderr,
+                "[tp5-numerical-mode] mode=%s reason=%s wire=%s late=%s direct=%s\n",
+                tp5_numerical_mode_name(plan.numerical_mode),
+                tp5_numerical_reason_name(plan.numerical_reason),
+                c.wire == tp5_wire_type::F32 ? "f32" : "f16",
+                late_plan ? "yes" : "no",
+                relay_direct_all ? "direct" : "p1");
+    }
+
     if (late_plan) {
         static std::atomic<bool> late_reported{false};
         if (!late_reported.exchange(true, std::memory_order_relaxed)) {
             fprintf(stderr,
-                    "[tp5-latebind] hc-down active producer=%s q=%s width=%u streams=%u rank=%u sidecar=%zuB "
+                    "[tp5-latebind] hc-down active producer=%s q=%s mode=%s width=%u streams=%u rank=%u sidecar=%zuB "
                     "(GGML_TP5_REPLICATE_ATTN remains independent)\n",
                     relay_direct_all ? "direct" : "p1",
                     plan.late_q8_fast ? "q8dot-approx" : "f32-exact",
+                    tp5_numerical_mode_name(plan.numerical_mode),
                     trefs[0].late.width, trefs[0].late.streams, trefs[0].late.late_rank,
                     size_t(trefs[0].late.streams) * trefs[0].late.late_rank *
                         (plan.late_sidecar_f16 ? sizeof(ggml_fp16_t) : sizeof(float)));
@@ -3399,7 +3551,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     struct {
                         uint32_t width, rank_dim, streams, rows_per_wg, n_workgroups, late_word_offset;
                     } q8_pc{late.width, late.late_rank, late.streams, 16u, q8_workgroups,
-                            (uint32_t) ((64 + c.late_host_offset + TP5_LATE_Q_CONTROL_BYTES) / 4)};
+                            tp5_late_q_payload_word_offset(c.late_host_offset, true)};
                     tp5_cmd_push(cmd, r.late_q8dot_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                  sizeof(q8_pc), &q8_pc);
                     tp5_cmd_dispatch(cmd, q8_workgroups, 1, 1);
@@ -3549,8 +3701,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                                      status_word_offset, profile_spin, sidecar_f16;
                         }
                             lo_pc{late.late_rank, late.streams,
-                                  (uint32_t) ((64 + c.late_host_offset +
-                                              (plan.late_q8_fast ? TP5_LATE_Q_CONTROL_BYTES : 0)) / 4),
+                                  tp5_late_q_payload_word_offset(c.late_host_offset, plan.late_q8_fast),
                                   c.spin_max, status_offset, profile_spin,
                                   plan.late_sidecar_f16 ? 1u : 0u};
                         static_assert(sizeof(lo_pc) == 28);
@@ -4179,12 +4330,13 @@ static bool tp5_relay_arm_bank(tp5_comm & c, uint64_t epoch) {
         status[6] = 0u; // LateBind sidecar ready
         status[7] = 0u; // Q point-of-use spin samples, separate from Y
         // Aggressive Q8 sidecar lives in this rank's device-coherent bcast
-        // VRAM. Reset its local ready/counter while the bank has transitive
-        // reuse credit, before the next primary stream can touch it.
-        if (c.ranks[i].bcast_host[bank]) {
-            auto * qheader = (volatile uint32_t *) c.ranks[i].bcast_host[bank];
-            qheader[4] = 0u; // Q sidecar ready
-            qheader[5] = 0u; // Q8 workgroup completion counter
+        // VRAM. Reset its local ready/counter in the unified Q control region
+        // (B + 64 + L) while the bank has transitive reuse credit, before the
+        // next primary stream can touch it.
+        if (c.ranks[i].bcast_host[bank] && c.late_host_offset) {
+            auto * qctrl = tp5_late_q_control_ptr(c.ranks[i].bcast_host[bank], c.late_host_offset);
+            qctrl[TP5_LATE_Q_READY_WORD]   = 0u; // Q sidecar ready
+            qctrl[TP5_LATE_Q_COUNTER_WORD] = 0u; // Q8 workgroup completion counter
         }
     }
     c.relay_bank_used[bank] = false;
@@ -4213,15 +4365,15 @@ static bool tp5_relay_ensure_armed_epoch(tp5_comm & c, uint64_t epoch) {
                                                             i * c.star_rank_stride + c.star_rank_stride - 64);
         if (status[1] == expected) {
             armed = true;
-            const auto * qheader = (const volatile uint32_t *) c.ranks[i].bcast_host[bank];
+            const auto * qctrl = tp5_late_q_control_cptr(c.ranks[i].bcast_host[bank], c.late_host_offset);
             if (status[0] != 0u || status[2] != 0u || status[3] != 0u ||
-                status[6] != 0u || (qheader && (qheader[4] != 0u || qheader[5] != 0u))) {
+                status[6] != 0u || (qctrl && (qctrl[TP5_LATE_Q_READY_WORD] != 0u || qctrl[TP5_LATE_Q_COUNTER_WORD] != 0u))) {
                 c.fail("RELAY pre-armed bank is not idle on rank " + std::to_string(i) +
                        " (epoch=" + std::to_string(epoch) + ", flag=" + std::to_string(status[0]) +
                        ", error=" + std::to_string(status[2]) + ", done=" + std::to_string(status[3]) +
                        ", late_ready=" + std::to_string(status[6]) +
-                       ", q8_ready=" + std::to_string(qheader ? qheader[4] : UINT32_MAX) +
-                       ", q8_count=" + std::to_string(qheader ? qheader[5] : UINT32_MAX) + ")");
+                       ", q8_ready=" + std::to_string(qctrl ? qctrl[TP5_LATE_Q_READY_WORD] : UINT32_MAX) +
+                       ", q8_count=" + std::to_string(qctrl ? qctrl[TP5_LATE_Q_COUNTER_WORD] : UINT32_MAX) + ")");
                 return false;
             }
         } else {
@@ -4479,8 +4631,9 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
                 if (status[2] != 0u) {
                     c.fail("RELAY sidecar aborted on rank " + std::to_string(i)); return false;
                 }
+                const auto * qctrl = tp5_late_q_control_cptr(c.ranks[i].bcast_host[bank], c.late_host_offset);
                 const bool q_ready = late_sidecar_f16 ?
-                    (((const volatile uint32_t *) c.ranks[i].bcast_host[bank])[4] == 1u) :
+                    (qctrl && qctrl[TP5_LATE_Q_READY_WORD] == 1u) :
                     (status[6] == 1u);
                 if (q_ready) {
                     late_pending &= ~bit;
@@ -4506,7 +4659,8 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
         float *      late_bcast_f32[5] = {};
         uint16_t *   late_bcast_f16[5] = {};
         for (size_t i = 0; i < c.n_ranks; ++i) {
-            void * dst = (char *) c.ranks[i].bcast_host[bank] + 64 + c.late_host_offset;
+            void * dst = (char *) c.ranks[i].bcast_host[bank] +
+                         tp5_late_q_bcast_payload_offset(c.late_host_offset, late_sidecar_f16);
             late_bcast_f32[i] = (float *) dst;
             late_bcast_f16[i] = (uint16_t *) dst;
             late_ptrs[i] = late_sidecar_f16 ?
@@ -4782,11 +4936,26 @@ static bool tp5_define_linear_chain(tp5_comm & c,
                         return false;
                     }
                 } else {
-                    // Exact fallback: norm and the F32 Q contraction remain
-                    // adjacent with no dependency barrier between them.
-                    if (!emit(pre, injected ? inject_end : 0, q_begin) ||
-                        !emit(p2, 0, norm_end) ||
-                        !emit(pre, q_begin)) {
+                    // Exact fallback: late_q reads z_p from outgoing->key.bindings[r],
+                    // while norm overwrites the same buffer with canonical y. To prevent
+                    // the RAW hazard, late_q and sidecar publication must strictly precede
+                    // norm, separated by an execution/memory barrier on the tensor buffer.
+                    if (!emit(pre, injected ? inject_end : 0)) {
+                        return false;
+                    }
+                    VkBufferMemoryBarrier q_norm_barrier{
+                        VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr,
+                        VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+                        outgoing->key.bindings[r].buf,
+                        outgoing->key.bindings[r].offset,
+                        outgoing->key.bindings[r].size
+                    };
+                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         0, 0, nullptr, 1, &q_norm_barrier, 0, nullptr);
+                    ++barriers;
+                    if (!emit(p2, 0, norm_end)) {
                         return false;
                     }
                 }
@@ -4796,10 +4965,12 @@ static bool tp5_define_linear_chain(tp5_comm & c,
         if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
             c.fail("LateBind linear primary end failed"); return false;
         }
-        fprintf(stderr, "[tp5-linear-definition] rank=%zu stages=%zu primary_cbs=1 late=%zu "
+        const char * active_num_mode = (late_sites == 0) ? "reference" :
+                                       (q8_sites > 0 ? "aggressive-q8" : "exact-f32");
+        fprintf(stderr, "[tp5-linear-definition] rank=%zu stages=%zu primary_cbs=1 mode=%s late=%zu "
                         "q8_fast=%zu scatter_early=%zu overlap=norm-q sidecar_pub=fused "
                         "dispatches=%zu barriers=%zu copies=%zu timing=%d\n",
-                r, n_stages, late_sites, q8_sites, hoisted, dispatches, barriers, copies, capture ? 1 : 0);
+                r, n_stages, active_num_mode, late_sites, q8_sites, hoisted, dispatches, barriers, copies, capture ? 1 : 0);
     }
     if (c.linear_program) c.retired_linear_programs.push_back(std::move(c.linear_program));
     c.linear_program = std::move(linear);

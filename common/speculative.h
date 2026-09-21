@@ -85,6 +85,39 @@ void common_speculative_set_paused(common_speculative * spec, llama_seq_id seq_i
 // reset internal speculative decoding state across iterations/prompts
 void common_speculative_reset(common_speculative * spec);
 
+// TP5 MTP cycle timing ledger (draft + target verify + catch-up + hidden handoff).
+struct common_speculative_cycle_record {
+    uint64_t cycle_id         = 0;
+    uint64_t draft_us         = 0;
+    uint64_t target_verify_us = 0;
+    uint64_t catchup_us       = 0;
+    uint64_t handoff_us       = 0;
+    uint64_t total_us         = 0;
+    uint32_t draft_tokens     = 0;
+    uint32_t accepted_tokens  = 0;
+    uint32_t final_tokens     = 0; // accepted_tokens + 1 (the verified/sampled token)
+    bool     device_hidden    = false;
+};
+
+struct common_speculative_cycle_summary {
+    uint64_t total_cycles           = 0;
+    uint64_t total_draft_us         = 0;
+    uint64_t total_target_verify_us = 0;
+    uint64_t total_catchup_us       = 0;
+    uint64_t total_handoff_us       = 0;
+    uint64_t total_us               = 0;
+    uint64_t total_draft_tokens     = 0;
+    uint64_t total_accepted_tokens  = 0;
+    uint64_t total_final_tokens     = 0;
+};
+
+// Pure formatting helpers for deterministic testing and structured logging
+std::string common_speculative_format_cycle_record(const common_speculative_cycle_record & r);
+std::string common_speculative_format_cycle_summary(const common_speculative_cycle_summary & s);
+
+// Record target verification wall-clock time for the ongoing MTP cycle.
+void common_speculative_record_target_verify_us(common_speculative * spec, uint64_t target_verify_us);
+
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 

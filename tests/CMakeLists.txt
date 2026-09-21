@@ -136,7 +136,7 @@ target_link_libraries(test-predefined-capacity PRIVATE ggml-base)
 llama_test(test-predefined-capacity LABEL "predefined;cpu")
 
 add_executable(test-mtp-workspace test-mtp-workspace.cpp)
-target_link_libraries(test-mtp-workspace PRIVATE llama)
+target_link_libraries(test-mtp-workspace PRIVATE llama llama-common)
 llama_test(test-mtp-workspace LABEL "predefined;cpu")
 
 add_executable(test-tp5-row-program test-tp5-row-program.cpp)

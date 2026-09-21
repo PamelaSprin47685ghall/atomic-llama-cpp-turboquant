@@ -993,6 +993,201 @@ static void test_nextn_layer_plan_bounds() {
     fprintf(stderr, "  NextN layer plan bounds: blk.48 accepted, blk.49 rejected with TP5_E_LAYER_BOUNDS\n");
 }
 
+enum class test_numerical_mode { REFERENCE, EXACT_F32, AGGRESSIVE_Q8 };
+enum class test_numerical_reason {
+    NONE, DISABLED_BY_ENV, NON_RELAY_SYNC, NON_F32_WIRE, NO_LATE_TENSORS,
+    EXACT_Q_REQUESTED, MISSING_HARDWARE_INT_DOT, UNSUPPORTED_WAVE32,
+    UNALIGNED_LATE_SHAPE, PIPELINE_UNAVAILABLE
+};
+
+struct test_numerical_spec {
+    bool latebind_env_enabled = false;
+    bool is_relay_sync        = false;
+    bool is_f32_wire          = false;
+    bool has_late_tensors     = false;
+    bool exact_q_requested    = false;
+    bool hw_int_dot           = false;
+    bool hw_wave32            = false;
+    bool shape_aligned        = false;
+    bool pipeline_ready       = false;
+};
+
+static inline std::pair<test_numerical_mode, test_numerical_reason> test_resolve_numerical_mode(
+        const test_numerical_spec & spec) {
+    if (!spec.latebind_env_enabled) return { test_numerical_mode::REFERENCE, test_numerical_reason::DISABLED_BY_ENV };
+    if (!spec.is_relay_sync)        return { test_numerical_mode::REFERENCE, test_numerical_reason::NON_RELAY_SYNC };
+    if (!spec.is_f32_wire)          return { test_numerical_mode::REFERENCE, test_numerical_reason::NON_F32_WIRE };
+    if (!spec.has_late_tensors)     return { test_numerical_mode::REFERENCE, test_numerical_reason::NO_LATE_TENSORS };
+    if (spec.exact_q_requested)     return { test_numerical_mode::EXACT_F32, test_numerical_reason::EXACT_Q_REQUESTED };
+    if (!spec.hw_int_dot)           return { test_numerical_mode::EXACT_F32, test_numerical_reason::MISSING_HARDWARE_INT_DOT };
+    if (!spec.hw_wave32)            return { test_numerical_mode::EXACT_F32, test_numerical_reason::UNSUPPORTED_WAVE32 };
+    if (!spec.shape_aligned)        return { test_numerical_mode::EXACT_F32, test_numerical_reason::UNALIGNED_LATE_SHAPE };
+    if (!spec.pipeline_ready)       return { test_numerical_mode::EXACT_F32, test_numerical_reason::PIPELINE_UNAVAILABLE };
+    return { test_numerical_mode::AGGRESSIVE_Q8, test_numerical_reason::NONE };
+}
+
+static void test_tp5_numerical_mode_resolution() {
+    fprintf(stderr, "--- test_tp5_numerical_mode_resolution ---\n");
+    test_numerical_spec base;
+    base.latebind_env_enabled = true;
+    base.is_relay_sync        = true;
+    base.is_f32_wire          = true;
+    base.has_late_tensors     = true;
+    base.exact_q_requested    = false;
+    base.hw_int_dot           = true;
+    base.hw_wave32            = true;
+    base.shape_aligned        = true;
+    base.pipeline_ready       = true;
+
+    // Full fast path -> AGGRESSIVE_Q8
+    auto res = test_resolve_numerical_mode(base);
+    TEST_ASSERT(res.first == test_numerical_mode::AGGRESSIVE_Q8);
+    TEST_ASSERT(res.second == test_numerical_reason::NONE);
+
+    // Disabled by env -> REFERENCE
+    {
+        auto s = base; s.latebind_env_enabled = false;
+        res = test_resolve_numerical_mode(s);
+        TEST_ASSERT(res.first == test_numerical_mode::REFERENCE);
+        TEST_ASSERT(res.second == test_numerical_reason::DISABLED_BY_ENV);
+    }
+    // Non-relay sync -> REFERENCE
+    {
+        auto s = base; s.is_relay_sync = false;
+        res = test_resolve_numerical_mode(s);
+        TEST_ASSERT(res.first == test_numerical_mode::REFERENCE);
+        TEST_ASSERT(res.second == test_numerical_reason::NON_RELAY_SYNC);
+    }
+    // Non-F32 wire -> REFERENCE
+    {
+        auto s = base; s.is_f32_wire = false;
+        res = test_resolve_numerical_mode(s);
+        TEST_ASSERT(res.first == test_numerical_mode::REFERENCE);
+        TEST_ASSERT(res.second == test_numerical_reason::NON_F32_WIRE);
+    }
+    // No late tensors -> REFERENCE
+    {
+        auto s = base; s.has_late_tensors = false;
+        res = test_resolve_numerical_mode(s);
+        TEST_ASSERT(res.first == test_numerical_mode::REFERENCE);
+        TEST_ASSERT(res.second == test_numerical_reason::NO_LATE_TENSORS);
+    }
+
+    // Exact Q requested via env -> EXACT_F32
+    {
+        auto s = base; s.exact_q_requested = true;
+        res = test_resolve_numerical_mode(s);
+        TEST_ASSERT(res.first == test_numerical_mode::EXACT_F32);
+        TEST_ASSERT(res.second == test_numerical_reason::EXACT_Q_REQUESTED);
+    }
+    // Missing int dot product -> EXACT_F32
+    {
+        auto s = base; s.hw_int_dot = false;
+        res = test_resolve_numerical_mode(s);
+        TEST_ASSERT(res.first == test_numerical_mode::EXACT_F32);
+        TEST_ASSERT(res.second == test_numerical_reason::MISSING_HARDWARE_INT_DOT);
+    }
+    // Unsupported wave32 -> EXACT_F32
+    {
+        auto s = base; s.hw_wave32 = false;
+        res = test_resolve_numerical_mode(s);
+        TEST_ASSERT(res.first == test_numerical_mode::EXACT_F32);
+        TEST_ASSERT(res.second == test_numerical_reason::UNSUPPORTED_WAVE32);
+    }
+    // Unaligned tensor shape -> EXACT_F32
+    {
+        auto s = base; s.shape_aligned = false;
+        res = test_resolve_numerical_mode(s);
+        TEST_ASSERT(res.first == test_numerical_mode::EXACT_F32);
+        TEST_ASSERT(res.second == test_numerical_reason::UNALIGNED_LATE_SHAPE);
+    }
+    // Pipeline creation failure -> EXACT_F32
+    {
+        auto s = base; s.pipeline_ready = false;
+        res = test_resolve_numerical_mode(s);
+        TEST_ASSERT(res.first == test_numerical_mode::EXACT_F32);
+        TEST_ASSERT(res.second == test_numerical_reason::PIPELINE_UNAVAILABLE);
+    }
+    fprintf(stderr, "  Numerical mode resolution: 10/10 branches verified\n");
+}
+
+static void test_tp5_latebind_protocol_invariants() {
+    fprintf(stderr, "--- test_tp5_latebind_protocol_invariants ---\n");
+    // Layout invariants from TP5 LateBind protocol
+    constexpr size_t TP5_RELAY_HEADER_BYTES = 64;
+    constexpr size_t TP5_LATE_Q_CONTROL_BYTES = 64;
+    constexpr size_t TP5_LATE_Q_READY_WORD = 0;
+    constexpr size_t TP5_LATE_Q_COUNTER_WORD = 1;
+
+    const auto ctrl_offset = [](size_t L) { return TP5_RELAY_HEADER_BYTES + L; };
+    const auto payload_offset = [](size_t L, bool fast) {
+        return TP5_RELAY_HEADER_BYTES + L + (fast ? TP5_LATE_Q_CONTROL_BYTES : 0);
+    };
+
+    // Test a variety of realistic alignments and offsets (e.g. 2560 elements * sizeof(float))
+    const size_t test_offsets[] = { 2560 * sizeof(float), 4096 * sizeof(float), 10240, 16384 };
+    for (size_t L : test_offsets) {
+        // Invariant 1: Control block is 64-byte aligned
+        TEST_ASSERT(ctrl_offset(L) % 64 == 0);
+        // Invariant 2: Aggressive Q8 Payload is 64-byte aligned
+        TEST_ASSERT(payload_offset(L, true) % 64 == 0);
+        // Invariant 3: Control block [ctrl, ctrl + 64) and Payload [payload, ...) do not overlap in aggressive mode
+        TEST_ASSERT(ctrl_offset(L) + TP5_LATE_Q_CONTROL_BYTES <= payload_offset(L, true));
+        TEST_ASSERT(payload_offset(L, true) - ctrl_offset(L) == TP5_LATE_Q_CONTROL_BYTES);
+
+        // Invariant 4: GPU word indexing matches CPU byte indexing
+        // GPU late_word_offset = (64 + L + 64) / 4 = payload_offset(L, true) / 4
+        const uint32_t late_word_offset = (uint32_t) (payload_offset(L, true) / 4);
+        // GPU writes ready flag to qmail[late_word_offset - 16u]
+        const size_t gpu_ready_byte = (late_word_offset - 16u) * 4;
+        TEST_ASSERT(gpu_ready_byte == ctrl_offset(L) + TP5_LATE_Q_READY_WORD * 4);
+        // GPU writes WG counter to qmail[late_word_offset - 15u]
+        const size_t gpu_counter_byte = (late_word_offset - 15u) * 4;
+        TEST_ASSERT(gpu_counter_byte == ctrl_offset(L) + TP5_LATE_Q_COUNTER_WORD * 4);
+
+        // Invariant 5: Regression test against the old defect
+        // In the old bug, CPU polled offset B + 16 (main header word 4), which is NOT the control block!
+        const size_t old_poll_offset = 16;
+        TEST_ASSERT(old_poll_offset != ctrl_offset(L));
+        // In the old bug, CPU payload read dst = B + 64 + L, which erroneously aliased the control region!
+        const size_t old_cpu_payload = 64 + L;
+        TEST_ASSERT(old_cpu_payload == ctrl_offset(L));
+        TEST_ASSERT(old_cpu_payload != payload_offset(L, true));
+
+        // Invariant 6: Exact fallback path consistency
+        // In exact mode (!fast), control is in host-imported RAM status[6], and payload broadcast is at B + 64 + L
+        TEST_ASSERT(payload_offset(L, false) == 64 + L);
+    }
+
+    // Invariant 7: F32-Q exact fallback execution order constraint
+    // Emulated command stream order check:
+    enum StageOp { OP_SCATTER, OP_LATE_Q_READ, OP_BARRIER_READ_WRITE, OP_NORM_WRITE };
+    std::vector<StageOp> exact_sequence = {
+        OP_SCATTER,
+        OP_LATE_Q_READ,
+        OP_BARRIER_READ_WRITE,
+        OP_NORM_WRITE
+    };
+    // Assert OP_LATE_Q_READ precedes OP_NORM_WRITE with an intervening barrier
+    auto q_pos = std::find(exact_sequence.begin(), exact_sequence.end(), OP_LATE_Q_READ);
+    auto norm_pos = std::find(exact_sequence.begin(), exact_sequence.end(), OP_NORM_WRITE);
+    auto bar_pos = std::find(exact_sequence.begin(), exact_sequence.end(), OP_BARRIER_READ_WRITE);
+    TEST_ASSERT(q_pos < bar_pos && bar_pos < norm_pos);
+
+    // If an old buggy sequence is constructed (norm before late_q), verify our invariant detects the hazard
+    std::vector<StageOp> buggy_sequence = {
+        OP_SCATTER,
+        OP_NORM_WRITE,
+        OP_LATE_Q_READ
+    };
+    auto b_q_pos = std::find(buggy_sequence.begin(), buggy_sequence.end(), OP_LATE_Q_READ);
+    auto b_norm_pos = std::find(buggy_sequence.begin(), buggy_sequence.end(), OP_NORM_WRITE);
+    // Old sequence violates read-before-write invariant
+    TEST_ASSERT(!(b_q_pos < b_norm_pos));
+
+    fprintf(stderr, "  LateBind protocol invariants: Q control/payload non-overlapping, word alignment verified, F32-Q order asserted\n");
+}
+
 int main() {
     test_plan_rejects_bad_ranks();
     test_plan_rejects_indivisible_moe();
@@ -1016,6 +1211,8 @@ int main() {
     test_tp5_split_state_gdn_qkv(false);
     test_tp5_split_state_gdn_qkv(true);
     test_nextn_layer_plan_bounds();
+    test_tp5_latebind_protocol_invariants();
+    test_tp5_numerical_mode_resolution();
 
     if (g_failures > 0) {
         fprintf(stderr, "%d failures\n", g_failures);

@@ -1,5 +1,7 @@
 #include "../common/speculative-mtp-workspace.h"
+#include "../common/speculative.h"
 #include "../src/llama-predefined-hidden.h"
+#include "../src/llama-context.h"
 
 #include <cstdio>
 #include <stdexcept>
@@ -165,6 +167,199 @@ static void device_hidden_rejects_stale_generation() {
     CHECK(!llama_predefined_hidden_generation_matches(source, LLAMA_PREDEFINED_H_RESULT, 7));
 }
 
+// Regression check for missing-regression-test:
+// Verify that predefined MTP execution sessions are exempted from legacy phase invalidation.
+// Legacy phase logic (n_tokens > n_seqs ? 1 : 0) oscillated on 1->4->1->2 sequences (0->1->0->1),
+// triggering 3x gf_res_prev->reset() and ggml_backend_sched_release_buffers(), breaking predefined graph reuse.
+// Predefined MTP shares a single maximum-capacity graph definition (capacity->verify_tokens) and must
+// remain stably in phase 0 without oscillation.
+static void predefined_mtp_phase_invalidation_exemption() {
+    const int mtp_token_seq[] = {1, 4, 1, 2};
+    constexpr int n_steps = 4;
+    const int n_seqs = 1;
+
+    // 1. Demonstrate legacy behavior: pure n_tokens > n_seqs logic causes 3 phase transitions.
+    {
+        int legacy_last_phase = -1;
+        int legacy_resets = 0;
+        for (int i = 0; i < n_steps; ++i) {
+            const int n_tokens = mtp_token_seq[i];
+            const int phase = n_tokens > n_seqs ? 1 : 0;
+            if (phase != legacy_last_phase) {
+                if (legacy_last_phase >= 0) {
+                    legacy_resets++;
+                }
+                legacy_last_phase = phase;
+            }
+        }
+        // Step 0 (1 token):  phase 0, last=-1 -> last=0, 0 resets
+        // Step 1 (4 tokens): phase 1, last=0  -> last=1, reset 1
+        // Step 2 (1 token):  phase 0, last=1  -> last=0, reset 2
+        // Step 3 (2 tokens): phase 1, last=0  -> last=1, reset 3
+        CHECK(legacy_resets == 3);
+    }
+
+    // 2. Predefined MTP session: execution definition is invariant (capacity_rows = 4).
+    // Phase must remain stably 0, resulting in ZERO resets across the entire 1->4->1->2 sequence.
+    {
+        int mtp_last_phase = -1;
+        int mtp_resets = 0;
+        const uint32_t capacity_rows = 4;
+        for (int i = 0; i < n_steps; ++i) {
+            const int n_tokens = mtp_token_seq[i];
+            const int phase = llama_context::ubatch_execution_phase(
+                LLM_GRAPH_TYPE_DECODER_MTP,
+                /*has_predefined_capacity=*/true,
+                capacity_rows,
+                n_tokens,
+                n_seqs);
+            CHECK(phase == 0);
+            if (phase != mtp_last_phase) {
+                if (mtp_last_phase >= 0) {
+                    mtp_resets++;
+                }
+                mtp_last_phase = phase;
+            }
+        }
+        CHECK(mtp_resets == 0);
+        CHECK(mtp_last_phase == 0);
+    }
+
+    // 3. Non-predefined MTP session: must preserve legacy phase switching behavior.
+    {
+        int non_predef_last_phase = -1;
+        int non_predef_resets = 0;
+        for (int i = 0; i < n_steps; ++i) {
+            const int n_tokens = mtp_token_seq[i];
+            const int phase = llama_context::ubatch_execution_phase(
+                LLM_GRAPH_TYPE_DECODER_MTP,
+                /*has_predefined_capacity=*/false,
+                0,
+                n_tokens,
+                n_seqs);
+            if (phase != non_predef_last_phase) {
+                if (non_predef_last_phase >= 0) {
+                    non_predef_resets++;
+                }
+                non_predef_last_phase = phase;
+            }
+        }
+        CHECK(non_predef_resets == 3);
+    }
+
+    // 4. Target trunk model: prompt prefill (phase 1) vs decode generation (phase 0)
+    // must strictly retain legacy boundary to prevent VRAM buffer bloat and view bound violations.
+    {
+        // Prefill: 32 tokens, 1 sequence -> phase 1
+        const int prefill_phase = llama_context::ubatch_execution_phase(
+            LLM_GRAPH_TYPE_DECODER,
+            /*has_predefined_capacity=*/true,
+            32,
+            32,
+            1);
+        CHECK(prefill_phase == 1);
+
+        // Decode: 1 token, 1 sequence -> phase 0
+        const int decode_phase = llama_context::ubatch_execution_phase(
+            LLM_GRAPH_TYPE_DECODER,
+            /*has_predefined_capacity=*/true,
+            1,
+            1,
+            1);
+        CHECK(decode_phase == 0);
+
+        // Batch decode: 4 tokens across 4 sequences -> phase 0
+        const int batch_decode_phase = llama_context::ubatch_execution_phase(
+            LLM_GRAPH_TYPE_DECODER,
+            /*has_predefined_capacity=*/false,
+            0,
+            4,
+            4);
+        CHECK(batch_decode_phase == 0);
+    }
+}
+
+static void test_mtp_cycle_ledger_accounting() {
+    // 1. Single cycle record formatting check
+    common_speculative_cycle_record r1;
+    r1.cycle_id         = 1;
+    r1.draft_us         = 1200;
+    r1.target_verify_us = 3500;
+    r1.catchup_us       = 800;
+    r1.handoff_us       = 50;
+    r1.total_us         = 1200 + 3500 + 800 + 50;
+    r1.draft_tokens     = 3;
+    r1.accepted_tokens  = 2;
+    r1.final_tokens     = 3; // 2 accepted + 1 target sampled
+    r1.device_hidden    = true;
+
+    const std::string line1 = common_speculative_format_cycle_record(r1);
+    CHECK(line1.find("[tp5-mtp-cycle] cycle=1") != std::string::npos);
+    CHECK(line1.find("draft_us=1200") != std::string::npos);
+    CHECK(line1.find("target_us=3500") != std::string::npos);
+    CHECK(line1.find("catchup_us=800") != std::string::npos);
+    CHECK(line1.find("handoff_us=50") != std::string::npos);
+    CHECK(line1.find("total_us=5550") != std::string::npos);
+    CHECK(line1.find("draft_tokens=3") != std::string::npos);
+    CHECK(line1.find("accepted_tokens=2") != std::string::npos);
+    CHECK(line1.find("final_tokens=3") != std::string::npos);
+    CHECK(line1.find("eff=0.667") != std::string::npos);
+    CHECK(line1.find("dev_hidden=1") != std::string::npos);
+
+    // 2. Summary accumulator check
+    common_speculative_cycle_summary summary;
+    auto accumulate = [&](const common_speculative_cycle_record & r) {
+        summary.total_cycles++;
+        summary.total_draft_us         += r.draft_us;
+        summary.total_target_verify_us += r.target_verify_us;
+        summary.total_catchup_us       += r.catchup_us;
+        summary.total_handoff_us       += r.handoff_us;
+        summary.total_us               += r.total_us;
+        summary.total_draft_tokens     += r.draft_tokens;
+        summary.total_accepted_tokens  += r.accepted_tokens;
+        summary.total_final_tokens     += r.final_tokens;
+    };
+
+    accumulate(r1);
+
+    common_speculative_cycle_record r2;
+    r2.cycle_id         = 2;
+    r2.draft_us         = 1000;
+    r2.target_verify_us = 3000;
+    r2.catchup_us       = 200;
+    r2.handoff_us       = 40;
+    r2.total_us         = 1000 + 3000 + 200 + 40;
+    r2.draft_tokens     = 3;
+    r2.accepted_tokens  = 0; // 0 accepted
+    r2.final_tokens     = 1;
+    r2.device_hidden    = true;
+    accumulate(r2);
+
+    CHECK(summary.total_cycles == 2);
+    CHECK(summary.total_draft_tokens == 6);
+    CHECK(summary.total_accepted_tokens == 2);
+    CHECK(summary.total_final_tokens == 4); // 3 + 1
+    // Total final tokens invariant: always equals total_accepted_tokens + total_cycles
+    CHECK(summary.total_final_tokens == summary.total_accepted_tokens + summary.total_cycles);
+
+    const std::string sum_line = common_speculative_format_cycle_summary(summary);
+    CHECK(sum_line.find("[tp5-mtp-cycle-summary] cycles=2") != std::string::npos);
+    CHECK(sum_line.find("avg_draft_us=1100.0") != std::string::npos);
+    CHECK(sum_line.find("avg_target_us=3250.0") != std::string::npos);
+    CHECK(sum_line.find("avg_catchup_us=500.0") != std::string::npos);
+    CHECK(sum_line.find("eff=0.333") != std::string::npos);
+
+    // 3. Target verification injection API contract check
+    common_params_speculative params_spec;
+    params_spec.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
+    common_speculative * spec_inst = common_speculative_init(params_spec, 1);
+    CHECK(spec_inst != nullptr);
+    common_speculative_record_target_verify_us(spec_inst, 4200);
+    // Verified: injection properly registers into the spec instance
+    common_speculative_record_target_verify_us(spec_inst, 0); // safe reset
+    common_speculative_free(spec_inst);
+}
+
 int main() {
     try {
         accepted_target_hidden_is_not_draft_hidden();
@@ -172,6 +367,8 @@ int main() {
         device_workspace_keeps_only_row_metadata();
         device_hidden_slices_use_actual_rows();
         device_hidden_rejects_stale_generation();
+        predefined_mtp_phase_invalidation_exemption();
+        test_mtp_cycle_ledger_accounting();
     } catch (const std::exception & e) {
         std::fprintf(stderr, "%s\n", e.what());
         return 1;

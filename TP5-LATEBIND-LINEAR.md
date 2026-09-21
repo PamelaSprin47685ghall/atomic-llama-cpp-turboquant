@@ -2,7 +2,36 @@
 
 本页对应 2026-09-21 的源码改造。**未编译、未运行 shader、模型或性能测试**；其他工作同时进行，由用户统一构建、验收。不能据此宣称已经恢复或超过 52.47 tok/s。
 
-## 执行入口
+## 执行入口与数值模式体系
+
+### 三类数值模式定义
+
+根据 P0 路线图"区分真正参考数值路径与 aggressive 路径"的要求，系统在定义期（Plan 构建 / 编译链定义期）严格确定并打印三类数值模式，杜绝逐 token 检查开销：
+
+1. **参考模式（`reference`）**：
+   * **定义**：常规非-LateBind 路径。完全遵循原始数学图与标准 AllReduce 传输/规约流程，无任何延迟绑定、解耦或量化；
+   * **生效条件**：未设置 `GGML_TP5_LATEBIND`（或非 `hc-down/1/on`）、同步模式非 `RELAY`、传输非 `f32` 线材、或当前 stage 无可延迟绑定的 HC 算子。
+2. **F32 LateBind 模式（`exact-f32`）**：
+   * **定义**：启用 LateBind 流水线解耦（P1/Scatter/Norm/Q 并行发射），但 Q 充分统计量保持精确 FP32 运算，sidecar 为 FP32，无任何激活量化或整数收缩误差（仅包含 RMS 树重排引入的必要末位浮点舍入）；
+   * **生效条件**：满足 LateBind 基础条件，但设置了 `GGML_TP5_LATEBIND_EXACT_Q=1`，或设备缺少硬件整数点积（`integer_dot_product`）、或不支持固定 32-lane wave32、或张量形状不对齐、或 Q8 着色器管线创建未就绪。
+3. **Aggressive 模式（`aggressive-q8`）**：
+   * **定义**：启用 LateBind 全流水线解耦 + activation Q8_0 量化 + 4-wave32 workgroup Q8xQ8 整数点积收缩 + FP16 sidecar 紧致传输 + LO Q8 激活重构；
+   * **生效条件**：满足 LateBind 基础条件，未请求 exact Q，且五卡均支持硬件整数点积与 wave32 控制，且张量形状对齐、Q8 着色器管线创建成功。
+
+### 模式判定与定义期输出示例
+
+定义期对每个构建的 plan 与每条编译的 linear chain 进行一次性静态确认，并输出统一日志：
+
+* **模式判定日志**（每个数值模式首次出现时输出一次）：
+  ```text
+  [tp5-numerical-mode] mode=aggressive-q8 reason=none wire=f32 late=yes direct=p1
+  [tp5-numerical-mode] mode=exact-f32 reason=exact-q-requested wire=f32 late=yes direct=p1
+  [tp5-numerical-mode] mode=reference reason=disabled-by-env wire=f32 late=no direct=p1
+  ```
+* **链定义日志**（每 rank 每条 primary CB 定义时输出一次）：
+  ```text
+  [tp5-linear-definition] rank=0 stages=96 primary_cbs=1 mode=aggressive-q8 late=96 q8_fast=96 ...
+  ```
 
 保留现有 `GGML_TP5_LATEBIND=hc-down`，只用于 RELAY/F32。`GGML_VK_DISABLE_PRODUCER_WIRE=1` 仍然保留 P1，attention replicate 仍独立可开关。
 
@@ -60,9 +89,9 @@ SiLU/lo → 原生 W_up/fold → 后续模型
 
 定义不完整、出现不可安全保留的事件/图像依赖、源 CB 发生变化时，整链在提交前明确失败，不静默漏录命令。普通模型 fallback 与 LateBind 替换以完整 stage 为单位，五卡资格必须一致。
 
-## 两种 generation
+## 两种 generation 与 Q Sidecar 内存布局
 
-每 bank 的 GPU inbox 前 64 字节仍为控制区：
+每 bank 的 GPU inbox 头部仍保留主 Relay 控制区（$B$ 起始的 64 字节）：
 
 | 位置 | 新含义 |
 | --- | --- |
@@ -72,9 +101,33 @@ SiLU/lo → 原生 W_up/fold → 后续模型
 | host status word 2 | sticky failure |
 | host status word 3 | 最后 inbox 读者完成的 epoch |
 | host status word 5 | norm 的 Y 等待迭代数（profile） |
-| host status word 6 | Q 上行 ready |
+| host status word 6 | Exact 路径 Q 上行 ready（host status 区） |
 | host status word 7 | lo 的 Q 等待迭代数（profile） |
-| host status word 8 | aggressive Q8 workgroup completion counter |
+
+### Q Sidecar 内存布局协议（已统一）
+
+为彻底消除与主 Relay Header 中 Y 状态的高频跨 Cache-line 伪共享，Aggressive Q8 路径（`late_q8_fast`）为 Q 分配了独立的 64 字节控制区：
+* **控制区物理基址**：$B + 64 + L$（64 字节对齐，紧跟在主 Y 负载之后）。
+  * `word 0`（偏移 0 字节）：Q sidecar ready 标志（GPU 写入 `1u`，CPU 轮询等待）。
+  * `word 1`（偏移 4 字节）：Q8 workgroup 完成计数器（GPU `atomicAdd`，最后一个工作组置位 word 0）。
+* **Q Payload 起点**：$B + 64 + L + 64 = B + 128 + L$。
+* **各端对齐保证**：
+  * GPU 生产端（`tp5_hc_latebind.comp`）使用 `late_word_offset = (128 + L) / 4`，写控制区于 `late_word_offset - 16u/15u`，写负载于 `late_word_offset`；
+  * GPU 消费端（`tp5_hc_resume.comp`）LO 算子读取 `inbox[late_word_offset]`（即 $B + 128 + L$）；
+  * CPU 重置（`tp5_relay_arm_bank`）、预武装检查（`tp5_relay_ensure_armed_epoch`）、就绪轮询（`allreduce_stages_internal`）统一对准 $B + 64 + L$ 控制区；
+  * CPU 归约源读取与广播写回目标（`late_ptrs[i]`、`late_bcast_f16[i]`）统一对准 $B + 128 + L$，不再覆盖控制区。
+
+### Exact Fallback 路径与 F32-Q RAW 修复
+
+在 Exact Fallback 路径（`!late_q8_fast`）下：
+1. **控制与负载协议**：
+   * 控制字位于系统 host-imported RAM 的末尾状态区（`status[6]`）；
+   * CPU 从系统内存 `star_host_aligned` 读取输入，归约结果广播写回 $B + 64 + L$；
+   * LO 消费端 push constant `late_word_offset` 为 $(64 + L) / 4$，对应 $B + 64 + L$。
+2. **F32-Q RAW 依赖修复**：
+   * 在原有命令编排中，`late_norm` 在 `late_q` 之前发射，导致 `norm` 将 canonical y 写回 `trefs[i].buf` 冲掉了 `late_q` 尚未读取的 `z_p`（同一缓冲区）；
+   * 修复后命令流严格重排：`emit(pre, ...)`（包含 scatter、`late_q` 读取 `z_p` 并输出到 sidecar、发布到 host-import）**严格先于** `emit(p2, 0, norm_end)`（`late_norm` 写回 canonical y）；
+   * 在两者之间显式插入针对张量缓冲区的 `VK_ACCESS_SHADER_READ_BIT` 到 `VK_ACCESS_SHADER_WRITE_BIT` 执行与内存屏障，彻底消除 RAW 冒险。
 
 CPU 仍然是原有 handoff 循环：Y 收齐后归约、fanout，并立即发布 word 0；随后收齐 Q，归约、fanout，再发布 word 2。不再让已经完成的 Y 等待 Q。
 
