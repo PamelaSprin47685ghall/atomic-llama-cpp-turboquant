@@ -64,9 +64,10 @@ enum class tp5_sync_mode { HOST, SYNCFD, TIMELINE, GPUFLAG, DRM, STAR, RELAY };
 static constexpr size_t TP5_MAILBOX_BANKS = 2;
 static constexpr size_t TP5_LATE_MAX_FLOATS = 8192; // up to 4 rows * 4 streams * rank <= 512
 enum class tp5_numerical_mode {
-    REFERENCE,      // 未启用 LateBind（REFERENCE/回退模式）：常规无 LateBind 路径，完全遵循原图/标准 AllReduce 数值
-    EXACT_F32,      // 调度收益但数学严格等价（EXACT_F32 模式）：启用 LateBind 解耦提前搬运，但 Q 充分统计量保持 FP32 精确路径无量化
-    AGGRESSIVE_Q8   // Aggressive 模式：启用 LateBind + Q8 激活量化 + Q8xQ8 整数点积 + FP16 sidecar 紧凑传输
+    REFERENCE,        // 未启用 LateBind（REFERENCE/回退模式）：常规无 LateBind 路径，完全遵循原图/标准 AllReduce 数值
+    EXACT_F32,        // 调度收益但数学严格等价（EXACT_F32 模式）：启用 LateBind 解耦提前搬运，但 Q 充分统计量保持 FP32 精确路径无量化
+    AGGRESSIVE_Q8,    // Aggressive 模式：启用 LateBind + Q8 激活量化 + Q8xQ8 整数点积 + FP16 sidecar 紧凑传输
+    P1A_NOSIDECAR_Q8  // P1-A 对照器具：不带 sidecar 的 aggressive Q8 HC（同精度 Q8dot/量化/fold，在 Y 就绪后本地串行执行）
 };
 
 enum class tp5_numerical_reason {
@@ -79,24 +80,27 @@ enum class tp5_numerical_reason {
     MISSING_HARDWARE_INT_DOT,
     UNSUPPORTED_WAVE32,
     UNALIGNED_LATE_SHAPE,
-    PIPELINE_UNAVAILABLE
+    PIPELINE_UNAVAILABLE,
+    P1A_BENCH_REQUESTED
 };
 
 static inline const char * tp5_numerical_mode_name(tp5_numerical_mode mode) {
     switch (mode) {
-        case tp5_numerical_mode::REFERENCE:     return "reference";
-        case tp5_numerical_mode::EXACT_F32:     return "exact-f32";
-        case tp5_numerical_mode::AGGRESSIVE_Q8: return "aggressive-q8";
-        default:                                return "unknown";
+        case tp5_numerical_mode::REFERENCE:        return "reference";
+        case tp5_numerical_mode::EXACT_F32:        return "exact-f32";
+        case tp5_numerical_mode::AGGRESSIVE_Q8:    return "aggressive-q8";
+        case tp5_numerical_mode::P1A_NOSIDECAR_Q8: return "p1a-nosidecar-q8";
+        default:                                   return "unknown";
     }
 }
 
 static inline const char * tp5_numerical_mode_desc(tp5_numerical_mode mode) {
     switch (mode) {
-        case tp5_numerical_mode::REFERENCE:     return "reference-no-latebind";
-        case tp5_numerical_mode::EXACT_F32:     return "exact-f32-strict-math";
-        case tp5_numerical_mode::AGGRESSIVE_Q8: return "aggressive-q8-quantized";
-        default:                                return "unknown";
+        case tp5_numerical_mode::REFERENCE:        return "reference-no-latebind";
+        case tp5_numerical_mode::EXACT_F32:        return "exact-f32-strict-math";
+        case tp5_numerical_mode::AGGRESSIVE_Q8:    return "aggressive-q8-quantized";
+        case tp5_numerical_mode::P1A_NOSIDECAR_Q8: return "p1a-nosidecar-q8-bench";
+        default:                                   return "unknown";
     }
 }
 
@@ -112,24 +116,29 @@ static inline const char * tp5_numerical_reason_name(tp5_numerical_reason reason
         case tp5_numerical_reason::UNSUPPORTED_WAVE32:       return "unsupported-wave32";
         case tp5_numerical_reason::UNALIGNED_LATE_SHAPE:     return "unaligned-late-shape";
         case tp5_numerical_reason::PIPELINE_UNAVAILABLE:     return "pipeline-unavailable";
+        case tp5_numerical_reason::P1A_BENCH_REQUESTED:      return "p1a-bench-requested";
         default:                                             return "unknown";
     }
 }
 
 struct tp5_numerical_spec {
-    bool latebind_env_enabled = false;
-    bool is_relay_sync        = false;
-    bool is_f32_wire          = false;
-    bool has_late_tensors     = false;
-    bool exact_q_requested    = false;
-    bool hw_int_dot           = false;
-    bool hw_wave32            = false;
-    bool shape_aligned        = false;
-    bool pipeline_ready       = false;
+    bool latebind_env_enabled    = false;
+    bool is_relay_sync           = false;
+    bool is_f32_wire             = false;
+    bool has_late_tensors        = false;
+    bool exact_q_requested       = false;
+    bool p1a_nosidecar_requested = false;
+    bool hw_int_dot              = false;
+    bool hw_wave32               = false;
+    bool shape_aligned           = false;
+    bool pipeline_ready          = false;
 };
 
 static inline std::pair<tp5_numerical_mode, tp5_numerical_reason> tp5_resolve_numerical_mode(
         const tp5_numerical_spec & spec) {
+    if (spec.p1a_nosidecar_requested) {
+        return { tp5_numerical_mode::P1A_NOSIDECAR_Q8, tp5_numerical_reason::NONE };
+    }
     if (!spec.latebind_env_enabled) {
         return { tp5_numerical_mode::REFERENCE, tp5_numerical_reason::DISABLED_BY_ENV };
     }
@@ -203,6 +212,13 @@ static bool tp5_latebind_fused_finalize_enabled() {
 static bool tp5_latebind_exact_q_requested() {
     const char * env = getenv("GGML_TP5_LATEBIND_EXACT_Q");
     return env && atoi(env) != 0;
+}
+
+// P1-A experimental comparison instrument: aggressive Q8 HC without sidecar.
+// Measurement only; defaults to OFF. When OFF, existing paths are completely untouched.
+static bool tp5_p1a_nosidecar_q8_requested() {
+    const char * env = getenv("GGML_TP5_P1A_NOSIDECAR_Q8");
+    return env && (strcmp(env, "1") == 0 || strcmp(env, "on") == 0 || strcmp(env, "true") == 0);
 }
 
 static size_t tp5_mailbox_bank(uint64_t epoch) {
@@ -3212,6 +3228,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
     num_spec.is_f32_wire          = (c.wire == tp5_wire_type::F32);
     num_spec.has_late_tensors     = late_plan;
     num_spec.exact_q_requested    = tp5_latebind_exact_q_requested();
+    num_spec.p1a_nosidecar_requested = tp5_p1a_nosidecar_q8_requested();
     num_spec.hw_int_dot           = true;
     num_spec.hw_wave32            = true;
     num_spec.shape_aligned        = true;
@@ -3229,8 +3246,9 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
     const auto resolved = tp5_resolve_numerical_mode(num_spec);
     plan.numerical_mode  = resolved.first;
     plan.numerical_reason = resolved.second;
-    plan.late_q8_fast    = (plan.numerical_mode == tp5_numerical_mode::AGGRESSIVE_Q8);
-    plan.late_sidecar_f16 = plan.late_q8_fast;
+    plan.late_q8_fast    = (plan.numerical_mode == tp5_numerical_mode::AGGRESSIVE_Q8 ||
+                            plan.numerical_mode == tp5_numerical_mode::P1A_NOSIDECAR_Q8);
+    plan.late_sidecar_f16 = (plan.numerical_mode == tp5_numerical_mode::AGGRESSIVE_Q8);
 
     static std::atomic<uint32_t> reported_modes_mask{0};
     const uint32_t mode_bit = 1u << (uint32_t) plan.numerical_mode;
@@ -4862,7 +4880,7 @@ static bool tp5_define_linear_chain(tp5_comm & c,
         if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) {
             c.fail("LateBind linear primary begin failed"); return false;
         }
-        size_t dispatches = 0, barriers = 0, copies = 0, hoisted = 0, late_sites = 0, q8_sites = 0;
+        size_t dispatches = 0, barriers = 0, copies = 0, hoisted = 0, late_sites = 0, q8_sites = 0, p1a_sites = 0;
         const auto emit = [&](const vk_tp5_command_tape & tape, size_t first = 0, size_t last = SIZE_MAX) {
             if (last == SIZE_MAX) last = tape.code.size();
             if (!tape.emit(cmd, first, last)) {
@@ -4887,7 +4905,8 @@ static bool tp5_define_linear_chain(tp5_comm & c,
             const size_t slot = tp5_plan_slot(r, tp5_mailbox_bank(epoch));
             const bool late_out = outgoing && outgoing->key.late[r].late_rank != 0;
             const bool direct_out = outgoing && tp5_relay_direct_stage(outgoing->key, c.n_ranks);
-            if (late_out && outgoing->late_q8_fast) ++q8_sites;
+            if (late_out && outgoing->numerical_mode == tp5_numerical_mode::P1A_NOSIDECAR_Q8) ++p1a_sites;
+            else if (late_out && outgoing->late_q8_fast) ++q8_sites;
             const bool scatter_source_matches = late_out && s < n_stages &&
                 graph.normalized_tensor != nullptr &&
                 linear->graphs[(s + 1) * c.n_ranks + r]->hc.inject_input_tensor == graph.normalized_tensor &&
@@ -4964,7 +4983,32 @@ static bool tp5_define_linear_chain(tp5_comm & c,
                     !norm_end || norm_end > p2.code.size()) {
                     c.fail("LateBind linear semantic split is invalid"); return false;
                 }
-                if (outgoing->late_q8_fast) {
+                if (outgoing->numerical_mode == tp5_numerical_mode::P1A_NOSIDECAR_Q8) {
+                    // P1-A measurement instrument: no-sidecar aggressive Q8 HC
+                    // Y is ready -> combine/RMS (late_norm) -> norm_ready -> ACT_Q8 -> act_ready ->
+                    // down Q8DOT -> q_local_ready -> LO_Q8 -> lo_ready -> UP_Q8DOT.
+                    if (!emit(p2, 0, norm_end)) {
+                        return false;
+                    }
+                    linear->late_steps.push_back({tp5_latebind_semantic_step::kind::WRITE_TREFS, "late_norm"});
+                    linear->late_steps.push_back({tp5_latebind_semantic_step::kind::BARRIER_NORM_ACT, "norm_ready"});
+
+                    if (!emit(pre, injected ? inject_end : 0, q_contract)) {
+                        return false;
+                    }
+                    linear->late_steps.push_back({tp5_latebind_semantic_step::kind::DISPATCH_ACT_Q8, "norm_act_q8"});
+                    linear->late_steps.push_back({tp5_latebind_semantic_step::kind::BARRIER_ACT_BUF, "act_ready"});
+
+                    if (!emit(pre, q_contract)) {
+                        return false;
+                    }
+                    linear->late_steps.push_back({tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT, "down_q8dot_local"});
+                    linear->late_steps.push_back({tp5_latebind_semantic_step::kind::BARRIER_LOCAL_Q, "q_local_ready"});
+
+                    linear->late_steps.push_back({tp5_latebind_semantic_step::kind::DISPATCH_LO_Q8, "lo_q8_local"});
+                    linear->late_steps.push_back({tp5_latebind_semantic_step::kind::BARRIER_LO_BUF, "lo_ready"});
+                    linear->late_steps.push_back({tp5_latebind_semantic_step::kind::DISPATCH_UP_Q8DOT, "up_q8dot_fold"});
+                } else if (outgoing->late_q8_fast) {
                     if (q_contract <= q_begin) {
                         c.fail("LateBind aggressive Q8 semantic split is missing"); return false;
                     }
@@ -5040,15 +5084,22 @@ static bool tp5_define_linear_chain(tp5_comm & c,
         }
         if (!linear->late_steps.empty()) {
             std::string war_err;
-            if (!tp5_validate_latebind_war_schedule(q8_sites > 0, linear->late_steps, war_err)) {
+            if (p1a_sites > 0) {
+                if (!tp5_validate_p1a_schedule(linear->late_steps, war_err)) {
+                    c.fail("P1-A linear schedule validation failed on rank " + std::to_string(r) + ": " + war_err);
+                    return false;
+                }
+            } else if (!tp5_validate_latebind_war_schedule(q8_sites > 0, linear->late_steps, war_err)) {
                 c.fail("LateBind linear WAR schedule validation failed on rank " + std::to_string(r) + ": " + war_err);
                 return false;
             }
         }
         const char * active_num_mode = (late_sites == 0) ? "reference" :
-                                       (q8_sites > 0 ? "aggressive-q8" : "exact-f32");
+                                       (p1a_sites > 0 ? "p1a-nosidecar-q8" :
+                                       (q8_sites > 0 ? "aggressive-q8" : "exact-f32"));
         const char * active_num_desc = (late_sites == 0) ? "reference-no-latebind" :
-                                       (q8_sites > 0 ? "aggressive-q8-quantized" : "exact-f32-strict-math");
+                                       (p1a_sites > 0 ? "p1a-nosidecar-q8-bench" :
+                                       (q8_sites > 0 ? "aggressive-q8-quantized" : "exact-f32-strict-math"));
         fprintf(stderr, "[tp5-linear-definition] rank=%zu stages=%zu primary_cbs=1 mode=%s desc=%s late=%zu "
                         "q8_fast=%zu scatter_early=%zu overlap=norm-q sidecar_pub=fused "
                         "dispatches=%zu barriers=%zu copies=%zu timing=%d\n",

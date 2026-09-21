@@ -17,6 +17,10 @@
 3. **Aggressive 模式（`aggressive-q8`）**：
    * **定义**：启用 LateBind 全流水线解耦 + activation Q8_0 量化 + 4-wave32 workgroup Q8xQ8 整数点积收缩 + FP16 sidecar 紧致传输 + LO Q8 激活重构；
    * **生效条件**：满足 LateBind 基础条件，未请求 exact Q，且五卡均支持硬件整数点积与 wave32 控制，且张量形状对齐、Q8 着色器管线创建成功。
+4. **P1-A 对照器具模式（`p1a-nosidecar-q8`）**：
+   * **定义**：用于与当前 sidecar LateBind 做同精度严格对照的测量对照器具，剥离调度重叠收益与近似算术收益。与 B（当前 aggressive LateBind）完全共用相同的 Q8_0 动态对称量化内核、Q8xQ8 整数点积（`dotPacked4x8EXT`）与 W_up/fold 实现；
+   * **差异核心**：模式 A 不设任何 sidecar，不做跨 rank Q 广播与 CPU 归约。其计算序列为：`Y 就绪 → combine/RMS (late_norm) → 激活量化 Q8 (norm_act_q8) → W_down Q8dot (down_q8dot_local) → LO Q8 (lo_q8_local) → W_up/fold Q8dot (up_q8dot_fold)`，所有 Q8 计算严格在 Y 就绪后在本地完成；
+   * **零影响保证**：此模式属于测量器具，默认严格关闭（`GGML_TP5_P1A_NOSIDECAR_Q8=0`）。关闭时既有路径（`reference`、`exact-f32`、`aggressive-q8`）的命令编排、屏障安排及数值完全不变，无任何运行时逐 token 判定开销。
 
 ### 模式判定与定义期输出示例
 
