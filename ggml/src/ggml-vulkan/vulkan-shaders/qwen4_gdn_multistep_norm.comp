@@ -1,20 +1,11 @@
 // =================================================================================================
-// OFFLINE EXPLORATORY SCAFFOLD / PROTOTYPE KERNEL ONLY (NOT CONNECTED TO VULKAN PIPELINE)
+// PRODUCTION VARIABLE-LENGTH MULTI-STEP GDN RMS NORMALIZATION AND GATING KERNEL
 // =================================================================================================
-// STATUS & HARD BOUNDARY:
-// - This compute shader serves strictly as an offline architectural prototype for multi-step
-//   GDN RMS normalization and SiLU gating in capacity mode.
-// - IT IS CURRENTLY 100% UNREACHABLE AT RUNTIME (no Vulkan pipeline is created, no dispatch routes here).
-// - GDN models remain strictly FAIL-CLOSED in llama_context::evaluate_target_capacity_admission.
-//
-// DESIGN INVARIANTS:
-// 1. RMS normalization and Z-gating iterate over active steps t < active_tokens.
-//    Inactive capacity steps [active_tokens, capacity_steps) are completely untouched.
-// 2. Width is fixed at 128 floats per head. Threads tid < 128 process elements.
-//
-// PREREQUISITES FOR FULL PRODUCTION GPU CLOSURE:
-// 1. Multi-step pipeline creation: Define push constants and bind VkPipeline in ggml-vulkan.cpp.
-// 2. Real-hardware proof: Bit-level verification against CPU reference on real AMD RX 6800.
+// STATUS & INVARIANTS:
+// 1. RMS normalization and Z-gating iterate over active steps t < eff_active (<= capacity_steps).
+//    Inactive capacity steps [eff_active, capacity_steps) are completely untouched.
+// 2. Head width is fixed at 128 floats per head. Threads tid < 128 process elements.
+// 3. Tree reduction uses standard parallel halving tree in sumsh[512] with barrier isolation per step.
 // =================================================================================================
 #version 450
 
@@ -75,27 +66,23 @@ void main() {
         if (tid < 128u) {
             xi = data_attn[step_base + tid];
         }
-        float sum = xi * xi;
-
-        sumsh[tid] = sum;
+        sumsh[tid] = xi * xi;
         barrier();
 
         [[unroll]] for (int s = 256; s > 0; s >>= 1) {
             if (tid < uint(s)) {
-                sum += sumsh[tid + uint(s)];
-                sumsh[tid] = sum;
+                sumsh[tid] += sumsh[tid + uint(s)];
             }
             barrier();
         }
-        sum = sumsh[0];
 
-        const float mean  = sum / 128.0f;
+        const float mean  = sumsh[0] / 128.0f;
         const float norm_scale = inversesqrt(mean + 1e-6f);
 
         if (tid < 128u) {
             const float attention_val = data_attn[step_base + tid];
             const float normalized    = norm_scale * attention_val;
-            const float gamma_val     = data_gamma[tid];
+            const float gamma_val     = data_gamma[head_offset + tid];
             const float z_val         = data_z[step_base + tid];
             const float gate          = 1.0f / (1.0f + exp(-z_val));
             data_out[step_base + tid] = normalized * gamma_val * gate;

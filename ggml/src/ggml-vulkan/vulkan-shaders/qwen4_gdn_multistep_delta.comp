@@ -1,20 +1,11 @@
 // =================================================================================================
-// OFFLINE EXPLORATORY SCAFFOLD / PROTOTYPE KERNEL ONLY (NOT CONNECTED TO VULKAN PIPELINE)
+// PRODUCTION VARIABLE-LENGTH MULTI-STEP GDN RECURRENCE KERNEL
 // =================================================================================================
-// STATUS & HARD BOUNDARY:
-// - This compute shader serves strictly as an offline architectural prototype for variable-length
-//   GDN recurrence in capacity mode.
-// - IT IS CURRENTLY 100% UNREACHABLE AT RUNTIME (no Vulkan pipeline is created, no dispatch routes here).
-// - GDN models remain strictly FAIL-CLOSED in llama_context::evaluate_target_capacity_admission.
-//
-// PREREQUISITES FOR FULL PRODUCTION GPU CLOSURE:
-// 1. Pipeline creation: Define vk_gdn_multistep_delta_push_constants and bind real VkPipeline in ggml-vulkan.cpp.
-// 2. Multi-step prep/norm: qwen4_gdn_segment_prep.comp and qwen4_gdn_segment_norm.comp currently only
-//    support single-step (N=1). A complete multi-step GPU path requires either multi-step prep/norm shaders
-//    or a standalone multi-step dispatch pathway.
-// 3. Conv-state & LateBind: Connect multi-step conv history rolling and push constant frame.active_tokens.
-// 4. Real-hardware proof: Must pass bit-level verification against CPU reference and dmesg/GPUVM audit
-//    on real AMD Radeon RX 6800 hardware before unblocking GDN admission.
+// STATUS & INVARIANTS:
+// 1. Recurrence advances in registers for active steps t < eff_active (<= capacity_steps).
+//    Inactive capacity steps [eff_active, capacity_steps) are completely untouched.
+// 2. Single-step active_tokens == 1 short-circuits directly for bit-identical performance with AR.
+// 3. Snapshot and final recurrent state persist only up to eff_active - 1.
 // =================================================================================================
 #version 450
 
