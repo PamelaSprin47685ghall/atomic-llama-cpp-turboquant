@@ -104,6 +104,40 @@
 3. Q10 收益账：独立接受率 a、b 笔下保守方案整步通过率 a^b；联合草稿必须预测多笔相互影响后的下一 frontier。验证窗口先收在固定 cohort、普通 BODY 区间。
 4. GPU 化顺序：Q3（多读者共享块，纯数据供给复用）→ Q6（WY 折叠，F32 门 2.5e-5）→ Q5（低秩，F32 门 ~5e-7 相对）→ Q7（LUT，需实测“减乘法≠减耗时”）。
 
+---
+
+## 下班交接｜2026-09-22（第三轮，Q2/Q4 生产化）
+
+**分支：** `master`（本轮 commit 见 git log；基于 `2b7b479d2`）
+**主题：** 把上一轮交接“下一步建议 1”落地：Q2/Q4 的结构/数值分离接入 decode 热路径。**未启动任何模型/GPU 测试**（开发机单 780M iGPU，遵守真机安全门；目标机模型 `/opt/llama/data/...` 本机不存在，semantic-smoke 无法在本机跑）。
+
+### 一、已合入
+
+|内容|入口|
+|---|---|
+|`llama_rerot_build_query_layouts_shared`：同一 reader 多 query 行的批量布局——结构一次（可见性分类 FULL/gated、两臂排序、per-run 升序 storage 数组、own-row 查找），每 query 只做数值（二分 causal 截断、virtual 计数、一次稳定排序分组）|`src/llama-rerot.{h,cpp}`|
+|`rerot_build_attn_layout` 组内路径切换到共享构建器（按 reader 分组后一次结构扫描，ownership 由组首行解析一次）|`src/llama-kv-cache.cpp`|
+|逐 query `llama_rerot_build_query_layout` **保留为 oracle**，未删除未修改|同上|
+|随机对拍测试（200 轮：全臂共存、STRONG/LAG1、边界位置、打乱行序）＋ cache 级回归（真实 `llama_kv_cache` + view 安装 + 5 行单 seq MTP-verify 形态，逐行对拍 oracle）|`tests/test-rerot-view.cpp`、`tests/test-xkv-runtime.cpp`|
+
+### 二、验证证据
+
+- `test-rerot-view`：0 failure（含新 `test_shared_layouts_vs_oracle`，200 轮随机对拍 group-for-group/entry-for-entry 一致）。
+- `test-xkv-runtime`：全过（含新 `test_rerot_shared_reader_multi_query`，真实 cache 级路径）。
+- rerot/xkv/flashprefill 全家 **45/45** ctest；`git diff --check` 干净。
+- **实测收益**（开发机 CPU，合成 K 键/Q 行，throwaway bench 已清理）：Q=6（单 pen MTP verify 形态）**5–8×**（K=4096：1046→156 us；K=16384,Q=12：8920→1074 us；K=65536,Q=6：20737→3784 us）；Q=1 也 ~1.1×。
+
+### 三、关键事实与纠错记录
+
+1. **第一版实现曾把 FULL（foreign public）行提前 emission，与 oracle 的 base→tagged(rank序) 全局序不一致**，200 轮对拍立即抓出（14800 断言失败）。修正后按 oracle 两臂分解（BASE 臂 + TAGGED 臂 rank-major 段）全绿——对拍 oracle 的设计直接兑付了价值。
+2. **同 run 同 owner 是硬不变量**：causal 标志由 `(node==reader)` 决定，同 run 恒同 node；实现内加了运行时断言。合成测试数据若违反此约束会被拒绝（不是静默错排）。
+3. **ownership 组内恒定成立**：分组按 `&rerot_reader_views[seq]` 指针，一个 view slot 即一个 seq；MTP verify 多行同 seq 共享同 view。
+
+### 四、下一步建议
+
+1. Q2/Q4 生产化剩余方向（RERoT.md §21.3）：写入布局维持长 span（`span_long_fraction` 验收指标）；flashprefill `llama_rerot_split_table_fragments` 调用点接 run-order 签名缓存。
+2. 目标机验证顺序：`test-rerot-view`/`test-xkv-runtime` 已 CPU 证明等价；真机收益需在目标机用真实模型跑 `rerot-semantic-smoke.py` 对比 decode 阶段 host 时间。
+3. Q3（多读者共享块）GPU 化仍是最大跨笔共享机会；Q5/Q6 F32 门已实测（相对 ~5e-7 / 绝对 ~2.5e-5）。
 
 ---
 

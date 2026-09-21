@@ -1171,6 +1171,165 @@ static void test_chapter09_exhaustive_dag_properties() {
     CHECK(dag_count > 0);
 }
 
+
+// ---------------------------------------------------------------------------
+// Shared-reader batched layout vs per-query oracle (2026-09-22 round).
+// llama_rerot_build_query_layouts_shared is the decode hot path's
+// structure/numeric split: one structural pass (classification, ordering,
+// per-run causal arrays) per reader state, then per-query numeric work.
+// The per-query builder stays the oracle: every batched output must equal
+// the per-query output group-for-group, entry-for-entry, including
+// query_virtual_pos. Randomized across arms (FULL foreign public, gated
+// private/pending, own frontier-equal public, untagged base, invisible
+// foreign), frontier modes, and query positions (before/inside/past every
+// run boundary).
+// ---------------------------------------------------------------------------
+static bool layouts_identical(
+        const llama_rerot_query_layout & shared,
+        const llama_rerot_query_layout & oracle,
+        const char * tag) {
+    bool ok = true;
+    if (shared.query_virtual_pos != oracle.query_virtual_pos) {
+        std::fprintf(stderr, "FAIL %s: query_virtual_pos %d vs %d\n", tag,
+            (int) shared.query_virtual_pos, (int) oracle.query_virtual_pos);
+        ok = false;
+    }
+    if (shared.groups.size() != oracle.groups.size() ||
+        shared.entries.size() != oracle.entries.size()) {
+        std::fprintf(stderr, "FAIL %s: shape (%zu g/%zu e) vs (%zu g/%zu e)\n", tag,
+            shared.groups.size(), shared.entries.size(),
+            oracle.groups.size(), oracle.entries.size());
+        return false;
+    }
+    for (size_t i = 0; i < shared.groups.size(); ++i) {
+        if (shared.groups[i].effective_pos != oracle.groups[i].effective_pos) {
+            std::fprintf(stderr, "FAIL %s: group %zu eff %d vs %d\n", tag, i,
+                (int) shared.groups[i].effective_pos,
+                (int) oracle.groups[i].effective_pos);
+            ok = false;
+        }
+    }
+    for (size_t i = 0; i < shared.entries.size(); ++i) {
+        if (shared.entries[i].key_index != oracle.entries[i].key_index ||
+            shared.entries[i].group_index != oracle.entries[i].group_index) {
+            std::fprintf(stderr, "FAIL %s: entry %zu (%u->%u) vs (%u->%u)\n", tag, i,
+                shared.entries[i].key_index, shared.entries[i].group_index,
+                oracle.entries[i].key_index, oracle.entries[i].group_index);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+static llama_kv_rerot_meta make_meta(
+        uint64_t episode,
+        llama_rerot_node_id node,
+        llama_rerot_run_id run,
+        llama_rerot_visibility vis,
+        uint64_t frontier) {
+    llama_kv_rerot_meta m;
+    m.episode_id = episode;
+    m.node_id = node;
+    m.run_id = run;
+    m.visibility = vis;
+    m.frontier = frontier;
+    return m;
+}
+
+static void test_shared_layouts_vs_oracle() {
+    constexpr uint64_t episode = 4242;
+    constexpr llama_rerot_node_id own = 1, peer = 2, foreign = 3;
+    constexpr llama_rerot_run_id run_base = 50; // untagged base rows carry no run
+    constexpr llama_rerot_run_id run_own = 51, run_peer_pub = 52,
+                                run_own_priv = 53, run_foreign_priv = 54;
+
+    std::mt19937_64 rng(0xC0FFEEull);
+    for (int iter = 0; iter < 200; ++iter) {
+        const llama_rerot_frontier_mode mode =
+            (iter % 2) ? LLAMA_REROT_FRONTIER_LAG1 : LLAMA_REROT_FRONTIER_STRONG;
+        const uint64_t reader_frontier = 3;
+
+        llama_rerot_reader_state reader;
+        reader.episode_id = episode;
+        reader.reader = own;
+        reader.query_run = run_own;
+        reader.frontier = reader_frontier;
+        reader.frontier_mode = mode;
+        reader.ordered_runs = { run_peer_pub, run_own_priv, run_own };
+
+        // Key world: every arm at once, storage positions shuffled across
+        // physical indices so ordering work is real. Storage values are
+        // drawn from a small dense range with duplicates across arms (the
+        // comparators must break ties identically).
+        std::vector<llama_rerot_key_record> keys;
+        {
+            uint32_t next_idx = 0;
+            const auto push = [&](llama_pos storage, bool owned, llama_kv_rerot_meta meta) {
+                keys.push_back({ next_idx++, storage, owned, meta });
+            };
+            // Untagged base: owned rows visible (causally gated); a foreign
+            // untagged row never is.
+            push(0, true, {});
+            push(1, true, {});
+            push(2, false, {});
+            push(5, true, {});
+            // Own run rows (public, own node): frontier <= reader frontier,
+            // owned, causally gated — includes the current decode row.
+            push(3, true, make_meta(episode, own, run_own, llama_rerot_visibility::public_live, 3));
+            push(4, true, make_meta(episode, own, run_own, llama_rerot_visibility::public_live, 3));
+            push(6, true, make_meta(episode, own, run_own, llama_rerot_visibility::public_live, 2));
+            // Own private rows: gated.
+            push(2, true, make_meta(episode, own, run_own_priv, llama_rerot_visibility::private_control, 0));
+            push(7, true, make_meta(episode, own, run_own_priv, llama_rerot_visibility::pending_record, 0));
+            // Peer public rows: frontier-dependent FULL vs invisible.
+            push(0, false, make_meta(episode, peer, run_peer_pub, llama_rerot_visibility::public_live, 1));
+            push(1, false, make_meta(episode, peer, run_peer_pub, llama_rerot_visibility::public_live, 2));
+            push(2, false, make_meta(episode, peer, run_peer_pub, llama_rerot_visibility::public_live, 3));
+            // Foreign private: never visible.
+            push(3, false, make_meta(episode, foreign, run_foreign_priv, llama_rerot_visibility::private_control, 0));
+            // Wrong-episode public: dropped.
+            push(4, false, make_meta(episode + 1, peer, run_peer_pub, llama_rerot_visibility::public_live, 0));
+            // Physical shuffle: reverse insertion order of the key vector.
+            std::shuffle(keys.begin(), keys.end(), rng);
+        }
+
+        // Query positions: every boundary of every arm, plus extremes.
+        std::vector<llama_pos> positions;
+        for (llama_pos p = 0; p <= 8; ++p) {
+            positions.push_back(p);
+        }
+        positions.push_back(100);
+        // Shuffle the QUERY batch too: the shared builder's outputs are
+        // positional, so this checks row-to-output alignment.
+        std::shuffle(positions.begin(), positions.end(), rng);
+
+        bool threw_shared = false, threw_oracle = false;
+        std::vector<llama_rerot_query_layout> shared;
+        try {
+            shared = llama_rerot_build_query_layouts_shared(reader, positions, keys);
+        } catch (const std::exception &) {
+            threw_shared = true;
+        }
+        std::vector<llama_rerot_query_layout> oracle;
+        try {
+            for (const llama_pos p : positions) {
+                oracle.push_back(llama_rerot_build_query_layout(reader, p, keys));
+            }
+        } catch (const std::exception &) {
+            threw_oracle = true;
+        }
+        CHECK(threw_shared == threw_oracle);
+        if (threw_shared) {
+            continue;
+        }
+        CHECK(shared.size() == oracle.size());
+        for (size_t i = 0; i < shared.size(); ++i) {
+            const std::string tag = "iter " + std::to_string(iter) + " pos " + std::to_string(positions[i]);
+            CHECK(layouts_identical(shared[i], oracle[i], tag.c_str()));
+        }
+    }
+}
+
 int main() {
     std::fprintf(stderr, "=== RERoT View Tests ===\n");
     test_dag_cycle_preferred_topo();
@@ -1190,6 +1349,7 @@ int main() {
     test_queue_independence();
     test_writer_mutation_stability();
     test_run_epoch_contract();
+    test_shared_layouts_vs_oracle();
     std::fprintf(stderr, "=== Results: %d failure(s) ===\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

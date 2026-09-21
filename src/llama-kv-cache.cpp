@@ -6248,7 +6248,18 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
     for (const auto & group : groups) {
         const auto & reader = *group.view;
 
-        // One scan + one sort per distinct reader state.
+        // One structural scan per distinct reader state: classify, order,
+        // and precompute per-run causal-cut arrays ONCE. Every query row of
+        // this reader then performs only numeric work (binary-search cuts,
+        // virtual arithmetic, one stable sort of its visible entries) via
+        // llama_rerot_build_query_layouts_shared — the structure/numeric
+        // separation of the 2026-09-22 round. Rows sharing a reader-view
+        // slot share one execution sequence, so ownership is constant for
+        // the group and is filled once here.
+        // Rows sharing one reader-view slot share one execution sequence
+        // (the view IS per-sequence), so ownership is constant for the
+        // group and is resolved once from the first row.
+        const llama_seq_id seq_id = ubatch.seq_id[group.rows.front()][0];
         std::vector<llama_rerot_key_record> keys;
         keys.reserve(n_kv);
         for (uint32_t key = 0; key < n_kv; ++key) {
@@ -6258,24 +6269,26 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
             keys.push_back({
                 key,
                 cells.pos_get(key),
-                false, // ownership is per query row; filled per row below
+                cells.seq_has(key, seq_id),
                 cells.rerot_get(key),
             });
         }
 
+        std::vector<llama_pos> query_pos;
+        query_pos.reserve(group.rows.size());
         for (const uint32_t query : group.rows) {
-            const llama_seq_id seq_id = ubatch.seq_id[query][0];
-            for (auto & key : keys) {
-                key.owned_by_reader = cells.seq_has(key.key_index, seq_id);
-            }
+            query_pos.push_back(ubatch.pos[query]);
+        }
 
-            auto query_layout = llama_rerot_build_query_layout(reader, ubatch.pos[query], keys);
+        const auto query_layouts = llama_rerot_build_query_layouts_shared(reader, query_pos, keys);
+        for (size_t i = 0; i < group.rows.size(); ++i) {
+            const uint32_t query = group.rows[i];
             const uint32_t group_base = static_cast<uint32_t>(result.groups.size());
-            for (auto g : query_layout.groups) {
+            for (auto g : query_layouts[i].groups) {
                 g.query_index = query;
                 result.groups.push_back(g);
             }
-            for (auto entry : query_layout.entries) {
+            for (auto entry : query_layouts[i].entries) {
                 entry.group_index += group_base;
                 result.entries.push_back(entry);
             }

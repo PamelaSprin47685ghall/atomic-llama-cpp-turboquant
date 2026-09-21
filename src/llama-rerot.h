@@ -259,6 +259,26 @@ llama_rerot_query_layout llama_rerot_build_query_layout(
     llama_pos query_storage_pos,
     const std::vector<llama_rerot_key_record> & keys);
 
+// Batched counterpart for query rows sharing ONE reader state (2026-09-22
+// compute-organization round: structure/numeric separation in the decode hot
+// path). The structural pass — visibility classification (FULL vs
+// causally-gated), per-arm ordering, per-key prefix counts, own-row lookup
+// table — runs ONCE per call, and every query row then performs only numeric
+// work: causal cuts by binary search over precomputed storage arrays,
+// virtual arithmetic from prefix counts, effective-position grouping by one
+// stable sort of the visible entries. Output[i] is EXACTLY
+// llama_rerot_build_query_layout(reader, query_storage_pos[i], keys) — same
+// groups, same entries, same order, same query_virtual_pos — so the per-query
+// builder remains the oracle (tests compare the two directly). Ownership in
+// `keys` must already reflect ONE sequence (rows sharing a reader-view slot
+// share their execution sequence); the caller fills it per group.
+// Throws the same exceptions as the per-query builder, in the same order
+// (reader validity, every position, run view, then per-key checks).
+std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
+    const llama_rerot_reader_state & reader,
+    const std::vector<llama_pos> & query_storage_pos,
+    const std::vector<llama_rerot_key_record> & keys);
+
 // Pure logical document/tree model. It never stores physical KV indices.
 class llama_rerot_document {
 public:
