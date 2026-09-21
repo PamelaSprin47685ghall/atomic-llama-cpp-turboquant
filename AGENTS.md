@@ -141,6 +141,10 @@ cache 级另省整个 R×K 字节展开＋R 个 K 长度向量分配（未计入
 
 纯函数模块的"类型独立"不必靠字节展开买——**POD view（指针＋宽度）同样零依赖**，还省掉转换。第七轮当时的"kept as bytes so llama-rerot stays independent"是伪约束。
 
+### 六、追加（同班次末尾）：oracle 去重 bitmap 化
+
+逐 query oracle（`llama_rerot_build_query_layout`）的 duplicate-key 检查仍是 unordered_set——shared/multi-reader 早在前几轮就换成 bitmap（实测 1141→45 us@K=65536）。oracle 不在 decode 热路径，但 view 测试 200 轮×R reader×每 query 都调它。已换 bitmap（语义不变：首个重复抛同消息），45/45 全绿，builder 基准无回归（bits 2409/16995 us 同噪声带）。commit `857286efe`。
+
 ### 五、Q3 host 侧收口状态与下一步
 
 九轮＋本轮后，`rerot_build_attn_layout` 的 cache→builder 链路：单趟 cell 扫描（bitset 填充）→ bitset 直供 → 共享结构 pass → reader 无关属性共享 → Q=6 数值快通道。**host 侧 Q3（公共 KV 块服务多读者）的组织层工作已收口**；剩余大项全部需要目标机/批准：
