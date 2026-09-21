@@ -331,6 +331,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-cuda.h
     include/ggml-opt.h
     include/ggml-predefined.h
+    include/ggml-device-copy.h
     include/ggml-metal.h
     include/ggml-rpc.h
     include/ggml-virtgpu.h

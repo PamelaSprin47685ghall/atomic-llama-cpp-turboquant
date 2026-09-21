@@ -19,6 +19,9 @@
 
 struct llama_model;
 struct llama_predefined_session;
+struct llama_predefined_hidden_store;
+struct llama_predefined_hidden_range;
+struct llama_device_hidden_input;
 struct ggml_predefined_capacity;
 class llama_batch_allocr;
 
@@ -75,6 +78,16 @@ struct llama_context {
     ggml_backend_sched_compute_pool_t get_compute_pool() const;
     bool prepare_predefined_mtp(llama_context & draft, uint32_t max_draft_tokens);
     const ggml_predefined_capacity * predefined_capacity() const;
+    bool enable_predefined_hidden(llama_context & draft);
+    uint32_t predefined_hidden_rows();
+    uint64_t predefined_hidden_generation() const;
+    bool predefined_hidden_copy(const llama_predefined_hidden_range * ranges, size_t n_ranges);
+    int decode_predefined_hidden(llama_batch batch, const llama_predefined_hidden_range * ranges, size_t n_ranges);
+    bool predefined_hidden_carry_io(float * data, size_t bytes, bool write);
+    bool predefined_hidden_reset();
+    bool predefined_hidden_capture(ggml_backend_t producer, const ggml_tensor * tensor, uint32_t offset, uint32_t rows);
+    bool predefined_hidden_readback();
+    bool predefined_hidden_bind_ubatch(llama_ubatch & ubatch, llama_device_hidden_input & input);
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
@@ -674,6 +687,8 @@ private:
     // `sched` is built over `compute_pool`, so it must also stay declared after
     // it in order to be destroyed first.
     ggml_backend_sched_compute_pool_ptr compute_pool;
+    // Declared before sched: scheduler retirement precedes buffer destruction.
+    std::unique_ptr<llama_predefined_hidden_store> predefined_hidden;
     // Shared by the target and MTP contexts. Owns capacity, not per-shape graphs.
     std::shared_ptr<llama_predefined_session> predefined_session;
     ggml_backend_sched_ptr sched;

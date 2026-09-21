@@ -202,6 +202,8 @@ add_library(ggml-base
             ggml.cpp
             ggml-alloc.c
             ggml-predefined.cpp
+            ggml-device-copy.cpp
+            ../include/ggml-device-copy.h
             ggml-flashprefill.cpp
             ggml-backend.cpp
             ggml-backend-meta.cpp

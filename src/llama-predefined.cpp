@@ -83,7 +83,10 @@ bool llama_context::prepare_predefined_mtp(llama_context & draft, uint32_t max_d
         ggml_backend_sched_compute_pool_set_retain_capacity(compute_pool.get(), true);
         // Embedding/sampler policy is already finalized by the MTP constructor.
         // Measure/reserve both mathematical entries before sealing. Existing
-        // per-buffer-type pooling takes max(target,draft), never their sum.
+        // pooling shares max(target,draft) only for IDENTICAL buffer types.
+        // Separate model-owned meta buffer types must not be aliased merely
+        // because their physical device lists happen to match: split hooks
+        // and model userdata belong to their respective wrappers.
         sched_need_reserve = true;
         draft.sched_need_reserve = true;
         sched_reserve();
@@ -97,7 +100,7 @@ bool llama_context::prepare_predefined_mtp(llama_context & draft, uint32_t max_d
         ggml_backend_sched_compute_pool_set_capacity_sealed(compute_pool.get(), true);
         predefined_session = definition;
         draft.predefined_session = std::move(definition);
-        LLAMA_LOG_INFO("%s: rows=%u verify=%u outputs=%u hidden=%u wire=%u; one shared maximum workspace (resource layer)\n",
+        LLAMA_LOG_INFO("%s: rows=%u verify=%u outputs=%u hidden=%u wire=%u; retained/sealed per-buffer-type maximum pool (resource layer)\n",
                        __func__, cap.tokens, cap.verify_tokens, limits.output_rows, limits.hidden_width, limits.wire_bytes);
         return true;
     } catch (const std::exception & e) {

@@ -19,6 +19,9 @@ add_library(llama
             llama-chat.cpp
             llama-context.cpp
             llama-predefined.cpp
+            llama-predefined-hidden.cpp
+            llama-predefined-hidden.h
+            ../include/llama-predefined-hidden.h
             llama-predefined-session.h
             llama-cparams.cpp
             llama-tp5-plan.h

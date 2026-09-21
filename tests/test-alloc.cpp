@@ -1,4 +1,5 @@
 #include "ggml-alloc.h"
+#include "ggml-device-copy.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "ggml-cpp.h"
 #include "../ggml/src/ggml-impl.h"
@@ -761,6 +762,41 @@ static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(!graph_reuses_allocation(true));
 }
 
+static void test_device_copy_contract() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX, 4);
+    backend.context->buffer_interface.get_tensor = [](ggml_backend_buffer_t, const ggml_tensor *, void *, size_t, size_t) {
+        GGML_ABORT("device-only copy attempted host readback");
+    };
+    backend.context->buffer_interface.set_tensor = [](ggml_backend_buffer_t, ggml_tensor *, const void *, size_t, size_t) {
+        GGML_ABORT("device-only copy attempted host upload");
+    };
+    auto [ctx, graph, ctx_ptr] = make_context();
+    GGML_UNUSED(graph);
+    auto * src = make_input_with_size(ctx, 64);
+    auto * dst = make_input_with_size(ctx, 64);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors_from_buft(ctx, &backend.buffer_type));
+    GGML_ASSERT(buffer);
+    ggml_device_copy_range range{src, dst, 4, 8, 32};
+    GGML_ASSERT(ggml_device_copy_ranges_valid(&range, 1));
+    GGML_ASSERT(!ggml_backend_device_copy_ranges(&backend.backend, &range, 1, true));
+    GGML_ASSERT(!ggml_backend_device_copy_ranges(&backend.backend, &range, 1, false));
+    GGML_ASSERT(ggml_backend_device_copy_ranges(&backend.backend, nullptr, 0, false));
+    range.src_offset = 60;
+    GGML_ASSERT(!ggml_device_copy_ranges_valid(&range, 1));
+    range.src_offset = SIZE_MAX - 3;
+    GGML_ASSERT(!ggml_device_copy_ranges_valid(&range, 1));
+    range.src_offset = 0;
+    range.dst_offset = 1;
+    GGML_ASSERT(!ggml_device_copy_ranges_valid(&range, 1));
+    range.dst_offset = 0;
+    range.bytes = SIZE_MAX - 3;
+    GGML_ASSERT(!ggml_device_copy_ranges_valid(&range, 1));
+    range.bytes = 64;
+    GGML_ASSERT(ggml_device_copy_ranges_valid(&range, 1));
+    GGML_ASSERT(!ggml_device_copy_ranges_valid(&range, GGML_DEVICE_COPY_MAX_RANGES + 1));
+    GGML_ASSERT(!ggml_device_copy_ranges_valid(nullptr, 1));
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -785,5 +821,6 @@ int main() {
     run("test_shared_buffer_pool_union", test_shared_buffer_pool_union);
     run("test_predefined_maximum_pool", test_predefined_maximum_pool);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
+    run("test_device_copy_contract", test_device_copy_contract);
     return 0;
 }

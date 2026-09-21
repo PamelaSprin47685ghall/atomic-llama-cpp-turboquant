@@ -9,6 +9,8 @@ extern "C" {
 
 // Startup-only TP5/Qwen4EXP MTP maximum-capacity resource preparation. Target
 // and draft share one high-water compute pool and one immutable capacity record.
+// Allocations are shared only between identical buffer types; different meta
+// model wrappers still have separate entries, even on the same GPU set.
 // It reserves graphs for sizing only; it does not execute a model or a shader.
 // Existing non-TP5/non-Qwen MTP paths are unchanged (success, no session attached).
 //

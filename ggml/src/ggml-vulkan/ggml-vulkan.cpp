@@ -1,6 +1,7 @@
 #include "ggml-vulkan.h"
 #include "ggml-vulkan-tp5-liveness.hpp"
 #include "ggml-tp5-profile.h"
+#include "ggml-device-copy.h"
 #include <vulkan/vulkan_core.h>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
@@ -1109,7 +1110,11 @@ struct vk_device_struct {
     vk_pipeline pipeline_moe_shared_up_swiglu;
     vk_pipeline pipeline_moe_projections[2];
     vk_pipeline pipeline_attention_projections[2];
-    vk_pipeline pipeline_attention_projections_mmvq[2];
+    // Mask is a specialization constant so unused arithmetic branches can be
+    // removed from the executable rather than kept behind a uniform runtime
+    // branch. Registration is cheap; the normal lazy pipeline path compiles
+    // only requested combinations. Mask 0 uses the existing native pipeline.
+    vk_pipeline pipeline_attention_projections_mmvq[2][8];
     // Same output epilogues with built-in Q5_K x Q8_1 integer contraction.
     vk_pipeline pipeline_output_q5k_mmvq_wire;
     vk_pipeline pipeline_output_q5k_mmvq_relay[2];
@@ -1920,13 +1925,7 @@ struct vk_attention_projections_push_constants {
     uint32_t rows2;
 };
 
-struct vk_attention_projections_mmvq_push_constants {
-    vk_attention_projections_push_constants projection;
-    uint32_t mmvq_mask;
-};
 static_assert(sizeof(vk_attention_projections_push_constants) == 16, "attention projection ABI");
-static_assert(sizeof(vk_attention_projections_mmvq_push_constants) == 20, "attention MMVQ ABI");
-static_assert(offsetof(vk_attention_projections_mmvq_push_constants, mmvq_mask) == 16, "attention MMVQ mask ABI");
 
 struct vk_op_multi_add_push_constants {
     // shape for dst
@@ -6409,12 +6408,17 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                                                qwen4_qsa_projections_mmvq_len;
                     const unsigned char * mmvq_data = variant == 0 ? qwen4_gdn_projections_mmvq_data :
                                                                      qwen4_qsa_projections_mmvq_data;
-                    ggml_vk_create_pipeline(device, device->pipeline_attention_projections_mmvq[variant],
-                                            variant == 0 ? "gdn_projections_mmvq" : "qsa_projections_mmvq",
-                                            mmvq_length, mmvq_data, "main", 10,
-                                            sizeof(vk_attention_projections_mmvq_push_constants),
-                                            { 1, 1, 1 }, { subgroup_size16, rm_kq, 2 }, 1, true, true,
-                                            force_subgroup_size16);
+                    for (uint32_t mask = 1; mask < 8; ++mask) {
+                        if (variant == 1 && (mask & 2u)) continue; // QSA has only one Q5 matrix
+                        const std::string name = std::string(variant == 0 ? "gdn_projections_mmvq_" :
+                                                                                       "qsa_projections_mmvq_") +
+                                                 std::to_string(mask);
+                        ggml_vk_create_pipeline(device, device->pipeline_attention_projections_mmvq[variant][mask],
+                                                name.c_str(), mmvq_length, mmvq_data, "main", 10,
+                                                sizeof(vk_attention_projections_push_constants),
+                                                { 1, 1, 1 }, { subgroup_size16, rm_kq, 2, mask }, 1, true, true,
+                                                force_subgroup_size16);
+                    }
                 }
 #endif
             }
@@ -11579,7 +11583,7 @@ static bool ggml_vk_tp5_q5k_output(ggml_backend_vk_context * ctx, vk_context & s
                                    const vk_subbuffer & fuse1, vk_mat_vec_push_constants pc) {
     if (!output || output != ctx->wire_producer || output->type != GGML_TYPE_F32 ||
         !ggml_is_contiguous(output) || ggml_nelements(output) != pc.stride_d ||
-        pc.ncols == 0 || pc.ncols % 256 != 0 || pc.base_work_group_y != 0 ||
+        pc.stride_d == 0 || pc.ncols == 0 || pc.ncols % 256 != 0 || pc.base_work_group_y != 0 ||
         pc.ne02 != 1 || pc.ne12 != 1 || pc.broadcast2 != 1 || pc.broadcast3 != 1)
         return false;
     auto & relay = quantized_input ? ctx->device->pipeline_output_q5k_mmvq_relay[ctx->wire_relay_f32 ? 1 : 0] :
@@ -11859,6 +11863,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         const bool tp5_output = !swap_inputs && src0->type == GGML_TYPE_Q5_K &&
             src1->type == GGML_TYPE_F32 && !x_non_contig && !y_non_contig &&
             mat_vec_cols == 1 && dispatch_batches == 1 &&
+            ggml_nelements(src0) <= UINT32_MAX &&
             ggml_nbytes(src0) <= ctx->device->properties.limits.maxStorageBufferRange &&
             ggml_vk_tp5_q5k_output(ctx, subctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops],
                                    quantize_y, d_X, d_Y, d_D, d_F0, d_F1, pc);
@@ -16052,9 +16057,8 @@ static void ggml_vk_attention_projections(ggml_backend_vk_context * ctx,
                                                       static_cast<uint32_t>(node(1)->ne[0]),
                                                       static_cast<uint32_t>(node(qsa ? 3 : 2)->ne[0]) };
     const uint32_t groups = CEIL_DIV(pc.rows0, 2) + CEIL_DIV(pc.rows1, 2) + CEIL_DIV(pc.rows2, 2);
-    auto & integer_pipeline = ctx->device->pipeline_attention_projections_mmvq[qsa ? 1 : 0];
     uint32_t mmvq_mask = 0;
-    if (integer_pipeline && ctx->device->integer_dot_product) {
+    if (ctx->device->integer_dot_product) {
         if (ggml_vk_should_use_mmvq(ctx->device, pc.rows0, 1, pc.width, GGML_TYPE_Q5_K))
             mmvq_mask |= 1u;
         if (!qsa && ggml_vk_should_use_mmvq(ctx->device, pc.rows1, 1, pc.width, GGML_TYPE_Q5_K))
@@ -16076,15 +16080,15 @@ static void ggml_vk_attention_projections(ggml_backend_vk_context * ctx,
             seen |= bit;
         }
     };
+    auto & integer_pipeline = ctx->device->pipeline_attention_projections_mmvq[qsa ? 1 : 0][mmvq_mask];
     vk_subbuffer quantized;
-    if (mmvq_mask != 0u && ggml_vk_region_q8_input(ctx, subctx, node(0)->src[1], quantized)) {
-        const vk_attention_projections_mmvq_push_constants qpc{pc, mmvq_mask};
+    if (mmvq_mask != 0u && integer_pipeline && ggml_vk_region_q8_input(ctx, subctx, node(0)->src[1], quantized)) {
         ggml_pipeline_request_descriptor_sets(ctx, integer_pipeline, 1);
         ggml_vk_dispatch_pipeline(
             ctx, subctx, integer_pipeline,
             { binding(node(0)->src[0]), binding(node(1)->src[0]), binding(node(2)->src[0]), binding(node(3)->src[0]),
               binding(node(0)->src[1]), binding(node(0)), binding(node(1)), binding(node(2)), binding(node(3)), quantized },
-            qpc, { groups, 1, 1 });
+            pc, { groups, 1, 1 });
         ++ctx->region_q8_projection_records;
         ctx->region_q8_used_masks[qsa ? 1 : 0] |= mmvq_mask;
         report_policy(mmvq_mask);
@@ -21387,6 +21391,79 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
     ggml_backend_vk_get_tensor_2d_async(backend, tensor, data, offset, size, 1, size, size);
 }
 
+static bool ggml_backend_vk_device_copy_ranges(ggml_backend_t backend,
+        const ggml_device_copy_range * ranges, size_t n, bool dry_run) {
+    if (!ggml_backend_is_vk(backend) || !ggml_device_copy_ranges_valid(ranges, n)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_vk_context *>(backend->context);
+    struct copy_range {
+        vk_buffer src, dst;
+        uint64_t src_offset = 0, dst_offset = 0, bytes = 0;
+    } copies[GGML_DEVICE_COPY_MAX_RANGES];
+    auto physical_offset = [](const ggml_tensor * t, const vk_buffer & buffer, size_t off,
+                               size_t bytes, uint64_t & out) {
+        const uint64_t base = vk_tensor_offset(t);
+        if (base > buffer->size || t->view_offs > buffer->size - base ||
+            off > buffer->size - base - t->view_offs) {
+            return false;
+        }
+        out = base + t->view_offs + off;
+        return bytes <= buffer->size - out && (out % sizeof(float)) == 0;
+    };
+    bool any = false;
+    for (size_t i = 0; i < n; ++i) {
+        const auto & r = ranges[i];
+        auto & c = copies[i];
+        if (!ggml_backend_buffer_is_vk(r.src->buffer) || !ggml_backend_buffer_is_vk(r.dst->buffer) ||
+            ggml_backend_buffer_get_usage(r.dst->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            return false;
+        }
+        c.src = static_cast<ggml_backend_vk_buffer_context *>(r.src->buffer->context)->dev_buffer;
+        c.dst = static_cast<ggml_backend_vk_buffer_context *>(r.dst->buffer->context)->dev_buffer;
+        c.bytes = r.bytes;
+        if (!c.src || !c.dst || c.src->device != ctx->device || c.dst->device != ctx->device ||
+            !physical_offset(r.src, c.src, r.src_offset, r.bytes, c.src_offset) ||
+            !physical_offset(r.dst, c.dst, r.dst_offset, r.bytes, c.dst_offset)) {
+            return false;
+        }
+        if (c.src == c.dst && c.src_offset == c.dst_offset) {
+            c.bytes = 0;
+        }
+        any |= c.bytes != 0;
+    }
+    auto overlaps = [](uint64_t a, uint64_t an, uint64_t b, uint64_t bn) {
+        return an && bn && a < b + bn && b < a + an;
+    };
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < n; ++j) {
+            const auto & a = copies[i];
+            const auto & b = copies[j];
+            if ((a.dst == b.src && overlaps(a.dst_offset, a.bytes, b.src_offset, b.bytes)) ||
+                (i != j && a.dst == b.dst && overlaps(a.dst_offset, a.bytes, b.dst_offset, b.bytes))) {
+                return false; // not memmove; do not manufacture implicit scratch
+            }
+        }
+    }
+    if (dry_run || !any) {
+        return true;
+    }
+    // Append to the existing compute stream. No temporary submit, native wait,
+    // descriptor allocation, host staging or host-domain barrier per row.
+    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+    ggml_vk_sync_buffers(nullptr, compute_ctx);
+    for (size_t i = 0; i < n; ++i) {
+        const auto & c = copies[i];
+        if (c.bytes) {
+            vk_tp5_hpp_commands(compute_ctx->s->buffer->buf).copyBuffer(c.src->buffer, c.dst->buffer,
+                vk::BufferCopy(c.src_offset, c.dst_offset, c.bytes));
+            compute_ctx->s->buffer->has_pending_mem_work = true;
+        }
+    }
+    ggml_vk_sync_buffers(nullptr, compute_ctx);
+    return true;
+}
+
 static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_backend_vk_cpy_tensor_async(" << src << " -> " << dst << ", size=" << ggml_nbytes(src) << ")");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend_dst->context;
@@ -25988,6 +26065,9 @@ const float * ggml_backend_vk_router_diag(ggml_backend_t backend, uint32_t * lay
 
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_device_copy_ranges") == 0) {
+        return (void *) ggml_backend_vk_device_copy_ranges;
+    }
     extern bool ggml_backend_vk_tp5_submit_epoch_chain(void *, const std::vector<std::vector<std::vector<void *>>> &, const std::vector<std::vector<ggml_tensor *>> &);
     extern bool ggml_backend_vk_tp5_prepare_graph(void *, size_t, ggml_cgraph *, bool, size_t);
     extern bool ggml_vk_tp5_get_cached_cmd_bufs(ggml_backend_t, ggml_cgraph *, std::vector<void *> &);
@@ -26048,8 +26128,8 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
             if (projections) *projections = ctx->region_q8_projection_records;
             if (gdn_mask) *gdn_mask = ctx->region_q8_used_masks[0];
             if (qsa_mask) *qsa_mask = ctx->region_q8_used_masks[1];
-            return ctx->device->integer_dot_product && ctx->device->pipeline_attention_projections_mmvq[0] &&
-                   ctx->device->pipeline_attention_projections_mmvq[1];
+            return ctx->device->integer_dot_product && ctx->device->pipeline_attention_projections_mmvq[0][3] &&
+                   ctx->device->pipeline_attention_projections_mmvq[1][1];
         };
     }
     if (strcmp(name, "ggml_backend_vk_get_sparse_dispatch_count") == 0) {

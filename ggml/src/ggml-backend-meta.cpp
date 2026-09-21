@@ -5,6 +5,7 @@
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
 #include "ggml-tp5-profile.h"
+#include "ggml-device-copy.h"
 
 typedef bool (*ggml_backend_comm_prepare_graph_t)(void *               comm_ctx,
                                                   size_t               rank,
@@ -2808,6 +2809,53 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
     }
     delete backend_ctx;
     delete backend;
+}
+
+bool ggml_backend_meta_device_copy_ranges(ggml_backend_t backend,
+        const ggml_device_copy_range * ranges, size_t n_ranges, bool dry_run) {
+    if (!backend || !ggml_backend_dev_is_meta(ggml_backend_get_device(backend)) ||
+        !ggml_device_copy_ranges_valid(ranges, n_ranges)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_meta_context *>(backend->context);
+    const size_t ranks = ctx->backend_configs.size();
+    if (ranks == 0 || ranks > GGML_BACKEND_META_MAX_DEVICES) {
+        return false;
+    }
+    ggml_device_copy_range local[GGML_BACKEND_META_MAX_DEVICES][GGML_DEVICE_COPY_MAX_RANGES]{};
+    for (size_t k = 0; k < n_ranges; ++k) {
+        const auto & r = ranges[k];
+        if (!ggml_backend_buffer_is_meta(r.src->buffer) || !ggml_backend_buffer_is_meta(r.dst->buffer) ||
+            ggml_backend_meta_buffer_n_bufs(r.src->buffer) != ranks ||
+            ggml_backend_meta_buffer_n_bufs(r.dst->buffer) != ranks ||
+            ggml_backend_meta_get_split_state(r.src, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+            ggml_backend_meta_get_split_state(r.dst, false).axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return false;
+        }
+        for (size_t rank = 0; rank < ranks; ++rank) {
+            local[rank][k] = {ggml_backend_meta_buffer_simple_tensor(r.src, rank),
+                              ggml_backend_meta_buffer_simple_tensor(r.dst, rank),
+                              r.src_offset, r.dst_offset, r.bytes};
+        }
+    }
+    // Preflight every rank before recording the first. Model-specific wrappers
+    // stay separate; copies are local to the matching physical device only.
+    for (size_t rank = 0; rank < ranks; ++rank) {
+        if (!ggml_backend_device_copy_ranges(ctx->backend_configs[rank].backend,
+                                              local[rank], n_ranges, true)) {
+            return false;
+        }
+    }
+    if (!dry_run) {
+        for (size_t rank = 0; rank < ranks; ++rank) {
+            if (!ggml_backend_device_copy_ranges(ctx->backend_configs[rank].backend,
+                                                  local[rank], n_ranges, false)) {
+                GGML_LOG_ERROR("%s: device copy recording failed after preflight on rank %zu\n", __func__, rank);
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {

@@ -12,6 +12,7 @@
 #include <unordered_map>
 
 // keep this struct lightweight
+struct llama_device_hidden_input;
 struct llama_ubatch {
     bool equal_seqs() const {
         return b_equal_seqs != 0;
@@ -88,6 +89,8 @@ struct llama_ubatch {
     // disabled via set_source_row_tracking(false) or synthetic ubatch via ubatch_reserve).
     // never a guessed coordinate. when non-null, points into data->source_row.
     int32_t      *  source_row     = nullptr; // [n_tokens] original batch row, nullptr if unavailable
+    // Borrowed only during process_ubatch/set_inputs, never retained by a graph.
+    const llama_device_hidden_input * device_hidden = nullptr;
 };
 
 // a helper for sanitizing, fulfilling and splitting a batch

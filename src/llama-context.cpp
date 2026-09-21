@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-predefined-hidden.h"
 #include "ggml-predefined.h"
 
 #include "ggml.h"
@@ -46,6 +47,15 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+// Meta encodes a parent definition ID in the upper 48 bits of its stage ID.
+// A graph owns this ID until it is actually rebuilt; neither batch size nor a
+// target/draft context switch grants permission to reuse somebody else's ID.
+static uint64_t llama_next_graph_definition_uid() {
+    static std::atomic<uint64_t> next_definition{1};
+    const uint64_t serial = next_definition.fetch_add(1, std::memory_order_relaxed);
+    return serial != 0 && serial < (1ULL << 47) ? (1ULL << 47) | serial : 0;
+}
 
 //
 // llama_context
@@ -1639,11 +1649,24 @@ void llama_context::sched_reserve() {
 }
 
 void llama_context::synchronize() {
-    if (!sched || n_queued_tokens == 0) {
+    if (!sched) {
+        return;
+    }
+    if (n_queued_tokens == 0) {
+        // Carry/seed/input copies may have been queued after sampling retired
+        // the decode. They still own persistent device buffers at teardown or
+        // a cross-context handoff, even though they do not count as tokens.
+        if (predefined_hidden && predefined_hidden->pending) {
+            ggml_backend_synchronize(predefined_hidden->executor);
+            predefined_hidden->pending = false;
+        }
         return;
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    if (predefined_hidden) {
+        predefined_hidden->pending = false;
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1909,12 +1932,18 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
 }
 
 float * llama_context::get_embeddings_nextn() {
+    if (!predefined_hidden_readback()) {
+        return nullptr;
+    }
     output_reorder();
 
     return embd_nextn.data;
 }
 
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
+    if (!predefined_hidden_readback()) {
+        return nullptr;
+    }
     output_reorder();
 
     try {
@@ -2371,6 +2400,18 @@ struct llama_compute_guard {
 };
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    llama_device_hidden_input hidden_input;
+    llama_ubatch input_ubatch;
+    const llama_ubatch * input_batch = &ubatch;
+    if (predefined_hidden && predefined_hidden->bound_input) {
+        input_ubatch = ubatch;
+        if (!predefined_hidden_bind_ubatch(input_ubatch, hidden_input)) {
+            LLAMA_LOG_ERROR("%s: invalid device-hidden source-row mapping\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        input_batch = &input_ubatch;
+    }
     // Capacity admission precedes memory->apply(), so an oversized execution
     // cannot advance KV/recurrent state before being refused. The existing
     // logical-shape checks below stay intact until all operators are lowered
@@ -2465,14 +2506,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // old constant also lost all of its high bits in meta's uid<<16 stage
         // encoding. Reserve the upper half of that 48-bit parent-ID space.
         if (gf) {
-            static std::atomic<uint64_t> next_definition{1};
-            const uint64_t serial = next_definition.fetch_add(1, std::memory_order_relaxed);
-            if (serial == 0 || serial >= (1ULL << 47)) {
+            const uint64_t definition_uid = llama_next_graph_definition_uid();
+            if (definition_uid == 0) {
                 LLAMA_LOG_ERROR("%s: graph definition ID space exhausted\n", __func__);
                 ret = GGML_STATUS_FAILED;
                 return nullptr;
             }
-            ggml_graph_set_uid(gf, (1ULL << 47) | serial);
+            ggml_graph_set_uid(gf, definition_uid);
         }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
@@ -2495,7 +2535,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
-        res->set_inputs(&ubatch);
+        try {
+            // The borrowed device binding lives only for this call; gparams
+            // and the reusable graph never retain its stack address.
+            res->set_inputs(input_batch);
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: input update failed: %s\n", __func__, e.what());
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -3577,6 +3625,25 @@ int llama_context::decode_impl(const llama_batch & batch_inp) {
         return encode(batch_inp);
     }
 
+    if (predefined_hidden && predefined_hidden->generation == UINT64_MAX) {
+        LLAMA_LOG_ERROR("%s: device hidden generation exhausted\n", __func__);
+        return -1;
+    }
+    struct hidden_result_guard {
+        llama_predefined_hidden_store * h;
+        bool success = false;
+        explicit hidden_result_guard(llama_predefined_hidden_store * store) : h(store) {
+            if (h) {
+                ++h->generation;
+                h->captured_rows = h->valid_rows = 0;
+                h->host_current = false;
+            }
+        }
+        ~hidden_result_guard() {
+            if (h) h->valid_rows = success ? h->captured_rows : 0;
+        }
+    } hidden_result(predefined_hidden.get());
+
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -3622,7 +3689,7 @@ int llama_context::decode_impl(const llama_batch & batch_inp) {
     // FlashPrefill: opt into the BatchIdentity source-row map only when a
     // validated exec is attached. OFF/legacy calls keep split semantics and
     // allocation behavior bit-identical (no tracking, no extra storage).
-    if (fp_exec_active) {
+    if (fp_exec_active || (predefined_hidden && predefined_hidden->bound_input)) {
         balloc->set_source_row_tracking(true);
     }
 
@@ -3633,6 +3700,12 @@ int llama_context::decode_impl(const llama_batch & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
+
+    if (predefined_hidden &&
+        (cparams.embeddings_nextn_masked ? n_outputs_all : n_tokens_all) > predefined_hidden->result_capacity) {
+        LLAMA_LOG_ERROR("%s: hidden result rows exceed predefined capacity\n", __func__);
+        return -1;
+    }
 
     if (output_all) {
         // require that all tokens are output
@@ -4049,7 +4122,13 @@ int llama_context::decode_impl(const llama_batch & batch_inp) {
             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
-            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+            if (t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && predefined_hidden) {
+                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+                if (!predefined_hidden_capture(backend_h, t_h_nextn, uint32_t(offset), uint32_t(n_rows))) {
+                    LLAMA_LOG_ERROR("%s: native hidden capture unavailable or over capacity\n", __func__);
+                    return -3;
+                }
+            } else if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
@@ -4206,6 +4285,8 @@ int llama_context::decode_impl(const llama_batch & batch_inp) {
     fp_metrics_pending = llama_flashprefill_metrics::slice_delta();
 
 
+
+    hidden_result.success = true;
 
     // XKV sealing note: no maintain() runs at the generic decode tail by design.
     // Target verification rows committed by kv-cache-context postcompute_success
@@ -4671,8 +4752,14 @@ ggml_cgraph * llama_context::graph_reserve(
     res->reset();
 
     auto * gf = model.build_graph(gparams);
-    if (gf && ubatch.n_tokens == 1) {
-        ggml_graph_set_uid(gf, 0x5100000000000000ULL);
+    if (gf) {
+        const uint64_t definition_uid = llama_next_graph_definition_uid();
+        if (definition_uid == 0) {
+            this->n_outputs = save_n_outputs;
+            LLAMA_LOG_ERROR("%s: graph definition ID space exhausted\n", __func__);
+            return nullptr;
+        }
+        ggml_graph_set_uid(gf, definition_uid);
     }
 
     this->n_outputs = save_n_outputs;

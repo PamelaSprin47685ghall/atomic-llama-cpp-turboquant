@@ -2978,7 +2978,14 @@ static void test_attention_projections_replay(test_env & env, bool require_mmvq 
             TEST_ASSERT(ggml_backend_sched_alloc_graph(schedulers[reference], graph));
         }
 
+        bool integer_region = false;
+        if (env.get_region_mmvq_stats) {
+            uint64_t records = 0;
+            env.get_region_mmvq_stats(env.backend_gpu, nullptr, &records, nullptr, nullptr);
+            integer_region = records > case_fused_before;
+        }
         for (int round = 0; round < 4; ++round) {
+            bool verify_old_recording = false;
             if (require_mmvq && !exercised_growth && round == 1) {
                 // Keep this smaller graph, its descriptors and weights live.
                 // Grow the region scratch with a different graph, then replay
@@ -2986,6 +2993,7 @@ static void test_attention_projections_replay(test_env & env, bool require_mmvq 
                 // tensor-pointer-only quantization cache cannot pass this.
                 test_attention_projections_replay(env, false, true);
                 exercised_growth = true;
+                verify_old_recording = true;
             }
             std::vector<float> input_vals(c.width + 32);
             for (size_t i = 0; i < input_vals.size(); ++i) {
@@ -2994,14 +3002,30 @@ static void test_attention_projections_replay(test_env & env, bool require_mmvq 
             for (int reference = 0; reference < 2; ++reference) {
                 ggml_backend_tensor_set(inputs[reference], input_vals.data(), 0, input_vals.size() * sizeof(float));
             }
+            uint64_t warm_fused_before = 0, warm_hits_before = 0;
+            if (verify_old_recording) {
+                env.get_region_mmvq_stats(env.backend_gpu, nullptr, &warm_fused_before, nullptr, nullptr);
+                env.get_stats(env.backend_gpu, &warm_hits_before, nullptr);
+            }
             for (int reference = 0; reference < 2; ++reference) {
+                uint64_t actual_before = 0;
+                if (reference == 0 && env.get_region_mmvq_stats)
+                    env.get_region_mmvq_stats(env.backend_gpu, nullptr, &actual_before, nullptr, nullptr);
                 CHECK_STATUS(ggml_backend_sched_graph_compute(schedulers[reference], graphs[reference]),
                              "attention projections replay");
+                if (reference == 0 && env.get_region_mmvq_stats) {
+                    uint64_t actual_after = 0;
+                    env.get_region_mmvq_stats(env.backend_gpu, nullptr, &actual_after, nullptr, nullptr);
+                    integer_region = integer_region || actual_after > actual_before;
+                }
             }
-            uint64_t case_fused_after = case_fused_before;
-            if (env.get_region_mmvq_stats)
-                env.get_region_mmvq_stats(env.backend_gpu, nullptr, &case_fused_after, nullptr, nullptr);
-            const bool integer_region = case_fused_after > case_fused_before;
+            if (verify_old_recording) {
+                uint64_t warm_fused_after = 0, warm_hits_after = 0;
+                env.get_region_mmvq_stats(env.backend_gpu, nullptr, &warm_fused_after, nullptr, nullptr);
+                env.get_stats(env.backend_gpu, &warm_hits_after, nullptr);
+                TEST_ASSERT(warm_fused_after == warm_fused_before);
+                TEST_ASSERT(warm_hits_after > warm_hits_before);
+            }
             for (int out_idx = 0; out_idx < 4; ++out_idx) {
                 std::vector<float> actual(ggml_nelements(outputs[0][out_idx])), expected(actual.size());
                 ggml_backend_tensor_get(outputs[0][out_idx], actual.data(), 0, actual.size() * sizeof(float));
@@ -3009,7 +3033,7 @@ static void test_attention_projections_replay(test_env & env, bool require_mmvq 
                 for (float val : actual)
                     TEST_ASSERT(std::isfinite(val));
                 bool equal = std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0;
-                if (integer_region && !equal) {
+                if (integer_region && !equal && !(c.qsa && out_idx == 3)) {
                     // Both paths use the same native Q8_1 arithmetic here,
                     // not an F32-activation oracle. Only FP accumulation order
                     // may differ between standalone and paired row kernels.

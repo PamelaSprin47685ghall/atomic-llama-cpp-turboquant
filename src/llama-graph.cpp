@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-predefined-hidden.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -116,6 +117,21 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
     }
 
+    if (ubatch->device_hidden) {
+        const auto & source = *ubatch->device_hidden;
+        if (!h || source.count == 0 || source.count > source.ranges.size() ||
+            source.rows != uint32_t(n_tokens) || h->type != GGML_TYPE_F32 ||
+            h->ne[0] != n_embd || h->ne[1] != n_tokens) {
+            throw std::runtime_error("device MTP hidden input shape mismatch");
+        }
+        auto copies = source.ranges;
+        for (size_t i = 0; i < source.count; ++i) copies[i].dst = h;
+        if (!ggml_backend_device_copy_ranges(source.executor, copies.data(), source.count, false)) {
+            throw std::runtime_error("device MTP hidden input has no native local copy");
+        }
+        return;
+    }
+
     // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
     //       for now, we assume that the hidden state is always provided as an embedding
     //       ref: https://github.com/ggml-org/llama.cpp/pull/23643
@@ -128,6 +144,10 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
 
 bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     bool res = true;
+
+    // h is an input even when a token-only batch supplies its bytes through a
+    // device binding. Do not omit its shape check merely because embd is null.
+    res &= h && h->ne[1] == params.ubatch.n_tokens;
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);

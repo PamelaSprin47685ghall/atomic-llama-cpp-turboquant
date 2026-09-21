@@ -244,12 +244,14 @@ bool ggml_predefined_slots_pending(ggml_predefined_slots_t slots) {
     return false;
 }
 
-void ggml_predefined_slots_free(ggml_predefined_slots_t slots) {
+bool ggml_predefined_slots_free(ggml_predefined_slots_t slots) {
     // An unretired parameter owner is deliberately preserved. This is not a
     // native wait and must not turn a partial submit into fictitious completion.
-    if (!ggml_predefined_slots_pending(slots)) {
-        delete slots;
+    if (ggml_predefined_slots_pending(slots)) {
+        return false;
     }
+    delete slots;
+    return true;
 }
 
 bool ggml_predefined_slots_acquire(ggml_predefined_slots_t state, uint64_t epoch, uint32_t * out) {

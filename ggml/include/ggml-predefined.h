@@ -150,7 +150,9 @@ GGML_API bool ggml_predefined_plan_workspace(
 // frame or fabricate completion. Calls are serialized by the session owner.
 typedef struct ggml_predefined_slots * ggml_predefined_slots_t;
 GGML_API ggml_predefined_slots_t ggml_predefined_slots_new(uint32_t ranks);
-GGML_API void ggml_predefined_slots_free(ggml_predefined_slots_t slots);
+// False preserves the metadata owner; the caller must also preserve its GPU
+// frame/argument allocations until native retirement has actually completed.
+GGML_API bool ggml_predefined_slots_free(ggml_predefined_slots_t slots);
 GGML_API bool ggml_predefined_slots_acquire(
         ggml_predefined_slots_t slots, uint64_t epoch, uint32_t * slot);
 GGML_API bool ggml_predefined_slots_record_submit(

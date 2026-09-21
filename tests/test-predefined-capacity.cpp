@@ -133,6 +133,7 @@ static void frame_slot_ownership() {
     CHECK(ggml_predefined_slots_acquire(slots, 1, &first));
     CHECK(ggml_predefined_slots_record_submit(slots, first, 1, 0, 10));
     CHECK(ggml_predefined_slots_record_submit(slots, first, 1, 1, 20));
+    CHECK(!ggml_predefined_slots_free(slots));
     CHECK(!ggml_predefined_slots_cancel(slots, first, 1));
     CHECK(ggml_predefined_slots_acquire(slots, 2, &second));
     CHECK(first != second);
@@ -149,7 +150,7 @@ static void frame_slot_ownership() {
     CHECK(ggml_predefined_slots_cancel(slots, second, 2));
     CHECK(!ggml_predefined_slots_pending(slots));
     CHECK(!ggml_predefined_slots_acquire(slots, 2, &third));
-    ggml_predefined_slots_free(slots);
+    CHECK(ggml_predefined_slots_free(slots));
 }
 
 int main() {

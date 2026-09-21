@@ -16,6 +16,11 @@ layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 layout(constant_id = 0) const uint BLOCK_SIZE     = 64;
 layout(constant_id = 1) const uint NUM_ROWS_QUANT = 2;
 layout(constant_id = 2) const uint NUM_ROWS_DENSE = 2;
+#ifdef QWEN_MMVQ
+// bit0: Q5[0], bit1: Q5[1] (GDN only), bit2: paired Q6. The selected
+// combination is immutable pipeline state, independent of the output route.
+layout(constant_id = 3) const uint QWEN_MMVQ_MASK = 0;
+#endif
 
 #if defined(GDN_PROJECTIONS)
 
@@ -146,9 +151,6 @@ layout(push_constant) uniform PushParams {
     uint rows0;
     uint rows1;
     uint rows2;
-#ifdef QWEN_MMVQ
-    uint mmvq_mask; // bit0 Q5[0], bit1 Q5[1] (GDN), bit2 paired Q6
-#endif
 }
 
 p;
@@ -317,7 +319,7 @@ void calc_superblock_q5_k(const uint  matrix_idx,
 
 void compute_q5_k(const uint matrix_idx, const uint first_row, const uint num_rows, const uint tid) {
 #ifdef QWEN_MMVQ
-    if ((p.mmvq_mask & (1u << matrix_idx)) != 0u) {
+    if ((QWEN_MMVQ_MASK & (1u << matrix_idx)) != 0u) {
         qwen_compute_mmvq(matrix_idx, first_row, num_rows, tid);
         return;
     }
@@ -494,7 +496,7 @@ void calc_superblock_paired_q6_k(const uint  itid,
 
 void compute_paired_q6_k(const uint first_row, const uint num_rows, const uint tid) {
 #ifdef QWEN_MMVQ
-    if ((p.mmvq_mask & 4u) != 0u) {
+    if ((QWEN_MMVQ_MASK & 4u) != 0u) {
         qwen_compute_mmvq(2u, first_row, num_rows, tid);
         return;
     }

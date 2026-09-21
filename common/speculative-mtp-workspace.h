@@ -12,14 +12,15 @@
 // One maximum-sized host handoff arena for an MTP driver. A verification batch
 // is shared by all its sequences, so allocate rows*width once, NOT
 // sequences*rows*width. Effective row counts and accepted prefixes are metadata.
-// The GPU-resident handoff can use the same ranges later; this class deliberately
-// makes no claim that the current host bridge has disappeared.
+// host_hidden=false retains only row/token/position metadata. The device path
+// uses exactly these accepted ranges without allocating a host hidden matrix.
 class common_mtp_workspace {
 public:
-    common_mtp_workspace(uint32_t sequences, uint32_t rows, uint32_t width)
+    common_mtp_workspace(uint32_t sequences, uint32_t rows, uint32_t width, bool host_hidden = true)
         : sequences_(sequences), capacity_(rows), width_(width),
-          verified_(elements(rows, width)), pending_(elements(sequences, width)),
-          seed_(elements(sequences, width)), tokens_(rows), positions_(rows), ranges_(sequences) {
+          host_hidden_(host_hidden),
+          verified_(host_hidden ? elements(rows, width) : 0), pending_(host_hidden ? elements(sequences, width) : 0),
+          seed_(host_hidden ? elements(sequences, width) : 0), tokens_(rows), positions_(rows), ranges_(sequences) {
         if (sequences == 0 || rows == 0 || width == 0) {
             throw std::invalid_argument("MTP workspace capacity must be nonzero");
         }
@@ -27,12 +28,14 @@ public:
 
     uint32_t capacity() const { return capacity_; }
     uint32_t width() const { return width_; }
+    uint32_t first_row(uint32_t sequence) const { return sequence < sequences_ ? ranges_[sequence].first : 0; }
+    uint32_t verified_rows(uint32_t sequence) const { return sequence < sequences_ ? ranges_[sequence].rows : 0; }
 
     float * pending(uint32_t sequence) {
-        return sequence < sequences_ ? pending_.data() + size_t(sequence) * width_ : nullptr;
+        return host_hidden_ && sequence < sequences_ ? pending_.data() + size_t(sequence) * width_ : nullptr;
     }
     const float * pending(uint32_t sequence) const {
-        return sequence < sequences_ ? pending_.data() + size_t(sequence) * width_ : nullptr;
+        return host_hidden_ && sequence < sequences_ ? pending_.data() + size_t(sequence) * width_ : nullptr;
     }
 
     bool has_staged(uint32_t sequence) const {
@@ -42,11 +45,13 @@ public:
     // Preflight all ranges before the first write. Call only after target output
     // has completed; this copies actual rows, never the padding to capacity.
     bool begin(uint32_t rows, const float * hidden, const llama_token * tokens, const llama_pos * positions) {
-        if (rows == 0 || rows > capacity_ || !hidden || !tokens || !positions ||
+        if (rows == 0 || rows > capacity_ || (host_hidden_ && !hidden) || !tokens || !positions ||
             std::any_of(ranges_.begin(), ranges_.end(), [](const range & r) { return r.staged; })) {
             return false;
         }
-        std::copy_n(hidden, size_t(rows) * width_, verified_.data());
+        if (host_hidden_) {
+            std::copy_n(hidden, size_t(rows) * width_, verified_.data());
+        }
         std::copy_n(tokens, rows, tokens_.data());
         std::copy_n(positions, rows, positions_.data());
         active_rows_ = rows;
@@ -70,12 +75,14 @@ public:
         r.rows = rows;
         r.staged = staged;
         r.commit = staged ? (deferred ? -1 : int64_t(rows)) : 0;
-        if (staged) {
+        if (staged && host_hidden_) {
             // Only the cross-batch seed needs its own copy. Remaining catch-up
             // inputs are verified_[first+i-1], not a second hidden-row matrix.
             std::copy_n(pending(seq), width_, seed_.data() + size_t(seq) * width_);
         }
-        std::copy_n(verified_.data() + size_t(first + rows - 1) * width_, width_, pending(seq));
+        if (host_hidden_) {
+            std::copy_n(verified_.data() + size_t(first + rows - 1) * width_, width_, pending(seq));
+        }
         return true;
     }
 
@@ -87,7 +94,9 @@ public:
         // Match the existing driver's indexing: row 0 is the sampled token,
         // row N is the Nth accepted candidate. A count is not a hidden state.
         const uint32_t row = std::min(accepted, r.rows - 1);
-        std::copy_n(verified_.data() + size_t(r.first + row) * width_, width_, pending(seq));
+        if (host_hidden_) {
+            std::copy_n(verified_.data() + size_t(r.first + row) * width_, width_, pending(seq));
+        }
         if (r.staged) {
             r.commit = std::min<uint64_t>(uint64_t(accepted) + 1, r.rows);
         }
@@ -119,8 +128,8 @@ public:
         const auto & r = ranges_[seq];
         token = tokens_[r.first + row];
         position = positions_[r.first + row];
-        hidden = row == 0 ? seed_.data() + size_t(seq) * width_
-                          : verified_.data() + size_t(r.first + row - 1) * width_;
+        hidden = !host_hidden_ ? nullptr : (row == 0 ? seed_.data() + size_t(seq) * width_
+                          : verified_.data() + size_t(r.first + row - 1) * width_);
         return true;
     }
 
@@ -133,7 +142,7 @@ public:
 
     void reset_sequence(uint32_t seq) {
         if (seq < sequences_) {
-            std::fill_n(pending(seq), width_, 0.0f);
+            if (host_hidden_) std::fill_n(pending(seq), width_, 0.0f);
             ranges_[seq] = {};
         }
     }
@@ -169,6 +178,7 @@ private:
     uint32_t capacity_;
     uint32_t width_;
     uint32_t active_rows_ = 0;
+    bool host_hidden_ = true;
     std::vector<float> verified_;
     std::vector<float> pending_;
     std::vector<float> seed_;
@@ -183,8 +193,8 @@ private:
 // be used on the returned borrowed view.
 class common_mtp_batch_storage {
 public:
-    common_mtp_batch_storage(uint32_t rows, uint32_t width)
-        : tokens_(checked_rows(rows)), embd_(checked_elements(rows, width)), positions_(rows),
+    common_mtp_batch_storage(uint32_t rows, uint32_t width, bool host_embeddings = true)
+        : tokens_(checked_rows(rows)), embd_(host_embeddings ? checked_elements(rows, width) : 0), positions_(rows),
           sequence_counts_(rows), sequence_ids_(rows), sequence_ptrs_(size_t(rows) + 1), logits_(rows) {
         for (uint32_t i = 0; i < rows; ++i) {
             sequence_ptrs_[i] = &sequence_ids_[i];
@@ -198,7 +208,7 @@ public:
     llama_batch view() {
         llama_batch result{};
         result.token = tokens_.data();
-        result.embd = embd_.data();
+        result.embd = embd_.empty() ? nullptr : embd_.data();
         result.pos = positions_.data();
         result.n_seq_id = sequence_counts_.data();
         result.seq_id = sequence_ptrs_.data();
