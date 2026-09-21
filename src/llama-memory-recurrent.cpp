@@ -5,6 +5,7 @@
 #include "llama-io.h"
 #include "llama-batch.h"
 #include "llama-model.h"
+#include "llama-rerot-profile.h"
 
 #include <algorithm>
 #include <cassert>
@@ -995,6 +996,10 @@ void llama_memory_recurrent::clear_brain_row(int32_t brain_row) {
     if (brain_row < 0 || (uint32_t) brain_row >= n_brain_rows) {
         return;
     }
+    // P0/P12 ledger: one brain-row clear transaction.
+    if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+        prof->clear_count.fetch_add(1, std::memory_order_relaxed);
+    }
 
     // Recurrent state can still be referenced by an asynchronously submitted
     // graph when RERoT retracts/rebuilds a lineage.  Drain that work before
@@ -1035,6 +1040,11 @@ void llama_memory_recurrent::clear_brain_row(int32_t brain_row) {
 void llama_memory_recurrent::clear_hand_row(int32_t hand_row) {
     if (hand_row < 0 || (uint32_t) hand_row >= size) {
         return;
+    }
+    // P0/P12 ledger: one clear transaction (n_rs_seq+1 snapshot planes per
+    // tensor, all layers).
+    if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+        prof->clear_count.fetch_add(1, std::memory_order_relaxed);
     }
 
     // See clear_brain_row(): RERoT prefix rebuild can arrive while the
@@ -1486,6 +1496,16 @@ bool llama_memory_recurrent::rerot_capture_hand_seed(llama_seq_id source_seq, st
         seed_out.insert(seed_out.end(), b.begin(), b.end());
     }
 
+    // P0/P12 ledger: one hand-seed capture = one D2H readback of the full
+    // serialized hand state (per-layer conv tails + recurrent states).
+    if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+        prof->hand_seed_count.fetch_add(1, std::memory_order_relaxed);
+        prof->hand_seed_bytes.fetch_add(seed_out.size(), std::memory_order_relaxed);
+        prof->d2h_bytes.fetch_add(seed_out.size(), std::memory_order_relaxed);
+        prof->ring.push(4 /* custom */, 5 /* hand-seed capture */, 0,
+                        0, (uint64_t) seed_out.size());
+    }
+
     return true;
 }
 
@@ -1493,6 +1513,13 @@ bool llama_memory_recurrent::rerot_apply_hand_seed(llama_seq_id dest_seq, const 
     if (seed_in.size() <
         sizeof(uint32_t) * 3 + sizeof(llama_pos)) {
         return false;
+    }
+    // P0/P12 ledger: one hand-seed apply = one H2D write of the serialized
+    // hand state (per-layer strided tensor sets + sync). Counted once here,
+    // after the format check, on every success or failure path alike.
+    const uint64_t rerot_apply_bytes_in = (uint64_t) seed_in.size();
+    if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+        prof->h2d_bytes.fetch_add(rerot_apply_bytes_in, std::memory_order_relaxed);
     }
 
     size_t offset = 0;

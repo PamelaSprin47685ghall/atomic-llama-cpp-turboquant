@@ -22,6 +22,7 @@
 #include "mtmd-helper.h"
 
 #include "../../src/llama-ext.h" // staging API: llama_get_ctx_other (used by mmproj draft mirroring)
+#include "../../src/llama-rerot-profile.h"
 
 #include <algorithm>
 #include <chrono>
@@ -2625,6 +2626,12 @@ private:
             return false;
         }
 
+        // P12: request-scoped ledger begins with the first adopted root.
+        // Checked before adopt_root/emplace so "first" means "transport
+        // empty"; queued roots while an episode is active keep accumulating
+        // into the same ledger (their prefill is parked at completion).
+        const bool rerot_prof_first_root = rerot_transport.empty();
+
         // The C0 decision must have been pre-saved while C0 logits were valid
         // (post_decode, possibly when this root was still parked). Without it
         // plain continuation cannot reproduce the ordinary next token, so fail
@@ -2790,6 +2797,10 @@ private:
         }
         episode->probing = true;
         episode->strategy_decided = false;
+        if (rerot_prof_first_root) {
+            llama_rerot_profile_begin((uint64_t) slot.task->id);
+        }
+        rerot_prof_phase_enter(llama_rerot_phase::probe);
         {
             auto transport_it = rerot_transport.find(episode_id);
             if (transport_it != rerot_transport.end()) {
@@ -2872,6 +2883,10 @@ private:
         if (!rerot_discard_probe_kv(slot, episode_id)) {
             return false;
         }
+        // P12: simple continuation ends the probe phase; the ordinary
+        // decode that follows is not attributed to any RERoT phase (the
+        // request-level ledger still counts routes/layout/sync).
+        rerot_prof_phase_exit(llama_rerot_phase::probe);
         episode->strategy_decided = true;
         episode->probing = false;
         episode->is_dag = false;
@@ -3020,6 +3035,9 @@ private:
             return false;
         }
         rerot_make_slot_idle(slot);
+        // P12: formal P committed and C_base captured; workers are admitted
+        // next (admission/prep window before the first logical frontier).
+        rerot_prof_phase_transition(llama_rerot_phase::formal_p, llama_rerot_phase::workers_start);
         if (!rerot->activate_dag_frontier(episode_id) || !rerot_admit_ready(episode_id)) {
             return false;
         }
@@ -3037,6 +3055,9 @@ private:
         if (!episode || transport_it == rerot_transport.end()) {
             return false;
         }
+        // P12: probe decided DAG; the prefix rebuild (memory truncation +
+        // re-forward) and the formal P forward are separately attributed.
+        rerot_prof_phase_transition(llama_rerot_phase::probe, llama_rerot_phase::dag_prefix_rebuild);
         const auto tags = rerot_native_think_tags(slot);
         if (tags.first.empty() || tags.second.empty()) {
             rerot->hard_abort(episode_id, "rerot_protocol_error: chat template has no native reasoning tags for DAG");
@@ -3095,6 +3116,9 @@ private:
             }
             rebuild_base = slot.prompt.tokens.size();
         }
+        // P12: rebuild (or suffix-only fast path) done; the formal plan
+        // prefix forward begins here.
+        rerot_prof_phase_transition(llama_rerot_phase::dag_prefix_rebuild, llama_rerot_phase::formal_p);
         llama_tokens dag_tool_suffix;
         if (!dag_prefix.empty() && rebuild_base < dag_prefix.size()) {
             dag_tool_suffix.assign(
@@ -3777,6 +3801,11 @@ private:
                         return false;
                     }
                     if (is_synth) {
+                        // P12: admitting the synthesis lane ends the worker
+                        // decode window (workers_finish covers the exit/fence
+                        // window; synthesis decode follows).
+                        rerot_prof_phase_exit(llama_rerot_phase::workers_frontier);
+                        rerot_prof_phase_enter(llama_rerot_phase::synthesis);
                         const int64_t start_us = episode->t_synthesis_eligible_us > 0 ? episode->t_synthesis_eligible_us : ggml_time_us();
                         const int64_t dur_us = std::max<int64_t>(0, ggml_time_us() - start_us);
                         const double dur_s = (double) dur_us / 1.0e6;
@@ -3880,6 +3909,12 @@ private:
     }
 
     void rerot_erase_episode(uint64_t episode_id) {
+        // P12: close the request-scoped ledger when the LAST episode tears
+        // down. rerot_transport.erase below removes this episode first, so
+        // empty() after it means no queued root was admitted either (a
+        // re-admitted root re-enters probe on a fresh ledger via
+        // rerot_start_root's first-root begin).
+        const size_t rerot_prof_remaining = rerot_transport.size() > 1 ? rerot_transport.size() - 1 : 0;
         if (ctx_tgt) {
             llama_rerot_episode_end(ctx_tgt, episode_id);
         }
@@ -3887,6 +3922,9 @@ private:
             rerot->erase_episode(episode_id);
         }
         rerot_transport.erase(episode_id);
+        if (rerot_prof_remaining == 0) {
+            llama_rerot_profile_end();
+        }
         if (rerot_metrics.episode_active > 0) {
             --rerot_metrics.episode_active;
         }
@@ -4251,6 +4289,14 @@ private:
             return false;
         }
 
+        // P12: the serial tail (final answer generation) is the synthesis
+        // phase; workers_frontier/workers_finish end at this handoff. The
+        // unforked-root path (child_fence=false) exits probe directly into
+        // synthesis; phase_exit on a never-entered phase is a no-op.
+        rerot_prof_phase_exit(llama_rerot_phase::workers_frontier);
+        rerot_prof_phase_exit(llama_rerot_phase::workers_finish);
+        rerot_prof_phase_enter(llama_rerot_phase::synthesis);
+
         // Final user-visible output resumes the original user params: the
         // response_task clone already carries the user reasoning budget, and
         // the saved user grammar is restored here (worker/internal phases run
@@ -4536,9 +4582,15 @@ private:
             return false;
         }
 
-        if (result.natural_final() &&
-            !rerot_begin_serial_tail(episode_id, result.final_node)) {
-            return false;
+        if (result.natural_final()) {
+            // P12: the exit/fence window (workers_finish) spans the last
+            // frontier commit to the serial-tail handoff; begin_serial_tail
+            // below exits it and enters synthesis.
+            rerot_prof_phase_exit(llama_rerot_phase::workers_frontier);
+            rerot_prof_phase_enter(llama_rerot_phase::workers_finish);
+            if (!rerot_begin_serial_tail(episode_id, result.final_node)) {
+                return false;
+            }
         }
 
         return true;
@@ -4638,9 +4690,16 @@ private:
         }
         SRV_INF("RERoT serial tail complete: episode=%" PRIu64 " node=%u token=%d stop=%d\n",
             episode_id, slot.rerot_node_id, id, slot.stop);
+        // P12: result_send spans the final-response assembly/queueing; the
+        // ledger closes when the last episode tears down (rerot_erase_episode
+        // below may admit a queued root, which re-enters probe on the same
+        // ledger only if profiling stays enabled).
+        rerot_prof_phase_exit(llama_rerot_phase::synthesis);
+        rerot_prof_phase_enter(llama_rerot_phase::result_send);
         rerot_record_completed_episode(episode_id);
         slot.print_timings();
         send_final_response(slot);
+        rerot_prof_phase_exit(llama_rerot_phase::result_send);
         metrics.on_prediction(slot);
         rerot_erase_episode(episode_id);
         slot.prompt.clear();
@@ -4663,10 +4722,15 @@ private:
             if (episode && episode->serial_tail) {
                 continue;
             }
+            // P12: the first logical frontier after admission flips the
+            // ledger from workers_start to the steady-state decode window.
+            // begin_frontier is per-episode; the transition is idempotent
+            // because phase_exit on an un-entered phase is a no-op.
             if (episode && !rerot->begin_frontier(ep_id)) {
                 rerot_propagate_hard_abort(ep_id);
                 return false;
             }
+            rerot_prof_phase_transition(llama_rerot_phase::workers_start, llama_rerot_phase::workers_frontier);
         }
         return true;
     }
@@ -4765,6 +4829,32 @@ private:
             return false;
         }
         return rerot->episode_for_slot(id_slot) != nullptr;
+    }
+
+    // --- P12 phase-ledger wiring (discussion §4.2/§13) ---------------------
+    // The ledger is request-scoped: begin at the first adopted root, end when
+    // the last episode tears down. Phases are entered/exited at the exact
+    // protocol transitions already implemented in this file; every phase
+    // boundary below is an existing, single, well-defined call site, so no
+    // new state machine is introduced. All calls are no-ops when
+    // LLAMA_REROT_PROFILE is unset.
+    static void rerot_prof_phase_enter(llama_rerot_phase phase) {
+        if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+            prof->phase_enter(phase);
+        }
+    }
+
+    static void rerot_prof_phase_exit(llama_rerot_phase phase) {
+        if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+            prof->phase_exit(phase);
+        }
+    }
+
+    static void rerot_prof_phase_transition(llama_rerot_phase from, llama_rerot_phase to) {
+        if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+            prof->phase_exit(from);
+            prof->phase_enter(to);
+        }
     }
 
     wanxiangqi_server_token_dump request_token_dump;
@@ -9523,6 +9613,9 @@ private:
                 const int64_t t0 = ggml_time_us();
                 llama_synchronize(ctx_tgt);
                 const int64_t dur_us = ggml_time_us() - t0;
+                if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+                    prof->record_sync((uint64_t) dur_us, 0);
+                }
                 rerot_metrics.sync_capture_us += dur_us;
                 ++rerot_metrics.sync_capture_count;
                 rerot_metrics.sync_capture_with_work_us += dur_us;
@@ -9562,6 +9655,9 @@ private:
                 const int64_t t0 = ggml_time_us();
                 llama_synchronize(ctx_tgt);
                 const int64_t dur_us = ggml_time_us() - t0;
+                if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+                    prof->record_sync((uint64_t) dur_us, 0);
+                }
                 rerot_metrics.sync_sample_us += dur_us;
                 ++rerot_metrics.sync_sample_count;
                 if (had_new_gpu_work) {

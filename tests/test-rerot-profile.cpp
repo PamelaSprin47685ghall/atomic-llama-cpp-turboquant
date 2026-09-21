@@ -155,6 +155,68 @@ static void test_phase_timing_accumulation() {
 }
 
 // ----------------------------------------------------------------------------
+// Test (2b): Full server lifecycle sequence — mirrors the exact phase
+// transition order wired into server-context.cpp (P12). Locks the invariants
+// the wiring depends on: exit-without-enter is a no-op at every boundary, a
+// re-entered phase accumulates across segments, and the DAG lifecycle walks
+// every phase without double-counting.
+// ----------------------------------------------------------------------------
+
+static void test_phase_lifecycle_dag_sequence() {
+    llama_rerot_profile prof;
+    prof.reset(4242);
+
+    // DAG lifecycle: probe → dag_prefix_rebuild → formal_p → workers_start →
+    // workers_frontier → (natural final) workers_finish → synthesis →
+    // result_send. Each transition exits the current phase and enters the
+    // next, exactly as the server call sites do.
+    const llama_rerot_phase dag_walk[] = {
+        llama_rerot_phase::probe,
+        llama_rerot_phase::dag_prefix_rebuild,
+        llama_rerot_phase::formal_p,
+        llama_rerot_phase::workers_start,
+        llama_rerot_phase::workers_frontier,
+        llama_rerot_phase::workers_finish,
+        llama_rerot_phase::synthesis,
+        llama_rerot_phase::result_send,
+    };
+
+    prof.phase_enter(dag_walk[0]);
+    for (size_t i = 1; i < sizeof(dag_walk) / sizeof(dag_walk[0]); ++i) {
+        prof.phase_exit(dag_walk[i - 1]);
+        prof.phase_enter(dag_walk[i]);
+    }
+    prof.phase_exit(dag_walk[sizeof(dag_walk) / sizeof(dag_walk[0]) - 1]);
+
+    for (size_t i = 0; i < sizeof(dag_walk) / sizeof(dag_walk[0]); ++i) {
+        const auto & st = prof.phases[(size_t) dag_walk[i]];
+        CHECK_EQ(st.count.load(), 1);          // each phase entered+exited once
+        CHECK_EQ(st.open_start_ns.load(), 0);  // closed
+    }
+
+    // Simple lifecycle: probe exits directly (no DAG phases); exit of
+    // never-entered DAG phases must remain a no-op.
+    prof.reset(4243);
+    prof.phase_enter(llama_rerot_phase::probe);
+    prof.phase_exit(llama_rerot_phase::workers_frontier);
+    prof.phase_exit(llama_rerot_phase::workers_finish);
+    prof.phase_exit(llama_rerot_phase::probe);
+    CHECK_EQ(prof.phases[(size_t) llama_rerot_phase::workers_frontier].count.load(), 0);
+    CHECK_EQ(prof.phases[(size_t) llama_rerot_phase::workers_finish].count.load(), 0);
+    CHECK_EQ(prof.phases[(size_t) llama_rerot_phase::probe].count.load(), 1);
+
+    // Unforked-root path: begin_serial_tail exits workers_frontier and
+    // workers_finish (both possibly never entered) then enters synthesis —
+    // the double-exit idiom used at the serial-tail call site.
+    prof.reset(4244);
+    prof.phase_exit(llama_rerot_phase::workers_frontier);
+    prof.phase_exit(llama_rerot_phase::workers_finish);
+    prof.phase_enter(llama_rerot_phase::synthesis);
+    prof.phase_exit(llama_rerot_phase::synthesis);
+    CHECK_EQ(prof.phases[(size_t) llama_rerot_phase::synthesis].count.load(), 1);
+}
+
+// ----------------------------------------------------------------------------
 // Test (3): Route Hits and Rejection Reasons
 // ----------------------------------------------------------------------------
 
@@ -626,6 +688,7 @@ int main() {
 
     test_gating_disabled_safety();
     test_phase_timing_accumulation();
+    test_phase_lifecycle_dag_sequence();
     test_route_hits_and_rejections();
     test_layout_counts_and_cas_hwm();
     test_bytes_and_host_metrics();
