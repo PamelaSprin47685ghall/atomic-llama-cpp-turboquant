@@ -173,8 +173,7 @@ target unmasked hidden + draft masked hidden、非 RERoT。不支持时启动失
 
 模型图的临时 `t_h_nextn` 在同一生产队列上复制到 RESULT，随后才允许图工作区
 被复用。完整 decode 成功才公开 `valid_rows`；失败不会暴露部分捕获为有效结果。
-每次 decode 的 RESULT 使用单调 generation；来自 RESULT 的范围必须携带匹配的
-generation，旧 acceptance 不能因新一轮恰好同样行数而读错结果。reset 不倒退代数。
+每次 decode 的 RESULT 使用单调 generation；交接规则以 `src/llama-predefined-hidden.h:llama_predefined_hidden_generation_matches` 为准：RESULT 槽要求 `valid_rows != 0 && expected != 0 && expected == source.generation`，CARRY/SEED 槽要求 `expected == 0`。旧 acceptance 不能因新一轮恰好同样行数而读错结果。reset 不倒退代数。证据面与验证提案见 `docs/TP5-MTP-EVIDENCE.md`、`docs/TP5-MTP-VERIFICATION-PROPOSAL.md` 与 `scripts/check-tp5-mtp-evidence.sh`（另一条线已交付，本文件只引用、不复述）。
 尚未完成的 copy 在无 queued token 时也有独立 pending 标记，退出/跨 owner
 交接仍须退休，不会因 token 计数清零而提前释放持久 buffer。
 
@@ -326,13 +325,12 @@ if (phase != last_graph_phase) {
 
 ### 10.3 解决方案：以“执行定义身份”为依据的豁免
 
-预定义 MTP 在 `prepare_predefined_mtp()` 初始化时，Target 与 MTP 已共享固定最大容量池（`retain_capacity = true`、`capacity_sealed = true`），且在 `process_ubatch()` 中已为 Draft 和 Catch-up 统一设定了固定执行容量：
-`predefined_capacity_rows_current = capacity->verify_tokens`。
+容量下沉现状（以 `src/llama-context.cpp:2507-2535` 为准）：MTP 图已容量化、target 主干尚未——`DRAFT/CATCHUP` 统一设定 `predefined_capacity_rows_current = capacity->verify_tokens`、`predefined_capacity_outputs_current = 1`；其余（target/prefill）在 48 层有状态主干独立完成容量下沉之前仍保持精确（`capacity_rows = ubatch.n_tokens`，输出取 `max(1, frame.active_outputs)`）。在具体条目被降为容量图之前，`capacity_rows` 保持等于图的真实行数，传输层已就绪但不把 padding 当有效行。
 
 因此，**MTP 的 Draft 与 Catch-up 在物理上属于完全相同的“执行定义身份（Execution Definition Identity）”**，并非 Prompt Prefill 与 Token Generation 之间的互斥生命周期交替。
 
-在 `llama_context::ubatch_execution_phase()` 中引入执行定义身份判定：
-- **判定条件**：
+在 `llama_context::ubatch_execution_phase()`（`src/llama-context.h:613-629`，调用点 `src/llama-context.cpp:2548-2566`）中引入执行定义身份判定：
+- **判定条件（以源码为准）**：
   `gtype == LLM_GRAPH_TYPE_DECODER_MTP && has_predefined_capacity && predefined_capacity_rows > 0`
 - **行为**：满足该条件的预定义 MTP 恒定归入统一阶段 `phase = 0`，不以 `n_tokens > n_seqs` 作为判断依据。
 - **效果**：
