@@ -64,6 +64,41 @@
 2. **不准关掉 Watchdog**：Watchdog 是系统的最后底线安全保障，必须通过写出健壮、安全、有界的工程代码来确保不触发 Watchdog，而不是关掉报警！
 3. **每步操作必须首先进行 GPU 状态审计**：执行任何高负荷或并发操作前，必须保证 GPU 处于干净空闲状态（`busy=0%`），失败时绝不允许盲目重试或让未配对的命令进入队列。
 
+
+---
+
+## 下班交接｜2026-09-21（晚）
+
+**分支：** `master` @ `29cd8f51a`（已推送 `origin/master`）
+**本轮主题：** 计算组织研究线——把 2026-09-21 十问中的四条等义数学落成代码，重构 indexed 布局 host 侧扫描。**未启动任何模型/GPU 测试**（开发机单 780M iGPU）。
+
+### 一、已合入（单笔 commit）
+
+|内容|入口|
+|---|---|
+|[Q3] 共享 KV 多读者块 attention（一次读块，逐读者 m/z/u，按读者合并）|`src/llama-rerot-math.*`|
+|[Q5] GDN 共同基底+低秩增量（每步精确追加一个秩一项；共享 B^T x）|同上|
+|[Q6] 已知 token WY 块折叠（M = I − K W K^T，W=(I+L)^{-1}diag(β)，**行索引 β**）|同上|
+|[Q7] PQ2_0 位平面恒等式（两 bit-plane 子集和 − Σx；16 表 LUT/4 权重）|同上|
+|indexed 布局按 distinct reader state 分组，每组一次扫描+排序（原为每 query O(n_kv) 全扫）|`llama_kv_cache::rerot_build_attn_layout`|
+|FP64/位级 oracle 测试（独立参考实现，不调被测核心）|`tests/test-rerot-math.cpp`|
+
+### 二、验证证据
+
+- `test-rerot-math`：0 failure（Q3 全 softmax 对拍+合并顺序无关；Q5 稠密递推 12 步对拍，秩每步恰 +1；Q6 24 随机 chunk T=1..8 对拍，β=0 时 M=G·I、Y=0 精确；Q7 四种编码全在位时位级相等）。
+- rerot/xkv/flashprefill ctest 全家 **45/45**（含 `test_ddvr_two_query_groups` 多 reader 多 query 精确组计数）。
+- 开发机预存失败（基线复现，与本轮无关）：vocabs、quantize-fns、archs、backend-ops timeout、vulkan-mesh（需 ≥2 设备）。
+- 磁盘曾满 100%：已清理 `build-o200k`、`build-landmark-check`、`build-xkv-landmark`、uv/puppeteer/codex-runtimes 缓存及 `build/bin` 陈旧版本化 so，现余 ~2.6G。
+
+### 三、下一步建议
+
+1. 数学参考层是 kernel 契约，**未进生产路径**；GPU 化前必须过 F32 数值门（Q5 重排、Q6 WY 重结合均不保证逐位一致）。
+2. Q6 的生产形态：秩算子 `x → G(x − K(W(K^T x)))` 应用折叠块，同一折叠块服务多 lane 固定入口重放——先在固定入口 F_i 上做收益测量。
+3. Q5 的 r 从离开共同基底起算（含固定入口）；超过约 d_k·d_v/(2(d_k+d_v)) 转稠密。
+4. Q8 跳块上界与 Q10 联合投机未动，不得与等义改写收益混记。
+
+---
+
 RERoT 设计、验证入口与路线见 [RERoT.md](RERoT.md)。TP5 设计与收敛路线见 [TP5.md](TP5.md)。更长的 09-14 现场报告见 [下班交接.md](下班交接.md)。
 
 ---
