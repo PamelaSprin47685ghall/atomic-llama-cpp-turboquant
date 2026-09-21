@@ -2343,11 +2343,16 @@ private:
         if (lcp == ordinary_n) {
             return true; // suffix-only fast path: memory already holds C0
         }
+        // Ensure all asynchronously scheduled compute or transfer commands on this context
+        // are fully retired on the GPU before issuing destructive memory resets.
+        // A race between an in-flight compute kernel and an immediate host clear/write
+        // causes invalid descriptor state and GPUVM page faults (ErrorDeviceLost).
         llama_memory_t memory = llama_get_memory(ctx_tgt);
         if (!memory) {
             rerot->hard_abort(episode_id, "rerot_state_error: missing memory for DAG prefix rebuild");
             return false;
         }
+        llama_synchronize(ctx_tgt);
         const llama_seq_id seq = slot.id;
         size_t base = lcp;
         // Recurrent rollback first: it is non-destructive on failure, and its

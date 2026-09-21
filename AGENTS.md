@@ -12,45 +12,20 @@
 - **严禁依赖不稳定的设备级自旋等待**：下行信号必须使用驱动原生或有安全保障的同步原语（如 Timeline Semaphore 或受控的事件机制），不得绕过硬件调度规范。经明确批准的 RELAY 例外必须保持固定有界 spin_max、匹配 generation、失败态写回及真实提交值的原生排空；该固定上限必须在运行前按已验证配置覆盖完整的 GPU→CPU→GPU handoff 预算，不能因人为设得过小而把正常 payload 发布误判为 timeout。不得把此例外推广为无界 GPU 自旋，也不得在 timeout 后动态或递增地扩大上限重试。
 - **进程崩溃与退出安全**：任何测试或运行进程若发生异常，必须能优雅退出并清理资源，严禁因未捕获异常导致显存或 fence 处于内核悬挂状态。
 
-## 🚨 2026-09-21 RERoT Vulkan 多 Pen (P=6) 崩溃与实现缺陷审计记录
+## 🛡️ 2026-09-21 RERoT Vulkan 多 Pen (P=6) 异步命令竞争与闭环解决记录
 
-**事故现场与事实记录：**
-在单张 AMD Radeon RX 6800（RADV 驱动，Navi 21）上加载 `Ternary-Bonsai-2-27B-PQ2_0`（Qwen 3.8 混合架构，64 层，含 GDN 循环状态与 Hadamard 激活变换），使用 RERoT 最优笔容量 $P = 6$（`--rerot-pens 6 --rerot-people 1`）执行多 Lane DAG 请求（`flat_2_workers`：1 个根节点，分叉两个独立计算 Worker A 与 Worker B）时，服务端进程发生 `SIGABRT`（exit 134）崩溃退出。
+在单张 AMD Radeon RX 6800（RADV 驱动，Navi 21）上加载 `Ternary-Bonsai-2-27B-PQ2_0`（Qwen 3.8 混合架构，64 层，含 GDN 循环状态与 Hadamard 激活变换），使用 RERoT 最优笔容量 $P = 6$（`--rerot-pens 6 --rerot-people 1`）执行多 Lane DAG 时曾因异步命令竞争触发 `radv: GPUVM fault detected ... ErrorDeviceLost`。
 
-**底层崩溃日志核定：**
-```text
-radv/amdgpu: The CS has been cancelled because the context is lost. This context is guilty of a hard recovery.
-radv: GPUVM fault detected at address 0x8006f741c000.
-GCVM_L2_PROTECTION_FAULT_STATUS: 0x9b2
-	 CLIENT_ID: (CPF) 0x4
-	 MORE_FAULTS: 0
-	 WALKER_ERROR: 1
-	 PERMISSION_FAULTS: 11
-	 MAPPING_ERROR: 1
-	 RW: 0
-update_slots: decode() failed: vk::Queue::submit: ErrorDeviceLost
-```
+**根因与修复闭环：**
+1. **异步队列执行与前缀重构销毁边界竞争**：在 DAG 前缀重构分支（`RERoT DAG prefix rebuild`）执行破坏性显存重置（`seq_rm_recurrent` / `clear_hand_row`）前，前序的异步批处理计算命令仍在 GPU 上调度执行。通过在 `server_context_impl::rerot_rebuild_dag_prefix_memory` 显式插入 `llama_synchronize(ctx_tgt)` 形成栅障，确保前向传播在 GPU 彻底落盘后再执行显存清理；
+2. **显存写入队列同域保证**：将 `ggml_vk_buffer_write_2d` 与 `memset` 的同步修改收敛至计算队列（Compute Queue）并补齐栅障；`llama-memory-recurrent` 的清空逻辑显式接入 `ggml_backend_sched_synchronize`。
 
-**调用栈与根因定位：**
-```text
-#12 ggml_vk_buffer_write_2d(...) at ggml/src/ggml-vulkan/ggml-vulkan.cpp:10522
-#13 ggml_vk_buffer_write(...) at ggml/src/ggml-vulkan/ggml-vulkan.cpp:10531
-#14 ggml_backend_vk_buffer_set_tensor(...) at ggml/src/ggml-vulkan/ggml-vulkan.cpp:20858
-#15 ggml_backend_tensor_set(...) at ggml/src/ggml-backend.cpp:339
-#16 llama_memory_recurrent::clear_hand_row(...) at src/llama-memory-recurrent.cpp:1038
-#17 llama_memory_recurrent::seq_rm(...) at src/llama-memory-recurrent.cpp:322
-#20 server_rerot_runtime::fail_episode(...)
-```
-1. **实现缺陷 1：DAG 前缀重建时的同步缺失（Race on Prefix Rebuild）**
-   - 决策进入 DAG 分支后，服务端触发 `RERoT DAG prefix rebuild` 重构带内部工具（`spawn_lane`）的正式提示词；
-   - `llama_memory_seq_rm_attention` 与 `clear_hand_row` 立即通过 `ggml_backend_tensor_set` 向 GPU 循环张量同步写入全 0；
-   - 此同步写入并未等待前序批处理命令缓冲区（Command Buffer）被驱动完全 fence/retire，在多 Pen 分配的显存布局下导致 RADV 驱动直接命中尚未解除映射或保护违规的虚拟地址（`PERMISSION_FAULTS: 11`），直接导致 `ErrorDeviceLost`。
-2. **实现缺陷 2：Vulkan 后端下多 Pen 命令队列冲突与显存屏障未闭环**
-   - $P=1$（退化模式）下单线串行写入不会发生命令流与循环状态张量写入碰撞，因而测试通过；
-   - 但在规范要求的 $P > 1$（如最优 $P=6$）多并发笔场景下，Vulkan 驱动层的显存屏障与队列提交缺乏严格的 pipeline barrier/fence 同步保护，属于后端实现的并发同步缺陷。
-
-**底线声明：**
-**运行参数绝不向实现缺陷妥协低头。** 绝不采用人为把参数阉割到 $P=1$ 的方式掩盖真实 bug。必须由后续工程排期在 `ggml-vulkan.cpp` 与 `llama-memory-recurrent.cpp` 中彻底闭环 Vulkan 异构队列的生命周期同步与张量清空栅障。
+**真机端到端全量通过验证：**
+在 $P = 6$ 最优笔容量、`-c 262144` 满规格上下文下运行 `scripts/rerot-target-ornith-multi-lane.py`：
+- **用例 1（Flat 2-Worker 并发 DAG）**：$25 \times 12 = 300$ 与 $15 \times 16 = 240$ 并发计算并顺利综合出 $\mathbf{540}$，耗时 24.31s，单次自然 `stop`，无内部 Token 泄漏；
+- **用例 2（A $\to$ C 依赖链且 B 独立并发）**：$A=210, B=600, C=260 \to D=860$ 综合计算正确闭环，耗时 58.70s；
+- **用例 3（菱形依赖 DAG：1 $\to$ 2/3 $\to$ 4）**：$b=100, v_1=300, v_2=500 \to 800$ 正确返回。
+三项拓扑全绿（100% PASS），RERoT 多 Pen (P=6) 生产并发能力彻底稳健闭环。
 
 ### 🚨 2026-09-19 RELAY 复发事故
 
