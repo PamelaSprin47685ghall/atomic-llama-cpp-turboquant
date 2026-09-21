@@ -106,6 +106,55 @@
 
 ---
 
+## 下班交接｜2026-09-22（第七轮，cache 级布局路径：validate 位图＋ownership 单趟＋装配 reserve）
+
+**分支：** `master`（本轮 commit 见 git log）
+**主题：** 把剖面从纯 builder 推进到 cache 级全路径（`rerot_build_attn_layout` 端到端）。两文件改动（`src/llama-kv-cache.cpp` +58、`src/llama-rerot.cpp` +14）。全程 CPU。
+
+### 一、关键发现：开发机 build 是 Debug（-O0）
+
+cache 级绝对数字（111ms）与纯 builder -O2 数字（4ms）差 8.5×——查 `build/CMakeCache.txt` 是 `CMAKE_BUILD_TYPE=Debug`。**cache 级数字只作同库相对比较**；-O2 结论由独立编译基准（`g++ -O2` 直编 `src/llama-rerot.cpp`）补齐。目标机/生产数字必须 Release 构建。
+
+### 二、三项改动
+
+1. **validate 换字节位图（本轮最大项）**：`llama_rerot_attn_layout::validate` 的 per-query 重复 key 检查原是逐 entry `unordered_set::insert`——每 reader 每 query ~n_kv 次哈希插入，cache 级剖面最大单项。换 `vector<uint8_t>` 位图＋同走重置，fail-loud 语义不变。cache 级（-O0）**111.4→66.2ms（-41%）**；-O2 管线上 validate 项 0.3ms。
+2. **ownership 列单趟共享**：原 per (cell, reader) `seq_has`（R·n_kv 次）；现一趟读 `seq_get_all` 位图填 R 列 64 位字再展开字节列。语义不变；实测收益不可测（bitset test 本已廉价），保留为消除 R 倍冗余的结构改进。
+3. **装配 reserve**：`result.groups/entries` 跨 reader push_back 无 reserve；先数总量再 reserve，cache 级再 -9%（66.2→60.5ms）。
+
+### 三、-O2 管线全景（production shape Q=1，独立编译基准）
+
+| 形态 | build | validate | 合计 |
+|---|---|---|---|
+| R=6 K=65536 | 3.4ms | 0.3ms | **~5.6ms**（含装配 1.9ms） |
+| R=1 K=65536 | 2.6ms | 0.07ms | 2.7ms |
+| R=12 K=262144 | 47.4ms | 3.8ms | 59.7ms |
+
+装配（1.9ms）是对已物化 per-query 向量的纯拷贝（4.8ns/entry，memcpy 速度）；融合进 builder 发射需改 oracle 对拍接口，收益 1.9ms，暂不做。
+
+### 四、验证
+
+- `test-rerot-view` 0 failure；`test-xkv-runtime` 全过（cache 级对拍 oracle：`test_rerot_shared_reader_multi_query` MTP verify 形状＋`test_ddvr_two_query_groups` 双 reader 组）；rerot/xkv/flashprefill 全家 **45/45**；`git diff --check` 干净。
+
+### 五、评估后未做（含理由）
+
+1. **跨 ubatch 结构缓存（Q4 增量）**：增量 append 行可省 scan＋分桶（~build 的 30%），但 cell 重用/回收使 sortedness 假设可能失效，staleness 风险大于 1ms 级收益。候选后续。
+2. **装配融合**：见上，1.9ms 不值得改对拍接口。
+
+### 六、下一步
+
+1. **Release 构建重测**：目标机或本地 Release build 出诚实 -O3 数字（本地磁盘 99% 余 1.7G，谨慎）。
+2. 真机收益：目标机 `rerot-semantic-smoke.py` 对比 decode host 时间。
+3. Q=6（MTP verify）数值通道 ~15ms 仍是下一大头（每 query 重扫全部列表；可探索相邻 query 增量截断）。
+4. GPU 化 Q3（多读者共享块）：host 侧已四轮加速，GPU 侧未动。
+5. 磁盘清理（~/.cache/ccache 1.2G、~/.cache/semble 918M）。
+
+### 七、教训
+
+- **先查构建类型再解释 8×差距**：cache 级 108ms vs 纯 builder 4ms 的差距花了半小时排查（怀疑世界形状、ownership、装配），最后发现是 Debug 库。教训：跨基准比较前先确认编译参数一致。
+- **unordered_set 在热路径的隐性成本**：validate 的哈希去重占 cache 级 -O0 的近半时间；位图/字节列是 O(entries) 顺序写的正确替代。第五轮已在 builder 内做过同样替换（1141→45us），本轮是同一教训在 validate 上的复发——**审计时应全库 grep 热路径的 unordered_set**。
+
+---
+
 ## 下班交接｜2026-09-22（第六轮，multi-reader 布局生产形态快路径）
 
 **分支：** `master`（本轮 commit 见 git log）

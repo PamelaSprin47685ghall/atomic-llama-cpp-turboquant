@@ -892,8 +892,12 @@ bool llama_rerot_attn_layout::validate(uint32_t n_keys, std::string * error) con
             return set_error(error, "RERoT query group metadata is invalid");
         }
     }
+    std::vector<uint8_t> seen(n_keys, 0); // per-query duplicate-key bitmap
     for (uint32_t query = 0; query < n_queries; ++query) {
-        std::unordered_set<uint32_t> seen_keys;
+        // The duplicate check was a per-entry unordered_set insert — the
+        // dominant validation cost at production shapes (one hash insert
+        // per entry, ~n_kv per reader per query). A byte bitmap keeps the
+        // same fail-loud guarantee at O(entries) sequential writes.
         for (uint32_t i = query_offsets[query]; i < query_offsets[query + 1]; ++i) {
             const auto & entry = entries[i];
             if (entry.key_index >= n_keys || entry.group_index >= groups.size()) {
@@ -902,9 +906,15 @@ bool llama_rerot_attn_layout::validate(uint32_t n_keys, std::string * error) con
             if (groups[entry.group_index].query_index != query) {
                 return set_error(error, "RERoT attention entry references another query's group");
             }
-            if (!seen_keys.insert(entry.key_index).second) {
+            if (seen[entry.key_index]++) {
                 return set_error(error, "RERoT attention query contains a duplicate physical key");
             }
+        }
+        // Reset only the touched bytes: entries reference distinct keys
+        // when valid, so clearing via the same walk is exact; on failure we
+        // return immediately and the vector dies with the call.
+        for (uint32_t i = query_offsets[query]; i < query_offsets[query + 1]; ++i) {
+            seen[entries[i].key_index] = 0;
         }
     }
     return true;

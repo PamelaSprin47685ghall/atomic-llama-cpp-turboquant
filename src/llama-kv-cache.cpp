@@ -6277,6 +6277,16 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
     group_qpos.reserve(groups.size());
     group_owned.reserve(groups.size());
     group_readers.reserve(groups.size());
+    // Ownership columns are bitsets of the SHARED key table, not byte
+    // vectors: the R columns share one pass over the resident cells (the
+    // old loop called cells.seq_has per (cell, reader) — R x n_kv bitset
+    // tests). The distinct reader sequences are few (one per pen); the
+    // bitset test is one AND per cell per distinct sequence.
+    std::vector<llama_seq_id> group_seqs;
+    std::vector<std::vector<uint64_t>> owned_words;
+    group_seqs.reserve(groups.size());
+    const size_t owned_words_per_col =
+        (shared_keys.size() + 63) / 64 + (shared_keys.empty() ? 1 : 0);
     for (const auto & group : groups) {
         const llama_seq_id seq_id = ubatch.seq_id[group.rows.front()][0];
         std::vector<llama_pos> qpos;
@@ -6284,16 +6294,54 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
         for (const uint32_t query : group.rows) {
             qpos.push_back(ubatch.pos[query]);
         }
-        std::vector<uint8_t> owned(shared_keys.size(), 0);
-        for (size_t k = 0; k < shared_keys.size(); ++k) {
-            owned[k] = cells.seq_has(shared_keys[k].key_index, seq_id) ? 1 : 0;
-        }
+        group_seqs.push_back(seq_id);
+        owned_words.emplace_back(owned_words_per_col, 0);
         group_qpos.push_back(std::move(qpos));
-        group_owned.push_back(std::move(owned));
         group_readers.push_back(*group.view);
+    }
+    {
+        // ONE pass over resident cells fills every reader's ownership bit
+        // at once: cell bitsets are read once, not once per reader.
+        for (uint32_t key = 0; key < shared_keys.size(); ++key) {
+            // shared_keys is dense over non-empty cells in scan order, so
+            // its element k has key_index k (built by the push_back loop
+            // above; key_index == the cell index).
+            const auto & cell_seq = cells.seq_get_all(shared_keys[key].key_index);
+            for (size_t g = 0; g < group_seqs.size(); ++g) {
+                if (cell_seq.test(group_seqs[g])) {
+                    owned_words[g][key >> 6] |= 1ull << (key & 63);
+                }
+            }
+        }
+    }
+    // Expand the bitsets to the byte columns the pure builder consumes.
+    // (A bitset-consuming builder overload would avoid the expansion; kept
+    // as bytes so llama-rerot stays independent of llama-kv-cells types.)
+    group_owned.resize(groups.size());
+    for (size_t g = 0; g < groups.size(); ++g) {
+        auto & owned = group_owned[g];
+        owned.resize(shared_keys.size(), 0);
+        for (size_t k = 0; k < shared_keys.size(); ++k) {
+            owned[k] = (owned_words[g][k >> 6] >> (k & 63)) & 1u ? 1 : 0;
+        }
     }
     const auto multi = llama_rerot_build_query_layouts_multi_reader(
         group_readers, group_qpos, shared_keys, group_owned);
+    // Reserve the assembly targets once: per-group push_back reallocation
+    // over ~R x n_kv entries was a measurable fraction of the cache-side
+    // cost at production shapes.
+    {
+        size_t total_entries = 0;
+        size_t total_groups = 0;
+        for (size_t g = 0; g < groups.size(); ++g) {
+            for (size_t i = 0; i < groups[g].rows.size() && i < multi[g].size(); ++i) {
+                total_entries += multi[g][i].entries.size();
+                total_groups += multi[g][i].groups.size();
+            }
+        }
+        result.entries.reserve(total_entries);
+        result.groups.reserve(total_groups);
+    }
     for (size_t g = 0; g < groups.size(); ++g) {
         const auto & group = groups[g];
         for (size_t i = 0; i < group.rows.size() && i < multi[g].size(); ++i) {
