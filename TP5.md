@@ -81,7 +81,7 @@ LateBind recipe 必须五个 rank 全部匹配（含 `capacity_rows` 一致且 `
 * **历史文档声称**：早期推测“$1 \to 4 \to 1 \to 2$ 行数动态变化会在每次 step 引发调度器 buffer 重建和 phase 释放”。
 * **当前代码事实**：
   - 在 `src/llama-context.h:629-645` 的 `llama_context::ubatch_execution_phase()` 中引入了预定义 MTP 身份豁免：当 `gtype == LLM_GRAPH_TYPE_DECODER_MTP && has_predefined_capacity && predefined_capacity_rows > 0` 时，**恒返回 0**；避免了 `n_tokens > n_seqs ? 1 : 0` 旧规则对预定义单一最大容量图（`verify_tokens`）的无效重置，保证了常驻复用；该行为已有 `tests/test-mtp-workspace.cpp` 完整测试覆盖；
-  - **重要边界纠偏**：Target 主干模型包含 48 层有状态的 GDN（含循环状态与卷积状态），尚未完成容量下沉改造，因此在 `src/llama-context.cpp:2514-2525` 中明确维持 `predefined_capacity_rows_current = ubatch.n_tokens` 的 **exact 精确构图模式**，不参与此项容量化阶段判定，防止状态张量被未初始化的 padding 污染。
+  - **重要边界纠偏**：Target 主干模型包含 48 层有状态的 GDN（含循环状态与卷积状态），尚未完成容量下沉改造，因此在 `src/llama-context.cpp:2514-2525` 中明确维持 `predefined_capacity_rows_current = ubatch.n_tokens` 的 **exact 精确构图模式**，不参与此项容量化阶段判定，防止状态张量被未初始化的 padding 污染。（注：单卡 GDN 变长多步容量融合已在真实 RX 6800 上通过密闭回归测试 `tests/test-vulkan-gdn-multistep.cpp`，对应提交 `e508881d7` 及修复链 `bff0c009b`、`3d3822c90`、`d6579d1bb`、`a2638e056`、`2d0b67c15`，覆盖 A=1/2/4、C=4 及尾部脏数据位级隔离；但生产准入护栏 `evaluate_target_capacity_admission` 对 GDN/recurrent 模型仍维持严格的 fail-closed 拦截，解禁仍须等待多卡与模型级一致性真机验证证据）。
 
 #### 3. multi-row LateBind 已支持 ≤4 行，而非 LateBind fused HC 仍要求严格单行
 * **历史文档声称**：讨论稿曾将“LateBind”与“旧 fused HC”的行数限制混为一谈，声称 LateBind 仅能支持单行 decode。

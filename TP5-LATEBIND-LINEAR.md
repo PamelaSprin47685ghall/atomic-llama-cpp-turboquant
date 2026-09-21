@@ -15,7 +15,7 @@
    * **定义**：启用 LateBind 流水线解耦（P1/Scatter/Norm/Q 并行发射），但 Q 充分统计量保持精确 FP32 运算，sidecar 为 FP32，无任何激活量化或整数收缩误差（仅包含 RMS 树重排引入的必要末位浮点舍入）；
    * **生效条件**：满足 LateBind 基础条件，但设置了 `GGML_TP5_LATEBIND_EXACT_Q=1`，或设备缺少硬件整数点积（`integer_dot_product`）、或不支持固定 32-lane wave32、或张量形状不对齐、或 Q8 着色器管线创建未就绪。
 3. **Aggressive 模式（`aggressive-q8`）**：
-   * **定义**：启用 LateBind 全流水线解耦 + activation Q8_0 量化 + 4-wave32 workgroup Q8xQ8 整数点积收缩 + FP16 sidecar 紧致传输 + LO Q8 激活重构；
+   * **定义**：启用 LateBind 全流水线解耦 + activation Q8_0 量化 + 20 个 256-thread workgroup（`rows_per_wg=16`，两行一波 wave32）Q8xQ8 整数点积收缩 + 本地 cached device-coherent VRAM FP16 sidecar 紧致传输 + LO Q8 激活重构；
    * **生效条件**：满足 LateBind 基础条件，未请求 exact Q，且五卡均支持硬件整数点积与 wave32 控制，且张量形状对齐、Q8 着色器管线创建成功。
 4. **P1-A 对照器具模式（`p1a-nosidecar-q8`）**：
    * **定义**：用于与当前 sidecar LateBind 做同精度严格对照的测量对照器具，剥离调度重叠收益与近似算术收益。与 B（当前 aggressive LateBind）完全共用相同的 Q8_0 动态对称量化内核、Q8xQ8 整数点积（`dotPacked4x8EXT`）与 W_up/fold 实现；
@@ -49,7 +49,7 @@ unset GGML_TP5_LATEBIND_FUSED_FINALIZE
 
 旧 `GGML_TP5_LATEBIND_FUSED_FINALIZE=1` 会明确报错。它对应共同 generation 的旧 1024-thread 等待流程，不能与新的 Y/Q 独立 generation 混用。
 
-默认 aggressive Q 在设备具备 packed signed 4×8 integer-dot、subgroup-size-control 且可强制 wave32 时启用。目标 Navi21 满足这些条件：local sufficient-statistic activation 先按 Q8_0 block 量化一次，再以 4-row / 4-wave32 workgroup 做 Q8×Q8 integer-dot contraction。日志为 `q=q8dot-approx`。设置
+默认 aggressive Q 在设备具备 packed signed 4×8 integer-dot、subgroup-size-control 且可强制 wave32 时启用。目标 Navi21 满足这些条件：local sufficient-statistic activation 先按 Q8_0 block 量化一次，再以 20 个 256-thread workgroup（`rows_per_wg=16`，两行一波 wave32）做 Q8×Q8 integer-dot contraction。日志为 `q=q8dot-approx`。设置
 
 ```bash
 export GGML_TP5_LATEBIND_EXACT_Q=1
