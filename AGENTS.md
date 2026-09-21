@@ -12,6 +12,46 @@
 - **严禁依赖不稳定的设备级自旋等待**：下行信号必须使用驱动原生或有安全保障的同步原语（如 Timeline Semaphore 或受控的事件机制），不得绕过硬件调度规范。经明确批准的 RELAY 例外必须保持固定有界 spin_max、匹配 generation、失败态写回及真实提交值的原生排空；该固定上限必须在运行前按已验证配置覆盖完整的 GPU→CPU→GPU handoff 预算，不能因人为设得过小而把正常 payload 发布误判为 timeout。不得把此例外推广为无界 GPU 自旋，也不得在 timeout 后动态或递增地扩大上限重试。
 - **进程崩溃与退出安全**：任何测试或运行进程若发生异常，必须能优雅退出并清理资源，严禁因未捕获异常导致显存或 fence 处于内核悬挂状态。
 
+## 🚨 2026-09-21 RERoT Vulkan 多 Pen (P=6) 崩溃与实现缺陷审计记录
+
+**事故现场与事实记录：**
+在单张 AMD Radeon RX 6800（RADV 驱动，Navi 21）上加载 `Ternary-Bonsai-2-27B-PQ2_0`（Qwen 3.8 混合架构，64 层，含 GDN 循环状态与 Hadamard 激活变换），使用 RERoT 最优笔容量 $P = 6$（`--rerot-pens 6 --rerot-people 1`）执行多 Lane DAG 请求（`flat_2_workers`：1 个根节点，分叉两个独立计算 Worker A 与 Worker B）时，服务端进程发生 `SIGABRT`（exit 134）崩溃退出。
+
+**底层崩溃日志核定：**
+```text
+radv/amdgpu: The CS has been cancelled because the context is lost. This context is guilty of a hard recovery.
+radv: GPUVM fault detected at address 0x8006f741c000.
+GCVM_L2_PROTECTION_FAULT_STATUS: 0x9b2
+	 CLIENT_ID: (CPF) 0x4
+	 MORE_FAULTS: 0
+	 WALKER_ERROR: 1
+	 PERMISSION_FAULTS: 11
+	 MAPPING_ERROR: 1
+	 RW: 0
+update_slots: decode() failed: vk::Queue::submit: ErrorDeviceLost
+```
+
+**调用栈与根因定位：**
+```text
+#12 ggml_vk_buffer_write_2d(...) at ggml/src/ggml-vulkan/ggml-vulkan.cpp:10522
+#13 ggml_vk_buffer_write(...) at ggml/src/ggml-vulkan/ggml-vulkan.cpp:10531
+#14 ggml_backend_vk_buffer_set_tensor(...) at ggml/src/ggml-vulkan/ggml-vulkan.cpp:20858
+#15 ggml_backend_tensor_set(...) at ggml/src/ggml-backend.cpp:339
+#16 llama_memory_recurrent::clear_hand_row(...) at src/llama-memory-recurrent.cpp:1038
+#17 llama_memory_recurrent::seq_rm(...) at src/llama-memory-recurrent.cpp:322
+#20 server_rerot_runtime::fail_episode(...)
+```
+1. **实现缺陷 1：DAG 前缀重建时的同步缺失（Race on Prefix Rebuild）**
+   - 决策进入 DAG 分支后，服务端触发 `RERoT DAG prefix rebuild` 重构带内部工具（`spawn_lane`）的正式提示词；
+   - `llama_memory_seq_rm_attention` 与 `clear_hand_row` 立即通过 `ggml_backend_tensor_set` 向 GPU 循环张量同步写入全 0；
+   - 此同步写入并未等待前序批处理命令缓冲区（Command Buffer）被驱动完全 fence/retire，在多 Pen 分配的显存布局下导致 RADV 驱动直接命中尚未解除映射或保护违规的虚拟地址（`PERMISSION_FAULTS: 11`），直接导致 `ErrorDeviceLost`。
+2. **实现缺陷 2：Vulkan 后端下多 Pen 命令队列冲突与显存屏障未闭环**
+   - $P=1$（退化模式）下单线串行写入不会发生命令流与循环状态张量写入碰撞，因而测试通过；
+   - 但在规范要求的 $P > 1$（如最优 $P=6$）多并发笔场景下，Vulkan 驱动层的显存屏障与队列提交缺乏严格的 pipeline barrier/fence 同步保护，属于后端实现的并发同步缺陷。
+
+**底线声明：**
+**运行参数绝不向实现缺陷妥协低头。** 绝不采用人为把参数阉割到 $P=1$ 的方式掩盖真实 bug。必须由后续工程排期在 `ggml-vulkan.cpp` 与 `llama-memory-recurrent.cpp` 中彻底闭环 Vulkan 异构队列的生命周期同步与张量清空栅障。
+
 ### 🚨 2026-09-19 RELAY 复发事故
 
 真实 `llama-server --tp5-sync relay` 在第二个请求的 epoch-chain 重用阶段发生 payload timeout，随后主机非正常重启；上一启动周期的 journal 损坏，无法从持久日志恢复完整 hang 栈。**RELAY 的 local-VRAM shader doorbell / GPU 等待路径仍是显式 opt-in，不改变默认 TIMELINE。** 本轮在用户明确批准后恢复了原始自治 bounded-spin 路径，并完成五卡 mesh 与短 real-model decode 验证；这不等于长时间压力稳定性证明。禁止把 timeout 当作 retry 而动态或递增地增大 spin bound；运行前可在明确批准的单一配置上设定一个覆盖完整 GPU→CPU→GPU handoff 预算的固定上限。禁止以 `vkDeviceWaitIdle` 或进程 abort 作为恢复手段。每个已提交 timeline 值必须在任何资源释放前由驱动原生 wait 有界排空；失败时必须保留无法证明已完成的资源。
