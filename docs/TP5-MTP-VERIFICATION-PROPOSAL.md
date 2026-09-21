@@ -123,7 +123,8 @@ curl -s -X POST http://127.0.0.1:8099/completion \
 ```
 
 ### 3.2 运行日志核心采集项
-日志持续写入 `$LOG_PATH`，会话期间必须实时观察以下结构化标签与状态监控：
+日志持续写入 `$LOG_PATH`，会话期间必须实时观察以下结构化标签与状态监控
+（其中哪些进脚本硬门禁、哪些是人工项，以 `docs/TP5-MTP-EVIDENCE.md` 第三节映射表为准）：
 1. **`[tp5-numerical-mode]`**：确认定义期单次打印，验证模式判定正确性；
 2. **`[tp5-mtp-graph]`**：捕捉 MTP 图的复用情况，区分首轮构建与后续命中；
 3. **`[tp5-mtp-hidden]`**：监控 Target 与 MTP 间 Hidden 状态的 generation 匹配；
@@ -134,9 +135,17 @@ curl -s -X POST http://127.0.0.1:8099/completion \
 8. **内核 `dma_fence` / GPUVM 故障监控**：会话中及退出后通过 `dmesg -T` 核查有无 `GPUVM fault`、`VM page fault`、`dma_fence_wait_timeout` 或 GPU reset。
 
 ### 3.3 自动化判定与检查
-请求返回后，立即执行自动化证据分析脚本：
+请求返回后，立即执行自动化证据分析脚本（脚本无执行位时用 `bash` 显式调用；判定项→检查方式映射见 `docs/TP5-MTP-EVIDENCE.md` 第三节）：
 ```bash
-./scripts/check-tp5-mtp-evidence.sh "$LOG_PATH"
+bash scripts/check-tp5-mtp-evidence.sh "$LOG_PATH"; echo "rc=$?"
+```
+脚本覆盖的硬门禁：[A] MTP 图复用（type=3）、[E] Hidden 零错配、[F] Cycle 恒等式/守恒（含缺失 cycle 即 FAIL）、
+[M] SUBMIT_EPOCH_CHAIN 命中连续、[N] numerical-mode 打印、[L] sidecar/自旋/邮箱失败签名、[D] DeviceLost/GPUVM 致命签名。
+人工观察项（P1 phase 直接计数、P2 status[2] 逐点为零、P3 均值预算与 dmesg 复核）由值守按证据文档确认。
+合成演练夹具（DevOps 重跑脚本逻辑，不跑真机）：
+```bash
+bash scripts/make-tp5-mtp-evidence-fixtures.sh /tmp/tp5-mtp-drill
+for f in /tmp/tp5-mtp-drill/*.log; do echo "=== $f"; bash scripts/check-tp5-mtp-evidence.sh "$f"; echo "rc=$?"; done
 ```
 
 ### 3.4 异常处理、停止规则与安全退出
@@ -151,32 +160,50 @@ curl -s -X POST http://127.0.0.1:8099/completion \
 
 ## 四、预期读数与判定阈值（引用 docs/TP5-MTP-EVIDENCE.md）
 
-根据 `docs/TP5-MTP-EVIDENCE.md`，将观测指标严格划分为**判定必要项（硬性门禁）**与**参考观测项**：
+根据 `docs/TP5-MTP-EVIDENCE.md` 第三节映射表，将观测指标严格划分为**脚本硬门禁**与**人工观察/参考项**。
+凡脚本无日志依据的项，一律不得写成硬门禁。
 
-### 4.1 判定必要项（必须 100% 达成，任一项违背即判定未通过）
-1. **MTP 图单最大定义完全复用**：
-   - 首步初始化构建恰好 1 次（`reuse=0`）；
-   - 随后的所有 draft / catchup 步骤**100% 命中复用（`reuse=1`）**；
-   - `definition_uid` 全程恒定，变化次数 $\le 1$（仅初始化首轮确定 UID）。
-2. **调度器缓冲区与 Phase 零抖动**：
-   - 整个会话期间 `phase` 翻转次数 $= 0$（恒处于 `phase=0`）；
-   - `gf_res_prev->reset` 调用次数 $= 0$；
-   - Sched 显存缓冲区释放次数 $= 0$。
-3. **Device Hidden Generation 零错配**：
-   - 日志中 `[tp5-mtp-hidden] * mismatch` 出现次数 $= 0$；
-   - 所有 Target $\to$ MTP 的 Hidden 拷贝均命中真实世代匹配。
-4. **MTP 周期账本时间与 Token 守恒不变量**：
-   - 账本恒等式严格成立：`total_us == draft_us + target_us + catchup_us + handoff_us`（100% 通过）；
-   - 最终 Token 守恒严格成立：`final_tokens == accepted_tokens + 1`；
-   - **`target_us > 0`**：确凿证实 `server-context.cpp` 的真实接入有效。
-5. **设备直传状态**：
-   - `dev_hidden == 1`，确认无 CPU 主机内存多余倒腾。
+### 4.1 脚本硬门禁（`bash scripts/check-tp5-mtp-evidence.sh` 判定，任一项 FAIL 即未通过）
+1. **[A] MTP 图单最大定义完全复用（type=3 = DECODER_MTP，见 `src/llama-graph.h:56-61`）**：
+   - MTP 图重建（`type=3 reuse=0`）次数 $\le 1$（仅初始化首轮）；
+   - MTP 图复用（`type=3 reuse=1`）次数 $\ge 1$；
+   - `definition_uid` 去重后恰好 1 个恒定 UID。
+   - 说明：旧文案曾误写 `type=2`；`type=2` 是 DECODER（target 主干），本门禁只看 `type=3`。
+2. **[E] Device Hidden Generation 零错配**：
+   - 日志中 `[tp5-mtp-hidden] … mismatch` 出现次数 $= 0$。
+3. **[F] MTP 周期账本恒等式与守恒（缺失 cycle 即 FAIL）**：
+   - 逐行成立：`total_us == draft_us + target_us + catchup_us + handoff_us`；
+   - 逐行成立：`final_tokens == accepted_tokens + 1`，且 `accepted_tokens ≤ draft_tokens`；
+   - 逐行成立：`target_us > 0`（确凿证实 server-context 真实接入有效）；
+   - 逐行成立：`dev_hidden == 1`（无 CPU 倒腾）；
+   - `GGML_TP5_MTP_PROFILE=1` 受控运行下零 `[tp5-mtp-cycle]` 行直接 FAIL（不再 WARN 放行）。
+4. **[M] SUBMIT_EPOCH_CHAIN 命中连续**：
+   - `[tp5-meta] SUBMIT_EPOCH_CHAIN FAILED` 出现次数 $= 0$；
+   - 命中行（`(PREDEFINED TRUTH)` / `SUCCESS`）至少 1 行，否则 FAIL。
+5. **[N] 数值模式定义期打印**：
+   - `[tp5-numerical-mode]` 缺失即 FAIL；本提案 timeline+f16 配置期望 `mode=reference`，不符即 FAIL。
+6. **[L] Sidecar/自旋/邮箱失败签名零容忍**：
+   - `RELAY LateBind sidecar timeout/exceeds`、`… is not 128-bit copy aligned`、
+     `RELAY pre-armed bank is not idle`、`RELAY mailbox status not idle`、
+     `RELAY bank generation differs` 任一出现即 FAIL。
+   - `[tp5-latebind-stage]` / `[tp5-latebind-profile]` 行数仅报告（本提案 timeline 配置下期望 0 行，有行则人工复核）。
+7. **[D] DeviceLost / GPUVM / 图分配致命签名零容忍**：
+   - `ErrorDeviceLost`、`VK_ERROR_DEVICE_LOST`、`GPUVM fault`、`dma_fence_wait_timeout`、
+     `graph definition ID space exhausted`、`failed to allocate/initialize graph` 任一出现即 FAIL。
 
-### 4.2 参考观测项（用于系统性能洞察，不阻塞功能判定通过）
-1. **`handoff_us` 耗时**：期望均值 $\le 200\,\mu\mathrm{s}$（设备内直传）；
-2. **`catchup_us` 耗时**：期望均值 $\le 1500\,\mu\mathrm{s}$；
-3. **`draft_us` 耗时**：单 Token 草稿生成时间（参考 10~25 ms）；
-4. **草稿接受率 `eff`**：通常在 0.33 ~ 0.90 之间（受 Prompt 与模型自然分布影响）。
+### 4.2 人工观察项（脚本不判，真机值守确认）
+1. **[P1] phase 翻转 / reset / sched 释放直接计数**：当前源码 `llama-context.cpp:2554-2566` 处切换静默执行，
+   无直接日志行，脚本无法判定。以 [A] 复用率 + [M] 链命中为间接证据；需新增 `[tp5-mtp-phase]` 日志后转脚本门禁（需求已报 Manager，见证据文档 §四 R1）。
+2. **[P2] status[2] 逐 rank 逐 bank 为零**：正常路径无逐点心跳打印（`status[2]` 只在 `c.fail(...)` 文案中出现），
+   脚本仅查 [L]/[D] 失败签名；逐点为零需新增心跳日志后转脚本门禁（需求已报 Manager，见证据文档 §四 R2）。
+3. **[P3] 均值预算与 dmesg 复核**：`handoff_us` 均值 $\le 200\,\mu\mathrm{s}$、`catchup_us` 均值 $\le 1500\,\mu\mathrm{s}$ 为参考阈值，
+   单样本短会话不做均值门禁；`draft_us`（参考 10~25 ms）、接受率 `eff`（通常 0.33~0.90）仅供洞察。
+   会话中及退出后人工核查 `dmesg` 有无 `GPUVM fault` / `dma_fence_wait_timeout` / GPU reset。
+
+### 4.3 与旧版的差异说明
+- 旧 4.1(2)“phase 翻转=0 / reset=0 / release=0”因无日志依据，已降为人工项 [P1]，不再作为脚本硬门禁；
+- 旧 4.1(5) `dev_hidden==1` 仍是脚本硬门禁（并入 [F] 逐行校验），保持不变；
+- 新增 [M][N][L][D] 四组脚本硬门禁，均有明确日志格式依据，杜绝“脚本不查却写成硬门禁”。
 
 ---
 
