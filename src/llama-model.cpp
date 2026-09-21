@@ -2021,6 +2021,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     }
                 }
                 (*target)[weight] = { it->tensor, sign_tensor };
+                if (hadamard_gdn_v_grouped && weight_name.find(".ssm_out.") != std::string::npos) {
+                    const int64_t n_v = hparams.ssm_dt_rank;
+                    const int64_t n_k = hparams.ssm_n_group;
+                    if (n_k > 0 && n_v > 0 && n_v % n_k == 0 && weight->ne[0] % n_v == 0) {
+                        auto & tr = (*target)[weight];
+                        tr.perm_hd  = weight->ne[0] / n_v;
+                        tr.perm_nk  = n_k;
+                        tr.perm_rep = n_v / n_k;
+                    }
+                }
             }
         }
     }

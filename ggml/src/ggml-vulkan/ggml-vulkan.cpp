@@ -1214,7 +1214,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_argsort_large_f32[num_argsort_pipelines];
     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
     vk_pipeline pipeline_sum_rows_f32;
-    vk_pipeline pipeline_fwht_f32[4];
+    vk_pipeline pipeline_fwht_f32[8];
     vk_pipeline pipeline_cumsum_f32;
     vk_pipeline pipeline_cumsum_small_f32;
     vk_pipeline pipeline_cumsum_multipass1_f32;
@@ -7224,7 +7224,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         (device->architecture == vk_device_architecture::INTEL_XE2 && ggml_vk_intel_windows_driver_equals_or_newer_than(device->properties.driverVersion, 101, 8860));
     if (can_use_fwht && device->subgroup_basic && device->subgroup_shuffle) {
         int idx = 0;
-        for (uint32_t n : {64, 128, 256, 512}) {
+        for (uint32_t n : {64, 128, 256, 512, 1024, 2048, 4096, 8192}) {
             if (device->subgroup_size <= n) {
                 ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_f32", fwht_f32_len, fwht_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { device->subgroup_size, n }, 1, true, true, device->subgroup_size);
             }
@@ -7232,7 +7232,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     } else if (can_use_fwht) {
         int idx = 0;
-        for (uint32_t n : {64, 128, 256, 512}) {
+        for (uint32_t n : {64, 128, 256, 512, 1024, 2048, 4096, 8192}) {
             const uint32_t block_size = std::min(device->subgroup_size, n);
             ggml_vk_create_pipeline(device, device->pipeline_fwht_f32[idx], "fwht_shmem_f32", fwht_shmem_f32_len, fwht_shmem_f32_data, "main", 2, sizeof(vk_op_fwht_push_constants), {1, 1, 1}, { block_size, n }, 1);
             ++idx;
@@ -16710,6 +16710,7 @@ static void ggml_vk_turbo_wht(ggml_backend_vk_context * ctx, vk_context& subctx,
         (uint32_t)ggml_nelements(src0), (uint32_t)direction, (uint32_t)group_size,
         src1 != nullptr ? 1u : 0u,
     };
+    fprintf(stderr, "DEBUG: ggml_vk_turbo_wht pipeline ptr: %p, name: %s, push_constant_size: %zu\n", (void*)ctx->device->pipeline_turbo_wht.get(), ctx->device->pipeline_turbo_wht ? ctx->device->pipeline_turbo_wht->name.c_str() : "null", ctx->device->pipeline_turbo_wht ? ctx->device->pipeline_turbo_wht->push_constant_size : 0);
     vk_pipeline pipeline = ctx->device->pipeline_turbo_wht;
     GGML_ASSERT(pipeline != nullptr);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);

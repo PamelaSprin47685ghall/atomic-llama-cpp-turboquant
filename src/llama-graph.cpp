@@ -2677,6 +2677,14 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     ggml_tensor * cur_mm = cur;
     if (hadamard_rotations && hadamard_rotations->count(w)) {
         const auto & t = hadamard_rotations->at(w);
+        if (t.perm_rep > 1) {
+            // tiled [hd, nk, rep] -> grouped [hd, rep, nk] feature order
+            ggml_tensor * x = ggml_is_contiguous(cur_mm) ? cur_mm : ggml_cont(ctx0, cur_mm);
+            const int64_t ne1 = x->ne[1], ne2 = x->ne[2], ne3 = x->ne[3];
+            x = ggml_reshape_4d(ctx0, x, t.perm_hd, t.perm_nk, t.perm_rep, ne1*ne2*ne3);
+            x = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
+            cur_mm = ggml_reshape_4d(ctx0, x, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
+        }
         if (t.signs) {
             cur_mm = ggml_mul(ctx0, cur_mm, t.signs);
         }
@@ -2722,6 +2730,14 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     ggml_tensor * cur_mm = cur;
     if (hadamard_rotations && hadamard_rotations->count(w)) {
         const auto & t = hadamard_rotations->at(w);
+        if (t.perm_rep > 1) {
+            // tiled [hd, nk, rep] -> grouped [hd, rep, nk] feature order
+            ggml_tensor * x = ggml_is_contiguous(cur_mm) ? cur_mm : ggml_cont(ctx0, cur_mm);
+            const int64_t ne1 = x->ne[1], ne2 = x->ne[2], ne3 = x->ne[3];
+            x = ggml_reshape_4d(ctx0, x, t.perm_hd, t.perm_nk, t.perm_rep, ne1*ne2*ne3);
+            x = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
+            cur_mm = ggml_reshape_4d(ctx0, x, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
+        }
         if (t.signs) {
             cur_mm = ggml_mul(ctx0, cur_mm, t.signs);
         }
@@ -3533,6 +3549,18 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         auto & cur = inps[0];
 
         cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+
+        // a Hadamard-latent embedding table stores rotated rows; restore the
+        // primal basis right after the lookup: h = s * (H z)
+        if (hadamard_inverses) {
+            const auto it = hadamard_inverses->find(tok_embd);
+            if (it != hadamard_inverses->end()) {
+                cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot);
+                if (it->second.signs) {
+                    cur = ggml_mul(ctx0, cur, it->second.signs);
+                }
+            }
+        }
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {
