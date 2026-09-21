@@ -233,6 +233,6 @@ for f in /tmp/tp5-mtp-drill/*.log; do echo "=== $f"; bash scripts/check-tp5-mtp-
 
 ## 七、执行基准（Execution Baseline）
 
-本次受控验证的被验证候选更新固定为 git commit `62409ebff97895a76e8f453a596362aa8c0de63d`（在原基准上合入 TARGET 容量化第一阶段双长度契约与 Attention 区域容量化，并包含 capacity 模式下 KV 尾部槽位安全重定向与 QSA fail-closed 修复）。该 commit 已通过 build-tp5 增量构建、全量 10/10 CPU 回归（含 test-target-capacity 9 组测试）与独立审查复核。
+本次受控验证的被验证候选更新固定为 git commit `14d9b321a2a44539ce3b2e42ae98c5237148beb0`（在原基准上合入 TARGET 容量化第一阶段、Attention 区域容量化及 KV 尾部安全修复，并包含 GDN 方案 B 算子活跃步参数下传、真实前向端到端测试与 GDN/recurrent 模型安全收口；GDN 仍 fail-closed）。该 commit 已通过 build-tp5 增量构建、全量 10/10 CPU 回归（含 test-target-capacity 12 组测试）与独立复核。
 
 执行时若工作树已在此基准之上前进，应在该 commit 的独立 worktree 中构建并运行受控会话；若因故直接在当前工作树执行，必须在执行前确认当前代码与该 commit 的差异并如实记录，保证验证对象是经过审计与六态演练的冻结状态。真机执行仍以用户明确批准为前提，未经批准不得启动任何 GPU 服务。
