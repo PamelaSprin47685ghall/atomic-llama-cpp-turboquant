@@ -3033,6 +3033,8 @@ struct ggml_backend_vk_context {
     std::vector<vk::CommandBuffer> replay_pending_bufs;
     uint64_t replay_hits = 0;
     uint64_t replay_misses = 0;
+    uint64_t replay_desc_alloc_count = 0;
+    uint64_t replay_desc_write_count = 0;
     uint64_t sparse_dispatch_count = 0;
     uint64_t                        recorded_dispatches   = 0;
     // Host-side extent for a capacity-defined graph. Zero means ordinary
@@ -10508,9 +10510,11 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
             std::vector<vk::DescriptorSetLayout> layouts(64, ctx->device->dsl);
             vk::DescriptorSetAllocateInfo ds_ai(dedicated_pool, 64, layouts.data());
             ctx->replay_recording_sets = ctx->device->device.allocateDescriptorSets(ds_ai);
+            ctx->replay_desc_alloc_count += 64;
         }
         descriptor_set = ctx->replay_recording_sets.back();
         ctx->replay_recording_sets.pop_back();
+        ctx->replay_desc_write_count++;
     } else {
         GGML_ASSERT(ctx->descriptor_set_idx < ctx->descriptor_sets.size());
         descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
@@ -10579,9 +10583,11 @@ static void ggml_vk_dispatch_pipeline_indirect(
             std::vector<vk::DescriptorSetLayout> layouts(64, ctx->device->dsl);
             vk::DescriptorSetAllocateInfo ds_ai(dedicated_pool, 64, layouts.data());
             ctx->replay_recording_sets = ctx->device->device.allocateDescriptorSets(ds_ai);
+            ctx->replay_desc_alloc_count += 64;
         }
         descriptor_set = ctx->replay_recording_sets.back();
         ctx->replay_recording_sets.pop_back();
+        ctx->replay_desc_write_count++;
     } else {
         GGML_ASSERT(ctx->descriptor_set_idx < ctx->descriptor_sets.size());
         descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
@@ -27096,12 +27102,16 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
     if (strcmp(name, "ggml_backend_vk_flush_async") == 0) {
         return (void *) ggml_vk_tp5_flush_async;
     }
-    if (strcmp(name, "ggml_backend_vk_get_replay_stats") == 0) {
-        return (void *) +[](ggml_backend_t backend, uint64_t * hits, uint64_t * misses) {
+    if (strcmp(name, "ggml_backend_vk_get_replay_stats") == 0 ||
+        strcmp(name, "ggml_backend_vk_get_replay_desc_stats") == 0) {
+        return (void *) +[](ggml_backend_t backend, uint64_t * hits, uint64_t * misses,
+                             uint64_t * desc_allocs, uint64_t * desc_writes) {
             if (!ggml_backend_is_vk(backend)) return;
             auto * ctx = (ggml_backend_vk_context *) backend->context;
             if (hits) *hits = ctx->replay_hits;
             if (misses) *misses = ctx->replay_misses;
+            if (desc_allocs) *desc_allocs = ctx->replay_desc_alloc_count;
+            if (desc_writes) *desc_writes = ctx->replay_desc_write_count;
         };
     }
     if (strcmp(name, "ggml_backend_vk_get_region_mmvq_stats") == 0) {
