@@ -992,6 +992,11 @@ llama_context::llama_context(
         }
     }
 
+    {
+        const char * LLAMA_TARGET_CAPACITY = getenv("LLAMA_TARGET_CAPACITY");
+        predefined_target_enabled = LLAMA_TARGET_CAPACITY ? (atoi(LLAMA_TARGET_CAPACITY) != 0) : predefined_target_enabled;
+    }
+
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
@@ -2511,6 +2516,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             // the post-attention FFN/head consumes at most one OUTPUT row.
             predefined_capacity_rows_current = capacity->verify_tokens;
             predefined_capacity_outputs_current = 1;
+        } else if (predefined_target_enabled && request.phase == GGML_PREDEFINED_TARGET) {
+            // TARGET capacity path: when enabled, capacity_rows and capacity_outputs
+            // are raised to verify_tokens (Manager decision 1: 单一容量, capacity_outputs == capacity_rows == verify_tokens).
+            // Manager decision 3: PLE/QSA 等无法收敛的组合 fail-closed: 拒绝进入容量路径并回退精确定义
+            const bool ple_unsupported = model.hparams.ple_n_heads > 0;
+            const bool multi_seq = (ubatch.n_seqs != 1 || ubatch.n_seqs_unq != 1);
+            if (ple_unsupported) {
+                LLAMA_LOG_INFO("%s: TARGET capacity path disabled for model with PLE (fail-closed, falling back to exact)\n", __func__);
+                predefined_capacity_rows_current = ubatch.n_tokens;
+                predefined_capacity_outputs_current = std::max<uint32_t>(1u, frame.active_outputs);
+            } else if (multi_seq) {
+                LLAMA_LOG_INFO("%s: TARGET capacity path disabled for multi-sequence (fail-closed, falling back to exact)\n", __func__);
+                predefined_capacity_rows_current = ubatch.n_tokens;
+                predefined_capacity_outputs_current = std::max<uint32_t>(1u, frame.active_outputs);
+            } else {
+                predefined_capacity_rows_current = capacity->verify_tokens;
+                predefined_capacity_outputs_current = capacity->verify_tokens;
+            }
         } else {
             // Target/prefill stays exact until the 48-layer stateful trunk has
             // independently completed capacity lowering.
@@ -4946,6 +4969,7 @@ llm_graph_params llama_context::graph_params(
         /*.predefined_capacity_rows =*/ predefined_frame_current_valid ? predefined_capacity_rows_current : 0u,
         /*.predefined_capacity_outputs =*/ predefined_frame_current_valid ? predefined_capacity_outputs_current : 0u,
         /*.predefined_enabled =*/ predefined_frame_current_valid,
+        /*.predefined_target_enabled =*/ predefined_target_enabled,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
         /*.flashprefill_reserve_sizing =*/ fp_reserve_sizing_active,

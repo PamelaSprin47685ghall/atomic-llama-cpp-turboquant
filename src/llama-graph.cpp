@@ -82,6 +82,9 @@ static bool can_reuse_kq_mask(
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
+        if (tokens && n_tokens > tokens->ne[0]) {
+            throw std::runtime_error("predefined token rows exceed fixed token capacity");
+        }
 
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     }
@@ -90,6 +93,9 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(n_embd == embd->ne[0]);
 
         const int64_t n_tokens = ubatch->n_tokens;
+        if (embd && n_tokens > embd->ne[1]) {
+            throw std::runtime_error("predefined embedding rows exceed fixed embedding capacity");
+        }
 
         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
     }
@@ -161,6 +167,9 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
+        if (n_tokens * n_pos_per_embd > pos->ne[0]) {
+            throw std::runtime_error("predefined position rows exceed fixed position capacity");
+        }
 
         if (ubatch->token && n_pos_per_embd == 4) {
             // in case we're using M-RoPE with text tokens, convert the 1D positions to 4D
@@ -2696,6 +2705,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_outputs_active (params.n_outputs),
     n_outputs_capacity(params.predefined_enabled ? params.predefined_capacity_outputs : params.n_outputs),
     predefined_enabled(params.predefined_enabled),
+    predefined_target_enabled(params.predefined_target_enabled),
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
     pooling_type     (cparams.pooling_type),
     rope_type        (hparams.rope_type),

@@ -1380,6 +1380,7 @@ struct llm_graph_params {
     uint32_t predefined_capacity_rows = 0;
     uint32_t predefined_capacity_outputs = 0;
     bool predefined_enabled = false;
+    bool predefined_target_enabled = false;
 
     llm_graph_cb cb;
 
@@ -1467,11 +1468,19 @@ struct llm_graph_params {
         const bool predefined_mtp_dynamic =
             predefined_enabled && other.predefined_enabled &&
             gtype == LLM_GRAPH_TYPE_DECODER_MTP && other.gtype == LLM_GRAPH_TYPE_DECODER_MTP;
+        const bool predefined_target_dynamic =
+            predefined_enabled && other.predefined_enabled &&
+            predefined_target_enabled && other.predefined_target_enabled &&
+            gtype == LLM_GRAPH_TYPE_DECODER && other.gtype == LLM_GRAPH_TYPE_DECODER &&
+            predefined_frame.phase == GGML_PREDEFINED_TARGET &&
+            other.predefined_frame.phase == GGML_PREDEFINED_TARGET &&
+            predefined_capacity_rows == predefined_capacity_outputs &&
+            other.predefined_capacity_rows == other.predefined_capacity_outputs;
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
-            (predefined_mtp_dynamic || ubatch.n_tokens == other.ubatch.n_tokens) &&
-            (predefined_mtp_dynamic || ubatch.n_seq_tokens == other.ubatch.n_seq_tokens) &&
+            (predefined_mtp_dynamic || predefined_target_dynamic || ubatch.n_tokens == other.ubatch.n_tokens) &&
+            (predefined_mtp_dynamic || predefined_target_dynamic || ubatch.n_seq_tokens == other.ubatch.n_seq_tokens) &&
             ubatch.n_seqs       == other.ubatch.n_seqs &&
             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
             (
@@ -1498,7 +1507,7 @@ struct llm_graph_params {
             return false;
         }
 
-        if (!predefined_mtp_dynamic && n_outputs != other.n_outputs) {
+        if (!predefined_mtp_dynamic && !predefined_target_dynamic && n_outputs != other.n_outputs) {
             return false;
         }
 
@@ -1506,7 +1515,7 @@ struct llm_graph_params {
             return false;
         }
 
-        if (samplers.size() > 0 && !predefined_mtp_dynamic) {
+        if (samplers.size() > 0 && !predefined_mtp_dynamic && !predefined_target_dynamic) {
             if (!ubatch.data || !other.ubatch.data) {
                 return false;
             }
@@ -1728,6 +1737,7 @@ struct llm_graph_context {
     const int64_t n_outputs_active;
     const int64_t n_outputs_capacity;
     const bool predefined_enabled;
+    const bool predefined_target_enabled;
     const int32_t n_ctx_orig; // yarn
 
     const enum llama_pooling_type pooling_type;

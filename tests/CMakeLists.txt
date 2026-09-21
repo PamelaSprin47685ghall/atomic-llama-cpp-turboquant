@@ -139,6 +139,11 @@ add_executable(test-mtp-workspace test-mtp-workspace.cpp)
 target_link_libraries(test-mtp-workspace PRIVATE llama llama-common)
 llama_test(test-mtp-workspace LABEL "predefined;cpu")
 
+add_executable(test-target-capacity test-target-capacity.cpp)
+target_include_directories(test-target-capacity PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-target-capacity PRIVATE llama llama-common ggml-base)
+llama_test(test-target-capacity LABEL "predefined;cpu")
+
 add_executable(test-predefined-coverage test-predefined-coverage.cpp)
 target_compile_features(test-predefined-coverage PRIVATE cxx_std_17)
 llama_test(test-predefined-coverage LABEL "predefined;cpu")

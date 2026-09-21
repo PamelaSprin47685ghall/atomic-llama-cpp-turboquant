@@ -89,6 +89,8 @@ struct llama_context {
     bool predefined_hidden_capture(ggml_backend_t producer, const ggml_tensor * tensor, uint32_t offset, uint32_t rows);
     bool predefined_hidden_readback();
     bool predefined_hidden_bind_ubatch(llama_ubatch & ubatch, llama_device_hidden_input & input);
+    void set_predefined_target_enabled(bool enabled) { predefined_target_enabled = enabled; }
+    bool get_predefined_target_enabled() const { return predefined_target_enabled; }
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
@@ -722,6 +724,7 @@ private:
     uint32_t predefined_capacity_rows_current = 0;
     uint32_t predefined_capacity_outputs_current = 0;
     bool predefined_frame_current_valid = false;
+    bool predefined_target_enabled = false;
     ggml_backend_sched_ptr sched;
 
     // training
