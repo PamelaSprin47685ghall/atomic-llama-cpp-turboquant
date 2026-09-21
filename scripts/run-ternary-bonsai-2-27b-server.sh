@@ -57,16 +57,17 @@ if pgrep -x ninja >/dev/null || pgrep -f 'cc1plus|/bin/ld ' >/dev/null; then
 fi
 
 # Ensure target Vulkan GPU is idle and clean before launching
-# Inspect DRM cards available under /sys/class/drm/
-for _ in $(seq 1 15); do
+# Allow desktop window compositor / browser baselines (< 2.0 GiB)
+MAX_BASELINE_VRAM=$((2 * 1024 * 1024 * 1024))
+
+for _ in $(seq 1 10); do
     busy=0
     for c in /sys/class/drm/card[0-9]; do
         [[ -d "$c" ]] || continue
         if [[ -f "$c/device/mem_info_vram_used" && -f "$c/device/gpu_busy_percent" ]]; then
             u=$(cat "$c/device/mem_info_vram_used" 2>/dev/null || echo 0)
-            gpu_busy=$(cat "$c/device/gpu_busy_percent" 2>/dev/null || echo 0)
-            if [[ "$u" =~ ^[0-9]+$ && "$gpu_busy" =~ ^[0-9]+$ ]]; then
-                if [ "$u" -gt 500000000 ] || [ "$gpu_busy" -ne 0 ]; then
+            if [[ "$u" =~ ^[0-9]+$ ]]; then
+                if [ "$u" -gt "$MAX_BASELINE_VRAM" ]; then
                     busy=1
                 fi
             fi
