@@ -2188,5 +2188,8 @@ struct llm_graph_context {
             ggml_tensor * dense_3) const;
 };
 
+// Expand ubatch token dimensions to fixed capacity for single-sequence capacity graph
+llama_ubatch llama_ubatch_expand_capacity(const llama_ubatch & ubatch, uint32_t capacity_rows);
+
 // TODO: better name
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional);

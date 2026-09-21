@@ -115,6 +115,10 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
 
     if (ubatch->token) {
+        if (tokens && n_tokens > tokens->ne[0]) {
+            throw std::runtime_error("predefined token rows exceed fixed token capacity");
+        }
+
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     } else {
         // note: mtmd embedding input goes through here
@@ -4108,6 +4112,17 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
+llama_ubatch llama_ubatch_expand_capacity(const llama_ubatch & ubatch, uint32_t capacity_rows) {
+    llama_ubatch shape_ubatch = ubatch;
+    if (capacity_rows != 0 && capacity_rows != ubatch.n_tokens) {
+        GGML_ASSERT(ubatch.n_seqs == 1 && ubatch.n_seqs_unq == 1);
+        GGML_ASSERT(capacity_rows >= ubatch.n_tokens);
+        shape_ubatch.n_tokens = capacity_rows;
+        shape_ubatch.n_seq_tokens = capacity_rows;
+    }
+    return shape_ubatch;
+}
+
 static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,
@@ -4124,13 +4139,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
 
-        llama_ubatch shape_ubatch = ubatch;
-        if (capacity_rows != 0 && capacity_rows != ubatch.n_tokens) {
-            GGML_ASSERT(ubatch.n_seqs == 1 && ubatch.n_seqs_unq == 1);
-            GGML_ASSERT(capacity_rows >= ubatch.n_tokens);
-            shape_ubatch.n_tokens = capacity_rows;
-            shape_ubatch.n_seq_tokens = capacity_rows;
-        }
+        llama_ubatch shape_ubatch = llama_ubatch_expand_capacity(ubatch, capacity_rows);
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, shape_ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, shape_ubatch);
 

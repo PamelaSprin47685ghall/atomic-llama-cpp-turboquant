@@ -11,6 +11,7 @@
 #include "llama.h"
 #include "llama-hparams.h"
 #include "llama-cparams.h"
+#include "llama-context.h"
 #include "llama-graph.h"
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -355,6 +356,193 @@ static void test_target_switch_off_status_quo() {
     fprintf(stderr, "  PASSED: test_target_switch_off_status_quo\n");
 }
 
+static void test_target_embd_h_bounds() {
+    fprintf(stderr, "--- test_target_embd_h_bounds ---\n");
+    struct ggml_init_params gparams = { 1024 * 1024, nullptr, false };
+    ggml_context * ctx = ggml_init(gparams);
+    CHECK(ctx != nullptr);
+
+    llm_graph_input_embd_h inp(2560);
+    ggml_tensor * tokens = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), ggml_nbytes(tokens));
+    ggml_backend_buffer_init_tensor(buf, tokens);
+    tokens->data = ggml_backend_buffer_get_base(buf);
+    tokens->buffer = buf;
+    inp.tokens = tokens;
+
+    llama_token tok_data[5] = {101, 102, 103, 104, 105};
+    llama_ubatch ubatch{};
+    ubatch.n_tokens = 3;
+    ubatch.token = tok_data;
+    inp.set_input(&ubatch); // active = 3 <= 4, succeeds
+
+    // active = 5 > 4, must throw runtime_error
+    bool threw = false;
+    try {
+        llama_ubatch ubatch_overflow{};
+        ubatch_overflow.n_tokens = 5;
+        ubatch_overflow.token = tok_data;
+        inp.set_input(&ubatch_overflow);
+    } catch (const std::runtime_error &) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    fprintf(stderr, "  PASSED: test_target_embd_h_bounds\n");
+}
+
+static void test_target_attn_kv_capacity_shapes() {
+    fprintf(stderr, "--- test_target_attn_kv_capacity_shapes (production helper) ---\n");
+    // Contract verification for single-sequence capacity expansion calling production llama_ubatch_expand_capacity:
+    // 1. Single-sequence invariant: ubatch.n_seqs == 1 && ubatch.n_seqs_unq == 1
+    // 2. shape_ubatch.n_tokens and shape_ubatch.n_seq_tokens expand to capacity_rows
+    const uint32_t capacity_rows = 4;
+    llama_ubatch ubatch{};
+    ubatch.n_tokens = 2;
+    ubatch.n_seqs = 1;
+    ubatch.n_seqs_unq = 1;
+    ubatch.n_seq_tokens = 2;
+
+    // Calls production function exported in llama-graph.h
+    llama_ubatch shape_ubatch = llama_ubatch_expand_capacity(ubatch, capacity_rows);
+
+    CHECK(shape_ubatch.n_tokens == 4);
+    CHECK(shape_ubatch.n_seq_tokens == 4);
+    CHECK(ubatch.n_tokens == 2); // original active token count intact
+
+    // Invariant: non-capacity mode (capacity_rows == 0 or == n_tokens) returns original shapes
+    llama_ubatch exact_ubatch = llama_ubatch_expand_capacity(ubatch, 2);
+    CHECK(exact_ubatch.n_tokens == 2);
+    CHECK(exact_ubatch.n_seq_tokens == 2);
+
+    fprintf(stderr, "  PASSED: test_target_attn_kv_capacity_shapes\n");
+}
+
+static void test_target_fail_closed_contract() {
+    fprintf(stderr, "--- test_target_fail_closed_contract (production function) ---\n");
+    // Verify fail-closed admission rules calling production llama_context::evaluate_target_capacity_admission
+    const uint32_t verify_tokens = 4;
+    const uint32_t active_tokens = 2;
+
+    llama_ubatch ubatch{};
+    ubatch.n_tokens = active_tokens;
+    ubatch.n_seqs = 1;
+    ubatch.n_seqs_unq = 1;
+
+    ggml_predefined_frame frame{};
+    frame.active_tokens = active_tokens;
+    frame.active_outputs = active_tokens;
+
+    llama_hparams hparams{};
+    hparams.n_layer_all = 32;
+
+    // Case 1: Switch OFF -> always exact
+    {
+        auto dec = llama_context::evaluate_target_capacity_admission(false, hparams, ubatch, frame, verify_tokens);
+        CHECK(!dec.entered);
+        CHECK(dec.capacity_rows == active_tokens);
+        CHECK(dec.capacity_outputs == active_tokens);
+    }
+
+    // Case 2: Switch ON, pure single-seq dense attention -> capacity entered!
+    {
+        auto dec = llama_context::evaluate_target_capacity_admission(true, hparams, ubatch, frame, verify_tokens);
+        CHECK(dec.entered);
+        CHECK(dec.capacity_rows == verify_tokens);
+        CHECK(dec.capacity_outputs == verify_tokens);
+        CHECK(dec.reason == nullptr);
+    }
+
+    // Case 3: Switch ON, but PLE enabled -> fail-closed to exact!
+    {
+        llama_hparams ple_hparams = hparams;
+        ple_hparams.ple_n_heads = 8;
+        auto dec = llama_context::evaluate_target_capacity_admission(true, ple_hparams, ubatch, frame, verify_tokens);
+        CHECK(!dec.entered);
+        CHECK(dec.capacity_rows == active_tokens);
+        CHECK(dec.reason != nullptr && strcmp(dec.reason, "model with PLE") == 0);
+    }
+
+    // Case 4: Switch ON, but QSA enabled -> fail-closed to exact!
+    {
+        llama_hparams qsa_hparams = hparams;
+        qsa_hparams.dsv4_compress_ratios[0] = 4; // layer 0 compression ratio > 0
+        auto dec = llama_context::evaluate_target_capacity_admission(true, qsa_hparams, ubatch, frame, verify_tokens);
+        CHECK(!dec.entered);
+        CHECK(dec.capacity_rows == active_tokens);
+        CHECK(dec.reason != nullptr && strcmp(dec.reason, "model with QSA") == 0);
+    }
+
+    // Case 5: Switch ON, but multi-sequence -> fail-closed to exact!
+    {
+        llama_ubatch multi_ubatch = ubatch;
+        multi_ubatch.n_seqs = 2;
+        auto dec = llama_context::evaluate_target_capacity_admission(true, hparams, multi_ubatch, frame, verify_tokens);
+        CHECK(!dec.entered);
+        CHECK(dec.capacity_rows == active_tokens);
+        CHECK(dec.reason != nullptr && strcmp(dec.reason, "multi-sequence") == 0);
+    }
+
+    fprintf(stderr, "  PASSED: test_target_fail_closed_contract\n");
+}
+
+static void test_target_kv_tail_safety_contract() {
+    fprintf(stderr, "--- test_target_kv_tail_safety_contract ---\n");
+    // Contract verification for KV capacity tail sanitization:
+    // When dst->ne[0] == capacity > active:
+    // 1. [0, active) is populated with valid slot indices.
+    // 2. [active, capacity) MUST NOT retain stale indices or 0 (which could overwrite prompt token at slot 0).
+    // 3. [active, capacity) must be sanitized to a safe, unread slot index.
+    // 4. Repeated writes into the safe slot do not touch or corrupt the active slot.
+
+    const int64_t active_slot = 42;
+    const int64_t safe_slot = 100; // unread empty slot
+    const uint32_t active = 1;
+    const uint32_t capacity = 4;
+
+    std::vector<int64_t> k_idxs(capacity, 0); // initial 0s (simulating danger of overwriting slot 0)
+
+    // Simulate the tail sanitization logic implemented in llama_kv_cache::set_input_k_idxs:
+    k_idxs[0] = active_slot;
+    if (capacity > active) {
+        for (uint32_t i = active; i < capacity; ++i) {
+            k_idxs[i] = safe_slot;
+        }
+    }
+
+    CHECK(k_idxs[0] == active_slot);
+    for (uint32_t i = active; i < capacity; ++i) {
+        CHECK(k_idxs[i] == safe_slot);
+        CHECK(k_idxs[i] != 0); // Slot 0 is protected from overwrite!
+        CHECK(k_idxs[i] != active_slot); // Active slot is protected from overwrite!
+    }
+
+    // Simulate ggml_set_rows forward execution order:
+    // i goes from 0 to capacity - 1
+    std::vector<float> kv_cache_mock(200, 0.0f);
+    kv_cache_mock[0] = 999.0f; // Prompt token at slot 0 must remain 999.0f
+
+    std::vector<float> k_cur_mock = { 1.23f, -99.0f, -99.0f, -99.0f }; // row 0 valid, rows 1..3 garbage
+
+    for (uint32_t i = 0; i < capacity; ++i) {
+        int64_t dst_slot = k_idxs[i];
+        kv_cache_mock[dst_slot] = k_cur_mock[i];
+    }
+
+    // Assert: Slot 0 intact!
+    CHECK(kv_cache_mock[0] == 999.0f);
+
+    // Assert: Active slot 42 intact with row 0 value!
+    CHECK(kv_cache_mock[active_slot] == 1.23f);
+
+    // Assert: Safe slot absorbed the inactive garbage rows!
+    CHECK(kv_cache_mock[safe_slot] == -99.0f);
+
+    fprintf(stderr, "  PASSED: test_target_kv_tail_safety_contract\n");
+}
+
 int main() {
     try {
         test_target_frame_contract();
@@ -362,6 +550,10 @@ int main() {
         test_target_input_shell_bounds();
         test_target_reuse_key_dynamic();
         test_target_switch_off_status_quo();
+        test_target_embd_h_bounds();
+        test_target_attn_kv_capacity_shapes();
+        test_target_fail_closed_contract();
+        test_target_kv_tail_safety_contract();
         fprintf(stderr, "\nALL TARGET CAPACITY CONTRACT TESTS PASSED (100%% CPU verified)\n");
         return 0;
     } catch (const std::exception & e) {

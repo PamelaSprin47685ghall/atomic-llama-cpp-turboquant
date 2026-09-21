@@ -2404,6 +2404,55 @@ struct llama_compute_guard {
     }
 };
 
+llama_context::target_capacity_decision llama_context::evaluate_target_capacity_admission(
+        bool target_enabled,
+        const llama_hparams & hparams,
+        const llama_ubatch & ubatch,
+        const ggml_predefined_frame & frame,
+        uint32_t verify_tokens) {
+    target_capacity_decision res{};
+    if (!target_enabled) {
+        res.entered = false;
+        res.capacity_rows = ubatch.n_tokens;
+        res.capacity_outputs = std::max<uint32_t>(1u, frame.active_outputs);
+        res.reason = nullptr;
+        return res;
+    }
+
+    const bool ple_unsupported = hparams.ple_n_heads > 0;
+    const bool multi_seq = (ubatch.n_seqs != 1 || ubatch.n_seqs_unq != 1);
+    bool qsa_unsupported = false;
+    for (uint32_t r : hparams.dsv4_compress_ratios) {
+        if (r > 0) {
+            qsa_unsupported = true;
+            break;
+        }
+    }
+
+    if (ple_unsupported) {
+        res.entered = false;
+        res.capacity_rows = ubatch.n_tokens;
+        res.capacity_outputs = std::max<uint32_t>(1u, frame.active_outputs);
+        res.reason = "model with PLE";
+    } else if (multi_seq) {
+        res.entered = false;
+        res.capacity_rows = ubatch.n_tokens;
+        res.capacity_outputs = std::max<uint32_t>(1u, frame.active_outputs);
+        res.reason = "multi-sequence";
+    } else if (qsa_unsupported) {
+        res.entered = false;
+        res.capacity_rows = ubatch.n_tokens;
+        res.capacity_outputs = std::max<uint32_t>(1u, frame.active_outputs);
+        res.reason = "model with QSA";
+    } else {
+        res.entered = true;
+        res.capacity_rows = verify_tokens;
+        res.capacity_outputs = verify_tokens;
+        res.reason = nullptr;
+    }
+    return res;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     predefined_frame_current_valid = false;
     predefined_capacity_rows_current = 0;
@@ -2517,22 +2566,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             predefined_capacity_rows_current = capacity->verify_tokens;
             predefined_capacity_outputs_current = 1;
         } else if (predefined_target_enabled && request.phase == GGML_PREDEFINED_TARGET) {
-            // TARGET capacity path: when enabled, capacity_rows and capacity_outputs
-            // are raised to verify_tokens (Manager decision 1: 单一容量, capacity_outputs == capacity_rows == verify_tokens).
-            // Manager decision 3: PLE/QSA 等无法收敛的组合 fail-closed: 拒绝进入容量路径并回退精确定义
-            const bool ple_unsupported = model.hparams.ple_n_heads > 0;
-            const bool multi_seq = (ubatch.n_seqs != 1 || ubatch.n_seqs_unq != 1);
-            if (ple_unsupported) {
-                LLAMA_LOG_INFO("%s: TARGET capacity path disabled for model with PLE (fail-closed, falling back to exact)\n", __func__);
-                predefined_capacity_rows_current = ubatch.n_tokens;
-                predefined_capacity_outputs_current = std::max<uint32_t>(1u, frame.active_outputs);
-            } else if (multi_seq) {
-                LLAMA_LOG_INFO("%s: TARGET capacity path disabled for multi-sequence (fail-closed, falling back to exact)\n", __func__);
-                predefined_capacity_rows_current = ubatch.n_tokens;
-                predefined_capacity_outputs_current = std::max<uint32_t>(1u, frame.active_outputs);
-            } else {
-                predefined_capacity_rows_current = capacity->verify_tokens;
-                predefined_capacity_outputs_current = capacity->verify_tokens;
+            // TARGET capacity path: evaluate admission via pure production function
+            const auto decision = evaluate_target_capacity_admission(
+                    predefined_target_enabled,
+                    model.hparams,
+                    ubatch,
+                    frame,
+                    capacity->verify_tokens);
+            predefined_capacity_rows_current = decision.capacity_rows;
+            predefined_capacity_outputs_current = decision.capacity_outputs;
+            if (!decision.entered && decision.reason) {
+                LLAMA_LOG_INFO("%s: TARGET capacity path disabled for %s (fail-closed, falling back to exact)\n",
+                        __func__, decision.reason);
             }
         } else {
             // Target/prefill stays exact until the 48-layer stateful trunk has

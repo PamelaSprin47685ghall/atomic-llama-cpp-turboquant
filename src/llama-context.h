@@ -92,6 +92,20 @@ struct llama_context {
     void set_predefined_target_enabled(bool enabled) { predefined_target_enabled = enabled; }
     bool get_predefined_target_enabled() const { return predefined_target_enabled; }
 
+    struct target_capacity_decision {
+        bool entered;
+        uint32_t capacity_rows;
+        uint32_t capacity_outputs;
+        const char * reason;
+    };
+
+    static target_capacity_decision evaluate_target_capacity_admission(
+            bool target_enabled,
+            const llama_hparams & hparams,
+            const llama_ubatch & ubatch,
+            const ggml_predefined_frame & frame,
+            uint32_t verify_tokens);
+
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
     uint32_t n_ctx_kv()  const;
