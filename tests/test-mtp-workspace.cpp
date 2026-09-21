@@ -547,6 +547,64 @@ static void test_mtp_evidence_surface_contracts() {
     }
 }
 
+static void test_predefined_hidden_witness_sync_avoidance() {
+    llama_predefined_hidden_store src{};
+    src.generation = 10;
+    src.valid_rows = 4;
+    src.synchronized_generation = 0; // initially unsynchronized
+
+    uint32_t sync_count = 0;
+    uint32_t avoided_count = 0;
+
+    auto step_arbitrate_sync = [&](uint64_t req_gen) {
+        if (src.synchronized_generation == req_gen) {
+            avoided_count++;
+            return false;
+        }
+        sync_count++;
+        src.synchronized_generation = src.generation;
+        return true;
+    };
+
+    // 1. Unwitnessed initial state: must execute sync (fallback)
+    CHECK(step_arbitrate_sync(10) == true);
+    CHECK(sync_count == 1);
+    CHECK(avoided_count == 0);
+    CHECK(src.synchronized_generation == 10);
+
+    // 2. Rows establishes witness for generation 10
+    // Subsequent copy within same cycle/generation: must avoid sync
+    CHECK(step_arbitrate_sync(10) == false);
+    CHECK(sync_count == 1);
+    CHECK(avoided_count == 1);
+
+    // 3. Subsequent decode within same cycle/generation: must avoid sync
+    CHECK(step_arbitrate_sync(10) == false);
+    CHECK(sync_count == 1);
+    CHECK(avoided_count == 2);
+
+    // 4. Decode advance / generation bump invalidates witness
+    ++src.generation; // gen = 11
+    src.synchronized_generation = 0; // invalidated by hidden_result_guard or capture
+
+    // Requesting generation 11 before rows sync -> fallback sync executed
+    CHECK(step_arbitrate_sync(11) == true);
+    CHECK(sync_count == 2);
+    CHECK(avoided_count == 2);
+    CHECK(src.synchronized_generation == 11);
+
+    // 5. Subsequent copy on generation 11 now avoids sync
+    CHECK(step_arbitrate_sync(11) == false);
+    CHECK(sync_count == 2);
+    CHECK(avoided_count == 3);
+
+    // 6. Reset invalidates witness
+    src.synchronized_generation = 0; // invalidated by predefined_hidden_reset
+    CHECK(step_arbitrate_sync(11) == true);
+    CHECK(sync_count == 3);
+    CHECK(avoided_count == 3);
+}
+
 int main() {
     try {
         accepted_target_hidden_is_not_draft_hidden();
@@ -557,6 +615,7 @@ int main() {
         predefined_mtp_phase_invalidation_exemption();
         test_mtp_cycle_ledger_accounting();
         test_mtp_evidence_surface_contracts();
+        test_predefined_hidden_witness_sync_avoidance();
     } catch (const std::exception & e) {
         std::fprintf(stderr, "%s\n", e.what());
         return 1;

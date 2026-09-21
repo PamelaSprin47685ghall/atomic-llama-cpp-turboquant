@@ -13,6 +13,7 @@
 # 判定总表（与 docs/TP5-MTP-EVIDENCE.md 同步）：
 #   A  MTP 图定义复用（type=3）        —— 脚本硬门禁
 #   E  Hidden generation 零错配        —— 脚本硬门禁
+#   H  Device-Hidden 冗余同步收窄      —— 脚本硬门禁（fallback 零容忍）
 #   F  Cycle 时间恒等式/Token 守恒      —— 脚本硬门禁（含缺失 cycle 即 FAIL）
 #   M  SUBMIT_EPOCH_CHAIN hits/FAILED  —— 脚本硬门禁
 #   N  numerical-mode 存在性与模式      —— 脚本硬门禁（存在性；模式值人工复核）
@@ -89,6 +90,26 @@ else
     grep '\[tp5-mtp-hidden\].*mismatch' "$LOG_FILE" | head -n 5 || true
     echo "  -> [FAIL] 发现 $GEN_MISMATCH_COUNT 次 Generation 错配，存在读过期数据风险！"
     FAILURES=$((FAILURES + 1))
+fi
+echo
+
+# ------------------------------------------------------------------------------
+# (H) Device-Hidden 冗余同步收窄校验
+# ------------------------------------------------------------------------------
+echo "[检查项 H] Device-Hidden 冗余同步收窄校验"
+
+FALLBACK_SYNC_COUNT=$(grep -c '\[tp5-mtp-hidden\] redundant CPU sync executed' "$LOG_FILE" || true)
+AVOIDED_SYNC_COUNT=$(grep -c '\[tp5-mtp-hidden\] redundant sync avoided' "$LOG_FILE" || true)
+
+echo "  - 成功绕过的冗余同步次数: $AVOIDED_SYNC_COUNT"
+echo "  - 降级触发的实际同步次数: $FALLBACK_SYNC_COUNT"
+
+if [[ "$FALLBACK_SYNC_COUNT" -gt 0 ]]; then
+    grep '\[tp5-mtp-hidden\] redundant CPU sync executed' "$LOG_FILE" | head -n 5 || true
+    echo "  -> [FAIL] 发现 $FALLBACK_SYNC_COUNT 次未预期降级同步，调用链未处于已见证完成状态！"
+    FAILURES=$((FAILURES + 1))
+else
+    echo "  -> [PASS] copy/decode 零多余 CPU 同步排空，同步收窄正常生效。"
 fi
 echo
 

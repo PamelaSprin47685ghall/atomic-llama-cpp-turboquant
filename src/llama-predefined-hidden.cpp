@@ -142,6 +142,7 @@ bool llama_context::predefined_hidden_capture(ggml_backend_t producer, const ggm
     h.captured_rows += rows;
     h.host_current = false;
     h.pending = true;
+    h.synchronized_generation = 0;
     return true;
 }
 
@@ -152,6 +153,7 @@ uint32_t llama_context::predefined_hidden_rows() {
     // Replaces the old hidden getter's existing completion point. This first
     // integration removes the host byte bridge, not the phase dependency.
     synchronize();
+    predefined_hidden->synchronized_generation = predefined_hidden->generation;
     return predefined_hidden->valid_rows;
 }
 
@@ -199,7 +201,21 @@ bool llama_context::predefined_hidden_copy(const llama_predefined_hidden_range *
                 seen |= ranges[j].source == ranges[i].source;
             }
             if (!seen) {
-                ranges[i].source->synchronize();
+                auto * src_store = ranges[i].source->predefined_hidden.get();
+                if (src_store && src_store->synchronized_generation == ranges[i].generation) {
+                    if (std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr) {
+                        LLAMA_LOG_INFO("[tp5-mtp-hidden] redundant sync avoided gen=%" PRIu64 "\n", ranges[i].generation);
+                    }
+                } else {
+                    if (std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr) {
+                        LLAMA_LOG_INFO("[tp5-mtp-hidden] redundant CPU sync executed gen=%" PRIu64 " src=%p\n",
+                                       ranges[i].generation, (const void *) ranges[i].source);
+                    }
+                    ranges[i].source->synchronize();
+                    if (src_store) {
+                        src_store->synchronized_generation = src_store->generation;
+                    }
+                }
             }
         }
     }
@@ -250,7 +266,23 @@ int llama_context::decode_predefined_hidden(llama_batch batch, const llama_prede
             if (ranges[i].source != this) {
                 bool seen = false;
                 for (size_t j = 0; j < i; ++j) seen |= ranges[j].source == ranges[i].source;
-                if (!seen) ranges[i].source->synchronize();
+                if (!seen) {
+                    auto * src_store = ranges[i].source->predefined_hidden.get();
+                    if (src_store && src_store->synchronized_generation == ranges[i].generation) {
+                        if (std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr) {
+                            LLAMA_LOG_INFO("[tp5-mtp-hidden] redundant sync avoided gen=%" PRIu64 "\n", ranges[i].generation);
+                        }
+                    } else {
+                        if (std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr) {
+                            LLAMA_LOG_INFO("[tp5-mtp-hidden] redundant CPU sync executed gen=%" PRIu64 " src=%p\n",
+                                           ranges[i].generation, (const void *) ranges[i].source);
+                        }
+                        ranges[i].source->synchronize();
+                        if (src_store) {
+                            src_store->synchronized_generation = src_store->generation;
+                        }
+                    }
+                }
             }
         }
         struct input_guard {
@@ -322,6 +354,7 @@ bool llama_context::predefined_hidden_reset() {
     ggml_backend_tensor_memset(h.tensors[LLAMA_PREDEFINED_H_CARRY], 0, 0, size_t(h.width) * sizeof(float));
     ggml_backend_tensor_memset(h.tensors[LLAMA_PREDEFINED_H_SEED], 0, 0, size_t(h.width) * sizeof(float));
     h.valid_rows = h.captured_rows = h.input_rows = 0;
+    h.synchronized_generation = 0;
     h.input_count = 0;
     h.input = {};
     h.host_current = false;

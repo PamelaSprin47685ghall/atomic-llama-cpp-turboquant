@@ -3848,6 +3848,7 @@ int llama_context::decode_impl(const llama_batch & batch_inp) {
             if (h) {
                 ++h->generation;
                 h->captured_rows = h->valid_rows = 0;
+                h->synchronized_generation = 0;
                 h->host_current = false;
             }
         }
