@@ -10,6 +10,7 @@
 // - CacheFragments: legal-fragment layout, compact uses, build key, budgets.
 #include "llama-flashprefill.h"
 #include "llama-flashprefill-layout.h"
+#include "ggml-predefined.h"
 
 class llm_graph_result; // metrics recording target (defined below)
 class llm_graph_input_attn_flashprefill; // companion input (defined below)
@@ -240,7 +241,9 @@ public:
     llm_graph_input_out_ids(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
-            uint32_t n_outputs) : hparams(hparams), cparams(cparams), n_outputs(n_outputs) {}
+            uint32_t n_outputs,
+            bool capacity_mode = false) :
+        hparams(hparams), cparams(cparams), n_outputs(n_outputs), capacity_mode(capacity_mode) {}
     virtual ~llm_graph_input_out_ids() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -253,6 +256,7 @@ public:
     const llama_cparams cparams;
 
     const uint32_t n_outputs;
+    const bool capacity_mode;
 };
 
 class llm_graph_input_mean : public llm_graph_input_i {
@@ -1368,6 +1372,15 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    // Capacity-defined execution metadata. The ubatch always describes useful
+    // rows; these fields describe the immutable physical definition. Until a
+    // graph has been completely lowered, capacity_rows intentionally equals
+    // active_tokens and therefore preserves the legacy exact-shape contract.
+    ggml_predefined_frame predefined_frame{};
+    uint32_t predefined_capacity_rows = 0;
+    uint32_t predefined_capacity_outputs = 0;
+    bool predefined_enabled = false;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -1432,11 +1445,33 @@ struct llm_graph_params {
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
+        if (predefined_enabled != other.predefined_enabled) {
+            return false;
+        }
+        if (predefined_enabled) {
+            if (predefined_capacity_rows == 0 || other.predefined_capacity_rows == 0 ||
+                predefined_frame.version != GGML_PREDEFINED_ABI_VERSION ||
+                other.predefined_frame.version != GGML_PREDEFINED_ABI_VERSION ||
+                predefined_frame.active_tokens != ubatch.n_tokens ||
+                other.predefined_frame.active_tokens != other.ubatch.n_tokens ||
+                predefined_frame.active_tokens > predefined_capacity_rows ||
+                other.predefined_frame.active_tokens > other.predefined_capacity_rows ||
+                predefined_capacity_rows != other.predefined_capacity_rows ||
+                predefined_capacity_outputs == 0 || other.predefined_capacity_outputs == 0 ||
+                predefined_frame.active_outputs > predefined_capacity_outputs ||
+                other.predefined_frame.active_outputs > other.predefined_capacity_outputs ||
+                predefined_capacity_outputs != other.predefined_capacity_outputs) {
+                return false;
+            }
+        }
+        const bool predefined_mtp_dynamic =
+            predefined_enabled && other.predefined_enabled &&
+            gtype == LLM_GRAPH_TYPE_DECODER_MTP && other.gtype == LLM_GRAPH_TYPE_DECODER_MTP;
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
-            ubatch.n_tokens     == other.ubatch.n_tokens &&
-            ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
+            (predefined_mtp_dynamic || ubatch.n_tokens == other.ubatch.n_tokens) &&
+            (predefined_mtp_dynamic || ubatch.n_seq_tokens == other.ubatch.n_seq_tokens) &&
             ubatch.n_seqs       == other.ubatch.n_seqs &&
             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
             (
@@ -1463,7 +1498,7 @@ struct llm_graph_params {
             return false;
         }
 
-        if (n_outputs != other.n_outputs) {
+        if (!predefined_mtp_dynamic && n_outputs != other.n_outputs) {
             return false;
         }
 
@@ -1471,7 +1506,7 @@ struct llm_graph_params {
             return false;
         }
 
-        if (samplers.size() > 0) {
+        if (samplers.size() > 0 && !predefined_mtp_dynamic) {
             if (!ubatch.data || !other.ubatch.data) {
                 return false;
             }
@@ -1688,6 +1723,11 @@ struct llm_graph_context {
 
     const int64_t n_tokens;
     const int64_t n_outputs;
+    const int64_t n_tokens_active;
+    const int64_t n_tokens_capacity;
+    const int64_t n_outputs_active;
+    const int64_t n_outputs_capacity;
+    const bool predefined_enabled;
     const int32_t n_ctx_orig; // yarn
 
     const enum llama_pooling_type pooling_type;

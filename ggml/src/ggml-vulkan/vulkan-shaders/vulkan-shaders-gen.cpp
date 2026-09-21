@@ -956,20 +956,23 @@ void process_shaders() {
                   {
                       { "TP5_LATE_Q", "1" }
     });
-    string_to_spv("tp5_hc_late_norm", "tp5_hc_latebind.comp",
+    string_to_spv("tp5_hc_late_act_q8", "tp5_hc_latebind.comp",
                   {
-                      { "TP5_LATE_NORM", "1" }
+                      { "TP5_LATE_ACT_Q8", "1" }
+    });
+    string_to_spv("tp5_hc_late_q_q8dot", "tp5_hc_latebind.comp",
+                  {
+                      { "TP5_LATE_Q_Q8DOT", "1" }
     });
     string_to_spv("tp5_hc_resume_norm", "tp5_hc_resume.comp", {{ "TP5_RESUME_NORM", "1" }});
     string_to_spv("tp5_hc_resume_lo", "tp5_hc_resume.comp", {{ "TP5_RESUME_LO", "1" }});
-    string_to_spv("tp5_hc_late_lo", "tp5_hc_latebind.comp",
+    string_to_spv("tp5_hc_resume_lo_q8", "tp5_hc_resume.comp", {{ "TP5_RESUME_LO_Q8", "1" }});
+    string_to_spv("tp5_hc_publish", "tp5_hc_publish.comp", {});
+    string_to_spv("tp5_hc_late_up_q8dot", "tp5_hc_latebind.comp",
                   {
-                      { "TP5_LATE_LO", "1" }
+                      { "TP5_LATE_UP_Q8DOT", "1" }
     });
-    string_to_spv("tp5_hc_late_finalize", "tp5_hc_latebind.comp",
-                  {
-                      { "TP5_LATE_FINALIZE", "1" }
-    });
+    string_to_spv("tp5_hc_publish_f16", "tp5_hc_publish.comp", {{ "TP5_PUBLISH_F16", "1" }});
     string_to_spv("qwen4_hc_up_fold", "qwen4_hc_up_fold.comp", {});
     string_to_spv("qwen4_hc_segment_norm", "qwen4_hc_segment_norm.comp", {});
     string_to_spv("qwen4_hc_sum_f16", "qwen4_hc_segment_norm.comp",
@@ -1291,6 +1294,23 @@ void process_shaders() {
                       "mul_mat_vecq.comp", defs);
     }
     string_to_spv("tp5_pack_f16", "tp5_pack_f16.comp", {});
+    // One fixed four-column direct producer for all verification lengths.
+    // Shape changes do not produce a family of NUM_COLS-specialized graphs.
+    for (int f32 = 0; f32 < 2; ++f32) {
+        auto defs = merge_maps(base_dict, {{"DATA_A_Q5_K", "1"}, {"D_TYPE", "float"},
+            {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}, {"TP5_RELAY_OUTPUT", "1"}, {"TP5_RELAY_ROWS", "1"}});
+        if (f32) defs["TP5_RELAY_OUTPUT_F32"] = "1";
+        string_to_spv(f32 ? "qwen4_output_q5k_mmvq_relay_rows_f32" : "qwen4_output_q5k_mmvq_relay_rows",
+                      "mul_mat_vecq.comp", defs);
+        defs["B_TYPE"] = "float";
+        defs["B_TYPEV2"] = "vec2";
+        defs["B_TYPEV4"] = "vec4";
+        string_to_spv(f32 ? "qwen4_output_q5k_relay_rows_f32" : "qwen4_output_q5k_relay_rows",
+                      "mul_mat_vec_q5_k.comp", defs);
+        string_to_spv(f32 ? "tp5_add_rows_f32" : "tp5_add_rows_f16", "tp5_add_rows.comp",
+                      f32 ? std::map<std::string, std::string>{{"TP5_RELAY_OUTPUT_F32", "1"}} :
+                            std::map<std::string, std::string>{});
+    }
     string_to_spv("tp5_pack_f16_vec", "tp5_pack_f16_vec.comp", {});
     string_to_spv("tp5_copy_u128", "tp5_copy_u128.comp", {});
     string_to_spv("tp5_gpuflag", "tp5_gpuflag.comp", {});

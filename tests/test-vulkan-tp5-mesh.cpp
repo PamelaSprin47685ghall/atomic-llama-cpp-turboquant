@@ -40,7 +40,8 @@ typedef bool   (*allreduce_t)(void *, ggml_tensor **);
 typedef void   (*tp5_flush_async_t)(ggml_backend_t);
 typedef bool (*submit_epoch_chain_t)(void *,
                                      const std::vector<std::vector<std::vector<void *>>> &,
-                                     const std::vector<std::vector<ggml_tensor *>> &);
+                                     const std::vector<std::vector<ggml_tensor *>> &,
+                                     const struct ggml_predefined_frame *, uint32_t, uint32_t);
 typedef bool (*get_cached_cmd_bufs_t)(ggml_backend_t, ggml_cgraph *, std::vector<void *> &);
 typedef bool (*prepare_graph_t)(void *, size_t, ggml_cgraph *, bool);
 
@@ -685,7 +686,7 @@ static void run_cached_compute_chain_regression(void * comm, bool is_f16_wire) {
         // A malformed final CB must fail BEFORE any reduction is submitted.
         auto invalid_cbs = cbs;
         invalid_cbs.back()[0].push_back(nullptr);
-        TEST_ASSERT(!g_submit_epoch_chain(comm, invalid_cbs, tensors));
+        TEST_ASSERT(!g_submit_epoch_chain(comm, invalid_cbs, tensors, nullptr, 0, 0));
 
         std::vector<std::vector<float>> oracle;
         compute_cpu_timeline_oracle(P, elements, steps, is_f16_wire, oracle);
@@ -703,7 +704,7 @@ static void run_cached_compute_chain_regression(void * comm, bool is_f16_wire) {
                 ggml_backend_synchronize(backend);
             }
             auto t_pass_start = std::chrono::high_resolution_clock::now();
-            TEST_ASSERT(g_submit_epoch_chain(comm, pass_cbs, tensors));
+            TEST_ASSERT(g_submit_epoch_chain(comm, pass_cbs, tensors, nullptr, 0, 0));
             for (auto backend : g_backends) {
                 ggml_backend_synchronize(backend);
             }
@@ -824,7 +825,7 @@ static void run_epoch_chain_regression(void * comm, const std::vector<ggml_backe
                 invalid_tensors[s][j] = dummy_tensors[j];
             }
         }
-        bool preflight_res = g_submit_epoch_chain(comm, invalid_cbs, invalid_tensors);
+        bool preflight_res = g_submit_epoch_chain(comm, invalid_cbs, invalid_tensors, nullptr, 0, 0);
         if (preflight_res) {
             fprintf(stderr, "FAIL: submit_epoch_chain accepted >128 stages (%zu); expected pre-submit false!\n",
                     invalid_stage_count);
@@ -915,7 +916,7 @@ static void run_epoch_chain_regression(void * comm, const std::vector<ggml_backe
         }
 
         // Submit chain
-        bool ok = g_submit_epoch_chain(comm, stage_cbs, stage_tensors);
+        bool ok = g_submit_epoch_chain(comm, stage_cbs, stage_tensors, nullptr, 0, 0);
         if (!ok) {
             fprintf(stderr, "FAIL: submit_epoch_chain returned false for call %d (%zu stages)\n", call_idx, N_STAGES);
             g_failures++;
@@ -1019,7 +1020,7 @@ static void run_epoch_chain_regression(void * comm, const std::vector<ggml_backe
         for (size_t j = 0; j < P; ++j) {
             ggml_backend_synchronize(backends[j]);
         }
-        ok = g_submit_epoch_chain(comm, stage_cbs, stage_tensors);
+        ok = g_submit_epoch_chain(comm, stage_cbs, stage_tensors, nullptr, 0, 0);
         if (!ok) {
             fprintf(stderr, "FAIL: submit_epoch_chain replay returned false for call %d (%zu stages)\n", call_idx,
                     N_STAGES);
@@ -1109,7 +1110,7 @@ static void run_paired_chain_benchmark(void *                              comm,
         }
         const auto start = std::chrono::steady_clock::now();
         if (batched) {
-            if (!g_submit_epoch_chain(comm, cbs, tensors))
+            if (!g_submit_epoch_chain(comm, cbs, tensors, nullptr, 0, 0))
                 return false;
         } else {
             for (auto & stage : tensors) {
@@ -1306,7 +1307,7 @@ static void run_producer_wire_regression(void * comm) {
                 TEST_ASSERT(g_allreduce(comm, outputs[stage].data()));
         }
         if (round >= 2)
-            TEST_ASSERT(g_submit_epoch_chain(comm, cbs, outputs));
+            TEST_ASSERT(g_submit_epoch_chain(comm, cbs, outputs, nullptr, 0, 0));
         for (size_t stage = 0; stage < 2; ++stage) {
             for (size_t rank = 0; rank < ranks; ++rank) {
                 ggml_backend_synchronize(g_backends[rank]);
@@ -1496,7 +1497,7 @@ static void run_hc_sum_regression(void * comm) {
             }
         }
         if (cached) {
-            TEST_ASSERT(g_submit_epoch_chain(comm, cbs, outputs));
+            TEST_ASSERT(g_submit_epoch_chain(comm, cbs, outputs, nullptr, 0, 0));
         } else {
             for (size_t stage = 0; stage < 2; ++stage) {
                 for (size_t rank = 0; rank < ranks; ++rank) {
@@ -1571,7 +1572,7 @@ static void run_hc_sum_regression(void * comm) {
                 TEST_ASSERT(g_prepare_graph(comm, rank, consumers[rank].ineligible_graph, true));
                 TEST_ASSERT(g_get_cached_cmd_bufs(g_backends[rank], consumers[rank].ineligible_graph, cbs[1][rank]));
             }
-            TEST_ASSERT(g_submit_epoch_chain(comm, cbs, inel_outputs));
+            TEST_ASSERT(g_submit_epoch_chain(comm, cbs, inel_outputs, nullptr, 0, 0));
             for (size_t rank = 0; rank < ranks; ++rank) {
                 ggml_backend_synchronize(g_backends[rank]);
                 std::vector<float> values(width);
@@ -1634,7 +1635,7 @@ static void run_hc_sum_regression(void * comm) {
                     TEST_ASSERT(g_get_cached_cmd_bufs(g_backends[rank], graph, cbs[stage][rank]));
                 }
             }
-            TEST_ASSERT(g_submit_epoch_chain(comm, cbs, outputs));
+            TEST_ASSERT(g_submit_epoch_chain(comm, cbs, outputs, nullptr, 0, 0));
             for (size_t rank = 0; rank < ranks; ++rank) {
                 ggml_backend_synchronize(g_backends[rank]);
                 std::vector<float> data(2 * streams * width), values(width);
@@ -1719,7 +1720,7 @@ static void run_hc_sum_regression(void * comm) {
                 TEST_ASSERT(g_get_cached_cmd_bufs(g_backends[rank], graph, cbs[stage][rank]));
             }
         }
-        TEST_ASSERT(g_submit_epoch_chain(comm, cbs, outputs));
+        TEST_ASSERT(g_submit_epoch_chain(comm, cbs, outputs, nullptr, 0, 0));
         for (size_t rank = 0; rank < ranks; ++rank) {
             ggml_backend_synchronize(g_backends[rank]);
             std::vector<float> data(2 * streams * width), values(width);
@@ -1734,7 +1735,7 @@ static void run_hc_sum_regression(void * comm) {
 
         // 3) Immediate unchanged replay: exercises collective-plan cache hit for this HC identity
         fill_churn_inputs(p_idx, eps, seed_offset);
-        TEST_ASSERT(g_submit_epoch_chain(comm, cbs, outputs));
+        TEST_ASSERT(g_submit_epoch_chain(comm, cbs, outputs, nullptr, 0, 0));
         for (size_t rank = 0; rank < ranks; ++rank) {
             ggml_backend_synchronize(g_backends[rank]);
             std::vector<float> values(width);

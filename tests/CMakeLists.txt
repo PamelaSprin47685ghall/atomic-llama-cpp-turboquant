@@ -139,6 +139,10 @@ add_executable(test-mtp-workspace test-mtp-workspace.cpp)
 target_link_libraries(test-mtp-workspace PRIVATE llama)
 llama_test(test-mtp-workspace LABEL "predefined;cpu")
 
+add_executable(test-tp5-row-program test-tp5-row-program.cpp)
+target_compile_features(test-tp5-row-program PRIVATE cxx_std_17)
+llama_test(test-tp5-row-program LABEL "predefined;cpu")
+
 add_executable(test-turbo-quant test-turbo-quant.c)
 target_include_directories(test-turbo-quant PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 target_link_libraries(test-turbo-quant PRIVATE ggml-base)

@@ -90,6 +90,7 @@ enum ggml_predefined_extent {
     GGML_PREDEFINED_EXTENT_SEQUENCES = 3,
     GGML_PREDEFINED_EXTENT_CONTEXT   = 4,
     GGML_PREDEFINED_EXTENT_PAYLOAD   = 5,
+    GGML_PREDEFINED_EXTENT_COUNT     = 6,
 };
 
 // ceil((frame[extent] * scale) / divisor). All arithmetic is checked before

@@ -98,8 +98,9 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
 bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
-    res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
+    const int64_t rows = params.predefined_enabled ? params.predefined_capacity_rows : params.ubatch.n_tokens;
+    res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == rows);
+    res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == rows);
 
     return res;
 }
@@ -121,7 +122,7 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         const auto & source = *ubatch->device_hidden;
         if (!h || source.count == 0 || source.count > source.ranges.size() ||
             source.rows != uint32_t(n_tokens) || h->type != GGML_TYPE_F32 ||
-            h->ne[0] != n_embd || h->ne[1] != n_tokens) {
+            h->ne[0] != n_embd || h->ne[1] < n_tokens) {
             throw std::runtime_error("device MTP hidden input shape mismatch");
         }
         auto copies = source.ranges;
@@ -144,14 +145,15 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
 
 bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     bool res = true;
+    const int64_t rows = params.predefined_enabled ? params.predefined_capacity_rows : params.ubatch.n_tokens;
 
     // h is an input even when a token-only batch supplies its bytes through a
     // device binding. Do not omit its shape check merely because embd is null.
-    res &= h && h->ne[1] == params.ubatch.n_tokens;
+    res &= h && h->ne[1] == rows;
 
-    res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
+    res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == rows);
+    res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == rows);
+    res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == rows);
 
     return res;
 }
@@ -181,7 +183,8 @@ void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
 bool llm_graph_input_pos::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
-    res &= pos->ne[0] == params.ubatch.n_tokens*n_pos_per_embd;
+    const int64_t rows = params.predefined_enabled ? params.predefined_capacity_rows : params.ubatch.n_tokens;
+    res &= pos->ne[0] == rows*n_pos_per_embd;
 
     return res;
 }
@@ -236,29 +239,57 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(ggml_backend_buffer_is_host(out_ids->buffer));
     int32_t * data = (int32_t *) out_ids->data;
 
-    if (n_outputs == n_tokens) {
-        for (int i = 0; i < n_tokens; ++i) {
+    int32_t active_outputs = 0;
+    if (capacity_mode) {
+        if (ubatch->output) {
+            for (int64_t i = 0; i < n_tokens; ++i) {
+                active_outputs += ubatch->output[i] != 0;
+            }
+        } else {
+            active_outputs = (int32_t) n_tokens;
+        }
+        if (active_outputs < 0 || uint32_t(active_outputs) > n_outputs) {
+            throw std::runtime_error("predefined output rows exceed fixed output capacity");
+        }
+        // Never retain stale indices in the inactive suffix. Correctness does
+        // not depend on these zeros because OUTPUTS dispatches skip them.
+        std::fill(data, data + n_outputs, 0);
+    } else {
+        active_outputs = (int32_t) n_outputs;
+    }
+
+    if (active_outputs == n_tokens) {
+        for (int i = 0; i < active_outputs; ++i) {
             data[i] = i;
         }
 
         return;
     }
 
-    GGML_ASSERT(ubatch->output);
+    if (!ubatch->output) {
+        throw std::runtime_error("output-row selection requires output flags");
+    }
 
-    int n_outputs = 0;
+    int written = 0;
 
     for (int i = 0; i < n_tokens; ++i) {
         if (ubatch->output[i]) {
-            data[n_outputs++] = i;
+            if (written >= active_outputs) {
+                throw std::runtime_error("output-row selection exceeds active output count");
+            }
+            data[written++] = i;
         }
+    }
+    if (written != active_outputs) {
+        throw std::runtime_error("output-row selection count mismatch");
     }
 }
 
 bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
-    res &= n_outputs == params.n_outputs;
+    res &= n_outputs == (params.predefined_enabled ? params.predefined_capacity_outputs : params.n_outputs);
+    res &= capacity_mode == params.predefined_enabled;
 
     return res;
 }
@@ -937,10 +968,20 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     bool res = true;
 
-    res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+    const uint32_t capacity_rows =
+        params.predefined_enabled ? params.predefined_capacity_rows : params.ubatch.n_tokens;
+    res &= self_k_idxs->ne[0] == capacity_rows;
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    llama_ubatch shape_ubatch = params.ubatch;
+    if (capacity_rows != params.ubatch.n_tokens) {
+        if (params.ubatch.n_seqs != 1 || params.ubatch.n_seqs_unq != 1) {
+            return false;
+        }
+        shape_ubatch.n_tokens = capacity_rows;
+        shape_ubatch.n_seq_tokens = capacity_rows;
+    }
+    res &= can_reuse_kq_mask(self_kq_mask, mctx, shape_ubatch, params.cparams);
 
     // RERoT DDVR: span metadata/offsets/visibility are input tensor data, not
     // topology. The reuse key covers only (n_token rows, span capacity bucket,
@@ -2650,6 +2691,11 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     norm_rms_eps     (hparams.f_norm_rms_eps),
     n_tokens         (ubatch.n_tokens),
     n_outputs        (params.n_outputs),
+    n_tokens_active  (ubatch.n_tokens),
+    n_tokens_capacity(params.predefined_enabled ? params.predefined_capacity_rows : ubatch.n_tokens),
+    n_outputs_active (params.n_outputs),
+    n_outputs_capacity(params.predefined_enabled ? params.predefined_capacity_outputs : params.n_outputs),
+    predefined_enabled(params.predefined_enabled),
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
     pooling_type     (cparams.pooling_type),
     rope_type        (hparams.rope_type),
@@ -3565,12 +3611,12 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
-    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens_capacity);
     cb(inp->tokens, "inp_tokens", -1);
     ggml_set_input(inp->tokens);
     res->t_inp_tokens = inp->tokens;
 
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
+    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens_capacity);
     cb(inp->embd, "inp_embd", -1);
     ggml_set_input(inp->embd);
 
@@ -3632,7 +3678,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     ggml_tensor * cur = ggml_build_forward_select(gf, inps.data(), inps.size(), ubatch.token ? 0 : 1);
 
     if (n_embd_inp != n_embd) {
-        cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);
+        cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens_capacity, cur->nb[1], 0);
     }
 
     res->t_inp_embd = cur;
@@ -3663,7 +3709,7 @@ ggml_tensor * llm_graph_context::build_inp_pos() const {
 
     auto & cur = inp->pos;
 
-    cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)n_tokens*hparams.n_pos_per_embd());
+    cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens_capacity*hparams.n_pos_per_embd());
     ggml_set_input(cur);
 
     res->add_input(std::move(inp));
@@ -3695,11 +3741,12 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
     //    return nullptr;
     //}
 
-    auto inp = std::make_unique<llm_graph_input_out_ids>(hparams, cparams, n_outputs);
+    auto inp = std::make_unique<llm_graph_input_out_ids>(
+        hparams, cparams, uint32_t(n_outputs_capacity), predefined_enabled);
 
     auto & cur = inp->out_ids;
 
-    cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs);
+    cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_outputs_capacity);
     ggml_set_input(cur);
 
     res->add_input(std::move(inp));
@@ -4059,6 +4106,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     const llama_kv_cache_context * mctx_cur,
           ggml_backend_sched_t sched,
                      bool fp_reserve_sizing,
+                 uint32_t capacity_rows,
           llm_graph_result * res) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
@@ -4066,10 +4114,17 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
 
-        inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
-        inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
+        llama_ubatch shape_ubatch = ubatch;
+        if (capacity_rows != 0 && capacity_rows != ubatch.n_tokens) {
+            GGML_ASSERT(ubatch.n_seqs == 1 && ubatch.n_seqs_unq == 1);
+            GGML_ASSERT(capacity_rows >= ubatch.n_tokens);
+            shape_ubatch.n_tokens = capacity_rows;
+            shape_ubatch.n_seq_tokens = capacity_rows;
+        }
+        inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, shape_ubatch);
+        inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, shape_ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, shape_ubatch, cparams);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 
@@ -4112,7 +4167,9 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
-    auto inp = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur, sched, fp_reserve_sizing, res);
+    auto inp = build_attn_inp_kv_impl(
+        ctx0, ubatch, hparams, cparams, mctx_cur, sched, fp_reserve_sizing,
+        uint32_t(n_tokens_capacity), res);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -5213,7 +5270,9 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), sched, fp_reserve_sizing, res);
+    auto inp_attn = build_attn_inp_kv_impl(
+        ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), sched, fp_reserve_sizing,
+        uint32_t(n_tokens), res);
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 

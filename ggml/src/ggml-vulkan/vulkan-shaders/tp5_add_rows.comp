@@ -1,0 +1,57 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// The ordinary terminal ADD is the producer. No packing/copy dispatch follows
+// it. Only contiguous, identically shaped F32 inputs use this variant.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer A { float a[]; };
+layout(std430, binding = 0) readonly buffer AV4 { vec4 a4[]; };
+layout(std430, binding = 1) readonly buffer B { float b[]; };
+layout(std430, binding = 1) readonly buffer BV4 { vec4 b4[]; };
+layout(std430, binding = 2) writeonly buffer D { float d[]; };
+layout(std430, binding = 2) writeonly buffer DV4 { vec4 d4[]; };
+layout(std430, binding = 3) coherent readonly buffer Route {
+    uint bank, ready, epoch, flags;
+    uint active_elements, capacity_elements;
+    uvec2 padding;
+} route;
+#ifdef TP5_RELAY_OUTPUT_F32
+#define WIRE float
+#define WIRE4 vec4
+#else
+#define WIRE float16_t
+#define WIRE4 f16vec4
+#endif
+layout(std430, binding = 4) coherent writeonly buffer Payload0 { WIRE wire0[]; };
+layout(std430, binding = 5) coherent writeonly buffer Payload1 { WIRE wire1[]; };
+layout(std430, binding = 4) coherent writeonly buffer Payload0V4 { WIRE4 wire04[]; };
+layout(std430, binding = 5) coherent writeonly buffer Payload1V4 { WIRE4 wire14[]; };
+layout(push_constant) uniform Params {
+    uint element_capacity;
+    uint permit_local_elision;
+    uint reserved0, reserved1;
+} p;
+
+void main() {
+    const uint base = gl_GlobalInvocationID.x * 4u;
+    // Host preflight proves active_elements <= both descriptor capacities.
+    // This guard is before every read; inactive columns are not zero tokens.
+    if (base >= route.active_elements || base >= p.element_capacity) return;
+    const bool keep_local = p.permit_local_elision == 0u || (route.flags & 1u) != 0u;
+    if (route.active_elements - base >= 4u && p.element_capacity - base >= 4u) {
+        precise vec4 result = a4[base / 4u] + b4[base / 4u];
+        if (keep_local) d4[base / 4u] = result;
+        if (route.bank == 0u) wire04[base / 4u] = WIRE4(result);
+        else wire14[base / 4u] = WIRE4(result);
+    } else {
+        for (uint i = 0u; i < 4u; ++i) {
+            const uint e = base + i;
+            if (e >= route.active_elements || e >= p.element_capacity) break;
+            precise float result = a[e] + b[e];
+            if (keep_local) d[e] = result;
+            if (route.bank == 0u) wire0[e] = WIRE(result);
+            else wire1[e] = WIRE(result);
+        }
+    }
+}

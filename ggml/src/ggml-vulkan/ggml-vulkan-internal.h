@@ -45,6 +45,11 @@ struct vk_tp5_device_caps {
     uint64_t max_storage_buffer_range = 0;
     uint64_t min_storage_buffer_offset_alignment = 0;
     bool     storage_buffer_array_dynamic_indexing   = false;
+    bool     integer_dot_product                     = false;
+    uint32_t subgroup_size                           = 0;
+    bool     subgroup_size_control                   = false;
+    uint32_t subgroup_min_size                       = 0;
+    uint32_t subgroup_max_size                       = 0;
     uint32_t max_storage_buffer_descriptors          = 0;
     float    timestamp_period                        = 0;
     uint32_t timestamp_valid_bits                    = 0;
@@ -70,15 +75,42 @@ bool ggml_vk_tp5_tensor_dev_ref(struct ggml_tensor * t, struct VkBuffer_T ** buf
 uint64_t ggml_vk_tp5_get_tensor_bda(struct ggml_tensor * t);
 
 static constexpr size_t VK_TP5_RELAY_ROUTE_MAX = 128;
-static constexpr size_t VK_TP5_RELAY_ROUTE_STRIDE = 256;
+// 128 reduction stages have 129 model compute groups; the last one is the
+// non-reducing tail and still needs maximum-graph indirect arguments.
+static constexpr size_t VK_TP5_PREDEFINED_STAGE_MAX = VK_TP5_RELAY_ROUTE_MAX + 1;
+// Header is the transport ABI; the remainder is a per-stage host-coherent
+// indirect-argument arena for the one maximum graph definition. This is not a
+// graph cache and not per token. 4 KiB gives 336 Vulkan dispatch triplets while
+// keeping all 128 stages below 512 KiB per rank.
+static constexpr size_t VK_TP5_RELAY_ROUTE_STRIDE = 4096;
+static constexpr size_t VK_TP5_PREDEFINED_ARGS_OFFSET = 64;
+static constexpr size_t VK_TP5_PREDEFINED_ARGS_STRIDE = 12;
+static constexpr size_t VK_TP5_PREDEFINED_ARGS_PER_STAGE =
+    (VK_TP5_RELAY_ROUTE_STRIDE - VK_TP5_PREDEFINED_ARGS_OFFSET) / VK_TP5_PREDEFINED_ARGS_STRIDE;
 static constexpr uint32_t VK_TP5_RELAY_ROUTE_KEEP_LOCAL = 1u << 0;
 struct vk_tp5_relay_route_entry {
     uint32_t bank     = 0;
     uint32_t ready    = 0;
     uint32_t epoch    = 0;
     uint32_t reserved = 0;
+    // Data-plane extent. Every rank and CPU handoff uses this same element
+    // count; bank capacity and a shader's column tile are never token counts.
+    uint32_t active_elements = 0;
+    uint32_t capacity_elements = 0;
+    uint32_t padding[2] = {0, 0};
+    // Host-produced indirect arguments. Only updated before the owning
+    // submission; never while the GPU may read this stage's route slot.
+    uint32_t dispatch_x = 0;
+    uint32_t dispatch_y = 1;
+    uint32_t dispatch_z = 1;
+    uint32_t padding2[5] = {0, 0, 0, 0, 0};
 };
-static_assert(sizeof(vk_tp5_relay_route_entry) == 16);
+static_assert(sizeof(vk_tp5_relay_route_entry) == 64);
+static_assert(offsetof(vk_tp5_relay_route_entry, ready) == 4);
+static_assert(offsetof(vk_tp5_relay_route_entry, active_elements) == 16);
+static_assert(offsetof(vk_tp5_relay_route_entry, dispatch_x) == 32);
+static_assert(offsetof(vk_tp5_relay_route_entry, dispatch_y) == 36);
+static_assert(offsetof(vk_tp5_relay_route_entry, dispatch_z) == 40);
 static_assert(VK_TP5_RELAY_ROUTE_STRIDE % sizeof(vk_tp5_relay_route_entry) == 0);
 
 struct vk_tp5_relay_payload_binding {
@@ -97,11 +129,14 @@ void ggml_vk_tp5_set_wire_output(ggml_backend_t backend, struct ggml_tensor * te
 // for Exact LateBind. This is deliberately independent of producer-wire: the
 // legacy RELAY P1 path must be able to keep its original producer unchanged.
 void ggml_vk_tp5_set_latebind_capture(ggml_backend_t backend, const struct ggml_cgraph * graph, bool enabled,
-                                     bool define_program = false);
+                                     bool define_program = false, size_t stage = SIZE_MAX);
+bool ggml_vk_tp5_predefined_rows(ggml_backend_t backend, uint32_t * active_rows, uint32_t * capacity_rows);
 struct vk_tp5_graph_program;
 // Definition-time lookup. The returned program owns immutable descriptors and
 // buffers, so its commands may be lowered into an independent primary CB.
 std::shared_ptr<const vk_tp5_graph_program> ggml_vk_tp5_graph_program(ggml_backend_t backend, void * first_cb);
+bool ggml_vk_tp5_patch_graph_program_rows(ggml_backend_t backend, void * first_cb,
+                                          uint32_t active_rows, uint32_t capacity_rows);
 bool ggml_vk_tp5_take_wire_output(ggml_backend_t       backend,
                                   struct ggml_tensor * tensor,
                                   struct VkBuffer_T ** buf,
@@ -114,7 +149,11 @@ bool ggml_vk_tp5_take_wire_output(ggml_backend_t       backend,
 bool ggml_vk_tp5_get_relay_ready(ggml_backend_t backend, size_t stage, volatile uint32_t ** ready_ptr);
 bool ggml_vk_tp5_update_relay_route(ggml_backend_t backend, size_t stage, uint32_t bank, uint64_t epoch,
                                     const vk_tp5_relay_payload_binding & payload,
-                                    volatile uint32_t ** ready_ptr, bool keep_local = false);
+                                    volatile uint32_t ** ready_ptr, bool keep_local, uint64_t active_elements);
+// Patch all host-coherent indirect commands recorded by this graph definition.
+// No command buffer, descriptor or tensor metadata changes at runtime.
+bool ggml_vk_tp5_update_predefined_dispatches(ggml_backend_t backend, void * first_cb, size_t stage,
+                                               uint32_t active_rows, uint32_t capacity_rows);
 void ggml_vk_tp5_clear_relay_payload_binding(ggml_backend_t backend);
 
 struct vk_tp5_hc_binding {
@@ -136,7 +175,14 @@ struct vk_tp5_hc_sum {
     // populated only for the first HC consumer after a TP boundary.
     vk_tp5_hc_binding                down_weight;
     vk_tp5_hc_binding                lo;
+    vk_tp5_hc_binding                up_weight;
+    vk_tp5_hc_binding                mixed;
     vk_tp5_hc_binding                quantized;
+    // Definition-time semantic identity only. These pointers are never
+    // dereferenced by the collective hot path; they prove that an early
+    // scatter consumes the exact normalized tensor produced by the preceding
+    // HC site rather than an unrelated scratch alias.
+    const struct ggml_tensor *        inject_input_tensor = nullptr;
 };
 
 // A recipe exists only for the committed first CB of a replay entry. Ordinary

@@ -77,6 +77,9 @@ void calc_superblock(const uint a_offset, const uint b_offset, const uint v_im, 
         const FLOAT_TYPE q4_15 = qs64_80_hi4.w;
 
         [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+#ifdef TP5_RELAY_ROWS
+            if (!mat_vec_col_active(j)) continue;
+#endif
             vec2 by10 =  vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y1_idx) / 2     ]);
             vec2 by116 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y1_idx) / 2 +  8]);
             vec2 by132 = vec2(data_b_v2[(j*p.batch_stride_b + b_offset + y1_idx) / 2 + 16]);

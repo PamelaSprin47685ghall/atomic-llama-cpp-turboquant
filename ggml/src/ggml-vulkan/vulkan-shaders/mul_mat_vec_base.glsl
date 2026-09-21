@@ -64,6 +64,10 @@ layout (push_constant) uniform parameter
 #endif
 } p;
 
+layout (constant_id = 0) const uint BLOCK_SIZE = 32;
+layout (constant_id = 1) const uint NUM_ROWS = 1;
+layout (constant_id = 2) const uint NUM_COLS = 1;
+
 #ifdef MUL_MAT_ID
 uint expert_id;
 #    ifdef MOE_DOWN_FOLD
@@ -122,11 +126,16 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
     }
 #    endif
 #else
+#ifdef TP5_RELAY_ROWS
+    const uint batch_idx = (gl_WorkGroupID.y + p.base_work_group_y) * NUM_COLS;
+#else
     const uint batch_idx = gl_WorkGroupID.y + p.base_work_group_y;
+#endif
 #endif
 
 #ifndef MUL_MAT_ID
     uint batch_idx_a = 0;
+#ifndef TP5_RELAY_ROWS
     if (batch_idx != 0) {
         const uint i13 = batch_idx / p.ne12;
         const uint i12 = batch_idx % p.ne12;
@@ -136,6 +145,7 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 
         batch_idx_a = i03 * p.ne02 + i02;
     }
+#endif
 #endif
 
     a_offset =
@@ -158,10 +168,6 @@ void get_offsets(out uint a_offset, out uint b_offset, out uint d_offset) {
 #endif
 }
 
-layout (constant_id = 0) const uint BLOCK_SIZE = 32;
-layout (constant_id = 1) const uint NUM_ROWS = 1;
-layout (constant_id = 2) const uint NUM_COLS = 1;
-
 #ifdef MOE_DOWN_FOLD
 shared float expert_outputs[10][NUM_ROWS];
 #    ifdef MOE_FUSE_SHARED_DOWN
@@ -176,6 +182,11 @@ FLOAT_TYPE shared_gate_value[NUM_COLS][NUM_ROWS];
 bool mat_vec_col_active(const uint j) {
 #ifdef MUL_MAT_ID_GROUPED
     return j < expert_count;
+#elif defined(TP5_RELAY_ROWS)
+    // Uniform across the workgroup; checked before activation and bias loads.
+    // The matrix width/strides remain definition-time constants.
+    return (gl_WorkGroupID.y + p.base_work_group_y) * NUM_COLS + j <
+           tp5_relay_route.active_elements / p.stride_d;
 #else
     return true;
 #endif
@@ -220,6 +231,9 @@ uint mat_vec_first_row() {
 #ifdef USE_SUBGROUP_ADD_NO_SHMEM
 void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+#ifdef TP5_RELAY_ROWS
+        if (!mat_vec_col_active(j)) continue;
+#endif
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
             temp[j][n] = subgroupAdd(temp[j][n]);
         }

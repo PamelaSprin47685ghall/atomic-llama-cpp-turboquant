@@ -97,6 +97,11 @@ layout(std430, binding = 5) coherent readonly buffer TP5RelayRoute {
     uint ready;
     uint epoch;
     uint reserved;
+#ifdef TP5_RELAY_ROWS
+    uint active_elements;
+    uint capacity_elements;
+    uvec2 padding;
+#endif
 } tp5_relay_route;
 layout(std430, binding = 6) coherent writeonly buffer TP5RelayPayload0 {
     TP5_RELAY_PAYLOAD_TYPE data_payload0[];
