@@ -167,3 +167,30 @@ M3 实施必须以以下三条为不可谈判前提，本文所有双长度契�
 - qwen4exp 主干：`src/models/qwen4exp.cpp:429-562`（trunk/gather/result）、`574-619`（MTP 头容量范式 `601-610`）、`760-768/884-942/1199-1230/1275-1328/1429-1443/1601-1650`。
 - Vulkan/RELAY：`ggml-vulkan.cpp:10150-10174/27488-27544/27546-27598`；`ggml-vulkan-collective.cpp:6310-6331/6433-6440/6796-6818`；`ggml-vulkan-tp5-rows.h:44-119`；shader 截断：`tp5_hc_resume.comp:113-257`、`tp5_add_rows.comp:16-50`、`tp5_relay_copy_f32.comp:21-83`。
 - 设计主文档：`TP5.md`、`RERoT.md`、`docs/TP5-MTP-PREDEFINED.md §10`。
+
+## 7. 当前进展与剩余闭合
+
+### 7.1 区域进展与提交状态
+- **输入 / 位置壳（区 0）**：`09d1a8d64`。`llm_graph_input_embd` / `pos` / `out_ids` 容量尺寸分配、有效前缀写入与无效后缀置零完成，超出抛错。
+- **Attention + KV 尾部安全（区 1）**：`62409ebff`。`qwen4exp` 注意力 Q/K/V/gate 及 QKVZ 容量形状展开；KV 缓存尾部 `[active, capacity)` 重定向至空闲安全槽位；QSA fail-closed 准入门禁接入。
+- **GDN CPU 方案 B（区 2 CPU）**：`14d9b321a`。`active_tokens` 注入 `op_params[2]`（`op_params[1] == 0` 避开冲突），CPU 时间维按 `effective_active` 截断且真实前向通过脏数据隔离。
+- **MoE 区域（区 3）**：`e5fd879ed`。盘点与第 13 组测试确认生产代码无需修改（算子形状天然由输入行维驱动，逐行独立无跨行归约，脏数据逐比特隔离）。
+- **Terminal Producer 区域（区 4）**：`354b5b1f8`。盘点与第 14 组测试确认生产代码无需修改（`inp_out_ids` 容量分配、D2H 活跃截断、采样器活跃行消费、LateBind 行程序截断天然就绪）。
+- **RELAY / 消费者通道**：代码盘点确认天然以活跃 payload 元素消费，无需额外修改。
+
+### 7.2 GDN GPU 侧状态
+- **着色器与管线接线**：多步变长内核 `qwen4_gdn_multistep_delta.comp`（`e09beffc7`）、`prep`/`norm`（`a74a03725`）、管线句柄创建与基于 `op_params[2]` 的容量分派接线、以及 `ggml_vk_can_fuse_gdn_segment` 容量匹配放宽（`5407c211b`）已完成结构闭环。
+- **安全隔离态**：虽然 GPU 着色器与分派接线已完成结构性闭环，但由于真机未验，生产准入函数 `evaluate_target_capacity_admission` 对所有 GDN/recurrent 模型仍维持严格的 **fail-closed** 拦截，安全回退精确路径。
+
+### 7.3 剩余闭合前置
+1. **真机 RX 6800 运行验证**：在目标硬件上验证多步 SPIR-V 执行、`dmesg` 零 VM Fault / ring timeout，以及循环状态与 CPU 参考的位级一致性。
+2. **解除 GDN fail-closed 决策**：在真机实测证据确凿后，方可由负责人裁决解除 `evaluate_target_capacity_admission` 中的循环状态 fail-closed 门禁。
+3. **容量路径启用的端到端证据**：端到端吞吐测速与正确性校验（须在真机获批前提下执行）。
+
+### 7.4 保持不匹配的未闭合回退项
+以下场景在图匹配与准入层显式保持不匹配或 fail-closed 回退至精确单定义 / 传统路径：
+- 多序列场景（`n_seqs != 1 || n_seqs_unq != 1`）；
+- 容量超界（`capacity_rows > 8`）；
+- 缓存段变体（`fused_gdn_cached_segment`）；
+- RBB 模式（`op_params[1] != 0`）；
+- Chunking 分块循环路径。
