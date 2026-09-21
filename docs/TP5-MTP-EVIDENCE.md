@@ -18,6 +18,8 @@
 | **(c)** | **无效行是否不写 KV / recurrent** | **已有** | `src/models/qwen4exp.cpp`、CPU 回归 `tests/test-mtp-workspace.cpp` | 1. MTP 层为纯 Dense Attention，在模型架构中被硬性标记为非 Recurrent；<br>2. Workspace 在序列更新与 commit 时，`commit_row` 只遍历已接受范围；超出的无效行（rejected rows）被范围截断，物理上不被执行 commit 消费；<br>3. KV 缓存仅写入有效行。 |
 | **(d)** | **Catch-up 是否只产生有效输出** | **已有** | `src/llama-context.cpp:2459-2476`、`common/speculative.cpp` | 1. Catch-up 阶段 `predefined_capacity_outputs_current = 0`（或 1），`frame.active_outputs = 0`，不计算亦不生成多余的 logits；<br>2. 仅做状态追赶，输出不进入采样器候选。 |
 | **(e)** | **Hidden RESULT / CARRY / SEED 的 generation 是否匹配** | **已补齐** | `src/llama-predefined-hidden.h`、`src/llama-predefined-hidden.cpp:176, 229` | 1. 严格规则：`RESULT` 槽位要求 `expected == source.generation && valid_rows > 0`；`CARRY` 与 `SEED` 要求 `expected == 0`；<br>2. 新增诊断：在 `GGML_TP5_MTP_PROFILE=1` 下，不匹配时输出警告：<br>`[tp5-mtp-hidden] copy gen mismatch: src_slot=... exp_gen=... actual_gen=...` 或 `[tp5-mtp-hidden] decode gen mismatch...` |
+| **(e2)** | **Device-Hidden 见证代际同步收窄（门禁 H）** | **已补齐** | `src/llama-predefined-hidden.cpp:205-218, 271-284` | 1. 规则：跨上下文隐层交接时，若源上下文 generation 已被当前上下文同步见证（`synchronized_generation == generation`），安全绕过 CPU 同步，直接通过设备端直传；若未见证则触发 fail-closed 兜底同步；<br>2. 观察点：在 PROFILE 下分别输出 `[tp5-mtp-hidden] redundant sync avoided gen=N` 与 `[tp5-mtp-hidden] redundant CPU sync executed gen=N src=PTR`。门禁 H 要求受控运行中 fallback 执行次数为 0。 |
+| **(g)** | **预定义五类三态语义覆盖（predefined_complete）** | **已补齐** | `ggml-vulkan-tp5-coverage.h`、`ggml-vulkan.cpp:24800-24812, 27634` | 1. 规则：固定算力、动态算力、数据搬运、状态写回、依赖边界 5 类语义全部达标（fixed_safe/dynamic_safe），零 unresolved；否则 predefined_complete 为 false，动态行执行触发 fail-closed 拒绝；<br>2. 观察点：定义期输出 `[predefined-coverage] gate-status: complete=... fixed_compute=... dynamic_compute=... data_movement=... state_writes=... dep_boundaries=... (dynamic row execution PERMITTED/BLOCKED)`。 |
 | **(f)** | **每 cycle 的 draft / verify / catch-up / handoff 时间与有效 token 产出** | **已有** | `common/speculative.h`、`common/speculative.cpp:25-54, 2508-2552` | 激活环境变量 `GGML_TP5_MTP_PROFILE=1` 时，每个投机周期在 `record_cycle_settle()` 结构化输出：<br>`[tp5-mtp-cycle] cycle=... draft_us=... target_us=... catchup_us=... handoff_us=... total_us=... draft_tokens=... accepted_tokens=... final_tokens=... eff=... dev_hidden=1`<br>会话结束时输出 `[tp5-mtp-cycle-summary]`。 |
 
 ---
@@ -43,14 +45,22 @@ export GGML_TP5_PROFILE=1
 bash scripts/check-tp5-mtp-evidence.sh /tmp/tp5-mtp-run.log
 ```
 
-### 3. 合成演练（只写夹具、不跑真机，DevOps 重跑）
+### 3. 合成演练夹具矩阵（8 组夹具，只写文件、不跑真机，DevOps 重跑）
 ```bash
 bash scripts/make-tp5-mtp-evidence-fixtures.sh /tmp/tp5-mtp-drill
 for f in /tmp/tp5-mtp-drill/*.log; do
     echo "=== $f"; bash scripts/check-tp5-mtp-evidence.sh "$f"; echo "rc=$?";
 done
 ```
-期望矩阵：`pass.log→rc=0`；`rebuild_fail / hidden_fail / cycle_missing / conservation_fail / state_spin_fail → rc=1`；
+8 组演练夹具完整期望矩阵（覆盖全部脚本门禁与异常路径）：
+1. `pass.log`              → `rc=0`：全绿标杆（含 `redundant sync avoided` 标签与完全守恒账本）；
+2. `rebuild_fail.log`      → `rc=1`：[A] MTP type=3 多次重建 + UID 分裂；
+3. `hidden_fail.log`       → `rc=1`：[E] generation 错配报警；
+4. `fallback_sync_fail.log` → `rc=1`：[H] 降级触发实际 CPU 同步（fallback > 0，fail-closed 拦截）；
+5. `cycle_missing.log`     → `rc=1`：[F] 零 cycle 行（PROFILE 下缺失账本即 FAIL）；
+6. `conservation_fail.log`  → `rc=1`：[F] 时间恒等式背离 + Token 守恒背离 + target_us=0；
+7. `cycle_seq_fail.log`    → `rc=1`：[F] 周期序号不连续（单调连续性断言拦截）；
+8. `state_spin_fail.log`   → `rc=1`：[L][M][D] sidecar 超时 + CHAIN FAILED + DeviceLost。
 用法错误（无参数/文件不存在）→ `rc=2`。
 
 ---
@@ -61,10 +71,11 @@ done
 | :--- | :--- | :--- | :--- |
 | MTP 图单最大定义复用（type=3） | `[tp5-mtp-graph] type=3 reuse=(0\|1) definition_uid=0x…`（`src/llama-context.cpp:2615,2641`） | **脚本硬门禁 [A]** | 重建 ≤1、复用 ≥1、UID 去重恰好 1；无 type=3 行直接 FAIL |
 | Hidden generation 零错配 | `[tp5-mtp-hidden] … mismatch`（`src/llama-predefined-hidden.cpp:176,229`） | **脚本硬门禁 [E]** | 出现次数必须为 0 |
-| Cycle 时间恒等式 | `[tp5-mtp-cycle] … total_us == draft+target+catchup+handoff`（`common/speculative.cpp:25-35`） | **脚本硬门禁 [F]** | 逐行整数校验；零 cycle 行直接 FAIL |
+| Device-Hidden 冗余同步收窄 | `[tp5-mtp-hidden] redundant CPU sync executed` 与 `redundant sync avoided`（`src/llama-predefined-hidden.cpp:205-218,271-284`） | **脚本硬门禁 [H]** | `fallback_sync_count == 0`（降级实际同步零容忍）；受控运行期望全量命中 `avoided` |
+| Cycle 时间恒等式与序号连续 | `[tp5-mtp-cycle] … total_us == draft+target+catchup+handoff`（`common/speculative.cpp:25-35`） | **脚本硬门禁 [F]** | 逐行整数校验；单调递增连续序号 (`cycle_id`)；覆盖零接受周期；零 cycle 行直接 FAIL |
 | Token 守恒 + target 接入 + 直传 | `final == accepted+1`、`target_us>0`、`dev_hidden==1`、`accepted ≤ draft` | **脚本硬门禁 [F]** | 逐行校验，任一违例即 FAIL |
 | SUBMIT_EPOCH_CHAIN 命中连续 | `[tp5-meta] SUBMIT_EPOCH_CHAIN … hits=N` / `… FAILED`（`ggml/src/ggml-backend-meta.cpp:3898,3999,4005`） | **脚本硬门禁 [M]** | FAILED>0 即 FAIL；零命中行即 FAIL |
-| numerical-mode 定义期打印 | `[tp5-numerical-mode] mode=…`（`ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp:3227`） | **脚本硬门禁 [N]** | 缺失即 FAIL；本提案 timeline+f16 期望 `mode=reference`，不符即 FAIL（模式值本身由人工复核配置一致性） |
+| numerical-mode 定义期打印 | `[tp5-numerical-mode] mode=%s desc=%s reason=%s wire=%s late=%s direct=%s`（`ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp:3239`） | **脚本硬门禁 [N]** | 缺失即 FAIL；本提案 timeline+f16 期望 `mode=reference`、`desc=reference-no-latebind`，不符即 FAIL；LateBind 开启时按 CLI `--tp5-latebind`（`exact` $\to$ `mode=exact-f32`/`desc=exact-f32-strict-math`, `aggressive` $\to$ `mode=aggressive-q8`/`desc=aggressive-q8-quantized`）人工复核一致性 |
 | sidecar/自旋/邮箱失败签名 | `RELAY LateBind sidecar timeout/exceeds`、`… is not 128-bit copy aligned`、`RELAY pre-armed bank is not idle`、`RELAY mailbox status not idle`、`RELAY bank generation differs` | **脚本硬门禁 [L]** | 任一出现即 FAIL；`[tp5-latebind-stage]`/`[tp5-latebind-profile]` 行数仅报告（timeline 配置下期望 0 行，有行则人工复核） |
 | DeviceLost / GPUVM / 图分配致命 | `ErrorDeviceLost`、`VK_ERROR_DEVICE_LOST`、`GPUVM fault`、`dma_fence_wait_timeout`、`graph definition ID space exhausted`、`failed to allocate/initialize graph` | **脚本硬门禁 [D]** | 任一出现即 FAIL |
 | phase 翻转 / reset / sched 释放直接计数 | **无直接日志行**：`llama-context.cpp:2554-2566` 处 phase 切换静默执行，无 INFO 打印 | **人工观察项 P1** | 脚本不判。需新增日志（见 §四需求 R1），在此之前以 [A] 复用率 + [M] 链命中为间接证据，真机值守另查 dmesg |
@@ -127,3 +138,19 @@ done
 - 周期生命周期实现：`common/speculative.cpp`
 - 单元契约回归：`tests/test-mtp-workspace.cpp`
 - 自动化门禁脚本：`scripts/check-tp5-mtp-evidence.sh`
+
+---
+
+## 六、架构决策记录 (ADR)：Device-Hidden 冗余同步收窄契约与见证代际（门禁 H）
+
+### 1. 上下文与物理问题 (Context & Physical Invariant)
+在 TP5 MTP 推测解码的 cross-context 隐层传输路径（`copy_predefined_hidden` 与 `decode_predefined_hidden`）中，Target 主干模型计算完成后，其产出的 `RESULT` 隐层张量驻留在设备显存中，需传递给 MTP 草稿上下文。
+- **历史冗余**：早先实现为防御性地保证隐层张量在 GPU 彻底落盘，每次跨上下文交接均无条件调用 `source->synchronize()`，引发高频的 CPU-GPU 往返同步开销（每次耗费数百微秒甚至毫秒级主机等待）；
+- **物理事实**：在规范的推测流水线中，Target 主干前向在进入交接前已经在其自身的执行队列中完成了提交或同步见证；同卡/跨卡隐层复制由驱动原生设备端 ranges 命令流完成。如果该源上下文的当前代际（`ranges[i].generation`）已经在此前被成功见证并同步，后续针对相同代际的重复跨步交接无需再次迫使 CPU 挂起排空。
+
+### 2. 选定方案与代际见证契约 (Witnessed-Generation Narrowing)
+在 commit `11f8c7eb2` 中引入见证代际同步收窄（fail-closed 机制）：
+1. **见证记录字段**：在 `llama_predefined_hidden_store` 中维护 `synchronized_generation`，记录该存储实例最后一次在主机端完成同步排空的世代序号；
+2. **安全绕过条件**：当且仅当 `src_store && src_store->synchronized_generation == ranges[i].generation` 时，认定数据依赖已在先验链路中闭环，安全跳过 CPU `source->synchronize()`，并在 PROFILE 开关下记录 `[tp5-mtp-hidden] redundant sync avoided gen=N`；
+3. **Fail-Closed 兜底与世代推进**：若 generation 未被见证（例如初次交接、世代递增后首次跨步），系统绝不冒险跳过，而是稳健触发 `source->synchronize()` 并更新 `src_store->synchronized_generation = src_store->generation`，同时记录 `[tp5-mtp-hidden] redundant CPU sync executed gen=N src=PTR`；
+4. **门禁 H 刚性拦截**：在受控推测验证中，推测循环进入稳定态后，正常的流水线应当完全命中绕过路径。门禁脚本 `scripts/check-tp5-mtp-evidence.sh` 设立检查项 H，对任何降级实际同步实行零容忍（`fallback_sync_count == 0`），出现未预期降级即判定未通过，杜绝隐式回退。

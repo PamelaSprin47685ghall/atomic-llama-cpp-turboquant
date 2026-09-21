@@ -2,7 +2,7 @@
 
 **文档状态**：待用户与 Manager 明确批准（PROPOSAL ONLY - DO NOT EXECUTE WITHOUT EXPLICIT APPROVAL）  
 **编制角色**：DevOps 责任人 (`devops`)  
-**基线分支/提交**：`master` @ `d2b354dce`  
+**基线分支/提交**：`master`（包含 TARGET 容量化基准 `14d9b321a`，以及最新 MTP/LateBind/coverage 已提交候选 `737aed5f8` 与 `11f8c7eb2`，提交日期：2026-09-21）  
 **依循规程**：`AGENTS.md`（真机安全门）、`docs/TP5-VERIFICATION-PLAN.md`、`docs/TP5-MTP-EVIDENCE.md`、`TP5-LATEBIND-LINEAR.md`
 
 ---
@@ -125,28 +125,40 @@ curl -s -X POST http://127.0.0.1:8099/completion \
 ### 3.2 运行日志核心采集项
 日志持续写入 `$LOG_PATH`，会话期间必须实时观察以下结构化标签与状态监控
 （其中哪些进脚本硬门禁、哪些是人工项，以 `docs/TP5-MTP-EVIDENCE.md` 第三节映射表为准）：
-1. **`[tp5-numerical-mode]`**：确认定义期单次打印，验证模式判定正确性；
-2. **`[tp5-mtp-graph]`**：捕捉 MTP 图的复用情况，区分首轮构建与后续命中；
-3. **`[tp5-mtp-hidden]`**：监控 Target 与 MTP 间 Hidden 状态的 generation 匹配；
-4. **`[tp5-mtp-cycle]`**：检查每个周期的各阶段纳秒/微秒时间账与 Token 产出统计；
-5. **`[tp5-latebind-stage]` 耗时与自旋监控**：关注每阶段 `sidecar_wait_us`（期望微秒级，无长尾）与 `q_spin`（自旋迭代数，不触发固定 spin_max 超时）；
-6. **`[tp5-meta] SUBMIT_EPOCH_CHAIN hits` 连续性**：监控图调度执行中命令链复用命中率保持 100% 连续性，零 miss、零破坏性回退；
-7. **状态字 2（Status Word 2）异常标志监控**：确认各卡各 bank 的 `status[2]`（sticky failure / abort 标记）全程保持为 `0u`，无任何 rank 触发错误标志；
-8. **内核 `dma_fence` / GPUVM 故障监控**：会话中及退出后通过 `dmesg -T` 核查有无 `GPUVM fault`、`VM page fault`、`dma_fence_wait_timeout` 或 GPU reset。
+1. **`[tp5-numerical-mode]` 数值模式定义期打印**：格式为 `[tp5-numerical-mode] mode=%s desc=%s reason=%s wire=%s late=%s direct=%s`，确认定义期单次打印，观察模式取值（reference / exact-f32 / aggressive-q8）及其描述字段（`desc=reference-no-latebind` 等）；
+2. **`[tp5-mtp-graph]`**：捕捉 MTP 图的复用情况，区分首轮构建（`reuse=0`）与后续命中（`reuse=1`），确认 definition_uid 恒定单一；
+3. **`[tp5-mtp-hidden]` 隐层代际与同步收窄**：
+   - 监控 Target 与 MTP 间 Hidden 状态的 generation 匹配（零 mismatch）；
+   - 监控见证代际同步收窄：观察 `[tp5-mtp-hidden] redundant sync avoided gen=N` 与 `[tp5-mtp-hidden] redundant CPU sync executed gen=N src=PTR`，受控运行中降级同步必须为 0 次；
+4. **`[tp5-mtp-cycle]` 周期完整账本**：检查每个周期的微秒时间账、Token 守恒、单调连续递增的 `cycle=N` 序号以及零接受周期覆盖（`accepted_tokens=0`）；
+5. **`[predefined-coverage]` 预定义五类三态语义覆盖观察点**：定义期捕捉 `[predefined-coverage] gate-status: complete=%s cap_rows=%u captured=%zu classified=%zu fixed_compute=%s dynamic_compute=%s data_movement=%s state_writes=%s dep_boundaries=%s uncovered_disp=%u copies=%u gap='%s' (dynamic row execution %s)`，五类语义（fixed_compute, dynamic_compute, data_movement, state_writes, dep_boundaries）必须全为 safe，无 unresolved，证实 `predefined_complete == true` 并获准动态行执行；
+6. **`[tp5-latebind-stage]` 耗时与自旋监控**：关注每阶段 `sidecar_wait_us`（期望微秒级，无长尾）与 `q_spin`（自旋迭代数，不触发固定 spin_max 超时；timeline 配置下期望 0 行）；
+7. **`[tp5-meta] SUBMIT_EPOCH_CHAIN hits` 连续性**：监控图调度执行中命令链复用命中率保持 100% 连续性，零 miss、零破坏性回退（零 FAILED）；
+8. **状态字 2（Status Word 2）异常标志监控**：确认各卡各 bank 的 `status[2]`（sticky failure / abort 标记）全程保持为 `0u`，无任何 rank 触发错误标志；
+9. **内核 `dma_fence` / GPUVM 故障监控**：会话中及退出后通过 `dmesg -T` 核查有无 `GPUVM fault`、`VM page fault`、`dma_fence_wait_timeout` 或 GPU reset。
 
 ### 3.3 自动化判定与检查
 请求返回后，立即执行自动化证据分析脚本（脚本无执行位时用 `bash` 显式调用；判定项→检查方式映射见 `docs/TP5-MTP-EVIDENCE.md` 第三节）：
 ```bash
 bash scripts/check-tp5-mtp-evidence.sh "$LOG_PATH"; echo "rc=$?"
 ```
-脚本覆盖的硬门禁：[A] MTP 图复用（type=3）、[E] Hidden 零错配、[F] Cycle 恒等式/守恒（含缺失 cycle 即 FAIL）、
-[M] SUBMIT_EPOCH_CHAIN 命中连续、[N] numerical-mode 打印、[L] sidecar/自旋/邮箱失败签名、[D] DeviceLost/GPUVM 致命签名。
-人工观察项（P1 phase 直接计数、P2 status[2] 逐点为零、P3 均值预算与 dmesg 复核）由值守按证据文档确认。
-合成演练夹具（DevOps 重跑脚本逻辑，不跑真机）：
+脚本覆盖的八大硬门禁：
+- **[A]** MTP 图单最大定义复用（type=3, UID 恒定单一）；
+- **[E]** Hidden generation 零错配；
+- **[H]** Device-Hidden 见证代际同步收窄（fallback 零容忍，降级同步必须为 0 次）；
+- **[F]** Cycle 时间恒等式、Token 守恒、单调连续序号及覆盖零接受（缺失 cycle 或断号即 FAIL）；
+- **[M]** SUBMIT_EPOCH_CHAIN 命中连续、零 FAILED 回退；
+- **[N]** numerical-mode 定义期单次打印（含 `mode=` 与 `desc=`）；
+- **[L]** sidecar/自旋/邮箱失败签名零容忍；
+- **[D]** DeviceLost/GPUVM/图分配致命签名零容忍。
+
+人工观察项（P1 phase 直接计数、P2 status[2] 逐点为零、P3 均值预算与 dmesg 复核）由真机值守按证据文档确认。
+合成演练夹具矩阵（8/8 组夹具，DevOps 重跑脚本逻辑，不跑真机）：
 ```bash
 bash scripts/make-tp5-mtp-evidence-fixtures.sh /tmp/tp5-mtp-drill
 for f in /tmp/tp5-mtp-drill/*.log; do echo "=== $f"; bash scripts/check-tp5-mtp-evidence.sh "$f"; echo "rc=$?"; done
 ```
+夹具矩阵覆盖：`pass.log` (rc=0), `rebuild_fail.log` (rc=1, [A]), `hidden_fail.log` (rc=1, [E]), `fallback_sync_fail.log` (rc=1, [H]), `cycle_missing.log` (rc=1, [F]), `conservation_fail.log` (rc=1, [F]), `cycle_seq_fail.log` (rc=1, [F]), `state_spin_fail.log` (rc=1, [L][M][D])。
 
 ### 3.4 异常处理、停止规则与安全退出
 - **超时停机线**：单次请求总耗时超过 **30 秒**未返回，判定为异常 Hang；
@@ -163,31 +175,37 @@ for f in /tmp/tp5-mtp-drill/*.log; do echo "=== $f"; bash scripts/check-tp5-mtp-
 根据 `docs/TP5-MTP-EVIDENCE.md` 第三节映射表，将观测指标严格划分为**脚本硬门禁**与**人工观察/参考项**。
 凡脚本无日志依据的项，一律不得写成硬门禁。
 
-### 4.1 脚本硬门禁（`bash scripts/check-tp5-mtp-evidence.sh` 判定，任一项 FAIL 即未通过）
+### 4.1 脚本硬门禁（`bash scripts/check-tp5-mtp-evidence.sh` 自动化判定，任一项 FAIL 即未通过）
 1. **[A] MTP 图单最大定义完全复用（type=3 = DECODER_MTP，见 `src/llama-graph.h:56-61`）**：
    - MTP 图重建（`type=3 reuse=0`）次数 $\le 1$（仅初始化首轮）；
    - MTP 图复用（`type=3 reuse=1`）次数 $\ge 1$；
    - `definition_uid` 去重后恰好 1 个恒定 UID。
-   - 说明：旧文案曾误写 `type=2`；`type=2` 是 DECODER（target 主干），本门禁只看 `type=3`。
+   - 说明：`type=2` 是 DECODER（target 主干），本门禁只看 `type=3`。
 2. **[E] Device Hidden Generation 零错配**：
    - 日志中 `[tp5-mtp-hidden] … mismatch` 出现次数 $= 0$。
-3. **[F] MTP 周期账本恒等式与守恒（缺失 cycle 即 FAIL）**：
-   - 逐行成立：`total_us == draft_us + target_us + catchup_us + handoff_us`；
-   - 逐行成立：`final_tokens == accepted_tokens + 1`，且 `accepted_tokens ≤ draft_tokens`；
-   - 逐行成立：`target_us > 0`（确凿证实 server-context 真实接入有效）；
-   - 逐行成立：`dev_hidden == 1`（无 CPU 倒腾）；
-   - `GGML_TP5_MTP_PROFILE=1` 受控运行下零 `[tp5-mtp-cycle]` 行直接 FAIL（不再 WARN 放行）。
-4. **[M] SUBMIT_EPOCH_CHAIN 命中连续**：
+3. **[H] Device-Hidden 冗余同步收窄校验（fallback 零容忍）**：
+   - `fallback_sync_count`（`[tp5-mtp-hidden] redundant CPU sync executed`）出现次数 $= 0$；
+   - 见证代际收窄生效，隐层在 GPU 设备端完全直传，受控运行中不得发生未预期 CPU 同步降级。
+4. **[F] MTP 周期账本恒等式、Token 守恒与单调连续性（缺失即 FAIL）**：
+   - 逐行成立时间恒等式：`total_us == draft_us + target_us + catchup_us + handoff_us`；
+   - 逐行成立 Token 守恒：`final_tokens == accepted_tokens + 1`，且 `accepted_tokens ≤ draft_tokens`；
+   - 逐行满足：`target_us > 0`（确凿证实 server-context 真实接入有效）；
+   - 逐行满足：`dev_hidden == 1`（无 CPU 倒腾）；
+   - 周期序号严格单调递增连续：`cycle=1, 2, 3...`（断号拦截）；
+   - 覆盖至少 1 次零接受周期（`accepted_tokens == 0`，验证 RAII 结算在非接受分支不丢失账本）；
+   - 受控运行下零 `[tp5-mtp-cycle]` 行直接 FAIL。
+5. **[M] SUBMIT_EPOCH_CHAIN 命中连续**：
    - `[tp5-meta] SUBMIT_EPOCH_CHAIN FAILED` 出现次数 $= 0$；
    - 命中行（`(PREDEFINED TRUTH)` / `SUCCESS`）至少 1 行，否则 FAIL。
-5. **[N] 数值模式定义期打印**：
-   - `[tp5-numerical-mode]` 缺失即 FAIL；本提案 timeline+f16 配置期望 `mode=reference`，不符即 FAIL。
-6. **[L] Sidecar/自旋/邮箱失败签名零容忍**：
+6. **[N] 数值模式定义期打印**：
+   - `[tp5-numerical-mode]` 缺失即 FAIL；
+   - 打印字段包含 `mode=%s`、`desc=%s`；本提案 timeline+f16 默认配置期望 `mode=reference`、`desc=reference-no-latebind`，不符即 FAIL。若显式指定 CLI `--tp5-latebind exact|aggressive` 则人工比对模式一致性。
+7. **[L] Sidecar/自旋/邮箱失败签名零容忍**：
    - `RELAY LateBind sidecar timeout/exceeds`、`… is not 128-bit copy aligned`、
      `RELAY pre-armed bank is not idle`、`RELAY mailbox status not idle`、
      `RELAY bank generation differs` 任一出现即 FAIL。
    - `[tp5-latebind-stage]` / `[tp5-latebind-profile]` 行数仅报告（本提案 timeline 配置下期望 0 行，有行则人工复核）。
-7. **[D] DeviceLost / GPUVM / 图分配致命签名零容忍**：
+8. **[D] DeviceLost / GPUVM / 图分配致命签名零容忍**：
    - `ErrorDeviceLost`、`VK_ERROR_DEVICE_LOST`、`GPUVM fault`、`dma_fence_wait_timeout`、
      `graph definition ID space exhausted`、`failed to allocate/initialize graph` 任一出现即 FAIL。
 
@@ -231,8 +249,57 @@ for f in /tmp/tp5-mtp-drill/*.log; do echo "=== $f"; bash scripts/check-tp5-mtp-
 
 ---
 
-## 七、执行基准（Execution Baseline）
+## 七、执行基准与候选钉点（Execution Baseline & Candidate Pinning）
 
-本次受控验证的被验证候选更新固定为 git commit `14d9b321a2a44539ce3b2e42ae98c5237148beb0`（在原基准上合入 TARGET 容量化第一阶段、Attention 区域容量化及 KV 尾部安全修复，并包含 GDN 方案 B 算子活跃步参数下传、真实前向端到端测试与 GDN/recurrent 模型安全收口；GDN 仍 fail-closed）。该 commit 已通过 build-tp5 增量构建、全量 10/10 CPU 回归（含 test-target-capacity 12 组测试）与独立复核。
+### 7.1 TARGET 容量化基准（`14d9b321a`）
+原 TARGET 容量化基准固定为 git commit `14d9b321a2a44539ce3b2e42ae98c5237148beb0`（在原基准上合入 TARGET 容量化第一阶段、Attention 区域容量化及 KV 尾部安全修复，并包含 GDN 方案 B 算子活跃步参数下传、真实前向端到端测试与 GDN/recurrent 模型安全收口；GDN 仍 fail-closed）。该基准保持不变，作为 TARGET 容量化线的基础锚点。
 
-执行时若工作树已在此基准之上前进，应在该 commit 的独立 worktree 中构建并运行受控会话；若因故直接在当前工作树执行，必须在执行前确认当前代码与该 commit 的差异并如实记录，保证验证对象是经过审计与六态演练的冻结状态。真机执行仍以用户明确批准为前提，未经批准不得启动任何 GPU 服务。
+### 7.2 MTP / LateBind / Coverage 最新候选钉点（`737aed5f8` 与 `11f8c7eb2`）
+在同一 `master` 分支上，MTP 本线已完成并在 `14d9b321a` 之后顺序合入两个最新候选提交（提交日期均为 **2026-09-21**）：
+1. **Candidate 1: `737aed5f813df4dc5d18a43429c0ab4866ade7e2` (2026-09-21)**：
+   - **LateBind WAR 屏障硬化**：消解阶段切换过程中的读后写竞争风险；
+   - **预定义五类三态语义覆盖**：实现 `ggml-vulkan-tp5-coverage.h` 与 `predefined_complete` 闭环，5 类语义（固定算力、动态算力、数据搬运、状态写回、依赖边界）由未决态（unresolved）收敛为安全态（fixed_safe/dynamic_safe），零 unresolved；若存在未覆盖项则动态行执行触发 fail-closed 拦截；
+   - **MTP 周期账本闭合**：引入 `cycle_settle_guard` RAII 守卫，确保零接受分支（`n_commit == 0`）及异常路径均准确记录账本；累加器与 Target 验证时间无条件置零；周期序号 `cycle_id` 单调连续递增；
+   - **CLI 选项扩充**：支持 `--tp5-latebind off|exact|aggressive` 显式控制 LateBind 数值模式；
+   - 审计与演练落档。
+2. **Candidate 2: `11f8c7eb23e3ceef0d8b4dc8b88f328ff267dac7` (2026-09-21)**：
+   - **Device-Hidden 见证代际同步收窄**：在 `src/llama-predefined-hidden.cpp` 中，通过 `synchronized_generation` 见证世代状态，安全跳过已见证代际的 CPU `source->synchronize()`，保持未见证代际的 fail-closed 兜底同步；
+   - **新增证据门禁检查项 H**：在 `scripts/check-tp5-mtp-evidence.sh` 中增加门禁 H，断言降级实际同步为 0 次（`fallback == 0`）；
+   - **8 组演练夹具矩阵**：在 `scripts/make-tp5-mtp-evidence-fixtures.sh` 中补齐 8 组测试夹具，完全覆盖通过与失败分支。
+
+**重要说明**：上述候选与门禁的更新属于**文档规约与候选代码准备**，**绝非真机验证证据本身**。未经用户与 Manager 明确授权，不得将候选合入视为已在真机上验证通过。
+
+---
+
+## 八、受控真机会话检查表与报批包（Controlled Session Checklist & Approval Package）
+
+**当前状态**：**待批准（PROPOSAL / APPROVAL PENDING - DO NOT EXECUTE WITHOUT EXPLICIT APPROVAL）**  
+本检查表严格依据 `AGENTS.md`“真机安全门”既有条款制定，不扩大授权，不增设自研安全政策。
+
+### 8.1 前置安全审计检查表（Pre-flight Audit Checklist）
+在获得批准并启动任何 GPU 进程前，必须逐项核对并打勾：
+- [ ] **S1. GPU 完全空闲**：5 卡（`card1..card5`）`gpu_busy_percent` 恒为 `0%`（严禁在 GPU 繁忙时叠加负载）；
+- [ ] **S2. 显存基线纯净**：5 卡 `mem_info_vram_used` 均处于空闲基线（$\le 35\,\text{MB}$，无未释放显存）；
+- [ ] **S3. 硬件温度安全**：5 卡核心温度全部 $\le 55^\circ\text{C}$，杜绝热积累；
+- [ ] **S4. 驱动日志零新增报错**：`dmesg -T` 中无当前启动周期的 `GPUVM fault`、`dma_fence_wait_timeout`、`page fault` 或 GPU reset；
+- [ ] **S5. 零残留僵尸进程**：无任何 `llama-server`、`llama-cli` 或 `test-vulkan` 进程在后台运行；
+- [ ] **Watchdog 状态在位**：确认 IPMI 硬件 Watchdog 正常运作，**严禁关闭 Watchdog**；
+- [ ] **自愈工具可用**：确认一键免密安全自愈脚本 `./scripts/reset-gpu.sh` 随时可用。
+
+### 8.2 运行边界约束（Runtime Boundaries & Constraints）
+- **单次、有界短请求**：恰好发送 1 次短请求（`prompt="1 2 3 4"`，`n_predict=12`，`stream=false`），绝对不做多并发压测，绝对不做 tok/s 测速；
+- **配置收窄**：采用安全规格 `-c 512 -b 32 -ub 32`，上下文显存占用缩减 90% 以上；
+- **独立端口与独立日志**：采用独立端口 `8099`，日志输出至 `/tmp/tp5_mtp_controlled_verify_<timestamp>.log`；
+- **硬性超时与失败即停**：
+  - 单请求超时上限为 **30 秒**，超时立即判定为异常并中止；
+  - 遇到日志中出现 `ErrorDeviceLost`、`GPUVM fault`、`sidecar timeout` 等任何致命或失败标志，立即终止；
+- **安全退出规程**：
+  - 终止时仅允许发送受控 `SIGTERM` 信号（`kill -15 <pid>`），通过 `comm_free_safe` 原生有界排空释放资源；
+  - **严禁使用 `kill -9` 强杀**，**严禁调用 `vkDeviceWaitIdle` 盲目自旋**，**严禁动态或递增扩大 spin bound 重试**。
+
+### 8.3 产出物与验收判据（Deliverables & Acceptance Criteria）
+会话结束后，必须完整产出并验证以下内容：
+1. **完整运行日志文件**：保存完整原始日志至 `$LOG_PATH`；
+2. **自动化门禁判定结果**：执行 `bash scripts/check-tp5-mtp-evidence.sh "$LOG_PATH"`，必须满足退出码 `rc=0`（全项 PASS，覆盖门禁 A/E/H/F/M/N/L/D）；
+3. **内核 dmesg 洁净审计**：真机会话退出后再次核查 `dmesg -T`，确认会话期间零新增 `GPUVM fault`、零 `dma_fence_wait_timeout`；
+4. **人工项比对记录**：由真机值守人员完成 P1（phase 切换正常）、P2（status[2] 全程为零）、P3（均值预算与 dmesg 复核）记录。
