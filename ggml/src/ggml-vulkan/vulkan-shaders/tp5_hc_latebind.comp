@@ -7,6 +7,10 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
+#if defined(TP5_LATE_INJECT) || defined(TP5_LATE_Q)
+#include "tp5_hc_subgroup.glsl"
+#endif
+
 // Exact LateBind-TP for Qwen4EXP HC.
 //
 // INJECT: compute the four exact scatter weights from the already-known HC
@@ -72,7 +76,7 @@ void main() {
         rowtmp       = fma(b0.x, v0.x, rowtmp);
         acc           = fma(rowtmp, float(w[ib].d), acc);
     }
-    acc = subgroupAdd(acc);
+    acc = tp5_hc_sum32(acc);
     if (lane == 0u) {
         // Match build_hc_combine / the existing fused HC path exactly for
         // the production 4-stream model: MUL by 0.25, then the explicit +0.
@@ -91,14 +95,14 @@ layout(local_size_x = 32) in;
 layout(std430, binding = 0) readonly buffer DownWeights {
     late_q8_0 w[];
 };
-layout(std430, binding = 1) readonly buffer Gamma {
-    float gamma[];
+layout(std430, binding = 1) readonly buffer Gamma4 {
+    vec4 gamma4[];
 };
-layout(std430, binding = 2) readonly buffer Residual {
-    float residual[];
+layout(std430, binding = 2) readonly buffer Residual4 {
+    vec4 residual4[];
 };
-layout(std430, binding = 3) readonly buffer LocalZ {
-    float local_z[];
+layout(std430, binding = 3) readonly buffer LocalZ4 {
+    vec4 local_z4[];
 };
 layout(std430, binding = 4) readonly buffer Scatter {
     float scatter[];
@@ -117,51 +121,212 @@ layout(push_constant) uniform QParams {
 void main() {
     const uint row  = gl_WorkGroupID.x;
     const uint lane = gl_LocalInvocationID.x;
-    if (row >= p.rank_dim) {
+    if (row >= p.rank_dim || p.streams != 4u || (p.width & 255u) != 0u) {
         return;
     }
     const uint k_dim = p.width * p.streams;
-    for (uint stream = 0u; stream < p.streams; ++stream) {
-        float acc = 0.0;
-        const uint base = stream * p.width;
-        const float s   = scatter[stream];
-        for (uint col = 8u * lane; col < p.width; col += 8u * 32u) {
-            const uint valid = min(8u, p.width - col);
-            float xv[8];
-            [[unroll]] for (uint e = 0u; e < 8u; ++e) {
-                if (e < valid) {
-                    const uint k = base + col + e;
-                    precise float rz = s * local_z[col + e];
-                    if (p.my_rank == 0u) {
-                        rz = residual[k] + rz;
-                    }
-                    xv[e] = gamma[k] * rz;
-                } else {
-                    xv[e] = 0.0;
-                }
-            }
+    float acc[4] = { 0.0, 0.0, 0.0, 0.0 };
+
+    // Production Qwen shape: width is an integer number of 256-column tiles,
+    // exactly matching one 32-lane subgroup × 8 columns/lane.  Traverse K
+    // once and keep four stream accumulators live.  local_z is common to all
+    // four streams, so this turns four identical VRAM reads into one without
+    // changing the per-stream column accumulation order.
+    const vec4 scatter4 = vec4(scatter[0], scatter[1], scatter[2], scatter[3]);
+    for (uint col = 8u * lane; col < p.width; col += 8u * 32u) {
+        const vec4 z0 = local_z4[col / 4u];
+        const vec4 z1 = local_z4[col / 4u + 1u];
+        [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
+            const uint base       = stream * p.width;
+            const float s         = scatter4[stream];
             const uint global_col = base + col;
             const uint ib  = (row * k_dim + global_col) / 32u;
             const uint iqs = global_col % 32u;
+
+            vec4 rz0 = z0 * s;
+            vec4 rz1 = z1 * s;
+            if (p.my_rank == 0u) {
+                rz0 += residual4[global_col / 4u];
+                rz1 += residual4[global_col / 4u + 1u];
+            }
+            const vec4 b0 = gamma4[global_col / 4u] * rz0;
+            const vec4 b1 = gamma4[global_col / 4u + 1u] * rz1;
+
             const i8vec2 q0 = unpack8(int32_t(w[ib].qs[iqs / 2u])).xy;
             const i8vec2 q1 = unpack8(int32_t(w[ib].qs[iqs / 2u + 1u])).xy;
             const i8vec2 q2 = unpack8(int32_t(w[ib].qs[iqs / 2u + 2u])).xy;
             const i8vec2 q3 = unpack8(int32_t(w[ib].qs[iqs / 2u + 3u])).xy;
             const vec4 v0 = vec4(q0.x, q0.y, q1.x, q1.y);
             const vec4 v1 = vec4(q2.x, q2.y, q3.x, q3.y);
-            const vec4 b0 = vec4(xv[0], xv[1], xv[2], xv[3]);
-            const vec4 b1 = vec4(xv[4], xv[5], xv[6], xv[7]);
-            float rowtmp = dot(b1, v1);
-            rowtmp       = fma(b0.w, v0.w, rowtmp);
-            rowtmp       = fma(b0.z, v0.z, rowtmp);
-            rowtmp       = fma(b0.y, v0.y, rowtmp);
-            rowtmp       = fma(b0.x, v0.x, rowtmp);
-            acc           = fma(rowtmp, float(w[ib].d), acc);
+
+            // Mirror native Q8_0 HC W_down: two 4-wide dots, apply the block
+            // scale, then accumulate the row partial.  The only difference is
+            // that B is formed lazily from the linear sufficient-statistic
+            // expression instead of loaded from a materialized normalized
+            // tensor.
+            float rowtmp = dot(b0, v0);
+            rowtmp      += dot(b1, v1);
+            rowtmp      *= float(w[ib].d);
+            acc[stream] += rowtmp;
         }
-        acc = subgroupAdd(acc);
+    }
+
+    [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
+        acc[stream] = tp5_hc_sum32(acc[stream]);
         if (lane == 0u) {
-            q_out[stream * p.rank_dim + row] = acc;
+            q_out[stream * p.rank_dim + row] = acc[stream];
         }
+    }
+}
+#endif
+
+#ifdef TP5_LATE_NORM
+// Safe/default post-generation finalizer.  Four independent 512-thread
+// workgroups preserve the established per-stream RMS tree while allowing the
+// four streams to occupy separate CUs.  The 4-float scatter scratch is reused
+// as the scale output after each workgroup has consumed its own scatter value.
+layout(local_size_x = 512) in;
+
+layout(std430, binding = 0) readonly buffer SumY {
+    float y[];
+};
+layout(std430, binding = 1) readonly buffer Residual {
+    float residual[];
+};
+layout(std430, binding = 2) readonly buffer Gamma {
+    float gamma[];
+};
+layout(std430, binding = 3) writeonly buffer Combined {
+    float combined[];
+};
+layout(std430, binding = 4) writeonly buffer Normalized {
+    float normalized[];
+};
+layout(std430, binding = 5) buffer ScatterScale {
+    float scatter_scale[];
+};
+
+layout(push_constant) uniform NormParams {
+    uint  width;
+    uint  streams;
+    float epsilon;
+    uint  reserved;
+} p;
+
+shared float partials[512];
+
+void finalize_stream(const uint iterations) {
+    const uint stream = gl_WorkGroupID.x;
+    const uint lane   = gl_LocalInvocationID.x;
+    const uint base   = stream * p.width;
+    const float s     = scatter_scale[stream];
+    float values[8];
+    float ss = 0.0;
+
+    [[unroll]] for (uint i = 0u; i < iterations; ++i) {
+        const uint col = lane + i * 512u;
+        float value = 0.0;
+        if (col < p.width) {
+            value = residual[base + col];
+            precise float product = y[col] * s;
+            precise float result  = value + product;
+            value = result;
+            combined[base + col] = result;
+        }
+        values[i] = value;
+        ss += value * value;
+    }
+
+    partials[lane] = ss;
+    barrier();
+    [[unroll]] for (uint stride = 256u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            ss += partials[lane + stride];
+            partials[lane] = ss;
+        }
+        barrier();
+    }
+
+    const float mean  = partials[0] / float(p.width);
+    const float scale = inversesqrt(mean + p.epsilon);
+    if (lane == 0u) {
+        scatter_scale[stream] = scale;
+    }
+    [[unroll]] for (uint i = 0u; i < iterations; ++i) {
+        const uint col = lane + i * 512u;
+        if (col < p.width) {
+            float norm              = scale * values[i];
+            const float scaled_norm = norm * gamma[base + col];
+            normalized[base + col]  = scaled_norm;
+        }
+    }
+}
+
+void main() {
+    if (p.streams != 4u || gl_WorkGroupID.x >= p.streams) {
+        return;
+    }
+    const uint blocks = (p.width + 511u) / 512u;
+    if (blocks > 4u) {
+        finalize_stream(8u);
+    } else if (blocks == 4u) {
+        finalize_stream(4u);
+    } else if (blocks == 3u) {
+        finalize_stream(3u);
+    } else if (blocks == 2u) {
+        finalize_stream(2u);
+    } else {
+        finalize_stream(1u);
+    }
+}
+#endif
+
+#ifdef TP5_LATE_LO
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) coherent volatile readonly buffer RelayInbox {
+    uint inbox[];
+};
+layout(std430, binding = 1) readonly buffer Scales {
+    float scales[];
+};
+layout(std430, binding = 2) writeonly buffer Lo {
+    float lo[];
+};
+layout(std430, binding = 3) coherent volatile buffer Status {
+    uint status[];
+};
+
+layout(push_constant) uniform LoParams {
+    uint rank_dim;
+    uint streams;
+    uint late_word_offset;
+    uint reserved;
+} p;
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    if (p.streams != 4u) {
+        return;
+    }
+    for (uint row = lane; row < p.rank_dim; row += 64u) {
+        precise float acc = uintBitsToFloat(inbox[p.late_word_offset + row]) * scales[0];
+        [[unroll]] for (uint stream = 1u; stream < 4u; ++stream) {
+            precise float term =
+                uintBitsToFloat(inbox[p.late_word_offset + stream * p.rank_dim + row]) * scales[stream];
+            acc = acc + term;
+        }
+        precise float scaled = acc * 0.25 + 0.0;
+        lo[row] = scaled / (1.0 + exp(-scaled));
+    }
+    memoryBarrierBuffer();
+    barrier();
+    if (lane == 0u) {
+        // relay_copy already published the same completion value; write it
+        // again here so diagnostic readers can treat this as the completion of
+        // the full safe LateBind P2, not merely the generation-copy prefix.
+        status[3] = status[1];
+        memoryBarrierBuffer();
     }
 }
 #endif

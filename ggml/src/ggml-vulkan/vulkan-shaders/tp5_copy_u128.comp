@@ -1,0 +1,30 @@
+#version 450
+
+// Descriptor-based 128-bit RELAY P1 copy.
+//
+// This intentionally preserves the old one-workgroup/vector-burst transport
+// quality without requiring buffer device address on imported host memory.
+// Decode payloads are small (e.g. 2560 F32 = 10 KiB), so one 64-lane
+// workgroup is enough; larger payloads may use multiple workgroups.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer SrcBuffer {
+    uvec4 src_data[];
+};
+
+layout(std430, binding = 1) coherent writeonly buffer DstBuffer {
+    uvec4 dst_data[];
+};
+
+layout(push_constant) uniform Params {
+    uint n_uvec4;
+} p;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    for (; idx < p.n_uvec4; idx += stride) {
+        dst_data[idx] = src_data[idx];
+    }
+}

@@ -131,6 +131,14 @@ if (Python3_Interpreter_FOUND)
 endif()
 
 # build test-tokenizer-0 target once and add many tests
+add_executable(test-predefined-capacity test-predefined-capacity.cpp)
+target_link_libraries(test-predefined-capacity PRIVATE ggml-base)
+llama_test(test-predefined-capacity LABEL "predefined;cpu")
+
+add_executable(test-mtp-workspace test-mtp-workspace.cpp)
+target_link_libraries(test-mtp-workspace PRIVATE llama)
+llama_test(test-mtp-workspace LABEL "predefined;cpu")
+
 add_executable(test-turbo-quant test-turbo-quant.c)
 target_include_directories(test-turbo-quant PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 target_link_libraries(test-turbo-quant PRIVATE ggml-base)
@@ -349,6 +357,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build_and_test(test-backend-memmove.cpp)
     llama_build_and_test(test-vulkan-moe-threshold.cpp)
+    # CPU-only transport/fusion composition contract; no Vulkan initialization.
+    llama_build_and_test(test-vulkan-tp5-output-liveness.cpp)
+    target_include_directories(test-vulkan-tp5-output-liveness PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-vulkan)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)

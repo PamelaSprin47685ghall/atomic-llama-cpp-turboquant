@@ -9337,10 +9337,6 @@ void ggml_compute_forward_flash_attn_ext(
 void ggml_compute_forward_flash_attn_ext_rerot(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
-    // TP5 QSA explicit head map is not implemented for the indexed RERoT
-    // path; fail closed rather than run the uniform integer-ratio assumption.
-    GGML_ASSERT(dst->op_params[8] != GGML_TP5_HEADMAP_MAGIC &&
-                "TP5 head map is not supported for FLASH_ATTN_EXT_REROT");
     const ggml_tensor * q       = dst->src[0];
     const ggml_tensor * k       = dst->src[1];
     const ggml_tensor * v       = dst->src[2];
@@ -9366,7 +9362,19 @@ void ggml_compute_forward_flash_attn_ext_rerot(
     const int64_t n_entries = entries->ne[1];
 
     GGML_ASSERT(dst->ne[0] == DV && dst->ne[1] == n_head && dst->ne[2] == n_queries);
-    GGML_ASSERT(n_head % n_head_k == 0 && n_head % n_head_v == 0);
+    uint8_t tp5_heads[GGML_TP5_HEADMAP_MAX_ENTRIES] = {};
+    const int32_t tp5_head_count = ggml_tp5_headmap_get(dst, tp5_heads);
+    GGML_ASSERT(tp5_head_count >= 0 && "invalid TP5 head map encoding");
+    const bool tp5_mapped = tp5_head_count > 0;
+    if (tp5_mapped) {
+        GGML_ASSERT(tp5_head_count == n_head && n_head_k == n_head_v &&
+                    "TP5 headmap RERoT geometry mismatch");
+        for (int32_t h = 0; h < tp5_head_count; ++h) {
+            GGML_ASSERT(tp5_heads[h] < n_head_k);
+        }
+    } else {
+        GGML_ASSERT(n_head % n_head_k == 0 && n_head % n_head_v == 0);
+    }
 
     float scale = 1.0f;
     float logit_softcap = 0.0f;
@@ -9411,8 +9419,8 @@ void ggml_compute_forward_flash_attn_ext_rerot(
     for (int64_t row = ith; row < n_rows; row += nth) {
         const int64_t query = row / n_head;
         const int64_t head  = row % n_head;
-        const int64_t k_head = head / (n_head / n_head_k);
-        const int64_t v_head = head / (n_head / n_head_v);
+        const int64_t k_head = tp5_mapped ? tp5_heads[head] : head / (n_head / n_head_k);
+        const int64_t v_head = tp5_mapped ? tp5_heads[head] : head / (n_head / n_head_v);
 
         const int32_t begin = offset_data[query];
         const int32_t end   = offset_data[query + 1];

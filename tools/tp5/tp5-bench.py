@@ -70,16 +70,25 @@ def request(url: str, payload: dict | None, timeout: float) -> dict:
         return json.load(response)
 
 
-def timeline_env(binary: Path) -> dict[str, str]:
+def timeline_env(binary: Path, mmvq: str) -> dict[str, str]:
     env = os.environ.copy()
     defaults = {
         "RADV_DEBUG": "nobolist", "GGML_TP5_ISOLATE_BO": "1",
         "GGML_TP5_MERGE_SUBMIT": "1", "GGML_VK_CMD_REPLAY": "1",
-        "GGML_TP5_CMD_REPLAY": "1", "GGML_VK_DISABLE_MMVQ": "1",
+        "GGML_TP5_CMD_REPLAY": "1",
         "GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM": "1", "GGML_VK_ALLOW_GRAPHICS_QUEUE": "1",
     }
     for key, value in defaults.items():
         env.setdefault(key, value)
+    # Do not silently turn off a backend optimization in the benchmark
+    # harness.  "auto" measures the backend policy; explicit on/off remains
+    # available for numeric/performance A/B.
+    env.pop("GGML_VK_DISABLE_MMVQ", None)
+    env.pop("GGML_VK_FORCE_MMVQ", None)
+    if mmvq == "off":
+        env["GGML_VK_DISABLE_MMVQ"] = "1"
+    elif mmvq == "on":
+        env["GGML_VK_FORCE_MMVQ"] = "1"
     env.update(GGML_TP5_SYNC="timeline", GGML_TP5_WIRE="f16", GGML_TP5_RELAY="off")
     env["LD_LIBRARY_PATH"] = str(binary.parent) + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
     return env
@@ -142,6 +151,8 @@ def main() -> int:
     parser.add_argument("--post-prefill-check", action="store_true", help="check a fresh decode after the prefill sweep")
     parser.add_argument("--cache-k", default="f16")
     parser.add_argument("--cache-v", default="f16")
+    parser.add_argument("--mmvq", choices=("auto", "on", "off"), default="auto",
+                        help="Vulkan MMVQ policy; auto preserves the backend cost model")
     parser.add_argument("--port", type=int, default=18095)
     parser.add_argument("--startup-timeout", type=float, default=300)
     parser.add_argument("--request-timeout", type=float, default=240)
@@ -160,7 +171,7 @@ def main() -> int:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if args.output.exists():
         parser.error("output exists; use a new path to preserve previous evidence")
-    env = timeline_env(binary)
+    env = timeline_env(binary, args.mmvq)
     argv = [str(binary), "-m", str(model), "-dev", "Vulkan0,Vulkan1,Vulkan2,Vulkan3,Vulkan4",
             "--split-mode", "tensor", "--fit", "off", "--tp5", "qwen4exp-af",
             "--tp5-sync", "timeline", "--tp5-wire", "f16", "-ngl", "999",

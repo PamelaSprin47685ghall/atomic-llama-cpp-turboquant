@@ -699,10 +699,19 @@ void rerot_main() {
         return;
     }
 
-    const uint gqa_div = (p.nek2 > 0u) ? (p.neq2 / p.nek2) : 1u;
-    const uint vdiv    = (p.nev2 > 0u) ? (p.neq2 / p.nev2) : 1u;
-    const uint kh = (gqa_div > 0u) ? (h / gqa_div) : h;
-    const uint vh = (vdiv    > 0u) ? (h / vdiv)    : h;
+    uint kh, vh;
+    if ((p.mask_n_head_log2 & TP5_HEADMAP_FLAG) != 0u) {
+        // Same explicit TP5 Q->KV mapping contract as ordinary FA. Mapped
+        // RERoT is dispatched with Br=1, so no workgroup assumes several
+        // adjacent Q heads share one KV tile.
+        kh = tp5_headmap_entry(h);
+        vh = kh;
+    } else {
+        const uint gqa_div = (p.nek2 > 0u) ? (p.neq2 / p.nek2) : 1u;
+        const uint vdiv    = (p.nev2 > 0u) ? (p.neq2 / p.nev2) : 1u;
+        kh = (gqa_div > 0u) ? (h / gqa_div) : h;
+        vh = (vdiv    > 0u) ? (h / vdiv)    : h;
+    }
 
     // This query's global entry range, split across entry-splits. Splits of an
     // empty range stay empty; their partials (L = 0) are identity elements for

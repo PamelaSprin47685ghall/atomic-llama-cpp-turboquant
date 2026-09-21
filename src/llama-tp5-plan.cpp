@@ -700,7 +700,8 @@ int64_t llama_tp5_qsa_global_kv_head(const llama_tp5_plan & plan, int64_t global
 }
 
 bool llama_tp5_qsa_headmap_stamp(const llama_tp5_plan & plan, uint32_t rank, struct ggml_tensor * fa_node) {
-    if (!plan.qsa_headmap || fa_node == nullptr || fa_node->op != GGML_OP_FLASH_ATTN_EXT) {
+    if (!plan.qsa_headmap || fa_node == nullptr ||
+        (fa_node->op != GGML_OP_FLASH_ATTN_EXT && fa_node->op != GGML_OP_FLASH_ATTN_EXT_REROT)) {
         return false;
     }
     if (rank >= plan.ranks || rank >= plan.local_qkv_map.size()) {

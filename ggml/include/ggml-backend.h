@@ -347,6 +347,12 @@ extern "C" {
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_compute_pool_t ggml_backend_sched_compute_pool_new(void);
     GGML_API ggml_backend_sched_compute_pool_t ggml_backend_sched_compute_pool_ref(ggml_backend_sched_compute_pool_t pool);
+    // Keep one largest shared temporary arena for all serial execution phases.
+    // Does not remove ownership synchronization or allow concurrent alias use.
+    GGML_API void ggml_backend_sched_compute_pool_set_retain_capacity(ggml_backend_sched_compute_pool_t pool, bool retain);
+    GGML_API bool ggml_backend_sched_compute_pool_get_retain_capacity(ggml_backend_sched_compute_pool_t pool);
+    GGML_API void ggml_backend_sched_compute_pool_set_capacity_sealed(ggml_backend_sched_compute_pool_t pool, bool sealed);
+    GGML_API bool ggml_backend_sched_compute_pool_get_capacity_sealed(ggml_backend_sched_compute_pool_t pool);
     GGML_API void                              ggml_backend_sched_compute_pool_free(ggml_backend_sched_compute_pool_t pool);
 
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);

@@ -49,11 +49,13 @@
 } while (0)
 
 typedef void (*get_replay_stats_t)(ggml_backend_t, uint64_t *, uint64_t *);
+typedef bool (*get_region_mmvq_stats_t)(ggml_backend_t, uint64_t *, uint64_t *, uint32_t *, uint32_t *);
 
 struct test_env {
     ggml_backend_t backend_gpu = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     get_replay_stats_t get_stats = nullptr;
+    get_region_mmvq_stats_t get_region_mmvq_stats = nullptr;
 
     bool init() {
         ggml_backend_load_all();
@@ -77,6 +79,8 @@ struct test_env {
         if (!get_stats) {
             return false;
         }
+        get_region_mmvq_stats = (get_region_mmvq_stats_t)
+            ggml_backend_reg_get_proc_address(reg_gpu, "ggml_backend_vk_get_region_mmvq_stats");
         ggml_backend_reg_t reg_cpu = ggml_backend_reg_by_name("CPU");
         if (!reg_cpu) {
             return false;
@@ -2868,7 +2872,7 @@ static void test_attention_region_replay(test_env & env) {
         "fallback, gated output and downstream views.\n");
 }
 
-static void test_attention_projections_replay(test_env & env) {
+static void test_attention_projections_replay(test_env & env, bool require_mmvq = false, bool growth_only = false) {
     struct proj_case {
         bool   qsa;
         int    width;
@@ -2888,14 +2892,27 @@ static void test_attention_projections_replay(test_env & env) {
         { true,  256,  16, 6,  6,  8,  0  }, // QSA width 256
         { true,  2560, 32, 12, 12, 16, 32 }, // QSA full width 2560, offset 32
         { true,  256,  5,  3,  3,  7,  64 }, // QSA partial row tiles (odd row counts), offset 64
+        { false, 768,  9,  5,  3,  3,  32 }, // lane-dependent K tails
+        { true,  1280, 7,  5,  5,  3,  64 }, // two iterations plus lane tails
+        { false, 3072, 9,  7,  5,  5,  0  }, // 4+2 integer-dot K loop
+        { true,  3584, 9,  5,  5,  7,  32 }, // 4+2+1 integer-dot K loop
+        { true,  8192, 16, 8,  8,  8,  32 }, // nested scratch-growth fixture only
         // Fallback cases: mismatched shapes that legitimately prevent fusion and execute as native operators
         { false, 256,  8,  8,  6,  4,  0  }, // GDN fallback: alpha rows != beta rows (6 != 4)
         { true,  256,  8,  6,  4,  8,  0  }, // QSA fallback: K rows != V rows (6 != 4)
     };
 
     ggml_backend_t backends[] = { env.backend_gpu, env.backend_cpu };
+    uint64_t quant_before = 0, fused_before = 0;
+    if (env.get_region_mmvq_stats)
+        env.get_region_mmvq_stats(env.backend_gpu, &quant_before, &fused_before, nullptr, nullptr);
+    bool exercised_growth = false;
 
     for (const auto & c : cases) {
+        if (growth_only != (c.width == 8192)) continue;
+        uint64_t case_fused_before = 0;
+        if (env.get_region_mmvq_stats)
+            env.get_region_mmvq_stats(env.backend_gpu, nullptr, &case_fused_before, nullptr, nullptr);
         auto * weights_ctx = ggml_init({ 1024 * 1024, nullptr, true });
         TEST_ASSERT(weights_ctx != nullptr);
 
@@ -2962,6 +2979,14 @@ static void test_attention_projections_replay(test_env & env) {
         }
 
         for (int round = 0; round < 4; ++round) {
+            if (require_mmvq && !exercised_growth && round == 1) {
+                // Keep this smaller graph, its descriptors and weights live.
+                // Grow the region scratch with a different graph, then replay
+                // this one with NEW input values. A stale descriptor or a
+                // tensor-pointer-only quantization cache cannot pass this.
+                test_attention_projections_replay(env, false, true);
+                exercised_growth = true;
+            }
             std::vector<float> input_vals(c.width + 32);
             for (size_t i = 0; i < input_vals.size(); ++i) {
                 input_vals[i] = std::sin(float(i % 251) * 0.071f + round * 0.23f) * 0.7f;
@@ -2973,13 +2998,27 @@ static void test_attention_projections_replay(test_env & env) {
                 CHECK_STATUS(ggml_backend_sched_graph_compute(schedulers[reference], graphs[reference]),
                              "attention projections replay");
             }
+            uint64_t case_fused_after = case_fused_before;
+            if (env.get_region_mmvq_stats)
+                env.get_region_mmvq_stats(env.backend_gpu, nullptr, &case_fused_after, nullptr, nullptr);
+            const bool integer_region = case_fused_after > case_fused_before;
             for (int out_idx = 0; out_idx < 4; ++out_idx) {
                 std::vector<float> actual(ggml_nelements(outputs[0][out_idx])), expected(actual.size());
                 ggml_backend_tensor_get(outputs[0][out_idx], actual.data(), 0, actual.size() * sizeof(float));
                 ggml_backend_tensor_get(outputs[1][out_idx], expected.data(), 0, expected.size() * sizeof(float));
                 for (float val : actual)
                     TEST_ASSERT(std::isfinite(val));
-                const bool equal = std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0;
+                bool equal = std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0;
+                if (integer_region && !equal) {
+                    // Both paths use the same native Q8_1 arithmetic here,
+                    // not an F32-activation oracle. Only FP accumulation order
+                    // may differ between standalone and paired row kernels.
+                    equal = true;
+                    for (size_t i = 0; i < actual.size(); ++i) {
+                        const float tol = 3e-5f * (1.0f + std::abs(expected[i]));
+                        equal = equal && std::isfinite(expected[i]) && std::abs(actual[i] - expected[i]) <= tol;
+                    }
+                }
                 if (!equal) {
                     std::fprintf(stderr, "Projection mismatch: qsa=%d width=%d output=%d round=%d\n", c.qsa, c.width,
                                  out_idx, round);
@@ -2995,9 +3034,19 @@ static void test_attention_projections_replay(test_env & env) {
         ggml_backend_buffer_free(weights_buffer);
         ggml_free(weights_ctx);
     }
-    printf(
-        "test_attention_projections_replay PASSED: bitwise agreement with native operators across GDN and QSA shapes, "
-        "tail widths, row tiles and views.\n");
+    if (require_mmvq) {
+        uint64_t quant_after = 0, fused_after = 0;
+        uint32_t gdn_mask = 0, qsa_mask = 0;
+        TEST_ASSERT(env.get_region_mmvq_stats);
+        TEST_ASSERT(env.get_region_mmvq_stats(env.backend_gpu, &quant_after, &fused_after, &gdn_mask, &qsa_mask));
+        TEST_ASSERT(fused_after > fused_before);
+        TEST_ASSERT(quant_after - quant_before == fused_after - fused_before); // ONE quantization per four-projection region
+        TEST_ASSERT((gdn_mask & 7u) == 7u && (qsa_mask & 5u) == 5u); // Q5 and paired Q6, not a float fallback
+        TEST_ASSERT(exercised_growth);
+    }
+    printf("test_attention_projections_replay PASSED%s: native oracle, K tails, row tiles, views, changing inputs; "
+           "F32 path bitwise, MMVQ path bounded accumulation tolerance.\n",
+           growth_only ? " (scratch-growth fixture)" : require_mmvq ? " (MMVQ + fusion + replay)" : "");
 }
 
 static void test_multi_rope_norm_replay(test_env & env) {
@@ -3438,21 +3487,28 @@ int main(int argc, char ** argv) {
     const bool hc_combine_only            = argc == 2 && std::strcmp(argv[1], "--hc-combine-only") == 0;
     const bool hc_variants_only            = argc == 2 && std::strcmp(argv[1], "--hc-variants-only") == 0;
     const bool attention_projections_only = argc == 2 && std::strcmp(argv[1], "--attention-projections-only") == 0;
+    const bool attention_mmvq_only = argc == 2 && std::strcmp(argv[1], "--attention-mmvq-only") == 0;
     const bool attention_region_only      = argc == 2 && std::strcmp(argv[1], "--attention-region-only") == 0;
     if (argc != 1 && !transfer_only && !snapshot_only && !moe_only && !moe_output_only && !gdn_only &&
         !gdn_cache_only && !staged_router_only && !router_gate_only && !rope_only && !rows_only && !hc_fold_only && !hc_combine_only &&
         !hc_variants_only &&
-        !attention_projections_only && !attention_region_only) {
+        !attention_projections_only && !attention_mmvq_only && !attention_region_only) {
         std::fprintf(stderr,
                      "Usage: %s "
                      "[--transfer-only|--snapshot-only|--moe-only|--moe-output-only|--gdn-only|--gdn-cache-only|--"
                      "staged-router-only|--router-gate-only|--rope-only|--rows-only|--hc-fold-only|--hc-combine-only|--hc-variants-only|--attention-"
-                     "projections-only|--attention-region-only]\n",
+                     "projections-only|--attention-mmvq-only|--attention-region-only]\n",
                      argv[0]);
         return 2;
     }
     // Enable Vulkan command replay for testing.
     setenv("GGML_VK_CMD_REPLAY", "1", 1);
+    if (attention_mmvq_only) {
+        // Dedicated numerical regression, not a performance policy. Exercise
+        // all implemented quantized members, including Q6_K on RDNA.
+        unsetenv("GGML_VK_DISABLE_MMVQ");
+        setenv("GGML_VK_FORCE_MMVQ", "1", 1);
+    }
     // The paired-expert K=128 MoE down kernel stays opt-in via
     // GGML_VK_MOE_DOWN_K128=1 so ablation programs can disable it; the
     // fixture runs identically on the native path without the flag.
@@ -3518,6 +3574,15 @@ int main(int argc, char ** argv) {
     }
     if (hc_variants_only) {
         test_hc_variant_numerics(env);
+        return 0;
+    }
+    if (attention_mmvq_only) {
+        if (!env.get_region_mmvq_stats ||
+            !env.get_region_mmvq_stats(env.backend_gpu, nullptr, nullptr, nullptr, nullptr)) {
+            fprintf(stderr, "SKIP attention-mmvq: fused integer-dot pipelines unavailable (0 MMVQ tests ran)\n");
+            return 77;
+        }
+        test_attention_projections_replay(env, true);
         return 0;
     }
     if (attention_projections_only) {

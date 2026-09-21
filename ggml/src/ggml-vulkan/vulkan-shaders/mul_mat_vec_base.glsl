@@ -240,6 +240,47 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
         }
     }
     barrier();
+#if defined(TP5_RELAY_OUTPUT) || defined(TP5_WIRE_OUTPUT)
+    // Fold complete contiguous row tiles in one invocation. Per-row expert
+    // summation is unchanged; the communication epilogue becomes a vec4 store.
+    // No grid barrier, ready atomic, or extra dispatch is introduced.
+    if (gl_LocalInvocationID.x == 0u) {
+        for (uint tile = 0u; tile < num_rows; tile += 4u) {
+            vec4 values = vec4(0.0);
+            const uint count = min(4u, num_rows - tile);
+            for (uint j = 0u; j < count; ++j) {
+                const uint row = tile + j;
+                precise float folded = expert_outputs[0][row];
+                [[unroll]] for (uint expert = 1u; expert < 10u; ++expert) {
+                    folded = folded + expert_outputs[expert][row];
+                }
+                const float gate = 1.0 / (1.0 + exp(-shared_gate[0]));
+#ifdef MOE_FUSE_SHARED_DOWN
+                precise float shared_value = shared_down_outputs[row] * gate;
+#else
+                precise float shared_value = shared_down[first_row + row] * gate;
+#endif
+                precise float result = folded + shared_value;
+                values[j] = result;
+                // Only a recorded graph-liveness proof AND a route that does
+                // not need z_p permit omitting this store. Local-wire always
+                // retains the normal F32 result; LateBind always retains z_p.
+                if (tp5_keep_local_output(p.fusion_flags)) {
+                    data_d[first_row + row] = result;
+                }
+            }
+            if (count == 4u) tp5_write_wire4(first_row + tile, values);
+            else {
+                uint j = 0u;
+                if (count >= 2u) {
+                    tp5_write_wire2(first_row + tile, values.xy);
+                    j = 2u;
+                }
+                for (; j < count; ++j) tp5_write_wire(first_row + tile + j, values[j]);
+            }
+        }
+    }
+#else
     const uint row = gl_LocalInvocationID.x;
     if (row < num_rows) {
         precise float folded = expert_outputs[0][row];
@@ -251,11 +292,14 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
         precise float shared_value = shared_down[first_row + row] * gate;
 #        endif
         precise float result    = folded + shared_value;
-        data_d[first_row + row] = result;
+        if (tp5_keep_local_output(p.fusion_flags)) {
+            data_d[first_row + row] = result;
+        }
 #        if defined(TP5_WIRE_OUTPUT) || defined(TP5_RELAY_OUTPUT)
         tp5_write_wire(first_row + row, result);
 #        endif
     }
+#endif
 #    elif defined(HC_UP_FOLD)
     if (tid == 0) {
         precise float acc = 0.0;
@@ -305,11 +349,25 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
                 const float gate = shared_gate_value[j][n];
                 temp[j][n]       = gate / (1.0 + exp(-gate)) * temp[j][n];
 #        endif
-                data_d[mat_vec_d_col_offset(j, d_offset) + first_row + n] = D_TYPE(temp[j][n]);
-#        if defined(TP5_WIRE_OUTPUT) || defined(TP5_RELAY_OUTPUT)
-                tp5_write_wire(mat_vec_d_col_offset(j, d_offset) + first_row + n, temp[j][n]);
-#        endif
+                if (tp5_keep_local_output(p.fusion_flags)) {
+                    data_d[mat_vec_d_col_offset(j, d_offset) + first_row + n] = D_TYPE(temp[j][n]);
+                }
             }
+#if defined(TP5_RELAY_OUTPUT) || defined(TP5_WIRE_OUTPUT)
+            uint r = 0u;
+            for (; r + 4u <= num_rows; r += 4u) {
+                tp5_write_wire4(mat_vec_d_col_offset(j, d_offset) + first_row + r,
+                                vec4(temp[j][r], temp[j][r + 1u], temp[j][r + 2u], temp[j][r + 3u]));
+            }
+            if (r + 2u <= num_rows) {
+                tp5_write_wire2(mat_vec_d_col_offset(j, d_offset) + first_row + r,
+                                vec2(temp[j][r], temp[j][r + 1u]));
+                r += 2u;
+            }
+            for (; r < num_rows; ++r) {
+                tp5_write_wire(mat_vec_d_col_offset(j, d_offset) + first_row + r, temp[j][r]);
+            }
+#endif
         }
     }
 #    endif

@@ -1,0 +1,29 @@
+#version 450
+
+// Vectorized canonical TP5 F32 -> F16 pack.
+// Each lane converts four adjacent F32 values and stores one f16vec4.  The
+// scalar pack shader remains the fallback for odd/tail/alignment cases.
+
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer InBuf {
+    vec4 in_data[];
+};
+
+layout(std430, binding = 1) writeonly buffer OutBuf {
+    f16vec4 out_data[];
+};
+
+layout(push_constant) uniform Params {
+    uint n_vec4;
+} p;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    const uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    for (; idx < p.n_vec4; idx += stride) {
+        out_data[idx] = f16vec4(in_data[idx]);
+    }
+}
