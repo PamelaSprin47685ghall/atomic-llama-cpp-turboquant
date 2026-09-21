@@ -1005,6 +1005,7 @@ void process_shaders() {
     });
     string_to_spv("qwen4_gdn_segment_prep", "qwen4_gdn_segment_prep.comp", {});
     string_to_spv("qwen4_gdn_segment_delta", "qwen4_gdn_segment_delta.comp", {});
+    string_to_spv("qwen4_gdn_multistep_delta", "qwen4_gdn_multistep_delta.comp", {});
     string_to_spv("qwen4_gdn_segment_norm", "qwen4_gdn_segment_norm.comp", {});
     string_to_spv("qwen4_gdn_cached_prep", "qwen4_gdn_segment_prep.comp",
                   {
