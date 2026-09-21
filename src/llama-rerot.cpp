@@ -981,10 +981,17 @@ std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
     tagged.reserve(keys.size());
 
     {
-        std::unordered_set<uint32_t> physical_seen;
-        physical_seen.reserve(keys.size());
+        // Duplicate-key detection over a byte bitmap (key_index is bounded
+        // by the caller's key table): the unordered_set cost dominated the
+        // structural scan at production K (measured 1141 us vs 45 us for
+        // the bitmap at K=65536 on the dev machine). Semantics unchanged:
+        // first duplicate in scan order throws, same message.
+        std::vector<uint8_t> physical_seen;
         for (const auto & key : keys) {
-            if (!physical_seen.insert(key.key_index).second) {
+            if (key.key_index >= physical_seen.size()) {
+                physical_seen.resize(size_t(key.key_index) + 1, 0);
+            }
+            if (physical_seen[key.key_index]++) {
                 throw std::invalid_argument("RERoT key records contain a duplicate physical key");
             }
             if (key.storage_pos < 0) {
@@ -1042,16 +1049,20 @@ std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
         }
     }
 
-    // BASE arm ordering: storage, then physical index.
-    std::stable_sort(base.begin(), base.end(),
+    // BASE arm ordering: storage, then physical index. The comparator is a
+    // total order (key_index is unique after the dedup above), so plain
+    // std::sort reproduces the stable order exactly and skips the merge
+    // sort's allocation.
+    std::sort(base.begin(), base.end(),
         [](const llama_rerot_key_record * lhs, const llama_rerot_key_record * rhs) {
             if (lhs->storage_pos != rhs->storage_pos) {
                 return lhs->storage_pos < rhs->storage_pos;
             }
             return lhs->key_index < rhs->key_index;
         });
-    // TAGGED arm ordering: the oracle's tagged comparator.
-    std::stable_sort(tagged.begin(), tagged.end(), [](const tagged_key & lhs, const tagged_key & rhs) {
+    // TAGGED arm ordering: the oracle's tagged comparator. Total order as
+    // well (same unique-key_index tiebreak).
+    std::sort(tagged.begin(), tagged.end(), [](const tagged_key & lhs, const tagged_key & rhs) {
         if (lhs.rank != rhs.rank) {
             return lhs.rank < rhs.rank;
         }
@@ -1068,13 +1079,23 @@ std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
     // For each segment keep, in sorted order, only the rows that passed the
     // frontier/ownership gate above, plus per-row causal flags and an
     // ascending storage array for the per-query binary-search cut.
-    struct segment_row {
-        const llama_rerot_key_record * key = nullptr;
-    };
+    //
+    // Q2/Q4 structure pass extension (2026-09-22 third round): within one
+    // segment, effective = (qv - visible_prefix) + (s_i - i), where i is
+    // the emission index inside the segment. The deviation d_i = s_i - i
+    // is QUERY-INDEPENDENT, so each segment is stably ordered by d_i ONCE
+    // here; the per-query pass then only k-way merges the R sorted
+    // deviation lists (values shifted by the query's own constant) and
+    // never sorts O(V) rows again. Storage duplicates make d_i dip (MTP
+    // verify rows share storage); gaps make it jump; the stable order by
+    // (d_i, emission i) is exactly the order the oracle's stable_sort
+    // produces for those rows, so group contents and entry order are
+    // reproduced identically.
     struct segment {
         uint32_t rank = 0;
-        std::vector<segment_row> rows;     // frontier-passing rows, sorted order
-        std::vector<llama_pos> storage;    // parallel ascending storage array
+        std::vector<const llama_rerot_key_record *> rows; // d-sorted (see above)
+        std::vector<llama_pos> storage;  // parallel ascending storage array (emission order)
+        std::vector<int64_t> dev;        // d_i = storage[i] - i, parallel to rows
         bool causal = false;              // own-run segment: cut applies
     };
     std::vector<segment> segments;
@@ -1087,7 +1108,7 @@ std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
             bool causal = false;
             size_t j = i;
             while (j < tagged.size() && tagged[j].rank == rank) {
-                seg.rows.push_back({ tagged[j].key });
+                seg.rows.push_back(tagged[j].key);
                 seg.storage.push_back(tagged[j].key->storage_pos);
                 causal |= tagged[j].causal;
                 ++j;
@@ -1100,137 +1121,215 @@ std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
                 }
             }
             seg.causal = causal;
+            // Stable order by deviation d = s - i (i = emission index).
+            // ties keep emission order, mirroring the oracle's
+            // stable_sort over the same rows.
+            std::vector<uint32_t> order(seg.rows.size());
+            for (uint32_t k = 0; k < order.size(); ++k) {
+                order[k] = k;
+            }
+            std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+                const int64_t da = int64_t(seg.storage[a]) - int64_t(a);
+                const int64_t db = int64_t(seg.storage[b]) - int64_t(b);
+                if (da != db) {
+                    return da < db;
+                }
+                return a < b;
+            });
+            {
+                std::vector<const llama_rerot_key_record *> rows2(seg.rows.size());
+                std::vector<llama_pos> storage2(seg.rows.size());
+                std::vector<int64_t> dev2(seg.rows.size());
+                for (size_t k = 0; k < order.size(); ++k) {
+                    rows2[k] = seg.rows[order[k]];
+                    storage2[k] = seg.storage[order[k]];
+                    dev2[k] = int64_t(storage2[k]) - int64_t(order[k]);
+                }
+                seg.rows = std::move(rows2);
+                seg.storage = std::move(storage2);
+                seg.dev = std::move(dev2);
+            }
             segments.push_back(std::move(seg));
             i = j;
         }
     }
 
-    // BASE arm storage array (ascending) for its own causal cut.
+    // BASE arm storage array (ascending) for its own causal cut. Base rows
+    // are also deviation-ordered: their emission index inside the visible
+    // prefix is their array index (the cut is a prefix of the ascending
+    // array), so d_i = storage[i] - i over the FULL array is the right
+    // query-independent order only when the cut keeps indices aligned.
+    // The cut selects a PREFIX, so visible base row j (emission order)
+    // is base[j] with emission index j: d = storage[j] - j. Sort the
+    // full base array by (storage[j] - j) stably once; a prefix cut then
+    // selects a SUBSET of the d-sorted list whose relative order is the
+    // stable order by d. (Removing elements from a stably-sorted list
+    // keeps it stably sorted.)
     std::vector<llama_pos> base_storage;
     base_storage.reserve(base.size());
     for (const auto * k : base) {
         base_storage.push_back(k->storage_pos);
     }
+    std::vector<uint32_t> base_order(base.size());
+    for (uint32_t k = 0; k < base_order.size(); ++k) {
+        base_order[k] = k;
+    }
+    std::sort(base_order.begin(), base_order.end(), [&](uint32_t a, uint32_t b) {
+        const int64_t da = int64_t(base[a]->storage_pos) - int64_t(a);
+        const int64_t db = int64_t(base[b]->storage_pos) - int64_t(b);
+        if (da != db) {
+            return da < db;
+        }
+        return a < b;
+    });
+    std::vector<int64_t> base_dev(base.size());
+    for (size_t k = 0; k < base_order.size(); ++k) {
+        base_dev[k] = int64_t(base[base_order[k]]->storage_pos) - int64_t(base_order[k]);
+    }
 
     // ---- Numeric pass: per query, causal cuts + virtualization + grouping. ----
-    struct visible_row {
-        const llama_rerot_key_record * key = nullptr;
-        llama_pos virtual_pos = 0;
-    };
-    std::vector<visible_row> visible;
-    visible.reserve(base.size() + tagged.size());
-
-    struct grouped_row {
-        const llama_rerot_key_record * key = nullptr;
-        int64_t effective = 0;
-    };
-    std::vector<grouped_row> grouped;
-    grouped.reserve(base.size() + tagged.size());
-
+    // Q2/Q4 numeric channel (2026-09-22 third round): no O(V) visible
+    // rebuild, no O(V) own-row pointer scan, no O(V log V) per-query sort.
+    // Per query:
+    //   - causal cuts are binary searches (unchanged);
+    //   - the own-row virtual index is segment-prefix arithmetic (visible
+    //     rows before the query row = base cut + earlier segments' cuts +
+    //     the local emission offset);
+    //   - grouping is a k-way merge over the R+1 deviation-sorted lists
+    //     (base prefix subset + per-rank segments), each already in the
+    //     oracle's stable order. For list L (visible-before count B) a row
+    //     with deviation d has effective = qv + d - B; the merged distinct
+    //     values are the group boundaries, and entries inside a group keep
+    //     their list order (base first, then rank order) — exactly the
+    //     oracle's stable_sort output order.
     std::vector<llama_rerot_query_layout> result;
     result.reserve(query_storage_pos.size());
 
-    for (const llama_pos q_pos : query_storage_pos) {
-        visible.clear();
+    const size_t n_lists = segments.size() + 1; // +1 for the base arm
+    std::vector<size_t> cut_of(segments.size(), 0);  // per-segment cut (rows)
+    std::vector<uint64_t> vis_before(n_lists, 0);    // visible rows before each list
+    std::vector<uint64_t> vis_count(n_lists, 0);     // visible rows in each list
+    std::vector<size_t> merge_pos(n_lists, 0);       // k-way merge cursors
 
-        // BASE arm: storage <= q_pos is a prefix of the ascending array.
+    for (const llama_pos q_pos : query_storage_pos) {
+        // Causal cuts.
+        size_t base_cut = 0;
         {
             const auto cut = std::upper_bound(base_storage.begin(), base_storage.end(), q_pos);
-            const size_t n = size_t(cut - base_storage.begin());
-            for (size_t k = 0; k < n; ++k) {
-                visible.push_back({ base[k], 0 });
-            }
+            base_cut = size_t(cut - base_storage.begin());
         }
-        // TAGGED arm: per-segment emission in rank order; own (causal)
-        // segments cut by storage <= q_pos, foreign segments pass whole.
-        for (const auto & seg : segments) {
+        for (size_t s = 0; s < segments.size(); ++s) {
+            const auto & seg = segments[s];
             if (!seg.causal) {
-                for (const auto & row : seg.rows) {
-                    visible.push_back({ row.key, 0 });
-                }
+                cut_of[s] = seg.rows.size();
                 continue;
             }
             const auto cut = std::upper_bound(seg.storage.begin(), seg.storage.end(), q_pos);
-            const size_t n = size_t(cut - seg.storage.begin());
-            for (size_t k = 0; k < n; ++k) {
-                visible.push_back({ seg.rows[k].key, 0 });
-            }
+            cut_of[s] = size_t(cut - seg.storage.begin());
         }
 
-        // Dense virtualization: BASE rows first, then TAGGED rows — the
-        // oracle's base-then-tagged numbering over the same visible set.
-        llama_pos virtual_pos = 0;
-        for (auto & v : visible) {
-            v.virtual_pos = virtual_pos++;
+        // Visible counts and prefixes (base arm is list 0).
+        uint64_t total = base_cut;
+        vis_count[0] = uint64_t(base_cut);
+        vis_before[0] = 0;
+        for (size_t s = 0; s < segments.size(); ++s) {
+            vis_before[s + 1] = total;
+            vis_count[s + 1] = uint64_t(cut_of[s]);
+            total += vis_count[s + 1];
         }
-        llama_pos query_virtual_pos = virtual_pos;
-        // Own-row lookup: the oracle scans its tagged list and keeps the
-        // LAST (node, query_run, owned, storage == q) match. The query
-        // run's segment holds exactly those rows; take the last equal-
-        // storage row in it.
-        for (const auto & seg : segments) {
-            if (seg.rank != run_rank.at(reader.query_run)) {
-                continue;
-            }
-            const auto it = std::lower_bound(seg.storage.begin(), seg.storage.end(), q_pos);
-            if (it != seg.storage.end() && *it == q_pos) {
-                size_t local = size_t(it - seg.storage.begin());
-                while (local + 1 < seg.storage.size() && seg.storage[local + 1] == q_pos) {
-                    ++local;
+
+        // Own-row lookup (the oracle's LAST-match semantics): the query
+        // run's segment holds every (node, query_run, owned) row; the
+        // last row with storage == q_pos in EMISSION order wins. The
+        // ascending storage array order IS the emission order inside one
+        // segment (the tagged comparator sorts by (rank, storage,
+        // frontier, idx)), so the last equal-storage entry of the array
+        // is the last emission-order match.
+        llama_pos query_virtual_pos = llama_pos(total);
+        {
+            const uint32_t want_rank = run_rank.at(reader.query_run);
+            for (size_t s = 0; s < segments.size(); ++s) {
+                if (segments[s].rank != want_rank) {
+                    continue;
                 }
-                // Virtual index: visible rows before this segment's cut,
-                // plus the local offset. All earlier rows in this segment
-                // with storage <= q_pos are visible (causal prefix).
-                llama_pos before = 0;
-                for (const auto & earlier : visible) {
-                    if (earlier.key == seg.rows[local].key) {
-                        break;
+                const auto & st = segments[s].storage;
+                const auto it = std::lower_bound(st.begin(), st.end(), q_pos);
+                if (it != st.end() && *it == q_pos) {
+                    size_t local = size_t(it - st.begin());
+                    while (local + 1 < st.size() && st[local + 1] == q_pos) {
+                        ++local;
                     }
-                    ++before;
+                    query_virtual_pos = llama_pos(vis_before[s + 1] + uint64_t(local));
                 }
-                query_virtual_pos = before;
+                break; // only the query run's segment can match
             }
-            break; // only the query run's segment can match
         }
         if (query_virtual_pos > std::numeric_limits<llama_pos>::max()) {
             throw std::overflow_error("RERoT query virtual position overflow");
         }
 
-        // Effective positions and grouping: the oracle groups by
-        // std::map<effective>; one stable sort by effective over the
-        // emission-ordered visible rows reproduces the identical group
-        // sequence and per-group row order.
-        grouped.clear();
-        for (const auto & v : visible) {
-            const int64_t effective = int64_t(query_virtual_pos) +
-                                      int64_t(v.key->storage_pos) -
-                                      int64_t(v.virtual_pos);
-            if (effective < 0 || effective > std::numeric_limits<llama_pos>::max()) {
-                throw std::overflow_error("RERoT effective query position is outside llama_pos range");
-            }
-            grouped.push_back({ v.key, effective });
-        }
-        std::stable_sort(grouped.begin(), grouped.end(),
-            [](const grouped_row & lhs, const grouped_row & rhs) {
-                return lhs.effective < rhs.effective;
-            });
-
+        // K-way merge over deviation-sorted lists.
         llama_rerot_query_layout layout;
         layout.query_virtual_pos = query_virtual_pos;
-        layout.groups.reserve(grouped.size());
-        layout.entries.reserve(grouped.size());
-        for (size_t i = 0; i < grouped.size();) {
-            const int64_t eff = grouped[i].effective;
-            size_t j = i;
-            while (j < grouped.size() && grouped[j].effective == eff) {
-                ++j;
+        layout.entries.reserve(size_t(total));
+        for (auto & p : merge_pos) {
+            p = 0;
+        }
+        const int64_t qv = int64_t(query_virtual_pos);
+        while (true) {
+            // Advance the base cursor past cut rows (the cut selects a
+            // subset of the d-sorted full array).
+            while (merge_pos[0] < base_order.size() && base_order[merge_pos[0]] >= base_cut) {
+                ++merge_pos[0];
             }
+            int64_t best = std::numeric_limits<int64_t>::max();
+            bool any = false;
+            if (merge_pos[0] < base_order.size()) {
+                best = qv + base_dev[merge_pos[0]] - int64_t(vis_before[0]);
+                any = true;
+            }
+            for (size_t s = 0; s < segments.size(); ++s) {
+                if (merge_pos[s + 1] >= cut_of[s]) {
+                    continue;
+                }
+                const int64_t v = qv + segments[s].dev[merge_pos[s + 1]] - int64_t(vis_before[s + 1]);
+                if (!any || v < best) {
+                    best = v;
+                    any = true;
+                }
+            }
+            if (!any) {
+                break;
+            }
+            // Emit one group: every list head whose effective == best.
             const uint32_t group_index = uint32_t(layout.groups.size());
-            layout.groups.push_back({ 0, llama_pos(eff) });
-            for (size_t k = i; k < j; ++k) {
-                layout.entries.push_back({ grouped[k].key->key_index, group_index });
+            bool emitted = false;
+            while (merge_pos[0] < base_order.size() && base_order[merge_pos[0]] < base_cut &&
+                   qv + base_dev[merge_pos[0]] - int64_t(vis_before[0]) == best) {
+                const uint32_t emi = base_order[merge_pos[0]];
+                layout.entries.push_back({ base[emi]->key_index, group_index });
+                ++merge_pos[0];
+                emitted = true;
             }
-            i = j;
+            for (size_t s = 0; s < segments.size(); ++s) {
+                const auto & seg = segments[s];
+                while (merge_pos[s + 1] < cut_of[s] &&
+                       qv + seg.dev[merge_pos[s + 1]] - int64_t(vis_before[s + 1]) == best) {
+                    layout.entries.push_back({ seg.rows[merge_pos[s + 1]]->key_index, group_index });
+                    ++merge_pos[s + 1];
+                    emitted = true;
+                }
+            }
+            if (!emitted) {
+                // Defensive: each list is sorted by effective, so a head
+                // equal to the minimum must exist whenever best was taken
+                // from a list head.
+                throw std::runtime_error("RERoT shared layout: k-way merge lost a group head");
+            }
+            if (best < 0 || best > std::numeric_limits<llama_pos>::max()) {
+                throw std::overflow_error("RERoT effective query position is outside llama_pos range");
+            }
+            layout.groups.push_back({ 0, llama_pos(best) });
         }
         result.push_back(std::move(layout));
     }

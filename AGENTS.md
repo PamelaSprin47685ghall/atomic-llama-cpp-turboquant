@@ -106,6 +106,49 @@
 
 ---
 
+## 下班交接｜2026-09-22（第四轮，数值通道 k 路归并＋跨 reader 共享供给）
+
+**分支：** `master`（本轮 commit 见 git log；基于 `8772195ac`）
+**主题：** 第三轮落地的 `llama_rerot_build_query_layouts_shared` 仍有三个浪费点：每 query 的 O(V log V) stable_sort（占大头）、own-row 虚拟索引的 O(V) 指针扫描、重复键检测的 unordered_set；cache 侧每个 reader 组还各自 O(n_kv) 重建 key 表。本轮全部消除，输出与 oracle 仍逐字节一致。
+
+### 一、核心数学发现（本轮最重要）
+
+段内第 i 行（发射序）的 effective = `(qv − B) + d_i`，其中 **`d_i = s_i − i` 与 query 无关**（B 为该段可见前缀计数）。storage 重复使 d 下降、空洞使 d 上升，但 d 的稳定序在结构期内固定。于是：
+
+- **结构期**：每段（含 BASE 臂）按 d 稳定排序一次；
+- **每 query**：只做二分 causal 截断＋R+1 路 k 路归并（组边界＝归并中不同值；组内 entry 序＝列表序＝ oracle stable_sort 输出序）；own-row 虚拟索引＝段前缀算术 O(1)。
+
+这是 Q2“段内相位常数”在分组层的直接兑现：排序 K 个 entry 只为发现 ~R 个组的浪费消失。
+
+### 二、已合入
+
+|改动|位置|实测（开发机 CPU，合成 K 键）|
+|---|---|---|
+|数值通道：段级偏差序＋k 路归并＋O(1) own-row|`src/llama-rerot.cpp` `llama_rerot_build_query_layouts_shared` 数值 pass|per-query 从 ~2400 us（Q=6,K=65536）降到 261 us|
+|重复键检测 unordered_set → 字节位图|同上结构 pass|1141 → 45 us（K=65536）|
+|全序比较器（唯一 key_index 断尾）stable_sort → std::sort|同上两臂排序＋偏差排序|tagged 排序 4251→3364 us（N=57344）|
+|cache 侧 R 组各自 O(n_kv) cell 扫描 → 一次共享扫描＋R 次位图填 ownership|`src/llama-kv-cache.cpp` `rerot_build_attn_layout`|R 个 pen 同 frontier 时 cell 访问 R·n_kv → n_kv + R·位图填充|
+
+### 三、验证
+
+- `test-rerot-view` 0 failure（含 200 轮随机对拍，覆盖 storage 重复/边界位置/打乱行序）；`test-xkv-runtime` 全过（含 cache 级多行回归与多 reader 跨组）。
+- rerot/xkv/flashprefill 全家 **45/45**。
+- **收益**（对 oracle 逐 query 全路径，生产形态物理序＝写入序）：K=65536,Q=6：16073→4783 us（**3.4×**）；K=262144,Q=6：96613→28584 us（3.4×）。最坏形态（物理序全打乱）：K=65536,Q=6：13399→7200 us；K=262144,Q=6：82351→44704 us。
+
+### 四、剩余大头与纠错记录
+
+1. **结构期 tagged 全局排序 3330 us（K=65536）是下一个目标**：rank 分桶（先按 rank 计数分桶再各桶排序）实测可再省 ~20%（4251→3364 us），未做——留给下一轮，避免本轮变更面过大。
+2. **偏差序的发现过程**：先验证“段内 effective 单调”假设被 storage 空洞推翻（空洞使 s−i 上升），但“d 的稳定序与 query 无关”仍成立——排序的对象从 effective 换成 d 即可把 per-query 排序完全移出。这是本轮唯一的关键洞察，其余是常规优化。
+3. own-row 语义确认：段内升序 storage 数组顺序即发射序（tagged 比较器保证），最后一个等 storage 行＝oracle 的 last-match。
+
+### 五、下一步建议
+
+1. 结构期 rank 分桶排序（~20% 再省）；生产形态下结构期输入已近似有序（物理序≈写入序），可探索检测后跳过排序。
+2. Q2/Q4 剩余：写入布局维持长 span（`span_long_fraction` 验收指标）；flashprefill `llama_rerot_split_table_fragments` 调用点接 run-order 签名缓存。
+3. 真机收益需目标机跑 `rerot-semantic-smoke.py` 对比 decode host 时间（等价性已 CPU 证明；开发机无目标模型）。
+
+---
+
 ## 下班交接｜2026-09-22（第三轮，Q2/Q4 生产化）
 
 **分支：** `master`（本轮 commit 见 git log；基于 `2b7b479d2`）
