@@ -17,8 +17,8 @@ LLAMA_BIN="${LLAMA_BIN:-$DEFAULT_BIN}"
 MODEL="${MODEL:-/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PQ2_0.gguf}"
 
 # Tuned parameters
-# -c: context window (default 32768, can go up to 262144)
-CTX="${CTX:-32768}"
+# -c: context window (262144)
+CTX="${CTX:-262144}"
 # -ngl: offload all layers to GPU
 NGL="${NGL:-99}"
 # -b / -ub: physical and logical batch size tuned for Vulkan MMQ / FWHT prefill saturation
@@ -26,6 +26,9 @@ BATCH="${BATCH:-2048}"
 UBATCH="${UBATCH:-512}"
 # Flash attention
 FA="${FA:-on}"
+# -kv auto: auto-fit unified KV cache
+# If KV is set, pass -kv "$KV" (e.g. KV="auto")
+KV="${KV:-}"
 
 # Model sampling recommendations (Thinking mode: temp 1.0, top_p 0.95, top_k 20)
 TEMP="${TEMP:-1.0}"
@@ -57,6 +60,7 @@ exec "$LLAMA_BIN" \
     -b "$BATCH" \
     -ub "$UBATCH" \
     -fa "$FA" \
+    ${KV:+-kv "$KV"} \
     --temp "$TEMP" \
     --top-p "$TOP_P" \
     --top-k "$TOP_K" \

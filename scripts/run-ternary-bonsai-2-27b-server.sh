@@ -18,10 +18,11 @@ MODEL="${MODEL:-/home/kunweiz/models/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-
 
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8080}"
-CTX="${CTX:-32768}"
+CTX="${CTX:-262144}"
 NGL="${NGL:-99}"
 BATCH="${BATCH:-2048}"
 UBATCH="${UBATCH:-512}"
+KV="${KV:-}"
 FA="${FA:-on}"
 PARALLEL="${PARALLEL:-1}"
 
@@ -49,6 +50,7 @@ exec "$SERVER" \
     -ngl "$NGL" \
     -b "$BATCH" \
     -ub "$UBATCH" \
+    ${KV:+-kv "$KV"} \
     -fa "$FA" \
     --parallel "$PARALLEL" \
     -np "$PARALLEL" \

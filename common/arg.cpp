@@ -1743,7 +1743,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_SIZE"));
     add_opt(common_arg(
-        {"--kv-size", "--total-kv"}, "N|auto",
+        {"--kv-size", "--total-kv", "-kv"}, "N|auto",
         string_format("unified KV cache capacity in tokens (default: %u, 0 = ctx-size, auto = use all available device memory)", params.n_ctx_kv),
         [](common_params & params, const std::string & value) {
             if (value == "auto") {
@@ -1765,7 +1765,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.kv_unified = true;
             }
         }
-    ).set_env("LLAMA_ARG_KV_SIZE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_env("LLAMA_ARG_KV_SIZE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--triattention"},
         "enable TriAttention KV cache eviction (requires --triattention-stats)",

@@ -2614,15 +2614,17 @@ common_params_fit_status common_fit_kv_cache(
     }
     const uint32_t n_ctx_seq = cparams->n_ctx;
     if (n_ctx_seq > n_max) {
-        LOG_WRN("%s: per-sequence context of %u tokens exceeds the maximum aligned KV capacity\n", __func__, n_ctx_seq);
+        LOG_WRN("%s: requested per-sequence context of %u exceeds maximum supported (%u)\n", __func__, n_ctx_seq, n_max);
         return COMMON_PARAMS_FIT_STATUS_FAILURE;
     }
 
-    // When TriAttention is enabled, the physical KV only needs to cover the
+    // When auto KV capacity is requested or TriAttention is enabled, the physical KV only needs to cover the
     // configured residency floor plus operational overhead (recent window + ubatch),
     // not the full per-sequence context. This allows physical KV << logical context.
     uint32_t n_min;
-    if (cparams->triattention) {
+    if (cparams->n_ctx_kv == 0) {
+        n_min = std::max<uint32_t>(n_align, (uint32_t) (((uint64_t) n_ctx_seq + n_align - 1) / n_align * n_align));
+    } else if (cparams->triattention) {
         const uint32_t tri_floor = (uint32_t) std::ceil((double) n_ctx_seq * cparams->triattention_ratio);
         // operational_floor = recent_window(128) + n_ubatch, aligned
         const uint32_t op_floor = cparams->n_ubatch + 128;
