@@ -2,6 +2,7 @@
 #include "../common/speculative.h"
 #include "../src/llama-predefined-hidden.h"
 #include "../src/llama-context.h"
+#include "../src/llama-graph.h"
 
 #include <cstdio>
 #include <stdexcept>
@@ -605,6 +606,166 @@ static void test_predefined_hidden_witness_sync_avoidance() {
     CHECK(avoided_count == 3);
 }
 
+// Sequential end-to-end invariant test for MTP single maximal definition across repeated 1->4->1->2 cycles.
+// Verifies:
+// 1. allow_reuse holds unconditionally at every step under fixed capacity (capacity_rows=4) without reallocation.
+// 2. common_mtp_workspace internal storage pointers and capacity bytes remain strictly invariant (no realloc).
+// 3. Active tokens & output semantics: draft step has active_tokens=1, active_outputs=1; catchup steps have active_outputs=0.
+// 4. commit_row accepts strictly within effective committed prefix and rejects all unaccepted/out-of-bound rows.
+// 5. Negative boundary invariants (capacity mismatch, unaccepted row access, buffer bounds).
+static void test_mtp_single_maximal_definition_sequence_invariants() {
+    const int mtp_token_seq[] = {1, 4, 1, 2, 1, 4, 1, 2};
+    constexpr size_t total_steps = sizeof(mtp_token_seq) / sizeof(mtp_token_seq[0]);
+    constexpr uint32_t capacity_rows = 4;
+    constexpr uint32_t capacity_outputs = 4;
+    constexpr uint32_t hidden_width = 128;
+
+    // 1. Baseline predefined MTP graph definition (Single Maximal Graph Definition)
+    llm_graph_params base_def{};
+    base_def.gtype = LLM_GRAPH_TYPE_DECODER_MTP;
+    base_def.predefined_enabled = true;
+    base_def.predefined_capacity_rows = capacity_rows;
+    base_def.predefined_capacity_outputs = capacity_outputs;
+    base_def.predefined_frame.version = GGML_PREDEFINED_ABI_VERSION;
+    base_def.predefined_frame.phase = GGML_PREDEFINED_DRAFT;
+    base_def.predefined_frame.active_tokens = 1;
+    base_def.predefined_frame.active_outputs = 1;
+    base_def.ubatch.n_tokens = 1;
+    base_def.ubatch.n_seqs = 1;
+    base_def.ubatch.n_seqs_unq = 1;
+    base_def.ubatch.n_seq_tokens = 1;
+    base_def.n_outputs = 1;
+
+    // Negative check on base definition: capacity mismatch MUST reject reuse
+    {
+        llm_graph_params bad_cap = base_def;
+        bad_cap.predefined_capacity_rows = 8;
+        bad_cap.predefined_capacity_outputs = 8;
+        CHECK(!base_def.allow_reuse(bad_cap));
+        CHECK(!bad_cap.allow_reuse(base_def));
+    }
+
+    // 2. Initialize host MTP workspace once with fixed capacity (capacity_rows = 4, width = 128)
+    common_mtp_workspace workspace(1, capacity_rows, hidden_width, /*host_hidden=*/true);
+    const float * const initial_pending_ptr = workspace.pending(0);
+    const size_t initial_storage_bytes = workspace.hidden_storage_bytes();
+    const uint32_t initial_capacity = workspace.capacity();
+    CHECK(initial_pending_ptr != nullptr);
+    CHECK(initial_storage_bytes > 0);
+    CHECK(initial_capacity == capacity_rows);
+
+    std::vector<float> verified_hidden(capacity_rows * hidden_width, 1.0f);
+    const llama_token mock_tokens[capacity_rows]   = {1001, 1002, 1003, 1004};
+    const llama_pos   mock_positions[capacity_rows] = {10, 11, 12, 13};
+
+    llm_graph_params prev_step_params = base_def;
+    int phase_resets = 0;
+    int last_phase = -1;
+
+    // 3. Drive 1 -> 4 -> 1 -> 2 -> 1 -> 4 -> 1 -> 2 sequence sequentially in a single uninterrupted execution
+    for (size_t step = 0; step < total_steps; ++step) {
+        const int n_tokens = mtp_token_seq[step];
+        const bool is_draft = (n_tokens == 1);
+        const uint32_t active_outputs = is_draft ? 1 : 0;
+        const enum ggml_predefined_phase phase = is_draft ? GGML_PREDEFINED_DRAFT : GGML_PREDEFINED_CATCHUP;
+
+        // (a) Construct step graph params
+        llm_graph_params step_params{};
+        step_params.gtype = LLM_GRAPH_TYPE_DECODER_MTP;
+        step_params.predefined_enabled = true;
+        step_params.predefined_capacity_rows = capacity_rows;
+        step_params.predefined_capacity_outputs = capacity_outputs;
+        step_params.predefined_frame.version = GGML_PREDEFINED_ABI_VERSION;
+        step_params.predefined_frame.phase = phase;
+        step_params.predefined_frame.active_tokens = n_tokens;
+        step_params.predefined_frame.active_outputs = active_outputs;
+        step_params.ubatch.n_tokens = n_tokens;
+        step_params.ubatch.n_seqs = 1;
+        step_params.ubatch.n_seqs_unq = 1;
+        step_params.ubatch.n_seq_tokens = n_tokens;
+        step_params.n_outputs = active_outputs;
+
+        // Invariant: allow_reuse holds against base definition and against immediately preceding step
+        CHECK(base_def.allow_reuse(step_params));
+        CHECK(step_params.allow_reuse(base_def));
+        CHECK(prev_step_params.allow_reuse(step_params));
+        CHECK(step_params.allow_reuse(prev_step_params));
+
+        // Invariant: execution phase remains stably 0 without oscillation or buffer resets
+        const int exec_phase = llama_context::ubatch_execution_phase(
+            LLM_GRAPH_TYPE_DECODER_MTP,
+            /*has_predefined_capacity=*/true,
+            capacity_rows,
+            n_tokens,
+            /*n_seqs=*/1);
+        CHECK(exec_phase == 0);
+        if (exec_phase != last_phase) {
+            if (last_phase >= 0) {
+                phase_resets++;
+            }
+            last_phase = exec_phase;
+        }
+
+        // (b) Drive MTP workspace with step input
+        for (uint32_t i = 0; i < uint32_t(n_tokens) * hidden_width; ++i) {
+            verified_hidden[i] = float(step * 1000 + i);
+        }
+        CHECK(workspace.begin(n_tokens, verified_hidden.data(), mock_tokens, mock_positions));
+        CHECK(workspace.sequence(0, 0, n_tokens, /*staged=*/true, /*deferred=*/true));
+
+        // Invariant: workspace internal storage address and capacity bytes never realloc
+        CHECK(workspace.pending(0) == initial_pending_ptr);
+        CHECK(workspace.hidden_storage_bytes() == initial_storage_bytes);
+        CHECK(workspace.capacity() == initial_capacity);
+
+        // (c) Active row & output semantics verification
+        if (is_draft) {
+            CHECK(step_params.predefined_frame.active_tokens == 1);
+            CHECK(step_params.predefined_frame.active_outputs == 1);
+        } else {
+            CHECK(step_params.predefined_frame.active_tokens == uint32_t(n_tokens));
+            CHECK(step_params.predefined_frame.active_outputs == 0);
+        }
+
+        // (d) Simulate acceptance & verify commit_row effective boundary
+        // For draft (n_tokens=1), 0 candidates accepted -> 1 committed (the seed/sampled row)
+        // For catch-up (n_tokens > 1), accept min(1, n_tokens-1) -> committed = accepted + 1
+        const uint32_t accepted_candidates = is_draft ? 0 : std::min<uint32_t>(1, n_tokens - 1);
+        CHECK(workspace.accept(0, accepted_candidates));
+
+        const uint32_t committed = workspace.commit_rows(0);
+        CHECK(committed == accepted_candidates + 1);
+        CHECK(committed <= uint32_t(n_tokens));
+
+        // Valid committed prefix must be accessible with correct metadata
+        llama_token out_tok = -1;
+        llama_pos   out_pos = -1;
+        const float * out_h = nullptr;
+        for (uint32_t r = 0; r < committed; ++r) {
+            CHECK(workspace.commit_row(0, r, out_tok, out_pos, out_h));
+            CHECK(out_tok == mock_tokens[r]);
+            CHECK(out_pos == mock_positions[r]);
+            CHECK(out_h != nullptr);
+        }
+
+        // All unaccepted rows in [committed, n_tokens) and out-of-capacity rows must be strictly rejected
+        for (uint32_t r = committed; r < capacity_rows + 2; ++r) {
+            CHECK(!workspace.commit_row(0, r, out_tok, out_pos, out_h));
+        }
+
+        workspace.clear_staged();
+        prev_step_params = step_params;
+    }
+
+    CHECK(phase_resets == 0);
+
+    // 4. Invariant preservation after complete 8-step sequence and reset
+    workspace.reset();
+    CHECK(workspace.pending(0) == initial_pending_ptr);
+    CHECK(workspace.hidden_storage_bytes() == initial_storage_bytes);
+    CHECK(workspace.capacity() == initial_capacity);
+}
+
 int main() {
     try {
         accepted_target_hidden_is_not_draft_hidden();
@@ -616,6 +777,7 @@ int main() {
         test_mtp_cycle_ledger_accounting();
         test_mtp_evidence_surface_contracts();
         test_predefined_hidden_witness_sync_avoidance();
+        test_mtp_single_maximal_definition_sequence_invariants();
     } catch (const std::exception & e) {
         std::fprintf(stderr, "%s\n", e.what());
         return 1;
