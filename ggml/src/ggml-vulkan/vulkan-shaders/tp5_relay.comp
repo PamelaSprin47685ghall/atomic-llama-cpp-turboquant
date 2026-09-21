@@ -4,14 +4,11 @@
 //
 // Hardware experimental path:
 // - Direct coherent reads from VRAM inbox written via CPU posted writes.
-// - Reuses TIMELINE pre-recorded entire stage chain and STAR GPU->host BDA push.
+// - Reuses the pre-recorded stage chain with ordinary descriptor bindings.
 // - Note on visibility: This is an experimental path. Coherent/volatile qualifiers
 //   alone do NOT establish portable host-device synchronization without proper
 //   domain barriers and cache flushes/invalidations. Cache bypass / L2 residency
 //   behavior is GPU- and driver-dependent and not guaranteed across architectures.
-
-#extension GL_EXT_buffer_reference : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
 layout(local_size_x = 64) in;
 
@@ -34,26 +31,18 @@ layout(std430, binding = 2) coherent volatile buffer ControlBuffer {
     uint control[];
 };
 
-// BDA buffer reference for host status array:
-// word0: upload seq (written by existing push shader)
+// Bind 3: coherent host-imported status array:
+// word0: upload seq (written by the descriptor-pack publish fill)
 // word1: GPU entered seq
 // word2: GPU error stage
 // word3: GPU consumed seq
 // word[3 + seq]: completed wait's unsuccessful polling iterations
-layout(buffer_reference, std430, buffer_reference_align = 4) coherent buffer HostStatusBuf {
+layout(std430, binding = 3) coherent buffer HostStatusBuf {
     uint status_words[];
-};
+} host_status;
 
-// Push constants: exactly 32 bytes (8 x 4 bytes)
-// uint64_t status_bda (8 bytes, offset 0)
-// uint n_elems        (4 bytes, offset 8)
-// uint seq            (4 bytes, offset 12)
-// uint rank           (4 bytes, offset 16)
-// uint spin_max       (4 bytes, offset 20)
-// uint mode           (4 bytes, offset 24)
-// uint reserved       (4 bytes, offset 28)
+// Push constants: exactly 24 bytes (6 x 4 bytes)
 layout(push_constant) uniform Params {
-    uint64_t status_bda;
     uint n_elems;
     uint seq;
     uint rank;
@@ -90,11 +79,11 @@ void main() {
                 if (control[1] != 0u && control[2] == 0u) {
                     control[2] = p.seq; // Set sticky first error on abort
                 }
-                HostStatusBuf(p.status_bda).status_words[2] = control[2];
+                host_status.status_words[2] = control[2];
                 s_ready = false;
             } else {
-                // Report entered seq via BDA and memoryBarrierBuffer before waiting
-                HostStatusBuf(p.status_bda).status_words[1] = p.seq;
+                // Report entered seq before waiting.
+                host_status.status_words[1] = p.seq;
                 memoryBarrierBuffer();
 
                 // Finite spin wait
@@ -104,7 +93,7 @@ void main() {
                         if (control[2] == 0u) {
                             control[2] = p.seq;
                         }
-                        HostStatusBuf(p.status_bda).status_words[2] = p.seq;
+                        host_status.status_words[2] = p.seq;
                         s_ready = false;
                         break;
                     }
@@ -112,7 +101,7 @@ void main() {
                     // Ready succeeds iff inbox[0] == seq (no GPU writes inbox[0])
                     if (inbox[0] == p.seq) {
                         s_ready = true;
-                        HostStatusBuf(p.status_bda).status_words[3u + p.seq] = spin;
+                        host_status.status_words[3u + p.seq] = spin;
                         break;
                     }
                 }
@@ -122,7 +111,7 @@ void main() {
                     if (control[2] == 0u) {
                         control[2] = p.seq; // Sticky first error only
                     }
-                    HostStatusBuf(p.status_bda).status_words[2] = p.seq;
+                    host_status.status_words[2] = p.seq;
                 }
             }
         }
@@ -149,7 +138,7 @@ void main() {
         barrier();
 
         if (lane == 0u) {
-            HostStatusBuf(p.status_bda).status_words[3] = p.seq;
+            host_status.status_words[3] = p.seq;
         }
     }
 }

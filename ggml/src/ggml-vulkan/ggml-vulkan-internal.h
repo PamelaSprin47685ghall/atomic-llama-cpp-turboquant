@@ -72,12 +72,19 @@ uint64_t ggml_vk_tp5_get_tensor_bda(struct ggml_tensor * t);
 static constexpr size_t VK_TP5_RELAY_ROUTE_MAX = 128;
 static constexpr size_t VK_TP5_RELAY_ROUTE_STRIDE = 256;
 struct vk_tp5_relay_route_entry {
-    uint64_t payload_bda = 0;
-    uint32_t ready       = 0;
-    uint32_t reserved    = 0;
+    uint32_t bank     = 0;
+    uint32_t ready    = 0;
+    uint32_t epoch    = 0;
+    uint32_t reserved = 0;
 };
 static_assert(sizeof(vk_tp5_relay_route_entry) == 16);
 static_assert(VK_TP5_RELAY_ROUTE_STRIDE % sizeof(vk_tp5_relay_route_entry) == 0);
+
+struct vk_tp5_relay_payload_binding {
+    struct VkBuffer_T * bank[2] = {nullptr, nullptr};
+    uint64_t            bytes[2] = {0, 0};
+    uint64_t            generation = 0;
+};
 
 // Configure the next graph's terminal producer, without recording or waiting.
 // A packed companion is available only after actual recording or validated
@@ -85,6 +92,10 @@ static_assert(VK_TP5_RELAY_ROUTE_STRIDE % sizeof(vk_tp5_relay_route_entry) == 0)
 void ggml_vk_tp5_set_wire_output(ggml_backend_t backend, struct ggml_tensor * tensor,
                                  bool compute_consumer = false, size_t relay_stage = SIZE_MAX,
                                  bool relay_f32 = false);
+// Mark one replay graph as eligible to publish its leading HC consumer recipe
+// for Exact LateBind. This is deliberately independent of producer-wire: the
+// legacy RELAY P1 path must be able to keep its original producer unchanged.
+void ggml_vk_tp5_set_latebind_capture(ggml_backend_t backend, const struct ggml_cgraph * graph, bool enabled);
 bool ggml_vk_tp5_take_wire_output(ggml_backend_t       backend,
                                   struct ggml_tensor * tensor,
                                   struct VkBuffer_T ** buf,
@@ -95,8 +106,10 @@ bool ggml_vk_tp5_take_wire_output(ggml_backend_t       backend,
                                   size_t               relay_stage = SIZE_MAX,
                                   size_t *             relay_stage_out = nullptr);
 bool ggml_vk_tp5_get_relay_ready(ggml_backend_t backend, size_t stage, volatile uint32_t ** ready_ptr);
-bool ggml_vk_tp5_update_relay_route(ggml_backend_t backend, size_t stage, uint64_t payload_bda,
+bool ggml_vk_tp5_update_relay_route(ggml_backend_t backend, size_t stage, uint32_t bank, uint64_t epoch,
+                                    const vk_tp5_relay_payload_binding & payload,
                                     volatile uint32_t ** ready_ptr);
+void ggml_vk_tp5_clear_relay_payload_binding(ggml_backend_t backend);
 
 struct vk_tp5_hc_binding {
     struct VkBuffer_T * buffer = nullptr;

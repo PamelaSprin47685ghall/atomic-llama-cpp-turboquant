@@ -40,13 +40,9 @@ layout (binding = 4) readonly buffer Fuse1 {D_TYPE data_fuse1[];};
 
 #ifdef TP5_RELAY_OUTPUT
 #    ifdef TP5_RELAY_OUTPUT_F32
-layout(buffer_reference, std430, buffer_reference_align = 4) coherent writeonly buffer TP5RelayWire {
-    float data[];
-};
+    #define TP5_RELAY_PAYLOAD_TYPE float
 #    else
-layout(buffer_reference, std430, buffer_reference_align = 2) coherent writeonly buffer TP5RelayWire {
-    float16_t data[];
-};
+    #define TP5_RELAY_PAYLOAD_TYPE float16_t
 #    endif
 #endif
 
@@ -56,10 +52,17 @@ layout(buffer_reference, std430, buffer_reference_align = 2) coherent writeonly 
 #            ifdef MOE_FUSE_SHARED_DOWN
 #                ifdef TP5_RELAY_OUTPUT
 layout(std430, binding = 9) coherent readonly buffer TP5RelayRoute {
-    uint64_t payload_bda;
+    uint bank;
     uint ready;
+    uint epoch;
     uint reserved;
 } tp5_relay_route;
+layout(std430, binding = 10) coherent writeonly buffer TP5RelayPayload0 {
+    TP5_RELAY_PAYLOAD_TYPE data_payload0[];
+};
+layout(std430, binding = 11) coherent writeonly buffer TP5RelayPayload1 {
+    TP5_RELAY_PAYLOAD_TYPE data_payload1[];
+};
 #                else
 layout(binding = 9) writeonly buffer WireOut {
     float16_t data_wire[];
@@ -68,10 +71,17 @@ layout(binding = 9) writeonly buffer WireOut {
 #            else
 #                ifdef TP5_RELAY_OUTPUT
 layout(std430, binding = 8) coherent readonly buffer TP5RelayRoute {
-    uint64_t payload_bda;
+    uint bank;
     uint ready;
+    uint epoch;
     uint reserved;
 } tp5_relay_route;
+layout(std430, binding = 9) coherent writeonly buffer TP5RelayPayload0 {
+    TP5_RELAY_PAYLOAD_TYPE data_payload0[];
+};
+layout(std430, binding = 10) coherent writeonly buffer TP5RelayPayload1 {
+    TP5_RELAY_PAYLOAD_TYPE data_payload1[];
+};
 #                else
 layout(binding = 8) writeonly buffer WireOut {
     float16_t data_wire[];
@@ -82,10 +92,17 @@ layout(binding = 8) writeonly buffer WireOut {
 #    endif
 #elif defined(TP5_RELAY_OUTPUT)
 layout(std430, binding = 5) coherent readonly buffer TP5RelayRoute {
-    uint64_t payload_bda;
+    uint bank;
     uint ready;
+    uint epoch;
     uint reserved;
 } tp5_relay_route;
+layout(std430, binding = 6) coherent writeonly buffer TP5RelayPayload0 {
+    TP5_RELAY_PAYLOAD_TYPE data_payload0[];
+};
+layout(std430, binding = 7) coherent writeonly buffer TP5RelayPayload1 {
+    TP5_RELAY_PAYLOAD_TYPE data_payload1[];
+};
 #elif defined(TP5_WIRE_OUTPUT)
 layout(binding = 5) writeonly buffer WireOut {
     float16_t data_wire[];
@@ -95,9 +112,15 @@ layout(binding = 5) writeonly buffer WireOut {
 void tp5_write_wire(const uint index, const float value) {
 #ifdef TP5_RELAY_OUTPUT
 #    ifdef TP5_RELAY_OUTPUT_F32
-    TP5RelayWire(tp5_relay_route.payload_bda).data[index] = value;
+    if (tp5_relay_route.bank == 0u)
+        data_payload0[index] = value;
+    else
+        data_payload1[index] = value;
 #    else
-    TP5RelayWire(tp5_relay_route.payload_bda).data[index] = float16_t(value);
+    if (tp5_relay_route.bank == 0u)
+        data_payload0[index] = float16_t(value);
+    else
+        data_payload1[index] = float16_t(value);
 #    endif
 #elif defined(TP5_WIRE_OUTPUT)
     data_wire[index] = float16_t(value);

@@ -11,10 +11,6 @@
 #    define TP5_HC_COLLECTIVE 1
 #    extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
-#ifdef TP5_HC_RELAY
-#    extension GL_EXT_buffer_reference : require
-#    extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-#endif
 #ifdef TP5_HC_Q8
 #    extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #    extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -71,6 +67,11 @@ layout(std430, binding = 5) readonly buffer Slot4 {
 layout(std430, binding = 1) coherent volatile buffer RelayInbox {
     uint relay_inbox[];
 };
+#        ifdef TP5_HC_RELAY
+layout(std430, binding = 2) coherent volatile buffer RelayStatus {
+    uint relay_status[];
+};
+#        endif
 #    endif
 
 layout(std430, binding = 6) readonly buffer Gamma {
@@ -157,9 +158,8 @@ layout(push_constant) uniform Params {
     uint  width;
     float epsilon;
 #ifdef TP5_HC_RELAY
-    uint64_t status_bda;
-    uint     spin_max;
-    uint     reserved;
+    uint spin_max;
+    uint reserved;
 #endif
 }
 
@@ -195,22 +195,17 @@ float block_value(uint col, uint stream) {
 }
 
 #ifdef TP5_HC_RELAY
-layout(buffer_reference, std430, buffer_reference_align = 4) coherent volatile buffer RelayStatus {
-    uint words[];
-};
-
 shared uint relay_ready;
 shared uint relay_expected;
 
 bool relay_wait_ready() {
     const uint lane = gl_LocalInvocationID.x;
     if (lane == 0u) {
-        RelayStatus status = RelayStatus(p.status_bda);
         relay_ready        = 0u;
-        relay_expected     = status.words[1];
-        if (status.words[2] == 0u && relay_expected != 0u) {
+        relay_expected     = relay_status[1];
+        if (relay_status[2] == 0u && relay_expected != 0u) {
             for (uint spin = 0u; spin < p.spin_max; ++spin) {
-                if ((spin & 1023u) == 0u && status.words[2] != 0u)
+                if ((spin & 1023u) == 0u && relay_status[2] != 0u)
                     break;
                 if (relay_inbox[0] == relay_expected) {
                     relay_ready = 1u;
@@ -218,12 +213,12 @@ bool relay_wait_ready() {
                 }
             }
             if (relay_ready == 0u) {
-                if (status.words[2] == 0u)
-                    status.words[2] = relay_expected;
-                status.words[4] = relay_inbox[0];
+                if (relay_status[2] == 0u)
+                    relay_status[2] = relay_expected;
+                relay_status[4] = relay_inbox[0];
             }
         } else if (relay_expected == 0u) {
-            status.words[2] = 0xffffffffu;
+            relay_status[2] = 0xffffffffu;
         }
     }
     barrier();
@@ -266,8 +261,7 @@ void relay_publish_completion() {
     if (gl_LocalInvocationID.x == 0u) {
         const uint prior = atomicAdd(relay_inbox[1], 1u);
         if (prior + 1u == gl_NumWorkGroups.x) {
-            RelayStatus status = RelayStatus(p.status_bda);
-            status.words[3] = relay_expected;
+            relay_status[3] = relay_expected;
             memoryBarrierBuffer();
         }
     }

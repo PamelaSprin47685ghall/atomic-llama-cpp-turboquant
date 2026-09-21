@@ -521,6 +521,7 @@ struct tp5_p1_resources {
     std::vector<vk_buffer>        owners;
     std::vector<VkCommandBuffer>  cmd_p1;
     std::vector<VkDescriptorSet>  ds_pack;
+    std::vector<VkDescriptorSet>  ds_relay_pack;
     std::vector<VkDescriptorSet>  ds_flag;
     std::vector<VkDescriptorSet>  ds_push;
     std::vector<VkDevice>         devices;
@@ -549,6 +550,18 @@ struct tp5_p1_resources {
             if (dev != VK_NULL_HANDLE && dp != VK_NULL_HANDLE && ds_pack[i] != VK_NULL_HANDLE) {
                 vkFreeDescriptorSets(dev, dp, 1, &ds_pack[i]);
                 ds_pack[i] = VK_NULL_HANDLE;
+            }
+        }
+        for (size_t idx = 0; idx < ds_relay_pack.size(); ++idx) {
+            const size_t i = idx / TP5_MAILBOX_BANKS;
+            if (i >= devices.size() || i >= desc_pools.size()) {
+                break;
+            }
+            VkDevice         dev = devices[i];
+            VkDescriptorPool dp  = desc_pools[i];
+            if (dev != VK_NULL_HANDLE && dp != VK_NULL_HANDLE && ds_relay_pack[idx] != VK_NULL_HANDLE) {
+                vkFreeDescriptorSets(dev, dp, 1, &ds_relay_pack[idx]);
+                ds_relay_pack[idx] = VK_NULL_HANDLE;
             }
         }
         for (size_t i = 0; i < ds_flag.size(); ++i) {
@@ -1012,7 +1025,7 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
         if (!ok) return false;
     }
 
-    if (c.sync_mode == tp5_sync_mode::STAR || c.sync_mode == tp5_sync_mode::RELAY) {
+    if (c.sync_mode == tp5_sync_mode::STAR) {
         struct {
             uint64_t src_bda_addr;
             uint64_t dst_bda_addr;
@@ -1044,15 +1057,16 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
     }
 
     if (c.sync_mode == tp5_sync_mode::RELAY) {
-        VkDescriptorSetLayoutBinding rb[2] = {
+        VkDescriptorSetLayoutBinding rb[3] = {
             {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
             {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
         };
         VkDescriptorSetLayoutCreateInfo rdci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        rdci.bindingCount = 2;
+        rdci.bindingCount = 3;
         rdci.pBindings = rb;
         if (vkCreateDescriptorSetLayout(r.vkdev, &rdci, nullptr, &r.relay_copy_dsl) != VK_SUCCESS) return false;
-        VkPushConstantRange rpc{VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+        VkPushConstantRange rpc{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
         VkPipelineLayoutCreateInfo rlci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         rlci.setLayoutCount = 1;
         rlci.pSetLayouts = &r.relay_copy_dsl;
@@ -1122,6 +1136,8 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
     // plan as well. The SUM/pack layout contains one input descriptor per rank.
     const uint32_t             plan_capacity = tp5_comm::MAX_CACHED_PLANS + 1;
     const uint32_t             sets_per_plan = TP5_MAILBOX_BANKS * 2 + 1 +
+                                               (c.sync_mode == tp5_sync_mode::RELAY && c.wire == tp5_wire_type::F16 ?
+                                                    TP5_MAILBOX_BANKS : 0) +
                                                (c.sync_mode == tp5_sync_mode::GPUFLAG ? 1 : 0) +
                                                (c.sync_mode == tp5_sync_mode::RELAY ? TP5_MAILBOX_BANKS : 0) +
                                                (c.sync_mode == tp5_sync_mode::RELAY && tp5_latebind_hc_enabled() ? 5 : 0);
@@ -1288,11 +1304,13 @@ void tp5_update_pack_descriptor(tp5_rank &      r,
                                 VkDeviceSize    in_offset,
                                 VkDeviceSize    in_size,
                                 uint32_t        n_slots,
-                                VkDeviceSize    wire_offset = 0) {
+                                VkBuffer        out_buf = VK_NULL_HANDLE,
+                                VkDeviceSize    out_offset = 0,
+                                VkDeviceSize    out_size = VK_WHOLE_SIZE) {
     if (ds == VK_NULL_HANDLE) return;
     VkDescriptorBufferInfo in_infos[8];
     std::fill_n(in_infos, n_slots, VkDescriptorBufferInfo{ in_tensor_buf, in_offset, in_size });
-    VkDescriptorBufferInfo out_info{r.wire_buf, wire_offset, VK_WHOLE_SIZE};
+    VkDescriptorBufferInfo out_info{out_buf != VK_NULL_HANDLE ? out_buf : r.wire_buf, out_offset, out_size};
     VkWriteDescriptorSet   w[2] = {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ds, 0, 0, n_slots, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
          nullptr,                                                                                                         in_infos, nullptr },
@@ -1303,11 +1321,16 @@ void tp5_update_pack_descriptor(tp5_rank &      r,
 }
 
 static bool tp5_alloc_host_import_buffer(tp5_rank & r, void * host_ptr, VkDeviceSize size,
-                                         VkBuffer & buf, VkDeviceMemory & mem, uint64_t & bda_addr) {
+                                         bool with_device_address, VkBuffer & buf, VkDeviceMemory & mem,
+                                         uint64_t & bda_addr) {
+    bda_addr = 0;
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = size;
     bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    if (with_device_address) {
+        bci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    }
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     VkExternalMemoryBufferCreateInfo ext{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
@@ -1349,10 +1372,12 @@ static bool tp5_alloc_host_import_buffer(tp5_rank & r, void * host_ptr, VkDevice
     }
 
     VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
-    flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    if (with_device_address) {
+        flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    }
 
     VkImportMemoryHostPointerInfoEXT imp{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
-    imp.pNext = &flags_info;
+    imp.pNext = with_device_address ? &flags_info : nullptr;
     imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
     imp.pHostPointer = host_ptr;
 
@@ -1375,19 +1400,21 @@ static bool tp5_alloc_host_import_buffer(tp5_rank & r, void * host_ptr, VkDevice
         return false;
     }
 
-    auto vkGetBufferDeviceAddressKHR = (PFN_vkGetBufferDeviceAddressKHR)
-        vkGetDeviceProcAddr(r.vkdev, "vkGetBufferDeviceAddressKHR");
-    if (!vkGetBufferDeviceAddressKHR) {
-        vkGetBufferDeviceAddressKHR = (PFN_vkGetBufferDeviceAddressKHR)
-            vkGetDeviceProcAddr(r.vkdev, "vkGetBufferDeviceAddress");
-    }
-    if (vkGetBufferDeviceAddressKHR) {
-        VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
-        dai.buffer = buf;
-        bda_addr = vkGetBufferDeviceAddressKHR(r.vkdev, &dai);
-    }
-    if (bda_addr == 0) {
-        fprintf(stderr, "tp5_alloc_host_import_buffer: WARN bda_addr is 0 for buf=%p\n", (void*)buf);
+    if (with_device_address) {
+        auto vkGetBufferDeviceAddressKHR = (PFN_vkGetBufferDeviceAddressKHR)
+            vkGetDeviceProcAddr(r.vkdev, "vkGetBufferDeviceAddressKHR");
+        if (!vkGetBufferDeviceAddressKHR) {
+            vkGetBufferDeviceAddressKHR = (PFN_vkGetBufferDeviceAddressKHR)
+                vkGetDeviceProcAddr(r.vkdev, "vkGetBufferDeviceAddress");
+        }
+        if (vkGetBufferDeviceAddressKHR) {
+            VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            dai.buffer = buf;
+            bda_addr = vkGetBufferDeviceAddressKHR(r.vkdev, &dai);
+        }
+        if (bda_addr == 0) {
+            fprintf(stderr, "tp5_alloc_host_import_buffer: WARN bda_addr is 0 for buf=%p\n", (void*)buf);
+        }
     }
     return true;
 }
@@ -1719,6 +1746,11 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
     }
     c.clear_cached_plans();
     if (c.failed) return false;
+    if (c.sync_mode == tp5_sync_mode::RELAY) {
+        for (auto backend : c.backends) {
+            ggml_vk_tp5_clear_relay_payload_binding(backend);
+        }
+    }
     c.workspace_gen++;
     for (bool & used : c.relay_bank_used) used = false;
 
@@ -1771,6 +1803,7 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
                     r.host_import_mem[b] = VK_NULL_HANDLE;
                 }
                 if (!tp5_alloc_host_import_buffer(r, (char *) ptr + i * rank_stride, rank_stride,
+                                                  c.sync_mode == tp5_sync_mode::STAR,
                                                   r.host_import_buf[b], r.host_import_mem[b], r.bda_addr[b])) {
                     c.fail("alloc_host_import_buffer failed on rank " + std::to_string(i));
                     return false;
@@ -1835,22 +1868,28 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
             if (r.wire_mem) { vkFreeMemory(r.vkdev, r.wire_mem, nullptr); r.wire_mem = VK_NULL_HANDLE; }
             r.wire_bda = 0;
             const size_t total_wire_size = rank_stride;
-            if (!tp5_alloc_device_buffer(r, total_wire_size,
-                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VkBufferUsageFlags wire_usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            if (c.sync_mode == tp5_sync_mode::STAR) {
+                wire_usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+            }
+            if (!tp5_alloc_device_buffer(r, total_wire_size, wire_usage,
                     false, r.wire_buf, r.wire_mem, nullptr)) {
                 c.fail("wire buffer allocation failed");
                 return false;
             }
-            auto vkGetBufferDeviceAddressKHR = (PFN_vkGetBufferDeviceAddressKHR)
-                vkGetDeviceProcAddr(r.vkdev, "vkGetBufferDeviceAddressKHR");
-            if (!vkGetBufferDeviceAddressKHR) {
-                vkGetBufferDeviceAddressKHR = (PFN_vkGetBufferDeviceAddressKHR)
-                    vkGetDeviceProcAddr(r.vkdev, "vkGetBufferDeviceAddress");
-            }
-            if (vkGetBufferDeviceAddressKHR) {
-                VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
-                dai.buffer = r.wire_buf;
-                r.wire_bda = vkGetBufferDeviceAddressKHR(r.vkdev, &dai);
+            if (c.sync_mode == tp5_sync_mode::STAR) {
+                auto vkGetBufferDeviceAddressKHR = (PFN_vkGetBufferDeviceAddressKHR)
+                    vkGetDeviceProcAddr(r.vkdev, "vkGetBufferDeviceAddressKHR");
+                if (!vkGetBufferDeviceAddressKHR) {
+                    vkGetBufferDeviceAddressKHR = (PFN_vkGetBufferDeviceAddressKHR)
+                        vkGetDeviceProcAddr(r.vkdev, "vkGetBufferDeviceAddress");
+                }
+                if (vkGetBufferDeviceAddressKHR) {
+                    VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+                    dai.buffer = r.wire_buf;
+                    r.wire_bda = vkGetBufferDeviceAddressKHR(r.vkdev, &dai);
+                }
             }
         }
         // STAR never reads a peer VRAM mailbox. With BDA enabled, RADV's
@@ -2116,15 +2155,17 @@ static void tp5_update_hc_descriptor(tp5_rank &             rank,
     for (size_t i = 0; i < 5; ++i) {
         if (relay) {
             // Keep the 12/13-binding HC layout identical to TIMELINE. Only
-            // binding 1 is consumed by the RELAY shader; duplicate the same
-            // local-VRAM buffer into the unused slot bindings so descriptor
-            // ownership and replay remain a single fixed layout.
+            // binding 1 is the inbox and binding 2 is the host-imported status
+            // range; duplicate the inbox into the remaining inactive slots.
             infos[i + 1] = { rank.bcast_buf[bank], 0, 64 + output.size };
         } else {
             infos[i + 1] = rank.inboxes.empty() ?
                                VkDescriptorBufferInfo{ rank.mailbox_buf, (bank * 5 + i) * stride, payload } :
                                VkDescriptorBufferInfo{ rank.inboxes[tp5_plan_slot(i, bank)].buf, 0, payload };
         }
+    }
+    if (relay) {
+        infos[2] = { rank.host_import_buf[bank], stride - 64, 64 };
     }
     infos[11] = { output.buf, output.offset, output.size };
     const bool has_quantized = (output.hc.quantized.buffer != nullptr);
@@ -2264,7 +2305,11 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
         new_p1->key = p1_key;
         new_p1->cmd_p1.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
         if (c.wire == tp5_wire_type::F16) {
-            new_p1->ds_pack.resize(c.n_ranks, VK_NULL_HANDLE);
+            if (c.sync_mode == tp5_sync_mode::RELAY) {
+                new_p1->ds_relay_pack.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
+            } else {
+                new_p1->ds_pack.resize(c.n_ranks, VK_NULL_HANDLE);
+            }
         }
         if (gpuflag) {
             new_p1->ds_flag.resize(c.n_ranks, VK_NULL_HANDLE);
@@ -2302,12 +2347,20 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
             }
             if (c.wire == tp5_wire_type::F16) {
                 if (trefs[i].packed_buf == VK_NULL_HANDLE) {
-                    if (vkAllocateDescriptorSets(r.vkdev, &ai, &new_p1->ds_pack[i]) != VK_SUCCESS) {
+                    if (c.sync_mode == tp5_sync_mode::RELAY) {
+                        for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
+                            const size_t idx = tp5_plan_slot(i, b);
+                            if (vkAllocateDescriptorSets(r.vkdev, &ai, &new_p1->ds_relay_pack[idx]) != VK_SUCCESS) {
+                                c.fail("allocation of RELAY pack descriptor set failed on rank " + std::to_string(i));
+                                return false;
+                            }
+                        }
+                    } else if (vkAllocateDescriptorSets(r.vkdev, &ai, &new_p1->ds_pack[i]) != VK_SUCCESS) {
                         c.fail("allocation of pack descriptor set failed on rank " + std::to_string(i));
                         return false;
                     }
                 }
-                if (r.push_pipe != VK_NULL_HANDLE && c.n_ranks == 5) {
+                if (c.sync_mode != tp5_sync_mode::RELAY && r.push_pipe != VK_NULL_HANDLE && c.n_ranks == 5) {
                     new_p1->ds_push.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
                     VkDescriptorSetAllocateInfo pai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, r.desc_pool, 1,
                                                     &r.push_dsl };
@@ -2340,7 +2393,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
         for (size_t i = 0; i < c.n_ranks; ++i) {
             tp5_rank & r          = c.ranks[i];
             const bool has_packed = (trefs[i].packed_buf != VK_NULL_HANDLE);
-            if (c.wire == tp5_wire_type::F16 && !has_packed) {
+            if (c.sync_mode != tp5_sync_mode::RELAY && c.wire == tp5_wire_type::F16 && !has_packed) {
                 tp5_update_pack_descriptor(r, new_p1->ds_pack[i], trefs[i].buf, trefs[i].offset, tensor_bytes,
                                            (uint32_t) c.n_ranks);
             }
@@ -2354,7 +2407,63 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     return false;
                 }
 
-                if (c.sync_mode == tp5_sync_mode::STAR || c.sync_mode == tp5_sync_mode::RELAY) {
+                if (c.sync_mode == tp5_sync_mode::RELAY) {
+                    const bool copy_payload = c.wire == tp5_wire_type::F32 || has_packed;
+                    const VkBuffer source_buf = has_packed ? trefs[i].packed_buf : trefs[i].buf;
+                    const VkDeviceSize source_offset = has_packed ? trefs[i].packed_offset : trefs[i].offset;
+                    const VkDeviceSize source_bytes = c.wire == tp5_wire_type::F16 ? payload : tensor_bytes;
+                    VkMemoryBarrier mb_pre{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                           VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                                           copy_payload ? VK_ACCESS_TRANSFER_READ_BIT : VK_ACCESS_SHADER_READ_BIT};
+                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                         copy_payload ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         0, 1, &mb_pre, 0, nullptr, 0, nullptr);
+
+                    if (copy_payload) {
+                        VkBufferCopy copy{source_offset, 0, source_bytes};
+                        vkCmdCopyBuffer(cmd, source_buf, r.host_import_buf[b], 1, &copy);
+                        VkMemoryBarrier mb_host{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                                VK_ACCESS_TRANSFER_WRITE_BIT,
+                                                VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT};
+                        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                             VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                                             0, 1, &mb_host, 0, nullptr, 0, nullptr);
+                    } else {
+                        if (new_p1->ds_relay_pack[idx] == VK_NULL_HANDLE) {
+                            c.fail("missing RELAY pack descriptor on rank " + std::to_string(i));
+                            return false;
+                        }
+                        tp5_update_pack_descriptor(r, new_p1->ds_relay_pack[idx], trefs[i].buf, trefs[i].offset,
+                                                   tensor_bytes, (uint32_t) c.n_ranks, r.host_import_buf[b], 0, payload);
+                        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.pack_pipe);
+                        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.pipe_layout, 0, 1,
+                                                &new_p1->ds_relay_pack[idx], 0, nullptr);
+                        const uint32_t n = (uint32_t) n_elems;
+                        vkCmdPushConstants(cmd, r.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(n), &n);
+                        vkCmdDispatch(cmd, (n + 255) / 256, 1, 1);
+                        VkMemoryBarrier mb_host{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                                VK_ACCESS_SHADER_WRITE_BIT,
+                                                VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT};
+                        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                             VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                                             0, 1, &mb_host, 0, nullptr, 0, nullptr);
+                    }
+
+                    // The route table is only for direct producers. The fallback
+                    // publishes the conventional host-import completion word.
+                    vkCmdFillBuffer(cmd, r.host_import_buf[b], c.star_rank_stride - 64, sizeof(uint32_t), 1u);
+                    VkMemoryBarrier mb_ready{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                             VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                                         0, 1, &mb_ready, 0, nullptr, 0, nullptr);
+                    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+                        c.fail("end cmd_p1 RELAY failed on rank " + std::to_string(i));
+                        return false;
+                    }
+                    continue;
+                }
+
+                if (c.sync_mode == tp5_sync_mode::STAR) {
                     VkMemoryBarrier mb_pre{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                                             VK_ACCESS_SHADER_WRITE_BIT,
                                             VK_ACCESS_SHADER_READ_BIT };
@@ -2373,13 +2482,11 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     uint64_t dst_bda = r.bda_addr[b];
                     uint32_t n_vec4 = has_packed ? (uint32_t)(n_elems / 8) : (uint32_t)(n_elems / 4);
                     uint64_t flag_bda = dst_bda + c.star_rank_stride - 64;
-                    const bool one_wg_payload = c.sync_mode == tp5_sync_mode::RELAY && n_elems <= 4096;
 
                     // Dispatch 1: payload data. A terminal producer may have
                     // already emitted the canonical F16 companion, in which
                     // case P1 copies it directly instead of re-reading F32 and
-                    // converting it again. Decode-sized RELAY payloads use one
-                    // workgroup to minimize scheduler footprint.
+                    // converting it again.
                     struct {
                         uint64_t src_bda;
                         uint64_t dst_bda;
@@ -2389,53 +2496,29 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                         uint32_t seq_val;
                         uint32_t mode;
                     } bda_pc{stage_bda_src, dst_bda, flag_bda, n_vec4, (uint32_t)n_elems, 1u,
-                             c.wire == tp5_wire_type::F32 ?
-                                 (one_wg_payload ? 6u : 5u) :
-                                 (one_wg_payload ? (has_packed ? 4u : 3u) : (has_packed ? 2u : 0u))};
+                             c.wire == tp5_wire_type::F32 ? 5u : (has_packed ? 2u : 0u)};
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.bda_push_pipe);
                     vkCmdPushConstants(cmd, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(bda_pc), &bda_pc);
-                    vkCmdDispatch(cmd,
-                                  one_wg_payload ? 1u :
-                                      (uint32_t)(n_elems + (has_packed ? 511 : 255)) / (has_packed ? 512 : 256),
+                    vkCmdDispatch(cmd, (uint32_t)(n_elems + (has_packed ? 511 : 255)) / (has_packed ? 512 : 256),
                                   1, 1);
 
                     // The completion flag must not become host-visible before
-                    // every payload store. Keep this real device->HOST publish
-                    // even for the one-workgroup payload path.
+                    // every payload store.
                     VkMemoryBarrier mb_host{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                                              VK_ACCESS_SHADER_WRITE_BIT,
                                              VK_ACCESS_HOST_READ_BIT };
                     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                         VK_PIPELINE_STAGE_HOST_BIT |
-                                             (c.sync_mode == tp5_sync_mode::RELAY ?
-                                                  VK_PIPELINE_STAGE_TRANSFER_BIT :
-                                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
+                                         VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                          0, 1, &mb_host, 0, nullptr, 0, nullptr);
 
-                    if (c.sync_mode == tp5_sync_mode::RELAY) {
-                        // A 4-byte transfer packet is cheaper than scheduling a
-                        // second compute dispatch whose only active lane writes
-                        // the constant host-ready value.
-                        vkCmdFillBuffer(cmd, r.host_import_buf[b], c.star_rank_stride - 64, sizeof(uint32_t), 1u);
-                    } else {
-                        bda_pc.mode = 1;
-                        vkCmdPushConstants(cmd, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                           sizeof(bda_pc), &bda_pc);
-                        vkCmdDispatch(cmd, 1, 1, 1);
-                    }
-                    // P1 and autonomous P2 share one queue submission in
-                    // RELAY. Publish the flag itself to HOST before P2 can
-                    // complete, but do NOT put COMPUTE in the destination
-                    // scope: P2 is deliberately allowed to enter its bounded
-                    // spin while the flag becomes host-visible.
+                    bda_pc.mode = 1;
+                    vkCmdPushConstants(cmd, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                       sizeof(bda_pc), &bda_pc);
+                    vkCmdDispatch(cmd, 1, 1, 1);
                     VkMemoryBarrier mb_flag{ VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-                                             c.sync_mode == tp5_sync_mode::RELAY ?
-                                                 VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_SHADER_WRITE_BIT,
+                                             VK_ACCESS_SHADER_WRITE_BIT,
                                              VK_ACCESS_HOST_READ_BIT };
-                    vkCmdPipelineBarrier(cmd,
-                                         c.sync_mode == tp5_sync_mode::RELAY ?
-                                             VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                         VK_PIPELINE_STAGE_HOST_BIT,
+                    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                                          0, 1, &mb_flag, 0, nullptr, 0, nullptr);
                     if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
                         c.fail("end cmd_p1 star failed on rank " + std::to_string(i));
@@ -2592,8 +2675,9 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
         static std::atomic<bool> late_reported{false};
         if (!late_reported.exchange(true, std::memory_order_relaxed)) {
             fprintf(stderr,
-                    "[tp5-latebind] exact hc-down active width=%u streams=%u rank=%u sidecar=%zuB "
+                    "[tp5-latebind] exact hc-down active producer=%s width=%u streams=%u rank=%u sidecar=%zuB "
                     "(GGML_TP5_REPLICATE_ATTN remains independent)\n",
+                    relay_direct_all ? "direct" : "p1",
                     trefs[0].late.width, trefs[0].late.streams, trefs[0].late.late_rank,
                     size_t(trefs[0].late.streams) * trefs[0].late.late_rank * sizeof(float));
         }
@@ -2788,8 +2872,9 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     const auto record_relay_copy = [&]() {
                         VkDescriptorBufferInfo src_info{r.bcast_buf[b], 0, 64 + tensor_bytes};
                         VkDescriptorBufferInfo dst_info{trefs[i].buf, trefs[i].offset, tensor_bytes};
-                        VkWriteDescriptorSet writes[2]{};
-                        for (uint32_t w = 0; w < 2; ++w) {
+                        VkDescriptorBufferInfo status_info{r.host_import_buf[b], c.star_rank_stride - 64, 64};
+                        VkWriteDescriptorSet writes[3]{};
+                        for (uint32_t w = 0; w < 3; ++w) {
                             writes[w].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                             writes[w].dstSet = plan.relay_ds[idx];
                             writes[w].dstBinding = w;
@@ -2798,14 +2883,15 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                         }
                         writes[0].pBufferInfo = &src_info;
                         writes[1].pBufferInfo = &dst_info;
-                        vkUpdateDescriptorSets(r.vkdev, 2, writes, 0, nullptr);
+                        writes[2].pBufferInfo = &status_info;
+                        vkUpdateDescriptorSets(r.vkdev, 3, writes, 0, nullptr);
                         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.relay_copy_pipe);
                         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.relay_copy_layout, 0, 1,
                                                 &plan.relay_ds[idx], 0, nullptr);
-                        struct { uint64_t status_bda; uint32_t n_elems; uint32_t seq; uint32_t spin_max;
-                                 uint32_t dst_offset_words; uint32_t reserved0; uint32_t reserved1; } relay_pc{
-                            r.bda_addr[b] + c.star_rank_stride - 64, (uint32_t)n_elems, 1u, c.spin_max,
-                            0u, profile_spin, 0u};
+                        struct { uint32_t n_elems; uint32_t spin_max; uint32_t dst_offset_words;
+                                 uint32_t profile_spin; } relay_pc{
+                            (uint32_t)n_elems, c.spin_max, 0u, profile_spin};
+                        static_assert(sizeof(relay_pc) == 16);
                         vkCmdPushConstants(cmd, r.relay_copy_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                            sizeof(relay_pc), &relay_pc);
                         vkCmdDispatch(cmd, 1, 1, 1);
@@ -2862,12 +2948,10 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                         struct {
                             uint32_t width;
                             float    epsilon;
-                            uint64_t status_bda;
                             uint32_t spin_max;
                             uint32_t reserved;
-                        } relay_hc_pc{trefs[i].hc.width, trefs[i].hc.epsilon,
-                                      r.bda_addr[b] + c.star_rank_stride - 64, c.spin_max, profile_spin};
-                        static_assert(sizeof(relay_hc_pc) == 24);
+                        } relay_hc_pc{trefs[i].hc.width, trefs[i].hc.epsilon, c.spin_max, profile_spin};
+                        static_assert(sizeof(relay_hc_pc) == 16);
                         vkCmdPushConstants(cmd, r.hc_sum_layout[pipe_idx], VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                            sizeof(relay_hc_pc), &relay_hc_pc);
                         vkCmdDispatch(cmd, 2, 1, 1);
@@ -3709,6 +3793,16 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
     return true;
 }
 
+static vk_tp5_relay_payload_binding tp5_relay_payload_binding(const tp5_comm & c, const tp5_rank & r) {
+    vk_tp5_relay_payload_binding payload;
+    for (size_t bank = 0; bank < TP5_MAILBOX_BANKS; ++bank) {
+        payload.bank[bank]  = r.host_import_buf[bank];
+        payload.bytes[bank] = c.star_rank_stride;
+    }
+    payload.generation = c.workspace_gen;
+    return payload;
+}
+
 static bool tp5_relay_submit_epoch_chain(
         tp5_comm & c, const std::vector<std::vector<std::vector<void *>>> & stage_compute_cbs,
         const std::vector<tp5_plan_key> & keys, size_t n_stages) {
@@ -3758,7 +3852,8 @@ static bool tp5_relay_submit_epoch_chain(
         const size_t   bank  = tp5_mailbox_bank(epoch);
         for (size_t i = 0; i < c.n_ranks; ++i) {
             volatile uint32_t * ready = nullptr;
-            if (!ggml_vk_tp5_update_relay_route(c.backends[i], s, c.ranks[i].bda_addr[bank], &ready) || !ready) {
+            const auto payload = tp5_relay_payload_binding(c, c.ranks[i]);
+            if (!ggml_vk_tp5_update_relay_route(c.backends[i], s, (uint32_t) bank, epoch, payload, &ready) || !ready) {
                 c.fail("RELAY direct route update failed stage=" + std::to_string(s) +
                        " rank=" + std::to_string(i));
                 return false;
@@ -5915,9 +6010,16 @@ bool ggml_backend_vk_tp5_comm_free_safe(void * comm) {
     }
     tp5_poll_gpu_timing(*c);
 
-    // Free Star AllReduce host allocations and worker pool/signaler
+    if (c->sync_mode == tp5_sync_mode::RELAY) {
+        for (auto backend : c->backends) {
+            ggml_vk_tp5_clear_relay_payload_binding(backend);
+        }
+    }
+
+    // Release imported buffers before their backing host allocations.
     c->avx2_pool.reset();
     c->drm_signaler.reset();
+    for (auto & r : c->ranks) tp5_destroy_rank(r);
     for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
         if (c->star_host_raw[b]) {
             free(c->star_host_raw[b]);
@@ -5925,8 +6027,6 @@ bool ggml_backend_vk_tp5_comm_free_safe(void * comm) {
             c->star_host_aligned[b] = nullptr;
         }
     }
-
-    for (auto & r : c->ranks) tp5_destroy_rank(r);
     delete c;
     return true;
 }
@@ -6008,6 +6108,15 @@ bool ggml_backend_vk_tp5_prepare_graph(void * comm, size_t rank, ggml_cgraph * g
         return false;
 
     static const bool disable_producer_wire = (getenv("GGML_VK_DISABLE_PRODUCER_WIRE") != nullptr);
+    // Consumer recipe capture is independent of producer-wire. Every subgraph
+    // after stage 0 consumes the previous reduction, including the final
+    // non-reducing tail. This keeps GGML_VK_DISABLE_PRODUCER_WIRE=1 on the
+    // exact legacy P1 producer path while still allowing LateBind to replace
+    // the downstream HC prefix/W_down.
+    const bool latebind_capture =
+        c->sync_mode == tp5_sync_mode::RELAY && c->wire == tp5_wire_type::F32 &&
+        tp5_latebind_hc_enabled() && stage > 0;
+    ggml_vk_tp5_set_latebind_capture(c->backends[rank], graph, latebind_capture);
     const bool        eligible =
         (((c->sync_mode == tp5_sync_mode::TIMELINE && c->wire == tp5_wire_type::F16) ||
           c->sync_mode == tp5_sync_mode::RELAY) &&
@@ -6025,8 +6134,10 @@ bool ggml_backend_vk_tp5_prepare_graph(void * comm, size_t rank, ggml_cgraph * g
     ggml_vk_tp5_set_wire_output(c->backends[rank], target, c->sync_mode == tp5_sync_mode::RELAY,
                                 relay_stage, relay_f32);
     if (relay_stage != SIZE_MAX) {
-        const size_t bank = tp5_mailbox_bank(c->allreduce_calls + 1);
-        if (!ggml_vk_tp5_update_relay_route(c->backends[rank], stage, c->ranks[rank].bda_addr[bank], nullptr)) {
+        const uint64_t epoch = c->allreduce_calls + 1;
+        const size_t bank = tp5_mailbox_bank(epoch);
+        const auto payload = tp5_relay_payload_binding(*c, c->ranks[rank]);
+        if (!ggml_vk_tp5_update_relay_route(c->backends[rank], stage, (uint32_t) bank, epoch, payload, nullptr)) {
             // Direct producer is an optimization, not a correctness fallback.
             // Reconfigure this recording for the established scratch/P1 path.
             ggml_vk_tp5_set_wire_output(c->backends[rank], target, true, SIZE_MAX, relay_f32);
@@ -6071,7 +6182,7 @@ int ggml_vk_tp5_relay_probe(ggml_backend_t * backends, size_t n, const ggml_vk_r
     } res;
     auto & c = res.comm;
     c.n_ranks = n;
-    c.sync_mode = tp5_sync_mode::STAR;
+    c.sync_mode = tp5_sync_mode::RELAY;
     c.wire = tp5_wire_type::F16;
     c.ranks.resize(n);
     c.backends.assign(backends, backends + n);
@@ -6102,14 +6213,9 @@ int ggml_vk_tp5_relay_probe(ggml_backend_t * backends, size_t n, const ggml_vk_r
         memset(c.star_host_raw[b], 0, n * stride);
     }
     struct relay_pc {
-        uint64_t status_bda;
         uint32_t n_elems, seq, rank, spin_max, mode, reserved;
     };
-    struct push_pc {
-        uint64_t src, dst, flag;
-        uint32_t n_vec4, n_elems, seq, mode;
-    };
-    static_assert(sizeof(relay_pc) == 32 && sizeof(push_pc) == 40, "shader push constant layout");
+    static_assert(sizeof(relay_pc) == 24, "shader push constant layout");
     const auto barrier = [](VkCommandBuffer cmd, VkPipelineStageFlags src, VkPipelineStageFlags dst,
                             VkAccessFlags writes, VkAccessFlags reads) {
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, writes, reads};
@@ -6135,8 +6241,9 @@ int ggml_vk_tp5_relay_probe(ggml_backend_t * backends, size_t n, const ggml_vk_r
             ggml_vk_tp5_mem_props(r.device, &props);
             if (!host_props_fn || host_props_fn(r.vkdev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, ptr, &host_props) != VK_SUCCESS ||
                 find_memory_type(props, host_props.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == UINT32_MAX ||
-                !tp5_alloc_host_import_buffer(r, ptr, stride, r.host_import_buf[b], r.host_import_mem[b], r.bda_addr[b]) || !r.bda_addr[b]) {
-                fprintf(stderr, "relay: coherent BDA host import unavailable on rank %zu\n", i);
+                !tp5_alloc_host_import_buffer(r, ptr, stride, false,
+                                              r.host_import_buf[b], r.host_import_mem[b], r.bda_addr[b])) {
+                fprintf(stderr, "relay: coherent host import unavailable on rank %zu\n", i);
                 return 1;
             }
             const VkMemoryPropertyFlags required = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
@@ -6151,18 +6258,12 @@ int ggml_vk_tp5_relay_probe(ggml_backend_t * backends, size_t n, const ggml_vk_r
                     i, b, memory_type, props.memoryTypes[memory_type].propertyFlags, stride);
         }
         if (!tp5_alloc_device_buffer(r, cfg.elements * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                 false, r.wire_buf, r.wire_mem, nullptr)) return 1;
-        auto bda_fn = (PFN_vkGetBufferDeviceAddress) vkGetDeviceProcAddr(r.vkdev, "vkGetBufferDeviceAddress");
-        if (!bda_fn) bda_fn = (PFN_vkGetBufferDeviceAddress) vkGetDeviceProcAddr(r.vkdev, "vkGetBufferDeviceAddressKHR");
-        if (!bda_fn) return 1;
-        VkBufferDeviceAddressInfo addr{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, r.wire_buf};
-        r.wire_bda = bda_fn(r.vkdev, &addr);
-        if (!r.wire_bda) return 1;
-        VkDescriptorSetLayoutBinding bindings[3]{};
-        for (uint32_t j = 0; j < 3; ++j) bindings[j] = {j, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutBinding bindings[4]{};
+        for (uint32_t j = 0; j < 4; ++j) bindings[j] = {j, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo dci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        dci.bindingCount = 3;
+        dci.bindingCount = 4;
         dci.pBindings = bindings;
         if (vkCreateDescriptorSetLayout(r.vkdev, &dci, nullptr, &res.dsls[i]) != VK_SUCCESS) return 1;
         VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(relay_pc)};
@@ -6181,14 +6282,20 @@ int ggml_vk_tp5_relay_probe(ggml_backend_t * backends, size_t n, const ggml_vk_r
         vkDestroyShaderModule(r.vkdev, module, nullptr);
         if (pipeline_result != VK_SUCCESS) return 1;
         VkDescriptorSet sets[TP5_MAILBOX_BANKS]{};
+        VkDescriptorSet pack_sets[TP5_MAILBOX_BANKS]{};
         for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
             VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, r.desc_pool, 1, &res.dsls[i]};
             if (vkAllocateDescriptorSets(r.vkdev, &ai, &sets[b]) != VK_SUCCESS) return 1;
-            VkDescriptorBufferInfo infos[3] = {{r.bcast_buf[b], 0, stride}, {r.wire_buf, 0, cfg.elements * sizeof(float)}, {r.bcast_buf[0], 0, 64}};
-            VkWriteDescriptorSet writes[3]{};
-            for (uint32_t j = 0; j < 3; ++j) writes[j] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets[b], j, 0, 1,
+            VkDescriptorBufferInfo infos[4] = {{r.bcast_buf[b], 0, stride}, {r.wire_buf, 0, cfg.elements * sizeof(float)},
+                                               {r.bcast_buf[0], 0, 64}, {r.host_import_buf[b], stride - status_bytes, status_bytes}};
+            VkWriteDescriptorSet writes[4]{};
+            for (uint32_t j = 0; j < 4; ++j) writes[j] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, sets[b], j, 0, 1,
                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &infos[j], nullptr};
-            vkUpdateDescriptorSets(r.vkdev, 3, writes, 0, nullptr);
+            vkUpdateDescriptorSets(r.vkdev, 4, writes, 0, nullptr);
+            VkDescriptorSetAllocateInfo pack_ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, r.desc_pool, 1, &r.dsl};
+            if (vkAllocateDescriptorSets(r.vkdev, &pack_ai, &pack_sets[b]) != VK_SUCCESS) return 1;
+            tp5_update_pack_descriptor(r, pack_sets[b], r.wire_buf, 0, cfg.elements * sizeof(float),
+                                       (uint32_t) n, r.host_import_buf[b], 0, cfg.elements * sizeof(ggml_fp16_t));
         }
         VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, r.cmd_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
         if (vkAllocateCommandBuffers(r.vkdev, &ai, &res.commands[i]) != VK_SUCCESS) return 1;
@@ -6197,7 +6304,7 @@ int ggml_vk_tp5_relay_probe(ggml_backend_t * backends, size_t n, const ggml_vk_r
         if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) return 1;
         vkCmdResetQueryPool(cmd, r.timing_pool, 0, 2);
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, r.timing_pool, 0);
-        relay_pc pc{r.bda_addr[0] + stride - status_bytes, cfg.elements, 0, (uint32_t) i, cfg.spin_max, 0, 0};
+        relay_pc pc{cfg.elements, 0, (uint32_t) i, cfg.spin_max, 0, 0};
         const auto consume = [&](uint32_t seq, uint32_t mode) {
             const size_t bank = seq ? tp5_mailbox_bank(seq) : 0;
             pc.seq = seq;
@@ -6210,22 +6317,23 @@ int ggml_vk_tp5_relay_probe(ggml_backend_t * backends, size_t n, const ggml_vk_r
                     VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
         };
         consume(0, 0);
-        // TIMELINE's fused ordering: COMPUTE -> PUSH -> dependent COMPUTE.
+        // RELAY's fused ordering: COMPUTE -> descriptor pack -> dependent COMPUTE.
         // All 96 stages are recorded once. No peer/host semaphore waits exist.
         for (uint32_t seq = 1; seq <= cfg.stages; ++seq) {
             const size_t b = tp5_mailbox_bank(seq);
-            push_pc push{r.wire_bda, r.bda_addr[b], r.bda_addr[b] + stride - status_bytes,
-                         cfg.elements / 4, cfg.elements, seq, 0};
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.bda_push_pipe);
-            vkCmdPushConstants(cmd, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.pack_pipe);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.pipe_layout, 0, 1,
+                                    &pack_sets[b], 0, nullptr);
+            const uint32_t n_elems = cfg.elements;
+            vkCmdPushConstants(cmd, r.pipe_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(n_elems), &n_elems);
             vkCmdDispatch(cmd, (cfg.elements + 255) / 256, 1, 1);
-            barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
-                    VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
-            push.mode = 1;
-            vkCmdPushConstants(cmd, r.bda_push_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-            vkCmdDispatch(cmd, 1, 1, 1);
-            barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
-                    VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+            barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                    VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+            vkCmdFillBuffer(cmd, r.host_import_buf[b], stride - status_bytes, sizeof(uint32_t), seq);
+            barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
             consume(seq, 1);
         }
         VkBufferCopy copy{0, 0, cfg.elements * sizeof(float)};

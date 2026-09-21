@@ -12,8 +12,11 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
 #ifdef MOE_K128_RELAY_OUTPUT
-#extension GL_EXT_buffer_reference : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#    ifdef MOE_K128_RELAY_OUTPUT_F32
+#        define MOE_K128_RELAY_PAYLOAD_TYPE float
+#    else
+#        define MOE_K128_RELAY_PAYLOAD_TYPE float16_t
+#    endif
 #endif
 
 // Paired-expert IQ4_NL K=128 MoE down projection + fold.
@@ -93,20 +96,18 @@ layout(std430, binding = 7) readonly buffer SharedGateIn {
     float shared_gate_in[];
 };
 #    ifdef MOE_K128_RELAY_OUTPUT
-#        ifdef MOE_K128_RELAY_OUTPUT_F32
-layout(buffer_reference, std430, buffer_reference_align = 4) coherent writeonly buffer RelayWireOut {
-    float data[];
-};
-#        else
-layout(buffer_reference, std430, buffer_reference_align = 2) coherent writeonly buffer RelayWireOut {
-    float16_t data[];
-};
-#        endif
 layout(std430, binding = 8) coherent readonly buffer RelayRoute {
-    uint64_t payload_bda;
+    uint bank;
     uint ready;
+    uint epoch;
     uint reserved;
 } relay_route;
+layout(std430, binding = 9) coherent writeonly buffer RelayPayload0 {
+    MOE_K128_RELAY_PAYLOAD_TYPE data_payload0[];
+};
+layout(std430, binding = 10) coherent writeonly buffer RelayPayload1 {
+    MOE_K128_RELAY_PAYLOAD_TYPE data_payload1[];
+};
 #    elif defined(MOE_K128_WIRE_OUTPUT)
 layout(std430, binding = 8) writeonly buffer WireOut {
     float16_t wire_out[];
@@ -120,20 +121,18 @@ layout(std430, binding = 6) readonly buffer SharedGateIn {
     float shared_gate_in[];
 };
 #    ifdef MOE_K128_RELAY_OUTPUT
-#        ifdef MOE_K128_RELAY_OUTPUT_F32
-layout(buffer_reference, std430, buffer_reference_align = 4) coherent writeonly buffer RelayWireOut {
-    float data[];
-};
-#        else
-layout(buffer_reference, std430, buffer_reference_align = 2) coherent writeonly buffer RelayWireOut {
-    float16_t data[];
-};
-#        endif
 layout(std430, binding = 7) coherent readonly buffer RelayRoute {
-    uint64_t payload_bda;
+    uint bank;
     uint ready;
+    uint epoch;
     uint reserved;
 } relay_route;
+layout(std430, binding = 8) coherent writeonly buffer RelayPayload0 {
+    MOE_K128_RELAY_PAYLOAD_TYPE data_payload0[];
+};
+layout(std430, binding = 9) coherent writeonly buffer RelayPayload1 {
+    MOE_K128_RELAY_PAYLOAD_TYPE data_payload1[];
+};
 #    elif defined(MOE_K128_WIRE_OUTPUT)
 layout(std430, binding = 7) writeonly buffer WireOut {
     float16_t wire_out[];
@@ -332,9 +331,15 @@ void main() {
         wire_out[first_row + n] = float16_t(result);
 #elif defined(MOE_K128_RELAY_OUTPUT)
 #    ifdef MOE_K128_RELAY_OUTPUT_F32
-        RelayWireOut(relay_route.payload_bda).data[first_row + n] = result;
+        if (relay_route.bank == 0u)
+            data_payload0[first_row + n] = result;
+        else
+            data_payload1[first_row + n] = result;
 #    else
-        RelayWireOut(relay_route.payload_bda).data[first_row + n] = float16_t(result);
+        if (relay_route.bank == 0u)
+            data_payload0[first_row + n] = float16_t(result);
+        else
+            data_payload1[first_row + n] = float16_t(result);
 #    endif
 #endif
     }

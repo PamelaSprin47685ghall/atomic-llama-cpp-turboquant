@@ -3,22 +3,17 @@
 // RELAY real-graph P2: it is resident before the CPU publishes the reduced
 // payload. CPU writes local VRAM through BAR; this shader waits only on that
 // generation doorbell and then consumes the payload autonomously.
-#extension GL_EXT_buffer_reference : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
 layout(local_size_x = 64) in;
 layout(std430, binding = 0) coherent volatile buffer InboxBuffer { uint inbox[]; };
 layout(std430, binding = 1) writeonly buffer DstBuffer { float dst[]; };
-layout(buffer_reference, std430, buffer_reference_align = 4) coherent volatile buffer StatusBuffer { uint words[]; };
+layout(std430, binding = 2) coherent volatile buffer StatusBuffer { uint status[]; };
 
 layout(push_constant) uniform Params {
-    uint64_t status_bda;
     uint n_elems;
-    uint seq;
     uint spin_max;
     uint dst_offset_words;
-    uint reserved0;
-    uint reserved1;
+    uint profile_spin;
 } p;
 
 shared uint ready;
@@ -29,13 +24,12 @@ void main() {
     if (lane == 0u) {
         ready = 0u;
         spin_used = 0u;
-        StatusBuffer status = StatusBuffer(p.status_bda);
-        uint expected = status.words[1];
-        if (status.words[2] == 0u && expected != 0u) {
+        uint expected = status[1];
+        if (status[2] == 0u && expected != 0u) {
             for (uint spin = 0u; spin < p.spin_max; ++spin) {
                 // A host-side bounded handoff failure requests an immediate
                 // fail-closed exit; do not burn the remaining spin budget.
-                if ((spin & 1023u) == 0u && status.words[2] != 0u) {
+                if ((spin & 1023u) == 0u && status[2] != 0u) {
                     break;
                 }
                 if (inbox[0] == expected) {
@@ -50,16 +44,16 @@ void main() {
             }
             if (ready == 0u) {
                 spin_used = p.spin_max;
-                if (status.words[2] == 0u) {
-                    status.words[2] = expected;
+                if (status[2] == 0u) {
+                    status[2] = expected;
                 }
-                status.words[4] = inbox[0];
+                status[4] = inbox[0];
             }
-            if (p.reserved0 != 0u) {
-                status.words[5] = spin_used;
+            if (p.profile_spin != 0u) {
+                status[5] = spin_used;
             }
         } else if (expected == 0u) {
-            status.words[2] = 0xffffffffu;
+            status[2] = 0xffffffffu;
         }
     }
     barrier();
@@ -80,7 +74,6 @@ void main() {
     memoryBarrierBuffer();
     barrier();
     if (lane == 0u) {
-        StatusBuffer status = StatusBuffer(p.status_bda);
-        status.words[3] = status.words[1];
+        status[3] = status[1];
     }
 }
