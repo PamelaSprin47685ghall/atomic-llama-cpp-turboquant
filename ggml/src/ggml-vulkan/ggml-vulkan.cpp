@@ -23562,11 +23562,31 @@ static bool ggml_vk_can_fuse_gdn_segment(ggml_backend_vk_context * ctx, const gg
             ggml_get_unary_op(node(1)) != GGML_UNARY_OP_SILU) {
             return false;
         }
-        if (!valid(node(2), GGML_TYPE_F32) || node(2)->ne[0] != 128 || node(2)->ne[1] != hk || node(2)->ne[2] != n_time ||
+
+        // Q/K/V views (node 2, 4, 6) sliced from the interleaved conv output (node 1) are naturally
+        // non-contiguous across time steps in capacity mode (nb[2] == channels * sizeof(float) > 128 * heads * sizeof(float)).
+        // The fused multistep prep kernel computes convolution internally from root inputs and writes tightly-packed
+        // Q/K/V buffers; it never reads these intermediate graph views. We strictly validate shape, type, strides,
+        // alignment, and verify that the view span is fully within the backing node(1) buffer range without enforcing ggml_is_contiguous.
+        const auto valid_strided_qkv_view = [&](const ggml_tensor * t, int64_t heads, size_t expected_view_offs) {
+            if (!t || t->type != GGML_TYPE_F32 || t->view_src != node(1) || t->view_offs != expected_view_offs ||
+                t->ne[0] != 128 || t->ne[1] != heads || t->ne[2] != n_time || t->ne[3] != 1 ||
+                t->nb[0] != sizeof(float) || t->nb[1] != 128 * sizeof(float) ||
+                t->nb[2] != (size_t) channels * sizeof(float) ||
+                get_misalign_bytes(ctx, t) != 0 ||
+                ggml_nelements(t) == 0 || ggml_nelements(t) > UINT32_MAX ||
+                ggml_nbytes(t) > ctx->device->properties.limits.maxStorageBufferRange) {
+                return false;
+            }
+            const size_t max_span_bytes = t->view_offs + (size_t)(n_time - 1) * t->nb[2] + (size_t) heads * t->nb[1];
+            return max_span_bytes <= ggml_nbytes(node(1));
+        };
+
+        if (!valid_strided_qkv_view(node(2), hk, 0) ||
             !valid(node(3), GGML_TYPE_F32) || node(3)->ne[0] != 128 || node(3)->ne[1] != hk || node(3)->ne[2] != n_time ||
-            !valid(node(4), GGML_TYPE_F32) || node(4)->ne[0] != 128 || node(4)->ne[1] != hk || node(4)->ne[2] != n_time ||
+            !valid_strided_qkv_view(node(4), hk, 128 * hk * sizeof(float)) ||
             !valid(node(5), GGML_TYPE_F32) || node(5)->ne[0] != 128 || node(5)->ne[1] != hk || node(5)->ne[2] != n_time ||
-            !valid(node(6), GGML_TYPE_F32) || node(6)->ne[0] != 128 || node(6)->ne[1] != hv || node(6)->ne[2] != n_time) {
+            !valid_strided_qkv_view(node(6), hv, 256 * hk * sizeof(float))) {
             return false;
         }
         if (!valid(node(14), GGML_TYPE_F32) || node(14)->ne[0] != 128 || node(14)->ne[1] != 128 || node(14)->ne[2] != hv ||
