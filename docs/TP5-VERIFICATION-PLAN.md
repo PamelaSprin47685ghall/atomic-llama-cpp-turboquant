@@ -226,8 +226,8 @@ grep '\[tp5-mtp-cycle-summary\]' /tmp/tp5_server_verify.log
 | `tp5_numerical_reason` 枚举 | `ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp` | L71–L82 | 包含 `DISABLED_BY_ENV`, `EXACT_Q_REQUESTED`, `MISSING_HARDWARE_INT_DOT` 等判定原因。 |
 | `[tp5-numerical-mode]` 打印 | `ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp` | L3213–L3220 | 定义期通过原子掩码单次输出 resolved 模式及 reason。 |
 | `[tp5-linear-definition]` 打印 | `ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp` | L4970–L4974 | 输出 `mode=... late=... q8_fast=...` 及 dispatches/barriers。 |
-| Q sidecar 状态协议与重置 | `ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp` | L4179–L4188 | `status[6] = 0`（LateBind sidecar ready），`qheader[4] = 0`（Q sidecar ready），`qheader[5] = 0`（Q8 counter）。 |
-| Q sidecar 轮询与归约 | `ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp` | L4482–L4526 | 区分 `late_sidecar_f16`（Aggressive Q 写本卡 device-coherent VRAM，CPU 在 BAR 原位读写）与 F32 Exact（轮询 `status[6]`，通过独立 64-thread publisher 搬运），并记录 `sidecar_wait_us`。 |
+| Q sidecar 状态协议与重置（已更正：`qheader` 已退役） | `ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp`（单一真源 `tp5_late_q_control_ptr/cptr`、`tp5_late_q_bcast_payload_offset`、`tp5_late_q_payload_word_offset`，约 L177–L200；重置约 L4381–L4397） | L4381–L4397 | `status[6] = 0`（Exact 回退 Q ready）；aggressive 下经 `tp5_late_q_control_ptr` 复位控制区 word0（ready）/word1（counter），即 `bcast_host+64+late_host_offset`。旧 `qheader[4]/[5]` 表述已作废。 |
+| Q sidecar 轮询与归约 | `ggml/src/ggml-vulkan/ggml-vulkan-collective.cpp`（同上单一真源函数族；轮询与归约约 L4696–L4736） | L4696–L4736 | 区分 `late_sidecar_f16`（经 `tp5_late_q_control_cptr` 轮询控制区 word0，payload 经 `tp5_late_q_bcast_payload_offset` 定位 `bcast_host+128+late_host_offset`）与 F32 Exact（轮询 `status[6]`，payload 走 host-imported 广播 `bcast_host+64+late_host_offset`，经独立 64-thread publisher 搬运），并记录 `sidecar_wait_us`。 |
 | `[tp5-mtp-cycle]` 格式化 | `common/speculative.cpp` | L25–L36 | 定义周期输出字段：`cycle`, `draft_us`, `target_us`, `catchup_us`, `handoff_us`, `total_us`, `eff`。 |
 | `[tp5-mtp-cycle-summary]` 格式化 | `common/speculative.cpp` | L38–L54 | 定义周期汇总输出字段与平均微秒。 |
 | `GGML_TP5_MTP_PROFILE` 开关 | `common/speculative.cpp` | L1617, L1762, L2512 | 读取 `GGML_TP5_PROFILE` 或 `GGML_TP5_MTP_PROFILE` 激活周期记录。 |
