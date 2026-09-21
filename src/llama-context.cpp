@@ -2429,6 +2429,16 @@ llama_context::target_capacity_decision llama_context::evaluate_target_capacity_
         }
     }
 
+    bool gdn_unsupported = (hparams.n_embd_r() > 0 || hparams.n_embd_s() > 0);
+    if (!gdn_unsupported) {
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (hparams.is_recr(il)) {
+                gdn_unsupported = true;
+                break;
+            }
+        }
+    }
+
     if (ple_unsupported) {
         res.entered = false;
         res.capacity_rows = ubatch.n_tokens;
@@ -2444,6 +2454,11 @@ llama_context::target_capacity_decision llama_context::evaluate_target_capacity_
         res.capacity_rows = ubatch.n_tokens;
         res.capacity_outputs = std::max<uint32_t>(1u, frame.active_outputs);
         res.reason = "model with QSA";
+    } else if (gdn_unsupported) {
+        res.entered = false;
+        res.capacity_rows = ubatch.n_tokens;
+        res.capacity_outputs = std::max<uint32_t>(1u, frame.active_outputs);
+        res.reason = "model with GDN/recurrent layers";
     } else {
         res.entered = true;
         res.capacity_rows = verify_tokens;

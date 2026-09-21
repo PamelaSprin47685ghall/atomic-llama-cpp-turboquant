@@ -2191,5 +2191,9 @@ struct llm_graph_context {
 // Expand ubatch token dimensions to fixed capacity for single-sequence capacity graph
 llama_ubatch llama_ubatch_expand_capacity(const llama_ubatch & ubatch, uint32_t capacity_rows);
 
+// Calculate the slice start index in conv_input for a given rollback slot,
+// ensuring the extracted tail strictly covers active tokens and never the inactive capacity suffix.
+int64_t llama_calc_conv_tail_s_idx(int64_t state_cols, uint32_t n_tokens_active, int64_t slot);
+
 // TODO: better name
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional);

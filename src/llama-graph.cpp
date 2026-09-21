@@ -4123,6 +4123,11 @@ llama_ubatch llama_ubatch_expand_capacity(const llama_ubatch & ubatch, uint32_t 
     return shape_ubatch;
 }
 
+int64_t llama_calc_conv_tail_s_idx(int64_t state_cols, uint32_t n_tokens_active, int64_t slot) {
+    const int64_t active_cols = state_cols + n_tokens_active;
+    return std::max<int64_t>(0, active_cols - state_cols - slot);
+}
+
 static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,
