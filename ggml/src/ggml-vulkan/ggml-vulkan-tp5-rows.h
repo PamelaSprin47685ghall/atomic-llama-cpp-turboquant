@@ -77,3 +77,44 @@ inline bool vk_tp5_make_row_arguments(const vk_tp5_row_dispatch & definition, ui
     out = args;
     return true;
 }
+
+// Unified LateBind token dimension: scatter[token][stream], rho[token][stream],
+// Q[token][stream][rank_dim], Y[token][width].
+// Fixed small column tile (VK_TP5_DIRECT_COLUMN_TILE = 4) handles effective rows.
+struct vk_tp5_latebind_layout {
+    uint32_t width = 0;
+    uint32_t streams = 4;
+    uint32_t rank_dim = 320;
+    uint32_t capacity_rows = VK_TP5_DIRECT_COLUMN_TILE; // 4 rows
+
+    uint64_t scatter_elements() const { return uint64_t(capacity_rows) * streams; }
+    uint64_t rho_elements()     const { return uint64_t(capacity_rows) * streams; }
+    uint64_t q_elements()       const { return uint64_t(capacity_rows) * streams * rank_dim; }
+    uint64_t y_elements()       const { return uint64_t(capacity_rows) * width; }
+    uint64_t act_q8_blocks()    const { return uint64_t(capacity_rows) * streams * (width / 32); }
+    uint64_t lo_elements()      const { return uint64_t(capacity_rows) * rank_dim; }
+
+    uint64_t scatter_offset(uint32_t token, uint32_t stream) const {
+        return uint64_t(token) * streams + stream;
+    }
+    uint64_t rho_offset(uint32_t token, uint32_t stream) const {
+        return uint64_t(token) * streams + stream;
+    }
+    uint64_t q_offset(uint32_t token, uint32_t stream, uint32_t row) const {
+        return (uint64_t(token) * streams + stream) * rank_dim + row;
+    }
+    uint64_t y_offset(uint32_t token, uint32_t col) const {
+        return uint64_t(token) * width + col;
+    }
+    uint64_t lo_offset(uint32_t token, uint32_t row) const {
+        return uint64_t(token) * rank_dim + row;
+    }
+};
+
+inline bool vk_tp5_latebind_token_is_active(uint32_t token, uint32_t active_rows) {
+    return token < active_rows;
+}
+
+inline uint64_t vk_tp5_latebind_active_q_elements(uint32_t active_rows, uint32_t streams, uint32_t rank_dim) {
+    return uint64_t(active_rows) * streams * rank_dim;
+}

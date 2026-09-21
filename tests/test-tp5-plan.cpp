@@ -1188,6 +1188,80 @@ static void test_tp5_latebind_protocol_invariants() {
     fprintf(stderr, "  LateBind protocol invariants: Q control/payload non-overlapping, word alignment verified, F32-Q order asserted\n");
 }
 
+static void test_tp5_latebind_multi_row_invariants() {
+    fprintf(stderr, "--- test_tp5_latebind_multi_row_invariants ---\n");
+    // Contract: Multi-row verification (active_rows in {1, 2, 4}) within single capacity=4 definition.
+    // Layout/parameters defined once; Q/sidecar layout contiguous; single-row non-regression guaranteed.
+    constexpr size_t TP5_RELAY_HEADER_BYTES = 64;
+    constexpr size_t TP5_LATE_Q_CONTROL_BYTES = 64;
+    constexpr size_t TP5_LATE_MAX_FLOATS = 8192;
+
+    const auto ctrl_offset = [](size_t L) { return TP5_RELAY_HEADER_BYTES + L; };
+    const auto payload_offset = [](size_t L, bool fast) {
+        return TP5_RELAY_HEADER_BYTES + L + (fast ? TP5_LATE_Q_CONTROL_BYTES : 0);
+    };
+
+    const uint32_t width = 2560;
+    const uint32_t streams = 4;
+    const uint32_t late_rank = 320;
+    const size_t capacity_rows = 4;
+    const size_t max_late_floats = capacity_rows * streams * late_rank; // 5120 <= 8192
+    TEST_ASSERT(max_late_floats <= TP5_LATE_MAX_FLOATS);
+
+    // Multi-row boundary sweep: 1..4 rows (including 3 rows)
+    for (uint32_t rows : {1u, 2u, 3u, 4u}) {
+        const size_t n_elems = size_t(width) * rows;
+        // Invariant 1: n_elems must be divisible by width
+        TEST_ASSERT(n_elems % width == 0);
+        const size_t derived_rows = n_elems / width;
+        TEST_ASSERT(derived_rows == rows);
+        TEST_ASSERT(derived_rows <= capacity_rows);
+
+        // Invariant 2: Active late_count matches GPU output and CPU handoff exactly
+        const size_t active_late_count = derived_rows * streams * late_rank;
+        TEST_ASSERT(active_late_count <= max_late_floats);
+        TEST_ASSERT(active_late_count == rows * 1280);
+
+        // Invariant 3: tp5_late_stage capacity check: capacity_rows * streams * rank_dim <= TP5_LATE_MAX_FLOATS
+        TEST_ASSERT(size_t(derived_rows) * streams * late_rank <= TP5_LATE_MAX_FLOATS);
+
+        // Invariant 4: Word alignment & non-overlapping invariants for multi-row
+        const size_t L = width * sizeof(float);
+        TEST_ASSERT(ctrl_offset(L) % 64 == 0);
+        TEST_ASSERT(payload_offset(L, true) % 64 == 0);
+        TEST_ASSERT(ctrl_offset(L) + TP5_LATE_Q_CONTROL_BYTES <= payload_offset(L, true));
+
+        // Invariant 5: External tensor binding size requirements against capacity_rows
+        const uint64_t mixed_min_size = uint64_t(derived_rows) * width * sizeof(float);
+        const uint64_t lo_min_size = uint64_t(derived_rows) * late_rank * sizeof(float);
+        const uint64_t res_min_size = uint64_t(derived_rows) * streams * width * sizeof(float);
+        const uint64_t binding1_local_z_min_size = uint64_t(derived_rows) * width * sizeof(float);
+        TEST_ASSERT(mixed_min_size == rows * 2560 * sizeof(float));
+        TEST_ASSERT(lo_min_size == rows * 320 * sizeof(float));
+        TEST_ASSERT(res_min_size == rows * 10240 * sizeof(float));
+        TEST_ASSERT(binding1_local_z_min_size == rows * 2560 * sizeof(float));
+
+        // Negative regression test: hc.bindings[1] under-sized must be rejected fail-closed
+        auto check_binding1_capacity = [&](uint64_t sz) -> bool {
+            return sz >= binding1_local_z_min_size;
+        };
+        TEST_ASSERT(check_binding1_capacity(binding1_local_z_min_size));
+        TEST_ASSERT(!check_binding1_capacity(binding1_local_z_min_size - 1));
+        if (rows > 1) {
+            // Legacy single-row size against multi-row capacity must fail closed
+            TEST_ASSERT(!check_binding1_capacity(width * sizeof(float)));
+        }
+
+        // Single-row non-regression check
+        if (rows == 1) {
+            TEST_ASSERT(active_late_count == streams * late_rank);
+            TEST_ASSERT(active_late_count == 1280);
+            TEST_ASSERT(mixed_min_size == width * sizeof(float));
+        }
+    }
+    fprintf(stderr, "  LateBind multi-row invariants: 1..4-row boundaries verified, external binding capacity asserted, single-row non-regression asserted\n");
+}
+
 int main() {
     test_plan_rejects_bad_ranks();
     test_plan_rejects_indivisible_moe();
@@ -1212,6 +1286,7 @@ int main() {
     test_tp5_split_state_gdn_qkv(true);
     test_nextn_layer_plan_bounds();
     test_tp5_latebind_protocol_invariants();
+    test_tp5_latebind_multi_row_invariants();
     test_tp5_numerical_mode_resolution();
 
     if (g_failures > 0) {

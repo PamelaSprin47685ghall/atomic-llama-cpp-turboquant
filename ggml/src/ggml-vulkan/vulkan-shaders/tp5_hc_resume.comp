@@ -30,6 +30,7 @@ layout(push_constant) uniform Params {
     uint spin_max;
     uint status_word_offset;
     uint profile_spin;
+    uint active_rows;
 } p;
 const uint GENERATION_WORD = 0u;
 const uint SPIN_WORD = 5u;
@@ -62,6 +63,7 @@ layout(push_constant) uniform Params {
     uint status_word_offset;
     uint profile_spin;
     uint sidecar_f16;
+    uint active_rows;
 } p;
 const uint GENERATION_WORD = 2u;
 const uint SPIN_WORD = 7u;
@@ -105,62 +107,66 @@ bool await_input() {
 void finalize_stream(const uint iterations) {
     const uint lane = gl_LocalInvocationID.x;
     const uint stream = gl_WorkGroupID.x;
-    const uint base = stream * p.width;
-    const float s = scatter[stream];
-    float values[16];
-    // Independent preparation happens before the point-of-use wait. Keep
-    // this bounded: do not preload the full W_down matrix into registers.
-    [[unroll]] for (uint i = 0u; i < 16u; ++i) {
-        const uint col = lane + i * 256u;
-        values[i] = i < iterations && col < p.width ? residual[base + col] : 0.0;
-    }
     if (!await_input()) {
         const float nanv = uintBitsToFloat(0x7fc00000u);
-        for (uint col = lane; col < p.width; col += 256u) {
-            combined[base + col] = nanv;
-            normalized[base + col] = nanv;
-            if (stream == 0u) sum_output[col] = nanv;
+        for (uint token = 0u; token < 4u; ++token) {
+            if (token >= p.active_rows) break;
+            const uint base = token * (p.streams * p.width) + stream * p.width;
+            for (uint col = lane; col < p.width; col += 256u) {
+                combined[base + col] = nanv;
+                normalized[base + col] = nanv;
+                if (stream == 0u) sum_output[token * p.width + col] = nanv;
+            }
+            if (lane == 0u) inverse_rho[token * p.streams + stream] = nanv;
         }
-        if (lane == 0u) inverse_rho[stream] = nanv;
         return;
     }
-    float ss = 0.0;
-    [[unroll]] for (uint i = 0u; i < 16u; ++i) {
-        const uint col = lane + i * 256u;
-        if (i < iterations && col < p.width) {
-            const float y = uintBitsToFloat(inbox[16u + col]);
-            precise float product = y * s;
-            precise float value = values[i] + product;
-            values[i] = value;
-            combined[base + col] = value;
-            // Retain canonical y for any other graph reader, without a
-            // separate copy dispatch or a subsequent HC readback.
-            if (stream == 0u) sum_output[col] = y;
+    [[unroll]] for (uint token = 0u; token < 4u; ++token) {
+        if (token >= p.active_rows) break;
+        const uint base = token * (p.streams * p.width) + stream * p.width;
+        const float s = scatter[token * p.streams + stream];
+        float values[16];
+        [[unroll]] for (uint i = 0u; i < 16u; ++i) {
+            const uint col = lane + i * 256u;
+            values[i] = i < iterations && col < p.width ? residual[base + col] : 0.0;
         }
-        ss += values[i] * values[i];
-    }
-    ss = subgroupAdd(ss);
-    if (gl_SubgroupInvocationID == 0u) {
-        partials[gl_SubgroupID] = ss;
-    }
-    barrier();
-    if (gl_SubgroupID == 0u) {
-        float fold = gl_SubgroupInvocationID < gl_NumSubgroups ?
-            partials[gl_SubgroupInvocationID] : 0.0;
-        fold = subgroupAdd(fold);
+        float ss = 0.0;
+        [[unroll]] for (uint i = 0u; i < 16u; ++i) {
+            const uint col = lane + i * 256u;
+            if (i < iterations && col < p.width) {
+                const float y = uintBitsToFloat(inbox[16u + token * p.width + col]);
+                precise float product = y * s;
+                precise float value = values[i] + product;
+                values[i] = value;
+                combined[base + col] = value;
+                if (stream == 0u) sum_output[token * p.width + col] = y;
+            }
+            ss += values[i] * values[i];
+        }
+        ss = subgroupAdd(ss);
         if (gl_SubgroupInvocationID == 0u) {
-            partials[0] = fold;
+            partials[gl_SubgroupID] = ss;
         }
-    }
-    barrier();
-    const float scale = inversesqrt(partials[0] / float(p.width) + p.epsilon);
-    if (lane == 0u) inverse_rho[stream] = scale;
-    [[unroll]] for (uint i = 0u; i < 16u; ++i) {
-        const uint col = lane + i * 256u;
-        if (i < iterations && col < p.width) {
-            float norm = scale * values[i];
-            normalized[base + col] = norm * gamma[base + col];
+        barrier();
+        if (gl_SubgroupID == 0u) {
+            float fold = gl_SubgroupInvocationID < gl_NumSubgroups ?
+                partials[gl_SubgroupInvocationID] : 0.0;
+            fold = subgroupAdd(fold);
+            if (gl_SubgroupInvocationID == 0u) {
+                partials[0] = fold;
+            }
         }
+        barrier();
+        const float scale = inversesqrt(partials[0] / float(p.width) + p.epsilon);
+        if (lane == 0u) inverse_rho[token * p.streams + stream] = scale;
+        [[unroll]] for (uint i = 0u; i < 16u; ++i) {
+            const uint col = lane + i * 256u;
+            if (i < iterations && col < p.width) {
+                float norm = scale * values[i];
+                normalized[base + col] = norm * gamma[stream * p.width + col];
+            }
+        }
+        barrier();
     }
 }
 void main() {
@@ -194,55 +200,76 @@ void main() {
         if (lane == 0u) atomicCompSwap(status[p.status_word_offset + 2u], 0u, 0xffffffffu);
         return;
     }
-    const vec4 scale = vec4(inverse_rho[0], inverse_rho[1], inverse_rho[2], inverse_rho[3]);
     if (!await_input()) {
-        for (uint row = lane; row < p.rank_dim; row += 256u)
-            lo[row] = uintBitsToFloat(0x7fc00000u);
+        for (uint token = 0u; token < 4u; ++token) {
+            if (token >= p.active_rows) break;
+            for (uint row = lane; row < p.rank_dim; row += 256u)
+                lo[token * p.rank_dim + row] = uintBitsToFloat(0x7fc00000u);
 #ifdef TP5_RESUME_LO_Q8
-        if (lane < 10u) {
-            lo_q8[lane].d = float16_t(uintBitsToFloat(0x7fc00000u));
-            [[unroll]] for (uint k = 0u; k < 16u; ++k)
-                lo_q8[lane].qs[k] = int16_t(0);
-        }
+            if (lane < 10u) {
+                lo_q8[token * 10u + lane].d = float16_t(uintBitsToFloat(0x7fc00000u));
+                [[unroll]] for (uint k = 0u; k < 16u; ++k)
+                    lo_q8[token * 10u + lane].qs[k] = int16_t(0);
+            }
 #endif
+        }
         return;
     }
 #ifdef TP5_RESUME_LO_Q8
     const uint row = lane;
-    const vec4 q = vec4(
-        load_q(row),
-        load_q(p.rank_dim + row),
-        load_q(2u * p.rank_dim + row),
-        load_q(3u * p.rank_dim + row));
-    const float scaled = dot(q, scale) * 0.25;
-    const float value = scaled / (1.0 + exp(-scaled));
-    lo[row] = value;
+    [[unroll]] for (uint token = 0u; token < 4u; ++token) {
+        if (token >= p.active_rows) break;
+        const vec4 scale = vec4(
+            inverse_rho[token * 4u + 0u],
+            inverse_rho[token * 4u + 1u],
+            inverse_rho[token * 4u + 2u],
+            inverse_rho[token * 4u + 3u]);
+        const uint q_token_offset = token * (4u * p.rank_dim);
+        const vec4 q = vec4(
+            load_q(q_token_offset + row),
+            load_q(q_token_offset + p.rank_dim + row),
+            load_q(q_token_offset + 2u * p.rank_dim + row),
+            load_q(q_token_offset + 3u * p.rank_dim + row));
+        const float scaled = dot(q, scale) * 0.25;
+        const float value = scaled / (1.0 + exp(-scaled));
+        lo[token * p.rank_dim + row] = value;
 
-    const float amax = subgroupMax(abs(value));
-    const float d = amax * (1.0 / 127.0);
-    const float inv_d = d != 0.0 ? 1.0 / d : 0.0;
-    const int qv = clamp(int(round(value * inv_d)), -127, 127);
-    lo_q_tmp[row] = qv;
-    barrier();
+        const float amax = subgroupMax(abs(value));
+        const float d = amax * (1.0 / 127.0);
+        const float inv_d = d != 0.0 ? 1.0 / d : 0.0;
+        const int qv = clamp(int(round(value * inv_d)), -127, 127);
+        lo_q_tmp[row] = qv;
+        barrier();
 
-    const uint sub = gl_SubgroupID;
-    const uint sublane = gl_SubgroupInvocationID;
-    if (sublane == 0u) lo_q8[sub].d = float16_t(d);
-    if (sublane < 16u) {
-        const uint base = sub * 32u + 2u * sublane;
-        const uint q0 = uint(lo_q_tmp[base]) & 0xffu;
-        const uint q1 = uint(lo_q_tmp[base + 1u]) & 0xffu;
-        lo_q8[sub].qs[sublane] = int16_t(q0 | (q1 << 8u));
+        const uint sub = gl_SubgroupID;
+        const uint sublane = gl_SubgroupInvocationID;
+        if (sublane == 0u) lo_q8[token * 10u + sub].d = float16_t(d);
+        if (sublane < 16u) {
+            const uint base = sub * 32u + 2u * sublane;
+            const uint q0 = uint(lo_q_tmp[base]) & 0xffu;
+            const uint q1 = uint(lo_q_tmp[base + 1u]) & 0xffu;
+            lo_q8[token * 10u + sub].qs[sublane] = int16_t(q0 | (q1 << 8u));
+        }
+        barrier();
     }
 #else
-    for (uint row = lane; row < p.rank_dim; row += 256u) {
-        const vec4 q = vec4(
-            load_q(row),
-            load_q(p.rank_dim + row),
-            load_q(2u * p.rank_dim + row),
-            load_q(3u * p.rank_dim + row));
-        const float scaled = dot(q, scale) * 0.25;
-        lo[row] = scaled / (1.0 + exp(-scaled));
+    [[unroll]] for (uint token = 0u; token < 4u; ++token) {
+        if (token >= p.active_rows) break;
+        const vec4 scale = vec4(
+            inverse_rho[token * 4u + 0u],
+            inverse_rho[token * 4u + 1u],
+            inverse_rho[token * 4u + 2u],
+            inverse_rho[token * 4u + 3u]);
+        const uint q_token_offset = token * (4u * p.rank_dim);
+        for (uint row = lane; row < p.rank_dim; row += 256u) {
+            const vec4 q = vec4(
+                load_q(q_token_offset + row),
+                load_q(q_token_offset + p.rank_dim + row),
+                load_q(q_token_offset + 2u * p.rank_dim + row),
+                load_q(q_token_offset + 3u * p.rank_dim + row));
+            const float scaled = dot(q, scale) * 0.25;
+            lo[token * p.rank_dim + row] = scaled / (1.0 + exp(-scaled));
+        }
     }
 #endif
     memoryBarrierBuffer();
