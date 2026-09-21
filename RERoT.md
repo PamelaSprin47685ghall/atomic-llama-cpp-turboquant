@@ -2336,6 +2336,7 @@ DAG RERoT implementation candidate
 | DDVR | `tests/test-rerot-ddvr.cpp` |
 | attention | `tests/test-rerot-attn.cpp` |
 | recurrent | `tests/test-rerot-recurrent.cpp` |
+| 数学参考层（Q3/Q5/Q6/Q7） | `src/llama-rerot-math.h`, `src/llama-rerot-math.cpp`, `tests/test-rerot-math.cpp` |
 | model fixed-tape | `tests/test-rerot-model-single.cpp`, `test-rerot-model-batch.cpp`, `test-rerot-model-permute.cpp` |
 
 纯文档/源码核对后常用的低风险检查：
@@ -2373,3 +2374,105 @@ c3648d789  DAG logical/view/fixed-entry implementation
 4. 历史数字保留 artifact/version 边界。
 5. 研究假说不升级为默认 fallback，除非有明确决定和门。
 6. 不再新增新的 RERoT 指南/审计/交接作为并行事实源。
+
+---
+
+## 21. 计算组织研究线（2026-09-21 轮）
+
+本节记录“重画计算组织而非先调 kernel”研究线的当前落地状态。十个研究问题（共享单位、段级 reader view、公共 KV 块服务多读者、DAG 结构/数值分离、GDN 共同基底+低秩增量、已知序列块递推、PQ2 位平面、充分统计量、联合采样、K×H 网格）中，第一轮（`29cd8f51a`）把四条等义数学落成代码并重构 indexed 布局扫描；第二轮（`2b7b479d2`）把剩余五个问题（Q2/Q4/Q8/Q9/Q10）的数学与契约层落成代码，并补上 Q5/Q6 的 F32 数值门实测；第三轮（`8772195ac`）把 Q2/Q4 的结构/数值分离接入 decode 热路径（`llama_rerot_build_query_layouts_shared`）；第四轮（`4f75dea5d`）把同一函数的数值通道换成段级偏差序＋k 路归并，并把 cache 侧 cell 扫描改为跨 reader 共享供给；第五轮（`66914c692`）把 Q3 host 侧推向单一共享 key world——R 个 pen 共享一次结构扫描与排序，每 reader 只付 ownership 过滤＋数值 pass（`llama_rerot_build_query_layouts_multi_reader`），并修复第四轮两个已提交 bug（own private/pending 的 frontier 门、段内 storage 重复下的偏差序置换）。第六轮（`0c793e2ac`）在同一函数内落三条生产形态快路径——tagged 序预检跳排序、连续 storage 恒等偏差序、uniform 桶＋全拥有恒等列表——把 decode 形态（Q=1）再压 2×。第七轮把剖面推进到 cache 级全路径：ownership 列单趟共享填充、validate 逐 entry 哈希去重换字节位图、装配 reserve——cache 级 -46%。第八轮攻下 Q=6（MTP verify 形态）数值通道：连续 run＋恒等通过集的段预计算 key-id 顺序列，发射链三次依赖随机读塌缩为一次顺序读，==best 重检整体提升出循环——Q=6 builder 16210→8758 us（1.85×）。第九轮把 reader 无关的段属性（uniform 探测、fast_keys 列）上收到共享结构 pass，每 reader 一次的 R×K 重复探测消失——builder -16%（R=6）到 -50%（R=12 K=262144），收益随 R 与 K 增长。第十轮（09-22 深夜）把 ownership 列从字节向量改为 packed bitset 直供：cache 级的 R×K 字节展开消失，builder 内 owned 探测变一次 AND（见 21.1 第九、十轮）。
+
+### 21.1 已落地（当前 HEAD，全部 CPU 验证）
+
+**数学参考层 `src/llama-rerot-math.{h,cpp}`**（纯 FP64，无 KV/server/graph 依赖）：
+
+1. **[Q3] 共享 KV 多读者块 attention**：`llama_rerot_shared_block_attention` 一次读一个物理块、为每个可见读者独立产生 (m, z, u) 在线 softmax 状态；`llama_rerot_attn_state_merge` 按读者合并。共享的是数据供给，不是 softmax 统计量——与 §2.5 STRONG 语义一致。
+2. **[Q5] GDN 共同基底+低秩增量**：`S_i = a_i·B + U_i·V_i^T`，每步精确追加一个秩一项（`llama_rerot_gdn_lowrank_step`）；共享基底的 `B^T x` 投影一次计算多消费者复用（`llama_rerot_gdn_base_project`）。不是 shared-RBB，不合并 lane 状态；基底只读。
+3. **[Q6] 已知 token 块递推（WY 折叠）**：`llama_rerot_gdn_chunk_fold` 把 T 步已知（teacher-forced）token 折成 `(M, Y)` 紧凑仿射转移：`M = I − K·W·K^T`，`W = (I+L)^{-1}·diag(β)`，`L[j,c] = β_j(k_j·k_c)` (j>c，**行索引 β**)，`Y` 为零状态臂。生产 kernel 应按秩算子 `x → G·(x − K(W(K^T x)))` 应用，并把同一折叠块应用到多 lane 状态。
+4. **[Q7] PQ2_0 位平面恒等式**：`{0,1,2,3}→{−1,0,+1,+2}` 使块内积变成 `Σ_{b0=1}x + 2Σ_{b1=1}x − Σx`（`llama_rerot_pq2_bitplane_dot`）或每 4 权重一次 16 表 LUT（`llama_rerot_pq2_lut_dot`）。与 ggml 整数路径位级一致（整数 activation 时）。
+
+第二轮新增（同一文件，纯 FP64/位级，无 KV/server/graph 依赖）：
+
+5. **[Q2] span 级 reader view**：`llama_rerot_span_view`（begin/len/phase）——段内 `s_j − v_j = phase` 常数，故 `q_v + s_j − v_j = q_v + phase` 对段内所有 j 成立（`llama_rerot_span_effective_pos`），整段共享一枚 effective Q；因果截断是一次比较（`llama_rerot_span_causal_len`），不是逐 key 掩码。视图描述复杂度由 span 数而非 token 数决定（`llama_rerot_span_long_fraction` 度量碎片化）。限制：空洞/异相位/异可见性必须拆段，最坏片段数仍接近 token 数。
+6. **[Q4] 结构/数值分离**：run ORDER 是结构（`llama_rerot_run_order`，签名 `llama_rerot_run_order_signature` 仅随结构事件变化），长度/水位/virtual starts 是数值（`llama_rerot_virtual_starts` 前缀和；`..._after_growth` 增量更新只平移后续 run，零结构工作）。“拓扑没变”≠“位置没变”：前缀 run 增长会移动后续 virtual 起点——但这恰是数值更新，不是重建世界。
+7. **[Q8] 跳块误差界（近似路线，明确门控）**：`llama_rerot_skip_mass_bound`（`q·k_j ≤ q·c + |q|·r`，Cauchy–Schwarz）给出被跳块质量上界 `Z_skip ≤ n·exp(scale·(q·c+|q|·r))`；`llama_rerot_skip_output_bound` 给出 `‖o − o_keep‖ ≤ 2·V_max·δ`，`δ = Z̄_skip/(Z_keep+Z̄_skip)`。同时以可执行反例固化“无有限充分统计量”结论：keys `{-1,+1}` vs `{0,0}` 数量与一阶矩相同但 `Z(q)` 不同（`2cosh(q) ≠ 2`）——同一 query 的块结果可精确合并（Q3），不同 query 的块结果不能因读同一历史而互用。
+8. **[Q9] 联合采样契约**：per-pen RNG 流（`llama_rerot_joint_sample_seed`，(base, pen) 派生 SplitMix64）使各笔 draw 与 cohort 大小、行序无关（轨迹安全：批量化不得改变各笔 RNG 消耗次序）；`llama_rerot_joint_sample_row` 按 temperature → top-k → top-p、最低索引 tie-break；贪心路径 `llama_rerot_joint_argmax_rows` 按块归约 argmax，不回传全行 logits。输出单位是“各笔下一步决策+状态与事件”，不只是 token 数组。
+9. **[Q10] frontier 网格联合验证**：`llama_rerot_verify_grid` 按列推进、STRONG barrier-after——cell (pen, h) 存活当且仅当自身前缀存活且所有 read source 的 h−1 列 cell 存活（自读平凡满足）；被拒笔发布 replacement，依赖者在 h+1 消费 replacement 而非草稿。`llama_rerot_verify_grid_naive` 是可执行反例：逐行独立验证在跨笔读下接受率虚高（测试中 C 全部自身草稿正确，但读 B 的被拒列，正确引擎 accepted=2、naive=3）。
+
+
+**indexed 布局 host 侧重构 `llama_kv_cache::rerot_build_attn_layout`**：旧路径每 query 行重建整份 n_kv key 表并重新排序（O(Q·n_kv) 扫描+排序，每行 ~40B·n_kv 临时内存）。第一轮（09-21）按 distinct reader state 分组，每组一次扫描+排序。第二轮（09-22）把组内路径也换成 Q2/Q4 生产化：新增纯函数 `llama_rerot_build_query_layouts_shared`（`src/llama-rerot.{h,cpp}`）——**结构一次**（可见性分类 FULL/gated、两臂各自排序、per-run 升序 storage 数组、own-row 查找表），**每 query 只做数值**（BASE 臂与每个 own-run 段各一次二分 causal 截断、稠密 virtual 计数、effective 分组一次稳定排序，替代逐 key std::map）。逐 query `llama_rerot_build_query_layout` 保留为 oracle，两者 group-for-group/entry-for-entry 构造性一致（测试直接对拍）。实测（开发机 CPU，合成 K 键/Q 行）：Q=6（单 pen MTP verify 形态）稳定 **5–8×**（K=4096：1046→156 us；K=16384,Q=12：8920→1074 us），Q=1 也有 ~1.1×。
+
+**第四轮深化（同一函数，09-22 深夜）**：
+- **数值通道换段级偏差序＋k 路归并**：段内 `effective = (qv − B_L) + d_i`，其中偏差 `d_i = s_i − i` 与 query 无关（i 为段内发射序）。结构期把每段（含 BASE 臂）按 d 稳定排序一次；每 query 只做二分 causal 截断＋R+1 路归并（组边界＝归并中的不同值，组内 entry 序＝列表序，即 oracle 的 stable_sort 输出序）。own-row 虚拟索引从 O(V) 指针扫描换成段前缀算术。重复键检测从 unordered_set（K=65536 实测 1141 us）换字节位图（45 us）；全序比较器（唯一 key_index 断尾）从 stable_sort 换 std::sort。实测（开发机 CPU，合成 K 键，物理序打乱＝最坏情形）：K=65536,Q=6：13399→7200 us；K=262144,Q=6：82351→44704 us；per-query 增量 261 us（结构 5690 us 为剩余大头，其中 tagged 全局排序 3330 us——rank 分桶可再省，未做）。对 oracle 逐 query 路径：生产形态（物理序＝写入序）K=65536,Q=6：16073→4783 us（**3.4×**）。
+- **cache 侧 cell 扫描跨 reader 共享（Q3 host 侧）**：`rerot_build_attn_layout` 的 R 个 reader 组原先各自 O(n_kv) 重建 key 表（每 cell 一次 rerot_get/pos_get/seq_has）；现改为一次扫描建共享 key 表，每组的 ownership 列从 per-seq 成员位图填。R 个 pen 同 frontier 执行时 cell 访问从 R·n_kv 降为 n_kv + R·(位图填充)。多 reader 跨组路径由 `test_ddvr_two_query_groups` 端到端覆盖。
+
+**第五轮：单一共享 key world（Q3 host 侧完成，09-22 夜）**：
+
+- **多 reader 共享世界**：新增 `llama_rerot_build_query_layouts_multi_reader(readers, query_pos, keys, base_owned)`（`src/llama-rerot.{h,cpp}`）——对 `keys` 做**一次**结构 pass（按 (episode, run, owner-node) 分桶、每桶按 oracle 的 (storage, frontier, idx) 排序＋偏差 (s−i) 序及其逆置换），**每 reader 只**做 ownership 相关过滤（own 段＝run 属主 node 等于 reader 的桶；foreign 段按 frontier 规则全量；base 臂按 `base_owned[r]` 列）＋逐 query 数值 pass（causal 截断＋k 路归并）。`rerot_build_attn_layout` 的 group 循环随之改为一次扫描（上界 `used_max_p1()`）＋一次 multi 调用；每组不再整表拷贝。语义边界：一个 run id 可由多个 node 先后持有（cell 生命周期内），分桶键含 owner-node 保证与逐行 node 判定逐字节一致——`test_sr_shared_physical_rows_3_ddvr_slots`（pub node 1 与 private node 9 同 run_id 1）钉住这个形状。
+- **修第四轮两个已提交 bug**（探针＋对拍抓出）：
+  1. **own private/pending 行的 frontier 门**：shared builder 曾对所有 own 行施加 `frontier <= reader.frontier`，而 oracle 对 private/pending 只查 `node==reader && owned && causal cut`——a future-frontier pending 行（当前写入批次）被错误丢弃。修复：private/pending 豁免 frontier 门（与 flashprefill builder 的判定对齐）。
+  2. **段内 storage 重复下的偏差序置换**：第四轮把段 storage 数组置换进偏差序，MTP verify 共享位置时置换非恒等、数组失序，`upper_bound` 截断/own-row 查找随即错位（7 个对拍 case 全分歧）。修复：段内保持**双序**——tagged 序（升序 storage，供截断与 own-row 二分）与偏差序（置换 d2t/t2d，供归并）；截断是 tagged 前缀，归并按 d2t[dp] < cut 过滤。
+- **实测**（开发机 CPU，合成 K 键，production shape 物理序=写入序）：R=6 时 legacy（每组拷贝＋单 reader builder）42293→17885 us（**2.36×**）；K=262144 R=6：259597→115992（2.24×）；R=12：92168→34039（2.71×）；R=1 仍 1.10×。对 per-query oracle：R=6，K=65536：112728→17885（**6.3×**）。乱序最坏形态不退化（17758 vs 17884）。
+
+**第六轮：生产形态快路径（09-22 深夜，同一函数内）**：
+
+- **tagged 序预检**：append-only run 的行按写入序到达＝tagged (storage, frontier, idx) 序（行内 tie 由 key_index 升序到达序保证）。O(n) 非降探测失败才落 std::sort——生产形态跳过全部桶排序。
+- **连续 storage 恒等偏差序**：桶内 storage 严格 +1 连续时 d=s₀ 处处相等，偏差序＝恒等，d2t/t2d 退化为 O(n) 顺序填充（跳过偏差排序与置换表构建）。空洞/重复（reclaim、MTP verify）仍走通用路径。
+- **uniform 桶＋全拥有恒等列表**：桶内 (visibility, frontier) 全一致时 frontier 门整桶一次判定；own 桶 ownership 列全 1（生产形态：reader 拥有自己整条 run）时 dp/prefix 列表＝恒等序列，不物化。`seg_view` 加 `identity` 旗标，消费端（vis_count、own-row 前缀、归并游标）经 `dp_size/dp_at/prefix_at` 访问。
+- **教训（本轮唯一 bug，200 轮对拍立即抓住）**：第二版编辑把 tagged 排序调用整个删除、只留探测——探测为真时无排序可跳，为假时也不排。8054 断言失败。修复＝条件排序恢复。教训：快路径的"跳过"必须写成 `if (!fast) { general }`，不能删掉 general 分支。
+- **实测**（开发机 CPU，合成 K 键，production shape，Q=1 decode 形态）：R=6：第五轮 7882→**3900 us（2.0×）**；R=1：6200→1946（3.2×）；K=262144 R=6：28864 us。Q=6（MTP verify 形态）数值通道主导，维持 ~16.4ms。相位剖面（Q=1 R=6）：struct 1.0ms + filter 0.33ms + numeric 1.8ms——numeric 即 39 万 entry 发射（输出本体），接近地板。乱序最坏形态不退化（identity/排序路径正确回退通用分支）。
+
+**第七轮：cache 级全路径剖面（09-22 凌晨）**：
+
+- **方法**：cache 级基准（真实 `llama_kv_cache`＋R pen 单 ubatch decode 形态，`/tmp/bench_cache_layout.cpp` 模板）＋相位计时拷贝。发现开发机 build 目录是 **Debug（-O0）**：绝对数字只作相对比较；纯 builder 的 -O2 数字由独立编译基准补齐。
+- **ownership 列单趟共享填充**：`rerot_build_attn_layout` 原先对每 reader 调 `cells.seq_has` 逐 (cell, reader) 测试（R·n_kv 次 bitset test）；现改为对 resident cells **一趟**读 `seq_get_all` 位图、按 distinct reader 序列表一次填 R 列 64 位字，再展开成 builder 消费的字节列。语义逐字节不变（测试全绿）；实测本项收益不可测（bitset test 本已廉价）——保留为结构改进（消除 R 倍冗余 pass）。
+- **validate 换字节位图（本轮最大项）**：`llama_rerot_attn_layout::validate` 的 per-query 重复 key 检查原是逐 entry `unordered_set::insert`（每 reader 每 query ~n_kv 次哈希插入）——cache 级剖面上是最大单项。换成 `std::vector<uint8_t>` 位图＋同走重置，fail-loud 语义不变。cache 级（-O0）111.4→66.2ms（**-41%**）；-O2 管线基准上 validate 项 0.3ms。
+- **装配 reserve**：`result.groups/entries` 跨 reader push_back 无 reserve，~R·n_kv entry 的重分配是可测项；先数一遍总量再 reserve。cache 级再 66.2→60.5ms（-9%）。
+- **-O2 管线全景**（独立编译基准，production shape Q=1）：R=6 K=65536：build 3.4ms＋装配 ~1.9ms＋validate 0.3ms ≈ **5.6ms**；R=1：2.7ms；R=12 K=262144：59.7ms。装配是对已物化 per-query 向量的纯拷贝（memcpy 速度，4.8ns/entry）——融合进 builder 发射需改 oracle 对拍接口，收益 1.9ms，暂不做。
+- **未做（评估后放弃/推迟）**：跨 ubatch 结构缓存（增量 append 行）——第六轮快路径已消除排序成本，增量缓存只省 scan＋分桶（约 build 的 30%），但引入 cell 重用/回收导致的 staleness 风险，本轮不冒；记为后续候选。
+
+**第八轮：Q=6 数值通道快发射（09-22）**：
+
+- **对象**：MTP verify 形态（一 pen 的 Q 行相邻位置共一 ubatch）此前是 host 侧最大遗留（Q=6 R=6 K=65536 builder ~16.2ms）。每个 query 的 k 路归并发射对每 entry 走 `dp_at → d2t[dp] → rows[t] → keys[ki].key_index` 三次**依赖随机读**（40B 记录），且每 entry 重算 `qv + dev[dp] − vis_before` 与 best 比较。
+- **改动**：结构期已检测的两个生产形态条件——run 的 storage 严格 +1（dev 为常数）＋通过集为恒等（uniform 桶全拥有/foreign）——联合成立时，为该段预计算 `fast_keys`（key-id 的顺序列，每 reader 一次，全 query 批共享）。发射时：有效值常数 ⟹ `==best` 重检提升出循环；own 段的因果截断在恒等置换下退化为前缀上界 `p < seg_cut`；foreign 段直接顺序倾倒。探测不成立的段（空洞、重复 storage、混合桶）保留通用分支。
+- **实测**（-O2 独立编译管线基准，production shape，R=6）：Q=1：build 3372→2983 us（−12%）；**Q=6：16210→8758 us（1.85×）**；Q=6 K=262144：34.8ms（结构 1.8ms＋每 query ~1.2ms，接近 65k×8B entry 输出的 memcpy 地板）。
+- **纠错**：首版 foreign 快分支漏置 `emitted` 旗标——`test_rerot_shared_reader_multi_query`（MTP verify 形状）立即以"k-way merge lost a group head"抓住。修复后最小复现（`/tmp/repro_fast.cpp` 模板）5/5 位置与逐 query oracle 逐字节一致。
+
+**第九轮：reader 无关段属性上收结构 pass（09-22 晚）**：
+
+- **对象**：第八轮后 builder 的 reader 侧仍有两处 R×K 重复工作：(1) uniform 探测——每个 reader 对每个段重读全部行 meta 验证 (visibility, frontier) 一致性，但 uniform 是 **run 桶属性**，不是 reader 属性；(2) fast_keys 列——`keys[rows[p]].key_index` 内容 reader 无关，却每 reader 重建一次。
+- **改动**：`shared_run` 增加 `uniform/u_vis/u_frontier` 与 `fast_keys`，全部在结构 pass 的 run 循环里一次算好；reader 侧 uniform 分支直接读共享旗标（连 `keys[rows[0]].meta` 的首行随机读也省了），fast_keys 发射读 `sv.run->fast_keys`。
+- **实测**（-O2 独立编译 min-of-10，production shape）：R=6 K=65536：2904→2434 us（−16%）；R=12 K=65536：4612→3680（−20%）；R=6 K=262144：19419→12461（−36%）；R=12 K=262144：34035→16967（−50%）；R=1 不变（无共享可收，预期）。管线级：Q=1 R=6 K=65536 总 4884→4475（−8%）；Q=6 R=6 K=262144 总 66118→55506（−16%），build 34777→23260（−33%）。
+- **评估后放弃**：(1) run 桶查找的 hash map 替换——实测 unordered_map 每 key 的 hash+probe 开销超过 6–12 个桶的线性扫描（struct pass 1396→2600 us 反向），保留线性扫描；教训是桶数在两位数时别急着上 hash。(2) Q2 写入布局主动维持长 span——find_slot 已是 cont=true 连续分配，碎片来自回收/环回，修它需要 per-run 分配策略（侵入 find_slot 核心环语义，风险大），而第六轮快路径已对空洞优雅降级；记为后续候选，等有生产 span 消费者再动。
+
+**第十轮：ownership 列 bitset 直供（09-22 深夜）**：
+
+- **对象**：cache 级早已把 R 列 ownership 建成 bitset（第七轮 owned_words），却为了纯 builder 的字节接口展开成 R×K 字节列，builder 内再逐行读回——展开与读回都是纯浪费。
+- **改动**：`llama_rerot_owned_view`（裸指针＋字数，无 kv-cells 类型依赖）＋ `llama_rerot_build_query_layouts_multi_reader_bits` 核心；字节重载变打包转发壳（测试与外部字节调用方不变）；cache 级直接传 owned_words。
+- **实测**（-O2 min-of-10）：builder 内 bytes→bits −5%（R=6 K=262144：13090→12450）到 −10%（R=12 K=65536：3943→3547）；R=1 无差（预期）。cache 级另省整个 R×K 字节展开（约 2×R×K 次内存访问，未计入 builder 数字）。
+- **接口教训**：纯函数模块的"类型独立"不必靠字节展开买——POD view（指针＋宽度）同样零依赖，还省转换。
+
+### 21.2 验证证据
+
+- `test-rerot-math`：0 failure。Q3 对拍独立全 softmax oracle（含不可见读者、合并顺序无关性）；Q5 对拍稠密 §2.3 逐步递推（12 步，α<1，异构 β，秩每步恰 +1，dense/output 双等价，多 lane 共享投影位级一致）；Q6 24 个随机 chunk（T=1..8，含 β=0 纯衰减，此时 M=G·I、Y=0 精确成立）对拍逐步 oracle ≤1e-10；Q7 全部四种编码存在下对拍 (code−1) 解码 oracle，整数 activation 时位级相等。
+  第二轮新增：Q2 span 有效位置对逐 key §2.4 定义、因果截断对逐 key 掩码、碎片化度量三态（全短/全长/混合）；Q4 前缀和对定义、增长更新=全量重算、签名对数值变化不变/对顺序变化必变；Q8 界的可靠性（精确偏差 ≤ 界、δ ≥ 真实跳过质量比）＋ `{-1,+1}` vs `{0,0}` 反例；Q9 行序无关、cohort 大小无关、确定性、最低索引 tie-break；Q10 依赖追踪 vs naive 的分岐断言（accepted=2 vs 3）。
+- **F32 数值门实测**（第二轮补上）：Q5 因子化路径 24 步 F32 vs FP64 稠密 oracle——**相对误差 ~1.9e-7（有界区间）/ ~5.1e-7（弱衰减区间）**，绝对误差由状态指数增长主导（有界区间 max|S|≈2e4 时 3.8e-3）；Q6 WY 折叠 T=8 F32 vs FP64 逐步——**绝对误差 2.5e-5**。这是重结合误差的诚实量级：两族在 F32 下都不逐位一致，GPU 化前必须按此量级设验收门，不得宣称位级等价。
+  第二轮生产化新增：`test_shared_layouts_vs_oracle`（`test-rerot-view`，200 轮随机对拍：FULL/gated/base/不可见各臂同在、STRONG/LAG1 交替、query 位置覆盖每个 run 边界并打乱行序，shared 与逐 query oracle group-for-group/entry-for-entry 一致）；`test_rerot_shared_reader_multi_query`（`test-xkv-runtime`，真实 `llama_kv_cache` + view 安装 + 5 行单 seq MTP-verify 形态，逐行对拍 cache 级布局与逐 query oracle 的 (key, effective) 集，并断言 own-node 行因果截断）。
+- **共享布局实测收益**（开发机 CPU，合成 K 键 / Q 行，throwaway bench 已清理）：第三轮 Q=6 稳定 5–8×（K=4096：1046→156 us；K=16384,Q=12：8920→1074 us），K=65536/Q=6：20737→3784 us；Q=1 也 ~1.1×。第四轮：对 oracle 逐 query 全路径（生产形态物理序＝写入序）K=65536,Q=6：16073→4783 us（3.4×），K=262144,Q=6：96613→28584 us（3.4×）；最坏形态（物理序打乱）K=65536,Q=6：13399→7200 us，K=262144,Q=6：82351→44704 us；剩余大头是结构期 tagged 全局排序（3330 us，rank 分桶可再省，未做）。这是 host 侧布局构建的收益，不含 GPU kernel 时间。
+- RERoT/xkv/flashprefill 全家 45/45 ctest 通过（含 `test_ddvr_two_query_groups` 的多 reader、多 query 行、跨 reader 可见性、精确组计数断言）。
+  第五轮新增：`test_multi_reader_layouts_vs_oracle`（`test-rerot-view`，200 轮：multi reader world 与单 reader shared builder＋per-query oracle **三路** group-for-group/entry-for-entry 一致；每臂覆盖——base/own public/own private+pending 含 future-frontier/foreign public FULL+LAG1/foreign private/错 episode，段内 storage 重复与空洞、物理序打乱、每 reader 独立 query 批次）。两处修复各配回归臂：`test_shared_layouts_vs_oracle` 加 future-frontier private/pending 行与段内重复行；`test_rerot_shared_reader_multi_query` 的 own node 多 run（2+3）与 `test_sr_shared_physical_rows_3_ddvr_slots` 的同 run_id 双 node 形状由 cache 级路径钉住。
+  第六轮：快路径不改语义——同一 200 轮三路对拍全绿（乱序世界强制走通用分支，恒等世界走快路径，两者输出逐字节一致）；`test_shared_reader_multi_query` 的部分拥有（ownership 列非全 1）与 `test_sr_shared_physical_rows_3_ddvr_slots` 的混合 frontier 桶覆盖非 uniform 回退。
+  第七轮：cache 级改动（ownership 单趟、validate 位图、reserve）由 `test_rerot_shared_reader_multi_query`（cache 级逐 query 对拍 oracle，含 MTP verify 形状）与 `test_ddvr_two_query_groups`（双 reader 组）钉住；全家 45/45 通过。
+  第八轮：快发射由同两个 cache 级测试钉住（MTP verify 形状正是快路径的目标形态），加上 `test_shared_layouts_vs_oracle`/`test_multi_reader_layouts_vs_oracle` 的 200 轮三路对拍（乱序/重复/混合世界强制走通用分支）；全家 45/45。
+  第九轮：属性上收不改任何输出字节（同输入同输出，纯计算位置移动），由同套 45/45 全绿钉住。
+  第十轮：bits 与 bytes 两条路径由 test-rerot-view 新增探针逐迭代位级对拍（同一 base_owned 打包后走 bits 核心，与字节重载输出逐 layout identical），加全套 45/45。
+- 开发机预存失败（与本轮无关，基线复现）：test-tokenizers-ggml-vocabs、test-quantize-fns、test-llama-archs、test-backend-ops timeout；test-vulkan-tp5-mesh/command-replay 需 ≥2 Vulkan 设备（开发机仅 1 块 780M iGPU）。
+
+### 21.3 边界与下一步（第二轮修订）
+
+- 数学参考层是 kernel 契约与 oracle，**未进入生产 decode 路径**；F32 门实测已给出量级（Q5 相对 ~5e-7，Q6 绝对 ~2.5e-5），GPU 化验收门按此量级设，不得宣称位级等价。
+- Q5 的 r 从离开共同基底起算，固定入口 F_i token 也计入；r 超过阈值（约 d_k·d_v / (2(d_k+d_v))）时应转稠密，不能丢弃小增量或强造基底。
+- Q6 只适用于已知 token（固定入口重放、MTP 验证块）；attention 仍按每行视图执行，不得因 GDN 块化放松因果。
+- Q7 的 LUT 路径在 GPU 上“减乘法≠减耗时”，需实测；块 scale 与 Hadamard 域不得交换。
+- Q8（跳块上界）与 Q10（K×H 联合投机）是近似/研究路线：本轮已把它们的**数学契约与可执行反例**落成参考代码（界、验证引擎、naive 对照），但收益测量、接受率账目与生产接入仍未做，不得与等义改写的收益混记。Q10 的保守“全笔通过才前进”方案在独立接受率 a、b 笔下整步通过率为 a^b，联合草稿必须学会预测多笔相互影响后的下一 frontier，而不是 b 条各自向前冲的草稿。
+- Q2/Q4 生产化已推进到单一共享 key world＋生产形态快路径（decode 热路径，见 21.1 第五～十轮）：结构扫描与排序对 R 个 reader 各只做一次，reader 无关段属性（uniform、fast_keys）已上收共享结构 pass（R=12 K=262144 builder −50%），ownership 列 bitset 直供（cache 级 R×K 字节展开删除），Q=6（MTP verify）数值通道已 1.85×（8758 us，接近 entry 输出 memcpy 地板）；剩余方向：让写入布局主动维持长而规则的 span（`llama_rerot_span_long_fraction` 是验收指标）；把 run-order 签名接入 flashprefill 的 `llama_rerot_split_table_fragments` 调用点，结构事件才重算 fragments，数值增长走增量前缀和——注意 flashprefill 侧已有 fp_key+freshness 整层缓存，fragment 级缓存的边际收益需先证明再动手。
+- Q3 host 侧的下一步：数值通道（Q=1 时 ~1.8ms/6 readers，即 entry 发射本体）已接近地板；结构 pass 1.0ms 中桶扫描是剩余项。真机收益需目标机 `rerot-semantic-smoke.py` 对比 decode host 时间（开发机数字是合成键，不是模型证据）。
