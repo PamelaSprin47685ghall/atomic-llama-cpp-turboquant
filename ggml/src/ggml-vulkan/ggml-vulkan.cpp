@@ -4572,7 +4572,7 @@ static vk_subbuffer ggml_vk_subbuffer(const ggml_backend_vk_context* ctx, const 
     return { buf, offset, ggml_vk_get_max_buffer_range(ctx, buf, offset) };
 }
 
-static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx) {
+static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subctx, bool force = false) {
     VK_LOG_DEBUG("ggml_vk_sync_buffers()");
 
     const bool transfer_queue = subctx->p->q->transfer_only;
@@ -4592,7 +4592,7 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
     // Only coalesce identical full-buffer dependencies within this recording.
     // Every dispatch, transfer, or event rearms the dependency; narrower
     // barriers deliberately do not clear it.
-    if (!subctx->s->buffer->has_pending_mem_work) {
+    if (!force && !subctx->s->buffer->has_pending_mem_work) {
         return;
     }
     subctx->s->buffer->has_pending_mem_work = false;
@@ -10505,10 +10505,22 @@ static void ggml_vk_buffer_write_2d(vk_buffer& dst, size_t offset, const void * 
     } else {
         std::lock_guard<std::recursive_mutex> guard(dst->device->mutex);
 
-        vk_context subctx = ggml_vk_create_temporary_context(dst->device->transfer_queue->cmd_pool);
+        // This is the synchronous buffer API.  Keep the mutation on the
+        // compute queue so it is ordered with graph submissions touching the
+        // same VRAM.  A transfer-only submit has no dependency on already
+        // queued compute and can otherwise overwrite recurrent state that is
+        // still being consumed.
+        vk_context subctx = ggml_vk_create_temporary_context(dst->device->compute_queue->cmd_pool);
         ggml_vk_ctx_begin(dst->device, subctx);
+        // Force a dependency on work from earlier submissions on this queue.
+        // ggml_vk_sync_buffers normally coalesces barriers within one command
+        // buffer; here the first barrier deliberately covers external work.
+        ggml_vk_sync_buffers(nullptr, subctx, true);
         bool ret = ggml_vk_buffer_write_2d_async(subctx, dst, offset, src, spitch, dpitch, width, height, true);
         GGML_ASSERT(ret);
+        // Make this transfer write visible to later graph submissions before
+        // the command buffer ends.
+        ggml_vk_sync_buffers(nullptr, subctx, true);
         ggml_vk_ctx_end(subctx);
 
         for (auto& cpy : subctx->in_memcpys) {
@@ -10744,10 +10756,14 @@ static void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, siz
     }
 
     std::lock_guard<std::recursive_mutex> guard(dst->device->mutex);
-    vk_context subctx = ggml_vk_create_temporary_context(dst->device->transfer_queue->cmd_pool);
+    // Synchronous state mutation must stay in the compute queue's ordering
+    // domain; an independent transfer queue can race an in-flight graph.
+    vk_context subctx = ggml_vk_create_temporary_context(dst->device->compute_queue->cmd_pool);
     ggml_vk_ctx_begin(dst->device, subctx);
+    ggml_vk_sync_buffers(nullptr, subctx, true);
     vk_tp5_hpp_commands(subctx->s->buffer->buf).fillBuffer(dst->buffer, offset, size, c);
     subctx->s->buffer->has_pending_mem_work = true;
+    ggml_vk_sync_buffers(nullptr, subctx, true);
     ggml_vk_ctx_end(subctx);
 
     ggml_vk_submit(subctx, dst->device->fence);

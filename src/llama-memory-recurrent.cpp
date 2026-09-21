@@ -996,6 +996,14 @@ void llama_memory_recurrent::clear_brain_row(int32_t brain_row) {
         return;
     }
 
+    // Recurrent state can still be referenced by an asynchronously submitted
+    // graph when RERoT retracts/rebuilds a lineage.  Drain that work before
+    // issuing out-of-band tensor writes; synchronizing only after the writes
+    // leaves Vulkan free to overlap a transfer with the previous compute.
+    if (backend_sched) {
+        ggml_backend_sched_synchronize(backend_sched);
+    }
+
     for (size_t il = 0; il < s_l.size(); ++il) {
         ggml_tensor * s = s_l[il];
         if (!s || !is_s_shared((int32_t) il)) {
@@ -1026,6 +1034,13 @@ void llama_memory_recurrent::clear_brain_row(int32_t brain_row) {
 void llama_memory_recurrent::clear_hand_row(int32_t hand_row) {
     if (hand_row < 0 || (uint32_t) hand_row >= size) {
         return;
+    }
+
+    // See clear_brain_row(): RERoT prefix rebuild can arrive while the
+    // previous decode is still in flight.  The clear is a destructive state
+    // mutation, so establish the lifetime boundary before touching any row.
+    if (backend_sched) {
+        ggml_backend_sched_synchronize(backend_sched);
     }
 
     for (size_t il = 0; il < r_l.size(); ++il) {
