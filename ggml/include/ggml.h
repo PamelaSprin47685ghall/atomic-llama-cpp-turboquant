@@ -2714,6 +2714,17 @@ extern "C" {
             struct ggml_tensor  * state,
             int64_t               K);
 
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            int64_t               K,
+            int64_t               active_tokens);
+
     // RERoT Parallel Delta: concurrent PUBLIC writers advance one shared brain
     // through a coherence-normalized regularized block update. Writer i uses
     // density_i = sum_j cos^2(k_i,k_j) over active writers; orthogonal writes

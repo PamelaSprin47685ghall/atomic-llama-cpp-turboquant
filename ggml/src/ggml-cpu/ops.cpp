@@ -11087,6 +11087,11 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int64_t K = ggml_get_op_params_i32(dst, 0);
     GGML_ASSERT(K >= 1);
+
+    // active_tokens is passed via op_params[2] for capacity mode; 0 means default to all n_tokens
+    // (slot 1 is strictly reserved for RBB discriminator and must be 0 for standard GDN)
+    const int64_t active_param = ggml_get_op_params_i32(dst, 2);
+    const int64_t effective_active = (active_param > 0 && active_param <= n_tokens) ? active_param : n_tokens;
     // per-seq stride in floats (seq s starts at state + s * seq_stride)
     const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
 
@@ -11156,7 +11161,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         // attn output pointer for first token of this (head, seq)
         float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
 
-        for (int64_t t = 0; t < n_tokens; t++) {
+        for (int64_t t = 0; t < effective_active; t++) {
             const float * q_d = (const float *)((const char *)src_q->data + iq3 * nbq3 + t * nbq2 + iq1 * nbq1);
             const float * k_d = (const float *)((const char *)src_k->data + ik3 * nbk3 + t * nbk2 + ik1 * nbk1);
             const float * v_d = (const float *)((const char *)src_v->data + iv3 * nbv3 + t * nbv2 + iv1 * nbv1);
@@ -11202,7 +11207,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             attn_data += S_v * H; // advance to next token
 
             if (K > 1) {
-                const int64_t target_slot = n_tokens - 1 - t;
+                const int64_t target_slot = effective_active - 1 - t;
                 if (target_slot >= 0 && target_slot < K) {
                     float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
                                      (iv3 * H + iv1) * S_v * S_v;
