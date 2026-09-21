@@ -1403,12 +1403,12 @@ std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
 // readers[r], query_pos[r], keys-with-reader-r's-ownership-column) — the
 // single-reader builder stays the oracle (tests compare all three paths).
 // With R pens on one frontier the scan+sort cost drops from R copies to one.
-std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layouts_multi_reader(
+std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layouts_multi_reader_bits(
         const std::vector<llama_rerot_reader_state> & readers,
         const std::vector<std::vector<llama_pos>> & query_storage_pos,
         const std::vector<llama_rerot_key_record> & keys,
-        const std::vector<std::vector<uint8_t>> & base_owned) {
-    if (readers.size() != query_storage_pos.size() || base_owned.size() != readers.size()) {
+        const std::vector<llama_rerot_owned_view> & base_owned_bits) {
+    if (readers.size() != query_storage_pos.size() || base_owned_bits.size() != readers.size()) {
         throw std::invalid_argument("RERoT multi-reader: reader/query/ownership counts differ");
     }
     for (size_t r = 0; r < readers.size(); ++r) {
@@ -1419,7 +1419,8 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
         if (reader.reader == LLAMA_REROT_NODE_INVALID || reader.query_run == LLAMA_REROT_RUN_INVALID) {
             throw std::invalid_argument("RERoT reader or query run is invalid");
         }
-        if (base_owned[r].size() != keys.size()) {
+        const size_t need_words = (keys.size() + 63) / 64 + (keys.empty() ? 1 : 0);
+        if (base_owned_bits[r].n_words < need_words) {
             throw std::invalid_argument("RERoT multi-reader: ownership column width mismatch");
         }
         for (const llama_pos pos : query_storage_pos[r]) {
@@ -1617,7 +1618,11 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
     std::vector<std::vector<llama_rerot_query_layout>> result(readers.size());
     for (size_t r = 0; r < readers.size(); ++r) {
         const auto & reader = readers[r];
-        const auto & owned_col = base_owned[r];
+        const llama_rerot_owned_view & owned_view = base_owned_bits[r];
+        // Row test: one AND per probe; null words read as zero (unowned).
+        const auto owned = [&](size_t k) -> bool {
+            return (owned_view.bits[k >> 6] >> (k & 63)) & 1ull;
+        };
 
         std::unordered_map<llama_rerot_run_id, uint32_t> run_rank;
         run_rank.reserve(reader.ordered_runs.size());
@@ -1719,7 +1724,7 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
                         bool all_owned = true;
                         if (need_own) {
                             for (const uint32_t ki : found.rows) {
-                                if (!owned_col[ki]) {
+                                if (!owned(ki)) {
                                     all_owned = false;
                                     break;
                                 }
@@ -1731,14 +1736,14 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
                             sv.dp.reserve(found.d2t.size());
                             for (size_t p = 0; p < found.rows.size(); ++p) {
                                 const uint32_t t = found.d2t[p];
-                                if (owned_col[found.rows[t]]) {
+                                if (owned(found.rows[t])) {
                                     sv.dp.push_back(uint32_t(p));
                                 }
                             }
                             sv.pass_prefix.assign(found.rows.size() + 1, 0);
                             for (size_t i = 0; i < found.rows.size(); ++i) {
                                 sv.pass_prefix[i + 1] =
-                                    sv.pass_prefix[i] + uint32_t(owned_col[found.rows[i]] != 0);
+                                    sv.pass_prefix[i] + uint32_t(owned(found.rows[i]));
                             }
                         }
                         segs.push_back(std::move(sv));
@@ -1751,7 +1756,7 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
                 const auto & meta = keys[found.rows[i]].meta;
                 if (meta.visibility == llama_rerot_visibility::public_live) {
                     if (own) {
-                        if (meta.frontier <= reader.frontier && owned_col[found.rows[i]]) {
+                        if (meta.frontier <= reader.frontier && owned(found.rows[i])) {
                             pass[i] = 1;
                         }
                     } else if (reader.frontier_mode == LLAMA_REROT_FRONTIER_STRONG) {
@@ -1768,7 +1773,7 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
                     // No frontier gate for own private/pending rows (the
                     // oracle checks node==reader && owned && causal cut
                     // only — pinned by the fifth-round probe).
-                    if (owned_col[found.rows[i]]) {
+                    if (owned(found.rows[i])) {
                         pass[i] = 1;
                     }
                 }
@@ -1814,7 +1819,7 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
         // stable order).
         std::vector<uint32_t> base;
         for (const uint32_t ki : untagged_sorted) {
-            if (owned_col[ki]) {
+            if (owned(ki)) {
                 base.push_back(ki);
             }
         }
@@ -2069,6 +2074,37 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
         }
     }
     return result;
+}
+
+// Byte-vector compatibility overload: packs each column into words and
+// forwards to the bitset core (tenth round). The cache level passes
+// owned_words directly; tests and any external byte callers keep working.
+std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layouts_multi_reader(
+        const std::vector<llama_rerot_reader_state> & readers,
+        const std::vector<std::vector<llama_pos>> & query_storage_pos,
+        const std::vector<llama_rerot_key_record> & keys,
+        const std::vector<std::vector<uint8_t>> & base_owned) {
+    if (readers.size() != query_storage_pos.size() || base_owned.size() != readers.size()) {
+        throw std::invalid_argument("RERoT multi-reader: reader/query/ownership counts differ");
+    }
+    const size_t n_words = (keys.size() + 63) / 64 + (keys.empty() ? 1 : 0);
+    std::vector<std::vector<uint64_t>> words(readers.size());
+    std::vector<llama_rerot_owned_view> views(readers.size());
+    for (size_t r = 0; r < readers.size(); ++r) {
+        if (base_owned[r].size() != keys.size()) {
+            throw std::invalid_argument("RERoT multi-reader: ownership column width mismatch");
+        }
+        auto & w = words[r];
+        w.assign(n_words, 0);
+        for (size_t k = 0; k < keys.size(); ++k) {
+            if (base_owned[r][k]) {
+                w[k >> 6] |= 1ull << (k & 63);
+            }
+        }
+        views[r] = { w.data(), w.size() };
+    }
+    return llama_rerot_build_query_layouts_multi_reader_bits(
+        readers, query_storage_pos, keys, views);
 }
 
 llama_rerot_query_layout llama_rerot_build_query_layout(

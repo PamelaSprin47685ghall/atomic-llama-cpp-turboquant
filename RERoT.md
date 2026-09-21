@@ -2379,7 +2379,7 @@ c3648d789  DAG logical/view/fixed-entry implementation
 
 ## 21. 计算组织研究线（2026-09-21 轮）
 
-本节记录“重画计算组织而非先调 kernel”研究线的当前落地状态。十个研究问题（共享单位、段级 reader view、公共 KV 块服务多读者、DAG 结构/数值分离、GDN 共同基底+低秩增量、已知序列块递推、PQ2 位平面、充分统计量、联合采样、K×H 网格）中，第一轮（`29cd8f51a`）把四条等义数学落成代码并重构 indexed 布局扫描；第二轮（`2b7b479d2`）把剩余五个问题（Q2/Q4/Q8/Q9/Q10）的数学与契约层落成代码，并补上 Q5/Q6 的 F32 数值门实测；第三轮（`8772195ac`）把 Q2/Q4 的结构/数值分离接入 decode 热路径（`llama_rerot_build_query_layouts_shared`）；第四轮（`4f75dea5d`）把同一函数的数值通道换成段级偏差序＋k 路归并，并把 cache 侧 cell 扫描改为跨 reader 共享供给；第五轮（`66914c692`）把 Q3 host 侧推向单一共享 key world——R 个 pen 共享一次结构扫描与排序，每 reader 只付 ownership 过滤＋数值 pass（`llama_rerot_build_query_layouts_multi_reader`），并修复第四轮两个已提交 bug（own private/pending 的 frontier 门、段内 storage 重复下的偏差序置换）。第六轮（`0c793e2ac`）在同一函数内落三条生产形态快路径——tagged 序预检跳排序、连续 storage 恒等偏差序、uniform 桶＋全拥有恒等列表——把 decode 形态（Q=1）再压 2×。第七轮把剖面推进到 cache 级全路径：ownership 列单趟共享填充、validate 逐 entry 哈希去重换字节位图、装配 reserve——cache 级 -46%。第八轮攻下 Q=6（MTP verify 形态）数值通道：连续 run＋恒等通过集的段预计算 key-id 顺序列，发射链三次依赖随机读塌缩为一次顺序读，==best 重检整体提升出循环——Q=6 builder 16210→8758 us（1.85×）。第九轮（09-22 晚）把 reader 无关的段属性（uniform 探测、fast_keys 列）上收到共享结构 pass，每 reader 一次的 R×K 重复探测消失——builder -16%（R=6）到 -50%（R=12 K=262144），收益随 R 与 K 增长（见 21.1 第九轮）。
+本节记录“重画计算组织而非先调 kernel”研究线的当前落地状态。十个研究问题（共享单位、段级 reader view、公共 KV 块服务多读者、DAG 结构/数值分离、GDN 共同基底+低秩增量、已知序列块递推、PQ2 位平面、充分统计量、联合采样、K×H 网格）中，第一轮（`29cd8f51a`）把四条等义数学落成代码并重构 indexed 布局扫描；第二轮（`2b7b479d2`）把剩余五个问题（Q2/Q4/Q8/Q9/Q10）的数学与契约层落成代码，并补上 Q5/Q6 的 F32 数值门实测；第三轮（`8772195ac`）把 Q2/Q4 的结构/数值分离接入 decode 热路径（`llama_rerot_build_query_layouts_shared`）；第四轮（`4f75dea5d`）把同一函数的数值通道换成段级偏差序＋k 路归并，并把 cache 侧 cell 扫描改为跨 reader 共享供给；第五轮（`66914c692`）把 Q3 host 侧推向单一共享 key world——R 个 pen 共享一次结构扫描与排序，每 reader 只付 ownership 过滤＋数值 pass（`llama_rerot_build_query_layouts_multi_reader`），并修复第四轮两个已提交 bug（own private/pending 的 frontier 门、段内 storage 重复下的偏差序置换）。第六轮（`0c793e2ac`）在同一函数内落三条生产形态快路径——tagged 序预检跳排序、连续 storage 恒等偏差序、uniform 桶＋全拥有恒等列表——把 decode 形态（Q=1）再压 2×。第七轮把剖面推进到 cache 级全路径：ownership 列单趟共享填充、validate 逐 entry 哈希去重换字节位图、装配 reserve——cache 级 -46%。第八轮攻下 Q=6（MTP verify 形态）数值通道：连续 run＋恒等通过集的段预计算 key-id 顺序列，发射链三次依赖随机读塌缩为一次顺序读，==best 重检整体提升出循环——Q=6 builder 16210→8758 us（1.85×）。第九轮把 reader 无关的段属性（uniform 探测、fast_keys 列）上收到共享结构 pass，每 reader 一次的 R×K 重复探测消失——builder -16%（R=6）到 -50%（R=12 K=262144），收益随 R 与 K 增长。第十轮（09-22 深夜）把 ownership 列从字节向量改为 packed bitset 直供：cache 级的 R×K 字节展开消失，builder 内 owned 探测变一次 AND（见 21.1 第九、十轮）。
 
 ### 21.1 已落地（当前 HEAD，全部 CPU 验证）
 
@@ -2444,6 +2444,13 @@ c3648d789  DAG logical/view/fixed-entry implementation
 - **实测**（-O2 独立编译 min-of-10，production shape）：R=6 K=65536：2904→2434 us（−16%）；R=12 K=65536：4612→3680（−20%）；R=6 K=262144：19419→12461（−36%）；R=12 K=262144：34035→16967（−50%）；R=1 不变（无共享可收，预期）。管线级：Q=1 R=6 K=65536 总 4884→4475（−8%）；Q=6 R=6 K=262144 总 66118→55506（−16%），build 34777→23260（−33%）。
 - **评估后放弃**：(1) run 桶查找的 hash map 替换——实测 unordered_map 每 key 的 hash+probe 开销超过 6–12 个桶的线性扫描（struct pass 1396→2600 us 反向），保留线性扫描；教训是桶数在两位数时别急着上 hash。(2) Q2 写入布局主动维持长 span——find_slot 已是 cont=true 连续分配，碎片来自回收/环回，修它需要 per-run 分配策略（侵入 find_slot 核心环语义，风险大），而第六轮快路径已对空洞优雅降级；记为后续候选，等有生产 span 消费者再动。
 
+**第十轮：ownership 列 bitset 直供（09-22 深夜）**：
+
+- **对象**：cache 级早已把 R 列 ownership 建成 bitset（第七轮 owned_words），却为了纯 builder 的字节接口展开成 R×K 字节列，builder 内再逐行读回——展开与读回都是纯浪费。
+- **改动**：`llama_rerot_owned_view`（裸指针＋字数，无 kv-cells 类型依赖）＋ `llama_rerot_build_query_layouts_multi_reader_bits` 核心；字节重载变打包转发壳（测试与外部字节调用方不变）；cache 级直接传 owned_words。
+- **实测**（-O2 min-of-10）：builder 内 bytes→bits −5%（R=6 K=262144：13090→12450）到 −10%（R=12 K=65536：3943→3547）；R=1 无差（预期）。cache 级另省整个 R×K 字节展开（约 2×R×K 次内存访问，未计入 builder 数字）。
+- **接口教训**：纯函数模块的"类型独立"不必靠字节展开买——POD view（指针＋宽度）同样零依赖，还省转换。
+
 ### 21.2 验证证据
 
 - `test-rerot-math`：0 failure。Q3 对拍独立全 softmax oracle（含不可见读者、合并顺序无关性）；Q5 对拍稠密 §2.3 逐步递推（12 步，α<1，异构 β，秩每步恰 +1，dense/output 双等价，多 lane 共享投影位级一致）；Q6 24 个随机 chunk（T=1..8，含 β=0 纯衰减，此时 M=G·I、Y=0 精确成立）对拍逐步 oracle ≤1e-10；Q7 全部四种编码存在下对拍 (code−1) 解码 oracle，整数 activation 时位级相等。
@@ -2457,6 +2464,7 @@ c3648d789  DAG logical/view/fixed-entry implementation
   第七轮：cache 级改动（ownership 单趟、validate 位图、reserve）由 `test_rerot_shared_reader_multi_query`（cache 级逐 query 对拍 oracle，含 MTP verify 形状）与 `test_ddvr_two_query_groups`（双 reader 组）钉住；全家 45/45 通过。
   第八轮：快发射由同两个 cache 级测试钉住（MTP verify 形状正是快路径的目标形态），加上 `test_shared_layouts_vs_oracle`/`test_multi_reader_layouts_vs_oracle` 的 200 轮三路对拍（乱序/重复/混合世界强制走通用分支）；全家 45/45。
   第九轮：属性上收不改任何输出字节（同输入同输出，纯计算位置移动），由同套 45/45 全绿钉住。
+  第十轮：bits 与 bytes 两条路径由 test-rerot-view 新增探针逐迭代位级对拍（同一 base_owned 打包后走 bits 核心，与字节重载输出逐 layout identical），加全套 45/45。
 - 开发机预存失败（与本轮无关，基线复现）：test-tokenizers-ggml-vocabs、test-quantize-fns、test-llama-archs、test-backend-ops timeout；test-vulkan-tp5-mesh/command-replay 需 ≥2 Vulkan 设备（开发机仅 1 块 780M iGPU）。
 
 ### 21.3 边界与下一步（第二轮修订）
@@ -2466,5 +2474,5 @@ c3648d789  DAG logical/view/fixed-entry implementation
 - Q6 只适用于已知 token（固定入口重放、MTP 验证块）；attention 仍按每行视图执行，不得因 GDN 块化放松因果。
 - Q7 的 LUT 路径在 GPU 上“减乘法≠减耗时”，需实测；块 scale 与 Hadamard 域不得交换。
 - Q8（跳块上界）与 Q10（K×H 联合投机）是近似/研究路线：本轮已把它们的**数学契约与可执行反例**落成参考代码（界、验证引擎、naive 对照），但收益测量、接受率账目与生产接入仍未做，不得与等义改写的收益混记。Q10 的保守“全笔通过才前进”方案在独立接受率 a、b 笔下整步通过率为 a^b，联合草稿必须学会预测多笔相互影响后的下一 frontier，而不是 b 条各自向前冲的草稿。
-- Q2/Q4 生产化已推进到单一共享 key world＋生产形态快路径（decode 热路径，见 21.1 第五～九轮）：结构扫描与排序对 R 个 reader 各只做一次，reader 无关段属性（uniform、fast_keys）已上收共享结构 pass（R=12 K=262144 builder −50%），Q=6（MTP verify）数值通道已 1.85×（8758 us，接近 entry 输出 memcpy 地板）；剩余方向：让写入布局主动维持长而规则的 span（`llama_rerot_span_long_fraction` 是验收指标）；把 run-order 签名接入 flashprefill 的 `llama_rerot_split_table_fragments` 调用点，结构事件才重算 fragments，数值增长走增量前缀和——注意 flashprefill 侧已有 fp_key+freshness 整层缓存，fragment 级缓存的边际收益需先证明再动手。
+- Q2/Q4 生产化已推进到单一共享 key world＋生产形态快路径（decode 热路径，见 21.1 第五～十轮）：结构扫描与排序对 R 个 reader 各只做一次，reader 无关段属性（uniform、fast_keys）已上收共享结构 pass（R=12 K=262144 builder −50%），ownership 列 bitset 直供（cache 级 R×K 字节展开删除），Q=6（MTP verify）数值通道已 1.85×（8758 us，接近 entry 输出 memcpy 地板）；剩余方向：让写入布局主动维持长而规则的 span（`llama_rerot_span_long_fraction` 是验收指标）；把 run-order 签名接入 flashprefill 的 `llama_rerot_split_table_fragments` 调用点，结构事件才重算 fragments，数值增长走增量前缀和——注意 flashprefill 侧已有 fp_key+freshness 整层缓存，fragment 级缓存的边际收益需先证明再动手。
 - Q3 host 侧的下一步：数值通道（Q=1 时 ~1.8ms/6 readers，即 entry 发射本体）已接近地板；结构 pass 1.0ms 中桶扫描是剩余项。真机收益需目标机 `rerot-semantic-smoke.py` 对比 decode host 时间（开发机数字是合成键，不是模型证据）。

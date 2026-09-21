@@ -106,6 +106,50 @@
 
 ---
 
+## 下班交接｜2026-09-22（第十轮，ownership 列 bitset 直供：cache 级 R×K 字节展开删除）
+
+**分支：** `master`（本轮 commit 见 git log）
+**主题：** 第九轮交接的候选清单第三项：owned_col 字节扫描（R×K）→ bitset 消费 overload。三文件：`src/llama-rerot.h`、`src/llama-rerot.cpp`、`src/llama-kv-cache.cpp`＋测试探针。全程 CPU。
+
+### 一、改动：ownership 列从字节展开改为 packed bitset 直供
+
+第七轮起 cache 级就把 R 列 ownership 建成 bitset（owned_words），却为纯 builder 的字节接口展开成 R×K 字节（group_owned），builder 内再逐行读回——**展开与读回都是纯浪费**（约 2×R×K 次内存访问）。
+
+**改动**：
+1. `llama_rerot_owned_view`：裸 `const uint64_t*`＋字数，**无 kv-cells 类型依赖**（保持 llama-rerot 纯函数模块独立性）；
+2. `llama_rerot_build_query_layouts_multi_reader_bits`：核心实现，owned 探测变一次 AND（`bits[k>>6]>>(k&63)&1`）；
+3. 字节重载变打包转发壳（测试与外部字节调用方零改动）；
+4. cache 级（`llama-kv-cache.cpp`）直接传 owned_words，R×K 字节展开整段删除。
+
+### 二、实测（-O2 独立编译 min-of-10，production shape，多次重复）
+
+|形状|bytes 路径|bits 路径|Δ|
+|---|---|---|---|
+|R=6 K=262144|13090 us|12450|−5%|
+|R=12 K=262144|18200|16880|−7%|
+|R=12 K=65536|3943|3547|−10%|
+|R=1 K=65536|1703|1693|0（预期）|
+
+cache 级另省整个 R×K 字节展开＋R 个 K 长度向量分配（未计入上表 builder 数字）。
+
+### 三、验证
+
+- `test-rerot-view` 新增探针：同一 base_owned 打包走 bits 核心 vs 字节重载，逐迭代逐 layout 位级 identical，200 轮 0 failure；
+- 全家 rerot/xkv/flashprefill **45/45**；`git diff --check` 干净。
+
+### 四、接口教训（写进 RERoT.md §21.1 第十轮）
+
+纯函数模块的"类型独立"不必靠字节展开买——**POD view（指针＋宽度）同样零依赖**，还省掉转换。第七轮当时的"kept as bytes so llama-rerot stays independent"是伪约束。
+
+### 五、Q3 host 侧收口状态与下一步
+
+九轮＋本轮后，`rerot_build_attn_layout` 的 cache→builder 链路：单趟 cell 扫描（bitset 填充）→ bitset 直供 → 共享结构 pass → reader 无关属性共享 → Q=6 数值快通道。**host 侧 Q3（公共 KV 块服务多读者）的组织层工作已收口**；剩余大项全部需要目标机/批准：
+1. **GPU 化 Q3**（Hydragen 式公共块多读者）：host 副作用已清，等真机；
+2. 真机 semantic-smoke（需模型＋server）；
+3. Release 构建（磁盘 98%，余 2.5G，先清 build 再说）。
+
+---
+
 ## 下班交接｜2026-09-22（第九轮，reader 无关段属性上收结构 pass：R 越大省越多）
 
 **分支：** `master`（本轮 commit 见 git log）

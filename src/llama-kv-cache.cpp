@@ -6272,10 +6272,8 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
     // Per-group query positions + ownership columns (the caller's seq_has
     // column per group: base rows and own-run rows of that reader's seq).
     std::vector<std::vector<llama_pos>> group_qpos;
-    std::vector<std::vector<uint8_t>> group_owned;
     std::vector<llama_rerot_reader_state> group_readers;
     group_qpos.reserve(groups.size());
-    group_owned.reserve(groups.size());
     group_readers.reserve(groups.size());
     // Ownership columns are bitsets of the SHARED key table, not byte
     // vectors: the R columns share one pass over the resident cells (the
@@ -6314,19 +6312,16 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
             }
         }
     }
-    // Expand the bitsets to the byte columns the pure builder consumes.
-    // (A bitset-consuming builder overload would avoid the expansion; kept
-    // as bytes so llama-rerot stays independent of llama-kv-cells types.)
-    group_owned.resize(groups.size());
+    // Tenth round: the builder consumes the packed bitsets directly
+    // (llama_rerot_owned_view is a plain pointer + width — no kv-cells
+    // type dependency), so the R x K byte expansion is gone.
+    std::vector<llama_rerot_owned_view> owned_views(groups.size());
     for (size_t g = 0; g < groups.size(); ++g) {
-        auto & owned = group_owned[g];
-        owned.resize(shared_keys.size(), 0);
-        for (size_t k = 0; k < shared_keys.size(); ++k) {
-            owned[k] = (owned_words[g][k >> 6] >> (k & 63)) & 1u ? 1 : 0;
-        }
+        GGML_ASSERT(owned_words[g].size() >= owned_words_per_col);
+        owned_views[g] = { owned_words[g].data(), owned_words[g].size() };
     }
-    const auto multi = llama_rerot_build_query_layouts_multi_reader(
-        group_readers, group_qpos, shared_keys, group_owned);
+    const auto multi = llama_rerot_build_query_layouts_multi_reader_bits(
+        group_readers, group_qpos, shared_keys, owned_views);
     // Reserve the assembly targets once: per-group push_back reallocation
     // over ~R x n_kv entries was a measurable fraction of the cache-side
     // cost at production shapes.

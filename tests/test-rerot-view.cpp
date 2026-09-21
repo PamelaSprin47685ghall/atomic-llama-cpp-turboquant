@@ -1464,6 +1464,39 @@ static void test_multi_reader_layouts_vs_oracle() {
         } catch (const std::exception &) {
             threw_multi = true;
         }
+        // Tenth round: the packed-bits core must be bit-identical to the
+        // byte-vector path (the cache level now calls the bits overload
+        // directly; this probe pins the two overloads together).
+        {
+            const size_t n_words = (keys.size() + 63) / 64 + (keys.empty() ? 1 : 0);
+            std::vector<std::vector<uint64_t>> words(R, std::vector<uint64_t>(n_words, 0));
+            std::vector<llama_rerot_owned_view> views(R);
+            for (uint32_t p = 0; p < R; ++p) {
+                for (size_t k = 0; k < keys.size(); ++k) {
+                    if (base_owned[p][k]) {
+                        words[p][k >> 6] |= 1ull << (k & 63);
+                    }
+                }
+                views[p] = { words[p].data(), words[p].size() };
+            }
+            bool threw_bits = false;
+            try {
+                const auto multi_bits = llama_rerot_build_query_layouts_multi_reader_bits(
+                    readers, qpos, keys, views);
+                CHECK(multi_bits.size() == multi.size());
+                for (uint32_t p = 0; p < R; ++p) {
+                    const std::string rtag = "bits iter " + std::to_string(iter) + " reader " + std::to_string(p);
+                    CHECK(multi_bits[p].size() == multi[p].size());
+                    for (size_t i = 0; i < multi_bits[p].size() && i < multi[p].size(); ++i) {
+                        const std::string tag = rtag + " pos " + std::to_string(qpos[p][i]);
+                        CHECK(layouts_identical(multi_bits[p][i], multi[p][i], tag.c_str()));
+                    }
+                }
+            } catch (const std::exception &) {
+                threw_bits = true;
+            }
+            CHECK(threw_bits == threw_multi);
+        }
         std::vector<std::vector<llama_rerot_query_layout>> ref(R);
         try {
             for (uint32_t p = 0; p < R; ++p) {

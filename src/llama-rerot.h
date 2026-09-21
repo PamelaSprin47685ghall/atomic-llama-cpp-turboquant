@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <string>
 #include <vector>
@@ -298,6 +299,27 @@ std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layou
     const std::vector<std::vector<llama_pos>> & query_storage_pos,
     const std::vector<llama_rerot_key_record> & keys,
     const std::vector<std::vector<uint8_t>> & base_owned);
+
+// Packed ownership columns (2026-09-22 tenth round, Q3 host-side tail).
+// The cache level already builds per-reader ownership as bitsets over the
+// shared key table; the byte-vector overload above forced an R x K expansion
+// that the builder then re-read row by row. A bitset view carries no
+// llama-kv-cells dependency — it is a plain pointer + width — so the pure
+// builder stays type-independent while consuming packed bits directly.
+struct llama_rerot_owned_view {
+    // bits[i] bit (i & 63): reader owns shared-table row i. Null words read
+    // as zero (unowned).
+    const uint64_t * bits = nullptr;
+    size_t n_words = 0;
+};
+
+// Bitset-consuming core. Identical output to the byte-vector overload
+// (same groups, entries, order, query_virtual_pos; same exceptions).
+std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layouts_multi_reader_bits(
+    const std::vector<llama_rerot_reader_state> & readers,
+    const std::vector<std::vector<llama_pos>> & query_storage_pos,
+    const std::vector<llama_rerot_key_record> & keys,
+    const std::vector<llama_rerot_owned_view> & base_owned_bits);
 
 // Pure logical document/tree model. It never stores physical KV indices.
 class llama_rerot_document {
