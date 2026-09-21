@@ -10105,13 +10105,27 @@ static bool ggml_vk_predefined_indirect_slot(
     }
     program.predefined_dispatches.push_back(definition);
     ++program.predefined_classified_dispatches;
+    // Coverage note: which frame extent drives this dynamic dispatch.
+    // Extent ids follow ggml_predefined_extent (ONE=0, TOKENS=1, OUTPUTS=2).
+    {
+        bool has_tokens = false, has_outputs = false, has_other = false;
+        for (int axis = 0; axis < 3; ++axis) {
+            const uint32_t e = definition.axis[axis].extent;
+            if (e == 1) has_tokens = true;
+            else if (e == 2) has_outputs = true;
+            else if (e != 0) has_other = true;
+        }
+        if (has_tokens && !has_outputs && !has_other) vk_tp5_coverage_note_dynamic_tokens(program.predefined_coverage);
+        else if (has_outputs && !has_tokens && !has_other) vk_tp5_coverage_note_dynamic_outputs(program.predefined_coverage);
+        else vk_tp5_coverage_note_dynamic_other(program.predefined_coverage);
+    }
     indirect = {ctx->relay_route_buffer, offset, sizeof(args)};
     return true;
 }
 
 static bool ggml_vk_predefined_classify_static(ggml_backend_vk_context * ctx) {
     if (!ctx->tp5_recording_program || ctx->tp5_definition_stage == SIZE_MAX ||
-        ctx->predefined_capacity_rows == 0) return false;
+        ctx->predefined_capacity_rows == 0) return false; // fail-open: no coverage note on early-out
     auto & program = *ctx->tp5_recording_program;
     if (program.predefined_stage == SIZE_MAX) {
         program.predefined_stage = ctx->tp5_definition_stage;
@@ -10124,6 +10138,7 @@ static bool ggml_vk_predefined_classify_static(ggml_backend_vk_context * ctx) {
         return false;
     }
     ++program.predefined_classified_dispatches;
+    vk_tp5_coverage_note_fixed(program.predefined_coverage);
     return true;
 }
 
@@ -24636,6 +24651,35 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 program.predefined_complete =
                     program.predefined_classified_dispatches ==
                     program.commands.count(vk_tp5_command_tape::kind::dispatch);
+                // Phase 1 coverage finalize (fail-open): populate the
+                // semantic record and emit a diagnostic when some class
+                // lacks proof. Deliberately does NOT change
+                // predefined_complete, does NOT reject(), and does NOT
+                // touch the warm-token update path.
+                {
+                    auto & cov = program.predefined_coverage;
+                    const size_t captured = program.commands.count(vk_tp5_command_tape::kind::dispatch);
+                    const size_t classified = program.predefined_classified_dispatches;
+                    cov.copy_total = (uint32_t) program.commands.count(vk_tp5_command_tape::kind::copy);
+                    cov.barrier_total = (uint32_t) program.commands.count(vk_tp5_command_tape::kind::barrier);
+                    cov.state_total = (uint32_t) program.commands.count(vk_tp5_command_tape::kind::state);
+                    cov.uncovered_dispatch = captured > classified ? (uint32_t)(captured - classified) : 0;
+                    if (cov.uncovered_dispatch != 0) {
+                        char buf[160];
+                        std::snprintf(buf, sizeof(buf),
+                            "%u dispatch(es) captured without static/dynamic classification",
+                            cov.uncovered_dispatch);
+                        vk_tp5_coverage_set_gap(cov, buf);
+                    } else if (cov.copy_total != 0) {
+                        char buf[160];
+                        std::snprintf(buf, sizeof(buf),
+                            "%u copy/fill/update op(s) use definition-time fixed ranges (no effective-range proof; view/KV/output-index/push-constant capacity params likewise unproven)",
+                            cov.copy_total);
+                        vk_tp5_coverage_set_gap(cov, buf);
+                    }
+                    cov.would_reject = vk_tp5_coverage_would_reject(cov);
+                    vk_tp5_coverage_report(cov, program.predefined_capacity_rows, captured, classified);
+                }
             }
             program.buffers = cache_entry.buffer_owners;
             program.hc = cache_entry.hc_sum_prefix ? ctx->hc_sum_recorded : vk_tp5_hc_sum{};

@@ -5,6 +5,7 @@
 
 #include "ggml-vulkan-internal.h"
 #include "ggml-predefined.h"
+#include "ggml-vulkan-tp5-coverage.h"
 #include <vulkan/vulkan_core.h>
 #include <algorithm>
 #include <cstring>
@@ -65,6 +66,12 @@ struct vk_tp5_graph_program {
     std::vector<ggml_predefined_dispatch> predefined_dispatches;
     size_t predefined_classified_dispatches = 0;
     bool predefined_complete = false;
+    // Phase 1 semantic coverage: record + fail-open diagnostics only.
+    // predefined_complete keeps its legacy dispatch-count meaning; this
+    // record adds the class split (fixed/dynamic/copy/state/barrier) and
+    // the first uncovered gap. would_reject inside is informational until
+    // a future fail-closed gate is explicitly enabled.
+    vk_tp5_predefined_coverage predefined_coverage;
     ~vk_tp5_graph_program() {
         for (VkDescriptorPool pool : descriptor_pools)
             if (pool) vkDestroyDescriptorPool(device, pool, nullptr);
