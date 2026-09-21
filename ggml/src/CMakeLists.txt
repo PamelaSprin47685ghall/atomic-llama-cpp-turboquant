@@ -195,11 +195,13 @@ add_library(ggml-base
             ../include/ggml-backend.h
             ../include/ggml-cpp.h
             ../include/ggml-opt.h
+            ../include/ggml-predefined.h
             ../include/ggml-flashprefill.h
             ../include/gguf.h
             ggml.c
             ggml.cpp
             ggml-alloc.c
+            ggml-predefined.cpp
             ggml-flashprefill.cpp
             ggml-backend.cpp
             ggml-backend-meta.cpp

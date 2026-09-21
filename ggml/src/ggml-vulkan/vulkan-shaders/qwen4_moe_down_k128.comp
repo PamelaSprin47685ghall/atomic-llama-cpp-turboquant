@@ -142,6 +142,7 @@ layout(std430, binding = 7) writeonly buffer WireOut {
 
 layout(push_constant) uniform PushParams {
     uint width; // output row length (routed->ne[0]); multiple of 256
+    uint fusion_flags; // bit 0x100: record-time graph liveness permits elision
 } p;
 
 // Native-order IQ4_NL decode, mirroring mul_mat_vec.comp's K_PER_ITER==8
@@ -326,7 +327,13 @@ void main() {
         precise float shared_value = shared_down_in[first_row + n] * gate;
 #endif
         precise float result = folded + shared_value;
+#if defined(MOE_K128_RELAY_OUTPUT)
+        if ((p.fusion_flags & 0x100u) == 0u || (relay_route.reserved & 1u) != 0u) {
+            folded_out[first_row + n] = result;
+        }
+#else
         folded_out[first_row + n] = result;
+#endif
 #if defined(MOE_K128_WIRE_OUTPUT)
         wire_out[first_row + n] = float16_t(result);
 #elif defined(MOE_K128_RELAY_OUTPUT)

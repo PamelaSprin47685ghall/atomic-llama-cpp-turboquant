@@ -1301,6 +1301,25 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return { GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1, false, {0} };
     };
 
+    auto handle_flash_attn_ext_rerot =
+        [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return handle_mirrored_attention(src_ss);
+        }
+        // q_groups/K/V all carry the attention-head dimension on axis 2.
+        // The indexed entry list and query offsets are shared control data;
+        // optional sinks follow Q-head ownership on their vector axis.
+        GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2);
+        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_2);
+        GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_2);
+        GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        GGML_ASSERT(tensor->src[5] == nullptr ||
+                    src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_0 ||
+                    src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        return { GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1, false, {0} };
+    };
+
     auto handle_ssm_conv = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis == src_ss[1].axis) {
             if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
@@ -1568,7 +1587,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_flash_attn_ext_banded(src_ss);
             } break;
             case GGML_OP_FLASH_ATTN_EXT_REROT: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+                split_state = handle_flash_attn_ext_rerot(src_ss);
             } break;
             case GGML_OP_XKV_RECONSTRUCT: {
             case GGML_OP_XKV_ATTENTION:
@@ -1812,7 +1831,8 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     const size_t n_simple_bufs = ggml_backend_meta_buffer_n_bufs(tensor->buffer);
     ggml_backend_meta_local_node_hook_t dev_local_node_hook = nullptr;
     void * dev_local_node_hook_userdata = nullptr;
-    if (tensor->op == GGML_OP_FLASH_ATTN_EXT || tensor->op == GGML_OP_GATED_DELTA_NET) {
+    if (tensor->op == GGML_OP_FLASH_ATTN_EXT || tensor->op == GGML_OP_FLASH_ATTN_EXT_REROT ||
+        tensor->op == GGML_OP_GATED_DELTA_NET) {
         const auto dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
         const auto * dev_ctx = static_cast<const ggml_backend_meta_device_context *>(dev->context);
         dev_local_node_hook = dev_ctx->local_node_hook;
@@ -1973,9 +1993,10 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         // op_params head-map ABI (ggml_tp5_headmap_set) on the rank-local clone
         // only; the global graph node stays untouched. Runs AFTER the rank-local
         // src remap so the hook can inspect local_node->src[0]/src[1] shapes.
-        // Dispatches on node->op (FA: Q->KV map; GDN: V->QK map).
+        // Dispatches on node->op (ordinary/indexed FA: Q->KV map; GDN: V->QK map).
         if (dev_local_node_hook != nullptr &&
-                (tensor->op == GGML_OP_FLASH_ATTN_EXT || tensor->op == GGML_OP_GATED_DELTA_NET)) {
+                (tensor->op == GGML_OP_FLASH_ATTN_EXT || tensor->op == GGML_OP_FLASH_ATTN_EXT_REROT ||
+                 tensor->op == GGML_OP_GATED_DELTA_NET)) {
             dev_local_node_hook(t_ij, j, dev_local_node_hook_userdata);
         }
 
@@ -2622,6 +2643,12 @@ struct ggml_backend_meta_context {
     std::vector<ggml_tensor *>  nodes_aux;
     std::vector<std::vector<std::vector<void *>>> chain_compute_cbs;
     std::vector<std::vector<ggml_tensor *>>       chain_tensors;
+    // The definition belongs to this backend/session entry. A function-static
+    // slot lets target and MTP evict (or accidentally reuse) one another. This
+    // is a single owner-local definition, not a map of token-shape graphs.
+    bool                        predefined_valid = false;
+    size_t                      predefined_n_subgraphs = 0;
+    uint64_t                    predefined_uid = 0;
     size_t                      n_reduce_steps;
     int                                           n_nodes       = 0;
     size_t                      max_tmp_size  = 0;
@@ -2676,6 +2703,9 @@ struct ggml_backend_meta_context {
     }
 
     void release_graph_state() {
+        predefined_valid = false;
+        predefined_n_subgraphs = 0;
+        predefined_uid = 0;
         chain_tensors.clear();
         chain_compute_cbs.clear();
         nodes_aux.clear();
@@ -3038,6 +3068,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid) || (cgraph->n_nodes != backend_ctx->n_nodes);
 
     if (needs_rebuild) {
+        // Old CB/tensor handles stop being executable BEFORE their graphs are
+        // reset below. A same-sized replacement is still a different definition.
+        backend_ctx->predefined_valid = false;
+        backend_ctx->predefined_n_subgraphs = 0;
+        backend_ctx->predefined_uid = 0;
+        backend_ctx->chain_compute_cbs.clear();
+        backend_ctx->chain_tensors.clear();
         for (size_t j = 0; j < n_backends; j++) {
             auto & bcj = backend_ctx->backend_configs[j];
             bcj.nodes.resize(cgraph->n_nodes);
@@ -3707,15 +3744,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     if (pfn_submit_chain && pfn_get_cbs && backend_ctx->comm_ctx && n_backends == 5 && backend_ctx->n_subgraphs > 1 &&
         (backend_ctx->n_subgraphs - 1) <= 128) {
         // 纯 Predefine 路线（唯一真理）：一旦初次建立预定义图句柄后，直接 100% 绝对复用，跳过逐轮 validation 开销
-        static bool s_predefined_valid = false;
-        static size_t s_predefined_n_subgraphs = 0;
-        static uint64_t s_predefined_uid = 0;
-
         auto & stage_compute_cbs = backend_ctx->chain_compute_cbs;
         auto & stage_tensors     = backend_ctx->chain_tensors;
 
-        if (s_predefined_valid && s_predefined_n_subgraphs == backend_ctx->n_subgraphs &&
-            (s_predefined_uid == 0 || s_predefined_uid == backend_ctx->uid)) {
+        if (backend_ctx->predefined_valid &&
+            backend_ctx->predefined_n_subgraphs == backend_ctx->n_subgraphs &&
+            backend_ctx->predefined_uid == backend_ctx->uid) {
             static const bool chain_timing_enabled = getenv("GGML_TP5_PROFILE") != nullptr;
             static int chain_hit_log = 0;
             bool chain_ok = false;
@@ -3822,9 +3856,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 chain_ok = pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors);
             }
             if (chain_ok) {
-                s_predefined_valid = true;
-                s_predefined_n_subgraphs = backend_ctx->n_subgraphs;
-                s_predefined_uid = backend_ctx->uid;
+                backend_ctx->predefined_valid = true;
+                backend_ctx->predefined_n_subgraphs = backend_ctx->n_subgraphs;
+                backend_ctx->predefined_uid = backend_ctx->uid;
                 if (++chain_hit_log <= 5 || chain_hit_log % 100 == 0) {
                     fprintf(stderr, "[tp5-meta] SUBMIT_EPOCH_CHAIN SUCCESS: predefined truth locked! (hits=%d)\n", chain_hit_log);
                 }

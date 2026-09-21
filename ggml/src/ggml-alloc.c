@@ -496,6 +496,8 @@ struct ggml_gallocr_buffer_pool_entry {
 struct ggml_gallocr_buffer_pool {
     int ref_count;
     uint64_t generation;
+    bool retain_capacity;
+    bool capacity_sealed;
 
     struct ggml_gallocr_buffer_pool_entry * entries;
     int n_entries;
@@ -565,6 +567,29 @@ void ggml_gallocr_buffer_pool_free(ggml_gallocr_buffer_pool_t pool) {
 uint64_t ggml_gallocr_buffer_pool_get_generation(ggml_gallocr_buffer_pool_t pool) {
     GGML_ASSERT(pool != NULL);
     return pool->generation;
+}
+
+void ggml_gallocr_buffer_pool_set_retain_capacity(ggml_gallocr_buffer_pool_t pool, bool retain) {
+    GGML_ASSERT(pool != NULL);
+    pool->retain_capacity = retain || pool->capacity_sealed;
+}
+
+bool ggml_gallocr_buffer_pool_get_retain_capacity(ggml_gallocr_buffer_pool_t pool) {
+    GGML_ASSERT(pool != NULL);
+    return pool->retain_capacity;
+}
+
+void ggml_gallocr_buffer_pool_set_capacity_sealed(ggml_gallocr_buffer_pool_t pool, bool sealed) {
+    GGML_ASSERT(pool != NULL);
+    pool->capacity_sealed = sealed;
+    if (sealed) {
+        pool->retain_capacity = true;
+    }
+}
+
+bool ggml_gallocr_buffer_pool_get_capacity_sealed(ggml_gallocr_buffer_pool_t pool) {
+    GGML_ASSERT(pool != NULL);
+    return pool->capacity_sealed;
 }
 
 static int ggml_gallocr_buffer_pool_find_entry(ggml_gallocr_buffer_pool_t pool, ggml_backend_buffer_type_t buft) {
@@ -766,7 +791,7 @@ void ggml_gallocr_reset(ggml_gallocr_t galloc) {
 // nobody still needs the larger one; each galloc reports its need through its talloc, which the
 // caller resets when the work changes phase. Never grows - the reserve path handles that.
 void ggml_gallocr_buffer_pool_trim(ggml_gallocr_buffer_pool_t pool) {
-    if (pool == NULL) {
+    if (pool == NULL || pool->retain_capacity || pool->capacity_sealed) {
         return;
     }
     for (int e = 0; e < pool->n_entries; ++e) {
@@ -1237,6 +1262,23 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
         return true;
+    }
+
+    // A maximum-capacity definition is immutable while running. Check every
+    // chunk before touching any of them so an over-capacity graph cannot leave
+    // another context's descriptors pointing at a partially replaced arena.
+    if (!no_alloc && galloc->buffer_pool->capacity_sealed) {
+        for (int i = 0; i < galloc->n_buffers; ++i) {
+            for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; ++c) {
+                const size_t have = ggml_vbuffer_chunk_size(galloc->buffers[i], c);
+                const size_t need = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
+                if (need > have) {
+                    GGML_LOG_ERROR("%s: predefined capacity exceeded for %s chunk %d: need %zu, have %zu (no resize)\n",
+                            __func__, ggml_backend_buft_name(galloc->bufts[i]), c, need, have);
+                    return false;
+                }
+            }
+        }
     }
 
     // grow shared buffers if needed

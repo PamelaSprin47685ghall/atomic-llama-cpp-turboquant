@@ -66,7 +66,9 @@ if [ "$BASELINE" -eq 1 ]; then
     # empty RADV_DEBUG is retained for controlled comparisons, not silently fixed.
     export RADV_DEBUG=${RADV_DEBUG-nobolist}
     export GGML_TP5_ISOLATE_BO=${GGML_TP5_ISOLATE_BO:-1}
-    export GGML_VK_DISABLE_MMVQ=${GGML_VK_DISABLE_MMVQ:-1}
+    # Do not silently disable a backend optimization in the canonical
+    # baseline. MMVQ "auto" now composes with Qwen region fusion; explicit
+    # GGML_VK_DISABLE_MMVQ=1 / GGML_VK_FORCE_MMVQ=1 remain diagnostic A/Bs.
     export GGML_TP5_CMD_REPLAY=${GGML_TP5_CMD_REPLAY:-1}
     export GGML_TP5_WIRE=f16 GGML_TP5_SYNC=timeline GGML_TP5_RELAY=off
     BIN=$(realpath -e "$BIN")
@@ -79,7 +81,7 @@ if [ "$BASELINE" -eq 1 ]; then
     say 'PROFILE=pure-tp-baseline; production TP5_ARGS/EXTRA_ARGS/slot/cache overrides are not used'
     printf 'command:'; printf ' %q' "${baseline_cmd[@]}"; printf '\n'
     for key in RADV_DEBUG GGML_TP5_ISOLATE_BO GGML_TP5_SYNC GGML_TP5_WIRE GGML_TP5_RELAY \
-        GGML_VK_CMD_REPLAY GGML_TP5_CMD_REPLAY GGML_VK_DISABLE_MMVQ \
+        GGML_VK_CMD_REPLAY GGML_TP5_CMD_REPLAY GGML_VK_DISABLE_MMVQ GGML_VK_FORCE_MMVQ \
         GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM GGML_VK_ALLOW_GRAPHICS_QUEUE \
         GGML_VK_DISABLE_HC_SUM GGML_VK_DISABLE_PRODUCER_WIRE GGML_VK_DISABLE_ATTENTION_COMPACT \
         GGML_TP5_CHAIN_CACHE GGML_TP5_SHARE_P1 GGML_TP5_PROFILE GGML_VK_PERF_LOGGER \

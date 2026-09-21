@@ -1933,6 +1933,30 @@ ggml_backend_sched_compute_pool_t ggml_backend_sched_compute_pool_ref(ggml_backe
     return pool;
 }
 
+void ggml_backend_sched_compute_pool_set_retain_capacity(ggml_backend_sched_compute_pool_t pool, bool retain) {
+    GGML_ASSERT(pool != nullptr);
+    std::lock_guard<std::recursive_mutex> lock(pool->mutex);
+    ggml_gallocr_buffer_pool_set_retain_capacity(pool->buffer_pool, retain);
+}
+
+bool ggml_backend_sched_compute_pool_get_retain_capacity(ggml_backend_sched_compute_pool_t pool) {
+    GGML_ASSERT(pool != nullptr);
+    std::lock_guard<std::recursive_mutex> lock(pool->mutex);
+    return ggml_gallocr_buffer_pool_get_retain_capacity(pool->buffer_pool);
+}
+
+void ggml_backend_sched_compute_pool_set_capacity_sealed(ggml_backend_sched_compute_pool_t pool, bool sealed) {
+    GGML_ASSERT(pool != nullptr);
+    std::lock_guard<std::recursive_mutex> lock(pool->mutex);
+    ggml_gallocr_buffer_pool_set_capacity_sealed(pool->buffer_pool, sealed);
+}
+
+bool ggml_backend_sched_compute_pool_get_capacity_sealed(ggml_backend_sched_compute_pool_t pool) {
+    GGML_ASSERT(pool != nullptr);
+    std::lock_guard<std::recursive_mutex> lock(pool->mutex);
+    return ggml_gallocr_buffer_pool_get_capacity_sealed(pool->buffer_pool);
+}
+
 void ggml_backend_sched_compute_pool_free(ggml_backend_sched_compute_pool_t pool) {
     if (pool == nullptr) {
         return;

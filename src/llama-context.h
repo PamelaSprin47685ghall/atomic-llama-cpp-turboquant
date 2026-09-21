@@ -18,6 +18,8 @@
 #include <vector>
 
 struct llama_model;
+struct llama_predefined_session;
+struct ggml_predefined_capacity;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -71,6 +73,8 @@ struct llama_context {
 
     ggml_backend_sched_t get_sched() const;
     ggml_backend_sched_compute_pool_t get_compute_pool() const;
+    bool prepare_predefined_mtp(llama_context & draft, uint32_t max_draft_tokens);
+    const ggml_predefined_capacity * predefined_capacity() const;
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
@@ -670,6 +674,8 @@ private:
     // `sched` is built over `compute_pool`, so it must also stay declared after
     // it in order to be destroyed first.
     ggml_backend_sched_compute_pool_ptr compute_pool;
+    // Shared by the target and MTP contexts. Owns capacity, not per-shape graphs.
+    std::shared_ptr<llama_predefined_session> predefined_session;
     ggml_backend_sched_ptr sched;
 
     // training

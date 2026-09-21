@@ -955,6 +955,16 @@ void process_shaders() {
                   {
                       { "TP5_LATE_Q", "1" }
     });
+    string_to_spv("tp5_hc_late_norm", "tp5_hc_latebind.comp",
+                  {
+                      { "TP5_LATE_NORM", "1" }
+    });
+    string_to_spv("tp5_hc_resume_norm", "tp5_hc_resume.comp", {{ "TP5_RESUME_NORM", "1" }});
+    string_to_spv("tp5_hc_resume_lo", "tp5_hc_resume.comp", {{ "TP5_RESUME_LO", "1" }});
+    string_to_spv("tp5_hc_late_lo", "tp5_hc_latebind.comp",
+                  {
+                      { "TP5_LATE_LO", "1" }
+    });
     string_to_spv("tp5_hc_late_finalize", "tp5_hc_latebind.comp",
                   {
                       { "TP5_LATE_FINALIZE", "1" }
@@ -1261,7 +1271,27 @@ void process_shaders() {
                   {
                       { "ATTENTION_PREP_COMPACT", "1" }
     });
+    // Always emit the integer-dot Qwen variants. Shader generation capability
+    // and runtime device capability are separate concerns: the standalone
+    // vulkan-shaders-gen target does not inherit ggml-vulkan's
+    // GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT C++ define. Runtime pipeline
+    // creation below is already gated by device->integer_dot_product.
+    string_to_spv("qwen4_gdn_projections_mmvq", "qwen4_attention_projections.comp",
+                  {{"GDN_PROJECTIONS", "1"}, {"QWEN_MMVQ", "1"}});
+    string_to_spv("qwen4_qsa_projections_mmvq", "qwen4_attention_projections.comp",
+                  {{"QSA_PROJECTIONS", "1"}, {"QWEN_MMVQ", "1"}});
+    for (int transport = 0; transport < 3; ++transport) {
+        auto defs = merge_maps(base_dict, {{"DATA_A_Q5_K", "1"}, {"D_TYPE", "float"},
+                                           {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}});
+        defs[transport == 0 ? "TP5_WIRE_OUTPUT" : "TP5_RELAY_OUTPUT"] = "1";
+        if (transport == 2) defs["TP5_RELAY_OUTPUT_F32"] = "1";
+        string_to_spv(transport == 0 ? "qwen4_output_q5k_mmvq_wire" :
+                      transport == 1 ? "qwen4_output_q5k_mmvq_relay" : "qwen4_output_q5k_mmvq_relay_f32",
+                      "mul_mat_vecq.comp", defs);
+    }
     string_to_spv("tp5_pack_f16", "tp5_pack_f16.comp", {});
+    string_to_spv("tp5_pack_f16_vec", "tp5_pack_f16_vec.comp", {});
+    string_to_spv("tp5_copy_u128", "tp5_copy_u128.comp", {});
     string_to_spv("tp5_gpuflag", "tp5_gpuflag.comp", {});
     string_to_spv("tp5_relay", "tp5_relay.comp", {});
     string_to_spv("tp5_relay_copy_f32", "tp5_relay_copy_f32.comp", {});

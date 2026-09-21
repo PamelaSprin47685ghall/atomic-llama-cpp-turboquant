@@ -71,6 +71,7 @@ uint64_t ggml_vk_tp5_get_tensor_bda(struct ggml_tensor * t);
 
 static constexpr size_t VK_TP5_RELAY_ROUTE_MAX = 128;
 static constexpr size_t VK_TP5_RELAY_ROUTE_STRIDE = 256;
+static constexpr uint32_t VK_TP5_RELAY_ROUTE_KEEP_LOCAL = 1u << 0;
 struct vk_tp5_relay_route_entry {
     uint32_t bank     = 0;
     uint32_t ready    = 0;
@@ -95,7 +96,12 @@ void ggml_vk_tp5_set_wire_output(ggml_backend_t backend, struct ggml_tensor * te
 // Mark one replay graph as eligible to publish its leading HC consumer recipe
 // for Exact LateBind. This is deliberately independent of producer-wire: the
 // legacy RELAY P1 path must be able to keep its original producer unchanged.
-void ggml_vk_tp5_set_latebind_capture(ggml_backend_t backend, const struct ggml_cgraph * graph, bool enabled);
+void ggml_vk_tp5_set_latebind_capture(ggml_backend_t backend, const struct ggml_cgraph * graph, bool enabled,
+                                     bool define_program = false);
+struct vk_tp5_graph_program;
+// Definition-time lookup. The returned program owns immutable descriptors and
+// buffers, so its commands may be lowered into an independent primary CB.
+std::shared_ptr<const vk_tp5_graph_program> ggml_vk_tp5_graph_program(ggml_backend_t backend, void * first_cb);
 bool ggml_vk_tp5_take_wire_output(ggml_backend_t       backend,
                                   struct ggml_tensor * tensor,
                                   struct VkBuffer_T ** buf,
@@ -108,7 +114,7 @@ bool ggml_vk_tp5_take_wire_output(ggml_backend_t       backend,
 bool ggml_vk_tp5_get_relay_ready(ggml_backend_t backend, size_t stage, volatile uint32_t ** ready_ptr);
 bool ggml_vk_tp5_update_relay_route(ggml_backend_t backend, size_t stage, uint32_t bank, uint64_t epoch,
                                     const vk_tp5_relay_payload_binding & payload,
-                                    volatile uint32_t ** ready_ptr);
+                                    volatile uint32_t ** ready_ptr, bool keep_local = false);
 void ggml_vk_tp5_clear_relay_payload_binding(ggml_backend_t backend);
 
 struct vk_tp5_hc_binding {

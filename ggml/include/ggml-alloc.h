@@ -61,6 +61,17 @@ GGML_API void           ggml_gallocr_reset(ggml_gallocr_t galloc);
 GGML_API void           ggml_gallocr_release_buffers(ggml_gallocr_t galloc);
 // shrink every shared buffer to the largest size its gallocs currently require
 GGML_API void           ggml_gallocr_buffer_pool_trim(ggml_gallocr_buffer_pool_t pool);
+// Maximum-capacity sessions keep the high-water allocation across phase/shape
+// changes. Plans may still be reset; physical shared buffers are not shrunk.
+// This is a pool policy, not a second allocation and not graph-reuse permission.
+// Caller serializes it with all allocator users. Disabling does not trim now.
+GGML_API void ggml_gallocr_buffer_pool_set_retain_capacity(ggml_gallocr_buffer_pool_t pool, bool retain);
+GGML_API bool ggml_gallocr_buffer_pool_get_retain_capacity(ggml_gallocr_buffer_pool_t pool);
+// Seal after all entries have been sized. A reserve exceeding a sealed pool
+// fails before freeing or changing any physical buffer. Unseal only at a
+// drained definition/configuration boundary, never as an allocation retry.
+GGML_API void ggml_gallocr_buffer_pool_set_capacity_sealed(ggml_gallocr_buffer_pool_t pool, bool sealed);
+GGML_API bool ggml_gallocr_buffer_pool_get_capacity_sealed(ggml_gallocr_buffer_pool_t pool);
 
 // pre-allocate buffers from a measure graph - does not allocate or modify the graph
 // call with a worst-case graph to avoid buffer reallocations

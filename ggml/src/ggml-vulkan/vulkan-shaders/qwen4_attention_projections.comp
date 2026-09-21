@@ -146,9 +146,16 @@ layout(push_constant) uniform PushParams {
     uint rows0;
     uint rows1;
     uint rows2;
+#ifdef QWEN_MMVQ
+    uint mmvq_mask; // bit0 Q5[0], bit1 Q5[1] (GDN), bit2 paired Q6
+#endif
 }
 
 p;
+
+#ifdef QWEN_MMVQ
+#include "qwen4_attention_mmvq.glsl"
+#endif
 
 shared float sccache_a[2][BLOCK_SIZE / 16][16];
 shared float sccache_b[2][BLOCK_SIZE / 16][16];
@@ -309,6 +316,12 @@ void calc_superblock_q5_k(const uint  matrix_idx,
 }
 
 void compute_q5_k(const uint matrix_idx, const uint first_row, const uint num_rows, const uint tid) {
+#ifdef QWEN_MMVQ
+    if ((p.mmvq_mask & (1u << matrix_idx)) != 0u) {
+        qwen_compute_mmvq(matrix_idx, first_row, num_rows, tid);
+        return;
+    }
+#endif
     const uint num_blocks_per_row = (p.width + 255u) / 256u;
 
     const uint it_size = gl_WorkGroupSize.x / 16u;
@@ -480,6 +493,12 @@ void calc_superblock_paired_q6_k(const uint  itid,
 }
 
 void compute_paired_q6_k(const uint first_row, const uint num_rows, const uint tid) {
+#ifdef QWEN_MMVQ
+    if ((p.mmvq_mask & 4u) != 0u) {
+        qwen_compute_mmvq(2u, first_row, num_rows, tid);
+        return;
+    }
+#endif
     const uint num_blocks_per_row = (p.width + 255u) / 256u;
     const uint it_size            = gl_WorkGroupSize.x / 16u;
     const uint itid               = tid % 16u;

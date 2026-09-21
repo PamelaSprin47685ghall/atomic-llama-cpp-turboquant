@@ -1,4 +1,6 @@
 #include "speculative.h"
+#include "speculative-mtp-workspace.h"
+#include "llama-predefined.h"
 
 #include "common.h"
 #include "ggml.h"
@@ -1298,7 +1300,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
-    llama_batch batch;
+    std::unique_ptr<common_mtp_batch_storage> batch_storage;
+    llama_batch batch{};
 
     std::vector<common_sampler_ptr> smpls;
 
@@ -1315,25 +1318,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool    is_mem_shared = false;   // gemma4
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
 
-    // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
-    // The last h-row of one process() call needs the first token of the NEXT
-    // call to pair with, so it's stashed here until that next call fires.
-    std::vector<std::vector<float>> pending_h;   // [n_seq][n_embd]
+    // Fixed-capacity carry/verification/catch-up storage. One shared row arena
+    // per driver; changing accepted/draft lengths only changes live ranges.
+    std::unique_ptr<common_mtp_workspace> workspace;
 
     std::vector<int32_t> i_batch_beg;
     std::vector<int32_t> i_batch_end;
 
-    // Hidden rows from the most recent target verification batch, grouped by seq.
-    // Row 0 corresponds to the sampled token, row N to the Nth accepted draft token.
-    std::vector<std::vector<float>> verify_h;
-    std::vector<int32_t> verify_h_rows;
-
-    // Qwen-style MTP catch-up is staged until target acceptance is known.
-    std::vector<llama_tokens>                 staged_tokens;
-    std::vector<std::vector<llama_pos>>       staged_pos;
-    std::vector<std::vector<float>>           staged_embd;
-    std::vector<int32_t>                      staged_commit_rows;
     std::vector<bool>                         paused;
+    std::vector<bool>                         drafting;
 
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
@@ -1363,11 +1356,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 ctx_dft ? "yes" : "no",
                 common_speculative_get_devices_str(this->params.devices).c_str());
 
-        n_batch_alloc = std::max((int32_t) llama_n_batch(ctx_dft), (int32_t) llama_n_batch(ctx_tgt));
-        batch = llama_batch_init(/*n_tokens=*/ n_batch_alloc, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
-        // llama_batch_init allocates only one of token/embd; MTP needs both.
-        // TODO: fix, how to call without malloc
-        batch.token = (llama_token *) malloc(sizeof(llama_token) * n_batch_alloc);
+        const uint32_t row_capacity = std::max(llama_n_batch(ctx_dft), llama_n_batch(ctx_tgt));
+        if (row_capacity == 0 || row_capacity > INT32_MAX || n_embd <= 0) {
+            throw std::invalid_argument("invalid maximum MTP batch capacity");
+        }
+        n_batch_alloc = (int32_t) row_capacity;
+        workspace = std::make_unique<common_mtp_workspace>(n_seq, row_capacity, n_embd);
+        batch_storage = std::make_unique<common_mtp_batch_storage>(row_capacity, n_embd);
+        batch = batch_storage->view();
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1409,20 +1405,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
-
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
 
-        verify_h.assign(n_seq, {});
-        verify_h_rows.assign(n_seq, 0);
-
-        staged_tokens.assign(n_seq, {});
-        staged_pos.assign(n_seq, {});
-        staged_embd.assign(n_seq, {});
-        staged_commit_rows.assign(n_seq, 0);
         paused.assign(n_seq, false);
+        drafting.assign(n_seq, false);
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1437,12 +1425,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             llama_sampler_free(backend_chains[seq_id]);
         }
         backend_chains.clear();
-
-        if (batch.token != nullptr) {
-            free(batch.token);
-            batch.token = nullptr;
-        }
-        llama_batch_free(batch);
+        // batch is a borrowed view into batch_storage. Its owner releases all
+        // arrays once, including on a partially constructed driver.
     }
 
     void reset() override {
@@ -1455,20 +1439,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         common_batch_clear(batch);
-        for (auto & h : pending_h) {
-            std::fill(h.begin(), h.end(), 0.0f);
-        }
-        for (auto & h : verify_h) {
-            h.clear();
-        }
-        std::fill(verify_h_rows.begin(), verify_h_rows.end(), 0);
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            staged_tokens[seq_id].clear();
-            staged_pos[seq_id].clear();
-            staged_embd[seq_id].clear();
-        }
-        std::fill(staged_commit_rows.begin(), staged_commit_rows.end(), 0);
+        workspace->reset();
         std::fill(paused.begin(), paused.end(), false);
+        std::fill(drafting.begin(), drafting.end(), false);
         std::fill(i_last.begin(), i_last.end(), -1);
         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
@@ -1489,7 +1462,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
 
-        if (pos_max < N - 1 && !is_mem_shared && staged_tokens[seq_id].empty()) {
+        if (pos_max < N - 1 && !is_mem_shared && !workspace->has_staged(seq_id)) {
             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
                     "process() hook may not have run on every prefill ubatch "
                     "(need_embd / logits=1 on every prompt position?). "
@@ -1498,30 +1471,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    void ensure_batch_capacity(int32_t n_tokens) {
-        if (n_tokens <= n_batch_alloc) {
-            return;
-        }
-
-        if (batch.token != nullptr) {
-            free(batch.token);
-            batch.token = nullptr;
-        }
-        llama_batch_free(batch);
-
-        n_batch_alloc = n_tokens;
-        batch = llama_batch_init(/*n_tokens=*/ n_batch_alloc, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
-        batch.token = (llama_token *) malloc(sizeof(llama_token) * n_batch_alloc);
-        GGML_ASSERT(batch.token != nullptr);
-    }
-
     void clear_staged() {
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            staged_tokens[seq_id].clear();
-            staged_pos[seq_id].clear();
-            staged_embd[seq_id].clear();
-            staged_commit_rows[seq_id] = 0;
-        }
+        workspace->clear_staged();
     }
 
     bool process_impl(const llama_batch & batch_in, const std::vector<bool> * defer) {
@@ -1536,11 +1487,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t n_tokens = batch_in.n_tokens;
         const bool stage = defer != nullptr && !is_mem_shared && !chain_heads;
+        if (n_tokens > n_batch_alloc) {
+            SPC_ERR("MTP input exceeds predefined capacity: rows=%d capacity=%d\n", n_tokens, n_batch_alloc);
+            return false;
+        }
 
         if (stage) {
             GGML_ASSERT(defer->size() == n_seq);
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                if (!staged_tokens[seq_id].empty()) {
+                if (workspace->has_staged(seq_id)) {
                     SPC_ERR("uncommitted MTP rows for seq_id=%d\n", (int) seq_id);
                     return false;
                 }
@@ -1578,20 +1533,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         if (!is_mem_shared && !stage) {
-            ensure_batch_capacity(n_tokens);
             common_batch_clear(batch);
 
             for (int32_t k = 0; k < n_tokens; ++k) {
                 const llama_seq_id seq_id = batch_in.seq_id[k][0];
+                if (paused[(size_t) seq_id]) {
+                    continue;
+                }
                 common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { seq_id }, 0);
 
                 const float * h_in = k == i_batch_beg[seq_id]
-                    ? pending_h[seq_id].data()
+                    ? workspace->pending(seq_id)
                     : h_tgt + (size_t) (k - 1) * n_embd;
                 std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_in, row_bytes);
             }
         }
 
+        if (!workspace->begin(n_tokens, h_tgt, batch_in.token, batch_in.pos)) {
+            SPC_ERR("%s", "MTP verification workspace is busy or over capacity\n");
+            return false;
+        }
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_end[seq_id] < 0) {
                 continue;
@@ -1600,35 +1561,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             const int32_t i_beg = i_batch_beg[seq_id];
             const int32_t n_rows = i_batch_end[seq_id] - i_beg + 1;
 
-            verify_h_rows[seq_id] = n_rows;
-            verify_h[seq_id].resize((size_t) n_rows * n_embd);
-            std::memcpy(verify_h[seq_id].data(), h_tgt + (size_t) i_beg * n_embd, row_bytes * n_rows);
-
-            if (stage) {
-                auto & tokens = staged_tokens[seq_id];
-                auto & pos    = staged_pos[seq_id];
-                auto & embd   = staged_embd[seq_id];
-
-                tokens.resize(n_rows);
-                pos.resize(n_rows);
-                embd.resize((size_t) n_rows * n_embd);
-
-                for (int32_t i = 0; i < n_rows; ++i) {
-                    const int32_t k = i_beg + i;
-                    tokens[i] = batch_in.token[k];
-                    pos[i]    = batch_in.pos[k];
-
-                    const float * h_in = i == 0
-                        ? pending_h[seq_id].data()
-                        : h_tgt + (size_t) (k - 1) * n_embd;
-                    std::memcpy(embd.data() + (size_t) i * n_embd, h_in, row_bytes);
-                }
-
-                staged_commit_rows[seq_id] = (*defer)[seq_id] ? -1 : n_rows;
+            if (!workspace->sequence(seq_id, i_beg, n_rows, stage, stage && (*defer)[seq_id])) {
+                SPC_ERR("invalid MTP verification range for seq_id=%d\n", (int) seq_id);
+                return false;
             }
-
-            std::memcpy(pending_h[seq_id].data(),
-                    verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
         }
 
         if (is_mem_shared || stage) {
@@ -1675,11 +1611,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool commit() override {
-        int32_t n_commit = 0;
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (staged_commit_rows[seq_id] > 0) {
-                n_commit += staged_commit_rows[seq_id];
-            }
+        const uint32_t n_commit = workspace->total_commit_rows();
+        if (n_commit > (uint32_t) n_batch_alloc) {
+            SPC_ERR("%s", "MTP catch-up exceeds predefined capacity\n");
+            return false;
         }
 
         if (n_commit == 0) {
@@ -1687,23 +1622,28 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
-        ensure_batch_capacity(n_commit);
         common_batch_clear(batch);
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            const int32_t n_rows = staged_commit_rows[seq_id];
+            const int32_t n_rows = workspace->commit_rows(seq_id);
             if (n_rows <= 0) {
                 continue;
             }
 
-            GGML_ASSERT(n_rows <= (int32_t) staged_tokens[seq_id].size());
             for (int32_t i = 0; i < n_rows; ++i) {
-                common_batch_add(batch, staged_tokens[seq_id][i], staged_pos[seq_id][i], { seq_id }, 0);
+                llama_token token;
+                llama_pos position;
+                const float * hidden;
+                if (!workspace->commit_row(seq_id, i, token, position, hidden)) {
+                    SPC_ERR("%s", "invalid MTP catch-up row\n");
+                    return false;
+                }
+                common_batch_add(batch, token, position, { seq_id }, 0);
                 std::memcpy(
                         batch.embd + (size_t) (batch.n_tokens - 1) * n_embd,
-                        staged_embd[seq_id].data() + (size_t) i * n_embd,
+                        hidden,
                         row_bytes);
             }
         }
@@ -1726,7 +1666,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // keep track of which sequences are still drafting
         int n_drafting = 0;
-        std::vector<bool> drafting(n_seq);
+        std::fill(drafting.begin(), drafting.end(), false);
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
@@ -1742,12 +1682,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             common_sampler_reset(smpls[seq_id].get());
 
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
-            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
+            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, workspace->pending(seq_id), row_bytes);
 
             i_last[seq_id] = batch.n_tokens - 1;
 
             if (chain_heads) {
-                chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
+                chain_h[seq_id].assign(workspace->pending(seq_id), workspace->pending(seq_id) + n_embd);
             }
         }
 
@@ -1875,20 +1815,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
-        const int32_t n_rows = verify_h_rows[seq_id];
-        if (n_rows <= 0) {
-            return;
-        }
-
-        const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
-        const size_t row_bytes = (size_t) n_embd * sizeof(float);
-        std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
-
-        if (!staged_tokens[seq_id].empty()) {
-            staged_commit_rows[seq_id] = std::min<int32_t>(
-                    (int32_t) n_accepted + 1,
-                    (int32_t) staged_tokens[seq_id].size());
-        }
+        workspace->accept(seq_id, n_accepted);
     }
 
     bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
@@ -1897,7 +1824,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         const size_t state_size = (size_t) n_embd * sizeof(float);
         data.resize(state_size);
-        std::memcpy(data.data(), pending_h[seq_id].data(), state_size);
+        std::memcpy(data.data(), workspace->pending(seq_id), state_size);
         return true;
     }
 
@@ -1906,13 +1833,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
-        std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
-        verify_h[seq_id].clear();
-        verify_h_rows[seq_id] = 0;
-        staged_tokens[seq_id].clear();
-        staged_pos[seq_id].clear();
-        staged_embd[seq_id].clear();
-        staged_commit_rows[seq_id] = 0;
+        workspace->reset_sequence(seq_id);
         i_last[seq_id] = -1;
         if (chain_heads) {
             chain_h[seq_id].clear();
@@ -1928,7 +1849,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     (int) seq_id, data.size(), state_size);
             return;
         }
-        std::memcpy(pending_h[seq_id].data(), data.data(), state_size);
+        std::memcpy(workspace->pending(seq_id), data.data(), state_size);
     }
 
     void set_paused(llama_seq_id seq_id, bool value) override {
@@ -2729,7 +2650,16 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
-                impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                auto impl = std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq);
+                // All sampler/hidden-state parameters are finalized now. Size
+                // both entries once before any request; failure destroys the
+                // fully constructed driver, including attached sampler chains.
+                if (impl->params.n_max < 0 ||
+                    !llama_predefined_mtp_reserve(impl->params.ctx_tgt, impl->params.ctx_dft,
+                                                 (uint32_t) impl->params.n_max)) {
+                    throw std::runtime_error("failed to define maximum-capacity MTP resources");
+                }
+                impls.push_back(std::move(impl));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {

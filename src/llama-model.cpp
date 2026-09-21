@@ -798,8 +798,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 // TP5 local-node head map hook (opt-in GGML_TP5_QSA_HEADMAP=1 /
 // GGML_TP5_GDN_HEADMAP=1): stamps the per-rank local arithmetic head map on
 // the meta backend's rank-local clones. One shared hook dispatches on
-// node->op: FLASH_ATTN_EXT gets the Q->KV map (QSA), GATED_DELTA_NET gets
-// the V->QK map (GDN). The userdata is the device's split-state userdata
+// node->op: ordinary/indexed FLASH_ATTN gets the Q->KV map (QSA),
+// GATED_DELTA_NET gets the V->QK map (GDN). The userdata is the device's split-state userdata
 // that carries the plan.
 static bool llama_tp5_local_node_hook(struct ggml_tensor * local_node, size_t rank, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud =
@@ -807,7 +807,8 @@ static bool llama_tp5_local_node_hook(struct ggml_tensor * local_node, size_t ra
     if (ud == nullptr || !ud->has_tp5_plan) {
         return false;
     }
-    if (local_node->op == GGML_OP_FLASH_ATTN_EXT && ud->tp5_plan.qsa_headmap) {
+    if ((local_node->op == GGML_OP_FLASH_ATTN_EXT || local_node->op == GGML_OP_FLASH_ATTN_EXT_REROT) &&
+        ud->tp5_plan.qsa_headmap) {
         if (!llama_tp5_qsa_headmap_stamp(ud->tp5_plan, (uint32_t) rank, local_node)) {
             GGML_ABORT("invalid TP5 QSA local geometry for rank %zu, node '%s'", rank, local_node->name);
         }

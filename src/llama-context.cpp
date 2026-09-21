@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "ggml-predefined.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -2370,6 +2371,18 @@ struct llama_compute_guard {
 };
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // Capacity admission precedes memory->apply(), so an oversized execution
+    // cannot advance KV/recurrent state before being refused. The existing
+    // logical-shape checks below stay intact until all operators are lowered
+    // to the runtime frame ABI; a larger allocation is not a larger token batch.
+    if (const auto * capacity = predefined_capacity()) {
+        if (ubatch.n_tokens > capacity->tokens || ubatch.n_seqs > capacity->limits.sequences) {
+            LLAMA_LOG_ERROR("%s: MTP execution exceeds its predefined capacity (tokens=%u, sequences=%u)\n",
+                            __func__, ubatch.n_tokens, ubatch.n_seqs);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+    }
     // Prompt processing and token generation never run at the same time, so the compute buffers
     // only ever have to hold one of them: on a change of phase the graph for the new phase is
     // reserved, which releases what the finished phase was holding (graph_reserve does the
@@ -2447,10 +2460,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
-        // Assign deterministic UID to decode graph so meta backend and device backends
-        // can stably reuse subgraphs and command buffers without rebuilding (O(1) replay).
-        if (gf && ubatch.n_tokens == 1) {
-            ggml_graph_set_uid(gf, 0x5100000000000000ULL);
+        // A definition keeps its ID for its whole lifetime, but target, MTP,
+        // and a genuine replacement definition must never share an ID. The
+        // old constant also lost all of its high bits in meta's uid<<16 stage
+        // encoding. Reserve the upper half of that 48-bit parent-ID space.
+        if (gf) {
+            static std::atomic<uint64_t> next_definition{1};
+            const uint64_t serial = next_definition.fetch_add(1, std::memory_order_relaxed);
+            if (serial == 0 || serial >= (1ULL << 47)) {
+                LLAMA_LOG_ERROR("%s: graph definition ID space exhausted\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            ggml_graph_set_uid(gf, (1ULL << 47) | serial);
         }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);

@@ -664,6 +664,68 @@ static void test_shared_buffer_pool_union() {
     GGML_ASSERT(backend.context->allocated_total() == 44);
 }
 
+static void test_predefined_maximum_pool() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_backend_buffer_type_t buft = &backend.buffer_type;
+    ggml_gallocr_buffer_pool_ptr pool(ggml_gallocr_buffer_pool_new());
+    ggml_gallocr_buffer_pool_set_retain_capacity(pool.get(), true);
+
+    auto [ctx_max, graph_max, ctx_max_ptr] = make_context();
+    auto * max_a = make_input_with_size(ctx_max, 128);
+    auto * max_b = make_input_with_size(ctx_max, 128);
+    auto * max_out = ggml_add(ctx_max, max_a, max_b);
+    ggml_set_output(max_out);
+    ggml_build_forward_expand(graph_max, max_out);
+    ggml_gallocr_ptr target(ggml_gallocr_new_n_shared(&buft, 1, pool.get()));
+    GGML_ASSERT(ggml_gallocr_reserve(target.get(), graph_max));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(target.get(), graph_max));
+    const size_t maximum = backend.context->allocated_total();
+    const uint64_t generation = ggml_gallocr_buffer_pool_get_generation(pool.get());
+    auto * original_buffer = max_a->buffer;
+    void * original_data = max_a->data;
+    GGML_ASSERT(maximum > 0);
+
+    auto [ctx_small, graph_small, ctx_small_ptr] = make_context();
+    auto * small_a = make_input_with_size(ctx_small, 16);
+    auto * small_b = make_input_with_size(ctx_small, 16);
+    auto * small_out = ggml_add(ctx_small, small_a, small_b);
+    ggml_set_output(small_out);
+    ggml_build_forward_expand(graph_small, small_out);
+    ggml_gallocr_ptr draft(ggml_gallocr_new_n_shared(&buft, 1, pool.get()));
+    GGML_ASSERT(ggml_gallocr_reserve(draft.get(), graph_small));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(draft.get(), graph_small));
+    // target and draft share max(), not separate resident allocations.
+    GGML_ASSERT(backend.context->allocated_total() == maximum);
+    ggml_gallocr_reset(draft.get());
+    ggml_gallocr_release_buffers(draft.get());
+    ggml_gallocr_buffer_pool_trim(pool.get());
+    GGML_ASSERT(backend.context->allocated_total() == maximum);
+    GGML_ASSERT(ggml_gallocr_buffer_pool_get_generation(pool.get()) == generation);
+    GGML_ASSERT(max_a->buffer == original_buffer && max_a->data == original_data);
+
+    ggml_gallocr_buffer_pool_set_capacity_sealed(pool.get(), true);
+    GGML_ASSERT(ggml_gallocr_buffer_pool_get_capacity_sealed(pool.get()));
+    ggml_gallocr_buffer_pool_set_retain_capacity(pool.get(), false);
+    GGML_ASSERT(ggml_gallocr_buffer_pool_get_retain_capacity(pool.get()));
+
+    auto [ctx_large, graph_large, ctx_large_ptr] = make_context();
+    auto * large_a = make_input_with_size(ctx_large, maximum * 2);
+    auto * large_b = make_input_with_size(ctx_large, maximum * 2);
+    auto * large_out = ggml_add(ctx_large, large_a, large_b);
+    ggml_set_output(large_out);
+    ggml_build_forward_expand(graph_large, large_out);
+    ggml_gallocr_ptr excess(ggml_gallocr_new_n_shared(&buft, 1, pool.get()));
+    GGML_ASSERT(!ggml_gallocr_reserve(excess.get(), graph_large));
+    GGML_ASSERT(backend.context->allocated_total() == maximum);
+    GGML_ASSERT(ggml_gallocr_buffer_pool_get_generation(pool.get()) == generation);
+    GGML_ASSERT(max_a->buffer == original_buffer && max_a->data == original_data);
+    // A rejected growth must not damage the smaller plan or its buffers.
+    GGML_ASSERT(ggml_gallocr_reserve(draft.get(), graph_small));
+    GGML_ASSERT(ggml_gallocr_alloc_graph(draft.get(), graph_small));
+    check_all_allocated(graph_small);
+    GGML_ASSERT(backend.context->allocated_total() == maximum);
+}
+
 static void test_backend_graph_optimize(ggml_backend_t, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(graph->n_nodes == 3);
     params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
@@ -721,6 +783,7 @@ int main() {
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_shared_buffer_pool_union", test_shared_buffer_pool_union);
+    run("test_predefined_maximum_pool", test_predefined_maximum_pool);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     return 0;
 }

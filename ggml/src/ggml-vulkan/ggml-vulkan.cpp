@@ -1,4 +1,5 @@
 #include "ggml-vulkan.h"
+#include "ggml-vulkan-tp5-liveness.hpp"
 #include "ggml-tp5-profile.h"
 #include <vulkan/vulkan_core.h>
 #if defined(__x86_64__) || defined(_M_X64)
@@ -100,6 +101,7 @@ typedef struct VkPhysicalDeviceCooperativeMatrixDecodeVectorFeaturesNV {
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-vulkan-internal.h"
+#include "ggml-vulkan-tp5-command.h"
 
 #include "ggml-xkv.h"
 #include "ggml-xkv-factor.h"
@@ -1107,6 +1109,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_moe_shared_up_swiglu;
     vk_pipeline pipeline_moe_projections[2];
     vk_pipeline pipeline_attention_projections[2];
+    vk_pipeline pipeline_attention_projections_mmvq[2];
+    // Same output epilogues with built-in Q5_K x Q8_1 integer contraction.
+    vk_pipeline pipeline_output_q5k_mmvq_wire;
+    vk_pipeline pipeline_output_q5k_mmvq_relay[2];
     vk_pipeline pipeline_attention_prep;
     vk_pipeline pipeline_attention_prep_compact;
     vk_pipeline pipeline_attention_reduce_gate;
@@ -1445,6 +1451,7 @@ struct vk_mat_mat_push_constants {
 #define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
 #define MAT_VEC_FUSION_FLAGS_SCALE0 0x4
 #define MAT_VEC_FUSION_FLAGS_SCALE1 0x8
+#define MAT_VEC_FUSION_FLAGS_TP5_ELIDE_LOCAL 0x100
 
 struct vk_mat_vec_push_constants {
     uint32_t ncols;
@@ -1519,7 +1526,9 @@ struct vk_moe_down_shared_push_constants {
 struct vk_moe_down_k128_push_constants {
     uint32_t width; // output row length (multiple of 256; K/experts/shared_k
                     // are fixed specialization constants in the shader)
+    uint32_t fusion_flags; // local-output liveness permission, as in mat_vec
 };
+static_assert(sizeof(vk_moe_down_k128_push_constants) == 8, "K128 push constant ABI");
 
 struct vk_mat_vec_id_grouped_push_constants {
     uint32_t ncols;
@@ -1907,6 +1916,14 @@ struct vk_attention_projections_push_constants {
     uint32_t rows1;
     uint32_t rows2;
 };
+
+struct vk_attention_projections_mmvq_push_constants {
+    vk_attention_projections_push_constants projection;
+    uint32_t mmvq_mask;
+};
+static_assert(sizeof(vk_attention_projections_push_constants) == 16, "attention projection ABI");
+static_assert(sizeof(vk_attention_projections_mmvq_push_constants) == 20, "attention MMVQ ABI");
+static_assert(offsetof(vk_attention_projections_mmvq_push_constants, mmvq_mask) == 16, "attention MMVQ mask ABI");
 
 struct vk_op_multi_add_push_constants {
     // shape for dst
@@ -2868,6 +2885,8 @@ struct ggml_backend_vk_context {
         bool valid = false;
         bool                                wire_requested = false;
         bool                                latebind_capture_requested = false;
+        bool                                tp5_program_requested = false;
+        std::shared_ptr<vk_tp5_graph_program> tp5_program;
         vk_buffer                           wire_output;
         bool                                wire_relay_direct = false;
         bool                                wire_relay_f32    = false;
@@ -2911,7 +2930,11 @@ struct ggml_backend_vk_context {
 
     ggml_tensor *                                           wire_target   = nullptr;
     const ggml_tensor *                                     wire_producer = nullptr;
+    bool                                                    wire_local_elision_safe = false;
     const ggml_cgraph *                                     latebind_capture_graph = nullptr;
+    const ggml_cgraph *                                     tp5_definition_graph = nullptr;
+    std::shared_ptr<vk_tp5_graph_program>                    tp5_recording_program;
+    std::unordered_map<void *, std::shared_ptr<const vk_tp5_graph_program>> tp5_programs;
     bool                                                    wire_consumer_compute = false;
     size_t                                                  wire_relay_stage = SIZE_MAX;
     bool                                                    wire_relay_f32 = false;
@@ -2932,6 +2955,17 @@ struct ggml_backend_vk_context {
     // recordings' owners are pinned in recording_quant_owners so the old
     // buffer outlives them; the cache entries themselves are freed below.
     vk_buffer                                               hc_quant_scratch;
+    // Fused QSA/GDN contractions use the built-in Q8_1 quantizer but not its
+    // generic prealloc_y lease: that lease may be overwritten by a standalone
+    // matvec between regions, and growing it with an active subctx submits it.
+    // Retain older allocations for ordinary asynchronous recordings as well
+    // as pinning the precise allocation in replay/program buffer owners.
+    vk_buffer                                               region_q8_scratch;
+    std::vector<vk_buffer>                                  region_q8_retired;
+    uint32_t                                                region_q8_reported_masks[2] = {0, 0};
+    uint64_t                                                region_q8_quantize_records = 0;
+    uint64_t                                                region_q8_projection_records = 0;
+    uint32_t                                                region_q8_used_masks[2] = {0, 0};
     // Every companion buffer used by any live recording (a recording can span
     // multiple HC sites; growth replaces the buffer mid-recording only between
     // recordings, but multiple distinct buffers may still be live across
@@ -3214,6 +3248,8 @@ static bool ggml_vk_cache_fingerprint_match(ggml_backend_vk_context *           
     const bool latebind_capture_requested = ctx->latebind_capture_graph == cgraph;
     if (entry.latebind_capture_requested != latebind_capture_requested)
         return false;
+    if (entry.tp5_program_requested != (ctx->tp5_definition_graph == cgraph))
+        return false;
     const bool wire_requested = cgraph->n_nodes > 0 && ctx->wire_target == cgraph->nodes[cgraph->n_nodes - 1];
     if (entry.wire_requested != wire_requested)
         return false;
@@ -3343,6 +3379,10 @@ static void ggml_vk_cache_entry_free_resources(ggml_backend_vk_context * ctx, gg
     if (entry.hc_sum_prefix && !entry.cmd_bufs.empty()) {
         ctx->hc_consumers.erase((void *) (VkCommandBuffer) entry.cmd_bufs.front());
     }
+    if (!entry.cmd_bufs.empty())
+        ctx->tp5_programs.erase((void *) (VkCommandBuffer) entry.cmd_bufs.front());
+    entry.tp5_program.reset();
+    entry.tp5_program_requested = false;
     entry.hc_sum_prefix = false;
     entry.descriptor_pools.clear();
     entry.descriptor_sets.clear();
@@ -3378,6 +3418,9 @@ static void ggml_vk_cache_invalidate_all(ggml_backend_vk_context * ctx) {
     ctx->cgraph_cmd_cache.clear();
     ctx->wire_outputs.clear();
     ctx->hc_consumers.clear();
+    ctx->tp5_programs.clear();
+    if (ctx->tp5_recording_program)
+        ctx->tp5_recording_program->commands.reject("source graph invalidated during definition");
     if (ctx->replay_cmd_pool_init) {
         ctx->device->device.resetCommandPool(ctx->replay_cmd_pool.pool);
         ctx->replay_cmd_pool.cmd_buffers.clear();
@@ -4552,7 +4595,7 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
     }
     subctx->s->buffer->has_pending_mem_work = false;
 
-    subctx->s->buffer->buf.pipelineBarrier(
+    vk_tp5_hpp_commands(subctx->s->buffer->buf).pipelineBarrier(
         subctx->p->q->stage_flags, subctx->p->q->stage_flags,
         {
     },
@@ -4569,7 +4612,7 @@ static void ggml_vk_reset_event(vk_context& ctx, vk::Event& event) {
     VK_LOG_DEBUG("ggml_vk_set_event()");
 
     ctx->s->buffer->has_pending_mem_work = true;
-    ctx->s->buffer->buf.resetEvent(
+    vk_tp5_hpp_commands(ctx->s->buffer->buf).resetEvent(
         event,
         ctx->p->q->stage_flags
     );
@@ -4579,7 +4622,7 @@ static void ggml_vk_set_event(vk_context& ctx, vk::Event& event) {
     VK_LOG_DEBUG("ggml_vk_set_event()");
 
     ctx->s->buffer->has_pending_mem_work = true;
-    ctx->s->buffer->buf.setEvent(
+    vk_tp5_hpp_commands(ctx->s->buffer->buf).setEvent(
         event,
         ctx->p->q->stage_flags
     );
@@ -4592,7 +4635,7 @@ static void ggml_vk_wait_events(vk_context& ctx, std::vector<vk::Event>&& events
     }
 
     ctx->s->buffer->has_pending_mem_work = true;
-    ctx->s->buffer->buf.waitEvents(
+    vk_tp5_hpp_commands(ctx->s->buffer->buf).waitEvents(
         events,
         ctx->p->q->stage_flags,
         ctx->p->q->stage_flags,
@@ -6313,12 +6356,28 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                     1, true, true, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_output_q5k_relay, "output_q5k_relay",
                                     qwen4_output_q5k_relay_len, qwen4_output_q5k_relay_data, "main", 8,
-                                    sizeof(vk_mat_vec_push_constants), { rm_kq, 1, 1 },
-                                    { subgroup_size16, rm_kq, 1 }, 1, true, true, force_subgroup_size16);
+                                    sizeof(vk_mat_vec_push_constants), { 4, 1, 1 },
+                                    { subgroup_size16, 4, 1 }, 1, true, true, force_subgroup_size16);
             ggml_vk_create_pipeline(device, device->pipeline_output_q5k_relay_f32, "output_q5k_relay_f32",
                                     qwen4_output_q5k_relay_f32_len, qwen4_output_q5k_relay_f32_data, "main", 8,
-                                    sizeof(vk_mat_vec_push_constants), { rm_kq, 1, 1 },
-                                    { subgroup_size16, rm_kq, 1 }, 1, true, true, force_subgroup_size16);
+                                    sizeof(vk_mat_vec_push_constants), { 4, 1, 1 },
+                                    { subgroup_size16, 4, 1 }, 1, true, true, force_subgroup_size16);
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+            if (device->integer_dot_product) {
+                ggml_vk_create_pipeline(device, device->pipeline_output_q5k_mmvq_wire, "output_q5k_mmvq_wire",
+                                        qwen4_output_q5k_mmvq_wire_len, qwen4_output_q5k_mmvq_wire_data, "main", 6,
+                                        sizeof(vk_mat_vec_push_constants), { rm_kq, 1, 1 },
+                                        { subgroup_size16, rm_kq, 1 }, 1, true, true, force_subgroup_size16);
+                for (uint32_t f32 = 0; f32 < 2; ++f32) {
+                    ggml_vk_create_pipeline(device, device->pipeline_output_q5k_mmvq_relay[f32],
+                                            f32 ? "output_q5k_mmvq_relay_f32" : "output_q5k_mmvq_relay",
+                                            f32 ? qwen4_output_q5k_mmvq_relay_f32_len : qwen4_output_q5k_mmvq_relay_len,
+                                            f32 ? qwen4_output_q5k_mmvq_relay_f32_data : qwen4_output_q5k_mmvq_relay_data,
+                                            "main", 8, sizeof(vk_mat_vec_push_constants), { 4, 1, 1 },
+                                            { subgroup_size16, 4, 1 }, 1, true, true, force_subgroup_size16);
+                }
+            }
+#endif
         }
         if (device->driver_id == vk::DriverId::eMesaRadv && subgroup_size16 == subgroup_size &&
             force_subgroup_size16 == subgroup_size16 && force_subgroup_size == subgroup_size && rm_kq == 2) {
@@ -6330,6 +6389,20 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                                         data[variant], "main", 9, sizeof(vk_attention_projections_push_constants),
                                         { 1, 1, 1 }, { subgroup_size16, rm_kq, 2 }, 1, true, true,
                                         force_subgroup_size16);
+#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
+                if (device->integer_dot_product) {
+                    const uint64_t mmvq_length = variant == 0 ? qwen4_gdn_projections_mmvq_len :
+                                                               qwen4_qsa_projections_mmvq_len;
+                    const unsigned char * mmvq_data = variant == 0 ? qwen4_gdn_projections_mmvq_data :
+                                                                     qwen4_qsa_projections_mmvq_data;
+                    ggml_vk_create_pipeline(device, device->pipeline_attention_projections_mmvq[variant],
+                                            variant == 0 ? "gdn_projections_mmvq" : "qsa_projections_mmvq",
+                                            mmvq_length, mmvq_data, "main", 10,
+                                            sizeof(vk_attention_projections_mmvq_push_constants),
+                                            { 1, 1, 1 }, { subgroup_size16, rm_kq, 2 }, 1, true, true,
+                                            force_subgroup_size16);
+                }
+#endif
             }
         }
         for (uint32_t combine = 0; combine < 2; ++combine) {
@@ -8549,7 +8622,17 @@ static vk_device ggml_vk_get_device(size_t idx) {
         const char * isolate_bo_env = getenv("GGML_TP5_ISOLATE_BO");
         const char * tp5_sync_env = getenv("GGML_TP5_SYNC");
         const bool is_star_mode = tp5_sync_env && (strcmp(tp5_sync_env, "star") == 0 || strcmp(tp5_sync_env, "l3_star") == 0);
-        if (!is_star_mode && isolate_bo_env && atoi(isolate_bo_env) != 0) {
+        const bool is_relay_mode = tp5_sync_env && strcmp(tp5_sync_env, "relay") == 0;
+        // RELAY's transport is descriptor-based and no longer needs BDA on
+        // imported host buffers.  That does NOT mean the entire Vulkan device
+        // should be created without BDA/descriptor-indexing: those are backend
+        // capabilities used by unrelated built-in kernels (and by derived
+        // coopmat2 paths).  TP5 isolation must stay local to TP5 resources and
+        // must never disable orthogonal device-wide optimizations.
+        //
+        // Keep the historical feature mask for the non-RELAY isolation modes
+        // that were explicitly designed around RADV's nobolist experiment.
+        if (!is_star_mode && !is_relay_mode && isolate_bo_env && atoi(isolate_bo_env) != 0) {
             if (device->architecture != AMD_RDNA2 || device->driver_id != vk::DriverId::eMesaRadv) {
                 GGML_ABORT("GGML_TP5_ISOLATE_BO requires RADV on RDNA2\n");
             }
@@ -9964,14 +10047,14 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     }
     ggml_vk_write_descriptor_set(ctx, descriptor_set, descriptor_buffer_infos);
 
-    subctx->s->buffer->buf.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, push_constant_size(push_constants), push_constant_data(push_constants));
-    subctx->s->buffer->buf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
-    subctx->s->buffer->buf.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+    vk_tp5_hpp_commands(subctx->s->buffer->buf).pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, push_constant_size(push_constants), push_constant_data(push_constants));
+    vk_tp5_hpp_commands(subctx->s->buffer->buf).bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
+    vk_tp5_hpp_commands(subctx->s->buffer->buf).bindDescriptorSets(vk::PipelineBindPoint::eCompute,
                                 pipeline->layout,
                                 0,
                                 { descriptor_set },
                                 {});
-    subctx->s->buffer->buf.dispatch(wg0, wg1, wg2);
+    vk_tp5_hpp_commands(subctx->s->buffer->buf).dispatch(wg0, wg1, wg2);
     subctx->s->buffer->has_pending_mem_work = true;
     ctx->recorded_dispatches++;
 }
@@ -10017,14 +10100,14 @@ static void ggml_vk_dispatch_pipeline_indirect(
                  .setBuffer(indirect.buffer->buffer)
                  .setOffset(indirect.offset)
                  .setSize(3 * sizeof(uint32_t));
-    subctx->s->buffer->buf.pipelineBarrier(
+    vk_tp5_hpp_commands(subctx->s->buffer->buf).pipelineBarrier(
         vk::PipelineStageFlagBits::eDrawIndirect,
         vk::PipelineStageFlagBits::eTransfer,
         {}, {}, { before_update }, {});
 
     for (uint32_t axis = 0; axis < 3; ++axis) {
         if (axis != dynamic_axis) {
-            subctx->s->buffer->buf.updateBuffer(
+            vk_tp5_hpp_commands(subctx->s->buffer->buf).updateBuffer(
                 indirect.buffer->buffer,
                 indirect.offset + axis * sizeof(uint32_t),
                 sizeof(uint32_t),
@@ -10041,18 +10124,18 @@ static void ggml_vk_dispatch_pipeline_indirect(
                    .setBuffer(indirect.buffer->buffer)
                    .setOffset(indirect.offset)
                    .setSize(3 * sizeof(uint32_t));
-    subctx->s->buffer->buf.pipelineBarrier(
+    vk_tp5_hpp_commands(subctx->s->buffer->buf).pipelineBarrier(
         vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
         vk::PipelineStageFlagBits::eDrawIndirect,
         {}, {}, { before_dispatch }, {});
 
-    subctx->s->buffer->buf.pushConstants(
+    vk_tp5_hpp_commands(subctx->s->buffer->buf).pushConstants(
         pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0,
         push_constant_size(push_constants), push_constant_data(push_constants));
-    subctx->s->buffer->buf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
-    subctx->s->buffer->buf.bindDescriptorSets(
+    vk_tp5_hpp_commands(subctx->s->buffer->buf).bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
+    vk_tp5_hpp_commands(subctx->s->buffer->buf).bindDescriptorSets(
         vk::PipelineBindPoint::eCompute, pipeline->layout, 0, { descriptor_set }, {});
-    subctx->s->buffer->buf.dispatchIndirect(indirect.buffer->buffer, indirect.offset);
+    vk_tp5_hpp_commands(subctx->s->buffer->buf).dispatchIndirect(indirect.buffer->buffer, indirect.offset);
     subctx->s->buffer->has_pending_mem_work = true;
     ctx->recorded_dispatches++;
 }
@@ -10076,6 +10159,8 @@ static void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx) {
     const bool is_replay_recording = (subctx->vk_ctx != nullptr && subctx->vk_ctx->replay_recording);
     subctx->seqs.push_back({ ggml_vk_begin_submission(device, *subctx->p, !is_replay_recording) });
     subctx->s = subctx->seqs[subctx->seqs.size() - 1].data();
+    if (is_replay_recording && subctx->p == &subctx->vk_ctx->replay_cmd_pool)
+        vk_tp5_register_source((VkCommandBuffer) subctx->s->buffer->buf);
 }
 
 static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
@@ -10252,7 +10337,7 @@ static void ggml_vk_buffer_write_nc_async(ggml_backend_vk_context * ctx, vk_cont
         }
 
         ggml_vk_sync_buffers(ctx, subctx);
-        subctx->s->buffer->buf.copyBuffer(buf->buffer, dst->buffer, slices);
+        vk_tp5_hpp_commands(subctx->s->buffer->buf).copyBuffer(buf->buffer, dst->buffer, slices);
         subctx->s->buffer->has_pending_mem_work = true;
         return;
     }
@@ -10268,7 +10353,7 @@ static void ggml_vk_buffer_write_nc_async(ggml_backend_vk_context * ctx, vk_cont
     VkBufferCopy buf_copy{ 0, offset, copy_size };
 
     ggml_vk_sync_buffers(ctx, subctx);
-    vkCmdCopyBuffer(subctx->s->buffer->buf, (VkBuffer)staging->buffer, (VkBuffer)dst->buffer, 1, &buf_copy);
+    tp5_cmd_copy(subctx->s->buffer->buf, (VkBuffer)staging->buffer, (VkBuffer)dst->buffer, 1, &buf_copy);
     subctx->s->buffer->has_pending_mem_work = true;
 
     for (uint64_t i3 = 0; i3 < ne3; i3++) {
@@ -10318,7 +10403,7 @@ static bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, siz
         }
 
         ggml_vk_sync_buffers(nullptr, subctx);
-        subctx->s->buffer->buf.copyBuffer(buf->buffer, dst->buffer, slices);
+        vk_tp5_hpp_commands(subctx->s->buffer->buf).copyBuffer(buf->buffer, dst->buffer, slices);
         subctx->s->buffer->has_pending_mem_work = true;
         return true;
     }
@@ -10350,7 +10435,7 @@ static bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, siz
     }
 
     ggml_vk_sync_buffers(nullptr, subctx);
-    subctx->s->buffer->buf.copyBuffer((VkBuffer)staging_buffer->buffer, (VkBuffer)dst->buffer, slices);
+    vk_tp5_hpp_commands(subctx->s->buffer->buf).copyBuffer((VkBuffer)staging_buffer->buffer, (VkBuffer)dst->buffer, slices);
     subctx->s->buffer->has_pending_mem_work = true;
 
     if (width == spitch) {
@@ -10441,9 +10526,9 @@ static bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size
     if (buf != nullptr) {
         // Memory is pinned, use as staging buffer
         ggml_vk_sync_buffers(nullptr, subctx);
-        subctx->s->buffer->buf.copyBuffer(src->buffer, buf->buffer, slices);
+        vk_tp5_hpp_commands(subctx->s->buffer->buf).copyBuffer(src->buffer, buf->buffer, slices);
         subctx->s->buffer->has_pending_mem_work = true;
-        subctx->s->buffer->buf.pipelineBarrier(
+        vk_tp5_hpp_commands(subctx->s->buffer->buf).pipelineBarrier(
             vk::PipelineStageFlagBits::eTransfer,
             vk::PipelineStageFlagBits::eHost,
             {},
@@ -10481,9 +10566,9 @@ static bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size
     }
 
     ggml_vk_sync_buffers(nullptr, subctx);
-    subctx->s->buffer->buf.copyBuffer(src->buffer, staging_buffer->buffer, staging_slices);
+    vk_tp5_hpp_commands(subctx->s->buffer->buf).copyBuffer(src->buffer, staging_buffer->buffer, staging_slices);
     subctx->s->buffer->has_pending_mem_work = true;
-    subctx->s->buffer->buf.pipelineBarrier(
+    vk_tp5_hpp_commands(subctx->s->buffer->buf).pipelineBarrier(
         vk::PipelineStageFlagBits::eTransfer,
         vk::PipelineStageFlagBits::eHost,
         {},
@@ -10517,7 +10602,7 @@ static void ggml_vk_buffer_read_2d(vk_buffer& src, size_t offset, void * dst, si
         std::lock_guard<std::recursive_mutex> guard(src->device->mutex);
         vk_context subctx = ggml_vk_create_temporary_context(src->device->compute_queue->cmd_pool);
         ggml_vk_ctx_begin(src->device, subctx);
-        subctx->s->buffer->buf.pipelineBarrier(
+        vk_tp5_hpp_commands(subctx->s->buffer->buf).pipelineBarrier(
             vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
             vk::PipelineStageFlagBits::eHost,
             {},
@@ -10570,7 +10655,7 @@ static void ggml_vk_buffer_copy_async(vk_context& ctx, vk_buffer& dst, size_t ds
 
     VkBufferCopy bc{ src_offset, dst_offset, size };
 
-    vkCmdCopyBuffer(ctx->s->buffer->buf, (VkBuffer)src->buffer, (VkBuffer)dst->buffer, 1, &bc);
+    tp5_cmd_copy(ctx->s->buffer->buf, (VkBuffer)src->buffer, (VkBuffer)dst->buffer, 1, &bc);
     ctx->s->buffer->has_pending_mem_work = true;
 }
 
@@ -10609,7 +10694,7 @@ static void ggml_vk_buffer_memset_async(vk_context& ctx, vk_buffer& dst, size_t 
     }
 
     // Fall back to GPU fillBuffer for non-UMA or non-host-visible buffers
-    ctx->s->buffer->buf.fillBuffer(dst->buffer, offset, size, c);
+    vk_tp5_hpp_commands(ctx->s->buffer->buf).fillBuffer(dst->buffer, offset, size, c);
     ctx->s->buffer->has_pending_mem_work = true;
 }
 
@@ -10625,7 +10710,7 @@ static void ggml_vk_buffer_memset(vk_buffer& dst, size_t offset, uint32_t c, siz
     std::lock_guard<std::recursive_mutex> guard(dst->device->mutex);
     vk_context subctx = ggml_vk_create_temporary_context(dst->device->transfer_queue->cmd_pool);
     ggml_vk_ctx_begin(dst->device, subctx);
-    subctx->s->buffer->buf.fillBuffer(dst->buffer, offset, size, c);
+    vk_tp5_hpp_commands(subctx->s->buffer->buf).fillBuffer(dst->buffer, offset, size, c);
     subctx->s->buffer->has_pending_mem_work = true;
     ggml_vk_ctx_end(subctx);
 
@@ -11350,8 +11435,26 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
     }
 }
 
-// Device tuning
+// Contraction policy, also used by MMVQ-capable fused regions. It selects an
+// arithmetic implementation, never whether a surrounding fusion is legal.
 static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_t n, uint32_t k, ggml_type src0_type) {
+    if (m == 0 || n == 0 || k == 0 || !device->integer_dot_product)
+        return false;
+    // Match the integer-dot variants actually emitted by vulkan-shaders-gen.
+    // In particular IQ2_S/IQ3_XXS/IQ3_S have native float matvecs, not MMVQ
+    // implementations. A generic "k>=2048" preference for these types used to
+    // veto whole MoE regions even though the standalone path then fell back.
+    switch (src0_type) {
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_0: case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0: case GGML_TYPE_Q5_1: case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ1_S: case GGML_TYPE_IQ1_M: case GGML_TYPE_MXFP4:
+            break;
+        default:
+            return false;
+    }
     if (device->mmvq_mode == 1) {
         return true;
     } else if (device->mmvq_mode == -1) {
@@ -11430,6 +11533,54 @@ static bool ggml_vk_should_use_mmvq(const vk_device& device, uint32_t m, uint32_
     }
 
     GGML_UNUSED(m);
+}
+
+// Transport is an epilogue of the chosen contraction, not a reason to change
+// its arithmetic. Both the built-in standalone GEMV and QSA/GDN fused regions
+// use this lowering. A missing transport variant leaves the normal tensor for
+// P1; it never disables MMVQ or dismantles a region.
+static bool ggml_vk_tp5_q5k_output(ggml_backend_vk_context * ctx, vk_context & subctx,
+                                   const ggml_tensor * output, bool quantized_input,
+                                   const vk_subbuffer & weights, const vk_subbuffer & input,
+                                   const vk_subbuffer & dst, const vk_subbuffer & fuse0,
+                                   const vk_subbuffer & fuse1, vk_mat_vec_push_constants pc) {
+    if (!output || output != ctx->wire_producer || output->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(output) || ggml_nelements(output) != pc.stride_d ||
+        pc.ncols == 0 || pc.ncols % 256 != 0 || pc.base_work_group_y != 0 ||
+        pc.ne02 != 1 || pc.ne12 != 1 || pc.broadcast2 != 1 || pc.broadcast3 != 1)
+        return false;
+    auto & relay = quantized_input ? ctx->device->pipeline_output_q5k_mmvq_relay[ctx->wire_relay_f32 ? 1 : 0] :
+        (ctx->wire_relay_f32 ? ctx->device->pipeline_output_q5k_relay_f32 : ctx->device->pipeline_output_q5k_relay);
+    auto & packed = quantized_input ? ctx->device->pipeline_output_q5k_mmvq_wire :
+                                     ctx->device->pipeline_output_q5k_wire;
+    const VkDeviceSize bytes = VkDeviceSize(pc.stride_d) * (ctx->wire_relay_f32 ? 4u : 2u);
+    const bool direct = ctx->wire_relay_stage != SIZE_MAX && relay && ggml_vk_relay_payloads_ready(ctx) &&
+                        bytes <= ctx->relay_payload_bytes[0] && bytes <= ctx->relay_payload_bytes[1];
+    if (!direct && (ctx->wire_relay_f32 || !packed || !ctx->wire_scratch || ctx->wire_scratch->size < bytes))
+        return false;
+    auto & pipeline = direct ? relay : packed;
+    if (CEIL_DIV(pc.stride_d, pipeline->wg_denoms[0]) > ctx->device->properties.limits.maxComputeWorkGroupCount[0])
+        return false;
+    pc.fusion_flags &= ~MAT_VEC_FUSION_FLAGS_TP5_ELIDE_LOCAL;
+    if (direct && ctx->wire_local_elision_safe)
+        pc.fusion_flags |= MAT_VEC_FUSION_FLAGS_TP5_ELIDE_LOCAL;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    if (direct) {
+        const vk_subbuffer route{ctx->relay_route_buffer, ctx->wire_relay_stage * VK_TP5_RELAY_ROUTE_STRIDE,
+                                  sizeof(vk_tp5_relay_route_entry)};
+        const vk::DescriptorBufferInfo payload0{ctx->relay_payload_banks[0], 0, bytes};
+        const vk::DescriptorBufferInfo payload1{ctx->relay_payload_banks[1], 0, bytes};
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                  {weights, input, dst, fuse0, fuse1, route, payload0, payload1},
+                                  pc, {pc.stride_d, 1, 1});
+        ctx->wire_relay_recorded = true;
+    } else {
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                                  {weights, input, dst, fuse0, fuse1, vk_subbuffer{ctx->wire_scratch, 0, bytes}},
+                                  pc, {pc.stride_d, 1, 1});
+        ctx->wire_recorded = ctx->wire_scratch;
+    }
+    return true;
 }
 
 static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, bool swap_inputs = false) {
@@ -11672,7 +11823,13 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
             fusion_flags, base_work_group_y,
             (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
         };
-        ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
+        const bool tp5_output = !swap_inputs && src0->type == GGML_TYPE_Q5_K &&
+            src1->type == GGML_TYPE_F32 && !x_non_contig && !y_non_contig &&
+            mat_vec_cols == 1 && dispatch_batches == 1 &&
+            ggml_nbytes(src0) <= ctx->device->properties.limits.maxStorageBufferRange &&
+            ggml_vk_tp5_q5k_output(ctx, subctx, cgraph->nodes[node_idx + ctx->num_additional_fused_ops],
+                                   quantize_y, d_X, d_Y, d_D, d_F0, d_F1, pc);
+        if (!tp5_output) ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
                                   {
                                     d_X,
                                     d_Y,
@@ -13584,7 +13741,15 @@ static void ggml_vk_flash_attn_rerot(ggml_backend_vk_context * ctx, vk_context &
     GGML_ASSERT(ne0 == HSV);
     GGML_ASSERT(ne1 == n_head_q && ne2 == n_queries);
     GGML_ASSERT(neq3 == 1 && nek3 == 1 && nev3 == 1 && ne3 == 1);
-    GGML_ASSERT(n_head_q % n_head_kv == 0 && n_head_q % n_head_v == 0);
+    const bool tp5_mapped = dst->op_params[8] == GGML_TP5_HEADMAP_MAGIC;
+    uint32_t tp5_packed = 0;
+    uint32_t tp5_count  = 0;
+    if (tp5_mapped) {
+        GGML_ASSERT(ggml_vk_fa_headmap_decode(dst, &tp5_packed, &tp5_count));
+        GGML_ASSERT(n_head_kv == n_head_v);
+    } else {
+        GGML_ASSERT(n_head_q % n_head_kv == 0 && n_head_q % n_head_v == 0);
+    }
     // Dim 3 is a size-1 batch dim the indexed kernel never strides.
     GGML_UNUSED(nbq3);
     GGML_UNUSED(nbk3);
@@ -13604,11 +13769,14 @@ static void ggml_vk_flash_attn_rerot(ggml_backend_vk_context * ctx, vk_context &
         scale /= logit_softcap;
     }
 
-    const uint32_t k_ratio = n_head_q / n_head_kv;
-    const uint32_t v_ratio = n_head_q / n_head_v;
-    uint32_t head_group = std::min(8u, std::min(k_ratio, v_ratio));
-    while (k_ratio % head_group != 0 || v_ratio % head_group != 0) {
-        --head_group;
+    uint32_t head_group = 1;
+    if (!tp5_mapped) {
+        const uint32_t k_ratio = n_head_q / n_head_kv;
+        const uint32_t v_ratio = n_head_q / n_head_v;
+        head_group = std::min(8u, std::min(k_ratio, v_ratio));
+        while (k_ratio % head_group != 0 || v_ratio % head_group != 0) {
+            --head_group;
+        }
     }
     vk_fa_tuning_params tuning_params;
     GGML_ASSERT(ggml_vk_flash_attn_rerot_tune(
@@ -13670,7 +13838,14 @@ static void ggml_vk_flash_attn_rerot(ggml_backend_vk_context * ctx, vk_context &
     }
 
     const uint32_t n_head_log2 = 1u << (uint32_t) floorf(log2f((float) n_head_q));
-    const uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
+    const uint32_t mask_n_head_log2 =
+        ((sinks != nullptr) << 24) | (tp5_mapped ? (1u << 25) : 0u) | n_head_log2;
+    float tp5_count_f = 0.0f;
+    float tp5_packed_f = 0.0f;
+    if (tp5_mapped) {
+        tp5_count_f = (float) tp5_count;
+        memcpy(&tp5_packed_f, &tp5_packed, sizeof(tp5_packed_f));
+    }
 
     vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
     vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
@@ -13689,7 +13864,7 @@ static void ggml_vk_flash_attn_rerot(ggml_backend_vk_context * ctx, vk_context &
                                               k_stride, (uint32_t)nbk2, 0,
                                               v_stride, (uint32_t)nbv2, 0,
                                               scale, 0.0f, logit_softcap,
-                                              mask_n_head_log2, 0.0f, 0.0f,
+                                              mask_n_head_log2, tp5_count_f, tp5_packed_f,
                                               1, 1, split_k };
 
     // Bindings 0..8: Q, K, V, dummy (mask), sinks, dst-or-partials, dummy
@@ -15334,11 +15509,63 @@ static void ggml_vk_segment_barrier(ggml_backend_vk_context * ctx, vk_context & 
         (wire_reuse ? (ctx->wire_consumer_compute ? vk::AccessFlags(vk::AccessFlagBits::eShaderRead)
                                                   : vk::AccessFlags(vk::AccessFlagBits::eTransferRead))
                     : vk::AccessFlags{});
-    subctx->s->buffer->buf.pipelineBarrier(
+    vk_tp5_hpp_commands(subctx->s->buffer->buf).pipelineBarrier(
         stages, vk::PipelineStageFlagBits::eComputeShader,
         {
     },
         { { accesses, vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite } }, {}, {});
+}
+
+// Reuse the built-in quantizer and Q8_1_x4 layout. One invocation prepares all
+// sibling contractions in a region. Do not cache validity by tensor pointer:
+// in-place updates/aliased storage and replay can reuse that pointer for a new
+// activation. Every recorded region includes its own GPU quantization.
+static bool ggml_vk_region_q8_input(ggml_backend_vk_context * ctx, vk_context & subctx,
+                                    const ggml_tensor * input, vk_subbuffer & result) {
+    if (!input || !ctx->device->integer_dot_product || input->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(input))
+        return false;
+    const uint64_t ne = ggml_nelements(input);
+    if (ne == 0 || ne != uint64_t(input->ne[0]) || ne > UINT32_MAX || ne % 128 != 0 ||
+        get_misalign_bytes(ctx, input) != 0)
+        return false;
+    auto quantizer = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+    if (!quantizer)
+        return false;
+    const uint64_t bytes = ne / ggml_blck_size(GGML_TYPE_Q8_1) * ggml_type_size(GGML_TYPE_Q8_1);
+    const uint64_t max_bytes = ctx->device->properties.limits.maxStorageBufferRange;
+    if (bytes > max_bytes)
+        return false;
+    if (!ctx->region_q8_scratch || ctx->region_q8_scratch->size < bytes) {
+        uint64_t capacity = std::min<uint64_t>(4096, max_bytes);
+        while (capacity < bytes)
+            capacity = capacity > max_bytes / 2 ? max_bytes : capacity * 2;
+        auto next = ggml_vk_create_buffer_device(ctx->device, capacity);
+        if (!next)
+            return false;
+        if (ctx->region_q8_scratch)
+            ctx->region_q8_retired.push_back(ctx->region_q8_scratch);
+        ctx->region_q8_scratch = std::move(next);
+    }
+    if (ctx->replay_recording &&
+        std::find(ctx->recording_quant_owners.begin(), ctx->recording_quant_owners.end(),
+                  ctx->region_q8_scratch) == ctx->recording_quant_owners.end()) {
+        ctx->recording_quant_owners.push_back(ctx->region_q8_scratch);
+    }
+    result = {ctx->region_q8_scratch, 0, bytes};
+    // Order both the input producer and previous scratch readers. This also
+    // works at the beginning of a replay CB: unlike a conditional generic
+    // barrier it cannot disappear because has_pending_mem_work starts false.
+    vk_tp5_hpp_commands(subctx->s->buffer->buf).pipelineBarrier(
+        vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer,
+        vk::PipelineStageFlagBits::eComputeShader, {},
+        {{vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite,
+          vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite}}, {}, {});
+    ggml_pipeline_request_descriptor_sets(ctx, quantizer, 1);
+    // The native helper already records the RAW dependency after quantization.
+    ggml_vk_quantize_q8_1(ctx, subctx, ggml_vk_tensor_subbuffer(ctx, input), result, (uint32_t) ne);
+    ++ctx->region_q8_quantize_records;
+    return true;
 }
 
 static void ggml_vk_segment_project(ggml_backend_vk_context * ctx,
@@ -15352,53 +15579,35 @@ static void ggml_vk_segment_project(ggml_backend_vk_context * ctx,
     const ggml_tensor *             weights = matmul->src[0];
     const uint32_t                  k       = static_cast<uint32_t>(weights->ne[0]);
     const uint32_t                  m       = static_cast<uint32_t>(output->ne[0]);
-    const vk_mat_vec_push_constants pc{ k, k, k, m, static_cast<uint32_t>(ggml_nelements(weights)), k, m, 0, 0,
+    const uint32_t output_flags = output == ctx->wire_producer && ctx->wire_local_elision_safe ?
+                                      MAT_VEC_FUSION_FLAGS_TP5_ELIDE_LOCAL : 0u;
+    const vk_mat_vec_push_constants pc{ k, k, k, m, static_cast<uint32_t>(ggml_nelements(weights)), k, m,
+                                        output_flags, 0,
                                         1, 1, 1, 1 };
     const vk_subbuffer              out = ggml_vk_tensor_subbuffer(ctx, output);
-    if (output == ctx->wire_producer && weights->type == GGML_TYPE_Q5_K && !extra &&
-        (ctx->device->pipeline_output_q5k_wire || ctx->device->pipeline_output_q5k_relay ||
-         ctx->device->pipeline_output_q5k_relay_f32)) {
-        vk_pipeline & relay_pipeline = ctx->wire_relay_f32 ? ctx->device->pipeline_output_q5k_relay_f32 :
-                                                             ctx->device->pipeline_output_q5k_relay;
-        const VkDeviceSize relay_payload_bytes =
-            VkDeviceSize(m) * (ctx->wire_relay_f32 ? sizeof(float) : sizeof(ggml_fp16_t));
-        const bool relay_output = ctx->wire_relay_stage != SIZE_MAX && relay_pipeline &&
-                                  ggml_vk_relay_payloads_ready(ctx) &&
-                                  relay_payload_bytes <= ctx->relay_payload_bytes[0] &&
-                                  relay_payload_bytes <= ctx->relay_payload_bytes[1];
-        auto & output_pipeline = relay_output ? relay_pipeline :
-                                                ctx->device->pipeline_output_q5k_wire;
-        ggml_pipeline_request_descriptor_sets(ctx, output_pipeline, 1);
-        if (relay_output) {
-            const vk_subbuffer route{ctx->relay_route_buffer,
-                                     ctx->wire_relay_stage * VK_TP5_RELAY_ROUTE_STRIDE,
-                                     sizeof(vk_tp5_relay_route_entry)};
-            const vk::DescriptorBufferInfo payload0{ctx->relay_payload_banks[0], 0, relay_payload_bytes};
-            const vk::DescriptorBufferInfo payload1{ctx->relay_payload_banks[1], 0, relay_payload_bytes};
-            ggml_vk_dispatch_pipeline(
-                ctx, subctx, output_pipeline,
-                { ggml_vk_tensor_subbuffer(ctx, weights), ggml_vk_tensor_subbuffer(ctx, input), out, out, out,
-                  route, payload0, payload1 }, pc,
-                { m, 1, 1 });
-        } else {
-            ggml_vk_dispatch_pipeline(
-                ctx, subctx, output_pipeline,
-                { ggml_vk_tensor_subbuffer(ctx, weights), ggml_vk_tensor_subbuffer(ctx, input), out, out, out,
-                  vk_subbuffer{ctx->wire_scratch, 0, m * sizeof(ggml_fp16_t)} }, pc,
-                { m, 1, 1 });
+    vk_subbuffer b_sub = b_override ? *b_override : ggml_vk_tensor_subbuffer(ctx, input);
+    vk_pipeline contraction = pipeline;
+    bool integer_contraction = false;
+    // QSA/GDN output projection is part of a larger fused region. MMVQ may
+    // replace its contraction without removing prep/state/cache/epilogue work.
+    // The same choice composes with local-wire and direct-host output sinks.
+    if (weights->type == GGML_TYPE_Q5_K && !extra && !b_override &&
+        ggml_vk_should_use_mmvq(ctx->device, m, 1, k, weights->type)) {
+        auto candidate = ggml_vk_get_dequantize_mul_mat_vec(ctx, weights->type, GGML_TYPE_Q8_1, 1, m, k);
+        if (candidate && ggml_vk_region_q8_input(ctx, subctx, input, b_sub)) {
+            contraction = candidate;
+            integer_contraction = true;
         }
-        if (relay_output) {
-            ctx->wire_relay_recorded = true;
-        } else {
-            ctx->wire_recorded = ctx->wire_scratch;
-        }
+    }
+    if (weights->type == GGML_TYPE_Q5_K && !extra && !b_override &&
+        ggml_vk_tp5_q5k_output(ctx, subctx, output, integer_contraction,
+                               ggml_vk_tensor_subbuffer(ctx, weights), b_sub, out, out, out, pc)) {
         return;
     }
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, contraction, 1);
     // NativeHC zone: b_override substitutes the B (activation) binding — used
     // by the q8dot down consumer, whose B is the Q8_0 companion scratch.
-    const vk_subbuffer b_sub = b_override ? *b_override : ggml_vk_tensor_subbuffer(ctx, input);
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+    ggml_vk_dispatch_pipeline(ctx, subctx, contraction,
                               { ggml_vk_tensor_subbuffer(ctx, weights), b_sub, out,
                                 extra ? ggml_vk_tensor_subbuffer(ctx, extra) : out, out },
                               pc, { m, 1, 1 });
@@ -15422,25 +15631,27 @@ static void ggml_vk_hc_segment(ggml_backend_vk_context * ctx, vk_context & subct
         const char * env = getenv("GGML_TP5_LATEBIND");
         return env && (strcmp(env, "hc-down") == 0 || strcmp(env, "1") == 0 || strcmp(env, "on") == 0);
     }();
-    static const bool latebind_hc_native = [] {
-        const char * dot = getenv("GGML_VK_HC_DOT");
-        const char * wg  = getenv("GGML_VK_HC_DOWN_WG");
-        return !(dot && strcmp(dot, "q8") == 0) && !(wg && wg[0]);
-    }();
     const ggml_tensor * down_node = graph->nodes[base + 3];
     const bool capture_common = first == 0 && fuse_inject && ctx->replay_recording &&
                                 ctx->device->pipeline_hc_sum_f16 && ctx->recorded_dispatches == 0 &&
                                 !ctx->do_add_rms_partials && !ctx->add_rms_partials_initialized &&
                                 subctx->seqs.size() == 1 && subctx->seqs.front().size() == 1;
     const bool capture_late =
-        capture_common && latebind_capture_requested && latebind_hc_down && latebind_hc_native &&
+        capture_common && latebind_capture_requested && latebind_hc_down &&
         down_node && down_node->op == GGML_OP_MUL_MAT &&
         down_node->src[0] && down_node->src[0]->type == GGML_TYPE_Q8_0 &&
         lo->type == GGML_TYPE_F32 && normalized->type == GGML_TYPE_F32 &&
         norm->ne[2] == 1 && normalized->ne[1] == 1 && lo->ne[1] == 1 &&
         norm->ne[0] != 0 && normalized->ne[0] % norm->ne[0] == 0 &&
         normalized->ne[0] / norm->ne[0] == 4 && lo->ne[0] > 0 && lo->ne[0] <= 512;
-    const bool capture_prefix = capture_common && (ctx->wire_target || capture_late);
+    static const bool relay_hc_requested = [] {
+        const char * env = getenv("GGML_TP5_RELAY_FUSED_HC");
+        return env && atoi(env) != 0;
+    }();
+    const bool relay_wire = ctx->wire_consumer_compute || ctx->wire_relay_stage != SIZE_MAX;
+    const bool capture_legacy = ctx->wire_target && !ctx->wire_relay_f32 &&
+                                (!relay_wire || relay_hc_requested);
+    const bool capture_prefix = capture_common && (capture_legacy || capture_late);
     // NativeHC zone: opt-in variant selection. The native pipelines remain the
     // default; a variant is used only when its pipeline was created (opt-in env
     // plus RADV/capability gates in ggml_vk_load_shaders). Only one wg variant
@@ -15540,21 +15751,24 @@ static void ggml_vk_hc_segment(ggml_backend_vk_context * ctx, vk_context & subct
                                                hc_quant_sub.size, hc_quant_sub.buffer };
         }
         ctx->hc_prefix_recorded       = (void *) (VkCommandBuffer) subctx->s->buffer->buf;
-        // Both CBs remain in ordinary execution. Only the collective chain
-        // may replace this exact prefix with a completed fused P2 dispatch.
-        ggml_vk_ctx_begin(ctx->device, subctx);
+        // Legacy F16 fused-SUM still uses a CB recipe. LateBind uses semantic
+        // offsets in its immutable definition; it must NOT split this CB.
+        if (!ctx->tp5_recording_program)
+            ggml_vk_ctx_begin(ctx->device, subctx);
+    }
+    if (ctx->tp5_recording_program && first == 0) {
+        auto & program = *ctx->tp5_recording_program;
+        const auto norm_buffer = ggml_vk_tensor_subbuffer(ctx, normalized);
+        program.hc_norm_end = program.commands.code.size();
+        program.normalized = {(VkBuffer) norm_buffer.buffer->buffer, norm_buffer.offset,
+                              norm_buffer.size, norm_buffer.buffer};
     }
     const bool hc_quant_consumer = down_pipeline == ctx->device->pipeline_hc_down_silu_q8dot;
     ggml_vk_segment_project(ctx, subctx, graph->nodes[base + 3], normalized, lo, down_pipeline,
                             nullptr, hc_quant_consumer ? &hc_quant_sub : nullptr);
     ggml_vk_segment_barrier(ctx, subctx);
-    if (capture_late) {
-        // Exact LateBind-TP replaces both the HC norm/combine prefix and this
-        // W_down+SiLU command buffer. Keep W_up/fold in a third CB so the
-        // collective chain can skip exactly two CBs and feed its late-bound
-        // normalized/lo outputs into the existing W_up implementation.
-        ggml_vk_ctx_begin(ctx->device, subctx);
-    }
+    if (ctx->tp5_recording_program && first == 0)
+        ctx->tp5_recording_program->hc_down_end = ctx->tp5_recording_program->commands.code.size();
     ggml_vk_segment_project(ctx, subctx, graph->nodes[base + 6], lo, mixed, up_pipeline, normalized);
 }
 
@@ -15606,8 +15820,11 @@ static void ggml_vk_moe_output_segment(ggml_backend_vk_context * ctx,
     ggml_vk_segment_barrier(ctx, subctx, ctx->wire_producer == node(28));
     const ggml_tensor *                routed = node(0);
     const uint32_t                     k = routed->src[0]->ne[0], m = routed->ne[0], experts = routed->ne[1];
+    const uint32_t output_flags = ctx->wire_producer == node(28) && ctx->wire_local_elision_safe ?
+                                      MAT_VEC_FUSION_FLAGS_TP5_ELIDE_LOCAL : 0u;
     const vk_mat_vec_id_push_constants pc{
-        k, k, k, m, k * m, k * experts, m * experts, MAT_VEC_FUSION_FLAGS_SCALE0, experts, experts, 1, experts, 0
+        k, k, k, m, k * m, k * experts, m * experts, MAT_VEC_FUSION_FLAGS_SCALE0 | output_flags,
+        experts, experts, 1, experts, 0
     };
     auto & wire_pipeline =
         fuse_shared_down ? ctx->device->pipeline_moe_down_fold_shared_wire : ctx->device->pipeline_moe_down_fold_wire;
@@ -15659,7 +15876,7 @@ static void ggml_vk_moe_output_segment(ggml_backend_vk_context * ctx,
     const vk::DescriptorBufferInfo relay_payload0{ctx->relay_payload_banks[0], 0, relay_payload_bytes};
     const vk::DescriptorBufferInfo relay_payload1{ctx->relay_payload_banks[1], 0, relay_payload_bytes};
     if (use_k128) {
-        const vk_moe_down_k128_push_constants k128_pc{ m };
+        const vk_moe_down_k128_push_constants k128_pc{ m, output_flags };
         ggml_pipeline_request_descriptor_sets(ctx, k128_pipeline, 1);
         if (k128_fuse_shared && any_output) {
             if (relay_output) {
@@ -15797,6 +16014,45 @@ static void ggml_vk_attention_projections(ggml_backend_vk_context * ctx,
                                                       static_cast<uint32_t>(node(1)->ne[0]),
                                                       static_cast<uint32_t>(node(qsa ? 3 : 2)->ne[0]) };
     const uint32_t groups = CEIL_DIV(pc.rows0, 2) + CEIL_DIV(pc.rows1, 2) + CEIL_DIV(pc.rows2, 2);
+    auto & integer_pipeline = ctx->device->pipeline_attention_projections_mmvq[qsa ? 1 : 0];
+    uint32_t mmvq_mask = 0;
+    if (integer_pipeline && ctx->device->integer_dot_product) {
+        if (ggml_vk_should_use_mmvq(ctx->device, pc.rows0, 1, pc.width, GGML_TYPE_Q5_K))
+            mmvq_mask |= 1u;
+        if (!qsa && ggml_vk_should_use_mmvq(ctx->device, pc.rows1, 1, pc.width, GGML_TYPE_Q5_K))
+            mmvq_mask |= 2u;
+        if (ggml_vk_should_use_mmvq(ctx->device, qsa ? pc.rows1 : pc.rows2, 1, pc.width, GGML_TYPE_Q6_K))
+            mmvq_mask |= 4u;
+    }
+    const auto report_policy = [&](uint32_t mask) {
+        static const bool report = [] {
+            const char * env = getenv("GGML_TP5_RELAY_DEBUG");
+            return env && atoi(env) != 0;
+        }();
+        const uint32_t bit = 1u << mask;
+        auto & seen = ctx->region_q8_reported_masks[qsa ? 1 : 0];
+        if (report && (seen & bit) == 0) {
+            fprintf(stderr, "[vulkan-region-policy] backend=%s family=%s fused=1 mmvq_mask=%u "
+                            "shared_q8_1=%u (recording, not timing)\n",
+                    ctx->name.c_str(), qsa ? "qsa-projections" : "gdn-projections", mask, mask ? 1u : 0u);
+            seen |= bit;
+        }
+    };
+    vk_subbuffer quantized;
+    if (mmvq_mask != 0u && ggml_vk_region_q8_input(ctx, subctx, node(0)->src[1], quantized)) {
+        const vk_attention_projections_mmvq_push_constants qpc{pc, mmvq_mask};
+        ggml_pipeline_request_descriptor_sets(ctx, integer_pipeline, 1);
+        ggml_vk_dispatch_pipeline(
+            ctx, subctx, integer_pipeline,
+            { binding(node(0)->src[0]), binding(node(1)->src[0]), binding(node(2)->src[0]), binding(node(3)->src[0]),
+              binding(node(0)->src[1]), binding(node(0)), binding(node(1)), binding(node(2)), binding(node(3)), quantized },
+            qpc, { groups, 1, 1 });
+        ++ctx->region_q8_projection_records;
+        ctx->region_q8_used_masks[qsa ? 1 : 0] |= mmvq_mask;
+        report_policy(mmvq_mask);
+        return;
+    }
+    report_policy(0);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(
         ctx, subctx, pipeline,
@@ -17790,7 +18046,7 @@ static void ggml_vk_topk_moe(ggml_backend_vk_context * ctx, vk_context& subctx, 
                      .setBuffer(src->buffer->buffer)
                      .setOffset(0)
                      .setSize(VK_WHOLE_SIZE);
-                    subctx->s->buffer->buf.pipelineBarrier(
+                    vk_tp5_hpp_commands(subctx->s->buffer->buf).pipelineBarrier(
                         vk::PipelineStageFlagBits::eComputeShader,
                         vk::PipelineStageFlagBits::eTransfer,
                         {}, {}, { b }, {});
@@ -17823,7 +18079,7 @@ static void ggml_vk_topk_moe(ggml_backend_vk_context * ctx, vk_context& subctx, 
                      .setBuffer(diag->buffer)
                      .setOffset(0)
                      .setSize(VK_WHOLE_SIZE);
-                    subctx->s->buffer->buf.pipelineBarrier(
+                    vk_tp5_hpp_commands(subctx->s->buffer->buf).pipelineBarrier(
                         vk::PipelineStageFlagBits::eTransfer,
                         vk::PipelineStageFlagBits::eComputeShader,
                         {}, {}, { b }, {});
@@ -19670,7 +19926,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
             if (vk_perf_logger_enabled && vk_perf_logger_concurrent) {
                 ctx->query_node_idx[ctx->query_idx] = node_idx;
-                compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
+                vk_tp5_hpp_commands(compute_ctx->s->buffer->buf).writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
                 ggml_vk_sync_buffers(ctx, compute_ctx);
             }
         }
@@ -20294,6 +20550,9 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
     ggml_vk_destroy_buffer(ctx->prealloc_sparse_meta);
     ggml_vk_destroy_buffer(ctx->sync_staging);
+
+    ggml_vk_destroy_buffer(ctx->region_q8_scratch);
+    ctx->region_q8_retired.clear();
 
     // RouterPaths zone: owned converted router weight buffers and the
     // owned diagnostic GPU storage (bounded teardown, no stale conversions).
@@ -20981,7 +21240,7 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
             }
         }
 
-        cpy_ctx->s->buffer->buf.copyBuffer(ctx->sync_staging->buffer, buf->buffer, slices);
+        vk_tp5_hpp_commands(cpy_ctx->s->buffer->buf).copyBuffer(ctx->sync_staging->buffer, buf->buffer, slices);
         cpy_ctx->s->buffer->has_pending_mem_work = true;
 
         if (size == stride_data) {
@@ -21026,7 +21285,7 @@ static bool ggml_backend_vk_set_tensor_snapshot_async(ggml_backend_t backend,
     // with the upload, not a host fence per tensor; replay flushes this prefix
     // before submitting cached compute, without baking host data into replay.
     ggml_vk_sync_buffers(nullptr, upload_ctx);
-    upload_ctx->s->buffer->buf.updateBuffer(buf_ctx->dev_buffer->buffer, dst_offset, size, data);
+    vk_tp5_hpp_commands(upload_ctx->s->buffer->buf).updateBuffer(buf_ctx->dev_buffer->buffer, dst_offset, size, data);
     upload_ctx->s->buffer->has_pending_mem_work = true;
     ggml_vk_sync_buffers(nullptr, upload_ctx);
     return true;
@@ -21070,7 +21329,7 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
             }
         }
 
-        compute_ctx->s->buffer->buf.copyBuffer(buf->buffer, ctx->sync_staging->buffer, slices);
+        vk_tp5_hpp_commands(compute_ctx->s->buffer->buf).copyBuffer(buf->buffer, ctx->sync_staging->buffer, slices);
         compute_ctx->s->buffer->has_pending_mem_work = true;
 
         if (size == stride_data) {
@@ -21749,6 +22008,9 @@ static bool ggml_vk_can_fuse_hc_segment(ggml_backend_vk_context * ctx,
                                         const ggml_cgraph *       graph,
                                         int                       first,
                                         bool                      combine) {
+    // Shape/alias safety is independent of arithmetic selection. Regions with
+    // MMVQ variants select those inside the fusion; they do not discard the
+    // fusion. Unsupported quant formats keep the native region implementation.
     static const bool disabled = getenv("GGML_VK_DISABLE_HC_SEGMENT") != nullptr;
     if (disabled || !ctx->device->pipeline_hc_project_fold)
         return false;
@@ -21786,9 +22048,7 @@ static bool ggml_vk_can_fuse_hc_segment(ggml_backend_vk_context * ctx,
                ggml_nbytes(weights) <= ctx->device->properties.limits.maxStorageBufferRange &&
                get_misalign_bytes(ctx, weights) == 0 && f32(input) && input->ne[0] == weights->ne[0] &&
                ggml_nelements(input) == input->ne[0] && f32(tensor) && tensor->ne[0] == weights->ne[1] &&
-               ggml_nelements(tensor) == tensor->ne[0] &&
-               !(ctx->device->integer_dot_product &&
-                 ggml_vk_should_use_mmvq(ctx->device, weights->ne[1], 1, weights->ne[0], weights->type));
+               ggml_nelements(tensor) == tensor->ne[0];
     };
     if (width <= 0 || width > 4096 || width % 8 != 0 || norm->ne[1] != 4 || norm->ne[2] != 1 || norm->ne[3] != 1 ||
         !f32(norm->src[0]) || !f32(norm) || !ggml_are_same_shape(norm, norm->src[0]) || reshape->src[0] != norm ||
@@ -21870,9 +22130,6 @@ static bool ggml_vk_can_fuse_moe_output_segment(ggml_backend_vk_context * ctx, c
         node(1)->src[0] != routed || !ggml_are_same_shape(node(1), routed) || !valid(node(1)->src[1], GGML_TYPE_F32) ||
         node(1)->src[1]->ne[0] != 1 || ggml_nelements(node(1)->src[1]) != 10)
         return false;
-    if (ctx->device->integer_dot_product &&
-        ggml_vk_should_use_mmvq(ctx->device, width, 1, weights->ne[0], weights->type))
-        return false;
     for (int expert = 0; expert < 10; ++expert) {
         const ggml_tensor * view = node(2 + expert);
         if (view->src[0] != node(1) || view->view_src != node(1) || !vector(view, width) ||
@@ -21889,9 +22146,7 @@ static bool ggml_vk_can_fuse_moe_output_segment(ggml_backend_vk_context * ctx, c
     const auto          projection   = [&](const ggml_tensor * t, ggml_type type, const ggml_tensor * input) {
         const ggml_tensor * w = t->src[0];
         return valid(w, type) && w->ne[2] == 1 && w->ne[3] == 1 && w->ne[0] % ggml_blck_size(type) == 0 &&
-               t->src[1] == input && vector(input, w->ne[0]) && vector(t, w->ne[1]) &&
-               !(ggml_is_quantized(type) && ctx->device->integer_dot_product &&
-                 ggml_vk_should_use_mmvq(ctx->device, w->ne[1], 1, w->ne[0], type));
+               t->src[1] == input && vector(input, w->ne[0]) && vector(t, w->ne[1]);
     };
     if (!vector(shared_input, width) || !projection(node(21), GGML_TYPE_Q6_K, shared_input) ||
         !projection(node(22), GGML_TYPE_Q6_K, shared_input) || !ggml_are_same_shape(node(21), node(22)) ||
@@ -21984,11 +22239,6 @@ static bool ggml_vk_can_fuse_moe_projections(ggml_backend_vk_context * ctx, cons
         !ggml_are_same_shape(up, swiglu) || swiglu->src[0] != gate || swiglu->src[1] != up ||
         ggml_get_glu_op(swiglu) != GGML_GLU_OP_SWIGLU || routed->src[1] != swiglu)
         return false;
-    if (ctx->device->integer_dot_product &&
-        (ggml_vk_should_use_mmvq(ctx->device, gate->ne[0], 1, gate_weights->ne[0], gate_weights->type) ||
-         ggml_vk_should_use_mmvq(ctx->device, up->ne[0], 1, up_weights->ne[0], up_weights->type)))
-        return false;
-
     const std::array<const ggml_tensor *, 4> outputs{ swiglu, node(26), node(28), node(31) };
     for (size_t o = 0; o < outputs.size(); ++o) {
         for (size_t previous = 0; previous < o; ++previous) {
@@ -22063,9 +22313,7 @@ static bool ggml_vk_can_fuse_attention_projections(ggml_backend_vk_context * ctx
     for (int n = 0; n < 4; ++n) {
         const ggml_tensor * w = node(n)->src[0];
         if (!valid(w) || !valid(node(n)) || node(n)->type != GGML_TYPE_F32 || w->ne[0] != input->ne[0] ||
-            w->ne[1] != node(n)->ne[0] || w->ne[2] != 1 || w->ne[3] != 1 || ggml_nelements(node(n)) != node(n)->ne[0] ||
-            (ctx->device->integer_dot_product && ggml_is_quantized(w->type) &&
-             ggml_vk_should_use_mmvq(ctx->device, w->ne[1], 1, w->ne[0], w->type)))
+            w->ne[1] != node(n)->ne[0] || w->ne[2] != 1 || w->ne[3] != 1 || ggml_nelements(node(n)) != node(n)->ne[0])
             return false;
         if (ggml_vk_tensors_overlap(node(n), input, false))
             return false;
@@ -22140,13 +22388,24 @@ static bool ggml_vk_can_fuse_attention_segment(ggml_backend_vk_context * ctx, co
         return valid(t, type) && ggml_is_contiguous(t) && ggml_nelements(t) == size;
     };
     const int64_t width = node(7)->ne[0], heads = node(7)->ne[1], kv_heads = node(12)->ne[1];
-    // TP5 QSA head-mapped FA nodes carry an explicit per-Q-head KV map; the
-    // fused attention segment's prep shaders assume the uniform integer
-    // heads/kv_heads ratio, so mapped nodes must not take this fusion.
-    if (node(26)->op_params[8] == GGML_TP5_HEADMAP_MAGIC) {
-        return false;
+    const ggml_tensor * fa = node(26);
+    const bool mapped_heads = fa->op_params[8] == GGML_TP5_HEADMAP_MAGIC;
+    if (mapped_heads) {
+        // The prep shader handles Q/K/V heads independently; only the actual
+        // FlashAttention dispatch needs Q->KV association, and its shader
+        // already consumes the explicit TP5 map.  Do not dismantle the whole
+        // region merely because the local head counts are not an integer GQA
+        // ratio.  Keep the same mapped-FA safety contract as supports_op.
+        float max_bias = 0.0f;
+        memcpy(&max_bias, (const float *) fa->op_params + 1, sizeof(max_bias));
+        if (!ggml_vk_fa_headmap_valid(fa) || max_bias != 0.0f ||
+            (fa->src[3] != nullptr && fa->src[3]->ne[2] != 1)) {
+            return false;
+        }
     }
-    if (width < 2 || width > 1024 || width % 2 || heads <= 0 || kv_heads <= 0 || heads % kv_heads ||
+    const bool uniform_gqa = heads > 0 && kv_heads > 0 && heads % kv_heads == 0;
+    if (width < 2 || width > 1024 || width % 2 || heads <= 0 || kv_heads <= 0 ||
+        (!mapped_heads && !uniform_gqa) ||
         node(7)->ne[2] != 1 || node(7)->ne[3] != 1 || node(7)->nb[0] != sizeof(float) ||
         node(7)->nb[1] != 2 * width * sizeof(float) || node(7)->view_offs != 0 || !valid(node(7), GGML_TYPE_F32) ||
         node(0)->ne[0] != 2 * width * heads || !vector(node(1), GGML_TYPE_F32, width * kv_heads) ||
@@ -22197,9 +22456,7 @@ static bool ggml_vk_can_fuse_attention_segment(ggml_backend_vk_context * ctx, co
         !vector(node(31), GGML_TYPE_F32, width * heads) || !valid(node(32)->src[0], GGML_TYPE_Q5_K) ||
         !ggml_is_contiguous(node(32)->src[0]) || node(32)->src[0]->ne[0] != width * heads || (width * heads) % 256 ||
         node(32)->src[0]->ne[1] != node(32)->ne[0] || node(32)->src[0]->ne[2] != 1 || node(32)->src[0]->ne[3] != 1 ||
-        !vector(node(32), GGML_TYPE_F32, node(32)->ne[0]) ||
-        (ctx->device->integer_dot_product &&
-         ggml_vk_should_use_mmvq(ctx->device, node(32)->ne[0], 1, width * heads, GGML_TYPE_Q5_K)))
+        !vector(node(32), GGML_TYPE_F32, node(32)->ne[0]))
         return false;
     // Actual materialized buffers must be disjoint. Cache reads are ordered after
     // their own writes; no generic elementwise alias exemption is needed here.
@@ -22316,8 +22573,7 @@ static bool ggml_vk_can_fuse_gdn_segment(ggml_backend_vk_context * ctx, const gg
     const auto projection = [&](const ggml_tensor * t, ggml_type type, const ggml_tensor * in, int64_t rows) {
         const ggml_tensor * w = t->src[0];
         return valid(w, type) && w->ne[2] == 1 && w->ne[3] == 1 && w->ne[1] == rows &&
-               w->ne[0] % ggml_blck_size(type) == 0 && t->src[1] == in && shape(in, w->ne[0], 1) && shape(t, rows, 1) &&
-               !(ctx->device->integer_dot_product && ggml_vk_should_use_mmvq(ctx->device, rows, 1, w->ne[0], type));
+               w->ne[0] % ggml_blck_size(type) == 0 && t->src[1] == in && shape(in, w->ne[0], 1) && shape(t, rows, 1);
     };
     if (!shape(node(7)->src[0], hv, 1) || !shape(node(7), hv, 1) || !shape(node(8), hv, 1) ||
         !shape(node(8)->src[1], hv, 1) || !shape(node(9), hv, 1) ||
@@ -22767,6 +23023,45 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->replay_pending_bufs.clear();
     }
 
+    // Store elision is a property of this concrete graph definition, not of a
+    // global transport/LateBind switch. Bake the permission into each terminal
+    // dispatch below, so replay never repeats this graph/liveness walk.
+    ctx->wire_local_elision_safe = false;
+#ifndef GGML_VULKAN_CHECK_RESULTS
+    if (ctx->wire_relay_stage != SIZE_MAX && ctx->wire_producer && ctx->wire_target == terminal) {
+        ctx->wire_local_elision_safe = ggml_vk_tp5_output_can_elide_local(
+            cgraph->nodes, cgraph->n_nodes, ctx->wire_producer, terminal,
+            [](const ggml_tensor * a, const ggml_tensor * b) {
+                VkBuffer ab = VK_NULL_HANDLE, bb = VK_NULL_HANDLE;
+                uint64_t ao = 0, as = 0, bo = 0, bs = 0;
+                // Unlike region-specific legality checks, this scan can see
+                // arbitrary trailing inputs, including unbound/host tensors.
+                // Unknown storage is a reason to retain z_p, never to cast a
+                // foreign buffer context or assume disjointness.
+                if (!ggml_vk_tp5_tensor_dev_ref(const_cast<ggml_tensor *>(a), &ab, &ao, &as) ||
+                    !ggml_vk_tp5_tensor_dev_ref(const_cast<ggml_tensor *>(b), &bb, &bo, &bs)) {
+                    return true;
+                }
+                if (ab != bb || as == 0 || bs == 0) {
+                    return false;
+                }
+                return ao <= bo ? bo - ao < as : ao - bo < bs;
+            });
+    }
+#endif
+
+    // Record ordinary model commands once as a definition IR. HC annotations
+    // below are command offsets, NOT extra CB boundaries. The runtime chain
+    // emits the selected recipe into a primary CB and never walks this IR.
+    ctx->tp5_recording_program.reset();
+    vk_tp5_capture_scope definition_scope;
+    if (ctx->replay_recording && ctx->tp5_definition_graph == cgraph) {
+        ctx->tp5_recording_program = std::make_shared<vk_tp5_graph_program>();
+        ctx->tp5_recording_program->device_owner = ctx->device;
+        ctx->tp5_recording_program->device = (VkDevice) ctx->device->device;
+        definition_scope.activate(&ctx->tp5_recording_program->commands);
+    }
+
     ctx->recorded_dispatches = 0;
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsLabelEXT dul = {};
@@ -22828,7 +23123,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         GGML_ASSERT(ctx->compute_ctx.expired());
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         ctx->query_idx = 0;
-        compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
+        vk_tp5_hpp_commands(compute_ctx->s->buffer->buf).writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
         ggml_vk_sync_buffers(ctx, compute_ctx);
     }
 
@@ -23225,7 +23520,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // track a single node/fusion for the current query
                 ctx->query_nodes[ctx->query_idx] = cgraph->nodes[i];
                 ctx->query_fusion_names[ctx->query_idx] = fusion_string;
-                compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
+                vk_tp5_hpp_commands(compute_ctx->s->buffer->buf).writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
                 ggml_vk_sync_buffers(ctx, compute_ctx);
             } else {
                 // track a fusion string and number of fused ops for the current node_idx
@@ -23278,16 +23573,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         VkCommandBuffer cb = (VkCommandBuffer) compute_ctx->s->buffer->buf;
         VkMemoryBarrier payload_publish{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                                         VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        tp5_cmd_barrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
                              0, 1, &payload_publish, 0, nullptr, 0, nullptr);
         const VkDeviceSize ready_off =
             (VkDeviceSize) ctx->wire_relay_stage * VK_TP5_RELAY_ROUTE_STRIDE +
             offsetof(vk_tp5_relay_route_entry, ready);
-        vkCmdFillBuffer(cb, (VkBuffer) ctx->relay_route_buffer->buffer, ready_off, sizeof(uint32_t), 1u);
+        tp5_cmd_fill(cb, (VkBuffer) ctx->relay_route_buffer->buffer, ready_off, sizeof(uint32_t), 1u);
         VkMemoryBarrier ready_publish{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                                       VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+        tp5_cmd_barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
                              0, 1, &ready_publish, 0, nullptr, 0, nullptr);
         compute_ctx->s->buffer->has_pending_mem_work = true;
     }
@@ -23399,6 +23694,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         cache_entry.cgraph_uid = cgraph->uid;
         cache_entry.scratch_gen = ctx->scratch_generation;
         cache_entry.latebind_capture_requested = ctx->latebind_capture_graph == cgraph;
+        cache_entry.tp5_program_requested = ctx->tp5_definition_graph == cgraph;
         cache_entry.wire_requested = cgraph->n_nodes > 0 && ctx->wire_target == cgraph->nodes[cgraph->n_nodes - 1];
         cache_entry.wire_output    = ctx->wire_recorded;
         cache_entry.wire_relay_direct = ctx->wire_relay_recorded;
@@ -23408,7 +23704,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         cache_entry.relay_payload_generation =
             cache_entry.wire_relay_direct ? ctx->relay_payload_generation : 0;
         cache_entry.cmd_bufs = ctx->replay_pending_bufs;
-        cache_entry.hc_sum_prefix  = ctx->hc_prefix_recorded && cache_entry.cmd_bufs.size() > 1 &&
+        cache_entry.hc_sum_prefix  = ctx->hc_prefix_recorded && !cache_entry.cmd_bufs.empty() &&
+                                    (ctx->tp5_recording_program || cache_entry.cmd_bufs.size() > 1) &&
                                     ctx->hc_prefix_recorded == (void *) (VkCommandBuffer) cache_entry.cmd_bufs.front();
         if (cache_entry.hc_sum_prefix)
             ctx->hc_consumers[ctx->hc_prefix_recorded] = ctx->hc_sum_recorded;
@@ -23446,6 +23743,25 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // the latest pointer. The vector is cleared per recording below.
         for (const auto & buffer : ctx->recording_quant_owners)
             retain_buffer(buffer);
+        if (ctx->tp5_recording_program) {
+            auto & program = *ctx->tp5_recording_program;
+            program.buffers = cache_entry.buffer_owners;
+            program.hc = cache_entry.hc_sum_prefix ? ctx->hc_sum_recorded : vk_tp5_hc_sum{};
+            // Transfer pool ownership, not just VkDescriptorSet handles.
+            for (auto pool : cache_entry.descriptor_pools)
+                program.descriptor_pools.push_back((VkDescriptorPool) pool);
+            cache_entry.descriptor_pools.clear();
+            if (program.commands.count(vk_tp5_command_tape::kind::dispatch) != ctx->recorded_dispatches)
+                program.commands.reject("incomplete dispatch capture");
+            if (program.commands.sources.size() != cache_entry.cmd_bufs.size())
+                program.commands.reject("source CB list changed during definition");
+            else for (size_t i = 0; i < cache_entry.cmd_bufs.size(); ++i)
+                if (program.commands.sources[i] != (VkCommandBuffer) cache_entry.cmd_bufs[i])
+                    program.commands.reject("source CB ordering changed during definition");
+            cache_entry.tp5_program = ctx->tp5_recording_program;
+            if (!cache_entry.cmd_bufs.empty())
+                ctx->tp5_programs[(void *) (VkCommandBuffer) cache_entry.cmd_bufs.front()] = cache_entry.tp5_program;
+        }
         ggml_vk_cache_build_fingerprint(cache_entry, cgraph);
         ctx->recording_quant_owners.clear();
         ctx->replay_recording = false;
@@ -24434,19 +24750,24 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 if (q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1) {
                     return false;
                 }
-                if (k->ne[2] < 1 || v->ne[2] < 1 || q->ne[2] % k->ne[2] != 0 || q->ne[2] % v->ne[2] != 0) {
+                if (k->ne[2] < 1 || v->ne[2] < 1) {
+                    return false;
+                }
+                const bool tp5_mapped = op->op_params[8] == GGML_TP5_HEADMAP_MAGIC;
+                if (tp5_mapped) {
+                    // RERoT shares ordinary FA's explicit Q->KV map ABI.  The
+                    // mapped dispatch uses one Q head per workgroup (Br=1), so
+                    // it does not require an integer local GQA ratio.
+                    if (k->ne[2] != v->ne[2] || !ggml_vk_fa_headmap_valid(op)) {
+                        return false;
+                    }
+                } else if (q->ne[2] % k->ne[2] != 0 || q->ne[2] % v->ne[2] != 0) {
                     return false;
                 }
                 if (q->nb[0] != sizeof(float) || entries->nb[0] != sizeof(int32_t) || offsets->nb[0] != sizeof(int32_t)) {
                     return false;
                 }
                 if (k->nb[0] != ggml_type_size(k->type) || v->nb[0] != ggml_type_size(v->type)) {
-                    return false;
-                }
-                // TP5 QSA explicit head map is not implemented for the
-                // RERoT-DDVR indexed path; fail closed rather than run the
-                // uniform integer-ratio assumption.
-                if (op->op_params[8] == GGML_TP5_HEADMAP_MAGIC) {
                     return false;
                 }
                 if (q->nb[1] % sizeof(float) != 0 || q->nb[2] % sizeof(float) != 0) {
@@ -25665,6 +25986,26 @@ static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const
             if (misses) *misses = ctx->replay_misses;
         };
     }
+    if (strcmp(name, "ggml_backend_vk_get_region_mmvq_stats") == 0) {
+        // Observer only: counts recorded commands, not executions or time.
+        // Tests combine this with completed graph results to reject a silent
+        // unfused/native fallback masquerading as an MMVQ+fusion test.
+        return (void *) +[](ggml_backend_t backend, uint64_t * quantizations, uint64_t * projections,
+                            uint32_t * gdn_mask, uint32_t * qsa_mask) -> bool {
+            if (quantizations) *quantizations = 0;
+            if (projections) *projections = 0;
+            if (gdn_mask) *gdn_mask = 0;
+            if (qsa_mask) *qsa_mask = 0;
+            if (!ggml_backend_is_vk(backend)) return false;
+            auto * ctx = (ggml_backend_vk_context *) backend->context;
+            if (quantizations) *quantizations = ctx->region_q8_quantize_records;
+            if (projections) *projections = ctx->region_q8_projection_records;
+            if (gdn_mask) *gdn_mask = ctx->region_q8_used_masks[0];
+            if (qsa_mask) *qsa_mask = ctx->region_q8_used_masks[1];
+            return ctx->device->integer_dot_product && ctx->device->pipeline_attention_projections_mmvq[0] &&
+                   ctx->device->pipeline_attention_projections_mmvq[1];
+        };
+    }
     if (strcmp(name, "ggml_backend_vk_get_sparse_dispatch_count") == 0) {
         return (void *) ggml_backend_vk_get_sparse_dispatch_count;
     }
@@ -25930,42 +26271,42 @@ void ggml_vk_tp5_mem_props(vk_device device, void * out) {
 }
 
 bool ggml_vk_tp5_tensor_dev_ref(ggml_tensor * t, VkBuffer * buf, VkDeviceSize * off, VkDeviceSize * size, vk_buffer * owner) {
-    if (!t || !t->buffer || !ggml_backend_buffer_is_vk(t->buffer)) return false;
+    if (!t || !buf || !off || !size || !t->buffer || !t->data ||
+        (t->view_src && !t->view_src->data) || !ggml_backend_buffer_is_vk(t->buffer)) return false;
     auto * buf_ctx = (ggml_backend_vk_buffer_context *) t->buffer->context;
     if (!buf_ctx || !buf_ctx->dev_buffer) return false;
     const vk::Buffer vb = buf_ctx->dev_buffer->buffer;
     if (!vb) return false;
+    const uint64_t base = vk_tensor_offset(t);
+    const uint64_t bytes = ggml_nbytes(t);
+    const uint64_t capacity = buf_ctx->dev_buffer->size;
+    if (!ggml_vk_tp5_range_fits(capacity, base, t->view_offs, bytes)) {
+        return false;
+    }
     *buf = (VkBuffer) vb;
     // Standard Vulkan backend offset calculation:
-    *off = (VkDeviceSize)(vk_tensor_offset(t) + t->view_offs);
-    *size = (VkDeviceSize) ggml_nbytes(t);
-    if (buf_ctx->dev_buffer->bda_addr == 0) {
-        auto pfn_bda = (PFN_vkGetBufferDeviceAddressKHR)
-            vkGetDeviceProcAddr(buf_ctx->dev_buffer->device->device, "vkGetBufferDeviceAddressKHR");
-        if (pfn_bda) {
-            VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
-            dai.buffer = (VkBuffer)vb;
-            buf_ctx->dev_buffer->bda_addr = pfn_bda(buf_ctx->dev_buffer->device->device, &dai);
-        }
-    }
+    *off = (VkDeviceSize)(base + t->view_offs);
+    *size = (VkDeviceSize) bytes;
+    // Pure descriptor/range lookup. In particular RELAY and graph-liveness
+    // inspection must not request a device address as an incidental side
+    // effect. Buffers without SHADER_DEVICE_ADDRESS usage are valid here.
     if (owner) *owner = buf_ctx->dev_buffer;
     return true;
 }
 
 uint64_t ggml_vk_tp5_get_tensor_bda(ggml_tensor * t) {
-    if (!t || !t->buffer || !ggml_backend_buffer_is_vk(t->buffer)) return 0;
-    auto * buf_ctx = (ggml_backend_vk_buffer_context *) t->buffer->context;
-    if (!buf_ctx || !buf_ctx->dev_buffer) return 0;
-    if (buf_ctx->dev_buffer->bda_addr == 0) {
-        auto pfn_bda = (PFN_vkGetBufferDeviceAddressKHR)
-            vkGetDeviceProcAddr(buf_ctx->dev_buffer->device->device, "vkGetBufferDeviceAddressKHR");
-        if (pfn_bda) {
-            VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
-            dai.buffer = (VkBuffer)buf_ctx->dev_buffer->buffer;
-            buf_ctx->dev_buffer->bda_addr = pfn_bda(buf_ctx->dev_buffer->device->device, &dai);
-        }
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0, bytes = 0;
+    vk_buffer owner;
+    if (!ggml_vk_tp5_tensor_dev_ref(t, &buffer, &offset, &bytes, &owner) ||
+        !owner->device->buffer_device_address || owner->bda_addr == 0) {
+        return 0;
     }
-    return (uint64_t)buf_ctx->dev_buffer->bda_addr + (uint64_t)(vk_tensor_offset(t) + t->view_offs);
+    // Device-local backend allocations acquire BDA at creation when supported.
+    // A missing base is failure, not '0 + view offset', which can otherwise
+    // masquerade as a nonzero valid address for a view in a descriptor-only BO.
+    const uint64_t base = (uint64_t) owner->bda_addr;
+    return ggml_vk_tp5_checked_address(base, offset);
 }
 
 bool ggml_vk_tp5_hc_consumer(ggml_backend_t backend, void * first_cb, vk_tp5_hc_sum * recipe) {
@@ -26110,16 +26451,25 @@ void ggml_vk_tp5_set_wire_output(ggml_backend_t backend, ggml_tensor * tensor, b
     ctx->wire_producer = producer;
 }
 
-void ggml_vk_tp5_set_latebind_capture(ggml_backend_t backend, const ggml_cgraph * graph, bool enabled) {
+void ggml_vk_tp5_set_latebind_capture(ggml_backend_t backend, const ggml_cgraph * graph, bool enabled,
+                                     bool define_program) {
     if (!ggml_backend_is_vk(backend))
         return;
     auto * ctx = (ggml_backend_vk_context *) backend->context;
     ctx->latebind_capture_graph = enabled ? graph : nullptr;
+    ctx->tp5_definition_graph = define_program ? graph : nullptr;
+}
+
+std::shared_ptr<const vk_tp5_graph_program> ggml_vk_tp5_graph_program(ggml_backend_t backend, void * first_cb) {
+    if (!ggml_backend_is_vk(backend)) return {};
+    auto * ctx = (ggml_backend_vk_context *) backend->context;
+    const auto it = ctx->tp5_programs.find(first_cb);
+    return it != ctx->tp5_programs.end() ? it->second : nullptr;
 }
 
 bool ggml_vk_tp5_update_relay_route(ggml_backend_t backend, size_t stage, uint32_t bank, uint64_t epoch,
                                     const vk_tp5_relay_payload_binding & payload,
-                                    volatile uint32_t ** ready_ptr) {
+                                    volatile uint32_t ** ready_ptr, bool keep_local) {
     if (ready_ptr) *ready_ptr = nullptr;
     if (!ggml_backend_is_vk(backend) || stage >= VK_TP5_RELAY_ROUTE_MAX || bank >= 2 || epoch == 0 ||
         epoch > UINT32_MAX || payload.bank[0] == nullptr || payload.bank[1] == nullptr ||
@@ -26146,7 +26496,7 @@ bool ggml_vk_tp5_update_relay_route(ggml_backend_t backend, size_t stage, uint32
     entry->bank     = bank;
     entry->ready    = 0u;
     entry->epoch    = (uint32_t) epoch;
-    entry->reserved = 0u;
+    entry->reserved = keep_local ? VK_TP5_RELAY_ROUTE_KEEP_LOCAL : 0u;
     std::atomic_thread_fence(std::memory_order_release);
 #if defined(__x86_64__) || defined(_M_X64)
     _mm_sfence();
@@ -26607,9 +26957,24 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             }
         } else if (tensor->op == GGML_OP_FLASH_ATTN_EXT_REROT) {
             const float * params = (const float *)tensor->op_params;
-            tensor_clone = ggml_flash_attn_ext_rerot(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3], src_clone[4], params[0], params[2]);
-            if (src_clone[5]) {
-                ggml_flash_attn_ext_add_sinks(tensor_clone, src_clone[5]);
+            if (tensor->op_params[8] == GGML_TP5_HEADMAP_MAGIC) {
+                // Rank-local TP5 mapped geometry intentionally violates the
+                // public constructor's global uniform-GQA invariant. Clone
+                // the already validated local op directly, preserving the
+                // canonical head-map ABI and all six explicit sources.
+                const int64_t ne[4] = { src_clone[2]->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3] };
+                tensor_clone = ggml_new_tensor(ggml_ctx, GGML_TYPE_F32, 4, ne);
+                memcpy(tensor_clone->op_params, tensor->op_params, 11 * sizeof(int32_t));
+                tensor_clone->op = GGML_OP_FLASH_ATTN_EXT_REROT;
+                for (int i = 0; i < 6; ++i) {
+                    tensor_clone->src[i] = src_clone[i];
+                }
+            } else {
+                tensor_clone = ggml_flash_attn_ext_rerot(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                                                         src_clone[3], src_clone[4], params[0], params[2]);
+                if (src_clone[5]) {
+                    ggml_flash_attn_ext_add_sinks(tensor_clone, src_clone[5]);
+                }
             }
         } else if (tensor->op == GGML_OP_FLASH_PREFILL_POOL) {
             ggml_vk_fp_params pp;

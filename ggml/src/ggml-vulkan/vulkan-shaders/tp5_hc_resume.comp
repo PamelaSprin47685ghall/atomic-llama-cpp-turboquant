@@ -1,0 +1,180 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+// Two independent data dependencies. The CPU publishes y_epoch (word 0)
+// immediately after y fanout, and q_epoch (word 2) after sidecar fanout.
+// No successful completion is published by the norm pass. Only LO, the last
+// reader of both inbox regions, may retire this mailbox generation.
+#ifdef TP5_RESUME_NORM
+layout(local_size_x = 512) in;
+layout(std430, binding = 0) coherent volatile readonly buffer Inbox { uint inbox[]; };
+layout(std430, binding = 1) readonly buffer Residual { float residual[]; };
+layout(std430, binding = 2) readonly buffer Gamma { float gamma[]; };
+layout(std430, binding = 3) writeonly buffer Combined { float combined[]; };
+layout(std430, binding = 4) writeonly buffer Normalized { float normalized[]; };
+layout(std430, binding = 5) readonly buffer Scatter { float scatter[]; };
+layout(std430, binding = 6) writeonly buffer Rho { float inverse_rho[]; };
+layout(std430, binding = 7) coherent volatile buffer Status { uint status[]; };
+layout(std430, binding = 8) writeonly buffer SumOutput { float sum_output[]; };
+layout(push_constant) uniform Params {
+    uint width;
+    uint streams;
+    float epsilon;
+    uint spin_max;
+    uint status_word_offset;
+    uint profile_spin;
+} p;
+const uint GENERATION_WORD = 0u;
+const uint SPIN_WORD = 5u;
+shared float partials[512];
+#endif
+
+#ifdef TP5_RESUME_LO
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) coherent volatile readonly buffer Inbox { uint inbox[]; };
+layout(std430, binding = 1) readonly buffer Rho { float inverse_rho[]; };
+layout(std430, binding = 2) writeonly buffer Lo { float lo[]; };
+layout(std430, binding = 3) coherent volatile buffer Status { uint status[]; };
+layout(push_constant) uniform Params {
+    uint rank_dim;
+    uint streams;
+    uint late_word_offset;
+    uint spin_max;
+    uint status_word_offset;
+    uint profile_spin;
+} p;
+const uint GENERATION_WORD = 2u;
+const uint SPIN_WORD = 7u;
+#endif
+
+shared uint ready;
+shared uint expected;
+
+bool await_input() {
+    if (gl_LocalInvocationID.x == 0u) {
+        ready = 0u;
+        expected = status[p.status_word_offset + 1u];
+        uint used = 0u;
+        if (expected != 0u && status[p.status_word_offset + 2u] == 0u) {
+            for (uint spin = 0u; spin < p.spin_max; ++spin) {
+                used = spin;
+                if ((spin & 1023u) == 0u && status[p.status_word_offset + 2u] != 0u)
+                    break;
+                if (inbox[GENERATION_WORD] == expected) {
+                    ready = 1u;
+                    break;
+                }
+            }
+        }
+        if (ready == 0u) {
+            atomicCompSwap(status[p.status_word_offset + 2u], 0u,
+                          expected != 0u ? expected : 0xffffffffu);
+            if (gl_WorkGroupID.x == 0u)
+                status[p.status_word_offset + 4u] = inbox[GENERATION_WORD];
+            used = p.spin_max;
+        }
+        if (p.profile_spin != 0u && gl_WorkGroupID.x == 0u)
+            status[p.status_word_offset + SPIN_WORD] = used;
+    }
+    barrier();
+    memoryBarrierBuffer();
+    return ready != 0u;
+}
+
+#ifdef TP5_RESUME_NORM
+void finalize_stream(const uint iterations) {
+    const uint lane = gl_LocalInvocationID.x;
+    const uint stream = gl_WorkGroupID.x;
+    const uint base = stream * p.width;
+    const float s = scatter[stream];
+    float values[8];
+    float weights[8];
+    // Independent preparation happens before the point-of-use wait. Keep
+    // this bounded: do not preload the full W_down matrix into registers.
+    [[unroll]] for (uint i = 0u; i < iterations; ++i) {
+        const uint col = lane + i * 512u;
+        values[i] = col < p.width ? residual[base + col] : 0.0;
+        weights[i] = col < p.width ? gamma[base + col] : 0.0;
+    }
+    if (!await_input()) {
+        const float nanv = uintBitsToFloat(0x7fc00000u);
+        for (uint col = lane; col < p.width; col += 512u) {
+            combined[base + col] = nanv;
+            normalized[base + col] = nanv;
+            if (stream == 0u) sum_output[col] = nanv;
+        }
+        if (lane == 0u) inverse_rho[stream] = nanv;
+        return;
+    }
+    float ss = 0.0;
+    [[unroll]] for (uint i = 0u; i < iterations; ++i) {
+        const uint col = lane + i * 512u;
+        if (col < p.width) {
+            const float y = uintBitsToFloat(inbox[16u + col]);
+            precise float product = y * s;
+            precise float value = values[i] + product;
+            values[i] = value;
+            combined[base + col] = value;
+            // Retain canonical y for any other graph reader, without a
+            // separate copy dispatch or a subsequent HC readback.
+            if (stream == 0u) sum_output[col] = y;
+        }
+        ss += values[i] * values[i];
+    }
+    partials[lane] = ss;
+    barrier();
+    [[unroll]] for (uint stride = 256u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            ss += partials[lane + stride];
+            partials[lane] = ss;
+        }
+        barrier();
+    }
+    const float scale = inversesqrt(partials[0] / float(p.width) + p.epsilon);
+    if (lane == 0u) inverse_rho[stream] = scale;
+    [[unroll]] for (uint i = 0u; i < iterations; ++i) {
+        const uint col = lane + i * 512u;
+        if (col < p.width) {
+            float norm = scale * values[i];
+            normalized[base + col] = norm * weights[i];
+        }
+    }
+}
+void main() {
+    if (p.streams != 4u || gl_WorkGroupID.x >= p.streams || p.width == 0u || p.width > 4096u)
+        return; // rejected by the host recipe before recording
+    const uint blocks = (p.width + 511u) / 512u;
+    if (blocks > 4u) finalize_stream(8u);
+    else if (blocks == 4u) finalize_stream(4u);
+    else if (blocks == 3u) finalize_stream(3u);
+    else if (blocks == 2u) finalize_stream(2u);
+    else finalize_stream(1u);
+}
+#endif
+
+#ifdef TP5_RESUME_LO
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    const vec4 scale = vec4(inverse_rho[0], inverse_rho[1], inverse_rho[2], inverse_rho[3]);
+    if (!await_input()) {
+        for (uint row = lane; row < p.rank_dim; row += 64u)
+            lo[row] = uintBitsToFloat(0x7fc00000u);
+        return;
+    }
+    for (uint row = lane; row < p.rank_dim; row += 64u) {
+        precise float acc = uintBitsToFloat(inbox[p.late_word_offset + row]) * scale[0];
+        [[unroll]] for (uint b = 1u; b < 4u; ++b) {
+            precise float term = uintBitsToFloat(inbox[p.late_word_offset + b * p.rank_dim + row]) * scale[b];
+            acc = acc + term;
+        }
+        precise float scaled = acc * 0.25 + 0.0;
+        lo[row] = scaled / (1.0 + exp(-scaled));
+    }
+    memoryBarrierBuffer();
+    barrier();
+    if (lane == 0u && status[p.status_word_offset + 2u] == 0u) {
+        status[p.status_word_offset + 3u] = expected;
+        memoryBarrierBuffer();
+    }
+}
+#endif

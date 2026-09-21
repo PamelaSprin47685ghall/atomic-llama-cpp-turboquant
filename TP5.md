@@ -1,3 +1,6 @@
+- RELAY 下 `GGML_TP5_ISOLATE_BO` 不再关闭整个 Vulkan device 的 BDA / descriptor-indexing / coopmat2 派生能力。RELAY 的 host transport 已经使用固定 storage descriptor，自身无需 imported-host BDA；因此 TP5 的资源隔离只作用于 TP5，不得以让 `RADV_DEBUG=nobolist` 生效为理由牺牲其它 Vulkan 内置 kernel 的设备能力。历史 52.47 tok/s 运行本身也是在这些设备能力仍开启、RADV 拒绝关闭 global BO list 的状态下取得的。
+- P1 与 LateBind precompute 的 full-chain 顺序固定为 `producer compute → P1 publish main y-partial → late_pre`。CPU 在 P1 ready 后即可开始主 activation 的五卡 reduce，而同一 GPU queue 继续计算 sidecar；不得排成 `late_pre → P1`，否则会把主通信人为推迟到 W_down sufficient statistic 之后。
+- GPU timing ledger 对 LateBind stage 单独报告 `p1_us` 与 `late_pre_us`，避免再把两者混成旧的 `producer_slot_us`；direct-host 实验同时打印 `direct=1`，便于下一轮严格拆账。
 # TP5：Qwen4EXP 在五张 RX 6800 上的 Vulkan 张量并行实现方案
 
 版本：工程交付与收敛标准稿（2026-09-14 晚）。源码基线：`64ad8cdff0f1f932f05fa489614deb63a84cd088`，分支 `master`。
@@ -6,21 +9,21 @@
 
 ## RELAY 名称与语义铁律（当前有效）
 
-`RELAY` 不是“谁完成后再通知另一边继续”的机制。它的主语义是**双方先进入等待状态，状态满足后自然继续**：GPU 的 terminal producer 直接按所选 wire 宽度（F16/F32）把 payload 写入 host-imported RAM；CPU 从 queue submit 前就持续轮询每个 stage 的 stable route-ready word；producer 只是在原 compute CB 尾部把 ready 从 0 写成 1。下行方向同理：P2 早已驻留并在本卡 local-VRAM 上有界轮询 generation；CPU reduce 后只写 payload 与 generation。没有 post-handoff submit、host semaphore signal、callback 或显式“唤醒”动作。达到严格 `spin_max` 必须写失败态并退出。旧 P1 只保留为 direct-producer 不具备时的兼容 fallback。
+`RELAY` 不是“谁完成后再通知另一边继续”的机制。它的主语义是**整条 GPU chain 先提交，CPU/GPU 双方随后只观察状态并自然继续**。上行 payload 可以由 terminal producer 的 direct-host 变体发布，也可以由紧随 producer、已经预录在同一 full chain 里的 P1 transport epilogue 发布；P1 并不意味着 CPU 在 producer 完成后再提交 GPU 工作。CPU 从 chain submit 前就持续轮询 ready state。下行 P2 也早已驻留并在本卡 local-VRAM 上有界轮询 generation；CPU reduce 后只写 payload 与 generation。没有 post-handoff submit、host semaphore signal、callback 或显式“唤醒”动作。达到严格 `spin_max` 必须写失败态并退出。**RELAY 的定义是 autonomous pre-submit/state observation，不是“必须删除 P1”。**
 
 **严禁以任何降级冒充 RELAY。** CPU payload 发布后才提交 P2、P2 one-shot doorbell check、host timeline signal、CPU 直接推进 P2，均属于 `CPU-gated STAR` 或其他非-RELAY 路径；不得使用 relay CLI/env、测试名、benchmark 标签或 tok/s 结果，且不得 silent fallback 或别名混称。本文中所有旧的 timeline/direct/host-relay 历史叙述不改变这一定义。
 
 ### RELAY soft-scheduling 快路径（2026-09-20，已实现、未真机验证）
 
-本轮第一目标只压**软调度**，不把算法级 lookahead/late-binding 混进基线。RELAY 仍以单个小 workgroup 的 bounded-spin P2 作为默认门闩，整 token 每 rank 一次 full-chain submit；stage 间不使用 peer semaphore、host timeline signal 或二次 P2 submit。具备 direct producer 的 stage **不再录制、不再提交 P1**：Q5_K output projection、MoE down/fold、shared-down 及 K128 特化直接双写本地 F32 结果与 host payload。producer 后只保留必要的 COMPUTE→HOST payload publish，以及 stable route table 上 4-byte `ready=1` 的 TRANSFER→HOST state publication；CPU 在此之前早已轮询该 word。
+本轮第一目标只压**软调度**，不把算法级 lookahead/late-binding 混进基线。RELAY 仍以单个小 workgroup 的 bounded-spin P2 作为默认门闩，整 token 每 rank 一次 full-chain submit；stage 间不使用 peer semaphore、host timeline signal 或二次 P2 submit。当前 F32 默认 transport 是 **VRAM-only producer → descriptor-based 128-bit vector P1 → host-imported payload**：P1 已在 full chain 中，既不增加 CPU gating，也把 system-memory 写流量与大 GEMV/MoE producer 隔离。`GGML_TP5_DIRECT_PRODUCER_HOST=1` 保留 direct-host 实验，不再因为少一个 dispatch 就自动抢占默认路径。
 
-replay 不直接绑定会随 workspace/bank 改变的 host payload BO。每个 Vulkan backend 持有一块长期稳定、CPU-cacheable、通过 external-memory-host 导入的 route table；每个 stage 使用 256-byte 对齐 slot，内容只有动态 `payload_bda + ready`。cached producer descriptor 永远绑定同一个 route slot，workspace resize 或 bank 轮换只更新 slot 里的 BDA，不修改 descriptor 或 command buffer。replay cache identity 固定 `route_stage`，而该 cache entry 实际是否录成 direct producer 由其独立资格位保存并在 warm replay 时重新发布。只有五个 rank 都拿到 direct 资格时 collective 才删除该 stage 的 P1，否则整 stage 回到旧路径。cold/one-shot RELAY 也使用同一资格：direct producer 已执行时只预提交 P2，不再补录或提交 P1。
+direct-host replay 不把会变化的 bank 选择固化进 cached producer。每个 Vulkan backend 持有长期稳定、CPU-cacheable 的 route table；每个 stage 使用 256-byte 对齐 slot 保存动态 bank/ready/epoch，而两个 host-imported payload bank 通过固定 storage descriptor 绑定。RELAY 不再要求 imported-host BDA，因此不会为了 TP5 transport 关闭整个 Vulkan device 的 BDA/descriptor-indexing/coopmat2 能力。默认 P1 transport 不使用 route table；显式 direct-host 只有五个 rank 都拿到资格时才删除该 stage 的 P1。
 
 上行 host payload 仍使用两个 bank。direct producer 不会越过尚未消费的同 bank payload：producer(e) 在本 queue 上位于 P2(e-1) 之后，而 P2(e-1) 只有在 CPU 已经消费 e-1 并发布下行 generation 后才能完成；因此 producer(e) 开始覆盖 bank(e) 时，CPU 必然更早已经消费 e-2 的同 bank payload。这个 ownership credit 由 queue order 与既有 P2 spin 自然成立，不需要 P1 充当信用节点。
 
 CPU→GPU 下行 local VRAM 优先选择 `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT | DEVICE_COHERENT_AMD`，**不再主动要求 `DEVICE_UNCACHED_AMD`**；只有目标机没有 cached device-coherent memory type 时才退到 uncached。这样 64-byte doorbell 与紧随其后的 decode payload 可以利用 GPU cache / Infinity Cache，而 `HOST_COHERENT + DEVICE_COHERENT_AMD` 已提供 host/device memory-domain 自动可见性。快路径按 `payload stores → sfence → generation stores → sfence` 发布，不再默认每 rank 调一次 `vkFlushMappedMemoryRanges`；`GGML_TP5_RELAY_FORCE_FLUSH=1` 可恢复旧诊断路径。CPU 上行 polling 改为一个 pending-rank bitmask 同时扫五卡 ready word，deadline 只周期检查，避免 hot spin 每轮读取 steady clock。
 
-wire 宽度重新作为性能变量，而不是先验固定 F16。RELAY 的 F16 与 F32 现在走**同一套 direct-route/replay/ready/P2 调度机制**：F16 producer 直接按 canonical `float16_t(result)` 写 host payload，CPU 用 AVX2+F16C 解包求和；F32 producer 直接写 float，CPU 用纯 AVX2 求和，省掉 pack/unpack 但上行字节数翻倍。fallback P1 也分别有 F16 conversion/copy 与 F32 literal-copy 模式，因此 `--tp5-wire f16` / `f32` 的比较不会混入不同调度路径。小 decode payload 的 CPU reduce 与五路 BAR broadcast 都是一遍 fan-out，不再先物化 host F32 sum 后再 `memcpy` 五遍。
+wire 宽度重新作为性能变量，而不是先验固定 F16。默认 P1 下，F32 使用 descriptor-based `uvec4`/128-bit burst 搬运；F16 若 terminal producer 已生成 device-local canonical F16 companion，则 P1 只做同样的 vector copy，否则使用 `vec4→f16vec4` vector pack。非对齐/尾部才回安全 scalar/transfer fallback。CPU 侧 F16 用 AVX2+F16C 解包求和，F32 用纯 AVX2 求和。direct-host 对照仍支持 F16/F32，但不再与默认 transport 混成一个“producer-wire”概念。
 
 ### RELAY fused-consumer / LateBind 试验入口（第二步，默认关闭）
 
@@ -34,17 +37,26 @@ RELAY 的 HC 边界现在可把**有界 doorbell 自旋直接并入下一段 HC 
 
 ### Exact LateBind HC-down（第二步，2026-09-21，opt-in）
 
-`GGML_TP5_LATEBIND=hc-down` 启用 exact HC-down LateBind；默认关闭。它只在 **RELAY + F32 wire + direct producer + 原生 F32 HC down** recipe 上生效，不改变 `GGML_TP5_REPLICATE_ATTN`。因此 attention replicate 仍可独立开/关，推荐按 `replicate={0,1} × latebind={0,1}` 四组做端到端 A/B。F16 wire 自动走旧路径，因为 sidecar 若按本地 F32 partial 计算会与 F16-rounded 主 activation 不再严格对应。
+`GGML_TP5_LATEBIND=hc-down` 启用 exact HC-down LateBind；默认关闭。它只在 **RELAY + F32 wire + 原生 F32 HC down** recipe 上生效，**不要求 direct producer**，也不改变 `GGML_TP5_REPLICATE_ATTN`。consumer recipe capture 与 producer transport 独立：P1 transport 和显式 direct-host 实验都可进入同一个 LateBind consumer。F16 wire 自动走旧路径，因为 sidecar 若按本地 F32 partial 计算会与 F16-rounded 主 activation 不再严格对应。
 
-命中 recipe 后，terminal producer 与 P2 之间提前计算四路 scatter 和 `4×320` 的 W_down sufficient statistic；每 rank 将约 5 KiB F32 sidecar 直接写入当前 bank 的 host-imported RAM。CPU 在已有 handoff loop 中有界轮询 sidecar ready，使用 AVX2 做五卡 F32 sum + fan-out。主 activation 与 sidecar CPU 工作允许重叠，但 GPU generation 只在两者都 ready 后发布。
+命中 recipe 后，terminal producer 与 P2 之间提前计算四路 scatter 和 `4×320` 的 W_down sufficient statistic。full-chain 顺序固定为 **producer → 主 P1 publish → late_pre**：CPU 一观察到主 partial ready 就开始五卡 `y` reduce，而同一 GPU queue 继续做 sidecar。sidecar 先写本地 VRAM，再由单个 descriptor-based 128-bit vector epilogue 搬约 5 KiB 到 host-imported bank，避免 320 个 row workgroup 直接做零散 system-memory store。CPU 有界轮询 sidecar ready 后使用 AVX2 做五卡 F32 sum + fan-out；generation 只在主 activation 与 sidecar 都 ready 后发布。
 
-fused P2/finalize 在同一个 bounded-spin kernel 中直接消费 local-VRAM 的 y 与 reduced sidecar，完成 `R_b + s_b*y`、四路 RMS/gamma、`sum_b(Q_b/rho_b)` 和 SiLU，并写回原 reduction tensor、combined、normalized 与 lo。随后 replay 跳过旧 HC norm/combine 和旧 W_down+SiLU 两个 CB，直接复用既有 W_up/fold CB。这样 W_down 的主要 FLOPs 从 collective 后的 causal tail 移进 relay window，同时删除 P2 copy→HC reread 的中间 materialization。
+默认安全路径由小型 P2 bounded-spin 先观察 generation 并把 reduced `y` 写回正常 VRAM；随后在**同一个 command buffer** 中用 **4 个独立 512-thread workgroup** 并行完成四路 `R_b+s_b*y`、原 512-lane RMS tree、gamma/normalized，再由一个 64-thread workgroup 完成 `sum_b(Q_b/rho_b)` 与 SiLU。这样既不让大 workgroup 承担长自旋，也不把四路 RMS 串在单个 1024-thread workgroup/单 CU 上。随后 replay 跳过旧 HC norm/combine 和旧 W_down+SiLU 两个 CB，直接复用既有 W_up/fold CB。旧单-dispatch 1024-thread finalize 仅由 `GGML_TP5_LATEBIND_FUSED_FINALIZE=1` 保留作实验入口。
 
-LateBind recipe 必须五个 rank 全部匹配；任一 rank 不匹配时整 stage 回旧 RELAY 路径。当前 recipe 要求 4-stream HC、Q8_0 W_down、F32 normalized/lo、late rank ≤512，并拒绝 `GGML_VK_HC_DOT=q8` 与 `GGML_VK_HC_DOWN_WG` 实验变体。所有 spin 仍受原固定 `spin_max` 约束，timeout 仍写 sticky failure 并退出。
+LateBind recipe 必须五个 rank 全部匹配；任一 rank 不匹配时整 stage 回旧 RELAY 路径。当前 recipe 要求 4-stream HC、Q8_0 W_down、F32 normalized/lo、late rank ≤512。`GGML_VK_HC_DOT=q8` / `GGML_VK_HC_DOWN_WG` 不再作为**全局 LateBind 否决条件**：它们仍可作用于其它 HC；命中 LateBind 的这个 W_down 已被 sufficient-statistic 公式替代。对同一个被替代 W_down，activation-Q8 是非线性量化，不能与 exact linear decomposition 同时成立；这是局部数学语义边界，不是允许一个优化全局关闭另一个优化的理由。所有 spin 仍受原固定 `spin_max` 约束，timeout 仍写 sticky failure 并退出。
 
 这里的 exact 指**代数上不引入量化/近似项**；W_down 被按 rank/stream 重新结合后，F32 加法顺序与旧 kernel 不同，因此不承诺逐位相同。RMS finalize 仍沿用每 stream 512-lane tree，scatter 也沿用原 Q8 inject 的 FMA/scale 顺序，以把差异限制在 LateBind 本身不可避免的线性重结合。scatter scratch 与 relay payload 同样按双 bank 复用，不按 plan 分配小块 device memory。
 
-该实现只做源码与静态编译验收，未执行 GPU/model。生产比较基线仍是用户实测的 F32、48 AllReduce、attention replicate、五卡 2475 MHz 的 52.47 tok/s。
+#### 正交优化规则：MMVQ、Qwen region fusion、producer transport、LateBind
+
+2026-09-21 的源码审计确认两个旧环境开关曾混合了“功能选择”和“实现质量”：
+
+- `GGML_VK_DISABLE_MMVQ=1` 原本用于数值验收；当前 AMD 单 token heuristic 会对许多 `k>=2048` 的 GEMV 选择 MMVQ。旧代码又把“MMVQ 会被选择”当成 HC/MoE/Attention/GDN **region fusion 的否决条件**，导致局部 GEMV heuristic 可以拆掉更大范围融合。新规则是：**region fusion 一旦满足自己的形状、别名和数学契约，就拥有这些节点；region 内部再对各 contraction 选择 native DMMV 或 MMVQ。** Attention/GDN 多投影只量化一次共享 F32 activation 为 Q8_1，兄弟 projection 共用；Q5_K terminal projection 的 MMVQ 也有 local-wire/direct-RELAY epilogue variant。只有没有被 region 消费的 standalone matvec 才继续走通用 MMVQ/DMMV heuristic。低层选择不得关闭高层优化。
+- `GGML_VK_DISABLE_PRODUCER_WIRE=1` 曾同时控制 device-local companion 与 direct-host producer。两者现拆开：F16 可继续由 producer 生成 local companion，再由 P1 搬运；F32 本来就是所需 wire 表示，默认直接从正常 VRAM output 进入 P1；把 external-host scalar store 塞进主 producer 的 direct-host 路径改为显式 `GGML_TP5_DIRECT_PRODUCER_HOST=1` 实验，不再自动抢占。
+- RELAY P1 不因放弃 direct-host 而退回低质量搬运。F32/已打包 F16 增加 descriptor-based 128-bit vector copy，避免 external-host BDA 依赖；F32→F16 fallback 也增加 `vec4→f16vec4` pack。非对齐/尾部形状保留原安全 fallback。
+- LateBind consumer capture、attention replicate、producer transport、MMVQ contraction 与 QSA/GDN head mapping 均按语义层正交组合。QSA 显式 headmap 现在继续命中 fused Attention region；Vulkan/CPU 的 indexed RERoT 路径也使用同一 canonical Q→KV map，而不是因为非均匀 local GQA 比例退回或拒绝。任何一个开关或 cost model 都不得以“启用自己”为理由静默关闭其它已合法优化；只有同一数学 contraction 的互斥实现（例如 exact LateBind 已替代的 W_down 与 activation-Q8 近似 W_down）才由 region 内 selector 选择其一。
+
+这批改动在用户下一轮真机测试前只做源码、shader 编译与链接验收；不将静态结果冒充性能收益。历史黄金工作负载仍是 F32、attention replicate、五卡 2475 MHz、171-token natural-stop 计数请求；旧 OMP 记录的 52.47 tok/s 仅作为复现参考，新默认路径必须重新配对测量。
 
 **演进历史说明**：本文第 0–28 节源于 2026-09-12 设计初稿；附录 C 记录 2026-09-13 目标机实施与真机首轮直连数据；正文开篇与文末《TP5-FAST》及《收敛与优化指导》记录 2026-09-14 重新插卡验证、物理内存审计、ioctl 剖析、`llama_tp5_plan` 统合接入、实验性 gpuflag 机制及最新收敛路线。凡设计初稿中标记为“拟实现项/拟新增”的模块（如 `llama_tp5_plan`、`tp5-inspect-model.py`、`tp5-manifest.json`、Vulkan collective、命令重放等），均已在当前 master 源码树中实现并按工程规范部署。
 
