@@ -16370,11 +16370,12 @@ static void ggml_vk_segment_project(ggml_backend_vk_context * ctx,
     const ggml_tensor *             weights = matmul->src[0];
     const uint32_t                  k       = static_cast<uint32_t>(weights->ne[0]);
     const uint32_t                  m       = static_cast<uint32_t>(output->ne[0]);
+    const uint32_t                  n_rows  = static_cast<uint32_t>(output->ne[1]);
     const uint32_t output_flags = output == ctx->wire_producer && ctx->wire_local_elision_safe ?
                                       MAT_VEC_FUSION_FLAGS_TP5_ELIDE_LOCAL : 0u;
     const vk_mat_vec_push_constants pc{ k, k, k, m, static_cast<uint32_t>(ggml_nelements(weights)), k, m,
                                         output_flags, 0,
-                                        1, 1, 1, 1 };
+                                        1, n_rows, n_rows, 1 };
     const vk_subbuffer              out = ggml_vk_tensor_subbuffer(ctx, output);
     vk_subbuffer b_sub = b_override ? *b_override : ggml_vk_tensor_subbuffer(ctx, input);
     vk_pipeline contraction = pipeline;
@@ -16402,9 +16403,9 @@ static void ggml_vk_segment_project(ggml_backend_vk_context * ctx,
         ggml_vk_tensor_subbuffer(ctx, weights), b_sub, out,
         extra ? ggml_vk_tensor_subbuffer(ctx, extra) : out, out };
     if (output_tail) {
-        ggml_vk_dispatch_output_tail(ctx, subctx, contraction, descriptors, pc, { m, 1, 1 });
+        ggml_vk_dispatch_output_tail(ctx, subctx, contraction, descriptors, pc, { m, n_rows, 1 });
     } else {
-        ggml_vk_dispatch_pipeline(ctx, subctx, contraction, descriptors, pc, { m, 1, 1 });
+        ggml_vk_dispatch_pipeline(ctx, subctx, contraction, descriptors, pc, { m, n_rows, 1 });
     }
 }
 
