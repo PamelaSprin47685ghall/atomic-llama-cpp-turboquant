@@ -5,14 +5,18 @@
 //
 // Evaluates:
 // 1. Numerical parity: verifies that ggml_flash_attn_ext on Vulkan produces
-//    active-query outputs matching the canonical CPU reference operator.
+//    active-query outputs matching the canonical CPU reference operator across
+//    both standard MHA, Grouped Query Attention (GQA, Hq > Hkv), and quantized KV (Q8_0).
 // 2. State tail isolation: verifies that changing inactive KV token inputs
 //    [n_past + active, n_past + capacity) between sentinel/poison values
 //    (-999.0f vs +888.0f) produces bit-identical active-query outputs on GPU.
 // 3. Mask & boundary enforcement: verifies that inactive queries [active, capacity)
 //    and inactive KV slots are completely masked by -INFINITY in the KQ mask
 //    without triggering GPUVM fault or invalid memory access.
-// 4. Capacity envelope: evaluates C in {4, 8} and A in {1, 2, C}.
+// 4. Capacity & configuration envelope:
+//    - C in {4, 8} and A in {1, 2, C}
+//    - Head configurations: MHA (4:4) and GQA (4:1, 8:2)
+//    - Precision formats: F32 KV and Q8_0 quantized KV
 // 5. Graceful skip: exits cleanly (0) when Vulkan backend or device 0 is unavailable.
 
 #include "ggml.h"
@@ -68,21 +72,41 @@ struct fa_capacity_tensors {
     ggml_tensor * out  = nullptr; // [hsv, hq, capacity, 1]
 };
 
+static bool quantize_row_data(ggml_type type, const float * src, void * dst, int64_t n) {
+    if (type == GGML_TYPE_F32) {
+        std::memcpy(dst, src, n * sizeof(float));
+        return true;
+    }
+    if (type == GGML_TYPE_F16) {
+        ggml_fp32_to_fp16_row(src, (ggml_fp16_t *) dst, n);
+        return true;
+    }
+    if (type == GGML_TYPE_Q8_0) {
+        const auto * traits = ggml_get_type_traits(type);
+        if (!traits || !traits->from_float_ref) return false;
+        traits->from_float_ref(src, dst, n);
+        return true;
+    }
+    return false;
+}
+
 static fa_capacity_tensors build_fa_capacity_graph(
         ggml_context * ctx,
         int64_t capacity,
-        int64_t n_past) {
+        int64_t n_past,
+        int64_t hq,
+        int64_t hkv,
+        ggml_type type_k,
+        ggml_type type_v) {
 
     const int64_t hsk = 128;
     const int64_t hsv = 128;
-    const int64_t hq  = 4;
-    const int64_t hkv = 4;
     const int64_t n_kv = n_past + capacity;
 
     fa_capacity_tensors t;
     t.q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, capacity, hq, 1);
-    t.k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, n_kv, hkv, 1);
-    t.v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsv, n_kv, hkv, 1);
+    t.k    = ggml_new_tensor_4d(ctx, type_k,        hsk, n_kv,     hkv, 1);
+    t.v    = ggml_new_tensor_4d(ctx, type_v,        hsv, n_kv,     hkv, 1);
     t.mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, capacity, 1, 1);
 
     const float scale = 1.0f / std::sqrt((float)hsk);
@@ -98,15 +122,17 @@ static void fill_fa_tensors(
         int64_t capacity,
         int64_t active,
         int64_t n_past,
+        int64_t hq,
+        int64_t hkv,
+        ggml_type type_k,
+        ggml_type type_v,
         float tail_poison_val) {
 
     const int64_t hsk  = 128;
     const int64_t hsv  = 128;
-    const int64_t hq   = 4;
-    const int64_t hkv  = 4;
     const int64_t n_kv = n_past + capacity;
 
-    // 1. Q: [hsk, capacity, hq, 1]
+    // 1. Q: [hsk, capacity, hq, 1], F32
     // Active queries get deterministic non-zero test patterns; inactive queries get 0.0f
     {
         std::vector<float> q_data(ggml_nelements(t.q), 0.0f);
@@ -121,45 +147,48 @@ static void fill_fa_tensors(
         ggml_backend_tensor_set(t.q, q_data.data(), 0, q_data.size() * sizeof(float));
     }
 
-    // 2. K: [hsk, n_kv, hkv, 1]
-    // Valid history + new active tokens get deterministic features;
-    // Inactive capacity tail [n_past + active, n_kv) gets tail_poison_val
+    // 2. K: [hsk, n_kv, hkv, 1], supports F32 and Q8_0
     {
-        std::vector<float> k_data(ggml_nelements(t.k), 0.0f);
+        const size_t k_row_size = ggml_row_size(type_k, hsk);
+        const size_t k_total_bytes = (size_t)hkv * n_kv * k_row_size;
+        std::vector<uint8_t> k_bytes(k_total_bytes, 0);
+        std::vector<float> row_buf(hsk);
+
         for (int64_t h = 0; h < hkv; ++h) {
             for (int64_t kv_idx = 0; kv_idx < n_kv; ++kv_idx) {
                 const bool is_active = (kv_idx < n_past + active);
                 for (int64_t d = 0; d < hsk; ++d) {
-                    size_t idx = (size_t)h * (n_kv * hsk) + kv_idx * hsk + d;
-                    if (is_active) {
-                        k_data[idx] = std::cos((float)(idx + 1) * 0.13f) * 0.5f;
-                    } else {
-                        k_data[idx] = tail_poison_val;
-                    }
+                    size_t seed_idx = (size_t)h * (n_kv * hsk) + kv_idx * hsk + d;
+                    row_buf[d] = is_active ? (std::cos((float)(seed_idx + 1) * 0.13f) * 0.5f) : tail_poison_val;
                 }
+                size_t byte_offset = ((size_t)h * n_kv + kv_idx) * k_row_size;
+                bool ok = quantize_row_data(type_k, row_buf.data(), k_bytes.data() + byte_offset, hsk);
+                GGML_ASSERT(ok && "quantize K row failed");
             }
         }
-        ggml_backend_tensor_set(t.k, k_data.data(), 0, k_data.size() * sizeof(float));
+        ggml_backend_tensor_set(t.k, k_bytes.data(), 0, k_total_bytes);
     }
 
-    // 3. V: [hsv, n_kv, hkv, 1]
-    // Same active vs inactive tail partition
+    // 3. V: [hsv, n_kv, hkv, 1], supports F32 and Q8_0
     {
-        std::vector<float> v_data(ggml_nelements(t.v), 0.0f);
+        const size_t v_row_size = ggml_row_size(type_v, hsv);
+        const size_t v_total_bytes = (size_t)hkv * n_kv * v_row_size;
+        std::vector<uint8_t> v_bytes(v_total_bytes, 0);
+        std::vector<float> row_buf(hsv);
+
         for (int64_t h = 0; h < hkv; ++h) {
             for (int64_t kv_idx = 0; kv_idx < n_kv; ++kv_idx) {
                 const bool is_active = (kv_idx < n_past + active);
                 for (int64_t d = 0; d < hsv; ++d) {
-                    size_t idx = (size_t)h * (n_kv * hsv) + kv_idx * hsv + d;
-                    if (is_active) {
-                        v_data[idx] = std::sin((float)(idx + 1) * 0.11f) * 0.5f;
-                    } else {
-                        v_data[idx] = tail_poison_val;
-                    }
+                    size_t seed_idx = (size_t)h * (n_kv * hsv) + kv_idx * hsv + d;
+                    row_buf[d] = is_active ? (std::sin((float)(seed_idx + 1) * 0.11f) * 0.5f) : tail_poison_val;
                 }
+                size_t byte_offset = ((size_t)h * n_kv + kv_idx) * v_row_size;
+                bool ok = quantize_row_data(type_v, row_buf.data(), v_bytes.data() + byte_offset, hsv);
+                GGML_ASSERT(ok && "quantize V row failed");
             }
         }
-        ggml_backend_tensor_set(t.v, v_data.data(), 0, v_data.size() * sizeof(float));
+        ggml_backend_tensor_set(t.v, v_bytes.data(), 0, v_total_bytes);
     }
 
     // 4. KQ Mask: [n_kv, capacity, 1, 1], type F16
@@ -186,15 +215,21 @@ static bool test_fa_capacity_case(
         backend_holder & fix,
         int64_t capacity,
         int64_t active,
-        int64_t n_past) {
+        int64_t n_past,
+        int64_t hq,
+        int64_t hkv,
+        ggml_type type_k,
+        ggml_type type_v,
+        const char * desc) {
 
-    std::fprintf(stderr, "== Test FA Capacity: C=%lld, A=%lld, n_past=%lld ==\n",
-                 (long long)capacity, (long long)active, (long long)n_past);
+    std::fprintf(stderr, "== Test FA Capacity: %s [C=%lld, A=%lld, n_past=%lld, Hq=%lld, Hkv=%lld, K=%s, V=%s] ==\n",
+                 desc, (long long)capacity, (long long)active, (long long)n_past,
+                 (long long)hq, (long long)hkv, ggml_type_name(type_k), ggml_type_name(type_v));
 
     const size_t ctx_size = 16 * 1024 * 1024;
     const int64_t hsv = 128;
-    const int64_t hq  = 4;
     const size_t active_output_elems = (size_t)active * hq * hsv;
+    const float parity_tol = (type_k == GGML_TYPE_F32 && type_v == GGML_TYPE_F32) ? 1e-3f : 2e-2f;
 
     std::vector<float> gpu_out_run1;
     std::vector<float> gpu_out_run2;
@@ -206,7 +241,7 @@ static bool test_fa_capacity_case(
         ggml_context * ctx = ggml_init(params);
         CHECK_TRUE(ctx != nullptr, "ctx init");
 
-        auto t = build_fa_capacity_graph(ctx, capacity, n_past);
+        auto t = build_fa_capacity_graph(ctx, capacity, n_past, hq, hkv, type_k, type_v);
 
         ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, t.out);
@@ -214,7 +249,7 @@ static bool test_fa_capacity_case(
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, fix.gpu);
         CHECK_TRUE(buf != nullptr, "gpu buf alloc");
 
-        fill_fa_tensors(fix.gpu, t, capacity, active, n_past, -999.0f);
+        fill_fa_tensors(fix.gpu, t, capacity, active, n_past, hq, hkv, type_k, type_v, -999.0f);
 
         ggml_status st = ggml_backend_graph_compute(fix.gpu, gf);
         CHECK_TRUE(st == GGML_STATUS_SUCCESS, "gpu graph compute failed (run 1)");
@@ -232,7 +267,7 @@ static bool test_fa_capacity_case(
         ggml_context * ctx = ggml_init(params);
         CHECK_TRUE(ctx != nullptr, "ctx init");
 
-        auto t = build_fa_capacity_graph(ctx, capacity, n_past);
+        auto t = build_fa_capacity_graph(ctx, capacity, n_past, hq, hkv, type_k, type_v);
 
         ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, t.out);
@@ -240,7 +275,7 @@ static bool test_fa_capacity_case(
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, fix.gpu);
         CHECK_TRUE(buf != nullptr, "gpu buf alloc");
 
-        fill_fa_tensors(fix.gpu, t, capacity, active, n_past, +888.0f);
+        fill_fa_tensors(fix.gpu, t, capacity, active, n_past, hq, hkv, type_k, type_v, +888.0f);
 
         ggml_status st = ggml_backend_graph_compute(fix.gpu, gf);
         CHECK_TRUE(st == GGML_STATUS_SUCCESS, "gpu graph compute failed (run 2)");
@@ -258,7 +293,7 @@ static bool test_fa_capacity_case(
         ggml_context * ctx = ggml_init(params);
         CHECK_TRUE(ctx != nullptr, "ctx init");
 
-        auto t = build_fa_capacity_graph(ctx, capacity, n_past);
+        auto t = build_fa_capacity_graph(ctx, capacity, n_past, hq, hkv, type_k, type_v);
 
         ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, t.out);
@@ -266,7 +301,7 @@ static bool test_fa_capacity_case(
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, fix.cpu);
         CHECK_TRUE(buf != nullptr, "cpu buf alloc");
 
-        fill_fa_tensors(fix.cpu, t, capacity, active, n_past, -999.0f);
+        fill_fa_tensors(fix.cpu, t, capacity, active, n_past, hq, hkv, type_k, type_v, -999.0f);
 
         ggml_status st = ggml_backend_graph_compute(fix.cpu, gf);
         CHECK_TRUE(st == GGML_STATUS_SUCCESS, "cpu graph compute failed");
@@ -295,12 +330,11 @@ static bool test_fa_capacity_case(
         for (size_t d = 0; d < (size_t)hq * hsv; ++d) {
             size_t idx = row_offset + d;
             CHECK_TRUE(std::isfinite(gpu_out_run1[idx]), "GPU output is not finite (NaN/Inf)");
-            CHECK_CLOSE(gpu_out_run1[idx], cpu_out[idx], 1e-3f, "active query output parity with CPU reference");
+            CHECK_CLOSE(gpu_out_run1[idx], cpu_out[idx], parity_tol, "active query output parity with CPU reference");
         }
     }
 
-    std::fprintf(stderr, "  PASSED (C=%lld, A=%lld, n_past=%lld)\n",
-                 (long long)capacity, (long long)active, (long long)n_past);
+    std::fprintf(stderr, "  PASSED: %s\n", desc);
     return true;
 }
 
@@ -330,26 +364,44 @@ int main() {
         int64_t capacity;
         int64_t active;
         int64_t n_past;
+        int64_t hq;
+        int64_t hkv;
+        ggml_type type_k;
+        ggml_type type_v;
+        const char * desc;
     };
 
-    // Test matrix covering:
-    // 1. C = 4 with A in {1, 2, 4} and n_past = 8 (typical decode & target verification)
-    // 2. C = 8 with A in {1, 4, 8} and n_past = 16 (maximum capacity envelope)
-    // 3. n_past = 0 edge case (prefill / zero prior context)
+    // Extended test matrix covering:
+    // 1. MHA F32 baseline: C in {4, 8}, A in {1, 2, C}
+    // 2. GQA F32 (4:1 and 4:2 ratio): C in {4, 8}, A < C
+    // 3. MHA Q8_0 quantized KV: C = 4, A = 2
+    // 4. Production Target Config: GQA 4:1 with Q8_0 quantized KV (C=4, A=2 and C=8, A=4)
+    // 5. Zero-past edge case (Prefill boundary)
     const std::vector<test_case> cases = {
-        {4, 1, 8},
-        {4, 2, 8},
-        {4, 4, 8},
-        {8, 1, 16},
-        {8, 4, 16},
-        {8, 8, 16},
-        {4, 2, 0},
+        // --- 1. MHA F32 Baseline ---
+        {4, 1, 8, 4, 4, GGML_TYPE_F32, GGML_TYPE_F32, "MHA F32 C=4 A=1"},
+        {4, 2, 8, 4, 4, GGML_TYPE_F32, GGML_TYPE_F32, "MHA F32 C=4 A=2"},
+        {4, 4, 8, 4, 4, GGML_TYPE_F32, GGML_TYPE_F32, "MHA F32 C=4 A=4"},
+        {8, 1, 16, 4, 4, GGML_TYPE_F32, GGML_TYPE_F32, "MHA F32 C=8 A=1"},
+        {8, 4, 16, 4, 4, GGML_TYPE_F32, GGML_TYPE_F32, "MHA F32 C=8 A=4"},
+        {8, 8, 16, 4, 4, GGML_TYPE_F32, GGML_TYPE_F32, "MHA F32 C=8 A=8"},
+        {4, 2, 0, 4, 4, GGML_TYPE_F32, GGML_TYPE_F32, "MHA F32 C=4 A=2 n_past=0"},
+
+        // --- 2. GQA F32 (Grouped Query Attention) ---
+        {4, 2, 8, 4, 1, GGML_TYPE_F32, GGML_TYPE_F32, "GQA 4:1 F32 C=4 A=2"},
+        {8, 4, 16, 8, 2, GGML_TYPE_F32, GGML_TYPE_F32, "GQA 4:1 F32 C=8 A=4"},
+
+        // --- 3. MHA Q8_0 Quantized KV ---
+        {4, 2, 8, 4, 4, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, "MHA Q8_0 C=4 A=2"},
+
+        // --- 4. Production Target Alignment: GQA + Q8_0 Quantized KV ---
+        {4, 2, 8, 4, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, "Production GQA 4:1 Q8_0 C=4 A=2"},
+        {8, 4, 16, 8, 2, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, "Production GQA 4:1 Q8_0 C=8 A=4"},
     };
 
     for (const auto & tc : cases) {
-        if (!test_fa_capacity_case(fix, tc.capacity, tc.active, tc.n_past)) {
-            std::fprintf(stderr, "FAILED on C=%lld, A=%lld, n_past=%lld\n",
-                         (long long)tc.capacity, (long long)tc.active, (long long)tc.n_past);
+        if (!test_fa_capacity_case(fix, tc.capacity, tc.active, tc.n_past, tc.hq, tc.hkv, tc.type_k, tc.type_v, tc.desc)) {
+            std::fprintf(stderr, "FAILED on case: %s\n", tc.desc);
             return 1;
         }
     }
