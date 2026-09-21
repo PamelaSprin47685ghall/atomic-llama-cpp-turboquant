@@ -46,6 +46,13 @@ layout(std430, binding = 1) readonly buffer InjectInput {
 layout(std430, binding = 2) writeonly buffer Scatter {
     float scatter[];
 };
+// Runtime active-row count published by the CPU in the RELAY broadcast header
+// (word 5) before this precompute command buffer is submitted. The push
+// constant keeps the capacity only as a fail-safe fallback; a maximum-capacity
+// definition must not execute padded-row work (M3 invariant 2).
+layout(std430, binding = 3) readonly buffer RowsHeader {
+    uint rows_header[];
+};
 
 layout(push_constant) uniform InjectParams {
     uint width;
@@ -59,9 +66,10 @@ void main() {
     if (stream >= p.streams) {
         return;
     }
+    const uint active_rows = rows_header[5u] != 0u ? rows_header[5u] : p.active_rows;
     const uint k_dim = p.width * p.streams;
     [[unroll]] for (uint token = 0u; token < 4u; ++token) {
-        if (token >= p.active_rows) break;
+        if (token >= active_rows) break;
         float acc = 0.0;
         const uint token_x_offset = token * k_dim;
         for (uint col = 8u * lane; col < k_dim; col += 8u * 256u) {
@@ -110,6 +118,10 @@ layout(std430, binding = 0) readonly buffer UpWeightsQ8 { late_q8_0 up_w[]; };
 layout(std430, binding = 1) readonly buffer LoQ8Input { late_q8_0 lo_q8_in[]; };
 layout(std430, binding = 2) readonly buffer NormalizedInput { float norm_in[]; };
 layout(std430, binding = 3) writeonly buffer MixedOutput { float mixed_out[]; };
+// Runtime active rows from the RELAY broadcast header (word 5).
+layout(std430, binding = 4) readonly buffer RowsHeader {
+    uint rows_header[];
+};
 
 layout(push_constant) uniform UpQ8Params {
     uint width;
@@ -128,11 +140,12 @@ shared vec4 up_partial[240]; // 24 rows * 10 R320 blocks
 void main() {
     const uint lane = gl_SubgroupInvocationID;
     if (p.rank_dim != 320u || p.streams != 4u || p.rows_per_wg != 24u || gl_NumSubgroups != 8u) return;
+    const uint active_rows = rows_header[5u] != 0u ? rows_header[5u] : p.active_rows;
     const uint blocks = 10u;
     const uint wave = gl_SubgroupID;
 
     [[unroll]] for (uint token = 0u; token < 4u; ++token) {
-        if (token >= p.active_rows) break;
+        if (token >= active_rows) break;
         if (lane < 30u) {
             const uint wave_row = lane / 10u;
             const uint block = lane - wave_row * 10u;
@@ -191,6 +204,10 @@ layout(std430, binding = 1) readonly buffer Residual { float residual[]; };
 layout(std430, binding = 2) readonly buffer LocalZ { float local_z[]; };
 layout(std430, binding = 3) readonly buffer Scatter { float scatter[]; };
 layout(std430, binding = 4) writeonly buffer ActivationQ8 { late_q8_0 act_q8[]; };
+// Runtime active rows from the RELAY broadcast header (word 5).
+layout(std430, binding = 5) readonly buffer RowsHeader {
+    uint rows_header[];
+};
 
 layout(push_constant) uniform ActQ8Params {
     uint width;
@@ -210,9 +227,10 @@ void main() {
     const uint block = gl_WorkGroupID.x * 2u + block_slot;
     const uint blocks = p.width / 32u;
     if (p.streams != 4u || gl_NumSubgroups != 8u || (blocks & 1u) != 0u || block >= blocks) return;
+    const uint active_rows = rows_header[5u] != 0u ? rows_header[5u] : p.active_rows;
 
     [[unroll]] for (uint token = 0u; token < 4u; ++token) {
-        if (token >= p.active_rows) break;
+        if (token >= active_rows) break;
         const uint col = block * 32u + lane;
         const uint global_col = stream * p.width + col;
         if (stream == 0u) z_shared[block_slot * 32u + lane] = local_z[token * p.width + col];
@@ -277,6 +295,8 @@ int32_t pack_q8_pair(const int16_t a, const int16_t b) {
 
 void main() {
     if (p.streams != 4u || p.rows_per_wg != 16u || gl_WorkGroupID.x >= p.n_workgroups) return;
+    // qmail[5] is RELAY header word 5: the CPU-published active-row count.
+    const uint active_rows = qmail[5u] != 0u ? qmail[5u] : p.active_rows;
     const uint lid = gl_LocalInvocationID.x;
     const uint row_slot = lid >> 4u;
     const uint lane16 = lid & 15u;
@@ -284,7 +304,7 @@ void main() {
     const uint blocks = p.width / 32u;
 
     [[unroll]] for (uint token = 0u; token < 4u; ++token) {
-        if (token >= p.active_rows) break;
+        if (token >= active_rows) break;
         vec4 acc = vec4(0.0);
         const uint token_act_offset = token * (p.streams * blocks);
         for (uint block = lane16; block < blocks; block += 16u) {
@@ -364,6 +384,10 @@ layout(std430, binding = 4) readonly buffer Scatter {
 layout(std430, binding = 5) writeonly buffer LateOut {
     float q_out[];
 };
+// Runtime active rows from the RELAY broadcast header (word 5).
+layout(std430, binding = 6) readonly buffer RowsHeader {
+    uint rows_header[];
+};
 
 layout(push_constant) uniform QParams {
     uint width;
@@ -380,9 +404,10 @@ void main() {
         return;
     }
     const uint k_dim = p.width * p.streams;
+    const uint active_rows = rows_header[5u] != 0u ? rows_header[5u] : p.active_rows;
 
     [[unroll]] for (uint token = 0u; token < 4u; ++token) {
-        if (token >= p.active_rows) break;
+        if (token >= active_rows) break;
         float acc[4] = { 0.0, 0.0, 0.0, 0.0 };
         const vec4 scatter4 = vec4(
             scatter[token * p.streams + 0u],

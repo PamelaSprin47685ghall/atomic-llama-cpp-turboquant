@@ -207,3 +207,37 @@ M3 实施必须以以下三条为不可谈判前提，本文所有双长度契�
 - 缓存段变体（`fused_gdn_cached_segment`）；
 - RBB 模式（`op_params[1] != 0`）；
 - Chunking 分块循环路径。
+
+### 7.5 M4 首步：LateBind 内核运行时有效行（已合入）
+
+**问题（M3 不变量 2 的现存违反）**：LateBind 全部内核（inject / ACT_Q8 / Q / Q8DOT /
+norm / LO / UP_Q8DOT）的 push constant 把 `late.capacity_rows` 当作执行行数烘焙，
+1 行 MTP draft 在容量 4 定义下执行 4 行的 late 工作——CPU 侧 payload/sidecar 归约
+早已按 active 计数，GPU 侧却按容量付费。
+
+**修复（单一运行时行源，零重录）**：
+
+1. **RELAY 广播 header word 5 作为运行时有效行的唯一发布点。** CPU 在提交前写入
+   （chain 路径在 `tp5_relay_submit_epoch_chain` 首个 bank；后续 bank 在 pre-arm
+   `tp5_relay_arm_bank` 传递信用验证后写入；one-shot 路径提交前写入，无帧则写 0）。
+   Word 5 位于 64 字节 header 内，与 generation（word 0/2）、counter（word 1）、
+   n_elems（word 3）互不重叠，relay probe 的 word 4 也不受影响。
+2. **全部 7 个 late 内核改为读 word 5 截断 token 循环**，push constant 的容量仅作
+   word 5 == 0 时的回退（非预定义 legacy 路径行为不变）。Q8DOT 经既有 QMailbox
+   binding 读 `qmail[5]`；norm/LO 经既有 Inbox binding 读 `inbox[5]`；
+   inject/ACT_Q8/Q/UP 新增一个只读 RowsHeader binding（绑定号各自追加，DSL 计数
+   3→4 / 5→6 / 6→7 / 4→5）。
+3. **inject 描述符改为每 bank**（原为每 rank 单份，因新增 bcast 依赖必须随 bank 切换），
+   `late_inject_ds` 尺寸与释放路径同步改为 `n_ranks * BANKS`。
+
+**写入时机与安全**：chain 首个 bank 在 `ensure_armed_epoch` 验证空闲后写入；后续
+bank 在 pre-arm 传递信用（上一读者完成）后、且下一消费者必须等到 generation 发布
+才能通过门铃等待的窗口内写入。无新增自旋、无 `vkDeviceWaitIdle`、无动态上限重试。
+
+**验证**：`test-tp5-plan` 新增 `test_tp5_latebind_runtime_rows_protocol`（word 5
+位置/发布值/legacy 回退/1→4→1→2 序列）；15/15 ctest 全绿（含 5 卡 mesh
+RELAY/STAR 96 轮 + 变异输入 + 延迟生产者）；GPU 空闲、内核零新增错误。
+relay probe 的 `consumer failed` 为基线既有行为（stash 前后一致），非本轮回归。
+
+**仍未闭合**：latebind GPU 路径的端到端真机验证需要真实模型（HC 图 + MTP 会话），
+须按 AGENTS.md 安全门获批后进行；本轮仅覆盖传输层回归与 CPU 协议测试。

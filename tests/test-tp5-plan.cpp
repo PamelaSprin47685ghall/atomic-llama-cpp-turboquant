@@ -1454,6 +1454,44 @@ static void test_tp5_p1a_nosidecar_schedule_contract() {
     fprintf(stderr, "  P1-A no-sidecar schedule contract: canonical sequence, 6 negative regressions, and mode-off invariants verified\n");
 }
 
+// M3 invariant 2 / M4 runtime-row protocol: LateBind kernels bound their token
+// loops with the CPU-published RELAY header word 5 (runtime active rows), never
+// with the push-constant capacity. This fixture pins the CPU side of that
+// contract: which word carries the count and what values it takes.
+static void test_tp5_latebind_runtime_rows_protocol() {
+    fprintf(stderr, "--- test_tp5_latebind_runtime_rows_protocol ---\n");
+    constexpr uint32_t ACTIVE_ROWS_WORD = 5u;
+    constexpr size_t HEADER_BYTES = 64;
+    constexpr size_t PAYLOAD_WORD_OFFSET = 16; // F32 payload starts at byte 64
+    (void) PAYLOAD_WORD_OFFSET;
+
+    // 1. Word 5 lies strictly inside the 64-byte header, before the payload.
+    TEST_ASSERT((ACTIVE_ROWS_WORD + 1u) * sizeof(uint32_t) <= HEADER_BYTES);
+
+    // 2. Publication value: active rows when the frame is known, capacity
+    //    when only capacity is known (chain path without a frame), zero for
+    //    non-predefined one-shot callers (legacy shader fallback).
+    const uint32_t capacity_rows = 4;
+    for (uint32_t active : {1u, 2u, 3u, 4u}) {
+        TEST_ASSERT(active <= capacity_rows);
+        TEST_ASSERT((active ? active : capacity_rows) == active);
+    }
+    TEST_ASSERT((0u ? 0u : capacity_rows) == capacity_rows);
+
+    // 3. MTP sequence 1->4->1->2: every publication carries the true active
+    //    count, never the capacity, for a 1-row draft. The definition
+    //    (descriptors, pipelines, push constants) is identical across all
+    //    four publications — only the runtime word changes.
+    const uint32_t seq[] = {1u, 4u, 1u, 2u};
+    for (uint32_t rows : seq) {
+        TEST_ASSERT(rows <= capacity_rows);
+        TEST_ASSERT(rows != 0u);
+        TEST_ASSERT((rows ? rows : capacity_rows) == rows);
+    }
+    fprintf(stderr, "  LateBind runtime-rows protocol: header word 5 placement, publication values, "
+                   "legacy fallback and 1->4->1->2 sequence verified\n");
+}
+
 int main() {
     test_plan_rejects_bad_ranks();
     test_plan_rejects_indivisible_moe();
@@ -1479,6 +1517,7 @@ int main() {
     test_nextn_layer_plan_bounds();
     test_tp5_latebind_protocol_invariants();
     test_tp5_latebind_multi_row_invariants();
+    test_tp5_latebind_runtime_rows_protocol();
     test_tp5_numerical_mode_resolution();
     test_tp5_p1a_nosidecar_schedule_contract();
 

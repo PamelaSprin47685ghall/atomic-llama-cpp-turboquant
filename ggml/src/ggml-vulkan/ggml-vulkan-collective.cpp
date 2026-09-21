@@ -1018,12 +1018,14 @@ struct tp5_comm {
                 plan.late_up_q8dot_ds[idx] = VK_NULL_HANDLE;
             }
         }
-        for (size_t i = 0; i < plan.late_inject_ds.size() && i < n_ranks; ++i) {
+        for (size_t idx = 0; idx < plan.late_inject_ds.size(); ++idx) {
+            const size_t i = idx / TP5_MAILBOX_BANKS;
+            if (i >= n_ranks) break;
             auto & r = ranks[i];
-            if (plan.late_inject_ds[i] != VK_NULL_HANDLE && r.vkdev != VK_NULL_HANDLE &&
-                r.desc_pool != VK_NULL_HANDLE) {
-                vkFreeDescriptorSets(r.vkdev, r.desc_pool, 1, &plan.late_inject_ds[i]);
-                plan.late_inject_ds[i] = VK_NULL_HANDLE;
+            if (idx < plan.late_inject_ds.size() && plan.late_inject_ds[idx] != VK_NULL_HANDLE &&
+                r.vkdev != VK_NULL_HANDLE && r.desc_pool != VK_NULL_HANDLE) {
+                vkFreeDescriptorSets(r.vkdev, r.desc_pool, 1, &plan.late_inject_ds[idx]);
+                plan.late_inject_ds[idx] = VK_NULL_HANDLE;
             }
         }
         for (size_t i = 0; i < plan.late_scatter_buf.size() && i < n_ranks; ++i) {
@@ -1490,9 +1492,9 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
                 vkDestroyShaderModule(r.vkdev, mod, nullptr);
                 return made;
             };
-            if (!make_late(3, 12, tp5_hc_late_inject_data, tp5_hc_late_inject_len,
+            if (!make_late(4, 12, tp5_hc_late_inject_data, tp5_hc_late_inject_len,
                            r.late_inject_dsl, r.late_inject_layout, r.late_inject_pipe) ||
-                !make_late(6, 20, tp5_hc_late_q_data, tp5_hc_late_q_len,
+                !make_late(7, 20, tp5_hc_late_q_data, tp5_hc_late_q_len,
                            r.late_q_dsl, r.late_q_layout, r.late_q_pipe) ||
                 !make_late(3, 4, tp5_hc_publish_data, tp5_hc_publish_len,
                            r.late_publish_dsl, r.late_publish_layout, r.late_publish_pipe) ||
@@ -1508,13 +1510,13 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
                 r.caps.subgroup_max_size >= 32u;
             if (q8_wave32) {
                 const bool q8_ok =
-                    make_late(5, 16, tp5_hc_late_act_q8_data, tp5_hc_late_act_q8_len,
+                    make_late(6, 16, tp5_hc_late_act_q8_data, tp5_hc_late_act_q8_len,
                               r.late_act_q8_dsl, r.late_act_q8_layout, r.late_act_q8_pipe, 32u) &&
                     make_late(3, 28, tp5_hc_late_q_q8dot_data, tp5_hc_late_q_q8dot_len,
                               r.late_q8dot_dsl, r.late_q8dot_layout, r.late_q8dot_pipe, 32u) &&
                     make_late(5, 32, tp5_hc_resume_lo_q8_data, tp5_hc_resume_lo_q8_len,
                               r.late_lo_q8_dsl, r.late_lo_q8_layout, r.late_lo_q8_pipe, 32u) &&
-                    make_late(4, 20, tp5_hc_late_up_q8dot_data, tp5_hc_late_up_q8dot_len,
+                    make_late(5, 20, tp5_hc_late_up_q8dot_data, tp5_hc_late_up_q8dot_len,
                               r.late_up_q8dot_dsl, r.late_up_q8dot_layout, r.late_up_q8dot_pipe, 32u);
                 if (!q8_ok) {
                     if (r.late_act_q8_pipe) vkDestroyPipeline(r.vkdev, r.late_act_q8_pipe, nullptr);
@@ -3283,7 +3285,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
         plan.late_q_contract_begin.resize(c.n_ranks * TP5_MAILBOX_BANKS);
         plan.late_norm_end.resize(c.n_ranks * TP5_MAILBOX_BANKS);
         plan.late_lo_begin.resize(c.n_ranks * TP5_MAILBOX_BANKS);
-        plan.late_inject_ds.resize(c.n_ranks, VK_NULL_HANDLE);
+        plan.late_inject_ds.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
         if (plan.late_q8_fast) {
             plan.late_act_q8_ds.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
             plan.late_q8dot_ds.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
@@ -3365,11 +3367,14 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     return false;
                 }
             }
-            VkDescriptorSetAllocateInfo inj_ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, r.desc_pool,
-                                                1, &r.late_inject_dsl};
-            if (vkAllocateDescriptorSets(r.vkdev, &inj_ai, &plan.late_inject_ds[i]) != VK_SUCCESS) {
-                c.fail("allocation of LateBind inject descriptor failed on rank " + std::to_string(i));
-                return false;
+            for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
+                VkDescriptorSetAllocateInfo inj_ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr,
+                                                    r.desc_pool, 1, &r.late_inject_dsl};
+                if (vkAllocateDescriptorSets(r.vkdev, &inj_ai,
+                                             &plan.late_inject_ds[tp5_plan_slot(i, b)]) != VK_SUCCESS) {
+                    c.fail("allocation of LateBind inject descriptor failed on rank " + std::to_string(i));
+                    return false;
+                }
             }
         }
         for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
@@ -3448,26 +3453,28 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
             const size_t max_rows = VK_TP5_DIRECT_COLUMN_TILE;
             const size_t late_count = max_rows * size_t(late.streams) * late.late_rank;
             VkDescriptorBufferInfo scatter_info{plan.late_scatter_buf[i], 0, max_rows * 4 * sizeof(float)};
-            VkDescriptorBufferInfo inject_infos[3] = {
-                {late.bindings[4].buffer, late.bindings[4].offset, late.bindings[4].size},
-                {late.bindings[5].buffer, late.bindings[5].offset, late.bindings[5].size},
-                scatter_info,
-            };
-            tp5_update_storage_set(r.vkdev, plan.late_inject_ds[i], inject_infos, 3);
 
             for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
                 const size_t idx = tp5_plan_slot(i, b);
+                VkDescriptorBufferInfo inject_infos[4] = {
+                    {late.bindings[4].buffer, late.bindings[4].offset, late.bindings[4].size},
+                    {late.bindings[5].buffer, late.bindings[5].offset, late.bindings[5].size},
+                    scatter_info,
+                    {r.bcast_buf[b], 0, (VkDeviceSize) c.star_rank_stride},
+                };
+                tp5_update_storage_set(r.vkdev, plan.late_inject_ds[idx], inject_infos, 4);
                 if (plan.late_q8_fast) {
                     const size_t act_elems = max_rows * size_t(late.streams) * late.width;
                     const VkDeviceSize act_q8_bytes = (VkDeviceSize) ggml_row_size(GGML_TYPE_Q8_0, act_elems);
-                    VkDescriptorBufferInfo act_q8_infos[5] = {
+                    VkDescriptorBufferInfo act_q8_infos[6] = {
                         {late.bindings[1].buffer, late.bindings[1].offset, late.bindings[1].size},
                         {late.bindings[0].buffer, late.bindings[0].offset, late.bindings[0].size},
                         {trefs[i].buf, trefs[i].offset, trefs[i].size},
                         scatter_info,
                         {plan.late_act_q8_buf[i], 0, act_q8_bytes},
+                        {r.bcast_buf[b], 0, (VkDeviceSize) c.star_rank_stride},
                     };
-                    tp5_update_storage_set(r.vkdev, plan.late_act_q8_ds[idx], act_q8_infos, 5);
+                    tp5_update_storage_set(r.vkdev, plan.late_act_q8_ds[idx], act_q8_infos, 6);
                     VkDescriptorBufferInfo q8dot_infos[3] = {
                         {late.down_weight.buffer, late.down_weight.offset, late.down_weight.size},
                         {plan.late_act_q8_buf[i], 0, act_q8_bytes},
@@ -3475,15 +3482,16 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     };
                     tp5_update_storage_set(r.vkdev, plan.late_q8dot_ds[idx], q8dot_infos, 3);
                 } else {
-                    VkDescriptorBufferInfo q_infos[6] = {
+                    VkDescriptorBufferInfo q_infos[7] = {
                         {late.down_weight.buffer, late.down_weight.offset, late.down_weight.size},
                         {late.bindings[1].buffer, late.bindings[1].offset, late.bindings[1].size},
                         {late.bindings[0].buffer, late.bindings[0].offset, late.bindings[0].size},
                         {trefs[i].buf, trefs[i].offset, trefs[i].size},
                         scatter_info,
                         {plan.late_sidecar_buf[i], 0, (VkDeviceSize) (late_count * sizeof(float))},
+                        {r.bcast_buf[b], 0, (VkDeviceSize) c.star_rank_stride},
                     };
-                    tp5_update_storage_set(r.vkdev, plan.late_q_ds[idx], q_infos, 6);
+                    tp5_update_storage_set(r.vkdev, plan.late_q_ds[idx], q_infos, 7);
                     VkDescriptorBufferInfo late_publish_infos[3] = {
                         {plan.late_sidecar_buf[i], 0, (VkDeviceSize) (late_count * sizeof(float))},
                         {r.host_import_buf[b], (VkDeviceSize) c.late_host_offset,
@@ -3519,13 +3527,14 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                         {plan.late_lo_q8_buf[i], 0, lo_q8_bytes},
                     };
                     tp5_update_storage_set(r.vkdev, plan.late_lo_q8_ds[idx], lo_q8_infos, 5);
-                    VkDescriptorBufferInfo up_q8_infos[4] = {
+                    VkDescriptorBufferInfo up_q8_infos[5] = {
                         {late.up_weight.buffer, late.up_weight.offset, late.up_weight.size},
                         {plan.late_lo_q8_buf[i], 0, lo_q8_bytes},
                         {late.bindings[3].buffer, late.bindings[3].offset, late.bindings[3].size},
                         {late.mixed.buffer, late.mixed.offset, late.mixed.size},
+                        {r.bcast_buf[b], 0, (VkDeviceSize) c.star_rank_stride},
                     };
-                    tp5_update_storage_set(r.vkdev, plan.late_up_q8dot_ds[idx], up_q8_infos, 4);
+                    tp5_update_storage_set(r.vkdev, plan.late_up_q8dot_ds[idx], up_q8_infos, 5);
                 } else {
                     tp5_update_storage_set(r.vkdev, plan.late_lo_ds[idx], lo_infos, 4);
                 }
@@ -3548,7 +3557,7 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
 
                 tp5_cmd_bind_pipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_inject_pipe);
                 tp5_cmd_bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_inject_layout, 0, 1,
-                                        &plan.late_inject_ds[i], 0, nullptr);
+                                        &plan.late_inject_ds[idx], 0, nullptr);
                 struct { uint32_t width, streams, active_rows; } inject_pc{
                     late.width, late.streams, late.capacity_rows ? late.capacity_rows : 1u};
                 static_assert(sizeof(inject_pc) == 12);
@@ -4348,7 +4357,7 @@ static void tp5_relay_request_abort(tp5_comm & c) {
 // published after P2(e-2) on the same queue, so the following handoff has
 // transitive ownership credit for reusing bank(e). Any broken ordering fails
 // closed.
-static bool tp5_relay_arm_bank(tp5_comm & c, uint64_t epoch) {
+static bool tp5_relay_arm_bank(tp5_comm & c, uint64_t epoch, uint32_t late_rows = 0) {
     if (epoch == 0) {
         c.fail("RELAY cannot arm generation zero");
         return false;
@@ -4395,6 +4404,15 @@ static bool tp5_relay_arm_bank(tp5_comm & c, uint64_t epoch) {
             qctrl[TP5_LATE_Q_READY_WORD]   = 0u; // Q sidecar ready
             qctrl[TP5_LATE_Q_COUNTER_WORD] = 0u; // Q8 workgroup completion counter
         }
+        // Publish the runtime active-row count (RELAY header word 5) while the
+        // bank provably has no in-flight reader: the credit checks above prove
+        // the previous epoch's late kernels completed, and the next consumer
+        // of this bank cannot pass its generation wait until a later handoff
+        // publishes it. LateBind kernels bound their token loops with this
+        // word so a maximum-capacity definition executes only useful rows.
+        if (c.ranks[i].bcast_host[bank]) {
+            ((volatile uint32_t *) c.ranks[i].bcast_host[bank])[5] = late_rows;
+        }
     }
     c.relay_bank_used[bank] = false;
     std::atomic_thread_fence(std::memory_order_release);
@@ -4407,7 +4425,7 @@ static bool tp5_relay_arm_bank(tp5_comm & c, uint64_t epoch) {
 // The previous chain pre-arms its successor from the final P1 flag. Accept
 // that ready state without a host wait; otherwise arm from already completed
 // predecessor credit. Mixed generations are a protocol failure, never a wait.
-static bool tp5_relay_ensure_armed_epoch(tp5_comm & c, uint64_t epoch) {
+static bool tp5_relay_ensure_armed_epoch(tp5_comm & c, uint64_t epoch, uint32_t late_rows = 0) {
     if (epoch == 0) {
         c.fail("RELAY cannot ensure generation zero");
         return false;
@@ -4441,7 +4459,7 @@ static bool tp5_relay_ensure_armed_epoch(tp5_comm & c, uint64_t epoch) {
         c.fail("RELAY bank generation differs across ranks for epoch " + std::to_string(epoch));
         return false;
     }
-    return armed || tp5_relay_arm_bank(c, epoch);
+    return armed || tp5_relay_arm_bank(c, epoch, late_rows);
 }
 
 static bool tp5_relay_direct_stage(const tp5_plan_key & key, size_t n_ranks) {
@@ -4521,7 +4539,8 @@ static bool tp5_relay_publish_generation(tp5_comm & c, size_t bank, uint32_t wor
 static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star_times * times = nullptr,
                              bool relay = false, uint64_t arm_next_epoch = 0,
                              volatile uint32_t * const * direct_ready = nullptr,
-                             size_t late_count = 0, bool late_sidecar_f16 = false) {
+                             size_t late_count = 0, bool late_sidecar_f16 = false,
+                             uint32_t late_rows = 0) {
     struct relay_abort_guard {
         tp5_comm & comm;
         bool active;
@@ -4618,7 +4637,7 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
         }
     }
     const auto arm_start = times ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    if (relay && arm_next_epoch != 0 && !tp5_relay_arm_bank(c, arm_next_epoch)) {
+    if (relay && arm_next_epoch != 0 && !tp5_relay_arm_bank(c, arm_next_epoch, late_rows)) {
         return false;
     }
     const auto data_start = times ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -5154,6 +5173,29 @@ static bool tp5_relay_submit_epoch_chain(
         return false;
     }
 
+    // Publish the runtime active-row count into the first bank's RELAY header
+    // word 5 before any rank is submitted. The bank is provably idle here:
+    // ensure_armed_epoch verified flag/error/done zero. Later banks in this
+    // chain receive the same word during their pre-arm in tp5_star_handoff,
+    // after the previous reader's transitive credit. LateBind kernels read
+    // word 5 to bound their token loops, so a maximum-capacity definition
+    // executes only the useful rows (M3 invariant 2).
+    {
+        const uint32_t late_rows = active_rows ? active_rows : capacity_rows;
+        const size_t first_bank = tp5_mailbox_bank(first_epoch);
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            if (c.ranks[i].bcast_host[first_bank]) {
+                ((volatile uint32_t *) c.ranks[i].bcast_host[first_bank])[5] = late_rows;
+            }
+        }
+        std::atomic_thread_fence(std::memory_order_release);
+#if defined(__x86_64__) || defined(_M_X64)
+        _mm_sfence();
+#endif
+    }
+
+    const uint32_t chain_late_rows = active_rows ? active_rows : capacity_rows;
+
     // Patch every capacity-aware dispatch, including the non-reducing tail,
     // before any rank is submitted. A smaller active prefix is legal only if
     // each source definition has classified every dispatch it owns.
@@ -5290,7 +5332,7 @@ static bool tp5_relay_submit_epoch_chain(
         tp5_star_times * step = prof ? &stage_times[s] : nullptr;
         if (!tp5_star_handoff(c, tp5_mailbox_bank(epoch), active_elems[s], step, true,
                               arm_next_epoch, direct ? c.relay_ready_routes[s].data() : nullptr,
-                              late_count, late_sidecar_f16)) {
+                              late_count, late_sidecar_f16, chain_late_rows)) {
             fprintf(stderr, "[tp5-relay-chain] handoff failed stage=%zu epoch=%llu bank=%zu\n",
                     s, (unsigned long long) epoch, tp5_mailbox_bank(epoch));
             return false;
@@ -5944,6 +5986,20 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
 
     const auto t_bp1 = std::chrono::high_resolution_clock::now();
 
+    // Runtime active-row count for LateBind kernels (RELAY header word 5).
+    // Non-predefined callers publish none; the late kernels then fall back to
+    // their push-constant capacity (single-row legacy behavior).
+    uint32_t one_shot_rows = 0;
+    if (c.sync_mode == tp5_sync_mode::RELAY) {
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            uint32_t rows = 0, cap = 0;
+            if (ggml_vk_tp5_predefined_rows(c.backends[i], &rows, &cap) && rows) {
+                one_shot_rows = rows;
+                break;
+            }
+        }
+    }
+
     if (c.sync_mode == tp5_sync_mode::RELAY && !tp5_relay_ensure_armed_epoch(c, epoch)) {
         return false;
     }
@@ -5958,6 +6014,21 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
     if (c.sync_mode == tp5_sync_mode::RELAY) {
         const size_t bank = tp5_mailbox_bank(epoch);
         volatile uint32_t * direct_ready[8] = {};
+        // Publish the runtime active-row count (RELAY header word 5) before
+        // this epoch's command buffers are submitted. Non-predefined callers
+        // publish no frame; word 5 stays 0 and the late kernels fall back to
+        // their push-constant capacity (single-row legacy behavior).
+        {
+            for (size_t i = 0; i < c.n_ranks; ++i) {
+                if (c.ranks[i].bcast_host[bank]) {
+                    ((volatile uint32_t *) c.ranks[i].bcast_host[bank])[5] = one_shot_rows;
+                }
+            }
+            std::atomic_thread_fence(std::memory_order_release);
+#if defined(__x86_64__) || defined(_M_X64)
+            _mm_sfence();
+#endif
+        }
         if (one_shot_direct) {
             for (size_t i = 0; i < c.n_ranks; ++i) {
                 if (!ggml_vk_tp5_get_relay_ready(c.backends[i], one_shot_relay_stage, &direct_ready[i]) ||
@@ -6128,7 +6199,8 @@ bool tp5_allreduce_mesh(tp5_comm & c, ggml_tensor ** tensors, size_t n_elems) {
             }
         }
         if (!tp5_star_handoff(c, tp5_mailbox_bank(epoch), n_elems, &relay_times, true, arm_next_epoch,
-                              one_shot_direct ? direct_ready : nullptr)) {
+                              one_shot_direct ? direct_ready : nullptr,
+                              0, false, one_shot_rows)) {
             return false;
         }
     } else if (c.sync_mode != tp5_sync_mode::GPUFLAG) {

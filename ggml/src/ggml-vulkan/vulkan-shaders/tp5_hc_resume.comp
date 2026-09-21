@@ -34,6 +34,12 @@ layout(push_constant) uniform Params {
 } p;
 const uint GENERATION_WORD = 0u;
 const uint SPIN_WORD = 5u;
+// RELAY header word 5 carries the CPU-published runtime active-row count.
+// It is written before this P2 command buffer is submitted, so it is already
+// visible when the generation doorbell arrives. The push constant keeps the
+// capacity only as a fail-safe fallback (M3 invariant 2: capacity is never the
+// effective row count of a maximum-capacity definition).
+const uint ACTIVE_ROWS_WORD = 5u;
 shared float partials[32];
 #endif
 
@@ -67,6 +73,7 @@ layout(push_constant) uniform Params {
 } p;
 const uint GENERATION_WORD = 2u;
 const uint SPIN_WORD = 7u;
+const uint ACTIVE_ROWS_WORD = 5u;
 #endif
 
 shared uint ready;
@@ -104,13 +111,13 @@ bool await_input() {
 }
 
 #ifdef TP5_RESUME_NORM
-void finalize_stream(const uint iterations) {
+void finalize_stream(const uint iterations, const uint active_rows) {
     const uint lane = gl_LocalInvocationID.x;
     const uint stream = gl_WorkGroupID.x;
     if (!await_input()) {
         const float nanv = uintBitsToFloat(0x7fc00000u);
         for (uint token = 0u; token < 4u; ++token) {
-            if (token >= p.active_rows) break;
+            if (token >= active_rows) break;
             const uint base = token * (p.streams * p.width) + stream * p.width;
             for (uint col = lane; col < p.width; col += 256u) {
                 combined[base + col] = nanv;
@@ -122,7 +129,7 @@ void finalize_stream(const uint iterations) {
         return;
     }
     [[unroll]] for (uint token = 0u; token < 4u; ++token) {
-        if (token >= p.active_rows) break;
+        if (token >= active_rows) break;
         const uint base = token * (p.streams * p.width) + stream * p.width;
         const float s = scatter[token * p.streams + stream];
         float values[16];
@@ -175,8 +182,9 @@ void main() {
             atomicCompSwap(status[p.status_word_offset + 2u], 0u, 0xffffffffu);
         return; // also rejected by the host recipe before recording
     }
+    const uint active_rows = inbox[ACTIVE_ROWS_WORD] != 0u ? inbox[ACTIVE_ROWS_WORD] : p.active_rows;
     const uint blocks = min(16u, (p.width + 255u) / 256u);
-    finalize_stream(blocks);
+    finalize_stream(blocks, active_rows);
 }
 #endif
 
@@ -200,9 +208,10 @@ void main() {
         if (lane == 0u) atomicCompSwap(status[p.status_word_offset + 2u], 0u, 0xffffffffu);
         return;
     }
+    const uint active_rows = inbox[ACTIVE_ROWS_WORD] != 0u ? inbox[ACTIVE_ROWS_WORD] : p.active_rows;
     if (!await_input()) {
         for (uint token = 0u; token < 4u; ++token) {
-            if (token >= p.active_rows) break;
+            if (token >= active_rows) break;
             for (uint row = lane; row < p.rank_dim; row += 256u)
                 lo[token * p.rank_dim + row] = uintBitsToFloat(0x7fc00000u);
 #ifdef TP5_RESUME_LO_Q8
@@ -218,7 +227,7 @@ void main() {
 #ifdef TP5_RESUME_LO_Q8
     const uint row = lane;
     [[unroll]] for (uint token = 0u; token < 4u; ++token) {
-        if (token >= p.active_rows) break;
+        if (token >= active_rows) break;
         const vec4 scale = vec4(
             inverse_rho[token * 4u + 0u],
             inverse_rho[token * 4u + 1u],
@@ -254,7 +263,7 @@ void main() {
     }
 #else
     [[unroll]] for (uint token = 0u; token < 4u; ++token) {
-        if (token >= p.active_rows) break;
+        if (token >= active_rows) break;
         const vec4 scale = vec4(
             inverse_rho[token * 4u + 0u],
             inverse_rho[token * 4u + 1u],

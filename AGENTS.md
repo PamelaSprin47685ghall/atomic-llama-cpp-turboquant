@@ -1,5 +1,57 @@
 # AGENTS.md
 
+## 下班交接｜2026-09-22（第十一轮，M4 首步：LateBind 运行时有效行直供内核）
+
+**分支：** `master`（本轮 commit 见 git log；基于 `4ec7571c4`，含 41 个此前未推送提交一并推上）
+**主题：** 未来路线图讨论稿中 M0–M2 已由前 54 个提交落地；本轮攻下 **M4 的第一个实质缺口**：
+LateBind 全部 7 个内核的 push constant 把 `capacity_rows` 当执行行数烘焙，1 行 MTP draft
+在容量 4 定义下执行 4 行 late 工作（M3 不变量 2「push-constant 不得把容量当有效」的现存违反）。
+
+### 一、改动：运行时有效行经 RELAY header word 5 直供内核
+
+1. **发布点（CPU）**：`tp5_relay_submit_epoch_chain` 在 `ensure_armed_epoch` 验证首个
+   bank 空闲后写 word 5（值 = `active_rows ? active_rows : capacity_rows`）；后续 bank 在
+   `tp5_relay_arm_bank` 传递信用验证后写入（`late_rows` 参数贯穿 `tp5_star_handoff`）；
+   one-shot 路径提交前写入（无帧写 0 → 内核回退到 push-constant 容量，legacy 行为不变）。
+2. **消费（GPU）**：7 个 late 内核全部改为读 header word 5 截断 token 循环——
+   Q8DOT 经既有 QMailbox binding 读 `qmail[5]`；norm/LO 经既有 Inbox 读 `inbox[5]`；
+   inject/ACT_Q8/Q/UP 新增只读 RowsHeader binding（DSL 计数 3→4 / 5→6 / 6→7 / 4→5）。
+3. **inject 描述符改每 bank**（`late_inject_ds` 从每 rank 单份改为 `n_ranks × BANKS`，
+   因新增 bcast 依赖随 bank 切换）；分配/释放/录制三处同步。
+4. Word 5 与既有协议零冲突：generation（word 0/2）、counter（word 1）、n_elems（word 3）、
+   relay probe 的 word 4 均不受影响；word 5 在 64 字节 header 内、F32 payload（word 16 起）之前。
+
+### 二、验证
+
+- `test-tp5-plan` 新增 `test_tp5_latebind_runtime_rows_protocol`：word 5 位置、发布值、
+  legacy 0 回退、1→4→1→2 序列（每次发布真 active，非容量）；全套 all passed。
+- **15/15 ctest 全绿**（tp5/mtp/predefined + 全部 vulkan：5 卡 mesh RELAY 96 轮 +
+  变异输入 + 延迟生产者 + STAR 96 轮、GDN multistep C=8、FA capacity、command replay
+  1→4→1→2 不可变描述符、output liveness）。
+- GPU 全程空闲审计通过；journal 零新增 amdgpu fault/hung。
+- relay probe `consumer failed rank=0` 为**基线既有行为**（stash 前后复现一致），非本轮回归。
+
+### 三、边界与未闭合
+
+1. **LateBind GPU 路径端到端验证需真实模型**（HC 图 + MTP 会话 + `GGML_TP5_LATEBIND=1`），
+   须按安全门获批后执行；本轮覆盖传输层回归 + CPU 协议测试。
+2. M4 剩余：多行 LateBind 的 `scatter/rho/Q/Y` 布局已有（`vk_tp5_latebind_layout`），
+   但 `tp5_late_consumer_ref` 仍限 `capacity_rows <= 4`（`VK_TP5_DIRECT_COLUMN_TILE`），
+   TARGET 容量化后需评估是否抬升。
+3. M3 剩余：GDN fail-closed 门禁维持（`evaluate_target_capacity_admission`），多卡/全模型
+   级验证后由负责人解禁。
+
+### 四、路线图对照（讨论稿 → 现状）
+
+| 讨论稿项 | 状态 |
+|---|---|
+| M0：Q sidecar 协议对齐 | ✅ 前 54 提交已落地（单源 helpers + Invariant 6/7 测试）|
+| M1：MTP 单容量闭环 | ✅ phase 豁免 + 1→4→1→2 工作区/重放/图复用三重测试 |
+| M2：MTP 成本闭合 | ✅ cycle ledger（draft/target/catchup/handoff 分项 + RAII settle）|
+| M3：TARGET 容量化 | 🔶 区 0–4 落地，GDN GPU 单卡验证过，多卡 fail-closed 待解禁 |
+| M4：LateBind 多行与数值隔离 | 🔶 本轮落地运行时有效行；P1-A 对照具已有；端到端真机待批 |
+| M5：组合与更深重叠 | ⬜ 未启动 |
+
 ## 真机安全门（任何 agent 开工前必读）
 
 真机测试必须小心；把机器弄死会造成好几天的时间浪费。**不要**未经检查启动大模型、叠加 GPU 负载或重启生产服务。
