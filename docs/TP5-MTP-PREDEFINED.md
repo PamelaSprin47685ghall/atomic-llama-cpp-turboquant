@@ -173,8 +173,7 @@ target unmasked hidden + draft masked hidden、非 RERoT。不支持时启动失
 
 模型图的临时 `t_h_nextn` 在同一生产队列上复制到 RESULT，随后才允许图工作区
 被复用。完整 decode 成功才公开 `valid_rows`；失败不会暴露部分捕获为有效结果。
-每次 decode 的 RESULT 使用单调 generation；来自 RESULT 的范围必须携带匹配的
-generation，旧 acceptance 不能因新一轮恰好同样行数而读错结果。reset 不倒退代数。
+每次 decode 的 RESULT 使用单调 generation；交接规则以 `src/llama-predefined-hidden.h:llama_predefined_hidden_generation_matches` 为准：RESULT 槽要求 `valid_rows != 0 && expected != 0 && expected == source.generation`，CARRY/SEED 槽要求 `expected == 0`。旧 acceptance 不能因新一轮恰好同样行数而读错结果。reset 不倒退代数。证据面与验证提案见 `docs/TP5-MTP-EVIDENCE.md`、`docs/TP5-MTP-VERIFICATION-PROPOSAL.md` 与 `scripts/check-tp5-mtp-evidence.sh`（另一条线已交付，本文件只引用、不复述）。
 尚未完成的 copy 在无 queued token 时也有独立 pending 标记，退出/跨 owner
 交接仍须退休，不会因 token 计数清零而提前释放持久 buffer。
 
@@ -290,3 +289,166 @@ producer-completion 规则约束，不允许在消费者仍读取时改 slot。
 已登记但未编译/执行 `test-tp5-row-program`：固定定义的长度反复变化、四列尾块、
 descriptor 容量拒绝、工作组上限、整数溢出、bank 末尾 status 隔离、ADD 尾块保护。
 这些是纯 CPU 规则用例，不代替两种 wire、两种 Q5_K 算术与真实 MTP 的数值验收。
+
+## 10. 执行定义身份与旧 phase 失效边界（Execution Definition Identity vs Legacy Phase Boundary）
+
+### 10.1 背景与根因
+
+在 `src/llama-context.cpp` 的 `process_ubatch()` 中，存在历史阶段切换管理：
+
+```cpp
+const int phase = ubatch.n_tokens > ubatch.n_seqs ? 1 : 0; // 1 = prompt processing
+if (phase != last_graph_phase) {
+    if (last_graph_phase >= 0) {
+        gf_res_prev->reset();
+        ggml_backend_sched_release_buffers(sched.get());
+    }
+    last_graph_phase = phase;
+}
+```
+
+**该逻辑在 Target 主干模型上的必要性：**
+1. **显存安全**：Prompt prefill 与 token generation 在常规推理中互斥；prefill 分配的大张量若不释放，会常驻锁定显存造成 OOM；
+2. **张量视图边界断言（View Bound Assert）**：上一阶段缓存的输入张量指针指向即将回收/变动的缓冲区，若不通过 `gf_res_prev->reset()` 清空，后续构图与视图重叠会触发底层断言崩溃；
+3. **48 层 Target 主干未全量容量化**：Target 模型尚未完全切入统一固定容量模式，仍须依赖显式的 Prefill/Decode 边界隔离。
+
+### 10.2 冲突：旧 phase 逻辑对预定义 MTP 的破坏
+
+在单序列 MTP 投机解码中，上下文在 Draft 阶段与 Catch-up 阶段反复切换：
+- **Draft 步**：每次采样 1 行（`n_tokens = 1, n_seqs = 1`）$	o$ `phase = 0`；
+- **Catch-up 步**：提交验证接受的多行（如接受 3 个 candidate + 1 个 sampled，`n_tokens = 4, n_seqs = 1`）$	o$ `phase = 1`。
+
+在典型的 1 $	o$ 4 $	o$ 1 $	o$ 2 序列中，旧逻辑会触发 3 次 phase 翻转（0 $	o$ 1 $	o$ 0 $	o$ 1）：
+1. 每次翻转强制执行 `gf_res_prev->reset()` 和 `ggml_backend_sched_release_buffers(sched.get())`；
+2. `sched->is_alloc = false` 导致后续 `can_reuse` 判定必然失败；
+3. 即使 `src/llama-graph.h` 中已预留 `predefined_mtp_dynamic` 豁免逻辑（允许 MTP 在 `n_tokens` 变化时命中同一图），也会被提前强行截断，迫使每步重新调用 `model.build_graph()`、分配全新 `definition_uid` 并重录 GPU 命令。
+
+### 10.3 解决方案：以“执行定义身份”为依据的豁免
+
+容量下沉现状（以 `src/llama-context.cpp:2507-2535` 为准）：MTP 图已容量化、target 主干尚未——`DRAFT/CATCHUP` 统一设定 `predefined_capacity_rows_current = capacity->verify_tokens`、`predefined_capacity_outputs_current = 1`；其余（target/prefill）在 48 层有状态主干独立完成容量下沉之前仍保持精确（`capacity_rows = ubatch.n_tokens`，输出取 `max(1, frame.active_outputs)`）。在具体条目被降为容量图之前，`capacity_rows` 保持等于图的真实行数，传输层已就绪但不把 padding 当有效行。
+
+因此，**MTP 的 Draft 与 Catch-up 在物理上属于完全相同的“执行定义身份（Execution Definition Identity）”**，并非 Prompt Prefill 与 Token Generation 之间的互斥生命周期交替。
+
+在 `llama_context::ubatch_execution_phase()`（`src/llama-context.h:613-629`，调用点 `src/llama-context.cpp:2548-2566`）中引入执行定义身份判定：
+- **判定条件（以源码为准）**：
+  `gtype == LLM_GRAPH_TYPE_DECODER_MTP && has_predefined_capacity && predefined_capacity_rows > 0`
+- **行为**：满足该条件的预定义 MTP 恒定归入统一阶段 `phase = 0`，不以 `n_tokens > n_seqs` 作为判断依据。
+- **效果**：
+  1. 1 $	o$ 4 $	o$ 1 $	o$ 2 序列保持恒定 `phase = 0`，零次 reset，零次 sched buffer release；
+  2. `sched->is_alloc` 保持为 `true`，`can_reuse` 顺利命中 `predefined_mtp_dynamic`，实现预定义图与 GPU 命令缓冲区的常驻复用；
+  3. Target 主干模型、常规 prefill/decode 以及未开启预定义的普通 MTP 严格保留原有的 phase 判定与缓冲区释放逻辑，不变量完整守住；
+  4. 判定开销为常数级逻辑判断，零逐 token 开销。
+
+## 11. MTP 完整 Cycle 计时账本（Full-Cycle Timing Ledger）
+
+### 11.1 设计背景与目标
+
+在投机解码中，单图 MTP 的收益不仅取决于 Draft 步的生成速度（tok/s），更取决于**完整 cycle 的闭合时间账**：
+若仅优化 Draft，而忽视 Catch-up 重放或 Target 验证交接，可能会出现“Draft 很快但总延迟变慢”的负收益。
+
+为在单序列与多序列 Qwen4EXP TP5 真机运行中精确测量真实效益，在 `common/speculative` 层接入了无开销、结构化的 **Cycle 计时账本**。
+
+### 11.2 四大阶段与产出度量
+
+每个投机解码 Cycle 包含四个互斥阶段及 token 产出度量：
+
+| 字段 | 含义 | 测量位置 |
+| --- | --- | --- |
+| `draft_us` | MTP 生成候选 Token 阶段的真实微秒耗时 | `common_speculative_impl_draft_mtp::draft()` |
+| `target_us` | Target 主干模型验证批次并采样的微秒耗时 | `common_speculative_record_target_verify_us()`（在 `tools/server/server-context.cpp` 中覆盖从 `llama_decode(ctx_tgt, batch_view)` 到 `common_sampler_sample_and_accept_n()` 完成的全过程，并在 `common_speculative_commit()` 前注入） |
+| `catchup_us` | MTP 接收 Target 验证结果后执行 Catch-up 重放的状态同步耗时 | `common_speculative_impl_draft_mtp::commit()` |
+| `handoff_us` | Target Hidden 状态向 MTP Workspace 交接的耗时（设备内直接拷贝或主机内存搬运） | `common_speculative_impl_draft_mtp::process_impl()` |
+| `total_us` | 单 Cycle 总耗时（`draft_us + target_us + catchup_us + handoff_us`） | `commit()` 结算处自动累加 |
+| `draft_tokens` | 该 Cycle 中 MTP 生成并提交给 Target 验证的候选 Token 数 | `draft()` 结果统计 |
+| `accepted_tokens` | Target 模型验证并通过的候选 Token 数 | `accept()` 累加 |
+| `final_tokens` | 该 Cycle 最终有效产生的新 Token 数（固定等于 `1 + accepted_tokens`） | 结算时计算 |
+| `eff` | 草稿接受效率（`accepted_tokens / draft_tokens`） | 纯函数格式化计算 |
+| `dev_hidden` | 是否命中设备侧零 CPU 拷贝交接（`1` = Device Hidden, `0` = Host Memcpy） | 运行时状态标志 |
+
+### 11.3 启用方式与输出风格
+
+- **环境变量开关**：
+  复用既有系统剖析开关：
+  ```bash
+  export GGML_TP5_PROFILE=1
+  # 或单独开启 MTP 周期账本：
+  export GGML_TP5_MTP_PROFILE=1
+  ```
+  未设置上述环境变量时，系统在热路径仅做单次空指针/环境检查，时钟采集与累加逻辑完全跳过，实现零开销。
+
+- **结构化输出示例**：
+  每 Cycle 完成后在 `stderr` 输出单行结构化日志：
+  ```text
+  [tp5-mtp-cycle] cycle=1 draft_us=1240 target_us=3120 catchup_us=480 handoff_us=35 total_us=4875 draft_tokens=3 accepted_tokens=2 final_tokens=3 eff=0.667 dev_hidden=1
+  [tp5-mtp-cycle] cycle=2 draft_us=1180 target_us=2980 catchup_us=210 handoff_us=32 total_us=4402 draft_tokens=3 accepted_tokens=1 final_tokens=2 eff=0.333 dev_hidden=1
+  ```
+
+- **会话结束汇总**：
+  在 `common_speculative_print_stats()` 中统一输出全局均值汇总行：
+  ```text
+  [tp5-mtp-cycle-summary] cycles=2 avg_draft_us=1210.0 avg_target_us=3050.0 avg_catchup_us=345.0 avg_handoff_us=33.5 avg_total_us=4638.5 draft_tokens=6 accepted_tokens=3 final_tokens=5 eff=0.500
+  ```
+  便于自动化脚本提取平均每 token 耗时以及 MTP 的加速收益比。
+
+## 12. 定义期语义覆盖与 `predefined_complete` 升级（Definition-Time Semantic Coverage & Upgraded predefined_complete）
+
+### 12.1 背景与语义升级
+
+在旧实现中，`program.predefined_complete` 仅仅通过简单的派发数量比较得出：
+```cpp
+program.predefined_complete = (classified_dispatches == captured_dispatches);
+```
+该比较存在五大已知盲点：固定 `vkCmdCopyBuffer` 范围、张量视图偏移（view offset）、KV 写入有效范围、输出投影索引（output indices）以及烘焙在 push constants 中的容量参数。旧版仅在 `vk_tp5_predefined_coverage` 中收集诊断并以 fail-open 模式在 `stderr` 打印警告，`predefined_complete` 仍置为 `true`。
+
+本升级将 `predefined_complete` 彻底重构为**定义期语义覆盖（Definition-Time Semantic Coverage）**：
+只有当定义在所有五个语义类别中均建立代码级安全证明、且**不存在任何 `unresolved` 状态**时，`predefined_complete` 才被置为 `true`。
+
+### 12.2 五大语义类别与三态模型
+
+定义期覆盖引入三态枚举：
+- `unresolved` (0)：在动态行执行（`active_rows < capacity_rows`）下不安全或无法证明；
+- `fixed_safe` (1)：已证明与行数无关（在任何活跃行下行为绝对恒定、无副作用越界）；
+- `dynamic_safe` (2)：已证明随有效行数（`active_tokens` / `active_outputs` 等）严格动态裁剪，不越界。
+
+五大盲点映射至以下五大类别：
+
+1. **`fixed_compute`（固定计算）**：
+   - 含义：与活跃行数无关的计算（通过 `ggml_vk_predefined_classify_static` 标记）。
+   - 判定：全部派发被分类时为 `fixed_safe`；存在未分类派发时为 `unresolved`。
+2. **`dynamic_compute`（动态计算）**：
+   - 含义：基于 tokens / outputs / context extent 动态缩放的间接派发。
+   - 判定：所有派发均通过 `ggml_vk_predefined_indirect_slot` 成功间接化时为 `dynamic_safe`；纯静态图为 `fixed_safe`；存在未分类派发时为 `unresolved`。
+3. **`data_movement`（数据搬运）**：
+   - 对应盲点：**盲点 1（fixed copy/fill/update ranges）** 与 **盲点 2（view offset）**。
+   - 判定：若命令带捕获了 `vkCmdCopyBuffer` / `FillBuffer` / `UpdateBuffer`（`copy_total != 0`），由于其偏移与大小固化于录制期，无法提供动态有效范围证明，判为 `unresolved`，并记录 `first_gap` 诊断；在无 raw copy 的纯计算图中，张量 view 偏移受 indirect dispatch 边界保护，判为 `fixed_safe`。
+4. **`state_writes`（状态写入）**：
+   - 对应盲点：**盲点 3（KV write ranges）** 与 **盲点 4（output indices）**。
+   - 判定：MTP 计算图中的 KV 写入（`set_rows_indirect`）和输出逻辑（`output_dispatch_indirect`）均经行除数整除验证与间接工作组缩放，证明不污染非活跃槽，判为 `dynamic_safe`；若存在未受控写入或未分类派发，判为 `unresolved`。
+5. **`dependency_boundaries`（依赖边界）**：
+   - 对应盲点：**盲点 5（push-constant capacity params）** 与同步栅障（pipeline barriers）。
+   - 判定：Pipeline barriers 原样完整捕获保存在命令带中；Shader push constants 虽描述物理容量，但通过行级整除性校验（如 `raw_per_row % divisor == 0`）保证尾部工作组绝不越界跨行污染，判为 `fixed_safe`；存在未分类派发时判为 `unresolved`。
+
+### 12.3 门禁链阻断规则与执行资格
+
+在 `ggml-vulkan.cpp:27647` 处的执行门禁：
+```cpp
+(!program.predefined_complete && active_rows != capacity_rows) || ... -> return false;
+```
+形成了严格的 **Fail-Closed** 安全屏障：
+- **通过（Permitted）**：当且仅当 `predefined_complete == true`（即 5 类无一 `unresolved`），才授予动态行执行资格（`active_rows != capacity_rows`，如 1 行或 4 行小前缀执行）；
+- **阻断（Blocked）**：若任何类别判定为 `unresolved`，`predefined_complete` 恒为 `false`，动态行执行被底层物理拒绝，仅退回到 `active_rows == capacity_rows` 的全量执行。
+
+### 12.4 当前真实 Definition 的状态与局限性说明
+
+1. **当前 MTP Draft / Catch-up Definition**：
+   - `commands.count(copy) == 0`，无原始固定拷贝；
+   - 所有派发均被 static 或 indirect 分类，`uncovered_dispatch == 0`；
+   - GEMM、Norm、Attn、Softmax、SetRows 均满足整除性校验；
+   - **结论**：五项全为 safe（`fixed_safe` 或 `dynamic_safe`），`predefined_complete = true`，成功保持动态行执行能力，零性能退化。
+2. **Target 主干 Definition（尚未全量容量化）**：
+   - 尚有未间接化算子，`uncovered_dispatch > 0`，判定为 `unresolved`，`predefined_complete = false`，门禁正确阻止其动态行执行，保持原有精确构图路径。
+3. **哪些类别目前仍无法全自动证明及原因**：
+   - **显式缓冲区分片拷贝（Raw BufferCopy）**：如果未来的预定义图中包含宿主向设备或设备内的裸 `vkCmdCopyBuffer`，由于 Vulkan 结构体中的 `srcOffset/dstOffset/size` 在录制时被字面固化，缺乏类似 `dispatchIndirect` 的 GPU 动态读取能力，因此后端无法在定义期自动推断有效行范围，必须显式保持为 `unresolved` 并被门禁阻断，直到引入间接拷贝机制或专用算子。
+   - **非连续视图与跨行切片（Non-contiguous view offsets）**：对于行间距 `nb[1]` 与元素大小不连续或工作组大小无法整除行宽度的非常规张量视图，无法单靠定义期元数据证明尾部线程不越界，因此维持未分类并保持 `unresolved`。
+
+这一设计在零运行时开销、零逐 token 遍历的前提下，彻底完成了从脆弱的派发计数到强健的定义期语义覆盖的升级。

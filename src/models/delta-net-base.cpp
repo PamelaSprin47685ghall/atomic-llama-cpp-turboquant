@@ -42,6 +42,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         ggml_tensor * b,
         ggml_tensor * s,
         int           il) {
+    if (q->ne[2] > ubatch.n_seq_tokens) {
+        // Chunking solver cannot safely truncate inactive capacity suffix in static graph without mutating chunk layout.
+        throw std::runtime_error("build_delta_net_chunking: chunking solver cannot safely truncate inactive capacity suffix in static graph (fail-closed)");
+    }
     const int64_t S_k      = q->ne[0];
     const int64_t H_k      = q->ne[1];
     const int64_t n_tokens = q->ne[2];
@@ -916,8 +920,10 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
-    // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    // In capacity mode (active < capacity), pass active_tokens so ggml_gated_delta_net
+    // strictly truncates execution and maps rollback snapshot slots from active_tokens.
+    const int64_t active_tokens = (q->ne[2] > ubatch.n_seq_tokens) ? (int64_t)ubatch.n_seq_tokens : 0;
+    ggml_tensor * gdn_out = ggml_gated_delta_net_ext(ctx0, q, k, v, g, b, s, K, active_tokens);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {

@@ -6851,6 +6851,31 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
             data[s*sinfo.size() + i] = offs + cur_idxs[i];
         }
     }
+
+    // Capacity mode tail sanitization: redirect inactive rows [n_tokens, capacity)
+    // to an empty cell to prevent ggml_set_rows from corrupting prompt/history tokens or slot 0.
+    const uint32_t cap_k = (uint32_t) dst->ne[0];
+    if (cap_k > n_tokens) {
+        GGML_ASSERT(sinfo.n_stream() == 1 && "capacity path only supports single-sequence");
+        const uint32_t st = sinfo.strm[0];
+        const auto & cells = v_cells[st];
+        int64_t safe_slot = -1;
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.is_empty(i)) {
+                safe_slot = i;
+                break;
+            }
+        }
+        if (safe_slot < 0) {
+            throw std::runtime_error("KV cache capacity mode: no empty cell available for inactive row tail redirection");
+        }
+        const int64_t offs = sinfo.strm[0]*stride;
+        const int64_t safe_idx = offs + safe_slot;
+        for (uint32_t i = n_tokens; i < cap_k; ++i) {
+            data[i] = safe_idx;
+        }
+    }
+
     // Host-side trace for the hot-slot38 NaN hunt: ubatch row -> dst slot,
     // with RoPE position and output flag. RoPE of finite inputs with finite
     // positions is finite, so finite positions here pin the NaN to pre-rope
@@ -6897,6 +6922,41 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
                     data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*kv_size + cur_idxs[i];
+                }
+            }
+        }
+    }
+
+    // Capacity mode tail sanitization: redirect inactive rows [n_tokens, capacity)
+    // to an empty cell to prevent ggml_set_rows from corrupting prompt/history tokens or slot 0.
+    const int64_t n_embd_v_gqa_cap = hparams.n_embd_v_gqa_max();
+    const uint32_t cap_v = (!v_trans) ? (uint32_t) dst->ne[0] : (uint32_t) (dst->ne[0] / n_embd_v_gqa_cap);
+    if (cap_v > n_tokens) {
+        GGML_ASSERT(sinfo.n_stream() == 1 && "capacity path only supports single-sequence");
+        const uint32_t st = sinfo.strm[0];
+        const auto & cells = v_cells[st];
+        int64_t safe_slot = -1;
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.is_empty(i)) {
+                safe_slot = i;
+                break;
+            }
+        }
+        if (safe_slot < 0) {
+            throw std::runtime_error("KV cache capacity mode: no empty cell available for inactive row tail redirection");
+        }
+        if (!v_trans) {
+            const int64_t offs = sinfo.strm[0]*stride;
+            const int64_t safe_idx = offs + safe_slot;
+            for (uint32_t i = n_tokens; i < cap_v; ++i) {
+                data[i] = safe_idx;
+            }
+        } else {
+            const int64_t kv_size = stride;
+            const int64_t offs = sinfo.strm[0]*kv_size*n_embd_v_gqa_cap;
+            for (uint32_t i = n_tokens; i < cap_v; ++i) {
+                for (int64_t j = 0; j < n_embd_v_gqa_cap; ++j) {
+                    data[i*n_embd_v_gqa_cap + j] = offs + j*kv_size + safe_slot;
                 }
             }
         }

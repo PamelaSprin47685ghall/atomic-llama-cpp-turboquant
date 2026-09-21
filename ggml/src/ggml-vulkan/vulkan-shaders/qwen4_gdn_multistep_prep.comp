@@ -1,0 +1,280 @@
+// =================================================================================================
+// OFFLINE EXPLORATORY SCAFFOLD / PROTOTYPE KERNEL ONLY (NOT CONNECTED TO VULKAN PIPELINE)
+// =================================================================================================
+// STATUS & HARD BOUNDARY:
+// - This compute shader serves strictly as an offline architectural prototype for multi-step
+//   GDN convolution, L2-norm, and gating preparation in capacity mode.
+// - IT IS CURRENTLY 100% UNREACHABLE AT RUNTIME (no Vulkan pipeline is created, no dispatch routes here).
+// - GDN models remain strictly FAIL-CLOSED in llama_context::evaluate_target_capacity_admission.
+//
+// DESIGN INVARIANTS:
+// 1. Convolution history rolling strictly advances for active steps [0, active_tokens).
+//    The persisted history destination is updated with the tail of step active_tokens - 1.
+//    Inactive capacity steps [active_tokens, capacity_steps) are NEVER rolled into history state!
+// 2. Q/K L2-norm and V/gate activations are computed and output per step t < active_tokens.
+// 3. Short-circuit fast path for active_tokens == 1 matches single-step AR performance bit-for-bit.
+//
+// PREREQUISITES FOR FULL PRODUCTION GPU CLOSURE:
+// 1. Multi-step pipeline creation: Define push constants and bind VkPipeline in ggml-vulkan.cpp.
+// 2. Multi-step fused dispatch: Replace or extend gdn_segment_pattern to support multistep prep + delta + norm.
+// 3. Real-hardware proof: Bit-level verification against CPU reference and dmesg/GPUVM fault audit on real AMD RX 6800.
+// =================================================================================================
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint  key_heads;
+    uint  value_heads;
+    float scale;
+    uint  headmap;
+    uint  active_tokens;   // Runtime active steps A in [1, capacity_steps]
+    uint  capacity_steps;  // Fixed compile-time capacity C (<= 8)
+    uint  n_snapshots;     // Rollback snapshot slot count K
+    float q_epsilon;
+    float k_epsilon;
+};
+
+#if defined(GDN_CACHED_INPUT)
+layout(binding = 0) readonly buffer HistoryCacheBuf {
+    float data_history_cache[];
+};
+
+layout(binding = 1) readonly buffer ConvWeightBuf {
+    float data_conv_weight[];
+};
+
+layout(binding = 2) readonly buffer RawAlphaBuf {
+    float data_raw_alpha[];
+};
+
+layout(binding = 3) readonly buffer AlphaBiasBuf {
+    float data_alpha_bias[];
+};
+
+layout(binding = 4) readonly buffer AlphaScaleBuf {
+    float data_alpha_scale[];
+};
+
+layout(binding = 5) readonly buffer RawBetaBuf {
+    float data_raw_beta[];
+};
+
+layout(binding = 6) writeonly buffer CombinedQKVBuf {
+    float data_combined_qkv[];
+};
+
+layout(binding = 7) writeonly buffer GBuf {
+    float data_g[];
+};
+
+layout(binding = 8) writeonly buffer BetaBuf {
+    float data_beta[];
+};
+
+layout(binding = 9) readonly buffer RawQKVBuf {
+    float data_raw_qkv[];
+};
+
+layout(binding = 10) readonly buffer HistoryRowIDBuf {
+    int data_history_row_id[];
+};
+
+layout(binding = 11) writeonly buffer HistoryDstBuf {
+    float data_history_dst[];
+};
+#else
+layout(binding = 0) readonly buffer ConcatBuf {
+    float data_concat[];
+};
+
+layout(binding = 1) readonly buffer ConvWeightBuf {
+    float data_conv_weight[];
+};
+
+layout(binding = 2) readonly buffer RawAlphaBuf {
+    float data_raw_alpha[];
+};
+
+layout(binding = 3) readonly buffer AlphaBiasBuf {
+    float data_alpha_bias[];
+};
+
+layout(binding = 4) readonly buffer AlphaScaleBuf {
+    float data_alpha_scale[];
+};
+
+layout(binding = 5) readonly buffer RawBetaBuf {
+    float data_raw_beta[];
+};
+
+layout(binding = 6) writeonly buffer QBuf {
+    float data_q[];
+};
+
+layout(binding = 7) writeonly buffer KBuf {
+    float data_k[];
+};
+
+layout(binding = 8) writeonly buffer VBuf {
+    float data_v[];
+};
+
+layout(binding = 9) writeonly buffer GBuf {
+    float data_g[];
+};
+
+layout(binding = 10) writeonly buffer BetaBuf {
+    float data_beta[];
+};
+#endif
+
+shared float sh_sum[512];
+
+float op_silu(float x) {
+    return x / (1.0f + exp(-x));
+}
+
+float op_softplus(float x) {
+    return (x > 20.0f) ? x : log(1.0f + exp(x));
+}
+
+float op_sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
+void main() {
+    const uint group_id = gl_WorkGroupID.x;
+    const uint tid      = gl_LocalInvocationID.x;
+
+    if (group_id >= 2u * key_heads + value_heads) {
+        return;
+    }
+
+    const uint eff_active = (active_tokens > 0u && active_tokens <= capacity_steps) ? active_tokens : capacity_steps;
+    const uint total_channels = (2u * key_heads + value_heads) * 128u;
+    const uint channel = group_id * 128u + tid;
+    const uint weight_base = 4u * channel;
+    const uint in_time_stride = capacity_steps + 3u;
+    const uint in_base = channel * in_time_stride;
+
+    // Load initial 3-tap convolution history once
+    vec4 conv_weights = vec4(data_conv_weight[weight_base + 0u],
+                             data_conv_weight[weight_base + 1u],
+                             data_conv_weight[weight_base + 2u],
+                             data_conv_weight[weight_base + 3u]);
+
+    float h0 = 0.0f;
+    float h1 = 0.0f;
+    float h2 = 0.0f;
+
+#if defined(GDN_CACHED_INPUT)
+    if (tid < 128u) {
+        const uint hist_row  = uint(data_history_row_id[0]);
+        const uint hist_base = hist_row * (3u * total_channels) + channel * 3u;
+        h0 = data_history_cache[hist_base + 0u];
+        h1 = data_history_cache[hist_base + 1u];
+        h2 = data_history_cache[hist_base + 2u];
+    }
+#else
+    if (tid < 128u) {
+        h0 = data_concat[in_base + 0u];
+        h1 = data_concat[in_base + 1u];
+        h2 = data_concat[in_base + 2u];
+    }
+#endif
+
+    // Multi-step temporal evolution
+    for (uint t = 0u; t < capacity_steps; ++t) {
+        if (t >= eff_active) {
+            break; // Truncate loop: inactive tokens NEVER advance convolution or emit activations!
+        }
+
+        float silu_val = 0.0f;
+        if (tid < 128u) {
+#if defined(GDN_CACHED_INPUT)
+            const float raw_val = data_raw_qkv[t * total_channels + channel];
+#else
+            const float raw_val = data_concat[in_base + t + 3u];
+#endif
+            const float conv_val = dot(vec4(h0, h1, h2, raw_val), conv_weights);
+            silu_val = op_silu(conv_val);
+
+            // Roll convolution history forward by 1 step
+            h0 = h1;
+            h1 = h2;
+            h2 = raw_val;
+        }
+
+        if (group_id < 2u * key_heads) {
+            // Q or K group: L2 normalization
+            const bool is_q = (group_id < key_heads);
+            const uint head_idx = is_q ? group_id : (group_id - key_heads);
+            const float eps = is_q ? q_epsilon : k_epsilon;
+
+            sh_sum[tid] = (tid < 128u) ? (silu_val * silu_val) : 0.0f;
+            barrier();
+
+            [[unroll]] for (int s = 256; s > 0; s >>= 1) {
+                if (tid < uint(s)) {
+                    sh_sum[tid] += sh_sum[tid + uint(s)];
+                }
+                barrier();
+            }
+
+            const float norm_scale = 1.0f / max(sqrt(sh_sum[0]), eps);
+
+            if (tid < 128u) {
+                const float norm_val = norm_scale * silu_val;
+#if defined(GDN_CACHED_INPUT)
+                data_combined_qkv[t * total_channels + group_id * 128u + tid] = norm_val;
+#else
+                const uint dst_idx = t * (key_heads * 128u) + head_idx * 128u + tid;
+                if (is_q) {
+                    data_q[dst_idx] = norm_val;
+                } else {
+                    data_k[dst_idx] = norm_val;
+                }
+#endif
+            }
+        } else {
+            // V group: store SiLU activation and produce gate & beta
+            const uint v_head = group_id - 2u * key_heads;
+
+            if (tid < 128u) {
+#if defined(GDN_CACHED_INPUT)
+                data_combined_qkv[t * total_channels + group_id * 128u + tid] = silu_val;
+#else
+                data_v[t * (value_heads * 128u) + v_head * 128u + tid] = silu_val;
+#endif
+            }
+
+            if (tid == 0u) {
+                const uint v_off = t * value_heads + v_head;
+                const float raw_a   = data_raw_alpha[v_off];
+                const float a_bias  = data_alpha_bias[v_head];
+                const float a_scale = data_alpha_scale[v_head];
+                const float raw_b   = data_raw_beta[v_off];
+
+                const float a_biased   = raw_a + a_bias;
+                const float a_softplus = op_softplus(a_biased);
+
+                data_g[v_off]    = a_softplus * a_scale;
+                data_beta[v_off] = op_sigmoid(raw_b);
+            }
+        }
+        barrier();
+    }
+
+    // Persist convolution history: strictly the state after step eff_active - 1
+#if defined(GDN_CACHED_INPUT)
+    if (tid < 128u) {
+        const uint dst_hist_base = channel * 3u;
+        data_history_dst[dst_hist_base + 0u] = h0;
+        data_history_dst[dst_hist_base + 1u] = h1;
+        data_history_dst[dst_hist_base + 2u] = h2;
+    }
+#endif
+}

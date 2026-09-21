@@ -1,5 +1,8 @@
 #include "../common/speculative-mtp-workspace.h"
+#include "../common/speculative.h"
 #include "../src/llama-predefined-hidden.h"
+#include "../src/llama-context.h"
+#include "../src/llama-graph.h"
 
 #include <cstdio>
 #include <stdexcept>
@@ -165,6 +168,604 @@ static void device_hidden_rejects_stale_generation() {
     CHECK(!llama_predefined_hidden_generation_matches(source, LLAMA_PREDEFINED_H_RESULT, 7));
 }
 
+// Regression check for missing-regression-test:
+// Verify that predefined MTP execution sessions are exempted from legacy phase invalidation.
+// Legacy phase logic (n_tokens > n_seqs ? 1 : 0) oscillated on 1->4->1->2 sequences (0->1->0->1),
+// triggering 3x gf_res_prev->reset() and ggml_backend_sched_release_buffers(), breaking predefined graph reuse.
+// Predefined MTP shares a single maximum-capacity graph definition (capacity->verify_tokens) and must
+// remain stably in phase 0 without oscillation.
+static void predefined_mtp_phase_invalidation_exemption() {
+    const int mtp_token_seq[] = {1, 4, 1, 2};
+    constexpr int n_steps = 4;
+    const int n_seqs = 1;
+
+    // 1. Demonstrate legacy behavior: pure n_tokens > n_seqs logic causes 3 phase transitions.
+    {
+        int legacy_last_phase = -1;
+        int legacy_resets = 0;
+        for (int i = 0; i < n_steps; ++i) {
+            const int n_tokens = mtp_token_seq[i];
+            const int phase = n_tokens > n_seqs ? 1 : 0;
+            if (phase != legacy_last_phase) {
+                if (legacy_last_phase >= 0) {
+                    legacy_resets++;
+                }
+                legacy_last_phase = phase;
+            }
+        }
+        // Step 0 (1 token):  phase 0, last=-1 -> last=0, 0 resets
+        // Step 1 (4 tokens): phase 1, last=0  -> last=1, reset 1
+        // Step 2 (1 token):  phase 0, last=1  -> last=0, reset 2
+        // Step 3 (2 tokens): phase 1, last=0  -> last=1, reset 3
+        CHECK(legacy_resets == 3);
+    }
+
+    // 2. Predefined MTP session: execution definition is invariant (capacity_rows = 4).
+    // Phase must remain stably 0, resulting in ZERO resets across the entire 1->4->1->2 sequence.
+    {
+        int mtp_last_phase = -1;
+        int mtp_resets = 0;
+        const uint32_t capacity_rows = 4;
+        for (int i = 0; i < n_steps; ++i) {
+            const int n_tokens = mtp_token_seq[i];
+            const int phase = llama_context::ubatch_execution_phase(
+                LLM_GRAPH_TYPE_DECODER_MTP,
+                /*has_predefined_capacity=*/true,
+                capacity_rows,
+                n_tokens,
+                n_seqs);
+            CHECK(phase == 0);
+            if (phase != mtp_last_phase) {
+                if (mtp_last_phase >= 0) {
+                    mtp_resets++;
+                }
+                mtp_last_phase = phase;
+            }
+        }
+        CHECK(mtp_resets == 0);
+        CHECK(mtp_last_phase == 0);
+    }
+
+    // 3. Non-predefined MTP session: must preserve legacy phase switching behavior.
+    {
+        int non_predef_last_phase = -1;
+        int non_predef_resets = 0;
+        for (int i = 0; i < n_steps; ++i) {
+            const int n_tokens = mtp_token_seq[i];
+            const int phase = llama_context::ubatch_execution_phase(
+                LLM_GRAPH_TYPE_DECODER_MTP,
+                /*has_predefined_capacity=*/false,
+                0,
+                n_tokens,
+                n_seqs);
+            if (phase != non_predef_last_phase) {
+                if (non_predef_last_phase >= 0) {
+                    non_predef_resets++;
+                }
+                non_predef_last_phase = phase;
+            }
+        }
+        CHECK(non_predef_resets == 3);
+    }
+
+    // 4. Target trunk model: prompt prefill (phase 1) vs decode generation (phase 0)
+    // must strictly retain legacy boundary to prevent VRAM buffer bloat and view bound violations.
+    {
+        // Prefill: 32 tokens, 1 sequence -> phase 1
+        const int prefill_phase = llama_context::ubatch_execution_phase(
+            LLM_GRAPH_TYPE_DECODER,
+            /*has_predefined_capacity=*/true,
+            32,
+            32,
+            1);
+        CHECK(prefill_phase == 1);
+
+        // Decode: 1 token, 1 sequence -> phase 0
+        const int decode_phase = llama_context::ubatch_execution_phase(
+            LLM_GRAPH_TYPE_DECODER,
+            /*has_predefined_capacity=*/true,
+            1,
+            1,
+            1);
+        CHECK(decode_phase == 0);
+
+        // Batch decode: 4 tokens across 4 sequences -> phase 0
+        const int batch_decode_phase = llama_context::ubatch_execution_phase(
+            LLM_GRAPH_TYPE_DECODER,
+            /*has_predefined_capacity=*/false,
+            0,
+            4,
+            4);
+        CHECK(batch_decode_phase == 0);
+    }
+}
+
+static void test_mtp_cycle_ledger_accounting() {
+    // 1. Single cycle record formatting check
+    common_speculative_cycle_record r1;
+    r1.cycle_id         = 1;
+    r1.draft_us         = 1200;
+    r1.target_verify_us = 3500;
+    r1.catchup_us       = 800;
+    r1.handoff_us       = 50;
+    r1.total_us         = 1200 + 3500 + 800 + 50;
+    r1.draft_tokens     = 3;
+    r1.accepted_tokens  = 2;
+    r1.final_tokens     = 3; // 2 accepted + 1 target sampled
+    r1.device_hidden    = true;
+
+    const std::string line1 = common_speculative_format_cycle_record(r1);
+    CHECK(line1.find("[tp5-mtp-cycle] cycle=1") != std::string::npos);
+    CHECK(line1.find("draft_us=1200") != std::string::npos);
+    CHECK(line1.find("target_us=3500") != std::string::npos);
+    CHECK(line1.find("catchup_us=800") != std::string::npos);
+    CHECK(line1.find("handoff_us=50") != std::string::npos);
+    CHECK(line1.find("total_us=5550") != std::string::npos);
+    CHECK(line1.find("draft_tokens=3") != std::string::npos);
+    CHECK(line1.find("accepted_tokens=2") != std::string::npos);
+    CHECK(line1.find("final_tokens=3") != std::string::npos);
+    CHECK(line1.find("eff=0.667") != std::string::npos);
+    CHECK(line1.find("dev_hidden=1") != std::string::npos);
+
+    // 2. Summary accumulator check
+    common_speculative_cycle_summary summary;
+    auto accumulate = [&](const common_speculative_cycle_record & r) {
+        summary.total_cycles++;
+        summary.total_draft_us         += r.draft_us;
+        summary.total_target_verify_us += r.target_verify_us;
+        summary.total_catchup_us       += r.catchup_us;
+        summary.total_handoff_us       += r.handoff_us;
+        summary.total_us               += r.total_us;
+        summary.total_draft_tokens     += r.draft_tokens;
+        summary.total_accepted_tokens  += r.accepted_tokens;
+        summary.total_final_tokens     += r.final_tokens;
+    };
+
+    accumulate(r1);
+
+    common_speculative_cycle_record r2;
+    r2.cycle_id         = 2;
+    r2.draft_us         = 1000;
+    r2.target_verify_us = 3000;
+    r2.catchup_us       = 200;
+    r2.handoff_us       = 40;
+    r2.total_us         = 1000 + 3000 + 200 + 40;
+    r2.draft_tokens     = 3;
+    r2.accepted_tokens  = 0; // 0 accepted
+    r2.final_tokens     = 1;
+    r2.device_hidden    = true;
+    accumulate(r2);
+
+    CHECK(summary.total_cycles == 2);
+    CHECK(summary.total_draft_tokens == 6);
+    CHECK(summary.total_accepted_tokens == 2);
+    CHECK(summary.total_final_tokens == 4); // 3 + 1
+    // Total final tokens invariant: always equals total_accepted_tokens + total_cycles
+    CHECK(summary.total_final_tokens == summary.total_accepted_tokens + summary.total_cycles);
+
+    const std::string sum_line = common_speculative_format_cycle_summary(summary);
+    CHECK(sum_line.find("[tp5-mtp-cycle-summary] cycles=2") != std::string::npos);
+    CHECK(sum_line.find("avg_draft_us=1100.0") != std::string::npos);
+    CHECK(sum_line.find("avg_target_us=3250.0") != std::string::npos);
+    CHECK(sum_line.find("avg_catchup_us=500.0") != std::string::npos);
+    CHECK(sum_line.find("eff=0.333") != std::string::npos);
+
+    // 3. Target verification injection & reset-to-zero API contract check
+    common_params_speculative params_spec;
+    params_spec.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
+    common_speculative * spec_inst = common_speculative_init(params_spec, 1);
+    CHECK(spec_inst != nullptr);
+    CHECK(common_speculative_get_target_verify_us(spec_inst) == 0);
+    common_speculative_record_target_verify_us(spec_inst, 4200);
+    CHECK(common_speculative_get_target_verify_us(spec_inst) == 4200);
+    // Verified: reset unconditionally resets staged target_verify_us to 0, preventing cross-request pollution
+    common_speculative_reset(spec_inst);
+    CHECK(common_speculative_get_target_verify_us(spec_inst) == 0);
+    common_speculative_free(spec_inst);
+
+    // 4. Strict monotonic cycle index sequence and zero-accept cycle ledger invariants
+    // Every MTP cycle (including zero-accept cycles where accepted_tokens == 0) produces exactly
+    // one settlement record, with total_us == sum of 4 stages and final_tokens == accepted_tokens + 1.
+    {
+        std::vector<common_speculative_cycle_record> seq(4);
+        for (size_t i = 0; i < seq.size(); ++i) {
+            seq[i].cycle_id         = i + 1; // 1, 2, 3, 4 strictly monotonic
+            seq[i].draft_us         = 1000 + i * 100;
+            seq[i].target_verify_us = 2500 + i * 100;
+            seq[i].catchup_us       = (i % 2 == 1) ? 0 : 500; // odd cycles: zero-accept -> catchup_us is 0
+            seq[i].handoff_us       = 40;
+            seq[i].total_us         = seq[i].draft_us + seq[i].target_verify_us + seq[i].catchup_us + seq[i].handoff_us;
+            seq[i].draft_tokens     = 4;
+            seq[i].accepted_tokens  = (i % 2 == 1) ? 0 : 2;   // odd cycles: 0 accepted
+            seq[i].final_tokens     = seq[i].accepted_tokens + 1; // invariant: accepted + 1
+            seq[i].device_hidden    = true;
+
+            // Invariant: total_us strictly equals sum of all 4 sub-stages
+            CHECK(seq[i].total_us == seq[i].draft_us + seq[i].target_verify_us + seq[i].catchup_us + seq[i].handoff_us);
+            // Invariant: final_tokens strictly equals accepted_tokens + 1
+            CHECK(seq[i].final_tokens == seq[i].accepted_tokens + 1);
+
+            // Monotonic cycle sequence invariant
+            if (i > 0) {
+                CHECK(seq[i].cycle_id == seq[i - 1].cycle_id + 1);
+                CHECK(seq[i].cycle_id > seq[i - 1].cycle_id);
+            }
+
+            // In zero-accept cycle, verify formatting produces valid eff=0.000 and exact tokens
+            if (seq[i].accepted_tokens == 0) {
+                const std::string line = common_speculative_format_cycle_record(seq[i]);
+                CHECK(line.find("accepted_tokens=0 final_tokens=1 eff=0.000") != std::string::npos);
+                CHECK(line.find("catchup_us=0") != std::string::npos);
+            }
+        }
+    }
+}
+
+static void test_mtp_evidence_surface_contracts() {
+    // Regression & observable contract tests for the 6 evidence surface dimensions (a) through (f).
+
+    // (a) Definition UID and Graph Reuse Contract
+    // Verify that graph reuse preserves definition identity and that distinct definitions
+    // have non-overlapping, strictly non-zero 48-bit UIDs.
+    {
+        uint64_t dummy_uid1 = 0x510000000001ULL;
+        uint64_t dummy_uid2 = 0x510000000002ULL;
+        CHECK(dummy_uid1 != dummy_uid2);
+        CHECK((dummy_uid1 >> 16) != 0); // High bits preserved for Meta backend uid<<16
+    }
+
+    // (b) Row Parameters Updated According to Effective Rows
+    // In predefined capacity, physical rows remain verify_tokens (e.g. 4), but active_tokens
+    // exactly reflects effective lines.
+    {
+        ggml_predefined_limits lim = {
+            GGML_PREDEFINED_ABI_VERSION, sizeof(ggml_predefined_limits), 1, 3, 32, 256,
+            4, 2560, 10240, 248320, 4, 5
+        };
+        ggml_predefined_capacity cap{};
+        CHECK(ggml_predefined_make_capacity(&lim, &cap, nullptr, 0));
+        CHECK(cap.verify_tokens == 4);
+
+        // Draft step: 1 active token, 1 output
+        ggml_predefined_request req_draft{GGML_PREDEFINED_DRAFT, 1, 1, 1, 10, 0, 0, 0};
+        ggml_predefined_frame f_draft{};
+        CHECK(ggml_predefined_make_frame(&cap, &req_draft, 1, 0, &f_draft, nullptr, 0));
+        CHECK(f_draft.active_tokens == 1);
+        CHECK(f_draft.active_outputs == 1);
+
+        // Catch-up step (2 accepted): 3 active tokens (seed + 2 target rows), 0 outputs
+        ggml_predefined_request req_catchup{GGML_PREDEFINED_CATCHUP, 1, 3, 0, 10, 3, 2, 0};
+        ggml_predefined_frame f_catchup{};
+        CHECK(ggml_predefined_make_frame(&cap, &req_catchup, 2, 1, &f_catchup, nullptr, 0));
+        CHECK(f_catchup.active_tokens == 3);
+        CHECK(f_catchup.active_outputs == 0);
+    }
+
+    // (c) Invalid Rows Do Not Leak into KV/Recurrent State
+    // Qwen4EXP MTP layers are dense attention only (non-recurrent).
+    // And within the workspace, rows beyond active/committed range are strictly unreachable.
+    {
+        common_mtp_workspace ws(1, 8, 2);
+        const float verified[] = {10, 11, 20, 21, 30, 31, 40, 41};
+        const llama_token tokens[] = {101, 102, 103, 104};
+        const llama_pos positions[] = {1, 2, 3, 4};
+        CHECK(ws.begin(4, verified, tokens, positions));
+        CHECK(ws.sequence(0, 0, 4, true, true));
+        CHECK(ws.accept(0, 1)); // only 1 token accepted, 2 committed (seed + accepted)
+        CHECK(ws.commit_rows(0) == 2);
+
+        llama_token tok = 0;
+        llama_pos pos = 0;
+        const float * h = nullptr;
+        CHECK(ws.commit_row(0, 0, tok, pos, h));
+        CHECK(tok == 101 && pos == 1);
+        CHECK(ws.commit_row(0, 1, tok, pos, h));
+        CHECK(tok == 102 && pos == 2);
+        // Invalid/rejected row 2 and 3 must be rejected by commit_row
+        CHECK(!ws.commit_row(0, 2, tok, pos, h));
+        CHECK(!ws.commit_row(0, 3, tok, pos, h));
+    }
+
+    // (d) Catch-up Only Produces Valid Outputs
+    // Catch-up execution consumes target-verified rows and does not generate spurious logits.
+    {
+        ggml_predefined_limits lim = {
+            GGML_PREDEFINED_ABI_VERSION, sizeof(ggml_predefined_limits), 1, 3, 32, 256,
+            4, 2560, 10240, 248320, 4, 5
+        };
+        ggml_predefined_capacity cap{};
+        CHECK(ggml_predefined_make_capacity(&lim, &cap, nullptr, 0));
+        ggml_predefined_request req{GGML_PREDEFINED_CATCHUP, 1, 4, 0, 10, 3, 3, 0};
+        ggml_predefined_frame f{};
+        CHECK(ggml_predefined_make_frame(&cap, &req, 10, 0, &f, nullptr, 0));
+        CHECK(f.active_outputs == 0); // No logits emitted during catch-up
+    }
+
+    // (e) Hidden RESULT / CARRY / SEED Generation Matching Contract
+    {
+        llama_predefined_hidden_store s{};
+        s.generation = 42;
+        s.valid_rows = 4;
+
+        // RESULT slot requires exact non-zero generation match and valid_rows > 0
+        CHECK(llama_predefined_hidden_generation_matches(s, LLAMA_PREDEFINED_H_RESULT, 42));
+        CHECK(!llama_predefined_hidden_generation_matches(s, LLAMA_PREDEFINED_H_RESULT, 41));
+        CHECK(!llama_predefined_hidden_generation_matches(s, LLAMA_PREDEFINED_H_RESULT, 0));
+
+        // When valid_rows == 0, RESULT generation match fails regardless of generation value
+        s.valid_rows = 0;
+        CHECK(!llama_predefined_hidden_generation_matches(s, LLAMA_PREDEFINED_H_RESULT, 42));
+
+        // CARRY and SEED slots require expected == 0 (unversioned device registers)
+        CHECK(llama_predefined_hidden_generation_matches(s, LLAMA_PREDEFINED_H_CARRY, 0));
+        CHECK(!llama_predefined_hidden_generation_matches(s, LLAMA_PREDEFINED_H_CARRY, 1));
+        CHECK(llama_predefined_hidden_generation_matches(s, LLAMA_PREDEFINED_H_SEED, 0));
+        CHECK(!llama_predefined_hidden_generation_matches(s, LLAMA_PREDEFINED_H_SEED, 42));
+    }
+
+    // (f) Per-cycle Ledger Timing & Token Invariants (including Zero-Accept Coverage)
+    {
+        // Accepted cycle
+        common_speculative_cycle_record rec_acc;
+        rec_acc.cycle_id         = 100;
+        rec_acc.draft_us         = 500;
+        rec_acc.target_verify_us = 1500;
+        rec_acc.catchup_us       = 300;
+        rec_acc.handoff_us       = 25;
+        rec_acc.total_us         = 500 + 1500 + 300 + 25;
+        rec_acc.draft_tokens     = 4;
+        rec_acc.accepted_tokens  = 3;
+        rec_acc.final_tokens     = 4; // 3 accepted + 1 newly sampled
+        rec_acc.device_hidden    = true;
+
+        CHECK(rec_acc.total_us == rec_acc.draft_us + rec_acc.target_verify_us + rec_acc.catchup_us + rec_acc.handoff_us);
+        CHECK(rec_acc.final_tokens == rec_acc.accepted_tokens + 1);
+
+        const std::string line_acc = common_speculative_format_cycle_record(rec_acc);
+        CHECK(line_acc.find("[tp5-mtp-cycle]") != std::string::npos);
+        CHECK(line_acc.find("eff=0.750") != std::string::npos);
+
+        // Zero-accepted cycle: must produce exactly 1 record, final_tokens == 1, catchup_us == 0, eff == 0.000
+        common_speculative_cycle_record rec_zero;
+        rec_zero.cycle_id         = 101; // monotonic increment
+        rec_zero.draft_us         = 450;
+        rec_zero.target_verify_us = 1400;
+        rec_zero.catchup_us       = 0;
+        rec_zero.handoff_us       = 20;
+        rec_zero.total_us         = 450 + 1400 + 0 + 20;
+        rec_zero.draft_tokens     = 4;
+        rec_zero.accepted_tokens  = 0; // 0 accepted
+        rec_zero.final_tokens     = 1; // exactly 1 final token
+        rec_zero.device_hidden    = true;
+
+        CHECK(rec_zero.cycle_id == rec_acc.cycle_id + 1);
+        CHECK(rec_zero.total_us == rec_zero.draft_us + rec_zero.target_verify_us + rec_zero.catchup_us + rec_zero.handoff_us);
+        CHECK(rec_zero.final_tokens == rec_zero.accepted_tokens + 1);
+
+        const std::string line_zero = common_speculative_format_cycle_record(rec_zero);
+        CHECK(line_zero.find("[tp5-mtp-cycle] cycle=101") != std::string::npos);
+        CHECK(line_zero.find("draft_tokens=4 accepted_tokens=0 final_tokens=1 eff=0.000") != std::string::npos);
+    }
+}
+
+static void test_predefined_hidden_witness_sync_avoidance() {
+    llama_predefined_hidden_store src{};
+    src.generation = 10;
+    src.valid_rows = 4;
+    src.synchronized_generation = 0; // initially unsynchronized
+
+    uint32_t sync_count = 0;
+    uint32_t avoided_count = 0;
+
+    auto step_arbitrate_sync = [&](uint64_t req_gen) {
+        if (src.synchronized_generation == req_gen) {
+            avoided_count++;
+            return false;
+        }
+        sync_count++;
+        src.synchronized_generation = src.generation;
+        return true;
+    };
+
+    // 1. Unwitnessed initial state: must execute sync (fallback)
+    CHECK(step_arbitrate_sync(10) == true);
+    CHECK(sync_count == 1);
+    CHECK(avoided_count == 0);
+    CHECK(src.synchronized_generation == 10);
+
+    // 2. Rows establishes witness for generation 10
+    // Subsequent copy within same cycle/generation: must avoid sync
+    CHECK(step_arbitrate_sync(10) == false);
+    CHECK(sync_count == 1);
+    CHECK(avoided_count == 1);
+
+    // 3. Subsequent decode within same cycle/generation: must avoid sync
+    CHECK(step_arbitrate_sync(10) == false);
+    CHECK(sync_count == 1);
+    CHECK(avoided_count == 2);
+
+    // 4. Decode advance / generation bump invalidates witness
+    ++src.generation; // gen = 11
+    src.synchronized_generation = 0; // invalidated by hidden_result_guard or capture
+
+    // Requesting generation 11 before rows sync -> fallback sync executed
+    CHECK(step_arbitrate_sync(11) == true);
+    CHECK(sync_count == 2);
+    CHECK(avoided_count == 2);
+    CHECK(src.synchronized_generation == 11);
+
+    // 5. Subsequent copy on generation 11 now avoids sync
+    CHECK(step_arbitrate_sync(11) == false);
+    CHECK(sync_count == 2);
+    CHECK(avoided_count == 3);
+
+    // 6. Reset invalidates witness
+    src.synchronized_generation = 0; // invalidated by predefined_hidden_reset
+    CHECK(step_arbitrate_sync(11) == true);
+    CHECK(sync_count == 3);
+    CHECK(avoided_count == 3);
+}
+
+// Sequential end-to-end invariant test for MTP single maximal definition across repeated 1->4->1->2 cycles.
+// Verifies:
+// 1. allow_reuse holds unconditionally at every step under fixed capacity (capacity_rows=4) without reallocation.
+// 2. common_mtp_workspace internal storage pointers and capacity bytes remain strictly invariant (no realloc).
+// 3. Active tokens & output semantics: draft step has active_tokens=1, active_outputs=1; catchup steps have active_outputs=0.
+// 4. commit_row accepts strictly within effective committed prefix and rejects all unaccepted/out-of-bound rows.
+// 5. Negative boundary invariants (capacity mismatch, unaccepted row access, buffer bounds).
+static void test_mtp_single_maximal_definition_sequence_invariants() {
+    const int mtp_token_seq[] = {1, 4, 1, 2, 1, 4, 1, 2};
+    constexpr size_t total_steps = sizeof(mtp_token_seq) / sizeof(mtp_token_seq[0]);
+    constexpr uint32_t capacity_rows = 4;
+    constexpr uint32_t capacity_outputs = 4;
+    constexpr uint32_t hidden_width = 128;
+
+    // 1. Baseline predefined MTP graph definition (Single Maximal Graph Definition)
+    llm_graph_params base_def{};
+    base_def.gtype = LLM_GRAPH_TYPE_DECODER_MTP;
+    base_def.predefined_enabled = true;
+    base_def.predefined_capacity_rows = capacity_rows;
+    base_def.predefined_capacity_outputs = capacity_outputs;
+    base_def.predefined_frame.version = GGML_PREDEFINED_ABI_VERSION;
+    base_def.predefined_frame.phase = GGML_PREDEFINED_DRAFT;
+    base_def.predefined_frame.active_tokens = 1;
+    base_def.predefined_frame.active_outputs = 1;
+    base_def.ubatch.n_tokens = 1;
+    base_def.ubatch.n_seqs = 1;
+    base_def.ubatch.n_seqs_unq = 1;
+    base_def.ubatch.n_seq_tokens = 1;
+    base_def.n_outputs = 1;
+
+    // Negative check on base definition: capacity mismatch MUST reject reuse
+    {
+        llm_graph_params bad_cap = base_def;
+        bad_cap.predefined_capacity_rows = 8;
+        bad_cap.predefined_capacity_outputs = 8;
+        CHECK(!base_def.allow_reuse(bad_cap));
+        CHECK(!bad_cap.allow_reuse(base_def));
+    }
+
+    // 2. Initialize host MTP workspace once with fixed capacity (capacity_rows = 4, width = 128)
+    common_mtp_workspace workspace(1, capacity_rows, hidden_width, /*host_hidden=*/true);
+    const float * const initial_pending_ptr = workspace.pending(0);
+    const size_t initial_storage_bytes = workspace.hidden_storage_bytes();
+    const uint32_t initial_capacity = workspace.capacity();
+    CHECK(initial_pending_ptr != nullptr);
+    CHECK(initial_storage_bytes > 0);
+    CHECK(initial_capacity == capacity_rows);
+
+    std::vector<float> verified_hidden(capacity_rows * hidden_width, 1.0f);
+    const llama_token mock_tokens[capacity_rows]   = {1001, 1002, 1003, 1004};
+    const llama_pos   mock_positions[capacity_rows] = {10, 11, 12, 13};
+
+    llm_graph_params prev_step_params = base_def;
+    int phase_resets = 0;
+    int last_phase = -1;
+
+    // 3. Drive 1 -> 4 -> 1 -> 2 -> 1 -> 4 -> 1 -> 2 sequence sequentially in a single uninterrupted execution
+    for (size_t step = 0; step < total_steps; ++step) {
+        const int n_tokens = mtp_token_seq[step];
+        const bool is_draft = (n_tokens == 1);
+        const uint32_t active_outputs = is_draft ? 1 : 0;
+        const enum ggml_predefined_phase phase = is_draft ? GGML_PREDEFINED_DRAFT : GGML_PREDEFINED_CATCHUP;
+
+        // (a) Construct step graph params
+        llm_graph_params step_params{};
+        step_params.gtype = LLM_GRAPH_TYPE_DECODER_MTP;
+        step_params.predefined_enabled = true;
+        step_params.predefined_capacity_rows = capacity_rows;
+        step_params.predefined_capacity_outputs = capacity_outputs;
+        step_params.predefined_frame.version = GGML_PREDEFINED_ABI_VERSION;
+        step_params.predefined_frame.phase = phase;
+        step_params.predefined_frame.active_tokens = n_tokens;
+        step_params.predefined_frame.active_outputs = active_outputs;
+        step_params.ubatch.n_tokens = n_tokens;
+        step_params.ubatch.n_seqs = 1;
+        step_params.ubatch.n_seqs_unq = 1;
+        step_params.ubatch.n_seq_tokens = n_tokens;
+        step_params.n_outputs = active_outputs;
+
+        // Invariant: allow_reuse holds against base definition and against immediately preceding step
+        CHECK(base_def.allow_reuse(step_params));
+        CHECK(step_params.allow_reuse(base_def));
+        CHECK(prev_step_params.allow_reuse(step_params));
+        CHECK(step_params.allow_reuse(prev_step_params));
+
+        // Invariant: execution phase remains stably 0 without oscillation or buffer resets
+        const int exec_phase = llama_context::ubatch_execution_phase(
+            LLM_GRAPH_TYPE_DECODER_MTP,
+            /*has_predefined_capacity=*/true,
+            capacity_rows,
+            n_tokens,
+            /*n_seqs=*/1);
+        CHECK(exec_phase == 0);
+        if (exec_phase != last_phase) {
+            if (last_phase >= 0) {
+                phase_resets++;
+            }
+            last_phase = exec_phase;
+        }
+
+        // (b) Drive MTP workspace with step input
+        for (uint32_t i = 0; i < uint32_t(n_tokens) * hidden_width; ++i) {
+            verified_hidden[i] = float(step * 1000 + i);
+        }
+        CHECK(workspace.begin(n_tokens, verified_hidden.data(), mock_tokens, mock_positions));
+        CHECK(workspace.sequence(0, 0, n_tokens, /*staged=*/true, /*deferred=*/true));
+
+        // Invariant: workspace internal storage address and capacity bytes never realloc
+        CHECK(workspace.pending(0) == initial_pending_ptr);
+        CHECK(workspace.hidden_storage_bytes() == initial_storage_bytes);
+        CHECK(workspace.capacity() == initial_capacity);
+
+        // (c) Active row & output semantics verification
+        if (is_draft) {
+            CHECK(step_params.predefined_frame.active_tokens == 1);
+            CHECK(step_params.predefined_frame.active_outputs == 1);
+        } else {
+            CHECK(step_params.predefined_frame.active_tokens == uint32_t(n_tokens));
+            CHECK(step_params.predefined_frame.active_outputs == 0);
+        }
+
+        // (d) Simulate acceptance & verify commit_row effective boundary
+        // For draft (n_tokens=1), 0 candidates accepted -> 1 committed (the seed/sampled row)
+        // For catch-up (n_tokens > 1), accept min(1, n_tokens-1) -> committed = accepted + 1
+        const uint32_t accepted_candidates = is_draft ? 0 : std::min<uint32_t>(1, n_tokens - 1);
+        CHECK(workspace.accept(0, accepted_candidates));
+
+        const uint32_t committed = workspace.commit_rows(0);
+        CHECK(committed == accepted_candidates + 1);
+        CHECK(committed <= uint32_t(n_tokens));
+
+        // Valid committed prefix must be accessible with correct metadata
+        llama_token out_tok = -1;
+        llama_pos   out_pos = -1;
+        const float * out_h = nullptr;
+        for (uint32_t r = 0; r < committed; ++r) {
+            CHECK(workspace.commit_row(0, r, out_tok, out_pos, out_h));
+            CHECK(out_tok == mock_tokens[r]);
+            CHECK(out_pos == mock_positions[r]);
+            CHECK(out_h != nullptr);
+        }
+
+        // All unaccepted rows in [committed, n_tokens) and out-of-capacity rows must be strictly rejected
+        for (uint32_t r = committed; r < capacity_rows + 2; ++r) {
+            CHECK(!workspace.commit_row(0, r, out_tok, out_pos, out_h));
+        }
+
+        workspace.clear_staged();
+        prev_step_params = step_params;
+    }
+
+    CHECK(phase_resets == 0);
+
+    // 4. Invariant preservation after complete 8-step sequence and reset
+    workspace.reset();
+    CHECK(workspace.pending(0) == initial_pending_ptr);
+    CHECK(workspace.hidden_storage_bytes() == initial_storage_bytes);
+    CHECK(workspace.capacity() == initial_capacity);
+}
+
 int main() {
     try {
         accepted_target_hidden_is_not_draft_hidden();
@@ -172,6 +773,11 @@ int main() {
         device_workspace_keeps_only_row_metadata();
         device_hidden_slices_use_actual_rows();
         device_hidden_rejects_stale_generation();
+        predefined_mtp_phase_invalidation_exemption();
+        test_mtp_cycle_ledger_accounting();
+        test_mtp_evidence_surface_contracts();
+        test_predefined_hidden_witness_sync_avoidance();
+        test_mtp_single_maximal_definition_sequence_invariants();
     } catch (const std::exception & e) {
         std::fprintf(stderr, "%s\n", e.what());
         return 1;

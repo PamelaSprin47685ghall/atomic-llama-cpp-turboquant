@@ -85,6 +85,9 @@ static bool can_reuse_kq_mask(
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
+        if (tokens && n_tokens > tokens->ne[0]) {
+            throw std::runtime_error("predefined token rows exceed fixed token capacity");
+        }
 
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     }
@@ -93,6 +96,9 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(n_embd == embd->ne[0]);
 
         const int64_t n_tokens = ubatch->n_tokens;
+        if (embd && n_tokens > embd->ne[1]) {
+            throw std::runtime_error("predefined embedding rows exceed fixed embedding capacity");
+        }
 
         ggml_backend_tensor_set(embd, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(embd));
     }
@@ -112,6 +118,10 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
 
     if (ubatch->token) {
+        if (tokens && n_tokens > tokens->ne[0]) {
+            throw std::runtime_error("predefined token rows exceed fixed token capacity");
+        }
+
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     } else {
         // note: mtmd embedding input goes through here
@@ -164,6 +174,9 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
+        if (n_tokens * n_pos_per_embd > pos->ne[0]) {
+            throw std::runtime_error("predefined position rows exceed fixed position capacity");
+        }
 
         if (ubatch->token && n_pos_per_embd == 4) {
             // in case we're using M-RoPE with text tokens, convert the 1D positions to 4D
@@ -2797,6 +2810,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_outputs_active (params.n_outputs),
     n_outputs_capacity(params.predefined_enabled ? params.predefined_capacity_outputs : params.n_outputs),
     predefined_enabled(params.predefined_enabled),
+    predefined_target_enabled(params.predefined_target_enabled),
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
     pooling_type     (cparams.pooling_type),
     rope_type        (hparams.rope_type),
@@ -4219,6 +4233,22 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
+llama_ubatch llama_ubatch_expand_capacity(const llama_ubatch & ubatch, uint32_t capacity_rows) {
+    llama_ubatch shape_ubatch = ubatch;
+    if (capacity_rows != 0 && capacity_rows != ubatch.n_tokens) {
+        GGML_ASSERT(ubatch.n_seqs == 1 && ubatch.n_seqs_unq == 1);
+        GGML_ASSERT(capacity_rows >= ubatch.n_tokens);
+        shape_ubatch.n_tokens = capacity_rows;
+        shape_ubatch.n_seq_tokens = capacity_rows;
+    }
+    return shape_ubatch;
+}
+
+int64_t llama_calc_conv_tail_s_idx(int64_t state_cols, uint32_t n_tokens_active, int64_t slot) {
+    const int64_t active_cols = state_cols + n_tokens_active;
+    return std::max<int64_t>(0, active_cols - state_cols - slot);
+}
+
 static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
            ggml_context * ctx0,
      const llama_ubatch & ubatch,
@@ -4235,13 +4265,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
 
-        llama_ubatch shape_ubatch = ubatch;
-        if (capacity_rows != 0 && capacity_rows != ubatch.n_tokens) {
-            GGML_ASSERT(ubatch.n_seqs == 1 && ubatch.n_seqs_unq == 1);
-            GGML_ASSERT(capacity_rows >= ubatch.n_tokens);
-            shape_ubatch.n_tokens = capacity_rows;
-            shape_ubatch.n_seq_tokens = capacity_rows;
-        }
+        llama_ubatch shape_ubatch = llama_ubatch_expand_capacity(ubatch, capacity_rows);
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, shape_ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, shape_ubatch);
 

@@ -89,6 +89,22 @@ struct llama_context {
     bool predefined_hidden_capture(ggml_backend_t producer, const ggml_tensor * tensor, uint32_t offset, uint32_t rows);
     bool predefined_hidden_readback();
     bool predefined_hidden_bind_ubatch(llama_ubatch & ubatch, llama_device_hidden_input & input);
+    void set_predefined_target_enabled(bool enabled) { predefined_target_enabled = enabled; }
+    bool get_predefined_target_enabled() const { return predefined_target_enabled; }
+
+    struct target_capacity_decision {
+        bool entered;
+        uint32_t capacity_rows;
+        uint32_t capacity_outputs;
+        const char * reason;
+    };
+
+    static target_capacity_decision evaluate_target_capacity_admission(
+            bool target_enabled,
+            const llama_hparams & hparams,
+            const llama_ubatch & ubatch,
+            const ggml_predefined_frame & frame,
+            uint32_t verify_tokens);
 
     uint32_t n_ctx()     const;
     uint32_t n_ctx_seq() const;
@@ -606,6 +622,29 @@ private:
     // Phase of the graph computed last: prompt processing and token generation never run at the
     // same time. On a change, the graph for the new phase is reserved, which releases the buffers
     // of the finished one (see graph_reserve).
+public:
+    // Pure logical helper to determine graph execution phase for memory management.
+    // Returns 1 for prompt processing (requiring separate buffer sizing/invalidation),
+    // and 0 for token generation or unified predefined execution definitions.
+    static inline int ubatch_execution_phase(
+            enum llm_graph_type gtype,
+            bool has_predefined_capacity,
+            uint32_t predefined_capacity_rows,
+            int n_tokens,
+            int n_seqs) {
+        // A predefined MTP execution session shares a single maximum-capacity graph definition
+        // across both one-row draft and multi-row catch-up (capacity->verify_tokens).
+        // Old phase switching (n_tokens > n_seqs ? 1 : 0) was designed solely for target prompt
+        // prefill vs token generation to prevent large buffers staying allocated.
+        // Predefined MTP maintains identical execution identity regardless of active token count,
+        // and must not trigger gf_res_prev reset or sched buffer release.
+        if (gtype == LLM_GRAPH_TYPE_DECODER_MTP && has_predefined_capacity && predefined_capacity_rows > 0) {
+            return 0;
+        }
+        return n_tokens > n_seqs ? 1 : 0;
+    }
+
+private:
     int      last_graph_phase = -1;   // -1 nothing yet, 0 token generation, 1 prompt processing
     uint32_t res_n_tokens_pp  = 0;
     uint32_t res_n_seqs_pp    = 0;
@@ -699,6 +738,7 @@ private:
     uint32_t predefined_capacity_rows_current = 0;
     uint32_t predefined_capacity_outputs_current = 0;
     bool predefined_frame_current_valid = false;
+    bool predefined_target_enabled = false;
     ggml_backend_sched_ptr sched;
 
     // training

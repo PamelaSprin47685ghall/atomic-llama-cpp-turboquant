@@ -22,6 +22,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-vulkan.h"
+#include "ggml-predefined.h"
 
 #include <cstdio>
 #include <cstring>
@@ -68,6 +69,10 @@ static comm_init_t  g_comm_init  = nullptr;
 static comm_free_t  g_comm_free  = nullptr;
 static allreduce_t  g_allreduce  = nullptr;
 static tp5_flush_async_t g_flush_async = nullptr;
+typedef bool (*set_predefined_rows_t)(ggml_backend_t, uint32_t, uint32_t);
+typedef void (*set_wire_output_t)(ggml_backend_t, ggml_tensor *, bool, size_t, bool);
+static set_predefined_rows_t g_set_predefined_rows = nullptr;
+static set_wire_output_t     g_set_wire_output     = nullptr;
 static submit_epoch_chain_t               g_submit_epoch_chain  = nullptr;
 static get_cached_cmd_bufs_t              g_get_cached_cmd_bufs = nullptr;
 static prepare_graph_t                    g_prepare_graph       = nullptr;
@@ -103,6 +108,10 @@ static void setup(const std::vector<int> & dev_ids) {
         ggml_backend_vk_reg(), "ggml_backend_vk_get_cached_cmd_bufs");
     g_prepare_graph =
         (prepare_graph_t) ggml_backend_reg_get_proc_address(ggml_backend_vk_reg(), "ggml_backend_comm_prepare_graph");
+    g_set_predefined_rows = (set_predefined_rows_t) ggml_backend_reg_get_proc_address(
+        ggml_backend_vk_reg(), "ggml_backend_set_predefined_rows");
+    g_set_wire_output = (set_wire_output_t) ggml_backend_reg_get_proc_address(
+        ggml_backend_vk_reg(), "ggml_backend_set_wire_output");
     if (!g_comm_init || !g_comm_free || !g_allreduce) {
         fprintf(stderr, "Vulkan registry does not expose the comm interface\n");
         exit(2);
@@ -1081,6 +1090,247 @@ static void run_epoch_chain_regression(void * comm, const std::vector<ggml_backe
     fprintf(stderr, "  epoch-chain regression complete: OK\n");
 }
 
+static void run_capacity_chain_regression(
+        void * comm,
+        const std::vector<ggml_backend_t> & backends,
+        bool is_f16_wire,
+        const std::string & sync_str) {
+    TEST_ASSERT(g_submit_epoch_chain);
+    const size_t P = backends.size();
+    fprintf(stderr, "  running capacity-chain regression (sync=%s, wire=%s, P=%zu)...\n",
+            sync_str.c_str(), is_f16_wire ? "f16" : "f32", P);
+
+    // 1. Pre-flight Fail-Closed Contract Verification
+    // 1.1 Non-zero capacity with nullptr frame must fail closed (return false)
+    {
+        std::vector<std::vector<std::vector<void *>>> dummy_cbs(2, std::vector<std::vector<void *>>(P));
+        std::vector<std::vector<ggml_tensor *>> dummy_tensors(1, std::vector<ggml_tensor *>(P));
+        for (size_t j = 0; j < P; ++j) {
+            dummy_tensors[0][j] = alloc_tensor(backends[j], 2560);
+        }
+        bool null_frame_res = g_submit_epoch_chain(comm, dummy_cbs, dummy_tensors, nullptr, 4, 4);
+        TEST_ASSERT(!null_frame_res);
+        fprintf(stderr, "    preflight nullptr frame with capacity>0 rejection: OK\n");
+    }
+
+    // 1.2 Overflow rejection: active_rows > capacity_rows must fail closed
+    {
+        ggml_predefined_frame overflow_frame{};
+        overflow_frame.version = GGML_PREDEFINED_ABI_VERSION;
+        overflow_frame.phase = GGML_PREDEFINED_TARGET;
+        overflow_frame.active_sequences = 1;
+        overflow_frame.active_tokens = 5; // active 5 > capacity 4
+        overflow_frame.active_outputs = 5;
+
+        std::vector<std::vector<std::vector<void *>>> dummy_cbs(2, std::vector<std::vector<void *>>(P));
+        std::vector<std::vector<ggml_tensor *>> dummy_tensors(1, std::vector<ggml_tensor *>(P));
+        for (size_t j = 0; j < P; ++j) {
+            dummy_tensors[0][j] = alloc_tensor(backends[j], 2560);
+        }
+        bool overflow_res = g_submit_epoch_chain(comm, dummy_cbs, dummy_tensors, &overflow_frame, 4, 4);
+        TEST_ASSERT(!overflow_res);
+        fprintf(stderr, "    preflight active_rows > capacity_rows rejection: OK\n");
+    }
+
+    // 1.3 Dynamic useful-row non-RELAY rejection: active_rows < capacity_rows requires RELAY sync mode
+    if (sync_str != "relay") {
+        ggml_predefined_frame dyn_frame{};
+        dyn_frame.version = GGML_PREDEFINED_ABI_VERSION;
+        dyn_frame.phase = GGML_PREDEFINED_TARGET;
+        dyn_frame.active_sequences = 1;
+        dyn_frame.active_tokens = 2; // active 2 < capacity 4
+        dyn_frame.active_outputs = 2;
+
+        std::vector<std::vector<std::vector<void *>>> dummy_cbs(2, std::vector<std::vector<void *>>(P));
+        std::vector<std::vector<ggml_tensor *>> dummy_tensors(1, std::vector<ggml_tensor *>(P));
+        for (size_t j = 0; j < P; ++j) {
+            dummy_tensors[0][j] = alloc_tensor(backends[j], 2560);
+        }
+        bool non_relay_res = g_submit_epoch_chain(comm, dummy_cbs, dummy_tensors, &dyn_frame, 4, 4);
+        TEST_ASSERT(!non_relay_res);
+        fprintf(stderr, "    preflight dynamic active < capacity non-RELAY fail-closed rejection: OK\n");
+    } else {
+        // Under RELAY: non-direct stages must also fail closed (tp5_relay_direct_stage required)
+        ggml_predefined_frame dyn_frame{};
+        dyn_frame.version = GGML_PREDEFINED_ABI_VERSION;
+        dyn_frame.phase = GGML_PREDEFINED_TARGET;
+        dyn_frame.active_sequences = 1;
+        dyn_frame.active_tokens = 2;
+        dyn_frame.active_outputs = 2;
+
+        std::vector<std::vector<std::vector<void *>>> dummy_cbs(2, std::vector<std::vector<void *>>(P));
+        std::vector<std::vector<ggml_tensor *>> dummy_tensors(1, std::vector<ggml_tensor *>(P));
+        for (size_t j = 0; j < P; ++j) {
+            dummy_tensors[0][j] = alloc_tensor(backends[j], 2560);
+        }
+        bool non_direct_res = g_submit_epoch_chain(comm, dummy_cbs, dummy_tensors, &dyn_frame, 4, 4);
+        TEST_ASSERT(!non_direct_res);
+        fprintf(stderr, "    preflight dynamic active < capacity non-direct stage fail-closed rejection: OK\n");
+    }
+
+    // 2. Full-Capacity Chain Execution (active_rows == capacity_rows == 4)
+    // Exercises submit_epoch_chain with a valid predefined frame across all 5 ranks
+    {
+        const size_t N_STAGES = 2;
+        const size_t n_elems  = 2560; // Divisible by capacity_rows (2560 % 4 == 0)
+
+        ggml_predefined_frame full_frame{};
+        full_frame.version = GGML_PREDEFINED_ABI_VERSION;
+        full_frame.phase = GGML_PREDEFINED_TARGET;
+        full_frame.active_sequences = 1;
+        full_frame.active_tokens = 4;
+        full_frame.active_outputs = 4;
+
+        std::vector<std::vector<std::vector<void *>>> stage_cbs(N_STAGES + 1, std::vector<std::vector<void *>>(P));
+        std::vector<std::vector<ggml_tensor *>>       stage_tensors(N_STAGES, std::vector<ggml_tensor *>(P));
+
+        for (size_t s = 0; s < N_STAGES; ++s) {
+            for (size_t j = 0; j < P; ++j) {
+                stage_tensors[s][j] = alloc_tensor(backends[j], (int64_t)n_elems);
+                fill_tensor(stage_tensors[s][j], std::vector<float>(n_elems, float(s + j + 1)));
+            }
+        }
+        for (auto b : backends) {
+            ggml_backend_synchronize(b);
+        }
+
+        bool ok = g_submit_epoch_chain(comm, stage_cbs, stage_tensors, &full_frame, 4, 4);
+        if (!ok) {
+            fprintf(stderr, "FAIL: submit_epoch_chain with full capacity frame returned false\n");
+            g_failures++;
+            return;
+        }
+
+        for (auto b : backends) {
+            ggml_backend_synchronize(b);
+        }
+
+        const float expected_sum_s0 = float(P * 1 + P * (P - 1) / 2);
+        for (size_t j = 0; j < P; ++j) {
+            std::vector<float> got(n_elems);
+            read_tensor(stage_tensors[0][j], got);
+            for (size_t e = 0; e < n_elems; ++e) {
+                if (std::fabs(got[e] - expected_sum_s0) > 1e-1f) {
+                    fprintf(stderr, "FAIL: full capacity AllReduce mismatch on rank %zu elem %zu: got=%f expect=%f\n",
+                            j, e, got[e], expected_sum_s0);
+                    g_failures++;
+                    return;
+                }
+            }
+        }
+        fprintf(stderr, "    full capacity chain execution (C=4, A=4, %zu stages, %zu elements, P=%zu): OK\n",
+                N_STAGES, n_elems, P);
+    }
+
+    // 3. Positive Variable-Length RELAY Direct Producer Chain Execution (C=4, A=2)
+    // Under RELAY mode, when each rank runs a direct wire producer (pipeline_tp5_add_rows):
+    // active_rows = 2 < capacity_rows = 4, width = 640 floats.
+    // Full tensor = 2560 floats, active payload = 1280 floats.
+    if (sync_str == "relay" && g_set_predefined_rows && g_set_wire_output) {
+        fprintf(stderr, "    running positive variable-length RELAY direct producer test (C=4, A=2, width=640)...\n");
+        const size_t   width     = 640;
+        const uint32_t cap_rows  = 4;
+        const uint32_t act_rows  = 2;
+        const size_t   n_elems   = width * cap_rows; // 2560
+        const size_t   act_elems = width * act_rows; // 1280
+
+        std::vector<ggml_context *>                   stage_ctxs(P, nullptr);
+        std::vector<ggml_backend_buffer_t>            stage_bufs(P, nullptr);
+        std::vector<ggml_cgraph *>                    stage_graphs(P, nullptr);
+        std::vector<std::vector<std::vector<void *>>> cbs(2, std::vector<std::vector<void *>>(P));
+        std::vector<std::vector<ggml_tensor *>>       outputs(1, std::vector<ggml_tensor *>(P));
+
+        for (size_t j = 0; j < P; ++j) {
+            TEST_ASSERT(g_set_predefined_rows(backends[j], act_rows, cap_rows));
+            auto * ctx = ggml_init({ 2 * 1024 * 1024, nullptr, true });
+            TEST_ASSERT(ctx);
+            stage_ctxs[j] = ctx;
+
+            auto * src0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, cap_rows);
+            auto * src1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, cap_rows);
+            auto * dst  = ggml_add(ctx, src0, src1);
+            ggml_set_output(dst);
+
+            auto * gf = ggml_new_graph_custom(ctx, 16, false);
+            ggml_build_forward_expand(gf, dst);
+            stage_graphs[j] = gf;
+
+            auto buf = ggml_backend_alloc_ctx_tensors(ctx, backends[j]);
+            TEST_ASSERT(buf);
+            stage_bufs[j] = buf;
+            outputs[0][j] = dst;
+
+            // Fill src0 & src1: active rows [0, 2) get valid numbers, inactive rows [2, 4) get poison
+            std::vector<float> v0(n_elems, 0.0f);
+            std::vector<float> v1(n_elems, 0.0f);
+            for (size_t r = 0; r < act_rows; ++r) {
+                for (size_t c = 0; c < width; ++c) {
+                    size_t idx = r * width + c;
+                    v0[idx] = float(j + 1);
+                    v1[idx] = 0.5f;
+                }
+            }
+            for (size_t r = act_rows; r < cap_rows; ++r) {
+                for (size_t c = 0; c < width; ++c) {
+                    size_t idx = r * width + c;
+                    v0[idx] = -999.0f;
+                    v1[idx] = -999.0f;
+                }
+            }
+            fill_tensor(src0, v0);
+            fill_tensor(src1, v1);
+
+            g_set_wire_output(backends[j], dst, false, 0, is_f16_wire ? false : true);
+            TEST_ASSERT(g_prepare_graph(comm, j, gf, true));
+            TEST_ASSERT(g_get_cached_cmd_bufs(backends[j], gf, cbs[0][j]));
+        }
+
+        for (auto b : backends) {
+            ggml_backend_synchronize(b);
+        }
+
+        ggml_predefined_frame var_frame{};
+        var_frame.version = GGML_PREDEFINED_ABI_VERSION;
+        var_frame.phase = GGML_PREDEFINED_TARGET;
+        var_frame.active_sequences = 1;
+        var_frame.active_tokens = act_rows;
+        var_frame.active_outputs = act_rows;
+
+        bool var_ok = g_submit_epoch_chain(comm, cbs, outputs, &var_frame, cap_rows, cap_rows);
+        if (!var_ok) {
+            fprintf(stderr, "FAIL: variable-length submit_epoch_chain returned false\n");
+            g_failures++;
+        } else {
+            for (auto b : backends) {
+                ggml_backend_synchronize(b);
+            }
+            // Check active elements [0, act_elems)
+            const float expected_active = float(P * (P + 1) / 2) + float(P) * 0.5f;
+            for (size_t j = 0; j < P; ++j) {
+                std::vector<float> got(n_elems);
+                read_tensor(outputs[0][j], got);
+                for (size_t e = 0; e < act_elems; ++e) {
+                    if (std::fabs(got[e] - expected_active) > 1e-1f) {
+                        fprintf(stderr, "FAIL: active element mismatch on rank %zu elem %zu: got=%f expect=%f\n",
+                                j, e, got[e], expected_active);
+                        g_failures++;
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "    variable-length RELAY direct producer execution (C=4, A=2, act_elems=%zu, P=%zu): OK\n",
+                    act_elems, P);
+        }
+
+        for (size_t j = 0; j < P; ++j) {
+            if (stage_bufs[j]) ggml_backend_buffer_free(stage_bufs[j]);
+            if (stage_ctxs[j]) ggml_free(stage_ctxs[j]);
+        }
+    }
+
+    fprintf(stderr, "  capacity-chain regression complete: OK\n");
+}
+
 // Paired warm measurements. Both paths execute and validate the same work;
 // input reset and readback are outside the timed submission + completion span.
 static void run_paired_chain_benchmark(void *                              comm,
@@ -1775,6 +2025,7 @@ int main(int argc, char ** argv) {
     size_t           chain_stages    = 32;
     bool             run_chain_reg   = false;
     bool             benchmark_chain = false;
+    bool             test_capacity_chain = false;
     std::string wire_str = "f16"; // default matches production collective
     std::string sync_str = "timeline";
     for (int i = 1; i < argc; ++i) {
@@ -1821,6 +2072,8 @@ int main(int argc, char ** argv) {
             chain_stages = atoll(next().c_str());
         else if (a == "--run-chain-regression")
             run_chain_reg = true;
+        else if (a == "--test-capacity-chain")
+            test_capacity_chain = true;
         else if (a == "--benchmark-chain")
             benchmark_chain = true;
     }
@@ -1829,7 +2082,7 @@ int main(int argc, char ** argv) {
         return 2;
     }
     if ((sync_str == "timeline" || sync_str == "star" || sync_str == "relay") &&
-        (run_chain_reg || adversarial)) {
+        (run_chain_reg || adversarial || test_capacity_chain)) {
         // The cached-compute fixture explicitly exercises replay, which is
         // otherwise opt-in independently of collective-plan replay.
         setenv("GGML_VK_CMD_REPLAY", "1", 1);
@@ -2018,9 +2271,11 @@ int main(int argc, char ** argv) {
     // 4.5) Epoch-chain regression & paired benchmark:
     // Run explicitly or as part of the adversarial suite.
     if ((sync_str == "timeline" || sync_str == "star" || sync_str == "drm" || sync_str == "relay") &&
-        (run_chain_reg || adversarial)) {
+        (run_chain_reg || adversarial || test_capacity_chain)) {
         fprintf(stderr, "\n--- Starting Epoch-Chain Regression Suite ---\n");
         run_epoch_chain_regression(comm, g_backends, is_f16_wire);
+        if (g_failures == 0)
+            run_capacity_chain_regression(comm, g_backends, is_f16_wire, sync_str);
         if (g_failures == 0)
             run_cached_compute_chain_regression(comm, is_f16_wire);
         // RELAY deliberately uses the CPU F32 handoff, not the timeline-only

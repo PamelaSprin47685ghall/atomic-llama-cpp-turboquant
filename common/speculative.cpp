@@ -22,6 +22,37 @@
 #include <map>
 #include <cinttypes>
 
+std::string common_speculative_format_cycle_record(const common_speculative_cycle_record & r) {
+    char buf[512];
+    double eff = r.draft_tokens > 0 ? (double) r.accepted_tokens / (double) r.draft_tokens : 0.0;
+    std::snprintf(buf, sizeof(buf),
+            "[tp5-mtp-cycle] cycle=%" PRIu64 " draft_us=%" PRIu64 " target_us=%" PRIu64 " catchup_us=%" PRIu64
+            " handoff_us=%" PRIu64 " total_us=%" PRIu64 " draft_tokens=%" PRIu32 " accepted_tokens=%" PRIu32
+            " final_tokens=%" PRIu32 " eff=%.3f dev_hidden=%d",
+            r.cycle_id, r.draft_us, r.target_verify_us, r.catchup_us,
+            r.handoff_us, r.total_us, r.draft_tokens, r.accepted_tokens,
+            r.final_tokens, eff, (int) r.device_hidden);
+    return std::string(buf);
+}
+
+std::string common_speculative_format_cycle_summary(const common_speculative_cycle_summary & s) {
+    char buf[512];
+    double mean_draft_us = s.total_cycles > 0 ? (double) s.total_draft_us / (double) s.total_cycles : 0.0;
+    double mean_target_us = s.total_cycles > 0 ? (double) s.total_target_verify_us / (double) s.total_cycles : 0.0;
+    double mean_catchup_us = s.total_cycles > 0 ? (double) s.total_catchup_us / (double) s.total_cycles : 0.0;
+    double mean_handoff_us = s.total_cycles > 0 ? (double) s.total_handoff_us / (double) s.total_cycles : 0.0;
+    double mean_total_us = s.total_cycles > 0 ? (double) s.total_us / (double) s.total_cycles : 0.0;
+    double overall_eff = s.total_draft_tokens > 0 ? (double) s.total_accepted_tokens / (double) s.total_draft_tokens : 0.0;
+    std::snprintf(buf, sizeof(buf),
+            "[tp5-mtp-cycle-summary] cycles=%" PRIu64 " avg_draft_us=%.1f avg_target_us=%.1f avg_catchup_us=%.1f"
+            " avg_handoff_us=%.1f avg_total_us=%.1f draft_tokens=%" PRIu64 " accepted_tokens=%" PRIu64
+            " final_tokens=%" PRIu64 " eff=%.3f",
+            s.total_cycles, mean_draft_us, mean_target_us, mean_catchup_us,
+            mean_handoff_us, mean_total_us, s.total_draft_tokens, s.total_accepted_tokens,
+            s.total_final_tokens, overall_eff);
+    return std::string(buf);
+}
+
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_INF(fmt, ...) LOG_INF("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1337,6 +1368,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     int32_t n_batch_alloc = 0;
 
+    // Cycle profiling ledger (draft + target verify + catch-up + hidden handoff)
+    uint64_t cur_cycle_draft_us         = 0;
+    uint64_t cur_cycle_handoff_us       = 0;
+    uint64_t cur_cycle_catchup_us       = 0;
+    uint32_t cur_cycle_draft_tokens     = 0;
+    uint32_t cur_cycle_accepted_tokens  = 0;
+    uint64_t cur_cycle_local_id         = 0;
+    common_speculative * parent_spec    = nullptr;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -1461,33 +1501,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // arrays once, including on a partially constructed driver.
     }
 
-    void reset() override {
-        auto * ctx_dft = this->params.ctx_dft;
-        if (ctx_dft) {
-            if (auto * mem = llama_get_memory(ctx_dft)) {
-                llama_memory_clear(mem, true);
-            }
-            llama_set_nextn_layer_offset(ctx_dft, 0);
-        }
-
-        common_batch_clear(batch);
-        workspace->reset();
-        device_target_generation = 0;
-        if (device_hidden && !llama_predefined_hidden_reset(ctx_dft)) {
-            throw std::runtime_error("device MTP hidden reset failed");
-        }
-        std::fill(paused.begin(), paused.end(), false);
-        std::fill(drafting.begin(), drafting.end(), false);
-        std::fill(i_last.begin(), i_last.end(), -1);
-        std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
-        std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
-        for (auto & h : chain_h) {
-            h.clear();
-        }
-        for (auto & smpl : smpls) {
-            common_sampler_reset(smpl.get());
-        }
-    }
+    void reset() override;
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         const int32_t N = (int32_t) prompt.size();
@@ -1574,6 +1588,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             SPC_ERR("%s", "target nextn embeddings are unavailable\n");
             return false;
         }
+
+        const bool prof_active = std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr;
+        const int64_t t_handoff_start = prof_active ? ggml_time_us() : 0;
 
         if (device_hidden) {
             device_target_generation = llama_predefined_hidden_generation(ctx_tgt);
@@ -1663,6 +1680,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             llama_set_nextn_layer_offset(ctx_dft, 0);
         }
 
+        if (prof_active) {
+            cur_cycle_handoff_us += (ggml_time_us() - t_handoff_start);
+        }
+
         return ok;
     }
 
@@ -1674,7 +1695,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return process_impl(batch_in, &defer);
     }
 
+    struct cycle_settle_guard {
+        common_speculative_impl_draft_mtp * self;
+        bool settled = false;
+
+        ~cycle_settle_guard() {
+            if (!settled && self) {
+                self->record_cycle_settle();
+            }
+        }
+
+        void settle() {
+            if (!settled && self) {
+                self->record_cycle_settle();
+                settled = true;
+            }
+        }
+    };
+
     bool commit() override {
+        cycle_settle_guard guard{this, false};
+
         const uint32_t n_commit = workspace->total_commit_rows();
         if (n_commit > (uint32_t) n_batch_alloc) {
             SPC_ERR("%s", "MTP catch-up exceeds predefined capacity\n");
@@ -1683,6 +1724,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (n_commit == 0) {
             clear_staged();
+            guard.settle();
             return true;
         }
 
@@ -1713,6 +1755,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         clear_staged();
 
+        const bool prof_active = std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr;
+        const int64_t t_catchup_start = prof_active ? ggml_time_us() : 0;
+
         const int32_t rc = device_hidden ? decode_device_target_rows(workspace->first_row(0), n_commit)
                                          : llama_decode(params.ctx_dft, batch);
         if (rc != 0) {
@@ -1720,10 +1765,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return false;
         }
 
+        if (prof_active) {
+            cur_cycle_catchup_us += (ggml_time_us() - t_catchup_start);
+        }
+
+        guard.settle();
         return true;
     }
 
+    void record_cycle_settle();
+
     void draft(common_speculative_draft_params_vec & dparams) override {
+        const bool prof_active = std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr;
+        const int64_t t_draft_start = prof_active ? ggml_time_us() : 0;
+
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
@@ -1887,12 +1942,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 dp.result->clear();
             }
         }
+
+        if (prof_active) {
+            cur_cycle_draft_us += (ggml_time_us() - t_draft_start);
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                if (dparams[s].result) {
+                    cur_cycle_draft_tokens += dparams[s].result->size();
+                }
+            }
+        }
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
+
+        cur_cycle_accepted_tokens += n_accepted;
 
         if (workspace->accept(seq_id, n_accepted) && device_hidden) {
             const uint32_t row = workspace->first_row(seq_id) +
@@ -2428,7 +2494,99 @@ struct common_speculative {
     // Reused acceptance mask. The number of physical sequences is fixed at
     // initialization; process_deferred need not allocate a vector every cycle.
     std::vector<bool> mtp_defer;
+
+    // Cycle profiling ledger state
+    uint64_t                         cycle_id              = 0;
+    uint64_t                         last_target_verify_us = 0;
+    common_speculative_cycle_summary cycle_summary;
 };
+
+void common_speculative_impl_draft_mtp::reset() {
+    auto * ctx_dft = this->params.ctx_dft;
+    if (ctx_dft) {
+        if (auto * mem = llama_get_memory(ctx_dft)) {
+            llama_memory_clear(mem, true);
+        }
+        llama_set_nextn_layer_offset(ctx_dft, 0);
+    }
+
+    common_batch_clear(batch);
+    workspace->reset();
+    device_target_generation = 0;
+    if (device_hidden && !llama_predefined_hidden_reset(ctx_dft)) {
+        throw std::runtime_error("device MTP hidden reset failed");
+    }
+    std::fill(paused.begin(), paused.end(), false);
+    std::fill(drafting.begin(), drafting.end(), false);
+    std::fill(i_last.begin(), i_last.end(), -1);
+    std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
+    std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
+    for (auto & h : chain_h) {
+        h.clear();
+    }
+    for (auto & smpl : smpls) {
+        common_sampler_reset(smpl.get());
+    }
+
+    // Reset per-cycle accumulators to prevent cross-request contamination
+    cur_cycle_draft_us        = 0;
+    cur_cycle_handoff_us      = 0;
+    cur_cycle_catchup_us      = 0;
+    cur_cycle_draft_tokens    = 0;
+    cur_cycle_accepted_tokens = 0;
+    if (parent_spec) {
+        parent_spec->last_target_verify_us = 0;
+    }
+}
+
+void common_speculative_impl_draft_mtp::record_cycle_settle() {
+    const bool prof_active = std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr;
+    if (prof_active) {
+        common_speculative_cycle_record rec;
+        if (parent_spec) {
+            rec.cycle_id = ++parent_spec->cycle_id;
+        } else {
+            rec.cycle_id = ++cur_cycle_local_id;
+        }
+        rec.draft_us         = cur_cycle_draft_us;
+        rec.target_verify_us = parent_spec ? parent_spec->last_target_verify_us : 0;
+        rec.catchup_us       = cur_cycle_catchup_us;
+        rec.handoff_us       = cur_cycle_handoff_us;
+        rec.total_us         = rec.draft_us + rec.target_verify_us + rec.catchup_us + rec.handoff_us;
+        rec.draft_tokens     = cur_cycle_draft_tokens;
+        rec.accepted_tokens  = cur_cycle_accepted_tokens;
+        rec.final_tokens     = cur_cycle_accepted_tokens + 1; // accepted + sampled token
+        rec.device_hidden    = device_hidden;
+
+        // Accumulate into summary
+        if (parent_spec) {
+            auto & s = parent_spec->cycle_summary;
+            s.total_cycles++;
+            s.total_draft_us         += rec.draft_us;
+            s.total_target_verify_us += rec.target_verify_us;
+            s.total_catchup_us       += rec.catchup_us;
+            s.total_handoff_us       += rec.handoff_us;
+            s.total_us               += rec.total_us;
+            s.total_draft_tokens     += rec.draft_tokens;
+            s.total_accepted_tokens  += rec.accepted_tokens;
+            s.total_final_tokens     += rec.final_tokens;
+        }
+
+        // Print structured log
+        const std::string line = common_speculative_format_cycle_record(rec);
+        std::fprintf(stderr, "%s\n", line.c_str());
+    }
+
+    // Reset per-cycle accumulators unconditionally
+    cur_cycle_draft_us         = 0;
+    cur_cycle_handoff_us       = 0;
+    cur_cycle_catchup_us       = 0;
+    cur_cycle_draft_tokens     = 0;
+    cur_cycle_accepted_tokens  = 0;
+    if (parent_spec) {
+        parent_spec->last_target_verify_us = 0;
+    }
+}
 
 static common_ngram_map get_common_ngram_map(
         common_speculative_type type,
@@ -2847,8 +3005,20 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .dparams   = */ common_speculative_draft_params_vec(n_seq),
         /* .impls     = */ std::move(impls),
         /* .impl_last = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
-        /* .mtp_defer = */ std::vector<bool>(n_seq, false)
+        /* .mtp_defer = */ std::vector<bool>(n_seq, false),
+        /* .cycle_id              = */ 0,
+        /* .last_target_verify_us = */ 0,
+        /* .cycle_summary         = */ {}
     };
+
+    for (auto & impl : result->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            auto * mtp = dynamic_cast<common_speculative_impl_draft_mtp *>(impl.get());
+            if (mtp) {
+                mtp->parent_spec = result;
+            }
+        }
+    }
 
     return result;
 }
@@ -2924,6 +3094,8 @@ void common_speculative_reset(common_speculative * spec) {
     if (spec == nullptr) {
         return;
     }
+
+    spec->last_target_verify_us = 0;
 
     for (auto & impl : spec->impls) {
         impl->reset();
@@ -3113,6 +3285,16 @@ void common_speculative_set_paused(common_speculative * spec, llama_seq_id seq_i
     }
 }
 
+void common_speculative_record_target_verify_us(common_speculative * spec, uint64_t target_verify_us) {
+    if (spec) {
+        spec->last_target_verify_us = target_verify_us;
+    }
+}
+
+uint64_t common_speculative_get_target_verify_us(const common_speculative * spec) {
+    return spec ? spec->last_target_verify_us : 0;
+}
+
 void common_speculative_print_stats(const common_speculative * spec) {
     if (spec == nullptr) {
         return;
@@ -3156,5 +3338,9 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_acc_tokens,
                 str_stats.c_str(),
                 str_perf.c_str());
+    }
+
+    if (spec->cycle_summary.total_cycles > 0) {
+        std::fprintf(stderr, "%s\n", common_speculative_format_cycle_summary(spec->cycle_summary).c_str());
     }
 }

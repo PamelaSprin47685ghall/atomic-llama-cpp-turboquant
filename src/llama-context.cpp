@@ -992,6 +992,11 @@ llama_context::llama_context(
         }
     }
 
+    {
+        const char * LLAMA_TARGET_CAPACITY = getenv("LLAMA_TARGET_CAPACITY");
+        predefined_target_enabled = LLAMA_TARGET_CAPACITY ? (atoi(LLAMA_TARGET_CAPACITY) != 0) : predefined_target_enabled;
+    }
+
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
@@ -2399,6 +2404,70 @@ struct llama_compute_guard {
     }
 };
 
+llama_context::target_capacity_decision llama_context::evaluate_target_capacity_admission(
+        bool target_enabled,
+        const llama_hparams & hparams,
+        const llama_ubatch & ubatch,
+        const ggml_predefined_frame & frame,
+        uint32_t verify_tokens) {
+    target_capacity_decision res{};
+    if (!target_enabled) {
+        res.entered = false;
+        res.capacity_rows = ubatch.n_tokens;
+        res.capacity_outputs = std::max<uint32_t>(1u, frame.active_outputs);
+        res.reason = nullptr;
+        return res;
+    }
+
+    const bool ple_unsupported = hparams.ple_n_heads > 0;
+    const bool multi_seq = (ubatch.n_seqs != 1 || ubatch.n_seqs_unq != 1);
+    bool qsa_unsupported = false;
+    for (uint32_t r : hparams.dsv4_compress_ratios) {
+        if (r > 0) {
+            qsa_unsupported = true;
+            break;
+        }
+    }
+
+    bool gdn_unsupported = (hparams.n_embd_r() > 0 || hparams.n_embd_s() > 0);
+    if (!gdn_unsupported) {
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (hparams.is_recr(il)) {
+                gdn_unsupported = true;
+                break;
+            }
+        }
+    }
+
+    if (ple_unsupported) {
+        res.entered = false;
+        res.capacity_rows = ubatch.n_tokens;
+        res.capacity_outputs = std::max<uint32_t>(1u, frame.active_outputs);
+        res.reason = "model with PLE";
+    } else if (multi_seq) {
+        res.entered = false;
+        res.capacity_rows = ubatch.n_tokens;
+        res.capacity_outputs = std::max<uint32_t>(1u, frame.active_outputs);
+        res.reason = "multi-sequence";
+    } else if (qsa_unsupported) {
+        res.entered = false;
+        res.capacity_rows = ubatch.n_tokens;
+        res.capacity_outputs = std::max<uint32_t>(1u, frame.active_outputs);
+        res.reason = "model with QSA";
+    } else if (gdn_unsupported) {
+        res.entered = false;
+        res.capacity_rows = ubatch.n_tokens;
+        res.capacity_outputs = std::max<uint32_t>(1u, frame.active_outputs);
+        res.reason = "model with GDN/recurrent layers";
+    } else {
+        res.entered = true;
+        res.capacity_rows = verify_tokens;
+        res.capacity_outputs = verify_tokens;
+        res.reason = nullptr;
+    }
+    return res;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     predefined_frame_current_valid = false;
     predefined_capacity_rows_current = 0;
@@ -2511,6 +2580,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             // the post-attention FFN/head consumes at most one OUTPUT row.
             predefined_capacity_rows_current = capacity->verify_tokens;
             predefined_capacity_outputs_current = 1;
+        } else if (predefined_target_enabled && request.phase == GGML_PREDEFINED_TARGET) {
+            // TARGET capacity path: evaluate admission via pure production function
+            const auto decision = evaluate_target_capacity_admission(
+                    predefined_target_enabled,
+                    model.hparams,
+                    ubatch,
+                    frame,
+                    capacity->verify_tokens);
+            predefined_capacity_rows_current = decision.capacity_rows;
+            predefined_capacity_outputs_current = decision.capacity_outputs;
+            if (!decision.entered && decision.reason) {
+                LLAMA_LOG_INFO("%s: TARGET capacity path disabled for %s (fail-closed, falling back to exact)\n",
+                        __func__, decision.reason);
+            }
         } else {
             // Target/prefill stays exact until the 48-layer stateful trunk has
             // independently completed capacity lowering.
@@ -2539,8 +2622,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // reserved, which releases what the finished phase was holding (graph_reserve does the
     // invalidation and the release in that order). Without it the larger phase's buffers stay
     // allocated for the whole session.
+    //
+    // Predefined MTP exemption: Predefined MTP sessions share a single unified execution definition
+    // (capacity_rows = capacity->verify_tokens) across both 1-token draft and multi-token catch-up.
+    // Categorizing multi-token catch-up as phase 1 (prompt processing) broke graph reuse by
+    // triggering reset() and sched buffer release. Predefined MTP stays in phase 0.
     {
-        const int phase = ubatch.n_tokens > ubatch.n_seqs ? 1 : 0;   // 1 = prompt processing
+        const int phase = ubatch_execution_phase(
+                gtype,
+                predefined_capacity() != nullptr,
+                predefined_capacity_rows_current,
+                ubatch.n_tokens,
+                ubatch.n_seqs);
         if (phase != last_graph_phase) {
             if (last_graph_phase >= 0) {
                 // Invalidate the previous graph result first: its tensors (the cached inputs of
@@ -2602,6 +2695,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        if (std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr) {
+            const uint64_t uid = gf ? ggml_graph_get_uid(gf) : 0;
+            LLAMA_LOG_INFO("[tp5-mtp-graph] type=%d reuse=1 definition_uid=0x%" PRIx64 " n_reused=%d ubatch_tokens=%d\n",
+                           (int) gtype, uid, n_reused, ubatch.n_tokens);
+        }
     } else {
         res->reset();
 
@@ -2623,6 +2721,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 return nullptr;
             }
             ggml_graph_set_uid(gf, definition_uid);
+            if (std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr) {
+                LLAMA_LOG_INFO("[tp5-mtp-graph] type=%d reuse=0 definition_uid=0x%" PRIx64 " ubatch_tokens=%d\n",
+                               (int) gtype, definition_uid, ubatch.n_tokens);
+            }
         }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
@@ -3746,6 +3848,7 @@ int llama_context::decode_impl(const llama_batch & batch_inp) {
             if (h) {
                 ++h->generation;
                 h->captured_rows = h->valid_rows = 0;
+                h->synchronized_generation = 0;
                 h->host_current = false;
             }
         }
@@ -4927,6 +5030,7 @@ llm_graph_params llama_context::graph_params(
         /*.predefined_capacity_rows =*/ predefined_frame_current_valid ? predefined_capacity_rows_current : 0u,
         /*.predefined_capacity_outputs =*/ predefined_frame_current_valid ? predefined_capacity_outputs_current : 0u,
         /*.predefined_enabled =*/ predefined_frame_current_valid,
+        /*.predefined_target_enabled =*/ predefined_target_enabled,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
         /*.flashprefill_reserve_sizing =*/ fp_reserve_sizing_active,

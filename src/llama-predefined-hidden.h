@@ -31,6 +31,10 @@ struct llama_predefined_hidden_store {
     uint32_t capacity = 0;
     uint32_t result_capacity = 0;
     uint64_t generation = 0;
+    // Witnessed completion generation: tracks the latest generation of this store
+    // that has been proven complete via a host-level synchronize().
+    // Reset to 0 whenever a new decode/capture begins or upon reset.
+    uint64_t synchronized_generation = 0;
     uint32_t captured_rows = 0;
     uint32_t valid_rows = 0;
     uint32_t input_rows = 0;

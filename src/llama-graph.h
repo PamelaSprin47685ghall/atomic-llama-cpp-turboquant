@@ -1389,6 +1389,7 @@ struct llm_graph_params {
     uint32_t predefined_capacity_rows = 0;
     uint32_t predefined_capacity_outputs = 0;
     bool predefined_enabled = false;
+    bool predefined_target_enabled = false;
 
     llm_graph_cb cb;
 
@@ -1476,11 +1477,19 @@ struct llm_graph_params {
         const bool predefined_mtp_dynamic =
             predefined_enabled && other.predefined_enabled &&
             gtype == LLM_GRAPH_TYPE_DECODER_MTP && other.gtype == LLM_GRAPH_TYPE_DECODER_MTP;
+        const bool predefined_target_dynamic =
+            predefined_enabled && other.predefined_enabled &&
+            predefined_target_enabled && other.predefined_target_enabled &&
+            gtype == LLM_GRAPH_TYPE_DECODER && other.gtype == LLM_GRAPH_TYPE_DECODER &&
+            predefined_frame.phase == GGML_PREDEFINED_TARGET &&
+            other.predefined_frame.phase == GGML_PREDEFINED_TARGET &&
+            predefined_capacity_rows == predefined_capacity_outputs &&
+            other.predefined_capacity_rows == other.predefined_capacity_outputs;
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
-            (predefined_mtp_dynamic || ubatch.n_tokens == other.ubatch.n_tokens) &&
-            (predefined_mtp_dynamic || ubatch.n_seq_tokens == other.ubatch.n_seq_tokens) &&
+            (predefined_mtp_dynamic || predefined_target_dynamic || ubatch.n_tokens == other.ubatch.n_tokens) &&
+            (predefined_mtp_dynamic || predefined_target_dynamic || ubatch.n_seq_tokens == other.ubatch.n_seq_tokens) &&
             ubatch.n_seqs       == other.ubatch.n_seqs &&
             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
             (
@@ -1507,7 +1516,7 @@ struct llm_graph_params {
             return false;
         }
 
-        if (!predefined_mtp_dynamic && n_outputs != other.n_outputs) {
+        if (!predefined_mtp_dynamic && !predefined_target_dynamic && n_outputs != other.n_outputs) {
             return false;
         }
 
@@ -1515,7 +1524,7 @@ struct llm_graph_params {
             return false;
         }
 
-        if (samplers.size() > 0 && !predefined_mtp_dynamic) {
+        if (samplers.size() > 0 && !predefined_mtp_dynamic && !predefined_target_dynamic) {
             if (!ubatch.data || !other.ubatch.data) {
                 return false;
             }
@@ -1737,6 +1746,7 @@ struct llm_graph_context {
     const int64_t n_outputs_active;
     const int64_t n_outputs_capacity;
     const bool predefined_enabled;
+    const bool predefined_target_enabled;
     const int32_t n_ctx_orig; // yarn
 
     const enum llama_pooling_type pooling_type;
@@ -2186,6 +2196,13 @@ struct llm_graph_context {
             ggml_tensor * dense_2_b,
             ggml_tensor * dense_3) const;
 };
+
+// Expand ubatch token dimensions to fixed capacity for single-sequence capacity graph
+llama_ubatch llama_ubatch_expand_capacity(const llama_ubatch & ubatch, uint32_t capacity_rows);
+
+// Calculate the slice start index in conv_input for a given rollback slot,
+// ensuring the extracted tail strictly covers active tokens and never the inactive capacity suffix.
+int64_t llama_calc_conv_tail_s_idx(int64_t state_cols, uint32_t n_tokens_active, int64_t slot);
 
 // TODO: better name
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional);

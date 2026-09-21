@@ -50,6 +50,7 @@ layout(std430, binding = 2) writeonly buffer Scatter {
 layout(push_constant) uniform InjectParams {
     uint width;
     uint streams;
+    uint active_rows;
 } p;
 
 void main() {
@@ -59,38 +60,40 @@ void main() {
         return;
     }
     const uint k_dim = p.width * p.streams;
-    float acc = 0.0;
-    for (uint col = 8u * lane; col < k_dim; col += 8u * 256u) {
-        const uint valid = min(8u, k_dim - col);
-        float xv[8];
-        [[unroll]] for (uint e = 0u; e < 8u; ++e) {
-            xv[e] = e < valid ? x[col + e] : 0.0;
+    [[unroll]] for (uint token = 0u; token < 4u; ++token) {
+        if (token >= p.active_rows) break;
+        float acc = 0.0;
+        const uint token_x_offset = token * k_dim;
+        for (uint col = 8u * lane; col < k_dim; col += 8u * 256u) {
+            const uint valid = min(8u, k_dim - col);
+            float xv[8];
+            [[unroll]] for (uint e = 0u; e < 8u; ++e) {
+                xv[e] = e < valid ? x[token_x_offset + col + e] : 0.0;
+            }
+            const uint ib  = (stream * k_dim + col) / 32u;
+            const uint iqs = col % 32u;
+            const i8vec2 q0 = unpack8(int32_t(w[ib].qs[iqs / 2u])).xy;
+            const i8vec2 q1 = unpack8(int32_t(w[ib].qs[iqs / 2u + 1u])).xy;
+            const i8vec2 q2 = unpack8(int32_t(w[ib].qs[iqs / 2u + 2u])).xy;
+            const i8vec2 q3 = unpack8(int32_t(w[ib].qs[iqs / 2u + 3u])).xy;
+            const vec4 v0 = vec4(q0.x, q0.y, q1.x, q1.y);
+            const vec4 v1 = vec4(q2.x, q2.y, q3.x, q3.y);
+            const vec4 b0 = vec4(xv[0], xv[1], xv[2], xv[3]);
+            const vec4 b1 = vec4(xv[4], xv[5], xv[6], xv[7]);
+            // Match the established HC inject Q8 two-dot/FMA contraction order.
+            float rowtmp = dot(b1, v1);
+            rowtmp       = fma(b0.w, v0.w, rowtmp);
+            rowtmp       = fma(b0.z, v0.z, rowtmp);
+            rowtmp       = fma(b0.y, v0.y, rowtmp);
+            rowtmp       = fma(b0.x, v0.x, rowtmp);
+            acc          = fma(rowtmp, float(w[ib].d), acc);
         }
-        const uint ib  = (stream * k_dim + col) / 32u;
-        const uint iqs = col % 32u;
-        const i8vec2 q0 = unpack8(int32_t(w[ib].qs[iqs / 2u])).xy;
-        const i8vec2 q1 = unpack8(int32_t(w[ib].qs[iqs / 2u + 1u])).xy;
-        const i8vec2 q2 = unpack8(int32_t(w[ib].qs[iqs / 2u + 2u])).xy;
-        const i8vec2 q3 = unpack8(int32_t(w[ib].qs[iqs / 2u + 3u])).xy;
-        const vec4 v0 = vec4(q0.x, q0.y, q1.x, q1.y);
-        const vec4 v1 = vec4(q2.x, q2.y, q3.x, q3.y);
-        const vec4 b0 = vec4(xv[0], xv[1], xv[2], xv[3]);
-        const vec4 b1 = vec4(xv[4], xv[5], xv[6], xv[7]);
-        // Match the established HC inject Q8 two-dot/FMA contraction order.
-        float rowtmp = dot(b1, v1);
-        rowtmp       = fma(b0.w, v0.w, rowtmp);
-        rowtmp       = fma(b0.z, v0.z, rowtmp);
-        rowtmp       = fma(b0.y, v0.y, rowtmp);
-        rowtmp       = fma(b0.x, v0.x, rowtmp);
-        acc           = fma(rowtmp, float(w[ib].d), acc);
-    }
-    acc = tp5_hc_sum32(acc);
-    if (lane == 0u) {
-        // Match build_hc_combine / the existing fused HC path exactly for
-        // the production 4-stream model: MUL by 0.25, then the explicit +0.
-        precise float scaled = acc * 0.25 + 0.0;
-        precise float sig    = 1.0 / (1.0 + exp(-scaled));
-        scatter[stream]      = sig * 2.0 + 0.0;
+        acc = tp5_hc_sum32(acc);
+        if (lane == 0u) {
+            precise float scaled = acc * 0.25 + 0.0;
+            precise float sig    = 1.0 / (1.0 + exp(-scaled));
+            scatter[token * p.streams + stream] = sig * 2.0 + 0.0;
+        }
     }
 }
 #endif
@@ -113,6 +116,7 @@ layout(push_constant) uniform UpQ8Params {
     uint rank_dim;
     uint streams;
     uint rows_per_wg;
+    uint active_rows;
 } p;
 
 int32_t pack_up_q8_pair(const int16_t a, const int16_t b) {
@@ -126,43 +130,50 @@ void main() {
     if (p.rank_dim != 320u || p.streams != 4u || p.rows_per_wg != 24u || gl_NumSubgroups != 8u) return;
     const uint blocks = 10u;
     const uint wave = gl_SubgroupID;
-    if (lane < 30u) {
-        const uint wave_row = lane / 10u;
-        const uint block = lane - wave_row * 10u;
-        const uint row_slot = wave * 3u + wave_row;
-        const uint row = gl_WorkGroupID.x * 24u + row_slot;
-        vec4 partial = vec4(0.0);
-        const late_q8_0 a = lo_q8_in[block];
-        if (row < p.width) {
-        [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
-            const uint weight_row = stream * p.width + row;
-            const late_q8_0 w = up_w[weight_row * blocks + block];
-            int32_t isum = 0;
-            [[unroll]] for (uint k = 0u; k < 8u; ++k) {
-                const int32_t wp = pack_up_q8_pair(w.qs[2u*k], w.qs[2u*k + 1u]);
-                const int32_t ap = pack_up_q8_pair(a.qs[2u*k], a.qs[2u*k + 1u]);
-                isum += dotPacked4x8EXT(wp, ap);
+
+    [[unroll]] for (uint token = 0u; token < 4u; ++token) {
+        if (token >= p.active_rows) break;
+        if (lane < 30u) {
+            const uint wave_row = lane / 10u;
+            const uint block = lane - wave_row * 10u;
+            const uint row_slot = wave * 3u + wave_row;
+            const uint row = gl_WorkGroupID.x * 24u + row_slot;
+            vec4 partial = vec4(0.0);
+            const late_q8_0 a = lo_q8_in[token * blocks + block];
+            if (row < p.width) {
+            [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
+                const uint weight_row = stream * p.width + row;
+                const late_q8_0 w = up_w[weight_row * blocks + block];
+                int32_t isum = 0;
+                [[unroll]] for (uint k = 0u; k < 8u; ++k) {
+                    const int32_t wp = pack_up_q8_pair(w.qs[2u*k], w.qs[2u*k + 1u]);
+                    const int32_t ap = pack_up_q8_pair(a.qs[2u*k], a.qs[2u*k + 1u]);
+                    isum += dotPacked4x8EXT(wp, ap);
+                }
+                    partial[stream] = float(isum) * (float(w.d) * float(a.d));
+                }
             }
-                partial[stream] = float(isum) * (float(w.d) * float(a.d));
+            up_partial[row_slot * 10u + block] = partial;
+        }
+        barrier();
+
+        if (gl_LocalInvocationID.x < 24u) {
+            const uint row_slot = gl_LocalInvocationID.x;
+            const uint row = gl_WorkGroupID.x * 24u + row_slot;
+            if (row < p.width) {
+                vec4 proj = up_partial[row_slot * 10u];
+                [[unroll]] for (uint block = 1u; block < 10u; ++block)
+                    proj += up_partial[row_slot * 10u + block];
+                const vec4 gate = vec4(1.0) / (vec4(1.0) + exp(-proj));
+                const uint norm_token_offset = token * (4u * p.width);
+                const vec4 n = vec4(norm_in[norm_token_offset + row],
+                                    norm_in[norm_token_offset + p.width + row],
+                                    norm_in[norm_token_offset + 2u * p.width + row],
+                                    norm_in[norm_token_offset + 3u * p.width + row]);
+                mixed_out[token * p.width + row] = dot(n, gate) * 0.25;
             }
         }
-        up_partial[row_slot * 10u + block] = partial;
-    }
-    barrier();
-
-    if (gl_LocalInvocationID.x < 24u) {
-        const uint row_slot = gl_LocalInvocationID.x;
-        const uint row = gl_WorkGroupID.x * 24u + row_slot;
-        if (row >= p.width) return;
-        vec4 proj = up_partial[row_slot * 10u];
-        [[unroll]] for (uint block = 1u; block < 10u; ++block)
-            proj += up_partial[row_slot * 10u + block];
-        const vec4 gate = vec4(1.0) / (vec4(1.0) + exp(-proj));
-        const vec4 n = vec4(norm_in[row],
-                            norm_in[p.width + row],
-                            norm_in[2u * p.width + row],
-                            norm_in[3u * p.width + row]);
-        mixed_out[row] = dot(n, gate) * 0.25;
+        barrier();
     }
 }
 #endif
@@ -185,7 +196,7 @@ layout(push_constant) uniform ActQ8Params {
     uint width;
     uint streams;
     uint my_rank;
-    uint reserved;
+    uint active_rows;
 } p;
 
 shared int q_shared[256];
@@ -200,28 +211,32 @@ void main() {
     const uint blocks = p.width / 32u;
     if (p.streams != 4u || gl_NumSubgroups != 8u || (blocks & 1u) != 0u || block >= blocks) return;
 
-    const uint col = block * 32u + lane;
-    const uint global_col = stream * p.width + col;
-    if (stream == 0u) z_shared[block_slot * 32u + lane] = local_z[col];
-    barrier();
-    precise float value = z_shared[block_slot * 32u + lane] * scatter[stream];
-    if (p.my_rank == 0u) value = value + residual[global_col];
-    value = value * gamma[global_col];
+    [[unroll]] for (uint token = 0u; token < 4u; ++token) {
+        if (token >= p.active_rows) break;
+        const uint col = block * 32u + lane;
+        const uint global_col = stream * p.width + col;
+        if (stream == 0u) z_shared[block_slot * 32u + lane] = local_z[token * p.width + col];
+        barrier();
+        precise float value = z_shared[block_slot * 32u + lane] * scatter[token * p.streams + stream];
+        if (p.my_rank == 0u) value = value + residual[token * (p.streams * p.width) + global_col];
+        value = value * gamma[global_col];
 
-    const float amax = subgroupMax(abs(value));
-    const float d = amax * (1.0 / 127.0);
-    const float inv_d = d != 0.0 ? 1.0 / d : 0.0;
-    const int q = clamp(int(round(value * inv_d)), -127, 127);
-    q_shared[subgroup * 32u + lane] = q;
-    barrier();
+        const float amax = subgroupMax(abs(value));
+        const float d = amax * (1.0 / 127.0);
+        const float inv_d = d != 0.0 ? 1.0 / d : 0.0;
+        const int q = clamp(int(round(value * inv_d)), -127, 127);
+        q_shared[subgroup * 32u + lane] = q;
+        barrier();
 
-    const uint out_block = stream * blocks + block;
-    if (lane == 0u) act_q8[out_block].d = float16_t(d);
-    if (lane < 16u) {
-        const uint base = subgroup * 32u + 2u * lane;
-        const uint lo = uint(q_shared[base]) & 0xffu;
-        const uint hi = uint(q_shared[base + 1u]) & 0xffu;
-        act_q8[out_block].qs[lane] = int16_t(lo | (hi << 8u));
+        const uint out_block = token * (p.streams * blocks) + stream * blocks + block;
+        if (lane == 0u) act_q8[out_block].d = float16_t(d);
+        if (lane < 16u) {
+            const uint base = subgroup * 32u + 2u * lane;
+            const uint lo = uint(q_shared[base]) & 0xffu;
+            const uint hi = uint(q_shared[base + 1u]) & 0xffu;
+            act_q8[out_block].qs[lane] = int16_t(lo | (hi << 8u));
+        }
+        barrier();
     }
 }
 #endif
@@ -249,6 +264,7 @@ layout(push_constant) uniform Q8DotParams {
     uint rows_per_wg;
     uint n_workgroups;
     uint late_word_offset;
+    uint active_rows;
 } p;
 
 shared uint publish_last;
@@ -266,41 +282,43 @@ void main() {
     const uint lane16 = lid & 15u;
     const uint row = gl_WorkGroupID.x * 16u + row_slot;
     const uint blocks = p.width / 32u;
-    vec4 acc = vec4(0.0);
 
-    for (uint block = lane16; block < blocks; block += 16u) {
-        [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
-            const uint wi = (row * 4u + stream) * blocks + block;
-            const uint ai = stream * blocks + block;
-            int32_t isum = 0;
-            [[unroll]] for (uint k = 0u; k < 8u; ++k) {
-                const int32_t wp = pack_q8_pair(w_q8[wi].qs[2u*k], w_q8[wi].qs[2u*k + 1u]);
-                const int32_t ap = pack_q8_pair(act_q8[ai].qs[2u*k], act_q8[ai].qs[2u*k + 1u]);
-                isum += dotPacked4x8EXT(wp, ap);
+    [[unroll]] for (uint token = 0u; token < 4u; ++token) {
+        if (token >= p.active_rows) break;
+        vec4 acc = vec4(0.0);
+        const uint token_act_offset = token * (p.streams * blocks);
+        for (uint block = lane16; block < blocks; block += 16u) {
+            [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
+                const uint wi = (row * 4u + stream) * blocks + block;
+                const uint ai = token_act_offset + stream * blocks + block;
+                int32_t isum = 0;
+                [[unroll]] for (uint k = 0u; k < 8u; ++k) {
+                    const int32_t wp = pack_q8_pair(w_q8[wi].qs[2u*k], w_q8[wi].qs[2u*k + 1u]);
+                    const int32_t ap = pack_q8_pair(act_q8[ai].qs[2u*k], act_q8[ai].qs[2u*k + 1u]);
+                    isum += dotPacked4x8EXT(wp, ap);
+                }
+                acc[stream] = fma(float(isum), float(w_q8[wi].d) * float(act_q8[ai].d), acc[stream]);
             }
-            acc[stream] = fma(float(isum), float(w_q8[wi].d) * float(act_q8[ai].d), acc[stream]);
         }
-    }
-    row_partial[lid] = acc;
-    barrier();
-    if (lane16 == 0u) {
-        vec4 sum = row_partial[row_slot * 16u];
-        [[unroll]] for (uint k = 1u; k < 16u; ++k)
-            sum += row_partial[row_slot * 16u + k];
-        group_out[row_slot] = sum;
-    }
+        row_partial[lid] = acc;
+        barrier();
+        if (lane16 == 0u) {
+            vec4 sum = row_partial[row_slot * 16u];
+            [[unroll]] for (uint k = 1u; k < 16u; ++k)
+                sum += row_partial[row_slot * 16u + k];
+            group_out[row_slot] = sum;
+        }
 
-    // The workgroup owns sixteen consecutive rows. Pack those results per
-    // stream into eight 32-bit F16 pairs directly in the local device-coherent
-    // VRAM sidecar. No system-RAM sidecar or publisher dispatch exists.
-    barrier();
-    if (lid < 32u) {
-        const uint stream = lid >> 3u;
-        const uint pair = lid & 7u;
-        const uint row0 = 2u * pair;
-        const uint elem = stream * p.rank_dim + gl_WorkGroupID.x * 16u + row0;
-        const uint word = p.late_word_offset + elem / 2u;
-        qmail[word] = packHalf2x16(vec2(group_out[row0][stream], group_out[row0 + 1u][stream]));
+        barrier();
+        if (lid < 32u) {
+            const uint stream = lid >> 3u;
+            const uint pair = lid & 7u;
+            const uint row0 = 2u * pair;
+            const uint elem = (token * p.streams + stream) * p.rank_dim + gl_WorkGroupID.x * 16u + row0;
+            const uint word = p.late_word_offset + elem / 2u;
+            qmail[word] = packHalf2x16(vec2(group_out[row0][stream], group_out[row0 + 1u][stream]));
+        }
+        barrier();
     }
 
     // Device-wide completion protocol, matching the established fused HC
@@ -352,6 +370,7 @@ layout(push_constant) uniform QParams {
     uint rank_dim;
     uint streams;
     uint my_rank;
+    uint active_rows;
 } p;
 
 void main() {
@@ -361,56 +380,56 @@ void main() {
         return;
     }
     const uint k_dim = p.width * p.streams;
-    float acc[4] = { 0.0, 0.0, 0.0, 0.0 };
 
-    // Production Qwen shape: width is an integer number of 256-column tiles,
-    // exactly matching one 32-lane subgroup × 8 columns/lane.  Traverse K
-    // once and keep four stream accumulators live.  local_z is common to all
-    // four streams, so this turns four identical VRAM reads into one without
-    // changing the per-stream column accumulation order.
-    const vec4 scatter4 = vec4(scatter[0], scatter[1], scatter[2], scatter[3]);
-    for (uint col = 8u * lane; col < p.width; col += 8u * 32u) {
-        const vec4 z0 = local_z4[col / 4u];
-        const vec4 z1 = local_z4[col / 4u + 1u];
-        [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
-            const uint base       = stream * p.width;
-            const float s         = scatter4[stream];
-            const uint global_col = base + col;
-            const uint ib  = (row * k_dim + global_col) / 32u;
-            const uint iqs = global_col % 32u;
+    [[unroll]] for (uint token = 0u; token < 4u; ++token) {
+        if (token >= p.active_rows) break;
+        float acc[4] = { 0.0, 0.0, 0.0, 0.0 };
+        const vec4 scatter4 = vec4(
+            scatter[token * p.streams + 0u],
+            scatter[token * p.streams + 1u],
+            scatter[token * p.streams + 2u],
+            scatter[token * p.streams + 3u]);
+        const uint token_z_offset = token * (p.width / 4u);
+        const uint token_res_offset = token * (k_dim / 4u);
+        for (uint col = 8u * lane; col < p.width; col += 8u * 32u) {
+            const vec4 z0 = local_z4[token_z_offset + col / 4u];
+            const vec4 z1 = local_z4[token_z_offset + col / 4u + 1u];
+            [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
+                const uint base       = stream * p.width;
+                const float s         = scatter4[stream];
+                const uint global_col = base + col;
+                const uint ib  = (row * k_dim + global_col) / 32u;
+                const uint iqs = global_col % 32u;
 
-            vec4 rz0 = z0 * s;
-            vec4 rz1 = z1 * s;
-            if (p.my_rank == 0u) {
-                rz0 += residual4[global_col / 4u];
-                rz1 += residual4[global_col / 4u + 1u];
+                vec4 rz0 = z0 * s;
+                vec4 rz1 = z1 * s;
+                if (p.my_rank == 0u) {
+                    rz0 += residual4[token_res_offset + global_col / 4u];
+                    rz1 += residual4[token_res_offset + global_col / 4u + 1u];
+                }
+                const vec4 b0 = gamma4[global_col / 4u] * rz0;
+                const vec4 b1 = gamma4[global_col / 4u + 1u] * rz1;
+
+                const i8vec2 q0 = unpack8(int32_t(w[ib].qs[iqs / 2u])).xy;
+                const i8vec2 q1 = unpack8(int32_t(w[ib].qs[iqs / 2u + 1u])).xy;
+                const i8vec2 q2 = unpack8(int32_t(w[ib].qs[iqs / 2u + 2u])).xy;
+                const i8vec2 q3 = unpack8(int32_t(w[ib].qs[iqs / 2u + 3u])).xy;
+                const vec4 v0 = vec4(q0.x, q0.y, q1.x, q1.y);
+                const vec4 v1 = vec4(q2.x, q2.y, q3.x, q3.y);
+
+                float rowtmp = dot(b0, v0);
+                rowtmp      += dot(b1, v1);
+                rowtmp      *= float(w[ib].d);
+                acc[stream] += rowtmp;
             }
-            const vec4 b0 = gamma4[global_col / 4u] * rz0;
-            const vec4 b1 = gamma4[global_col / 4u + 1u] * rz1;
-
-            const i8vec2 q0 = unpack8(int32_t(w[ib].qs[iqs / 2u])).xy;
-            const i8vec2 q1 = unpack8(int32_t(w[ib].qs[iqs / 2u + 1u])).xy;
-            const i8vec2 q2 = unpack8(int32_t(w[ib].qs[iqs / 2u + 2u])).xy;
-            const i8vec2 q3 = unpack8(int32_t(w[ib].qs[iqs / 2u + 3u])).xy;
-            const vec4 v0 = vec4(q0.x, q0.y, q1.x, q1.y);
-            const vec4 v1 = vec4(q2.x, q2.y, q3.x, q3.y);
-
-            // Mirror native Q8_0 HC W_down: two 4-wide dots, apply the block
-            // scale, then accumulate the row partial.  The only difference is
-            // that B is formed lazily from the linear sufficient-statistic
-            // expression instead of loaded from a materialized normalized
-            // tensor.
-            float rowtmp = dot(b0, v0);
-            rowtmp      += dot(b1, v1);
-            rowtmp      *= float(w[ib].d);
-            acc[stream] += rowtmp;
         }
-    }
 
-    [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
-        acc[stream] = tp5_hc_sum32(acc[stream]);
-        if (lane == 0u) {
-            q_out[stream * p.rank_dim + row] = acc[stream];
+        [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
+            acc[stream] = tp5_hc_sum32(acc[stream]);
+            if (lane == 0u) {
+                const uint out_idx = (token * p.streams + stream) * p.rank_dim + row;
+                q_out[out_idx] = acc[stream];
+            }
         }
     }
 }

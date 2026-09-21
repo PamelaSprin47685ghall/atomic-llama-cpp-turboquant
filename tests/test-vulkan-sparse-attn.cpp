@@ -560,13 +560,13 @@ static bool test_repeated_graph_mask_mutation(ggml_backend_t backend_gpu, ggml_b
     fa_graph_fixture fix_cpu(cfg, backend_cpu, true);
     fix_cpu.out->op_params[4] = 0; // CPU dense reference
 
-    typedef void (*get_replay_stats_t)(ggml_backend_t, uint64_t *, uint64_t *);
+    typedef void (*get_replay_stats_t)(ggml_backend_t, uint64_t *, uint64_t *, uint64_t *, uint64_t *);
     ggml_backend_reg_t reg_gpu = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_gpu));
     get_replay_stats_t get_replay_stats = reg_gpu ?
         (get_replay_stats_t) ggml_backend_reg_get_proc_address(reg_gpu, "ggml_backend_vk_get_replay_stats") : nullptr;
 
     uint64_t replay_hits_start = 0, replay_misses_start = 0;
-    if (get_replay_stats) get_replay_stats(backend_gpu, &replay_hits_start, &replay_misses_start);
+    if (get_replay_stats) get_replay_stats(backend_gpu, &replay_hits_start, &replay_misses_start, nullptr, nullptr);
 
     // Generate fixed Q, K, V data once so that only the mask mutates across iterations
     test_data td = generate_test_inputs(cfg, 555);
@@ -610,7 +610,7 @@ static bool test_repeated_graph_mask_mutation(ggml_backend_t backend_gpu, ggml_b
 
     if (get_replay_stats) {
         uint64_t replay_hits_end = 0, replay_misses_end = 0;
-        get_replay_stats(backend_gpu, &replay_hits_end, &replay_misses_end);
+        get_replay_stats(backend_gpu, &replay_hits_end, &replay_misses_end, nullptr, nullptr);
         std::printf("  Replay stats during mask mutation: hits=%llu (+%llu), misses=%llu (+%llu)\n",
                     (unsigned long long)replay_hits_end, (unsigned long long)(replay_hits_end - replay_hits_start),
                     (unsigned long long)replay_misses_end, (unsigned long long)(replay_misses_end - replay_misses_start));

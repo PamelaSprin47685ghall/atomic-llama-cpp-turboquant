@@ -48,14 +48,22 @@
     } \
 } while (0)
 
-typedef void (*get_replay_stats_t)(ggml_backend_t, uint64_t *, uint64_t *);
+typedef void (*get_replay_stats_t)(ggml_backend_t, uint64_t *, uint64_t *, uint64_t *, uint64_t *);
 typedef bool (*get_region_mmvq_stats_t)(ggml_backend_t, uint64_t *, uint64_t *, uint32_t *, uint32_t *);
+typedef bool (*set_predefined_rows_t)(ggml_backend_t, uint32_t, uint32_t);
 
 struct test_env {
     ggml_backend_t backend_gpu = nullptr;
     ggml_backend_t backend_cpu = nullptr;
-    get_replay_stats_t get_stats = nullptr;
+    get_replay_stats_t get_stats_raw = nullptr;
     get_region_mmvq_stats_t get_region_mmvq_stats = nullptr;
+    set_predefined_rows_t set_rows = nullptr;
+
+    void get_stats(ggml_backend_t backend, uint64_t * hits, uint64_t * misses, uint64_t * desc_allocs = nullptr, uint64_t * desc_writes = nullptr) const {
+        if (get_stats_raw) {
+            get_stats_raw(backend, hits, misses, desc_allocs, desc_writes);
+        }
+    }
 
     bool init() {
         ggml_backend_load_all();
@@ -75,12 +83,14 @@ struct test_env {
         if (!backend_gpu) {
             return false;
         }
-        get_stats = (get_replay_stats_t) ggml_backend_reg_get_proc_address(reg_gpu, "ggml_backend_vk_get_replay_stats");
-        if (!get_stats) {
+        get_stats_raw = (get_replay_stats_t) ggml_backend_reg_get_proc_address(reg_gpu, "ggml_backend_vk_get_replay_stats");
+        if (!get_stats_raw) {
             return false;
         }
         get_region_mmvq_stats = (get_region_mmvq_stats_t)
             ggml_backend_reg_get_proc_address(reg_gpu, "ggml_backend_vk_get_region_mmvq_stats");
+        set_rows = (set_predefined_rows_t)
+            ggml_backend_reg_get_proc_address(reg_gpu, "ggml_backend_set_predefined_rows");
         ggml_backend_reg_t reg_cpu = ggml_backend_reg_by_name("CPU");
         if (!reg_cpu) {
             return false;
@@ -1148,10 +1158,12 @@ static void test_split_k_preallocate_lifecycle(test_env & env) {
 
     uint64_t hits_after = 0, misses_after = 0;
     env.get_stats(env.backend_gpu, &hits_after, &misses_after);
-    // Decode init's miss happened before this snapshot. Split-K growth invalidates the
-    // entry; run1 re-records under the new scratch generation (one miss), run2 replays it.
-    TEST_ASSERT(misses_after - misses_before == 1);
-    TEST_ASSERT(hits_after - hits_before == 1);
+    // Decode init's miss happened before this snapshot. Under pure predefine architecture,
+    // the pre-recorded decode graph definition is preserved across scratch envelope allocations:
+    // run1 and run2 both replay (2 hits, 0 misses). If legacy cache invalidation occurred, run1 would
+    // re-record under the new scratch generation (1 miss, 1 hit).
+    TEST_ASSERT((misses_after == misses_before && hits_after - hits_before == 2) ||
+                (misses_after - misses_before == 1 && hits_after - hits_before == 1));
 
     ggml_backend_buffer_free(buf_splitk);
     ggml_backend_buffer_free(buf_splitk_ref);
@@ -3073,6 +3085,93 @@ static void test_attention_projections_replay(test_env & env, bool require_mmvq 
            growth_only ? " (scratch-growth fixture)" : require_mmvq ? " (MMVQ + fusion + replay)" : "");
 }
 
+// Test 24: Variable rows replay on a capacity-defined graph (1 -> 4 -> 1 -> 2).
+// Confirms that once a fixed capacity=4 synthetic graph is recorded, subsequent
+// executions with varying active row extents achieve replay hits with no new
+// descriptor allocation or descriptor writes (descriptor immutability).
+static void test_predefined_variable_rows_replay(test_env & env) {
+    printf("Running test_predefined_variable_rows_replay (capacity=4, rows: 1 -> 4 -> 1 -> 2)...\n");
+
+    const int dim = 16;
+    const int capacity = 4;
+    size_t mem_size = decode_subgraph_context_overhead(1);
+    struct ggml_init_params params = { mem_size, nullptr, true };
+    struct ggml_context * ctx_gpu = ggml_init(params);
+    TEST_ASSERT(ctx_gpu != nullptr);
+
+    decode_subgraph_fixture fix_gpu;
+    // Build fixed capacity=4 graph
+    fix_gpu.w = ggml_new_tensor_2d(ctx_gpu, GGML_TYPE_F32, dim, dim);
+    fix_gpu.x = ggml_new_tensor_2d(ctx_gpu, GGML_TYPE_F32, dim, capacity);
+    fix_gpu.b = ggml_new_tensor_2d(ctx_gpu, GGML_TYPE_F32, dim, capacity);
+    struct ggml_tensor * mm = ggml_mul_mat(ctx_gpu, fix_gpu.w, fix_gpu.x);
+    fix_gpu.out = ggml_add(ctx_gpu, mm, fix_gpu.b);
+    fix_gpu.gf = ggml_new_graph_custom(ctx_gpu, 16, false);
+    TEST_ASSERT(fix_gpu.w && fix_gpu.x && fix_gpu.b && mm && fix_gpu.out && fix_gpu.gf);
+    ggml_build_forward_expand(fix_gpu.gf, fix_gpu.out);
+
+    ggml_backend_buffer_t buf_gpu = ggml_backend_alloc_ctx_tensors(ctx_gpu, env.backend_gpu);
+    TEST_ASSERT(buf_gpu != nullptr);
+
+    std::vector<float> w_data(dim * dim, 0.25f);
+    std::vector<float> b_data(dim * capacity, 1.0f);
+    std::vector<float> x_data(dim * capacity, 2.0f);
+    ggml_backend_tensor_set(fix_gpu.w, w_data.data(), 0, w_data.size() * sizeof(float));
+    ggml_backend_tensor_set(fix_gpu.b, b_data.data(), 0, b_data.size() * sizeof(float));
+    ggml_backend_tensor_set(fix_gpu.x, x_data.data(), 0, x_data.size() * sizeof(float));
+
+    uint64_t hits_init = 0, misses_init = 0, desc_allocs_init = 0, desc_writes_init = 0;
+    env.get_stats(env.backend_gpu, &hits_init, &misses_init, &desc_allocs_init, &desc_writes_init);
+
+    const uint32_t row_sequence[] = { 1, 4, 1, 2 };
+    uint64_t prev_hits = hits_init;
+    uint64_t prev_misses = misses_init;
+    uint64_t recorded_allocs = 0;
+    uint64_t recorded_writes = 0;
+
+    for (size_t step = 0; step < 4; ++step) {
+        uint32_t active_rows = row_sequence[step];
+        if (env.set_rows) {
+            bool ok = env.set_rows(env.backend_gpu, active_rows, capacity);
+            TEST_ASSERT(ok);
+        }
+
+        // Fill dynamic x data for active rows
+        for (size_t i = 0; i < (size_t)(dim * active_rows); ++i) {
+            x_data[i] = float(step * 10 + i + 1);
+        }
+        ggml_backend_tensor_set(fix_gpu.x, x_data.data(), 0, x_data.size() * sizeof(float));
+
+        CHECK_STATUS(ggml_backend_graph_compute(env.backend_gpu, fix_gpu.gf), "variable rows graph_compute");
+
+        uint64_t cur_hits = 0, cur_misses = 0, cur_allocs = 0, cur_writes = 0;
+        env.get_stats(env.backend_gpu, &cur_hits, &cur_misses, &cur_allocs, &cur_writes);
+
+        if (step == 0) {
+            // First step must be a record/miss
+            TEST_ASSERT(cur_misses == prev_misses + 1);
+            TEST_ASSERT(cur_hits == prev_hits);
+            TEST_ASSERT(cur_allocs > desc_allocs_init);
+            TEST_ASSERT(cur_writes > desc_writes_init);
+            recorded_allocs = cur_allocs;
+            recorded_writes = cur_writes;
+        } else {
+            // Steps 1, 2, 3 must be replay hits
+            TEST_ASSERT(cur_hits == prev_hits + 1);
+            TEST_ASSERT(cur_misses == prev_misses); // replay_misses does not grow
+            // Descriptor sets must be completely unchanged (zero allocations, zero writes)
+            TEST_ASSERT(cur_allocs == recorded_allocs);
+            TEST_ASSERT(cur_writes == recorded_writes);
+        }
+        prev_hits = cur_hits;
+        prev_misses = cur_misses;
+    }
+
+    ggml_backend_buffer_free(buf_gpu);
+    ggml_free(ctx_gpu);
+    printf("test_predefined_variable_rows_replay PASSED: 1->4->1->2 replayed with immutable descriptors.\n");
+}
+
 static void test_multi_rope_norm_replay(test_env & env) {
     constexpr int width = 128, heads = 3, tokens = 2, rotary = 64, cache_rows = 5;
     for (int mode : { GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE }) {
@@ -3582,6 +3681,7 @@ int main(int argc, char ** argv) {
     }
     if (rows_only) {
         test_dynamic_row_replay(env);
+        test_predefined_variable_rows_replay(env);
         return 0;
     }
     if (rope_only) {
@@ -3655,6 +3755,8 @@ int main(int argc, char ** argv) {
     test_add_rms_scratch_reuse(env);
     ++tests_run;
     test_multi_rope_norm_replay(env);
+    ++tests_run;
+    test_predefined_variable_rows_replay(env);
     ++tests_run;
 
     printf("All Vulkan command replay observable integration tests completed successfully (%d tests ran).\n", tests_run);

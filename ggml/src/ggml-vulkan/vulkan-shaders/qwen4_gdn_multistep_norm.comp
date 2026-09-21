@@ -1,0 +1,92 @@
+// =================================================================================================
+// PRODUCTION VARIABLE-LENGTH MULTI-STEP GDN RMS NORMALIZATION AND GATING KERNEL
+// =================================================================================================
+// STATUS & INVARIANTS:
+// 1. RMS normalization and Z-gating iterate over active steps t < eff_active (<= capacity_steps).
+//    Inactive capacity steps [eff_active, capacity_steps) are completely untouched.
+// 2. Head width is fixed at 128 floats per head. Threads tid < 128 process elements.
+// 3. Tree reduction uses standard parallel halving tree in sumsh[512] with barrier isolation per step.
+// =================================================================================================
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint  key_heads;
+    uint  value_heads;
+    float scale;
+    uint  headmap;
+    uint  active_tokens;   // Runtime active steps A in [1, capacity_steps]
+    uint  capacity_steps;  // Fixed compile-time capacity C (<= 8)
+    uint  n_snapshots;     // Rollback snapshot slot count K
+    float q_epsilon;
+    float k_epsilon;
+};
+
+layout(binding = 0) readonly buffer AttnBuf {
+    float data_attn[];
+};
+
+layout(binding = 1) readonly buffer GammaBuf {
+    float data_gamma[];
+};
+
+layout(binding = 2) readonly buffer ZBuf {
+    float data_z[];
+};
+
+layout(binding = 3) writeonly buffer OutBuf {
+    float data_out[];
+};
+
+shared float sumsh[512];
+
+void main() {
+    const uint head_id = gl_WorkGroupID.x;
+    const uint tid     = gl_LocalInvocationID.x;
+
+    if (head_id >= value_heads) {
+        return;
+    }
+
+    const uint eff_active = (active_tokens > 0u && active_tokens <= capacity_steps) ? active_tokens : capacity_steps;
+    const uint total_stride = value_heads * 128u;
+    const uint head_offset  = head_id * 128u;
+
+    for (uint t = 0u; t < capacity_steps; ++t) {
+        if (t >= eff_active) {
+            break; // Truncate loop: inactive tokens are never normalized or output!
+        }
+
+        const uint step_base = t * total_stride + head_offset;
+
+        float xi = 0.0f;
+        if (tid < 128u) {
+            xi = data_attn[step_base + tid];
+        }
+        sumsh[tid] = xi * xi;
+        barrier();
+
+        [[unroll]] for (int s = 256; s > 0; s >>= 1) {
+            if (tid < uint(s)) {
+                sumsh[tid] += sumsh[tid + uint(s)];
+            }
+            barrier();
+        }
+
+        const float mean  = sumsh[0] / 128.0f;
+        const float norm_scale = inversesqrt(mean + 1e-6f);
+
+        if (tid < 128u) {
+            const float attention_val = data_attn[step_base + tid];
+            const float normalized    = norm_scale * attention_val;
+            const float gamma_val     = data_gamma[head_offset + tid];
+            const float z_val         = data_z[step_base + tid];
+            const float gate          = 1.0f / (1.0f + exp(-z_val));
+            data_out[step_base + tid] = normalized * gamma_val * gate;
+        }
+        barrier();
+    }
+}

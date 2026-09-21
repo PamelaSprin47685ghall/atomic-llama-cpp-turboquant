@@ -11,6 +11,7 @@
 #include "ggml.h"
 
 #include "../ggml/src/ggml-impl.h" // ggml_set_op_params (private FA node construction)
+#include "../ggml/src/ggml-vulkan/ggml-vulkan-collective.hpp"
 
 #include <memory>
 #include <cstdio>
@@ -993,6 +994,466 @@ static void test_nextn_layer_plan_bounds() {
     fprintf(stderr, "  NextN layer plan bounds: blk.48 accepted, blk.49 rejected with TP5_E_LAYER_BOUNDS\n");
 }
 
+enum class test_numerical_mode { REFERENCE, EXACT_F32, AGGRESSIVE_Q8, P1A_NOSIDECAR_Q8 };
+enum class test_numerical_reason {
+    NONE, DISABLED_BY_ENV, NON_RELAY_SYNC, NON_F32_WIRE, NO_LATE_TENSORS,
+    EXACT_Q_REQUESTED, MISSING_HARDWARE_INT_DOT, UNSUPPORTED_WAVE32,
+    UNALIGNED_LATE_SHAPE, PIPELINE_UNAVAILABLE, P1A_BENCH_REQUESTED
+};
+
+struct test_numerical_spec {
+    bool latebind_env_enabled    = false;
+    bool is_relay_sync           = false;
+    bool is_f32_wire             = false;
+    bool has_late_tensors        = false;
+    bool exact_q_requested       = false;
+    bool p1a_nosidecar_requested = false;
+    bool hw_int_dot              = false;
+    bool hw_wave32               = false;
+    bool shape_aligned           = false;
+    bool pipeline_ready          = false;
+};
+
+static inline std::pair<test_numerical_mode, test_numerical_reason> test_resolve_numerical_mode(
+        const test_numerical_spec & spec) {
+    if (spec.p1a_nosidecar_requested) return { test_numerical_mode::P1A_NOSIDECAR_Q8, test_numerical_reason::NONE };
+    if (!spec.latebind_env_enabled) return { test_numerical_mode::REFERENCE, test_numerical_reason::DISABLED_BY_ENV };
+    if (!spec.is_relay_sync)        return { test_numerical_mode::REFERENCE, test_numerical_reason::NON_RELAY_SYNC };
+    if (!spec.is_f32_wire)          return { test_numerical_mode::REFERENCE, test_numerical_reason::NON_F32_WIRE };
+    if (!spec.has_late_tensors)     return { test_numerical_mode::REFERENCE, test_numerical_reason::NO_LATE_TENSORS };
+    if (spec.exact_q_requested)     return { test_numerical_mode::EXACT_F32, test_numerical_reason::EXACT_Q_REQUESTED };
+    if (!spec.hw_int_dot)           return { test_numerical_mode::EXACT_F32, test_numerical_reason::MISSING_HARDWARE_INT_DOT };
+    if (!spec.hw_wave32)            return { test_numerical_mode::EXACT_F32, test_numerical_reason::UNSUPPORTED_WAVE32 };
+    if (!spec.shape_aligned)        return { test_numerical_mode::EXACT_F32, test_numerical_reason::UNALIGNED_LATE_SHAPE };
+    if (!spec.pipeline_ready)       return { test_numerical_mode::EXACT_F32, test_numerical_reason::PIPELINE_UNAVAILABLE };
+    return { test_numerical_mode::AGGRESSIVE_Q8, test_numerical_reason::NONE };
+}
+
+static void test_tp5_numerical_mode_resolution() {
+    fprintf(stderr, "--- test_tp5_numerical_mode_resolution ---\n");
+    test_numerical_spec base;
+    base.latebind_env_enabled    = true;
+    base.is_relay_sync           = true;
+    base.is_f32_wire             = true;
+    base.has_late_tensors        = true;
+    base.exact_q_requested       = false;
+    base.p1a_nosidecar_requested = false;
+    base.hw_int_dot              = true;
+    base.hw_wave32               = true;
+    base.shape_aligned           = true;
+    base.pipeline_ready          = true;
+
+    // Full fast path -> AGGRESSIVE_Q8
+    auto res = test_resolve_numerical_mode(base);
+    TEST_ASSERT(res.first == test_numerical_mode::AGGRESSIVE_Q8);
+    TEST_ASSERT(res.second == test_numerical_reason::NONE);
+
+    // P1-A requested via env -> P1A_NOSIDECAR_Q8
+    {
+        auto s = base; s.p1a_nosidecar_requested = true;
+        res = test_resolve_numerical_mode(s);
+        TEST_ASSERT(res.first == test_numerical_mode::P1A_NOSIDECAR_Q8);
+        TEST_ASSERT(res.second == test_numerical_reason::NONE);
+    }
+
+    // Disabled by env -> REFERENCE
+    {
+        auto s = base; s.latebind_env_enabled = false;
+        res = test_resolve_numerical_mode(s);
+        TEST_ASSERT(res.first == test_numerical_mode::REFERENCE);
+        TEST_ASSERT(res.second == test_numerical_reason::DISABLED_BY_ENV);
+    }
+    // Non-relay sync -> REFERENCE
+    {
+        auto s = base; s.is_relay_sync = false;
+        res = test_resolve_numerical_mode(s);
+        TEST_ASSERT(res.first == test_numerical_mode::REFERENCE);
+        TEST_ASSERT(res.second == test_numerical_reason::NON_RELAY_SYNC);
+    }
+    // Non-F32 wire -> REFERENCE
+    {
+        auto s = base; s.is_f32_wire = false;
+        res = test_resolve_numerical_mode(s);
+        TEST_ASSERT(res.first == test_numerical_mode::REFERENCE);
+        TEST_ASSERT(res.second == test_numerical_reason::NON_F32_WIRE);
+    }
+    // No late tensors -> REFERENCE
+    {
+        auto s = base; s.has_late_tensors = false;
+        res = test_resolve_numerical_mode(s);
+        TEST_ASSERT(res.first == test_numerical_mode::REFERENCE);
+        TEST_ASSERT(res.second == test_numerical_reason::NO_LATE_TENSORS);
+    }
+
+    // Exact Q requested via env -> EXACT_F32
+    {
+        auto s = base; s.exact_q_requested = true;
+        res = test_resolve_numerical_mode(s);
+        TEST_ASSERT(res.first == test_numerical_mode::EXACT_F32);
+        TEST_ASSERT(res.second == test_numerical_reason::EXACT_Q_REQUESTED);
+    }
+    // Missing int dot product -> EXACT_F32
+    {
+        auto s = base; s.hw_int_dot = false;
+        res = test_resolve_numerical_mode(s);
+        TEST_ASSERT(res.first == test_numerical_mode::EXACT_F32);
+        TEST_ASSERT(res.second == test_numerical_reason::MISSING_HARDWARE_INT_DOT);
+    }
+    // Unsupported wave32 -> EXACT_F32
+    {
+        auto s = base; s.hw_wave32 = false;
+        res = test_resolve_numerical_mode(s);
+        TEST_ASSERT(res.first == test_numerical_mode::EXACT_F32);
+        TEST_ASSERT(res.second == test_numerical_reason::UNSUPPORTED_WAVE32);
+    }
+    // Unaligned tensor shape -> EXACT_F32
+    {
+        auto s = base; s.shape_aligned = false;
+        res = test_resolve_numerical_mode(s);
+        TEST_ASSERT(res.first == test_numerical_mode::EXACT_F32);
+        TEST_ASSERT(res.second == test_numerical_reason::UNALIGNED_LATE_SHAPE);
+    }
+    // Pipeline creation failure -> EXACT_F32
+    {
+        auto s = base; s.pipeline_ready = false;
+        res = test_resolve_numerical_mode(s);
+        TEST_ASSERT(res.first == test_numerical_mode::EXACT_F32);
+        TEST_ASSERT(res.second == test_numerical_reason::PIPELINE_UNAVAILABLE);
+    }
+    fprintf(stderr, "  Numerical mode resolution: 11/11 branches verified\n");
+}
+
+static void test_tp5_latebind_protocol_invariants() {
+    fprintf(stderr, "--- test_tp5_latebind_protocol_invariants ---\n");
+    // Layout invariants from TP5 LateBind protocol
+    constexpr size_t TP5_RELAY_HEADER_BYTES = 64;
+    constexpr size_t TP5_LATE_Q_CONTROL_BYTES = 64;
+    constexpr size_t TP5_LATE_Q_READY_WORD = 0;
+    constexpr size_t TP5_LATE_Q_COUNTER_WORD = 1;
+
+    const auto ctrl_offset = [](size_t L) { return TP5_RELAY_HEADER_BYTES + L; };
+    const auto payload_offset = [](size_t L, bool fast) {
+        return TP5_RELAY_HEADER_BYTES + L + (fast ? TP5_LATE_Q_CONTROL_BYTES : 0);
+    };
+
+    // Test a variety of realistic alignments and offsets (e.g. 2560 elements * sizeof(float))
+    const size_t test_offsets[] = { 2560 * sizeof(float), 4096 * sizeof(float), 10240, 16384 };
+    for (size_t L : test_offsets) {
+        // Invariant 1: Control block is 64-byte aligned
+        TEST_ASSERT(ctrl_offset(L) % 64 == 0);
+        // Invariant 2: Aggressive Q8 Payload is 64-byte aligned
+        TEST_ASSERT(payload_offset(L, true) % 64 == 0);
+        // Invariant 3: Control block [ctrl, ctrl + 64) and Payload [payload, ...) do not overlap in aggressive mode
+        TEST_ASSERT(ctrl_offset(L) + TP5_LATE_Q_CONTROL_BYTES <= payload_offset(L, true));
+        TEST_ASSERT(payload_offset(L, true) - ctrl_offset(L) == TP5_LATE_Q_CONTROL_BYTES);
+
+        // Invariant 4: GPU word indexing matches CPU byte indexing
+        // GPU late_word_offset = (64 + L + 64) / 4 = payload_offset(L, true) / 4
+        const uint32_t late_word_offset = (uint32_t) (payload_offset(L, true) / 4);
+        // GPU writes ready flag to qmail[late_word_offset - 16u]
+        const size_t gpu_ready_byte = (late_word_offset - 16u) * 4;
+        TEST_ASSERT(gpu_ready_byte == ctrl_offset(L) + TP5_LATE_Q_READY_WORD * 4);
+        // GPU writes WG counter to qmail[late_word_offset - 15u]
+        const size_t gpu_counter_byte = (late_word_offset - 15u) * 4;
+        TEST_ASSERT(gpu_counter_byte == ctrl_offset(L) + TP5_LATE_Q_COUNTER_WORD * 4);
+
+        // Invariant 5: Regression test against the old defect
+        // In the old bug, CPU polled offset B + 16 (main header word 4), which is NOT the control block!
+        const size_t old_poll_offset = 16;
+        TEST_ASSERT(old_poll_offset != ctrl_offset(L));
+        // In the old bug, CPU payload read dst = B + 64 + L, which erroneously aliased the control region!
+        const size_t old_cpu_payload = 64 + L;
+        TEST_ASSERT(old_cpu_payload == ctrl_offset(L));
+        TEST_ASSERT(old_cpu_payload != payload_offset(L, true));
+
+        // Invariant 6: Exact fallback path consistency
+        // In exact mode (!fast), control is in host-imported RAM status[6], and payload broadcast is at B + 64 + L
+        TEST_ASSERT(payload_offset(L, false) == 64 + L);
+
+        // Invariant 7: Workspace capacity bounds check covers control block + payload in both exact and fast modes
+        // In exact mode (!fast), wire is F32, payload starts at B + 64 + L, so end is 64 + L + wire_bytes.
+        // In fast mode (fast), wire is F16, payload starts at B + 128 + L (after 64B control), so end is 128 + L + wire_bytes.
+        // Old check used (L + wire_bytes + 64) which under-counted by 64B in fast mode.
+        const size_t late_counts[] = { 1024, 2048, 2560 };
+        for (size_t late_count : late_counts) {
+            const size_t exact_wire_bytes = late_count * sizeof(float);
+            const size_t fast_wire_bytes  = late_count * sizeof(uint16_t); // ggml_fp16_t wire
+
+            const size_t exact_payload_end = payload_offset(L, false) + exact_wire_bytes;
+            const size_t fast_payload_end  = payload_offset(L, true)  + fast_wire_bytes;
+
+            const size_t old_exact_check = L + exact_wire_bytes + 64;
+            const size_t old_fast_check  = L + fast_wire_bytes  + 64;
+
+            // In exact mode, old check happened to match single-source payload end
+            TEST_ASSERT(exact_payload_end == old_exact_check);
+
+            // In fast mode, old check under-counted by exactly TP5_LATE_Q_CONTROL_BYTES (64B)
+            TEST_ASSERT(fast_payload_end > old_fast_check);
+            TEST_ASSERT(fast_payload_end - old_fast_check == TP5_LATE_Q_CONTROL_BYTES);
+
+            // A stride between old check and new check must fail the single-source bounds check
+            const size_t borderline_stride = old_fast_check + 32; // > old check, but < real payload end
+            TEST_ASSERT(old_fast_check <= borderline_stride);
+            TEST_ASSERT(fast_payload_end > borderline_stride); // correctly identified as exceeding workspace
+        }
+    }
+
+    // Invariant 8: Definition-time WAR contract verification for Exact F32 and Aggressive Q8
+    // Validates against production tp5_latebind_semantic_step & tp5_validate_latebind_war_schedule.
+    std::string war_err;
+
+    // 1. Exact F32 canonical schedule: READ_TREFS (late_q) -> BARRIER_WAR_TREFS (q_norm_barrier) -> WRITE_TREFS (late_norm)
+    std::vector<tp5_latebind_semantic_step> canonical_exact = {
+        { tp5_latebind_semantic_step::kind::READ_TREFS,        "late_q" },
+        { tp5_latebind_semantic_step::kind::BARRIER_WAR_TREFS, "q_norm_barrier" },
+        { tp5_latebind_semantic_step::kind::WRITE_TREFS,       "late_norm" },
+    };
+    TEST_ASSERT(tp5_validate_latebind_war_schedule(false, canonical_exact, war_err));
+
+    // 2. Aggressive Q8 canonical schedule:
+    // READ_TREFS (late_act_q8) -> BARRIER_ACT_BUF (act_ready) -> BARRIER_WAR_TREFS (q_norm_barrier) -> WRITE_TREFS (late_norm) -> DISPATCH_Q8DOT (late_q8dot)
+    // Note: No barrier between late_norm and late_q8dot (zero-barrier overlap).
+    std::vector<tp5_latebind_semantic_step> canonical_agg = {
+        { tp5_latebind_semantic_step::kind::READ_TREFS,        "late_act_q8" },
+        { tp5_latebind_semantic_step::kind::BARRIER_ACT_BUF,   "act_ready" },
+        { tp5_latebind_semantic_step::kind::BARRIER_WAR_TREFS, "q_norm_barrier" },
+        { tp5_latebind_semantic_step::kind::WRITE_TREFS,       "late_norm" },
+        { tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT,    "late_q8dot" },
+    };
+    TEST_ASSERT(tp5_validate_latebind_war_schedule(true, canonical_agg, war_err));
+
+    // 3. Negative regression 1: Aggressive Q8 missing WAR barrier on trefs (the pre-fix defect)
+    std::vector<tp5_latebind_semantic_step> reg_agg_no_war = {
+        { tp5_latebind_semantic_step::kind::READ_TREFS,        "late_act_q8" },
+        { tp5_latebind_semantic_step::kind::BARRIER_ACT_BUF,   "act_ready" },
+        { tp5_latebind_semantic_step::kind::WRITE_TREFS,       "late_norm" },
+        { tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT,    "late_q8dot" },
+    };
+    TEST_ASSERT(!tp5_validate_latebind_war_schedule(true, reg_agg_no_war, war_err));
+    TEST_ASSERT(war_err.find("missing BARRIER_WAR_TREFS") != std::string::npos);
+
+    // 4. Negative regression 2: Exact F32 missing WAR barrier on trefs
+    std::vector<tp5_latebind_semantic_step> reg_exact_no_war = {
+        { tp5_latebind_semantic_step::kind::READ_TREFS,        "late_q" },
+        { tp5_latebind_semantic_step::kind::WRITE_TREFS,       "late_norm" },
+    };
+    TEST_ASSERT(!tp5_validate_latebind_war_schedule(false, reg_exact_no_war, war_err));
+    TEST_ASSERT(war_err.find("missing BARRIER_WAR_TREFS") != std::string::npos);
+
+    // 5. Negative regression 3: Misplaced barrier (after write instead of before write)
+    std::vector<tp5_latebind_semantic_step> reg_barrier_after_write = {
+        { tp5_latebind_semantic_step::kind::READ_TREFS,        "late_act_q8" },
+        { tp5_latebind_semantic_step::kind::BARRIER_ACT_BUF,   "act_ready" },
+        { tp5_latebind_semantic_step::kind::WRITE_TREFS,       "late_norm" },
+        { tp5_latebind_semantic_step::kind::BARRIER_WAR_TREFS, "q_norm_barrier" },
+        { tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT,    "late_q8dot" },
+    };
+    TEST_ASSERT(!tp5_validate_latebind_war_schedule(true, reg_barrier_after_write, war_err));
+    TEST_ASSERT(war_err.find("BARRIER_WAR_TREFS must precede WRITE_TREFS") != std::string::npos);
+
+    // 6. Negative regression 4: Write before read hazard (norm overwrites before Q reads)
+    std::vector<tp5_latebind_semantic_step> reg_write_before_read = {
+        { tp5_latebind_semantic_step::kind::WRITE_TREFS,       "late_norm" },
+        { tp5_latebind_semantic_step::kind::BARRIER_WAR_TREFS, "q_norm_barrier" },
+        { tp5_latebind_semantic_step::kind::READ_TREFS,        "late_q" },
+    };
+    TEST_ASSERT(!tp5_validate_latebind_war_schedule(false, reg_write_before_read, war_err));
+    TEST_ASSERT(war_err.find("READ_TREFS must precede BARRIER_WAR_TREFS") != std::string::npos);
+
+    // 7. Negative regression 5: Barrier mistakenly inserted between norm and Q8dot
+    // Violates the requirement that norm and Q8dot have zero execution barriers between them.
+    std::vector<tp5_latebind_semantic_step> reg_barrier_in_q8dot = {
+        { tp5_latebind_semantic_step::kind::READ_TREFS,        "late_act_q8" },
+        { tp5_latebind_semantic_step::kind::BARRIER_ACT_BUF,   "act_ready" },
+        { tp5_latebind_semantic_step::kind::BARRIER_WAR_TREFS, "q_norm_barrier" },
+        { tp5_latebind_semantic_step::kind::WRITE_TREFS,       "late_norm" },
+        { tp5_latebind_semantic_step::kind::BARRIER_ACT_BUF,   "extra_barrier" },
+        { tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT,    "late_q8dot" },
+    };
+    TEST_ASSERT(!tp5_validate_latebind_war_schedule(true, reg_barrier_in_q8dot, war_err));
+    TEST_ASSERT(war_err.find("zero-barrier overlap violated") != std::string::npos);
+
+    fprintf(stderr, "  LateBind protocol invariants: Q control/payload non-overlapping, word alignment verified, F32-Q order asserted\n");
+}
+
+static void test_tp5_latebind_multi_row_invariants() {
+    fprintf(stderr, "--- test_tp5_latebind_multi_row_invariants ---\n");
+    // Contract: Multi-row verification (active_rows in {1, 2, 4}) within single capacity=4 definition.
+    // Layout/parameters defined once; Q/sidecar layout contiguous; single-row non-regression guaranteed.
+    constexpr size_t TP5_RELAY_HEADER_BYTES = 64;
+    constexpr size_t TP5_LATE_Q_CONTROL_BYTES = 64;
+    constexpr size_t TP5_LATE_MAX_FLOATS = 8192;
+
+    const auto ctrl_offset = [](size_t L) { return TP5_RELAY_HEADER_BYTES + L; };
+    const auto payload_offset = [](size_t L, bool fast) {
+        return TP5_RELAY_HEADER_BYTES + L + (fast ? TP5_LATE_Q_CONTROL_BYTES : 0);
+    };
+
+    const uint32_t width = 2560;
+    const uint32_t streams = 4;
+    const uint32_t late_rank = 320;
+    const size_t capacity_rows = 4;
+    const size_t max_late_floats = capacity_rows * streams * late_rank; // 5120 <= 8192
+    TEST_ASSERT(max_late_floats <= TP5_LATE_MAX_FLOATS);
+
+    // Multi-row boundary sweep: 1..4 rows (including 3 rows)
+    for (uint32_t rows : {1u, 2u, 3u, 4u}) {
+        const size_t n_elems = size_t(width) * rows;
+        // Invariant 1: n_elems must be divisible by width
+        TEST_ASSERT(n_elems % width == 0);
+        const size_t derived_rows = n_elems / width;
+        TEST_ASSERT(derived_rows == rows);
+        TEST_ASSERT(derived_rows <= capacity_rows);
+
+        // Invariant 2: Active late_count matches GPU output and CPU handoff exactly
+        const size_t active_late_count = derived_rows * streams * late_rank;
+        TEST_ASSERT(active_late_count <= max_late_floats);
+        TEST_ASSERT(active_late_count == rows * 1280);
+
+        // Invariant 3: tp5_late_stage capacity check: capacity_rows * streams * rank_dim <= TP5_LATE_MAX_FLOATS
+        TEST_ASSERT(size_t(derived_rows) * streams * late_rank <= TP5_LATE_MAX_FLOATS);
+
+        // Invariant 4: Word alignment & non-overlapping invariants for multi-row
+        const size_t L = width * sizeof(float);
+        TEST_ASSERT(ctrl_offset(L) % 64 == 0);
+        TEST_ASSERT(payload_offset(L, true) % 64 == 0);
+        TEST_ASSERT(ctrl_offset(L) + TP5_LATE_Q_CONTROL_BYTES <= payload_offset(L, true));
+
+        // Invariant 5: External tensor binding size requirements against capacity_rows
+        const uint64_t mixed_min_size = uint64_t(derived_rows) * width * sizeof(float);
+        const uint64_t lo_min_size = uint64_t(derived_rows) * late_rank * sizeof(float);
+        const uint64_t res_min_size = uint64_t(derived_rows) * streams * width * sizeof(float);
+        const uint64_t binding1_local_z_min_size = uint64_t(derived_rows) * width * sizeof(float);
+        TEST_ASSERT(mixed_min_size == rows * 2560 * sizeof(float));
+        TEST_ASSERT(lo_min_size == rows * 320 * sizeof(float));
+        TEST_ASSERT(res_min_size == rows * 10240 * sizeof(float));
+        TEST_ASSERT(binding1_local_z_min_size == rows * 2560 * sizeof(float));
+
+        // Negative regression test: hc.bindings[1] under-sized must be rejected fail-closed
+        auto check_binding1_capacity = [&](uint64_t sz) -> bool {
+            return sz >= binding1_local_z_min_size;
+        };
+        TEST_ASSERT(check_binding1_capacity(binding1_local_z_min_size));
+        TEST_ASSERT(!check_binding1_capacity(binding1_local_z_min_size - 1));
+        if (rows > 1) {
+            // Legacy single-row size against multi-row capacity must fail closed
+            TEST_ASSERT(!check_binding1_capacity(width * sizeof(float)));
+        }
+
+        // Single-row non-regression check
+        if (rows == 1) {
+            TEST_ASSERT(active_late_count == streams * late_rank);
+            TEST_ASSERT(active_late_count == 1280);
+            TEST_ASSERT(mixed_min_size == width * sizeof(float));
+        }
+    }
+    fprintf(stderr, "  LateBind multi-row invariants: 1..4-row boundaries verified, external binding capacity asserted, single-row non-regression asserted\n");
+}
+
+static void test_tp5_p1a_nosidecar_schedule_contract() {
+    fprintf(stderr, "--- test_tp5_p1a_nosidecar_schedule_contract ---\n");
+    std::string err;
+
+    // 1. Canonical P1-A schedule:
+    // Y is ready -> combine/RMS (WRITE_TREFS) -> norm_ready (BARRIER_NORM_ACT) ->
+    // norm_act_q8 (DISPATCH_ACT_Q8) -> act_ready (BARRIER_ACT_BUF) ->
+    // down_q8dot_local (DISPATCH_Q8DOT) -> q_local_ready (BARRIER_LOCAL_Q) ->
+    // lo_q8_local (DISPATCH_LO_Q8) -> lo_ready (BARRIER_LO_BUF) ->
+    // up_q8dot_fold (DISPATCH_UP_Q8DOT)
+    std::vector<tp5_latebind_semantic_step> canonical_p1a = {
+        { tp5_latebind_semantic_step::kind::WRITE_TREFS,       "late_norm" },
+        { tp5_latebind_semantic_step::kind::BARRIER_NORM_ACT,  "norm_ready" },
+        { tp5_latebind_semantic_step::kind::DISPATCH_ACT_Q8,   "norm_act_q8" },
+        { tp5_latebind_semantic_step::kind::BARRIER_ACT_BUF,   "act_ready" },
+        { tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT,    "down_q8dot_local" },
+        { tp5_latebind_semantic_step::kind::BARRIER_LOCAL_Q,   "q_local_ready" },
+        { tp5_latebind_semantic_step::kind::DISPATCH_LO_Q8,    "lo_q8_local" },
+        { tp5_latebind_semantic_step::kind::BARRIER_LO_BUF,    "lo_ready" },
+        { tp5_latebind_semantic_step::kind::DISPATCH_UP_Q8DOT, "up_q8dot_fold" },
+    };
+    TEST_ASSERT(tp5_validate_p1a_schedule(canonical_p1a, err));
+
+    // 2. Negative Regression 1: Norm after Q8 (violates combine/norm before Q8)
+    {
+        std::vector<tp5_latebind_semantic_step> reg_norm_after_q8 = {
+            { tp5_latebind_semantic_step::kind::DISPATCH_ACT_Q8,   "norm_act_q8" },
+            { tp5_latebind_semantic_step::kind::WRITE_TREFS,       "late_norm" },
+            { tp5_latebind_semantic_step::kind::BARRIER_NORM_ACT,  "norm_ready" },
+            { tp5_latebind_semantic_step::kind::BARRIER_ACT_BUF,   "act_ready" },
+            { tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT,    "down_q8dot_local" },
+            { tp5_latebind_semantic_step::kind::BARRIER_LOCAL_Q,   "q_local_ready" },
+            { tp5_latebind_semantic_step::kind::DISPATCH_LO_Q8,    "lo_q8_local" },
+            { tp5_latebind_semantic_step::kind::BARRIER_LO_BUF,    "lo_ready" },
+            { tp5_latebind_semantic_step::kind::DISPATCH_UP_Q8DOT, "up_q8dot_fold" },
+        };
+        TEST_ASSERT(!tp5_validate_p1a_schedule(reg_norm_after_q8, err));
+        TEST_ASSERT(err.find("norm") != std::string::npos || err.find("BARRIER_NORM_ACT") != std::string::npos);
+    }
+
+    // 3. Negative Regression 2: Pre-norm sidecar read on trefs (violates no-sidecar invariant)
+    {
+        std::vector<tp5_latebind_semantic_step> reg_sidecar_read = canonical_p1a;
+        reg_sidecar_read.insert(reg_sidecar_read.begin(), { tp5_latebind_semantic_step::kind::READ_TREFS, "late_act_q8" });
+        TEST_ASSERT(!tp5_validate_p1a_schedule(reg_sidecar_read, err));
+        TEST_ASSERT(err.find("no-sidecar invariant violated") != std::string::npos);
+    }
+
+    // 4. Negative Regression 3: Missing Q8 down projection
+    {
+        std::vector<tp5_latebind_semantic_step> reg_missing_down = canonical_p1a;
+        reg_missing_down.erase(reg_missing_down.begin() + 4);
+        TEST_ASSERT(!tp5_validate_p1a_schedule(reg_missing_down, err));
+        TEST_ASSERT(err.find("missing DISPATCH_Q8DOT") != std::string::npos);
+    }
+
+    // 5. Negative Regression 4: Missing Q8 up projection
+    {
+        std::vector<tp5_latebind_semantic_step> reg_missing_up = canonical_p1a;
+        reg_missing_up.pop_back();
+        TEST_ASSERT(!tp5_validate_p1a_schedule(reg_missing_up, err));
+        TEST_ASSERT(err.find("missing DISPATCH_UP_Q8DOT") != std::string::npos);
+    }
+
+    // 6. Negative Regression 5: Missing barrier between norm and ACT_Q8
+    {
+        std::vector<tp5_latebind_semantic_step> reg_missing_norm_barrier = canonical_p1a;
+        reg_missing_norm_barrier.erase(reg_missing_norm_barrier.begin() + 1);
+        TEST_ASSERT(!tp5_validate_p1a_schedule(reg_missing_norm_barrier, err));
+        TEST_ASSERT(err.find("missing BARRIER_NORM_ACT") != std::string::npos);
+    }
+
+    // 7. Negative Regression 6: Missing barrier between down Q8 and LO Q8
+    {
+        std::vector<tp5_latebind_semantic_step> reg_missing_q_barrier = canonical_p1a;
+        reg_missing_q_barrier.erase(reg_missing_q_barrier.begin() + 5);
+        TEST_ASSERT(!tp5_validate_p1a_schedule(reg_missing_q_barrier, err));
+        TEST_ASSERT(err.find("missing BARRIER_LOCAL_Q") != std::string::npos);
+    }
+
+    // 8. Default-off invariant: When P1-A mode is disabled, existing exact and aggressive schedules
+    // remain 100% identical and validate successfully under tp5_validate_latebind_war_schedule.
+    {
+        std::vector<tp5_latebind_semantic_step> canonical_exact = {
+            { tp5_latebind_semantic_step::kind::READ_TREFS,        "late_q" },
+            { tp5_latebind_semantic_step::kind::BARRIER_WAR_TREFS, "q_norm_barrier" },
+            { tp5_latebind_semantic_step::kind::WRITE_TREFS,       "late_norm" },
+        };
+        TEST_ASSERT(tp5_validate_latebind_war_schedule(false, canonical_exact, err));
+
+        std::vector<tp5_latebind_semantic_step> canonical_agg = {
+            { tp5_latebind_semantic_step::kind::READ_TREFS,        "late_act_q8" },
+            { tp5_latebind_semantic_step::kind::BARRIER_ACT_BUF,   "act_ready" },
+            { tp5_latebind_semantic_step::kind::BARRIER_WAR_TREFS, "q_norm_barrier" },
+            { tp5_latebind_semantic_step::kind::WRITE_TREFS,       "late_norm" },
+            { tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT,    "late_q8dot" },
+        };
+        TEST_ASSERT(tp5_validate_latebind_war_schedule(true, canonical_agg, err));
+    }
+
+    fprintf(stderr, "  P1-A no-sidecar schedule contract: canonical sequence, 6 negative regressions, and mode-off invariants verified\n");
+}
+
 int main() {
     test_plan_rejects_bad_ranks();
     test_plan_rejects_indivisible_moe();
@@ -1016,6 +1477,10 @@ int main() {
     test_tp5_split_state_gdn_qkv(false);
     test_tp5_split_state_gdn_qkv(true);
     test_nextn_layer_plan_bounds();
+    test_tp5_latebind_protocol_invariants();
+    test_tp5_latebind_multi_row_invariants();
+    test_tp5_numerical_mode_resolution();
+    test_tp5_p1a_nosidecar_schedule_contract();
 
     if (g_failures > 0) {
         fprintf(stderr, "%d failures\n", g_failures);

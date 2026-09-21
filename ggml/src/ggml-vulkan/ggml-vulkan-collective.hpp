@@ -489,3 +489,214 @@ private:
     bool m_stop = false;
 };
 
+// Definition-time LateBind execution semantics and WAR contract verification.
+// Pure CPU-verifiable semantic steps; zero runtime overhead on warm tokens.
+struct tp5_latebind_semantic_step {
+    enum class kind {
+        READ_TREFS,           // late_q (exact) or late_act_q8 (aggressive) reads z_p from bindings[r]
+        BARRIER_ACT_BUF,      // act_ready barrier on late_act_q8_buf (aggressive only)
+        BARRIER_WAR_TREFS,    // explicit SHADER_READ -> SHADER_WRITE barrier on bindings[r]
+        WRITE_TREFS,          // late_norm writes canonical y to bindings[r]
+        DISPATCH_Q8DOT,       // late_q8dot contraction (aggressive only, no barrier after norm)
+        BARRIER_NORM_ACT,     // norm_ready barrier on normalized buffer (P1-A only)
+        DISPATCH_ACT_Q8,      // norm_act_q8: quantize normalized activation to Q8 (P1-A only)
+        BARRIER_LOCAL_Q,      // q_local_ready barrier on local Q buffer (P1-A only)
+        DISPATCH_LO_Q8,       // lo_q8_local: LO activation and Q8 quantization from local Q (P1-A only)
+        BARRIER_LO_BUF,       // lo_ready barrier on LO Q8 buffer (P1-A only)
+        DISPATCH_UP_Q8DOT     // up_q8dot_fold: W_up/fold Q8dot (P1-A only)
+    };
+    kind type;
+    const char * name;
+};
+
+// Validates that the LateBind command sequence satisfies the Write-After-Read (WAR)
+// hazard contract on trefs (bindings[r]) and preserves the zero-barrier overlap
+// between norm and Q8dot. Returns true on success; fills err on violation.
+static inline bool tp5_validate_latebind_war_schedule(
+        bool aggressive_q8,
+        const std::vector<tp5_latebind_semantic_step> & steps,
+        std::string & err) {
+    int read_idx = -1;
+    int act_barrier_idx = -1;
+    int war_barrier_idx = -1;
+    int write_idx = -1;
+    int q8dot_idx = -1;
+
+    for (int i = 0; i < (int) steps.size(); ++i) {
+        switch (steps[i].type) {
+            case tp5_latebind_semantic_step::kind::READ_TREFS:
+                if (read_idx != -1) { err = "duplicate READ_TREFS"; return false; }
+                read_idx = i;
+                break;
+            case tp5_latebind_semantic_step::kind::BARRIER_ACT_BUF:
+                if (act_barrier_idx == -1) { act_barrier_idx = i; }
+                break;
+            case tp5_latebind_semantic_step::kind::BARRIER_WAR_TREFS:
+                if (war_barrier_idx == -1) { war_barrier_idx = i; }
+                break;
+            case tp5_latebind_semantic_step::kind::WRITE_TREFS:
+                if (write_idx != -1) { err = "duplicate WRITE_TREFS"; return false; }
+                write_idx = i;
+                break;
+            case tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT:
+                if (q8dot_idx != -1) { err = "duplicate DISPATCH_Q8DOT"; return false; }
+                q8dot_idx = i;
+                break;
+        }
+    }
+
+    if (read_idx == -1) { err = "missing READ_TREFS"; return false; }
+    if (war_barrier_idx == -1) { err = "missing BARRIER_WAR_TREFS"; return false; }
+    if (write_idx == -1) { err = "missing WRITE_TREFS"; return false; }
+
+    // Core WAR rule: READ must precede WAR barrier, WAR barrier must precede WRITE
+    if (read_idx >= war_barrier_idx) {
+        err = "READ_TREFS must precede BARRIER_WAR_TREFS";
+        return false;
+    }
+    if (war_barrier_idx >= write_idx) {
+        err = "BARRIER_WAR_TREFS must precede WRITE_TREFS";
+        return false;
+    }
+
+    if (aggressive_q8) {
+        if (act_barrier_idx == -1) { err = "missing BARRIER_ACT_BUF for aggressive Q8"; return false; }
+        if (q8dot_idx == -1) { err = "missing DISPATCH_Q8DOT for aggressive Q8"; return false; }
+        if (read_idx >= act_barrier_idx) {
+            err = "READ_TREFS (act_q8) must precede BARRIER_ACT_BUF";
+            return false;
+        }
+        if (act_barrier_idx >= war_barrier_idx) {
+            err = "BARRIER_ACT_BUF must precede BARRIER_WAR_TREFS";
+            return false;
+        }
+        if (write_idx >= q8dot_idx) {
+            err = "WRITE_TREFS (norm) must precede DISPATCH_Q8DOT";
+            return false;
+        }
+        // Invariant: No barrier between WRITE_TREFS and DISPATCH_Q8DOT
+        if (q8dot_idx != write_idx + 1) {
+            err = "unexpected barrier between norm and Q8dot: zero-barrier overlap violated";
+            return false;
+        }
+    } else {
+        if (act_barrier_idx != -1) { err = "unexpected BARRIER_ACT_BUF in exact F32 mode"; return false; }
+        if (q8dot_idx != -1) { err = "unexpected DISPATCH_Q8DOT in exact F32 mode"; return false; }
+    }
+
+    return true;
+}
+
+// Validates that the P1-A (no-sidecar aggressive Q8 HC) command sequence satisfies its contract:
+// 1. combine/norm (WRITE_TREFS) must strictly precede all Q8 operations (combine/norm before Q8).
+// 2. Complete local Q8 pipeline is present: ACT_Q8 -> down Q8DOT -> LO_Q8 -> up Q8DOT.
+// 3. No sidecar: no READ_TREFS on trefs before norm, no cross-rank sidecar publication.
+// 4. Barriers enforce data visibility: norm_ready, act_ready, q_local_ready, lo_ready.
+static inline bool tp5_validate_p1a_schedule(
+        const std::vector<tp5_latebind_semantic_step> & steps,
+        std::string & err) {
+    int write_trefs_idx = -1;
+    int barrier_norm_act_idx = -1;
+    int dispatch_act_q8_idx = -1;
+    int barrier_act_buf_idx = -1;
+    int dispatch_down_q8_idx = -1;
+    int barrier_local_q_idx = -1;
+    int dispatch_lo_q8_idx = -1;
+    int barrier_lo_buf_idx = -1;
+    int dispatch_up_q8_idx = -1;
+
+    for (int i = 0; i < (int) steps.size(); ++i) {
+        switch (steps[i].type) {
+            case tp5_latebind_semantic_step::kind::READ_TREFS:
+                err = "P1-A must not contain READ_TREFS (no-sidecar invariant violated: pre-norm read on trefs detected)";
+                return false;
+            case tp5_latebind_semantic_step::kind::BARRIER_WAR_TREFS:
+                err = "P1-A must not contain BARRIER_WAR_TREFS (no pre-norm read hazard)";
+                return false;
+            case tp5_latebind_semantic_step::kind::WRITE_TREFS:
+                if (write_trefs_idx != -1) { err = "duplicate WRITE_TREFS"; return false; }
+                write_trefs_idx = i;
+                break;
+            case tp5_latebind_semantic_step::kind::BARRIER_NORM_ACT:
+                if (barrier_norm_act_idx != -1) { err = "duplicate BARRIER_NORM_ACT"; return false; }
+                barrier_norm_act_idx = i;
+                break;
+            case tp5_latebind_semantic_step::kind::DISPATCH_ACT_Q8:
+                if (dispatch_act_q8_idx != -1) { err = "duplicate DISPATCH_ACT_Q8"; return false; }
+                dispatch_act_q8_idx = i;
+                break;
+            case tp5_latebind_semantic_step::kind::BARRIER_ACT_BUF:
+                if (barrier_act_buf_idx != -1) { err = "duplicate BARRIER_ACT_BUF"; return false; }
+                barrier_act_buf_idx = i;
+                break;
+            case tp5_latebind_semantic_step::kind::DISPATCH_Q8DOT:
+                if (dispatch_down_q8_idx != -1) { err = "duplicate DISPATCH_Q8DOT (down)"; return false; }
+                dispatch_down_q8_idx = i;
+                break;
+            case tp5_latebind_semantic_step::kind::BARRIER_LOCAL_Q:
+                if (barrier_local_q_idx != -1) { err = "duplicate BARRIER_LOCAL_Q"; return false; }
+                barrier_local_q_idx = i;
+                break;
+            case tp5_latebind_semantic_step::kind::DISPATCH_LO_Q8:
+                if (dispatch_lo_q8_idx != -1) { err = "duplicate DISPATCH_LO_Q8"; return false; }
+                dispatch_lo_q8_idx = i;
+                break;
+            case tp5_latebind_semantic_step::kind::BARRIER_LO_BUF:
+                if (barrier_lo_buf_idx != -1) { err = "duplicate BARRIER_LO_BUF"; return false; }
+                barrier_lo_buf_idx = i;
+                break;
+            case tp5_latebind_semantic_step::kind::DISPATCH_UP_Q8DOT:
+                if (dispatch_up_q8_idx != -1) { err = "duplicate DISPATCH_UP_Q8DOT"; return false; }
+                dispatch_up_q8_idx = i;
+                break;
+        }
+    }
+
+    if (write_trefs_idx == -1) { err = "missing WRITE_TREFS (late_norm)"; return false; }
+    if (barrier_norm_act_idx == -1) { err = "missing BARRIER_NORM_ACT"; return false; }
+    if (dispatch_act_q8_idx == -1) { err = "missing DISPATCH_ACT_Q8"; return false; }
+    if (barrier_act_buf_idx == -1) { err = "missing BARRIER_ACT_BUF"; return false; }
+    if (dispatch_down_q8_idx == -1) { err = "missing DISPATCH_Q8DOT (down projection)"; return false; }
+    if (barrier_local_q_idx == -1) { err = "missing BARRIER_LOCAL_Q"; return false; }
+    if (dispatch_lo_q8_idx == -1) { err = "missing DISPATCH_LO_Q8"; return false; }
+    if (barrier_lo_buf_idx == -1) { err = "missing BARRIER_LO_BUF"; return false; }
+    if (dispatch_up_q8_idx == -1) { err = "missing DISPATCH_UP_Q8DOT"; return false; }
+
+    // Order invariant: combine/norm -> norm_ready -> ACT_Q8 -> act_ready -> down Q8DOT -> q_local_ready -> LO_Q8 -> lo_ready -> UP_Q8DOT
+    if (write_trefs_idx >= barrier_norm_act_idx) {
+        err = "WRITE_TREFS (norm) must precede BARRIER_NORM_ACT";
+        return false;
+    }
+    if (barrier_norm_act_idx >= dispatch_act_q8_idx) {
+        err = "BARRIER_NORM_ACT (norm) must precede DISPATCH_ACT_Q8";
+        return false;
+    }
+    if (dispatch_act_q8_idx >= barrier_act_buf_idx) {
+        err = "DISPATCH_ACT_Q8 must precede BARRIER_ACT_BUF";
+        return false;
+    }
+    if (barrier_act_buf_idx >= dispatch_down_q8_idx) {
+        err = "BARRIER_ACT_BUF must precede DISPATCH_Q8DOT";
+        return false;
+    }
+    if (dispatch_down_q8_idx >= barrier_local_q_idx) {
+        err = "DISPATCH_Q8DOT must precede BARRIER_LOCAL_Q";
+        return false;
+    }
+    if (barrier_local_q_idx >= dispatch_lo_q8_idx) {
+        err = "BARRIER_LOCAL_Q must precede DISPATCH_LO_Q8";
+        return false;
+    }
+    if (dispatch_lo_q8_idx >= barrier_lo_buf_idx) {
+        err = "DISPATCH_LO_Q8 must precede BARRIER_LO_BUF";
+        return false;
+    }
+    if (barrier_lo_buf_idx >= dispatch_up_q8_idx) {
+        err = "BARRIER_LO_BUF must precede DISPATCH_UP_Q8DOT";
+        return false;
+    }
+
+    return true;
+}
+
+

@@ -228,6 +228,8 @@ int main(int argc, char ** argv) {
         common_batch_add  (batch_tgt, id_last, n_past++, { seq_id }, true);
 
         // evaluate the target model on [id_last, draft0, draft1, ..., draftN-1]
+        const bool prof_active = spec && (std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr);
+        const int64_t t_tgt_start = prof_active ? ggml_time_us() : 0;
         {
             for (size_t i = 0; i < draft.size(); ++i) {
                 common_batch_add(batch_tgt, draft[i], n_past + i, { seq_id }, true);
@@ -258,6 +260,10 @@ int main(int argc, char ** argv) {
         // disagrees with the draft
         //
         auto ids = common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
+
+        if (prof_active) {
+            common_speculative_record_target_verify_us(spec, ggml_time_us() - t_tgt_start);
+        }
 
         //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
 

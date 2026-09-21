@@ -168,6 +168,7 @@ struct vk_tp5_hc_sum {
     float                            epsilon = 0;
     uint32_t                         streams = 0;
     uint32_t                         late_rank = 0;
+    uint32_t                         capacity_rows = 1;
     vk_tp5_hc_binding                block;
     // residual, gamma, combined output, normalized output, inject weights/input
     std::array<vk_tp5_hc_binding, 6> bindings;

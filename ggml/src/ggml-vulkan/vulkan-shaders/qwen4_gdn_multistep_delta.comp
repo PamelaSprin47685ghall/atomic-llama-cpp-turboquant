@@ -1,0 +1,215 @@
+// =================================================================================================
+// PRODUCTION VARIABLE-LENGTH MULTI-STEP GDN RECURRENCE KERNEL
+// =================================================================================================
+// STATUS & INVARIANTS:
+// 1. Recurrence advances in registers for active steps t < eff_active (<= capacity_steps).
+//    Inactive capacity steps [eff_active, capacity_steps) are completely untouched.
+// 2. Single-step active_tokens == 1 short-circuits directly for bit-identical performance with AR.
+// 3. Snapshot and final recurrent state persist only up to eff_active - 1.
+// =================================================================================================
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_clustered : enable
+
+layout(constant_id = 0) const uint SUBGROUP_SIZE = 64;
+
+const uint LANES_PER_COLUMN = 8;
+const uint ROWS_PER_LANE    = 16;  // 128 / 8
+const uint S_V              = 128;
+
+const uint COLS_PER_SUBGROUP = SUBGROUP_SIZE / LANES_PER_COLUMN;
+const uint WORKGROUP_SIZE    = 256;
+const uint SUBGROUPS_PER_WG  = WORKGROUP_SIZE / SUBGROUP_SIZE;
+const uint COLS_PER_WG       = COLS_PER_SUBGROUP * SUBGROUPS_PER_WG;
+
+layout(local_size_x = WORKGROUP_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Parameters {
+    uint  value_heads;
+    uint  key_heads;
+    float scale;
+    // TP5 GDN head map (opt-in): bit 31 set when a map is present; the low
+    // 30 bits pack up to 10 3-bit per-local-V-head QK head indices. Zero
+    // keeps the native uniform V->QK broadcast (head_id % key_heads).
+    uint  headmap;
+    uint  active_tokens;   // Runtime active steps A in [1, capacity_steps]
+    uint  capacity_steps;  // Fixed compile-time capacity C (<= 8)
+    uint  n_snapshots;     // Rollback snapshot slot count K
+};
+
+layout(binding = 0) readonly buffer QBuf {
+    float data_q[];
+};
+
+layout(binding = 1) readonly buffer KBuf {
+    float data_k[];
+};
+
+layout(binding = 2) readonly buffer VBuf {
+    float data_v[];
+};
+
+layout(binding = 3) readonly buffer GBuf {
+    float data_g[];
+};
+
+layout(binding = 4) readonly buffer BetaBuf {
+    float data_beta[];
+};
+
+layout(binding = 5) readonly buffer StateInBuf {
+    float data_state_in[];
+};
+
+layout(binding = 6) writeonly buffer StateOutBuf {
+    float data_state_out[];
+};
+
+layout(binding = 7) writeonly buffer AttnBuf {
+    float data_attn[];
+};
+
+layout(binding = 8) writeonly buffer SnapshotsBuf {
+    float data_snapshots[];
+};
+
+void main() {
+    const uint head_id = gl_WorkGroupID.x;
+    const uint qk_head = (headmap & 0x80000000u) != 0u
+        ? ((headmap >> (3u * head_id)) & 0x7u)
+        : (head_id % key_heads);
+    const uint lane    = gl_SubgroupInvocationID % 8u;
+    const uint column  = gl_WorkGroupID.z * COLS_PER_WG + gl_SubgroupID * COLS_PER_SUBGROUP +
+                        (gl_SubgroupInvocationID / LANES_PER_COLUMN);
+
+    const uint state_base = head_id * (128u * 128u) + column * 128u;
+    const uint qk_head_base = qk_head * 128u;
+    const uint v_head_base  = head_id * 128u;
+
+    const uint qk_token_stride = key_heads * 128u;
+    const uint v_token_stride  = value_heads * 128u;
+    const uint g_token_stride  = value_heads;
+    const uint b_token_stride  = value_heads;
+    const uint attn_token_stride = value_heads * 128u;
+    const uint snap_slot_stride  = value_heads * (128u * 128u);
+
+    // 1. Initial State Load: Load initial state S_0 once into registers
+    float s_shard[16];
+    [[unroll]] for (uint r = 0u; r < 16u; ++r) {
+        const uint row = r * 8u + lane;
+        s_shard[r]     = data_state_in[state_base + row];
+    }
+
+    const uint eff_active = (active_tokens > 0u && active_tokens <= capacity_steps) ? active_tokens : capacity_steps;
+
+    // 2. Short-circuit fast path for single-step active_tokens == 1
+    if (eff_active == 1u) {
+        const float beta_val = data_beta[head_id];
+        const float g_val    = exp(data_g[head_id]);
+        const float v_val    = data_v[v_head_base + column];
+
+        float k_reg[16];
+        float q_reg[16];
+        [[unroll]] for (uint r = 0u; r < 16u; ++r) {
+            const uint row = r * 8u + lane;
+            k_reg[r]       = data_k[qk_head_base + row];
+            q_reg[r]       = data_q[qk_head_base + row];
+        }
+
+        float kv_shard = 0.0;
+        [[unroll]] for (uint r = 0u; r < 16u; ++r) { kv_shard += g_val * s_shard[r] * k_reg[r]; }
+        const float kv_col = subgroupClusteredAdd(kv_shard, 8u);
+
+        const float delta_col = (v_val - kv_col) * beta_val;
+
+        float attn_partial = 0.0;
+        [[unroll]] for (uint r = 0u; r < 16u; ++r) {
+            const float new_s = g_val * s_shard[r] + k_reg[r] * delta_col;
+            s_shard[r]        = new_s;
+            attn_partial += new_s * q_reg[r];
+        }
+        const float attn_col = subgroupClusteredAdd(attn_partial, 8u);
+
+        if (lane == 0u) {
+            data_attn[head_id * 128u + column] = attn_col * scale;
+        }
+
+        // Final state writeback
+        [[unroll]] for (uint r = 0u; r < 16u; ++r) {
+            const uint row                   = r * 8u + lane;
+            data_state_out[state_base + row] = s_shard[r];
+        }
+
+        // Snapshot writeback if K > 1
+        if (n_snapshots > 1u) {
+            [[unroll]] for (uint r = 0u; r < 16u; ++r) {
+                const uint row = r * 8u + lane;
+                data_snapshots[0u * snap_slot_stride + state_base + row] = s_shard[r];
+            }
+        }
+        return;
+    }
+
+    // 3. Multi-step in-register recurrence loop
+    for (uint t = 0u; t < capacity_steps; ++t) {
+        if (t >= eff_active) {
+            break; // Truncate loop: inactive tokens NEVER advance recurrence or pollute state!
+        }
+
+        const uint qk_off   = t * qk_token_stride + qk_head_base;
+        const uint v_off    = t * v_token_stride  + v_head_base + column;
+        const uint g_off    = t * g_token_stride  + head_id;
+        const uint b_off    = t * b_token_stride  + head_id;
+        const uint attn_off = t * attn_token_stride + head_id * 128u + column;
+
+        const float beta_val = data_beta[b_off];
+        const float g_val    = exp(data_g[g_off]);
+        const float v_val    = data_v[v_off];
+
+        float k_reg[16];
+        float q_reg[16];
+        [[unroll]] for (uint r = 0u; r < 16u; ++r) {
+            const uint row = r * 8u + lane;
+            k_reg[r]       = data_k[qk_off + row];
+            q_reg[r]       = data_q[qk_off + row];
+        }
+
+        float kv_shard = 0.0;
+        [[unroll]] for (uint r = 0u; r < 16u; ++r) { kv_shard += g_val * s_shard[r] * k_reg[r]; }
+        const float kv_col = subgroupClusteredAdd(kv_shard, 8u);
+
+        const float delta_col = (v_val - kv_col) * beta_val;
+
+        float attn_partial = 0.0;
+        [[unroll]] for (uint r = 0u; r < 16u; ++r) {
+            const float new_s = g_val * s_shard[r] + k_reg[r] * delta_col;
+            s_shard[r]        = new_s;
+            attn_partial += new_s * q_reg[r];
+        }
+        const float attn_col = subgroupClusteredAdd(attn_partial, 8u);
+
+        if (lane == 0u) {
+            data_attn[attn_off] = attn_col * scale;
+        }
+
+        // Rollback snapshot writeback: reverse-mapped from eff_active: target_slot = eff_active - 1 - t
+        if (n_snapshots > 1u) {
+            const uint target_slot = eff_active - 1u - t;
+            if (target_slot < n_snapshots) {
+                const uint snap_base = target_slot * snap_slot_stride + state_base;
+                [[unroll]] for (uint r = 0u; r < 16u; ++r) {
+                    const uint row = r * 8u + lane;
+                    data_snapshots[snap_base + row] = s_shard[r];
+                }
+            }
+        }
+    }
+
+    // 4. Final state writeback: persist the state after step eff_active - 1
+    [[unroll]] for (uint r = 0u; r < 16u; ++r) {
+        const uint row                   = r * 8u + lane;
+        data_state_out[state_base + row] = s_shard[r];
+    }
+}

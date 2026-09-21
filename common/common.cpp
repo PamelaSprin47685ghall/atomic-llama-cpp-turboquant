@@ -412,6 +412,18 @@ void common_tp5_apply_env(const common_params & params) {
     if (!params.tp5.sync.empty()) {
         setenv("GGML_TP5_SYNC", params.tp5.sync.c_str(), 1);
     }
+    if (!params.tp5.latebind.empty()) {
+        if (params.tp5.latebind == "off") {
+            setenv("GGML_TP5_LATEBIND", "0", 1);
+            setenv("GGML_TP5_LATEBIND_EXACT_Q", "0", 1);
+        } else if (params.tp5.latebind == "exact") {
+            setenv("GGML_TP5_LATEBIND", "hc-down", 1);
+            setenv("GGML_TP5_LATEBIND_EXACT_Q", "1", 1);
+        } else if (params.tp5.latebind == "aggressive") {
+            setenv("GGML_TP5_LATEBIND", "hc-down", 1);
+            setenv("GGML_TP5_LATEBIND_EXACT_Q", "0", 1);
+        }
+    }
     unsetenv("GGML_TP5_RELAY");
     setenv("GGML_VK_CMD_REPLAY", params.tp5.cmd_replay ? "1" : "0", 1);
     if (!params.tp5.manifest.empty()) {
