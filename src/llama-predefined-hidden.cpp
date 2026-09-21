@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "ggml-alloc.h"
 
+#include <cinttypes>
 #include <algorithm>
 #include <limits>
 #include <new>
@@ -172,6 +173,10 @@ bool llama_context::predefined_hidden_copy(const llama_predefined_hidden_range *
         }
         const auto & src = *r.source->predefined_hidden;
         if (!llama_predefined_hidden_generation_matches(src, r.src_slot, r.generation)) {
+            if (std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr) {
+                LLAMA_LOG_WARN("[tp5-mtp-hidden] copy gen mismatch: src_slot=%u exp_gen=%" PRIu64 " actual_gen=%" PRIu64 " valid_rows=%u\n",
+                               r.src_slot, r.generation, src.generation, src.valid_rows);
+            }
             return false;
         }
         const uint32_t src_rows = readable_rows(src, r.src_slot);
@@ -221,6 +226,10 @@ int llama_context::decode_predefined_hidden(llama_batch batch, const llama_prede
         }
         const auto & source = *r.source->predefined_hidden;
         if (!llama_predefined_hidden_generation_matches(source, r.src_slot, r.generation)) {
+            if (std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr) {
+                LLAMA_LOG_WARN("[tp5-mtp-hidden] decode gen mismatch: src_slot=%u exp_gen=%" PRIu64 " actual_gen=%" PRIu64 " valid_rows=%u\n",
+                               r.src_slot, r.generation, source.generation, source.valid_rows);
+            }
             return -1;
         }
         const uint32_t available = readable_rows(source, r.src_slot);

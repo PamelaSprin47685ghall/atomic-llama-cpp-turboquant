@@ -2612,6 +2612,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        if (std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr) {
+            const uint64_t uid = gf ? ggml_graph_get_uid(gf) : 0;
+            LLAMA_LOG_INFO("[tp5-mtp-graph] type=%d reuse=1 definition_uid=0x%" PRIx64 " n_reused=%d ubatch_tokens=%d\n",
+                           (int) gtype, uid, n_reused, ubatch.n_tokens);
+        }
     } else {
         res->reset();
 
@@ -2633,6 +2638,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 return nullptr;
             }
             ggml_graph_set_uid(gf, definition_uid);
+            if (std::getenv("GGML_TP5_PROFILE") != nullptr || std::getenv("GGML_TP5_MTP_PROFILE") != nullptr) {
+                LLAMA_LOG_INFO("[tp5-mtp-graph] type=%d reuse=0 definition_uid=0x%" PRIx64 " ubatch_tokens=%d\n",
+                               (int) gtype, definition_uid, ubatch.n_tokens);
+            }
         }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
