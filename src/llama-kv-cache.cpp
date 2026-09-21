@@ -6212,116 +6212,153 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
     result.n_queries = ubatch.n_tokens;
     result.query_offsets.reserve(size_t(result.n_queries) + 1);
     result.query_offsets.push_back(0);
-
-    std::vector<llama_seq_id> batch_seqs;
-    batch_seqs.reserve(ubatch.n_tokens);
-    for (uint32_t q = 0; q < ubatch.n_tokens; ++q) {
-        const llama_seq_id seq_id = ubatch.seq_id[q][0];
-        if (std::find(batch_seqs.begin(), batch_seqs.end(), seq_id) == batch_seqs.end()) {
-            batch_seqs.push_back(seq_id);
-        }
-    }
-
-    // Phase timing probe: capture snapshot start
-    const auto t_snap_start = std::chrono::steady_clock::now();
-
-    llama_rerot_kv_snapshot snapshot;
-    for (uint32_t i = 0; i < batch_seqs.size(); ++i) {
-        const auto s_id = batch_seqs[i];
-        snapshot.seq_to_index[s_id] = i;
-        if (s_id >= 0 && (size_t) s_id < rerot_reader_views.size()) {
-            const auto & r = rerot_reader_views[s_id];
-            if (r.active()) {
-                snapshot.episode_id = r.episode_id;
-                if (r.reader != LLAMA_REROT_NODE_INVALID) {
-                    snapshot.node_to_index[r.reader] = i;
-                }
-            }
-        }
-    }
-
-    for (uint32_t key = 0; key < n_kv; ++key) {
-        if (cells.is_empty(key)) {
-            continue;
-        }
-        const llama_pos storage_pos = cells.pos_get(key);
-        const auto meta = cells.rerot_get(key);
-
-        uint64_t seq_mask = 0;
-        for (uint32_t i = 0; i < batch_seqs.size(); ++i) {
-            if (cells.seq_has(key, batch_seqs[i])) {
-                seq_mask |= (1ULL << i);
-            }
-        }
-
-        if (!meta.active()) {
-            if (seq_mask != 0) {
-                snapshot.base_cells.push_back({ key, storage_pos, seq_mask });
-            }
-            continue;
-        }
-
-        if (snapshot.episode_id != 0 && meta.episode_id != snapshot.episode_id) {
-            continue;
-        }
-
-        snapshot.run_buckets[meta.run_id].push_back({
-            key,
-            storage_pos,
-            meta.frontier,
-            meta.node_id,
-            meta.visibility,
-            seq_mask
-        });
-    }
-
-    std::stable_sort(snapshot.base_cells.begin(), snapshot.base_cells.end(),
-        [](const llama_rerot_snapshot_base_cell & a, const llama_rerot_snapshot_base_cell & b) {
-            if (a.storage_pos != b.storage_pos) {
-                return a.storage_pos < b.storage_pos;
-            }
-            return a.key_index < b.key_index;
-        });
-
-    for (auto & pair : snapshot.run_buckets) {
-        std::stable_sort(pair.second.begin(), pair.second.end(),
-            [](const llama_rerot_snapshot_cell & a, const llama_rerot_snapshot_cell & b) {
-                if (a.storage_pos != b.storage_pos) {
-                    return a.storage_pos < b.storage_pos;
-                }
-                if (a.frontier != b.frontier) {
-                    return a.frontier < b.frontier;
-                }
-                return a.key_index < b.key_index;
-            });
-    }
-
-    const auto t_snap_end = std::chrono::steady_clock::now();
-    const uint64_t snap_us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t_snap_end - t_snap_start).count();
-
-    // Layout timing probe: query layout loop start
     const auto t_layout_start = std::chrono::steady_clock::now();
 
+    // Per-reader-view shared scan (2026-09-21 compute-organization round).
+    // The old loop rebuilt the full n_kv key table and re-sorted it for every
+    // query row (O(Q * n_kv) scans + sorts, ~n_kv * 40B per-row temporaries).
+    // Rows sharing one reader state (one pen's decode rows, MTP verify
+    // rows) share the same visibility world: scan + sort once per DISTINCT
+    // reader state, then per query apply only the two per-query gates
+    // (causal storage bound, query-run current-row match) and the phase
+    // grouping. Output is byte-identical to per-query
+    // llama_rerot_build_query_layout by construction: same visible set,
+    // same ordering keys, same effective-position arithmetic.
+    struct scan_key {
+        const llama_rerot_reader_state * view = nullptr;
+        std::vector<uint32_t> rows; // ubatch rows, in order
+    };
+    std::vector<scan_key> groups;
     for (uint32_t query = 0; query < ubatch.n_tokens; ++query) {
         const llama_seq_id seq_id = ubatch.seq_id[query][0];
         const auto & reader = rerot_reader_views.at(seq_id);
-
-        auto query_layout = llama_rerot_build_query_layout(reader, ubatch.pos[query], snapshot);
-        const uint32_t group_base = static_cast<uint32_t>(result.groups.size());
-        for (auto group : query_layout.groups) {
-            group.query_index = query;
-            result.groups.push_back(group);
+        scan_key * group = nullptr;
+        for (auto & cand : groups) {
+            // Reader states are stable for the duration of one ubatch
+            // (mutations bump epochs and force a rebuild); pointer identity
+            // is the exact equality of the visibility world.
+            if (cand.view == &reader) {
+                group = &cand;
+                break;
+            }
         }
-        for (auto entry : query_layout.entries) {
-            entry.group_index += group_base;
-            result.entries.push_back(entry);
+        if (!group) {
+            groups.push_back(scan_key{ &reader, {} });
+            group = &groups.back();
         }
-        result.query_offsets.push_back(static_cast<uint32_t>(result.entries.size()));
+        group->rows.push_back(query);
     }
 
+    // Q3 host-side shared supply (2026-09-22 fifth round): ONE structural
+    // pass serves EVERY distinct reader group. The third round scanned the
+    // resident cells once but still copied the full key table per group and
+    // re-ran the classification/sort work per reader; the fifth round feeds
+    // all readers from ONE shared key world — per-(episode, run) segments
+    // with deviation ordering computed once, per reader only the ownership-
+    // dependent filtering. The scan bound is used_max_p1() (no used cell
+    // lives at or past it), so empty tail cells beyond the highest used
+    // index cost nothing. Record contents are identical to the per-group
+    // build by construction.
+    std::vector<llama_rerot_key_record> shared_keys;
+    const uint32_t scan_end = std::min<uint32_t>(n_kv, cells.used_max_p1());
+    shared_keys.reserve(scan_end);
+    for (uint32_t key = 0; key < scan_end; ++key) {
+        if (cells.is_empty(key)) {
+            continue;
+        }
+        shared_keys.push_back({
+            key,
+            cells.pos_get(key),
+            false,
+            cells.rerot_get(key),
+        });
+    }
+    // Per-group query positions + ownership columns (the caller's seq_has
+    // column per group: base rows and own-run rows of that reader's seq).
+    std::vector<std::vector<llama_pos>> group_qpos;
+    std::vector<llama_rerot_reader_state> group_readers;
+    group_qpos.reserve(groups.size());
+    group_readers.reserve(groups.size());
+    // Ownership columns are bitsets of the SHARED key table, not byte
+    // vectors: the R columns share one pass over the resident cells (the
+    // old loop called cells.seq_has per (cell, reader) — R x n_kv bitset
+    // tests). The distinct reader sequences are few (one per pen); the
+    // bitset test is one AND per cell per distinct sequence.
+    std::vector<llama_seq_id> group_seqs;
+    std::vector<std::vector<uint64_t>> owned_words;
+    group_seqs.reserve(groups.size());
+    const size_t owned_words_per_col =
+        (shared_keys.size() + 63) / 64 + (shared_keys.empty() ? 1 : 0);
+    for (const auto & group : groups) {
+        const llama_seq_id seq_id = ubatch.seq_id[group.rows.front()][0];
+        std::vector<llama_pos> qpos;
+        qpos.reserve(group.rows.size());
+        for (const uint32_t query : group.rows) {
+            qpos.push_back(ubatch.pos[query]);
+        }
+        group_seqs.push_back(seq_id);
+        owned_words.emplace_back(owned_words_per_col, 0);
+        group_qpos.push_back(std::move(qpos));
+        group_readers.push_back(*group.view);
+    }
+    {
+        // ONE pass over resident cells fills every reader's ownership bit
+        // at once: cell bitsets are read once, not once per reader.
+        for (uint32_t key = 0; key < shared_keys.size(); ++key) {
+            // shared_keys is dense over non-empty cells in scan order, so
+            // its element k has key_index k (built by the push_back loop
+            // above; key_index == the cell index).
+            const auto & cell_seq = cells.seq_get_all(shared_keys[key].key_index);
+            for (size_t g = 0; g < group_seqs.size(); ++g) {
+                if (cell_seq.test(group_seqs[g])) {
+                    owned_words[g][key >> 6] |= 1ull << (key & 63);
+                }
+            }
+        }
+    }
+    // Tenth round: the builder consumes the packed bitsets directly
+    // (llama_rerot_owned_view is a plain pointer + width — no kv-cells
+    // type dependency), so the R x K byte expansion is gone.
+    std::vector<llama_rerot_owned_view> owned_views(groups.size());
+    for (size_t g = 0; g < groups.size(); ++g) {
+        GGML_ASSERT(owned_words[g].size() >= owned_words_per_col);
+        owned_views[g] = { owned_words[g].data(), owned_words[g].size() };
+    }
+    const auto multi = llama_rerot_build_query_layouts_multi_reader_bits(
+        group_readers, group_qpos, shared_keys, owned_views);
+    // Reserve the assembly targets once: per-group push_back reallocation
+    // over ~R x n_kv entries was a measurable fraction of the cache-side
+    // cost at production shapes.
+    {
+        size_t total_entries = 0;
+        size_t total_groups = 0;
+        for (size_t g = 0; g < groups.size(); ++g) {
+            for (size_t i = 0; i < groups[g].rows.size() && i < multi[g].size(); ++i) {
+                total_entries += multi[g][i].entries.size();
+                total_groups += multi[g][i].groups.size();
+            }
+        }
+        result.entries.reserve(total_entries);
+        result.groups.reserve(total_groups);
+    }
+    for (size_t g = 0; g < groups.size(); ++g) {
+        const auto & group = groups[g];
+        for (size_t i = 0; i < group.rows.size() && i < multi[g].size(); ++i) {
+            const uint32_t query = group.rows[i];
+            const uint32_t group_base = static_cast<uint32_t>(result.groups.size());
+            for (auto grp : multi[g][i].groups) {
+                grp.query_index = query;
+                result.groups.push_back(grp);
+            }
+            for (auto entry : multi[g][i].entries) {
+                entry.group_index += group_base;
+                result.entries.push_back(entry);
+            }
+            result.query_offsets.push_back(static_cast<uint32_t>(result.entries.size()));
+        }
+    }
     const auto t_layout_end = std::chrono::steady_clock::now();
     const uint64_t layout_us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t_layout_end - t_layout_start).count();
-
     std::string error;
     if (!result.validate(n_kv, &error)) {
         throw std::runtime_error("invalid RERoT attention layout: " + error);
@@ -6329,19 +6366,17 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
 
     // Accumulate batch layout timing and counts to active profile ledger
     if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
-        prof->layout_view_build_us.fetch_add(snap_us + layout_us, std::memory_order_relaxed);
+        prof->layout_view_build_us.fetch_add(layout_us, std::memory_order_relaxed);
         prof->layout_view_build_count.fetch_add(ubatch.n_tokens, std::memory_order_relaxed);
         prof->actual_query_rows.fetch_add(ubatch.n_tokens, std::memory_order_relaxed);
         prof->live_groups.fetch_add(result.groups.size(), std::memory_order_relaxed);
         prof->cap_groups.fetch_add(result.groups.capacity(), std::memory_order_relaxed);
         prof->live_entries.fetch_add(result.entries.size(), std::memory_order_relaxed);
         prof->cap_entries.fetch_add(result.entries.capacity(), std::memory_order_relaxed);
-        prof->run_count.fetch_add(snapshot.run_buckets.size(), std::memory_order_relaxed);
 
         uint64_t prev_hwm = prof->high_watermark_n_kv.load(std::memory_order_relaxed);
         while (n_kv > prev_hwm && !prof->high_watermark_n_kv.compare_exchange_weak(prev_hwm, n_kv, std::memory_order_relaxed)) {}
 
-        prof->ring.push(4 /* custom/layout-audit */, 1 /* snapshot */, (uint16_t) snapshot.run_buckets.size(), (uint32_t) n_kv, snap_us);
         prof->ring.push(4 /* custom/layout-audit */, 2 /* layout */, (uint16_t) result.groups.size(), (uint32_t) result.entries.size(), layout_us);
     }
 

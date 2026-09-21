@@ -1171,6 +1171,552 @@ static void test_chapter09_exhaustive_dag_properties() {
     CHECK(dag_count > 0);
 }
 
+
+// ---------------------------------------------------------------------------
+// Shared-reader batched layout vs per-query oracle (2026-09-22 round).
+// llama_rerot_build_query_layouts_shared is the decode hot path's
+// structure/numeric split: one structural pass (classification, ordering,
+// per-run causal arrays) per reader state, then per-query numeric work.
+// The per-query builder stays the oracle: every batched output must equal
+// the per-query output group-for-group, entry-for-entry, including
+// query_virtual_pos. Randomized across arms (FULL foreign public, gated
+// private/pending, own frontier-equal public, untagged base, invisible
+// foreign), frontier modes, and query positions (before/inside/past every
+// run boundary).
+// ---------------------------------------------------------------------------
+static bool layouts_identical(
+        const llama_rerot_query_layout & shared,
+        const llama_rerot_query_layout & oracle,
+        const char * tag) {
+    bool ok = true;
+    if (shared.query_virtual_pos != oracle.query_virtual_pos) {
+        std::fprintf(stderr, "FAIL %s: query_virtual_pos %d vs %d\n", tag,
+            (int) shared.query_virtual_pos, (int) oracle.query_virtual_pos);
+        ok = false;
+    }
+    if (shared.groups.size() != oracle.groups.size() ||
+        shared.entries.size() != oracle.entries.size()) {
+        std::fprintf(stderr, "FAIL %s: shape (%zu g/%zu e) vs (%zu g/%zu e)\n", tag,
+            shared.groups.size(), shared.entries.size(),
+            oracle.groups.size(), oracle.entries.size());
+        return false;
+    }
+    for (size_t i = 0; i < shared.groups.size(); ++i) {
+        if (shared.groups[i].effective_pos != oracle.groups[i].effective_pos) {
+            std::fprintf(stderr, "FAIL %s: group %zu eff %d vs %d\n", tag, i,
+                (int) shared.groups[i].effective_pos,
+                (int) oracle.groups[i].effective_pos);
+            ok = false;
+        }
+    }
+    for (size_t i = 0; i < shared.entries.size(); ++i) {
+        if (shared.entries[i].key_index != oracle.entries[i].key_index ||
+            shared.entries[i].group_index != oracle.entries[i].group_index) {
+            std::fprintf(stderr, "FAIL %s: entry %zu (%u->%u) vs (%u->%u)\n", tag, i,
+                shared.entries[i].key_index, shared.entries[i].group_index,
+                oracle.entries[i].key_index, oracle.entries[i].group_index);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+static llama_kv_rerot_meta make_meta(
+        uint64_t episode,
+        llama_rerot_node_id node,
+        llama_rerot_run_id run,
+        llama_rerot_visibility vis,
+        uint64_t frontier) {
+    llama_kv_rerot_meta m;
+    m.episode_id = episode;
+    m.node_id = node;
+    m.run_id = run;
+    m.visibility = vis;
+    m.frontier = frontier;
+    return m;
+}
+
+static void test_shared_layouts_vs_oracle() {
+    constexpr uint64_t episode = 4242;
+    constexpr llama_rerot_node_id own = 1, peer = 2, foreign = 3;
+    constexpr llama_rerot_run_id run_base = 50; // untagged base rows carry no run
+    constexpr llama_rerot_run_id run_own = 51, run_peer_pub = 52,
+                                run_own_priv = 53, run_foreign_priv = 54;
+
+    std::mt19937_64 rng(0xC0FFEEull);
+    for (int iter = 0; iter < 200; ++iter) {
+        const llama_rerot_frontier_mode mode =
+            (iter % 2) ? LLAMA_REROT_FRONTIER_LAG1 : LLAMA_REROT_FRONTIER_STRONG;
+        const uint64_t reader_frontier = 3;
+
+        llama_rerot_reader_state reader;
+        reader.episode_id = episode;
+        reader.reader = own;
+        reader.query_run = run_own;
+        reader.frontier = reader_frontier;
+        reader.frontier_mode = mode;
+        reader.ordered_runs = { run_peer_pub, run_own_priv, run_own };
+
+        // Key world: every arm at once, storage positions shuffled across
+        // physical indices so ordering work is real. Storage values are
+        // drawn from a small dense range with duplicates across arms (the
+        // comparators must break ties identically).
+        std::vector<llama_rerot_key_record> keys;
+        {
+            uint32_t next_idx = 0;
+            const auto push = [&](llama_pos storage, bool owned, llama_kv_rerot_meta meta) {
+                keys.push_back({ next_idx++, storage, owned, meta });
+            };
+            // Untagged base: owned rows visible (causally gated); a foreign
+            // untagged row never is.
+            push(0, true, {});
+            push(1, true, {});
+            push(2, false, {});
+            push(5, true, {});
+            // Own run rows (public, own node): frontier <= reader frontier,
+            // owned, causally gated — includes the current decode row.
+            push(3, true, make_meta(episode, own, run_own, llama_rerot_visibility::public_live, 3));
+            push(4, true, make_meta(episode, own, run_own, llama_rerot_visibility::public_live, 3));
+            push(6, true, make_meta(episode, own, run_own, llama_rerot_visibility::public_live, 2));
+            // WITHIN-RUN duplicate storage (MTP verify rows sharing a
+            // position): the 09-22 fifth-round probe caught the 4th round
+            // permuting the segment's storage array into deviation order
+            // (non-identity permutation at duplicates) and binary-searching
+            // the non-monotonic result. Keep duplicates in EVERY tagged arm.
+            push(4, true, make_meta(episode, own, run_own, llama_rerot_visibility::public_live, 2));
+            push(6, true, make_meta(episode, own, run_own, llama_rerot_visibility::public_live, 3));
+            // Own private rows: gated.
+            push(2, true, make_meta(episode, own, run_own_priv, llama_rerot_visibility::private_control, 0));
+            push(7, true, make_meta(episode, own, run_own_priv, llama_rerot_visibility::pending_record, 0));
+            // Own private/pending rows of a FUTURE frontier: the oracle has
+            // no frontier gate for them (node==reader && owned && causal cut
+            // only). The 09-22 fifth-round probe caught the shared builder
+            // dropping these; keep the arm so the comparison never regresses.
+            push(8, true, make_meta(episode, own, run_own_priv, llama_rerot_visibility::private_control, 99));
+            push(9, true, make_meta(episode, own, run_own_priv, llama_rerot_visibility::pending_record, 99));
+            // Peer public rows: frontier-dependent FULL vs invisible.
+            push(0, false, make_meta(episode, peer, run_peer_pub, llama_rerot_visibility::public_live, 1));
+            push(1, false, make_meta(episode, peer, run_peer_pub, llama_rerot_visibility::public_live, 2));
+            push(1, false, make_meta(episode, peer, run_peer_pub, llama_rerot_visibility::public_live, 1));
+            push(1, false, make_meta(episode, peer, run_peer_pub, llama_rerot_visibility::public_live, 2));
+            push(2, false, make_meta(episode, peer, run_peer_pub, llama_rerot_visibility::public_live, 3));
+            // Foreign private: never visible.
+            push(3, false, make_meta(episode, foreign, run_foreign_priv, llama_rerot_visibility::private_control, 0));
+            // Wrong-episode public: dropped.
+            push(4, false, make_meta(episode + 1, peer, run_peer_pub, llama_rerot_visibility::public_live, 0));
+            // Physical shuffle: reverse insertion order of the key vector.
+            std::shuffle(keys.begin(), keys.end(), rng);
+        }
+
+        // Query positions: every boundary of every arm, plus extremes.
+        std::vector<llama_pos> positions;
+        for (llama_pos p = 0; p <= 10; ++p) {
+            positions.push_back(p);
+        }
+        positions.push_back(100);
+        // Shuffle the QUERY batch too: the shared builder's outputs are
+        // positional, so this checks row-to-output alignment.
+        std::shuffle(positions.begin(), positions.end(), rng);
+
+        bool threw_shared = false, threw_oracle = false;
+        std::vector<llama_rerot_query_layout> shared;
+        try {
+            shared = llama_rerot_build_query_layouts_shared(reader, positions, keys);
+        } catch (const std::exception &) {
+            threw_shared = true;
+        }
+        std::vector<llama_rerot_query_layout> oracle;
+        try {
+            for (const llama_pos p : positions) {
+                oracle.push_back(llama_rerot_build_query_layout(reader, p, keys));
+            }
+        } catch (const std::exception &) {
+            threw_oracle = true;
+        }
+        CHECK(threw_shared == threw_oracle);
+        if (threw_shared) {
+            continue;
+        }
+        CHECK(shared.size() == oracle.size());
+        for (size_t i = 0; i < shared.size(); ++i) {
+            const std::string tag = "iter " + std::to_string(iter) + " pos " + std::to_string(positions[i]);
+            CHECK(layouts_identical(shared[i], oracle[i], tag.c_str()));
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Multi-reader shared-world builder vs single-reader shared builder vs
+// per-query oracle (2026-09-22 fifth round, Q3 host side). R pens of one
+// frontier share ONE key world; the multi-reader entry must reproduce, per
+// reader, exactly what the single-reader entry produces with that reader's
+// ownership column — and both must match the per-query oracle. The random
+// world keeps EVERY arm (base/own public/own private+pending incl.
+// FUTURE-frontier rows/foreign public FULL/foreign private/wrong episode),
+// WITHIN-RUN storage duplicates (MTP verify shape) and gaps, shuffled
+// physical order, and shuffled query batches per reader.
+// ---------------------------------------------------------------------------
+static void test_multi_reader_layouts_vs_oracle() {
+    constexpr uint64_t episode = 909;
+    constexpr llama_rerot_node_id own = 1, peer = 2, foreign = 3;
+    constexpr llama_rerot_run_id run_own = 71, run_peer_pub = 72,
+                                run_own_priv = 73, run_foreign_priv = 74;
+
+    std::mt19937_64 rng(0x5EED5EEDull);
+    for (int iter = 0; iter < 200; ++iter) {
+        const llama_rerot_frontier_mode mode =
+            (iter % 2) ? LLAMA_REROT_FRONTIER_LAG1 : LLAMA_REROT_FRONTIER_STRONG;
+        const uint64_t frontier = 3;
+
+        // R pens: every pen's query run is run_own; peers own their public
+        // runs (RANK order differs per reader only through peer permutation —
+        // here peers stay in run order, which is one legal PAC-DFS order).
+        const uint32_t R = 1 + (iter % 5);
+        // Peer run ids live in their OWN range (200+p): run ids are unique
+        // per node in production, and the shared world buckets by (episode,
+        // run) — a collision with own_priv would merge two owners.
+        std::vector<llama_rerot_run_id> peer_runs;
+        for (uint32_t p = 0; p < R - 1; ++p) {
+            peer_runs.push_back(200 + p);
+        }
+
+        std::vector<llama_rerot_reader_state> readers;
+        for (uint32_t p = 0; p < R; ++p) {
+            llama_rerot_reader_state reader;
+            reader.episode_id = episode;
+            reader.reader = own;
+            reader.query_run = run_own;
+            reader.frontier = frontier;
+            reader.frontier_mode = mode;
+            // Own-subtree-last: peers first, own run last.
+            reader.ordered_runs = peer_runs;
+            reader.ordered_runs.push_back(run_own);
+            readers.push_back(reader);
+        }
+
+        // Shared key world (ONE table; ownership is per reader via columns).
+        std::vector<llama_rerot_key_record> keys;
+        {
+            uint32_t next_idx = 0;
+            const auto push = [&](llama_pos storage, llama_kv_rerot_meta meta) {
+                keys.push_back({ next_idx++, storage, false, meta });
+            };
+            // Untagged base rows (ownership varies per reader column).
+            push(0, {});
+            push(1, {});
+            push(2, {});
+            push(5, {});
+            // Own run: public rows with duplicates + gaps.
+            push(3, make_meta(episode, own, run_own, llama_rerot_visibility::public_live, 3));
+            push(4, make_meta(episode, own, run_own, llama_rerot_visibility::public_live, 3));
+            push(4, make_meta(episode, own, run_own, llama_rerot_visibility::public_live, 2));
+            push(6, make_meta(episode, own, run_own, llama_rerot_visibility::public_live, 2));
+            push(6, make_meta(episode, own, run_own, llama_rerot_visibility::public_live, 3));
+            push(2, make_meta(episode, own, run_own_priv, llama_rerot_visibility::private_control, 0));
+            push(7, make_meta(episode, own, run_own_priv, llama_rerot_visibility::pending_record, 0));
+            push(8, make_meta(episode, own, run_own_priv, llama_rerot_visibility::private_control, 99));
+            push(9, make_meta(episode, own, run_own_priv, llama_rerot_visibility::pending_record, 99));
+            // Peer public runs (FULL iff frontier passes, with duplicates).
+            for (uint32_t p = 0; p < R - 1; ++p) {
+                push(0, make_meta(episode, peer, peer_runs[p], llama_rerot_visibility::public_live, 1));
+                push(1, make_meta(episode, peer, peer_runs[p], llama_rerot_visibility::public_live, 2));
+                push(1, make_meta(episode, peer, peer_runs[p], llama_rerot_visibility::public_live, 1));
+                push(2, make_meta(episode, peer, peer_runs[p], llama_rerot_visibility::public_live, 3));
+            }
+            // Foreign private + wrong episode: never visible.
+            push(3, make_meta(episode, foreign, run_foreign_priv, llama_rerot_visibility::private_control, 0));
+            push(4, make_meta(episode + 1, peer, 200, llama_rerot_visibility::public_live, 0));
+            std::shuffle(keys.begin(), keys.end(), rng);
+        }
+
+        // Per-reader ownership columns (what the caller's seq_has fills):
+        // the reader owns its OWN run's rows and run_own_priv's rows (they
+        // were written into its sequence), plus untagged rows where
+        // (scan index % 4) == (p % 4) — varied across readers so the columns
+        // genuinely differ. Peer-run rows stay unowned (foreign).
+        std::vector<std::vector<uint8_t>> base_owned(R, std::vector<uint8_t>(keys.size(), 0));
+        for (uint32_t p = 0; p < R; ++p) {
+            for (size_t k = 0; k < keys.size(); ++k) {
+                const auto & meta = keys[k].meta;
+                if (meta.active() && (meta.run_id == run_own || meta.run_id == run_own_priv)) {
+                    base_owned[p][k] = 1;
+                } else if (!meta.active() && (k % 4) == (p % 4)) {
+                    base_owned[p][k] = 1;
+                }
+            }
+        }
+
+        // Per-reader query batches: boundary positions, shuffled.
+        std::vector<std::vector<llama_pos>> qpos(R);
+        for (uint32_t p = 0; p < R; ++p) {
+            for (llama_pos q = 0; q <= 10; ++q) {
+                qpos[p].push_back(q);
+            }
+            qpos[p].push_back(100);
+            std::shuffle(qpos[p].begin(), qpos[p].end(), rng);
+        }
+
+        bool threw_multi = false, threw_ref = false;
+        std::vector<std::vector<llama_rerot_query_layout>> multi;
+        try {
+            multi = llama_rerot_build_query_layouts_multi_reader(readers, qpos, keys, base_owned);
+        } catch (const std::exception &) {
+            threw_multi = true;
+        }
+        // Tenth round: the packed-bits core must be bit-identical to the
+        // byte-vector path (the cache level now calls the bits overload
+        // directly; this probe pins the two overloads together).
+        {
+            const size_t n_words = (keys.size() + 63) / 64 + (keys.empty() ? 1 : 0);
+            std::vector<std::vector<uint64_t>> words(R, std::vector<uint64_t>(n_words, 0));
+            std::vector<llama_rerot_owned_view> views(R);
+            for (uint32_t p = 0; p < R; ++p) {
+                for (size_t k = 0; k < keys.size(); ++k) {
+                    if (base_owned[p][k]) {
+                        words[p][k >> 6] |= 1ull << (k & 63);
+                    }
+                }
+                views[p] = { words[p].data(), words[p].size() };
+            }
+            bool threw_bits = false;
+            try {
+                const auto multi_bits = llama_rerot_build_query_layouts_multi_reader_bits(
+                    readers, qpos, keys, views);
+                CHECK(multi_bits.size() == multi.size());
+                for (uint32_t p = 0; p < R; ++p) {
+                    const std::string rtag = "bits iter " + std::to_string(iter) + " reader " + std::to_string(p);
+                    CHECK(multi_bits[p].size() == multi[p].size());
+                    for (size_t i = 0; i < multi_bits[p].size() && i < multi[p].size(); ++i) {
+                        const std::string tag = rtag + " pos " + std::to_string(qpos[p][i]);
+                        CHECK(layouts_identical(multi_bits[p][i], multi[p][i], tag.c_str()));
+                    }
+                }
+            } catch (const std::exception &) {
+                threw_bits = true;
+            }
+            CHECK(threw_bits == threw_multi);
+            // Eleventh round: persistent shared world. Build incrementally
+            // (half the table, then append the rest, then a publish-style
+            // meta rewrite) and require output identical to the byte path.
+            bool threw_world = false;
+            try {
+                llama_rerot_shared_world world;
+                const size_t half = keys.size() / 2;
+                std::vector<llama_rerot_key_record> first(keys.begin(), keys.begin() + half);
+                std::vector<llama_rerot_key_record> rest(keys.begin() + half, keys.end());
+                world.build_world(first);
+                world.append_keys(rest);
+                // Publish-style meta rewrite: same records, frontier+1.
+                if (!keys.empty()) {
+                    std::vector<llama_rerot_key_record> updated;
+                    for (const auto & k : keys) {
+                        llama_rerot_key_record u = k;
+                        if (u.meta.active()) {
+                            u.meta.publish_epoch += 1;
+                        }
+                        updated.push_back(u);
+                    }
+                    world.set_key_meta(updated);
+                }
+                const auto multi_world = llama_rerot_build_query_layouts_multi_reader_world(
+                    readers, qpos, world, views);
+                CHECK(multi_world.size() == multi.size());
+                for (uint32_t p = 0; p < R; ++p) {
+                    const std::string rtag = "world iter " + std::to_string(iter) + " reader " + std::to_string(p);
+                    CHECK(multi_world[p].size() == multi[p].size());
+                    for (size_t i = 0; i < multi_world[p].size() && i < multi[p].size(); ++i) {
+                        const std::string tag = rtag + " pos " + std::to_string(qpos[p][i]);
+                        CHECK(layouts_identical(multi_world[p][i], multi[p][i], tag.c_str()));
+                    }
+                }
+            } catch (const std::exception &) {
+                threw_world = true;
+            }
+            CHECK(threw_world == threw_multi);
+        }
+        std::vector<std::vector<llama_rerot_query_layout>> ref(R);
+        try {
+            for (uint32_t p = 0; p < R; ++p) {
+                std::vector<llama_rerot_key_record> keys_p(keys);
+                for (size_t k = 0; k < keys_p.size(); ++k) {
+                    keys_p[k].owned_by_reader = base_owned[p][k] != 0;
+                }
+                ref[p] = llama_rerot_build_query_layouts_shared(readers[p], qpos[p], keys_p);
+            }
+        } catch (const std::exception &) {
+            threw_ref = true;
+        }
+        CHECK(threw_multi == threw_ref);
+        if (threw_multi) {
+            continue;
+        }
+        CHECK(multi.size() == ref.size());
+        for (uint32_t p = 0; p < R; ++p) {
+            const std::string rtag = "iter " + std::to_string(iter) + " reader " + std::to_string(p);
+            CHECK(multi[p].size() == ref[p].size());
+            for (size_t i = 0; i < multi[p].size() && i < ref[p].size(); ++i) {
+                const std::string tag = rtag + " pos " + std::to_string(qpos[p][i]);
+                CHECK(layouts_identical(multi[p][i], ref[p][i], tag.c_str()));
+            }
+            // Reader 0 additionally against the per-query ORACLE.
+            if (p == 0) {
+                std::vector<llama_rerot_key_record> keys_p(keys);
+                for (size_t k = 0; k < keys_p.size(); ++k) {
+                    keys_p[k].owned_by_reader = base_owned[p][k] != 0;
+                }
+                for (size_t i = 0; i < qpos[p].size(); ++i) {
+                    const auto oracle = llama_rerot_build_query_layout(readers[p], qpos[p][i], keys_p);
+                    const std::string tag = rtag + " oracle pos " + std::to_string(qpos[p][i]);
+                    CHECK(layouts_identical(multi[p][i], oracle, tag.c_str()));
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Eleventh round: llama_rerot_shared_world — the structural pass extracted
+// into a persistent object. This test drives the incremental surface
+// directly: out-of-order append (recycled-cell shape), duplicate append
+// (must throw), meta rewrite (publish shape), meta that escapes the run
+// bucket (must throw), and layout equivalence vs the from-scratch bits
+// path after every mutation step.
+// ---------------------------------------------------------------------------
+static void test_shared_world_incremental() {
+    constexpr uint64_t episode = 4242;
+    std::mt19937_64 rng(0xE11E11E11ull);
+
+    for (int iter = 0; iter < 60; ++iter) {
+        // Base world: 3 runs (2 own-node runs + 1 peer), some untagged.
+        std::vector<llama_rerot_key_record> keys;
+        uint32_t next_idx = 0;
+        const auto push = [&](llama_pos storage, llama_kv_rerot_meta meta) {
+            keys.push_back({ next_idx++, storage, false, meta });
+        };
+        push(0, {});
+        push(1, {});
+        push(2, {});
+        for (llama_pos s = 0; s < 6; ++s) {
+            push(s, make_meta(episode, 1, 10, llama_rerot_visibility::public_live, 3));
+        }
+        push(6, make_meta(episode, 1, 11, llama_rerot_visibility::private_control, 0));
+        push(7, make_meta(episode, 1, 11, llama_rerot_visibility::pending_record, 0));
+        for (llama_pos s = 0; s < 4; ++s) {
+            push(s, make_meta(episode, 2, 20, llama_rerot_visibility::public_live, 1));
+        }
+        std::shuffle(keys.begin(), keys.end(), rng);
+
+        llama_rerot_shared_world world;
+        world.build_world(keys);
+
+        // Reader: own node 1, query run 10, peers first.
+        llama_rerot_reader_state reader;
+        reader.episode_id = episode;
+        reader.reader = 1;
+        reader.query_run = 10;
+        reader.frontier = 3;
+        reader.frontier_mode = LLAMA_REROT_FRONTIER_STRONG;
+        reader.ordered_runs = { 20, 11, 10 };
+
+        const auto layout_for = [&](const std::vector<llama_rerot_key_record> & table,
+                                    const llama_pos q) {
+            // From-scratch reference over `table` with full ownership.
+            std::vector<llama_rerot_key_record> owned(table);
+            for (auto & k : owned) {
+                k.owned_by_reader = true; // world rows are all resident; the
+                                          // bitset below mirrors that
+            }
+            return llama_rerot_build_query_layout(reader, q, owned);
+        };
+
+        // Ownership bitset: every resident row owned (probe shape).
+        const auto make_views = [&](size_t n_keys, size_t R) {
+            const size_t words = (n_keys + 63) / 64 + 1;
+            std::vector<std::vector<uint64_t>> w(R, std::vector<uint64_t>(words, ~0ull));
+            std::vector<llama_rerot_owned_view> v(R);
+            for (size_t r = 0; r < R; ++r) {
+                v[r] = { w[r].data(), w[r].size() };
+            }
+            return std::make_pair(std::move(w), std::move(v));
+        };
+
+        // Step 1: append out-of-order rows (recycled-cell shape: storage
+        // below the current tail of run 10).
+        std::vector<llama_rerot_key_record> appended;
+        appended.push_back({ next_idx++, 3, false,
+            make_meta(episode, 1, 10, llama_rerot_visibility::public_live, 2) });
+        appended.push_back({ next_idx++, 9, false, {} });
+        world.append_keys(appended);
+        keys.insert(keys.end(), appended.begin(), appended.end());
+        {
+            const auto [w, v] = make_views(keys.size(), 1);
+            const auto got = llama_rerot_build_query_layouts_multi_reader_world(
+                { reader }, { { 8 } }, world, v);
+            const auto ref = layout_for(keys, 8);
+            CHECK(got.size() == 1 && got[0].size() == 1);
+            if (got.size() == 1 && got[0].size() == 1) {
+                CHECK(layouts_identical(got[0][0], ref, "world out-of-order append"));
+            }
+        }
+
+        // Step 2: duplicate append must throw and leave the world usable.
+        bool threw = false;
+        try {
+            world.append_keys({ keys.front() });
+        } catch (const std::invalid_argument &) {
+            threw = true;
+        }
+        CHECK(threw);
+
+        // Step 3: publish-style meta rewrite (pending -> public).
+        std::vector<llama_rerot_key_record> updated;
+        for (const auto & k : keys) {
+            llama_rerot_key_record u = k;
+            if (u.meta.active() && u.meta.visibility == llama_rerot_visibility::pending_record) {
+                u.meta.visibility = llama_rerot_visibility::public_live;
+                u.meta.publish_epoch = 9;
+            } else if (u.meta.active()) {
+                u.meta.frontier = 2;
+            }
+            updated.push_back(u);
+        }
+        world.set_key_meta(updated);
+        for (auto & k : keys) {
+            k.meta = world.key(k.key_index).meta;
+        }
+        {
+            const auto [w, v] = make_views(keys.size(), 1);
+            const auto got = llama_rerot_build_query_layouts_multi_reader_world(
+                { reader }, { { 5 } }, world, v);
+            const auto ref = layout_for(keys, 5);
+            CHECK(got.size() == 1 && got[0].size() == 1);
+            if (got.size() == 1 && got[0].size() == 1) {
+                CHECK(layouts_identical(got[0][0], ref, "world meta rewrite"));
+            }
+        }
+
+        // Step 4: meta that escapes the run bucket must throw. Pick an
+        // ACTIVE record (untagged records carry no bucket and are skipped).
+        threw = false;
+        const llama_rerot_key_record * active_rec = nullptr;
+        for (const auto & k : keys) {
+            if (k.meta.active()) { active_rec = &k; break; }
+        }
+        if (active_rec) {
+            try {
+                llama_rerot_key_record u = *active_rec;
+                u.meta.run_id = 999;
+                world.set_key_meta({ u });
+            } catch (const std::invalid_argument &) {
+                threw = true;
+            }
+            CHECK(threw);
+        }
+    }
+}
+
+
 static void assert_query_layouts_identical(
         const llama_rerot_query_layout & old_layout,
         const llama_rerot_query_layout & new_layout,
@@ -1632,6 +2178,7 @@ static void test_differential_query_layout_snapshot() {
     }
 }
 
+
 int main() {
     std::fprintf(stderr, "=== RERoT View Tests ===\n");
     test_differential_query_layout_snapshot();
@@ -1652,7 +2199,9 @@ int main() {
     test_queue_independence();
     test_writer_mutation_stability();
     test_run_epoch_contract();
+    test_shared_layouts_vs_oracle();
+    test_multi_reader_layouts_vs_oracle();
+    test_shared_world_incremental();
     std::fprintf(stderr, "=== Results: %d failure(s) ===\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }
-

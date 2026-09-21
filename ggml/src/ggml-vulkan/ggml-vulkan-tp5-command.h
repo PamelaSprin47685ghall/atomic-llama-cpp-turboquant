@@ -4,6 +4,7 @@
 #pragma once
 
 #include "ggml-vulkan-internal.h"
+#include "ggml-predefined.h"
 #include <vulkan/vulkan_core.h>
 #include <algorithm>
 #include <cstring>
@@ -50,9 +51,20 @@ struct vk_tp5_graph_program {
     std::vector<vk_buffer> buffers;
     std::vector<std::shared_ptr<void>> pipeline_owners;
     vk_tp5_hc_binding normalized;
+    const ggml_tensor * normalized_tensor = nullptr;
     size_t hc_norm_end = 0;
     size_t hc_down_end = 0;
+    size_t hc_up_end = 0;
     vk_tp5_hc_sum hc;
+    // One immutable dispatch recipe per capacity-aware dispatch in this graph.
+    // Indirect arguments themselves live in the stage's stable host-coherent
+    // route arena and are rewritten before submission, never in the CB.
+    size_t predefined_stage = SIZE_MAX;
+    uint32_t predefined_capacity_rows = 0;
+    uint32_t predefined_capacity_outputs = 0;
+    std::vector<ggml_predefined_dispatch> predefined_dispatches;
+    size_t predefined_classified_dispatches = 0;
+    bool predefined_complete = false;
     ~vk_tp5_graph_program() {
         for (VkDescriptorPool pool : descriptor_pools)
             if (pool) vkDestroyDescriptorPool(device, pool, nullptr);

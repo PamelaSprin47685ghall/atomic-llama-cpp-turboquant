@@ -1,0 +1,59 @@
+#version 450
+#ifdef TP5_PUBLISH_F16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
+// Compact Exact-LateBind sidecar publisher.
+//
+// Q stays entirely in local VRAM. One 64-lane workgroup copies the 4*rank
+// F32 sufficient statistic to the host-imported relay slot using 128-bit
+// stores, then lane 0 publishes status[6]. Keeping payload and ready in one
+// compute dispatch removes the old copy -> COMPUTE/HOST -> vkCmdFillBuffer ->
+// TRANSFER/HOST sequence while preserving payload-before-ready ordering.
+
+layout(local_size_x = 64) in;
+
+#ifdef TP5_PUBLISH_F16
+layout(std430, binding = 0) readonly buffer LocalSidecar {
+    vec4 src[];
+};
+layout(std430, binding = 1) coherent writeonly buffer HostSidecar {
+    f16vec4 dst[];
+};
+#else
+layout(std430, binding = 0) readonly buffer LocalSidecar {
+    uvec4 src[];
+};
+
+layout(std430, binding = 1) coherent writeonly buffer HostSidecar {
+    uvec4 dst[];
+};
+#endif
+
+layout(std430, binding = 2) coherent volatile buffer Status {
+    uint status[];
+};
+
+layout(push_constant) uniform Params {
+    uint n_uvec4;
+} p;
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    for (uint i = lane; i < p.n_uvec4; i += 64u) {
+#ifdef TP5_PUBLISH_F16
+        dst[i] = f16vec4(src[i]);
+#else
+        dst[i] = src[i];
+#endif
+    }
+
+    // All sidecar stores come from this one workgroup. Order every lane's
+    // payload stores before publishing the CPU-visible ready word.
+    memoryBarrierBuffer();
+    barrier();
+    if (lane == 0u) {
+        status[6] = 1u;
+        memoryBarrierBuffer();
+    }
+}

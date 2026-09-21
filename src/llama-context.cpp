@@ -2400,6 +2400,9 @@ struct llama_compute_guard {
 };
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    predefined_frame_current_valid = false;
+    predefined_capacity_rows_current = 0;
+    predefined_capacity_outputs_current = 0;
     llama_device_hidden_input hidden_input;
     llama_ubatch input_ubatch;
     const llama_ubatch * input_batch = &ubatch;
@@ -2422,6 +2425,113 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                             __func__, ubatch.n_tokens, ubatch.n_seqs);
             ret = GGML_STATUS_FAILED;
             return nullptr;
+        }
+        ggml_predefined_request request{};
+        request.sequences = ubatch.n_seqs;
+        request.tokens    = ubatch.n_tokens;
+        request.outputs   = n_outputs;
+
+        // Context extent belongs to useful rows, not the physical maximum.
+        // Position 0 is a valid context of length 1; negative positions are
+        // invalid for this capacity-defined execution.
+        uint64_t context_tokens = 0;
+        if (!ubatch.pos || ubatch.n_pos == 0) {
+            LLAMA_LOG_ERROR("%s: predefined execution requires explicit token positions\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            const llama_pos pos = ubatch.pos[(size_t) i * ubatch.n_pos];
+            if (pos < 0) {
+                LLAMA_LOG_ERROR("%s: predefined execution received a negative token position\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            context_tokens = std::max<uint64_t>(context_tokens, uint64_t(pos) + 1);
+        }
+        if (context_tokens == 0 || context_tokens > UINT32_MAX) {
+            LLAMA_LOG_ERROR("%s: predefined context extent is invalid\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        request.context_tokens = (uint32_t) context_tokens;
+
+        if (gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+            if (n_outputs == 0) {
+                // MTP state catch-up consumes sampled + accepted target rows
+                // but deliberately produces no logits.
+                if (ubatch.n_tokens < ubatch.n_seqs) {
+                    LLAMA_LOG_ERROR("%s: invalid MTP catch-up row count\n", __func__);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+                request.phase = GGML_PREDEFINED_CATCHUP;
+                request.accepted_tokens = ubatch.n_tokens - ubatch.n_seqs;
+            } else {
+                request.phase = GGML_PREDEFINED_DRAFT;
+                // Draft steps are one useful row per active sequence. The
+                // exact step ordinal is not needed by any lowered dispatch
+                // yet; zero remains a valid member of the immutable ABI.
+                request.draft_step = 0;
+            }
+        } else if (n_outputs == (int32_t) ubatch.n_tokens &&
+                   ubatch.n_tokens <= capacity->verify_tokens) {
+            // A target verification contains one sampled row per sequence plus
+            // the candidate rows. Ordinary one-token decode is the degenerate
+            // case with zero candidates.
+            if (ubatch.n_tokens < ubatch.n_seqs) {
+                LLAMA_LOG_ERROR("%s: invalid target verification row count\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            request.phase = GGML_PREDEFINED_TARGET;
+            request.draft_tokens = ubatch.n_tokens - ubatch.n_seqs;
+        } else {
+            request.phase = GGML_PREDEFINED_PREFILL;
+        }
+
+        uint64_t epoch = ++predefined_frame_epoch;
+        if (epoch == 0) {
+            epoch = ++predefined_frame_epoch;
+        }
+        ggml_predefined_frame frame{};
+        char frame_error[192];
+        if (!ggml_predefined_make_frame(
+                capacity, &request, epoch, uint32_t(epoch % GGML_PREDEFINED_FRAME_SLOTS),
+                &frame, frame_error, sizeof(frame_error))) {
+            LLAMA_LOG_ERROR("%s: invalid predefined execution frame: %s\n", __func__, frame_error);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        predefined_frame_current = frame;
+        if (gtype == LLM_GRAPH_TYPE_DECODER_MTP &&
+            (request.phase == GGML_PREDEFINED_DRAFT || request.phase == GGML_PREDEFINED_CATCHUP)) {
+            // One MTP mathematical entry covers both one-row draft and
+            // sampled+accepted catch-up. Attention/KV consume active TOKENS;
+            // the post-attention FFN/head consumes at most one OUTPUT row.
+            predefined_capacity_rows_current = capacity->verify_tokens;
+            predefined_capacity_outputs_current = 1;
+        } else {
+            // Target/prefill stays exact until the 48-layer stateful trunk has
+            // independently completed capacity lowering.
+            predefined_capacity_rows_current = ubatch.n_tokens;
+            predefined_capacity_outputs_current = std::max<uint32_t>(1u, frame.active_outputs);
+        }
+        predefined_frame_current_valid = true;
+        // Until a concrete entry has been lowered to a capacity-shaped graph,
+        // capacity_rows stays equal to the graph's real rows. The transport
+        // plumbing is therefore live without silently treating padded rows as
+        // useful work. The maximum-graph path will raise only capacity_rows
+        // after all participating operators have adopted the frame contract.
+        for (ggml_backend_t backend : backend_ptrs) {
+            if (ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_META &&
+                !ggml_backend_meta_set_predefined_frame(
+                    backend, &frame, predefined_capacity_rows_current,
+                    predefined_capacity_outputs_current)) {
+                LLAMA_LOG_ERROR("%s: failed to publish predefined execution frame to meta backend\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
         }
     }
     // Prompt processing and token generation never run at the same time, so the compute buffers
@@ -4813,6 +4923,10 @@ llm_graph_params llama_context::graph_params(
         /*.hadamard_inverses  =*/ &model.hadamard_inverses,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
+        /*.predefined_frame =*/ predefined_frame_current_valid ? predefined_frame_current : ggml_predefined_frame{},
+        /*.predefined_capacity_rows =*/ predefined_frame_current_valid ? predefined_capacity_rows_current : 0u,
+        /*.predefined_capacity_outputs =*/ predefined_frame_current_valid ? predefined_capacity_outputs_current : 0u,
+        /*.predefined_enabled =*/ predefined_frame_current_valid,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
         /*.flashprefill_reserve_sizing =*/ fp_reserve_sizing_active,

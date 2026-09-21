@@ -6,6 +6,7 @@
 #include "ggml-cpp.h"
 #include "ggml-tp5-profile.h"
 #include "ggml-device-copy.h"
+#include "ggml-predefined.h"
 
 typedef bool (*ggml_backend_comm_prepare_graph_t)(void *               comm_ctx,
                                                   size_t               rank,
@@ -2656,6 +2657,11 @@ struct ggml_backend_meta_context {
     size_t                      n_subgraphs   = 0;
     uint64_t                    uid           = 0;
     int                         debug         = 0;
+    uint32_t                    predefined_active_rows   = 0;
+    uint32_t                    predefined_capacity_rows = 0;
+    uint32_t                    predefined_capacity_outputs = 0;
+    ggml_predefined_frame       predefined_frame{};
+    bool                        predefined_frame_valid = false;
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
@@ -2790,6 +2796,74 @@ struct ggml_backend_meta_context {
         GGML_ASSERT(backend_configs.empty());
     }
 };
+
+bool ggml_backend_meta_set_predefined_rows(ggml_backend_t backend, uint32_t active_rows, uint32_t capacity_rows) {
+    if (!backend || !ggml_backend_dev_is_meta(ggml_backend_get_device(backend)) ||
+        active_rows == 0 || capacity_rows == 0 || active_rows > capacity_rows) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_meta_context *>(backend->context);
+    typedef bool (*set_rows_t)(ggml_backend_t, uint32_t, uint32_t);
+    std::vector<set_rows_t> setters(ctx->backend_configs.size(), nullptr);
+    for (size_t i = 0; i < ctx->backend_configs.size(); ++i) {
+        auto child = ctx->backend_configs[i].backend;
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(child));
+        if (!reg) return false;
+        setters[i] = reinterpret_cast<set_rows_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_predefined_rows"));
+        if (!setters[i]) return false;
+    }
+    for (size_t i = 0; i < ctx->backend_configs.size(); ++i) {
+        if (!setters[i](ctx->backend_configs[i].backend, active_rows, capacity_rows)) return false;
+    }
+    ctx->predefined_active_rows   = active_rows;
+    ctx->predefined_capacity_rows = capacity_rows;
+    ctx->predefined_capacity_outputs = capacity_rows;
+    ctx->predefined_frame = {};
+    ctx->predefined_frame.version = GGML_PREDEFINED_ABI_VERSION;
+    ctx->predefined_frame.phase = GGML_PREDEFINED_DRAFT;
+    ctx->predefined_frame.active_sequences = 1;
+    ctx->predefined_frame.active_tokens = active_rows;
+    ctx->predefined_frame.active_outputs = active_rows;
+    ctx->predefined_frame.context_tokens = active_rows;
+    ctx->predefined_frame.payload_elements = active_rows;
+    ctx->predefined_frame_valid = true;
+    return true;
+}
+
+bool ggml_backend_meta_set_predefined_frame(
+        ggml_backend_t backend, const ggml_predefined_frame * frame,
+        uint32_t capacity_rows, uint32_t capacity_outputs) {
+    if (!backend || !frame || !ggml_backend_dev_is_meta(ggml_backend_get_device(backend)) ||
+        frame->version != GGML_PREDEFINED_ABI_VERSION || frame->phase >= GGML_PREDEFINED_PHASE_COUNT ||
+        frame->active_sequences == 0 || frame->active_tokens == 0 || capacity_rows == 0 ||
+        capacity_outputs == 0 || frame->active_tokens > capacity_rows ||
+        frame->active_outputs > capacity_outputs) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_meta_context *>(backend->context);
+    typedef bool (*set_frame_t)(ggml_backend_t, const ggml_predefined_frame *, uint32_t, uint32_t);
+    std::vector<set_frame_t> setters(ctx->backend_configs.size(), nullptr);
+    for (size_t i = 0; i < ctx->backend_configs.size(); ++i) {
+        auto child = ctx->backend_configs[i].backend;
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(child));
+        if (!reg) return false;
+        setters[i] = reinterpret_cast<set_frame_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_predefined_frame"));
+        if (!setters[i]) return false;
+    }
+    // Preflight all child entry points before mutating any child state. The
+    // setter itself only copies host metadata and cannot fail after validation.
+    for (size_t i = 0; i < ctx->backend_configs.size(); ++i) {
+        if (!setters[i](ctx->backend_configs[i].backend, frame, capacity_rows, capacity_outputs)) return false;
+    }
+    ctx->predefined_active_rows   = frame->active_tokens;
+    ctx->predefined_capacity_rows = capacity_rows;
+    ctx->predefined_capacity_outputs = capacity_outputs;
+    ctx->predefined_frame         = *frame;
+    ctx->predefined_frame_valid   = true;
+    return true;
+}
 
 static const char * ggml_backend_meta_get_name(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_meta(backend));
@@ -3771,7 +3845,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     // FAST PATH: Single-submit epoch chain for TP5 decode (O(1) CPU submissions per token)
     typedef bool (*tp5_submit_epoch_chain_t)(void * comm_ctx,
                                             const std::vector<std::vector<std::vector<void *>>> & stage_compute_cbs,
-                                            const std::vector<std::vector<ggml_tensor *>> & stage_tensors);
+                                            const std::vector<std::vector<ggml_tensor *>> & stage_tensors,
+                                            const ggml_predefined_frame * frame,
+                                            uint32_t capacity_rows, uint32_t capacity_outputs);
     typedef bool (*tp5_get_cached_cmd_bufs_t)(ggml_backend_t backend, ggml_cgraph * cgraph, std::vector<void *> & out_cbs);
     static tp5_submit_epoch_chain_t pfn_submit_chain = nullptr;
     static tp5_get_cached_cmd_bufs_t pfn_get_cbs = nullptr;
@@ -3803,13 +3879,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             bool chain_ok = false;
             if (chain_timing_enabled) {
                 const auto t_chain_call_0 = std::chrono::high_resolution_clock::now();
-                chain_ok = pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors);
+                chain_ok = pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors,
+                                            backend_ctx->predefined_frame_valid ? &backend_ctx->predefined_frame : nullptr,
+                                            backend_ctx->predefined_capacity_rows,
+                                            backend_ctx->predefined_capacity_outputs);
                 const auto t_chain_call_1 = std::chrono::high_resolution_clock::now();
                 const double chain_call_ms = std::chrono::duration<double, std::milli>(t_chain_call_1 - t_chain_call_0).count();
                 fprintf(stderr, "\n[META_CHAIN_EXEC_TIME] pfn_submit_chain took %6.2f ms (ok=%d, n_stages=%zu, predefine=true)\n\n",
                         chain_call_ms, (int)chain_ok, backend_ctx->n_subgraphs);
             } else {
-                chain_ok = pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors);
+                chain_ok = pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors,
+                                            backend_ctx->predefined_frame_valid ? &backend_ctx->predefined_frame : nullptr,
+                                            backend_ctx->predefined_capacity_rows,
+                                            backend_ctx->predefined_capacity_outputs);
             }
             if (chain_ok) {
                 if (++chain_hit_log <= 5 || chain_hit_log % 100 == 0) {
@@ -3895,13 +3977,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             bool              chain_ok;
             if (chain_timing_enabled) {
                 const auto t_chain_call_0 = std::chrono::high_resolution_clock::now();
-                chain_ok = pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors);
+                chain_ok = pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors,
+                                            backend_ctx->predefined_frame_valid ? &backend_ctx->predefined_frame : nullptr,
+                                            backend_ctx->predefined_capacity_rows,
+                                            backend_ctx->predefined_capacity_outputs);
                 const auto t_chain_call_1 = std::chrono::high_resolution_clock::now();
                 const double chain_call_ms = std::chrono::duration<double, std::milli>(t_chain_call_1 - t_chain_call_0).count();
                 fprintf(stderr, "\n[META_CHAIN_EXEC_TIME] pfn_submit_chain took %6.2f ms (ok=%d, n_stages=%zu)\n\n",
                         chain_call_ms, (int)chain_ok, backend_ctx->n_subgraphs);
             } else {
-                chain_ok = pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors);
+                chain_ok = pfn_submit_chain(backend_ctx->comm_ctx, stage_compute_cbs, stage_tensors,
+                                            backend_ctx->predefined_frame_valid ? &backend_ctx->predefined_frame : nullptr,
+                                            backend_ctx->predefined_capacity_rows,
+                                            backend_ctx->predefined_capacity_outputs);
             }
             if (chain_ok) {
                 backend_ctx->predefined_valid = true;

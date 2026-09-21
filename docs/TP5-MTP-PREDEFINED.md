@@ -5,9 +5,10 @@
 本批是**资源层、执行参数 ABI、MTP 主机状态存储和定义所有权**的实现。
 只改源码；没有配置构建目录、编译、执行测试或启动 GPU / 模型。
 
-**尚不是完整的“单张最大 GPU 图”。** Vulkan 算子的有效行数下沉、最大形状图构建、
-多行 direct producer 尚未在这一批闭合。设备侧 hidden handoff 已在后续源码批次接入，
-详见第 8 节；尚未编译或运行。当前逻辑形状检查
+**尚不是完整的“单张最大 GPU 图”。** 最大形状图构建、其他算子的有效行数下沉
+仍未全部闭合。设备侧 hidden handoff 已在后续源码批次接入（第 8 节）；
+多行 Q5_K/terminal ADD direct producer 与有效载荷消费见第 9 节。
+这些新增路径尚未编译或运行。当前逻辑形状检查
 继续保留，不能仅把 `ne == n_tokens` 改成 `<=` 并宣称完成。
 
 为避免把资源冻结误当作完整后端支持，资源预分配入口通过
@@ -217,3 +218,75 @@ Vulkan 实现追加到既有 compute stream，一批范围共用前后依赖，�
 切片、错误映射、溢出用例；`test-alloc` 的 device-only 范围检查及禁止 CPU fallback。
 另含 RESULT 的旧代、零代、失败捕获拒绝检查。
 本批仍然**没有编译、shader 生成或执行测试**。
+
+## 9. 后续源码批次：多行 producer、有效载荷和固定列块
+
+本批接入真实 Vulkan 记录路径，不只是参数结构：
+
+- Q5_K projection 的 native float 与 MMVQ 两种算术路径，增加同一个固定 4-column
+  传输变体，不为 `2/3/4/…` token 分别创建一组传输 pipeline；
+- 多行 MoE 的最终 `routed + shared` ADD 原位完成 host payload 写出，无单独 P1；
+- 普通 RELAY P2 从 generation 一起发布的长度字段取得有效元素数，只复制有效前缀。
+
+传输仍由原来的 direct-host opt-in 控制，不强开、不拆单行融合区，也不因通信
+强制切换 native float/MMVQ。不能把“存在 batched shader”当作全模型均已命中：
+当前普通 Q5_K GEMV 选择器上限为 18 列；超过上限仍走原 GEMM/P1 路径。
+新的 ADD 只接受两个输入及输出都是连续、相同形状、对齐的 F32 张量，且不与
+ADD+RMS partial 融合抢占。未覆盖的类型、布局、算子仍保留原路径。
+
+### 9.1 固定容量与本轮长度
+
+route slot 仍为每 stage 256 字节，不增加 per-shape route table。有效结构扩展为
+64 字节，旧 `bank/ready/epoch/flags` 四字布局不变，新增：
+
+```text
+byte 16: active_elements
+byte 20: capacity_elements
+byte 32: dispatch_x, dispatch_y, dispatch_z
+```
+
+`active_elements` 来自实际 stage 长度；capacity 排除 host payload bank 尾部的
+64-byte status 区域。额外记录的 descriptor capacity 则约束这一算子本身的输入
+和输出范围，不能因为整个 bank 更大，就允许 shader 写过 tensor 边界。
+
+CPU reduce 仍按同一有效长度处理。CPU 下行在写 generation 前写
+`inbox[3] = active_elements`，不会占用 LateBind 的 `inbox[2]` 独立 Q generation。
+普通 P2 命中 generation 后检查 `0 < active_elements <= recorded_capacity`；
+非法长度进入原 sticky-error/NaN 失败路径，不写成功 completion。失败时全容量
+毒化只是 fail-closed，不会提交无效 token 的 KV/recurrent 结果。
+
+### 9.2 一次定义 dispatch，长度从稳定参数槽读取
+
+`ggml-vulkan-tp5-rows.h` 定义无 Vulkan 依赖的列块/容量/indirect-arguments 规则。
+Q5_K 使用 `ceil(active_rows / 4)` 个列块，ADD 使用
+`ceil(active_elements / 1024)` 个工作组；两者记录 `dispatchIndirect`，不把
+当前有效行数烘焙进 dispatch 命令。矩阵宽度、物理 stride、descriptor range
+和列块大小保持定义时的值。
+
+最后不足四列时，两个 Q5_K shader 都在 **任何 B 或 bias 读取之前**判断列是否
+有效，subgroup reduction 同样不处理无效列；不用补零 token，不启动空列工作组。
+ADD 的尾块也在读写前做有效范围判断。单行现有 GEMV/fused-region pipeline
+保持原来的选择方式，未改成最大批量跑一遍。
+
+host-coherent route/indirect 参数在所属提交之前一次写好。新 recorder 复用普通
+pipeline 的 descriptor/push-constant 记录，不使用原 GPU-generated indirect
+helper 的逐算子 updateBuffer 和 transfer barrier。真正由 GPU 生成的 indirect
+参数仍走原有依赖路径，本批没有删除它们的内存依赖。
+
+### 9.3 重放和生命周期
+
+每个已记录 producer 保存自身的 row-program recipe（容量、宽度、行块）。旧图
+重放时恢复该 recipe，再生成该 stage 的 arguments，不能沿用刚刚运行的另一张
+图的 tile/容量。定义切换并不增加一个 shape→graph map。
+
+新图第一次记录时，在记录 dispatch 前准备参数；记录结束发布的是 CPU 元数据，
+**不会**在它已经可能提交后再次写相同参数。frame/route 的复用仍受原有提交与
+producer-completion 规则约束，不允许在消费者仍读取时改 slot。
+
+该工作解决了传输算子自己的动态有效范围，**尚未使整个 ggml 图固定为最大形状**。
+前端仍按精确逻辑形状构建，Attention、GDN/recurrent、MoE packing 和其他计算
+算子的容量/有效范围还需要逐项接通。因此不能据此宣称 `1→4→2` 已零建图。
+
+已登记但未编译/执行 `test-tp5-row-program`：固定定义的长度反复变化、四列尾块、
+descriptor 容量拒绝、工作组上限、整数溢出、bank 末尾 status 隔离、ADD 尾块保护。
+这些是纯 CPU 规则用例，不代替两种 wire、两种 Q5_K 算术与真实 MTP 的数值验收。

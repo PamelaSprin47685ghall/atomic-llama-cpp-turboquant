@@ -18,12 +18,14 @@ layout(push_constant) uniform Params {
 
 shared uint ready;
 shared uint spin_used;
+shared uint active_elements;
 
 void main() {
     uint lane = gl_LocalInvocationID.x;
     if (lane == 0u) {
         ready = 0u;
         spin_used = 0u;
+        active_elements = 0u;
         uint expected = status[1];
         if (status[2] == 0u && expected != 0u) {
             for (uint spin = 0u; spin < p.spin_max; ++spin) {
@@ -37,7 +39,17 @@ void main() {
                     // for the lifetime of this activation. The CPU clears it
                     // before publishing the next generation, avoiding a
                     // needless GPU write into host-mapped VRAM.
-                    ready = 1u;
+                    // Length is part of the same payload publication. A
+                    // maximum-capacity definition does not copy padded rows.
+                    memoryBarrierBuffer();
+                    active_elements = inbox[3];
+                    if (active_elements == 0u || active_elements > p.n_elems) {
+                        status[2] = expected;
+                        status[4] = active_elements;
+                        ready = 2u;
+                    } else {
+                        ready = 1u;
+                    }
                     spin_used = spin;
                     break;
                 }
@@ -57,7 +69,7 @@ void main() {
         }
     }
     barrier();
-    if (ready == 0u) {
+    if (ready != 1u) {
         // A timed-out P2 must not leave a plausible previous activation for
         // later graph work. Status records the failure; NaNs make the GPU
         // data path fail closed without a host synchronization round-trip.
@@ -68,7 +80,7 @@ void main() {
         return;
     }
     memoryBarrierBuffer();
-    for (uint e = lane; e < p.n_elems; e += 64u) {
+    for (uint e = lane; e < active_elements; e += 64u) {
         dst[p.dst_offset_words + e] = uintBitsToFloat(inbox[16u + e]);
     }
     memoryBarrierBuffer();

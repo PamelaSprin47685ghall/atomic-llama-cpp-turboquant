@@ -1,12 +1,19 @@
 #version 450
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#ifdef TP5_RESUME_LO_Q8
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 
 // Two independent data dependencies. The CPU publishes y_epoch (word 0)
 // immediately after y fanout, and q_epoch (word 2) after sidecar fanout.
 // No successful completion is published by the norm pass. Only LO, the last
 // reader of both inbox regions, may retire this mailbox generation.
 #ifdef TP5_RESUME_NORM
-layout(local_size_x = 512) in;
+layout(local_size_x = 256) in;
 layout(std430, binding = 0) coherent volatile readonly buffer Inbox { uint inbox[]; };
 layout(std430, binding = 1) readonly buffer Residual { float residual[]; };
 layout(std430, binding = 2) readonly buffer Gamma { float gamma[]; };
@@ -26,15 +33,27 @@ layout(push_constant) uniform Params {
 } p;
 const uint GENERATION_WORD = 0u;
 const uint SPIN_WORD = 5u;
-shared float partials[512];
+shared float partials[32];
 #endif
 
-#ifdef TP5_RESUME_LO
-layout(local_size_x = 64) in;
+#if defined(TP5_RESUME_LO) || defined(TP5_RESUME_LO_Q8)
+#ifdef TP5_RESUME_LO_Q8
+layout(local_size_x = 320) in;
+#else
+layout(local_size_x = 256) in;
+#endif
 layout(std430, binding = 0) coherent volatile readonly buffer Inbox { uint inbox[]; };
 layout(std430, binding = 1) readonly buffer Rho { float inverse_rho[]; };
 layout(std430, binding = 2) writeonly buffer Lo { float lo[]; };
 layout(std430, binding = 3) coherent volatile buffer Status { uint status[]; };
+#ifdef TP5_RESUME_LO_Q8
+struct late_lo_q8_0 {
+    float16_t d;
+    int16_t   qs[16];
+};
+layout(std430, binding = 4) writeonly buffer LoQ8 { late_lo_q8_0 lo_q8[]; };
+shared int lo_q_tmp[320];
+#endif
 layout(push_constant) uniform Params {
     uint rank_dim;
     uint streams;
@@ -42,6 +61,7 @@ layout(push_constant) uniform Params {
     uint spin_max;
     uint status_word_offset;
     uint profile_spin;
+    uint sidecar_f16;
 } p;
 const uint GENERATION_WORD = 2u;
 const uint SPIN_WORD = 7u;
@@ -87,18 +107,16 @@ void finalize_stream(const uint iterations) {
     const uint stream = gl_WorkGroupID.x;
     const uint base = stream * p.width;
     const float s = scatter[stream];
-    float values[8];
-    float weights[8];
+    float values[16];
     // Independent preparation happens before the point-of-use wait. Keep
     // this bounded: do not preload the full W_down matrix into registers.
-    [[unroll]] for (uint i = 0u; i < iterations; ++i) {
-        const uint col = lane + i * 512u;
-        values[i] = col < p.width ? residual[base + col] : 0.0;
-        weights[i] = col < p.width ? gamma[base + col] : 0.0;
+    [[unroll]] for (uint i = 0u; i < 16u; ++i) {
+        const uint col = lane + i * 256u;
+        values[i] = i < iterations && col < p.width ? residual[base + col] : 0.0;
     }
     if (!await_input()) {
         const float nanv = uintBitsToFloat(0x7fc00000u);
-        for (uint col = lane; col < p.width; col += 512u) {
+        for (uint col = lane; col < p.width; col += 256u) {
             combined[base + col] = nanv;
             normalized[base + col] = nanv;
             if (stream == 0u) sum_output[col] = nanv;
@@ -107,9 +125,9 @@ void finalize_stream(const uint iterations) {
         return;
     }
     float ss = 0.0;
-    [[unroll]] for (uint i = 0u; i < iterations; ++i) {
-        const uint col = lane + i * 512u;
-        if (col < p.width) {
+    [[unroll]] for (uint i = 0u; i < 16u; ++i) {
+        const uint col = lane + i * 256u;
+        if (i < iterations && col < p.width) {
             const float y = uintBitsToFloat(inbox[16u + col]);
             precise float product = y * s;
             precise float value = values[i] + product;
@@ -121,22 +139,27 @@ void finalize_stream(const uint iterations) {
         }
         ss += values[i] * values[i];
     }
-    partials[lane] = ss;
-    barrier();
-    [[unroll]] for (uint stride = 256u; stride > 0u; stride >>= 1u) {
-        if (lane < stride) {
-            ss += partials[lane + stride];
-            partials[lane] = ss;
-        }
-        barrier();
+    ss = subgroupAdd(ss);
+    if (gl_SubgroupInvocationID == 0u) {
+        partials[gl_SubgroupID] = ss;
     }
+    barrier();
+    if (gl_SubgroupID == 0u) {
+        float fold = gl_SubgroupInvocationID < gl_NumSubgroups ?
+            partials[gl_SubgroupInvocationID] : 0.0;
+        fold = subgroupAdd(fold);
+        if (gl_SubgroupInvocationID == 0u) {
+            partials[0] = fold;
+        }
+    }
+    barrier();
     const float scale = inversesqrt(partials[0] / float(p.width) + p.epsilon);
     if (lane == 0u) inverse_rho[stream] = scale;
-    [[unroll]] for (uint i = 0u; i < iterations; ++i) {
-        const uint col = lane + i * 512u;
-        if (col < p.width) {
+    [[unroll]] for (uint i = 0u; i < 16u; ++i) {
+        const uint col = lane + i * 256u;
+        if (i < iterations && col < p.width) {
             float norm = scale * values[i];
-            normalized[base + col] = norm * weights[i];
+            normalized[base + col] = norm * gamma[base + col];
         }
     }
 }
@@ -146,37 +169,82 @@ void main() {
             atomicCompSwap(status[p.status_word_offset + 2u], 0u, 0xffffffffu);
         return; // also rejected by the host recipe before recording
     }
-    const uint blocks = (p.width + 511u) / 512u;
-    if (blocks > 4u) finalize_stream(8u);
-    else if (blocks == 4u) finalize_stream(4u);
-    else if (blocks == 3u) finalize_stream(3u);
-    else if (blocks == 2u) finalize_stream(2u);
-    else finalize_stream(1u);
+    const uint blocks = min(16u, (p.width + 255u) / 256u);
+    finalize_stream(blocks);
 }
 #endif
 
-#ifdef TP5_RESUME_LO
+#if defined(TP5_RESUME_LO) || defined(TP5_RESUME_LO_Q8)
+float load_q(const uint index) {
+    if (p.sidecar_f16 == 0u) {
+        return uintBitsToFloat(inbox[p.late_word_offset + index]);
+    }
+    const uint packed = inbox[p.late_word_offset + (index >> 1u)];
+    const vec2 pair = unpackHalf2x16(packed);
+    return (index & 1u) == 0u ? pair.x : pair.y;
+}
+
 void main() {
     const uint lane = gl_LocalInvocationID.x;
-    if (p.streams != 4u || p.rank_dim == 0u || p.rank_dim > 512u) {
+    if (p.streams != 4u || p.rank_dim == 0u || p.rank_dim > 512u
+#ifdef TP5_RESUME_LO_Q8
+        || p.rank_dim != 320u || gl_NumSubgroups != 10u
+#endif
+    ) {
         if (lane == 0u) atomicCompSwap(status[p.status_word_offset + 2u], 0u, 0xffffffffu);
         return;
     }
     const vec4 scale = vec4(inverse_rho[0], inverse_rho[1], inverse_rho[2], inverse_rho[3]);
     if (!await_input()) {
-        for (uint row = lane; row < p.rank_dim; row += 64u)
+        for (uint row = lane; row < p.rank_dim; row += 256u)
             lo[row] = uintBitsToFloat(0x7fc00000u);
+#ifdef TP5_RESUME_LO_Q8
+        if (lane < 10u) {
+            lo_q8[lane].d = float16_t(uintBitsToFloat(0x7fc00000u));
+            [[unroll]] for (uint k = 0u; k < 16u; ++k)
+                lo_q8[lane].qs[k] = int16_t(0);
+        }
+#endif
         return;
     }
-    for (uint row = lane; row < p.rank_dim; row += 64u) {
-        precise float acc = uintBitsToFloat(inbox[p.late_word_offset + row]) * scale[0];
-        [[unroll]] for (uint b = 1u; b < 4u; ++b) {
-            precise float term = uintBitsToFloat(inbox[p.late_word_offset + b * p.rank_dim + row]) * scale[b];
-            acc = acc + term;
-        }
-        precise float scaled = acc * 0.25 + 0.0;
+#ifdef TP5_RESUME_LO_Q8
+    const uint row = lane;
+    const vec4 q = vec4(
+        load_q(row),
+        load_q(p.rank_dim + row),
+        load_q(2u * p.rank_dim + row),
+        load_q(3u * p.rank_dim + row));
+    const float scaled = dot(q, scale) * 0.25;
+    const float value = scaled / (1.0 + exp(-scaled));
+    lo[row] = value;
+
+    const float amax = subgroupMax(abs(value));
+    const float d = amax * (1.0 / 127.0);
+    const float inv_d = d != 0.0 ? 1.0 / d : 0.0;
+    const int qv = clamp(int(round(value * inv_d)), -127, 127);
+    lo_q_tmp[row] = qv;
+    barrier();
+
+    const uint sub = gl_SubgroupID;
+    const uint sublane = gl_SubgroupInvocationID;
+    if (sublane == 0u) lo_q8[sub].d = float16_t(d);
+    if (sublane < 16u) {
+        const uint base = sub * 32u + 2u * sublane;
+        const uint q0 = uint(lo_q_tmp[base]) & 0xffu;
+        const uint q1 = uint(lo_q_tmp[base + 1u]) & 0xffu;
+        lo_q8[sub].qs[sublane] = int16_t(q0 | (q1 << 8u));
+    }
+#else
+    for (uint row = lane; row < p.rank_dim; row += 256u) {
+        const vec4 q = vec4(
+            load_q(row),
+            load_q(p.rank_dim + row),
+            load_q(2u * p.rank_dim + row),
+            load_q(3u * p.rank_dim + row));
+        const float scaled = dot(q, scale) * 0.25;
         lo[row] = scaled / (1.0 + exp(-scaled));
     }
+#endif
     memoryBarrierBuffer();
     barrier();
     if (lane == 0u && status[p.status_word_offset + 2u] == 0u) {

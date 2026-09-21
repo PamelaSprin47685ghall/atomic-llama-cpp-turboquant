@@ -30,6 +30,9 @@ vec2 cache_b_ds;
 
 void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx) {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+#ifdef TP5_RELAY_ROWS
+        if (!mat_vec_col_active(j)) continue;
+#endif
         // Preload data_b block
         const uint b_block_idx = (j*p.batch_stride_b + col) / QUANT_K_Q8_1 + b_offset;
         const uint b_block_idx_outer = b_block_idx / 4;

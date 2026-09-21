@@ -28,6 +28,7 @@ extern "C" {
     typedef void * ggml_backend_graph_plan_t;
     typedef struct ggml_backend_reg * ggml_backend_reg_t;
     typedef struct ggml_backend_device * ggml_backend_dev_t;
+    struct ggml_predefined_frame;
 
 
     //
@@ -547,6 +548,23 @@ extern "C" {
     GGML_API void ggml_backend_meta_set_local_node_hook(ggml_backend_dev_t meta_dev,
                                                         ggml_backend_meta_local_node_hook_t hook);
     GGML_API struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct ggml_tensor * tensor, size_t index);
+
+    // Predefined-row execution contract for TP-style meta backends. The graph
+    // owns capacity-shaped tensors; active_rows is useful work for this
+    // invocation. This only supplies host-side execution metadata. Backends
+    // must still lower every stateful/operator dispatch before capacity_rows >
+    // active_rows can execute safely. Values are consumed synchronously while
+    // building/submitting the graph and never replace native retirement.
+    GGML_API bool ggml_backend_meta_set_predefined_rows(
+        ggml_backend_t backend, uint32_t active_rows, uint32_t capacity_rows);
+    // Full execution-frame variant used by the single maximum-capacity TP5
+    // definition. capacity_rows is immutable for the definition; all useful
+    // work (phase, tokens, outputs, context, draft/catch-up state) comes from
+    // frame. The frame is copied synchronously into the meta/backend owner;
+    // the caller may reuse its storage immediately after this call.
+    GGML_API bool ggml_backend_meta_set_predefined_frame(
+        ggml_backend_t backend, const struct ggml_predefined_frame * frame,
+        uint32_t capacity_rows, uint32_t capacity_outputs);
 
     //
     // Utils

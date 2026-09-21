@@ -23,6 +23,7 @@ struct llama_predefined_hidden_store;
 struct llama_predefined_hidden_range;
 struct llama_device_hidden_input;
 struct ggml_predefined_capacity;
+struct ggml_predefined_frame;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -691,6 +692,13 @@ private:
     std::unique_ptr<llama_predefined_hidden_store> predefined_hidden;
     // Shared by the target and MTP contexts. Owns capacity, not per-shape graphs.
     std::shared_ptr<llama_predefined_session> predefined_session;
+    // Monotonic host ticket for the execution-frame ABI. It is metadata only;
+    // native GPU retirement remains owned by the backend/communicator.
+    uint64_t predefined_frame_epoch = 0;
+    ggml_predefined_frame predefined_frame_current{};
+    uint32_t predefined_capacity_rows_current = 0;
+    uint32_t predefined_capacity_outputs_current = 0;
+    bool predefined_frame_current_valid = false;
     ggml_backend_sched_ptr sched;
 
     // training

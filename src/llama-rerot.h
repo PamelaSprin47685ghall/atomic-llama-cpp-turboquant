@@ -345,6 +345,185 @@ llama_rerot_query_layout llama_rerot_build_query_layout(
     const llama_rerot_reader_state & reader,
     llama_pos query_storage_pos,
     const llama_rerot_kv_snapshot & snapshot);
+// Batched counterpart for query rows sharing ONE reader state (2026-09-22
+// compute-organization round: structure/numeric separation in the decode hot
+// path). The structural pass — visibility classification (FULL vs
+// causally-gated), per-arm ordering, per-key prefix counts, own-row lookup
+// table — runs ONCE per call, and every query row then performs only numeric
+// work: causal cuts by binary search over precomputed storage arrays,
+// virtual arithmetic from prefix counts, effective-position grouping by one
+// stable sort of the visible entries. Output[i] is EXACTLY
+// llama_rerot_build_query_layout(reader, query_storage_pos[i], keys) — same
+// groups, same entries, same order, same query_virtual_pos — so the per-query
+// builder remains the oracle (tests compare the two directly). Ownership in
+// `keys` must already reflect ONE sequence (rows sharing a reader-view slot
+// share their execution sequence); the caller fills it per group.
+// Throws the same exceptions as the per-query builder, in the same order
+// (reader validity, every position, run view, then per-key checks).
+std::vector<llama_rerot_query_layout> llama_rerot_build_query_layouts_shared(
+    const llama_rerot_reader_state & reader,
+    const std::vector<llama_pos> & query_storage_pos,
+    const std::vector<llama_rerot_key_record> & keys);
+
+// Multi-reader counterpart (2026-09-22 fifth round, Q3 host-side deepening).
+// R pens of one frontier share ONE key world: the structural pass — episode
+// filter, run classification, per-run ascending storage arrays, deviation
+// (s - i) ordering — is computed ONCE over `keys` and served to every
+// reader; each reader then pays only its ownership-dependent work (own-run
+// gate, base-arm membership) plus its per-query numeric pass.
+// `keys` must be ONE shared table whose owned_by_reader column is IGNORED
+// (ownership is per (reader, run) and derived from meta.run_id ==
+// reader.query_run inside); readers must share one episode. Output[r][i] is
+// EXACTLY llama_rerot_build_query_layout(readers[r], query_pos[r][i],
+// keys-with-r's-ownership-column) — same groups, entries, order and
+// query_virtual_pos as the per-group shared builder. Throws the same
+// exceptions as the per-query builder (reader validity, positions, run
+// view, duplicate keys, negative storage).
+std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layouts_multi_reader(
+    const std::vector<llama_rerot_reader_state> & readers,
+    const std::vector<std::vector<llama_pos>> & query_storage_pos,
+    const std::vector<llama_rerot_key_record> & keys,
+    const std::vector<std::vector<uint8_t>> & base_owned);
+
+// Packed ownership columns (2026-09-22 tenth round, Q3 host-side tail).
+// The cache level already builds per-reader ownership as bitsets over the
+// shared key table; the byte-vector overload above forced an R x K expansion
+// that the builder then re-read row by row. A bitset view carries no
+// llama-kv-cells dependency — it is a plain pointer + width — so the pure
+// builder stays type-independent while consuming packed bits directly.
+struct llama_rerot_owned_view {
+    // bits[i] bit (i & 63): reader owns shared-table row i. Null words read
+    // as zero (unowned).
+    const uint64_t * bits = nullptr;
+    size_t n_words = 0;
+};
+
+// Bitset-consuming core. Identical output to the byte-vector overload
+// (same groups, entries, order, query_virtual_pos; same exceptions).
+std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layouts_multi_reader_bits(
+    const std::vector<llama_rerot_reader_state> & readers,
+    const std::vector<std::vector<llama_pos>> & query_storage_pos,
+    const std::vector<llama_rerot_key_record> & keys,
+    const std::vector<llama_rerot_owned_view> & base_owned_bits);
+
+// Persistent shared world (2026-09-22 eleventh round, fourth question:
+// "compile the DAG into a structural program; most frontiers only update
+// numbers"). The structural pass of the multi-reader builder — run
+// bucketing by (episode, run, node), per-run tagged ordering, deviation
+// tables, uniformity probes, fast-key columns, untagged ordering — is a
+// function of the KEY TABLE only. On the production shape the table is
+// append-only between structural events (a new token appends its cell's
+// record; publish reclassifies meta in place without changing order), so
+// the structural pass can be computed once per structural event and
+// REUSED by every subsequent frontier, leaving each frontier only the
+// per-reader ownership filtering and the per-query numeric pass.
+//
+// Contract:
+//   - build_world(keys) validates exactly like the builder's structural
+//     pass (duplicate physical keys, negative storage) and computes the
+//     full run/untagged structure;
+//   - append_keys(keys) adds records whose key indices are NEW (not
+//     already present) and whose arrival preserves each run's tagged
+//     order (the production append shape); throws otherwise;
+//   - the world keeps its OWN copy of the key records, so later cell
+//     mutations (publish/reclassify) do NOT leak in — the owner must
+//     call set_key_meta after any in-place meta change, which updates
+//     the copy and the uniformity probes in O(run size);
+//   - build_query_layouts_multi_reader_world(...) consumes the world
+//     and produces EXACTLY the same output as ..._multi_reader_bits on
+//     the equivalent key table.
+class llama_rerot_shared_world {
+public:
+    struct run {
+        uint64_t episode_id = 0;
+        llama_rerot_run_id run_id = LLAMA_REROT_RUN_INVALID;
+        llama_rerot_node_id owner_node = LLAMA_REROT_NODE_INVALID;
+        std::vector<uint32_t> rows;      // key indices, tagged order
+        std::vector<llama_pos> storage;  // ascending (== tagged order)
+        std::vector<uint32_t> d2t;       // d-position -> tagged index
+        std::vector<uint32_t> t2d;       // tagged index -> d-position
+        std::vector<int64_t> dev;        // d = storage - tagged idx, at d-positions
+        bool contiguous = false;        // storage strictly +1 (dev constant)
+        bool uniform = false;           // (visibility, frontier) shared by all rows
+        llama_rerot_visibility u_vis = llama_rerot_visibility::normal;
+        uint64_t u_frontier = 0;
+        std::vector<uint32_t> fast_keys; // contiguous runs: key ids in d-order
+    };
+
+    llama_rerot_shared_world() = default;
+
+    // Full structural pass over `keys` (same validation and same structure
+    // as the builder's internal pass). Throws std::invalid_argument on
+    // duplicate physical keys or negative storage positions.
+    void build_world(const std::vector<llama_rerot_key_record> & keys);
+
+    // Structural core over a CALLER-OWNED table: fills runs()/untagged_sorted()
+    // (and the internal key map) without copying records. The one-shot bits
+    // builder uses this to pay no record-copy; the world must not outlive
+    // the caller's table and keys_ref() stays empty.
+    void build_world_structure(const std::vector<llama_rerot_key_record> & keys);
+
+    // Incremental append (production decode shape): every record must
+    // carry a key index not yet present, and within each run the arrival
+    // must preserve tagged order (storage, frontier then index ascending
+    // at the tail). O(delta + runs) when the fast path holds; falls back
+    // to a full rebuild when a run's tail order is violated.
+    void append_keys(const std::vector<llama_rerot_key_record> & keys);
+
+    // In-place meta update after publish/reclassify: refreshes the
+    // record copy and the run's uniformity probe (O(rows of the run)).
+    // `keys` must describe ONLY changed records (key index must exist).
+    void set_key_meta(const std::vector<llama_rerot_key_record> & keys);
+
+    size_t n_keys() const { return key_at.size(); }
+    bool empty() const { return key_at.empty(); }
+    // Access the record for key index k (k < n_keys()); the world's copy,
+    // reflecting every accepted update.
+    const llama_rerot_key_record & key(uint32_t k) const {
+        return records[size_t(key_index_to_pos(k))];
+    }
+
+    const std::vector<run> & runs() const { return runs_; }
+    // Untagged key indices in (storage, key_index) order — the base arm.
+    const std::vector<uint32_t> & untagged_sorted() const { return untagged_sorted_; }
+    // The world's record store, position-indexed (key(k) == keys_ref()[pos
+    // of k]); builders iterate this instead of a caller-owned table.
+    const std::vector<llama_rerot_key_record> & keys_ref() const { return records; }
+
+private:
+    // key index -> position in `records` (or UINT32_MAX when absent).
+    std::vector<uint32_t> key_at;
+    std::vector<llama_rerot_key_record> records;
+    // Structure-only builds borrow the caller's table; owned builds read
+    // `records` (borrowed_table == nullptr).
+    const std::vector<llama_rerot_key_record> * borrowed_table = nullptr;
+
+    // The table the structural helpers (rebuild_run_structure,
+    // recompute_uniform) must read rows from.
+    const std::vector<llama_rerot_key_record> & structure_table() const {
+        return borrowed_table ? *borrowed_table : records;
+    }
+    std::vector<run> runs_;
+    std::vector<uint32_t> untagged_sorted_;
+
+    uint32_t key_index_to_pos(uint32_t k) const { return key_at[k]; }
+
+    void rebuild_run_structure(run & r);
+    void recompute_uniform(run & r);
+    void insert_untagged(uint32_t pos);
+};
+
+// World-consuming core: identical output to
+// llama_rerot_build_query_layouts_multi_reader_bits given the world built
+// from the same key table (same groups, entries, order,
+// query_virtual_pos; same exceptions). The structural pass is skipped —
+// the reader-side ownership filtering and per-query numeric pass run
+// directly over the world's run/untagged structure.
+std::vector<std::vector<llama_rerot_query_layout>> llama_rerot_build_query_layouts_multi_reader_world(
+    const std::vector<llama_rerot_reader_state> & readers,
+    const std::vector<std::vector<llama_pos>> & query_storage_pos,
+    const llama_rerot_shared_world & world,
+    const std::vector<llama_rerot_owned_view> & base_owned_bits);
 
 // Pure logical document/tree model. It never stores physical KV indices.
 class llama_rerot_document {
