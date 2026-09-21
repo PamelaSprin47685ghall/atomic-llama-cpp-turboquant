@@ -157,6 +157,8 @@ void main() {
     const uint total_channels = (2u * key_heads + value_heads) * 128u;
     const uint channel = group_id * 128u + tid;
     const uint weight_base = 4u * channel;
+    const uint in_time_stride = capacity_steps + 3u;
+    const uint in_base = channel * in_time_stride;
 
     // Load initial 3-tap convolution history once
     vec4 conv_weights = vec4(data_conv_weight[weight_base + 0u],
@@ -178,9 +180,9 @@ void main() {
     }
 #else
     if (tid < 128u) {
-        h0 = data_concat[weight_base + 0u];
-        h1 = data_concat[weight_base + 1u];
-        h2 = data_concat[weight_base + 2u];
+        h0 = data_concat[in_base + 0u];
+        h1 = data_concat[in_base + 1u];
+        h2 = data_concat[in_base + 2u];
     }
 #endif
 
@@ -195,7 +197,7 @@ void main() {
 #if defined(GDN_CACHED_INPUT)
             const float raw_val = data_raw_qkv[t * total_channels + channel];
 #else
-            const float raw_val = data_concat[t * total_channels + channel + 3u];
+            const float raw_val = data_concat[in_base + t + 3u];
 #endif
             const float conv_val = dot(vec4(h0, h1, h2, raw_val), conv_weights);
             silu_val = op_silu(conv_val);
