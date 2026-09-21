@@ -1704,6 +1704,8 @@ struct llm_graph_context {
     const llama_hadamard_rotations * hadamard_rotations = nullptr;
     const llama_hadamard_rotations * hadamard_inverses  = nullptr;
 
+    mutable std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hadamard_memo;
+
     // FlashPrefill reserve sizing (GraphIntegration): mirrors
     // llm_graph_params.flashprefill_reserve_sizing for input construction.
     const bool fp_reserve_sizing;

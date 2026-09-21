@@ -2677,6 +2677,11 @@ ggml_tensor * llm_graph_context::build_lora_mm(
     ggml_tensor * cur_mm = cur;
     if (hadamard_rotations && hadamard_rotations->count(w)) {
         const auto & t = hadamard_rotations->at(w);
+        const auto memo_key = std::make_pair((const ggml_tensor *) cur, (const ggml_tensor *) t.rot);
+        const auto memo_it  = hadamard_memo.find(memo_key);
+        if (memo_it != hadamard_memo.end()) {
+            cur_mm = memo_it->second;
+        } else {
         if (t.perm_rep > 1) {
             // tiled [hd, nk, rep] -> grouped [hd, rep, nk] feature order
             ggml_tensor * x = ggml_is_contiguous(cur_mm) ? cur_mm : ggml_cont(ctx0, cur_mm);
@@ -2689,6 +2694,8 @@ ggml_tensor * llm_graph_context::build_lora_mm(
             cur_mm = ggml_mul(ctx0, cur_mm, t.signs);
         }
         cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
+        hadamard_memo[memo_key] = cur_mm;
+        }
     }
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
 
@@ -2730,6 +2737,11 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     ggml_tensor * cur_mm = cur;
     if (hadamard_rotations && hadamard_rotations->count(w)) {
         const auto & t = hadamard_rotations->at(w);
+        const auto memo_key = std::make_pair((const ggml_tensor *) cur, (const ggml_tensor *) t.rot);
+        const auto memo_it  = hadamard_memo.find(memo_key);
+        if (memo_it != hadamard_memo.end()) {
+            cur_mm = memo_it->second;
+        } else {
         if (t.perm_rep > 1) {
             // tiled [hd, nk, rep] -> grouped [hd, rep, nk] feature order
             ggml_tensor * x = ggml_is_contiguous(cur_mm) ? cur_mm : ggml_cont(ctx0, cur_mm);
@@ -2742,6 +2754,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
             cur_mm = ggml_mul(ctx0, cur_mm, t.signs);
         }
         cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
+        hadamard_memo[memo_key] = cur_mm;
+        }
     }
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur_mm, ids);
 

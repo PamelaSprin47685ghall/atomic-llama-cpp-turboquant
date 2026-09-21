@@ -246,6 +246,12 @@ struct block_pq2_0
     uint8_t qs[QUANT_K_PQ2_0 / 4];
 };
 
+struct block_pq2_0_packed16
+{
+    float16_t d;
+    uint16_t qs[QUANT_K_PQ2_0 / 8];
+};
+
 #if defined(DATA_A_PQ2_0)
 #define QUANT_K QUANT_K_PQ2_0
 #define QUANT_R QUANT_R_PQ2_0
