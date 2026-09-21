@@ -2379,7 +2379,7 @@ c3648d789  DAG logical/view/fixed-entry implementation
 
 ## 21. 计算组织研究线（2026-09-21 轮）
 
-本节记录“重画计算组织而非先调 kernel”研究线的当前落地状态。十个研究问题（共享单位、段级 reader view、公共 KV 块服务多读者、DAG 结构/数值分离、GDN 共同基底+低秩增量、已知序列块递推、PQ2 位平面、充分统计量、联合采样、K×H 网格）中，本轮把四条等义数学落成了代码，并重构了 indexed 布局的 host 侧扫描。
+本节记录“重画计算组织而非先调 kernel”研究线的当前落地状态。十个研究问题（共享单位、段级 reader view、公共 KV 块服务多读者、DAG 结构/数值分离、GDN 共同基底+低秩增量、已知序列块递推、PQ2 位平面、充分统计量、联合采样、K×H 网格）中，第一轮（`29cd8f51a`）把四条等义数学落成代码并重构 indexed 布局扫描；第二轮（当前 HEAD）把剩余五个问题（Q2/Q4/Q8/Q9/Q10）的数学与契约层落成代码，并补上 Q5/Q6 的 F32 数值门实测。
 
 ### 21.1 已落地（当前 HEAD，全部 CPU 验证）
 
@@ -2390,18 +2390,29 @@ c3648d789  DAG logical/view/fixed-entry implementation
 3. **[Q6] 已知 token 块递推（WY 折叠）**：`llama_rerot_gdn_chunk_fold` 把 T 步已知（teacher-forced）token 折成 `(M, Y)` 紧凑仿射转移：`M = I − K·W·K^T`，`W = (I+L)^{-1}·diag(β)`，`L[j,c] = β_j(k_j·k_c)` (j>c，**行索引 β**)，`Y` 为零状态臂。生产 kernel 应按秩算子 `x → G·(x − K(W(K^T x)))` 应用，并把同一折叠块应用到多 lane 状态。
 4. **[Q7] PQ2_0 位平面恒等式**：`{0,1,2,3}→{−1,0,+1,+2}` 使块内积变成 `Σ_{b0=1}x + 2Σ_{b1=1}x − Σx`（`llama_rerot_pq2_bitplane_dot`）或每 4 权重一次 16 表 LUT（`llama_rerot_pq2_lut_dot`）。与 ggml 整数路径位级一致（整数 activation 时）。
 
+第二轮新增（同一文件，纯 FP64/位级，无 KV/server/graph 依赖）：
+
+5. **[Q2] span 级 reader view**：`llama_rerot_span_view`（begin/len/phase）——段内 `s_j − v_j = phase` 常数，故 `q_v + s_j − v_j = q_v + phase` 对段内所有 j 成立（`llama_rerot_span_effective_pos`），整段共享一枚 effective Q；因果截断是一次比较（`llama_rerot_span_causal_len`），不是逐 key 掩码。视图描述复杂度由 span 数而非 token 数决定（`llama_rerot_span_long_fraction` 度量碎片化）。限制：空洞/异相位/异可见性必须拆段，最坏片段数仍接近 token 数。
+6. **[Q4] 结构/数值分离**：run ORDER 是结构（`llama_rerot_run_order`，签名 `llama_rerot_run_order_signature` 仅随结构事件变化），长度/水位/virtual starts 是数值（`llama_rerot_virtual_starts` 前缀和；`..._after_growth` 增量更新只平移后续 run，零结构工作）。“拓扑没变”≠“位置没变”：前缀 run 增长会移动后续 virtual 起点——但这恰是数值更新，不是重建世界。
+7. **[Q8] 跳块误差界（近似路线，明确门控）**：`llama_rerot_skip_mass_bound`（`q·k_j ≤ q·c + |q|·r`，Cauchy–Schwarz）给出被跳块质量上界 `Z_skip ≤ n·exp(scale·(q·c+|q|·r))`；`llama_rerot_skip_output_bound` 给出 `‖o − o_keep‖ ≤ 2·V_max·δ`，`δ = Z̄_skip/(Z_keep+Z̄_skip)`。同时以可执行反例固化“无有限充分统计量”结论：keys `{-1,+1}` vs `{0,0}` 数量与一阶矩相同但 `Z(q)` 不同（`2cosh(q) ≠ 2`）——同一 query 的块结果可精确合并（Q3），不同 query 的块结果不能因读同一历史而互用。
+8. **[Q9] 联合采样契约**：per-pen RNG 流（`llama_rerot_joint_sample_seed`，(base, pen) 派生 SplitMix64）使各笔 draw 与 cohort 大小、行序无关（轨迹安全：批量化不得改变各笔 RNG 消耗次序）；`llama_rerot_joint_sample_row` 按 temperature → top-k → top-p、最低索引 tie-break；贪心路径 `llama_rerot_joint_argmax_rows` 按块归约 argmax，不回传全行 logits。输出单位是“各笔下一步决策+状态与事件”，不只是 token 数组。
+9. **[Q10] frontier 网格联合验证**：`llama_rerot_verify_grid` 按列推进、STRONG barrier-after——cell (pen, h) 存活当且仅当自身前缀存活且所有 read source 的 h−1 列 cell 存活（自读平凡满足）；被拒笔发布 replacement，依赖者在 h+1 消费 replacement 而非草稿。`llama_rerot_verify_grid_naive` 是可执行反例：逐行独立验证在跨笔读下接受率虚高（测试中 C 全部自身草稿正确，但读 B 的被拒列，正确引擎 accepted=2、naive=3）。
+
 **indexed 布局 host 侧重构 `llama_kv_cache::rerot_build_attn_layout`**：旧路径每 query 行重建整份 n_kv key 表并重新排序（O(Q·n_kv) 扫描+排序，每行 ~40B·n_kv 临时内存）。新路径按 distinct reader state 分组（同一 pen 的 decode 行、MTP verify 行共享同一可见性世界），每组一次扫描+一次排序，per query 只做因果截断与相位分组。输出与逐 query 调 `llama_rerot_build_query_layout` 构造性一致。
 
 ### 21.2 验证证据
 
 - `test-rerot-math`：0 failure。Q3 对拍独立全 softmax oracle（含不可见读者、合并顺序无关性）；Q5 对拍稠密 §2.3 逐步递推（12 步，α<1，异构 β，秩每步恰 +1，dense/output 双等价，多 lane 共享投影位级一致）；Q6 24 个随机 chunk（T=1..8，含 β=0 纯衰减，此时 M=G·I、Y=0 精确成立）对拍逐步 oracle ≤1e-10；Q7 全部四种编码存在下对拍 (code−1) 解码 oracle，整数 activation 时位级相等。
+  第二轮新增：Q2 span 有效位置对逐 key §2.4 定义、因果截断对逐 key 掩码、碎片化度量三态（全短/全长/混合）；Q4 前缀和对定义、增长更新=全量重算、签名对数值变化不变/对顺序变化必变；Q8 界的可靠性（精确偏差 ≤ 界、δ ≥ 真实跳过质量比）＋ `{-1,+1}` vs `{0,0}` 反例；Q9 行序无关、cohort 大小无关、确定性、最低索引 tie-break；Q10 依赖追踪 vs naive 的分岐断言（accepted=2 vs 3）。
+- **F32 数值门实测**（第二轮补上）：Q5 因子化路径 24 步 F32 vs FP64 稠密 oracle——**相对误差 ~1.9e-7（有界区间）/ ~5.1e-7（弱衰减区间）**，绝对误差由状态指数增长主导（有界区间 max|S|≈2e4 时 3.8e-3）；Q6 WY 折叠 T=8 F32 vs FP64 逐步——**绝对误差 2.5e-5**。这是重结合误差的诚实量级：两族在 F32 下都不逐位一致，GPU 化前必须按此量级设验收门，不得宣称位级等价。
 - RERoT/xkv/flashprefill 全家 45/45 ctest 通过（含 `test_ddvr_two_query_groups` 的多 reader、多 query 行、跨 reader 可见性、精确组计数断言）。
 - 开发机预存失败（与本轮无关，基线复现）：test-tokenizers-ggml-vocabs、test-quantize-fns、test-llama-archs、test-backend-ops timeout；test-vulkan-tp5-mesh/command-replay 需 ≥2 Vulkan 设备（开发机仅 1 块 780M iGPU）。
 
-### 21.3 边界与下一步
+### 21.3 边界与下一步（第二轮修订）
 
-- 数学参考层是 kernel 契约与 oracle，**未进入生产 decode 路径**；任何 GPU 化必须先过 F32 数值门（Q5 的代数重排在 F32 下不保证逐位一致；Q6 的 WY 重结合同理）。
+- 数学参考层是 kernel 契约与 oracle，**未进入生产 decode 路径**；F32 门实测已给出量级（Q5 相对 ~5e-7，Q6 绝对 ~2.5e-5），GPU 化验收门按此量级设，不得宣称位级等价。
 - Q5 的 r 从离开共同基底起算，固定入口 F_i token 也计入；r 超过阈值（约 d_k·d_v / (2(d_k+d_v))）时应转稠密，不能丢弃小增量或强造基底。
 - Q6 只适用于已知 token（固定入口重放、MTP 验证块）；attention 仍按每行视图执行，不得因 GDN 块化放松因果。
 - Q7 的 LUT 路径在 GPU 上“减乘法≠减耗时”，需实测；块 scale 与 Hadamard 域不得交换。
-- Q8（跳块上界）与 Q10（K×H 联合投机）是近似/研究路线，未动，不得与等义改写的收益混记。
+- Q8（跳块上界）与 Q10（K×H 联合投机）是近似/研究路线：本轮已把它们的**数学契约与可执行反例**落成参考代码（界、验证引擎、naive 对照），但收益测量、接受率账目与生产接入仍未做，不得与等义改写的收益混记。Q10 的保守“全笔通过才前进”方案在独立接受率 a、b 笔下整步通过率为 a^b，联合草稿必须学会预测多笔相互影响后的下一 frontier，而不是 b 条各自向前冲的草稿。
+- Q2/Q4 的生产化方向（未做）：让写入布局主动维持长而规则的 span（`llama_rerot_span_long_fraction` 是验收指标）；把 run-order 签名接入现有 `llama_rerot_split_table_fragments` 调用点，结构事件才重算 fragments，数值增长走增量前缀和。

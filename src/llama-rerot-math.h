@@ -33,6 +33,35 @@
 //        bit-plane subset sum minus the plain activation sum, with the block
 //        scale factored out. Bit-exact with ggml's integer accumulation.
 //
+//   [Q2] Span-view reference. A reader view is address ranges + one phase
+//        per span + a visibility boundary — not per-key entries. Within a
+//        span of unit storage/virtual step the DDVR phase is constant, so ONE
+//        effective query serves the whole span, and causal truncation is one
+//        cut. The span count — not the token count — is the view's real
+//        description complexity.
+//
+//   [Q4] Structure/numeric separation for reader run orders. The run ORDER
+//        is structure (changes on stage/FRAME/run-set events); lengths,
+//        watermarks and virtual starts are numeric (prefix sums over the
+//        known order, incrementally updatable without re-sorting).
+//
+//   [Q8] Skip-block bounds — APPROXIMATE research route, explicitly gated:
+//        no exact finite sufficient statistic exists for frozen softmax
+//        contexts (Z(q) depends on the full key set); only sound upper
+//        bounds on skipped mass and output deviation are provided.
+//
+//   [Q9] Joint sampler contract. Per-pen RNG streams seeded by (base, pen)
+//        make each pen's draws independent of cohort size and row order;
+//        rows apply temperature -> top-k -> top-p with lowest-index
+//        tie-break. Greedy path reduces per-block maxima without
+//        materializing full logits rows on the host.
+//
+//   [Q10] Frontier-grid joint verification. Draft grids are verified against
+//        FRONTIER dependencies (peers' committed tokens), never per row;
+//        a rejected pen publishes a replacement and dependents of a rejected
+//        pen consume its REPLACEMENT, not its draft. The naive per-row engine
+//        is kept as the executable counterexample of what goes wrong.
+//
 // Nothing in this header changes execution semantics: STRONG frontier
 // visibility, DDVR phases, and lane-local recurrence are inputs, not
 // redefinitions. Approximate schemes (skip-block bounds, joint multi-step
@@ -42,6 +71,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <utility>
 
 // ---------------------------------------------------------------------------
 // [Q3] Shared-KV multi-reader block attention
@@ -225,3 +255,171 @@ double llama_rerot_pq2_bitplane_dot(const uint8_t * qs, const double * x, uint32
 // submasks, then the group contributes T[m0] + 2 T[m1] - sum_j x_j where m0/m1
 // are the group's low/high bit-plane masks. Returns the block's unscaled sum.
 double llama_rerot_pq2_lut_dot(const uint8_t * qs, const double * x, uint32_t n);
+
+// ---------------------------------------------------------------------------
+// [Q2] Span-view reference: ranges + phase + visibility boundary
+// ---------------------------------------------------------------------------
+
+// One span of a reader view: a half-open virtual interval with CONSTANT DDVR
+// phase (storage_pos - virtual_pos) over unit steps, plus a visibility
+// boundary. This is the description a reader view needs per span — not one
+// entry per key.
+struct llama_rerot_span_view {
+    uint32_t begin = 0;        // first virtual position covered
+    uint32_t len = 0;           // span length (>= 1)
+    int64_t phase = 0;          // DDVR phase: storage_pos - virtual_pos, constant
+};
+
+// Effective RoPE position for a reader whose query sits at virtual position
+// `q_v`: within a span, q_v + s_j - v_j = q_v + phase for every j, so the
+// whole span shares ONE effective query (RERoT.md §2.4). Returns q_v + span
+// phase. The span's j-dependence cancels — this is the identity that kills
+// per-key entry construction.
+int64_t llama_rerot_span_effective_pos(int64_t query_virtual_pos, const llama_rerot_span_view & span);
+
+// Causal cut for a unit-step span: the largest virtual position a query at
+// q_v may read, i.e. min(q_v, span_end - 1). The span's visible prefix is
+// [begin, begin + visible_len). Returns visible length (0 if fully future).
+// One comparison replaces a per-key causal mask over the span.
+uint32_t llama_rerot_span_causal_len(const llama_rerot_span_view & span, int64_t query_virtual_pos);
+
+// Fragmentation metric: view description cost should scale with the number
+// of spans (runs/pages), not with history token count. Returns the fraction of
+// the covered length carried by spans of length >= min_long (0.0 when empty).
+// A well-maintained write layout keeps this close to 1.
+double llama_rerot_span_long_fraction(const std::vector<llama_rerot_span_view> & spans, uint32_t min_long);
+
+// ---------------------------------------------------------------------------
+// [Q4] Structure/numeric separation over a frozen run order
+// ---------------------------------------------------------------------------
+
+// Reader run-order structure: WHICH runs precede which (topology), frozen
+// until a structural event (stage start, FRAME change, run-set change, KV
+// migration, recovery, capacity crossing) redefines it.
+struct llama_rerot_run_order {
+    std::vector<uint32_t> run_ids; // topological run order (structure)
+};
+
+// Numeric layer over a frozen order: lengths + watermarks. Virtual start of
+// run g is the prefix sum of the CURRENT lengths of all runs preceding it in
+// the order — a numeric update when a run grows, never a re-sort.
+struct llama_rerot_run_lengths {
+    std::vector<uint32_t> len;    // current visible length per run (by index into run_order.run_ids)
+};
+
+// Compute virtual starts for every run from the frozen order + current
+// lengths (prefix sums). Returns [n_runs] virtual starts. Throws on size
+// mismatch. This is the whole numeric path: no topological work.
+std::vector<int64_t> llama_rerot_virtual_starts(
+    const llama_rerot_run_order & order,
+    const llama_rerot_run_lengths & lengths);
+
+// Incremental numeric update: run `grown_run` gains `delta` tokens. Returns
+// the new virtual starts. Only runs AFTER grown_run in the order shift; the
+// update is O(n_runs) arithmetic with zero structural work. Throws on bad
+// index or overflow.
+std::vector<int64_t> llama_rerot_virtual_starts_after_growth(
+    const llama_rerot_run_order & order,
+    const llama_rerot_run_lengths & lengths,
+    size_t grown_run,
+    uint32_t delta);
+
+// Structure signature: changes ONLY on structural events. Two views with the
+// same signature share the same run order (so numeric updates suffice);
+// different signatures require re-definition. Content hash over run ids.
+uint64_t llama_rerot_run_order_signature(const llama_rerot_run_order & order);
+
+// ---------------------------------------------------------------------------
+// [Q8] Skip-block bounds (approximate research route — NOT exact)
+// ---------------------------------------------------------------------------
+
+// Sound upper bound on the unnormalized attention mass a skipped block can
+// contribute, from a per-block key center c and radius r:
+//   q . k_j <= q . c + |q| * r        (Cauchy-Schwarz on the residual)
+//   Z_skip <= n * exp(scale * (q . c + |q| * r))
+// All phases, scales, softcaps, quantization domains and visibility must be
+// accounted for by the caller when choosing c/r — a loose bound saves nothing.
+// Throws on empty block or negative radius.
+double llama_rerot_skip_mass_bound(
+    const std::vector<double> & query,
+    const std::vector<double> & center,   // [head_dim] block key center
+    double radius,                        // bound on |k_j - c| for all j
+    uint32_t n_block,                     // number of keys in the skipped block
+    double scale);
+
+// Output deviation bound: o = convex combination of keep/skip parts gives
+//   ||o - o_keep|| <= 2 * V_max * delta,  delta = Z_skip / (Z_keep + Z_skip)
+// Returns {delta, bound} where bound = 2 * v_max * delta. Throws on
+// non-finite or non-positive masses.
+std::pair<double, double> llama_rerot_skip_output_bound(
+    double z_keep,
+    double z_skip_bound,
+    double v_max);   // bound on |v_j| (any norm; caller must supply a valid one)
+
+// ---------------------------------------------------------------------------
+// [Q9] Joint sampler contract (per-pen RNG streams, row-order independence)
+// ---------------------------------------------------------------------------
+
+// One row of the joint sampler: temperature -> top-k -> top-p, then a draw
+// from the row's OWN RNG stream (never a shared cohort stream). Ties break to
+// the LOWEST token index. `rng_state` is advanced in place; identical inputs
+// and identical (base_seed, pen) reproduce identical draws.
+uint32_t llama_rerot_joint_sample_row(
+    const std::vector<double> & logits,  // [vocab] one pen's row
+    double temperature,
+    uint32_t top_k,
+    double top_p,
+    uint64_t & rng_state);               // per-pen stream state (xorshift64*)
+
+// Derive a per-pen stream seed from (base_seed, pen): different pens get
+// independent streams; the same pen keeps its stream across cohort-size and
+// row-order changes (the contract that makes joint sampling trajectory-safe).
+uint64_t llama_rerot_joint_sample_seed(uint64_t base_seed, uint32_t pen);
+
+// Greedy joint head: per-block partial maxima reduce to per-row argmax with
+// lowest-index tie-break, without materializing full rows on the host.
+// `block_maxima` is [n_blocks][vocab] per-block maxima; returns [n_rows]
+// argmax tokens. Throws on empty input or mismatched block sizes.
+std::vector<uint32_t> llama_rerot_joint_argmax_rows(
+    const std::vector<std::vector<double>> & block_maxima);
+
+// ---------------------------------------------------------------------------
+// [Q10] Frontier-grid joint verification
+// ---------------------------------------------------------------------------
+
+// A draft grid: pens x horizon. draft[pen][h] is pen's proposed token at
+// frontier step h. The verification question: which cells survive, given
+// that column h+1 of pen i may depend on column h of OTHER pens (STRONG
+// frontier semantics: peers' COMMITTED tokens, not drafts).
+struct llama_rerot_draft_grid {
+    uint32_t n_pens = 0;
+    uint32_t horizon = 0;
+    std::vector<uint32_t> draft;    // [n_pens * horizon]
+    std::vector<uint32_t> truth;    // [n_pens * horizon] oracle committed tokens
+};
+
+// Verification outcome per pen: accepted prefix length within the grid, and
+// (if < horizon) the replacement token the pen must publish instead of the
+// draft (the first rejected draft cell's truth).
+struct llama_rerot_grid_verdict {
+    std::vector<uint32_t> accepted;     // [n_pens] accepted prefix length per pen
+    std::vector<uint32_t> replacement;   // [n_pens] truth token at the first rejection (valid iff accepted < horizon)
+};
+
+// Dependency-tracked joint verification: cell (pen, h) survives only if
+// every cell it READS survived. Reads are declared per column: reads[h] is
+// the list of (reader_pen -> source_pen) edges for column h (the source is
+// read at column h-1's commit boundary, STRONG barrier-after). A pen's cell
+// at column h is accepted iff the pen's own prefix through h-1 is accepted
+// AND every source pen's cell at column h-1 was accepted (or the source is
+// the pen itself). Rejected pens publish replacements; dependents then
+// consume replacements, NOT drafts — the naive per-row engine that ignores
+// this is the executable counterexample (see test).
+llama_rerot_grid_verdict llama_rerot_verify_grid(
+    const llama_rerot_draft_grid & grid,
+    const std::vector<std::vector<std::pair<uint32_t, uint32_t>>> & reads); // [horizon] edges
+
+// Naive per-row verification (WRONG under cross-pen dependencies): each pen
+// accepts its own draft prefix against truth independently. Reference only —
+// the counterexample engine. Same signature as the correct one.
+llama_rerot_grid_verdict llama_rerot_verify_grid_naive(const llama_rerot_draft_grid & grid);

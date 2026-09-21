@@ -14,7 +14,7 @@ namespace {
 
 [[noreturn]] void invalid_arg(const char * message) {
     throw std::invalid_argument(message);
-}
+    }
 
 } // namespace
 
@@ -335,14 +335,14 @@ std::vector<double> solve_unit_lower(const std::vector<double> & l, std::vector<
         const double * row = l.data() + i * t;
         for (size_t j = 0; j < i; ++j) {
             acc -= row[j] * b[j];
-        }
+            }
         if (!std::isfinite(acc)) {
             invalid_arg("RERoT GDN chunk fold: non-finite unit-lower solve");
-        }
+            }
         b[i] = acc;
-    }
+        }
     return b;
-}
+    }
 
 } // namespace
 
@@ -606,4 +606,391 @@ double llama_rerot_pq2_lut_dot(const uint8_t * qs, const double * x, uint32_t n)
         total += t[m0] + 2.0 * t[m1] - t[15];
     }
     return total;
+}
+
+// ---------------------------------------------------------------------------
+// [Q2] Span-view reference
+// ---------------------------------------------------------------------------
+
+int64_t llama_rerot_span_effective_pos(int64_t query_virtual_pos, const llama_rerot_span_view & span) {
+    // §2.4: within the span, s_j - v_j = phase is constant, so
+    //   q_v + s_j - v_j = q_v + phase   for every key j in the span.
+    // One effective query serves the whole span; j cancels.
+    return query_virtual_pos + span.phase;
+}
+
+uint32_t llama_rerot_span_causal_len(const llama_rerot_span_view & span, int64_t query_virtual_pos) {
+    if (span.len == 0) {
+        invalid_arg("RERoT span causal len: empty span");
+    }
+    // Visible prefix = keys with virtual position <= query_virtual_pos.
+    // Span covers virtuals [begin, begin+len); one cut replaces the per-key
+    // causal mask.
+    const int64_t end = int64_t(span.begin) + int64_t(span.len);
+    const int64_t limit = std::min<int64_t>(query_virtual_pos + 1, end);
+    const int64_t visible = limit - int64_t(span.begin);
+    return visible <= 0 ? 0 : uint32_t(visible);
+}
+
+double llama_rerot_span_long_fraction(const std::vector<llama_rerot_span_view> & spans, uint32_t min_long) {
+    uint64_t total = 0;
+    uint64_t long_total = 0;
+    for (const auto & span : spans) {
+        if (span.len == 0) {
+            invalid_arg("RERoT span long fraction: empty span");
+        }
+        total += span.len;
+        if (span.len >= min_long) {
+            long_total += span.len;
+        }
+    }
+    if (total == 0) {
+        return 0.0;
+    }
+    return double(long_total) / double(total);
+}
+
+// ---------------------------------------------------------------------------
+// [Q4] Structure/numeric separation over a frozen run order
+// ---------------------------------------------------------------------------
+
+std::vector<int64_t> llama_rerot_virtual_starts(
+    const llama_rerot_run_order & order,
+    const llama_rerot_run_lengths & lengths) {
+    if (lengths.len.size() != order.run_ids.size()) {
+        invalid_arg("RERoT virtual starts: size mismatch");
+    }
+    std::vector<int64_t> starts(order.run_ids.size(), 0);
+    int64_t acc = 0;
+    for (size_t i = 0; i < order.run_ids.size(); ++i) {
+        starts[i] = acc;
+        acc += int64_t(lengths.len[i]);
+        if (acc < starts[i]) {
+            invalid_arg("RERoT virtual starts: overflow");
+        }
+    }
+    return starts;
+}
+
+std::vector<int64_t> llama_rerot_virtual_starts_after_growth(
+    const llama_rerot_run_order & order,
+    const llama_rerot_run_lengths & lengths,
+    size_t grown_run,
+    uint32_t delta) {
+    if (grown_run >= lengths.len.size()) {
+        invalid_arg("RERoT virtual starts after growth: bad run index");
+    }
+    llama_rerot_run_lengths grown = lengths;
+    const uint64_t new_len = uint64_t(grown.len[grown_run]) + uint64_t(delta);
+    if (new_len > uint64_t(std::numeric_limits<uint32_t>::max())) {
+        invalid_arg("RERoT virtual starts after growth: length overflow");
+    }
+    grown.len[grown_run] = uint32_t(new_len);
+    return llama_rerot_virtual_starts(order, grown);
+}
+
+uint64_t llama_rerot_run_order_signature(const llama_rerot_run_order & order) {
+    // FNV-1a over run ids: stable across processes, changes iff the order
+    // (the structure) changes. Lengths/watermarks never enter the signature.
+    uint64_t hash = 1469598103934665603ull;
+    for (const uint32_t id : order.run_ids) {
+        hash ^= uint64_t(id);
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+// ---------------------------------------------------------------------------
+// [Q8] Skip-block bounds
+// ---------------------------------------------------------------------------
+
+double llama_rerot_skip_mass_bound(
+    const std::vector<double> & query,
+    const std::vector<double> & center,
+    double radius,
+    uint32_t n_block,
+    double scale) {
+    if (query.size() != center.size() || query.empty()) {
+        invalid_arg("RERoT skip mass bound: size mismatch");
+    }
+    if (!(radius >= 0.0) || !std::isfinite(radius)) {
+        invalid_arg("RERoT skip mass bound: negative radius");
+    }
+    if (n_block == 0) {
+        invalid_arg("RERoT skip mass bound: empty block");
+    }
+
+    // q . k_j = q . c + q . (k_j - c) <= q . c + |q| * |k_j - c| <= q . c + |q| * r
+    double dot = 0.0;
+    double q_norm = 0.0;
+    for (size_t i = 0; i < query.size(); ++i) {
+        dot += query[i] * center[i];
+        q_norm += query[i] * query[i];
+    }
+    q_norm = std::sqrt(q_norm);
+    const double bound = scale * (dot + q_norm * radius);
+    // n_block keys each contribute at most exp(bound).
+    return double(n_block) * std::exp(bound);
+}
+
+std::pair<double, double> llama_rerot_skip_output_bound(double z_keep, double z_skip_bound, double v_max) {
+    if (!(z_keep > 0.0) || !std::isfinite(z_keep) || !std::isfinite(z_skip_bound) || z_skip_bound < 0.0) {
+        invalid_arg("RERoT skip output bound: non-finite or non-positive masses");
+    }
+    if (!(v_max >= 0.0) || !std::isfinite(v_max)) {
+        invalid_arg("RERoT skip output bound: bad v_max");
+    }
+    const double delta = z_skip_bound / (z_keep + z_skip_bound);
+    return { delta, 2.0 * v_max * delta };
+}
+
+// ---------------------------------------------------------------------------
+// [Q9] Joint sampler contract
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// xorshift64* — one draw per step; the stream is the pen's own, so draw
+// counts never depend on cohort composition (trajectory safety).
+double next_unit(uint64_t & state) {
+    state ^= state >> 12;
+    state ^= state << 25;
+    state ^= state >> 27;
+    return double((state * 2685821657736338717ull) >> 11) / 9007199254740992.0;
+}
+
+} // namespace
+
+uint64_t llama_rerot_joint_sample_seed(uint64_t base_seed, uint32_t pen) {
+    // SplitMix64 over (base, pen): independent streams per pen, stable across
+    // cohort-size and row-order changes.
+    uint64_t z = base_seed + (uint64_t(pen) + 0x9e3779b97f4a7c15ull);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+}
+
+uint32_t llama_rerot_joint_sample_row(
+    const std::vector<double> & logits,
+    double temperature,
+    uint32_t top_k,
+    double top_p,
+    uint64_t & rng_state) {
+    if (logits.empty()) {
+        invalid_arg("RERoT joint sample row: empty logits");
+    }
+    if (!(temperature > 0.0) || !std::isfinite(temperature)) {
+        invalid_arg("RERoT joint sample row: bad temperature");
+    }
+    if (!(top_p >= 0.0 && top_p <= 1.0)) {
+        invalid_arg("RERoT joint sample row: bad top_p");
+    }
+
+    // temperature
+    std::vector<double> t(logits.size());
+    for (size_t i = 0; i < logits.size(); ++i) {
+        t[i] = logits[i] / temperature;
+    }
+
+    // top-k: keep the k largest; ties keep the LOWEST token index (stable
+    // ordering with index as tie-break).
+    if (top_k > 0 && top_k < t.size()) {
+        std::vector<uint32_t> idx(t.size());
+        for (size_t i = 0; i < idx.size(); ++i) {
+            idx[i] = uint32_t(i);
+        }
+        std::stable_sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) {
+            return t[a] > t[b];
+        });
+        std::vector<uint8_t> kept(t.size(), 0);
+        for (uint32_t i = 0; i < top_k; ++i) {
+            kept[idx[i]] = 1;
+        }
+        for (size_t i = 0; i < t.size(); ++i) {
+            if (!kept[i]) {
+                t[i] = -INFINITY;
+            }
+        }
+    }
+
+    // softmax over the surviving set
+    double m = -INFINITY;
+    for (double v : t) {
+        m = std::max(m, v);
+    }
+    std::vector<double> probs(t.size(), 0.0);
+    double z = 0.0;
+    for (size_t i = 0; i < t.size(); ++i) {
+        if (std::isfinite(t[i])) {
+            probs[i] = std::exp(t[i] - m);
+            z += probs[i];
+        }
+    }
+
+    // top-p (nucleus): keep the smallest prefix of the probability-descending
+    // order whose mass >= top_p; ties break to the lowest token index.
+    if (top_p < 1.0) {
+        std::vector<uint32_t> idx(t.size());
+        for (size_t i = 0; i < idx.size(); ++i) {
+            idx[i] = uint32_t(i);
+        }
+        std::stable_sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) {
+            return probs[a] > probs[b];
+        });
+        double cum = 0.0;
+        std::vector<uint8_t> in_nucleus(t.size(), 0);
+        for (uint32_t i : idx) {
+            in_nucleus[i] = 1;
+            cum += probs[i] / z;
+            if (cum >= top_p) {
+                break;
+            }
+        }
+        for (size_t i = 0; i < t.size(); ++i) {
+            if (!in_nucleus[i]) {
+                probs[i] = 0.0;
+            }
+        }
+        z = 0.0;
+        for (double p : probs) {
+            z += p;
+        }
+    }
+
+    // draw from the pen's OWN stream
+    const double u = next_unit(rng_state);
+    double target = u * z;
+    for (size_t i = 0; i < probs.size(); ++i) {
+        if (probs[i] <= 0.0) {
+            continue;
+        }
+        target -= probs[i];
+        if (target < 0.0) {
+            return uint32_t(i);
+        }
+    }
+    // Floating-point fallback: the last surviving index.
+    for (size_t i = probs.size(); i-- > 0;) {
+        if (probs[i] > 0.0) {
+            return uint32_t(i);
+        }
+    }
+    return uint32_t(logits.size() - 1);
+}
+
+std::vector<uint32_t> llama_rerot_joint_argmax_rows(
+    const std::vector<std::vector<double>> & block_maxima) {
+    if (block_maxima.empty() || block_maxima[0].empty()) {
+        invalid_arg("RERoT joint argmax rows: empty input");
+    }
+    const size_t vocab = block_maxima[0].size();
+    std::vector<double> best(vocab, -INFINITY);
+    for (const auto & block : block_maxima) {
+        if (block.size() != vocab) {
+            invalid_arg("RERoT joint argmax rows: block size mismatch");
+        }
+        for (size_t i = 0; i < vocab; ++i) {
+            best[i] = std::max(best[i], block[i]);
+        }
+    }
+    // Lowest-index tie-break: strict > keeps the earlier maximum.
+    uint32_t arg = 0;
+    for (size_t i = 1; i < vocab; ++i) {
+        if (best[i] > best[arg]) {
+            arg = uint32_t(i);
+        }
+    }
+    return std::vector<uint32_t>{ arg };
+}
+// ---------------------------------------------------------------------------
+// [Q10] Frontier-grid joint verification
+// ---------------------------------------------------------------------------
+
+llama_rerot_grid_verdict llama_rerot_verify_grid(
+    const llama_rerot_draft_grid & grid,
+    const std::vector<std::vector<std::pair<uint32_t, uint32_t>>> & reads) {
+    if (grid.n_pens == 0 || grid.horizon == 0) {
+        invalid_arg("RERoT verify grid: empty grid");
+    }
+    if (grid.draft.size() != size_t(grid.n_pens) * grid.horizon ||
+        grid.truth.size() != size_t(grid.n_pens) * grid.horizon) {
+        invalid_arg("RERoT verify grid: grid size mismatch");
+    }
+    if (reads.size() != grid.horizon) {
+        invalid_arg("RERoT verify grid: reads size mismatch");
+    }
+    for (const auto & edges : reads) {
+        for (const auto & e : edges) {
+            if (e.first >= grid.n_pens || e.second >= grid.n_pens) {
+                invalid_arg("RERoT verify grid: read edge out of range");
+            }
+        }
+    }
+
+    llama_rerot_grid_verdict verdict;
+    verdict.accepted.assign(grid.n_pens, 0);
+    verdict.replacement.assign(grid.n_pens, 0);
+
+    // Column-by-column, STRONG barrier-after: cell (pen, h) reads sources'
+    // column h-1 COMMITTED tokens. A cell survives iff the pen's own prefix
+    // through h-1 survived AND every read source survived its column h-1 cell
+    // (self-reads are trivially satisfied). Rejection at h publishes truth as
+    // the replacement; dependents at h+1 then consume the replacement.
+    std::vector<uint32_t> alive(grid.n_pens, 1); // prefix alive through h-1
+    for (uint32_t h = 0; h < grid.horizon; ++h) {
+        std::vector<uint32_t> next_alive(grid.n_pens, 0);
+        for (uint32_t p = 0; p < grid.n_pens; ++p) {
+            if (!alive[p]) {
+                continue; // prefix already broken; nothing at h survives
+            }
+            const bool draft_ok = grid.draft[size_t(p) * grid.horizon + h] ==
+                                  grid.truth[size_t(p) * grid.horizon + h];
+            bool deps_ok = true;
+            for (const auto & e : reads[h]) {
+                if (e.first != p) {
+                    continue;
+                }
+                if (h > 0 && e.second != p && !alive[e.second]) {
+                    deps_ok = false; // source's column h-1 was rejected
+                }
+            }
+            if (draft_ok && deps_ok) {
+                next_alive[p] = 1;
+                verdict.accepted[p] = h + 1;
+            } else {
+                verdict.replacement[p] = grid.truth[size_t(p) * grid.horizon + h];
+            }
+        }
+        alive = std::move(next_alive);
+    }
+    return verdict;
+}
+
+llama_rerot_grid_verdict llama_rerot_verify_grid_naive(const llama_rerot_draft_grid & grid) {
+    if (grid.n_pens == 0 || grid.horizon == 0) {
+        invalid_arg("RERoT verify grid naive: empty grid");
+    }
+    if (grid.draft.size() != size_t(grid.n_pens) * grid.horizon ||
+        grid.truth.size() != size_t(grid.n_pens) * grid.horizon) {
+        invalid_arg("RERoT verify grid naive: grid size mismatch");
+    }
+
+    // Per-row independent verification — the counterexample engine: ignores
+    // that a cell may have consumed another pen's DRAFT at column h-1, which
+    // was then rejected and replaced.
+    llama_rerot_grid_verdict verdict;
+    verdict.accepted.assign(grid.n_pens, 0);
+    verdict.replacement.assign(grid.n_pens, 0);
+    for (uint32_t p = 0; p < grid.n_pens; ++p) {
+        uint32_t h = 0;
+        while (h < grid.horizon &&
+               grid.draft[size_t(p) * grid.horizon + h] == grid.truth[size_t(p) * grid.horizon + h]) {
+            ++h;
+        }
+        verdict.accepted[p] = h;
+        if (h < grid.horizon) {
+            verdict.replacement[p] = grid.truth[size_t(p) * grid.horizon + h];
+        }
+    }
+    return verdict;
 }

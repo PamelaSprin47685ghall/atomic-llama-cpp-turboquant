@@ -67,6 +67,46 @@
 
 ---
 
+## 下班交接｜2026-09-22（第二轮，研究线收口）
+
+**分支：** `master`（本轮 commit 见 git log；基于 `bd87b9e73`）
+**主题：** 把十问中剩余五问（Q2/Q4/Q8/Q9/Q10）的数学与契约层落成代码，并补上 Q5/Q6 的 F32 数值门实测。十问的“数学上成立”部分全部收口。**未启动任何模型/GPU 测试**（开发机单 780M iGPU，遵守真机安全门）。
+
+### 一、已合入
+
+全部落在 `src/llama-rerot-math.{h,cpp}`（纯 FP64/位级参考层，无 KV/server/graph 依赖）＋ `tests/test-rerot-math.cpp`：
+
+|问题|内容|关键函数|
+|---|---|---|
+|Q2|span 级 reader view：段内相位常数→整段共享一枚 effective Q；因果截断一次比较；碎片化度量|`span_effective_pos` / `span_causal_len` / `span_long_fraction`|
+|Q4|结构/数值分离：run order 签名仅随结构事件变；virtual starts 是前缀和，增长走增量更新|`run_order_signature` / `virtual_starts(_after_growth)`|
+|Q8|跳块误差界（近似路线）：Cauchy–Schwarz 质量上界 + 凸组合输出偏差界；可执行反例固化“无有限充分统计量”|`skip_mass_bound` / `skip_output_bound`|
+|Q9|联合采样契约：per-pen RNG 流（(base,pen) 派生）与 cohort 大小/行序无关；temperature→top-k→top-p、最低索引 tie-break；贪心按块归约 argmax|`joint_sample_seed/row` / `joint_argmax_rows`|
+|Q10|frontier 网格验证：按列推进、STRONG barrier-after，依赖死亡传染；naive 逐行验证引擎作为可执行反例保留|`verify_grid` / `verify_grid_naive`|
+|F32 门|Q5 因子化 24 步、Q6 WY 折叠 T=8 的 F32 重结合误差实测|`test_f32_gate`|
+
+### 二、验证证据
+
+- `test-rerot-math`：0 failure。新增五族全部对拍独立 oracle；Q10 依赖追踪 vs naive 分岐断言（accepted=2 vs 3）。
+- **F32 门实测数据**：Q5 低秩因子化 24 步 F32 vs FP64 稠密——**相对误差 ~1.9e-7（有界区间）/ ~5.1e-7（弱衰减区间）**；Q6 WY 折叠 T=8 F32 vs FP64 逐步——**绝对误差 2.5e-5**。结论：两族在 F32 下都不逐位一致，GPU 化验收门按此量级设。
+- rerot/xkv/flashprefill ctest 全家 **45/45**；`git diff --check` 干净；`scripts/rerot-dag-reference.py` 逻辑检查全过。
+
+### 三、关键事实与纠错记录
+
+1. **Q10 期望值纠错**：C 读 B 的 col-0（当时存活），C 的 col-1 存活；C 死于 col-2（读 B 的被拒 col-1）。正确引擎 accepted[C]=2、naive=3——这正是逐行独立验证在跨笔读下接受率虚高的可执行证据。
+2. **Q8 无充分统计量反例**：keys {-1,+1} vs {0,0} 数量与一阶矩相同但 Z(q) 不同（2cosh(1)≠2）。同一 query 的块结果可精确合并（Q3），不同 query 不能因读同一历史互用。
+3. **Q5 F32 绝对误差的误导性**：弱衰减区间绝对误差 26.5，但相对误差 5.1e-7——绝对误差由状态指数增长主导，门必须按相对误差设，否则会把重结合误差与状态放大混为一谈。
+
+### 四、下一步建议
+
+1. **生产化优先级**：Q2/Q4 已有明确接入点——`llama_rerot_split_table_fragments` 调用点（`llama-kv-cache.cpp:5124`）按 run-order 签名缓存 fragments，结构事件才重算；写入布局维持长 span（`span_long_fraction` 为验收指标）。
+2. Q9 联合采样需 server 协议改动（`server-context.cpp` 采样路径），风险大，建议先在测试 harness 里对拍现有 per-pen 采样轨迹。
+3. Q10 收益账：独立接受率 a、b 笔下保守方案整步通过率 a^b；联合草稿必须预测多笔相互影响后的下一 frontier。验证窗口先收在固定 cohort、普通 BODY 区间。
+4. GPU 化顺序：Q3（多读者共享块，纯数据供给复用）→ Q6（WY 折叠，F32 门 2.5e-5）→ Q5（低秩，F32 门 ~5e-7 相对）→ Q7（LUT，需实测“减乘法≠减耗时”）。
+
+
+---
+
 ## 下班交接｜2026-09-21（晚）
 
 **分支：** `master` @ `29cd8f51a`（已推送 `origin/master`）
