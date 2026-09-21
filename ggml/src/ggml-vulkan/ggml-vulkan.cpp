@@ -15364,6 +15364,25 @@ static void ggml_vk_hc_segment(ggml_backend_vk_context * ctx, vk_context & subct
                                 ctx->device->pipeline_hc_sum_f16 && ctx->recorded_dispatches == 0 &&
                                 !ctx->do_add_rms_partials && !ctx->add_rms_partials_initialized &&
                                 subctx->seqs.size() == 1 && subctx->seqs.front().size() == 1;
+    static const bool latebind_hc_down = [] {
+        const char * env = getenv("GGML_TP5_LATEBIND");
+        return env && (strcmp(env, "hc-down") == 0 || strcmp(env, "1") == 0 || strcmp(env, "on") == 0);
+    }();
+    static const bool latebind_hc_native = [] {
+        const char * dot = getenv("GGML_VK_HC_DOT");
+        const char * wg  = getenv("GGML_VK_HC_DOWN_WG");
+        return !(dot && strcmp(dot, "q8") == 0) && !(wg && wg[0]);
+    }();
+    const ggml_tensor * down_node = graph->nodes[base + 3];
+    const bool capture_late =
+        capture_prefix && latebind_hc_down && latebind_hc_native && ctx->wire_relay_stage != SIZE_MAX &&
+        ctx->wire_relay_f32 &&
+        down_node && down_node->op == GGML_OP_MUL_MAT &&
+        down_node->src[0] && down_node->src[0]->type == GGML_TYPE_Q8_0 &&
+        lo->type == GGML_TYPE_F32 && normalized->type == GGML_TYPE_F32 &&
+        norm->ne[2] == 1 && normalized->ne[1] == 1 && lo->ne[1] == 1 &&
+        norm->ne[0] != 0 && normalized->ne[0] % norm->ne[0] == 0 &&
+        normalized->ne[0] / norm->ne[0] == 4 && lo->ne[0] > 0 && lo->ne[0] <= 512;
     // NativeHC zone: opt-in variant selection. The native pipelines remain the
     // default; a variant is used only when its pipeline was created (opt-in env
     // plus RADV/capability gates in ggml_vk_load_shaders). Only one wg variant
@@ -15450,9 +15469,13 @@ static void ggml_vk_hc_segment(ggml_backend_vk_context * ctx, vk_context & subct
         };
         ctx->hc_sum_recorded.width    = pc.width;
         ctx->hc_sum_recorded.epsilon  = pc.epsilon;
+        ctx->hc_sum_recorded.streams  = (uint32_t) (normalized->ne[0] / pc.width);
+        ctx->hc_sum_recorded.late_rank = capture_late ? (uint32_t) lo->ne[0] : 0u;
         ctx->hc_sum_recorded.block    = binding(block);
         ctx->hc_sum_recorded.bindings = { binding(residual),   binding(normalized->src[1]), binding(combined),
                                           binding(normalized), binding(inject->src[0]),     binding(inject->src[1]) };
+        ctx->hc_sum_recorded.down_weight = capture_late ? binding(down_node->src[0]) : vk_tp5_hc_binding{};
+        ctx->hc_sum_recorded.lo          = capture_late ? binding(lo) : vk_tp5_hc_binding{};
         ctx->hc_sum_recorded.quantized = {};
         if (hc_quant_producer) {
             ctx->hc_sum_recorded.quantized = { (VkBuffer) hc_quant_sub.buffer->buffer, hc_quant_sub.offset,
@@ -15467,6 +15490,13 @@ static void ggml_vk_hc_segment(ggml_backend_vk_context * ctx, vk_context & subct
     ggml_vk_segment_project(ctx, subctx, graph->nodes[base + 3], normalized, lo, down_pipeline,
                             nullptr, hc_quant_consumer ? &hc_quant_sub : nullptr);
     ggml_vk_segment_barrier(ctx, subctx);
+    if (capture_late) {
+        // Exact LateBind-TP replaces both the HC norm/combine prefix and this
+        // W_down+SiLU command buffer. Keep W_up/fold in a third CB so the
+        // collective chain can skip exactly two CBs and feed its late-bound
+        // normalized/lo outputs into the existing W_up implementation.
+        ggml_vk_ctx_begin(ctx->device, subctx);
+    }
     ggml_vk_segment_project(ctx, subctx, graph->nodes[base + 6], lo, mixed, up_pipeline, normalized);
 }
 

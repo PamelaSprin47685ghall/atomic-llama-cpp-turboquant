@@ -947,6 +947,18 @@ void process_shaders() {
     string_to_spv("tp5_sum_f16", "tp5_sum_f16.comp", {});
     string_to_spv("tp5_p2p_push_f16", "tp5_p2p_push_f16.comp", {});
     string_to_spv("tp5_bda_push_f16", "tp5_bda_push_f16.comp", {});
+    string_to_spv("tp5_hc_late_inject", "tp5_hc_latebind.comp",
+                  {
+                      { "TP5_LATE_INJECT", "1" }
+    });
+    string_to_spv("tp5_hc_late_q", "tp5_hc_latebind.comp",
+                  {
+                      { "TP5_LATE_Q", "1" }
+    });
+    string_to_spv("tp5_hc_late_finalize", "tp5_hc_latebind.comp",
+                  {
+                      { "TP5_LATE_FINALIZE", "1" }
+    });
     string_to_spv("qwen4_hc_up_fold", "qwen4_hc_up_fold.comp", {});
     string_to_spv("qwen4_hc_segment_norm", "qwen4_hc_segment_norm.comp", {});
     string_to_spv("qwen4_hc_sum_f16", "qwen4_hc_segment_norm.comp",

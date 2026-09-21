@@ -32,6 +32,20 @@ RELAY 的 HC 边界现在可把**有界 doorbell 自旋直接并入下一段 HC 
 
 这次提交只完成源码与协议接线，**没有执行 shader 编译、GPU mesh、真实模型或吞吐测试**，因此不能把上述任一路径写成硬件验收或性能数字。
 
+### Exact LateBind HC-down（第二步，2026-09-21，opt-in）
+
+`GGML_TP5_LATEBIND=hc-down` 启用 exact HC-down LateBind；默认关闭。它只在 **RELAY + F32 wire + direct producer + 原生 F32 HC down** recipe 上生效，不改变 `GGML_TP5_REPLICATE_ATTN`。因此 attention replicate 仍可独立开/关，推荐按 `replicate={0,1} × latebind={0,1}` 四组做端到端 A/B。F16 wire 自动走旧路径，因为 sidecar 若按本地 F32 partial 计算会与 F16-rounded 主 activation 不再严格对应。
+
+命中 recipe 后，terminal producer 与 P2 之间提前计算四路 scatter 和 `4×320` 的 W_down sufficient statistic；每 rank 将约 5 KiB F32 sidecar 直接写入当前 bank 的 host-imported RAM。CPU 在已有 handoff loop 中有界轮询 sidecar ready，使用 AVX2 做五卡 F32 sum + fan-out。主 activation 与 sidecar CPU 工作允许重叠，但 GPU generation 只在两者都 ready 后发布。
+
+fused P2/finalize 在同一个 bounded-spin kernel 中直接消费 local-VRAM 的 y 与 reduced sidecar，完成 `R_b + s_b*y`、四路 RMS/gamma、`sum_b(Q_b/rho_b)` 和 SiLU，并写回原 reduction tensor、combined、normalized 与 lo。随后 replay 跳过旧 HC norm/combine 和旧 W_down+SiLU 两个 CB，直接复用既有 W_up/fold CB。这样 W_down 的主要 FLOPs 从 collective 后的 causal tail 移进 relay window，同时删除 P2 copy→HC reread 的中间 materialization。
+
+LateBind recipe 必须五个 rank 全部匹配；任一 rank 不匹配时整 stage 回旧 RELAY 路径。当前 recipe 要求 4-stream HC、Q8_0 W_down、F32 normalized/lo、late rank ≤512，并拒绝 `GGML_VK_HC_DOT=q8` 与 `GGML_VK_HC_DOWN_WG` 实验变体。所有 spin 仍受原固定 `spin_max` 约束，timeout 仍写 sticky failure 并退出。
+
+这里的 exact 指**代数上不引入量化/近似项**；W_down 被按 rank/stream 重新结合后，F32 加法顺序与旧 kernel 不同，因此不承诺逐位相同。RMS finalize 仍沿用每 stream 512-lane tree，scatter 也沿用原 Q8 inject 的 FMA/scale 顺序，以把差异限制在 LateBind 本身不可避免的线性重结合。scatter scratch 与 relay payload 同样按双 bank 复用，不按 plan 分配小块 device memory。
+
+该实现只做源码与静态编译验收，未执行 GPU/model。生产比较基线仍是用户实测的 F32、48 AllReduce、attention replicate、五卡 2475 MHz 的 52.47 tok/s。
+
 **演进历史说明**：本文第 0–28 节源于 2026-09-12 设计初稿；附录 C 记录 2026-09-13 目标机实施与真机首轮直连数据；正文开篇与文末《TP5-FAST》及《收敛与优化指导》记录 2026-09-14 重新插卡验证、物理内存审计、ioctl 剖析、`llama_tp5_plan` 统合接入、实验性 gpuflag 机制及最新收敛路线。凡设计初稿中标记为“拟实现项/拟新增”的模块（如 `llama_tp5_plan`、`tp5-inspect-model.py`、`tp5-manifest.json`、Vulkan collective、命令重放等），均已在当前 master 源码树中实现并按工程规范部署。
 
 ---

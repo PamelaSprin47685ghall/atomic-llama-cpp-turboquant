@@ -60,6 +60,12 @@ enum class tp5_wire_type { F32, F16 };
 enum class tp5_sync_mode { HOST, SYNCFD, TIMELINE, GPUFLAG, DRM, STAR, RELAY };
 
 static constexpr size_t TP5_MAILBOX_BANKS = 2;
+static constexpr size_t TP5_LATE_MAX_FLOATS = 2048; // 4 streams * rank <= 512
+
+static bool tp5_latebind_hc_enabled() {
+    const char * env = getenv("GGML_TP5_LATEBIND");
+    return env && (strcmp(env, "hc-down") == 0 || strcmp(env, "1") == 0 || strcmp(env, "on") == 0);
+}
 
 static size_t tp5_mailbox_bank(uint64_t epoch) {
     return (size_t) ((epoch - 1) & 1);
@@ -242,6 +248,15 @@ struct tp5_rank {
     VkPipeline relay_copy_pipe = VK_NULL_HANDLE;
     VkPipelineLayout relay_copy_layout = VK_NULL_HANDLE;
     VkDescriptorSetLayout relay_copy_dsl = VK_NULL_HANDLE;
+    VkPipeline late_inject_pipe = VK_NULL_HANDLE;
+    VkPipelineLayout late_inject_layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout late_inject_dsl = VK_NULL_HANDLE;
+    VkPipeline late_q_pipe = VK_NULL_HANDLE;
+    VkPipelineLayout late_q_layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout late_q_dsl = VK_NULL_HANDLE;
+    VkPipeline late_finalize_pipe = VK_NULL_HANDLE;
+    VkPipelineLayout late_finalize_layout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout late_finalize_dsl = VK_NULL_HANDLE;
 
 
     // Pre-allocated static descriptor sets and command buffers for Star AllReduce
@@ -409,12 +424,18 @@ static bool tp5_gpuflag_drain_all(tp5_comm & c);
 struct tp5_hc_key {
     uint32_t                       width        = 0;
     uint32_t                       epsilon_bits = 0;
+    uint32_t                       streams      = 0;
+    uint32_t                       late_rank    = 0;
     std::array<tp5_binding_key, 6> bindings{};
+    tp5_binding_key                down_weight{};
+    tp5_binding_key                lo{};
     tp5_binding_key                quantized{};
 
     bool operator==(const tp5_hc_key & other) const {
         return width == other.width && epsilon_bits == other.epsilon_bits &&
-               bindings == other.bindings && quantized == other.quantized;
+               streams == other.streams && late_rank == other.late_rank &&
+               bindings == other.bindings && down_weight == other.down_weight &&
+               lo == other.lo && quantized == other.quantized;
     }
 };
 
@@ -426,6 +447,7 @@ struct tp5_plan_key {
     std::vector<tp5_binding_key> bindings;
     std::vector<tp5_binding_key> packed_bindings;
     std::array<tp5_hc_key, 8>    hc{};
+    std::array<tp5_hc_key, 8>    late{};
     std::array<bool, 8>           relay_direct{};
 
     bool operator==(const tp5_plan_key & o) const {
@@ -442,7 +464,7 @@ struct tp5_plan_key {
             if (!(packed_bindings[i] == o.packed_bindings[i]))
                 return false;
         }
-        return hc == o.hc && relay_direct == o.relay_direct;
+        return hc == o.hc && late == o.late && relay_direct == o.relay_direct;
     }
 };
 
@@ -558,8 +580,14 @@ struct tp5_cached_plan {
     std::vector<vk_buffer>       owners;
     std::shared_ptr<tp5_p1_resources> p1;
     std::vector<VkCommandBuffer> cmd_p2;
+    std::vector<VkCommandBuffer> cmd_late_pre;
     std::vector<VkDescriptorSet> ds_sum;
     std::vector<VkDescriptorSet> relay_ds;
+    std::vector<VkDescriptorSet> late_inject_ds;
+    std::vector<VkDescriptorSet> late_q_ds;
+    std::vector<VkDescriptorSet> late_finalize_ds;
+    std::vector<VkBuffer>        late_scatter_buf;
+    std::vector<VkDeviceMemory>  late_scatter_mem;
     std::vector<VkCommandBuffer> star_cmd_p1;
     std::vector<VkCommandBuffer> star_cmd_p2;
     uint64_t last_used_call = 0;
@@ -575,6 +603,7 @@ struct tensor_dev_ref {
     VkDeviceSize  packed_size   = 0;
     vk_buffer     packed_owner;
     vk_tp5_hc_sum hc;
+    vk_tp5_hc_sum late;
     bool          relay_direct = false;
     bool          ok = false;
 };
@@ -605,6 +634,8 @@ struct tp5_comm {
     bool relay_bank_used[TP5_MAILBOX_BANKS] = {false, false};
     size_t star_host_alloc_size = 0;
     size_t star_rank_stride = 0;
+    size_t late_host_offset = 0;
+    size_t late_max_floats = TP5_LATE_MAX_FLOATS;
     std::unique_ptr<tp5_avx2_pool> avx2_pool;
     std::unique_ptr<tp5_drm_signaler> drm_signaler;
     std::unique_ptr<tp5_submit_pool> submit_pool;
@@ -666,6 +697,11 @@ struct tp5_comm {
                 vkFreeCommandBuffers(r.vkdev, r.cmd_pool, 1, &plan.cmd_p2[idx]);
                 plan.cmd_p2[idx] = VK_NULL_HANDLE;
             }
+            if (idx < plan.cmd_late_pre.size() && plan.cmd_late_pre[idx] != VK_NULL_HANDLE &&
+                r.cmd_pool != VK_NULL_HANDLE) {
+                vkFreeCommandBuffers(r.vkdev, r.cmd_pool, 1, &plan.cmd_late_pre[idx]);
+                plan.cmd_late_pre[idx] = VK_NULL_HANDLE;
+            }
             if (idx < plan.star_cmd_p1.size() && plan.star_cmd_p1[idx] != VK_NULL_HANDLE && r.cmd_pool != VK_NULL_HANDLE) {
                 vkFreeCommandBuffers(r.vkdev, r.cmd_pool, 1, &plan.star_cmd_p1[idx]);
                 plan.star_cmd_p1[idx] = VK_NULL_HANDLE;
@@ -681,6 +717,35 @@ struct tp5_comm {
             if (idx < plan.relay_ds.size() && plan.relay_ds[idx] != VK_NULL_HANDLE && r.desc_pool != VK_NULL_HANDLE) {
                 vkFreeDescriptorSets(r.vkdev, r.desc_pool, 1, &plan.relay_ds[idx]);
                 plan.relay_ds[idx] = VK_NULL_HANDLE;
+            }
+            if (idx < plan.late_q_ds.size() && plan.late_q_ds[idx] != VK_NULL_HANDLE && r.desc_pool != VK_NULL_HANDLE) {
+                vkFreeDescriptorSets(r.vkdev, r.desc_pool, 1, &plan.late_q_ds[idx]);
+                plan.late_q_ds[idx] = VK_NULL_HANDLE;
+            }
+            if (idx < plan.late_finalize_ds.size() && plan.late_finalize_ds[idx] != VK_NULL_HANDLE &&
+                r.desc_pool != VK_NULL_HANDLE) {
+                vkFreeDescriptorSets(r.vkdev, r.desc_pool, 1, &plan.late_finalize_ds[idx]);
+                plan.late_finalize_ds[idx] = VK_NULL_HANDLE;
+            }
+        }
+        for (size_t i = 0; i < plan.late_inject_ds.size() && i < n_ranks; ++i) {
+            auto & r = ranks[i];
+            if (plan.late_inject_ds[i] != VK_NULL_HANDLE && r.vkdev != VK_NULL_HANDLE &&
+                r.desc_pool != VK_NULL_HANDLE) {
+                vkFreeDescriptorSets(r.vkdev, r.desc_pool, 1, &plan.late_inject_ds[i]);
+                plan.late_inject_ds[i] = VK_NULL_HANDLE;
+            }
+        }
+        for (size_t i = 0; i < plan.late_scatter_buf.size() && i < n_ranks; ++i) {
+            auto & r = ranks[i];
+            if (plan.late_scatter_buf[i] != VK_NULL_HANDLE && r.vkdev != VK_NULL_HANDLE) {
+                vkDestroyBuffer(r.vkdev, plan.late_scatter_buf[i], nullptr);
+                plan.late_scatter_buf[i] = VK_NULL_HANDLE;
+            }
+            if (i < plan.late_scatter_mem.size() && plan.late_scatter_mem[i] != VK_NULL_HANDLE &&
+                r.vkdev != VK_NULL_HANDLE) {
+                vkFreeMemory(r.vkdev, plan.late_scatter_mem[i], nullptr);
+                plan.late_scatter_mem[i] = VK_NULL_HANDLE;
             }
         }
         plan.owners.clear();
@@ -1000,6 +1065,52 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
         ok = vkCreateComputePipelines(r.vkdev, VK_NULL_HANDLE, 1, &relay_ci, nullptr, &r.relay_copy_pipe) == VK_SUCCESS;
         vkDestroyShaderModule(r.vkdev, relay_mod, nullptr);
         if (!ok) return false;
+
+        if (tp5_latebind_hc_enabled()) {
+            const auto make_late = [&](uint32_t bindings, uint32_t pc_bytes,
+                                       const unsigned char * spv, uint64_t spv_len,
+                                       VkDescriptorSetLayout & dsl, VkPipelineLayout & layout,
+                                       VkPipeline & pipeline) -> bool {
+                std::vector<VkDescriptorSetLayoutBinding> bs(bindings);
+                for (uint32_t i = 0; i < bindings; ++i) {
+                    bs[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+                }
+                VkDescriptorSetLayoutCreateInfo dci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+                dci.bindingCount = bindings;
+                dci.pBindings    = bs.data();
+                if (vkCreateDescriptorSetLayout(r.vkdev, &dci, nullptr, &dsl) != VK_SUCCESS)
+                    return false;
+                VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, pc_bytes};
+                VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+                pli.setLayoutCount         = 1;
+                pli.pSetLayouts            = &dsl;
+                pli.pushConstantRangeCount = 1;
+                pli.pPushConstantRanges    = &pcr;
+                if (vkCreatePipelineLayout(r.vkdev, &pli, nullptr, &layout) != VK_SUCCESS)
+                    return false;
+                VkShaderModule mod = VK_NULL_HANDLE;
+                if (!tp5_create_shader_module(r.vkdev, spv, spv_len, &mod))
+                    return false;
+                VkComputePipelineCreateInfo pci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+                pci.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+                pci.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+                pci.stage.module = mod;
+                pci.stage.pName  = "main";
+                pci.layout       = layout;
+                const bool made =
+                    vkCreateComputePipelines(r.vkdev, VK_NULL_HANDLE, 1, &pci, nullptr, &pipeline) == VK_SUCCESS;
+                vkDestroyShaderModule(r.vkdev, mod, nullptr);
+                return made;
+            };
+            if (!make_late(3, 8, tp5_hc_late_inject_data, tp5_hc_late_inject_len,
+                           r.late_inject_dsl, r.late_inject_layout, r.late_inject_pipe) ||
+                !make_late(6, 16, tp5_hc_late_q_data, tp5_hc_late_q_len,
+                           r.late_q_dsl, r.late_q_layout, r.late_q_pipe) ||
+                !make_late(9, 32, tp5_hc_late_finalize_data, tp5_hc_late_finalize_len,
+                           r.late_finalize_dsl, r.late_finalize_layout, r.late_finalize_pipe)) {
+                return false;
+            }
+        }
     }
 
     // Two sum sets plus one pack set per cached binding; reserve one temporary
@@ -1007,7 +1118,8 @@ bool tp5_build_rank_pipelines(tp5_comm & c, tp5_rank & r) {
     const uint32_t             plan_capacity = tp5_comm::MAX_CACHED_PLANS + 1;
     const uint32_t             sets_per_plan = TP5_MAILBOX_BANKS * 2 + 1 +
                                                (c.sync_mode == tp5_sync_mode::GPUFLAG ? 1 : 0) +
-                                               (c.sync_mode == tp5_sync_mode::RELAY ? TP5_MAILBOX_BANKS : 0);
+                                               (c.sync_mode == tp5_sync_mode::RELAY ? TP5_MAILBOX_BANKS : 0) +
+                                               (c.sync_mode == tp5_sync_mode::RELAY && tp5_latebind_hc_enabled() ? 5 : 0);
     VkDescriptorPoolSize       ps{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                              plan_capacity * (std::max(uint32_t(c.n_ranks + 3), 12u) * sets_per_plan +
                                               (c.sync_mode == tp5_sync_mode::GPUFLAG ? 5 : 0)) };
@@ -1498,14 +1610,23 @@ void tp5_destroy_rank(tp5_rank & r) {
     if (r.flag_pipe) { vkDestroyPipeline(r.vkdev, r.flag_pipe, nullptr); r.flag_pipe = VK_NULL_HANDLE; }
     if (r.push_pipe) { vkDestroyPipeline(r.vkdev, r.push_pipe, nullptr); r.push_pipe = VK_NULL_HANDLE; }
     if (r.relay_copy_pipe) { vkDestroyPipeline(r.vkdev, r.relay_copy_pipe, nullptr); r.relay_copy_pipe = VK_NULL_HANDLE; }
+    if (r.late_inject_pipe) { vkDestroyPipeline(r.vkdev, r.late_inject_pipe, nullptr); r.late_inject_pipe = VK_NULL_HANDLE; }
+    if (r.late_q_pipe) { vkDestroyPipeline(r.vkdev, r.late_q_pipe, nullptr); r.late_q_pipe = VK_NULL_HANDLE; }
+    if (r.late_finalize_pipe) { vkDestroyPipeline(r.vkdev, r.late_finalize_pipe, nullptr); r.late_finalize_pipe = VK_NULL_HANDLE; }
     if (r.pipe_layout) { vkDestroyPipelineLayout(r.vkdev, r.pipe_layout, nullptr); r.pipe_layout = VK_NULL_HANDLE; }
     if (r.flag_pipe_layout) { vkDestroyPipelineLayout(r.vkdev, r.flag_pipe_layout, nullptr); r.flag_pipe_layout = VK_NULL_HANDLE; }
     if (r.push_layout) { vkDestroyPipelineLayout(r.vkdev, r.push_layout, nullptr); r.push_layout = VK_NULL_HANDLE; }
     if (r.relay_copy_layout) { vkDestroyPipelineLayout(r.vkdev, r.relay_copy_layout, nullptr); r.relay_copy_layout = VK_NULL_HANDLE; }
+    if (r.late_inject_layout) { vkDestroyPipelineLayout(r.vkdev, r.late_inject_layout, nullptr); r.late_inject_layout = VK_NULL_HANDLE; }
+    if (r.late_q_layout) { vkDestroyPipelineLayout(r.vkdev, r.late_q_layout, nullptr); r.late_q_layout = VK_NULL_HANDLE; }
+    if (r.late_finalize_layout) { vkDestroyPipelineLayout(r.vkdev, r.late_finalize_layout, nullptr); r.late_finalize_layout = VK_NULL_HANDLE; }
     if (r.dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.dsl, nullptr); r.dsl = VK_NULL_HANDLE; }
     if (r.flag_dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.flag_dsl, nullptr); r.flag_dsl = VK_NULL_HANDLE; }
     if (r.push_dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.push_dsl, nullptr); r.push_dsl = VK_NULL_HANDLE; }
     if (r.relay_copy_dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.relay_copy_dsl, nullptr); r.relay_copy_dsl = VK_NULL_HANDLE; }
+    if (r.late_inject_dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.late_inject_dsl, nullptr); r.late_inject_dsl = VK_NULL_HANDLE; }
+    if (r.late_q_dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.late_q_dsl, nullptr); r.late_q_dsl = VK_NULL_HANDLE; }
+    if (r.late_finalize_dsl) { vkDestroyDescriptorSetLayout(r.vkdev, r.late_finalize_dsl, nullptr); r.late_finalize_dsl = VK_NULL_HANDLE; }
     if (r.desc_pool) { vkDestroyDescriptorPool(r.vkdev, r.desc_pool, nullptr); r.desc_pool = VK_NULL_HANDLE; }
     if (r.cmd_pool) { vkDestroyCommandPool(r.vkdev, r.cmd_pool, nullptr); r.cmd_pool = VK_NULL_HANDLE; }
 
@@ -1561,9 +1682,18 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
         return false;
     }
     max_elems = ((max_elems * wire_b + alignment - 1) / alignment) * alignment / wire_b;
+    const bool   late_enabled = c.sync_mode == tp5_sync_mode::RELAY &&
+                              c.wire == tp5_wire_type::F32 && tp5_latebind_hc_enabled();
+    const size_t late_align   = std::max<size_t>(64, alignment);
+    const size_t late_offset  =
+        ((max_elems * sizeof(float) + late_align - 1) / late_align) * late_align;
+    const size_t late_bytes   = late_enabled ? TP5_LATE_MAX_FLOATS * sizeof(float) : 0;
+    c.late_host_offset        = late_offset;
     for (const auto & r : c.ranks) {
         const uint64_t relay_header = c.sync_mode == tp5_sync_mode::RELAY ? 64u : 0u;
-        if ((uint64_t) max_elems * sizeof(float) + relay_header > r.caps.max_storage_buffer_range) {
+        const uint64_t required =
+            late_enabled ? relay_header + late_offset + late_bytes : (uint64_t) max_elems * sizeof(float) + relay_header;
+        if (required > r.caps.max_storage_buffer_range) {
             c.fail("tensor or mailbox slot exceeds maxStorageBufferRange");
             return false;
         }
@@ -1589,7 +1719,9 @@ bool tp5_setup_workspace(tp5_comm & c, size_t max_elems) {
 
     if (c.sync_mode == tp5_sync_mode::STAR || c.sync_mode == tp5_sync_mode::RELAY) {
         const size_t page_size = 4096;
-        const size_t rank_stride = ((max_elems * sizeof(float) + 64 + page_size - 1) / page_size) * page_size;
+        const size_t rank_payload_bytes =
+            late_enabled ? late_offset + late_bytes : max_elems * sizeof(float);
+        const size_t rank_stride = ((rank_payload_bytes + 64 + page_size - 1) / page_size) * page_size;
         const size_t stage_stride = (c.n_ranks + 1) * rank_stride;
         // Stages reuse two banks; no command addresses a stage-indexed slot.
         // Importing 128 unused copies makes amdgpu walk that entire USERPTR
@@ -1904,6 +2036,8 @@ static bool tp5_hc_consumer_ref(tp5_comm &       c,
         return false;
     ref.hc    = std::move(hc);
     key.width = ref.hc.width;
+    key.streams = ref.hc.streams;
+    key.late_rank = 0;
     std::memcpy(&key.epsilon_bits, &ref.hc.epsilon, sizeof(key.epsilon_bits));
     for (size_t i = 0; i < key.bindings.size(); ++i) {
         const auto & binding = ref.hc.bindings[i];
@@ -1914,6 +2048,50 @@ static bool tp5_hc_consumer_ref(tp5_comm &       c,
     } else {
         key.quantized = {};
     }
+    return true;
+}
+
+static bool tp5_late_consumer_ref(tp5_comm &       c,
+                                  size_t           rank,
+                                  void *           first_cb,
+                                  tensor_dev_ref & ref,
+                                  size_t           n_elems,
+                                  tp5_hc_key &     key) {
+    if (!tp5_latebind_hc_enabled() || c.sync_mode != tp5_sync_mode::RELAY ||
+        c.wire != tp5_wire_type::F32 || c.n_ranks != 5)
+        return false;
+    vk_tp5_hc_sum hc;
+    if (!ggml_vk_tp5_hc_consumer(c.backends[rank], first_cb, &hc) ||
+        hc.width != n_elems || hc.streams != 4 || hc.late_rank == 0 ||
+        size_t(hc.streams) * hc.late_rank > TP5_LATE_MAX_FLOATS ||
+        hc.block.buffer != ref.buf || hc.block.offset != ref.offset || hc.block.size != ref.size)
+        return false;
+    auto & r = c.ranks[rank];
+    const auto valid = [&](const vk_tp5_hc_binding & binding) {
+        return binding.buffer && binding.owner && binding.size &&
+               binding.size <= r.caps.max_storage_buffer_range &&
+               binding.offset % std::max(uint64_t(4), r.caps.min_storage_buffer_offset_alignment) == 0;
+    };
+    for (const auto & binding : hc.bindings)
+        if (!valid(binding))
+            return false;
+    if (!valid(hc.down_weight) || !valid(hc.lo))
+        return false;
+    if (hc.lo.size < uint64_t(hc.late_rank) * sizeof(float))
+        return false;
+
+    ref.late       = std::move(hc);
+    key.width      = ref.late.width;
+    key.streams    = ref.late.streams;
+    key.late_rank  = ref.late.late_rank;
+    std::memcpy(&key.epsilon_bits, &ref.late.epsilon, sizeof(key.epsilon_bits));
+    for (size_t i = 0; i < key.bindings.size(); ++i) {
+        const auto & binding = ref.late.bindings[i];
+        key.bindings[i] = { binding.buffer, binding.offset, binding.size };
+    }
+    key.down_weight = { ref.late.down_weight.buffer, ref.late.down_weight.offset, ref.late.down_weight.size };
+    key.lo          = { ref.late.lo.buffer, ref.late.lo.offset, ref.late.lo.size };
+    key.quantized   = {};
     return true;
 }
 
@@ -1961,6 +2139,21 @@ static void tp5_update_hc_descriptor(tp5_rank &             rank,
     vkUpdateDescriptorSets(rank.vkdev, count, writes, 0, nullptr);
 }
 
+static void tp5_update_storage_set(VkDevice dev, VkDescriptorSet set,
+                                   const VkDescriptorBufferInfo * infos, uint32_t count) {
+    VkWriteDescriptorSet writes[12]{};
+    GGML_ASSERT(count <= 12);
+    for (uint32_t i = 0; i < count; ++i) {
+        writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet          = set;
+        writes[i].dstBinding      = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo     = &infos[i];
+    }
+    vkUpdateDescriptorSets(dev, count, writes, 0, nullptr);
+}
+
 static void tp5_update_push_descriptor(tp5_comm & c, tp5_rank & r, size_t rank_idx, VkDescriptorSet ds,
                                        VkBuffer src_buf, VkDeviceSize src_off, VkDeviceSize payload, size_t bank,
                                        VkDeviceSize slot_off) {
@@ -2004,6 +2197,12 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                 plan.owners.push_back(binding.owner);
             if (trefs[i].hc.quantized.buffer && trefs[i].hc.quantized.owner)
                 plan.owners.push_back(trefs[i].hc.quantized.owner);
+        }
+        if (trefs[i].late.late_rank) {
+            for (const auto & binding : trefs[i].late.bindings)
+                plan.owners.push_back(binding.owner);
+            plan.owners.push_back(trefs[i].late.down_weight.owner);
+            plan.owners.push_back(trefs[i].late.lo.owner);
         }
     }
     const size_t wire_b = c.wire == tp5_wire_type::F16 ? 2 : 4;
@@ -2381,6 +2580,25 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
     plan.p1 = p1_res;
     plan.cmd_p2.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
     plan.ds_sum.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
+    bool late_plan = c.sync_mode == tp5_sync_mode::RELAY && !trefs.empty();
+    for (size_t i = 0; late_plan && i < c.n_ranks; ++i)
+        late_plan = trefs[i].late.late_rank != 0;
+    if (late_plan) {
+        static std::atomic<bool> late_reported{false};
+        if (!late_reported.exchange(true, std::memory_order_relaxed)) {
+            fprintf(stderr,
+                    "[tp5-latebind] exact hc-down active width=%u streams=%u rank=%u sidecar=%zuB "
+                    "(GGML_TP5_REPLICATE_ATTN remains independent)\n",
+                    trefs[0].late.width, trefs[0].late.streams, trefs[0].late.late_rank,
+                    size_t(trefs[0].late.streams) * trefs[0].late.late_rank * sizeof(float));
+        }
+        plan.cmd_late_pre.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
+        plan.late_inject_ds.resize(c.n_ranks, VK_NULL_HANDLE);
+        plan.late_q_ds.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
+        plan.late_finalize_ds.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
+        plan.late_scatter_buf.resize(c.n_ranks, VK_NULL_HANDLE);
+        plan.late_scatter_mem.resize(c.n_ranks, VK_NULL_HANDLE);
+    }
     if (c.sync_mode == tp5_sync_mode::RELAY) {
         plan.relay_ds.resize(c.n_ranks * TP5_MAILBOX_BANKS, VK_NULL_HANDLE);
     }
@@ -2397,23 +2615,147 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
             const size_t pipe_idx = (trefs[i].hc.quantized.buffer != nullptr) ? 1 : 0;
             sum_ai.pSetLayouts = &r.hc_sum_dsl[pipe_idx];
         }
+        if (late_plan) {
+            if (!tp5_alloc_device_buffer(r, 4 * sizeof(float), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
+                                         plan.late_scatter_buf[i], plan.late_scatter_mem[i], nullptr)) {
+                c.fail("allocation of LateBind scatter buffer failed on rank " + std::to_string(i));
+                return false;
+            }
+            VkDescriptorSetAllocateInfo inj_ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, r.desc_pool,
+                                                1, &r.late_inject_dsl};
+            if (vkAllocateDescriptorSets(r.vkdev, &inj_ai, &plan.late_inject_ds[i]) != VK_SUCCESS) {
+                c.fail("allocation of LateBind inject descriptor failed on rank " + std::to_string(i));
+                return false;
+            }
+        }
         for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
             const size_t idx = tp5_plan_slot(i, b);
             if (vkAllocateCommandBuffers(r.vkdev, &cba, &plan.cmd_p2[idx]) != VK_SUCCESS) {
                 c.fail("allocation of P2 command buffer failed on rank " + std::to_string(i));
                 return false;
             }
+            if (late_plan && vkAllocateCommandBuffers(r.vkdev, &cba, &plan.cmd_late_pre[idx]) != VK_SUCCESS) {
+                c.fail("allocation of LateBind precompute command buffer failed on rank " + std::to_string(i));
+                return false;
+            }
             if (vkAllocateDescriptorSets(r.vkdev, &sum_ai, &plan.ds_sum[idx]) != VK_SUCCESS) {
                 c.fail("allocation of sum descriptor set failed on rank " + std::to_string(i));
                 return false;
             }
-            if (c.sync_mode == tp5_sync_mode::RELAY && !trefs[i].hc.width) {
+            if (late_plan) {
+                VkDescriptorSetAllocateInfo q_ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, r.desc_pool,
+                                                  1, &r.late_q_dsl};
+                VkDescriptorSetAllocateInfo f_ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr, r.desc_pool,
+                                                  1, &r.late_finalize_dsl};
+                if (vkAllocateDescriptorSets(r.vkdev, &q_ai, &plan.late_q_ds[idx]) != VK_SUCCESS ||
+                    vkAllocateDescriptorSets(r.vkdev, &f_ai, &plan.late_finalize_ds[idx]) != VK_SUCCESS) {
+                    c.fail("allocation of LateBind descriptor set failed on rank " + std::to_string(i));
+                    return false;
+                }
+            } else if (c.sync_mode == tp5_sync_mode::RELAY && !trefs[i].hc.width) {
                 VkDescriptorSetAllocateInfo relay_ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
                 relay_ai.descriptorPool = r.desc_pool;
                 relay_ai.descriptorSetCount = 1;
                 relay_ai.pSetLayouts = &r.relay_copy_dsl;
                 if (vkAllocateDescriptorSets(r.vkdev, &relay_ai, &plan.relay_ds[idx]) != VK_SUCCESS) {
                     c.fail("allocation of RELAY descriptor set failed on rank " + std::to_string(i));
+                    return false;
+                }
+            }
+        }
+    }
+
+    if (late_plan) {
+        const uint32_t profile_spin = getenv("GGML_TP5_PROFILE") ? 1u : 0u;
+        (void) profile_spin;
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            tp5_rank & r = c.ranks[i];
+            const auto & late = trefs[i].late;
+            const size_t late_count = size_t(late.streams) * late.late_rank;
+            VkDescriptorBufferInfo scatter_info{plan.late_scatter_buf[i], 0, 4 * sizeof(float)};
+            VkDescriptorBufferInfo inject_infos[3] = {
+                {late.bindings[4].buffer, late.bindings[4].offset, late.bindings[4].size},
+                {late.bindings[5].buffer, late.bindings[5].offset, late.bindings[5].size},
+                scatter_info,
+            };
+            tp5_update_storage_set(r.vkdev, plan.late_inject_ds[i], inject_infos, 3);
+
+            for (size_t b = 0; b < TP5_MAILBOX_BANKS; ++b) {
+                const size_t idx = tp5_plan_slot(i, b);
+                VkDescriptorBufferInfo q_infos[6] = {
+                    {late.down_weight.buffer, late.down_weight.offset, late.down_weight.size},
+                    {late.bindings[1].buffer, late.bindings[1].offset, late.bindings[1].size},
+                    {late.bindings[0].buffer, late.bindings[0].offset, late.bindings[0].size},
+                    {trefs[i].buf, trefs[i].offset, trefs[i].size},
+                    scatter_info,
+                    {r.host_import_buf[b], (VkDeviceSize) c.late_host_offset,
+                     (VkDeviceSize) (late_count * sizeof(float))},
+                };
+                tp5_update_storage_set(r.vkdev, plan.late_q_ds[idx], q_infos, 6);
+
+                VkDescriptorBufferInfo final_infos[9] = {
+                    {r.bcast_buf[b], 0, (VkDeviceSize) c.star_rank_stride},
+                    {r.host_import_buf[b], 0, (VkDeviceSize) c.star_rank_stride},
+                    {late.bindings[0].buffer, late.bindings[0].offset, late.bindings[0].size},
+                    {late.bindings[1].buffer, late.bindings[1].offset, late.bindings[1].size},
+                    {late.bindings[2].buffer, late.bindings[2].offset, late.bindings[2].size},
+                    {late.bindings[3].buffer, late.bindings[3].offset, late.bindings[3].size},
+                    scatter_info,
+                    {late.lo.buffer, late.lo.offset, late.lo.size},
+                    {trefs[i].buf, trefs[i].offset, trefs[i].size},
+                };
+                tp5_update_storage_set(r.vkdev, plan.late_finalize_ds[idx], final_infos, 9);
+
+                VkCommandBuffer cmd = plan.cmd_late_pre[idx];
+                VkCommandBufferUsageFlags cb_flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+                VkCommandBufferBeginInfo beg_late{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr, cb_flags,
+                                                   nullptr};
+                if (vkBeginCommandBuffer(cmd, &beg_late) != VK_SUCCESS) {
+                    c.fail("begin LateBind precompute failed on rank " + std::to_string(i));
+                    return false;
+                }
+                VkMemoryBarrier mb_in{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                      VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                                      VK_ACCESS_SHADER_READ_BIT};
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_in, 0, nullptr, 0, nullptr);
+
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_inject_pipe);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_inject_layout, 0, 1,
+                                        &plan.late_inject_ds[i], 0, nullptr);
+                struct { uint32_t width, streams; } inject_pc{late.width, late.streams};
+                vkCmdPushConstants(cmd, r.late_inject_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                   sizeof(inject_pc), &inject_pc);
+                vkCmdDispatch(cmd, late.streams, 1, 1);
+
+                VkMemoryBarrier mb_scatter{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb_scatter,
+                                     0, nullptr, 0, nullptr);
+
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_q_pipe);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_q_layout, 0, 1,
+                                        &plan.late_q_ds[idx], 0, nullptr);
+                struct { uint32_t width, rank_dim, streams, my_rank; } q_pc{
+                    late.width, late.late_rank, late.streams, (uint32_t) i};
+                vkCmdPushConstants(cmd, r.late_q_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(q_pc), &q_pc);
+                vkCmdDispatch(cmd, late.late_rank, 1, 1);
+
+                VkMemoryBarrier mb_host{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                         VK_ACCESS_SHADER_WRITE_BIT,
+                                         VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                     VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     0, 1, &mb_host, 0, nullptr, 0, nullptr);
+                const VkDeviceSize late_ready_off = (VkDeviceSize) c.star_rank_stride - 64 + 6 * sizeof(uint32_t);
+                vkCmdFillBuffer(cmd, r.host_import_buf[b], late_ready_off, sizeof(uint32_t), 1u);
+                VkMemoryBarrier mb_ready{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                          VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                                     0, 1, &mb_ready, 0, nullptr, 0, nullptr);
+                if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+                    c.fail("end LateBind precompute failed on rank " + std::to_string(i));
                     return false;
                 }
             }
@@ -2437,7 +2779,31 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                 const size_t bcast_bytes = tensor_bytes; // CPU accumulation produces F32, regardless of wire type.
                 if (c.sync_mode == tp5_sync_mode::RELAY) {
                     const uint32_t profile_spin = getenv("GGML_TP5_PROFILE") ? 1u : 0u;
-                    if (trefs[i].hc.width) {
+                    if (late_plan) {
+                        const auto & late = trefs[i].late;
+                        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_finalize_pipe);
+                        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_finalize_layout, 0, 1,
+                                                &plan.late_finalize_ds[idx], 0, nullptr);
+                        struct {
+                            uint32_t width;
+                            uint32_t rank_dim;
+                            uint32_t streams;
+                            uint32_t spin_max;
+                            uint32_t late_word_offset;
+                            uint32_t profile_spin;
+                            float    epsilon;
+                            uint32_t status_word_offset;
+                        } late_pc{
+                            late.width, late.late_rank, late.streams, c.spin_max,
+                            (uint32_t) ((64 + c.late_host_offset) / sizeof(uint32_t)),
+                            profile_spin, late.epsilon,
+                            (uint32_t) ((c.star_rank_stride - 64) / sizeof(uint32_t))
+                        };
+                        static_assert(sizeof(late_pc) == 32);
+                        vkCmdPushConstants(cmd, r.late_finalize_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                           sizeof(late_pc), &late_pc);
+                        vkCmdDispatch(cmd, 1, 1, 1);
+                    } else if (trefs[i].hc.width) {
                         // Fast RELAY path: the downstream HC consumer itself
                         // owns the bounded doorbell wait. Once the generation
                         // arrives it continues directly with inject/RMS/norm,
@@ -3004,6 +3370,7 @@ static bool tp5_relay_arm_bank(tp5_comm & c, uint64_t epoch) {
         status[3] = 0u;
         status[4] = 0u;
         status[5] = 0u;
+        status[6] = 0u; // exact LateBind sidecar ready
     }
     c.relay_bank_used[bank] = false;
     std::atomic_thread_fence(std::memory_order_release);
@@ -3031,10 +3398,11 @@ static bool tp5_relay_ensure_armed_epoch(tp5_comm & c, uint64_t epoch) {
                                                             i * c.star_rank_stride + c.star_rank_stride - 64);
         if (status[1] == expected) {
             armed = true;
-            if (status[0] != 0u || status[2] != 0u || status[3] != 0u) {
+            if (status[0] != 0u || status[2] != 0u || status[3] != 0u || status[6] != 0u) {
                 c.fail("RELAY pre-armed bank is not idle on rank " + std::to_string(i) +
                        " (epoch=" + std::to_string(epoch) + ", flag=" + std::to_string(status[0]) +
-                       ", error=" + std::to_string(status[2]) + ", done=" + std::to_string(status[3]) + ")");
+                       ", error=" + std::to_string(status[2]) + ", done=" + std::to_string(status[3]) +
+                       ", late_ready=" + std::to_string(status[6]) + ")");
                 return false;
             }
         } else {
@@ -3058,9 +3426,28 @@ static bool tp5_relay_direct_stage(const tp5_plan_key & key, size_t n_ranks) {
     return true;
 }
 
+static bool tp5_late_stage(const tp5_plan_key & key, size_t n_ranks) {
+    if (!tp5_latebind_hc_enabled() || n_ranks == 0 || n_ranks > key.late.size())
+        return false;
+    uint32_t streams = 0;
+    uint32_t rank_dim = 0;
+    for (size_t i = 0; i < n_ranks; ++i) {
+        if (key.late[i].late_rank == 0 || key.late[i].streams != 4)
+            return false;
+        if (i == 0) {
+            streams  = key.late[i].streams;
+            rank_dim = key.late[i].late_rank;
+        } else if (key.late[i].streams != streams || key.late[i].late_rank != rank_dim) {
+            return false;
+        }
+    }
+    return size_t(streams) * rank_dim <= TP5_LATE_MAX_FLOATS;
+}
+
 static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star_times * times = nullptr,
                              bool relay = false, uint64_t arm_next_epoch = 0,
-                             volatile uint32_t * const * direct_ready = nullptr) {
+                             volatile uint32_t * const * direct_ready = nullptr,
+                             size_t late_count = 0) {
     struct relay_abort_guard {
         tp5_comm & comm;
         bool active;
@@ -3198,6 +3585,47 @@ static bool tp5_star_handoff(tp5_comm & c, size_t bank, size_t n_elems, tp5_star
             std::memcpy(bcast_ptrs[i], sum, bcast_bytes);
         }
     }
+    if (relay && late_count != 0) {
+        if (late_count > c.late_max_floats || c.late_host_offset + late_count * sizeof(float) + 64 > c.star_rank_stride) {
+            c.fail("RELAY LateBind sidecar exceeds workspace");
+            return false;
+        }
+        uint32_t late_pending = c.n_ranks == 32 ? UINT32_MAX : ((1u << c.n_ranks) - 1u);
+        for (uint64_t spin = 0; late_pending != 0u; ++spin) {
+            for (size_t i = 0; i < c.n_ranks; ++i) {
+                const uint32_t bit = 1u << i;
+                if ((late_pending & bit) == 0u)
+                    continue;
+                const auto * status = (const volatile uint32_t *) ((const char *) c.star_host_aligned[bank] +
+                    i * c.star_rank_stride + c.star_rank_stride - 64);
+                if (status[6] == 1u) {
+                    late_pending &= ~bit;
+                }
+            }
+            if (late_pending == 0u)
+                break;
+            if ((spin & 1023u) == 0u && std::chrono::steady_clock::now() >= deadline) {
+                size_t rank = 0;
+                while (rank < c.n_ranks && (late_pending & (1u << rank)) == 0u)
+                    ++rank;
+                c.fail("RELAY LateBind sidecar timeout on rank " + std::to_string(rank));
+                return false;
+            }
+#if defined(__x86_64__) || defined(_M_X64)
+            _mm_pause();
+#endif
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const void * late_ptrs[5] = {};
+        float *      late_bcast[5] = {};
+        for (size_t i = 0; i < c.n_ranks; ++i) {
+            late_ptrs[i] = (const char *) c.star_host_aligned[bank] +
+                           i * c.star_rank_stride + c.late_host_offset;
+            late_bcast[i] = (float *) ((char *) c.ranks[i].bcast_host[bank] +
+                                       64 + c.late_host_offset);
+        }
+        tp5_accumulate_broadcast_star_f32(late_ptrs, late_bcast, late_count);
+    }
     const auto reduced = times ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (times) {
         times->cpu_data_us = std::chrono::duration<double, std::micro>(reduced - data_start).count();
@@ -3292,12 +3720,17 @@ static bool tp5_relay_submit_epoch_chain(
 
     const auto route_begin = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     size_t n_direct_stages = 0;
+    size_t n_late_stages   = 0;
     for (size_t s = 0; s < n_stages; ++s) {
         auto & direct_ready = c.relay_ready_routes[s];
         direct_ready.fill(nullptr);
-        if (!tp5_relay_direct_stage(keys[s], c.n_ranks))
+        const bool direct = tp5_relay_direct_stage(keys[s], c.n_ranks);
+        if (direct)
+            ++n_direct_stages;
+        if (tp5_late_stage(keys[s], c.n_ranks))
+            ++n_late_stages;
+        if (!direct)
             continue;
-        ++n_direct_stages;
         const uint64_t epoch = first_epoch + s;
         const size_t   bank  = tp5_mailbox_bank(epoch);
         for (size_t i = 0; i < c.n_ranks; ++i) {
@@ -3318,7 +3751,7 @@ static bool tp5_relay_submit_epoch_chain(
     double submit_wall_us = 0.0;
     for (size_t i = 0; i < c.n_ranks; ++i) {
         auto & scratch = c.chain_scratch[i];
-        const size_t min_collective_cbs = 2 * n_stages - n_direct_stages;
+        const size_t min_collective_cbs = 2 * n_stages - n_direct_stages + n_late_stages;
         if (scratch.compute.size() < min_collective_cbs || scratch.compute.size() > UINT32_MAX) {
             if (submitted_any) tp5_relay_request_abort(c);
             c.fail("RELAY epoch chain command layout invalid on rank " + std::to_string(i));
@@ -3369,9 +3802,11 @@ static bool tp5_relay_submit_epoch_chain(
         // completed. Arm e+1 before reducing/publishing e.
         const uint64_t arm_next_epoch = epoch < UINT32_MAX ? epoch + 1 : 0;
         const bool direct = tp5_relay_direct_stage(keys[s], c.n_ranks);
+        const bool late   = tp5_late_stage(keys[s], c.n_ranks);
+        const size_t late_count = late ? size_t(keys[s].late[0].streams) * keys[s].late[0].late_rank : 0;
         tp5_star_times * step = prof ? &stage_times[s] : nullptr;
         if (!tp5_star_handoff(c, tp5_mailbox_bank(epoch), keys[s].n_elems, step, true,
-                              arm_next_epoch, direct ? c.relay_ready_routes[s].data() : nullptr)) {
+                              arm_next_epoch, direct ? c.relay_ready_routes[s].data() : nullptr, late_count)) {
             fprintf(stderr, "[tp5-relay-chain] handoff failed stage=%zu epoch=%llu bank=%zu\n",
                     s, (unsigned long long) epoch, tp5_mailbox_bank(epoch));
             return false;
@@ -4498,6 +4933,7 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
         key.stride        = 0;
         key.workspace_gen = 0;
         key.hc.fill(tp5_hc_key{});
+        key.late.fill(tp5_hc_key{});
         key.relay_direct.fill(false);
         key.bindings.resize(c.n_ranks);
         key.packed_bindings.resize(c.n_ranks);
@@ -4551,10 +4987,29 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
             key.packed_bindings[j] = { ref.packed_buf, ref.packed_offset, ref.packed_size };
             key.relay_direct[j]    = ref.relay_direct;
             const auto & consumer  = stage_compute_cbs[s + 1][j];
+            if (consumer.size() > 2 && c.sync_mode == tp5_sync_mode::RELAY && tp5_latebind_hc_enabled()) {
+                tp5_late_consumer_ref(c, j, consumer.front(), ref, n_elems, key.late[j]);
+            }
             if (consumer.size() > 1 && c.sync_mode != tp5_sync_mode::STAR) {
                 tp5_hc_consumer_ref(c, j, consumer.front(), ref, n_elems, key.hc[j]);
             }
             max_elems = std::max(max_elems, n_elems);
+        }
+        bool late_all = tp5_latebind_hc_enabled() && c.sync_mode == tp5_sync_mode::RELAY;
+        for (size_t j = 0; j < c.n_ranks; ++j) {
+            late_all = late_all && key.late[j].late_rank != 0;
+        }
+        if (late_all) {
+            // The exact LateBind finalizer subsumes the old HC prefix. Keep a
+            // single replacement recipe so command-buffer skipping is uniform
+            // across all five ranks.
+            key.hc.fill(tp5_hc_key{});
+            for (size_t j = 0; j < c.n_ranks; ++j)
+                refs[s * c.n_ranks + j].hc = {};
+        } else {
+            key.late.fill(tp5_hc_key{});
+            for (size_t j = 0; j < c.n_ranks; ++j)
+                refs[s * c.n_ranks + j].late = {};
         }
     }
     if (max_elems > c.max_elems && !tp5_setup_workspace(c, max_elems)) {
@@ -4644,10 +5099,14 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
     // Build all ranks before submitting any rank; allocations and pointer
     // fixups cannot fail halfway through an inter-device dependency chain.
     size_t n_direct_stages = 0;
+    size_t n_late_stages   = 0;
     if (c.sync_mode == tp5_sync_mode::RELAY) {
         for (size_t s = 0; s < n_stages; ++s) {
             if (tp5_relay_direct_stage(keys[s], c.n_ranks)) {
                 ++n_direct_stages;
+            }
+            if (tp5_late_stage(keys[s], c.n_ranks)) {
+                ++n_late_stages;
             }
         }
     }
@@ -4704,11 +5163,15 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
             size_t n_compute = 0;
             for (const auto & stage : stage_compute_cbs)
                 n_compute += stage[i].size();
-            for (size_t s = 0; s < n_stages; ++s)
-                if (c.cached_plans[c.chain_plan_indices[s]].key.hc[i].width) {
+            for (size_t s = 0; s < n_stages; ++s) {
+                const auto & stage_key = c.cached_plans[c.chain_plan_indices[s]].key;
+                if (stage_key.late[i].late_rank) {
+                    n_compute -= 2;
+                } else if (stage_key.hc[i].width) {
                     --n_compute;
                 }
-            scratch.compute.resize(n_compute + 2 * n_stages - n_direct_stages +
+            }
+            scratch.compute.resize(n_compute + 2 * n_stages - n_direct_stages + n_late_stages +
                                    (capture ? 5 * n_stages + 3 : 0));
             const auto append_segment = [&](size_t slot, size_t begin, size_t end, uint64_t wait_epoch,
                                             uint64_t signal) {
@@ -4737,10 +5200,17 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
                 }
                 if (capture)
                     scratch.compute[cursor++] = c.ranks[i].timing_markers[5 * s + 1];
-                const size_t first_compute =
-                    s > 0 && c.cached_plans[c.chain_plan_indices[s - 1]].key.hc[i].width ? 1 : 0;
+                size_t first_compute = 0;
+                if (s > 0) {
+                    const auto & prev_key = c.cached_plans[c.chain_plan_indices[s - 1]].key;
+                    first_compute = prev_key.late[i].late_rank ? 2 : prev_key.hc[i].width ? 1 : 0;
+                }
                 for (size_t cb = first_compute; cb < stage_compute_cbs[s][i].size(); ++cb) {
                     scratch.compute[cursor++] = (VkCommandBuffer) stage_compute_cbs[s][i][cb];
+                }
+                const auto & current_plan = c.cached_plans[c.chain_plan_indices[s]];
+                if (current_plan.key.late[i].late_rank) {
+                    scratch.compute[cursor++] = current_plan.cmd_late_pre[bslot];
                 }
                 if (capture)
                     scratch.compute[cursor++] = c.ranks[i].timing_markers[5 * s + 2];
@@ -4785,7 +5255,8 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
             scratch.compute[cursor++] = c.cached_plans[c.chain_plan_indices.back()].cmd_p2[last_slot];
             if (capture)
                 scratch.compute[cursor++] = c.ranks[i].timing_markers[5 * n_stages + 1];
-            const size_t first_tail = c.cached_plans[c.chain_plan_indices.back()].key.hc[i].width ? 1 : 0;
+            const auto & last_key = c.cached_plans[c.chain_plan_indices.back()].key;
+            const size_t first_tail = last_key.late[i].late_rank ? 2 : last_key.hc[i].width ? 1 : 0;
             for (size_t cb = first_tail; cb < stage_compute_cbs.back()[i].size(); ++cb) {
                 scratch.compute[cursor++] = (VkCommandBuffer) stage_compute_cbs.back()[i][cb];
             }
@@ -4918,7 +5389,8 @@ bool ggml_backend_vk_tp5_submit_epoch_chain(void * comm_handle,
             const auto & scratch = c.chain_scratch[i];
             const size_t markers = c.ranks[i].timing_markers.size();
             const size_t collective_cbs =
-                c.sync_mode == tp5_sync_mode::RELAY ? 2 * n_stages - n_direct_stages : 2 * n_stages;
+                c.sync_mode == tp5_sync_mode::RELAY ?
+                    2 * n_stages - n_direct_stages + n_late_stages : 2 * n_stages;
             fprintf(stderr,
                     "[tp5-host-timing] rank=%zu batches=%zu compute_cbs=%zu collective_cbs=%zu marker_cbs=%zu "
                     "submit_wall_us=%lld\n",

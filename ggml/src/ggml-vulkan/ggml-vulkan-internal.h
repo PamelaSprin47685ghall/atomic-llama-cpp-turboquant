@@ -108,9 +108,15 @@ struct vk_tp5_hc_binding {
 struct vk_tp5_hc_sum {
     uint32_t                         width   = 0;
     float                            epsilon = 0;
+    uint32_t                         streams = 0;
+    uint32_t                         late_rank = 0;
     vk_tp5_hc_binding                block;
     // residual, gamma, combined output, normalized output, inject weights/input
     std::array<vk_tp5_hc_binding, 6> bindings;
+    // Exact LateBind-TP: W_down and the post-SiLU low-rank output. These are
+    // populated only for the first HC consumer after a TP boundary.
+    vk_tp5_hc_binding                down_weight;
+    vk_tp5_hc_binding                lo;
     vk_tp5_hc_binding                quantized;
 };
 

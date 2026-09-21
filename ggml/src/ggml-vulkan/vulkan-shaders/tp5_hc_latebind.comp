@@ -1,0 +1,376 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Exact LateBind-TP for Qwen4EXP HC.
+//
+// INJECT: compute the four exact scatter weights from the already-known HC
+// inject inputs.
+// Q:      precompute W_down,b * gamma_b * (rank0 ? R_b : 0 + s_b*z_p)
+//         before the full TP sum is available.
+// FINAL:  after the CPU has reduced both y and the tiny 4*rank sidecar, form
+//         the exact combined residual/RMSNorm and finish W_down with only
+//         Q_b/rho_b + SiLU left. W_up/fold remains the existing next CB.
+
+struct late_q8_0 {
+    float16_t d;
+    int16_t   qs[16];
+};
+
+#ifdef TP5_LATE_INJECT
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) readonly buffer InjectWeights {
+    late_q8_0 w[];
+};
+layout(std430, binding = 1) readonly buffer InjectInput {
+    float x[];
+};
+layout(std430, binding = 2) writeonly buffer Scatter {
+    float scatter[];
+};
+
+layout(push_constant) uniform InjectParams {
+    uint width;
+    uint streams;
+} p;
+
+void main() {
+    const uint stream = gl_WorkGroupID.x;
+    const uint lane   = gl_LocalInvocationID.x;
+    if (stream >= p.streams) {
+        return;
+    }
+    const uint k_dim = p.width * p.streams;
+    float acc = 0.0;
+    for (uint col = 8u * lane; col < k_dim; col += 8u * 32u) {
+        const uint valid = min(8u, k_dim - col);
+        float xv[8];
+        [[unroll]] for (uint e = 0u; e < 8u; ++e) {
+            xv[e] = e < valid ? x[col + e] : 0.0;
+        }
+        const uint ib  = (stream * k_dim + col) / 32u;
+        const uint iqs = col % 32u;
+        const i8vec2 q0 = unpack8(int32_t(w[ib].qs[iqs / 2u])).xy;
+        const i8vec2 q1 = unpack8(int32_t(w[ib].qs[iqs / 2u + 1u])).xy;
+        const i8vec2 q2 = unpack8(int32_t(w[ib].qs[iqs / 2u + 2u])).xy;
+        const i8vec2 q3 = unpack8(int32_t(w[ib].qs[iqs / 2u + 3u])).xy;
+        const vec4 v0 = vec4(q0.x, q0.y, q1.x, q1.y);
+        const vec4 v1 = vec4(q2.x, q2.y, q3.x, q3.y);
+        const vec4 b0 = vec4(xv[0], xv[1], xv[2], xv[3]);
+        const vec4 b1 = vec4(xv[4], xv[5], xv[6], xv[7]);
+        // Match the established HC inject Q8 two-dot/FMA contraction order.
+        float rowtmp = dot(b1, v1);
+        rowtmp       = fma(b0.w, v0.w, rowtmp);
+        rowtmp       = fma(b0.z, v0.z, rowtmp);
+        rowtmp       = fma(b0.y, v0.y, rowtmp);
+        rowtmp       = fma(b0.x, v0.x, rowtmp);
+        acc           = fma(rowtmp, float(w[ib].d), acc);
+    }
+    acc = subgroupAdd(acc);
+    if (lane == 0u) {
+        // Match build_hc_combine / the existing fused HC path exactly for
+        // the production 4-stream model: MUL by 0.25, then the explicit +0.
+        precise float scaled = acc * 0.25 + 0.0;
+        precise float sig    = 1.0 / (1.0 + exp(-scaled));
+        scatter[stream]      = sig * 2.0 + 0.0;
+    }
+}
+#endif
+
+#ifdef TP5_LATE_Q
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer DownWeights {
+    late_q8_0 w[];
+};
+layout(std430, binding = 1) readonly buffer Gamma {
+    float gamma[];
+};
+layout(std430, binding = 2) readonly buffer Residual {
+    float residual[];
+};
+layout(std430, binding = 3) readonly buffer LocalZ {
+    float local_z[];
+};
+layout(std430, binding = 4) readonly buffer Scatter {
+    float scatter[];
+};
+layout(std430, binding = 5) writeonly buffer LateOut {
+    float q_out[];
+};
+
+layout(push_constant) uniform QParams {
+    uint width;
+    uint rank_dim;
+    uint streams;
+    uint my_rank;
+} p;
+
+void main() {
+    const uint row  = gl_WorkGroupID.x;
+    const uint lane = gl_LocalInvocationID.x;
+    if (row >= p.rank_dim) {
+        return;
+    }
+    const uint k_dim = p.width * p.streams;
+    for (uint stream = 0u; stream < p.streams; ++stream) {
+        float acc = 0.0;
+        const uint base = stream * p.width;
+        const float s   = scatter[stream];
+        for (uint col = 8u * lane; col < p.width; col += 8u * 64u) {
+            const uint valid = min(8u, p.width - col);
+            float xv[8];
+            [[unroll]] for (uint e = 0u; e < 8u; ++e) {
+                if (e < valid) {
+                    const uint k = base + col + e;
+                    precise float rz = s * local_z[col + e];
+                    if (p.my_rank == 0u) {
+                        rz = residual[k] + rz;
+                    }
+                    xv[e] = gamma[k] * rz;
+                } else {
+                    xv[e] = 0.0;
+                }
+            }
+            const uint global_col = base + col;
+            const uint ib  = (row * k_dim + global_col) / 32u;
+            const uint iqs = global_col % 32u;
+            const i8vec2 q0 = unpack8(int32_t(w[ib].qs[iqs / 2u])).xy;
+            const i8vec2 q1 = unpack8(int32_t(w[ib].qs[iqs / 2u + 1u])).xy;
+            const i8vec2 q2 = unpack8(int32_t(w[ib].qs[iqs / 2u + 2u])).xy;
+            const i8vec2 q3 = unpack8(int32_t(w[ib].qs[iqs / 2u + 3u])).xy;
+            const vec4 v0 = vec4(q0.x, q0.y, q1.x, q1.y);
+            const vec4 v1 = vec4(q2.x, q2.y, q3.x, q3.y);
+            const vec4 b0 = vec4(xv[0], xv[1], xv[2], xv[3]);
+            const vec4 b1 = vec4(xv[4], xv[5], xv[6], xv[7]);
+            float rowtmp = dot(b1, v1);
+            rowtmp       = fma(b0.w, v0.w, rowtmp);
+            rowtmp       = fma(b0.z, v0.z, rowtmp);
+            rowtmp       = fma(b0.y, v0.y, rowtmp);
+            rowtmp       = fma(b0.x, v0.x, rowtmp);
+            acc           = fma(rowtmp, float(w[ib].d), acc);
+        }
+        acc = subgroupAdd(acc);
+        if (lane == 0u) {
+            q_out[stream * p.rank_dim + row] = acc;
+        }
+    }
+}
+#endif
+
+#ifdef TP5_LATE_FINALIZE
+layout(local_size_x = 1024) in;
+
+layout(std430, binding = 0) coherent volatile readonly buffer RelayInbox {
+    uint inbox[];
+};
+layout(std430, binding = 1) coherent volatile buffer Status {
+    uint status[];
+};
+layout(std430, binding = 2) readonly buffer Residual {
+    float residual[];
+};
+layout(std430, binding = 3) readonly buffer Gamma {
+    float gamma[];
+};
+layout(std430, binding = 4) writeonly buffer Combined {
+    float combined[];
+};
+layout(std430, binding = 5) writeonly buffer Normalized {
+    float normalized[];
+};
+layout(std430, binding = 6) readonly buffer Scatter {
+    float scatter[];
+};
+layout(std430, binding = 7) writeonly buffer Lo {
+    float lo[];
+};
+layout(std430, binding = 8) writeonly buffer SumOutput {
+    float sum_output[];
+};
+
+layout(push_constant) uniform FinalParams {
+    uint width;
+    uint rank_dim;
+    uint streams;
+    uint spin_max;
+    uint late_word_offset;
+    uint profile_spin;
+    float epsilon;
+    uint status_word_offset;
+} p;
+
+shared float partials[1024];
+shared float scales[4];
+shared uint  ready;
+shared uint  expected;
+shared uint  spin_used;
+
+bool wait_generation() {
+    const uint tid = gl_LocalInvocationID.x;
+    if (tid == 0u) {
+        ready     = 0u;
+        expected  = status[p.status_word_offset + 1u];
+        spin_used = 0u;
+        if (status[p.status_word_offset + 2u] == 0u && expected != 0u) {
+            for (uint spin = 0u; spin < p.spin_max; ++spin) {
+                if ((spin & 1023u) == 0u && status[p.status_word_offset + 2u] != 0u) {
+                    break;
+                }
+                if (inbox[0] == expected) {
+                    ready     = 1u;
+                    spin_used = spin;
+                    break;
+                }
+            }
+            if (ready == 0u) {
+                spin_used = p.spin_max;
+                if (status[p.status_word_offset + 2u] == 0u) {
+                    status[p.status_word_offset + 2u] = expected;
+                }
+                status[p.status_word_offset + 4u] = inbox[0];
+            }
+            if (p.profile_spin != 0u) {
+                status[p.status_word_offset + 5u] = spin_used;
+            }
+        } else if (expected == 0u) {
+            status[p.status_word_offset + 2u] = 0xffffffffu;
+        }
+    }
+    barrier();
+    if (ready != 0u) {
+        memoryBarrierBuffer();
+    }
+    return ready != 0u;
+}
+
+void poison() {
+    const uint tid    = gl_LocalInvocationID.x;
+    const uint stream = tid / 256u;
+    const uint lane   = tid & 255u;
+    const float nanv  = uintBitsToFloat(0x7fc00000u);
+    if (stream < p.streams) {
+        const uint base = stream * p.width;
+        for (uint col = lane; col < p.width; col += 256u) {
+            combined[base + col]   = nanv;
+            normalized[base + col] = nanv;
+            if (stream == 0u) {
+                sum_output[col] = nanv;
+            }
+        }
+    }
+    if (tid < p.rank_dim) {
+        lo[tid] = nanv;
+    }
+    memoryBarrierBuffer();
+}
+
+// Use the same 512-lane per-stream RMS tree as qwen4_hc_segment_norm.comp.
+// A single 1024-lane workgroup handles streams 0/1 first, then 2/3. This
+// keeps all four rho values in one workgroup for the final low-rank fold
+// without changing the established per-stream RMS reduction topology.
+void finalize_pair(const uint pair_base, const uint iterations) {
+    const uint tid          = gl_LocalInvocationID.x;
+    const uint row          = tid / 512u;
+    const uint lane         = tid % 512u;
+    const uint stream       = pair_base + row;
+    const uint partial_base = row * 512u;
+    const uint base         = stream * p.width;
+    const float s           = scatter[stream];
+    float values[8];
+    float ss = 0.0;
+
+    [[unroll]] for (uint i = 0u; i < iterations; ++i) {
+        const uint col = lane + i * 512u;
+        float value = 0.0;
+        if (col < p.width) {
+            const float y = uintBitsToFloat(inbox[16u + col]);
+            value = residual[base + col];
+            precise float product = y * s;
+            precise float result  = value + product;
+            value = result;
+            combined[base + col] = value;
+            if (stream == 0u) {
+                sum_output[col] = y;
+            }
+        }
+        values[i] = value;
+        ss += value * value;
+    }
+    partials[partial_base + lane] = ss;
+    barrier();
+    [[unroll]] for (uint stride = 256u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            ss += partials[partial_base + lane + stride];
+            partials[partial_base + lane] = ss;
+        }
+        barrier();
+    }
+    const float mean  = partials[partial_base] / float(p.width);
+    const float scale = inversesqrt(mean + p.epsilon);
+    if (lane == 0u) {
+        scales[stream] = scale;
+    }
+    [[unroll]] for (uint i = 0u; i < iterations; ++i) {
+        const uint col = lane + i * 512u;
+        if (col < p.width) {
+            float norm              = scale * values[i];
+            const float scaled_norm = norm * gamma[base + col];
+            normalized[base + col]  = scaled_norm;
+        }
+    }
+    // partials is reused for the second stream pair; every thread must finish
+    // both its tree reads and normalized writes before that reuse.
+    barrier();
+}
+
+void main() {
+    if (p.streams != 4u || !wait_generation()) {
+        poison();
+        return;
+    }
+
+    // Mirror qwen4_hc_segment_norm.comp's constant loop instances so RADV sees
+    // the same per-stream RMS accumulation shape.
+    const uint blocks = (p.width + 511u) / 512u;
+    if (blocks > 4u) {
+        finalize_pair(0u, 8u);
+        finalize_pair(2u, 8u);
+    } else if (blocks == 4u) {
+        finalize_pair(0u, 4u);
+        finalize_pair(2u, 4u);
+    } else if (blocks == 3u) {
+        finalize_pair(0u, 3u);
+        finalize_pair(2u, 3u);
+    } else if (blocks == 2u) {
+        finalize_pair(0u, 2u);
+        finalize_pair(2u, 2u);
+    } else {
+        finalize_pair(0u, 1u);
+        finalize_pair(2u, 1u);
+    }
+
+    const uint tid = gl_LocalInvocationID.x;
+    if (tid < p.rank_dim) {
+        precise float acc = uintBitsToFloat(inbox[p.late_word_offset + tid]) * scales[0];
+        [[unroll]] for (uint b = 1u; b < 4u; ++b) {
+            precise float term = uintBitsToFloat(inbox[p.late_word_offset + b * p.rank_dim + tid]) * scales[b];
+            acc = acc + term;
+        }
+        precise float scaled = acc * 0.25 + 0.0;
+        lo[tid] = scaled / (1.0 + exp(-scaled));
+    }
+    memoryBarrierBuffer();
+    barrier();
+    if (tid == 0u) {
+        status[p.status_word_offset + 3u] = expected;
+        memoryBarrierBuffer();
+    }
+}
+#endif
