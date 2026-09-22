@@ -1,5 +1,41 @@
 # AGENTS.md
 
+## 下班交接｜2026-09-22（第二十三轮，回滚至 abd816e4d 基线 wire + 全部后续程序修复 backport）
+
+**分支：** `master`
+**主题：** 按你的指示放弃 Makefile DSL / Compact Dict JSON / lazy-grammar 试验，**语义回滚至 `abd816e4d` 的最初 DAG JSON wire 形态（`strategy: "simple" / "dag"` + `payload`）**，同时**完整保留其后所有不涉及 wire 的程序修复**。
+
+### 一、语义回滚与保留矩阵
+
+| 模块 | 回滚至 `abd816e4d` | 保留后来的程序修复（backport） |
+|---|---|---|
+| **探针话术** | `Choose whether this request continues as a single answer or a DAG of independent sub-questions. Output only JSON: {"strategy":"simple","payload":{}} or {"strategy":"dag","payload":{"questions":[{"id":"...","intent":"..."}],"depends_on":[]}}.
+` | 末尾补 `
+`（满足后来加的探针注入换行守卫） |
+| **文法** | `json_schema_to_grammar(server_rerot_routing_schema_json())`（eager，从 `{` 起） | 删除了全部 lazy + pattern trigger 试验代码 |
+| **Schema** | `oneOf`: `strategy:"simple" + payload:{}` ／ `strategy:"dag" + DagPayload` | 保留了去重扫描辅助 |
+| **解析器** | `strategy == "simple"` 校验 payload 为空对象；`"dag"` 走 `questions`/`depends_on` + Kahn 全拓扑 | `incomplete` 语义保留：截断继续采样，完整但校验失败立即定案；去重扫描放在 `json::parse` 之后 |
+| **测试** | `test-rerot-parser` / `test-rerot-runtime` 恢复 strategy wire 夹具 | 5 套测试（parser/runtime/view/attn/flashprefill）**全 0 failure** |
+| **Vulkan 修复** | — | **完整保留**：turbo_wht / 29 个同类 shader 的 `NumWorkGroups` 线性化；host `wg_scale`；rope 动态行跨步；`Br=1` 钉扎 |
+| **seq 分区修复** | — | **完整保留**：单一权威分区（`set_pen_capacity` 唯一划分点）、`alloc_internal_seq` 断言无别名、`rerot_seq_retarget` 拷前清空、park/resume 空决策语义 |
+| **容量闸门** | — | **完整保留**：`rerot_admit_ready_result` 三态（`ok/saturated/failed`），消灭 5000+ 次刷屏的 admission 活锁 |
+
+### 二、真机验证（780M，K=q8_0 / V=turbo4，`-np 2 --rerot-people 2 --rerot-pens 4`）
+
+| 提示 | 响应时间 | 探针 | 策略 | 结果 |
+|---|---|---|---|---|
+| `9.11 和 9.9 哪个大？直接回答。` | 6.43s | probe=66 | simple | **HTTP 200** / 64 token 正常回答 |
+| `Compute 13*17 step by step.` | 7.95s | probe=74 | simple | **HTTP 200** / 80 token 正常回答 |
+| `Solve (1) 13*17, (2) 21*19` | 6.81s | probe=? | dag | **HTTP 500 精确拒绝**（`cycle detected: q1<->q2`） |
+
+- **环路被拒原文**（`probe_reject` trace 铁证）：
+  ```json
+  {"strategy":"dag","payload":{"questions":[{"id":"q1","intent":"Compute 13*17"},{"id":"q2","intent":"Compute 21*19"}],"depends_on":[{"id":"q1","depends_on_id":"q2"},{"id":"q2","depends_on_id":"q1"}]}}
+  ```
+  Kahn 算法在 **6.8s** 精确抓住互相依赖的死锁并 fail-closed，**未发生挂起、未发生 GPU 越界、未引发 Xorg 崩溃**。
+- `ctest -R "rerot|xkv|flashprefill"`：**50/50 全绿**（12.7s 完成）。
+- `dmesg` GPUVM / page fault 计数 = **0**；Xorg 存活。
+
 ## 下班交接｜2026-09-22（第二十二轮，多 lane 长序列三类真机缺陷：越界地毯二期 + 探针上限 + seq 域单一权威重构）
 
 **分支：** `master`

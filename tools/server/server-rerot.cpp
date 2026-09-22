@@ -997,46 +997,66 @@ std::string server_rerot_format_plan_prefix(
 }
 
 std::string_view server_rerot_routing_probe_prompt() {
-    // Fixed instruction injected after C0 capture. Used verbatim as specified.
-    // The trailing template line is the wire-format anchor the routing grammar
-    // and the first sampled token depend on.
     static constexpr std::string_view prompt =
-        "Let's decompose into a maximally concurrent epistemic DAG. Maximize DAG width; minimize critical path depth. Enforce parallel analytical execution:\n"
-        "\n"
-        "1. Orthogonal Faceting (MECE): Split problem into disjoint structural layers, independent subsystems, or distinct analytical dimensions. Fork concurrently.\n"
-        "2. Regime Partitioning: Fork isolated lanes for orthogonal parameter regimes, edge-cases, and nominal vs pathological scenarios.\n"
-        "3. Adversarial Falsification: Run constructive derivations in parallel with active counterexample hunting, edge-case attacks, and failure-mode stress-tests.\n"
-        "4. Disjoint Cross-Audit: Verify high-risk core invariants by assigning redundant, independent derivation pathways in parallel.\n"
-        "5. Strict Causal Gating: Declare dependency B <- A IF AND ONLY IF task B is physically unstartable without an explicit, uncomputed output artifact of A. ABSOLUTELY FORBID narrative, rhetorical, or pedagogical sequencing. Output serialization belongs exclusively to final synthesis.\n"
-        "\n"
-        "Every task MUST be an atomic, falsifiable operation or derivation\u2014NEVER a vague topic outline.\n"
-        "Plan in JSON: {\"tasks\":{\"<id>\":\"<full English intent>\",...},\"deps\":{\"<id>\":[\"<dep_id>\"],...}}\n";
+        "Choose whether this request continues as a single answer or a DAG of independent sub-questions. "
+        "Output only JSON: {\"strategy\":\"simple\",\"payload\":{}} or "
+        "{\"strategy\":\"dag\",\"payload\":{\"questions\":[{\"id\":\"...\",\"intent\":\"...\"}],\"depends_on\":[]}}.\n";
     return prompt;
 }
 
 std::string server_rerot_routing_schema_json() {
-    // Compact dict: every task with its intent first, dependency edges after —
-    // the natural order of thought, with no strategy/payload/question fat.
+    // Exact schema from AGENTS.md §02.4
     return R"({
-  "type": "object",
-  "required": ["tasks"],
-  "additionalProperties": false,
-  "properties": {
-    "tasks": {
+  "oneOf": [
+    {
       "type": "object",
-      "minProperties": 1,
-      "additionalProperties": {
-        "type": "string",
-        "minLength": 1
+      "required": ["strategy", "payload"],
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {"const": "simple"},
+        "payload": {"const": {}}
       }
     },
-    "deps": {
+    {
       "type": "object",
-      "additionalProperties": {
-        "type": "array",
-        "items": {
-          "type": "string",
-          "minLength": 1
+      "required": ["strategy", "payload"],
+      "additionalProperties": false,
+      "properties": {
+        "strategy": {"const": "dag"},
+        "payload": {"$ref": "#/$defs/DagPayload"}
+      }
+    }
+  ],
+  "$defs": {
+    "DagPayload": {
+      "type": "object",
+      "required": ["questions", "depends_on"],
+      "additionalProperties": false,
+      "properties": {
+        "questions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "intent"],
+            "additionalProperties": false,
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "intent": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        "depends_on": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "depends_on_id"],
+            "additionalProperties": false,
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "depends_on_id": {"type": "string", "minLength": 1}
+            }
+          }
         }
       }
     }
@@ -1073,175 +1093,174 @@ std::string server_rerot_source_end_grammar(std::string_view close_marker) {
 //   {"tasks":{"A":"intent",...}}[,"deps":{"C":["A"],...}}]
 // Fail-closed: syntax, shape, id and graph defects each leave strategy invalid
 // with a non-empty error; nothing is repaired, dropped or reordered.
-server_rerot_routing_decision server_rerot_parse_routing_decision(
-        const std::string & text,
-        bool force_single_node_dag) {
+server_rerot_routing_decision server_rerot_parse_routing_decision(const std::string & json_str) {
     server_rerot_routing_decision result;
-
-    // The routing grammar is lazy: the model may reason in free text for as long
-    // as it needs and the GBNF only takes over at the plan object. Everything
-    // before that object is thinking, not protocol, so parse from the plan's
-    // opening brace instead of byte zero. Without this the leading prose would
-    // make every parse fail as `incomplete` and the probe could only ever end by
-    // exhausting its token budget.
-    //
-    // The start marker is the same one the grammar trigger uses, so the parser
-    // and the sampler agree on exactly where the plan begins; text after the
-    // object is left alone (a trailing note cannot invalidate the plan).
-    static constexpr std::string_view k_plan_open = "{\"tasks\"";
-    const size_t plan_at = text.find(k_plan_open);
-    if (plan_at == std::string::npos) {
-        if (text.find('{') == std::string::npos) {
-            // No object opened yet: still thinking. Keep sampling.
-            result.incomplete = true;
-            result.error = "no routing plan object sampled yet";
-            return result;
-        }
-        // An object is open but "tasks" has not been written: either mid-object
-        // or a plan that omits the key. Either way it is not yet decidable.
-        result.incomplete = true;
-        result.error = "routing plan object is missing \"tasks\"";
-        return result;
-    }
 
     json root_json;
     try {
-        // Parse the plan and whatever follows it; nlohmann stops at the first
-        // complete value, so trailing prose is harmless.
-        root_json = json::parse(text.begin() + (std::ptrdiff_t) plan_at, text.end());
+        root_json = json::parse(json_str);
     } catch (const std::exception & e) {
-        // Truncated mid-object: keep sampling until the probe terminator decides.
+        // Truncated JSON is not a verdict: the probe streams token by token and
+        // every prefix is syntactically incomplete. Keep sampling; only a
+        // syntactically complete object that fails validation is final.
         result.incomplete = true;
         result.error = "incomplete JSON: " + std::string(e.what());
         return result;
     }
 
     // Duplicate-member scan runs AFTER the parse: the scanner reports malformed
-    // input as a duplicate, and truncation must stay classified as `incomplete`.
-    // nlohmann keeps the last duplicate member, so an ambiguous object would be
-    // silently repaired - reject it outright instead. Scope it to the plan
-    // substring so thinking text before the object cannot affect the verdict.
-    if (json_text_has_duplicate_keys(std::string_view(text).substr(plan_at))) {
+    // input as a duplicate (observed: a bare "{" was rejected as duplicates), so
+    // parsing first keeps "syntax error" and "ambiguous object" distinct. nlohmann
+    // keeps the last duplicate member, so an ambiguous object would otherwise be
+    // silently repaired - reject it outright instead.
+    if (json_text_has_duplicate_keys(json_str)) {
         result.error = "duplicate JSON object members are not allowed";
         return result;
     }
 
-    if (!root_json.is_object()) {
-        result.error = "routing decision must be a JSON object";
+    if (!root_json.is_object() || !root_json.contains("strategy") || !root_json.contains("payload")) {
+        result.error = "Missing strategy or payload";
         return result;
     }
-    if (!json_object_has_only_keys(root_json, {"tasks", "deps"}, &result.error, "routing root")) {
-        return result;
-    }
-    const auto tasks_it = root_json.find("tasks");
-    if (tasks_it == root_json.end() || !tasks_it->is_object() || tasks_it->empty()) {
-        result.error = "missing or empty \"tasks\" object";
+    if (!json_object_has_only_keys(root_json, {"strategy", "payload"}, &result.error, "routing root")) {
         return result;
     }
 
-    std::unordered_set<std::string> known_ids;
-    uint32_t rank = 0;
-    for (auto it = tasks_it->begin(); it != tasks_it->end(); ++it) {
-        const std::string id = it.key();
-        if (!it->is_string()) {
-            result.error = "intent for task '" + id + "' must be a string";
+    std::string strategy = root_json["strategy"].is_string() ? root_json["strategy"].get<std::string>() : "";
+    if (strategy == "simple") {
+        if (!root_json["payload"].is_object() || !root_json["payload"].empty()) {
+            result.error = "simple payload must be empty object {}";
             return result;
         }
-        const std::string intent = it->get<std::string>();
-        if (id.empty() || only_ascii_space(id) || intent.empty() || only_ascii_space(intent)) {
-            result.error = "id and intent must not be empty or whitespace-only";
-            return result;
-        }
-        if (id == "0") {
-            result.error = "id '0' is reserved for main synthesis";
-            return result;
-        }
-        if (!known_ids.insert(id).second) {
-            result.error = "duplicate question id: " + id;
-            return result;
-        }
-        result.questions.push_back({id, intent, rank++});
+        result.strategy = server_rerot_routing_decision::strategy_type::simple;
+        return result;
     }
 
-    const auto deps_it = root_json.find("deps");
-    if (deps_it != root_json.end()) {
-        if (!deps_it->is_object()) {
-            result.error = "\"deps\" must be an object";
+    if (strategy == "dag") {
+        const auto & payload = root_json["payload"];
+        if (!payload.is_object() || !payload.contains("questions") || !payload.contains("depends_on")) {
+            result.error = "dag payload missing questions or depends_on";
             return result;
         }
+        if (!json_object_has_only_keys(payload, {"questions", "depends_on"}, &result.error, "dag payload")) {
+            return result;
+        }
+
+        const auto & q_arr = payload["questions"];
+        if (!q_arr.is_array() || q_arr.empty()) {
+            result.error = "questions must be a non-empty array";
+            return result;
+        }
+
+        auto is_all_ws = [](const std::string & s) {
+            return std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isspace(c); });
+        };
+
+        std::unordered_set<std::string> known_ids;
+        uint32_t rank = 0;
+        for (const auto & item : q_arr) {
+            if (!item.is_object() || !item.contains("id") || !item.contains("intent")) {
+                result.error = "question item missing id or intent";
+                return result;
+            }
+            if (!json_object_has_only_keys(item, {"id", "intent"}, &result.error, "question")) {
+                return result;
+            }
+            if (!item["id"].is_string() || !item["intent"].is_string()) {
+                result.error = "id and intent must be strings";
+                return result;
+            }
+            std::string qid = item["id"].get<std::string>();
+            std::string intent = item["intent"].get<std::string>();
+            if (qid.empty() || is_all_ws(qid) || intent.empty() || is_all_ws(intent)) {
+                result.error = "id and intent must not be empty or whitespace-only";
+                return result;
+            }
+            if (qid == "0") {
+                result.error = "id '0' is reserved for main synthesis";
+                return result;
+            }
+            if (known_ids.count(qid)) {
+                result.error = "duplicate question id: " + qid;
+                return result;
+            }
+            known_ids.insert(qid);
+            result.questions.push_back({qid, intent, rank++});
+        }
+
+        const auto & dep_arr = payload["depends_on"];
+        if (!dep_arr.is_array()) {
+            result.error = "depends_on must be an array";
+            return result;
+        }
+
         std::set<std::pair<std::string, std::string>> seen_edges;
-        for (auto it = deps_it->begin(); it != deps_it->end(); ++it) {
-            const std::string to_id = it.key();
-            if (!known_ids.count(to_id)) {
-                result.error = "unknown endpoint in dependency: " + to_id;
+        for (const auto & dep : dep_arr) {
+            if (!dep.is_object() || !dep.contains("id") || !dep.contains("depends_on_id")) {
+                result.error = "depends_on item missing id or depends_on_id";
                 return result;
             }
-            if (!it->is_array()) {
-                result.error = "dependency list for '" + to_id + "' must be an array";
+            if (!json_object_has_only_keys(dep, {"id", "depends_on_id"}, &result.error, "depends_on")) {
                 return result;
             }
-            for (const auto & dep : *it) {
-                if (!dep.is_string()) {
-                    result.error = "dependency ids must be strings";
-                    return result;
-                }
-                const std::string from_id = dep.get<std::string>();
-                if (from_id.empty() || only_ascii_space(from_id) || !known_ids.count(from_id)) {
-                    result.error = "unknown endpoint in dependency: " + from_id + " -> " + to_id;
-                    return result;
-                }
-                if (from_id == to_id) {
-                    result.error = "self-loop dependency: " + to_id;
-                    return result;
-                }
-                if (!seen_edges.emplace(from_id, to_id).second) {
-                    result.error = "duplicate dependency edge: " + from_id + " -> " + to_id;
-                    return result;
-                }
-                result.dependencies.push_back({from_id, to_id});
+            if (!dep["id"].is_string() || !dep["depends_on_id"].is_string()) {
+                result.error = "dependency endpoints must be strings";
+                return result;
             }
-        }
-    }
+            std::string to_id = dep["id"].get<std::string>();
+            std::string from_id = dep["depends_on_id"].get<std::string>();
 
-    // Kahn topological sweep over the declared id set: a cycle rejects the whole
-    // plan; a partial topology is never published in place of the real graph.
-    std::unordered_map<std::string, int> in_degree;
-    std::unordered_map<std::string, std::vector<std::string>> adj;
-    for (const auto & q : result.questions) {
-        in_degree.emplace(q.id, 0);
-    }
-    for (const auto & edge : result.dependencies) {
-        in_degree[edge.to_id]++;
-        adj[edge.from_id].push_back(edge.to_id);
-    }
-    std::queue<std::string> q;
-    for (const auto & [qid, deg] : in_degree) {
-        if (deg == 0) {
-            q.push(qid);
+            if (!known_ids.count(to_id) || !known_ids.count(from_id)) {
+                result.error = "unknown endpoint in dependency: " + from_id + " -> " + to_id;
+                return result;
+            }
+            if (to_id == from_id) {
+                result.error = "self-loop dependency: " + to_id;
+                return result;
+            }
+            if (seen_edges.count({from_id, to_id})) {
+                result.error = "duplicate dependency edge: " + from_id + " -> " + to_id;
+                return result;
+            }
+            seen_edges.insert({from_id, to_id});
+            result.dependencies.push_back({from_id, to_id});
         }
-    }
-    size_t visited = 0;
-    while (!q.empty()) {
-        std::string u = q.front();
-        q.pop();
-        visited++;
-        for (const auto & v : adj[u]) {
-            if (--in_degree[v] == 0) {
-                q.push(v);
+
+        // Kahn algorithm topological check
+        std::unordered_map<std::string, int> in_degree;
+        std::unordered_map<std::string, std::vector<std::string>> adj;
+        for (const auto & qid : known_ids) {
+            in_degree[qid] = 0;
+        }
+        for (const auto & edge : result.dependencies) {
+            in_degree[edge.to_id]++;
+            adj[edge.from_id].push_back(edge.to_id);
+        }
+
+        std::queue<std::string> q;
+        for (const auto & [qid, deg] : in_degree) {
+            if (deg == 0) q.push(qid);
+        }
+        size_t visited = 0;
+        while (!q.empty()) {
+            std::string u = q.front();
+            q.pop();
+            visited++;
+            for (const auto & v : adj[u]) {
+                if (--in_degree[v] == 0) q.push(v);
             }
         }
-    }
-    if (visited != result.questions.size()) {
-        result.error = "cycle detected in dependency graph";
+
+        if (visited != known_ids.size()) {
+            result.error = "cycle detected in dependency graph";
+            return result;
+        }
+
+        result.strategy = server_rerot_routing_decision::strategy_type::dag;
         return result;
     }
 
-    // §02.3 single-task passthrough: one task and no dependency edges is an
-    // ordinary single-stream continuation; anything else runs the DAG path.
-    result.strategy = (!force_single_node_dag && result.questions.size() == 1 &&
-                       result.dependencies.empty())
-        ? server_rerot_routing_decision::strategy_type::simple
-        : server_rerot_routing_decision::strategy_type::dag;
+    result.error = "unknown strategy: " + strategy;
     return result;
 }
 

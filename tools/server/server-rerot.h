@@ -177,8 +177,6 @@ private:
 std::string_view server_rerot_planner_prompt();
 std::string_view server_rerot_planner_grammar();
 std::string_view server_rerot_routing_probe_prompt();
-// Compact Dict JSON Schema for the routing probe (AGENTS.md §02.4).
-std::string server_rerot_routing_schema_json();
 // GBNF produced from that schema by json_schema_to_grammar().
 std::string server_rerot_routing_grammar();
 std::string server_rerot_source_end_grammar(std::string_view close_marker);
@@ -371,16 +369,16 @@ struct server_rerot_routing_decision {
     bool is_dag() const { return strategy == strategy_type::dag && error.empty(); }
 };
 
-// Parses and strictly validates one routing probe decision in the Compact
-// Dict JSON wire format ({"tasks":{...},"deps":{...}}) per AGENTS.md §02.4 &
-// §02.6 (fail-closed: any parse, shape or graph defect leaves strategy invalid
-// with a non-empty error; nothing is repaired, dropped or reordered).
-// force_single_node_dag: a single node with no dependency edges maps to
-// strategy_type::simple (§02.3 single-task passthrough) unless the caller
-// explicitly keeps single-worker DAG mode (Stage-5 DAG tests).
-server_rerot_routing_decision server_rerot_parse_routing_decision(
-    const std::string & text,
-    bool force_single_node_dag = false);
+// Parses and strictly validates a routing probe decision. The wire format is
+// {"strategy":"simple","payload":{}} or
+// {"strategy":"dag","payload":{"questions":[...],"depends_on":[...]}}; the
+// strategy field decides the route explicitly (AGENTS.md §02.4 & §02.6).
+// Fail-closed: any parse, shape or graph defect leaves strategy invalid with a
+// non-empty error; nothing is repaired, dropped or reordered.
+server_rerot_routing_decision server_rerot_parse_routing_decision(const std::string & json_str);
+
+// Returns JSON schema string for GBNF conversion (§02.4)
+std::string server_rerot_routing_schema_json();
 
 struct server_rerot_node_runtime {
     llama_rerot_node_id id = LLAMA_REROT_NODE_INVALID;

@@ -3030,7 +3030,7 @@ static void test_rerot_enter_simple_sampler_state_preservation_and_anti_pollutio
         // and a probe sampler is initialized and polluted with probe tokens.
         server_task probe_task = clone_mock_task(transport.response_task);
         probe_task.params.sampling.reasoning_budget_tokens = -1;
-        probe_task.params.sampling.grammar = { COMMON_GRAMMAR_TYPE_USER, server_rerot_routing_grammar() };
+        probe_task.params.sampling.grammar = { COMMON_GRAMMAR_TYPE_OUTPUT_FORMAT, R"({"strategy": "simple"})" };
         slot.task = std::make_unique<const server_task>(std::move(probe_task));
 
         // Swap to probe sampler
@@ -3215,7 +3215,19 @@ static void test_dag_runtime_lifecycle() {
     const uint64_t ep_id = runtime.adopt_root(10, 10, root_slot, 1, 0);
     CHECK(ep_id != 0);
 
-    const std::string dag_json = "{\"tasks\":{\"A\":\"Fact A\",\"B\":\"Fact B\",\"C\":\"Synthesize C\"},\"deps\":{\"C\":[\"A\"]}}";
+    const std::string dag_json = R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Synthesize C"}
+        ],
+        "depends_on": [
+          {"id": "C", "depends_on_id": "A"}
+        ]
+      }
+    })";
     const auto decision = server_rerot_parse_routing_decision(dag_json);
     CHECK(decision.is_dag());
 
@@ -3382,7 +3394,16 @@ static void test_c0_and_dag_admit_without_parked_seq() {
     CHECK(runtime.capture_c_base(ep_id));
     CHECK(ep->c_base.valid());
 
-    const std::string dag_json = "{\"tasks\":{\"A\":\"Fact A\",\"B\":\"Fact B\"}}";
+    const std::string dag_json = R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"}
+        ],
+        "depends_on": []
+      }
+    })";
     const auto decision = server_rerot_parse_routing_decision(dag_json);
     CHECK(decision.is_dag());
     std::string err;
@@ -3462,7 +3483,13 @@ static void test_dag_capture_c_base_snapshots_current_seed() {
 
     // Multi-stage COW and immutability (§12.4):
     // Modifying worker or root seeds post-admission must not mutate C_base snapshot.
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"1\":\"Worker 1\",\"2\":\"Worker 2\"}}");
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [{"id": "1", "intent": "Worker 1"}, {"id": "2", "intent": "Worker 2"}],
+        "depends_on": []
+      }
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -3509,7 +3536,20 @@ static void test_dag_predecessor_completion_order_and_physical_row_invariance() 
     // and C's topological reader view must be strictly invariant: P, A, B, C (own work last).
 
     const std::vector<uint8_t> base_seed = {0x11, 0x22, 0x33, 0x44, 0x55};
-    const std::string dag_json = "{\"tasks\":{\"A\":\"Fact A\",\"B\":\"Fact B\",\"C\":\"Join C\"},\"deps\":{\"C\":[\"A\",\"B\"]}}";
+    const std::string dag_json = R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Join C"}
+        ],
+        "depends_on": [
+          {"id": "C", "depends_on_id": "A"},
+          {"id": "C", "depends_on_id": "B"}
+        ]
+      }
+    })";
 
     struct ScenarioResult {
         std::vector<uint8_t> c_initial_seed;
@@ -3776,9 +3816,9 @@ static void test_dag_c0_probe_to_simple_continuation_and_grammar_isolation() {
     CHECK(ep_b_ptr->probe_seq >= 8);
     CHECK(root_b->exec_seq == ep_b_ptr->probe_seq);
 
-    // In probe mode, planner generates routing decision JSON (e.g. strategy: direct)
+    // In probe mode, planner generates routing decision JSON (e.g. strategy: simple)
     // Probe writes go to probe_seq; C0 state on slot 0 is untouched
-    const auto routing_decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"ordinary continuation\"}}");
+    const auto routing_decision = server_rerot_parse_routing_decision(R"({"strategy":"simple","payload":{}})");
     CHECK(routing_decision.is_simple());
 
     // Rollback isolated probe -> restore C0 exact quantum state
@@ -3821,7 +3861,13 @@ static void test_dag_c0_probe_to_simple_continuation_and_grammar_isolation() {
     // =========================================================================
     const uint64_t ep_dag = runtime.adopt_root(103, 103, 0, 1, 0);
     CHECK(ep_dag != 0);
-    const auto dag_decision = server_rerot_parse_routing_decision("{\"tasks\":{\"W1\":\"Worker 1\"}}", true);
+    const auto dag_decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [{"id": "W1", "intent": "Worker 1"}],
+        "depends_on": []
+      }
+    })");
     std::string err;
     CHECK(runtime.initialize_dag(ep_dag, dag_decision, &err));
     CHECK(runtime.capture_c0(ep_dag, 1, 0));
@@ -3863,7 +3909,19 @@ static void test_dag_admission_view_survival() {
     const uint64_t ep_id = runtime.adopt_root(13, 13, 0, 1, 0);
     CHECK(ep_id != 0);
 
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Fact A\",\"B\":\"Fact B\",\"C\":\"Synthesize C\"},\"deps\":{\"C\":[\"A\"]}}");
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Synthesize C"}
+        ],
+        "depends_on": [
+          {"id": "C", "depends_on_id": "A"}
+        ]
+      }
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -3929,7 +3987,17 @@ static void test_dag_w_gt_p_yield_without_seal() {
     const uint64_t ep_id = runtime.adopt_root(14, 14, 0, 1, 0);
     CHECK(ep_id != 0);
 
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Fact A\",\"B\":\"Fact B\",\"C\":\"Fact C\"}}");
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Fact C"}
+        ],
+        "depends_on": []
+      }
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -4026,7 +4094,17 @@ static void test_dag_w_gt_p_logical_cohort_and_time_slice_certification() {
     const uint64_t ep_id = runtime.adopt_root(115, 115, 0, 1, 0);
     CHECK(ep_id != 0);
 
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"w1\":\"Fact 1\",\"w2\":\"Fact 2\",\"w3\":\"Fact 3\"}}");
+    const auto decision = server_rerot_parse_routing_decision(R"json({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "w1", "intent": "Fact 1"},
+          {"id": "w2", "intent": "Fact 2"},
+          {"id": "w3", "intent": "Fact 3"}
+        ],
+        "depends_on": []
+      }
+    })json");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -4192,7 +4270,16 @@ static void test_dag_w_active_state_retention_and_swap() {
     const uint64_t ep_id = runtime.adopt_root(114, 114, 0, 1, 0);
     CHECK(ep_id != 0);
 
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"w1\":\"Fact 1 derivation\",\"w2\":\"Fact 2 derivation\"}}");
+    const auto decision = server_rerot_parse_routing_decision(R"json({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "w1", "intent": "Fact 1 derivation"},
+          {"id": "w2", "intent": "Fact 2 derivation"}
+        ],
+        "depends_on": []
+      }
+    })json");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -4294,7 +4381,16 @@ static void test_dag_frozen_read_publish_epoch() {
     const uint64_t ep_id = runtime.adopt_root(15, 15, 0, 1, 0);
     CHECK(ep_id != 0);
 
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Fact A\",\"B\":\"Fact B\"}}");
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"}
+        ],
+        "depends_on": []
+      }
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -4334,7 +4430,16 @@ static void test_dag_logical_step_hides_foreign_pending() {
 
     const uint64_t ep_id = runtime.adopt_root(16, 16, 0, 1, 0);
     CHECK(ep_id != 0);
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Fact A\",\"B\":\"Fact B\"}}");
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"}
+        ],
+        "depends_on": []
+      }
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -4385,7 +4490,10 @@ static void test_dag_refuses_nested_html_fork() {
     runtime.set_pen_capacity(2);
     const uint64_t ep_id = runtime.adopt_root(18, 16, 0, 1, 0);
     CHECK(ep_id != 0);
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"A\"}}", true);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {"questions": [{"id": "A", "intent": "A"}], "depends_on": []}
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -4400,7 +4508,10 @@ static void test_dag_save_refuses_probe_and_persists_c0() {
     runtime.set_pen_capacity(2);
     const uint64_t ep_id = runtime.adopt_root(17, 16, 0, 1, 0);
     CHECK(ep_id != 0);
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"A\"}}", true);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {"questions": [{"id": "A", "intent": "A"}], "depends_on": []}
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -4507,7 +4618,17 @@ static void test_dag_seal_exactly_once_and_refuses_unstarted() {
     runtime.set_pen_capacity(4);
     const uint64_t ep_id = runtime.adopt_root(30, 30, 0, 1, 0);
     CHECK(ep_id != 0);
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Fact A\",\"B\":\"Fact B\",\"C\":\"Needs A\"},\"deps\":{\"C\":[\"A\"]}}");
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Needs A"}
+        ],
+        "depends_on": [{"id": "C", "depends_on_id": "A"}]
+      }
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -4564,7 +4685,16 @@ static void test_dag_seal_releases_pen_parked_until_cohort_retire() {
     runtime.set_pen_capacity(1);
     const uint64_t ep_id = runtime.adopt_root(31, 31, 0, 1, 0);
     CHECK(ep_id != 0);
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Fact A\",\"B\":\"Fact B\"}}");
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"}
+        ],
+        "depends_on": []
+      }
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -4635,7 +4765,17 @@ static void test_dag_complete_admission_evicts_no_peer() {
     runtime.set_pen_capacity(2);
     const uint64_t ep_id = runtime.adopt_root(33, 33, 0, 1, 0);
     CHECK(ep_id != 0);
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Fact A\",\"B\":\"Fact B\",\"C\":\"Fact C\"}}");
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Fact C"}
+        ],
+        "depends_on": []
+      }
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -4673,7 +4813,17 @@ static void test_dag_seal_evicts_no_bound_peer() {
     runtime.set_pen_capacity(1);
     const uint64_t ep_id = runtime.adopt_root(34, 34, 0, 1, 0);
     CHECK(ep_id != 0);
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Fact A\",\"B\":\"Fact B\",\"C\":\"Fact C\"}}");
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Fact C"}
+        ],
+        "depends_on": []
+      }
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -4715,7 +4865,16 @@ static void test_dag_yield_force_under_resource_pressure() {
     runtime.set_pen_capacity(2);
     const uint64_t ep_id = runtime.adopt_root(32, 32, 0, 1, 0);
     CHECK(ep_id != 0);
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Fact A\",\"B\":\"Fact B\"}}");
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"}
+        ],
+        "depends_on": []
+      }
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -4758,7 +4917,10 @@ static void test_dag_admit_anchors_worker_storage_to_c_base() {
         const uint64_t ep_id = runtime.adopt_root(32, 32, 0, 1, 0);
         CHECK(ep_id != 0);
         CHECK(runtime.capture_c0(ep_id, 1, 0));
-        const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"A\"}}", true);
+        const auto decision = server_rerot_parse_routing_decision(R"({
+          "strategy": "dag",
+          "payload": {"questions": [{"id": "A", "intent": "A"}], "depends_on": []}
+        })");
         CHECK(decision.is_dag());
         std::string err;
         CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -4787,7 +4949,10 @@ static void test_dag_init_alone_never_admits_until_base_captured() {
     runtime.set_pen_capacity(4);
     const uint64_t ep_id = runtime.adopt_root(33, 33, 0, 1, 5);
     CHECK(ep_id != 0);
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"A\"}}", true);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {"questions": [{"id": "A", "intent": "A"}], "depends_on": []}
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -4858,7 +5023,16 @@ static void test_dag_frozen_view_gates_foreign_frame() {
     runtime.set_pen_capacity(4);
     const uint64_t ep_id = runtime.adopt_root(35, 35, 0, 1, 0);
     CHECK(ep_id != 0);
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Fact A\",\"B\":\"Fact B\"}}");
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"}
+        ],
+        "depends_on": []
+      }
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -4943,7 +5117,10 @@ static void test_dag_load_refuses_bad_cohort_and_sampler_snapshot() {
         runtime.set_pen_capacity(2);
         const uint64_t ep_id = runtime.adopt_root(52, 52, 0, 1, 0);
         CHECK(ep_id != 0);
-        const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"A\"}}", true);
+        const auto decision = server_rerot_parse_routing_decision(R"({
+          "strategy": "dag",
+          "payload": {"questions": [{"id": "A", "intent": "A"}], "depends_on": []}
+        })");
         CHECK(decision.is_dag());
         std::string err;
         CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -4970,7 +5147,10 @@ static void test_dag_load_rebinds_pens_for_bound_slots() {
     runtime.set_pen_capacity(2);
     const uint64_t ep_id = runtime.adopt_root(40, 40, 0, 1, 0);
     CHECK(ep_id != 0);
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"A\"}}", true);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {"questions": [{"id": "A", "intent": "A"}], "depends_on": []}
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -5021,7 +5201,16 @@ static void test_dag_step_publish_is_atomic_on_member_failure() {
     runtime.set_pen_capacity(2);
     const uint64_t ep_id = runtime.adopt_root(61, 61, 0, 1, 0);
     CHECK(ep_id != 0);
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Fact A\",\"B\":\"Fact B\"}}");
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"}
+        ],
+        "depends_on": []
+      }
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -5086,7 +5275,10 @@ static void test_dag_step_publish_overflow_keeps_history_public() {
     runtime.set_pen_capacity(2);
     const uint64_t ep_id = runtime.adopt_root(62, 62, 0, 1, 0);
     CHECK(ep_id != 0);
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Fact A\"}}", true);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {"questions": [{"id": "A", "intent": "Fact A"}], "depends_on": []}
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -5149,7 +5341,10 @@ static void test_dag_init_frames_prefix_keeps_view_not_body_export() {
     const auto run_probe = ep->document.append_run(
         0, llama_rerot_visibility::private_control, 10, 2, 0, llama_rerot_segment_kind::probe_control);
 
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Fact A\"}}", true);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {"questions": [{"id": "A", "intent": "Fact A"}], "depends_on": []}
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -5225,7 +5420,10 @@ static void test_dag_ensure_run_keeps_segment_kinds_distinct() {
     CHECK(ep != nullptr);
     const auto run_p = ep->document.append_run(0, llama_rerot_visibility::public_live, 0, 10, 1);
 
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Fact A\"}}", true);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {"questions": [{"id": "A", "intent": "Fact A"}], "depends_on": []}
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -5338,7 +5536,10 @@ static void test_dag_prefix_rebuild_reconciles_root_runs() {
 
     // Base past C0 is refused; post-init rebuild is refused.
     CHECK(!runtime.prepare_dag_prefix_rebuild(ep_id, 11, &err));
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"A\"}}", true);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {"questions": [{"id": "A", "intent": "A"}], "depends_on": []}
+    })");
     CHECK(decision.is_dag());
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
     CHECK(!runtime.prepare_dag_prefix_rebuild(ep_id, 6, &err));
@@ -5354,7 +5555,17 @@ static void test_dag_three_lane_flat_cycle_and_peer_uptake() {
     const uint64_t ep_id = runtime.adopt_root(40, 40, 0, 1, 0);
     CHECK(ep_id != 0);
 
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Fact A\",\"B\":\"Fact B\",\"C\":\"Fact C\"}}");
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Fact C"}
+        ],
+        "depends_on": []
+      }
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -5558,7 +5769,23 @@ static void test_dag_diamond_and_unequal_length_history() {
     const uint64_t ep_id = runtime.adopt_root(41, 41, 0, 1, 0);
     CHECK(ep_id != 0);
 
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"1\":\"Base fact\",\"2\":\"Left branch\",\"3\":\"Right branch\",\"4\":\"Join synthesis\"},\"deps\":{\"2\":[\"1\"],\"3\":[\"1\"],\"4\":[\"2\",\"3\"]}}");
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "1", "intent": "Base fact"},
+          {"id": "2", "intent": "Left branch"},
+          {"id": "3", "intent": "Right branch"},
+          {"id": "4", "intent": "Join synthesis"}
+        ],
+        "depends_on": [
+          {"id": "2", "depends_on_id": "1"},
+          {"id": "3", "depends_on_id": "1"},
+          {"id": "4", "depends_on_id": "2"},
+          {"id": "4", "depends_on_id": "3"}
+        ]
+      }
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -5755,7 +5982,19 @@ static void test_dag_a_to_c_with_b_independent_overlap() {
     const uint64_t ep_id = runtime.adopt_root(42, 42, 0, 1, 0);
     CHECK(ep_id != 0);
 
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Fact A\",\"B\":\"Fact B\",\"C\":\"Fact C\"},\"deps\":{\"C\":[\"A\"]}}");
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"},
+          {"id": "C", "intent": "Fact C"}
+        ],
+        "depends_on": [
+          {"id": "C", "depends_on_id": "A"}
+        ]
+      }
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -5934,7 +6173,10 @@ static void test_dag_initialize_refuses_double_init() {
     runtime.set_pen_capacity(2);
     const uint64_t ep_id = runtime.adopt_root(53, 53, 0, 1, 0);
     CHECK(ep_id != 0);
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"A\"}}", true);
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {"questions": [{"id": "A", "intent": "A"}], "depends_on": []}
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -5959,7 +6201,18 @@ static void test_dag_source_end_multi_token_and_starting_frame_gate() {
     CHECK(ep_id != 0);
     runtime.set_dag_protocol_markers(ep_id, "</think>", "<think>");
 
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Fact A\",\"B\":\"Fact B\"},\"deps\":{\"B\":[\"A\"]}}");
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"}
+        ],
+        "depends_on": [
+          {"id": "B", "depends_on_id": "A"}
+        ]
+      }
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -6032,7 +6285,16 @@ static void test_dag_microbatch_slice_order_and_no_earlier_public_leak() {
     const uint64_t ep1 = runtime1.adopt_root(101, 101, 0, 1, 0);
     CHECK(ep1 != 0);
 
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Fact A\",\"B\":\"Fact B\"}}");
+    const auto decision = server_rerot_parse_routing_decision(R"({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Fact A"},
+          {"id": "B", "intent": "Fact B"}
+        ],
+        "depends_on": []
+      }
+    })");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime1.initialize_dag(ep1, decision, &err));
@@ -6155,7 +6417,11 @@ static void test_dag_duplicate_source_end_and_restore_no_double_decrement() {
     runtime.set_pen_capacity(3);
     const uint64_t ep_id = runtime.adopt_root(70, 70, 0, 1, 0);
     CHECK(ep_id != 0);
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Worker A\",\"B\":\"Worker B\"},\"deps\":{\"B\":[\"A\"]}}");
+    const auto decision = server_rerot_parse_routing_decision(
+        "{\"strategy\": \"dag\", \"payload\": {\"questions\": ["
+        "{\"id\": \"A\", \"intent\": \"Worker A\"},"
+        "{\"id\": \"B\", \"intent\": \"Worker B\"}"
+        "], \"depends_on\": [{\"id\": \"B\", \"depends_on_id\": \"A\"}]}}");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -6224,7 +6490,11 @@ static void test_dag_abort_clears_orphan_refs_and_pens() {
     runtime.set_pen_capacity(3);
     const uint64_t ep_id = runtime.adopt_root(80, 80, 0, 1, 0);
     CHECK(ep_id != 0);
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Worker A\",\"B\":\"Worker B\"}}");
+    const auto decision = server_rerot_parse_routing_decision(
+        "{\"strategy\": \"dag\", \"payload\": {\"questions\": ["
+        "{\"id\": \"A\", \"intent\": \"Worker A\"},"
+        "{\"id\": \"B\", \"intent\": \"Worker B\"}"
+        "], \"depends_on\": []}}");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -6294,7 +6564,16 @@ static void test_dag_demote_restore_different_physical_slots() {
     ref_runtime.set_pen_capacity(6);
     const uint64_t ep_ref = ref_runtime.adopt_root(100, 100, 0, 1, 0);
     CHECK(ep_ref != 0);
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Worker Alpha\",\"B\":\"Worker Beta\"}}");
+    const auto decision = server_rerot_parse_routing_decision(R"json({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "A", "intent": "Worker Alpha"},
+          {"id": "B", "intent": "Worker Beta"}
+        ],
+        "depends_on": []
+      }
+    })json");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(ref_runtime.initialize_dag(ep_ref, decision, &err));
@@ -6479,7 +6758,11 @@ static void test_dag_streaming_isolation_and_terminal_guarantees() {
     const uint64_t ep_id = runtime.adopt_root(160, 160, 0, 1, 0);
     CHECK(ep_id != 0);
 
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Task A\",\"B\":\"Task B\"}}");
+    const auto decision = server_rerot_parse_routing_decision(
+        "{\"strategy\": \"dag\", \"payload\": {\"questions\": ["
+        "{\"id\": \"A\", \"intent\": \"Task A\"},"
+        "{\"id\": \"B\", \"intent\": \"Task B\"}"
+        "], \"depends_on\": []}}");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -6612,7 +6895,16 @@ static void test_dag_lora_multimodal_bypass_and_lineage() {
         const uint64_t ep_id = runtime.adopt_root(188, 188, 0, 1, 0);
         CHECK(ep_id != 0);
 
-        const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"worker1\":\"Task 1 pipeline verification\",\"worker2\":\"Task 2 pipeline verification\"}}");
+        const auto decision = server_rerot_parse_routing_decision(R"json({
+          "strategy": "dag",
+          "payload": {
+            "questions": [
+              {"id": "worker1", "intent": "Task 1 pipeline verification"},
+              {"id": "worker2", "intent": "Task 2 pipeline verification"}
+            ],
+            "depends_on": []
+          }
+        })json");
         CHECK(decision.is_dag());
         std::string err;
         CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -6683,7 +6975,16 @@ static void test_dag_synthesis_complementary_results_distinct_intents() {
     const uint64_t ep_id = runtime.adopt_root(95, 95, 0, 1, 0);
     CHECK(ep_id != 0);
 
-    const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"algebra\":\"Derive algebraic lemma: a^2 - b^2 = (a-b)(a+b)\",\"geometry\":\"Construct geometric dissection proof\"}}");
+    const auto decision = server_rerot_parse_routing_decision(R"json({
+      "strategy": "dag",
+      "payload": {
+        "questions": [
+          {"id": "algebra", "intent": "Derive algebraic lemma: a^2 - b^2 = (a-b)(a+b)"},
+          {"id": "geometry", "intent": "Construct geometric dissection proof"}
+        ],
+        "depends_on": []
+      }
+    })json");
     CHECK(decision.is_dag());
     std::string err;
     CHECK(runtime.initialize_dag(ep_id, decision, &err));
@@ -6943,7 +7244,16 @@ static void test_dag_tri_mtp_ram_shift_speculative_matrix() {
         const uint64_t ep_dag = runtime_dag.adopt_root(600, 600, 0, 1, 0);
         CHECK(ep_dag != 0);
 
-        const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"W1\":\"Calculate First Fact\",\"W2\":\"Calculate Second Fact\"}}");
+        const auto decision = server_rerot_parse_routing_decision(R"json({
+          "strategy": "dag",
+          "payload": {
+            "questions": [
+              {"id": "W1", "intent": "Calculate First Fact"},
+              {"id": "W2", "intent": "Calculate Second Fact"}
+            ],
+            "depends_on": []
+          }
+        })json");
         CHECK(decision.is_dag());
         std::string dag_err;
         CHECK(runtime_dag.initialize_dag(ep_dag, decision, &dag_err));
@@ -6993,7 +7303,13 @@ static void test_dag_tri_mtp_ram_shift_speculative_matrix() {
         CHECK(runtime_dag.erase_episode(ep_dag));
         const uint64_t ep_other = runtime_dag.adopt_root(700, 700, 0, 8, 0, 888);
         CHECK(ep_other == 888);
-        const auto other_dec = server_rerot_parse_routing_decision("{\"tasks\":{\"O1\":\"Other Worker\"}}", true);
+        const auto other_dec = server_rerot_parse_routing_decision(R"json({
+          "strategy": "dag",
+          "payload": {
+            "questions": [{"id": "O1", "intent": "Other Worker"}],
+            "depends_on": []
+          }
+        })json");
         std::string other_err;
         CHECK(runtime_dag.initialize_dag(ep_other, other_dec, &other_err));
         CHECK(runtime_dag.capture_c0(ep_other, 5, 0));
@@ -7060,7 +7376,13 @@ int main() {
         server_rerot_runtime runtime(nullptr);
         const uint64_t ep_id = runtime.adopt_root(15, 15, 0, 1, 0);
         CHECK(ep_id != 0);
-        const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"A\":\"Fact A\"}}", true);
+        const auto decision = server_rerot_parse_routing_decision(R"({
+          "strategy": "dag",
+          "payload": {
+            "questions": [{"id": "A", "intent": "Fact A"}],
+            "depends_on": []
+          }
+        })");
         std::string err;
         CHECK(runtime.initialize_dag(ep_id, decision, &err));
         auto * ep = runtime.episode(ep_id);
@@ -7087,7 +7409,13 @@ int main() {
         server_rerot_runtime runtime(nullptr);
         const uint64_t ep_id = runtime.adopt_root(16, 16, 0, 1, 0);
         CHECK(ep_id != 0);
-        const auto decision = server_rerot_parse_routing_decision("{\"tasks\":{\"1\":\"Worker 1\"}}", true);
+        const auto decision = server_rerot_parse_routing_decision(R"({
+          "strategy": "dag",
+          "payload": {
+            "questions": [{"id": "1", "intent": "Worker 1"}],
+            "depends_on": []
+          }
+        })");
         CHECK(decision.is_dag());
         std::string err;
         CHECK(runtime.initialize_dag(ep_id, decision, &err));

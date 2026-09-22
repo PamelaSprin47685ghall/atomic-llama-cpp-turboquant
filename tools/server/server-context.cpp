@@ -162,18 +162,11 @@ enum class server_rerot_injection_kind : uint8_t {
 
 // A routing plan is a few short lines by construction — that is the entire
 // point of the dependency-line DSL. Probe tokens are deliberately excluded
-// from the user's n_predict budget and from the episode visibility counters.
-//
-// With the lazy grammar the model may think in free text before opening a plan,
-// and choosing never to open one is a legitimate outcome (it falls back to an
-// ordinary single-stream answer). The budget therefore has to be large enough
-// for thinking plus a plan, while still bounding the case where the model loops
-// forever without ever committing to either (observed before the cap: 240s of
-// plan-shaped rambling with zero bytes streamed to the client).
-//
-// 4096 keeps that guarantee against an unbounded hang while leaving room for the
-// observed thinking length (a few hundred tokens) and the plan itself.
-static constexpr uint64_t SERVER_REROT_PROBE_MAX_TOKENS = 4096;
+// from the user's n_predict budget and from the episode visibility counters,
+// so without this cap a plan that never emits the blank-line terminator would
+// ramble until the whole context is full (observed: model looping plan lines
+// for 240s with zero bytes streamed). Fail closed well before that.
+static constexpr uint64_t SERVER_REROT_PROBE_MAX_TOKENS = 512;
 static constexpr size_t SERVER_REROT_PRIVATE_BATCH = 32;
 
 static bool server_rerot_private_microbatch(server_rerot_injection_kind injection) {
@@ -2455,23 +2448,8 @@ private:
             COMMON_GRAMMAR_TYPE_USER,
             server_rerot_routing_grammar(),
         };
-        // Lazy + pattern trigger: the model may think for as long as it needs in
-        // free text, and the GBNF only takes over once the plan object opens.
-        // Previously the grammar was eager, so the template line had to be the
-        // very last thing in the prompt (any thinking before the plan was
-        // impossible: the first sampled token had to be '{'), which is why the
-        // probe had to start immediately after the example.
-        //
-        // The trigger is the opening brace followed by the first key: matching
-        // only '{' would also fire on a brace inside ordinary prose, while the
-        // explicit "tasks" prefix makes the match unambiguous. The pattern is a
-        // non-anchored regex (common_grammar_sampler_init), so it activates on a
-        // SUFFIX of whatever the model wrote. '\{' is escaped for the regex;
-        // '\s*' tolerates pretty-printed JSON.
-        params.sampling.grammar_lazy = true;
-        params.sampling.grammar_triggers = {
-            { COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN, "\\{\\s*\"tasks\"" },
-        };
+        params.sampling.grammar_lazy = false;
+        params.sampling.grammar_triggers.clear();
         params.sampling.preserved_tokens.clear();
     }
 
@@ -4232,20 +4210,16 @@ private:
             slot.rerot_inflight_extra_plans.clear();
             slot.rerot_inflight_extra_bytes.clear();
             slot.rerot_inflight_forced = false;
-            // The model is free to never emit a plan: the lazy grammar only takes
-            // over once it opens the plan object, so thinking that never produces
-            // one is a legitimate outcome, not a failure. Once the budget for
-            // that decision is spent, stop probing and continue as an ordinary
-            // single-stream answer over the pristine C0 state. Aborting here
-            // would turn "the model chose to just answer" into a 500.
+            // Nothing else bounds the probe (see SERVER_REROT_PROBE_MAX_TOKENS):
+            // a plan that never terminates must fail closed, not burn the context.
             if (episode_now->probe_tokens > SERVER_REROT_PROBE_MAX_TOKENS) {
-                if (slot.task && slot.task->params.rerot_trace) {
-                    SRV_INF("rerot.trace.probe_none: episode=%" PRIu64 " tokens=%" PRIu64
-                            " bytes=%zu reason=budget\n",
-                        episode_id, episode_now->probe_tokens, episode_now->probe_bytes.size());
-                }
-                rerot_prof_phase_exit(llama_rerot_phase::probe);
-                return rerot_enter_simple(slot, episode_id);
+                rerot->hard_abort(
+                    episode_id,
+                    string_format(
+                        "rerot_resource_exhausted: routing probe exceeded %" PRIu64
+                        " tokens without a plan terminator",
+                        SERVER_REROT_PROBE_MAX_TOKENS));
+                return false;
             }
             return rerot_try_finish_probe(slot);
         }
@@ -4837,23 +4811,11 @@ private:
             if (llama_vocab_is_eog(vocab, id)) {
                 const auto * ep = rerot ? rerot->episode(slot.rerot_episode_id) : nullptr;
                 const bool undecided_probe = ep && ep->probing && !ep->strategy_decided;
-                if (undecided_probe) {
-                    // The model ended its turn without ever opening a plan: with a
-                    // lazy grammar that is a normal outcome (it simply answered).
-                    // Drop the probe and continue as an ordinary single stream on
-                    // the pristine C0 state; only a real child lane that closes
-                    // before its delimiter is a protocol violation.
-                    if (slot.task && slot.task->params.rerot_trace) {
-                        SRV_INF("rerot.trace.probe_none: episode=%" PRIu64 " tokens=%" PRIu64
-                                " bytes=%zu reason=eog\n",
-                            slot.rerot_episode_id, ep->probe_tokens, ep->probe_bytes.size());
-                    }
-                    rerot_prof_phase_exit(llama_rerot_phase::probe);
-                    return rerot_enter_simple(slot, slot.rerot_episode_id);
-                }
                 rerot->hard_abort(
                     slot.rerot_episode_id,
-                    "rerot_protocol_error: EOG sampled before the current child delimiter closed");
+                    undecided_probe
+                        ? "rerot_protocol_error: EOG sampled while the routing plan was still undecided"
+                        : "rerot_protocol_error: EOG sampled before the current child delimiter closed");
                 return false;
             }
             slot.sampled = id;
