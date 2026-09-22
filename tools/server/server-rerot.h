@@ -177,8 +177,9 @@ private:
 std::string_view server_rerot_planner_prompt();
 std::string_view server_rerot_planner_grammar();
 std::string_view server_rerot_routing_probe_prompt();
-// Flat GBNF for the Makefile-style dependency line DSL. Returned verbatim;
-// no JSON-Schema-to-Grammar conversion is involved (AGENTS.md §02).
+// Compact Dict JSON Schema for the routing probe (AGENTS.md §02.4).
+std::string server_rerot_routing_schema_json();
+// GBNF produced from that schema by json_schema_to_grammar().
 std::string server_rerot_routing_grammar();
 std::string server_rerot_source_end_grammar(std::string_view close_marker);
 // Eager grammar for one child: arbitrary text must eventually terminate with
@@ -361,14 +362,19 @@ struct server_rerot_routing_decision {
     std::vector<server_rerot_dag_plan_item> questions;
     std::vector<server_rerot_dag_edge> dependencies;
     std::string error;
+    // Set when the text is not yet syntactically complete JSON: the probe is
+    // still streaming and must keep sampling. A syntactically complete plan
+    // that fails validation is final and fails closed immediately instead.
+    bool incomplete = false;
 
     bool is_simple() const { return strategy == strategy_type::simple; }
     bool is_dag() const { return strategy == strategy_type::dag && error.empty(); }
 };
 
-// Parses and strictly validates one routing probe decision in the
-// dependency line DSL according to AGENTS.md §02.4 & §02.6 (fail-closed:
-// any parse or graph defect leaves strategy invalid with a non-empty error).
+// Parses and strictly validates one routing probe decision in the Compact
+// Dict JSON wire format ({"tasks":{...},"deps":{...}}) per AGENTS.md §02.4 &
+// §02.6 (fail-closed: any parse, shape or graph defect leaves strategy invalid
+// with a non-empty error; nothing is repaired, dropped or reordered).
 // force_single_node_dag: a single node with no dependency edges maps to
 // strategy_type::simple (§02.3 single-task passthrough) unless the caller
 // explicitly keeps single-worker DAG mode (Stage-5 DAG tests).

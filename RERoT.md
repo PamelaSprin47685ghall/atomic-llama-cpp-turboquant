@@ -336,12 +336,12 @@ KV allocator 的“head/cursor”也不是通用 checkpoint。Unified KV 有共�
   C0
    └──→ 隔离 probe branch
             ↓
-        依赖行 DSL 计划（空行终止）
-            ├─ 单节点（无依赖边）→ simple
+        Compact Dict JSON 计划
+            ├─ 单任务无依赖 → simple
             │    → 丢弃 probe branch
             │    → 原 C0 sampler/state 继续
             │
-            └─ 多节点/含依赖 → dag
+            └─ 多任务或含依赖 → dag
                  → 校验整张计划
                  → 丢弃 probe branch
                  → 从 C0 构建正式规划边界 P
@@ -351,58 +351,66 @@ KV allocator 的“head/cursor”也不是通用 checkpoint。Unified KV 有共�
 
 “隔离”不是因为 PRIVATE 可以消除因果影响，而是反过来：**PRIVATE 不能从已经运行过的 recurrent/sampler 里扣掉。** 要得到干净 simple continuation，必须保留真正的 C0 边界。
 
-### 4.3 路由 DSL
+### 4.3 路由 JSON（Compact Dict JSON）
 
-正式路由探针不再是 JSON，而是超轻量的 Makefile 风格依赖行 DSL：低熵、零键名、无括号语法噪音（写入 Token 中语法噪音 > 65% 的 JSON 方案已废除）。单节点计划即普通续写，线上不再出现 `direct` 关键字。
+路由探针的输出格式为**极简扁平键值对 JSON**：`tasks` 先给出全部任务与意图，`deps` 再集中给出依赖连线。这一顺序符合正常思维序（先想清楚要做哪些事，再决定谁依赖谁），避免「生成意图前先决定依赖图」的因果倒置；同时没有 `strategy` / `payload` / `questions` / `depends_on_id` 这些冗余层级，写 Token 显著低于旧 schema，也无需任何语法长篇说明——JSON 是模型的原生先验（此前试用的 Makefile 行式 DSL `ID [<- DEPS]: INTENT` 因 Prompt 解释开销与因果倒置问题**已作废并清理**）。
 
-隔离 probe 注入的单行指令（末尾必须紧跟换行，保证模型首颗 Token 命中首个任务 ID、首行不粘连）：
-
-```text
-Plan 1+ tasks as DAG (ID [<- DEPS]: INTENT, no preamble, end with blank line):
-```
-
-约束文法由 `server_rerot_routing_grammar()` 直接返回字面 GBNF，不再经过 JSON Schema→grammar 转换器：
-
-```gbnf
-root ::= dag-line ("\n" dag-line)* "\n\n"
-dag-line ::= id (" <- " deps)? ": " intent
-deps ::= id (", " id)*
-id ::= [A-Za-z0-9_-]+
-intent ::= [^\r\n]+
-```
-
-1. 首字符必须是 `[A-Za-z0-9_-]`，物理屏蔽一切 preamble（`Sure,` 等废话进不来）；
-2. 依赖声明可选，多依赖用 `, ` 分隔；
-3. 冒号与意图之间必须是 `: `；
-4. 空行（`\n\n`）终止整张计划。`rerot_try_finish_probe()` 只在采到终止空行后才裁决：DSL 的任何行前缀单独看都是合法单节点，提前裁决会把半张计划误判成 simple。
-
-语义映射：单节点且无依赖边 → `strategy_type::simple`（丢弃 probe、恢复 C0 续写）；多节点或显式依赖边 → `strategy_type::dag`，走正式 P 注入、C_base 捕获与多 Lane 调度。Stage-5 单 worker DAG 测试经 `force_single_node_dag` 显式维持 dag 模式。
-
-正确单节点（simple）：
+隔离 probe 注入的单行模板（末尾带换行，首颗 Token 直接落进对象体，不粘连）：
 
 ```text
-A: 计算第一项所需事实
+Plan in JSON: {"tasks":{"A":"...","B":"..."},"deps":{"B":["A"]}}
 ```
 
-正确 DAG 例子：
+> 注：示例必须**自洽**——`deps` 里出现的每个 id 都要在 `tasks` 中声明。早期模板写成 `{"tasks":{"A":"..."},"deps":{"C":["A"]}}`，模型会忠实照抄出「未声明的 C」而被 fail-closed 拒绝（真机实测：`unknown endpoint in dependency: C`），故示例改为声明 A、B 后令 B 依赖 A。
 
-```text
-A: 计算第一项所需事实
-B: 独立检查第二项
-C <- A: 使用 A 的结果继续推导
+多任务 DAG 形态：
+
+```json
+{
+  "tasks": {
+    "A": "计算第一项所需事实",
+    "B": "独立检查第二项",
+    "C": "使用 A 的结果继续推导"
+  },
+  "deps": { "C": ["A"] }
+}
 ```
 
-A、B 可同时开始；A SEALED 后 C 可启动，不等 B 完成；B 与 C 可以继续实时共享 PUBLIC。
+单任务（= 直接/简单路线）时 `deps` 可省略或为 `{}`：
+
+```json
+{ "tasks": { "A": "直接回答用户问题" } }
+```
+
+Schema（`server_rerot_routing_schema_json()`，经 `json_schema_to_grammar()` 生成探针 GBNF）：
+
+```json
+{
+  "type": "object",
+  "required": ["tasks"],
+  "additionalProperties": false,
+  "properties": {
+    "tasks": { "type": "object", "minProperties": 1,
+               "additionalProperties": { "type": "string", "minLength": 1 } },
+    "deps":  { "type": "object",
+               "additionalProperties": { "type": "array", "items": { "type": "string", "minLength": 1 } } }
+  }
+}
+```
+
+强制分层：`minLength` / `additionalProperties:false` 由**文法**物理屏蔽；转换器未渲染 `minProperties`，故「空 `tasks` 对象」由**解析器**拒绝。解析器同时 fail-closed 校验：重复 JSON 成员（nlohmann 会静默保留最后一个，必须先拒绝）、id/intent 非空且非纯空白、保留 id `"0"`、未知依赖端点、自环、重复边、Kahn 全拓扑覆盖（有环则整张图拒绝）。
+
+语义映射：单任务且无依赖边 → `strategy_type::simple`（丢弃 probe、恢复 C0 续写）；多任务或显式依赖边 → `strategy_type::dag`（正式 P 注入、C_base 捕获与多 Lane 调度）。Stage-5 单 worker DAG 测试经 `force_single_node_dag` 显式维持 dag 模式。
 
 ### 4.4 控制面语义校验
 
 grammar 只负责结构子集。正式计划提交前还必须：
 
-1. 按行可解析：缺冒号、空意图/空 ID、行内空行一律拒绝。
-2. `questions` 非空；ID、intent 非空且非纯空白。
+1. `tasks` 为 JSON 对象且非空；无重复 JSON 成员；缺 `tasks` 或空 `tasks` 一律拒绝。
+2. ID、intent 非空且非纯空白。
 3. ID 唯一；`0` 保留给内部主体阶段。
 4. questions 数组顺序固定为 `plan_rank`。
-5. `depends_on` 转成 `u → v`。
+5. `deps` 的 `{id: [dep_id...]}` 转成 `dep_id → id`。
 6. 拒绝未知端点、自环、重复边。
 7. Kahn 必须消费全部工作节点，否则整张计划拒绝。
 8. runtime 自动建立 `0.plan` 的公共起点语义和“全部工作 → 0.synthesize”的最终条件。
@@ -429,7 +437,7 @@ simple 恢复后必须证明：
 
 当前 HEAD 已有：
 
-- `server_rerot_routing_probe_prompt()`（单行 DSL 指令，末尾带换行）；
+- `server_rerot_routing_schema_json()`（Compact Dict JSON Schema）/ `server_rerot_routing_probe_prompt()`（单行模板，末尾带换行）；
 - `server_rerot_routing_grammar()`；
 - `server_rerot_parse_routing_decision()`，含 duplicate IDs/edges、自环、unknown endpoint、Kahn cycle check；
 - `capture_c0()` / `rerot_start_root()` / `rerot_try_finish_probe()`；

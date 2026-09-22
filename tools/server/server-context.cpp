@@ -3239,22 +3239,17 @@ private:
         if (!episode || !episode->probing || episode->strategy_decided) {
             return true;
         }
-        // Every prefix of a probe is individually line-well-formed, so a
-        // strategy may only be decided once the grammar's blank-line
-        // terminator has actually been sampled (any prefix would otherwise
-        // look like a complete single-task plan).
-        if (episode->probe_bytes.size() < 2 ||
-            episode->probe_bytes.compare(
-                episode->probe_bytes.size() - 2, 2, "\n\n") != 0) {
+        const auto decision = server_rerot_parse_routing_decision(episode->probe_bytes);
+        if (decision.incomplete) {
+            // Truncated JSON: the probe is still streaming. The grammar admits
+            // no malformed object, so this cannot be a corrupt plan.
             return true;
         }
-        const auto decision = server_rerot_parse_routing_decision(episode->probe_bytes);
         if (!decision.error.empty()) {
-            // The routing grammar can only complete at the blank-line terminator,
-            // so a plan rejected here is final: no later token can extend it.
-            // Report the parser's own diagnosis immediately instead of letting
-            // the sampler emit EOG and surfacing an unrelated delimiter error
-            // (which also costs one extra decode step before failing closed).
+            // Syntactically complete JSON that fails validation is final: no
+            // later token can repair it. Report the parser's own diagnosis
+            // immediately instead of letting the sampler emit EOG and surfacing
+            // an unrelated delimiter error.
             if (slot.task && slot.task->params.rerot_trace) {
                 SRV_INF("rerot.trace.probe_reject: episode=%" PRIu64 " bytes=%zu error=%s plan=%s\n",
                     slot.rerot_episode_id, episode->probe_bytes.size(),

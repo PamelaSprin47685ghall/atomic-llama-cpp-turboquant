@@ -17,6 +17,10 @@
 #include <set>
 #include <unordered_set>
 #include <utility>
+#include <initializer_list>
+#include <nlohmann/json.hpp>
+
+using json = nlohmann::json;
 
 namespace {
 
@@ -168,6 +172,163 @@ bool dag_node_in_started_set(const server_rerot_episode & ep, llama_rerot_node_i
         default:
             return false;
     }
+}
+
+void skip_json_ws(std::string_view text, size_t & pos) {
+    while (pos < text.size() && ascii_space(static_cast<unsigned char>(text[pos]))) {
+        ++pos;
+    }
+}
+
+bool skip_json_string(std::string_view text, size_t & pos) {
+    if (pos >= text.size() || text[pos] != '"') {
+        return false;
+    }
+    ++pos;
+    while (pos < text.size()) {
+        if (text[pos] == '\\') {
+            pos += (pos + 1 < text.size()) ? 2 : 1;
+            continue;
+        }
+        if (text[pos] == '"') {
+            ++pos;
+            return true;
+        }
+        ++pos;
+    }
+    return false;
+}
+
+bool json_value_has_duplicate_keys(std::string_view text, size_t & pos);
+
+bool json_object_has_duplicate_keys(std::string_view text, size_t & pos) {
+    if (pos >= text.size() || text[pos] != '{') {
+        return true;
+    }
+    ++pos;
+    skip_json_ws(text, pos);
+    std::unordered_set<std::string> keys;
+    if (pos < text.size() && text[pos] == '}') {
+        ++pos;
+        return false;
+    }
+    while (pos < text.size()) {
+        skip_json_ws(text, pos);
+        const size_t key_begin = pos;
+        if (!skip_json_string(text, pos)) {
+            return true;
+        }
+        if (!keys.insert(std::string(text.substr(key_begin, pos - key_begin))).second) {
+            return true;
+        }
+        skip_json_ws(text, pos);
+        if (pos >= text.size() || text[pos] != ':') {
+            return true;
+        }
+        ++pos;
+        skip_json_ws(text, pos);
+        if (json_value_has_duplicate_keys(text, pos)) {
+            return true;
+        }
+        skip_json_ws(text, pos);
+        if (pos < text.size() && text[pos] == ',') {
+            ++pos;
+            continue;
+        }
+        if (pos < text.size() && text[pos] == '}') {
+            ++pos;
+            return false;
+        }
+        return true;
+    }
+    return true;
+}
+
+bool json_array_has_duplicate_keys(std::string_view text, size_t & pos) {
+    if (pos >= text.size() || text[pos] != '[') {
+        return true;
+    }
+    ++pos;
+    skip_json_ws(text, pos);
+    if (pos < text.size() && text[pos] == ']') {
+        ++pos;
+        return false;
+    }
+    while (pos < text.size()) {
+        skip_json_ws(text, pos);
+        if (json_value_has_duplicate_keys(text, pos)) {
+            return true;
+        }
+        skip_json_ws(text, pos);
+        if (pos < text.size() && text[pos] == ',') {
+            ++pos;
+            continue;
+        }
+        if (pos < text.size() && text[pos] == ']') {
+            ++pos;
+            return false;
+        }
+        return true;
+    }
+    return true;
+}
+
+bool json_value_has_duplicate_keys(std::string_view text, size_t & pos) {
+    skip_json_ws(text, pos);
+    if (pos >= text.size()) {
+        return true;
+    }
+    const char ch = text[pos];
+    if (ch == '{') {
+        return json_object_has_duplicate_keys(text, pos);
+    }
+    if (ch == '[') {
+        return json_array_has_duplicate_keys(text, pos);
+    }
+    if (ch == '"') {
+        return !skip_json_string(text, pos);
+    }
+    if (ch == 't' || ch == 'f' || ch == 'n' || ch == '-' || (ch >= '0' && ch <= '9')) {
+        while (pos < text.size() && !ascii_space(static_cast<unsigned char>(text[pos])) &&
+               text[pos] != ',' && text[pos] != '}' && text[pos] != ']') {
+            ++pos;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool json_text_has_duplicate_keys(std::string_view text) {
+    size_t pos = 0;
+    skip_json_ws(text, pos);
+    if (json_value_has_duplicate_keys(text, pos)) {
+        return true;
+    }
+    skip_json_ws(text, pos);
+    return pos != text.size();
+}
+
+bool json_object_has_only_keys(
+        const json & object,
+        std::initializer_list<const char *> allowed,
+        std::string * error,
+        const char * context) {
+    for (auto it = object.begin(); it != object.end(); ++it) {
+        bool ok = false;
+        for (const char * key : allowed) {
+            if (it.key() == key) {
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) {
+            if (error) {
+                *error = std::string("unexpected field '") + it.key() + "' in " + context;
+            }
+            return false;
+        }
+    }
+    return true;
 }
 
 void skip_ascii_space(std::string_view text, size_t & pos, size_t end) {
@@ -836,25 +997,48 @@ std::string server_rerot_format_plan_prefix(
 }
 
 std::string_view server_rerot_routing_probe_prompt() {
-    // Fixed one-line instruction injected after C0 capture. The trailing
-    // newline forces the model's first sampled token to start the first task
-    // line, so no preamble can glue onto the instruction.
+    // Fixed one-line template injected after C0 capture. A single example is
+    // enough: JSON is native to the model and needs no syntax lecture. The
+    // trailing newline keeps the first sampled token inside the object (no
+    // glued preamble).
     static constexpr std::string_view prompt =
-        "Plan 1+ tasks as DAG (ID [<- DEPS]: INTENT, no preamble, end with blank line):\n";
+        "Plan in JSON: {\"tasks\":{\"A\":\"...\",\"B\":\"...\"},\"deps\":{\"B\":[\"A\"]}}\n";
     return prompt;
 }
 
+std::string server_rerot_routing_schema_json() {
+    // Compact dict: every task with its intent first, dependency edges after —
+    // the natural order of thought, with no strategy/payload/question fat.
+    return R"({
+  "type": "object",
+  "required": ["tasks"],
+  "additionalProperties": false,
+  "properties": {
+    "tasks": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "deps": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+})";
+}
+
 std::string server_rerot_routing_grammar() {
-    // Flat, deterministic GBNF for the dependency line DSL: the first
-    // character must be an id character (preamble is physically excluded)
-    // and a blank line terminates the plan. Returned verbatim — no
-    // JSON-Schema conversion.
-    return R"(root ::= dag-line ("\n" dag-line)* "\n\n"
-dag-line ::= id (" <- " deps)? ": " intent
-deps ::= id (", " id)*
-id ::= [A-Za-z0-9_-]+
-intent ::= [^\r\n]+
-)";
+    const auto schema = nlohmann::ordered_json::parse(server_rerot_routing_schema_json());
+    return json_schema_to_grammar(schema);
 }
 
 std::string server_rerot_source_end_grammar(std::string_view close_marker) {
@@ -877,173 +1061,114 @@ std::string server_rerot_source_end_grammar(std::string_view close_marker) {
     }, options);
 }
 
-// ASCII trim over a borrowed slice: no allocation, no copying.
-static std::string_view trim_dsl_view(std::string_view text) {
-    size_t begin = 0;
-    size_t end = text.size();
-    while (begin < end && ascii_space(static_cast<unsigned char>(text[begin]))) {
-        ++begin;
-    }
-    while (end > begin && ascii_space(static_cast<unsigned char>(text[end - 1]))) {
-        --end;
-    }
-    return text.substr(begin, end - begin);
-}
-
-// Task/dependency id class of the routing grammar: [A-Za-z0-9_-]+.
-static bool valid_dsl_id(std::string_view id) {
-    if (id.empty()) {
-        return false;
-    }
-    for (const char ch : id) {
-        const bool ok = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
-                        (ch >= '0' && ch <= '9') || ch == '_' || ch == '-';
-        if (!ok) {
-            return false;
-        }
-    }
-    return true;
-}
-
+// Parses one routing probe decision. Compact Dict JSON wire format:
+//   {"tasks":{"A":"intent",...}}[,"deps":{"C":["A"],...}}]
+// Fail-closed: syntax, shape, id and graph defects each leave strategy invalid
+// with a non-empty error; nothing is repaired, dropped or reordered.
 server_rerot_routing_decision server_rerot_parse_routing_decision(
         const std::string & text,
         bool force_single_node_dag) {
     server_rerot_routing_decision result;
 
-    // Linear scan over borrowed views of `text`; strings are copied only
-    // into the decision itself. Trailing blank lines are ignored (the
-    // grammar closes every plan with "\n\n"); any interior blank line or
-    // malformed head is a hard failure — never a repair.
-    size_t content_end = text.size();
-    while (content_end > 0 && text[content_end - 1] == '\n') {
-        --content_end;
-    }
-
-    std::unordered_set<std::string_view> known_ids;
-    // Dependency endpoints borrowed from `text` for the second pass: a line
-    // may forward-reference an id declared on a later line.
-    std::vector<std::pair<std::string_view, std::string_view>> raw_edges;
-    const auto fail_line = [&](size_t line_no, std::string message) {
-        result.error =
-            "line " + std::to_string(line_no) + ": " + std::move(message);
-    };
-
-    uint32_t rank = 0;
-    size_t line_no = 0;
-    size_t pos = 0;
-    while (pos < content_end) {
-        size_t nl = text.find('\n', pos);
-        if (nl == std::string::npos || nl > content_end) {
-            nl = content_end;
-        }
-        const std::string_view line(text.data() + pos, nl - pos);
-        pos = nl + 1;
-        ++line_no;
-
-        if (line.empty()) {
-            fail_line(line_no, "blank line inside plan");
-            return result;
-        }
-        // The first ':' separates the head from the intent; an id can never
-        // contain ':' so the split is unambiguous.
-        const size_t colon = line.find(':');
-        if (colon == std::string_view::npos) {
-            fail_line(line_no, "missing ':' separator");
-            return result;
-        }
-        const std::string_view head = trim_dsl_view(line.substr(0, colon));
-        const std::string_view intent = trim_dsl_view(line.substr(colon + 1));
-        if (head.empty()) {
-            fail_line(line_no, "task id must not be empty or whitespace-only");
-            return result;
-        }
-        if (intent.empty()) {
-            fail_line(line_no, "intent must not be empty or whitespace-only");
-            return result;
-        }
-
-        std::string_view id = head;
-        std::string_view deps_part;
-        const size_t arrow = head.find(" <- ");
-        if (arrow != std::string_view::npos) {
-            id = trim_dsl_view(head.substr(0, arrow));
-            deps_part = head.substr(arrow + 4);
-        }
-        if (!valid_dsl_id(id)) {
-            fail_line(line_no, "invalid task id '" + std::string(id) + "'");
-            return result;
-        }
-        if (id == "0") {
-            fail_line(line_no, "id '0' is reserved for main synthesis");
-            return result;
-        }
-        if (!known_ids.insert(id).second) {
-            fail_line(line_no, "duplicate question id: " + std::string(id));
-            return result;
-        }
-
-        if (arrow != std::string_view::npos) {
-            size_t dep_pos = 0;
-            while (true) {
-                const size_t comma = deps_part.find(',', dep_pos);
-                const std::string_view dep = trim_dsl_view(
-                    comma == std::string_view::npos
-                        ? deps_part.substr(dep_pos)
-                        : deps_part.substr(dep_pos, comma - dep_pos));
-                if (dep.empty()) {
-                    fail_line(
-                        line_no,
-                        "dependency id must not be empty or whitespace-only");
-                    return result;
-                }
-                if (!valid_dsl_id(dep)) {
-                    fail_line(
-                        line_no,
-                        "invalid dependency id '" + std::string(dep) + "'");
-                    return result;
-                }
-                raw_edges.emplace_back(dep, id);
-                if (comma == std::string_view::npos) {
-                    break;
-                }
-                dep_pos = comma + 1;
-            }
-        }
-
-        result.questions.push_back({std::string(id), std::string(intent), rank});
-        ++rank;
-    }
-
-    if (result.questions.empty()) {
-        result.error = "routing plan has no tasks";
+    json root_json;
+    try {
+        root_json = json::parse(text);
+    } catch (const std::exception & e) {
+        // In practice only truncation reaches here (the grammar admits no
+        // malformed object): keep sampling until the probe terminator decides.
+        result.incomplete = true;
+        result.error = "incomplete JSON: " + std::string(e.what());
         return result;
     }
 
-    // Graph semantics over the complete id set: unknown endpoint (a dep
-    // never declared at line start), self-loop, duplicate edge — then a full
-    // Kahn sweep that rejects any cycle outright. Fail-closed: no edge or
-    // node is ever dropped to make a broken graph look valid.
-    std::set<std::pair<std::string, std::string>> seen_edges;
-    for (const auto & [from, to] : raw_edges) {
-        if (!known_ids.count(from) || !known_ids.count(to)) {
-            result.error =
-                "unknown endpoint in dependency: " + std::string(from) +
-                " -> " + std::string(to);
-            return result;
-        }
-        if (from == to) {
-            result.error = "self-loop dependency: " + std::string(to);
-            return result;
-        }
-        if (!seen_edges.emplace(std::string(from), std::string(to)).second) {
-            result.error =
-                "duplicate dependency edge: " + std::string(from) +
-                " -> " + std::string(to);
-            return result;
-        }
-        result.dependencies.push_back({std::string(from), std::string(to)});
+    // Duplicate-member scan runs AFTER the parse: the scanner reports malformed
+    // input as a duplicate, and truncation must stay classified as `incomplete`.
+    // nlohmann keeps the last duplicate member, so an ambiguous object would be
+    // silently repaired - reject it outright instead.
+    if (json_text_has_duplicate_keys(text)) {
+        result.error = "duplicate JSON object members are not allowed";
+        return result;
     }
 
+    if (!root_json.is_object()) {
+        result.error = "routing decision must be a JSON object";
+        return result;
+    }
+    if (!json_object_has_only_keys(root_json, {"tasks", "deps"}, &result.error, "routing root")) {
+        return result;
+    }
+    const auto tasks_it = root_json.find("tasks");
+    if (tasks_it == root_json.end() || !tasks_it->is_object() || tasks_it->empty()) {
+        result.error = "missing or empty \"tasks\" object";
+        return result;
+    }
+
+    std::unordered_set<std::string> known_ids;
+    uint32_t rank = 0;
+    for (auto it = tasks_it->begin(); it != tasks_it->end(); ++it) {
+        const std::string id = it.key();
+        if (!it->is_string()) {
+            result.error = "intent for task '" + id + "' must be a string";
+            return result;
+        }
+        const std::string intent = it->get<std::string>();
+        if (id.empty() || only_ascii_space(id) || intent.empty() || only_ascii_space(intent)) {
+            result.error = "id and intent must not be empty or whitespace-only";
+            return result;
+        }
+        if (id == "0") {
+            result.error = "id '0' is reserved for main synthesis";
+            return result;
+        }
+        if (!known_ids.insert(id).second) {
+            result.error = "duplicate question id: " + id;
+            return result;
+        }
+        result.questions.push_back({id, intent, rank++});
+    }
+
+    const auto deps_it = root_json.find("deps");
+    if (deps_it != root_json.end()) {
+        if (!deps_it->is_object()) {
+            result.error = "\"deps\" must be an object";
+            return result;
+        }
+        std::set<std::pair<std::string, std::string>> seen_edges;
+        for (auto it = deps_it->begin(); it != deps_it->end(); ++it) {
+            const std::string to_id = it.key();
+            if (!known_ids.count(to_id)) {
+                result.error = "unknown endpoint in dependency: " + to_id;
+                return result;
+            }
+            if (!it->is_array()) {
+                result.error = "dependency list for '" + to_id + "' must be an array";
+                return result;
+            }
+            for (const auto & dep : *it) {
+                if (!dep.is_string()) {
+                    result.error = "dependency ids must be strings";
+                    return result;
+                }
+                const std::string from_id = dep.get<std::string>();
+                if (from_id.empty() || only_ascii_space(from_id) || !known_ids.count(from_id)) {
+                    result.error = "unknown endpoint in dependency: " + from_id + " -> " + to_id;
+                    return result;
+                }
+                if (from_id == to_id) {
+                    result.error = "self-loop dependency: " + to_id;
+                    return result;
+                }
+                if (!seen_edges.emplace(from_id, to_id).second) {
+                    result.error = "duplicate dependency edge: " + from_id + " -> " + to_id;
+                    return result;
+                }
+                result.dependencies.push_back({from_id, to_id});
+            }
+        }
+    }
+
+    // Kahn topological sweep over the declared id set: a cycle rejects the whole
+    // plan; a partial topology is never published in place of the real graph.
     std::unordered_map<std::string, int> in_degree;
     std::unordered_map<std::string, std::vector<std::string>> adj;
     for (const auto & q : result.questions) {
@@ -1053,7 +1178,6 @@ server_rerot_routing_decision server_rerot_parse_routing_decision(
         in_degree[edge.to_id]++;
         adj[edge.from_id].push_back(edge.to_id);
     }
-
     std::queue<std::string> q;
     for (const auto & [qid, deg] : in_degree) {
         if (deg == 0) {
@@ -1076,9 +1200,8 @@ server_rerot_routing_decision server_rerot_parse_routing_decision(
         return result;
     }
 
-    // §02.3 single-task passthrough: one node and no edges is an ordinary
-    // single-stream continuation; anything else takes the DAG path. Stage-5
-    // single-worker DAG tests keep dag mode via force_single_node_dag.
+    // §02.3 single-task passthrough: one task and no dependency edges is an
+    // ordinary single-stream continuation; anything else runs the DAG path.
     result.strategy = (!force_single_node_dag && result.questions.size() == 1 &&
                        result.dependencies.empty())
         ? server_rerot_routing_decision::strategy_type::simple
