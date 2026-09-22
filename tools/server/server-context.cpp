@@ -2799,6 +2799,20 @@ private:
         episode->strategy_decided = false;
         if (rerot_prof_first_root) {
             llama_rerot_profile_begin((uint64_t) slot.task->id);
+            // §4.2 phase ledger: the C0 ordinary prefill completed BEFORE the
+            // first root adopted this episode (start_root runs at
+            // DONE_PROMPT), so a live normal_prefill window can never be
+            // observed. Accumulate the slot's own completed pp timing once
+            // here (same source as metrics.on_prompt_eval; includes any
+            // parked wait before admission, matching the request wall clock
+            // the user experienced). Parked roots keep the current behavior
+            // (prefill outside the ledger). No-op when profiling is off.
+            if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+                if (slot.t_prompt_processing > 0.0) {
+                    prof->phase_accumulate(llama_rerot_phase::normal_prefill,
+                        (uint64_t) (slot.t_prompt_processing * 1.0e3) /* ms->us */);
+                }
+            }
         }
         rerot_prof_phase_enter(llama_rerot_phase::probe);
         {

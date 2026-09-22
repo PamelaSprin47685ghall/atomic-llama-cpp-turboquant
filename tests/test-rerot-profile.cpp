@@ -577,6 +577,65 @@ static void test_profile_full_reset() {
 }
 
 // ----------------------------------------------------------------------------
+// Test (8b): Parallelism Ledger (§4.3) — mirrors the production accumulation
+// sites: snapshot_dag_logical_step (W/P/cohort per logical step),
+// advance_frontier (logical frontiers, DAG only), yield_dag_pen_for_ready
+// (physical time-slice boundaries). Locks the sum/max/CAS semantics the
+// [rerot-profile-parallel] summary line reads.
+// ----------------------------------------------------------------------------
+
+static void test_parallel_ledger() {
+    llama_rerot_profile prof;
+    prof.reset(1100);
+    CHECK_EQ(prof.parallel_snapshots.load(), 0);
+    CHECK_EQ(prof.sum_w.load(), 0);
+    CHECK_EQ(prof.max_w.load(), 0);
+    CHECK_EQ(prof.sum_p.load(), 0);
+    CHECK_EQ(prof.sum_cohort.load(), 0);
+    CHECK_EQ(prof.max_cohort.load(), 0);
+    CHECK_EQ(prof.logical_frontiers.load(), 0);
+    CHECK_EQ(prof.pen_yields.load(), 0);
+
+    // Two logical-step snapshots: W=5/P=6/cohort=3, then W=5/P=6/cohort=2
+    // (a member sealed between steps). Mirrors the snapshot site's exact
+    // fetch_add/store pattern including the non-atomic max_w/max_cohort
+    // store(std::max(...)) idiom.
+    for (const uint64_t cohort : {3ULL, 2ULL}) {
+        const uint64_t w = 5, p = 6;
+        prof.parallel_snapshots.fetch_add(1, std::memory_order_relaxed);
+        prof.sum_w.fetch_add(w, std::memory_order_relaxed);
+        prof.max_w.store(std::max(prof.max_w.load(std::memory_order_relaxed), w), std::memory_order_relaxed);
+        prof.sum_p.fetch_add(p, std::memory_order_relaxed);
+        prof.sum_cohort.fetch_add(cohort, std::memory_order_relaxed);
+        prof.max_cohort.store(
+            std::max(prof.max_cohort.load(std::memory_order_relaxed), cohort),
+            std::memory_order_relaxed);
+    }
+    CHECK_EQ(prof.parallel_snapshots.load(), 2);
+    CHECK_EQ(prof.sum_w.load(), 10);
+    CHECK_EQ(prof.max_w.load(), 5);
+    CHECK_EQ(prof.sum_p.load(), 12);
+    CHECK_EQ(prof.sum_cohort.load(), 5);
+    CHECK_EQ(prof.max_cohort.load(), 3);
+
+    // Frontier commits and pen yields
+    prof.logical_frontiers.fetch_add(1, std::memory_order_relaxed);
+    prof.logical_frontiers.fetch_add(1, std::memory_order_relaxed);
+    prof.pen_yields.fetch_add(1, std::memory_order_relaxed);
+    CHECK_EQ(prof.logical_frontiers.load(), 2);
+    CHECK_EQ(prof.pen_yields.load(), 1);
+
+    // Reset clears the whole parallel block
+    prof.reset(1101);
+    CHECK_EQ(prof.parallel_snapshots.load(), 0);
+    CHECK_EQ(prof.sum_w.load(), 0);
+    CHECK_EQ(prof.sum_p.load(), 0);
+    CHECK_EQ(prof.max_cohort.load(), 0);
+    CHECK_EQ(prof.logical_frontiers.load(), 0);
+    CHECK_EQ(prof.pen_yields.load(), 0);
+}
+
+// ----------------------------------------------------------------------------
 // Test (9): format_tsv Field Count Stability & Script Parsability
 // ----------------------------------------------------------------------------
 
@@ -632,12 +691,13 @@ static void test_format_tsv_stability() {
     // 1 (request_id)
     // + 9 * 3 (phases: us, max_us, count) = 27
     // + 4 * (1 hit + 6 rejections) = 28
+    // + 8 (parallelism: snapshots, sum_w, max_w, avg_p, avg_cohort, max_cohort, frontiers, pen_yields)
     // + 11 (layout)
     // + 14 (host & command: 11 + upload_staging_us + upload_set_us + upload_count)
     // + 9 (state & memory)
     // + 5 (computation)
-    // Total = 1 + 27 + 28 + 11 + 14 + 9 + 5 = 95
-    CHECK_EQ(line_count, 95);
+    // Total = 1 + 27 + 28 + 8 + 11 + 14 + 9 + 5 = 103
+    CHECK_EQ(line_count, 103);
     CHECK(found_req);
     CHECK(found_formal_p);
     CHECK(found_indexed_hit);
@@ -766,6 +826,7 @@ int main() {
     test_layout_counts_and_cas_hwm();
     test_bytes_and_host_metrics();
     test_counter_ownership_split();
+    test_parallel_ledger();
     test_sync_recording();
     test_bounded_ring_buffer_and_reset();
     test_profile_full_reset();

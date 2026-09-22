@@ -126,6 +126,20 @@ struct llama_rerot_profile {
     };
     phase_stat phases[(size_t) llama_rerot_phase::count];
 
+    // (1b) Parallelism / phase-shape ledger (§4.3 阶段与并行): W = logical
+    // DAG workers (episode nodes minus planner root), P = physical pen
+    // capacity, logical frontiers opened, and the W>P time-slices that each
+    // split one logical step into several physical slices. Waiting
+    // successors are recorded per snapshot as the cohort's pending members.
+    std::atomic<uint64_t> parallel_snapshots{0};
+    std::atomic<uint64_t> sum_w{0};
+    std::atomic<uint64_t> max_w{0};
+    std::atomic<uint64_t> sum_p{0};
+    std::atomic<uint64_t> sum_cohort{0};
+    std::atomic<uint64_t> max_cohort{0};
+    std::atomic<uint64_t> logical_frontiers{0};
+    std::atomic<uint64_t> pen_yields{0};
+
     // (2) Route hits and rejections
     struct route_stat {
         std::atomic<uint64_t> hits{0};

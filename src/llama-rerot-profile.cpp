@@ -121,6 +121,15 @@ void llama_rerot_profile::reset(uint64_t new_request_id) {
         }
     }
 
+    parallel_snapshots.store(0, std::memory_order_relaxed);
+    sum_w.store(0, std::memory_order_relaxed);
+    max_w.store(0, std::memory_order_relaxed);
+    sum_p.store(0, std::memory_order_relaxed);
+    sum_cohort.store(0, std::memory_order_relaxed);
+    max_cohort.store(0, std::memory_order_relaxed);
+    logical_frontiers.store(0, std::memory_order_relaxed);
+    pen_yields.store(0, std::memory_order_relaxed);
+
     live_groups.store(0, std::memory_order_relaxed);
     cap_groups.store(0, std::memory_order_relaxed);
     live_entries.store(0, std::memory_order_relaxed);
@@ -270,6 +279,14 @@ std::string llama_rerot_profile::format_tsv() const {
     ss << "cap_groups\t" << cap_groups.load(std::memory_order_relaxed) << "\n";
     ss << "live_entries\t" << live_entries.load(std::memory_order_relaxed) << "\n";
     ss << "cap_entries\t" << cap_entries.load(std::memory_order_relaxed) << "\n";
+    ss << "parallel_snapshots\t" << parallel_snapshots.load(std::memory_order_relaxed) << "\n";
+    ss << "sum_w\t" << sum_w.load(std::memory_order_relaxed) << "\n";
+    ss << "max_w\t" << max_w.load(std::memory_order_relaxed) << "\n";
+    ss << "avg_p\t" << (parallel_snapshots.load(std::memory_order_relaxed) > 0 ? sum_p.load(std::memory_order_relaxed) / parallel_snapshots.load(std::memory_order_relaxed) : 0) << "\n";
+    ss << "avg_cohort\t" << (parallel_snapshots.load(std::memory_order_relaxed) > 0 ? sum_cohort.load(std::memory_order_relaxed) / parallel_snapshots.load(std::memory_order_relaxed) : 0) << "\n";
+    ss << "max_cohort\t" << max_cohort.load(std::memory_order_relaxed) << "\n";
+    ss << "logical_frontiers\t" << logical_frontiers.load(std::memory_order_relaxed) << "\n";
+    ss << "pen_yields\t" << pen_yields.load(std::memory_order_relaxed) << "\n";
     ss << "actual_query_rows\t" << actual_query_rows.load(std::memory_order_relaxed) << "\n";
     ss << "reader_visible_keys_total\t" << reader_visible_keys_total.load(std::memory_order_relaxed) << "\n";
     ss << "reader_visible_keys_max\t" << reader_visible_keys_max.load(std::memory_order_relaxed) << "\n";
@@ -333,6 +350,23 @@ void llama_rerot_profile::print_summary(FILE * stream) const {
         phases[(size_t) llama_rerot_phase::workers_finish].total_us.load(std::memory_order_relaxed),
         phases[(size_t) llama_rerot_phase::synthesis].total_us.load(std::memory_order_relaxed),
         phases[(size_t) llama_rerot_phase::result_send].total_us.load(std::memory_order_relaxed));
+
+    std::fprintf(stream,
+        "[rerot-profile-parallel] req=%" PRIu64
+        " snaps=%" PRIu64 " W_sum=%" PRIu64 " W_max=%" PRIu64
+        " P_avg=%" PRIu64 " cohort_avg=%" PRIu64 " cohort_max=%" PRIu64
+        " frontiers=%" PRIu64 " pen_yields=%" PRIu64 "\n",
+        request_id,
+        parallel_snapshots.load(std::memory_order_relaxed),
+        sum_w.load(std::memory_order_relaxed),
+        max_w.load(std::memory_order_relaxed),
+        parallel_snapshots.load(std::memory_order_relaxed) > 0
+            ? sum_p.load(std::memory_order_relaxed) / parallel_snapshots.load(std::memory_order_relaxed) : 0,
+        parallel_snapshots.load(std::memory_order_relaxed) > 0
+            ? sum_cohort.load(std::memory_order_relaxed) / parallel_snapshots.load(std::memory_order_relaxed) : 0,
+        max_cohort.load(std::memory_order_relaxed),
+        logical_frontiers.load(std::memory_order_relaxed),
+        pen_yields.load(std::memory_order_relaxed));
 
     std::fprintf(stream,
         "[rerot-profile-routes] req=%" PRIu64

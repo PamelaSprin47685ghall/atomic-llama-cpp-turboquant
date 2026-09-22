@@ -1,5 +1,6 @@
 #include "server-rerot.h"
 #include "common.h"
+#include "llama-rerot-profile.h"
 #include "json-schema-to-grammar.h"
 #include "peg-parser.h"
 
@@ -3175,6 +3176,23 @@ void server_rerot_runtime::snapshot_dag_logical_step(uint64_t episode_id) {
         consider(nid);
     }
     ep->dag_step_committed.clear();
+    // §4.3 parallel ledger: one record per logical step snapshot. W counts
+    // logical workers (nodes minus the sealed planner root), P the physical
+    // pen capacity, cohort the members of this step (waiting-successor
+    // pressure shows as W_max/cohort_max vs the P average). No-op when
+    // LLAMA_REROT_PROFILE is unset.
+    if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+        const uint64_t w = ep->nodes.size() > 1 ? (uint64_t) ep->nodes.size() - 1 : 0;
+        prof->parallel_snapshots.fetch_add(1, std::memory_order_relaxed);
+        prof->sum_w.fetch_add(w, std::memory_order_relaxed);
+        prof->max_w.store(std::max(prof->max_w.load(std::memory_order_relaxed), w), std::memory_order_relaxed);
+        prof->sum_p.fetch_add(pen_capacity(), std::memory_order_relaxed);
+        prof->sum_cohort.fetch_add(ep->dag_step_cohort.size(), std::memory_order_relaxed);
+        prof->max_cohort.store(
+            std::max(prof->max_cohort.load(std::memory_order_relaxed),
+                     (uint64_t) ep->dag_step_cohort.size()),
+            std::memory_order_relaxed);
+    }
     // This-step BODY stays PENDING until the cohort publishes at the step
     // boundary. The PUBLIC watermark is frozen at the last committed frontier
     // (advance_frontier) and never moves here: every foreign PUBLIC run —
@@ -3529,7 +3547,16 @@ bool server_rerot_runtime::yield_dag_pen_for_ready(uint64_t episode_id, bool res
         llama_memory_seq_rm_attention(memory_, victim->exec_seq, -1, -1);
         llama_memory_seq_rm_recurrent(memory_, victim->exec_seq, -1, -1);
     }
-    return suspend_pen(victim_pen);
+    // §4.3: a successful yield is one physical time-slice boundary (the
+    // W>P event that pays the hand-seed capture + attention copy). Counted
+    // only when the suspend actually happens.
+    const bool yielded = suspend_pen(victim_pen);
+    if (yielded) {
+        if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+            prof->pen_yields.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return yielded;
 }
 
 std::vector<llama_rerot_node_id> server_rerot_runtime::get_eligible_dag_nodes(uint64_t episode_id) const {
@@ -4407,6 +4434,10 @@ void server_rerot_runtime::advance_frontier(uint64_t episode_id) {
     ++current->frontier;
     if (current->is_dag) {
         current->frozen_read_publish_epoch = current->publish_epoch;
+        // §4.3: count committed logical frontiers (DAG episodes only).
+        if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+            prof->logical_frontiers.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
 
