@@ -3027,6 +3027,9 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const auto memo_it  = hadamard_memo.find(memo_key);
         if (memo_it != hadamard_memo.end()) {
             cur_mm = memo_it->second;
+            if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+                prof->hadamard_memo_hits.fetch_add(1, std::memory_order_relaxed);
+            }
         } else {
         if (t.perm_rep > 1) {
             // tiled [hd, nk, rep] -> grouped [hd, rep, nk] feature order
@@ -3041,6 +3044,9 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         }
         cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
         hadamard_memo[memo_key] = cur_mm;
+        if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+            prof->hadamard_memo_misses.fetch_add(1, std::memory_order_relaxed);
+        }
         }
     }
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
@@ -3089,6 +3095,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const auto memo_it  = hadamard_memo.find(memo_key);
         if (memo_it != hadamard_memo.end()) {
             cur_mm = memo_it->second;
+            if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+                prof->hadamard_memo_hits.fetch_add(1, std::memory_order_relaxed);
+            }
         } else {
         if (t.perm_rep > 1) {
             // tiled [hd, nk, rep] -> grouped [hd, rep, nk] feature order
@@ -3103,6 +3112,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         }
         cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
         hadamard_memo[memo_key] = cur_mm;
+        if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+            prof->hadamard_memo_misses.fetch_add(1, std::memory_order_relaxed);
+        }
         }
     }
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur_mm, ids);

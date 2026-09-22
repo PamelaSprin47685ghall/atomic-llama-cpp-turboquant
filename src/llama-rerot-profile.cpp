@@ -173,6 +173,8 @@ void llama_rerot_profile::reset(uint64_t new_request_id) {
     gemv_count.store(0, std::memory_order_relaxed);
     gemm_count.store(0, std::memory_order_relaxed);
     multi_row_gdn_hits.store(0, std::memory_order_relaxed);
+    hadamard_memo_hits.store(0, std::memory_order_relaxed);
+    hadamard_memo_misses.store(0, std::memory_order_relaxed);
     attention_split_count.store(0, std::memory_order_relaxed);
 
     ring.reset();
@@ -338,6 +340,8 @@ std::string llama_rerot_profile::format_tsv() const {
     ss << "gemv_count\t" << gemv_count.load(std::memory_order_relaxed) << "\n";
     ss << "gemm_count\t" << gemm_count.load(std::memory_order_relaxed) << "\n";
     ss << "multi_row_gdn_hits\t" << multi_row_gdn_hits.load(std::memory_order_relaxed) << "\n";
+    ss << "hadamard_memo_hits\t" << hadamard_memo_hits.load(std::memory_order_relaxed) << "\n";
+    ss << "hadamard_memo_misses\t" << hadamard_memo_misses.load(std::memory_order_relaxed) << "\n";
     ss << "attention_split_count\t" << attention_split_count.load(std::memory_order_relaxed) << "\n";
 
     return ss.str();
@@ -459,13 +463,16 @@ void llama_rerot_profile::print_summary(FILE * stream) const {
     std::fprintf(stream,
         "[rerot-profile-compute] req=%" PRIu64
         " q_prep=%" PRIu64 " gemv=%" PRIu64 " gemm=%" PRIu64
-        " multi_row_gdn=%" PRIu64 " attn_splits=%" PRIu64 "\n",
+        " multi_row_gdn=%" PRIu64 " attn_splits=%" PRIu64
+        " had_memo=%" PRIu64 "/%" PRIu64 "\n",
         request_id,
         q_prep_rows.load(std::memory_order_relaxed),
         gemv_count.load(std::memory_order_relaxed),
         gemm_count.load(std::memory_order_relaxed),
         multi_row_gdn_hits.load(std::memory_order_relaxed),
-        attention_split_count.load(std::memory_order_relaxed));
+        attention_split_count.load(std::memory_order_relaxed),
+        hadamard_memo_hits.load(std::memory_order_relaxed),
+        hadamard_memo_misses.load(std::memory_order_relaxed));
 }
 
 // Global active profiling instance & lock

@@ -487,6 +487,28 @@ static void test_phase_first_cost() {
 }
 
 // ----------------------------------------------------------------------------
+// Test (6c): §9.3 Hadamard memoization hit/miss evidence
+// ----------------------------------------------------------------------------
+static void test_hadamard_memo_counters() {
+    llama_rerot_profile prof;
+    prof.reset(1007);
+
+    CHECK_EQ(prof.hadamard_memo_hits.load(), 0);
+    CHECK_EQ(prof.hadamard_memo_misses.load(), 0);
+
+    // Production idiom: miss = first materialization, hit = sibling reuse
+    prof.hadamard_memo_misses.fetch_add(1, std::memory_order_relaxed);
+    prof.hadamard_memo_hits.fetch_add(3, std::memory_order_relaxed);
+    CHECK_EQ(prof.hadamard_memo_misses.load(), 1);
+    CHECK_EQ(prof.hadamard_memo_hits.load(), 3);
+
+    // reset clears both
+    prof.reset(1007);
+    CHECK_EQ(prof.hadamard_memo_hits.load(), 0);
+    CHECK_EQ(prof.hadamard_memo_misses.load(), 0);
+}
+
+// ----------------------------------------------------------------------------
 // Test (7): Bounded Ring Buffer FIFO Overwrite & Value-Init Reset Semantics
 // ----------------------------------------------------------------------------
 
@@ -737,9 +759,9 @@ static void test_format_tsv_stability() {
     // + 11 (layout)
     // + 14 (host & command: 11 + upload_staging_us + upload_set_us + upload_count)
     // + 9 (state & memory)
-    // + 5 (computation)
-    // Total = 1 + 36 + 28 + 8 + 11 + 14 + 9 + 5 = 112
-    CHECK_EQ(line_count, 112);
+    // + 7 (computation)
+    // Total = 1 + 36 + 28 + 8 + 11 + 14 + 9 + 7 = 114
+    CHECK_EQ(line_count, 114);
     CHECK(found_req);
     CHECK(found_formal_p);
     CHECK(found_formal_p_first);
@@ -873,6 +895,7 @@ int main() {
     test_parallel_ledger();
     test_sync_recording();
     test_phase_first_cost();
+    test_hadamard_memo_counters();
     test_bounded_ring_buffer_and_reset();
     test_profile_full_reset();
     test_format_tsv_stability();

@@ -198,6 +198,11 @@ struct llama_rerot_profile {
     std::atomic<uint64_t> gemm_count{0};
     std::atomic<uint64_t> multi_row_gdn_hits{0};
     std::atomic<uint64_t> attention_split_count{0};
+    // §9.3 shared activation-rotation memoization (build_lora_mm): hits mean
+    // sibling projections reused the rotated activation; misses are first
+    // materializations. hit/(hit+miss) is the P7 recipe-expansion evidence.
+    std::atomic<uint64_t> hadamard_memo_hits{0};
+    std::atomic<uint64_t> hadamard_memo_misses{0};
 
     // Detailed trace bounded ring buffer
     llama_rerot_bounded_ring_buffer ring;
