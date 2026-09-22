@@ -1,5 +1,72 @@
 # AGENTS.md
 
+## 下班交接｜2026-09-22（第十八轮，flashprefill 布局路径：常驻表共享扫描 + 每桶排序探测）
+
+**分支：** `master`
+**主题：** 十问讨论稿的主干前四问落到 **flashprefill 布局路径**（`llama_flashprefill_build_rerot_plan`）。
+上一轮交接以后，这条路径是唯一还没做过跨 reader 共享的主干环节。全程 CPU 验证，未启动模型/GPU（真机安全门）。
+
+### 一、先测后改：相位剖析推翻了一个此前的结论
+
+在真实 builder 上临时插桩（**已 `git checkout` 回退，未提交**）后：
+
+- **92% 的单次 build 时间是每 view group 重复的全 cell 扫描**（R=6 是 R=1 的 7.6×，同 K）；
+- **排序只占 7.8%** —— 前几轮在 indexed 路径上得出的「排序是大头」**不能外推到这条路径**；
+- 匹配总 K 分解（K=131073）：R=1 = 60.7ms（共享扫描 + 1 view），R=8 = 230.7ms（共享扫描 + 8 view），每 view ≈ 21ms。
+
+### 二、两处改动（`src/llama-kv-cache.cpp`，+85 行）
+
+| # | 改动 | 依据 |
+|---|---|---|
+| 1 | **常驻表共享扫描**：新增 `fp_resident_row`/`fp_resident_scan`/`fp_scan_resident()`，一次扫完所有常驻 cell；每个 view group 由扫描退化为**过滤**（只有可见性谓词是 per-reader）。`sig` 直接取 `cells.seq_get_all(idx)`，删除 `live` + `member_sig` | 十问问题三「一块数据供给服务多个 reader」在 host 侧的对偶 |
+| 2 | **每桶 sortedness 探测**：桶按 cell index 序填充、排序键是 storage 序，生产形状两者一致；O(n) 探测失败才 `std::sort`。**比较器只写一次**，probe 与回退 sort 共用 | 十问问题四「结构不变就不重做」的最小实例 |
+
+### 三、实测（fragments/groups/uses 数量前后完全一致）
+
+| 形状 | 前 | 后 | 加速 |
+|---|---|---|---|
+| R=12 K=196609 | 1,143,707 us | 460,967 us | **2.48×** |
+| R=6 K=98305 | 237,534 us | 128,921 us | **1.84×** |
+| R=4 K=65537 | 105,332 us | 65,458 us | **1.61×** |
+| R=1 K=16385 | 8,161 us | 7,132 us | 1.14× |
+
+拆开看：共享扫描单独贡献 R=12 **2.25×** / R=6 **1.71×** / R=4 **1.54×**（R=1 仅 1.03×）；排序探测再 −5~7%。
+**收益随 reader 数增长**——与十问「K 笔共享结构天然在同一层、同一执行阶段」一致。
+
+### 四、新增回归臂（`tests/test-flashprefill-state.cpp`）
+
+`test_rerot_shared_scan_multi_reader`：一次规划调用里两个不同 reader + **物理 cell 被两个 reader 共享**。
+钉住三件事：每 reader 的 (physical, effective) 集与逐 query oracle 一致；A-only cell 对 B 不可见（共享 cell 语义）；
+B 的 base 段内出现**两个 DDVR 相位**（0@7 → 2@8，因为 cell 1 不属于 B）——这正是必须保持 per-reader 的相位，
+会被错误的共享化一次抹平。写这个臂时我先把期望值算错两次（run30 成员数 4 数成 3），由 oracle 纠正。
+
+### 五、本轮工程教训（重要，写进 RERoT.md §21.4）
+
+1. **绝不能在 1 万行文件上做全文字符串 strip**：一次 `s.replace(frag,'')` 清理插桩误删了真实 `}`，
+   把 85 行改动炸成 2047 行差、大括号 1983 vs 938。恢复：`git checkout` 回 HEAD → `git apply` 保存的测试 patch →
+   主文件用**逐条 `assert count==1` 的锚点替换**重做。
+2. **插桩必须可逆**：先插桩→测量→回退，才没有把 indexed 路径的相位结论外推到这条路径（实际结论相反）。
+3. **probe 与它替换的 sort 共用同一个比较器**，且覆盖排序键全部分量（第十一轮教训的第二次应用）。
+
+### 六、验证
+
+- ctest `rerot|xkv|flashprefill` **47/47**；`test-tp5-plan` / `test-meta-reduce-boundary` 全过。
+- ASAN（/tmp/asan18）：`flashprefill-state` / `flashprefill-routing` / `rerot-view` **0 错误**。
+  唯一已知报告是 `test-xkv-runtime` 基线既有的 alloc-dealloc-mismatch（测试自带的 operator new/delete 重载
+  与 libstdc++ `std::get_temporary_buffer` 冲突，在 oracle `llama_rerot_build_query_layout` 内，与本轮无关；
+  第十三轮起即为基线）。
+
+### 七、边界与未闭合
+
+1. **per-view 过滤仍是 O(K) 每 reader**：匹配总 K 下 R=8 是 R=1 的 3.8×。共享扫描只消除了重复扫描，没消除
+   **重复分桶**。下一步是让分桶按 run 复用（同一 run 成员集对所有 reader 相同，只有 own/gate 不同），把 Q4 的
+   `llama_rerot_run_order_signature` 接到这个调用点；flashprefill 侧已有 `fp_key` + freshness 整层缓存，
+   fragment 级缓存的边际收益需先证明再动手（21.3 节保留此判断，本轮未推翻）。
+2. 排序探测在生产形状收益有限（R=1 时探测本身有成本）；若写入侧后续主动维持长 span（Q2 的
+   `span_long_fraction` 验收指标），cell 序与 storage 序会更稳定，届时再评估把探测上移到写入侧。
+3. 真机收益仍需目标机跑模型会话验证；本轮全部数字是开发机 CPU 合成键，不是模型证据。
+
+
 ## 下班交接｜2026-09-22（第十七轮，§4.1 几何第二步：resume_norm / resume_lo_q8 / UP_Q8DOT 三 kernel 收口）
 
 **分支：** `master`（本轮 commit 见 git log；基于 `c67819718`，rebase 过 RERoT `0cf626757`）

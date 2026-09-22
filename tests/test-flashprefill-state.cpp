@@ -1152,6 +1152,95 @@ static void test_rerot_virtualization_shared_view() {
     }
 }
 
+// Scenario M (round-18): MANY distinct reader views in ONE planning call, with
+// physical cells SHARED between readers (the shared-cell/seq_cp shape). Pins
+// the shared resident scan: every reader's fragments and per-query legality
+// must be identical to what a per-reader walk would produce, and ownership
+// signatures must reflect the union of every referencing sequence (seq_get_all
+// semantics) rather than one reader's view of the cell.
+static void test_rerot_shared_scan_multi_reader() {
+    llama_kv_cells cells;
+    cells.resize(14);
+    cells.set_generation_enabled(true);
+    const uint32_t seqA = 3;   // reader A's query sequence
+    const uint32_t seqB = 4;   // reader B's query sequence
+
+    // Untagged base cells, several co-owned by BOTH readers (shared cells).
+    cells.pos_set(0, 0); cells.seq_add(0, seqA); cells.seq_add(0, seqB);
+    cells.pos_set(1, 1); cells.seq_add(1, seqA);
+    cells.pos_set(2, 2); cells.seq_add(2, seqA); cells.seq_add(2, seqB);
+    cells.pos_set(3, 3); cells.seq_add(3, seqB);
+
+    // Run 30 = peer public run at an OLD frontier (FULL for both readers).
+    for (uint32_t i = 4; i < 8; ++i) {
+        cells.pos_set(i, (llama_pos) i);
+        cells.seq_add(i, seqA);
+        cells.seq_add(i, seqB);
+        cells.rerot_set(i, fp_tag(4, 9, 30, llama_rerot_visibility::public_live, 2, 5));
+    }
+    // Run 31 = reader A's own private query run.
+    cells.pos_set(8, 8); cells.seq_add(8, seqA);
+    cells.rerot_set(8, fp_tag(4, 1, 31, llama_rerot_visibility::private_control, 0, 10));
+    // Run 32 = reader B's own private query run.
+    cells.pos_set(9, 9); cells.seq_add(9, seqB);
+    cells.rerot_set(9, fp_tag(4, 2, 32, llama_rerot_visibility::private_control, 0, 10));
+    // Run 33 = reader A's frontier-equal OWN-node public (gated for A).
+    cells.pos_set(10, 10); cells.seq_add(10, seqA);
+    cells.rerot_set(10, fp_tag(4, 1, 33, llama_rerot_visibility::public_live, 3, 10));
+    // Run 34 = a run owned by NEITHER reader: must never appear.
+    cells.pos_set(11, 11); cells.seq_add(11, seqA);
+    cells.rerot_set(11, fp_tag(4, 8, 34, llama_rerot_visibility::private_control, 0, 10));
+    // Holes keep the physical layout non-contiguous.
+    cells.pos_set(12, 20); cells.seq_add(12, seqA); cells.seq_add(12, seqB);
+    cells.pos_set(13, 21); cells.seq_add(13, seqB);
+
+    const llama_rerot_reader_state rA = fp_reader(4, 1, 31, 10, {30, 31});
+    const llama_rerot_reader_state rB = fp_reader(4, 2, 32, 10, {30, 32});
+
+    const fp_q_expectation expA = fp_run_oracle(rA, 8, fp_keys_for_seq(cells, seqA));
+    const fp_q_expectation expB = fp_run_oracle(rB, 9, fp_keys_for_seq(cells, seqB));
+    // A sees: shared base {0,2} + own base {1} + FULL run30 {4,5,6,7} + own query cell {8}
+    CHECK(expA.phys_eff.size() == 8);
+    CHECK(fp_contains_phys(expA, 8) && fp_contains_phys(expA, 0) && fp_contains_phys(expA, 2));
+    CHECK(!fp_contains_phys(expA, 3) && !fp_contains_phys(expA, 9) && !fp_contains_phys(expA, 11));
+    // B sees: shared base {0,2,3} (cell 1 is A-only, correctly excluded) +
+    // FULL run30 {4,5,6,7} + own query cell {9}. The base splits into two
+    // effective phases (0@7 then 2@8) because cell 1 is not B's: the DDVR
+    // phase inside the untagged arm is exactly what must stay per-reader.
+    CHECK(expB.phys_eff.size() == 8);
+    CHECK(fp_contains_phys(expB, 9) && fp_contains_phys(expB, 3) && !fp_contains_phys(expB, 1));
+    CHECK(!fp_contains_phys(expB, 8) && !fp_contains_phys(expB, 11));
+
+    llama_ubatch ub{};
+    ub.n_tokens = 2;
+    llama_pos pos_arr[2] = {8, 9};
+    int32_t nseq_arr[2] = {1, 1};
+    llama_seq_id sa[1] = {(llama_seq_id) seqA};
+    llama_seq_id sb[1] = {(llama_seq_id) seqB};
+    llama_seq_id * seq_arr[2] = {sa, sb};
+    ub.pos = pos_arr;
+    ub.n_seq_id = nseq_arr;
+    ub.seq_id = seq_arr;
+    std::vector<llama_rerot_reader_state> views(8);
+    views[seqA] = rA;
+    views[seqB] = rB;
+    llama_flashprefill_layout_params params;
+    params.want_exact_rows = true;
+    llama_flashprefill_layout built;
+    std::string error;
+    CHECK(llama_flashprefill_fixture_build_rerot(cells, views, ub, params, built, &error));
+    CHECK(fp_layout_matches_oracle(built, 0, expA, &error));
+    CHECK(fp_layout_matches_oracle(built, 1, expB, &error));
+    if (!error.empty()) {
+        std::fprintf(stderr, "fixture mismatch: %s\n", error.c_str());
+    }
+
+    // The two queries must land in DISTINCT reader views (two view groups).
+    CHECK(built.queries.size() == 2);
+    CHECK(built.queries[0].query_virtual_pos == expA.query_virtual);
+    CHECK(built.queries[1].query_virtual_pos == expB.query_virtual);
+}
+
 // ---- Real-context integration helpers (chains B/C/F; --model mode only) ----
 
 static llama_flashprefill_row fp_prefill_row(int32_t seq, int32_t pos, int32_t begin, int32_t end) {
@@ -1975,6 +2064,7 @@ int main(int argc, char ** argv) {
     test_pen_suspend_resume();
     test_rerot_virtualization_future_gated();
     test_rerot_virtualization_shared_view();
+    test_rerot_shared_scan_multi_reader();
     test_ordinary_foreign_isolation();
     failures += flashprefill_state_envelope_tests::run_tests();
 

@@ -2583,3 +2583,69 @@ c3648d789  DAG logical/view/fixed-entry implementation
 - Q8（跳块上界）与 Q10（K×H 联合投机）是近似/研究路线：本轮已把它们的**数学契约与可执行反例**落成参考代码（界、验证引擎、naive 对照），但收益测量、接受率账目与生产接入仍未做，不得与等义改写的收益混记。Q10 的保守“全笔通过才前进”方案在独立接受率 a、b 笔下整步通过率为 a^b，联合草稿必须学会预测多笔相互影响后的下一 frontier，而不是 b 条各自向前冲的草稿。
 - Q2/Q4 生产化已推进到单一共享 key world＋生产形态快路径（decode 热路径，见 21.1 第五～十轮）：结构扫描与排序对 R 个 reader 各只做一次，reader 无关段属性（uniform、fast_keys）已上收共享结构 pass（R=12 K=262144 builder −50%），ownership 列 bitset 直供（cache 级 R×K 字节展开删除），Q=6（MTP verify）数值通道已 1.85×（8758 us，接近 entry 输出 memcpy 地板）；剩余方向：让写入布局主动维持长而规则的 span（`llama_rerot_span_long_fraction` 是验收指标）；把 run-order 签名接入 flashprefill 的 `llama_rerot_split_table_fragments` 调用点，结构事件才重算 fragments，数值增长走增量前缀和——注意 flashprefill 侧已有 fp_key+freshness 整层缓存，fragment 级缓存的边际收益需先证明再动手。
 - Q3 host 侧：第十五轮消灭 layout build 的 size 阶段 value-init 浪费（scratch capacity 释放、25MB entries zero-fill、37MB groups zero-fill）并让 groups 由 sink 直接 append、const 段零拷贝引用 fast_keys。cache 级稳态（生产 scratch 路径）R=12 K=262k：**4.3ms（69× vs 班11前基线）**，默认 validate 下 9.3ms——逼近 25MB emit 的带宽下界，host 侧布局构建实质归零；剩余成本是语义必需 emission（GPU 搬运用途下还应走段描述压缩，见 Q2）。剩余工作全在 cache 级接入：`replace_keys`（环形 cell 复用）＋ `apply_ubatch` on_cell 协调 ＋ purge/回滚失效语义；接入后每 frontier 只付数值 pass。真机收益需目标机 `rerot-semantic-smoke.py` 对比 decode host 时间（开发机数字是合成键，不是模型证据）。
+
+### 21.4 第十八轮：flashprefill 布局路径的共享扫描与排序探测
+
+十问把「共享计算的单位」和「结构/数值分离」列为主干前四问。第十八轮把这两个问题落到 **flashprefill 布局路径**
+（`llama_flashprefill_build_rerot_plan`，即 `LLAMA_FLASHPREFILL_ROLE_REROT_TEACHER_FORCED` 角色下的
+legal-fragment 规划）：这是当时唯一还没做过任何跨 reader 共享的主干环节。
+
+**先测后改（相位剖析）。** 在真实 builder 上临时插桩（已回退，未提交）后得到的关键事实：
+
+- 单次 layout build 中 **92% 的时间是每 view group 重复的全 cell 扫描**（R=6 是 R=1 的 7.6 倍，同 K）；
+- 排序只占 7.8%——此前几轮在 indexed 路径上得出的「排序是大头」结论**不能外推到 flashprefill 路径**；
+- 匹配总 K 的分解（K=131073）：R=1「共享扫描 + 1 view」= 60.7ms，R=8「共享扫描 + 8 view」= 230.7ms，即每 view 约 21ms。
+
+**改动一：常驻表共享扫描（Q3「一块数据供给服务多个 reader」在 host 侧的对偶）。**
+
+新增 `fp_resident_row` / `fp_resident_scan` / `fp_scan_resident()`（`src/llama-kv-cache.cpp`）：一次扫完所有常驻
+cell，记录 (idx, storage, meta, sig)。每个 view group 由「扫描」退化为「过滤」——只有可见性谓词是 per-reader。
+顺带 `sig` 直接取 `cells.seq_get_all(idx)`，替掉原来每 cell 一次的 live 序列枚举 + bitset 重建；`live` /
+`member_sig` 随之删除（`seq_get_all` 与旧的 live 枚举等价：任何置位 seq 的 `seq_get_used>0`，所以 live 必含
+所有置位）。
+
+**改动二：每桶 sortedness 探测（Q4「结构不变就不重做」的最小实例）。**
+
+桶由共享扫描按 **cell index 升序**填充，而排序键是 (storage, ...)。生产环形写满足「写序 ≈ storage 序」，所以
+多数桶其实已有序。加 O(n) 探测，**比较器只写一次**、probe 与回退 `std::sort` 共用，避免第十一轮
+「probe 只查部分排序键导致增量路径与全量重建静默分叉」的复发；探测失败才排序。这是精确跳过，不是近似。
+
+**实测（同一 layout，fragments/groups/uses 数量前后完全一致）：**
+
+| 形状（K 为总常驻键） | 前 | 后 | 加速 |
+|---|---|---|---|
+| R=12 K=196609 | 1,143,707 us | 460,967 us | **2.48x** |
+| R=6 K=98305 | 237,534 us | 128,921 us | **1.84x** |
+| R=4 K=65537 | 105,332 us | 65,458 us | **1.61x** |
+| R=1 K=16385 | 8,161 us | 7,132 us | 1.14x |
+| R=8 K=131073（匹配总 K） | 230,682 us | 213,674 us | 1.08x（共享扫描之后的余量） |
+
+其中共享扫描一项单独贡献 R=12 **2.25x** / R=6 **1.71x** / R=4 **1.54x**（R=1 仅 1.03x，无共享可省）；
+排序探测再贡献 R=12 -7.0% / R=6 -5.3% / R=8 -7.4%。**收益随 reader 数增长**，与十问「K 笔共享结构天然就在
+同一层、同一执行阶段」的判断一致。
+
+**新增回归臂**（`tests/test-flashprefill-state.cpp::test_rerot_shared_scan_multi_reader`）：一次规划调用里放
+**两个不同 reader**，且物理 cell 被两个 reader **共享**（seq_cp / 共享 cell 形状）。断言：每 reader 的
+(physical, effective) 集与逐 query oracle 一致；A-only cell 对 B 不可见；B 的 base 段内出现两个 DDVR 相位
+（cell 1 不属于 B 时 0@7 -> 2@8）——这正是**必须保持 per-reader** 的相位，会被错误的共享化一次抹平。写这臂时
+我自己先算错两次期望（8/9 混淆 run30 的成员数），由 oracle 纠正——这就是对拍臂的价值。
+
+**工程教训（本轮踩坑，写进规则）。**
+
+1. **不能在 1 万行文件上做全文字符串 strip**：本轮一次探针清理 `s.replace(frag,'')` 误删了真实的 `}`，
+   把一个 85 行改动炸成 2047 行差、文件大括号失衡（1983 vs 938）。恢复方式：`git checkout` 回干净 HEAD，
+   把已保存的 patch（测试文件）重新 `git apply`，再用**逐条 count-asserted 的锚点替换**重做主文件改动。
+   断言 `count==1` 的锚点替换是这类文件上唯一安全的编辑方式。
+2. **插桩要可逆**：本轮先做「插桩 → 测量 → `git checkout` 回退」，从而把「之前几轮的相位结论」限定在它
+   有据可依的路径上，没有把 indexed 路径的结论外推到 flashprefill 路径（实际结论相反）。
+3. **probe 与它替换的 sort 必须共用同一个比较器**，且 probe 覆盖排序键的**全部**分量；否则快路径与回退
+   路径会静默分叉。
+
+**未做（下一步）：**
+
+- per-view 过滤仍是 O(K) 每 reader：匹配总 K 下 R=8 的 build 时间是 R=1 的 3.8 倍。共享扫描只消灭了重复扫描，
+  没消灭重复分桶。真正下一步是让分桶也按 run 复用（同一 run 的成员集对所有 reader 相同，只有「该 reader 是否
+  own/gate」不同），即把 Q4 的 run-order 签名接到这个调用点——flashprefill 侧已有 `fp_key` + freshness 整层缓存，
+  fragment 级缓存的边际收益需先证明再动手（21.3 节保留此判断，本轮未推翻）。
+- 排序探测在生产形状收益有限（R=1 时探测本身有成本）；若写入侧后续主动维持长 span（Q2 的
+  `span_long_fraction` 验收），cell 序与 storage 序会一致得更稳定，届时再评估是否把探测上移到写入侧。
