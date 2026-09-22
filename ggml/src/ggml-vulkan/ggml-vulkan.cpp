@@ -15893,9 +15893,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         {
             uint32_t nrows = (uint32_t)ggml_nrows(src0);
             uint32_t z = 1;
-            if (nrows > ctx->device->properties.limits.maxComputeWorkGroupCount[0]) {
-                z = CEIL_DIV(nrows, 32768);
-                nrows = 32768;
+            const uint32_t max_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
+            if (nrows > max_x) {
+                // Split across Z; shader uses NumWorkGroups.x as the row stride.
+                z = CEIL_DIV(nrows, max_x);
+                nrows = max_x;
             }
             elements = { nrows, (uint32_t)ne00, z };
 
@@ -16058,18 +16060,27 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             if (op == GGML_OP_CONCAT && ggml_is_quantized(dst->type)) {
                 ne = ne / ggml_blck_size(dst->type) * ggml_type_size(dst->type) / ggml_vk_concat_unit_size(dst->type);
             }
-            // copy_to_quant has block size of 32, and each thread does QUANT_K elements.
-            // Splitting into 512x512xZ wouldn't work well since each workgroup does 1024 elements.
-            // So divide by block size here before splitting into 512x512 groups.
+            // Quant CPY pipelines use wg_denoms[0] == blck_size (or 32 for
+            // f32→quant). `ne` below is the intended WORKGROUP count; scale the
+            // X element extent by wg_denoms[0] so CEIL_DIV(elements[0], denom)
+            // recovers that count. Shaders linearize via gl_NumWorkGroups.
+            uint32_t wg_scale = 1;
             if (op == GGML_OP_CPY && !ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
-                ne = CEIL_DIV(ne, ggml_blck_size(dst->type));
+                // f32→quant (copy_to_quant): local_size_x=32, each thread writes
+                // QUANT_K (== blck) elems → one WG covers 32*blck elems.
+                ne = CEIL_DIV(ne, 32 * ggml_blck_size(dst->type));
+                wg_scale = pipeline->wg_denoms[0];
+            } else if (op == GGML_OP_CPY && ggml_is_quantized(src0->type) && !ggml_is_quantized(dst->type)) {
+                // quant→f32 (copy_from_quant): one WG per block; denom == blck.
+                ne = CEIL_DIV(ne, ggml_blck_size(src0->type));
+                wg_scale = pipeline->wg_denoms[0];
             }
             if (ne > 262144) {
-                elements = { 512, 512, CEIL_DIV(ne, 262144) };
+                elements = { 512 * wg_scale, 512, CEIL_DIV(ne, 262144) };
             } else if (ne > 512) {
-                elements = { 512, CEIL_DIV(ne, 512), 1 };
+                elements = { 512 * wg_scale, CEIL_DIV(ne, 512), 1 };
             } else {
-                elements = { ne, 1, 1 };
+                elements = { ne * wg_scale, 1, 1 };
             }
 
             if (pipeline == ctx->device->pipeline_cpy_transpose_32 ||
@@ -17869,7 +17880,6 @@ static void ggml_vk_turbo_wht(ggml_backend_vk_context * ctx, vk_context& subctx,
         (uint32_t)ggml_nelements(src0), (uint32_t)direction, (uint32_t)group_size,
         src1 != nullptr ? 1u : 0u,
     };
-    fprintf(stderr, "DEBUG: ggml_vk_turbo_wht pipeline ptr: %p, name: %s, push_constant_size: %zu\n", (void*)ctx->device->pipeline_turbo_wht.get(), ctx->device->pipeline_turbo_wht ? ctx->device->pipeline_turbo_wht->name.c_str() : "null", ctx->device->pipeline_turbo_wht ? ctx->device->pipeline_turbo_wht->push_constant_size : 0);
     vk_pipeline pipeline = ctx->device->pipeline_turbo_wht;
     GGML_ASSERT(pipeline != nullptr);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
@@ -17878,13 +17888,19 @@ static void ggml_vk_turbo_wht(ggml_backend_vk_context * ctx, vk_context& subctx,
     // InnerQ scale_inv (src[1]) is optional: bind src0 as a dummy when NULL.
     // The shader never reads binding 2 unless use_scale is set.
     vk_subbuffer scale_buf = src1 != nullptr ? ggml_vk_tensor_subbuffer(ctx, src1, false) : src_buf;
-    // Spread workgroups across Y/Z to stay within maxComputeWorkGroupCount[0].
-    const uint32_t n_groups = pc.ne / (uint32_t)group_size;
+    // Each workgroup handles exactly 128 elements (pipeline->wg_denoms[0] == 128,
+    // matching local_size_x). The shader linearizes via gl_NumWorkGroups, so the
+    // host only needs a dense 3D reshape that stays inside maxComputeWorkGroupCount.
+    // CRITICAL: elements[0] must be a multiple of 128 yielding the intended X
+    // workgroup count — NEVER scale by WHT group_size (32/64/128). The old
+    // `512 * group_size` formula produced wg_x=256 when group_size=64 while the
+    // shader still assumed stride 512 → GPUVM page fault / Xorg kill on APU.
+    const uint32_t total_wg = CEIL_DIV(pc.ne, 128u);
     std::array<uint32_t, 3> elements;
-    if (n_groups > 262144) {
-        elements = { 512 * (uint32_t)group_size, 512, CEIL_DIV(n_groups, 262144) };
-    } else if (n_groups > 512) {
-        elements = { 512 * (uint32_t)group_size, CEIL_DIV(n_groups, 512), 1 };
+    if (total_wg > 262144u) {
+        elements = { 512u * 128u, 512u, CEIL_DIV(total_wg, 262144u) };
+    } else if (total_wg > 512u) {
+        elements = { 512u * 128u, CEIL_DIV(total_wg, 512u), 1u };
     } else {
         elements = { pc.ne, 1, 1 };
     }
@@ -18914,17 +18930,24 @@ static vk_subbuffer ggml_vk_router_converted_weight(ggml_backend_vk_context * ct
         // the f16 contig cpy pipeline uses 512-element workgroups, and the
         // f32->quant copy_to_quant pipeline uses 32*QUANT_K-element groups
         // (ne pre-divided by the destination block size).
+        // Mirror GGML_OP_CPY reshape: for f32→quant, ne is a WORKGROUP
+        // count and elements[0] must be scaled by wg_denoms[0] so
+        // CEIL_DIV(elements[0], denom) recovers that count. Shaders
+        // linearize via gl_NumWorkGroups.
         uint32_t ne_dispatch = ne;
+        uint32_t wg_scale = 1;
         if (mode_slot == 1) {
-            ne_dispatch = CEIL_DIV(ne, (uint32_t) ggml_blck_size(GGML_TYPE_Q8_0));
+            // copy_to_quant: 32 threads × QUANT_K elems per WG
+            ne_dispatch = CEIL_DIV(ne, 32u * (uint32_t) ggml_blck_size(GGML_TYPE_Q8_0));
+            wg_scale = pipeline->wg_denoms[0];
         }
         std::array<uint32_t, 3> elements;
         if (ne_dispatch > 262144) {
-            elements = { 512, 512, CEIL_DIV(ne_dispatch, 262144) };
+            elements = { 512 * wg_scale, 512, CEIL_DIV(ne_dispatch, 262144) };
         } else if (ne_dispatch > 512) {
-            elements = { 512, CEIL_DIV(ne_dispatch, 512), 1 };
+            elements = { 512 * wg_scale, CEIL_DIV(ne_dispatch, 512), 1 };
         } else {
-            elements = { ne_dispatch, 1, 1 };
+            elements = { ne_dispatch * wg_scale, 1, 1 };
         }
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { in, out }, pc, elements);
         ggml_vk_ctx_end(subctx);

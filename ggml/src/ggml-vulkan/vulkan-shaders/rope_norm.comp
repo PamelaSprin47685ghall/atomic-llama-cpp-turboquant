@@ -5,7 +5,9 @@
 
 void main() {
     const uint i0 = 2*gl_GlobalInvocationID.y;
-    const uint row = gl_GlobalInvocationID.x + 32768 * gl_GlobalInvocationID.z;
+    // Host may split oversized row counts across Z (elements[0] capped).
+    // Use NumWorkGroups.x — never hardcode the 32768 host cap.
+    const uint row = gl_GlobalInvocationID.x + gl_NumWorkGroups.x * gl_GlobalInvocationID.z;
     if (row >= pc.nrows) {
         return;
     }

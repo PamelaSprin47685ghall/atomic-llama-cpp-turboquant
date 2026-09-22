@@ -16,7 +16,7 @@ shared FLOAT_TYPE sum_xx[BLOCK_SIZE];
 shared FLOAT_TYPE sum_xg[BLOCK_SIZE];
 
 void main() {
-    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint row = ((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x);
     const uint tid = gl_LocalInvocationID.x;
 
     // Compute derivative of x[i]/norm(x) = g[i]/norm(x) - x[i] dot(x,g)/KX / norm(x)^1.5

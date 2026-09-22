@@ -41,8 +41,13 @@ const float S2[128] = float[128](
 
 void main() {
     const uint tid  = gl_LocalInvocationID.x;
-    const uint base = (gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x) * 128;
+    // Linear workgroup index via NumWorkGroups — never hardcode 512/262144.
+    // Host may reshape the grid any way that stays within device limits; the
+    // address stays contiguous as long as every WG covers exactly 128 elems.
+    const uint base = ((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y)
+                        * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 128;
 
+    // Per-thread bound: a partial last WG must not touch past ne.
     if (base + tid >= p.ne) return;
 
     // Group size resolved on host (ggml_turbo_wht: 32/64/128, auto already

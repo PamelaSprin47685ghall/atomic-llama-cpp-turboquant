@@ -27,7 +27,7 @@ shared FLOAT_TYPE shA[BATCH_N * N];
 shared FLOAT_TYPE shB[BATCH_N * K];
 
 void main() {
-    const uint batch = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint batch = ((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x);
     const uint tid = gl_LocalInvocationID.x;
 
     if (batch >= p.ne02 * p.ne03) {

@@ -11,7 +11,7 @@ layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 shared FLOAT_TYPE sum[BLOCK_SIZE];
 
 void main() {
-    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint row = ((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x);
     const uint tid = gl_LocalInvocationID.x;
 
     const uint a_base = get_aoffset() + src0_idx(row * p.ne00);

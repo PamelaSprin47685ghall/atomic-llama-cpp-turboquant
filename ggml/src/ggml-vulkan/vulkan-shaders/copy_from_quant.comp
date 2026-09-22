@@ -19,7 +19,7 @@ void main() {
     }
 #endif
 
-    const uint idx = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x * QUANT_K;
+    const uint idx = ((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x) * QUANT_K;
 
     if (idx >= p.ne) {
         return;

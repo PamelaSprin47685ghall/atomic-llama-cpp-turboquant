@@ -22,7 +22,7 @@ shared FLOAT_TYPE partial[BLOCK_SIZE / SUBGROUP_SIZE];
 shared FLOAT_TYPE last_sum;
 
 void main() {
-    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint row = ((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x);
     const uint tid = gl_LocalInvocationID.x;
 
     const uint i03 = fastdiv(row, p.ne0_12mp, p.ne0_12L);

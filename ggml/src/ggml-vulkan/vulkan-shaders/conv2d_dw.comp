@@ -89,7 +89,7 @@ FLOAT_TYPE conv_2d_dw_cwhn(uint idx) {
 }
 
 void main() {
-    uint idx = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+    uint idx = (gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * 512u + gl_GlobalInvocationID.x;
     if (idx >= p.ne) {
         return;
     }

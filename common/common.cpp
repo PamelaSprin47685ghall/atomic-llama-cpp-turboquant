@@ -1639,11 +1639,25 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // the per-slot accounting) has to follow the capacity the fit just solved; leaving the
     // auto placeholder in place divides the pool into slices far below the solved average
     // (measured: 22 advertised slots for a pool solved as 6 x 131072).
-    if (dynamic_kv && cparams.n_seq_max > 0 && (int) cparams.n_seq_max != params.n_parallel) {
+    // RERoT keeps n_seq_max = LLAMA_MAX_SEQ as the logical parked/archive id arena while
+    // request concurrency B lives in n_parallel / rerot_person_max. Adopting n_seq_max here
+    // would inflate n_parallel to 256, admit request slots past the first B brain rows, and
+    // trip brain_copy's >= 0 assert on the first prefill (provisional map is seq_id < B).
+    if (dynamic_kv && !params.rerot_enabled &&
+        cparams.n_seq_max > 0 && (int) cparams.n_seq_max != params.n_parallel) {
         COM_INF("auto-fit: %u parallel slots, %u KV tokens\n", cparams.n_seq_max, cparams.n_ctx_kv);
         params.n_parallel    = (int) cparams.n_seq_max;
         params.n_parallel_pp = 1;
         params.n_ctx_kv      = cparams.n_ctx_kv;
+    }
+
+    // Keep outer request concurrency aligned with B (brains). Pens (P) are execution
+    // slots beyond [0, B) and must not be treated as independent root request slots.
+    if (params.rerot_enabled && params.rerot_person_max > 0 &&
+        params.n_parallel != (int) params.rerot_person_max) {
+        COM_INF("RERoT: aligning n_parallel (%d -> %u) to --rerot-people (request concurrency B)\n",
+            params.n_parallel, params.rerot_person_max);
+        params.n_parallel = (int) params.rerot_person_max;
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);

@@ -428,7 +428,13 @@ void llm_graph_input_rs::set_input_recurrent(
         int32_t * data = (int32_t *) (brain_copy->data ? brain_copy->data : ggml_get_data(brain_copy));
         for (uint32_t i = 0; i < mctx->get_ubatch().n_seqs; ++i) {
             data[i] = mctx->brain_copy((int32_t) i);
-            GGML_ASSERT(data[i] >= 0);
+            // Fail closed: a negative index means the seq never acquired a brain
+            // row (slot id >= B without provisional/episode map). Writing it would
+            // OOB the shared S tensor.
+            if (data[i] < 0) {
+                GGML_ABORT("%s: brain_copy[%u] = %d (seq needs acquire_brain_row or slot id < B)\n",
+                    __func__, i, data[i]);
+            }
         }
     }
 

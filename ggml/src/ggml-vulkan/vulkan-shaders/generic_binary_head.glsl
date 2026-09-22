@@ -36,7 +36,11 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 layout(constant_id = 0) const bool norepeat = false;
 
 uint get_idx() {
-    return gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+    // Host packs work into Y/Z with a fixed X slab of 512 elements
+    // (ggml_vk_op_f32). Do not hardcode Z-stride 262144 — use NumWorkGroups.y.
+    // GID.x is the in-slab offset (may span multiple X-WGs when wg_denoms[0] < 512).
+    return (gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * 512u
+         + gl_GlobalInvocationID.x;
 }
 
 uint get_aoffset() { return p.misalign_offsets >> 16; }

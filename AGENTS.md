@@ -1,5 +1,66 @@
 # AGENTS.md
 
+## 下班交接｜2026-09-22（第二十轮，核显 GPUVM 越界崩溃地毯修复 + RERoT 槽位/脑行修正 + 路由探针挂死上限）
+
+**分支：** `master`
+**主题：** 三组真机缺陷的根因定位与修复；全部有复现证据与回归证据。路由 DSL 换轨已在上一提交 `82c854de3` 落地，本轮是其**真机暴露出的下游缺陷**。
+
+### 一、核显 GPUVM page fault → Xorg 被内核重置（根因）
+
+**现场：** `journalctl -k` 记录 `[gfxhub] page fault from client 10 (TCP)`、`GPUVM fault at 0x800775210000`、`ring comp_1.1.0 timeout` → `ring gfx_0.0.0 timeout (Process Xorg pid 739)`，即 compute 队列复位传染图形队列，桌面被杀。
+
+**根因（纯数学，已静态证明）：** `turbo_wht.comp` 用硬编码线性化
+`base = (WorkGroupID.z*262144 + WorkGroupID.y*512 + WorkGroupID.x) * 128`，
+而 host `ggml_vk_turbo_wht` 按 `wg_denoms[0]=128` 反算网格、且把 `elements[0]` 写成 `512 * group_size`。
+当 `group_size=64`（本模型）时 X 维实际只有 **256** 个 workgroup，shader 却按 **512** 跨步：
+每推进一行 Y，基址前移 65536 元素而实际只覆盖 32768 → **2 倍虚增**，末行直接越界写显存。
+
+**修复：**
+1. `turbo_wht.comp` 改为 `((z*NumWorkGroups.y + y)*NumWorkGroups.x + x) * 128`，并恢复逐线程守卫 `base + tid >= p.ne`（此前误改为 `base >= p.ne`，barrier 分歧风险）；
+2. host 改 `total_wg = CEIL_DIV(pc.ne, 128)`、`elements[0] = 512*128`，与 local_size 解耦，**永不再乘 WHT group_size**；
+3. **地毯：** 同类「512-slab 折叠 + 硬编码跨步」全部改为 `gl_NumWorkGroups` 线性化——`generic_unary_head/binary_head.glsl`、`multi_add`、`out_prod`、`concat`、`conv2d_dw`、`pad`、`silu_back`、`upscale`、`opt_step_adamw/sgd`、`glu_main`、`copy_to_quant/copy_from_quant`、`conv2d_mm/conv3d_mm`(B_idx_NPQ)、`rope_*`×4、`argmax/cumsum/norm/l2_norm/rms_norm_back/soft_max/soft_max_back/solve_tri/sum_rows`；
+4. host 侧补 `wg_scale`（CPY f32↔quant 与 router 路径按 `wg_denoms[0]` 缩放 X 维）；ROPE 行切分改用 `maxComputeWorkGroupCount[0]`，shader 用 `NumWorkGroups.x` 作行跨步（消除 `32768` 硬编码）。
+
+**审计结论：** 「512-slab 折叠」类 dispatch（`cpy_to_contiguous`、`cpy_to_strided`、`SET_ROWS`、`ROPE`、`turbo_wht`、router quant、`multi_add`、`out_prod`）的消费者已全部 `NumWorkGroups` 化；其余「刚性网格」shader（dequant/qwen4/xkv/flash/tp5/ssm 等）由各自 dispatch 给精确网格、无折叠，属另一套正确契约。
+
+### 二、`brain_copy >= 0` assert（真 bug，非安全屏障）
+
+**根因链：** `common.cpp` 的 dynamic-KV「采用已解槽数」逻辑把 `cparams.n_seq_max` 回写进 `params.n_parallel`；RERoT 下 `n_seq_max = LLAMA_MAX_SEQ (256)` 是**逻辑停放 id 域**而非请求并发 B，于是 4 个 slot 全被当成根请求槽位，LRU 把根请求派给 **slot 3**，超出临时脑行映射 `seq_id < B=2` → `brain_row_for_seq` 返回 −1 → `data[i] >= 0` 断言。
+
+**修复：** ① `--rerot` 开启时跳过该回写；② 新增对齐：`n_parallel` 跟随 `--rerot-people`；③ `external_slot_eligible()` 用 `rerot_person_max` 限定根请求槽位（pens 只能作子 lane）；④ 断言换成点名 seq 的 fail-closed abort（`brain_copy[i] = -1 (seq needs acquire_brain_row or slot id < B)`）。
+
+**证据：** 日志由「capping 256→4 + 根请求落 slot 3 + 断言」变为 `n_slots = 4, n_request_slots = 2`，根请求落 slot 0/1，断言消失。
+
+### 三、路由探针无限生成（240s 挂死）→ 硬上限 + 精确诊断
+
+**现场（`--rerot-trace`）：** 探针在 `node=0 serial=0` 上以 ~12 tok/s 连续生成 240s，反复输出 `2: 9.9 is larger.` / `99 <- 1, 2: …` 一类循环计划行，**从不输出终止空行**；客户端 240s 零字节超时。
+
+**根因：** 探针 token 被刻意排除在用户 `n_predict` 之外，也不计入 `check_hard_limits` 统计的 public/private/pending → **没有任何上限**（episode 预算由 context 推导，可达 8k）。
+
+**修复：**
+1. `SERVER_REROT_PROBE_MAX_TOKENS = 512` 硬上限（探针提交路径逐 token 检查），超限即 fail-closed：`rerot_resource_exhausted: routing probe exceeded 512 tokens without a plan terminator`；
+2. `rerot_try_finish_probe`：终止空行已到且解析被拒时**立即定案**（文法只能在终止符完成 ⇒ 判决终局），不再等 EOG 白烧一步；
+3. trace 门控新增 `rerot.trace.probe_reject`（打印完整计划文本）；EOG abort 文案区分「探针未决」与「worker 分隔符未关」。
+
+**实测：** 挂死 → **40.2s** 精确报错（原 240s+ 无界）；语义非法计划 → **5.1–5.6s** `routing plan rejected: line 2: duplicate question id: -`；正常路径 `13*17` → **HTTP 200 / 9.4s**，`probe_tokens=37, frame_tokens=0` → 单节点判为 `simple`，产出 96 token 真实推理。
+
+### 四、KV 上限结论（负责人给定）
+
+**K = q8_0、V = turbo4 已是极限，不可再压。** 对照观察支持此结论：同一提示在 `-ctk turbo3 -ctv turbo3` 下探针**打转**，换 `q8_0/turbo4` 后能收尾。本轮真机复测一律使用 `-ctk q8_0 -ctv turbo4`。
+
+### 五、验证记录
+
+- `test-backend-ops -b Vulkan0`：**TURBO_WHT 45/45**、**SET_ROWS 319/319**、**CPY 250/250** 全部 OK；
+- `dmesg` GPUVM / page fault 计数 = **0**；多轮真机模型运行后 **Xorg_OK**（崩溃不再复现）；
+- `ctest -R "rerot|xkv|flashprefill"`：**50/50 全绿**（覆盖 `test-rerot-parser/view/runtime/attn/ddvr/math/profile/recurrent/span-expand/q-prep/q3-shared-kv-2reader/shared-block` 与 `test-flashprefill-{state,routing,select,attn}`、`test-xkv-*`）；
+- `llama-server` 与全部测试目标编译零 error、改动文件零 warning。
+
+### 六、未闭合与待决策
+
+1. **探针失败策略**：当前 fail-closed（整请求报错），与 RERoT.md「不可静默修复」红线一致；是否改为「探针失败 → 退化为普通单流续写」属产品语义变更，待负责人决定。
+2. **id 退化**：该模型常把 `-` 当项目符号 → 多行 id 全为 `-` → 重复拒选（文法 `id ::= [A-Za-z0-9_-]+` 允许）。可选收紧为「id 至少含一个字母数字」，只改报错措辞、不改变成败。
+3. 本轮全部为开发机单卡 780M 上真机验证；5×6800 目标机的 RERoT 多 lane 收益与 DAG 全链路仍需在该机复测。
+
 ## 下班交接｜2026-09-22（第十九轮，最终交付：FlashPrefill 共享 Run 分桶与 Base 零拷贝 + 十问缺口完整盘点归档）
 
 **分支：** `master`

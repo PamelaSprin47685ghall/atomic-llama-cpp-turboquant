@@ -411,7 +411,7 @@ void quantize(uint dst_idx, uint src_idx)
 #if defined(SET_ROWS) && defined(DATA_A_TURBO3_0)
 void main() {
     const uint t   = gl_LocalInvocationID.x;
-    const uint g   = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint g   = ((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x);
     const uint gpr = p.ne00 / 128;
 
     if (gpr == 0) return;
@@ -534,7 +534,7 @@ shared float gnrm_t2;
 
 void main() {
     const uint t   = gl_LocalInvocationID.x;
-    const uint g   = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint g   = ((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x);
     const uint gpr = p.ne00 / 128;
 
     if (gpr == 0) return;
@@ -656,7 +656,7 @@ shared float gnrm_t4;
 
 void main() {
     const uint t   = gl_LocalInvocationID.x;
-    const uint g   = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint g   = ((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x);
     const uint gpr = p.ne00 / 128;
 
     if (gpr == 0) return;
@@ -741,7 +741,7 @@ void main() {
 
 void main() {
     const uint t   = gl_LocalInvocationID.x;    // 0..31, one per block element
-    const uint g   = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint g   = ((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x);
     const uint gpr = p.ne00 / 32;  // blocks per row
 
     if (gpr == 0) return;
@@ -859,7 +859,7 @@ void main() {
     init_iq_shmem(gl_WorkGroupSize);
 #endif
 
-    const uint idx = ((gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x) * BLOCK_SIZE + gl_LocalInvocationID.x) * QUANT_K;
+    const uint idx = ((((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x)) * BLOCK_SIZE + gl_LocalInvocationID.x) * QUANT_K;
 
     if (idx >= p.ne) {
         return;
@@ -887,7 +887,7 @@ void main() {
     init_iq_shmem(gl_WorkGroupSize);
 #endif
 
-    const uint idx = (gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x * 32 + gl_LocalInvocationID.x) * QUANT_K;
+    const uint idx = (((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x) * 32 + gl_LocalInvocationID.x) * QUANT_K;
 
     if (idx >= p.ne) {
         return;

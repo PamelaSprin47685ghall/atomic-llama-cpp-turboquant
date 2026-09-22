@@ -1,5 +1,5 @@
 void main() {
-    const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+    const uint i = (gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * 512u + gl_GlobalInvocationID.x;
 
     if (i >= p.N) {
         return;

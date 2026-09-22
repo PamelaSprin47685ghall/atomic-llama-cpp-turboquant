@@ -18,7 +18,7 @@ shared FLOAT_TYPE tmpmax[BLOCK_SIZE];
 shared uint tmp[BLOCK_SIZE];
 
 void main() {
-    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint row = ((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x);
     const uint col = gl_LocalInvocationID.x;
 
     if (row >= p.KY) {

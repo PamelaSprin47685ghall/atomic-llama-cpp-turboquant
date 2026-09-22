@@ -40,7 +40,7 @@ shared FLOAT_TYPE vals[BLOCK_SIZE];
 // as if it were a template function, to allow unrolling.
 void soft_max(uint num_iters) {
     const uint tid = gl_LocalInvocationID.x;
-    const uint rowx = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint rowx = ((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x);
 
     const uint32_t i03 = rowx / (p.ne01 * p.ne02);
     const uint32_t i02 = (rowx - i03 * p.ne01 * p.ne02) / p.ne01;

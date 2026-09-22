@@ -17,7 +17,7 @@ layout (binding = 2) buffer D {D_TYPE data_d[];};
 shared FLOAT_TYPE sum_yg[BLOCK_SIZE];
 
 void main() {
-    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint row = ((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x);
     const uint tid = gl_LocalInvocationID.x;
 
     if (row >= p.KY) {

@@ -15,7 +15,7 @@ layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 shared FLOAT_TYPE tmp[BLOCK_SIZE];
 
 void main() {
-    const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint row = ((gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y) * gl_NumWorkGroups.x + gl_WorkGroupID.x);
     const uint col = gl_LocalInvocationID.x;
     const float weight = p.weight;
 

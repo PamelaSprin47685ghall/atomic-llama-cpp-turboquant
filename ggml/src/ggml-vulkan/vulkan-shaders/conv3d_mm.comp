@@ -165,7 +165,7 @@ Z,P,Q=OD,OH,OW
 */
 
 uint32_t B_idx_K   = gl_WorkGroupID.x;
-uint32_t B_idx_NPQ = gl_WorkGroupID.y + gl_WorkGroupID.z * 512;
+uint32_t B_idx_NPQ = gl_WorkGroupID.y + gl_WorkGroupID.z * gl_NumWorkGroups.y;
 
 uint32_t T_y = tid / NT_NPQ;
 uint32_t T_x = tid % NT_NPQ;

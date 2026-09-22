@@ -159,6 +159,14 @@ enum class server_rerot_injection_kind : uint8_t {
     plan_prefix,
 };
 
+
+// A routing plan is a few short lines by construction — that is the entire
+// point of the dependency-line DSL. Probe tokens are deliberately excluded
+// from the user's n_predict budget and from the episode visibility counters,
+// so without this cap a plan that never emits the blank-line terminator would
+// ramble until the whole context is full (observed: model looping plan lines
+// for 240s with zero bytes streamed). Fail closed well before that.
+static constexpr uint64_t SERVER_REROT_PROBE_MAX_TOKENS = 512;
 static constexpr size_t SERVER_REROT_PRIVATE_BATCH = 32;
 
 static bool server_rerot_private_microbatch(server_rerot_injection_kind injection) {
@@ -3242,7 +3250,20 @@ private:
         }
         const auto decision = server_rerot_parse_routing_decision(episode->probe_bytes);
         if (!decision.error.empty()) {
-            return true;
+            // The routing grammar can only complete at the blank-line terminator,
+            // so a plan rejected here is final: no later token can extend it.
+            // Report the parser's own diagnosis immediately instead of letting
+            // the sampler emit EOG and surfacing an unrelated delimiter error
+            // (which also costs one extra decode step before failing closed).
+            if (slot.task && slot.task->params.rerot_trace) {
+                SRV_INF("rerot.trace.probe_reject: episode=%" PRIu64 " bytes=%zu error=%s plan=%s\n",
+                    slot.rerot_episode_id, episode->probe_bytes.size(),
+                    decision.error.c_str(), episode->probe_bytes.c_str());
+            }
+            rerot->hard_abort(
+                slot.rerot_episode_id,
+                "rerot_protocol_error: routing plan rejected: " + decision.error);
+            return false;
         }
         const uint64_t probe_ep_id = slot.rerot_episode_id;
         auto probe_transport_it = rerot_transport.find(probe_ep_id);
@@ -4148,6 +4169,17 @@ private:
             slot.rerot_inflight_extra_plans.clear();
             slot.rerot_inflight_extra_bytes.clear();
             slot.rerot_inflight_forced = false;
+            // Nothing else bounds the probe (see SERVER_REROT_PROBE_MAX_TOKENS):
+            // a plan that never terminates must fail closed, not burn the context.
+            if (episode_now->probe_tokens > SERVER_REROT_PROBE_MAX_TOKENS) {
+                rerot->hard_abort(
+                    episode_id,
+                    string_format(
+                        "rerot_resource_exhausted: routing probe exceeded %" PRIu64
+                        " tokens without a plan terminator",
+                        SERVER_REROT_PROBE_MAX_TOKENS));
+                return false;
+            }
             return rerot_try_finish_probe(slot);
         }
         const auto injection = slot.rerot_injection;
@@ -4736,9 +4768,14 @@ private:
 
         if (!slot.rerot_serial_tail) {
             if (llama_vocab_is_eog(vocab, id)) {
+                const auto * ep = rerot ? rerot->episode(slot.rerot_episode_id) : nullptr;
+                const bool undecided_probe =
+                    ep && ep->probing && !ep->strategy_decided;
                 rerot->hard_abort(
                     slot.rerot_episode_id,
-                    "rerot_protocol_error: EOG sampled before the current child delimiter closed");
+                    undecided_probe
+                        ? "rerot_protocol_error: EOG sampled while the routing plan was still undecided"
+                        : "rerot_protocol_error: EOG sampled before the current child delimiter closed");
                 return false;
             }
             slot.sampled = id;
@@ -5773,9 +5810,15 @@ private:
     }
 
     bool external_slot_eligible(const server_task & task, const server_slot & slot) const {
-        return !params_base.rerot_enabled ||
-            task.is_child() ||
-            slot.id < params_base.n_parallel;
+        if (!params_base.rerot_enabled || task.is_child()) {
+            return true;
+        }
+        // Root requests occupy the first B slots so provisional brain_row_for_seq
+        // (seq_id < n_brain_rows) holds through C0 prefill. Prefer explicit B.
+        const int request_cap = params_base.rerot_person_max > 0
+            ? (int) params_base.rerot_person_max
+            : params_base.n_parallel;
+        return slot.id < request_cap;
     }
 
     bool rerot_person_admission_available(const server_task & task) const {
