@@ -79,6 +79,12 @@ struct ggml_tp5_profile {
     std::atomic<uint64_t> vk_rerot_shmem_reject{0};
     std::atomic<uint64_t> vk_rerot_reject_reasons[(size_t) ggml_tp5_rerot_reject_reason::count]{};
 
+    // GDN (GATED_DELTA_NET) dispatch & eligibility evidence, §9.1: separate
+    // from the RERoT attention counters so a GDN rejection is never
+    // misattributed as an indexed-attention reject.
+    std::atomic<uint64_t> vk_gdn_dispatch{0};
+    std::atomic<uint64_t> vk_gdn_reject_reasons[(size_t) ggml_tp5_rerot_reject_reason::count]{};
+
     void reset(uint64_t new_id, bool decode);
     void print_summary() const;
 };

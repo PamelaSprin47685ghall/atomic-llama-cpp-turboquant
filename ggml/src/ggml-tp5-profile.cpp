@@ -70,6 +70,10 @@ void ggml_tp5_profile::reset(uint64_t new_id, bool decode) {
     for (size_t i = 0; i < (size_t) ggml_tp5_rerot_reject_reason::count; ++i) {
         vk_rerot_reject_reasons[i] = 0;
     }
+    vk_gdn_dispatch = 0;
+    for (size_t i = 0; i < (size_t) ggml_tp5_rerot_reject_reason::count; ++i) {
+        vk_gdn_reject_reasons[i] = 0;
+    }
 }
 
 void ggml_tp5_profile::print_summary() const {
@@ -151,6 +155,17 @@ void ggml_tp5_profile::print_summary() const {
                 r_rej_shape,
                 r_rej_subgrp,
                 r_rej_layout);
+    }
+    const uint64_t g_disp = vk_gdn_dispatch.load();
+    const uint64_t g_rej_shape = vk_gdn_reject_reasons[(size_t) ggml_tp5_rerot_reject_reason::unsupported_shape].load();
+    const uint64_t g_rej_type = vk_gdn_reject_reasons[(size_t) ggml_tp5_rerot_reject_reason::unsupported_type].load();
+    const uint64_t g_rej_layout = vk_gdn_reject_reasons[(size_t) ggml_tp5_rerot_reject_reason::layout].load();
+    if (g_disp != 0 || g_rej_shape != 0 || g_rej_type != 0 || g_rej_layout != 0) {
+        fprintf(stderr,
+                "[tp5-gdn-profile] exec=%" PRIu64 " dispatch=%" PRIu64
+                " reject_shape=%" PRIu64 " reject_type=%" PRIu64
+                " reject_layout=%" PRIu64 "\n",
+                graph_exec_id, g_disp, g_rej_shape, g_rej_type, g_rej_layout);
     }
 }
 

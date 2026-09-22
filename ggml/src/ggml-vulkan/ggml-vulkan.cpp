@@ -21299,6 +21299,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
 
     case GGML_OP_GATED_DELTA_NET:
+        if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+            prof->vk_gdn_dispatch.fetch_add(1, std::memory_order_relaxed);
+        }
         ggml_vk_gated_delta_net(ctx, compute_ctx, node);
 
         break;
@@ -25651,6 +25654,15 @@ static void ggml_vk_rerot_reject(ggml_tp5_rerot_reject_reason reason) {
     }
 }
 
+// Same evidence channel for the GATED_DELTA_NET eligibility gate (§9.1):
+// separate counters so a GDN rejection is never misattributed as an
+// indexed-attention reject. Zero-overhead when GGML_TP5_PROFILE is unset.
+static void ggml_vk_gdn_reject(ggml_tp5_rerot_reject_reason reason) {
+    if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+        prof->vk_gdn_reject_reasons[(size_t) reason].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
@@ -26638,16 +26650,19 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             {
                 const uint32_t S_v = op->src[2]->ne[0];
                 if (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) {
+                    ggml_vk_gdn_reject(ggml_tp5_rerot_reject_reason::unsupported_shape);
                     return false;
                 }
                 for (int i = 0; i < 6; i++) {
                     if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32) {
+                        ggml_vk_gdn_reject(ggml_tp5_rerot_reject_reason::unsupported_type);
                         return false;
                     }
                 }
                 // RBB reads the per-writer native overlay as src[6].
                 if (ggml_get_op_params_i32(op, 1) != 0 &&
                     (op->src[6] == nullptr || op->src[6]->type != GGML_TYPE_F32)) {
+                    ggml_vk_gdn_reject(ggml_tp5_rerot_reject_reason::unsupported_type);
                     return false;
                 }
                 // TP5 GDN head map (opt-in): validate before enqueue so no
@@ -26658,23 +26673,31 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     const ggml_tp5_gdn_headmap headmap = ggml_tp5_gdn_headmap_decode(op);
                     if (headmap.present) {
                         if (!headmap.valid) {
+                            ggml_vk_gdn_reject(ggml_tp5_rerot_reject_reason::layout);
                             return false;
                         }
                         if (ggml_get_op_params_i32(op, 1) != 0) {
+                            ggml_vk_gdn_reject(ggml_tp5_rerot_reject_reason::layout);
                             return false;
                         }
                         if (op->src[2]->ne[1] != (int64_t) headmap.count) {
+                            ggml_vk_gdn_reject(ggml_tp5_rerot_reject_reason::unsupported_shape);
                             return false;
                         }
                         for (uint32_t i = 0; i < headmap.count; ++i) {
                             if (headmap.qk[i] >= (uint32_t) op->src[0]->ne[1] ||
                                 headmap.qk[i] >= (uint32_t) op->src[1]->ne[1]) {
+                                ggml_vk_gdn_reject(ggml_tp5_rerot_reject_reason::unsupported_shape);
                                 return false;
                             }
                         }
                     }
                 }
-                return op->type == GGML_TYPE_F32;
+                if (op->type != GGML_TYPE_F32) {
+                    ggml_vk_gdn_reject(ggml_tp5_rerot_reject_reason::unsupported_type);
+                    return false;
+                }
+                return true;
             }
         case GGML_OP_SSM_SCAN:
             {
