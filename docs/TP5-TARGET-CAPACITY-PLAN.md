@@ -398,6 +398,21 @@ over 256 线程 → 每 subgroup 恰 2 行），但旧实现走 LDS 往返：`ro
 **语义**：归并仍是 16 项的树状重结合（旧版是 16 项串行链）——aggressive 模式
 本就声明重结合自由；发布顺序与 word 地址逐一保持。
 
+### 7.13 ACT_Q8 打包约定 bug 修复（§7.9 引入，本轮静态发现）
+
+第十七轮把 resume_lo_q8 的打包换成 shuffle 时推导了 `qs_words[j] = lanes
+4j..4j+3 LE` 的全库约定（PACK_WEIGHTS、Q8DOT 消费者、resume_lo_q8 三方一致），
+反查发现 **ACT_Q8（§7.9 激活打包引入）从未按 packed 布局改写**：它仍存
+16 个半字到 `qs_words[2*lane]`/`[2*lane+1]`——索引越界到 15（数组只有 8），
+且每字只有 16/32 payload 位。OOB 写入会溢出到相邻块（跨 subgroup 竞争），
+Q8DOT 消费者读到的上半 16 位是垃圾。
+
+**修复**：lane<8 时一次拼 4×8 全字存 `qs_words[lane]`，与 PACK_WEIGHTS
+逐位一致。mesh 测试只建 pipeline 不跑 latebind plan，所以此 bug 一直未被
+运行时抓住——**这正是"bit 级正确性靠布局等价推导"必须覆盖每个生产者的
+教训**：三个生产者（pack_weights/act_q8/lo_q8）必须共享同一条 word 拼装
+公式，而不是各自手写。
+
 ### 7.12 §4.1 几何第二步：resume_norm / resume_lo_q8 / UP_Q8DOT 三 kernel 收口
 
 第十六轮把 Q8DOT 行归并换成半波 shuffle 树后，本轮把同一原则推到剩余三个

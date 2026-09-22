@@ -288,12 +288,17 @@ void main() {
 
         const uint out_block = token * (p.streams * blocks) + stream * blocks + block;
         if (lane == 0u) act_q8[out_block].d = d;
+        // §7.9 layout fix: qs_words[j] must be a 4x8 little-endian word
+        // (lanes 4j..4j+3), matching PACK_WEIGHTS and the Q8DOT consumers.
+        // The previous store wrote sixteen half-words at indices 0..15 —
+        // past the 8-word array and with only 16 of 32 payload bits set.
         if (lane < 8u) {
             const uint base = subgroup * 32u + 4u * lane;
-            const uint w0 = uint(q_shared[base]) & 0xffu | (uint(q_shared[base + 1u]) & 0xffu) << 8u;
-            const uint w1 = uint(q_shared[base + 2u]) & 0xffu | (uint(q_shared[base + 3u]) & 0xffu) << 8u;
-            act_q8[out_block].qs_words[2u * lane] = w0;
-            act_q8[out_block].qs_words[2u * lane + 1u] = w1;
+            const uint word = uint(q_shared[base]) & 0xffu |
+                              (uint(q_shared[base + 1u]) & 0xffu) << 8u |
+                              (uint(q_shared[base + 2u]) & 0xffu) << 16u |
+                              (uint(q_shared[base + 3u]) & 0xffu) << 24u;
+            act_q8[out_block].qs_words[lane] = word;
         }
         barrier();
     }
