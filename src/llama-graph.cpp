@@ -926,9 +926,72 @@ void llm_graph_input_attn_rerot::fill_spans(
     }
 
     st_entries.assign((size_t) entries->ne[1] * 2, 0);
-    for (size_t i = 0; i < n_entries; ++i) {
-        st_entries[2 * i + 0] = (int32_t) layout.entries[i].key_index;
-        st_entries[2 * i + 1] = (int32_t) layout.entries[i].group_index;
+    // Sixteenth round (question two): const-effective contiguous segments
+    // arrive as a span side-channel (key range + group + entry slot), so
+    // the i32 staging buffer expands from O(spans) range writes instead of
+    // O(entries) per-key conversions. Spans with entry_index beyond
+    // n_entries (stale/capacity) are rejected by the layout validator.
+    // Non-span rows come from the authoritative entry stream: the builder
+    // wrote scalar arms (and mixed general shapes) there; spans are absent
+    // for those queries, so a whole-layout span table with holes still
+    // expands correctly (uncovered rows copied, covered rows skipped).
+    const uint64_t span_rows = [&] {
+        uint64_t total = 0;
+        for (const auto & sp : layout.spans) {
+            total += sp.count;
+        }
+        return total;
+    }();
+    if (span_rows == 0) {
+        // General shape (duplicate storage, non-contiguous runs, tests):
+        // the plain copy.
+        for (size_t i = 0; i < n_entries; ++i) {
+            st_entries[2 * i + 0] = (int32_t) layout.entries[i].key_index;
+            st_entries[2 * i + 1] = (int32_t) layout.entries[i].group_index;
+        }
+    } else {
+        // Expand by entry ranges (sixteenth round): the span table is
+        // emitted in merge order, so entry_index is non-decreasing. Walk
+        // the table once with a cursor: slots between spans are the
+        // authoritative scalar entries (copied verbatim), slots inside a
+        // span are the ascending key range with the span's single group.
+        // O(n_entries) total, no bitmap, two int32 stores per row.
+        size_t cursor = 0;
+        for (const auto & sp : layout.spans) {
+            if (n_entries && sp.entry_index >= n_entries) {
+                throw std::runtime_error(
+                    "RERoT DDVR: span entry index beyond live entries;"
+                    " rebuild required, refusing to misroute keys");
+            }
+            if (n_entries && (uint64_t) sp.entry_index + sp.count > n_entries) {
+                throw std::runtime_error(
+                    "RERoT DDVR: span range beyond live entries;"
+                    " rebuild required, refusing to misroute keys");
+            }
+            if (sp.entry_index < cursor) {
+                throw std::runtime_error(
+                    "RERoT DDVR: span table is not entry-ordered;"
+                    " rebuild required");
+            }
+            // Scalar rows before this span.
+            for (; cursor < sp.entry_index; ++cursor) {
+                st_entries[2 * cursor + 0] = (int32_t) layout.entries[cursor].key_index;
+                st_entries[2 * cursor + 1] = (int32_t) layout.entries[cursor].group_index;
+            }
+            // Span rows: ascending run range with one group (branchless
+            // inner loop — vectorizes to two interleaved stores).
+            int32_t * out = st_entries.data() + 2 * (size_t) sp.entry_index;
+            for (uint32_t k = 0; k < sp.count; ++k) {
+                out[2 * k + 0] = (int32_t) (sp.key_start + k);
+                out[2 * k + 1] = (int32_t) sp.group_index;
+            }
+            cursor += sp.count;
+        }
+        // Tail rows after the last span.
+        for (; cursor < n_entries; ++cursor) {
+            st_entries[2 * cursor + 0] = (int32_t) layout.entries[cursor].key_index;
+            st_entries[2 * cursor + 1] = (int32_t) layout.entries[cursor].group_index;
+        }
     }
 
     st_offsets.assign(n_offsets, 0);

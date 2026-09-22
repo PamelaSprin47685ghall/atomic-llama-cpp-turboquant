@@ -2526,6 +2526,17 @@ c3648d789  DAG logical/view/fixed-entry implementation
   默认 validate（tier-1 max-reduce）在 R=12 上固定占 ~5ms；val=0 时 numeric+direct-emit=4.3ms，已逼近 25MB emit 的内存带宽下界。
 - **验证**：全 rerot/xkv/flashprefill 电池 0 failure；ASAN（/tmp/asan15，Debug+ASAN 全量重建）0 错误；`test_rerot_world_incremental_decode` Phase 1–7 全过（含 MTP 重复 storage 形状——正是它把 groups size 交互 bug 钉住）。
 
+**第十六轮：问题二的段级表示落地——span 侧信道让默认 validate 与关掉等速（09-22 夜班）**：
+
+- **动机（十问问题二）**：reader view 不必是逐 key 排列。段内第 j 枚 key 的 effective 位置 \(p_i+s_0-b_i\) 与 \(j\) 无关，整段共享一枚 effective Q；视图的描述复杂度应取决于 run/段数，而不是历史 token 数。第十五轮后 host 侧剩余固定成本只剩 **默认 validate 档的 3.1M-entry 顺序最大值扫描（~4.6ms @R=12 K=262k）** 与 fill_spans 的 2×25MB 跨步转换——两者都在为“逐 entry”付费，而生产 decode 形状里 12/13 的段是整个连续范围。
+- **改动一（`llama_rerot_attn_layout::span`）**：新侧信道记录 `{key_start, count, group_index, entry_index}`——merge 的 bulk（const-effective＋contiguous-identity）分支每段 push_back 一次（R=12 时每 query 12 次而非 21845 次结构写），entry_index 是全局 entry 槽位，group_index 在 merge 解决组号后回填。`entries` 仍是权威契约（op params、直接 set 路径、测试都读它）——span 只描述，不替换。
+- **改动二（tier-1 validate 改查段边界）**：默认档从“3.1M-entry max-reduce”变为“span 表边界检查＋未覆盖槽的 gap 扫描”。生产形状下 span 覆盖 ~全部 entry，实际扫描量跌到 base 臂的零星行。**validate 相：4.6ms → 3us；validate=1 与 validate=0 首次等速**（R=12 4139↔4162us 噪声带内）。
+- **改动三（fill_spans 按段展开）**：staging 的 i32 缓冲区从“逐 entry 跨步转换”改为游标式展开：span 之间是 scalar entry（原样拷贝），span 之内是 `key_start+k` 连续范围+单一 group 的无分支内循环；拒绝 entry_index 乱序/越界（fail-loud 于上传路径之前，不得静默错路由 key）。
+- **span reserve 绑定诚实上界**：`(world run 数+1) × 每 reader query 行数`，取代“随 groups 走 entry_bound”的过度预留。
+- **踩坑记录（重要）**：第一版让 bulk 分支跳过 entry 写入、只留 span，`layout.entries` 保持零填充，cache 级 11 个测试立刻全红（`g[0..4]=k0,4`——同一 key 重复）。**原因：entries 是既有消费者的权威流（test 直读、op params 的 live_entries、直接 set 路径），span 只是旁路**。修正方案：builder 仍写 entries，span 只喂 loader/validator 的 O(段) 路径。这正是“重构必须尊重既有契约”的实例——Q2 的段描述化要一直到 kernel 契约支持 span tensor 才能真正去掉逐 entry 物化。
+- **测试**：`test_rerot_shared_reader_multi_query`（MTP 重复 storage 形状，正是最可能暴露 span 与 entry 分叉的形状）新增 span 契约断言：零长度 span 拒绝、group/key/entry 三重边界、**span 展开逐 slot 复现 authoritative entry 流**（key==base+k 且 group 一致）、entry-ordered 游标单调。`test_rerot_world_incremental_decode` Phase 1–7 同路径覆盖。
+- **实测**（cache-prod bench，生产 scratch 路径，min-of-5）：R=12 K=262144 validate=0/默认 **4142/4162us**（validate 成本首次归零）；R=6 K=131072 1179us；R=6 K=65536 611us。默认档与关档等速意味着"关掉 validate 换速度"的取舍消失——builder 是唯一真理的同时，审计也免费。
+
 ### 21.2 验证证据
 
 - `test-rerot-math`：0 failure。Q3 对拍独立全 softmax oracle（含不可见读者、合并顺序无关性）；Q5 对拍稠密 §2.3 逐步递推（12 步，α<1，异构 β，秩每步恰 +1，dense/output 双等价，多 lane 共享投影位级一致）；Q6 24 个随机 chunk（T=1..8，含 β=0 纯衰减，此时 M=G·I、Y=0 精确成立）对拍逐步 oracle ≤1e-10；Q7 全部四种编码存在下对拍 (code−1) 解码 oracle，整数 activation 时位级相等。

@@ -892,7 +892,7 @@ bool llama_rerot_attn_layout::validate(uint32_t n_keys, std::string * error) con
     }();
     if (validate_mode <= 1) {
         if (n_queries == 0) {
-            if (!groups.empty() || !entries.empty() || !query_offsets.empty()) {
+            if (!groups.empty() || !entries.empty() || !query_offsets.empty() || !spans.empty()) {
                 return set_error(error, "empty RERoT attention layout contains data");
             }
             return true;
@@ -913,19 +913,49 @@ bool llama_rerot_attn_layout::validate(uint32_t n_keys, std::string * error) con
             }
         }
         if (validate_mode == 1) {
-            // Sequential range audit, branchless: reduce the maxima of
-            // key_index and group_index over all entries (auto-vectorized
-            // max walk — no per-entry branch, no random access) and compare
-            // once against the bounds. The per-entry group->query
-            // consistency walk (random access into groups) is the tier-2
-            // paranoid audit.
-            uint32_t max_key = 0, max_group = 0;
-            for (const auto & entry : entries) {
-                max_key = entry.key_index > max_key ? entry.key_index : max_key;
-                max_group = entry.group_index > max_group ? entry.group_index : max_group;
+            // Sequential range audit (sixteenth round, question two):
+            // check the span table's RANGE BOUNDS instead of walking every
+            // entry — one bound check covers a whole const-effective
+            // segment. Uncovered rows (scalar merge arms, general shapes
+            // built without the span channel) fall back to the sequential
+            // per-entry max walk. No random access in either branch.
+            uint64_t covered = 0;
+            for (const auto & sp : spans) {
+                if (sp.group_index >= n_groups) {
+                    return set_error(error, "RERoT attention entry is out of range");
+                }
+                if ((uint64_t) sp.entry_index + sp.count > entries.size()) {
+                    return set_error(error, "RERoT span entry range is out of bounds");
+                }
+                if ((uint64_t) sp.key_start + sp.count > n_keys) {
+                    return set_error(error, "RERoT attention entry is out of range");
+                }
+                covered += sp.count;
             }
-            if (max_key >= n_keys || max_group >= n_groups) {
-                return set_error(error, "RERoT attention entry is out of range");
+            if (covered < entries.size()) {
+                // Uncovered rows (scalar merge arms / base rows): walk
+                // ONLY the gaps between spans (same cursor discipline as
+                // the loader) so the tier-1 audit stays O(entries -
+                // span_rows) instead of O(entries).
+                uint32_t max_key = 0, max_group = 0;
+                size_t cursor = 0;
+                const auto scan = [&](size_t from, size_t to) {
+                    for (size_t i = from; i < to; ++i) {
+                        max_key = entries[i].key_index > max_key ? entries[i].key_index : max_key;
+                        max_group = entries[i].group_index > max_group ? entries[i].group_index : max_group;
+                    }
+                };
+                for (const auto & sp : spans) {
+                    if (sp.entry_index < cursor) {
+                        return set_error(error, "RERoT span table is not entry-ordered");
+                    }
+                    scan(cursor, sp.entry_index);
+                    cursor = (size_t) sp.entry_index + sp.count;
+                }
+                scan(cursor, entries.size());
+                if (max_key >= n_keys || max_group >= n_groups) {
+                    return set_error(error, "RERoT attention entry is out of range");
+                }
             }
         }
         return true;
@@ -2400,7 +2430,6 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
             }
         }
 
-
         // Base arm: untagged rows owned by THIS reader, (storage, idx)
         // order, deviation-ordered (same identity as the single-reader
         // builder: d = storage[j] - j over the full array, prefix cuts keep
@@ -2490,8 +2519,10 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
             L.key_ids.reserve(hint);
         }
         for (size_t qi = 0; qi < query_storage_pos[r].size(); ++qi) {
+            const size_t query_span_start = sink && sink->spans_out
+                ? sink->spans_out->size() : 0;
             const llama_pos q_pos = query_storage_pos[r][qi];
-            // Causal cuts: base prefix + per-segment tagged prefix.
+
             size_t base_cut = 0;
             {
                 const auto cut = std::upper_bound(base_storage.begin(), base_storage.end(), q_pos);
@@ -2724,7 +2755,6 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
                 // cursor.
                 std::fill(merge_pos.begin(), merge_pos.end(), 0);
                 llama_rerot_attn_entry * emit_out = nullptr;
-                uint32_t group_base = 0;
                 size_t emit_cursor = 0;
                 if (sink) {
                     emit_out = sink->entries + sink->entry_cursor;
@@ -2751,6 +2781,9 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
                     const uint32_t group_index = sink
                         ? uint32_t(sink->groups_out->size())
                         : uint32_t(layout.groups.size());
+                    const size_t span_begin = sink && sink->spans_out
+                        ? sink->spans_out->size()
+                        : 0;
                     bool emitted = false;
                     for (size_t li = 0; li < lists.size(); ++li) {
                         // Contiguous-identity fast path: the whole list
@@ -2765,10 +2798,29 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
                             lists[li].head(int64_t(merge_pos[li])) == best) {
                             const size_t p = merge_pos[li];
                             const size_t n = n_rows - p;
-                            llama_rerot_attn_entry * out = emit_out + emit_cursor;
-                            const uint32_t * kids = lists[li].keys() + p;
-                            for (size_t i = 0; i < n; ++i) {
-                                out[i] = { kids[i], group_index };
+                            if (sink && sink->spans_out) {
+                                // Span side-channel (sixteenth round): the
+                                // bulk segment is a contiguous ascending key
+                                // range — describe it once so the loader and
+                                // the validator can work in O(ranges).
+                                // entry_index is the GLOBAL slot of the
+                                // first key (sink cursor + rows emitted for
+                                // this query so far); group_index is stamped
+                                // after the merge loop resolves it.
+                                // Entries are STILL written below: the vector
+                                // is the authoritative consumer contract
+                                // (direct-set paths and op params read it).
+                                const uint32_t * kids = lists[li].keys() + p;
+                                sink->spans_out->push_back(
+                                    { kids[0], uint32_t(n), 0,
+                                      uint32_t(sink->entry_cursor + emit_cursor) });
+                            }
+                            {
+                                llama_rerot_attn_entry * out = emit_out + emit_cursor;
+                                const uint32_t * kids = lists[li].keys() + p;
+                                for (size_t i = 0; i < n; ++i) {
+                                    out[i] = { kids[i], group_index };
+                                }
                             }
                             emit_cursor += n;
                             merge_pos[li] = n_rows;
@@ -2777,6 +2829,10 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
                         }
                         while (merge_pos[li] < n_rows &&
                                lists[li].head(int64_t(merge_pos[li])) == best) {
+                            // The span side-channel only covers WHOLE-LIST bulk
+                            // segments (const_eff); scalar arms always write
+                            // entries directly — a partially consumed bulk
+                            // list still lands here for its tail.
                             emit_out[emit_cursor++] = { lists[li].keys()[merge_pos[li]], group_index };
                             ++merge_pos[li];
                             emitted = true;
@@ -2791,6 +2847,14 @@ std::vector<std::vector<llama_rerot_query_layout>> multi_reader_numeric_pass(
                     if (sink) {
                         GGML_ASSERT(sink->groups_out->size() < sink->groups_out->capacity());
                         sink->groups_out->push_back({ sink->query_index_per_reader[r][qi], llama_pos(best) });
+                        // Stamp the group index onto spans recorded in
+                        // this iteration (they were pushed before the group
+                        // existed).
+                        if (sink->spans_out) {
+                            for (size_t si = span_begin; si < sink->spans_out->size(); ++si) {
+                                (*sink->spans_out)[si].group_index = group_index;
+                            }
+                        }
                     } else {
                         layout.groups.push_back({ 0, llama_pos(best) });
                     }

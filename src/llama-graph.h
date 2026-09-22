@@ -675,7 +675,6 @@ struct llm_graph_fp_key {
     int32_t  v_type = -1; // ggml_type tag of the V cache tensor at build
     int32_t  n_pos  = 1;  // positions per token (model-fixed; q_pos stride)
     int32_t  backend_variant = 0; // 0 = unset, 1 = CPU reference, 2 = Vulkan fused, 3 = CUDA native
-
     // The metadata is shared by layers, but their K/V formats need not be.
     // Indexed by logical layer; (-1,-1) denotes an ineligible layer.
     std::vector<std::pair<int32_t, int32_t>> layer_kv_types;

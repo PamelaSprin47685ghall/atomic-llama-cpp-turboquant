@@ -358,6 +358,45 @@ LateBind 全部 7 个内核的 push constant 把 `capacity_rows` 当执行行数
 
 ---
 
+## 下班交接｜2026-09-22（第十六轮，十问问题二落地：span 侧信道消灭默认 validate 成本——4.1ms / validate 免费）
+
+**分支：** `master`（本轮 commit 见 git log；第十五轮 `4f33d005a` 在历史里）
+
+### 一、本轮定位
+
+按十问中的问题二（reader view 应表现为「地址范围＋位置偏移＋可见性边界」而非逐 key 排列）审查第十五轮后的剖面：host 侧固定成本只剩两处「逐 entry」付费——默认 validate 的 3.1M-entry max-reduce（~4.6ms）与 fill_spans 的 2×25MB 跨步转换。生产 decode 形状里 12/13 段是整个连续范围（same effective Q、ascending key range），为每枚 key 单独付费没有信息量增益。
+
+### 二、改动
+
+1. **`llama_rerot_attn_layout::span` 侧信道**（`src/llama-rerot.h`）：`{key_start, count, group_index, entry_index}`。merge 的 bulk 分支每段 push_back 一次；entry_index 是全局 entry 槽位（merge 时 sink cursor + 已发射行），group_index 在 merge 解决组号后回填。**`entries` 仍是权威契约**（op params live_entries、直接 set 路径、测试直读）。
+2. **tier-1 validate 改查段边界**：span 表范围检查＋未覆盖槽的 gap 扫描（同一游标纪律）。R=12 val 相 4.6ms→3us，**validate=1 与 validate=0 首次等速**。
+3. **fill_spans 按段展开 i32 staging**（`src/llama-graph.cpp`）：span 之间 scalar entry 原样拷贝、span 之内 `key_start+k` 连续范围＋单 group 无分支内循环；拒绝 entry 乱序/越界。
+4. **span reserve 绑诚实上界**：`(world run 数+1) × 每 reader query 行数`。
+5. **缓存级测试新增 span 契约断言**（`test_rerot_shared_reader_multi_query`）：零长度拒绝、三重边界、**span 展开逐 slot 复现 authoritative entry 流**、entry-ordered 单调。MTP 重复 storage 形状正是最可能暴露分叉的形状。
+
+### 三、实测（cache-prod，min-of-5）
+
+|形状|14轮|15轮|16轮 val=0|16轮默认|
+|---|---|---|---|---|
+|R=12 K=262144|37,778|4,311|**4,142**|**4,162（首次免费）**|
+|R=6 K=131072|10,082|1,180|1,179|1,180|
+|R=6 K=65536|4,863|610|611|618|
+
+默认 validate 成本归零——「为速度关审计」的取舍消失。剩余 4.1ms 逼近 25MB emit 带宽下界；再降必须动 kernel 契约（span tensor 直喂 op，去掉 entries 物化）。
+
+### 四、关键纠错（写进 RERoT.md §21 第十六轮）
+
+第一版让 bulk 分支跳过 entries 写入、只留 span → 11 个 cache 测试全红（同一 key 重复 5 次）。根因：**entries 是既有消费者的权威流，span 只是旁路**；"bulk 跳过 entries"版本在任何直读 entries 的路径上都是错的。修正为 builder 仍写 entries。教训：段描述化的收益点在 loader/validator（O(段)），不在 builder 的发射契约——kernel 侧不吃 span tensor 之前，逐 entry 物化删不掉。
+
+### 五、下一班建议
+
+1. **kernel 契约升级（Q2 完全体）**：`ggml_flash_attn_ext_rerot` 接受 span tensor 变体（或 entries 的 RLE 编码），CPU/Vulkan 两侧实现；这是把 25MB upload 再砍一个数量级的唯一路径，但属 kernel 契约变更，需单独一轮＋全 op 测试。
+2. 十问问题一（公共子表达式单生产者）与问题三（公共 KV 块服务多 reader）需要图/kernel 侧改动，GPU 批准后启动。
+3. Q7（PQ2_0 LUT）已证伪 vec_dot 粒度；只值得 GEMM 级共享表重做。
+4. Q5/Q6（GDN 共同基底＋块递推）可在 CPU 侧继续推进数学层。
+
+---
+
 ## 下班交接｜2026-09-22（第十五轮，size 阶段价值初始化清零＋groups append 化：R=12 4.3ms / 69×）
 
 **分支：** `master`（本轮 commit 见 git log；第十四轮 `09dcdd4f6` 在历史里）

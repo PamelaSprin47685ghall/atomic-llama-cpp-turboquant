@@ -230,6 +230,29 @@ struct llama_rerot_attn_layout {
     std::vector<llama_rerot_attn_group> groups;
     std::vector<llama_rerot_attn_entry> entries;
     std::vector<uint32_t> query_offsets;
+    // Contiguous span description of the same entry stream (sixteenth
+    // round: question two of the compute-organization review). Each span
+    // fills entries[query_offsets[i] + inner .. + count) with the ascending
+    // key range [key_start, key_start + count), all tagged group_index.
+    // Emitted by the sink during the merge for every bulk
+    // (const-effective, contiguous-identity) segment — 12 appends per
+    // query instead of ~K per-entry struct writes. The loader
+    // (fill_spans) expands the span table into the i32 entry tensor.
+    //
+    // A segment that is NOT expressible (non-monotone keys, scalar merge
+    // arms) is simply absent from the table: the entry vector stays
+    // authoritative, so general shapes pay nothing and keep working.
+    struct span {
+        uint32_t key_start   = 0;   // first physical key of the range
+        uint32_t count       = 0;   // range length (keys are +1 ascending)
+        uint32_t group_index = 0;   // entry group for the whole range
+        uint32_t entry_index = 0;   // GLOBAL entry slot of key_start
+        // Absorption note (sixteenth round): a span is emitted DURING the
+        // merge, before the enclosing group index exists; the group is
+        // stamped after (see multi_reader_numeric_pass). entry_index lets
+        // the loader expand O(spans) without scanning.
+    };
+    std::vector<span> spans;
 
     bool empty() const {
         return n_queries == 0;
@@ -242,20 +265,15 @@ struct llama_rerot_attn_layout {
     // appended by the sink (push_back) and must start empty; offsets are
     // rebuilt by push_back. Stale bytes in `entries` beyond the emitted
     // cursor are never read: the shrink at the end caps the size.
-    // Reset for a fresh build while RETAINING capacity AND the entries'
-    // exact size: the builder pre-sizes `entries` to the frontier's upper
-    // bound by cursor write, so keeping the size makes the steady-state
-    // resize a no-op (no value-init pass over ~25MB). `groups` are
-    // appended by the sink (push_back) and must start empty; offsets are
-    // rebuilt by push_back. Stale bytes in `entries` beyond the emitted
-    // cursor are never read: the shrink at the end caps the size.
     void clear() {
         n_queries = 0;
         groups.clear();
+        spans.clear();
         query_offsets.clear();
     }
 
     bool validate(uint32_t n_keys, std::string * error = nullptr) const;
+
 
     // Persistent duplicate-key scratch for the validating mode: the layout
     // object lives across frontiers inside the KV cache, so the bitmap is
@@ -595,6 +613,13 @@ struct rerot_emission_sink {
     // closing resize growth.
     llama_rerot_attn_entry * entries = nullptr;
     std::vector<llama_rerot_attn_group> * groups_out = nullptr;
+    // Optional span side-channel: bulk (const-effective contiguous)
+    // segments append one span instead of COUNT entry writes. Non-null
+    // => the builder AVOIDS the per-entry writes for those segments and
+    // trusts the loader to expand them (layout.spans contracts the
+    // invariant; validate() compares entry stream and span stream).
+    // The cursor bookkeeping (entry_cursor) still advances by count.
+    std::vector<llama_rerot_attn_layout::span> * spans_out = nullptr;
     std::vector<uint32_t> * query_offsets = nullptr;
     std::vector<llama_pos> * query_virtual_pos = nullptr;
     // Per-reader ubatch-row arrays: query_index_per_reader[r][qi] is the

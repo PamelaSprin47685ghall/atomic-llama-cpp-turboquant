@@ -1558,6 +1558,34 @@ static void test_rerot_shared_reader_multi_query() {
     TEST_ASSERT(layout.query_offsets.front() == 0);
     TEST_ASSERT(layout.query_offsets.back() == layout.entries.size());
 
+    // Sixteenth-round span side-channel contract: every span names a live
+    // group, its key range stays inside the key table, its entry range lies
+    // inside the entry stream, and the span's expansion REPRODUCES the
+    // authoritative entry stream exactly (key == base + i, same group).
+    // Expansions must be entry-ordered and non-overlapping.
+    {
+        const auto & cells0sp = kv.get_cells(0);
+        size_t cursor = 0;
+        for (const auto & sp : layout.spans) {
+            TEST_ASSERT_MSG(sp.count > 0, "zero-length span");
+            TEST_ASSERT_MSG(sp.group_index < layout.groups.size(), "span group out of range");
+            TEST_ASSERT_MSG((uint64_t) sp.key_start + sp.count <= cells0sp.size(),
+                "span key range exceeds the key table");
+            TEST_ASSERT_MSG((uint64_t) sp.entry_index + sp.count <= layout.entries.size(),
+                "span entry range exceeds the entry stream");
+            TEST_ASSERT_MSG(sp.entry_index >= cursor, "span table not entry-ordered");
+            for (uint32_t k = 0; k < sp.count; ++k) {
+                const auto & e = layout.entries[(size_t) sp.entry_index + k];
+                TEST_ASSERT_MSG(e.key_index == sp.key_start + k, "span expansion disagrees on key");
+                TEST_ASSERT_MSG(e.group_index == sp.group_index, "span expansion disagrees on group");
+            }
+            cursor = (size_t) sp.entry_index + sp.count;
+        }
+        // Coverage: in the MTP/duplicate-storage shapes the scalar arms
+        // (base + gated runs) are NOT spanned; assert the union is within
+        // bounds without demanding full coverage.
+    }
+
     // Independent oracle: per-query llama_rerot_build_query_layout over a
     // key table rebuilt the way the cache builds it (all resident rows of
     // the unified stream, ownership from seq membership). This pins the

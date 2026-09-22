@@ -6625,6 +6625,23 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
         if (result.groups.capacity() < group_bound) {
             result.groups.reserve(group_bound);
         }
+        // Spans: one per bulk segment per query at most (list index count
+        // per reader), far smaller than the group bound — reserve the
+        // honest per-reader bound so the merge's push_backs stay realloc-
+        // free without a 25MB over-reservation.
+        {
+            // Honest span bound: each reader query emits at most one span
+            // per its ordered segments (run buckets + base arm), i.e. at
+            // most (world run count + 1) per query row.
+            const size_t run_ceiling = world.runs().size() + 1;
+            size_t span_bound = 0;
+            for (const auto & gv : groups) {
+                span_bound += gv.rows.size() * (run_ceiling + 1);
+            }
+            if (result.spans.capacity() < span_bound) {
+                result.spans.reserve(span_bound);
+            }
+        }
         // Entries: overwrite the full bound by cursor; only grow (and
         // zero-fill) when the previous frontier left it smaller.
         if (result.entries.size() != entry_bound) {
@@ -6640,11 +6657,18 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
         rerot_emission_sink sink;
         sink.entries = result.entries.data();
         sink.groups_out = &result.groups;
+        // Span side-channel (sixteenth round): bulk (const-effective,
+        // contiguous) segments describe themselves once in result.spans
+        // instead of writing n entries each. result.entries KEEPS its
+        // authoritative contents (scalar arms + all general shapes),
+        // while the loader expands the spans into the i32 tensor.
+        sink.spans_out = &result.spans;
         sink.query_offsets = &result.query_offsets;
         sink.query_virtual_pos = &rerot_qvp_sink;
         // Groups are appended by the sink: start from an empty (but
         // capacity-retaining) vector; entries are overwritten by cursor.
         result.groups.clear();
+        result.spans.clear();
         rerot_qvp_sink.clear();
         rerot_qvp_sink.reserve(size_t(ubatch.n_tokens));
         // Per-reader ubatch-row pointers: groups[g].rows in order — the
