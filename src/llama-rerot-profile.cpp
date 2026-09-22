@@ -111,6 +111,8 @@ void llama_rerot_profile::reset(uint64_t new_request_id) {
         phases[i].total_us.store(0, std::memory_order_relaxed);
         phases[i].max_us.store(0, std::memory_order_relaxed);
         phases[i].count.store(0, std::memory_order_relaxed);
+        phases[i].first_us.store(0, std::memory_order_relaxed);
+        phases[i].first_valid.store(0, std::memory_order_relaxed);
         phases[i].open_start_ns.store(0, std::memory_order_relaxed);
     }
 
@@ -198,6 +200,14 @@ void llama_rerot_profile::phase_exit(llama_rerot_phase phase) {
 void llama_rerot_profile::phase_accumulate(llama_rerot_phase phase, uint64_t duration_us) {
     const size_t p = (size_t) phase;
     if (p >= (size_t) llama_rerot_phase::count) return;
+    // §2.4 cold-transition billing: the first occurrence of a phase carries
+    // the one-time definition/compile/alloc cost that steady state amortizes.
+    // CAS-gated so only the true first accumulate wins (concurrent firsts
+    // keep whichever lands first; steady-state calls never overwrite).
+    uint64_t seen = 0;
+    if (phases[p].first_valid.compare_exchange_strong(seen, 1, std::memory_order_relaxed)) {
+        phases[p].first_us.store(duration_us, std::memory_order_relaxed);
+    }
     phases[p].total_us.fetch_add(duration_us, std::memory_order_relaxed);
     phases[p].count.fetch_add(1, std::memory_order_relaxed);
     atomic_max(phases[p].max_us, duration_us);
@@ -261,6 +271,7 @@ std::string llama_rerot_profile::format_tsv() const {
         ss << "phase_" << llama_rerot_phase_name(phase) << "_us\t" << phases[i].total_us.load(std::memory_order_relaxed) << "\n";
         ss << "phase_" << llama_rerot_phase_name(phase) << "_max_us\t" << phases[i].max_us.load(std::memory_order_relaxed) << "\n";
         ss << "phase_" << llama_rerot_phase_name(phase) << "_count\t" << phases[i].count.load(std::memory_order_relaxed) << "\n";
+        ss << "phase_" << llama_rerot_phase_name(phase) << "_first_us\t" << phases[i].first_us.load(std::memory_order_relaxed) << "\n";
     }
 
     // Routes
@@ -350,6 +361,26 @@ void llama_rerot_profile::print_summary(FILE * stream) const {
         phases[(size_t) llama_rerot_phase::workers_finish].total_us.load(std::memory_order_relaxed),
         phases[(size_t) llama_rerot_phase::synthesis].total_us.load(std::memory_order_relaxed),
         phases[(size_t) llama_rerot_phase::result_send].total_us.load(std::memory_order_relaxed));
+
+    // §2.4 cold-transition billing: first occurrence per phase (graph
+    // definition, pipeline compile, buffer allocs). steady =
+    // (total - first) / (count - 1) once count > 1.
+    std::fprintf(stream,
+        "[rerot-profile-cold] req=%" PRIu64
+        " prefill_first_us=%" PRIu64 " probe_first_us=%" PRIu64
+        " rebuild_first_us=%" PRIu64 " formal_p_first_us=%" PRIu64
+        " wstart_first_us=%" PRIu64 " wfront_first_us=%" PRIu64
+        " wfin_first_us=%" PRIu64 " synth_first_us=%" PRIu64 " send_first_us=%" PRIu64 "\n",
+        request_id,
+        phases[(size_t) llama_rerot_phase::normal_prefill].first_us.load(std::memory_order_relaxed),
+        phases[(size_t) llama_rerot_phase::probe].first_us.load(std::memory_order_relaxed),
+        phases[(size_t) llama_rerot_phase::dag_prefix_rebuild].first_us.load(std::memory_order_relaxed),
+        phases[(size_t) llama_rerot_phase::formal_p].first_us.load(std::memory_order_relaxed),
+        phases[(size_t) llama_rerot_phase::workers_start].first_us.load(std::memory_order_relaxed),
+        phases[(size_t) llama_rerot_phase::workers_frontier].first_us.load(std::memory_order_relaxed),
+        phases[(size_t) llama_rerot_phase::workers_finish].first_us.load(std::memory_order_relaxed),
+        phases[(size_t) llama_rerot_phase::synthesis].first_us.load(std::memory_order_relaxed),
+        phases[(size_t) llama_rerot_phase::result_send].first_us.load(std::memory_order_relaxed));
 
     std::fprintf(stream,
         "[rerot-profile-parallel] req=%" PRIu64

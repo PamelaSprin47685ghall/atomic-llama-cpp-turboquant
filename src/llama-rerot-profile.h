@@ -122,8 +122,10 @@ struct llama_rerot_profile {
         std::atomic<uint64_t> total_us{0};
         std::atomic<uint64_t> max_us{0};
         std::atomic<uint64_t> count{0};
-        std::atomic<int64_t>  open_start_ns{0}; // monotonic start marker for ongoing section
-    };
+        std::atomic<uint64_t> first_us{0};    // §2.4 cold-transition billing: duration of the
+        std::atomic<uint64_t> first_valid{0}; // first recorded occurrence (graph definition,
+        std::atomic<int64_t>  open_start_ns{0}; // pipeline compilation, buffer allocs included).
+    }; // first_valid gates first_us (0 duration is a legal first occurrence).
     phase_stat phases[(size_t) llama_rerot_phase::count];
 
     // (1b) Parallelism / phase-shape ledger (§4.3 阶段与并行): W = logical

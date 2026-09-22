@@ -447,6 +447,46 @@ static void test_sync_recording() {
 }
 
 // ----------------------------------------------------------------------------
+// Test (6b): §2.4 Cold-Transition First-Occurrence Billing
+// The first accumulate of a phase records its duration in first_us (one-time
+// definition/compile/alloc cost); later accumulates never overwrite it, and
+// steady-state per-call cost is derivable as (total - first) / (count - 1).
+// ----------------------------------------------------------------------------
+static void test_phase_first_cost() {
+    llama_rerot_profile prof;
+    prof.reset(1006);
+
+    const auto probe = llama_rerot_phase::probe;
+    const size_t p = (size_t) probe;
+
+    // First occurrence: 8000us (cold — graph definition + pipeline compile)
+    prof.phase_accumulate(probe, 8000);
+    CHECK_EQ(prof.phases[p].first_us.load(), 8000);
+    CHECK_EQ(prof.phases[p].count.load(), 1);
+    CHECK_EQ(prof.phases[p].total_us.load(), 8000);
+
+    // Steady occurrences: 120us each — first_us must stay at the cold value
+    prof.phase_accumulate(probe, 120);
+    prof.phase_accumulate(probe, 120);
+    CHECK_EQ(prof.phases[p].first_us.load(), 8000); // never overwritten
+    CHECK_EQ(prof.phases[p].count.load(), 3);
+    CHECK_EQ(prof.phases[p].total_us.load(), 8240);
+    CHECK_EQ(prof.phases[p].max_us.load(), 8000);
+
+    // Steady-state derivation: (8240 - 8000) / (3 - 1) = 120
+    CHECK_EQ(prof.phases[p].total_us.load() - prof.phases[p].first_us.load(), 240);
+
+    // Zero-duration first occurrence is legal (first_valid gates, not duration)
+    const auto synth = llama_rerot_phase::synthesis;
+    prof.phase_accumulate(synth, 0);
+    CHECK_EQ(prof.phases[(size_t) synth].first_us.load(), 0);
+    CHECK_EQ(prof.phases[(size_t) synth].count.load(), 1);
+    prof.phase_accumulate(synth, 500);
+    CHECK_EQ(prof.phases[(size_t) synth].first_us.load(), 0); // still the first
+    CHECK_EQ(prof.phases[(size_t) synth].total_us.load(), 500);
+}
+
+// ----------------------------------------------------------------------------
 // Test (7): Bounded Ring Buffer FIFO Overwrite & Value-Init Reset Semantics
 // ----------------------------------------------------------------------------
 
@@ -662,6 +702,7 @@ static void test_format_tsv_stability() {
     size_t line_count = 0;
     bool found_req = false;
     bool found_formal_p = false;
+    bool found_formal_p_first = false;
     bool found_indexed_hit = false;
     bool found_hwm = false;
     bool found_upload = false;
@@ -681,6 +722,7 @@ static void test_format_tsv_stability() {
 
         if (key == "request_id" && val == "8888") found_req = true;
         if (key == "phase_formal_p_us" && val == "420") found_formal_p = true;
+        if (key == "phase_formal_p_first_us" && val == "420") found_formal_p_first = true;
         if (key == "route_indexed_rerot_hits" && val == "1") found_indexed_hit = true;
         if (key == "high_watermark_n_kv" && val == "2048") found_hwm = true;
         if (key == "upload_bytes" && val == "16384") found_upload = true;
@@ -696,10 +738,11 @@ static void test_format_tsv_stability() {
     // + 14 (host & command: 11 + upload_staging_us + upload_set_us + upload_count)
     // + 9 (state & memory)
     // + 5 (computation)
-    // Total = 1 + 27 + 28 + 8 + 11 + 14 + 9 + 5 = 103
-    CHECK_EQ(line_count, 103);
+    // Total = 1 + 36 + 28 + 8 + 11 + 14 + 9 + 5 = 112
+    CHECK_EQ(line_count, 112);
     CHECK(found_req);
     CHECK(found_formal_p);
+    CHECK(found_formal_p_first);
     CHECK(found_indexed_hit);
     CHECK(found_hwm);
     CHECK(found_upload);
@@ -714,6 +757,7 @@ static void test_format_tsv_stability() {
         size_t n = std::fread(buf, 1, sizeof(buf) - 1, tmp);
         buf[n] = '\0';
         CHECK(std::strstr(buf, "[rerot-profile]") != nullptr);
+        CHECK(std::strstr(buf, "[rerot-profile-cold]") != nullptr);
         CHECK(std::strstr(buf, "[rerot-profile-routes]") != nullptr);
         CHECK(std::strstr(buf, "[rerot-profile-layout]") != nullptr);
         std::fclose(tmp);
@@ -828,6 +872,7 @@ int main() {
     test_counter_ownership_split();
     test_parallel_ledger();
     test_sync_recording();
+    test_phase_first_cost();
     test_bounded_ring_buffer_and_reset();
     test_profile_full_reset();
     test_format_tsv_stability();
