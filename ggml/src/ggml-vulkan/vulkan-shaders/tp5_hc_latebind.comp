@@ -6,6 +6,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 
 #if defined(TP5_LATE_INJECT) || defined(TP5_LATE_Q) || defined(TP5_LATE_ACT_Q8) || \
     defined(TP5_LATE_Q_Q8DOT) || defined(TP5_LATE_UP_Q8DOT)
@@ -328,8 +329,6 @@ layout(push_constant) uniform Q8DotParams {
 } p;
 
 shared uint publish_last;
-shared vec4 row_partial[256];
-shared vec4 group_out[16];
 
 void main() {
     if (p.streams != 4u || p.rows_per_wg != 16u || gl_WorkGroupID.x >= p.n_workgroups) return;
@@ -359,25 +358,29 @@ void main() {
                 acc[stream] = fma(float(isum), w_q8[wi].d * act_q8[ai].d, acc[stream]);
             }
         }
-        row_partial[lid] = acc;
-        barrier();
-        if (lane16 == 0u) {
-            vec4 sum = row_partial[row_slot * 16u];
-            [[unroll]] for (uint k = 1u; k < 16u; ++k)
-                sum += row_partial[row_slot * 16u + k];
-            group_out[row_slot] = sum;
+        // §4.1 geometry: each row's 16 reduction lanes are exactly half of a
+        // wave32 (rows_per_wg=16 over 256 threads => 2 rows per subgroup).
+        // A shuffle tree inside that half-wave replaces the LDS round-trip
+        // (write + barrier + serial 16-term sum + barrier) with 4 in-wave
+        // exchanges. group_out and row_partial disappear entirely: after the
+        // tree, every lane of subgroup s holds row (2s)'s sum in its lower
+        // half and row (2s+1)'s in the upper half.
+        [[unroll]] for (uint mask = 1u; mask < 16u; mask <<= 1u) {
+            acc += subgroupShuffleXor(acc, mask);
         }
-
-        barrier();
-        if (lid < 32u) {
-            const uint stream = lid >> 3u;
-            const uint pair = lid & 7u;
-            const uint row0 = 2u * pair;
-            const uint elem = (token * p.streams + stream) * p.rank_dim + gl_WorkGroupID.x * 16u + row0;
+        // Cross-half exchange must run converged in the whole wave; only the
+        // first 4 lanes of each subgroup then publish (one per stream). Each
+        // subgroup owns row pair (2s, 2s+1) of this workgroup, so 8 subgroups
+        // x 4 streams = the same 32 packed words the LDS version produced.
+        const vec4 pair_hi = subgroupShuffleXor(acc, 16u);
+        if (gl_SubgroupInvocationID < 4u) {
+            const uint stream = gl_SubgroupInvocationID;
+            const uint row0 = 2u * gl_SubgroupID;
+            const uint elem = (token * p.streams + stream) * p.rank_dim +
+                              gl_WorkGroupID.x * 16u + row0;
             const uint word = p.late_word_offset + elem / 2u;
-            qmail[word] = packHalf2x16(vec2(group_out[row0][stream], group_out[row0 + 1u][stream]));
+            qmail[word] = packHalf2x16(vec2(acc[stream], pair_hi[stream]));
         }
-        barrier();
     }
 
     // Device-wide completion protocol, matching the established fused HC

@@ -3489,7 +3489,9 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                     uint64_t(late.late_rank) * late.streams * late.width / 32u;
                 const VkDeviceSize packed_bytes =
                     VkDeviceSize(weight_blocks + 1u) * (sizeof(float) + 8u * sizeof(uint32_t));
-                if (packed_bytes == 0 || packed_bytes > 2u * r.caps.max_storage_buffer_range ||
+                // The binding range below is packed_bytes directly (single
+                // descriptor, no split), so the honest bound is one range, not two.
+                if (packed_bytes == 0 || packed_bytes > r.caps.max_storage_buffer_range ||
                     !tp5_alloc_device_buffer(r, packed_bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
                                              plan.late_down_packed_buf[i], plan.late_down_packed_mem[i],
                                              nullptr) ||
@@ -3528,8 +3530,13 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                         VkSubmitInfo clear_si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
                         clear_si.commandBufferCount = 1;
                         clear_si.pCommandBuffers = &clear_cmd;
+                        // Bounded wait matching the relay handoff timeout
+                        // convention (cold path, but never unbounded: a hung
+                        // clear must fail closed, not block teardown forever).
+                        constexpr uint64_t clear_timeout_ns =
+                            uint64_t(2000u) * 1000u * 1000u;
                         if (vkQueueSubmit(r.queue, 1, &clear_si, clear_fence) == VK_SUCCESS &&
-                            vkWaitForFences(r.vkdev, 1, &clear_fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS) {
+                            vkWaitForFences(r.vkdev, 1, &clear_fence, VK_TRUE, clear_timeout_ns) == VK_SUCCESS) {
                             // Flag words are zero before any pack replay.
                         } else {
                             c.fail("submission of LateBind pack clear failed on rank " + std::to_string(i));

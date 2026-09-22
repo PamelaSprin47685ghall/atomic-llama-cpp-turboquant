@@ -371,3 +371,37 @@ code size 18920 是最大者，是几何优化的下一候选。**注意**：此
 两个点积消费者代码量大幅缩减；两个生产者开销微增。VGPR 全部维持 64、零 spill。
 **代价**：activation 显存 +6%（36B vs 34B/块，46080B vs 43520B @max_rows=4）。
 真机收益仍需模型会话（安全门未批）。
+
+### 7.10 §4.1 几何第一步：Q8DOT 行归并 LDS 往返 → wave 内 shuffle 树（已合入）
+
+**问题**：`late_q_q8dot` 每行 16 条归并 lane 恰是 wave32 的半波（rows_per_wg=16
+over 256 线程 → 每 subgroup 恰 2 行），但旧实现走 LDS 往返：`row_partial[lid]`
+写 → barrier → lane16==0 串行加 16 项 → `group_out` → barrier → 32 lane 发布。
+两次 barrier＋一次 16 项串行加＋2KB LDS 全部只为发现 16 个已就绪的行和。
+
+**改动**（tp5_hc_latebind.comp，单 kernel）：
+
+1. 行内归并变 `subgroupShuffleXor` 掩码 1/2/4/8 的 4 步半波树——零 LDS、零 barrier；
+2. 跨半波一次 `subgroupShuffleXor(acc, 16u)` 把偶行的和送到奇行 lane；
+3. 发布变每 subgroup 前 4 lane（一 lane 一 stream）打包 F16 对——8 subgroup ×
+   4 stream = 与旧版完全相同的 32 个 packed word，地址映射不变；
+4. `row_partial`/`group_out` shared 数组删除，LDS 只剩 `publish_last` 一个字。
+
+**RADV codegen 实测**：
+
+| 指标 | 改前 | 改后 | Δ |
+|---|---|---|---|
+| code size | 1696 | **1248** | **−26.4%** |
+| LDS | 5120B | **1024B** | **−80%** |
+| VGPR / spill | 64 / 0 | 64 / 0 | 不变 |
+
+**语义**：归并仍是 16 项的树状重结合（旧版是 16 项串行链）——aggressive 模式
+本就声明重结合自由；发布顺序与 word 地址逐一保持。
+
+### 7.11 两处小修（前轮交接遗留）
+
+1. **packed 权重 range check**：`2u * max_storage_buffer_range` → 单 range——
+   绑定 range 直接是 packed_bytes，无 split，双倍上限是错的宽松（3.7MB 从不
+   触发，但检查应诚实）；
+2. **pack clear fence**：`UINT64_MAX` → 2s 有界（与 relay handoff timeout 同
+   惯例）——冷路径但绝不无界，挂死的 clear 必须 fail-closed。

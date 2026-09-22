@@ -1,5 +1,60 @@
 # AGENTS.md
 
+## 下班交接｜2026-09-22（第十六轮，§4.1 几何第一步：Q8DOT 行归并 shuffle 树 + 两处小修）
+
+**分支：** `master`（本轮 commit 见 git log；基于 `1fe1d8b0d`）
+**主题：** 路线图 §4.1"看实际 RADV codegen"的第一笔几何优化 + 前轮交接遗留的
+两处小修。全程 CPU + 既有 GPU 回归，未启动模型。
+
+### 一、班首审计：两份路线图草案的可操作项全部已落地
+
+对两份草案（`fe46587f8` 基与 `90f6b9433` 基）逐项核对当前源码：
+
+| 草案项 | 现状 |
+|---|---|
+| P0-1 Q sidecar 布局对齐 | **已落地**：CPU/GPU 全走 `tp5_late_q_control_*`/`tp5_late_q_payload_word_offset` 单一定义；静态推导验证 ready=word(64+L)/4、counter=+1、payload=(64+L+64)/4 两侧一致 |
+| P0-2 F32-Q 输入寿命（WAR） | **已落地**：`q_norm_barrier`（READ→BARRIER→WRITE）+ `tp5_validate_latebind_war_schedule`/`tp5_validate_p1a_schedule` 定义期校验 |
+| M0 数值模式三分 | **已落地**：`tp5_numerical_mode` 四态（reference/exact-f32/aggressive-q8/**p1a-nosidecar-q8**）+ `GGML_TP5_P1A_NOSIDECAR_Q8` 对照器具 |
+| M1 MTP phase 豁免 | **已落地**：`ubatch_execution_phase` 对 `LLM_GRAPH_TYPE_DECODER_MTP && has_predefined_capacity` 恒返 0 |
+| P1-A 无 sidecar aggressive Q8 | **已落地**：独立调度分支 + 专用校验器（见上） |
+
+结论：草案的"先修"清单在近几轮已全部收口，本轮转入 §4.1。
+
+### 二、改动一：Q8DOT 行归并 LDS 往返 → wave 内 shuffle 树
+
+`late_q_q8dot` 每行 16 归并 lane 恰为 wave32 半波（16 行/256 线程 → 每 subgroup
+2 行）。旧路径 LDS 往返（写→barrier→串行 16 项加→barrier→32 lane 发布）换为：
+
+1. `subgroupShuffleXor` 掩码 1/2/4/8 四步半波树（零 LDS、零 barrier）；
+2. 跨半波 `subgroupShuffleXor(acc, 16u)` 一次；
+3. 每 subgroup 前 4 lane 发布（一 lane 一 stream）——8×4 = 与旧版相同的 32
+   packed word，地址映射不变；
+4. `row_partial`/`group_out` 删除，LDS 5120→1024B（只剩 `publish_last`）。
+
+**RADV codegen**：code 1696→**1248**（−26.4%）、LDS 5120→**1024**（−80%）、
+VGPR 64/spill 0 不变。语义：16 项归并从串行链变树状重结合——aggressive 本就
+声明重结合自由。
+
+### 三、改动二：两处小修（前轮交接"值得考虑"项）
+
+1. packed 权重 range check `2u * max_storage_buffer_range` → 单 range（绑定
+   直接用 packed_bytes，无双 buffer split，双上限是错误宽松）；
+2. pack clear fence `UINT64_MAX` → 2s 有界（与 relay handoff timeout 同惯例；
+   挂死的 clear 必须 fail-closed 而非永久阻塞 teardown）。
+
+### 四、验证
+
+15/15 ctest 全绿（两轮：几何改动后 + 小修后各一轮）；GPU 空闲（5×0%）；
+零新增内核错误。真机收益需模型会话（安全门未批）。
+
+### 五、下一步
+
+1. §4.1 几何搜索剩余维度：rows_per_wg（4/8/16）、K 并行 lanes（8/16/32）——
+   Q8DOT 已有 baseline（code 1248/LDS 1024），下一候选 `resume_norm`（18920B）；
+2. P1-C transport 三选一、P2/P3 全部真机门控；
+3. 草案"多行 LateBind"（width×active_tokens 统一 token 维度）是下一个代码侧
+   大项——`tp5_late_consumer_ref` 的 `hc.width == n_elems` 限制。
+
 ## 下班交接｜2026-09-22（第十五轮，P1-B 第二步：激活侧同布局打包，点积内层零打包 ALU）
 
 **分支：** `master`（本轮 commit 见 git log；基于 `86dcfd2fb`）
