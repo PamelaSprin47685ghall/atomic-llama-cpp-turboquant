@@ -2847,36 +2847,26 @@ private:
         // Probe writes go to episode->probe_seq. C0 on slot.id is not mutated.
         {
             const std::string probe_prompt(server_rerot_routing_probe_prompt());
-            const std::string_view json_prefix = server_rerot_routing_probe_json_prefix();
-            if (probe_prompt.size() < json_prefix.size() ||
-                !std::equal(
-                    json_prefix.rbegin(), json_prefix.rend(),
-                    probe_prompt.rbegin())) {
+            // The DSL grammar starts at the first character of the first task
+            // line, so the prompt must end on a fresh line: the model's first
+            // sampled token then opens dag-line 1 (no glued preamble) and no
+            // forced prompt token ever enters the grammar stacks.
+            if (probe_prompt.empty() || probe_prompt.back() != '\n') {
                 rerot->hard_abort(
                     episode_id,
-                    "rerot_protocol_error: routing probe prompt missing JSON prefix");
+                    "rerot_protocol_error: routing probe prompt missing trailing newline");
                 rerot_propagate_hard_abort();
                 return false;
             }
-            const std::string prose =
-                probe_prompt.substr(0, probe_prompt.size() - json_prefix.size());
-            // Tokenize prose and JSON opener separately, then concatenate.
-            // A single full-string tokenize can glue "\\n{" across the opener
-            // boundary; separate passes keep the opener an exact token suffix
-            // that can be accepted into the routing grammar.
-            llama_tokens probe_tokens = rerot_tokenize_injection(prose);
-            llama_tokens prefix_tokens = rerot_tokenize_injection(json_prefix);
-            if (prefix_tokens.empty()) {
+            llama_tokens probe_tokens = rerot_tokenize_injection(probe_prompt);
+            if (probe_tokens.empty()) {
                 rerot->hard_abort(
                     episode_id,
-                    "rerot_protocol_error: routing probe JSON prefix tokenization failed");
+                    "rerot_protocol_error: routing probe prompt tokenization failed");
                 rerot_propagate_hard_abort();
                 return false;
             }
-            probe_tokens.insert(
-                probe_tokens.end(), prefix_tokens.begin(), prefix_tokens.end());
-            episode->probe_bytes = std::string(json_prefix);
-            episode->probe_json_prefix_tokens = std::move(prefix_tokens);
+            episode->probe_bytes.clear();
             if (!rerot_set_injection(
                     slot,
                     server_rerot_injection_kind::probe,
@@ -2978,7 +2968,7 @@ private:
             return false;
         }
         // Restore the pristine post-prefill output/usage cursors: probe prompt
-        // + routing JSON generation must not count as ordinary sampled
+        // + routing plan generation must not count as ordinary sampled
         // continuation. Episode-level sampled count restarts; the consumed C0
         // token below brings both counters to exactly the ordinary state.
         slot.n_decoded = slot.rerot_c0_n_decoded;
@@ -3239,6 +3229,15 @@ private:
     bool rerot_try_finish_probe(server_slot & slot) {
         auto * episode = rerot ? rerot->episode(slot.rerot_episode_id) : nullptr;
         if (!episode || !episode->probing || episode->strategy_decided) {
+            return true;
+        }
+        // Every prefix of a probe is individually line-well-formed, so a
+        // strategy may only be decided once the grammar's blank-line
+        // terminator has actually been sampled (any prefix would otherwise
+        // look like a complete single-task plan).
+        if (episode->probe_bytes.size() < 2 ||
+            episode->probe_bytes.compare(
+                episode->probe_bytes.size() - 2, 2, "\n\n") != 0) {
             return true;
         }
         const auto decision = server_rerot_parse_routing_decision(episode->probe_bytes);
@@ -4309,20 +4308,14 @@ private:
                 "rerot_protocol_error: HTML planner production path is retired");
             return false;
         } else if (injection == server_rerot_injection_kind::probe) {
-            auto * probe_ep = rerot->episode(episode_id);
-            if (!probe_ep || !slot.smpl || probe_ep->probe_json_prefix_tokens.empty()) {
+            // No forced prefix enters the routing grammar: the prompt is
+            // prose, probe_bytes starts empty, and the grammar stack stays at
+            // root until the model samples its first task-line token.
+            if (!slot.smpl) {
                 rerot->hard_abort(
                     episode_id,
-                    "rerot_state_error: missing probe JSON prefix tokens for grammar sync");
+                    "rerot_state_error: probe sampler missing");
                 return false;
-            }
-            // Teacher-forced opener is already in KV; advance the routing
-            // grammar to the same prefix so sampling only continues it.
-            for (llama_token tok : probe_ep->probe_json_prefix_tokens) {
-                common_sampler_accept(slot.smpl.get(), tok, /* accept_grammar = */ true);
-            }
-            if (probe_ep->probe_bytes.empty()) {
-                probe_ep->probe_bytes = std::string(server_rerot_routing_probe_json_prefix());
             }
             return true;
         } else if (injection == server_rerot_injection_kind::plan_prefix) {

@@ -7,7 +7,6 @@
 #include <cstdio>
 #include <string>
 #include <vector>
-#include <nlohmann/json.hpp>
 
 static int g_failures = 0;
 
@@ -308,163 +307,112 @@ static void test_rejects_obsolete_or_malformed_delimiters() {
 }
 
 static void test_routing_decision_parser() {
-    // direct = ordinary continuation (internal strategy_type::simple)
-    const std::string direct_json = R"({"strategy":"direct"})";
-    const auto dec_direct = server_rerot_parse_routing_decision(direct_json);
-    CHECK(dec_direct.is_simple());
-    CHECK(!dec_direct.is_dag());
+    // §02.3 single-task passthrough: one line without dependency edges maps
+    // to the ordinary single-stream continuation. Trailing blank lines are
+    // optional for the parser (the server additionally requires the grammar's
+    // "\n\n" terminator before deciding — see rerot_try_finish_probe).
+    const auto dec_simple = server_rerot_parse_routing_decision("A: do something\n\n");
+    CHECK(dec_simple.is_simple());
+    CHECK(!dec_simple.is_dag());
+    CHECK(dec_simple.error.empty());
+    CHECK(dec_simple.questions.size() == 1);
+    CHECK(dec_simple.questions[0].id == "A");
+    CHECK(dec_simple.questions[0].intent == "do something");
+    CHECK(dec_simple.questions[0].plan_rank == 0);
+    CHECK(server_rerot_parse_routing_decision("A: do something").is_simple());
+    CHECK(server_rerot_parse_routing_decision("A: do something\n").is_simple());
 
-    // direct must not carry a payload
-    const std::string direct_bad = R"({"strategy":"direct","payload":{}})";
-    CHECK(!server_rerot_parse_routing_decision(direct_bad).is_simple());
-    // obsolete wire name "simple" is rejected
-    CHECK(!server_rerot_parse_routing_decision(
-        R"({"strategy":"simple","payload":{}})").is_simple());
+    // One node stays dag only when the caller explicitly forces it
+    // (Stage-5 single-worker DAG tests).
+    const auto dec_forced = server_rerot_parse_routing_decision(
+        "A: Fact A\n\n", /*force_single_node_dag=*/true);
+    CHECK(dec_forced.is_dag());
+    CHECK(!dec_forced.is_simple());
 
-    // DAG valid (§02.4)
-    const std::string dag_json = R"({
-      "strategy": "dag",
-      "payload": {
-        "questions": [
-          {"id": "A", "intent": "Fact A"},
-          {"id": "B", "intent": "Fact B"},
-          {"id": "C", "intent": "Step C"}
-        ],
-        "depends_on": [
-          {"id": "C", "depends_on_id": "A"}
-        ]
-      }
-    })";
-    const auto dec_dag = server_rerot_parse_routing_decision(dag_json);
-    CHECK(dec_dag.is_dag());
-    CHECK(dec_dag.questions.size() == 3);
-    CHECK(dec_dag.dependencies.size() == 1);
-    CHECK(dec_dag.dependencies[0].from_id == "A");
-    CHECK(dec_dag.dependencies[0].to_id == "C");
+    // Two independent nodes are already a DAG (parallel decomposition).
+    const auto dec_pair = server_rerot_parse_routing_decision("A: task1\nB: task2\n\n");
+    CHECK(dec_pair.is_dag());
+    CHECK(dec_pair.error.empty());
+    CHECK(dec_pair.questions.size() == 2);
+    CHECK(dec_pair.dependencies.empty());
+    CHECK(dec_pair.questions[0].plan_rank == 0);
+    CHECK(dec_pair.questions[1].plan_rank == 1);
 
-    // DAG with cycle -> rejected (§02.6)
-    const std::string cycle_json = R"({
-      "strategy": "dag",
-      "payload": {
-        "questions": [
-          {"id": "A", "intent": "Task A"},
-          {"id": "B", "intent": "Task B"}
-        ],
-        "depends_on": [
-          {"id": "B", "depends_on_id": "A"},
-          {"id": "A", "depends_on_id": "B"}
-        ]
-      }
-    })";
-    CHECK(!server_rerot_parse_routing_decision(cycle_json).is_dag());
+    // Classic dependency chain A <- ... with rank in line order.
+    const auto dec_chain = server_rerot_parse_routing_decision(
+        "A: step one\nB <- A: step two\nC <- B: step three\n\n");
+    CHECK(dec_chain.is_dag());
+    CHECK(dec_chain.questions.size() == 3);
+    CHECK(dec_chain.dependencies.size() == 2);
+    CHECK(dec_chain.dependencies[0].from_id == "A");
+    CHECK(dec_chain.dependencies[0].to_id == "B");
+    CHECK(dec_chain.dependencies[1].from_id == "B");
+    CHECK(dec_chain.dependencies[1].to_id == "C");
 
-    // DAG with duplicate question id -> rejected
-    const std::string dup_id_json = R"({
-      "strategy": "dag",
-      "payload": {
-        "questions": [
-          {"id": "A", "intent": "Task A"},
-          {"id": "A", "intent": "Task A duplicate"}
-        ],
-        "depends_on": []
-      }
-    })";
-    CHECK(!server_rerot_parse_routing_decision(dup_id_json).is_dag());
+    // Diamond join with multi-dependency syntax.
+    const auto dec_diamond = server_rerot_parse_routing_decision(
+        "A: base\nB <- A: left\nC <- A: right\nD <- B, C: merge\n\n");
+    CHECK(dec_diamond.is_dag());
+    CHECK(dec_diamond.questions.size() == 4);
+    CHECK(dec_diamond.dependencies.size() == 4);
 
-    // DAG with unknown endpoint -> rejected
-    const std::string unknown_ep_json = R"({
-      "strategy": "dag",
-      "payload": {
-        "questions": [{"id": "A", "intent": "Task A"}],
-        "depends_on": [{"id": "A", "depends_on_id": "UNKNOWN"}]
-      }
-    })";
-    CHECK(!server_rerot_parse_routing_decision(unknown_ep_json).is_dag());
+    // Forward reference: ids are validated against the complete set, so a
+    // line may depend on an id declared later.
+    const auto dec_forward = server_rerot_parse_routing_decision(
+        "B <- A: second\nA: first\n\n");
+    CHECK(dec_forward.is_dag());
+    CHECK(dec_forward.dependencies.size() == 1);
+    CHECK(dec_forward.questions[0].id == "B");
 
-    // DAG with whitespace-only intent -> rejected (AGENTS.md §02.6.2)
-    const std::string ws_intent_json = R"({
-      "strategy": "dag",
-      "payload": {
-        "questions": [{"id": "A", "intent": "   \t\n  "}],
-        "depends_on": []
-      }
-    })";
-    CHECK(!server_rerot_parse_routing_decision(ws_intent_json).is_dag());
+    // Complex ids: underscores and hyphens are legal (grammar id class).
+    const auto dec_ids = server_rerot_parse_routing_decision(
+        "step_1: do step one\nsub-task-2 <- step_1: do step two\n\n");
+    CHECK(dec_ids.is_dag());
+    CHECK(dec_ids.questions.size() == 2);
+    CHECK(dec_ids.questions[0].id == "step_1");
+    CHECK(dec_ids.questions[1].id == "sub-task-2");
 
-    // DAG with non-string id -> rejected without crash
-    const std::string non_str_id_json = R"({
-      "strategy": "dag",
-      "payload": {
-        "questions": [{"id": 123, "intent": "Task 123"}],
-        "depends_on": []
-      }
-    })";
-    CHECK(!server_rerot_parse_routing_decision(non_str_id_json).is_dag());
-
-    // Schema JSON non-empty and parsable
-    const std::string schema_str = server_rerot_routing_schema_json();
-    CHECK(!schema_str.empty());
-    nlohmann::json parsed_schema = nlohmann::json::parse(schema_str);
-    CHECK(parsed_schema.contains("oneOf"));
-
-    // Extra fields and duplicate keys are rejected (§02.4 / §02.6)
-    CHECK(!server_rerot_parse_routing_decision(
-        R"({"strategy":"direct","extra":true})").is_simple());
-    CHECK(!server_rerot_parse_routing_decision(
-        R"({"strategy":"direct","strategy":"dag"})").is_simple());
-    CHECK(!server_rerot_parse_routing_decision(R"({
-      "strategy": "dag",
-      "payload": {
-        "questions": [{"id": "A", "intent": "Fact A", "rank": 1}],
-        "depends_on": []
-      }
-    })").is_dag());
-    CHECK(!server_rerot_parse_routing_decision(R"({
-      "strategy": "dag",
-      "payload": {
-        "questions": [{"id": "A", "intent": "Fact A"}],
-        "depends_on": [],
-        "extra": []
-      }
-    })").is_dag());
+    // An intent may itself contain ':' and '<-' — only the head is split.
+    const auto dec_intent = server_rerot_parse_routing_decision(
+        "algebra: derive x <- y: expand (a+b)^2\n\n");
+    CHECK(dec_intent.is_simple());
+    CHECK(dec_intent.questions[0].intent == "derive x <- y: expand (a+b)^2");
 }
 
 static void test_routing_decision_rejections() {
-    // Control-plane fail-closed matrix (RERoT.md 15.1): single-node valid
-    // plus every rejection the peer parser must enforce. Invalid inputs must
-    // be explicitly invalid — nonempty error, neither dag nor simple — since
-    // a silent fallback to simple is forbidden by contract.
-    const auto one_node = server_rerot_parse_routing_decision(
-        R"({"strategy":"dag","payload":{"questions":[{"id":"A","intent":"Fact A"}],"depends_on":[]}})");
-    CHECK(one_node.is_dag());
-    CHECK(!one_node.is_simple());
-    CHECK(one_node.error.empty());
-    CHECK(one_node.questions.size() == 1);
-
+    // Control-plane fail-closed matrix (RERoT.md 15.1): every rejection the
+    // peer parser must enforce. Invalid inputs must be explicitly invalid —
+    // nonempty error, neither dag nor simple — since a silent fallback to
+    // simple is forbidden by contract.
     const char * invalid_cases[] = {
-        // dag strategy with an empty (simple-shaped) payload
-        R"({"strategy":"dag","payload":{}})",
-        // dag payload missing depends_on
-        R"({"strategy":"dag","payload":{"questions":[{"id":"A","intent":"Fact A"}]}})",
+        // missing ':' separator
+        "A task without colon\n\n",
+        // empty intent
+        "A: \n\n",
         // self-loop
-        R"({"strategy":"dag","payload":{)"
-        R"("questions":[{"id":"A","intent":"Fact A"}],)"
-        R"("depends_on":[{"id":"A","depends_on_id":"A"}]}})",
-        // duplicate edge
-        R"({"strategy":"dag","payload":{)"
-        R"("questions":[{"id":"A","intent":"Fact A"},{"id":"B","intent":"Fact B"}],)"
-        R"("depends_on":[{"id":"B","depends_on_id":"A"},{"id":"B","depends_on_id":"A"}]}})",
-        // reserved id "0"
-        R"({"strategy":"dag","payload":{)"
-        R"("questions":[{"id":"0","intent":"Reserved"}],"
-        R"("depends_on":[]}})",
+        "A <- A: self loop\n\n",
+        // duplicate id
+        "A: task1\nA: task2\n\n",
+        // unknown dependency endpoint (Z never declared)
+        "B <- Z: unknown dep\n\n",
+        // two-node cycle
+        "A <- B: first\nB <- A: second\n\n",
+        // reserved id "0" (main synthesis)
+        "0: reserved task\n\n",
         // whitespace-only id
-        R"({"strategy":"dag","payload":{)"
-        R"("questions":[{"id":"   ","intent":"Fact A"}],"
-        R"("depends_on":[]}})",
+        "   : Fact A\n\n",
+        // interior blank line (the terminator may only end the plan)
+        "A: one\n\nB: two\n\n",
+        // duplicate dependency edge within one head
+        "A: base\nC <- A, A: join\n\n",
+        // id outside the grammar id class
+        "A B: spaced id\n\n",
+        // empty input / terminator-only input
+        "",
+        "\n\n",
     };
-    for (const char * json : invalid_cases) {
-        const auto decision = server_rerot_parse_routing_decision(json);
+    for (const char * text : invalid_cases) {
+        const auto decision = server_rerot_parse_routing_decision(text);
         CHECK(!decision.is_dag());
         CHECK(!decision.is_simple());
         CHECK(!decision.error.empty());
@@ -602,19 +550,8 @@ static void test_format_fixed_entry() {
 static void test_format_plan_prefix() {
     // PUBLIC 0.plan body: id+intent in plan_rank order. It must not close
     // reasoning and must not emit worker lane: frames.
-    const auto decision = server_rerot_parse_routing_decision(R"({
-      "strategy": "dag",
-      "payload": {
-        "questions": [
-          {"id": "A", "intent": "Fact A"},
-          {"id": "B", "intent": "Fact B"},
-          {"id": "C", "intent": "Fact C <think>"}
-        ],
-        "depends_on": [
-          {"id": "C", "depends_on_id": "A"}
-        ]
-      }
-    })");
+    const auto decision = server_rerot_parse_routing_decision(
+        "A: Fact A\nB: Fact B\nC <- A: Fact C <think>\n\n");
     CHECK(decision.is_dag());
     const std::string think_end = "</think>";
     const std::string think_start = "<think>";
@@ -643,29 +580,50 @@ static void test_dag_protocol_does_not_require_source_end_grammar() {
     const std::string optional_grammar = server_rerot_source_end_grammar("</think>");
     (void) optional_grammar;
 
-    const auto decision = server_rerot_parse_routing_decision(R"({
-      "strategy": "dag",
-      "payload": {
-        "questions": [{"id": "A", "intent": "Fact A"}],
-        "depends_on": []
-      }
-    })");
+    // Single-worker DAG kept explicitly (§02.3 default maps one node to
+    // simple).
+    const auto decision = server_rerot_parse_routing_decision(
+        "A: Fact A\n\n", /*force_single_node_dag=*/true);
     CHECK(decision.is_dag());
     CHECK(decision.error.empty());
 }
 
-static void test_routing_schema_grammar() {
+static void test_routing_dsl_grammar() {
+    // The probe prompt must end on a fresh line so the first sampled token
+    // opens the first task line directly (no glued preamble).
+    const std::string_view probe_prompt = server_rerot_routing_probe_prompt();
+    CHECK(!probe_prompt.empty());
+    CHECK(probe_prompt.back() == '\n');
+
     const std::string grammar = server_rerot_routing_grammar();
     CHECK(!grammar.empty());
-    CHECK(grammar_accepts(grammar, R"({"strategy":"direct"})"));
-    CHECK(!grammar_accepts(grammar, R"({"strategy":"direct","payload":{}})"));
-    CHECK(!grammar_accepts(grammar, R"({"strategy":"simple","payload":{}})"));
+    // Legal DSL outputs.
     CHECK(grammar_accepts(
-        grammar,
-        R"({"strategy":"dag","payload":{"questions":[{"id":"A","intent":"Fact A"}],"depends_on":[]}})"));
-    CHECK(!grammar_accepts(
-        grammar,
-        R"({"strategy":"dag","payload":{"questions":[{"id":"A","intent":"Fact A","extra":1}],"depends_on":[]}})"));
+        grammar, "A: do something\n\n"));
+    CHECK(grammar_accepts(
+        grammar, "A: task1\nB: task2\n\n"));
+    CHECK(grammar_accepts(
+        grammar, "A: one\nB <- A: two\nC <- B: three\n\n"));
+    CHECK(grammar_accepts(
+        grammar, "A: base\nB <- A: left\nC <- A: right\nD <- B, C: merge\n\n"));
+    CHECK(grammar_accepts(
+        grammar, "step_1: do it\nsub-task-2 <- step_1: then it\n\n"));
+    // No preamble: the first character must be an id character.
+    CHECK(!grammar_accepts(grammar, "Sure, here is a plan:\nA: x\n\n"));
+    CHECK(!grammar_accepts(grammar, " A: leading space\n\n"));
+    // Malformed lines and missing/early terminator.
+    CHECK(!grammar_accepts(grammar, "A task without colon\n\n"));
+    CHECK(!grammar_accepts(grammar, "A: \n\n"));
+    CHECK(!grammar_accepts(grammar, "A: one\n\nB: two\n\n"));
+    CHECK(!grammar_accepts(grammar, "A: one"));
+    CHECK(!grammar_accepts(grammar, "A: one\n"));
+    CHECK(!grammar_accepts(grammar, ""));
+    // Unknown ids/self-loops/cycles are semantically rejected by the parser,
+    // not the grammar — the grammar only guarantees well-formed lines.
+    CHECK(grammar_accepts(grammar, "A <- A: self loop\n\n"));
+    // ': ' needs the literal space; intent may not contain CR.
+    CHECK(!grammar_accepts(grammar, "A:Fact missing space\n\n"));
+    CHECK(!grammar_accepts(grammar, "A: carriage\rreturn\n\n"));
 }
 
 int main() {
@@ -677,7 +635,7 @@ int main() {
     test_format_fixed_entry();
     test_format_plan_prefix();
     test_dag_protocol_does_not_require_source_end_grammar();
-    test_routing_schema_grammar();
+    test_routing_dsl_grammar();
     test_plain_public_text();
     test_split_open_and_close();
     test_byte_by_byte_record();

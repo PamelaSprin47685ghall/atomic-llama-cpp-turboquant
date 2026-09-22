@@ -177,7 +177,8 @@ private:
 std::string_view server_rerot_planner_prompt();
 std::string_view server_rerot_planner_grammar();
 std::string_view server_rerot_routing_probe_prompt();
-std::string_view server_rerot_routing_probe_json_prefix();
+// Flat GBNF for the Makefile-style dependency line DSL. Returned verbatim;
+// no JSON-Schema-to-Grammar conversion is involved (AGENTS.md §02).
 std::string server_rerot_routing_grammar();
 std::string server_rerot_source_end_grammar(std::string_view close_marker);
 // Eager grammar for one child: arbitrary text must eventually terminate with
@@ -365,11 +366,15 @@ struct server_rerot_routing_decision {
     bool is_dag() const { return strategy == strategy_type::dag && error.empty(); }
 };
 
-// Parses and strictly validates JSON according to AGENTS.md §02.4 & §02.6
-server_rerot_routing_decision server_rerot_parse_routing_decision(const std::string & json_str);
-
-// Returns JSON schema string for GBNF conversion (§02.4)
-std::string server_rerot_routing_schema_json();
+// Parses and strictly validates one routing probe decision in the
+// dependency line DSL according to AGENTS.md §02.4 & §02.6 (fail-closed:
+// any parse or graph defect leaves strategy invalid with a non-empty error).
+// force_single_node_dag: a single node with no dependency edges maps to
+// strategy_type::simple (§02.3 single-task passthrough) unless the caller
+// explicitly keeps single-worker DAG mode (Stage-5 DAG tests).
+server_rerot_routing_decision server_rerot_parse_routing_decision(
+    const std::string & text,
+    bool force_single_node_dag = false);
 
 struct server_rerot_node_runtime {
     llama_rerot_node_id id = LLAMA_REROT_NODE_INVALID;
@@ -505,10 +510,9 @@ struct server_rerot_episode {
     mutable int64_t t_synthesis_eligible_us = 0;
     std::string source_end_marker;
     std::string think_start_marker = "<think>";
+    // DSL text sampled by the in-flight routing probe. Starts empty: the
+    // teacher-forced prompt never enters it and never enters the grammar.
     std::string probe_bytes;
-    // Exact tokens that decode to server_rerot_routing_probe_json_prefix();
-    // accepted into the probe sampler after the forced prompt finishes.
-    std::vector<llama_token> probe_json_prefix_tokens;
     server_rerot_prebranch_checkpoint c0;
     server_rerot_prebranch_checkpoint c_base;
     uint64_t frozen_read_publish_epoch = 0;

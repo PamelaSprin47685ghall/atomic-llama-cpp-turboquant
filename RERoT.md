@@ -336,12 +336,12 @@ KV allocator 的“head/cursor”也不是通用 checkpoint。Unified KV 有共�
   C0
    └──→ 隔离 probe branch
             ↓
-        schema-constrained JSON
-            ├─ direct
+        依赖行 DSL 计划（空行终止）
+            ├─ 单节点（无依赖边）→ simple
             │    → 丢弃 probe branch
             │    → 原 C0 sampler/state 继续
             │
-            └─ dag
+            └─ 多节点/含依赖 → dag
                  → 校验整张计划
                  → 丢弃 probe branch
                  → 从 C0 构建正式规划边界 P
@@ -351,99 +351,45 @@ KV allocator 的“head/cursor”也不是通用 checkpoint。Unified KV 有共�
 
 “隔离”不是因为 PRIVATE 可以消除因果影响，而是反过来：**PRIVATE 不能从已经运行过的 recurrent/sampler 里扣掉。** 要得到干净 simple continuation，必须保留真正的 C0 边界。
 
-### 4.3 路由 schema
+### 4.3 路由 DSL
 
-正式 schema 不是旧的手写 GBNF，而是 JSON Schema 交给现有 schema→grammar 转换器。
+正式路由探针不再是 JSON，而是超轻量的 Makefile 风格依赖行 DSL：低熵、零键名、无括号语法噪音（写入 Token 中语法噪音 > 65% 的 JSON 方案已废除）。单节点计划即普通续写，线上不再出现 `direct` 关键字。
 
-隔离 probe 注入的短样板（末尾 JSON opener 为 teacher-forced，模型只续写 strategy）：
+隔离 probe 注入的单行指令（末尾必须紧跟换行，保证模型首颗 Token 命中首个任务 ID、首行不粘连）：
 
 ```text
-Let's choose whether this request needs deep think or not. JSON: {"strategy":"direct"} or {"strategy":"dag","payload":{"questions":[{"id":"...","intent":"..."}],"depends_on":[]}}
-{"strategy":"
+Plan 1+ tasks as DAG (ID [<- DEPS]: INTENT, no preamble, end with blank line):
 ```
 
-`direct` 线格式无 payload；内部仍映射到 `strategy_type::simple` / `is_simple()` 续写路径。
+约束文法由 `server_rerot_routing_grammar()` 直接返回字面 GBNF，不再经过 JSON Schema→grammar 转换器：
 
-```json
-{
-  "oneOf": [
-    {
-      "type": "object",
-      "required": ["strategy"],
-      "additionalProperties": false,
-      "properties": {
-        "strategy": {"const": "direct"}
-      }
-    },
-    {
-      "type": "object",
-      "required": ["strategy", "payload"],
-      "additionalProperties": false,
-      "properties": {
-        "strategy": {"const": "dag"},
-        "payload": {"$ref": "#/$defs/DagPayload"}
-      }
-    }
-  ],
-  "$defs": {
-    "DagPayload": {
-      "type": "object",
-      "required": ["questions", "depends_on"],
-      "additionalProperties": false,
-      "properties": {
-        "questions": {
-          "type": "array",
-          "minItems": 1,
-          "items": {
-            "type": "object",
-            "required": ["id", "intent"],
-            "additionalProperties": false,
-            "properties": {
-              "id": {"type": "string", "minLength": 1},
-              "intent": {"type": "string", "minLength": 1}
-            }
-          }
-        },
-        "depends_on": {
-          "type": "array",
-          "items": {
-            "type": "object",
-            "required": ["id", "depends_on_id"],
-            "additionalProperties": false,
-            "properties": {
-              "id": {"type": "string", "minLength": 1},
-              "depends_on_id": {"type": "string", "minLength": 1}
-            }
-          }
-        }
-      }
-    }
-  }
-}
+```gbnf
+root ::= dag-line ("\n" dag-line)* "\n\n"
+dag-line ::= id (" <- " deps)? ": " intent
+deps ::= id (", " id)*
+id ::= [A-Za-z0-9_-]+
+intent ::= [^\r\n]+
 ```
 
-正确 direct：
+1. 首字符必须是 `[A-Za-z0-9_-]`，物理屏蔽一切 preamble（`Sure,` 等废话进不来）；
+2. 依赖声明可选，多依赖用 `, ` 分隔；
+3. 冒号与意图之间必须是 `: `；
+4. 空行（`\n\n`）终止整张计划。`rerot_try_finish_probe()` 只在采到终止空行后才裁决：DSL 的任何行前缀单独看都是合法单节点，提前裁决会把半张计划误判成 simple。
 
-```json
-{"strategy":"direct"}
+语义映射：单节点且无依赖边 → `strategy_type::simple`（丢弃 probe、恢复 C0 续写）；多节点或显式依赖边 → `strategy_type::dag`，走正式 P 注入、C_base 捕获与多 Lane 调度。Stage-5 单 worker DAG 测试经 `force_single_node_dag` 显式维持 dag 模式。
+
+正确单节点（simple）：
+
+```text
+A: 计算第一项所需事实
 ```
 
 正确 DAG 例子：
 
-```json
-{
-  "strategy": "dag",
-  "payload": {
-    "questions": [
-      {"id":"A","intent":"计算第一项所需事实"},
-      {"id":"B","intent":"独立检查第二项"},
-      {"id":"C","intent":"使用 A 的结果继续推导"}
-    ],
-    "depends_on": [
-      {"id":"C","depends_on_id":"A"}
-    ]
-  }
-}
+```text
+A: 计算第一项所需事实
+B: 独立检查第二项
+C <- A: 使用 A 的结果继续推导
 ```
 
 A、B 可同时开始；A SEALED 后 C 可启动，不等 B 完成；B 与 C 可以继续实时共享 PUBLIC。
@@ -452,7 +398,7 @@ A、B 可同时开始；A SEALED 后 C 可启动，不等 B 完成；B 与 C 可
 
 grammar 只负责结构子集。正式计划提交前还必须：
 
-1. JSON 可解析；拒绝重复 object member 等歧义输入。
+1. 按行可解析：缺冒号、空意图/空 ID、行内空行一律拒绝。
 2. `questions` 非空；ID、intent 非空且非纯空白。
 3. ID 唯一；`0` 保留给内部主体阶段。
 4. questions 数组顺序固定为 `plan_rank`。
@@ -483,7 +429,7 @@ simple 恢复后必须证明：
 
 当前 HEAD 已有：
 
-- `server_rerot_routing_schema_json()`；
+- `server_rerot_routing_probe_prompt()`（单行 DSL 指令，末尾带换行）；
 - `server_rerot_routing_grammar()`；
 - `server_rerot_parse_routing_decision()`，含 duplicate IDs/edges、自环、unknown endpoint、Kahn cycle check；
 - `capture_c0()` / `rerot_start_root()` / `rerot_try_finish_probe()`；
