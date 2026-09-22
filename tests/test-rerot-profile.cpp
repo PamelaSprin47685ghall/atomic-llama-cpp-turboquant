@@ -564,6 +564,12 @@ static void test_state_memory_ledger() {
     CHECK_EQ(prof.in_flight_slots.load(), 3);
     CHECK_EQ(prof.max_in_flight_slots.load(), 5);
 
+    // §4.3 host & command: submit_count is a plain accumulator wired at
+    // llama_context::graph_compute (one per graph launch).
+    prof.submit_count.fetch_add(1, std::memory_order_relaxed);
+    prof.submit_count.fetch_add(1, std::memory_order_relaxed);
+    CHECK_EQ(prof.submit_count.load(), 2);
+
     prof.reset(1009);
     CHECK_EQ(prof.scratch_peak_bytes.load(), 0);
     CHECK_EQ(prof.in_flight_slots.load(), 0);

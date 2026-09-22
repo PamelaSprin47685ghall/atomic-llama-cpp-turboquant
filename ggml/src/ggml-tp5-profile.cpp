@@ -24,6 +24,7 @@ void ggml_tp5_profile::reset(uint64_t new_id, bool decode) {
     is_decode     = decode;
     queue_submits = 0;
     submit_batches = 0;
+    cb_allocations = 0;
     host_wait_us = 0;
     host_wait_count = 0;
     backpressure_us = 0;
@@ -81,13 +82,13 @@ void ggml_tp5_profile::print_summary() const {
     const uint64_t spin_total = relay_gpu_spin_iters.load();
     fprintf(stderr,
             "[tp5-profile] exec=%" PRIu64 " decode=%d "
-            "submits=%" PRIu64 " batches=%" PRIu64 " "
+            "submits=%" PRIu64 " batches=%" PRIu64 " cb_alloc=%" PRIu64 " "
             "wait_us=%" PRIu64 " wait_n=%" PRIu64 " bp_us=%" PRIu64 " "
             "collective=%" PRIu64 " fd_exp=%" PRIu64 " fd_imp=%" PRIu64 " "
             "drm_wait=%" PRIu64 " "
             "creplay=%" PRIu64 "/%" PRIu64 " plan=%" PRIu64 "/%" PRIu64 "\n",
             graph_exec_id, (int) is_decode,
-            queue_submits.load(), submit_batches.load(),
+            queue_submits.load(), submit_batches.load(), cb_allocations.load(),
             host_wait_us.load(), host_wait_count.load(), backpressure_us.load(),
             collective_calls.load(), fd_exports.load(), fd_imports.load(),
             drm_wait_hits.load(),

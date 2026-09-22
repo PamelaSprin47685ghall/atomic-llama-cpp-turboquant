@@ -6,6 +6,8 @@
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
+
+#include "llama-rerot-profile.h"
 #include "llama-batch.h"
 // FlashPrefill V2 policy contract (PolicyCore owner). The src-internal header
 // forwards to the public include/llama-flashprefill.h; only the public C
@@ -5059,6 +5061,13 @@ ggml_status llama_context::graph_compute(
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+    }
+
+    // §4.3 host & command: one submit per graph launch (the scheduler may
+    // internally batch several Vulkan queue submits per launch; the
+    // device-level count lives in the TP5-side queue submit profile).
+    if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+        prof->submit_count.fetch_add(1, std::memory_order_relaxed);
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));

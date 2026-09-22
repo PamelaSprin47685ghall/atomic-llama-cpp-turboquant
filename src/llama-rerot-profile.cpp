@@ -5,6 +5,12 @@
 
 #include "llama-rerot-profile.h"
 
+// §4.3 host & command: the Vulkan command-buffer allocation count is
+// owned by the ggml-layer TP5 profile (ggml_vk_create_cmd_buffer is
+// below llama's layer boundary). print_summary/format_tsv mirror the
+// authoritative value here; the local field stays zero otherwise.
+#include "ggml-tp5-profile.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
@@ -351,7 +357,9 @@ std::string llama_rerot_profile::format_tsv() const {
     ss << "upload_set_us\t" << upload_set_us.load(std::memory_order_relaxed) << "\n";
     ss << "upload_count\t" << upload_count.load(std::memory_order_relaxed) << "\n";
     ss << "graph_def_count\t" << graph_def_count.load(std::memory_order_relaxed) << "\n";
-    ss << "cb_allocations\t" << cb_allocations.load(std::memory_order_relaxed) << "\n";
+    ss << "cb_allocations\t" << (ggml_tp5_profile_active()
+        ? ggml_tp5_profile_active()->cb_allocations.load(std::memory_order_relaxed)
+        : cb_allocations.load(std::memory_order_relaxed)) << "\n";
     ss << "cb_alloc_bytes\t" << cb_alloc_bytes.load(std::memory_order_relaxed) << "\n";
     ss << "submit_count\t" << submit_count.load(std::memory_order_relaxed) << "\n";
     ss << "sync_us_total\t" << sync_us_total.load(std::memory_order_relaxed) << "\n";
@@ -472,6 +480,11 @@ void llama_rerot_profile::print_summary(FILE * stream) const {
                 double(live_entries.load(std::memory_order_relaxed)) : 0.0,
         high_watermark_n_kv.load(std::memory_order_relaxed));
 
+    // Mirror the authoritative ggml-layer CB allocation count (single
+    // relaxed load; zero when the TP5 profile is inactive).
+    const uint64_t cb_allocs_mirror = ggml_tp5_profile_active()
+        ? ggml_tp5_profile_active()->cb_allocations.load(std::memory_order_relaxed)
+        : cb_allocations.load(std::memory_order_relaxed);
 
     std::fprintf(stream,
         "[rerot-profile-host] req=%" PRIu64
@@ -486,7 +499,7 @@ void llama_rerot_profile::print_summary(FILE * stream) const {
         upload_set_us.load(std::memory_order_relaxed),
         upload_count.load(std::memory_order_relaxed),
         graph_def_count.load(std::memory_order_relaxed),
-        cb_allocations.load(std::memory_order_relaxed),
+        cb_allocs_mirror,
         cb_alloc_bytes.load(std::memory_order_relaxed),
         submit_count.load(std::memory_order_relaxed),
         sync_us_total.load(std::memory_order_relaxed),

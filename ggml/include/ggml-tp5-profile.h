@@ -27,6 +27,11 @@ struct ggml_tp5_profile {
 
     std::atomic<uint64_t> queue_submits{0};
     std::atomic<uint64_t> submit_batches{0};
+    // Vulkan command-buffer pool growth: each allocation is one primary CB
+    // (vk::CommandBufferAllocateInfo count=1). Pools recycle; a rising
+    // allocation count across a request window means the pool kept
+    // growing (per-launch CB churn), the §4.3 'cb_allocations' ask.
+    std::atomic<uint64_t> cb_allocations{0};
     std::atomic<uint64_t> host_wait_us{0};
     std::atomic<uint64_t> host_wait_count{0};
     std::atomic<uint64_t> backpressure_us{0};

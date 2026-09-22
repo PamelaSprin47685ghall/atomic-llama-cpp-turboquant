@@ -4138,6 +4138,11 @@ static vk_command_buffer* ggml_vk_create_cmd_buffer(vk_device& device, vk_comman
         1);
     const std::vector<vk::CommandBuffer> cmd_buffers = device->device.allocateCommandBuffers(command_buffer_alloc_info);
     p.cmd_buffers.push_back({ cmd_buffers.front(), 0, true });
+    // §4.3 host & command: pool growth evidence. Pools recycle finished
+    // CBs; a rising count across a request window is per-launch churn.
+    if (ggml_tp5_profile * prof = ggml_tp5_profile_active()) {
+        prof->cb_allocations.fetch_add(1, std::memory_order_relaxed);
+    }
     return &p.cmd_buffers[p.cmd_buffers.size()-1];
 }
 
