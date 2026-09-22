@@ -2855,10 +2855,10 @@ private:
         // Probe writes go to episode->probe_seq. C0 on slot.id is not mutated.
         {
             const std::string probe_prompt(server_rerot_routing_probe_prompt());
-            // The DSL grammar starts at the first character of the first task
-            // line, so the prompt must end on a fresh line: the model's first
-            // sampled token then opens dag-line 1 (no glued preamble) and no
-            // forced prompt token ever enters the grammar stacks.
+            // The JSON grammar starts at the opening brace, so the template
+            // must end on a fresh line: the model's first sampled token then
+            // opens the object (no glued preamble) and no forced prompt token
+            // ever enters the grammar stacks.
             if (probe_prompt.empty() || probe_prompt.back() != '\n') {
                 rerot->hard_abort(
                     episode_id,
