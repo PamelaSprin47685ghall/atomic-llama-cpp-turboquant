@@ -320,20 +320,20 @@ relay probe 的 `consumer failed` 为基线既有行为（stash 前后一致）�
 
 **首次 RADV 实测**（RX 6800，`--sync relay --rounds 1`，5 卡 mesh 创建路径）：
 
-| kernel | VGPR | SGPR | spilled | LDS | code size |
+| kernel | VGPR | SGPR | spill S/V | LDS | code size |
 |---|---|---|---|---|---|
 | tp5_hc_late_inject | 32 | 108 | 0/0 | 1024 | 1144 |
-| tp5_hc_late_q | 64 | 108 | 0/0 | — | 2316 |
+| tp5_hc_late_q | 64 | 108 | 0/0 | 1024 | 2316 |
 | tp5_hc_publish | 8 | 108 | 0/0 | 0 | 120 |
-| tp5_hc_resume_norm | — | — | — | — | 18920 |
-| tp5_hc_resume_lo | — | — | — | — | 1340 |
-| tp5_hc_late_pack | 24 | 108 | 0/0 | — | 452 |
-| tp5_hc_late_act_q8 | — | — | — | 2048 | 1952 |
+| tp5_hc_resume_norm | 32 | 108 | 0/0 | 1024 | 18920 |
+| tp5_hc_resume_lo | 8 | 108 | 0/0 | 1024 | 1340 |
+| tp5_hc_late_pack | 24 | 108 | 0/0 | 0 | 452 |
+| tp5_hc_late_act_q8 | 64 | 108 | 0/0 | 2048 | 1952 |
 | tp5_hc_late_q_q8dot | 64 | 108 | 0/0 | 5120 | 2676 |
-| tp5_hc_resume_lo_q8 | — | — | — | — | 3996 |
-| tp5_hc_late_up_q8dot | — | — | — | 4096 | 6152 |
+| tp5_hc_resume_lo_q8 | 64 | 108 | 0/0 | 2048 | 3996 |
+| tp5_hc_late_up_q8dot | 64 | 108 | 0/0 | 4096 | 6152 |
 
-（“—”为 RADV 未报告该项；spilled 为 SGPR/VGPR 两项。）
+（SGPR 108 为 RADV 对全部 compute pipeline 的固定开销报告；spill S/V = Spilled SGPRs/VGPRs。）
 
 **结论**：全部 latebind kernel 零 spill——P1-B 打包布局与现有几何在寄存器压力下
 健康，§4.1 的几何搜索（row/wave/K tile 候选）不会先撞寄存器場。`resume_norm`

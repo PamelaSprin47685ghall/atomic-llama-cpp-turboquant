@@ -32,15 +32,17 @@
 | kernel | VGPR | SGPR | spill | LDS | code |
 |---|---|---|---|---|---|
 | late_inject | 32 | 108 | 0 | 1024 | 1144 |
-| late_q | 64 | 108 | 0 | — | 2316 |
+| late_q | 64 | 108 | 0 | 1024 | 2316 |
 | publish | 8 | 108 | 0 | 0 | 120 |
-| resume_norm | — | — | — | — | 18920 |
-| resume_lo | — | — | — | — | 1340 |
-| late_pack | 24 | 108 | 0 | — | 452 |
-| late_act_q8 | — | — | — | 2048 | 1952 |
+| resume_norm | 32 | 108 | 0 | 1024 | 18920 |
+| resume_lo | 8 | 108 | 0 | 1024 | 1340 |
+| late_pack | 24 | 108 | 0 | 0 | 452 |
+| late_act_q8 | 64 | 108 | 0 | 2048 | 1952 |
 | late_q_q8dot | 64 | 108 | 0 | 5120 | 2676 |
-| resume_lo_q8 | — | — | — | — | 3996 |
-| late_up_q8dot | — | — | — | 4096 | 6152 |
+| resume_lo_q8 | 64 | 108 | 0 | 2048 | 3996 |
+| late_up_q8dot | 64 | 108 | 0 | 4096 | 6152 |
+
+（首版表格因采集命令 `awk '!seen[$0]++'` 跨 kernel 去重产生“—”残留，本表为完整重采；SGPR 108 为 RADV 对全部 compute pipeline 的固定报告。）
 
 **结论**：全部零 spill——P1-B 打包布局与现有几何在寄存器压力下健康；
 §4.1 几何搜索（row/wave/K tile）不会先撞寄存器墙。resume_norm（18920B）
