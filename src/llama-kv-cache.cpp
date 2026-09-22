@@ -6683,7 +6683,10 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
 
         // §4.3 layout group: run count from the shared world, continuous
         // span count from the run descriptors, and per-reader visible keys
-        // (entries per distinct reader state — the visibility world size).
+        // derived from the EMITTED query offsets (one sample per query row;
+        // the direct-emission path no longer exposes per-query layout
+        // objects, and query_offsets[i+1]-query_offsets[i] is exactly the
+        // visible-entry count of query i in the final assembled layout).
         {
             uint64_t runs_total = 0;
             uint64_t contig_total = 0;
@@ -6694,10 +6697,9 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
             prof->run_count.fetch_add(runs_total, std::memory_order_relaxed);
             prof->continuous_span_count.fetch_add(contig_total, std::memory_order_relaxed);
         }
-        for (size_t g = 0; g < multi.size(); ++g) {
-            for (const auto & ql : multi[g]) {
-                prof->record_reader_visible_keys(ql.entries.size());
-            }
+        for (size_t q = 1; q < result.query_offsets.size(); ++q) {
+            const uint64_t visible = (uint64_t) result.query_offsets[q] - result.query_offsets[q - 1];
+            prof->record_reader_visible_keys(visible);
         }
 
         uint64_t prev_hwm = prof->high_watermark_n_kv.load(std::memory_order_relaxed);
