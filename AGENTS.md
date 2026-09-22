@@ -1,5 +1,38 @@
 # AGENTS.md
 
+## 下班交接｜2026-09-22（第十七轮，§4.1 几何第二步：resume_norm / resume_lo_q8 / UP_Q8DOT 三 kernel 收口）
+
+**分支：** `master`（本轮 commit 见 git log；基于 `c67819718`，rebase 过 RERoT `0cf626757`）
+**主题：** 第十六轮 Q8DOT 半波 shuffle 树的同一原则推到剩余三个 LDS 往返点。全程 CPU + 既有 GPU 回归，未启动模型（安全门）。
+
+### 一、三项改动（单 shader 文件为主，UP_Q8DOT 另改 dispatch 常量）
+
+1. **resume_norm**：跨 subgroup 折叠原是"lane0 写 `partials[sg]`→barrier→subgroup 0 各 lane 读 `partials[i]`→subgroupAdd→lane0 回写 `partials[0]`→barrier"——subgroup 0 单波串行在四个 stream WG 的关键路径上。固定 8-subgroup 形状下全员直读 8 个 partial 寄存器求和：少一个 barrier、无单波串行、`partials[32]`→`[8]`。**code 18920→15412（−18.5%），VGPR 32→24（SIMD 占用率 +33%）**。加 `gl_NumSubgroups != 8u` fail-closed 守卫（Q8 家族惯例）。
+2. **resume_lo_q8**：`lo_q_tmp[320]` LDS 往返换 wave 内 `subgroupShuffle` 三次重建对齐 4-lane 组（`g0 = sublane & ~3u`）；每 lane 打包自己组的 4 个 int8 为一个 uint32，lane 0/4/8/.../28 提交 word。**code 4000→3928，LDS 2048→1024（−50%）**，每 token 两 barrier 全消。NaN 失败态路径不变（d=NaN bits、qs 清零）。
+3. **late_up_q8dot**：几何重排 3 行/wave×10 lane（30/32 有效、10 非 2 的幂）→ **4 行/wave×8 lane（32/32 全有效）**；行折叠变纯 butterfly 掩码 1/2/4（对齐 8-lane 组永不越行）；`up_partial[240]`（4096B）整个删除。**code 5044→1088（−78.5%）、LDS 4096→0**。dispatch：`rows_per_wg 24→32`、`(w+23)/24→(w+31)/32`；width=10240 时 320 WG×32 = 10240 精确覆盖（旧 427×24=10248 冗余 8）。
+4. （卫生）`tp5_hc_subgroup.glsl` include 条件收窄到 INJECT/exact-Q（真正调用 `tp5_hc_sum32` 者）；Q8 家族不再编译死 128B shared（RADV 本会消除，codegen 无变化）。
+
+### 二、验证
+
+15/15 ctest 全绿（每项改动后各一轮，共 4 轮）；GPU 空闲（5×0%）；零内核错误。mesh 只建 pipeline（codegen 证据有效）；bit 级正确性依据：UP 行覆盖精确等式、butterfly 对齐组不变量、lo_q8 word 布局等价推导（`qs_words[j] = lanes 4j..4j+3 LE`，与旧 ACT_Q8/LO_Q8 约定逐字一致）。真机收益需模型会话（安全门未批）。
+
+### 三、§4.1 全景（本班末，RADV 实测）
+
+| Kernel | code | LDS | VGPR | 本线累计 |
+|---|---|---|---|---|
+| late_q_q8dot | 1248 | 1024 | 64 | −26.4%（vs 1696）|
+| late_up_q8dot | **1088** | **0** | 64 | **−82%**（vs 6152 原始）|
+| resume_norm | 15412 | 1024 | **24** | −18.5% |
+| resume_lo_q8 | 3928 | 1024 | 64 | −1.8% |
+| late_act_q8 | 2064 | 2048 | 64 | 持平（生产者，+5.7% 上轮）|
+
+### 四、下一步
+
+1. 真机收益测量（P1-B 两步 + §4.1 两步几何）——全部等模型会话批准；
+2. §4.1 剩余维度：rows_per_wg（Q8DOT 16→8/4）、K lanes（16→32）——需真机计时通道，codegen 已到收益递减区；
+3. `resume_norm` 仍 15412B：剩余大头是 4×16 unroll 的 load/store 主体，属数据搬运本体，非归并浪费；
+4. 多行 LateBind（token 维度统一）仍是代码侧最大结构项。
+
 ## 下班交接｜2026-09-22（第十六轮，§4.1 几何第一步：Q8DOT 行归并 shuffle 树 + 两处小修）
 
 **分支：** `master`（本轮 commit 见 git log；基于 `1fe1d8b0d`）

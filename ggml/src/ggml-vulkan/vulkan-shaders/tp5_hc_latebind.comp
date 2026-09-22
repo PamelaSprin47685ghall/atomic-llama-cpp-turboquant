@@ -8,8 +8,11 @@
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 
-#if defined(TP5_LATE_INJECT) || defined(TP5_LATE_Q) || defined(TP5_LATE_ACT_Q8) || \
-    defined(TP5_LATE_Q_Q8DOT) || defined(TP5_LATE_UP_Q8DOT)
+// Only INJECT and the exact Q contraction fold across subgroups via
+// tp5_hc_sum32; the Q8 kernels do their own wave-local reductions. Keeping
+// the include off the Q8 variants avoids compiling a dead 128-byte shared
+// array (and its barrier pair) into ACT_Q8 / Q8DOT / UP_Q8DOT.
+#if defined(TP5_LATE_INJECT) || defined(TP5_LATE_Q)
 #include "tp5_hc_subgroup.glsl"
 #endif
 #if defined(TP5_LATE_Q_Q8DOT) || defined(TP5_LATE_UP_Q8DOT) || defined(TP5_LATE_PACK_WEIGHTS)
@@ -153,11 +156,13 @@ void main() {
 #endif
 
 #ifdef TP5_LATE_UP_Q8DOT
-// Aggressive approximate HC up/fold. LO is quantized once by resume_lo_q8;
-// R320 has only ten Q8 blocks, so one-row-per-wave wastes 22/32 lanes. Pack
-// three output rows into each wave (10 lanes/row, lanes 30-31 idle): eight
-// wave32 subgroups therefore produce up to 24 rows per 256-thread workgroup.
-// Reduction is deliberately reassociated through shared memory.
+// Aggressive approximate HC up/fold. LO is quantized once by resume_lo_q8.
+// §4.1 geometry: four rows per wave, eight lanes each (32 lanes, zero idle;
+// 32 rows per 256-thread WG vs 24 before). Lanes 0-1 consume two of R320's
+// ten Q8 blocks each, lanes 2-7 one; the row fold is a pure power-of-two
+// butterfly (masks 1/2/4) inside the aligned 8-lane group, so the old
+// up_partial[240] LDS round-trip (two barriers + 24 serial fold threads)
+// disappears entirely.
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer UpWeightsQ8 { late_q8_packed up_w[]; };
@@ -177,58 +182,51 @@ layout(push_constant) uniform UpQ8Params {
     uint active_rows;
 } p;
 
-shared vec4 up_partial[240]; // 24 rows * 10 R320 blocks
-
 void main() {
     const uint lane = gl_SubgroupInvocationID;
-    if (p.rank_dim != 320u || p.streams != 4u || p.rows_per_wg != 24u || gl_NumSubgroups != 8u) return;
+    if (p.rank_dim != 320u || p.streams != 4u || p.rows_per_wg != 32u || gl_NumSubgroups != 8u) return;
     const uint active_rows = rows_header[5u] != 0u ? rows_header[5u] : p.active_rows;
     const uint blocks = 10u;
     const uint wave = gl_SubgroupID;
+    const uint row_in_wave = lane >> 3u;   // 4 rows per wave32
+    const uint k_lane = lane & 7u;         // 8 K-lanes per row
 
     [[unroll]] for (uint token = 0u; token < 4u; ++token) {
         if (token >= active_rows) break;
-        if (lane < 30u) {
-            const uint wave_row = lane / 10u;
-            const uint block = lane - wave_row * 10u;
-            const uint row_slot = wave * 3u + wave_row;
-            const uint row = gl_WorkGroupID.x * 24u + row_slot;
-            vec4 partial = vec4(0.0);
-            const late_q8_packed a = lo_q8_in[token * blocks + block];
-            if (row < p.width) {
-            [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
-                const uint weight_row = stream * p.width + row;
-                // Packed weights (P1-B): block i lives at index i + 1;
-                // index 0 is the persistent pack done flag.
-                const late_q8_packed w = up_w[weight_row * blocks + block + 1u];
-                int32_t isum = 0;
-                [[unroll]] for (uint k = 0u; k < 8u; ++k) {
-                    isum += dotPacked4x8EXT(int32_t(w.qs_words[k]), int32_t(a.qs_words[k]));
-                }
-                    partial[stream] = float(isum) * (w.d * a.d);
+        const uint row = gl_WorkGroupID.x * 32u + wave * 4u + row_in_wave;
+        vec4 partial = vec4(0.0);
+        if (row < p.width) {
+            [[unroll]] for (uint b = k_lane; b < blocks; b += 8u) {
+                const late_q8_packed a = lo_q8_in[token * blocks + b];
+                [[unroll]] for (uint stream = 0u; stream < 4u; ++stream) {
+                    const uint weight_row = stream * p.width + row;
+                    // Packed weights (P1-B): block i lives at index i + 1;
+                    // index 0 is the persistent pack done flag.
+                    const late_q8_packed w = up_w[weight_row * blocks + b + 1u];
+                    int32_t isum = 0;
+                    [[unroll]] for (uint k = 0u; k < 8u; ++k) {
+                        isum += dotPacked4x8EXT(int32_t(w.qs_words[k]), int32_t(a.qs_words[k]));
+                    }
+                    partial[stream] += float(isum) * (w.d * a.d);
                 }
             }
-            up_partial[row_slot * 10u + block] = partial;
         }
-        barrier();
-
-        if (gl_LocalInvocationID.x < 24u) {
-            const uint row_slot = gl_LocalInvocationID.x;
-            const uint row = gl_WorkGroupID.x * 24u + row_slot;
-            if (row < p.width) {
-                vec4 proj = up_partial[row_slot * 10u];
-                [[unroll]] for (uint block = 1u; block < 10u; ++block)
-                    proj += up_partial[row_slot * 10u + block];
-                const vec4 gate = vec4(1.0) / (vec4(1.0) + exp(-proj));
-                const uint norm_token_offset = token * (4u * p.width);
-                const vec4 n = vec4(norm_in[norm_token_offset + row],
-                                    norm_in[norm_token_offset + p.width + row],
-                                    norm_in[norm_token_offset + 2u * p.width + row],
-                                    norm_in[norm_token_offset + 3u * p.width + row]);
-                mixed_out[token * p.width + row] = dot(n, gate) * 0.25;
-            }
+        // Power-of-two butterfly inside the aligned 8-lane group: masks 1/2/4
+        // never leave the row. After three steps every lane of the group
+        // holds the full 10-block row sum; lane 0 commits the epilogue.
+        vec4 acc = partial;
+        acc += subgroupShuffleXor(acc, 1u);
+        acc += subgroupShuffleXor(acc, 2u);
+        acc += subgroupShuffleXor(acc, 4u);
+        if (k_lane == 0u && row < p.width) {
+            const vec4 gate = vec4(1.0) / (vec4(1.0) + exp(-acc));
+            const uint norm_token_offset = token * (4u * p.width);
+            const vec4 n = vec4(norm_in[norm_token_offset + row],
+                                norm_in[norm_token_offset + p.width + row],
+                                norm_in[norm_token_offset + 2u * p.width + row],
+                                norm_in[norm_token_offset + 3u * p.width + row]);
+            mixed_out[token * p.width + row] = dot(n, gate) * 0.25;
         }
-        barrier();
     }
 }
 #endif

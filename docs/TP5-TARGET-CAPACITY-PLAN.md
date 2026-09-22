@@ -398,6 +398,26 @@ over 256 线程 → 每 subgroup 恰 2 行），但旧实现走 LDS 往返：`ro
 **语义**：归并仍是 16 项的树状重结合（旧版是 16 项串行链）——aggressive 模式
 本就声明重结合自由；发布顺序与 word 地址逐一保持。
 
+### 7.12 §4.1 几何第二步：resume_norm / resume_lo_q8 / UP_Q8DOT 三 kernel 收口
+
+第十六轮把 Q8DOT 行归并换成半波 shuffle 树后，本轮把同一原则推到剩余三个
+LDS 往返点。全部改动只动 kernel 内部归并拓扑与（UP_Q8DOT）行/lane 几何；
+push constant ABI、descriptor、buffer 布局、发布协议零改动。
+
+| Kernel | 改动 | code | LDS | VGPR |
+|---|---|---|---|---|
+| `resume_norm` | 跨 subgroup 折叠从"subgroup 0 串行折 8 项＋回写＋双 barrier"改为全员直读 8 个 partial 寄存器求和；`partials[32]`→`[8]`；加 `gl_NumSubgroups != 8u` fail-closed 守卫 | 18920→**15412**（−18.5%）| 1024 | 32→**24**（占用率 +33%）|
+| `resume_lo_q8` | `lo_q_tmp[320]` LDS 往返（写→barrier→8 lane 跨步读→barrier）改为 wave 内 `subgroupShuffle` 三次重建 4-lane 组；NaN 失败态路径不变 | 4000→**3928** | 2048→**1024**（−50%）| 64 |
+| `late_up_q8dot` | 几何重排：3 行/wave×10 lane（30/32 有效）→ **4 行/wave×8 lane（32/32 全有效）**；行折叠变纯 2 的幂 butterfly（掩码 1/2/4，永不越行）；`up_partial[240]` 整个删除 | 5044→**1088**（−78.5%）| 4096→**0**（−100%）| 64 |
+
+UP_Q8DOT 行覆盖核对：width=10240 时旧 `(w+23)/24` WG×24 = 10248（8 行
+冗余），新 `(w+31)/32`×32 = 10240 精确。数值语义：aggressive 路径本就声明
+归并重结合自由；行内求和从"串行 10 项"变 butterfly 树，误差量级不变。
+
+另：`tp5_hc_subgroup.glsl` 的 include 条件从 5 个 kernel 收窄到真正调用
+`tp5_hc_sum32` 的 INJECT 与 exact Q 两个——Q8 家族不再编译死代码 128B
+shared 数组（RADV 本会消除，属卫生性收紧，codegen 无变化）。
+
 ### 7.11 两处小修（前轮交接遗留）
 
 1. **packed 权重 range check**：`2u * max_storage_buffer_range` → 单 range——

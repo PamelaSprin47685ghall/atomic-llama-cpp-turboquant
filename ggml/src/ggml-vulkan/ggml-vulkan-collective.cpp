@@ -4051,12 +4051,12 @@ bool tp5_record_plan(tp5_comm & c, tp5_cached_plan & plan, const std::vector<ten
                             tp5_cmd_bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_up_q8dot_layout,
                                                     0, 1, &plan.late_up_q8dot_ds[idx], 0, nullptr);
                             struct { uint32_t width, rank_dim, streams, rows_per_wg, active_rows; } up_pc{
-                                late.width, late.late_rank, late.streams, 24u,
+                                late.width, late.late_rank, late.streams, 32u,
                                 late.capacity_rows ? late.capacity_rows : 1u};
                             static_assert(sizeof(up_pc) == 20);
                             tp5_cmd_push(cmd, r.late_up_q8dot_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                          sizeof(up_pc), &up_pc);
-                            tp5_cmd_dispatch(cmd, (late.width + 23u) / 24u, 1, 1);
+                            tp5_cmd_dispatch(cmd, (late.width + 31u) / 32u, 1, 1);
                         } else {
                             tp5_cmd_bind_pipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_lo_pipe);
                             tp5_cmd_bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, r.late_lo_layout, 0, 1,

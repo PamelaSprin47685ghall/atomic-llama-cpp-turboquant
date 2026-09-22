@@ -2,6 +2,7 @@
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 #ifdef TP5_RESUME_LO_Q8
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
@@ -40,7 +41,7 @@ const uint SPIN_WORD = 5u;
 // capacity only as a fail-safe fallback (M3 invariant 2: capacity is never the
 // effective row count of a maximum-capacity definition).
 const uint ACTIVE_ROWS_WORD = 5u;
-shared float partials[32];
+shared float partials[8];
 #endif
 
 #if defined(TP5_RESUME_LO) || defined(TP5_RESUME_LO_Q8)
@@ -61,7 +62,6 @@ struct late_lo_q8_packed {
     uint    qs_words[8];
 };
 layout(std430, binding = 4) writeonly buffer LoQ8 { late_lo_q8_packed lo_q8[]; };
-shared int lo_q_tmp[320];
 #endif
 layout(push_constant) uniform Params {
     uint rank_dim;
@@ -152,21 +152,22 @@ void finalize_stream(const uint iterations, const uint active_rows) {
             }
             ss += values[i] * values[i];
         }
+        // §4.1 geometry: the cross-subgroup fold was a serial subgroup-0
+        // pass over partials[32] (write -> barrier -> subgroup 0 folds ->
+        // lane 0 writes back -> barrier). With the fixed 8-subgroup shape
+        // every thread reads the eight published partials directly and sums
+        // them in registers: one barrier fewer, no single-wave
+        // serialization, and partials shrinks to exactly eight words.
         ss = subgroupAdd(ss);
         if (gl_SubgroupInvocationID == 0u) {
             partials[gl_SubgroupID] = ss;
         }
         barrier();
-        if (gl_SubgroupID == 0u) {
-            float fold = gl_SubgroupInvocationID < gl_NumSubgroups ?
-                partials[gl_SubgroupInvocationID] : 0.0;
-            fold = subgroupAdd(fold);
-            if (gl_SubgroupInvocationID == 0u) {
-                partials[0] = fold;
-            }
+        float fold = 0.0;
+        [[unroll]] for (uint sgi = 0u; sgi < 8u; ++sgi) {
+            fold += partials[sgi];
         }
-        barrier();
-        const float scale = inversesqrt(partials[0] / float(p.width) + p.epsilon);
+        const float scale = inversesqrt(fold / float(p.width) + p.epsilon);
         if (lane == 0u) inverse_rho[token * p.streams + stream] = scale;
         [[unroll]] for (uint i = 0u; i < 16u; ++i) {
             const uint col = lane + i * 256u;
@@ -179,7 +180,11 @@ void finalize_stream(const uint iterations, const uint active_rows) {
     }
 }
 void main() {
-    if (p.streams != 4u || gl_WorkGroupID.x >= p.streams || p.width == 0u || p.width > 4096u) {
+    // The register fold below assumes the fixed 8-subgroup shape (256 threads
+    // / wave32). Any other topology must fail closed, matching the Q8 family
+    // convention, rather than read past the published partials.
+    if (p.streams != 4u || gl_WorkGroupID.x >= p.streams || p.width == 0u || p.width > 4096u ||
+        gl_NumSubgroups != 8u) {
         if (gl_LocalInvocationID.x == 0u)
             atomicCompSwap(status[p.status_word_offset + 2u], 0u, 0xffffffffu);
         return; // also rejected by the host recipe before recording
@@ -249,20 +254,23 @@ void main() {
         const float d = amax * (1.0 / 127.0);
         const float inv_d = d != 0.0 ? 1.0 / d : 0.0;
         const int qv = clamp(int(round(value * inv_d)), -127, 127);
-        lo_q_tmp[row] = qv;
-        barrier();
-
+        // §4.1 geometry: pack the subgroup's 32 int8 values via wave-local
+        // shuffles instead of the lo_q_tmp LDS round-trip (write -> barrier
+        // -> strided 8-lane read -> barrier). Every lane rebuilds the aligned
+        // 4-value group it belongs to with three shuffles; lanes 0,4,8,...28
+        // commit the words. Both per-token barriers disappear and lo_q_tmp
+        // (1280B) drops out of the shared budget entirely.
         const uint sub = gl_SubgroupID;
         const uint sublane = gl_SubgroupInvocationID;
+        const uint g0 = sublane & ~3u;
+        const int qv0 = subgroupShuffle(qv, g0);
+        const int qv1 = subgroupShuffle(qv, g0 + 1u);
+        const int qv2 = subgroupShuffle(qv, g0 + 2u);
+        const int qv3 = subgroupShuffle(qv, g0 + 3u);
+        const uint word = (uint(qv0) & 0xffu) | (uint(qv1) & 0xffu) << 8u |
+                          (uint(qv2) & 0xffu) << 16u | (uint(qv3) & 0xffu) << 24u;
         if (sublane == 0u) lo_q8[token * 10u + sub].d = d;
-        if (sublane < 8u) {
-            const uint base = sub * 32u + 4u * sublane;
-            const uint w0 = uint(lo_q_tmp[base]) & 0xffu | (uint(lo_q_tmp[base + 1u]) & 0xffu) << 8u;
-            const uint w1 = uint(lo_q_tmp[base + 2u]) & 0xffu | (uint(lo_q_tmp[base + 3u]) & 0xffu) << 8u;
-            lo_q8[token * 10u + sub].qs_words[2u * sublane] = w0;
-            lo_q8[token * 10u + sub].qs_words[2u * sublane + 1u] = w1;
-        }
-        barrier();
+        if ((sublane & 3u) == 0u) lo_q8[token * 10u + sub].qs_words[sublane >> 2u] = word;
     }
 #else
     [[unroll]] for (uint token = 0u; token < 4u; ++token) {
