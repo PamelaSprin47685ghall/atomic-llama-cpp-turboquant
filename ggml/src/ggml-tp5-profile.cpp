@@ -63,6 +63,8 @@ void ggml_tp5_profile::reset(uint64_t new_id, bool decode) {
     vk_rerot_split_k_max = 0;
     vk_rerot_queries = 0;
     vk_rerot_entries = 0;
+    vk_rerot_live_entries = 0;
+    vk_rerot_cap_entries = 0;
     vk_rerot_shmem_reject = 0;
     for (size_t i = 0; i < (size_t) ggml_tp5_rerot_reject_reason::count; ++i) {
         vk_rerot_reject_reasons[i] = 0;
@@ -127,12 +129,14 @@ void ggml_tp5_profile::print_summary() const {
                 "[tp5-rerot-profile] exec=%" PRIu64 " dispatch=%" PRIu64
                 " split_k_avg=%.2f split_k_max=%" PRIu64
                 " queries=%" PRIu64 " entries=%" PRIu64
+                " live_entries=%" PRIu64 " cap_entries=%" PRIu64
                 " shmem_reject=%" PRIu64 " reject_tune=%" PRIu64
                 " reject_type=%" PRIu64 " reject_pq2_0=%" PRIu64 "\n",
                 graph_exec_id, r_disp,
                 r_disp ? double(r_sk_tot) / double(r_disp) : 0.0,
                 vk_rerot_split_k_max.load(),
                 vk_rerot_queries.load(), vk_rerot_entries.load(),
+                vk_rerot_live_entries.load(), vk_rerot_cap_entries.load(),
                 vk_rerot_shmem_reject.load(),
                 vk_rerot_reject_reasons[(size_t) ggml_tp5_rerot_reject_reason::shmem_tune].load(),
                 r_rej_type,

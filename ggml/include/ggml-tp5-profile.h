@@ -71,6 +71,10 @@ struct ggml_tp5_profile {
     std::atomic<uint64_t> vk_rerot_split_k_max{0};
     std::atomic<uint64_t> vk_rerot_queries{0};
     std::atomic<uint64_t> vk_rerot_entries{0};
+    // P9 live-length split-K evidence: entries counted at the live clamp vs
+    // the capacity-padded entries->ne[1] the old average used.
+    std::atomic<uint64_t> vk_rerot_live_entries{0};
+    std::atomic<uint64_t> vk_rerot_cap_entries{0};
     std::atomic<uint64_t> vk_rerot_shmem_reject{0};
     std::atomic<uint64_t> vk_rerot_reject_reasons[(size_t) ggml_tp5_rerot_reject_reason::count]{};
 

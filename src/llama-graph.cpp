@@ -4551,6 +4551,20 @@ ggml_tensor * llm_graph_context::build_attn_rerot(
         inp->get_rerot_entries(), inp->get_rerot_offsets(), sinks,
         kq_scale, hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
     ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+    // P9 (live-length split-K): record the build-time live entry count in
+    // op_params slot 4 so the Vulkan dispatch clamps split_k against real
+    // work instead of the capacity-padded entries->ne[1]. Set once at build
+    // time; reuse within a capacity bucket keeps the stale (build-time) value
+    // so the replay fingerprint stays consistent. The stale count is still a
+    // strictly tighter estimate than the bucket capacity.
+    {
+        uint32_t live_entries = 0;
+        if (const auto * attn_ctx = inp->mctx) {
+            const auto & layout = attn_ctx->get_rerot_attn_layout();
+            live_entries = (uint32_t) layout.entries.size();
+        }
+        ((int32_t *) cur->op_params)[4] = live_entries ? (int32_t) live_entries : -1;
+    }
     cb(cur, "rerot_indexed_attn", il);
 
     if (v->type == GGML_TYPE_TURBO3_0 || v->type == GGML_TYPE_TURBO4_0 || v->type == GGML_TYPE_TURBO2_0) {

@@ -1887,6 +1887,66 @@ static void test_rerot_capacity_bucket_separation() {
 // between capacity-stable rebuilds) must produce output identical to a
 // from-scratch full upload of the same live data. This pins the invariant
 // that the zero tail never needs re-uploading and is never read.
+// P9 (live-length split-K): the op contract that carries the build-time
+// live entry count to the Vulkan dispatch. The dispatch clamps split_k
+// against op_params slot 4 instead of the capacity-padded entries->ne[1];
+// this test pins the slot semantics the dispatch relies on: zero-init
+// (unset -> dispatch uses capacity, pre-P9 behavior), set_prec does not
+// clobber it, and a set value survives.
+static void test_rerot_live_entries_op_params_slot() {
+    std::puts("--- RERoT live-entries op_params slot (P9) ---");
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ 16 * 1024 * 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    CHECK(ctx != nullptr);
+    if (!ctx) {
+        return;
+    }
+
+    constexpr int d  = 8;
+    constexpr int dv = 6;
+    constexpr int hq = 2, hkv = 1;
+    constexpr int nkv = 8;
+    constexpr int nq = 2;
+    constexpr int ne = 7; // live entries; capacity bucket would be 256
+
+    ggml_tensor * q = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d, 4, hq, 1);
+    ggml_tensor * k = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d, nkv, hkv, 1);
+    ggml_tensor * v = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, dv, nkv, hkv, 1);
+    ggml_tensor * e = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 2, ne);
+    ggml_tensor * o = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, nq + 1);
+
+    ggml_tensor * out =
+        ggml_flash_attn_ext_rerot(ctx.get(), q, k, v, e, o, nullptr, 0.5f, 0.0f);
+    CHECK(out != nullptr);
+
+    // (a) Slot 4 is zero-initialized: an op built without the live-count
+    // hint leaves the slot at 0, and the dispatch treats <= 0 as "unset"
+    // (falls back to the capacity count — the pre-P9 behavior).
+    CHECK(ggml_get_op_params_i32(out, 4) == 0);
+
+    // (b) set_prec writes slot 3 only; the live-count slot is untouched.
+    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    CHECK(ggml_get_op_params_i32(out, 3) == (int32_t) GGML_PREC_F32);
+    CHECK(ggml_get_op_params_i32(out, 4) == 0);
+
+    // (c) A set live count survives (build_attn_rerot writes it once after
+    // construction; nothing in the op lifecycle may overwrite it).
+    ggml_set_op_params_i32(out, 4, ne);
+    CHECK(ggml_get_op_params_i32(out, 4) == ne);
+
+    // (d) The clamp the dispatch derives: with 7 live entries over 2
+    // queries, entries_per_query = 3 (vs 128 under the capacity average),
+    // so split_k can never exceed 3 regardless of desired occupancy.
+    const int32_t live = ggml_get_op_params_i32(out, 4);
+    const uint32_t entries_per_query = std::max(1u, uint32_t(live) / uint32_t(nq));
+    CHECK(entries_per_query == 3);
+}
+
 static void test_rerot_live_prefix_upload_invariant() {
     std::puts("--- RERoT live-prefix upload invariant (P5) ---");
 
@@ -2017,6 +2077,7 @@ int main(int argc, char ** argv) {
     std::puts("=== RERoT indexed attention test ===");
     test_rerot_capacity_bucket_separation();
     test_rerot_live_prefix_upload_invariant();
+    test_rerot_live_entries_op_params_slot();
     test_indexed_basic();
     test_ddvr_imrope_via_indexed_op();
     test_frontier_strong_vs_lag1();

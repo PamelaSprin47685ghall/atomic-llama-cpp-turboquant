@@ -14506,6 +14506,7 @@ static void ggml_vk_flash_attn_rerot(ggml_backend_vk_context * ctx, vk_context &
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     uint32_t split_k = 1;
+    uint32_t live_entries = n_entries;
     if ((sinks == nullptr || tuning_params.block_rows > 1) && n_queries > 0 && n_entries > 0) {
         // Keep enough independent workgroups to occupy the device. The indexed
         // shader writes [Dv, flattened(query, head), split] partials, exactly
@@ -14513,7 +14514,21 @@ static void ggml_vk_flash_attn_rerot(ggml_backend_vk_context * ctx, vk_context &
         const uint32_t shader_cores = ctx->device->shader_core_count ? ctx->device->shader_core_count : 16;
         const uint32_t rows = n_queries * head_groups;
         const uint32_t desired = std::max(1u, (shader_cores * 2u) / std::max(1u, rows));
-        const uint32_t entries_per_query = std::max(1u, n_entries / n_queries);
+        // P9 (live-length split-K): op_params slot 4 carries the build-time
+        // live entry count (set in build_attn_rerot; -1 when the layout was
+        // unavailable). Clamp split_k against real per-query work instead
+        // of the capacity-padded entries->ne[1], which overestimates by up to
+        // one entry bucket (256) and admits empty split workgroups. The
+        // build-time value can go stale within a reuse bucket; a stale count
+        // is still a strictly tighter estimate than the bucket capacity, and
+        // the shader already no-ops empty per-query splits (chunk = ceil(len/S)).
+        int32_t live_entries_i32 = 0;
+        memcpy(&live_entries_i32, (const int32_t *) dst->op_params + 4, sizeof(int32_t));
+        live_entries =
+            live_entries_i32 > 0 && (uint32_t) live_entries_i32 <= n_entries
+                ? (uint32_t) live_entries_i32
+                : n_entries;
+        const uint32_t entries_per_query = std::max(1u, live_entries / n_queries);
         split_k = std::min(desired, entries_per_query);
     }
 
@@ -14524,6 +14539,8 @@ static void ggml_vk_flash_attn_rerot(ggml_backend_vk_context * ctx, vk_context &
         while (cur_sk_max < split_k && !prof->vk_rerot_split_k_max.compare_exchange_weak(cur_sk_max, split_k, std::memory_order_relaxed)) {}
         prof->vk_rerot_queries.fetch_add(n_queries, std::memory_order_relaxed);
         prof->vk_rerot_entries.fetch_add(n_entries, std::memory_order_relaxed);
+        prof->vk_rerot_live_entries.fetch_add(live_entries, std::memory_order_relaxed);
+        prof->vk_rerot_cap_entries.fetch_add(n_entries, std::memory_order_relaxed);
     }
 
     const uint64_t n_flat = (uint64_t)n_queries * n_head_q;
