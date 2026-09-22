@@ -3019,6 +3019,12 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w_s,
         enum ggml_prec   prec) const {
     ggml_tensor * cur_mm = cur;
+    // §9.2 batch-shape evidence: the activation's token dim is the b that
+    // decides GEMV vs small-batch matrix path. Recorded at graph definition
+    // (per definition, not per decode step).
+    if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+        prof->record_matmul_rows(cur->ne[2]);
+    }
     if (hadamard_rotations && hadamard_rotations->count(w)) {
         const auto & t = hadamard_rotations->at(w);
         const auto memo_key = std::make_pair(
@@ -3087,6 +3093,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
     ggml_tensor * cur_mm = cur;
+    if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+        prof->record_matmul_rows(cur->ne[2]);
+    }
     if (hadamard_rotations && hadamard_rotations->count(w)) {
         const auto & t = hadamard_rotations->at(w);
         const auto memo_key = std::make_pair(

@@ -203,6 +203,14 @@ struct llama_rerot_profile {
     // materializations. hit/(hit+miss) is the P7 recipe-expansion evidence.
     std::atomic<uint64_t> hadamard_memo_hits{0};
     std::atomic<uint64_t> hadamard_memo_misses{0};
+    // §9.2 batch-shape distribution of dense matmuls, recorded at graph
+    // definition in build_lora_mm: b = row count of the activation operand.
+    // b=1 is the GEMV decode shape; the b>1 buckets are the multi-lane cohort
+    // shapes the small-batch matrix-path comparison targets. Counted per
+    // graph definition (not per decode step); m/k are model constants and
+    // stay out of the ledger.
+    static constexpr size_t MATMUL_ROWS_BUCKETS = 7; // b in {1,2,3,4,6,8}, >8
+    std::atomic<uint64_t> matmul_rows_hist[MATMUL_ROWS_BUCKETS]{};
 
     // Detailed trace bounded ring buffer
     llama_rerot_bounded_ring_buffer ring;
@@ -230,6 +238,9 @@ struct llama_rerot_profile {
     // GEMM / GEMV shape tracking
     void record_gemm(int64_t m, int64_t n, int64_t k);
     void record_gemv(int64_t m, int64_t k);
+    // §9.2: bucket a dense matmul by activation row count; also advances
+    // gemv_count (b==1) / gemm_count (b>1).
+    void record_matmul_rows(int64_t rows);
 
     // Summary formatting and script-parsable dump
     void print_summary(FILE * stream = stderr) const;

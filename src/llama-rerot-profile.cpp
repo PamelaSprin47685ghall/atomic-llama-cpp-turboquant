@@ -175,6 +175,9 @@ void llama_rerot_profile::reset(uint64_t new_request_id) {
     multi_row_gdn_hits.store(0, std::memory_order_relaxed);
     hadamard_memo_hits.store(0, std::memory_order_relaxed);
     hadamard_memo_misses.store(0, std::memory_order_relaxed);
+    for (auto & h : matmul_rows_hist) {
+        h.store(0, std::memory_order_relaxed);
+    }
     attention_split_count.store(0, std::memory_order_relaxed);
 
     ring.reset();
@@ -263,6 +266,28 @@ void llama_rerot_profile::record_gemv(int64_t m, int64_t k) {
     ring.push(3, 0 /* GEMV */, (uint16_t) std::min<int64_t>(k, 65535), (uint32_t) m, 1);
 }
 
+void llama_rerot_profile::record_matmul_rows(int64_t rows) {
+    if (rows <= 0) return;
+    size_t b;
+    switch (rows) {
+        case 1: b = 0; break;
+        case 2: b = 1; break;
+        case 3: b = 2; break;
+        case 4: b = 3; break;
+        case 6: b = 4; break;
+        case 8: b = 5; break;
+        default: b = 6; break; // > 8: prefill / synthesis bulk shapes
+    }
+    matmul_rows_hist[b].fetch_add(1, std::memory_order_relaxed);
+    if (rows == 1) {
+        gemv_count.fetch_add(1, std::memory_order_relaxed);
+        ring.push(3, 0 /* GEMV */, 0, 0, 1);
+    } else {
+        gemm_count.fetch_add(1, std::memory_order_relaxed);
+        ring.push(3, 1 /* GEMM */, (uint16_t) std::min<int64_t>(rows, 65535), 0, (uint64_t) rows);
+    }
+}
+
 std::string llama_rerot_profile::format_tsv() const {
     std::ostringstream ss;
     ss << "request_id\t" << request_id << "\n";
@@ -342,6 +367,13 @@ std::string llama_rerot_profile::format_tsv() const {
     ss << "multi_row_gdn_hits\t" << multi_row_gdn_hits.load(std::memory_order_relaxed) << "\n";
     ss << "hadamard_memo_hits\t" << hadamard_memo_hits.load(std::memory_order_relaxed) << "\n";
     ss << "hadamard_memo_misses\t" << hadamard_memo_misses.load(std::memory_order_relaxed) << "\n";
+    ss << "matmul_rows_b1\t" << matmul_rows_hist[0].load(std::memory_order_relaxed) << "\n";
+    ss << "matmul_rows_b2\t" << matmul_rows_hist[1].load(std::memory_order_relaxed) << "\n";
+    ss << "matmul_rows_b3\t" << matmul_rows_hist[2].load(std::memory_order_relaxed) << "\n";
+    ss << "matmul_rows_b4\t" << matmul_rows_hist[3].load(std::memory_order_relaxed) << "\n";
+    ss << "matmul_rows_b6\t" << matmul_rows_hist[4].load(std::memory_order_relaxed) << "\n";
+    ss << "matmul_rows_b8\t" << matmul_rows_hist[5].load(std::memory_order_relaxed) << "\n";
+    ss << "matmul_rows_gt8\t" << matmul_rows_hist[6].load(std::memory_order_relaxed) << "\n";
     ss << "attention_split_count\t" << attention_split_count.load(std::memory_order_relaxed) << "\n";
 
     return ss.str();
@@ -464,7 +496,9 @@ void llama_rerot_profile::print_summary(FILE * stream) const {
         "[rerot-profile-compute] req=%" PRIu64
         " q_prep=%" PRIu64 " gemv=%" PRIu64 " gemm=%" PRIu64
         " multi_row_gdn=%" PRIu64 " attn_splits=%" PRIu64
-        " had_memo=%" PRIu64 "/%" PRIu64 "\n",
+        " had_memo=%" PRIu64 "/%" PRIu64
+        " mm_rows=1:%" PRIu64 " 2:%" PRIu64 " 3:%" PRIu64 " 4:%" PRIu64
+        " 6:%" PRIu64 " 8:%" PRIu64 " >8:%" PRIu64 "\n",
         request_id,
         q_prep_rows.load(std::memory_order_relaxed),
         gemv_count.load(std::memory_order_relaxed),
@@ -472,7 +506,14 @@ void llama_rerot_profile::print_summary(FILE * stream) const {
         multi_row_gdn_hits.load(std::memory_order_relaxed),
         attention_split_count.load(std::memory_order_relaxed),
         hadamard_memo_hits.load(std::memory_order_relaxed),
-        hadamard_memo_misses.load(std::memory_order_relaxed));
+        hadamard_memo_misses.load(std::memory_order_relaxed),
+        matmul_rows_hist[0].load(std::memory_order_relaxed),
+        matmul_rows_hist[1].load(std::memory_order_relaxed),
+        matmul_rows_hist[2].load(std::memory_order_relaxed),
+        matmul_rows_hist[3].load(std::memory_order_relaxed),
+        matmul_rows_hist[4].load(std::memory_order_relaxed),
+        matmul_rows_hist[5].load(std::memory_order_relaxed),
+        matmul_rows_hist[6].load(std::memory_order_relaxed));
 }
 
 // Global active profiling instance & lock

@@ -509,6 +509,44 @@ static void test_hadamard_memo_counters() {
 }
 
 // ----------------------------------------------------------------------------
+// Test (6d): §9.2 matmul batch-shape histogram
+// b=1 is the GEMV decode shape; b>1 buckets are the multi-lane cohort
+// shapes the small-batch matrix-path comparison targets.
+// ----------------------------------------------------------------------------
+static void test_matmul_rows_histogram() {
+    llama_rerot_profile prof;
+    prof.reset(1008);
+
+    // Production idiom: one record per graph-definition matmul
+    prof.record_matmul_rows(1);   // GEMV decode
+    prof.record_matmul_rows(1);
+    prof.record_matmul_rows(2);   // 2-lane cohort
+    prof.record_matmul_rows(6);   // P=6 full cohort
+    prof.record_matmul_rows(512); // prefill bulk -> >8 bucket
+
+    CHECK_EQ(prof.matmul_rows_hist[0].load(), 2); // b=1
+    CHECK_EQ(prof.matmul_rows_hist[1].load(), 1); // b=2
+    CHECK_EQ(prof.matmul_rows_hist[4].load(), 1); // b=6
+    CHECK_EQ(prof.matmul_rows_hist[6].load(), 1); // >8
+    CHECK_EQ(prof.gemv_count.load(), 2);          // b==1 advanced gemv
+    CHECK_EQ(prof.gemm_count.load(), 3);          // b>1 advanced gemm
+
+    // Non-positive rows are ignored (defensive)
+    prof.record_matmul_rows(0);
+    prof.record_matmul_rows(-3);
+    CHECK_EQ(prof.matmul_rows_hist[0].load(), 2);
+    CHECK_EQ(prof.matmul_rows_hist[6].load(), 1);
+
+    // reset clears
+    prof.reset(1008);
+    for (size_t i = 0; i < llama_rerot_profile::MATMUL_ROWS_BUCKETS; ++i) {
+        CHECK_EQ(prof.matmul_rows_hist[i].load(), 0);
+    }
+    CHECK_EQ(prof.gemv_count.load(), 0);
+    CHECK_EQ(prof.gemm_count.load(), 0);
+}
+
+// ----------------------------------------------------------------------------
 // Test (7): Bounded Ring Buffer FIFO Overwrite & Value-Init Reset Semantics
 // ----------------------------------------------------------------------------
 
@@ -759,9 +797,9 @@ static void test_format_tsv_stability() {
     // + 11 (layout)
     // + 14 (host & command: 11 + upload_staging_us + upload_set_us + upload_count)
     // + 9 (state & memory)
-    // + 7 (computation)
-    // Total = 1 + 36 + 28 + 8 + 11 + 14 + 9 + 7 = 114
-    CHECK_EQ(line_count, 114);
+    // + 14 (computation)
+    // Total = 1 + 36 + 28 + 8 + 11 + 14 + 9 + 14 = 121
+    CHECK_EQ(line_count, 121);
     CHECK(found_req);
     CHECK(found_formal_p);
     CHECK(found_formal_p_first);
@@ -896,6 +934,7 @@ int main() {
     test_sync_recording();
     test_phase_first_cost();
     test_hadamard_memo_counters();
+    test_matmul_rows_histogram();
     test_bounded_ring_buffer_and_reset();
     test_profile_full_reset();
     test_format_tsv_stability();
