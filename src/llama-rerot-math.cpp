@@ -4,6 +4,7 @@
 // oracles and kernel contracts, not production kernels.
 
 #include "llama-rerot-math.h"
+#include "ggml.h"
 
 #include <algorithm>
 #include <cmath>
@@ -993,4 +994,219 @@ llama_rerot_grid_verdict llama_rerot_verify_grid_naive(const llama_rerot_draft_g
         }
     }
     return verdict;
+}
+
+// ---------------------------------------------------------------------------
+// [R02] Live Q-prep reference (C07): gather + effective-position RoPE over
+// the active group prefix only, padding poisoned. Self-contained rotation
+// math mirroring ggml rope NORMAL/NEOX (freq_base/freq_scale/freq_factors/
+// YaRN correction); MROPE/IMROPE section modes are supported through the
+// same per-coordinate machinery. No ggml dependency — this stays a pure
+// reference module.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// YaRN ramp/correction, mirroring ggml_cpu ops.cpp rope_yarn/rope_yarn_ramp.
+float qprep_yarn_ramp(float low, float high, int64_t i0) {
+    const float y = (float(i0) / 2.0f - low) / std::max(0.001f, high - low);
+    return 1.0f - std::min(1.0f, std::max(0.0f, y));
+}
+
+void qprep_rope_yarn(
+        float theta_extrap, float freq_scale, const float corr_dims[2],
+        int64_t i0, float ext_factor, float mscale,
+        float & cos_theta, float & sin_theta) {
+    const float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    if (ext_factor != 0.0f) {
+        const float ramp_mix = qprep_yarn_ramp(corr_dims[0], corr_dims[1], i0) * ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * std::logf(1.0f / freq_scale);
+    }
+    cos_theta = std::cosf(theta) * mscale;
+    sin_theta = std::sinf(theta) * mscale;
+}
+
+// YaRN correction-dims selection mirroring ggml rope_yarn_corr_dims.
+void qprep_yarn_corr_dims(
+        int64_t n_dims, int64_t n_ctx_orig,
+        float freq_base, float beta_fast, float beta_slow,
+        float corr_dims[2]) {
+    const float start = std::floorf(float(n_ctx_orig) *
+        std::logf(freq_base) / (beta_fast * std::logf(2.0f)));
+    const float stop  = std::floorf(float(n_ctx_orig) *
+        std::logf(freq_base) / (beta_slow * std::logf(2.0f)));
+    corr_dims[0] = std::max(0.0f, std::min(float(n_dims - 1), start));
+    corr_dims[1] = std::max(0.0f, std::min(float(n_dims - 1), stop));
+}
+
+void qprep_rope_cache(
+        float theta_base, float freq_scale, const float * freq_factors,
+        const float corr_dims[2], int64_t n_dims, float ext_factor, float mscale,
+        float theta_scale, float sin_sign, std::vector<float> & cache) {
+    cache.resize(size_t(n_dims) * 2);
+    float theta = theta_base;
+    for (int64_t i0 = 0; i0 < n_dims; i0 += 2) {
+        const float ff = freq_factors ? freq_factors[i0 / 2] : 1.0f;
+        qprep_rope_yarn(theta / ff, freq_scale, corr_dims, i0, ext_factor, mscale,
+            cache[size_t(i0) + 0], cache[size_t(i0) + 1]);
+        cache[size_t(i0) + 1] *= sin_sign;
+        theta *= theta_scale;
+    }
+}
+
+void qprep_rotate_normal(
+        const std::vector<float> & cache, int64_t n_dims, int64_t n_rot,
+        int64_t stride, float * vec) {
+    // NORMAL (LLaMA): pairs (i, i + n_rot/2) for i in [0, n_rot/2).
+    for (int64_t i = 0; i < n_rot / 2; ++i) {
+        const float x = vec[i * stride];
+        const float y = vec[(i + n_rot / 2) * stride];
+        const float c = cache[2 * i + 0];
+        const float s = cache[2 * i + 1];
+        vec[i * stride]             = x * c - y * s;
+        vec[(i + n_rot / 2) * stride] = x * s + y * c;
+    }
+    (void) n_dims;
+}
+
+void qprep_rotate_neox(
+        const std::vector<float> & cache, int64_t n_dims, int64_t n_rot,
+        int64_t stride, float * vec) {
+    // NEOX (GPT-NeoX): pairs (i, i + n_rot/2) for i in [0, n_rot/2), same
+    // pair order but the half layout differs for n_dims > n_rot. The ggml
+    // neox path applies the rotation to the first n_rot dims in-place.
+    for (int64_t i = 0; i < n_rot / 2; ++i) {
+        const float x = vec[i * stride];
+        const float y = vec[(i + n_rot / 2) * stride];
+        const float c = cache[2 * i + 0];
+        const float s = cache[2 * i + 1];
+        vec[i * stride]             = x * c - y * s;
+        vec[(i + n_rot / 2) * stride] = x * s + y * c;
+    }
+    (void) n_dims;
+}
+
+} // namespace
+
+std::vector<int> llama_rerot_q_prep_supported_modes() {
+    // R02 candidate support table (single source for the future Vulkan
+    // dispatch gate): VISION is explicitly NOT supported (text-only v1,
+    // matching build_rerot_q_groups' require_supported gate).
+    return { 0 /* NORMAL */, 2 /* NEOX */, 8 /* MROPE */, 24 /* IMROPE */ };
+}
+
+std::vector<float> llama_rerot_q_prep_reference(
+        const float * q_raw,
+        const int32_t * q_indices,
+        const int32_t * q_pos,
+        const llama_rerot_q_prep_contract & c) {
+    if (c.head_dim <= 0 || c.heads <= 0 || c.n_tokens <= 0) {
+        invalid_arg("RERoT q-prep reference: invalid head/token dims");
+    }
+    if (c.capacity <= 0 || c.active < 0 || c.active > c.capacity) {
+        invalid_arg("RERoT q-prep reference: active/capacity contract violated");
+    }
+    if (c.n_rot <= 0 || c.n_rot > c.head_dim || (c.n_rot % 2) != 0) {
+        invalid_arg("RERoT q-prep reference: invalid rotary dims");
+    }
+    if (c.n_pos != 1 && c.n_pos != 4) {
+        invalid_arg("RERoT q-prep reference: n_pos must be 1 or 4");
+    }
+    const bool multi_coord = c.rope_mode == 8 /* MROPE */ || c.rope_mode == 24 /* IMROPE */;
+    if (multi_coord && c.n_pos != 4) {
+        invalid_arg("RERoT q-prep reference: MROPE/IMROPE require n_pos == 4");
+    }
+    if (!multi_coord && c.n_pos != 1) {
+        invalid_arg("RERoT q-prep reference: NORMAL/NEOX require n_pos == 1");
+    }
+    if (c.rope_mode != 0 && c.rope_mode != 2 && c.rope_mode != 8 && c.rope_mode != 24) {
+        invalid_arg("RERoT q-prep reference: unsupported rope mode");
+    }
+    if (c.rope_mode == 8 || c.rope_mode == 24) {
+        if (c.mrope_sections == nullptr) {
+            invalid_arg("RERoT q-prep reference: MROPE/IMROPE require sections");
+        }
+    }
+    if (q_raw == nullptr || q_indices == nullptr || q_pos == nullptr) {
+        invalid_arg("RERoT q-prep reference: null input pointer");
+    }
+
+    float corr_dims[2] = { 0.0f, 0.0f };
+    const float theta_scale = std::powf(c.freq_base, -2.0f / float(c.n_rot));
+    if (c.ext_factor != 0.0f) {
+        qprep_yarn_corr_dims(c.n_rot, c.n_ctx_orig, c.freq_base,
+            c.beta_fast, c.beta_slow, corr_dims);
+    }
+
+    // Output: [head_dim, heads, capacity] row-major, padding poisoned.
+    const size_t out_size = size_t(c.head_dim) * size_t(c.heads) * size_t(c.capacity);
+    std::vector<float> out(out_size);
+    const float nanf_val = std::nanf("");
+
+    const size_t head_bytes = size_t(c.head_dim);
+    std::vector<float> cache;
+
+    for (int64_t g = 0; g < c.active; ++g) {
+        const int32_t token = q_indices[g];
+        if (token < 0 || token >= c.n_tokens) {
+            invalid_arg("RERoT q-prep reference: q_indices out of range");
+        }
+        const float * src = q_raw + size_t(token) * size_t(c.heads) * head_bytes;
+        float * dst = out.data() + size_t(g) * size_t(c.heads) * head_bytes;
+
+        for (int64_t h = 0; h < c.heads; ++h) {
+            float * vec = dst + size_t(h) * head_bytes;
+            const float * svec = src + size_t(h) * head_bytes;
+            std::copy(svec, svec + head_bytes, vec);
+        }
+
+        if (multi_coord) {
+            // Sectioned multi-coordinate rotation: per-section dim range
+            // rotated with its own coordinate (MROPE); IMROPE uses the same
+            // sectioning with the text-delta convention applied by the
+            // caller's q_pos (fourth coord pinned 0 by fill_spans).
+            const int sections[4] = {
+                c.mrope_sections[0], c.mrope_sections[1],
+                c.mrope_sections[2], c.mrope_sections[3],
+            };
+            for (int sec = 0; sec < 4; ++sec) {
+                const int64_t sec_begin = sec == 0 ? 0 : sections[sec - 1];
+                const int64_t sec_end   = sections[sec];
+                if (sec_end <= sec_begin || sec_end > c.n_rot) {
+                    invalid_arg("RERoT q-prep reference: invalid mrope sections");
+                }
+                const int32_t p = q_pos[size_t(sec) * size_t(c.capacity) + g];
+                const float theta_base = float(p) * std::powf(c.freq_base, 0.0f);
+                qprep_rope_cache(theta_base, c.freq_scale, c.freq_factors, corr_dims,
+                    sec_end - sec_begin, c.ext_factor, c.attn_factor, theta_scale, 1.0f, cache);
+                for (int64_t h = 0; h < c.heads; ++h) {
+                    float * vec = dst + size_t(h) * head_bytes + sec_begin;
+                    qprep_rotate_normal(cache, sec_end - sec_begin, sec_end - sec_begin, 1, vec);
+                }
+            }
+        } else {
+            const int32_t p = q_pos[g];
+            const float theta_base = float(p) * std::powf(c.freq_base, 0.0f);
+            qprep_rope_cache(theta_base, c.freq_scale, c.freq_factors, corr_dims,
+                c.n_rot, c.ext_factor, c.attn_factor, theta_scale, 1.0f, cache);
+            for (int64_t h = 0; h < c.heads; ++h) {
+                float * vec = dst + size_t(h) * head_bytes;
+                if (c.rope_mode == 2) {
+                    qprep_rotate_neox(cache, c.n_rot, c.n_rot, 1, vec);
+                } else {
+                    qprep_rotate_normal(cache, c.n_rot, c.n_rot, 1, vec);
+                }
+            }
+        }
+    }
+
+    // Poison the padding: [active, capacity) groups all NaN.
+    for (int64_t g = c.active; g < c.capacity; ++g) {
+        float * dst = out.data() + size_t(g) * size_t(c.heads) * head_bytes;
+        std::fill(dst, dst + size_t(c.heads) * head_bytes, nanf_val);
+    }
+
+    return out;
 }

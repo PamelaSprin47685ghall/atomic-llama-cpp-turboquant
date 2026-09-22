@@ -1,0 +1,66 @@
+#version 450
+
+layout (push_constant) uniform parameter
+{
+    uint n_spans;
+    uint n_entries;
+} p;
+
+struct span_t {
+    uint key_start;
+    uint count;
+    uint group_index;
+    uint entry_index;
+};
+
+layout (binding = 0) readonly buffer Spans  { span_t spans[]; };
+layout (binding = 1) readonly buffer Prefix { uint   prefix[]; };
+layout (binding = 2) readonly buffer Spill  { ivec2  spill[]; };
+layout (binding = 3) writeonly buffer Out   { ivec2  data_out[]; };
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n_entries) {
+        return;
+    }
+
+    if (p.n_spans == 0) {
+        // Pass-through (identity): out = spill = full dense entries
+        data_out[i] = spill[i];
+        return;
+    }
+
+    // Binary search for b = first span with entry_index > i
+    // in the range [0, n_spans].
+    // If all spans have entry_index <= i, b = n_spans.
+    // If all spans have entry_index > i, b = 0.
+    uint l = 0;
+    uint r = p.n_spans;
+    while (l < r) {
+        uint mid = (l + r) >> 1;
+        if (spans[mid].entry_index > i) {
+            r = mid;
+        } else {
+            l = mid + 1;
+        }
+    }
+    const uint b = l;
+
+    if (b > 0) {
+        const span_t sp = spans[b - 1];
+        if (i < sp.entry_index + sp.count) {
+            // Covered by span (b - 1)
+            data_out[i] = ivec2(int(sp.key_start + (i - sp.entry_index)), int(sp.group_index));
+            return;
+        }
+    }
+
+    // Uncovered: belongs to spill buffer.
+    // prefix[b] = sum of counts of spans[0 .. b-1].
+    // Number of covered items preceding index i is exactly prefix[b],
+    // so the spill index is i - prefix[b].
+    const uint spill_idx = i - prefix[b];
+    data_out[i] = spill[spill_idx];
+}

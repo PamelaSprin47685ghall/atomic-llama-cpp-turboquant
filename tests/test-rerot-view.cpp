@@ -2179,6 +2179,152 @@ static void test_differential_query_layout_snapshot() {
     }
 }
 
+static void test_compact_span_abi() {
+    // R13-A (C05): compact span coverage accounting, expand bit-identity,
+    // and boundary rejection.
+
+    using E = llama_rerot_attn_entry;
+    using S = llama_rerot_attn_layout::span;
+
+    // ---- dense-only (no spans) ----
+    {
+        llama_rerot_attn_layout layout;
+        layout.n_queries = 1;
+        layout.groups = {{0, 0}};
+        layout.entries = {
+            {0, 0}, {1, 0}, {2, 0},
+        };
+        layout.query_offsets = {0, 3};
+
+        auto cov = llama_rerot_spans_coverage(layout);
+        CHECK(cov.total_rows == 3);
+        CHECK(cov.span_rows == 0);
+        CHECK(cov.spill_rows == 3);
+        CHECK(cov.dense_only());
+        CHECK(!cov.full_coverage());
+
+        // Expand must be bit-identical to entries when spans are empty.
+        auto expanded = llama_rerot_spans_expand(layout);
+        CHECK(expanded.size() == 3);
+        for (size_t i = 0; i < 3; ++i) {
+            CHECK(expanded[i].key_index   == layout.entries[i].key_index);
+            CHECK(expanded[i].group_index == layout.entries[i].group_index);
+        }
+    }
+
+    // ---- partial coverage (one span, head and tail spill) ----
+    {
+        llama_rerot_attn_layout layout;
+        layout.n_queries = 1;
+        layout.groups = {{0, 0}, {0, 1}};
+        layout.entries = {
+            {10, 0},   // head spill: group 0
+            {0, 0},    // placeholder overwritten by span: {100, 1}
+            {0, 0},    // placeholder overwritten by span: {101, 1}
+            {0, 0},    // placeholder overwritten by span: {102, 1}
+            {13, 0},   // tail spill: group 0
+        };
+        layout.query_offsets = {0, 5};
+        layout.spans.push_back({100, 3, 1, 1}); // 3 rows at entry[1..3]
+
+        auto cov = llama_rerot_spans_coverage(layout);
+        CHECK(cov.total_rows == 5);
+        CHECK(cov.span_rows == 3);
+        CHECK(cov.spill_rows == 2);
+        CHECK(!cov.dense_only());
+        CHECK(!cov.full_coverage());
+
+        auto expanded = llama_rerot_spans_expand(layout);
+        CHECK(expanded.size() == 5);
+        // entry[0] = head spill = key 10, group 0
+        CHECK(expanded[0].key_index == 10);
+        CHECK(expanded[0].group_index == 0);
+        // entry[1..3] = span rows
+        CHECK(expanded[1].key_index == 100);
+        CHECK(expanded[1].group_index == 1);
+        CHECK(expanded[2].key_index == 101);
+        CHECK(expanded[2].group_index == 1);
+        CHECK(expanded[3].key_index == 102);
+        CHECK(expanded[3].group_index == 1);
+        // entry[4] = tail spill = key 13, group 0
+        CHECK(expanded[4].key_index == 13);
+        CHECK(expanded[4].group_index == 0);
+    }
+
+    // ---- full coverage ----
+    {
+        llama_rerot_attn_layout layout;
+        layout.n_queries = 1;
+        layout.groups = {{0, 0}};
+        layout.entries = {{0,0}, {0,0}};
+        layout.query_offsets = {0, 2};
+        layout.spans.push_back({50, 2, 0, 0});
+
+        auto cov = llama_rerot_spans_coverage(layout);
+        CHECK(cov.total_rows == 2);
+        CHECK(cov.span_rows == 2);
+        CHECK(cov.spill_rows == 0);
+        CHECK(cov.full_coverage());
+
+        auto expanded = llama_rerot_spans_expand(layout);
+        CHECK(expanded.size() == 2);
+        CHECK(expanded[0].key_index == 50 && expanded[0].group_index == 0);
+        CHECK(expanded[1].key_index == 51 && expanded[1].group_index == 0);
+    }
+
+    // ---- zero-count span reject ----
+    {
+        llama_rerot_attn_layout layout;
+        layout.n_queries = 1;
+        layout.groups = {{0, 0}};
+        layout.entries = {{0,0}};
+        layout.query_offsets = {0, 1};
+        layout.spans.push_back({0, 0, 0, 0}); // zero count
+        bool threw = false;
+        try {
+            llama_rerot_spans_expand(layout);
+        } catch (const std::runtime_error &) {
+            threw = true;
+        }
+        CHECK(threw);
+    }
+
+    // ---- overflow reject (entry_index + count > n_entries) ----
+    {
+        llama_rerot_attn_layout layout;
+        layout.n_queries = 1;
+        layout.groups = {{0, 0}};
+        layout.entries = {{0,0}};
+        layout.query_offsets = {0, 1};
+        layout.spans.push_back({0, 3, 0, 0}); // count=3 but n_entries=1
+        bool threw = false;
+        try {
+            llama_rerot_spans_expand(layout);
+        } catch (const std::runtime_error &) {
+            threw = true;
+        }
+        CHECK(threw);
+    }
+
+    // ---- non-monotonic reject ----
+    {
+        llama_rerot_attn_layout layout;
+        layout.n_queries = 1;
+        layout.groups = {{0, 0}};
+        layout.entries = {{0,0}, {0,0}, {0,0}, {0,0}};
+        layout.query_offsets = {0, 4};
+        layout.spans.push_back({10, 1, 0, 2}); // entry_index 2
+        layout.spans.push_back({20, 1, 0, 1}); // entry_index 1 — backwards
+        bool threw = false;
+        try {
+            llama_rerot_spans_expand(layout);
+        } catch (const std::runtime_error &) {
+            threw = true;
+        }
+        CHECK(threw);
+    }
+}
+
 
 int main() {
     std::fprintf(stderr, "=== RERoT View Tests ===\n");
@@ -2203,6 +2349,7 @@ int main() {
     test_shared_layouts_vs_oracle();
     test_multi_reader_layouts_vs_oracle();
     test_shared_world_incremental();
+    test_compact_span_abi();
     std::fprintf(stderr, "=== Results: %d failure(s) ===\n", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

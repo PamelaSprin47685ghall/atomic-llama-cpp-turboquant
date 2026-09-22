@@ -936,6 +936,9 @@ void process_shaders() {
                       { "ATTN_GATE_ONLY", "1" }
     });
 
+    // RERoT compact span expansion: spans + prefix + spill -> dense entries
+    string_to_spv("rerot_span_expand", "rerot_span_expand.comp", {});
+
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
     string_to_spv("flash_attn_sparse_compact", "flash_attn_sparse_compact.comp", {});
 

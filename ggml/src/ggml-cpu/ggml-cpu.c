@@ -2067,6 +2067,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_flash_attn_ext_rerot(params, tensor);
             } break;
+        case GGML_OP_REROT_SPAN_EXPAND:
+            {
+                ggml_compute_forward_rerot_span_expand(params, tensor);
+            } break;
         case GGML_OP_XKV_RECONSTRUCT:
             {
                 ggml_compute_forward_xkv_reconstruct(params, tensor);
@@ -2534,6 +2538,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_XKV_LANDMARK_BUILD:
         case GGML_OP_XKV_LANDMARK_ROWS:
         case GGML_OP_XKV_LANDMARK_MERGE:
+        case GGML_OP_REROT_SPAN_EXPAND:
             {
                 n_tasks = 1;
             } break;

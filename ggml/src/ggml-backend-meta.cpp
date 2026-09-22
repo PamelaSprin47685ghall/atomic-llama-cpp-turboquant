@@ -1451,6 +1451,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_COS: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
+            case GGML_OP_REROT_SPAN_EXPAND: {
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
             case GGML_OP_SUM: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;

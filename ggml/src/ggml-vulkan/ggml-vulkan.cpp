@@ -1265,6 +1265,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_xkv_landmark_merge;
     vk_pipeline pipeline_rwkv_wkv6_f32;
     vk_pipeline pipeline_rwkv_wkv7_f32;
+    vk_pipeline pipeline_rerot_span_expand;
     vk_pipeline pipeline_gated_linear_attn_f32;
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
@@ -7471,6 +7472,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     // XKV selected-row factor reconstruction: 10 bindings, 84B push constants, one dispatch per op
     ggml_vk_create_pipeline(device, device->pipeline_xkv_reconstruct, "xkv_reconstruct", xkv_reconstruct_len, xkv_reconstruct_data, "main", 10, 84, {64, 1, 1}, {}, 1);
+
+    // RERoT span expand: 4 bindings, 8B push constants {n_spans, n_entries}, 256 local_size
+    ggml_vk_create_pipeline(device, device->pipeline_rerot_span_expand, "rerot_span_expand", rerot_span_expand_len, rerot_span_expand_data, "main", 4, 2 * sizeof(uint32_t), {256, 1, 1}, {}, 1);
 
     // XKV dual-source indexed attention: 11 bindings, 112B push constants, one dispatch per KV head.
     ggml_vk_create_pipeline(device, device->pipeline_xkv_attention, "xkv_attention", xkv_attention_len, xkv_attention_data, "main", 11, 112, {1, 1, 1}, {}, 1);
@@ -15855,8 +15859,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             elements = { (uint32_t)CEIL_DIV(ne00, 128), 1, 1 };
         } else {
             elements = { (uint32_t)ne01, (uint32_t)ne02, (uint32_t)ne03 };
-        }
-        break;
+        } break;
 
     case GGML_OP_SUM:
         // We use GGML_OP_SUM_ROWS with 1 row.
@@ -17878,6 +17881,36 @@ static void ggml_vk_turbo_wht(ggml_backend_vk_context * ctx, vk_context& subctx,
 
 static void ggml_vk_silu_back(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_SILU_BACK, { (uint32_t)ggml_nelements(src0), 0, 0.0f, 0.0f, 0.0f, 0.0f });
+}
+
+static void ggml_vk_rerot_span_expand(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * spans, const ggml_tensor * prefix, const ggml_tensor * spill, ggml_tensor * dst) {
+    const uint32_t n_spans   = (uint32_t) ggml_get_op_params_i32(dst, 0);
+    const uint32_t n_entries = (uint32_t) ggml_get_op_params_i32(dst, 1);
+
+    struct {
+        uint32_t n_spans;
+        uint32_t n_entries;
+    } pc = { n_spans, n_entries };
+
+    vk_pipeline pipeline = ctx->device->pipeline_rerot_span_expand;
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer spans_buf  = ggml_vk_tensor_subbuffer(ctx, spans, false);
+    vk_subbuffer prefix_buf = ggml_vk_tensor_subbuffer(ctx, prefix, false);
+    vk_subbuffer spill_buf  = ggml_vk_tensor_subbuffer(ctx, spill, false);
+    vk_subbuffer dst_buf    = ggml_vk_tensor_subbuffer(ctx, dst, false);
+
+    std::array<uint32_t, 3> elements = { n_entries, 1, 1 };
+    if (n_entries > 0) {
+        // local_size_x is 256
+        elements[0] = CEIL_DIV(n_entries, 256) * 256;
+    }
+
+    ggml_vk_sync_buffers(ctx, subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { spans_buf, prefix_buf, spill_buf, dst_buf }, pc, elements);
+    ggml_vk_sync_buffers(ctx, subctx);
 }
 
 // XKV selected-row factor reconstruction: single dispatch per op, code streams
@@ -21260,6 +21293,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         } else {
             ggml_vk_mul_mat_id(ctx, compute_ctx, cgraph, node_idx);
         }
+
+        break;
+    case GGML_OP_REROT_SPAN_EXPAND:
+        ggml_vk_rerot_span_expand(ctx, compute_ctx, src0, src1, src2, node);
 
         break;
 
@@ -26464,6 +26501,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_COUNT_EQUAL:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_I32
                 && ggml_is_contiguous(op->src[1]) && op->src[1]->type == GGML_TYPE_I32;
+        case GGML_OP_REROT_SPAN_EXPAND:
+            {
+                static const bool enabled = (getenv("LLAMA_REROT_GPU_SPAN_EXPAND") && strcmp(getenv("LLAMA_REROT_GPU_SPAN_EXPAND"), "1") == 0);
+                if (!enabled) return false;
+                return op->src[0] && op->src[0]->type == GGML_TYPE_I32 &&
+                       op->src[1] && op->src[1]->type == GGML_TYPE_I32 &&
+                       op->src[2] && op->src[2]->type == GGML_TYPE_I32 &&
+                       op->type == GGML_TYPE_I32;
+            }
         case GGML_OP_IM2COL:
             return ggml_is_contiguous(op->src[1])
                 && op->src[1]->type == GGML_TYPE_F32
@@ -28321,6 +28367,11 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                     ggml_flash_attn_ext_add_sinks(tensor_clone, src_clone[5]);
                 }
             }
+        } else if (tensor->op == GGML_OP_REROT_SPAN_EXPAND) {
+            tensor_clone = ggml_rerot_span_expand(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], tensor->ne[1]);
+            tensor_clone->op_params[0] = tensor->op_params[0];
+            tensor_clone->op_params[1] = tensor->op_params[1];
+            tensor_clone->op_params[2] = tensor->op_params[2];
         } else if (tensor->op == GGML_OP_FLASH_PREFILL_POOL) {
             ggml_vk_fp_params pp;
             GGML_ASSERT(ggml_vk_fp_unpack_params(tensor, FP_OP_POOL, pp));

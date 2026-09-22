@@ -13840,3 +13840,67 @@ void ggml_compute_forward_flash_prefill_attn(
         memcpy(out_ptr, out_tmp, (size_t)Dv * sizeof(float));
     }
 }
+
+void ggml_compute_forward_rerot_span_expand(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * spans_t  = dst->src[0];
+    const ggml_tensor * prefix_t = dst->src[1];
+    const ggml_tensor * spill_t  = dst->src[2];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(spans_t->type == GGML_TYPE_I32);
+    GGML_ASSERT(prefix_t->type == GGML_TYPE_I32);
+    GGML_ASSERT(spill_t->type == GGML_TYPE_I32);
+
+    const int32_t n_spans   = ggml_get_op_params_i32(dst, 0);
+    const int32_t n_entries = ggml_get_op_params_i32(dst, 1);
+
+    const uint32_t * spans_data  = (const uint32_t *) spans_t->data;
+    const int32_t  * spill_data  = (const int32_t *)  spill_t->data;
+    int32_t        * out_data    = (int32_t *)        dst->data;
+
+    if (n_spans == 0) {
+        // Pass-through identity: out = spill
+        if (n_entries > 0 && spill_data && out_data) {
+            memcpy(out_data, spill_data, (size_t) n_entries * 2 * sizeof(int32_t));
+        }
+        return;
+    }
+
+    // Inline CPU expansion matching llama_rerot_spans_expand slot-for-slot
+    // spans: uvec4 {key_start, count, group_index, entry_index}
+    // spill: authoritative entries not covered by spans, packed in entry order
+    int32_t cursor = 0;
+    int32_t spill_idx = 0;
+    for (int32_t s = 0; s < n_spans; ++s) {
+        const uint32_t key_start   = spans_data[4 * s + 0];
+        const uint32_t count       = spans_data[4 * s + 1];
+        const uint32_t group_index = spans_data[4 * s + 2];
+        const uint32_t entry_index = spans_data[4 * s + 3];
+
+        // Uncovered scalar rows before this span come from spill buffer
+        while (cursor < (int32_t) entry_index) {
+            out_data[2 * cursor + 0] = spill_data[2 * spill_idx + 0];
+            out_data[2 * cursor + 1] = spill_data[2 * spill_idx + 1];
+            ++cursor;
+            ++spill_idx;
+        }
+        // Covered span rows: ascending key range, constant group_index
+        for (uint32_t k = 0; k < count; ++k) {
+            out_data[2 * cursor + 0] = (int32_t) (key_start + k);
+            out_data[2 * cursor + 1] = (int32_t) group_index;
+            ++cursor;
+        }
+    }
+    // Tail rows after the last span
+    while (cursor < n_entries) {
+        out_data[2 * cursor + 0] = spill_data[2 * spill_idx + 0];
+        out_data[2 * cursor + 1] = spill_data[2 * spill_idx + 1];
+        ++cursor;
+        ++spill_idx;
+    }
+}

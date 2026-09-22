@@ -174,6 +174,10 @@ struct server_rerot_metrics {
     uint64_t parallel_model_tokens = 0;
     double completed_episode_seconds = 0.0;
     double parallel_seconds = 0.0;
+    // Sum over completed episodes of the episode's peak concurrent Lane count
+    // (C02: request-scoped peak evidence counter; delta across one request =
+    // that request's multi-Lane peak). NOT a gauge.
+    uint64_t parallel_peak_lanes_sum = 0;
     uint64_t frontiers = 0;
     uint64_t topology_barriers = 0;
     uint64_t refresh_total = 0;

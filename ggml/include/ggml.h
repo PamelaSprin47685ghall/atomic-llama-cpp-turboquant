@@ -612,6 +612,7 @@ extern "C" {
         GGML_OP_XKV_LANDMARK_BUILD,
         GGML_OP_XKV_LANDMARK_ROWS,
         GGML_OP_XKV_LANDMARK_MERGE,
+        GGML_OP_REROT_SPAN_EXPAND,
 
         GGML_OP_COUNT,
     };
@@ -2550,6 +2551,13 @@ extern "C" {
             struct ggml_tensor  * sinks,
             float                 scale,
             float                 logit_softcap);
+
+    GGML_API struct ggml_tensor * ggml_rerot_span_expand(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * spans,
+            struct ggml_tensor  * prefix,
+            struct ggml_tensor  * spill,
+            int64_t               n_entries);
 
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,

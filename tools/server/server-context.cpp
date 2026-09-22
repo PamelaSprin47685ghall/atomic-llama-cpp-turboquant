@@ -1647,6 +1647,7 @@ private:
         int64_t parallel_started_us = 0;
         uint64_t parallel_elapsed_us = 0;
         bool parallel_finished = false;
+        uint64_t parallel_peak_lanes = 0;
         common_grammar saved_user_grammar;
         common_sampler_ptr c0_sampler;
         std::unordered_map<llama_rerot_node_id, common_sampler_ptr> lane_samplers;
@@ -1843,6 +1844,18 @@ private:
         transport_it->second->parallel_started_us = ggml_time_us();
     }
 
+    // C02: capture the episode's peak concurrent Lane count (logical lanes).
+    // Called every frontier admission; idempotent max across the episode.
+    void rerot_note_lane_count(uint64_t episode_id, uint64_t live_lanes) {
+        auto transport_it = rerot_transport.find(episode_id);
+        if (transport_it == rerot_transport.end()) {
+            return;
+        }
+        if (live_lanes > transport_it->second->parallel_peak_lanes) {
+            transport_it->second->parallel_peak_lanes = live_lanes;
+        }
+    }
+
     void rerot_note_parallel_end(uint64_t episode_id, int64_t now_us) {
         auto transport_it = rerot_transport.find(episode_id);
         if (transport_it == rerot_transport.end() ||
@@ -1875,6 +1888,7 @@ private:
         rerot_metrics.parallel_model_tokens += transport.parallel_model_tokens;
         rerot_metrics.completed_episode_seconds += episode_seconds;
         rerot_metrics.parallel_seconds += parallel_seconds;
+        rerot_metrics.parallel_peak_lanes_sum += transport.parallel_peak_lanes;
 
         const double aggregate_tps = episode_seconds > 0.0
             ? static_cast<double>(transport.model_tokens) / episode_seconds
@@ -3740,6 +3754,7 @@ private:
             episode->running.size() + episode->starting.size();
         rerot_metrics.max_live_lanes = std::max<uint64_t>(
             rerot_metrics.max_live_lanes, live_lanes);
+        rerot_note_lane_count(episode_id, live_lanes);
         if (live_lanes > 1) {
             rerot_note_parallel_start(episode_id);
         }
@@ -10796,6 +10811,7 @@ void server_routes::init_routes() {
             emit_rerot("counter", "rerot_parallel_model_tokens", "Model-forward tokens committed between first multi-Lane admission and the final acquire fence.", r.parallel_model_tokens);
             emit_rerot("counter", "rerot_completed_episode_seconds", "RERoT episode wall time after prompt prefill; divide completed model tokens by this value for aggregate throughput.", r.completed_episode_seconds);
             emit_rerot("counter", "rerot_parallel_seconds", "Multi-Lane phase wall time; divide parallel model tokens by this value for parallel aggregate throughput.", r.parallel_seconds);
+            emit_rerot("counter", "rerot_parallel_peak_lanes_total", "Sum over completed RERoT episodes of peak concurrent Lane count during the episode's multi-Lane phase (C02 evidence counter).", r.parallel_peak_lanes_sum);
             emit_rerot("counter", "rerot_frontiers", "RERoT frontiers committed.", r.frontiers);
             emit_rerot("counter", "rerot_topology_barriers", "RERoT topology barriers completed.", r.topology_barriers);
             emit_rerot("counter", "rerot_refresh_total", "RERoT view refreshes completed.", r.refresh_total);

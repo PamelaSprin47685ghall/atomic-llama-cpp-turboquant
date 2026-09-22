@@ -423,3 +423,71 @@ llama_rerot_grid_verdict llama_rerot_verify_grid(
 // accepts its own draft prefix against truth independently. Reference only —
 // the counterexample engine. Same signature as the correct one.
 llama_rerot_grid_verdict llama_rerot_verify_grid_naive(const llama_rerot_draft_grid & grid);
+
+// ---------------------------------------------------------------------------
+// [R02] Live Q-prep contract (C07): gather + effective-position RoPE over
+// the LIVE group prefix only. This is the input contract a fused GPU kernel
+// must implement; the old chain (GET_ROWS over the padded bucket + ROPE over
+// the full bucket) computes the same active rows and wastes the padding.
+// ---------------------------------------------------------------------------
+
+struct llama_rerot_q_prep_contract {
+    // Inputs
+    int64_t head_dim = 0;    // rotary-aware head dim (raw head dim)
+    int64_t heads    = 0;    // query heads
+    int64_t n_tokens = 0;    // source token count (raw Q rows)
+    int64_t capacity = 0;    // group capacity bucket (32-aligned); groups below
+    int64_t active   = 0;    // live groups; MUST be 0 <= active <= capacity
+    int64_t n_pos    = 1;    // RoPE coordinates: 1 (NORMAL/NEOX) or 4 (MROPE/IMROPE)
+    int64_t n_rot    = 0;    // rotary dimensions (<= head_dim)
+    int     rope_mode = 0;   // GGML_ROPE_TYPE_*
+    float   freq_base  = 10000.0f;
+    float   freq_scale = 1.0f;
+    float   ext_factor = 0.0f;   // YaRN: 0 = disabled
+    float   attn_factor = 1.0f;
+    float   beta_fast   = 32.0f;
+    float   beta_slow   = 1.0f;
+    int64_t n_ctx_orig = 0;      // context length for YaRN correction
+    const float * freq_factors = nullptr;  // [n_rot/2] optional per-dim factors
+    const int   * mrope_sections = nullptr; // [4] for MROPE/IMROPE
+
+    // Layout invariants (the protocol):
+    //  - q_raw: row-major [head_dim, heads, n_tokens], F32.
+    //  - q_indices[i] for i in [0, active) picks the token each live group
+    //    gathers from q_raw; values in [0, n_tokens). Duplicates are legal
+    //    (a token may serve several groups).
+    //  - q_pos: per group per coordinate effective position, strided by
+    //    capacity: q_pos[coord * capacity + i] (capacity stride, matching
+    //    fill_spans; the padded suffix is never read).
+    //  - Output: row-major [head_dim, heads, capacity], F32, capacity
+    //    stride. ONLY [0, active) groups are written with rotated queries;
+    //    [active, capacity) MUST be poison (NaN) so any consumer reading
+    //    inactive rows fails loudly.
+    //  - Replay contract: for a fixed (capacity, active) pair the kernel
+    //    must be replayable (same inputs -> same outputs) across frontiers;
+    //    active may change between frontiers without redefinition.
+};
+
+// CPU reference for the R02 live Q-prep candidate: gather + RoPE over only
+// the active prefix, poison the padding. This is the equivalence target the
+// fused kernel must match (same numerical mode, atol/rtol vs the old chain).
+// Throws std::invalid_argument on contract violations (active > capacity,
+// q_indices out of range, unsupported rope mode for this reference, n_pos
+// mismatch).
+//
+// NOTE: the rotation math is implemented with the production ggml rope
+// helpers so the reference shares the math but independently expresses the
+// active/stride/gather structure (independent of GET_ROWS/ROPE graph ops).
+// YaRN ext_factor != 0 and MROPE/IMROPE section modes are exercised by the
+// caller's tests; unsupported combinations must route the fused candidate
+// back to the old chain.
+std::vector<float> llama_rerot_q_prep_reference(
+    const float * q_raw,
+    const int32_t * q_indices,
+    const int32_t * q_pos,
+    const llama_rerot_q_prep_contract & contract);
+
+// RoPE-mode support table for the R02 candidate (declarative, single
+// source for the future Vulkan dispatch gate): returns the supported rope
+// modes (GGML_ROPE_TYPE_* values) and whether the reference covers them.
+std::vector<int> llama_rerot_q_prep_supported_modes();

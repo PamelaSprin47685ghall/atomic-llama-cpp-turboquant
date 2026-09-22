@@ -879,6 +879,15 @@ void llm_graph_input_attn_rerot::fill_spans(
         throw std::runtime_error("RERoT DDVR: cannot fill span tensors from an empty layout");
     }
     const size_t n_groups  = layout.groups.size();
+
+    // R13-A: Guarded GPU fast path flag (LLAMA_REROT_GPU_SPAN_EXPAND=1).
+    // Default stays the existing CPU expansion.
+    static const bool gpu_span_expand_env = [] {
+        const char * e = getenv("LLAMA_REROT_GPU_SPAN_EXPAND");
+        return e && strcmp(e, "1") == 0;
+    }();
+    GGML_UNUSED(gpu_span_expand_env);
+
     const size_t n_entries = layout.entries.size();
     const size_t n_offsets = layout.query_offsets.size();
     const int64_t group_cap = q_indices->ne[0];

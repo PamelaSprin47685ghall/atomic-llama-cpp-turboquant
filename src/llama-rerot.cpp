@@ -1032,6 +1032,60 @@ bool llama_rerot_attn_layout::validate(uint32_t n_keys, std::string * error) con
     return true;
 }
 
+// --- R13-A compact span ABI (C05) -----------------------------------------------
+
+llama_rerot_span_coverage llama_rerot_spans_coverage(
+        const llama_rerot_attn_layout & layout) {
+    llama_rerot_span_coverage cov;
+    cov.total_rows = layout.entries.size();
+    uint64_t covered = 0;
+    for (const auto & sp : layout.spans) {
+        covered += sp.count;
+    }
+    cov.span_rows = covered;
+    // Covered ranges are entry-disjoint by construction (non-decreasing
+    // entry_index + count windows), so spill is total minus covered.
+    cov.spill_rows = covered < cov.total_rows ? cov.total_rows - covered : 0;
+    return cov;
+}
+
+std::vector<llama_rerot_attn_entry> llama_rerot_spans_expand(
+        const llama_rerot_attn_layout & layout) {
+    const size_t n_entries = layout.entries.size();
+    std::vector<llama_rerot_attn_entry> out(n_entries);
+
+    size_t cursor = 0;
+    for (const auto & sp : layout.spans) {
+        if (sp.count == 0) {
+            throw std::runtime_error(
+                "RERoT span expand: zero-count span is not expressible");
+        }
+        if ((uint64_t) sp.entry_index + sp.count > n_entries) {
+            throw std::runtime_error(
+                "RERoT span expand: span range beyond live entries");
+        }
+        if (sp.entry_index < cursor) {
+            throw std::runtime_error(
+                "RERoT span expand: span table is not entry-ordered");
+        }
+        // Scalar rows before this span come from the authoritative stream.
+        for (; cursor < sp.entry_index; ++cursor) {
+            out[cursor] = layout.entries[cursor];
+        }
+        // Span rows: ascending key range, one group.
+        for (uint32_t k = 0; k < sp.count; ++k) {
+            out[cursor].key_index   = sp.key_start + k;
+            out[cursor].group_index = sp.group_index;
+            ++cursor;
+        }
+    }
+    // Tail rows after the last span.
+    for (; cursor < n_entries; ++cursor) {
+        out[cursor] = layout.entries[cursor];
+    }
+    return out;
+}
+
 // Batched shared-reader layout construction (2026-09-22 compute-organization
 // round). Structure/numeric separation, mirroring llama_rerot_build_query_layout
 // exactly:

@@ -254,6 +254,22 @@ struct llama_rerot_attn_layout {
     };
     std::vector<span> spans;
 
+    // R13-A compact span ABI (C05):
+    //  - Spans are a compressed description of a suffix of the authoritative
+    //    entry stream; the entries vector stays authoritative for every row
+    //    a span does NOT cover (dense compatibility).
+    //  - On the wire/GPU side a span is 16 bytes: {u32 key_start, u32 count,
+    //    u32 group_index, u32 entry_index}; LLAMA_REROT_SPAN_ABI_VERSION
+    //    identifies this layout. A consumer that does not understand the
+    //    version MUST treat the spans table as absent (dense entries only).
+    //  - Invariants enforced by validate():
+    //      sp.count > 0
+    //      sp.entry_index + sp.count <= n_entries (no overflow)
+    //      entry_index non-decreasing across spans; span-covered key ranges
+    //        are +1 ascending and share one group_index
+    //  - Coverage accounting: span_rows(spans) + spill_rows(entries not
+    //    covered) == n_entries.
+
     bool empty() const {
         return n_queries == 0;
     }
@@ -871,4 +887,39 @@ bool llama_rerot_cell_visible_gated(
     bool owned_by_reader,
     llama_pos storage_pos,
     llama_pos query_storage_pos);
+
+// --- R13-A compact span ABI (C05) -------------------------------------------------
+
+// Version of the span wire/GPU layout. Bump when the 16-byte record changes
+// meaning. Consumers that do not recognize this version must fall back to
+// dense entries (spans are a compression, never the only authority).
+static constexpr uint32_t LLAMA_REROT_SPAN_ABI_VERSION = 1;
+static constexpr size_t   LLAMA_REROT_SPAN_ABI_SIZE   = 16; // 4 x u32
+
+struct llama_rerot_span_coverage {
+    uint64_t span_rows  = 0; // rows described by spans (sum of counts)
+    uint64_t spill_rows = 0; // rows covered by authoritative entries only
+    uint64_t total_rows = 0; // n_entries
+    // True when the span table is empty (dense compatibility path) or when
+    // every entry is span-covered.
+    bool dense_only() const { return span_rows == 0; }
+    bool full_coverage() const { return total_rows > 0 && spill_rows == 0; }
+};
+
+// Account span vs spill coverage WITHOUT expanding. O(n_spans) reads, no
+// allocation. Assumes the layout passed validate(); on an invalid layout the
+// returned accounting is unspecified (callers validate first).
+llama_rerot_span_coverage llama_rerot_spans_coverage(
+    const llama_rerot_attn_layout & layout);
+
+// Expand the span table into a full dense entry stream, slot for slot, and
+// return it. This is the CPU reference for the R13-A GPU expand kernel:
+// the expanded stream MUST be bit-identical to layout.entries. Uncovered
+// slots come from entries (dense compatibility); covered slots are the
+// ascending key range tagged with the span's group_index. Throws
+// std::runtime_error on span-table violations (zero count, overflow,
+// non-monotone entry_index, range beyond n_entries).
+std::vector<llama_rerot_attn_entry> llama_rerot_spans_expand(
+    const llama_rerot_attn_layout & layout);
+
 

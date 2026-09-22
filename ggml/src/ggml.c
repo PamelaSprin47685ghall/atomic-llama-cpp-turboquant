@@ -1161,9 +1161,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "XKV_LANDMARK_BUILD",
     "XKV_LANDMARK_ROWS",
     "XKV_LANDMARK_MERGE",
+    "REROT_SPAN_EXPAND",
 };
 
-static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
+static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT != 116");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1291,9 +1292,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "xkv_landmark_build(a_k,b_k,rows,pos,meta,rope,scratch,eb,srcfp,status)",
     "xkv_landmark_rows(sel,meta,off,ids,kv,pos,ptrs,outpos,status)",
     "xkv_landmark_merge(idx,sc,base,outsc,status)",
+    "rerot_span_expand(spans,prefix,spill)",
 };
 
-static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
+static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT != 116");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5621,6 +5623,39 @@ struct ggml_tensor * ggml_flash_attn_ext_rerot(
     result->src[3] = entries;
     result->src[4] = offsets;
     result->src[5] = sinks;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_rerot_span_expand(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * spans,
+        struct ggml_tensor  * prefix,
+        struct ggml_tensor  * spill,
+        int64_t               n_entries) {
+    GGML_ASSERT(spans != NULL && prefix != NULL && spill != NULL);
+    GGML_ASSERT(spans->type == GGML_TYPE_I32);
+    GGML_ASSERT(prefix->type == GGML_TYPE_I32);
+    GGML_ASSERT(spill->type == GGML_TYPE_I32);
+    GGML_ASSERT(spans->ne[0] == 4);
+    GGML_ASSERT(spill->ne[0] == 2);
+    GGML_ASSERT(prefix->ne[0] >= spans->ne[1] + 1);
+    GGML_ASSERT(n_entries >= 0);
+
+    const int64_t n_spans = spans->ne[1];
+    const int64_t n_spill = spill->ne[1];
+
+    int64_t ne[4] = { 2, n_entries, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_I32, 2, ne);
+
+    result->op     = GGML_OP_REROT_SPAN_EXPAND;
+    result->src[0] = spans;
+    result->src[1] = prefix;
+    result->src[2] = spill;
+
+    ggml_set_op_params_i32(result, 0, (int32_t) n_spans);
+    ggml_set_op_params_i32(result, 1, (int32_t) n_entries);
+    ggml_set_op_params_i32(result, 2, (int32_t) n_spill);
 
     return result;
 }

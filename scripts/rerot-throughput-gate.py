@@ -1,5 +1,46 @@
 #!/usr/bin/env python3
-"""Compare single-Lane generation throughput with RERoT aggregate throughput."""
+"""RERoT throughput gate: same-build scheduling-strategy comparison (RERoT OFF vs ON).
+
+C02 fixes (攻坚总计划 §2.4 / §12):
+  1. Per-sample judgment: every correctness check is evaluated for EVERY round;
+     a single bad round fails the gate (no last-round masking of earlier aborts).
+  2. Gauge/counter separation: gauges (rerot_pens_allocated, rerot_batch_pens, ...)
+     are snapshotted and reported, but NEVER used for before/after delta checks.
+     Multi-Lane evidence comes from the counters rerot_parallel_model_tokens /
+     rerot_parallel_seconds (event evidence), and from
+     rerot_parallel_peak_lanes_total (request-scoped peak lanes, counter).
+  3. Missing metrics are reported as `missing` and yield evidence-incomplete
+     (exit 3), never a fabricated 0.0.
+  4. No parallel token/time evidence -> `parallel_faster_than_serial` is
+     NOT_EXERCISED (evidence-incomplete), never silently substituted by the
+     aggregate number.
+  5. Route gate: if --enable-operator-route-gate is set but the route counter
+     is absent from /metrics, the gate reports evidence-incomplete instead of
+     inventing a 0 hit count.
+  6. timings.prompt_ms is reported as prompt_ms, not ttft_ms. TTFT requires
+     streaming sampling; see scripts/rerot-ttft-sample.py. The gate requires
+     non-streaming requests and records ttft_ms as null.
+  7. Comparison kinds are explicit: same-build scheduling strategy (default)
+     vs implementation-version comparison (--baseline-base-url).
+  8. Paired statistics: every (serial, rerot) pair is retained; the verdict
+     uses the paired ratio distribution (median + lower bound), not two
+     independent side medians.
+  9. Historical baseline responses are never part of the formal verdict
+     unless --baseline-manifest matches the live server manifest; even then
+     they are reported as historical_reference and excluded from the paired
+     verdict (which requires same-run fresh pairs).
+ 10. Timeout help text: the client-side HTTP deadline does not cancel GPU
+     work and is not a device-recovery mechanism.
+
+Exit codes: 0 PASS, 1 operational error, 2 FAIL (checks), 3 evidence-incomplete.
+
+Note on rerot_q_prep_rows accounting (攻坚总计划 §2.4): q_prep_rows is
+accumulated in llama-graph.cpp graph construction as group_cap * heads, where
+group_cap is the 32-aligned capacity bucket — NOT dispatched live rows. It is
+not exported to /metrics and this gate deliberately does not use it. Any
+future exporter must divide by live_groups only after accounting for graph
+replay counts; the capacity-based value overstates processed rows.
+"""
 
 from __future__ import annotations
 
@@ -13,6 +54,15 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+EXIT_PASS = 0
+EXIT_ERROR = 1
+EXIT_FAIL = 2
+EXIT_EVIDENCE_INCOMPLETE = 3
+
+CHECK_OK = "ok"
+CHECK_FAIL = "fail"
+CHECK_NOT_EXERCISED = "not_exercised"  # route not hit / no parallel phase
+CHECK_EVIDENCE_INCOMPLETE = "evidence_incomplete"  # required metric missing
 
 # TODO: Enable when P0 low-level operator route counters land in /metrics.
 # Once implemented, verify operator route hit metrics (e.g. Vulkan RERoT kernel hits).
@@ -103,7 +153,9 @@ def validate_dag_payload(payload: Any) -> tuple[bool, str]:
     )
 
 
-METRICS = (
+# Counter metrics: monotonic accumulators; before/after delta across one request
+# equals that request's contribution (exactly one episode per round is asserted).
+COUNTER_METRICS: tuple[str, ...] = (
     "rerot_completed_episode_total",
     "rerot_completed_model_tokens",
     "rerot_parallel_model_tokens",
@@ -114,6 +166,15 @@ METRICS = (
     "rerot_pending_tokens",
     "rerot_hard_aborts",
     "rerot_final_fences",
+    "rerot_frontier_rows",
+    # Request-scoped multi-Lane peak pens, summed over completed episodes.
+    # Present when the server exports it (C02); absent on older builds ->
+    # reported missing (evidence-incomplete) rather than 0.
+    "rerot_parallel_peak_lanes_total",
+)
+
+# Gauge metrics: instantaneous state; reported as snapshots, NEVER delta-checked.
+GAUGE_METRICS: tuple[str, ...] = (
     "rerot_people_capacity",
     "rerot_people_resident",
     "rerot_pens_capacity",
@@ -121,10 +182,27 @@ METRICS = (
     "rerot_pens_running",
     "rerot_batch_people",
     "rerot_batch_pens",
-    "rerot_frontier_rows",
     "rerot_brain_bytes",
     "rerot_hand_bytes",
 )
+
+# Counters required for a meaningful verdict. Absence -> evidence-incomplete.
+REQUIRED_COUNTERS: tuple[str, ...] = (
+    "rerot_completed_episode_total",
+    "rerot_completed_model_tokens",
+    "rerot_parallel_model_tokens",
+    "rerot_completed_episode_seconds",
+    "rerot_parallel_seconds",
+    "rerot_public_tokens",
+    "rerot_private_tokens",
+    "rerot_pending_tokens",
+    "rerot_hard_aborts",
+    "rerot_final_fences",
+)
+
+# Optional: when the route gate is enabled, this counter must be registered by
+# the server (P0 operator route counters). Absent -> evidence-incomplete, never 0.
+ROUTE_HIT_METRIC = "rerot_operator_route_hits"
 
 
 def request_json(url: str, payload: dict[str, Any], api_key: str, timeout: float) -> tuple[float, dict[str, Any]]:
@@ -194,10 +272,76 @@ def fetch_metrics(base_url: str, api_key: str, timeout: float) -> dict[str, floa
     return values
 
 
-def metric_delta(before: dict[str, float], after: dict[str, float], name: str) -> float:
-    if name not in after:
-        return 0.0
-    return after[name] - before.get(name, 0.0)
+def counter_delta(before: dict[str, float], after: dict[str, float], name: str) -> tuple[float, bool]:
+    """Delta for a counter metric.
+
+    Returns (value, present). present=False means the counter is not registered
+    in /metrics on either scrape; the value is then 0.0 and MUST NOT be used as
+    evidence (callers report evidence-incomplete instead).
+    """
+    if name not in after and name not in before:
+        return 0.0, False
+    return after.get(name, 0.0) - before.get(name, 0.0), True
+
+
+def fetch_props(base_url: str, api_key: str, timeout: float) -> dict[str, Any]:
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}/props",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def parse_build_number(build_info: Any) -> int | None:
+    """Extract the build number from the /props build_info field.
+
+    build_info is typically the llama_print_build_info() text containing a
+    line like 'build: 4665 (ffffffff)'. Returns None when unparseable.
+    """
+    if isinstance(build_info, int):
+        return build_info
+    if isinstance(build_info, str):
+        for part in build_info.replace("(", " ").replace(")", " ").split():
+            if part.isdigit() and len(part) >= 4:
+                return int(part)
+    return None
+
+
+def manifest_from_props(props: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "build_number": parse_build_number(props.get("build_info")),
+        "model_alias": props.get("model_alias"),
+        "model_ftype": props.get("model_ftype"),
+        "model_sha256": props.get("model_sha256"),
+    }
+
+
+def load_manifest(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"failed to load manifest {path}: {error}") from error
+    if not isinstance(data, dict):
+        raise RuntimeError(f"manifest {path} must be a JSON object")
+    return data
+
+
+def manifests_match(server: dict[str, Any], baseline: dict[str, Any]) -> tuple[bool, list[str]]:
+    mismatches: list[str] = []
+    # build_number and model_sha256 are the hard identity keys. model_alias and
+    # model_ftype are soft: a missing side is reported, not rejected.
+    for key in ("build_number", "model_sha256"):
+        s = server.get(key)
+        b = baseline.get(key)
+        if s is None or b is None:
+            mismatches.append(f"'{key}' missing on one side (server={s!r}, baseline={b!r})")
+        elif s != b:
+            mismatches.append(f"'{key}' differs (server={s!r}, baseline={b!r})")
+    for key in ("model_alias", "model_ftype"):
+        if server.get(key) != baseline.get(key):
+            mismatches.append(f"'{key}' differs (server={server.get(key)!r}, baseline={baseline.get(key)!r})")
+    return not mismatches, mismatches
 
 
 def serial_throughput(response: dict[str, Any]) -> float:
@@ -212,8 +356,11 @@ def serial_throughput(response: dict[str, Any]) -> float:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the same deterministic request with RERoT OFF/ON and fail unless "
-            "both request-wide and multi-Lane model-token throughput beat one Lane."
+            "Same-build scheduling-strategy gate: run the same deterministic request with "
+            "RERoT OFF/ON on ONE server and fail unless the RERoT path beats the single-Lane "
+            "path on paired throughput with every round semantically valid. "
+            "Implementation-version comparison (two servers) is a separate mode: "
+            "--baseline-base-url."
         )
     )
     parser.add_argument("--base-url", default="http://127.0.0.1:8080")
@@ -222,20 +369,57 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--baseline-response",
         type=Path,
-        help="Reuse an existing RERoT-OFF response instead of issuing the OFF request.",
+        help=(
+            "Reuse an existing RERoT-OFF response instead of issuing the OFF request for "
+            "round 0. Pairs built on it are reported as historical_reference and are EXCLUDED "
+            "from the formal paired verdict; use --baseline-manifest to validate that the "
+            "response came from the same model/build."
+        ),
+    )
+    parser.add_argument(
+        "--baseline-manifest",
+        type=Path,
+        help=(
+            "JSON manifest of the build/model that produced --baseline-response "
+            "(build_number, model_sha256, model_alias, model_ftype). Compared against the "
+            "live server /props; on mismatch the baseline is not used at all."
+        ),
+    )
+    parser.add_argument(
+        "--baseline-base-url",
+        default=None,
+        help=(
+            "Implementation-version comparison mode: issue serial (RERoT-OFF) requests against "
+            "this server and RERoT-ON requests against --base-url. Without it, both sides run "
+            "on --base-url (same-build scheduling-strategy comparison)."
+        ),
+    )
+    parser.add_argument(
+        "--baseline-api-key",
+        default=None,
+        help="API key for --baseline-base-url (defaults to --api-key).",
     )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument(
         "--timeout",
         type=float,
         default=180.0,
-        help="Request timeout in seconds (default: 180.0s, bounded below 5-minute IPMI watchdog threshold).",
+        help=(
+            "Client-side HTTP request deadline in seconds (default: 180.0). "
+            "This timeout does NOT cancel in-flight GPU work on the server and is not a "
+            "device-recovery or watchdog mechanism; server-side drain/safety is managed by "
+            "the server itself."
+        ),
     )
     parser.add_argument(
         "--min-ratio",
         type=float,
         default=1.0,
-        help="Required RERoT/serial throughput ratio; comparison is strict.",
+        help=(
+            "Required paired throughput ratio lower bound: the median paired ratio must be "
+            ">= min-ratio AND every paired ratio must be > 1.0 (胜出规则 §11.4). "
+            "A 2%% median improvement means --min-ratio 1.02."
+        ),
     )
     parser.add_argument(
         "--rounds",
@@ -250,7 +434,9 @@ def parse_args() -> argparse.Namespace:
         default=ENABLE_OPERATOR_ROUTE_GATE,
         help=(
             "TODO: Assert low-level operator route hit metrics once P0 counters land; "
-            "disabled by default so unreleased metrics are not fabricated."
+            "disabled by default. If enabled while the server does not export "
+            "'rerot_operator_route_hits', the gate reports evidence-incomplete instead of "
+            "fabricating a zero hit count."
         ),
     )
     args = parser.parse_args()
@@ -260,8 +446,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("--min-ratio must be positive")
     if args.rounds <= 0:
         parser.error("--rounds must be >= 1")
+    if args.baseline_manifest and not args.baseline_response:
+        parser.error("--baseline-manifest requires --baseline-response")
+    if args.baseline_base_url is not None and args.baseline_response is not None:
+        parser.error("--baseline-response cannot be combined with --baseline-base-url")
     return args
-
 
 
 def calculate_percentiles(values: list[float]) -> dict[str, float]:
@@ -284,10 +473,12 @@ def extract_rerot_token_breakdown(response: dict[str, Any]) -> dict[str, Any]:
     usage = response.get("usage", {})
     rerot_meta = usage.get("rerot", {})
     timings = response.get("timings", {})
-    
-    # Prompt processing time as proxy for TTFT if available
-    ttft_ms = timings.get("prompt_ms", 0.0)
-    
+
+    # C02 #6: timings.prompt_ms is the prompt COMPUTE time, not time-to-first-
+    # token. TTFT needs streaming sampling (scripts/rerot-ttft-sample.py); the
+    # gate requires non-streaming requests and cannot observe it.
+    prompt_ms = timings.get("prompt_ms", 0.0)
+
     return {
         "prompt_tokens": usage.get("prompt_tokens", 0),
         "completion_tokens": usage.get("completion_tokens", 0),
@@ -297,8 +488,138 @@ def extract_rerot_token_breakdown(response: dict[str, Any]) -> dict[str, Any]:
         "actual_replayed_tokens": rerot_meta.get("actual_replayed_tokens", 0),
         "sampled_tokens": rerot_meta.get("sampled_tokens", 0),
         "useful_body_tokens": rerot_meta.get("sampled_tokens", 0),
-        "ttft_ms": ttft_ms,
+        "prompt_ms": prompt_ms,
+        "ttft_ms": None,  # not observable with non-streaming requests
     }
+
+
+def evaluate_round_checks(
+    d: dict[str, float],
+    present: dict[str, bool],
+    payload: Any,
+    is_dag_payload: bool,
+    dag_structure_err: str,
+    route_gate_enabled: bool,
+) -> tuple[dict[str, str], dict[str, str], list[str]]:
+    """Per-round correctness checks.
+
+    Returns (checks, details, missing). Checks use only counter deltas whose
+    counters were present in the scrape; any required-metric absence yields
+    CHECK_EVIDENCE_INCOMPLETE for the dependent checks and a missing entry.
+    """
+    checks: dict[str, str] = {}
+    details: dict[str, str] = {}
+    missing: list[str] = []
+
+    def counter_evidence(name: str) -> tuple[float, bool]:
+        if not present.get(name, False):
+            missing.append(name)
+            return 0.0, False
+        return d.get(name, 0.0), True
+
+    visible_tokens = d.get("rerot_public_tokens", 0.0) + d.get("rerot_private_tokens", 0.0) + d.get("rerot_pending_tokens", 0.0)
+
+    # ---- Per-sample episode accounting (counters) ----
+    ep, ep_ok = counter_evidence("rerot_completed_episode_total")
+    if not ep_ok:
+        checks["one_completed_episode"] = CHECK_EVIDENCE_INCOMPLETE
+        details["one_completed_episode"] = f"required counter rerot_completed_episode_total missing from /metrics"
+    else:
+        checks["one_completed_episode"] = CHECK_OK if ep == 1 else CHECK_FAIL
+        details["one_completed_episode"] = f"rerot_completed_episode_total delta must equal 1, observed {ep:g}"
+
+    aborts, aborts_ok = counter_evidence("rerot_hard_aborts")
+    if not aborts_ok:
+        checks["no_hard_abort"] = CHECK_EVIDENCE_INCOMPLETE
+        details["no_hard_abort"] = "required counter rerot_hard_aborts missing from /metrics"
+    else:
+        checks["no_hard_abort"] = CHECK_OK if aborts == 0 else CHECK_FAIL
+        details["no_hard_abort"] = f"rerot_hard_aborts delta must equal 0, observed {aborts:g}"
+
+    fences, fences_ok = counter_evidence("rerot_final_fences")
+    if not fences_ok:
+        checks["one_final_fence"] = CHECK_EVIDENCE_INCOMPLETE
+        details["one_final_fence"] = "required counter rerot_final_fences missing from /metrics"
+    else:
+        checks["one_final_fence"] = CHECK_OK if fences == 1 else CHECK_FAIL
+        details["one_final_fence"] = f"rerot_final_fences delta must equal 1, observed {fences:g}"
+
+    m_tok, m_tok_ok = counter_evidence("rerot_completed_model_tokens")
+    vis_pub, vis_pub_ok = counter_evidence("rerot_public_tokens")
+    vis_priv, vis_priv_ok = counter_evidence("rerot_private_tokens")
+    vis_pend, vis_pend_ok = counter_evidence("rerot_pending_tokens")
+    if m_tok_ok and vis_pub_ok and vis_priv_ok and vis_pend_ok:
+        visible = vis_pub + vis_priv + vis_pend
+        checks["visibility_accounting_exact"] = CHECK_OK if visible == m_tok else CHECK_FAIL
+        details["visibility_accounting_exact"] = (
+            f"visible tokens ({visible:g}) must equal completed model tokens ({m_tok:g})"
+        )
+    else:
+        checks["visibility_accounting_exact"] = CHECK_EVIDENCE_INCOMPLETE
+        details["visibility_accounting_exact"] = (
+            f"visibility accounting requires rerot_{'public,private,pending' if not vis_pub_ok else 'completed_model'}"
+            f"_tokens (missing={[n for n in missing if 'tokens' in n]})"
+        )
+
+    # ---- Multi-Lane evidence (counters only; gauges never gate) ----
+    par_tok, par_tok_ok = counter_evidence("rerot_parallel_model_tokens")
+    par_sec, par_sec_ok = counter_evidence("rerot_parallel_seconds")
+    peak_pens, peak_pens_ok = counter_evidence("rerot_parallel_peak_lanes_total")
+    if not par_tok_ok or not par_sec_ok:
+        checks["multi_lane_parallel_work"] = CHECK_EVIDENCE_INCOMPLETE
+        details["multi_lane_parallel_work"] = (
+            "required counters rerot_parallel_model_tokens/rerot_parallel_seconds missing from /metrics"
+        )
+    elif par_tok <= 0 or par_sec <= 0:
+        checks["multi_lane_parallel_work"] = CHECK_NOT_EXERCISED
+        details["multi_lane_parallel_work"] = (
+            "multi-Lane phase produced no parallel model tokens/seconds this round: "
+            "the request did not exercise parallel execution"
+        )
+    else:
+        checks["multi_lane_parallel_work"] = CHECK_OK
+        details["multi_lane_parallel_work"] = (
+            f"parallel counters positive (tokens={par_tok:g}, seconds={par_sec:g})"
+        )
+    if peak_pens_ok:
+        checks["multi_lane_peak_lanes"] = CHECK_OK if peak_pens >= 2 else CHECK_FAIL
+        details["multi_lane_peak_lanes"] = (
+            f"request-scoped peak lanes (counter delta) must be >= 2, observed {peak_pens:g}"
+        )
+    else:
+        # Absent on older builds; recorded as not_exercised, not fatal, but
+        # listed under missing so the report is explicit.
+        checks["multi_lane_peak_lanes"] = CHECK_NOT_EXERCISED
+        details["multi_lane_peak_lanes"] = (
+            "counter rerot_parallel_peak_lanes_total not exported by this server build; "
+            "multi-Lane evidence relies on parallel token counters only"
+        )
+
+    # ---- Payload structure (identical every round; kept per-round for uniform reporting) ----
+    checks["request_dag_structure"] = CHECK_OK if is_dag_payload else CHECK_FAIL
+    details["request_dag_structure"] = (
+        "payload verified as DAG/multi-Lane structure"
+        if is_dag_payload
+        else f"missing required DAG/multi-Lane structure in request: {dag_structure_err}"
+    )
+
+    # ---- Operator route gate (C02 #5) ----
+    if route_gate_enabled:
+        hits, hits_ok = counter_evidence(ROUTE_HIT_METRIC)
+        if not hits_ok:
+            checks["operator_route_hit"] = CHECK_EVIDENCE_INCOMPLETE
+            details["operator_route_hit"] = (
+                f"route gate enabled but counter {ROUTE_HIT_METRIC} is not registered in /metrics "
+                "(P0 route counters not landed); no fabricated hit count"
+            )
+        else:
+            checks["operator_route_hit"] = CHECK_OK if hits > 0 else CHECK_FAIL
+            details["operator_route_hit"] = f"operator route hits must be > 0, observed {hits:g}"
+    else:
+        checks["operator_route_hit"] = CHECK_NOT_EXERCISED
+        details["operator_route_hit"] = "route gate disabled (default); enable with --enable-operator-route-gate"
+
+    return checks, details, missing
 
 
 def main() -> int:
@@ -307,7 +628,17 @@ def main() -> int:
     if payload.get("stream") is True:
         raise RuntimeError("throughput gate requires a non-streaming request")
 
+    # C02 #7: explicit comparison kinds.
+    if args.baseline_base_url:
+        comparison_kind = "implementation_version"
+    else:
+        comparison_kind = "same_build_scheduling_strategy"
+
+    serial_base_url = args.baseline_base_url or args.base_url
+    serial_api_key = args.baseline_api_key or args.api_key
     endpoint = f"{args.base_url.rstrip('/')}/v1/chat/completions"
+    serial_endpoint = f"{serial_base_url.rstrip('/')}/v1/chat/completions"
+
     serial_payload = dict(payload)
     serial_payload.update({"stream": False, "rerot": False, "rerot_trace": False})
     # An explicit frontier selects RERoT even when rerot=false.
@@ -317,6 +648,32 @@ def main() -> int:
 
     # Pre-flight health check before issuing any benchmark load (fail-closed if server is down)
     verify_server_health(args.base_url, args.api_key, args.timeout)
+    if args.baseline_base_url:
+        verify_server_health(args.baseline_base_url, serial_api_key, args.timeout)
+
+    # C02 #9: historical baseline validation against the live server manifest.
+    historical_baseline: dict[str, Any] | None = None
+    baseline_match_ok = True
+    baseline_mismatch_reasons: list[str] = []
+    if args.baseline_response:
+        server_props = fetch_props(args.base_url, args.api_key, args.timeout)
+        server_manifest = manifest_from_props(server_props)
+        if args.baseline_manifest:
+            baseline_manifest = load_manifest(args.baseline_manifest)
+            baseline_match_ok, baseline_mismatch_reasons = manifests_match(server_manifest, baseline_manifest)
+        else:
+            baseline_mismatch_reasons.append(
+                "--baseline-manifest not provided; manifest identity unverifiable"
+            )
+        if not baseline_match_ok:
+            raise RuntimeError(
+                "historical baseline rejected: server/baseline manifest mismatch: "
+                + "; ".join(baseline_mismatch_reasons)
+                + ". Re-measure the serial side instead of reusing this response."
+            )
+        historical_baseline = json.loads(args.baseline_response.read_text(encoding="utf-8"))
+        if not isinstance(historical_baseline, dict):
+            raise RuntimeError("--baseline-response must contain a JSON object")
 
     # §17 A/B/B/A paired measurement pattern
     # When rounds > 1, interleave execution order to neutralize warm-cache drift
@@ -325,9 +682,14 @@ def main() -> int:
     serial_tps_list: list[float] = []
     aggregate_tps_list: list[float] = []
     parallel_tps_list: list[float] = []
-    last_deltas: dict[str, float] = {}
-    last_rerot_response: dict[str, Any] = {}
-    last_serial_response: dict[str, Any] = {}
+    pairs: list[dict[str, Any]] = []
+    round_checks: list[dict[str, Any]] = []
+    all_missing: set[str] = set()
+    any_round_failed = False
+    any_evidence_incomplete = False
+    any_not_exercised = False
+
+    is_dag_payload, dag_structure_err = validate_dag_payload(payload)
 
     total_pairs = args.rounds
     for round_idx in range(total_pairs):
@@ -335,129 +697,189 @@ def main() -> int:
         run_serial_first = (round_idx % 2 == 0)
 
         def do_serial() -> tuple[float | None, dict[str, Any], float]:
-            if args.baseline_response and round_idx == 0:
-                s_resp = json.loads(args.baseline_response.read_text(encoding="utf-8"))
+            if historical_baseline is not None and round_idx == 0:
+                s_resp = historical_baseline
                 s_wall = None
             else:
-                s_wall, s_resp = request_json(endpoint, serial_payload, args.api_key, args.timeout)
+                s_wall, s_resp = request_json(serial_endpoint, serial_payload, serial_api_key, args.timeout)
             s_tps = serial_throughput(s_resp)
             return s_wall, s_resp, s_tps
 
-        def do_rerot() -> tuple[float, dict[str, Any], dict[str, float], float, float]:
+        def do_rerot() -> tuple[float, dict[str, Any], dict[str, float], dict[str, bool], dict[str, float], dict[str, float], float, float]:
             before_m = fetch_metrics(args.base_url, args.api_key, args.timeout)
             r_wall, r_resp = request_json(endpoint, rerot_payload, args.api_key, args.timeout)
             after_m = fetch_metrics(args.base_url, args.api_key, args.timeout)
-            d = {name: metric_delta(before_m, after_m, name) for name in METRICS}
-            
+            d: dict[str, float] = {}
+            present: dict[str, bool] = {}
+            for name in COUNTER_METRICS:
+                value, ok = counter_delta(before_m, after_m, name)
+                d[name] = value
+                present[name] = ok
+            gauge_before = {name: before_m.get(name) for name in GAUGE_METRICS if name in before_m}
+            gauge_after = {name: after_m.get(name) for name in GAUGE_METRICS if name in after_m}
+
             ep_sec = d["rerot_completed_episode_seconds"]
             m_tok = d["rerot_completed_model_tokens"]
             par_sec = d["rerot_parallel_seconds"]
             par_tok = d["rerot_parallel_model_tokens"]
+            if not present["rerot_completed_episode_seconds"] or not present["rerot_completed_model_tokens"]:
+                raise RuntimeError(
+                    "completed RERoT episode did not publish positive token/time counters "
+                    "(counters missing from /metrics; cannot compute throughput)"
+                )
             if ep_sec <= 0 or m_tok <= 0:
                 raise RuntimeError("completed RERoT episode did not publish positive token/time counters")
-            if par_sec <= 0 or par_tok <= 0:
-                par_sec = ep_sec
-                par_tok = m_tok
             agg_tps = m_tok / ep_sec
-            par_tps = par_tok / par_sec
-            return r_wall, r_resp, d, agg_tps, par_tps
+            # C02 #4: no silent fallback to aggregate when the parallel phase
+            # was not exercised. parallel_exercised drives the verdict state.
+            if not present["rerot_parallel_seconds"] or not present["rerot_parallel_model_tokens"]:
+                parallel_exercised = False
+                par_tps = float("nan")
+            elif par_sec <= 0 or par_tok <= 0:
+                parallel_exercised = False
+                par_tps = float("nan")
+            else:
+                parallel_exercised = True
+                par_tps = par_tok / par_sec
+            return r_wall, r_resp, d, present, gauge_before, gauge_after, agg_tps, (par_tps if parallel_exercised else float("nan"))
 
         if run_serial_first:
             sw, sr, stps = do_serial()
-            rw, rr, d, atps, ptps = do_rerot()
+            rw, rr, d, present, gb, ga, atps, ptps = do_rerot()
         else:
-            rw, rr, d, atps, ptps = do_rerot()
+            rw, rr, d, present, gb, ga, atps, ptps = do_rerot()
             sw, sr, stps = do_serial()
 
         serial_samples.append({"round": round_idx, "client_wall_seconds": sw, "tokens_per_second": stps})
         serial_tps_list.append(stps)
+        parallel_exercised = ptps == ptps  # NaN check
         rerot_samples.append({
             "round": round_idx,
             "client_wall_seconds": rw,
             "aggregate_tokens_per_second": atps,
-            "parallel_tokens_per_second": ptps,
+            "parallel_tokens_per_second": ptps if parallel_exercised else None,
+            "parallel_exercised": parallel_exercised,
             "token_breakdown": extract_rerot_token_breakdown(rr),
             "metrics_delta": d,
+            "metrics_present": present,
+            "gauge_before": gb,
+            "gauge_after": ga,
         })
         aggregate_tps_list.append(atps)
-        parallel_tps_list.append(ptps)
-        last_deltas = d
-        last_rerot_response = rr
-        last_serial_response = sr
+        if parallel_exercised:
+            parallel_tps_list.append(ptps)
 
-    # Use median metrics across rounds for gate verdict (§17)
+        checks, details, missing = evaluate_round_checks(
+            d, present, payload, is_dag_payload, dag_structure_err,
+            getattr(args, "enable_operator_route_gate", False),
+        )
+        all_missing.update(missing)
+        round_status = "ok"
+        for name, state in checks.items():
+            if state == CHECK_FAIL:
+                round_status = "fail"
+                any_round_failed = True
+            elif state == CHECK_EVIDENCE_INCOMPLETE:
+                if round_status == "ok":
+                    round_status = "evidence_incomplete"
+                any_evidence_incomplete = True
+            elif state == CHECK_NOT_EXERCISED:
+                any_not_exercised = True
+        round_checks.append({
+            "round": round_idx,
+            "status": round_status,
+            "checks": checks,
+            "check_details": details,
+            "missing_metrics": sorted(missing),
+        })
+
+        is_historical = historical_baseline is not None and round_idx == 0
+        pairs.append({
+            "round": round_idx,
+            "historical": is_historical,
+            "serial_tokens_per_second": stps,
+            "aggregate_tokens_per_second": atps,
+            "parallel_tokens_per_second": ptps if parallel_exercised else None,
+            "parallel_exercised": parallel_exercised,
+            "aggregate_ratio": atps / stps,
+            "parallel_ratio": (ptps / stps) if parallel_exercised else None,
+            "serial_wall_seconds": sw,
+            "rerot_wall_seconds": rw,
+        })
+
+    # ---- Aggregate statistics (reference only; verdict is paired) ----
     serial_stats = calculate_percentiles(serial_tps_list)
     aggregate_stats = calculate_percentiles(aggregate_tps_list)
     parallel_stats = calculate_percentiles(parallel_tps_list)
 
-    median_serial_tps = serial_stats["median"]
-    median_aggregate_tps = aggregate_stats["median"]
-    median_parallel_tps = parallel_stats["median"]
+    # ---- Paired statistics (C02 #8) ----
+    formal_pairs = [p for p in pairs if not p["historical"]]
+    historical_pairs = [p for p in pairs if p["historical"]]
+    paired_aggregate_ratios = [p["aggregate_ratio"] for p in formal_pairs]
+    paired_parallel_ratios = [p["parallel_ratio"] for p in formal_pairs if p["parallel_ratio"] is not None]
 
-    visible_tokens = sum(
-        last_deltas[name]
-        for name in ("rerot_public_tokens", "rerot_private_tokens", "rerot_pending_tokens")
-    )
-    is_dag_payload, dag_structure_err = validate_dag_payload(payload)
-
-    threshold = median_serial_tps * args.min_ratio
-    checks = {
-        # Preserved existing checks (never removed or weakened; one_final_fence compatibility intact)
-        "one_completed_episode": last_deltas["rerot_completed_episode_total"] == 1,
-        "no_hard_abort": last_deltas["rerot_hard_aborts"] == 0,
-        "one_final_fence": last_deltas["rerot_final_fences"] == 1,
-        "visibility_accounting_exact": visible_tokens == last_deltas["rerot_completed_model_tokens"],
-        "aggregate_faster_than_serial": median_aggregate_tps > threshold,
-        "parallel_faster_than_serial": median_parallel_tps > threshold,
-        # Assertions: DAG/multi-Lane payload structure and multi-Lane metrics
-        "request_dag_structure": is_dag_payload,
-        "multi_lane_pens_allocated": last_deltas["rerot_pens_allocated"] > 1,
-        "multi_lane_batch_pens": last_deltas["rerot_batch_pens"] > 1,
-    }
-
-    evidence_details: dict[str, str] = {
-        "one_completed_episode": (
-            f"rerot_completed_episode_total delta must equal 1, observed {last_deltas['rerot_completed_episode_total']}"
-        ),
-        "no_hard_abort": (
-            f"rerot_hard_aborts delta must equal 0, observed {last_deltas['rerot_hard_aborts']}"
-        ),
-        "one_final_fence": (
-            f"rerot_final_fences delta must equal 1, observed {last_deltas['rerot_final_fences']}"
-        ),
-        "visibility_accounting_exact": (
-            f"visible tokens ({visible_tokens}) must equal completed model tokens ({last_deltas['rerot_completed_model_tokens']})"
-        ),
-        "aggregate_faster_than_serial": (
-            f"aggregate throughput median ({median_aggregate_tps:.3f} tok/s) must exceed threshold ({threshold:.3f} tok/s)"
-        ),
-        "parallel_faster_than_serial": (
-            f"parallel throughput median ({median_parallel_tps:.3f} tok/s) must exceed threshold ({threshold:.3f} tok/s)"
-        ),
-        "request_dag_structure": (
-            "payload verified as DAG/multi-Lane structure"
-            if is_dag_payload
-            else f"missing required DAG/multi-Lane structure in request: {dag_structure_err}"
-        ),
-        "multi_lane_pens_allocated": (
-            f"rerot_pens_allocated delta must be > 1 for real multi-Lane execution, observed {last_deltas['rerot_pens_allocated']}"
-        ),
-        "multi_lane_batch_pens": (
-            f"rerot_batch_pens delta must be > 1 for real multi-Lane execution, observed {last_deltas['rerot_batch_pens']}"
-        ),
-    }
-
-    if getattr(args, "enable_operator_route_gate", False):
-        operator_route_hits = last_deltas.get("rerot_operator_route_hits", 0.0)
-        checks["operator_route_hit"] = operator_route_hits > 0
-        evidence_details["operator_route_hit"] = (
-            f"operator route hits must be > 0, observed {operator_route_hits}"
+    if paired_aggregate_ratios:
+        ratio_stats_agg = calculate_percentiles(paired_aggregate_ratios)
+        # §11.4: median >= min_ratio AND interval lower bound (min ratio) > 1.0.
+        paired_aggregate_pass = (
+            ratio_stats_agg["median"] >= args.min_ratio and ratio_stats_agg["min"] > 1.0
         )
+        paired_aggregate_state = CHECK_OK if paired_aggregate_pass else CHECK_FAIL
+    else:
+        ratio_stats_agg = {}
+        paired_aggregate_pass = False
+        paired_aggregate_state = CHECK_EVIDENCE_INCOMPLETE
 
-    passed = all(checks.values())
+    if paired_parallel_ratios:
+        ratio_stats_par = calculate_percentiles(paired_parallel_ratios)
+        paired_parallel_pass = (
+            ratio_stats_par["median"] >= args.min_ratio and ratio_stats_par["min"] > 1.0
+        )
+        paired_parallel_state = CHECK_OK if paired_parallel_pass else CHECK_FAIL
+    elif any(p["parallel_exercised"] for p in formal_pairs) and not paired_parallel_ratios:
+        ratio_stats_par = {}
+        paired_parallel_pass = False
+        paired_parallel_state = CHECK_EVIDENCE_INCOMPLETE
+    else:
+        ratio_stats_par = {}
+        paired_parallel_pass = False
+        # C02 #4: parallel not exercised in any formal round -> NOT_EXERCISED.
+        paired_parallel_state = CHECK_NOT_EXERCISED
+
+    verdict_checks = {
+        "per_round_all_ok": CHECK_OK if (not any_round_failed and not any_evidence_incomplete) else
+        (CHECK_EVIDENCE_INCOMPLETE if not any_round_failed else CHECK_FAIL),
+        "aggregate_faster_than_serial_paired": paired_aggregate_state,
+        "parallel_faster_than_serial_paired": paired_parallel_state,
+        "request_dag_structure": CHECK_OK if is_dag_payload else CHECK_FAIL,
+    }
+
+    # Overall exit code precedence: operational error already raised (1);
+    # hard failure beats evidence-incomplete (2 > 3).
+    if any_round_failed or paired_aggregate_state == CHECK_FAIL or paired_parallel_state == CHECK_FAIL:
+        passed = False
+        status = "fail"
+        exit_code = EXIT_FAIL
+    elif any_evidence_incomplete or paired_aggregate_state == CHECK_EVIDENCE_INCOMPLETE:
+        passed = False
+        status = "evidence_incomplete"
+        exit_code = EXIT_EVIDENCE_INCOMPLETE
+    else:
+        passed = True
+        status = "pass"
+        exit_code = EXIT_PASS
 
     result = {
-        "schema_version": 2,
+        "schema_version": 3,
+        "status": status,
+        "passed": passed,
+        "comparison": {
+            "kind": comparison_kind,
+            "base_url": args.base_url,
+            "baseline_base_url": args.baseline_base_url,
+            "historical_baseline_used": historical_baseline is not None,
+            "historical_baseline_manifest_match": baseline_match_ok,
+        },
         "rounds": args.rounds,
         "request": rerot_payload,
         "minimum_ratio": args.min_ratio,
@@ -465,23 +887,35 @@ def main() -> int:
             "serial_tps": serial_stats,
             "aggregate_tps": aggregate_stats,
             "parallel_tps": parallel_stats,
+            "paired_aggregate_ratio": ratio_stats_agg,
+            "paired_parallel_ratio": ratio_stats_par,
         },
         "serial": {
-            "tokens_per_second": median_serial_tps,
+            "tokens_per_second": serial_stats.get("median"),
             "samples": serial_samples,
-            "response": last_serial_response,
         },
         "rerot": {
-            "aggregate_tokens_per_second": median_aggregate_tps,
-            "parallel_tokens_per_second": median_parallel_tps,
-            "token_breakdown": extract_rerot_token_breakdown(last_rerot_response),
+            "aggregate_tokens_per_second": aggregate_stats.get("median"),
+            "parallel_tokens_per_second": parallel_stats.get("median"),
             "samples": rerot_samples,
-            "metrics_delta": last_deltas,
-            "response": last_rerot_response,
         },
-        "checks": checks,
-        "check_details": evidence_details,
-        "passed": passed,
+        "pairs": pairs,
+        "historical_reference": {
+            "pairs": historical_pairs,
+            "note": (
+                "pairs built on --baseline-response are reported here and are excluded "
+                "from the formal paired verdict"
+            ),
+        },
+        "round_checks": round_checks,
+        "verdict_checks": verdict_checks,
+        "missing_metrics": sorted(all_missing),
+        "not_exercised": (
+            "parallel throughput not exercised in any formal round (no multi-Lane "
+            "token/time counters); aggregate-only verdict"
+            if paired_parallel_state == CHECK_NOT_EXERCISED
+            else None
+        ),
     }
     args.output.write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -489,18 +923,30 @@ def main() -> int:
 
     print(
         f"rounds={args.rounds} "
-        f"serial_median={median_serial_tps:.3f} tok/s "
-        f"rerot_aggregate_median={median_aggregate_tps:.3f} tok/s "
-        f"rerot_parallel_median={median_parallel_tps:.3f} tok/s "
-        f"passed={str(passed).lower()}"
+        f"serial_median={serial_stats.get('median', float('nan')):.3f} tok/s "
+        f"rerot_aggregate_median={aggregate_stats.get('median', float('nan')):.3f} tok/s "
+        f"rerot_parallel_median={parallel_stats.get('median', float('nan')):.3f} tok/s "
+        f"paired_aggregate_ratio_median={ratio_stats_agg.get('median', float('nan')):.3f} "
+        f"status={status}"
     )
     if not passed:
-        for name, ok in checks.items():
-            if not ok:
-                detail = evidence_details.get(name, "no detail recorded")
-                print(f"FAIL: {name} ({detail})", file=sys.stderr)
-        return 2
-    return 0
+        for round_rec in round_checks:
+            if round_rec["status"] == "fail":
+                for name, state in round_rec["checks"].items():
+                    if state == CHECK_FAIL:
+                        print(
+                            f"FAIL round={round_rec['round']}: {name} "
+                            f"({round_rec['check_details'].get(name, 'no detail')})",
+                            file=sys.stderr,
+                        )
+        for name, state in verdict_checks.items():
+            if state in (CHECK_FAIL, CHECK_EVIDENCE_INCOMPLETE, CHECK_NOT_EXERCISED):
+                print(f"{state.upper()}: {name}", file=sys.stderr)
+        if all_missing:
+            print(f"MISSING metrics (evidence-incomplete): {sorted(all_missing)}", file=sys.stderr)
+        if paired_parallel_state == CHECK_NOT_EXERCISED:
+            print("NOT_EXERCISED: parallel throughput (no multi-Lane token/time counters)", file=sys.stderr)
+    return exit_code
 
 
 if __name__ == "__main__":
@@ -508,4 +954,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except (OSError, ValueError, RuntimeError, urllib.error.URLError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(EXIT_ERROR)

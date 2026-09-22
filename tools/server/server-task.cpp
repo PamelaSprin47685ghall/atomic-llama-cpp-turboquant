@@ -211,7 +211,7 @@ bool server_rerot_metrics::empty() const {
         && public_tokens == 0 && private_tokens == 0 && pending_tokens == 0
         && completed_episodes == 0 && completed_model_tokens == 0
         && parallel_model_tokens == 0 && completed_episode_seconds == 0.0
-        && parallel_seconds == 0.0
+        && parallel_seconds == 0.0 && parallel_peak_lanes_sum == 0
         && frontiers == 0 && topology_barriers == 0 && refresh_total == 0
         && mtp_invalidations == 0 && context_shifts == 0
         && hard_aborts == 0 && final_fences == 0
@@ -257,6 +257,7 @@ json server_rerot_metrics::to_json() const {
         { "rerot_parallel_model_tokens",      parallel_model_tokens },
         { "rerot_completed_episode_seconds",  completed_episode_seconds },
         { "rerot_parallel_seconds",           parallel_seconds },
+        { "rerot_parallel_peak_lanes_sum",    parallel_peak_lanes_sum },
         { "rerot_frontiers",                  frontiers },
         { "rerot_topology_barriers",   topology_barriers },
         { "rerot_refresh_total",       refresh_total },
@@ -338,6 +339,7 @@ void server_rerot_metrics::accumulate(const server_rerot_metrics & delta) {
     parallel_model_tokens      += delta.parallel_model_tokens;
     completed_episode_seconds  += delta.completed_episode_seconds;
     parallel_seconds           += delta.parallel_seconds;
+    parallel_peak_lanes_sum    += delta.parallel_peak_lanes_sum;
     frontiers                  += delta.frontiers;
     topology_barriers   += delta.topology_barriers;
     refresh_total       += delta.refresh_total;
