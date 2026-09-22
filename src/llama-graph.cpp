@@ -1145,6 +1145,19 @@ void llm_graph_input_attn_rerot::fill_spans(
         prof->cap_groups.fetch_add((uint64_t) group_cap, std::memory_order_relaxed);
         prof->cap_entries.fetch_add((uint64_t) entries->ne[1], std::memory_order_relaxed);
         prof->ring.push(4 /* upload-audit */, 4 /* live-vs-cap groups */, (uint16_t) n_pos, (uint32_t) n_groups, (uint64_t) group_cap);
+
+        // §4.3 state & memory: staging scratch peak (the four host staging
+        // vectors this frontier materialized) and in-flight upload slots
+        // (one slot per tensor upload issued this fill — the async snapshot
+        // path may still own them when the next frontier reuses the staging
+        // buffers). The §7 two-slot question reads directly off these.
+        const uint64_t scratch_now =
+            (uint64_t) st_q_indices.size() * sizeof(int32_t) +
+            (uint64_t) st_q_pos.size() * sizeof(int32_t) +
+            (uint64_t) st_entries.size() * sizeof(int32_t) +
+            (uint64_t) st_offsets.size() * sizeof(int32_t);
+        prof->update_scratch_peak(scratch_now);
+        prof->update_in_flight_slots(full_upload ? (uint64_t) (3 + n_pos) : (uint64_t) (2 + n_pos));
     }
 
     ++epoch;

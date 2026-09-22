@@ -547,6 +547,30 @@ static void test_matmul_rows_histogram() {
 }
 
 // ----------------------------------------------------------------------------
+// Test (6e): §4.3 state & memory — scratch peak / in-flight upload slots
+// ----------------------------------------------------------------------------
+static void test_state_memory_ledger() {
+    llama_rerot_profile prof;
+    prof.reset(1009);
+
+    // Production idiom: update_scratch_peak is max-only, update_in_flight_slots
+    // records current + max
+    prof.update_scratch_peak(1 << 20);
+    prof.update_scratch_peak(1 << 19); // smaller — no change
+    CHECK_EQ(prof.scratch_peak_bytes.load(), 1 << 20);
+
+    prof.update_in_flight_slots(5);
+    prof.update_in_flight_slots(3); // current drops, max stays
+    CHECK_EQ(prof.in_flight_slots.load(), 3);
+    CHECK_EQ(prof.max_in_flight_slots.load(), 5);
+
+    prof.reset(1009);
+    CHECK_EQ(prof.scratch_peak_bytes.load(), 0);
+    CHECK_EQ(prof.in_flight_slots.load(), 0);
+    CHECK_EQ(prof.max_in_flight_slots.load(), 0);
+}
+
+// ----------------------------------------------------------------------------
 // Test (7): Bounded Ring Buffer FIFO Overwrite & Value-Init Reset Semantics
 // ----------------------------------------------------------------------------
 
@@ -935,6 +959,7 @@ int main() {
     test_phase_first_cost();
     test_hadamard_memo_counters();
     test_matmul_rows_histogram();
+    test_state_memory_ledger();
     test_bounded_ring_buffer_and_reset();
     test_profile_full_reset();
     test_format_tsv_stability();
