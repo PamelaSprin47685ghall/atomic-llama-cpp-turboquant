@@ -3,60 +3,67 @@
 ## 下班交接｜2026-09-22（第二十一轮，路由探针换轨：作废 Makefile 行式 DSL → Compact Dict JSON）
 
 **分支：** `master`
-**主题：** 按新规格作废上一轮的行式 DSL，改为**极简扁平键值对 JSON**（`tasks` 先给全部任务与意图，`deps` 再集中给依赖连线），并修掉一个会让探针必然失败的**模板自相矛盾**缺陷。真机三次请求全部 HTTP 200 走通 DAG。
+**主题：** 按新规格作废上一轮的行式 DSL，改为**极简扁平键值对 JSON**（`tasks` 先给全部任务与意图，`deps` 再集中给依赖连线）。真机 5 次请求全部 HTTP 200，路由能自适应 simple / dag。
 
 ### 一、换轨内容
 
 | 项 | 旧（已废弃） | 新 |
 |---|---|---|
-| 探针提示词 | `Plan 1+ tasks as DAG (ID [<- DEPS]: INTENT, no preamble, end with blank line):\n` | `Plan in JSON: {"tasks":{"A":"...","B":"..."},"deps":{"B":["A"]}}\n` |
+| 探针提示词 | `Plan 1+ tasks as DAG (ID [<- DEPS]: INTENT, …)` | `Plan in JSON: {"tasks":{"<id>":"<intent>",...},"deps":{"<id>":["<dep_id>"],...}}\n` |
 | 文法 | 手写扁平 GBNF（`dag-line`/`deps`/`id`/`intent`） | `server_rerot_routing_schema_json()` + `json_schema_to_grammar()` |
-| 解析 | 手写 `std::string_view` 行扫描 | `nlohmann::json::parse` + 恢复的重复成员扫描（防止 nlohmann 静默取最后一个成员） |
-| 冗余 Key | — | 彻底删除旧版的 `strategy` / `payload` / `questions` / `depends_on_id` |
+| 解析 | 手写 `std::string_view` 行扫描 | `nlohmann::json::parse` + 恢复的重复成员扫描（nlohmann 会静默取最后一个成员） |
+| 冗余 Key | — | 彻底删除 `strategy` / `payload` / `questions` / `depends_on_id` |
 
-DSL 相关函数（`trim_dsl_view` / `valid_dsl_id` / 行扫描解析）与手写 GBNF **已全部删除**（grep 零残留）。
+DSL 相关函数（`trim_dsl_view` / `valid_dsl_id` / 行扫描解析）与手写 GBNF **已全部删除**（`grep` 零残留，仅测试里保留一条「提示词不得含 dag-line」的守卫断言）。
 
-### 二、本轮最重要的真机发现（模板必须自洽）
+### 二、模板迭代的三个真机教训（重要）
 
-规格给出的模板示例 `{"tasks":{"A":"..."},"deps":{"C":["A"]}}` **自相矛盾**：`deps` 引用了 `C`，但示例 `tasks` 只声明了 `A`。模型会**忠实照抄这个结构**——真机实测输出：
+1. **具名示例会被照抄**：规格最初的 `{"tasks":{"A":"..."},"deps":{"C":["A"]}}` 里 `deps` 引用了未声明的 `C`，模型忠实照抄出 `{"tasks":{"A":"13*17=221","B":"21*19=399"},"deps":{"C":["A","B"]}}` → 按规格自身的「未知端点必须拒绝」被拒，**每个请求都失败**（实测 `unknown endpoint in dependency: C`）。
+2. **改用占位符 `<id>` / `<intent>` / `<dep_id>`**：模型不再照抄具名依赖，必须给出真实 id。
+3. **必须显式给出 `...`**：模板不含 `...` 时模型不知道能否继续追加条目（塌缩成单条目或自造汇聚节点）；加上 `...` 后计划正常。
 
-```json
-{"tasks":{"A":"13*17=221","B":"21*19=399"},"deps":{"C":["A","B"]}}
+最终模板（`server_rerot_routing_probe_prompt()`）：
+
+```text
+Plan in JSON: {"tasks":{"<id>":"<intent>",...},"deps":{"<id>":["<dep_id>"],...}}
 ```
 
-即它把 `C` 当作「汇聚节点」照搬，而 `C` 未在 `tasks` 声明 → 按规格自身的「未知端点必须拒绝」被 fail-closed 拒选（`unknown endpoint in dependency: C`），**每个请求都失败**。
+### 三、强制分层（转换器能力边界，测试已钉住）
 
-**修正：** 模板示例改为自洽形式 `{"tasks":{"A":"...","B":"..."},"deps":{"B":["A"]}}`（仍示范 `deps` 形状，但所有被引用 id 都已声明）。修正后同样的模型/提示词开始产出合法计划并走通 DAG。
+`json_schema_to_grammar()` 渲染 `minLength` / `additionalProperties:false`（由**文法**物理屏蔽），但**不渲染 `minProperties`**，故「空 `tasks` 对象」由**解析器**拒绝。解析器还 fail-closed 校验：重复 JSON 成员、id/intent 非空且非纯空白、保留 id `"0"`、未知依赖端点、自环、重复边、Kahn 全拓扑覆盖（有环整张拒绝）。任何缺陷都不得删边/裁节点/静默修复。
 
-### 三、强制分层（转换器能力边界，已写成测试钉住）
+### 四、探针完成判定与诊断（保留上轮加固 + 本轮新增）
 
-`json_schema_to_grammar()` 渲染 `minLength` / `additionalProperties:false`（由**文法**物理屏蔽），但**不渲染 `minProperties`**，因此「空 `tasks` 对象」由**解析器**拒绝。解析器还 fail-closed 校验：重复 JSON 成员、id/intent 非空且非纯空白、保留 id `"0"`、未知依赖端点、自环、重复边、Kahn 全拓扑覆盖（有环整张拒绝）。任何缺陷都不得删边/裁节点/静默修复。
-
-### 四、探针完成判定与诊断（保留上轮加固）
-
-- 解析器新增 `incomplete` 语义：JSON 尚不合法解析（截断，探针仍在流式）→ 继续采样；**语法完整但校验失败** → 立即 fail-closed 并回报解析器自己的诊断（不再等 EOG）；
-- 探针 512-token 硬上限（探针 token 不计入用户 `n_predict` 也不进 episode 硬限计数，否则可无界生成）；
-- trace 门控 `rerot.trace.probe_reject` 打印**被拒计划全文**（本轮就是靠它拿到 `deps:{"C":...}` 的铁证）；
-- 去重扫描必须在 `json::parse` **之后**（否则扫描器会把截断误报为「重复成员」，实测在 `{` 2 字节时就误拒）。
+- 解析器 `incomplete` 语义：JSON 尚不合法解析（截断，探针仍在流式）→ 继续采样；**语法完整但校验失败** → 立即 fail-closed 并回报解析器自己的诊断（不再等 EOG）；
+- 探针 512-token 硬上限；EOG 文案区分「探针未决 / worker 分隔符未关」；
+- trace 门控**成对**日志：`rerot.trace.probe_reject`（被拒计划全文）与 `rerot.trace.probe_plan`（**已接受计划 + 选定策略**），前者是抓住 C 照抄问题的关键，后者用于事后核对探针质量；
+- 去重扫描必须在 `json::parse` **之后**（扫描器会把截断误报为「重复成员」，实测 `{` 两字节即误拒）。
 
 ### 五、验证记录
 
-- **单测：** `test-rerot-parser` **0 failure**（合法矩阵：单任务/空 deps/并行双任务/链式/菱形/自由文本 intent/plan_rank；拒选矩阵：缺 tasks、空 tasks、类型错、空 intent、保留 0、未知端点、自环、重复边、环路、多余字段、重复成员、损坏 JSON；文法接受/拒选矩阵含「旧 DSL 不再可入」）；
-- **回归：** `ctest -R "rerot|xkv|flashprefill"` **50/50**；`test-rerot-view` / `test-rerot-runtime` 均 **0 failure**；
-- **真机（780M，K=q8_0 / V=turbo4，`-np 2 --rerot-people 2 --rerot-pens 4`）三次请求全部 HTTP 200 且均走 DAG**：
+- **单测：** `test-rerot-parser` **0 failure**（合法：单任务/空 deps/并行双任务/链式/菱形/自由文本 intent/plan_rank；拒选：缺 tasks、空 tasks、类型错、空 intent、保留 0、未知端点、自环、重复边、环路、多余字段、重复成员、损坏 JSON；文法接受/拒选矩阵含「旧 DSL 不再可入」）；
+- **回归：** `ctest -R "rerot|xkv|flashprefill"` **50/50**；`test-rerot-view` / `test-rerot-runtime` 各 **0 failure**；
+- **真机**（780M，K=q8_0 / V=turbo4，`-np 2 --rerot-people 2 --rerot-pens 4`，最终模板）**5/5 全 HTTP 200**：
 
-| 提示 | probe tokens | frame tokens | 结果 |
-|---|---|---|---|
-| 9.11 vs 9.9 | 55 | 581 | 200 / 26.3s，“9.9 is larger” |
-| 13*17 与 21*19 | 57 | 601 | 200 / 23.8s，221 / 399 |
-| 13*17 step by step | 79 | 643 | 200 / 29.7s，10*17 + 3*17 → 221 |
+| 提示 | probe tokens | frame tokens | 策略 | 结果 |
+|---|---|---|---|---|
+| 9.11 vs 9.9 | 56 | 0 | simple | 200 / 8.8–9.5s |
+| 13*17 与 21*19 | 59 | 591 | dag（2 独立节点） | 200 / 23.2s，221 / 399 |
+| 13*17 step by step | 80 | 760 | dag（A→B 链） | 200 / 57.3s，10*17+3*17 → 221 |
 
-第三条的计划原文（trace 拼接）：`{"tasks":{"A":"compute 10*17 and compute 3*17","B":"Add the two partial products to get the final result"},"deps":{"B":["A"]}}`；日志可见 `DAG prefix rebuild … dag=305`、`Lane admitted node=1/2/3`、每 lane 自然 `</think>` 收尾、`DAG start: nodes=4`。
+`rerot.trace.probe_plan` 实测原文（最终模板，占位符均被替换为真实 id）：
+
+```text
+episode=1 tokens=56 strategy=simple text={"tasks":{"a":"Compare 9.11 and 9.9 and determine which is larger"},"deps":{}}
+episode=2 tokens=59 strategy=dag    text={"tasks":{"task1":"Calculate 13*17","task2":"Calculate 21*19"},"deps":{}}
+```
+
+即：单任务且无依赖 → `simple`（frame=0）；两任务无依赖 → `dag` 并行；A→B 链 → `dag` 带边。自适应行为与设计预期一致。
 
 ### 六、未闭合
 
-1. `deps` 引用未声明 id 仍为 fail-closed（规格要求）；模板已引导模型只在已声明 id 间连线，但若模型再造汇聚节点仍会拒选——如需容错，应作为产品语义变更单独决策。
-2. 目标机 5×6800 的 DAG 收益/多 lane 实测仍未在本轮覆盖。
+1. `deps` 引用未声明 id 仍 fail-closed（规格要求）；模板已用占位符引导模型只在已声明 id 间连线。
+2. 目标机 5×6800 的 DAG 多 lane 收益仍未复测。
 
 ## 下班交接｜2026-09-22（第二十轮，核显 GPUVM 越界崩溃地毯修复 + RERoT 槽位/脑行修正 + 路由探针挂死上限）
 

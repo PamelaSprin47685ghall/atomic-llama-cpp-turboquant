@@ -358,10 +358,11 @@ KV allocator 的“head/cursor”也不是通用 checkpoint。Unified KV 有共�
 隔离 probe 注入的单行模板（末尾带换行，首颗 Token 直接落进对象体，不粘连）：
 
 ```text
-Plan in JSON: {"tasks":{"A":"...","B":"..."},"deps":{"B":["A"]}}
+Plan in JSON: {"tasks":{"<id>":"<intent>",...},"deps":{"<id>":["<dep_id>"],...}}
 ```
 
-> 注：示例必须**自洽**——`deps` 里出现的每个 id 都要在 `tasks` 中声明。早期模板写成 `{"tasks":{"A":"..."},"deps":{"C":["A"]}}`，模型会忠实照抄出「未声明的 C」而被 fail-closed 拒绝（真机实测：`unknown endpoint in dependency: C`），故示例改为声明 A、B 后令 B 依赖 A。
+> 注：模板用 `<id>` / `<intent>` / `<dep_id>` 占位符，并以 `...` 明示「可继续追加条目」（模型此前不知道能否再加任务，导致单条目塌缩或自造汇聚节点）；要求**一致替换**：`deps` 的键与数组元素都必须取自 `tasks` 已声明的 id。
+> 早期模板写成 `{"tasks":{"A":"..."},"deps":{"C":["A"]}}`（具名示例）时，模型会忠实照抄出「未声明的 C」而被 fail-closed 拒绝（真机实测：`unknown endpoint in dependency: C`）；改为占位符后模型必须给出真实 id，不再有可照抄的具名依赖。
 
 多任务 DAG 形态：
 

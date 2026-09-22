@@ -1002,7 +1002,7 @@ std::string_view server_rerot_routing_probe_prompt() {
     // trailing newline keeps the first sampled token inside the object (no
     // glued preamble).
     static constexpr std::string_view prompt =
-        "Plan in JSON: {\"tasks\":{\"A\":\"...\",\"B\":\"...\"},\"deps\":{\"B\":[\"A\"]}}\n";
+        "Plan in JSON: {\"tasks\":{\"<id>\":\"<intent>\",...},\"deps\":{\"<id>\":[\"<dep_id>\"],...}}\n";
     return prompt;
 }
 

@@ -3260,6 +3260,16 @@ private:
                 "rerot_protocol_error: routing plan rejected: " + decision.error);
             return false;
         }
+        if (slot.task && slot.task->params.rerot_trace) {
+            // Symmetric to probe_reject: the accepted plan and the route it
+            // selected are the control-plane artifact worth reconstructing
+            // after the fact (JSON wire format, no extra cost when untraced).
+            SRV_INF("rerot.trace.probe_plan: episode=%" PRIu64 " tokens=%" PRIu64
+                    " strategy=%s text=%s\n",
+                slot.rerot_episode_id, episode->probe_tokens,
+                decision.is_simple() ? "simple" : "dag",
+                episode->probe_bytes.c_str());
+        }
         const uint64_t probe_ep_id = slot.rerot_episode_id;
         auto probe_transport_it = rerot_transport.find(probe_ep_id);
         const int64_t t_probe_start_us = probe_transport_it != rerot_transport.end() ? probe_transport_it->second->t_probe_start_us : 0;
