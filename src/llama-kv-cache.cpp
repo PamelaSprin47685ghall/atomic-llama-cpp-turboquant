@@ -6667,14 +6667,38 @@ llama_rerot_attn_layout llama_kv_cache::rerot_build_attn_layout(
         t_layout_end - t_layout_start).count();
 
     // Accumulate batch layout timing and counts to active profile ledger
+    // P0 evidence-integrity split: this site is the ONLY accumulator for
+    // layout-shape counters (live groups/entries, query rows, runs,
+    // continuous spans, reader-visible keys) and for PURE layout build time.
+    // fill_spans (llama-graph.cpp) owns capacity-bucket counters, upload
+    // bytes, and staging/set timing — the old double accumulation here
+    // (vector::capacity() as "cap", staging time as "layout time") made
+    // every live/cap ratio read ~1.0x and mixed two different clocks.
     if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
         prof->layout_view_build_us.fetch_add(layout_us, std::memory_order_relaxed);
-        prof->layout_view_build_count.fetch_add(ubatch.n_tokens, std::memory_order_relaxed);
+        prof->layout_view_build_count.fetch_add(1, std::memory_order_relaxed);
         prof->actual_query_rows.fetch_add(ubatch.n_tokens, std::memory_order_relaxed);
         prof->live_groups.fetch_add(result.groups.size(), std::memory_order_relaxed);
-        prof->cap_groups.fetch_add(result.groups.capacity(), std::memory_order_relaxed);
         prof->live_entries.fetch_add(result.entries.size(), std::memory_order_relaxed);
-        prof->cap_entries.fetch_add(result.entries.capacity(), std::memory_order_relaxed);
+
+        // §4.3 layout group: run count from the shared world, continuous
+        // span count from the run descriptors, and per-reader visible keys
+        // (entries per distinct reader state — the visibility world size).
+        {
+            uint64_t runs_total = 0;
+            uint64_t contig_total = 0;
+            for (const auto & r : world.runs()) {
+                runs_total += 1;
+                contig_total += r.contiguous ? 1 : 0;
+            }
+            prof->run_count.fetch_add(runs_total, std::memory_order_relaxed);
+            prof->continuous_span_count.fetch_add(contig_total, std::memory_order_relaxed);
+        }
+        for (size_t g = 0; g < multi.size(); ++g) {
+            for (const auto & ql : multi[g]) {
+                prof->record_reader_visible_keys(ql.entries.size());
+            }
+        }
 
         uint64_t prev_hwm = prof->high_watermark_n_kv.load(std::memory_order_relaxed);
         while (n_kv > prev_hwm && !prof->high_watermark_n_kv.compare_exchange_weak(prev_hwm, n_kv, std::memory_order_relaxed)) {}

@@ -1061,21 +1061,25 @@ void llm_graph_input_attn_rerot::fill_spans(
     const auto t2 = std::chrono::steady_clock::now();
 
     if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+        // P0 evidence-integrity split: fill_spans owns ONLY capacity-bucket
+        // counters and upload/staging timing. live_groups/live_entries and
+        // pure layout build time accumulate exclusively in
+        // rerot_build_attn_layout (llama-kv-cache.cpp); the old duplicate
+        // fetch_add here double-counted every frontier's live shapes.
         const uint64_t staging_us  = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
         const uint64_t set_us      = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
         const uint64_t total_bytes = (uint64_t) (q_idx_bytes + (full_upload ? ggml_nbytes(q_pos) : n_groups * n_pos * sizeof(int32_t)) + ent_bytes + off_bytes);
         prof->upload_bytes.fetch_add(total_bytes, std::memory_order_relaxed);
         prof->h2d_bytes.fetch_add(total_bytes, std::memory_order_relaxed);
-        prof->layout_view_build_us.fetch_add(staging_us, std::memory_order_relaxed);
-        prof->layout_view_build_count.fetch_add(1, std::memory_order_relaxed);
+        prof->upload_staging_us.fetch_add(staging_us, std::memory_order_relaxed);
+        prof->upload_set_us.fetch_add(set_us, std::memory_order_relaxed);
+        prof->upload_count.fetch_add(1, std::memory_order_relaxed);
         prof->ring.push(4 /* custom/upload-audit */, 0 /* staging */, 0, (uint32_t) total_bytes, staging_us);
         prof->ring.push(4 /* custom/upload-audit */, 1 /* set */,     0, (uint32_t) total_bytes, set_us);
         // P2 evidence: Q-prep (gather + RoPE over q_indices rows) processes
-        // the full group capacity; record live vs capacity so the padding
-        // waste is attributable per frontier.
-        prof->live_groups.fetch_add(n_groups, std::memory_order_relaxed);
+        // the full group capacity; capacity lives ONLY here (the bucketed
+        // tensor shape), live counts live only in the layout site.
         prof->cap_groups.fetch_add((uint64_t) group_cap, std::memory_order_relaxed);
-        prof->live_entries.fetch_add(n_entries, std::memory_order_relaxed);
         prof->cap_entries.fetch_add((uint64_t) entries->ne[1], std::memory_order_relaxed);
         prof->ring.push(4 /* upload-audit */, 4 /* live-vs-cap groups */, (uint16_t) n_pos, (uint32_t) n_groups, (uint64_t) group_cap);
     }

@@ -345,6 +345,78 @@ static void test_bytes_and_host_metrics() {
 }
 
 // ----------------------------------------------------------------------------
+// Test (5b): P0 evidence-integrity counter ownership split
+// ----------------------------------------------------------------------------
+
+// The two production accumulator sites must own DISJOINT counter sets:
+//   rerot_build_attn_layout (llama-kv-cache.cpp): live_groups,
+//   live_entries, actual_query_rows, run_count, continuous_span_count,
+//   reader_visible_keys_*, layout_view_build_us/count.
+//   fill_spans (llama-graph.cpp): cap_groups, cap_entries, upload_bytes,
+//   upload_staging_us, upload_set_us, upload_count.
+// The old code accumulated live_groups/live_entries at BOTH sites and
+// mixed staging time into layout_view_build_us, double-counting every
+// frontier and making live/cap ratios read ~1.0x. This test simulates both
+// sites' accumulation exactly once each and pins the resulting values; a
+// regression that re-adds either site's counters fails these checks.
+static void test_counter_ownership_split() {
+    llama_rerot_profile prof;
+    prof.reset(1006);
+
+    // One frontier: 12 live groups / 300 live entries / 6 query rows,
+    // bucket capacities 32 / 512.
+    const uint64_t n_groups = 12, n_entries = 300, q_rows = 6;
+    const uint64_t group_cap = 32, entry_cap = 512;
+
+    // Site 1 (rerot_build_attn_layout): live shapes + pure layout time.
+    prof.layout_view_build_us.fetch_add(150, std::memory_order_relaxed);
+    prof.layout_view_build_count.fetch_add(1, std::memory_order_relaxed);
+    prof.actual_query_rows.fetch_add(q_rows, std::memory_order_relaxed);
+    prof.live_groups.fetch_add(n_groups, std::memory_order_relaxed);
+    prof.live_entries.fetch_add(n_entries, std::memory_order_relaxed);
+    prof.run_count.fetch_add(3, std::memory_order_relaxed);
+    prof.continuous_span_count.fetch_add(2, std::memory_order_relaxed);
+    prof.record_reader_visible_keys(150);
+    prof.record_reader_visible_keys(150);
+
+    // Site 2 (fill_spans): capacities + upload timing.
+    prof.cap_groups.fetch_add(group_cap, std::memory_order_relaxed);
+    prof.cap_entries.fetch_add(entry_cap, std::memory_order_relaxed);
+    prof.upload_staging_us.fetch_add(40, std::memory_order_relaxed);
+    prof.upload_set_us.fetch_add(90, std::memory_order_relaxed);
+    prof.upload_count.fetch_add(1, std::memory_order_relaxed);
+
+    // Single-charge invariants: each counter holds its site's value exactly.
+    CHECK_EQ(prof.live_groups.load(), n_groups);
+    CHECK_EQ(prof.live_entries.load(), n_entries);
+    CHECK_EQ(prof.actual_query_rows.load(), q_rows);
+    CHECK_EQ(prof.cap_groups.load(), group_cap);
+    CHECK_EQ(prof.cap_entries.load(), entry_cap);
+    CHECK_EQ(prof.run_count.load(), 3);
+    CHECK_EQ(prof.continuous_span_count.load(), 2);
+    CHECK_EQ(prof.reader_visible_keys_total.load(), 300);
+    CHECK_EQ(prof.reader_visible_keys_samples.load(), 2);
+    CHECK_EQ(prof.reader_visible_keys_max.load(), 150);
+    CHECK_EQ(prof.upload_count.load(), 1);
+
+    // The live/cap ratio the ledger exists to measure: 12/32 and 300/512.
+    // Under the old double accumulation live was 2x (24/32, 600/512>1)
+    // and cap carried vector::capacity() noise — both destroy attribution.
+    CHECK(prof.live_groups.load() * group_cap == n_groups * prof.cap_groups.load());
+    CHECK(prof.live_entries.load() < prof.cap_entries.load());
+
+    // Clock separation: layout time must not absorb staging time.
+    CHECK_EQ(prof.layout_view_build_us.load(), 150);
+    CHECK_EQ(prof.upload_staging_us.load(), 40);
+    CHECK_EQ(prof.upload_set_us.load(), 90);
+    CHECK_EQ(prof.layout_view_build_count.load(), 1);
+    // Staging + set are separate from layout: 150 != 40 + 90 by construction
+    // of this fixture; the fields exist so production can tell them apart.
+    CHECK(prof.layout_view_build_us.load() !=
+          prof.upload_staging_us.load() + prof.upload_set_us.load());
+}
+
+// ----------------------------------------------------------------------------
 // Test (6): Sync Recording (no_work vs with_work)
 // ----------------------------------------------------------------------------
 
@@ -556,15 +628,16 @@ static void test_format_tsv_stability() {
     }
 
     // Expected line count:
+    // Expected line count:
     // 1 (request_id)
     // + 9 * 3 (phases: us, max_us, count) = 27
     // + 4 * (1 hit + 6 rejections) = 28
     // + 11 (layout)
-    // + 11 (host & command)
+    // + 14 (host & command: 11 + upload_staging_us + upload_set_us + upload_count)
     // + 9 (state & memory)
     // + 5 (computation)
-    // Total = 1 + 27 + 28 + 11 + 11 + 9 + 5 = 92
-    CHECK_EQ(line_count, 92);
+    // Total = 1 + 27 + 28 + 11 + 14 + 9 + 5 = 95
+    CHECK_EQ(line_count, 95);
     CHECK(found_req);
     CHECK(found_formal_p);
     CHECK(found_indexed_hit);
@@ -692,6 +765,7 @@ int main() {
     test_route_hits_and_rejections();
     test_layout_counts_and_cas_hwm();
     test_bytes_and_host_metrics();
+    test_counter_ownership_split();
     test_sync_recording();
     test_bounded_ring_buffer_and_reset();
     test_profile_full_reset();

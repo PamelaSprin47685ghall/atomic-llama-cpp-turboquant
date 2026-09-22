@@ -146,10 +146,16 @@ struct llama_rerot_profile {
     std::atomic<uint64_t> continuous_span_count{0};
     std::atomic<uint64_t> high_watermark_n_kv{0};
 
-    // (4) Host and command
+    // (4) Host and command — P0 evidence split: layout_* accumulates ONLY in
+    // rerot_build_attn_layout (pure layout build); upload_* accumulates ONLY
+    // in fill_spans (CPU staging + tensor set). The old single
+    // layout_view_build_us mixed both clocks and double-counted.
     std::atomic<uint64_t> layout_view_build_us{0};
     std::atomic<uint64_t> layout_view_build_count{0};
     std::atomic<uint64_t> upload_bytes{0};
+    std::atomic<uint64_t> upload_staging_us{0};
+    std::atomic<uint64_t> upload_set_us{0};
+    std::atomic<uint64_t> upload_count{0};
     std::atomic<uint64_t> graph_def_count{0};
     std::atomic<uint64_t> cb_allocations{0};
     std::atomic<uint64_t> cb_alloc_bytes{0};

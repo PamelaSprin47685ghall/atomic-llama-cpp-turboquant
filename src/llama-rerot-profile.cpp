@@ -136,6 +136,9 @@ void llama_rerot_profile::reset(uint64_t new_request_id) {
     layout_view_build_us.store(0, std::memory_order_relaxed);
     layout_view_build_count.store(0, std::memory_order_relaxed);
     upload_bytes.store(0, std::memory_order_relaxed);
+    upload_staging_us.store(0, std::memory_order_relaxed);
+    upload_set_us.store(0, std::memory_order_relaxed);
+    upload_count.store(0, std::memory_order_relaxed);
     graph_def_count.store(0, std::memory_order_relaxed);
     cb_allocations.store(0, std::memory_order_relaxed);
     cb_alloc_bytes.store(0, std::memory_order_relaxed);
@@ -279,6 +282,9 @@ std::string llama_rerot_profile::format_tsv() const {
     ss << "layout_view_build_us\t" << layout_view_build_us.load(std::memory_order_relaxed) << "\n";
     ss << "layout_view_build_count\t" << layout_view_build_count.load(std::memory_order_relaxed) << "\n";
     ss << "upload_bytes\t" << upload_bytes.load(std::memory_order_relaxed) << "\n";
+    ss << "upload_staging_us\t" << upload_staging_us.load(std::memory_order_relaxed) << "\n";
+    ss << "upload_set_us\t" << upload_set_us.load(std::memory_order_relaxed) << "\n";
+    ss << "upload_count\t" << upload_count.load(std::memory_order_relaxed) << "\n";
     ss << "graph_def_count\t" << graph_def_count.load(std::memory_order_relaxed) << "\n";
     ss << "cb_allocations\t" << cb_allocations.load(std::memory_order_relaxed) << "\n";
     ss << "cb_alloc_bytes\t" << cb_alloc_bytes.load(std::memory_order_relaxed) << "\n";
@@ -351,12 +357,16 @@ void llama_rerot_profile::print_summary(FILE * stream) const {
 
     std::fprintf(stream,
         "[rerot-profile-host] req=%" PRIu64
-        " view_build_us=%" PRIu64 " up_bytes=%" PRIu64 " gdefs=%" PRIu64
+        " view_build_us=%" PRIu64 " up_bytes=%" PRIu64 " up_stg_us=%" PRIu64
+        " up_set_us=%" PRIu64 " up_n=%" PRIu64 " gdefs=%" PRIu64
         " cb_allocs=%" PRIu64 " cb_bytes=%" PRIu64 " submits=%" PRIu64
         " sync_us=%" PRIu64 " sync_n=%" PRIu64 " gen=%" PRIu64 "\n",
         request_id,
         layout_view_build_us.load(std::memory_order_relaxed),
         upload_bytes.load(std::memory_order_relaxed),
+        upload_staging_us.load(std::memory_order_relaxed),
+        upload_set_us.load(std::memory_order_relaxed),
+        upload_count.load(std::memory_order_relaxed),
         graph_def_count.load(std::memory_order_relaxed),
         cb_allocations.load(std::memory_order_relaxed),
         cb_alloc_bytes.load(std::memory_order_relaxed),
