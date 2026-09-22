@@ -46,11 +46,13 @@ static std::vector<int32_t> run_span_expand_graph(
     struct ggml_context * ctx = ggml_init(params);
     CHECK(ctx != nullptr);
 
-    struct ggml_tensor * t_spans = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, std::max((int64_t)1, n_spans));
-    struct ggml_tensor * t_prefix = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, std::max((int64_t)1, n_spans + 1));
+    // n_spans==0 must use spans->ne[1]==0 so ggml_rerot_span_expand derives
+    // op_params n_spans=0 (true pass-through). Do NOT pad to 1 row.
+    struct ggml_tensor * t_spans = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, n_spans);
+    struct ggml_tensor * t_prefix = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_spans + 1);
     struct ggml_tensor * t_spill = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, std::max((int64_t)1, n_spill));
 
-    struct ggml_tensor * t_out = ggml_rerot_span_expand(ctx, t_spans, t_prefix, t_spill, n_entries);
+    struct ggml_tensor * t_out = ggml_rerot_span_expand(ctx, t_spans, t_prefix, t_spill, n_spans, n_entries);
 
     struct ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, t_out);

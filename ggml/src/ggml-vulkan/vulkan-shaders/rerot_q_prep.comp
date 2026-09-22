@@ -1,0 +1,151 @@
+#version 450
+
+// GGML_OP_REROT_Q_PREP: gather live Q rows by index, apply RoPE, write capacity-strided
+// output. Launch over capacity*heads (padded to local_size); inactive groups g>=active
+// write NaN for that head row so the GPU path is self-contained.
+// Host may alternatively memset dst to NaN and dispatch active-only; this shader still
+// implements the poison branch for a single capacity launch.
+// No WHT fusion.
+
+#include "rope_params.glsl"
+
+#define GGML_ROPE_TYPE_NORMAL 0
+#define GGML_ROPE_TYPE_NEOX   2
+#define GGML_ROPE_TYPE_MROPE  8
+#define GGML_ROPE_TYPE_VISION 24
+#define GGML_ROPE_TYPE_IMROPE 40
+
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly  buffer QRaw { float q_raw[]; };
+layout (binding = 1) readonly  buffer QIdx { int   q_indices[]; };
+layout (binding = 2) readonly  buffer QPos { int   rope_data_pos[]; };
+// May be unbound/empty when has_ff=0; host still binds a dummy buffer.
+layout (binding = 3) readonly  buffer FF   { float rope_data_ff[]; };
+layout (binding = 4) writeonly buffer Dst  { float rope_data_d[]; };
+
+// Push layout (std430, 80 bytes) — must match ggml_vk_rerot_q_prep host packing:
+//   [0..8]  uint: n_active, capacity, heads, head_dim, n_rot, n_tokens, rope_mode, has_ff, n_pos
+//   [9..12] float: freq_scale, freq_base, ext_factor, attn_factor
+//   [13..14] float corr_dims[2]
+//   [15]    float theta_scale
+//   [16..19] int sections[4]
+layout (push_constant) uniform parameter {
+    uint  n_active;    // live group count; unused GLSL reserved word `active`
+    uint  capacity;
+    uint  heads;
+    uint  head_dim;
+    uint  n_rot;       // n_dims
+    uint  n_tokens;
+    uint  rope_mode;   // GGML_ROPE_TYPE_*
+    uint  has_ff;
+    uint  n_pos;       // 1 or 4
+    float freq_scale;
+    float freq_base;
+    float ext_factor;
+    float attn_factor;
+    float corr_dims[2];
+    float theta_scale;
+    int   sections[4];
+} p;
+
+// Alias q_raw for rope_funcs (byte/element strides set via rope_params).
+#define rope_data_a q_raw
+#define ROPE_D_TYPE float
+// rope_funcs.glsl references rope_data_i for ROPE+SET_ROWS fusion. We never
+// enable that path (set_rows_stride=0), but glslc still requires a declaration.
+uvec2 rope_data_i[1];
+#include "rope_funcs.glsl"
+
+void write_nan_row(const uint base) {
+    for (uint d = 0; d < p.head_dim; ++d) {
+        rope_data_d[base + d] = uintBitsToFloat(0x7fc00000u); // NaN
+    }
+}
+
+void copy_row(const uint src_base, const uint dst_base) {
+    for (uint d = 0; d < p.head_dim; ++d) {
+        rope_data_d[dst_base + d] = q_raw[src_base + d];
+    }
+}
+
+void main() {
+    const uint idx = gl_GlobalInvocationID.x;
+    const uint n_inv = p.capacity * p.heads;
+    if (idx >= n_inv) {
+        return;
+    }
+
+    const uint g = idx / p.heads;
+    const uint h = idx - g * p.heads;
+    const uint dst_base = (g * p.heads + h) * p.head_dim;
+
+    // Inactive capacity tail: poison this head row only (do not skip other lanes).
+    if (g >= p.n_active) {
+        write_nan_row(dst_base);
+        return;
+    }
+
+    const int token = q_indices[g];
+    if (token < 0 || uint(token) >= p.n_tokens) {
+        write_nan_row(dst_base);
+        return;
+    }
+
+    const uint src_base = (uint(token) * p.heads + h) * p.head_dim;
+
+    // Unsupported / vision: gather only (no RoPE). Host supports_op should reject these.
+    if (p.rope_mode == GGML_ROPE_TYPE_VISION) {
+        copy_row(src_base, dst_base);
+        return;
+    }
+
+    rope_params rp;
+    rp.rope_mode       = p.rope_mode;
+    rp.nrows           = 1;
+    rp.n_dims          = p.n_rot;
+    rp.freq_scale      = p.freq_scale;
+    rp.freq_base       = p.freq_base;
+    rp.ext_factor      = p.ext_factor;
+    rp.attn_factor     = p.attn_factor;
+    rp.corr_dims[0]    = p.corr_dims[0];
+    rp.corr_dims[1]    = p.corr_dims[1];
+    rp.theta_scale     = p.theta_scale;
+    rp.has_ff          = p.has_ff;
+    rp.sections[0]     = p.sections[0];
+    rp.sections[1]     = p.sections[1];
+    rp.sections[2]     = p.sections[2];
+    rp.sections[3]     = p.sections[3];
+    rp.is_imrope       = (p.rope_mode == GGML_ROPE_TYPE_IMROPE) ? 1u : 0u;
+    rp.is_back         = 0;
+    rp.set_rows_stride = 0;
+    rp.ne00            = p.head_dim;
+    rp.ne01            = 1;
+    // ne02 = capacity so MROPE/IMROPE pos lookup rope_data_pos[g + k*capacity] works.
+    rp.ne02            = p.capacity;
+    rp.nb01            = 0;
+    rp.nb02            = 0;
+    rp.nb03            = 0;
+    rp.nb11            = 0;
+    rp.nb12            = 0;
+    rp.nb13            = 0;
+    rp.a_offset        = src_base;
+    rp.d_offset        = dst_base;
+
+    // i2 = g indexes q_pos; i1=i3=0 (per-head invocation).
+    for (uint i0 = 0; i0 < p.head_dim; i0 += 2) {
+        if (p.rope_mode == GGML_ROPE_TYPE_NORMAL) {
+            rope_norm(i0, 0, g, 0, rp);
+        } else if (p.rope_mode == GGML_ROPE_TYPE_NEOX) {
+            rope_neox(i0, 0, g, 0, rp);
+        } else if (p.rope_mode == GGML_ROPE_TYPE_MROPE || p.rope_mode == GGML_ROPE_TYPE_IMROPE) {
+            rope_multi(i0, 0, g, 0, rp);
+        } else {
+            // Unknown mode: copy the pair.
+            rope_data_d[dst_base + i0 + 0] = q_raw[src_base + i0 + 0];
+            if (i0 + 1 < p.head_dim) {
+                rope_data_d[dst_base + i0 + 1] = q_raw[src_base + i0 + 1];
+            }
+        }
+    }
+}

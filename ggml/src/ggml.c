@@ -1162,9 +1162,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "XKV_LANDMARK_ROWS",
     "XKV_LANDMARK_MERGE",
     "REROT_SPAN_EXPAND",
+    "REROT_Q_PREP",
 };
 
-static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT != 116");
+static_assert(GGML_OP_COUNT == 117, "GGML_OP_COUNT != 117");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1293,9 +1294,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "xkv_landmark_rows(sel,meta,off,ids,kv,pos,ptrs,outpos,status)",
     "xkv_landmark_merge(idx,sc,base,outsc,status)",
     "rerot_span_expand(spans,prefix,spill)",
+    "rerot_q_prep(q,idx,pos,ff)",
 };
 
-static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT != 116");
+static_assert(GGML_OP_COUNT == 117, "GGML_OP_COUNT != 117");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5632,6 +5634,7 @@ struct ggml_tensor * ggml_rerot_span_expand(
         struct ggml_tensor  * spans,
         struct ggml_tensor  * prefix,
         struct ggml_tensor  * spill,
+        int64_t               n_spans,
         int64_t               n_entries) {
     GGML_ASSERT(spans != NULL && prefix != NULL && spill != NULL);
     GGML_ASSERT(spans->type == GGML_TYPE_I32);
@@ -5639,10 +5642,11 @@ struct ggml_tensor * ggml_rerot_span_expand(
     GGML_ASSERT(spill->type == GGML_TYPE_I32);
     GGML_ASSERT(spans->ne[0] == 4);
     GGML_ASSERT(spill->ne[0] == 2);
-    GGML_ASSERT(prefix->ne[0] >= spans->ne[1] + 1);
+    GGML_ASSERT(n_spans >= 0);
+    GGML_ASSERT(n_spans == 0 || spans->ne[1] >= n_spans);
+    GGML_ASSERT(prefix->ne[0] >= n_spans + 1);
     GGML_ASSERT(n_entries >= 0);
 
-    const int64_t n_spans = spans->ne[1];
     const int64_t n_spill = spill->ne[1];
 
     int64_t ne[4] = { 2, n_entries, 1, 1 };
@@ -5656,6 +5660,80 @@ struct ggml_tensor * ggml_rerot_span_expand(
     ggml_set_op_params_i32(result, 0, (int32_t) n_spans);
     ggml_set_op_params_i32(result, 1, (int32_t) n_entries);
     ggml_set_op_params_i32(result, 2, (int32_t) n_spill);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_rerot_q_prep(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q_raw,
+        struct ggml_tensor  * q_indices,
+        struct ggml_tensor  * q_pos,
+        struct ggml_tensor  * freq_factors,
+        int32_t               active,
+        int                   n_dims,
+        int                   sections[GGML_MROPE_SECTIONS],
+        int                   mode,
+        int                   n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow) {
+    GGML_ASSERT(q_raw != NULL && q_indices != NULL && q_pos != NULL);
+    GGML_ASSERT(q_raw->type == GGML_TYPE_F32);
+    GGML_ASSERT(q_indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(q_pos->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(q_raw));
+    GGML_ASSERT(ggml_is_contiguous(q_indices));
+    GGML_ASSERT(ggml_is_contiguous(q_pos));
+
+    const int64_t head_dim = q_raw->ne[0];
+    const int64_t heads    = q_raw->ne[1];
+    const int64_t n_tokens = q_raw->ne[2];
+    const int64_t capacity = q_indices->ne[0];
+
+    GGML_ASSERT(head_dim > 0 && heads > 0 && n_tokens > 0);
+    GGML_ASSERT(capacity > 0);
+    GGML_ASSERT(active >= 0 && (int64_t) active <= capacity);
+    GGML_ASSERT(n_dims > 0 && n_dims <= head_dim && (n_dims % 2) == 0);
+    GGML_ASSERT((mode & 1) == 0 && "mode & 1 == 1 is no longer supported");
+
+    const bool mrope_used = mode & GGML_ROPE_TYPE_MROPE;
+    if (mrope_used) {
+        GGML_ASSERT(q_pos->ne[0] == capacity * 4);
+    } else {
+        GGML_ASSERT(q_pos->ne[0] == capacity);
+    }
+
+    if (freq_factors) {
+        GGML_ASSERT(freq_factors->type == GGML_TYPE_F32);
+        GGML_ASSERT(freq_factors->ne[0] >= n_dims / 2);
+    }
+
+    int64_t ne[4] = { head_dim, heads, capacity, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 3, ne);
+
+    int32_t params[15] = { active, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
+    memcpy(params +  5, &freq_base,   sizeof(float));
+    memcpy(params +  6, &freq_scale,  sizeof(float));
+    memcpy(params +  7, &ext_factor,  sizeof(float));
+    memcpy(params +  8, &attn_factor, sizeof(float));
+    memcpy(params +  9, &beta_fast,   sizeof(float));
+    memcpy(params + 10, &beta_slow,   sizeof(float));
+    if (mrope_used && sections) {
+        memcpy(params + 11, sections, sizeof(int32_t) * GGML_MROPE_SECTIONS);
+    } else {
+        memset(params + 11, 0, sizeof(int32_t) * GGML_MROPE_SECTIONS);
+    }
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_REROT_Q_PREP;
+    result->src[0] = q_raw;
+    result->src[1] = q_indices;
+    result->src[2] = q_pos;
+    result->src[3] = freq_factors;
 
     return result;
 }

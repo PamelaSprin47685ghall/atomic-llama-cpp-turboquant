@@ -614,6 +614,8 @@ extern "C" {
         GGML_OP_XKV_LANDMARK_MERGE,
         GGML_OP_REROT_SPAN_EXPAND,
 
+        GGML_OP_REROT_Q_PREP,
+
         GGML_OP_COUNT,
     };
 
@@ -2557,7 +2559,35 @@ extern "C" {
             struct ggml_tensor  * spans,
             struct ggml_tensor  * prefix,
             struct ggml_tensor  * spill,
+            int64_t               n_spans,
             int64_t               n_entries);
+
+    // Fused live gather + RoPE for RERoT Q groups.
+    // q_raw:        F32 [head_dim, heads, n_tokens]
+    // q_indices:    I32 [capacity]; only [0, active) are read
+    // q_pos:        I32 [capacity * n_pos] (n_pos = 1 or 4; stride = capacity)
+    // freq_factors: F32 [n_dims/2] or NULL
+    // Returns F32 [head_dim, heads, capacity]. Groups [active, capacity) are NaN.
+    // op_params: [0]=active [1]=n_dims [2]=mode [3]=0 [4]=n_ctx_orig;
+    //            floats freq_base/scale/ext/attn/beta_fast/beta_slow at 5..10;
+    //            sections at 11..14 (same packing as ggml_rope_impl with active in slot 0).
+    GGML_API struct ggml_tensor * ggml_rerot_q_prep(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q_raw,
+            struct ggml_tensor  * q_indices,
+            struct ggml_tensor  * q_pos,
+            struct ggml_tensor  * freq_factors,
+            int32_t               active,
+            int                   n_dims,
+            int                   sections[GGML_MROPE_SECTIONS],
+            int                   mode,
+            int                   n_ctx_orig,
+            float                 freq_base,
+            float                 freq_scale,
+            float                 ext_factor,
+            float                 attn_factor,
+            float                 beta_fast,
+            float                 beta_slow);
 
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,

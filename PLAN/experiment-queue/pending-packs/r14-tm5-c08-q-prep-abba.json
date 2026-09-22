@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "document_kind": "PENDING_EXPERIMENT_PACK",
+  "pack_id": "r14-tm5-c08-q-prep-abba",
+  "approval_status": "NOT_APPROVED",
+  "approved_by": null,
+  "approved_at": null,
+  "expires_at": null,
+  "warning": "本文件为待执行ABBA实验包（C08 GPU live Q-prep候选 vs 基线密集预处理），不是启动许可。严禁假造5卡胜出结论或硬件裁决；未经许可不得自动置为已批准。",
+  "experiment": {
+    "protocol": "ABBA",
+    "target_task": "R14",
+    "baseline_task": "TM5",
+    "candidate": "C08_Q_PREP_GPU",
+    "baseline": "DENSE_CPU_Q_PREP",
+    "required_hardware": "5GPU_VK_TP5",
+    "status": "PENDING_5GPU",
+    "verdict": {
+      "status": "PENDING_5GPU",
+      "winner": "NO_WINNER_CLAIMED",
+      "pass": false,
+      "fabricated": false,
+      "reason": "1GPU devhost cannot run 5GPU TP5 ABBA matrix; pack is inert pending multi-GPU allocation."
+    },
+    "evidence_layout_dir": "PLAN/experiment-queue/pending-packs/layouts/r14-tm5-c08-q-prep-abba",
+    "offline_oracle_verification": {
+      "oracle_test": "tests/test-rerot-q-prep.cpp",
+      "oracle_result": "PASS",
+      "oracle_environment": "1GPU_DEVHOST"
+    }
+  },
+  "target": {
+    "workspace": "/home/kunweiz/Desktop/atomic-llama-cpp-turboquant",
+    "audited_head": "f51efe8208fdf6f7998b39483510c3e73c124310",
+    "host_identity": null,
+    "device_bdfs": [],
+    "device_uuids": []
+  },
+  "models": [
+    "Qwen/Qwen2.5-32B-Instruct"
+  ],
+  "build": {
+    "binary_path": null,
+    "binary_sha256": null,
+    "compiler": null,
+    "flags": [],
+    "driver_identity": null
+  },
+  "permitted_tiers": [],
+  "scope": {
+    "sync_modes": ["ABBA_PAIRED"],
+    "wire_formats": ["REROT_Q_PREP_V1"],
+    "fixed_spin_max": 10000,
+    "max_context_tokens": 4096,
+    "max_active_rows": 4,
+    "max_capacity_rows": 4,
+    "max_readers": 2,
+    "max_logical_workers": 2,
+    "physical_pens": 5,
+    "max_requests": 32,
+    "max_dispatches": 128,
+    "memory_budget_bytes_per_rank": {},
+    "headroom_bytes_per_rank": {}
+  },
+  "executor": {
+    "owner": null,
+    "exclusive_lock_id": null,
+    "bind_address": null,
+    "private_port": null
+  },
+  "logs": {
+    "before_cursor": null,
+    "persistent_destination": null
+  },
+  "completion_contract": {
+    "implementation_reference": "ggml_backend_vk_tp5_comm_free_safe",
+    "native_wait_deadline": null,
+    "wait_only_actually_submitted_values": true,
+    "timeout_is_cancellation": false,
+    "retain_resources_if_completion_unknown": true
+  },
+  "stop_conditions": [
+    "new_gpu_vm_fault",
+    "new_gpu_hang_or_device_lost",
+    "unresolved_submitted_work",
+    "unexpected_device_owner",
+    "memory_budget_exceeded",
+    "required_health_evidence_missing"
+  ],
+  "forbidden_recovery": [
+    "unbounded_spin",
+    "increase_spin_bound_after_timeout",
+    "disable_watchdog",
+    "fabricate_completion_signal",
+    "automatic_kill9_abort_reset_or_reboot",
+    "release_inflight_resources_without_completion_proof"
+  ],
+  "on_block": "冻结受影响GPU设备集的新提交；记录证据与解除条件；开发者转task-board中的without_gpu_window任务。"
+}

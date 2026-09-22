@@ -1,0 +1,118 @@
+#version 450
+
+// =============================================================================
+// C10 / Q3 prototype — two-reader shared KV tile (Hydragen-style supply)
+// =============================================================================
+//
+// Mathematical contract (matches src/llama-rerot-math.h):
+//   llama_rerot_shared_block_attention for n_readers == 2
+//   - One physical K/V block is loaded once.
+//   - Each visible reader consumes it with an independent online softmax
+//     state (m, z, u). Softmax statistics are NEVER shared across readers.
+//   - Invisible readers leave an empty state (used=0).
+//
+// This is a compileable Vulkan stub for offline shader build + CPU golden
+// compare. It is NOT wired into production flash_attn_rerot dispatch.
+// Default host path remains CPU; GPU runtime compare is optional and must
+// skip cleanly when no device is present (does not require 5 GPUs).
+//
+// Bindings:
+//   0: Q  float[2 * head_dim]     pre-RoPE'd queries (caller owns DDVR phase)
+//   1: K  float[n_block * head_dim]
+//   2: V  float[n_block * value_dim]
+//   3: Out float[2 * (3 + value_dim)]
+//        per reader r: [used, m, z, u[0..value_dim)]
+//        used==0 means empty (invisible or empty block)
+//
+// Push constants (20 B, std430-compatible packing):
+//   n_block, head_dim, value_dim, visible_mask (bit0=r0, bit1=r1), scale
+//
+// Workgroup: single invocation does the serial online pass (correctness stub).
+
+layout (local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout (push_constant) uniform parameter {
+    uint  n_block;
+    uint  head_dim;
+    uint  value_dim;
+    uint  visible_mask;
+    float scale;
+} p;
+
+layout (binding = 0) readonly  buffer QBuf { float q[]; };
+layout (binding = 1) readonly  buffer KBuf { float k[]; };
+layout (binding = 2) readonly  buffer VBuf { float v[]; };
+layout (binding = 3) writeonly buffer OBuf { float o[]; };
+
+void main() {
+    // Only the lead invocation runs; others (if any) no-op.
+    if (gl_GlobalInvocationID.x != 0u) {
+        return;
+    }
+
+    const uint HD = p.head_dim;
+    const uint VD = p.value_dim;
+    const uint NB = p.n_block;
+    // Per-reader output stride: used + m + z + u[VD]
+    const uint OS = 3u + VD;
+
+    for (uint r = 0u; r < 2u; ++r) {
+        const bool visible = ((p.visible_mask >> r) & 1u) != 0u;
+        const uint base = r * OS;
+
+        if (!visible || NB == 0u || HD == 0u || VD == 0u) {
+            o[base + 0u] = 0.0; // used = empty
+            o[base + 1u] = 0.0;
+            o[base + 2u] = 0.0;
+            for (uint e = 0u; e < VD; ++e) {
+                o[base + 3u + e] = 0.0;
+            }
+            continue;
+        }
+
+        float m = 0.0;
+        float z = 0.0;
+        // Online first-key init + subsequent rescale (matches CPU oracle).
+        bool have = false;
+
+        // Temporary u in registers: value_dim is expected small in the
+        // prototype fixtures (≤64). Cap at 128 for the stub.
+        float u[128];
+        for (uint e = 0u; e < min(VD, 128u); ++e) {
+            u[e] = 0.0;
+        }
+
+        for (uint j = 0u; j < NB; ++j) {
+            float dot = 0.0;
+            for (uint e = 0u; e < HD; ++e) {
+                dot += q[r * HD + e] * k[j * HD + e];
+            }
+            const float score = p.scale * dot;
+
+            if (!have) {
+                m = score;
+                z = 1.0;
+                for (uint e = 0u; e < min(VD, 128u); ++e) {
+                    u[e] = v[j * VD + e];
+                }
+                have = true;
+            } else {
+                const float m_new = max(m, score);
+                const float w_old = exp(m - m_new);
+                const float w_new = exp(score - m_new);
+                z = w_old * z + w_new;
+                for (uint e = 0u; e < min(VD, 128u); ++e) {
+                    u[e] = w_old * u[e] + w_new * v[j * VD + e];
+                }
+                m = m_new;
+            }
+        }
+
+        o[base + 0u] = have ? 1.0 : 0.0;
+        o[base + 1u] = m;
+        o[base + 2u] = z;
+        for (uint e = 0u; e < VD; ++e) {
+            o[base + 3u + e] = (e < 128u) ? u[e] : 0.0;
+        }
+    }
+}

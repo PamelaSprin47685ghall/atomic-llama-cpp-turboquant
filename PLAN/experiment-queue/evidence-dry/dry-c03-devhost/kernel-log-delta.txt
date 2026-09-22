@@ -1,0 +1,3 @@
+# NOT_CAPTURED
+# cursor range: n/a
+# permission/missing: dry-run did not touch kernel logs

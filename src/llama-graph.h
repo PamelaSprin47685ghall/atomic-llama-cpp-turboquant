@@ -619,6 +619,21 @@ private:
     std::vector<int32_t> st_q_pos;
     std::vector<int32_t> st_entries;
     std::vector<int32_t> st_offsets;
+
+    // R13-A GPU expand bridge (LLAMA_REROT_GPU_SPAN_EXPAND=1):
+    // compact descriptors are graph inputs; entries is the expand op
+    // output so flash_attn_ext_rerot has an explicit expand→attention
+    // dependency. Default path leaves these null and keeps dense upload.
+    bool gpu_span_expand = false;
+    int32_t baked_n_spans   = 0;
+    int32_t baked_n_entries = 0;
+    int32_t baked_n_spill   = 0;
+    ggml_tensor * t_spans  = nullptr;
+    ggml_tensor * t_prefix = nullptr;
+    ggml_tensor * t_spill  = nullptr;
+    std::vector<uint32_t> st_spans;
+    std::vector<uint32_t> st_prefix;
+    std::vector<int32_t>  st_spill;
 };
 
 // FlashPrefill V2 sparse-path graph input (GraphIntegration).

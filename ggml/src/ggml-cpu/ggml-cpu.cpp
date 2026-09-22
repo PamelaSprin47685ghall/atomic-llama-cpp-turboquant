@@ -637,6 +637,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_FLASH_PREFILL_ATTN:
             return ggml_backend_cpu_supports_flash_prefill(op);
         case GGML_OP_REROT_SPAN_EXPAND:
+        case GGML_OP_REROT_Q_PREP:
             return true;
         default:
             return true;

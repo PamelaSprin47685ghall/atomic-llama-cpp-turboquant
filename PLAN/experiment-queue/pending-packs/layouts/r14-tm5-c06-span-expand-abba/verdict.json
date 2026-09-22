@@ -1,0 +1,8 @@
+{
+  "verdict": "PENDING_5GPU",
+  "winner": "NO_WINNER_CLAIMED",
+  "status": "PENDING_5GPU",
+  "reason": "1GPU devhost cannot run 5GPU TP5 ABBA matrix; pack is inert pending multi-GPU allocation.",
+  "pass": false,
+  "fabricated": false
+}

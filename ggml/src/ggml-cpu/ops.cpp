@@ -13904,3 +13904,147 @@ void ggml_compute_forward_rerot_span_expand(
         ++spill_idx;
     }
 }
+
+// GGML_OP_REROT_Q_PREP: gather live Q rows + RoPE into capacity-strided F32,
+// poison inactive tail [active, capacity) with NaN. Semantics match
+// llama_rerot_q_prep_reference / ggml_rope_flt; does not call llama.
+void ggml_compute_forward_rerot_q_prep(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * q_raw   = dst->src[0];
+    const ggml_tensor * q_idx   = dst->src[1];
+    const ggml_tensor * q_pos   = dst->src[2];
+    const ggml_tensor * freq_t  = dst->src[3];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(q_raw && q_raw->type == GGML_TYPE_F32);
+    GGML_ASSERT(q_idx && q_idx->type == GGML_TYPE_I32);
+    GGML_ASSERT(q_pos && q_pos->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(q_raw));
+    GGML_ASSERT(ggml_is_contiguous(q_idx));
+    GGML_ASSERT(ggml_is_contiguous(q_pos));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int32_t active     = ((const int32_t *) dst->op_params)[0];
+    const int     n_dims     = ((const int32_t *) dst->op_params)[1];
+    const int     mode       = ((const int32_t *) dst->op_params)[2];
+    const int     n_ctx_orig = ((const int32_t *) dst->op_params)[4];
+
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    int sections[4];
+    memcpy(&freq_base,   (const int32_t *) dst->op_params +  5, sizeof(float));
+    memcpy(&freq_scale,  (const int32_t *) dst->op_params +  6, sizeof(float));
+    memcpy(&ext_factor,  (const int32_t *) dst->op_params +  7, sizeof(float));
+    memcpy(&attn_factor, (const int32_t *) dst->op_params +  8, sizeof(float));
+    memcpy(&beta_fast,   (const int32_t *) dst->op_params +  9, sizeof(float));
+    memcpy(&beta_slow,   (const int32_t *) dst->op_params + 10, sizeof(float));
+    memcpy(sections,     (const int32_t *) dst->op_params + 11, sizeof(int) * 4);
+
+    const int64_t head_dim = q_raw->ne[0];
+    const int64_t heads    = q_raw->ne[1];
+    const int64_t n_tokens = q_raw->ne[2];
+    const int64_t capacity = q_idx->ne[0];
+
+    GGML_ASSERT(dst->ne[0] == head_dim && dst->ne[1] == heads && dst->ne[2] == capacity);
+    GGML_ASSERT(active >= 0 && (int64_t) active <= capacity);
+    GGML_ASSERT(n_dims > 0 && n_dims <= head_dim && (n_dims % 2) == 0);
+
+    const bool is_imrope  = mode == GGML_ROPE_TYPE_IMROPE;
+    const bool mrope_used = mode & GGML_ROPE_TYPE_MROPE;
+    const bool is_vision  = mode == GGML_ROPE_TYPE_VISION;
+
+    // Text-only fused v1: VISION and unknown modes are not supported.
+    if (is_vision ||
+        !(mode == GGML_ROPE_TYPE_NORMAL ||
+          mode == GGML_ROPE_TYPE_NEOX   ||
+          mode == GGML_ROPE_TYPE_MROPE  ||
+          mode == GGML_ROPE_TYPE_IMROPE)) {
+        GGML_ABORT("ggml_compute_forward_rerot_q_prep: unsupported rope mode");
+    }
+
+    if (mrope_used) {
+        GGML_ASSERT(q_pos->ne[0] == capacity * 4);
+        GGML_ASSERT(sections[0] > 0 || sections[1] > 0 || sections[2] > 0);
+    } else {
+        GGML_ASSERT(q_pos->ne[0] == capacity);
+    }
+
+    const float * freq_factors = nullptr;
+    if (freq_t != nullptr) {
+        GGML_ASSERT(freq_t->type == GGML_TYPE_F32);
+        GGML_ASSERT(freq_t->ne[0] >= n_dims / 2);
+        freq_factors = (const float *) freq_t->data;
+    }
+
+    const float * q_raw_data = (const float *) q_raw->data;
+    const int32_t * indices  = (const int32_t *) q_idx->data;
+    const int32_t * pos      = (const int32_t *) q_pos->data;
+    float * out              = (float *) dst->data;
+
+    const size_t head_elems = (size_t) head_dim;
+    const size_t group_elems = head_elems * (size_t) heads;
+
+    float corr_dims[2];
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+    const float theta_scale = powf(freq_base, -2.0f / (float) n_dims);
+
+    // Cache sized like ggml_rope_flt (full ne0 = head_dim).
+    std::vector<float> cache((size_t) head_dim);
+
+    for (int64_t g = 0; g < active; ++g) {
+        const int32_t token = indices[g];
+        GGML_ASSERT(token >= 0 && (int64_t) token < n_tokens);
+
+        const float * src_group = q_raw_data + (size_t) token * group_elems;
+        float * dst_group = out + (size_t) g * group_elems;
+
+        // Gather all heads for this live group, then rotate in place.
+        memcpy(dst_group, src_group, group_elems * sizeof(float));
+
+        if (!mrope_used) {
+            const float p = (float) pos[g];
+            ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, head_dim,
+                                ext_factor, attn_factor, cache.data(), /*sin_sign=*/1.0f, theta_scale);
+        } else {
+            const float p_t = (float) pos[g];
+            const float p_h = (float) pos[g + capacity];
+            const float p_w = (float) pos[g + capacity * 2];
+            const float p_e = (float) pos[g + capacity * 3];
+            ggml_mrope_cache_init(
+                p_t, p_h, p_w, p_e, sections, is_imrope, /*indep_sects=*/false,
+                freq_scale, freq_factors, corr_dims, head_dim,
+                ext_factor, attn_factor, cache.data(), /*sin_sign=*/1.0f, theta_scale);
+        }
+
+        for (int64_t h = 0; h < heads; ++h) {
+            float * vec = dst_group + (size_t) h * head_elems;
+            switch (mode) {
+                case GGML_ROPE_TYPE_NORMAL:
+                    rotate_pairs<float>(n_dims, /*n_offset=*/1, cache.data(), vec, vec, /*scale=*/1);
+                    break;
+                case GGML_ROPE_TYPE_NEOX:
+                case GGML_ROPE_TYPE_MROPE:
+                case GGML_ROPE_TYPE_IMROPE:
+                    rotate_pairs<float>(n_dims, n_dims / 2, cache.data(), vec, vec);
+                    break;
+                default:
+                    GGML_ABORT("ggml_compute_forward_rerot_q_prep: rope type not supported");
+            }
+            // Non-rotary tail channels already gathered from src; leave as-is.
+            (void) n_dims;
+        }
+    }
+
+    // Poison inactive capacity tail so consumers cannot treat padding as live.
+    const float nanf_val = nanf("");
+    for (int64_t g = active; g < capacity; ++g) {
+        float * dst_group = out + (size_t) g * group_elems;
+        for (size_t i = 0; i < group_elems; ++i) {
+            dst_group[i] = nanf_val;
+        }
+    }
+}

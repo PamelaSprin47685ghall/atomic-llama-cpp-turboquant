@@ -19,6 +19,7 @@
 
 #include "ggml-backend.h"
 #include "llama-xkv-graph-ref.h"
+#include "llama-rerot-math.h"
 
 #include <mutex>
 
@@ -794,14 +795,55 @@ void llm_graph_input_attn_rerot::build_span_tensors(
     // first fill_spans performs a full-capacity upload (P5).
     zeroed_capacity = 0;
 
+    // R13-A: optional GPU expand path. Default remains dense host expand.
+    static const bool gpu_span_expand_env = [] {
+        const char * e = getenv("LLAMA_REROT_GPU_SPAN_EXPAND");
+        return e && strcmp(e, "1") == 0;
+    }();
+    gpu_span_expand = gpu_span_expand_env;
+    t_spans = t_prefix = t_spill = nullptr;
+    baked_n_spans = baked_n_entries = baked_n_spill = 0;
+    st_spans.clear();
+    st_prefix.clear();
+    st_spill.clear();
+
     q_indices = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, key.group_cap);
     ggml_set_input(q_indices);
 
     q_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) key.group_cap * n_pos);
     ggml_set_input(q_pos);
 
-    entries = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 2, key.entry_cap);
-    ggml_set_input(entries);
+
+    if (gpu_span_expand) {
+        // Compact descriptors uploaded by fill_spans; entries produced on
+        // device by GGML_OP_REROT_SPAN_EXPAND (explicit expand→attn edge).
+        // Exact live counts are baked into topology: reuse requires the
+        // same n_spans/n_entries/n_spill (see spans_can_reuse).
+        const auto cov = llama_rerot_spans_coverage(layout);
+        baked_n_spans   = (int32_t) layout.spans.size();
+        baked_n_entries = (int32_t) layout.entries.size();
+        baked_n_spill   = (int32_t) cov.spill_rows;
+
+        t_spans = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 4, baked_n_spans);
+        ggml_set_input(t_spans);
+        ggml_set_name(t_spans, "rerot_spans_compact");
+
+        t_prefix = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) baked_n_spans + 1);
+        ggml_set_input(t_prefix);
+        ggml_set_name(t_prefix, "rerot_spans_prefix");
+
+        t_spill = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 2, std::max<int64_t>(1, baked_n_spill));
+        ggml_set_input(t_spill);
+        ggml_set_name(t_spill, "rerot_spans_spill");
+
+        entries = ggml_rerot_span_expand(
+            ctx0, t_spans, t_prefix, t_spill, baked_n_spans, baked_n_entries);
+        ggml_set_name(entries, "rerot_entries_expanded");
+        // NOT set_input: computed by expand; attention depends on it.
+    } else {
+        entries = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 2, key.entry_cap);
+        ggml_set_input(entries);
+    }
 
     offsets = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) ubatch.n_tokens + 1);
     ggml_set_input(offsets);
@@ -856,7 +898,26 @@ bool llm_graph_input_attn_rerot::spans_can_reuse(
     if (q_pos == nullptr || q_pos->ne[0] != (int64_t) key.group_cap * n_pos) {
         return false;
     }
-    if (entries == nullptr || entries->ne[0] != 2 || entries->ne[1] != (int64_t) key.entry_cap) {
+    if (gpu_span_expand) {
+        // GPU expand bakes exact live counts into topology.
+        if ((int32_t) layout.spans.size() != baked_n_spans) {
+            return false;
+        }
+        if ((int32_t) layout.entries.size() != baked_n_entries) {
+            return false;
+        }
+        const auto cov = llama_rerot_spans_coverage(layout);
+        if ((int32_t) cov.spill_rows != baked_n_spill) {
+            return false;
+        }
+        if (entries == nullptr || entries->op != GGML_OP_REROT_SPAN_EXPAND ||
+            entries->ne[0] != 2 || entries->ne[1] != (int64_t) baked_n_entries) {
+            return false;
+        }
+        if (!t_spans || !t_prefix || !t_spill) {
+            return false;
+        }
+    } else if (entries == nullptr || entries->ne[0] != 2 || entries->ne[1] != (int64_t) key.entry_cap) {
         return false;
     }
     if (offsets == nullptr || offsets->ne[0] != (int64_t) key.n_tokens + 1) {
@@ -879,14 +940,6 @@ void llm_graph_input_attn_rerot::fill_spans(
         throw std::runtime_error("RERoT DDVR: cannot fill span tensors from an empty layout");
     }
     const size_t n_groups  = layout.groups.size();
-
-    // R13-A: Guarded GPU fast path flag (LLAMA_REROT_GPU_SPAN_EXPAND=1).
-    // Default stays the existing CPU expansion.
-    static const bool gpu_span_expand_env = [] {
-        const char * e = getenv("LLAMA_REROT_GPU_SPAN_EXPAND");
-        return e && strcmp(e, "1") == 0;
-    }();
-    GGML_UNUSED(gpu_span_expand_env);
 
     const size_t n_entries = layout.entries.size();
     const size_t n_offsets = layout.query_offsets.size();
@@ -934,39 +987,20 @@ void llm_graph_input_attn_rerot::fill_spans(
         }
     }
 
-    st_entries.assign((size_t) entries->ne[1] * 2, 0);
-    // Sixteenth round (question two): const-effective contiguous segments
-    // arrive as a span side-channel (key range + group + entry slot), so
-    // the i32 staging buffer expands from O(spans) range writes instead of
-    // O(entries) per-key conversions. Spans with entry_index beyond
-    // n_entries (stale/capacity) are rejected by the layout validator.
-    // Non-span rows come from the authoritative entry stream: the builder
-    // wrote scalar arms (and mixed general shapes) there; spans are absent
-    // for those queries, so a whole-layout span table with holes still
-    // expands correctly (uncovered rows copied, covered rows skipped).
-    const uint64_t span_rows = [&] {
-        uint64_t total = 0;
-        for (const auto & sp : layout.spans) {
-            total += sp.count;
+    if (gpu_span_expand) {
+        // R13-A GPU path: pack compact spans + prefix + spill; the expand
+        // op materializes dense entries on-device for attention.
+        if (entries->op != GGML_OP_REROT_SPAN_EXPAND ||
+            !t_spans || !t_prefix || !t_spill ||
+            (int32_t) layout.spans.size() != baked_n_spans ||
+            (int32_t) n_entries != baked_n_entries) {
+            throw std::runtime_error(
+                "RERoT DDVR: GPU span-expand topology stale;"
+                " rebuild required before compact upload");
         }
-        return total;
-    }();
-    if (span_rows == 0) {
-        // General shape (duplicate storage, non-contiguous runs, tests):
-        // the plain copy.
-        for (size_t i = 0; i < n_entries; ++i) {
-            st_entries[2 * i + 0] = (int32_t) layout.entries[i].key_index;
-            st_entries[2 * i + 1] = (int32_t) layout.entries[i].group_index;
-        }
-    } else {
-        // Expand by entry ranges (sixteenth round): the span table is
-        // emitted in merge order, so entry_index is non-decreasing. Walk
-        // the table once with a cursor: slots between spans are the
-        // authoritative scalar entries (copied verbatim), slots inside a
-        // span are the ascending key range with the span's single group.
-        // O(n_entries) total, no bitmap, two int32 stores per row.
-        size_t cursor = 0;
-        for (const auto & sp : layout.spans) {
+        st_spans.assign((size_t) baked_n_spans * 4, 0);
+        for (size_t s = 0; s < layout.spans.size(); ++s) {
+            const auto & sp = layout.spans[s];
             if (n_entries && sp.entry_index >= n_entries) {
                 throw std::runtime_error(
                     "RERoT DDVR: span entry index beyond live entries;"
@@ -977,29 +1011,114 @@ void llm_graph_input_attn_rerot::fill_spans(
                     "RERoT DDVR: span range beyond live entries;"
                     " rebuild required, refusing to misroute keys");
             }
-            if (sp.entry_index < cursor) {
+            st_spans[4 * s + 0] = sp.key_start;
+            st_spans[4 * s + 1] = sp.count;
+            st_spans[4 * s + 2] = sp.group_index;
+            st_spans[4 * s + 3] = sp.entry_index;
+        }
+        st_prefix.assign(1, 0);
+        {
+            uint32_t acc = 0;
+            for (const auto & sp : layout.spans) {
+                acc += sp.count;
+                st_prefix.push_back(acc);
+            }
+        }
+        st_spill.assign((size_t) std::max(baked_n_spill, 1) * 2, 0);
+        {
+            size_t cursor = 0;
+            size_t spill_i = 0;
+            for (const auto & sp : layout.spans) {
+                if (sp.entry_index < cursor) {
+                    throw std::runtime_error(
+                        "RERoT DDVR: span table is not entry-ordered;"
+                        " rebuild required");
+                }
+                for (; cursor < sp.entry_index; ++cursor, ++spill_i) {
+                    st_spill[2 * spill_i + 0] = (int32_t) layout.entries[cursor].key_index;
+                    st_spill[2 * spill_i + 1] = (int32_t) layout.entries[cursor].group_index;
+                }
+                cursor += sp.count;
+            }
+            for (; cursor < n_entries; ++cursor, ++spill_i) {
+                st_spill[2 * spill_i + 0] = (int32_t) layout.entries[cursor].key_index;
+                st_spill[2 * spill_i + 1] = (int32_t) layout.entries[cursor].group_index;
+            }
+            if ((int32_t) spill_i != baked_n_spill) {
                 throw std::runtime_error(
-                    "RERoT DDVR: span table is not entry-ordered;"
+                    "RERoT DDVR: spill packing mismatch vs baked coverage;"
                     " rebuild required");
             }
-            // Scalar rows before this span.
-            for (; cursor < sp.entry_index; ++cursor) {
+        }
+        st_entries.clear(); // dense entries produced by expand op
+    } else {
+        st_entries.assign((size_t) entries->ne[1] * 2, 0);
+        // Sixteenth round (question two): const-effective contiguous segments
+        // arrive as a span side-channel (key range + group + entry slot), so
+        // the i32 staging buffer expands from O(spans) range writes instead of
+        // O(entries) per-key conversions. Spans with entry_index beyond
+        // n_entries (stale/capacity) are rejected by the layout validator.
+        // Non-span rows come from the authoritative entry stream: the builder
+        // wrote scalar arms (and mixed general shapes) there; spans are absent
+        // for those queries, so a whole-layout span table with holes still
+        // expands correctly (uncovered rows copied, covered rows skipped).
+        const uint64_t span_rows = [&] {
+            uint64_t total = 0;
+            for (const auto & sp : layout.spans) {
+                total += sp.count;
+            }
+            return total;
+        }();
+        if (span_rows == 0) {
+            // General shape (duplicate storage, non-contiguous runs, tests):
+            // the plain copy.
+            for (size_t i = 0; i < n_entries; ++i) {
+                st_entries[2 * i + 0] = (int32_t) layout.entries[i].key_index;
+                st_entries[2 * i + 1] = (int32_t) layout.entries[i].group_index;
+            }
+        } else {
+            // Expand by entry ranges (sixteenth round): the span table is
+            // emitted in merge order, so entry_index is non-decreasing. Walk
+            // the table once with a cursor: slots between spans are the
+            // authoritative scalar entries (copied verbatim), slots inside a
+            // span are the ascending key range with the span's single group.
+            // O(n_entries) total, no bitmap, two int32 stores per row.
+            size_t cursor = 0;
+            for (const auto & sp : layout.spans) {
+                if (n_entries && sp.entry_index >= n_entries) {
+                    throw std::runtime_error(
+                        "RERoT DDVR: span entry index beyond live entries;"
+                        " rebuild required, refusing to misroute keys");
+                }
+                if (n_entries && (uint64_t) sp.entry_index + sp.count > n_entries) {
+                    throw std::runtime_error(
+                        "RERoT DDVR: span range beyond live entries;"
+                        " rebuild required, refusing to misroute keys");
+                }
+                if (sp.entry_index < cursor) {
+                    throw std::runtime_error(
+                        "RERoT DDVR: span table is not entry-ordered;"
+                        " rebuild required");
+                }
+                // Scalar rows before this span.
+                for (; cursor < sp.entry_index; ++cursor) {
+                    st_entries[2 * cursor + 0] = (int32_t) layout.entries[cursor].key_index;
+                    st_entries[2 * cursor + 1] = (int32_t) layout.entries[cursor].group_index;
+                }
+                // Span rows: ascending run range with one group (branchless
+                // inner loop — vectorizes to two interleaved stores).
+                int32_t * out = st_entries.data() + 2 * (size_t) sp.entry_index;
+                for (uint32_t k = 0; k < sp.count; ++k) {
+                    out[2 * k + 0] = (int32_t) (sp.key_start + k);
+                    out[2 * k + 1] = (int32_t) sp.group_index;
+                }
+                cursor += sp.count;
+            }
+            // Tail rows after the last span.
+            for (; cursor < n_entries; ++cursor) {
                 st_entries[2 * cursor + 0] = (int32_t) layout.entries[cursor].key_index;
                 st_entries[2 * cursor + 1] = (int32_t) layout.entries[cursor].group_index;
             }
-            // Span rows: ascending run range with one group (branchless
-            // inner loop — vectorizes to two interleaved stores).
-            int32_t * out = st_entries.data() + 2 * (size_t) sp.entry_index;
-            for (uint32_t k = 0; k < sp.count; ++k) {
-                out[2 * k + 0] = (int32_t) (sp.key_start + k);
-                out[2 * k + 1] = (int32_t) sp.group_index;
-            }
-            cursor += sp.count;
-        }
-        // Tail rows after the last span.
-        for (; cursor < n_entries; ++cursor) {
-            st_entries[2 * cursor + 0] = (int32_t) layout.entries[cursor].key_index;
-            st_entries[2 * cursor + 1] = (int32_t) layout.entries[cursor].group_index;
         }
     }
 
@@ -1123,7 +1242,22 @@ void llm_graph_input_attn_rerot::fill_spans(
             upload_at_offset_or_fallback(q_pos, chunk, (size_t) k * group_cap * sizeof(int32_t), n_groups * sizeof(int32_t));
         }
     }
-    upload_tensor_snapshot_or_fallback(entries,   st_entries.data(),   ent_bytes);
+    if (gpu_span_expand) {
+        // Upload compact descriptors only; entries filled by expand op.
+        if (baked_n_spans > 0) {
+            upload_tensor_snapshot_or_fallback(
+                t_spans, st_spans.data(), st_spans.size() * sizeof(uint32_t));
+        }
+        upload_tensor_snapshot_or_fallback(
+            t_prefix, st_prefix.data(), st_prefix.size() * sizeof(uint32_t));
+        if (baked_n_spill > 0) {
+            upload_tensor_snapshot_or_fallback(
+                t_spill, st_spill.data(), (size_t) baked_n_spill * 2 * sizeof(int32_t));
+        }
+        GGML_UNUSED(ent_bytes);
+    } else {
+        upload_tensor_snapshot_or_fallback(entries, st_entries.data(), ent_bytes);
+    }
     upload_tensor_snapshot_or_fallback(offsets,   st_offsets.data(),   off_bytes);
     if (full_upload) {
         zeroed_capacity = cap_now;
@@ -4554,34 +4688,88 @@ ggml_tensor * llm_graph_context::build_rerot_q_groups(
     const int64_t heads = q_raw->ne[1];
     const int64_t groups = inp->get_rerot_q_indices()->ne[0];
 
-    // P2 evidence: the Q-prep region (GET_ROWS gather + effective-position
-    // RoPE below) processes the full bucketed group capacity, not the live
-    // group count. Count here — the single site where the padded rows are
-    // actually computed — so q_prep_rows vs live_groups quantifies the
-    // fill waste the fused live-row Q-prep candidate would remove. No-op
-    // when LLAMA_REROT_PROFILE is unset.
-    if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
-        prof->q_prep_rows.fetch_add((uint64_t) groups * (uint64_t) heads, std::memory_order_relaxed);
-    }
-
-    ggml_tensor * q_flat = ggml_reshape_2d(ctx0, q_raw, head_dim * heads, n_tokens);
-    ggml_tensor * q_grouped = ggml_get_rows(ctx0, q_flat, inp->get_rerot_q_indices());
-    q_grouped = ggml_reshape_3d(ctx0, q_grouped, head_dim, heads, groups);
-    cb(q_grouped, "rerot_q_grouped_raw", il);
+    // R02: env-gated fused live gather+RoPE (ggml_rerot_q_prep). Default
+    // remains get_rows + rope over the capacity-padded bucket. Opt-in via
+    // LLAMA_REROT_GPU_Q_PREP=1 for supported text RoPE modes only (VISION
+    // stays on the old chain). Not default-enabled.
+    static const bool gpu_q_prep_env = [] {
+        const char * e = getenv("LLAMA_REROT_GPU_Q_PREP");
+        return e && strcmp(e, "1") == 0;
+    }();
 
     const int mode = static_cast<int>(rope_type);
-    if (mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE || mode == GGML_ROPE_TYPE_VISION) {
-        GGML_ASSERT(sections != nullptr);
-        q_grouped = ggml_rope_multi(
-            ctx0, q_grouped, inp->get_rerot_q_pos(), freq_factors,
-            n_rot, sections, mode, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-    } else {
-        q_grouped = ggml_rope_ext(
-            ctx0, q_grouped, inp->get_rerot_q_pos(), freq_factors,
-            n_rot, mode, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
+    // capacity = q_indices bucket width; active prefers live layout count,
+    // else capacity (safe no-poison: every row is treated live).
+    const int64_t capacity = groups;
+    int32_t active = (int32_t) capacity;
+    if (const auto * attn_ctx = inp->mctx) {
+        active = (int32_t) attn_ctx->get_rerot_attn_layout().groups.size();
     }
+
+    const auto supported = llama_rerot_q_prep_supported_modes();
+    const bool mode_supported =
+        std::find(supported.begin(), supported.end(), mode) != supported.end();
+
+    const char * skip_reason = nullptr;
+    if (!gpu_q_prep_env) {
+        skip_reason = "LLAMA_REROT_GPU_Q_PREP!=1";
+    } else if (!mode_supported) {
+        skip_reason = "unsupported rope mode";
+    } else if (active < 0 || (int64_t) active > capacity) {
+        skip_reason = "active/capacity contract violated";
+    }
+
+    if (skip_reason != nullptr) {
+        // Log once per distinct reason so default builds stay quiet after
+        // the first fallback explanation.
+        static bool logged_env = false;
+        static bool logged_mode = false;
+        static bool logged_contract = false;
+        bool * flag = !gpu_q_prep_env ? &logged_env
+                     : !mode_supported ? &logged_mode
+                     : &logged_contract;
+        if (!*flag) {
+            LLAMA_LOG_INFO("%s: fused ggml_rerot_q_prep skipped (%s); using get_rows+rope\n",
+                          __func__, skip_reason);
+            *flag = true;
+        }
+
+        // P2 evidence: GET_ROWS+RoPE over the full capacity bucket.
+        if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+            prof->q_prep_rows.fetch_add((uint64_t) capacity * (uint64_t) heads, std::memory_order_relaxed);
+        }
+
+        ggml_tensor * q_flat = ggml_reshape_2d(ctx0, q_raw, head_dim * heads, n_tokens);
+        ggml_tensor * q_grouped = ggml_get_rows(ctx0, q_flat, inp->get_rerot_q_indices());
+        q_grouped = ggml_reshape_3d(ctx0, q_grouped, head_dim, heads, capacity);
+        cb(q_grouped, "rerot_q_grouped_raw", il);
+
+        if (mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE || mode == GGML_ROPE_TYPE_VISION) {
+            GGML_ASSERT(sections != nullptr);
+            q_grouped = ggml_rope_multi(
+                ctx0, q_grouped, inp->get_rerot_q_pos(), freq_factors,
+                n_rot, sections, mode, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        } else {
+            q_grouped = ggml_rope_ext(
+                ctx0, q_grouped, inp->get_rerot_q_pos(), freq_factors,
+                n_rot, mode, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        }
+        cb(q_grouped, "rerot_q_grouped", il);
+        return q_grouped;
+    }
+
+    // Fused live-row path: physical output stride stays capacity; work is
+    // active-prefix only; inactive tail is NaN-poisoned by the op.
+    if (llama_rerot_profile * prof = llama_rerot_profile_active()) {
+        prof->q_prep_rows.fetch_add((uint64_t) active * (uint64_t) heads, std::memory_order_relaxed);
+    }
+
+    ggml_tensor * q_grouped = ggml_rerot_q_prep(
+        ctx0, q_raw, inp->get_rerot_q_indices(), inp->get_rerot_q_pos(), freq_factors,
+        active, (int) n_rot, sections, mode, n_ctx_orig,
+        freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
     cb(q_grouped, "rerot_q_grouped", il);
     return q_grouped;
 }

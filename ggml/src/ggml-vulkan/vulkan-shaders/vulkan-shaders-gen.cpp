@@ -939,6 +939,13 @@ void process_shaders() {
     // RERoT compact span expansion: spans + prefix + spill -> dense entries
     string_to_spv("rerot_span_expand", "rerot_span_expand.comp", {});
 
+    // RERoT Q prep: gather live Q + RoPE into capacity-strided F32 (poison inactive)
+    string_to_spv("rerot_q_prep", "rerot_q_prep.comp", {});
+
+    // C10 / Q3 prototype: two-reader shared KV tile (compile + CPU golden).
+    // Not production flash_attn_rerot; host dispatch remains opt-in/off.
+    string_to_spv("rerot_shared_kv_2reader", "rerot_shared_kv_2reader.comp", {});
+
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
     string_to_spv("flash_attn_sparse_compact", "flash_attn_sparse_compact.comp", {});
 

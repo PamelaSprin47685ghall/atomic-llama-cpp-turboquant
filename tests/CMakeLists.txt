@@ -212,12 +212,20 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-rerot-view PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-rerot-span-expand.cpp)
     target_include_directories(test-rerot-span-expand PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    llama_build_and_test(test-rerot-q-prep.cpp)
+    target_include_directories(test-rerot-q-prep PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test-rerot-q-prep PRIVATE ggml-base llama)
     llama_build_and_test(test-rerot-ddvr.cpp)
     target_include_directories(test-rerot-ddvr PRIVATE ${PROJECT_SOURCE_DIR}/src)
     llama_build_and_test(test-rerot-math.cpp)
     llama_build_and_test(test-rerot-shared-block.cpp)
     target_include_directories(test-rerot-shared-block PRIVATE ${PROJECT_SOURCE_DIR}/src)
     target_link_libraries(test-rerot-shared-block PRIVATE ggml-base)
+    # C10 / Q3 two-reader shared-KV prototype: CPU golden + optional glslc;
+    # GPU dispatch deferred (skips cleanly when no device). No 5-GPU requirement.
+    llama_build_and_test(test-rerot-q3-shared-kv-2reader.cpp)
+    target_include_directories(test-rerot-q3-shared-kv-2reader PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test-rerot-q3-shared-kv-2reader PRIVATE ggml-base)
     target_include_directories(test-rerot-math PRIVATE ${PROJECT_SOURCE_DIR}/src)
     # [Q7] F32 gate compares against ggml's own PQ2_0 block layout/decode
     # (ggml-common.h / ggml-quants.c pointers are declared there).

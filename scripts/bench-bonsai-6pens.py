@@ -7,7 +7,7 @@ import time
 import urllib.request
 import urllib.error
 
-def request_json(url, payload, timeout=300.0):
+def request_json(url, payload, timeout=600.0):
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode('utf-8'),
@@ -39,22 +39,20 @@ def fetch_metrics(base_url, timeout=5.0):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:18089")
-    parser.add_argument("--timeout", type=float, default=300.0)
+    parser.add_argument("--timeout", type=float, default=600.0)
     args = parser.parse_args()
 
     endpoint = f"{args.base_url.rstrip('/')}/v1/chat/completions"
 
-    # 6-lane independent task DAG prompt
     prompt = (
-        "Decompose into DAG of 6 independent questions: "
-        "Question A: What is 25 * 12? "
-        "Question B: What is 15 * 16? "
-        "Question C: What is 14 * 15? "
-        "Question D: What is 30 * 20? "
-        "Question E: What is 12 * 12? "
-        "Question F: What is 20 * 20? "
-        "Synthesize the total sum of A + B + C + D + E + F. "
-        "Answer with the plain text final result only without invoking tools."
+        "Decompose into DAG of 6 independent sub-questions: "
+        "Question 1: compute 1 * 10. "
+        "Question 2: compute 2 * 10. "
+        "Question 3: compute 3 * 10. "
+        "Question 4: compute 4 * 10. "
+        "Question 5: compute 5 * 10. "
+        "Question 6: compute 6 * 10. "
+        "Synthesize the total sum of all 6 values. Output the final numerical sum."
     )
 
     base_payload = {
@@ -64,7 +62,7 @@ def main():
         ],
         "temperature": 0.0,
         "seed": 424242,
-        "max_tokens": 4096,
+        "max_tokens": 512,
         "stream": False,
     }
 
@@ -73,8 +71,7 @@ def main():
     print("==================================================================")
 
     # 1. RERoT OFF Baseline
-    print("
->>> [1/2] Running Baseline: RERoT OFF (Single-stream)...")
+    print("\n>>> [1/2] Running Baseline: RERoT OFF (Single-stream)...")
     payload_off = dict(base_payload)
     payload_off["rerot"] = False
     payload_off["rerot_trace"] = False
@@ -95,14 +92,13 @@ def main():
     print(f"  End-to-end TPS   : {(pred_n_off / dur_off):.2f} tok/s")
     print(f"  Output snippet   : {content_off[:120]}...")
 
-    # Cooldown pause
     time.sleep(2.0)
 
     # 2. RERoT ON (6 Pens)
-    print("
->>> [2/2] Running RERoT ON (P=6 Adaptive Multi-Lane)...")
+    print("\n>>> [2/2] Running RERoT ON (P=6 Adaptive Multi-Lane)...")
     payload_on = dict(base_payload)
     payload_on["rerot"] = True
+    payload_on["rerot_frontier"] = "strong"
     payload_on["rerot_trace"] = False
 
     m_before_on = fetch_metrics(args.base_url)
@@ -115,7 +111,6 @@ def main():
 
     content_on = resp_on["choices"][0]["message"]["content"].strip()
 
-    # Prometheus metrics delta for parallel tokens
     d_par_tok = m_after_on.get("rerot_parallel_model_tokens", 0.0) - m_before_on.get("rerot_parallel_model_tokens", 0.0)
     d_par_sec = m_after_on.get("rerot_parallel_seconds", 0.0) - m_before_on.get("rerot_parallel_seconds", 0.0)
     d_tot_tok = m_after_on.get("rerot_completed_model_tokens", 0.0) - m_before_on.get("rerot_completed_model_tokens", 0.0)
@@ -133,9 +128,7 @@ def main():
         print(f"  RERoT Parallel   : {par_tps:.2f} tok/s")
     print(f"  Output snippet   : {content_on[:120]}...")
 
-    # Summary
-    print("
-==================================================================")
+    print("\n==================================================================")
     print("                      Benchmark Comparison Summary                ")
     print("==================================================================")
     speedup_wall = dur_off / dur_on if dur_on > 0 else 0.0

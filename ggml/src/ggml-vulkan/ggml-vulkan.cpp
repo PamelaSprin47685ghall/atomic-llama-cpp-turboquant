@@ -1266,6 +1266,11 @@ struct vk_device_struct {
     vk_pipeline pipeline_rwkv_wkv6_f32;
     vk_pipeline pipeline_rwkv_wkv7_f32;
     vk_pipeline pipeline_rerot_span_expand;
+    // RERoT fused Q-prep (gather+RoPE+NaN poison). Opt-in via LLAMA_REROT_GPU_Q_PREP=1.
+    vk_pipeline pipeline_rerot_q_prep;
+    // C10 / Q3 two-reader shared-KV prototype (shader compile registration).
+    // Not dispatched from production graphs; see rerot_shared_kv_2reader.comp.
+    vk_pipeline pipeline_rerot_shared_kv_2reader;
     vk_pipeline pipeline_gated_linear_attn_f32;
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
@@ -7475,6 +7480,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     // RERoT span expand: 4 bindings, 8B push constants {n_spans, n_entries}, 256 local_size
     ggml_vk_create_pipeline(device, device->pipeline_rerot_span_expand, "rerot_span_expand", rerot_span_expand_len, rerot_span_expand_data, "main", 4, 2 * sizeof(uint32_t), {256, 1, 1}, {}, 1);
+
+    // RERoT Q prep: 5 bindings, 80B push constants, local_size=64
+    // Opt-in only (supports_op gated by LLAMA_REROT_GPU_Q_PREP=1).
+    ggml_vk_create_pipeline(device, device->pipeline_rerot_q_prep, "rerot_q_prep", rerot_q_prep_len, rerot_q_prep_data, "main", 5, 80, {64, 1, 1}, {}, 1);
+
+    // C10 / Q3 two-reader shared KV prototype: 4 bindings, 20B push constants,
+    // local_size=1 (serial correctness stub). Not used by production graphs.
+    ggml_vk_create_pipeline(device, device->pipeline_rerot_shared_kv_2reader, "rerot_shared_kv_2reader",
+                            rerot_shared_kv_2reader_len, rerot_shared_kv_2reader_data, "main",
+                            4, 5 * sizeof(uint32_t), {1, 1, 1}, {}, 1);
 
     // XKV dual-source indexed attention: 11 bindings, 112B push constants, one dispatch per KV head.
     ggml_vk_create_pipeline(device, device->pipeline_xkv_attention, "xkv_attention", xkv_attention_len, xkv_attention_data, "main", 11, 112, {1, 1, 1}, {}, 1);
@@ -17913,6 +17928,104 @@ static void ggml_vk_rerot_span_expand(ggml_backend_vk_context * ctx, vk_context 
     ggml_vk_sync_buffers(ctx, subctx);
 }
 
+// Push layout must match rerot_q_prep.comp (80 bytes).
+struct vk_op_rerot_q_prep_push {
+    uint32_t n_active; // matches shader; avoid GLSL reserved word `active`
+    uint32_t capacity;
+    uint32_t heads;
+    uint32_t head_dim;
+    uint32_t n_rot;
+    uint32_t n_tokens;
+    uint32_t rope_mode;
+    uint32_t has_ff;
+    uint32_t n_pos;
+    float    freq_scale;
+    float    freq_base;
+    float    ext_factor;
+    float    attn_factor;
+    float    corr_dims[2];
+    float    theta_scale;
+    int32_t  sections[4];
+};
+static_assert(sizeof(vk_op_rerot_q_prep_push) == 80, "rerot_q_prep push must be 80B");
+
+static void ggml_vk_rerot_q_prep(ggml_backend_vk_context * ctx, vk_context & subctx,
+        const ggml_tensor * q_raw, const ggml_tensor * q_indices, const ggml_tensor * q_pos,
+        const ggml_tensor * freq_factors, ggml_tensor * dst) {
+    const int32_t active     = ((const int32_t *) dst->op_params)[0];
+    const int     n_dims     = ((const int32_t *) dst->op_params)[1];
+    const int     mode       = ((const int32_t *) dst->op_params)[2];
+    const int     n_ctx_orig = ((const int32_t *) dst->op_params)[4];
+    const float   freq_base  = ((const float *)   dst->op_params)[5];
+    const float   freq_scale = ((const float *)   dst->op_params)[6];
+    const float   ext_factor = ((const float *)   dst->op_params)[7];
+    const float   attn_factor= ((const float *)   dst->op_params)[8];
+    const float   beta_fast  = ((const float *)   dst->op_params)[9];
+    const float   beta_slow  = ((const float *)   dst->op_params)[10];
+
+    int sections[4] = {};
+    if (mode & GGML_ROPE_TYPE_MROPE) {
+        memcpy(sections, (const int32_t *) dst->op_params + 11, sizeof(int) * 4);
+    }
+
+    float corr_dims[2];
+    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+    const float theta_scale = powf(freq_base, -2.0f / (float) n_dims);
+
+    const uint32_t capacity = (uint32_t) q_indices->ne[0];
+    const uint32_t heads    = (uint32_t) q_raw->ne[1];
+    const uint32_t head_dim = (uint32_t) q_raw->ne[0];
+    const uint32_t n_tokens = (uint32_t) q_raw->ne[2];
+    const bool mrope_used   = (mode & GGML_ROPE_TYPE_MROPE) != 0;
+    const uint32_t has_ff   = freq_factors != nullptr ? 1u : 0u;
+
+    vk_op_rerot_q_prep_push pc {};
+    pc.n_active    = (uint32_t) active;
+    pc.capacity    = capacity;
+    pc.heads       = heads;
+    pc.head_dim    = head_dim;
+    pc.n_rot       = (uint32_t) n_dims;
+    pc.n_tokens    = n_tokens;
+    pc.rope_mode   = (uint32_t) mode;
+    pc.has_ff      = has_ff;
+    pc.n_pos       = mrope_used ? 4u : 1u;
+    pc.freq_scale  = freq_scale;
+    pc.freq_base   = freq_base;
+    pc.ext_factor  = ext_factor;
+    pc.attn_factor = attn_factor;
+    pc.corr_dims[0] = corr_dims[0];
+    pc.corr_dims[1] = corr_dims[1];
+    pc.theta_scale = theta_scale;
+    pc.sections[0] = sections[0];
+    pc.sections[1] = sections[1];
+    pc.sections[2] = sections[2];
+    pc.sections[3] = sections[3];
+
+    vk_pipeline pipeline = ctx->device->pipeline_rerot_q_prep;
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer q_raw_buf = ggml_vk_tensor_subbuffer(ctx, q_raw, false);
+    vk_subbuffer idx_buf   = ggml_vk_tensor_subbuffer(ctx, q_indices, false);
+    vk_subbuffer pos_buf   = ggml_vk_tensor_subbuffer(ctx, q_pos, false);
+    // When has_ff=0 the shader must not read FF; still bind a live buffer.
+    vk_subbuffer ff_buf    = has_ff
+        ? ggml_vk_tensor_subbuffer(ctx, freq_factors, false)
+        : q_raw_buf;
+    vk_subbuffer dst_buf   = ggml_vk_tensor_subbuffer(ctx, dst, false);
+
+    const uint32_t n_inv = capacity * heads;
+    std::array<uint32_t, 3> elements = { 64, 1, 1 };
+    if (n_inv > 0) {
+        elements[0] = CEIL_DIV(n_inv, 64u) * 64u;
+    }
+
+    ggml_vk_sync_buffers(ctx, subctx);
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { q_raw_buf, idx_buf, pos_buf, ff_buf, dst_buf }, pc, elements);
+    ggml_vk_sync_buffers(ctx, subctx);
+}
+
 // XKV selected-row factor reconstruction: single dispatch per op, code streams
 // stay device-resident. Host validates shapes/fingerprints via
 // ggml_xkv_reconstruct_supports(); bounds poison NaN in-shader (no host mirror).
@@ -21298,6 +21411,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_REROT_SPAN_EXPAND:
         ggml_vk_rerot_span_expand(ctx, compute_ctx, src0, src1, src2, node);
 
+        break;
+    case GGML_OP_REROT_Q_PREP:
+        ggml_vk_rerot_q_prep(ctx, compute_ctx, src0, src1, src2, node->src[3], node);
         break;
 
     case GGML_OP_FLASH_ATTN_EXT:
@@ -26510,6 +26626,25 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                        op->src[2] && op->src[2]->type == GGML_TYPE_I32 &&
                        op->type == GGML_TYPE_I32;
             }
+        case GGML_OP_REROT_Q_PREP:
+            {
+                // Default OFF. Opt-in only when env is exactly "1".
+                static const bool enabled = (getenv("LLAMA_REROT_GPU_Q_PREP") && strcmp(getenv("LLAMA_REROT_GPU_Q_PREP"), "1") == 0);
+                if (!enabled) return false;
+                if (!op->src[0] || !op->src[1] || !op->src[2]) return false;
+                if (op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32) return false;
+                if (op->src[1]->type != GGML_TYPE_I32 || op->src[2]->type != GGML_TYPE_I32) return false;
+                if (!ggml_is_contiguous(op->src[0]) || !ggml_is_contiguous(op->src[1]) || !ggml_is_contiguous(op->src[2])) return false;
+                if (op->src[3] && (op->src[3]->type != GGML_TYPE_F32 || !ggml_is_contiguous(op->src[3]))) return false;
+                const int mode = ((const int32_t *) op->op_params)[2];
+                if (!(mode == GGML_ROPE_TYPE_NORMAL ||
+                      mode == GGML_ROPE_TYPE_NEOX   ||
+                      mode == GGML_ROPE_TYPE_MROPE  ||
+                      mode == GGML_ROPE_TYPE_IMROPE)) {
+                    return false;
+                }
+                return true;
+            }
         case GGML_OP_IM2COL:
             return ggml_is_contiguous(op->src[1])
                 && op->src[1]->type == GGML_TYPE_F32
@@ -28368,10 +28503,33 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                 }
             }
         } else if (tensor->op == GGML_OP_REROT_SPAN_EXPAND) {
-            tensor_clone = ggml_rerot_span_expand(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], tensor->ne[1]);
+            tensor_clone = ggml_rerot_span_expand(
+                ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                ggml_get_op_params_i32(tensor, 0),
+                ggml_get_op_params_i32(tensor, 1));
             tensor_clone->op_params[0] = tensor->op_params[0];
             tensor_clone->op_params[1] = tensor->op_params[1];
             tensor_clone->op_params[2] = tensor->op_params[2];
+        } else if (tensor->op == GGML_OP_REROT_Q_PREP) {
+            const int32_t active = tensor->op_params[0];
+            const int n_dims    = tensor->op_params[1];
+            const int mode      = tensor->op_params[2];
+            const int n_ctx_orig = tensor->op_params[4];
+            float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+            int sections[GGML_MROPE_SECTIONS];
+            memcpy(&freq_base,   tensor->op_params +  5, sizeof(float));
+            memcpy(&freq_scale,  tensor->op_params +  6, sizeof(float));
+            memcpy(&ext_factor,  tensor->op_params +  7, sizeof(float));
+            memcpy(&attn_factor, tensor->op_params +  8, sizeof(float));
+            memcpy(&beta_fast,   tensor->op_params +  9, sizeof(float));
+            memcpy(&beta_slow,   tensor->op_params + 10, sizeof(float));
+            memcpy(sections,     tensor->op_params + 11, sizeof(int) * GGML_MROPE_SECTIONS);
+            tensor_clone = ggml_rerot_q_prep(
+                ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3],
+                active, n_dims, sections, mode, n_ctx_orig,
+                freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+            // Preserve full packed op_params (15 ints) including any host-side tweaks.
+            memcpy(tensor_clone->op_params, tensor->op_params, sizeof(int32_t) * 15);
         } else if (tensor->op == GGML_OP_FLASH_PREFILL_POOL) {
             ggml_vk_fp_params pp;
             GGML_ASSERT(ggml_vk_fp_unpack_params(tensor, FP_OP_POOL, pp));

@@ -37,7 +37,19 @@
       "blocked_scope": null,
       "blocker_evidence": null,
       "unblock_condition": null,
-      "evidence_paths": [],
+      "evidence_paths": [
+        "ggml/src/ggml-vulkan/vulkan-shaders/rerot_q_prep.comp",
+        "ggml/include/ggml.h",
+        "ggml/src/ggml.c",
+        "ggml/src/ggml-cpu/ops.cpp",
+        "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+        "src/llama-graph.cpp",
+        "src/llama-rerot-math.cpp",
+        "src/llama-rerot-math.h",
+        "tests/test-rerot-math.cpp",
+        "tests/test-rerot-q-prep.cpp",
+        "tests/CMakeLists.txt"
+      ],
       "full_task_card": "**来源：附件第一部分缺口一。入口：** `src/llama-graph.cpp::build_rerot_q_groups`，Vulkan 算子注册／dispatch／shader 生成；`rerot_q_prep.comp` 为建议新增文件。\n\n**实现次序：** ① 定义 raw Q、query-index、effective_pos、n_live、capacity、head_dim/heads、RoPE mode/frequency 的 CPU 契约；② 先实现 live gather+RoPE，不同时重写 WHT；③ 物理输出 stride 保持 capacity，工作量以 active 派发，尾块线程只能做必要掩码；④ 核验所有消费者不读 inactive 输出，调试时用毒值检测；⑤ 再评估 WHT 融合，不能把 RoPE 与 WHT 顺序交换。\n\n**必测：** live=0 的可表达空任务／拒绝语义、1、cap−1、cap、cap+1 拒绝；head dim 非整 tile；非连续 Q；重复 query index；MROPE/IMROPE/普通 RoPE；大 effective position；不同 freq_factors。复用 `test-rerot-ddvr`、`test-rerot-attn`；新增实际 Vulkan Q-prep 对拍和 replay 1→4→1→2。\n\n**交付证据：** 同一数值模式下输出对旧链的 atol/rtol；实际处理行、dispatch 和 GPU 时间；kernel 真命中。2%/15% 只能是可调投资阈值，不能把填充行比直接当总耗时比，也不能因此不写候选。未知 mode 提交前走旧链并记录原因。"
     },
     {
@@ -59,7 +71,9 @@
       "blocked_scope": null,
       "blocker_evidence": null,
       "unblock_condition": null,
-      "evidence_paths": [],
+      "evidence_paths": [
+        "PLAN/fixtures/r07-small-batch-shapes.json"
+      ],
       "full_task_card": "**来源：附件第一部分缺口二。入口：** `ggml-vulkan.cpp` 的投影 supports_op／recipe、现有投影 shader 与 quant block helpers。\n\n**实现次序：** ① 用当前真实权重格式构造 b=1,2,3,4,6 形状；② 输出可执行的拒绝原因矩阵，不只汇总 unsupported_shape；③ 从 b=2/4 的共享 weight-tile 路径开始，扩展3/6尾块；④ PQ2_0 每块128元素，scale、编码、打包偏移沿用当前定义；⑤ 定义期选择 GEMV、小矩阵或旧路径，热循环不在线 autotune。\n\n**必测：** K/M 边界、128块边界、尾部、非零 tensor offset、非均匀 TP head map、四个实际量化码值。独立解码+dot oracle；不得用同一个打包 helper 自测自证全部正确。加 b=1 回归与实际 recipe hit。\n\n**收益账：** 单行延迟、整批延迟、每个有效行成本、权重读取／解码次数、VGPR/LDS。b=6 是本算子支持范围，不自动扩大 LateBind 的容量4限制。Q7 LUT 等本路径有矩阵级基线后再比较。"
     },
     {
@@ -147,7 +161,19 @@
       "blocked_scope": null,
       "blocker_evidence": null,
       "unblock_condition": null,
-      "evidence_paths": [],
+      "evidence_paths": [
+        "ggml/src/ggml-vulkan/vulkan-shaders/rerot_span_expand.comp",
+        "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+        "ggml/include/ggml.h",
+        "ggml/src/ggml.c",
+        "ggml/src/ggml-cpu/ops.cpp",
+        "src/llama-graph.cpp",
+        "src/llama-graph.h",
+        "src/llama-rerot.h",
+        "src/llama-rerot.cpp",
+        "tests/test-rerot-span-expand.cpp",
+        "tests/test-rerot-view.cpp"
+      ],
       "full_task_card": "**来源：附件第一部分缺口六。入口：** `llama-rerot.h`、`llama-graph.cpp::fill_spans`、`ggml_flash_attn_ext_rerot`、CPU/Vulkan 后端。\n\n**R13-A（优先）：** 保留 attention 的 dense entries 消费，新增版本化 compact 描述输入；CPU 只上传 spans+必要spill；GPU 用小展开 kernel 生成当前 epoch 的 entries，供布局相同的层复用。展开结果按 layout身份／epoch管理，不能跨不同层布局盲目复用。这个桥接阶段不同时重写复杂 attention。\n\n**R13-B（后续）：** 在同一 ABI 上增加原生 span 消费的 attention 变体，再去掉完整 entries 物化。CPU fallback／外部旧调用保留真实兼容路径，不让两份描述成为各自独立的权威。\n\n**契约与必测：** `{key_start,count,group_index,entry_index}` 各字段范围及乘加溢出；span单调且不重叠；gap／spill必须有权威来源；重复 storage、多query、部分 ownership、SWA／ring wrap、zero count、乱序拒绝。expanded stream 逐slot等于既有 entries oracle。展开→attention 的计算读写依赖必须显式满足【K3】。\n\n**收益账：** Host生成、staging、上传、GPU展开、attention和总请求分别计时。记录上传字节与span覆盖率，而不是固定“几十字节”。不能在 R13-A 前删除旧 entries 发射；覆盖不足时允许显式 dense fallback。"
     },
     {
@@ -169,7 +195,11 @@
       "blocked_scope": null,
       "blocker_evidence": null,
       "unblock_condition": null,
-      "evidence_paths": [],
+      "evidence_paths": [
+        "PLAN/experiment-queue/pending-packs/r14-tm5-c06-span-expand-abba.json",
+        "PLAN/experiment-queue/pending-packs/r14-tm5-c08-q-prep-abba.json",
+        "scripts/test-pending-abba-packs-mock.py"
+      ],
       "full_task_card": "**来源：附件第一部分缺口七。入口：** `rerot-throughput-gate.py`、semantic smoke、DAG reference、多Lane请求脚本。\n\n**实现次序：** ① 完成第2.4节全部脚本修复及反例单测；② 分开“旧实现 vs 新实现”的同工作负载对照与“串行DAG vs 并行DAG”对照；③ 固定模型、数值模式、可见性规则、输出预算和采样配置；④ 配对记录全部请求与route；⑤ 分开 Target-only、MTP、全特性组合。\n\n**必测拓扑：** Flat、链加独立节点、Diamond；STRONG/LAG1；W=P 与 W>P；固定入口／prefix rebuild／synthesis；取消和重复请求。完成相同DAG才比较任务墙钟，内部生成更多 token 不能自动当用户更快。\n\n**交付：** 每一轮语义合格、任务完成时间、最终有用token、内部forward token、首token、p50/p95与完整原始数据。全特性设置但route未命中，结论只能是 not-exercised。与 TM5 共用验证框架，但不混用模型基线。"
     },
     {
@@ -191,7 +221,10 @@
       "blocked_scope": null,
       "blocker_evidence": null,
       "unblock_condition": null,
-      "evidence_paths": [],
+      "evidence_paths": [
+        "PLAN/fixtures/t1c-transport-enum.json",
+        "scripts/test-t1c-publish-order-mock.py"
+      ],
       "full_task_card": "**来源：附件第二部分缺口一。入口：** `ggml-vulkan-collective.cpp`、LateBind sidecar生产者、publisher与CPU reduce路径。\n\n**实现次序：** ① 把三种传输选项落实为定义期不可变选项；② 固定相同Q8Packed算术、F16/F32 sidecar格式、rank/active、输入、数值模式；③ 记录每rank producer完成、ready可见、CPU读取/归约、下行发布、下一消费者真正开跑；④ 按当前LateBind准入使用RELAY/F32/5rank，或明确这是另一个实验模式。\n\n**必测：** payload→ready 的发布顺序、generation、环槽复用、延迟rank、缺失ready、CPU读取格式、错误路径。host-imported不自动代表L3命中，BAR映射不自动代表廉价、cache coherent也不免除执行依赖；实际内存属性与协议要记录。\n\n**裁决：** 比端到端关键路径而不是publisher dispatch数。首版按机型和层组固化胜出方案，不做每token动态三选一。传输候选的生命周期和下行同步不应同时重写；否则无法归因。"
     },
     {
@@ -345,7 +378,16 @@
       "blocked_scope": null,
       "blocker_evidence": null,
       "unblock_condition": null,
-      "evidence_paths": [],
+      "evidence_paths": [
+        "ggml/src/ggml-vulkan/vulkan-shaders/rerot_shared_kv_2reader.comp",
+        "ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp",
+        "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+        "tests/test-rerot-q3-shared-kv-2reader.cpp",
+        "tests/test-rerot-math.cpp",
+        "tests/test-rerot-shared-block.cpp",
+        "src/llama-rerot-math.h",
+        "src/llama-rerot-math.cpp"
+      ],
       "full_task_card": "**来源：附件第三部分缺口九。入口：** `flash_attn_rerot.comp`、RERoT dispatch，`test-rerot-shared-block.cpp` oracle。\n\n**实现次序：** ① 先做2个Reader一个workgroup／cohort，再比较4；② 公共KV tile一次载入，为每个合法Reader消费各自已预处理的effective Q，并计算独立的局部在线softmax状态；③ 私有／不完全共享段继续走独立路径；④ 用同一query的 `(m,z,u)` 精确组合公共与私有块；⑤ 集成R13后才探索span原生遍历。12个Reader不等于强塞12个完整累积向量到一个workgroup。\n\n**合并式：** `m=max(m1,m2)`；`z=exp(m1-m)z1+exp(m2-m)z2`；`u=exp(m1-m)u1+exp(m2-m)u2`；最后`o=u/z`。两个空块／全mask边界单独按既有语义处理，避免 `-inf - -inf` 生成NaN。不能先把每块输出各自归一化再直接相加。\n\n**必测：** Reader可见集部分相交／互不相交；STRONG/LAG1；private/pending与future-frontier；不同effective_pos；GQA非均匀映射；极端logit；sink／softcap等真实算子参数；空块；一块只对一个Reader可见。比较实际GPU输出，不只跑CPU参考。\n\n**收益账：** KV读取、LDS/VGPR/spill、occupancy相关统计和完整attention时间。CPU的1.36–1.97×不能承诺GPU同倍数。Hydragen证明共享prefix的精确注意力可以复用数据供给，但不能直接证明本仓库任意可见性／DDVR／RDNA2组合的收益【P1】。"
     },
     {

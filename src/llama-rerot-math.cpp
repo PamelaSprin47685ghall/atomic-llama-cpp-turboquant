@@ -1059,14 +1059,15 @@ void qprep_rope_cache(
 void qprep_rotate_normal(
         const std::vector<float> & cache, int64_t n_dims, int64_t n_rot,
         int64_t stride, float * vec) {
-    // NORMAL (LLaMA): pairs (i, i + n_rot/2) for i in [0, n_rot/2).
-    for (int64_t i = 0; i < n_rot / 2; ++i) {
-        const float x = vec[i * stride];
-        const float y = vec[(i + n_rot / 2) * stride];
-        const float c = cache[2 * i + 0];
-        const float s = cache[2 * i + 1];
-        vec[i * stride]             = x * c - y * s;
-        vec[(i + n_rot / 2) * stride] = x * s + y * c;
+    // NORMAL (LLaMA / ggml GGML_ROPE_TYPE_NORMAL): adjacent pairs (i, i+1)
+    // with cache indexed at the same even offsets (rotate_pairs scale=1).
+    for (int64_t i0 = 0; i0 < n_rot; i0 += 2) {
+        const float x = vec[i0 * stride];
+        const float y = vec[(i0 + 1) * stride];
+        const float c = cache[size_t(i0) + 0];
+        const float s = cache[size_t(i0) + 1];
+        vec[i0 * stride]       = x * c - y * s;
+        vec[(i0 + 1) * stride] = x * s + y * c;
     }
     (void) n_dims;
 }
@@ -1094,7 +1095,8 @@ std::vector<int> llama_rerot_q_prep_supported_modes() {
     // R02 candidate support table (single source for the future Vulkan
     // dispatch gate): VISION is explicitly NOT supported (text-only v1,
     // matching build_rerot_q_groups' require_supported gate).
-    return { 0 /* NORMAL */, 2 /* NEOX */, 8 /* MROPE */, 24 /* IMROPE */ };
+    // Align with ggml.h: NORMAL=0, NEOX=2, MROPE=8, IMROPE=40; VISION=24 rejected.
+    return { 0 /* NORMAL */, 2 /* NEOX */, 8 /* MROPE */, 40 /* IMROPE */ };
 }
 
 std::vector<float> llama_rerot_q_prep_reference(
@@ -1114,17 +1116,17 @@ std::vector<float> llama_rerot_q_prep_reference(
     if (c.n_pos != 1 && c.n_pos != 4) {
         invalid_arg("RERoT q-prep reference: n_pos must be 1 or 4");
     }
-    const bool multi_coord = c.rope_mode == 8 /* MROPE */ || c.rope_mode == 24 /* IMROPE */;
+    const bool multi_coord = c.rope_mode == 8 /* MROPE */ || c.rope_mode == 40 /* IMROPE */;
     if (multi_coord && c.n_pos != 4) {
         invalid_arg("RERoT q-prep reference: MROPE/IMROPE require n_pos == 4");
     }
     if (!multi_coord && c.n_pos != 1) {
         invalid_arg("RERoT q-prep reference: NORMAL/NEOX require n_pos == 1");
     }
-    if (c.rope_mode != 0 && c.rope_mode != 2 && c.rope_mode != 8 && c.rope_mode != 24) {
+    if (c.rope_mode != 0 && c.rope_mode != 2 && c.rope_mode != 8 && c.rope_mode != 40) {
         invalid_arg("RERoT q-prep reference: unsupported rope mode");
     }
-    if (c.rope_mode == 8 || c.rope_mode == 24) {
+    if (c.rope_mode == 8 || c.rope_mode == 40) {
         if (c.mrope_sections == nullptr) {
             invalid_arg("RERoT q-prep reference: MROPE/IMROPE require sections");
         }
@@ -1183,7 +1185,8 @@ std::vector<float> llama_rerot_q_prep_reference(
                     sec_end - sec_begin, c.ext_factor, c.attn_factor, theta_scale, 1.0f, cache);
                 for (int64_t h = 0; h < c.heads; ++h) {
                     float * vec = dst + size_t(h) * head_bytes + sec_begin;
-                    qprep_rotate_normal(cache, sec_end - sec_begin, sec_end - sec_begin, 1, vec);
+                    // MROPE/IMROPE use ggml half-offset pairing (NEOX-style).
+                    qprep_rotate_neox(cache, sec_end - sec_begin, sec_end - sec_begin, 1, vec);
                 }
             }
         } else {
