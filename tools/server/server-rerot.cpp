@@ -1248,10 +1248,7 @@ server_rerot_runtime::server_rerot_runtime(
     : memory_(memory),
       frontier_mode_(frontier_mode),
       first_internal_seq_(first_internal_seq),
-      max_seq_(std::max(first_internal_seq, max_seq)) {
-    for (uint32_t seq = first_internal_seq_; seq < max_seq_; ++seq) {
-        free_internal_seqs_.push_back(static_cast<llama_seq_id>(seq));
-    }
+      max_seq_(std::max(std::max(first_internal_seq, max_seq), (uint32_t) 1)) {
     if (first_internal_seq_ > 0) {
         set_pen_capacity(first_internal_seq_);
     }
@@ -1315,12 +1312,37 @@ uint64_t server_rerot_runtime::adopt_root(
 }
 
 void server_rerot_runtime::set_pen_capacity(uint32_t total_pens) {
+    // One authority for both roles. The id space is split once, here:
+    //
+    //   lanes    [0, max(pen_capacity, first_internal_seq_))  physical execution
+    //   internal [that, max_seq_)                             park/archive/probe
+    //
+    // `first_internal_seq_` is the server's slot concurrency (what the memory
+    // allocator reserved for real sequences); pens are the execution lanes that
+    // run on those slots. A lane may therefore only ever own an id below the
+    // arena base, and the arena may only ever issue ids at or above it. Every
+    // allocation double-checks that (alloc_internal_seq), so a mistake fails
+    // loudly at the source instead of surfacing as a GPU fault much later.
+    const uint32_t n_lanes = std::max(total_pens, first_internal_seq_);
+    const uint32_t arena_base = std::min(n_lanes, max_seq_);
+
     pens_.clear();
     pens_.resize(total_pens);
+    free_internal_seqs_.clear();
+    seq_role_lane_.fill(false);
+    seq_role_internal_.fill(false);
+
     for (uint32_t i = 0; i < total_pens; ++i) {
         pens_[i].id = static_cast<rerot_pen_id>(i);
         pens_[i].state = server_pen_state::free;
-        pens_[i].exec_seq = first_internal_seq_ + i < max_seq_ ? first_internal_seq_ + i : i;
+        // Rebound at admission; a free lane owns no physical sequence yet.
+        pens_[i].exec_seq = (i < arena_base) ? static_cast<llama_seq_id>(i) : -1;
+    }
+    for (uint32_t seq = 0; seq < arena_base; ++seq) {
+        seq_role_lane_[seq] = true;
+    }
+    for (uint32_t seq = arena_base; seq < max_seq_; ++seq) {
+        free_internal_seqs_.push_back(static_cast<llama_seq_id>(seq));
     }
 }
 
@@ -1452,6 +1474,19 @@ bool server_rerot_runtime::suspend_pen(rerot_pen_id pen_id) {
     return true;
 }
 
+// seq_cp_attention() copies src ownership onto dst and therefore assumes dst owns
+// nothing yet (llama_kv_cache::seq_cp issues a bare seq_add per src cell). Parked
+// seqs are reused across yields/passivations, so a lane that parks twice keeps the
+// ownership of the previous copy and the second seq_add trips
+// `assert(!seq[i].test(seq_id))` in llama_kv_cells. Clear the destination first.
+static void rerot_seq_retarget(
+        llama_memory_t memory,
+        llama_seq_id src_seq,
+        llama_seq_id dst_seq) {
+    llama_memory_seq_rm_attention(memory, dst_seq, -1, -1);
+    llama_memory_seq_cp_attention(memory, src_seq, dst_seq, -1, -1);
+}
+
 bool server_rerot_runtime::resume_pen(
         uint64_t episode_id,
         llama_rerot_node_id node_id,
@@ -1485,7 +1520,7 @@ bool server_rerot_runtime::resume_pen(
     n->exec_seq = exec_seq;
 
     if (memory_ && n->parked_seq >= 0) {
-        llama_memory_seq_cp_attention(memory_, n->parked_seq, exec_seq, -1, -1);
+        rerot_seq_retarget(memory_, n->parked_seq, exec_seq);
         if (!n->hand_seed.empty() &&
             !llama_memory_rerot_apply_hand_seed(
                 memory_, exec_seq, n->hand_seed.data(), n->hand_seed.size())) {
@@ -2495,6 +2530,13 @@ std::optional<llama_seq_id> server_rerot_runtime::alloc_internal_seq() {
     }
     const auto seq_id = free_internal_seqs_.front();
     free_internal_seqs_.pop_front();
+    // Fail closed at the source: an id that a lane already owns can never
+    // become an internal (parked/archive/probe) id. Catching it here turns a
+    // silent two-writers-one-row corruption into an immediate, named abort.
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_role_internal_.size());
+    GGML_ASSERT(!seq_role_lane_[seq_id]);
+    GGML_ASSERT(!seq_role_internal_[seq_id]);
+    seq_role_internal_[seq_id] = true;
     return seq_id;
 }
 
@@ -2503,6 +2545,9 @@ void server_rerot_runtime::free_internal_seq(llama_seq_id seq_id) {
         seq_id >= static_cast<llama_seq_id>(max_seq_)) {
         return;
     }
+    GGML_ASSERT((size_t) seq_id < seq_role_lane_.size());
+    GGML_ASSERT(!seq_role_lane_[seq_id]);
+    seq_role_internal_[seq_id] = false;
     if (std::find(free_internal_seqs_.begin(), free_internal_seqs_.end(), seq_id) == free_internal_seqs_.end()) {
         free_internal_seqs_.push_back(seq_id);
     }
@@ -3493,7 +3538,7 @@ bool server_rerot_runtime::yield_dag_pen_for_ready(uint64_t episode_id, bool res
             }
             victim->parked_seq = *parked;
         }
-        llama_memory_seq_cp_attention(memory_, victim->exec_seq, victim->parked_seq, -1, -1);
+        rerot_seq_retarget(memory_, victim->exec_seq, victim->parked_seq);
         const size_t seed_size =
             llama_memory_rerot_capture_hand_seed(memory_, victim->exec_seq, nullptr, 0);
         if (seed_size > 0) {
@@ -3617,7 +3662,7 @@ bool server_rerot_runtime::seal_dag_node(
                 }
                 nr.parked_seq = *parked;
             }
-            llama_memory_seq_cp_attention(memory_, nr.exec_seq, nr.parked_seq, -1, -1);
+            rerot_seq_retarget(memory_, nr.exec_seq, nr.parked_seq);
             const size_t seed_size =
                 llama_memory_rerot_capture_hand_seed(memory_, nr.exec_seq, nullptr, 0);
             if (seed_size > 0) {

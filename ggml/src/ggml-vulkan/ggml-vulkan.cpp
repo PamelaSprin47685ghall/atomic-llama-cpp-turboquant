@@ -14499,7 +14499,19 @@ static void ggml_vk_flash_attn_rerot(ggml_backend_vk_context * ctx, vk_context &
     vk_fa_tuning_params tuning_params;
     GGML_ASSERT(ggml_vk_flash_attn_rerot_tune(
         ctx->device, HSK, HSV, n_kv, k->type, v->type, head_group, tuning_params));
-    const uint32_t head_groups = n_head_q / tuning_params.block_rows;
+    // The dedicated shader hard-codes `Br = 1` (flash_attn_base.glsl,
+    // constant_id 1) and derives every head/row identity from
+    // `WorkGroupID.y` and `ne2 = n_head_q`. The Y grid must therefore stay
+    // n_head_q: shrinking it by tuning.block_rows leaves heads uncomputed and
+    // desynchronises the split-K partial stride (rows beyond the allocation ->
+    // GPUVM fault / device lost). GQA grouping is a property of the ordinary
+    // FA path, not of this kernel, so only the shared-memory staged variant is
+    // requested here.
+    const uint32_t head_groups = n_head_q;
+    // Keep the requested variant consistent with that contract: the RERoT
+    // kernel stages its own K/V tile, so the ordinary path's multi-row GQA
+    // grouping (block_rows > 1) is not a variant this shader implements.
+    tuning_params.block_rows = 1;
 
     // Strides in ordinary FA units (see the rerot_main push-constant overlay
     // in flash_attn_base.glsl).

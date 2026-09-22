@@ -3097,7 +3097,8 @@ private:
         // P12: formal P committed and C_base captured; workers are admitted
         // next (admission/prep window before the first logical frontier).
         rerot_prof_phase_transition(llama_rerot_phase::formal_p, llama_rerot_phase::workers_start);
-        if (!rerot->activate_dag_frontier(episode_id) || !rerot_admit_ready(episode_id)) {
+        if (!rerot->activate_dag_frontier(episode_id) ||
+            rerot_admit_ready(episode_id) == rerot_admit_ready_result::failed) {
             return false;
         }
         SRV_INF("RERoT DAG start: episode=%" PRIu64 " nodes=%zu released_slot=%d\n",
@@ -3264,11 +3265,23 @@ private:
             // Symmetric to probe_reject: the accepted plan and the route it
             // selected are the control-plane artifact worth reconstructing
             // after the fact (JSON wire format, no extra cost when untraced).
+            // The plan is emitted on ONE line (newlines/tabs escaped) so a
+            // multi-task plan can never be truncated by log line splitting.
+            std::string plan_line;
+            plan_line.reserve(episode->probe_bytes.size() + 16);
+            for (const char ch : episode->probe_bytes) {
+                switch (ch) {
+                    case '\n': plan_line += "\\n"; break;
+                    case '\r': plan_line += "\\r"; break;
+                    case '\t': plan_line += "\\t"; break;
+                    default:   plan_line += ch;    break;
+                }
+            }
             SRV_INF("rerot.trace.probe_plan: episode=%" PRIu64 " tokens=%" PRIu64
                     " strategy=%s text=%s\n",
                 slot.rerot_episode_id, episode->probe_tokens,
                 decision.is_simple() ? "simple" : "dag",
-                episode->probe_bytes.c_str());
+                plan_line.c_str());
         }
         const uint64_t probe_ep_id = slot.rerot_episode_id;
         auto probe_transport_it = rerot_transport.find(probe_ep_id);
@@ -3607,7 +3620,16 @@ private:
         }
         // Preserve the pending next-token decision alongside lineage/sampler;
         // resume feeds it, never a stale logit row and never a re-forward.
-        transport_it->second->pending_tokens.insert_or_assign(slot.rerot_node_id, slot.sampled);
+        // LLAMA_TOKEN_NULL means the lane was descheduled before its first
+        // decision of this frame: there is nothing to carry, and writing the
+        // placeholder would make the resume path treat a normal re-entry as a
+        // corrupt RUNNING lane. Drop any older entry instead of leaving a
+        // stale decision behind for a lane that has not sampled yet.
+        if (slot.sampled != LLAMA_TOKEN_NULL) {
+            transport_it->second->pending_tokens.insert_or_assign(slot.rerot_node_id, slot.sampled);
+        } else {
+            transport_it->second->pending_tokens.erase(slot.rerot_node_id);
+        }
     }
 
     void rerot_idle_unbound_slots(uint64_t episode_id) {
@@ -3785,17 +3807,20 @@ private:
                 // Resumed RUNNING: feed the parked pending decision through
                 // the ordinary next-input path (plan/append forwards
                 // slot.sampled; i_batch stays -1: no valid row exists yet).
-                // Missing or null pending is corruption: fail closed rather
-                // than reseed or sample a stale row.
+                // Absent pending means the lane produced no decision before it
+                // was descheduled (first forward of the frame). i_batch=-1 and
+                // sam=\0 make the ordinary path forward the current prompt and
+                // sample fresh; never reseed over the parked lineage and never
+                // sample a stale logit row.
                 const auto pend_it = transport_it->second->pending_tokens.find(node_id);
-                if (pend_it == transport_it->second->pending_tokens.end() ||
-                    pend_it->second == LLAMA_TOKEN_NULL) {
-                    rerot->hard_abort(episode_id, "rerot_state_error: resumed RUNNING lane has no pending decision");
-                    return false;
+                if (pend_it != transport_it->second->pending_tokens.end() &&
+                    pend_it->second != LLAMA_TOKEN_NULL) {
+                    slot.sampled = pend_it->second;
+                    transport_it->second->pending_tokens.erase(pend_it);
+                } else {
+                    slot.sampled = LLAMA_TOKEN_NULL;
                 }
-                slot.sampled = pend_it->second;
                 slot.i_batch = -1;
-                transport_it->second->pending_tokens.erase(pend_it);
                 rerot_bind_sampler(slot);
             }
         } else {
@@ -3822,10 +3847,14 @@ private:
         return true;
     }
 
-    bool rerot_admit_ready(uint64_t episode_id) {
+    // Advisory result: `ok` = admission ran, `saturated` = pen arena full
+    // (no progress this step, not an error), `failed` = episode aborted.
+    enum class rerot_admit_ready_result : uint8_t { ok = 0, saturated, failed };
+
+    rerot_admit_ready_result rerot_admit_ready(uint64_t episode_id) {
         auto * episode = rerot ? rerot->episode(episode_id) : nullptr;
         if (!episode || episode->hard_aborted) {
-            return false;
+            return rerot_admit_ready_result::failed;
         }
 
         // pen_capacity is the hard in-flight-lane bound. The DAG activa-
@@ -3840,7 +3869,14 @@ private:
         // lanes stay queued until a running lane finishes.
         const uint64_t live_lanes = rerot->pens_for_person(episode_id).size();
         if (episode->is_dag && live_lanes >= rerot->pen_capacity()) {
-            return true;
+            // Capacity reached: every pen is bound, so there is nothing to
+            // admit. This is NOT an error and NOT progress: reporting plain
+            // success made finish_frontier treat an untouched cohort as
+            // advanced and re-enter admission on every decode step, which reset
+            // the frame-injection cursor of the still-STARTING lane; its fixed
+            // entry then never completed, no pen was released, and the episode
+            // livelocked admitting the same node forever.
+            return rerot_admit_ready_result::saturated;
         }
 
         while (!episode->suspended.empty() || !episode->ready_queue.empty()) {
@@ -3894,13 +3930,13 @@ private:
                         if (!rerot->resume_pen(episode_id, nid, free_slot->id, free_slot->id) ||
                             !rerot_prepare_child_slot(episode_id, nid, *free_slot)) {
                             rerot->hard_abort(episode_id, "rerot_state_error: suspended pen resumption failed");
-                            return false;
+                            return rerot_admit_ready_result::failed;
                         }
                     } else if (!rerot->admit_next_child(
                                    episode_id, free_slot->id, free_slot->id, nullptr, nid) ||
                                !rerot_prepare_child_slot(episode_id, nid, *free_slot)) {
                         rerot->hard_abort(episode_id, "rerot_state_error: child admission failed");
-                        return false;
+                        return rerot_admit_ready_result::failed;
                     }
                     if (is_synth) {
                         // P12: admitting the synthesis lane ends the worker
@@ -3933,7 +3969,7 @@ private:
                     admitted == LLAMA_REROT_NODE_INVALID ||
                     !rerot_prepare_child_slot(episode_id, admitted, *free_slot)) {
                     rerot->hard_abort(episode_id, "rerot_state_error: child admission failed");
-                    return false;
+                    return rerot_admit_ready_result::failed;
                 }
                 if (admitted == episode->synthesis_node) {
                     const int64_t start_us = episode->t_synthesis_eligible_us > 0 ? episode->t_synthesis_eligible_us : ggml_time_us();
@@ -3954,7 +3990,7 @@ private:
                 if (!rerot->resume_pen(episode_id, suspended_id, free_slot->id, free_slot->id) ||
                     !rerot_prepare_child_slot(episode_id, suspended_id, *free_slot)) {
                     rerot->hard_abort(episode_id, "rerot_state_error: suspended pen resumption failed");
-                    return false;
+                    return rerot_admit_ready_result::failed;
                 }
                 continue;
             }
@@ -3965,10 +4001,10 @@ private:
                 admitted == LLAMA_REROT_NODE_INVALID ||
                 !rerot_prepare_child_slot(episode_id, admitted, *free_slot)) {
                 rerot->hard_abort(episode_id, "rerot_state_error: child admission failed");
-                return false;
+                return rerot_admit_ready_result::failed;
             }
         }
-        return true;
+        return rerot_admit_ready_result::ok;
     }
 
     std::string rerot_render_public_document(
@@ -4685,7 +4721,7 @@ private:
                                     rerot_make_slot_idle(yield_slot);
                                     SLT_INF(yield_slot, "RERoT episode %" PRIu64 " yielded pen %d to episode %" PRIu64 "\n",
                                         episode_id, yield_pen_id, other_ep_id);
-                                    rerot_admit_ready(other_ep_id);
+                                    (void) rerot_admit_ready(other_ep_id);
                                     break;
                                 }
                             }
@@ -4700,7 +4736,7 @@ private:
             rerot_idle_unbound_slots(episode_id);
         }
 
-        if (!rerot_admit_ready(episode_id)) {
+        if (rerot_admit_ready(episode_id) == rerot_admit_ready_result::failed) {
             return false;
         }
 

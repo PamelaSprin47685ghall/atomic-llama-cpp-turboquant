@@ -1018,9 +1018,23 @@ private:
     llama_memory_t memory_ = nullptr;
     llama_rerot_frontier_mode frontier_mode_ = LLAMA_REROT_FRONTIER_STRONG;
     uint64_t next_episode_id_ = 1;
-    uint32_t first_internal_seq_ = 0;
+
+    // Sequence ids are a single finite resource with four roles. Giving each
+    // role its own range up front is the invariant that keeps two writers off
+    // one physical KV row; the old code handed out lane ids and parked/archive
+    // ids from one lazily-appended deque, so a pen could be born owning an id
+    // the arena later reissued (GPUVM fault -> device loss).
+    //
+    //   lanes   : [0, n_lanes)                     physical execution sequences
+    //   internal: [n_lanes, max_seq_)              parked / archive / probe
+    //
+    // `n_lanes` is the server's request concurrency (first_internal_seq), which
+    // is the largest role count the memory allocator itself reserved.
+    uint32_t first_internal_seq_ = 0;   // == n_lanes
     uint32_t max_seq_ = 256;
     std::deque<llama_seq_id> free_internal_seqs_;
+    std::array<bool, LLAMA_MAX_SEQ> seq_role_lane_{};    // reserved as a lane
+    std::array<bool, LLAMA_MAX_SEQ> seq_role_internal_{}; // handed to parked/archive/probe
     std::unordered_map<uint64_t, server_rerot_episode> episodes_;
     std::unordered_map<int, uint64_t> slot_to_episode_;
     std::vector<server_pen> pens_;

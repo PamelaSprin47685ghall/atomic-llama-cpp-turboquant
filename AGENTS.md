@@ -1,5 +1,58 @@
 # AGENTS.md
 
+## 下班交接｜2026-09-22（第二十二轮，多 lane 长序列三类真机缺陷：越界地毯二期 + 探针上限 + seq 域单一权威重构）
+
+**分支：** `master`
+**主题：** 用「给学生讲 Raft」这个真实长输出任务压出三类缺陷；前两类按地毯法根治，第三类**按你的要求做了系统性重构**（不再头疼医头）：seq id 的四个角色改为单一权威分区。
+
+### 一、GPUVM 越界二期：`flash_attn_rerot` 的 grid 与 `Br=1` 契约冲突（真 bug）
+
+**现场：** 6 lane 并行、长序列（`n=126`）时 `radv: GPUVM fault at 0x80061fe21000`、`CLIENT_ID (TCP)` → `vk::Queue::submit: ErrorDeviceLost`（compute 队列，不是显示）。
+
+**根因（纯索引）：** 专用 shader 把 `Br` 硬编码为 1（`flash_attn_base.glsl`，`constant_id 1`），head/行身份完全由 `WorkGroupID.y` 与 `ne2 = n_head_q` 决定；而 host 却按 **`head_groups = n_head_q / tuning.block_rows`** 划 Y 网格（tuning 在 GQA 分组可用时返回 `block_rows>1`）→ ① 部分 head 永不被计算；② split-K 部分行的步进与分配尺寸脱钩，长序列时越过分配区。
+
+**修复：** host 恒以 `n_head_q` 为 Y 网格，并把 tuning 变体钉为 `block_rows = 1`（多行 GQA 分组是普通 FA 路径的变体，不是这个 kernel 实现的东西）。
+
+### 二、探针阶段的两个诊断缺陷（本轮新增证据通道）
+
+1. **EOG 文案错位**：探针未决时采样到 EOG 会报「子分隔符未关」，与事实无关；现按 `episode->probing && !strategy_decided` 区分为「探针未决」。
+2. **缺「已接受计划」日志**：原有只有被拒计划（`probe_reject`）。新增 `rerot.trace.probe_plan`（已接受计划 + 选定策略），并**把计划压成单行**（转义 `\n/\r/\t`）——多任务计划的 JSON 是多行的，先前会被日志按行截断（本轮实测：第一版只拿到 `text={`）。
+
+### 三、seq id 域：从「隐式分区」重构为「单一权威」（按你的指示）
+
+**缺陷本质：** 一个 id 空间混了四种角色，靠「谁先谁后」隐式分区：
+- pen（物理执行 lane）默认 `exec_seq = first_internal_seq_ + i`；
+- 而 `alloc_internal_seq()` 的 arena **也从 `first_internal_seq_` 起发号**。
+
+于是 `--rerot-pens 6` 时，arena 前 6 个 id 已被 lane 占用，随后 park/archive/probe 再发号就会**与某条 lane 撞 id** → 两个 lane 写同一物理 KV 行 → 第二阶段越界（`0x80062382b000`）或静默污染；叠加「容量闸门返回成功」导致的 live-lock，表现为 `resumed RUNNING lane has no pending decision` / 无限 `Lane admitted`。
+
+**重构（单一权威 + 显式不变量）：**
+- `set_pen_capacity()` 是**唯一**划分点：
+  `lanes = [0, max(pen_capacity, first_internal_seq_))`，`internal arena = [该基址, max_seq_)`；
+  分区在两个 `std::array<bool, LLAMA_MAX_SEQ>` 角色位图里显式记录；
+- `alloc_internal_seq()` 在**分配点**断言 `!seq_role_lane_[id] && !seq_role_internal_[id]` —— 任何别名在源头 fail-closed，而不是等 GPU 越界；
+- `free_internal_seq()` 同样断言归还的确实是 arena id；
+- pen 超出请求并发数（`--rerot-pens > n_parallel`）时**不预置 id**（`-1`），由 admission 重绑到真实物理槽位。
+
+顺带修掉两处同族真 bug：
+- **park 写入 `LLAMA_TOKEN_NULL` 占位** → resume 端把正常重入当损坏硬杀（`resumed RUNNING lane has no pending decision`）。改为：无待续判决就不写 pending，resume 端缺 pending 时以 `sampled=NULL, i_batch=-1` 走正常下一步。
+- **`yield_dag_pen_for_ready()` 的 `seq_cp` 假设目标 seq 干净** → 复用 `parked_seq` 时第二次 `seq_add` 触发 `llama_kv_cells` 断言。新增 `rerot_seq_retarget()`：拷贝前先清目标归属（4 处：yield / passivate / unpark）。
+- **`rerot_admit_ready()` 的容量闸门返回「成功」** → `finish_frontier` 把它当「cohort 已推进」，每个 decode 步重入 admission，反复重置仍在 STARTING 的 lane 的帧注入游标（`injection=8` 卡在 `n=11`），pen 永不释放 → live-lock。改为三态返回值（`ok / saturated / failed`），`saturated` 明确表示「无进展且非错误」。
+
+### 四、KV 上限（负责人给定，未再下压）
+
+**K = q8_0、V = turbo4 已到极限。** 对照：`turbo3/turbo3` 时探针打转，换回后正常。
+
+### 五、验证记录
+
+- `test-rerot-runtime` / `test-rerot-attn` / `test-rerot-view` / `test-rerot-parser` / `test-rerot-recurrent` / `test-rerot-span-expand` 全 **0 failure**；
+- 真机（780M，K=q8_0/V=turbo4，`-np 2 --rerot-people 2 --rerot-pens 6`）「给学生讲 Raft」：探针 355 tokens → `dag`，**8 节点**（6 worker + 0.plan + synthesis），`deps` 为 `1→2→3→4→5→6` 递进链（第 4 步同时依赖 2、3），**HTTP 200**，`GPUVM/page fault = 0`，Xorg 存活。
+
+### 六、未闭合
+
+1. `--rerot-pens > n_parallel` 时超出部分不预置 seq（由 admission 重绑）；若未来要真正并行超过槽位数，需要同时抬高 `n_parallel`（请求并发）而不只是 pens。
+2. 5×6800 目标机的多 lane 收益与长序列压测仍需在该机复测。
+
 ## 下班交接｜2026-09-22（第二十一轮，路由探针换轨：作废 Makefile 行式 DSL → Compact Dict JSON）
 
 **分支：** `master`
